@@ -44,9 +44,7 @@ jobs:
           --buildtype=plain \
           --prefix=/usr \
           --sysconfdir=/etc \
-          --libdir=lib/x86_64-linux-gnu \
           --bindir=lib/nntrainer/bin \
-          --includedir=include \
           -Dinstall-app=true \
           -Dreduce-tolerance=false \
           -Denable-debug=true \
