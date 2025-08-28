@@ -24,13 +24,13 @@
 #include "layer_context.h"
 #include "model.h"
 #include "model_common_properties.h"
+#include <activation_realizer.h>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <sys/resource.h>
-#include <activation_realizer.h>
 // #include <bits/fs_fwd.h>
 // #include <bits/fs_path.h>
 #include <common_properties.h>
@@ -349,16 +349,15 @@ NeuralNetwork::~NeuralNetwork() {
 sharedConstTensors NeuralNetwork::forwarding(
   bool training, std::function<bool(void *userdata)> stop_cb, void *userdata) {
 
-  unsigned int lookahead =
-    std::get<props::FsuLookahead>(model_flex_props);
-  
-  for(unsigned int i =0 ;i<lookahead;++i){
+  unsigned int lookahead = std::get<props::FsuLookahead>(model_flex_props);
+
+  for (unsigned int i = 0; i < lookahead; ++i) {
     model_graph.LoadTensors(i);
   }
 
   std::function<void(std::shared_ptr<LayerNode>, bool)> forwarding_op =
     [this, stop_cb, userdata, lookahead](std::shared_ptr<LayerNode> node,
-                              bool training) -> void {
+                                         bool training) -> void {
     (void)this;
     PROFILE_MEM_ANNOTATE("Forwarding for layer: " + node->getName());
 
@@ -396,16 +395,18 @@ sharedConstTensors NeuralNetwork::forwarding(
                the forwarding, ask load tensors for next n layers.
       **/
 
-      model_graph.LoadTensors(f+lookahead);
-      
+      model_graph.LoadTensors(f + lookahead);
+
       model_graph.checkLoadComplete(f);
-      
-      std::cout << ">>>>>>>>>>>>>>>>>>> Forwarding Start " << node->getName()<<std::endl;
+
+      std::cout << ">>>>>>>>>>>>>>>>>>> Forwarding Start " << node->getName()
+                << std::endl;
       // std::cout << "Layer : " << node->getName() << std::endl;
       node->forwarding(training);
       // print_rss();
-      std::cout << ">>>>>>>>>>>>>>>>>>> Forwarding END " << node->getName()<<std::endl;
-      // model_graph.UnloadTensors(f);      
+      std::cout << ">>>>>>>>>>>>>>>>>>> Forwarding END " << node->getName()
+                << std::endl;
+      // model_graph.UnloadTensors(f);
 
       // model_graph.LoadTensors(f);
       // model_graph.checkLoadComplete(f);
@@ -442,9 +443,7 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
   return forwarding(training);
 }
 
-void NeuralNetwork::InvalidAllFSU() {
-    model_graph.Inactive(0);
-}
+void NeuralNetwork::InvalidAllFSU() { model_graph.Inactive(0); }
 
 size_t getMemoryUsage() {
   struct rusage usage;
@@ -467,11 +466,10 @@ void print_rss() {
 sharedConstTensors NeuralNetwork::incremental_forwarding(
   unsigned int from, unsigned int to, bool training,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
-  
-  unsigned int lookahead =
-    std::get<props::FsuLookahead>(model_flex_props);
-  
-  for(unsigned int i =0 ;i<lookahead;++i){
+
+  unsigned int lookahead = std::get<props::FsuLookahead>(model_flex_props);
+
+  for (unsigned int i = 0; i < lookahead; ++i) {
     model_graph.LoadTensors(i);
   }
   std::function<void(std::shared_ptr<LayerNode>, bool)> forwarding_op =
@@ -487,11 +485,11 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
       model_graph.flushCacheExcept(f);
       node->incremental_forwarding(from, to, training);
     } else {
-      
-      model_graph.LoadTensors(f+lookahead);
-      
+
+      model_graph.LoadTensors(f + lookahead);
+
       model_graph.checkLoadComplete(f);
-      
+
       node->incremental_forwarding(from, to, training);
     }
   };
@@ -709,6 +707,7 @@ void NeuralNetwork::save(const std::string &file_path,
 
 void NeuralNetwork::load(const std::string &file_path,
                          ml::train::ModelFormat format) {
+  std::cout << "NeuralNetwork::load" << std::endl;
   /// @todo this switch case should be delegating the function call only. It's
   /// not delegating for now as required logics are manageable for now.
 
@@ -723,32 +722,35 @@ void NeuralNetwork::load(const std::string &file_path,
     std::vector<std::pair<size_t, size_t>> file_offset;
     size_t start_from = 0;
 
-    for(auto node : model_graph.getLayerNodes()){
+    for (auto node : model_graph.getLayerNodes()) {
       auto weights = node->getRunContext().getWeights();
-      for(auto weight:weights){
-	auto dim = weight->getDim();
-	size_t size = dim.getDataTypeSize()*dim.getDataLen();
+      for (auto weight : weights) {
+        auto dim = weight->getDim();
+        size_t size = dim.getDataTypeSize() * dim.getDataLen();
 
-	file_offset.emplace_back(std::make_pair(start_from,size));
-	start_from+= size;
+        file_offset.emplace_back(std::make_pair(start_from, size));
+        start_from += size;
       }
     }
 
-    // for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+    // for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
+    // iter++) {
     //   auto weights = (*iter)->getRunContext().getWeights();
     //   for (auto weight : weights) {
     //     // auto dim = weight->getVariable();
     // 	auto dim = weight->getDim();
-    // 	// std::cout << dim.getDataTypeSize() << " : " << dim.getDataLen()<<std::endl;
+    // 	// std::cout << dim.getDataTypeSize() << " : " <<
+    // dim.getDataLen()<<std::endl;
     //     size_t size = dim.getDataTypeSize() * dim.getDataLen();
-    //     // size_t size = dim.getMemoryBytes(); // dim.getDataTypeSize() * dim.getDataLen();
+    //     // size_t size = dim.getMemoryBytes(); // dim.getDataTypeSize() *
+    //     dim.getDataLen();
     // 	std::cout << size << " ------------------------"<<std::endl;
 
     //     file_offset.emplace_back(std::make_pair(start_from, size));
     //     start_from += size;
     //   }
     // }
-    
+
     model_graph.setWeightOffset(file_offset);
   }
 
@@ -762,11 +764,12 @@ void NeuralNetwork::load(const std::string &file_path,
       (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
 
     for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
-
+      std::cout << "iterating model graph at " << (*iter)->getName()
+                << std::endl;
       if ((*iter)->getWeightDataType() == TensorDim::DataType::BCQ) {
-        (*iter)->read_quantization_info(model_file, false, exec_mode,
-                                        fsu_mode);
+        (*iter)->read_quantization_info(model_file, false, exec_mode, fsu_mode);
       } else {
+        std::cout << "read file: " << (*iter)->getName() << std::endl;
         (*iter)->read(model_file, false, exec_mode, fsu_mode);
       }
     }
@@ -842,20 +845,26 @@ void NeuralNetwork::load(const std::string &file_path,
       << "Cannot open QNN context bin file";
 
     std::thread qnn_load([this, &v]() {
-      int ret =
-        ct_engine.getRegisteredContext("qnn")->load(props::FilePath(v[0]));
-      throw_status(ret);
+      for (int i = 0; i < v.size() - 1; i++) {
+        std::cout << "Loading qnn context file " << v[i] << std::endl;
+        int ret =
+          ct_engine.getRegisteredContext("qnn")->load(props::FilePath(v[i]));
+        throw_status(ret);
+      }
     });
-    
 
+    int last_idx = v.size() - 1;
     if (!fsu_mode && v.size() > 1) {
-      NNTR_THROW_IF(!isFileExist(props::FilePath(v[1])), std::invalid_argument)
+      NNTR_THROW_IF(!isFileExist(props::FilePath(v[last_idx])),
+                    std::invalid_argument)
         << "Cannot open weight bin file";
-      load(props::FilePath(v[1]), ml::train::ModelFormat::MODEL_FORMAT_BIN);
+      load(props::FilePath(v[last_idx]),
+           ml::train::ModelFormat::MODEL_FORMAT_BIN);
     } else if (fsu_mode) {
       NNTR_THROW_IF(v.size() <= 1, std::invalid_argument)
         << "Swap mode should run with loading a weight-bin file";
-      NNTR_THROW_IF(!isFileExist(props::FilePath(v[1])), std::invalid_argument)
+      NNTR_THROW_IF(!isFileExist(props::FilePath(v[last_idx])),
+                    std::invalid_argument)
         << "Cannot open weight bin file";
       // model_graph.setFsuWeightPath(v[1]);
     }
@@ -974,7 +983,7 @@ sharedConstTensors NeuralNetwork::inference(sharedConstTensors X,
   if (!validateInput(X))
     throw std::invalid_argument("Input validation failed.");
 
-  allocate(ExecutionMode::INFERENCE);
+  // allocate(ExecutionMode::INFERENCE);
 
   int nn_foward;
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");
@@ -1030,7 +1039,11 @@ NeuralNetwork::inference(unsigned int batch_size,
 
   for (auto &out : output_tensors) {
     auto out_t = *out.get();
-    output.push_back(out_t.getData());
+    float *float_out = (float *)malloc(out_t.size() * sizeof(float));
+    for (int i = 0; i < out_t.size(); i++) {
+      float_out[i] = (float)(out_t.getData<uint16_t>()[i]);
+    }
+    output.push_back(float_out);
   }
 
   return output;
@@ -1142,7 +1155,8 @@ std::vector<float *> NeuralNetwork::incremental_inference(
 
     output.push_back(last_out_buf_data);
   }
-  if(std::get<props::Fsu>(model_flex_props) && exec_mode == ExecutionMode::INFERENCE){
+  if (std::get<props::Fsu>(model_flex_props) &&
+      exec_mode == ExecutionMode::INFERENCE) {
     InvalidAllFSU();
   }
   return output;

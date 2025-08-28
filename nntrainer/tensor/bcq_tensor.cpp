@@ -412,7 +412,7 @@ void BCQTensor::createBCQW() {
 
   bcq_weight = std::make_shared<BiQGEMM::BCQW>(
   (uint32_t *)(data->getAddr<uint32_t>()), (float *)((uint32_t *)(data->getAddr<uint32_t>()) + size()) , width(), height(),
-  number_of_cluster, qbit_of_clusters, size_of_clusters, hidden_tile_size, true);
+  number_of_cluster, qbit_of_clusters, size_of_clusters, hidden_tile_size);
 
 }
 

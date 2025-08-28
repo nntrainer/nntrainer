@@ -175,7 +175,7 @@ static Tensor *requestTensor_(const TensorSpecV2 &spec,
 
   std::vector<unsigned> order = spec.additional_exec_order;
   if (expose) {
-    std::cout << "expoed ------------"<<std::endl;
+    std::cout << "expoed ------------" << std::endl;
     order.push_back(TensorPool::PERSIST_END_ORDER);
   }
 
@@ -457,7 +457,7 @@ std::vector<Weight *> Manager::requestWeights(
           TensorDim var32_dim(dim_v);
           var32_dim.setDataType(ml::train::TensorDim::DataType::FP32);
           std::vector<unsigned int> var32_exec_order;
-	  std::cout <<" PERSIS_END_ORDER :VAR32 "<<std::endl;
+          std::cout << " PERSIS_END_ORDER :VAR32 " << std::endl;
           var32_exec_order.push_back(TensorPool::PERSIST_END_ORDER);
 
           var32 = weight_pool.requestOrExtend(shared_name + ":var32", var32_dim,
@@ -598,17 +598,16 @@ Manager::requestInputs(const GraphNode &node,
                        const std::vector<TensorDim> &inputs_dim,
                        const std::vector<std::string> &outputs_name) {
   using RT = TensorSpecV2::RequestType;
-  
+
   bool is_train_mode = (exec_mode == ExecutionMode::TRAIN) ? true : false;
-  
+
   TensorSpecV2 var_common_spec, grad_common_spec;
-  if (is_train_mode)
-  {
+  if (is_train_mode) {
     var_common_spec.ls = TensorLifespan::FORWARD_GRAD_LIFESPAN;
   } else {
     var_common_spec.ls = TensorLifespan::FORWARD_FUNC_LIFESPAN;
   }
-  
+
   grad_common_spec.ls = TensorLifespan::CALC_DERIV_LIFESPAN;
   /// @todo handle this inside layer
   if (node.getType() == ActivationLayer::type or
@@ -736,7 +735,7 @@ std::vector<Tensor *> Manager::requestWeightOptimizerVariables(
   std::vector<unsigned int> exec;
   exec.reserve(1);
   if (is_grad_clip || is_mixed_precision) {
-    std::cout << "is_grad_clip || is_mixed"<<std::endl;
+    std::cout << "is_grad_clip || is_mixed" << std::endl;
     exec.emplace_back(TensorPool::PERSIST_END_ORDER);
   } else {
     exec.emplace_back(getMinMaxTensorExecutionOrder(name, true).second);
@@ -771,7 +770,7 @@ void Manager::flushCache() {
 
 bool Manager::checkLoadComplete(unsigned int order) {
 
-  auto checkLoadCompleteAtPool = [&](TensorPool &pool, unsigned int order) {
+  auto checkLoadCompleteAtPool = [](TensorPool &pool, unsigned int order) {
     return pool.checkLoadComplete(order);
   };
 
@@ -786,8 +785,10 @@ bool Manager::checkLoadComplete(unsigned int order) {
   //   auto &tasks = async_load_tensor[order];
   //   std::unique_lock<std::mutex> lock(completed_load_mutex);
   //   if (exec_mode == ExecutionMode::TRAIN) {
-  //     // auto w_fut = completed_load_tensor[std::get<0>(tasks)].wait();// .get_future();
-  //     // auto t_fut = completed_load_tensor[std::get<1>(tasks)].wait();//.get_future();
+  //     // auto w_fut = completed_load_tensor[std::get<0>(tasks)].wait();//
+  //     .get_future();
+  //     // auto t_fut =
+  //     completed_load_tensor[std::get<1>(tasks)].wait();//.get_future();
   //     lock.unlock();
   //     if (std::get<0>(tasks) != 0)
   // 	completed_load_fut[std::get<0>(tasks)].wait();
@@ -796,11 +797,13 @@ bool Manager::checkLoadComplete(unsigned int order) {
   // 	completed_load_fut[std::get<1>(tasks)].wait();
   //       // t_fut.wait();
   //   } else {
-  //     // auto w_fut = completed_load_tensor[std::get<0>(tasks)].get();//.get_future();
+  //     // auto w_fut =
+  //     completed_load_tensor[std::get<0>(tasks)].get();//.get_future();
   //     lock.unlock();
   //     if (std::get<0>(tasks) != 0) {
-  //       std::cout << "waiting for : "<< order << " : " << std::get<0>(tasks)<<std::endl;
-  // 	completed_load_fut[std::get<0>(tasks)].wait();	
+  //       std::cout << "waiting for : "<< order << " : " <<
+  //       std::get<0>(tasks)<<std::endl;
+  // 	completed_load_fut[std::get<0>(tasks)].wait();
   //        // w_fut.wait();
   //     }
   //   }
@@ -837,13 +840,13 @@ bool Manager::checkUnloadComplete(unsigned int order) {
 
 void Manager::LoadTensors(unsigned int order,
                           unsigned int remainder_lookahead) {
-  
+
   auto loadTensorsAsync = [&](TensorPool &pool, unsigned int order) {
     return pool.loadCacheExecAsync(
       order, [&](int id, TaskExecutor::CompleteStatus status,
                  std::future<TaskExecutor::CompleteStatus> fut) {
         std::scoped_lock<std::mutex> lock(completed_load_mutex);
-        completed_load_fut[id]=std::move(fut);
+        completed_load_fut[id] = std::move(fut);
       });
   };
 
@@ -856,7 +859,7 @@ void Manager::LoadTensors(unsigned int order,
     auto load_weight = loadTensorsAsync(weight_pool, o);
     ml_logd("load weigth is requested in LoadTensors with order - %d", o);
     int load_tensor = 0;
-    
+
     if (exec_mode != ml::train::ExecutionMode::INFERENCE) {
       load_tensor = loadTensorsAsync(tensor_pool, o);
       ml_logd("load tensor is requested in LoadTensors with order - %d", o);
@@ -868,8 +871,10 @@ void Manager::LoadTensors(unsigned int order,
 
   // for (unsigned int i = order; i < order + remainder_lookahead + 1; ++i) {
   //   if (i <= max_exec_order) {
-      // enqueTasks(i);
-  enqueTasks(order);
+  // enqueTasks(i);
+  if (order <= max_exec_order) {
+    enqueTasks(order);
+  }
   //   }
   // }
 }
@@ -878,7 +883,7 @@ void Manager::UnloadTensors(unsigned int order) {
 
   auto unloadTensorsAsync = [&](TensorPool &pool, unsigned int order) {
     return pool.flushCacheExecAsync(
-				    order, [&](int id, TaskExecutor::CompleteStatus status,
+      order, [&](int id, TaskExecutor::CompleteStatus status,
                  std::future<TaskExecutor::CompleteStatus> fut) {
         std::scoped_lock<std::mutex> lock(completed_unload_mutex);
         completed_unload_tensor[id].set_value(true);
@@ -908,13 +913,12 @@ void Manager::UnloadTensors(unsigned int order) {
 void Manager::flushCacheExcept(unsigned int order) {
   auto loadAsync = [&](TensorPool &pool, unsigned int order) {
     return pool.loadCacheExecAsync(
-				   
-				   order, [&](int id, TaskExecutor::CompleteStatus status,
+
+      order, [&](int id, TaskExecutor::CompleteStatus status,
                  std::future<TaskExecutor::CompleteStatus> fu) {
         std::scoped_lock<std::mutex> lock(completed_mutex);
         completed[id].set_value(true);
       });
-    
   };
 
   auto waitComplete = [&](unsigned int o) {

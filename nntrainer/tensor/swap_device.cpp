@@ -16,8 +16,8 @@
 #include <malloc.h>
 #include <profiler.h>
 #include <stdlib.h>
-#include <sys/types.h>
 #include <sys/resource.h>
+#include <sys/types.h>
 
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -72,6 +72,8 @@ void SwapDevice::start(size_t size, ml::train::ExecutionMode _execution_mode) {
 
 void *SwapDevice::getBuffer(off_t offset, size_t size, void *memory_ptr,
                             unsigned int id, bool alloc_only) {
+  std::cout << "swapdefice::getbuffer" << offset << " " << size << " "
+            << memory_ptr << " " << id << std::endl;
   NNTR_THROW_IF(fd <= 0, std::runtime_error)
     << "SwapDevice: Device is not started";
 
@@ -84,16 +86,30 @@ void *SwapDevice::getBuffer(off_t offset, size_t size, void *memory_ptr,
     size_t diff = len_offset.first - off;
     size_t len = len_offset.second + diff;
 
-    char *ptr = static_cast<char *>(mmap(
-      nullptr, len, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_SHARED, fd, off));
+    char *ptr = static_cast<char *>(
+      mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, off));
+    std::cout << "mmap result: " << (void *)ptr << ", diff: " << diff
+              << std::endl;
+
+    const size_t error_buflen = 100;
+    char error_buf[error_buflen];
+    NNTR_THROW_IF(ptr == MAP_FAILED, std::runtime_error)
+      << "SwapDevice: mmap: " << SAFE_STRERROR(errno, error_buf, error_buflen);
 
     // MADVISE can be used to improve performance.
     // madvise(ptr, len, MADV_SEQUENTIAL);
 
     void *buf = static_cast<void *>(ptr + diff);
 
+    std::cout << "memcpy(" << memory_ptr << ", " << buf << ", "
+              << len_offset.second << ")" << std::endl;
     memcpy(memory_ptr, buf, len_offset.second);
-    munmap(ptr, len);
+    std::cout << "memcpy done for " << id << std::endl;
+    const auto ret = munmap(ptr, len);
+
+    NNTR_THROW_IF(ret == -1, std::runtime_error)
+      << "SwapDevice: munmap: "
+      << SAFE_STRERROR(errno, error_buf, error_buflen);
 
     ++offset_index;
     if (offset_index >= (int)weight_offset.size()) {
@@ -241,20 +257,20 @@ void SwapDevice::finish() {
 /*     if (ptr)
       free(ptr);
  */  }
-  mapped.clear();
+mapped.clear();
 #else
   for (auto &alloc : allocated)
     free(alloc.first);
   allocated.clear();
 #endif
 
-  close(fd);
-  fd = -1;
-  if (execution_mode == ml::train::ExecutionMode::TRAIN) {
-    int status = std::remove(dev_path.c_str());
-    NNTR_THROW_IF(status, std::runtime_error)
-      << "SwapDevice: Couldn't remove " << dev_path.c_str();
-  }
+close(fd);
+fd = -1;
+if (execution_mode == ml::train::ExecutionMode::TRAIN) {
+  int status = std::remove(dev_path.c_str());
+  NNTR_THROW_IF(status, std::runtime_error)
+    << "SwapDevice: Couldn't remove " << dev_path.c_str();
+}
 }
 
 } // namespace nntrainer
