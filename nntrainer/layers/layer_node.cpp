@@ -25,6 +25,7 @@
 #include <connection.h>
 #include <context.h>
 #include <engine.h>
+#include <input_layer.h>
 #include <layer_node.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -585,13 +586,21 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
     actual_input_dims =
       std::vector<TensorDim>(prop_dims.begin(), prop_dims.end());
     for (auto &d : actual_input_dims) {
-      /// Input Tensor type of input layer needs to be float.
       d.setDataType(
-        str_converter<enum_class_prop_tag,
-                      nntrainer::TensorDataTypeInfo>::from_string("FP32"));
+        str_converter<enum_class_prop_tag, nntrainer::TensorDataTypeInfo>::
+          from_string(tensor_type[2]));
       d.setFormat(
         str_converter<enum_class_prop_tag, nntrainer::TensorFormatInfo>::
           from_string(tensor_type[0]));
+
+      if (getType() == InputLayer::type &&
+          !dynamic_cast<InputLayer *>(layer.get())
+             ->getInputTensorDataType()
+             .empty()) {
+        TensorDim::DataType input_dtype =
+          dynamic_cast<InputLayer *>(layer.get())->getInputTensorDataType();
+        d.setDataType(input_dtype);
+      }
     }
   }
 

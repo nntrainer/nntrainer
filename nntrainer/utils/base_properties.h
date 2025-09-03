@@ -706,6 +706,41 @@ struct TensorTypeInfo {
 namespace props {
 
 /**
+ * @brief Input Data Type Enumeration Information
+ *  This property is differentiated with TensorDataType in that it doesn't have
+ *  default value
+ */
+class InputTensorDataType final : public EnumProperty<TensorDataTypeInfo> {
+public:
+  using prop_tag = enum_class_prop_tag;
+  static constexpr const char *key = "input_dtype";
+};
+
+/**
+ * @brief Weight Data Type Enumeration Information
+ *  This property can be used when any layer is created.
+ *  This property is differentiated with TensorDataType in that it doesn't have
+ *  default value
+ */
+class WeightDtype final : public EnumProperty<TensorDataTypeInfo> {
+public:
+  using prop_tag = enum_class_prop_tag;
+  static constexpr const char *key = "weight_dtype";
+
+  /**
+   * @brief Constructor
+   */
+  WeightDtype(){};
+
+  /**
+   * @brief Constructor
+   *
+   * @param value value to set
+   */
+  WeightDtype(TensorDataTypeInfo::Enum value) { set(value); };
+};
+
+/**
  * @brief Activation Enumeration Information
  *
  */
