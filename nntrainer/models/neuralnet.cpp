@@ -1061,9 +1061,6 @@ NeuralNetwork::inference(unsigned int batch_size,
       break;
     case ml::train::TensorDim::DataType::UINT4:
     case ml::train::TensorDim::DataType::UINT8:
-    case ml::train::TensorDim::DataType::Q4_K:
-    case ml::train::TensorDim::DataType::Q6_K:
-    case ml::train::TensorDim::DataType::Q4_0:
       output.push_back(out_t.getData<uint8_t>());
       break;
     case ml::train::TensorDim::DataType::UINT16:

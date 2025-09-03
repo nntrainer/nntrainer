@@ -672,11 +672,6 @@ NetworkGraph::canExecuteInPlace(const std::shared_ptr<LayerNode> &lnode) {
     return inplace_type;
   }
 
-  if (lnode->getType() == InputLayer::type &&
-      !istrequal(getTensorType()[2], "FP32")) {
-    return InPlaceType::NONE;
-  }
-
   if (lnode->getType() == MultiOutLayer::type) {
     return InPlaceType::RESTRICTING;
   }

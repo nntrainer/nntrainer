@@ -71,16 +71,17 @@ void InputLayer::exportTo(Exporter &exporter,
 }
 
 void InputLayer::finalize(InitLayerContext &context) {
+  TensorDim::DataType input_dtype =
+    context.getInputDimensions()[0].getDataType();
+  TensorDim::DataType output_dtype = context.getActivationDataType();
 
   std::vector<TensorDim> output_dims = context.getInputDimensions();
   for (auto &d : output_dims) {
-    d.setDataType(context.getActivationDataType());
+    d.setDataType(output_dtype);
   }
-
   context.setOutputDimensions(output_dims);
-  is_inplace = true;
-  if (context.getActivationDataType() != ml::train::TensorDim::DataType::FP32)
-    is_inplace = false;
+
+  is_inplace = input_dtype == output_dtype ? true : false;
 }
 
 } /* namespace nntrainer */
