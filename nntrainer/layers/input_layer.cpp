@@ -74,13 +74,8 @@ void InputLayer::exportTo(Exporter &exporter,
 
 void InputLayer::finalize(InitLayerContext &context) {
   TensorDim::DataType input_dtype =
-    std::get<props::InputTensorDataType>(input_props).empty()
-      ? context.getInputDimensions()[0].getDataType()
-      : (TensorDim::DataType)std::get<props::InputTensorDataType>(input_props);
-  TensorDim::DataType output_dtype =
-    std::get<props::TensorDataType>(input_props).empty()
-      ? context.getActivationDataType()
-      : (TensorDim::DataType)std::get<props::TensorDataType>(input_props);
+    context.getInputDimensions()[0].getDataType();
+  TensorDim::DataType output_dtype = context.getActivationDataType();
 
   std::vector<TensorDim> output_dims = context.getInputDimensions();
   for (auto &d : output_dims) {

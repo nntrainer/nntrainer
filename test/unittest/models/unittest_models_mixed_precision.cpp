@@ -28,8 +28,7 @@ static std::unique_ptr<NeuralNetwork> fc_mixed_training() {
     {"batch_size=1", "model_tensor_type=FP16-FP16", "loss_scale=65536"});
 
   auto graph = makeGraph({
-    {"input",
-     {"name=in", "input_shape=1:1:3", "input_dtype=FP32", "tensor_dtype=FP16"}},
+    {"input", {"name=in", "input_shape=1:1:3", "input_dtype=FP32"}},
     {"Fully_connected", {"name=fc", "input_layers=in", "unit=10"}},
     {"mse", {"name=loss", "input_layers=fc"}},
   });
@@ -49,8 +48,12 @@ static std::unique_ptr<NeuralNetwork> fc_mixed_training_nan_sgd() {
     {"batch_size=1", "model_tensor_type=FP16-FP16", "loss_scale=65536"});
 
   auto graph = makeGraph({
+<<<<<<< HEAD
     {"input",
      {"name=in", "input_shape=1:1:1", "input_dtype=FP32", "tensor_dtype=FP16"}},
+=======
+    {"input", {"name=in", "input_shape=1:1:1", "input_dtype=FP32"}},
+>>>>>>> 1f2152be... [layer] enable fp16 dtype for input tensor
     {"Fully_connected", {"name=fc0", "input_layers=in", "unit=1"}},
     {"Fully_connected", {"name=fc1", "input_layers=fc0", "unit=1"}},
     {"mse", {"name=loss", "input_layers=fc1"}},
