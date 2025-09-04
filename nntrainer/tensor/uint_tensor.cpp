@@ -340,7 +340,8 @@ template <typename T> void UIntTensor<T>::copyData(const Tensor &from) {
   /// @todo support copy from other data types
   switch (from.getDataType()) {
   case ml::train::TensorDim::DataType::FP32: {
-    copy_fp32(from.size(), from.getData<float>(), (T *)getData());
+    // copy_fp32(from.size(), from.getData<float>(), (T *)getData());
+    memcpy((T *)getData(), from.getData<float>(), from.size() * 2);
     break;
   }
   default:

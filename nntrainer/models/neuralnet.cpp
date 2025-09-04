@@ -1040,9 +1040,7 @@ NeuralNetwork::inference(unsigned int batch_size,
   for (auto &out : output_tensors) {
     auto out_t = *out.get();
     float *float_out = (float *)malloc(out_t.size() * sizeof(float));
-    for (int i = 0; i < out_t.size(); i++) {
-      float_out[i] = (float)(out_t.getData<uint16_t>()[i]);
-    }
+    memcpy(float_out, out_t.getData(), out_t.size() * sizeof(uint16_t));
     output.push_back(float_out);
   }
 
