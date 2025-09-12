@@ -69,6 +69,7 @@ class DataBuffer;
 using DatasetType = ml::train::DatasetType;
 using DatasetModeType = ml::train::DatasetModeType;
 using RunStats = ml::train::RunStats;
+using IO_TensorType = ml::train::TensorDim::IO_TensorType;
 
 /**
  * @class   NeuralNetwork Class
@@ -357,6 +358,19 @@ public:
    */
   sharedConstTensors inference(sharedConstTensors X, sharedConstTensors label,
                                bool free_mem = false);
+
+  /**
+   * @brief     Run the inference of the model
+   * @param[in] batch batch size of current input
+   * @param[in] input inputs as a list of each input data
+   * @param[in] label labels as a list of each label data
+   * @retval list of output as IO_TensorType
+   * @note The output memory must not be freed by the caller
+   */
+  std::vector<IO_TensorType> inference(unsigned int batch,
+                                       const std::vector<IO_TensorType> &input,
+                                       const std::vector<IO_TensorType> &label =
+                                         std::vector<IO_TensorType>()) override;
 
   /**
    * @brief     Run the inference of the model

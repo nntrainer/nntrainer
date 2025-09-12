@@ -296,6 +296,20 @@ public:
    * @param[in] batch batch size of current input
    * @param[in] input inputs as a list of each input data
    * @param[in] label labels as a list of each label data
+   * @retval list of output as IO_TensorType
+   * @note The output memory must not be freed by the caller
+   */
+  virtual std::vector<TensorDim::IO_TensorType>
+  inference(unsigned int batch,
+            const std::vector<TensorDim::IO_TensorType> &input,
+            const std::vector<TensorDim::IO_TensorType> &label =
+              std::vector<TensorDim::IO_TensorType>()) = 0;
+
+  /**
+   * @brief     Run the inference of the model
+   * @param[in] batch batch size of current input
+   * @param[in] input inputs as a list of each input data
+   * @param[in] label labels as a list of each label data
    * @retval list of output as float *
    * @note The output memory must not be freed by the caller
    */

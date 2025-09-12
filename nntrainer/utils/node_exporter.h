@@ -251,7 +251,8 @@ void Exporter::saveTflResult(
                    std::vector<props::InputConnection>,
                    std::vector<props::InputShape>, props::SharedFrom,
                    props::ClipGradByGlobalNorm, props::Packed,
-                   props::LossScaleForMixed, props::ComputeEngine> &props,
+                   props::WeightDtype, props::LossScaleForMixed,
+                   props::ComputeEngine, props::InputTensorDataType> &props,
   const LayerNode *self);
 
 class BatchNormalizationLayer;
