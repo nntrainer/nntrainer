@@ -17,9 +17,10 @@
 #ifdef __cplusplus
 
 #include <array>
-#include <iosfwd>
-
 #include <bitset>
+#include <cstdint>
+#include <iosfwd>
+#include <variant>
 #include <vector>
 
 #ifdef ENABLE_FP16
@@ -39,6 +40,14 @@ namespace train {
  */
 class TensorDim {
 public:
+#ifdef ENABLE_FP16
+  using IO_TensorType = std::variant<float *, uint32_t *, uint16_t *, uint8_t *,
+                                     int16_t *, int8_t *, _FP16 *>;
+#else
+  using IO_TensorType = std::variant<float *, uint32_t *, uint16_t *, uint8_t *,
+                                     int16_t *, int8_t *>;
+#endif
+
   static constexpr const size_t MAXDIM = 4;
 
   /**

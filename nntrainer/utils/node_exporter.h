@@ -319,7 +319,8 @@ class InputLayer;
  */
 template <>
 void Exporter::saveTflResult(
-  const std::tuple<props::Normalization, props::Standardization> &props,
+  const std::tuple<props::Normalization, props::Standardization,
+                   props::InputTensorDataType, props::TensorDataType> &props,
   const InputLayer *self);
 
 class Pooling2DLayer;
