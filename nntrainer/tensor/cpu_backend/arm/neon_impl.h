@@ -16,6 +16,7 @@
 #ifdef __cplusplus
 
 #include <arm_neon.h>
+#include <climits>
 #include <cmath>
 #include <limits>
 #include <neon_mathfun.h>

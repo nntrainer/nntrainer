@@ -20,6 +20,7 @@
 #include <armv7_neon.h>
 #endif
 
+#include <cstring>
 #include <iostream>
 
 namespace nntrainer::neon {

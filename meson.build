@@ -5,7 +5,7 @@ project('nntrainer', 'c', 'cpp',
   default_options: [
     'werror=true',
     'warning_level=1',
-    'c_std=gnu89',
+    'c_std=gnu11',
     'cpp_std=c++17',
     'buildtype=release'
   ]
@@ -81,7 +81,8 @@ warning_flags = [
   '-Wno-unused-variable',
   '-Wno-comment',
   '-Wno-ignored-attributes',
-  '-Wno-sign-compare'
+  '-Wno-sign-compare',
+  '-Wno-error=declaration-after-statement'
 ]
 
 if cxx_compiler_id == 'clang'
@@ -175,7 +176,11 @@ if get_option('enable-fp16')
      ## About FP16-SIMD in aarch64
      # FP16-SIMD is supported since armv8.2. If you enable this forcibly, it won't be
      # comaptible with armv8.0 machines.
-     if cxx.has_argument('-mfp16-format=ieee')
+     if cxx.has_argument('-march=armv9-a')
+       # Enable when armv9.2 is officially supported
+       # add_project_arguments('-march=armv9.2-a+fp16+i8mm', language: ['c','cpp'])
+       add_project_arguments('-march=armv8.2-a+fp16+i8mm+dotprod', language: ['c','cpp'])
+     elif cxx.has_argument('-mfp16-format=ieee')
        add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
        add_project_arguments('-march=armv8.2-a+fp16', language: ['c', 'cpp'])
      else
