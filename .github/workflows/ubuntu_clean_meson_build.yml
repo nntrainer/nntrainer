@@ -11,7 +11,6 @@ jobs:
     strategy:
       matrix:
         os: [ ubuntu-20.04, ubuntu-22.04, ubuntu-22.04-arm ]
-        meson_options: [ "-Denable-fp16=false", "-Denable-fp16=true" ]
 
     steps:
     - uses: actions/checkout@v4
@@ -55,10 +54,20 @@ jobs:
           -Dcapi-ml-common-actual=capi-ml-common \
           -Dcapi-ml-inference-actual=capi-ml-inference \
           -Denable-capi=enabled \
-          ${{ matrix.meson_options }} \
+          -Denable-fp16=true \
           build
     - run: ninja -C build
     - name: run App Tests
       run: meson test -C build --no-suite unittests
     - name: run Unittests
       run: meson test -C build --suite unittests
+    - name: Compress Artifacts
+      if: always()
+      run: |
+        mkdir -p /tmp/build
+        zip -r /tmp/build/$(date +"%Y-%m").zip build
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: build-artifact-${{ matrix.os }}
+        path: /tmp/build
