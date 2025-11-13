@@ -37,6 +37,35 @@ if get_option('enable-opencl')
   nntrainer_base_deps += clblast_dep
 endif
 
+if get_option('enable-cuda')
+  # Add CUDA runtime library dependency
+  if get_option('platform') == 'windows'
+    # Windows: Use CUDA runtime library
+    cuda_dep = dependency('cuda', method: 'cmake', required: false)
+    if not cuda_dep.found()
+      # Fallback to manual library specification for Windows
+      cuda_lib = cc.find_library('cudart', required: false)
+      if cuda_lib.found()
+        nntrainer_base_deps += cuda_lib
+      endif
+    else
+      nntrainer_base_deps += cuda_dep
+    endif
+  else
+    # Linux and others: Use pkg-config or manual library specification
+    cuda_dep = dependency('cuda', method: 'pkg-config', required: false)
+    if not cuda_dep.found()
+      # Fallback to manual library specification for Linux
+      cuda_lib = cc.find_library('cudart', required: false)
+      if cuda_lib.found()
+        nntrainer_base_deps += cuda_lib
+      endif
+    else
+      nntrainer_base_deps += cuda_dep
+    endif
+  endif
+endif
+
 if get_option('platform') == 'tizen'
   nntrainer_base_deps += dependency('dlog')
 endif
@@ -80,6 +109,11 @@ if get_option('enable-opencl')
   nntrainer_headers += meson.current_source_dir() / 'cl_buffer_manager.h'
   nntrainer_common_sources += 'cl_context.cpp'
   nntrainer_common_sources += 'cl_buffer_manager.cpp'
+endif
+
+if get_option('enable-cuda')
+  nntrainer_headers += meson.current_source_dir() / 'cuda_context.h'
+  nntrainer_common_sources += 'cuda_context.cpp'
 endif
 
 foreach s : nntrainer_common_sources
