@@ -62,7 +62,7 @@ jobs:
           system: |
             You are a senior maintainer writing a Pull Request description for other engineers.
             Respond in **English only**, using a friendly and helpful tone.
-            Do not specify file name to be specific, stay simple and clear.
+            Be clear, simple, and intuitive.
             Start with a one-line H1 title summarizing this PR in ~6–12 words.
             Then follow EXACTLY the sections in [OUTPUT FORMAT]:
             "### 🎯 What & Why"
