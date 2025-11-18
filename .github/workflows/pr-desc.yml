@@ -1,0 +1,106 @@
+name: pr-description
+
+on:
+  pull_request:
+    types: [opened, synchronize, labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  models: read
+
+jobs:
+  describe:
+    if: contains(join(github.event.pull_request.labels.*.name, ','), 'ai-describe')
+
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Sanity check files
+        run: |
+          set -euxo pipefail
+          test -f .github/models/pr-desc/prompt.md
+          test -f .github/models/pr-desc/build_context.js
+          node -v
+          git --version
+
+      - name: Build context
+        run: |
+          set -euo pipefail
+          node .github/models/pr-desc/build_context.js \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" > pr_context.json
+          echo "CONTEXT_BYTES=$(wc -c < pr_context.json)"
+
+      - name: Compose prompt file (template + context)
+        run: |
+          : > combined_prompt.txt
+          echo "[PROMPT TEMPLATE]" >> combined_prompt.txt
+          cat .github/models/pr-desc/prompt.md >> combined_prompt.txt
+          echo -e "\n---\n[CONTEXT JSON]\n" >> combined_prompt.txt
+          cat pr_context.json >> combined_prompt.txt
+          echo "COMBINED_PROMPT_BYTES=$(wc -c < combined_prompt.txt)"
+
+      - name: Generate PR description (EN, friendly tone, with title)
+        id: ai_full
+        uses: actions/ai-inference@v1
+        with:
+          model: gpt-4o-mini
+          max-tokens: 1000
+          temperature: 0.2
+          top_p: 0.9
+          system: |
+            You are a senior maintainer writing a Pull Request description for other engineers.
+            Respond in **English only**, using a friendly and helpful tone.
+            Do not specify file name to be specific, stay simple and clear.
+            Start with a one-line H1 title summarizing this PR in ~6–12 words.
+            Then follow EXACTLY the sections in [OUTPUT FORMAT]:
+            "### 🎯 What & Why"
+            "### 💡 Key Changes"
+            "### 🔎 Pointers for Reviewer"
+            Do not add other sections.
+          prompt-file: combined_prompt.txt
+
+      - name: Save raw AI response to file
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 모델 응답을 직접 파일에 저장
+          cat > ai_response.txt << 'EOF'
+          ${{ steps.ai_full.outputs.response }}
+          EOF
+
+      - name: Convert backticks to single quotes
+        shell: python
+        run: |
+          from pathlib import Path
+          text = Path('ai_response.txt').read_text()
+          Path('pr_comment.md').write_text(text.replace('`', "'"))
+
+      - name: Sanitize inline code spans
+        shell: bash
+        run: |
+          set -euo pipefail
+          perl -0pe 's/`([^`]+)`/<code>\1<\/code>/g' pr_comment.md > pr_comment_sanitized.md
+          mv pr_comment_sanitized.md pr_comment.md
+
+          echo "COMMENT_BYTES=$(wc -c < pr_comment.md)"
+          head -c 200 pr_comment.md || true; echo
+
+      - name: Post as PR comment (never edit PR body)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NUM="${{ github.event.pull_request.number }}"
+          gh pr comment "$NUM" --body-file pr_comment.md
