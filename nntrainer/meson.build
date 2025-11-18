@@ -95,6 +95,11 @@ foreach elem : nntrainer_elements
   nntrainer_inc_abs += meson.current_source_dir() / elem
 endforeach
 
+# Add CUDA operations subdir if CUDA is enabled
+if get_option('enable-cuda')
+  subdir('tensor/cuda_operations')
+endif
+
 nntrainer_common_sources = [
   'nntrainer_logger.cpp',
   'app_context.cpp',
@@ -114,6 +119,7 @@ endif
 if get_option('enable-cuda')
   nntrainer_headers += meson.current_source_dir() / 'cuda_context.h'
   nntrainer_common_sources += 'cuda_context.cpp'
+  extra_defines += '-DENABLE_CUDA=1'
 endif
 
 foreach s : nntrainer_common_sources
