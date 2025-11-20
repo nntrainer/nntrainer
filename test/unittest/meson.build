@@ -90,6 +90,7 @@ endif
 
 if get_option('enable-cuda')
   test_target += [['unittest_cuda', []]]
+  test_target += [['unittest_cuda_addition', []]]
 endif
 
 if get_option('enable-fp16')
