@@ -86,14 +86,14 @@ inline static void rotary_emb_cl_internal(
       break;
     }
 
-    result = cl_buffer_manager.getInBufferC()->WriteDataRegion(
+    result = cl_buffer_manager.getOutBufferB()->WriteDataRegion(
       cl_context->command_queue_inst_, dim3_size, cos_.data());
     if (!result) {
       printf("Failed to write cos data\n");
       break;
     }
 
-    result = cl_buffer_manager.getInBufferC()->WriteDataRegion(
+    result = cl_buffer_manager.getOutBufferB()->WriteDataRegion(
       cl_context->command_queue_inst_, dim4_size, sin_.data(), 0, dim3_size);
     if (!result) {
       printf("Failed to write sin data\n");
@@ -128,14 +128,14 @@ inline static void rotary_emb_cl_internal(
       break;
     }
 
-    result = kernel->SetKernelArguments(4, cl_buffer_manager.getInBufferC(),
+    result = kernel->SetKernelArguments(4, cl_buffer_manager.getOutBufferB(),
                                         sizeof(cl_mem));
     if (!result) {
       printf("Failed to set cosBuf argument\n");
       break;
     }
 
-    result = kernel->SetKernelArguments(5, cl_buffer_manager.getInBufferC(),
+    result = kernel->SetKernelArguments(5, cl_buffer_manager.getOutBufferB(),
                                         sizeof(cl_mem));
     if (!result) {
       printf("Failed to set sinBuf argument\n");
