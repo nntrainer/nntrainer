@@ -191,6 +191,20 @@ private:
     }                                             \
   } while (0)
 
+#define GEN_TEST_INPUT_DOUBLE(input, equation_i_j_k_l)        \
+  do {                                                        \
+    for (int i = 0; i < batch; ++i) {                         \
+      for (int j = 0; j < channel; ++j) {                     \
+        for (int k = 0; k < height; ++k) {                    \
+          for (int l = 0; l < width; ++l) {                   \
+            float val = (equation_i_j_k_l);                   \
+            input[i*batch + j*channel + k*height + l] = val;  \
+          }                                                   \
+        }                                                     \
+      }                                                       \
+    }                                                         \
+  } while (0)
+
 /**
  * @brief return a tensor filled with contant value with dimension
  */

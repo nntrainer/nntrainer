@@ -29,6 +29,7 @@
 #include <layer_context.h>
 #include <tensor.h>
 
+
 #define EXPECT_IN_RANGE(VAL, MIN, MAX)                                         \
   EXPECT_GE((VAL), (MIN));                                                     \
   EXPECT_LE((VAL), (MAX))
@@ -1703,6 +1704,7 @@ TEST(blas_kernels, l2norm) {
   const int channel = 1;
   const int height = 768;
   const int width = 768;
+  const int size = batch * channel * height * width;
 
   const float alpha = 1e-1;
   const int MOD = 10;
@@ -1711,21 +1713,21 @@ TEST(blas_kernels, l2norm) {
     nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32};
 
   nntrainer::Tensor A_fp32(batch, channel, height, width, t_type_nchw_fp32);
-  nntrainer::Tensor B_fp32(batch, channel, height, width, t_type_nchw_fp32);
-
   GEN_TEST_INPUT(A_fp32, ((i * (batch * height * channel) +
-                           j * (batch * height) + k * (width) + l + 1) %
-                          MOD) *
-                           alpha);
+                           j * (batch * height) + 
+                           k * (width) + l + 1) 
+                           % MOD) *alpha);
 
-  GEN_TEST_INPUT(B_fp32, ((i * (batch * height * channel) +
-                           j * (batch * height) + k * (width) + l + 1) %
-                          MOD) *
-                           alpha);
-
+  double* B_fp32 = new double[size];
+  GEN_TEST_INPUT_DOUBLE(B_fp32, ((i * (batch * height * channel) +
+                                  j * (batch * height) + 
+                                  k * (width) + l + 1) 
+                                  % MOD) *alpha);
+  
   float gpu_result = nrm2Cl(A_fp32);
-  float cpu_result = B_fp32.l2norm();
-
+  float cpu_result = dnrm2(size, B_fp32, 1);
+  delete[] B_fp32;
+  
   EXPECT_FLOAT_EQ(gpu_result, cpu_result);
 }
 

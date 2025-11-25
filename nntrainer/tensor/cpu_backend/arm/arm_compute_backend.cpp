@@ -296,6 +296,14 @@ float snrm2(const unsigned int N, const float *X, const unsigned int incX) {
 #endif
 }
 
+double dnrm2(const unsigned int N, const double *X, const unsigned int incX) {
+#ifdef USE_BLAS
+  return __cblas_dnrm2(N, X, incX);
+#else
+  return __fallback_dnrm2(N, X, incX);
+#endif
+}
+
 void sgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
            const unsigned int M, const unsigned int N, const unsigned int K,
            const float alpha, const float *A, const unsigned int lda,

@@ -74,6 +74,13 @@ void __cblas_sscal(const unsigned int N, const float alpha, float *X,
 float __cblas_snrm2(const unsigned int N, const float *X,
                     const unsigned int incX);
 /**
+ * @brief     snrm2 computation : Euclidean norm
+ * @param[in] N number of elements in X
+ * @param[in] X double * for Vector X
+ */
+double __cblas_dnrm2(const unsigned int N, const double *X,
+                    const unsigned int incX);
+/**
  * @brief     sgemm computation  : Y = alpha*op(A)*op(B) + beta*C,
  * where op(X) is one of X or X**T
  * @param[in] TStorageOrder Row major / Col major

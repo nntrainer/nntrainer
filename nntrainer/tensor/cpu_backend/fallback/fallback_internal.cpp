@@ -67,6 +67,19 @@ float __fallback_snrm2(const unsigned int N, const float *X,
   return sqrt(sum);
 }
 
+double __fallback_dnrm2(const unsigned int N, const double *X,
+                       const unsigned int incX) {
+  assert(incX > 0);
+  double sum = 0.0f;
+  double tmp;
+
+  for (unsigned int i = 0; i < N; i++) {
+    tmp = X[i * incX];
+    sum += tmp * tmp;
+  }
+  return sqrt(sum);
+}
+
 void __fallback_copy_s16_fp32(const unsigned int N, const int16_t *X,
                               float *Y) {
   for (unsigned int i = 0; i < N; ++i) {
