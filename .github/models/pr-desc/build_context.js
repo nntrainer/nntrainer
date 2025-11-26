@@ -24,7 +24,7 @@ function clip(s, max) {
   return s.length <= max ? s : s.slice(0, max) + `\n\n[truncated ${s.length - max} chars]`;
 }
 
-// ---------- 0) 규칙 로딩 ----------
+// ---------- 0) Rule Loading ----------
 const rulesPath = '.github/models/pr-desc/rules.json';
 let rules = { modules: [], fallbackModule: 'Misc' };
 if (existsSync(rulesPath)) {
@@ -57,7 +57,7 @@ function bumpToken(token, weight = 1) {
   interestTokens.set(norm, (interestTokens.get(norm) || 0) + weight);
 }
 
-// ---------- 1) Overview / Modules 원문 문서 ----------
+// ---------- 1) Overview / Modules Source Documents ----------
 const ctxRoot = '.github/models/pr-desc/context';
 let overview = '';
 const overviewPath = join(ctxRoot, 'overview.md');
@@ -74,8 +74,8 @@ const commitSubjects = sh(`git log --pretty=%s ${base}..${head}`).split('\n').fi
 const commitBodiesRaw = sh(`git log --pretty=%B ${base}..${head}`);
 const commitBodies = commitBodiesRaw.split('\n\n').map(s => s.trim()).filter(Boolean).slice(0, 10).map(s => clip(s, 800));
 
-// name-status 파싱 (status, path[, path2])
-// M A D R100 old -> new 형태는 탭으로 분리
+// name-status parsing (status, path[, path2])
+// M A D R100 old -> new format is separated by tabs
 const changedFiles = [];
 if (nameStatusRaw) {
   for (const line of nameStatusRaw.split('\n')) {
@@ -96,7 +96,7 @@ if (nameStatusRaw) {
   }
 }
 
-// numstat 파싱 (added removed path[, path2])
+// numstat parsing (added removed path[, path2])
 const churnMap = new Map(); // key: path(to), value: {added, removed}
 if (numstatRaw) {
   for (const line of numstatRaw.split('\n')) {
@@ -105,7 +105,7 @@ if (numstatRaw) {
     if (parts.length < 3) continue;
     const added = parts[0] === '-' ? 0 : parseInt(parts[0], 10) || 0;
     const removed = parts[1] === '-' ? 0 : parseInt(parts[1], 10) || 0;
-    const pth = parts[2].includes('\t') ? parts[3] : parts[2]; // rename의 경우 path\tpath2
+    const pth = parts[2].includes('\t') ? parts[3] : parts[2]; // for rename path\tpath2
     const path = parts[3] || parts[2];
     churnMap.set(path, { added, removed });
   }
@@ -163,15 +163,15 @@ modulesDoc = clip(modulesDoc, 24000);
 
 
 function statusWeight(status) {
-  // Rxxx, Cxxx 등은 리네임/복사로 간주
+  // Rxxx, Cxxx, etc. are considered renames/copies
   if (status.startsWith('R') || status.startsWith('C')) return 2.0;
   if (status === 'D') return 2.5;
   if (status === 'A') return 1.5;
-  // 기본 M
+  // Default M
   return 1.0;
 }
 
-// ---------- 3) 모듈 그룹화 + 영향도 산출 ----------
+// ---------- 3) Module Grouping + Impact Calculation ----------
 const modulesAgg = new Map(); // name -> { files:[], score:0, weight, counts, lines }
 const unmatched = [];
 for (const f of changedFiles) {
@@ -200,12 +200,12 @@ for (const f of changedFiles) {
   if (f.status.startsWith('R') || f.status.startsWith('C')) agg.hasRename = true;
   if (f.status === 'D') agg.hasDelete = true;
 
-  // 점수 = (모듈 가중치) * (상태 가중치) * (규모 가중치)
-  const sizeFactor = Math.log10(1 + churn.added + churn.removed + 1); // 0~대략 4
+  // score = (module weight) * (status weight) * (size weight)
+  const sizeFactor = Math.log10(1 + churn.added + churn.removed + 1); // 0~approximately 4
   agg.score += cls.weight * statusWeight(f.status) * (1 + sizeFactor);
 }
 
-// 모듈별 최종 영향도 레벨 결정
+// Final impact level determination by module
 function levelFromScore(s) {
   if (s >= 30) return 'High';
   if (s >= 12) return 'Medium';
@@ -241,7 +241,7 @@ const apiSurfaceChanges = changedFiles.filter(f => headerOrConfig(f.path)).map(f
 const testFiles = changedFiles.filter(f => /(^|\/)(test|tests|testing|spec)\b|_test\.(cc|cpp|c|py|js|ts)$/.test(f.path)).map(f => f.path);
 const concurrencySensitive= changedFiles.filter(f => /(thread|mutex|atomic|lock|concurrent|parallel)/i.test(f.path)).map(f => f.path);
 
-// ---------- 4) Diff/Commits 텍스트 ----------
+// ---------- 4) Diff/Commits Text ----------
 const diff = clip(`### name-status\n${nameStatusRaw}\n\n### stat\n${statRaw}`, 8000);
 
 const buckets = { feat:0, fix:0, refactor:0, test:0, docs:0, chore:0, other:0 };
@@ -261,7 +261,7 @@ const commits =
  (commitSubjects.length ? `\n\nSamples:\n- ${commitSubjects.slice(0,5).join('\n- ')}` : '') +
  (commitBodies.length ? `\n\nCommit bodies (top, clipped):\n- ${commitBodies.join('\n- ')}` : '');
 
-// ---------- 5) 모듈 임팩트 요약 텍스트 (모델 힌트용) ----------
+// ---------- 5) Module Impact Summary Text (Model Hint) ----------
 let moduleImpactSummary = '';
 if (Object.keys(moduleImpact).length) {
   // 영향도 높은 순으로 상위 5개
@@ -273,7 +273,7 @@ if (Object.keys(moduleImpact).length) {
   ).join('\n');
 }
 
-// ---------- 6) 출력 ----------
+// ---------- 6) Output ----------
 const out = {
   overview: clip(overview, 8000),
   modules: modulesDoc,
