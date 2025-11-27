@@ -91,6 +91,7 @@ endif
 if get_option('enable-cuda')
   test_target += [['unittest_cuda', []]]
   test_target += [['unittest_cuda_addition', []]]
+  test_target += [['unittest_cuda_quantize', []]]
 endif
 
 if get_option('enable-fp16')
@@ -107,7 +108,7 @@ endif
 foreach target: test_target
   cuda_deps = []
   cuda_link_args = []
-  if target[0] == 'unittest_cuda' and get_option('enable-cuda')
+  if target[0].startswith('unittest_cuda') and get_option('enable-cuda')
     cuda_deps = [cuda_dep]
     cuda_link_args = ['-NODEFAULTLIB:LIBCMT', '-NOIMPLIB', '-NOEXP']
   endif
