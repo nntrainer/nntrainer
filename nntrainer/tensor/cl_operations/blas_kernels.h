@@ -119,6 +119,13 @@ void openvino_gemm_cl(void *input, void *weights, void *scales, void *output,
                       unsigned int quantization_group_size);
 
 /**
+ * @brief INT4 input quantization using quantize_input_int4_pad kernel
+ */
+void openvino_quantize_input_int4_pad(void *input, void *quantized_input, void *scales,
+                                      unsigned int M, unsigned int K,
+                                      unsigned int quantization_group_size);
+
+/**
  * @brief INT4 GEMM async computation
  */
 void openvino_gemm_async_cl(float *input, std::vector<void *> weights,

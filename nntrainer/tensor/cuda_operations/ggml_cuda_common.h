@@ -1,3 +1,9 @@
+/**
+ * @file ggml_cuda_common.h
+ * @brief Common definitions and structures for CUDA operations in GGML
+ * @author Samsung R&D Institute
+ * @bug No known bugs
+ */
 #pragma once
 
 #include <cstdint>

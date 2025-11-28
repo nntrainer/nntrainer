@@ -1,3 +1,9 @@
+/**
+ * @file ggml_quantize_cuda.h
+ * @brief Header file for CUDA quantization functions
+ * @author Samsung R&D Institute
+ * @bug No known bugs
+ */
 #pragma once
 
 #include "ggml_cuda_common.h"
@@ -5,6 +11,9 @@
 #include <cuda_runtime.h>
 
 // Struct for MMQ Q8_1 block (CUDA specific)
+/**
+ * @brief Structure for MMQ Q8_1 block (CUDA specific)
+ */
 struct block_q8_1_mmq {
   union {
     float d4[4];       // 1 32 bit scale per 32 values, stored as d0,d1,d2,d3

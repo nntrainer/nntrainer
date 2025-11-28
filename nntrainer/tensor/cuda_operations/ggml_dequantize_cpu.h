@@ -1,3 +1,9 @@
+/**
+ * @file ggml_dequantize_cpu.h
+ * @brief Header file for CPU dequantization functions
+ * @author Samsung R&D Institute
+ * @bug No known bugs
+ */
 #pragma once
 
 #include <cstdint>

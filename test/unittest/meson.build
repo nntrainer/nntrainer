@@ -84,8 +84,9 @@ if host_machine.system() != 'windows'
 endif
 
 if get_option('enable-opencl')
-  test_target += [['unittest_blas_kernels_cl', []]]
-  test_target += [['unittest_attention_kernels_cl', []]]
+  test_target += [['unittest_blas_kernels_cl', ['unittest_util.cpp']]]
+  test_target += [['unittest_attention_kernels_cl', ['unittest_util.cpp']]]
+  test_target += [['unittest_quantize_cl', ['unittest_util.cpp']]]
 endif
 
 if get_option('enable-cuda')

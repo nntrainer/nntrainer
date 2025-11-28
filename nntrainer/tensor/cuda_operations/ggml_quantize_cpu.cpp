@@ -1,3 +1,9 @@
+/**
+ * @file ggml_quantize_cpu.cpp
+ * @brief CPU implementation for quantizing GGML data
+ * @author Samsung R&D Institute
+ * @bug No known bugs
+ */
 #include "ggml_quantize_cpu.h"
 #include "ggml_cuda_common.h"
 
