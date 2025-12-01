@@ -10,6 +10,7 @@ optimizer_sources = [
   'lr_scheduler_step.cpp',
   'optimizer_wrapped.cpp',
   'adamw.cpp',
+  'lion.cpp',
 ]
 
 optimizer_headers = [

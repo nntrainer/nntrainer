@@ -35,6 +35,7 @@ class LearningRateScheduler;
 enum OptimizerType {
   ADAM = ML_TRAIN_OPTIMIZER_TYPE_ADAM,      /** adam */
   ADAMW = ML_TRAIN_OPTIMIZER_TYPE_ADAMW,    /** AdamW */
+  LION = ML_TRAIN_OPTIMIZER_TYPE_LION,      /** Lion */
   SGD = ML_TRAIN_OPTIMIZER_TYPE_SGD,        /** sgd */
   UNKNOWN = ML_TRAIN_OPTIMIZER_TYPE_UNKNOWN /** unknown */
 };
@@ -142,6 +143,14 @@ SGD(const std::vector<std::string> &properties = {}) {
 inline std::unique_ptr<Optimizer>
 AdamW(const std::vector<std::string> &properties = {}) {
   return createOptimizer(OptimizerType::ADAMW, properties);
+}
+
+/**
+ * @brief Helper function to create Lion Optimizer
+ */
+inline std::unique_ptr<Optimizer>
+Lion(const std::vector<std::string> &properties = {}) {
+  return createOptimizer(OptimizerType::LION, properties);
 }
 
 } // namespace optimizer
