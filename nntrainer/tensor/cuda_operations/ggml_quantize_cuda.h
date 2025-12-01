@@ -121,3 +121,25 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     return MMQ_Q8_1_DS_LAYOUT_D4;
   }
 }
+
+/**
+ * @brief Quantizes FP16 input to INT4 format with padding support (CUDA).
+ *
+ * This function quantizes FP16 input data to INT4 format in groups,
+ * matching the OpenCL openvino_quantize_input_int4_pad kernel behavior.
+ * Each group is quantized independently with its own scale factor.
+ *
+ * @param input Pointer to the input FP16 data array on the device.
+ * @param quantized_input Pointer to the output INT8 buffer on the device.
+ * @param scales Pointer to the output UINT16 (FP16) scales buffer on the
+ * device.
+ * @param M Number of rows in the input matrix.
+ * @param K Number of columns in the input matrix.
+ * @param quantization_group_size Size of each quantization group (typically
+ * 32).
+ * @param stream The CUDA stream to execute the kernel on (default: 0).
+ */
+void quantize_input_int4_pad_cuda(const void *input, void *quantized_input,
+                                  void *scales, unsigned int M, unsigned int K,
+                                  unsigned int quantization_group_size,
+                                  cudaStream_t stream = 0);

@@ -228,3 +228,101 @@ void quantize_mmq_q8_1_cuda(const float *x, void *vy, const ggml_type type_src0,
     break;
   }
 }
+
+// CUDA kernel for INT4 quantization with padding
+static __global__ void quantize_input_int4_pad_kernel(
+  const float *__restrict__ input, int8_t *__restrict__ quantized_input,
+  half *__restrict__ scales, unsigned int M, unsigned int K,
+  unsigned int quantization_group_size) {
+
+  const unsigned int group_id = blockIdx.x;
+  const unsigned int tid = threadIdx.x;
+
+  const unsigned int align_k =
+    ((K + quantization_group_size - 1) / quantization_group_size) *
+    quantization_group_size;
+  const unsigned int groups_in_row = align_k / quantization_group_size;
+  const unsigned int row_id = group_id / groups_in_row;
+  const unsigned int group_id_in_row = group_id % groups_in_row;
+  const unsigned int input_offset =
+    (row_id * K) + (group_id_in_row * quantization_group_size);
+  const unsigned int output_offset = group_id * quantization_group_size;
+  const unsigned int max_quantize_block = quantization_group_size;
+
+  unsigned int quantize_block;
+  if (group_id_in_row == groups_in_row - 1) {
+    quantize_block = quantization_group_size - (align_k - K);
+  } else {
+    quantize_block = quantization_group_size;
+  }
+
+  // Shared memory for reduction
+  __shared__ float shared_max[32];
+
+  // Find maximum absolute value
+  float local_max = 0.0f;
+  for (unsigned int i = tid; i < quantize_block; i += blockDim.x) {
+    unsigned int idx = input_offset + i;
+    float val = (idx < row_id * K + K)
+                  ? fabsf(__half2float(__float2half(input[idx])))
+                  : 0.0f;
+    local_max = fmaxf(local_max, val);
+  }
+
+  shared_max[tid] = local_max;
+
+  // Reduction in shared memory
+  for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + s]);
+    }
+  }
+
+  float max_value = fmaxf(shared_max[0], 0.001f);
+
+  // Calculate quantization scale
+  float quan_scale = max_value / 127.0f;
+  float quan_scale_1 = 1.0f / quan_scale;
+
+  // Quantize the data
+  for (unsigned int i = tid; i < quantize_block; i += blockDim.x) {
+    unsigned int input_idx = input_offset + i;
+    unsigned int output_idx = output_offset + i;
+    float val = (input_idx < row_id * K + K)
+                  ? __half2float(__float2half(input[input_idx]))
+                  : 0.0f;
+    float quantized_val = val * quan_scale_1;
+    quantized_input[output_idx] = (int8_t)__float2int_rn(quantized_val);
+  }
+
+  // Pad with zeros if necessary
+  for (unsigned int i = quantize_block + tid; i < max_quantize_block;
+       i += blockDim.x) {
+    unsigned int output_idx = output_offset + i;
+    quantized_input[output_idx] = 0;
+  }
+
+  // Store the scale (thread 0 only)
+  if (tid == 0) {
+    scales[group_id * 2] = __float2half(quan_scale);
+    scales[group_id * 2 + 1] = (__half)0.0f; // Placeholder for activation sum
+  }
+}
+
+void quantize_input_int4_pad_cuda(const void *input, void *quantized_input,
+                                  void *scales, unsigned int M, unsigned int K,
+                                  unsigned int quantization_group_size,
+                                  cudaStream_t stream) {
+  const unsigned int align_k =
+    ((K + quantization_group_size - 1) / quantization_group_size) *
+    quantization_group_size;
+  const unsigned int groups_in_row = align_k / quantization_group_size;
+  const unsigned int total_groups = M * groups_in_row;
+
+  const dim3 grid(total_groups);
+  const dim3 block(32);
+
+  quantize_input_int4_pad_kernel<<<grid, block, 0, stream>>>(
+    (const float *)input, (int8_t *)quantized_input, (half *)scales, M, K,
+    quantization_group_size);
+}

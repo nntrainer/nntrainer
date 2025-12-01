@@ -7,9 +7,9 @@
 #ifndef NNTRAINER_UNITTEST_UTIL_H
 #define NNTRAINER_UNITTEST_UTIL_H
 
-#include <vector>
 #include <cstddef>
 #include <random>
+#include <vector>
 
 namespace nntrainer {
 
@@ -36,6 +36,15 @@ void *allocateSVM(size_t size_bytes);
 
 // Release SVM memory.
 void freeSVM(void *ptr);
+
+// Helper for Round to Nearest Even (RTE)
+int8_t round_half_to_even(float x);
+
+// CPU reference implementation for INT4 quantization
+void cpu_quantize_input_int4_pad(float *input, int8_t *quantized_input,
+                                 uint16_t *scales, unsigned int M,
+                                 unsigned int K,
+                                 unsigned int quantization_group_size);
 
 } // namespace nntrainer
 

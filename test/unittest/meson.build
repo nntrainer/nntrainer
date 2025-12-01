@@ -92,7 +92,7 @@ endif
 if get_option('enable-cuda')
   test_target += [['unittest_cuda', []]]
   test_target += [['unittest_cuda_addition', []]]
-  test_target += [['unittest_cuda_quantize', []]]
+  test_target += [['unittest_cuda_quantize', ['unittest_util.cpp']]]
 endif
 
 if get_option('enable-fp16')
@@ -116,7 +116,7 @@ foreach target: test_target
   
   exe = executable(
     target[0],
-    [target[0] + '.cpp'] + [target[1]],
+    [target[0] + '.cpp'] + target[1],
     # below is temporary measure, we will eventually remove unittest_nntrainer_models
     include_directories: include_directories('models'),
     dependencies: unittest_nntrainer_deps + cuda_deps,
