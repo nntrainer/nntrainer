@@ -137,7 +137,8 @@ void Weight::applyGradient(double lr, Tensor &updated_grad) {
     quantizeWeight();
     return;
   } else {
-    return applyGradient(lr);
+    /** FP32 (or matching dtype) path: apply the provided updated_grad directly */
+    var->add_i(updated_grad, -lr);
   }
 }
 
