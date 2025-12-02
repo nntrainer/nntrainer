@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  *
- * @file   ernie_causallm.h
+ * @file   ernie_causallm.cpp
  * @brief  ernie 4.5 causallm header
  * @date   02 December 2025
  * @see    https://github.com/nnstreamer/nntrainer
- * @author Donghak Park <donghak.park.com>
+ * @author Donghak Park <donghak.park@samsung.com>
  * @bug    No known bugs except for NYI items
  */
 
