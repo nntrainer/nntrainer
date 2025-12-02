@@ -422,6 +422,27 @@ private:
    */
   void calcCommonDerivative(nntrainer::RunLayerContext &context);
 
+  /**
+   * @brief pre_compute frequencies for Rotary Embedding for ERNIE.
+   * @note it is expected to be called only once at the finalize.
+   * @param[in] head_dim dimension of head
+   * @param[in] seq_len sequence length
+   * @param[in] theta base of theta (default = 10000)
+   */
+  void precompute_freqs_ernie(int head_dim, unsigned int seq_len, float theta);
+
+  /**
+   * @brief     apply rotary embedding for ERNIE
+   * @param[in] in input tensor
+   * @param[out] out output tensor
+   * @param[in] dim hidden dim size
+   * @param[in] from sequence order
+   * @param[in] convert_only - conversion only
+   */
+  void apply_rotary_emb_tensor_ernie(nntrainer::Tensor &in,
+                                     nntrainer::Tensor &out, unsigned int dim,
+                                     unsigned int from, bool convert_only);
+
   size_t calc_attn_index(size_t i);
 
 }; // end of class MHACoreLayer

@@ -21,8 +21,15 @@
 
 namespace causallm {
 
+/**
+ * @class ErnieMoELayer
+ * @brief Mixture of Expert Layer for ERNIE 4.5
+ */
 class ErnieMoELayer : public nntrainer::LayerImpl {
 public:
+  /**
+   * @brief     Constructor of Mixture of Expert Layer
+   */
   ErnieMoELayer();
 
   /**

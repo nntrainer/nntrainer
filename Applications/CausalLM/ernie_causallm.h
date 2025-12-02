@@ -15,6 +15,10 @@
 
 namespace causallm {
 
+/**
+ * @class Ernie4_5_MoeForCausalLM
+ * @brief Mixture of Expert Layer for ERNIE 4.5
+ */
 class Ernie4_5_MoeForCausalLM : public CausalLM {
 public:
   static constexpr const char *architecture = "Ernie4_5_MoeForCausalLM";
@@ -77,8 +81,8 @@ private:
   unsigned int MOE_INTERMEDIATE_SIZE; /**< MoE intermediate size */
   float MOE_NORM_MIN;                 /**< MoE normalization minimum */
 
-  std::vector<std::string> LAYER_TYPES;  /**< Layer types */
-  float ATTENTION_ROPE_SCALING_FACTOR;   /**< Attention RoPE scaling factor */
+  std::vector<std::string> LAYER_TYPES; /**< Layer types */
+  float ATTENTION_ROPE_SCALING_FACTOR;  /**< Attention RoPE scaling factor */
 };
 
 } // namespace causallm
