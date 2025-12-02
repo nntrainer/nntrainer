@@ -22,7 +22,7 @@ causallm_layer_dependencies += [
     causallm_mha_core_dep,
     causallm_embedding_layer_dep,
     causallm_reshaped_rms_norm_dep,
-    causallm_qkv_layer_dep, 
+    causallm_qkv_layer_dep,
 ]
 
 subdir('models')

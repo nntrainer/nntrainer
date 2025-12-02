@@ -30,6 +30,7 @@
 #include <factory.h>
 
 #include "causal_lm.h"
+#include "ernie_causallm.h"
 #include "gemma3_causallm.h"
 #include "gptoss_cached_slim_causallm.h"
 #include "gptoss_causallm.h"
@@ -153,6 +154,13 @@ int main(int argc, char *argv[]) {
     "Gemma3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
                                                         nntr_cfg);
+    });
+
+  causallm::Factory::Instance().registerModel(
+    "Ernie4_5_MoeForCausalLM",
+    [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Ernie4_5_MoeForCausalLM>(
+        cfg, generation_cfg, nntr_cfg);
     });
 
   // Validate arguments
