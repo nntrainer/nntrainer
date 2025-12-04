@@ -39,6 +39,7 @@
 #include "qwen3_causallm.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
+#include "deepseek_v2_lite_causallm.h"
 #include <sys/resource.h>
 
 #include <atomic>
@@ -160,6 +161,13 @@ int main(int argc, char *argv[]) {
     "Ernie4_5_MoeForCausalLM",
     [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Ernie4_5_MoeForCausalLM>(
+        cfg, generation_cfg, nntr_cfg);
+    });
+
+  causallm::Factory::Instance().registerModel(
+    "DeepseekV2ForCausalLM",
+    [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::DeepseekV2ForCausalLM>(
         cfg, generation_cfg, nntr_cfg);
     });
 

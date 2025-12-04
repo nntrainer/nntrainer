@@ -83,7 +83,7 @@ public:
   /**
    * @copydoc Layer::getType()
    */
-  const std::string getType() const override { return ErnieMoELayer::type; };
+  const std::string getType() const override { return DeepseekMoELayer::type; };
 
   /**
    * @brief Layer::supportBackwarding()
@@ -99,7 +99,7 @@ public:
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
-  static constexpr const char *type = "ernie_moe"; /**< type of the layer */
+  static constexpr const char *type = "deepseek_moe"; /**< type of the layer */
 
 private:
   unsigned int num_experts;        /**< number of experts */

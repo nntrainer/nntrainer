@@ -15,8 +15,7 @@
 #include <llm_util.hpp>
 
 #include <deepseek_v2_lite_causallm.h>
-#include <ernie_moe_layer.h>
-
+#include <deepseek_moe_layer.h>
 
 namespace causallm {
 
@@ -58,7 +57,7 @@ DeepseekV2ForCausalLM::createMlp(const int layer_id, int dim, int hidden_dim,
 
   } else {
     layers.push_back(createLayer(
-      "ernie_moe",
+      "deepseek_moe",
       {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
        withKey("input_layers", input_name),
        withKey("unit", MOE_INTERMEDIATE_SIZE),
@@ -149,7 +148,7 @@ void DeepseekV2ForCausalLM::registerCustomLayers() {
 
   try {
     app_context->registerFactory(
-      nntrainer::createLayer<causallm::DeepSeekMoELayer>);
+      nntrainer::createLayer<causallm::DeepseekMoELayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
