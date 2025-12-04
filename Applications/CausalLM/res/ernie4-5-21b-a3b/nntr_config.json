@@ -1,0 +1,22 @@
+{
+    "model_tensor_type": "Q4_0-FP32",
+    "model_file_name": "ernie-21b-q6k-q40-x86.bin",
+
+    "lora_rank" : 0,
+    "lora_alpha" : 0,
+    "lora_target": [],
+
+    "fc_layer_dtype" : "Q4_0",
+    "embedding_dtype" : "Q6_K",
+    "lmhead_dtype" : "Q6_K",
+
+    "bad_word_ids": [],
+    "fsu": false,
+    "num_to_generate": 100,
+    "init_seq_len": 1024,
+    "max_seq_len": 2048,
+    "batch_size": 1,
+
+    "tokenizer_file": "/home/donghak/workspace/nntrainer/Applications/CausalLM/res/ernie-21b-a3b/tokenizer.json",
+    "sample_input": "Hi, i am"
+}

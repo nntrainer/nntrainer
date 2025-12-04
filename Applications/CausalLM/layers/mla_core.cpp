@@ -183,10 +183,14 @@ void MLACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     nntrainer::Tensor output_step = output.getSharedDataTensor(
       output_step_dim, batch * output.getDim().getFeatureLen(), true);
 
+    nntrainer::Tensor w_uv = context.getWeight(tensor_idx[AttentionParams::weight_uv]);
+    nntrainer::Tensor w_uk = context.getWeight(tensor_idx[AttentionParams::weight_uk]);
+
     one_batch_incremental_forwarding(
       batch, _from, from, to, query_step, latent_kv_step, key_rope_step,
       output_step, cache_c_kv, cache_k_pe, cache_c_kv.getDim(),
-      cache_c_kv_step_dim, cache_k_pe.getDim(), cache_k_pe_step_dim);
+      cache_c_kv_step_dim, cache_k_pe.getDim(), cache_k_pe_step_dim,
+      w_uv, w_uk);
   }
 }
 
@@ -195,10 +199,11 @@ void MLACoreLayer::one_batch_incremental_forwarding(
   const unsigned int to, nntrainer::Tensor &query_step,
   nntrainer::Tensor &latent_kv_step, nntrainer::Tensor &key_rope_step,
   nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_c_kv,
-  nntrainer::Tensor &cache_k_pe, ml::train::TensorDim &cache_c_kv_dim,
-  ml::train::TensorDim &cache_c_kv_step_dim,
-  ml::train::TensorDim &cache_k_pe_dim,
-  ml::train::TensorDim &cache_k_pe_step_dim) {
+  nntrainer::Tensor &cache_k_pe, const ml::train::TensorDim &cache_c_kv_dim,
+  const ml::train::TensorDim &cache_c_kv_step_dim,
+  const ml::train::TensorDim &cache_k_pe_dim,
+  const ml::train::TensorDim &cache_k_pe_step_dim,
+  const nntrainer::Tensor &w_uv, const nntrainer::Tensor &w_uk) {
 
   // 1. Update Caches
   nntrainer::Tensor b_cache_c_kv_step = cache_c_kv.getSharedDataTensor(
@@ -230,11 +235,9 @@ void MLACoreLayer::one_batch_incremental_forwarding(
   float *output_ptr = attention_output_step.getData<float>();
   
   // Weights
-  nntrainer::Tensor w_uv = context.getWeight(tensor_idx[AttentionParams::weight_uv]);
-  float *w_uv_ptr = w_uv.getData<float>();
-  
-  nntrainer::Tensor w_uk = context.getWeight(tensor_idx[AttentionParams::weight_uk]);
-  float *w_uk_ptr = w_uk.getData<float>();
+  // Weights
+  const float *w_uv_ptr = w_uv.getData<float>();
+  const float *w_uk_ptr = w_uk.getData<float>();
 
   unsigned int seq_len = to; // Total sequence length processed so far
   unsigned int q_head_dim = qk_nope_dim + qk_rope_dim;
@@ -318,7 +321,7 @@ void MLACoreLayer::one_batch_incremental_forwarding(
         
         for (unsigned int i = 0; i < qk_nope_dim; ++i) {
             float k_val = 0.0f;
-            float *w_uk_row = w_uk_ptr + (h * qk_nope_dim + i) * kv_lora_rank;
+            const float *w_uk_row = w_uk_ptr + (h * qk_nope_dim + i) * kv_lora_rank;
             for (unsigned int k = 0; k < kv_lora_rank; ++k) {
                 k_val += c_kv_t[k] * w_uk_row[k];
             }
@@ -387,7 +390,7 @@ void MLACoreLayer::one_batch_incremental_forwarding(
       for (unsigned int v = 0; v < v_head_dim; ++v) {
           float val = 0.0f;
           unsigned int row_idx = h * v_head_dim + v;
-          float *w_row = w_uv_ptr + row_idx * kv_lora_rank;
+          const float *w_row = w_uv_ptr + row_idx * kv_lora_rank;
           
           for (unsigned int k = 0; k < kv_lora_rank; ++k) {
               val += context_head[k] * w_row[k];
@@ -587,8 +590,9 @@ void MLACoreLayer::updateTensorsByInputDimensions(
   context.updateInput(INOUT_INDEX::KEY_ROPE, input_dimensions[INOUT_INDEX::KEY_ROPE]);
   
   // Update output dim
-  std::vector<nntrainer::TensorDim> output_dims = context.getOutputDimensions();
-  output_dims[0] = input_dims[0];
+  // Update output dim
+  std::vector<nntrainer::TensorDim> output_dims(1);
+  output_dims[0] = input_dimensions[0];
   size_t v_head_dim = (qk_nope_dim + qk_rope_dim);
   output_dims[0].width(num_heads_Q * v_head_dim);
   context.updateOutput(0, output_dims[0]);

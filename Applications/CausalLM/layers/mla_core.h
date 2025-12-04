@@ -363,10 +363,11 @@ private:
     const unsigned int to, nntrainer::Tensor &query_step,
     nntrainer::Tensor &latent_kv_step, nntrainer::Tensor &key_rope_step,
     nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_c_kv,
-    nntrainer::Tensor &cache_k_pe, ml::train::TensorDim &cache_c_kv_dim,
-    ml::train::TensorDim &cache_c_kv_step_dim,
-    ml::train::TensorDim &cache_k_pe_dim,
-    ml::train::TensorDim &cache_k_pe_step_dim);
+    nntrainer::Tensor &cache_k_pe, const ml::train::TensorDim &cache_c_kv_dim,
+    const ml::train::TensorDim &cache_c_kv_step_dim,
+    const ml::train::TensorDim &cache_k_pe_dim,
+    const ml::train::TensorDim &cache_k_pe_step_dim,
+    const nntrainer::Tensor &w_uv, const nntrainer::Tensor &w_uk);
 
   void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
                         unsigned int from, BS::thread_pool<> &pool);

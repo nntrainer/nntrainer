@@ -2,13 +2,17 @@
 
 - This application provides examples to run causal llm models using nntrainer.
 - This example only provides *inference* mode, not *training* mode yet.
-
+ 
 ## Supported models
 
-- Llama
-- Qwen3 (1.7b/4b/7b/14b)
-- Qwen3MoE (30b-A3b)
-- Gpt-Oss-20b 
+| Model | Model Param Size |
+| :--- | :--- |
+| **Llama** | - |
+| **Qwen3** | 0.6B, 1.7B, 4B, 7B, 14B |
+| **Qwen3MoE** | 30B-A3B |
+| **Gpt-Oss** | 20B, 120B |
+| **Ernie 4.5** | 21B-A3B |
+| **Deepseek V2 Lite** | 16B |
 - You can try your own model with custom layers! 
 - Feel free to contribute! 😊
 

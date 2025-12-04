@@ -76,6 +76,13 @@ private:
 
   std::vector<std::string> LAYER_TYPES; /**< Layer types */
   float ATTENTION_ROPE_SCALING_FACTOR;  /**< Attention RoPE scaling factor */
+
+  // MLA specific parameters
+  unsigned int Q_LORA_RANK;      /**< Q LoRA rank */
+  unsigned int KV_LORA_RANK;     /**< KV LoRA rank */
+  unsigned int QK_NOPE_HEAD_DIM; /**< QK non-RoPE head dimension */
+  unsigned int QK_ROPE_HEAD_DIM; /**< QK RoPE head dimension */
+  unsigned int V_HEAD_DIM;       /**< Value head dimension */
 };
 
 } // namespace causallm
