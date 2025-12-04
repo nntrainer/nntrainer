@@ -103,92 +103,92 @@ private:
   nntrainer::IniWrapper ini;
 };
 
-#define GEN_TEST_INPUT_NHWC(input, eqation_i_j_k_l) \
-  do {                                              \
-    for (int i = 0; i < batch; ++i) {               \
-      for (int j = 0; j < height; ++j) {            \
-        for (int k = 0; k < width; ++k) {           \
-          for (int l = 0; l < channel; ++l) {       \
-            float val = (eqation_i_j_k_l);          \
-            input.setValue(i, l, j, k, val);        \
-          }                                         \
-        }                                           \
-      }                                             \
-    }                                               \
+#define GEN_TEST_INPUT_NHWC(input, eqation_i_j_k_l)                            \
+  do {                                                                         \
+    for (int i = 0; i < batch; ++i) {                                          \
+      for (int j = 0; j < height; ++j) {                                       \
+        for (int k = 0; k < width; ++k) {                                      \
+          for (int l = 0; l < channel; ++l) {                                  \
+            float val = (eqation_i_j_k_l);                                     \
+            input.setValue(i, l, j, k, val);                                   \
+          }                                                                    \
+        }                                                                      \
+      }                                                                        \
+    }                                                                          \
   } while (0)
 
-#define GEN_TEST_INPUT(input, eqation_i_j_k_l) \
-  do {                                         \
-    for (int i = 0; i < batch; ++i) {          \
-      for (int j = 0; j < channel; ++j) {      \
-        for (int k = 0; k < height; ++k) {     \
-          for (int l = 0; l < width; ++l) {    \
-            float val = (eqation_i_j_k_l);     \
-            input.setValue(i, j, k, l, val);   \
-          }                                    \
-        }                                      \
-      }                                        \
-    }                                          \
+#define GEN_TEST_INPUT(input, eqation_i_j_k_l)                                 \
+  do {                                                                         \
+    for (int i = 0; i < batch; ++i) {                                          \
+      for (int j = 0; j < channel; ++j) {                                      \
+        for (int k = 0; k < height; ++k) {                                     \
+          for (int l = 0; l < width; ++l) {                                    \
+            float val = (eqation_i_j_k_l);                                     \
+            input.setValue(i, j, k, l, val);                                   \
+          }                                                                    \
+        }                                                                      \
+      }                                                                        \
+    }                                                                          \
   } while (0)
 
-#define GEN_TEST_INPUT_RAND(input, min, max)                       \
-  do {                                                             \
-    for (int i = 0; i < batch; ++i) {                              \
-      for (int j = 0; j < channel; ++j) {                          \
-        for (int k = 0; k < height; ++k) {                         \
-          for (int l = 0; l < width; ++l) {                        \
-            std::uniform_real_distribution<double> dist(min, max); \
-            std::default_random_engine gen((k + 1) * (l + 42));    \
-            float val = dist(gen);                                 \
-            input.setValue(i, j, k, l, val);                       \
-          }                                                        \
-        }                                                          \
-      }                                                            \
-    }                                                              \
+#define GEN_TEST_INPUT_RAND(input, min, max)                                   \
+  do {                                                                         \
+    for (int i = 0; i < batch; ++i) {                                          \
+      for (int j = 0; j < channel; ++j) {                                      \
+        for (int k = 0; k < height; ++k) {                                     \
+          for (int l = 0; l < width; ++l) {                                    \
+            std::uniform_real_distribution<double> dist(min, max);             \
+            std::default_random_engine gen((k + 1) * (l + 42));                \
+            float val = dist(gen);                                             \
+            input.setValue(i, j, k, l, val);                                   \
+          }                                                                    \
+        }                                                                      \
+      }                                                                        \
+    }                                                                          \
   } while (0)
 
-#define GEN_TEST_INPUT_RAND_B(input, min, max)                     \
-  do {                                                             \
-    for (int i = 0; i < batch; ++i) {                              \
-      for (int j = 0; j < channel; ++j) {                          \
-        for (int k = 0; k < height_b; ++k) {                       \
-          for (int l = 0; l < width_b; ++l) {                      \
-            std::uniform_real_distribution<double> dist(min, max); \
-            std::default_random_engine gen((k + 42) * (l + 1));    \
-            float val = dist(gen);                                 \
-            input.setValue(i, j, k, l, val);                       \
-          }                                                        \
-        }                                                          \
-      }                                                            \
-    }                                                              \
+#define GEN_TEST_INPUT_RAND_B(input, min, max)                                 \
+  do {                                                                         \
+    for (int i = 0; i < batch; ++i) {                                          \
+      for (int j = 0; j < channel; ++j) {                                      \
+        for (int k = 0; k < height_b; ++k) {                                   \
+          for (int l = 0; l < width_b; ++l) {                                  \
+            std::uniform_real_distribution<double> dist(min, max);             \
+            std::default_random_engine gen((k + 42) * (l + 1));                \
+            float val = dist(gen);                                             \
+            input.setValue(i, j, k, l, val);                                   \
+          }                                                                    \
+        }                                                                      \
+      }                                                                        \
+    }                                                                          \
   } while (0)
 
-#define GEN_TEST_INPUT_B(input, equation_i_j_k_l) \
-  do {                                            \
-    for (int i = 0; i < batch; ++i) {             \
-      for (int j = 0; j < channel; ++j) {         \
-        for (int k = 0; k < height_b; ++k) {      \
-          for (int l = 0; l < width_b; ++l) {     \
-            float val = (equation_i_j_k_l);       \
-            input.setValue(i, j, k, l, val);      \
-          }                                       \
-        }                                         \
-      }                                           \
-    }                                             \
+#define GEN_TEST_INPUT_B(input, equation_i_j_k_l)                              \
+  do {                                                                         \
+    for (int i = 0; i < batch; ++i) {                                          \
+      for (int j = 0; j < channel; ++j) {                                      \
+        for (int k = 0; k < height_b; ++k) {                                   \
+          for (int l = 0; l < width_b; ++l) {                                  \
+            float val = (equation_i_j_k_l);                                    \
+            input.setValue(i, j, k, l, val);                                   \
+          }                                                                    \
+        }                                                                      \
+      }                                                                        \
+    }                                                                          \
   } while (0)
 
-#define GEN_TEST_INPUT_C(input, equation_i_j_k_l) \
-  do {                                            \
-    for (int i = 0; i < batch_b; ++i) {           \
-      for (int j = 0; j < channel; ++j) {         \
-        for (int k = 0; k < height; ++k) {        \
-          for (int l = 0; l < width; ++l) {       \
-            float val = (equation_i_j_k_l);       \
-            input.setValue(i, j, k, l, val);      \
-          }                                       \
-        }                                         \
-      }                                           \
-    }                                             \
+#define GEN_TEST_INPUT_C(input, equation_i_j_k_l)                              \
+  do {                                                                         \
+    for (int i = 0; i < batch_b; ++i) {                                        \
+      for (int j = 0; j < channel; ++j) {                                      \
+        for (int k = 0; k < height; ++k) {                                     \
+          for (int l = 0; l < width; ++l) {                                    \
+            float val = (equation_i_j_k_l);                                    \
+            input.setValue(i, j, k, l, val);                                   \
+          }                                                                    \
+        }                                                                      \
+      }                                                                        \
+    }                                                                          \
   } while (0)
 
 /**
@@ -433,6 +433,140 @@ struct static_cast_func {
   T operator()(const T1 &x) const {
     return static_cast<T>(x);
   }
+};
+
+#define EXPECT_IN_RANGE(VAL, MIN, MAX)                                         \
+  EXPECT_GE((VAL), (MIN));                                                     \
+  EXPECT_LE((VAL), (MAX))
+
+#ifdef ENABLE_OPENCL
+#include <cl_context.h>
+#include <engine.h>
+
+inline void *allocateSVM(size_t size_bytes) {
+  auto *blas_cc = static_cast<nntrainer::ClContext *>(
+    nntrainer::Engine::Global().getRegisteredContext("gpu"));
+
+  void *ptr = blas_cc->context_inst_.createSVMRegion(size_bytes);
+
+  if (ptr == nullptr) {
+    throw std::runtime_error(
+      "Failed to allocated SVM for the OpenCL BLAS unit test.");
+  }
+
+  return ptr;
+}
+
+inline void freeSVM(void *ptr) {
+  auto *blas_cc = static_cast<nntrainer::ClContext *>(
+    nntrainer::Engine::Global().getRegisteredContext("gpu"));
+
+  blas_cc->context_inst_.releaseSVMRegion(ptr);
+  ptr = nullptr;
+}
+#endif
+
+/**
+ * @brief Helper function to generate random data
+ *
+ * @tparam T data type
+ * @tparam random_init True if want random
+ * @param size data length
+ * @param min_val minimum value
+ * @param max_val maximum value
+ * @return std::vector<T> random vector
+ */
+template <typename T, bool random_init = false>
+static inline std::vector<T>
+generate_random_vector(size_t size, float min_val = -1.F, float max_val = 1.F) {
+  std::random_device rd;
+  auto init_val = random_init ? rd() : 42;
+  std::mt19937 gen(init_val);
+  std::uniform_real_distribution<float> dist(min_val, max_val);
+  std::vector<T> vec(size);
+  for (auto &val : vec) {
+    val = static_cast<T>(dist(gen));
+  }
+  return vec;
+}
+
+static inline std::vector<float> generate_vector(const size_t size,
+                                                 float min_val, float max_val) {
+  const float step = (max_val - min_val) / (float)size;
+  float current_value = min_val;
+  std::vector<float> vec(size, 0.0f);
+
+  for (int i = 0; i < vec.size(); ++i) {
+    vec[i] = current_value;
+    current_value += step;
+  }
+
+  return vec;
+}
+
+static inline void printMatrixF(const char *name, float *data, int Y, int X) {
+  printf("%s :\n", name);
+  for (int y = 0; y < Y; y++) {
+    printf("[");
+    for (int x = 0; x < X; x++) {
+      std::cout << data[y * X + x] << " ";
+    }
+    printf("]\n");
+  }
+}
+
+static inline void printMatrixI(const char *name, float *data, int Y, int X) {
+  printf("%s :\n", name);
+  for (int y = 0; y < Y; y++) {
+    // printf("[");
+    for (int x = 0; x < X; x++) {
+      if (x % 10 == 0) {
+        printf("| ");
+      }
+      std::cout << (int)(0.5f + data[y * X + x]) << " ";
+    }
+    printf("\n");
+  }
+}
+
+static inline std::vector<float> generate_01_vector(const size_t size,
+                                                    const float ones_ratio) {
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_real_distribution<float> dist(0.0f, (float)size);
+  if (ones_ratio >= 1.0) {
+    std::vector<float> vec(size, 1.0f);
+    return vec;
+  } else {
+    std::vector<float> vec(size, 0.0f);
+    size_t ones_cnt = (size_t)(size * ones_ratio);
+    for (size_t i = 0; i < ones_cnt; i++) {
+      int pos = static_cast<int>(dist(gen));
+      vec[pos] = 1.0f;
+    }
+    return vec;
+  }
+}
+
+/**
+ * @brief Helper function to print data
+ *
+ * @param data
+ * @param size
+ * @param count
+ */
+template <typename T = float>
+static void debug_print_beg_end(const T *const data, const unsigned int size,
+                                const uint32_t count = 5) {
+  std::cout << "[";
+  for (unsigned int i = 0; i < count; ++i) {
+    std::cout << std::fixed << std::setprecision(3) << data[i] << " ";
+  }
+  std::cout << "][";
+  for (unsigned int i = size - count; i < size; ++i) {
+    std::cout << std::fixed << std::setprecision(3) << data[i] << " ";
+  }
+  std::cout << "]" << std::endl;
 };
 
 #endif /* __cplusplus */
