@@ -5,7 +5,8 @@ if nvcc.found()
   cuda_sources = [
     'rmsnorm_cuda.cu',
     'addition_cuda.cu',
-    'ggml_quantize_cuda.cu'
+    'ggml_quantize_cuda.cu',
+    'gemm_int4_cuda.cu'
   ]
 
   cuda_headers = [
@@ -15,7 +16,8 @@ if nvcc.found()
     'ggml_cuda_common.h',
     'ggml_quantize_cuda.h',
     'ggml_quantize_cpu.h',
-    'ggml_dequantize_cpu.h'
+    'ggml_dequantize_cpu.h',
+    'gemm_int4_cuda.h'
   ]
 
   kernel_objects = []
@@ -31,6 +33,7 @@ if nvcc.found()
 
   # Add cuda_interface.cpp to regular sources
   nntrainer_sources += meson.current_source_dir() / 'cuda_interface.cpp'
+  nntrainer_sources += meson.current_source_dir() / 'gemm_int4_cpu.cpp'
   nntrainer_sources += meson.current_source_dir() / 'ggml_quantize_cpu.cpp'
   nntrainer_sources += meson.current_source_dir() / 'ggml_dequantize_cpu.cpp'
 

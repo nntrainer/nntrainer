@@ -17,8 +17,10 @@
 #include <random>
 #include <vector>
 
+#if defined(ENABLE_OPENCL)
 #include "blas_kernels.h"
 #include "cl_context.h"
+#endif
 #include "engine.h"
 #include "fp16.h"
 #include "ggml_cuda_common.h"
@@ -376,7 +378,7 @@ run_int4_quantize_input_test_cuda_(const unsigned int M, const unsigned int K,
   // CPU quantization
   std::vector<int8_t> ref_quantized_input(M * K);
   std::vector<uint16_t> ref_scales(total_groups * 2);
-  nntrainer::cpu_quantize_input_int4_pad(
+  nntrainer::cpu_quantize_input_int8_pad(
     input_host.data(), ref_quantized_input.data(), ref_scales.data(), M, K,
     quantization_group_size);
 
@@ -407,14 +409,14 @@ run_int4_quantize_input_test_cuda_(const unsigned int M, const unsigned int K,
   for (int iter = 0; iter < 10; ++iter) {
     if (iter == 0) {
       // First iteration - no timing
-      quantize_input_int4_pad_cuda(d_input, d_quantized_input, d_scales, M, K,
+      quantize_input_int8_pad_cuda(d_input, d_quantized_input, d_scales, M, K,
                                    quantization_group_size, stream);
       CUDA_CHECK(cudaStreamSynchronize(stream));
     } else {
       // Measured iterations
       CUDA_CHECK(cudaEventRecord(start, stream));
 
-      quantize_input_int4_pad_cuda(d_input, d_quantized_input, d_scales, M, K,
+      quantize_input_int8_pad_cuda(d_input, d_quantized_input, d_scales, M, K,
                                    quantization_group_size, stream);
 
       CUDA_CHECK(cudaEventRecord(stop, stream));
@@ -587,14 +589,14 @@ TEST(nntrainer_CUDA_Quantize, int4_quantize_input_pad_cuda_performance) {
   for (int iter = 0; iter < num_iterations; ++iter) {
     if (iter == 0) {
       // Warm-up iteration (not measured)
-      quantize_input_int4_pad_cuda(d_input, d_quantized_input, d_scales, M, K,
+      quantize_input_int8_pad_cuda(d_input, d_quantized_input, d_scales, M, K,
                                    quantization_group_size, stream);
       CUDA_CHECK(cudaStreamSynchronize(stream));
     } else {
       // Measured iterations
       CUDA_CHECK(cudaEventRecord(start, stream));
 
-      quantize_input_int4_pad_cuda(d_input, d_quantized_input, d_scales, M, K,
+      quantize_input_int8_pad_cuda(d_input, d_quantized_input, d_scales, M, K,
                                    quantization_group_size, stream);
 
       CUDA_CHECK(cudaEventRecord(stop, stream));
@@ -704,7 +706,7 @@ run_cuda_vs_openvino_quantize_test(const unsigned int M, const unsigned int K,
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreate(&stream));
 
-  quantize_input_int4_pad_cuda(d_input, d_quantized, d_scales, M, K,
+  quantize_input_int8_pad_cuda(d_input, d_quantized, d_scales, M, K,
                                quantization_group_size, stream);
   CUDA_CHECK(cudaStreamSynchronize(stream));
 

@@ -139,7 +139,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
  * 32).
  * @param stream The CUDA stream to execute the kernel on (default: 0).
  */
-void quantize_input_int4_pad_cuda(const void *input, void *quantized_input,
+void quantize_input_int8_pad_cuda(const void *input, void *quantized_input,
                                   void *scales, unsigned int M, unsigned int K,
                                   unsigned int quantization_group_size,
                                   cudaStream_t stream = 0);

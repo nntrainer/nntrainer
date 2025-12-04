@@ -62,7 +62,7 @@ static void run_int4_quantize_input_test_(const uint32_t M, const uint32_t K,
   std::vector<int8_t> ref_quantized_input(M * K);
   // Ref scales size is doubled
   std::vector<uint16_t> ref_scales(M * K / scale_group_size * 2);
-  cpu_quantize_input_int4_pad(input.data(), ref_quantized_input.data(),
+  cpu_quantize_input_int8_pad(input.data(), ref_quantized_input.data(),
                               ref_scales.data(), M, K, scale_group_size);
 
   // GPU INT4 input quantization

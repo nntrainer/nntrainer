@@ -309,7 +309,7 @@ static __global__ void quantize_input_int4_pad_kernel(
   }
 }
 
-void quantize_input_int4_pad_cuda(const void *input, void *quantized_input,
+void quantize_input_int8_pad_cuda(const void *input, void *quantized_input,
                                   void *scales, unsigned int M, unsigned int K,
                                   unsigned int quantization_group_size,
                                   cudaStream_t stream) {
