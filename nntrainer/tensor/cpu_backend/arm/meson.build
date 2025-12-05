@@ -20,6 +20,7 @@ if get_option('enable-fp16')
   arm_compute_backend_sources += 'arm_compute_backend_fp16.cpp'
   arm_compute_backend_sources += 'neon_impl_fp16.cpp'
   arm_compute_backend_sources += 'neon_kleidiai.cpp'
+  arm_compute_backend_sources += 'kleidiai_qsi8d32p.cpp'
   arm_compute_backend_headers += 'neon_kleidiai.h'
 
   subdir('hgemm')

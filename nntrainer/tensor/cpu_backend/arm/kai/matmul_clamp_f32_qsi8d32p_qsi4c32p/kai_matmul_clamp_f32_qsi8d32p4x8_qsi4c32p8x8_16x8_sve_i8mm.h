@@ -1,3 +1,13 @@
+/**
+ * @file kai_matmul_clamp_f32_qsi8d32p4x8_qsi4c32p8x8_16x8_sve_i8mm.h
+ * @date   5 December 2025
+ * @see    https://github.com/ARM-software/kleidiai
+ * @author Sungsik Kong <ss.kong@samsung.com>
+ * @bug    No known bugs except for NYI items
+ * @brief  kai_matmul_clamp_f32_qsi8d32p4x8_qsi4c32p8x8_16x8_sve_i8mm.h
+ * copied from kleidiai
+ *
+ */
 //
 // SPDX-FileCopyrightText: Copyright 2025 Arm Limited and/or its affiliates <open-source-office@arm.com>
 //
