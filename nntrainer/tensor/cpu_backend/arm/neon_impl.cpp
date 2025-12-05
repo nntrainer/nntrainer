@@ -27,6 +27,7 @@
 #ifdef ARMV7
 #include <armv7_neon.h>
 #endif
+#include "nntr_ggml_impl_common.h"
 #include <fallback_internal.h>
 #include <util_func.h>
 
@@ -1336,6 +1337,172 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
       // This matches most framework "pass-through NaN" behavior.
       output[k] =
         (v < lower_bound) ? lower_bound : ((v > upper_bound) ? upper_bound : v);
+    }
+  }
+}
+
+/**
+ * @brief Highly optimized version - processes 4 rows simultaneously
+ * and writes directly to output block, eliminating intermediate copies.
+ * Uses 128-bit NEON operations and prefetching for maximum throughput.
+ */
+inline static void neon_transform_4rows_to_q4_0x4(
+  const uint8_t *__restrict row0_ptr, const uint8_t *__restrict row1_ptr,
+  const uint8_t *__restrict row2_ptr, const uint8_t *__restrict row3_ptr,
+  uint16_t scale0, uint16_t scale1, uint16_t scale2, uint16_t scale3,
+  block_q4_0x4 *__restrict out) {
+
+  // Prefetch next cache lines
+#ifndef _MSC_VER
+  __builtin_prefetch(row0_ptr + 64, 0, 3);
+  __builtin_prefetch(row1_ptr + 64, 0, 3);
+  __builtin_prefetch(row2_ptr + 64, 0, 3);
+  __builtin_prefetch(row3_ptr + 64, 0, 3);
+#endif
+
+  // Store scales directly
+  out->d[0] = scale0;
+  out->d[1] = scale1;
+  out->d[2] = scale2;
+  out->d[3] = scale3;
+
+  // Load 16 bytes from each row (strided by 32 bytes in source)
+  // For each row: load bytes at offsets 0, 32, 64, ..., 480 (16 values)
+  uint8_t r0[16], r1[16], r2[16], r3[16];
+
+  // Gather 16 bytes per row with stride 32
+  for (int j = 0; j < 16; j++) {
+    r0[j] = row0_ptr[j * 32];
+    r1[j] = row1_ptr[j * 32];
+    r2[j] = row2_ptr[j * 32];
+    r3[j] = row3_ptr[j * 32];
+  }
+
+  // Process all 4 rows with NEON
+  const uint8x8_t mask = vdup_n_u8(0x0F);
+
+  // Row 0
+  {
+    uint8x8_t lo = vld1_u8(r0);
+    uint8x8_t hi = vld1_u8(r0 + 8);
+    uint8x8_t v0 = vand_u8(lo, mask);
+    uint8x8_t v1 = vshr_n_u8(lo, 4);
+    uint8x8_t v2 = vand_u8(hi, mask);
+    uint8x8_t v3 = vshr_n_u8(hi, 4);
+    uint8x8_t even = vorr_u8(v0, vshl_n_u8(v2, 4));
+    uint8x8_t odd = vorr_u8(v1, vshl_n_u8(v3, 4));
+    uint8x8x2_t zip = vzip_u8(even, odd);
+    // First half goes to qs[0..7], second half to qs[32..39]
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[0]), zip.val[0]);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[32]), zip.val[1]);
+  }
+
+  // Row 1
+  {
+    uint8x8_t lo = vld1_u8(r1);
+    uint8x8_t hi = vld1_u8(r1 + 8);
+    uint8x8_t v0 = vand_u8(lo, mask);
+    uint8x8_t v1 = vshr_n_u8(lo, 4);
+    uint8x8_t v2 = vand_u8(hi, mask);
+    uint8x8_t v3 = vshr_n_u8(hi, 4);
+    uint8x8_t even = vorr_u8(v0, vshl_n_u8(v2, 4));
+    uint8x8_t odd = vorr_u8(v1, vshl_n_u8(v3, 4));
+    uint8x8x2_t zip = vzip_u8(even, odd);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[8]), zip.val[0]);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[40]), zip.val[1]);
+  }
+
+  // Row 2
+  {
+    uint8x8_t lo = vld1_u8(r2);
+    uint8x8_t hi = vld1_u8(r2 + 8);
+    uint8x8_t v0 = vand_u8(lo, mask);
+    uint8x8_t v1 = vshr_n_u8(lo, 4);
+    uint8x8_t v2 = vand_u8(hi, mask);
+    uint8x8_t v3 = vshr_n_u8(hi, 4);
+    uint8x8_t even = vorr_u8(v0, vshl_n_u8(v2, 4));
+    uint8x8_t odd = vorr_u8(v1, vshl_n_u8(v3, 4));
+    uint8x8x2_t zip = vzip_u8(even, odd);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[16]), zip.val[0]);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[48]), zip.val[1]);
+  }
+
+  // Row 3
+  {
+    uint8x8_t lo = vld1_u8(r3);
+    uint8x8_t hi = vld1_u8(r3 + 8);
+    uint8x8_t v0 = vand_u8(lo, mask);
+    uint8x8_t v1 = vshr_n_u8(lo, 4);
+    uint8x8_t v2 = vand_u8(hi, mask);
+    uint8x8_t v3 = vshr_n_u8(hi, 4);
+    uint8x8_t even = vorr_u8(v0, vshl_n_u8(v2, 4));
+    uint8x8_t odd = vorr_u8(v1, vshl_n_u8(v3, 4));
+    uint8x8x2_t zip = vzip_u8(even, odd);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[24]), zip.val[0]);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[56]), zip.val[1]);
+  }
+}
+
+void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
+                                         const uint8_t *osv32_weights,
+                                         const uint16_t *osv32_scales,
+                                         size_t scale_group_size,
+                                         void *dst_q4_0x4) {
+  NNTR_THROW_IF((!(scale_group_size == 32 || scale_group_size == 64 ||
+                   scale_group_size == 128)),
+                std::invalid_argument)
+    << "Scale group size must be 32/64/128";
+  NNTR_THROW_IF(K % QK4_0 != 0, std::invalid_argument)
+    << "K size must be divisible by QK4_0 (32)";
+  NNTR_THROW_IF(N % 4 != 0, std::invalid_argument)
+    << "N size must be divisible by 4";
+  constexpr size_t ROW_BLOCK_SIZE = 32;
+  constexpr size_t Q4_0X_BLOCK_SIZE = 4;
+
+  const size_t rows_count_pad = align(N, ROW_BLOCK_SIZE);
+  const size_t columns_count_pad = align(K, ROW_BLOCK_SIZE);
+  const size_t column_blocks_count = columns_count_pad / 2;
+  const size_t bytes_per_row_block_span = column_blocks_count * ROW_BLOCK_SIZE;
+  const size_t num_blocks_per_row = K / QK4_0;
+
+  block_q4_0x4 *dst_ptr = reinterpret_cast<block_q4_0x4 *>(dst_q4_0x4);
+
+#pragma omp parallel for schedule(static)
+  for (long long row_id = 0; row_id < static_cast<long long>(N);
+       row_id += Q4_0X_BLOCK_SIZE) {
+    const size_t row_block_id = row_id / ROW_BLOCK_SIZE;
+    const size_t i_in_block = row_id % ROW_BLOCK_SIZE;
+    const size_t row_base =
+      row_block_id * bytes_per_row_block_span + i_in_block;
+
+    // Output pointer for this row group
+    block_q4_0x4 *out =
+      dst_ptr + (row_id / Q4_0X_BLOCK_SIZE) * num_blocks_per_row;
+
+    // Precompute row pointers for fast inner loop
+    const uint8_t *row0_base = osv32_weights + row_base;
+    const uint8_t *row1_base = osv32_weights + row_base + 1;
+    const uint8_t *row2_base = osv32_weights + row_base + 2;
+    const uint8_t *row3_base = osv32_weights + row_base + 3;
+
+    for (size_t col_idx = 0; col_idx < K; col_idx += QK4_0) {
+      // Calculate weight offset: (col_idx / 2) * 32 = col_idx * 16
+      const size_t weight_offset = (col_idx / 2) * ROW_BLOCK_SIZE;
+
+      // Get scales for all 4 rows
+      const size_t scale_col = col_idx / scale_group_size;
+      const size_t scale_base = scale_col * rows_count_pad;
+      uint16_t s0 = osv32_scales[row_id + 0 + scale_base];
+      uint16_t s1 = osv32_scales[row_id + 1 + scale_base];
+      uint16_t s2 = osv32_scales[row_id + 2 + scale_base];
+      uint16_t s3 = osv32_scales[row_id + 3 + scale_base];
+
+      // Transform 4 rows directly to output
+      neon_transform_4rows_to_q4_0x4(
+        row0_base + weight_offset, row1_base + weight_offset,
+        row2_base + weight_offset, row3_base + weight_offset, s0, s1, s2, s3,
+        out);
+      out++;
     }
   }
 }

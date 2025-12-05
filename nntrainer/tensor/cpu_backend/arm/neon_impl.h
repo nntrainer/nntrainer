@@ -773,6 +773,22 @@ void clamp(const T *input, T *output, size_t length,
            T lower_bound = std::numeric_limits<T>::lowest(),
            T upper_bound = std::numeric_limits<T>::max());
 
+/**
+ * @brief Transforms data from in-memory layout osv32_isv2 to block_q4_0x4
+ * in-memory layout with ARM NEON optimization and OpenMP parallelization.
+ * @param N number of rows
+ * @param K number of columns
+ * @param osv32_weights uint8_t* data of weights in osv32_isv2 layout
+ * @param osv32_scales fp16* scales
+ * @param scale_group_size group size (32 or 64 or 128)
+ * @param dst_q4_0x4 void * output data in block_q4_0x4 layout
+ */
+void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
+                                         const uint8_t *osv32_weights,
+                                         const uint16_t *osv32_scales,
+                                         size_t scale_group_size,
+                                         void *dst_q4_0x4);
+
 /// @note The structure should later be neon_impl_aarch64 and neon_impl_armv7l
 #if defined(__aarch64__) || defined(_M_ARM64)
 /**
