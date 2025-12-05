@@ -1255,9 +1255,11 @@ void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight);
  * @param scale_group_size group size (32 or 64 or 128)
  * @param dst_q4_0x void * output data in block_q4_0x8 or block_q4_0x4 layout
  */
-void transform_q4_0x_from_int4(size_t N, size_t K, const uint8_t *osv32_weights,
-                               const uint16_t *osv32_scales,
-                               size_t scale_group_size, void *dst_q4_0x);
+void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
+                                       const uint8_t *osv32_weights,
+                                       const uint16_t *osv32_scales,
+                                       size_t scale_group_size,
+                                       void *dst_q4_0x);
 
 } /* namespace nntrainer */
 #endif /* __cplusplus */

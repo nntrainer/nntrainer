@@ -297,6 +297,23 @@ void copy_f32_f16(unsigned int N, const float *input, uint16_t *output);
  */
 void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight);
 
+/**
+ * @brief Transform data from in-memory layout osv32_isv2 to block_q4_0x8
+ * in-memory layout.
+ *
+ * @param N number of rows
+ * @param K number of columns
+ * @param osv32_weights uint8_t* data of weights in osv32_isv2 layout
+ * @param osv32_scales fp16* scales
+ * @param scale_group_size group size (32 or 64 or 128)
+ * @param dst_q4_0x void * output data in block_q4_0x8 or block_q4_0x4 layout
+ */
+void transform_int4_osv32_isv2_to_q4_0x8(size_t N, size_t K,
+                                         const uint8_t *osv32_weights,
+                                         const uint16_t *osv32_scales,
+                                         size_t scale_group_size,
+                                         void *dst_q4_0x);
+
 } // namespace nntrainer::avx2
 
 #endif /* __cplusplus */

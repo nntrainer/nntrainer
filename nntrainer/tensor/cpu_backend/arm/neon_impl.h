@@ -593,6 +593,13 @@ void custom_scopy(const unsigned int N, const float *X, const int incX,
 void copy_int4_to_fp32(const unsigned int N, const uint8_t *X, float *Y);
 
 /**
+ * @brief     Create Q4_0 weights from int4 weights using NEON optimization
+ * @param[in] int4_weight uint8_t* input int4 weights (16 bytes)
+ * @param[out] q4_0_weight uint8_t* output Q4_0 weights (16 bytes)
+ */
+void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight);
+
+/**
  * @brief     sine with neon: Y = sin(alpha * X)
  * @param[in] N number of elements in X
  * @param[in] X float * for Vector X
@@ -788,6 +795,11 @@ void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
                                          const uint16_t *osv32_scales,
                                          size_t scale_group_size,
                                          void *dst_q4_0x4);
+void transform_int4_osv32_isv2_to_q4_0x4_old(size_t N, size_t K,
+                                             const uint8_t *osv32_weights,
+                                             const uint16_t *osv32_scales,
+                                             size_t scale_group_size,
+                                             void *dst_q4_0x4);
 
 /// @note The structure should later be neon_impl_aarch64 and neon_impl_armv7l
 #if defined(__aarch64__) || defined(_M_ARM64)

@@ -18,10 +18,6 @@
 #include "q4_0_utils.h"
 #include "util_func.h"
 
-#ifdef __AVX2__
-#include <immintrin.h>
-#endif
-
 namespace nntrainer {
 
 void Q4_0Utils::unpackOneBlockQ4_0x4(const block_q4_0x4 *in, block_q4_0 *dst) {
