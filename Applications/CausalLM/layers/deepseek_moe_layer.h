@@ -105,10 +105,12 @@ private:
   unsigned int num_experts;        /**< number of experts */
   unsigned int num_shared_experts; /**< number of shared experts */
   unsigned int topk;             /**< number of experts per token, i.e., topk */
+  unsigned int num_group_experts; /**< number of group experts */
   nntrainer::ActiFunc acti_func; /**< activation function for the expert */
   std::tuple<props::NumExperts, props::NumExpertsPerToken,
              nntrainer::props::Unit, props::MoEActivation,
-             props::NumSharedExperts, props::MoENormMin>
+             props::NumSharedExperts, props::MoENormMin, props::NumGroupExperts,
+             props::NormTopKProb>
     moe_props;
 
   // weight indices

@@ -85,6 +85,24 @@ public:
 };
 
 /**
+ * @brief NumGroupExperts, Number of group experts property
+ */
+class NumGroupExperts : public nntrainer::Property<unsigned int> {
+public:
+  static constexpr const char *key = "num_group_experts";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+/**
+ * @brief NormTopKProb, Normalize top-k probabilities property
+ */
+class NormTopKProb : public nntrainer::Property<bool> {
+public:
+  static constexpr const char *key = "norm_topk_prob";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+/**
  * @brief unit property, unit is used to measure how many weights are there
  *
  */

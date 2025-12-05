@@ -4,11 +4,6 @@
   ],
   "attention_bias": false,
   "attention_dropout": 0.0,
-  "auto_map": {
-    "AutoConfig": "configuration_deepseek.DeepseekV2Config",
-    "AutoModel": "modeling_deepseek.DeepseekV2Model",
-    "AutoModelForCausalLM": "modeling_deepseek.DeepseekV2ForCausalLM"
-  },
   "aux_loss_alpha": 0.001,
   "bos_token_id": 100000,
   "eos_token_id": 100001,

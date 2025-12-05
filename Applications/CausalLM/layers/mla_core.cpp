@@ -100,6 +100,14 @@ void MLACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     cache_k_pe_dim, "cache_k_pe", nntrainer::Initializer::NONE, false,
     nntrainer::TensorLifespan::MAX_LIFESPAN);
 
+  ml::train::TensorDim w_uk_dim(
+    {1, 1, num_heads_Q * qk_nope_dim, kv_lora_rank},
+    {context.getFormat(), context.getActivationDataType()});
+
+  tensor_idx[AttentionParams::weight_uk] = context.requestWeight(
+    w_uk_dim, nntrainer::Initializer::XAVIER_UNIFORM,
+    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "w_uk");
+
   size_t v_head_dim = (qk_nope_dim + qk_rope_dim);
   
   ml::train::TensorDim w_uv_dim(
@@ -109,14 +117,6 @@ void MLACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   tensor_idx[AttentionParams::weight_uv] = context.requestWeight(
     w_uv_dim, nntrainer::Initializer::XAVIER_UNIFORM,
     nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "w_uv");
-
-  ml::train::TensorDim w_uk_dim(
-    {1, 1, num_heads_Q * qk_nope_dim, kv_lora_rank},
-    {context.getFormat(), context.getActivationDataType()});
-
-  tensor_idx[AttentionParams::weight_uk] = context.requestWeight(
-    w_uk_dim, nntrainer::Initializer::XAVIER_UNIFORM,
-    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "w_uk");
 
   if (freqs_cos == nullptr)
     precompute_freqs(qk_rope_dim, max_position_embeddings, theta);

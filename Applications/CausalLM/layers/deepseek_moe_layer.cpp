@@ -20,9 +20,11 @@ DeepseekMoELayer::DeepseekMoELayer() :
   num_experts(0),
   num_shared_experts(0),
   topk(0),
+  num_group_experts(0),
   moe_props(props::NumExperts(), props::NumExpertsPerToken(),
             nntrainer::props::Unit(), props::MoEActivation(),
-            props::NumSharedExperts(), props::MoENormMin()),
+            props::NumSharedExperts(), props::MoENormMin(),
+            props::NumGroupExperts(), props::NormTopKProb()),
   expert_gate_proj_indices({}),
   expert_up_proj_indices({}),
   expert_down_proj_indices({}),
@@ -58,10 +60,18 @@ void DeepseekMoELayer::finalize(nntrainer::InitLayerContext &context) {
   num_experts = std::get<props::NumExperts>(moe_props).get();
   num_shared_experts = std::get<props::NumSharedExperts>(moe_props).get();
   topk = std::get<props::NumExpertsPerToken>(moe_props).get();
+  num_group_experts = std::get<props::NumGroupExperts>(moe_props).get();
+  if (num_group_experts == 0) {
+    num_group_experts = 1; // Default to 1 if not set
+    std::get<props::NumGroupExperts>(moe_props).set(num_group_experts);
+  }
   float moe_norm_min = std::get<props::MoENormMin>(moe_props).get();
   if (moe_norm_min == 0.0f) {
     moe_norm_min = 1e-12f; // Default value if not set
     std::get<props::MoENormMin>(moe_props).set(moe_norm_min);
+  }
+  if (std::get<props::NormTopKProb>(moe_props).empty()) {
+    std::get<props::NormTopKProb>(moe_props).set(true); // Default to true
   }
   const unsigned int intermediate_size =
     std::get<nntrainer::props::Unit>(moe_props).get();
@@ -92,22 +102,7 @@ void DeepseekMoELayer::finalize(nntrainer::InitLayerContext &context) {
     gate_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "gate", true);
 
-  // 4-1. Initialize e_score_correction_bias
-  nntrainer::TensorDim e_score_correction_bias_dim(
-    1, 1, 1, num_experts,
-    nntrainer::TensorDim::TensorType(context.getFormat(),
-                                     nntrainer::TensorDim::DataType::FP32),
-    is_nchw ? 0b0011 : 0b0101);
-
-  e_score_correction_bias_idx = context.requestWeight(
-    e_score_correction_bias_dim, weight_initializer, weight_regularizer,
-    weight_regularizer_constant, weight_decay, "moe_statics", false);
-
-  // 5. Initializer expert weights
-  expert_gate_proj_indices.reserve(num_experts);
-  expert_up_proj_indices.reserve(num_experts);
-  expert_down_proj_indices.reserve(num_experts);
-
+  // 5-1. Initialize shared expert weights
   if (num_shared_experts > 0) {
     nntrainer::TensorDim shared_expert_gate_dim(
       1, is_nchw ? 1 : num_shared_experts * intermediate_size,
@@ -137,6 +132,11 @@ void DeepseekMoELayer::finalize(nntrainer::InitLayerContext &context) {
       shared_expert_down_dim, weight_initializer, weight_regularizer,
       weight_regularizer_constant, weight_decay, "shared_experts_down", false);
   }
+
+  // 5. Initializer expert weights
+  expert_gate_proj_indices.reserve(num_experts);
+  expert_up_proj_indices.reserve(num_experts);
+  expert_down_proj_indices.reserve(num_experts);
 
   nntrainer::TensorDim expert_gate_dim(
     1, is_nchw ? 1 : intermediate_size, is_nchw ? hidden_size : 1,
@@ -171,8 +171,6 @@ void DeepseekMoELayer::finalize(nntrainer::InitLayerContext &context) {
     need_load.push_back(true);
   }
 
-  // 5-1. Initialize shared expert weights
-
   // 6. Request intermediate tensors
   const unsigned batch_size = in_dim.batch();
   const unsigned seq_len = in_dim.height();
@@ -192,7 +190,7 @@ void DeepseekMoELayer::finalize(nntrainer::InitLayerContext &context) {
 }
 
 void DeepseekMoELayer::forwarding(nntrainer::RunLayerContext &context,
-                               bool training) {}
+                                  bool training) {}
 
 inline void DeepseekMoELayer::compute_expert_forward(
   const nntrainer::Tensor &input, nntrainer::Tensor &output,
@@ -285,9 +283,9 @@ inline void DeepseekMoELayer::compute_expert_forward(
   }
 }
 
-void DeepseekMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                           unsigned int from, unsigned int to,
-                                           bool training) {
+void DeepseekMoELayer::incremental_forwarding(
+  nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
+  bool training) {
 
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -362,15 +360,7 @@ void DeepseekMoELayer::incremental_forwarding(nntrainer::RunLayerContext &contex
 
     router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
 
-    // Add e_score_correction_bias
-    nntrainer::Tensor &e_score_correction_bias =
-      context.getWeight(e_score_correction_bias_idx);
-
-    nntrainer::Tensor biased_router_logits(router_logits.getDim());
-    biased_router_logits.copyData(router_logits);
-    biased_router_logits.add_i(e_score_correction_bias);
-
-    auto topk_result = biased_router_logits.topK(topk);
+    auto topk_result = router_logits.topK(topk);
     auto topk_values = std::get<0>(topk_result);
     auto topk_indices = std::get<1>(topk_result);
 
@@ -389,8 +379,10 @@ void DeepseekMoELayer::incremental_forwarding(nntrainer::RunLayerContext &contex
       for (int k = 0; k < static_cast<int>(topk); ++k) {
         unsigned expert_idx = indices_data[i * topk + k];
         float weight = router_logits.getValue<float>(i, 0, 0, expert_idx);
-        weight /=
-          std::max(sum_prob, std::get<props::MoENormMin>(moe_props).get());
+        if (std::get<props::NormTopKProb>(moe_props).get()) {
+          weight /=
+            std::max(sum_prob, std::get<props::MoENormMin>(moe_props).get());
+        }
         expert_assignments[expert_idx].emplace_back(i, weight);
       }
     }
@@ -491,7 +483,7 @@ void DeepseekMoELayer::calcGradient(nntrainer::RunLayerContext &context) {
 }
 
 void DeepseekMoELayer::exportTo(nntrainer::Exporter &exporter,
-                             const ml::train::ExportMethods &method) const {
+                                const ml::train::ExportMethods &method) const {
   nntrainer::LayerImpl::exportTo(exporter, method);
   exporter.saveResult(moe_props, method, this); // Save MoE specific properties
 }

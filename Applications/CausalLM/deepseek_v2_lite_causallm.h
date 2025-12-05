@@ -73,6 +73,8 @@ private:
   unsigned int NUM_SHARED_EXPERTS;    /**< Number of shared experts */
   unsigned int MOE_INTERMEDIATE_SIZE; /**< MoE intermediate size */
   float MOE_NORM_MIN;                 /**< MoE normalization minimum */
+  unsigned int NUM_GROUP_EXPERTS;     /**< Number of group experts */
+  bool NORM_TOPK_PROB;                /**< Normalize top-k probabilities */
 
   std::vector<std::string> LAYER_TYPES; /**< Layer types */
   float ATTENTION_ROPE_SCALING_FACTOR;  /**< Attention RoPE scaling factor */

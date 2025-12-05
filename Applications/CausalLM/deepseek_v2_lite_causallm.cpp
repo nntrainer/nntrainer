@@ -16,6 +16,7 @@
 #include <deepseek_v2_lite_causallm.h>
 #include <deepseek_moe_layer.h>
 #include <mla_core.h>
+#include <iostream>
 
 namespace causallm {
 
@@ -65,6 +66,8 @@ DeepseekV2ForCausalLM::createMlp(const int layer_id, int dim, int hidden_dim,
        withKey("num_shared_experts", NUM_SHARED_EXPERTS),
        withKey("num_experts_per_token", NUM_EXPERTS_PER_TOK),
        withKey("moe_norm_min", std::to_string(MOE_NORM_MIN)),
+       withKey("num_group_experts", NUM_GROUP_EXPERTS),
+       withKey("norm_topk_prob", NORM_TOPK_PROB ? "true" : "false"),
        withKey("moe_activation", "swish")}));
   }
   return layers;
@@ -81,44 +84,15 @@ std::vector<LayerHandle> DeepseekV2ForCausalLM::createAttention(
 
   std::string q_input_layer = query_name;
 
-  if (Q_LORA_RANK > 0) {
-    // Q_A: [Hidden, Q_LORA_RANK]
-    auto q_a_name = "layer" + std::to_string(layer_id) + "_q_a_proj";
-    layers.push_back(createLayer(
-      "fully_connected",
-      {withKey("name", q_a_name), withKey("unit", Q_LORA_RANK),
-       withKey("disable_bias", "false"), withKey("input_layers", q_input_layer),
-       withKey("weight_initializer", "ones")}));
-
-    // Q_A_Norm: RMSNorm
-    auto q_a_norm_name = "layer" + std::to_string(layer_id) + "_q_a_layernorm";
-    layers.push_back(createLayer(
-      "rms_norm",
-      {withKey("name", q_a_norm_name), withKey("epsilon", std::to_string(NORM_EPS)),
-       withKey("input_layers", q_a_name)}));
-
-    // Q_B: [Q_LORA_RANK, NumHeads * (QK_NOPE + QK_ROPE)]
-    auto q_b_name = "layer" + std::to_string(layer_id) + "_q_b_proj";
-    int q_out_dim = n_heads * (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM);
-    layers.push_back(createLayer(
-      "fully_connected",
-      {withKey("name", q_b_name), withKey("unit", q_out_dim),
-       withKey("disable_bias", "true"),
-       withKey("input_layers", q_a_norm_name),
-       withKey("weight_initializer", "ones")}));
-
-    q_input_layer = q_b_name;
-  } else {
     // Standard Linear Projection for Q
     auto q_proj_name = "layer" + std::to_string(layer_id) + "_q_proj";
     int q_out_dim = n_heads * (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM);
     layers.push_back(createLayer(
       "fully_connected",
       {withKey("name", q_proj_name), withKey("unit", q_out_dim),
-       withKey("disable_bias", "false"), withKey("input_layers", q_input_layer),
+       withKey("disable_bias", ATTENTION_BIAS ? "false" : "true"), withKey("input_layers", q_input_layer),
        withKey("weight_initializer", "ones")}));
     q_input_layer = q_proj_name;
-  }
 
   // 2. KV Compression (Latent KV)
   // Input: [Batch, Seq, Hidden]
@@ -132,7 +106,7 @@ std::vector<LayerHandle> DeepseekV2ForCausalLM::createAttention(
   layers.push_back(createLayer(
     "fully_connected",
     {withKey("name", kv_a_proj_name), withKey("unit", kv_a_out_dim),
-     withKey("disable_bias", "false"), withKey("input_layers", key_name),
+     withKey("disable_bias", ATTENTION_BIAS ? "false" : "true"), withKey("input_layers", q_input_layer),
      withKey("weight_initializer", "ones")}));
 
   // Split KV_A output into LatentKV and KeyRoPE
@@ -142,12 +116,19 @@ std::vector<LayerHandle> DeepseekV2ForCausalLM::createAttention(
   auto key_rope_name = "layer" + std::to_string(layer_id) + "_key_rope";
 
   layers.push_back(createLayer(
-    "split",
-    {withKey("name", latent_kv_name + "," + key_rope_name),
+    "slice",
+    {withKey("name", latent_kv_name),
      withKey("input_layers", kv_a_proj_name), withKey("axis", "3"),
-     withKey("split_dimension",
-             std::to_string(KV_LORA_RANK) + "," +
-               std::to_string(QK_ROPE_HEAD_DIM))}));
+     withKey("start_index", "1"),
+     withKey("end_index", std::to_string(KV_LORA_RANK + 1))}));
+
+  layers.push_back(createLayer(
+    "slice",
+    {withKey("name", key_rope_name),
+     withKey("input_layers", kv_a_proj_name), withKey("axis", "3"),
+     withKey("start_index", std::to_string(KV_LORA_RANK + 1)),
+     withKey("end_index",
+             std::to_string(KV_LORA_RANK + QK_ROPE_HEAD_DIM + 1))}));
 
   // KV_A_Norm on LatentKV
   auto kv_a_norm_name = "layer" + std::to_string(layer_id) + "_kv_a_layernorm";
@@ -180,11 +161,11 @@ std::vector<LayerHandle> DeepseekV2ForCausalLM::createAttention(
   // 4. Output Projection
   // Input: [Batch, Seq, NumHeads * V_HEAD_DIM]
   // Output: [Batch, Seq, Hidden]
-  auto o_proj_name = "layer" + std::to_string(layer_id) + "_o_proj";
+  auto o_proj_name = "layer" + std::to_string(layer_id) + "_attention_out";
   layers.push_back(createLayer(
     "fully_connected",
     {withKey("name", o_proj_name), withKey("unit", DIM),
-     withKey("disable_bias", "false"), withKey("input_layers", mla_core_name),
+     withKey("disable_bias", ATTENTION_BIAS ? "false" : "true"), withKey("input_layers", mla_core_name),
      withKey("weight_initializer", "ones")}));
 
   return layers;
@@ -194,25 +175,37 @@ void DeepseekV2ForCausalLM::setupParameters(json &cfg, json &generation_cfg,
                                               json &nntr_cfg) {
 
   try {
-    NUM_EXPERTS = cfg["moe_num_experts"].get<unsigned int>();
+    NUM_EXPERTS = cfg["n_routed_experts"].get<unsigned int>();
     NUM_EXPERTS_PER_TOK = cfg["num_experts_per_tok"].get<unsigned int>();
     MOE_INTERMEDIATE_SIZE = cfg["moe_intermediate_size"].get<unsigned int>();
-    INTERMEDIATE_SIZE = cfg["moe_intermediate_size"].get<unsigned int>();
-    NUM_SHARED_EXPERTS = cfg["moe_num_shared_experts"].get<unsigned int>();
+    INTERMEDIATE_SIZE = cfg["intermediate_size"].get<unsigned int>();
+    NUM_SHARED_EXPERTS = cfg["n_shared_experts"].get<unsigned int>();
+    if (DIM == 2048 && NUM_SHARED_EXPERTS == 2) {
+      NUM_SHARED_EXPERTS = 1;
+    }
     MOE_NORM_MIN =
       cfg.contains("moe_norm_min") ? cfg["moe_norm_min"].get<float>() : 1e-12f;
+    NUM_GROUP_EXPERTS = cfg.contains("n_group") ? cfg["n_group"].get<unsigned int>() : 1;
+    NORM_TOPK_PROB = cfg.contains("norm_topk_prob") ? cfg["norm_topk_prob"].get<bool>() : true;
 
     // MLA parameters
-    Q_LORA_RANK = cfg.contains("q_lora_rank")
-                    ? cfg["q_lora_rank"].get<unsigned int>()
-                    : 0;
+    if (cfg.contains("q_lora_rank") && !cfg["q_lora_rank"].is_null()) {
+      Q_LORA_RANK = cfg["q_lora_rank"].get<unsigned int>();
+    } else {
+      Q_LORA_RANK = 0;
+    }
     KV_LORA_RANK = cfg["kv_lora_rank"].get<unsigned int>();
     QK_NOPE_HEAD_DIM = cfg["qk_nope_head_dim"].get<unsigned int>();
     QK_ROPE_HEAD_DIM = cfg["qk_rope_head_dim"].get<unsigned int>();
+    QK_ROPE_HEAD_DIM = cfg["qk_rope_head_dim"].get<unsigned int>();
     V_HEAD_DIM = cfg["v_head_dim"].get<unsigned int>();
+    if (cfg.contains("attention_bias")) {
+      ATTENTION_BIAS = cfg["attention_bias"].get<bool>();
+    }
 
   } catch (const std::exception &e) {
-    throw std::runtime_error("DeepseekV2 Causallm: config parsing error");
+    throw std::runtime_error("DeepseekV2 Causallm: config parsing error: " +
+                             std::string(e.what()));
   }
 }
 

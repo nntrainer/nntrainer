@@ -1,0 +1,10 @@
+input : 
+{
+  <｜begin▁of▁sentence｜>User: Give me short introduction about Large Language Model\n\nAssistant:
+}
+output :
+{
+A Large Language Model is a type of artificial intelligence model that has been trained on a vast amount of text data, typically sourced from books, websites, and other written materials. These models are designed to understand and generate human-like text, making them useful for a wide range of applications, such as chatbots, language translation, and content creation.
+
+Large Language Models are built using deep learning techniques, which involve training the model on large datasets using powerful computers. The training process involves feeding the
+}

@@ -167,6 +167,7 @@ protected:
   float NORM_EPS = 1e-5;           /**< RMSNorm epsilon value */
   float EMBEDDING_SCALE = 1.0f;
   int GQA_SIZE;
+  bool ATTENTION_BIAS = false;
 
   unsigned int BATCH_SIZE;              /**< Batch size for the model */
   unsigned int INIT_SEQ_LEN;            /**< Initial sequence length */
