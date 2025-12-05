@@ -10,6 +10,9 @@ subdir('matmul_clamp_f32_qsi8d32p_qsi4c32p')
 nntrainer_inc += include_directories('matmul_clamp_f32_qsi8d32p_qsi4c32p')
 nntrainer_inc_abs += meson.current_source_dir() / 'matmul_clamp_f32_qsi8d32p_qsi4c32p'
 
+subdir('pack')
+nntrainer_inc += include_directories('pack')
+nntrainer_inc_abs += meson.current_source_dir() / 'pack'
 
 foreach h : kai_headers
   nntrainer_headers += meson.current_source_dir() / h

@@ -680,7 +680,284 @@ TEST(nntrainer_cpu_backend_standalone, qai8dxp_qsi4cxp_3072x512x512_CMP) {
   ASSERT_LE(qai8dxp_qsi4cxp_mse_packed, eps * M * K * N);
 }
 
-TEST(nntrainer_cpu_backend_standalone, sincos16_3072) {
+
+
+std::tuple<float, uint32_t> test_gemm_qsi8d32p_qsi4c32p_unpacked(
+  const uint32_t M, const uint32_t K, const uint32_t N, const float *weights,
+  const float *activations, std::vector<float> &ref_dst, bool transB = true,
+  bool print = false) {
+  // Step1. Set qsi8d32p_qsi4c32p quant test components
+  // For qs4c32 format with block size 32:
+  // - Each block has: sizeof(uint16_t) (scale as fp16) + bl/2 bytes (4-bit packed data)
+  // - Number of blocks per row: K / bl
+  const size_t bl = 32; // block length
+  const size_t num_blocks_per_row = K / bl;
+  const size_t bytes_per_block = sizeof(uint16_t) + bl / 2; // fp16 scale + packed 4-bit data
+  const size_t rhs_native_size_qs4c32 =
+    static_cast<size_t>(N) * num_blocks_per_row * bytes_per_block;
+
+  uint8_t *rhs_native_mtx_qs4c32 = new uint8_t[rhs_native_size_qs4c32];
+  std::memset(rhs_native_mtx_qs4c32, 0, rhs_native_size_qs4c32);
+
+  // Step2. 4-bit Weight quantization with block size 32 (qsi4c32p format)
+  std::cerr << "Step 2: Quantizing weights to qs4c32 format..." << std::endl;
+  nntrainer::nntr_quant_qs4c32_f32(N, K, bl, (void *)weights,
+                                   (void *)rhs_native_mtx_qs4c32);
+  std::cerr << "Step 2: Done." << std::endl;
+
+  // Step3. Run GEMM! (Online activation quantization + kernel routine + return
+  // float)
+  std::vector<float> dst(static_cast<size_t>(M) * N);
+  auto t1 = high_resolution_clock::now();
+  // #### MAIN TESTED METHOD ####
+  std::cerr << "Step 3: Running GEMM..." << std::endl;
+  uint32_t opt_kernel_variant_idx =
+    nntrainer::nntr_gemm_qsi8d32p_qsi4c32p_unpacked(
+      M, N, K, (void *)activations, (void *)rhs_native_mtx_qs4c32,
+      nullptr, dst.data(), transB);  // scales are embedded in qs4c32 format
+  std::cerr << "Step 3: Done." << std::endl;
+  // #### MAIN TESTED METHOD ####
+  auto t2 = high_resolution_clock::now();
+  auto dt = duration_cast<nanoseconds>(t2 - t1);
+  if (print) {
+    std::cout << "[INFO] test_gemm_qsi8d32p_qsi4c32p_unpacked: " << dt.count()
+              << " ns " << dt.count() / 1'000 << " us "
+              << dt.count() / 1'000'000 << " ms " << std::endl;
+  }
+
+  // Step4. Compute quantization error
+  auto mean_squared_error = compute_mse(M, N, ref_dst, dst, print);
+
+  delete[] rhs_native_mtx_qs4c32;
+
+  return {mean_squared_error, opt_kernel_variant_idx};
+}
+
+
+static uint32_t
+run_qsi8d32p_qsi4c32p_test_unpacked(const uint32_t M, const uint32_t K,
+                                    const uint32_t N, float &qsi8d32p_qsi4c32p_mse,
+                                    bool transB = true, bool print = false) {
+  if (print) {
+    std::cout << "[INFO] qsi8d32p_qsi4c32p Test (M:" << M << ", K:" << K
+              << ", N:" << N << ")" << std::endl;
+  }
+
+  std::vector<float> activation =
+    generate_random_vector<float>(static_cast<std::size_t>(M) * K);
+  std::vector<float> weight =
+    generate_random_vector<float>(static_cast<std::size_t>(N) * K);
+  std::vector<float> ref_dst(static_cast<std::size_t>(M) * N);
+
+  // GROUND TRUTH TRANSB SGEMM for reference
+  auto t1 = high_resolution_clock::now();
+  nntrainer::sgemm(0, false, true, M, N, K, 1.F, activation.data(), K,
+                   weight.data(), K, 0.F, ref_dst.data(), N);
+  auto t2 = high_resolution_clock::now();
+  auto dt = duration_cast<nanoseconds>(t2 - t1);
+  if (print) {
+    std::cout << "[INFO] sgemm :    " << dt.count() << " ns "
+              << dt.count() / 1'000 << " us " << dt.count() / 1'000'000
+              << " ms " << std::endl;
+  }
+  const auto [mse, opt_kernel_variant_idx] = test_gemm_qsi8d32p_qsi4c32p_unpacked(
+    M, K, N, weight.data(), activation.data(), ref_dst, transB, print);
+
+  qsi8d32p_qsi4c32p_mse = mse;
+
+  return opt_kernel_variant_idx;
+}
+
+float test_gemm_qsi8d32p_qsi4c32p_packed(const uint32_t M, const uint32_t K,
+                                         const uint32_t N, const float *weights,
+                                         const float *activations,
+                                         std::vector<float> &ref_dst,
+                                         uint32_t opt_kernel_idx,
+                                         bool transB = true, bool print = false) {
+  // Step1. Set qsi8d32p_qsi4c32p quant test components using qs4c32 format
+  // For qs4c32 format with block size 32:
+  // - Each block has: sizeof(uint16_t) (scale as fp16) + bl/2 bytes (4-bit packed data)
+  // - Number of blocks per row: K / bl
+  const size_t bl = 32; // block length
+  const size_t num_blocks_per_row = K / bl;
+  const size_t bytes_per_block = sizeof(uint16_t) + bl / 2; // fp16 scale + packed 4-bit data
+  const size_t rhs_native_size_qs4c32 =
+    static_cast<size_t>(N) * num_blocks_per_row * bytes_per_block;
+
+  uint8_t *rhs_native_mtx_qs4c32 = new uint8_t[rhs_native_size_qs4c32];
+  std::memset(rhs_native_mtx_qs4c32, 0, rhs_native_size_qs4c32);
+
+  // Step2. 4-bit Weight quantization with block size 32 (qsi4c32 format with embedded fp16 scales)
+  nntrainer::nntr_quant_qs4c32_f32(N, K, bl, (void *)weights,
+                                   (void *)rhs_native_mtx_qs4c32);
+
+  // Step3. Offline weight packing
+  size_t packed_weight_size =
+    nntrainer::nntr_get_rhs_packed_size_qsi8d32p_qsi4c32p(N, K, opt_kernel_idx,
+                                                          transB);
+  uint8_t *packed_weight = new uint8_t[packed_weight_size];
+
+  nntrainer::nntr_qsi8d32p_qsi4c32p_rhs_pack(
+    N, K, packed_weight, rhs_native_mtx_qs4c32, nullptr, opt_kernel_idx,
+    transB);  // scales are embedded in qs4c32 format
+
+  // Step4. Run GEMM! (Online activation quantization + kernel routine + return
+  // float)
+  std::vector<float> dst(static_cast<size_t>(M) * N);
+  auto t1 = high_resolution_clock::now();
+  // #### MAIN TESTED METHOD ####
+  nntrainer::nntr_gemm_qsi8d32p_qsi4c32p_packed(M, N, K, (void *)activations,
+                                                (void *)packed_weight, dst.data(),
+                                                opt_kernel_idx, transB);
+  // #### MAIN TESTED METHOD ####
+  auto t2 = high_resolution_clock::now();
+  auto dt = duration_cast<nanoseconds>(t2 - t1);
+  if (print) {
+    std::cout << "[INFO] test_gemm_qsi8d32p_qsi4c32p_packed: " << dt.count()
+              << " ns " << dt.count() / 1'000 << " us "
+              << dt.count() / 1'000'000 << " ms " << std::endl;
+  }
+
+  // Step5. Compute quantization error
+  auto mean_squared_error = compute_mse(M, N, ref_dst, dst, print);
+
+  delete[] rhs_native_mtx_qs4c32;
+  delete[] packed_weight;
+
+  return mean_squared_error;
+}
+
+
+
+void run_qsi8d32p_qsi4c32p_test_packed(const uint32_t M, const uint32_t K,
+                                       const uint32_t N,
+                                       float &qsi8d32p_qsi4c32p_mse,
+                                       uint32_t opt_kernel_idx,
+                                       bool transB = true, bool print = false) {
+  if (print) {
+    std::cout << "[INFO] run_qsi8d32p_qsi4c32p_test_packed Test (M:" << M
+              << ", K:" << K << ", N:" << N
+              << ") with opt_kernel_idx : " << opt_kernel_idx << std::endl;
+  }
+
+  std::vector<float> activation =
+    generate_random_vector<float>(static_cast<std::size_t>(M) * K);
+  std::vector<float> weight =
+    generate_random_vector<float>(static_cast<std::size_t>(N) * K);
+  std::vector<float> ref_dst(static_cast<std::size_t>(M) * N);
+
+  // GROUND TRUTH TRANSB SGEMM for reference
+  auto t1 = high_resolution_clock::now();
+  nntrainer::sgemm(0, false, true, M, N, K, 1.F, activation.data(), K,
+                   weight.data(), K, 0.F, ref_dst.data(), N);
+  auto t2 = high_resolution_clock::now();
+  auto dt = duration_cast<nanoseconds>(t2 - t1);
+  if (print) {
+    std::cout << "[INFO] sgemm :    " << dt.count() << " ns "
+              << dt.count() / 1'000 << " us " << dt.count() / 1'000'000
+              << " ms " << std::endl;
+  }
+  qsi8d32p_qsi4c32p_mse =
+    test_gemm_qsi8d32p_qsi4c32p_packed(M, K, N, weight.data(), activation.data(),
+                                       ref_dst, opt_kernel_idx, transB, print);
+}
+
+TEST(nntrainer_cpu_backend_standalone, qsi8d32p_qsi4c32p_1x3072x512_CMP) {
+  const unsigned int M = 1;
+  const unsigned int K = 3072;
+  const unsigned int N = 512;
+  float qsi8d32p_qsi4c32p_mse;
+  float qsi8d32p_qsi4c32p_mse_packed;
+  constexpr float eps = 1e-5;
+  const uint32_t TC = 20;
+  std::vector<uint32_t> opt_idx_variant_candidates;
+  uint32_t opt_idx_variant = 0;
+  for (uint32_t tc = 0; tc < TC; ++tc) {
+    opt_idx_variant = run_qsi8d32p_qsi4c32p_test_unpacked(
+      M, K, N, qsi8d32p_qsi4c32p_mse, true, false);
+    opt_idx_variant_candidates.push_back(opt_idx_variant);
+  }
+  auto result = most_frequent(opt_idx_variant_candidates);
+  opt_idx_variant = result.first;
+
+  run_qsi8d32p_qsi4c32p_test_packed(M, K, N, qsi8d32p_qsi4c32p_mse_packed,
+                                    opt_idx_variant, true, false);
+  ASSERT_LE(qsi8d32p_qsi4c32p_mse, eps * M * K * N);
+  ASSERT_LE(qsi8d32p_qsi4c32p_mse_packed, eps * M * K * N);
+}
+
+TEST(nntrainer_cpu_backend_standalone, qsi8d32p_qsi4c32p_768x768x768_CMP) {
+  const unsigned int M = 768;
+  const unsigned int K = 768;
+  const unsigned int N = 768;
+  float qsi8d32p_qsi4c32p_mse;
+  float qsi8d32p_qsi4c32p_mse_packed;
+  constexpr float eps = 1e-5;
+  const uint32_t TC = 20;
+  std::vector<uint32_t> opt_idx_variant_candidates;
+  uint32_t opt_idx_variant = 0;
+  for (uint32_t tc = 0; tc < TC; ++tc) {
+    opt_idx_variant = run_qsi8d32p_qsi4c32p_test_unpacked(
+      M, K, N, qsi8d32p_qsi4c32p_mse, true, false);
+    opt_idx_variant_candidates.push_back(opt_idx_variant);
+  }
+  auto result = most_frequent(opt_idx_variant_candidates);
+  opt_idx_variant = result.first;
+
+  run_qsi8d32p_qsi4c32p_test_packed(M, K, N, qsi8d32p_qsi4c32p_mse_packed,
+                                    opt_idx_variant, true, false);
+  ASSERT_LE(qsi8d32p_qsi4c32p_mse, eps * M * K * N);
+  ASSERT_LE(qsi8d32p_qsi4c32p_mse_packed, eps * M * K * N);
+}
+
+TEST(nntrainer_cpu_backend_standalone, qsi8d32p_qsi4c32p_512x768x2048_CMP) {
+  const unsigned int M = 512;
+  const unsigned int K = 768;
+  const unsigned int N = 2048;
+  float qsi8d32p_qsi4c32p_mse;
+  float qsi8d32p_qsi4c32p_mse_packed;
+  constexpr float eps = 1e-5;
+  const uint32_t TC = 20;
+  std::vector<uint32_t> opt_idx_variant_candidates;
+  uint32_t opt_idx_variant = 0;
+  for (uint32_t tc = 0; tc < TC; ++tc) {
+    opt_idx_variant = run_qsi8d32p_qsi4c32p_test_unpacked(
+      M, K, N, qsi8d32p_qsi4c32p_mse, true, false);
+    opt_idx_variant_candidates.push_back(opt_idx_variant);
+  }
+  auto result = most_frequent(opt_idx_variant_candidates);
+  opt_idx_variant = result.first;
+
+  run_qsi8d32p_qsi4c32p_test_packed(M, K, N, qsi8d32p_qsi4c32p_mse_packed,
+                                    opt_idx_variant, true, false);
+  ASSERT_LE(qsi8d32p_qsi4c32p_mse, eps * M * K * N);
+  ASSERT_LE(qsi8d32p_qsi4c32p_mse_packed, eps * M * K * N);
+}
+
+TEST(nntrainer_cpu_backend_standalone, qsi8d32p_qsi4c32p_3072x512x512_CMP) {
+  const unsigned int M = 3072;
+  const unsigned int K = 512;
+  const unsigned int N = 512;
+  float qsi8d32p_qsi4c32p_mse;
+  float qsi8d32p_qsi4c32p_mse_packed;
+  constexpr float eps = 1e-5;
+  const uint32_t TC = 20;
+  std::vector<uint32_t> opt_idx_variant_candidates;
+  uint32_t opt_idx_variant = 0;
+  for (uint32_t tc = 0; tc < TC; ++tc) {
+    opt_idx_variant = run_qsi8d32p_qsi4c32p_test_unpacked(
+      M, K, N, qsi8d32p_qsi4c32p_mse, true, false);
+    opt_idx_variant_candidates.push_back(opt_idx_variant);
+  }
+  auto result = most_frequent(opt_idx_variant_candidates);
+  opt_idx_variant = result.first;
+
+  run_qsi8d32p_qsi4c32p_test_packed(M, K, N, qsi8d32p_qsi4c32p_mse_packed,
+                                    opt_idx_variant, true, false);
+  ASSERT_LE(qsi8d32p_qsi4c32p_mse, eps * M * K * N);
+  ASSERT_LE(qsi8d32p_qsi4c32p_mse_packed, eps * M * K * N);
+}
+TEST(nntrainer_cpu_backend_standalone, trigonometric_values_test) {
   const unsigned int N = 3072;
   run_trigonometric_values_test(N);
 }
