@@ -528,6 +528,92 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(
   void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
   bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
   T upper_bound = std::numeric_limits<T>::max());
+
+/**
+ * @brief get size of memory to allocate for rhs weight packing of qsi8d32p to
+ * qsi4c32p
+ *
+ * @param n row length if not transposed
+ * @param k col length if not transposed
+ * @return size_t size of memory to allocate
+ */
+size_t nntr_get_rhs_packed_size_qsi8d32p_qsi4c32p(size_t n, size_t k,
+                                                  uint32_t idx_variant,
+                                                  bool transB);
+
+/**
+ * @brief rhs matrix packing for qsi8d32p_qsi4c32p format
+ *
+ * @param n row length if not transposed
+ * @param k col length if not transposed
+ * @param rhs_packed_mtx_qs4cx dst* to store results
+ * @param rhs_native_mtx_qs4cx input matrix data
+ * @param rhs_scales_f32 input qparam data
+ * @param transB rather the matrix is transposed or not
+ */
+void nntr_qsi8d32p_qsi4c32p_rhs_pack(size_t n, size_t k,
+                                     void *rhs_packed_mtx_qs4cx,
+                                     void *rhs_native_mtx_qs4cx,
+                                     void *rhs_scales_f32, uint32_t idx_variant,
+                                     bool transB);
+
+/**
+ * @brief qs4c32 quantization of (n*k) matrix with block size 32.
+ * qsi4c32p refers to quantized symmetric 4-bit quantization with block size 32.
+ *
+ * @param n N length of the matrix
+ * @param k K length of the matrix (must be divisible by bl)
+ * @param bl block length (typically 32)
+ * @param rhs_native_mtx_f32 matrix data before quantization to load
+ * @param rhs_native_mtx_qs4c32 matrix data after quantization to store
+ */
+void nntr_quant_qs4c32_f32(size_t n, size_t k, size_t bl,
+                           void *rhs_native_mtx_f32,
+                           void *rhs_native_mtx_qs4c32);
+
+/**
+ * @brief GEMM of qsi8d32p runtime-quantized activation and offline qsi4c32p
+ * quantized weight
+ *
+ * @tparam T dataType of input activation and output matrices
+ * @param m M length of the matrix
+ * @param n N length of the matrix
+ * @param k K length of the matrix
+ * @param lhs_native_mtx activation (not quantized)
+ * @param rhs_native_mtx_qs4cx offline quantized weight
+ * @param rhs_scales scale factor vector of quantized weight
+ * @param dst_mtx dst matrix
+ * @param lower_bound lower bound to clamp
+ * @param upper_bound upper bound to clamp
+ * @param transB Choose weight data to be transposed or not. Default value
+ * regards the weight to be transpoed.
+ */
+template <typename T = float>
+uint32_t nntr_gemm_qsi8d32p_qsi4c32p_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales, T *dst_mtx, bool transB = true,
+  T lower_bound = std::numeric_limits<T>::lowest(),
+  T upper_bound = std::numeric_limits<T>::max());
+
+/**
+ * @brief run qsi8d32p_qsi4c32p GEMM with offline weight packing
+ *
+ * @param m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param lhs_native_mtx_f32 activation
+ * @param rhs_packed_mtx_qs4cx qs4cx quantized weight, packed already
+ * @param dst_act_mtx_f32 dst data
+ * @param transB rather the weight matrix is transposed or not
+ * @param lower_bound clipping param
+ * @param upper_bound clipping param
+ */
+template <typename T = float>
+void nntr_gemm_qsi8d32p_qsi4c32p_packed(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
+  void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
+  bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
+  T upper_bound = std::numeric_limits<T>::max());
 #endif
 /**
  * @brief Multihead softmax, exp(x_i) / sum(exp(x_i)), inplace version
