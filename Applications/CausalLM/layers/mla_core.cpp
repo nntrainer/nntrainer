@@ -179,6 +179,9 @@ void MLACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       output_step, cache_k, cache_v, cache_k.getDim(),
       cache_k_step_dim, cache_v.getDim(), cache_v_step_dim);
   }
+  // std::cout <<"\n " << context.getName() <<"'s Outputs " << std::endl;
+  // output.print(std::cout);
+  // std::cout << "============================================" << std::endl;
 }
 
 void MLACoreLayer::one_batch_incremental_forwarding(
@@ -259,12 +262,6 @@ void MLACoreLayer::one_batch_incremental_forwarding(
         unsigned int q_idx = from + t_q; 
 
         // Query pointers for this step
-        // Input: [B=1, C=1, H=Step, W=NumHeads * (NopeDim + RopeDim)]
-        // Stride W = 1.
-        // Stride H (Step) = NumHeads * (NopeDim + RopeDim).
-        // Layout: t_0: [H0_Nope, H0_Rope, H1_Nope, H1_Rope...], t_1: [...]
-        // So offset for Head h, Step t:
-        // t * (NumHeads * (NopeDim + RopeDim)) + h * (NopeDim + RopeDim)
         float *q_head_ptr = query_ptr + t_q * num_heads_Q * q_head_dim + h * q_head_dim;
         float *q_nope_ptr = q_head_ptr;
         float *q_rope_ptr = q_head_ptr + qk_nope_dim;

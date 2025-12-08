@@ -301,17 +301,6 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
       hidden_step.add_i(bias);
     }
   }
-  std::cout <<"\n " << context.getName() <<"'s Inputs " << std::endl;
-  input_.print(std::cout);
-  std::cout << "============================================" << std::endl;
-
-  std::cout <<"\n " << context.getName() <<"'s Weight " << std::endl;
-  weight.print(std::cout);
-  std::cout << "============================================" << std::endl;
-
-  std::cout <<"\n " << context.getName() <<"'s Outputs " << std::endl;
-  hidden_.print(std::cout);
-  std::cout << "============================================" << std::endl;
 }
 
 void FullyConnectedLayer::calcDerivative(RunLayerContext &context) {

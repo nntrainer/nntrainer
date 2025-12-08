@@ -10,12 +10,12 @@
 #include <omp.h>
 #include <stdexcept>
 
-#include <deepseek_moe_layer.h>
+#include <deepseek_moe_layer_slim.h>
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
-DeepseekMoELayer::DeepseekMoELayer() :
+DeepseekSlimMoELayer::DeepseekSlimMoELayer() :
   LayerImpl(),
   num_experts(0),
   num_shared_experts(0),
@@ -24,7 +24,8 @@ DeepseekMoELayer::DeepseekMoELayer() :
   moe_props(props::NumExperts(), props::NumExpertsPerToken(),
             nntrainer::props::Unit(), props::MoEActivation(),
             props::NumSharedExperts(), props::MoENormMin(),
-            props::NumGroupExperts(), props::NormTopKProb()),
+            props::NumGroupExperts(), props::NormTopKProb(),
+            props::RoutedScalingFactor()),
   expert_gate_proj_indices({}),
   expert_up_proj_indices({}),
   expert_down_proj_indices({}),
@@ -35,7 +36,7 @@ DeepseekMoELayer::DeepseekMoELayer() :
   router_logits_idx(std::numeric_limits<unsigned>::max()),
   expert_mask_idx(std::numeric_limits<unsigned>::max()) {}
 
-void DeepseekMoELayer::finalize(nntrainer::InitLayerContext &context) {
+void DeepseekSlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
   // 1. Validate input/output dimensions
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
     << "MoE layer only supports single input";
@@ -73,6 +74,12 @@ void DeepseekMoELayer::finalize(nntrainer::InitLayerContext &context) {
   if (std::get<props::NormTopKProb>(moe_props).empty()) {
     std::get<props::NormTopKProb>(moe_props).set(true); // Default to true
   }
+  if (std::get<props::RoutedScalingFactor>(moe_props).empty()) {
+    std::get<props::RoutedScalingFactor>(moe_props).set(1.0f); // Default to 1.0
+  }
+
+  routed_scaling_factor = std::get<props::RoutedScalingFactor>(moe_props).get();
+
   const unsigned int intermediate_size =
     std::get<nntrainer::props::Unit>(moe_props).get();
   const unsigned int hidden_size = in_dim.width(); // Feature dimension
@@ -156,17 +163,17 @@ void DeepseekMoELayer::finalize(nntrainer::InitLayerContext &context) {
     expert_up_proj_indices.push_back(context.requestWeight(
       expert_gate_dim, // Same dimensions as gate projection
       weight_initializer, weight_regularizer, weight_regularizer_constant,
-      weight_decay, "expert_up_" + std::to_string(i), false));
+      weight_decay, "expert_up_" + std::to_string(i), false, true));
 
     expert_gate_proj_indices.push_back(context.requestWeight(
       expert_gate_dim, weight_initializer, weight_regularizer,
       weight_regularizer_constant, weight_decay,
-      "expert_gate_" + std::to_string(i), false));
+      "expert_gate_" + std::to_string(i), false, true));
 
     expert_down_proj_indices.push_back(context.requestWeight(
       expert_down_dim, weight_initializer, weight_regularizer,
       weight_regularizer_constant, weight_decay,
-      "expert_down_" + std::to_string(i), false));
+      "expert_down_" + std::to_string(i), false, true));
 
     need_load.push_back(true);
   }
@@ -189,10 +196,10 @@ void DeepseekMoELayer::finalize(nntrainer::InitLayerContext &context) {
                           nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
 }
 
-void DeepseekMoELayer::forwarding(nntrainer::RunLayerContext &context,
+void DeepseekSlimMoELayer::forwarding(nntrainer::RunLayerContext &context,
                                   bool training) {}
 
-inline void DeepseekMoELayer::compute_expert_forward(
+inline void DeepseekSlimMoELayer::compute_expert_forward(
   const nntrainer::Tensor &input, nntrainer::Tensor &output,
   const std::vector<std::pair<unsigned, float>> &token_assignments,
   const nntrainer::Tensor &gate_proj, const nntrainer::Tensor &up_proj,
@@ -283,7 +290,7 @@ inline void DeepseekMoELayer::compute_expert_forward(
   }
 }
 
-void DeepseekMoELayer::incremental_forwarding(
+void DeepseekSlimMoELayer::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
 
@@ -295,6 +302,7 @@ void DeepseekMoELayer::incremental_forwarding(
   nntrainer::TensorDim input_step_dim = input_.getDim();
   nntrainer::TensorDim output_step_dim = output_.getDim();
   nntrainer::TensorDim router_logits_step_dim = router_logits_.getDim();
+  
   nntrainer::Tensor &shared_gate_proj = context.getWeight(shared_gate_proj_idx);
   nntrainer::Tensor &shared_up_proj = context.getWeight(shared_up_proj_idx);
   nntrainer::Tensor &shared_down_proj = context.getWeight(shared_down_proj_idx);
@@ -328,7 +336,6 @@ void DeepseekMoELayer::incremental_forwarding(
 
     // Compute shared experts
     if (num_shared_experts > 0) {
-
       nntrainer::Tensor shared_output(total_tokens, 1, 1, hidden_size,
                                       output.getTensorType());
       const unsigned int intermediate_size =
@@ -383,6 +390,7 @@ void DeepseekMoELayer::incremental_forwarding(
           weight /=
             std::max(sum_prob, std::get<props::MoENormMin>(moe_props).get());
         }
+        weight *= routed_scaling_factor;
         expert_assignments[expert_idx].emplace_back(i, weight);
       }
     }
@@ -412,12 +420,51 @@ void DeepseekMoELayer::incremental_forwarding(
 #pragma omp parallel for schedule(dynamic)
     for (int expert_idx : target_idx_vector) {
       const auto &assignments = expert_assignments[expert_idx];
+      if (need_load[expert_idx]) {
+
+        context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
+        context.getWeight(expert_up_proj_indices[expert_idx]).activate();
+        context.getWeight(expert_down_proj_indices[expert_idx]).activate();
+
+        {
+          std::lock_guard<std::mutex> lock(cache_mutex);
+          loaded_expert_deque.push_back(expert_idx);
+          iteration_map[expert_idx] = --loaded_expert_deque.end();
+          need_load[expert_idx] = false;
+        }
+
         compute_expert_forward(
           input, expert_outputs[expert_idx], assignments,
           context.getWeight(expert_gate_proj_indices[expert_idx]),
           context.getWeight(expert_up_proj_indices[expert_idx]),
           context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
+
+      } else {
+
+        compute_expert_forward(
+          input, expert_outputs[expert_idx], assignments,
+          context.getWeight(expert_gate_proj_indices[expert_idx]),
+          context.getWeight(expert_up_proj_indices[expert_idx]),
+          context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
+      }
     }
+
+// Evict experts
+#pragma omp parallel
+    while (loaded_expert_deque.size() > 16) {
+      int target_idx;
+      {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        target_idx = loaded_expert_deque.front();
+        loaded_expert_deque.pop_front();
+        iteration_map.erase(target_idx);
+        need_load[target_idx] = true;
+      }
+      context.getWeight(expert_gate_proj_indices[target_idx]).deactivate();
+      context.getWeight(expert_up_proj_indices[target_idx]).deactivate();
+      context.getWeight(expert_down_proj_indices[target_idx]).deactivate();
+    }
+
     // Combine expert outputs
     for (int expert_idx : target_idx_vector) {
       output.add_i(expert_outputs[expert_idx]);
@@ -428,28 +475,28 @@ void DeepseekMoELayer::incremental_forwarding(
   }
 }
 
-void DeepseekMoELayer::setProperty(const std::vector<std::string> &values) {
+void DeepseekSlimMoELayer::setProperty(const std::vector<std::string> &values) {
   auto remain_props = loadProperties(values, moe_props);
   nntrainer::LayerImpl::setProperty(remain_props);
 }
 
-void DeepseekMoELayer::calcDerivative(nntrainer::RunLayerContext &context) {
+void DeepseekSlimMoELayer::calcDerivative(nntrainer::RunLayerContext &context) {
   // MoE layer does not support derivative calculation
   throw std::runtime_error("MoE layer does not support derivative calculation");
 }
 
-void DeepseekMoELayer::calcGradient(nntrainer::RunLayerContext &context) {
+void DeepseekSlimMoELayer::calcGradient(nntrainer::RunLayerContext &context) {
   // MoE layer does not support gradient calculation
   throw std::runtime_error("MoE layer does not support gradient calculation");
 }
 
-void DeepseekMoELayer::exportTo(nntrainer::Exporter &exporter,
+void DeepseekSlimMoELayer::exportTo(nntrainer::Exporter &exporter,
                                 const ml::train::ExportMethods &method) const {
   nntrainer::LayerImpl::exportTo(exporter, method);
   exporter.saveResult(moe_props, method, this); // Save MoE specific properties
 }
 
-void DeepseekMoELayer::updateTensorsByInputDimensions(
+void DeepseekSlimMoELayer::updateTensorsByInputDimensions(
   nntrainer::RunLayerContext &context,
   std::vector<nntrainer::TensorDim> input_dimensions) {
   ml::train::TensorDim input_dim = context.getInput(SINGLE_INOUT_IDX).getDim();

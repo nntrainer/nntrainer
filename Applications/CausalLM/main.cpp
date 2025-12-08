@@ -40,6 +40,9 @@
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include "deepseek_v2_lite_causallm.h"
+#include "deepseek_v2_lite_slim_causallm.h"
+
+#include <atomic>
 #include <sys/resource.h>
 
 #include <atomic>
@@ -170,7 +173,12 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::DeepseekV2ForCausalLM>(
         cfg, generation_cfg, nntr_cfg);
     });
-
+  causallm::Factory::Instance().registerModel(
+    "DeepseekV2SlimCausalLM",
+    [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::DeepseekV2SlimCausalLM>(
+        cfg, generation_cfg, nntr_cfg);
+    });
   // Validate arguments
   if (argc < 2) {
     std::cerr << "Usage: " << argv[0] << " <model_path> [input_prompt]\n"

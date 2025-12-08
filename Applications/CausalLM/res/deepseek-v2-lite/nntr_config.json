@@ -12,11 +12,11 @@
 
     "bad_word_ids": [],
     "fsu": false,
-    "num_to_generate": 1,
-    "init_seq_len": 1,
+    "num_to_generate": 10,
+    "init_seq_len": 1024,
     "max_seq_len": 2048,
     "batch_size": 1,
 
     "tokenizer_file": "/home/donghak/workspace/nntrainer/Applications/CausalLM/res/deepseek-v2-lite/tokenizer.json",
-    "sample_input": "I"
+    "sample_input": "I want"
 }

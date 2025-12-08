@@ -131,6 +131,34 @@ public:
   using prop_tag = nntrainer::enum_class_prop_tag;
   static constexpr const char *key = "gamma_initializer";
 };
+
+/**
+ * @brief Axis property
+ */
+class Axis : public nntrainer::PositiveIntegerProperty {
+public:
+  static constexpr const char *key = "axis";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+/**
+ * @brief StartIndex property
+ */
+class StartIndex : public nntrainer::PositiveIntegerProperty {
+public:
+  static constexpr const char *key = "start_index";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+/**
+ * @brief EndIndex property
+ */
+class EndIndex : public nntrainer::PositiveIntegerProperty {
+public:
+  static constexpr const char *key = "end_index";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
 }; // namespace props
 
 WIN_EXPORT enum RMSParams { gamma };

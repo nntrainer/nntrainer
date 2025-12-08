@@ -1,6 +1,6 @@
 {
   "architectures": [
-    "DeepseekV2ForCausalLM"
+    "DeepseekV2SlimCausalLM"
   ],
   "attention_bias": false,
   "attention_dropout": 0.0,

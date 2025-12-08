@@ -12,6 +12,7 @@ causallm_embedding_pooling_src_abs = [meson.current_source_dir() / 'embedding_po
 
 
 openmp_dep = dependency('openmp')
+
 causallm_rms_norm = shared_library(
     'rms_norm_layer', 
     causallm_rms_norm_src_abs, 

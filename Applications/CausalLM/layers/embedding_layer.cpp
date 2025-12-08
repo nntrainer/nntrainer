@@ -155,9 +155,6 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
               << "\n hidden: " << hidden_ << std::endl;
 #endif
   }
-  std::cout <<"\n Embedding Outputs " << std::endl;
-  hidden_.print(std::cout);
-  std::cout << "============================================" << std::endl;
 }
 
 void EmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {

@@ -39,10 +39,10 @@ def save_deep_seek_v2_lite_chat_for_nntrainer(params, config, dtype, file):
 
     def save_attention(layer_name):  
         # Save Q/K/V/O projections in topological order
-        save_projection(layer_name, "self_attn.q_proj")
         save_projection(layer_name, "self_attn.kv_a_proj_with_mqa")
         save_weight(f"{layer_name}self_attn.kv_a_layernorm.weight")
         save_projection(layer_name, "self_attn.kv_b_proj")
+        save_projection(layer_name, "self_attn.q_proj")
         save_projection(layer_name, "self_attn.o_proj")
         
 
@@ -50,7 +50,7 @@ def save_deep_seek_v2_lite_chat_for_nntrainer(params, config, dtype, file):
         """Save feed forward layer weights"""  
         
         if layer_name == "model.layers.0.":
-            for proj in ["up_proj", "gate_proj", "down_proj"]:  
+            for proj in ["gate_proj", "up_proj", "down_proj"]:  
                 save_projection(layer_name, f"mlp.{proj}")  
 
         else:
@@ -90,7 +90,7 @@ def save_deep_seek_v2_lite_chat_for_nntrainer(params, config, dtype, file):
 
 
 
-with open(f"./nntr_deepseek_v2_lite_moe.bin", "wb") as f_model :
+with open(f"./nntr_deepseek_v2_lite_moe_1208.bin", "wb") as f_model :
     save_deep_seek_v2_lite_chat_for_nntrainer(model.state_dict(), config, data_dtype, f_model)
     
 print("Save Done")
