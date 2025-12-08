@@ -1,23 +1,125 @@
 {
- "modules": [
-    { "name": "Compiler",        "patterns": ["^(src/|nntrainer/)?compiler/"],                          "weight": 3 },
-    { "name": "Dataset",         "patterns": ["^(src/|nntrainer/)?dataset/"],                           "weight": 2 },
-    { "name": "Graph",           "patterns": ["^(src/|nntrainer/)?graph/"],                             "weight": 3 },
-    { "name": "Layers",          "patterns": ["^(src/|nntrainer/)?layers?/"],                           "weight": 3 },
-    { "name": "Models",          "patterns": ["^(src/|nntrainer/)?models?/"],                           "weight": 3 },
-    { "name": "OpenCL",          "patterns": ["^(src/|nntrainer/)?opencl/", "\\.cl$"],                  "weight": 2 },
-    { "name": "Optimizers",      "patterns": ["^(src/|nntrainer/)?optimizers?/"],                       "weight": 2 },
-    { "name": "Tensor",          "patterns": ["^(src/|nntrainer/)?tensor/"],                            "weight": 3 },
-    { "name": "CPU Backend","patterns": ["^(src/|nntrainer/)?cpu_backend/", "cpu_backend/","backend/(cpu|tensor)/"], "weight": 3 },
-    { "name": "Utils",           "patterns": ["^(src/|nntrainer/)?utils?/", "include/.+\\.(h|hpp|hh)$"],"weight": 2 },
-    { "name": "Tests",           "patterns": ["^(tests?|test)/", "\\.(test\\.|_test\\.)"],   "weight": 1 },
-    { "name": "Other Modules",   "patterns": ["^(src/)?other_modules?/"],                    "weight": 2 },
-    { "name": "Build/CI",        "patterns": ["^cmake/", "^\\.github/", "^(scripts?|tools?)/","\\.yml$", "\\.yaml$"], "weight": 1 },
-    { "name": "Docs",            "patterns": ["^docs?/", "\\.(md|rst)$"],                    "weight": 1 }
+  "modules": [
+    {
+      "name": "Compiler",
+      "patterns": [
+        "^(src/|nntrainer/)?compiler/"
+      ],
+      "weight": 3
+    },
+    {
+      "name": "Dataset",
+      "patterns": [
+        "^(src/|nntrainer/)?dataset/"
+      ],
+      "weight": 2
+    },
+    {
+      "name": "Graph",
+      "patterns": [
+        "^(src/|nntrainer/)?graph/"
+      ],
+      "weight": 3
+    },
+    {
+      "name": "Layers",
+      "patterns": [
+        "^(src/|nntrainer/)?layers?/"
+      ],
+      "weight": 3
+    },
+    {
+      "name": "Models",
+      "patterns": [
+        "^(src/|nntrainer/)?models?/"
+      ],
+      "weight": 3
+    },
+    {
+      "name": "OpenCL",
+      "patterns": [
+        "^(src/|nntrainer/)?opencl/",
+        "\\.cl$"
+      ],
+      "weight": 2
+    },
+    {
+      "name": "Optimizers",
+      "patterns": [
+        "^(src/|nntrainer/)?optimizers?/"
+      ],
+      "weight": 2
+    },
+    {
+      "name": "Tensor",
+      "patterns": [
+        "^(src/|nntrainer/)?tensor/"
+      ],
+      "weight": 3
+    },
+    {
+      "name": "CPU Backend",
+      "patterns": [
+        "tensor/cpu_backend/",
+        "^(src/|nntrainer/)?cpu_backend/",
+        "cpu_backend/",
+        "backend/(cpu|tensor)/"
+      ],
+      "weight": 3
+    },
+    {
+      "name": "Utils",
+      "patterns": [
+        "^(src/|nntrainer/)?utils?/",
+        "include/.+\\.(h|hpp|hh)$"
+      ],
+      "weight": 2
+    },
+    {
+      "name": "Tests",
+      "patterns": [
+        "^(tests?|test)/",
+        "\\.(test\\.|_test\\.)"
+      ],
+      "weight": 1
+    },
+    {
+      "name": "Other Modules",
+      "patterns": [
+        "^(src/)?other_modules?/"
+      ],
+      "weight": 2
+    },
+    {
+      "name": "Build/CI",
+      "patterns": [
+        "^cmake/",
+        "^\\.github/",
+        "^(scripts?|tools?)/",
+        "\\.yml$",
+        "\\.yaml$"
+      ],
+      "weight": 1
+    },
+    {
+      "name": "Docs",
+      "patterns": [
+        "^docs?/",
+        "\\.(md|rst)$"
+      ],
+      "weight": 1
+    }
   ],
   "fallbackModule": "Misc",
   "riskHints": {
-    "include": ["include/**", "public/**", "schema/**"],
-    "abiSensitive": ["include/**", "public/**"]
+    "include": [
+      "include/**",
+      "public/**",
+      "schema/**"
+    ],
+    "abiSensitive": [
+      "include/**",
+      "public/**"
+    ]
   }
 }

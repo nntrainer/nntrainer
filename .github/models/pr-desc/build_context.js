@@ -264,7 +264,7 @@ const commits =
 // ---------- 5) Module Impact Summary Text (Model Hint) ----------
 let moduleImpactSummary = '';
 if (Object.keys(moduleImpact).length) {
-  // 영향도 높은 순으로 상위 5개
+  // Top 5 modules sorted by highest impact
   const top = Object.entries(moduleImpact)
     .sort((a,b) => b[1].score - a[1].score)
     .slice(0,5);
@@ -279,9 +279,9 @@ const out = {
   modules: modulesDoc,
   diff,
   commits,
-  // 새 필드들
-  moduleImpact, // 모듈별 상세(머신 가독)
- moduleImpactSummary: moduleImpactSummary || '(no module impact detected)',
+  // New fields for enhanced context
+  moduleImpact, // Per-module details (machine-readable)
+  moduleImpactSummary: moduleImpactSummary || '(no module impact detected)',
  reviewerSignals: {
  apiSurfaceChanges,
  testFiles,
