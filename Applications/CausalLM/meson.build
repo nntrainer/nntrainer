@@ -1,6 +1,4 @@
-message('Processing CausalLM')
 causallm_src = [
-    meson.current_source_dir() / 'causal_lm.cpp',
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
 ]
