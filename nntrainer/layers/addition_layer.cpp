@@ -73,6 +73,10 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
       }
     }
   }
+  std::cout <<"\n " << context.getName() <<"'s Outputs " << std::endl;
+  hidden_.print(std::cout);
+  std::cout << "============================================" << std::endl;
+  exit(0);
 }
 
 void AdditionLayer::calcDerivative(RunLayerContext &context) {

@@ -144,6 +144,50 @@ public:
 };
 
 /**
+ * @brief RopeScalingBetaFast
+ */
+class RopeScalingBetaFast : public nntrainer::Property<float> {
+public:
+  RopeScalingBetaFast(float value = 32.0) { set(value); };
+  static constexpr const char *key =
+    "rope_scaling_beta_fast";                 /**< unique key to access */
+  using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
+/**
+ * @brief RopeScalingBetaSlow
+ */
+class RopeScalingBetaSlow : public nntrainer::Property<float> {
+public:
+  RopeScalingBetaSlow(float value = 1.0) { set(value); };
+  static constexpr const char *key =
+    "rope_scaling_beta_slow";                 /**< unique key to access */
+  using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
+/**
+ * @brief RopeScalingMscale
+ */
+class RopeScalingMscale : public nntrainer::Property<float> {
+public:
+  RopeScalingMscale(float value = 1.0) { set(value); };
+  static constexpr const char *key =
+    "rope_scaling_mscale";                    /**< unique key to access */
+  using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
+/**
+ * @brief RopeScalingMscaleAllDim
+ */
+class RopeScalingMscaleAllDim : public nntrainer::Property<float> {
+public:
+  RopeScalingMscaleAllDim(float value = 1.0) { set(value); };
+  static constexpr const char *key =
+    "rope_scaling_mscale_all_dim";            /**< unique key to access */
+  using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
+/**
  * @brief KVLoRARank
  * Dimension of the compressed latent vector for KV
  */
@@ -174,6 +218,17 @@ public:
   QKNopeDim(unsigned int value = 128) { set(value); };
   static constexpr const char *key = "qk_nope_dim"; /**< unique key to access */
   using prop_tag = nntrainer::uint_prop_tag;        /**< property type */
+};
+
+/**
+ * @brief VHeadDim
+ * Dimension of the Value Head
+ */
+class VHeadDim : public nntrainer::PositiveIntegerProperty {
+public:
+  VHeadDim(unsigned int value = 128) { set(value); };
+  static constexpr const char *key = "v_head_dim"; /**< unique key to access */
+  using prop_tag = nntrainer::uint_prop_tag;       /**< property type */
 };
 
 }; // namespace props
@@ -283,7 +338,9 @@ private:
     props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
-    props::KVLoRARank, props::QKRoPEDim, props::QKNopeDim>
+    props::RopeScalingBetaFast, props::RopeScalingBetaSlow,
+    props::RopeScalingMscale, props::RopeScalingMscaleAllDim,
+    props::KVLoRARank, props::QKRoPEDim, props::QKNopeDim, props::VHeadDim>
     mla_core_props; /**< mla_core layer properties */
 
   /** softmax activation operation */
@@ -299,6 +356,7 @@ private:
   size_t kv_lora_rank;
   size_t qk_rope_dim;
   size_t qk_nope_dim;
+  size_t v_head_dim;
   
   bool cache_shift;
   float theta;
@@ -361,13 +419,12 @@ private:
   void one_batch_incremental_forwarding(
     const unsigned int batch, const unsigned int _from, const unsigned int from,
     const unsigned int to, nntrainer::Tensor &query_step,
-    nntrainer::Tensor &latent_kv_step, nntrainer::Tensor &key_rope_step,
-    nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_c_kv,
-    nntrainer::Tensor &cache_k_pe, const ml::train::TensorDim &cache_c_kv_dim,
-    const ml::train::TensorDim &cache_c_kv_step_dim,
-    const ml::train::TensorDim &cache_k_pe_dim,
-    const ml::train::TensorDim &cache_k_pe_step_dim,
-    const nntrainer::Tensor &w_uv, const nntrainer::Tensor &w_uk);
+    nntrainer::Tensor &kv_b_step, nntrainer::Tensor &key_rope_step,
+    nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_k,
+    nntrainer::Tensor &cache_v, const ml::train::TensorDim &cache_k_dim,
+    const ml::train::TensorDim &cache_k_step_dim,
+    const ml::train::TensorDim &cache_v_dim,
+    const ml::train::TensorDim &cache_v_step_dim);
 
   void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
                         unsigned int from, BS::thread_pool<> &pool);

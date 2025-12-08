@@ -22,68 +22,67 @@ print("model load done")
 
 
 def save_deep_seek_v2_lite_chat_for_nntrainer(params, config, dtype, file):
-    """Convert and save weights as nntrainer format for multi-head attention model"""
+    """Convert and save weights as nntrainer format for multi-head attention model"""  
 
     n_layers = config.num_hidden_layers
     n_experts = config.n_routed_experts
-
+      
     def save_weight(weight_name, is_transpose=False):
         print(weight_name, params[weight_name].shape, "dtype = ", dtype )
         if is_transpose:
-            np.array(params[weight_name].permute(1,0), dtype=dtype).tofile(file)
+            np.array(params[weight_name].permute(1,0), dtype=dtype).tofile(file)  
         else:
-            np.array(params[weight_name], dtype=dtype).tofile(file)
+            np.array(params[weight_name], dtype=dtype).tofile(file)  
 
-    def save_projection(layer_name, proj_name):
-        save_weight(f"{layer_name}{proj_name}.weight", True)
+    def save_projection(layer_name, proj_name):  
+        save_weight(f"{layer_name}{proj_name}.weight", True)  
 
-    def save_attention(layer_name):
-        """Save attention layer weights"""
-
+    def save_attention(layer_name):  
+        # Save Q/K/V/O projections in topological order
+        save_projection(layer_name, "self_attn.q_proj")
+        save_projection(layer_name, "self_attn.kv_a_proj_with_mqa")
         save_weight(f"{layer_name}self_attn.kv_a_layernorm.weight")
+        save_projection(layer_name, "self_attn.kv_b_proj")
+        save_projection(layer_name, "self_attn.o_proj")
+        
 
-        # Save Q/K/V/O projections using helper
-        for proj in ["q_proj", "o_proj", "kv_a_proj_with_mqa", "kv_b_proj"]:
-            save_projection(layer_name, f"self_attn.{proj}")
-
-
-    def save_feed_forward(layer_name):
-        """Save feed forward layer weights"""
-
+    def save_feed_forward(layer_name):  
+        """Save feed forward layer weights"""  
+        
         if layer_name == "model.layers.0.":
-            for proj in ["up_proj", "gate_proj", "down_proj"]:
-                save_projection(layer_name, f"mlp.{proj}")
+            for proj in ["up_proj", "gate_proj", "down_proj"]:  
+                save_projection(layer_name, f"mlp.{proj}")  
 
         else:
-            save_weight(f"{layer_name}mlp.gate.weight", True)
-
+            save_weight(f"{layer_name}mlp.gate.weight", True)  
+            
             #Save Shared Experts per Layer
-            for proj in ["up_proj", "gate_proj", "down_proj"]:
-                save_projection(layer_name, f"mlp.shared_experts.{proj}")
-
-                # Save MoE projections using helper
+            for proj in ["up_proj", "gate_proj", "down_proj"]:  
+                save_projection(layer_name, f"mlp.shared_experts.{proj}")  
+                
+            # Save MoE projections using helper  
             for expert_id in range(n_experts):
-                for proj in ["up_proj", "gate_proj", "down_proj"]:
-                    save_projection(layer_name, f"mlp.experts.{expert_id}.{proj}")
+                for proj in ["up_proj", "gate_proj", "down_proj"]:  
+                    save_projection(layer_name, f"mlp.experts.{expert_id}.{proj}")  
 
 
-                    ##### START HERE FROM INITIAL LAYER ################################
+    ##### START HERE FROM INITIAL LAYER ################################
     ####################################################################
-    # Save embedding layer
+    # Save embedding layer  
     save_weight("model.embed_tokens.weight")
 
-    # Process all layers
-    for layer_idx in range(n_layers):
-        layer_prefix = f"model.layers.{layer_idx}."
-        save_weight(f"{layer_prefix}input_layernorm.weight")
-        save_attention(layer_prefix)
-        save_weight(f"{layer_prefix}post_attention_layernorm.weight")
-        save_feed_forward(layer_prefix)
+    # Process all layers  
+    for layer_idx in range(n_layers):  
+        layer_prefix = f"model.layers.{layer_idx}."  
+        save_weight(f"{layer_prefix}input_layernorm.weight")  
+        save_attention(layer_prefix)  
+        save_weight(f"{layer_prefix}post_attention_layernorm.weight")  
+        save_feed_forward(layer_prefix)  
 
-        # Save Norm Weights
-    save_weight("model.norm.weight")
-    save_weight("lm_head.weight")
-
+    # Save Norm Weights
+    save_weight("model.norm.weight")  
+    save_weight("lm_head.weight")  
+    
     ##### SAVE END HERE ################################################
     ####################################################################
 
@@ -93,5 +92,5 @@ def save_deep_seek_v2_lite_chat_for_nntrainer(params, config, dtype, file):
 
 with open(f"./nntr_deepseek_v2_lite_moe.bin", "wb") as f_model :
     save_deep_seek_v2_lite_chat_for_nntrainer(model.state_dict(), config, data_dtype, f_model)
-
+    
 print("Save Done")

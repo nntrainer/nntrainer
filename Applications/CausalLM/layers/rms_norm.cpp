@@ -80,6 +80,11 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
               << "output:" << out_step << "gamma:" << gamma << std::endl;
 #endif
   }
+
+  std::cout <<"\n " << context.getName() <<"'s RMS_NORM Outputs " << std::endl;
+  out.print(std::cout);
+  std::cout << "============================================" << std::endl;
+
 }
 
 void RMSNormLayer::updateTensorsByInputDimensions(

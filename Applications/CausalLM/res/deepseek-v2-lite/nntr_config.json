@@ -12,8 +12,8 @@
 
     "bad_word_ids": [],
     "fsu": false,
-    "num_to_generate": 10,
-    "init_seq_len": 100,
+    "num_to_generate": 1,
+    "init_seq_len": 1,
     "max_seq_len": 2048,
     "batch_size": 1,
 

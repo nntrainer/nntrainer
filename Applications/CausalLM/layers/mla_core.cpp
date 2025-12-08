@@ -35,7 +35,10 @@ MLACoreLayer::MLACoreLayer() :
     props::SlidingWindow(), props::MaxNewTokens(), props::RopeTheta(),
     props::MaxPositionEmbeddings(), props::UseSink(), props::RopeScalingType(),
     props::RopeScalingFactor(), props::RopeScalingMaxPositionEmbeddings(),
-    props::KVLoRARank(), props::QKRoPEDim(), props::QKNopeDim()),
+    props::RopeScalingBetaFast(), props::RopeScalingBetaSlow(),
+    props::RopeScalingMscale(), props::RopeScalingMscaleAllDim(),
+    props::KVLoRARank(), props::QKRoPEDim(), props::QKNopeDim(),
+    props::VHeadDim()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -45,6 +48,7 @@ MLACoreLayer::MLACoreLayer() :
   kv_lora_rank(0),
   qk_rope_dim(0),
   qk_nope_dim(0),
+  v_head_dim(0),
   cache_shift(false) {
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
@@ -66,6 +70,7 @@ void MLACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   kv_lora_rank = std::get<props::KVLoRARank>(mla_core_props).get();
   qk_rope_dim = std::get<props::QKRoPEDim>(mla_core_props).get();
   qk_nope_dim = std::get<props::QKNopeDim>(mla_core_props).get();
+  v_head_dim = std::get<props::VHeadDim>(mla_core_props).get();
   
   unsigned int max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mla_core_props).get();
@@ -83,47 +88,33 @@ void MLACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   unsigned int batch_size = query_dim.batch();
   
-  ml::train::TensorDim cache_c_kv_dim(
-    {batch_size, 1, max_timestep, kv_lora_rank},
-    {context.getFormat(), context.getActivationDataType()});
-    
-  unsigned int k_pe_width = input_dims[INOUT_INDEX::KEY_ROPE].width();
-  ml::train::TensorDim cache_k_pe_dim(
-    {batch_size, 1, max_timestep, k_pe_width},
-    {context.getFormat(), context.getActivationDataType()});
+  // Cache K (Full K: Nope + RoPE)
+  // Dim: [Batch, 1, MaxTimestep, NumHeads * (QK_NOPE + QK_ROPE)]
+  unsigned int k_head_dim = qk_nope_dim + qk_rope_dim;
+  ml::train::TensorDim cache_k_dim(
+    batch_size, 1, max_timestep, num_heads_Q * k_head_dim,
+    context.getFormat(), context.getActivationDataType());
+
+  // Cache V
+  // Dim: [Batch, 1, MaxTimestep, NumHeads * V_HEAD]
+  ml::train::TensorDim cache_v_dim(
+    batch_size, 1, max_timestep, num_heads_Q * v_head_dim,
+    context.getFormat(), context.getActivationDataType());
 
   tensor_idx[AttentionParams::cache_c_kv] = context.requestTensor(
-    cache_c_kv_dim, "cache_c_kv", nntrainer::Initializer::NONE, false,
+    cache_k_dim, "cache_k", nntrainer::Initializer::NONE, false,
     nntrainer::TensorLifespan::MAX_LIFESPAN);
-    
+
   tensor_idx[AttentionParams::cache_k_pe] = context.requestTensor(
-    cache_k_pe_dim, "cache_k_pe", nntrainer::Initializer::NONE, false,
+    cache_v_dim, "cache_v", nntrainer::Initializer::NONE, false,
     nntrainer::TensorLifespan::MAX_LIFESPAN);
-
-  ml::train::TensorDim w_uk_dim(
-    {1, 1, num_heads_Q * qk_nope_dim, kv_lora_rank},
-    {context.getFormat(), context.getActivationDataType()});
-
-  tensor_idx[AttentionParams::weight_uk] = context.requestWeight(
-    w_uk_dim, nntrainer::Initializer::XAVIER_UNIFORM,
-    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "w_uk");
-
-  size_t v_head_dim = (qk_nope_dim + qk_rope_dim);
-  
-  ml::train::TensorDim w_uv_dim(
-    {1, 1, num_heads_Q * v_head_dim, kv_lora_rank},
-    {context.getFormat(), context.getActivationDataType()});
-    
-  tensor_idx[AttentionParams::weight_uv] = context.requestWeight(
-    w_uv_dim, nntrainer::Initializer::XAVIER_UNIFORM,
-    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "w_uv");
 
   if (freqs_cos == nullptr)
     precompute_freqs(qk_rope_dim, max_position_embeddings, theta);
 
   std::vector<nntrainer::TensorDim> output_dims(1);
-  output_dims[0] = input_dims[0];
-  output_dims[0].width(num_heads_Q * v_head_dim);
+  output_dims[0] = input_dims[0]; // Copy dims from Query (Batch, 1, Seq)
+  output_dims[0].width(num_heads_Q * v_head_dim); // Set width
   context.setOutputDimensions(output_dims);
 }
 
@@ -149,12 +140,12 @@ void MLACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   }
 
   nntrainer::Tensor &query = context.getInput(INOUT_INDEX::QUERY);
-  nntrainer::Tensor &latent_kv = context.getInput(INOUT_INDEX::LATENT_KV);
+  nntrainer::Tensor &kv_b_output = context.getInput(INOUT_INDEX::LATENT_KV); // Reused index for KV_B
   nntrainer::Tensor &key_rope = context.getInput(INOUT_INDEX::KEY_ROPE);
   nntrainer::Tensor &output = context.getOutput(INOUT_INDEX::OUTPUT);
 
-  nntrainer::Tensor &cache_c_kv = context.getTensor(tensor_idx[AttentionParams::cache_c_kv]);
-  nntrainer::Tensor &cache_k_pe = context.getTensor(tensor_idx[AttentionParams::cache_k_pe]);
+  nntrainer::Tensor &cache_k = context.getTensor(tensor_idx[AttentionParams::cache_c_kv]);
+  nntrainer::Tensor &cache_v = context.getTensor(tensor_idx[AttentionParams::cache_k_pe]);
 
   auto get_step_dim = [to, from](const ml::train::TensorDim &dim) {
     auto step_dim = dim;
@@ -164,240 +155,197 @@ void MLACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   };
 
   ml::train::TensorDim query_step_dim = get_step_dim(query.getDim());
-  ml::train::TensorDim latent_kv_step_dim = get_step_dim(latent_kv.getDim());
+  ml::train::TensorDim kv_b_step_dim = get_step_dim(kv_b_output.getDim());
   ml::train::TensorDim key_rope_step_dim = get_step_dim(key_rope.getDim());
   ml::train::TensorDim output_step_dim = get_step_dim(output.getDim());
   
-  ml::train::TensorDim cache_c_kv_step_dim = get_step_dim(cache_c_kv.getDim());
-  ml::train::TensorDim cache_k_pe_step_dim = get_step_dim(cache_k_pe.getDim());
+  ml::train::TensorDim cache_k_step_dim = get_step_dim(cache_k.getDim());
+  ml::train::TensorDim cache_v_step_dim = get_step_dim(cache_v.getDim());
 
   unsigned int batch_size = (_from) ? 1 : query.batch();
 
   for (unsigned int batch = 0; batch < batch_size; ++batch) {
     nntrainer::Tensor query_step = query.getSharedDataTensor(
       query_step_dim, batch * query.getDim().getFeatureLen(), true);
-    nntrainer::Tensor latent_kv_step = latent_kv.getSharedDataTensor(
-      latent_kv_step_dim, batch * latent_kv.getDim().getFeatureLen(), true);
+    nntrainer::Tensor kv_b_step = kv_b_output.getSharedDataTensor(
+      kv_b_step_dim, batch * kv_b_output.getDim().getFeatureLen(), true);
     nntrainer::Tensor key_rope_step = key_rope.getSharedDataTensor(
       key_rope_step_dim, batch * key_rope.getDim().getFeatureLen(), true);
     nntrainer::Tensor output_step = output.getSharedDataTensor(
       output_step_dim, batch * output.getDim().getFeatureLen(), true);
 
-    nntrainer::Tensor w_uv = context.getWeight(tensor_idx[AttentionParams::weight_uv]);
-    nntrainer::Tensor w_uk = context.getWeight(tensor_idx[AttentionParams::weight_uk]);
-
     one_batch_incremental_forwarding(
-      batch, _from, from, to, query_step, latent_kv_step, key_rope_step,
-      output_step, cache_c_kv, cache_k_pe, cache_c_kv.getDim(),
-      cache_c_kv_step_dim, cache_k_pe.getDim(), cache_k_pe_step_dim,
-      w_uv, w_uk);
+      batch, _from, from, to, query_step, kv_b_step, key_rope_step,
+      output_step, cache_k, cache_v, cache_k.getDim(),
+      cache_k_step_dim, cache_v.getDim(), cache_v_step_dim);
   }
 }
 
 void MLACoreLayer::one_batch_incremental_forwarding(
   const unsigned int batch, const unsigned int _from, const unsigned int from,
   const unsigned int to, nntrainer::Tensor &query_step,
-  nntrainer::Tensor &latent_kv_step, nntrainer::Tensor &key_rope_step,
-  nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_c_kv,
-  nntrainer::Tensor &cache_k_pe, const ml::train::TensorDim &cache_c_kv_dim,
-  const ml::train::TensorDim &cache_c_kv_step_dim,
-  const ml::train::TensorDim &cache_k_pe_dim,
-  const ml::train::TensorDim &cache_k_pe_step_dim,
-  const nntrainer::Tensor &w_uv, const nntrainer::Tensor &w_uk) {
+  nntrainer::Tensor &kv_b_step, nntrainer::Tensor &key_rope_step,
+  nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_k,
+  nntrainer::Tensor &cache_v, const ml::train::TensorDim &cache_k_dim,
+  const ml::train::TensorDim &cache_k_step_dim,
+  const ml::train::TensorDim &cache_v_dim,
+  const ml::train::TensorDim &cache_v_step_dim) {
 
-  // 1. Update Caches
-  nntrainer::Tensor b_cache_c_kv_step = cache_c_kv.getSharedDataTensor(
-    cache_c_kv_step_dim,
-    batch * cache_c_kv_dim.getFeatureLen() + from * cache_c_kv_dim.width(), true);
+  unsigned int step_len = to - from;
+  float *kv_b_ptr = kv_b_step.getData<float>();
+  float *key_rope_ptr = key_rope_step.getData<float>();
   
-  nntrainer::Tensor b_cache_k_pe_step = cache_k_pe.getSharedDataTensor(
-    cache_k_pe_step_dim,
-    batch * cache_k_pe_dim.getFeatureLen() + from * cache_k_pe_dim.width(), true);
+  float *cache_k_ptr = cache_k.getData<float>() + batch * cache_k_dim.getFeatureLen() + from * cache_k_dim.width();
+  float *cache_v_ptr = cache_v.getData<float>() + batch * cache_v_dim.getFeatureLen() + from * cache_v_dim.width();
 
-  b_cache_c_kv_step.copyData(latent_kv_step);
-  b_cache_k_pe_step.copyData(key_rope_step);
+  unsigned int kv_b_head_dim = qk_nope_dim + v_head_dim;
+  unsigned int k_full_dim = qk_nope_dim + qk_rope_dim;
 
-  // 2. Apply RoPE to Key Cache (RoPE part)
-  // Note: key_rope_step is already in cache, apply in place
-  apply_rotary_emb_tensor_v2(b_cache_k_pe_step, b_cache_k_pe_step, qk_rope_dim, _from, false);
+  // Update Caches (Unchanged)
+  for (unsigned int t = 0; t < step_len; ++t) {
+    for (unsigned int h = 0; h < num_heads_Q; ++h) {
+      float *src_kv_b = kv_b_ptr + t * num_heads_Q * kv_b_head_dim + h * kv_b_head_dim;
+      float *src_k_rope = key_rope_ptr + t * qk_rope_dim; // Broadcasted RoPE key
+      
+      float *dst_k = cache_k_ptr + t * num_heads_Q * k_full_dim + h * k_full_dim;
+      float *dst_v = cache_v_ptr + t * num_heads_Q * v_head_dim + h * v_head_dim;
+      
+      std::copy(src_kv_b, src_kv_b + qk_nope_dim, dst_k);
+      std::copy(src_k_rope, src_k_rope + qk_rope_dim, dst_k + qk_nope_dim);
+      std::copy(src_kv_b + qk_nope_dim, src_kv_b + kv_b_head_dim, dst_v);
+    }
+  }
 
-  // 3. MLA Attention Calculation
-  // We will iterate over heads and compute scores
-  // Query Layout: [Head1_Nope, Head1_Rope, Head2_Nope, Head2_Rope, ...]
-  // Dimensions:
-  // q_nope_dim = qk_nope_dim
-  // q_rope_dim = qk_rope_dim
-  // kv_lora_rank = kv_lora_rank
-  
+  // Apple RoPE to Cache K (Unchanged)
+  for (unsigned int t = 0; t < step_len; ++t) {
+    unsigned int pos = from + t;
+    if (pos >= (*freqs_cos).size()) continue;
+    
+    const std::vector<float> &cos_t = (*freqs_cos)[pos];
+    const std::vector<float> &sin_t = (*freqs_sin)[pos];
+    unsigned int half_ = qk_rope_dim / 2;
+    
+    for (unsigned int h = 0; h < num_heads_Q; ++h) {
+      float *k_head_ptr = cache_k_ptr + t * num_heads_Q * k_full_dim + h * k_full_dim;
+      float *k_rope_ptr = k_head_ptr + qk_nope_dim;
+      
+      for (unsigned int i = 0; i < half_; ++i) {
+        float r1 = k_rope_ptr[2 * i];
+        float r2 = k_rope_ptr[2 * i + 1];
+        k_rope_ptr[2 * i] = r1 * cos_t[i] - r2 * sin_t[i];
+        k_rope_ptr[2 * i + 1] = r1 * sin_t[i] + r2 * cos_t[i];
+      }
+    }
+  }
+
+  // 3. Attention Calculation
   float *query_ptr = query_step.getData<float>();
-  float *cache_c_kv_ptr = cache_c_kv.getData<float>() + batch * cache_c_kv_dim.getFeatureLen();
-  float *cache_k_pe_ptr = cache_k_pe.getData<float>() + batch * cache_k_pe_dim.getFeatureLen();
   float *output_ptr = attention_output_step.getData<float>();
   
-  // Weights
-  // Weights
-  const float *w_uv_ptr = w_uv.getData<float>();
-  const float *w_uk_ptr = w_uk.getData<float>();
-
-  unsigned int seq_len = to; // Total sequence length processed so far
+  float *full_cache_k_ptr = cache_k.getData<float>() + batch * cache_k_dim.getFeatureLen();
+  float *full_cache_v_ptr = cache_v.getData<float>() + batch * cache_v_dim.getFeatureLen();
+  
   unsigned int q_head_dim = qk_nope_dim + qk_rope_dim;
+  unsigned int seq_len = to; 
   
-  // Temporary buffer for scores: [NumHeads, SeqLen]
-  std::vector<float> scores(num_heads_Q * seq_len);
-  
-  // Temporary buffer for latent context: [NumHeads, KV_LORA_RANK]
-  // Note: In MLA, context is first aggregated in latent space (KV_LORA_RANK), then projected.
-  // But since we have multiple heads, we usually project first?
-  // Wait, DeepSeek MLA:
-  // "For each head, we compute attention scores, then aggregate C_KV."
-  // "Then we concatenate heads and project? No, MLA projects C_KV to Output."
-  // Actually, standard MLA:
-  // Context = Sum(Score * C_KV) -> [KV_LORA_RANK]
-  // Output = Context * W_UV -> [NumHeads * V_Head_Dim]
-  // Wait, if we aggregate C_KV, we lose head information?
-  // No, MLA has multiple heads.
-  // Each head has its own query $q_i$.
-  // $Score_i = q_{i,nop} c_{KV}^T + q_{i,pe} k_{pe}^T$
-  // $Attn_i = Softmax(Score_i)$
-  // $Context_i = Attn_i \cdot c_{KV}$ -> [KV_LORA_RANK]
-  // $Output_i = Context_i \cdot W_{UV, i}$ -> [V_Head_Dim]
-  // $Output = Concat(Output_i)$
-  // Optimization:
-  // $Context_{combined} = \sum_i (Attn_i \otimes c_{KV})$ ? No.
-  // We compute $Context_i$ for each head.
-  // Then we can batch project: $[NumHeads, KV_LORA_RANK] \times [NumHeads, KV_LORA_RANK, V_Head_Dim]$?
-  // Or $W_{UV}$ is $[NumHeads * V_Head_Dim, KV_LORA_RANK]$.
-  // Let's assume $W_{UV}$ projects from latent to full output.
-  
-  // 3.1 Compute Scores and Context per Head
   auto &pool = nntrainer::ThreadPoolManager::Global().getThreadPool();
   std::vector<std::future<void>> futures;
 
   for (unsigned int h = 0; h < num_heads_Q; ++h) {
-    futures.push_back(pool.submit_task([=, &scores]() {
-      // Pointers for this head
-      float *q_head_ptr = query_ptr + h * q_head_dim;
-      float *q_nope_ptr = q_head_ptr;
-      float *q_rope_ptr = q_head_ptr + qk_nope_dim;
-      
-      // Apply RoPE to q_rope_ptr (Need a temporary buffer or in-place if safe)
-      // Since query_step is [1, 1, 1, ...], we can modify in place if we are careful.
-      // But we need `_from` position.
-      // Let's use a temp buffer for rotated query rope
-      std::vector<float> q_rope_rotated(qk_rope_dim);
-      // Copy
-      std::copy(q_rope_ptr, q_rope_ptr + qk_rope_dim, q_rope_rotated.begin());
-      
-      // Apply RoPE: We need a helper that works on single vector
-      // Existing `apply_rotary_emb_tensor_v2` works on tensors.
-      // We can manually call `compute_rotary_emb_value` if we had access.
-      // Or just use the precomputed cos/sin directly.
-      unsigned int half_ = qk_rope_dim / 2;
-      const std::vector<float> &cos = (*freqs_cos)[_from];
-      const std::vector<float> &sin = (*freqs_sin)[_from];
-      
-      for (unsigned int i = 0; i < half_; ++i) {
-        float r1 = q_rope_rotated[i];
-        float r2 = q_rope_rotated[i + half_];
-        q_rope_rotated[i] = r1 * cos[i] - r2 * sin[i];
-        q_rope_rotated[i + half_] = r1 * sin[i + half_] + r2 * cos[i + half_];
-      }
-      
-      // Compute Scores for all timesteps t in [0, to)
-      for (unsigned int t = 0; t < to; ++t) {
-        float score = 0.0f;
-        
-        // Content Score: q_nope . k_nop[t]
-        // k_nop[t] = c_kv[t] * W_UK_head^T
-        // W_UK_head is [QK_NOPE_DIM, KV_LORA_RANK]
-        // We compute k_nop_t on the fly or assume q_nope is absorbed?
-        // Let's compute k_nop_t for this head.
-        
-        float *c_kv_t = cache_c_kv_ptr + t * kv_lora_rank;
-        
-        // Project c_kv_t to k_nop_t
-        // k_nop_t[i] = Sum_k (c_kv_t[k] * W_UK[h, i, k])
-        // W_UK flat index: h * QK_NOPE_DIM * KV_LORA_RANK + i * KV_LORA_RANK + k
-        
-        for (unsigned int i = 0; i < qk_nope_dim; ++i) {
-            float k_val = 0.0f;
-            const float *w_uk_row = w_uk_ptr + (h * qk_nope_dim + i) * kv_lora_rank;
-            for (unsigned int k = 0; k < kv_lora_rank; ++k) {
-                k_val += c_kv_t[k] * w_uk_row[k];
-            }
-            // Dot product with q_nope
-            score += q_nope_ptr[i] * k_val;
+    futures.push_back(pool.submit_task([=]() {
+      float score_scale = 1.0f / std::sqrt(static_cast<float>(qk_nope_dim + qk_rope_dim));
+
+      for (unsigned int t_q = 0; t_q < step_len; ++t_q) {
+        unsigned int q_idx = from + t_q; 
+
+        // Query pointers for this step
+        // Input: [B=1, C=1, H=Step, W=NumHeads * (NopeDim + RopeDim)]
+        // Stride W = 1.
+        // Stride H (Step) = NumHeads * (NopeDim + RopeDim).
+        // Layout: t_0: [H0_Nope, H0_Rope, H1_Nope, H1_Rope...], t_1: [...]
+        // So offset for Head h, Step t:
+        // t * (NumHeads * (NopeDim + RopeDim)) + h * (NopeDim + RopeDim)
+        float *q_head_ptr = query_ptr + t_q * num_heads_Q * q_head_dim + h * q_head_dim;
+        float *q_nope_ptr = q_head_ptr;
+        float *q_rope_ptr = q_head_ptr + qk_nope_dim;
+
+        // Apply RoPE to Query (Interleaved)
+        std::vector<float> q_rope_rotated(qk_rope_dim);
+        std::copy(q_rope_ptr, q_rope_ptr + qk_rope_dim, q_rope_rotated.begin());
+
+        const std::vector<float> &cos = (*freqs_cos)[_from + t_q]; // Use correct position for query
+        const std::vector<float> &sin = (*freqs_sin)[_from + t_q];
+        unsigned int half_ = qk_rope_dim / 2;
+
+        for (unsigned int i = 0; i < half_; ++i) {
+          float r1 = q_rope_rotated[2 * i];
+          float r2 = q_rope_rotated[2 * i + 1];
+          q_rope_rotated[2 * i] = r1 * cos[i] - r2 * sin[i];
+          q_rope_rotated[2 * i + 1] = r1 * sin[i] + r2 * cos[i];
         }
-        
-        // RoPE Score: q_rope . k_pe[t]
-        float *k_pe_t = cache_k_pe_ptr + t * qk_rope_dim;
-        for (unsigned int k = 0; k < qk_rope_dim; ++k) {
-            score += q_rope_rotated[k] * k_pe_t[k];
+
+        // Compute Scores
+        std::vector<float> scores(seq_len);
+        float max_val = -std::numeric_limits<float>::infinity();
+
+        for (unsigned int t_k = 0; t_k < seq_len; ++t_k) {
+          // Causal Masking
+          if (t_k > q_idx) {
+            scores[t_k] = -std::numeric_limits<float>::infinity();
+            continue;
+          }
+
+          float score = 0.0f;
+          float *k_head_ptr = full_cache_k_ptr + t_k * num_heads_Q * k_full_dim + h * k_full_dim;
+
+          // Nope part
+          for (unsigned int i = 0; i < qk_nope_dim; ++i) {
+            score += q_nope_ptr[i] * k_head_ptr[i];
+          }
+
+          // RoPE part
+          float *k_rope_ptr = k_head_ptr + qk_nope_dim;
+          for (unsigned int i = 0; i < qk_rope_dim; ++i) {
+            score += q_rope_rotated[i] * k_rope_ptr[i];
+          }
+
+          score *= score_scale; // Correct scaling
+          scores[t_k] = score;
+          if (score > max_val) max_val = score;
         }
-        
-        score *= attention_scaling; // Apply scaling
-        scores[h * seq_len + t] = score;
-      }
-      
-      // Softmax for this head
-      // Apply causal mask (if t > from, usually handled by loop range, but here we compute all up to `to`)
-      // Actually we only care about the last row (current step) attending to all previous.
-      // Since query is 1 step (`_from`), we are computing row `_from`.
-      // We need to mask out t > _from? No, `to` is `_from + 1` usually.
-      // If `to` > `_from + 1`, we are processing multiple query steps?
-      // `incremental_forwarding` usually processes 1 query step attending to `to` context.
-      // So we are computing 1 row of scores: [0, ..., to-1].
-      
-      // Softmax
-      float max_val = -std::numeric_limits<float>::infinity();
-      for (unsigned int t = 0; t < to; ++t) {
-          if (scores[h * seq_len + t] > max_val) max_val = scores[h * seq_len + t];
-      }
-      
-      float sum_exp = 0.0f;
-      for (unsigned int t = 0; t < to; ++t) {
-          scores[h * seq_len + t] = std::exp(scores[h * seq_len + t] - max_val);
-          sum_exp += scores[h * seq_len + t];
-      }
-      for (unsigned int t = 0; t < to; ++t) {
-          scores[h * seq_len + t] /= sum_exp;
-      }
-      
-      // Context Aggregation: Sum(Score[t] * c_kv[t])
-      std::vector<float> context_head(kv_lora_rank, 0.0f);
-      for (unsigned int t = 0; t < to; ++t) {
-          float attn = scores[h * seq_len + t];
-          float *c_kv_t = cache_c_kv_ptr + t * kv_lora_rank;
-          for (unsigned int k = 0; k < kv_lora_rank; ++k) {
-              context_head[k] += attn * c_kv_t[k];
+
+        // Softmax
+        float sum_exp = 0.0f;
+        for (unsigned int t_k = 0; t_k < seq_len; ++t_k) {
+          if (scores[t_k] == -std::numeric_limits<float>::infinity()) {
+            scores[t_k] = 0.0f;
+          } else {
+            scores[t_k] = std::exp(scores[t_k] - max_val);
+            sum_exp += scores[t_k];
           }
-      }
-      
-      // Up-Projection: Context_head * W_UV_head
-      // W_UV is [NumHeads * V_Head_Dim, KV_LORA_RANK] (transposed in memory usually [Out, In])
-      // We need W_UV part for this head.
-      // Let's assume W_UV is [NumHeads, V_Head_Dim, KV_LORA_RANK] logically.
-      // Flat index: h * V_Head_Dim * KV_LORA_RANK + v * KV_LORA_RANK + k
-      // Wait, nntrainer weights are [Output, Input].
-      // Output dim: NumHeads * V_Head_Dim. Input dim: KV_LORA_RANK.
-      // So W_UV is a matrix of size (NumHeads * V_Head_Dim) x KV_LORA_RANK.
-      // Row `r` corresponds to output element `r`.
-      // Output for head `h` is rows `h * V_Head_Dim` to `(h+1) * V_Head_Dim`.
-      
-      size_t v_head_dim = (qk_nope_dim + qk_rope_dim); // Assumed
-      float *out_head_ptr = output_ptr + h * v_head_dim;
-      
-      for (unsigned int v = 0; v < v_head_dim; ++v) {
-          float val = 0.0f;
-          unsigned int row_idx = h * v_head_dim + v;
-          const float *w_row = w_uv_ptr + row_idx * kv_lora_rank;
-          
-          for (unsigned int k = 0; k < kv_lora_rank; ++k) {
-              val += context_head[k] * w_row[k];
+        }
+        for (unsigned int t_k = 0; t_k < seq_len; ++t_k) {
+          scores[t_k] /= sum_exp;
+        }
+
+        // Weighted Sum of V
+        float *out_head_ptr = output_ptr + t_q * num_heads_Q * v_head_dim + h * v_head_dim;
+        std::fill(out_head_ptr, out_head_ptr + v_head_dim, 0.0f);
+
+        for (unsigned int t_k = 0; t_k < seq_len; ++t_k) {
+          float attn = scores[t_k];
+          if (attn == 0.0f) continue;
+          float *v_head_ptr = full_cache_v_ptr + t_k * num_heads_Q * v_head_dim + h * v_head_dim;
+          for (unsigned int i = 0; i < v_head_dim; ++i) {
+            out_head_ptr[i] += attn * v_head_ptr[i];
           }
-          out_head_ptr[v] = val;
-      }
+        }
+      } // End query loop
     }));
+  }
+  
+  for (auto &f : futures) {
+    f.wait();
   }
   
   for (auto &fut : futures) fut.get();
@@ -467,8 +415,22 @@ void MLACoreLayer::_compute_default_parameters(int head_dim, float theta) {
 }
 
 void MLACoreLayer::_compute_yarn_parameters(int head_dim, float theta) {
-  // Placeholder for YARN, falling back to default for now or copying logic if needed
-  _compute_default_parameters(head_dim, theta);
+  // Yarn implementation simplified:
+  // For short sequences, the frequency correction is minimal.
+  // The most important part is the attention scaling (mscale).
+  
+  float mscale = std::get<props::RopeScalingMscale>(mla_core_props).get();
+  float mscale_all_dim = std::get<props::RopeScalingMscaleAllDim>(mla_core_props).get();
+  
+  attention_scaling = mscale * mscale_all_dim;
+  
+  // Use default frequency calculation for now
+  // TODO: Implement full Yarn frequency correction if needed for long context
+  unsigned int half_ = head_dim / 2;
+  for (unsigned int i = 0; i < half_; ++i) {
+    thetas.push_back(1.0 /
+                     (std::pow(theta, (2 * i) / static_cast<float>(head_dim))));
+  }
 }
 
 void MLACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,

@@ -78,6 +78,12 @@ private:
 
   std::vector<std::string> LAYER_TYPES; /**< Layer types */
   float ATTENTION_ROPE_SCALING_FACTOR;  /**< Attention RoPE scaling factor */
+  float ROPE_SCALING_BETA_FAST;         /**< RoPE scaling beta fast */
+  float ROPE_SCALING_BETA_SLOW;         /**< RoPE scaling beta slow */
+  float ROPE_SCALING_MSCALE;            /**< RoPE scaling mscale */
+  float ROPE_SCALING_MSCALE_ALL_DIM;    /**< RoPE scaling mscale all dim */
+  std::string ROPE_SCALING_TYPE;        /**< RoPE scaling type */
+  unsigned int ROPE_SCALING_MAX_POSITION_EMBEDDINGS; /**< RoPE scaling max position embeddings */
 
   // MLA specific parameters
   unsigned int Q_LORA_RANK;      /**< Q LoRA rank */
