@@ -18,7 +18,6 @@ endif
 
 common_win_subproject_cmake_defines = {
   'CMAKE_MSVC_RUNTIME_LIBRARY': 'MultiThreaded',
-  'CMAKE_BUILD_TYPE': cmake_build_type,
 }
 
 # Set version info
@@ -584,6 +583,17 @@ else
     iniparser_options.add_cmake_defines({'BUILD_TESTING': false})
     iniparser_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
     iniparser_options.add_cmake_defines({'CMAKE_BUILD_TYPE': cmake_build_type})
+    if get_option('platform') == 'windows'
+      iniparser_options.add_cmake_defines(common_win_subproject_cmake_defines)
+      if arch == 'aarch64' or arch == 'arm64'
+        iniparser_options.add_cmake_defines({'CMAKE_SYSTEM_PROCESSOR': 'ARM64'})
+        iniparser_options.add_cmake_defines({'CMAKE_C_FLAGS': '--target=aarch64-pc-windows-msvc'})
+        iniparser_options.add_cmake_defines({'CMAKE_CXX_FLAGS': '--target=aarch64-pc-windows-msvc'})
+        iniparser_options.add_cmake_defines({'CMAKE_STATIC_LINKER_FLAGS': '/machine:ARM64'})
+        iniparser_options.add_cmake_defines({'CMAKE_SHARED_LINKER_FLAGS': '/machine:ARM64'})
+        iniparser_options.add_cmake_defines({'CMAKE_EXE_LINKER_FLAGS': '/machine:ARM64'})
+      endif
+    endif
     iniparser_subproject = cmake.subproject('iniparser', options: iniparser_options, required: true)
     iniparser_dep = iniparser_subproject.dependency('iniparser-static')
   endif
