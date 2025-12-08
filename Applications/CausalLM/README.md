@@ -56,9 +56,7 @@ $ ./tools/package_android.sh -Domp-num-threads=4 -Dggml-thread-backend=omp
 
 - qwen3_causallm : basic implementation of qwen3 model
 - qwen3_moe_causallm : basic implementation of qwen3 moe model
-- qwen3_slim_moe_causallm : nntrainer's FSU-scheme-activated qwen3 moe model (not recommended)
-- nntr_qwen3_moe_causallm : nntrainer's Q/K/V parallelized qwen3 moe model (not recommended)
-- nntr_qwen3_causallm : nntrainer's Q/K/V parallelized qwen3 model (not recommended)
+- qwen3_slim_moe_causallm : nntrainer's FSU-scheme-activated qwen3 moe model
 - qwen3_cached_slim_moe_causallm : nntrainer's MoE-specific FSU-based qwen3 moe model
 - gptoss_causallm : basic implementation of gpt oss model
 - gptoss_cached_slim_causallm : nntrainer's MoE-specific FSU-based gpt-oss moe model
