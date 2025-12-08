@@ -1,18 +1,8 @@
+message('Processing CausalLM')
 causallm_src = [
     meson.current_source_dir() / 'causal_lm.cpp',
     meson.current_source_dir() / 'huggingface_tokenizer.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
-]
-
-causallm_src += [
-    meson.current_source_dir() / 'qwen3_causallm.cpp',
-    meson.current_source_dir() / 'qwen3_moe_causallm.cpp',
-    meson.current_source_dir() / 'qwen3_slim_moe_causallm.cpp',
-    meson.current_source_dir() / 'qwen3_cached_slim_moe_causallm.cpp',
-    meson.current_source_dir() / 'nntr_qwen3_causallm.cpp',
-    meson.current_source_dir() / 'nntr_qwen3_moe_causallm.cpp',
-    meson.current_source_dir() / 'gptoss_causallm.cpp',
-    meson.current_source_dir() / 'gptoss_cached_slim_causallm.cpp',
 ]
 
 executable_src = [
@@ -23,23 +13,21 @@ causallm_inc_abs = [meson.current_source_dir()]
 causallm_inc = [include_directories('.')]
 
 # Build layer dependency
+causallm_layer_dependencies = []
 subdir('layers')
 
-# causallm_layer_dependencies
-causallm_layer_dependencies = [
+# Add common layers to dependencies
+causallm_layer_dependencies += [
     causallm_rms_norm_dep,
     causallm_tie_word_embedding_dep,
     causallm_swiglu_dep,
     causallm_mha_core_dep,
     causallm_embedding_layer_dep,
     causallm_reshaped_rms_norm_dep,
-    causallm_moe_layer_dep,
-    causallm_slim_moe_layer_dep,
-    causallm_cached_slim_moe_layer_dep,
     causallm_qkv_layer_dep, 
-    casuallm_gptoss_moe_layer_dep,
-    causallm_cached_slim_gpt_oss_moe_layer_dep,
 ]
+
+subdir('models')
 
 if (get_option('platform') == 'windows') and (build_machine.system() == 'windows')
     run_command(powershell_prog, '-ExecutionPolicy', 'Bypass', '-File', join_paths(meson.source_root(), 'jni', 'prepare_encoder.ps1'), meson.build_root(), '0.2', check: true)
