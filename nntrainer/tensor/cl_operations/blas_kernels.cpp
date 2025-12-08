@@ -30,12 +30,9 @@ void gemv_int4_async_cl(std::vector<void *> weights,
   auto &clbuffInstance = ClBufferManager::Global();
 
   const bool scale_row_major = false;
-  std::string compile_options =
-    " -D SIZE_QUANTIZATION_GROUP=" + std::to_string(quantization_group_size) +
-    " -D SCALE_ROW_MAJOR=" + std::to_string(scale_row_major);
 
   ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
-    int4_gemv_kernel, "fully_connected_gpu_int4_gemv", compile_options);
+    int4_gemv_kernel, "fully_connected_gpu_int4_gemv");
   if (!kernel_ptr) {
     throw std::runtime_error(
       "Failed to get kernel_ptr for fully_connected_gpu_int4_gemv");
@@ -83,6 +80,18 @@ void gemv_int4_async_cl(std::vector<void *> weights,
       throw std::runtime_error(
         "Failed to set kernel argument 5 for fully_connected_gpu_int4_gemv");
 
+    int q_group_size = quantization_group_size;
+    result = kernel_ptr->SetKernelArguments(arg++, &q_group_size, sizeof(int));
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 6 for fully_connected_gpu_int4_gemv");
+
+    int row_major = scale_row_major;
+    result = kernel_ptr->SetKernelArguments(arg++, &row_major, sizeof(int));
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 7 for fully_connected_gpu_int4_gemv");
+
     const int work_groups_count[3] = {(int)(alignN / 2), 1, 16};
     result = blas_cc->command_queue_inst_.DispatchCommand(
       kernel_ptr, work_groups_count, work_group_size);
@@ -116,12 +125,9 @@ void gemv_int4_cl(char *weight, uint16_t *scale, uint16_t *input,
   auto &clbuffInstance = ClBufferManager::Global();
 
   const bool scale_row_major = false;
-  std::string compile_options =
-    " -D SIZE_QUANTIZATION_GROUP=" + std::to_string(quantization_group_size) +
-    " -D SCALE_ROW_MAJOR=" + std::to_string(scale_row_major);
 
   ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
-    int4_gemv_kernel, "fully_connected_gpu_int4_gemv", compile_options);
+    int4_gemv_kernel, "fully_connected_gpu_int4_gemv");
   if (!kernel_ptr) {
     throw std::runtime_error(
       "Failed to get kernel_ptr for fully_connected_gpu_int4_gemv");
@@ -160,6 +166,18 @@ void gemv_int4_cl(char *weight, uint16_t *scale, uint16_t *input,
   if (!result)
     throw std::runtime_error(
       "Failed to set kernel argument 5 for fully_connected_gpu_int4_gemv");
+
+  int q_group_size = quantization_group_size;
+  result = kernel_ptr->SetKernelArguments(arg++, &q_group_size, sizeof(int));
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 6 for fully_connected_gpu_int4_gemv");
+
+  int row_major = scale_row_major;
+  result = kernel_ptr->SetKernelArguments(arg++, &row_major, sizeof(int));
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 7 for fully_connected_gpu_int4_gemv");
 
   const int work_groups_count[3] = {(int)(alignN / 2), 1, 16};
   const int work_group_size[3] = {16, 1, 16};
@@ -445,13 +463,9 @@ void openvino_gemm_async_cl(float *input, std::vector<void *> weights,
   std::vector<cl_event> quantize_event(1);
   {
     int alignK = align(K, quantization_group_size);
-    std::string compile_options =
-      " -D SIZE_N=" + std::to_string(Ns[0]) +
-      " -D SIZE_K=" + std::to_string(K) +
-      " -D SIZE_QUANTIZATION_GROUP=" + std::to_string(quantization_group_size);
 
     ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
-      int4_quantize_input_kernel, "quantize_input_int4_pad", compile_options);
+      int4_quantize_input_kernel, "quantize_input_int4_pad");
     if (!kernel_ptr) {
       throw std::runtime_error("Failed to get kernel_ptr for quantize_input");
       return;
@@ -477,6 +491,25 @@ void openvino_gemm_async_cl(float *input, std::vector<void *> weights,
       throw std::runtime_error("Failed to set kernel argument 2 for "
                                "quantize_input");
 
+    int size_n = Ns[0];
+    int size_k = K;
+    int q_group_size = quantization_group_size;
+
+    result = kernel_ptr->SetKernelArguments(arg++, &size_n, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 3 for "
+                               "quantize_input");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &size_k, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 4 for "
+                               "quantize_input");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &q_group_size, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 5 for "
+                               "quantize_input");
+
     std::array<size_t, 3> global_work_size = {
       (M * alignK) / quantization_group_size, 1, 1};
 
@@ -491,13 +524,9 @@ void openvino_gemm_async_cl(float *input, std::vector<void *> weights,
     const unsigned int alignN = align(N, N_GROUP_SIZE);
 
     const bool scale_row_major = false;
-    std::string compile_options =
-      " -D SIZE_N=" + std::to_string(N) + " -D SIZE_K=" + std::to_string(K) +
-      " -D SIZE_QUANTIZATION_GROUP=" + std::to_string(quantization_group_size) +
-      " -D SCALE_ROW_MAJOR=" + std::to_string(scale_row_major);
 
     ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
-      openvino_gemm_kernel, "fc_bf_tiled_kernel_default", compile_options);
+      openvino_gemm_kernel, "fc_bf_tiled_kernel_default");
     if (!kernel_ptr) {
       throw std::runtime_error(
         "Failed to get kernel_ptr for fc_bf_tiled_kernel_default");
@@ -505,6 +534,10 @@ void openvino_gemm_async_cl(float *input, std::vector<void *> weights,
     }
 
     int arg = 0;
+    int size_n = N;
+    int size_k = K;
+    int q_group_size = quantization_group_size;
+    int row_major = scale_row_major;
 
     result =
       kernel_ptr->SetKernelSVMArguments(arg++, clbuffInstance.getSVMInput());
@@ -545,6 +578,26 @@ void openvino_gemm_async_cl(float *input, std::vector<void *> weights,
     if (!result)
       throw std::runtime_error(
         "Failed to set kernel argument 6 for fc_bf_tiled_kernel_default");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &size_n, sizeof(int));
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 7 for fc_bf_tiled_kernel_default");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &size_k, sizeof(int));
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 8 for fc_bf_tiled_kernel_default");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &q_group_size, sizeof(int));
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 9 for fc_bf_tiled_kernel_default");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &row_major, sizeof(int));
+    if (!result)
+      throw std::runtime_error(
+        "Failed to set kernel argument 10 for fc_bf_tiled_kernel_default");
 
     const int work_groups_count[3] = {(int)(alignN / 2),
                                       (int)(align(ceilDiv(M, 8), 8)), 1};
@@ -601,21 +654,20 @@ void openvino_gemm_cl(void *input, void *weights, void *scales, void *output,
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   auto &clbuffInstance = ClBufferManager::Global();
   const bool scale_row_major = false;
-  std::string compile_options =
-    " -D SIZE_N=" + std::to_string(N) + " -D SIZE_K=" + std::to_string(K) +
-    " -D SIZE_QUANTIZATION_GROUP=" + std::to_string(quantization_group_size) +
-    " -D SCALE_ROW_MAJOR=" + std::to_string(scale_row_major);
 
   std::vector<cl_event> quantize_event(1);
   {
     ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
-      int4_quantize_input_kernel, "quantize_input_int4_pad", compile_options);
+      int4_quantize_input_kernel, "quantize_input_int4_pad");
     if (!kernel_ptr) {
       throw std::runtime_error("Failed to get kernel_ptr for quantize_input");
       return;
     }
 
     int arg = 0;
+    int size_n = N;
+    int size_k = K;
+    int q_group_size = quantization_group_size;
 
     result = kernel_ptr->SetKernelSVMArguments(arg++, input);
 
@@ -635,6 +687,21 @@ void openvino_gemm_cl(void *input, void *weights, void *scales, void *output,
       throw std::runtime_error("Failed to set kernel argument 2 for "
                                "quantize_input");
 
+    result = kernel_ptr->SetKernelArguments(arg++, &size_n, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 3 for "
+                               "quantize_input");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &size_k, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 4 for "
+                               "quantize_input");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &q_group_size, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 5 for "
+                               "quantize_input");
+
     std::array<size_t, 3> global_work_size = {
       (M * alignK) / quantization_group_size, 1, 1};
 
@@ -645,7 +712,7 @@ void openvino_gemm_cl(void *input, void *weights, void *scales, void *output,
 
   // 3. Perform Matrix Multiplication
   ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
-    openvino_gemm_kernel, "fc_bf_tiled_kernel_default", compile_options);
+    openvino_gemm_kernel, "fc_bf_tiled_kernel_default");
   if (!kernel_ptr) {
     throw std::runtime_error(
       "Failed to get kernel_ptr for fc_bf_tiled_kernel_default");
@@ -653,6 +720,10 @@ void openvino_gemm_cl(void *input, void *weights, void *scales, void *output,
   }
 
   int arg = 0;
+  int size_n = N;
+  int size_k = K;
+  int q_group_size = quantization_group_size;
+  int row_major = scale_row_major;
 
   result = kernel_ptr->SetKernelSVMArguments(arg++, input);
 
@@ -691,6 +762,26 @@ void openvino_gemm_cl(void *input, void *weights, void *scales, void *output,
   if (!result)
     throw std::runtime_error(
       "Failed to set kernel argument 6 for fc_bf_tiled_kernel_default");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &size_n, sizeof(int));
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 7 for fc_bf_tiled_kernel_default");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &size_k, sizeof(int));
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 8 for fc_bf_tiled_kernel_default");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &q_group_size, sizeof(int));
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 9 for fc_bf_tiled_kernel_default");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &row_major, sizeof(int));
+  if (!result)
+    throw std::runtime_error(
+      "Failed to set kernel argument 10 for fc_bf_tiled_kernel_default");
 
   const int work_groups_count[3] = {(int)(alignN / 2),
                                     (int)(align(ceilDiv(M, 8), 8)), 1};

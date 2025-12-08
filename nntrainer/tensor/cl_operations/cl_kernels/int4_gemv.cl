@@ -188,10 +188,12 @@ __attribute__((intel_reqd_sub_group_size(SUBGROUP_SIZE))) kernel void
 fully_connected_gpu_int4_gemv(__global half *input, const __global half *scales,
                               __global half *output,
                               const __global char *weights, const int WEIGHTS_K,
-                              const int WEIGHTS_N) {
-  const int SCALE_GROUP_NUM = CEIL_DIV(WEIGHTS_K, SIZE_QUANTIZATION_GROUP);
+                              const int WEIGHTS_N,
+                              const int quantization_group_size,
+                              const int scale_row_major) {
+  const int SCALE_GROUP_NUM = CEIL_DIV(WEIGHTS_K, quantization_group_size);
   int ALIGN_WEIGHTS_N = ALIGN(WEIGHTS_N, 32);
-  int ALIGN_WEIGHTS_K = ALIGN(WEIGHTS_K, SIZE_QUANTIZATION_GROUP);
+  int ALIGN_WEIGHTS_K = ALIGN(WEIGHTS_K, quantization_group_size);
 
   int n = get_global_id(0) * 2;         // N
   int thr_id = get_local_id(2);         // 0~15
@@ -204,33 +206,34 @@ fully_connected_gpu_int4_gemv(__global half *input, const __global half *scales,
   __local float all_sum_even[16][16]; // [wi_id, thr_id]
   __local float all_sum_odd[16][16];
 
-#if SCALE_ROW_MAJOR
-  scales += ((n / 32) * 32 + (n % 32) / 2) * SCALE_GROUP_NUM;
-#else
-  // Scale layout is fbyx
-  scales += (n / 32) * 32 + (n % 32) / 2;
-#endif
+  if (scale_row_major) {
+    scales += ((n / 32) * 32 + (n % 32) / 2) * SCALE_GROUP_NUM;
+  } else {
+    // Scale layout is fbyx
+    scales += (n / 32) * 32 + (n % 32) / 2;
+  }
 
   float2 sum_all = 0;
   for (int gk = gk0; gk < gk1; gk++) {
-    __global half *A = input + gk * DECOMPRESSION_GROUP_SIZE;
-    int w_id = get_4bit_weight_index(gk * DECOMPRESSION_GROUP_SIZE, n,
+    __global half *A = input + gk * quantization_group_size;
+    int w_id = get_4bit_weight_index(gk * quantization_group_size, n,
                                      ALIGN_WEIGHTS_K, ALIGN_WEIGHTS_N, 32);
 
     const __global char *B = weights + w_id;
 
     GEMV_ACCUMULATOR_VEC_TYPE sum = 0;
 
-#if SCALE_ROW_MAJOR
-    float scale_0 = convert_float(scales[gk]);
-    float scale_1 = convert_float(scales[gk + 16 * SCALE_GROUP_NUM]);
-#else
-    float scale_0 = convert_float(scales[gk * ALIGN_WEIGHTS_N]);
-    float scale_1 = convert_float(scales[gk * ALIGN_WEIGHTS_N + 16]);
-#endif
+    float scale_0, scale_1;
+    if (scale_row_major) {
+      scale_0 = convert_float(scales[gk]);
+      scale_1 = convert_float(scales[gk + 16 * SCALE_GROUP_NUM]);
+    } else {
+      scale_0 = convert_float(scales[gk * ALIGN_WEIGHTS_N]);
+      scale_1 = convert_float(scales[gk * ALIGN_WEIGHTS_N + 16]);
+    }
 
     __attribute__((opencl_unroll_hint(4))) for (int g = 0;
-                                                g < DECOMPRESSION_GROUP_SIZE;
+                                                g < quantization_group_size;
                                                 g += 16, B += 16 * 16) {
       GEMV_INPUT_VEC_TYPE input_value =
         GEMV_INPUT_BLOCK_READ(A, g); // read 16 elements of A
