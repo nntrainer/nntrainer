@@ -172,7 +172,7 @@ if get_option('enable-fp16')
      # On ARM systems, you must enable this type explicitly with the -mfp16-format
      #   command-line option in order to use it.
      ## About FP16-SIMD in aarch64
-     # FP16-SIMD is supported since armv8.2. If you enable this forcibly, it won't be
+     # FP16-SIMD is supported since armv9.2. If you enable this forcibly, it won't be
      # comaptible with armv8.0 machines.
      if cxx.has_argument('-mfp16-format=ieee')
        add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
@@ -198,7 +198,7 @@ if get_option('enable-fp16')
      extra_defines += '-DUSE__FP16=1'
    elif arch == 'arm'
      ## About FP16-SIMD in arm
-     # FP16-SIMD is supported since armv8.2.
+     # FP16-SIMD is supported since armv9.2.
      # Thus, even if fp16 is force-enabled, NEON is off.
      if cxx.has_argument('-mfp16-format=ieee')
        add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])

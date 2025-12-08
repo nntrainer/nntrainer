@@ -43,13 +43,13 @@ $ ./nntr_causallm /tmp/nntrainer/Applications/CausalLM/res/qwen3-4b/
 
 - PC test
 ```
-$ meson build -Denable-fp16=true -Dggml-thread-backend=omp -Denable-transformer=true -Domp-num-threads=4
+$ meson build -Denable-fp16=true -Dthread-backend=omp -Denable-transformer=true -Domp-num-threads=4
 $ export OMP_THREAD_LIMIT=16 && export OMP_WAIT_POLICY=active && export OMP_PROC_BIND=true && export OMP_PLACES=cores && export OMP_NUM_THREADS=4
 ```
 
 - Android test
 ```
-$ ./tools/package_android.sh -Domp-num-threads=4 -Dggml-thread-backend=omp
+$ ./tools/package_android.sh -Domp-num-threads=4 -Dthread-backend=omp
 ```
 
 ## Supported Models

@@ -10,14 +10,14 @@ ggml_interface_sources = [
   'ggml_interface.cpp'
 ]
 
-if get_option('ggml-thread-backend') == 'bstp'
+if get_option('thread-backend') == 'bstp'
   ggml_interface_sources += 'ggml_interface_bs_threadpool.cpp'
-elif get_option('ggml-thread-backend') == 'omp'
+elif get_option('thread-backend') == 'omp'
   ggml_interface_sources += 'ggml_interface_omp.cpp'
-elif get_option('ggml-thread-backend') == 'mixed'
+elif get_option('thread-backend') == 'mixed'
   ggml_interface_sources += 'ggml_interface_mixed.cpp'
 else
-  message('Unknown ggml-thread-backend meson option! Use omp as a default.')
+  message('Unknown thread-backend meson option! Use omp as a default.')
   ggml_interface_sources += 'ggml_interface_omp.cpp'
 endif
 
