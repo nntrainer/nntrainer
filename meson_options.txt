@@ -50,7 +50,7 @@ option('enable-biqgemm', type: 'boolean', value: false)
 option('biqgemm-path', type: 'string', value: '../BiQGEMM')
 option('enable-benchmarks', type: 'boolean', value : false)
 option('enable-ruy', type: 'boolean', value: false)
-option('ggml-thread-backend', type: 'string', value: 'mixed')
+option('thread-backend', type: 'string', value: 'omp')
 
 # ml-api dependency (to enable, install capi-inference from github.com/nnstreamer/api )
 # To inter-operate with nnstreamer and ML-API packages, you need to enable this.
