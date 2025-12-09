@@ -3,7 +3,6 @@ onnx_example_sources = [
 ]
 
 onnx_example_dependencies = [app_utils_dep,
-  iniparser_dep,
   nntrainer_dep,
   nntrainer_ccapi_dep
 ]

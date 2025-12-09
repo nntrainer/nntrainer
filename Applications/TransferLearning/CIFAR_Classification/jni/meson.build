@@ -25,7 +25,7 @@ classification_sources = [
 
 e = executable('nntrainer_classification',
   classification_sources,
-  dependencies: [app_utils_dep, iniparser_dep, nntrainer_dep, tflite_dep],
+  dependencies: [app_utils_dep, nntrainer_dep, tflite_dep],
   include_directories: include_directories('.'),
   install: get_option('install-app'),
   install_dir: application_install_dir
@@ -43,7 +43,7 @@ classification_func_sources = [
 
 e = executable('nntrainer_classification_func',
   classification_func_sources,
-  dependencies: [iniparser_dep, nntrainer_ccapi_dep, app_utils_dep],
+  dependencies: [nntrainer_ccapi_dep, app_utils_dep],
   include_directories: include_directories('.'),
   install: get_option('install-app'),
   install_dir: application_install_dir

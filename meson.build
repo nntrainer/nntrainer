@@ -14,6 +14,9 @@ project('nntrainer', 'c', 'cpp',
 cmake_build_type = 'Release'
 if get_option('buildtype') == 'debug'
   cmake_build_type = 'Debug'
+  if build_machine.system() == 'windows'
+    add_project_arguments('-D_ITERATOR_DEBUG_LEVEL=2', language : 'cpp')
+  endif  
 endif
 
 common_win_subproject_cmake_defines = {
@@ -105,9 +108,9 @@ warning_c_flags = [
 ]
 
 arch = host_machine.cpu_family()
-
+message('HOST MACHINE: ' + arch)
 target = target_machine.cpu_family()
-
+message('TARGET MACHINE: ' + target)
 
 subprojects_dir_relative = 'subprojects'
 subprojects_dir_absolute = meson.current_source_dir() / subprojects_dir_relative
@@ -131,7 +134,7 @@ elif arch == 'x86' or arch == 'x86_64'
   message('Build for X86 architecture')
   if cxx_compiler_id == 'msvc'
     add_project_arguments(['/arch:AVX2'], language: ['c','cpp'])
-    # Note: C runtime library (/MT or /MD) is controlled by b_vscrt option
+   add_project_arguments(['cpp_args=/MT'], language: ['c','cpp'] )
   else
     add_project_arguments(['-march=native'], language: ['c','cpp'])
     add_project_arguments(['-mavx2', '-mfma'], language: ['c','cpp'])
@@ -236,6 +239,9 @@ if get_option('enable-opencl')
     clblast_options.add_cmake_defines({'CMAKE_CXX_STANDARD': '17'})
     clblast_options.add_cmake_defines({'TUNERS': false})
     clblast_options.add_cmake_defines({'CMAKE_BUILD_TYPE': cmake_build_type})
+    #modify the opencl path if you need.
+    #clblast_options.add_cmake_defines({'OPENCL_INCLUDE_DIRS': 'C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/include'})    
+    #clblast_options.add_cmake_defines({'OPENCL_LIBRARIES': 'C:/Program Files (x86)/Intel/oneAPI/compiler/2025.2/lib/OpenCL.lib'})        
     if get_option('default_library') == 'static'
       clblast_options.add_cmake_defines({'OVERRIDE_MSVC_FLAGS_TO_MT': false})
       clblast_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
@@ -473,7 +479,19 @@ if get_option('enable-openmp')
       dependencies : [libiomp])
 
   message('set openmp with libiomp5md for windows-----------------')
+elif cxx_compiler_id == 'clang-cl' and (arch == 'aarch64')
+    libiomp_root_opt = get_option('libiomp_root')
+    libiomp_root = join_paths(meson.project_source_root(), libiomp_root_opt)
+    omp_lib_path=join_paths(libiomp_root, 'ARM64')
+    libomp = cc.find_library('libomp', dirs : omp_lib_path, required : true)
+    omp_args = ['-Xclang', '-fopenmp']
+    openmp_dep = declare_dependency(
+      dependencies : libomp,
+      compile_args : omp_args,
+      link_args : []
+    )
 else
+    add_project_link_arguments('-fopenmp', '-static-openmp', language: 'cpp')
     openmp_dep = dependency('openmp')
 endif
   if get_option('omp-num-threads') > 0
@@ -570,24 +588,6 @@ libm_dep = cxx.find_library('m', required: false) # cmath library
 libdl_dep = cxx.find_library('dl', required: false) # DL library
 
 thread_dep = dependency('threads') # pthread for tensorflow-lite
-
-if get_option('platform') == 'android'
-  iniparser_root = subprojects_dir_absolute / 'iniparser'
-  iniparser_dep = declare_dependency()
-else
-  iniparser_dep = dependency('iniparser', required : false, version : '>=3.2') # iniparser
-
-  if not iniparser_dep.found()
-    iniparser_options = cmake.subproject_options()
-    iniparser_options.add_cmake_defines({'BUILD_DOCS': false})
-    iniparser_options.add_cmake_defines({'BUILD_EXAMPLES': false})
-    iniparser_options.add_cmake_defines({'BUILD_TESTING': false})
-    iniparser_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
-    iniparser_options.add_cmake_defines({'CMAKE_BUILD_TYPE': cmake_build_type})
-    iniparser_subproject = cmake.subproject('iniparser', options: iniparser_options, required: true)
-    iniparser_dep = iniparser_subproject.dependency('iniparser-static')
-  endif
-endif
 
 # Configure the Ruy project (CMake)
 ruy_dep = dummy_dep

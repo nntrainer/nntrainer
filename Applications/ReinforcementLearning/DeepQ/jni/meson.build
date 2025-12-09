@@ -19,7 +19,6 @@ deepq_inc = [
 ]
 
 deepq_deps=[
-  iniparser_dep,
   nntrainer_dep,
   tflite_dep,
   jsoncpp_dep,
