@@ -27,7 +27,7 @@ jobs:
         with:
           architecture: x64
       - name: Prepare Build
-        run: meson setup --native-file windows-native.ini builddir
+        run: meson setup --native-file configurations/windows-native.ini builddir
       - name: Run Build
         run: meson compile -C builddir
       - name: Run Test Suite

@@ -101,7 +101,7 @@ else
 
   if get_option('platform') == 'windows'
     nntrainer_def = custom_target('nntrainer_def',
-    command : ['python', meson.source_root() / 'generate_def.py', '--objects_dir', meson.build_root() / 'nntrainer' / 'libnntrainer.a.p', '--working_dir', meson.current_build_dir()],
+    command : ['python', meson.source_root() / 'tools' / 'pyutils' / 'generate_def.py', '--objects_dir', meson.build_root() / 'nntrainer' / 'libnntrainer.a.p', '--working_dir', meson.current_build_dir()],
     output: 'nntrainer.def',
     depends: nntrainer_static,
     )
