@@ -8,7 +8,7 @@ echo $TARGET
 
 
 if [ ! -d $TARGET ]; then
-    if [[ $1 == -D* ]]; then
+    if [[ $1 == -D* ]] || [[ $1 == --arm-arch* ]]; then
 	TARGET=$(pwd)
 	echo $TARGET
     else
@@ -20,12 +20,40 @@ fi
 pushd $TARGET
 
 filtered_args=()
+arm_arch=""
 
 for arg in "$@"; do
     if [[ $arg == -D* ]]; then
 	filtered_args+=("$arg")
     fi
+    # Handle --arm-arch=<version> argument
+    if [[ $arg == --arm-arch=* ]]; then
+        arm_arch="${arg#*=}"
+    fi
 done
+
+# If --arm-arch specified, read configuration from JSON file
+if [[ -n "$arm_arch" ]]; then
+    # Convert dots to dashes for filename (e.g., armv8.2-a -> armv8-2-a)
+    arch_filename=$(echo "$arm_arch" | sed 's/\./-/g')
+    json_file="${TARGET}/tools/cross/android_${arch_filename}.json"
+    if [[ -f "$json_file" ]]; then
+        echo "Using ARM architecture config from: $json_file"
+        # Read values from JSON using Python (portable, no jq dependency)
+        enable_fp16=$(python3 -c "import json; print(json.load(open('$json_file'))['enable_fp16'])")
+        # Add arm-arch to meson args
+        filtered_args+=("-Darm-arch=${arm_arch}")
+        # Handle enable_fp16 based on JSON boolean
+        if [[ "$enable_fp16" == "False" ]]; then
+            filtered_args+=("-Denable-fp16=false")
+        fi
+    else
+        echo "Warning: JSON config file not found: $json_file"
+        echo "Available configurations:"
+        ls -1 "${TARGET}/tools/cross/"*.json 2>/dev/null || echo "  No configurations found in tools/cross/"
+    fi
+fi
+
 
 if [ ! -d builddir ]; then
     #default value of openblas num threads is 1 for android

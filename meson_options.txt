@@ -64,3 +64,9 @@ option('nnstreamer-subplugin-install-path', type: 'string', value: 'lib/nnstream
 # application related options
 option('enable-transformer', type: 'boolean', value: false)
 option('libiomp_root', type:'string', value: './libiomp_win')
+
+# ARM architecture options
+option('arm-arch', type: 'combo',
+       choices: ['auto', 'armv7l', 'armv8.2-a', 'armv9.2-a'],
+       value: 'auto',
+       description: 'Target ARM architecture. "auto" detects from host for native builds, defaults to armv8.2-a for cross-compilation.')

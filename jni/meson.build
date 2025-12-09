@@ -1,12 +1,20 @@
 and_conf = configuration_data()
 
 flags = []
+arm_march_flag = ''
 if get_option('debug')
     flags += '-g'
 endif
 
 if get_option('enable-fp16')
-   flags += '-march=armv8.2-a+fp16+dotprod+i8mm'
+   # Use arm-arch option for architecture-specific flags
+   arm_arch_opt = get_option('arm-arch')
+   if arm_arch_opt == 'armv9.2-a'
+     arm_march_flag = '-march=armv9.2-a+fp16+sve2+sme'
+   elif arm_arch_opt == 'armv8.2-a' or arm_arch_opt == 'auto'
+     arm_march_flag = '-march=armv8.2-a+fp16+dotprod+i8mm'
+   endif
+   flags += arm_march_flag
 endif
 
 flags += '-O@0@'.format(get_option('optimization'))
@@ -14,12 +22,14 @@ message('compile flags are:' + ' '.join(flags))
 
 flags = extra_defines + flags
 
+
 and_conf.set('MESON_CFLAGS', ' '.join(flags))
 and_conf.set('MESON_CXXFLAGS', ' '.join(flags))
 and_conf.set('MESON_NNTRAINER_SRCS', ' '.join(nntrainer_sources))
 and_conf.set('MESON_NNTRAINER_INCS', ' '.join(nntrainer_inc_abs))
 and_conf.set('MESON_CCAPI_NNTRAINER_SRCS', ' '.join(ccapi_src))
 and_conf.set('MESON_CCAPI_NNTRAINER_INCS', ' '.join(ccapi_inc_abs))
+and_conf.set('MESON_ARM_MARCH', arm_march_flag)
 
 and_conf.set('VERSION_MAJOR', nntrainer_version_split[0])
 and_conf.set('VERSION_MINOR', nntrainer_version_split[1])

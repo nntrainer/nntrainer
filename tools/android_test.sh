@@ -7,6 +7,7 @@
 opencl_arg="-Denable-opencl=true"  
 enable_gpu=0
 filtered_args=()
+all_args=("$@")
 
 for arg in "$@"; do
     if [[ $arg == -D* ]]; then
@@ -18,7 +19,9 @@ for arg in "$@"; do
     fi
 done
 
-./tools/package_android.sh ${filtered_args[@]}
+# Pass all original arguments (including --arm-arch) to package_android.sh
+./tools/package_android.sh "${all_args[@]}"
+
 
 # You can modify test/jni/Android.mk to choose module that you wish to build
 pushd test/jni
