@@ -14,7 +14,7 @@ import shutil
 import sys
 import subprocess
 
-REPO_DIR = os.path.abspath(os.path.dirname(__file__))
+REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
 SUBPROJECTS_DIR = os.path.join(REPO_DIR, 'subprojects')
 RESOURCES_DIR = os.path.join(REPO_DIR, 'nntrainer-windows-resource')
 

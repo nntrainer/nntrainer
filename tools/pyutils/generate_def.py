@@ -66,7 +66,7 @@ def writedef(deffile, defs):
             else:
                 fh.write("  {}\n".format(k))
 
-REPO_DIR = os.path.abspath(os.path.dirname(__file__))
+REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
 
 def get_args():
     parser = argparse.ArgumentParser()

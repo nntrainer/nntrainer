@@ -30,7 +30,7 @@ jobs:
     - name: Install build systems
       run: sudo apt install meson ninja-build
     - name: Prepare Build
-      run: meson setup --native-file linux-native-clang.ini builddir
+      run: meson setup --native-file configurations/linux-native-clang.ini builddir
     - name: Run Build
       run: meson compile -C builddir
     - name: Run Test Suite
