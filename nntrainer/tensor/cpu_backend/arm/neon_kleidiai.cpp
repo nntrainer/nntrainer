@@ -186,8 +186,6 @@ kai_matmul_ukernel_f32_qa8dxp_qs4cxp ukernel_variants[] = {
 
 };
 
-static size_t roundup(size_t a, size_t b) { return ((a + b - 1) / b) * b; }
-
 uint32_t nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
   size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
   void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
@@ -369,11 +367,6 @@ void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_single_thread(
   size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
   void *rhs_packed_mtx_qs4cx, float *dst_act_mtx_f32, uint32_t idx_variant,
   bool transB, float lower_bound, float upper_bound) {
-  rhs_format format = rhs_format::nxk;
-  if (!transB) {
-    format = rhs_format::kxn;
-  }
-
   const size_t mr = ukernel_variants[idx_variant].ukernel.get_mr();
   const size_t nr = ukernel_variants[idx_variant].ukernel.get_nr();
   const size_t kr = ukernel_variants[idx_variant].ukernel.get_kr();
@@ -420,11 +413,6 @@ void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_n_parallel(
   size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
   void *rhs_packed_mtx_qs4cx, float *dst_act_mtx_f32, uint32_t idx_variant,
   bool transB, float lower_bound, float upper_bound) {
-  rhs_format format = rhs_format::nxk;
-  if (!transB) {
-    format = rhs_format::kxn;
-  }
-
   const size_t mr = ukernel_variants[idx_variant].ukernel.get_mr();
   const size_t nr = ukernel_variants[idx_variant].ukernel.get_nr();
   const size_t kr = ukernel_variants[idx_variant].ukernel.get_kr();
@@ -441,7 +429,7 @@ void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_n_parallel(
   int n_threads = 4;
   assert(n % n_threads == 0);
   size_t n_ukernel = n / n_threads;
-#pragma omp parallel for num_thread(n_threads)
+#pragma omp parallel for num_threads(n_threads)
   for (int current_thread = 0; current_thread < n_threads; ++current_thread) {
     const size_t dst_stride = n * sizeof(float);
     const size_t lhs_offset =
