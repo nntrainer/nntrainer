@@ -11,6 +11,15 @@ nntrainer_inc_abs = [
   meson.source_root() / 'api' / 'ccapi' / 'include'
 ]
 
+nntrainer_common_sources = [
+  'nntrainer_logger.cpp',
+  'app_context.cpp',
+  'engine.cpp',
+  'mem_allocator.cpp',
+  'iniparser.c',
+  'dictionary.c'
+]
+
 nntrainer_sources = []
 nntrainer_headers = [
    meson.current_source_dir() / 'nntrainer_log.h',
@@ -20,11 +29,12 @@ nntrainer_headers = [
    meson.current_source_dir() / 'context.h',
    meson.current_source_dir() / 'engine.h',
    meson.current_source_dir() / 'mem_allocator.h',
+   meson.current_source_dir() / 'iniparser.h',
+   meson.current_source_dir() / 'dictionary.h',      
 ]
 
 nntrainer_base_deps=[
   blas_dep,
-  iniparser_dep,
   libdl_dep,
   libm_dep,
   ml_api_common_dep,
@@ -65,13 +75,6 @@ foreach elem : nntrainer_elements
   nntrainer_inc += include_directories(elem)
   nntrainer_inc_abs += meson.current_source_dir() / elem
 endforeach
-
-nntrainer_common_sources = [
-  'nntrainer_logger.cpp',
-  'app_context.cpp',
-  'engine.cpp',
-  'mem_allocator.cpp'
-]
 
 nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'ruy'
 

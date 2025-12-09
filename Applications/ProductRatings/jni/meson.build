@@ -15,7 +15,7 @@ endif
 
 e = executable('nntrainer_product_ratings',
   'main.cpp',
-  dependencies: [iniparser_dep, nntrainer_ccapi_dep, gtest_dep, nntrainer_dep],
+  dependencies: [nntrainer_ccapi_dep, gtest_dep, nntrainer_dep],
   install: get_option('install-app'),
   install_dir: application_install_dir
 )

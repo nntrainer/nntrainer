@@ -4,7 +4,6 @@ multi_input_sources = [
 ]
 
 multi_input_dependencies = [app_utils_dep,
-  iniparser_dep,
   nntrainer_dep,
   nntrainer_ccapi_dep
 ]

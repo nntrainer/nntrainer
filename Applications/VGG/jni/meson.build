@@ -13,7 +13,7 @@ endif
 
 executable('nntrainer_vgg',
   vgg_sources,
-  dependencies: [iniparser_dep, nntrainer_dep, nntrainer_ccapi_dep, app_utils_dep],
+  dependencies: [nntrainer_dep, nntrainer_ccapi_dep, app_utils_dep],
   include_directories: [include_directories('.'), cifar_include_dir],
   install: get_option('install-app'),
   install_dir: application_install_dir
