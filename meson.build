@@ -455,15 +455,29 @@ message('set nntrainer num threads=@0@'.format(get_option('nntr-num-threads')))
 openmp_dep = dummy_dep
 if get_option('enable-openmp')
  # For Windows on x64, use OpenMP 5.0 instead of the OpenMP 2.0 standard
- if cxx_compiler_id == 'msvc' and (arch == 'x86' or arch == 'x86_64')
+  openmp_win_found = false
+  if cxx_compiler_id == 'msvc' and (arch == 'x86' or arch == 'x86_64')
+    omp_lib_subdir = 'x64'
+    omp_lib_name = 'libiomp5md'
+    openmp_win_found = true
+  elif cxx_compiler_id == 'clang-cl' and (arch == 'aarch64' or arch == 'arm64')
+    omp_lib_subdir = 'arm64'
+    omp_lib_name = 'libomp'
+    openmp_win_found = true
+  endif
+
+  if openmp_win_found
     libiomp_root_opt = get_option('libiomp_root')
     libiomp_root = join_paths(meson.project_source_root(), libiomp_root_opt)
-    omp_libdir = libiomp_root
+    omp_libdir = libiomp_root / omp_lib_subdir
     omp_incdir = join_paths(libiomp_root_opt, 'include')
+
+    omp_libdir_win = omp_libdir.replace('/', '\\')
+    run_command(['xcopy', '/C', '/Y', omp_libdir_win, meson.current_build_dir()], check: true)
 
     add_project_arguments('/openmp', language: ['cpp','c'])
     cpp = meson.get_compiler('cpp')
-    libiomp = cpp.find_library('libiomp5md', dirs: omp_libdir, required: true)
+    libiomp = cpp.find_library(omp_lib_name, dirs: omp_libdir, required: true)
 
     openmp_dep = declare_dependency(
       include_directories : include_directories(omp_incdir),
@@ -471,10 +485,10 @@ if get_option('enable-openmp')
       link_args : ['/NODEFAULTLIB:vcomp'],
       dependencies : [libiomp])
 
-  message('set openmp with libiomp5md for windows-----------------')
-else
+    message('set openmp with @0@ for windows @1@-----------------'.format(omp_lib_name, omp_lib_subdir))
+  else
     openmp_dep = dependency('openmp')
-endif
+  endif
   if get_option('omp-num-threads') > 0
     extra_defines += '-DOMP_NUM_THREADS=@0@'.format(get_option('omp-num-threads'))
     message('set nntrainer omp threads=@0@'.format(get_option('omp-num-threads')))
