@@ -661,8 +661,7 @@ void nntr_gemm_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
 
 #if !((defined(_MSC_VER)) && !defined(__clang__)) && defined(__aarch64__)
 #if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_MATMUL_INT8)
-  if (ggml_cpu_has_sve() && ggml_cpu_has_matmul_int8() &&
-      ggml_cpu_get_sve_cnt() == QK8_0) {
+  {
     const void *b_ptr = vx;
     const void *a_ptr = vy;
     float *res_ptr = s;
@@ -8289,7 +8288,7 @@ void nntr_vec_dot_q6_K_q8_K(int n, float *__restrict s, size_t bs,
   const int nb = n / QK_K;
 
 #ifdef __ARM_FEATURE_SVE
-  const int vector_length = ggml_cpu_get_sve_cnt() * 8;
+  const int vector_length = QK8_0 * 8;
   float sum = 0;
   svuint8_t m4b = svdup_n_u8(0xf);
   svint32_t vzero = svdup_n_s32(0);
@@ -9526,7 +9525,7 @@ void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
 
 #if !((defined(_MSC_VER)) && !defined(__clang__)) && defined(__aarch64__)
 #if defined(__ARM_FEATURE_SVE)
-  if (ggml_cpu_has_sve() && ggml_cpu_get_sve_cnt() == QK8_0) {
+  {
     const void *b_ptr = vx;
     const void *a_ptr = vy;
     float *res_ptr = s;
