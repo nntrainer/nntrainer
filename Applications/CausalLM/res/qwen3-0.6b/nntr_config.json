@@ -1,0 +1,23 @@
+{
+    "model_tensor_type": "Q4_0-FP32",
+    "model_file_name": "qwen3-0.6b-q6k-q40-q40-fp32-x86.bin",
+
+    "lora_rank" : 0,
+    "lora_alpha" : 0,
+    "lora_target": [],
+
+    "fc_layer_dtype" : "Q4_0",
+    "embedding_dtype" : "Q6_K",
+    "lmhead_dtype": "Q4_0",
+
+    "bad_word_ids": [],
+    "fsu": false,
+    "num_to_generate": 4096,
+    "init_seq_len": 1024,
+    "max_seq_len": 8192,
+    "batch_size": 1,
+
+    "tokenizer_file": "/home/hs89/hdd/workspace/git/nntrainer/Applications/CausalLM/res/qwen3-0.6b/tokenizer.json",
+    "sample_input": "<|im_start|>user\n 나한테 LLM에 대해서 설명해줘, 한국어로 대답해줘!.<|im_end|>\n<|im_start|>assistant\n"
+    
+}

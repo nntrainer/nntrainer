@@ -314,6 +314,7 @@ void DeepseekSlimMoELayer::incremental_forwarding(
   input_step_dim.height(to - from);
   output_step_dim.height(to - from);
 
+
   for (unsigned int b = 0; b < input_.batch(); ++b) {
     auto input = input_.getSharedDataTensor(
       input_step_dim, b * input_step_dim.getFeatureLen(), true);
@@ -357,6 +358,13 @@ void DeepseekSlimMoELayer::incremental_forwarding(
 
       acti_out.dot(shared_down_proj, shared_output);
 
+      // // Debug: print shared expert output
+      // std::cout << "Shared Expert Output (first 8): ";
+      // for (int i = 0; i < 8 && i < static_cast<int>(shared_output.size()); ++i) {
+      //   std::cout << shared_output.getValue<float>(0, 0, 0, i) << ", ";
+      // }
+      // std::cout << std::endl;
+
       // Add shared expert output to final output
       output.add_i(shared_output);
     }
@@ -393,6 +401,7 @@ void DeepseekSlimMoELayer::incremental_forwarding(
         weight *= routed_scaling_factor;
         expert_assignments[expert_idx].emplace_back(i, weight);
       }
+
     }
 
     // Parallel processing for multiple tokens with many active experts
@@ -407,7 +416,7 @@ void DeepseekSlimMoELayer::incremental_forwarding(
       }
     }
     std::vector<int> target_idx_vector;
-
+    // std::cout <<"ToPK : ";
     for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
          ++expert_idx) {
       const auto &assignments = expert_assignments[expert_idx];
@@ -415,8 +424,9 @@ void DeepseekSlimMoELayer::incremental_forwarding(
         continue;
 
       target_idx_vector.push_back(expert_idx);
+      // std::cout << expert_idx << ", ";
     }
-
+    // std::cout << std::endl;
 #pragma omp parallel for schedule(dynamic)
     for (int expert_idx : target_idx_vector) {
       const auto &assignments = expert_assignments[expert_idx];
@@ -451,7 +461,7 @@ void DeepseekSlimMoELayer::incremental_forwarding(
 
 // Evict experts
 #pragma omp parallel
-    while (loaded_expert_deque.size() > 16) {
+    while (loaded_expert_deque.size() > 40) {
       int target_idx;
       {
         std::lock_guard<std::mutex> lock(cache_mutex);
@@ -466,13 +476,18 @@ void DeepseekSlimMoELayer::incremental_forwarding(
     }
 
     // Combine expert outputs
+    nntrainer::Tensor routed_only(total_tokens, 1, 1, hidden_size, output.getTensorType());
+    routed_only.setZero();
     for (int expert_idx : target_idx_vector) {
-      output.add_i(expert_outputs[expert_idx]);
+      routed_only.add_i(expert_outputs[expert_idx]);
     }
+    output.add_i(routed_only);
 
     // reshape output: [B*S,1,1,H] -> [B,1,S,H]
     output.reshape({batch_size, 1, seq_len, hidden_size});
   }
+  
+
 }
 
 void DeepseekSlimMoELayer::setProperty(const std::vector<std::string> &values) {

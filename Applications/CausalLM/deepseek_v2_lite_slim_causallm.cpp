@@ -124,7 +124,7 @@ std::vector<LayerHandle> DeepseekV2SlimCausalLM::createAttention(
 
   layers.push_back(createLayer(
     "rms_norm",
-    {withKey("name", kv_a_norm_name), withKey("epsilon", std::to_string(NORM_EPS)),
+    {withKey("name", kv_a_norm_name), withKey("epsilon", std::to_string(NORM_EPS)),withKey("packed", "false"),
      withKey("input_layers", latent_kv_name)}));
 
   // 3. KV_B_PROJ
@@ -203,9 +203,7 @@ void DeepseekV2SlimCausalLM::setupParameters(json &cfg, json &generation_cfg,
     MOE_INTERMEDIATE_SIZE = cfg["moe_intermediate_size"].get<unsigned int>();
     INTERMEDIATE_SIZE = cfg["intermediate_size"].get<unsigned int>();
     NUM_SHARED_EXPERTS = cfg["n_shared_experts"].get<unsigned int>();
-    if (DIM == 2048 && NUM_SHARED_EXPERTS == 2) {
-      NUM_SHARED_EXPERTS = 1;
-    }
+    // NOTE: Use n_shared_experts directly from config, do not override
     MOE_NORM_MIN =
       cfg.contains("moe_norm_min") ? cfg["moe_norm_min"].get<float>() : 1e-12f;
     NUM_GROUP_EXPERTS = cfg.contains("n_group") ? cfg["n_group"].get<unsigned int>() : 1;
@@ -219,7 +217,6 @@ void DeepseekV2SlimCausalLM::setupParameters(json &cfg, json &generation_cfg,
     }
     KV_LORA_RANK = cfg["kv_lora_rank"].get<unsigned int>();
     QK_NOPE_HEAD_DIM = cfg["qk_nope_head_dim"].get<unsigned int>();
-    QK_ROPE_HEAD_DIM = cfg["qk_rope_head_dim"].get<unsigned int>();
     QK_ROPE_HEAD_DIM = cfg["qk_rope_head_dim"].get<unsigned int>();
     V_HEAD_DIM = cfg["v_head_dim"].get<unsigned int>();
     if (cfg.contains("attention_bias")) {

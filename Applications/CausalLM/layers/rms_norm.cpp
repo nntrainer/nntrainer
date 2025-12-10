@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <iomanip>
 
 #include "rms_norm.h"
 
@@ -80,6 +81,7 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
               << "output:" << out_step << "gamma:" << gamma << std::endl;
 #endif
   }
+
 
 }
 

@@ -231,9 +231,7 @@ void DeepseekV2ForCausalLM::setupParameters(json &cfg, json &generation_cfg,
     MOE_INTERMEDIATE_SIZE = cfg["moe_intermediate_size"].get<unsigned int>();
     INTERMEDIATE_SIZE = cfg["intermediate_size"].get<unsigned int>();
     NUM_SHARED_EXPERTS = cfg["n_shared_experts"].get<unsigned int>();
-    if (DIM == 2048 && NUM_SHARED_EXPERTS == 2) {
-      NUM_SHARED_EXPERTS = 1;
-    }
+    // NOTE: Use n_shared_experts directly from config, do not override
     MOE_NORM_MIN =
       cfg.contains("moe_norm_min") ? cfg["moe_norm_min"].get<float>() : 1e-12f;
     NUM_GROUP_EXPERTS = cfg.contains("n_group") ? cfg["n_group"].get<unsigned int>() : 1;

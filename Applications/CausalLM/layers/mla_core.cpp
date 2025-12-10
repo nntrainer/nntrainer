@@ -14,6 +14,8 @@
 #include <cmath>
 #include <thread>
 #include <vector>
+#include <iomanip>
+#include <iostream>
 
 #include <fp16.h>
 #include <layer_context.h>
@@ -79,6 +81,10 @@ void MLACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   theta = (float)std::get<props::RopeTheta>(mla_core_props).get();
   rope_scaling_type = std::get<props::RopeScalingType>(mla_core_props).get();
   scale = std::get<props::RopeScalingFactor>(mla_core_props).get();
+  if (rope_scaling_type == "yarn") {
+    original_max_position_embeddings =
+      std::get<props::RopeScalingMaxPositionEmbeddings>(mla_core_props).get();
+  }
 
   // Validate dimensions
   size_t expected_query_width = (qk_nope_dim + qk_rope_dim) * num_heads_Q;
@@ -179,9 +185,7 @@ void MLACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       output_step, cache_k, cache_v, cache_k.getDim(),
       cache_k_step_dim, cache_v.getDim(), cache_v_step_dim);
   }
-  // std::cout <<"\n " << context.getName() <<"'s Outputs " << std::endl;
-  // output.print(std::cout);
-  // std::cout << "============================================" << std::endl;
+
 }
 
 void MLACoreLayer::one_batch_incremental_forwarding(
@@ -204,20 +208,33 @@ void MLACoreLayer::one_batch_incremental_forwarding(
   unsigned int kv_b_head_dim = qk_nope_dim + v_head_dim;
   unsigned int k_full_dim = qk_nope_dim + qk_rope_dim;
 
-  // Update Caches (Unchanged)
+
+
+  // Update Caches
+  // Python does: k_nope = k_nope.view(B, S, NumHeads, kv_b_head_dim).transpose(1, 2)
+  // This results in (B, NumHeads, S, kv_b_head_dim) access pattern with strided memory
+  // Original memory layout: (B, S, NumHeads * kv_b_head_dim)
+  // For position [h, t, d]: index = t * (NumHeads * kv_b_head_dim) + h * kv_b_head_dim + d
   for (unsigned int t = 0; t < step_len; ++t) {
     for (unsigned int h = 0; h < num_heads_Q; ++h) {
+      // Access pattern after view().transpose(): data[batch, head, seq, dim]
+      // In original memory: kv_b_ptr[seq * (num_heads * dim) + head * dim + d]
       float *src_kv_b = kv_b_ptr + t * num_heads_Q * kv_b_head_dim + h * kv_b_head_dim;
-      float *src_k_rope = key_rope_ptr + t * qk_rope_dim; // Broadcasted RoPE key
+      float *src_k_rope = key_rope_ptr + t * qk_rope_dim; // Broadcasted RoPE key (same for all heads)
       
       float *dst_k = cache_k_ptr + t * num_heads_Q * k_full_dim + h * k_full_dim;
       float *dst_v = cache_v_ptr + t * num_heads_Q * v_head_dim + h * v_head_dim;
       
+      // Copy k_nope (first qk_nope_dim elements of kv_b)
       std::copy(src_kv_b, src_kv_b + qk_nope_dim, dst_k);
+      // Copy k_rope (from separate key_rope input, broadcasted to all heads)
       std::copy(src_k_rope, src_k_rope + qk_rope_dim, dst_k + qk_nope_dim);
+      // Copy v (remaining v_head_dim elements of kv_b)
       std::copy(src_kv_b + qk_nope_dim, src_kv_b + kv_b_head_dim, dst_v);
     }
   }
+  
+
 
   // Apple RoPE to Cache K (Unchanged)
   for (unsigned int t = 0; t < step_len; ++t) {
@@ -240,6 +257,9 @@ void MLACoreLayer::one_batch_incremental_forwarding(
       }
     }
   }
+
+
+
 
   // 3. Attention Calculation
   float *query_ptr = query_step.getData<float>();
@@ -280,6 +300,8 @@ void MLACoreLayer::one_batch_incremental_forwarding(
           q_rope_rotated[2 * i] = r1 * cos[i] - r2 * sin[i];
           q_rope_rotated[2 * i + 1] = r1 * sin[i] + r2 * cos[i];
         }
+
+
 
         // Compute Scores
         std::vector<float> scores(seq_len);
@@ -346,6 +368,8 @@ void MLACoreLayer::one_batch_incremental_forwarding(
   }
   
   for (auto &fut : futures) fut.get();
+  
+
 }
 
 void MLACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len, float theta) {
@@ -409,25 +433,92 @@ void MLACoreLayer::_compute_default_parameters(int head_dim, float theta) {
     thetas.push_back(1.0 /
                      (std::pow(theta, (2 * i) / static_cast<float>(head_dim))));
   }
+
 }
 
 void MLACoreLayer::_compute_yarn_parameters(int head_dim, float theta) {
-  // Yarn implementation simplified:
-  // For short sequences, the frequency correction is minimal.
-  // The most important part is the attention scaling (mscale).
-  
+
+  // Config parameters
+  const float partial_rotary_factor = 1.0f;
+  const int dim = static_cast<int>(head_dim * partial_rotary_factor);
+  const float base = theta;
+
+  // Attention scaling calculation
+  auto get_mscale = [](float scale, float mscale = 1.0f) {
+    return (scale <= 1.0f) ? 1.0f : (0.1f * mscale * std::log(scale) + 1.0f);
+  };
+
   float mscale = std::get<props::RopeScalingMscale>(mla_core_props).get();
-  float mscale_all_dim = std::get<props::RopeScalingMscaleAllDim>(mla_core_props).get();
-  
-  attention_scaling = mscale * mscale_all_dim;
-  
-  // Use default frequency calculation for now
-  // TODO: Implement full Yarn frequency correction if needed for long context
-  unsigned int half_ = head_dim / 2;
-  for (unsigned int i = 0; i < half_; ++i) {
-    thetas.push_back(1.0 /
-                     (std::pow(theta, (2 * i) / static_cast<float>(head_dim))));
+  float mscale_all_dim =
+    std::get<props::RopeScalingMscaleAllDim>(mla_core_props).get();
+
+  attention_scaling = get_mscale(scale, mscale) / get_mscale(scale, mscale_all_dim);
+  // attention_scaling = get_mscale(scale, mscale);
+
+
+
+  // Beta parameters
+  const float beta_fast =
+    std::get<props::RopeScalingBetaFast>(mla_core_props).get();
+  const float beta_slow =
+    std::get<props::RopeScalingBetaSlow>(mla_core_props).get();
+  const bool truncate = false;
+
+  // Helper functions
+  auto find_correction_dim = [&](float num_rotations) {
+    return (dim * std::log(original_max_position_embeddings /
+                           (num_rotations * 2 * M_PI))) /
+           (2 * std::log(base));
+  };
+
+  auto [low, high] = [&]() {
+    float low_val = find_correction_dim(beta_fast);
+    float high_val = find_correction_dim(beta_slow);
+    if (truncate) {
+      low_val = std::floor(low_val);
+      high_val = std::ceil(high_val);
+    }
+    return std::make_pair(low_val, high_val);
+  }();
+
+  // Compute position frequencies
+  thetas.resize(dim / 2);
+
+  // Compute interpolation and extrapolation frequencies
+  std::vector<float> inv_freq_interpolation;
+  std::vector<float> inv_freq_extrapolation;
+  for (size_t i = 0; i < dim / 2; ++i) {
+    inv_freq_extrapolation.push_back(
+      1.0 / (std::pow(theta, (2 * i) / static_cast<float>(head_dim))));
+    inv_freq_interpolation.push_back(
+      1.0 / (scale * std::pow(theta, (2 * i) / static_cast<float>(head_dim))));
   }
+
+  auto linear_ramp_factor = [](float min, float max, int size) {
+    if (min == max) {
+      max += 0.001f; // Prevent singularity
+    }
+    std::vector<float> ramp(size);
+    for (int i = 0; i < size; ++i) {
+      float val = (i - min) / (max - min);
+      ramp[i] = std::clamp(val, 0.0f, 1.0f);
+    }
+    return ramp;
+  };
+
+  std::vector<float> inv_freq_extrapolation_factor =
+    linear_ramp_factor(low, high, dim / 2);
+  for (auto &val : inv_freq_extrapolation_factor) {
+    val = 1.0f - val;
+  }
+
+  // Combine frequencies
+  for (size_t i = 0; i < thetas.size(); ++i) {
+    thetas[i] =
+      inv_freq_extrapolation[i] * inv_freq_extrapolation_factor[i] +
+      inv_freq_interpolation[i] * (1.0f - inv_freq_extrapolation_factor[i]);
+  }
+
 }
 
 void MLACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
@@ -549,11 +640,10 @@ void MLACoreLayer::updateTensorsByInputDimensions(
   context.updateInput(INOUT_INDEX::KEY_ROPE, input_dimensions[INOUT_INDEX::KEY_ROPE]);
   
   // Update output dim
-  // Update output dim
   std::vector<nntrainer::TensorDim> output_dims(1);
   output_dims[0] = input_dimensions[0];
-  size_t v_head_dim = (qk_nope_dim + qk_rope_dim);
-  output_dims[0].width(num_heads_Q * v_head_dim);
+  // Note: Using member v_head_dim (not local shadow)
+  output_dims[0].width(num_heads_Q * this->v_head_dim);
   context.updateOutput(0, output_dims[0]);
 
   context.updateTensor(tensor_idx[AttentionParams::cache_c_kv], kv_cache_dim);

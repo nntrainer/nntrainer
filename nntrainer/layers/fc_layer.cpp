@@ -31,6 +31,7 @@
 #include <util_func.h>
 
 #include <iostream>
+#include <iomanip>
 
 namespace nntrainer {
 
@@ -301,6 +302,16 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
       hidden_step.add_i(bias);
     }
   }
+
+  // Debug: Print last 20 values for _attention_out layers
+  // std::string layer_name = context.getName();
+  // if (layer_name.find("_attention_out") != std::string::npos) {
+  //   std::cout << "[C++] " << layer_name << " Output (last 20): ";
+  //   for (int i = std::max(0, static_cast<int>(hidden_.width()) - 20); i < static_cast<int>(hidden_.width()); ++i) {
+  //     std::cout << std::fixed << std::setprecision(6) << hidden_.getValue<float>(0, 0, 0, i) << ", ";
+  //   }
+  //   std::cout << std::endl;
+  // }
 }
 
 void FullyConnectedLayer::calcDerivative(RunLayerContext &context) {

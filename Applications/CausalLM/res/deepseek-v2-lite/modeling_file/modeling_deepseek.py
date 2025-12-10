@@ -148,12 +148,20 @@ class DeepseekV2MoE(nn.Module):
         return hidden_states
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        print(f"[PYTHON] MoE Input (last 20): {hidden_states[0, 0, -20:].tolist()}")
         residuals = hidden_states
         orig_shape = hidden_states.shape
         topk_indices, topk_weights = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        print(f"[PYTHON] TopK indices: {topk_indices[0].tolist()}")
+        print(f"[PYTHON] TopK weights: {topk_weights[0].tolist()}")
         hidden_states = self.moe(hidden_states, topk_indices, topk_weights).view(*orig_shape)
-        hidden_states = hidden_states + self.shared_experts(residuals)
+        print(f"[PYTHON] Routed Expert Output (last 20): {hidden_states[0, 0, -20:].tolist()}")
+
+        shared_output = self.shared_experts(residuals)
+        print(f"[PYTHON] Shared Expert Output (last 20): {shared_output[0, 0, -20:].tolist()}")
+        hidden_states = hidden_states + shared_output
+        print(f"[PYTHON] Final MoE Output (last 20): {hidden_states[0, 0, -20:].tolist()}")
         return hidden_states
 
 
@@ -219,6 +227,11 @@ class DeepseekV2RotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
+        # Debug: Print inv_freq values (first time only)
+        if not hasattr(self, '_inv_freq_printed'):
+            print(f"[PYTHON] RoPE inv_freq (first 10): {self.inv_freq[:10].tolist()}")
+            self._inv_freq_printed = True
+        
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
 
@@ -350,21 +363,32 @@ class DeepseekV2Attention(nn.Module):
         query_shape = (batch_size, seq_length, -1, self.qk_head_dim)
         key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
 
-        if self.q_lora_rank is None:
-            q = self.q_proj(hidden_states)
-        else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        q = q.view(query_shape).transpose(1, 2)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
+        q = self.q_proj(hidden_states)
+        
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         k_nope, k_pe = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_nope = self.kv_b_proj(self.kv_a_layernorm(k_nope)).view(key_shape).transpose(1, 2)
+        
+        k_nope = self.kv_b_proj(self.kv_a_layernorm(k_nope))
+        q = q.view(query_shape).transpose(1, 2)
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        k_nope = k_nope.view(key_shape).transpose(1, 2)
+        
         k_nope, value_states = torch.split(k_nope, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+        # Debug: value_states after split
+        if self.layer_idx == 0:
+            print(f"[PYTHON] Layer {self.layer_idx} value_states head0 (last 10): {value_states[0, 0, 0, -10:].tolist()}")
 
         k_pe = k_pe.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
         q_pe, k_pe = apply_rotary_emb(q_pe, k_pe, position_embeddings.to(q_pe.device))
-
+        
+        # Debug: RoPE applied values
+        if self.layer_idx == 0:
+            print(f"[PYTHON] Layer {self.layer_idx} q_nope head0 (last 10): {q_nope[0, 0, 0, -10:].tolist()}")
+            print(f"[PYTHON] Layer {self.layer_idx} q_pe after RoPE head0 (last 10): {q_pe[0, 0, 0, -10:].tolist()}")
+            print(f"[PYTHON] Layer {self.layer_idx} k_nope head0 (last 10): {k_nope[0, 0, 0, -10:].tolist()}")
+            print(f"[PYTHON] Layer {self.layer_idx} k_pe after RoPE (last 10): {k_pe[0, 0, 0, -10:].tolist()}")
+        
         k_pe = k_pe.expand(*k_nope.shape[:-1], -1)
         query_states = torch.cat((q_nope, q_pe), dim=-1)
         key_states = torch.cat((k_nope, k_pe), dim=-1)
@@ -390,6 +414,11 @@ class DeepseekV2Attention(nn.Module):
         )
 
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
+        
+        # Debug: attn_output before o_proj (this should match C++ mla_core output)
+        if self.layer_idx == 0:
+            print(f"[PYTHON] Layer {self.layer_idx} attn_output BEFORE o_proj (last 20): {attn_output[0, 0, -20:].tolist()}")
+        
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -417,11 +446,14 @@ class DeepseekV2DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        # print(f"Layer ==== ")
         residual = hidden_states
+        print(f"[PYTHON] input hidden state of decoder layer: {hidden_states[0, 0, -20:].tolist()}")
         hidden_states = self.input_layernorm(hidden_states)
-        print(f"RMS Norm : {hidden_states}")
+        print(f"[PYTHON] input_layernorm layer: {hidden_states[0, 0, -20:].tolist()}")
+
         # Self Attention
-        
+
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -432,13 +464,20 @@ class DeepseekV2DecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
+        print(f"[PYTHON] attention output : {hidden_states[0, 0, -20:].tolist()}")
+
         hidden_states = residual + hidden_states
-        print(f"Attention + Residual : {hidden_states}")
+        print(f"[PYTHON] attention + residual output : {hidden_states[0, 0, -20:].tolist()}")
+
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        print(f"[PYTHON] post layer norm output : {hidden_states[0, 0, -20:].tolist()}")
+
         hidden_states = self.mlp(hidden_states)
+        print(f"[PYTHON] MLP output : {hidden_states[0, 0, -20:].tolist()}")
         hidden_states = residual + hidden_states
+        print(f"[PYTHON] MLP + residual output : {hidden_states[0, 0, -20:].tolist()}")
         return hidden_states
 
 
@@ -525,7 +564,7 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
         )
 
         hidden_states = inputs_embeds
-        print(f"Embedding Output : {hidden_states}")
+        
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
@@ -540,6 +579,8 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
             )
 
         hidden_states = self.norm(hidden_states)
+        print(f"[PYTHON] Model Output Norm(last Norm) : {hidden_states[0, 0, -20:].tolist()}")
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
@@ -608,6 +649,15 @@ class DeepseekV2ForCausalLM(DeepseekV2PreTrainedModel, GenerationMixin):
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        # Debug: Print top 5 tokens and logits for comparison with C++
+        if logits.shape[1] == 1:  # Only for single token generation
+            flat_logits = logits[0, 0, :]
+            top_values, top_indices = torch.topk(flat_logits, 5)
+            print(f"[PYTHON] Top 5 tokens: ", end="")
+            for i in range(5):
+                print(f"({top_indices[i].item()}, {top_values[i].item():.6f}) ", end="")
+            print()
 
         loss = None
         if labels is not None:
