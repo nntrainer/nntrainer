@@ -70,3 +70,6 @@ option('arm-arch', type: 'combo',
        choices: ['auto', 'armv7l', 'armv8.2-a', 'armv9.2-a'],
        value: 'auto',
        description: 'Target ARM architecture. "auto" detects from host for native builds, defaults to armv8.2-a for cross-compilation.')
+option('arm-march', type: 'string',
+       value: '',
+       description: 'ARM march flag (e.g., "-march=armv8.2-a+fp16+dotprod+i8mm"). If empty, derived from arm-arch.')
