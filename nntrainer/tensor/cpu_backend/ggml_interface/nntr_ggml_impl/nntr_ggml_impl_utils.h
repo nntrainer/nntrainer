@@ -8,7 +8,7 @@
  *
  * Modified by Pawel Debski, 2025: Adapted for CPU backend integration
  *
- * @file   nntr_ggml_impl_internal.h
+ * @file   nntr_ggml_impl_utils.h
  * @date   20 August 2025
  * @see    https://github.com/nnstreamer/nntrainer
  * @author  Pawel Debski <p.debski2@samsung.com>
