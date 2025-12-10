@@ -1594,56 +1594,79 @@ static inline void transpose_matrix_16x16(const uint8_t *input,
                        output + 8 * output_stride + 8, output_stride);
 }
 
-static inline void create_q4_0_weights_x4(const uint8_t *int4_weight,
-                                          uint8_t *q4_blocks) {
-  static constexpr const size_t ROW_BLOCK_BYTE_SIZE = 16;
-
-  // Create masks for extracting low and high nibbles
-  const uint8x8_t low_nibble_mask = vdup_n_u8(0x0F);
-  const uint8x8_t high_nibble_mask = vdup_n_u8(0xF0);
-
-  for (int i = 0; i < 4; ++i) {
-    // Load 16 bytes of input data (8 bytes for each half)
-    uint8x8_t input_low = vld1_u8(&int4_weight[i * ROW_BLOCK_BYTE_SIZE]);
-    uint8x8_t input_high = vld1_u8(&int4_weight[i * ROW_BLOCK_BYTE_SIZE + 8]);
-
-    // A = input_low & low_nibble_mask
-    uint8x8_t A = vand_u8(input_low, low_nibble_mask);
-    // B = (input_low & high_nibble_mask) >> 4
-    uint8x8_t B = vshr_n_u8(vand_u8(input_low, high_nibble_mask), 4);
-
-    // C = input_high & low_nibble_mask
-    uint8x8_t C = vand_u8(input_high, low_nibble_mask);
-    // D = (input_high & high_nibble_mask) >> 4
-    uint8x8_t D = vshr_n_u8(vand_u8(input_high, high_nibble_mask), 4);
-
-    // AC = A | (C << 4)
-    uint8x8_t AC = vorr_u8(A, vshl_n_u8(C, 4));
-
-    // BD = B | (D << 4)
-    uint8x8_t BD = vorr_u8(B, vshl_n_u8(D, 4));
-
-    // Interleave AC and BD and store
-    uint8x8x2_t result;
-    result.val[0] = AC;
-    result.val[1] = BD;
-    vst2_u8(&q4_blocks[i * ROW_BLOCK_BYTE_SIZE], result);
-  }
+static inline void transpose_matrix_16x8(const uint8_t *input, int input_stride,
+                                         uint8_t *output, int output_stride) {
+  transpose_matrix_8x8(input, input_stride, output, output_stride);
+  transpose_matrix_8x8(input + 8 * input_stride, input_stride, output + 8,
+                       output_stride);
 }
 
-inline static void nntr_make_block_q4_0x4(const uint8_t *in, block_q4_0x4 *out,
-                                          const uint16_t *scales) {
-  constexpr size_t IN_CNT = 4;
-  constexpr size_t HALF_SIZE = 8;
+inline static void
+neon_transform_transposed_4rows_to_q4_0x4(const uint8_t *__restrict in,
+                                          block_q4_0x4 *__restrict out) {
 
-  memcpy(out->d, scales, IN_CNT * sizeof(uint16_t));
+  // Process all 4 rows with NEON
+  const uint8x8_t mask = vdup_n_u8(0x0F);
 
-  for (int i = 0; i < IN_CNT; ++i) {
-    memcpy(&out->qs[i * HALF_SIZE], &in[16 * i], HALF_SIZE);
+  // Row 0
+  {
+    uint8x8_t lo = vld1_u8(in);
+    uint8x8_t hi = vld1_u8(in + 8);
+    uint8x8_t v0 = vand_u8(lo, mask);
+    uint8x8_t v1 = vshr_n_u8(lo, 4);
+    uint8x8_t v2 = vand_u8(hi, mask);
+    uint8x8_t v3 = vshr_n_u8(hi, 4);
+    uint8x8_t even = vorr_u8(v0, vshl_n_u8(v2, 4));
+    uint8x8_t odd = vorr_u8(v1, vshl_n_u8(v3, 4));
+    uint8x8x2_t zip = vzip_u8(even, odd);
+    // First half goes to qs[0..7], second half to qs[32..39]
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[0]), zip.val[0]);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[32]), zip.val[1]);
   }
-  for (int i = 0; i < IN_CNT; ++i) {
-    memcpy(&out->qs[IN_CNT * HALF_SIZE + i * HALF_SIZE], &in[16 * i + 8],
-           HALF_SIZE);
+
+  // Row 1
+  {
+    uint8x8_t lo = vld1_u8(in + 16);
+    uint8x8_t hi = vld1_u8(in + 24);
+    uint8x8_t v0 = vand_u8(lo, mask);
+    uint8x8_t v1 = vshr_n_u8(lo, 4);
+    uint8x8_t v2 = vand_u8(hi, mask);
+    uint8x8_t v3 = vshr_n_u8(hi, 4);
+    uint8x8_t even = vorr_u8(v0, vshl_n_u8(v2, 4));
+    uint8x8_t odd = vorr_u8(v1, vshl_n_u8(v3, 4));
+    uint8x8x2_t zip = vzip_u8(even, odd);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[8]), zip.val[0]);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[40]), zip.val[1]);
+  }
+
+  // Row 2
+  {
+    uint8x8_t lo = vld1_u8(in + 32);
+    uint8x8_t hi = vld1_u8(in + 40);
+    uint8x8_t v0 = vand_u8(lo, mask);
+    uint8x8_t v1 = vshr_n_u8(lo, 4);
+    uint8x8_t v2 = vand_u8(hi, mask);
+    uint8x8_t v3 = vshr_n_u8(hi, 4);
+    uint8x8_t even = vorr_u8(v0, vshl_n_u8(v2, 4));
+    uint8x8_t odd = vorr_u8(v1, vshl_n_u8(v3, 4));
+    uint8x8x2_t zip = vzip_u8(even, odd);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[16]), zip.val[0]);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[48]), zip.val[1]);
+  }
+
+  // Row 3
+  {
+    uint8x8_t lo = vld1_u8(in + 48);
+    uint8x8_t hi = vld1_u8(in + 56);
+    uint8x8_t v0 = vand_u8(lo, mask);
+    uint8x8_t v1 = vshr_n_u8(lo, 4);
+    uint8x8_t v2 = vand_u8(hi, mask);
+    uint8x8_t v3 = vshr_n_u8(hi, 4);
+    uint8x8_t even = vorr_u8(v0, vshl_n_u8(v2, 4));
+    uint8x8_t odd = vorr_u8(v1, vshl_n_u8(v3, 4));
+    uint8x8x2_t zip = vzip_u8(even, odd);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[24]), zip.val[0]);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[56]), zip.val[1]);
   }
 }
 
@@ -1667,9 +1690,9 @@ void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
   static constexpr const size_t COLUMN_BLOCK_SIZE = 2;
   static constexpr const size_t ROW_BLOCK_BYTE_SIZE = 16;
 
-  uint8_t dst_tmp[8 * ROW_BLOCK_BYTE_SIZE];
+  // uint8_t dst_tmp[8 * ROW_BLOCK_BYTE_SIZE];
   uint8_t *dst_ = reinterpret_cast<uint8_t *>(dst_q4_0x);
-  uint8_t mx16x16[16 * 16];
+  uint8_t mx8x16[8 * 16];
 
   // --- Layout ---
   const size_t rows_count_pad = align(N, ROW_BLOCK_SIZE);
@@ -1679,33 +1702,41 @@ void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
   const size_t bytes_per_row_block_span = column_blocks_count * ROW_BLOCK_SIZE;
   const int column_blocks_cnt = K / QK4_0;
 
-  for (size_t row_id = 0; row_id < N; row_id += 16) {
-    const size_t row_in_block_id = row_id / ROW_BLOCK_SIZE;
-    size_t i_in_block = row_id % ROW_BLOCK_SIZE;
-    for (int column_out_block_id = 0; column_out_block_id < column_blocks_cnt;
-         column_out_block_id++) {
-      int column_idx = column_out_block_id * QK4_0;
-      int scale_offset = (column_idx / scale_group_size) * rows_count_pad;
+  for (int column_out_block_id = 0; column_out_block_id < column_blocks_cnt;
+       column_out_block_id++) {
+    int column_idx = column_out_block_id * QK4_0;
+    int scale_offset = (column_idx / scale_group_size) * rows_count_pad;
+    for (size_t row_id = 0; row_id < N; row_id += 8) {
+      const size_t row_in_block_id = row_id / ROW_BLOCK_SIZE;
+      size_t i_in_block = row_id % ROW_BLOCK_SIZE;
       const size_t row_block_base =
         row_in_block_id * bytes_per_row_block_span + i_in_block;
       int src_offset =
         row_block_base + column_out_block_id * 16 * ROW_BLOCK_SIZE;
-      transpose_matrix_16x16(&osv32_weights[src_offset], ROW_BLOCK_SIZE,
-                             mx16x16, 16);
-      int max_r = std::min((size_t)16, N - row_id);
+
+      transpose_matrix_16x8(&osv32_weights[src_offset], ROW_BLOCK_SIZE, mx8x16,
+                            16);
       size_t row_out_block_id = row_id / NUM_Q4_0_BLOCKS;
       int dst_offset =
         (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) *
         (column_out_block_id + row_out_block_id * column_blocks_cnt);
-      for (int r = 0; r < max_r; r += NUM_Q4_0_BLOCKS) {
-        create_q4_0_weights_x4(&mx16x16[16 * r], dst_tmp);
 
-        nntr_make_block_q4_0x4(dst_tmp, (block_q4_0x4 *)(dst_ + dst_offset),
-                               &osv32_scales[scale_offset + row_id + r]);
-        row_out_block_id++;
-        dst_offset +=
-          (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) * column_blocks_cnt;
-      }
+      block_q4_0x4 *out = (block_q4_0x4 *)(dst_ + dst_offset);
+      const uint16_t *s_ptr = &osv32_scales[scale_offset + row_id];
+      out->d[0] = s_ptr[0];
+      out->d[1] = s_ptr[1];
+      out->d[2] = s_ptr[2];
+      out->d[3] = s_ptr[3];
+      neon_transform_transposed_4rows_to_q4_0x4(mx8x16, out);
+
+      dst_offset += (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) * column_blocks_cnt;
+      out = (block_q4_0x4 *)(dst_ + dst_offset);
+
+      out->d[0] = s_ptr[4];
+      out->d[1] = s_ptr[5];
+      out->d[2] = s_ptr[6];
+      out->d[3] = s_ptr[7];
+      neon_transform_transposed_4rows_to_q4_0x4(&mx8x16[64], out);
     }
   }
 }
