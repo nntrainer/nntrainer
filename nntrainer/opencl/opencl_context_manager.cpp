@@ -129,7 +129,8 @@ bool ContextManager::CreateDefaultGPUDevice() {
   platform_id_ = nullptr;
   device_id_ = nullptr;
 
-  static constexpr cl_device_type kDefaultQueryDeviceType = CL_DEVICE_TYPE_GPU;
+  // NOTE(m.wlasiuk) : on CI build fallback to CPU device (pocl)
+  static constexpr cl_device_type kDefaultQueryDeviceType = CL_DEVICE_TYPE_ALL;
 
   ml_logi("Collecting OpenCL platforms ...");
 
@@ -236,6 +237,8 @@ bool ContextManager::CreateDefaultGPUDevice() {
       return false;
     }
     ml_loge("No suitable platform / device found - using default (first)");
+    ml_loge("No suitable platform / device found - %p / %p",
+            platform_device_pairs[0].first, platform_device_pairs[0].second);
     platform_id_ = platform_device_pairs[0].first;
     device_id_ = platform_device_pairs[0].second;
     device_info_ = std::make_unique<DeviceInfo>();

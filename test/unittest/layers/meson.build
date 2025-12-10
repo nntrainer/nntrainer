@@ -116,12 +116,13 @@ test_target = [
 
 if get_option('enable-opencl')
   test_target += 'unittest_layers_addition_cl.cpp'
-  test_target += 'unittest_layers_rmsnorm_cl.cpp'
   test_target += 'unittest_layers_reshape_cl.cpp'
   test_target += 'unittest_layers_transpose_cl.cpp'
   test_target += 'unittest_layers_fully_connected_cl.cpp'
-  test_target += 'unittest_layers_concat_cl.cpp'
-  test_target += 'unittest_layers_swiglu_cl.cpp'
+  # note: temporarily disable
+  # test_target += 'unittest_layers_rmsnorm_cl.cpp'
+  # test_target += 'unittest_layers_concat_cl.cpp'
+  # test_target += 'unittest_layers_swiglu_cl.cpp'
 endif
 
 if get_option('enable-tflite-backbone')

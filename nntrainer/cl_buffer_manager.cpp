@@ -22,7 +22,7 @@ namespace nntrainer {
 void ClBufferManager::initBuffers() {
   inBufferA = new opencl::Buffer(context_inst_, buffer_size_bytes, true);
   inBufferB = new opencl::Buffer(context_inst_, buffer_size_bytes, true);
-  inBufferC = new opencl::Buffer(context_inst_, unused_buffer_bytes, true);
+  inBufferC = new opencl::Buffer(context_inst_, buffer_size_bytes, true);
   outBufferA = new opencl::Buffer(context_inst_, buffer_size_bytes, false);
   outBufferB = new opencl::Buffer(context_inst_, unused_buffer_bytes, false);
 
