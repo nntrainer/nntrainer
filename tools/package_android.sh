@@ -41,8 +41,10 @@ if [[ -n "$arm_arch" ]]; then
         echo "Using ARM architecture config from: $json_file"
         # Read values from JSON using Python (portable, no jq dependency)
         enable_fp16=$(python3 -c "import json; print(json.load(open('$json_file'))['enable_fp16'])")
-        # Add arm-arch to meson args
+        arm_march=$(python3 -c "import json; print(json.load(open('$json_file'))['arm_march'])")
+        # Add arm-arch and arm-march to meson args
         filtered_args+=("-Darm-arch=${arm_arch}")
+        filtered_args+=("-Darm-march=-march=${arm_march}")
         # Handle enable_fp16 based on JSON boolean
         if [[ "$enable_fp16" == "False" ]]; then
             filtered_args+=("-Denable-fp16=false")

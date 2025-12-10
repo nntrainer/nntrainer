@@ -6,15 +6,23 @@ if get_option('debug')
     flags += '-g'
 endif
 
-if get_option('enable-fp16')
-   # Use arm-arch option for architecture-specific flags
-   arm_arch_opt = get_option('arm-arch')
-   if arm_arch_opt == 'armv9.2-a'
-     arm_march_flag = '-march=armv9.2-a+fp16+sve2+sme'
-   elif arm_arch_opt == 'armv8.2-a' or arm_arch_opt == 'auto'
-     arm_march_flag = '-march=armv8.2-a+fp16+dotprod+i8mm'
-   endif
-   flags += arm_march_flag
+# Architecture flags: applied based on platform (decoupled from enable-fp16)
+if get_option('platform') == 'android'
+  arm_march_flag = get_option('arm-march')
+  if arm_march_flag == ''
+    # Fallback: derive from arm-arch (for builds without --arm-arch argument)
+    arm_arch_opt = get_option('arm-arch')
+    if arm_arch_opt == 'armv9.2-a'
+      arm_march_flag = '-march=armv9.2-a+fp16+sve2+sme'
+    elif arm_arch_opt == 'armv8.2-a' or arm_arch_opt == 'auto'
+      arm_march_flag = '-march=armv8.2-a+fp16+dotprod+i8mm'
+    elif arm_arch_opt == 'armv7l'
+      arm_march_flag = '-march=armv7-a+neon'
+    endif
+  endif
+  if arm_march_flag != ''
+    flags += arm_march_flag
+  endif
 endif
 
 flags += '-O@0@'.format(get_option('optimization'))
