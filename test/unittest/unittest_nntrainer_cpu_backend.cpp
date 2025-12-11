@@ -28,25 +28,6 @@ using std::chrono::milliseconds;
 using std::chrono::nanoseconds;
 using std::chrono::seconds;
 
-#define EXPECT_IN_RANGE(VAL, MIN, MAX)                                         \
-  EXPECT_GE((VAL), (MIN));                                                     \
-  EXPECT_LE((VAL), (MAX))
-
-template <typename T, bool random_init = false>
-static inline std::vector<T>
-generate_random_vector(size_t size, float min_val = -1.F, float max_val = 1.F) {
-  std::random_device rd;
-  auto init_val = random_init ? rd() : 42;
-  std::mt19937 gen(init_val);
-  // std::mt19937 gen(rd());
-  std::uniform_real_distribution<float> dist(min_val, max_val);
-  std::vector<T> vec(size);
-  for (auto &val : vec) {
-    val = static_cast<T>(dist(gen));
-  }
-  return vec;
-}
-
 #if defined(ENABLE_FP16) || defined(__AVX2__)
 static inline std::vector<uint16_t>
 convert_vector_f32_to_f16_as_uint16(std::vector<float> f32_vec) {
@@ -1188,39 +1169,6 @@ TEST(nntrainer_cpu_backend_standalone, clamp_3072_0_1) {
   float lower_bound = 0.F;
   float upper_bound = 1.F;
   run_clamp_test(N, lower_bound, upper_bound, false);
-}
-
-static inline void printMatrixI(const char *name, float *data, int Y, int X) {
-  printf("%s :\n", name);
-  for (int y = 0; y < Y; y++) {
-    // printf("[");
-    for (int x = 0; x < X; x++) {
-      if (x % 10 == 0) {
-        printf("| ");
-      }
-      std::cout << (int)(0.5f + data[y * X + x]) << " ";
-    }
-    printf("\n");
-  }
-}
-
-static inline std::vector<float> generate_01_vector(const size_t size,
-                                                    const float ones_ratio) {
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_real_distribution<float> dist(0.0f, (float)size);
-  if (ones_ratio >= 1.0) {
-    std::vector<float> vec(size, 1.0f);
-    return vec;
-  } else {
-    std::vector<float> vec(size, 0.0f);
-    size_t ones_cnt = (size_t)(size * ones_ratio);
-    for (size_t i = 0; i < ones_cnt; i++) {
-      int pos = static_cast<int>(dist(gen));
-      vec[pos] = 1.0f;
-    }
-    return vec;
-  }
 }
 
 static void run_transform_int4_test_(const uint32_t K, const uint32_t N,

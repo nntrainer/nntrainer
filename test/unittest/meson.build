@@ -80,7 +80,9 @@ if host_machine.system() != 'windows'
 endif
 
 if get_option('enable-opencl')
-  test_target += [['unittest_blas_kernels_cl', []]]
+  test_target += [['unittest_opencl_kernels_blas', []]]
+  test_target += [['unittest_opencl_kernels_int4', []]]
+  test_target += [['unittest_opencl_kernels_qk_k', []]]
   test_target += [['unittest_attention_kernels_cl', []]]
 endif
 

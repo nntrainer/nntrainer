@@ -22,20 +22,6 @@
 #include <tensor.h>
 #include <tensor_dim.h>
 
-template <typename T>
-static inline std::vector<T>
-generate_random_vector(size_t size, float min_val = -1.F, float max_val = 1.F) {
-  std::random_device rd;
-  std::mt19937 gen(42);
-  // std::mt19937 gen(rd());
-  std::uniform_real_distribution<float> dist(min_val, max_val);
-  std::vector<T> vec(size);
-  for (auto &val : vec) {
-    val = static_cast<T>(dist(gen));
-  }
-  return vec;
-}
-
 TEST(nntrainer_TensorDim, ctor_initializer_p) {
   unsigned int b = 3;
   unsigned int c = 2;
