@@ -1,0 +1,111 @@
+0.4.0 -> 0.5.0:
+      - Reordering of execution order
+      - split apply gradient step in execution order
+      - Fix the memory pool and Tensor Pool bugs
+      - Support Proactive Swap for less memory consumption
+      - Add Cache Pool / Cache Loader / Cache Element
+      - Update and add Memory Planner
+      - Add Execution Order & Memory Usage Tracing for Debugging
+      - Add TaskExecutor for multi-threading
+      - Add Swish Activation
+      - NNStreamer Training Plugins ( Un-stable )
+      - Tensorflow-lite Exporter (Un-Stable)
+      - Provides More C/C++ APIs
+      - Add Android Applications ( Kotlin & Java ) for On-Device training of Resnet18
+
+0.3.0 -> 0.4.0:
+      - Fix Batch Normalization Bugs
+      - Fix Embedding Layer Bugs
+      - Fix Grdient Access Bugs
+      - Add a lot of unit tests to evaluate NNTrainer implementation
+      - New Features
+      	- New Layers
+	  - Attention Layer
+	  - Eanble Weight / Tensor Sharing
+	  - Implement Realizer to manipulate the network graph
+	    - Flatten Realizer, Recurrent Realizer with in/out property
+	    - Privious Input Realizer, Attach Activation Layer Realizer
+	  - Support Conv1D Layer
+	    - Support Dilation Property
+	  - Support multi-label/input for model
+	  - Support reshape Layer
+	  - Support Batch normalization 1 D
+	  - Support LSTM Cell Layer
+	  - Support RNNCell Layer
+	  - Support GRUCell Layer
+	  - Support Mol Attention Layer
+	  - Support Multi-Head Attention Layer
+	  - Support Gradient Clipping by Global Norm
+	  - Support Reduce Mean Layer
+	  - Support Leaky Relu Layer
+	  - Support Zoneout LSTM Cell Layer
+	  - Support Learning Rate Scheduling
+	  - Improve Load/Save Model
+	  - Support TFLite Export (Experimental)
+	  - Support Positional Encoding Layer
+	  - Support Layer Normalization
+	- Provides More C/C++ APIs
+      - New Applications
+      	- Transformer Applications
+
+0.2.0 -> 0.3.0
+      - Fix Batch Normalization Bugs
+      - Fix Stride and Padding in Conv2D and Pooling2D Layer
+      - Add a lot of unit tests to evaluate NNTrainer implementation
+      - New Layers
+      	- Recurrent Layers : RNN, LSTM, GRU
+	- Embedding Layer
+	- Distributed Layer
+	- KNN Layer
+	- L2Norm Layer
+      - Rewrite DataSet to support element-wise ( not batch-wise ) getter & Better Data Handling
+      - Interpreter to convert the model into various other framework such as TfLite
+      - Provides More C/C++ APIs
+      	- Inferece APIs
+	- Save / Load Model APIs
+      - New Applications
+      	- and more
+	
+0.1.1 -> 0.2.0:
+      - Rewrite CONV2D to support Multi-Stride & Padding
+      - Fix DataSet synchronization problem
+      - Add a lot of unit tests to evaluate NNTrainer implementation
+      - and more.
+      - New Layers
+      	- Batch Normalization Layer
+	- Addition & Concat Layer
+	- Augmentation Layers : Flip / Translate / Permute / Split
+	- Backbone Layer
+	- Multi-Output Layer
+	- Split Layer
+      - Support Custom Layer with Container (AppContext)
+      - Introdue Network Graph Structure & Optimization Scheme
+      - Introduce Techniques to Maximize Buffer Reusability
+      - Introduce Dynamic Fine-Tuning
+      - Support In/Out-Place & Lazy Tensor Computation
+      - Support In/Out Place Layer Calculation to reduce memory consumption
+      - Introduce Optimizer & Memory Manager for better maintain
+      - Provides C/C++ APIs
+      - New Applications
+      	- VGG
+	- ResNet
+	- Custom Layers
+	- SimpleShot ( Meta-Learning )
+	- and more
+
+0.1.0.rc1 -> 0.1.1
+      - Fix for Softmax calculation
+      - Use im2col to compute Convolution Layer
+      - Update hyper-parameter keywords.
+      	- Network to Model
+      	- Weight_Decay to Weight_Regularizer
+	- model_path to save_path
+	- and others.
+      - Update Documentation
+      - Fix undeterministic behavior of databuffer
+      - Fix race condition of databuffer
+      - Resolve coverity and save issues
+      - and more.
+      - Added NNStreamer Filter Element for NNTrainer Inference
+      - Accelerate Tensor Calculation with BLAS Library
+
