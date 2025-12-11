@@ -22,7 +22,7 @@ namespace nntrainer {
  * @brief ThreadPoolManager is a singleton class that manages a thread pool
  *
  */
-class ThreadPoolManager : public Singleton<ThreadPoolManager> {
+class ThreadPoolManager : public Noncopyable, public Nonmovable {
 public:
   /**
    * @brief Select optimal number of thread to use in K-quantized GEMM and GEMV
@@ -54,4 +54,3 @@ private:
 } // namespace nntrainer
 
 #endif // THREAD_POOL_MANAGER_HPP
-

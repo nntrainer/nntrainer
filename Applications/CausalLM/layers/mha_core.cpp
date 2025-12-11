@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include <engine.h>
 #include <fp16.h>
 #include <layer_context.h>
 #include <mha_core.h>
@@ -480,7 +481,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   /** 1. Load Input Tensors of this batch : b_ denotes a Tensor for this batch
    * **/
-  auto &pool = nntrainer::ThreadPoolManager::Global().getThreadPool();
+  auto &pool =
+    nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
 
   nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
     cache_key_step_dim,
@@ -556,7 +558,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   /** 1. Load Input Tensors of this batch : b_ denotes a Tensor for this batch
    * **/
-  auto &pool = nntrainer::ThreadPoolManager::Global().getThreadPool();
+  auto &pool =
+    nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
 
   nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
     cache_key_step_dim,

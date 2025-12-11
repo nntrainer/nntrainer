@@ -62,6 +62,8 @@ void Engine::initialize() noexcept {
   }
 };
 
+void Engine::release() { thread_pool_manager_.reset(); }
+
 std::string
 Engine::parseComputeEngine(const std::vector<std::string> &props) const {
   for (auto &prop : props) {
@@ -168,6 +170,16 @@ int Engine::registerContext(const std::string &library_path,
   registerContext(type, context);
 
   return 0;
+}
+
+ThreadPoolManager *Engine::getThreadPoolManager() {
+  std::lock_guard<std::mutex> lock(thread_pool_manager_mutex_);
+
+  if (!thread_pool_manager_) {
+    thread_pool_manager_ = std::make_unique<ThreadPoolManager>();
+  }
+
+  return thread_pool_manager_.get();
 }
 
 } // namespace nntrainer
