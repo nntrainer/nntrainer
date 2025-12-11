@@ -1326,7 +1326,7 @@ int NetworkGraph::initialize(ExecutionMode mode,
                                           auto &&pred, auto &&identify) {
     if (conns.empty()) {
       for (unsigned int i = 0; i < graph.size(); ++i) {
-        auto lnode = getSortedLayerNode(i).get();
+        auto lnode = LNODE(graph.getNode(i)).get();
         if (!pred(lnode)) {
           continue;
         }

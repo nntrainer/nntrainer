@@ -152,8 +152,8 @@ std::array<UserDataType, 1>
 createFakeMultiInoutDataGenerator(unsigned int batch_size,
                              unsigned int simulated_data_size) {
   UserDataType train_data(new nntrainer::util::MultiInoutDataLoader(
-    {{batch_size, 1, 4, 2},
-     {batch_size, 1, 1, 2}},
+    {{batch_size, 1, 1, 2},
+     {batch_size, 1, 4, 2}},
     {{batch_size, 1, 1, 1}, {batch_size, 1, 1, 1}}, simulated_data_size));
 
   return {std::move(train_data)};
@@ -168,27 +168,23 @@ void runInferenceAndPrintSamples(const ModelHandle &model,
   // Prepare input and output tensors for inference using std::vector for
   // automatic memory management Note: Input order follows compilation order:
   // input1 (1:4:2) comes before input0 (1:1:2)
-  std::vector<float> input1_data(batch_size * 1 * 4 *
-                                 2); // input1: batch_size:1:4:2
-  std::vector<float> input0_data(batch_size * 1 * 1 *
-                                 2); // input0: batch_size:1:1:2
-  std::vector<float> label0_data(batch_size * 1 * 1 *
-                                 1); // output_1: batch_size:1:1:1
-  std::vector<float> label1_data(batch_size * 1 * 1 *
-                                 1); // output_2: batch_size:1:1:1
+  std::vector<float> input0_data(batch_size * 1 * 1 * 2);
+  std::vector<float> input1_data(batch_size * 1 * 4 * 2);
+  std::vector<float> label0_data(batch_size * 1 * 1 * 1);
+  std::vector<float> label1_data(batch_size * 1 * 1 * 1);
 
   std::vector<float *> input_tensors(2);
   std::vector<float *> label_tensors(2);
 
-  // Set up input tensors in compilation order: input1, input0
+  // Set up input tensors in compilation order: input0, input1
   input_tensors[0] =
-    input1_data.data(); // input1 (1:4:2) - first in compilation order
+    input0_data.data(); // input0 (1:1:2) - first in compilation order
   input_tensors[1] =
-    input0_data.data(); // input0 (1:1:2) - second in compilation order
+    input1_data.data(); // input1 (1:4:2) - second in compilation order
 
   // Set up label tensors
-  label_tensors[0] = label0_data.data(); // output_1
-  label_tensors[1] = label1_data.data(); // output_2
+  label_tensors[0] = label0_data.data(); // output_0
+  label_tensors[1] = label1_data.data(); // output_1
 
   // Run inference on a few samples
   const int num_samples_to_test = std::min(2, (int)batch_size);
@@ -203,20 +199,20 @@ void runInferenceAndPrintSamples(const ModelHandle &model,
     train_user_data->next(input_tensors.data(), label_tensors.data(), &last);
 
     if (sample_idx == 0) {
-      input_tensors[1][0] = -0.5f;
-      input_tensors[1][1] = 0.2f;
+      input_tensors[0][0] = -0.5f;
+      input_tensors[0][1] = 0.2f;
 
       float vals[] = {-0.9f, 0.1f, 0.8f, -0.2f, 0.0f, 0.5f, -0.4f, 0.7f};
-      for (int i = 0; i < 8; ++i) input_tensors[0][i] = vals[i];
+      for (int i = 0; i < 8; ++i) input_tensors[1][i] = vals[i];
     } else {
-      input_tensors[1][0] = 0.8f;
-      input_tensors[1][1] = -0.9f;
+      input_tensors[0][0] = 0.8f;
+      input_tensors[0][1] = -0.9f;
 
       float vals[] = {0.3f, -0.6f, -0.1f, 0.4f, 0.9f, -0.8f, 0.2f, -0.5f};
-      for (int i = 0; i < 8; ++i) input_tensors[0][i] = vals[i];
+      for (int i = 0; i < 8; ++i) input_tensors[1][i] = vals[i];
     }
     
-    float input_val = input_tensors[1][0];
+    float input_val = input_tensors[0][0];
     label_tensors[0][0] = input_val * 2.0f;
     label_tensors[1][0] = input_val * input_val;
 
@@ -226,7 +222,7 @@ void runInferenceAndPrintSamples(const ModelHandle &model,
 
     std::cout << "Input0: [";
     for (int i = 0; i < 2; ++i) {
-      std::cout << input_tensors[1][i];
+      std::cout << input_tensors[0][i];
       if (i < 1)
         std::cout << ", ";
     }
@@ -234,7 +230,7 @@ void runInferenceAndPrintSamples(const ModelHandle &model,
 
     std::cout << "Input1: [";
     for (int i = 0; i < 8; ++i) {
-      std::cout << input_tensors[0][i];
+      std::cout << input_tensors[1][i];
       if (i < 7)
         std::cout << ", ";
     }
@@ -242,10 +238,10 @@ void runInferenceAndPrintSamples(const ModelHandle &model,
 
     if (outputs.size() >= 2) {
       std::cout << "Label0: " << label_tensors[0][0]
-                << ", Predicted0: " << outputs[1][0]
+                << ", Predicted0: " << outputs[0][0]
                 << std::endl;
       std::cout << "Label1: " << label_tensors[1][0]
-                << ", Predicted1: " << outputs[0][0]
+                << ", Predicted1: " << outputs[1][0]
                 << std::endl;
     } else {
       std::cout << "Error: Expected 2 outputs but got " << outputs.size()
