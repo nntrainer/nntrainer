@@ -838,14 +838,13 @@ void NeuralNetwork::load(const std::string &file_path,
   case ml::train::ModelFormat::MODEL_FORMAT_QNN: {
     // for now, we only support to QNN binary format for Inference mode.
     // expect to have the file path for qnn bin and nntrainer bin seperated by
-    // ":" QNN bin ( graph ) : NNTrainer bin (weight)
     NNTR_THROW_IF(exec_mode != ExecutionMode::INFERENCE, std::invalid_argument)
       << "Only support QNN biarny for Infernece";
     NNTR_THROW_IF(!isFileExist(props::FilePath(v[0])), std::invalid_argument)
       << "Cannot open QNN context bin file";
 
     std::thread qnn_load([this, &v]() {
-      for (int i = 0; i < v.size() - 1; i++) {
+      for (int i = 0; i < v.size(); i++) {
         std::cout << "Loading qnn context file " << v[i] << std::endl;
         int ret =
           ct_engine.getRegisteredContext("qnn")->load(props::FilePath(v[i]));

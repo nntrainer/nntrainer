@@ -217,7 +217,8 @@ void Exporter::saveTflResult(
 
 template <>
 void Exporter::saveTflResult(
-  const std::tuple<props::Normalization, props::Standardization> &props,
+  const std::tuple<props::Normalization, props::Standardization,
+                   props::InputTensorDataType, props::TensorDataType> &props,
   const InputLayer *self) {
   createIfNull(tf_node);
   // input layer exports to Transpose operator (NCHW -> NHWC)
