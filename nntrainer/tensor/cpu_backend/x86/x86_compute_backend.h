@@ -570,7 +570,12 @@ void sscal(const unsigned int N, const float alpha, float *X,
  * @param[in] X float * for Vector X
  */
 float snrm2(const unsigned int N, const float *X, const unsigned int incX);
-
+/**
+ * @brief     snrm2 computation : Euclidean norm
+ * @param[in] N number of elements in X
+ * @param[in] X double * for Vector X
+ */
+double dnrm2(const unsigned int N, const double *X, const unsigned int incX);
 /**
  * @brief     copy function : Y = X
  * @param[in] N number of elements in X
