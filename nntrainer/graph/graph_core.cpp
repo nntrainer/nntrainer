@@ -47,7 +47,8 @@ void GraphCore::makeAdjacencyList(
   }
 
   /** make the connections */
-  for (auto &node : node_list) {
+  for (unsigned int i = node_list.size() - 1; i != -1; --i) {
+    auto &node = node_list[i];
     for (auto const &in_conn : node->getInputConnections()) {
       unsigned int to_node_id = getNodeIdx(in_conn);
       adj[to_node_id].push_back(node);
@@ -84,7 +85,7 @@ void GraphCore::topologicalSort() {
   // should be the only one input for now.). Need to support multiple input and
   // support search.
 
-  for (unsigned int i = 0; i < adj.size(); ++i) {
+  for (unsigned int i = adj.size() - 1; i != -1; --i) {
     if (visited[i] == false) {
       topologicalSortUtil(adj, i, visited, dfs_stack);
     }

@@ -10,8 +10,13 @@
  * @bug No known bugs except for NYI items
  */
 
+#include <fc_layer.h>
+#include <graph_core.h>
 #include <gtest/gtest.h>
 #include <ini_wrapper.h>
+#include <input_layer.h>
+#include <layer_node.h>
+#include <multiout_layer.h>
 #include <neuralnet.h>
 #include <util_func.h>
 
@@ -396,6 +401,275 @@ TEST(nntrainerGraphUnitTest, NoLossLayerWhenInferenceMode) {
 
   in.clear();
   ans.clear();
+}
+
+void check_sorted_graph(nntrainer::GraphCore graph,
+                        std::vector<std::string> expected_layer_names) {
+  int expected_graph_size = expected_layer_names.size();
+  EXPECT_EQ(graph.size(), expected_graph_size);
+  for (int i = 0; i < expected_graph_size; i++) {
+    EXPECT_EQ(graph.getSortedNode(i)->getName(), expected_layer_names[i]);
+    EXPECT_EQ(graph.getSortedNodeIdx(expected_layer_names[i]), i);
+  }
+}
+
+TEST(nntrainerGraphUnitTest, topological_sort_simple) {
+  nntrainer::GraphCore graph;
+
+  auto input_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::InputLayer>());
+  input_layer->setName("input");
+
+  auto fc1_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc1_layer->setName("fc1");
+
+  auto fc2_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc2_layer->setName("fc2");
+
+  graph.addNode(input_layer);
+  graph.addNode(fc1_layer);
+  graph.addNode(fc2_layer);
+  // Create simple linear graph: input -> fc1 -> fc2 -> output
+  fc1_layer->setProperty({"input_layers=input"});
+  fc2_layer->setProperty({"input_layers=fc1"});
+
+  EXPECT_NO_THROW(graph.topologicalSort());
+  check_sorted_graph(graph, {"input", "fc1", "fc2"});
+}
+
+TEST(nntrainerGraphUnitTest, topological_sort_branching) {
+  nntrainer::GraphCore graph;
+
+  auto input_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::InputLayer>());
+  input_layer->setName("input");
+
+  auto fc1_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc1_layer->setName("fc1");
+
+  auto fc2_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc2_layer->setName("fc2");
+
+  auto fc3_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc3_layer->setName("fc3");
+
+  auto fc4_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc4_layer->setName("fc4");
+
+  graph.addNode(input_layer);
+  graph.addNode(fc1_layer);
+  graph.addNode(fc2_layer);
+  graph.addNode(fc3_layer);
+  graph.addNode(fc4_layer);
+
+  // input -> fc1 -> fc4
+  // input (branch) -> fc3 -> fc2
+  fc1_layer->setProperty({"input_layers=input"});
+  fc2_layer->setProperty({"input_layers=fc3"});
+  fc3_layer->setProperty({"input_layers=input"});
+  fc4_layer->setProperty({"input_layers=fc1"});
+
+  EXPECT_NO_THROW(graph.topologicalSort());
+  check_sorted_graph(graph, {"input", "fc1", "fc3", "fc2", "fc4"});
+}
+
+TEST(nntrainerGraphUnitTest, topological_sort_non_connected) {
+  nntrainer::GraphCore graph;
+
+  auto input1_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::InputLayer>());
+  input1_layer->setName("input1");
+
+  auto input2_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::InputLayer>());
+  input2_layer->setName("input2");
+
+  auto fc1_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc1_layer->setName("fc1");
+
+  auto fc2_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc2_layer->setName("fc2");
+
+  graph.addNode(input1_layer);
+  graph.addNode(input2_layer);
+  graph.addNode(fc1_layer);
+  graph.addNode(fc2_layer);
+
+  // input1 -> fc1
+  // input2 -> fc2
+  fc1_layer->setProperty({"input_layers=input1"});
+  fc2_layer->setProperty({"input_layers=input2"});
+
+  EXPECT_NO_THROW(graph.topologicalSort());
+  check_sorted_graph(graph, {"input1", "input2", "fc1", "fc2"});
+}
+
+TEST(nntrainerGraphUnitTest, topological_sort_cycle_detection) {
+  nntrainer::GraphCore graph;
+
+  auto fc1_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc1_layer->setName("fc1");
+
+  auto fc2_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc2_layer->setName("fc2");
+
+  graph.addNode(fc1_layer);
+  graph.addNode(fc2_layer);
+
+  // fc1 <-> fc2
+  fc1_layer->setProperty({"input_layers=fc2"});
+  fc2_layer->setProperty({"input_layers=fc1"});
+
+  // throw if there is cycle?
+  EXPECT_NO_THROW(graph.topologicalSort());
+  check_sorted_graph(graph, {"fc2", "fc1"});
+}
+
+TEST(nntrainerGraphUnitTest, topological_sort_multiple_inputs) {
+  nntrainer::GraphCore graph;
+
+  auto input1_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::InputLayer>());
+  input1_layer->setName("input1");
+
+  auto input2_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::InputLayer>());
+  input2_layer->setName("input2");
+
+  auto input3_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::InputLayer>());
+  input3_layer->setName("input3");
+
+  auto fc_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc_layer->setName("fc");
+
+  graph.addNode(input1_layer);
+  graph.addNode(input2_layer);
+  graph.addNode(input3_layer);
+  graph.addNode(fc_layer);
+
+  // {input1, input2, input3} -> fc
+  fc_layer->setProperty({"input_layers=input1,input2,input3"});
+
+  EXPECT_NO_THROW(graph.topologicalSort());
+  check_sorted_graph(graph, {"input1", "input2", "input3", "fc"});
+}
+
+TEST(nntrainerGraphUnitTest, topological_sort_multiple_outputs) {
+  nntrainer::GraphCore graph;
+
+  auto input_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::InputLayer>());
+  input_layer->setName("input");
+
+  auto multiout_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::MultiOutLayer>());
+  multiout_layer->setName("multiout");
+
+  auto fc1_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc1_layer->setName("fc1");
+
+  auto fc2_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc2_layer->setName("fc2");
+
+  auto fc3_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc3_layer->setName("fc3");
+
+  auto fc4_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc4_layer->setName("fc4");
+
+  graph.addNode(input_layer);
+  graph.addNode(multiout_layer);
+  graph.addNode(fc1_layer);
+  graph.addNode(fc2_layer);
+  graph.addNode(fc3_layer);
+  graph.addNode(fc4_layer);
+
+  // input -> multiout -> {fc1 -> fc3, fc2, fc4}
+  multiout_layer->setProperty({"input_layers=input"});
+  fc1_layer->setProperty({"input_layers=multiout"});
+  fc2_layer->setProperty({"input_layers=multiout"});
+  fc3_layer->setProperty({"input_layers=fc1"});
+  fc4_layer->setProperty({"input_layers=multiout"});
+
+  EXPECT_NO_THROW(graph.topologicalSort());
+  check_sorted_graph(graph, {"input", "multiout", "fc1", "fc2", "fc3", "fc4"});
+}
+
+TEST(nntrainerGraphUnitTest, topological_sort_complex_multi_output) {
+  nntrainer::GraphCore graph;
+
+  auto input_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::InputLayer>());
+  input_layer->setName("input");
+
+  auto multiout1_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::MultiOutLayer>());
+  multiout1_layer->setName("multiout1");
+
+  auto multiout2_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::MultiOutLayer>());
+  multiout2_layer->setName("multiout2");
+
+  auto fc1_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc1_layer->setName("fc1");
+
+  auto fc2_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc2_layer->setName("fc2");
+
+  auto fc3_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc3_layer->setName("fc3");
+
+  auto fc4_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc4_layer->setName("fc4");
+
+  auto fc5_layer = std::make_shared<nntrainer::LayerNode>(
+    std::make_unique<nntrainer::FullyConnectedLayer>());
+  fc5_layer->setName("fc5");
+
+  graph.addNode(input_layer);
+  graph.addNode(fc1_layer);
+  graph.addNode(fc2_layer);
+  graph.addNode(fc3_layer);
+  graph.addNode(fc4_layer);
+  graph.addNode(fc5_layer);
+  graph.addNode(multiout1_layer);
+  graph.addNode(multiout2_layer);
+
+  // input -> {multiout1, multiout2}
+  // multiout1 -> {fc1, fc2}
+  // multiout2 -> {fc4, fc5}
+  // {fc2, fc4} -> fc3
+  multiout1_layer->setProperty({"input_layers=input"});
+  multiout2_layer->setProperty({"input_layers=input"});
+  fc1_layer->setProperty({"input_layers=multiout1"});
+  fc2_layer->setProperty({"input_layers=multiout1"});
+  fc3_layer->setProperty({"input_layers=fc2,fc4"});
+  fc5_layer->setProperty({"input_layers=multiout2"});
+  fc4_layer->setProperty({"input_layers=multiout2"});
+
+  EXPECT_NO_THROW(graph.topologicalSort());
+  check_sorted_graph(graph, {"input", "multiout1", "fc1", "fc2", "multiout2",
+                             "fc4", "fc3", "fc5"});
 }
 
 int main(int argc, char **argv) {
