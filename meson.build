@@ -172,19 +172,19 @@ if get_option('enable-fp16')
      # On ARM systems, you must enable this type explicitly with the -mfp16-format
      #   command-line option in order to use it.
      ## About FP16-SIMD in aarch64
-     # FP16-SIMD is supported since armv8.2. If you enable this forcibly, it won't be
+     # FP16-SIMD is supported since armv9.2. If you enable this forcibly, it won't be
      # comaptible with armv8.0 machines.
-     if cxx.has_argument('-mfp16-format=ieee')
-       add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
-       add_project_arguments('-march=armv8.2-a+fp16', language: ['c', 'cpp'])
-     else
+      if cxx.has_argument('-mfp16-format=ieee')
+        add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
+        add_project_arguments('-march=armv8.2-a+fp16', language: ['c', 'cpp'])
+      else
        message ('The compiler does not support -mfp16-format=ieee. However, according to https://gcc.gnu.org/onlinedocs/gcc-9.1.0/gcc/Half-Precision.html, gcc may use IEEE fp16 anyway. Thus, we will proceed without the option for FP16 support.')
      endif
      extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
    elif arch == 'arm'
      ## About FP16-SIMD in arm
-     # FP16-SIMD is supported since armv8.2.
+     # FP16-SIMD is supported since armv9.2.
      # Thus, even if fp16 is force-enabled, NEON is off.
      if cxx.has_argument('-mfp16-format=ieee')
        add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])

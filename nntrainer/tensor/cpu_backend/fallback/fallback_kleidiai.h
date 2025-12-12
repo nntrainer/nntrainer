@@ -82,3 +82,30 @@ void ref_matmul_f32_qa8dx_qs4cx(size_t m, size_t n, size_t k, rhs_format format,
                                 const uint8_t *rhs_qs4cx,
                                 const float *rhs_scales_f32, float *dst_f32,
                                 float scalar_min, float scalar_max);
+
+/**
+ * @brief qs4c32 quantization of (n*k) matrix with block size 32.
+ * qsi4c32p refers to quantized symmetric 4-bit quantization with block size 32.
+ *
+ * @param n N length of the matrix
+ * @param k K length of the matrix (must be divisible by bl)
+ * @param bl block length (typically 32)
+ * @param rhs_f32 matrix data before quantization to load
+ * @param rhs_qs4c32 matrix data after quantization to store
+ */
+void quant_qs4c32_f32(size_t n, size_t k, size_t bl, const float *rhs_f32,
+                      uint8_t *rhs_qs4c32);
+
+/**
+ * @brief qs8d32 quantization of (m*k) matrix with block size 32.
+ * qsi8d32p refers to quantized symmetric 8-bit quantization with block size 32.
+ *
+ * @param n N length of the matrix
+ * @param k K length of the matrix (must be divisible by bl)
+ * @param bl block length (typically 32)
+ * @param rhs_f32 matrix data before quantization to load
+ * @param rhs_qs8c32 matrix data after quantization to store
+ */
+void ref_quant_qs8d32_f32(size_t n, size_t k, size_t bl, const float *rhs_f32,
+                          uint8_t *rhs_qs8c32);
+
