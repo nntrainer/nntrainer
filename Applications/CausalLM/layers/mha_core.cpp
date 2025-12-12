@@ -1138,4 +1138,168 @@ nntrainer::LayerPluggable ml_train_layer_pluggable{create_mha_core_layer,
 
 #endif
 
+void MHACoreLayer::precompute_freqs_ernie(int head_dim, unsigned int seq_len,
+                                          float theta) {
+  // compute the freqs only when it is the first time to call this function
+  if (freqs_cos != nullptr && freqs_cos->size() == seq_len)
+    return;
+  if (rope_scaling_type == "default")
+    _compute_default_parameters(head_dim, theta);
+  else if (rope_scaling_type == "yarn")
+    _compute_yarn_parameters(head_dim, theta);
+  else
+    NNTR_THROW_IF(true, std::invalid_argument) << "Unsupported rope type!";
+  // cos / sin
+  unsigned int half_ = head_dim / 2;
+  auto cos = new std::vector<std::vector<float>>();
+  cos->assign(seq_len, std::vector<float>(head_dim, 0));
+  auto sin = new std::vector<std::vector<float>>();
+  sin->assign(seq_len, std::vector<float>(head_dim, 0));
+  // update cos / sin frequency
+  for (unsigned int i = 0; i < seq_len; ++i) {
+#ifdef USE_NEON
+    nntrainer::calc_trigonometric_vals_dup(half_, thetas.data(),
+                                           (*cos)[i].data(), (*sin)[i].data(),
+                                           i, attention_scaling);
+#else
+    for (unsigned int j = 0; j < half_; ++j) {
+      double angle = (double)i * thetas[j];
+      (*cos)[i][2 * j] = (float)(std::cos(angle) * (double)attention_scaling);
+      (*cos)[i][2 * j + 1] =
+        (float)(std::cos(angle) *
+                (double)attention_scaling); // repeated 2 times
+
+      (*sin)[i][2 * j] = (float)(std::sin(angle) * (double)attention_scaling);
+      (*sin)[i][2 * j + 1] =
+        (float)(std::sin(angle) *
+                (double)attention_scaling); // repeated 2 times
+    }
+#endif
+  }
+  freqs_cos = cos;
+  freqs_sin = sin;
+#ifdef ENABLE_FP16
+  // cos / sin for FP16
+  auto cos_fp16 = new std::vector<std::vector<_FP16>>();
+  cos_fp16->assign(seq_len, std::vector<_FP16>(head_dim, 0));
+  auto sin_fp16 = new std::vector<std::vector<_FP16>>();
+  sin_fp16->assign(seq_len, std::vector<_FP16>(head_dim, 0));
+  for (unsigned int i = 0; i < seq_len; ++i) {
+    for (unsigned int j = 0; j < head_dim; ++j) {
+      (*cos_fp16)[i][j] = (_FP16)(*cos)[i][j];
+      (*sin_fp16)[i][j] = (_FP16)(*sin)[i][j];
+    }
+  }
+  freqs_cos_fp16 = cos_fp16;
+  freqs_sin_fp16 = sin_fp16;
+#endif
+};
+
+void MHACoreLayer::apply_rotary_emb_tensor_ernie(nntrainer::Tensor &in,
+                                                 nntrainer::Tensor &out,
+                                                 unsigned int dim,
+                                                 unsigned int from,
+                                                 bool convert_only) {
+  unsigned int half_ = dim / 2;
+  unsigned int max_timestep =
+    std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
+  if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    std::vector<float> *cos_ = nullptr;
+    std::vector<float> *sin_ = nullptr;
+    for (unsigned int b = 0; b < in.batch(); b++) {
+      for (unsigned int c = 0; c < in.channel(); c++) {
+        for (unsigned int h = 0; h < in.height(); h++) {
+          if (from < max_timestep) {
+            if (from + h >= freqs_cos->size()) {
+              throw std::runtime_error(
+                "RoPE index out of bounds: " + std::to_string(from + h) +
+                " >= " + std::to_string(freqs_cos->size()));
+            }
+            cos_ = &(*freqs_cos)[from + h];
+            sin_ = &(*freqs_sin)[from + h];
+          }
+          float *in_ptr = in.getData<float>() +
+                          b * in.channel() * in.height() * in.width() +
+                          c * in.height() * in.width() + h * in.width();
+
+          if (out.getDataType() == ml::train::TensorDim::DataType::FP32) {
+            float *out_ptr = out.getData<float>() +
+                             b * out.channel() * out.height() * out.width() +
+                             c * out.height() * out.width() + h * out.width();
+            for (unsigned int w = 0; w < in.width(); w += dim) {
+              for (unsigned int i = 0; i < dim; i += 2) {
+                float in0 = in_ptr[w + i];
+                float in1 = in_ptr[w + i + 1];
+                float c = (*cos_)[i];
+                float s = (*sin_)[i];
+                out_ptr[w + i] = in0 * c - in1 * s;
+                out_ptr[w + i + 1] = in1 * c + in0 * s;
+              }
+            }
+          } else if (out.getDataType() ==
+                       ml::train::TensorDim::DataType::UINT16 ||
+                     out.getDataType() ==
+                       ml::train::TensorDim::DataType::FP16) {
+            uint16_t *out_ptr = out.getData<uint16_t>() +
+                                b * out.channel() * out.height() * out.width() +
+                                c * out.height() * out.width() +
+                                h * out.width();
+            for (unsigned int w = 0; w < in.width(); w += dim) {
+              for (unsigned int i = 0; i < dim; i += 2) {
+                float in0 = in_ptr[w + i];
+                float in1 = in_ptr[w + i + 1];
+                float c = (*cos_)[i];
+                float s = (*sin_)[i];
+                float out0 = in0 * c - in1 * s;
+                float out1 = in1 * c + in0 * s;
+                out_ptr[w + i] = nntrainer::compute_fp32_to_fp16(out0);
+                out_ptr[w + i + 1] = nntrainer::compute_fp32_to_fp16(out1);
+              }
+            }
+          }
+        }
+      }
+    }
+  } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    std::vector<_FP16> *cos_ = nullptr;
+    std::vector<_FP16> *sin_ = nullptr;
+    for (unsigned int b = 0; b < in.batch(); b++) {
+      for (unsigned int c = 0; c < in.channel(); c++) {
+        for (unsigned int h = 0; h < in.height(); h++) {
+          if (from < max_timestep) {
+            if (from + h >= freqs_cos_fp16->size()) {
+              throw std::runtime_error(
+                "RoPE index out of bounds (FP16): " + std::to_string(from + h) +
+                " >= " + std::to_string(freqs_cos_fp16->size()));
+            }
+            cos_ = &(*freqs_cos_fp16)[from + h];
+            sin_ = &(*freqs_sin_fp16)[from + h];
+          }
+          _FP16 *in_ptr = in.getData<_FP16>() +
+                          b * in.channel() * in.height() * in.width() +
+                          c * in.height() * in.width() + h * in.width();
+          _FP16 *out_ptr = out.getData<_FP16>() +
+                           b * out.channel() * out.height() * out.width() +
+                           c * out.height() * out.width() + h * out.width();
+
+          for (unsigned int w = 0; w < in.width(); w += dim) {
+            for (unsigned int i = 0; i < dim; i += 2) {
+              float in0 = (float)in_ptr[w + i];
+              float in1 = (float)in_ptr[w + i + 1];
+              float c = (float)(*cos_)[i];
+              float s = (float)(*sin_)[i];
+              out_ptr[w + i] = (_FP16)(in0 * c - in1 * s);
+              out_ptr[w + i + 1] = (_FP16)(in1 * c + in0 * s);
+            }
+          }
+        }
+      }
+    }
+#else
+    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+#endif
+  }
+}
+
 } // namespace causallm

@@ -1,65 +1,46 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
- * Copyright (C) 2020 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *   http://www.apache.org/licenses/LICENSE-2.0
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- *
- * @file	qwen_moe_layer_fsu.cpp
- * @date	09 June 2025
- * @brief	This is a Mixture of Expert Layer Class for Neural Network
- * @see		https://github.com/nnstreamer/
- * @author	Eunju Yang <ej.yang@samsung.com>
- * @bug		No known bugs except for NYI items
- * @note    MoE layer with on-the-fly expert FSU
- *
+ * @file   ernie_moe_layer.cpp
+ * @brief  ernie 4.5 causallm header
+ * @date   02 December 2025
+ * @see    https://github.com/nnstreamer/nntrainer
+ * @author Donghak Park <donghak.park@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #include <acti_func.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <ernie_moe_layer.h>
 #include <node_exporter.h>
 #include <omp.h>
-#include <qwen_moe_layer_cached.h>
 #include <stdexcept>
-
-#include <chrono>
-using std::chrono::duration_cast;
-using std::chrono::high_resolution_clock;
-using std::chrono::microseconds; // or microseconds
-using std::chrono::milliseconds; // or microseconds
-using std::chrono::nanoseconds;  // or microseconds
-using std::chrono::seconds;      // or microseconds
 
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
-CachedSlimMoELayer::CachedSlimMoELayer() :
+ErnieMoELayer::ErnieMoELayer() :
   LayerImpl(),
   num_experts(0),
+  num_shared_experts(0),
   topk(0),
   moe_props(props::NumExperts(), props::NumExpertsPerToken(),
-            nntrainer::props::Unit(), props::MoEActivation()),
+            nntrainer::props::Unit(), props::MoEActivation(),
+            props::NumSharedExperts(), props::MoENormMin()),
   expert_gate_proj_indices({}),
   expert_up_proj_indices({}),
   expert_down_proj_indices({}),
   loaded_expert_deque({}),
   need_load({}),
   gate_idx(std::numeric_limits<unsigned>::max()),
+  e_score_correction_bias_idx(std::numeric_limits<unsigned>::max()),
   router_logits_idx(std::numeric_limits<unsigned>::max()),
   expert_mask_idx(std::numeric_limits<unsigned>::max()) {}
 
-void CachedSlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
-
+void ErnieMoELayer::finalize(nntrainer::InitLayerContext &context) {
   // 1. Validate input/output dimensions
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
     << "MoE layer only supports single input";
@@ -82,7 +63,13 @@ void CachedSlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
 
   // 3. Get MoE properties
   num_experts = std::get<props::NumExperts>(moe_props).get();
+  num_shared_experts = std::get<props::NumSharedExperts>(moe_props).get();
   topk = std::get<props::NumExpertsPerToken>(moe_props).get();
+  float moe_norm_min = std::get<props::MoENormMin>(moe_props).get();
+  if (moe_norm_min == 0.0f) {
+    moe_norm_min = 1e-12f; // Default value if not set
+    std::get<props::MoENormMin>(moe_props).set(moe_norm_min);
+  }
   const unsigned int intermediate_size =
     std::get<nntrainer::props::Unit>(moe_props).get();
   const unsigned int hidden_size = in_dim.width(); // Feature dimension
@@ -112,10 +99,51 @@ void CachedSlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
     gate_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "gate", true);
 
+  // 4-1. Initialize e_score_correction_bias
+  nntrainer::TensorDim e_score_correction_bias_dim(
+    1, 1, 1, num_experts,
+    nntrainer::TensorDim::TensorType(context.getFormat(),
+                                     nntrainer::TensorDim::DataType::FP32),
+    is_nchw ? 0b0011 : 0b0101);
+
+  e_score_correction_bias_idx = context.requestWeight(
+    e_score_correction_bias_dim, weight_initializer, weight_regularizer,
+    weight_regularizer_constant, weight_decay, "moe_statics", false);
+
   // 5. Initializer expert weights
   expert_gate_proj_indices.reserve(num_experts);
   expert_up_proj_indices.reserve(num_experts);
   expert_down_proj_indices.reserve(num_experts);
+
+  if (num_shared_experts > 0) {
+    nntrainer::TensorDim shared_expert_gate_dim(
+      1, is_nchw ? 1 : num_shared_experts * intermediate_size,
+      is_nchw ? hidden_size : 1,
+      is_nchw ? num_shared_experts * intermediate_size : hidden_size,
+      nntrainer::TensorDim::TensorType(context.getFormat(),
+                                       context.getWeightDataType()),
+      is_nchw ? 0b0011 : 0b0101);
+
+    nntrainer::TensorDim shared_expert_down_dim(
+      1, is_nchw ? 1 : hidden_size,
+      is_nchw ? num_shared_experts * intermediate_size : 1,
+      is_nchw ? hidden_size : num_shared_experts * intermediate_size,
+      nntrainer::TensorDim::TensorType(context.getFormat(),
+                                       context.getWeightDataType()),
+      is_nchw ? 0b0011 : 0b0101);
+
+    shared_up_proj_idx = context.requestWeight(
+      shared_expert_gate_dim, weight_initializer, weight_regularizer,
+      weight_regularizer_constant, weight_decay, "shared_experts_up", false);
+
+    shared_gate_proj_idx = context.requestWeight(
+      shared_expert_gate_dim, weight_initializer, weight_regularizer,
+      weight_regularizer_constant, weight_decay, "shared_experts_gate", false);
+
+    shared_down_proj_idx = context.requestWeight(
+      shared_expert_down_dim, weight_initializer, weight_regularizer,
+      weight_regularizer_constant, weight_decay, "shared_experts_down", false);
+  }
 
   nntrainer::TensorDim expert_gate_dim(
     1, is_nchw ? 1 : intermediate_size, is_nchw ? hidden_size : 1,
@@ -132,25 +160,25 @@ void CachedSlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
     is_nchw ? 0b0011 : 0b0101);
 
   for (unsigned int i = 0; i < num_experts; ++i) {
-    // Up projection
     expert_up_proj_indices.push_back(context.requestWeight(
       expert_gate_dim, // Same dimensions as gate projection
       weight_initializer, weight_regularizer, weight_regularizer_constant,
       weight_decay, "expert_up_" + std::to_string(i), false, true));
 
-    // Gate projection
     expert_gate_proj_indices.push_back(context.requestWeight(
       expert_gate_dim, weight_initializer, weight_regularizer,
       weight_regularizer_constant, weight_decay,
       "expert_gate_" + std::to_string(i), false, true));
 
-    // Down projection
     expert_down_proj_indices.push_back(context.requestWeight(
       expert_down_dim, weight_initializer, weight_regularizer,
       weight_regularizer_constant, weight_decay,
       "expert_down_" + std::to_string(i), false, true));
+
     need_load.push_back(true);
   }
+
+  // 5-1. Initialize shared expert weights
 
   // 6. Request intermediate tensors
   const unsigned batch_size = in_dim.batch();
@@ -170,10 +198,10 @@ void CachedSlimMoELayer::finalize(nntrainer::InitLayerContext &context) {
                           nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
 }
 
-void CachedSlimMoELayer::forwarding(nntrainer::RunLayerContext &context,
-                                    bool training) {}
+void ErnieMoELayer::forwarding(nntrainer::RunLayerContext &context,
+                               bool training) {}
 
-inline void CachedSlimMoELayer::compute_expert_forward(
+inline void ErnieMoELayer::compute_expert_forward(
   const nntrainer::Tensor &input, nntrainer::Tensor &output,
   const std::vector<std::pair<unsigned, float>> &token_assignments,
   const nntrainer::Tensor &gate_proj, const nntrainer::Tensor &up_proj,
@@ -264,13 +292,9 @@ inline void CachedSlimMoELayer::compute_expert_forward(
   }
 }
 
-void CachedSlimMoELayer::incremental_forwarding(
-  nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
-  bool training) {
-
-#ifdef DEBUG
-  auto t1 = high_resolution_clock::now();
-#endif
+void ErnieMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
+                                           unsigned int from, unsigned int to,
+                                           bool training) {
 
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -280,6 +304,9 @@ void CachedSlimMoELayer::incremental_forwarding(
   nntrainer::TensorDim input_step_dim = input_.getDim();
   nntrainer::TensorDim output_step_dim = output_.getDim();
   nntrainer::TensorDim router_logits_step_dim = router_logits_.getDim();
+  nntrainer::Tensor &shared_gate_proj = context.getWeight(shared_gate_proj_idx);
+  nntrainer::Tensor &shared_up_proj = context.getWeight(shared_up_proj_idx);
+  nntrainer::Tensor &shared_down_proj = context.getWeight(shared_down_proj_idx);
 
   input_step_dim.batch(1);
   output_step_dim.batch(1);
@@ -289,7 +316,6 @@ void CachedSlimMoELayer::incremental_forwarding(
   output_step_dim.height(to - from);
 
   for (unsigned int b = 0; b < input_.batch(); ++b) {
-
     auto input = input_.getSharedDataTensor(
       input_step_dim, b * input_step_dim.getFeatureLen(), true);
     auto output = output_.getSharedDataTensor(
@@ -309,42 +335,69 @@ void CachedSlimMoELayer::incremental_forwarding(
     output.reshape({total_tokens, 1, 1, hidden_size});
     output.setZero();
 
+    // Compute shared experts
+    if (num_shared_experts > 0) {
+
+      nntrainer::Tensor shared_output(total_tokens, 1, 1, hidden_size,
+                                      output.getTensorType());
+      const unsigned int intermediate_size =
+        std::get<nntrainer::props::Unit>(moe_props).get();
+
+      nntrainer::TensorDim intermediate_dim(
+        {total_tokens, 1, 1, num_shared_experts * intermediate_size},
+        input.getTensorType());
+
+      nntrainer::Tensor gate_out(intermediate_dim);
+      nntrainer::Tensor acti_out(intermediate_dim);
+      nntrainer::Tensor up_out(intermediate_dim);
+
+      input.dot(shared_gate_proj, gate_out);
+      input.dot(shared_up_proj, up_out);
+
+      acti_func.run_fn(gate_out, acti_out);
+      acti_out.multiply_i(up_out);
+
+      acti_out.dot(shared_down_proj, shared_output);
+
+      // Add shared expert output to final output
+      output.add_i(shared_output);
+    }
+
     // routing
     nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
     input.dot(gate_weights, router_logits);
+
     router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);
 
-    // get extra topK
-    auto extra_topk_result = router_logits.topK(topk + 5);
-    auto extra_topk_values = std::get<0>(extra_topk_result);
-    auto extra_topk_indices = std::get<1>(extra_topk_result);
-    std::deque<int> extra_top_k = {};
-    extra_topk_values.divide_i(extra_topk_values.sum(3));
-    const uint32_t *extra_indices_data = extra_topk_indices.getData<uint32_t>();
+    // Add e_score_correction_bias
+    nntrainer::Tensor &e_score_correction_bias =
+      context.getWeight(e_score_correction_bias_idx);
 
-    // get extra topk
-    for (int i = static_cast<int>(total_tokens) - 1; i >= 0; --i) {
-      for (int k = 0; k < static_cast<int>(topk + 5); ++k) {
-        unsigned expert_idx = extra_indices_data[i * topk + k];
-        extra_top_k.push_back(expert_idx);
-      }
-    }
+    nntrainer::Tensor biased_router_logits(router_logits.getDim());
+    biased_router_logits.copyData(router_logits);
+    biased_router_logits.add_i(e_score_correction_bias);
 
-    auto topk_result = router_logits.topK(topk);
+    auto topk_result = biased_router_logits.topK(topk);
     auto topk_values = std::get<0>(topk_result);
     auto topk_indices = std::get<1>(topk_result);
-
-    // norm_topk_prob
-    topk_values.divide_i(topk_values.sum(3));
 
     const uint32_t *indices_data = topk_indices.getData<uint32_t>();
     std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
       num_experts);
     // Set expert mask
     for (int i = 0; i < static_cast<int>(total_tokens); ++i) {
+      float sum_prob = 0.0f;
       for (int k = 0; k < static_cast<int>(topk); ++k) {
         unsigned expert_idx = indices_data[i * topk + k];
-        float weight = topk_values.getValue<float>(i, 0, 0, k);
+        float weight = router_logits.getValue<float>(i, 0, 0, expert_idx);
+        sum_prob += weight;
+      }
+
+      for (int k = 0; k < static_cast<int>(topk); ++k) {
+        unsigned expert_idx = indices_data[i * topk + k];
+        float weight = router_logits.getValue<float>(i, 0, 0, expert_idx);
+        weight /=
+          std::max(sum_prob, std::get<props::MoENormMin>(moe_props).get());
         expert_assignments[expert_idx].emplace_back(i, weight);
       }
     }
@@ -357,6 +410,7 @@ void CachedSlimMoELayer::incremental_forwarding(
       if (!expert_assignments[expert_idx].empty()) {
         expert_outputs[expert_idx] = nntrainer::Tensor(
           total_tokens, 1, 1, hidden_size, output.getTensorType());
+        expert_outputs[expert_idx].setZero();
       }
     }
     std::vector<int> target_idx_vector;
@@ -370,17 +424,10 @@ void CachedSlimMoELayer::incremental_forwarding(
       target_idx_vector.push_back(expert_idx);
     }
 
-    int hit_count = 0;
-    int miss_count = 0;
-
 #pragma omp parallel for schedule(dynamic)
     for (int expert_idx : target_idx_vector) {
       const auto &assignments = expert_assignments[expert_idx];
       if (need_load[expert_idx]) {
-
-#ifdef DEBUG
-        auto t1_miss = high_resolution_clock::now();
-#endif
 
         context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
         context.getWeight(expert_up_proj_indices[expert_idx]).activate();
@@ -391,7 +438,6 @@ void CachedSlimMoELayer::incremental_forwarding(
           loaded_expert_deque.push_back(expert_idx);
           iteration_map[expert_idx] = --loaded_expert_deque.end();
           need_load[expert_idx] = false;
-          miss_count += 1;
         }
 
         compute_expert_forward(
@@ -399,42 +445,16 @@ void CachedSlimMoELayer::incremental_forwarding(
           context.getWeight(expert_gate_proj_indices[expert_idx]),
           context.getWeight(expert_up_proj_indices[expert_idx]),
           context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-#ifdef DEBUG
-        auto t2_miss = high_resolution_clock::now();
-#endif
+
       } else {
 
-#ifdef DEBUG
-        auto t1_hit = high_resolution_clock::now();
-#endif
-        {
-          std::lock_guard<std::mutex> lock(cache_mutex);
-          hit_count += 1;
-        }
-
         compute_expert_forward(
           input, expert_outputs[expert_idx], assignments,
           context.getWeight(expert_gate_proj_indices[expert_idx]),
           context.getWeight(expert_up_proj_indices[expert_idx]),
           context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-
-#ifdef DEBUG
-        auto t2_hit = high_resolution_clock::now();
-#endif
       }
     }
-
-    for (int i = extra_top_k.size() - 1; i >= 0; i--) {
-      if (iteration_map.find(extra_top_k[i]) != iteration_map.end()) {
-        loaded_expert_deque.erase(iteration_map[extra_top_k[i]]);
-        loaded_expert_deque.push_back(extra_top_k[i]);
-        iteration_map[extra_top_k[i]] = --loaded_expert_deque.end();
-      }
-    }
-
-#ifdef DEBUG
-    auto t1_evict = high_resolution_clock::now();
-#endif
 
 // Evict experts
 #pragma omp parallel
@@ -442,81 +462,52 @@ void CachedSlimMoELayer::incremental_forwarding(
       int target_idx;
       {
         std::lock_guard<std::mutex> lock(cache_mutex);
+
         if (loaded_expert_deque.size() > 16)
           break;
+
         target_idx = loaded_expert_deque.front();
         loaded_expert_deque.pop_front();
         iteration_map.erase(target_idx);
         need_load[target_idx] = true;
       }
-
       context.getWeight(expert_gate_proj_indices[target_idx]).deactivate();
       context.getWeight(expert_up_proj_indices[target_idx]).deactivate();
       context.getWeight(expert_down_proj_indices[target_idx]).deactivate();
     }
 
-#ifdef DEBUG
-    auto t2_evict = high_resolution_clock::now();
-#endif
-
     // Combine expert outputs
-    int init = 0;
     for (int expert_idx : target_idx_vector) {
-      if (!init) {
-        output.copyData(expert_outputs[expert_idx]);
-        ++init;
-      } else {
-        output.add_i(expert_outputs[expert_idx]);
-      }
+      output.add_i(expert_outputs[expert_idx]);
     }
 
     // reshape output: [B*S,1,1,H] -> [B,1,S,H]
     output.reshape({batch_size, 1, seq_len, hidden_size});
-
-#ifdef DEBUG
-    auto t2 = high_resolution_clock::now();
-    auto dt = duration_cast<nanoseconds>(t2 - t1);
-    auto dt_miss = duration_cast<nanoseconds>(t2_miss - t1_miss);
-    auto dt_hit = duration_cast<nanoseconds>(t2_hit - t1_hit);
-    auto dt_evict = duration_cast<nanoseconds>(t2_evict - t1_evict);
-    std::cout << context.getName() << " \t| " << dt.count() << " ns "
-              << "\t| " << dt.count() / 1'000 << " us "
-              << "\t| " << dt.count() / 1'000'000 << " ms "
-              << "\t| "
-              << "hit ratio: " << hit_count / 8.0 << "\t | "
-              << " miss ratio: " << miss_count / 8.0 << "\t | "
-              << "hit_compute: " << dt_hit.count() / 1'000'000 << " ms "
-              << "\t| "
-              << "miss_compute: " << dt_miss.count() / 1'000'000 << " ms "
-              << "\t| "
-              << "evict_time: " << dt_evict.count() / 1'000'000 << " ms "
-              << "\t| " << std::endl;
-#endif
   }
 }
 
-void CachedSlimMoELayer::setProperty(const std::vector<std::string> &values) {
+void ErnieMoELayer::setProperty(const std::vector<std::string> &values) {
   auto remain_props = loadProperties(values, moe_props);
   nntrainer::LayerImpl::setProperty(remain_props);
 }
 
-void CachedSlimMoELayer::calcDerivative(nntrainer::RunLayerContext &context) {
+void ErnieMoELayer::calcDerivative(nntrainer::RunLayerContext &context) {
   // MoE layer does not support derivative calculation
   throw std::runtime_error("MoE layer does not support derivative calculation");
 }
 
-void CachedSlimMoELayer::calcGradient(nntrainer::RunLayerContext &context) {
+void ErnieMoELayer::calcGradient(nntrainer::RunLayerContext &context) {
   // MoE layer does not support gradient calculation
   throw std::runtime_error("MoE layer does not support gradient calculation");
 }
 
-void CachedSlimMoELayer::exportTo(
-  nntrainer::Exporter &exporter, const ml::train::ExportMethods &method) const {
+void ErnieMoELayer::exportTo(nntrainer::Exporter &exporter,
+                             const ml::train::ExportMethods &method) const {
   nntrainer::LayerImpl::exportTo(exporter, method);
   exporter.saveResult(moe_props, method, this); // Save MoE specific properties
 }
 
-void CachedSlimMoELayer::updateTensorsByInputDimensions(
+void ErnieMoELayer::updateTensorsByInputDimensions(
   nntrainer::RunLayerContext &context,
   std::vector<nntrainer::TensorDim> input_dimensions) {
   ml::train::TensorDim input_dim = context.getInput(SINGLE_INOUT_IDX).getDim();

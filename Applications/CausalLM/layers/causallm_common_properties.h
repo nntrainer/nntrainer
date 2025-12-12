@@ -67,6 +67,24 @@ public:
 };
 
 /**
+ * @brief NumSharedExpers,  Number of shared experts property
+ */
+class NumSharedExperts : public nntrainer::Property<unsigned int> {
+public:
+  static constexpr const char *key = "num_shared_experts";
+  using prop_tag = nntrainer::uint_prop_tag;
+};
+
+/**
+ * @brief MoENormMin, Minimum value for MoE normalization
+ */
+class MoENormMin : public nntrainer::Property<float> {
+public:
+  static constexpr const char *key = "moe_norm_min";
+  using prop_tag = nntrainer::float_prop_tag;
+};
+
+/**
  * @brief unit property, unit is used to measure how many weights are there
  *
  */
