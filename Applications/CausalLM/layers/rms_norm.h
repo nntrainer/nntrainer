@@ -43,7 +43,7 @@ public:
    * @brief Construct a new custom RMS normalization layer object
    *
    */
-  WIN_EXPORT RMSNormLayer() : Layer() {}
+  WIN_EXPORT RMSNormLayer() : Layer(), wt_idx:{0} {}
 
   /**
    * @brief Destroy the custom RMS normalization layer object

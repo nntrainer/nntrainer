@@ -58,6 +58,7 @@ CartPole::CartPole() {
   steps_beyond_done = -1;
   count = 0;
   action_dim = 2;
+  S = { 0 };
 }
 
 void CartPole::init() {

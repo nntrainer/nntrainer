@@ -352,7 +352,6 @@ std::tuple<float, uint32_t> test_gemm_qai8dxp_qsi4cxp_unpacked(
 
   uint8_t *rhs_native_mtx_qs4cx = new uint8_t[rhs_native_size_qs4cx];
   uint8_t *rhs_scales_f32 = new uint8_t[rhs_scales_size_f32];
-  uint8_t *lhs_ref_mtx_qa8dx = new uint8_t[lhs_ref_size_qa8dx];
 
   // Step2. 4-bit Weight quantization, for qs4cx format, with fp32 scale
   nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weights,
@@ -382,7 +381,6 @@ std::tuple<float, uint32_t> test_gemm_qai8dxp_qsi4cxp_unpacked(
 
   delete[] rhs_native_mtx_qs4cx;
   delete[] rhs_scales_f32;
-  delete[] lhs_ref_mtx_qa8dx;
 
   return {mean_squared_error, opt_kernel_variant_idx};
 }
@@ -442,7 +440,6 @@ float test_gemm_qai8dxp_qsi4cxp_packed(const uint32_t M, const uint32_t K,
 
   uint8_t *rhs_native_mtx_qs4cx = new uint8_t[rhs_native_size_qs4cx];
   uint8_t *rhs_scales_f32 = new uint8_t[rhs_scales_size_f32];
-  uint8_t *lhs_ref_mtx_qa8dx = new uint8_t[lhs_ref_size_qa8dx];
 
   // Step2. 4-bit Weight quantization, for qs4cx format, with fp32 scale
   nntrainer::nntr_quant_qs4cx_f32(N, K, (void *)weights,
@@ -480,7 +477,6 @@ float test_gemm_qai8dxp_qsi4cxp_packed(const uint32_t M, const uint32_t K,
 
   delete[] rhs_native_mtx_qs4cx;
   delete[] rhs_scales_f32;
-  delete[] lhs_ref_mtx_qa8dx;
   delete[] packed_weight;
 
   return mean_squared_error;

@@ -332,6 +332,8 @@ detect_objects(float *input, ml::train::Model *det_model,
 DirDataLoader::DirDataLoader(const char *directory_, int label_len_,
                              int new_img_dim_, std::vector<float> ch_mean_,
                              std::vector<float> ch_std_) :
+  det_input_img_dim(0),
+  curr_bb_info(NULL),
   label_len(label_len_),
   new_img_dim(new_img_dim_),
   ch_mean(ch_mean_),
