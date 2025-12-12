@@ -52,12 +52,10 @@ $ export OMP_THREAD_LIMIT=16 && export OMP_WAIT_POLICY=active && export OMP_PROC
 $ ./tools/package_android.sh -Domp-num-threads=4 -Dggml-thread-backend=omp
 ```
 
-## Model Explanations
+## Supported Models
 
-- qwen3_causallm : basic implementation of qwen3 model
-- qwen3_moe_causallm : basic implementation of qwen3 moe model
-- qwen3_slim_moe_causallm : nntrainer's FSU-scheme-activated qwen3 moe model
-- qwen3_cached_slim_moe_causallm : nntrainer's MoE-specific FSU-based qwen3 moe model
-- gptoss_causallm : basic implementation of gpt oss model
-- gptoss_cached_slim_causallm : nntrainer's MoE-specific FSU-based gpt-oss moe model
+- Qwen3 (0.6B, 1.7B, 4B, 8B, 14B, 32B) [[link](https://huggingface.co/Qwen/Qwen3-4B)]
+- Qwen3-MoE (30B-A3B) [[link](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507)]
+- GPT-OSS (MoE: 20B, 120B) [[link](https://huggingface.co/openai/gpt-oss-20b)]
 
+For more details, please refer to the [Model Documentation](models/README.md).
