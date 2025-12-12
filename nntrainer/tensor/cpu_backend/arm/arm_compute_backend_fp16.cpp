@@ -15,8 +15,8 @@
 #include <fallback_internal.h>
 #include <fallback_kleidiai.h>
 #include <ggml_interface.h>
+#include <kleidiai_interface.h>
 #include <neon_impl.h>
-#include <neon_kleidiai.h>
 #include <nntrainer_error.h>
 #ifdef USE_BLAS
 #include <cblas_interface.h>

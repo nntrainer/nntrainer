@@ -3,7 +3,7 @@
  * Copyright (C) 2024 Arm Limited and/or its affiliates
  * Copyright (C) 2024 Sungsik Kong <ss.kong@samsung.com>
  *
- * @file   neon_kleidiai.cpp
+ * @file   kleidiai_interface_qai8dxp_qsi4cxp.cpp
  * @date   15 September 2025
  * @see    https://github.com/ARM-software/kleidiai
  * @see    https://github.com/nnstreamer/nntrainer
@@ -38,8 +38,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <kleidiai_interface.h>
 #include <limits>
-#include <neon_kleidiai.h>
 #include <string>
 
 #include <chrono>
@@ -52,7 +52,6 @@ using std::chrono::nanoseconds;  // or microseconds
 using std::chrono::seconds;      // or microseconds
 
 // Include micro-kernel variants
-#include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_lhs_quant_pack_qai8dxp_f32.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod.h"
@@ -62,8 +61,9 @@ using std::chrono::seconds;      // or microseconds
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_4x8x32_neon_i8mm.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp_qsi4cxp_interface.h"
-#include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0.h"
-#include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.h"
+#include "kai/pack/kai_lhs_quant_pack_qai8dxp_f32.h"
+#include "kai/pack/kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0.h"
+#include "kai/pack/kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.h"
 
 #define INT4_MIN (-8)
 #define INT4_MAX (7)

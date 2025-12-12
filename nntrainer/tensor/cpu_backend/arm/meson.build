@@ -19,22 +19,22 @@ nntrainer_inc_abs += meson.current_source_dir() / 'matrix_transpose_neon'
 if get_option('enable-fp16')
   arm_compute_backend_sources += 'arm_compute_backend_fp16.cpp'
   arm_compute_backend_sources += 'neon_impl_fp16.cpp'
-  arm_compute_backend_sources += 'neon_kleidiai.cpp'
-  arm_compute_backend_sources += 'kleidiai_qsi8d32p.cpp'
+  arm_compute_backend_sources += 'kleidiai_interface_qai8dxp_qsi4cxp.cpp'
+  arm_compute_backend_sources += 'kleidiai_interface_qsi8d32p_qsi4c32p.cpp'
   
   # Select thread backend for kleidiai parallel implementation
   if get_option('thread-backend') == 'bstp'
-    arm_compute_backend_sources += 'kleidiai_qsi8d32p_stdthread.cpp'
+    arm_compute_backend_sources += 'kleidiai_interface_qsi8d32p_qsi4c32p_stdthread.cpp'
   elif get_option('thread-backend') == 'omp'
-    arm_compute_backend_sources += 'kleidiai_qsi8d32p_omp.cpp'
+    arm_compute_backend_sources += 'kleidiai_interface_qsi8d32p_qsi4c32p_omp.cpp'
   elif get_option('thread-backend') == 'mixed'
-    arm_compute_backend_sources += 'kleidiai_qsi8d32p_omp.cpp'
+    arm_compute_backend_sources += 'kleidiai_interface_qsi8d32p_qsi4c32p_omp.cpp'
   else
     message('Unknown thread-backend meson option! Use omp as a default for kleidiai.')
-    arm_compute_backend_sources += 'kleidiai_qsi8d32p_omp.cpp'
+    arm_compute_backend_sources += 'kleidiai_interface_qsi8d32p_qsi4c32p_omp.cpp'
   endif
   
-  arm_compute_backend_headers += 'neon_kleidiai.h'
+  arm_compute_backend_headers += 'kleidiai_interface.h'
 
   subdir('hgemm')
   nntrainer_inc += include_directories('hgemm')

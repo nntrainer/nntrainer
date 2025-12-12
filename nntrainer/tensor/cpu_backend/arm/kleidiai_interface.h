@@ -3,7 +3,7 @@
  * Copyright (C) 2024 Arm Limited and/or its affiliates
  * Copyright (C) 2024 Sungsik Kong <ss.kong@samsung.com>
  *
- * @file   neon_kleidiai.h
+ * @file   kleidiai_interface.h
  * @date   15 September 2025
  * @see    https://github.com/nnstreamer/nntrainer
  * @author Sungsik Kong
@@ -172,3 +172,24 @@ void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp(size_t m, size_t n, size_t k,
                                          float *dst_act_mtx_f32,
                                          uint32_t idx_variant, bool transB,
                                          float lower_bound, float upper_bound);
+
+/**
+ * @brief Transform osv32_isv2 quantized weights to qsi4c32p packed format.
+ *
+ * This function transforms weights from OpenVINO GPU format (osv32_isv2) to
+ * ARM KleidiAI packed format (qsi4c32p) without going through FP32
+ * dequantization.
+ *
+ * @param n Number of rows (output channels)
+ * @param k Number of columns (input channels), must be divisible by 32
+ * @param osv32_weights Input weights in osv32_isv2 format
+ * @param osv32_scales Input scales in FP16 format (indexed per row)
+ * @param qsi4c32p_packed Output buffer for packed qsi4c32p weights
+ * @param packed_size Output size of the packed buffer
+ * @param kernel_idx Kernel variant index (default=3 for GEMM, 1 for GEMV)
+ * @param transB Whether the matrix is transposed (default=true for NxK)
+ */
+void nntr_kai_repack_osv32_to_qsi4c32p(
+  size_t n, size_t k, const uint8_t *osv32_weights,
+  const uint16_t *osv32_scales, void *qsi4c32p_packed, size_t &packed_size,
+  uint32_t kernel_idx = 3, bool transB = true);

@@ -8,7 +8,10 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include "int4_utils.h"
+#include "kleidiai_interface.h"
 #include "nntrainer_test_util.h"
+#include <cfloat>
 #include <cpu_backend.h>
 #include <fallback_internal.h>
 #include <gtest/gtest.h>
@@ -951,7 +954,128 @@ TEST(nntrainer_cpu_backend_standalone, qsi8d32p_qsi4c32p_3072x512x512_CMP) {
   ASSERT_LE(qsi8d32p_qsi4c32p_mse, eps * M * K * N);
   ASSERT_LE(qsi8d32p_qsi4c32p_mse_packed, eps * M * K * N);
 }
+
+TEST(nntrainer_cpu_backend_standalone, qsi8d32p_qsi4c32p_3072x102x1024_CMP) {
+  const unsigned int M = 3072;
+  const unsigned int K = 1024;
+  const unsigned int N = 1024;
+  float qsi8d32p_qsi4c32p_mse;
+  float qsi8d32p_qsi4c32p_mse_packed;
+  constexpr float eps = 1e-5;
+  const uint32_t TC = 20;
+  std::vector<uint32_t> opt_idx_variant_candidates;
+  uint32_t opt_idx_variant = 0;
+  for (uint32_t tc = 0; tc < TC; ++tc) {
+    opt_idx_variant = run_qsi8d32p_qsi4c32p_test_unpacked(
+      M, K, N, qsi8d32p_qsi4c32p_mse, true, false);
+    opt_idx_variant_candidates.push_back(opt_idx_variant);
+  }
+  auto result = most_frequent(opt_idx_variant_candidates);
+  opt_idx_variant = result.first;
+
+  run_qsi8d32p_qsi4c32p_test_packed(M, K, N, qsi8d32p_qsi4c32p_mse_packed,
+                                    opt_idx_variant, true, false);
+  ASSERT_LE(qsi8d32p_qsi4c32p_mse, eps * M * K * N);
+  ASSERT_LE(qsi8d32p_qsi4c32p_mse_packed, eps * M * K * N);
+}
+
+/**
+ * @brief Test helper function for osv32_isv2 to qsi4c32p transform
+ *
+ * Tests the lossless transformation from OpenVINO osv32_isv2 format to
+ * KleidiAI qsi4c32p packed format by:
+ * 1. Generating random FP32 weights
+ * 2. Quantizing to osv32_isv2 format using Int4Utils
+ * 3. Transforming to qsi4c32p using nntr_kai_repack_osv32_to_qsi4c32p
+ * 4. Running GEMM with packed weights
+ * 5. Comparing against FP32 reference GEMM
+ */
+static void run_transform_osv32_to_qsi4c32p_test(const uint32_t K,
+                                                 const uint32_t N,
+                                                 uint32_t kernel_idx = 3,
+                                                 bool print = false) {
+  const uint32_t M = 3072;      // Batch size for GEMM test
+  const size_t group_size = 32; // Fixed group size
+
+  // Step 1: Generate random FP32 weights
+  std::vector<float> weight_fp32 =
+    generate_random_vector<float>(N * K, -1.0f, 1.0f);
+
+  // Step 2: Quantize to osv32_isv2 format
+  std::vector<uint8_t> osv32_weights;
+  std::vector<uint16_t> osv32_scales;
+  nntrainer::Int4Utils::quantizeAndRepack(weight_fp32.data(), N, K, group_size,
+                                          osv32_weights, osv32_scales);
+
+  // Step 3: Transform osv32_isv2 -> qsi4c32p packed
+  size_t packed_size = 0;
+  size_t expected_packed_size =
+    nntr_kai_get_rhs_packed_size_qsi8d32p_qsi4c32p(N, K, kernel_idx, true);
+  std::vector<uint8_t> qsi4c32p_packed(expected_packed_size);
+
+  auto t0 = high_resolution_clock::now();
+  nntr_kai_repack_osv32_to_qsi4c32p(N, K, osv32_weights.data(),
+                                    osv32_scales.data(), qsi4c32p_packed.data(),
+                                    packed_size, kernel_idx, true);
+  auto t1 = high_resolution_clock::now();
+  auto transform_time = duration_cast<microseconds>(t1 - t0);
+
+  if (print) {
+    std::cout << "[INFO] Transform time: " << transform_time.count() << " us"
+              << std::endl;
+    std::cout << "[INFO] Packed size: " << packed_size << " bytes" << std::endl;
+  }
+
+  // Step 4: Generate random FP32 activations
+  std::vector<float> activations =
+    generate_random_vector<float>(M * K, -1.0f, 1.0f);
+
+  // Step 5: Run FP32 reference GEMM
+  std::vector<float> ref_dst(M * N, 0.0f);
+  nntrainer::sgemm(0, false, true, M, N, K, 1.0f, activations.data(), K,
+                   weight_fp32.data(), K, 0.0f, ref_dst.data(), N);
+
+  // Step 6: Run GEMM with transformed qsi4c32p weights
+  std::vector<float> qsi4c32p_dst(M * N, 0.0f);
+  nntrainer::nntr_gemm_qsi8d32p_qsi4c32p_packed(
+    M, N, K, (void *)activations.data(), (void *)qsi4c32p_packed.data(),
+    qsi4c32p_dst.data(), kernel_idx, true);
+
+  // Step 7: Compute MSE and cosine similarity
+  float mean_squared_error = compute_mse(M, N, ref_dst, qsi4c32p_dst, print);
+  float cos_sim =
+    cosine_similarity<float, float>(ref_dst.data(), qsi4c32p_dst.data(), M * N);
+
+  if (print) {
+    std::cout << "[INFO] MSE: " << mean_squared_error
+              << ", Cosine Sim: " << cos_sim << std::endl;
+  }
+
+  // Step 8: Assert quality metrics
+  // For 4-bit quantization, expect some quantization noise
+  const float mse_threshold = 0.6f;      // Allow quantization noise
+  const float cos_sim_threshold = 0.99f; // High similarity expected
+
+  EXPECT_LE(mean_squared_error, mse_threshold);
+  EXPECT_GE(cos_sim, cos_sim_threshold);
+}
+
+#define DECLARE_transform_osv32_to_qsi4c32p_test(K, N)                         \
+  TEST(nntrainer_cpu_backend_standalone,                                       \
+       transform_osv32_to_qsi4c32p_K##K##_N##N) {                              \
+    run_transform_osv32_to_qsi4c32p_test(K, N, 3, true);                       \
+  }
+
+// Test cases with various K and N dimensions
+DECLARE_transform_osv32_to_qsi4c32p_test(128, 64);
+DECLARE_transform_osv32_to_qsi4c32p_test(256, 128);
+DECLARE_transform_osv32_to_qsi4c32p_test(512, 256);
+DECLARE_transform_osv32_to_qsi4c32p_test(512, 512);
+DECLARE_transform_osv32_to_qsi4c32p_test(1024, 512);
+DECLARE_transform_osv32_to_qsi4c32p_test(1024, 1024);
+
 TEST(nntrainer_cpu_backend_standalone, trigonometric_values_test) {
+
   const unsigned int N = 3072;
   run_trigonometric_values_test(N);
 }
