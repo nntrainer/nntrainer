@@ -114,6 +114,17 @@ public:
 };
 
 /**
+ * @brief Weight Dimension property which saves a single tensor dim
+ *
+ */
+class WeightDim : public GenericShape {
+
+public:
+  static constexpr const char *key = "weight_dim"; /**< unique key to access */
+  using prop_tag = dimension_prop_tag;             /**< property type */
+};
+
+/**
  * @brief properties for shared from
  *
  */
@@ -201,8 +212,9 @@ LayerNode::LayerNode(std::unique_ptr<nntrainer::Layer> &&l) :
   run_context(nullptr),
   layer_node_props(new PropsType(
     props::Name(), props::Distribute(), props::Trainable(), {}, {},
-    props::SharedFrom(), props::ClipGradByGlobalNorm(), props::Packed(),
-    props::WeightDtype(), props::LossScaleForMixed(), props::ComputeEngine())),
+    props::WeightDim(), props::SharedFrom(), props::ClipGradByGlobalNorm(),
+    props::Packed(), props::WeightDtype(), props::LossScaleForMixed(),
+    props::ComputeEngine())),
   layer_node_props_realization(
     new RealizationPropsType(props::Flatten(), props::Activation())),
   loss(new props::Loss()),
@@ -462,6 +474,10 @@ bool LayerNode::hasInputShapeProperty() const {
                      [](const auto &input) { return !input.empty(); });
 }
 
+bool LayerNode::isWeightNode() const {
+  return layer->getType() == "weight" ? true : false;
+}
+
 const std::vector<TensorDim> LayerNode::getInputDimensions() const {
   NNTR_THROW_IF(!run_context, std::runtime_error)
     << __func__ << " layer needs to be finalized first!";
@@ -554,14 +570,14 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
       "Trying to finalizing a layer which is already finalized in layer: " +
       getName());
 
-  std::vector<TensorDim> actual_input_dims;
+  std::vector<TensorDim> init_dims;
   auto &prop_dims = std::get<std::vector<props::InputShape>>(*layer_node_props);
   auto &prop_in_layers =
     std::get<std::vector<props::InputConnection>>(*layer_node_props);
 
   /** prepare input dimensions */
   if (!input_dims.empty()) {
-    actual_input_dims = input_dims;
+    init_dims = input_dims;
     if (hasInputShapeProperty()) {
       std::vector<TensorDim> actual_prop_dims(prop_dims.begin(),
                                               prop_dims.end());
@@ -578,6 +594,17 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
             from_string(tensor_type[0]));
       }
     }
+  } else if (isWeightNode()) {
+    init_dims =
+      std::vector<TensorDim>({std::get<props::WeightDim>(*layer_node_props)});
+    for (auto &d : init_dims) {
+      d.setDataType(
+        str_converter<enum_class_prop_tag, nntrainer::TensorDataTypeInfo>::
+          from_string(tensor_type[2]));
+      d.setFormat(
+        str_converter<enum_class_prop_tag, nntrainer::TensorFormatInfo>::
+          from_string(tensor_type[0]));
+    }
   } else {
     NNTR_THROW_IF(!hasInputShapeProperty(), std::invalid_argument)
       << "if input dims not given, input shapes must be given by the user as "
@@ -589,9 +616,9 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
       << "input shapes must be one if connection is not given but given "
          "dimesions size of: "
       << prop_dims.size();
-    actual_input_dims =
+    init_dims =
       std::vector<TensorDim>(prop_dims.begin(), prop_dims.end());
-    for (auto &d : actual_input_dims) {
+    for (auto &d : init_dims) {
       /// Input Tensor type of input layer needs to be float.
       d.setDataType(
         str_converter<enum_class_prop_tag,
@@ -602,7 +629,7 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
     }
   }
 
-  NNTR_THROW_IF(actual_input_dims.size() < getNumInputConnections(),
+  NNTR_THROW_IF(init_dims.size() < getNumInputConnections(),
                 std::invalid_argument)
     << "number of input dimensions must be equal or larger "
     << "than number of input connections, node name: " << getName()
@@ -656,7 +683,7 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
   }
 
   auto context = InitLayerContext(
-    actual_input_dims, out_info, getInPlaceType() != InPlaceType::NONE,
+    init_dims, out_info, getInPlaceType() != InPlaceType::NONE,
     getName(), scope, max_norm, tensor_type, loss_scale, mode, compute_engine);
 
   layer->finalize(context);
@@ -685,14 +712,14 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
  */
 InitLayerContext
 LayerNode::refinalize(const std::vector<TensorDim> &input_dims) {
-  std::vector<TensorDim> actual_input_dims;
+  std::vector<TensorDim> init_dims;
   auto &prop_dims = std::get<std::vector<props::InputShape>>(*layer_node_props);
   auto &prop_in_layers =
     std::get<std::vector<props::InputConnection>>(*layer_node_props);
 
   /** prepare input dimensions */
   if (!input_dims.empty()) {
-    actual_input_dims = input_dims;
+    init_dims = input_dims;
     if (hasInputShapeProperty()) {
       std::vector<TensorDim> actual_prop_dims(prop_dims.begin(),
                                               prop_dims.end());
@@ -701,6 +728,9 @@ LayerNode::refinalize(const std::vector<TensorDim> &input_dims) {
         << "calculated input dimension is different from given input_shape "
            "property";
     }
+  } else if (isWeightNode()) {
+    init_dims =
+      std::vector<TensorDim>({std::get<props::WeightDim>(*layer_node_props)});
   } else {
     NNTR_THROW_IF(!hasInputShapeProperty(), std::invalid_argument)
       << "if input dims not given, input shapes must be given by the user as "
@@ -712,11 +742,11 @@ LayerNode::refinalize(const std::vector<TensorDim> &input_dims) {
       << "input shapes must be one if connection is not given but given "
          "dimesions size of: "
       << prop_dims.size();
-    actual_input_dims =
+    init_dims =
       std::vector<TensorDim>(prop_dims.begin(), prop_dims.end());
   }
 
-  NNTR_THROW_IF(actual_input_dims.size() < getNumInputConnections(),
+  NNTR_THROW_IF(init_dims.size() < getNumInputConnections(),
                 std::invalid_argument)
     << "number of input dimensions must be equal or larger "
     << "than number of input connections, node name: " << getName()
@@ -748,7 +778,7 @@ LayerNode::refinalize(const std::vector<TensorDim> &input_dims) {
     out_info.push_back(true);
   }
 
-  auto context = InitLayerContext(actual_input_dims, out_info,
+  auto context = InitLayerContext(init_dims, out_info,
                                   getInPlaceType() != InPlaceType::NONE,
                                   getName(), scope, max_norm);
 
