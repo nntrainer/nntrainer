@@ -363,7 +363,7 @@ public:
    * @brief   If the current layer can support in-place
    * @return  true if inplace, else false
    */
-  bool supportInPlace() const;
+  bool supportInPlace() const override;
 
   /**
    * @brief Initialize the in-place settings of the layer

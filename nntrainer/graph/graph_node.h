@@ -109,6 +109,13 @@ public:
    * respectively
    */
   virtual void setExecutionOrder(ExecutionOrder exec_order_) = 0;
+
+  /**
+   * @brief Check if this node can support in-place execution
+   * @return true if inplace, else false
+   * @note Used by memory manager to determine input tensor lifespan
+   */
+  virtual bool supportInPlace() const { return false; }
 };
 
 /**
