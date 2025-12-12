@@ -1541,64 +1541,55 @@ void transform_int4_osv32_isv2_to_q4_0x4_old(size_t N, size_t K,
   }
 }
 
-// 8x8 matrix transpose using NEON instructions for 1-byte elements
-static inline void transpose_matrix_8x8(const uint8_t *input, int input_stride,
-                                        uint8_t *output, int output_stride) {
-  uint8x8_t rows[8];
-  for (int i = 0; i < 8; i++) {
-    rows[i] = vld1_u8(&input[i * input_stride]);
-  }
-
-  uint8x8x2_t trn01 = vtrn_u8(rows[0], rows[1]);
-  uint8x8x2_t trn23 = vtrn_u8(rows[2], rows[3]);
-  uint8x8x2_t trn45 = vtrn_u8(rows[4], rows[5]);
-  uint8x8x2_t trn67 = vtrn_u8(rows[6], rows[7]);
-
-  uint16x4x2_t trn0123a = vtrn_u16(vreinterpret_u16_u8(trn01.val[0]),
-                                   vreinterpret_u16_u8(trn23.val[0]));
-  uint16x4x2_t trn0123b = vtrn_u16(vreinterpret_u16_u8(trn01.val[1]),
-                                   vreinterpret_u16_u8(trn23.val[1]));
-  uint16x4x2_t trn4567a = vtrn_u16(vreinterpret_u16_u8(trn45.val[0]),
-                                   vreinterpret_u16_u8(trn67.val[0]));
-  uint16x4x2_t trn4567b = vtrn_u16(vreinterpret_u16_u8(trn45.val[1]),
-                                   vreinterpret_u16_u8(trn67.val[1]));
-
-  uint32x2x2_t last0 = vtrn_u32(vreinterpret_u32_u16(trn0123a.val[0]),
-                                vreinterpret_u32_u16(trn4567a.val[0]));
-  uint32x2x2_t last1 = vtrn_u32(vreinterpret_u32_u16(trn0123b.val[0]),
-                                vreinterpret_u32_u16(trn4567b.val[0]));
-  uint32x2x2_t last2 = vtrn_u32(vreinterpret_u32_u16(trn0123a.val[1]),
-                                vreinterpret_u32_u16(trn4567a.val[1]));
-  uint32x2x2_t last3 = vtrn_u32(vreinterpret_u32_u16(trn0123b.val[1]),
-                                vreinterpret_u32_u16(trn4567b.val[1]));
-
-  vst1_u8(&output[0 * output_stride], vreinterpret_u8_u32(last0.val[0]));
-  vst1_u8(&output[1 * output_stride], vreinterpret_u8_u32(last1.val[0]));
-  vst1_u8(&output[2 * output_stride], vreinterpret_u8_u32(last2.val[0]));
-  vst1_u8(&output[3 * output_stride], vreinterpret_u8_u32(last3.val[0]));
-  vst1_u8(&output[4 * output_stride], vreinterpret_u8_u32(last0.val[1]));
-  vst1_u8(&output[5 * output_stride], vreinterpret_u8_u32(last1.val[1]));
-  vst1_u8(&output[6 * output_stride], vreinterpret_u8_u32(last2.val[1]));
-  vst1_u8(&output[7 * output_stride], vreinterpret_u8_u32(last3.val[1]));
-}
-
-static inline void transpose_matrix_16x16(const uint8_t *input,
-                                          int input_stride, uint8_t *output,
-                                          int output_stride) {
-  transpose_matrix_8x8(input, input_stride, output, output_stride);
-  transpose_matrix_8x8(input + 8, input_stride, output + 8 * output_stride,
-                       output_stride);
-  transpose_matrix_8x8(input + 8 * input_stride, input_stride, output + 8,
-                       output_stride);
-  transpose_matrix_8x8(input + 8 * input_stride + 8, input_stride,
-                       output + 8 * output_stride + 8, output_stride);
-}
-
 static inline void transpose_matrix_16x8(const uint8_t *input, int input_stride,
                                          uint8_t *output, int output_stride) {
-  transpose_matrix_8x8(input, input_stride, output, output_stride);
-  transpose_matrix_8x8(input + 8 * input_stride, input_stride, output + 8,
-                       output_stride);
+  uint8x8_t rows[16];
+  for (int i = 0; i < 8; i++) {
+    rows[2 * i] = vld1_u8(&input[2 * i * input_stride]);
+    rows[2 * i + 1] = vld1_u8(&input[(2 * i + 1) * input_stride]);
+  }
+
+  uint8x16_t rows2[8];
+  rows2[0] = vcombine_u8(rows[0], rows[8]);
+  rows2[1] = vcombine_u8(rows[1], rows[9]);
+  rows2[2] = vcombine_u8(rows[2], rows[10]);
+  rows2[3] = vcombine_u8(rows[3], rows[11]);
+  rows2[4] = vcombine_u8(rows[4], rows[12]);
+  rows2[5] = vcombine_u8(rows[5], rows[13]);
+  rows2[6] = vcombine_u8(rows[6], rows[14]);
+  rows2[7] = vcombine_u8(rows[7], rows[15]);
+
+  uint8x16x2_t trn01 = vtrnq_u8(rows2[0], rows2[1]);
+  uint8x16x2_t trn23 = vtrnq_u8(rows2[2], rows2[3]);
+  uint8x16x2_t trn45 = vtrnq_u8(rows2[4], rows2[5]);
+  uint8x16x2_t trn67 = vtrnq_u8(rows2[6], rows2[7]);
+
+  uint16x8x2_t trn0123a = vtrnq_u16(vreinterpretq_u16_u8(trn01.val[0]),
+                                    vreinterpretq_u16_u8(trn23.val[0]));
+  uint16x8x2_t trn0123b = vtrnq_u16(vreinterpretq_u16_u8(trn01.val[1]),
+                                    vreinterpretq_u16_u8(trn23.val[1]));
+  uint16x8x2_t trn4567a = vtrnq_u16(vreinterpretq_u16_u8(trn45.val[0]),
+                                    vreinterpretq_u16_u8(trn67.val[0]));
+  uint16x8x2_t trn4567b = vtrnq_u16(vreinterpretq_u16_u8(trn45.val[1]),
+                                    vreinterpretq_u16_u8(trn67.val[1]));
+
+  uint32x4x2_t last0 = vtrnq_u32(vreinterpretq_u32_u16(trn0123a.val[0]),
+                                 vreinterpretq_u32_u16(trn4567a.val[0]));
+  uint32x4x2_t last1 = vtrnq_u32(vreinterpretq_u32_u16(trn0123b.val[0]),
+                                 vreinterpretq_u32_u16(trn4567b.val[0]));
+  uint32x4x2_t last2 = vtrnq_u32(vreinterpretq_u32_u16(trn0123a.val[1]),
+                                 vreinterpretq_u32_u16(trn4567a.val[1]));
+  uint32x4x2_t last3 = vtrnq_u32(vreinterpretq_u32_u16(trn0123b.val[1]),
+                                 vreinterpretq_u32_u16(trn4567b.val[1]));
+
+  vst1q_u8(&output[0 * output_stride], vreinterpretq_u8_u32(last0.val[0]));
+  vst1q_u8(&output[1 * output_stride], vreinterpretq_u8_u32(last1.val[0]));
+  vst1q_u8(&output[2 * output_stride], vreinterpretq_u8_u32(last2.val[0]));
+  vst1q_u8(&output[3 * output_stride], vreinterpretq_u8_u32(last3.val[0]));
+  vst1q_u8(&output[4 * output_stride], vreinterpretq_u8_u32(last0.val[1]));
+  vst1q_u8(&output[5 * output_stride], vreinterpretq_u8_u32(last1.val[1]));
+  vst1q_u8(&output[6 * output_stride], vreinterpretq_u8_u32(last2.val[1]));
+  vst1q_u8(&output[7 * output_stride], vreinterpretq_u8_u32(last3.val[1]));
 }
 
 inline static void
@@ -1692,7 +1683,6 @@ void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
 
   // uint8_t dst_tmp[8 * ROW_BLOCK_BYTE_SIZE];
   uint8_t *dst_ = reinterpret_cast<uint8_t *>(dst_q4_0x);
-  uint8_t mx8x16[8 * 16];
 
   // --- Layout ---
   const size_t rows_count_pad = align(N, ROW_BLOCK_SIZE);
@@ -1702,21 +1692,23 @@ void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
   const size_t bytes_per_row_block_span = column_blocks_count * ROW_BLOCK_SIZE;
   const int column_blocks_cnt = K / QK4_0;
 
+#pragma omp parallel for schedule(dynamic)
   for (int column_out_block_id = 0; column_out_block_id < column_blocks_cnt;
        column_out_block_id++) {
-    int column_idx = column_out_block_id * QK4_0;
-    int scale_offset = (column_idx / scale_group_size) * rows_count_pad;
+    uint8_t mx8x16[8 * 16];
+    const int column_idx = column_out_block_id * QK4_0;
+    const int scale_offset = (column_idx / scale_group_size) * rows_count_pad;
     for (size_t row_id = 0; row_id < N; row_id += 8) {
       const size_t row_in_block_id = row_id / ROW_BLOCK_SIZE;
-      size_t i_in_block = row_id % ROW_BLOCK_SIZE;
+      const size_t i_in_block = row_id % ROW_BLOCK_SIZE;
       const size_t row_block_base =
         row_in_block_id * bytes_per_row_block_span + i_in_block;
-      int src_offset =
+      const int src_offset =
         row_block_base + column_out_block_id * 16 * ROW_BLOCK_SIZE;
 
       transpose_matrix_16x8(&osv32_weights[src_offset], ROW_BLOCK_SIZE, mx8x16,
                             16);
-      size_t row_out_block_id = row_id / NUM_Q4_0_BLOCKS;
+      const size_t row_out_block_id = row_id / NUM_Q4_0_BLOCKS;
       int dst_offset =
         (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) *
         (column_out_block_id + row_out_block_id * column_blocks_cnt);

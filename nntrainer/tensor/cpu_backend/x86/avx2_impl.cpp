@@ -2097,9 +2097,7 @@ void transform_int4_osv32_isv2_to_q4_0x8(size_t N, size_t K,
 
   static constexpr const size_t dst_tmp_size =
     (8 * ROW_BLOCK_BYTE_SIZE) / sizeof(__m256i);
-  __m256i dst_tmp[dst_tmp_size];
   uint8_t *dst_ = reinterpret_cast<uint8_t *>(dst_q4_0x);
-  alignas(32) uint8_t mx16x16[16 * 16];
 
   // --- Layout ---
   const size_t rows_count_pad = align(N, ROW_BLOCK_SIZE);
@@ -2109,7 +2107,11 @@ void transform_int4_osv32_isv2_to_q4_0x8(size_t N, size_t K,
   const size_t bytes_per_row_block_span = column_blocks_count * ROW_BLOCK_SIZE;
   const int column_blocks_cnt = K / QK4_0;
 
-  for (size_t row_id = 0; row_id < N; row_id += 16) {
+  alignas(32) static thread_local __m256i dst_tmp[dst_tmp_size];
+  alignas(32) static thread_local uint8_t mx16x16[16 * 16];
+
+#pragma omp parallel for schedule(guided)
+  for (int row_id = 0; row_id < (int)N; row_id += 16) {
     const size_t row_in_block_id = row_id / ROW_BLOCK_SIZE;
     size_t i_in_block = row_id % ROW_BLOCK_SIZE;
     for (int column_out_block_id = 0; column_out_block_id < column_blocks_cnt;
