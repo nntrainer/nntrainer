@@ -47,29 +47,27 @@ LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -DENABLE_FP16=1 -DUSE__F
 
 # Source files
 LOCAL_SRC_FILES := ../main.cpp \
-    ../causal_lm.cpp \
-    ../qwen3_causallm.cpp \
-    ../qwen3_moe_causallm.cpp \
-    ../qwen3_slim_moe_causallm.cpp \
-    ../qwen3_cached_slim_moe_causallm.cpp \
-    ../nntr_qwen3_causallm.cpp \
-    ../nntr_qwen3_moe_causallm.cpp \
-    ../gptoss_causallm.cpp \
-    ../gptoss_cached_slim_causallm.cpp \
+    ../models/causal_lm.cpp \
+    ../models/qwen3/qwen3_causallm.cpp \
+    ../models/qwen3_moe/qwen3_moe_causallm.cpp \
+    ../models/qwen3_slim_moe/qwen3_slim_moe_causallm.cpp \
+    ../models/qwen3_cached_slim_moe/qwen3_cached_slim_moe_causallm.cpp \
+    ../models/gpt_oss/gptoss_causallm.cpp \
+    ../models/gpt_oss_cached_slim/gptoss_cached_slim_causallm.cpp \
     ../huggingface_tokenizer.cpp \
     ../llm_util.cpp \
     ../layers/embedding_layer.cpp \
     ../layers/mha_core.cpp \
-    ../layers/qwen_moe_layer.cpp \
+    ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/rms_norm.cpp \
     ../layers/swiglu.cpp \
     ../layers/tie_word_embedding.cpp\
-    ../layers/qwen_moe_layer_cached.cpp \
+    ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../layers/qkv_layer.cpp \
-    ../layers/qwen_moe_layer_fsu.cpp \
-    ../layers/gpt_oss_moe_layer.cpp \
-    ../layers/gpt_oss_moe_layer_cached.cpp \
+    ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
+    ../models/gpt_oss/gpt_oss_moe_layer.cpp \
+    ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
@@ -77,5 +75,12 @@ LOCAL_STATIC_LIBRARIES := tokenizers_c
 LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
     $(LOCAL_PATH)/.. \
     $(LOCAL_PATH)/../layers \
+    $(LOCAL_PATH)/../models \
+    $(LOCAL_PATH)/../models/gpt_oss \
+    $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
+    $(LOCAL_PATH)/../models/qwen3 \
+    $(LOCAL_PATH)/../models/qwen3_moe \
+    $(LOCAL_PATH)/../models/qwen3_slim_moe \
+    $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
 
 include $(BUILD_EXECUTABLE)
