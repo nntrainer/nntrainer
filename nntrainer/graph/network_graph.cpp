@@ -1191,7 +1191,7 @@ int NetworkGraph::initialize(ExecutionMode mode,
 
   /** check if the given config of node is of input node */
   auto is_input_node = [](const LayerNode *node) -> bool {
-    return node->getInputConnections().empty();
+    return node->getInputConnections().empty() && !node->isWeightNode();
   };
 
   for (unsigned int idx = 0; idx < graph.size(); ++idx) {
@@ -1403,7 +1403,7 @@ int NetworkGraph::reinitialize(
 
   /** check if the given config of node is of input node */
   auto is_input_node = [](const LayerNode *node) -> bool {
-    return node->getInputConnections().empty();
+    return node->getInputConnections().empty() && !node->isWeightNode();
   };
 
   for (unsigned int idx = 0; idx < graph.size(); ++idx) {

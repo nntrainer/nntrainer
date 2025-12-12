@@ -57,10 +57,15 @@ TEST_P(LayerSemantics, finalizeValidateLayerNode_p) {
   auto lnode = nntrainer::createLayerNode(expected_type);
   std::vector<std::string> props = {"name=test"};
   std::string input_shape = "input_shape=1:1:1";
+  if (expected_type == "weight") {
+    input_shape = "weight_dim=1:1:1";
+  }
   std::string input_layers = "input_layers=a";
   for (auto idx = 1u; idx < num_inputs; idx++) {
-    input_shape += ",1:1:1";
-    input_layers += ",a";
+    if (expected_type != "weight") {
+      input_shape += ",1:1:1";
+      input_layers += ",a";
+    }
   }
   props.push_back(input_shape);
   props.push_back(input_layers);
@@ -103,10 +108,15 @@ TEST_P(LayerSemantics, setBatchValidateLayerNode_p) {
   auto lnode = nntrainer::createLayerNode(expected_type);
   std::vector<std::string> props = {"name=test"};
   std::string input_shape = "input_shape=1:1:1";
+  if (expected_type == "weight") {
+    input_shape = "weight_dim=1:1:1";
+  }
   std::string input_layers = "input_layers=a";
   for (auto idx = 1u; idx < num_inputs; idx++) {
-    input_shape += ",1:1:1";
-    input_layers += ",a";
+    if (expected_type != "weight") {
+      input_shape += ",1:1:1";
+      input_layers += ",a";
+    }
   }
   props.push_back(input_shape);
   props.push_back(input_layers);
@@ -155,10 +165,15 @@ TEST_P(LayerSemanticsGpu, finalizeValidateLayerNode_p) {
   auto lnode = nntrainer::createLayerNode(expected_type, {"engine=gpu"});
   std::vector<std::string> props = {"name=test"};
   std::string input_shape = "input_shape=1:1:1";
+  if (expected_type == "weight") {
+    input_shape = "weight_dim=1:1:1";
+  }
   std::string input_layers = "input_layers=a";
   for (auto idx = 1u; idx < num_inputs; idx++) {
-    input_shape += ",1:1:1";
-    input_layers += ",a";
+    if (expected_type != "weight") {
+      input_shape += ",1:1:1";
+      input_layers += ",a";
+    }
   }
   props.push_back(input_shape);
   props.push_back(input_layers);
@@ -201,10 +216,15 @@ TEST_P(LayerSemanticsGpu, setBatchValidateLayerNode_p) {
   auto lnode = nntrainer::createLayerNode(expected_type, {"engine=gpu"});
   std::vector<std::string> props = {"name=test"};
   std::string input_shape = "input_shape=1:1:1";
+  if (expected_type == "weight") {
+    input_shape = "weight_dim=1:1:1";
+  }
   std::string input_layers = "input_layers=a";
   for (auto idx = 1u; idx < num_inputs; idx++) {
-    input_shape += ",1:1:1";
-    input_layers += ",a";
+    if (expected_type != "weight") {
+      input_shape += ",1:1:1";
+      input_layers += ",a";
+    }
   }
   props.push_back(input_shape);
   props.push_back(input_layers);
