@@ -408,9 +408,6 @@ void check_sorted_graph(nntrainer::GraphCore graph,
   int expected_graph_size = expected_layer_names.size();
   EXPECT_EQ(graph.size(), expected_graph_size);
   for (int i = 0; i < expected_graph_size; i++) {
-    std::cout << i << " " << graph.getSortedNode(i)->getName() << std::endl;
-  }
-  for (int i = 0; i < expected_graph_size; i++) {
     EXPECT_EQ(graph.getSortedNode(i)->getName(), expected_layer_names[i]);
     EXPECT_EQ(graph.getSortedNodeIdx(expected_layer_names[i]), i);
   }
