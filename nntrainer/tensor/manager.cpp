@@ -609,10 +609,16 @@ Manager::requestInputs(const GraphNode &node,
 
   grad_common_spec.ls = TensorLifespan::CALC_DERIV_LIFESPAN;
   /// @todo handle this inside layer
-  if (node.getType() == ActivationLayer::type or
-      node.getType() == MultiOutLayer::type or
-      node.getType() == BatchNormalizationLayer::type or
-      node.getType() == LayerNormalizationLayer::type or !node.getTrainable())
+  /// @note ActivationLayer with supportInPlace()=false (e.g., swish, gelu) needs input in backward.
+  ///       For these layers, extend input lifespan to FORWARD_DERIV_LIFESPAN.
+  if (node.getType() == ActivationLayer::type) {
+    if (node.supportInPlace())
+      var_common_spec.ls = TensorLifespan::FORWARD_FUNC_LIFESPAN;
+    else
+      var_common_spec.ls = TensorLifespan::FORWARD_DERIV_LIFESPAN;
+  } else if (node.getType() == MultiOutLayer::type or
+             node.getType() == BatchNormalizationLayer::type or
+             node.getType() == LayerNormalizationLayer::type or !node.getTrainable())
     var_common_spec.ls = TensorLifespan::FORWARD_FUNC_LIFESPAN;
 
   if (node.getType() == MSELossLayer::type or
