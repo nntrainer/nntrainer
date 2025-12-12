@@ -15,36 +15,38 @@ __kernel void rotary_emb_cl(__global float *input, __global float *output,
 
   unsigned int b = get_global_id(0);
   unsigned int c = get_global_id(1);
+  unsigned int basis = height * width * (b * channel + c);
 
   if (b < batch && c < channel) {
     for (unsigned int h = 0; h < height; h++) {
+      unsigned int basis_h = basis + h * width;
+
       if (from + h < max_timestep) {
         unsigned idx = (from + h) * dim;
         for (unsigned int i = idx; i < idx + dim; i++) {
           cos_ptr[i - idx] = freqs_cos[i];
           sin_ptr[i - idx + offsetSin] = freqs_sin[i + offsetFreqsSin];
         }
-      }
 
-      for (unsigned int w = 0; w < width; w = w + dim) {
-        for (unsigned int k = 0; k < dim; k++) {
-          unsigned int span = w + k;
-          value = input[b * channel * height * width + c * height * width +
-                        h * width + span];
-          if (k < half_) {
-            transformed_value =
-              -1.0f * input[b * channel * height * width + c * height * width +
-                            h * width + span + half_];
-          } else {
-            transformed_value =
-              input[b * channel * height * width + c * height * width +
-                    h * width + span - half_];
+        for (unsigned int w = 0; w < width; w = w + dim) {
+          for (unsigned int k = 0; k < dim; k++) {
+            unsigned int span = w + k;
+            value = input[basis_h + span];
+            if (k < half_) {
+              transformed_value =
+                -1.0f * input[basis_h + span + half_];
+            } else {
+              transformed_value =
+                input[basis_h + span - half_];
+            }
+            value =
+              value * cos_ptr[k] + transformed_value * sin_ptr[k + offsetSin];
+            output[basis_h + span] = value;
           }
-          value =
-            value * cos_ptr[k] + transformed_value * sin_ptr[k + offsetSin];
-          output[b * channel * height * width + c * height * width + h * width +
-                 span] = value;
         }
+      } else {
+        unsigned int roundup = ((width + dim - 1) / dim) * dim;
+        memcpy (&output[basis_h], &input[basis_h], sizeof (float) * roundup);
       }
     }
   }
