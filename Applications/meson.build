@@ -21,7 +21,7 @@ if enable_ccapi
 endif
 subdir('VGG/jni')
 subdir('Resnet/jni')
-subdir('Multi_input/jni')
+subdir('Multi_inout/jni')
 
 # if enable_capi
 #   subdir('TransferLearning/Draw_Classification/jni')

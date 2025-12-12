@@ -50,7 +50,7 @@ protected:
  * @brief MultiData Generator
  *
  */
-class MultiDataLoader final : public DataLoader {
+class MultiInoutDataLoader final : public DataLoader {
 public:
   /**
    * @brief Construct a new Random Data Loader object
@@ -59,13 +59,14 @@ public:
    * @param output_shapes label_shapes with appropriate batch
    * @param iteration     iteration per epoch
    */
-  MultiDataLoader(const std::vector<TensorDim> &input_shapes,
-                  const std::vector<TensorDim> &output_shapes, int iteration);
+  MultiInoutDataLoader(const std::vector<TensorDim> &input_shapes,
+                       const std::vector<TensorDim> &output_shapes,
+                       int iteration);
 
   /**
    * @brief Destroy the Random Data Loader object
    */
-  ~MultiDataLoader() {}
+  ~MultiInoutDataLoader() {}
 
   /**
    * @copydoc void DataLoader::next(float **input, float**label, bool *last)
@@ -81,7 +82,7 @@ private:
   std::vector<TensorDim> input_shapes;
   std::vector<TensorDim> output_shapes;
 
-  std::uniform_int_distribution<int> input_dist;
+  std::uniform_real_distribution<float> input_dist;
   std::uniform_int_distribution<int> label_dist;
 };
 

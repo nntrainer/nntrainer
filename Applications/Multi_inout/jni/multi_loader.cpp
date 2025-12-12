@@ -41,53 +41,56 @@ bool updateIteration(unsigned int &iteration, unsigned int data_size) {
 
 } // namespace
 
-MultiDataLoader::MultiDataLoader(const std::vector<TensorDim> &input_shapes,
-                                 const std::vector<TensorDim> &output_shapes,
-                                 int data_size_) :
+MultiInoutDataLoader::MultiInoutDataLoader(
+  const std::vector<TensorDim> &input_shapes,
+  const std::vector<TensorDim> &output_shapes, int data_size_) :
   iteration(0),
   data_size(data_size_),
   count(0),
   input_shapes(input_shapes),
   output_shapes(output_shapes),
-  input_dist(0, 255),
+  input_dist(-1.0f, 1.0f),
   label_dist(0, output_shapes.front().width() - 1) {
   NNTR_THROW_IF(output_shapes.empty(), std::invalid_argument)
     << "output_shape size empty not supported";
-  NNTR_THROW_IF(output_shapes.size() > 1, std::invalid_argument)
-    << "output_shape size > 1 is not supported";
 
   indicies = std::vector<unsigned int>(data_size_);
   std::iota(indicies.begin(), indicies.end(), 0);
   std::shuffle(indicies.begin(), indicies.end(), rng);
 }
 
-void MultiDataLoader::next(float **input, float **label, bool *last) {
+void MultiInoutDataLoader::next(float **input, float **label, bool *last) {
 
-  auto fill_input = [](float *input, unsigned int length, unsigned int value) {
-    for (unsigned int i = 0; i < length; ++i) {
-      *input = value;
-      input++;
-    }
-  };
-
-  auto fill_label = [](float *input, unsigned int length, unsigned int value) {
-    for (unsigned int i = 0; i < length; ++i) {
-      *input = value;
-      input++;
-    }
-  };
-
+  // Fill input tensors with random values
   float **cur_input_tensor = input;
-  const auto num_input = input_shapes.size() - 1;
   for (unsigned int i = 0; i < input_shapes.size(); ++i) {
-    fill_input(*cur_input_tensor,
-               input_shapes.at(num_input - i).getFeatureLen(), indicies[count]);
+    // For each input tensor, fill with random values
+    unsigned int tensor_len = input_shapes.at(i).getFeatureLen();
+    for (unsigned int j = 0; j < tensor_len; ++j) {
+      (*cur_input_tensor)[j] = input_dist(rng);
+    }
     ++cur_input_tensor;
   }
 
+  // Get the first value of input0 for target calculation
+  float first_input_value = input[1][0];
+
+  // Calculate target outputs: double and square of first input value
+  // float double_value = 2.0f * first_input_value;
+  // float square_value = first_input_value * first_input_value;
+
+  float double_value = 2.0f * first_input_value;
+  float square_value = first_input_value * first_input_value;
+
+  // Fill label tensors with calculated target values
   float **cur_label_tensor = label;
   for (unsigned int i = 0; i < output_shapes.size(); ++i) {
-    fill_label(*cur_label_tensor, output_shapes.at(i).getFeatureLen(), 1);
+    unsigned int tensor_len = output_shapes.at(i).getFeatureLen();
+    float target_value = (i == 0) ? double_value : square_value;
+
+    for (unsigned int j = 0; j < tensor_len; ++j) {
+      (*cur_label_tensor)[j] = target_value;
+    }
     cur_label_tensor++;
   }
 

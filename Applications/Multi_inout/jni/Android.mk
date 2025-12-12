@@ -50,7 +50,7 @@ LOCAL_CFLAGS += -pthread -fexceptions -fopenmp
 LOCAL_LDFLAGS += -fexceptions
 LOCAL_MODULE_TAGS := optional
 LOCAL_ARM_MODE := arm
-LOCAL_MODULE := nntrainer_multi_input
+LOCAL_MODULE := nntrainer_multi_inout
 LOCAL_LDLIBS := -llog -landroid -fopenmp
 
 LOCAL_SRC_FILES := main.cpp multi_loader.cpp
