@@ -1226,6 +1226,7 @@ static inline std::vector<float> generate_01_vector(const size_t size,
 static void run_transform_int4_test_(const uint32_t K, const uint32_t N,
                                      const int scale_group_size,
                                      bool use_ones = false) {
+  nntrainer::init_backend();
   const size_t q4_data_size = K * N / Q4_0 * sizeof(block_q4_0);
   std::vector<float> weight_fp32;
   if (use_ones) {
@@ -1246,15 +1247,18 @@ static void run_transform_int4_test_(const uint32_t K, const uint32_t N,
     weight_fp32.data(), N, K, scale_group_size, osv32_weights, osv32_scales);
 
   // MAIN TEST - direct transform Int4 data (osv32_isv2) ---> Q4_0x
+  int run_cnt = 100;
   std::vector<uint8_t> dst_q4_0x(q4_data_size);
   auto t0 = std::chrono::high_resolution_clock::now();
-  nntrainer::transform_q4_0x_from_int4(N, K, osv32_weights.data(),
-                                       osv32_scales.data(), scale_group_size,
-                                       dst_q4_0x.data());
+  for (int i = 0; i < run_cnt; i++) {
+    nntrainer::transform_int4_osv32_isv2_to_q4_0(
+      N, K, osv32_weights.data(), osv32_scales.data(), scale_group_size,
+      dst_q4_0x.data());
+  }
   auto t1 = std::chrono::high_resolution_clock::now();
   auto exec_time =
     std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
-  std::cout << "Time: " << (double)exec_time.count() / 1000 << " ms"
+  std::cout << "Time: " << (double)exec_time.count() / (1000 * run_cnt) << " ms"
             << std::endl;
 
   // Check MSE quantized values
