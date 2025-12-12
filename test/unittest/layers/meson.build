@@ -115,7 +115,23 @@ test_target = [
   'unittest_layers_slice.cpp',
   'unittest_layers_gather.cpp',
   'unittest_layers_tensor.cpp',
-  'unittest_layers_channel_shuffle.cpp'
+  'unittest_layers_channel_shuffle.cpp',
+  'unittest_layers_rnn_direct.cpp',
+  'unittest_layers_gru_direct.cpp',
+  'unittest_layers_lstm_direct.cpp',
+  'unittest_layers_grucell_direct.cpp',
+  'unittest_layers_lstmcell_direct.cpp',
+  'unittest_layers_rnncell_direct.cpp',
+  'unittest_layers_zoneout_lstmcell_direct.cpp',
+  'unittest_layers_multi_head_attention_direct.cpp',
+  'unittest_layers_reduce_mean_direct.cpp',
+  'unittest_layers_reduce_sum_direct.cpp',
+  'unittest_layers_layer_normalization_direct.cpp',
+  'unittest_layers_time_dist.cpp',
+  'unittest_layers_embedding_direct.cpp',
+  'unittest_layers_permute_direct.cpp',
+  'unittest_layers_split_direct.cpp',
+  'unittest_layers_upsample2d_direct.cpp'
 ]
 
 if get_option('enable-opencl')
