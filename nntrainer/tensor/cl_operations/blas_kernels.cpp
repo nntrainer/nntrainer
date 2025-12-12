@@ -1257,4 +1257,54 @@ void transpose_16(void *input, void *output, int width, int height,
   }
 }
 */
+void openvino_quantize_input_int4_pad(void *input, void *quantized_input, void *scales,
+                                      unsigned int M, unsigned int K,
+                                      unsigned int quantization_group_size) {
+  int alignK = align(K, quantization_group_size);
+
+  bool result = false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  auto &clbuffInstance = ClBufferManager::Global();
+  const bool scale_row_major = false;
+  std::string compile_options =
+    " -D SIZE_N=" + std::to_string(M) + " -D SIZE_K=" + std::to_string(K) +
+    " -D SIZE_QUANTIZATION_GROUP=" + std::to_string(quantization_group_size) +
+    " -D SCALE_ROW_MAJOR=" + std::to_string(scale_row_major);
+
+  ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
+    int4_quantize_input_kernel, "quantize_input_int4_pad", compile_options);
+  if (!kernel_ptr) {
+    throw std::runtime_error("Failed to get kernel_ptr for quantize_input");
+    return;
+  }
+
+  int arg = 0;
+
+  result = kernel_ptr->SetKernelSVMArguments(arg++, input);
+
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 0 for "
+                             "quantize_input");
+
+  result =
+    kernel_ptr->SetKernelSVMArguments(arg++, quantized_input);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 1 for "
+                             "quantize_input");
+
+  result =
+    kernel_ptr->SetKernelSVMArguments(arg++, scales);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 2 for "
+                             "quantize_input");
+
+  std::array<size_t, 3> global_work_size = {
+    (M * alignK) / quantization_group_size, 1, 1};
+
+  blas_cc->command_queue_inst_.enqueueKernel(
+    kernel_ptr->GetKernel(), global_work_size.size(), global_work_size.data(),
+    nullptr, 0, nullptr, nullptr);
+}
+
 } // namespace nntrainer

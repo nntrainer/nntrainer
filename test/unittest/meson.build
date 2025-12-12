@@ -84,8 +84,15 @@ if host_machine.system() != 'windows'
 endif
 
 if get_option('enable-opencl')
-  test_target += [['unittest_blas_kernels_cl', []]]
-  test_target += [['unittest_attention_kernels_cl', []]]
+  test_target += [['unittest_blas_kernels_cl', ['unittest_util.cpp']]]
+  test_target += [['unittest_attention_kernels_cl', ['unittest_util.cpp']]]
+  test_target += [['unittest_quantize_cl', ['unittest_util.cpp']]]
+endif
+
+if get_option('enable-cuda')
+  test_target += [['unittest_cuda', []]]
+  test_target += [['unittest_cuda_addition', []]]
+  test_target += [['unittest_cuda_quantize', ['unittest_util.cpp']]]
 endif
 
 if get_option('enable-fp16')
@@ -100,12 +107,20 @@ if get_option('enable-profile')
 endif
 
 foreach target: test_target
+  cuda_deps = []
+  cuda_link_args = []
+  if target[0].startswith('unittest_cuda') and get_option('enable-cuda')
+    cuda_deps = [cuda_dep]
+    cuda_link_args = ['-NODEFAULTLIB:LIBCMT', '-NOIMPLIB', '-NOEXP']
+  endif
+  
   exe = executable(
     target[0],
-    [target[0] + '.cpp'] + [target[1]],
+    [target[0] + '.cpp'] + target[1],
     # below is temporary measure, we will eventually remove unittest_nntrainer_models
     include_directories: include_directories('models'),
-    dependencies: unittest_nntrainer_deps,
+    dependencies: unittest_nntrainer_deps + cuda_deps,
+    link_args: cuda_link_args,
     install: get_option('enable-test'),
     install_dir: application_install_dir
   )

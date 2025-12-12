@@ -50,6 +50,12 @@ void Engine::add_default_object() {
 
   registerContext("gpu", &cl_context);
 #endif
+
+#ifdef ENABLE_CUDA
+  auto &cuda_context = nntrainer::CudaContext::Global();
+
+  registerContext("cuda", &cuda_context);
+#endif
 }
 
 void Engine::initialize() noexcept {
