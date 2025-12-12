@@ -1,0 +1,1355 @@
+From a30a6780d1e6305a42a3c730a5846fd73c0d38d3 Mon Sep 17 00:00:00 2001
+From: Donghak PARK <donghak.park@samsung.com>
+Date: Fri, 12 Dec 2025 15:37:47 +0900
+Subject: [PATCH 1/2] [Unittest] Add Layer Unittest
+
+Add Layer Unittest
+- slice layer
+- gather layer
+- tensor layer
+
+Resolves:
+
+**Self evaluation:**
+1. Build test:	 [X]Passed [ ]Failed [ ]Skipped
+2. Run test:	 [X]Passed [ ]Failed [ ]Skipped
+
+Signed-off-by: Donghak PARK <donghak.park@samsung.com>
+---
+ test/unittest/layers/meson.build              |  6 +-
+ .../unittest_layers_channel_shuffle.cpp       | 59 +++++++++++++++++++
+ ...nittest_layers_convolution2d_transpose.cpp | 46 +++++++++++++++
+ .../layers/unittest_layers_gather.cpp         | 58 ++++++++++++++++++
+ .../unittest/layers/unittest_layers_slice.cpp | 58 ++++++++++++++++++
+ .../layers/unittest_layers_tensor.cpp         | 47 +++++++++++++++
+ .../layers/unittest_layers_time_dist.cpp      | 44 ++++++++++++++
+ 7 files changed, 317 insertions(+), 1 deletion(-)
+ create mode 100644 test/unittest/layers/unittest_layers_channel_shuffle.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_gather.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_slice.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_tensor.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_time_dist.cpp
+
+diff --git a/test/unittest/layers/meson.build b/test/unittest/layers/meson.build
+index be6af153cf..cac252c2eb 100644
+--- a/test/unittest/layers/meson.build
++++ b/test/unittest/layers/meson.build
+@@ -111,7 +111,11 @@ test_target = [
+   'unittest_layers_mol_attention.cpp',
+   'unittest_layers_multi_head_attention.cpp',
+   'unittest_layers_positional_encoding.cpp',
+-  'unittest_layers_upsample2d.cpp'
++  'unittest_layers_upsample2d.cpp',
++  'unittest_layers_slice.cpp',
++  'unittest_layers_gather.cpp',
++  'unittest_layers_tensor.cpp',
++  'unittest_layers_channel_shuffle.cpp'
+ ]
+ 
+ if get_option('enable-opencl')
+diff --git a/test/unittest/layers/unittest_layers_channel_shuffle.cpp b/test/unittest/layers/unittest_layers_channel_shuffle.cpp
+new file mode 100644
+index 0000000000..854ed154cb
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_channel_shuffle.cpp
+@@ -0,0 +1,59 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_channel_shuffle.cpp
++ * @date 12 December 2025
++ * @brief Channel Shuffle Layer Test
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <channel_shuffle.h>
++#include <layers_common_tests.h>
++
++// Note: ChannelShuffle LayerSemantics tests are skipped because they require
++// channels > split_number, but the default input has only 1 channel.
++
++
++/**
++ * @brief Direct test for ChannelShuffle setProperty
++ */
++TEST(ChannelShuffleDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::ChannelShuffle>({});
++  EXPECT_NO_THROW(layer->setProperty({"split_number=4"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(ChannelShuffleDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::ChannelShuffle>({});
++  EXPECT_EQ(layer->getType(), "channel_shuffle");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(ChannelShuffleDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::ChannelShuffle>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with different group values
++ */
++TEST(ChannelShuffleDirect, setProperty_various_groups) {
++  auto layer1 = nntrainer::createLayer<nntrainer::ChannelShuffle>({});
++  EXPECT_NO_THROW(layer1->setProperty({"split_number=2"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::ChannelShuffle>({});
++  EXPECT_NO_THROW(layer2->setProperty({"split_number=8"}));
++
++  auto layer3 = nntrainer::createLayer<nntrainer::ChannelShuffle>({});
++  EXPECT_NO_THROW(layer3->setProperty({"split_number=16"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_convolution2d_transpose.cpp b/test/unittest/layers/unittest_layers_convolution2d_transpose.cpp
+index cea4b93d1a..b983bd4bfb 100644
+--- a/test/unittest/layers/unittest_layers_convolution2d_transpose.cpp
++++ b/test/unittest/layers/unittest_layers_convolution2d_transpose.cpp
+@@ -390,3 +390,49 @@ GTEST_PARAMETER_TEST(
+                     conv2d_transpose_sb_same_dilation_w16a16,
+                     conv2d_transpose_mb_same_dilation_w16a16));
+ #endif
++
++/**
++ * @brief Direct test for Conv2DTransposeLayer setProperty
++ */
++TEST(Conv2DTransposeLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::Conv2DTransposeLayer>({});
++  EXPECT_NO_THROW(layer->setProperty(
++    {"filters=16", "kernel_size=3,3", "stride=2,2", "padding=1,1"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(Conv2DTransposeLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::Conv2DTransposeLayer>({});
++  EXPECT_EQ(layer->getType(), "conv2dtranspose");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(Conv2DTransposeLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::Conv2DTransposeLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test various property combinations
++ */
++TEST(Conv2DTransposeLayerDirect, setProperty_various) {
++  auto layer = nntrainer::createLayer<nntrainer::Conv2DTransposeLayer>({});
++  
++  // Test with dilation
++  EXPECT_NO_THROW(layer->setProperty(
++    {"filters=8", "kernel_size=5,5", "dilation=2,2"}));
++  
++  // Test with same padding
++  auto layer2 = nntrainer::createLayer<nntrainer::Conv2DTransposeLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty(
++    {"filters=4", "kernel_size=3,3", "padding=same"}));
++  
++  // Test with valid padding
++  auto layer3 = nntrainer::createLayer<nntrainer::Conv2DTransposeLayer>({});
++  EXPECT_NO_THROW(layer3->setProperty(
++    {"filters=4", "kernel_size=3,3", "padding=valid"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_gather.cpp b/test/unittest/layers/unittest_layers_gather.cpp
+new file mode 100644
+index 0000000000..26b65333f4
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_gather.cpp
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_gather.cpp
++ * @date 12 December 2025
++ * @brief Gather Layer Test
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <gather_layer.h>
++#include <layers_common_tests.h>
++
++auto semantic_gather = LayerSemanticsParamType(
++  nntrainer::createLayer<nntrainer::GatherLayer>, nntrainer::GatherLayer::type,
++  {"axis=1"},
++  LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false, 2);
++
++GTEST_PARAMETER_TEST(Gather, LayerSemantics,
++                     ::testing::Values(semantic_gather));
++
++/**
++ * @brief Direct test for GatherLayer setProperty
++ */
++TEST(GatherLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::GatherLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"axis=2"}));
++}
++
++/**
++ * @brief Test setProperty with invalid property
++ */
++TEST(GatherLayerDirect, setProperty_invalid) {
++  auto layer = nntrainer::createLayer<nntrainer::GatherLayer>({});
++  EXPECT_THROW(layer->setProperty({"invalid_prop=value"}),
++               nntrainer::exception::not_supported);
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(GatherLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::GatherLayer>({});
++  EXPECT_EQ(layer->getType(), "gather");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(GatherLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::GatherLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
+diff --git a/test/unittest/layers/unittest_layers_slice.cpp b/test/unittest/layers/unittest_layers_slice.cpp
+new file mode 100644
+index 0000000000..420b8e00f1
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_slice.cpp
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_slice.cpp
++ * @date 12 December 2025
++ * @brief Slice Layer Test
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <slice_layer.h>
++#include <layers_common_tests.h>
++
++auto semantic_slice = LayerSemanticsParamType(
++  nntrainer::createLayer<nntrainer::SliceLayer>, nntrainer::SliceLayer::type,
++  {"axis=1", "start_index=1", "end_index=3"},
++  LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false, 1);
++
++GTEST_PARAMETER_TEST(Slice, LayerSemantics, ::testing::Values(semantic_slice));
++
++/**
++ * @brief Direct test for SliceLayer setProperty
++ */
++TEST(SliceLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::SliceLayer>({});
++  EXPECT_NO_THROW(
++    layer->setProperty({"axis=2", "start_index=1", "end_index=5"}));
++}
++
++/**
++ * @brief Test setProperty with invalid property
++ */
++TEST(SliceLayerDirect, setProperty_invalid) {
++  auto layer = nntrainer::createLayer<nntrainer::SliceLayer>({});
++  EXPECT_THROW(layer->setProperty({"invalid_prop=value"}),
++               nntrainer::exception::not_supported);
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(SliceLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::SliceLayer>({});
++  EXPECT_EQ(layer->getType(), "slice");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(SliceLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::SliceLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
+diff --git a/test/unittest/layers/unittest_layers_tensor.cpp b/test/unittest/layers/unittest_layers_tensor.cpp
+new file mode 100644
+index 0000000000..c3942b9910
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_tensor.cpp
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_tensor.cpp
++ * @date 12 December 2025
++ * @brief Tensor Layer Test
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <tensor_layer.h>
++#include <layers_common_tests.h>
++
++// TensorLayer is a special layer for QNN and is not compatible with
++// LayerSemantics framework, so we only test direct APIs.
++
++
++
++/**
++ * @brief Test setProperty with invalid property
++ */
++TEST(TensorLayerDirect, setProperty_invalid) {
++  auto layer = nntrainer::createLayer<nntrainer::TensorLayer>({});
++  EXPECT_THROW(layer->setProperty({"invalid_prop=value"}),
++               std::invalid_argument);
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(TensorLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::TensorLayer>({});
++  EXPECT_EQ(layer->getType(), "tensor");
++}
++
++/**
++ * @brief Test supportBackwarding returns false
++ */
++TEST(TensorLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::TensorLayer>({});
++  EXPECT_FALSE(layer->supportBackwarding());
++}
+diff --git a/test/unittest/layers/unittest_layers_time_dist.cpp b/test/unittest/layers/unittest_layers_time_dist.cpp
+new file mode 100644
+index 0000000000..a35e52d3a7
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_time_dist.cpp
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_time_dist.cpp
++ * @date 12 December 2025
++ * @brief Time Distributed Layer Test
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <time_dist.h>
++#include <layers_common_tests.h>
++
++// TimeDistLayer requires a distributed layer to be set, which makes 
++// LayerSemantics testing complex. We only test direct APIs here.
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(TimeDistLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::TimeDistLayer>({});
++  EXPECT_EQ(layer->getType(), "time_dist");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(TimeDistLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::TimeDistLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test requireLabel returns false by default
++ */
++TEST(TimeDistLayerDirect, requireLabel) {
++  auto layer = nntrainer::createLayer<nntrainer::TimeDistLayer>({});
++  EXPECT_FALSE(layer->requireLabel());
++}
+
+From bc9e2ca1e626f48a0467c337799ee39dba4fdbec Mon Sep 17 00:00:00 2001
+From: Donghak PARK <donghak.park@samsung.com>
+Date: Fri, 12 Dec 2025 16:46:24 +0900
+Subject: [PATCH 2/2] [Unittest] Add Unittest for Code Coverage
+
+Add Unittest For Code Coverage
+
+**Self evaluation:**
+1. Build test:	 [X]Passed [ ]Failed [ ]Skipped
+2. Run test:	 [X]Passed [ ]Failed [ ]Skipped
+
+Signed-off-by: Donghak PARK <donghak.park@samsung.com>
+---
+ test/unittest/layers/meson.build              | 13 ++++-
+ .../unittest_layers_embedding_direct.cpp      | 52 ++++++++++++++++++
+ .../layers/unittest_layers_gru_direct.cpp     | 55 +++++++++++++++++++
+ .../layers/unittest_layers_grucell_direct.cpp | 52 ++++++++++++++++++
+ ...test_layers_layer_normalization_direct.cpp | 52 ++++++++++++++++++
+ .../layers/unittest_layers_lstm_direct.cpp    | 55 +++++++++++++++++++
+ .../unittest_layers_lstmcell_direct.cpp       | 52 ++++++++++++++++++
+ ...est_layers_multi_head_attention_direct.cpp | 52 ++++++++++++++++++
+ .../layers/unittest_layers_permute_direct.cpp | 52 ++++++++++++++++++
+ .../unittest_layers_reduce_mean_direct.cpp    | 55 +++++++++++++++++++
+ .../unittest_layers_reduce_sum_direct.cpp     | 55 +++++++++++++++++++
+ .../layers/unittest_layers_rnn_direct.cpp     | 55 +++++++++++++++++++
+ .../layers/unittest_layers_rnncell_direct.cpp | 52 ++++++++++++++++++
+ .../layers/unittest_layers_split_direct.cpp   | 52 ++++++++++++++++++
+ .../unittest_layers_upsample2d_direct.cpp     | 52 ++++++++++++++++++
+ ...nittest_layers_zoneout_lstmcell_direct.cpp | 52 ++++++++++++++++++
+ 16 files changed, 807 insertions(+), 1 deletion(-)
+ create mode 100644 test/unittest/layers/unittest_layers_embedding_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_gru_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_grucell_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_layer_normalization_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_lstm_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_lstmcell_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_multi_head_attention_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_permute_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_reduce_mean_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_reduce_sum_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_rnn_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_rnncell_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_split_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_upsample2d_direct.cpp
+ create mode 100644 test/unittest/layers/unittest_layers_zoneout_lstmcell_direct.cpp
+
+diff --git a/test/unittest/layers/meson.build b/test/unittest/layers/meson.build
+index cac252c2eb..6b586b75a5 100644
+--- a/test/unittest/layers/meson.build
++++ b/test/unittest/layers/meson.build
+@@ -115,7 +115,18 @@ test_target = [
+   'unittest_layers_slice.cpp',
+   'unittest_layers_gather.cpp',
+   'unittest_layers_tensor.cpp',
+-  'unittest_layers_channel_shuffle.cpp'
++  'unittest_layers_channel_shuffle.cpp',
++  'unittest_layers_rnn_direct.cpp',
++  'unittest_layers_gru_direct.cpp',
++  'unittest_layers_lstm_direct.cpp',
++  'unittest_layers_grucell_direct.cpp',
++  'unittest_layers_lstmcell_direct.cpp',
++  'unittest_layers_rnncell_direct.cpp',
++  'unittest_layers_zoneout_lstmcell_direct.cpp',
++  'unittest_layers_multi_head_attention_direct.cpp',
++  'unittest_layers_reduce_mean_direct.cpp',
++  'unittest_layers_reduce_sum_direct.cpp',
++  'unittest_layers_layer_normalization_direct.cpp'
+ ]
+ 
+ if get_option('enable-opencl')
+diff --git a/test/unittest/layers/unittest_layers_embedding_direct.cpp b/test/unittest/layers/unittest_layers_embedding_direct.cpp
+new file mode 100644
+index 0000000000..7995bb84f6
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_embedding_direct.cpp
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_embedding_direct.cpp
++ * @date 12 December 2025
++ * @brief Embedding Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <embedding.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for EmbeddingLayer setProperty
++ */
++TEST(EmbeddingLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::EmbeddingLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"in_dim=1000", "out_dim=64"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(EmbeddingLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::EmbeddingLayer>({});
++  EXPECT_EQ(layer->getType(), "embedding");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(EmbeddingLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::EmbeddingLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with different dimensions
++ */
++TEST(EmbeddingLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::EmbeddingLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"in_dim=5000", "out_dim=128"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::EmbeddingLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"in_dim=32000", "out_dim=256"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_gru_direct.cpp b/test/unittest/layers/unittest_layers_gru_direct.cpp
+new file mode 100644
+index 0000000000..390cc043c8
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_gru_direct.cpp
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_gru_direct.cpp
++ * @date 12 December 2025
++ * @brief GRU Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <gru.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for GRULayer setProperty
++ */
++TEST(GRULayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::GRULayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"unit=32"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(GRULayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::GRULayer>({});
++  EXPECT_EQ(layer->getType(), "gru");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(GRULayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::GRULayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with various unit sizes and properties
++ */
++TEST(GRULayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::GRULayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"unit=64"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::GRULayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"unit=128", "return_sequences=true"}));
++
++  auto layer3 = nntrainer::createLayer<nntrainer::GRULayer>({});
++  EXPECT_NO_THROW(layer3->setProperty({"unit=256", "hidden_state_activation=tanh"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_grucell_direct.cpp b/test/unittest/layers/unittest_layers_grucell_direct.cpp
+new file mode 100644
+index 0000000000..8c67e8fc1b
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_grucell_direct.cpp
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_grucell_direct.cpp
++ * @date 12 December 2025
++ * @brief GRUCell Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <grucell.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for GRUCellLayer setProperty
++ */
++TEST(GRUCellLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::GRUCellLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"unit=32"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(GRUCellLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::GRUCellLayer>({});
++  EXPECT_EQ(layer->getType(), "grucell");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(GRUCellLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::GRUCellLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with various unit sizes
++ */
++TEST(GRUCellLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::GRUCellLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"unit=64"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::GRUCellLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"unit=128"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_layer_normalization_direct.cpp b/test/unittest/layers/unittest_layers_layer_normalization_direct.cpp
+new file mode 100644
+index 0000000000..9773f8c32e
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_layer_normalization_direct.cpp
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_layer_normalization_direct.cpp
++ * @date 12 December 2025
++ * @brief Layer Normalization Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <layer_normalization_layer.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for LayerNormalizationLayer setProperty
++ */
++TEST(LayerNormalizationLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::LayerNormalizationLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"epsilon=1e-5"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(LayerNormalizationLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::LayerNormalizationLayer>({});
++  EXPECT_EQ(layer->getType(), "layer_normalization");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(LayerNormalizationLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::LayerNormalizationLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with different epsilon values
++ */
++TEST(LayerNormalizationLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::LayerNormalizationLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"epsilon=1e-6"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::LayerNormalizationLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"epsilon=1e-4"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_lstm_direct.cpp b/test/unittest/layers/unittest_layers_lstm_direct.cpp
+new file mode 100644
+index 0000000000..1d7e3217aa
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_lstm_direct.cpp
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_lstm_direct.cpp
++ * @date 12 December 2025
++ * @brief LSTM Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <lstm.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for LSTMLayer setProperty
++ */
++TEST(LSTMLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::LSTMLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"unit=32"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(LSTMLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::LSTMLayer>({});
++  EXPECT_EQ(layer->getType(), "lstm");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(LSTMLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::LSTMLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with various unit sizes and properties
++ */
++TEST(LSTMLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::LSTMLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"unit=64"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::LSTMLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"unit=128", "return_sequences=true"}));
++
++  auto layer3 = nntrainer::createLayer<nntrainer::LSTMLayer>({});
++  EXPECT_NO_THROW(layer3->setProperty({"unit=256", "hidden_state_activation=tanh"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_lstmcell_direct.cpp b/test/unittest/layers/unittest_layers_lstmcell_direct.cpp
+new file mode 100644
+index 0000000000..31d45c9723
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_lstmcell_direct.cpp
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_lstmcell_direct.cpp
++ * @date 12 December 2025
++ * @brief LSTMCell Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <lstmcell.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for LSTMCellLayer setProperty
++ */
++TEST(LSTMCellLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::LSTMCellLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"unit=32"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(LSTMCellLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::LSTMCellLayer>({});
++  EXPECT_EQ(layer->getType(), "lstmcell");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(LSTMCellLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::LSTMCellLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with various unit sizes
++ */
++TEST(LSTMCellLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::LSTMCellLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"unit=64"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::LSTMCellLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"unit=128"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_multi_head_attention_direct.cpp b/test/unittest/layers/unittest_layers_multi_head_attention_direct.cpp
+new file mode 100644
+index 0000000000..566c5e267e
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_multi_head_attention_direct.cpp
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_multi_head_attention_direct.cpp
++ * @date 12 December 2025
++ * @brief Multi Head Attention Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <multi_head_attention_layer.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for MultiHeadAttentionLayer setProperty
++ */
++TEST(MultiHeadAttentionLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::MultiHeadAttentionLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"num_heads=4", "projected_key_dim=32"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(MultiHeadAttentionLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::MultiHeadAttentionLayer>({});
++  EXPECT_EQ(layer->getType(), "multi_head_attention");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(MultiHeadAttentionLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::MultiHeadAttentionLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with various head counts
++ */
++TEST(MultiHeadAttentionLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::MultiHeadAttentionLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"num_heads=8", "projected_key_dim=64"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::MultiHeadAttentionLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"num_heads=16", "projected_key_dim=128"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_permute_direct.cpp b/test/unittest/layers/unittest_layers_permute_direct.cpp
+new file mode 100644
+index 0000000000..28af8c9e74
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_permute_direct.cpp
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_permute_direct.cpp
++ * @date 12 December 2025
++ * @brief Permute Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <permute_layer.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for PermuteLayer setProperty
++ */
++TEST(PermuteLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::PermuteLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"direction=0:2:1:3"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(PermuteLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::PermuteLayer>({});
++  EXPECT_EQ(layer->getType(), "permute");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(PermuteLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::PermuteLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with different permutation directions
++ */
++TEST(PermuteLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::PermuteLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"direction=0:1:3:2"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::PermuteLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"direction=0:3:1:2"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_reduce_mean_direct.cpp b/test/unittest/layers/unittest_layers_reduce_mean_direct.cpp
+new file mode 100644
+index 0000000000..20d50a011a
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_reduce_mean_direct.cpp
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_reduce_mean_direct.cpp
++ * @date 12 December 2025
++ * @brief Reduce Mean Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <reduce_mean_layer.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for ReduceMeanLayer setProperty
++ */
++TEST(ReduceMeanLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::ReduceMeanLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"axis=1"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(ReduceMeanLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::ReduceMeanLayer>({});
++  EXPECT_EQ(layer->getType(), "reduce_mean");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(ReduceMeanLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::ReduceMeanLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with different axes
++ */
++TEST(ReduceMeanLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::ReduceMeanLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"axis=1"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::ReduceMeanLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"axis=2"}));
++
++  auto layer3 = nntrainer::createLayer<nntrainer::ReduceMeanLayer>({});
++  EXPECT_NO_THROW(layer3->setProperty({"axis=3"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_reduce_sum_direct.cpp b/test/unittest/layers/unittest_layers_reduce_sum_direct.cpp
+new file mode 100644
+index 0000000000..0116e0859e
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_reduce_sum_direct.cpp
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_reduce_sum_direct.cpp
++ * @date 12 December 2025
++ * @brief Reduce Sum Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <reduce_sum_layer.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for ReduceSumLayer setProperty
++ */
++TEST(ReduceSumLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::ReduceSumLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"axis=1"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(ReduceSumLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::ReduceSumLayer>({});
++  EXPECT_EQ(layer->getType(), "reduce_sum");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(ReduceSumLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::ReduceSumLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with different axes
++ */
++TEST(ReduceSumLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::ReduceSumLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"axis=1"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::ReduceSumLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"axis=2"}));
++
++  auto layer3 = nntrainer::createLayer<nntrainer::ReduceSumLayer>({});
++  EXPECT_NO_THROW(layer3->setProperty({"axis=3"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_rnn_direct.cpp b/test/unittest/layers/unittest_layers_rnn_direct.cpp
+new file mode 100644
+index 0000000000..3573d0cf57
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_rnn_direct.cpp
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_rnn_direct.cpp
++ * @date 12 December 2025
++ * @brief RNN Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <rnn.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for RNNLayer setProperty
++ */
++TEST(RNNLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::RNNLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"unit=32"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(RNNLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::RNNLayer>({});
++  EXPECT_EQ(layer->getType(), "rnn");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(RNNLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::RNNLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with various unit sizes
++ */
++TEST(RNNLayerDirect, setProperty_various_units) {
++  auto layer1 = nntrainer::createLayer<nntrainer::RNNLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"unit=64"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::RNNLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"unit=128", "return_sequences=true"}));
++
++  auto layer3 = nntrainer::createLayer<nntrainer::RNNLayer>({});
++  EXPECT_NO_THROW(layer3->setProperty({"unit=256", "hidden_state_activation=tanh"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_rnncell_direct.cpp b/test/unittest/layers/unittest_layers_rnncell_direct.cpp
+new file mode 100644
+index 0000000000..e8a045f51b
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_rnncell_direct.cpp
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_rnncell_direct.cpp
++ * @date 12 December 2025
++ * @brief RNNCell Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <rnncell.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for RNNCellLayer setProperty
++ */
++TEST(RNNCellLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::RNNCellLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"unit=32"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(RNNCellLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::RNNCellLayer>({});
++  EXPECT_EQ(layer->getType(), "rnncell");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(RNNCellLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::RNNCellLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with various unit sizes
++ */
++TEST(RNNCellLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::RNNCellLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"unit=64"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::RNNCellLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"unit=128"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_split_direct.cpp b/test/unittest/layers/unittest_layers_split_direct.cpp
+new file mode 100644
+index 0000000000..9f41bed7e2
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_split_direct.cpp
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_split_direct.cpp
++ * @date 12 December 2025
++ * @brief Split Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <split_layer.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for SplitLayer setProperty
++ */
++TEST(SplitLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::SplitLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"split_dimension=1", "split_number=2"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(SplitLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::SplitLayer>({});
++  EXPECT_EQ(layer->getType(), "split");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(SplitLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::SplitLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with different dimensions
++ */
++TEST(SplitLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::SplitLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"split_dimension=2", "split_number=4"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::SplitLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"split_dimension=3", "split_number=2"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_upsample2d_direct.cpp b/test/unittest/layers/unittest_layers_upsample2d_direct.cpp
+new file mode 100644
+index 0000000000..00823fe8b9
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_upsample2d_direct.cpp
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_upsample2d_direct.cpp
++ * @date 12 December 2025
++ * @brief Upsample2D Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <upsample2d_layer.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for Upsample2dLayer setProperty
++ */
++TEST(Upsample2dLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::Upsample2dLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"upsample=2x2"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(Upsample2dLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::Upsample2dLayer>({});
++  EXPECT_EQ(layer->getType(), "upsample2d");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(Upsample2dLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::Upsample2dLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with different upsample factors
++ */
++TEST(Upsample2dLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::Upsample2dLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"upsample=3x3"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::Upsample2dLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"upsample=4x4"}));
++}
+diff --git a/test/unittest/layers/unittest_layers_zoneout_lstmcell_direct.cpp b/test/unittest/layers/unittest_layers_zoneout_lstmcell_direct.cpp
+new file mode 100644
+index 0000000000..a93708e6f6
+--- /dev/null
++++ b/test/unittest/layers/unittest_layers_zoneout_lstmcell_direct.cpp
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
++ *
++ * @file unittest_layers_zoneout_lstmcell_direct.cpp
++ * @date 12 December 2025
++ * @brief ZoneoutLSTMCell Layer Direct Unit Tests
++ * @see https://github.com/nnstreamer/nntrainer
++ * @author Donghak Park <donghak.park@samsung.com>
++ * @bug No known bugs except for NYI items
++ */
++#include <tuple>
++
++#include <gtest/gtest.h>
++
++#include <zoneout_lstmcell.h>
++#include <layers_common_tests.h>
++
++/**
++ * @brief Direct test for ZoneoutLSTMCellLayer setProperty
++ */
++TEST(ZoneoutLSTMCellLayerDirect, setProperty_valid) {
++  auto layer = nntrainer::createLayer<nntrainer::ZoneoutLSTMCellLayer>({});
++  EXPECT_NO_THROW(layer->setProperty({"unit=32"}));
++}
++
++/**
++ * @brief Test getType returns correct type
++ */
++TEST(ZoneoutLSTMCellLayerDirect, getType) {
++  auto layer = nntrainer::createLayer<nntrainer::ZoneoutLSTMCellLayer>({});
++  EXPECT_EQ(layer->getType(), "zoneout_lstmcell");
++}
++
++/**
++ * @brief Test supportBackwarding returns true
++ */
++TEST(ZoneoutLSTMCellLayerDirect, supportBackwarding) {
++  auto layer = nntrainer::createLayer<nntrainer::ZoneoutLSTMCellLayer>({});
++  EXPECT_TRUE(layer->supportBackwarding());
++}
++
++/**
++ * @brief Test with various properties
++ */
++TEST(ZoneoutLSTMCellLayerDirect, setProperty_various) {
++  auto layer1 = nntrainer::createLayer<nntrainer::ZoneoutLSTMCellLayer>({});
++  EXPECT_NO_THROW(layer1->setProperty({"unit=64"}));
++
++  auto layer2 = nntrainer::createLayer<nntrainer::ZoneoutLSTMCellLayer>({});
++  EXPECT_NO_THROW(layer2->setProperty({"unit=128", "hidden_state_zoneout_rate=0.1"}));
++}
