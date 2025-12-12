@@ -1,0 +1,6 @@
+{
+    "arm_arch": "armv8.2-a",
+    "arm_march": "armv8.2-a+fp16+dotprod+i8mm",
+    "enable_fp16": true,
+    "app_abi": "arm64-v8a"
+}

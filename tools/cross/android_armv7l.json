@@ -1,0 +1,6 @@
+{
+    "arm_arch": "armv7l",
+    "arm_march": "armv7-a+neon",
+    "enable_fp16": false,
+    "app_abi": "armeabi-v7a"
+}

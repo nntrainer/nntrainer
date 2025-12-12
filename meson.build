@@ -176,9 +176,22 @@ if get_option('enable-fp16')
      # comaptible with armv8.0 machines.
      if cxx.has_argument('-mfp16-format=ieee')
        add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
-       add_project_arguments('-march=armv8.2-a+fp16', language: ['c', 'cpp'])
      else
        message ('The compiler does not support -mfp16-format=ieee. However, according to https://gcc.gnu.org/onlinedocs/gcc-9.1.0/gcc/Half-Precision.html, gcc may use IEEE fp16 anyway. Thus, we will proceed without the option for FP16 support.')
+     endif
+     # Use arm-arch option for architecture-specific flags
+     arm_arch_opt = get_option('arm-arch')
+     if arm_arch_opt == 'armv9.2-a'
+       add_project_arguments('-march=armv9.2-a+fp16+sve2+sme', language: ['c', 'cpp'])
+       extra_defines += '-DARM_ARCH_ARMV9_2A=1'
+       extra_defines += '-DENABLE_SVE2=1'
+     elif arm_arch_opt == 'armv8.2-a'
+       add_project_arguments('-march=armv8.2-a+fp16+dotprod+i8mm', language: ['c', 'cpp'])
+       extra_defines += '-DARM_ARCH_ARMV8_2A=1'
+     else
+       # auto: default to armv8.2-a+fp16+dotprod+i8mm for native aarch64 builds
+       add_project_arguments('-march=armv8.2-a+fp16+dotprod+i8mm', language: ['c', 'cpp'])
+       extra_defines += '-DARM_ARCH_ARMV8_2A=1'
      endif
      extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
