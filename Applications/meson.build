@@ -59,3 +59,5 @@ if get_option('enable-transformer')
     subdir('CausalLM')
   endif
 endif
+
+subdir('Optimizers/jni')

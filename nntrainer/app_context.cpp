@@ -29,6 +29,7 @@
 
 #include <adam.h>
 #include <adamw.h>
+#include <lion.h>
 #include <sgd.h>
 
 #include <activation_layer.h>
@@ -259,6 +260,7 @@ void AppContext::add_default_object() {
   registerFactory(nntrainer::createOptimizer<Adam>, Adam::type, OptType::ADAM);
   registerFactory(nntrainer::createOptimizer<AdamW>, AdamW::type,
                   OptType::ADAMW);
+  registerFactory(nntrainer::createOptimizer<Lion>, Lion::type, OptType::LION);
   registerFactory(AppContext::unknownFactory<nntrainer::Optimizer>, "unknown",
                   OptType::UNKNOWN);
 
