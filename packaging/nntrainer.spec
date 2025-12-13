@@ -48,7 +48,6 @@
 
 %endif # 0%{tizen_version_major}%{tizen_version_minor} >= 65
 
-%define enable_fp16 0
 ### nntrainer fp16 implementation relies on NEON, which requires armv8.2-a
 ### armv7l Tizen: do not support fp16 neon.
 ### aarch64 Tizen: uses armv8.0a. no fp16 neon.
@@ -61,6 +60,11 @@
 %define fp16_support -Denable-fp16=false
 %endif # enable_fp16
 
+%if (0%{?enable_fp16}) && (0%{?enable_transformer})
+%define transformer_support -Denable-transformer=true
+%else
+%define transformer_support -Denable-transformer=false
+%endif
 
 ## GPU flag
 ## To enable OpenCL, pass the flag to gbs build with: --define "_with_gpu 1"
@@ -461,7 +465,8 @@ meson --buildtype=plain --prefix=%{_prefix} --sysconfdir=%{_sysconfdir} \
       %{enable_reduce_tolerance} %{configure_subplugin_install_path} %{enable_debug} \
       -Dml-api-support=enabled -Denable-nnstreamer-tensor-filter=enabled \
       -Denable-nnstreamer-tensor-trainer=enabled -Denable-capi=enabled \
-      %{fp16_support} %{opencl_support} build --wrap-mode=nodownload
+      %{fp16_support} %{opencl_support} build --wrap-mode=nodownload \
+      %{transformer_support}
 
 ninja -C build %{?_smp_mflags}
 
@@ -628,6 +633,14 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/hgemm_transA.h
 %{_includedir}/nntrainer/hgemm_transAB.h
 %{_includedir}/nntrainer/hgemm_transB.h
+%{_includedir}/nntrainer/hgemm_pack.h
+%{_includedir}/nntrainer/hgemm_padding.h
+%{_includedir}/nntrainer/hgemm_padding_a.h
+%{_includedir}/nntrainer/hgemm_padding_b.h
+%{_includedir}/nntrainer/kai_common.h
+%{_includedir}/nntrainer/mask_neon.h
+%{_includedir}/nntrainer/matrix_transpose_kernels_neon.h
+%{_includedir}/nntrainer/neon_kleidiai.h
 %{_includedir}/nntrainer/kai_lhs_quant_pack_qai8dxp_f32.h
 %{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod.h
 %{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod.h

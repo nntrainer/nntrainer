@@ -3,6 +3,10 @@ hgemm_headers = [
   'hgemm_util.h',
   'hgemm_pack.h',
   'hgemm_common.h',
+  'hgemm_noTrans.h',
+  'hgemm_transA.h',
+  'hgemm_transAB.h',
+  'hgemm_transB.h'
 ]
 
 subdir('hgemm_kernel')

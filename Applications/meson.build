@@ -55,7 +55,7 @@ if get_option('enable-transformer')
   if host_machine.system() != 'windows'
   subdir('PicoGPT/jni')
   endif
-  if (get_option('platform') != 'tizen') and (get_option('platform') != 'windows')
+  if get_option('platform') != 'windows'
     subdir('CausalLM')
   endif
 endif

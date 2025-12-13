@@ -11,6 +11,8 @@
  *
  */
 
+#include <cstring>
+
 #include <hgemm.h>
 #include <matrix_transpose_neon.h>
 #include <memory>

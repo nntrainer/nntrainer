@@ -5,7 +5,7 @@ project('nntrainer', 'c', 'cpp',
   default_options: [
     'werror=true',
     'warning_level=1',
-    'c_std=gnu89',
+    'c_std=gnu99',
     'cpp_std=c++17',
     'buildtype=release'
   ]
@@ -80,7 +80,10 @@ warning_flags = [
   '-Wno-unused-variable',
   '-Wno-comment',
   '-Wno-ignored-attributes',
-  '-Wno-sign-compare'
+  '-Wno-sign-compare',
+  '-Wno-unused-but-set-variable',
+  '-Wno-unused-function',
+  '-Wno-array-bounds'
 ]
 
 if cxx_compiler_id == 'clang'
@@ -99,7 +102,8 @@ warning_c_flags = [
   '-Wnested-externs',
   '-Waggregate-return',
   '-Wold-style-definition',
-  '-Wdeclaration-after-statement',
+  '-Wno-declaration-after-statement',
+  '-Wno-unused-but-set-variable',
   '-Wno-error=varargs'
 ]
 
