@@ -281,6 +281,16 @@ public:
   virtual int addLayer(std::shared_ptr<Layer> layer) = 0;
 
   /**
+   * @brief     add checkpoint block for gradient checkpointing
+   * @param[in] layer_names vector of layer names to be checkpointed
+   * @note This should be called before compile()
+   * @retval #ML_ERROR_NONE Successful.
+   * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
+   */
+  virtual int
+  addCheckpointBlock(const std::vector<std::string> &layer_names) = 0;
+
+  /**
    * @brief add referring to reference layers.
    * @note This method does add the provided layers itself but adds a deep copy
    * of the passed layers to the model. The layers passed to this function can
