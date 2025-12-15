@@ -225,6 +225,9 @@ public:
    * @param node Graph node to extract node identifiers/info
    * @param inputs_dim Specification for the tensors
    * @param outputs_name Name of the already requested output tensors
+   * @param is_checkpoint_layer True if this is a checkpointed layer
+   * @param is_first_in_checkpoint_block True if this is the first layer in
+   * checkpoint block
    *
    * @return created tensors list
    *
@@ -237,7 +240,9 @@ public:
    */
   std::vector<Var_Grad *>
   requestInputs(const GraphNode &node, const std::vector<TensorDim> &inputs_dim,
-                const std::vector<std::string> &outputs_name = {});
+                const std::vector<std::string> &outputs_name = {},
+                bool is_checkpoint_layer = false,
+                bool is_first_in_checkpoint_block = false);
 
   /**
    * @brief     Get all the weights which match the above condition

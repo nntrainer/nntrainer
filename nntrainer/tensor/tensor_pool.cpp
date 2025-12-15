@@ -287,7 +287,30 @@ void TensorPool::expandLifespan(RequestSpec &spec,
     << spec.tensor->getName();
 
   if (details.lifespan != TensorLifespan::UNMANAGED) {
-    /// update only if lifespan is unmanaged
+    // If source tensor has FORWARD_RECOMPUTE_LIFESPAN (checkpoint layer
+    // output), don't propagate FORWARD_FUNC_LIFESPAN from view to source. This
+    // prevents initial forward lifespan from being added to checkpoint outputs.
+    auto source_mask = static_cast<unsigned int>(details.lifespan);
+    auto view_mask = static_cast<unsigned int>(lifespan);
+    constexpr unsigned int FORWARD_FUNC_MASK =
+      static_cast<unsigned int>(TensorLifespan::FORWARD_FUNC_LIFESPAN);
+    constexpr unsigned int FORWARD_RECOMPUTE_MASK =
+      static_cast<unsigned int>(TensorLifespan::FORWARD_RECOMPUTE_LIFESPAN);
+
+    // If source has RECOMPUTE but not FWD, and view has FWD, don't add FWD to
+    // source Also skip adding exec_order to prevent initial forward order from
+    // being propagated
+    if ((source_mask & FORWARD_RECOMPUTE_MASK) &&
+        !(source_mask & FORWARD_FUNC_MASK) && (view_mask & FORWARD_FUNC_MASK)) {
+      view_mask &= ~FORWARD_FUNC_MASK; // Remove FWD from view before OR
+      lifespan = static_cast<TensorLifespan>(view_mask);
+      // Don't add exec_order - it contains initial forward order that shouldn't
+      // be propagated
+      details.lifespan =
+        enum_class_or<TensorLifespan>(details.lifespan, lifespan);
+      return;
+    }
+
     details.lifespan =
       enum_class_or<TensorLifespan>(details.lifespan, lifespan);
   }

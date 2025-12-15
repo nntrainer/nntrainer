@@ -999,6 +999,64 @@ public:
     return "cpu";
   }
 
+  /**
+   * @brief Set if this layer is part of a checkpoint block
+   *
+   * @param checkpointed true if this layer is checkpointed
+   */
+  void setCheckpointed(bool checkpointed) { is_checkpointed = checkpointed; }
+
+  /**
+   * @brief Check if this layer is part of a checkpoint block
+   *
+   * @return true if checkpointed, false otherwise
+   */
+  bool isCheckpointed() const { return is_checkpointed; }
+
+  /**
+   * @brief Set if this layer is the first layer in a checkpoint block
+   *
+   * @param val true if first layer, false otherwise
+   */
+  void setFirstInCheckpointBlock(bool val) { is_checkpoint_boundary = val; }
+
+  /**
+   * @brief Get if this layer is the first layer in a checkpoint block
+   *
+   * @return true if first layer, false otherwise
+   */
+  bool isFirstInCheckpointBlock() const { return is_checkpoint_boundary; }
+
+  /**
+   * @brief Set if this layer is the last layer in a checkpoint block
+   *
+   * @param val true if last layer, false otherwise
+   */
+  void setLastInCheckpointBlock(bool val) { is_checkpoint_block_end = val; }
+
+  /**
+   * @brief Get if this layer is the last layer in a checkpoint block
+   *
+   * @return true if last layer, false otherwise
+   */
+  bool isLastInCheckpointBlock() const { return is_checkpoint_block_end; }
+
+  /**
+   * @brief Set the checkpoint block ID this layer belongs to
+   *
+   * @param block_id Checkpoint block identifier
+   */
+  void setCheckpointBlockId(const std::string &block_id) {
+    checkpoint_block_id = block_id;
+  }
+
+  /**
+   * @brief Get the checkpoint block ID this layer belongs to
+   *
+   * @return std::string Block identifier
+   */
+  std::string getCheckpointBlockId() const { return checkpoint_block_id; }
+
 private:
   /**
    * @brief     Get the Input Layers object
@@ -1077,6 +1135,16 @@ properties in the context/graph unless intended. */
                                  output  */
 
   std::array<TensorDim::DataType, 2> data_type;
+
+  /** Gradient checkpointing related fields */
+  bool is_checkpointed =
+    false; /**< Whether this layer is in a checkpoint block*/
+  bool is_checkpoint_boundary =
+    false; /**< Whether this is a block boundary layer */
+  bool is_checkpoint_block_end =
+    false; /**< Whether this is the last layer in checkpoint block */
+  std::string checkpoint_block_id; /**< ID of the checkpoint block this layer
+                                      belongs to */
 
   /**
    * @brief   Get the effective layer managed by this layer node

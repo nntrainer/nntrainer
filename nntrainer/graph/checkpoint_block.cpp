@@ -19,9 +19,7 @@ namespace nntrainer {
 
 CheckpointBlock::CheckpointBlock(const std::vector<std::string> &layers,
                                  const std::string &id) :
-  layer_names(layers),
-  block_id(id),
-  enabled(true) {
+  layer_names(layers), block_id(id), enabled(true) {
 
   if (layers.empty()) {
     throw std::invalid_argument("CheckpointBlock: layer list cannot be empty");

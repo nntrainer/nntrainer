@@ -207,9 +207,13 @@ LayerNode::LayerNode(std::unique_ptr<nntrainer::Layer> &&l) :
   layer_node_props_realization(
     new RealizationPropsType(props::Flatten(), props::Activation())),
   loss(new props::Loss()),
-  exec_order({0, 0, 0, 0}),
+  exec_order({0, 0, 0, 0, 0}),
   needs_restore_data(false),
-  data_type({TensorDim::DataType::FP32, TensorDim::DataType::FP32}) {
+  data_type({TensorDim::DataType::FP32, TensorDim::DataType::FP32}),
+  is_checkpointed(false),
+  is_checkpoint_boundary(false),
+  is_checkpoint_block_end(false),
+  checkpoint_block_id("") {
   if (layer && layer->getType() == TimeDistLayer::type) {
     std::get<props::Distribute>(*layer_node_props).set(true);
   }
@@ -661,9 +665,13 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
     out_info.push_back(true);
   }
 
+  // Pass checkpoint information to InitLayerContext
+  bool is_checkpointed = isCheckpointed();
+
   auto context = InitLayerContext(
     actual_input_dims, out_info, getInPlaceType() != InPlaceType::NONE,
-    getName(), scope, max_norm, tensor_type, loss_scale, mode, compute_engine);
+    getName(), scope, max_norm, tensor_type, loss_scale, mode, compute_engine,
+    is_checkpointed);
 
   layer->finalize(context);
 

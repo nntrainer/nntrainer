@@ -44,7 +44,7 @@ InitLayerContext::InitLayerContext(
   bool is_inplace_, const std::string &n, const std::string &prefix_,
   const float max_norm, std::array<std::string, 3> tensor_type_,
   const float loss_scale_, ml::train::ExecutionMode mode_,
-  ml::train::LayerComputeEngine engine_) :
+  ml::train::LayerComputeEngine engine_, bool is_checkpointed_) :
   input_dim(dim),
   is_inplace(is_inplace_),
   clip_by_global_norm(max_norm),
@@ -55,7 +55,8 @@ InitLayerContext::InitLayerContext(
   tensor_type(tensor_type_),
   loss_scale(loss_scale_),
   mode(mode_),
-  engine(engine_) {
+  engine(engine_),
+  is_checkpointed(is_checkpointed_) {
   NNTR_THROW_IF(!validate(), std::invalid_argument)
     << "Invalid init context name: " << name
     << " num inputs: " << getNumInputs();
@@ -242,13 +243,37 @@ bool RunLayerContext::weightHasGradient(unsigned int idx) const {
  *
  * @param idx Identifier of the output
  * @return Tensor& Reference to the output tensor
+ * @note For gradient checkpointing:
+ *   - Initial forward: returns initial_outputs (short-lived)
+ *   - Recompute forward: returns outputs (default)
+ *   - Backward: returns outputs (default)
  */
 Tensor &RunLayerContext::getOutput(unsigned int idx) {
-  return outputs[idx]->getVariableRef();
+  if (is_initial_forward && is_inplace && !initial_inputs.empty() &&
+      initial_inputs[0] != nullptr) {
+    auto &tensor = initial_inputs[0]->getVariableRef();
+    return tensor;
+  }
+  if (is_checkpointed && is_initial_forward && !initial_outputs.empty()) {
+    auto &tensor = initial_outputs[idx]->getVariableRef();
+    return tensor;
+  }
+  auto &tensor = outputs[idx]->getVariableRef();
+  return tensor;
 }
 
 const Tensor &RunLayerContext::getOutput(unsigned int idx) const {
-  return outputs[idx]->getVariableRef();
+  if (is_initial_forward && is_inplace && !initial_inputs.empty() &&
+      initial_inputs[0] != nullptr) {
+    auto &tensor = initial_inputs[0]->getVariableRef();
+    return tensor;
+  }
+  if (is_checkpointed && is_initial_forward && !initial_outputs.empty()) {
+    auto &tensor = initial_outputs[idx]->getVariableRef();
+    return tensor;
+  }
+  auto &tensor = outputs[idx]->getVariableRef();
+  return tensor;
 }
 
 /**
@@ -282,6 +307,8 @@ bool RunLayerContext::outputHasGradient(unsigned int idx) const {
  *
  * @note recommended to NOT use this function as a layer developer but rather
  * use getOutputGrad().
+ * @note For gradient checkpointing:
+ *   - Backward phase: returns outputs gradient (from next layer's backprop)
  */
 Tensor &RunLayerContext::getOutputGradUnsafe(unsigned int idx) {
   return outputs[idx]->getGradientRef();
@@ -301,14 +328,33 @@ const Tensor RunLayerContext::getIncomingDerivative(unsigned int idx) const {
  * @brief Get the Input tensor object
  *
  * @param idx Identifier of the input
- * @return Tensor& Reference to the input grad tensor
+ * @return Tensor& Reference to the input tensor
+ * @note For gradient checkpointing:
+ *   - Initial forward: returns inputs (pointer to previous layer's output)
+ *   - Recompute forward (first layer only): returns initial_inputs (saved copy)
+ *   - Backward: returns inputs (recomputed values via pointer)
  */
 Tensor &RunLayerContext::getInput(unsigned int idx) {
-  return inputs[idx]->getVariableRef();
+  if (is_initial_forward) {
+    if (idx < initial_inputs.size() && initial_inputs[idx] != nullptr) {
+      auto &tensor = initial_inputs[idx]->getVariableRef();
+      return tensor; // Initial forward: use initial outputs from previous layer
+    }
+  }
+  auto &tensor = inputs[idx]->getVariableRef();
+
+  return tensor; // Normal/Recompute: pointer to recompute outputs
 }
 
 const Tensor &RunLayerContext::getInput(unsigned int idx) const {
-  return inputs[idx]->getVariableRef();
+  if (is_initial_forward) {
+    if (idx < initial_inputs.size() && initial_inputs[idx] != nullptr) {
+      auto &tensor = initial_inputs[idx]->getVariableRef();
+      return tensor;
+    }
+  }
+  auto &tensor = inputs[idx]->getVariableRef();
+  return tensor;
 }
 
 /**
@@ -316,6 +362,8 @@ const Tensor &RunLayerContext::getInput(unsigned int idx) const {
  *
  * @param idx Identifier of the input
  * @return Tensor& Reference to the input grad tensor
+ * @note For gradient checkpointing:
+ *   - Backward phase: returns inputs gradient (default)
  */
 Tensor &RunLayerContext::getInputGrad(unsigned int idx) {
   if (!inputs[idx]->hasGradient()) {
@@ -351,8 +399,18 @@ Tensor &RunLayerContext::getOutgoingDerivative(unsigned int idx) {
  *
  * @param idx Identifier of the tensor
  * @return Tensor& Reference to the tensor
+ * @note For gradient checkpointing:
+ *   - Initial forward: returns initial_tensors (short-lived)
+ *   - Recompute forward: returns tensors (default)
+ *   - Backward phase: returns tensors (default)
  */
 Tensor &RunLayerContext::getTensor(unsigned int idx) {
+  if (is_initial_forward) {
+    if (idx < initial_tensors.size() && initial_tensors[idx] != nullptr) {
+      auto &tensor = initial_tensors[idx]->getVariableRef();
+      return tensor;
+    }
+  }
   return tensors[idx]->getVariableRef();
 }
 
@@ -361,8 +419,18 @@ Tensor &RunLayerContext::getTensor(unsigned int idx) {
  *
  * @param idx Identifier of the tensor
  * @return Tensor& Reference to the tensor
+ * @note For gradient checkpointing:
+ *   - Initial forward: returns initial_tensors (short-lived)
+ *   - Recompute forward: returns tensors (default)
+ *   - Backward phase: returns tensors (default)
  */
 const Tensor &RunLayerContext::getTensor(unsigned int idx) const {
+  if (is_initial_forward) {
+    if (idx < initial_tensors.size() && initial_tensors[idx] != nullptr) {
+      auto &tensor = initial_tensors[idx]->getVariableRef();
+      return tensor;
+    }
+  }
   return tensors[idx]->getVariableRef();
 }
 
@@ -470,6 +538,10 @@ void RunLayerContext::setBatch(unsigned int batch) {
     vg->setBatchSize(batch);
   for (auto &vg : outputs)
     vg->setBatchSize(batch);
+  for (auto &vg : initial_inputs)
+    vg->setBatchSize(batch);
+  for (auto &vg : initial_outputs)
+    vg->setBatchSize(batch);
 }
 
 /**
@@ -480,18 +552,26 @@ void RunLayerContext::setBatch(unsigned int batch) {
  */
 void RunLayerContext::updateTensor(unsigned int idx, unsigned int batch) {
   tensors[idx]->setBatchSize(batch);
+  if (idx < initial_tensors.size() && initial_tensors[idx])
+    initial_tensors[idx]->setBatchSize(batch);
 }
 
 void RunLayerContext::updateInput(unsigned int idx, TensorDim dimension) {
   inputs[idx]->updateDimension(dimension);
+  if (idx < initial_inputs.size() && initial_inputs[idx])
+    initial_inputs[idx]->updateDimension(dimension);
 }
 
 void RunLayerContext::updateOutput(unsigned int idx, TensorDim dimension) {
   outputs[idx]->updateDimension(dimension);
+  if (idx < initial_outputs.size() && initial_outputs[idx])
+    initial_outputs[idx]->updateDimension(dimension);
 }
 
 void RunLayerContext::updateTensor(unsigned int idx, TensorDim dimension) {
   tensors[idx]->updateDimension(dimension);
+  if (idx < initial_tensors.size() && initial_tensors[idx])
+    initial_tensors[idx]->updateDimension(dimension);
 }
 
 /**

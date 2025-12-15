@@ -171,7 +171,7 @@ static Tensor *requestTensor_(const TensorSpecV2 &spec,
     << "Modifying view cannot be requested, the request type has to be "
        "delegated to either view or unique";
 
-  auto [forward, calc_grad, calc_deriv, apply_grad] = exec_order;
+  auto [forward, recompute, calc_grad, calc_deriv, apply_grad] = exec_order;
 
   std::vector<unsigned> order = spec.additional_exec_order;
   if (expose) {
@@ -181,6 +181,9 @@ static Tensor *requestTensor_(const TensorSpecV2 &spec,
   const auto name = scope + ":" + spec.name;
   if (enum_class_or(spec.ls, LS::FORWARD_FUNC_LIFESPAN) == spec.ls) {
     order.push_back(forward);
+  }
+  if (enum_class_or(spec.ls, LS::FORWARD_RECOMPUTE_LIFESPAN) == spec.ls) {
+    order.push_back(recompute);
   }
   if (enum_class_or(spec.ls, LS::CALC_GRAD_LIFESPAN) == spec.ls) {
     order.push_back(calc_grad);
@@ -373,8 +376,9 @@ void Manager::initializeTensorsTrain(unsigned int max_exec_order_) {
 std::vector<Weight *> Manager::requestWeights(
   const GraphNode &node, const std::vector<Weight::Spec> &weights_spec,
   bool trainable, const std::vector<std::string> &shared_names) {
-  const auto [forwarding_order, calcGradient_order, calcDerivative_order,
-              applyGradient_order] = node.getExecutionOrder();
+  const auto [forwarding_order, recompute_order, calcGradient_order,
+              calcDerivative_order, applyGradient_order] =
+    node.getExecutionOrder();
 
   std::vector<unsigned int> default_var_exec_order(
     {forwarding_order, calcDerivative_order});
@@ -521,8 +525,9 @@ std::vector<Weight *> Manager::requestWeights(
 std::vector<Var_Grad *> Manager::requestTensors(
   const GraphNode &node, const std::vector<Var_Grad::Spec> &tensors_spec,
   bool trainable, const std::vector<std::string> &shared_names) {
-  const auto [forwarding_order, calcGradient_order, calcDerivative_order,
-              applyGradient_order] = node.getExecutionOrder();
+  const auto [forwarding_order, recompute_order, calcGradient_order,
+              calcDerivative_order, applyGradient_order] =
+    node.getExecutionOrder();
 
   std::vector<Var_Grad *> ret;
   size_t current_size = tensors_v2.size();
@@ -538,6 +543,11 @@ std::vector<Var_Grad *> Manager::requestTensors(
     /** usage for tensors */
     if (enum_class_logical_and(tspan, TensorLifespan::FORWARD_FUNC_LIFESPAN))
       var_exec_order.push_back(forwarding_order);
+
+    if (is_train_mode && enum_class_logical_and(
+                           tspan, TensorLifespan::FORWARD_RECOMPUTE_LIFESPAN)) {
+      var_exec_order.push_back(recompute_order);
+    }
 
     /** usage for tensors gradient in backwarding */
     if (trainable && is_train_mode &&
@@ -592,10 +602,10 @@ std::vector<Var_Grad *> Manager::requestTensors(
 /**
  * @brief     Create tensors with the given spec
  */
-std::vector<Var_Grad *>
-Manager::requestInputs(const GraphNode &node,
-                       const std::vector<TensorDim> &inputs_dim,
-                       const std::vector<std::string> &outputs_name) {
+std::vector<Var_Grad *> Manager::requestInputs(
+  const GraphNode &node, const std::vector<TensorDim> &inputs_dim,
+  const std::vector<std::string> &outputs_name, bool is_checkpoint_layer,
+  bool is_first_in_checkpoint_block) {
   using RT = TensorSpecV2::RequestType;
 
   bool is_train_mode = exec_mode == ExecutionMode::TRAIN;
@@ -609,7 +619,8 @@ Manager::requestInputs(const GraphNode &node,
 
   grad_common_spec.ls = TensorLifespan::CALC_DERIV_LIFESPAN;
   /// @todo handle this inside layer
-  /// @note ActivationLayer with supportInPlace()=false (e.g., swish, gelu) needs input in backward.
+  /// @note ActivationLayer with supportInPlace()=false (e.g., swish, gelu)
+  /// needs input in backward.
   ///       For these layers, extend input lifespan to FORWARD_DERIV_LIFESPAN.
   if (node.getType() == ActivationLayer::type) {
     if (node.supportInPlace())
@@ -618,7 +629,8 @@ Manager::requestInputs(const GraphNode &node,
       var_common_spec.ls = TensorLifespan::FORWARD_DERIV_LIFESPAN;
   } else if (node.getType() == MultiOutLayer::type or
              node.getType() == BatchNormalizationLayer::type or
-             node.getType() == LayerNormalizationLayer::type or !node.getTrainable())
+             node.getType() == LayerNormalizationLayer::type or
+             !node.getTrainable())
     var_common_spec.ls = TensorLifespan::FORWARD_FUNC_LIFESPAN;
 
   if (node.getType() == MSELossLayer::type or
@@ -628,6 +640,13 @@ Manager::requestInputs(const GraphNode &node,
 
   if (node.getType() == GRUCellLayer::type) {
     grad_common_spec.ls = TensorLifespan::CALC_GRAD_DERIV_LIFESPAN;
+  }
+
+  // For checkpoint layers (except first in block), inputs only need to exist
+  // during recompute forward and backward, not initial forward
+  // First layer in block: initial_inputs = inputs, so needs initial forward too
+  if (is_checkpoint_layer && !is_first_in_checkpoint_block) {
+    var_common_spec.ls = promoteToRecompute(var_common_spec.ls);
   }
 
   std::vector<Var_Grad *> ret;

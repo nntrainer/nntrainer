@@ -33,6 +33,7 @@
 #include <chrono>
 #endif
 
+#include <checkpoint_block.h>
 #include <common_properties.h>
 #include <compiler_fwd.h>
 #include <dynamic_training_optimization.h>
@@ -492,6 +493,14 @@ public:
   int addLayer(NodeType layer);
 
   /**
+   * @brief     add checkpoint block for gradient checkpointing
+   * @param[in] layer_names vector of layer names to be checkpointed
+   * @retval #ML_ERROR_NONE Successful.
+   * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
+   */
+  int addCheckpointBlock(const std::vector<std::string> &layer_names) override;
+
+  /**
    * @brief     set optimizer for the neural network model
    * @retval #ML_ERROR_NONE Successful.
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
@@ -714,6 +723,9 @@ private:
     nullptr; /** Configurations bound to current engine */
 
   NetworkGraph model_graph; /** Network Model Graph */
+
+  std::vector<CheckpointBlock>
+    checkpoint_blocks; /** Checkpoint blocks for gradient checkpointing */
 
   GraphRepresentation graph_representation; /** Unsorted graph representation */
 

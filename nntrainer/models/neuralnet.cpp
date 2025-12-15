@@ -203,6 +203,11 @@ int NeuralNetwork::compile(ExecutionMode mode) {
     model_graph.addLayer(node);
   }
 
+  // Apply checkpoint blocks before compile
+  if (!checkpoint_blocks.empty()) {
+    model_graph.applyCheckpointBlocks(checkpoint_blocks);
+  }
+
   int status = model_graph.compile(loss_type);
   NN_RETURN_STATUS();
 
@@ -1542,6 +1547,35 @@ int NeuralNetwork::addLayer(NodeType layer) {
   graph_representation.push_back(layer);
 
   return status;
+}
+
+int NeuralNetwork::addCheckpointBlock(
+  const std::vector<std::string> &layer_names) {
+  if (initialized) {
+    ml_loge("Cannot add checkpoint block after initialization");
+    return ML_ERROR_NOT_SUPPORTED;
+  }
+
+  if (layer_names.size() < 2) {
+    ml_loge("Checkpoint block must have at least 2 layers");
+    return ML_ERROR_INVALID_PARAMETER;
+  }
+
+  try {
+    // Create checkpoint block with auto-generated ID
+    std::string block_id =
+      "checkpoint_block_" + std::to_string(checkpoint_blocks.size());
+    CheckpointBlock block(layer_names, block_id);
+    checkpoint_blocks.push_back(block);
+
+    ml_logi("Added checkpoint block '%s' with %zu layers", block_id.c_str(),
+            layer_names.size());
+  } catch (const std::exception &e) {
+    ml_loge("Failed to create checkpoint block: %s", e.what());
+    return ML_ERROR_INVALID_PARAMETER;
+  }
+
+  return ML_ERROR_NONE;
 }
 
 NeuralNetwork &NeuralNetwork::copyConfiguration(NeuralNetwork &from) {
