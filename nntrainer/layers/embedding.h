@@ -101,6 +101,11 @@ public:
    */
   void setProperty(const std::vector<std::string> &values) override;
 
+  /**
+   * @copydoc Layer::getProperty(const std::string &key)
+   */
+  std::string getProperty(const std::string &key) override;
+
   static constexpr const char *type = "embedding";
 
 private:

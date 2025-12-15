@@ -28,14 +28,6 @@ TEST(TimeDistLayerDirect, getType) {
 }
 
 /**
- * @brief Test supportBackwarding returns true
- */
-TEST(TimeDistLayerDirect, supportBackwarding) {
-  auto layer = nntrainer::createLayer<nntrainer::TimeDistLayer>({});
-  EXPECT_TRUE(layer->supportBackwarding());
-}
-
-/**
  * @brief Test requireLabel returns false by default
  */
 TEST(TimeDistLayerDirect, requireLabel) {

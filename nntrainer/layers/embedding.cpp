@@ -81,6 +81,14 @@ void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
   LayerImpl::setProperty(remain_props);
 }
 
+std::string EmbeddingLayer::getProperty(const std::string &key) {
+  std::string result = find_in_tuple(embedding_props, key);
+  if (!result.empty()) {
+    return result;
+  }
+  return LayerImpl::getProperty(key);
+}
+
 void EmbeddingLayer::forwarding(RunLayerContext &context, bool training) {
   /// @todo get input and output dimension from input_ and hidden itself
   unsigned int in_dim = std::get<props::InDim>(embedding_props);
