@@ -34,10 +34,6 @@
 #include <nntr_ggml_impl_common.h>
 #include <nntr_ggml_impl_utils.h>
 
-void nntr_ggml_init() {
-  // Fallback: no initialization needed
-}
-
 void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc) {
