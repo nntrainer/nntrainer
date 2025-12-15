@@ -192,6 +192,7 @@ if get_option('enable-fp16')
        # auto: default to armv8.2-a+fp16+dotprod+i8mm for native aarch64 builds
        add_project_arguments('-march=armv8.2-a+fp16+dotprod+i8mm', language: ['c', 'cpp'])
        extra_defines += '-DARM_ARCH_ARMV8_2A=1'
+       message('Unknown arm-arch option. Using default armv8.2-a+fp16+dotprod+i8mm')
      endif
      extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
