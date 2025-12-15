@@ -13,13 +13,11 @@
 
 #include <gtest/gtest.h>
 
-#include <tensor_layer.h>
 #include <layers_common_tests.h>
+#include <tensor_layer.h>
 
 // TensorLayer is a special layer for QNN and is not compatible with
 // LayerSemantics framework, so we only test direct APIs.
-
-
 
 /**
  * @brief Test setProperty with invalid property

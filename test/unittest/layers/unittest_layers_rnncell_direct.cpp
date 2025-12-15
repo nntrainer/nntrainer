@@ -11,8 +11,8 @@
  */
 #include <gtest/gtest.h>
 
-#include <rnncell.h>
 #include <layers_common_tests.h>
+#include <rnncell.h>
 
 /**
  * @brief Direct test for RNNCellLayer setProperty
@@ -47,4 +47,21 @@ TEST(RNNCellLayerDirect, setProperty_various) {
 
   auto layer2 = nntrainer::createLayer<nntrainer::RNNCellLayer>({});
   EXPECT_NO_THROW(layer2->setProperty({"unit=128"}));
+}
+
+/**
+ * @brief Test setProperty with invalid property name
+ */
+TEST(RNNCellLayerDirect, setProperty_invalid_name) {
+  auto layer = nntrainer::createLayer<nntrainer::RNNCellLayer>({});
+  EXPECT_THROW(layer->setProperty({"invalid_property=100"}), std::exception);
+}
+
+/**
+ * @brief Test setProperty with invalid value type
+ */
+TEST(RNNCellLayerDirect, setProperty_invalid_type) {
+  auto layer = nntrainer::createLayer<nntrainer::RNNCellLayer>({});
+  // unit expects a positive integer, passing a string
+  EXPECT_THROW(layer->setProperty({"unit=not_a_number"}), std::exception);
 }

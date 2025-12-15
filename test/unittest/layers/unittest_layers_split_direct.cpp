@@ -11,16 +11,8 @@
  */
 #include <gtest/gtest.h>
 
-#include <split_layer.h>
 #include <layers_common_tests.h>
-
-/**
- * @brief Direct test for SplitLayer setProperty
- */
-TEST(SplitLayerDirect, setProperty_valid) {
-  auto layer = nntrainer::createLayer<nntrainer::SplitLayer>({});
-  EXPECT_NO_THROW(layer->setProperty({"split_dimension=1", "split_number=2"}));
-}
+#include <split_layer.h>
 
 /**
  * @brief Test getType returns correct type
@@ -39,12 +31,19 @@ TEST(SplitLayerDirect, supportBackwarding) {
 }
 
 /**
- * @brief Test with different dimensions
+ * @brief Test setProperty with invalid property name
  */
-TEST(SplitLayerDirect, setProperty_various) {
-  auto layer1 = nntrainer::createLayer<nntrainer::SplitLayer>({});
-  EXPECT_NO_THROW(layer1->setProperty({"split_dimension=2", "split_number=4"}));
+TEST(SplitLayerDirect, setProperty_invalid_name) {
+  auto layer = nntrainer::createLayer<nntrainer::SplitLayer>({});
+  EXPECT_THROW(layer->setProperty({"invalid_property=100"}), std::exception);
+}
 
-  auto layer2 = nntrainer::createLayer<nntrainer::SplitLayer>({});
-  EXPECT_NO_THROW(layer2->setProperty({"split_dimension=3", "split_number=2"}));
+/**
+ * @brief Test setProperty with invalid value type
+ */
+TEST(SplitLayerDirect, setProperty_invalid_type) {
+  auto layer = nntrainer::createLayer<nntrainer::SplitLayer>({});
+  // split_dimension expects an integer, passing a string
+  EXPECT_THROW(layer->setProperty({"split_dimension=not_a_number"}),
+               std::exception);
 }

@@ -13,8 +13,8 @@
 
 #include <gtest/gtest.h>
 
-#include <slice_layer.h>
 #include <layers_common_tests.h>
+#include <slice_layer.h>
 
 auto semantic_slice = LayerSemanticsParamType(
   nntrainer::createLayer<nntrainer::SliceLayer>, nntrainer::SliceLayer::type,

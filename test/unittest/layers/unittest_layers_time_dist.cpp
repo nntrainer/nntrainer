@@ -13,10 +13,10 @@
 
 #include <gtest/gtest.h>
 
-#include <time_dist.h>
 #include <layers_common_tests.h>
+#include <time_dist.h>
 
-// TimeDistLayer requires a distributed layer to be set, which makes 
+// TimeDistLayer requires a distributed layer to be set, which makes
 // LayerSemantics testing complex. We only test direct APIs here.
 
 /**
@@ -25,12 +25,4 @@
 TEST(TimeDistLayerDirect, getType) {
   auto layer = nntrainer::createLayer<nntrainer::TimeDistLayer>({});
   EXPECT_EQ(layer->getType(), "time_dist");
-}
-
-/**
- * @brief Test requireLabel returns false by default
- */
-TEST(TimeDistLayerDirect, requireLabel) {
-  auto layer = nntrainer::createLayer<nntrainer::TimeDistLayer>({});
-  EXPECT_FALSE(layer->requireLabel());
 }

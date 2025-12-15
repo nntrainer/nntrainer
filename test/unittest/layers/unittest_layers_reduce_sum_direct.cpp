@@ -11,8 +11,8 @@
  */
 #include <gtest/gtest.h>
 
-#include <reduce_sum_layer.h>
 #include <layers_common_tests.h>
+#include <reduce_sum_layer.h>
 
 /**
  * @brief Direct test for ReduceSumLayer setProperty
@@ -50,4 +50,21 @@ TEST(ReduceSumLayerDirect, setProperty_various) {
 
   auto layer3 = nntrainer::createLayer<nntrainer::ReduceSumLayer>({});
   EXPECT_NO_THROW(layer3->setProperty({"axis=3"}));
+}
+
+/**
+ * @brief Test setProperty with invalid property name
+ */
+TEST(ReduceSumLayerDirect, setProperty_invalid_name) {
+  auto layer = nntrainer::createLayer<nntrainer::ReduceSumLayer>({});
+  EXPECT_THROW(layer->setProperty({"invalid_property=100"}), std::exception);
+}
+
+/**
+ * @brief Test setProperty with invalid value type
+ */
+TEST(ReduceSumLayerDirect, setProperty_invalid_type) {
+  auto layer = nntrainer::createLayer<nntrainer::ReduceSumLayer>({});
+  // axis expects an integer, passing a string
+  EXPECT_THROW(layer->setProperty({"axis=not_a_number"}), std::exception);
 }

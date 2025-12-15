@@ -421,18 +421,18 @@ TEST(Conv2DTransposeLayerDirect, supportBackwarding) {
  */
 TEST(Conv2DTransposeLayerDirect, setProperty_various) {
   auto layer = nntrainer::createLayer<nntrainer::Conv2DTransposeLayer>({});
-  
+
   // Test with dilation
-  EXPECT_NO_THROW(layer->setProperty(
-    {"filters=8", "kernel_size=5,5", "dilation=2,2"}));
-  
+  EXPECT_NO_THROW(
+    layer->setProperty({"filters=8", "kernel_size=5,5", "dilation=2,2"}));
+
   // Test with same padding
   auto layer2 = nntrainer::createLayer<nntrainer::Conv2DTransposeLayer>({});
-  EXPECT_NO_THROW(layer2->setProperty(
-    {"filters=4", "kernel_size=3,3", "padding=same"}));
-  
+  EXPECT_NO_THROW(
+    layer2->setProperty({"filters=4", "kernel_size=3,3", "padding=same"}));
+
   // Test with valid padding
   auto layer3 = nntrainer::createLayer<nntrainer::Conv2DTransposeLayer>({});
-  EXPECT_NO_THROW(layer3->setProperty(
-    {"filters=4", "kernel_size=3,3", "padding=valid"}));
+  EXPECT_NO_THROW(
+    layer3->setProperty({"filters=4", "kernel_size=3,3", "padding=valid"}));
 }

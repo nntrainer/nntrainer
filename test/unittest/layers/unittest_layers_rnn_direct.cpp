@@ -11,8 +11,8 @@
  */
 #include <gtest/gtest.h>
 
-#include <rnn.h>
 #include <layers_common_tests.h>
+#include <rnn.h>
 
 /**
  * @brief Direct test for RNNLayer setProperty
@@ -49,5 +49,23 @@ TEST(RNNLayerDirect, setProperty_various_units) {
   EXPECT_NO_THROW(layer2->setProperty({"unit=128", "return_sequences=true"}));
 
   auto layer3 = nntrainer::createLayer<nntrainer::RNNLayer>({});
-  EXPECT_NO_THROW(layer3->setProperty({"unit=256", "hidden_state_activation=tanh"}));
+  EXPECT_NO_THROW(
+    layer3->setProperty({"unit=256", "hidden_state_activation=tanh"}));
+}
+
+/**
+ * @brief Test setProperty with invalid property name
+ */
+TEST(RNNLayerDirect, setProperty_invalid_name) {
+  auto layer = nntrainer::createLayer<nntrainer::RNNLayer>({});
+  EXPECT_THROW(layer->setProperty({"invalid_property=100"}), std::exception);
+}
+
+/**
+ * @brief Test setProperty with invalid value type
+ */
+TEST(RNNLayerDirect, setProperty_invalid_type) {
+  auto layer = nntrainer::createLayer<nntrainer::RNNLayer>({});
+  // unit expects a positive integer, passing a string
+  EXPECT_THROW(layer->setProperty({"unit=not_a_number"}), std::exception);
 }

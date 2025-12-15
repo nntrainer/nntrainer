@@ -48,3 +48,20 @@ TEST(LayerNormalizationLayerDirect, setProperty_various) {
   auto layer2 = nntrainer::createLayer<nntrainer::LayerNormalizationLayer>({});
   EXPECT_NO_THROW(layer2->setProperty({"epsilon=1e-4"}));
 }
+
+/**
+ * @brief Test setProperty with invalid property name
+ */
+TEST(LayerNormalizationLayerDirect, setProperty_invalid_name) {
+  auto layer = nntrainer::createLayer<nntrainer::LayerNormalizationLayer>({});
+  EXPECT_THROW(layer->setProperty({"invalid_property=100"}), std::exception);
+}
+
+/**
+ * @brief Test setProperty with invalid value type
+ */
+TEST(LayerNormalizationLayerDirect, setProperty_invalid_type) {
+  auto layer = nntrainer::createLayer<nntrainer::LayerNormalizationLayer>({});
+  // epsilon expects a float, passing a string
+  EXPECT_THROW(layer->setProperty({"epsilon=not_a_number"}), std::exception);
+}

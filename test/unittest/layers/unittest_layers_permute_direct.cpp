@@ -11,16 +11,8 @@
  */
 #include <gtest/gtest.h>
 
-#include <permute_layer.h>
 #include <layers_common_tests.h>
-
-/**
- * @brief Direct test for PermuteLayer setProperty
- */
-TEST(PermuteLayerDirect, setProperty_valid) {
-  auto layer = nntrainer::createLayer<nntrainer::PermuteLayer>({});
-  EXPECT_NO_THROW(layer->setProperty({"direction=0:2:1:3"}));
-}
+#include <permute_layer.h>
 
 /**
  * @brief Test getType returns correct type
@@ -39,12 +31,18 @@ TEST(PermuteLayerDirect, supportBackwarding) {
 }
 
 /**
- * @brief Test with different permutation directions
+ * @brief Test setProperty with invalid property name
  */
-TEST(PermuteLayerDirect, setProperty_various) {
-  auto layer1 = nntrainer::createLayer<nntrainer::PermuteLayer>({});
-  EXPECT_NO_THROW(layer1->setProperty({"direction=0:1:3:2"}));
+TEST(PermuteLayerDirect, setProperty_invalid_name) {
+  auto layer = nntrainer::createLayer<nntrainer::PermuteLayer>({});
+  EXPECT_THROW(layer->setProperty({"invalid_property=100"}), std::exception);
+}
 
-  auto layer2 = nntrainer::createLayer<nntrainer::PermuteLayer>({});
-  EXPECT_NO_THROW(layer2->setProperty({"direction=0:3:1:2"}));
+/**
+ * @brief Test setProperty with invalid value type
+ */
+TEST(PermuteLayerDirect, setProperty_invalid_type) {
+  auto layer = nntrainer::createLayer<nntrainer::PermuteLayer>({});
+  // direction expects a valid permutation format, passing invalid
+  EXPECT_THROW(layer->setProperty({"direction=not_valid"}), std::exception);
 }

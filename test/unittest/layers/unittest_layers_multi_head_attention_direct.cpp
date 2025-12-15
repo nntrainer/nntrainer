@@ -11,8 +11,8 @@
  */
 #include <gtest/gtest.h>
 
-#include <multi_head_attention_layer.h>
 #include <layers_common_tests.h>
+#include <multi_head_attention_layer.h>
 
 /**
  * @brief Direct test for MultiHeadAttentionLayer setProperty
@@ -46,5 +46,23 @@ TEST(MultiHeadAttentionLayerDirect, setProperty_various) {
   EXPECT_NO_THROW(layer1->setProperty({"num_heads=8", "projected_key_dim=64"}));
 
   auto layer2 = nntrainer::createLayer<nntrainer::MultiHeadAttentionLayer>({});
-  EXPECT_NO_THROW(layer2->setProperty({"num_heads=16", "projected_key_dim=128"}));
+  EXPECT_NO_THROW(
+    layer2->setProperty({"num_heads=16", "projected_key_dim=128"}));
+}
+
+/**
+ * @brief Test setProperty with invalid property name
+ */
+TEST(MultiHeadAttentionLayerDirect, setProperty_invalid_name) {
+  auto layer = nntrainer::createLayer<nntrainer::MultiHeadAttentionLayer>({});
+  EXPECT_THROW(layer->setProperty({"invalid_property=100"}), std::exception);
+}
+
+/**
+ * @brief Test setProperty with invalid value type
+ */
+TEST(MultiHeadAttentionLayerDirect, setProperty_invalid_type) {
+  auto layer = nntrainer::createLayer<nntrainer::MultiHeadAttentionLayer>({});
+  // num_heads expects a positive integer, passing a string
+  EXPECT_THROW(layer->setProperty({"num_heads=not_a_number"}), std::exception);
 }

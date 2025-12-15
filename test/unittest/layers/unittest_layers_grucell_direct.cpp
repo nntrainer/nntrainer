@@ -48,3 +48,20 @@ TEST(GRUCellLayerDirect, setProperty_various) {
   auto layer2 = nntrainer::createLayer<nntrainer::GRUCellLayer>({});
   EXPECT_NO_THROW(layer2->setProperty({"unit=128"}));
 }
+
+/**
+ * @brief Test setProperty with invalid property name
+ */
+TEST(GRUCellLayerDirect, setProperty_invalid_name) {
+  auto layer = nntrainer::createLayer<nntrainer::GRUCellLayer>({});
+  EXPECT_THROW(layer->setProperty({"invalid_property=100"}), std::exception);
+}
+
+/**
+ * @brief Test setProperty with invalid value type
+ */
+TEST(GRUCellLayerDirect, setProperty_invalid_type) {
+  auto layer = nntrainer::createLayer<nntrainer::GRUCellLayer>({});
+  // unit expects a positive integer, passing a string
+  EXPECT_THROW(layer->setProperty({"unit=not_a_number"}), std::exception);
+}

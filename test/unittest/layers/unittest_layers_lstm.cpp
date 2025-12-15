@@ -71,14 +71,14 @@ GTEST_PARAMETER_TEST(LSTM, LayerGoldenTest,
 auto lstm_single_step_w16a16 = LayerGoldenTestParamType(
   nntrainer::createLayer<nntrainer::LSTMLayer>,
   {"unit=5", "integrate_bias=true"}, "3:1:1:7",
-  "lstm_single_step_w16a16.nnlayergolden",
-  LayerGoldenTestParamOptions::DEFAULT, "nchw", "fp16", "fp16");
+  "lstm_single_step_w16a16.nnlayergolden", LayerGoldenTestParamOptions::DEFAULT,
+  "nchw", "fp16", "fp16");
 
 auto lstm_multi_step_w16a16 = LayerGoldenTestParamType(
   nntrainer::createLayer<nntrainer::LSTMLayer>,
   {"unit=5", "integrate_bias=true"}, "3:1:4:7",
-  "lstm_multi_step_w16a16.nnlayergolden",
-  LayerGoldenTestParamOptions::DEFAULT, "nchw", "fp16", "fp16");
+  "lstm_multi_step_w16a16.nnlayergolden", LayerGoldenTestParamOptions::DEFAULT,
+  "nchw", "fp16", "fp16");
 
 auto lstm_single_step_seq_w16a16 = LayerGoldenTestParamType(
   nntrainer::createLayer<nntrainer::LSTMLayer>,

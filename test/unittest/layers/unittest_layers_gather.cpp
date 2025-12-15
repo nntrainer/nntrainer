@@ -18,8 +18,8 @@
 
 auto semantic_gather = LayerSemanticsParamType(
   nntrainer::createLayer<nntrainer::GatherLayer>, nntrainer::GatherLayer::type,
-  {"axis=1"},
-  LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false, 2);
+  {"axis=1"}, LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false,
+  2);
 
 GTEST_PARAMETER_TEST(Gather, LayerSemantics,
                      ::testing::Values(semantic_gather));

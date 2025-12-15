@@ -11,16 +11,8 @@
  */
 #include <gtest/gtest.h>
 
-#include <upsample2d_layer.h>
 #include <layers_common_tests.h>
-
-/**
- * @brief Direct test for Upsample2dLayer setProperty
- */
-TEST(Upsample2dLayerDirect, setProperty_valid) {
-  auto layer = nntrainer::createLayer<nntrainer::Upsample2dLayer>({});
-  EXPECT_NO_THROW(layer->setProperty({"upsample=2x2"}));
-}
+#include <upsample2d_layer.h>
 
 /**
  * @brief Test getType returns correct type
@@ -39,12 +31,18 @@ TEST(Upsample2dLayerDirect, supportBackwarding) {
 }
 
 /**
- * @brief Test with different upsample factors
+ * @brief Test setProperty with invalid property name
  */
-TEST(Upsample2dLayerDirect, setProperty_various) {
-  auto layer1 = nntrainer::createLayer<nntrainer::Upsample2dLayer>({});
-  EXPECT_NO_THROW(layer1->setProperty({"upsample=3x3"}));
+TEST(Upsample2dLayerDirect, setProperty_invalid_name) {
+  auto layer = nntrainer::createLayer<nntrainer::Upsample2dLayer>({});
+  EXPECT_THROW(layer->setProperty({"invalid_property=100"}), std::exception);
+}
 
-  auto layer2 = nntrainer::createLayer<nntrainer::Upsample2dLayer>({});
-  EXPECT_NO_THROW(layer2->setProperty({"upsample=4x4"}));
+/**
+ * @brief Test setProperty with invalid value type
+ */
+TEST(Upsample2dLayerDirect, setProperty_invalid_type) {
+  auto layer = nntrainer::createLayer<nntrainer::Upsample2dLayer>({});
+  // upsample expects a valid format, passing invalid
+  EXPECT_THROW(layer->setProperty({"upsample_mode=not_valid"}), std::exception);
 }

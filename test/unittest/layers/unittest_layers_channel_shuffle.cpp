@@ -19,7 +19,6 @@
 // Note: ChannelShuffle LayerSemantics tests are skipped because they require
 // channels > split_number, but the default input has only 1 channel.
 
-
 /**
  * @brief Direct test for ChannelShuffle setProperty
  */

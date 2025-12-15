@@ -11,8 +11,8 @@
  */
 #include <gtest/gtest.h>
 
-#include <zoneout_lstmcell.h>
 #include <layers_common_tests.h>
+#include <zoneout_lstmcell.h>
 
 /**
  * @brief Direct test for ZoneoutLSTMCellLayer setProperty
@@ -46,5 +46,23 @@ TEST(ZoneoutLSTMCellLayerDirect, setProperty_various) {
   EXPECT_NO_THROW(layer1->setProperty({"unit=64"}));
 
   auto layer2 = nntrainer::createLayer<nntrainer::ZoneoutLSTMCellLayer>({});
-  EXPECT_NO_THROW(layer2->setProperty({"unit=128", "hidden_state_zoneout_rate=0.1"}));
+  EXPECT_NO_THROW(
+    layer2->setProperty({"unit=128", "hidden_state_zoneout_rate=0.1"}));
+}
+
+/**
+ * @brief Test setProperty with invalid property name
+ */
+TEST(ZoneoutLSTMCellLayerDirect, setProperty_invalid_name) {
+  auto layer = nntrainer::createLayer<nntrainer::ZoneoutLSTMCellLayer>({});
+  EXPECT_THROW(layer->setProperty({"invalid_property=100"}), std::exception);
+}
+
+/**
+ * @brief Test setProperty with invalid value type
+ */
+TEST(ZoneoutLSTMCellLayerDirect, setProperty_invalid_type) {
+  auto layer = nntrainer::createLayer<nntrainer::ZoneoutLSTMCellLayer>({});
+  // unit expects a positive integer, passing a string
+  EXPECT_THROW(layer->setProperty({"unit=not_a_number"}), std::exception);
 }

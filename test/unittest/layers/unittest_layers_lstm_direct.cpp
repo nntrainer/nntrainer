@@ -11,8 +11,8 @@
  */
 #include <gtest/gtest.h>
 
-#include <lstm.h>
 #include <layers_common_tests.h>
+#include <lstm.h>
 
 /**
  * @brief Direct test for LSTMLayer setProperty
@@ -49,5 +49,23 @@ TEST(LSTMLayerDirect, setProperty_various) {
   EXPECT_NO_THROW(layer2->setProperty({"unit=128", "return_sequences=true"}));
 
   auto layer3 = nntrainer::createLayer<nntrainer::LSTMLayer>({});
-  EXPECT_NO_THROW(layer3->setProperty({"unit=256", "hidden_state_activation=tanh"}));
+  EXPECT_NO_THROW(
+    layer3->setProperty({"unit=256", "hidden_state_activation=tanh"}));
+}
+
+/**
+ * @brief Test setProperty with invalid property name
+ */
+TEST(LSTMLayerDirect, setProperty_invalid_name) {
+  auto layer = nntrainer::createLayer<nntrainer::LSTMLayer>({});
+  EXPECT_THROW(layer->setProperty({"invalid_property=100"}), std::exception);
+}
+
+/**
+ * @brief Test setProperty with invalid value type
+ */
+TEST(LSTMLayerDirect, setProperty_invalid_type) {
+  auto layer = nntrainer::createLayer<nntrainer::LSTMLayer>({});
+  // unit expects a positive integer, passing a string
+  EXPECT_THROW(layer->setProperty({"unit=not_a_number"}), std::exception);
 }
