@@ -9,8 +9,6 @@
  * @author Donghak Park <donghak.park@samsung.com>
  * @bug No known bugs except for NYI items
  */
-#include <tuple>
-
 #include <gtest/gtest.h>
 
 #include <permute_layer.h>
