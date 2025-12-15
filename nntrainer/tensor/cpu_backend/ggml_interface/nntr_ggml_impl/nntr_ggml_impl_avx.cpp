@@ -3676,7 +3676,7 @@ void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
                              rhs_vec_4567_3, 170),
           _mm256_shuffle_epi32(lhs_vec_1, 255));
 
-        // Accumulated values multipled with appropriate scales
+        // Accumulated values multiplied with appropriate scales
         acc_row =
           _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc),
                           _mm256_mul_ps(col_scale_f32, row_scale_f32), acc_row);

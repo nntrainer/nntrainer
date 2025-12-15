@@ -39,9 +39,17 @@ if [[ -n "$arm_arch" ]]; then
     json_file="${TARGET}/tools/cross/android_${arch_filename}.json"
     if [[ -f "$json_file" ]]; then
         echo "Using ARM architecture config from: $json_file"
-        # Read values from JSON using Python (portable, no jq dependency)
-        enable_fp16=$(python3 -c "import json; print(json.load(open('$json_file'))['enable_fp16'])")
-        arm_march=$(python3 -c "import json; print(json.load(open('$json_file'))['arm_march'])")
+        # Read values from JSON using Python (single invocation, portable, no jq dependency)
+        eval "$(python3 -c "
+import json, sys
+try:
+    data = json.load(open('$json_file'))
+    print(f'enable_fp16={data.get(\"enable_fp16\", \"True\")}')
+    print(f'arm_march=\"{data.get(\"arm_march\", \"\")}\"')
+except Exception as e:
+    print(f'echo \"Error reading JSON: {e}\" >&2', file=sys.stderr)
+    sys.exit(1)
+")"
         # Add arm-arch and arm-march to meson args
         filtered_args+=("-Darm-arch=${arm_arch}")
         filtered_args+=("-Darm-march=-march=${arm_march}")
