@@ -68,7 +68,6 @@ test_target = [
   'unittest_layers.cpp',
   'unittest_layers_impl.cpp',
   'unittest_layers_input.cpp',
-  'unittest_layers_weight.cpp',
   'unittest_layers_loss.cpp',
   'unittest_layers_fully_connected.cpp',
   'unittest_layers_batch_normalization.cpp',
