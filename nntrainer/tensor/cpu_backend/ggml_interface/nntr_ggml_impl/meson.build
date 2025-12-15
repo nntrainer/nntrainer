@@ -14,7 +14,7 @@ ggml_impl_interface_sources = [
 arch = host_machine.cpu_family()
 arm_arch_opt = get_option('arm-arch')
 
-if arch == 'arm' or arch == 'aarch64' or get_option('platform') == 'android'
+if arch == 'aarch64' or get_option('platform') == 'android'
   if arm_arch_opt == 'armv9.2-a'
     # SVE/SVE2 implementation for armv9.2-a
     ggml_impl_interface_sources += 'nntr_ggml_impl_sve.cpp'
@@ -25,6 +25,8 @@ if arch == 'arm' or arch == 'aarch64' or get_option('platform') == 'android'
 elif arch == 'x86_64' or arch == 'x86'
   # AVX/AVX2/AVX512 implementation for x86_64
   ggml_impl_interface_sources += 'nntr_ggml_impl_avx.cpp'
+elif arch == 'arm'
+  ggml_impl_interface_sources += 'nntr_ggml_impl_fallback.cpp'
 else
   # Fallback for other architectures
   ggml_impl_interface_sources += 'nntr_ggml_impl_fallback.cpp'
