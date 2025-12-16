@@ -128,6 +128,7 @@ subdir('compiler')
 subdir('layers')
 subdir('datasets')
 subdir('models')
+subdir('gradient_checkpointing')
 if get_option('enable-tflite-interpreter')
   subdir('integration_tests')
 endif

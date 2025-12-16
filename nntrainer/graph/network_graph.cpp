@@ -439,6 +439,18 @@ sharedConstTensors NetworkGraph::forwarding(
 
     if (ln->isCheckpointed()) {
       ln->getRunContext().setInitialForward(true);
+#ifdef ENABLE_TEST
+      if (gc_verify) {
+        std::vector<Tensor> forward_inputs;
+        std::vector<Tensor> forward_weights;
+        for (int i = 0; i < ln->getNumInputs(); i++)
+          forward_inputs.push_back(ln->getInput(i));
+        for (int i = 0; i < ln->getNumWeights(); i++)
+          forward_weights.push_back(ln->getWeight(i));
+        gc_verifier.saveForwardInputs(ln, forward_inputs);
+        gc_verifier.saveForwardWeights(ln, forward_weights);
+      }
+#endif
     }
 
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
@@ -446,6 +458,18 @@ sharedConstTensors NetworkGraph::forwarding(
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
 
     if (ln->isCheckpointed()) {
+#ifdef ENABLE_TEST
+      if (gc_verify) {
+        std::vector<Tensor> forward_outputs;
+        std::vector<Tensor> forward_tensors;
+        for (int i = 0; i < ln->getNumOutputs(); i++)
+          forward_outputs.push_back(ln->getOutput(i));
+        for (int i = 0; i < ln->getRunContext().getNumTensors(); i++)
+          forward_tensors.push_back(ln->getRunContext().getTensor(i));
+        gc_verifier.saveForwardOutputs(ln, forward_outputs);
+        gc_verifier.saveForwardTensors(ln, forward_tensors);
+      }
+#endif
       ln->getRunContext().setInitialForward(false);
     }
   }
@@ -2202,7 +2226,31 @@ void NetworkGraph::recomputeCheckpointBlock(const std::string &block_id) {
 
   for (size_t i = 0; i < layers_to_recompute.size(); ++i) {
     auto &layer = layers_to_recompute[i];
+#ifdef ENABLE_TEST
+    if (gc_verify) {
+      std::vector<Tensor> recompute_inputs;
+      std::vector<Tensor> recompute_weights;
+      for (int i = 0; i < layer->getNumInputs(); i++)
+        recompute_inputs.push_back(layer->getInput(i));
+      for (int i = 0; i < layer->getNumWeights(); i++)
+        recompute_weights.push_back(layer->getWeight(i));
+      gc_verifier.verifyRecomputeInputs(layer, recompute_inputs);
+      gc_verifier.verifyRecomputeWeights(layer, recompute_weights);
+    }
+#endif
     layer->forwarding(true);
+#ifdef ENABLE_TEST
+      if (gc_verify) {
+        std::vector<Tensor> recompute_outputs;
+        std::vector<Tensor> recompute_tensors;
+        for (int i = 0; i < layer->getNumOutputs(); i++)
+          recompute_outputs.push_back(layer->getOutput(i));
+        for (int i = 0; i < layer->getRunContext().getNumTensors(); i++)
+          recompute_tensors.push_back(layer->getRunContext().getTensor(i));
+        gc_verifier.verifyRecomputeOutputs(layer, recompute_outputs);
+        gc_verifier.verifyRecomputeTensors(layer, recompute_tensors);
+      }
+#endif
   }
 }
 } /* namespace nntrainer */

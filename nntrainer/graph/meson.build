@@ -21,3 +21,10 @@ endforeach
 foreach h : graph_headers
   nntrainer_headers += meson.current_source_dir() / h
 endforeach
+
+if get_option('enable-test')
+  gradient_checkpointing_test_dir = '..' / '..' / 'test' / 'unittest' / 'gradient_checkpointing'
+  nntrainer_inc += include_directories(gradient_checkpointing_test_dir)
+  nntrainer_sources += files(join_paths(gradient_checkpointing_test_dir,
+                                        'gradient_checkpointing_test_util.cpp'))
+endif
