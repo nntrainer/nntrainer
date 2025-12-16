@@ -22,18 +22,21 @@ Same configuration; switch only the optimizer:
 cd build/Applications/Optimizers/jni
 
 # Lion (Default, varied Weight Decay)
-./nntrainer_optimizers --dataset=random --opt=lion  --wd=0     --bs=16 --db=32 --epochs=5 --lr=0.001
-./nntrainer_optimizers --dataset=random --opt=lion  --wd=0.01  --bs=16 --db=32 --epochs=5 --lr=0.001
+./nntrainer_optimizers --dataset=random --opt=lion   --wd=0     --bs=16 --db=32 --epochs=5 --lr=0.001
+./nntrainer_optimizers --dataset=random --opt=lion   --wd=0.01  --bs=16 --db=32 --epochs=5 --lr=0.001
+
+# Sophia (Second-order, with weight decay)
+./nntrainer_optimizers --dataset=random --opt=sophia --wd=0.01  --bs=16 --db=32 --epochs=5 --lr=0.001
 
 # Adam
-./nntrainer_optimizers --dataset=random --opt=adam             --bs=16 --db=32 --epochs=5 --lr=0.001
+./nntrainer_optimizers --dataset=random --opt=adam              --bs=16 --db=32 --epochs=5 --lr=0.001
 
 # AdamW
-./nntrainer_optimizers --dataset=random --opt=adamw            --bs=16 --db=32 --epochs=5 --lr=0.001
+./nntrainer_optimizers --dataset=random --opt=adamw             --bs=16 --db=32 --epochs=5 --lr=0.001
 
 # SGD (Varied Learning Rate)
-./nntrainer_optimizers --dataset=random --opt=sgd              --bs=16 --db=32 --epochs=5 --lr=0.001
-./nntrainer_optimizers --dataset=random --opt=sgd              --bs=16 --db=32 --epochs=5 --lr=0.0005
+./nntrainer_optimizers --dataset=random --opt=sgd               --bs=16 --db=32 --epochs=5 --lr=0.001
+./nntrainer_optimizers --dataset=random --opt=sgd               --bs=16 --db=32 --epochs=5 --lr=0.0005
 ```
 
 **With MNIST Data**
@@ -43,10 +46,11 @@ Compare optimizers with the same settings (requires MNIST resources):
 ```bash
 cd build/Applications/Optimizers/jni
 
-./nntrainer_optimizers --dataset=mnist --opt=lion  --lr=0.001 --wd=0.01 --epochs=100 --bs=32
-./nntrainer_optimizers --dataset=mnist --opt=adam  --lr=0.001              --epochs=100 --bs=32
-./nntrainer_optimizers --dataset=mnist --opt=adamw --lr=0.001 --wd=0.01     --epochs=100 --bs=32
-./nntrainer_optimizers --dataset=mnist --opt=sgd   --lr=0.001              --epochs=100 --bs=32
+./nntrainer_optimizers --dataset=mnist --opt=lion   --lr=0.001 --wd=0.01 --epochs=100 --bs=32
+./nntrainer_optimizers --dataset=mnist --opt=sophia --lr=0.001 --wd=0.01 --epochs=100 --bs=32
+./nntrainer_optimizers --dataset=mnist --opt=adam   --lr=0.001              --epochs=100 --bs=32
+./nntrainer_optimizers --dataset=mnist --opt=adamw  --lr=0.001 --wd=0.01 --epochs=100 --bs=32
+./nntrainer_optimizers --dataset=mnist --opt=sgd    --lr=0.001              --epochs=100 --bs=32
 ```
 
 Run from an arbitrary directory with explicit resource paths:
@@ -63,8 +67,8 @@ Run from an arbitrary directory with explicit resource paths:
 
 **General**
 - `--dataset=random|mnist` : dataset type (default: random)
-- `--opt=lion|adam|adamw|sgd` : optimizer (default: lion)
-- `--wd=<float>` : weight decay (used by Lion/AdamW)
+- `--opt=lion|sophia|adam|adamw|sgd` : optimizer (default: lion)
+- `--wd=<float>` : weight decay (used by Lion/Sophia/AdamW)
 - `--epochs=<int>` : number of epochs
 - `--bs=<int>` : batch size
 - `--lr=<float>` : learning rate

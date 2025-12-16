@@ -158,6 +158,7 @@ TEST(ccapi_optimizer, construct_02_p) {
   EXPECT_NO_THROW(ml::train::optimizer::SGD());
   EXPECT_NO_THROW(ml::train::optimizer::AdamW());
   EXPECT_NO_THROW(ml::train::optimizer::Lion());
+  EXPECT_NO_THROW(ml::train::optimizer::Sophia());
 }
 
 /**

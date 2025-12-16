@@ -32,13 +32,13 @@
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Application Dataset Type
+ * @brief Application Dataset Type Enumeration
  *
  */
 enum class AppDataset { RANDOM, MNIST };
 
 /**
- * @brief Application Configuration
+ * @brief Application Configuration Structure
  *
  */
 struct AppConfig {
@@ -73,7 +73,7 @@ constexpr unsigned int MNIST_LABEL_SIZE = 10;
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Weight Statistics
+ * @brief Weight Statistics Structure
  *
  */
 struct WeightStats {
@@ -188,7 +188,7 @@ int random_dataset_cb(float **input, float **label, bool *last,
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Mnist Data Info for callback
+ * @brief MNIST Data Info structure for callback
  *
  */
 class MnistDataInfo {
@@ -333,7 +333,7 @@ static void parse_args(int argc, char *argv[]) {
       std::cout << "Usage: nntrainer_optimizers [options]\n\n"
                 << "General Options:\n"
                 << "  --dataset=random|mnist       (default: random)\n"
-                << "  --opt=lion|adam|adamw|sgd (default: lion)\n"
+                << "  --opt=lion|sophia|adam|adamw|sgd (default: lion)\n"
                 << "  --lr=<float>              Learning rate\n"
                 << "  --wd=<float>              Weight decay\n"
                 << "  --bs=<int>                Batch size\n"
@@ -401,7 +401,7 @@ int main(int argc, char *argv[]) {
     std::vector<std::string> opt_props = {"learning_rate=" +
                                           std::to_string(g_conf.learning_rate)};
     if (g_conf.weight_decay > 0.0f) {
-      // Typically used by Lion, AdamW
+      // Typically used by Lion, Sophia, AdamW
       opt_props.emplace_back("weight_decay=" +
                              std::to_string(g_conf.weight_decay));
     }
@@ -423,8 +423,9 @@ int main(int argc, char *argv[]) {
 
     std::cout << "["
               << (g_conf.dataset == AppDataset::RANDOM ? "RANDOM" : "MNIST")
-              << "] " << "Start Training. " << "opt=" << g_conf.optimizer_type
-              << " " << "lr=" << g_conf.learning_rate << " "
+              << "] Start Training. "
+              << "opt=" << g_conf.optimizer_type << " "
+              << "lr=" << g_conf.learning_rate << " "
               << "wd=" << g_conf.weight_decay << " "
               << "bs=" << g_conf.batch_size << " "
               << "w_l2_before=" << ws_before.l2 << std::endl;
@@ -438,9 +439,10 @@ int main(int argc, char *argv[]) {
 
     std::cout << "["
               << (g_conf.dataset == AppDataset::RANDOM ? "RANDOM" : "MNIST")
-              << "] " << "Finished. " << "w_l2_after=" << ws_after.l2 << " "
-              << "delta_l2=" << delta.l2 << " " << "elems=" << delta.num_elems
-              << std::endl;
+              << "] Finished. "
+              << "w_l2_after=" << ws_after.l2 << " "
+              << "delta_l2=" << delta.l2 << " "
+              << "elems=" << delta.num_elems << std::endl;
 
   } catch (const std::exception &e) {
     std::cerr << "Uncaught Exception: " << e.what() << std::endl;

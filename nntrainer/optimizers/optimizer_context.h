@@ -35,7 +35,7 @@ public:
    *
    */
   RunOptimizerContext(Weight *w = nullptr, size_t iter = 0, double lr = 0.0) :
-    weight(w), iteration(iter), learning_rate(lr) {}
+    weight(w), iteration(iter), learning_rate(lr), batch_size(1u) {}
 
   /**
    * @brief Get the Weight tensor object
@@ -115,10 +115,27 @@ public:
    */
   void applyLossScale(Tensor &fp32_grad);
 
+  /**
+   * @brief   Get the current batch size
+   *
+   * @return batch size
+   */
+  unsigned int getBatchSize() const { return batch_size; }
+
+  /**
+   * @brief   Set the current batch size
+   *
+   * @param batch The batch size
+   */
+  void setBatchSize(unsigned int batch) {
+    batch_size = batch == 0u ? 1u : batch;
+  }
+
 private:
-  Weight *weight;       /**< weights for the optimizer */
-  size_t iteration;     /**< iteration number */
-  double learning_rate; /**< learning rate */
+  Weight *weight;          /**< weights for the optimizer */
+  size_t iteration;        /**< iteration number */
+  double learning_rate;    /**< learning rate */
+  unsigned int batch_size; /**< batch size */
 };
 
 } // namespace nntrainer

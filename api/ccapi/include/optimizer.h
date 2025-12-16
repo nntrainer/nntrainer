@@ -36,6 +36,7 @@ enum OptimizerType {
   ADAM = ML_TRAIN_OPTIMIZER_TYPE_ADAM,      /** adam */
   ADAMW = ML_TRAIN_OPTIMIZER_TYPE_ADAMW,    /** AdamW */
   LION = ML_TRAIN_OPTIMIZER_TYPE_LION,      /** Lion */
+  SOPHIA = ML_TRAIN_OPTIMIZER_TYPE_SOPHIA,  /** Sophia */
   SGD = ML_TRAIN_OPTIMIZER_TYPE_SGD,        /** sgd */
   UNKNOWN = ML_TRAIN_OPTIMIZER_TYPE_UNKNOWN /** unknown */
 };
@@ -151,6 +152,14 @@ AdamW(const std::vector<std::string> &properties = {}) {
 inline std::unique_ptr<Optimizer>
 Lion(const std::vector<std::string> &properties = {}) {
   return createOptimizer(OptimizerType::LION, properties);
+}
+
+/**
+ * @brief Helper function to create Sophia Optimizer
+ */
+inline std::unique_ptr<Optimizer>
+Sophia(const std::vector<std::string> &properties = {}) {
+  return createOptimizer(OptimizerType::SOPHIA, properties);
 }
 
 } // namespace optimizer
