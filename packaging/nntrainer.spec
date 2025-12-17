@@ -698,6 +698,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/graph_node.h
 %{_includedir}/nntrainer/model_common_properties.h
 %{_includedir}/nntrainer/network_graph.h
+%{_includedir}/nntrainer/checkpoint_block.h
 %{_includedir}/nntrainer/graph_core.h
 %{_includedir}/nntrainer/manager.h
 %{_includedir}/nntrainer/basic_planner.h
