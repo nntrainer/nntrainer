@@ -1,0 +1,2586 @@
+From e3c7dc7997f23618cecbc78fb06b8fe8f9127083 Mon Sep 17 00:00:00 2001
+From: SeungBaek Hong <sb92.hong@samsung.com>
+Date: Fri, 12 Dec 2025 16:25:36 +0900
+Subject: [PATCH 1/5] [onnx] fix issue of weight layer
+
+The input layer was identified during compilation based on the number of
+input connections(or property). Howerver, weight layer also has no input
+connection, so it causes some issues. this commit resolved these issues.
+
+Signed-off-by: SeungBaek Hong <sb92.hong@samsung.com>
+---
+ nntrainer/compiler/onnx_interpreter.cpp       |  2 +-
+ nntrainer/graph/network_graph.cpp             | 12 +++----
+ nntrainer/layers/layer_node.cpp               | 34 ++++++++++++++++--
+ nntrainer/layers/layer_node.h                 | 20 +++++++----
+ .../layers/layers_dependent_common_tests.cpp  | 36 ++++++++++++++-----
+ 5 files changed, 81 insertions(+), 23 deletions(-)
+
+diff --git a/nntrainer/compiler/onnx_interpreter.cpp b/nntrainer/compiler/onnx_interpreter.cpp
+index 1f55812172..2e87e179a8 100644
+--- a/nntrainer/compiler/onnx_interpreter.cpp
++++ b/nntrainer/compiler/onnx_interpreter.cpp
+@@ -252,7 +252,7 @@ void ONNXInterpreter::loadInputsAndWeights(
+     representation.push_back(createLayerNode(
+       "weight",
+       {withKey("name", cleanName(initializer.name())), withKey("dim", dim),
+-       withKey("input_shape", dim),
++       withKey("weight_dim", dim),
+        withKey("tensor_dtype", getDataTypeFromONNX(initializer.data_type())),
+        withKey("weight_name", cleanName(initializer.name()))}));
+   }
+diff --git a/nntrainer/graph/network_graph.cpp b/nntrainer/graph/network_graph.cpp
+index 23b7dd31f8..34f12e3306 100644
+--- a/nntrainer/graph/network_graph.cpp
++++ b/nntrainer/graph/network_graph.cpp
+@@ -226,8 +226,8 @@ int NetworkGraph::checkCompiledGraph() {
+   for (auto iter = cbegin(); iter != cend(); iter++) {
+     auto lnode = (*iter);
+     if (lnode->getNumInputConnections() == 0) {
+-      if (!lnode->hasInputShapeProperty()) {
+-        ml_loge("Layer with no inbound connection need input_shape property");
++      if (!lnode->isWeightNode() && !lnode->hasInputShapeProperty()) {
++        ml_loge("Input layer need input_shape property");
+         return ML_ERROR_INVALID_PARAMETER;
+       }
+     }
+@@ -1191,7 +1191,7 @@ int NetworkGraph::initialize(ExecutionMode mode,
+ 
+   /** check if the given config of node is of input node */
+   auto is_input_node = [](const LayerNode *node) -> bool {
+-    return node->getInputConnections().empty();
++    return node->getInputConnections().empty() && !node->isWeightNode();
+   };
+ 
+   for (unsigned int idx = 0; idx < graph.size(); ++idx) {
+@@ -1207,7 +1207,7 @@ int NetworkGraph::initialize(ExecutionMode mode,
+      * Set input dimension for all the layers.
+      * For input layer, as input dimension is known, set input tensor.
+      */
+-    if (!is_input_node(lnode.get())) {
++    if (lnode->getNumInputConnections() > 0) {
+       if (input_map.find(lnode->getName()) == input_map.end())
+         throw std::runtime_error("Cannot find input buffers for the node");
+       inputs = input_map.at(lnode->getName());
+@@ -1403,7 +1403,7 @@ int NetworkGraph::reinitialize(
+ 
+   /** check if the given config of node is of input node */
+   auto is_input_node = [](const LayerNode *node) -> bool {
+-    return node->getInputConnections().empty();
++    return node->getInputConnections().empty() && !node->isWeightNode();
+   };
+ 
+   for (unsigned int idx = 0; idx < graph.size(); ++idx) {
+@@ -1420,7 +1420,7 @@ int NetworkGraph::reinitialize(
+      * Set input dimension for all the layers.
+      * For input layer, as input dimension is known, set input tensor.
+      */
+-    if (!is_input_node(lnode.get())) {
++    if (lnode->getNumInputConnections() > 0) {
+       if (input_map.find(lnode->getName()) == input_map.end())
+         throw std::runtime_error("Cannot find input buffers for the node");
+       inputs = input_map.at(lnode->getName());
+diff --git a/nntrainer/layers/layer_node.cpp b/nntrainer/layers/layer_node.cpp
+index 8d2663b9d9..f60b45c217 100644
+--- a/nntrainer/layers/layer_node.cpp
++++ b/nntrainer/layers/layer_node.cpp
+@@ -113,6 +113,17 @@ class InputShape : public GenericShape {
+   using prop_tag = dimension_prop_tag;              /**< property type */
+ };
+ 
++/**
++ * @brief Weight Dimension property which saves a single tensor dim
++ *
++ */
++class WeightDim : public GenericShape {
++
++public:
++  static constexpr const char *key = "weight_dim"; /**< unique key to access */
++  using prop_tag = dimension_prop_tag;             /**< property type */
++};
++
+ /**
+  * @brief properties for shared from
+  *
+@@ -201,8 +212,9 @@ LayerNode::LayerNode(std::unique_ptr<nntrainer::Layer> &&l) :
+   run_context(nullptr),
+   layer_node_props(new PropsType(
+     props::Name(), props::Distribute(), props::Trainable(), {}, {},
+-    props::SharedFrom(), props::ClipGradByGlobalNorm(), props::Packed(),
+-    props::WeightDtype(), props::LossScaleForMixed(), props::ComputeEngine())),
++    props::WeightDim(), props::SharedFrom(), props::ClipGradByGlobalNorm(),
++    props::Packed(), props::WeightDtype(), props::LossScaleForMixed(),
++    props::ComputeEngine())),
+   layer_node_props_realization(
+     new RealizationPropsType(props::Flatten(), props::Activation())),
+   loss(new props::Loss()),
+@@ -462,6 +474,10 @@ bool LayerNode::hasInputShapeProperty() const {
+                      [](const auto &input) { return !input.empty(); });
+ }
+ 
++bool LayerNode::isWeightNode() const {
++  return layer->getType() == "weight" ? true : false;
++}
++
+ const std::vector<TensorDim> LayerNode::getInputDimensions() const {
+   NNTR_THROW_IF(!run_context, std::runtime_error)
+     << __func__ << " layer needs to be finalized first!";
+@@ -578,6 +594,17 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
+             from_string(tensor_type[0]));
+       }
+     }
++  } else if (isWeightNode()) {
++    actual_input_dims =
++      std::vector<TensorDim>({std::get<props::WeightDim>(*layer_node_props)});
++    for (auto &d : actual_input_dims) {
++      d.setDataType(
++        str_converter<enum_class_prop_tag, nntrainer::TensorDataTypeInfo>::
++          from_string(tensor_type[2]));
++      d.setFormat(
++        str_converter<enum_class_prop_tag, nntrainer::TensorFormatInfo>::
++          from_string(tensor_type[0]));
++    }
+   } else {
+     NNTR_THROW_IF(!hasInputShapeProperty(), std::invalid_argument)
+       << "if input dims not given, input shapes must be given by the user as "
+@@ -701,6 +728,9 @@ LayerNode::refinalize(const std::vector<TensorDim> &input_dims) {
+         << "calculated input dimension is different from given input_shape "
+            "property";
+     }
++  } else if (isWeightNode()) {
++    actual_input_dims =
++      std::vector<TensorDim>({std::get<props::WeightDim>(*layer_node_props)});
+   } else {
+     NNTR_THROW_IF(!hasInputShapeProperty(), std::invalid_argument)
+       << "if input dims not given, input shapes must be given by the user as "
+diff --git a/nntrainer/layers/layer_node.h b/nntrainer/layers/layer_node.h
+index 83e6e9be30..5f96ff9eb6 100644
+--- a/nntrainer/layers/layer_node.h
++++ b/nntrainer/layers/layer_node.h
+@@ -48,6 +48,7 @@ class Distribute;
+ class Flatten;
+ class Loss;
+ class InputShape;
++class WeightDim;
+ class Activation;
+ class SharedFrom;
+ class InputConnection;
+@@ -520,6 +521,13 @@ class LayerNode final : public ml::train::Layer, public GraphNode {
+    */
+   bool hasInputShapeProperty() const;
+ 
++  /**
++   * @brief check whether the layer is weight layer
++   *
++   * @return bool true if weight layer, else false
++   */
++  bool isWeightNode() const;
++
+   /**
+    * @brief Get the input dimension
+    * @return TensorDim dimension of the input
+@@ -1043,12 +1051,12 @@ will also contain the properties of the layer. The properties will be copied
+ upon final creation. Editing properties of the layer after init will not the
+ properties in the context/graph unless intended. */
+ 
+-  using PropsType =
+-    std::tuple<props::Name, props::Distribute, props::Trainable,
+-               std::vector<props::InputConnection>,
+-               std::vector<props::InputShape>, props::SharedFrom,
+-               props::ClipGradByGlobalNorm, props::Packed, props::WeightDtype,
+-               props::LossScaleForMixed, props::ComputeEngine>;
++  using PropsType = std::tuple<props::Name, props::Distribute, props::Trainable,
++                               std::vector<props::InputConnection>,
++                               std::vector<props::InputShape>, props::WeightDim,
++                               props::SharedFrom, props::ClipGradByGlobalNorm,
++                               props::Packed, props::WeightDtype,
++                               props::LossScaleForMixed, props::ComputeEngine>;
+ 
+   using RealizationPropsType = std::tuple<props::Flatten, props::Activation>;
+   /** these realization properties results in addition of new layers, hence
+diff --git a/test/unittest/layers/layers_dependent_common_tests.cpp b/test/unittest/layers/layers_dependent_common_tests.cpp
+index f0819a3f82..fb77059eff 100644
+--- a/test/unittest/layers/layers_dependent_common_tests.cpp
++++ b/test/unittest/layers/layers_dependent_common_tests.cpp
+@@ -57,10 +57,15 @@ TEST_P(LayerSemantics, finalizeValidateLayerNode_p) {
+   auto lnode = nntrainer::createLayerNode(expected_type);
+   std::vector<std::string> props = {"name=test"};
+   std::string input_shape = "input_shape=1:1:1";
++  if (expected_type == "weight") {
++    input_shape = "weight_dim=1:1:1";
++  }
+   std::string input_layers = "input_layers=a";
+   for (auto idx = 1u; idx < num_inputs; idx++) {
+-    input_shape += ",1:1:1";
+-    input_layers += ",a";
++    if (expected_type != "weight") {
++      input_shape += ",1:1:1";
++      input_layers += ",a";
++    }
+   }
+   props.push_back(input_shape);
+   props.push_back(input_layers);
+@@ -103,10 +108,15 @@ TEST_P(LayerSemantics, setBatchValidateLayerNode_p) {
+   auto lnode = nntrainer::createLayerNode(expected_type);
+   std::vector<std::string> props = {"name=test"};
+   std::string input_shape = "input_shape=1:1:1";
++  if (expected_type == "weight") {
++    input_shape = "weight_dim=1:1:1";
++  }
+   std::string input_layers = "input_layers=a";
+   for (auto idx = 1u; idx < num_inputs; idx++) {
+-    input_shape += ",1:1:1";
+-    input_layers += ",a";
++    if (expected_type != "weight") {
++      input_shape += ",1:1:1";
++      input_layers += ",a";
++    }
+   }
+   props.push_back(input_shape);
+   props.push_back(input_layers);
+@@ -155,10 +165,15 @@ TEST_P(LayerSemanticsGpu, finalizeValidateLayerNode_p) {
+   auto lnode = nntrainer::createLayerNode(expected_type, {"engine=gpu"});
+   std::vector<std::string> props = {"name=test"};
+   std::string input_shape = "input_shape=1:1:1";
++  if (expected_type == "weight") {
++    input_shape = "weight_dim=1:1:1";
++  }
+   std::string input_layers = "input_layers=a";
+   for (auto idx = 1u; idx < num_inputs; idx++) {
+-    input_shape += ",1:1:1";
+-    input_layers += ",a";
++    if (expected_type != "weight") {
++      input_shape += ",1:1:1";
++      input_layers += ",a";
++    }
+   }
+   props.push_back(input_shape);
+   props.push_back(input_layers);
+@@ -201,10 +216,15 @@ TEST_P(LayerSemanticsGpu, setBatchValidateLayerNode_p) {
+   auto lnode = nntrainer::createLayerNode(expected_type, {"engine=gpu"});
+   std::vector<std::string> props = {"name=test"};
+   std::string input_shape = "input_shape=1:1:1";
++  if (expected_type == "weight") {
++    input_shape = "weight_dim=1:1:1";
++  }
+   std::string input_layers = "input_layers=a";
+   for (auto idx = 1u; idx < num_inputs; idx++) {
+-    input_shape += ",1:1:1";
+-    input_layers += ",a";
++    if (expected_type != "weight") {
++      input_shape += ",1:1:1";
++      input_layers += ",a";
++    }
+   }
+   props.push_back(input_shape);
+   props.push_back(input_layers);
+
+From eb80105b4fc3fbaaa5249d0adde76a80d0f6bf67 Mon Sep 17 00:00:00 2001
+From: sumon-98 <sumon.nath@samsung.com>
+Date: Thu, 11 Dec 2025 17:12:41 +0530
+Subject: [PATCH 2/5] [onnx] added weight loading support for onnx through per
+ layer bins
+
+**Self evaluation:**
+1. Build test: [*]Passed [ ]Failed [ ]Skipped
+2. Run test: []Passed [ ]Failed [*]Skipped
+
+Signed-off-by: sumon-98 <sumon.nath@samsung.com>
+---
+ Applications/ONNX/jni/main.cpp                |  42 +++++++++-
+ .../ONNX/jni/python_scripts/create_bin.py     |  37 +++++++++
+ .../jni/python_scripts/create_simple_model.py |  35 +++++++++
+ Applications/ONNX/jni/simple_model.onnx       | Bin 0 -> 572 bytes
+ nntrainer/models/neuralnet.cpp                |  73 ++++++++++++++++++
+ nntrainer/tensor/tensor.h                     |   5 ++
+ 6 files changed, 190 insertions(+), 2 deletions(-)
+ create mode 100644 Applications/ONNX/jni/python_scripts/create_bin.py
+ create mode 100644 Applications/ONNX/jni/python_scripts/create_simple_model.py
+ create mode 100644 Applications/ONNX/jni/simple_model.onnx
+
+diff --git a/Applications/ONNX/jni/main.cpp b/Applications/ONNX/jni/main.cpp
+index 024dfa4fa1..6dcf2418a7 100644
+--- a/Applications/ONNX/jni/main.cpp
++++ b/Applications/ONNX/jni/main.cpp
+@@ -20,21 +20,30 @@
+ int main() {
+   auto model = ml::train::createModel();
+ 
++  std::cout << "--------------------------------------Create Model "
++               "Done--------------------------------------"
++            << std::endl;
+   try {
+-    std::string path = "../../../../Applications/ONNX/jni/llama_example.onnx";
++    std::string path = "../../../../Applications/ONNX/jni/simple_model.onnx";
+     model->load(path, ml::train::ModelFormat::MODEL_FORMAT_ONNX);
+   } catch (const std::exception &e) {
+     std::cerr << "Error during load: " << e.what() << "\n";
+     return 1;
+   }
+ 
++  std::cout << "--------------------------------------Load Model "
++               "Done--------------------------------------"
++            << std::endl;
+   try {
+-    model->compile();
++    model->compile(ml::train::ExecutionMode::INFERENCE);
+   } catch (const std::exception &e) {
+     std::cerr << "Error during compile: " << e.what() << "\n";
+     return 1;
+   }
+ 
++  std::cout << "--------------------------------------Compile Model "
++               "Done--------------------------------------"
++            << std::endl;
+   try {
+     model->initialize();
+   } catch (const std::exception &e) {
+@@ -42,7 +51,36 @@ int main() {
+     return 1;
+   }
+ 
++  std::cout << "--------------------------------------Initialize Model "
++               "Done--------------------------------------"
++            << std::endl;
+   model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
+ 
++  std::cout << "--------------------------------------Summarize Model "
++               "Done--------------------------------------"
++            << std::endl;
++
++  std::string weight_path = "../../../../Applications/ONNX/jni/bins/";
++  try {
++    model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
++  } catch (std::exception &e) {
++    std::cerr << "Error during loading weights: " << e.what() << "\n";
++    return 1;
++  }
++
++  float *input1 = new float[4];
++  for (int i = 0; i < 4; i++) {
++    input1[i] = (i + 1);
++  }
++  std::vector<float *> in;
++  in.push_back(input1);
++  auto ans = model->inference(1, in);
++
++  std::cout << "-------------------------------------------Inference "
++               "Done--------------------------------------------"
++            << std::endl;
++  for (auto it : ans) {
++    std::cout << "Ans: " << it[0] << std::endl;
++  }
+   return 0;
+ }
+diff --git a/Applications/ONNX/jni/python_scripts/create_bin.py b/Applications/ONNX/jni/python_scripts/create_bin.py
+new file mode 100644
+index 0000000000..4a0d779134
+--- /dev/null
++++ b/Applications/ONNX/jni/python_scripts/create_bin.py
+@@ -0,0 +1,37 @@
++import onnx
++import numpy as np
++import json
++from onnx import numpy_helper, TensorProto
++
++def cleanName(name):
++    if name.startswith('/'):
++        name = name[1:]
++    
++    name = name.replace('/', '_')
++    name = name.replace('.', '_')
++    name = name.replace(':', '_')
++    name = name.lower()
++    
++    return name
++    
++    
++model = onnx.load("../simple_model.onnx", load_external_data=True)
++
++metadata = {}
++
++
++for tensor in model.graph.initializer:
++    arr = numpy_helper.to_array(tensor)  
++    
++    filename = f"../{cleanName(tensor.name)}.bin"
++    arr.tofile(filename)
++    
++    # Save metadata (name, dtype, shape, file)
++    metadata[tensor.name] = {
++        "file": filename,
++        "tensor name": tensor.name,
++        "dtype": TensorProto.DataType.Name(tensor.data_type),
++        "shape": list(arr.shape)
++    }
++    
++    print(f"Saved {tensor.name} -> {filename}, dtype={arr.dtype}, shape={arr.shape}")
+\ No newline at end of file
+diff --git a/Applications/ONNX/jni/python_scripts/create_simple_model.py b/Applications/ONNX/jni/python_scripts/create_simple_model.py
+new file mode 100644
+index 0000000000..55da8602e4
+--- /dev/null
++++ b/Applications/ONNX/jni/python_scripts/create_simple_model.py
+@@ -0,0 +1,35 @@
++import torch
++import torch.nn as nn
++
++class CustomModel(nn.Module):
++    def __init__(self):
++        super(CustomModel, self).__init__()
++        # First linear: 2 -> 5 (no bias)
++        self.linear1 = nn.Linear(2, 5, bias=False)
++        # Mul parameter: (1,5) so it matches output of linear1
++        self.mul_param = nn.Parameter(torch.randn(1, 5))
++        # Second linear: 5 -> 7 (no bias)
++        self.linear2 = nn.Linear(5, 7, bias=False)
++
++    def forward(self, x):
++        x = self.linear1(x)        # (2,2) -> (2,5)
++        x = x * self.mul_param     # elementwise mul (broadcast)
++        x = self.linear2(x)        # (2,5) -> (2,7)
++        return x
++
++# Create model & input
++model = CustomModel()
++model.eval()
++inp = torch.randn(2, 2)  # fixed input shape
++
++# Export ONNX with fixed sizes (no dynamic axes)
++torch.onnx.export(
++    model,
++    inp,
++    "../simple_model.onnx",
++    input_names=["input"],
++    output_names=["output"],
++    opset_version=17
++)
++
++print("Model exported to custom_model_fixed.onnx (fixed shape 2x2 → 2x7)")
+\ No newline at end of file
+diff --git a/Applications/ONNX/jni/simple_model.onnx b/Applications/ONNX/jni/simple_model.onnx
+new file mode 100644
+index 0000000000000000000000000000000000000000..3114345e351a36369677336b8d8cc19fdc506d80
+GIT binary patch
+literal 572
+zcmd<!5MnQ=EXglQ&X8g?(zDPruv*N*<;BICnO9I+!o`=LmseqB<(pXITbdJZDI}qv
+zlbM&ASY)UV70NFy0ji5Pkm5&^QDTFr;Iik!sfmj-7ielhVo_qQ5U)PS2Dou7Ag&TK
+zkl=FULY3p<M{$&)fe;%+8{7>>P}jlSAjFlMn3)%!UX)mnp{35j$iXVW=!CG_OJw)K
+z3-)O~vi4v8<k^4QXl|bwdB;}EfrAOG5G@S6G@MK}+eMt@wHLkn(vDqujopctG5g;9
+z{I`!GoN@obmGb*zK4|S<zf;IwYZ=fc4tAhj=q~o^Vf=k~)4usxhI_>%*4tfau&@hD
+zzrH8=-R8X$E=Acn?+LZ5-jHhR&^Tcq*Qax~ORlHd6+E76*UWv=PXDRGz6>K%yFS4c
+zw&i+{?F#wM*d2Pjz}6*V>)xXlrFQR*Pq(RkUb^oG=ZSqm?|1FnrYN-U&#fDF=eut1
+zD@Zf5bC0REJK|}%*Zt7}JE5WoyVAeDc2VNc_!i>h;^ANv;^1Q9U;^PJ2`*^ZqRFs3
+IF$o9)02dX@FaQ7m
+
+literal 0
+HcmV?d00001
+
+diff --git a/nntrainer/models/neuralnet.cpp b/nntrainer/models/neuralnet.cpp
+index 9b2c88205d..c1f98aba35 100644
+--- a/nntrainer/models/neuralnet.cpp
++++ b/nntrainer/models/neuralnet.cpp
+@@ -689,6 +689,9 @@ void NeuralNetwork::load(const std::string &file_path,
+   size_t start_from = 0;
+   std::vector<std::pair<size_t, size_t>> file_offset;
+   for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
++#ifdef ENABLE_ONNX_INTERPRETER
++    start_from = 0;
++#endif
+     auto weights = (*iter)->getRunContext().getWeights();
+     for (auto weight : weights) {
+       size_t size = weight->getVariable().getMemoryBytes();
+@@ -745,12 +748,43 @@ void NeuralNetwork::load(const std::string &file_path,
+         auto node = *iter;
+         auto exec_order = std::get<0>((*iter)->getExecutionOrder());
+ 
++#ifdef ENABLE_ONNX_INTERPRETER
++        auto rc = node->getRunContext(); // SAFE local copies
++        bool hasWeights = rc.getNumWeights();
++        std::string base0 = v[0];
++        std::string base1 = (v.size() == 2 ? v[1] : "");
++        std::string layerName = rc.getName();
++
++        threads.emplace_back([=]() {
++          if (!MMAP_READ) {
++            if (hasWeights) {
++              std::string file_path;
++              if (!base1.empty()) {
++                file_path = base1 + layerName + ".bin";
++              } else {
++                file_path = base0 + layerName + ".bin";
++              }
++              // std::cout << "Appended Layer: " << file_path << std::endl;
++              auto local_model_file = checkedOpenStream<std::ifstream>(
++                file_path, std::ios::in | std::ios::binary);
++
++              int local_fd = open(file_path.c_str(), O_RDONLY);
++              NNTR_THROW_IF((local_fd == -1), std::invalid_argument)
++                << "Cannot open file : " << file_path;
++
++              node->read(local_model_file, false, exec_mode, fsu_mode,
++                         std::numeric_limits<size_t>::max(), true, local_fd);
++
++              close(local_fd);
++            }
++#else
+         threads.emplace_back([&, node]() {
+           if (!MMAP_READ) {
+             auto local_model_file = checkedOpenStream<std::ifstream>(
+               (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
+             node->read(local_model_file, false, exec_mode, fsu_mode,
+                        std::numeric_limits<size_t>::max(), true, model_file_fd);
++#endif
+           } else {
+ #if defined(_WIN32)
+             // Map per-ask, then unmap immediately after: enables early release
+@@ -780,6 +814,44 @@ void NeuralNetwork::load(const std::string &file_path,
+             CloseHandle(hFile);
+ #else
+             // POSIX: map per-task, advise kernel, drop pages, unmap
++#ifdef ENABLE_ONNX_INTERPRETER
++            if (hasWeights) {
++              std::string file_path;
++              if (!base1.empty()) {
++                file_path = base1 + layerName + ".bin";
++              } else {
++                file_path = base0 + layerName + ".bin";
++              }
++              int fd = ::open(file_path.c_str(), O_RDONLY);
++              NNTR_THROW_IF((fd == -1), std::invalid_argument)
++                << "Cannot open file : " << f_path;
++
++              struct stat st {};
++              NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
++                << "Cannot get file info (fstat): " << f_path;
++
++              size_t f_size = static_cast<size_t>(st.st_size);
++              void *mmap_ptr =
++                ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
++              ::close(fd); // fd not needed after mmap
++              NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
++                << "mmap failed";
++
++              // Hint: many model loads touch scattered regions -> RANDOM helps
++              // reduce readahead
++              (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
++
++              char *view = static_cast<char *>(mmap_ptr);
++              node->read(view, false, exec_mode, fsu_mode,
++                         std::numeric_limits<size_t>::max(), true);
++
++              // Early drop: pages no longer needed; helps lower peak RSS during
++              // overlap
++              (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
++
++              ::munmap(mmap_ptr, f_size);
++            }
++#else
+             int fd = ::open(f_path.c_str(), O_RDONLY);
+             NNTR_THROW_IF((fd == -1), std::invalid_argument)
+               << "Cannot open file : " << f_path;
+@@ -808,6 +880,7 @@ void NeuralNetwork::load(const std::string &file_path,
+             (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+ 
+             ::munmap(mmap_ptr, f_size);
++#endif
+ #endif
+           }
+         });
+diff --git a/nntrainer/tensor/tensor.h b/nntrainer/tensor/tensor.h
+index 0ef3f842ce..e50bfe5d8b 100644
+--- a/nntrainer/tensor/tensor.h
++++ b/nntrainer/tensor/tensor.h
+@@ -520,7 +520,12 @@ class Tensor {
+   template <typename T = float>
+   static Tensor Map(T *buf, unsigned int bytes, const TensorDim &d,
+                     size_t offset = 0) {
++    // commented out as weight layers are treated as inputs, need to bypass it
++#ifndef ENABLE_ONNX_INTERPRETER
+     if (d.getDataLen() == 0 || buf == nullptr) {
++#else
++    if (d.getDataLen() == 0) {
++#endif
+       throw std::invalid_argument(
+         "[Tensor::Map] empty tensor dim is not allowed");
+     }
+
+From c7ab389fe17e13121789e3181d1148508eb5f64c Mon Sep 17 00:00:00 2001
+From: Sachin Singh <sachin.3@samsung.com>
+Date: Sun, 14 Dec 2025 19:20:25 +0530
+Subject: [PATCH 3/5] [ONNX] Matmul and Slice Layer fix to infer ONNX Models
+
+Matmul Layer: Kernel performing dot operation accepts tensors having channel size only one. Hence a condition statement is added to matmul layer to perform required reshaping steps before and after performing the dot op.
+Slice Layer: .setTensorDim is added to set TensorDim.
+
+**Self evaluation:**
+1. Build test: [*]Passed [ ]Failed [ ]Skipped
+2. Run test: []Passed [ ]Failed [*]Skipped
+
+Signed-off-by: Sachin Singh <sachin.3@samsung.com>
+---
+ nntrainer/layers/gather_layer.cpp | 56 ++++++++++++++++++++++++++++---
+ nntrainer/layers/matmul_layer.cpp | 23 +++++++++++--
+ nntrainer/layers/slice_layer.cpp  |  6 ++--
+ nntrainer/layers/slice_layer.h    |  1 +
+ 4 files changed, 76 insertions(+), 10 deletions(-)
+
+diff --git a/nntrainer/layers/gather_layer.cpp b/nntrainer/layers/gather_layer.cpp
+index 54ec881a92..97f998c740 100644
+--- a/nntrainer/layers/gather_layer.cpp
++++ b/nntrainer/layers/gather_layer.cpp
+@@ -6,7 +6,7 @@
+  * @date   02 April 2025
+  * @see    https://github.com/nnstreamer/nntrainer
+  * @author SeungBaek Hong <sb92.hong@samsung.com>
+- * @bug    It's not implemented operation yet. Just a draft for compilation.
++ * @bug    No known bugs except for NYI items
+  * @brief  This is gather layer class (operation layer)
+  */
+ 
+@@ -44,13 +44,59 @@ void GatherLayer::finalize(InitLayerContext &context) {
+ 
+ void GatherLayer::forwarding_operation(const Tensor &input, const Tensor &index,
+                                        Tensor &output) {
+-  // TODO: implement forwarding operation
+-  throw std::runtime_error("forwarding operation is not implemented yet");
++  for (unsigned int b = 0; b < index.getDim().batch(); ++b) {
++    for (unsigned int i = 0; i < index.getDim().channel(); ++i) {
++      for (unsigned int j = 0; j < index.getDim().height(); ++j) {
++        for (unsigned int k = 0; k < index.getDim().width(); ++k) {
++          auto selected = (size_t)index.getValue(b, i, j, k);
++          if (selected >= input.getDim()[axis]) {
++            throw std::invalid_argument("The index value is out of range.");
++          }
++          switch (axis) {
++          case 1:
++            output.setValue(b, i, j, k, input.getValue(b, selected, j, k));
++            break;
++          case 2:
++            output.setValue(b, i, j, k, input.getValue(b, i, selected, k));
++            break;
++          case 3:
++            output.setValue(b, i, j, k, input.getValue(b, i, j, selected));
++          default:
++            break;
++          }
++        }
++      }
++    }
++  }
+ }
+ 
+ void GatherLayer::calcDerivative(RunLayerContext &context) {
+-  // TODO: implement derivative calculation
+-  throw std::runtime_error("derivative calculation is not implemented yet");
++  const Tensor &index = context.getInput(1);
++  const Tensor &inDeriv = context.getIncomingDerivative(SINGLE_INOUT_IDX);
++  Tensor &outDeriv = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
++
++  for (unsigned int b = 0; b < index.getDim().batch(); ++b) {
++    for (unsigned int i = 0; i < index.getDim().channel(); ++i) {
++      for (unsigned int j = 0; j < index.getDim().height(); ++j) {
++        for (unsigned int k = 0; k < index.getDim().width(); ++k) {
++          auto inDerivValue = inDeriv.getValue(b, i, j, k);
++          auto selected = (size_t)index.getValue(b, i, j, k);
++          switch (axis) {
++          case 0:
++            outDeriv.addValue(b, selected, j, k, inDerivValue, 1);
++            break;
++          case 1:
++            outDeriv.addValue(b, i, selected, k, inDerivValue, 1);
++            break;
++          case 2:
++            outDeriv.addValue(b, i, j, selected, inDerivValue, 1);
++          default:
++            break;
++          }
++        }
++      }
++    }
++  }
+ }
+ 
+ void GatherLayer::setProperty(const std::vector<std::string> &values) {
+diff --git a/nntrainer/layers/matmul_layer.cpp b/nntrainer/layers/matmul_layer.cpp
+index d56889d13d..039593e6a2 100644
+--- a/nntrainer/layers/matmul_layer.cpp
++++ b/nntrainer/layers/matmul_layer.cpp
+@@ -24,7 +24,6 @@ namespace nntrainer {
+ void MatMulLayer::finalize(InitLayerContext &context) {
+   TensorDim inputDim0 = context.getInputDimensions()[0];
+   TensorDim inputDim1 = context.getInputDimensions()[1];
+-
+   if (inputDim0[1] != inputDim1[1]) {
+     throw std::invalid_argument("MatMulLayer requires matching channel size. ");
+   } else if (inputDim0[3] != inputDim1[2]) {
+@@ -40,7 +39,27 @@ void MatMulLayer::finalize(InitLayerContext &context) {
+ 
+ void MatMulLayer::forwarding_operation(const Tensor &input0,
+                                        const Tensor &input1, Tensor &output) {
+-  input0.dot(input1, output);
++
++  if (input0.channel() != 1) {
++
++    unsigned int batch = input0.batch();
++    unsigned int channel = input0.channel();
++    unsigned int height0 = input0.height();
++    unsigned int width0 = input0.width();
++
++    unsigned int height1 = input1.height();
++    unsigned int width1 = input1.width();
++
++    Tensor input0_ = input0, input1_ = input1;
++
++    input0_.reshape(TensorDim({batch * channel, 1, height0, width0}));
++    input1_.reshape(TensorDim({batch * channel, 1, height1, width1}));
++    output.reshape(TensorDim({batch * channel, 1, height0, width1}));
++
++    input0_.dotBatched(input1_, output);
++    output.reshape(TensorDim({batch, channel, height0, width1}));
++  } else
++    input0.dot(input1, output);
+ }
+ 
+ void MatMulLayer::calcDerivative(RunLayerContext &context) {
+diff --git a/nntrainer/layers/slice_layer.cpp b/nntrainer/layers/slice_layer.cpp
+index bfa67c03a8..a1c5227a50 100644
+--- a/nntrainer/layers/slice_layer.cpp
++++ b/nntrainer/layers/slice_layer.cpp
+@@ -26,16 +26,16 @@ namespace nntrainer {
+ void SliceLayer::finalize(InitLayerContext &context) {
+   axis = std::get<props::Axis>(slice_props).get();
+   start = std::get<props::StartIndex>(slice_props).get() - 1;
+-  unsigned int end = std::get<props::EndIndex>(slice_props).get() - 1;
++  end = std::get<props::EndIndex>(slice_props).get() - 1;
+ 
+   const TensorDim &in_dim = context.getInputDimensions()[0];
+   TensorDim outputDim = context.getInputDimensions()[0];
+ 
+   for (unsigned int i = 0; i < 4; ++i) {
+     if (i == axis) {
+-      outputDim[i] = end - start;
++      outputDim.setTensorDim(i, end - start);
+     } else {
+-      outputDim[i] = in_dim[i];
++      outputDim.setTensorDim(i, in_dim[i]);
+     }
+   }
+ 
+diff --git a/nntrainer/layers/slice_layer.h b/nntrainer/layers/slice_layer.h
+index 0352711834..a9d364af93 100644
+--- a/nntrainer/layers/slice_layer.h
++++ b/nntrainer/layers/slice_layer.h
+@@ -99,6 +99,7 @@ class SliceLayer : public UnaryOperationLayer {
+   bool support_backwarding;
+   unsigned int axis;
+   unsigned int start;
++  unsigned int end;
+   // TensorDim starts;
+ };
+ 
+
+From 6225deff18a65259eadd5b7617a8bad4ab534d4a Mon Sep 17 00:00:00 2001
+From: Sachin Singh <sachin.3@samsung.com>
+Date: Sun, 14 Dec 2025 19:22:00 +0530
+Subject: [PATCH 4/5] [ONNX] Added Pow, reducesum op and float attribute
+ support
+
+Added ops and parsing of float attribute.
+
+**Self evaluation:**
+1. Build test: [*]Passed [ ]Failed [ ]Skipped
+2. Run test: []Passed [ ]Failed [*]Skipped
+
+Signed-off-by: Sachin Singh <sachin.3@samsung.com>
+---
+ nntrainer/compiler/onnx_interpreter.cpp | 51 ++++++++++++++++++++-----
+ nntrainer/compiler/onnx_interpreter.h   |  3 ++
+ 2 files changed, 45 insertions(+), 9 deletions(-)
+
+diff --git a/nntrainer/compiler/onnx_interpreter.cpp b/nntrainer/compiler/onnx_interpreter.cpp
+index 2e87e179a8..d7cb02dc6e 100644
+--- a/nntrainer/compiler/onnx_interpreter.cpp
++++ b/nntrainer/compiler/onnx_interpreter.cpp
+@@ -6,6 +6,7 @@
+  * @date   12 February 2025
+  * @see    https://github.com/nnstreamer/nntrainer
+  * @author SeungBaek Hong <sb92.hong@samsung.com>
++ * @author Sachin Singh <sachin.3@samsung.com>
+  * @bug	   No known bugs except for NYI items
+  * @brief  This is onnx converter interface for c++ API
+  */
+@@ -71,15 +72,24 @@ std::string ONNXInterpreter::extractTensorAttribute(
+       oss << prefix << "=";
+ 
+       if (attr.has_t()) {
+-        const auto &shape_tensor = attr.t().raw_data();
+-        const int64_t *vals =
+-          reinterpret_cast<const int64_t *>(shape_tensor.data());
+-        int size = shape_tensor.size() / sizeof(int64_t);
+-
+-        for (int i = start_offset; i < size; ++i) {
+-          oss << vals[i] + alpha;
+-          if (i < size - 1)
+-            oss << separator;
++        const auto &raw_tensor = attr.t().raw_data();
++        if (attr.t().data_type() == onnx::TensorProto_DataType_INT64) {
++
++          const int64_t *vals =
++            reinterpret_cast<const int64_t *>(raw_tensor.data());
++          int size = raw_tensor.size() / sizeof(int64_t);
++
++          for (int i = start_offset; i < size; ++i) {
++            oss << vals[i] + alpha;
++            if (i < size - 1)
++              oss << separator;
++          }
++
++        } else if (attr.t().data_type() == onnx::TensorProto_DataType_FLOAT) {
++          const float *vals =
++            reinterpret_cast<const float *>(raw_tensor.data());
++          int size = raw_tensor.size() / sizeof(float);
++          oss << *vals;
+         }
+         return oss.str();
+       }
+@@ -143,11 +153,20 @@ void ONNXInterpreter::registerNodeHandlers() {
+   registerBasicUnaryOp("Relu");
+   registerBasicUnaryOp("Identity");
+   registerBasicUnaryOp("Gather");
++  registerBasicUnaryOp("GatherElements");
+   registerBasicUnaryOp("Cosine");
+   registerBasicUnaryOp("Sine");
+   registerBasicUnaryOp("Tangent");
+   registerBasicUnaryOp("Neg");
+ 
++  NodeHandlers["Pow"] = [this](const onnx::NodeProto &node,
++                               GraphRepresentation &rep) {
++    std::vector<std::string> props;
++    props.push_back(extractTensorAttribute(constantTensors.at(node.input(1)),
++                                           "value", "exponent"));
++    handleUnaryOp(node, rep, layerKeyMap[node.op_type()], props);
++  };
++
+   NodeHandlers["Reshape"] = [this](const onnx::NodeProto &node,
+                                    GraphRepresentation &rep) {
+     std::vector<std::string> props;
+@@ -173,6 +192,13 @@ void ONNXInterpreter::registerNodeHandlers() {
+     handleBinaryOp(node, rep, layerKeyMap[node.op_type()], props);
+   };
+ 
++  NodeHandlers["GatherElements"] = [this](const onnx::NodeProto &node,
++                                          GraphRepresentation &rep) {
++    std::vector<std::string> props;
++    props.push_back("axis=2");
++    handleBinaryOp(node, rep, layerKeyMap[node.op_type()], props);
++  };
++
+   NodeHandlers["Cast"] = [this](const onnx::NodeProto &node,
+                                 GraphRepresentation &rep) {
+     std::vector<std::string> props;
+@@ -226,6 +252,13 @@ void ONNXInterpreter::registerNodeHandlers() {
+     props.push_back(extractAttribute(node, "axes", "axis"));
+     handleUnaryOp(node, rep, layerKeyMap[node.op_type()], props);
+   };
++
++  NodeHandlers["ReduceSum"] = [this](const onnx::NodeProto &node,
++                                     GraphRepresentation &rep) {
++    std::vector<std::string> props;
++    props.push_back("axis=3");
++    handleUnaryOp(node, rep, layerKeyMap[node.op_type()], props);
++  };
+ };
+ 
+ std::string ONNXInterpreter::getDataTypeFromONNX(int onnx_type) {
+diff --git a/nntrainer/compiler/onnx_interpreter.h b/nntrainer/compiler/onnx_interpreter.h
+index d3ca2341fa..354ec45eee 100644
+--- a/nntrainer/compiler/onnx_interpreter.h
++++ b/nntrainer/compiler/onnx_interpreter.h
+@@ -6,6 +6,7 @@
+  * @date   12 February 2025
+  * @see    https://github.com/nnstreamer/nntrainer
+  * @author SeungBaek Hong <sb92.hong@samsung.com>
++ * @author Sachin Singh <sachin.3@samsung.com>
+  * @bug	   No known bugs except for NYI items
+  * @brief  This is onnx converter interface for c++ API
+  */
+@@ -171,6 +172,7 @@ class ONNXInterpreter : public GraphInterpreter {
+     {"Div", "divide"},
+     {"MatMul", "matmul"},
+     {"ReduceMean", "reduce_mean"},
++    {"ReduceSum", "reduce_sum"},
+     {"Reshape", "reshape"},
+     {"Transpose", "permute"},
+     {"Cast", "cast"},
+@@ -182,6 +184,7 @@ class ONNXInterpreter : public GraphInterpreter {
+     {"Identity", "identity"},
+     {"Unsqueeze", "reshape"},
+     {"Gather", "gather"},
++    {"GatherElements", "gather"},
+     {"Cosine", "cosine"},
+     {"Sine", "sine"},
+     {"Tangent", "tangent"},
+
+From f75cf1cb970f9ec5d882f25c6573b90a08a3e49d Mon Sep 17 00:00:00 2001
+From: Sachin Singh <sachin.3@samsung.com>
+Date: Sun, 14 Dec 2025 19:27:43 +0530
+Subject: [PATCH 5/5] [ONNX] ONNX Application tree change
+
+Organizing ONNX apps within ONNX folder
+
+**Self evaluation:**
+1. Build test: [*]Passed [ ]Failed [ ]Skipped
+2. Run test: []Passed [ ]Failed [*]Skipped
+---
+ Applications/ONNX/jni/{ => fcModel}/main.cpp  |  46 ++-
+ .../ONNX/jni/{ => fcModel}/simple_model.onnx  | Bin
+ .../ONNX/jni/{ => llama}/llama_example.onnx   | Bin
+ Applications/ONNX/jni/llama/main.cpp          |  48 +++
+ Applications/ONNX/jni/meson.build             |  55 +++-
+ .../ONNX/jni/qwen3/multi-token/main.cpp       | 156 ++++++++++
+ .../ONNX/jni/qwen3/single-token/main.cpp      | 124 ++++++++
+ .../fcModel}/python_scripts/create_bin.py     |  15 +-
+ .../python_scripts/create_simple_model.py     |  14 +-
+ .../python/qwen3/multi-token/create_bin.py    |  75 +++++
+ .../python/qwen3/multi-token/custom_qwen3.py  | 276 +++++++++++++++++
+ .../python/qwen3/multi-token/decode_tokens.py |  21 ++
+ .../python/qwen3/multi-token/onnx_exporter.py | 114 +++++++
+ .../ONNX/python/qwen3/requirements.txt        |  59 ++++
+ .../ONNX/python/qwen3/single-token/compare.py |  22 ++
+ .../python/qwen3/single-token/create_bin.py   |  75 +++++
+ .../python/qwen3/single-token/custom_qwen3.py | 278 ++++++++++++++++++
+ .../qwen3/single-token/onnx_exporter.py       |  56 ++++
+ 18 files changed, 1396 insertions(+), 38 deletions(-)
+ rename Applications/ONNX/jni/{ => fcModel}/main.cpp (61%)
+ rename Applications/ONNX/jni/{ => fcModel}/simple_model.onnx (100%)
+ rename Applications/ONNX/jni/{ => llama}/llama_example.onnx (100%)
+ create mode 100644 Applications/ONNX/jni/llama/main.cpp
+ create mode 100644 Applications/ONNX/jni/qwen3/multi-token/main.cpp
+ create mode 100644 Applications/ONNX/jni/qwen3/single-token/main.cpp
+ rename Applications/ONNX/{jni => python/fcModel}/python_scripts/create_bin.py (67%)
+ rename Applications/ONNX/{jni => python/fcModel}/python_scripts/create_simple_model.py (74%)
+ create mode 100644 Applications/ONNX/python/qwen3/multi-token/create_bin.py
+ create mode 100644 Applications/ONNX/python/qwen3/multi-token/custom_qwen3.py
+ create mode 100644 Applications/ONNX/python/qwen3/multi-token/decode_tokens.py
+ create mode 100644 Applications/ONNX/python/qwen3/multi-token/onnx_exporter.py
+ create mode 100644 Applications/ONNX/python/qwen3/requirements.txt
+ create mode 100644 Applications/ONNX/python/qwen3/single-token/compare.py
+ create mode 100644 Applications/ONNX/python/qwen3/single-token/create_bin.py
+ create mode 100644 Applications/ONNX/python/qwen3/single-token/custom_qwen3.py
+ create mode 100644 Applications/ONNX/python/qwen3/single-token/onnx_exporter.py
+
+diff --git a/Applications/ONNX/jni/main.cpp b/Applications/ONNX/jni/fcModel/main.cpp
+similarity index 61%
+rename from Applications/ONNX/jni/main.cpp
+rename to Applications/ONNX/jni/fcModel/main.cpp
+index 6dcf2418a7..3b56c19597 100644
+--- a/Applications/ONNX/jni/main.cpp
++++ b/Applications/ONNX/jni/fcModel/main.cpp
+@@ -20,20 +20,16 @@
+ int main() {
+   auto model = ml::train::createModel();
+ 
+-  std::cout << "--------------------------------------Create Model "
+-               "Done--------------------------------------"
+-            << std::endl;
++  std::cout << "--------------------------------------Create Model Done--------------------------------------" << std::endl;
+   try {
+-    std::string path = "../../../../Applications/ONNX/jni/simple_model.onnx";
++    std::string path = "model_path(onnx)";
+     model->load(path, ml::train::ModelFormat::MODEL_FORMAT_ONNX);
+   } catch (const std::exception &e) {
+     std::cerr << "Error during load: " << e.what() << "\n";
+     return 1;
+   }
+ 
+-  std::cout << "--------------------------------------Load Model "
+-               "Done--------------------------------------"
+-            << std::endl;
++  std::cout << "--------------------------------------Load Model Done--------------------------------------" << std::endl;
+   try {
+     model->compile(ml::train::ExecutionMode::INFERENCE);
+   } catch (const std::exception &e) {
+@@ -41,9 +37,7 @@ int main() {
+     return 1;
+   }
+ 
+-  std::cout << "--------------------------------------Compile Model "
+-               "Done--------------------------------------"
+-            << std::endl;
++  std::cout << "--------------------------------------Compile Model Done--------------------------------------" << std::endl;
+   try {
+     model->initialize();
+   } catch (const std::exception &e) {
+@@ -51,36 +45,30 @@ int main() {
+     return 1;
+   }
+ 
+-  std::cout << "--------------------------------------Initialize Model "
+-               "Done--------------------------------------"
+-            << std::endl;
++  std::cout << "--------------------------------------Initialize Model Done--------------------------------------" << std::endl;
+   model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
+ 
+-  std::cout << "--------------------------------------Summarize Model "
+-               "Done--------------------------------------"
+-            << std::endl;
++  std::cout << "--------------------------------------Summarize Model Done--------------------------------------" << std::endl;
+ 
+-  std::string weight_path = "../../../../Applications/ONNX/jni/bins/";
++  std::string weight_path = "model_weights_path(dir)";
+   try {
+-    model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+-  } catch (std::exception &e) {
+-    std::cerr << "Error during loading weights: " << e.what() << "\n";
+-    return 1;
+-  }
++        model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
++      } catch (std::exception &e) {
++        std::cerr << "Error during loading weights: " << e.what() << "\n";
++        return 1;
++      }
+ 
+   float *input1 = new float[4];
+-  for (int i = 0; i < 4; i++) {
++  for(int i = 0; i < 4; i++){
+     input1[i] = (i + 1);
+   }
+-  std::vector<float *> in;
++  std::vector<float *> in; 
+   in.push_back(input1);
+   auto ans = model->inference(1, in);
+ 
+-  std::cout << "-------------------------------------------Inference "
+-               "Done--------------------------------------------"
+-            << std::endl;
+-  for (auto it : ans) {
+-    std::cout << "Ans: " << it[0] << std::endl;
++  std::cout << "-------------------------------------------Inference Done--------------------------------------------" << std::endl;
++  for(auto it: ans) {
++      std::cout << "Ans: " << it[0] << std::endl;
+   }
+   return 0;
+ }
+diff --git a/Applications/ONNX/jni/simple_model.onnx b/Applications/ONNX/jni/fcModel/simple_model.onnx
+similarity index 100%
+rename from Applications/ONNX/jni/simple_model.onnx
+rename to Applications/ONNX/jni/fcModel/simple_model.onnx
+diff --git a/Applications/ONNX/jni/llama_example.onnx b/Applications/ONNX/jni/llama/llama_example.onnx
+similarity index 100%
+rename from Applications/ONNX/jni/llama_example.onnx
+rename to Applications/ONNX/jni/llama/llama_example.onnx
+diff --git a/Applications/ONNX/jni/llama/main.cpp b/Applications/ONNX/jni/llama/main.cpp
+new file mode 100644
+index 0000000000..640a276f6f
+--- /dev/null
++++ b/Applications/ONNX/jni/llama/main.cpp
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Seungbaek Hong <sb92.hong@samsung.com>
++ *
++ * @file   main.cpp
++ * @date   26 Feb 2025
++ * @brief  onnx example using nntrainer-onnx-api
++ * @see    https://github.com/nnstreamer/nntrainer
++ * @author Seungbaek Hong <sb92.honge@samsung.com>
++ * @bug    No known bugs except for NYI items
++ */
++
++#include <iostream>
++#include <layer.h>
++#include <model.h>
++#include <nntrainer-api-common.h>
++#include <optimizer.h>
++#include <util_func.h>
++
++int main() {
++  auto model = ml::train::createModel();
++
++  try {
++    std::string path = "../../../../Applications/ONNX/jni/llama/llama_example.onnx";
++    model->load(path, ml::train::ModelFormat::MODEL_FORMAT_ONNX);
++  } catch (const std::exception &e) {
++    std::cerr << "Error during load: " << e.what() << "\n";
++    return 1;
++  }
++
++  try {
++    model->compile();
++  } catch (const std::exception &e) {
++    std::cerr << "Error during compile: " << e.what() << "\n";
++    return 1;
++  }
++
++  try {
++    model->initialize();
++  } catch (const std::exception &e) {
++    std::cerr << "Error during initialize: " << e.what() << "\n";
++    return 1;
++  }
++
++  model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
++
++  return 0;
++}
+diff --git a/Applications/ONNX/jni/meson.build b/Applications/ONNX/jni/meson.build
+index 9b999dd87b..48cd720ab2 100644
+--- a/Applications/ONNX/jni/meson.build
++++ b/Applications/ONNX/jni/meson.build
+@@ -1,7 +1,4 @@
+-onnx_example_sources = [
+-  'main.cpp',
+-]
+-
++# Common dependencies for all ONNX examples
+ onnx_example_dependencies = [app_utils_dep,
+   iniparser_dep,
+   nntrainer_dep,
+@@ -12,9 +9,53 @@ if get_option('enable-test')
+   onnx_example_dependencies += [gtest_dep]
+ endif
+ 
+-e = executable('nntrainer_onnx_example',
+-  onnx_example_sources,
+-  include_directories: [include_directories('.')],
++# fcModel example
++fcModel_sources = [
++  'fcModel/main.cpp',
++]
++
++executable('nntrainer_onnx_fcModel',
++  fcModel_sources,
++  include_directories: [include_directories('.'), include_directories('fcModel')],
++  dependencies: onnx_example_dependencies,
++  install: get_option('install-app'),
++  install_dir: application_install_dir
++)
++
++# llama example
++llama_sources = [
++  'llama/main.cpp',
++]
++
++executable('nntrainer_onnx_llama',
++  llama_sources,
++  include_directories: [include_directories('.'), include_directories('llama')],
++  dependencies: onnx_example_dependencies,
++  install: get_option('install-app'),
++  install_dir: application_install_dir
++)
++
++# qwen3 single-token example
++qwen3_single_token_sources = [
++  'qwen3/single-token/main.cpp',
++]
++
++executable('nntrainer_onnx_qwen3_single_token',
++  qwen3_single_token_sources,
++  include_directories: [include_directories('.'), include_directories('qwen3'), include_directories('qwen3/single-token')],
++  dependencies: onnx_example_dependencies,
++  install: get_option('install-app'),
++  install_dir: application_install_dir
++)
++
++# qwen3 multi-token example
++qwen3_multi_token_sources = [
++  'qwen3/multi-token/main.cpp',
++]
++
++executable('nntrainer_onnx_qwen3_multi_token',
++  qwen3_multi_token_sources,
++  include_directories: [include_directories('.'), include_directories('qwen3'), include_directories('qwen3/multi-token')],
+   dependencies: onnx_example_dependencies,
+   install: get_option('install-app'),
+   install_dir: application_install_dir
+diff --git a/Applications/ONNX/jni/qwen3/multi-token/main.cpp b/Applications/ONNX/jni/qwen3/multi-token/main.cpp
+new file mode 100644
+index 0000000000..2ab663f6ce
+--- /dev/null
++++ b/Applications/ONNX/jni/qwen3/multi-token/main.cpp
+@@ -0,0 +1,156 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Sachin Singh <sachin.3@samsung.com>
++ * @file   main.cpp
++ * @date   14 October 2025
++ * @brief  onnx example using nntrainer-onnx-api
++ * @see    https://github.com/nnstreamer/nntrainer
++ * @author Sachin Singh <sachin.3@samsung.com>
++ * @bug    No known bugs except for NYI items
++ */
++
++#include <algorithm>
++#include <fstream>
++#include <iostream>
++#include <layer.h>
++#include <model.h>
++#include <nntrainer-api-common.h>
++#include <optimizer.h>
++#include <util_func.h>
++
++void loadFromRaw(float *data, size_t size, const std::string &filename) {
++
++  std::ifstream file(filename, std::ios::binary);
++  if (!file.is_open()) {
++    std::cerr << "Error: Cannot open file: " << filename << std::endl;
++    return;
++  }
++
++  file.read(reinterpret_cast<char *>(data), size * sizeof(float));
++  std::streamsize bytesRead = file.gcount();
++
++  if (bytesRead != size * sizeof(float)) {
++    std::cerr << "Warning: Expected " << size * sizeof(float)
++              << " bytes, but read " << bytesRead << " bytes.\n";
++  }
++
++  file.close();
++  return;
++}
++
++void saveToRaw(float *data, size_t size, const std::string &filename) {
++  std::ofstream out(filename, std::ios::binary);
++  if (!out) {
++    std::cerr << "Error: Cannot open file " << filename << " for writing.\n";
++    return;
++  }
++
++  out.write(reinterpret_cast<const char *>(data), size * sizeof(float));
++  out.close();
++
++  std::cout << std::endl << ".bin generated successfully !";
++}
++
++int main() {
++  auto model = ml::train::createModel();
++
++  std::cout << "--------------------------------------Create Model "
++               "Done--------------------------------------"
++            << std::endl;
++  try {
++    std::string path =
++      "../../../../Applications/ONNX/python/qwen3/multi-token/qwen3_model.onnx";
++    model->load(path, ml::train::ModelFormat::MODEL_FORMAT_ONNX);
++  } catch (const std::exception &e) {
++    std::cerr << "Error during load: " << e.what() << "\n";
++    return 1;
++  }
++
++  std::cout << "--------------------------------------Load Model "
++               "Done--------------------------------------"
++            << std::endl;
++  try {
++    model->compile(ml::train::ExecutionMode::INFERENCE);
++  } catch (const std::exception &e) {
++    std::cerr << "Error during compile: " << e.what() << "\n";
++    return 1;
++  }
++
++  std::cout << "--------------------------------------Compile Model "
++               "Done--------------------------------------"
++            << std::endl;
++  try {
++    model->initialize();
++  } catch (const std::exception &e) {
++    std::cerr << "Error during initialize: " << e.what() << "\n";
++    return 1;
++  }
++
++  std::cout << "--------------------------------------Initialize Model "
++               "Done--------------------------------------"
++            << std::endl;
++  model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
++
++  std::cout << "--------------------------------------Summarize Model "
++               "Done--------------------------------------"
++            << std::endl;
++
++  std::string weight_path =
++    "../../../../Applications/ONNX/python/qwen3/multi-token/bins/";
++  try {
++    model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
++  } catch (std::exception &e) {
++    std::cerr << "Error during loading weights: " << e.what() << "\n";
++    return 1;
++  }
++
++  std::cout << "--------------------------------------Loading weights "
++               "Done--------------------------------------"
++            << std::endl;
++
++  const int max_embedding_length = 256;
++  const int tokens_to_be_generated = 20;
++  const int num_vocab = 151936;
++  int curr_len = 0;
++
++  float *input = new float[max_embedding_length];
++  float *sin = new float[max_embedding_length * 128];
++  float *cos = new float[max_embedding_length * 128];
++  float *epsilon = new float[1];
++
++  // Loading inputs
++  loadFromRaw(
++    input, max_embedding_length,
++    "../../../../Applications/ONNX/python/qwen3/multi-token/input_tokens.bin");
++
++  for (int i = 0; i < max_embedding_length; i++) {
++    if (input[i] == 151643)
++      break;
++    ++curr_len;
++  }
++
++  // Loading rotary embeddings
++  loadFromRaw(sin, max_embedding_length * 128,
++              "../../../../Applications/ONNX/python/qwen3/multi-token/"
++              "rotary_embeddings_sine.bin");
++  loadFromRaw(cos, max_embedding_length * 128,
++              "../../../../Applications/ONNX/python/qwen3/multi-token/"
++              "rotary_embeddings_cosine.bin");
++
++  epsilon[0] = 1e-6;
++
++  for (int i = 0; i < tokens_to_be_generated; i++) {
++    float *output = model->inference(1, {epsilon, sin, cos, input})[0];
++    output = output + (int)(curr_len - 1) * (num_vocab);
++    float token_id =
++      std::distance(output, std::max_element(output, output + num_vocab));
++    input[curr_len] = token_id;
++    curr_len += 1;
++  }
++
++  saveToRaw(
++    input, curr_len,
++    "../../../../Applications/ONNX/python/qwen3/multi-token/output_tokens.bin");
++
++  return 0;
++}
+diff --git a/Applications/ONNX/jni/qwen3/single-token/main.cpp b/Applications/ONNX/jni/qwen3/single-token/main.cpp
+new file mode 100644
+index 0000000000..b3174f69d3
+--- /dev/null
++++ b/Applications/ONNX/jni/qwen3/single-token/main.cpp
+@@ -0,0 +1,124 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Sachin Singh <sachin.3@samsung.com>
++ * @file   main.cpp
++ * @date   14 October 2025
++ * @brief  onnx example using nntrainer-onnx-api
++ * @see    https://github.com/nnstreamer/nntrainer
++ * @author Sachin Singh <sachin.3@samsung.com>
++ * @bug    No known bugs except for NYI items
++ */
++
++#include <fstream>
++#include <iostream>
++#include <layer.h>
++#include <model.h>
++#include <nntrainer-api-common.h>
++#include <optimizer.h>
++#include <util_func.h>
++
++void saveToRaw(const float *data, size_t size, const std::string &filename) {
++  std::ofstream out(filename, std::ios::binary);
++  if (!out) {
++    std::cerr << "Error: Cannot open file " << filename << " for writing.\n";
++    return;
++  }
++
++  out.write(reinterpret_cast<const char *>(data), size * sizeof(float));
++  out.close();
++
++  std::cout << std::endl << ".bin generated successfully !";
++}
++
++int main() {
++  auto model = ml::train::createModel();
++
++  std::cout << "--------------------------------------Create Model "
++               "Done--------------------------------------"
++            << std::endl;
++  try {
++    std::string path = "../../../../Applications/ONNX/python/qwen3/"
++                       "single-token/qwen3_model.onnx";
++    model->load(path, ml::train::ModelFormat::MODEL_FORMAT_ONNX);
++  } catch (const std::exception &e) {
++    std::cerr << "Error during load: " << e.what() << "\n";
++    return 1;
++  }
++
++  std::cout << "--------------------------------------Load Model "
++               "Done--------------------------------------"
++            << std::endl;
++  try {
++    model->compile(ml::train::ExecutionMode::INFERENCE);
++  } catch (const std::exception &e) {
++    std::cerr << "Error during compile: " << e.what() << "\n";
++    return 1;
++  }
++
++  std::cout << "--------------------------------------Compile Model "
++               "Done--------------------------------------"
++            << std::endl;
++  try {
++    model->initialize();
++  } catch (const std::exception &e) {
++    std::cerr << "Error during initialize: " << e.what() << "\n";
++    return 1;
++  }
++
++  std::cout << "--------------------------------------Initialize Model "
++               "Done--------------------------------------"
++            << std::endl;
++  model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
++
++  std::cout << "--------------------------------------Summarize Model "
++               "Done--------------------------------------"
++            << std::endl;
++
++  std::string weight_path =
++    "../../../../Applications/ONNX/python/qwen3/single-token/bins/";
++  try {
++    model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
++  } catch (std::exception &e) {
++    std::cerr << "Error during loading weights: " << e.what() << "\n";
++    return 1;
++  }
++
++  std::cout << "--------------------------------------Loading weights "
++               "Done--------------------------------------"
++            << std::endl;
++
++  float *input = new float[1];
++  float *sin = new float[128];
++  float *cos = new float[128];
++  float *epsilon = new float[1];
++  const int num_vocab = 151936;
++
++  input[0] = 52;
++
++  for (int i = 0; i < 128; i++) {
++    sin[i] = 0;
++    cos[i] = 1;
++  }
++  epsilon[0] = 1e-6;
++
++  std::vector<float *> in;
++
++  in.push_back(epsilon);
++  in.push_back(sin);
++  in.push_back(cos);
++  in.push_back(input);
++
++  auto ans = model->inference(1, in);
++
++  std::cout << "-------------------------------------------Inference "
++               "Done--------------------------------------------"
++            << std::endl;
++
++  for (auto it : ans) {
++    saveToRaw(it, num_vocab,
++              "../../../../Applications/ONNX/python/qwen3/single-token/"
++              "nntrainer_logits.bin");
++  }
++
++  return 0;
++}
+diff --git a/Applications/ONNX/jni/python_scripts/create_bin.py b/Applications/ONNX/python/fcModel/python_scripts/create_bin.py
+similarity index 67%
+rename from Applications/ONNX/jni/python_scripts/create_bin.py
+rename to Applications/ONNX/python/fcModel/python_scripts/create_bin.py
+index 4a0d779134..63178dcc9d 100644
+--- a/Applications/ONNX/jni/python_scripts/create_bin.py
++++ b/Applications/ONNX/python/fcModel/python_scripts/create_bin.py
+@@ -1,3 +1,15 @@
++"""
++SPDX-License-Identifier: Apache-2.0
++Copyright (C) 2025 Sumon Nath <sumon.nath@samsung.com>
++
++@file create_bin.py
++@date 9 September 2025
++@brief This script creates weight.bin for each weight of the ONNX model and converts all ONNX weights to FP32.
++@note This script has been tested with transformers version 4.55.0 and PyTorch version 2.8.0
++
++@author Sumon Nath <sumon.nath@samsung.com>
++"""
++
+ import onnx
+ import numpy as np
+ import json
+@@ -34,4 +46,5 @@ def cleanName(name):
+         "shape": list(arr.shape)
+     }
+     
+-    print(f"Saved {tensor.name} -> {filename}, dtype={arr.dtype}, shape={arr.shape}")
+\ No newline at end of file
++    print(f"Saved {tensor.name} -> {filename}, dtype={arr.dtype}, shape={arr.shape}")
++    
+\ No newline at end of file
+diff --git a/Applications/ONNX/jni/python_scripts/create_simple_model.py b/Applications/ONNX/python/fcModel/python_scripts/create_simple_model.py
+similarity index 74%
+rename from Applications/ONNX/jni/python_scripts/create_simple_model.py
+rename to Applications/ONNX/python/fcModel/python_scripts/create_simple_model.py
+index 55da8602e4..cc3673d45a 100644
+--- a/Applications/ONNX/jni/python_scripts/create_simple_model.py
++++ b/Applications/ONNX/python/fcModel/python_scripts/create_simple_model.py
+@@ -1,3 +1,15 @@
++"""
++SPDX-License-Identifier: Apache-2.0
++Copyright (C) 2025 Sumon Nath <sumon.nath@samsung.com>
++
++@file create_simple_model.py
++@date 9 September 2025
++@brief This script creates a simple onnx fc model.
++@note This script has been tested with transformers version 4.55.0 and PyTorch version 2.8.0
++
++@author Sumon Nath <sumon.nath@samsung.com>
++"""
++
+ import torch
+ import torch.nn as nn
+ 
+@@ -32,4 +44,4 @@ def forward(self, x):
+     opset_version=17
+ )
+ 
+-print("Model exported to custom_model_fixed.onnx (fixed shape 2x2 → 2x7)")
+\ No newline at end of file
++print("Model exported to custom_model_fixed.onnx (fixed shape 2x2 → 2x7)")
+diff --git a/Applications/ONNX/python/qwen3/multi-token/create_bin.py b/Applications/ONNX/python/qwen3/multi-token/create_bin.py
+new file mode 100644
+index 0000000000..974f53ad45
+--- /dev/null
++++ b/Applications/ONNX/python/qwen3/multi-token/create_bin.py
+@@ -0,0 +1,75 @@
++"""
++SPDX-License-Identifier: Apache-2.0
++Copyright (C) 2025 Sachin Singh <sachin.3@samsung.com>
++
++@file create_bin.py
++@date 17 September 2025
++@brief This script creates weight.bin for each weight of the ONNX model and converts all ONNX weights to FP32.
++@note This script has been tested with transformers version 4.55.0 and PyTorch version 2.8.0
++
++@author Sachin Singh <sachin.3@samsung.com>
++"""
++
++import onnx
++import numpy as np
++import json
++import os
++import shutil
++from onnx import numpy_helper, TensorProto
++
++def cleanName(name):
++    if name.startswith('/'):
++        name = name[1:]
++    
++    name = name.replace('/', '_')
++    name = name.replace('.', '_')
++    name = name.replace(':', '_')
++    name = name.lower()
++    
++    return name
++    
++model_name="./qwen3_model.onnx"    
++model = onnx.load(model_name, load_external_data=True)
++new_initializers = []
++
++metadata = {}
++
++script_dir = os.path.dirname(os.path.abspath(__file__))
++folder = os.path.join(script_dir, "bins")
++if os.path.exists(folder):
++    shutil.rmtree(folder) 
++os.makedirs(folder)
++
++for tensor in model.graph.initializer:
++    arr = numpy_helper.to_array(tensor).astype(np.float32)
++    if tensor.data_type != TensorProto.FLOAT:
++        new_tensor = numpy_helper.from_array(arr, name=tensor.name)
++        new_initializers.append(new_tensor)
++    else:
++        new_initializers.append(tensor)    
++    filename = f"./bins/{cleanName(tensor.name)}.bin"
++    arr.tofile(filename)
++    
++    # Save metadata (name, dtype, shape, file)
++    metadata[tensor.name] = {
++        "file": filename,
++        "tensor name": tensor.name,
++        "dtype": TensorProto.DataType.Name(tensor.data_type),
++        "shape": list(arr.shape)
++    }
++    
++    print(f"Saved {tensor.name} -> {filename}, dtype={arr.dtype}, shape={arr.shape}")
++
++# Replace initializers
++model.graph.initializer.clear()
++model.graph.initializer.extend(new_initializers)
++onnx.save(model, 
++          model_name,
++          save_as_external_data=True,
++          all_tensors_to_one_file=True,
++          size_threshold=0,
++          )    
++
++with open("./weights_metadata.json", "w") as f:
++    json.dump(metadata, f, indent=4) 
++    
+\ No newline at end of file
+diff --git a/Applications/ONNX/python/qwen3/multi-token/custom_qwen3.py b/Applications/ONNX/python/qwen3/multi-token/custom_qwen3.py
+new file mode 100644
+index 0000000000..1514fb6d19
+--- /dev/null
++++ b/Applications/ONNX/python/qwen3/multi-token/custom_qwen3.py
+@@ -0,0 +1,276 @@
++"""
++SPDX-License-Identifier: Apache-2.0
++Copyright (C) 2025 Sachin Singh <sachin.3@samsung.com>
++
++@file modelling_qwen3.py
++@date 17 September 2025
++@brief This is a Qwen3 1.7B modeling file that is compatible with Hugging Face and supports conversion
++       from PyTorch to ONNX to NNTrainer. It does not include masking and caching for token generation.
++@note This script has been tested with transformers version 4.55.0 and PyTorch version 2.8.0
++
++@author Sachin Singh <sachin.3@samsung.com>
++"""
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
++from transformers.modeling_utils import PreTrainedModel
++
++class Qwen3RotaryEmbedding(nn.Module):
++    def __init__(self, config, device=None):
++        super().__init__()
++        # BC: "rope_type" was originally "type"
++        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
++            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
++        else:
++            self.rope_type = "default"
++        self.max_seq_len_cached = config.max_position_embeddings
++        self.original_max_seq_len = config.max_position_embeddings
++
++        self.config = config
++        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
++
++        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
++        self.register_buffer("inv_freq", inv_freq, persistent=False)
++        self.original_inv_freq = self.inv_freq
++
++    @torch.no_grad()
++    #@dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
++    def forward(self, x, position_ids):
++        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
++        position_ids_expanded = position_ids[:, None, :].float()
++
++        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
++        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
++            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
++            emb = torch.cat((freqs, freqs), dim=-1)
++            cos = emb.cos() * self.attention_scaling
++            sin = emb.sin() * self.attention_scaling
++
++        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
++
++class Qwen3RMSNorm(nn.Module):
++    def __init__(self, hidden_size):
++        """
++        Qwen3RMSNorm is equivalent to T5LayerNorm
++        """
++        super().__init__()
++        self.weight = nn.Parameter(torch.ones(hidden_size))
++
++    def forward(self, hidden_states,eps):
++        variance = hidden_states.pow(2).mean(3,keepdim=True)
++        std_dev = torch.sqrt(variance + eps)
++        hidden_states = hidden_states * torch.pow(std_dev, -1)
++        return hidden_states * self.weight
++
++class Qwen3MLP(nn.Module):
++    def __init__(self, config):
++        super().__init__()
++        self.config = config
++        self.hidden_size = config.hidden_size
++        self.intermediate_size = config.intermediate_size
++        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
++        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
++        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
++        self.act_fn = F.silu
++
++    def forward(self, x):
++        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
++        return down_proj
++
++def rotate_half(x):
++    """Rotates half the hidden dims of the input."""
++    x1 = x[..., : x.shape[-1] // 2]
++    x2 = x[..., x.shape[-1] // 2 :x.shape[-1]]
++   
++    y = torch.cat((-x2, x1), dim=3)
++    
++    return y # -1 changed to 3
++
++
++def apply_rotary_pos_emb(q, k, cos, sin):
++    
++    cos = cos.reshape(1,256,128)
++    sin = sin.reshape(1,256,128)
++
++    q_embed = (q * cos) + (rotate_half(q) * sin)
++    k_embed = (k * cos) + (rotate_half(k) * sin)
++    return q_embed, k_embed
++
++def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
++    """
++    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
++    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
++    """
++   
++    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
++    if n_rep == 1:
++        return hidden_states
++    
++    hidden_states = torch.cat([hidden_states]*n_rep,dim=2)
++    hidden_states = hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
++    return hidden_states
++
++class Qwen3Attention(nn.Module):
++    """Multi-headed attention from 'Attention Is All You Need' paper"""
++
++    def __init__(self, config, layer_idx: int):
++        super().__init__()
++        self.config = config
++        self.layer_idx = layer_idx
++        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
++        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
++        self.scaling = self.head_dim**-0.5
++        self.attention_dropout = config.attention_dropout
++        self.is_causal = True
++        
++        causal_mask = torch.full((1, 1, self.config.max_position_embeddings, self.config.max_position_embeddings), float("-inf"))
++        causal_mask = torch.triu(causal_mask, diagonal=1) 
++        self.register_buffer("attention_mask",causal_mask)
++        self.register_buffer("scaling_factor", torch.tensor([self.scaling], dtype=torch.float32))
++
++        self.q_proj = nn.Linear(
++            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
++        )
++        self.k_proj = nn.Linear(
++            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
++        )
++        self.v_proj = nn.Linear(
++            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
++        )
++        self.o_proj = nn.Linear(
++            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
++        )
++        self.q_norm = Qwen3RMSNorm(self.head_dim)  # unlike olmo, only on the head dim!
++        self.k_norm = Qwen3RMSNorm(self.head_dim)  # thus post q_norm does not need reshape
++        
++    def forward(
++        self,
++        hidden_states,
++        cos,
++        sin,
++        eps,
++    ):
++        _,_,slen,_ = hidden_states.shape
++        q_hidden_shape = (1,slen, self.config.num_attention_heads, self.head_dim)
++        kv_hidden_shape = (1,slen, self.config.num_key_value_heads, self.head_dim)  
++        
++ 
++        query_states = self.q_norm(self.q_proj(hidden_states).view(q_hidden_shape),eps).transpose(1, 2)
++        key_states = self.k_norm(self.k_proj(hidden_states).view(kv_hidden_shape),eps).transpose(1, 2)
++        value_states = self.v_proj(hidden_states).view(kv_hidden_shape).transpose(1, 2)      
++        
++        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
++        
++        key_states = repeat_kv(key_states, self.num_key_value_groups)
++        value_states = repeat_kv(value_states, self.num_key_value_groups)
++        
++        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))*self.scaling_factor      
++        attn_weights = attn_weights + self.attention_mask
++               
++        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
++        attn_output = torch.matmul(attn_weights, value_states)
++        attn_output = attn_output.transpose(1, 2).contiguous()
++        attn_output = attn_output.reshape(1, 1, slen, self.config.hidden_size).contiguous()
++        attn_output = self.o_proj(attn_output)
++        
++        return attn_output
++
++
++class Qwen3DecoderLayer(nn.Module):
++    def __init__(self, config, layer_idx: int):
++        super().__init__()
++        
++        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
++        self.mlp = Qwen3MLP(config)
++        self.input_layernorm = Qwen3RMSNorm(config.hidden_size)
++        self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size)
++        
++    def forward(
++        self,
++        hidden_states,
++        cos,
++        sin,
++        eps,
++    ):
++        residual = hidden_states
++        hidden_states = self.input_layernorm(hidden_states,eps)
++        # Self Attention
++        hidden_states = self.self_attn(
++            hidden_states,
++            cos,
++            sin,
++            eps,
++            )
++        hidden_states = residual + hidden_states
++
++        # Fully Connected
++        residual = hidden_states
++        hidden_states = self.post_attention_layernorm(hidden_states,eps)
++        hidden_states = self.mlp(hidden_states)
++        hidden_states = residual + hidden_states
++        return hidden_states
++
++class Qwen3Model(PreTrainedModel):
++    def __init__(self, config):
++        super().__init__(config)
++
++        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
++        self.register_buffer("vocab_weights",self.embed_tokens.weight)
++        self.register_buffer("broadcast",torch.ones(self.config.max_position_embeddings,config.hidden_size,dtype=torch.int64))
++        
++        self.layers = nn.ModuleList(
++            [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
++        )
++        self.norm = Qwen3RMSNorm(config.hidden_size)
++    
++    def forward(
++        self,
++        input_ids,
++        cos,
++        sin,
++        eps,
++    ):
++      
++        input_ids = self.broadcast * input_ids
++        hidden_states = torch.gather(self.vocab_weights,0,input_ids)
++               
++        for decoder_layer in self.layers[:self.config.num_hidden_layers]:
++           
++            hidden_states = decoder_layer(
++                hidden_states.reshape(1,1,self.config.max_position_embeddings,self.config.hidden_size),
++                cos,
++                sin,
++                eps,
++            )  
++        hidden_states = self.norm(hidden_states,eps)
++        return hidden_states
++        
++
++class NNTrainerQwen3ForCausalLM(PreTrainedModel):
++  
++    def __init__(self, config):
++        super().__init__(config)
++        self.model = Qwen3Model(config)
++        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
++    
++    def forward(
++        self,
++        input_ids,
++        cos,
++        sin,
++        eps,
++    ):  
++        
++        hidden_states = self.model(
++            input_ids,
++            cos,
++            sin,
++            eps,
++        )
++
++        logits = self.lm_head(hidden_states)
++        
++        return logits
++        
+\ No newline at end of file
+diff --git a/Applications/ONNX/python/qwen3/multi-token/decode_tokens.py b/Applications/ONNX/python/qwen3/multi-token/decode_tokens.py
+new file mode 100644
+index 0000000000..c1fd354680
+--- /dev/null
++++ b/Applications/ONNX/python/qwen3/multi-token/decode_tokens.py
+@@ -0,0 +1,21 @@
++"""
++SPDX-License-Identifier: Apache-2.0
++Copyright (C) 2025 Sachin Singh <sachin.3@samsung.com>
++
++@file decode_tokens.py
++@date 23 September 2025
++@brief This script is used to decode the tokens generated by NNTrainer model.
++@note This script has been tested with transformers version 4.55.0 and PyTorch version 2.8.0
++
++@author Sachin Singh <sachin.3@samsung.com>
++"""
++import numpy as np
++from transformers import AutoTokenizer
++
++model_name = "Qwen/Qwen3-1.7B"
++tokenizer = AutoTokenizer.from_pretrained(model_name)
++
++generated = np.fromfile("./output_tokens.bin",dtype="float32").astype('int32')
++
++decoded = tokenizer.decode(generated, skip_special_tokens=True)
++print("NNTrainer model: ",decoded)
+diff --git a/Applications/ONNX/python/qwen3/multi-token/onnx_exporter.py b/Applications/ONNX/python/qwen3/multi-token/onnx_exporter.py
+new file mode 100644
+index 0000000000..aab7c6efa3
+--- /dev/null
++++ b/Applications/ONNX/python/qwen3/multi-token/onnx_exporter.py
+@@ -0,0 +1,114 @@
++"""
++SPDX-License-Identifier: Apache-2.0
++Copyright (C) 2025 Sachin Singh <sachin.3@samsung.com>
++
++@file onnx_exporter.py
++@date 17 September 2025
++@brief This file inferences qwen model using custom_qwen3.py file and generates its ONNX model.
++@note This script has been tested with transformers version 4.55.0 and PyTorch version 2.8.0
++
++@author Sachin Singh <sachin.3@samsung.com>
++"""
++
++import torch
++from transformers import AutoTokenizer, Qwen3Config, AutoModelForCausalLM
++from custom_qwen3 import  NNTrainerQwen3ForCausalLM, Qwen3RotaryEmbedding
++import onnx
++import numpy as np
++
++model_name = "Qwen/Qwen3-1.7B"
++tokenizer = AutoTokenizer.from_pretrained(model_name)
++
++
++####Offical Model####
++
++config = Qwen3Config.from_pretrained(model_name)  
++
++# Fixed maximum length model can handle
++max_len = 256
++config.max_position_embeddings = max_len
++official_model = AutoModelForCausalLM.from_pretrained(model_name,config = config).eval()
++
++#tokens to be generated
++num_tokens_to_generate = 20
++
++# Prompt
++prompt = "Tell me a dad joke about a computer: "
++print("\nInput prompt: ",prompt)
++
++enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_len)
++cur_len = enc.input_ids.size(1)
++
++input_ids = torch.full((1, max_len), tokenizer.pad_token_id)  # preallocate with PAD
++input_ids[0, :cur_len] = enc.input_ids[0]
++
++generated = input_ids.clone()
++
++for step in range(num_tokens_to_generate):  # generate 20 tokens
++
++    outputs = official_model(
++        input_ids=generated
++    )
++
++    next_token_logits = outputs.logits[:, cur_len - 1, :]
++    next_token_id = torch.argmax(next_token_logits, dim=-1)
++
++    generated[0][cur_len] = next_token_id
++    cur_len += 1
++
++decoded = tokenizer.decode(generated[0, :cur_len], skip_special_tokens=True)
++print("\nOfficial Model: ",decoded)
++
++####Custom Model####
++
++qwenConfig = official_model.config
++custom_model =  NNTrainerQwen3ForCausalLM(qwenConfig)
++custom_model.load_state_dict(official_model.state_dict(),strict=False)
++
++rotary_emb = Qwen3RotaryEmbedding(qwenConfig)
++
++generated = input_ids.clone() # input to official Qwen model
++cur_len =  enc.input_ids.size(1)
++
++position_ids = torch.arange(generated.shape[1]).reshape(1, -1).repeat(generated.shape[0], 1)
++cos, sin = rotary_emb(generated.to(torch.float32), position_ids)
++cos, sin = torch.tensor(cos.numpy()), torch.tensor(sin.numpy())
++variance_epsilon = torch.tensor([[1e-6,]])
++
++cos = cos.reshape(max_len * 128)
++sin = sin.reshape(max_len * 128)
++
++generated.detach().numpy().astype(np.float32).tofile('./input_tokens.bin')
++cos.detach().numpy().tofile('./rotary_embeddings_cosine.bin')
++sin.detach().numpy().tofile('./rotary_embeddings_sine.bin')
++
++for step in range(num_tokens_to_generate):  # generate 20 tokens
++
++    outputs = custom_model(
++        generated.reshape(max_len,1), 
++        cos,
++        sin,
++        variance_epsilon
++    )
++
++    next_token_logits = outputs[0][:, cur_len - 1, :]
++    next_token_id = torch.argmax(next_token_logits,dim=-1)
++    generated[0][cur_len] = next_token_id
++    cur_len += 1
++
++
++decoded = tokenizer.decode(generated[0, :cur_len], skip_special_tokens=True)
++print("\nCustom Model: ",decoded)
++
++torch.onnx.export(
++    custom_model, (generated.reshape(max_len,1), cos, sin, variance_epsilon),
++    './qwen3_model.onnx',
++    export_params=True,
++    opset_version=17,
++    input_names=['input', 'cos', 'sin', 'variance_epsilon'],
++    output_names=['output'],
++    keep_initializers_as_inputs=False,
++    dynamic_axes=None,
++ )
++
++print("<Model exported successfully>")
+diff --git a/Applications/ONNX/python/qwen3/requirements.txt b/Applications/ONNX/python/qwen3/requirements.txt
+new file mode 100644
+index 0000000000..ca54115cf4
+--- /dev/null
++++ b/Applications/ONNX/python/qwen3/requirements.txt
+@@ -0,0 +1,59 @@
++accelerate==1.10.0
++annotated-types==0.7.0
++certifi==2025.8.3
++charset-normalizer==3.4.3
++coloredlogs==15.0.1
++filelock==3.18.0
++flatbuffers==25.2.10
++fsspec==2025.7.0
++hf-xet==1.1.7
++huggingface-hub==0.34.4
++humanfriendly==10.0
++idna==3.10
++Jinja2==3.1.6
++llama_models==0.2.0
++markdown-it-py==4.0.0
++MarkupSafe==3.0.2
++mdurl==0.1.2
++mpmath==1.3.0
++networkx==3.5
++numpy==2.3.2
++nvidia-cublas-cu12==12.8.4.1
++nvidia-cuda-cupti-cu12==12.8.90
++nvidia-cuda-nvrtc-cu12==12.8.93
++nvidia-cuda-runtime-cu12==12.8.90
++nvidia-cudnn-cu12==9.10.2.21
++nvidia-cufft-cu12==11.3.3.83
++nvidia-cufile-cu12==1.13.1.3
++nvidia-curand-cu12==10.3.9.90
++nvidia-cusolver-cu12==11.7.3.90
++nvidia-cusparse-cu12==12.5.8.93
++nvidia-cusparselt-cu12==0.7.1
++nvidia-nccl-cu12==2.27.3
++nvidia-nvjitlink-cu12==12.8.93
++nvidia-nvtx-cu12==12.8.90
++onnx==1.18.0
++onnxruntime==1.22.1
++packaging==25.0
++pillow==12.0.0
++protobuf==6.31.1
++psutil==7.0.0
++pydantic==2.12.2
++pydantic_core==2.41.4
++Pygments==2.19.2
++PyYAML==6.0.2
++regex==2025.7.34
++requests==2.32.4
++rich==14.2.0
++safetensors==0.6.2
++setuptools==80.9.0
++sympy==1.14.0
++tiktoken==0.12.0
++tokenizers==0.21.4
++torch==2.8.0
++tqdm==4.67.1
++transformers==4.55.0
++triton==3.4.0
++typing-inspection==0.4.2
++typing_extensions==4.14.1
++urllib3==2.5.0
+\ No newline at end of file
+diff --git a/Applications/ONNX/python/qwen3/single-token/compare.py b/Applications/ONNX/python/qwen3/single-token/compare.py
+new file mode 100644
+index 0000000000..8272151a22
+--- /dev/null
++++ b/Applications/ONNX/python/qwen3/single-token/compare.py
+@@ -0,0 +1,22 @@
++"""
++SPDX-License-Identifier: Apache-2.0
++Copyright (C) 2025 Sachin Singh <sachin.3@samsung.com>
++
++@file compare.py
++@date 17 September 2025
++@brief This script compares official and NNTrainer model output logits.
++@note This script has been tested with transformers version 4.55.0 and PyTorch version 2.8.0
++
++@author Sachin Singh <sachin.3@samsung.com>
++"""
++
++import numpy as np
++
++arr1 = np.fromfile("./modelling_logits.bin",dtype="float32").reshape(1,151936)
++arr2 = np.fromfile("./nntrainer_logits.bin",dtype="float32").reshape(1,151936)
++
++if(np.allclose(arr1,arr2,atol=1e-4,rtol=1e-4)):
++    print("equal")
++else:
++    print("not equal")    
++    
+\ No newline at end of file
+diff --git a/Applications/ONNX/python/qwen3/single-token/create_bin.py b/Applications/ONNX/python/qwen3/single-token/create_bin.py
+new file mode 100644
+index 0000000000..974f53ad45
+--- /dev/null
++++ b/Applications/ONNX/python/qwen3/single-token/create_bin.py
+@@ -0,0 +1,75 @@
++"""
++SPDX-License-Identifier: Apache-2.0
++Copyright (C) 2025 Sachin Singh <sachin.3@samsung.com>
++
++@file create_bin.py
++@date 17 September 2025
++@brief This script creates weight.bin for each weight of the ONNX model and converts all ONNX weights to FP32.
++@note This script has been tested with transformers version 4.55.0 and PyTorch version 2.8.0
++
++@author Sachin Singh <sachin.3@samsung.com>
++"""
++
++import onnx
++import numpy as np
++import json
++import os
++import shutil
++from onnx import numpy_helper, TensorProto
++
++def cleanName(name):
++    if name.startswith('/'):
++        name = name[1:]
++    
++    name = name.replace('/', '_')
++    name = name.replace('.', '_')
++    name = name.replace(':', '_')
++    name = name.lower()
++    
++    return name
++    
++model_name="./qwen3_model.onnx"    
++model = onnx.load(model_name, load_external_data=True)
++new_initializers = []
++
++metadata = {}
++
++script_dir = os.path.dirname(os.path.abspath(__file__))
++folder = os.path.join(script_dir, "bins")
++if os.path.exists(folder):
++    shutil.rmtree(folder) 
++os.makedirs(folder)
++
++for tensor in model.graph.initializer:
++    arr = numpy_helper.to_array(tensor).astype(np.float32)
++    if tensor.data_type != TensorProto.FLOAT:
++        new_tensor = numpy_helper.from_array(arr, name=tensor.name)
++        new_initializers.append(new_tensor)
++    else:
++        new_initializers.append(tensor)    
++    filename = f"./bins/{cleanName(tensor.name)}.bin"
++    arr.tofile(filename)
++    
++    # Save metadata (name, dtype, shape, file)
++    metadata[tensor.name] = {
++        "file": filename,
++        "tensor name": tensor.name,
++        "dtype": TensorProto.DataType.Name(tensor.data_type),
++        "shape": list(arr.shape)
++    }
++    
++    print(f"Saved {tensor.name} -> {filename}, dtype={arr.dtype}, shape={arr.shape}")
++
++# Replace initializers
++model.graph.initializer.clear()
++model.graph.initializer.extend(new_initializers)
++onnx.save(model, 
++          model_name,
++          save_as_external_data=True,
++          all_tensors_to_one_file=True,
++          size_threshold=0,
++          )    
++
++with open("./weights_metadata.json", "w") as f:
++    json.dump(metadata, f, indent=4) 
++    
+\ No newline at end of file
+diff --git a/Applications/ONNX/python/qwen3/single-token/custom_qwen3.py b/Applications/ONNX/python/qwen3/single-token/custom_qwen3.py
+new file mode 100644
+index 0000000000..ff76b8f784
+--- /dev/null
++++ b/Applications/ONNX/python/qwen3/single-token/custom_qwen3.py
+@@ -0,0 +1,278 @@
++"""
++SPDX-License-Identifier: Apache-2.0
++Copyright (C) 2025 Sachin Singh <sachin.3@samsung.com>
++
++@file custom_qwen3.py
++@date 13 August 2025
++@brief This is a Qwen3 1.7B modeling file that is compatible with Hugging Face and supports conversion
++       from PyTorch to ONNX to NNTrainer. It does not include masking and caching for token generation.
++@note This script has been tested with transformers version 4.55.0 and PyTorch version 2.8.0
++
++@author Sachin Singh <sachin.3@samsung.com>
++"""
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
++from transformers.modeling_utils import PreTrainedModel
++
++class Qwen3RotaryEmbedding(nn.Module):
++    def __init__(self, config, device=None):
++        super().__init__()
++        # BC: "rope_type" was originally "type"
++        if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
++            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
++        else:
++            self.rope_type = "default"
++        self.max_seq_len_cached = config.max_position_embeddings
++        self.original_max_seq_len = config.max_position_embeddings
++
++        self.config = config
++        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
++
++        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
++        self.register_buffer("inv_freq", inv_freq, persistent=False)
++        self.original_inv_freq = self.inv_freq
++
++    @torch.no_grad()
++    #@dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
++    def forward(self, x, position_ids):
++        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
++        position_ids_expanded = position_ids[:, None, :].float()
++
++        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
++        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
++            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
++            emb = torch.cat((freqs, freqs), dim=-1)
++            cos = emb.cos() * self.attention_scaling
++            sin = emb.sin() * self.attention_scaling
++
++        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
++
++class Qwen3RMSNorm(nn.Module):
++    def __init__(self, hidden_size):
++        """
++        Qwen3RMSNorm is equivalent to T5LayerNorm
++        """
++        super().__init__()
++        self.weight = nn.Parameter(torch.ones(hidden_size))
++
++    def forward(self, hidden_states,eps):
++        input_dtype = hidden_states.dtype
++        variance = hidden_states.pow(2).mean(3,keepdim=True)
++        std_dev = torch.sqrt(variance + eps)
++        hidden_states = hidden_states * torch.pow(std_dev, -1)
++        return hidden_states.to(input_dtype) * self.weight
++
++class Qwen3MLP(nn.Module):
++    def __init__(self, config):
++        super().__init__()
++        self.config = config
++        self.hidden_size = config.hidden_size
++        self.intermediate_size = config.intermediate_size
++        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
++        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
++        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
++        self.act_fn = F.silu
++
++    def forward(self, x):
++        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
++        return down_proj
++
++def rotate_half(x):
++    """Rotates half the hidden dims of the input."""
++    x1 = x[..., : x.shape[-1] // 2]
++    x2 = x[..., x.shape[-1] // 2 :x.shape[-1]]
++    return torch.cat((-x2, x1), dim=3) # -1 changed to 3
++
++
++def apply_rotary_pos_emb(q, k, cos, sin):
++
++    q_embed = (q * cos) + (rotate_half(q) * sin)
++    k_embed = (k * cos) + (rotate_half(k) * sin)
++    return q_embed, k_embed
++
++def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
++    """
++    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
++    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
++    """
++    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
++    if n_rep == 1:
++        return hidden_states
++    
++    hidden_states = torch.cat([hidden_states]*n_rep,dim=2)
++    hidden_states = hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
++    return hidden_states
++
++class Qwen3Attention(nn.Module):
++    """Multi-headed attention from 'Attention Is All You Need' paper"""
++
++    def __init__(self, config, layer_idx: int):
++        super().__init__()
++        self.config = config
++        self.layer_idx = layer_idx
++        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
++        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
++        self.scaling = self.head_dim**-0.5
++        self.attention_dropout = config.attention_dropout
++        self.is_causal = True
++
++        self.q_proj = nn.Linear(
++            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
++        )
++        self.k_proj = nn.Linear(
++            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
++        )
++        self.v_proj = nn.Linear(
++            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
++        )
++        self.o_proj = nn.Linear(
++            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
++        )
++        self.q_norm = Qwen3RMSNorm(self.head_dim)  # unlike olmo, only on the head dim!
++        self.k_norm = Qwen3RMSNorm(self.head_dim)  # thus post q_norm does not need reshape
++        
++    def forward(
++        self,
++        hidden_states,
++        cos,
++        sin,
++        eps
++    ):
++        
++        q_hidden_shape = (1,1,self.config.num_attention_heads,self.head_dim)
++        kv_hidden_shape = (1,1,self.config.num_key_value_heads,self.head_dim)  
++               
++        query_states = self.q_norm(self.q_proj(hidden_states).view(q_hidden_shape),eps).transpose(1,2)
++        key_states = self.k_norm(self.k_proj(hidden_states).view(kv_hidden_shape),eps).transpose(1,2)
++        value_states = self.v_proj(hidden_states).view(kv_hidden_shape).transpose(1,2)
++               
++        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
++            
++        key_states = repeat_kv(key_states, self.num_key_value_groups)
++        value_states = repeat_kv(value_states, self.num_key_value_groups)
++        
++        #attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
++        
++        #The above line is replaced by mul operation and reducesum.
++        #This was done to overcome an issue related with the above matmul op while inferencing in nntrainer
++        #This only working in the case single token inference. 
++        
++        attn_weights = query_states.transpose(1,2) * key_states.transpose(1,2)
++        attn_weights = torch.sum(attn_weights, dim=3,keepdim=True)
++        
++        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)  
++        
++        attn_output = value_states.transpose(1,2) * attn_weights
++        
++        # Line above replaces the below two. 
++        # attn_output = torch.matmul(attn_weights, value_states)
++        # attn_output = attn_output.transpose(1, 2).contiguous()   
++              
++        attn_output = attn_output.reshape(1, 1, 1, self.config.hidden_size).contiguous()
++        attn_output = self.o_proj(attn_output)
++        return attn_output
++
++class Qwen3DecoderLayer(nn.Module):
++    def __init__(self, config, layer_idx: int):
++        super().__init__()
++        
++        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
++        self.mlp = Qwen3MLP(config)
++        self.input_layernorm = Qwen3RMSNorm(config.hidden_size)
++        self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size)
++        
++    def forward(
++        self,
++        hidden_states,
++        cos,
++        sin,
++        eps
++    ):
++        residual = hidden_states
++        hidden_states = self.input_layernorm(hidden_states,eps)
++       
++        # Self Attention
++        hidden_states = self.self_attn(
++            hidden_states,
++            cos,
++            sin,
++            eps
++            )
++        hidden_states = residual + hidden_states
++
++        # Fully Connected
++        residual = hidden_states
++        
++        hidden_states = self.post_attention_layernorm(hidden_states,eps)
++        hidden_states = self.mlp(hidden_states)
++        hidden_states = residual + hidden_states
++        return hidden_states
++
++class Qwen3Model(PreTrainedModel):
++    def __init__(self, config):
++        super().__init__(config)
++
++        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
++        self.register_buffer("vocab_weights",self.embed_tokens.weight)
++        self.register_buffer("broadcast",torch.ones(1,config.hidden_size,dtype=torch.int64))
++        
++        self.layers = nn.ModuleList(
++            [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
++        )
++        
++        self.norm = Qwen3RMSNorm(config.hidden_size)
++    
++    def forward(
++        self,
++        input_ids,
++        cos,
++        sin,
++        eps
++    ):
++        
++        #hidden_states_new = self.embed_tokens(input_ids)
++
++        # nn.embedding is replaced by gather op for easier tracing. Hence input is broadcasted to (1,1,1,self.config,hidden_size).   
++        input_ids = self.broadcast * input_ids
++        hidden_states = torch.gather(self.vocab_weights,0,input_ids)
++             
++        for decoder_layer in self.layers[:self.config.num_hidden_layers]:
++            hidden_states = decoder_layer(
++                hidden_states.reshape(1,1,1,self.config.hidden_size),
++                cos,
++                sin,
++                eps
++            )
++
++        hidden_states = self.norm(hidden_states,eps)
++        return hidden_states
++        
++
++class NNTrainerQwen3ForCausalLM(PreTrainedModel):
++  
++    def __init__(self, config):
++        super().__init__(config)
++        self.model = Qwen3Model(config)
++        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
++          
++    def forward(
++        self,
++        input_ids,
++        cos,
++        sin,
++        eps
++    ):  
++        hidden_states = self.model(
++            input_ids,
++            cos,
++            sin,
++            eps
++        )
++                
++        logits = self.lm_head(hidden_states)
++        
++        return logits
++    
+\ No newline at end of file
+diff --git a/Applications/ONNX/python/qwen3/single-token/onnx_exporter.py b/Applications/ONNX/python/qwen3/single-token/onnx_exporter.py
+new file mode 100644
+index 0000000000..ce4240e4ba
+--- /dev/null
++++ b/Applications/ONNX/python/qwen3/single-token/onnx_exporter.py
+@@ -0,0 +1,56 @@
++"""
++SPDX-License-Identifier: Apache-2.0
++Copyright (C) 2025 Sachin Singh <sachin.3@samsung.com>
++
++@file onnx_exporter.py
++@date 17 September 2025
++@brief This file inferences qwen model using custom_qwen3.py file and generates its ONNX model.
++@note This script has been tested with transformers version 4.55.0 and PyTorch version 2.8.0
++
++@author Sachin Singh <sachin.3@samsung.com>
++"""
++
++from transformers import AutoModelForCausalLM, AutoTokenizer
++from custom_qwen3 import  NNTrainerQwen3ForCausalLM, Qwen3RotaryEmbedding
++import torch
++import numpy as np
++
++model_name = "Qwen/Qwen3-1.7B"
++
++official_model = AutoModelForCausalLM.from_pretrained(model_name)
++
++qwenConfig = official_model.config
++custom_model =  NNTrainerQwen3ForCausalLM(qwenConfig)
++custom_model.load_state_dict(official_model.state_dict(),strict=False)
++
++rotary_emb = Qwen3RotaryEmbedding(qwenConfig)
++
++x = torch.tensor([[52,],]).view(-1, 1)
++position_ids = torch.arange(1).reshape(1, -1)
++cos, sin = rotary_emb(x, position_ids)
++cos, sin = torch.tensor(cos.numpy()), torch.tensor(sin.numpy())
++variance_epsilon = torch.tensor([[1e-6,]])
++
++logits_of_custom_model = custom_model(x,cos,sin,variance_epsilon)
++logits_of_official_model = official_model(x).logits
++
++if (torch.allclose(logits_of_custom_model, logits_of_official_model,atol=1e-5)):
++    print("<All logits matched successfully>")
++else:
++    print("<Some logits do not match>")
++
++logits_of_custom_model = logits_of_custom_model.detach().numpy()
++logits_of_custom_model.tofile("./modelling_logits.bin")
++
++torch.onnx.export(
++    custom_model, (x, cos, sin, variance_epsilon),
++    'qwen3_model.onnx',
++    export_params=True,
++    opset_version=17,
++    input_names=['input', 'cos', 'sin', 'variance_epsilon'],
++    output_names=['output'],
++    keep_initializers_as_inputs=False,
++    dynamic_axes=None,
++ )
++
++print("<Model exported successfully>") 
