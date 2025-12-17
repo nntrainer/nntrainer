@@ -211,7 +211,7 @@ LayerNode::LayerNode(std::unique_ptr<nntrainer::Layer> &&l) :
   needs_restore_data(false),
   data_type({TensorDim::DataType::FP32, TensorDim::DataType::FP32}),
   is_checkpointed(false),
-  is_checkpoint_boundary(false),
+  is_checkpoint_block_start(false),
   is_checkpoint_block_end(false),
   checkpoint_block_id("") {
   if (layer && layer->getType() == TimeDistLayer::type) {

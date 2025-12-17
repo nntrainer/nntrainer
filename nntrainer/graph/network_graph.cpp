@@ -45,6 +45,8 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <map>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -880,9 +882,9 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
    */
   std::vector<std::string> input_names;
   input_names.reserve(prev_inputs.size());
-  std::transform(prev_inputs.begin(), prev_inputs.end(),
-                 std::back_inserter(input_names),
-                 [](auto const &vg) -> const auto & { return vg->getName(); });
+  std::transform(
+    prev_inputs.begin(), prev_inputs.end(), std::back_inserter(input_names),
+    [](auto const &vg) -> const auto & { return vg->getName(); });
   const std::vector<Var_Grad *> &inputs = tensor_manager->requestInputs(
     gnode, init_context.getInputDimensions(), input_names,
     lnode->isCheckpointed(), lnode->isFirstInCheckpointBlock());
@@ -1304,9 +1306,9 @@ NetworkGraph::refinalizeContext(const std::shared_ptr<LayerNode> &lnode,
    */
   std::vector<std::string> input_names;
   input_names.reserve(prev_inputs.size());
-  std::transform(prev_inputs.begin(), prev_inputs.end(),
-                 std::back_inserter(input_names),
-                 [](auto const &vg) -> const auto & { return vg->getName(); });
+  std::transform(
+    prev_inputs.begin(), prev_inputs.end(), std::back_inserter(input_names),
+    [](auto const &vg) -> const auto & { return vg->getName(); });
   const std::vector<Var_Grad *> &inputs = tensor_manager->requestInputs(
     gnode, init_context.getInputDimensions(), input_names);
 
@@ -2027,12 +2029,14 @@ void NetworkGraph::setInputsLabels(const std::vector<Tensor> &inputs,
 void NetworkGraph::setInputsLabels(sharedConstTensors &inputs,
                                    sharedConstTensors &labels) {
   std::vector<Tensor> ins;
-  std::transform(inputs.begin(), inputs.end(), std::back_inserter(ins),
-                 [](auto const &val) -> const auto & { return *val.get(); });
+  std::transform(
+    inputs.begin(), inputs.end(), std::back_inserter(ins),
+    [](auto const &val) -> const auto & { return *val.get(); });
 
   std::vector<Tensor> labs;
-  std::transform(labels.begin(), labels.end(), std::back_inserter(labs),
-                 [](auto const &val) -> const auto & { return *val.get(); });
+  std::transform(
+    labels.begin(), labels.end(), std::back_inserter(labs),
+    [](auto const &val) -> const auto & { return *val.get(); });
 
   setInputsLabels(ins, labs);
 }
@@ -2147,6 +2151,139 @@ void NetworkGraph::applyCheckpointBlocks(
       "  Expanded checkpoint block from %zu user layers to %zu total layers",
       user_layer_names.size(), layer_names.size());
 
+    // Verify that layers in checkpoint block form a connected subgraph
+    // using input/output connections
+    std::set<std::string> block_layer_set(layer_names.begin(),
+                                          layer_names.end());
+
+    // Verify all layers exist in the graph
+    for (const auto &layer_name : layer_names) {
+      auto layer_node = getLayerNode(layer_name);
+      if (!layer_node) {
+        throw std::invalid_argument("Checkpoint block '" + block_id +
+                                    "': Layer '" + layer_name +
+                                    "' not found in the graph");
+      }
+    }
+
+    // BFS to verify all layers are reachable from start layers
+    // Start layers: layers whose inputs are all from outside the block
+    // End layers: layers whose outputs are all to outside the block
+    std::set<std::string> reachable_layers;
+    std::set<std::string> start_layers;
+    std::set<std::string> end_layers;
+    std::queue<std::string> to_visit;
+
+    for (const auto &layer_name : layer_names) {
+      auto layer_node = getLayerNode(layer_name);
+
+      // Check if this is a start layer (no internal inputs)
+      const auto &input_connections = layer_node->getInputConnections();
+      bool has_internal_input = false;
+      for (const auto &input : input_connections) {
+        if (block_layer_set.find(input) != block_layer_set.end()) {
+          has_internal_input = true;
+          break;
+        }
+      }
+      if (!has_internal_input) {
+        to_visit.push(layer_name);
+        reachable_layers.insert(layer_name);
+        start_layers.insert(layer_name);
+      }
+
+      // Check if this is an end layer (no internal outputs)
+      const auto &output_connections = layer_node->getOutputConnections();
+      bool has_internal_output = false;
+      for (const auto &output : output_connections) {
+        if (block_layer_set.find(output) != block_layer_set.end()) {
+          has_internal_output = true;
+          break;
+        }
+      }
+      if (!has_internal_output) {
+        end_layers.insert(layer_name);
+      }
+    }
+
+    if (start_layers.empty()) {
+      throw std::invalid_argument(
+        "Checkpoint block '" + block_id +
+        "': Could not find a start layer (cycle detected or invalid block)");
+    }
+
+    // Build reverse connection map (output -> inputs) from input connections
+    // This is needed because output connections are not set before compile()
+    std::map<std::string, std::set<std::string>> reverse_connections;
+    for (const auto &layer_name : layer_names) {
+      auto layer_node = getLayerNode(layer_name);
+      const auto &input_connections = layer_node->getInputConnections();
+      for (const auto &input : input_connections) {
+        if (block_layer_set.find(input) != block_layer_set.end()) {
+          reverse_connections[input].insert(layer_name);
+        }
+      }
+    }
+
+    // Verify that all layers form a single connected subgraph
+    // Start BFS from ONE start layer and traverse both directions
+    std::set<std::string> connected_layers;
+    std::queue<std::string> connectivity_queue;
+
+    // Start from the first start layer
+    std::string first_start = *start_layers.begin();
+    connectivity_queue.push(first_start);
+    connected_layers.insert(first_start);
+
+    while (!connectivity_queue.empty()) {
+      std::string current = connectivity_queue.front();
+      connectivity_queue.pop();
+
+      auto current_node = getLayerNode(current);
+
+      // Follow forward direction (using reverse_connections map)
+      auto it = reverse_connections.find(current);
+      if (it != reverse_connections.end()) {
+        for (const auto &output : it->second) {
+          if (connected_layers.find(output) == connected_layers.end()) {
+            connected_layers.insert(output);
+            connectivity_queue.push(output);
+          }
+        }
+      }
+
+      // Follow backward direction (input connections)
+      const auto &input_connections = current_node->getInputConnections();
+      for (const auto &input : input_connections) {
+        if (block_layer_set.find(input) != block_layer_set.end() &&
+            connected_layers.find(input) == connected_layers.end()) {
+          connected_layers.insert(input);
+          connectivity_queue.push(input);
+        }
+      }
+    }
+
+    // Check if all layers are connected (single connected component)
+    // Use block_layer_set for comparison to handle duplicates in layer_names
+    if (connected_layers.size() != block_layer_set.size()) {
+      std::string disconnected;
+      for (const auto &layer_name : block_layer_set) {
+        if (connected_layers.find(layer_name) == connected_layers.end()) {
+          if (!disconnected.empty())
+            disconnected += ", ";
+          disconnected += layer_name;
+        }
+      }
+      throw std::invalid_argument(
+        "Checkpoint block '" + block_id +
+        "': Layers do not form a single connected graph. "
+        "Disconnected layers: " +
+        disconnected);
+    }
+
+    ml_logi("  Verified checkpoint block layers are connected (%zu layers)",
+            layer_names.size());
+
     ml_logi(
       "Processing checkpoint block '%s' with %zu layers (expanded from %zu)",
       block_id.c_str(), layer_names.size(), user_layer_names.size());
@@ -2161,21 +2298,23 @@ void NetworkGraph::applyCheckpointBlocks(
         layer_node->setCheckpointed(true);
         layer_node->setCheckpointBlockId(block_id);
 
-        // Mark first layer in the block
-        if (i == 0) {
-          layer_node->setFirstInCheckpointBlock(true);
-          ml_logd("  Layer '%s' marked as first in checkpoint block",
+        // Mark start layers (layers with no internal inputs) as first in block
+        bool is_start = start_layers.find(layer_name) != start_layers.end();
+        layer_node->setFirstInCheckpointBlock(is_start);
+        if (is_start) {
+          ml_logd("  Layer '%s' marked as start layer in checkpoint block",
                   layer_name.c_str());
         } else {
-          layer_node->setFirstInCheckpointBlock(false);
-          ml_logd("  Layer '%s' marked as checkpointed (not first)",
+          ml_logd("  Layer '%s' marked as checkpointed (not start)",
                   layer_name.c_str());
         }
 
-        if (i == layer_names.size() - 1) {
-          layer_node->setLastInCheckpointBlock(true);
-        } else {
-          layer_node->setLastInCheckpointBlock(false);
+        // Mark end layers (layers with no internal outputs) as last in block
+        bool is_end = end_layers.find(layer_name) != end_layers.end();
+        layer_node->setLastInCheckpointBlock(is_end);
+        if (is_end) {
+          ml_logd("  Layer '%s' marked as end layer in checkpoint block",
+                  layer_name.c_str());
         }
 
         // Disable in-place optimization for checkpointed layers
