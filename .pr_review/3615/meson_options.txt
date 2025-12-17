@@ -1,0 +1,75 @@
+option('platform', type: 'combo', choices: ['none', 'tizen', 'yocto', 'android', 'windows'], value: 'none')
+option('enable-app', type: 'boolean', value: true)
+option('install-app', type: 'boolean', value: true)
+option('use_gym', type: 'boolean', value: false)
+option('enable-capi', type: 'feature', value: 'auto')
+option('enable-ccapi', type: 'boolean', value: true)
+option('enable-test', type: 'boolean', value: true)
+option('enable-logging', type: 'boolean', value: true)
+option('enable-tizen-feature-check', type: 'boolean', value: true)
+option('enable-nnstreamer-backbone', type: 'boolean', value: false)
+option('enable-tflite-backbone', type: 'boolean', value: true)
+option('enable-profile', type: 'boolean', value: false)
+option('enable-trace', type: 'boolean', value: false)
+option('enable-debug', type: 'boolean', value: false)
+option('enable-tflite-interpreter', type: 'boolean', value: true)
+option('enable-onnx-interpreter', type: 'boolean', value: false)
+option('enable-fsu', type: 'boolean', value: false)
+option('fsu-path', type: 'string', value: '')
+option('test-timeout', type: 'integer', value: 90)
+option('opencl-kernel-path', type: 'string', value: 'nntrainer_opencl_kernels')
+option('enable-mmap', type: 'boolean', value: true)
+option('enable-npu', type: 'boolean', value: false)
+option('mmap-read', type: 'boolean', value: true)
+option('enable-kernel-caching', type: 'boolean', value: false)
+
+# dependency conflict resolution
+option('capi-ml-inference-actual', type: 'string', value: 'capi-ml-inference',
+        description: 'backward compatible dependency name of capi-ml-inference. ignored if ml-api-support is disabled.')
+option('capi-ml-common-actual', type: 'string', value: 'capi-ml-common',
+        description: 'backward compatible dependency name of capi-ml-common. ignored if ml-api-support is disabled.')
+option('tizen-version-major', type: 'integer', min : 4, max : 9999, value: 9999) # 9999 means "not Tizen"
+option('tizen-version-minor', type: 'integer', min : 0, max : 9999, value: 0)
+option('openblas-num-threads', type: 'integer', min : 0, max : 9999, value: 0)
+#This is for the multi-threading in nntrainer
+option('nntr-num-threads', type: 'integer', min : 0, max : 9999, value: 1)
+option('omp-num-threads', type: 'integer', min : 0, max : 9999, value: 6)
+option('hgemm-experimental-kernel', type: 'boolean', value: false)
+
+# test related option
+option('reduce-tolerance', type: 'boolean', value: true)
+option('enable-long-test', type: 'boolean', value: false)
+
+# backend options
+option('enable-blas', type: 'boolean', value: true)
+option('enable-fp16', type: 'boolean', value: false)
+option('enable-cublas', type: 'boolean', value: false)
+option('enable-openmp', type: 'boolean', value: true)
+option('enable-opencl', type: 'boolean', value: false)
+option('enable-biqgemm', type: 'boolean', value: false)
+option('biqgemm-path', type: 'string', value: '../BiQGEMM')
+option('enable-benchmarks', type: 'boolean', value : false)
+option('enable-ruy', type: 'boolean', value: false)
+option('ggml-thread-backend', type: 'string', value: 'mixed')
+
+# ml-api dependency (to enable, install capi-inference from github.com/nnstreamer/api )
+# To inter-operate with nnstreamer and ML-API packages, you need to enable this.
+# If this is disabled, related options (capi-ml-*) are ignored.
+option('ml-api-support', type: 'feature', value: 'auto')
+# @todo : make them use 'feature' and depend on ml-api-support
+option('enable-nnstreamer-tensor-filter', type: 'feature', value: 'auto')
+option('enable-nnstreamer-tensor-trainer', type: 'feature', value: 'auto')
+option('nnstreamer-subplugin-install-path', type: 'string', value: 'lib/nnstreamer') # where nnstreamer subplugin should be installed (after prefix)
+
+# application related options
+option('enable-transformer', type: 'boolean', value: false)
+option('libiomp_root', type:'string', value: './libiomp_win')
+
+# ARM architecture options
+option('arm-arch', type: 'combo',
+       choices: ['auto', 'armv7l', 'armv8.2-a', 'armv9.2-a'],
+       value: 'auto',
+       description: 'Target ARM architecture. "auto" detects from host for native builds, defaults to armv8.2-a for cross-compilation.')
+option('arm-march', type: 'string',
+       value: '',
+       description: 'ARM march flag (e.g., "-march=armv8.2-a+fp16+dotprod+i8mm"). If empty, derived from arm-arch.')
