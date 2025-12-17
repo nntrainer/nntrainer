@@ -422,7 +422,7 @@ public:
    */
   void allocateWeights(bool init = true) {
     unsigned int max_exec_order =
-      std::get<3>(backward_iter_end->getExecutionOrder());
+      std::get<4>(backward_iter_end->getExecutionOrder());
 
     if (exec_mode == ExecutionMode::INFERENCE)
       max_exec_order = std::get<0>(forward_iter_end->getExecutionOrder());
