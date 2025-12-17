@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <neuralnet.h>
+#include <stdexcept>
 
 /**
  * @brief Simple fixed-pattern data generator used by gradient checkpointing
