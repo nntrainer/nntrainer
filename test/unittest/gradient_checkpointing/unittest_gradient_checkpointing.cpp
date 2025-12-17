@@ -396,6 +396,39 @@ TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_03) {
   EXPECT_NO_THROW(model->train());
 }
 
+TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_04) {
+  // A checkpoint block that skips the middle layer should fail connectivity
+  std::unique_ptr<ml::train::Model> model;
+  std::unique_ptr<ml::train::Optimizer> optimizer;
+
+  EXPECT_NO_THROW(model = ml::train::createModel(
+                    ml::train::ModelType::NEURAL_NET, {"loss=mse"}));
+
+  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
+    "input",
+    {"input_shape=1:" + std::to_string(8) + ":1", "name=input_tokens"})));
+
+  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
+    "fully_connected", {"unit=" + std::to_string(16), "name=fc1"})));
+
+  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
+    "fully_connected", {"unit=" + std::to_string(16), "name=fc2"})));
+
+  EXPECT_NO_THROW(model->addLayer(
+    ml::train::createLayer("fully_connected", {"unit=1", "name=fc3"})));
+
+  EXPECT_EQ(model->addCheckpointBlock({"fc1", "fc3"}), ML_ERROR_NONE);
+
+  EXPECT_NO_THROW(model->setProperty(
+    {"batch_size=" + std::to_string(4), "epochs=" + std::to_string(1)}));
+
+  EXPECT_NO_THROW(
+    optimizer = ml::train::createOptimizer("adam", {"learning_rate=0.001"}));
+  EXPECT_NO_THROW(model->setOptimizer(std::move(optimizer)));
+
+  EXPECT_THROW(model->compile(), std::invalid_argument);
+}
+
 /**
  * @brief Main gtest
  */
