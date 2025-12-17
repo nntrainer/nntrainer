@@ -16,6 +16,10 @@
 
 #include <neuralnet.h>
 
+/**
+ * @brief Simple fixed-pattern data generator used by gradient checkpointing
+ * tests to feed repeatable input/label batches.
+ */
 class SimpleDataGenerator {
 public:
   SimpleDataGenerator(int _batch_size, int _seq_len, int _num_batches) :
@@ -62,6 +66,9 @@ private:
   std::vector<float> label_data;
 };
 
+/**
+ * @brief Dataset callback for SimpleDataGenerator
+ */
 int dataset_cb(float **input, float **label, bool *last, void *user_data) {
   auto *generator = reinterpret_cast<SimpleDataGenerator *>(user_data);
   generator->next(input, label, last);

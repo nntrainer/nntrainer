@@ -20,43 +20,79 @@
 
 #include <tensor.h>
 
+/**
+ * @class GradientCheckpointingVerifier
+ * @brief Helper to snapshot forward tensors and verify recomputed tensors
+ *        during gradient checkpointing tests.
+ */
 class GradientCheckpointingVerifier {
 public:
+  /**
+   * @brief     Constructor of GradientCheckpointingVerifier Class
+   */
   GradientCheckpointingVerifier() = default;
 
+  /**
+   * @brief Save inputs in forwarding
+   */
   void saveForwardInputs(const std::shared_ptr<nntrainer::LayerNode> &lnode,
                          const std::vector<nntrainer::Tensor> &inputs);
 
+  /**
+   * @brief Save outputs in forwarding
+   */
   void saveForwardOutputs(const std::shared_ptr<nntrainer::LayerNode> &lnode,
                           const std::vector<nntrainer::Tensor> &outputs);
 
+  /**
+   * @brief Save weights in forwarding
+   */
   void saveForwardWeights(const std::shared_ptr<nntrainer::LayerNode> &lnode,
                           const std::vector<nntrainer::Tensor> &weights);
 
+  /**
+   * @brief Save tensors in forwarding
+   */
   void saveForwardTensors(const std::shared_ptr<nntrainer::LayerNode> &lnode,
                           const std::vector<nntrainer::Tensor> &tensors);
 
+  /**
+   * @brief Compare inputs in forwarding and recomputation
+   */
   void
   verifyRecomputeInputs(const std::shared_ptr<nntrainer::LayerNode> &lnode,
                         const std::vector<nntrainer::Tensor> &recompute_inputs);
 
+  /**
+   * @brief Compare outputs in forwarding and recomputation
+   */
   void verifyRecomputeOutputs(
     const std::shared_ptr<nntrainer::LayerNode> &lnode,
     const std::vector<nntrainer::Tensor> &recompute_outputs);
 
+  /**
+   * @brief Compare weights in forwarding and recomputation
+   */
   void verifyRecomputeWeights(
     const std::shared_ptr<nntrainer::LayerNode> &lnode,
     const std::vector<nntrainer::Tensor> &recompute_weights);
 
+  /**
+   * @brief Compare tensors in forwarding and recomputation
+   */
   void verifyRecomputeTensors(
     const std::shared_ptr<nntrainer::LayerNode> &lnode,
     const std::vector<nntrainer::Tensor> &recompute_tensors);
 
 private:
-  std::map<std::string, std::vector<nntrainer::Tensor>> saved_forward_inputs;
-  std::map<std::string, std::vector<nntrainer::Tensor>> saved_forward_outputs;
-  std::map<std::string, std::vector<nntrainer::Tensor>> saved_forward_weights;
-  std::map<std::string, std::vector<nntrainer::Tensor>> saved_forward_tensors;
+  std::map<std::string, std::vector<nntrainer::Tensor>>
+    saved_forward_inputs; /** saved input tensors in forwarding */
+  std::map<std::string, std::vector<nntrainer::Tensor>>
+    saved_forward_outputs; /** saved output tensors in forwarding */
+  std::map<std::string, std::vector<nntrainer::Tensor>>
+    saved_forward_weights; /** saved weight tensors in forwarding */
+  std::map<std::string, std::vector<nntrainer::Tensor>>
+    saved_forward_tensors; /** saved tensors in forwarding */
 
   /**
    * @brief prototypical version of checking tensor is equal

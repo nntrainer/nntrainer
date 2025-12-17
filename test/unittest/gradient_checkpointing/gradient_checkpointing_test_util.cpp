@@ -122,19 +122,14 @@ void GradientCheckpointingVerifier::tensorEqual(const nntrainer::Tensor &lhs,
   const float abs_tolerance = 1e-6f;
   const float *lhs_data = lhs.getData();
   const float *rhs_data = rhs.getData();
-
   bool match = true;
   for (size_t i = 0; i < lhs.size(); i++) {
-    auto diff = std::abs(lhs.getValue(i) - rhs.getValue(i));
-    float threshold = abs_tolerance + rel_tolerance * std::abs(lhs.getValue(i));
+    float diff = std::abs(lhs_data[i] - rhs_data[i]);
+    float threshold = abs_tolerance + rel_tolerance * std::abs(lhs_data[i]);
     if (diff > threshold) {
-      printf("diff : %lf, thresh : %lf\n", diff, threshold);
       match = false;
       break;
     }
-  }
-  if (!match) {
-    printf("diff %s\n", rhs.getName().c_str());
   }
   EXPECT_TRUE(match);
 }

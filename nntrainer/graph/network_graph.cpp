@@ -2240,16 +2240,16 @@ void NetworkGraph::recomputeCheckpointBlock(const std::string &block_id) {
 #endif
     layer->forwarding(true);
 #ifdef ENABLE_TEST
-      if (gc_verify) {
-        std::vector<Tensor> recompute_outputs;
-        std::vector<Tensor> recompute_tensors;
-        for (int i = 0; i < layer->getNumOutputs(); i++)
-          recompute_outputs.push_back(layer->getOutput(i));
-        for (int i = 0; i < layer->getRunContext().getNumTensors(); i++)
-          recompute_tensors.push_back(layer->getRunContext().getTensor(i));
-        gc_verifier.verifyRecomputeOutputs(layer, recompute_outputs);
-        gc_verifier.verifyRecomputeTensors(layer, recompute_tensors);
-      }
+    if (gc_verify) {
+      std::vector<Tensor> recompute_outputs;
+      std::vector<Tensor> recompute_tensors;
+      for (int i = 0; i < layer->getNumOutputs(); i++)
+        recompute_outputs.push_back(layer->getOutput(i));
+      for (int i = 0; i < layer->getRunContext().getNumTensors(); i++)
+        recompute_tensors.push_back(layer->getRunContext().getTensor(i));
+      gc_verifier.verifyRecomputeOutputs(layer, recompute_outputs);
+      gc_verifier.verifyRecomputeTensors(layer, recompute_tensors);
+    }
 #endif
   }
 }
