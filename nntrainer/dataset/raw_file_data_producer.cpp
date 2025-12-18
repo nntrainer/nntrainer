@@ -50,12 +50,12 @@ RawFileDataProducer::finalize(const std::vector<TensorDim> &input_dims,
   auto sz = size(input_dims, label_dims);
   auto path_prop = std::get<props::FilePath>(*raw_file_props);
 
-  auto size_accumulator = [](const unsigned int &a, const TensorDim &b) {
+  auto size_accumulator = [](const size_t &a, const TensorDim &b) {
     return a + b.getFeatureLen();
   };
 
-  auto sample_size =
-    std::accumulate(input_dims.begin(), input_dims.end(), 0u, size_accumulator);
+  auto sample_size = std::accumulate(input_dims.begin(), input_dims.end(),
+                                     (size_t)0, size_accumulator);
   sample_size = std::accumulate(label_dims.begin(), label_dims.end(),
                                 sample_size, size_accumulator);
 
@@ -85,12 +85,12 @@ RawFileDataProducer::finalize(const std::vector<TensorDim> &input_dims,
 unsigned int
 RawFileDataProducer::size(const std::vector<TensorDim> &input_dims,
                           const std::vector<TensorDim> &label_dims) const {
-  auto size_accumulator = [](const unsigned int &a, const TensorDim &b) {
+  auto size_accumulator = [](const size_t &a, const TensorDim &b) {
     return a + b.getFeatureLen();
   };
 
-  auto sample_size =
-    std::accumulate(input_dims.begin(), input_dims.end(), 0u, size_accumulator);
+  auto sample_size = std::accumulate(input_dims.begin(), input_dims.end(),
+                                     (size_t)0, size_accumulator);
   sample_size = std::accumulate(label_dims.begin(), label_dims.end(),
                                 sample_size, size_accumulator);
   NNTR_THROW_IF(sample_size == 0, std::invalid_argument)

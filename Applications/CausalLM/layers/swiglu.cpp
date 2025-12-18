@@ -46,17 +46,12 @@ void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
   unsigned int _from = from;
 
-  if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
-    from = 0;
-    to = 1;
-  }
+  int iter = to - from;
 
   if (in1.getDataType() == ml::train::TensorDim::DataType::FP32) {
     for (unsigned int b = 0; b < in1.batch(); b++) {
       for (unsigned int c = 0; c < in1.channel(); c++) {
-        for (unsigned int h = from; h < to; h++) {
+        for (unsigned int h = 0; h < iter; h++) {
           nntrainer::swiglu(in1.width(),
                             out.getData<float>() + out.getIndex(b, c, h, 0),
                             in1.getData<float>() + in1.getIndex(b, c, h, 0),
@@ -68,7 +63,7 @@ void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 #ifdef ENABLE_FP16
     for (unsigned int b = 0; b < in1.batch(); b++) {
       for (unsigned int c = 0; c < in1.channel(); c++) {
-        for (unsigned int h = from; h < to; h++) {
+        for (unsigned int h = 0; h < iter; h++) {
           nntrainer::swiglu(in1.width(),
                             out.getData<_FP16>() + out.getIndex(b, c, h, 0),
                             in1.getData<_FP16>() + in1.getIndex(b, c, h, 0),

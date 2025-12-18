@@ -407,11 +407,11 @@ NNTrainer::TensorsQueue::~TensorsQueue() {
   for (auto &data : queue) {
     for (auto inputs : data.inputs) {
       ml_logd("free: ##I addr:%p", inputs);
-      delete inputs;
+      delete[] inputs;
     }
     for (auto labels : data.labels) {
       ml_logd("free: ##L addr:%p", labels);
-      delete labels;
+      delete[] labels;
     }
   }
 }

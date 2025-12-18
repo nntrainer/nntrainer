@@ -401,6 +401,26 @@ public:
 };
 
 /**
+ * @brief StartIndex property, start index to be slicing
+ *
+ */
+class StartIndex : public PositiveIntegerProperty {
+public:
+  static constexpr const char *key = "start_index"; /**< unique key to access */
+  using prop_tag = uint_prop_tag;                   /**< property type */
+};
+
+/**
+ * @brief EndIndex property, end index to be slicing
+ *
+ */
+class EndIndex : public PositiveIntegerProperty {
+public:
+  static constexpr const char *key = "end_index"; /**< unique key to access */
+  using prop_tag = uint_prop_tag;                 /**< property type */
+};
+
+/**
  * @brief SplitDimension property, dimension along which to split the input
  *
  */

@@ -89,13 +89,13 @@ UIntTensor<T>::UIntTensor(
       for (unsigned int j = 0; j < channel(); ++j)
         for (unsigned int k = 0; k < height(); ++k)
           for (unsigned int l = 0; l < width(); ++l)
-            this->setValue(i, j, k, l, d[i][j][k][l]);
+            this->setValue(i, j, k, l, static_cast<float>(d[i][j][k][l]));
   } else {
     for (unsigned int i = 0; i < batch(); ++i)
       for (unsigned int j = 0; j < height(); ++j)
         for (unsigned int k = 0; k < width(); ++k)
           for (unsigned int l = 0; l < channel(); ++l)
-            this->setValue(i, l, j, k, d[i][j][k][l]);
+            this->setValue(i, l, j, k, static_cast<float>(d[i][j][k][l]));
   }
 
   // copy scale factors
@@ -266,24 +266,24 @@ T &UIntTensor<T>::getValue(unsigned int b, unsigned int c, unsigned int h,
 
 template <typename T> void UIntTensor<T>::setValue(float value) {
   T *data = (T *)getData();
-  std::fill(data, data + size(), value);
+  std::fill(data, data + size(), static_cast<T>(value));
 }
 
 template <typename T>
 void UIntTensor<T>::addValue(unsigned int b, unsigned int c, unsigned int h,
                              unsigned int w, float value, float beta) {
   auto const &idx = getIndex(b, c, h, w);
-  float output = ((T *)getData())[idx];
+  float output = static_cast<float>(((T *)getData())[idx]);
   output *= beta;
   output += value;
 
-  ((T *)getData())[idx] = std::trunc(output);
+  ((T *)getData())[idx] = static_cast<T>(output);
 }
 
 template <typename T>
 void UIntTensor<T>::setValue(unsigned int b, unsigned int c, unsigned int h,
                              unsigned int w, float value) {
-  ((T *)getData())[getIndex(b, c, h, w)] = (T)value;
+  ((T *)getData())[getIndex(b, c, h, w)] = static_cast<T>(value);
 }
 
 template <typename T> void UIntTensor<T>::setZero() {
@@ -355,7 +355,8 @@ void UIntTensor<T>::copy_with_stride(const Tensor &input, Tensor &output) {
     for (unsigned int c = 0; c < output.channel(); ++c) {
       for (unsigned int h = 0; h < output.height(); ++h) {
         for (unsigned int w = 0; w < output.width(); ++w) {
-          output.setValue(b, c, h, w, input.getValue<T>(b, c, h, w));
+          output.setValue(b, c, h, w,
+                          static_cast<float>(input.getValue<T>(b, c, h, w)));
         }
       }
     }
@@ -462,12 +463,12 @@ template <typename T> float UIntTensor<T>::max_abs() const {
 
 template <typename T> float UIntTensor<T>::maxValue() const {
   const T *data = (T *)getData();
-  return *std::max_element(data, data + size());
+  return static_cast<float>(*std::max_element(data, data + size()));
 }
 
 template <typename T> float UIntTensor<T>::minValue() const {
   const T *data = (T *)getData();
-  return *std::min_element(data, data + size());
+  return static_cast<float>(*std::min_element(data, data + size()));
 }
 
 template <typename T> void UIntTensor<T>::print(std::ostream &out) const {

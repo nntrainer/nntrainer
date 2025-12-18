@@ -1,0 +1,78 @@
+name: "Tizen x86_64"
+
+on:
+  schedule:
+    # 04:30 AM (KST) Mon-Fri
+    - cron: "30 19 * * 0-4"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Tizen GBS build on Ubuntu (x86_64)
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v1
+
+    - name: prepare GBS
+      run: |
+        echo "deb [trusted=yes] http://download.tizen.org/tools/latest-release/Ubuntu_22.04/ /" | sudo tee /etc/apt/sources.list.d/tizen.list
+        sudo apt-get update && sudo apt-get install -y gbs
+        cp .github/workflows/tizen.gbs.conf ~/.gbs.conf
+
+    - name: get date
+      id: get-date
+      run: |
+        echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+    - name: restore gbs cache from main branch
+      uses: actions/cache/restore@v4
+      with:
+        path: ~/GBS-ROOT/local/cache
+        key: gbs-cache-x86_64-${{ steps.get-date.outputs.date }}
+        restore-keys: |
+          gbs-cache-x86_64-
+
+    - name: run GBS
+      run: |
+        gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A x86_64 --define "unit_test 1"
+
+    - name: save gbs cache
+      uses: actions/cache/save@v4
+      with:
+        path: ~/GBS-ROOT/local/cache
+        key: gbs-cache-x86_64-${{ steps.get-date.outputs.date }}
+
+    - name: get ML API
+      uses: actions/checkout@v4
+      with:
+        repository: nnstreamer/api
+        path: api
+    - name: get ML Agent
+      uses: actions/checkout@v4
+      with:
+        repository: nnstreamer/deviceMLOps.MLAgent
+        path: mlagent
+    - name: get NNStreamer
+      uses: actions/checkout@v4
+      with:
+        repository: nnstreamer/nnstreamer
+        path: _nnstreamer
+    - name: build and test nnstreamer ml-api and ml-agent
+      run: |
+        pushd _nnstreamer
+        echo "::group::Build and run unit-tests for NNStreamer"
+        gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A x86_64 --define "unit_test 1"
+        echo "::endgroup::"
+        popd
+        pushd api
+        echo "::group::Build and run unit-tests for ML API"
+        gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A x86_64 --define "unit_test 1"
+        echo "::endgroup::"
+        popd
+        pushd mlagent
+        echo "::group::Build and run unit-tests for ML Agent (deviceMLOps.MLAgent)"
+        gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A x86_64 --define "unit_test 1"
+        echo "::endgroup::"
+        popd

@@ -350,33 +350,6 @@ void gemm_q6_K(const unsigned int M, const unsigned int N, const unsigned int K,
   return __ggml_gemm_q6_K<_FP16>(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
-void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
-                                        const uint16_t *vcache, float *output,
-                                        int num_cache_head, int gqa_size,
-                                        int head_dim,
-                                        size_t local_window_size) {
-  neon::compute_fp16vcache_fp32_transposed(
-    row_num, in, reinterpret_cast<const _FP16 *>(vcache), output,
-    num_cache_head, gqa_size, head_dim, local_window_size);
-}
-
-template <>
-void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
-                     int num_rows, int num_cache_head, int head_dim,
-                     int gqa_size, int tile_size, size_t local_window_size) {
-  neon::compute_kcaches<_FP16>(in, reinterpret_cast<const _FP16 *>(kcache),
-                               output, num_rows, num_cache_head, head_dim,
-                               gqa_size, tile_size, local_window_size);
-}
-
-void compute_rotary_emb_value(unsigned int width, unsigned int dim,
-                              unsigned int half_, float *inout, void *output,
-                              const float *cos_, const float *sin_,
-                              bool only_convert_to_fp16) {
-  neon::compute_rotary_emb_value(width, dim, half_, inout, output, cos_, sin_,
-                                 only_convert_to_fp16);
-}
-
 template <>
 void softmax_row_inplace(_FP16 *qk_out, size_t start_row, size_t end_row,
                          size_t num_heads, _FP16 *sink) {

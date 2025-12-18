@@ -36,6 +36,8 @@
 
 #ifdef ENABLE_OPENCL
 #include <cl_context.h>
+#elif ENABLE_CUDA
+#include <cuda_context.h>
 #endif
 
 namespace nntrainer {

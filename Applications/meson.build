@@ -37,11 +37,13 @@ subdir('ONNX/jni')
 subdir('SimpleFC/jni')
 
 if host_machine.system() != 'windows'
-  subdir('KNN/jni')
+  if get_option('enable-tflite-backbone')
+    subdir('KNN/jni')
+    subdir('TransferLearning/CIFAR_Classification/jni')
+  endif
   subdir('YOLOv2/jni')
   subdir('YOLOv3/jni')
   subdir('ReinforcementLearning/DeepQ/jni')
-  subdir('TransferLearning/CIFAR_Classification/jni')
   subdir('Custom')
   if get_option('enable-tflite-interpreter')
   subdir('TFlite_export')

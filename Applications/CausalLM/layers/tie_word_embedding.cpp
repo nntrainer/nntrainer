@@ -215,18 +215,19 @@ void TieWordEmbedding::incremental_forwarding_embedding(
       input_.getAddress<float>(b * input_.getDim().getFeatureLen());
 
     nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
+    int iter = to - from;
 
 #pragma omp parallel for
-    for (int i = from; i < to; ++i) {
-      unsigned int embed_idx = static_cast<unsigned int>(in_data[i - from]);
+    for (int i = 0; i < iter; ++i) {
+      unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
       if (embed_idx >= in_dim) {
         throw std::invalid_argument("input word index is greater than in_dim");
       }
 
       nntrainer::Tensor cur_weight =
         weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
-      nntrainer::Tensor out_tensor = batchsliced_hidden.getSharedDataTensor(
-        out_tensor_dim, out_dim * (i - from));
+      nntrainer::Tensor out_tensor =
+        batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
 
       if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K) {
         ///@note this should be replaced with quantizer operation
@@ -262,15 +263,6 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
 
   ml::train::TensorDim input_step_dim = input_dim;
   ml::train::TensorDim hidden_step_dim = hidden_dim;
-
-  unsigned int _from = from;
-
-  if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
-    from = 0;
-    to = 1;
-  }
 
   input_step_dim.batch(1);
   input_step_dim.height(1);

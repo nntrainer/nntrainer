@@ -992,8 +992,8 @@ static std::unique_ptr<NeuralNetwork> makeNegOperation() {
   auto outer_graph =
     makeGraph({{"input", {"name=in", "input_shape=1:1:2"}},
                {"fully_connected", {"name=fc", "unit=2", "input_layers=in"}},
-               {"neg", {"name=neg_layer", "input_layers=fc"}},
-               {"mse", {"name=loss", "input_layers=neg_layer"}}});
+               {"negative", {"name=negative_layer", "input_layers=fc"}},
+               {"mse", {"name=loss", "input_layers=negative_layer"}}});
 
   for (auto &node : outer_graph) {
     nn->addLayer(node);

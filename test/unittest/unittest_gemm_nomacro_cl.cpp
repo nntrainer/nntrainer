@@ -1,3 +1,11 @@
+/**
+ * @file   unittest_gemm_nomacro_cl.cpp
+ * @date   18 Dec 2025
+ * @brief  Unit test for GEMM OpenCL without macro.
+ * @author Daekyoung Jung <dk11.jung@samsung.com>
+ * @bug    No known bugs.
+ */
+
 #include "gtest/gtest.h"
 
 #include "fallback_internal.h"

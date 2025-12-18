@@ -21,7 +21,7 @@ int main() {
   auto model = ml::train::createModel();
 
   try {
-    std::string path = "../../../../Applications/ONNX/jni/add_example.onnx";
+    std::string path = "../../../../Applications/ONNX/jni/llama_example.onnx";
     model->load(path, ml::train::ModelFormat::MODEL_FORMAT_ONNX);
   } catch (const std::exception &e) {
     std::cerr << "Error during load: " << e.what() << "\n";

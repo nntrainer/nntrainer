@@ -18,7 +18,6 @@ endif
 
 common_win_subproject_cmake_defines = {
   'CMAKE_MSVC_RUNTIME_LIBRARY': 'MultiThreaded',
-  'CMAKE_BUILD_TYPE': cmake_build_type,
 }
 
 # Set version info
@@ -39,11 +38,6 @@ add_project_arguments('-DVERSION_MICRO=' + nntrainer_version_split[2], language:
 cc = meson.get_compiler('c')
 cxx = meson.get_compiler('cpp')
 cxx_compiler_id = cxx.get_id()
-
-subprojects_dir_relative = 'subprojects'
-subprojects_dir_absolute = meson.current_source_dir() / subprojects_dir_relative
-windows_resource_dir_relative = 'nntrainer-windows-resource'
-windows_resource_dir_absolute = meson.current_source_dir() / windows_resource_dir_relative
 
 powershell_prog = find_program('powershell', required: (build_machine.system() == 'windows'))
 
@@ -114,6 +108,19 @@ arch = host_machine.cpu_family()
 target = target_machine.cpu_family()
 
 
+subprojects_dir_relative = 'subprojects'
+subprojects_dir_absolute = meson.current_source_dir() / subprojects_dir_relative
+
+if get_option('platform') == 'windows'
+  if arch == 'arm' or arch == 'aarch64'
+  windows_resource_dir_relative = 'nntrainer-windows-resource' / 'arm64'
+  windows_resource_dir_absolute = meson.current_source_dir() / windows_resource_dir_relative
+  else
+  windows_resource_dir_relative = 'nntrainer-windows-resource' / 'x64'
+  windows_resource_dir_absolute = meson.current_source_dir() / windows_resource_dir_relative
+  endif
+endif
+
 if arch == 'arm' or arch == 'aarch64' or get_option('platform') == 'android'
   message('Build for ARM architecture')
   if arch == 'arm'
@@ -123,7 +130,7 @@ elif arch == 'x86' or arch == 'x86_64'
   message('Build for X86 architecture')
   if cxx_compiler_id == 'msvc'
     add_project_arguments(['/arch:AVX2'], language: ['c','cpp'])
-   add_project_arguments(['cpp_args=/MT'], language: ['c','cpp'] )
+    # Note: C runtime library (/MT or /MD) is controlled by b_vscrt option
   else
     add_project_arguments(['-march=native'], language: ['c','cpp'])
     add_project_arguments(['-mavx2', '-mfma'], language: ['c','cpp'])
@@ -378,6 +385,10 @@ if get_option('enable-cublas')
   extra_defines += '-DUSE_CUBLAS=1'
 endif
 
+if get_option('enable-cuda')
+  extra_defines += '-DENABLE_CUDA=1'
+endif
+
 if get_option('enable-blas')
   extra_defines += '-DUSE_BLAS=1'
 
@@ -447,15 +458,30 @@ extra_defines += '-DNNTR_NUM_THREADS=@0@'.format(get_option('nntr-num-threads'))
 message('set nntrainer num threads=@0@'.format(get_option('nntr-num-threads')))
 openmp_dep = dummy_dep
 if get_option('enable-openmp')
- if cxx_compiler_id == 'msvc'
+ # For Windows on x64, use OpenMP 5.0 instead of the OpenMP 2.0 standard
+  openmp_win_found = false
+  if cxx_compiler_id == 'msvc' and (arch == 'x86' or arch == 'x86_64')
+    omp_lib_subdir = 'x64'
+    omp_lib_name = 'libiomp5md'
+    openmp_win_found = true
+  elif cxx_compiler_id == 'clang-cl' and (arch == 'aarch64' or arch == 'arm64')
+    omp_lib_subdir = 'arm64'
+    omp_lib_name = 'libomp'
+    openmp_win_found = true
+  endif
+
+  if openmp_win_found
     libiomp_root_opt = get_option('libiomp_root')
     libiomp_root = join_paths(meson.project_source_root(), libiomp_root_opt)
-    omp_libdir = libiomp_root
+    omp_libdir = libiomp_root / omp_lib_subdir
     omp_incdir = join_paths(libiomp_root_opt, 'include')
+
+    omp_libdir_win = omp_libdir.replace('/', '\\')
+    run_command(['xcopy', '/C', '/Y', omp_libdir_win, meson.current_build_dir()], check: true)
 
     add_project_arguments('/openmp', language: ['cpp','c'])
     cpp = meson.get_compiler('cpp')
-    libiomp = cpp.find_library('libiomp5md', dirs: omp_libdir, required: true)
+    libiomp = cpp.find_library(omp_lib_name, dirs: omp_libdir, required: true)
 
     openmp_dep = declare_dependency(
       include_directories : include_directories(omp_incdir),
@@ -463,10 +489,10 @@ if get_option('enable-openmp')
       link_args : ['/NODEFAULTLIB:vcomp'],
       dependencies : [libiomp])
 
-  message('set openmp with libiomp5md for windows-----------------')
-else
+    message('set openmp with @0@ for windows @1@-----------------'.format(omp_lib_name, omp_lib_subdir))
+  else
     openmp_dep = dependency('openmp')
-endif
+  endif
   if get_option('omp-num-threads') > 0
     extra_defines += '-DOMP_NUM_THREADS=@0@'.format(get_option('omp-num-threads'))
     message('set nntrainer omp threads=@0@'.format(get_option('omp-num-threads')))
@@ -575,6 +601,17 @@ else
     iniparser_options.add_cmake_defines({'BUILD_TESTING': false})
     iniparser_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
     iniparser_options.add_cmake_defines({'CMAKE_BUILD_TYPE': cmake_build_type})
+    if get_option('platform') == 'windows'
+      iniparser_options.add_cmake_defines(common_win_subproject_cmake_defines)
+      if arch == 'aarch64' or arch == 'arm64'
+        iniparser_options.add_cmake_defines({'CMAKE_SYSTEM_PROCESSOR': 'ARM64'})
+        iniparser_options.add_cmake_defines({'CMAKE_C_FLAGS': '--target=aarch64-pc-windows-msvc'})
+        iniparser_options.add_cmake_defines({'CMAKE_CXX_FLAGS': '--target=aarch64-pc-windows-msvc'})
+        iniparser_options.add_cmake_defines({'CMAKE_STATIC_LINKER_FLAGS': '/machine:ARM64'})
+        iniparser_options.add_cmake_defines({'CMAKE_SHARED_LINKER_FLAGS': '/machine:ARM64'})
+        iniparser_options.add_cmake_defines({'CMAKE_EXE_LINKER_FLAGS': '/machine:ARM64'})
+      endif
+    endif
     iniparser_subproject = cmake.subproject('iniparser', options: iniparser_options, required: true)
     iniparser_dep = iniparser_subproject.dependency('iniparser-static')
   endif
@@ -731,7 +768,7 @@ if get_option('enable-app')
     warning('android app is not supported for now, building app skipped')
   else
     if host_machine.system() != 'windows'
-      if not tflite_dep.found()
+      if get_option('enable-tflite-backbone') and not tflite_dep.found()
         error('Tensorflow-Lite dependency not found')
       endif
     endif

@@ -2,16 +2,17 @@
 /**
  * Copyright (C) 2025 Sumon Nath <sumon.nath@samsung.com>
  *
- * @file   neg_layer.h
+ * @file   negative_layer.h
  * @date   3 July 2025
  * @see    https://github.com/nnstreamer/nntrainer
  * @author Sumon Nath <sumon.nath@samsung.com>
  * @bug    No known bugs except for NYI items
- * @brief  This is neg layer class (operation layer)
+ * @brief  This is negative layer class (operation layer)
+ *
  */
 
-#ifndef __NEG_LAYER_H__
-#define __NEG_LAYER_H__
+#ifndef __NEGATIVE_LAYER_H__
+#define __NEGATIVE_LAYER_H__
 #ifdef __cplusplus
 
 #include <common_properties.h>
@@ -21,35 +22,35 @@
 namespace nntrainer {
 
 /**
- * @class Neg Layer
- * @brief Neg Layer
+ * @class Negative Layer
+ * @brief Negative Layer
  */
-class NegLayer : public UnaryOperationLayer {
+class NegativeLayer : public UnaryOperationLayer {
 public:
   /**
-   * @brief Constructor of Neg Layer
+   * @brief Constructor of Negative Layer
    */
-  NegLayer() :
+  NegativeLayer() :
     UnaryOperationLayer(),
-    neg_props(props::Print(), props::InPlaceProp()),
+    negative_props(props::Print(), props::InPlaceProp()),
     support_backwarding(true) {}
 
   /**
-   * @brief Destructor of Neg Layer
+   * @brief Destructor of Negative Layer
    */
-  ~NegLayer(){};
+  ~NegativeLayer(){};
 
   /**
-   *  @brief  Move constructor of Neg Layer.
-   *  @param[in] NegLayer &&
+   *  @brief  Move constructor of Negative Layer.
+   *  @param[in] NegativeLayer &&
    */
-  NegLayer(NegLayer &&rhs) noexcept = default;
+  NegativeLayer(NegativeLayer &&rhs) noexcept = default;
 
   /**
-   * @brief Move assignment operator.
-   * @parma[in] rhs NegLayer to be moved.
+   * @brief  Move assignment operator.
+   * @param[in] rhs NegativeLayer to be moved.
    */
-  NegLayer &operator=(NegLayer &&rhs) = default;
+  NegativeLayer &operator=(NegativeLayer &&rhs) = default;
 
   /**
    * @copydoc Layer::finalize(InitLayerContext &context)
@@ -57,9 +58,9 @@ public:
   void finalize(InitLayerContext &context) final;
 
   /**
-   * @brief forwarding operation for neg
+   * @brief forwarding operation for negative
    *
-   * @param input first input tensor
+   * @param input input tensor
    * @param hidden tensor to store the result value
    */
   void forwarding_operation(const Tensor &input, Tensor &hidden) final;
@@ -79,9 +80,14 @@ public:
    * @return InPlaceType
    */
   InPlaceType initializeInPlace() final {
-    is_inplace = !std::get<props::InPlaceProp>(neg_props).empty() &&
-                 std::get<props::InPlaceProp>(neg_props).get();
-    support_backwarding = !is_inplace;
+    if (std::get<props::InPlaceProp>(negative_props).empty() ||
+        !std::get<props::InPlaceProp>(negative_props).get()) {
+      is_inplace = false;
+      support_backwarding = true;
+    } else {
+      is_inplace = true;
+      support_backwarding = false;
+    }
 
     if (!supportInPlace())
       return InPlaceType::NONE;
@@ -104,15 +110,15 @@ public:
   /**
    * @copydoc Layer::getType()
    */
-  const std::string getType() const final { return NegLayer::type; };
+  const std::string getType() const final { return NegativeLayer::type; };
 
-  std::tuple<props::Print, props::InPlaceProp> neg_props;
-  bool support_backwarding;
+  std::tuple<props::Print, props::InPlaceProp> negative_props;
+  bool support_backwarding; /**< support backwarding */
 
-  inline static const std::string type = "neg";
+  static constexpr const char *type = "negative";
 };
 
 } // namespace nntrainer
 
 #endif /* __cplusplus */
-#endif /* __NEG_LAYER_H__ */
+#endif /* __NEGATIVE_LAYER_H__ */

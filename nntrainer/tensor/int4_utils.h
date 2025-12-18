@@ -138,6 +138,24 @@ public:
                                   const size_t group_size,
                                   const size_t row_index,
                                   float *dequantized_row);
+
+  /**
+   * @brief Dequantize weights in osv32_isv2 layout by row
+   *
+   * @param weights quantized weights in osv32_isv2 layout
+   * @param scales fp16 scales
+   * @param rows_count number of rows of data
+   * @param columns_count number of columns of data
+   * @param group_size group size (32 or 64 or 128)
+   * @param row_index row index to dequantize
+   * @param column_index column start index
+   * @param weight_int4_row32 output 32xint4 (16 bytes)
+   * @param scale output scale
+   */
+  static void dequantizePackedRow32ToInt4Scale(
+    const uint8_t *weights, const uint16_t *scales, const size_t rows_count,
+    const size_t columns_count, const size_t group_size, const size_t row_index,
+    const size_t column_index, uint8_t *weight_int4_row32, uint16_t *scale);
 };
 
 } // namespace nntrainer

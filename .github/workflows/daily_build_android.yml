@@ -1,0 +1,46 @@
+name: "Android"
+
+on:
+  schedule:
+    # 04:30 AM (KST) Mon-Fri
+    - cron: "30 19 * * 0-4"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    name: Android NDK build on Ubuntu for arm64-v8a
+    strategy:
+      matrix:
+        cl_options: [ "-Denable-opencl=false", "-Denable-opencl=true" ]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r26d
+        link-to-sdk: true
+    - name: Prepare Build
+      run: |
+        echo "::group::Install required packages"
+        sudo apt-get update
+        sudo apt-get install tar wget gzip libglib2.0-dev libjson-glib-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libunwind-dev googletest liborc-0.4-dev flex bison libopencv-dev pkg-config python3-dev python3-numpy python3 meson ninja-build libflatbuffers-dev flatbuffers-compiler protobuf-compiler
+        echo "::endgroup::"
+    - name: Install submodules
+      run: git submodule sync && git submodule update --init --recursive
+    - name: NDK Build
+      run: |
+        echo "::group::Run package_android.sh"
+        ./tools/package_android.sh ${{ matrix.cl_options }}
+        echo "::endgroup::"
+    - name: Install built binaries for application build
+      run: |
+        echo "Installing build bianries for application build"
+        mkdir -p libs/arm64-v8a
+        cp -R builddir/android_build_result/lib/arm64-v8a/* libs/arm64-v8a
+    - name: Android NNTrainer Application Build
+      run: |
+        echo "::group::LogisticRegression"
+        pushd Applications/LogisticRegression/jni
+        ndk-build NDK_PROJECT_PATH=./ APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk
+        popd
+        echo "::endgroup::"

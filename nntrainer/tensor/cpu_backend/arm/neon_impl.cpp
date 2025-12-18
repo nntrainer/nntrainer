@@ -12,15 +12,22 @@
  */
 
 #include <climits>
+#include <float.h>
+#include <memory>
+
+#if !defined(__FLT_MIN__)
+#define __FLT_MIN__ FLT_MIN
+#endif
+
 #include <fp16.h>
 #include <matrix_transpose_neon.h>
-#include <memory>
 #include <neon_impl.h>
 #include <neon_setting.h>
 #include <nntrainer_error.h>
 #ifdef ARMV7
 #include <armv7_neon.h>
 #endif
+#include "nntr_ggml_impl_common.h"
 #include <fallback_internal.h>
 #include <util_func.h>
 
@@ -112,7 +119,9 @@ void ele_qmul(int8_t *lhs, int8_t *rhs, int8_t *res, unsigned int data_len,
 bool is_valid(const unsigned int N, const float *X) {
   size_t i = 0;
   float inf_s = std::numeric_limits<float>::infinity();
+  float neg_inf_s = -std::numeric_limits<float>::infinity();
   float32x4_t inf = vdupq_n_f32(inf_s);
+  float32x4_t neg_inf = vdupq_n_f32(neg_inf_s);
   uint32x4_t zero = vdupq_n_u32(0);
 
   for (; N - i >= 4; i += 4) {
@@ -125,6 +134,11 @@ bool is_valid(const unsigned int N, const float *X) {
       return false;
 
     vcmp = vceqq_f32(vec, inf);
+
+    if (vaddvq_u32(vcmp))
+      return false;
+
+    vcmp = vceqq_f32(vec, neg_inf);
 
     if (vaddvq_u32(vcmp))
       return false;
@@ -402,54 +416,69 @@ void copy_int4_to_fp32(const unsigned int N, const uint8_t *X, float *Y) {
   // keep in mind that : len(X) = N, and len(Y) = 2*N
 
   // processing batch of 16
-  float32x4_t y0, y1, y2, y3;
-  float32x4_t y4, y5, y6, y7;
-
-  uint8_t low0, low1, high0, high1;
+  float y0_array[4], y1_array[4], y2_array[4], y3_array[4];
+  float y4_array[4], y5_array[4], y6_array[4], y7_array[4];
+  uint8_t low_array[8], high_array[8];
 
   for (; (N - idx) >= 16; idx += 16) {
     uint8x16_t batch = vld1q_u8(&X[idx]);
 
     uint8x8_t low = vget_low_u8(batch);
     uint8x8_t high = vget_high_u8(batch);
+
+    // Extract vector data to arrays
+    vst1_u8(low_array, low);
+    vst1_u8(high_array, high);
+
     unsigned int i = 0;
     for (; i < 8; ++i) {
-      low0 = low[i] >> 4;
-      low1 = low[i] & 0x0f;
+      uint8_t low0 = low_array[i] >> 4;
+      uint8_t low1 = low_array[i] & 0x0f;
 
-      high0 = high[i] >> 4;
-      high1 = high[i] & 0x0f;
+      uint8_t high0 = high_array[i] >> 4;
+      uint8_t high1 = high_array[i] & 0x0f;
 
       // 0 ~ 8
       if (i < 2) {
-        y0[2 * i] = low0;
-        y0[2 * i + 1] = low1;
+        y0_array[2 * i] = low0;
+        y0_array[2 * i + 1] = low1;
       } else if (i < 4) {
-        y1[2 * (i - 2)] = low0;
-        y1[2 * (i - 2) + 1] = low1;
+        y1_array[2 * (i - 2)] = low0;
+        y1_array[2 * (i - 2) + 1] = low1;
       } else if (i < 6) {
-        y2[2 * (i - 4)] = low0;
-        y2[2 * (i - 4) + 1] = low1;
+        y2_array[2 * (i - 4)] = low0;
+        y2_array[2 * (i - 4) + 1] = low1;
       } else {
-        y3[2 * (i - 6)] = low0;
-        y3[2 * (i - 6) + 1] = low1;
+        y3_array[2 * (i - 6)] = low0;
+        y3_array[2 * (i - 6) + 1] = low1;
       }
 
       // 8 ~ 16
       if (i < 2) {
-        y4[2 * i] = high0;
-        y4[2 * i + 1] = high1;
+        y4_array[2 * i] = high0;
+        y4_array[2 * i + 1] = high1;
       } else if (i < 4) {
-        y5[2 * (i - 2)] = high0;
-        y5[2 * (i - 2) + 1] = high1;
+        y5_array[2 * (i - 2)] = high0;
+        y5_array[2 * (i - 2) + 1] = high1;
       } else if (i < 6) {
-        y6[2 * (i - 4)] = high0;
-        y6[2 * (i - 4) + 1] = high1;
+        y6_array[2 * (i - 4)] = high0;
+        y6_array[2 * (i - 4) + 1] = high1;
       } else {
-        y7[2 * (i - 6)] = high0;
-        y7[2 * (i - 6) + 1] = high1;
+        y7_array[2 * (i - 6)] = high0;
+        y7_array[2 * (i - 6) + 1] = high1;
       }
     }
+
+    // Store arrays back to vectors
+    float32x4_t y0 = vld1q_f32(y0_array);
+    float32x4_t y1 = vld1q_f32(y1_array);
+    float32x4_t y2 = vld1q_f32(y2_array);
+    float32x4_t y3 = vld1q_f32(y3_array);
+    float32x4_t y4 = vld1q_f32(y4_array);
+    float32x4_t y5 = vld1q_f32(y5_array);
+    float32x4_t y6 = vld1q_f32(y6_array);
+    float32x4_t y7 = vld1q_f32(y7_array);
+
     vst1q_f32(&Y[2 * idx], y0);
     vst1q_f32(&Y[2 * idx + 4], y1);
     vst1q_f32(&Y[2 * idx + 8], y2);
@@ -463,26 +492,36 @@ void copy_int4_to_fp32(const unsigned int N, const uint8_t *X, float *Y) {
   // processing remaining batch of 8
   for (; (N - idx) >= 8; idx += 8) {
     uint8x8_t batch = vld1_u8(&X[idx]);
+    uint8_t batch_array[8];
+
+    // Extract vector data to array
+    vst1_u8(batch_array, batch);
 
     unsigned int i = 0;
     for (; i < 8; ++i) {
-      low0 = batch[i] >> 4;
-      low1 = batch[i] & 0x0f;
+      uint8_t low0 = batch_array[i] >> 4;
+      uint8_t low1 = batch_array[i] & 0x0f;
 
       if (i < 2) {
-        y0[2 * i] = low0;
-        y0[2 * i + 1] = low1;
+        y0_array[2 * i] = low0;
+        y0_array[2 * i + 1] = low1;
       } else if (i < 4) {
-        y1[2 * (i - 2)] = low0;
-        y1[2 * (i - 2) + 1] = low1;
+        y1_array[2 * (i - 2)] = low0;
+        y1_array[2 * (i - 2) + 1] = low1;
       } else if (i < 6) {
-        y2[2 * (i - 4)] = low0;
-        y2[2 * (i - 4) + 1] = low1;
+        y2_array[2 * (i - 4)] = low0;
+        y2_array[2 * (i - 4) + 1] = low1;
       } else {
-        y3[2 * (i - 6)] = low0;
-        y3[2 * (i - 6) + 1] = low1;
+        y3_array[2 * (i - 6)] = low0;
+        y3_array[2 * (i - 6) + 1] = low1;
       }
     }
+
+    // Store arrays back to vectors
+    float32x4_t y0 = vld1q_f32(y0_array);
+    float32x4_t y1 = vld1q_f32(y1_array);
+    float32x4_t y2 = vld1q_f32(y2_array);
+    float32x4_t y3 = vld1q_f32(y3_array);
 
     vst1q_f32(&Y[2 * idx], y0);
     vst1q_f32(&Y[2 * idx + 4], y1);
@@ -791,7 +830,7 @@ void copy_u16_fp32(const unsigned int N, const uint16_t *X, float *Y) {
   /// @todo implement int16_t to fp32
   unsigned int idx = 0;
   for (; (N - idx) >= 1; ++idx) {
-    Y[idx] = X[idx];
+    Y[idx] = nntrainer::compute_fp16_to_fp32(X[idx]);
   }
 }
 
@@ -1301,5 +1340,388 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
     }
   }
 }
+
+/**
+ * @brief Highly optimized version - processes 4 rows simultaneously
+ * and writes directly to output block, eliminating intermediate copies.
+ * Uses 128-bit NEON operations and prefetching for maximum throughput.
+ */
+inline static void neon_transform_4rows_to_q4_0x4(
+  const uint8_t *__restrict row0_ptr, const uint8_t *__restrict row1_ptr,
+  const uint8_t *__restrict row2_ptr, const uint8_t *__restrict row3_ptr,
+  uint16_t scale0, uint16_t scale1, uint16_t scale2, uint16_t scale3,
+  block_q4_0x4 *__restrict out) {
+
+  // Prefetch next cache lines
+#ifndef _MSC_VER
+  __builtin_prefetch(row0_ptr + 64, 0, 3);
+  __builtin_prefetch(row1_ptr + 64, 0, 3);
+  __builtin_prefetch(row2_ptr + 64, 0, 3);
+  __builtin_prefetch(row3_ptr + 64, 0, 3);
+#endif
+
+  // Store scales directly
+  out->d[0] = scale0;
+  out->d[1] = scale1;
+  out->d[2] = scale2;
+  out->d[3] = scale3;
+
+  // Load 16 bytes from each row (strided by 32 bytes in source)
+  // For each row: load bytes at offsets 0, 32, 64, ..., 480 (16 values)
+  uint8_t r0[16], r1[16], r2[16], r3[16];
+
+  // Gather 16 bytes per row with stride 32
+  for (int j = 0; j < 16; j++) {
+    r0[j] = row0_ptr[j * 32];
+    r1[j] = row1_ptr[j * 32];
+    r2[j] = row2_ptr[j * 32];
+    r3[j] = row3_ptr[j * 32];
+  }
+
+  // Process all 4 rows with NEON
+  const uint8x8_t mask = vdup_n_u8(0x0F);
+
+  // Row 0
+  {
+    uint8x8_t lo = vld1_u8(r0);
+    uint8x8_t hi = vld1_u8(r0 + 8);
+    uint8x8_t v0 = vand_u8(lo, mask);
+    uint8x8_t v1 = vshr_n_u8(lo, 4);
+    uint8x8_t v2 = vand_u8(hi, mask);
+    uint8x8_t v3 = vshr_n_u8(hi, 4);
+    uint8x8_t even = vorr_u8(v0, vshl_n_u8(v2, 4));
+    uint8x8_t odd = vorr_u8(v1, vshl_n_u8(v3, 4));
+    uint8x8x2_t zip = vzip_u8(even, odd);
+    // First half goes to qs[0..7], second half to qs[32..39]
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[0]), zip.val[0]);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[32]), zip.val[1]);
+  }
+
+  // Row 1
+  {
+    uint8x8_t lo = vld1_u8(r1);
+    uint8x8_t hi = vld1_u8(r1 + 8);
+    uint8x8_t v0 = vand_u8(lo, mask);
+    uint8x8_t v1 = vshr_n_u8(lo, 4);
+    uint8x8_t v2 = vand_u8(hi, mask);
+    uint8x8_t v3 = vshr_n_u8(hi, 4);
+    uint8x8_t even = vorr_u8(v0, vshl_n_u8(v2, 4));
+    uint8x8_t odd = vorr_u8(v1, vshl_n_u8(v3, 4));
+    uint8x8x2_t zip = vzip_u8(even, odd);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[8]), zip.val[0]);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[40]), zip.val[1]);
+  }
+
+  // Row 2
+  {
+    uint8x8_t lo = vld1_u8(r2);
+    uint8x8_t hi = vld1_u8(r2 + 8);
+    uint8x8_t v0 = vand_u8(lo, mask);
+    uint8x8_t v1 = vshr_n_u8(lo, 4);
+    uint8x8_t v2 = vand_u8(hi, mask);
+    uint8x8_t v3 = vshr_n_u8(hi, 4);
+    uint8x8_t even = vorr_u8(v0, vshl_n_u8(v2, 4));
+    uint8x8_t odd = vorr_u8(v1, vshl_n_u8(v3, 4));
+    uint8x8x2_t zip = vzip_u8(even, odd);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[16]), zip.val[0]);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[48]), zip.val[1]);
+  }
+
+  // Row 3
+  {
+    uint8x8_t lo = vld1_u8(r3);
+    uint8x8_t hi = vld1_u8(r3 + 8);
+    uint8x8_t v0 = vand_u8(lo, mask);
+    uint8x8_t v1 = vshr_n_u8(lo, 4);
+    uint8x8_t v2 = vand_u8(hi, mask);
+    uint8x8_t v3 = vshr_n_u8(hi, 4);
+    uint8x8_t even = vorr_u8(v0, vshl_n_u8(v2, 4));
+    uint8x8_t odd = vorr_u8(v1, vshl_n_u8(v3, 4));
+    uint8x8x2_t zip = vzip_u8(even, odd);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[24]), zip.val[0]);
+    vst1_u8(reinterpret_cast<uint8_t *>(&out->qs[56]), zip.val[1]);
+  }
+}
+
+void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
+                                         const uint8_t *osv32_weights,
+                                         const uint16_t *osv32_scales,
+                                         size_t scale_group_size,
+                                         void *dst_q4_0x4) {
+  NNTR_THROW_IF((!(scale_group_size == 32 || scale_group_size == 64 ||
+                   scale_group_size == 128)),
+                std::invalid_argument)
+    << "Scale group size must be 32/64/128";
+  NNTR_THROW_IF(K % QK4_0 != 0, std::invalid_argument)
+    << "K size must be divisible by QK4_0 (32)";
+  NNTR_THROW_IF(N % 4 != 0, std::invalid_argument)
+    << "N size must be divisible by 4";
+  constexpr size_t ROW_BLOCK_SIZE = 32;
+  constexpr size_t Q4_0X_BLOCK_SIZE = 4;
+
+  const size_t rows_count_pad = align(N, ROW_BLOCK_SIZE);
+  const size_t columns_count_pad = align(K, ROW_BLOCK_SIZE);
+  const size_t column_blocks_count = columns_count_pad / 2;
+  const size_t bytes_per_row_block_span = column_blocks_count * ROW_BLOCK_SIZE;
+  const size_t num_blocks_per_row = K / QK4_0;
+
+  block_q4_0x4 *dst_ptr = reinterpret_cast<block_q4_0x4 *>(dst_q4_0x4);
+
+#pragma omp parallel for schedule(static)
+  for (long long row_id = 0; row_id < static_cast<long long>(N);
+       row_id += Q4_0X_BLOCK_SIZE) {
+    const size_t row_block_id = row_id / ROW_BLOCK_SIZE;
+    const size_t i_in_block = row_id % ROW_BLOCK_SIZE;
+    const size_t row_base =
+      row_block_id * bytes_per_row_block_span + i_in_block;
+
+    // Output pointer for this row group
+    block_q4_0x4 *out =
+      dst_ptr + (row_id / Q4_0X_BLOCK_SIZE) * num_blocks_per_row;
+
+    // Precompute row pointers for fast inner loop
+    const uint8_t *row0_base = osv32_weights + row_base;
+    const uint8_t *row1_base = osv32_weights + row_base + 1;
+    const uint8_t *row2_base = osv32_weights + row_base + 2;
+    const uint8_t *row3_base = osv32_weights + row_base + 3;
+
+    for (size_t col_idx = 0; col_idx < K; col_idx += QK4_0) {
+      // Calculate weight offset: (col_idx / 2) * 32 = col_idx * 16
+      const size_t weight_offset = (col_idx / 2) * ROW_BLOCK_SIZE;
+
+      // Get scales for all 4 rows
+      const size_t scale_col = col_idx / scale_group_size;
+      const size_t scale_base = scale_col * rows_count_pad;
+      uint16_t s0 = osv32_scales[row_id + 0 + scale_base];
+      uint16_t s1 = osv32_scales[row_id + 1 + scale_base];
+      uint16_t s2 = osv32_scales[row_id + 2 + scale_base];
+      uint16_t s3 = osv32_scales[row_id + 3 + scale_base];
+
+      // Transform 4 rows directly to output
+      neon_transform_4rows_to_q4_0x4(
+        row0_base + weight_offset, row1_base + weight_offset,
+        row2_base + weight_offset, row3_base + weight_offset, s0, s1, s2, s3,
+        out);
+      out++;
+    }
+  }
+}
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+static inline void load_fp16_4_to_chunk(const uint16_t *src, float *dst,
+                                        int chunk_size) {
+  int i = 0;
+  for (; i + 4 <= chunk_size; i += 4) {
+    uint16x4_t u16_vec = vld1_u16(src + i);
+    float16x4_t half = vreinterpret_f16_u16(u16_vec);
+    float32x4_t f32 = vcvt_f32_f16(half);
+    vst1q_f32(dst + i, f32);
+  }
+  for (; i < chunk_size; ++i) {
+    dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
+  }
+}
+
+void compute_kcaches_uint16(const float *in, const uint16_t *kcache,
+                            float *output, int num_rows, int num_cache_head,
+                            int head_dim, int gqa_size, int tile_size,
+                            size_t local_window_size) {
+  std::vector<float> tmp_fp32(head_dim);
+
+  int start_row =
+    num_rows < local_window_size ? 0 : num_rows - local_window_size;
+  int row_cnt = num_rows < local_window_size ? num_rows : local_window_size;
+  const int tile_count = (row_cnt + tile_size - 1) / tile_size;
+
+  for (int n = 0; n < num_cache_head; ++n) {
+    for (int t = 0; t < tile_count; ++t) {
+      int row_tile_start = t * tile_size;
+      int tile_rows = std::min(tile_size, row_cnt - row_tile_start);
+
+      for (int g = 0; g < gqa_size; ++g) {
+        const float *in_ptr = in + n * gqa_size * head_dim + g * head_dim;
+        for (int t_row = 0; t_row < tile_rows; ++t_row) {
+          int row = start_row + row_tile_start + t_row;
+          if (t_row + 1 < tile_rows) {
+            const uint16_t *next_kptr =
+              kcache + ((row + 1) * num_cache_head + n) * head_dim;
+            /// @note This intrinsic is only available for GCC / Clang compiler.
+            // __builtin_prefetch(next_kptr, 0, 3); // Read, L1 cache
+          }
+          const uint16_t *kptr = kcache + (row * num_cache_head + n) * head_dim;
+
+          load_fp16_4_to_chunk(kptr, tmp_fp32.data(), head_dim);
+
+          const float *k_row = tmp_fp32.data();
+
+          float sum = 0.0f;
+          int i = 0;
+          float32x4_t acc = vdupq_n_f32(0.0f);
+          for (; i + 4 <= head_dim; i += 4) {
+            float32x4_t va = vld1q_f32(in_ptr + i);
+            float32x4_t vb = vld1q_f32(k_row + i);
+            acc = vfmaq_f32(acc, va, vb);
+          }
+
+          acc = vpaddq_f32(acc, acc);
+          acc = vpaddq_f32(acc, acc);
+          sum += vgetq_lane_f32(acc, 0);
+
+          for (; i < head_dim; ++i)
+            sum += in_ptr[i] * k_row[i];
+
+          output[(row - start_row) * num_cache_head * gqa_size + n * gqa_size +
+                 g] = sum / sqrt((float)head_dim);
+        }
+      }
+    }
+  }
+}
+
+void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
+                                        const uint16_t *vcache, float *output,
+                                        int num_cache_head, int gqa_size,
+                                        int head_dim,
+                                        size_t local_window_size) {
+  std::vector<float> tmp_fp32(head_dim);
+
+  for (int n = 0; n < num_cache_head; ++n) {
+    int num_blocks = head_dim / 4;
+    int rem = head_dim % 4;
+
+    std::vector<float32x4_t> sumVec(num_blocks * gqa_size, vdupq_n_f32(0.0f));
+    std::vector<float> sumRem(gqa_size * rem, 0.0f);
+
+    for (int j = row_num < local_window_size ? 0
+                                             : row_num + 1 - local_window_size;
+         j <= row_num; ++j) {
+      const uint16_t *vptr = vcache + (j * num_cache_head + n) * head_dim;
+
+      load_fp16_4_to_chunk(vptr, tmp_fp32.data(), head_dim);
+
+      for (int h = 0; h < gqa_size; ++h) {
+        float a_val = in[(row_num < local_window_size
+                            ? j
+                            : j - (row_num + 1 - local_window_size)) *
+                           gqa_size * num_cache_head +
+                         n * gqa_size + h];
+
+        float32x4_t inVec = vdupq_n_f32(a_val);
+
+        for (int b = 0; b < num_blocks; ++b) {
+          float32x4_t bVec = vld1q_f32(&tmp_fp32[b * 4]);
+          sumVec[h * num_blocks + b] =
+            vfmaq_f32(sumVec[h * num_blocks + b], inVec, bVec);
+        }
+
+        float *remPtr = &sumRem.data()[h * rem];
+        int base = num_blocks * 4;
+        for (int r = 0; r < rem; ++r) {
+          remPtr[r] += a_val * tmp_fp32[base + r];
+        }
+      }
+    }
+
+    for (int h = 0; h < gqa_size; ++h) {
+      for (int b = 0; b < num_blocks; ++b) {
+        int out_base = (n * gqa_size + h) * head_dim + b * 4;
+        vst1q_f32(&output[out_base], sumVec[h * num_blocks + b]);
+      }
+
+      float *remPtr = &sumRem.data()[h * rem];
+      int base = num_blocks * 4;
+      for (int r = 0; r < rem; ++r) {
+        int out_idx = (n * gqa_size + h) * head_dim + base + r;
+        output[out_idx] = remPtr[r];
+      }
+    }
+  }
+}
+
+void compute_rotary_emb_value_uint16(unsigned int width, unsigned int dim,
+                                     unsigned int half_, float *inout,
+                                     void *output, const float *cos_,
+                                     const float *sin_,
+                                     bool only_convert_to_fp16) {
+  enum class OutputType { FP16, FP32 };
+
+  OutputType out_type = OutputType::FP32;
+  if (output != nullptr)
+    out_type = OutputType::FP16;
+
+  for (unsigned int w = 0; w < width; w += dim) {
+    unsigned int k = 0;
+    for (; k + 3 < half_; k += 4) {
+      unsigned int i0 = w + k;
+      unsigned int i1 = w + k + half_;
+
+      float32x4_t a = vld1q_f32(&inout[i0]);
+      float32x4_t b = vld1q_f32(&inout[i1]);
+
+      if (only_convert_to_fp16) {
+        if (out_type == OutputType::FP16) {
+          float16x4_t a_fp16 = vcvt_f16_f32(a);
+          float16x4_t b_fp16 = vcvt_f16_f32(b);
+
+          vst1_u16(static_cast<uint16_t *>(output) + i0,
+                   vreinterpret_u16_f16(a_fp16));
+          vst1_u16(static_cast<uint16_t *>(output) + i1,
+                   vreinterpret_u16_f16(b_fp16));
+        }
+      } else {
+        float32x4_t cos_v = vld1q_f32(&cos_[k]);
+        float32x4_t sin_v = vld1q_f32(&sin_[k]);
+
+        float32x4_t out0 = vsubq_f32(vmulq_f32(a, cos_v), vmulq_f32(b, sin_v));
+        float32x4_t out1 = vaddq_f32(vmulq_f32(a, sin_v), vmulq_f32(b, cos_v));
+
+        if (out_type == OutputType::FP16) {
+          float16x4_t out0_fp16 = vcvt_f16_f32(out0);
+          float16x4_t out1_fp16 = vcvt_f16_f32(out1);
+
+          vst1_u16(static_cast<uint16_t *>(output) + i0,
+                   vreinterpret_u16_f16(out0_fp16));
+          vst1_u16(static_cast<uint16_t *>(output) + i1,
+                   vreinterpret_u16_f16(out1_fp16));
+        } else if (out_type == OutputType::FP32) {
+          vst1q_f32(&inout[i0], out0);
+          vst1q_f32(&inout[i1], out1);
+        }
+      }
+    }
+
+    for (; k < half_; ++k) {
+      unsigned int i0 = w + k;
+      unsigned int i1 = w + k + half_;
+      float a = inout[i0];
+      float b = inout[i1];
+
+      if (only_convert_to_fp16) {
+        static_cast<uint16_t *>(output)[i0] =
+          nntrainer::compute_fp32_to_fp16(a);
+        static_cast<uint16_t *>(output)[i1] =
+          nntrainer::compute_fp32_to_fp16(b);
+      } else {
+
+        float c = cos_[k];
+        float s = sin_[k];
+
+        float out0 = a * c - b * s;
+        float out1 = a * s + b * c;
+
+        if (out_type == OutputType::FP16) {
+          static_cast<uint16_t *>(output)[i0] =
+            nntrainer::compute_fp32_to_fp16(out0);
+          static_cast<uint16_t *>(output)[i1] =
+            nntrainer::compute_fp32_to_fp16(out1);
+        } else if (out_type == OutputType::FP32) {
+          inout[i0] = out0;
+          inout[i1] = out1;
+        }
+      }
+    }
+  }
+}
+#endif
 
 } // namespace nntrainer::neon

@@ -118,7 +118,7 @@ DirDataProducer::finalize(const std::vector<TensorDim> &input_dims,
       std::string p = std::filesystem::absolute(entry.path()).string();
       if (p.compare(".") && p.compare("..")) {
         num_data++;
-        data_list.push_back(std::make_pair(id, p));
+        data_list.push_back(std::make_pair((unsigned int)id, p));
       }
       itr++;
     }
@@ -152,7 +152,7 @@ DirDataProducer::finalize(const std::vector<TensorDim> &input_dims,
 
     unsigned int c_id = data_list[idx].first;
 
-    std::memset(labels[0].getData(), 0.0, num_class * sizeof(float));
+    std::memset(labels[0].getData(), 0, num_class * sizeof(float));
 
     labels[0].getData()[c_id] = 1.0;
 

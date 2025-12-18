@@ -21,6 +21,17 @@
 #include <stdexcept>
 #include <tensor_dim.h>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#ifdef max
+#undef max
+#undef min
+#endif
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace nntrainer {
 
 #ifdef ENABLE_FP16
@@ -1199,6 +1210,18 @@ void repack_q4_0(void *W, void *repacked_W, size_t data_size,
                  const unsigned int M, const unsigned int N);
 
 /**
+ * @brief unpack q40x8 to q40 - invers method: repack_q4_0
+ *
+ * @param in_q4_0x input q40x
+ * @param out_q4_0 output q40
+ * @param data_size total weight size
+ * @param M number of rows
+ * @param N number of columns
+ */
+void unpack_q4_0(const void *in_q4_0x, void *out_q4_0, size_t data_size,
+                 const unsigned int M, const unsigned int N);
+
+/**
  * @brief Multihead softmax, exp(x_i) / sum(exp(x_i)), inplace version
  * @param[in/out] qk_out float* input/output values
  * @param[in] start_row start row number
@@ -1314,5 +1337,41 @@ void clamp(const T *input, T *output, size_t length,
            T lower_bound = std::numeric_limits<T>::lowest(),
            T upper_bound = std::numeric_limits<T>::max());
 } /* namespace nntrainer */
+
+/**
+ * @brief     Create a Q4_0 weights (without XOR 0x88) from int4 weights
+ *
+ * @param[in] int4_weight Pointer to the input 4-bit quantized weights array.
+ * The array should contain 16 bytes representing 32 4-bit values. Each byte
+ * contains two 4-bit quantized values packed together.
+ * @param[out] q4_0_weight Pointer to the output 4-bit quantized weights
+ * array. The array should contain 16 bytes representing 32 4-bit values. Each
+ * byte contains two 4-bit quantized values packed together.
+ * @note      The input int4_weight array should contain exactly 32 4-bit
+ * values (16 bytes) to match the weight of Q4_0 block size (32 elements per
+ * block).
+ * Input:  | 0, 1 | 2, 3 | 4, 5 | ... |14,15 |16,17 | ... |28,29 |30,31 |
+ *         | A, B | A, B | A, B | ... | A, B | C, D | ... | C, D | C, D |
+ *
+ * Output: | 0,16 | 1,17 | 2,18 | 3,19 | ...          ... |14,30 |15,31 |
+ *         | A, C | B, D | A, C | B, D | ...          ... | A, C | B, D |
+ */
+void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight);
+
+/**
+ * @brief Transform data from in-memory layout osv32_isv2 to block_q4_0x8 or
+ * block_q4_0x4 (for ARM backend) in-memory layout.
+ *
+ * @param N number of rows
+ * @param K number of columns
+ * @param osv32_weights uint8_t* data of weights in osv32_isv2 layout
+ * @param osv32_scales fp16* scales
+ * @param scale_group_size group size (32 or 64 or 128)
+ * @param dst_q4_0x void * output data in block_q4_0x8 or block_q4_0x4 layout
+ */
+void transform_q4_0x_from_int4(size_t N, size_t K, const uint8_t *osv32_weights,
+                               const uint16_t *osv32_scales,
+                               size_t scale_group_size, void *dst_q4_0x);
+
 #endif /* __cplusplus */
 #endif /* __FALLBACK_H__ */

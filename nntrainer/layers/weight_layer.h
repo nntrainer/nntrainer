@@ -84,16 +84,7 @@ public:
   /**
    * @copydoc Layer::supportBackwarding()
    */
-  bool supportBackwarding() const override { return true; }
-
-  /**
-   * @brief Initialize the in-place settings of the layer
-   * @return InPlaceType
-   */
-  InPlaceType initializeInPlace() final {
-    is_inplace = true;
-    return InPlaceType::NON_RESTRICTING;
-  }
+  bool supportBackwarding() const override { return false; }
 
   /**
    * @copydoc Layer::setProperty(const PropertyType type, const std::string
@@ -104,12 +95,9 @@ public:
   static constexpr const char *type = "weight";
 
 private:
-  std::tuple<std::vector<props::TensorDimension>,
-             std::vector<props::TensorDataType>, std::vector<props::WeightName>>
+  std::tuple<props::TensorDimension, props::TensorDataType, props::WeightName>
     weight_props;
-
-  std::vector<unsigned int> weight_idx; /**< indices of the weights */
-  unsigned int n_weight;
+  unsigned int weight_idx;
 };
 } // namespace nntrainer
 

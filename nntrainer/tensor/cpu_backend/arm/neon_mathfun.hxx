@@ -35,7 +35,7 @@
   (this is the zlib license)
 */
 
-#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+#if defined(__ARM_NEON__) || defined(__ARM_NEON) || defined(_M_ARM64)
 
 typedef uint32x4_t v4su; // vector of 4 uint32
 typedef int32x4_t v4si;  // vector of 4 uint32

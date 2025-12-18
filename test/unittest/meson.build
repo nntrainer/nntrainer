@@ -57,6 +57,9 @@ endif
 test_target = [
   ['unittest_nntrainer_activations', []],
   ['unittest_nntrainer_cpu_backend', []],
+  ['unittest_nntrainer_fallback', []],
+  ['unittest_nntrainer_tensor_types', []],
+  ['unittest_nntrainer_tensor_advanced', []],
   ['unittest_nntrainer_exe_order', []],
   ['unittest_nntrainer_internal', []],
   ['unittest_nntrainer_lazy_tensor', []],
@@ -77,18 +80,12 @@ test_target = [
 if host_machine.system() != 'windows'
   test_target += [['unittest_nntrainer_appcontext', []]]
   test_target += [['unittest_nntrainer_modelfile', []]]
+  test_target += [['unittest_nntrainer_tensor_utils', []]]
 endif
 
 if get_option('enable-opencl')
-  test_target += [['unittest_blas_kernels_cl', ['unittest_util.cpp']]]
-  test_target += [['unittest_attention_kernels_cl', ['unittest_util.cpp']]]
-  test_target += [['unittest_quantize_cl', ['unittest_util.cpp']]]
-endif
-
-if get_option('enable-cuda')
-  test_target += [['unittest_cuda', []]]
-  test_target += [['unittest_cuda_addition', []]]
-  test_target += [['unittest_cuda_quantize', ['unittest_util.cpp']]]
+  test_target += [['unittest_blas_kernels_cl', []]]
+  test_target += [['unittest_attention_kernels_cl', []]]
 endif
 
 if get_option('enable-fp16')
@@ -103,20 +100,12 @@ if get_option('enable-profile')
 endif
 
 foreach target: test_target
-  cuda_deps = []
-  cuda_link_args = []
-  if target[0].startswith('unittest_cuda') and get_option('enable-cuda')
-    cuda_deps = [cuda_dep]
-    cuda_link_args = ['-NODEFAULTLIB:LIBCMT', '-NOIMPLIB', '-NOEXP']
-  endif
-  
   exe = executable(
     target[0],
-    [target[0] + '.cpp'] + target[1],
+    [target[0] + '.cpp'] + [target[1]],
     # below is temporary measure, we will eventually remove unittest_nntrainer_models
     include_directories: include_directories('models'),
-    dependencies: unittest_nntrainer_deps + cuda_deps,
-    link_args: cuda_link_args,
+    dependencies: unittest_nntrainer_deps,
     install: get_option('enable-test'),
     install_dir: application_install_dir
   )

@@ -189,7 +189,7 @@ void Int4Utils::dequantizePacked(const std::vector<uint8_t> &weights,
                                  const size_t group_size,
                                  std::vector<float> &dequantized_weights) {
   const auto groups_per_row = ceilDiv(columns_count, group_size);
-  const auto rows_count_pad = align(rows_count, group_size);
+  const auto rows_count_pad = align(rows_count, ROW_BLOCK_SIZE);
   const auto row_blocks_count = ceilDiv(rows_count, ROW_BLOCK_SIZE);
   const auto columns_count_pad = align(columns_count, group_size);
   const auto column_blocks_count =
@@ -299,4 +299,43 @@ void Int4Utils::dequantizePackedRow(uint8_t *weights, uint16_t *scales,
   }
 }
 
+void Int4Utils::dequantizePackedRow32ToInt4Scale(
+  const uint8_t *weights, const uint16_t *scales, const size_t rows_count,
+  const size_t columns_count, const size_t group_size, const size_t row_index,
+  const size_t column_index, uint8_t *weight_int4_row32, uint16_t *scale) {
+  // --- Validate ---
+  NNTR_THROW_IF(rows_count == 0 || columns_count == 0, std::invalid_argument)
+    << "rows_count and columns_count must be > 0";
+  NNTR_THROW_IF(row_index >= rows_count, std::out_of_range)
+    << "row_index out of range";
+  NNTR_THROW_IF(!(group_size == 32 || group_size == 64 || group_size == 128),
+                std::invalid_argument)
+    << "group_size must be 32/64/128";
+  NNTR_THROW_IF(columns_count % 32 != 0, std::invalid_argument)
+    << "columns_count must be divisible by 32";
+
+  // --- Layout ---
+  const size_t rows_count_pad = align(rows_count, ROW_BLOCK_SIZE);
+  const size_t columns_count_pad = align(columns_count, group_size);
+  const size_t column_blocks_count =
+    ceilDiv(columns_count_pad, COLUMN_BLOCK_SIZE); // COLUMN_BLOCK_SIZE == 2
+  const size_t padded_groups_per_row = ceilDiv(columns_count, group_size);
+
+  // Address the bytes for this row
+  const size_t row_block_id = row_index / ROW_BLOCK_SIZE;
+  const size_t i_in_block = row_index % ROW_BLOCK_SIZE;
+  const size_t bytes_per_row_block_span = column_blocks_count * ROW_BLOCK_SIZE;
+  const size_t row_block_base =
+    row_block_id * bytes_per_row_block_span + i_in_block;
+
+  for (size_t column_block_id = 0; column_block_id < 16; ++column_block_id) {
+    const size_t weights_idx =
+      row_block_base + (column_index / 2 + column_block_id) * ROW_BLOCK_SIZE;
+    const uint8_t packed_byte = weights[weights_idx];
+
+    weight_int4_row32[column_block_id] = packed_byte;
+  }
+
+  *scale = scales[row_index + (column_index / group_size) * rows_count_pad];
+}
 } // namespace nntrainer

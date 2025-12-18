@@ -686,9 +686,10 @@ TEST(nntrainer_Tensor, QTensor_13_p) {
   size_t data_size = 221184;
 
   // Float tensor
-  std::vector<float> weight = generate_random_vector<float>(K * N, -0.05, 0.05);
+  std::vector<float> weight =
+    generate_random_vector<float>(K * N, -0.05f, 0.05f);
   std::vector<float> activation =
-    generate_random_vector<float>(M * K, -0.05, 0.05);
+    generate_random_vector<float>(M * K, -0.05f, 0.05f);
 
   nntrainer::Tensor W_fp32(
     1, 1, K, N,
@@ -748,9 +749,10 @@ TEST(nntrainer_Tensor, QTensor_14_p) {
   uint32_t N = 1024;
 
   // Float tensor
-  std::vector<float> weight = generate_random_vector<float>(K * N, -0.05, 0.05);
+  std::vector<float> weight =
+    generate_random_vector<float>(K * N, -0.05f, 0.05f);
   std::vector<float> activation =
-    generate_random_vector<float>(M * K, -0.05, 0.05);
+    generate_random_vector<float>(M * K, -0.05f, 0.05f);
   nntrainer::Tensor W_fp32(
     1, 1, K, N,
     {ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::FP32});
@@ -876,7 +878,8 @@ TEST(nntrainer_Tensor, Q_Tensor_17_p) {
   uint32_t N = 1024; // width
 
   // Float tensor
-  std::vector<float> weight = generate_random_vector<float>(K * N, -0.05, 0.05);
+  std::vector<float> weight =
+    generate_random_vector<float>(K * N, -0.05f, 0.05f);
 
   nntrainer::Tensor W_fp32(
     1, 1, K, N,
@@ -922,7 +925,7 @@ TEST(nntrainer_Tensor, QTensor_18_p) {
 
   std::vector<float> weight = generate_random_vector<float>(K * N);
   std::vector<float> activation =
-    generate_random_vector<float>(M * K, -0.05, 0.05);
+    generate_random_vector<float>(M * K, -0.05f, 0.05f);
 
   nntrainer::Tensor W_fp32(
     1, 1, N, K,
@@ -985,7 +988,7 @@ TEST(nntrainer_Tensor, QTensor_19_p) {
 
   std::vector<float> weight = generate_random_vector<float>(K * N);
   std::vector<float> activation =
-    generate_random_vector<float>(M * K, -0.05, 0.05);
+    generate_random_vector<float>(M * K, -0.05f, 0.05f);
 
   nntrainer::Tensor W_fp32(
     1, 1, K, N,
@@ -1075,7 +1078,7 @@ TEST(nntrainer_Tensor, QTensor_21_p) {
   // Float tensor
   std::vector<float> weight = generate_random_vector<float>(K * N);
   std::vector<float> activation =
-    generate_random_vector<float>(M * K, -0.05, 0.05);
+    generate_random_vector<float>(M * K, -0.05f, 0.05f);
 
   nntrainer::Tensor W_fp32(
     1, 1, K, N,

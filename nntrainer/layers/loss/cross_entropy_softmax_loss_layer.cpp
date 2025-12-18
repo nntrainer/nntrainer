@@ -38,7 +38,7 @@ void CrossEntropySoftmaxLossLayer::forwarding(RunLayerContext &context,
       Tensor &y2 = context.getLabel(SINGLE_INOUT_IDX);
       l = y2.multiply(hidden_.apply<float>(logFloat<float>))
             .sum_by_batch()
-            .multiply(-1);
+            .multiply(-1.0f);
 
       // update the loss value
       LossLayer::updateLoss(context, l);

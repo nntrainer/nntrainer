@@ -217,7 +217,7 @@ int8_t &CharTensor::getValue(unsigned int b, unsigned int c, unsigned int h,
 
 void CharTensor::setValue(float value) {
   int8_t *data = (int8_t *)getData();
-  std::fill(data, data + size(), value);
+  std::fill(data, data + size(), static_cast<int8_t>(value));
 }
 
 void CharTensor::addValue(unsigned int b, unsigned int c, unsigned int h,
@@ -227,12 +227,12 @@ void CharTensor::addValue(unsigned int b, unsigned int c, unsigned int h,
   output *= beta;
   output += value;
 
-  ((int8_t *)getData())[idx] = std::trunc(output);
+  ((int8_t *)getData())[idx] = static_cast<int8_t>(std::trunc(output));
 }
 
 void CharTensor::setValue(unsigned int b, unsigned int c, unsigned int h,
                           unsigned int w, float value) {
-  ((int8_t *)getData())[getIndex(b, c, h, w)] = (int8_t)value;
+  ((int8_t *)getData())[getIndex(b, c, h, w)] = static_cast<int8_t>(value);
 }
 
 void CharTensor::setZero() {
@@ -356,7 +356,8 @@ Tensor &CharTensor::add(Tensor const &input, Tensor &output,
 
           output.setValue(
             b, c, h, w,
-            std::max(-128, std::min((int)std::lround(val / scale), 127)));
+            static_cast<int8_t>(
+              std::max(-128, std::min((int)std::lround(val / scale), 127))));
         }
       }
     }

@@ -515,7 +515,7 @@ void quantize_row_q8_0_ref(const float *__restrict x, block_q8_0 *__restrict y,
     for (int j = 0; j < QK8_0; ++j) {
       const float x0 = x[i * QK8_0 + j] * id;
 
-      y[i].qs[j] = roundf(x0);
+      y[i].qs[j] = static_cast<int8_t>(roundf(x0));
     }
   }
 }

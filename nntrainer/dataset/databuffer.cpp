@@ -197,7 +197,7 @@ void DataBuffer::displayProgress(const int count, float loss) {
     else
       progress = (((float)(count * batch_size)) / (float)samples_per_epoch);
 
-    int pos = barWidth * progress;
+    int pos = (int)(barWidth * progress);
     std::cout << " [ ";
     for (int l = 0; l < barWidth; ++l) {
       if (l <= pos)

@@ -230,6 +230,11 @@ bool ContextManager::CreateDefaultGPUDevice() {
   }
 
   if ((nullptr == platform_id_) || (nullptr == device_id_)) {
+    if (platform_device_pairs.empty()) {
+      ml_loge("No suitable platforms / device found - aborting OpenCL context "
+              "creation.");
+      return false;
+    }
     ml_loge("No suitable platform / device found - using default (first)");
     platform_id_ = platform_device_pairs[0].first;
     device_id_ = platform_device_pairs[0].second;

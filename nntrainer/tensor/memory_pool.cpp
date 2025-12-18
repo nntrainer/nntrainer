@@ -25,6 +25,10 @@
 #include <profiler.h>
 #include <vector>
 
+#ifdef ENABLE_CUDA
+#include <cuda_context.h>
+#endif
+
 #if defined(_WIN32)
 #define GET_SYSTEM_ALIGMENT()                                                  \
   ([]() -> size_t {                                                            \
@@ -172,13 +176,44 @@ void MemoryPool::allocate() {
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   mem_pool = cl_context->context_inst_.createSVMRegion(pool_size);
 
-  if (mem_pool == nullptr) {
-    throw std::runtime_error("Failed to allocate SVM memory pool of size " +
-                             std::to_string(pool_size) + " bytes");
+  // If SVM allocation fails, use calloc()
+  if (mem_pool != nullptr) {
+    svm_allocation = true;
+  }
+#elif ENABLE_CUDA
+#ifdef DEBUG
+  std::cout << "[DEBUG] MemoryPool::allocate using CUDA Device Memory, size="
+            << pool_size << std::endl;
+#endif
+  auto *cuda_context =
+    static_cast<CudaContext *>(Engine::Global().getRegisteredContext("cuda"));
+  if (cuda_context) {
+    mem_pool = cuda_context->context_inst_.allocateDeviceMemory(pool_size);
+#ifdef DEBUG
+    std::cout << "[DEBUG] MemoryPool::allocate CUDA mem_pool=" << mem_pool
+              << std::endl;
+#endif
+  } else {
+#ifdef DEBUG
+    std::cerr << "[ERROR] MemoryPool::allocate: CUDA context not found!"
+              << std::endl;
+#endif
   }
 #else
+#ifdef DEBUG
+  std::cout << "[DEBUG] MemoryPool::allocate using calloc (CPU)" << std::endl;
+#endif
   mem_pool = calloc(pool_size, 1);
 #endif
+
+  if (mem_pool == nullptr) {
+#ifdef DEBUG
+    std::cout << "[DEBUG] MemoryPool::allocate: mem_pool is null, falling back "
+                 "to calloc"
+              << std::endl;
+#endif
+    mem_pool = calloc(pool_size, 1);
+  }
 
   unsigned int idx = 1;
   for (auto &s : memory_offset) {
@@ -251,14 +286,11 @@ void MemoryPool::allocateFSU() {
  *
  */
 std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
-#if defined(__ANDROID__)
-  auto mem_data = std::make_shared<MemoryData>((void *)memory_ptrs.at(idx - 1));
-#else
   if (mem_pool == nullptr)
     throw std::invalid_argument("Getting memory before allocation");
 
   auto mem_data = std::make_shared<MemoryData>((void *)memory_ptrs.at(idx - 1));
-#endif
+  mem_data->setSVM(svm_allocation);
   return mem_data;
 }
 
@@ -269,9 +301,17 @@ std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
 void MemoryPool::deallocate() {
   if (mem_pool != nullptr) {
 #ifdef ENABLE_OPENCL
-    auto *cl_context =
-      static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-    cl_context->context_inst_.releaseSVMRegion(mem_pool);
+    if (svm_allocation) {
+      auto *cl_context =
+        static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+      cl_context->context_inst_.releaseSVMRegion(mem_pool);
+    } else {
+      free(mem_pool);
+    }
+#elif defined(ENABLE_CUDA)
+    auto *cuda_context =
+      static_cast<CudaContext *>(Engine::Global().getRegisteredContext("cuda"));
+    cuda_context->context_inst_.releaseDeviceMemory(mem_pool);
 #else
     free(mem_pool);
 #endif

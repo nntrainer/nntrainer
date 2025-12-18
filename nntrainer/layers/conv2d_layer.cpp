@@ -95,8 +95,8 @@ static void col2im(const Tensor &col_matrix, const TensorDim &kdim,
    */
   auto apply_data = [&]<typename T>(T *val) {
     unsigned col_w = 0;
-    for (int hs = -pt; hs <= h_stride_end; hs += hstride) {
-      for (int ws = -pl; ws <= w_stride_end; ws += wstride) {
+    for (int hs = -(int)pt; hs <= h_stride_end; hs += hstride) {
+      for (int ws = -(int)pl; ws <= w_stride_end; ws += wstride) {
         unsigned col_h = 0;
         int patch_height_end = hs + eff_k_height;
         int patch_width_end = ws + eff_k_width;
@@ -238,7 +238,7 @@ static void im2col(const Tensor &in, const TensorDim &kdim,
     /// hs is height_strided, ws is width_strided
     unsigned int owidth = out.width();
     unsigned int base_im_w = 0;
-    for (int hs = -pt; hs <= h_stride_end; hs += mstride[0]) {
+    for (int hs = -(int)pt; hs <= h_stride_end; hs += mstride[0]) {
       unsigned int base_im_h = 0;
       int patch_height_end = eff_k_height + hs;
       /// map the patch to a single line looping through channel
@@ -252,7 +252,7 @@ static void im2col(const Tensor &in, const TensorDim &kdim,
           }
 
           unsigned int im_w = base_im_w;
-          for (int ws = -pl; ws <= w_stride_end; ws += mstride[1]) {
+          for (int ws = -(int)pl; ws <= w_stride_end; ws += mstride[1]) {
             unsigned int im_h = base_im_h;
             int patch_width_end = eff_k_width + ws;
 
@@ -610,7 +610,7 @@ void Conv2DLayer::calcGradient(RunLayerContext &context) {
        * for the whole batch. try this while benchmarking.
        */
       im2col(in_sub, filter_dim, padding, stride, dilation, result);
-      deriv_sub.dot(result, delK, false, false, b == 0 ? 0 : 1);
+      deriv_sub.dot(result, delK, false, false, b == 0 ? 0.0f : 1.0f);
     }
     result.deallocate();
   }

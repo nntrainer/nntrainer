@@ -124,6 +124,38 @@ TEST(nntrainer_Optimizer, create_09_n) {
   EXPECT_ANY_THROW(op = ac->createOptimizerObject("non-existing type", {}));
 }
 
+/**
+ * @brief Optimizer create
+ */
+TEST(nntrainer_Optimizer, create_adamw_01_p) {
+  std::unique_ptr<nntrainer::Optimizer> op;
+  auto &eg = nntrainer::Engine::Global();
+  auto ac = eg.getRegisteredContext("cpu");
+  EXPECT_NO_THROW(op =
+                    ac->createOptimizerObject("adamw", {"weight_decay=0.01"}));
+}
+
+/**
+ * @brief Optimizer create
+ */
+TEST(nntrainer_Optimizer, create_adamw_02_n) {
+  std::unique_ptr<nntrainer::Optimizer> op;
+  auto &eg = nntrainer::Engine::Global();
+  auto ac = eg.getRegisteredContext("cpu");
+  EXPECT_ANY_THROW(op = ac->createOptimizerObject("adamw", {"unknown"}));
+}
+
+/**
+ * @brief Optimizer create
+ */
+TEST(nntrainer_Optimizer, create_adamw_03_n) {
+  std::unique_ptr<nntrainer::Optimizer> op;
+  auto &eg = nntrainer::Engine::Global();
+  auto ac = eg.getRegisteredContext("cpu");
+  EXPECT_ANY_THROW(op =
+                     ac->createOptimizerObject("adamw", {"learning_rate:0.1"}));
+}
+
 TEST(nntrainer_throw_if, throw_invalid_arg_p) {
   try {
     NNTR_THROW_IF(1 == 1, std::invalid_argument) << "error msg";

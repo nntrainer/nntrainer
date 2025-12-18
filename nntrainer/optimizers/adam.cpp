@@ -58,17 +58,25 @@ void Adam::setProperty(const std::vector<std::string> &values) {
   Optimizer::setProperty(left);
 }
 
-double Adam::getUpdatedLearningRate(unsigned int iteration, double ll) const {
+double Adam::getUpdatedLearningRate(unsigned int iteration, double lr) const {
   auto &beta1 = std::get<PropsB1>(adam_props).get();
   auto &beta2 = std::get<PropsB2>(adam_props).get();
 
+  /// @note This change suppresses C4244 warnings due to precision loss.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4244)
+#endif
   std::function<float(double)> biasCorrection = [&](float f) {
     return 1.0f - pow(f, iteration + 1);
   };
 
-  ll *= sqrt(biasCorrection(beta2)) / biasCorrection(beta1);
+  lr *= sqrt(biasCorrection(beta2)) / biasCorrection(beta1);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
-  return ll;
+  return lr;
 }
 
 void Adam::applyGradient(RunOptimizerContext &context) {
@@ -93,8 +101,8 @@ void Adam::applyGradient(RunOptimizerContext &context) {
   // This is implementation of adam from original paper.
   // This is not deleted intentionally.
   unsigned int iteration = context.getIteration();
-  float biasCorrection1 = 1 - pow(beta1, iteration + 1);
-  float biasCorrection2 = 1 - pow(beta2, iteration + 1);
+  float biasCorrection1 = 1.0 - pow((double)beta1, iteration + 1);
+  float biasCorrection2 = 1.0 - pow((double)beta2, iteration + 1);
   Tensor &wm = context.getOptimizerVariable(AdamParams::wm);
   Tensor &wv = context.getOptimizerVariable(AdamParams::wv);
 
@@ -113,11 +121,19 @@ void Adam::applyGradient(RunOptimizerContext &context) {
     context.applyGradient(context.getLearningRate() / biasCorrection1, x_grad);
 
   } else {
+    /// @note This change suppresses C4244 warnings due to precision loss.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4244)
+#endif
     std::function<double(double)> sqrtEps = [epsilon](double f) {
-      return 1 / (sqrtDouble(f) + epsilon);
+      return 1.0 / (sqrtDouble(f) + epsilon);
     };
 
     x_grad = wv.apply<float>(sqrtEps, x_grad);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
     x_grad.multiply_i(wm);
     context.applyGradient(
       getUpdatedLearningRate(context.getIteration(), context.getLearningRate()),

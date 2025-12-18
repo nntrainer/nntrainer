@@ -72,7 +72,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, default="./Qwen3-4b")
     parser.add_argument("--output_name", type=str, default="./nntr_qwen3_4b_fp32.bin")
     parser.add_argument("--data_type", type=str, default="float32")
-    args = parser.parse_args
+    args = parser.parse_args()
 
     data_dtype = args.data_type
     model_path = args.model_path
