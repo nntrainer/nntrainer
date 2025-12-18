@@ -55,13 +55,13 @@ void ReduceMeanLayer::calcDerivative(RunLayerContext &context) {
   auto &deriv = context.getIncomingDerivative(SINGLE_INOUT_IDX);
   auto &ret_deriv = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
 
-  unsigned int div = ret_deriv.size() / deriv.size();
+  unsigned int div = static_cast<unsigned int>(ret_deriv.size() / deriv.size());
 
   /** TODO: optimize this by supporting broadcast in copy */
   ret_deriv.setZero();
   ret_deriv.add_i(deriv);
 
-  ret_deriv.divide_i(div);
+  ret_deriv.divide_i(static_cast<float>(div));
 }
 
 void ReduceMeanLayer::setProperty(const std::vector<std::string> &values) {

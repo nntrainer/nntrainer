@@ -54,6 +54,10 @@
 #include <slice_realizer.h>
 #include <util_func.h>
 
+#ifdef ENABLE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #ifdef ENABLE_TFLITE_INTERPRETER
 #include <tflite_interpreter.h>
 #endif
@@ -737,13 +741,15 @@ void NeuralNetwork::load(const std::string &file_path,
         NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
           << "Cannot open file : " << f_path;
       }
-      std::vector<std::future<void>> futures;
+      // std::vector<std::future<void>> futures;
+      std::vector<std::thread> threads;
+      threads.reserve(model_graph.size());
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
            ++iter) {
         auto node = *iter;
         auto exec_order = std::get<0>((*iter)->getExecutionOrder());
 
-        futures.emplace_back(std::async(std::launch::async, [&, node] {
+        threads.emplace_back([&, node]() {
           if (!MMAP_READ) {
             auto local_model_file = checkedOpenStream<std::ifstream>(
               (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
@@ -751,7 +757,7 @@ void NeuralNetwork::load(const std::string &file_path,
                        std::numeric_limits<size_t>::max(), true, model_file_fd);
           } else {
 #if defined(_WIN32)
-            // Map per-task, then unmap immediately after: enables early release
+            // Map per-ask, then unmap immediately after: enables early release
             // of pages
             HANDLE hFile =
               CreateFileA(f_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
@@ -777,39 +783,43 @@ void NeuralNetwork::load(const std::string &file_path,
             CloseHandle(hMap);
             CloseHandle(hFile);
 #else
-      // POSIX: map per-task, advise kernel, drop pages, unmap
-      int fd = ::open(f_path.c_str(), O_RDONLY);
-      NNTR_THROW_IF((fd == -1), std::invalid_argument)
-        << "Cannot open file : " << f_path;
+            // POSIX: map per-task, advise kernel, drop pages, unmap
+            int fd = ::open(f_path.c_str(), O_RDONLY);
+            NNTR_THROW_IF((fd == -1), std::invalid_argument)
+              << "Cannot open file : " << f_path;
 
-      struct stat st {};
-      NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
-        << "Cannot get file info (fstat): " << f_path;
+            struct stat st {};
+            NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
+              << "Cannot get file info (fstat): " << f_path;
 
-      size_t f_size = static_cast<size_t>(st.st_size);
-      void *mmap_ptr = ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
-      ::close(fd); // fd not needed after mmap
-      NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
-        << "mmap failed";
+            size_t f_size = static_cast<size_t>(st.st_size);
+            void *mmap_ptr =
+              ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            ::close(fd); // fd not needed after mmap
+            NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+              << "mmap failed";
 
-      // Hint: many model loads touch scattered regions -> RANDOM helps reduce readahead
-      (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+            // Hint: many model loads touch scattered regions -> RANDOM helps
+            // reduce readahead
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
 
-      char *view = static_cast<char *>(mmap_ptr);
-      node->read(view, false, exec_mode, fsu_mode,
-                 std::numeric_limits<size_t>::max(), true);
+            char *view = static_cast<char *>(mmap_ptr);
+            node->read(view, false, exec_mode, fsu_mode,
+                       std::numeric_limits<size_t>::max(), true);
 
-      // Early drop: pages no longer needed; helps lower peak RSS during overlap
-      (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+            // Early drop: pages no longer needed; helps lower peak RSS during
+            // overlap
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
 
-      ::munmap(mmap_ptr, f_size);
+            ::munmap(mmap_ptr, f_size);
 #endif
           }
-        }));
+        });
       }
-
-      for (auto &f : futures)
-        f.get();
+      for (auto &t : threads) {
+        if (t.joinable())
+          t.join();
+      }
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
            ++iter) {
@@ -1182,8 +1192,13 @@ std::vector<float *> NeuralNetwork::incremental_inference(
             step * out_t.width();
           // std::memcpy( last_out_buf_data + batch * out_t.width(),
           // out_t_batch_ptr, out_t.width()*sizeof(float));
+#ifdef ENABLE_CUDA
+          cudaMemcpy(last_out_buf_data + batch * out_t.width(), out_t_batch_ptr,
+                     out_t.width() * sizeof(float), cudaMemcpyDefault);
+#else
           scopy(out_t.width(), out_t_batch_ptr, 1,
                 last_out_buf_data + batch * out_t.width(), 1);
+#endif
         }
       }
     }

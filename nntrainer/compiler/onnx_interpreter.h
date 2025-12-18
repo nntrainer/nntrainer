@@ -12,6 +12,7 @@
 
 #ifndef __ONNX_INTERPRETER_H__
 #define __ONNX_INTERPRETER_H__
+#include "compiler_fwd.h"
 #ifdef ENABLE_ONNX_INTERPRETER
 
 #include <app_context.h>
@@ -26,6 +27,10 @@
 #include <util_func.h>
 
 namespace nntrainer {
+
+using NodeHandler =
+  std::function<void(const onnx::NodeProto &, GraphRepresentation &)>;
+
 /**
  * @brief ONNX Interpreter class for converting onnx model to nntrainer model.
  *
@@ -36,13 +41,57 @@ public:
    * @brief Construct a new ONNXInterpreter object
    *
    */
-  ONNXInterpreter(){};
+  ONNXInterpreter() { registerNodeHandlers(); };
 
   /**
    * @brief Destroy the ONNXInterpreter object
    *
    */
   ~ONNXInterpreter(){};
+
+  void handleUnaryOp(const onnx::NodeProto &node,
+                     GraphRepresentation &representation,
+                     const std::string &op_type,
+                     std::vector<std::string> &props);
+
+  void handleBinaryOp(const onnx::NodeProto &node,
+                      GraphRepresentation &representation,
+                      const std::string &op_type,
+                      std::vector<std::string> &props);
+
+  void registerBasicUnaryOp(const std::string &op_type);
+
+  void registerBasicBinaryOp(const std::string &op_type);
+
+  void registerNodeHandlers();
+
+  std::vector<std::string> createOutputRemap(const onnx::NodeProto &node);
+
+  /**
+   * @brief Get data type from onnx type enum.
+   *
+   * @param onnx_type
+   * @return std::string tensor data type
+   */
+  std::string getDataTypeFromONNX(int onnx_type);
+
+  /**
+   * @brief Load the onnx model from file
+   *
+   */
+  void loadONNXModel(const std::string &file_path);
+
+  /**
+   * @brief Load inputs and weights from onnx model to nntrainer model.
+   *
+   */
+  void loadInputsAndWeights(GraphRepresentation &representation);
+
+  /**
+   * @brief Load operations from onnx model to nntrainer model.
+   *
+   */
+  void loadOperations(GraphRepresentation &representation);
 
   /**
    * @copydoc GraphInterpreter::serialize(const GraphRepresentation
@@ -64,6 +113,29 @@ public:
   std::string cleanName(std::string name);
 
   /**
+   * @brief Extracts an attribute value from an ONNX node and converts it to a
+   * string for NNTrainer's property format.
+   */
+  std::string extractAttribute(const onnx::NodeProto &node,
+                               const std::string &attr_name,
+                               const std::string &prefix = "",
+                               const std::string &separator = ",",
+                               const int start_offset = 0,
+                               const bool need_default_value = false,
+                               const std::string &default_value = "");
+
+  /**
+   * @brief Extracts an attribute value from an Constant node and converts it to
+   * a string for NNTrainer's property format.
+   */
+  std::string extractTensorAttribute(const onnx::NodeProto &node,
+                                     const std::string &attr_name,
+                                     const std::string &prefix = "",
+                                     const std::string &separator = ",",
+                                     const int start_offset = 0,
+                                     const int alpha = 0);
+
+  /**
    * @brief Transform dimension string to nntrainer's format.
    *
    * @param shape ONNX TensorShapeProto
@@ -78,13 +150,47 @@ public:
   std::string transformDimString(onnx::TensorProto initializer);
 
 private:
+  std::unordered_map<std::string, NodeHandler>
+    NodeHandlers;              // node handlers function map
   onnx::ModelProto onnx_model; // parsed onnx model
   std::unique_ptr<ml::train::Model>
     nntrainer_model; // converted nntrainer model
-  std::unordered_map<std::string, std::string>
-    layerOutputMap; // key: name of output, value: name of layer
   std::unordered_map<std::string, onnx::TensorProto>
     initializers; // initializers are used to identify weights
+  std::unordered_map<std::string, onnx::NodeProto>
+    constantTensors; // Constant tensor list
+  std::unordered_map<std::string, onnx::TensorShapeProto>
+    inputDims; // input dims
+  std::unordered_map<std::string, std::string>
+    layerOutputMap; // key: name of output, value: name of layer
+
+  std::unordered_map<std::string, std::string> layerKeyMap = {
+    {"Add", "add"},
+    {"Sub", "subtract"},
+    {"Mul", "multiply"},
+    {"Div", "divide"},
+    {"MatMul", "matmul"},
+    {"ReduceMean", "reduce_mean"},
+    {"Reshape", "reshape"},
+    {"Transpose", "permute"},
+    {"Cast", "cast"},
+    {"Pow", "pow"},
+    {"Sqrt", "sqrt"},
+    {"Softmax", "activation"},
+    {"Sigmoid", "activation"},
+    {"Relu", "activation"},
+    {"Identity", "identity"},
+    {"Unsqueeze", "reshape"},
+    {"Gather", "gather"},
+    {"Cosine", "cosine"},
+    {"Sine", "sine"},
+    {"Tangent", "tangent"},
+    {"Slice", "slice"},
+    {"Neg", "negative"},
+    {"Concat", "concat"}};
+
+  std::unordered_map<std::string, std::string> activationKeyMap = {
+    {"Softmax", "softmax"}, {"Relu", "relu"}, {"Sigmoid", "sigmoid"}};
 };
 
 } // namespace nntrainer

@@ -16,6 +16,7 @@
 
 #include <addition_layer.h>
 #include <fc_layer.h>
+#include <input_layer.h>
 #include <nntrainer_log.h>
 #include <reshape_layer.h>
 
@@ -52,6 +53,9 @@ void CudaContext::add_default_object() {
 
   registerFactory(nntrainer::createLayer<ReshapeLayer>, ReshapeLayer::type,
                   ml::train::LayerType::LAYER_RESHAPE);
+
+  registerFactory(nntrainer::createLayer<InputLayer>, InputLayer::type,
+                  ml::train::LayerType::LAYER_IN);
 }
 
 template <typename T>

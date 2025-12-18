@@ -1,9 +1,10 @@
-name: "Daily Build Test - Ubuntu"
+name: "Ubuntu"
 
 on:
   schedule:
     # 04:30 AM (KST) Mon-Fri
     - cron: "30 19 * * 0-4"
+  workflow_dispatch:
 
 jobs:
   meson_test:

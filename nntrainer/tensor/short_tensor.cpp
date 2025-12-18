@@ -217,7 +217,7 @@ int16_t &ShortTensor::getValue(unsigned int b, unsigned int c, unsigned int h,
 
 void ShortTensor::setValue(float value) {
   int16_t *data = (int16_t *)getData();
-  std::fill(data, data + size(), value);
+  std::fill(data, data + size(), static_cast<int16_t>(value));
 }
 
 void ShortTensor::addValue(unsigned int b, unsigned int c, unsigned int h,
@@ -227,12 +227,12 @@ void ShortTensor::addValue(unsigned int b, unsigned int c, unsigned int h,
   output *= beta;
   output += value;
 
-  ((int16_t *)getData())[idx] = std::trunc(output);
+  ((int16_t *)getData())[idx] = static_cast<int16_t>(std::trunc(output));
 }
 
 void ShortTensor::setValue(unsigned int b, unsigned int c, unsigned int h,
                            unsigned int w, float value) {
-  ((int16_t *)getData())[getIndex(b, c, h, w)] = (int16_t)value;
+  ((int16_t *)getData())[getIndex(b, c, h, w)] = static_cast<int16_t>(value);
 }
 
 void ShortTensor::setZero() {

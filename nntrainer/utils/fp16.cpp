@@ -25,8 +25,9 @@ float fp32_from_bits(uint32_t w) {
   return __uint_as_float((unsigned int)w);
 #elif defined(__INTEL_COMPILER)
   return _castu32_f32(w);
-#elif defined(_MSC_VER) && (defined(_M_ARM) || defined(_M_ARM64))
-  return _CopyFloatFromInt32((__int32)w);
+/// @todo resolve unknown identifier error
+// #elif defined(_MSC_VER) && (defined(_M_ARM) || defined(_M_ARM64))
+//   return _CopyFloatFromInt32((__int32)w);
 #else
   union {
     uint32_t as_bits;
@@ -43,8 +44,9 @@ uint32_t fp32_to_bits(float f) {
   return (uint32_t)__float_as_uint(f);
 #elif defined(__INTEL_COMPILER)
   return _castf32_u32(f);
-#elif defined(_MSC_VER) && (defined(_M_ARM) || defined(_M_ARM64))
-  return (uint32_t)_CopyInt32FromFloat(f);
+/// @todo resolve unknown identifier error
+// #elif defined(_MSC_VER) && (defined(_M_ARM) || defined(_M_ARM64))
+//   return (uint32_t)_CopyInt32FromFloat(f);
 #else
   union {
     float as_value;
@@ -55,7 +57,7 @@ uint32_t fp32_to_bits(float f) {
 }
 
 uint16_t compute_fp32_to_fp16(float f) {
-#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L) || \
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L) ||              \
   defined(__GNUC__) && !defined(__STRICT_ANSI__)
   const float scale_to_inf = 0x1.0p+112f;
   const float scale_to_zero = 0x1.0p-110f;
@@ -87,7 +89,7 @@ float compute_fp16_to_fp32(uint16_t h) {
   const uint32_t sign = w & UINT32_C(0x80000000);
   const uint32_t two_w = w + w;
   const uint32_t exp_offset = UINT32_C(0xE0) << 23;
-#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L) || \
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L) ||              \
   defined(__GNUC__) && !defined(__STRICT_ANSI__)
   const float exp_scale = 0x1.0p-112f;
 #else

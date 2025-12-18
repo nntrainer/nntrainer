@@ -15,7 +15,8 @@
 #define __CPU_BACKEND_H__
 #ifdef __cplusplus
 #if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \
-  defined(__ANDROID__) || defined(__arm__)
+  defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
+  defined(_M_ARM64)
 #include <arm_compute_backend.h>
 #elif defined(__x86_64__) || defined(__i586__) || defined(_M_X64) ||           \
   defined(_M_IX86)
@@ -1114,6 +1115,20 @@ extern void repack_q4_0(void *W, void *repacked_W, size_t data_size,
  */
 extern void repack_q4_K(void *W, void *repacked_W, size_t data_size,
                         const unsigned int M, const unsigned int N);
+
+/**
+ * @brief unpack q40x8 or q40x4 (for ARM backend) to q40 - invers method:
+ * repack_q4_0
+ *
+ * @param in_q4_0x input q40x
+ * @param out_q4_0 output q40
+ * @param data_size total weight size
+ * @param M number of rows
+ * @param N number of columns
+ */
+extern void unpack_q4_0(const void *in_q4_0x, void *out_q4_0, size_t data_size,
+                        const unsigned int M, const unsigned int N);
+
 /**
  * @brief Quantize float to q6_K Quantization format
  *
@@ -1289,5 +1304,43 @@ template <typename T = float>
 extern void clamp(const T *input, T *output, size_t length,
                   T lower_bound = std::numeric_limits<T>::lowest(),
                   T upper_bound = std::numeric_limits<T>::max());
+
+/**
+ * @brief     Create a Q4_0 weights (without XOR 0x88) from int4 weights
+ *
+ * @param[in] int4_weight Pointer to the input 4-bit quantized weights array.
+ * The array should contain 16 bytes representing 32 4-bit values. Each byte
+ * contains two 4-bit quantized values packed together.
+ * @param[out] q4_0_weight Pointer to the output 4-bit quantized weights
+ * array. The array should contain 16 bytes representing 32 4-bit values. Each
+ * byte contains two 4-bit quantized values packed together.
+ * @note      The input int4_weight array should contain exactly 32 4-bit
+ * values (16 bytes) to match the weight of Q4_0 block size (32 elements per
+ * block).
+ * Input:  | 0, 1 | 2, 3 | 4, 5 | ... |14,15 |16,17 | ... |28,29 |30,31 |
+ *         | A, B | A, B | A, B | ... | A, B | C, D | ... | C, D | C, D |
+ *
+ * Output: | 0,16 | 1,17 | 2,18 | 3,19 | ...          ... |14,30 |15,31 |
+ *         | A, C | B, D | A, C | B, D | ...          ... | A, C | B, D |
+ */
+extern void create_q4_0_weights(const uint8_t *int4_weight,
+                                uint8_t *q4_0_weight);
+
+/**
+ * @brief Transforms data from in-memory layout osv32_isv2 to block_q4_0x8 or
+ * block_q4_0x4 (for ARM backend) in-memory layout.
+ *
+ * @param N number of rows
+ * @param K number of columns
+ * @param osv32_weights uint8_t* data of weights in osv32_isv2 layout
+ * @param osv32_scales fp16* scales
+ * @param scale_group_size group size (32 or 64 or 128)
+ * @param dst_q4_0x void * output data in block_q4_0x8 or block_q4_0x4 layout
+ */
+extern void transform_q4_0x_from_int4(size_t N, size_t K,
+                                      const uint8_t *osv32_weights,
+                                      const uint16_t *osv32_scales,
+                                      size_t scale_group_size, void *dst_q4_0x);
+
 #endif
 #endif

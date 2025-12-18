@@ -14,15 +14,18 @@
 #include <gtest/gtest.h>
 
 #include <layers_common_tests.h>
-#include <neg_layer.h>
+#include <negative_layer.h>
 
-auto semantic_neg = LayerSemanticsParamType(
-  nntrainer::createLayer<nntrainer::NegLayer>, nntrainer::NegLayer::type, {},
+auto semantic_negative = LayerSemanticsParamType(
+  nntrainer::createLayer<nntrainer::NegativeLayer>,
+  nntrainer::NegativeLayer::type, {},
   LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false, 1);
 
-auto semantic_neg_multi = LayerSemanticsParamType(
-  nntrainer::createLayer<nntrainer::NegLayer>, nntrainer::NegLayer::type, {},
+auto semantic_negative_multi = LayerSemanticsParamType(
+  nntrainer::createLayer<nntrainer::NegativeLayer>,
+  nntrainer::NegativeLayer::type, {},
   LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false, 2);
 
-GTEST_PARAMETER_TEST(Neg, LayerSemantics,
-                     ::testing::Values(semantic_neg, semantic_neg_multi));
+GTEST_PARAMETER_TEST(Negative, LayerSemantics,
+                     ::testing::Values(semantic_negative,
+                                       semantic_negative_multi));

@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <fallback_internal.h>
 #include <limits>
+#include <q4_0_utils.h>
 #include <stdexcept>
 #include <tensor_dim.h>
 #include <util_func.h>
@@ -83,33 +84,33 @@ void __fallback_copy_u16_fp32(const unsigned int N, const uint16_t *X,
 void __fallback_copy_fp32_u32(const unsigned int N, const float *X,
                               uint32_t *Y) {
   for (unsigned int i = 0; i < N; ++i) {
-    Y[i] = X[i];
+    Y[i] = static_cast<uint32_t>(X[i]);
   }
 }
 
 void __fallback_copy_fp32_u16(const unsigned int N, const float *X,
                               uint16_t *Y) {
   for (unsigned int i = 0; i < N; ++i) {
-    Y[i] = X[i];
+    Y[i] = static_cast<uint16_t>(X[i]);
   }
 }
 
 void __fallback_copy_fp32_u8(const unsigned int N, const float *X, uint8_t *Y) {
   for (unsigned int i = 0; i < N; ++i) {
-    Y[i] = X[i];
+    Y[i] = static_cast<uint8_t>(X[i]);
   }
 }
 
 void __fallback_copy_fp32_s16(const unsigned int N, const float *X,
                               int16_t *Y) {
   for (unsigned int i = 0; i < N; ++i) {
-    Y[i] = X[i];
+    Y[i] = static_cast<int16_t>(X[i]);
   }
 }
 
 void __fallback_copy_fp32_s8(const unsigned int N, const float *X, int8_t *Y) {
   for (unsigned int i = 0; i < N; ++i) {
-    Y[i] = X[i];
+    Y[i] = static_cast<int8_t>(X[i]);
   }
 }
 
@@ -153,8 +154,8 @@ void __fallback_scopy_int4_to_float32(const unsigned int N, const uint8_t *X,
                                       const unsigned int incX, float *Y,
                                       const unsigned int incY) {
   for (unsigned int idx = 0; idx < N; idx++) {
-    Y[2 * idx] = X[idx] >> 4;
-    Y[2 * idx + 1] = X[idx] & 0x0f;
+    Y[2 * idx] = static_cast<float>(X[idx] >> 4);
+    Y[2 * idx + 1] = static_cast<float>(X[idx] & 0x0f);
   }
 }
 
@@ -550,6 +551,12 @@ void __fallback_repack_q4_K_to_q4_K_8(void *W, void *repacked_W,
   throw std::runtime_error("NYI : __fallback_repack_q4_K_to_q4_K_8");
 }
 
+void __fallback_unpack_q4_0_8_to_q4_0(const void *in_q4_0x, void *out_q4_0,
+                                      size_t data_size, const unsigned int M,
+                                      const unsigned int N) {
+  throw std::runtime_error("NYI : __fallback_unpack_q4_0_8_to_q4_0");
+}
+
 void __fallback_softmax_row_inplace(float *qk_out, size_t start_row,
                                     size_t end_row, size_t num_heads) {
   throw std::runtime_error("NYI : __fallback_softmax_row_inplace");
@@ -604,6 +611,27 @@ void __fallback_clamp(const float *input, float *output, size_t length,
   for (int i = 0; i < length; ++i) {
     output[i] = std::clamp(input[i], lower_bound, upper_bound);
   }
+}
+
+void __fallback_create_q4_0_weights(const uint8_t *int4_weight,
+                                    uint8_t *q4_0_weight) {
+  for (int i = 0; i < 8; i++) {
+    char v0 = int4_weight[i] & 0xF;
+    char v1 = (int4_weight[i] >> 4) & 0xF;
+    char v2 = int4_weight[8 + i] & 0xF;
+    char v3 = (int4_weight[8 + i] >> 4) & 0xF;
+    q4_0_weight[2 * i] = (v0 | (v2 << 4));
+    q4_0_weight[2 * i + 1] = (v1 | (v3 << 4));
+  }
+}
+
+void __fallback_transform_q4_0x_from_int4(size_t N, size_t K,
+                                          const uint8_t *osv32_weights,
+                                          const uint16_t *osv32_scales,
+                                          size_t scale_group_size,
+                                          void *dst_q4_0x) {
+  Q4_0Utils::transformQ4_0x_FromInt4(N, K, osv32_weights, osv32_scales,
+                                     scale_group_size, 8, dst_q4_0x);
 }
 
 } // namespace nntrainer

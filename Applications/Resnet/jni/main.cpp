@@ -66,14 +66,14 @@ std::vector<LayerHandle> resnetBlock(const std::string &block_name,
   };
 
   auto create_conv = [&with_name, filters,
-                      pre_trained](const std::string &name, int kernel_size,
+                      pre_trained](const std::string &name, int k_size,
                                    int stride, const std::string &padding,
                                    const std::string &input_layer) {
     std::vector<std::string> props{
       with_name(name),
       nntrainer::withKey("stride", {stride, stride}),
       nntrainer::withKey("filters", filters),
-      nntrainer::withKey("kernel_size", {kernel_size, kernel_size}),
+      nntrainer::withKey("kernel_size", {k_size, k_size}),
       nntrainer::withKey("padding", padding),
       nntrainer::withKey("input_layers", input_layer),
       nntrainer::withKey("trainable", pre_trained ? "true" : "false")};
@@ -83,9 +83,10 @@ std::vector<LayerHandle> resnetBlock(const std::string &block_name,
 
 /** residual path */
 #if defined(ENABLE_TFLITE_INTERPRETER)
-  LayerHandle a1 = create_conv("a1", 3, downsample ? 2 : 1, "same", input_name);
+  LayerHandle a1 = create_conv("a1", kernel_size, downsample ? 2 : 1, "same",
+                               input_name);
 #else
-  LayerHandle a1 = create_conv("a1", 3, downsample ? 2 : 1,
+  LayerHandle a1 = create_conv("a1", kernel_size, downsample ? 2 : 1,
                                downsample ? "1,1" : "same", input_name);
 #endif
   LayerHandle a2 = createLayer(
@@ -94,7 +95,7 @@ std::vector<LayerHandle> resnetBlock(const std::string &block_name,
      nntrainer::withKey("momentum", "0.9"),
      nntrainer::withKey("epsilon", "0.00001"),
      nntrainer::withKey("trainable", pre_trained ? "true" : "false")});
-  LayerHandle a3 = create_conv("a3", 3, 1, "same", scoped_name("a2"));
+  LayerHandle a3 = create_conv("a3", kernel_size, 1, "same", scoped_name("a2"));
 
   /** skip path */
   LayerHandle b1 = nullptr;

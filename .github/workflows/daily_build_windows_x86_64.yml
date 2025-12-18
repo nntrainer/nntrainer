@@ -1,0 +1,33 @@
+name: "Windows x86_64"
+
+on:
+  schedule:
+    # 04:30 AM (KST) Mon-Fri
+    - cron: "30 19 * * 0-4"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ windows-2022, windows-2025 ]
+
+    name: Windows Meson build & test (x86_64)
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Install submodules
+        run: git submodule sync && git submodule update --init --recursive
+      - name: Install Python Dependencies
+        run: pip install meson==1.7.2 ninja
+      - name: Prepare MSVC
+        uses: bus1/cabuild/action/msdevshell@v1
+        with:
+          architecture: x64
+      - name: Prepare Build
+        run: meson setup --native-file windows-native.ini builddir
+      - name: Run Build
+        run: meson compile -C builddir
+      - name: Run Test Suite
+        run: meson test -C builddir

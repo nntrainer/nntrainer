@@ -959,7 +959,7 @@ void Tensor::normalization_i() {
 
 void Tensor::standardization_i() {
   Tensor mean_by_batch = this->sum_by_batch();
-  mean_by_batch.divide_i(getDim().getFeatureLen());
+  mean_by_batch.divide_i(static_cast<float>(getDim().getFeatureLen()));
 
   this->subtract_i(mean_by_batch);
   Tensor std_dev_by_batch(batch(), 1, 1, 1, getFormat(), getDataType());
@@ -986,7 +986,7 @@ void Tensor::standardization_i() {
 #endif
   }
 
-  std_dev_by_batch.divide_i(getDim().getFeatureLen());
+  std_dev_by_batch.divide_i(static_cast<float>(getDim().getFeatureLen()));
   this->divide_i(std_dev_by_batch);
 }
 

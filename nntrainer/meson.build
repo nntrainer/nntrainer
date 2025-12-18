@@ -51,6 +51,34 @@ if get_option('enable-cuda')
     else
       nntrainer_base_deps += cuda_dep
     endif
+
+    # Also link against cuda.lib for Driver API functions (cuDeviceGet, etc.)
+    # Attempt to find CUDA_PATH from environment variable for dynamic path resolution
+    cuda_dirs = []
+    python_cmd = find_program('python', required: false)
+    if python_cmd.found()
+      r = run_command(python_cmd, '-c', 'import os; print(os.environ.get("CUDA_PATH", ""))', check: false)
+      if r.returncode() == 0
+        cuda_env_path = r.stdout().strip()
+        if cuda_env_path != ''
+          cuda_dirs += [cuda_env_path / 'lib/x64']
+        endif
+      endif
+    endif
+
+    # Find cuda.lib using the dynamically resolved directory or fallback to default paths
+    cuda_driver_lib = cc.find_library('cuda', required: false, dirs: cuda_dirs)
+    
+    if not cuda_driver_lib.found()
+        # Fallback: try finding without specific dirs (system path)
+        cuda_driver_lib = cc.find_library('cuda', required: false)
+    endif
+    
+    if cuda_driver_lib.found()
+        nntrainer_base_deps += cuda_driver_lib
+    else
+        warning('CUDA driver library (cuda.lib) not found. Driver API calls may fail to link.')
+    endif
   else
     # Linux and others: Use pkg-config or manual library specification
     cuda_dep = dependency('cuda', method: 'pkg-config', required: false)
@@ -62,6 +90,12 @@ if get_option('enable-cuda')
       endif
     else
       nntrainer_base_deps += cuda_dep
+    endif
+    
+    # On Linux, cuda driver API is usually in libcuda.so
+    cuda_driver_lib = cc.find_library('cuda', required: false)
+    if cuda_driver_lib.found()
+        nntrainer_base_deps += cuda_driver_lib
     endif
   endif
 endif
@@ -89,6 +123,10 @@ if get_option('enable-opencl')
   nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
 endif
 
+if get_option('enable-cuda')
+  nntrainer_elements += 'cuda'
+endif
+
 foreach elem : nntrainer_elements
   subdir(elem)
   nntrainer_inc += include_directories(elem)
@@ -113,8 +151,9 @@ endif
 
 if get_option('enable-cuda')
   nntrainer_headers += meson.current_source_dir() / 'cuda_context.h'
+  nntrainer_headers += meson.current_source_dir() / 'cuda_buffer_manager.h'
   nntrainer_common_sources += 'cuda_context.cpp'
-  extra_defines += '-DENABLE_CUDA=1'
+  nntrainer_common_sources += 'cuda_buffer_manager.cpp'
 endif
 
 foreach s : nntrainer_common_sources

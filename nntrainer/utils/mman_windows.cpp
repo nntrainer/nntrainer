@@ -69,14 +69,14 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
     (sizeof(off_t) <= sizeof(DWORD)) ? (DWORD)off : (DWORD)(off & 0xFFFFFFFFL);
   const DWORD file_offset_high = (sizeof(off_t) <= sizeof(DWORD))
                                    ? (DWORD)0
-                                   : (DWORD)((off >> 32) & 0xFFFFFFFFL);
+                                   : (DWORD)(((uint64_t)off >> 32) & 0xFFFFFFFFL);
   const off_t max_size = off + (off_t)len;
   const DWORD max_size_low = (sizeof(off_t) <= sizeof(DWORD))
                                ? (DWORD)max_size
                                : (DWORD)(max_size & 0xFFFFFFFFL);
   const DWORD max_size_high = (sizeof(off_t) <= sizeof(DWORD))
                                 ? (DWORD)0
-                                : (DWORD)((max_size >> 32) & 0xFFFFFFFFL);
+                                : (DWORD)(((uint64_t)max_size >> 32) & 0xFFFFFFFFL);
   errno = 0;
 
   if (len == 0 || prot == PROT_EXEC) {

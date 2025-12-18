@@ -234,7 +234,7 @@ void Int4QTensor::setValue(float value) {
   NNTR_THROW_IF(value < -8 || value > 7, std::out_of_range)
     << "Value must be in range [-8, 7]. Input value: " << value;
 
-  int8_t val = value;
+  int8_t val = static_cast<int8_t>(value);
   int8_t *data = (int8_t *)getData();
   std::fill(data, data + (size() + 1) / 2, (val << 4) | (val & 0x0f));
 }
@@ -248,7 +248,7 @@ void Int4QTensor::addValue(unsigned int b, unsigned int c, unsigned int h,
   output += value;
 
   // if result value is out of range, clamp to max/min value
-  int8_t val = std::trunc(std::clamp((int)output, -8, 7));
+  int8_t val = static_cast<int8_t>(std::trunc(std::clamp((int)output, -8, 7)));
 
   // encode result value to int8 data
   ((int8_t *)getData())[idx / 2] =
@@ -263,7 +263,7 @@ void Int4QTensor::setValue(unsigned int b, unsigned int c, unsigned int h,
     << "Value must be in range [-8, 7]. Input value: " << value;
 
   auto const &idx = getIndex(b, c, h, w);
-  int8_t val = value;
+  int8_t val = static_cast<int8_t>(value);
 
   ((int8_t *)getData())[idx / 2] =
     (idx % 2 == 0) ? (val << 4) | (((int8_t *)getData())[idx / 2] & 0x0f)

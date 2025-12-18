@@ -67,8 +67,8 @@ void Upsample2dLayer::forwarding(nntrainer::RunLayerContext &context,
     }
     break;
   case props::UpsampleModeInfo::Interpolation::bilinear: {
-    float scale_h = kernel_size[0];
-    float scale_w = kernel_size[1];
+    float scale_h = (float)kernel_size[0];
+    float scale_w = (float)kernel_size[1];
 
     for (int b = 0; b < (int)out.batch(); b++) {
       for (int c = 0; c < (int)out.channel(); c++) {

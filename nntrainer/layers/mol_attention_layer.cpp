@@ -220,12 +220,12 @@ void MoLAttentionLayer::forwarding(RunLayerContext &context, bool training) {
   for (unsigned int b = 0; b < batch; b++) {
     for (unsigned int h = 0; h < u_base.height(); h++) {
       float *u_data = u_base.getAddress<float>(b, 0, h, 0);
-      std::fill(u_data, u_data + u_base.width(), h + 1);
+      std::fill(u_data, u_data + u_base.width(), static_cast<float>(h + 1));
     }
   }
 
-  Tensor u_pos = u_base.add(0.5);
-  u_base.add_i(-0.5);
+  Tensor u_pos = u_base.add(0.5f);
+  u_base.add_i(-0.5f);
   Tensor u_neg = u_base;
 
   Tensor beta_eps = beta.add(1e-8f);

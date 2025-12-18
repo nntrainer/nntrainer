@@ -25,6 +25,15 @@
 namespace nntrainer {
 
 /**
+ * @brief weight decay property for AdamW
+ */
+class PropsWeightDecayW : public Property<double> {
+public:
+  static constexpr const char *key = "weight_decay";
+  using prop_tag = double_prop_tag;
+};
+
+/**
  * @class   AdamW Optimizer class
  * @brief   AdamW Optimizer
  */
@@ -78,7 +87,17 @@ public:
   void setProperty(const std::vector<std::string> &values) override;
 
 private:
-  std::tuple<PropsB1, PropsB2, PropsEpsilon, TorchRef> adam_props;
+  std::tuple<PropsB1, PropsB2, PropsEpsilon, TorchRef, PropsWeightDecayW>
+    adam_props;
+
+  /**
+   * @brief Get updated learning rate
+   *
+   * @param lr learning rate
+   *
+   * @return updated learning rate
+   */
+  double getUpdatedLearningRate(unsigned int iteration, double lr) const;
 };
 } /* namespace nntrainer */
 

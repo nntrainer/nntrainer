@@ -17,6 +17,8 @@
 #include <cpu_backend.h>
 #include <float_tensor.h>
 #include <int4_tensor.h>
+#include <q4_0_utils.h>
+
 #include <tensor.h>
 #include <util_func.h>
 
@@ -488,8 +490,8 @@ void FloatTensor::sum_by_batch(Tensor &output) const {
 
   Tensor ones(1, 1, 1, feat_len, this->getFormat());
   ones.setValue(1.0);
-  sgemv((unsigned int)dim.getStorageOrder(), false, batch, feat_len, 1, data,
-        feat_len, ones.getData<float>(), 1, 0.0, out_data, 1);
+  sgemv((unsigned int)dim.getStorageOrder(), false, (int)batch, (int)feat_len,
+        1, data, (int)feat_len, ones.getData<float>(), 1, 0.0, out_data, 1);
 }
 
 Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
@@ -516,8 +518,9 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
     size_t batch = dim.batch();
     Tensor ones(1, 1, 1, batch, getTensorType());
     ones.setValue(alpha);
-    sgemv((unsigned int)dim.getStorageOrder(), true, batch, feat_len, 1, data,
-          feat_len, ones.getData<float>(), 1, beta, output.getData<float>(), 1);
+    sgemv((unsigned int)dim.getStorageOrder(), true, (int)batch, (int)feat_len,
+          1, data, (int)feat_len, ones.getData<float>(), 1, beta,
+          output.getData<float>(), 1);
   } break;
   case 1: {
     CREATE_IF_EMPTY_DIMS(output, dim[0], 1, dim[2], dim[3], getTensorType());
@@ -526,8 +529,8 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
       unsigned int t_axis = dim[1];
       Tensor ones(1, 1, 1, t_axis, getTensorType());
       ones.setValue(alpha);
-      sgemv((unsigned int)dim.getStorageOrder(), false, feat_len, t_axis, 1,
-            data, t_axis, ones.getData<float>(), 1, beta,
+      sgemv((unsigned int)dim.getStorageOrder(), false, (int)feat_len,
+            (int)t_axis, 1, data, (int)t_axis, ones.getData<float>(), 1, beta,
             output.getData<float>(), 1);
     } else {
       unsigned int feat_len = dim[2] * dim[3];
@@ -536,9 +539,9 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
       ones.setValue(alpha);
       float *rdata = output.getData<float>();
       for (unsigned int k = 0; k < dim[0]; ++k) {
-        sgemv((unsigned int)dim.getStorageOrder(), true, t_axis, feat_len, 1,
-              &data[k * dim.getFeatureLen()], feat_len, ones.getData<float>(),
-              1, beta, &rdata[k * feat_len], 1);
+        sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
+              (int)feat_len, 1, &data[k * dim.getFeatureLen()], (int)feat_len,
+              ones.getData<float>(), 1, beta, &rdata[k * feat_len], 1);
       }
     }
   } break;
@@ -551,9 +554,9 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
       ones.setValue(alpha);
       float *rdata = output.getData<float>();
       for (unsigned int k = 0; k < dim[0]; ++k) {
-        sgemv((unsigned int)dim.getStorageOrder(), true, t_axis, feat_len, 1,
-              &data[k * dim.getFeatureLen()], feat_len, ones.getData<float>(),
-              1, beta, &rdata[k * feat_len], 1);
+        sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
+              (int)feat_len, 1, &data[k * dim.getFeatureLen()], (int)feat_len,
+              ones.getData<float>(), 1, beta, &rdata[k * feat_len], 1);
       }
     } else {
       unsigned int t_3 = dim[3];
@@ -569,14 +572,14 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
             unsigned int ridx =
               k * output.getDim().getFeatureLen() + c * dim[3];
 
-            sgemv((unsigned int)dim.getStorageOrder(), true, t_axis, t_3, 1,
-                  &data[idx], t_3, ones.getData<float>(), 1, beta, &rdata[ridx],
-                  1);
+            sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
+                  (int)t_3, 1, &data[idx], (int)t_3, ones.getData<float>(), 1,
+                  beta, &rdata[ridx], 1);
           }
         }
       } else {
-        sgemv((unsigned int)dim.getStorageOrder(), true, t_axis,
-              output.getDim().getDataLen(), 1, data, t_axis,
+        sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
+              (int)output.getDim().getDataLen(), 1, data, (int)t_axis,
               ones.getData<float>(), 1, beta, output.getData<float>(), 1);
       }
     }
@@ -594,9 +597,9 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
         for (unsigned int c = 0; c < dim[2]; ++c) {
           unsigned int idx = k * dim.getFeatureLen() + c * dim[3] * dim[1];
           unsigned int ridx = k * output.getDim().getFeatureLen() + c * dim[1];
-          sgemv((unsigned int)dim.getStorageOrder(), true, t_axis, t_3, 1,
-                &data[idx], t_3, ones.getData<float>(), 1, beta, &rdata[ridx],
-                1);
+          sgemv((unsigned int)dim.getStorageOrder(), true, (int)t_axis,
+                (int)t_3, 1, &data[idx], (int)t_3, ones.getData<float>(), 1,
+                beta, &rdata[ridx], 1);
         }
       }
     } else {
@@ -606,8 +609,9 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
       ones.setValue(alpha);
 
       if (dim.getStorageOrder() == TStorageOrder::ROW_MAJOR) {
-        sgemv((unsigned int)dim.getStorageOrder(), false, m, n, 1, data, n,
-              ones.getData<float>(), 1, beta, output.getData<float>(), 1);
+        sgemv((unsigned int)dim.getStorageOrder(), false, (int)m, (int)n, 1,
+              data, (int)n, ones.getData<float>(), 1, beta,
+              output.getData<float>(), 1);
       } else {
         float *rdata = output.getData<float>();
 
@@ -616,9 +620,9 @@ Tensor &FloatTensor::sum(unsigned int axis, Tensor &output, float alpha,
             unsigned int idx = k * dim.getFeatureLen() + c * dim[3] * dim[2];
             unsigned int ridx = k * dim[1] * dim[2] + c * dim[2];
 
-            sgemv((unsigned int)dim.getStorageOrder(), false, dim[2], n, 1,
-                  &data[idx], dim[2], ones.getData<float>(), 1, beta,
-                  &rdata[ridx], 1);
+            sgemv((unsigned int)dim.getStorageOrder(), false, (int)dim[2],
+                  (int)n, 1, &data[idx], (int)dim[2], ones.getData<float>(), 1,
+                  beta, &rdata[ridx], 1);
           }
         }
       }
@@ -722,67 +726,75 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   float *data = (float *)getData();
   unsigned int M = getDim().height();
   unsigned int K = getDim().width();
+  Tdatatype input_dtype = input[0]->getDataType();
+
+  // Handle standard inputs
+  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::QINT4) {
+    for (unsigned int i = 0; i < input.size(); ++i) {
+      dot(*input[i], *output[i], trans, trans_in, beta);
+    }
+    return;
+  }
 
   std::vector<unsigned int> Ns;
   std::vector<void *> mdatas;
   std::vector<float *> rdatas;
 
-  if (input[0]->getDataType() == Tdatatype::Q4_0) {
-    for (unsigned int i = 0; i < input.size(); ++i) {
-      int N = input[i]->getDim().width();
-      void *mdata = (void *)input[i]->getData<uint8_t>();
-      float *rdata = output[i]->getData<float>();
-#ifdef ENABLE_OPENCL
-      if (M == 1) {
-        gemm_q4_0(M, N, K, data, K, (void *)mdata, N, rdata, N);
-      } else {
-        Ns.push_back(N);
-        mdatas.push_back(mdata);
-        rdatas.push_back(rdata);
-      }
-#else
-      /// @todo Support multi-weight q4_0 for x64
-      gemm_q4_0(M, N, K, data, K, (void *)mdata, N, rdata, N);
-#endif
-    }
+  for (unsigned int i = 0; i < input.size(); ++i) {
+    Ns.push_back(input[i]->getDim().width());
+    mdatas.push_back((void *)input[i]->getData<uint8_t>());
+    rdatas.push_back(output[i]->getData<float>());
+  }
 
 #ifdef ENABLE_OPENCL
-    if (M != 1) {
+  if (input_dtype == Tdatatype::Q4_0) {
+    if (M == 1) {
+      for (unsigned int i = 0; i < input.size(); ++i) {
+        gemm_q4_0(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i], Ns[i]);
+      }
+    } else {
       gemm_q4_0_async_cl(mdatas, data, rdatas, M, Ns, K);
     }
-#endif
-  } else if (input[0]->getDataType() == Tdatatype::QINT4) {
-#ifndef ENABLE_OPENCL
-    throw std::runtime_error("Error: QINT4 Dot is not supported on CPU");
-#else
-    std::vector<uint16_t *> scales;
-
-    for (unsigned int i = 0; i < input.size(); ++i) {
-      int N = input[i]->getDim().width();
-      void *mdata = (void *)input[i]->getData<uint8_t>();
-      float *rdata = output[i]->getData<float>();
-      uint16_t *scale = input[i]->getScale<uint16_t>();
-
-      Ns.push_back(N);
-      mdatas.push_back(mdata);
-      rdatas.push_back(rdata);
-      scales.push_back(scale);
-    }
-
-    /// Asynchronous execution
-    if (M == 1) {
-      gemv_int4_async_cl(mdatas, scales, data, rdatas, K, Ns,
-                         Int4QTensor::getGroupSize());
+  } else { // QINT4
+    /// Run on GPU only when memory is a Shared Virual Memory
+    if (input[0]->getMemoryData()->isSVM() &&
+        output[0]->getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
+      std::vector<uint16_t *> scales;
+      for (unsigned int i = 0; i < input.size(); ++i) {
+        scales.push_back(input[i]->getScale<uint16_t>());
+      }
+      if (M == 1) {
+        gemv_int4_async_cl(mdatas, scales, data, rdatas, K, Ns,
+                           Int4QTensor::getGroupSize());
+      } else {
+        openvino_gemm_async_cl(data, mdatas, scales, rdatas, M, Ns, K,
+                               Int4QTensor::getGroupSize());
+      }
     } else {
-      openvino_gemm_async_cl(data, mdatas, scales, rdatas, M, Ns, K,
-                             Int4QTensor::getGroupSize());
-    }
-#endif
-  } else {
-    for (unsigned int i = 0; i < input.size(); ++i) {
-      dot(*input[i], *output[i], trans, trans_in, beta);
+      /// @todo This should be replaced with standard CPU INT4 computation
+      for (unsigned int i = 0; i < input.size(); ++i) {
+        gemm_q4_0(M, Ns[i], K, data, K, (void *)input[i]->getData(), Ns[i],
+                  rdatas[i], Ns[i]);
+      }
     }
   }
+#else
+  if (input_dtype == Tdatatype::Q4_0) {
+    /// @todo Support multi-weight q4_0 for x64
+    for (unsigned int i = 0; i < input.size(); ++i) {
+      gemm_q4_0(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i], Ns[i]);
+    }
+  } else { // QINT4
+    /// @note It is essential to understand that this section of the code
+    /// requires the `input` data to be converted to Q4_0 type, not QINT4 type.
+    /// This should be replaced with standard CPU INT4 computation instead of
+    /// using Q4_0.
+    for (unsigned int i = 0; i < input.size(); ++i) {
+      gemm_q4_0(M, Ns[i], K, data, K, (void *)input[i]->getData(), Ns[i],
+                rdatas[i], Ns[i]);
+    }
+  }
+#endif
 }
 
 Tensor &FloatTensor::dotFloat(Tensor const &input, Tensor &output, bool trans,
@@ -980,17 +992,24 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
       "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
   }
 #else
-  throw std::runtime_error(
-    "Error: FP16 should be enabled for QINT4 Dot on CPU");
+  /// @note It is essential to understand that this section of the code requires
+  /// the `input` data to be converted to Q4_0 type, not QINT4 type. This should
+  /// be replaced with standard CPU INT4 computation instead of using Q4_0.
+  gemm_q4_0(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
 #endif
 #else
-  /// @note this should be if (M == 1) else
-  if (M == 1) {
-    gemv_int4_cl(mdata, input.getScale<uint16_t>(), data, rdata, K, N,
-                 Int4QTensor::getGroupSize());
+  if (input.getMemoryData()->isSVM() && output.getMemoryData()->isSVM() &&
+      getMemoryData()->isSVM()) {
+    if (M == 1) {
+      gemv_int4_cl(mdata, input.getScale<uint16_t>(), data, rdata, K, N,
+                   Int4QTensor::getGroupSize());
+    } else {
+      openvino_sgemm_cl(data, mdata, input.getScale<uint16_t>(), rdata, M, N, K,
+                        Int4QTensor::getGroupSize());
+    }
   } else {
-    openvino_sgemm_cl(data, mdata, input.getScale<uint16_t>(), rdata, M, N, K,
-                      Int4QTensor::getGroupSize());
+    /// @todo This should be replaced with standard CPU INT4 computation
+    gemm_q4_0(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
   }
 #endif
 
@@ -1108,7 +1127,14 @@ void FloatTensor::topK(unsigned int k, void *output_data,
   output_dim.width(k);
   const auto output_strides = output_dim.computeStrides();
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4849)
+#endif
 #pragma omp parallel for collapse(3)
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
   for (int b = 0; b < static_cast<int>(batch); ++b) {
     for (int c = 0; c < static_cast<int>(channel); ++c) {
       for (int h = 0; h < static_cast<int>(height); ++h) {
@@ -1297,7 +1323,8 @@ std::vector<Tensor> FloatTensor::split(std::vector<size_t> sizes, int axis) {
     axis = 3;
   }
 
-  size_t total_size = std::accumulate(sizes.begin(), sizes.end(), 0);
+  size_t total_size =
+    std::accumulate(sizes.begin(), sizes.end(), static_cast<size_t>(0));
   NNTR_THROW_IF(dim.getTensorDim(axis) != total_size, std::invalid_argument)
     << "given sum of sizes did not match with origin tensor dim, tensor dim: "
     << dim.getTensorDim(axis) << " total size: " << total_size;

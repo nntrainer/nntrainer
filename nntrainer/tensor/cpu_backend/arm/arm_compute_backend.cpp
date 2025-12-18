@@ -19,6 +19,7 @@
 #include <ggml_interface.h>
 #include <neon_impl.h>
 #include <nntrainer_error.h>
+#include <q4_0_utils.h>
 
 namespace nntrainer {
 
@@ -427,6 +428,12 @@ void repack_q4_K(void *W, void *repacked_W, size_t data_size,
   __ggml_repack_q4_K_to_q4_K_8(W, repacked_W, data_size, M, N);
 }
 
+void unpack_q4_0(const void *in_q4_0x, void *out_q4_0, size_t data_size,
+                 const unsigned int M, const unsigned int N) {
+  Q4_0Utils::unpackBlocksQ4_0x4((const block_q4_0x4 *)in_q4_0x, data_size, M, N,
+                                (block_q4_0 *)out_q4_0);
+}
+
 template <>
 void softmax_row_inplace(float *qk_out, size_t start_row, size_t end_row,
                          size_t num_heads, float *sink) {
@@ -450,4 +457,85 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
            float upper_bound) {
   neon::clamp(input, output, length, lower_bound, upper_bound);
 }
+
+template <>
+void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
+                     int num_rows, int num_cache_head, int head_dim,
+                     int gqa_size, int tile_size, size_t local_window_size) {
+#ifdef ENABLE_FP16
+  neon::compute_kcaches<_FP16>(in, reinterpret_cast<const _FP16 *>(kcache),
+                               output, num_rows, num_cache_head, head_dim,
+                               gqa_size, tile_size, local_window_size);
+#else
+/// @note float16x4_t and related FP16 NEON are available
+#if defined(__aarch64__) || defined(_M_ARM64)
+  neon::compute_kcaches_uint16(in, kcache, output, num_rows, num_cache_head,
+                               head_dim, gqa_size, tile_size,
+                               local_window_size);
+#else
+  __fallback_compute_kcaches(in, kcache, output, num_rows, num_cache_head,
+                             head_dim, gqa_size, tile_size, local_window_size);
+#endif
+#endif
+}
+
+void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
+                                        const uint16_t *vcache, float *output,
+                                        int num_cache_head, int gqa_size,
+                                        int head_dim,
+                                        size_t local_window_size) {
+#ifdef ENABLE_FP16
+  neon::compute_fp16vcache_fp32_transposed(
+    row_num, in, reinterpret_cast<const _FP16 *>(vcache), output,
+    num_cache_head, gqa_size, head_dim, local_window_size);
+#else
+/// @note float16x4_t and related FP16 NEON are available
+#if defined(__aarch64__) || defined(_M_ARM64)
+  neon::compute_fp16vcache_fp32_transposed(row_num, in, vcache, output,
+                                           num_cache_head, gqa_size, head_dim,
+                                           local_window_size);
+#else
+  __fallback_compute_fp16vcache_fp32_transposed(row_num, in, vcache, output,
+                                                num_cache_head, gqa_size,
+                                                head_dim, local_window_size);
+#endif
+#endif
+}
+
+void compute_rotary_emb_value(unsigned int width, unsigned int dim,
+                              unsigned int half_, float *inout, void *output,
+                              const float *cos_, const float *sin_,
+                              bool only_convert_to_fp16) {
+#ifdef ENABLE_FP16
+  neon::compute_rotary_emb_value(width, dim, half_, inout, output, cos_, sin_,
+                                 only_convert_to_fp16);
+#else
+/// @note float16x4_t and related FP16 NEON are available
+#if defined(__aarch64__) || defined(_M_ARM64)
+  neon::compute_rotary_emb_value_uint16(width, dim, half_, inout, output, cos_,
+                                        sin_, only_convert_to_fp16);
+#else
+  __fallback_compute_rotary_emb_value(width, dim, half_, inout, output, cos_,
+                                      sin_, only_convert_to_fp16);
+#endif
+#endif
+}
+
+void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight) {
+  __fallback_create_q4_0_weights(int4_weight, q4_0_weight);
+}
+
+/// @todo rename it to `transform_int4_osv32_isv2_to_q4_0`
+void transform_q4_0x_from_int4(size_t N, size_t K, const uint8_t *osv32_weights,
+                               const uint16_t *osv32_scales,
+                               size_t scale_group_size, void *dst_q4_0x) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+  neon::transform_int4_osv32_isv2_to_q4_0x4(N, K, osv32_weights, osv32_scales,
+                                            scale_group_size, dst_q4_0x);
+#else
+  Q4_0Utils::transformQ4_0x_FromInt4(N, K, osv32_weights, osv32_scales,
+                                     scale_group_size, 4, dst_q4_0x);
+#endif
+}
+
 } /* namespace nntrainer */

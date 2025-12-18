@@ -8,7 +8,7 @@
  * manages the global configuration of the current environment
  * @see    https://github.com/nnstreamer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
- * @bug	   No known bugs except for NYI items
+ * @bug    No known bugs except for NYI items
  *
  */
 
@@ -36,6 +36,7 @@
 #include <addition_layer.h>
 #include <attention_layer.h>
 #include <bn_layer.h>
+#include <cast_layer.h>
 #include <centroid_knn.h>
 #include <channel_shuffle.h>
 #include <concat_layer.h>
@@ -52,6 +53,7 @@
 #include <embedding.h>
 #include <fc_layer.h>
 #include <flatten_layer.h>
+#include <gather_layer.h>
 #include <gru.h>
 #include <grucell.h>
 #include <identity_layer.h>
@@ -70,7 +72,7 @@
 #include <multi_head_attention_layer.h>
 #include <multiout_layer.h>
 #include <multiply_layer.h>
-#include <neg_layer.h>
+#include <negative_layer.h>
 #include <nntrainer_error.h>
 #include <permute_layer.h>
 #include <plugged_layer.h>
@@ -86,6 +88,7 @@
 #include <rnn.h>
 #include <rnncell.h>
 #include <sine_layer.h>
+#include <slice_layer.h>
 #include <split_layer.h>
 #include <sqrt_layer.h>
 #include <subtract_layer.h>
@@ -301,7 +304,13 @@ void AppContext::add_default_object() {
                   LayerType::LAYER_TANGENT);
   registerFactory(nntrainer::createLayer<MatMulLayer>, MatMulLayer::type,
                   LayerType::LAYER_MATMUL);
-  registerFactory(nntrainer::createLayer<NegLayer>, NegLayer::type,
+  registerFactory(nntrainer::createLayer<CastLayer>, CastLayer::type,
+                  LayerType::LAYER_CAST);
+  registerFactory(nntrainer::createLayer<GatherLayer>, GatherLayer::type,
+                  LayerType::LAYER_GATHER);
+  registerFactory(nntrainer::createLayer<SliceLayer>, SliceLayer::type,
+                  LayerType::LAYER_SLICE);
+  registerFactory(nntrainer::createLayer<NegativeLayer>, NegativeLayer::type,
                   LayerType::LAYER_NEG);
   registerFactory(nntrainer::createLayer<FullyConnectedLayer>,
                   FullyConnectedLayer::type, LayerType::LAYER_FC);

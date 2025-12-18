@@ -527,7 +527,7 @@ void Conv2DTransposeLayer::calcGradient(RunLayerContext &context) {
        * for the whole batch. try this while benchmarking.
        */
       im2col_transpose(in_sub, filter_dim, padding, stride, dilation, result);
-      deriv_sub.dot(result, delK, false, false, b == 0 ? 0 : 1);
+      deriv_sub.dot(result, delK, false, false, b == 0 ? 0.0f : 1.0f);
     }
     result.deallocate();
   }

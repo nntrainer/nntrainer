@@ -18,13 +18,13 @@
 
 auto semantic_weight = LayerSemanticsParamType(
   nntrainer::createLayer<nntrainer::WeightLayer>, nntrainer::WeightLayer::type,
-  {"dim=1:1:1"}, LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT,
-  false, 1);
+  {"dim=1:1:1", "tensor_dtype=FP32", "weight_name=unittest_weight1"},
+  LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false, 1);
 
 auto semantic_weight_multi = LayerSemanticsParamType(
   nntrainer::createLayer<nntrainer::WeightLayer>, nntrainer::WeightLayer::type,
-  {"dim=1:1:1"}, LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT,
-  false, 2);
+  {"dim=1:1:1", "tensor_dtype=FP32", "weight_name=unittest_weight2"},
+  LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false, 2);
 
 GTEST_PARAMETER_TEST(Weight, LayerSemantics,
                      ::testing::Values(semantic_weight, semantic_weight_multi));

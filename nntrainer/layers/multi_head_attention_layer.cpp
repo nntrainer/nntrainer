@@ -455,7 +455,8 @@ void MultiHeadAttentionLayer::forwarding(RunLayerContext &context,
 
   /** scaled dot product attention */
   projected_query.dotBatched(projected_key, attention_weight, false, true);
-  attention_weight.multiply_i(1 / sqrt((float)projected_query_dim_prop));
+  attention_weight.multiply_i(1.0f /
+                              std::sqrt((float)projected_query_dim_prop));
 
   if (provide_attention_mask) {
     // Tensor &attention_mask =
@@ -500,7 +501,7 @@ void MultiHeadAttentionLayer::forwarding(RunLayerContext &context,
       attention_weight.reshape(
         TensorDim({batch_size, num_heads, query_height, key_height}));
       attention_weight.sum(1, ret_attention_weight, 1, 0);
-      ret_attention_weight.divide_i(num_heads);
+      ret_attention_weight.divide_i(static_cast<float>(num_heads));
       attention_weight.reshape(
         TensorDim({batch_size * num_heads, 1, query_height, key_height}));
     } else {

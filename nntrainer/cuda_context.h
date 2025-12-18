@@ -35,6 +35,8 @@
 
 #include "singleton.h"
 
+#include "cuda_context_manager.h"
+
 namespace nntrainer {
 
 extern std::mutex cuda_factory_mutex;
@@ -45,6 +47,8 @@ extern std::mutex cuda_factory_mutex;
  */
 class CudaContext : public Context, public Singleton<CudaContext> {
 public:
+  cuda::ContextManager &context_inst_ = cuda::ContextManager::Global();
+
   /**
    * @brief   Default constructor
    */

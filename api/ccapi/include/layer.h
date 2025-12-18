@@ -48,9 +48,12 @@ enum LayerType {
   LAYER_COSINE = ML_TRAIN_LAYER_TYPE_COSINE,     /**< Cosine Layer type */
   LAYER_TANGENT = ML_TRAIN_LAYER_TYPE_TANGENT,   /**< Tangent Layer type */
   LAYER_MATMUL =
-    ML_TRAIN_LAYER_TYPE_MATMUL,        /**< Matrix multiplication Layer type */
-  LAYER_NEG = ML_TRAIN_LAYER_TYPE_NEG, /**< Negate Layer type */
-  LAYER_FC = ML_TRAIN_LAYER_TYPE_FC,   /**< Fully Connected Layer type */
+    ML_TRAIN_LAYER_TYPE_MATMUL, /**< Matrix multiplication Layer type */
+  LAYER_CAST = ML_TRAIN_LAYER_TYPE_CAST,     /**< Cast Layer type */
+  LAYER_GATHER = ML_TRAIN_LAYER_TYPE_GATHER, /**< Gather Layer type */
+  LAYER_SLICE = ML_TRAIN_LAYER_TYPE_SLICE,   /**< Slice Layer type */
+  LAYER_NEG = ML_TRAIN_LAYER_TYPE_NEG,       /**< Negative Layer type */
+  LAYER_FC = ML_TRAIN_LAYER_TYPE_FC,         /**< Fully Connected Layer type */
   LAYER_SWIGLU = ML_TRAIN_LAYER_TYPE_SWIGLU, /**< Swiglu Layer type */
   LAYER_BN = ML_TRAIN_LAYER_TYPE_BN, /**< Batch Normalization Layer type */
   LAYER_CONV2D = ML_TRAIN_LAYER_TYPE_CONV2D, /**< Convolution 2D Layer type */
@@ -111,20 +114,27 @@ enum LayerType {
     ML_TRAIN_LAYER_TYPE_LOSS_CROSS_ENTROPY_SOFTMAX, /**< Cross Entropy with
                                                        Softmax Loss Layer type
                                                      */
-  LAYER_TIME_DIST,       /**< Time Distributed Layer type */
-  LAYER_BACKBONE_TFLITE, /**< Backbone using TFLite */
-  LAYER_RESHAPE,         /**< Reshape Layer type */
-  LAYER_REDUCE_MEAN,     /**< Reduce mean Layer type */
+  LAYER_RMSNORM = ML_TRAIN_LAYER_TYPE_RMSNORM,      /**<RMS NORM Layer */
+  LAYER_TRANSPOSE = ML_TRAIN_LAYER_TYPE_TRANSPOSE,  /**< Transpose Layer type */
+  LAYER_CHANNEL_SHUFFLE =
+    ML_TRAIN_LAYER_TYPE_CHANNEL_SHUFFLE, /**< Channel Shuffle Layer type */
   LAYER_REDUCE_SUM =
     ML_TRAIN_LAYER_TYPE_REDUCE_SUM, /**< Reduce sum Layer type */
-  LAYER_LOSS_CONSTANT_DERIVATIVE,   /**< Synthetic loss layer to feed constant
-                                       derivative */
-  LAYER_UPSAMPLE2D,                 /**< Upsample 2D Layer type */
-  LAYER_RMSNORM = ML_TRAIN_LAYER_TYPE_RMSNORM,     /**<RMS NORM Layer */
-  LAYER_TRANSPOSE = ML_TRAIN_LAYER_TYPE_TRANSPOSE, /**< Transpose Layer type */
-  LAYER_CHANNEL_SHUFFLE =
-    ML_TRAIN_LAYER_TYPE_CHANNEL_SHUFFLE,      /**< Channel Shuffle Layer type */
-  LAYER_UNKNOWN = ML_TRAIN_LAYER_TYPE_UNKNOWN /**< Unknown */
+  LAYER_REDUCE_MEAN =
+    ML_TRAIN_LAYER_TYPE_REDUCE_MEAN,           /**< Reduce mean Layer type */
+  LAYER_RESHAPE = ML_TRAIN_LAYER_TYPE_RESHAPE, /**< Reshape Layer type */
+  LAYER_UPSAMPLE2D =
+    ML_TRAIN_LAYER_TYPE_UPSAMPLE2D, /**< Upsample 2D Layer type */
+
+  LAYER_UNKNOWN = ML_TRAIN_LAYER_TYPE_UNKNOWN, /**< Unknown */
+
+  LAYER_TIME_DIST =
+    ML_TRAIN_LAYER_EXPERIMENTAL, /**< Time Distributed Layer type */
+  LAYER_BACKBONE_TFLITE =
+    ML_TRAIN_LAYER_EXPERIMENTAL + 1, /**< Backbone using TFLite */
+  LAYER_LOSS_CONSTANT_DERIVATIVE =
+    ML_TRAIN_LAYER_EXPERIMENTAL + 2, /**< Synthetic loss layer to feed
+        constant derivative */
 };
 
 /**
@@ -409,10 +419,34 @@ MatMulLayer(const std::vector<std::string> &properties = {}) {
 }
 
 /**
- * @brief Helper function to create neg layer
+ * @brief Helper function to create cast layer
  */
 inline std::unique_ptr<Layer>
-NegLayer(const std::vector<std::string> &properties = {}) {
+CastLayer(const std::vector<std::string> &properties = {}) {
+  return createLayer(LayerType::LAYER_CAST, properties);
+}
+
+/**
+ * @brief Helper function to create gather layer
+ */
+inline std::unique_ptr<Layer>
+GatherLayer(const std::vector<std::string> &properties = {}) {
+  return createLayer(LayerType::LAYER_GATHER, properties);
+}
+
+/**
+ * @brief Helper function to create Slice layer
+ */
+inline std::unique_ptr<Layer>
+SliceLayer(const std::vector<std::string> &properties = {}) {
+  return createLayer(LayerType::LAYER_SLICE, properties);
+}
+
+/**
+ * @brief Helper function to create Negative layer
+ */
+inline std::unique_ptr<Layer>
+NegativeLayer(const std::vector<std::string> &properties = {}) {
   return createLayer(LayerType::LAYER_NEG, properties);
 }
 

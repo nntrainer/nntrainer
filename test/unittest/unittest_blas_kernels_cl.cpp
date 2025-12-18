@@ -36,6 +36,8 @@ using namespace nntrainer;
 // Functions
 // -----
 
+#define Q4_0 32
+
 static std::pair<float, float>
 dotCL_sgemv_test_func(const int batch, const int channel, const int height,
                       const int width, const int height_b, const int width_b,
@@ -893,7 +895,7 @@ static void run_int4_gemm_test_(const uint32_t M, const uint32_t K,
   nntrainer::sgemm(0, false, true, M, N, K, 1.F, input.data(), K,
                    weight_fp32.data(), K, 0.F, ref_dst.data(), N);
 
-  // Reference Q4_0 GEMV
+  // Reference Q4_0 GEMM
   if (K % Q4_0 == 0 && N % 8 == 0) {
     size_t q4_data_size = K * N / Q4_0 * sizeof(block_q4_0);
     std::vector<float> q4_output_fp32(M * N);

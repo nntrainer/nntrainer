@@ -8,7 +8,9 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include "int4_utils.h"
 #include "nntrainer_test_util.h"
+#include "q4_0_utils.h"
 #include <cpu_backend.h>
 #include <fallback_internal.h>
 #include <fp16.h>
@@ -25,6 +27,10 @@ using std::chrono::microseconds;
 using std::chrono::milliseconds;
 using std::chrono::nanoseconds;
 using std::chrono::seconds;
+
+#define EXPECT_IN_RANGE(VAL, MIN, MAX)                                         \
+  EXPECT_GE((VAL), (MIN));                                                     \
+  EXPECT_LE((VAL), (MAX))
 
 template <typename T, bool random_init = false>
 static inline std::vector<T>
@@ -76,6 +82,7 @@ static inline double find_max_diff(T *src, T *src2, int M, int N) {
 }
 
 #define QK4_0 32
+#define Q4_0 32
 /**
  * @brief q4_0 block
  *
@@ -741,17 +748,17 @@ TEST(nntrainer_cpu_backend_standalone, softmax_row_inplace) {
   size_t num_heads = 10;
   size_t qk_out_size = num_heads * end_row;
   std::vector<float> qk_out = {
-    -2.509198, 5.930860,  9.014286,  -6.331305, 4.639878,  5.593820,
-    1.973170,  1.937003,  -6.879627, -1.083345, -6.880110, -8.000502,
-    -8.838327, -0.815022, 7.323523,  -3.325828, 2.022300,  -7.142663,
-    4.161452,  3.017770,  -9.588310, -8.871769, 9.398197,  4.439975,
-    6.648853,  8.771055,  -5.753218, -9.984425, -6.363501, 9.844232};
+    -2.509198f, 5.930860f,  9.014286f,  -6.331305f, 4.639878f,  5.593820f,
+    1.973170f,  1.937003f,  -6.879627f, -1.083345f, -6.880110f, -8.000502f,
+    -8.838327f, -0.815022f, 7.323523f,  -3.325828f, 2.022300f,  -7.142663f,
+    4.161452f,  3.017770f,  -9.588310f, -8.871769f, 9.398197f,  4.439975f,
+    6.648853f,  8.771055f,  -5.753218f, -9.984425f, -6.363501f, 9.844232f};
   std::vector<float> ref_out = {
-    0.986697, 0.999999, 0.405184, 0.000021, 0.043301, 0.040031,
-    0.487615, 0.999879, 0.000016, 0.000018, 0.012472, 0.000001,
-    0.000000, 0.005194, 0.633859, 0.000005, 0.512170, 0.000114,
-    0.999957, 0.001083, 0.000831, 0.000000, 0.594816, 0.994785,
-    0.322840, 0.959963, 0.000215, 0.000007, 0.000027, 0.998899};
+    0.986697f, 0.999999f, 0.405184f, 0.000021f, 0.043301f, 0.040031f,
+    0.487615f, 0.999879f, 0.000016f, 0.000018f, 0.012472f, 0.000001f,
+    0.000000f, 0.005194f, 0.633859f, 0.000005f, 0.512170f, 0.000114f,
+    0.999957f, 0.001083f, 0.000831f, 0.000000f, 0.594816f, 0.994785f,
+    0.322840f, 0.959963f, 0.000215f, 0.000007f, 0.000027f, 0.998899f};
 
   nntrainer::softmax_row_inplace(qk_out.data(), start_row, end_row, num_heads);
 
@@ -766,17 +773,17 @@ TEST(nntrainer_cpu_backend_standalone, softmax_row) {
   size_t num_heads = 10;
   size_t qk_out_size = num_heads * end_row;
   std::vector<float> qk_out = {
-    -2.509198, 5.930860,  9.014286,  -6.331305, 4.639878,  5.593820,
-    1.973170,  1.937003,  -6.879627, -1.083345, -6.880110, -8.000502,
-    -8.838327, -0.815022, 7.323523,  -3.325828, 2.022300,  -7.142663,
-    4.161452,  3.017770,  -9.588310, -8.871769, 9.398197,  4.439975,
-    6.648853,  8.771055,  -5.753218, -9.984425, -6.363501, 9.844232};
+    -2.509198f, 5.930860f,  9.014286f,  -6.331305f, 4.639878f,  5.593820f,
+    1.973170f,  1.937003f,  -6.879627f, -1.083345f, -6.880110f, -8.000502f,
+    -8.838327f, -0.815022f, 7.323523f,  -3.325828f, 2.022300f,  -7.142663f,
+    4.161452f,  3.017770f,  -9.588310f, -8.871769f, 9.398197f,  4.439975f,
+    6.648853f,  8.771055f,  -5.753218f, -9.984425f, -6.363501f, 9.844232f};
   std::vector<float> ref_out = {
-    0.986697, 0.999999, 0.405184, 0.000021, 0.043301, 0.040031,
-    0.487615, 0.999879, 0.000016, 0.000018, 0.012472, 0.000001,
-    0.000000, 0.005194, 0.633859, 0.000005, 0.512170, 0.000114,
-    0.999957, 0.001083, 0.000831, 0.000000, 0.594816, 0.994785,
-    0.322840, 0.959963, 0.000215, 0.000007, 0.000027, 0.998899};
+    0.986697f, 0.999999f, 0.405184f, 0.000021f, 0.043301f, 0.040031f,
+    0.487615f, 0.999879f, 0.000016f, 0.000018f, 0.012472f, 0.000001f,
+    0.000000f, 0.005194f, 0.633859f, 0.000005f, 0.512170f, 0.000114f,
+    0.999957f, 0.001083f, 0.000831f, 0.000000f, 0.594816f, 0.994785f,
+    0.322840f, 0.959963f, 0.000215f, 0.000007f, 0.000027f, 0.998899f};
 
   nntrainer::softmax_row(qk_out.data(), start_row, end_row, num_heads);
 
@@ -796,23 +803,25 @@ TEST(nntrainer_cpu_backend_standalone, compute_kcaches) {
   size_t kcache_size = num_rows * N * head_dim;
   size_t output_size = num_rows * N * group_size;
   std::vector<float> in = {
-    -2.509198, 5.930860,  9.014286,  -6.331305, 4.639878,  5.593820,  1.973170,
-    1.937003,  -6.879627, -1.083345, -6.880110, -8.000502, -8.838327, -0.815022,
-    7.323523,  -3.325828, 2.022300,  -7.142663, 4.161452,  3.017770,  -9.588310,
-    -8.871769, 9.398197,  4.439975,  6.648853,  8.771055,  -5.753218, -9.984425,
-    -6.363501, 9.844232,  -6.331910, 2.349631,  -3.915155, 2.233063,  0.495129,
-    -9.858674, -1.361099, -9.538752, -4.175417, 0.495493,  2.237058,  -2.002780,
-    -7.210123, -9.066687, -4.157107, 9.475111,  -2.672763, -5.344573, -0.878600,
-    -8.187871, 5.703520,  2.367721,  -6.006524, -2.350760, 0.284688,  9.664618,
-    1.848291,  -0.664742, -9.070992, 7.198808,  2.150897,  3.606151,  -6.589518,
-    -0.990015, -8.698968, -9.734701, 8.977711,  8.844034,  9.312640,  1.265764,
-    6.167947,  -2.291670, -3.907725, -9.680675, -8.046557, -5.382123, 3.684660,
-    -5.179491, -1.196950, 3.665271};
+    -2.509198f, 5.930860f,  9.014286f,  -6.331305f, 4.639878f,  5.593820f,
+    1.973170f,  1.937003f,  -6.879627f, -1.083345f, -6.880110f, -8.000502f,
+    -8.838327f, -0.815022f, 7.323523f,  -3.325828f, 2.022300f,  -7.142663f,
+    4.161452f,  3.017770f,  -9.588310f, -8.871769f, 9.398197f,  4.439975f,
+    6.648853f,  8.771055f,  -5.753218f, -9.984425f, -6.363501f, 9.844232f,
+    -6.331910f, 2.349631f,  -3.915155f, 2.233063f,  0.495129f,  -9.858674f,
+    -1.361099f, -9.538752f, -4.175417f, 0.495493f,  2.237058f,  -2.002780f,
+    -7.210123f, -9.066687f, -4.157107f, 9.475111f,  -2.672763f, -5.344573f,
+    -0.878600f, -8.187871f, 5.703520f,  2.367721f,  -6.006524f, -2.350760f,
+    0.284688f,  9.664618f,  1.848291f,  -0.664742f, -9.070992f, 7.198808f,
+    2.150897f,  3.606151f,  -6.589518f, -0.990015f, -8.698968f, -9.734701f,
+    8.977711f,  8.844034f,  9.312640f,  1.265764f,  6.167947f,  -2.291670f,
+    -3.907725f, -9.680675f, -8.046557f, -5.382123f, 3.684660f,  -5.179491f,
+    -1.196950f, 3.665271f};
   std::vector<uint16_t> kcache = {3751, 7967, 9507, 1842, 7322, 7799, 5990,
                                   5972, 1568, 4463, 1568, 1008, 590,  4597,
                                   8663, 3343, 6015, 1437, 7083, 6512};
-  std::vector<float> ref_out = {0.089252,  -0.072949, 0.058948,  -0.045583,
-                                -0.025812, -0.002068, -0.014971, -0.028027};
+  std::vector<float> ref_out = {0.089252f,  -0.072949f, 0.058948f,  -0.045583f,
+                                -0.025812f, -0.002068f, -0.014971f, -0.028027f};
   std::vector<float> output(output_size);
 
   nntrainer::compute_kcaches<uint16_t>(in.data(), kcache.data(), output.data(),
@@ -831,25 +840,27 @@ TEST(nntrainer_cpu_backend_standalone, compute_rotary_emb_value_out_null) {
   bool only_convert_to_fp16 = false;
 
   std::vector<float> inout = {
-    -0.250920, 0.593086,  0.901429,  -0.633130, 0.463988,  0.559382,  0.197317,
-    0.193700,  -0.687963, -0.108334, -0.688011, -0.800050, -0.883833, -0.081502,
-    0.732352,  -0.332583, 0.202230,  -0.714266, 0.416145,  0.301777,  -0.958831,
-    -0.887177, 0.939820,  0.443998,  0.664885,  0.877105,  -0.575322, -0.998442,
-    -0.636350, 0.984423,  -0.633191, 0.234963,  -0.391515, 0.223306,  0.049513,
-    -0.985867, -0.136110, -0.953875, -0.417542, 0.049549};
-  std::vector<float> cos_ = {-0.508061, 0.998221,  -0.733869, 0.164825,
-                             0.297530,  -0.591437, -0.165907, -0.999895,
-                             -0.163179, 0.249787};
-  std::vector<float> sin_ = {0.809128,  -0.390829, -0.112627, 0.377992,
-                             -0.994569, -0.641599, -0.927266, -0.401338,
-                             0.244335,  -0.414953};
+    -0.250920f, 0.593086f,  0.901429f,  -0.633130f, 0.463988f,  0.559382f,
+    0.197317f,  0.193700f,  -0.687963f, -0.108334f, -0.688011f, -0.800050f,
+    -0.883833f, -0.081502f, 0.732352f,  -0.332583f, 0.202230f,  -0.714266f,
+    0.416145f,  0.301777f,  -0.958831f, -0.887177f, 0.939820f,  0.443998f,
+    0.664885f,  0.877105f,  -0.575322f, -0.998442f, -0.636350f, 0.984423f,
+    -0.633191f, 0.234963f,  -0.391515f, 0.223306f,  0.049513f,  -0.985867f,
+    -0.136110f, -0.953875f, -0.417542f, 0.049549f};
+  std::vector<float> cos_ = {-0.508061f, 0.998221f,  -0.733869f, 0.164825f,
+                             0.297530f,  -0.591437f, -0.165907f, -0.999895f,
+                             -0.163179f, 0.249787};
+  std::vector<float> sin_ = {0.809128f,  -0.390829f, -0.112627f, 0.377992f,
+                             -0.994569f, -0.641599f, -0.927266f, -0.401338f,
+                             0.244335f,  -0.414953f};
   std::vector<float> ref_out = {
-    0.684172,  0.279348,  -0.761074, -0.073549, 0.866425,  -0.544224, 0.154785,
-    -0.480342, 0.010582,  0.098163,  0.146526,  -1.030422, 0.547092,  -0.252752,
-    -0.243571, -0.162197, -0.216517, 0.636452,  -0.236000, 0.120334,  0.999478,
-    -0.793769, -0.733800, -0.011226, 0.247067,  -1.151284, -0.030760, 0.615511,
-    0.205859,  0.266457,  -0.454117, 0.581280,  0.181472,  0.204634,  -0.646542,
-    0.020328,  0.556058,  1.354487,  -0.087349, -0.396113};
+    0.684172f,  0.279348f,  -0.761074f, -0.073549f, 0.866425f,  -0.544224f,
+    0.154785f,  -0.480342f, 0.010582f,  0.098163f,  0.146526f,  -1.030422f,
+    0.547092f,  -0.252752f, -0.243571f, -0.162197f, -0.216517f, 0.636452f,
+    -0.236000f, 0.120334f,  0.999478f,  -0.793769f, -0.733800f, -0.011226f,
+    0.247067f,  -1.151284f, -0.030760f, 0.615511f,  0.205859f,  0.266457f,
+    -0.454117f, 0.581280f,  0.181472f,  0.204634f,  -0.646542f, 0.020328f,
+    0.556058f,  1.354487f,  -0.087349f, -0.396113f};
 
   nntrainer::compute_rotary_emb_value(width, dim, half_, inout.data(), nullptr,
                                       cos_.data(), sin_.data(),
@@ -867,25 +878,27 @@ TEST(nntrainer_cpu_backend_standalone, compute_rotary_emb_value_out_uint16) {
   bool only_convert_to_fp16 = false;
 
   std::vector<float> inout = {
-    -0.250920, 0.593086,  0.901429,  -0.633130, 0.463988,  0.559382,  0.197317,
-    0.193700,  -0.687963, -0.108334, -0.688011, -0.800050, -0.883833, -0.081502,
-    0.732352,  -0.332583, 0.202230,  -0.714266, 0.416145,  0.301777,  -0.958831,
-    -0.887177, 0.939820,  0.443998,  0.664885,  0.877105,  -0.575322, -0.998442,
-    -0.636350, 0.984423,  -0.633191, 0.234963,  -0.391515, 0.223306,  0.049513,
-    -0.985867, -0.136110, -0.953875, -0.417542, 0.049549};
-  std::vector<float> cos_ = {-0.508061, 0.998221,  -0.733869, 0.164825,
-                             0.297530,  -0.591437, -0.165907, -0.999895,
-                             -0.163179, 0.249787};
-  std::vector<float> sin_ = {0.809128,  -0.390829, -0.112627, 0.377992,
-                             -0.994569, -0.641599, -0.927266, -0.401338,
-                             0.244335,  -0.414953};
+    -0.250920f, 0.593086f,  0.901429f,  -0.633130f, 0.463988f,  0.559382f,
+    0.197317f,  0.193700f,  -0.687963f, -0.108334f, -0.688011f, -0.800050f,
+    -0.883833f, -0.081502f, 0.732352f,  -0.332583f, 0.202230f,  -0.714266f,
+    0.416145f,  0.301777f,  -0.958831f, -0.887177f, 0.939820f,  0.443998f,
+    0.664885f,  0.877105f,  -0.575322f, -0.998442f, -0.636350f, 0.984423f,
+    -0.633191f, 0.234963f,  -0.391515f, 0.223306f,  0.049513f,  -0.985867f,
+    -0.136110f, -0.953875f, -0.417542f, 0.049549f};
+  std::vector<float> cos_ = {-0.508061f, 0.998221f,  -0.733869f, 0.164825f,
+                             0.297530f,  -0.591437f, -0.165907f, -0.999895f,
+                             -0.163179f, 0.249787f};
+  std::vector<float> sin_ = {0.809128f,  -0.390829f, -0.112627f, 0.377992f,
+                             -0.994569f, -0.641599f, -0.927266f, -0.401338f,
+                             0.244335f,  -0.414953f};
   std::vector<float> ref_out = {
-    0.684172,  0.279348,  -0.761074, -0.073549, 0.866425,  -0.544224, 0.154785,
-    -0.480342, 0.010582,  0.098163,  0.146526,  -1.030422, 0.547092,  -0.252752,
-    -0.243571, -0.162197, -0.216517, 0.636452,  -0.236000, 0.120334,  0.999478,
-    -0.793769, -0.733800, -0.011226, 0.247067,  -1.151284, -0.030760, 0.615511,
-    0.205859,  0.266457,  -0.454117, 0.581280,  0.181472,  0.204634,  -0.646542,
-    0.020328,  0.556058,  1.354487,  -0.087349, -0.396113};
+    0.684172f,  0.279348f,  -0.761074f, -0.073549f, 0.866425f,  -0.544224f,
+    0.154785f,  -0.480342f, 0.010582f,  0.098163f,  0.146526f,  -1.030422f,
+    0.547092f,  -0.252752f, -0.243571f, -0.162197f, -0.216517f, 0.636452f,
+    -0.236000f, 0.120334f,  0.999478f,  -0.793769f, -0.733800f, -0.011226f,
+    0.247067f,  -1.151284f, -0.030760f, 0.615511f,  0.205859f,  0.266457f,
+    -0.454117f, 0.581280f,  0.181472f,  0.204634f,  -0.646542f, 0.020328f,
+    0.556058f,  1.354487f,  -0.087349f, -0.396113f};
   std::vector<uint16_t> output(width);
 
   nntrainer::compute_rotary_emb_value(width, dim, half_, inout.data(),
@@ -908,25 +921,25 @@ TEST(nntrainer_cpu_backend_standalone, compute_fp16vcache_fp32_transposed) {
   size_t vcache_size = max_iter * num_cache_head * head_dim;
   size_t output_size = num_cache_head * gqa_size * head_dim;
 
-  std::vector<float> in = {0.092400,  -0.414656, -0.271581, -0.300455,
-                           0.317950,  -0.176271, 0.138504,  -0.361754,
-                           -0.024215, -0.968064, 0.360932,  0.384471};
+  std::vector<float> in = {0.092400f,  -0.414656f, -0.271581f, -0.300455f,
+                           0.317950f,  -0.176271f, 0.138504f,  -0.361754f,
+                           -0.024215f, -0.968064f, 0.360932f,  0.384471f};
   std::vector<float> f32_vcache = {
-    -0.250920, 0.593086,  0.901429,  -0.633130, 0.463988,  0.559382,
-    0.197317,  0.193700,  -0.687963, -0.108334, -0.688011, -0.800050,
-    -0.883833, -0.081502, 0.732352,  -0.332583, 0.202230,  -0.714266,
-    0.416145,  0.301777,  -0.958831, -0.887177, 0.939820,  0.443998,
-    0.664885,  0.877105,  -0.575322, -0.998442, -0.636350, 0.984423,
-    -0.633191, 0.234963,  -0.391515, 0.223306,  0.049513,  -0.985867};
+    -0.250920f, 0.593086f,  0.901429f,  -0.633130f, 0.463988f,  0.559382f,
+    0.197317f,  0.193700f,  -0.687963f, -0.108334f, -0.688011f, -0.800050f,
+    -0.883833f, -0.081502f, 0.732352f,  -0.332583f, 0.202230f,  -0.714266f,
+    0.416145f,  0.301777f,  -0.958831f, -0.887177f, 0.939820f,  0.443998f,
+    0.664885f,  0.877105f,  -0.575322f, -0.998442f, -0.636350f, 0.984423f,
+    -0.633191f, 0.234963f,  -0.391515f, 0.223306f,  0.049513f,  -0.985867f};
   std::vector<uint16_t> vcache =
     convert_vector_f32_to_f16_as_uint16(f32_vcache);
   std::vector<float> ref_out = {
-    0.109160,  0.150761,  -0.221623, -0.340605, 0.341716,  0.192903,
-    0.229677,  0.296728,  -0.246453, 0.030694,  -0.299190, -0.204716,
-    0.418990,  -0.358029, -0.310309, -0.199024, -0.234911, 0.386668,
-    -0.108879, 0.098724,  0.353685,  0.152306,  0.054675,  -0.253151,
-    0.121229,  -0.048077, 0.057462,  0.393775,  0.436868,  -0.115650,
-    0.494638,  -0.060525, -0.078396, 0.019140,  -0.078680, 0.571263};
+    0.109160f,  0.150761f,  -0.221623f, -0.340605f, 0.341716f,  0.192903f,
+    0.229677f,  0.296728f,  -0.246453f, 0.030694f,  -0.299190f, -0.204716f,
+    0.418990f,  -0.358029f, -0.310309f, -0.199024f, -0.234911f, 0.386668f,
+    -0.108879f, 0.098724f,  0.353685f,  0.152306f,  0.054675f,  -0.253151f,
+    0.121229f,  -0.048077f, 0.057462f,  0.393775f,  0.436868f,  -0.115650f,
+    0.494638f,  -0.060525f, -0.078396f, 0.019140f,  -0.078680f, 0.571263f};
   std::vector<float> output(output_size);
 
   nntrainer::compute_fp16vcache_fp32_transposed(
@@ -1176,6 +1189,188 @@ TEST(nntrainer_cpu_backend_standalone, clamp_3072_0_1) {
   float upper_bound = 1.F;
   run_clamp_test(N, lower_bound, upper_bound, false);
 }
+
+static inline void printMatrixI(const char *name, float *data, int Y, int X) {
+  printf("%s :\n", name);
+  for (int y = 0; y < Y; y++) {
+    // printf("[");
+    for (int x = 0; x < X; x++) {
+      if (x % 10 == 0) {
+        printf("| ");
+      }
+      std::cout << (int)(0.5f + data[y * X + x]) << " ";
+    }
+    printf("\n");
+  }
+}
+
+static inline std::vector<float> generate_01_vector(const size_t size,
+                                                    const float ones_ratio) {
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_real_distribution<float> dist(0.0f, (float)size);
+  if (ones_ratio >= 1.0) {
+    std::vector<float> vec(size, 1.0f);
+    return vec;
+  } else {
+    std::vector<float> vec(size, 0.0f);
+    size_t ones_cnt = (size_t)(size * ones_ratio);
+    for (size_t i = 0; i < ones_cnt; i++) {
+      int pos = static_cast<int>(dist(gen));
+      vec[pos] = 1.0f;
+    }
+    return vec;
+  }
+}
+
+static void run_transform_int4_test_(const uint32_t K, const uint32_t N,
+                                     const int scale_group_size,
+                                     bool use_ones = false) {
+  const size_t q4_data_size = K * N / Q4_0 * sizeof(block_q4_0);
+  std::vector<float> weight_fp32;
+  if (use_ones) {
+    float ones_ratio = 0.1f;
+    weight_fp32 = generate_01_vector(N * K, ones_ratio);
+  } else {
+    weight_fp32 = generate_random_vector<float, false>(N * K, -1.0, 1.0);
+  }
+
+  bool print = false;
+  if (print && use_ones) {
+    printMatrixI("weight_fp32", weight_fp32.data(), N, K);
+  }
+
+  std::vector<uint8_t> osv32_weights;
+  std::vector<uint16_t> osv32_scales;
+  nntrainer::Int4Utils::quantizeAndRepack(
+    weight_fp32.data(), N, K, scale_group_size, osv32_weights, osv32_scales);
+
+  // MAIN TEST - direct transform Int4 data (osv32_isv2) ---> Q4_0x
+  std::vector<uint8_t> dst_q4_0x(q4_data_size);
+  auto t0 = std::chrono::high_resolution_clock::now();
+  nntrainer::transform_q4_0x_from_int4(N, K, osv32_weights.data(),
+                                       osv32_scales.data(), scale_group_size,
+                                       dst_q4_0x.data());
+  auto t1 = std::chrono::high_resolution_clock::now();
+  auto exec_time =
+    std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
+  std::cout << "Time: " << (double)exec_time.count() / 1000 << " ms"
+            << std::endl;
+
+  // Check MSE quantized values
+  std::vector<uint8_t> unpacked_weights_q4(q4_data_size);
+  nntrainer::unpack_q4_0(dst_q4_0x.data(), unpacked_weights_q4.data(),
+                         q4_data_size, N, K);
+  std::vector<float> dequantized_weights_q4(N * K);
+  nntrainer::dequantize_row_q4_0(unpacked_weights_q4.data(),
+                                 dequantized_weights_q4.data(), N * K);
+  if (print && use_ones) {
+    printMatrixI("dequantized_weights_q4 I", dequantized_weights_q4.data(), N,
+                 K);
+  }
+  float mse_direct_transform_q4 =
+    mse<float>(weight_fp32.data(), dequantized_weights_q4.data(), N * K);
+  std::cout << "MSE direct transform Q4_0: " << std::setprecision(10)
+            << mse_direct_transform_q4 << std::endl;
+  // MAIN TEST - END
+
+  // Reference solution - Int4 data (osv32_isv2) --> FP32 --> quantization to
+  // Q4_0x8 For checking difference of accuracy
+  std::vector<float> dequant_weight_fp32(N * K);
+  nntrainer::Int4Utils::dequantizePacked(osv32_weights, osv32_scales, N, K,
+                                         scale_group_size, dequant_weight_fp32);
+  std::vector<uint8_t> tmp_q4_weight(q4_data_size);
+  nntrainer::quantize_q4_0(dequant_weight_fp32.data(), tmp_q4_weight.data(), N,
+                           K, nullptr);
+  std::vector<uint8_t> ref_q4_0x8(q4_data_size);
+  nntrainer::repack_q4_0(ref_q4_0x8.data(), tmp_q4_weight.data(), q4_data_size,
+                         N, K);
+  // Check MSE quantized values
+  std::vector<uint8_t> unpacked_ref_weights_q4(q4_data_size);
+  nntrainer::unpack_q4_0(ref_q4_0x8.data(), unpacked_ref_weights_q4.data(),
+                         q4_data_size, N, K);
+  std::vector<float> dequantized_ref_weights_q4(N * K);
+  nntrainer::dequantize_row_q4_0(unpacked_ref_weights_q4.data(),
+                                 dequantized_ref_weights_q4.data(), N * K);
+  float mse_fp32_transform_q4 =
+    mse<float>(weight_fp32.data(), dequantized_ref_weights_q4.data(), N * K);
+  std::cout << "MSE FP32 transform Q4_0:   " << std::setprecision(10)
+            << mse_fp32_transform_q4 << std::endl;
+  // Reference solution - END
+
+  float mse_dequant_int4_vs_trans_q4 = mse<float>(
+    dequant_weight_fp32.data(), dequantized_weights_q4.data(), N * K);
+  std::cout << "MSE dequant Int4 vs direct transform Q4_0: "
+            << std::setprecision(10) << mse_dequant_int4_vs_trans_q4
+            << std::endl;
+
+  // This is a proof that the transformQ4_0x_FromInt4() is lossless computation.
+  const float epsilon = 0.00001f;
+  EXPECT_IN_RANGE(mse_dequant_int4_vs_trans_q4, 0, epsilon);
+
+  // Other MSEs
+  const float epsilon_direct = (use_ones) ? 0.00001f : 0.002f;
+  EXPECT_IN_RANGE(mse_direct_transform_q4, 0, epsilon_direct);
+  const float epsilon_fp32 = (use_ones) ? 0.00001f : 0.004f;
+  EXPECT_IN_RANGE(mse_fp32_transform_q4, 0, epsilon_fp32);
+  if (!use_ones) {
+    EXPECT_LE(mse_direct_transform_q4, mse_fp32_transform_q4);
+  }
+
+  // Additional test with using GEMMs
+  const uint32_t M = 4;
+  const uint32_t input_size = M * K;
+  const int INT4_BLOCK_N_SIZE = 32;
+  uint32_t alignN = nntrainer::align(N, INT4_BLOCK_N_SIZE);
+  std::vector<float> input =
+    generate_random_vector<float, false>(input_size, -1.0, 1.0);
+
+  // SGEMM - reference
+  std::vector<float> ref_output_fp32(M * N, 0.0f);
+  nntrainer::sgemm(0, false, true, M, N, K, 1.F, input.data(), K,
+                   weight_fp32.data(), K, 0.F, ref_output_fp32.data(), N);
+
+  // GEMM INT4->transform->Q4
+  std::vector<float> int4_trans_q4_output_fp32(M * N);
+  nntrainer::gemm_q4_0(M, N, K, input.data(), K, dst_q4_0x.data(), N,
+                       int4_trans_q4_output_fp32.data(), N);
+  float mse_int4_trans_q4 =
+    mse<float>(ref_output_fp32.data(), int4_trans_q4_output_fp32.data(), M * N);
+  std::cout << "MSE GEMM INT4->transform->Q4:            "
+            << std::setprecision(10) << mse_int4_trans_q4 << std::endl;
+
+  // GEMM INT4->dequant->FP32->quant->Q4
+  std::vector<float> int4_fp32_q4_output_fp32(M * N);
+  nntrainer::gemm_q4_0(M, N, K, input.data(), K, ref_q4_0x8.data(), N,
+                       int4_fp32_q4_output_fp32.data(), N);
+  float mse_int4_fp32_q4 =
+    mse<float>(ref_output_fp32.data(), int4_fp32_q4_output_fp32.data(), M * N);
+  std::cout << "MSE GEMM INT4->dequant->FP32->quant->Q4: "
+            << std::setprecision(10) << mse_int4_fp32_q4 << std::endl;
+}
+
+#define DECLARE_transform_int4_test_K_N(K, N, G)                               \
+  TEST(nntrainer_blas_kernel,                                                  \
+       _transform_int4_test_K##K##_N##N##_Group##G##_RandomOnes) {             \
+    run_transform_int4_test_(K, N, G, true);                                   \
+  }                                                                            \
+  TEST(nntrainer_blas_kernel,                                                  \
+       _transform_int4_test_K##K##_N##N##_Group##G##_RandomFloat) {            \
+    run_transform_int4_test_(K, N, G, false);                                  \
+  }
+
+DECLARE_transform_int4_test_K_N(128, 40, 32);
+DECLARE_transform_int4_test_K_N(128, 40, 64);
+DECLARE_transform_int4_test_K_N(256, 40, 128);
+DECLARE_transform_int4_test_K_N(32, 40, 32);
+DECLARE_transform_int4_test_K_N(32, 48, 32);
+DECLARE_transform_int4_test_K_N(64, 40, 32);
+DECLARE_transform_int4_test_K_N(320, 640, 32);
+DECLARE_transform_int4_test_K_N(1024, 640, 32);
+DECLARE_transform_int4_test_K_N(1024, 648, 32);
+DECLARE_transform_int4_test_K_N(1024, 648, 64);
+DECLARE_transform_int4_test_K_N(1024, 648, 128);
+DECLARE_transform_int4_test_K_N(3072, 8192, 32);
 
 int main(int argc, char **argv) {
   int result = -1;

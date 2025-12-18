@@ -121,11 +121,11 @@ private:
   /**
    * @brief Get updated learning rate
    *
-   * @param ll learning rate
+   * @param lr learning rate
    *
    * @return updated learning rate
    */
-  double getUpdatedLearningRate(unsigned int iteration, double ll) const;
+  double getUpdatedLearningRate(unsigned int iteration, double lr) const;
 };
 } /* namespace nntrainer */
 

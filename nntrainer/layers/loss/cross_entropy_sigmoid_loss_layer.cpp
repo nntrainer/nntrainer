@@ -38,9 +38,9 @@ void CrossEntropySigmoidLossLayer::forwarding(RunLayerContext &context,
     // @note: the output should be logit before applying sigmoid
     // log(1 + exp(-abs(y))) + max(y, 0)
     Tensor mid_term = y.apply<float>(static_cast<float (*)(float)>(&std::fabs))
-                        .multiply(-1.0)
+                        .multiply(-1.0f)
                         .apply<float>(static_cast<float (*)(float)>(&std::exp))
-                        .add(1.0)
+                        .add(1.0f)
                         .apply<float>(logFloat<float>);
     mid_term = mid_term.add(y.apply<float>(ActiFunc::relu<float>));
 
@@ -62,7 +62,8 @@ void CrossEntropySigmoidLossLayer::calcDerivative(RunLayerContext &context) {
 
   y.apply<float>(ActiFunc::sigmoid<float>, ret_derivative);
   ret_derivative.subtract_i(y2);
-  if (ret_derivative.divide_i(ret_derivative.size()) != ML_ERROR_NONE) {
+  if (ret_derivative.divide_i(static_cast<float>(ret_derivative.size())) !=
+      ML_ERROR_NONE) {
     throw std::runtime_error("[CrossEntropySigmoidLossLayer::calcDerivative] "
                              "Error when calculating loss");
   }

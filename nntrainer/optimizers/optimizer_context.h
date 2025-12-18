@@ -45,11 +45,24 @@ public:
   Tensor &getWeight() const;
 
   /**
+   * @brief Get the Weight FP32 tensor object (master weight for mixed
+   * precision)
+   *
+   * @return Tensor& Reference to the FP32 master weight tensor
+   */
+  Tensor &getWeightFP32() const;
+
+  /**
    * @brief Get the Weight Gradient tensor object
    *
    * @return Tensor& Reference to the weight grad tensor
    */
   Tensor &getGradient() const;
+
+  /**
+   * @brief Return if the underlying weight is mixed precision
+   */
+  bool isMixedPrecision() const;
 
   /**
    * @brief Get the optimizer variable associated to this weight
@@ -101,11 +114,6 @@ public:
    * @brief   Apply loss scale to gradient (full precision)
    */
   void applyLossScale(Tensor &fp32_grad);
-
-  /**
-   * @brief     Calculate gradient from the decay of the weight
-   */
-  void calcWeightDecayGradient();
 
 private:
   Weight *weight;       /**< weights for the optimizer */

@@ -57,6 +57,9 @@ endif
 test_target = [
   ['unittest_nntrainer_activations', []],
   ['unittest_nntrainer_cpu_backend', []],
+  ['unittest_nntrainer_fallback', []],
+  ['unittest_nntrainer_tensor_types', []],
+  ['unittest_nntrainer_tensor_advanced', []],
   ['unittest_nntrainer_exe_order', []],
   ['unittest_nntrainer_internal', []],
   ['unittest_nntrainer_lazy_tensor', []],
@@ -77,6 +80,7 @@ test_target = [
 if host_machine.system() != 'windows'
   test_target += [['unittest_nntrainer_appcontext', []]]
   test_target += [['unittest_nntrainer_modelfile', []]]
+  test_target += [['unittest_nntrainer_tensor_utils', []]]
 endif
 
 if get_option('enable-opencl')

@@ -24,6 +24,14 @@ using MemoryDataValidateCallback = std::function<void(unsigned int)>;
  * @brief  MemoryData Class
  */
 class MemoryData {
+  /**
+   * @brief MemoryPool is granted friend access to call setSVM()
+   * @details This restricts the ability to modify the SVM allocation flag
+   *          to only MemoryPool::getMemory(), preventing malicious or
+   *          accidental modification from other parts of the codebase.
+   */
+  friend class MemoryPool;
+
 public:
   /**
    * @brief  Constructor of Memory Data
@@ -34,7 +42,8 @@ public:
     id(0),
     address(addr),
     validate_cb([](unsigned int) {}),
-    invalidate_cb([](unsigned int) {}) {}
+    invalidate_cb([](unsigned int) {}),
+    svm_allocation(false) {}
 
   /**
    * @brief  Constructor of Memory Data
@@ -49,7 +58,8 @@ public:
     id(mem_id),
     address(memory_ptr),
     validate_cb(v_cb),
-    invalidate_cb(i_cb) {}
+    invalidate_cb(i_cb),
+    svm_allocation(false) {}
 
   /**
    * @brief  Deleted constructor of Memory Data
@@ -109,12 +119,27 @@ public:
    */
   void setValid(bool v) { valid = v; }
 
+  /**
+   * @brief   Check if data is a shared virtual memory
+   */
+  bool isSVM() const { return svm_allocation; }
+
 private:
+  /**
+   * @brief  Set SVM allocation flag (private - only accessible by MemoryPool)
+   * @param[in] is_svm True if this memory is a shared virtual memory
+   * @note This method is intentionally private to prevent modification of the
+   *       SVM flag after MemoryData creation. Only MemoryPool (friend class)
+   *       can call this during memory allocation to ensure data integrity.
+   */
+  void setSVM(bool is_svm) { svm_allocation = is_svm; }
+
   bool valid;
   unsigned int id;
   void *address;
   MemoryDataValidateCallback validate_cb;
   MemoryDataValidateCallback invalidate_cb;
+  bool svm_allocation;
 };
 
 } // namespace nntrainer
