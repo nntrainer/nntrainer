@@ -16,6 +16,7 @@
 
 #include <addition_layer.h>
 #include <fc_layer.h>
+#include <input_layer.h>
 #include <nntrainer_log.h>
 #include <reshape_layer.h>
 
@@ -52,6 +53,9 @@ void CudaContext::add_default_object() {
 
   registerFactory(nntrainer::createLayer<ReshapeLayer>, ReshapeLayer::type,
                   ml::train::LayerType::LAYER_RESHAPE);
+
+  registerFactory(nntrainer::createLayer<InputLayer>, InputLayer::type,
+                  ml::train::LayerType::LAYER_IN);
 }
 
 template <typename T>
@@ -66,7 +70,13 @@ const int CudaContext::registerFactory(const FactoryType<T> factory,
   auto &str_map = std::get<StrIndexType<T>>(index);
   auto &int_map = std::get<IntIndexType>(index);
 
-  std::string assigned_key = key == "" ? factory({})->getType() : key;
+  std::string assigned_key;
+  if (key == "") {
+    auto temp_obj = factory({});
+    assigned_key = temp_obj->getType();
+  } else {
+    assigned_key = key;
+  }
 
   std::transform(assigned_key.begin(), assigned_key.end(), assigned_key.begin(),
                  [](unsigned char c) { return std::tolower(c); });

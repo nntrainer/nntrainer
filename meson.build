@@ -385,6 +385,10 @@ if get_option('enable-cublas')
   extra_defines += '-DUSE_CUBLAS=1'
 endif
 
+if get_option('enable-cuda')
+  extra_defines += '-DENABLE_CUDA=1'
+endif
+
 if get_option('enable-blas')
   extra_defines += '-DUSE_BLAS=1'
 

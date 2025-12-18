@@ -788,9 +788,9 @@ public:
  */
 struct ComputeEngineTypeInfo {
   using Enum = ml::train::LayerComputeEngine;
-  static constexpr std::initializer_list<Enum> EnumList = {Enum::CPU, Enum::GPU,
-                                                           Enum::QNN};
-  static constexpr const char *EnumStr[] = {"cpu", "gpu", "qnn"};
+  static constexpr std::initializer_list<Enum> EnumList = {
+    Enum::CPU, Enum::GPU, Enum::QNN, Enum::CUDA};
+  static constexpr const char *EnumStr[] = {"cpu", "gpu", "qnn", "cuda"};
 };
 
 /**

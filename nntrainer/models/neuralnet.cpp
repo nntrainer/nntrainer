@@ -54,6 +54,10 @@
 #include <slice_realizer.h>
 #include <util_func.h>
 
+#ifdef ENABLE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #ifdef ENABLE_TFLITE_INTERPRETER
 #include <tflite_interpreter.h>
 #endif
@@ -1188,8 +1192,13 @@ std::vector<float *> NeuralNetwork::incremental_inference(
             step * out_t.width();
           // std::memcpy( last_out_buf_data + batch * out_t.width(),
           // out_t_batch_ptr, out_t.width()*sizeof(float));
+#ifdef ENABLE_CUDA
+          cudaMemcpy(last_out_buf_data + batch * out_t.width(), out_t_batch_ptr,
+                     out_t.width() * sizeof(float), cudaMemcpyDefault);
+#else
           scopy(out_t.width(), out_t_batch_ptr, 1,
                 last_out_buf_data + batch * out_t.width(), 1);
+#endif
         }
       }
     }

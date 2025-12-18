@@ -23,6 +23,10 @@
 #include <dynamic_library_loader.h>
 #include <engine.h>
 
+#ifdef ENABLE_CUDA
+#include <cuda_context.h>
+#endif
+
 static std::string solib_suffix = ".so";
 static std::string contextlib_suffix = "context.so";
 static const std::string func_tag = "[Engine] ";
