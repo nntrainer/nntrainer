@@ -535,6 +535,8 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(
  *
  * @param n row length if not transposed
  * @param k col length if not transposed
+ * @param idx_variant idx of kernel variant
+ * @param transB rather the weight matrix is transposed or not
  * @return size_t size of memory to allocate
  */
 size_t nntr_get_rhs_packed_size_qsi8d32p_qsi4c32p(size_t n, size_t k,

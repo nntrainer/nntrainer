@@ -172,7 +172,7 @@ if get_option('enable-fp16')
      # On ARM systems, you must enable this type explicitly with the -mfp16-format
      #   command-line option in order to use it.
      ## About FP16-SIMD in aarch64
-     # FP16-SIMD is supported since armv9.2. If you enable this forcibly, it won't be
+     # FP16-SIMD is supported since armv8.2. If you enable this forcibly, it won't be
      # comaptible with armv8.0 machines.
      if cxx.has_argument('-mfp16-format=ieee')
        add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])

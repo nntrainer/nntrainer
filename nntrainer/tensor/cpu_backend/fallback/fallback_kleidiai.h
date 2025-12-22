@@ -108,4 +108,3 @@ void quant_qs4c32_f32(size_t n, size_t k, size_t bl, const float *rhs_f32,
  */
 void ref_quant_qs8d32_f32(size_t n, size_t k, size_t bl, const float *rhs_f32,
                           uint8_t *rhs_qs8c32);
-

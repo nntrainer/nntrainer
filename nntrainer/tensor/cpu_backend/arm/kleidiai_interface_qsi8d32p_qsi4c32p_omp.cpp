@@ -33,7 +33,11 @@
 // Packing functions for qsi8d32p_qsi4c32p
 #include "kai/pack/kai_lhs_quant_pack_qsi8d32p_f32.h"
 
-// Micro-kernel struct definition (must match kleidiai_qsi8d32p.cpp)
+/**
+ * @brief Micro-kernel struct definition for qsi8d32p_qsi4c32p
+ *
+ * @note This struct must match the struct definition in kleidiai_qsi8d32p.cpp
+ */
 struct kai_matmul_ukernel_f32_qsi8d32p_qsi4c32p {
   kai_matmul_clamp_f32_qsi8d32p_qsi4c32p_ukernel ukernel;
   std::string name = {};

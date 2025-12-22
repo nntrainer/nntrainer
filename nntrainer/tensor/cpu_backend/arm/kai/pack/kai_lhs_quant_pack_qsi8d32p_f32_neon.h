@@ -1,8 +1,23 @@
-//
-// SPDX-FileCopyrightText: Copyright 2024 Arm Limited and/or its affiliates <open-source-office@arm.com>
-//
 // SPDX-License-Identifier: Apache-2.0
-//
+/**
+ * Copyright (C) 2024 Arm Limited and/or its affiliates
+ * Copyright (C) 2024 Sungsik Kong <ss.kong@samsung.com>
+ *
+ * @file   kai_lhs_quant_pack_qsi8d32p_f32_neon.h
+ * @date   8 December 2025
+ * @see    https://github.com/ARM-software/kleidiai
+ * @see    https://github.com/nnstreamer/nntrainer
+ * @author Sungsik Kong <ss.kong@samsung.com>
+ *
+ * @brief  LHS Quantized Packing for QSI8D32P (NEON) Header
+ *
+ * @note   Licensed under the Apache License, Version 2.0 (the "License");
+ *         you may not use this file except in compliance with the License.
+ *         You may obtain a copy of the License at
+ *             http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * @bug    No known bugs except for NYI items
+ */
 #pragma once
 
 #include <stddef.h>
@@ -22,61 +37,73 @@ size_t kai_get_m_step_lhs_quant_pack_qsi8d32p_f32_neon(size_t mr);
 
 /// Gets the offset in bytes for the LHS matrix (not packed)
 ///
-/// This function should be called before passing the pointer to the LHS matrix to the micro-kernel.
+/// This function should be called before passing the pointer to the LHS matrix
+/// to the micro-kernel.
 ///
 /// @param[in] m_idx      Row index in the LHS matrix (not packed).
-/// @param[in] lhs_stride The number of bytes in in each row of the LHS matrix (not packed)
+/// @param[in] lhs_stride The number of bytes in in each row of the LHS matrix
+/// (not packed)
 ///
 /// @return the offset in bytes to the LHS matrix
-size_t kai_get_lhs_offset_lhs_quant_pack_qsi8d32p_f32_neon(size_t m_idx, size_t lhs_stride);
+size_t kai_get_lhs_offset_lhs_quant_pack_qsi8d32p_f32_neon(size_t m_idx,
+                                                           size_t lhs_stride);
 
 /// Gets the offset in bytes for the packed LHS matrix,
-/// which contains the packed 8-bit quantized symmetric per-block (qsi8d32) values.
+/// which contains the packed 8-bit quantized symmetric per-block (qsi8d32)
+/// values.
 ///
-/// This function should be called before passing the pointer to the packed LHS matrix to the micro-kernel.
+/// This function should be called before passing the pointer to the packed LHS
+/// matrix to the micro-kernel.
 ///
-/// @param[in] m_idx Row index in the LHS matrix (not packed). It must be a multiple of mr.
+/// @param[in] m_idx Row index in the LHS matrix (not packed). It must be a
+/// multiple of mr.
 /// @param[in] k     Total number of columns in the LHS matrix (not packed).
 /// @param[in] bl    The block length.
 /// @param[in] mr    The number of M rows to interleave on the same output row.
-/// @param[in] kr    The number of columns loaded in the single inner most loop of the matmul micro-kernel.
+/// @param[in] kr    The number of columns loaded in the single inner most loop
+/// of the matmul micro-kernel.
 /// @param[in] sr    The number of kr splits. It can be 1 (no splits) up to kr.
 ///
 /// @return the offset in bytes to the packed LHS matrix
 size_t kai_get_lhs_packed_offset_lhs_quant_pack_qsi8d32p_f32_neon(
-    size_t m_idx, size_t k, size_t bl, size_t mr, size_t kr, size_t sr);
+  size_t m_idx, size_t k, size_t bl, size_t mr, size_t kr, size_t sr);
 
 /// Gets the size in bytes for the quantized and packed LHS matrix
 ///
 /// @param[in] m  Total number of rows in the LHS matrix (not packed).
 /// @param[in] k  Total number of columns in the LHS matrix (not packed).
-/// @param[in] bl The block length, which defines the number of K values stored in a single block. It must be a
-/// multiple of 32.
+/// @param[in] bl The block length, which defines the number of K values stored
+/// in a single block. It must be a multiple of 32.
 /// @param[in] mr The number of M rows to interleave on the same output row.
-/// @param[in] kr The number of columns loaded in the single inner most loop of the matmul micro-kernel.
+/// @param[in] kr The number of columns loaded in the single inner most loop of
+/// the matmul micro-kernel.
 /// @param[in] sr The number of kr splits. It can be 1 (no splits) up to kr.
 ///
 /// @return the packed LHS matrix size in bytes
 size_t kai_get_lhs_packed_size_lhs_quant_pack_qsi8d32p_f32_neon(
-    size_t m, size_t k, size_t bl, size_t mr, size_t kr, size_t sr);
+  size_t m, size_t k, size_t bl, size_t mr, size_t kr, size_t sr);
 
 /// Run the micro-kernel to quantize and pack the LHS matrix.
 ///
 /// @param[in]  m           The number of output rows written.
-/// @param[in]  k           The number of channels. The common dimension of LHS & RHS. It must be multiple of 8.
-/// @param[in]  bl          The block length, which defines the number of K values stored in a single block. It must be
-/// a multiple of 32.
-/// @param[in]  mr          The number of M rows to interleave on the same output row.
-/// @param[in]  kr          The number of columns loaded in the single inner most loop of the matmul micro-kernel.
-/// @param[in]  sr          The number of kr splits. It can be 1 (no splits) up to kr.
+/// @param[in]  k           The number of channels. The common dimension of LHS
+/// & RHS. It must be multiple of 8.
+/// @param[in]  bl          The block length, which defines the number of K
+/// values stored in a single block. It must be a multiple of 32.
+/// @param[in]  mr          The number of M rows to interleave on the same
+/// output row.
+/// @param[in]  kr          The number of columns loaded in the single inner
+/// most loop of the matmul micro-kernel.
+/// @param[in]  sr          The number of kr splits. It can be 1 (no splits) up
+/// to kr.
 ///                         However, kr must be multiple of sr.
 /// @param[in]  m_idx_start The starting M index.
 /// @param[in]  lhs         LHS matrix.
 /// @param[in]  lhs_stride  Stride in bytes between two rows of LHS.
 /// @param[out] lhs_packed  The quantized and packed LHS matrix.
 void kai_run_lhs_quant_pack_qsi8d32p_f32_neon(
-    size_t m, size_t k, size_t bl, size_t mr, size_t kr, size_t sr, size_t m_idx_start, const float* lhs,
-    size_t lhs_stride, void* lhs_packed);
+  size_t m, size_t k, size_t bl, size_t mr, size_t kr, size_t sr,
+  size_t m_idx_start, const float *lhs, size_t lhs_stride, void *lhs_packed);
 
 #ifdef __cplusplus
 }
