@@ -105,3 +105,82 @@ void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp_parallel(
 
   delete[] lhs_packed_mtx;
 }
+
+/**
+ * @brief OpenMP-based parallel GEMM implementation optimized for m=1 (GEMV)
+ *
+ * When m=1, the LHS is a single row vector. Parallelizing over M is useless,
+ * so instead we parallelize over the N dimension, splitting the RHS columns
+ * and output vector across threads.
+ */
+void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp_parallel_m1(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32, void *rhs_packed_mtx,
+  float *dst_act_mtx_f32, uint32_t idx_variant, bool transB, float lower_bound,
+  float upper_bound) {
+  (void)transB; // Currently only NxK format is supported
+  (void)m;      // m is always 1 for this function
+
+  const size_t mr = ukernel_variants_qsi8d32p[idx_variant].ukernel.get_mr();
+  const size_t kr = ukernel_variants_qsi8d32p[idx_variant].ukernel.get_kr();
+  const size_t sr = ukernel_variants_qsi8d32p[idx_variant].ukernel.get_sr();
+  const size_t nr = ukernel_variants_qsi8d32p[idx_variant].ukernel.get_nr();
+  const size_t bl = 32;
+
+  // LHS packing: quantize f32 to qsi8d32p and pack (single row, done once)
+  const size_t lhs_packed_size =
+    kai_get_lhs_packed_size_lhs_quant_pack_qsi8d32p_f32(1, k, bl, mr, kr, sr);
+  uint8_t *lhs_packed_mtx = new uint8_t[lhs_packed_size];
+  kai_run_lhs_quant_pack_qsi8d32p_f32(
+    1, k, bl, mr, kr, sr,              // m=1
+    0,                                 // m_idx_start
+    (const float *)lhs_native_mtx_f32, // LHS (f32)
+    k * sizeof(float),                 // LHS stride
+    lhs_packed_mtx);                   // LHS packed output
+
+  int n_threads = 4;
+  // Round up n/n_threads to the nearest multiple of nr for proper RHS tiling
+  const size_t n_per_thread_raw = (n + n_threads - 1) / n_threads;
+  const size_t n_per_thread = ((n_per_thread_raw + nr - 1) / nr) * nr;
+
+#pragma omp parallel for num_threads(n_threads)
+  for (int current_thread = 0; current_thread < n_threads; ++current_thread) {
+    const size_t n_start = current_thread * n_per_thread;
+
+    // Check if this thread has work to do
+    if (n_start >= n) {
+      continue;
+    }
+
+    // Calculate actual n for this thread (may be less for last thread)
+    size_t n_chunk = n_per_thread;
+    if (n_start + n_chunk > n) {
+      n_chunk = n - n_start;
+    }
+
+    const size_t dst_stride = n * sizeof(float);
+    const size_t lhs_offset =
+      ukernel_variants_qsi8d32p[idx_variant].ukernel.get_lhs_packed_offset(0, k,
+                                                                           bl);
+    const size_t rhs_offset =
+      ukernel_variants_qsi8d32p[idx_variant].ukernel.get_rhs_packed_offset(
+        n_start, k, bl);
+
+    const void *lhs_ptr =
+      (const void *)((const char *)lhs_packed_mtx + lhs_offset);
+    const void *rhs_ptr =
+      (const void *)((const char *)rhs_packed_mtx + rhs_offset);
+    // For m=1, dst is a vector, so offset by n_start floats
+    float *dst_ptr = dst_act_mtx_f32 + n_start;
+
+    ukernel_variants_qsi8d32p[idx_variant].ukernel.run_matmul(
+      1, n_chunk, k, bl, // m=1, this thread's n chunk
+      lhs_ptr,           // LHS packed (shared)
+      rhs_ptr,           // RHS packed (this thread's portion)
+      dst_ptr,           // DST (this thread's portion)
+      dst_stride,        // DST stride (row)
+      sizeof(float),     // DST stride (col)
+      lower_bound, upper_bound);
+  }
+
+  delete[] lhs_packed_mtx;
+}

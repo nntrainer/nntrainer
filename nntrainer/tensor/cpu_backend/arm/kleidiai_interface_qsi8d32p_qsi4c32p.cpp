@@ -492,6 +492,12 @@ extern void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp_parallel(
   float *dst_act_mtx_f32, uint32_t idx_variant, bool transB, float lower_bound,
   float upper_bound);
 
+// External function for m=1 case (GEMV) with N-dimension parallelization
+extern void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp_parallel_m1(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32, void *rhs_packed_mtx,
+  float *dst_act_mtx_f32, uint32_t idx_variant, bool transB, float lower_bound,
+  float upper_bound);
+
 void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp(size_t m, size_t n, size_t k,
                                          void *lhs_native_mtx_f32,
                                          void *rhs_packed_mtx,
@@ -499,6 +505,7 @@ void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp(size_t m, size_t n, size_t k,
                                          uint32_t idx_variant, bool transB,
                                          float lower_bound, float upper_bound) {
   if (m == 1) {
+    // Use N-dimension parallelized version for GEMV (m=1) case
     return nntr_kai_gemm_qsi8d32p_qsi4c32p_olp_single_thread(
       m, n, k, lhs_native_mtx_f32, rhs_packed_mtx, dst_act_mtx_f32, idx_variant,
       transB, lower_bound, upper_bound);
