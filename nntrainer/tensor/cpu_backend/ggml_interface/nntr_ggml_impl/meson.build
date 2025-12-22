@@ -14,7 +14,10 @@ ggml_impl_interface_sources = [
 arch = host_machine.cpu_family()
 arm_arch_opt = get_option('arm-arch')
 
-if arch == 'aarch64' or get_option('platform') == 'android'
+message('arm_arch_opt : ' + arm_arch_opt)
+
+# arm_arch_opt != 'none' case for cross-compilation scenario
+if arch == 'aarch64' or arm_arch_opt != 'none'
   if arm_arch_opt == 'armv9.2-a'
     # SVE/SVE2 implementation for armv9.2-a
     ggml_impl_interface_sources += 'nntr_ggml_impl_sve.cpp'

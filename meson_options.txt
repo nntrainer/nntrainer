@@ -67,9 +67,9 @@ option('libiomp_root', type:'string', value: './libiomp_win')
 
 # ARM architecture options
 option('arm-arch', type: 'combo',
-       choices: ['auto', 'armv7l', 'armv8.2-a', 'armv9.2-a'],
-       value: 'auto',
-       description: 'Target ARM architecture. "auto" detects from host for native builds, defaults to armv8.2-a for cross-compilation.')
+       choices: ['none', 'armv7l', 'armv8.2-a', 'armv9.2-a'],
+       value: 'none',
+       description: 'Target ARM architecture. "none" disables arm related features.')
 option('arm-march', type: 'string',
        value: '',
        description: 'ARM march flag (e.g., "-march=armv8.2-a+fp16+dotprod+i8mm"). If empty, derived from arm-arch.')

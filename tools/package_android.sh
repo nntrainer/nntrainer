@@ -33,6 +33,10 @@ for arg in "$@"; do
 done
 
 # If --arm-arch specified, read configuration from JSON file
+if [[ -z "$arm_arch" ]]; then
+    arm_arch="armv8.2-a"
+fi
+
 if [[ -n "$arm_arch" ]]; then
     # Convert dots to dashes for filename (e.g., armv8.2-a -> armv8-2-a)
     arch_filename=$(echo "$arm_arch" | sed 's/\./-/g')
