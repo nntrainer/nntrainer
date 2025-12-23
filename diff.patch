@@ -1,0 +1,3072 @@
+diff --git a/api/ccapi/include/model.h b/api/ccapi/include/model.h
+index 01f4b3d0fe..5e5dd4d3d1 100644
+--- a/api/ccapi/include/model.h
++++ b/api/ccapi/include/model.h
+@@ -217,6 +217,16 @@ class Model {
+    */
+   virtual int addLayer(std::shared_ptr<Layer> layer) = 0;
+ 
++  /**
++   * @brief     add checkpoint block for gradient checkpointing
++   * @param[in] layer_names vector of layer names to be checkpointed
++   * @note This should be called before compile()
++   * @retval #ML_ERROR_NONE Successful.
++   * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
++   */
++  virtual int
++  addCheckpointBlock(const std::vector<std::string> &layer_names) = 0;
++
+   /**
+    * @brief add referring to reference layers.
+    * @note This method does add the provided layers itself but adds a deep copy
+@@ -417,6 +427,10 @@ class Model {
+    */
+   virtual void exports(const ExportMethods &method,
+                        const std::string file_path) = 0;
++
++#ifdef ENABLE_TEST
++  virtual void setGCVerify() = 0;
++#endif
+ };
+ 
+ /**
+diff --git a/docs/gradient-checkpointing.md b/docs/gradient-checkpointing.md
+new file mode 100644
+index 0000000000..f5f8a89691
+--- /dev/null
++++ b/docs/gradient-checkpointing.md
+@@ -0,0 +1,185 @@
++# Gradient Checkpointing
++
++Gradient checkpointing is a memory optimization technique that trades computation for memory by recomputing intermediate activations during the backward pass instead of storing them.
++
++## Overview
++
++When training deep neural networks, intermediate activations from the forward pass must be stored for use during backpropagation. This can consume significant memory, especially for large models. Gradient checkpointing reduces memory usage by:
++
++1. **Discarding** intermediate activations after the forward pass
++2. **Recomputing** them during the backward pass when needed
++
++This trades ~20-30% additional computation time for up to **45% memory reduction**.
++
++## Usage
++
++### C++ API
++
++```cpp
++#include <model.h>
++
++// Create and configure your model
++auto model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
++
++// Add layers
++model->addLayer(ml::train::createLayer("input", {"name=input", "input_shape=1:1:784"}));
++model->addLayer(ml::train::createLayer("fully_connected", {"name=fc1", "unit=512"}));
++model->addLayer(ml::train::createLayer("activation", {"name=act1", "activation=relu"}));
++model->addLayer(ml::train::createLayer("fully_connected", {"name=fc2", "unit=256"}));
++model->addLayer(ml::train::createLayer("activation", {"name=act2", "activation=relu"}));
++model->addLayer(ml::train::createLayer("fully_connected", {"name=fc3", "unit=128"}));
++model->addLayer(ml::train::createLayer("activation", {"name=act3", "activation=relu"}));
++model->addLayer(ml::train::createLayer("fully_connected", {"name=output", "unit=10"}));
++model->addLayer(ml::train::createLayer("mse", {"name=loss"}));
++
++// Define checkpoint blocks BEFORE model initialization
++// Each checkpoint block specifies a range of layers whose activations will be recomputed
++model->addCheckpointBlock({"fc1", "act1", "fc2", "act2"});  // Checkpoint layers fc1 through act2
++
++// Initialize and compile the model
++model->setProperty({"batch_size=32", "epochs=10"});
++model->setOptimizer(ml::train::createOptimizer("adam", {"learning_rate=0.001"}));
++model->compile();
++model->initialize();
++
++// Train as usual
++model->train(dataset);
++```
++
++### Multiple Checkpoint Blocks
++
++You can define multiple checkpoint blocks for different sections of your model:
++
++```cpp
++// For a transformer-like model with multiple layers
++model->addCheckpointBlock({"layer1_attn", "layer1_ffn"});
++model->addCheckpointBlock({"layer2_attn", "layer2_ffn"});
++model->addCheckpointBlock({"layer3_attn", "layer3_ffn"});
++```
++
++## API Reference
++
++### `Model::addCheckpointBlock`
++
++```cpp
++int addCheckpointBlock(const std::vector<std::string> &layer_names);
++```
++
++**Parameters:**
++- `layer_names`: Vector of layer names that form a checkpoint block. Layers must be consecutive in the model graph.
++
++**Returns:**
++- `ML_ERROR_NONE` on success
++- `ML_ERROR_INVALID_PARAMETER` if layers are not consecutive or model is already initialized
++
++**Notes:**
++- Must be called **before** `model->initialize()`
++- Layers in a checkpoint block must be consecutive in the forward pass order
++- The first layer's input and last layer's output are preserved; intermediate activations are recomputed
++
++## Performance Characteristics
++
++### Memory Savings
++
++| Model Configuration | Memory Reduction |
++|---------------------|------------------|
++| 2 layers            | ~17-22%          |
++| 4 layers            | ~28-39%          |
++| 6+ layers           | ~32-46%          |
++
++### Computation Overhead
++
++- Forward pass: Minimal overhead
++- Backward pass: ~20-30% additional time (due to recomputation)
++
++### When to Use
++
++**Recommended:**
++- Large models that don't fit in memory
++- Models with 2+ consecutive layers that can be checkpointed
++- Training with large batch sizes
++
++**Not Recommended:**
++- Small models where memory is not a concern
++- Single-layer checkpoint blocks (overhead exceeds savings)
++- Inference-only scenarios (no backward pass)
++
++## Implementation Details
++
++### How It Works
++
++1. **Forward Pass**: 
++   - First layer input is saved with `FORWARD_GRAD_LIFESPAN | RECOMPUTE`
++   - Intermediate activations use `CALC_GRAD_DERIV_LIFESPAN | RECOMPUTE` (discarded after forward)
++   - Last layer output is saved with `FORWARD_GRAD_LIFESPAN | RECOMPUTE`
++
++2. **Backward Pass**:
++   - When gradients reach a checkpoint block, the forward pass is re-executed for that block
++   - Recomputed activations are used for gradient calculation
++   - Activations are discarded again after use
++
++### Execution Order
++
++The implementation extends the execution order tuple from 4 to 5 elements:
++```
++(forward_order, recompute_order, calc_gradient_order, calc_derivative_order, apply_gradient_order)
++```
++
++## Example: Transformer with Checkpointing
++
++```cpp
++// Create a transformer model with gradient checkpointing
++auto model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
++
++// Add transformer layers
++for (int i = 0; i < num_layers; i++) {
++    std::string prefix = "layer" + std::to_string(i);
++    
++    model->addLayer(createLayer("multi_head_attention", 
++        {"name=" + prefix + "_attn", "num_heads=8"}));
++    model->addLayer(createLayer("layer_normalization", 
++        {"name=" + prefix + "_ln1"}));
++    model->addLayer(createLayer("fully_connected", 
++        {"name=" + prefix + "_ffn1", "unit=2048"}));
++    model->addLayer(createLayer("activation", 
++        {"name=" + prefix + "_act", "activation=gelu"}));
++    model->addLayer(createLayer("fully_connected", 
++        {"name=" + prefix + "_ffn2", "unit=512"}));
++    model->addLayer(createLayer("layer_normalization", 
++        {"name=" + prefix + "_ln2"}));
++    
++    // Checkpoint each transformer block
++    model->addCheckpointBlock({
++        prefix + "_attn", prefix + "_ln1",
++        prefix + "_ffn1", prefix + "_act",
++        prefix + "_ffn2", prefix + "_ln2"
++    });
++}
++
++model->compile();
++model->initialize();
++```
++
++## Troubleshooting
++
++### "Cannot add checkpoint block after initialization"
++- Ensure `addCheckpointBlock()` is called before `model->initialize()`
++
++### "Layers in checkpoint block must be consecutive"
++- Verify that all layers in the block are connected sequentially in the graph
++
++### Memory not reduced as expected
++- Check that checkpoint blocks contain at least 2 layers
++- Single-layer blocks have overhead that exceeds savings
++
++## Known Issues / TODO
++
++- [ ] **unittest_nntrainer_exe_order**: Requires update for 5-tuple ExecutionOrder format. The test compares execution order output with golden data, which needs regeneration for the new format. (follow-up PR)
++- [ ] **Gradient checkpointing unit tests**: Add dedicated unit tests for:
++  - CheckpointBlock class functionality
++  - Recomputation correctness verification
++
++## See Also
++
++- [NNTrainer Model API](./model-api.md)
++- [Memory Management](./memory-management.md)
+diff --git a/nntrainer/graph/checkpoint_block.cpp b/nntrainer/graph/checkpoint_block.cpp
+new file mode 100644
+index 0000000000..ac4eab7f1a
+--- /dev/null
++++ b/nntrainer/graph/checkpoint_block.cpp
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Yeonjae Kim <duswo1120@snu.ac.kr>
++ * Copyright (C) 2025 Hoyeon Jo <jhy213@snu.ac.kr>
++ *
++ * @file   checkpoint_block.cpp
++ * @date   23 Oct 2025
++ * @brief  Checkpoint block implementation
++ * @see    https://github.com/nnstreamer/nntrainer
++ * @author Yeonjae Kim <duswo1120@snu.ac.kr>
++ * @author Hoyeon Jo <jhy213@snu.ac.kr>
++ * @bug    No known bugs except for NYI items
++ */
++
++#include <checkpoint_block.h>
++#include <stdexcept>
++
++namespace nntrainer {
++
++CheckpointBlock::CheckpointBlock(const std::vector<std::string> &layers,
++                                 const std::string &id) :
++  layer_names(layers), block_id(id), enabled(true) {
++
++  if (layers.empty()) {
++    throw std::invalid_argument("CheckpointBlock: layer list cannot be empty");
++  }
++
++  start_layer = layers.front();
++  end_layer = layers.back();
++
++  // Generate block ID if not provided
++  if (block_id.empty()) {
++    block_id = "checkpoint_block_" + start_layer + "_to_" + end_layer;
++  }
++}
++
++} // namespace nntrainer
+diff --git a/nntrainer/graph/checkpoint_block.h b/nntrainer/graph/checkpoint_block.h
+new file mode 100644
+index 0000000000..ff4bb91cb2
+--- /dev/null
++++ b/nntrainer/graph/checkpoint_block.h
+@@ -0,0 +1,101 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Yeonjae Kim <duswo1120@snu.ac.kr>
++ * Copyright (C) 2025 Hoyeon Jo <jhy213@snu.ac.kr>
++ *
++ * @file   checkpoint_block.h
++ * @date   23 Oct 2025
++ * @brief  Checkpoint block for gradient checkpointing
++ * @see    https://github.com/nnstreamer/nntrainer
++ * @author Yeonjae Kim <duswo1120@snu.ac.kr>
++ * @author Hoyeon Jo <jhy213@snu.ac.kr>
++ * @bug    No known bugs except for NYI items
++ */
++
++#ifndef __CHECKPOINT_BLOCK_H__
++#define __CHECKPOINT_BLOCK_H__
++
++#include <string>
++#include <vector>
++
++namespace nntrainer {
++
++/**
++ * @class CheckpointBlock
++ * @brief Represents a block of layers for gradient checkpointing
++ *
++ * @details Gradient checkpointing saves memory by not storing intermediate
++ * activations during forward pass. Instead, they are recomputed during
++ * backward pass when needed.
++ */
++class CheckpointBlock {
++private:
++  std::vector<std::string> layer_names; /**< Names of layers in this block */
++  std::string start_layer;              /**< First layer in the block */
++  std::string end_layer;                /**< Last layer in the block */
++  std::string block_id;                 /**< Unique identifier for this block */
++  bool enabled;                         /**< Whether checkpointing is enabled */
++
++public:
++  /**
++   * @brief Construct a new Checkpoint Block object
++   *
++   * @param layers Vector of layer names to include in this block
++   * @param id Unique identifier for this block
++   */
++  CheckpointBlock(const std::vector<std::string> &layers,
++                  const std::string &id = "");
++
++  /**
++   * @brief Get the layer names in this block
++   *
++   * @return const std::vector<std::string>& Layer names
++   */
++  const std::vector<std::string> &getLayerNames() const { return layer_names; }
++
++  /**
++   * @brief Get the start layer name
++   *
++   * @return std::string Name of the first layer
++   */
++  std::string getStartLayer() const { return start_layer; }
++
++  /**
++   * @brief Get the end layer name
++   *
++   * @return std::string Name of the last layer
++   */
++  std::string getEndLayer() const { return end_layer; }
++
++  /**
++   * @brief Get the block ID
++   *
++   * @return std::string Block identifier
++   */
++  std::string getBlockId() const { return block_id; }
++
++  /**
++   * @brief Check if checkpointing is enabled
++   *
++   * @return true if enabled, false otherwise
++   */
++  bool isEnabled() const { return enabled; }
++
++  /**
++   * @brief Enable or disable checkpointing for this block
++   *
++   * @param enable true to enable, false to disable
++   */
++  void setEnabled(bool enable) { enabled = enable; }
++
++  /**
++   * @brief Get the number of layers in this block
++   *
++   * @return size_t Number of layers
++   */
++  size_t size() const { return layer_names.size(); }
++};
++
++} // namespace nntrainer
++
++#endif // __CHECKPOINT_BLOCK_H__
+diff --git a/nntrainer/graph/graph_node.h b/nntrainer/graph/graph_node.h
+index 5331c6b832..c15bae7164 100644
+--- a/nntrainer/graph/graph_node.h
++++ b/nntrainer/graph/graph_node.h
+@@ -32,14 +32,16 @@ class GraphNode {
+    * Each element indicates the orders with which the below operations
+    * for each node are executed:
+    * 1. Forwarding
+-   * 2. calcGradient
+-   * 3. calcDerivative
+-   * 4. ApplyGradient
++   * 2. Recompute Forward (for gradient checkpointing)
++   * 3. calcGradient
++   * 4. calcDerivative
++   * 5. ApplyGradient
+    * One constraint is that they must be sorted in ascending order.
+    * This ensures that the operations are executed in the order of their
+    * listing.
+    */
+-  typedef std::tuple<unsigned int, unsigned int, unsigned int, unsigned int>
++  typedef std::tuple<unsigned int, unsigned int, unsigned int, unsigned int,
++                     unsigned int>
+     ExecutionOrder;
+ 
+   /**
+@@ -109,6 +111,13 @@ class GraphNode {
+    * respectively
+    */
+   virtual void setExecutionOrder(ExecutionOrder exec_order_) = 0;
++
++  /**
++   * @brief Check if this node can support in-place execution
++   * @return true if inplace, else false
++   * @note Used by memory manager to determine input tensor lifespan
++   */
++  virtual bool supportInPlace() const { return false; }
+ };
+ 
+ /**
+diff --git a/nntrainer/graph/meson.build b/nntrainer/graph/meson.build
+index 37139d343c..f19e7afdc5 100644
+--- a/nntrainer/graph/meson.build
++++ b/nntrainer/graph/meson.build
+@@ -1,7 +1,8 @@
+ graph_sources = [
+   'network_graph.cpp',
+   'graph_core.cpp',
+-  'connection.cpp'
++  'connection.cpp',
++  'checkpoint_block.cpp'
+ ]
+ 
+ graph_headers = [
+@@ -10,6 +11,7 @@ graph_headers = [
+   'network_graph.h',
+   'graph_core.h',
+   'graph_node.h',
++  'checkpoint_block.h',
+ ]
+ 
+ foreach s : graph_sources
+@@ -19,3 +21,10 @@ endforeach
+ foreach h : graph_headers
+   nntrainer_headers += meson.current_source_dir() / h
+ endforeach
++
++if get_option('enable-test')
++  gradient_checkpointing_test_dir = '..' / '..' / 'test' / 'unittest' / 'gradient_checkpointing'
++  nntrainer_inc += include_directories(gradient_checkpointing_test_dir)
++  nntrainer_sources += files(join_paths(gradient_checkpointing_test_dir,
++                                        'gradient_checkpointing_test_util.cpp'))
++endif
+diff --git a/nntrainer/graph/network_graph.cpp b/nntrainer/graph/network_graph.cpp
+index 23b7dd31f8..5f3abb61bf 100644
+--- a/nntrainer/graph/network_graph.cpp
++++ b/nntrainer/graph/network_graph.cpp
+@@ -42,8 +42,13 @@
+ #include <util_func.h>
+ #include <weight_layer.h>
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <iostream>
++#include <map>
++#include <queue>
++#include <set>
++#include <sstream>
+ #include <stdexcept>
+ #include <string>
+ 
+@@ -102,11 +107,41 @@ int NetworkGraph::compile(const std::string &loss_type) {
+ 
+ void NetworkGraph::setExecutionOrder() {
+   auto backward_order = graph.size();
++
++  std::set<std::string> recomputed_blocks;
++
++  std::map<std::string, unsigned int> layer_recompute_orders;
++
+   for (auto iter = getBackwardingBeginIter(); iter != getBackwardingEndIter();
+        iter++) {
+     auto &node = *iter;
+     auto order_idx = getBackwardingEndIter() - iter - 1;
+     auto forward_order = order_idx;
++
++    if (node->isCheckpointed()) {
++      const std::string &block_id = node->getCheckpointBlockId();
++
++      if (recomputed_blocks.find(block_id) == recomputed_blocks.end()) {
++        std::vector<std::shared_ptr<LayerNode>> block_layers;
++        for (auto fwd_iter = cbegin(); fwd_iter != cend(); ++fwd_iter) {
++          auto &fwd_node = *fwd_iter;
++          if (fwd_node->getCheckpointBlockId() == block_id &&
++              fwd_node->isCheckpointed()) {
++            block_layers.push_back(fwd_node);
++          }
++        }
++
++        // Assign recompute orders in forward order (same as
++        // recomputeCheckpointBlock)
++        for (auto &layer : block_layers) {
++          layer_recompute_orders[layer->getName()] = backward_order;
++          backward_order++;
++        }
++
++        recomputed_blocks.insert(block_id);
++      }
++    }
++
+     auto calc_gradient_order = backward_order;
+     if (node->getTrainable())
+       backward_order++;
+@@ -115,8 +150,14 @@ void NetworkGraph::setExecutionOrder() {
+       backward_order++;
+     auto apply_gradient_order = backward_order++;
+ 
+-    node->setExecutionOrder({forward_order, calc_gradient_order,
+-                             calc_derivative_order, apply_gradient_order});
++    unsigned int recompute_order = 0;
++    if (node->isCheckpointed()) {
++      recompute_order = layer_recompute_orders[node->getName()];
++    }
++
++    node->setExecutionOrder({forward_order, recompute_order,
++                             calc_gradient_order, calc_derivative_order,
++                             apply_gradient_order});
+   }
+ 
+   /**
+@@ -124,7 +165,7 @@ void NetworkGraph::setExecutionOrder() {
+    * This set max execution order is used to extend gradient exec orders for
+    * clipping.
+    */
+-  graph_exec_end = std::get<3>((*(cbegin()))->getExecutionOrder());
++  graph_exec_end = std::get<4>((*(cbegin()))->getExecutionOrder());
+ }
+ 
+ void NetworkGraph::addLayerNode(std::unique_ptr<Layer> layer) {
+@@ -397,9 +438,42 @@ sharedConstTensors NetworkGraph::forwarding(
+   std::function<bool(void *userdata)> stop_cb, void *userdata) {
+   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
+     auto &ln = *iter;
++
++    if (ln->isCheckpointed()) {
++      ln->getRunContext().setInitialForward(true);
++#ifdef ENABLE_TEST
++      if (gc_verify) {
++        std::vector<Tensor> forward_inputs;
++        std::vector<Tensor> forward_weights;
++        for (int i = 0; i < ln->getNumInputs(); i++)
++          forward_inputs.push_back(ln->getInput(i));
++        for (int i = 0; i < ln->getNumWeights(); i++)
++          forward_weights.push_back(ln->getWeight(i));
++        gc_verifier.saveForwardInputs(ln, forward_inputs);
++        gc_verifier.saveForwardWeights(ln, forward_weights);
++      }
++#endif
++    }
++
+     PROFILE_TIME_START(profile_keys.at(ln->getType()));
+     forwarding_op(*iter, training);
+     PROFILE_TIME_END(profile_keys.at(ln->getType()));
++
++    if (ln->isCheckpointed()) {
++#ifdef ENABLE_TEST
++      if (gc_verify) {
++        std::vector<Tensor> forward_outputs;
++        std::vector<Tensor> forward_tensors;
++        for (int i = 0; i < ln->getNumOutputs(); i++)
++          forward_outputs.push_back(ln->getOutput(i));
++        for (int i = 0; i < ln->getRunContext().getNumTensors(); i++)
++          forward_tensors.push_back(ln->getRunContext().getTensor(i));
++        gc_verifier.saveForwardOutputs(ln, forward_outputs);
++        gc_verifier.saveForwardTensors(ln, forward_tensors);
++      }
++#endif
++      ln->getRunContext().setInitialForward(false);
++    }
+   }
+ 
+   sharedConstTensors out;
+@@ -422,9 +496,17 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
+   std::function<bool(void *userdata)> stop_cb, void *userdata) {
+   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
+     auto &ln = *iter;
++    if (ln->isCheckpointed()) {
++      ln->getRunContext().setInitialForward(true);
++    }
++
+     PROFILE_TIME_START(profile_keys.at(ln->getType()));
+     forwarding_op(*iter, training);
+     PROFILE_TIME_END(profile_keys.at(ln->getType()));
++
++    if (ln->isCheckpointed()) {
++      ln->getRunContext().setInitialForward(false);
++    }
+   }
+ 
+   sharedConstTensors out;
+@@ -464,8 +546,20 @@ bool NetworkGraph::backwarding(
+     throw std::runtime_error(
+       "Error: last layer does not accept label, we can't train");
+ 
++  std::set<std::string> recomputed_blocks;
++
+   for (iter_ = iter_begin; iter_ != iter_end && !stop_cb(userdata); iter_++) {
+     auto &ln = *iter_;
++
++    if (ln->isCheckpointed()) {
++      const std::string &block_id = ln->getCheckpointBlockId();
++
++      if (recomputed_blocks.find(block_id) == recomputed_blocks.end()) {
++        recomputeCheckpointBlock(block_id);
++        recomputed_blocks.insert(block_id);
++      }
++    }
++
+     PROFILE_TIME_START(profile_keys.at(ln->getType()));
+     is_valid = backwarding_op(ln, iteration);
+     PROFILE_TIME_END(profile_keys.at(ln->getType()));
+@@ -568,9 +662,9 @@ LayerNode *NetworkGraph::computeBackwardEnd() {
+     int cur_order = std::get<0>(exec_order);
+     if (ln->needsCalcDerivative() || ln->needsCalcGradient()) {
+ #ifdef ENABLE_TEST
+-      cur_order = std::get<2>(exec_order);
++      cur_order = std::get<3>(exec_order);
+ #else
+-      cur_order = std::get<1>(exec_order);
++      cur_order = std::get<2>(exec_order);
+ #endif
+     }
+ 
+@@ -612,7 +706,7 @@ void NetworkGraph::allocateTensors(ExecutionMode exec_mode_) {
+      * + 1
+      */
+     tensor_manager->allocateTensors(
+-      std::get<3>(backward_iter_end->getExecutionOrder()));
++      std::get<4>(backward_iter_end->getExecutionOrder()));
+   }
+ }
+ 
+@@ -776,6 +870,9 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
+ 
+   /** finalize the layer and get the final context */
+   auto init_context = lnode->finalize(input_dims, getTensorType(), exec_mode);
++
++  bool is_checkpointed_layer = lnode->isCheckpointed();
++
+   const auto &ct_engine = nntrainer::Engine::Global();
+ 
+   /**
+@@ -785,11 +882,12 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
+    */
+   std::vector<std::string> input_names;
+   input_names.reserve(prev_inputs.size());
+-  std::transform(
+-    prev_inputs.begin(), prev_inputs.end(), std::back_inserter(input_names),
+-    [](auto const &vg) -> const auto & { return vg->getName(); });
++  std::transform(prev_inputs.begin(), prev_inputs.end(),
++                 std::back_inserter(input_names),
++                 [](auto const &vg) -> const auto & { return vg->getName(); });
+   const std::vector<Var_Grad *> &inputs = tensor_manager->requestInputs(
+-    gnode, init_context.getInputDimensions(), input_names);
++    gnode, init_context.getInputDimensions(), input_names,
++    lnode->isCheckpointed(), lnode->isFirstInCheckpointBlock());
+ 
+   /** In-Place optimizations */
+   /**
+@@ -887,10 +985,185 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
+     });
+   }
+ 
++  // Gradient checkpointing: Check if this layer needs initial_outputs
++  // A layer needs initial_outputs if:
++  // 1. It is checkpointed, OR
++  // 2. It receives input from a checkpointed layer (to propagate initial
++  // values)
++  const bool is_checkpoint_layer = lnode->isCheckpointed();
++  const bool is_first_checkpoint_layer =
++    is_checkpoint_layer && lnode->isFirstInCheckpointBlock();
++  const bool is_last_checkpoint_layer =
++    is_checkpoint_layer && lnode->isLastInCheckpointBlock();
++
++  bool needs_initial_outputs = is_checkpointed_layer;
++  if (!needs_initial_outputs) {
++    if (!needs_initial_outputs) {
++      for (unsigned int i = 0; i < lnode->getNumOutputConnections(); ++i) {
++        auto conn = lnode->getOutputConnection(i);
++        if (!conn)
++          continue;
++        auto sink_node = getLayerNode(conn->getName());
++        if (sink_node && sink_node->isCheckpointed()) {
++          needs_initial_outputs = true;
++          break;
++        }
++      }
++    }
++  }
++
++  // CRITICAL: If this layer feeds a FIRST checkpoint layer, its normal output
++  // must be kept alive until the sink layer's backward pass completes.
++  // The first checkpoint layer uses saved_inputs (normal inputs) instead of
++  // initial_outputs, so the producer's normal output must persist until
++  // recompute AND calc_grad time (just like normal FORWARD_GRAD_LIFESPAN).
++  bool feeds_first_checkpoint_layer = false;
++  unsigned int first_checkpoint_recompute_order = 0;
++  unsigned int first_checkpoint_calc_grad_order = 0;
++  for (unsigned int i = 0; i < lnode->getNumOutputConnections(); ++i) {
++    auto conn = lnode->getOutputConnection(i);
++    if (!conn)
++      continue;
++    auto sink_node = getLayerNode(conn->getName());
++    if (sink_node && sink_node->isCheckpointed() &&
++        sink_node->isFirstInCheckpointBlock()) {
++      feeds_first_checkpoint_layer = true;
++      auto sink_exec_order = sink_node->getExecutionOrder();
++      first_checkpoint_recompute_order = std::get<1>(sink_exec_order);
++      first_checkpoint_calc_grad_order = std::get<2>(sink_exec_order);
++      break;
++    }
++  }
++
++  // For checkpoint layers, convert output lifespan to recompute-based
++  // For last layer in block: output = initial_output, so also add
++  // FORWARD_FUNC_LIFESPAN
++  if (is_checkpoint_layer) {
++    std::for_each(
++      out_specs.begin(), out_specs.end(),
++      [is_last_checkpoint_layer](VarGradSpecV2 &spec) {
++        spec.variable_spec.ls = promoteToRecompute(spec.variable_spec.ls);
++        // Last layer: output = initial_output, needs initial forward too
++        if (is_last_checkpoint_layer) {
++          spec.variable_spec.ls = static_cast<TensorLifespan>(
++            static_cast<unsigned int>(spec.variable_spec.ls) |
++            static_cast<unsigned int>(TensorLifespan::FORWARD_FUNC_LIFESPAN));
++        }
++      });
++  }
++
++  // Extend output lifespan if feeding first checkpoint layer
++  // Add the sink layer's recompute AND calc_grad orders to
++  // additional_exec_order so that the output tensor stays valid until the sink
++  // layer's backward pass
++  if (feeds_first_checkpoint_layer) {
++    for (auto &spec : out_specs) {
++      // Add recompute order to keep output alive until recompute
++      spec.variable_spec.additional_exec_order.push_back(
++        first_checkpoint_recompute_order);
++      // Add calc_grad order to keep output alive until backward pass (like
++      // FORWARD_GRAD_LIFESPAN)
++      spec.variable_spec.additional_exec_order.push_back(
++        first_checkpoint_calc_grad_order);
++    }
++  }
++
++  // Request outputs (default: for recompute & backward)
+   const std::vector<Var_Grad *> &outputs = tensor_manager->requestTensors(
+     out_specs, Manager::TensorGroupType::OUTPUT, lnode->getExecutionOrder(),
+     lnode->getName());
+ 
++  // Request initial forward outputs first (before modifying out_specs)
++  std::vector<Var_Grad *> initial_outputs;
++  if (needs_initial_outputs) {
++    if (!lnode->isCheckpointed() || is_last_checkpoint_layer) {
++      initial_outputs = outputs;
++    } else if (lnode->isCheckpointed() &&
++               (lnode->getInPlaceType() != InPlaceType::NONE)) {
++      initial_outputs.clear();
++    } else {
++      auto initial_out_specs = out_specs;
++      const unsigned int terminal_forward_order =
++        std::get<0>(forward_iter_end->getExecutionOrder());
++
++      auto append_consumer_order = [](VarGradSpecV2 &spec, unsigned int order) {
++        auto &orders = spec.variable_spec.additional_exec_order;
++        if (std::find(orders.begin(), orders.end(), order) == orders.end()) {
++          orders.push_back(order);
++        }
++      };
++
++      // Allocate initial_outputs for all layers
++      // Note: For in-place layers like MultiOut, layer_context.cpp will
++      // automatically return initial_inputs instead of initial_outputs during
++      // getOutput()
++      for (size_t spec_idx = 0; spec_idx < initial_out_specs.size();
++           ++spec_idx) {
++        auto &spec = initial_out_specs[spec_idx];
++        // Create new name instead of modifying in place
++        spec.variable_spec.name = spec.variable_spec.name + "_initial";
++        spec.variable_spec.ls = TensorLifespan::FORWARD_FUNC_LIFESPAN;
++
++        // Initial forward doesn't need gradients - only variables
++        spec.gradient_spec = nullptr;
++
++        bool consumer_added = false;
++        if (spec_idx < lnode->getNumOutputConnections()) {
++          auto conn = lnode->getOutputConnection(spec_idx);
++          if (conn) {
++            auto sink_node = getLayerNode(conn->getName());
++            if (sink_node) {
++              // For in-place layers, we need to follow the chain to find all
++              // actual consumers, because in-place layers share memory with
++              // input
++              std::vector<std::shared_ptr<LayerNode>> consumers_to_process;
++              consumers_to_process.push_back(sink_node);
++
++              while (!consumers_to_process.empty()) {
++                auto current = consumers_to_process.back();
++                consumers_to_process.pop_back();
++
++                // Use actual in-place type instead of hardcoded layer types
++                // This correctly handles cases like GELU (not in-place) vs ReLU
++                // (in-place)
++                bool is_inplace =
++                  (current->getInPlaceType() != InPlaceType::NONE);
++
++                if (is_inplace) {
++                  // In-place layer: follow to its consumers
++                  for (unsigned int i = 0;
++                       i < current->getNumOutputConnections(); ++i) {
++                    auto next_conn = current->getOutputConnection(i);
++                    if (next_conn) {
++                      auto next_node = getLayerNode(next_conn->getName());
++                      if (next_node) {
++                        consumers_to_process.push_back(next_node);
++                      }
++                    }
++                  }
++                } else {
++                  // Non-in-place layer: this is an actual consumer
++                  auto sink_forward_order =
++                    std::get<0>(current->getExecutionOrder());
++                  append_consumer_order(spec, sink_forward_order + 1);
++                  consumer_added = true;
++                }
++              }
++            }
++          }
++        }
++
++        if (!consumer_added) {
++          append_consumer_order(spec, terminal_forward_order + 1);
++        }
++      }
++
++      initial_outputs = tensor_manager->requestTensors(
++        initial_out_specs, Manager::TensorGroupType::OUTPUT,
++        lnode->getExecutionOrder(), lnode->getName());
++    }
++  }
++
+   /** create shared weight names if requested */
+   std::vector<std::string> shared_weight_names;
+   std::vector<std::string> shared_tensor_names;
+@@ -945,15 +1218,70 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
+ 
+   auto ct_data = context->getContextData();
+ 
++  // Gradient checkpointing: Handle intermediate tensors for checkpointed layers
++  auto tensors_spec = init_context.getTensorsSpec();
++  std::vector<Var_Grad *> initial_tensors;
++
++  if (lnode->isCheckpointed() && tensors_spec.size() > 0) {
++    // Dual allocation for intermediate tensors (like outputs)
++    std::vector<InitLayerContext::TensorSpec> initial_tensors_spec;
++    initial_tensors_spec.reserve(tensors_spec.size());
++
++    for (const auto &spec : tensors_spec) {
++      const auto &[dim, init, need_grad, name, lifespan, engine] = spec;
++      // Create new spec with modified name and lifespan
++      initial_tensors_spec.emplace_back(dim, init, need_grad, name + "_initial",
++                                        TensorLifespan::FORWARD_FUNC_LIFESPAN,
++                                        engine);
++    }
++
++    initial_tensors = tensor_manager->requestTensors(
++      *lnode.get(), initial_tensors_spec, true, {});
++
++    // Recompute tensors: change lifespan to be available during backward
++    for (auto &spec : tensors_spec) {
++      auto &lifespan = std::get<4>(spec);
++      lifespan = promoteToRecompute(lifespan);
++    }
++  }
++
++  // Gradient checkpointing: Saved inputs will be set in initialize()
++  // after all layers are finalized and input_map is constructed
++  std::vector<Var_Grad *> saved_inputs;
++  if (is_first_checkpoint_layer) {
++    saved_inputs = inputs;
++  }
++
+   lnode->configureRunContext(
+-    // TODO: update weights spec for trainable based on layer trainable prop
+     tensor_manager->requestWeights(gnode, init_context.getWeightsSpec(),
+                                    trainable, shared_weight_names),
+-    inputs, outputs,
+-    tensor_manager->requestTensors(gnode, init_context.getTensorsSpec(),
+-                                   trainable, shared_tensor_names),
++    inputs, outputs, // outputs = recompute_outputs for checkpointed layers
++    tensor_manager->requestTensors(gnode, tensors_spec, trainable,
++                                   shared_tensor_names),
+     init_context.getLossScale(), ct_data);
+ 
++  // Gradient checkpointing: Configure checkpointed layers AFTER
++  // configureRunContext
++  if (!initial_outputs.empty() && !lnode->isCheckpointed()) {
++    lnode->getRunContext().setInitialOutputs(initial_outputs);
++  }
++
++  if (lnode->isCheckpointed()) {
++    // Store initial forward outputs (short-lived, used only in initial forward)
++    lnode->getRunContext().setInitialOutputs(initial_outputs);
++
++    // Store recompute outputs (used for recompute forward & backward)
++    lnode->getRunContext().setRecomputeOutputs(outputs);
++
++    // Store initial tensors if allocated
++    lnode->getRunContext().setInitialTensors(initial_tensors);
++
++    // Store saved inputs if allocated (first layer only)
++    lnode->getRunContext().setInitialInputs(saved_inputs);
++
++    lnode->getRunContext().setCheckpointed(true);
++  }
++
+   return outputs;
+ }
+ 
+@@ -978,9 +1306,9 @@ NetworkGraph::refinalizeContext(const std::shared_ptr<LayerNode> &lnode,
+    */
+   std::vector<std::string> input_names;
+   input_names.reserve(prev_inputs.size());
+-  std::transform(
+-    prev_inputs.begin(), prev_inputs.end(), std::back_inserter(input_names),
+-    [](auto const &vg) -> const auto & { return vg->getName(); });
++  std::transform(prev_inputs.begin(), prev_inputs.end(),
++                 std::back_inserter(input_names),
++                 [](auto const &vg) -> const auto & { return vg->getName(); });
+   const std::vector<Var_Grad *> &inputs = tensor_manager->requestInputs(
+     gnode, init_context.getInputDimensions(), input_names);
+ 
+@@ -1189,6 +1517,14 @@ int NetworkGraph::initialize(ExecutionMode mode,
+    */
+   std::unordered_map<std::string, std::vector<Var_Grad *>> input_map;
+ 
++  /**
++   * this contains the map from node name to its INITIAL input tensor names
++   * (for gradient checkpointing initial forward pass)
++   * @note: these input tensors are short-lived, used only during initial
++   * forward
++   */
++  std::unordered_map<std::string, std::vector<Var_Grad *>> initial_input_map;
++
+   /** check if the given config of node is of input node */
+   auto is_input_node = [](const LayerNode *node) -> bool {
+     return node->getInputConnections().empty();
+@@ -1215,7 +1551,7 @@ int NetworkGraph::initialize(ExecutionMode mode,
+ 
+     /**
+      * Initialize all the layers, allocate output tensors for each layer
+-     * init2and add optimizer related weights for the layer
++     * and add optimizer related weights for the layer
+      */
+     const std::vector<Var_Grad *> &outputs = finalizeContext(lnode, inputs);
+ 
+@@ -1223,12 +1559,59 @@ int NetworkGraph::initialize(ExecutionMode mode,
+     if (idx == graph.size() - 1)
+       break;
+ 
++    // Collect initial forward outputs to propagate to downstream sinks.
++    // Non-checkpointed layers can also own initial outputs if they feed a
++    // checkpointed consumer.
++    std::vector<Var_Grad *> initial_outputs =
++      lnode->getRunContext().getInitialOutputs();
++
++    // For checkpointed in-place layers, use initial_inputs instead of
++    // initial_outputs This is because getOutput() returns initial_inputs for
++    // in-place layers Use actual in-place type instead of hardcoded layer types
++    // This correctly handles cases like GELU (not in-place) vs ReLU (in-place)
++    bool is_inplace_layer = (lnode->getInPlaceType() != InPlaceType::NONE);
++    if (lnode->isCheckpointed() && is_inplace_layer) {
++      // For FIRST checkpoint layer, use normal inputs (from input_map) instead
++      // of initial_input_map because first layer uses saved_inputs = inputs
++      // (normal inputs)
++      std::vector<Var_Grad *> initial_inputs_vec;
++      if (lnode->isFirstInCheckpointBlock()) {
++        // First checkpoint layer: use normal inputs
++        auto input_it = input_map.find(lnode->getName());
++        if (input_it != input_map.end()) {
++          initial_inputs_vec = input_it->second;
++        }
++      } else {
++        // Non-first checkpoint layer: use initial_input_map
++        auto init_it = initial_input_map.find(lnode->getName());
++        if (init_it != initial_input_map.end()) {
++          initial_inputs_vec = init_it->second;
++        } else {
++          initial_inputs_vec = lnode->getRunContext().getInitialInputs();
++        }
++      }
++      if (!initial_inputs_vec.empty()) {
++        initial_outputs = initial_inputs_vec;
++
++        // For multi-output in-place layers (e.g., MultiOut), replicate the
++        // single initial_input across all output indices since they share the
++        // same memory
++        bool is_multiout_layer = (lnode->getType() == MultiOutLayer::type);
++        if (is_multiout_layer && initial_outputs.size() == 1 &&
++            lnode->getNumOutputConnections() > 1) {
++          auto shared_tensor = initial_outputs[0];
++          initial_outputs.resize(lnode->getNumOutputConnections());
++          for (size_t i = 0; i < initial_outputs.size(); ++i) {
++            initial_outputs[i] = shared_tensor;
++          }
++        }
++      }
++    }
++
+     for (auto i = 0u, num_node = lnode->getNumOutputConnections(); i < num_node;
+          ++i) {
+       auto conn = lnode->getOutputConnection(i);
+       if (!conn) {
+-        ml_logi("out connection not defined for  %s, %u",
+-                lnode->getName().c_str(), i);
+         continue;
+       }
+ 
+@@ -1245,14 +1628,50 @@ int NetworkGraph::initialize(ExecutionMode mode,
+       auto &sink_tensors = it->second;
+       sink_tensors.resize(sink_node->getNumInputConnections());
+       sink_tensors[conn->getIndex()] = outputs[i];
++
++      // Setup initial output connections (for initial forward)
++      // If current layer is checkpointed, connect its initial_outputs (or
++      // initial_inputs for in-place) to next layer
++      if (!initial_outputs.empty()) {
++        [[maybe_unused]] auto [init_it, init_b] =
++          initial_input_map.try_emplace({sink_node->getName(), {}});
++
++        auto &init_sink_tensors = init_it->second;
++        init_sink_tensors.resize(sink_node->getNumInputConnections());
++        // For in-place layers, we only have 1 input/output, so use index 0
++        unsigned int output_idx = (initial_outputs.size() == 1) ? 0 : i;
++        init_sink_tensors[conn->getIndex()] = initial_outputs[output_idx];
++      }
++    }
++  }
++
++  // CRITICAL: Set initial_inputs for ALL layers that receive inputs from
++  // checkpointed layers This ensures that during initial forward, getInput()
++  // returns the correct initial outputs EXCEPTION: First layer in checkpoint
++  // block already has initial_inputs set to normal inputs
++  //            in finalizeContext() - do NOT overwrite with initial_input_map
++  for (unsigned int idx = 0; idx < graph.size(); ++idx) {
++    auto const &lnode = getSortedLayerNode(idx);
++
++    // Skip first layer in checkpoint block - it already has initial_inputs =
++    // normal inputs set in finalizeContext(). We don't want to overwrite with
++    // initial_outputs from non-checkpointed previous layer.
++    if (lnode->isCheckpointed() && lnode->isFirstInCheckpointBlock()) {
++      continue;
++    }
++
++    if (initial_input_map.find(lnode->getName()) != initial_input_map.end()) {
++      auto &rc = lnode->getRunContext();
++      auto &initial_inputs_vec = initial_input_map.at(lnode->getName());
++      rc.setInitialInputs(initial_inputs_vec);
+     }
+   }
+ 
+   for (unsigned int idx = 0; idx < graph.size(); ++idx) {
+     auto const &lnode = getSortedLayerNode(idx);
+     auto &rc = lnode->getRunContext();
+-    auto first_grad_access = std::get<1>(lnode->getExecutionOrder());
+-    auto last_grad_access = std::get<3>(lnode->getExecutionOrder());
++    auto first_grad_access = std::get<2>(lnode->getExecutionOrder());
++    auto last_grad_access = std::get<4>(lnode->getExecutionOrder());
+     for (unsigned i = 0; i < rc.getNumWeights(); ++i) {
+       if (!rc.weightHasGradient(i)) {
+         /// @todo this is duck taping that MUST BE REMOVED. We will need to
+@@ -1610,14 +2029,12 @@ void NetworkGraph::setInputsLabels(const std::vector<Tensor> &inputs,
+ void NetworkGraph::setInputsLabels(sharedConstTensors &inputs,
+                                    sharedConstTensors &labels) {
+   std::vector<Tensor> ins;
+-  std::transform(
+-    inputs.begin(), inputs.end(), std::back_inserter(ins),
+-    [](auto const &val) -> const auto & { return *val.get(); });
++  std::transform(inputs.begin(), inputs.end(), std::back_inserter(ins),
++                 [](auto const &val) -> const auto & { return *val.get(); });
+ 
+   std::vector<Tensor> labs;
+-  std::transform(
+-    labels.begin(), labels.end(), std::back_inserter(labs),
+-    [](auto const &val) -> const auto & { return *val.get(); });
++  std::transform(labels.begin(), labels.end(), std::back_inserter(labs),
++                 [](auto const &val) -> const auto & { return *val.get(); });
+ 
+   setInputsLabels(ins, labs);
+ }
+@@ -1681,4 +2098,296 @@ void NetworkGraph::resetLossScale(float scale) {
+   }
+ }
+ 
++void NetworkGraph::applyCheckpointBlocks(
++  const std::vector<CheckpointBlock> &checkpoint_blocks) {
++
++  ml_logi("Applying %zu checkpoint blocks to the graph",
++          checkpoint_blocks.size());
++
++  for (const auto &block : checkpoint_blocks) {
++    if (!block.isEnabled()) {
++      continue;
++    }
++
++    const auto &user_layer_names = block.getLayerNames();
++    const std::string &block_id = block.getBlockId();
++
++    if (user_layer_names.size() < 2) {
++      ml_logw("Checkpoint block '%s' has less than 2 layers, skipping",
++              block_id.c_str());
++      continue;
++    }
++
++    // Expand layer names to include auto-generated layers
++    // Auto-generated layers have names like "{original_layer}/suffix"
++    // We find all layers whose name starts with a user-specified layer name +
++    // "/"
++    std::vector<std::string> layer_names;
++
++    for (const auto &user_name : user_layer_names) {
++      // Add the user-specified layer
++      layer_names.push_back(user_name);
++
++      // Find all auto-generated layers for this user layer
++      // These have names like "{user_name}/activation_realized",
++      // "{user_name}/generated_out_0", etc.
++      std::string prefix = user_name + "/";
++      for (auto iter = cbegin(); iter != cend(); ++iter) {
++        auto &node = *iter;
++        const std::string &node_name = node->getName();
++        // Check if this layer's name starts with the user layer's name + "/"
++        if (node_name.size() > prefix.size() &&
++            node_name.compare(0, prefix.size(), prefix) == 0) {
++          layer_names.push_back(node_name);
++          ml_logi("  Auto-including '%s' in checkpoint block (child of '%s')",
++                  node_name.c_str(), user_name.c_str());
++        }
++      }
++    }
++
++    ml_logi(
++      "  Expanded checkpoint block from %zu user layers to %zu total layers",
++      user_layer_names.size(), layer_names.size());
++
++    // Verify that layers in checkpoint block form a connected subgraph
++    // using input/output connections
++    std::set<std::string> block_layer_set(layer_names.begin(),
++                                          layer_names.end());
++
++    // Verify all layers exist in the graph
++    for (const auto &layer_name : layer_names) {
++      auto layer_node = getLayerNode(layer_name);
++      if (!layer_node) {
++        throw std::invalid_argument("Checkpoint block '" + block_id +
++                                    "': Layer '" + layer_name +
++                                    "' not found in the graph");
++      }
++    }
++
++    // BFS to verify all layers are reachable from start layers
++    // Start layers: layers whose inputs are all from outside the block
++    // End layers: layers whose outputs are all to outside the block
++    std::set<std::string> reachable_layers;
++    std::set<std::string> start_layers;
++    std::set<std::string> end_layers;
++    std::queue<std::string> to_visit;
++
++    for (const auto &layer_name : layer_names) {
++      auto layer_node = getLayerNode(layer_name);
++
++      // Check if this is a start layer (no internal inputs)
++      const auto &input_connections = layer_node->getInputConnections();
++      bool has_internal_input = false;
++      for (const auto &input : input_connections) {
++        if (block_layer_set.find(input) != block_layer_set.end()) {
++          has_internal_input = true;
++          break;
++        }
++      }
++      if (!has_internal_input) {
++        to_visit.push(layer_name);
++        reachable_layers.insert(layer_name);
++        start_layers.insert(layer_name);
++      }
++
++      // Check if this is an end layer (no internal outputs)
++      const auto &output_connections = layer_node->getOutputConnections();
++      bool has_internal_output = false;
++      for (const auto &output : output_connections) {
++        if (block_layer_set.find(output) != block_layer_set.end()) {
++          has_internal_output = true;
++          break;
++        }
++      }
++      if (!has_internal_output) {
++        end_layers.insert(layer_name);
++      }
++    }
++
++    if (start_layers.empty()) {
++      throw std::invalid_argument(
++        "Checkpoint block '" + block_id +
++        "': Could not find a start layer (cycle detected or invalid block)");
++    }
++
++    // Build reverse connection map (output -> inputs) from input connections
++    // This is needed because output connections are not set before compile()
++    std::map<std::string, std::set<std::string>> reverse_connections;
++    for (const auto &layer_name : layer_names) {
++      auto layer_node = getLayerNode(layer_name);
++      const auto &input_connections = layer_node->getInputConnections();
++      for (const auto &input : input_connections) {
++        if (block_layer_set.find(input) != block_layer_set.end()) {
++          reverse_connections[input].insert(layer_name);
++        }
++      }
++    }
++
++    // Verify that all layers form a single connected subgraph
++    // Start BFS from ONE start layer and traverse both directions
++    std::set<std::string> connected_layers;
++    std::queue<std::string> connectivity_queue;
++
++    // Start from the first start layer
++    std::string first_start = *start_layers.begin();
++    connectivity_queue.push(first_start);
++    connected_layers.insert(first_start);
++
++    while (!connectivity_queue.empty()) {
++      std::string current = connectivity_queue.front();
++      connectivity_queue.pop();
++
++      auto current_node = getLayerNode(current);
++
++      // Follow forward direction (using reverse_connections map)
++      auto it = reverse_connections.find(current);
++      if (it != reverse_connections.end()) {
++        for (const auto &output : it->second) {
++          if (connected_layers.find(output) == connected_layers.end()) {
++            connected_layers.insert(output);
++            connectivity_queue.push(output);
++          }
++        }
++      }
++
++      // Follow backward direction (input connections)
++      const auto &input_connections = current_node->getInputConnections();
++      for (const auto &input : input_connections) {
++        if (block_layer_set.find(input) != block_layer_set.end() &&
++            connected_layers.find(input) == connected_layers.end()) {
++          connected_layers.insert(input);
++          connectivity_queue.push(input);
++        }
++      }
++    }
++
++    // Check if all layers are connected (single connected component)
++    // Use block_layer_set for comparison to handle duplicates in layer_names
++    if (connected_layers.size() != block_layer_set.size()) {
++      std::string disconnected;
++      for (const auto &layer_name : block_layer_set) {
++        if (connected_layers.find(layer_name) == connected_layers.end()) {
++          if (!disconnected.empty())
++            disconnected += ", ";
++          disconnected += layer_name;
++        }
++      }
++      throw std::invalid_argument(
++        "Checkpoint block '" + block_id +
++        "': Layers do not form a single connected graph. "
++        "Disconnected layers: " +
++        disconnected);
++    }
++
++    ml_logi("  Verified checkpoint block layers are connected (%zu layers)",
++            layer_names.size());
++
++    ml_logi(
++      "Processing checkpoint block '%s' with %zu layers (expanded from %zu)",
++      block_id.c_str(), layer_names.size(), user_layer_names.size());
++
++    for (size_t i = 0; i < layer_names.size(); ++i) {
++      const auto &layer_name = layer_names[i];
++
++      try {
++        auto layer_node = getLayerNode(layer_name);
++
++        // All layers in the block are checkpointed
++        layer_node->setCheckpointed(true);
++        layer_node->setCheckpointBlockId(block_id);
++
++        // Mark start layers (layers with no internal inputs) as first in block
++        bool is_start = start_layers.find(layer_name) != start_layers.end();
++        layer_node->setFirstInCheckpointBlock(is_start);
++        if (is_start) {
++          ml_logd("  Layer '%s' marked as start layer in checkpoint block",
++                  layer_name.c_str());
++        } else {
++          ml_logd("  Layer '%s' marked as checkpointed (not start)",
++                  layer_name.c_str());
++        }
++
++        // Mark end layers (layers with no internal outputs) as last in block
++        bool is_end = end_layers.find(layer_name) != end_layers.end();
++        layer_node->setLastInCheckpointBlock(is_end);
++        if (is_end) {
++          ml_logd("  Layer '%s' marked as end layer in checkpoint block",
++                  layer_name.c_str());
++        }
++
++        // Disable in-place optimization for checkpointed layers
++        if (layer_node->getInPlaceType() != InPlaceType::NONE) {
++          ml_logd(
++            "  Disabling in-place optimization for checkpointed layer '%s'",
++            layer_name.c_str());
++          layer_node->setInPlaceType(InPlaceType::NONE);
++        }
++
++      } catch (const std::exception &e) {
++        ml_loge("Failed to apply checkpoint block to layer '%s': %s",
++                layer_name.c_str(), e.what());
++        throw;
++      }
++    }
++  }
++
++  ml_logi("Successfully applied checkpoint blocks");
++}
++
++void NetworkGraph::recomputeCheckpointBlock(const std::string &block_id) {
++  // Collect all layers in this checkpoint block (including boundary)
++  std::vector<std::shared_ptr<LayerNode>> all_block_layers;
++
++  for (auto iter = cbegin(); iter != cend(); ++iter) {
++    auto &node = *iter;
++    if (node->getCheckpointBlockId() == block_id) {
++      all_block_layers.push_back(node);
++    }
++  }
++
++  if (all_block_layers.empty()) {
++    return;
++  }
++
++  // Filter: only recompute checkpointed layers (exclude first boundary layer)
++  std::vector<std::shared_ptr<LayerNode>> layers_to_recompute;
++  for (auto &layer : all_block_layers) {
++    if (layer->isCheckpointed()) {
++      layers_to_recompute.push_back(layer);
++    }
++  }
++
++  if (layers_to_recompute.empty()) {
++    return;
++  }
++
++  for (size_t i = 0; i < layers_to_recompute.size(); ++i) {
++    auto &layer = layers_to_recompute[i];
++#ifdef ENABLE_TEST
++    if (gc_verify) {
++      std::vector<Tensor> recompute_inputs;
++      std::vector<Tensor> recompute_weights;
++      for (int i = 0; i < layer->getNumInputs(); i++)
++        recompute_inputs.push_back(layer->getInput(i));
++      for (int i = 0; i < layer->getNumWeights(); i++)
++        recompute_weights.push_back(layer->getWeight(i));
++      gc_verifier.verifyRecomputeInputs(layer, recompute_inputs);
++      gc_verifier.verifyRecomputeWeights(layer, recompute_weights);
++    }
++#endif
++    layer->forwarding(true);
++#ifdef ENABLE_TEST
++    if (gc_verify) {
++      std::vector<Tensor> recompute_outputs;
++      std::vector<Tensor> recompute_tensors;
++      for (int i = 0; i < layer->getNumOutputs(); i++)
++        recompute_outputs.push_back(layer->getOutput(i));
++      for (int i = 0; i < layer->getRunContext().getNumTensors(); i++)
++        recompute_tensors.push_back(layer->getRunContext().getTensor(i));
++      gc_verifier.verifyRecomputeOutputs(layer, recompute_outputs);
++      gc_verifier.verifyRecomputeTensors(layer, recompute_tensors);
++    }
++#endif
++  }
++}
+ } /* namespace nntrainer */
+diff --git a/nntrainer/graph/network_graph.h b/nntrainer/graph/network_graph.h
+index e09b744aa0..f1e3ff26b9 100644
+--- a/nntrainer/graph/network_graph.h
++++ b/nntrainer/graph/network_graph.h
+@@ -21,9 +21,15 @@
+ #include <stack>
+ #include <vector>
+ 
++#include <checkpoint_block.h>
+ #include <graph_core.h>
+ #include <layer_node.h>
+ #include <manager.h>
++#include <tensor.h>
++
++#ifdef ENABLE_TEST
++#include <gradient_checkpointing_test_util.h>
++#endif
+ 
+ namespace nntrainer {
+ using ExecutionMode = ml::train::ExecutionMode;
+@@ -53,6 +59,9 @@ class NetworkGraph {
+     is_clip_grad(false),
+     loss_scale(1.0f) {
+     nan_count = 0;
++#ifdef ENABLE_TEST
++    gc_verify = false;
++#endif
+   }
+ 
+   /**
+@@ -84,6 +93,9 @@ class NetworkGraph {
+     is_clip_grad(false),
+     loss_scale(1.0f) {
+     nan_count = 0;
++#ifdef ENABLE_TEST
++    gc_verify = false;
++#endif
+   }
+ 
+   /**
+@@ -198,6 +210,21 @@ class NetworkGraph {
+   static void applyGradients(LayerNode *node,
+                              const std::function<void(Weight &)> &apply_func);
+ 
++  /**
++   * @brief Apply checkpoint blocks to the graph
++   * @param checkpoint_blocks Vector of checkpoint blocks to apply
++   * @note This should be called before compile()
++   */
++  void
++  applyCheckpointBlocks(const std::vector<CheckpointBlock> &checkpoint_blocks);
++
++  /**
++   * @brief Recompute forward pass for a checkpoint block
++   * @param block_id Checkpoint block identifier
++   * @note This is called during backwarding to restore activations
++   */
++  void recomputeCheckpointBlock(const std::string &block_id);
++
+   /**
+    * @brief     forwarding network graph
+    * @param[in] training true if forwarding is on training
+@@ -388,7 +415,7 @@ class NetworkGraph {
+    */
+   void allocateWeights(bool init = true) {
+     unsigned int max_exec_order =
+-      std::get<3>(backward_iter_end->getExecutionOrder());
++      std::get<4>(backward_iter_end->getExecutionOrder());
+ 
+     if (exec_mode == ExecutionMode::INFERENCE)
+       max_exec_order = std::get<0>(forward_iter_end->getExecutionOrder());
+@@ -542,6 +569,10 @@ class NetworkGraph {
+     tensor_manager->setWeightOffset(offsets);
+   }
+ 
++#ifdef ENABLE_TEST
++  void setGCVerify() { gc_verify = true; }
++#endif
++
+ private:
+   std::map<std::string, std::string> sub_in_out; /** This is map to identify
+                  input and output layer name of subgraph */
+@@ -584,6 +615,12 @@ class NetworkGraph {
+   float loss_scale;
+   unsigned int nan_count;
+ 
++#ifdef ENABLE_TEST
++  GradientCheckpointingVerifier gc_verifier;
++
++  bool gc_verify;
++#endif
++
+   /**
+    * @brief     topological sort
+    * @param[in] ith index of LayerNode
+diff --git a/nntrainer/layers/layer_context.cpp b/nntrainer/layers/layer_context.cpp
+index f69f2ea413..5f3956de87 100644
+--- a/nntrainer/layers/layer_context.cpp
++++ b/nntrainer/layers/layer_context.cpp
+@@ -44,7 +44,7 @@ InitLayerContext::InitLayerContext(
+   bool is_inplace_, const std::string &n, const std::string &prefix_,
+   const float max_norm, std::array<std::string, 3> tensor_type_,
+   const float loss_scale_, ml::train::ExecutionMode mode_,
+-  ml::train::LayerComputeEngine engine_) :
++  ml::train::LayerComputeEngine engine_, bool is_checkpointed_) :
+   input_dim(dim),
+   is_inplace(is_inplace_),
+   clip_by_global_norm(max_norm),
+@@ -55,7 +55,8 @@ InitLayerContext::InitLayerContext(
+   tensor_type(tensor_type_),
+   loss_scale(loss_scale_),
+   mode(mode_),
+-  engine(engine_) {
++  engine(engine_),
++  is_checkpointed(is_checkpointed_) {
+   NNTR_THROW_IF(!validate(), std::invalid_argument)
+     << "Invalid init context name: " << name
+     << " num inputs: " << getNumInputs();
+@@ -242,13 +243,37 @@ bool RunLayerContext::weightHasGradient(unsigned int idx) const {
+  *
+  * @param idx Identifier of the output
+  * @return Tensor& Reference to the output tensor
++ * @note For gradient checkpointing:
++ *   - Initial forward: returns initial_outputs (short-lived)
++ *   - Recompute forward: returns outputs (default)
++ *   - Backward: returns outputs (default)
+  */
+ Tensor &RunLayerContext::getOutput(unsigned int idx) {
+-  return outputs[idx]->getVariableRef();
++  if (is_initial_forward && is_inplace && !initial_inputs.empty() &&
++      initial_inputs[0] != nullptr) {
++    auto &tensor = initial_inputs[0]->getVariableRef();
++    return tensor;
++  }
++  if (is_checkpointed && is_initial_forward && !initial_outputs.empty()) {
++    auto &tensor = initial_outputs[idx]->getVariableRef();
++    return tensor;
++  }
++  auto &tensor = outputs[idx]->getVariableRef();
++  return tensor;
+ }
+ 
+ const Tensor &RunLayerContext::getOutput(unsigned int idx) const {
+-  return outputs[idx]->getVariableRef();
++  if (is_initial_forward && is_inplace && !initial_inputs.empty() &&
++      initial_inputs[0] != nullptr) {
++    auto &tensor = initial_inputs[0]->getVariableRef();
++    return tensor;
++  }
++  if (is_checkpointed && is_initial_forward && !initial_outputs.empty()) {
++    auto &tensor = initial_outputs[idx]->getVariableRef();
++    return tensor;
++  }
++  auto &tensor = outputs[idx]->getVariableRef();
++  return tensor;
+ }
+ 
+ /**
+@@ -282,6 +307,8 @@ bool RunLayerContext::outputHasGradient(unsigned int idx) const {
+  *
+  * @note recommended to NOT use this function as a layer developer but rather
+  * use getOutputGrad().
++ * @note For gradient checkpointing:
++ *   - Backward phase: returns outputs gradient (from next layer's backprop)
+  */
+ Tensor &RunLayerContext::getOutputGradUnsafe(unsigned int idx) {
+   return outputs[idx]->getGradientRef();
+@@ -301,14 +328,33 @@ const Tensor RunLayerContext::getIncomingDerivative(unsigned int idx) const {
+  * @brief Get the Input tensor object
+  *
+  * @param idx Identifier of the input
+- * @return Tensor& Reference to the input grad tensor
++ * @return Tensor& Reference to the input tensor
++ * @note For gradient checkpointing:
++ *   - Initial forward: returns inputs (pointer to previous layer's output)
++ *   - Recompute forward (first layer only): returns initial_inputs (saved copy)
++ *   - Backward: returns inputs (recomputed values via pointer)
+  */
+ Tensor &RunLayerContext::getInput(unsigned int idx) {
+-  return inputs[idx]->getVariableRef();
++  if (is_initial_forward) {
++    if (idx < initial_inputs.size() && initial_inputs[idx] != nullptr) {
++      auto &tensor = initial_inputs[idx]->getVariableRef();
++      return tensor; // Initial forward: use initial outputs from previous layer
++    }
++  }
++  auto &tensor = inputs[idx]->getVariableRef();
++
++  return tensor; // Normal/Recompute: pointer to recompute outputs
+ }
+ 
+ const Tensor &RunLayerContext::getInput(unsigned int idx) const {
+-  return inputs[idx]->getVariableRef();
++  if (is_initial_forward) {
++    if (idx < initial_inputs.size() && initial_inputs[idx] != nullptr) {
++      auto &tensor = initial_inputs[idx]->getVariableRef();
++      return tensor;
++    }
++  }
++  auto &tensor = inputs[idx]->getVariableRef();
++  return tensor;
+ }
+ 
+ /**
+@@ -316,6 +362,8 @@ const Tensor &RunLayerContext::getInput(unsigned int idx) const {
+  *
+  * @param idx Identifier of the input
+  * @return Tensor& Reference to the input grad tensor
++ * @note For gradient checkpointing:
++ *   - Backward phase: returns inputs gradient (default)
+  */
+ Tensor &RunLayerContext::getInputGrad(unsigned int idx) {
+   if (!inputs[idx]->hasGradient()) {
+@@ -351,8 +399,18 @@ Tensor &RunLayerContext::getOutgoingDerivative(unsigned int idx) {
+  *
+  * @param idx Identifier of the tensor
+  * @return Tensor& Reference to the tensor
++ * @note For gradient checkpointing:
++ *   - Initial forward: returns initial_tensors (short-lived)
++ *   - Recompute forward: returns tensors (default)
++ *   - Backward phase: returns tensors (default)
+  */
+ Tensor &RunLayerContext::getTensor(unsigned int idx) {
++  if (is_initial_forward) {
++    if (idx < initial_tensors.size() && initial_tensors[idx] != nullptr) {
++      auto &tensor = initial_tensors[idx]->getVariableRef();
++      return tensor;
++    }
++  }
+   return tensors[idx]->getVariableRef();
+ }
+ 
+@@ -361,8 +419,18 @@ Tensor &RunLayerContext::getTensor(unsigned int idx) {
+  *
+  * @param idx Identifier of the tensor
+  * @return Tensor& Reference to the tensor
++ * @note For gradient checkpointing:
++ *   - Initial forward: returns initial_tensors (short-lived)
++ *   - Recompute forward: returns tensors (default)
++ *   - Backward phase: returns tensors (default)
+  */
+ const Tensor &RunLayerContext::getTensor(unsigned int idx) const {
++  if (is_initial_forward) {
++    if (idx < initial_tensors.size() && initial_tensors[idx] != nullptr) {
++      auto &tensor = initial_tensors[idx]->getVariableRef();
++      return tensor;
++    }
++  }
+   return tensors[idx]->getVariableRef();
+ }
+ 
+@@ -470,6 +538,10 @@ void RunLayerContext::setBatch(unsigned int batch) {
+     vg->setBatchSize(batch);
+   for (auto &vg : outputs)
+     vg->setBatchSize(batch);
++  for (auto &vg : initial_inputs)
++    vg->setBatchSize(batch);
++  for (auto &vg : initial_outputs)
++    vg->setBatchSize(batch);
+ }
+ 
+ /**
+@@ -480,18 +552,26 @@ void RunLayerContext::setBatch(unsigned int batch) {
+  */
+ void RunLayerContext::updateTensor(unsigned int idx, unsigned int batch) {
+   tensors[idx]->setBatchSize(batch);
++  if (idx < initial_tensors.size() && initial_tensors[idx])
++    initial_tensors[idx]->setBatchSize(batch);
+ }
+ 
+ void RunLayerContext::updateInput(unsigned int idx, TensorDim dimension) {
+   inputs[idx]->updateDimension(dimension);
++  if (idx < initial_inputs.size() && initial_inputs[idx])
++    initial_inputs[idx]->updateDimension(dimension);
+ }
+ 
+ void RunLayerContext::updateOutput(unsigned int idx, TensorDim dimension) {
+   outputs[idx]->updateDimension(dimension);
++  if (idx < initial_outputs.size() && initial_outputs[idx])
++    initial_outputs[idx]->updateDimension(dimension);
+ }
+ 
+ void RunLayerContext::updateTensor(unsigned int idx, TensorDim dimension) {
+   tensors[idx]->updateDimension(dimension);
++  if (idx < initial_tensors.size() && initial_tensors[idx])
++    initial_tensors[idx]->updateDimension(dimension);
+ }
+ 
+ /**
+diff --git a/nntrainer/layers/layer_context.h b/nntrainer/layers/layer_context.h
+index 40165ad672..6ff39739f9 100644
+--- a/nntrainer/layers/layer_context.h
++++ b/nntrainer/layers/layer_context.h
+@@ -55,6 +55,8 @@ class InitLayerContext {
+    * type.
+    * @param loss_scale loss scale value for mixed precision training
+    * @param mode execution mode.
++   * @param is_checkpointed_ true if layer is checkpointed for gradient
++   * checkpointing
+    */
+   InitLayerContext(
+     const std::vector<TensorDim> &dim,
+@@ -64,7 +66,8 @@ class InitLayerContext {
+     std::array<std::string, 3> tensor_type_ = {"NCHW", "FP32", "FP32"},
+     const float loss_scale = 1.0,
+     ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN,
+-    ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU);
++    ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU,
++    bool is_checkpointed_ = false);
+   /**
+    * @brief   get Tensor Format of Layer
+    *
+@@ -117,6 +120,13 @@ class InitLayerContext {
+    */
+   const ml::train::ExecutionMode &getExecutionMode() const { return mode; }
+ 
++  /**
++   * @brief Check if this layer is checkpointed for gradient checkpointing
++   *
++   * @return true if checkpointed, false otherwise
++   */
++  bool isCheckpointed() const { return is_checkpointed; }
++
+   /**
+    * @brief Get the number of inputs for the layer
+    *
+@@ -434,6 +444,9 @@ class InitLayerContext {
+   std::vector<TensorSpec>
+     tensors_spec; /**< Specification for the var_grad (trainable/non-trainable
+                      variables) */
++  std::vector<TensorSpec>
++    recompute_tensors_spec; /**< Specification for recompute tensors (gradient
++                               checkpointing) */
+ 
+   std::vector<bool> req_out_is_connected;
+   /**< a bool vector to tell if requested out is actually connected to others */
+@@ -443,6 +456,8 @@ class InitLayerContext {
+   float loss_scale; /**< loss_scale value */
+   ml::train::ExecutionMode mode;
+   ml::train::LayerComputeEngine engine;
++  bool is_checkpointed =
++    false; /**< true if layer is checkpointed for gradient checkpointing */
+ };
+ 
+ /**
+@@ -983,6 +998,78 @@ class RunLayerContext {
+    */
+   bool reStoreData() { return restoreData; }
+ 
++  /**
++   * @brief Set checkpointed flag
++   * @param checkpointed true if this layer is checkpointed
++   */
++  void setCheckpointed(bool checkpointed) { is_checkpointed = checkpointed; }
++
++  /**
++   * @brief Set initial forward mode (for gradient checkpointing)
++   * @param initial_fwd true if in initial forward mode
++   */
++  void setInitialForward(bool initial_fwd) { is_initial_forward = initial_fwd; }
++
++  /**
++   * @brief Get initial forward mode
++   * @return true if in initial forward mode
++   */
++  bool isInitialForward() const { return is_initial_forward; }
++
++  /**
++   * @brief Set initial inputs (called during initialization)
++   * @param initial_ins Initial forward inputs
++   */
++  void setInitialInputs(const std::vector<Var_Grad *> &initial_ins) {
++    initial_inputs = initial_ins;
++  }
++
++  /**
++   * @brief Set initial outputs (called during initialization)
++   * @param initial_outs Initial forward outputs
++   */
++  void setInitialOutputs(const std::vector<Var_Grad *> &initial_outs) {
++    initial_outputs = initial_outs;
++  }
++
++  /**
++   * @brief Set initial tensors (called during initialization)
++   * @param initial_t Initial forward intermediate tensors
++   */
++  void setInitialTensors(const std::vector<Var_Grad *> &initial_t) {
++    initial_tensors = initial_t;
++  }
++
++  /**
++   * @brief Set recompute outputs (called during initialization)
++   * @param recompute_outs Recompute forward outputs
++   */
++  void setRecomputeOutputs(const std::vector<Var_Grad *> &recompute_outs) {
++    outputs = recompute_outs; // outputs is used for recompute & backward
++  }
++
++  /**
++   * @brief Get initial inputs
++   * @return Initial forward inputs (saved for recompute)
++   */
++  const std::vector<Var_Grad *> &getInitialInputs() const {
++    return initial_inputs;
++  }
++
++  /**
++   * @brief Get initial outputs
++   * @return Initial forward outputs
++   */
++  const std::vector<Var_Grad *> &getInitialOutputs() const {
++    return initial_outputs;
++  }
++
++  /**
++   * @brief Get outputs
++   * @return Layer outputs
++   */
++  const std::vector<Var_Grad *> &getOutputs() const { return outputs; }
++
+ private:
+   std::tuple<props::Name, props::Trainable> props; /**< props of the layer */
+   std::shared_ptr<ContextData> ct_data;
+@@ -990,11 +1077,27 @@ class RunLayerContext {
+   bool is_inplace;  /**< if the layer is expected to run in-place */
+   float loss_scale; /**< loss_scale of the layer */
+   bool restoreData; /**< reset output for mixed precsion */
+-
+-  std::vector<Weight *> weights;   /**< weights of the layer */
+-  std::vector<Var_Grad *> inputs;  /**< inputs of the layer */
+-  std::vector<Var_Grad *> outputs; /**< outputs of the layer */
+-  std::vector<Var_Grad *> tensors; /**< tensors of the layer */
++  bool is_initial_forward =
++    false; /**< true if in initial forward mode for gradient checkpointing */
++
++  std::vector<Weight *> weights; /**< weights of the layer */
++  std::vector<Var_Grad *>
++    inputs; /**< inputs of the layer (default: recompute & backward) */
++  std::vector<Var_Grad *>
++    outputs; /**< outputs of the layer (default: recompute & backward) */
++  std::vector<Var_Grad *>
++    tensors; /**< tensors of the layer (default: recompute & backward) */
++
++  bool is_checkpointed = false; /**< true if this layer is checkpointed */
++
++  // Gradient checkpointing: initial forward tensors (short-lived, used only in
++  // initial forward)
++  std::vector<Var_Grad *>
++    initial_inputs; /**< Initial forward inputs (short-lived) */
++  std::vector<Var_Grad *>
++    initial_outputs; /**< Initial forward outputs (short-lived) */
++  std::vector<Var_Grad *>
++    initial_tensors; /**< Initial forward intermediate tensors (short-lived) */
+ 
+ #ifdef DEBUG
+   std::map<std::string, const void *>
+diff --git a/nntrainer/layers/layer_node.cpp b/nntrainer/layers/layer_node.cpp
+index 8d2663b9d9..35f104e171 100644
+--- a/nntrainer/layers/layer_node.cpp
++++ b/nntrainer/layers/layer_node.cpp
+@@ -206,9 +206,13 @@ LayerNode::LayerNode(std::unique_ptr<nntrainer::Layer> &&l) :
+   layer_node_props_realization(
+     new RealizationPropsType(props::Flatten(), props::Activation())),
+   loss(new props::Loss()),
+-  exec_order({0, 0, 0, 0}),
++  exec_order({0, 0, 0, 0, 0}),
+   needs_restore_data(false),
+-  data_type({TensorDim::DataType::FP32, TensorDim::DataType::FP32}) {
++  data_type({TensorDim::DataType::FP32, TensorDim::DataType::FP32}),
++  is_checkpointed(false),
++  is_checkpoint_block_start(false),
++  is_checkpoint_block_end(false),
++  checkpoint_block_id("") {
+   if (layer && layer->getType() == TimeDistLayer::type) {
+     std::get<props::Distribute>(*layer_node_props).set(true);
+   }
+@@ -655,9 +659,13 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
+     out_info.push_back(true);
+   }
+ 
++  // Pass checkpoint information to InitLayerContext
++  bool is_checkpointed = isCheckpointed();
++
+   auto context = InitLayerContext(
+     actual_input_dims, out_info, getInPlaceType() != InPlaceType::NONE,
+-    getName(), scope, max_norm, tensor_type, loss_scale, mode, compute_engine);
++    getName(), scope, max_norm, tensor_type, loss_scale, mode, compute_engine,
++    is_checkpointed);
+ 
+   layer->finalize(context);
+ 
+diff --git a/nntrainer/layers/layer_node.h b/nntrainer/layers/layer_node.h
+index 83e6e9be30..c71487d84a 100644
+--- a/nntrainer/layers/layer_node.h
++++ b/nntrainer/layers/layer_node.h
+@@ -363,7 +363,7 @@ class LayerNode final : public ml::train::Layer, public GraphNode {
+    * @brief   If the current layer can support in-place
+    * @return  true if inplace, else false
+    */
+-  bool supportInPlace() const;
++  bool supportInPlace() const override;
+ 
+   /**
+    * @brief Initialize the in-place settings of the layer
+@@ -994,6 +994,64 @@ class LayerNode final : public ml::train::Layer, public GraphNode {
+     return "cpu";
+   }
+ 
++  /**
++   * @brief Set if this layer is part of a checkpoint block
++   *
++   * @param checkpointed true if this layer is checkpointed
++   */
++  void setCheckpointed(bool checkpointed) { is_checkpointed = checkpointed; }
++
++  /**
++   * @brief Check if this layer is part of a checkpoint block
++   *
++   * @return true if checkpointed, false otherwise
++   */
++  bool isCheckpointed() const { return is_checkpointed; }
++
++  /**
++   * @brief Set if this layer is the first layer in a checkpoint block
++   *
++   * @param val true if first layer, false otherwise
++   */
++  void setFirstInCheckpointBlock(bool val) { is_checkpoint_block_start = val; }
++
++  /**
++   * @brief Get if this layer is the first layer in a checkpoint block
++   *
++   * @return true if first layer, false otherwise
++   */
++  bool isFirstInCheckpointBlock() const { return is_checkpoint_block_start; }
++
++  /**
++   * @brief Set if this layer is the last layer in a checkpoint block
++   *
++   * @param val true if last layer, false otherwise
++   */
++  void setLastInCheckpointBlock(bool val) { is_checkpoint_block_end = val; }
++
++  /**
++   * @brief Get if this layer is the last layer in a checkpoint block
++   *
++   * @return true if last layer, false otherwise
++   */
++  bool isLastInCheckpointBlock() const { return is_checkpoint_block_end; }
++
++  /**
++   * @brief Set the checkpoint block ID this layer belongs to
++   *
++   * @param block_id Checkpoint block identifier
++   */
++  void setCheckpointBlockId(const std::string &block_id) {
++    checkpoint_block_id = block_id;
++  }
++
++  /**
++   * @brief Get the checkpoint block ID this layer belongs to
++   *
++   * @return std::string Block identifier
++   */
++  std::string getCheckpointBlockId() const { return checkpoint_block_id; }
++
+ private:
+   /**
+    * @brief     Get the Input Layers object
+@@ -1072,6 +1130,16 @@ properties in the context/graph unless intended. */
+ 
+   std::array<TensorDim::DataType, 2> data_type;
+ 
++  /** Gradient checkpointing related fields */
++  bool is_checkpointed =
++    false; /**< Whether this layer is in a checkpoint block*/
++  bool is_checkpoint_block_start =
++    false; /**< Whether this is the first layer in checkpoint block */
++  bool is_checkpoint_block_end =
++    false; /**< Whether this is the last layer in checkpoint block */
++  std::string checkpoint_block_id; /**< ID of the checkpoint block this layer
++                                      belongs to */
++
+   /**
+    * @brief   Get the effective layer managed by this layer node
+    *
+diff --git a/nntrainer/meson.build b/nntrainer/meson.build
+index 9daa9a04d6..7246837f22 100644
+--- a/nntrainer/meson.build
++++ b/nntrainer/meson.build
+@@ -41,6 +41,10 @@ if get_option('platform') == 'tizen'
+   nntrainer_base_deps += dependency('dlog')
+ endif
+ 
++if get_option('enable-test')
++  nntrainer_base_deps += gtest_dep
++endif
++
+ nntrainer_elements = [
+   'compiler',
+   'schema',
+diff --git a/nntrainer/models/neuralnet.cpp b/nntrainer/models/neuralnet.cpp
+index 9b2c88205d..f86bdb10f7 100644
+--- a/nntrainer/models/neuralnet.cpp
++++ b/nntrainer/models/neuralnet.cpp
+@@ -202,6 +202,11 @@ int NeuralNetwork::compile(ExecutionMode mode) {
+     model_graph.addLayer(node);
+   }
+ 
++  // Apply checkpoint blocks before compile
++  if (!checkpoint_blocks.empty()) {
++    model_graph.applyCheckpointBlocks(checkpoint_blocks);
++  }
++
+   int status = model_graph.compile(loss_type);
+   NN_RETURN_STATUS();
+ 
+@@ -1530,6 +1535,35 @@ int NeuralNetwork::addLayer(NodeType layer) {
+   return status;
+ }
+ 
++int NeuralNetwork::addCheckpointBlock(
++  const std::vector<std::string> &layer_names) {
++  if (initialized) {
++    ml_loge("Cannot add checkpoint block after initialization");
++    return ML_ERROR_NOT_SUPPORTED;
++  }
++
++  if (layer_names.size() < 2) {
++    ml_loge("Checkpoint block must have at least 2 layers");
++    return ML_ERROR_INVALID_PARAMETER;
++  }
++
++  try {
++    // Create checkpoint block with auto-generated ID
++    std::string block_id =
++      "checkpoint_block_" + std::to_string(checkpoint_blocks.size());
++    CheckpointBlock block(layer_names, block_id);
++    checkpoint_blocks.push_back(block);
++
++    ml_logi("Added checkpoint block '%s' with %zu layers", block_id.c_str(),
++            layer_names.size());
++  } catch (const std::exception &e) {
++    ml_loge("Failed to create checkpoint block: %s", e.what());
++    return ML_ERROR_INVALID_PARAMETER;
++  }
++
++  return ML_ERROR_NONE;
++}
++
+ NeuralNetwork &NeuralNetwork::copyConfiguration(NeuralNetwork &from) {
+   if (this != &from) {
+     model_props = from.model_props;
+diff --git a/nntrainer/models/neuralnet.h b/nntrainer/models/neuralnet.h
+index 5ba34dfbfe..3f347108c0 100644
+--- a/nntrainer/models/neuralnet.h
++++ b/nntrainer/models/neuralnet.h
+@@ -33,6 +33,7 @@
+ #include <chrono>
+ #endif
+ 
++#include <checkpoint_block.h>
+ #include <common_properties.h>
+ #include <compiler_fwd.h>
+ #include <dynamic_training_optimization.h>
+@@ -478,6 +479,14 @@ class NeuralNetwork : public ml::train::Model {
+    */
+   int addLayer(NodeType layer);
+ 
++  /**
++   * @brief     add checkpoint block for gradient checkpointing
++   * @param[in] layer_names vector of layer names to be checkpointed
++   * @retval #ML_ERROR_NONE Successful.
++   * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
++   */
++  int addCheckpointBlock(const std::vector<std::string> &layer_names) override;
++
+   /**
+    * @brief     set optimizer for the neural network model
+    * @retval #ML_ERROR_NONE Successful.
+@@ -643,6 +652,10 @@ class NeuralNetwork : public ml::train::Model {
+   void exports(const ml::train::ExportMethods &method,
+                const std::string file_path) override;
+ 
++#ifdef ENABLE_TEST
++  void setGCVerify() override { model_graph.setGCVerify(); }
++#endif
++
+ private:
+   using FlexiblePropTypes =
+     std::tuple<props::Epochs, props::TrainingBatchSize, props::SavePath,
+@@ -702,6 +715,9 @@ class NeuralNetwork : public ml::train::Model {
+ 
+   NetworkGraph model_graph; /** Network Model Graph */
+ 
++  std::vector<CheckpointBlock>
++    checkpoint_blocks; /** Checkpoint blocks for gradient checkpointing */
++
+   GraphRepresentation graph_representation; /** Unsorted graph representation */
+ 
+   DynamicTrainingOptimization dynamic_training_opt; /**< Dynamic fine-tuning
+diff --git a/nntrainer/tensor/manager.cpp b/nntrainer/tensor/manager.cpp
+index 4120fa995a..50a0356809 100644
+--- a/nntrainer/tensor/manager.cpp
++++ b/nntrainer/tensor/manager.cpp
+@@ -171,7 +171,7 @@ static Tensor *requestTensor_(const TensorSpecV2 &spec,
+     << "Modifying view cannot be requested, the request type has to be "
+        "delegated to either view or unique";
+ 
+-  auto [forward, calc_grad, calc_deriv, apply_grad] = exec_order;
++  auto [forward, recompute, calc_grad, calc_deriv, apply_grad] = exec_order;
+ 
+   std::vector<unsigned> order = spec.additional_exec_order;
+   if (expose) {
+@@ -182,6 +182,9 @@ static Tensor *requestTensor_(const TensorSpecV2 &spec,
+   if (enum_class_or(spec.ls, LS::FORWARD_FUNC_LIFESPAN) == spec.ls) {
+     order.push_back(forward);
+   }
++  if (enum_class_or(spec.ls, LS::FORWARD_RECOMPUTE_LIFESPAN) == spec.ls) {
++    order.push_back(recompute);
++  }
+   if (enum_class_or(spec.ls, LS::CALC_GRAD_LIFESPAN) == spec.ls) {
+     order.push_back(calc_grad);
+   }
+@@ -373,8 +376,9 @@ void Manager::initializeTensorsTrain(unsigned int max_exec_order_) {
+ std::vector<Weight *> Manager::requestWeights(
+   const GraphNode &node, const std::vector<Weight::Spec> &weights_spec,
+   bool trainable, const std::vector<std::string> &shared_names) {
+-  const auto [forwarding_order, calcGradient_order, calcDerivative_order,
+-              applyGradient_order] = node.getExecutionOrder();
++  const auto [forwarding_order, recompute_order, calcGradient_order,
++              calcDerivative_order, applyGradient_order] =
++    node.getExecutionOrder();
+ 
+   std::vector<unsigned int> default_var_exec_order(
+     {forwarding_order, calcDerivative_order});
+@@ -521,8 +525,9 @@ std::vector<Weight *> Manager::requestWeights(
+ std::vector<Var_Grad *> Manager::requestTensors(
+   const GraphNode &node, const std::vector<Var_Grad::Spec> &tensors_spec,
+   bool trainable, const std::vector<std::string> &shared_names) {
+-  const auto [forwarding_order, calcGradient_order, calcDerivative_order,
+-              applyGradient_order] = node.getExecutionOrder();
++  const auto [forwarding_order, recompute_order, calcGradient_order,
++              calcDerivative_order, applyGradient_order] =
++    node.getExecutionOrder();
+ 
+   std::vector<Var_Grad *> ret;
+   size_t current_size = tensors_v2.size();
+@@ -539,6 +544,11 @@ std::vector<Var_Grad *> Manager::requestTensors(
+     if (enum_class_logical_and(tspan, TensorLifespan::FORWARD_FUNC_LIFESPAN))
+       var_exec_order.push_back(forwarding_order);
+ 
++    if (is_train_mode && enum_class_logical_and(
++                           tspan, TensorLifespan::FORWARD_RECOMPUTE_LIFESPAN)) {
++      var_exec_order.push_back(recompute_order);
++    }
++
+     /** usage for tensors gradient in backwarding */
+     if (trainable && is_train_mode &&
+         enum_class_logical_and(tspan, TensorLifespan::CALC_GRAD_LIFESPAN)) {
+@@ -592,10 +602,10 @@ std::vector<Var_Grad *> Manager::requestTensors(
+ /**
+  * @brief     Create tensors with the given spec
+  */
+-std::vector<Var_Grad *>
+-Manager::requestInputs(const GraphNode &node,
+-                       const std::vector<TensorDim> &inputs_dim,
+-                       const std::vector<std::string> &outputs_name) {
++std::vector<Var_Grad *> Manager::requestInputs(
++  const GraphNode &node, const std::vector<TensorDim> &inputs_dim,
++  const std::vector<std::string> &outputs_name, bool is_checkpoint_layer,
++  bool is_first_in_checkpoint_block) {
+   using RT = TensorSpecV2::RequestType;
+ 
+   bool is_train_mode = exec_mode == ExecutionMode::TRAIN;
+@@ -609,10 +619,18 @@ Manager::requestInputs(const GraphNode &node,
+ 
+   grad_common_spec.ls = TensorLifespan::CALC_DERIV_LIFESPAN;
+   /// @todo handle this inside layer
+-  if (node.getType() == ActivationLayer::type or
+-      node.getType() == MultiOutLayer::type or
+-      node.getType() == BatchNormalizationLayer::type or
+-      node.getType() == LayerNormalizationLayer::type or !node.getTrainable())
++  /// @note ActivationLayer with supportInPlace()=false (e.g., swish, gelu)
++  /// needs input in backward.
++  ///       For these layers, extend input lifespan to FORWARD_DERIV_LIFESPAN.
++  if (node.getType() == ActivationLayer::type) {
++    if (node.supportInPlace())
++      var_common_spec.ls = TensorLifespan::FORWARD_FUNC_LIFESPAN;
++    else
++      var_common_spec.ls = TensorLifespan::FORWARD_DERIV_LIFESPAN;
++  } else if (node.getType() == MultiOutLayer::type or
++             node.getType() == BatchNormalizationLayer::type or
++             node.getType() == LayerNormalizationLayer::type or
++             !node.getTrainable())
+     var_common_spec.ls = TensorLifespan::FORWARD_FUNC_LIFESPAN;
+ 
+   if (node.getType() == MSELossLayer::type or
+@@ -624,6 +642,13 @@ Manager::requestInputs(const GraphNode &node,
+     grad_common_spec.ls = TensorLifespan::CALC_GRAD_DERIV_LIFESPAN;
+   }
+ 
++  // For checkpoint layers (except first in block), inputs only need to exist
++  // during recompute forward and backward, not initial forward
++  // First layer in block: initial_inputs = inputs, so needs initial forward too
++  if (is_checkpoint_layer && !is_first_in_checkpoint_block) {
++    var_common_spec.ls = promoteToRecompute(var_common_spec.ls);
++  }
++
+   std::vector<Var_Grad *> ret;
+   size_t current_size = inputs_v2.size();
+ 
+diff --git a/nntrainer/tensor/manager.h b/nntrainer/tensor/manager.h
+index 1fd495c1cb..17d3e75f34 100644
+--- a/nntrainer/tensor/manager.h
++++ b/nntrainer/tensor/manager.h
+@@ -218,6 +218,9 @@ class Manager : public Noncopyable, public Nonmovable {
+    * @param node Graph node to extract node identifiers/info
+    * @param inputs_dim Specification for the tensors
+    * @param outputs_name Name of the already requested output tensors
++   * @param is_checkpoint_layer True if this is a checkpointed layer
++   * @param is_first_in_checkpoint_block True if this is the first layer in
++   * checkpoint block
+    *
+    * @return created tensors list
+    *
+@@ -230,7 +233,9 @@ class Manager : public Noncopyable, public Nonmovable {
+    */
+   std::vector<Var_Grad *>
+   requestInputs(const GraphNode &node, const std::vector<TensorDim> &inputs_dim,
+-                const std::vector<std::string> &outputs_name = {});
++                const std::vector<std::string> &outputs_name = {},
++                bool is_checkpoint_layer = false,
++                bool is_first_in_checkpoint_block = false);
+ 
+   /**
+    * @brief     Get all the weights which match the above condition
+diff --git a/nntrainer/tensor/tensor_pool.cpp b/nntrainer/tensor/tensor_pool.cpp
+index 8899ecca7c..8faaec161f 100644
+--- a/nntrainer/tensor/tensor_pool.cpp
++++ b/nntrainer/tensor/tensor_pool.cpp
+@@ -284,7 +284,30 @@ void TensorPool::expandLifespan(RequestSpec &spec,
+     << spec.tensor->getName();
+ 
+   if (details.lifespan != TensorLifespan::UNMANAGED) {
+-    /// update only if lifespan is unmanaged
++    // If source tensor has FORWARD_RECOMPUTE_LIFESPAN (checkpoint layer
++    // output), don't propagate FORWARD_FUNC_LIFESPAN from view to source. This
++    // prevents initial forward lifespan from being added to checkpoint outputs.
++    auto source_mask = static_cast<unsigned int>(details.lifespan);
++    auto view_mask = static_cast<unsigned int>(lifespan);
++    constexpr unsigned int FORWARD_FUNC_MASK =
++      static_cast<unsigned int>(TensorLifespan::FORWARD_FUNC_LIFESPAN);
++    constexpr unsigned int FORWARD_RECOMPUTE_MASK =
++      static_cast<unsigned int>(TensorLifespan::FORWARD_RECOMPUTE_LIFESPAN);
++
++    // If source has RECOMPUTE but not FWD, and view has FWD, don't add FWD to
++    // source Also skip adding exec_order to prevent initial forward order from
++    // being propagated
++    if ((source_mask & FORWARD_RECOMPUTE_MASK) &&
++        !(source_mask & FORWARD_FUNC_MASK) && (view_mask & FORWARD_FUNC_MASK)) {
++      view_mask &= ~FORWARD_FUNC_MASK; // Remove FWD from view before OR
++      lifespan = static_cast<TensorLifespan>(view_mask);
++      // Don't add exec_order - it contains initial forward order that shouldn't
++      // be propagated
++      details.lifespan =
++        enum_class_or<TensorLifespan>(details.lifespan, lifespan);
++      return;
++    }
++
+     details.lifespan =
+       enum_class_or<TensorLifespan>(details.lifespan, lifespan);
+   }
+diff --git a/nntrainer/tensor/tensor_wrap_specs.h b/nntrainer/tensor/tensor_wrap_specs.h
+index 3507f010dd..47b551e9df 100644
+--- a/nntrainer/tensor/tensor_wrap_specs.h
++++ b/nntrainer/tensor/tensor_wrap_specs.h
+@@ -56,6 +56,9 @@ enum class TensorLifespan {
+   FORWARD_GRAD_AGRAD_LIFESPAN =
+     0b1101, /**< Forward + grad + apply gradient lifespan */
+   FORWARD_DERIV_LIFESPAN = 0b011, /**< Forward + deriv lifespan */
++  FORWARD_RECOMPUTE_LIFESPAN =
++    0b10000, /**< Forward to recompute lifespan for checkpoint block boundaries
++              */
+   BACKWARD_FUNC_LIFESPAN =
+     CALC_GRAD_DERIV_AGRAD_LIFESPAN, /**< Alias of CALC_GRAD_DERIV_AGRAD_LIFESPAN
+                                      */
+@@ -71,6 +74,24 @@ enum class TensorLifespan {
+                                allocate memory */
+ };
+ 
++/**
++ * @brief Promote tensor lifespan from initial forward to recompute forward
++ * @details Converts FORWARD_FUNC_LIFESPAN to FORWARD_RECOMPUTE_LIFESPAN
++ *          while preserving other lifespan bits (CALC_GRAD, CALC_DERIV, etc.)
++ * @param span Original tensor lifespan
++ * @return Promoted tensor lifespan with FORWARD_RECOMPUTE instead of
++ * FORWARD_FUNC
++ */
++constexpr TensorLifespan promoteToRecompute(TensorLifespan span) {
++  auto mask = static_cast<unsigned>(span);
++  if (mask & static_cast<unsigned>(TensorLifespan::FORWARD_FUNC_LIFESPAN)) {
++    mask &= ~static_cast<unsigned>(TensorLifespan::FORWARD_FUNC_LIFESPAN);
++    mask |= static_cast<unsigned>(TensorLifespan::FORWARD_RECOMPUTE_LIFESPAN);
++    return static_cast<TensorLifespan>(mask);
++  }
++  return span;
++}
++
+ /**
+  * @brief Specification of the Weight as a tensor wrapper
+  *
+diff --git a/packaging/nntrainer.spec b/packaging/nntrainer.spec
+index 5c4097873e..93797c5282 100644
+--- a/packaging/nntrainer.spec
++++ b/packaging/nntrainer.spec
+@@ -698,6 +698,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
+ %{_includedir}/nntrainer/graph_node.h
+ %{_includedir}/nntrainer/model_common_properties.h
+ %{_includedir}/nntrainer/network_graph.h
++%{_includedir}/nntrainer/checkpoint_block.h
+ %{_includedir}/nntrainer/graph_core.h
+ %{_includedir}/nntrainer/manager.h
+ %{_includedir}/nntrainer/basic_planner.h
+diff --git a/test/unittest/gradient_checkpointing/gradient_checkpointing_test_util.cpp b/test/unittest/gradient_checkpointing/gradient_checkpointing_test_util.cpp
+new file mode 100644
+index 0000000000..410341867a
+--- /dev/null
++++ b/test/unittest/gradient_checkpointing/gradient_checkpointing_test_util.cpp
+@@ -0,0 +1,135 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Yeonjae Kim <duswo1120@snu.ac.kr>
++ * Copyright (C) 2025 Hoyeon Jo <jhy213@snu.ac.kr>
++ *
++ * @file gradient_checkpointing_test_util.cpp
++ * @date 16 December 2025
++ * @brief NNTrainer gradient checkpointing related common functions
++ * @see	https://github.com/nnstreamer/nntrainer
++ * @author Yeonjae Kim <duswo1120@snu.ac.kr>
++ * @author Hoyeon Jo <jhy213@snu.ac.kr>
++ * @bug No known bugs except for NYI items
++ */
++
++#include <gtest/gtest.h>
++
++#include <layer_node.h>
++#include <layer_normalization_layer.h>
++
++#include <gradient_checkpointing_test_util.h>
++
++void GradientCheckpointingVerifier::saveForwardInputs(
++  const std::shared_ptr<nntrainer::LayerNode> &lnode,
++  const std::vector<nntrainer::Tensor> &inputs) {
++  std::vector<nntrainer::Tensor> saved_inputs;
++  for (const auto &input : inputs)
++    saved_inputs.push_back(input.clone());
++  saved_forward_inputs[lnode->getName()] = saved_inputs;
++}
++
++void GradientCheckpointingVerifier::saveForwardOutputs(
++  const std::shared_ptr<nntrainer::LayerNode> &lnode,
++  const std::vector<nntrainer::Tensor> &outputs) {
++  std::vector<nntrainer::Tensor> saved_outputs;
++  for (const auto &output : outputs)
++    saved_outputs.push_back(output.clone());
++  saved_forward_outputs[lnode->getName()] = saved_outputs;
++}
++
++void GradientCheckpointingVerifier::saveForwardWeights(
++  const std::shared_ptr<nntrainer::LayerNode> &lnode,
++  const std::vector<nntrainer::Tensor> &weights) {
++  std::vector<nntrainer::Tensor> saved_weights;
++  for (const auto &weight : weights)
++    saved_weights.push_back(weight.clone());
++  saved_forward_weights[lnode->getName()] = saved_weights;
++}
++
++void GradientCheckpointingVerifier::saveForwardTensors(
++  const std::shared_ptr<nntrainer::LayerNode> &lnode,
++  const std::vector<nntrainer::Tensor> &tensors) {
++  std::vector<nntrainer::Tensor> saved_tensors;
++  for (const auto &tensor : tensors)
++    saved_tensors.push_back(tensor.clone());
++  saved_forward_tensors[lnode->getName()] = saved_tensors;
++}
++
++void GradientCheckpointingVerifier::verifyRecomputeInputs(
++  const std::shared_ptr<nntrainer::LayerNode> &lnode,
++  const std::vector<nntrainer::Tensor> &recompute_inputs) {
++  EXPECT_NE(saved_forward_inputs.find(lnode->getName()),
++            saved_forward_inputs.end());
++  std::vector<nntrainer::Tensor> &forward_inputs =
++    saved_forward_inputs.at(lnode->getName());
++  EXPECT_EQ(forward_inputs.size(), recompute_inputs.size());
++  for (int i = 0; i < forward_inputs.size(); i++)
++    tensorEqual(forward_inputs[i], recompute_inputs[i]);
++}
++
++void GradientCheckpointingVerifier::verifyRecomputeOutputs(
++  const std::shared_ptr<nntrainer::LayerNode> &lnode,
++  const std::vector<nntrainer::Tensor> &recompute_outputs) {
++  EXPECT_NE(saved_forward_outputs.find(lnode->getName()),
++            saved_forward_outputs.end());
++  std::vector<nntrainer::Tensor> &forward_outputs =
++    saved_forward_outputs.at(lnode->getName());
++  EXPECT_EQ(forward_outputs.size(), recompute_outputs.size());
++  for (int i = 0; i < forward_outputs.size(); i++)
++    tensorEqual(forward_outputs[i], recompute_outputs[i]);
++}
++
++void GradientCheckpointingVerifier::verifyRecomputeWeights(
++  const std::shared_ptr<nntrainer::LayerNode> &lnode,
++  const std::vector<nntrainer::Tensor> &recompute_weights) {
++  EXPECT_NE(saved_forward_weights.find(lnode->getName()),
++            saved_forward_weights.end());
++  std::vector<nntrainer::Tensor> &forward_weights =
++    saved_forward_weights.at(lnode->getName());
++  EXPECT_EQ(forward_weights.size(), recompute_weights.size());
++  for (int i = 0; i < forward_weights.size(); i++)
++    tensorEqual(forward_weights[i], recompute_weights[i]);
++}
++
++void GradientCheckpointingVerifier::verifyRecomputeTensors(
++  const std::shared_ptr<nntrainer::LayerNode> &lnode,
++  const std::vector<nntrainer::Tensor> &recompute_tensors) {
++  EXPECT_NE(saved_forward_tensors.find(lnode->getName()),
++            saved_forward_tensors.end());
++  std::vector<nntrainer::Tensor> &forward_tensors =
++    saved_forward_tensors.at(lnode->getName());
++  EXPECT_EQ(forward_tensors.size(), recompute_tensors.size());
++  for (int i = 0; i < forward_tensors.size(); i++) {
++    // Skip stateful tensors like KV cache that accumulate across iterations
++    if (recompute_tensors[i].getName().find("cache_key") != std::string::npos ||
++        recompute_tensors[i].getName().find("cache_value") !=
++          std::string::npos ||
++        (lnode->getType() == nntrainer::LayerNormalizationLayer::type &&
++         i > 2)) {
++      continue;
++    }
++    tensorEqual(forward_tensors[i], recompute_tensors[i]);
++  }
++}
++
++void GradientCheckpointingVerifier::tensorEqual(const nntrainer::Tensor &lhs,
++                                                const nntrainer::Tensor &rhs) {
++  // Check dimensions
++  EXPECT_EQ(lhs.getDim(), rhs.getDim());
++
++  // Compute element-wise difference
++  const float rel_tolerance = 1e-5f;
++  const float abs_tolerance = 1e-6f;
++  const float *lhs_data = lhs.getData();
++  const float *rhs_data = rhs.getData();
++  bool match = true;
++  for (size_t i = 0; i < lhs.size(); i++) {
++    float diff = std::abs(lhs_data[i] - rhs_data[i]);
++    float threshold = abs_tolerance + rel_tolerance * std::abs(lhs_data[i]);
++    if (diff > threshold) {
++      match = false;
++      break;
++    }
++  }
++  EXPECT_TRUE(match);
++}
+\ No newline at end of file
+diff --git a/test/unittest/gradient_checkpointing/gradient_checkpointing_test_util.h b/test/unittest/gradient_checkpointing/gradient_checkpointing_test_util.h
+new file mode 100644
+index 0000000000..4b625f61ff
+--- /dev/null
++++ b/test/unittest/gradient_checkpointing/gradient_checkpointing_test_util.h
+@@ -0,0 +1,107 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Yeonjae Kim <duswo1120@snu.ac.kr>
++ * Copyright (C) 2025 Hoyeon Jo <jhy213@snu.ac.kr>
++ *
++ * @file gradient_checkpointing_test_util.h
++ * @date 16 December 2025
++ * @brief NNTrainer gradient checkpointing related common functions
++ * @see	https://github.com/nnstreamer/nntrainer
++ * @author Yeonjae Kim <duswo1120@snu.ac.kr>
++ * @author Hoyeon Jo <jhy213@snu.ac.kr>
++ * @bug No known bugs except for NYI items
++ */
++#ifndef __GRADIENT_CHECKPOINTING_TEST_UTIL_H__
++#define __GRADIENT_CHECKPOINTING_TEST_UTIL_H__
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include <tensor.h>
++
++/**
++ * @class GradientCheckpointingVerifier
++ * @brief Helper to snapshot forward tensors and verify recomputed tensors
++ *        during gradient checkpointing tests.
++ */
++class GradientCheckpointingVerifier {
++public:
++  /**
++   * @brief     Constructor of GradientCheckpointingVerifier Class
++   */
++  GradientCheckpointingVerifier() = default;
++
++  /**
++   * @brief Save inputs in forwarding
++   */
++  void saveForwardInputs(const std::shared_ptr<nntrainer::LayerNode> &lnode,
++                         const std::vector<nntrainer::Tensor> &inputs);
++
++  /**
++   * @brief Save outputs in forwarding
++   */
++  void saveForwardOutputs(const std::shared_ptr<nntrainer::LayerNode> &lnode,
++                          const std::vector<nntrainer::Tensor> &outputs);
++
++  /**
++   * @brief Save weights in forwarding
++   */
++  void saveForwardWeights(const std::shared_ptr<nntrainer::LayerNode> &lnode,
++                          const std::vector<nntrainer::Tensor> &weights);
++
++  /**
++   * @brief Save tensors in forwarding
++   */
++  void saveForwardTensors(const std::shared_ptr<nntrainer::LayerNode> &lnode,
++                          const std::vector<nntrainer::Tensor> &tensors);
++
++  /**
++   * @brief Compare inputs in forwarding and recomputation
++   */
++  void
++  verifyRecomputeInputs(const std::shared_ptr<nntrainer::LayerNode> &lnode,
++                        const std::vector<nntrainer::Tensor> &recompute_inputs);
++
++  /**
++   * @brief Compare outputs in forwarding and recomputation
++   */
++  void verifyRecomputeOutputs(
++    const std::shared_ptr<nntrainer::LayerNode> &lnode,
++    const std::vector<nntrainer::Tensor> &recompute_outputs);
++
++  /**
++   * @brief Compare weights in forwarding and recomputation
++   */
++  void verifyRecomputeWeights(
++    const std::shared_ptr<nntrainer::LayerNode> &lnode,
++    const std::vector<nntrainer::Tensor> &recompute_weights);
++
++  /**
++   * @brief Compare tensors in forwarding and recomputation
++   */
++  void verifyRecomputeTensors(
++    const std::shared_ptr<nntrainer::LayerNode> &lnode,
++    const std::vector<nntrainer::Tensor> &recompute_tensors);
++
++private:
++  std::map<std::string, std::vector<nntrainer::Tensor>>
++    saved_forward_inputs; /** saved input tensors in forwarding */
++  std::map<std::string, std::vector<nntrainer::Tensor>>
++    saved_forward_outputs; /** saved output tensors in forwarding */
++  std::map<std::string, std::vector<nntrainer::Tensor>>
++    saved_forward_weights; /** saved weight tensors in forwarding */
++  std::map<std::string, std::vector<nntrainer::Tensor>>
++    saved_forward_tensors; /** saved tensors in forwarding */
++
++  /**
++   * @brief prototypical version of checking tensor is equal
++   * @param lhs forward tensor to be compared
++   * @param rhs recomute tensor to be compared
++   * @retval true tensor is equal
++   * @retval false tensor is not equal
++   */
++  void tensorEqual(const nntrainer::Tensor &lhs, const nntrainer::Tensor &rhs);
++};
++
++#endif // __GRADIENT_CHECKPOINTING_TEST_UTIL_H__
+diff --git a/test/unittest/gradient_checkpointing/meson.build b/test/unittest/gradient_checkpointing/meson.build
+new file mode 100644
+index 0000000000..ba8cb09707
+--- /dev/null
++++ b/test/unittest/gradient_checkpointing/meson.build
+@@ -0,0 +1,25 @@
++test_name = 'unittest_gradient_checkpointing'
++
++test_target = [
++  'gradient_checkpointing_test_util.cpp',
++  'unittest_gradient_checkpointing.cpp'
++]
++
++exe = executable(
++  test_name,
++  test_target,
++  dependencies: [
++    nntrainer_test_main_deps,
++    nntrainer_dep,
++    nntrainer_ccapi_dep
++  ],
++  install: get_option('enable-test'),
++  install_dir: application_install_dir
++)
++
++
++test(test_name, exe,
++  args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), test_name),
++  timeout: test_timeout,
++  suite: 'unittests'
++)
+diff --git a/test/unittest/gradient_checkpointing/unittest_gradient_checkpointing.cpp b/test/unittest/gradient_checkpointing/unittest_gradient_checkpointing.cpp
+new file mode 100644
+index 0000000000..aae16ea14a
+--- /dev/null
++++ b/test/unittest/gradient_checkpointing/unittest_gradient_checkpointing.cpp
+@@ -0,0 +1,453 @@
++// SPDX-License-Identifier: Apache-2.0
++/**
++ * Copyright (C) 2025 Yeonjae Kim <duswo1120@snu.ac.kr>
++ * Copyright (C) 2025 Hoyeon Jo <jhy213@snu.ac.kr>
++ *
++ * @file unittest_gradient_checkpointing.cpp
++ * @date 16 December 2025
++ * @brief gradient checkpointing test
++ * @see	https://github.com/nnstreamer/nntrainer
++ * @author Yeonjae Kim <duswo1120@snu.ac.kr>
++ * @author Hoyeon Jo <jhy213@snu.ac.kr>
++ * @bug No known bugs except for NYI items
++ */
++
++#include <gtest/gtest.h>
++
++#include <neuralnet.h>
++#include <stdexcept>
++
++/**
++ * @brief Simple fixed-pattern data generator used by gradient checkpointing
++ * tests to feed repeatable input/label batches.
++ */
++class SimpleDataGenerator {
++public:
++  SimpleDataGenerator(int _batch_size, int _seq_len, int _num_batches) :
++    batch_size(_batch_size),
++    seq_len(_seq_len),
++    num_batches(_num_batches),
++    current_batch(0) {
++
++    // Allocate memory for input and label
++    input_data.resize(batch_size * seq_len);
++    label_data.resize(batch_size * seq_len);
++
++    // Initialize with simple pattern
++    for (int i = 0; i < batch_size * seq_len; i++) {
++      input_data[i] = static_cast<float>(i % 10) / 10.0f;
++      label_data[i] = static_cast<float>((i + 1) % 10) / 10.0f;
++    }
++  }
++
++  void next(float **input, float **label, bool *last) {
++    // Always provide data
++    *input = input_data.data();
++    *label = label_data.data();
++
++    // Set last flag when we reach the end
++    *last = (current_batch >= num_batches - 1);
++
++    current_batch++;
++
++    // Reset for next epoch
++    if (current_batch >= num_batches) {
++      current_batch = 0;
++    }
++  }
++
++  void reset() { current_batch = 0; }
++
++private:
++  int batch_size;
++  int seq_len;
++  int num_batches;
++  int current_batch;
++  std::vector<float> input_data;
++  std::vector<float> label_data;
++};
++
++/**
++ * @brief Dataset callback for SimpleDataGenerator
++ */
++int dataset_cb(float **input, float **label, bool *last, void *user_data) {
++  auto *generator = reinterpret_cast<SimpleDataGenerator *>(user_data);
++  generator->next(input, label, last);
++  // Always return success
++  return 0;
++}
++
++TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_01) {
++  // Transformer layers with relu
++  std::unique_ptr<ml::train::Model> model;
++  std::unique_ptr<ml::train::Optimizer> optimizer;
++  std::unique_ptr<ml::train::Dataset> dataset;
++
++  EXPECT_NO_THROW(model = ml::train::createModel(
++                    ml::train::ModelType::NEURAL_NET, {"loss=mse"}));
++
++  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++    "input",
++    {"input_shape=1:" + std::to_string(32) + ":1", "name=input_tokens"})));
++
++  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++    "fully_connected", {"unit=" + std::to_string(64), "name=embedding"})));
++
++  for (int i = 0; i < 2; i++) {
++    std::string prefix = "layer" + std::to_string(i);
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "multiout", {"name=" + prefix + "/ln_multiout1"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "layer_normalization", {"axis=3", "name=" + prefix + "/ln1"})));
++
++    EXPECT_NO_THROW(model->addLayer(
++      ml::train::createLayer("multiout", {"name=" + prefix + "/multi_out1"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "multi_head_attention",
++      {"name=" + prefix + "/mha",
++       "input_layers=" + prefix + "/multi_out1(0)," + prefix +
++         "/multi_out1(1)," + prefix + "/multi_out1(2)",
++       "num_heads=" + std::to_string(4)})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "addition",
++      {"name=" + prefix + "/add1",
++       "input_layers=" + prefix + "/ln_multiout1(1)," + prefix + "/mha"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "multiout", {"name=" + prefix + "/ln_multiout2"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "layer_normalization", {"axis=3", "name=" + prefix + "/ln2"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "fully_connected", {"unit=" + std::to_string(256), "activation=relu",
++                          "name=" + prefix + "/fc1"})));
++
++    EXPECT_NO_THROW(model->addLayer(
++      ml::train::createLayer("fully_connected", {"unit=" + std::to_string(64),
++                                                 "name=" + prefix + "/fc2"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "addition",
++      {"name=" + prefix + "/add2",
++       "input_layers=" + prefix + "/ln_multiout2(1)," + prefix + "/fc2"})));
++  }
++
++  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++    "layer_normalization", {"axis=3", "name=final_ln"})));
++
++  EXPECT_NO_THROW(model->addLayer(
++    ml::train::createLayer("fully_connected", {"unit=1", "name=output"})));
++
++  for (int i = 0; i < 2; i++) {
++    std::string prefix = "layer" + std::to_string(i);
++    std::vector<std::string> block_layers{prefix + "/ln_multiout1",
++                                          prefix + "/ln1",
++                                          prefix + "/multi_out1",
++                                          prefix + "/mha",
++                                          prefix + "/add1",
++                                          prefix + "/ln_multiout2",
++                                          prefix + "/ln2",
++                                          prefix + "/fc1",
++                                          prefix + "/fc1/activation_realized",
++                                          prefix + "/fc2",
++                                          prefix + "/add2"};
++    EXPECT_NO_THROW(model->addCheckpointBlock(block_layers));
++  }
++
++  EXPECT_NO_THROW(model->setProperty(
++    {"batch_size=" + std::to_string(4), "epochs=" + std::to_string(2)}));
++
++  EXPECT_NO_THROW(
++    optimizer = ml::train::createOptimizer("adam", {"learning_rate=0.001"}));
++  EXPECT_NO_THROW(model->setOptimizer(std::move(optimizer)));
++
++  EXPECT_EQ(model->compile(), ML_ERROR_NONE);
++
++  EXPECT_EQ(model->initialize(), ML_ERROR_NONE);
++
++  EXPECT_NO_THROW(dataset = ml::train::createDataset(
++                    ml::train::DatasetType::GENERATOR, dataset_cb,
++                    new SimpleDataGenerator(4, 32, 8)));
++  EXPECT_EQ(model->setDataset(ml::train::DatasetModeType::MODE_TRAIN,
++                              std::move(dataset)),
++            ML_ERROR_NONE);
++
++  EXPECT_NO_THROW(model->setGCVerify());
++  EXPECT_NO_THROW(model->train());
++}
++
++TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_02) {
++  // Transformer layers with gelu
++  std::unique_ptr<ml::train::Model> model;
++  std::unique_ptr<ml::train::Optimizer> optimizer;
++  std::unique_ptr<ml::train::Dataset> dataset;
++
++  EXPECT_NO_THROW(model = ml::train::createModel(
++                    ml::train::ModelType::NEURAL_NET, {"loss=mse"}));
++
++  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++    "input",
++    {"input_shape=1:" + std::to_string(32) + ":1", "name=input_tokens"})));
++
++  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++    "fully_connected", {"unit=" + std::to_string(64), "name=embedding"})));
++
++  for (int i = 0; i < 2; i++) {
++    std::string prefix = "layer" + std::to_string(i);
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "multiout", {"name=" + prefix + "/ln_multiout1"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "layer_normalization", {"axis=3", "name=" + prefix + "/ln1"})));
++
++    EXPECT_NO_THROW(model->addLayer(
++      ml::train::createLayer("multiout", {"name=" + prefix + "/multi_out1"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "multi_head_attention",
++      {"name=" + prefix + "/mha",
++       "input_layers=" + prefix + "/multi_out1(0)," + prefix +
++         "/multi_out1(1)," + prefix + "/multi_out1(2)",
++       "num_heads=" + std::to_string(4)})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "addition",
++      {"name=" + prefix + "/add1",
++       "input_layers=" + prefix + "/ln_multiout1(1)," + prefix + "/mha"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "multiout", {"name=" + prefix + "/ln_multiout2"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "layer_normalization", {"axis=3", "name=" + prefix + "/ln2"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "fully_connected", {"unit=" + std::to_string(256), "activation=gelu",
++                          "name=" + prefix + "/fc1"})));
++
++    EXPECT_NO_THROW(model->addLayer(
++      ml::train::createLayer("fully_connected", {"unit=" + std::to_string(64),
++                                                 "name=" + prefix + "/fc2"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "addition",
++      {"name=" + prefix + "/add2",
++       "input_layers=" + prefix + "/ln_multiout2(1)," + prefix + "/fc2"})));
++  }
++
++  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++    "layer_normalization", {"axis=3", "name=final_ln"})));
++
++  EXPECT_NO_THROW(model->addLayer(
++    ml::train::createLayer("fully_connected", {"unit=1", "name=output"})));
++
++  for (int i = 0; i < 2; i++) {
++    std::string prefix = "layer" + std::to_string(i);
++    std::vector<std::string> block_layers{prefix + "/ln_multiout1",
++                                          prefix + "/ln1",
++                                          prefix + "/multi_out1",
++                                          prefix + "/mha",
++                                          prefix + "/add1",
++                                          prefix + "/ln_multiout2",
++                                          prefix + "/ln2",
++                                          prefix + "/fc1",
++                                          prefix + "/fc1/activation_realized",
++                                          prefix + "/fc2",
++                                          prefix + "/add2"};
++    EXPECT_NO_THROW(model->addCheckpointBlock(block_layers));
++  }
++
++  EXPECT_NO_THROW(model->setProperty(
++    {"batch_size=" + std::to_string(4), "epochs=" + std::to_string(2)}));
++
++  EXPECT_NO_THROW(
++    optimizer = ml::train::createOptimizer("adam", {"learning_rate=0.001"}));
++  EXPECT_NO_THROW(model->setOptimizer(std::move(optimizer)));
++
++  EXPECT_EQ(model->compile(), ML_ERROR_NONE);
++
++  EXPECT_EQ(model->initialize(), ML_ERROR_NONE);
++
++  EXPECT_NO_THROW(dataset = ml::train::createDataset(
++                    ml::train::DatasetType::GENERATOR, dataset_cb,
++                    new SimpleDataGenerator(4, 32, 8)));
++  EXPECT_EQ(model->setDataset(ml::train::DatasetModeType::MODE_TRAIN,
++                              std::move(dataset)),
++            ML_ERROR_NONE);
++
++  EXPECT_NO_THROW(model->setGCVerify());
++  EXPECT_NO_THROW(model->train());
++}
++
++TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_03) {
++  // Transformer layers with swiglu
++  std::unique_ptr<ml::train::Model> model;
++  std::unique_ptr<ml::train::Optimizer> optimizer;
++  std::unique_ptr<ml::train::Dataset> dataset;
++
++  EXPECT_NO_THROW(model = ml::train::createModel(
++                    ml::train::ModelType::NEURAL_NET, {"loss=mse"}));
++
++  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++    "input",
++    {"input_shape=1:" + std::to_string(32) + ":1", "name=input_tokens"})));
++
++  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++    "fully_connected", {"unit=" + std::to_string(64), "name=embedding"})));
++
++  for (int i = 0; i < 2; i++) {
++    std::string prefix = "layer" + std::to_string(i);
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "multiout", {"name=" + prefix + "/ln_multiout1"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "layer_normalization", {"axis=3", "name=" + prefix + "/ln1"})));
++
++    EXPECT_NO_THROW(model->addLayer(
++      ml::train::createLayer("multiout", {"name=" + prefix + "/multi_out1"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "multi_head_attention",
++      {"name=" + prefix + "/mha",
++       "input_layers=" + prefix + "/multi_out1(0)," + prefix +
++         "/multi_out1(1)," + prefix + "/multi_out1(2)",
++       "num_heads=" + std::to_string(4)})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "addition",
++      {"name=" + prefix + "/add1",
++       "input_layers=" + prefix + "/ln_multiout1(1)," + prefix + "/mha"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "multiout", {"name=" + prefix + "/ln_multiout2"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "layer_normalization", {"axis=3", "name=" + prefix + "/ln2"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "fully_connected",
++      {"unit=" + std::to_string(256), "name=" + prefix + "/gate_proj"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "activation", {"activation=swish", "name=" + prefix + "/gate_act"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "fully_connected",
++      {"unit=" + std::to_string(256), "input_layers=" + prefix + "/ln2",
++       "name=" + prefix + "/up_proj"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "multiply",
++      {"name=" + prefix + "/glu_mul",
++       "input_layers=" + prefix + "/gate_act," + prefix + "/up_proj"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "fully_connected",
++      {"unit=" + std::to_string(64), "name=" + prefix + "/down_proj"})));
++
++    EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++      "addition", {"name=" + prefix + "/add2", "input_layers=" + prefix +
++                                                 "/ln_multiout2(1)," + prefix +
++                                                 "/down_proj"})));
++  }
++
++  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++    "layer_normalization", {"axis=3", "name=final_ln"})));
++
++  EXPECT_NO_THROW(model->addLayer(
++    ml::train::createLayer("fully_connected", {"unit=1", "name=output"})));
++
++  for (int i = 0; i < 2; i++) {
++    std::string prefix = "layer" + std::to_string(i);
++    std::vector<std::string> block_layers{
++      prefix + "/ln_multiout1", prefix + "/ln1",       prefix + "/multi_out1",
++      prefix + "/mha",          prefix + "/add1",      prefix + "/ln_multiout2",
++      prefix + "/ln2",          prefix + "/gate_proj", prefix + "/gate_act",
++      prefix + "/up_proj",      prefix + "/glu_mul",   prefix + "/down_proj",
++      prefix + "/add2"};
++    EXPECT_NO_THROW(model->addCheckpointBlock(block_layers));
++  }
++
++  EXPECT_NO_THROW(model->setProperty(
++    {"batch_size=" + std::to_string(4), "epochs=" + std::to_string(2)}));
++
++  EXPECT_NO_THROW(
++    optimizer = ml::train::createOptimizer("adam", {"learning_rate=0.001"}));
++  EXPECT_NO_THROW(model->setOptimizer(std::move(optimizer)));
++
++  EXPECT_EQ(model->compile(), ML_ERROR_NONE);
++
++  EXPECT_EQ(model->initialize(), ML_ERROR_NONE);
++
++  EXPECT_NO_THROW(dataset = ml::train::createDataset(
++                    ml::train::DatasetType::GENERATOR, dataset_cb,
++                    new SimpleDataGenerator(4, 32, 8)));
++  EXPECT_EQ(model->setDataset(ml::train::DatasetModeType::MODE_TRAIN,
++                              std::move(dataset)),
++            ML_ERROR_NONE);
++
++  EXPECT_NO_THROW(model->setGCVerify());
++  EXPECT_NO_THROW(model->train());
++}
++
++TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_04) {
++  // A checkpoint block that skips the middle layer should fail connectivity
++  std::unique_ptr<ml::train::Model> model;
++  std::unique_ptr<ml::train::Optimizer> optimizer;
++
++  EXPECT_NO_THROW(model = ml::train::createModel(
++                    ml::train::ModelType::NEURAL_NET, {"loss=mse"}));
++
++  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++    "input",
++    {"input_shape=1:" + std::to_string(8) + ":1", "name=input_tokens"})));
++
++  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++    "fully_connected", {"unit=" + std::to_string(16), "name=fc1"})));
++
++  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
++    "fully_connected", {"unit=" + std::to_string(16), "name=fc2"})));
++
++  EXPECT_NO_THROW(model->addLayer(
++    ml::train::createLayer("fully_connected", {"unit=1", "name=fc3"})));
++
++  EXPECT_EQ(model->addCheckpointBlock({"fc1", "fc3"}), ML_ERROR_NONE);
++
++  EXPECT_NO_THROW(model->setProperty(
++    {"batch_size=" + std::to_string(4), "epochs=" + std::to_string(1)}));
++
++  EXPECT_NO_THROW(
++    optimizer = ml::train::createOptimizer("adam", {"learning_rate=0.001"}));
++  EXPECT_NO_THROW(model->setOptimizer(std::move(optimizer)));
++
++  EXPECT_THROW(model->compile(), std::invalid_argument);
++}
++
++/**
++ * @brief Main gtest
++ */
++int main(int argc, char **argv) {
++  int result = -1;
++
++  try {
++    testing::InitGoogleTest(&argc, argv);
++  } catch (...) {
++    std::cerr << "Error during IniGoogleTest" << std::endl;
++    return 0;
++  }
++
++  try {
++    result = RUN_ALL_TESTS();
++  } catch (...) {
++    std::cerr << "Error during RUN_ALL_TESTS()" << std::endl;
++  }
++
++  return result;
++}
+diff --git a/test/unittest/meson.build b/test/unittest/meson.build
+index 753b6737bf..7fd63e6a34 100644
+--- a/test/unittest/meson.build
++++ b/test/unittest/meson.build
+@@ -123,6 +123,7 @@ subdir('compiler')
+ subdir('layers')
+ subdir('datasets')
+ subdir('models')
++subdir('gradient_checkpointing')
+ if get_option('enable-tflite-interpreter')
+   subdir('integration_tests')
+ endif
