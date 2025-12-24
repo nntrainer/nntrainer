@@ -185,7 +185,8 @@ void sgemv(const unsigned int TStorageOrder, bool TransA, const unsigned int M,
            const unsigned int N, const float alpha, const float *A,
            const unsigned int lda, const float *X, const unsigned int incX,
            const float beta, float *Y, const unsigned int incY) {
-#ifdef USE_BLAS
+#if defined(USE_BLAS) &&                                                       \
+  !(defined(ENABLE_ONNX_INTERPRETER) && defined(ENABLE_FP16))
   __cblas_sgemv(TStorageOrder, TransA, M, N, alpha, A, lda, X, incX, beta, Y,
                 incY);
 #else

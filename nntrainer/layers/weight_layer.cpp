@@ -37,9 +37,10 @@ void WeightLayer::finalize(InitLayerContext &context) {
     std::get<props::WeightInitializer>(*layer_impl_props);
   auto &weight_decay = std::get<props::WeightDecay>(*layer_impl_props);
 
-  const auto &weight_dim = std::get<props::TensorDimension>(weight_props).get();
+  auto &weight_dim = std::get<props::TensorDimension>(weight_props).get();
   const auto &weight_dtype = std::get<props::TensorDataType>(weight_props);
   const auto &weight_name = std::get<props::WeightName>(weight_props);
+  weight_dim.setDataType(weight_dtype);
 
   std::vector<TensorDim> output_dims(1);
 

@@ -150,6 +150,21 @@ public:
   //  */
   std::string transformDimString(onnx::TensorProto initializer);
 
+  /**
+   * @brief Debug function to print datatypes of all graph elements
+   */
+  void debugPrintGraphDatatypes();
+
+  /**
+   * @brief Debug function to print node information with datatypes
+   */
+  void debugPrintNodeInfo(const onnx::NodeProto &node);
+
+  /**
+   * @brief Debug function to print tensor datatype information
+   */
+  void debugPrintTensorInfo(const std::string &name, const onnx::TensorProto &tensor);
+
 private:
   std::unordered_map<std::string, NodeHandler>
     NodeHandlers;              // node handlers function map

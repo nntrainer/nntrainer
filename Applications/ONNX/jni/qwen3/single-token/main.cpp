@@ -38,7 +38,7 @@ int main() {
             << std::endl;
   try {
     std::string path = "../../../../Applications/ONNX/python/qwen3/"
-                       "single-token/qwen3_model.onnx";
+                       "single-token-fp16/qwen3_model.onnx";
     model->load(path, ml::train::ModelFormat::MODEL_FORMAT_ONNX);
   } catch (const std::exception &e) {
     std::cerr << "Error during load: " << e.what() << "\n";
@@ -48,6 +48,16 @@ int main() {
   std::cout << "--------------------------------------Load Model "
                "Done--------------------------------------"
             << std::endl;
+
+// Set FP16 tensor type BEFORE compilation for mixed precision
+#ifdef ENABLE_FP16
+  std::cout << "--------------------------------------Converting model to "
+               "FP16--------------------------------------"
+            << std::endl;
+  model->setProperty({"model_tensor_type=FP16-FP16"});
+  model->setProperty({"loss_scale=17768"});
+#endif
+
   try {
     model->compile(ml::train::ExecutionMode::INFERENCE);
   } catch (const std::exception &e) {
@@ -75,7 +85,7 @@ int main() {
             << std::endl;
 
   std::string weight_path =
-    "../../../../Applications/ONNX/python/qwen3/single-token/bins/";
+    "../../../../Applications/ONNX/python/qwen3/single-token-fp16/bins/";
   try {
     model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
   } catch (std::exception &e) {
@@ -116,7 +126,7 @@ int main() {
 
   for (auto it : ans) {
     saveToRaw(it, num_vocab,
-              "../../../../Applications/ONNX/python/qwen3/single-token/"
+              "../../../../Applications/ONNX/python/qwen3/single-token-fp16/"
               "nntrainer_logits.bin");
   }
 

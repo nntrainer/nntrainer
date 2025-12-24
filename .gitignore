@@ -71,3 +71,6 @@ test/jni/googletest/
 ctre-unicode.hpp
 encoder.hpp
 json.hpp
+
+*.weight
+onnx__*

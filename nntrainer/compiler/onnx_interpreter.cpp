@@ -90,6 +90,12 @@ std::string ONNXInterpreter::extractTensorAttribute(
             reinterpret_cast<const float *>(raw_tensor.data());
           int size = raw_tensor.size() / sizeof(float);
           oss << *vals;
+#ifdef ENABLE_FP16
+        } else if (attr.t().data_type() == onnx::TensorProto_DataType_FLOAT16) {
+          const _FP16 *vals =
+            reinterpret_cast<const _FP16 *>(raw_tensor.data());
+          oss << static_cast<float>(*vals);
+#endif
         }
         return oss.str();
       }
@@ -367,6 +373,10 @@ GraphRepresentation ONNXInterpreter::deserialize(const std::string &in) {
   GraphRepresentation graph;
   // Load ONNX model file
   loadONNXModel(in);
+
+  // Debug: Print graph datatypes for analysis
+  // debugPrintGraphDatatypes();
+
   // Load inputs and weights from ONNX model files and add them to graph
   loadInputsAndWeights(graph);
   // Load operations from ONNX model files and add them to graph
@@ -424,5 +434,168 @@ std::string ONNXInterpreter::transformDimString(onnx::TensorProto initializer) {
   }
 
   return dim;
-};
+}
+
+void ONNXInterpreter::debugPrintGraphDatatypes() {
+  std::cout << "\n=== ONNX Graph Datatype Analysis ===" << std::endl;
+  std::cout << "======================================" << std::endl;
+
+  // Print input datatypes
+  std::cout << "\n--- INPUT TENSORS ---" << std::endl;
+  for (const auto &input : onnx_model.graph().input()) {
+    auto shape = input.type().tensor_type();
+    int onnx_data_type = shape.elem_type();
+    std::string nntrainer_dtype = getDataTypeFromONNX(onnx_data_type);
+
+    std::cout << "Input: " << cleanName(input.name()) << std::endl;
+    std::cout << "  ONNX Type: " << onnx_data_type << " (" << nntrainer_dtype
+              << ")" << std::endl;
+
+    // Print shape information
+    auto tensor_shape = shape.shape();
+    std::cout << "  Shape: ";
+    for (int i = 0; i < tensor_shape.dim_size(); ++i) {
+      if (tensor_shape.dim()[i].has_dim_value()) {
+        std::cout << tensor_shape.dim()[i].dim_value();
+      } else {
+        std::cout << "dynamic";
+      }
+      if (i < tensor_shape.dim_size() - 1)
+        std::cout << " x ";
+    }
+    std::cout << std::endl;
+  }
+
+  // Print weight/initializer datatypes
+  std::cout << "\n--- WEIGHT/INITIALIZER TENSORS ---" << std::endl;
+  for (const auto &initializer : onnx_model.graph().initializer()) {
+    std::cout << "Weight: " << cleanName(initializer.name()) << std::endl;
+    debugPrintTensorInfo(cleanName(initializer.name()), initializer);
+  }
+
+  // Print node operation datatypes
+  std::cout << "\n--- OPERATION NODES ---" << std::endl;
+  for (const auto &node : onnx_model.graph().node()) {
+    debugPrintNodeInfo(node);
+  }
+
+  std::cout << "\n======================================" << std::endl;
+  std::cout << "=== End Graph Analysis ===" << std::endl;
+}
+
+void ONNXInterpreter::debugPrintNodeInfo(const onnx::NodeProto &node) {
+  std::cout << "\nNode: " << cleanName(node.name())
+            << " (Op: " << node.op_type() << ")" << std::endl;
+
+  // Print input information
+  std::cout << "  Inputs:" << std::endl;
+  for (const auto &input_name : node.input()) {
+    std::string clean_input_name = cleanName(input_name);
+    std::cout << "    " << clean_input_name;
+
+    // Check if it's an initializer/weight
+    if (initializers.find(input_name) != initializers.end()) {
+      auto &tensor = initializers[input_name];
+      std::string dtype = getDataTypeFromONNX(tensor.data_type());
+      std::cout << " [WEIGHT, Type: " << dtype << "]";
+    }
+    // Check if it's a constant tensor
+    else if (constantTensors.find(clean_input_name) != constantTensors.end()) {
+      std::cout << " [CONSTANT]";
+    }
+    // Check if it's a graph input
+    else {
+      bool is_graph_input = false;
+      for (const auto &input : onnx_model.graph().input()) {
+        if (cleanName(input.name()) == clean_input_name) {
+          auto shape = input.type().tensor_type();
+          std::string dtype = getDataTypeFromONNX(shape.elem_type());
+          std::cout << " [INPUT, Type: " << dtype << "]";
+          is_graph_input = true;
+          break;
+        }
+      }
+      if (!is_graph_input) {
+        std::cout << " [INTERMEDIATE]";
+      }
+    }
+    std::cout << std::endl;
+  }
+
+  // Print output information
+  std::cout << "  Outputs:" << std::endl;
+  for (const auto &output_name : node.output()) {
+    std::cout << "    " << cleanName(output_name) << " [OUTPUT]" << std::endl;
+  }
+
+  // Check for datatype casting operations
+  if (node.op_type() == "Cast") {
+    for (const auto &attr : node.attribute()) {
+      if (attr.name() == "to") {
+        std::string target_dtype = getDataTypeFromONNX(attr.i());
+        std::cout << "  CAST OPERATION: Converts to " << target_dtype
+                  << std::endl;
+      }
+    }
+  }
+
+  // Print tensor attributes with datatypes
+  for (const auto &attr : node.attribute()) {
+    if (attr.has_t()) {
+      std::cout << "  Tensor Attribute '" << attr.name() << "':" << std::endl;
+      debugPrintTensorInfo(attr.name(), attr.t());
+    }
+  }
+}
+
+void ONNXInterpreter::debugPrintTensorInfo(const std::string &name,
+                                           const onnx::TensorProto &tensor) {
+  int onnx_data_type = tensor.data_type();
+  std::string nntrainer_dtype = getDataTypeFromONNX(onnx_data_type);
+
+  std::cout << "  ONNX Type: " << onnx_data_type << " (" << nntrainer_dtype
+            << ")" << std::endl;
+
+  // Print dimensions
+  std::cout << "  Dimensions: ";
+  if (tensor.dims_size() > 0) {
+    for (int i = 0; i < tensor.dims_size(); ++i) {
+      std::cout << tensor.dims(i);
+      if (i < tensor.dims_size() - 1)
+        std::cout << " x ";
+    }
+  } else {
+    std::cout << "scalar";
+  }
+  std::cout << std::endl;
+
+  // Print data location
+  if (tensor.has_raw_data()) {
+    std::cout << "  Data: Stored in raw_data field ("
+              << tensor.raw_data().size() << " bytes)" << std::endl;
+  } else if (tensor.float_data_size() > 0) {
+    std::cout << "  Data: " << tensor.float_data_size() << " float values"
+              << std::endl;
+  } else if (tensor.int64_data_size() > 0) {
+    std::cout << "  Data: " << tensor.int64_data_size() << " int64 values"
+              << std::endl;
+  } else if (tensor.int32_data_size() > 0) {
+    std::cout << "  Data: " << tensor.int32_data_size() << " int32 values"
+              << std::endl;
+  } else {
+    std::cout << "  Data: No data stored" << std::endl;
+  }
+
+  // Print first few values if available (for debugging)
+  if (tensor.has_raw_data() && tensor.raw_data().size() > 0) {
+    const char *raw_data = tensor.raw_data().data();
+    std::cout << "  First few bytes: ";
+    int bytes_to_show = std::min(16, (int)tensor.raw_data().size());
+    for (int i = 0; i < bytes_to_show; ++i) {
+      printf("%02x ", (unsigned char)raw_data[i]);
+    }
+    std::cout << std::endl;
+  }
+}
+
 }; // namespace nntrainer
