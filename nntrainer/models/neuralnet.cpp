@@ -844,7 +844,7 @@ void NeuralNetwork::load(const std::string &file_path,
       << "Cannot open QNN context bin file";
 
     std::thread qnn_load([this, &v]() {
-      for (int i = 0; i < v.size(); i++) {
+      for (size_t i = 0; i < v.size(); i++) {
         std::cout << "Loading qnn context file " << v[i] << std::endl;
         int ret =
           ct_engine.getRegisteredContext("qnn")->load(props::FilePath(v[i]));
