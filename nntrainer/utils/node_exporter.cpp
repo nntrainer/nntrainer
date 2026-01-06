@@ -88,11 +88,12 @@ void Exporter::saveTflResult(const std::tuple<> &props,
 
 template <>
 void Exporter::saveTflResult(
-  const std::tuple<
-    props::Name, props::Distribute, props::Trainable,
-    std::vector<props::InputConnection>, std::vector<props::InputShape>,
-    props::SharedFrom, props::ClipGradByGlobalNorm, props::Packed,
-    props::WeightDtype, props::LossScaleForMixed, props::ComputeEngine> &props,
+  const std::tuple<props::Name, props::Distribute, props::Trainable,
+                   std::vector<props::InputConnection>,
+                   std::vector<props::InputShape>, props::WeightDimension,
+                   props::SharedFrom, props::ClipGradByGlobalNorm,
+                   props::Packed, props::WeightDtype, props::LossScaleForMixed,
+                   props::ComputeEngine> &props,
   const LayerNode *self) {
   createIfNull(tf_node);
   tf_node->setLayerNode(*self);

@@ -220,6 +220,7 @@ class Unit;
 class Flatten;
 class Distribute;
 class Trainable;
+class WeightDimension;
 class InputShape;
 class WeightRegularizer;
 class WeightRegularizerConstant;
@@ -249,11 +250,12 @@ class LayerNode;
  */
 template <>
 void Exporter::saveTflResult(
-  const std::tuple<
-    props::Name, props::Distribute, props::Trainable,
-    std::vector<props::InputConnection>, std::vector<props::InputShape>,
-    props::SharedFrom, props::ClipGradByGlobalNorm, props::Packed,
-    props::WeightDtype, props::LossScaleForMixed, props::ComputeEngine> &props,
+  const std::tuple<props::Name, props::Distribute, props::Trainable,
+                   std::vector<props::InputConnection>,
+                   std::vector<props::InputShape>, props::WeightDimension,
+                   props::SharedFrom, props::ClipGradByGlobalNorm,
+                   props::Packed, props::WeightDtype, props::LossScaleForMixed,
+                   props::ComputeEngine> &props,
   const LayerNode *self);
 
 class BatchNormalizationLayer;
