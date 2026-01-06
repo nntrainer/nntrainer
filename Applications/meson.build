@@ -61,3 +61,4 @@ if get_option('enable-transformer')
 endif
 
 subdir('Optimizers/jni')
+subdir('XLMRoberta')
