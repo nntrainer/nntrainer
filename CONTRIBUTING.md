@@ -35,6 +35,7 @@ The committers are:
 * Ellen @Seunghui98
 * Junbong Yu @junbong-yu
 * HyeongGwon Hong @h0g1
+* Joonseok Oh @jayden0701
 
 ## Merging a pull-request
 
