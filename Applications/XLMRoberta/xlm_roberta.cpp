@@ -1,0 +1,628 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2025 Jijoong Moon <jijoong.moon@samsung.com>
+ * Copyright (C) 2025 Seungback Hong <sb92.hong@samsung.com>
+ * Copyright (C) 2025 Hyeonseok Lee <hs89.lee@samsung.com>
+ * Copyright (C) 2025 Eunju Yang <ej.yang@samsung.com>
+ * Copyright (C) 2025 Junbong Yu <junbong.yu@samsung.com>
+ *
+ * @file   main.cpp
+ * @date   06 Jan 2026
+ * @see    https://github.com/nnstreamer/nntrainer
+ * @author Junbong Yu <junbong.yu@samsung.com>
+ * @bug    No known bugs except for NYI items
+ * @brief  This file defines XLM Roberta's basic actions
+ * @note   This causal_lm.h constructs a class for Transformer-based Causal
+ * Language Model (CausalLM). It aims to support AutoModelForCausalLM with
+ * nntrainer. It supports the following models:
+ *          - intfloat/multilingual-e5-large-instruct
+ */
+
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <vector>
+
+#include <common.h>
+#include <layer_context.h>
+#include <mha_core.h>
+#include <tensor.h>
+#include <engine.h>
+#include <app_context.h>
+
+#include <xlm_roberta.h>
+#include <llm_util.hpp>
+#include <position.h>
+#include <token_type.h>
+
+namespace xlmroberta {
+
+using causallm::json;
+using causallm::ModelType;
+
+XLMRoberta::XLMRoberta(json &cfg, json &generation_cfg, json &nntr_cfg) :
+  Transformer(cfg, generation_cfg, nntr_cfg, ModelType::MODEL) {
+  setupParameters(cfg, generation_cfg, nntr_cfg);
+}
+
+void XLMRoberta::setupParameters(json &cfg, json &generation_cfg,
+                               json &nntr_cfg) {
+  // Initialize output list
+  for (unsigned int i = 0; i < BATCH_SIZE; ++i)
+    output_list.push_back("");
+
+  // allocate memory for the internal buffer
+  ids_history = (unsigned int *)malloc(static_cast<size_t>(BATCH_SIZE) *
+                                       MAX_SEQ_LEN * sizeof(unsigned int));
+
+  BAD_WORD_IDS = nntr_cfg["bad_word_ids"].get<std::vector<unsigned int>>();
+  NUM_BADWORDS = BAD_WORD_IDS.size();
+
+  LMHEAD_DTYPE = nntr_cfg.contains("lmhead_dtype")
+                   ? nntr_cfg["lmhead_dtype"]
+                   : nntr_cfg["embedding_dtype"];
+
+  USE_KVCACHE = false;
+  PRE_COMPUTED_CACHE_PATH = "";
+  SYS_PROMP_LEN = 0;
+
+  if (nntr_cfg.contains("system_prompt") &&
+      nntr_cfg["system_prompt"].contains("kvcache")) {
+    USE_KVCACHE = true;
+    PRE_COMPUTED_CACHE_PATH =
+      nntr_cfg["system_prompt"]["kvcache"]["pre_computed_cache_path"];
+    if (nntr_cfg["system_prompt"]["kvcache"].contains("sys_prompt_token_size"))
+      SYS_PROMP_LEN =
+        nntr_cfg["system_prompt"]["kvcache"]["sys_prompt_token_size"]
+          .get<unsigned int>();
+  }
+
+  EOS_TOKEN_ID =
+    generation_cfg["eos_token_id"].get<std::vector<unsigned int>>();
+  BOS_TOKEN_ID = generation_cfg["bos_token_id"].get<unsigned int>();
+  TOP_K = generation_cfg.contains("top_k")
+            ? generation_cfg["top_k"].get<unsigned int>()
+            : 20;
+  TOP_P = generation_cfg.contains("top_p")
+            ? generation_cfg["top_p"].get<float>()
+            : 0.95;
+  TEMPERATURE = generation_cfg.contains("temperature")
+                  ? generation_cfg["temperature"].get<float>()
+                  : 0.7;
+  global_token_len = 0;
+}
+
+void XLMRoberta::constructModel() {
+
+  // It adds all transformer model's block to model
+  // Transformer::constructModel();
+
+//   const std::string lmhead_type =
+//     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "fully_connected";
+
+//   // add lmhead
+//   std::vector<std::string> lmhead_prop = {
+//     withKey("name", "output_of_causallm"),
+//     withKey("unit", NUM_VOCAB),
+//     withKey("disable_bias", "true"),
+//     withKey("input_layers", "output_norm"),
+//     withKey("weight_dtype", LMHEAD_DTYPE),
+//   };
+
+//   if (TIE_WORD_EMBEDDINGS)
+//     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
+
+//   model->addLayer(createLayer(lmhead_type, lmhead_prop));
+
+//////////////////////// implement from scratch!! ////////////////////////
+  // layers used in the model
+  // layers used in the model
+  std::vector<LayerHandle> layers;
+
+  // create model
+  model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+
+  // create input layer
+  layers.push_back(createLayer(
+    "input", {withKey("name", "input0"),
+              withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))}));
+
+  // create embedding layer
+  const std::string embedding_type =
+    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
+
+  // Custom: position_ids
+  layers.push_back(createLayer(
+      "position",
+      {"name=position",
+       "weight_dtype=" + EMBEDDING_DTYPE,
+       "out_dim=" + std::to_string(DIM),
+       "input_layer=input0"}));
+
+  // Custom: token_type_ids
+  layers.push_back(createLayer(
+      "token_type",
+      {"name=token_type",
+       "weight_dtype=" + EMBEDDING_DTYPE,
+       "out_dim=" + std::to_string(DIM),
+       "input_layer=input0"}));
+
+  // embedding0: word_embedding
+  layers.push_back(createLayer(
+      embedding_type,
+      {"name=embedding0_word_embedding",
+       "in_dim=" + std::to_string(NUM_VOCAB),
+       "weight_dtype=" + EMBEDDING_DTYPE,
+       "out_dim=" + std::to_string(DIM),
+       "input_layer=input0"}));
+
+  // embedding0: position_embedding
+  layers.push_back(createLayer(
+      embedding_type,
+      {"name=embedding0_position_embedding",
+       "in_dim=" + std::to_string(NUM_VOCAB),
+       "weight_dtype=" + EMBEDDING_DTYPE,
+       "out_dim=" + std::to_string(DIM),
+       "input_layer=position"}));
+
+  // embedding0: token_type_embedding
+  layers.push_back(createLayer(
+      embedding_type,
+      {"name=embedding0_token_type_embedding",
+       "in_dim=" + std::to_string(NUM_VOCAB),
+       "weight_dtype=" + EMBEDDING_DTYPE,
+       "out_dim=" + std::to_string(DIM),
+       "input_layer=token_type"}));
+
+  // create transformer layers
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    std::vector<LayerHandle> transformer;
+    if (i == 0)
+      transformer = createTransformerDecoderBlock(0, "embedding0");
+    else
+      transformer = createTransformerDecoderBlock(
+        i, "layer" + std::to_string(i - 1) + "_decoder_output");
+    layers.insert(layers.end(), transformer.begin(), transformer.end());
+  }
+
+  // create rms_norm
+  layers.push_back(createLayer(
+    "rms_norm",
+    {withKey("name", "output_norm"),
+     withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("input_layers",
+             "layer" + std::to_string(NUM_LAYERS - 1) + "_decoder_output"),
+     withKey("packed", "false")}));
+
+  // add created layers into the model
+  for (auto &layer : layers) {
+    model->addLayer(layer);
+  }
+
+}
+
+void XLMRoberta::setupParameters(json &cfg, json &generation_cfg,
+                                        json &nntr_cfg) {
+  Transformer::setupParameters(cfg, generation_cfg, nntr_cfg);
+
+  if (cfg.contains("layer_types")) {
+    layer_types = cfg["layer_types"].get<std::vector<std::string>>();
+  }
+}
+
+void XLMRoberta::registerOutputs(
+  std::unique_ptr<tokenizers::Tokenizer> &tokenizer,
+  std::vector<unsigned int> ids, unsigned int pos,
+  const std::vector<bool> &eos_list) {
+
+  static const std::vector<char> puncts{',', '!', ':', ';', '?'};
+  for (size_t b = 0; b < ids.size(); ++b) {
+    if (!eos_list[b]) {
+      pending_ids_.push_back(static_cast<int>(ids[b]));
+      ids_history[b * MAX_SEQ_LEN + pos] = ids[b];
+      std::string decoded_str = tokenizer->Decode(pending_ids_);
+
+      if (std::find(puncts.begin(), puncts.end(), decoded_str.back()) !=
+          puncts.end()) {
+        // last symbol is a punctuation, hold on
+      } else if (decoded_str.size() >= 3 &&
+                 decoded_str.compare(decoded_str.size() - 3, 3, "") == 0) {
+        // ends with an incomplete token, hold on
+      } else {
+#if defined(_WIN32)
+        std::wcout << L"" << utf8_to_wstring(decoded_str);
+        std::wcout.flush();
+#else
+        std::cout << decoded_str;
+        std::cout.flush();
+#endif
+        output_list[b].append(decoded_str);
+        pending_ids_.clear();
+      }
+    }
+  }
+}
+
+void XLMRoberta::save_kvcache(std::string path, int to_) {
+  auto f = nntrainer::checkedOpenStream<std::ofstream>(
+    path, std::ios::out | std::ios::binary | std::ios::trunc);
+
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [&f](ml::train::Layer &l, nntrainer::RunLayerContext &context,
+              void *idx) {
+      if (l.getType() == causallm::MHACoreLayer::type) {
+        int to = static_cast<int>(reinterpret_cast<intptr_t>(idx));
+        auto k_cache = context.getTensor(0);
+        auto v_cache = context.getTensor(1);
+        ml::train::TensorDim k_dim = k_cache.getDim();
+        ml::train::TensorDim v_dim = v_cache.getDim();
+        k_dim.height(to);
+        v_dim.height(to);
+        nntrainer::Tensor k_cache_prompt =
+          k_cache.getSharedDataTensor(k_dim, 0, true);
+        nntrainer::Tensor v_cache_prompt =
+          v_cache.getSharedDataTensor(v_dim, 0, true);
+        k_cache_prompt.save(f);
+        v_cache_prompt.save(f);
+      }
+    };
+  void *arg = reinterpret_cast<void *>(static_cast<intptr_t>(to_));
+  model->forEachLayer(fn, arg);
+  f.close();
+}
+
+void XLMRoberta::load_kvcache(std::string path, int to_) {
+  auto f = nntrainer::checkedOpenStream<std::ifstream>(
+    path, std::ios::in | std::ios::binary);
+
+  model->allocate(ml::train::ExecutionMode::INFERENCE);
+
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [&f](ml::train::Layer &l, nntrainer::RunLayerContext &context,
+              void *idx) {
+      if (l.getType() == causallm::MHACoreLayer::type) {
+        auto k_cache = context.getTensor(0);
+        auto v_cache = context.getTensor(1);
+        int to = static_cast<int>(reinterpret_cast<intptr_t>(idx));
+        ml::train::TensorDim k_dim = k_cache.getDim();
+        ml::train::TensorDim v_dim = v_cache.getDim();
+        k_dim.height(to);
+        v_dim.height(to);
+        nntrainer::Tensor k_cache_prompt =
+          k_cache.getSharedDataTensor(k_dim, 0, true);
+        nntrainer::Tensor v_cache_prompt =
+          v_cache.getSharedDataTensor(v_dim, 0, true);
+        k_cache_prompt.read(f);
+        v_cache_prompt.read(f);
+      }
+    };
+  void *arg = reinterpret_cast<void *>(static_cast<intptr_t>(to_));
+  model->forEachLayer(fn, arg);
+  f.close();
+}
+
+std::vector<unsigned int> XLMRoberta::generate(float *logits, bool do_sample,
+                                             float repetition_penalty,
+                                             unsigned int *input_ids,
+                                             unsigned int NUM_INPUT_IDS) {
+
+  std::vector<unsigned int> outputs;
+  for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
+
+    // apply repetition penalty
+    if (repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0) {
+      applyRepetitionPenalty(logits, input_ids, NUM_INPUT_IDS,
+                             repetition_penalty);
+    }
+
+    // apply bad words penalty
+    if (BAD_WORD_IDS.size() != 0 && NUM_BADWORDS != 0) {
+      applyBadWordsPenalty(logits, BAD_WORD_IDS.data(), NUM_BADWORDS);
+    }
+
+    // return argmax if do_sample is false
+    if (do_sample == false) {
+      unsigned int argmax_idx =
+        std::distance(logits, std::max_element(logits, logits + NUM_VOCAB));
+      outputs.push_back(argmax_idx);
+    } else {
+      // apply temperature & top-k & top-p to logits
+      float max_logits = applyTKP(logits, NUM_VOCAB, TEMPERATURE, TOP_K, TOP_P);
+      // transform logits to softmax
+      float sum_exp_logits = 0;
+      for (unsigned int i = 0; i < NUM_VOCAB; i++) {
+        float exp_x = exp(logits[i] - max_logits);
+        sum_exp_logits += exp_x;
+        logits[i] = exp_x;
+      }
+
+      for (unsigned int i = 0; i < NUM_VOCAB; ++i) {
+        logits[i] /= sum_exp_logits;
+      }
+
+      // sample from final logits
+      std::discrete_distribution<int> dist(logits, logits + NUM_VOCAB);
+      unsigned int sampled_idx = dist(rng);
+
+      // add sampled word
+      outputs.push_back(sampled_idx);
+    }
+
+    // set batch offset
+    logits = logits + NUM_VOCAB;
+    input_ids = input_ids + MAX_SEQ_LEN;
+  }
+
+  return outputs;
+};
+
+void XLMRoberta::registerCustomLayers()
+{
+  auto &ct_engine = nntrainer::Engine::Global();
+  auto app_context =
+      static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+
+  try
+  {
+    app_context->registerFactory(
+        nntrainer::createLayer<xlmroberta::Position>);
+
+    app_context->registerFactory(
+        nntrainer::createLayer<xlmroberta::TokenType>);
+  }
+  catch (std::invalid_argument &e)
+  {
+    std::cerr << "failed to register factory, reason: " << e.what()
+              << std::endl;
+  }
+}
+
+void XLMRoberta::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
+                   const WSTR tail_prompt) {
+
+  if (!is_initialized) {
+    throw std::runtime_error("CausalLM model is not initialized. Please call "
+                             "initialize() before run().");
+  }
+
+  output_list.clear();
+  for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+    output_list.push_back("");
+  }
+
+  if (MAX_SEQ_LEN < INIT_SEQ_LEN) {
+    throw std::invalid_argument(
+      "MAX_SEQ_LEN must be greater than or equal to INIT_SEQ_LEN");
+  }
+
+  /**
+   * Variables for Log
+   */
+  unsigned int generation_cnt = 0;
+  int64_t total_generation_duration = 0;
+
+  /**
+   * INPUT PREPARATION
+   */
+  std::vector<float *> input;
+  std::vector<float *> label;
+
+  /**
+   * SAVE_KVCACHE ?
+   *  if USE_KVCACHE && system_prompt is given && but the
+   * PRE_COMPUTED_CACHE_PATH does not exist
+   */
+  SAVE_KVCACHE = (USE_KVCACHE && system_prompt != "" &&
+                  !std::filesystem::exists(PRE_COMPUTED_CACHE_PATH));
+
+#if defined(_WIN32)
+  std::wcout << L"" << system_prompt << L"" << text_ << std::endl;
+  std::wstring prompt_ = prompt;
+  if (!SAVE_KVCACHE)
+    prompt_ += TAIL_PROMPT;
+  std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+  auto _input = tokenizer->Encode(converter.to_bytes(prompt_));
+#else
+  // print input text
+  std::cout << system_prompt << prompt << tail_prompt << std::endl;
+
+  // actual prompt to be used in computation
+  std::string prompt_;
+
+  if (USE_KVCACHE) {
+    prompt_ = SAVE_KVCACHE ? system_prompt : (prompt + tail_prompt);
+  } else {
+    prompt_ = system_prompt + prompt + tail_prompt;
+  }
+
+  if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0)
+    SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
+
+  auto _input = tokenizer->Encode(prompt_);
+#endif
+
+  // | <------------------- MAX_SEQ_LEN -------------------> |
+  //                       ||             ||
+  // |<-- System prompt -->||<-- input -->||<-- generate -->|
+
+  std::vector<int64_t> init_input;
+  unsigned int _len = _input.size();
+  unsigned int num_allow_str = MAX_SEQ_LEN - NUM_TO_GENERATE;
+  unsigned text_len = _len;
+
+  if (_len > num_allow_str)
+    text_len = num_allow_str;
+
+  // feed only available length
+  // if _input is allowed, it feeds all of the _input
+  // otherwise, feeds only a part of _input
+  for (unsigned int i = 0; i < text_len; ++i)
+    init_input.push_back(_input[i]);
+
+  ///@todo currently, the whole sequence may not be fed into the model
+  /// This should be handled later.
+  _input.clear();
+
+  unsigned int init_len = init_input.size();
+  float *input_sample =
+    (float *)malloc(sizeof(float) * BATCH_SIZE * MAX_SEQ_LEN);
+  std::vector<bool> eos_list(BATCH_SIZE, false);
+
+  unsigned int input_len = init_len;
+  unsigned int token_generation_idx = input_len + 1;
+
+  for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+    for (unsigned int i = 0; i < input_len; ++i) {
+      input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + i] =
+        static_cast<float>(init_input[i]);
+      ids_history[static_cast<size_t>(b) * MAX_SEQ_LEN + i] = init_input[i];
+    }
+  }
+
+  /**
+   * PREFILL
+   */
+  std::vector<int64_t> token_ids;
+  input.push_back(input_sample);
+
+  ///@note contains possible bug
+  // std::vector<ml::train::TensorDim> input_dims;
+  // ml::train::TensorDim input_dim(1, 1, input_len, DIM);
+  // input_dims.push_back(input_dim);
+  // model->resetInputDimension(input_dims);
+
+  auto start_prefill = std::chrono::high_resolution_clock::now();
+
+  std::vector<float *> output;
+
+  if (SAVE_KVCACHE) {
+    //@note This is for the save the kv cache. precomputed kv cache should be
+    // always located at the begining of the prompt.
+    // Therefore, it start from 0. and system prompt should be saved in the
+    // init_input, so that we can compute system prompt size properly
+    //
+    // The structure of this precomputed K,V Cache is :
+    //
+    //  //<-- System Prompt -->/<-- Input Tokens -->/<-- Tail prompt --> //
+    //  //< Precomputed cache >/<--given as input-->/<--- from json ---->//
+    //
+
+    std::cout << "\n==============[KV CACHE SAVE MODE]================\n";
+    output = model->incremental_inference(BATCH_SIZE, input, label, input_len,
+                                          0 + global_token_len,
+                                          input_len + global_token_len, false);
+
+    SYS_PROMP_LEN = input_len;
+    save_kvcache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
+
+    std::cout
+      << "kv caches are saved in " << PRE_COMPUTED_CACHE_PATH << std::endl
+      << "and the size of prompt is " << SYS_PROMP_LEN << ".\n"
+      << "You may need this prompt lenth to set the \"sys_prompt_token_size\""
+      << "\n==================================================\n"
+      << std::endl;
+    return;
+  }
+
+  if (USE_KVCACHE) {
+    load_kvcache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
+  } else {
+    SYS_PROMP_LEN = 0;
+  }
+  output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
+                                        SYS_PROMP_LEN,
+                                        SYS_PROMP_LEN + input_len, false);
+
+  // post process of model output
+  std::vector<unsigned int> id_list(generate_multi_tokens(
+    output[0], NUM_VOCAB, BATCH_SIZE, 1, ids_history, _len));
+
+  if (init_len < INIT_SEQ_LEN)
+    registerOutputs(tokenizer, id_list, init_len, eos_list);
+
+  auto finish_prefill = std::chrono::high_resolution_clock::now();
+  auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    finish_prefill - start_prefill);
+
+  /**
+   * TOKEN GENERATION
+   */
+
+  input_len += SYS_PROMP_LEN;
+
+  // Update generated token by prefill as an input
+  for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+    input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+      static_cast<float>(id_list[b]);
+
+  auto start_generation = std::chrono::high_resolution_clock::now();
+
+  for (token_generation_idx = input_len + 1;
+       token_generation_idx < input_len + 1 + NUM_TO_GENERATE;
+       ++token_generation_idx) {
+
+    auto output_interval =
+      model->incremental_inference(BATCH_SIZE, input, label, input_len,
+                                   token_generation_idx - 1 + global_token_len,
+                                   token_generation_idx + global_token_len);
+    std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
+    if (token_generation_idx < input_len) {
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+        input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+          static_cast<float>(init_input[token_generation_idx - SYS_PROMP_LEN]);
+      }
+      registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list);
+    } else {
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+        input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+          static_cast<float>(ids_list[b]);
+      }
+      registerOutputs(tokenizer, ids_list, token_generation_idx, eos_list);
+    }
+    ++generation_cnt;
+
+    // check FINISH
+    for (unsigned int j = 0; j < BATCH_SIZE; ++j) {
+      if (!eos_list[j] && (std::find(EOS_TOKEN_ID.begin(), EOS_TOKEN_ID.end(),
+                                     ids_list[j]) != EOS_TOKEN_ID.end())) {
+        eos_list[j] = true;
+      }
+    }
+
+    bool is_finish = true;
+    for (unsigned int j = 0; j < BATCH_SIZE; ++j) {
+      if (!eos_list[j]) {
+        is_finish = false;
+        break;
+      }
+    }
+
+    if (is_finish) {
+      free(input_sample);
+      break;
+    }
+  }
+
+
+  global_token_len += (generation_cnt + init_len);
+
+  auto finish_generation = std::chrono::high_resolution_clock::now();
+  auto generation_duration =
+    std::chrono::duration_cast<std::chrono::milliseconds>(finish_generation -
+                                                          start_generation);
+
+  std::cout << "\n\n";
+  std::cout << "=================[ LLM with NNTrainer ]===================\n";
+  std::cout << "prefill: " << init_len << " tokens, "
+            << prefill_duration.count() << " ms, "
+            << ((double)init_len / prefill_duration.count() * 1000) << " TPS\n";
+  std::cout << "generation: " << generation_cnt << " tokens, "
+            << generation_duration.count() << " ms, "
+            << ((double)generation_cnt / generation_duration.count() * 1000)
+            << " TPS\n";
+  std::cout << "==========================================================\n";
+};
+
+} // namespace causallm
