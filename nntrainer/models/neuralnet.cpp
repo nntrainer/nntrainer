@@ -689,6 +689,9 @@ void NeuralNetwork::load(const std::string &file_path,
   size_t start_from = 0;
   std::vector<std::pair<size_t, size_t>> file_offset;
   for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+#ifdef ENABLE_ONNX_INTERPRETER
+    start_from = 0;
+#endif
     auto weights = (*iter)->getRunContext().getWeights();
     for (auto weight : weights) {
       size_t size = weight->getVariable().getMemoryBytes();
@@ -745,12 +748,42 @@ void NeuralNetwork::load(const std::string &file_path,
         auto node = *iter;
         auto exec_order = std::get<0>((*iter)->getExecutionOrder());
 
+#ifdef ENABLE_ONNX_INTERPRETER
+        auto rc = node->getRunContext(); // SAFE local copies
+        bool hasWeights = rc.getNumWeights();
+        std::string base0 = v[0];
+        std::string base1 = (v.size() == 2 ? v[1] : "");
+        std::string layerName = rc.getName();
+
+        threads.emplace_back([=]() {
+          if (!MMAP_READ) {
+            if (hasWeights) {
+              std::string file_path;
+              if (!base1.empty()) {
+                file_path = base1 + layerName + ".bin";
+              } else {
+                file_path = base0 + layerName + ".bin";
+              }
+              auto local_model_file = checkedOpenStream<std::ifstream>(
+                file_path, std::ios::in | std::ios::binary);
+
+              int local_fd = open(file_path.c_str(), O_RDONLY);
+              NNTR_THROW_IF((local_fd == -1), std::invalid_argument)
+                << "Cannot open file : " << file_path;
+
+              node->read(local_model_file, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true, local_fd);
+
+              close(local_fd);
+            }
+#else
         threads.emplace_back([&, node]() {
           if (!MMAP_READ) {
             auto local_model_file = checkedOpenStream<std::ifstream>(
               (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
             node->read(local_model_file, false, exec_mode, fsu_mode,
                        std::numeric_limits<size_t>::max(), true, model_file_fd);
+#endif
           } else {
 #if defined(_WIN32)
             // Map per-ask, then unmap immediately after: enables early release
@@ -780,6 +813,44 @@ void NeuralNetwork::load(const std::string &file_path,
             CloseHandle(hFile);
 #else
             // POSIX: map per-task, advise kernel, drop pages, unmap
+#ifdef ENABLE_ONNX_INTERPRETER
+            if (hasWeights) {
+              std::string file_path;
+              if (!base1.empty()) {
+                file_path = base1 + layerName + ".bin";
+              } else {
+                file_path = base0 + layerName + ".bin";
+              }
+              int fd = ::open(file_path.c_str(), O_RDONLY);
+              NNTR_THROW_IF((fd == -1), std::invalid_argument)
+                << "Cannot open file : " << f_path;
+
+              struct stat st {};
+              NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
+                << "Cannot get file info (fstat): " << f_path;
+
+              size_t f_size = static_cast<size_t>(st.st_size);
+              void *mmap_ptr =
+                ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+              ::close(fd); // fd not needed after mmap
+              NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+                << "mmap failed";
+
+              // Hint: many model loads touch scattered regions -> RANDOM helps
+              // reduce readahead
+              (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+
+              char *view = static_cast<char *>(mmap_ptr);
+              node->read(view, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true);
+
+              // Early drop: pages no longer needed; helps lower peak RSS during
+              // overlap
+              (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+
+              ::munmap(mmap_ptr, f_size);
+            }
+#else
             int fd = ::open(f_path.c_str(), O_RDONLY);
             NNTR_THROW_IF((fd == -1), std::invalid_argument)
               << "Cannot open file : " << f_path;
@@ -808,6 +879,7 @@ void NeuralNetwork::load(const std::string &file_path,
             (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
 
             ::munmap(mmap_ptr, f_size);
+#endif
 #endif
           }
         });
