@@ -29,10 +29,7 @@
 #include <layer_context.h>
 #include <tensor.h>
 
-#define EXPECT_IN_RANGE(VAL, MIN, MAX)                                         \
-  EXPECT_GE((VAL), (MIN));                                                     \
-  EXPECT_LE((VAL), (MAX))
-
+#include "unittest_util.h"
 using namespace nntrainer;
 
 // -----
@@ -138,28 +135,6 @@ dot_gemm_fp16(const int batch, const int channel, const int height,
 }
 #endif
 
-void *allocateSVM(size_t size_bytes) {
-  auto *blas_cc = static_cast<nntrainer::ClContext *>(
-    nntrainer::Engine::Global().getRegisteredContext("gpu"));
-
-  void *ptr = blas_cc->context_inst_.createSVMRegion(size_bytes);
-
-  if (ptr == nullptr) {
-    throw std::runtime_error(
-      "Failed to allocated SVM for the OpenCL BLAS unit test.");
-  }
-
-  return ptr;
-}
-
-void freeSVM(void *ptr) {
-  auto *blas_cc = static_cast<nntrainer::ClContext *>(
-    nntrainer::Engine::Global().getRegisteredContext("gpu"));
-
-  blas_cc->context_inst_.releaseSVMRegion(ptr);
-  ptr = nullptr;
-}
-
 auto debug_print_data = [](const float *const data, const unsigned int len,
                            const uint32_t count = 5) {
   std::cout << "[";
@@ -173,44 +148,6 @@ auto debug_print_data = [](const float *const data, const unsigned int len,
   std::cout << "]";
 };
 
-/**
- * @brief Helper function to generate random data
- *
- * @tparam T data type
- * @tparam random_init True if want random
- * @param size data length
- * @param min_val minimum value
- * @param max_val maximum value
- * @return std::vector<T> random vector
- */
-template <typename T, bool random_init = false>
-static inline std::vector<T>
-generate_random_vector(size_t size, float min_val = -1.F, float max_val = 1.F) {
-  std::random_device rd;
-  auto init_val = random_init ? rd() : 42;
-  std::mt19937 gen(init_val);
-  std::uniform_real_distribution<float> dist(min_val, max_val);
-  std::vector<T> vec(size);
-  for (auto &val : vec) {
-    val = static_cast<T>(dist(gen));
-  }
-  return vec;
-}
-
-static inline std::vector<float> generate_vector(const size_t size,
-                                                 float min_val, float max_val) {
-  const float step = (max_val - min_val) / (float)size;
-  float current_value = min_val;
-  std::vector<float> vec(size, 0.0f);
-
-  for (int i = 0; i < vec.size(); ++i) {
-    vec[i] = current_value;
-    current_value += step;
-  }
-
-  return vec;
-}
-
 static inline void printMatrixF(const char *name, float *data, int Y, int X) {
   printf("%s :\n", name);
   for (int y = 0; y < Y; y++) {
@@ -219,39 +156,6 @@ static inline void printMatrixF(const char *name, float *data, int Y, int X) {
       std::cout << data[y * X + x] << " ";
     }
     printf("]\n");
-  }
-}
-
-static inline void printMatrixI(const char *name, float *data, int Y, int X) {
-  printf("%s :\n", name);
-  for (int y = 0; y < Y; y++) {
-    // printf("[");
-    for (int x = 0; x < X; x++) {
-      if (x % 10 == 0) {
-        printf("| ");
-      }
-      std::cout << (int)(0.5f + data[y * X + x]) << " ";
-    }
-    printf("\n");
-  }
-}
-
-static inline std::vector<float> generate_01_vector(const size_t size,
-                                                    const float ones_ratio) {
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_real_distribution<float> dist(0.0f, (float)size);
-  if (ones_ratio >= 1.0) {
-    std::vector<float> vec(size, 1.0f);
-    return vec;
-  } else {
-    std::vector<float> vec(size, 0.0f);
-    size_t ones_cnt = (size_t)(size * ones_ratio);
-    for (size_t i = 0; i < ones_cnt; i++) {
-      int pos = static_cast<int>(dist(gen));
-      vec[pos] = 1.0f;
-    }
-    return vec;
   }
 }
 
@@ -1174,6 +1078,7 @@ DECLARE_int4_gemm_test_M_K_N(28, 3072, 256, 32);
 DECLARE_int4_gemm_test_M_K_N(28, 3072, 8192, 32);
 DECLARE_int4_gemm_test_M_K_N(28, 8192, 3072, 32);
 DECLARE_int4_gemm_test_M_K_N(28, 3072, 3072, 32);
+DECLARE_int4_gemm_test_M_K_N(28, 32, 3072, 32);
 
 DECLARE_int4_gemm_test_M_K_N(28, 3072, 256, 128);
 DECLARE_int4_gemm_test_M_K_N(28, 3072, 8192, 128);

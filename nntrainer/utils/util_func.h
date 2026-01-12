@@ -117,8 +117,20 @@ template <typename T = float> T logFloat(T x) {
  */
 template <typename T = float> T exp_util(T x) { return static_cast<T>(exp(x)); }
 
+/**
+ * @brief     Calculate the ceiling of division
+ * @param[in] a dividend
+ * @param[in] b divisor
+ * @return    ceiling of a/b
+ */
 uint32_t ceilDiv(uint32_t a, uint32_t b);
 
+/**
+ * @brief     Align a to the nearest multiple of b (round up)
+ * @param[in] a value to align
+ * @param[in] b alignment boundary
+ * @return    a aligned to the nearest multiple of b
+ */
 uint32_t align(uint32_t a, uint32_t b);
 
 #ifdef _WIN32

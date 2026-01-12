@@ -47,9 +47,10 @@ enum class ExecutionMode {
  * @brief     Enumeration of layer compute engine
  */
 enum LayerComputeEngine {
-  CPU, /**< CPU as the compute engine */
-  GPU, /**< GPU as the compute engine */
-  QNN, /**< QNN as the compute engine */
+  CPU,  /**< CPU as the compute engine */
+  GPU,  /**< GPU as the compute engine */
+  QNN,  /**< QNN as the compute engine */
+  CUDA, /**< CUDA as the compute engine */
 };
 
 /**

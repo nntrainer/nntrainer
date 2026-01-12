@@ -11,6 +11,8 @@ project('nntrainer', 'c', 'cpp',
   ]
 )
 
+message('ROOT: enable-opencl option value: ' + get_option('enable-opencl').to_string())
+
 cmake_build_type = 'Release'
 if get_option('buildtype') == 'debug'
   cmake_build_type = 'Debug'
@@ -107,7 +109,6 @@ arch = host_machine.cpu_family()
 
 target = target_machine.cpu_family()
 
-
 subprojects_dir_relative = 'subprojects'
 subprojects_dir_absolute = meson.current_source_dir() / subprojects_dir_relative
 
@@ -131,6 +132,7 @@ elif arch == 'x86' or arch == 'x86_64'
   if cxx_compiler_id == 'msvc'
     add_project_arguments(['/arch:AVX2'], language: ['c','cpp'])
     # Note: C runtime library (/MT or /MD) is controlled by b_vscrt option
+    add_project_arguments(['/MD', '/Zc:__cplusplus'], language: ['c','cpp'] )
   else
     add_project_arguments(['-march=native'], language: ['c','cpp'])
     add_project_arguments(['-mavx2', '-mfma'], language: ['c','cpp'])
@@ -399,6 +401,10 @@ if get_option('enable-cublas')
   extra_defines += '-DUSE_CUBLAS=1'
 endif
 
+if get_option('enable-cuda')
+  extra_defines += '-DENABLE_CUDA=1'
+endif
+
 if get_option('enable-blas')
   extra_defines += '-DUSE_BLAS=1'
 
@@ -414,7 +420,7 @@ if get_option('enable-blas')
     openblas_dir_relative = subprojects_dir_relative / 'OpenBLAS'
     openblas_lib_dir_relative = windows_resource_dir_relative / 'OpenBLAS'
     openblas_include = include_directories(openblas_dir_relative, openblas_lib_dir_relative)
-    blas_dep = declare_dependency(include_directories: openblas_include, link_args:['openblas.lib'])
+    blas_dep = declare_dependency(include_directories: openblas_include, link_args:[meson.current_build_dir() / 'openblas.lib'])
   else
     blas_dep = dependency('openblas', required : false)
 
