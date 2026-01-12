@@ -25,6 +25,11 @@
 #include <profiler.h>
 #include <vector>
 
+#ifdef ENABLE_CUDA
+#include <cuda_context.h>
+#define DEBUG 1
+#endif
+
 #if defined(_WIN32)
 #define GET_SYSTEM_ALIGMENT()                                                  \
   ([]() -> size_t {                                                            \
@@ -176,6 +181,22 @@ void MemoryPool::allocate() {
   if (mem_pool != nullptr) {
     svm_allocation = true;
   }
+#ifdef DEBUG
+  std::cout << "[DEBUG] MemoryPool::allocate using OpenCL Device Memory, size="
+            << pool_size << std::endl;
+#endif
+
+#elif ENABLE_CUDA
+  auto *cuda_context =
+    static_cast<CudaContext *>(Engine::Global().getRegisteredContext("cuda"));
+  mem_pool = cuda_context->context_inst_.allocateDeviceMemory(pool_size);
+
+  if (mem_pool == nullptr) {
+    throw std::runtime_error("Failed to allocate SVM memory pool of size " +
+                             std::to_string(pool_size) + " bytes");
+  }
+#else
+  mem_pool = calloc(pool_size, 1);
 #endif
 
   if (mem_pool == nullptr)
@@ -274,6 +295,10 @@ void MemoryPool::deallocate() {
     } else {
       free(mem_pool);
     }
+#elif defined(ENABLE_CUDA)
+    auto *cuda_context =
+      static_cast<CudaContext *>(Engine::Global().getRegisteredContext("cuda"));
+    cuda_context->context_inst_.releaseDeviceMemory(mem_pool);
 #else
     free(mem_pool);
 #endif

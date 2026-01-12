@@ -23,6 +23,10 @@
 #include <dynamic_library_loader.h>
 #include <engine.h>
 
+#ifdef ENABLE_CUDA
+#include <cuda_context.h>
+#endif
+
 static std::string solib_suffix = ".so";
 static std::string contextlib_suffix = "context.so";
 static const std::string func_tag = "[Engine] ";
@@ -49,6 +53,12 @@ void Engine::add_default_object() {
   auto &cl_context = nntrainer::ClContext::Global();
 
   registerContext("gpu", &cl_context);
+#endif
+
+#ifdef ENABLE_CUDA
+  auto &cuda_context = nntrainer::CudaContext::Global();
+
+  registerContext("cuda", &cuda_context);
 #endif
 }
 
