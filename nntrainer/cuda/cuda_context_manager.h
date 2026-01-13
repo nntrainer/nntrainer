@@ -5,7 +5,7 @@
  * @file    cuda_context_manager.h
  * @date    11 Dec 2025
  * @see     https://github.com/nnstreamer/nntrainer
- * @author  Donghak Jung <dk11.jung@samsung.com>
+ * @author  Daekyoung Jung <dk11.jung@samsung.com>
  * @bug     No known bugs except for NYI items
  * @brief   CUDA wrapper for context management
  *

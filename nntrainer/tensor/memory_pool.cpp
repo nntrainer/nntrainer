@@ -181,10 +181,6 @@ void MemoryPool::allocate() {
   if (mem_pool != nullptr) {
     svm_allocation = true;
   }
-#ifdef DEBUG
-  std::cout << "[DEBUG] MemoryPool::allocate using OpenCL Device Memory, size="
-            << pool_size << std::endl;
-#endif
 
 #elif ENABLE_CUDA
   auto *cuda_context =
