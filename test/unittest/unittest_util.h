@@ -71,31 +71,6 @@ std::vector<float> generate_01_vector(const size_t size,
 void gemm_fp32_ref(const float *input, const float *weights, float *output,
                    unsigned int M, unsigned int N, unsigned int K);
 
-// Helper for Round to Nearest Even (RTE)
-int8_t round_half_to_even(float x);
-
-// CPU reference implementation for INT4 quantization
-void cpu_quantize_input_int8_pad(float *input, int8_t *quantized_input,
-                                 uint16_t *scales, unsigned int M,
-                                 unsigned int K,
-                                 unsigned int quantization_group_size);
-
-void printMatrixI(const char *name, float *data, int Y, int X);
-
-std::vector<float> generate_vector(const size_t size, float min_val,
-                                   float max_val);
-
-std::vector<float> generate_01_vector(const size_t size,
-                                      const float ones_ratio);
-
-// Standard FP32 GEMM for Reference
-// C = A * B
-// A: M x K
-// B: K x N
-// C: M x N
-void gemm_fp32_ref(const float *input, const float *weights, float *output,
-                   unsigned int M, unsigned int N, unsigned int K);
-
 } // namespace nntrainer
 
 #endif // NNTRAINER_UNITTEST_UTIL_H
