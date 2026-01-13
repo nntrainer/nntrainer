@@ -9,12 +9,14 @@
  *
  */
 
-#include "unittest_util.h"
 #if defined(ENABLE_OPENCL)
 #include <cl_context.h>
 #endif
 #include <engine.h>
 #include <fp16.h>
+#include <iostream>
+#include <random>
+#include <vector>
 
 namespace nntrainer {
 #if defined(ENABLE_OPENCL)

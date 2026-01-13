@@ -35,7 +35,7 @@
 
 #include "singleton.h"
 
-#include "cuda/cuda_context_manager.h"
+#include "cuda_context_manager.h"
 
 namespace nntrainer {
 

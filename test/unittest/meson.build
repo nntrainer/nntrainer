@@ -134,3 +134,6 @@ subdir('models')
 if get_option('enable-tflite-interpreter')
   subdir('integration_tests')
 endif
+if get_option('enable-cuda')
+  subdir('cuda')
+endif
