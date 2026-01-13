@@ -82,8 +82,10 @@ float applyTKP(float *logits, int len, float temperature, unsigned int top_k,
       logits[i] = logits[i] / temperature;
     top_indices_and_logits.push_back({i, logits[i]});
   }
-  sort(top_indices_and_logits.begin(), top_indices_and_logits.end(),
-       [](auto &a, auto &b) { return a.second > b.second; });
+  std::partial_sort(top_indices_and_logits.begin(),
+                    top_indices_and_logits.begin() + top_k,
+                    top_indices_and_logits.end(),
+                    [](auto &a, auto &b) { return a.second > b.second; });
 
   // Accumulate logits
   float cum_prob = 0;
@@ -94,7 +96,7 @@ float applyTKP(float *logits, int len, float temperature, unsigned int top_k,
   }
 
   // Apply Top-K and Top-P
-  std::fill_n(logits, sizeof(len), -INFINITY);
+  std::fill_n(logits, len, -INFINITY);
   for (unsigned int i = 0; i < top_index; ++i) {
     logits[top_indices_and_logits[i].first] = top_indices_and_logits[i].second;
   }
@@ -210,8 +212,10 @@ std::vector<int> generate_multi_tokens(
   for (unsigned int i = 0; i < NUM_VOCAB; ++i) {
     top_indices_and_logits.push_back({i, logits[i]});
   }
-  sort(top_indices_and_logits.begin(), top_indices_and_logits.end(),
-       [](auto &a, auto &b) { return a.second > b.second; });
+  std::partial_sort(top_indices_and_logits.begin(),
+                    top_indices_and_logits.begin() + NUM_TARGET_TOKENS,
+                    top_indices_and_logits.end(),
+                    [](auto &a, auto &b) { return a.second > b.second; });
 
   // add sampled words
   for (unsigned int i = 0; i < NUM_TARGET_TOKENS; ++i) {
