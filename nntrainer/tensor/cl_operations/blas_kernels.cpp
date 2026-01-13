@@ -1355,7 +1355,6 @@ void openvino_quantize_input_int4_pad(void *input, void *quantized_input, void *
   bool result = false;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  auto &clbuffInstance = ClBufferManager::Global();
   const bool scale_row_major = false;
   std::string compile_options =
     " -D SIZE_N=" + std::to_string(M) + " -D SIZE_K=" + std::to_string(K) +
