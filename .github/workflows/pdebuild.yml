@@ -43,6 +43,17 @@ jobs:
       with:
         ref: ${{ github.event.pull_request.head.sha }}
         fetch-depth: -${{ github.event.pull_request.commits }}
+    - name: Free disk space
+      run: |
+        echo "::group::Free disk space"
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /usr/local/share/boost
+        sudo apt-get clean
+        # Workaround for Azure CLI repo 403 error
+        sudo rm -f /etc/apt/sources.list.d/azure-cli.sources /etc/apt/sources.list.d/azure-cli.list || true
+        echo "::endgroup::"
     - name: Check if rebuild required
       uses: ./.github/actions/check-rebuild
       with:
