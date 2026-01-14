@@ -2,8 +2,8 @@
 // Created by donghak on 25. 12. 4..
 //
 
-#ifndef NNTRAINER_DEEPSEEK_V2_LITE_SLIM_CAUSALLM_H
-#define NNTRAINER_DEEPSEEK_V2_LITE_SLIM_CAUSALLM_H
+#ifndef NNTRAINER_DEEPSEEK_V2_LITE_CAUSALLM_H
+#define NNTRAINER_DEEPSEEK_V2_LITE_CAUSALLM_H
 #include <causal_lm.h>
 
 namespace causallm {
@@ -12,15 +12,16 @@ namespace causallm {
  * @class DeepseekV2ForCausalLM
  * @brief Mixture of Expert Layer for DeepSeek_V2_Lite
  */
-class DeepseekV2SlimCausalLM : public CausalLM {
+class DeepseekV2ForCausalLM : public CausalLM {
 public:
-  static constexpr const char *architecture = "DeepseekV2SlimCausalLM";
-  DeepseekV2SlimCausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
+  static constexpr const char *architecture = "DeepseekV2ForCausalLM";
+  DeepseekV2ForCausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
+    Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
     CausalLM(cfg, generation_cfg, nntr_cfg) {
     setupParameters(cfg, generation_cfg, nntr_cfg);
   }
 
-  virtual ~DeepseekV2SlimCausalLM() = default;
+  virtual ~DeepseekV2ForCausalLM() = default;
 
   /**
    * @brief MoE layer
@@ -84,7 +85,6 @@ private:
   float ROPE_SCALING_MSCALE_ALL_DIM;    /**< RoPE scaling mscale all dim */
   std::string ROPE_SCALING_TYPE;        /**< RoPE scaling type */
   unsigned int ROPE_SCALING_MAX_POSITION_EMBEDDINGS; /**< RoPE scaling max position embeddings */
-  float ROUTED_SCALING_FACTOR;                       /**< Routed scaling factor */
 
   // MLA specific parameters
   unsigned int Q_LORA_RANK;      /**< Q LoRA rank */
@@ -95,4 +95,4 @@ private:
 };
 
 } // namespace causallm
-#endif // NNTRAINER_DEEPSEEK_V2_LITE_SLIM_CAUSALLM_H
+#endif // NNTRAINER_DEEPSEEK_V2_LITE_CAUSALLM_H

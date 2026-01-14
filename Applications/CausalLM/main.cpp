@@ -30,17 +30,17 @@
 #include <factory.h>
 
 #include "causal_lm.h"
-#include "ernie_causallm.h"
 #include "gemma3_causallm.h"
 #include "gptoss_cached_slim_causallm.h"
 #include "gptoss_causallm.h"
+#include "deepseek_v2_lite_causallm.h"
+#include "deepseek_v2_lite_slim_causallm.h"
+#include "ernie4_5/ernie_causallm.h"
 #include "qwen2_causallm.h"
 #include "qwen3_cached_slim_moe_causallm.h"
 #include "qwen3_causallm.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
-#include "deepseek_v2_lite_causallm.h"
-#include "deepseek_v2_lite_slim_causallm.h"
 
 #include <atomic>
 #include <sys/resource.h>

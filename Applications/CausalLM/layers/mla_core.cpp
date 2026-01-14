@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * Copyright (C) 2025 Jijoong Moon <jijoong.moon@samsung.com>
+ * Copyright (C) 2025 Donghak Park <donghak.park@samsung.com>
  *
  * @file   mla_core.cpp
  * @date   03 December 2025
  * @see    https://github.com/nnstreamer/nntrainer
- * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @author Donghak Park <donghak.park@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This code implements the Multi-Head Latent Attention (MLA) core layer.
  */
@@ -22,6 +22,7 @@
 #include <mla_core.h>
 #include <nntrainer_error.h>
 #include <node_exporter.h>
+#include <engine.h>
 
 #include <cstdint>
 
@@ -271,7 +272,7 @@ void MLACoreLayer::one_batch_incremental_forwarding(
   unsigned int q_head_dim = qk_nope_dim + qk_rope_dim;
   unsigned int seq_len = to; 
   
-  auto &pool = nntrainer::ThreadPoolManager::Global().getThreadPool();
+  auto &pool = nntrainer::Engine::Global().getThreadPoolManager()->getThreadPool();
   std::vector<std::future<void>> futures;
 
   for (unsigned int h = 0; h < num_heads_Q; ++h) {

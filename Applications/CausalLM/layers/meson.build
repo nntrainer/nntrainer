@@ -9,6 +9,7 @@ causallm_embedding_src_abs = [meson.current_source_dir() / 'embedding_layer.cpp'
 causallm_reshaped_rms_norm_src_abs = [meson.current_source_dir() / 'reshaped_rms_norm.cpp']
 causallm_qkv_layer_src_abs = [meson.current_source_dir() / 'qkv_layer.cpp']
 causallm_embedding_pooling_src_abs = [meson.current_source_dir() / 'embedding_pooling_layer.cpp']
+causallm_mla_core_abs = [meson.current_source_dir() / 'mla_core.cpp']
 
 
 openmp_dep = dependency('openmp')
@@ -115,5 +116,35 @@ causallm_qkv_layer = shared_library(
 
 causallm_qkv_layer_dep = declare_dependency(
     link_with: causallm_qkv_layer,
+    include_directories: causallm_layer_inc
+)
+
+causallm_mla_core = shared_library(
+    'mla_core',
+    causallm_mla_core_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+
+causallm_mla_core_dep = declare_dependency(
+    link_with: causallm_mla_core,
+    include_directories: causallm_layer_inc
+)
+
+causallm_split_src_abs = [meson.current_source_dir() / 'causallm_split_layer.cpp']
+
+causallm_split_layer = shared_library(
+    'split_layer',
+    causallm_split_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+
+causallm_split_layer_dep = declare_dependency(
+    link_with: causallm_split_layer,
     include_directories: causallm_layer_inc
 )

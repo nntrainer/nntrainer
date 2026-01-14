@@ -1,26 +1,34 @@
-//
-// Created by donghak on 25. 12. 4..
-//
+// SPDX-License-Identifier: Apache-2.0
+/**
+ *
+ * @file   ernie_causallm.h
+ * @brief  ernie 4.5 causallm header
+ * @date   02 December 2025
+ * @see    https://github.com/nnstreamer/nntrainer
+ * @author Donghak Park <donghak.park@samsung.com>
+ * @bug    No known bugs except for NYI items
+ */
 
-#ifndef NNTRAINER_DEEPSEEK_V2_LITE_CAUSALLM_H
-#define NNTRAINER_DEEPSEEK_V2_LITE_CAUSALLM_H
+#ifndef NNTRAINER_ERNIE_CAUSALLM_H
+#define NNTRAINER_ERNIE_CAUSALLM_H
 #include <causal_lm.h>
 
 namespace causallm {
 
 /**
- * @class DeepseekV2ForCausalLM
- * @brief Mixture of Expert Layer for DeepSeek_V2_Lite
+ * @class Ernie4_5_MoeForCausalLM
+ * @brief Mixture of Expert Layer for ERNIE 4.5
  */
-class DeepseekV2ForCausalLM : public CausalLM {
+class Ernie4_5_MoeForCausalLM : public CausalLM {
 public:
-  static constexpr const char *architecture = "DeepseekV2ForCausalLM";
-  DeepseekV2ForCausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
+  static constexpr const char *architecture = "Ernie4_5_MoeForCausalLM";
+  Ernie4_5_MoeForCausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
+    Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM),
     CausalLM(cfg, generation_cfg, nntr_cfg) {
     setupParameters(cfg, generation_cfg, nntr_cfg);
   }
 
-  virtual ~DeepseekV2ForCausalLM() = default;
+  virtual ~Ernie4_5_MoeForCausalLM() = default;
 
   /**
    * @brief MoE layer
@@ -73,25 +81,10 @@ private:
   unsigned int NUM_SHARED_EXPERTS;    /**< Number of shared experts */
   unsigned int MOE_INTERMEDIATE_SIZE; /**< MoE intermediate size */
   float MOE_NORM_MIN;                 /**< MoE normalization minimum */
-  unsigned int NUM_GROUP_EXPERTS;     /**< Number of group experts */
-  bool NORM_TOPK_PROB;                /**< Normalize top-k probabilities */
 
   std::vector<std::string> LAYER_TYPES; /**< Layer types */
   float ATTENTION_ROPE_SCALING_FACTOR;  /**< Attention RoPE scaling factor */
-  float ROPE_SCALING_BETA_FAST;         /**< RoPE scaling beta fast */
-  float ROPE_SCALING_BETA_SLOW;         /**< RoPE scaling beta slow */
-  float ROPE_SCALING_MSCALE;            /**< RoPE scaling mscale */
-  float ROPE_SCALING_MSCALE_ALL_DIM;    /**< RoPE scaling mscale all dim */
-  std::string ROPE_SCALING_TYPE;        /**< RoPE scaling type */
-  unsigned int ROPE_SCALING_MAX_POSITION_EMBEDDINGS; /**< RoPE scaling max position embeddings */
-
-  // MLA specific parameters
-  unsigned int Q_LORA_RANK;      /**< Q LoRA rank */
-  unsigned int KV_LORA_RANK;     /**< KV LoRA rank */
-  unsigned int QK_NOPE_HEAD_DIM; /**< QK non-RoPE head dimension */
-  unsigned int QK_ROPE_HEAD_DIM; /**< QK RoPE head dimension */
-  unsigned int V_HEAD_DIM;       /**< Value head dimension */
 };
 
 } // namespace causallm
-#endif // NNTRAINER_DEEPSEEK_V2_LITE_CAUSALLM_H
+#endif // NNTRAINER_ERNIE_CAUSALLM_H

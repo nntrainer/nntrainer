@@ -1,15 +1,13 @@
 {
+    "model_type": "CausalLM",
     "model_tensor_type": "FP32-FP32",
     "model_file_name": "nntr_deepseek_v2_lite_moe.bin",
-
     "lora_rank": 0,
     "lora_alpha": 0,
     "lora_target": [],
-
     "fc_layer_dtype": "FP32",
     "embedding_dtype": "FP32",
     "lmhead_dtype": "FP32",
-
     "bad_word_ids": [],
     "fsu": false,
     "num_to_generate": 1024,
