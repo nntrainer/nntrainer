@@ -29,6 +29,11 @@
 #include <omp.h>
 #include <stdexcept>
 
+#include <chrono>
+using std::chrono::duration_cast;
+using std::chrono::high_resolution_clock;
+using std::chrono::nanoseconds;
+
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -303,13 +308,20 @@ void CachedSlimGptOssMoELayer::incremental_forwarding(
     int hit_count = 0;
     int miss_count = 0;
 
+#ifdef DEBUG
+    auto t1_miss = high_resolution_clock::now();
+    auto t2_miss = high_resolution_clock::now();
+    auto t1_hit = high_resolution_clock::now();
+    auto t2_hit = high_resolution_clock::now();
+#endif
+
 #pragma omp parallel for schedule(dynamic)
     for (int expert_idx : target_idx_vector) {
       const auto &assignments = expert_assignments[expert_idx];
       if (need_load[expert_idx]) {
 
 #ifdef DEBUG
-        auto t1_miss = high_resolution_clock::now();
+        t1_miss = high_resolution_clock::now();
 #endif
 
         context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
@@ -337,12 +349,12 @@ void CachedSlimGptOssMoELayer::incremental_forwarding(
           context.getWeight(expert_up_bias_indices[expert_idx]),
           context.getWeight(expert_down_bias_indices[expert_idx]), hidden_size);
 #ifdef DEBUG
-        auto t2_miss = high_resolution_clock::now();
+        t2_miss = high_resolution_clock::now();
 #endif
       } else {
 
 #ifdef DEBUG
-        auto t1_hit = high_resolution_clock::now();
+        t1_hit = high_resolution_clock::now();
 #endif
         {
           std::lock_guard<std::mutex> lock(cache_mutex);
@@ -359,7 +371,7 @@ void CachedSlimGptOssMoELayer::incremental_forwarding(
           context.getWeight(expert_down_bias_indices[expert_idx]), hidden_size);
 
 #ifdef DEBUG
-        auto t2_hit = high_resolution_clock::now();
+        t2_hit = high_resolution_clock::now();
 #endif
       }
     }
@@ -430,7 +442,7 @@ void CachedSlimGptOssMoELayer::incremental_forwarding(
               << "miss_compute: " << dt_miss.count() / 1'000'000 << " ms "
               << "\t| "
               << "evict_time: " << dt_evict.count() / 1'000'000 << " ms "
-              << "\t| " std::cout << std::endl;
+              << "\t| " << std::endl;
 #endif
   }
 }

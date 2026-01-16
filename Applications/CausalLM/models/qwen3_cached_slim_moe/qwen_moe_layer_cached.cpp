@@ -34,10 +34,7 @@
 #include <chrono>
 using std::chrono::duration_cast;
 using std::chrono::high_resolution_clock;
-using std::chrono::microseconds; // or microseconds
-using std::chrono::milliseconds; // or microseconds
-using std::chrono::nanoseconds;  // or microseconds
-using std::chrono::seconds;      // or microseconds
+using std::chrono::nanoseconds;
 
 namespace causallm {
 
@@ -373,13 +370,20 @@ void CachedSlimMoELayer::incremental_forwarding(
     int hit_count = 0;
     int miss_count = 0;
 
+#ifdef DEBUG
+    auto t1_miss = high_resolution_clock::now();
+    auto t2_miss = t1_miss;
+    auto t1_hit = high_resolution_clock::now();
+    auto t2_hit = t1_hit;
+#endif
+
 #pragma omp parallel for schedule(dynamic)
     for (int expert_idx : target_idx_vector) {
       const auto &assignments = expert_assignments[expert_idx];
       if (need_load[expert_idx]) {
 
 #ifdef DEBUG
-        auto t1_miss = high_resolution_clock::now();
+        t1_miss = high_resolution_clock::now();
 #endif
 
         context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
@@ -400,12 +404,12 @@ void CachedSlimMoELayer::incremental_forwarding(
           context.getWeight(expert_up_proj_indices[expert_idx]),
           context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
 #ifdef DEBUG
-        auto t2_miss = high_resolution_clock::now();
+        t2_miss = high_resolution_clock::now();
 #endif
       } else {
 
 #ifdef DEBUG
-        auto t1_hit = high_resolution_clock::now();
+        t1_hit = high_resolution_clock::now();
 #endif
         {
           std::lock_guard<std::mutex> lock(cache_mutex);
@@ -419,7 +423,7 @@ void CachedSlimMoELayer::incremental_forwarding(
           context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
 
 #ifdef DEBUG
-        auto t2_hit = high_resolution_clock::now();
+        t2_hit = high_resolution_clock::now();
 #endif
       }
     }
