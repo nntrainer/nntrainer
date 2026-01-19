@@ -34,6 +34,8 @@ The committers are:
 * Junbong Yu @junbong-yu
 * HyeongGwon Hong @h0g1
 * Joonseok Oh @jayden0701
+* Jaemin Shin @jaemini-shin
+* Jiyoung Lee @dlwlzzero
 
 ## Merging a pull-request
 
