@@ -624,6 +624,16 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z);
 void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha);
 
 /**
+ * @brief tanh_gelu function : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X +
+ * 0.044715 * X^3)))
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+void tanh_gelu(const unsigned int N, const float *X, float *Y);
+
+/**
  * @brief returns maximum value of the vector X
  *
  * @param N number of elements in X

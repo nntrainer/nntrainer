@@ -12,6 +12,7 @@
  */
 
 #include <assert.h>
+#include <cmath>
 #include <fallback_internal.h>
 #include <nntrainer_error.h>
 
@@ -194,6 +195,14 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z) {
 
 void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha) {
   __fallback_swiglu(N, X, Y, Z, alpha);
+}
+
+void tanh_gelu(const unsigned int N, const float *X, float *Y) {
+  for (unsigned int i = 0; i < N; ++i) {
+    float x = X[i];
+    Y[i] = 0.5f * x *
+           (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+  }
 }
 
 float max_val(const unsigned int N, float *X) { return __fallback_max(N, X); }

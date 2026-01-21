@@ -478,14 +478,8 @@ public:
    */
   template <typename T = float>
   static Tensor &tanhGelu(Tensor const &t_in, Tensor &t_out) {
-    t_in.apply<T>(
-      [&](T x) {
-        return static_cast<T>(
-          0.5 * x *
-          (1 + tanhFloat<T>(
-                 static_cast<T>(sqrt(2 / M_PI) * (x + 0.044715 * pow(x, 3))))));
-      },
-      t_out);
+    nntrainer::tanh_gelu(t_in.size(), t_in.getData<float>(),
+                         t_out.getData<float>());
     return t_out;
   }
 

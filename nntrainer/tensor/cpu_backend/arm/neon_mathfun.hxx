@@ -40,6 +40,10 @@
 typedef uint32x4_t v4su; // vector of 4 uint32
 typedef int32x4_t v4si;  // vector of 4 uint32
 
+#ifdef ARMV7
+#include <armv7_neon.h>
+#endif
+
 #define c_inv_mant_mask ~0x7f800000u
 #define c_cephes_SQRTHF 0.707106781186547524
 #define c_cephes_log_p0 7.0376836292E-2
@@ -63,7 +67,7 @@ typedef int32x4_t v4si;  // vector of 4 uint32
  * @param x input register variable
  * @return v4sf
  */
-v4sf log_ps(v4sf x) {
+inline v4sf log_ps(v4sf x) {
   v4sf one = vdupq_n_f32(1);
 
   x = vmaxq_f32(x, vdupq_n_f32(0)); /* force flush to zero on denormal values */
@@ -154,7 +158,7 @@ v4sf log_ps(v4sf x) {
  * @param x input register variable
  * @return v4sf
  */
-v4sf exp_ps(v4sf x) {
+inline v4sf exp_ps(v4sf x) {
   v4sf tmp, fx;
 
   v4sf one = vdupq_n_f32(1);
@@ -247,7 +251,7 @@ v4sf exp_ps(v4sf x) {
  * @param x input register variable
  * @return v4sf
  */
-void sincos_ps(v4sf x, v4sf *ysin, v4sf *ycos) { // any x
+inline void sincos_ps(v4sf x, v4sf *ysin, v4sf *ycos) { // any x
   v4sf xmm1, xmm2, xmm3, y;
 
   v4su emm2;
@@ -320,7 +324,7 @@ void sincos_ps(v4sf x, v4sf *ysin, v4sf *ycos) { // any x
  * @param x input register variable
  * @return v4sf
  */
-v4sf sin_ps(v4sf x) {
+inline v4sf sin_ps(v4sf x) {
   v4sf ysin, ycos;
   sincos_ps(x, &ysin, &ycos);
   return ysin;
@@ -332,10 +336,29 @@ v4sf sin_ps(v4sf x) {
  * @param x input register variable
  * @return v4sf
  */
-v4sf cos_ps(v4sf x) {
+inline v4sf cos_ps(v4sf x) {
   v4sf ysin, ycos;
   sincos_ps(x, &ysin, &ycos);
   return ycos;
+}
+
+/**
+ * @brief tanh function with simd
+ *
+ * @param x input register variable
+ * @return v4sf
+ */
+inline v4sf tanh_ps(v4sf x) {
+  v4sf one = vdupq_n_f32(1.0f);
+  v4sf two = vdupq_n_f32(2.0f);
+  v4sf minus_one = vdupq_n_f32(-1.0f);
+
+  v4sf y = vmulq_f32(x, two);
+  y = exp_ps(y);
+  v4sf num = vsubq_f32(y, one);
+  v4sf den = vaddq_f32(y, one);
+  v4sf res = vdivq_f32(num, den);
+  return res;
 }
 
 #endif
