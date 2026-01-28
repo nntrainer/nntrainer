@@ -4,6 +4,7 @@ if get_option('enable-cuda')
     ['unittest_quantize_cuda', ['../unittest_util.cpp']],
     ['unittest_int4_utils_cuda', []],
     ['unittest_gemm_fp32_qint4_comparison', ['../unittest_util.cpp']],
+    ['unittest_rope_reference', ['../unittest_util.cpp']],
   ]
 
   foreach target : cuda_test_target

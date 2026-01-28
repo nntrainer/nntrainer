@@ -2,6 +2,7 @@ cuda_sources = [
   'cuda_context_manager.cpp',
   'cuda_util.cpp',
   'custom_dot_wrapper_cuda.cpp',
+  'rope_reference.cpp',
 ]
 
 cuda_headers = [
@@ -11,6 +12,8 @@ cuda_headers = [
   'gemm_int4_cuda.h',
   'dequantize_cuda.h',
   'quantize_cuda.h',
+  'rope_reference.h',
+  'rope.h',
 ]
 
 foreach s : cuda_sources
@@ -21,7 +24,8 @@ if get_option('enable-cuda')
   cuda_sources_cu = [
     'gemm_int4_cuda.cu',
     'quantize_cuda.cu',
-    'dequantize_cuda.cu'
+    'dequantize_cuda.cu',
+    'rope.cu',
   ]
 
   nvcc = find_program('nvcc', required: true)
