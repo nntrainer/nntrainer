@@ -3,6 +3,7 @@ cuda_sources = [
   'cuda_util.cpp',
   'custom_dot_wrapper_cuda.cpp',
   'rope_reference.cpp',
+  'mha_cpu_ref.cpp',
 ]
 
 cuda_headers = [
@@ -14,6 +15,8 @@ cuda_headers = [
   'quantize_cuda.h',
   'rope_reference.h',
   'rope.h',
+  'mha_cpu_ref.h',
+  'mha_cuda.h',
 ]
 
 foreach s : cuda_sources
@@ -26,6 +29,7 @@ if get_option('enable-cuda')
     'quantize_cuda.cu',
     'dequantize_cuda.cu',
     'rope.cu',
+    'mha_cuda.cu',
   ]
 
   nvcc = find_program('nvcc', required: true)
