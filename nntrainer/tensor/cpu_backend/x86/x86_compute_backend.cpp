@@ -352,6 +352,32 @@ void tanh_gelu_v2_unrolledx4(const unsigned int N, const float *X, float *Y) {
   }
 }
 
+
+void tanh_gelu_v3(const unsigned int N, const float *X, float *Y) {
+  for (unsigned int i = 0; i < N; ++i) {
+    float x = X[i];
+    Y[i] = 0.5f * x *
+           (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+  }
+}
+
+void tanh_gelu_v3_unrolledx2(const unsigned int N, const float *X, float *Y) {
+  for (unsigned int i = 0; i < N; ++i) {
+    float x = X[i];
+    Y[i] = 0.5f * x *
+           (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+  }
+}
+
+void tanh_gelu_v3_unrolledx4(const unsigned int N, const float *X, float *Y) {
+  for (unsigned int i = 0; i < N; ++i) {
+    float x = X[i];
+    Y[i] = 0.5f * x *
+           (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+  }
+}
+
+
 void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z) {
   for (unsigned int i = 0; i < N; ++i) {
     float y = Y[i];
@@ -371,6 +397,15 @@ void tanh_gelu_v2_mul_unrolledx2(const unsigned int N, float *X, float *Y, float
 }
 
 void tanh_gelu_v2_mul_unrolledx4(const unsigned int N, float *X, float *Y, float *Z) {
+  for (unsigned int i = 0; i < N; ++i) {
+    float y = Y[i];
+    float z = Z[i];
+    X[i] = 0.5f * y *
+           (1.0f + std::tanh(0.7978845608f * (y + 0.044715f * y * y * y))) * z;
+  }
+}
+
+void tanh_gelu_v3_mul(const unsigned int N, float *X, float *Y, float *Z) {
   for (unsigned int i = 0; i < N; ++i) {
     float y = Y[i];
     float z = Z[i];

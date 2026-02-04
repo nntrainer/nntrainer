@@ -771,6 +771,39 @@ extern void tanh_gelu_v2_unrolledx2(const unsigned int N, const float *X, float 
 extern void tanh_gelu_v2_unrolledx4(const unsigned int N, const float *X, float *Y);
 
 /**
+ * @brief tanh_gelu function with neon but with polynomial approximation
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+
+ 
+extern void tanh_gelu_v3(const unsigned int N, const float *X, float *Y);
+
+/**
+ * @brief tanh_gelu function with neon but with polynomial approximation
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+
+ 
+extern void tanh_gelu_v3_unrolledx2(const unsigned int N, const float *X, float *Y);
+
+/**
+ * @brief tanh_gelu function with neon but with polynomial approximation
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+
+ 
+extern void tanh_gelu_v3_unrolledx4(const unsigned int N, const float *X, float *Y);
+
+/**
  * @brief tanh_gelu function with neon but as : X = Y / (1 + exp(-pi/4*(Y + 0.04
  * 4715Y^3)) * Z 
  *
@@ -779,6 +812,8 @@ extern void tanh_gelu_v2_unrolledx4(const unsigned int N, const float *X, float 
  * @param Y float * for Vector Y (input)
  * @param Z float * for Vector Z (input)
  */
+
+
 
  
 extern void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z);
@@ -809,6 +844,20 @@ extern void tanh_gelu_v2_mul_unrolledx2(const unsigned int N, float *X, float *Y
  
 extern void tanh_gelu_v2_mul_unrolledx4(const unsigned int N, float *X, float *Y, float *Z);
 
+/**
+ * @brief tanh_gelu function with neon but as : X = Y / (1 + exp(-pi/4*(Y + 0.04
+ * 4715Y^3)) * Z 
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (output)
+ * @param Y float * for Vector Y (input)
+ * @param Z float * for Vector Z (input)
+ */
+
+
+
+ 
+extern void tanh_gelu_v3_mul(const unsigned int N, float *X, float *Y, float *Z);
 
 /**
  * @brief returns maximum value of the vector X
