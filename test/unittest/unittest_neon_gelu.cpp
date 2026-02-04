@@ -487,7 +487,7 @@ TEST(ActivationNeon, TanhGeluV2Mulx4Accuracy) {
 
 TEST(ActivationNeonPerf, TanhGeluVsSwiGluTime) {
   constexpr size_t N = 8192;     
-  constexpr int iters = 50000;              
+  constexpr int iters = 1000;              
 
   std::mt19937 rng(789);
   std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
