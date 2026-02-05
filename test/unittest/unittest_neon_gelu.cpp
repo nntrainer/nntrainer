@@ -17,7 +17,7 @@
  * @brief	This is the unittest code for several kernels for activation function
  * @see		https://github.com/nntrainer/
  * @author	h0g1 <h0g1.hong@samsung.com>
- * @bug		No known bugs except for NYI items
+ * @bug		No known bugs
  *
  */
 #include <gtest/gtest.h>
@@ -30,14 +30,11 @@
 #include <random>
 #include <vector>
 
-
 #include <cpu_backend.h> // tanh_gelu, swiglu
 
 namespace {
 
 static inline float ref_tanh_gelu(float x) {
-  // Official formula of tanh_gelu
-  // 0.5 * X * (1 + tanh(sqrt(2/pi) * (X + 0.044715 * X^3)))
   const float half = 0.5f;
   const float c = 0.044715f;
   const float k = 0.7978845608f; // sqrt(2/pi)
@@ -46,8 +43,6 @@ static inline float ref_tanh_gelu(float x) {
 }
 
 static inline float ref_tanh_gelu_mul(float x, float y) {
-  // Official formula of tanh_gelu
-  // 0.5 * X * (1 + tanh(sqrt(2/pi) * (X + 0.044715 * X^3)))
   const float half = 0.5f;
   const float c = 0.044715f;
   const float k = 0.7978845608f; // sqrt(2/pi)
@@ -56,21 +51,17 @@ static inline float ref_tanh_gelu_mul(float x, float y) {
 }
 
 static inline float ref_swiglu(float y, float z, float alpha) {
-  // (y / (1 + exp(-alpha*y))) * z
   float denom = 1.0f + std::exp(-alpha * y);
-  return (y / denom) * z ;
+  return (y / denom) * z;
 }
 
 static inline float abs_err(float a, float b) { return std::fabs(a - b); }
 
-
-static inline void expect_close(float got, float ref,
-                                float abs_tol, float rel_tol) {
+static inline void expect_close(float got, float ref, float abs_tol,
+                                float rel_tol) {
   float ae = abs_err(got, ref);
-  EXPECT_TRUE(ae <= abs_tol)
-      << "got=" << got << " ref=" << ref
-      << " abs_err=" << ae
-      << " abs_tol=" << abs_tol;
+  EXPECT_TRUE(ae <= abs_tol) << "got=" << got << " ref=" << ref
+                             << " abs_err=" << ae << " abs_tol=" << abs_tol;
 }
 
 } // namespace
@@ -79,19 +70,19 @@ TEST(ActivationNeon, TanhGeluAccuracy) {
   constexpr size_t N = 4096;
 
   std::mt19937 rng(123);
-  //Input Range
   std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
 
   std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i) x[i] = dist(rng);
+  for (size_t i = 0; i < N; ++i)
+    x[i] = dist(rng);
 
-
-  nntrainer::tanh_gelu(static_cast<unsigned int>(N), x.data(), y.data()); 
+  nntrainer::tanh_gelu(static_cast<unsigned int>(N), x.data(), y.data());
 
   // Reference
-  for (size_t i = 0; i < N; ++i) y_ref[i] = ref_tanh_gelu(x[i]);
+  for (size_t i = 0; i < N; ++i)
+    y_ref[i] = ref_tanh_gelu(x[i]);
 
-  //Tolerance, use abs_tol only now
+  // Tolerance, use abs_tol only now
   const float abs_tol = 1e-5f;
   const float rel_tol = 1e-5f;
 
@@ -109,15 +100,18 @@ TEST(ActivationNeon, TanhGelux2Accuracy) {
   std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
 
   std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i) x[i] = dist(rng);
+  for (size_t i = 0; i < N; ++i)
+    x[i] = dist(rng);
 
   // DUT
-  nntrainer::tanh_gelu_unrolledx2(static_cast<unsigned int>(N), x.data(), y.data()); // 3
+  nntrainer::tanh_gelu_unrolledx2(static_cast<unsigned int>(N), x.data(),
+                                  y.data()); // 3
 
   // Reference
-  for (size_t i = 0; i < N; ++i) y_ref[i] = ref_tanh_gelu(x[i]);
+  for (size_t i = 0; i < N; ++i)
+    y_ref[i] = ref_tanh_gelu(x[i]);
 
-  //Tolerance
+  // Tolerance
   const float abs_tol = 1e-5f;
   const float rel_tol = 1e-5f;
 
@@ -135,13 +129,16 @@ TEST(ActivationNeon, TanhGelux4Accuracy) {
   std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
 
   std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i) x[i] = dist(rng);
+  for (size_t i = 0; i < N; ++i)
+    x[i] = dist(rng);
 
   // DUT
-  nntrainer::tanh_gelu_unrolledx4(static_cast<unsigned int>(N), x.data(), y.data()); // 3
+  nntrainer::tanh_gelu_unrolledx4(static_cast<unsigned int>(N), x.data(),
+                                  y.data()); // 3
 
   // Reference
-  for (size_t i = 0; i < N; ++i) y_ref[i] = ref_tanh_gelu(x[i]);
+  for (size_t i = 0; i < N; ++i)
+    y_ref[i] = ref_tanh_gelu(x[i]);
 
   // Tolerance
   const float abs_tol = 1e-5f;
@@ -161,13 +158,16 @@ TEST(ActivationNeon, TanhGeluv2Accuracy) {
   std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
 
   std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i) x[i] = dist(rng);
+  for (size_t i = 0; i < N; ++i)
+    x[i] = dist(rng);
 
   // DUT
-  nntrainer::tanh_gelu_v2(static_cast<unsigned int>(N), x.data(), y.data()); // 3
+  nntrainer::tanh_gelu_v2(static_cast<unsigned int>(N), x.data(),
+                          y.data()); // 3
 
   // Reference
-  for (size_t i = 0; i < N; ++i) y_ref[i] = ref_tanh_gelu(x[i]);
+  for (size_t i = 0; i < N; ++i)
+    y_ref[i] = ref_tanh_gelu(x[i]);
 
   // Tolerance
   const float abs_tol = 1e-5f;
@@ -187,13 +187,16 @@ TEST(ActivationNeon, TanhGeluv2x2Accuracy) {
   std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
 
   std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i) x[i] = dist(rng);
+  for (size_t i = 0; i < N; ++i)
+    x[i] = dist(rng);
 
   // DUT
-  nntrainer::tanh_gelu_v2_unrolledx2(static_cast<unsigned int>(N), x.data(), y.data()); // 3
+  nntrainer::tanh_gelu_v2_unrolledx2(static_cast<unsigned int>(N), x.data(),
+                                     y.data()); // 3
 
   // Reference
-  for (size_t i = 0; i < N; ++i) y_ref[i] = ref_tanh_gelu(x[i]);
+  for (size_t i = 0; i < N; ++i)
+    y_ref[i] = ref_tanh_gelu(x[i]);
 
   // Tolerance
   const float abs_tol = 1e-5f;
@@ -213,13 +216,16 @@ TEST(ActivationNeon, TanhGeluv2x4Accuracy) {
   std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
 
   std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i) x[i] = dist(rng);
+  for (size_t i = 0; i < N; ++i)
+    x[i] = dist(rng);
 
   // DUT
-  nntrainer::tanh_gelu_v2_unrolledx4(static_cast<unsigned int>(N), x.data(), y.data()); // 3
+  nntrainer::tanh_gelu_v2_unrolledx4(static_cast<unsigned int>(N), x.data(),
+                                     y.data()); // 3
 
   // Reference
-  for (size_t i = 0; i < N; ++i) y_ref[i] = ref_tanh_gelu(x[i]);
+  for (size_t i = 0; i < N; ++i)
+    y_ref[i] = ref_tanh_gelu(x[i]);
 
   // Tolerance
   const float abs_tol = 1e-5f;
@@ -239,13 +245,16 @@ TEST(ActivationNeon, TanhGeluv3Accuracy) {
   std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
 
   std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i) x[i] = dist(rng);
+  for (size_t i = 0; i < N; ++i)
+    x[i] = dist(rng);
 
   // DUT
-  nntrainer::tanh_gelu_v3(static_cast<unsigned int>(N), x.data(), y.data()); // 3
+  nntrainer::tanh_gelu_v3(static_cast<unsigned int>(N), x.data(),
+                          y.data()); // 3
 
   // Reference
-  for (size_t i = 0; i < N; ++i) y_ref[i] = ref_tanh_gelu(x[i]);
+  for (size_t i = 0; i < N; ++i)
+    y_ref[i] = ref_tanh_gelu(x[i]);
 
   // Tolerance
   const float abs_tol = 3e-5f;
@@ -265,13 +274,16 @@ TEST(ActivationNeon, TanhGeluv3x2Accuracy) {
   std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
 
   std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i) x[i] = dist(rng);
+  for (size_t i = 0; i < N; ++i)
+    x[i] = dist(rng);
 
   // DUT
-  nntrainer::tanh_gelu_v3_unrolledx2(static_cast<unsigned int>(N), x.data(), y.data()); // 3
+  nntrainer::tanh_gelu_v3_unrolledx2(static_cast<unsigned int>(N), x.data(),
+                                     y.data()); // 3
 
   // Reference
-  for (size_t i = 0; i < N; ++i) y_ref[i] = ref_tanh_gelu(x[i]);
+  for (size_t i = 0; i < N; ++i)
+    y_ref[i] = ref_tanh_gelu(x[i]);
 
   // Tolerance
   const float abs_tol = 3e-5f;
@@ -283,7 +295,6 @@ TEST(ActivationNeon, TanhGeluv3x2Accuracy) {
   }
 }
 
-
 TEST(ActivationNeon, TanhGeluv3x4Accuracy) {
   constexpr size_t N = 4096;
 
@@ -292,13 +303,16 @@ TEST(ActivationNeon, TanhGeluv3x4Accuracy) {
   std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
 
   std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i) x[i] = dist(rng);
+  for (size_t i = 0; i < N; ++i)
+    x[i] = dist(rng);
 
   // DUT
-  nntrainer::tanh_gelu_v3_unrolledx4(static_cast<unsigned int>(N), x.data(), y.data()); // 3
+  nntrainer::tanh_gelu_v3_unrolledx4(static_cast<unsigned int>(N), x.data(),
+                                     y.data()); // 3
 
   // Reference
-  for (size_t i = 0; i < N; ++i) y_ref[i] = ref_tanh_gelu(x[i]);
+  for (size_t i = 0; i < N; ++i)
+    y_ref[i] = ref_tanh_gelu(x[i]);
 
   // Tolerance
   const float abs_tol = 3e-5f;
@@ -314,7 +328,7 @@ TEST(ActivationNeon, SwiGluAccuracy) {
   constexpr size_t N = 4096;
 
   std::mt19937 rng(456);
-  //Input Range
+  // Input Range
   std::uniform_real_distribution<float> dist_y(-10.0f, 10.0f);
   std::uniform_real_distribution<float> dist_z(-10.0f, 10.0f);
 
@@ -326,15 +340,17 @@ TEST(ActivationNeon, SwiGluAccuracy) {
   }
 
   const float alpha = 1.0f; // Parametrize it if necessary
-  nntrainer::swiglu(static_cast<unsigned int>(N), x.data(), y.data(), z.data(), alpha); // 4
+  nntrainer::swiglu(static_cast<unsigned int>(N), x.data(), y.data(), z.data(),
+                    alpha); // 4
 
-  for (size_t i = 0; i < N; ++i) x_ref[i] = ref_swiglu(y[i], z[i], alpha);
+  for (size_t i = 0; i < N; ++i)
+    x_ref[i] = ref_swiglu(y[i], z[i], alpha);
 
-  //Tolerance
+  // Tolerance
   const float abs_tol = 1e-5f;
   const float rel_tol = 1e-5f;
-  
-  //Test for each case
+
+  // Test for each case
   for (size_t i = 0; i < N; ++i) {
     expect_close(x[i], x_ref[i], abs_tol, rel_tol);
   }
@@ -355,9 +371,11 @@ TEST(ActivationNeon, SwiGlux2Accuracy) {
   }
 
   const float alpha = 1.0f; // Parametrize it if necessary
-  nntrainer::swiglu_unrolledx2(static_cast<unsigned int>(N), x.data(), y.data(), z.data(), alpha); // 4
+  nntrainer::swiglu_unrolledx2(static_cast<unsigned int>(N), x.data(), y.data(),
+                               z.data(), alpha); // 4
 
-  for (size_t i = 0; i < N; ++i) x_ref[i] = ref_swiglu(y[i], z[i], alpha);
+  for (size_t i = 0; i < N; ++i)
+    x_ref[i] = ref_swiglu(y[i], z[i], alpha);
 
   // Tolerance
   const float abs_tol = 1e-5f;
@@ -383,9 +401,11 @@ TEST(ActivationNeon, SwiGlux4Accuracy) {
   }
 
   const float alpha = 1.0f; // Parametrize it if necessary
-  nntrainer::swiglu_unrolledx4(static_cast<unsigned int>(N), x.data(), y.data(), z.data(), alpha); // 4
+  nntrainer::swiglu_unrolledx4(static_cast<unsigned int>(N), x.data(), y.data(),
+                               z.data(), alpha); // 4
 
-  for (size_t i = 0; i < N; ++i) x_ref[i] = ref_swiglu(y[i], z[i], alpha);
+  for (size_t i = 0; i < N; ++i)
+    x_ref[i] = ref_swiglu(y[i], z[i], alpha);
 
   // Tolerance
   const float abs_tol = 1e-5f;
@@ -400,7 +420,7 @@ TEST(ActivationNeon, TanhGeluV2MulAccuracy) {
   constexpr size_t N = 4096;
 
   std::mt19937 rng(456);
-  //Input Range
+  // Input Range
   std::uniform_real_distribution<float> dist_y(-10.0f, 10.0f);
   std::uniform_real_distribution<float> dist_z(-10.0f, 10.0f);
 
@@ -411,15 +431,17 @@ TEST(ActivationNeon, TanhGeluV2MulAccuracy) {
     z[i] = dist_z(rng);
   }
 
-  nntrainer::tanh_gelu_v2_mul(static_cast<unsigned int>(N), x.data(), y.data(), z.data()); 
+  nntrainer::tanh_gelu_v2_mul(static_cast<unsigned int>(N), x.data(), y.data(),
+                              z.data());
 
-  for (size_t i = 0; i < N; ++i) x_ref[i] = ref_tanh_gelu_mul(y[i], z[i]);
+  for (size_t i = 0; i < N; ++i)
+    x_ref[i] = ref_tanh_gelu_mul(y[i], z[i]);
 
-  //Tolerance
+  // Tolerance
   const float abs_tol = 1e-5f;
   const float rel_tol = 1e-5f;
-  
-  //Test for each case
+
+  // Test for each case
   for (size_t i = 0; i < N; ++i) {
     expect_close(x[i], x_ref[i], abs_tol, rel_tol);
   }
@@ -429,7 +451,7 @@ TEST(ActivationNeon, TanhGeluV2Mulx2Accuracy) {
   constexpr size_t N = 4096;
 
   std::mt19937 rng(456);
-  //Input Range
+  // Input Range
   std::uniform_real_distribution<float> dist_y(-10.0f, 10.0f);
   std::uniform_real_distribution<float> dist_z(-10.0f, 10.0f);
 
@@ -440,15 +462,17 @@ TEST(ActivationNeon, TanhGeluV2Mulx2Accuracy) {
     z[i] = dist_z(rng);
   }
 
-  nntrainer::tanh_gelu_v2_mul_unrolledx2(static_cast<unsigned int>(N), x.data(), y.data(), z.data()); 
+  nntrainer::tanh_gelu_v2_mul_unrolledx2(static_cast<unsigned int>(N), x.data(),
+                                         y.data(), z.data());
 
-  for (size_t i = 0; i < N; ++i) x_ref[i] = ref_tanh_gelu_mul(y[i], z[i]);
+  for (size_t i = 0; i < N; ++i)
+    x_ref[i] = ref_tanh_gelu_mul(y[i], z[i]);
 
-  //Tolerance
+  // Tolerance
   const float abs_tol = 1e-5f;
   const float rel_tol = 1e-5f;
-  
-  //Test for each case
+
+  // Test for each case
   for (size_t i = 0; i < N; ++i) {
     expect_close(x[i], x_ref[i], abs_tol, rel_tol);
   }
@@ -458,7 +482,7 @@ TEST(ActivationNeon, TanhGeluV2Mulx4Accuracy) {
   constexpr size_t N = 4096;
 
   std::mt19937 rng(456);
-  //Input Range
+  // Input Range
   std::uniform_real_distribution<float> dist_y(-10.0f, 10.0f);
   std::uniform_real_distribution<float> dist_z(-10.0f, 10.0f);
 
@@ -469,50 +493,52 @@ TEST(ActivationNeon, TanhGeluV2Mulx4Accuracy) {
     z[i] = dist_z(rng);
   }
 
-  nntrainer::tanh_gelu_v2_mul_unrolledx4(static_cast<unsigned int>(N), x.data(), y.data(), z.data()); 
+  nntrainer::tanh_gelu_v2_mul_unrolledx4(static_cast<unsigned int>(N), x.data(),
+                                         y.data(), z.data());
 
-  for (size_t i = 0; i < N; ++i) x_ref[i] = ref_tanh_gelu_mul(y[i], z[i]);
+  for (size_t i = 0; i < N; ++i)
+    x_ref[i] = ref_tanh_gelu_mul(y[i], z[i]);
 
-  //Tolerance
+  // Tolerance
   const float abs_tol = 1e-5f;
   const float rel_tol = 1e-5f;
-  
-  //Test for each case
+
+  // Test for each case
   for (size_t i = 0; i < N; ++i) {
     expect_close(x[i], x_ref[i], abs_tol, rel_tol);
   }
 }
 
-
-
 TEST(ActivationNeonPerf, TanhGeluVsSwiGluTime) {
-  constexpr size_t N = 8192;     
-  constexpr int iters = 1000;              
+  constexpr size_t N = 8192;
+  constexpr int iters = 1000;
 
   std::mt19937 rng(789);
   std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
   std::uniform_real_distribution<float> distz(-5.0f, 5.0f);
 
-  std::vector<float> x(N*iters), y(N*iters), z(N*iters), r(N*iters), out(N*iters);
-  std::vector<float> x_d(N*iters), y_d(N*iters), z_d(N*iters), r_d(N*iters), out_d(N*iters);
+  std::vector<float> x(N * iters), y(N * iters), z(N * iters), r(N * iters),
+    out(N * iters);
+  std::vector<float> x_d(N * iters), y_d(N * iters), z_d(N * iters),
+    r_d(N * iters), out_d(N * iters);
 
   std::vector<std::vector<float>> inputs;
-  
-  //Input data
+
+  // Input data
   float *px = x.data();
   float *py = y.data();
   float *pz = z.data();
   float *pr = r.data();
   float *pout = out.data();
 
-  //Dummy data for fair comparison of kernel execution time
+  // Dummy data for fair comparison of kernel execution time
   float *px_d = x_d.data();
   float *py_d = y_d.data();
   float *pz_d = z_d.data();
   float *pr_d = r_d.data();
   float *pout_d = out_d.data();
 
-  for (size_t i = 0; i < N*iters; ++i) {
+  for (size_t i = 0; i < N * iters; ++i) {
     x[i] = dist(rng);
     y[i] = dist(rng);
     z[i] = distz(rng);
@@ -522,13 +548,11 @@ TEST(ActivationNeonPerf, TanhGeluVsSwiGluTime) {
   }
 
   auto bench = [&](const char *name, auto &&fn) {
-   
-
     // timed
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < iters; ++i) {
       fn();
-      //Next data
+      // Next data
       px += N;
       py += N;
       pz += N;
@@ -545,116 +569,75 @@ TEST(ActivationNeonPerf, TanhGeluVsSwiGluTime) {
 
     // checksum to prevent DCE
     float acc = 0.f;
-    for (size_t i = 0; i < N; i += 4096) acc += out[i];
+    for (size_t i = 0; i < N; i += 4096)
+      acc += out[i];
 
-    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    auto ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     double ms = ns / 1e6;
-    std::cout << "[PERF] " << name << " : "
-              << ms << " ms total, "
+    std::cout << "[PERF] " << name << " : " << ms << " ms total, "
               << (ms / iters) << " ms/iter, "
               << "checksum=" << acc << "\n";
   };
 
- 
-
-
   const float alpha = 1.0f;
 
-  
-
-  
-  bench("swiglu(alpha=1)", [&](){
-    nntrainer::swiglu(static_cast<unsigned int>(N), pout, py, pz, alpha); // 6
+  bench("tanh_gelu_v3", [&]() {
+    nntrainer::tanh_gelu_v3(static_cast<unsigned int>(N), px, pout); // 5
   });
 
- 
-
-  bench("swiglu(alpha=1)_unrolledx2", [&](){
-    nntrainer::swiglu_unrolledx2(static_cast<unsigned int>(N), pout, py, pz, alpha); // 6
+  bench("tanh_gelu_v3_unrolledx2", [&]() {
+    nntrainer::tanh_gelu_v3_unrolledx2(static_cast<unsigned int>(N), px,
+                                       pout); // 5
   });
 
- 
-
-  bench("swiglu(alpha=1)_unrolledx4", [&](){
-    nntrainer::swiglu_unrolledx4(static_cast<unsigned int>(N), pout, py, pz, alpha); // 6
+  bench("tanh_gelu_v3_unrolledx4", [&]() {
+    nntrainer::tanh_gelu_v3_unrolledx4(static_cast<unsigned int>(N), px,
+                                       pout); // 5
   });
-  
- 
 
-  bench("tanh_gelu", [&](){
+  bench("swiglu(alpha=1)", [&]() {
+    nntrainer::swiglu(static_cast<unsigned int>(N), pout, py, pz,
+                      alpha); // 6
+  });
+
+  bench("swiglu(alpha=1)_unrolledx2", [&]() {
+    nntrainer::swiglu_unrolledx2(static_cast<unsigned int>(N), pout, py, pz,
+                                 alpha); // 6
+  });
+
+  bench("swiglu(alpha=1)_unrolledx4", [&]() {
+    nntrainer::swiglu_unrolledx4(static_cast<unsigned int>(N), pout, py, pz,
+                                 alpha); // 6
+  });
+
+  bench("tanh_gelu", [&]() {
     nntrainer::tanh_gelu(static_cast<unsigned int>(N), px, pout); // 5
   });
 
-  
-
-  bench("tanh_gelu_unrolledx2", [&](){
-    nntrainer::tanh_gelu_unrolledx2(static_cast<unsigned int>(N), px, pout); // 5    
+  bench("tanh_gelu_unrolledx2", [&]() {
+    nntrainer::tanh_gelu_unrolledx2(static_cast<unsigned int>(N), px,
+                                    pout); // 5
   });
 
-  
-
-  bench("tanh_gelu_unrolledx4", [&](){
-    nntrainer::tanh_gelu_unrolledx4(static_cast<unsigned int>(N), px, pout); // 5
-    
+  bench("tanh_gelu_unrolledx4", [&]() {
+    nntrainer::tanh_gelu_unrolledx4(static_cast<unsigned int>(N), px,
+                                    pout); // 5
   });
 
-  
-
-
-  
-
-  bench("tanh_gelu_v2", [&](){
+  bench("tanh_gelu_v2", [&]() {
     nntrainer::tanh_gelu_v2(static_cast<unsigned int>(N), px, pout); // 5
-    
   });
 
-  
-
-  bench("tanh_gelu_v2_unrolledx2", [&](){
-    nntrainer::tanh_gelu_v2_unrolledx2(static_cast<unsigned int>(N), px, pout); // 5
-    
+  bench("tanh_gelu_v2_unrolledx2", [&]() {
+    nntrainer::tanh_gelu_v2_unrolledx2(static_cast<unsigned int>(N), px,
+                                       pout); // 5
   });
 
-  
-
-
-  bench("tanh_gelu_v2_unrolledx4", [&](){
-    nntrainer::tanh_gelu_v2_unrolledx4(static_cast<unsigned int>(N), px, pout); // 5
-    
+  bench("tanh_gelu_v2_unrolledx4", [&]() {
+    nntrainer::tanh_gelu_v2_unrolledx4(static_cast<unsigned int>(N), px,
+                                       pout); // 5
   });
-
-  bench("tanh_gelu_v3", [&](){
-    nntrainer::tanh_gelu_v3(static_cast<unsigned int>(N), px, pout); // 5
-    
-  });
-
-  
-
-  bench("tanh_gelu_v3_unrolledx2", [&](){
-    nntrainer::tanh_gelu_v3_unrolledx2(static_cast<unsigned int>(N), px, pout); // 5
-    
-  });
-
- 
-
-  
-
-  bench("tanh_gelu_v3_unrolledx4", [&](){
-    nntrainer::tanh_gelu_v3_unrolledx4(static_cast<unsigned int>(N), px, pout); // 5
-    
-  });
-
-  
-  
-  
-
-
-
-
-  
-  
-  
-
 }
 
 int main(int argc, char **argv) {

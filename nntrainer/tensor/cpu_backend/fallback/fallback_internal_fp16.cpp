@@ -222,6 +222,26 @@ void __fallback_swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z) {
   }
 }
 
+void __fallback_tanh_gelu(const unsigned int N, const _FP16 *X, _FP16 *Y) {
+  for (unsigned int i = 0; i < N; ++i) {
+    float x = static_cast<float>(X[i]);
+    Y[i] = static_cast<_FP16>(
+      0.5f * x *
+      (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x))));
+  }
+}
+
+void __fallback_tanh_gelu_mul(const unsigned int N, _FP16 *X, _FP16 *Y,
+                              _FP16 *Z) {
+  for (unsigned int i = 0; i < N; ++i) {
+    float y = static_cast<float>(Y[i]);
+    float z = static_cast<float>(Z[i]);
+    X[i] = static_cast<_FP16>(
+      0.5f * y *
+      (1.0f + std::tanh(0.7978845608f * (y + 0.044715f * y * y * y))) * z);
+  }
+}
+
 _FP16 __fallback_max(const unsigned int N, _FP16 *X) {
   std::vector<_FP16> v(X, X + N);
   return *std::max_element(v.begin(), v.end());

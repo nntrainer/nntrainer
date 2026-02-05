@@ -493,6 +493,28 @@ void __fallback_compute_rotary_embedding_value(unsigned int dim,
 void __fallback_swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z);
 
 /**
+ * @brief tanh_gelu function : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *                                  + 0.044715 * X^3)))
+ *
+ * @param N number of elements in X
+ * @param X const _FP16 * for Vector X (input)
+ * @param Y _FP16 * for Vector Y (output)
+ */
+void __fallback_tanh_gelu(const unsigned int N, const _FP16 *X, _FP16 *Y);
+
+/**
+ * @brief tanh_gelu mul function : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *                                      + 0.044715 * X^3))) * Z
+ *
+ * @param N number of elements in X
+ * @param X _FP16 * for Vector X (output)
+ * @param Y _FP16 * for Vector Y (input)
+ * @param Z _FP16 * for Vector Z (input)
+ */
+void __fallback_tanh_gelu_mul(const unsigned int N, _FP16 *X, _FP16 *Y,
+                              _FP16 *Z);
+
+/**
  * @brief returns maximum value of the vector X
  *
  * @param N number of elements in X
@@ -539,7 +561,7 @@ void __fallback_calc_trigonometric_vals_dup(unsigned int N_half, T *angle,
                                             unsigned int from = 0,
                                             float attention_scaling = 1.0f);
 /**
- * @brief swiglu function with neon : X = (Y / (1 + exp( -Y ))) * Z
+ * @brief swiglu function: X = (Y / (1 + exp( -Y ))) * Z
  *
  * @param N number of elements in X
  * @param X float * for Vector X
@@ -558,6 +580,28 @@ void __fallback_swiglu(const unsigned int N, float *X, float *Y, float *Z);
  */
 void __fallback_swiglu(const unsigned int N, float *X, float *Y, float *Z,
                        float alpha);
+
+/**
+ * @brief tanh_gelu function : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *                                  + 0.044715 * X^3)))
+ *
+ * @param N number of elements in X
+ * @param X const float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+void __fallback_tanh_gelu(const unsigned int N, const float *X, float *Y);
+
+/**
+ * @brief tanh_gelu mul function : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *                                      + 0.044715 * X^3))) * Z
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (output)
+ * @param Y float * for Vector Y (input)
+ * @param Z float * for Vector Z (input)
+ */
+void __fallback_tanh_gelu_mul(const unsigned int N, float *X, float *Y,
+                              float *Z);
 
 /**
  * @brief returns maximum value of the vector X

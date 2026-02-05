@@ -194,6 +194,10 @@ void swiglu(const unsigned int N, _FP16 *X, _FP16 *Y, _FP16 *Z) {
   __fallback_swiglu(N, X, Y, Z);
 }
 
+void tanh_gelu(const unsigned int N, const _FP16 *X, _FP16 *Y) {
+  __fallback_tanh_gelu(N, X, Y);
+}
+
 _FP16 max_val(const unsigned int N, _FP16 *X) { return __fallback_max(N, X); }
 
 void softmax(const unsigned int N, _FP16 *X, _FP16 *Y) {

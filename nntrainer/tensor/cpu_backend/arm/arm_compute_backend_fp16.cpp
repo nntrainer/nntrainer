@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * Copyright (C) 2024 Sungsik Kong <ss.kong@samsung.com>
+ * Copyright (C) 2026 h0g1 <h0g1.hong@samsung.com>
  *
  * @file arm_compute_backend_fp16.cpp
- * @date   23 April 2024
+ * @date   05 Feb 2026
  * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
+ * @author h0g1 <h0g1.hong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Compute backend for arm
  *

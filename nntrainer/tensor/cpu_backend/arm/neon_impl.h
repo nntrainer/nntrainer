@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * Copyright (C) 2024 Sungsik Kong <ss.kong@samsung.com>
+ * Copyright (C) 2026 h0g1 <h0g1.hong@samsung.com>
  *
  * @file neon_impl.h
- * @date   23 April 2024
+ * @date   05 Feb 2026
  * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
+ * @author h0g1 <h0g1.hong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Single-precision computation functions based on NEON
  *
@@ -476,8 +478,9 @@ void calc_trigonometric_vals_dup(unsigned int N_half, T *angle, T *cos_,
 void swiglu(const unsigned int N, float *X, float *Y, float *Z);
 
 /**
- * @brief swiglu function with alpha and neon : X = (Y / (1 + exp(- alpha * Y)))
- * * Z
+ * @brief swiglu function with alpha and neon
+ *  X = (Y / (1 + exp(- alpha * Y)))
+ *      * Z
  * @param N number of elements in X
  * @param X float* for Vector X
  * @param Y float* for Vector Y
@@ -487,98 +490,101 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z);
 void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha);
 
 /**
- * @brief swiglu function with alpha and neon : X = (Y / (1 + exp(- alpha * Y))) with loop unrolling x2
- * * Z
+ * @brief swiglu function with alpha and neon
+ * X = (Y / (1 + exp(- alpha * Y)))
+ *      * Z with loop unrolling x2
  * @param N number of elements in X
  * @param X float* for Vector X
  * @param Y float* for Vector Y
  * @param Z float* for Vector Z
  * @param alpha float
  */
-void swiglu_unrolledx2(const unsigned int N, float *X, float *Y, float *Z, float alpha);
+void swiglu_unrolledx2(const unsigned int N, float *X, float *Y, float *Z,
+                       float alpha);
 
 /**
- * @brief swiglu function with alpha and neon : X = (Y / (1 + exp(- alpha * Y))) with loop unrolling x4
- * * Z
+ * @brief swiglu function with alpha and neon
+ * X = (Y / (1 + exp(- alpha * Y)))
+ *      * Z with loop unrolling x4
  * @param N number of elements in X
  * @param X float* for Vector X
  * @param Y float* for Vector Y
  * @param Z float* for Vector Z
  * @param alpha float
  */
-void swiglu_unrolledx4(const unsigned int N, float *X, float *Y, float *Z, float alpha);
-
+void swiglu_unrolledx4(const unsigned int N, float *X, float *Y, float *Z,
+                       float alpha);
 
 /**
- * @brief tanh_gelu function with neon : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
- * + 0.044715 * X^3)))
+ * @brief tanh_gelu function with neon
+ * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *      + 0.044715 * X^3)))
  *
  * @param N number of elements in X
  * @param X float * for Vector X (input)
  * @param Y float * for Vector Y (output)
  */
 
- 
 void tanh_gelu(const unsigned int N, const float *X, float *Y);
 
 /**
- * @brief tanh_gelu function with neon : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
- * + 0.044715 * X^3))) with loop unrolling x2
+ * @brief tanh_gelu function with neon
+ * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *      + 0.044715 * X^3))) with loop unrolling x2
  *
  * @param N number of elements in X
  * @param X float * for Vector X (input)
  * @param Y float * for Vector Y (output)
  */
 
- 
 void tanh_gelu_unrolledx2(const unsigned int N, const float *X, float *Y);
 
 /**
- * @brief tanh_gelu function with neon : Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
- * + 0.044715 * X^3))) with loop unrolling x4
+ * @brief tanh_gelu function with neon
+ * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
+ *      + 0.044715 * X^3))) with loop unrolling x4
  *
  * @param N number of elements in X
  * @param X float * for Vector X (input)
  * @param Y float * for Vector Y (output)
  */
 
- 
 void tanh_gelu_unrolledx4(const unsigned int N, const float *X, float *Y);
 
 /**
- * @brief tanh_gelu function with neon but as : Y = X / (1 + exp(-pi/4*(X + 0.04
- * 4715X^3))
+ * @brief tanh_gelu function with neon but as
+ * Y = X / (1 + exp(-pi/4*(X + 0.04
+ *      4715X^3))
  *
  * @param N number of elements in X
  * @param X float * for Vector X (input)
  * @param Y float * for Vector Y (output)
  */
 
- 
 void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
 
 /**
- * @brief tanh_gelu function with neon but as : Y = X / (1 + exp(-pi/4*(X + 0.04
- * 4715X^3)) with loop unrolling x2
+ * @brief tanh_gelu function with neon but as
+ * Y = X / (1 + exp(-pi/4*(X + 0.04
+ *      4715X^3)) with loop unrolling x2
  *
  * @param N number of elements in X
  * @param X float * for Vector X (input)
  * @param Y float * for Vector Y (output)
  */
 
- 
 void tanh_gelu_v2_unrolledx2(const unsigned int N, const float *X, float *Y);
 
 /**
- * @brief tanh_gelu function with neon but as : Y = X / (1 + exp(-pi/4*(X + 0.04
- * 4715X^3)) with loop unrolling x4
+ * @brief tanh_gelu function with neon but as
+ * Y = X / (1 + exp(-pi/4*(X + 0.04
+ *      4715X^3)) with loop unrolling x4
  *
  * @param N number of elements in X
  * @param X float * for Vector X (input)
  * @param Y float * for Vector Y (output)
  */
 
- 
 void tanh_gelu_v2_unrolledx4(const unsigned int N, const float *X, float *Y);
 
 /**
@@ -589,7 +595,6 @@ void tanh_gelu_v2_unrolledx4(const unsigned int N, const float *X, float *Y);
  * @param Y float * for Vector Y (output)
  */
 
- 
 void tanh_gelu_v3(const unsigned int N, const float *X, float *Y);
 
 /**
@@ -600,7 +605,6 @@ void tanh_gelu_v3(const unsigned int N, const float *X, float *Y);
  * @param Y float * for Vector Y (output)
  */
 
- 
 void tanh_gelu_v3_unrolledx2(const unsigned int N, const float *X, float *Y);
 
 /**
@@ -611,13 +615,12 @@ void tanh_gelu_v3_unrolledx2(const unsigned int N, const float *X, float *Y);
  * @param Y float * for Vector Y (output)
  */
 
- 
 void tanh_gelu_v3_unrolledx4(const unsigned int N, const float *X, float *Y);
 
-
 /**
- * @brief tanh_gelu function with neon but as : Y = X / (1 + exp(-pi/4*(X + 0.04
- * 4715X^3)) with multiplication
+ * @brief tanh_gelu function with neon but as
+ * Y = X / (1 + exp(-pi/4*(X + 0.04
+ *      4715X^3)) with multiplication
  *
  * @param N number of elements in X
  * @param X float * for Vector X (output) - for consistency with SwiGLU
@@ -625,14 +628,12 @@ void tanh_gelu_v3_unrolledx4(const unsigned int N, const float *X, float *Y);
  * @param Z float * for Vector
  */
 
- 
-
- 
 void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z);
 
 /**
- * @brief tanh_gelu function with neon but as : Y = X / (1 + exp(-pi/4*(X + 0.04
- * 4715X^3)) with multiplication with loop unrolling x2
+ * @brief tanh_gelu function with neon but as
+ * Y = X / (1 + exp(-pi/4*(X + 0.04
+ *      4715X^3)) with multiplication with loop unrolling x2
  *
  * @param N number of elements in X
  * @param X float * for Vector X (output) - for consistency with SwiGLU
@@ -640,13 +641,13 @@ void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z);
  * @param Z float * for Vector
  */
 
- 
-void tanh_gelu_v2_mul_unrolledx2(const unsigned int N, float *X, float *Y, float *Z);
-
+void tanh_gelu_v2_mul_unrolledx2(const unsigned int N, float *X, float *Y,
+                                 float *Z);
 
 /**
- * @brief tanh_gelu function with neon but as : Y = X / (1 + exp(-pi/4*(X + 0.04
- * 4715X^3)) with multiplication with loop unrolling x4
+ * @brief tanh_gelu function with neon but as
+ * Y = X / (1 + exp(-pi/4*(X + 0.04
+ *      4715X^3)) with multiplication with loop unrolling x4
  *
  * @param N number of elements in X
  * @param X float * for Vector X (output) - for consistency with SwiGLU
@@ -654,12 +655,13 @@ void tanh_gelu_v2_mul_unrolledx2(const unsigned int N, float *X, float *Y, float
  * @param Z float * for Vector
  */
 
- 
-void tanh_gelu_v2_mul_unrolledx4(const unsigned int N, float *X, float *Y, float *Z);
+void tanh_gelu_v2_mul_unrolledx4(const unsigned int N, float *X, float *Y,
+                                 float *Z);
 
 /**
- * @brief tanh_gelu function with neon but as : Y = X / (1 + exp(-pi/4*(X + 0.04
- * 4715X^3)) with multiplication
+ * @brief tanh_gelu function with neon but as
+ * Y = X / (1 + exp(-pi/4*(X + 0.04
+ *      4715X^3)) with multiplication
  *
  * @param N number of elements in X
  * @param X float * for Vector X (output) - for consistency with SwiGLU
@@ -667,9 +669,6 @@ void tanh_gelu_v2_mul_unrolledx4(const unsigned int N, float *X, float *Y, float
  * @param Z float * for Vector
  */
 
- 
-
- 
 void tanh_gelu_v3_mul(const unsigned int N, float *X, float *Y, float *Z);
 
 /**
