@@ -134,9 +134,8 @@ protected:
 
   unsigned int SYS_PROMP_LEN;
   std::string PRE_COMPUTED_CACHE_PATH;
-  std::string TAIL_PROMPT;
   bool SAVE_KVCACHE;
-  bool USE_KVCACHE;
+  bool USE_KVCACHE; /**< Use saved kvcache of system prompt */
   unsigned int global_token_len;
 
   std::mt19937 rng; /**< Random Number Gen */

@@ -62,6 +62,7 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
                    ? nntr_cfg["lmhead_dtype"]
                    : nntr_cfg["embedding_dtype"];
 
+  SAVE_KVCACHE = false;
   USE_KVCACHE = false;
   PRE_COMPUTED_CACHE_PATH = "";
   SYS_PROMP_LEN = 0;
@@ -315,18 +316,31 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   /**
    * SAVE_KVCACHE ?
-   *  if USE_KVCACHE && system_prompt is given && but the
-   * PRE_COMPUTED_CACHE_PATH does not exist
+   *  using saved kvcache of system prompt is enabled
+   *  && system_prompt is given
+   *  && but the PRE_COMPUTED_CACHE_PATH does not exist
    */
   SAVE_KVCACHE = (USE_KVCACHE && system_prompt != "" &&
                   !std::filesystem::exists(PRE_COMPUTED_CACHE_PATH));
 
 #if defined(_WIN32)
+  // print input text
   std::wcout << L"" << system_prompt << L"" << text_ << std::endl;
-  std::wstring prompt_ = prompt;
-  if (!SAVE_KVCACHE)
-    prompt_ += TAIL_PROMPT;
+
+  // actual prompt to be used in computation
+  std::wstring prompt_;
+
+  if (USE_KVCACHE) {
+    prompt_ = SAVE_KVCACHE ? system_prompt : (prompt + tail_prompt);
+  } else {
+    prompt_ = system_prompt + prompt + tail_prompt;
+  }
+
   std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+
+  if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0)
+    SYS_PROMP_LEN = tokenizer->Encode(converter.to_bytes(system_prompt)).size();
+
   auto _input = tokenizer->Encode(converter.to_bytes(prompt_));
 #else
   // print input text
