@@ -10,7 +10,6 @@
  * @brief  Conditional header file to support unsupported intrinsics on armv7l
  *
  */
-#pragma once
 #include <arm_neon.h>
 #include <cmath>
 

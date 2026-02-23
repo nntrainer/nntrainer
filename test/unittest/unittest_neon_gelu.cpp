@@ -1,23 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
- * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
+ * Copyright (C) 2026 Hyeong Gwon Hong <h0g1.hong@samsung.com>
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *   http://www.apache.org/licenses/LICENSE-2.0
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- *
- * @file	unittest_neon_gelu.cpp
- * @date	02 Feb 2026
- * @brief	This is the unittest code for several kernels for activation function
- * @see		https://github.com/nntrainer/
- * @author	h0g1 <h0g1.hong@samsung.com>
- * @bug		No known bugs
+ * @file unittest_neon_gelu.cpp
+ * @date   05 Feb 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Hyeong Gwon Hong <h0g1.hong@samsung.com>
+ * @bug    No known bugs except for NYI items
+ * @brief  Unittest for accuracy and time of swiglu and gelu kernels
  *
  */
 #include <gtest/gtest.h>
@@ -92,64 +82,6 @@ TEST(ActivationNeon, TanhGeluAccuracy) {
   }
 }
 
-TEST(ActivationNeon, TanhGelux2Accuracy) {
-  constexpr size_t N = 4096;
-
-  std::mt19937 rng(123);
-  // Input Range
-  std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
-
-  std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i)
-    x[i] = dist(rng);
-
-  // DUT
-  nntrainer::tanh_gelu_unrolledx2(static_cast<unsigned int>(N), x.data(),
-                                  y.data()); // 3
-
-  // Reference
-  for (size_t i = 0; i < N; ++i)
-    y_ref[i] = ref_tanh_gelu(x[i]);
-
-  // Tolerance
-  const float abs_tol = 1e-5f;
-  const float rel_tol = 1e-5f;
-
-  // Test for each case
-  for (size_t i = 0; i < N; ++i) {
-    expect_close(y[i], y_ref[i], abs_tol, rel_tol);
-  }
-}
-
-TEST(ActivationNeon, TanhGelux4Accuracy) {
-  constexpr size_t N = 4096;
-
-  std::mt19937 rng(123);
-  // Input Range
-  std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
-
-  std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i)
-    x[i] = dist(rng);
-
-  // DUT
-  nntrainer::tanh_gelu_unrolledx4(static_cast<unsigned int>(N), x.data(),
-                                  y.data()); // 3
-
-  // Reference
-  for (size_t i = 0; i < N; ++i)
-    y_ref[i] = ref_tanh_gelu(x[i]);
-
-  // Tolerance
-  const float abs_tol = 1e-5f;
-  const float rel_tol = 1e-5f;
-
-  // Test for each case
-  for (size_t i = 0; i < N; ++i) {
-    expect_close(y[i], y_ref[i], abs_tol, rel_tol);
-  }
-}
-
 TEST(ActivationNeon, TanhGeluv2Accuracy) {
   constexpr size_t N = 4096;
 
@@ -172,151 +104,6 @@ TEST(ActivationNeon, TanhGeluv2Accuracy) {
   // Tolerance
   const float abs_tol = 1e-5f;
   const float rel_tol = 1e-5f;
-
-  // Test for each case
-  for (size_t i = 0; i < N; ++i) {
-    expect_close(y[i], y_ref[i], abs_tol, rel_tol);
-  }
-}
-
-TEST(ActivationNeon, TanhGeluv2x2Accuracy) {
-  constexpr size_t N = 4096;
-
-  std::mt19937 rng(123);
-  // Input Range
-  std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
-
-  std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i)
-    x[i] = dist(rng);
-
-  // DUT
-  nntrainer::tanh_gelu_v2_unrolledx2(static_cast<unsigned int>(N), x.data(),
-                                     y.data()); // 3
-
-  // Reference
-  for (size_t i = 0; i < N; ++i)
-    y_ref[i] = ref_tanh_gelu(x[i]);
-
-  // Tolerance
-  const float abs_tol = 1e-5f;
-  const float rel_tol = 1e-5f;
-
-  // Test for each case
-  for (size_t i = 0; i < N; ++i) {
-    expect_close(y[i], y_ref[i], abs_tol, rel_tol);
-  }
-}
-
-TEST(ActivationNeon, TanhGeluv2x4Accuracy) {
-  constexpr size_t N = 4096;
-
-  std::mt19937 rng(123);
-  // Input Range
-  std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
-
-  std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i)
-    x[i] = dist(rng);
-
-  // DUT
-  nntrainer::tanh_gelu_v2_unrolledx4(static_cast<unsigned int>(N), x.data(),
-                                     y.data()); // 3
-
-  // Reference
-  for (size_t i = 0; i < N; ++i)
-    y_ref[i] = ref_tanh_gelu(x[i]);
-
-  // Tolerance
-  const float abs_tol = 1e-5f;
-  const float rel_tol = 1e-5f;
-
-  // Test for each case
-  for (size_t i = 0; i < N; ++i) {
-    expect_close(y[i], y_ref[i], abs_tol, rel_tol);
-  }
-}
-
-TEST(ActivationNeon, TanhGeluv3Accuracy) {
-  constexpr size_t N = 4096;
-
-  std::mt19937 rng(123);
-  // Input Range
-  std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
-
-  std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i)
-    x[i] = dist(rng);
-
-  // DUT
-  nntrainer::tanh_gelu_v3(static_cast<unsigned int>(N), x.data(),
-                          y.data()); // 3
-
-  // Reference
-  for (size_t i = 0; i < N; ++i)
-    y_ref[i] = ref_tanh_gelu(x[i]);
-
-  // Tolerance
-  const float abs_tol = 3e-5f;
-  const float rel_tol = 3e-5f;
-
-  // Test for each case
-  for (size_t i = 0; i < N; ++i) {
-    expect_close(y[i], y_ref[i], abs_tol, rel_tol);
-  }
-}
-
-TEST(ActivationNeon, TanhGeluv3x2Accuracy) {
-  constexpr size_t N = 4096;
-
-  std::mt19937 rng(123);
-  // Input Range
-  std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
-
-  std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i)
-    x[i] = dist(rng);
-
-  // DUT
-  nntrainer::tanh_gelu_v3_unrolledx2(static_cast<unsigned int>(N), x.data(),
-                                     y.data()); // 3
-
-  // Reference
-  for (size_t i = 0; i < N; ++i)
-    y_ref[i] = ref_tanh_gelu(x[i]);
-
-  // Tolerance
-  const float abs_tol = 3e-5f;
-  const float rel_tol = 3e-5f;
-
-  // Test for each case
-  for (size_t i = 0; i < N; ++i) {
-    expect_close(y[i], y_ref[i], abs_tol, rel_tol);
-  }
-}
-
-TEST(ActivationNeon, TanhGeluv3x4Accuracy) {
-  constexpr size_t N = 4096;
-
-  std::mt19937 rng(123);
-  // Input Range
-  std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
-
-  std::vector<float> x(N), y(N), y_ref(N);
-  for (size_t i = 0; i < N; ++i)
-    x[i] = dist(rng);
-
-  // DUT
-  nntrainer::tanh_gelu_v3_unrolledx4(static_cast<unsigned int>(N), x.data(),
-                                     y.data()); // 3
-
-  // Reference
-  for (size_t i = 0; i < N; ++i)
-    y_ref[i] = ref_tanh_gelu(x[i]);
-
-  // Tolerance
-  const float abs_tol = 3e-5f;
-  const float rel_tol = 3e-5f;
 
   // Test for each case
   for (size_t i = 0; i < N; ++i) {
@@ -356,67 +143,7 @@ TEST(ActivationNeon, SwiGluAccuracy) {
   }
 }
 
-TEST(ActivationNeon, SwiGlux2Accuracy) {
-  constexpr size_t N = 4096;
-
-  std::mt19937 rng(456);
-  std::uniform_real_distribution<float> dist_y(-10.0f, 10.0f);
-  std::uniform_real_distribution<float> dist_z(-3.0f, 3.0f);
-
-  std::vector<float> x(N), y(N), z(N), x_ref(N);
-
-  for (size_t i = 0; i < N; ++i) {
-    y[i] = dist_y(rng);
-    z[i] = dist_z(rng);
-  }
-
-  const float alpha = 1.0f; // Parametrize it if necessary
-  nntrainer::swiglu_unrolledx2(static_cast<unsigned int>(N), x.data(), y.data(),
-                               z.data(), alpha); // 4
-
-  for (size_t i = 0; i < N; ++i)
-    x_ref[i] = ref_swiglu(y[i], z[i], alpha);
-
-  // Tolerance
-  const float abs_tol = 1e-5f;
-  const float rel_tol = 1e-5f;
-
-  for (size_t i = 0; i < N; ++i) {
-    expect_close(x[i], x_ref[i], abs_tol, rel_tol);
-  }
-}
-
-TEST(ActivationNeon, SwiGlux4Accuracy) {
-  constexpr size_t N = 4096;
-
-  std::mt19937 rng(456);
-  std::uniform_real_distribution<float> dist_y(-10.0f, 10.0f);
-  std::uniform_real_distribution<float> dist_z(-3.0f, 3.0f);
-
-  std::vector<float> x(N), y(N), z(N), x_ref(N);
-
-  for (size_t i = 0; i < N; ++i) {
-    y[i] = dist_y(rng);
-    z[i] = dist_z(rng);
-  }
-
-  const float alpha = 1.0f; // Parametrize it if necessary
-  nntrainer::swiglu_unrolledx4(static_cast<unsigned int>(N), x.data(), y.data(),
-                               z.data(), alpha); // 4
-
-  for (size_t i = 0; i < N; ++i)
-    x_ref[i] = ref_swiglu(y[i], z[i], alpha);
-
-  // Tolerance
-  const float abs_tol = 1e-5f;
-  const float rel_tol = 1e-5f;
-
-  for (size_t i = 0; i < N; ++i) {
-    expect_close(x[i], x_ref[i], abs_tol, rel_tol);
-  }
-}
-
-TEST(ActivationNeon, TanhGeluV2MulAccuracy) {
+TEST(ActivationNeon, TanhGeluMulAccuracy) {
   constexpr size_t N = 4096;
 
   std::mt19937 rng(456);
@@ -431,70 +158,8 @@ TEST(ActivationNeon, TanhGeluV2MulAccuracy) {
     z[i] = dist_z(rng);
   }
 
-  nntrainer::tanh_gelu_v2_mul(static_cast<unsigned int>(N), x.data(), y.data(),
-                              z.data());
-
-  for (size_t i = 0; i < N; ++i)
-    x_ref[i] = ref_tanh_gelu_mul(y[i], z[i]);
-
-  // Tolerance
-  const float abs_tol = 1e-5f;
-  const float rel_tol = 1e-5f;
-
-  // Test for each case
-  for (size_t i = 0; i < N; ++i) {
-    expect_close(x[i], x_ref[i], abs_tol, rel_tol);
-  }
-}
-
-TEST(ActivationNeon, TanhGeluV2Mulx2Accuracy) {
-  constexpr size_t N = 4096;
-
-  std::mt19937 rng(456);
-  // Input Range
-  std::uniform_real_distribution<float> dist_y(-10.0f, 10.0f);
-  std::uniform_real_distribution<float> dist_z(-10.0f, 10.0f);
-
-  std::vector<float> x(N), y(N), z(N), x_ref(N);
-
-  for (size_t i = 0; i < N; ++i) {
-    y[i] = dist_y(rng);
-    z[i] = dist_z(rng);
-  }
-
-  nntrainer::tanh_gelu_v2_mul_unrolledx2(static_cast<unsigned int>(N), x.data(),
-                                         y.data(), z.data());
-
-  for (size_t i = 0; i < N; ++i)
-    x_ref[i] = ref_tanh_gelu_mul(y[i], z[i]);
-
-  // Tolerance
-  const float abs_tol = 1e-5f;
-  const float rel_tol = 1e-5f;
-
-  // Test for each case
-  for (size_t i = 0; i < N; ++i) {
-    expect_close(x[i], x_ref[i], abs_tol, rel_tol);
-  }
-}
-
-TEST(ActivationNeon, TanhGeluV2Mulx4Accuracy) {
-  constexpr size_t N = 4096;
-
-  std::mt19937 rng(456);
-  // Input Range
-  std::uniform_real_distribution<float> dist_y(-10.0f, 10.0f);
-  std::uniform_real_distribution<float> dist_z(-10.0f, 10.0f);
-
-  std::vector<float> x(N), y(N), z(N), x_ref(N);
-
-  for (size_t i = 0; i < N; ++i) {
-    y[i] = dist_y(rng);
-    z[i] = dist_z(rng);
-  }
-
-  nntrainer::tanh_gelu_v2_mul_unrolledx4(static_cast<unsigned int>(N), x.data(),
-                                         y.data(), z.data());
+  nntrainer::tanh_gelu_mul(static_cast<unsigned int>(N), x.data(), y.data(),
+                           z.data());
 
   for (size_t i = 0; i < N; ++i)
     x_ref[i] = ref_tanh_gelu_mul(y[i], z[i]);
@@ -582,61 +247,17 @@ TEST(ActivationNeonPerf, TanhGeluVsSwiGluTime) {
 
   const float alpha = 1.0f;
 
-  bench("tanh_gelu_v3", [&]() {
-    nntrainer::tanh_gelu_v3(static_cast<unsigned int>(N), px, pout); // 5
-  });
-
-  bench("tanh_gelu_v3_unrolledx2", [&]() {
-    nntrainer::tanh_gelu_v3_unrolledx2(static_cast<unsigned int>(N), px,
-                                       pout); // 5
-  });
-
-  bench("tanh_gelu_v3_unrolledx4", [&]() {
-    nntrainer::tanh_gelu_v3_unrolledx4(static_cast<unsigned int>(N), px,
-                                       pout); // 5
-  });
-
   bench("swiglu(alpha=1)", [&]() {
     nntrainer::swiglu(static_cast<unsigned int>(N), pout, py, pz,
                       alpha); // 6
-  });
-
-  bench("swiglu(alpha=1)_unrolledx2", [&]() {
-    nntrainer::swiglu_unrolledx2(static_cast<unsigned int>(N), pout, py, pz,
-                                 alpha); // 6
-  });
-
-  bench("swiglu(alpha=1)_unrolledx4", [&]() {
-    nntrainer::swiglu_unrolledx4(static_cast<unsigned int>(N), pout, py, pz,
-                                 alpha); // 6
   });
 
   bench("tanh_gelu", [&]() {
     nntrainer::tanh_gelu(static_cast<unsigned int>(N), px, pout); // 5
   });
 
-  bench("tanh_gelu_unrolledx2", [&]() {
-    nntrainer::tanh_gelu_unrolledx2(static_cast<unsigned int>(N), px,
-                                    pout); // 5
-  });
-
-  bench("tanh_gelu_unrolledx4", [&]() {
-    nntrainer::tanh_gelu_unrolledx4(static_cast<unsigned int>(N), px,
-                                    pout); // 5
-  });
-
   bench("tanh_gelu_v2", [&]() {
     nntrainer::tanh_gelu_v2(static_cast<unsigned int>(N), px, pout); // 5
-  });
-
-  bench("tanh_gelu_v2_unrolledx2", [&]() {
-    nntrainer::tanh_gelu_v2_unrolledx2(static_cast<unsigned int>(N), px,
-                                       pout); // 5
-  });
-
-  bench("tanh_gelu_v2_unrolledx4", [&]() {
-    nntrainer::tanh_gelu_v2_unrolledx4(static_cast<unsigned int>(N), px,
-                                       pout); // 5
   });
 }
 

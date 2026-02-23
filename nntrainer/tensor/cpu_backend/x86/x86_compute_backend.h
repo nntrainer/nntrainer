@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * Copyright (C) 2024 Sungsik Kong <ss.kong@samsung.com>
- * Copyright (C) 2026 h0g1 <h0g1.hong@samsung.com>
  *
  * @file   x86_compute_backend.h
- * @date   05 Feb 2026
+ * @date   23 April 2024
  * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
- * @author h0g1 <h0g1.hong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Compute backend for x86
  *
@@ -528,28 +526,6 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z);
 void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha);
 
 /**
- * @brief swiglu function with alpha : X = (Y / (1 + exp(- alpha * Y))) * Z
- * @param N number of elements in X
- * @param X float* for Vector X
- * @param Y float* for Vector Y
- * @param Z float* for Vector Z
- * @param alpha float
- */
-void swiglu_unrolledx2(const unsigned int N, float *X, float *Y, float *Z,
-                       float alpha);
-
-/**
- * @brief swiglu function with alpha : X = (Y / (1 + exp(- alpha * Y))) * Z
- * @param N number of elements in X
- * @param X float* for Vector X
- * @param Y float* for Vector Y
- * @param Z float* for Vector Z
- * @param alpha float
- */
-void swiglu_unrolledx4(const unsigned int N, float *X, float *Y, float *Z,
-                       float alpha);
-
-/**
  * @brief tanh_gelu function
  * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
  *     + 0.044715 * X^3)))
@@ -563,28 +539,6 @@ void tanh_gelu(const unsigned int N, const float *X, float *Y);
 /**
  * @brief tanh_gelu function
  * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
- *     + 0.044715 * X^3)))
- *
- * @param N number of elements in X
- * @param X float * for Vector X (input)
- * @param Y float * for Vector Y (output)
- */
-void tanh_gelu_unrolledx2(const unsigned int N, const float *X, float *Y);
-
-/**
- * @brief tanh_gelu function
- * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
- *     + 0.044715 * X^3))) with x2 loop unrolling
- *
- * @param N number of elements in X
- * @param X float * for Vector X (input)
- * @param Y float * for Vector Y (output)
- */
-void tanh_gelu_unrolledx4(const unsigned int N, const float *X, float *Y);
-
-/**
- * @brief tanh_gelu function
- * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
  *     + 0.044715 * X^3))) with x4 loop unrolling
  *
  * @param N number of elements in X
@@ -594,59 +548,16 @@ void tanh_gelu_unrolledx4(const unsigned int N, const float *X, float *Y);
 void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
 
 /**
- * @brief tanh_gelu function
- * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
- *     + 0.044715 * X^3)))
+ * @brief tanh_gelu function with neon but as
+ * X = Y / (1 + exp(-pi/4*(Y
+ *     + 0.044715Y^3)) * Z
  *
  * @param N number of elements in X
- * @param X float * for Vector X (input)
- * @param Y float * for Vector Y (output)
+ * @param X float * for Vector X (output)
+ * @param Y float * for Vector Y (input)
+ * @param Z float * for Vector Z (input)
  */
-void tanh_gelu_v2_unrolledx2(const unsigned int N, const float *X, float *Y);
-
-/**
- * @brief tanh_gelu function
- * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
- *     + 0.044715 * X^3)))
- *
- * @param N number of elements in X
- * @param X float * for Vector X (input)
- * @param Y float * for Vector Y (output)
- */
-void tanh_gelu_v2_unrolledx4(const unsigned int N, const float *X, float *Y);
-
-/**
- * @brief tanh_gelu function
- * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
- *     + 0.044715 * X^3))) with x4 loop unrolling
- *
- * @param N number of elements in X
- * @param X float * for Vector X (input)
- * @param Y float * for Vector Y (output)
- */
-void tanh_gelu_v3(const unsigned int N, const float *X, float *Y);
-
-/**
- * @brief tanh_gelu function
- * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
- *     + 0.044715 * X^3)))
- *
- * @param N number of elements in X
- * @param X float * for Vector X (input)
- * @param Y float * for Vector Y (output)
- */
-void tanh_gelu_v3_unrolledx2(const unsigned int N, const float *X, float *Y);
-
-/**
- * @brief tanh_gelu function
- * Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X
- *     + 0.044715 * X^3)))
- *
- * @param N number of elements in X
- * @param X float * for Vector X (input)
- * @param Y float * for Vector Y (output)
- */
-void tanh_gelu_v3_unrolledx4(const unsigned int N, const float *X, float *Y);
+void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z);
 
 /**
  * @brief tanh_gelu function with neon but as
@@ -659,43 +570,6 @@ void tanh_gelu_v3_unrolledx4(const unsigned int N, const float *X, float *Y);
  * @param Z float * for Vector Z (input)
  */
 void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z);
-
-/**
- * @brief tanh_gelu function with neon but as
- * X = Y / (1 + exp(-pi/4*(Y
- *     + 0.044715Y^3)) * Z with loop unrolling x2
- *
- * @param N number of elements in X
- * @param X float * for Vector X (output)
- * @param Y float * for Vector Y (input)
- * @param Z float * for Vector Z (input)
- */
-void tanh_gelu_v2_mul_unrolledx2(const unsigned int N, float *X, float *Y,
-                                 float *Z);
-
-/**
- * @brief tanh_gelu function with neon but as
- * X = Y / (1 + exp(-pi/4*(Y
- *     + 0.044715Y^3)) * Z with loop unrolling x4
- *
- * @param N number of elements in X
- * @param X float * for Vector X (output)
- * @param Y float * for Vector Y (input)
- * @param Z float * for Vector Z (input)
- */
-void tanh_gelu_v2_mul_unrolledx4(const unsigned int N, float *X, float *Y,
-                                 float *Z);
-/**
- * @brief tanh_gelu function with neon but as
- * X = Y / (1 + exp(-pi/4*(Y
- *     + 0.044715Y^3)) * Z
- *
- * @param N number of elements in X
- * @param X float * for Vector X (output)
- * @param Y float * for Vector Y (input)
- * @param Z float * for Vector Z (input)
- */
-void tanh_gelu_v3_mul(const unsigned int N, float *X, float *Y, float *Z);
 
 /**
  * @brief returns maximum value of the vector X

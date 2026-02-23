@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * Copyright (C) 2024 Sungsik Kong <ss.kong@samsung.com>
- * Copyright (C) 2026 h0g1 <h0g1.hong@samsung.com>
  *
  * @file arm_compute_backend.cpp
- * @date   05 Feb 2026
+ * @date   23 April 2024
  * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
- * @author h0g1 <h0g1.hong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Compute backend for arm
  *
@@ -52,35 +50,9 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha) {
   nntrainer::neon::swiglu(N, X, Y, Z, alpha);
 }
 
-void swiglu_unrolledx2(const unsigned int N, float *X, float *Y, float *Z,
-                       float alpha) {
-  nntrainer::neon::swiglu_unrolledx2(N, X, Y, Z, alpha);
-}
-
-void swiglu_unrolledx4(const unsigned int N, float *X, float *Y, float *Z,
-                       float alpha) {
-  nntrainer::neon::swiglu_unrolledx4(N, X, Y, Z, alpha);
-}
-
 void tanh_gelu(const unsigned int N, const float *X, float *Y) {
 #ifdef __ARM_NEON
   nntrainer::neon::tanh_gelu(N, X, Y);
-#else
-  __fallback_tanh_gelu(N, X, Y);
-#endif
-}
-
-void tanh_gelu_unrolledx2(const unsigned int N, const float *X, float *Y) {
-#ifdef __ARM_NEON
-  nntrainer::neon::tanh_gelu_unrolledx2(N, X, Y);
-#else
-  __fallback_tanh_gelu(N, X, Y);
-#endif
-}
-
-void tanh_gelu_unrolledx4(const unsigned int N, const float *X, float *Y) {
-#ifdef __ARM_NEON
-  nntrainer::neon::tanh_gelu_unrolledx4(N, X, Y);
 #else
   __fallback_tanh_gelu(N, X, Y);
 #endif
@@ -90,47 +62,15 @@ void tanh_gelu_v2(const unsigned int N, const float *X, float *Y) {
 #ifdef __ARM_NEON
   nntrainer::neon::tanh_gelu_v2(N, X, Y);
 #else
-  __fallback_tanh_gelu(N, X, Y);
+  __fallback_tanh_gelu_v2(N, X, Y);
 #endif
 }
 
-void tanh_gelu_v2_unrolledx2(const unsigned int N, const float *X, float *Y) {
+void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z) {
 #ifdef __ARM_NEON
-  nntrainer::neon::tanh_gelu_v2_unrolledx2(N, X, Y);
+  nntrainer::neon::tanh_gelu_mul(N, X, Y, Z);
 #else
-  __fallback_tanh_gelu(N, X, Y);
-#endif
-}
-
-void tanh_gelu_v2_unrolledx4(const unsigned int N, const float *X, float *Y) {
-#ifdef __ARM_NEON
-  nntrainer::neon::tanh_gelu_v2_unrolledx4(N, X, Y);
-#else
-  __fallback_tanh_gelu(N, X, Y);
-#endif
-}
-
-void tanh_gelu_v3(const unsigned int N, const float *X, float *Y) {
-#ifdef __ARM_NEON
-  nntrainer::neon::tanh_gelu_v3(N, X, Y);
-#else
-  __fallback_tanh_gelu(N, X, Y);
-#endif
-}
-
-void tanh_gelu_v3_unrolledx2(const unsigned int N, const float *X, float *Y) {
-#ifdef __ARM_NEON
-  nntrainer::neon::tanh_gelu_v3(N, X, Y);
-#else
-  __fallback_tanh_gelu(N, X, Y);
-#endif
-}
-
-void tanh_gelu_v3_unrolledx4(const unsigned int N, const float *X, float *Y) {
-#ifdef __ARM_NEON
-  nntrainer::neon::tanh_gelu_v3(N, X, Y);
-#else
-  __fallback_tanh_gelu(N, X, Y);
+  __fallback_tanh_gelu_mul(N, X, Y, Z);
 #endif
 }
 
@@ -138,33 +78,7 @@ void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z) {
 #ifdef __ARM_NEON
   nntrainer::neon::tanh_gelu_v2_mul(N, X, Y, Z);
 #else
-  __fallback_tanh_gelu_mul(N, X, Y, Z);
-#endif
-}
-
-void tanh_gelu_v2_mul_unrolledx2(const unsigned int N, float *X, float *Y,
-                                 float *Z) {
-#ifdef __ARM_NEON
-  nntrainer::neon::tanh_gelu_v2_mul_unrolledx2(N, X, Y, Z);
-#else
-  __fallback_tanh_gelu_mul(N, X, Y, Z);
-#endif
-}
-
-void tanh_gelu_v2_mul_unrolledx4(const unsigned int N, float *X, float *Y,
-                                 float *Z) {
-#ifdef __ARM_NEON
-  nntrainer::neon::tanh_gelu_v2_mul_unrolledx4(N, X, Y, Z);
-#else
-  __fallback_tanh_gelu_mul(N, X, Y, Z);
-#endif
-}
-
-void tanh_gelu_v3_mul(const unsigned int N, float *X, float *Y, float *Z) {
-#ifdef __ARM_NEON
-  nntrainer::neon::tanh_gelu_v3_mul(N, X, Y, Z);
-#else
-  __fallback_tanh_gelu_mul(N, X, Y, Z);
+  __fallback_tanh_gelu_v2_mul(N, X, Y, Z);
 #endif
 }
 

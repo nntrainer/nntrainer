@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * Copyright (C) 2024 Sungsik Kong <ss.kong@samsung.com>
- * Copyright (C) 2026 h0g1 <h0g1.hong@samsung.com>
  *
  * @file   x86_compute_backend.cpp
- * @date   05 Feb 2026
+ * @date   23 April 2024
  * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
- * @author h0g1 <h0g1.hong@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Compute backend for x86
  *
  */
 
 #include <assert.h>
-#include <cmath>
 
 #include <avx2_impl.h>
 #ifdef USE_BLAS
@@ -298,26 +295,8 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha) {
   nntrainer::avx2::swiglu(N, X, Y, Z, alpha);
 }
 
-void swiglu_unrolledx2(const unsigned int N, float *X, float *Y, float *Z,
-                       float alpha) {
-  nntrainer::avx2::swiglu(N, X, Y, Z, alpha);
-}
-
-void swiglu_unrolledx4(const unsigned int N, float *X, float *Y, float *Z,
-                       float alpha) {
-  nntrainer::avx2::swiglu(N, X, Y, Z, alpha);
-}
-
 void tanh_gelu(const unsigned int N, const float *X, float *Y) {
   // AVX implmenetation will be implemented, now fallback instead
-  __fallback_tanh_gelu(N, X, Y);
-}
-
-void tanh_gelu_unrolledx2(const unsigned int N, const float *X, float *Y) {
-  __fallback_tanh_gelu(N, X, Y);
-}
-
-void tanh_gelu_unrolledx4(const unsigned int N, const float *X, float *Y) {
   __fallback_tanh_gelu(N, X, Y);
 }
 
@@ -325,41 +304,11 @@ void tanh_gelu_v2(const unsigned int N, const float *X, float *Y) {
   __fallback_tanh_gelu(N, X, Y);
 }
 
-void tanh_gelu_v2_unrolledx2(const unsigned int N, const float *X, float *Y) {
-  __fallback_tanh_gelu(N, X, Y);
-}
-
-void tanh_gelu_v2_unrolledx4(const unsigned int N, const float *X, float *Y) {
-  __fallback_tanh_gelu(N, X, Y);
-}
-
-void tanh_gelu_v3(const unsigned int N, const float *X, float *Y) {
-  __fallback_tanh_gelu(N, X, Y);
-}
-
-void tanh_gelu_v3_unrolledx2(const unsigned int N, const float *X, float *Y) {
-  __fallback_tanh_gelu(N, X, Y);
-}
-
-void tanh_gelu_v3_unrolledx4(const unsigned int N, const float *X, float *Y) {
-  __fallback_tanh_gelu(N, X, Y);
+void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z) {
+  __fallback_tanh_gelu_mul(N, X, Y, Z);
 }
 
 void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z) {
-  __fallback_tanh_gelu_mul(N, X, Y, Z);
-}
-
-void tanh_gelu_v2_mul_unrolledx2(const unsigned int N, float *X, float *Y,
-                                 float *Z) {
-  __fallback_tanh_gelu_mul(N, X, Y, Z);
-}
-
-void tanh_gelu_v2_mul_unrolledx4(const unsigned int N, float *X, float *Y,
-                                 float *Z) {
-  __fallback_tanh_gelu_mul(N, X, Y, Z);
-}
-
-void tanh_gelu_v3_mul(const unsigned int N, float *X, float *Y, float *Z) {
   __fallback_tanh_gelu_mul(N, X, Y, Z);
 }
 

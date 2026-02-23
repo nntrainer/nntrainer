@@ -40,10 +40,6 @@
 typedef uint32x4_t v4su; // vector of 4 uint32
 typedef int32x4_t v4si;  // vector of 4 uint32
 
-#ifdef ARMV7
-#include <armv7_neon.h>
-#endif
-
 #define c_inv_mant_mask ~0x7f800000u
 #define c_cephes_SQRTHF 0.707106781186547524
 #define c_cephes_log_p0 7.0376836292E-2
