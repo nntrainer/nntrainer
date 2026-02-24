@@ -34,6 +34,9 @@
 
   (this is the zlib license)
 */
+#ifdef ARMV7
+#include <armv7_neon.h>
+#endif
 
 #if defined(__ARM_NEON__) || defined(__ARM_NEON) || defined(_M_ARM64)
 
