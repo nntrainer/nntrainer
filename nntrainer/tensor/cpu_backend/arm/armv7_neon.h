@@ -10,6 +10,9 @@
  * @brief  Conditional header file to support unsupported intrinsics on armv7l
  *
  */
+#ifndef ARMV7_NEON_
+#define ARMV7_NEON_
+
 #include <arm_neon.h>
 #include <cmath>
 
@@ -120,4 +123,5 @@ static inline float16_t vmaxvq_f16(float16x8_t a) {
   }
   return ret;
 }
+#endif
 #endif

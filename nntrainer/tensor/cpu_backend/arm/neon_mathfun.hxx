@@ -38,7 +38,8 @@
 #include <armv7_neon.h>
 #endif
 
-#if defined(__ARM_NEON__) || defined(__ARM_NEON) || defined(_M_ARM64)
+#if defined(__ARM_NEON__) || defined(__ARM_NEON) || defined(_M_ARM64) ||       \
+  defined(ARMV7)
 
 typedef uint32x4_t v4su; // vector of 4 uint32
 typedef int32x4_t v4si;  // vector of 4 uint32
