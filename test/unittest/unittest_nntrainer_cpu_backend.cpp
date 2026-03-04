@@ -797,6 +797,32 @@ TEST(nntrainer_cpu_backend_standalone, softmax_row_inplace) {
   }
 }
 
+TEST(nntrainer_cpu_backend_standalone, softmax_row_inplace_sink) {
+  size_t start_row = 0;
+  size_t end_row = 2;
+  size_t num_heads = 10;
+  size_t qk_out_size = num_heads * end_row;
+  std::vector<float> qk_out = {-6.880110f, -8.000502f, -8.838327f, -0.815022f,
+                               7.323523f,  -3.325828f, 2.022300f,  -7.142663f,
+                               4.161452f,  3.017770f,  -9.588310f, -8.871769f,
+                               9.398197f,  4.439975f,  6.648853f,  8.771055f,
+                               -5.753218f, -9.984425f, -6.363501f, 9.844232f};
+  std::vector<float> sink = {-2.509198f, 5.930860f, 9.014286f, -6.331305f,
+                             4.639878f,  5.593820f, 1.973170f, 1.937003f,
+                             -6.879627f, -1.083345f};
+  std::vector<float> ref_out = {
+    0.012472f, 0.000001f, 0.000000f, 0.005194f, 0.633859f, 0.000005f, 0.512170f,
+    0.000114f, 0.999957f, 0.001083f, 0.000831f, 0.000000f, 0.594816f, 0.994785f,
+    0.322840f, 0.959963f, 0.000215f, 0.000007f, 0.000027f, 0.998899f};
+
+  nntrainer::softmax_row_inplace(qk_out.data(), start_row, end_row, num_heads,
+                                 sink.data());
+
+  for (size_t i = 0; i < qk_out_size; i++) {
+    EXPECT_NEAR(ref_out[i], qk_out[i], 0.0001f);
+  }
+}
+
 TEST(nntrainer_cpu_backend_standalone, softmax_row) {
   size_t start_row = 0;
   size_t end_row = 3;
@@ -1003,6 +1029,32 @@ TEST(nntrainer_cpu_backend_standalone, softmax_row_inplace_fp16) {
     0.322840, 0.959963, 0.000215, 0.000007, 0.000027, 0.998899};
 
   nntrainer::softmax_row_inplace(qk_out.data(), start_row, end_row, num_heads);
+
+  for (size_t i = 0; i < qk_out_size; i++) {
+    EXPECT_NEAR(ref_out[i], qk_out[i], 0.0005f);
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone, softmax_row_inplace_fp16_sink) {
+  size_t start_row = 0;
+  size_t end_row = 2;
+  size_t num_heads = 10;
+  size_t qk_out_size = num_heads * end_row;
+  std::vector<__fp16> qk_out = {-6.880110f, -8.000502f, -8.838327f, -0.815022f,
+                                7.323523f,  -3.325828f, 2.022300f,  -7.142663f,
+                                4.161452f,  3.017770f,  -9.588310f, -8.871769f,
+                                9.398197f,  4.439975f,  6.648853f,  8.771055f,
+                                -5.753218f, -9.984425f, -6.363501f, 9.844232f};
+  std::vector<__fp16> sink = {-2.509198f, 5.930860f, 9.014286f, -6.331305f,
+                              4.639878f,  5.593820f, 1.973170f, 1.937003f,
+                              -6.879627f, -1.083345f};
+  std::vector<__fp16> ref_out = {
+    0.012472f, 0.000001f, 0.000000f, 0.005194f, 0.633859f, 0.000005f, 0.512170f,
+    0.000114f, 0.999957f, 0.001083f, 0.000831f, 0.000000f, 0.594816f, 0.994785f,
+    0.322840f, 0.959963f, 0.000215f, 0.000007f, 0.000027f, 0.998899f};
+
+  nntrainer::softmax_row_inplace(qk_out.data(), start_row, end_row, num_heads,
+                                 sink.data());
 
   for (size_t i = 0; i < qk_out_size; i++) {
     EXPECT_NEAR(ref_out[i], qk_out[i], 0.0005f);
