@@ -80,6 +80,12 @@ inline v4sf cos_ps(v4sf x);
  */
 inline void sincos_ps(v4sf x, v4sf *s, v4sf *c);
 
+/**
+ * @brief reciprocal function with neon x = 1/x
+ * @param[in] x input register variable (float32x4_t)
+ */
+inline v4sf rcp_ps(v4sf x);
+
 #include "neon_mathfun.hxx"
 
 #endif

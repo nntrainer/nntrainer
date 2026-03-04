@@ -361,4 +361,18 @@ inline v4sf tanh_ps(v4sf x) {
   return res;
 }
 
+/**
+ * @brief reciprocal function with simd
+ *
+ * @param x input register variable
+ * @return v4sf
+ */
+v4sf rcp_ps(v4sf x) {
+  // apply reciprocal once
+  v4sf rcp = vrecpeq_f32(x);
+  // apply Newton-Rapson method to enhance accuracy
+  // x_n+1 = x_n * (2 - x_0 * x_n)
+  return vmulq_f32(rcp, vrecpsq_f32(x, rcp));
+}
+
 #endif

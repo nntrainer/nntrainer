@@ -1432,56 +1432,74 @@ void exp_i(const unsigned int N, float *X) {
 
 static void softmax_row_inplace(float *qk_out, size_t start_row, size_t end_row,
                                 size_t num_heads) {
-  size_t row_range = end_row - start_row;
-  const size_t full_blocks = (num_heads / 4) * 4;
-  // const size_t remainder = num_heads % 4;
+  const size_t vec_end = num_heads & ~((size_t)3); // floor(num_heads / 4) * 4
 
+  // 1. find max for each head
   float *max_vals = new float[num_heads];
+
+  // initialize max_vals with first row of qk_out
+  std::memcpy(max_vals, qk_out + start_row * num_heads,
+              num_heads * sizeof(float));
+
+  // update max_vals for each row
+  for (size_t r = start_row + 1; r < end_row; ++r) {
+    float *row = qk_out + (num_heads * r);
+    for (size_t c = 0; c < vec_end; c += 4) {
+      float32x4_t v = vld1q_f32(row + c);
+      float32x4_t m = vld1q_f32(max_vals + c);
+      m = vmaxq_f32(v, m);
+      vst1q_f32(max_vals + c, m);
+    }
+    for (size_t c = vec_end; c < num_heads; ++c) {
+      max_vals[c] = std::max(max_vals[c], row[c]);
+    }
+  }
+
+  // 2. calc exp(x - max) and sum
   float *sum_vals = new float[num_heads];
+  std::memset(sum_vals, 0, num_heads * sizeof(float));
 
-  // 1. max
-  for (size_t c = 0; c < num_heads; ++c) {
-    float max_val = -INFINITY;
-    for (size_t r = start_row; r < end_row; ++r)
-      max_val = std::max(max_val, qk_out[r * num_heads + c]);
-    max_vals[c] = max_val;
+  for (size_t r = start_row; r < end_row; ++r) {
+    float *row = qk_out + (num_heads * r);
+    for (size_t c = 0; c < vec_end; c += 4) {
+      float32x4_t s = vld1q_f32(sum_vals + c);
+      float32x4_t v = vld1q_f32(row + c);
+      float32x4_t m = vld1q_f32(max_vals + c);
+      float32x4_t d = vsubq_f32(v, m); // x - max
+      float32x4_t e = exp_ps(d);       // exp(x - max)
+      vst1q_f32(row + c, e);           // overwrite qk_out
+      s = vaddq_f32(s, e);             // sum += exp(x - max)
+      vst1q_f32(sum_vals + c, s);      // update sum_vals
+    }
+    for (size_t c = vec_end; c < num_heads; ++c) {
+      float e = std::exp(row[c] - max_vals[c]);
+      row[c] = e;
+      sum_vals[c] += e;
+    }
   }
 
-  // 2. inplace exp + sum
-  for (size_t c = 0; c < full_blocks; c += 4) {
-    float32x4_t maxv = vld1q_f32(&max_vals[c]);
-    float32x4_t sum = vdupq_n_f32(0.0f);
-    for (size_t r = 0; r < row_range; ++r) {
-      float *ptr = &qk_out[(start_row + r) * num_heads + c];
-      float32x4_t val = vld1q_f32(ptr);
-      float32x4_t e = exp_ps(vsubq_f32(val, maxv));
-      vst1q_f32(ptr, e); // overwrite qk_out
-      sum = vaddq_f32(sum, e);
-    }
-    vst1q_f32(&sum_vals[c], sum);
+  // 3. calc 1/sum
+  // vdivq_f32 is slow
+  // precalculate (1/sum) and then multiply is much faster
+  for (size_t c = 0; c < vec_end; c += 4) {
+    float32x4_t s = vld1q_f32(sum_vals + c);
+    s = rcp_ps(s); // sum = 1/sum
+    vst1q_f32(sum_vals + c, s);
+  }
+  for (size_t c = vec_end; c < num_heads; ++c) {
+    sum_vals[c] = 1 / sum_vals[c];
   }
 
-  for (size_t c = full_blocks; c < num_heads; ++c) {
-    float sum = 0.0f;
-    float maxv = max_vals[c];
-    for (size_t r = 0; r < row_range; ++r) {
-      float &a = qk_out[(start_row + r) * num_heads + c];
-      a = std::exp(a - maxv); // overwrite qk_out
-      sum += a;
+  for (size_t r = start_row; r < end_row; ++r) {
+    float *row = qk_out + (num_heads * r);
+    for (size_t c = 0; c < vec_end; c += 4) {
+      float32x4_t s = vld1q_f32(sum_vals + c); // 1/sum
+      float32x4_t v = vld1q_f32(row + c);      // exp(x - max)
+      float32x4_t o = vmulq_f32(v, s);         // exp(x - max) * (1/sum)
+      vst1q_f32(row + c, o);                   // overwrite qk_out
     }
-    sum_vals[c] = sum;
-  }
-  // 3. softmax = exp / sum (inplace)
-  for (size_t r = 0; r < row_range; ++r) {
-    for (size_t c = 0; c < full_blocks; c += 4) {
-      float *ptr = &qk_out[(start_row + r) * num_heads + c];
-      float32x4_t val = vld1q_f32(ptr); // already exp(x - max)
-      float32x4_t sumv = vld1q_f32(&sum_vals[c]);
-      float32x4_t soft = vdivq_f32(val, sumv);
-      vst1q_f32(ptr, soft);
-    }
-    for (size_t c = full_blocks; c < num_heads; ++c) {
-      qk_out[(start_row + r) * num_heads + c] /= sum_vals[c];
+    for (size_t c = vec_end; c < num_heads; ++c) {
+      row[c] *= sum_vals[c];
     }
   }
 
@@ -1492,56 +1510,87 @@ static void softmax_row_inplace(float *qk_out, size_t start_row, size_t end_row,
 static void softmax_row_with_sink_inplace(float *qk_out, size_t start_row,
                                           size_t end_row, size_t num_heads,
                                           float *sink) {
-  size_t row_range = end_row - start_row;
-  const size_t full_blocks = (num_heads / 4) * 4;
+  const size_t vec_end = num_heads & ~((size_t)3); // floor(num_heads / 4) * 4
 
+  // 1. find max for each head
   float *max_vals = new float[num_heads];
+
+  // initialize max_vals with sink
+  std::memcpy(max_vals, sink, num_heads * sizeof(float));
+
+  // update max_vals for each row
+  for (size_t r = start_row; r < end_row; ++r) {
+    float *row = qk_out + (num_heads * r);
+    for (size_t c = 0; c < vec_end; c += 4) {
+      float32x4_t v = vld1q_f32(row + c);
+      float32x4_t m = vld1q_f32(max_vals + c);
+      m = vmaxq_f32(v, m);
+      vst1q_f32(max_vals + c, m);
+    }
+    for (size_t c = vec_end; c < num_heads; ++c) {
+      max_vals[c] = std::max(max_vals[c], row[c]);
+    }
+  }
+
+  // 2. calc exp(x - max) and sum
   float *sum_vals = new float[num_heads];
-
-  // 1. max
-  for (size_t c = 0; c < num_heads; ++c) {
-    float max_val = sink[c];
-    for (size_t r = start_row; r < end_row; ++r)
-      max_val = std::max(max_val, qk_out[r * num_heads + c]);
+  // init sum_vals with exp(sink - max)
+  {
+    for (size_t c = 0; c < vec_end; c += 4) {
+      float32x4_t v = vld1q_f32(sink + c);
+      float32x4_t m = vld1q_f32(max_vals + c);
+      float32x4_t d = vsubq_f32(v, m); // sink - max
+      float32x4_t e = exp_ps(d);       // exp(sink - max)
+      vst1q_f32(sum_vals + c, e);
+    }
+    for (size_t c = vec_end; c < num_heads; ++c) {
+      float e = std::exp(sink[c] - max_vals[c]);
+      sum_vals[c] = e;
+    }
   }
 
-  // 2. inplace exp + sum
-  for (size_t c = 0; c < full_blocks; c += 4) {
-    float32x4_t maxv = vld1q_f32(&max_vals[c]);
-    float32x4_t sum = exp_ps(vsubq_f32(vld1q_f32(&sink[c]), maxv));
-
-    for (size_t r = 0; r < row_range; ++r) {
-      float *ptr = &qk_out[(start_row + r) * num_heads + c];
-      float32x4_t val = vld1q_f32(ptr);
-      float32x4_t e = exp_ps(vsubq_f32(val, maxv));
-      vst1q_f32(ptr, e); // overwrite qk_out
-      sum = vaddq_f32(sum, e);
+  for (size_t r = start_row; r < end_row; ++r) {
+    float *row = qk_out + (num_heads * r);
+    for (size_t c = 0; c < vec_end; c += 4) {
+      float32x4_t s = vld1q_f32(sum_vals + c);
+      float32x4_t v = vld1q_f32(row + c);
+      float32x4_t m = vld1q_f32(max_vals + c);
+      float32x4_t d = vsubq_f32(v, m); // x - max
+      float32x4_t e = exp_ps(d);       // exp(x - max)
+      vst1q_f32(row + c, e);           // overwrite qk_out
+      s = vaddq_f32(s, e);             // sum += exp(x - max)
+      vst1q_f32(sum_vals + c, s);      // update sum_vals
     }
-    vst1q_f32(&sum_vals[c], sum);
+    for (size_t c = vec_end; c < num_heads; ++c) {
+      float e = std::exp(row[c] - max_vals[c]);
+      row[c] = e;
+      sum_vals[c] += e;
+    }
   }
 
-  for (size_t c = full_blocks; c < num_heads; ++c) {
-    float maxv = max_vals[c];
-    float sum = std::exp(sink[c] - maxv);
-
-    for (size_t r = 0; r < row_range; ++r) {
-      float &a = qk_out[(start_row + r) * num_heads + c];
-      a = std::exp(a - maxv); // overwrite qk_out
-      sum += a;
-    }
-    sum_vals[c] = sum;
+  // 3. calc 1/sum
+  // vdivq_f32 is slow
+  // precalculate (1/sum) and then multiply is much faster
+  for (size_t c = 0; c < vec_end; c += 4) {
+    float32x4_t s = vld1q_f32(sum_vals + c);
+    s = rcp_ps(s); // sum = 1/sum
+    vst1q_f32(sum_vals + c, s);
   }
-  // 3. softmax = exp / sum (inplace)
-  for (size_t r = 0; r < row_range; ++r) {
-    for (size_t c = 0; c < full_blocks; c += 4) {
-      float *ptr = &qk_out[(start_row + r) * num_heads + c];
-      float32x4_t val = vld1q_f32(ptr); // already exp(x - max)
-      float32x4_t sumv = vld1q_f32(&sum_vals[c]);
-      float32x4_t soft = vdivq_f32(val, sumv);
-      vst1q_f32(ptr, soft);
+  for (size_t c = vec_end; c < num_heads; ++c) {
+    sum_vals[c] = 1 / sum_vals[c];
+  }
+
+  // 4. calc exp(x - max) * (1/sum)
+  for (size_t r = start_row; r < end_row; ++r) {
+    float *row = qk_out + (num_heads * r);
+    for (size_t c = 0; c < vec_end; c += 4) {
+      float32x4_t s = vld1q_f32(sum_vals + c); // 1/sum
+      float32x4_t v = vld1q_f32(row + c);      // exp(x - max)
+      float32x4_t o = vmulq_f32(v, s);         // exp(x - max) * (1/sum)
+      vst1q_f32(row + c, o);                   // overwrite qk_out
     }
-    for (size_t c = full_blocks; c < num_heads; ++c) {
-      qk_out[(start_row + r) * num_heads + c] /= sum_vals[c];
+    for (size_t c = vec_end; c < num_heads; ++c) {
+      row[c] *= sum_vals[c];
     }
   }
 
@@ -1562,120 +1611,13 @@ void softmax_row_inplace(float *qk_out, size_t start_row, size_t end_row,
 
 static void softmax_row(float *qk_out, size_t start_row, size_t end_row,
                         size_t num_heads) {
-  const size_t full_block = (num_heads / 4) * 4;
-
-  float *max_vals = new float[num_heads];
-  float *sum_vals = new float[num_heads];
-
-  // 1. Find Max along with col
-  for (size_t c = 0; c < num_heads; ++c) {
-    float max_val = -INFINITY;
-    for (size_t r = start_row; r < end_row; ++r) {
-      max_val = std::max(max_val, qk_out[r * num_heads + c]);
-    }
-    max_vals[c] = max_val;
-  }
-
-  // 2. Compute sum along with col (exp vectorized)
-  for (size_t c = 0; c < full_block; c += 4) {
-    float32x4_t sum = vdupq_n_f32(0.0f);
-    for (size_t r = start_row; r < end_row; ++r) {
-      float32x4_t val = vld1q_f32(&qk_out[r * num_heads + c]);
-      float32x4_t maxv = vld1q_f32(&max_vals[c]);
-      float32x4_t sub = vsubq_f32(val, maxv);
-      float32x4_t e = exp_ps(sub);
-      sum = vaddq_f32(sum, e);
-    }
-    vst1q_f32(&sum_vals[c], sum);
-  }
-
-  for (size_t c = full_block; c < num_heads; ++c) {
-    float sum = 0.0f;
-    for (size_t r = start_row; r < end_row; ++r) {
-      sum += std::exp(qk_out[r * num_heads + c] - max_vals[c]);
-    }
-    sum_vals[c] = sum;
-  }
-
-  // 3. apply softmax
-  for (size_t r = start_row; r < end_row; ++r) {
-    for (size_t c = 0; c < full_block; c += 4) {
-      float32x4_t val = vld1q_f32(&qk_out[r * num_heads + c]);
-      float32x4_t maxv = vld1q_f32(&max_vals[c]);
-      float32x4_t sub = vsubq_f32(val, maxv);
-      float32x4_t e = exp_ps(sub);
-      float32x4_t sumv = vld1q_f32(&sum_vals[c]);
-      float32x4_t softmax = vdivq_f32(e, sumv);
-      vst1q_f32(&qk_out[r * num_heads + c], softmax);
-    }
-    for (size_t c = full_block; c < num_heads; ++c) {
-      qk_out[r * num_heads + c] =
-        std::exp(qk_out[r * num_heads + c] - max_vals[c]) / sum_vals[c];
-    }
-  }
-
-  delete[] max_vals;
-  delete[] sum_vals;
+  softmax_row_inplace(qk_out, start_row, end_row, num_heads);
 }
 
 static void softmax_with_sink_row(float *qk_out, size_t start_row,
                                   size_t end_row, size_t num_heads,
                                   float *sink) {
-  const size_t full_block = (num_heads / 4) * 4;
-
-  float *max_vals = new float[num_heads];
-  float *sum_vals = new float[num_heads];
-
-  // 1. Find Max along with col
-  for (size_t c = 0; c < num_heads; ++c) {
-    float max_val = sink[c];
-    for (size_t r = start_row; r < end_row; ++r) {
-      max_val = std::max(max_val, qk_out[r * num_heads + c]);
-    }
-    max_vals[c] = max_val;
-  }
-
-  // 2. Compute sum along with col (exp vectorized)
-  for (size_t c = 0; c < full_block; c += 4) {
-    float32x4_t maxv = vld1q_f32(&max_vals[c]);
-    float32x4_t sum = exp_ps(vsubq_f32(vld1q_f32(&sink[c]), maxv));
-
-    for (size_t r = start_row; r < end_row; ++r) {
-      float32x4_t val = vld1q_f32(&qk_out[r * num_heads + c]);
-      float32x4_t sub = vsubq_f32(val, maxv);
-      float32x4_t e = exp_ps(sub);
-      sum = vaddq_f32(sum, e);
-    }
-    vst1q_f32(&sum_vals[c], sum);
-  }
-
-  for (size_t c = full_block; c < num_heads; ++c) {
-    float sum = std::exp(sink[c] - max_vals[c]);
-    for (size_t r = start_row; r < end_row; ++r) {
-      sum += std::exp(qk_out[r * num_heads + c] - max_vals[c]);
-    }
-    sum_vals[c] = sum;
-  }
-
-  // 3. apply softmax
-  for (size_t r = start_row; r < end_row; ++r) {
-    for (size_t c = 0; c < full_block; c += 4) {
-      float32x4_t val = vld1q_f32(&qk_out[r * num_heads + c]);
-      float32x4_t maxv = vld1q_f32(&max_vals[c]);
-      float32x4_t sub = vsubq_f32(val, maxv);
-      float32x4_t e = exp_ps(sub);
-      float32x4_t sumv = vld1q_f32(&sum_vals[c]);
-      float32x4_t softmax = vdivq_f32(e, sumv);
-      vst1q_f32(&qk_out[r * num_heads + c], softmax);
-    }
-    for (size_t c = full_block; c < num_heads; ++c) {
-      qk_out[r * num_heads + c] =
-        std::exp(qk_out[r * num_heads + c] - max_vals[c]) / sum_vals[c];
-    }
-  }
-
-  delete[] max_vals;
-  delete[] sum_vals;
+  softmax_row_with_sink_inplace(qk_out, start_row, end_row, num_heads, sink);
 }
 
 template <>
