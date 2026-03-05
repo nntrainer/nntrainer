@@ -100,6 +100,15 @@ public:
   virtual void run(const WSTR prompt, bool do_sample = false,
                    const WSTR system_prompt = "", const WSTR tail_prompt = "");
 
+  /**
+   * @brief Check if the model has image input. False by default.
+   * For multi-modal models, override this function with
+   * it's own image input checker.
+   * @param input_text the input_prompt for model
+   * @return true if the model has image input, false otherwise
+   */
+  virtual bool checkImageInput(const std::string &input_text) { return false; }
+
 protected:
   /**
    * @brief Setup the parameters for the Transformer model
@@ -175,6 +184,7 @@ protected:
   unsigned int FSU_LOOKAHEAD;
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
+  bool HAS_IMAGE_INPUT = false;
 };
 /**
  * Loads JSON data from a file with detailed error handling

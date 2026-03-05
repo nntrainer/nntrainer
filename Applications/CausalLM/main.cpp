@@ -257,6 +257,14 @@ int main(int argc, char *argv[]) {
 
     auto model = causallm::Factory::Instance().create(architecture, cfg,
                                                       generation_cfg, nntr_cfg);
+
+    // Check for image input support in config.
+    // If supported, check if it needs to run in image input mode
+    if (nntr_cfg.contains("image_input_support") &&
+        nntr_cfg["image_input_support"].get<bool>()) {
+      model->checkImageInput(input_text);
+    }
+
     model->initialize();
     model->load_weight(weight_file);
 
