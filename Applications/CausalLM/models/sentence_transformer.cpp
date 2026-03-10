@@ -199,6 +199,11 @@ void SentenceTransformer::run(const WSTR prompt, bool do_sample,
         std::cout << ", ...";
       std::cout << "] (Total DIM: " << DIM << ")" << std::endl;
     }
+
+    // output should be deallocated after use.
+    for (auto out : results) {
+      delete[] out;
+    }
   } catch (const std::exception &e) {
     std::cerr << "Error during embedding run: " << e.what() << std::endl;
   }

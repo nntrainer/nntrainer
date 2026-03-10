@@ -1159,43 +1159,29 @@ std::vector<float *> NeuralNetwork::incremental_inference(
   // auto end_increment = std::chrono::high_resolution_clock::now();
   std::vector<float *> output;
 
-  ///@note Always we take the first position of output
-  // unsigned int step = ((to - from) == 0) ? 0 : (to - from) - 1;
-  unsigned int step = 0;
-
   for (auto &out : output_tensors) {
     auto out_t = *out.get();
     float *last_out_buf_data;
 
     if (output_hidden_state) {
-      last_out_buf_data = out_t.getData();
-    } else {
-      last_out_buf_data = new float[batch_size * out_t.width()];
+      std::cout << "Warning: output_hidden_state is not supported yet.\n"
+                << "Returning last hidden state only...\n"
+                << "Please free output memory after use!";
+    }
+    const size_t buf_size = batch_size * out_t.getDim().getFeatureLen();
+    last_out_buf_data = new float[buf_size];
 
-      for (unsigned int batch = 0; batch < batch_size; ++batch) {
-        if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
+    if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
 
-          const _FP16 *out_t_batch_ptr =
-            out_t.getData<_FP16>() + batch * out_t.getDim().getFeatureLen() +
-            step * out_t.width();
-          scopy(out_t.width(), out_t_batch_ptr, 1,
-                last_out_buf_data + batch * out_t.width(), 1);
-
+      nntrainer::scopy(buf_size, out_t.getData<_FP16>(), 1, last_out_buf_data,
+                       1);
 #else
-          throw std::invalid_argument("Error: enable-fp16 is not set");
+      throw std::invalid_argument("Error: enable-fp16 is not set");
 #endif
-        } else if (out->getDataType() == ml::train::TensorDim::DataType::FP32) {
+    } else if (out->getDataType() == ml::train::TensorDim::DataType::FP32) {
 
-          const float *out_t_batch_ptr =
-            out_t.getData() + batch * out_t.getDim().getFeatureLen() +
-            step * out_t.width();
-          // std::memcpy( last_out_buf_data + batch * out_t.width(),
-          // out_t_batch_ptr, out_t.width()*sizeof(float));
-          scopy(out_t.width(), out_t_batch_ptr, 1,
-                last_out_buf_data + batch * out_t.width(), 1);
-        }
-      }
+      std::memcpy(last_out_buf_data, out_t.getData(), sizeof(float) * buf_size);
     }
 
     output.push_back(last_out_buf_data);
