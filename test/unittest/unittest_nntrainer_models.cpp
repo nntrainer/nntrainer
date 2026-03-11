@@ -11,6 +11,7 @@
  *
  */
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -1137,6 +1138,75 @@ TEST(nntrainerModels, loadFromLayersRecurrent_p) {
               expected_input_layers.at(i))
       << "at " << i;
   };
+}
+
+/**
+ * @brief Regression test for incremental_inference step selection.
+ *
+ * For sequence outputs, output_hidden_state=false must return the last step.
+ */
+TEST(nntrainerModels, incrementalInferenceReturnsLastStep_p) {
+  nntrainer::NeuralNetwork nn;
+
+  fc_softmax_mse_distribute.save_ini();
+  nn.load(fc_softmax_mse_distribute.getIniName(),
+          ml::train::ModelFormat::MODEL_FORMAT_INI);
+  fc_softmax_mse_distribute.erase_ini();
+
+  EXPECT_EQ(nn.compile(), ML_ERROR_NONE);
+  EXPECT_EQ(nn.initialize(), ML_ERROR_NONE);
+
+  auto in_dim = nn.getInputDimension();
+  auto out_dim = nn.getOutputDimension();
+  ASSERT_EQ(in_dim.size(), 1u);
+  ASSERT_EQ(out_dim.size(), 1u);
+  ASSERT_GT(out_dim[0].height(), 1u);
+
+  const unsigned int width = out_dim[0].width();
+  const unsigned int sequence_len = out_dim[0].height();
+  std::vector<float> input(in_dim[0].getDataLen(), 0.0f);
+  std::vector<float *> input_ptr{input.data()};
+  std::vector<float> first_step(width);
+  std::vector<float> last_step(width);
+
+  bool distinguished_steps = false;
+  for (unsigned int trial = 0; trial < 4; ++trial) {
+    for (unsigned int i = 0; i < input.size(); ++i) {
+      input[i] = static_cast<float>((trial + 1) * (i + 1));
+    }
+
+    auto full_hidden =
+      nn.incremental_inference(1, input_ptr, {}, sequence_len, 0, sequence_len,
+                               true);
+    ASSERT_EQ(full_hidden.size(), 1u);
+
+    for (unsigned int i = 0; i < width; ++i) {
+      first_step[i] = full_hidden[0][i];
+      last_step[i] = full_hidden[0][(sequence_len - 1) * width + i];
+    }
+
+    for (unsigned int i = 0; i < width; ++i) {
+      if (std::fabs(first_step[i] - last_step[i]) > 1e-5f) {
+        distinguished_steps = true;
+        break;
+      }
+    }
+    if (distinguished_steps)
+      break;
+  }
+
+  ASSERT_TRUE(distinguished_steps)
+    << "Failed to generate distinguishable first/last sequence outputs";
+
+  auto reduced =
+    nn.incremental_inference(1, input_ptr, {}, sequence_len, 0, sequence_len,
+                             false);
+  ASSERT_EQ(reduced.size(), 1u);
+
+  for (unsigned int i = 0; i < width; ++i) {
+    EXPECT_NEAR(reduced[0][i], last_step[i], 1e-5f)
+      << "Mismatch at width index " << i;
+  }
 }
 
 /**
