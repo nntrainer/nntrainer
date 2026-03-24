@@ -141,9 +141,7 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   for (unsigned int b = 0; b < b_size; ++b) {
     nntrainer::Tensor input_step = input_.getSharedDataTensor(
       input_step_dim,
-      b * input_dim.getFeatureLen() +
-        (to - from == 1 ? 0 : (to - 1) * input_.width()),
-      true);
+      b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
