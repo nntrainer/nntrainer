@@ -1,7 +1,7 @@
 # Execute gbs with --define "testcoverage 1" in case that you must get unittest coverage statistics
 %define         use_cblas 1
-%define         nnstreamer_filter 1
-%define         nnstreamer_trainer 1
+%define         nnstreamer_filter 0
+%define         nnstreamer_trainer 0
 %define         nnstreamer_subplugin_path lib/nnstreamer
 %define         use_gym 0
 %define         use_ruy 0

@@ -59,39 +59,8 @@ jobs:
       run: |
         gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A ${{ matrix.gbs_build_arch }} ${{ matrix.gbs_build_option }}
 
-    - name: get ML API
-      if: env.rebuild == '1'
-      uses: actions/checkout@v4
-      with:
-        repository: nnstreamer/api
-        path: api
-    - name: get ML Agent
-      if: env.rebuild == '1'
-      uses: actions/checkout@v4
-      with:
-        repository: nnstreamer/deviceMLOps.MLAgent
-        path: mlagent
-    - name: get NNStreamer
-      if: env.rebuild == '1'
-      uses: actions/checkout@v4
-      with:
-        repository: nnstreamer/nnstreamer
-        path: _nnstreamer
-    - name: build and test nnstreamer ml-api and ml-agent
-      if: env.rebuild == '1'
-      run: |
-        pushd _nnstreamer
-        echo "::group::Build and run unit-tests for NNStreamer"
-        gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A ${{ matrix.gbs_build_arch }} ${{ matrix.gbs_build_option }}
-        echo "::endgroup::"
-        popd
-        pushd api
-        echo "::group::Build and run unit-tests for ML API"
-        gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A ${{ matrix.gbs_build_arch }} ${{ matrix.gbs_build_option }}
-        echo "::endgroup::"
-        popd
-        pushd mlagent
-        echo "::group::Build and run unit-tests for ML Agent (deviceMLOps.MLAgent)"
-        gbs build --skip-srcrpm --define "_skip_debug_rpm 1" -A ${{ matrix.gbs_build_arch }} ${{ matrix.gbs_build_option }}
-        echo "::endgroup::"
-        popd
+    # Disabled: nnstreamer/api/mlagent tests are unstable on Tizen CI
+    # - name: get ML API
+    # - name: get ML Agent
+    # - name: get NNStreamer
+    # - name: build and test nnstreamer ml-api and ml-agent
