@@ -195,6 +195,7 @@ void ClContext::initBlasClKernels() {
   registerClKernel(transpose_16bit_kernel, "kernel_transpose_16");
   registerClKernel(transpose_32bit_16bit_kernel, "kernel_transpose_32_16");
   registerClKernel(q4_0_ab_bi_8x4_kernel, "kernel_mul_mat_Ab_Bi_8x4");
+  registerClKernel(flash_attention_fp32_kernel, "flash_attention_fp32");
 
   // register INT4 computation kernels
   registerClKernel(int4_gemv_kernel, "fully_connected_gpu_int4_gemv");

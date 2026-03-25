@@ -88,6 +88,7 @@ if get_option('enable-opencl')
   test_target += [['unittest_opencl_kernels_int4', []]]
   test_target += [['unittest_opencl_kernels_qk_k', []]]
   test_target += [['unittest_attention_kernels_cl', []]]
+  test_target += [['unittest_flash_attention_cl', []]]
 endif
 
 if get_option('enable-fp16')

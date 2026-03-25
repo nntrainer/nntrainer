@@ -8,6 +8,7 @@ cl_op_kernels = [
   'convert_block_q4_0.cl',
   'copy.cl',
   'dot.cl',
+  'flash_attention_fp32.cl',
   'int4_gemv.cl',
   'int4_quantize_input.cl',
   'int4_gemm.cl',
