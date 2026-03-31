@@ -74,7 +74,8 @@ test_target = [
   ['unittest_common_properties', []],
   ['unittest_nntrainer_tensor_pool', []],
   ['unittest_nntrainer_lr_scheduler', []],
-  ['unittest_nntrainer_save_with_dtype', []]
+  ['unittest_nntrainer_save_with_dtype', []],
+  ['unittest_thread_manager', []],
   #['unittest_nntrainer_task', []],
 ]
 

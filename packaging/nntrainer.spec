@@ -608,6 +608,8 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/nntr_ggml_impl_utils.h
 %{_includedir}/nntrainer/bs_thread_pool.h
 %{_includedir}/nntrainer/bs_thread_pool_manager.hpp
+%{_includedir}/nntrainer/thread_manager.h
+%{_includedir}/nntrainer/thread_manager_util.h
 %ifarch %{ix86} x86_64
 %{_includedir}/nntrainer/x86_compute_backend.h
 %{_includedir}/nntrainer/avx2_impl.h
