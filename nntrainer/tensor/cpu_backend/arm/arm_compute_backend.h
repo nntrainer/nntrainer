@@ -1108,6 +1108,26 @@ void cosine(const unsigned int N, T *X, T *Y, float alpha = 1.f,
  * @param X float * for Vector X
  */
 void inv_sqrt_inplace(const unsigned int N, float *X);
+
+/**
+ * @brief Vectorized squaring operation using NEON: out[i] = a[i] * a[i]
+ *
+ * @param a input float vector
+ * @param out output float vector
+ * @param len number of elements to process
+ */
+void neon_square(const float *a, float *out, size_t len);
+
+/**
+ * @brief Vectorized scalar addition using NEON: out[i] = a[i] + scalar
+ *
+ * @param a input float vector
+ * @param scalar scalar value to add
+ * @param out output float vector
+ * @param len number of elements to process
+ */
+void neon_add_scalar(const float *a, float scalar, float *out, size_t len);
+
 /**
  * @brief     elementwise vector multiplication : Z = X ⊙ alpha * Y +
  * beta * Z

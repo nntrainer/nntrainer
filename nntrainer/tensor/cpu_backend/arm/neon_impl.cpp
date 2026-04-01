@@ -637,6 +637,32 @@ void inv_sqrt_inplace(const unsigned int N, float *X) {
   }
 }
 
+void neon_square(const float *a, float *out, size_t len) {
+  size_t i = 0;
+  for (; i + 4 <= len; i += 4) {
+    float32x4_t va = vld1q_f32(a + i);
+    float32x4_t vresult = vmulq_f32(va, va);  // Multiply by itself
+    vst1q_f32(out + i, vresult);
+  }
+  for (; i < len; ++i) {
+    out[i] = a[i] * a[i];
+  }
+}
+
+void neon_add_scalar(const float *a, float scalar, float *out, size_t len) {
+  size_t i = 0;
+  float32x4_t vscalar = vdupq_n_f32(scalar);  // Broadcast scalar ONCE
+  
+  for (; i + 4 <= len; i += 4) {
+    float32x4_t va = vld1q_f32(a + i);
+    float32x4_t vresult = vaddq_f32(va, vscalar);
+    vst1q_f32(out + i, vresult);
+  }
+  for (; i < len; ++i) {
+    out[i] = a[i] + scalar;
+  }
+}
+
 void ele_mul(const unsigned int N, const float *X, const float *Y, float *Z,
              float alpha, float beta) {
   unsigned int i = 0;

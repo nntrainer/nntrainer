@@ -243,6 +243,14 @@ void cosine(const unsigned int N, float *X, float *Y, float alpha, float beta) {
   nntrainer::neon::cosine(N, X, Y, alpha, beta);
 }
 
+void neon_square(const float *a, float *out, size_t len) {
+  nntrainer::neon::neon_square(a, out, len);
+}
+
+void neon_add_scalar(const float *a, float scalar, float *out, size_t len) {
+  nntrainer::neon::neon_add_scalar(a, scalar, out, len);
+}
+
 void inv_sqrt_inplace(const unsigned int N, float *X) {
   nntrainer::neon::inv_sqrt_inplace(N, X);
 }

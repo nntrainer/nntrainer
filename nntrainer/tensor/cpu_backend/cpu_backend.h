@@ -1443,6 +1443,26 @@ extern void compute_rotary_emb_value(unsigned int width, unsigned int dim,
 extern void rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
                                               float *__restrict Y, size_t H,
                                               size_t W, float epsilon);
+
+/**
+ * @brief Element-wise squaring: out = a * a
+ *
+ * @param[in] a input array
+ * @param[out] out output array
+ * @param[in] len number of elements
+ */
+extern void neon_square(const float *a, float *out, size_t len);
+
+/**
+ * @brief Add scalar to array: out = a + scalar
+ *
+ * @param[in] a input array
+ * @param[in] scalar scalar value
+ * @param[out] out output array
+ * @param[in] len number of elements
+ */
+extern void neon_add_scalar(const float *a, float scalar, float *out, size_t len);
+
 /**
  * @brief rms normalization computation w.r.t. width in H*W matrix input
  *

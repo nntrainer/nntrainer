@@ -459,6 +459,18 @@ int FloatTensor::add_i_partial(unsigned int len, unsigned int addr_idx,
 }
 
 Tensor &FloatTensor::add(float const &value, Tensor &output) const {
+  CREATE_IF_EMPTY_DIMS(output, dim, nullptr);
+  
+  // Use SIMD for scalar addition when both tensors are contiguous
+  if (contiguous && output.getContiguous()) {
+    const float *data = (float *)getData();
+    float *out_data = (float *)output.getData();
+    size_t len = size();
+    neon_add_scalar(data, value, out_data, len);
+    return output;
+  }
+  
+  // Fallback to scalar implementation for non-contiguous tensors
   auto f = std::bind(std::plus<float>(), std::placeholders::_1, value);
   apply(f, output);
   return output;
@@ -675,6 +687,26 @@ void FloatTensor::normalization_i(unsigned int dim, float p, float epsilon) {
 }
 
 Tensor &FloatTensor::pow(float exponent, Tensor &output) const {
+  CREATE_IF_EMPTY_DIMS(output, dim, nullptr);
+
+  const float *data = (float *)getData();
+  float *out_data = (float *)output.getData();
+  size_t len = size();
+  
+  // Use SIMD for squaring (exponent = 2.0)
+  if (exponent == 2.0f && contiguous && output.getContiguous()) {
+    neon_square(data, out_data, len);
+    return output;
+  }
+  
+  // Use SIMD for inverse square root (exponent = -0.5)
+  if (exponent == -0.5f && contiguous && output.getContiguous()) {
+    scopy(len, data, 1, out_data, 1);
+    inv_sqrt_inplace(len, out_data);
+    return output;
+  }
+  
+  // Fallback to scalar implementation for other exponents
   auto f = [exponent](float in) { return powf(in, exponent); };
   apply(f, output);
   return output;
@@ -716,6 +748,19 @@ void FloatTensor::tan(Tensor &output, float alpha) {
 }
 
 void FloatTensor::inv_sqrt(Tensor &out) {
+  CREATE_IF_EMPTY_DIMS(out, dim);
+  
+  // Use SIMD for contiguous tensors
+  if (contiguous && out.getContiguous()) {
+    const float *data = (float *)getData();
+    float *out_data = (float *)out.getData();
+    size_t len = size();
+    scopy(len, data, 1, out_data, 1);
+    inv_sqrt_inplace(len, out_data);
+    return;
+  }
+  
+  // Fallback to scalar implementation for non-contiguous tensors
   apply([](float val) -> float { return 1 / std::sqrt(val); }, out);
 }
 
