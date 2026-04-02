@@ -34,7 +34,6 @@
 #include <complex>
 
 #include <acti_func.h>
-#include <bs_thread_pool_manager.hpp>
 #include <common_properties.h>
 #include <cpu_backend.h>
 #include <layer_impl.h>
@@ -415,15 +414,13 @@ private:
   void compute_kcaches(nntrainer::Tensor &in, nntrainer::Tensor &cache,
                        nntrainer::Tensor &out, unsigned int from,
                        size_t sequence_len, unsigned int num_heads,
-                       unsigned int group_size, unsigned int head_dim,
-                       BS::thread_pool<> &pool);
+                       unsigned int group_size, unsigned int head_dim);
 
   void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
-                        unsigned int from, BS::thread_pool<> &pool);
+                        unsigned int from);
 
   void softmax_triangle(nntrainer::Tensor &qk_out, size_t row, size_t num_heads,
-                        unsigned int from, BS::thread_pool<> &pool,
-                        nntrainer::Tensor &sink_step);
+                        unsigned int from, nntrainer::Tensor &sink_step);
 
   void compute_vcaches(nntrainer::Tensor &in, nntrainer::Tensor &vcache,
                        nntrainer::Tensor &out, unsigned int from,
@@ -434,8 +431,7 @@ private:
                                      nntrainer::Tensor &vcache,
                                      nntrainer::Tensor &output, int from,
                                      int num_cache_head, int gqa_size,
-                                     int head_dim, int to,
-                                     BS::thread_pool<> &pool);
+                                     int head_dim, int to);
 
   /************** END OF  ROTARY EMBEDDING *************/
 
