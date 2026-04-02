@@ -615,7 +615,6 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %ifarch aarch64
 %{_includedir}/nntrainer/arm_compute_backend.h
 %{_includedir}/nntrainer/neon_impl.h
-%{_includedir}/nntrainer/neon_setting.h
 %{_includedir}/nntrainer/neon_mathfun.h
 %{_includedir}/nntrainer/neon_mathfun.hxx
 %{_includedir}/nntrainer/matrix_transpose_neon.h
@@ -646,7 +645,6 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
     %{_includedir}/nntrainer/arm_compute_backend.h
     %{_includedir}/nntrainer/armv7_neon.h
     %{_includedir}/nntrainer/neon_impl.h
-    %{_includedir}/nntrainer/neon_setting.h
     %{_includedir}/nntrainer/neon_mathfun.h
     %{_includedir}/nntrainer/neon_mathfun.hxx
     %{_includedir}/nntrainer/matrix_transpose_neon.h

@@ -18,6 +18,7 @@
 #include <node_exporter.h>
 #include <tensor.h>
 #include <tensor_dim.h>
+#include <thread_manager.h>
 #include <tie_word_embedding.h>
 #include <util_func.h>
 
@@ -221,8 +222,8 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
     int iter = to - from;
 
-#pragma omp parallel for
-    for (int i = 0; i < iter; ++i) {
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(iter), [&](size_t i) {
       unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
       if (embed_idx >= in_dim) {
         throw std::invalid_argument("input word index is greater than in_dim");
@@ -247,7 +248,7 @@ void TieWordEmbedding::incremental_forwarding_embedding(
       if (scale != 1.0f) {
         out_tensor.multiply_i(scale);
       }
-    }
+    });
 
 #ifdef DEBUG
     std::cout << context.getName() << " : "

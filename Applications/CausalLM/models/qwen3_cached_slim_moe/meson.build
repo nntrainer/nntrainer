@@ -10,7 +10,7 @@ causallm_cached_slim_moe_layer = shared_library(
     'qwen_moe_layer_cached',
     causallm_cached_slim_moe_layer_src_abs,
     include_directories: [causallm_layer_inc, qwen3_cached_slim_moe_inc],
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, openmp_dep],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
     install_dir: application_install_dir
 )

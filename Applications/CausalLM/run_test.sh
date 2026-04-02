@@ -162,31 +162,24 @@ cd "$SCRIPT_DIR/jni/libs/arm64-v8a"
 log_info "Pushing files to $INSTALL_DIR/..."
 
 # Push executable
-log_info "  [1/7] test_causal_lm..."
+log_info "  [1/6] test_causal_lm..."
 adb push test_causal_lm "$INSTALL_DIR/" || true
 
 # Push libraries
-log_info "  [2/7] libcausallm.so..."
+log_info "  [2/6] libcausallm.so..."
 adb push libcausallm.so "$INSTALL_DIR/" || true
 
-log_info "  [3/7] libnntrainer.so..."
+log_info "  [3/6] libnntrainer.so..."
 adb push libnntrainer.so "$INSTALL_DIR/" || true
 
-log_info "  [4/7] libccapi-nntrainer.so..."
+log_info "  [4/6] libccapi-nntrainer.so..."
 adb push libccapi-nntrainer.so "$INSTALL_DIR/" || true
 
-log_info "  [5/7] libc++_shared.so..."
+log_info "  [5/6] libc++_shared.so..."
 adb push libc++_shared.so "$INSTALL_DIR/" || true
 
-log_info "  [6/7] libomp.so..."
-if [ -f libomp.so ]; then
-    adb push libomp.so "$INSTALL_DIR/" || true
-else
-    log_warning "libomp.so not found, skipping"
-fi
-
 # Push json.hpp
-log_info "  [7/7] json.hpp..."
+log_info "  [6/6] json.hpp..."
 if [ -f "$SCRIPT_DIR/json.hpp" ]; then
     adb push "$SCRIPT_DIR/json.hpp" "$INSTALL_DIR/" || true
 else

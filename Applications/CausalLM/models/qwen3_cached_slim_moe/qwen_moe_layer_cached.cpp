@@ -27,9 +27,9 @@
 #include <atomic>
 #include <cmath>
 #include <node_exporter.h>
-#include <omp.h>
 #include <qwen_moe_layer_cached.h>
 #include <stdexcept>
+#include <thread_manager.h>
 
 #include <chrono>
 using std::chrono::duration_cast;
@@ -206,15 +206,17 @@ inline void CachedSlimMoELayer::compute_expert_forward(
 
   if (num_tokens > 1) {
     /** if prefill, copy data to make a batch */
-#pragma omp parallel for schedule(static) if (num_tokens > 4)
-    for (size_t i = 0; i < num_tokens; ++i) {
-      const unsigned token_idx = token_assignments[i].first;
-      // Use tensor's optimized copy operation
-      nntrainer::Tensor src_view = input.getSharedDataTensor(
-        {1, 1, 1, hidden_size}, token_idx * hidden_size, true);
-      nntrainer::Tensor dst_view = token_input.getSharedDataTensor(
-        {1, 1, 1, hidden_size}, i * hidden_size, true);
-      dst_view.copyData(src_view);
+    {
+      auto &tm = nntrainer::ThreadManager::Global();
+      tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
+        const unsigned token_idx = token_assignments[i].first;
+        // Use tensor's optimized copy operation
+        nntrainer::Tensor src_view = input.getSharedDataTensor(
+          {1, 1, 1, hidden_size}, token_idx * hidden_size, true);
+        nntrainer::Tensor dst_view = token_input.getSharedDataTensor(
+          {1, 1, 1, hidden_size}, i * hidden_size, true);
+        dst_view.copyData(src_view);
+      });
     }
   } else {
     /** if token generation, do not copy but get the shared tensor */
@@ -236,13 +238,13 @@ inline void CachedSlimMoELayer::compute_expert_forward(
     // Element-wise multiply: silu(gate_out) * up_out
     acti_out.multiply_i(up_out);
   } else {
-#pragma omp parallel for schedule(static) if (num_tokens > 4)
-    for (size_t i = 0; i < num_tokens; ++i) {
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
       const unsigned offset = acti_out.getIndex(0, 0, i, 0);
       nntrainer::swiglu(acti_out.width(), acti_out.getData<float>() + offset,
                         gate_out.getData<float>() + offset,
                         up_out.getData<float>() + offset);
-    }
+    });
   }
 
   acti_out.dot(down_proj, token_expert_output);
@@ -348,13 +350,15 @@ void CachedSlimMoELayer::incremental_forwarding(
 
     // Parallel processing for multiple tokens with many active experts
     std::vector<nntrainer::Tensor> expert_outputs(num_experts);
-#pragma omp parallel for schedule(static)
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      if (!expert_assignments[expert_idx].empty()) {
-        expert_outputs[expert_idx] = nntrainer::Tensor(
-          total_tokens, 1, 1, hidden_size, output.getTensorType());
-      }
+    {
+      auto &tm = nntrainer::ThreadManager::Global();
+      tm.parallel_for(
+        0, static_cast<size_t>(num_experts), [&](size_t expert_idx) {
+          if (!expert_assignments[expert_idx].empty()) {
+            expert_outputs[expert_idx] = nntrainer::Tensor(
+              total_tokens, 1, 1, hidden_size, output.getTensorType());
+          }
+        });
     }
     std::vector<int> target_idx_vector;
 
@@ -377,55 +381,62 @@ void CachedSlimMoELayer::incremental_forwarding(
     auto t2_hit = t1_hit;
 #endif
 
-#pragma omp parallel for schedule(dynamic)
-    for (int expert_idx : target_idx_vector) {
-      const auto &assignments = expert_assignments[expert_idx];
-      if (need_load[expert_idx]) {
+    /// @todo revisit multi thread design
+    {
+      auto &tm = nntrainer::ThreadManager::Global();
+      tm.parallel_for(
+        0, static_cast<size_t>(target_idx_vector.size()), [&](size_t ti) {
+          int expert_idx = target_idx_vector[ti];
+          const auto &assignments = expert_assignments[expert_idx];
+          if (need_load[expert_idx]) {
 
 #ifdef DEBUG
-        t1_miss = high_resolution_clock::now();
+            t1_miss = high_resolution_clock::now();
 #endif
 
-        context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
-        context.getWeight(expert_up_proj_indices[expert_idx]).activate();
-        context.getWeight(expert_down_proj_indices[expert_idx]).activate();
+            context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
+            context.getWeight(expert_up_proj_indices[expert_idx]).activate();
+            context.getWeight(expert_down_proj_indices[expert_idx]).activate();
 
-        {
-          std::lock_guard<std::mutex> lock(cache_mutex);
-          loaded_expert_deque.push_back(expert_idx);
-          iteration_map[expert_idx] = --loaded_expert_deque.end();
-          need_load[expert_idx] = false;
-          miss_count += 1;
-        }
+            {
+              std::lock_guard<std::mutex> lock(cache_mutex);
+              loaded_expert_deque.push_back(expert_idx);
+              iteration_map[expert_idx] = --loaded_expert_deque.end();
+              need_load[expert_idx] = false;
+              miss_count += 1;
+            }
 
-        compute_expert_forward(
-          input, expert_outputs[expert_idx], assignments,
-          context.getWeight(expert_gate_proj_indices[expert_idx]),
-          context.getWeight(expert_up_proj_indices[expert_idx]),
-          context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
+            compute_expert_forward(
+              input, expert_outputs[expert_idx], assignments,
+              context.getWeight(expert_gate_proj_indices[expert_idx]),
+              context.getWeight(expert_up_proj_indices[expert_idx]),
+              context.getWeight(expert_down_proj_indices[expert_idx]),
+              hidden_size);
 #ifdef DEBUG
-        t2_miss = high_resolution_clock::now();
+            t2_miss = high_resolution_clock::now();
 #endif
-      } else {
-
-#ifdef DEBUG
-        t1_hit = high_resolution_clock::now();
-#endif
-        {
-          std::lock_guard<std::mutex> lock(cache_mutex);
-          hit_count += 1;
-        }
-
-        compute_expert_forward(
-          input, expert_outputs[expert_idx], assignments,
-          context.getWeight(expert_gate_proj_indices[expert_idx]),
-          context.getWeight(expert_up_proj_indices[expert_idx]),
-          context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
+          } else {
 
 #ifdef DEBUG
-        t2_hit = high_resolution_clock::now();
+            t1_hit = high_resolution_clock::now();
 #endif
-      }
+            {
+              std::lock_guard<std::mutex> lock(cache_mutex);
+              hit_count += 1;
+            }
+
+            compute_expert_forward(
+              input, expert_outputs[expert_idx], assignments,
+              context.getWeight(expert_gate_proj_indices[expert_idx]),
+              context.getWeight(expert_up_proj_indices[expert_idx]),
+              context.getWeight(expert_down_proj_indices[expert_idx]),
+              hidden_size);
+
+#ifdef DEBUG
+            t2_hit = high_resolution_clock::now();
+#endif
+          }
+        });
     }
 
     for (int i = extra_top_k.size() - 1; i >= 0; i--) {
@@ -440,8 +451,8 @@ void CachedSlimMoELayer::incremental_forwarding(
     auto t1_evict = high_resolution_clock::now();
 #endif
 
-// Evict experts
-#pragma omp parallel
+    // Evict experts
+    /// @todo apply multi thread loop
     while (loaded_expert_deque.size() > 32) {
       int target_idx;
       {

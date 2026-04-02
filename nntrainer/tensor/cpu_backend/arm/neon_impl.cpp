@@ -22,13 +22,13 @@
 #include <fp16.h>
 #include <matrix_transpose_neon.h>
 #include <neon_impl.h>
-#include <neon_setting.h>
 #include <nntrainer_error.h>
 #ifdef ARMV7
 #include <armv7_neon.h>
 #endif
 #include "nntr_ggml_impl_common.h"
 #include <fallback_internal.h>
+#include <thread_manager.h>
 #include <util_func.h>
 
 #include "nntr_ggml_impl_common.h"
@@ -2119,45 +2119,46 @@ void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
   const size_t bytes_per_row_block_span = column_blocks_count * ROW_BLOCK_SIZE;
   const int column_blocks_cnt = K / QK4_0;
 
-#pragma omp parallel for schedule(dynamic)
-  for (int column_out_block_id = 0; column_out_block_id < column_blocks_cnt;
-       column_out_block_id++) {
-    uint8_t mx8x16[8 * 16];
-    const int column_idx = column_out_block_id * QK4_0;
-    const int scale_offset = (column_idx / scale_group_size) * rows_count_pad;
-    for (size_t row_id = 0; row_id < N; row_id += 8) {
-      const size_t row_in_block_id = row_id / ROW_BLOCK_SIZE;
-      const size_t i_in_block = row_id % ROW_BLOCK_SIZE;
-      const size_t row_block_base =
-        row_in_block_id * bytes_per_row_block_span + i_in_block;
-      const int src_offset =
-        row_block_base + column_out_block_id * 16 * ROW_BLOCK_SIZE;
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(
+    0, static_cast<size_t>(column_blocks_cnt), [&](size_t column_out_block_id) {
+      uint8_t mx8x16[8 * 16];
+      const int column_idx = column_out_block_id * QK4_0;
+      const int scale_offset = (column_idx / scale_group_size) * rows_count_pad;
+      for (size_t row_id = 0; row_id < N; row_id += 8) {
+        const size_t row_in_block_id = row_id / ROW_BLOCK_SIZE;
+        const size_t i_in_block = row_id % ROW_BLOCK_SIZE;
+        const size_t row_block_base =
+          row_in_block_id * bytes_per_row_block_span + i_in_block;
+        const int src_offset =
+          row_block_base + column_out_block_id * 16 * ROW_BLOCK_SIZE;
 
-      transpose_matrix_16x8(&osv32_weights[src_offset], ROW_BLOCK_SIZE, mx8x16,
-                            16);
-      const size_t row_out_block_id = row_id / NUM_Q4_0_BLOCKS;
-      int dst_offset =
-        (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) *
-        (column_out_block_id + row_out_block_id * column_blocks_cnt);
+        transpose_matrix_16x8(&osv32_weights[src_offset], ROW_BLOCK_SIZE,
+                              mx8x16, 16);
+        const size_t row_out_block_id = row_id / NUM_Q4_0_BLOCKS;
+        int dst_offset =
+          (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) *
+          (column_out_block_id + row_out_block_id * column_blocks_cnt);
 
-      block_q4_0x4 *out = (block_q4_0x4 *)(dst_ + dst_offset);
-      const uint16_t *s_ptr = &osv32_scales[scale_offset + row_id];
-      out->d[0] = s_ptr[0];
-      out->d[1] = s_ptr[1];
-      out->d[2] = s_ptr[2];
-      out->d[3] = s_ptr[3];
-      neon_transform_transposed_4rows_to_q4_0x4(mx8x16, out);
+        block_q4_0x4 *out = (block_q4_0x4 *)(dst_ + dst_offset);
+        const uint16_t *s_ptr = &osv32_scales[scale_offset + row_id];
+        out->d[0] = s_ptr[0];
+        out->d[1] = s_ptr[1];
+        out->d[2] = s_ptr[2];
+        out->d[3] = s_ptr[3];
+        neon_transform_transposed_4rows_to_q4_0x4(mx8x16, out);
 
-      dst_offset += (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) * column_blocks_cnt;
-      out = (block_q4_0x4 *)(dst_ + dst_offset);
+        dst_offset +=
+          (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) * column_blocks_cnt;
+        out = (block_q4_0x4 *)(dst_ + dst_offset);
 
-      out->d[0] = s_ptr[4];
-      out->d[1] = s_ptr[5];
-      out->d[2] = s_ptr[6];
-      out->d[3] = s_ptr[7];
-      neon_transform_transposed_4rows_to_q4_0x4(&mx8x16[64], out);
-    }
-  }
+        out->d[0] = s_ptr[4];
+        out->d[1] = s_ptr[5];
+        out->d[2] = s_ptr[6];
+        out->d[3] = s_ptr[7];
+        neon_transform_transposed_4rows_to_q4_0x4(&mx8x16[64], out);
+      }
+    });
 }
 
 #if defined(__aarch64__) || defined(_M_ARM64)

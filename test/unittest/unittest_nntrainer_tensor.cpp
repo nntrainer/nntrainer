@@ -21,6 +21,7 @@
 #include <nntrainer_error.h>
 #include <tensor.h>
 #include <tensor_dim.h>
+#include <thread_manager.h>
 
 TEST(nntrainer_TensorDim, ctor_initializer_p) {
   unsigned int b = 3;
@@ -1209,9 +1210,10 @@ TEST(nntrainer_Tensor, getBatchSlice_parallel_p) {
 
   nntrainer::Tensor ref_slice = input.getBatchSlice(indices);
 
-// Enable OpenMP and test parallel execution
-#pragma omp parallel for
-  for (int i = 0; i < 100; ++i) {
+  // Enable parallel execution
+  auto &tm = nntrainer::ThreadManager::Global();
+
+  tm.parallel_for(0, 100, [&](size_t i) {
     nntrainer::Tensor par_slice = input.getBatchSlice(indices);
     EXPECT_EQ(ref_slice.getDim(), par_slice.getDim());
     EXPECT_EQ(ref_slice.size(), par_slice.size());
@@ -1219,7 +1221,7 @@ TEST(nntrainer_Tensor, getBatchSlice_parallel_p) {
     for (unsigned int idx = 0; idx < ref_slice.size(); ++idx) {
       EXPECT_FLOAT_EQ(ref_slice.getValue(idx), par_slice.getValue(idx));
     }
-  }
+  });
 }
 
 TEST(nntrainer_Tensor, getBatchSlice_duplicate_indices_p) {

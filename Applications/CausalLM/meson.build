@@ -54,8 +54,7 @@ causallm = shared_library('causallm',
         nntrainer_dep,
         nntrainer_ccapi_dep,
         causallm_layer_dependencies, 
-        tokenizer_dependencies,
-        openmp_dep
+        tokenizer_dependencies
     ],
     include_directories: causallm_inc,
     install: true,

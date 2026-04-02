@@ -31,12 +31,12 @@ SIMPLESHOT_DIR = .
 LOCAL_ARM_NEON := true
 LOCAL_CFLAGS += -std=c++17 -Ofast -mcpu=cortex-a53 -Ilz4-nougat/lib
 LOCAL_LDFLAGS += -Llz4-nougat/lib/obj/local/$(TARGET_ARCH_ABI)/
-LOCAL_CXXFLAGS += -std=c++17 -frtti -fexceptions -fopenmp -static-openmp
-LOCAL_CFLAGS += -pthread -fexceptions -fopenmp -static-openmp
+LOCAL_CXXFLAGS += -std=c++17 -frtti -fexceptions
+LOCAL_CFLAGS += -pthread -fexceptions
 LOCAL_MODULE_TAGS := optional
 LOCAL_ARM_MODE := arm
 LOCAL_MODULE := simpleshot_jni
-LOCAL_LDLIBS := -llog -landroid -fopenmp -static-openmp -ljnigraphics
+LOCAL_LDLIBS := -llog -landroid -ljnigraphics
 
 LOCAL_SRC_FILES := simpleshot.cpp simpleshot_jni.cpp dataloader.cpp image.cpp
 LOCAL_SHARED_LIBRARIES := ccapi-nntrainer nntrainer

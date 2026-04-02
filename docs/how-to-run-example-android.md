@@ -63,7 +63,7 @@ libcapi-nntrainer.so  libccapi-nntrainer.so  libc++_shared.so  libnnstreamer-nat
 Build can also be conducted manually using `meson`.
 
 ```bash
-$ meson setup build -Dplatform=android -Dopenblas-num-threads=1 -Denable-tflite-interpreter=false -Denable-tflite-backbone=false -Denable-fp16=true -Domp-num-threads=1 -Denable-opencl=true -Dhgemm-experimental-kernel=false
+$ meson setup build -Dplatform=android -Dopenblas-num-threads=1 -Denable-tflite-interpreter=false -Denable-tflite-backbone=false -Denable-fp16=true -Denable-opencl=true -Dhgemm-experimental-kernel=false
 $
 $ meson compile -C build
 $

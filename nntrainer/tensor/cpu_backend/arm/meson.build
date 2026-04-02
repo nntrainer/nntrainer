@@ -1,7 +1,6 @@
 arm_compute_backend_headers = [
     'arm_compute_backend.h',
     'neon_impl.h',
-    'neon_setting.h',
     'neon_mathfun.h',
     'neon_mathfun.hxx',
 ]

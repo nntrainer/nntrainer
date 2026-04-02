@@ -8,7 +8,7 @@ It supports *inference* mode (text generation) on various devices, including And
 - **Standalone Application (`nntr_causallm`)**: A command-line tool to load models and generate text.
 - **C API (Optional)**: A lightweight C interface (`libcausallm_api.so`) for integrating LLM capabilities into other applications (e.g., Android JNI, iOS, or other C/C++ apps).
 - **Core Library**: The core implementation is separated into `libcausallm_core.so` for modularity.
-- **Supported Backends**: CPU (OpenMP), with GPU/NPU support planned.
+- **Supported Backends**: CPU, with GPU/NPU support planned.
 
 ## Supported models
 
@@ -46,14 +46,14 @@ For detailed documentation, please refer to [API Documentation](api/README.md).
 Compile the application with transformer support enabled.
 
 ```bash
-$ meson build -Denable-fp16=true -Dthread-backend=omp -Denable-transformer=true -Domp-num-threads=4
+$ meson build -Denable-fp16=true -Dthread-backend=omp -Denable-transformer=true
 $ ninja -C build
 ```
 
 Run the model:
 
 ```bash
-$ export OMP_THREAD_LIMIT=16 && export OMP_WAIT_POLICY=active && export OMP_PROC_BIND=true && export OMP_PLACES=cores && export OMP_NUM_THREADS=4
+$ export NNTR_NUM_THREADS=4
 $ ./build/Applications/CausalLM/nntr_causallm {your model config folder}
 ```
 

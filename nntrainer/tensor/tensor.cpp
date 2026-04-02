@@ -11,6 +11,8 @@
 
 #include <numeric>
 
+#include <thread_manager.h>
+
 #include <char_tensor.h>
 #include <float_tensor.h>
 #include <int4_tensor.h>
@@ -1327,9 +1329,9 @@ Tensor Tensor::getBatchSlice(const std::vector<unsigned int> &indices) const {
   unsigned char *dst_data =
     static_cast<unsigned char *>(output.getData<void>());
 
-// Parallel copy using OpenMP
-#pragma omp parallel for schedule(static)
-  for (int i = 0; i < static_cast<int>(indices.size()); ++i) {
+  // Parallel copy using ThreadManager
+  auto &tm = ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(indices.size()), [&](size_t i) {
     const unsigned batch_idx = indices[i];
 
     // Calculate memory offsets
@@ -1345,7 +1347,7 @@ Tensor Tensor::getBatchSlice(const std::vector<unsigned int> &indices) const {
     // Perform memory copy
     std::memcpy(dst_data + dst_offset, src_data + src_offset,
                 single_batch_bytes);
-  }
+  });
 
   return output;
 }

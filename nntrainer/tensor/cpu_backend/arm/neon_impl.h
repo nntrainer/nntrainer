@@ -879,7 +879,7 @@ void clamp(const T *input, T *output, size_t length,
 
 /**
  * @brief Transforms data from in-memory layout osv32_isv2 to block_q4_0x4
- * in-memory layout with ARM NEON optimization and OpenMP parallelization.
+ * in-memory layout with ARM NEON optimization.
  * @param N number of rows
  * @param K number of columns
  * @param osv32_weights uint8_t* data of weights in osv32_isv2 layout

@@ -28,7 +28,6 @@ nntrainer_base_deps=[
   libdl_dep,
   libm_dep,
   ml_api_common_dep,
-  openmp_dep,
   ruy_dep,
   thread_dep,
 ]
