@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <cmath>
 #include <mutex>
-#include <omp.h>
 #include <thread>
 #include <vector>
 
@@ -374,18 +373,19 @@ void MHACoreLayer::compute_kcaches(nntrainer::Tensor &in,
       int row_to_compute = is_causal ? from + 1 : from + sequence_len;
       unsigned int num_cache_head = num_head / group_size;
 
-      // Use OpenMP for lower overhead parallelization during decoding
+      // Use ThreadManager for lower overhead parallelization during decoding
       const float *in_data = in.getData<float>();
       const uint16_t *cache_data = cache.getData<uint16_t>();
       float *out_data = out.getData<float>();
 
-#pragma omp parallel for schedule(static)
-      for (unsigned int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
-        nntrainer::compute_kcaches<uint16_t>(
-          in_data, cache_data, out_data, row_to_compute, num_cache_head,
-          head_dim, group_size, tile_size, local_window_size, head_kv,
-          head_kv + 1);
-      }
+      auto &tm = nntrainer::ThreadManager::Global();
+      tm.parallel_for(0, static_cast<size_t>(num_cache_head),
+                      [=](size_t head_kv) {
+                        nntrainer::compute_kcaches<uint16_t>(
+                          in_data, cache_data, out_data, row_to_compute,
+                          num_cache_head, head_dim, group_size, tile_size,
+                          local_window_size, head_kv, head_kv + 1);
+                      });
 
     } else {
       // Sequence processing (prefill or chunked)
@@ -417,17 +417,18 @@ void MHACoreLayer::compute_kcaches(nntrainer::Tensor &in,
       int num_rows = is_causal ? from + 1 : from + sequence_len;
       unsigned int num_cache_head = num_head / group_size;
 
-      // Use OpenMP for lower overhead parallelization during decoding
+      // Use ThreadManager for lower overhead parallelization during decoding
       const _FP16 *in_data = in.getData<_FP16>();
       const _FP16 *cache_data = cache.getData<_FP16>();
       _FP16 *out_data = out.getData<_FP16>();
 
-#pragma omp parallel for schedule(static)
-      for (unsigned int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
-        nntrainer::compute_kcaches(
-          in_data, cache_data, out_data, num_rows, num_cache_head, head_dim,
-          group_size, tile_size, local_window_size, head_kv, head_kv + 1);
-      }
+      auto &tm = nntrainer::ThreadManager::Global();
+      tm.parallel_for(
+        0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
+          nntrainer::compute_kcaches(
+            in_data, cache_data, out_data, num_rows, num_cache_head, head_dim,
+            group_size, tile_size, local_window_size, head_kv, head_kv + 1);
+        });
     } else {
       unsigned int seq_start =
         sequence_len < local_window_size ? 0 : sequence_len - local_window_size;
@@ -1135,12 +1136,13 @@ void MHACoreLayer::compute_fp16vcache_transposed(
       const uint16_t *vcache_data = vcache.getData<uint16_t>();
       float *output_data = output.getData<float>();
 
-#pragma omp parallel for schedule(static)
-      for (int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
-        nntrainer::compute_fp16vcache_fp32_transposed(
-          row_num, in_data, vcache_data, output_data, num_cache_head, gqa_size,
-          head_dim, local_window_size, head_kv, head_kv + 1);
-      }
+      auto &tm = nntrainer::ThreadManager::Global();
+      tm.parallel_for(
+        0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
+          nntrainer::compute_fp16vcache_fp32_transposed(
+            row_num, in_data, vcache_data, output_data, num_cache_head,
+            gqa_size, head_dim, local_window_size, head_kv, head_kv + 1);
+        });
     }
   } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
@@ -1176,12 +1178,13 @@ void MHACoreLayer::compute_fp16vcache_transposed(
       const _FP16 *vcache_data = vcache.getData<_FP16>();
       _FP16 *output_data = output.getData<_FP16>();
 
-#pragma omp parallel for schedule(static)
-      for (int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
-        nntrainer::compute_fp16vcache_transposed(
-          row_num, in_data, vcache_data, output_data, num_cache_head, gqa_size,
-          head_dim, local_window_size, head_kv, head_kv + 1);
-      }
+      auto &tm_fp16 = nntrainer::ThreadManager::Global();
+      tm_fp16.parallel_for(
+        0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
+          nntrainer::compute_fp16vcache_transposed(
+            row_num, in_data, vcache_data, output_data, num_cache_head,
+            gqa_size, head_dim, local_window_size, head_kv, head_kv + 1);
+        });
     }
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";

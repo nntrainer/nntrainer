@@ -18,6 +18,7 @@
 #include <float_tensor.h>
 #include <int4_tensor.h>
 #include <q4_0_utils.h>
+#include <thread_manager.h>
 
 #include <tensor.h>
 #include <util_func.h>
@@ -660,13 +661,13 @@ void FloatTensor::normalization_i(unsigned int dim, float p, float epsilon) {
     size_t total_elements = size();
     int num_vectors = static_cast<int>(total_elements / dim_size);
 
-#pragma omp parallel for
-    for (int i = 0; i < num_vectors; ++i) {
+    auto &tm = ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(num_vectors), [&](size_t i) {
       float *vec_ptr = data + i * dim_size;
       float norm = snrm2(dim_size, vec_ptr, 1);
       float scale = 1.0f / std::max(norm, epsilon);
       sscal(dim_size, scale, vec_ptr, 1);
-    }
+    });
   } else {
     throw nntrainer::exception::not_supported(
       "FloatTensor::normalization_i currently only optimizes for the last "
@@ -1156,56 +1157,50 @@ void FloatTensor::topK(unsigned int k, void *output_data,
   output_dim.width(k);
   const auto output_strides = output_dim.computeStrides();
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4849)
-#endif
-#pragma omp parallel for collapse(3)
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
-  for (int b = 0; b < static_cast<int>(batch); ++b) {
-    for (int c = 0; c < static_cast<int>(channel); ++c) {
-      for (int h = 0; h < static_cast<int>(height); ++h) {
+  auto &tm = ThreadManager::Global();
+  tm.parallel_for(
+    0, static_cast<size_t>(batch * channel * height), [&](size_t idx) {
+      int b = static_cast<int>(idx / (channel * height));
+      int c = static_cast<int>((idx / height) % channel);
+      int h = static_cast<int>(idx % height);
 
-        size_t offset;
+      size_t offset;
+      if (format == Tformat::NCHW) {
+        // NCHW: [b][c][h][i]
+        offset =
+          b * input_strides[0] + c * input_strides[1] + h * input_strides[2];
+      } else {
+        // NHWC: [b][h][i][c]
+        offset = b * input_strides[0] + h * input_strides[1] + c;
+      }
+
+      const unsigned int width_stride =
+        format == Tformat::NHWC ? input_strides[2] : 1;
+      const float *B = static_cast<const float *>(getData()) + offset;
+      std::vector<size_t> local_idx(width);
+      std::iota(local_idx.begin(), local_idx.end(), 0);
+      std::partial_sort(local_idx.begin(), local_idx.begin() + k,
+                        local_idx.end(),
+                        [&B, width_stride](size_t i1, size_t i2) {
+                          return B[i1 * width_stride] > B[i2 * width_stride];
+                        });
+
+      // write top-k values and their indices to output
+      for (unsigned int i = 0; i < k; ++i) {
+        size_t output_idx;
         if (format == Tformat::NCHW) {
           // NCHW: [b][c][h][i]
-          offset =
-            b * input_strides[0] + c * input_strides[1] + h * input_strides[2];
+          output_idx = b * output_strides[0] + c * output_strides[1] +
+                       h * output_strides[2] + i;
         } else {
           // NHWC: [b][h][i][c]
-          offset = b * input_strides[0] + h * input_strides[1] + c;
+          output_idx = b * output_strides[0] + h * output_strides[1] +
+                       i * output_strides[2] + c;
         }
-
-        const unsigned int width_stride =
-          format == Tformat::NHWC ? input_strides[2] : 1;
-        const float *B = static_cast<const float *>(getData()) + offset;
-        std::vector<size_t> idx(width);
-        std::iota(idx.begin(), idx.end(), 0);
-        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
-                          [&B, width_stride](size_t i1, size_t i2) {
-                            return B[i1 * width_stride] > B[i2 * width_stride];
-                          });
-
-        // write top-k values and their indices to output
-        for (unsigned int i = 0; i < k; ++i) {
-          size_t output_idx;
-          if (format == Tformat::NCHW) {
-            // NCHW: [b][c][h][i]
-            output_idx = b * output_strides[0] + c * output_strides[1] +
-                         h * output_strides[2] + i;
-          } else {
-            // NHWC: [b][h][i][c]
-            output_idx = b * output_strides[0] + h * output_strides[1] +
-                         i * output_strides[2] + c;
-          }
-          output_buffer[output_idx] = B[idx[i]];
-          indices_data[output_idx] = static_cast<uint32_t>(idx[i]);
-        }
+        output_buffer[output_idx] = B[local_idx[i]];
+        indices_data[output_idx] = static_cast<uint32_t>(local_idx[i]);
       }
-    }
-  }
+    });
 }
 
 float FloatTensor::max_abs() const {

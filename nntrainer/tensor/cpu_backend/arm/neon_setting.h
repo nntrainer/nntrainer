@@ -12,8 +12,6 @@
  *
  */
 
-#include <omp.h>
-
 /// @note This variable should be optimized by user
 /// @todo Must find a general solution to optimize the functionality of
 /// multithreading : determining the combination of #threads and size of
