@@ -15,7 +15,7 @@ Representative files:
 - Properties:
   - `base_properties.*`, other property helper files.
 - Threading:
-  - `bs_thread_pool.*`, `bs_thread_pool_manager.*`, `nntr_threads.*`.
+  - `nntr_threads.*`.
 - Numeric utilities:
   - `fp16.*` for half-precision conversions.
 - Configuration and misc:

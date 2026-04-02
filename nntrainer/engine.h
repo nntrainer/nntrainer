@@ -34,7 +34,6 @@
 #include <cl_context.h>
 #endif
 
-#include "bs_thread_pool_manager.hpp"
 #include "singleton.h"
 
 namespace nntrainer {
@@ -142,11 +141,6 @@ public:
 
   /**
    *
-   * @brief   Get pointer to thread pool manager, contruct it if needed
-   * @return  Pointer to thread pool manager
-   */
-  ThreadPoolManager *getThreadPoolManager();
-
   /**
    *
    * @brief Parse compute Engine keywords in properties : eg) engine = cpu
@@ -286,8 +280,6 @@ private:
 
   std::string working_path_base;
 
-  std::mutex thread_pool_manager_mutex_ = {};
-  std::unique_ptr<ThreadPoolManager> thread_pool_manager_ = {};
 };
 
 namespace plugin {}

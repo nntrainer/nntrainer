@@ -61,8 +61,6 @@
 /usr/include/nntrainer/noncopyable.h
 /usr/include/nntrainer/nonmovable.h
 /usr/include/nntrainer/singleton.h
-/usr/include/nntrainer/bs_thread_pool.h
-/usr/include/nntrainer/bs_thread_pool_manager.hpp
 /usr/include/nntrainer/fp16.h
 /usr/include/nntrainer/util_simd.h
 /usr/include/nntrainer/dynamic_library_loader.h
