@@ -17,91 +17,74 @@
 #include <layer_context.h>
 #include <layer_devel.h>
 #include <node_exporter.h>
-#include <utility>
 
-#pragma once
-#ifdef _WIN32
-#define WIN_EXPORT __declspec(dllexport)
-#else
-#define WIN_EXPORT
-#endif
-
-namespace causallm {
+namespace nntrainer {
 
 /**
  * @brief A SwiGLU layer for llama.
  *
  */
-WIN_EXPORT class SwiGLULayer final : public nntrainer::Layer {
+class SwiGLULayer final : public Layer {
 public:
   /**
    * @brief Construct a new custom SwiGLU layer object
    *
    */
-  WIN_EXPORT SwiGLULayer() : Layer() {}
+  SwiGLULayer() = default;
 
   /**
    * @brief Destroy the custom SwiGLU layer object
    *
    */
-  WIN_EXPORT ~SwiGLULayer() {}
+  ~SwiGLULayer() {}
 
   /**
    * @copydoc Layer::finalize(InitLayerContext &context)
    */
-  WIN_EXPORT void finalize(nntrainer::InitLayerContext &context) override;
+  void finalize(InitLayerContext &context) override;
 
   /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
    */
-  WIN_EXPORT void forwarding(nntrainer::RunLayerContext &context,
-                             bool training) override;
+  void forwarding(RunLayerContext &context, bool training) override;
 
   /**
    * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
    * int from, unsigned int to, bool training)
    */
-  WIN_EXPORT void incremental_forwarding(nntrainer::RunLayerContext &context,
-                                         unsigned int from, unsigned int to,
-                                         bool training) override;
+  void incremental_forwarding(RunLayerContext &context, unsigned int from,
+                              unsigned int to, bool training) override;
 
   /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
    */
-  WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
+  void calcDerivative(RunLayerContext &context) override;
 
   /**
    * @copydoc bool supportBackwarding() const
    */
-  WIN_EXPORT bool supportBackwarding() const override { return true; };
+  bool supportBackwarding() const override { return true; };
 
   /**
    * @copydoc Layer::exportTo(Exporter &exporter, ExportMethods method)
    */
-  WIN_EXPORT void
-  exportTo(nntrainer::Exporter &exporter,
-           const ml::train::ExportMethods &method) const override{};
-
+  void exportTo(Exporter &exporter,
+                const ml::train::ExportMethods &method) const override{};
   /**
    * @copydoc Layer::getType()
    */
-  WIN_EXPORT const std::string getType() const override {
-    return SwiGLULayer::type;
-  };
-
+  const std::string getType() const override { return SwiGLULayer::type; };
   /**
    * @copydoc Layer::setProperty(const std::vector<std::string> &values)
    */
-  WIN_EXPORT void
-  setProperty(const std::vector<std::string> &values) override{};
+  void setProperty(const std::vector<std::string> &values) override{};
 
-  WIN_EXPORT void updateTensorsByInputDimensions(
-    nntrainer::RunLayerContext &context,
-    std::vector<nntrainer::TensorDim> input_dimensions) override;
+  void updateTensorsByInputDimensions(
+    RunLayerContext &context, std::vector<TensorDim> input_dimensions) override;
 
   inline static const std::string type = "swiglu";
 };
 
-} // namespace causallm
+} // namespace nntrainer
 
 #endif /* __SWIGLU_LAYER_H__ */

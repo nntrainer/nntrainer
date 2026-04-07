@@ -23,7 +23,6 @@
 #include <embedding_layer.h>
 #include <mha_core.h>
 #include <rms_norm.h>
-#include <swiglu.h>
 #include <tie_word_embedding.h>
 
 namespace causallm {
@@ -499,7 +498,6 @@ void Transformer::registerCustomLayers() {
     static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
 
   try {
-    app_context->registerFactory(nntrainer::createLayer<causallm::SwiGLULayer>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::RMSNormLayer>);
     app_context->registerFactory(

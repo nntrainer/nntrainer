@@ -62,7 +62,8 @@ layer_sources = [
   'positional_encoding_layer.cpp',
   'identity_layer.cpp',
   'upsample2d_layer.cpp',
-  'channel_shuffle.cpp'
+  'channel_shuffle.cpp',
+  'swiglu.cpp'
 ]
 
 layer_headers = [
@@ -75,6 +76,7 @@ layer_headers = [
   'layer_node.h',
   'weight_layer.h',
   'tensor_layer.h',
+  'swiglu.h',
 ]
 
 layer_deps = []

@@ -15,7 +15,7 @@
 
 #include "swiglu.h"
 
-namespace causallm {
+namespace nntrainer {
 
 static constexpr size_t OUT_IDX = 0;
 static constexpr size_t INPUT_IDX_1 = 0;
@@ -30,14 +30,19 @@ namespace ActivationOp {
 float swiglu(float x) { return x / (1 + nntrainer::exp_util(-x)); }
 } // namespace ActivationOp
 
-void SwiGLULayer::finalize(nntrainer::InitLayerContext &context) {
+void SwiGLULayer::finalize(InitLayerContext &context) {
   context.setOutputDimensions({context.getInputDimensions()[0]});
 }
 
-void SwiGLULayer::forwarding(nntrainer::RunLayerContext &context,
-                             bool training) {}
+void SwiGLULayer::forwarding(RunLayerContext &context, bool training) {
+  // For batch size = 1 training, call incremental_forwarding with the actual
+  // input length
+  const nntrainer::Tensor &in1 = context.getInput(INPUT_IDX_1);
+  auto to = in1.getDim().height();
+  incremental_forwarding(context, 0, to, training);
+}
 
-void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
+void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
                                          unsigned int from, unsigned int to,
                                          bool training) {
   nntrainer::Tensor &in1 = context.getInput(INPUT_IDX_1);
@@ -78,8 +83,7 @@ void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 }
 
 void SwiGLULayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
+  RunLayerContext &context, std::vector<TensorDim> input_dimensions) {
   ml::train::TensorDim input_dim1 = context.getInput(INPUT_IDX_1).getDim();
   ml::train::TensorDim input_dim2 = context.getInput(INPUT_IDX_2).getDim();
   ml::train::TensorDim output_dim = context.getOutput(OUT_IDX).getDim();
@@ -93,25 +97,44 @@ void SwiGLULayer::updateTensorsByInputDimensions(
   context.updateOutput(OUT_IDX, output_dim);
 }
 
-void SwiGLULayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  // std::throw_with_nested(std::runtime_error("Training is not supported
-  // yet."));
+void SwiGLULayer::calcDerivative(RunLayerContext &context) {
+  const nntrainer::Tensor &incoming_deriv =
+    context.getIncomingDerivative(OUT_IDX);
+  nntrainer::Tensor &d_gate = context.getOutgoingDerivative(INPUT_IDX_1);
+  nntrainer::Tensor &d_up = context.getOutgoingDerivative(INPUT_IDX_2);
+  nntrainer::Tensor &gate = context.getInput(INPUT_IDX_1);
+  nntrainer::Tensor &up = context.getInput(INPUT_IDX_2);
+
+  // Create temporary tensor for sig_gate
+  nntrainer::Tensor sig_gate(gate.getDim(), true);
+
+  if (gate.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    // Generate sig_gate
+    gate.apply<float>(
+      [](float x) { return 1.0f / (1.0f + nntrainer::exp_util(-x)); },
+      sig_gate);
+    // d_up = Swish(gate) * dy
+    gate.multiply(sig_gate, d_up);
+    d_up.multiply_i(incoming_deriv);
+
+    // Swish'(gate) = sig_gate + gate * sig_gate * (1 - sig_gate)
+    // We use d_gate as a memory-safe buffer to calculate (1 - sig_gate) to
+    // avoid allocations
+    d_gate.copyData(sig_gate);
+    d_gate.multiply_i(-1.0f);
+    d_gate.add_i(1.0f);
+
+    // d_gate is now (1 - sig_gate)
+    d_gate.multiply_i(gate);
+    d_gate.multiply_i(sig_gate); // gate * sig_gate * (1 - sig_gate)
+    d_gate.add_i(sig_gate);      // Swish'(gate)
+
+    d_gate.multiply_i(up);
+    d_gate.multiply_i(incoming_deriv);
+  } else if (gate.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    throw std::invalid_argument(
+      "SwiGLULayer calcDerivative for FP16 is not yet implemented");
+  }
 }
 
-#ifdef PLUGGABLE
-
-nntrainer::Layer *create_swiglu_layer() {
-  auto layer = new SwiGLULayer();
-  return layer;
-}
-
-void destroy_swiglu_layer(nntrainer::Layer *layer) { delete layer; }
-
-extern "C" {
-nntrainer::LayerPluggable ml_train_layer_pluggable{create_swiglu_layer,
-                                                   destroy_swiglu_layer};
-}
-
-#endif
-
-} // namespace causallm
+} // namespace nntrainer

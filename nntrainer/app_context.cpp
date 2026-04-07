@@ -94,6 +94,7 @@
 #include <split_layer.h>
 #include <sqrt_layer.h>
 #include <subtract_layer.h>
+#include <swiglu.h>
 #include <tangent_layer.h>
 #include <tensor_layer.h>
 #include <time_dist.h>
@@ -401,6 +402,8 @@ void AppContext::add_default_object() {
 
   registerFactory(nntrainer::createLayer<ChannelShuffle>, ChannelShuffle::type,
                   LayerType::LAYER_CHANNEL_SHUFFLE);
+  registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type,
+                  LayerType::LAYER_SWIGLU);
 
 #ifdef ENABLE_NNSTREAMER_BACKBONE
   registerFactory(nntrainer::createLayer<NNStreamerLayer>,
