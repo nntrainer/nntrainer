@@ -133,7 +133,7 @@ public:
   bool isSpinMode() const { return spin_mode_; }
 
   static void setConfig(const ThreadManagerConfig &config) {
-    pending_config_ = config;
+    config_ = config;
   }
 
 protected:
@@ -284,8 +284,7 @@ private:
   std::condition_variable io_cv_;
 
   // ─── Config ─────────────────────────────────────────
-  ThreadManagerConfig config_;
-  static ThreadManagerConfig pending_config_;
+  static ThreadManagerConfig config_;
 };
 
 } // namespace nntrainer

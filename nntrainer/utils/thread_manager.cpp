@@ -216,7 +216,7 @@ static std::vector<unsigned int> getCoresByPerformance() {
 #endif
 }
 
-ThreadManagerConfig ThreadManager::pending_config_ = {};
+ThreadManagerConfig ThreadManager::config_ = {};
 
 ThreadManager::ThreadManager() {}
 
@@ -241,7 +241,6 @@ ThreadManager::~ThreadManager() {
 }
 
 void ThreadManager::initialize() noexcept {
-  config_ = pending_config_;
   auto config = config_;
 
   unsigned int hw_threads = getPhysicalCoreCount();
