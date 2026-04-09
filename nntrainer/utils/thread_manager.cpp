@@ -249,15 +249,21 @@ void ThreadManager::initialize() noexcept {
   if (hw_threads <= 1)
     return;
 
-  // keep 1 thread for io
-  unsigned int available = hw_threads > 1 ? hw_threads - 1 : 1;
-  if (config.compute_threads > available)
-    config.compute_threads = available;
+  // adjust configuration if thread number overs
+  if (hw_threads < config.compute_threads + config.io_threads) {
+    std::cerr << "Too many threads!\n"
+              << "  available threads: " << hw_threads << "\n"
+              << "  compute_threads: " << config.compute_threads << "\n"
+              << "  io_threads: " << config.io_threads << std::endl;
 
-  unsigned int remaining =
-    available > config.compute_threads ? available - config.compute_threads : 0;
-  if (config.io_threads > remaining)
-    config.io_threads = remaining > 0 ? remaining : 1;
+    // use at most 1 io thread
+    if (config.io_threads > 1)
+      config.io_threads = 1;
+
+    // check if it still overs
+    if (hw_threads < config.compute_threads + config.io_threads)
+      config.compute_threads = hw_threads - config.io_threads;
+  }
 
   // set mode based on affinity setting
   spin_mode_ = config.enable_affinity;

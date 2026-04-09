@@ -35,7 +35,7 @@ struct ThreadManagerConfig {
    * std::thread::hardware_concurrency() / 2
    */
   unsigned int compute_threads = defaultComputeThreads();
-  unsigned int io_threads = 1;
+  unsigned int io_threads = 0;
 
   /**
    * @brief Enable CPU affinity pinning.
