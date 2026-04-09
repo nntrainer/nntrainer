@@ -244,8 +244,10 @@ void ThreadManager::initialize() noexcept {
   auto config = config_;
 
   unsigned int hw_threads = getPhysicalCoreCount();
-  if (hw_threads == 0)
-    hw_threads = 1;
+
+  // Don't initialize for single core system
+  if (hw_threads <= 1)
+    return;
 
   // keep 1 thread for io
   unsigned int available = hw_threads > 1 ? hw_threads - 1 : 1;
@@ -443,6 +445,9 @@ void ThreadManager::ioWorkerLoop() {
 }
 
 CompletionToken ThreadManager::submit(std::function<void()> task) {
+  if (io_workers_.empty())
+    throw std::runtime_error{"io thread is not enabled."};
+
   CompletionToken token = CompletionToken::create();
   {
     std::lock_guard<std::mutex> lock(io_mutex_);
