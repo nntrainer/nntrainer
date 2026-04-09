@@ -212,6 +212,7 @@ void ClContext::initBlasClKernels() {
   registerClKernel(hgemm_trans_ab_kernel, "sgemm_cl_transAB_fp16");
   registerClKernel(addition_fp16_kernel, "addition_cl_fp16");
   registerClKernel(hscal_kernel, "sscal_cl_fp16");
+  registerClKernel(flash_attention_fp16_kernel, "flash_attention_fp16");
 #endif
   blas_kernels_initialized = true;
 }
