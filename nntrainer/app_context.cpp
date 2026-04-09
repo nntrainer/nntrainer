@@ -60,6 +60,7 @@
 #include <identity_layer.h>
 #include <input_layer.h>
 #include <layer_normalization_layer.h>
+#include <lm_head.h>
 #include <lr_scheduler_constant.h>
 #include <lr_scheduler_cosine.h>
 #include <lr_scheduler_exponential.h>
@@ -386,6 +387,9 @@ void AppContext::add_default_object() {
 
   registerFactory(nntrainer::createLayer<ChannelShuffle>, ChannelShuffle::type,
                   LayerType::LAYER_CHANNEL_SHUFFLE);
+
+  registerFactory(nntrainer::createLayer<LmHeadLayer>, LmHeadLayer::type,
+                  LayerType::LAYER_LMHEAD);
 
 #ifdef ENABLE_NNSTREAMER_BACKBONE
   registerFactory(nntrainer::createLayer<NNStreamerLayer>,

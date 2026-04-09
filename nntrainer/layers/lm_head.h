@@ -26,88 +26,82 @@
 #include <layer_devel.h>
 #include <layer_impl.h>
 
-namespace causallm {
+namespace nntrainer {
 
 /**
  * @class   LMHead layer
  * @brief   LMHead layer
  */
-WIN_EXPORT class LmHeadLayer : public nntrainer::LayerImpl {
+class LmHeadLayer : public LayerImpl {
 public:
   /**
    * @brief     Constructor of Embedding Layer
    */
-  WIN_EXPORT LmHeadLayer();
+  LmHeadLayer();
 
   /**
    * @brief     Destructor of Embedding Layer
    */
-  WIN_EXPORT ~LmHeadLayer() = default;
+  ~LmHeadLayer() = default;
 
   /**
    *  @brief  Move constructor.
    *  @param[in] LmHeadLayer &&
    */
-  WIN_EXPORT LmHeadLayer(LmHeadLayer &&rhs) noexcept = default;
+  LmHeadLayer(LmHeadLayer &&rhs) noexcept = default;
 
   /**
    * @brief  Move assignment operator.
    * @parma[in] rhs LmHeadLayer to be moved.
    */
-  WIN_EXPORT LmHeadLayer &operator=(LmHeadLayer &&rhs) = default;
+  LmHeadLayer &operator=(LmHeadLayer &&rhs) = default;
 
   /**
    * @copydoc Layer::finalize(InitLayerContext &context)
    */
-  WIN_EXPORT void finalize(nntrainer::InitLayerContext &context) override;
+  void finalize(InitLayerContext &context) override;
 
   /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
    */
-  WIN_EXPORT void forwarding(nntrainer::RunLayerContext &context,
-                             bool training) override;
+  void forwarding(RunLayerContext &context, bool training) override;
 
   /**
 ￼   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
 ￼   * int from, unsigned int to, bool training)
 ￼   */
-  WIN_EXPORT void incremental_forwarding(nntrainer::RunLayerContext &context,
-                                         unsigned int from, unsigned int to,
-                                         bool training) override;
+  void incremental_forwarding(RunLayerContext &context, unsigned int from,
+                              unsigned int to, bool training) override;
 
   /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
    */
-  WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
+  void calcDerivative(RunLayerContext &context) override;
 
   /**
    * @copydoc Layer::calcGradient(RunLayerContext &context)
    */
-  WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
+  void calcGradient(RunLayerContext &context) override;
 
   /**
    * @copydoc Layer::exportTo(Exporter &exporter, ml::train::ExportMethods
    * method)
    */
-  WIN_EXPORT void
-  exportTo(nntrainer::Exporter &exporter,
-           const ml::train::ExportMethods &method) const override;
+  void exportTo(Exporter &exporter,
+                const ml::train::ExportMethods &method) const override;
 
   /**
    * @copydoc Layer::getType()
    */
-  WIN_EXPORT const std::string getType() const override {
-    return LmHeadLayer::type;
-  };
+  const std::string getType() const override { return LmHeadLayer::type; };
 
   /**
    * @copydoc Layer::supportBackwarding()
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; }
+  bool supportBackwarding() const override { return true; }
 
-  WIN_EXPORT void updateTensorsByInputDimensions(
-    nntrainer::RunLayerContext &context,
-    std::vector<nntrainer::TensorDim> input_dimensions) override;
+  void updateTensorsByInputDimensions(
+    RunLayerContext &context, std::vector<TensorDim> input_dimensions) override;
 
   using Layer::setProperty;
 
@@ -115,15 +109,15 @@ public:
    * @copydoc Layer::setProperty(const PropertyType type, const std::string
    * &value)
    */
-  WIN_EXPORT void setProperty(const std::vector<std::string> &values) override;
+  void setProperty(const std::vector<std::string> &values) override;
 
   inline static const std::string type = "lm_head";
 
 private:
-  std::tuple<nntrainer::props::Unit> lmhead_props;
+  std::tuple<props::Unit> lmhead_props;
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
 };
-} // namespace causallm
+} // namespace nntrainer
 
 #endif
 #endif

@@ -76,7 +76,6 @@ LOCAL_SRC_FILES := \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/mha_core.cpp \
-    ../layers/lm_head.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/rms_norm.cpp \
