@@ -19,6 +19,16 @@
 #include <opencl_buffer.h>
 #include <opencl_kernel.h>
 
+#ifdef ENABLE_FP16
+#ifndef _FP16
+#ifdef USE__FP16
+#define _FP16 __fp16
+#else
+#define _FP16 _Float16
+#endif
+#endif
+#endif
+
 #include <string>
 
 namespace nntrainer {
@@ -69,9 +79,27 @@ void flash_attention_fp32_cl(float *query, float *key, float *value, float *outp
                              unsigned int num_heads_kv, unsigned int batch,
                              float scale);
 
-#ifdef ENABLE_FP16
 
-#endif
+/**
+ * @brief Flash Attention FP16 computation with GQA support
+ * @param[in] query _FP16 * for Query matrix
+ * @param[in] key _FP16 * for Key matrix
+ * @param[in] value _FP16 * for Value matrix
+ * @param[out] output _FP16 * for Output matrix
+ * @param[in] seqlen_q sequence length of query
+ * @param[in] seqlen_k sequence length of key
+ * @param[in] head_dim dimension of each attention head
+ * @param[in] num_heads_q number of query attention heads
+ * @param[in] num_heads_kv number of key/value attention heads
+ * @param[in] batch batch size
+ * @param[in] scale scaling factor for attention scores
+ */
+void flash_attention_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value, _FP16 *output,
+                             unsigned int seqlen_q, unsigned int seqlen_k,
+                             unsigned int head_dim, unsigned int num_heads_q,
+                             unsigned int num_heads_kv, unsigned int batch,
+                             float scale);
+
 
 } // namespace nntrainer
 #endif /* __FLASH_ATTENTION_H__ */

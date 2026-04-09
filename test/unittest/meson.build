@@ -94,6 +94,7 @@ endif
 if get_option('enable-fp16')
   test_target += [['unittest_nntrainer_tensor_fp16', []]]
   test_target += [['unittest_nntrainer_tensor_pool_fp16', []]]
+  test_target += [['unittest_flash_attention_fp16_cl', []]]
 endif
 
 if get_option('enable-profile')
