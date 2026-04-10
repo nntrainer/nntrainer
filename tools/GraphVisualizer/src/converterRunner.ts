@@ -907,7 +907,7 @@ def main():
             "codegen", "lfm2", "granitemoehybrid", "mamba", "mamba2",
         }
         encoder_decoder_types = {
-            "t5", "mt5", "bart", "mbart", "pegasus", "marian",
+            "t5", "mt5", "bart", "mbart", "pegasus", "marian", "t5gemma2",
         }
         is_custom = model_type in CUSTOM_LOADERS
         is_causal = model_type in causal_types
@@ -916,13 +916,15 @@ def main():
         if is_custom:
             model, config, input_kwargs = load_custom_model(
                 model_type, args.model, config, args.seq_len, verbose=True)
+            # Ensure model is float32 for tracing
+            model = model.float()
         else:
             # Try from_pretrained first; fall back to from_config for weight-less dirs
             loaded = False
             if is_causal:
                 try:
                     model = AutoModelForCausalLM.from_pretrained(
-                        args.model, dtype=torch.float32)
+                        args.model, torch_dtype=torch.float32)
                     loaded = True
                 except (OSError, ValueError):
                     pass
@@ -931,12 +933,14 @@ def main():
             else:
                 try:
                     model = AutoModel.from_pretrained(
-                        args.model, dtype=torch.float32)
+                        args.model, torch_dtype=torch.float32)
                     loaded = True
                 except (OSError, ValueError):
                     pass
                 if not loaded:
                     model = AutoModel.from_config(config)
+            # Ensure model is float32 for tracing (in case from_config was used)
+            model = model.float()
             model.eval()
 
             vocab_size = getattr(config, "vocab_size", 30000)

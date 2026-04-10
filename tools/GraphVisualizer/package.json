@@ -4,6 +4,10 @@
   "description": "Visualize and verify TorchFXConverter results: compare PyTorch FX graphs with NNTrainer converted graphs",
   "version": "0.1.0",
   "publisher": "nntrainer",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nnstreamer/nntrainer"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -95,6 +99,11 @@
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
     "eslint": "^8.56.0",
-    "typescript": "^5.3.0"
+    "typescript": "^5.3.0",
+    "undici": "^5.28.0",
+    "vsce": "^1.103.1"
+  },
+  "overrides": {
+    "undici": "^5.28.0"
   }
 }
