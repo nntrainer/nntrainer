@@ -85,9 +85,16 @@ public:
   virtual ~Transformer() {}
 
   /**
-   * @brief Initialize and Construct the Transformer model
+   * @brief Initialize and Construct the Transformer model for inference
    */
   virtual void initialize();
+
+  /**
+   * @brief Initialize and Construct the Transformer model for training
+   * @param lr Learning rate for the optimizer
+   * @param epochs Number of training epochs
+   */
+  virtual void initializeForTraining(float lr = 1e-4, unsigned int epochs = 1);
 
   /**
    * @brief Load the model weights from a file
@@ -130,6 +137,25 @@ public:
    * @brief get the status of run
    */
   bool hasRun() const { return has_run_; }
+
+  /**
+   * @brief Configure dataset for the model
+   */
+  virtual void setDataset(ml::train::DatasetModeType mode,
+                          std::shared_ptr<ml::train::Dataset> dataset) {
+    if (!model)
+      throw std::invalid_argument("Model is not initialized");
+    model->setDataset(mode, std::move(dataset));
+  }
+
+  /**
+   * @brief Train the model
+   */
+  virtual void train(const std::vector<std::string> &values = {}) {
+    if (!model)
+      throw std::invalid_argument("Model is not initialized");
+    model->train(values);
+  }
 
 protected:
   /**
@@ -237,11 +263,31 @@ protected:
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
 
+  /** LoRA parameters */
+  unsigned int LORA_RANK = 0;             /**< LoRA rank (0 = disabled) */
+  unsigned int LORA_ALPHA = 0;            /**< LoRA alpha for scaling */
+  std::vector<std::string> LORA_TARGETS;  /**< Target layer names for LoRA */
+
+  /**
+   * @brief Check if LoRA should be applied to a layer
+   * @param layer_suffix The suffix identifying the layer type (e.g., "wq",
+   * "ffn_down")
+   * @return true if LoRA is enabled and this layer is a target
+   */
+  bool isLoRATarget(const std::string &layer_suffix) const;
+
   // Performance metrics
   TransformerPerformanceMetrics performance_metrics;
 
   bool has_run_ = false;
 };
+/**
+ * @brief Loads raw bytes from a file as a string
+ * @param path Path to the file
+ * @return File contents as a string
+ */
+std::string LoadBytesFromFile(const std::string &path);
+
 /**
  * Loads JSON data from a file with detailed error handling
  * @param file_path Path to JSON file

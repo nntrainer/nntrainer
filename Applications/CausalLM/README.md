@@ -350,3 +350,23 @@ nntr_causallm /path/to/model
 cp /path/to/model/config.json /path/to/model/generation_config.json /output/dir/
 nntr_causallm /output/dir
 ```
+
+## Training a CausalLM model (QWEN3) using NNTrainer
+
+Steps:
+1. Download the dataset required. In the sample example, we have taken the SST2 dataset. Can download it using:
+```bash
+cd Applications/CausalLM
+python download_sst2.py
+```
+2. Download the required model from hugging face and convert it into an NNTrainer compatible format.
+```bash
+cd Applications/CausalLM
+./download_qwen3_4b.sh
+```
+3. Build the training application and then run training using our pipeline.
+```bash
+meson configure build -Denable-transformer=true
+ninja -C build
+./build/Applications/CausalLM/nntr_causallm_lora_train Applications/CausalLM/res/qwen3/qwen3-4b ./Applications/CausalLM/sst2_data/train.txt --lr 0.0001 --epochs 1 --output model_weights.bin
+```

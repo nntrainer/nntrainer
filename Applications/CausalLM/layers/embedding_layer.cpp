@@ -11,7 +11,7 @@
  * @note   This embedding layer supports FP32/FP16/Q6_K data type only.
  */
 
-#include <embedding_layer.h>
+#include "embedding_layer.h"
 #include <layer_context.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -48,7 +48,7 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
     std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
   auto &weight_regularizer_constant =
     std::get<nntrainer::props::WeightRegularizerConstant>(*layer_impl_props);
-  auto weight_initializer = nntrainer::props::InitializerInfo::Enum::NONE;
+  auto weight_initializer = nntrainer::Initializer::ONES;
   auto &weight_decay =
     std::get<nntrainer::props::WeightDecay>(*layer_impl_props);
 
@@ -85,11 +85,17 @@ void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void EmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
-                                bool training) {}
+                                bool training) {
+
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  unsigned int seq_len = input_.getDim().width();
+  incremental_forwarding(context, 0, seq_len, training);
+}
 
 void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             unsigned int from, unsigned int to,
                                             bool training) {
+
 
   /// @todo get input and output dimension from input_ and hidden itself
   unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);
@@ -97,7 +103,6 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
                   ? 1.0f
                   : std::get<nntrainer::props::Scale>(embedding_props).get();
-  unsigned int _from = from;
 
   nntrainer::Tensor &weight = context.getWeight(weight_idx);
   nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -125,7 +130,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       nntrainer::Tensor cur_weight =
         weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
       nntrainer::Tensor out_tensor =
-        batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
+        batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (from + i));
 
       if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K) {
         ///@note this should be replaced with quantizer operation
@@ -159,11 +164,43 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 }
 
 void EmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  throw nntrainer::exception::not_supported(
-    "calcDerivative for Embedding layer is not supported");
+
+  // Embedding is the first layer; no gradient to propagate further back.
 }
 
-void EmbeddingLayer::calcGradient(nntrainer::RunLayerContext &context) {}
+void EmbeddingLayer::calcGradient(nntrainer::RunLayerContext &context) {
+
+  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &dweight = context.getWeightGrad(weight_idx);
+  
+  float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
+    ? 1.0f : std::get<nntrainer::props::Scale>(embedding_props).get();
+
+  size_t batch = in.batch();
+  size_t seq_len = in.getDim().getFeatureLen();
+  unsigned int out_dim = std::get<nntrainer::props::OutDim>(embedding_props);
+  unsigned int in_dim = std::get<nntrainer::props::InDim>(embedding_props);
+  float *dw_data = dweight.getData<float>();
+  const float *dy_data = dy.getData<float>();
+
+  dweight.setZero();
+
+  for (size_t b = 0; b < batch; ++b) {
+    const float *in_data = in.getAddress<float>(b * in.getDim().getFeatureLen());
+    const float *dy_batch_data = dy_data + b * dy.getDim().getFeatureLen();
+    for (size_t i = 0; i < seq_len; ++i) {
+      unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
+      if (embed_idx >= in_dim) continue;
+      
+      float *dw_row = dw_data + embed_idx * out_dim;
+      const float *dy_row = dy_batch_data + i * out_dim;
+      for (size_t j = 0; j < out_dim; ++j) {
+         dw_row[j] += dy_row[j] * scale;
+      }
+    }
+  }
+}
 
 void EmbeddingLayer::exportTo(nntrainer::Exporter &exporter,
                               const ml::train::ExportMethods &method) const {
@@ -180,22 +217,18 @@ void EmbeddingLayer::save(std::ofstream &file,
   for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
     if (run_context.isGradientFirstAccess(i)) {
       auto &weight = run_context.getWeight(i);
-      if (dtype == nntrainer::TensorDim::DataType::NONE ||
-          weight.getDataType() == dtype)
+      if (weight.getDataType() == dtype)
         weight.save(file);
       else {
         NNTR_THROW_IF(weight.getDataType() !=
                         nntrainer::TensorDim::DataType::FP32,
                       std::runtime_error)
           << "Save with quantization only supports for FP32 weight.";
-        ///@note The codelines below can be replaced with quantizer's
-        /// quantize()
         nntrainer::TensorDim dim = weight.getDim();
         unsigned int K = dim.height();
         unsigned int N = dim.width();
 
         if (dtype == nntrainer::TensorDim::DataType::Q4_0) {
-
           // Skip quantization for bias-like tensors (1D with height == 1)
           // as they are not suitable for Q4_0 block quantization
           if (K == 1) {
@@ -217,10 +250,6 @@ void EmbeddingLayer::save(std::ofstream &file,
             quant_weight.save(file);
           }
         } else if (dtype == nntrainer::TensorDim::DataType::Q6_K) {
-          //////////////////////////////////////////////////////////////////
-          ///@note Please note that Embedding layer doesn't need to be
-          /// transposed!
-          //////////////////////////////////////////////////////////////////
           nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                          {nntrainer::Tformat::NCHW, dtype});
           nntrainer::quantize_q6_K(weight.getData<float>(),

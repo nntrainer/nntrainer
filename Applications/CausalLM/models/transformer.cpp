@@ -11,11 +11,13 @@
  */
 
 #include <fstream>
+#include <iostream>
 
 #include <app_context.h>
 #include <engine.h>
 #include <model.h>
 
+#include <layer.h>
 #include <llm_util.hpp>
 #include <tokenizers_cpp.h>
 #include <transformer.h>
@@ -179,6 +181,19 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   NORM_EPS = cfg["rms_norm_eps"];
   GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
 
+  /** LoRA parameters */
+  if (nntr_cfg.contains("lora_rank")) {
+    LORA_RANK = nntr_cfg["lora_rank"].get<unsigned int>();
+  }
+  if (nntr_cfg.contains("lora_alpha")) {
+    LORA_ALPHA = nntr_cfg["lora_alpha"].get<unsigned int>();
+  }
+  if (nntr_cfg.contains("lora_target")) {
+    for (const auto &target : nntr_cfg["lora_target"]) {
+      LORA_TARGETS.push_back(target.get<std::string>());
+    }
+  }
+
   return;
 };
 
@@ -216,6 +231,38 @@ void Transformer::initialize() {
 #endif
 }
 
+void Transformer::initializeForTraining(float lr, unsigned int epochs) {
+  registerCustomLayers();
+
+  model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+
+  // setup model property
+  std::vector<std::string> model_props = {
+    withKey("batch_size", BATCH_SIZE), withKey("epochs", epochs),
+    withKey("model_tensor_type", MODEL_TENSOR_TYPE)};
+
+  model->setProperty(model_props);
+
+  // set optimizer (Adam for LoRA fine-tuning)
+  auto optimizer =
+    ml::train::createOptimizer("adam", {"learning_rate=" + std::to_string(lr)});
+  if (model->setOptimizer(std::move(optimizer))) {
+    throw std::invalid_argument("Failed to set optimizer.");
+  }
+
+  auto [x, h] = constructModel();
+
+  if (model->compile(x, h, ml::train::ExecutionMode::TRAIN)) {
+    throw std::invalid_argument("Model compilation for training failed.");
+  }
+
+  if (model->initialize(ml::train::ExecutionMode::TRAIN)) {
+    throw std::invalid_argument("Model initialization for training failed.");
+  }
+
+  is_initialized = true;
+}
+
 /**
  * @brief Construct the default decoder-only transformer graph.
  */
@@ -249,7 +296,7 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
   h = out_norm(h);
 
   return {x, h};
-};
+}
 
 /**
  * @brief Load model weights from a binary nntrainer model file.
@@ -364,6 +411,16 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
   return decoder_output({residual, ffn_out});
 }
 
+bool Transformer::isLoRATarget(const std::string &layer_suffix) const {
+  if (LORA_RANK == 0)
+    return false;
+  for (const auto &target : LORA_TARGETS) {
+    if (target == layer_suffix)
+      return true;
+  }
+  return false;
+}
+
 /**
  * @brief Create external KV-cache placeholder tensors for one layer.
  */
@@ -376,7 +433,6 @@ Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
   ml::train::TensorDim cache_dim(
     {BATCH_SIZE, 1, max_timestep, kv_width},
     {ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::FP16});
-
   Tensor cache_k(cache_dim, "cache_k_l" + std::to_string(layer_id));
   Tensor cache_v(cache_dim, "cache_v_l" + std::to_string(layer_id));
   return {cache_k, cache_v};
@@ -406,31 +462,42 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
                                     Tensor key, Tensor value) {
 
   // Q layer
-  LayerHandle wq(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
-     withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+  std::vector<std::string> wq_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
+    withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones")};
+  if (isLoRATarget("wq")) {
+    wq_props.push_back(withKey("lora_rank", LORA_RANK));
+    wq_props.push_back(withKey("lora_alpha", LORA_ALPHA));
+  }
+  LayerHandle wq(createLayer("fully_connected", wq_props));
   Tensor q = wq(query);
 
   // K layer
-  LayerHandle wk(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
-     withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+  std::vector<std::string> wk_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
+    withKey("unit", head_dim * n_heads / GQA_SIZE),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones")};
+  if (isLoRATarget("wk")) {
+    wk_props.push_back(withKey("lora_rank", LORA_RANK));
+    wk_props.push_back(withKey("lora_alpha", LORA_ALPHA));
+  }
+  LayerHandle wk(createLayer("fully_connected", wk_props));
   Tensor k = wk(key);
 
   // V layer
-  LayerHandle wv(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
-     withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+  std::vector<std::string> wv_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
+    withKey("unit", head_dim * n_heads / GQA_SIZE),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones")};
+  if (isLoRATarget("wv")) {
+    wv_props.push_back(withKey("lora_rank", LORA_RANK));
+    wv_props.push_back(withKey("lora_alpha", LORA_ALPHA));
+  }
+  LayerHandle wv(createLayer("fully_connected", wv_props));
   Tensor v = wv(value);
 
-  // External KV cache placeholders (per-layer). Their actual storage is owned
-  // by the host (KVCacheManager) and bound at runtime via setExternalTensors.
+  // External KV cache placeholders (per-layer).
   auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
 
   // Attention core layer
@@ -448,11 +515,15 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
   Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer
-  LayerHandle wo(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
-     withKey("unit", DIM), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+  std::vector<std::string> wo_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
+    withKey("unit", DIM), withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones")};
+  if (isLoRATarget("wo")) {
+    wo_props.push_back(withKey("lora_rank", LORA_RANK));
+    wo_props.push_back(withKey("lora_alpha", LORA_ALPHA));
+  }
+  LayerHandle wo(createLayer("fully_connected", wo_props));
   return wo(a);
 }
 
@@ -462,18 +533,26 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
 Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
                               Tensor input) {
 
-  LayerHandle ffn_up(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
-     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+  std::vector<std::string> up_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
+    withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones")};
+  if (isLoRATarget("ffn_up")) {
+    up_props.push_back(withKey("lora_rank", LORA_RANK));
+    up_props.push_back(withKey("lora_alpha", LORA_ALPHA));
+  }
+  LayerHandle ffn_up(createLayer("fully_connected", up_props));
   Tensor up = ffn_up(input);
 
-  LayerHandle ffn_gate(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
-     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+  std::vector<std::string> gate_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
+    withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones")};
+  if (isLoRATarget("ffn_gate")) {
+    gate_props.push_back(withKey("lora_rank", LORA_RANK));
+    gate_props.push_back(withKey("lora_alpha", LORA_ALPHA));
+  }
+  LayerHandle ffn_gate(createLayer("fully_connected", gate_props));
   Tensor gate = ffn_gate(input);
 
   LayerHandle swiglu(createLayer(
@@ -481,11 +560,15 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
   Tensor act = swiglu({gate, up});
 
-  LayerHandle ffn_down(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
-     withKey("unit", dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+  std::vector<std::string> down_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
+    withKey("unit", dim), withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones")};
+  if (isLoRATarget("ffn_down")) {
+    down_props.push_back(withKey("lora_rank", LORA_RANK));
+    down_props.push_back(withKey("lora_alpha", LORA_ALPHA));
+  }
+  LayerHandle ffn_down(createLayer("fully_connected", down_props));
   return ffn_down(act);
 }
 

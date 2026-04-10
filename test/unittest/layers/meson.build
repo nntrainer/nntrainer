@@ -114,6 +114,19 @@ test_target = [
   'unittest_layers_upsample2d.cpp'
 ]
 
+if get_option('enable-transformer')
+  test_target += 'unittest_layers_causallm_rmsnorm.cpp'
+  test_target += meson.source_root() / 'Applications' / 'CausalLM' / 'layers' / 'rms_norm.cpp'
+  test_target += 'unittest_layers_causallm_lm_head.cpp'
+  test_target += meson.source_root() / 'Applications' / 'CausalLM' / 'layers' / 'lm_head.cpp'
+  test_target += 'unittest_layers_causallm_swiglu.cpp'
+  test_target += meson.source_root() / 'Applications' / 'CausalLM' / 'layers' / 'swiglu.cpp'
+  test_target += 'unittest_layers_causallm_tiewordembedding.cpp'
+  test_target += meson.source_root() / 'Applications' / 'CausalLM' / 'layers' / 'tie_word_embedding.cpp'
+  test_target += 'unittest_layers_causallm_mhacore.cpp'
+  test_target += meson.source_root() / 'Applications' / 'CausalLM' / 'layers' / 'mha_core.cpp'
+endif
+
 if get_option('enable-opencl')
   test_target += 'unittest_layers_addition_cl.cpp'
   test_target += 'unittest_layers_rmsnorm_cl.cpp'
@@ -139,11 +152,17 @@ if get_option('enable-nnstreamer-backbone')
   endif
 endif
 
+layer_test_deps = [nntrainer_test_main_deps]
+layer_test_inc = []
+
+if get_option('enable-transformer')
+  layer_test_inc += include_directories('../../../Applications/CausalLM/layers')
+endif
+
 exe = executable(
   'unittest_layers', test_target,
-  dependencies: [
-    nntrainer_test_main_deps,
-  ],
+  dependencies: layer_test_deps,
+  include_directories: layer_test_inc,
   cpp_args : cpp_args_str,
   install: get_option('enable-test'),
   install_dir: application_install_dir

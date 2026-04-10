@@ -8,11 +8,10 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
  * @bug    No known bugs except for NYI items
- * @note   This layer only supports inference mode.
  */
 
-#ifndef __RMS_NORM_LAYER_H__
-#define __RMS_NORM_LAYER_H__
+#ifndef __CAUSALLM_RESHAPED_RMS_NORM_LAYER_H__
+#define __CAUSALLM_RESHAPED_RMS_NORM_LAYER_H__
 
 #pragma once
 #ifdef _WIN32
@@ -27,7 +26,7 @@
 #include <utility>
 
 #include <base_properties.h>
-#include <causallm_common_properties.h>
+#include "causallm_common_properties.h"
 #include <connection.h>
 #include <tensor.h>
 #include <tensor_wrap_specs.h>
@@ -78,6 +77,11 @@ public:
                                          bool training) override;
 
   /**
+   * @copydoc Layer::calcGradient(RunLayerContext &context)
+   */
+  WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
+
+  /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
    */
   WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
@@ -85,7 +89,7 @@ public:
   /**
    * @copydoc bool supportBackwarding() const
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; };
+  WIN_EXPORT bool supportBackwarding() const override { return true; };
 
   /**
    * @copydoc Layer::exportTo(Exporter &exporter, ExportMethods method)
@@ -118,7 +122,8 @@ public:
   inline static const std::string type = "reshaped_rms_norm";
 
 private:
-  std::array<unsigned int, 1> wt_idx;
+  enum RMSParams { gamma, inv_rms };
+  std::array<unsigned int, 2> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
              props::FeatureSize>
     rms_props;
@@ -128,4 +133,4 @@ private:
 
 } // namespace causallm
 
-#endif /* __CAUSALLM_RMS_NORM_LAYER_H__ */
+#endif /* __CAUSALLM_RESHAPED_RMS_NORM_LAYER_H__ */

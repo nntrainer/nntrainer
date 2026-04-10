@@ -18,6 +18,6 @@
     "max_seq_len": 2048,
     "batch_size": 1,
 
-    "tokenizer_file": "/tmp/nntrainer/Applications/CausalLM/res/qwen3-4b/tokenizer.json",
+    "tokenizer_file": "Applications/CausalLM/res/qwen3/qwen3-4b/tokenizer.json",
     "sample_input": "<|im_start|>user\nGive me a short introduction to large language model.<|im_end|>\n<|im_start|>assistant\n"
 }

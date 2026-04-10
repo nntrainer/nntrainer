@@ -26,7 +26,7 @@
 #include <node_exporter.h>
 #include <utility>
 
-#include <causallm_common_properties.h>
+#include "causallm_common_properties.h"
 #include <connection.h>
 #include <tensor.h>
 #include <tensor_wrap_specs.h>
@@ -76,9 +76,14 @@ public:
   WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
 
   /**
+   * @copydoc Layer::calcGradient(RunLayerContext &context)
+   */
+  WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
+
+  /**
    * @copydoc bool supportBackwarding() const
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; };
+  WIN_EXPORT bool supportBackwarding() const override { return true; };
 
   /**
    * @copydoc Layer::exportTo(Exporter &exporter, ExportMethods method)
@@ -111,7 +116,7 @@ public:
   inline static const std::string type = "rms_norm";
 
 private:
-  std::array<unsigned int, 1> wt_idx;
+  std::array<unsigned int, 3> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon> rms_props;
 };
 

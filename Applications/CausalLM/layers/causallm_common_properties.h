@@ -97,7 +97,7 @@ public:
 };
 }; // namespace props
 
-WIN_EXPORT enum RMSParams { gamma };
+WIN_EXPORT enum RMSParams { gamma, inv_rms, temp_full };
 
 } // namespace causallm
 
