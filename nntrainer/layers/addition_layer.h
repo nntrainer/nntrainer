@@ -100,6 +100,13 @@ public:
     add_props; /**< fc layer properties : unit - number of output neurons */
 
   static constexpr const char *type = "addition";
+
+private:
+  /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<TensorDim>, 3>
+  getLayerDimensions(InitLayerContext &context) override;
 };
 
 } // namespace nntrainer

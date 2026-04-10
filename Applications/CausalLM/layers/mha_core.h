@@ -475,6 +475,12 @@ private:
   /************** END OF  ROTARY EMBEDDING *************/
 
   /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<nntrainer::TensorDim>, 3>
+  getLayerDimensions(nntrainer::InitLayerContext &context) override;
+
+  /**
    * @brief calculate common derivative
    * @param context Context of the layer
    */

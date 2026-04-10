@@ -89,4 +89,16 @@ void InputLayer::updateTensorsByInputDimensions(
   context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
 }
 
+std::array<std::vector<TensorDim>, 3>
+InputLayer::getLayerDimensions(InitLayerContext &context) {
+  TensorDim::DataType output_dtype = context.getActivationDataType();
+
+  std::vector<TensorDim> output_dims = context.getInputDimensions();
+  for (auto &d : output_dims) {
+    d.setDataType(output_dtype);
+  }
+
+  return {output_dims, {}, {}};
+}
+
 } /* namespace nntrainer */

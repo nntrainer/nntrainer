@@ -122,8 +122,16 @@ private:
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
              props::FeatureSize>
     rms_props;
+  std::shared_ptr<nntrainer::Tensor> input_fp32;
+  std::shared_ptr<nntrainer::Tensor> output_fp32;
 
   unsigned int feature_size;
+
+  /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<nntrainer::TensorDim>, 3>
+  getLayerDimensions(nntrainer::InitLayerContext &context) override;
 };
 
 } // namespace causallm

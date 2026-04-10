@@ -99,4 +99,14 @@ void MultiOutLayer::updateTensorsByInputDimensions(
   }
 }
 
+std::array<std::vector<TensorDim>, 3>
+MultiOutLayer::getLayerDimensions(InitLayerContext &context) {
+  std::vector<TensorDim> out_dims(context.getNumRequestedOutputs());
+  const TensorDim &in_dim = context.getInputDimensions()[SINGLE_INOUT_IDX];
+
+  std::fill(out_dims.begin(), out_dims.end(), in_dim);
+
+  return {out_dims, {}, {}};
+}
+
 } /* namespace nntrainer */

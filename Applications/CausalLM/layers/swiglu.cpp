@@ -98,6 +98,19 @@ void SwiGLULayer::calcDerivative(nntrainer::RunLayerContext &context) {
   // yet."));
 }
 
+std::array<std::vector<nntrainer::TensorDim>, 3>
+SwiGLULayer::getLayerDimensions(nntrainer::InitLayerContext &context) {
+  NNTR_THROW_IF(context.getInputDimensions()[INPUT_IDX_1] !=
+                  context.getInputDimensions()[INPUT_IDX_2],
+                std::invalid_argument)
+    << "2 input dimensions of SwiGLU layer SHOULD BE identical";
+
+  return {std::move(std::vector<nntrainer::TensorDim>{
+            (context.getInputDimensions()[INPUT_IDX_1])}),
+          {},
+          {}};
+}
+
 #ifdef PLUGGABLE
 
 nntrainer::Layer *create_swiglu_layer() {

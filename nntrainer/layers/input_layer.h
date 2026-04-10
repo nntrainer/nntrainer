@@ -113,6 +113,12 @@ public:
 
 private:
   std::tuple<props::Normalization, props::Standardization> input_props;
+
+  /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<TensorDim>, 3>
+  getLayerDimensions(InitLayerContext &context) override;
 };
 } // namespace nntrainer
 

@@ -100,6 +100,13 @@ public:
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
   inline static const std::string type = "swiglu";
+
+private:
+  /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<nntrainer::TensorDim>, 3>
+  getLayerDimensions(nntrainer::InitLayerContext &context) override;
 };
 
 } // namespace causallm

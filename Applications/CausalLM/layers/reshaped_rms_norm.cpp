@@ -120,6 +120,33 @@ void ReshapedRMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   std::throw_with_nested(std::runtime_error("Training is not supported yet."));
 }
 
+std::array<std::vector<nntrainer::TensorDim>, 3>
+ReshapedRMSNormLayer::getLayerDimensions(nntrainer::InitLayerContext &context) {
+  std::vector<nntrainer::TensorDim> output_dims = context.getInputDimensions();
+
+  NNTR_THROW_IF(output_dims[SINGLE_INOUT_IDX].width() % feature_size != 0,
+                std::invalid_argument)
+    << "feature size must be a divisor of width, width of output: "
+    << output_dims[SINGLE_INOUT_IDX] << ", feature_size: " << feature_size;
+
+  if (output_dims[SINGLE_INOUT_IDX].getDataType() ==
+      ml::train::TensorDim::DataType::FP16) {
+    ml::train::TensorDim in_out_fp32_dim = output_dims[SINGLE_INOUT_IDX];
+    in_out_fp32_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+    input_fp32 = std::make_shared<nntrainer::Tensor>(in_out_fp32_dim);
+    output_fp32 = std::make_shared<nntrainer::Tensor>(in_out_fp32_dim);
+  }
+
+  std::vector<nntrainer::TensorDim> weight_dims;
+  nntrainer::TensorDim gamma_dim(
+    1, 1, 1, feature_size,
+    nntrainer::TensorDim::TensorType(context.getFormat(),
+                                     context.getWeightDataType()));
+  weight_dims.push_back(gamma_dim);
+
+  return {output_dims, weight_dims, {}};
+}
+
 #ifdef PLUGGABLE
 
 nntrainer::Layer *create_rms_norm_layer() {

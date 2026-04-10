@@ -176,6 +176,20 @@ public:
   virtual const std::string getType() const = 0;
 
   /**
+   * @brief     get output, weight and tensor dimensions of layer
+   * @param     context Context of the layer
+   *
+   * @details   Input dimensions will be provided set in the context. This
+   * function must set output dimensions in the given context. Further, context
+   * can be finalze weights for the layer, and any extra tensor required
+   * for the operation of the layer.
+   */
+  virtual std::array<std::vector<TensorDim>, 3>
+  getLayerDimensions(InitLayerContext &context) {
+    return {std::move(context.getInputDimensions()), {}, {}};
+  };
+
+  /**
    * @brief     Finalize creating the layer
    * @param     context Context of the layer
    *

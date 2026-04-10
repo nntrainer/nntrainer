@@ -236,6 +236,48 @@ void EmbeddingLayer::save(std::ofstream &file,
   }
 }
 
+std::array<std::vector<nntrainer::TensorDim>, 3>
+EmbeddingLayer::getLayerDimensions(nntrainer::InitLayerContext &context) {
+  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
+    << "Embedding layer takes only one input";
+
+  const nntrainer::TensorDim &input_dim =
+    context.getInputDimensions()[SINGLE_INOUT_IDX];
+  NNTR_THROW_IF(input_dim.channel() != 1, std::invalid_argument)
+    << "Embedding layer takes only one for channel size";
+
+  NNTR_THROW_IF(input_dim.getDataType() != nntrainer::TensorDim::DataType::FP32,
+                std::invalid_argument)
+    << "Embedding layer takes only FP32 input data";
+
+  size_t in_dim =
+    static_cast<size_t>(std::get<nntrainer::props::InDim>(embedding_props));
+  size_t out_dim =
+    static_cast<size_t>(std::get<nntrainer::props::OutDim>(embedding_props));
+
+  std::vector<nntrainer::TensorDim> output_dims;
+  nntrainer::TensorDim output_dim = input_dim;
+
+  // output_dim expected as hidden x num input (batch size)
+  output_dim.height(input_dim.width());
+  output_dim.width(out_dim);
+  output_dim.setTensorType(
+    {context.getFormat(), context.getActivationDataType()});
+  output_dims.push_back(output_dim);
+
+  std::vector<nntrainer::TensorDim> weight_dims;
+  nntrainer::TensorDim weight_dim = output_dim;
+
+  weight_dim.setTensorType({context.getFormat(), context.getWeightDataType()});
+
+  weight_dim.height(in_dim);
+  weight_dim.width(out_dim);
+  weight_dim.batch(1);
+  weight_dims.push_back(weight_dim);
+
+  return {output_dims, weight_dims, {}};
+}
+
 #ifdef PLUGGABLE
 
 nntrainer::Layer *create_embedding_layer() {

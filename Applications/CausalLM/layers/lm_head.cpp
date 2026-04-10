@@ -185,6 +185,62 @@ void LmHeadLayer::updateTensorsByInputDimensions(
   context.updateInput(SINGLE_INOUT_IDX, in_dim);
 }
 
+std::array<std::vector<nntrainer::TensorDim>, 3>
+LmHeadLayer::getLayerDimensions(nntrainer::InitLayerContext &context) {
+  auto &disable_bias =
+    std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+
+  auto unit = std::get<nntrainer::props::Unit>(lmhead_props).get();
+
+  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
+    << "lm head layer takes only one input";
+
+  std::vector<ml::train::TensorDim> output_dims(1);
+  std::vector<ml::train::TensorDim> weight_dims;
+
+  /// @todo fc actaully supports multidimensions.
+  /// EffDimFlag shouldn't be fixed like this.
+  context.setEffDimFlagInputDimension(0, 0b1001);
+  context.setDynDimFlagInputDimension(0, 0b1000);
+  bool is_nchw = (context.getFormat() == nntrainer::Tformat::NCHW);
+
+  /** set output dimensions */
+  ///@note lm_head's output dimension (height is always 1 !)
+  auto const &in_dim = context.getInputDimensions()[SINGLE_INOUT_IDX];
+  output_dims[SINGLE_INOUT_IDX] = in_dim;
+  if (is_nchw)
+    output_dims[SINGLE_INOUT_IDX].width(unit);
+  else
+    output_dims[SINGLE_INOUT_IDX].channel(unit);
+  output_dims[SINGLE_INOUT_IDX].height(1);
+
+  output_dims[SINGLE_INOUT_IDX].setTensorType(
+    {context.getFormat(), context.getActivationDataType()});
+
+  ///@note LMHead layer's tensor dim is transposed dim of user-defined
+  /// dim
+  /// so it can reuse embedding layer.
+  ml::train::TensorDim weight_dim(
+    1, is_nchw ? 1 : unit, is_nchw ? in_dim.width() : 1,
+    is_nchw ? unit : in_dim.channel(),
+    ml::train::TensorDim::TensorType(context.getFormat(),
+                                     context.getWeightDataType()),
+    is_nchw ? 0b0011 : 0b0101);
+  weight_dims.push_back(weight_dim);
+
+  if (disable_bias.empty() || disable_bias.get() == false) {
+    /** set weight specifications */
+    ml::train::TensorDim bias_dim(
+      1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
+      ml::train::TensorDim::TensorType(context.getFormat(),
+                                       context.getWeightDataType()),
+      is_nchw ? 0b0001 : 0b0100);
+    weight_dims.push_back(bias_dim);
+  }
+
+  return {output_dims, weight_dims, {}};
+}
+
 #ifdef PLUGGABLE
 
 nntrainer::Layer *create_tie_word_embedding() {

@@ -376,4 +376,98 @@ void FullyConnectedLayer::calcGradient(RunLayerContext &context) {
   }
 }
 
+std::array<std::vector<TensorDim>, 3>
+FullyConnectedLayer::getLayerDimensions(InitLayerContext &context) {
+  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
+    << "Fully connected layer takes only one input";
+
+  auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
+  const auto &unit = std::get<props::Unit>(fc_props).get();
+  const auto &lora_rank = (std::get<props::LoraRank>(fc_props).empty())
+                            ? 0
+                            : std::get<props::LoraRank>(fc_props).get();
+
+  /// @todo fc actaully supports multidimensions. EffDimFlag shouldn't be fixed
+  /// like this.
+  context.setEffDimFlagInputDimension(0, 0b1001);
+  context.setDynDimFlagInputDimension(0, 0b1000);
+
+  bool is_nchw = (context.getFormat() == Tformat::NCHW);
+  auto const &in_dim = context.getInputDimensions()[SINGLE_INOUT_IDX];
+
+  std::vector<TensorDim> output_dims;
+  std::vector<TensorDim> weight_dims;
+  std::vector<TensorDim> tensor_dims;
+
+  TensorDim output_dim = in_dim;
+  is_nchw ? output_dim.width(unit) : output_dim.channel(unit);
+  output_dim.setTensorType(
+    {context.getFormat(), context.getActivationDataType()});
+  output_dims.push_back(output_dim);
+
+  /** set weight specifications */
+  // @todo : This NCHW format setting is just temporal, it needs to be set by
+  // global configuration
+
+  /** Weight Dimension : (1, 1, in_dim.width(), unit)*/
+  TensorDim weight_dim(
+    1, is_nchw ? 1 : unit, is_nchw ? in_dim.width() : 1,
+    is_nchw ? unit : in_dim.channel(),
+    TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
+    is_nchw ? 0b0011 : 0b0101);
+  weight_dims.push_back(weight_dim);
+
+  if (disable_bias.empty() || disable_bias.get() == false) {
+    /** Bias Dimension : (1, 1, 1, unit) */
+    /// @note bias is directly added to activation
+    /// since we have no dequantizer for add operation,
+    /// we have to set its data type as same as activation.
+    /// This should be updated when the dequantizer is supported.
+    TensorDim bias_dim(1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
+                       TensorDim::TensorType(context.getFormat(),
+                                             context.getActivationDataType()),
+                       is_nchw ? 0b0001 : 0b0100);
+    weight_dims.push_back(bias_dim);
+  }
+
+  if (lora_rank) {
+    /** loraA Dimension : (1, 1, in_dim.width, lora_rank) */
+    TensorDim loraA_dim(
+      1, is_nchw ? 1 : lora_rank, is_nchw ? in_dim.width() : 1,
+      is_nchw ? lora_rank : in_dim.channel(),
+      TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
+      is_nchw ? 0b0011 : 0b0101);
+    weight_dims.push_back(loraA_dim);
+
+    /** loraB Dimension : (1, 1, lora_rank, unit) */
+    TensorDim loraB_dim(
+      1, is_nchw ? 1 : unit, is_nchw ? lora_rank : 1,
+      is_nchw ? unit : lora_rank,
+      TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
+      is_nchw ? 0b0011 : 0b0101);
+    weight_dims.push_back(loraB_dim);
+
+    /** loraTmp Dimension : (B, 1, in_dim.height(), lora_rank) */
+    TensorDim loraTmp_dim(
+      in_dim.batch(), is_nchw ? 1 : lora_rank, is_nchw ? in_dim.height() : 1,
+      is_nchw ? lora_rank : in_dim.width(),
+      TensorDim::TensorType(context.getFormat(),
+                            context.getActivationDataType()),
+      is_nchw ? 0b1011 : 0b1101);
+    tensor_dims.push_back(loraTmp_dim);
+
+    /** loraTmp Dimension : (B, 1, in_dim.height(), unit) */
+    TensorDim loraOut_dim(
+      in_dim.batch(), is_nchw ? 1 : unit, is_nchw ? in_dim.height() : 1,
+      is_nchw ? unit : in_dim.width(),
+      TensorDim::TensorType(context.getFormat(),
+                            context.getActivationDataType()),
+      is_nchw ? 0b1011 : 0b1101);
+    tensor_dims.push_back(loraOut_dim);
+  }
+
+  return std::array<std::vector<TensorDim>, 3>{output_dims, weight_dims,
+                                               tensor_dims};
+}
+
 } /* namespace nntrainer */

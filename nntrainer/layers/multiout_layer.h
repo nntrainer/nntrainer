@@ -104,6 +104,13 @@ public:
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
   static constexpr const char *type = "multiout";
+
+private:
+  /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<TensorDim>, 3>
+  getLayerDimensions(InitLayerContext &context) override;
 };
 
 } // namespace nntrainer

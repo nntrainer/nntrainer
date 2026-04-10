@@ -487,6 +487,94 @@ void TieWordEmbedding::save(std::ofstream &file,
   }
 }
 
+std::array<std::vector<nntrainer::TensorDim>, 3>
+TieWordEmbedding::getLayerDimensions(nntrainer::InitLayerContext &context) {
+  return mode_ == mode::embedding ? getEmbeddingDimensions(context)
+                                  : getLMheadDimensions(context);
+}
+
+std::array<std::vector<nntrainer::TensorDim>, 3>
+TieWordEmbedding::getEmbeddingDimensions(nntrainer::InitLayerContext &context) {
+  unsigned int in_dim =
+    std::get<nntrainer::props::InDim>(tieword_embedding_props);
+  unsigned int out_dim =
+    std::get<nntrainer::props::OutDim>(tieword_embedding_props);
+
+  const nntrainer::TensorDim &input_dim =
+    context.getInputDimensions()[SINGLE_INOUT_IDX];
+
+  nntrainer::TensorDim output_dim = input_dim;
+
+  // output_dim expected as hidden x num input (batch size)
+  output_dim.height(input_dim.width());
+  output_dim.width(out_dim);
+  output_dim.setTensorType(
+    {context.getFormat(), context.getActivationDataType()});
+
+  nntrainer::TensorDim weight_dim = output_dim;
+
+  weight_dim.setTensorType({context.getFormat(), context.getWeightDataType()});
+
+  weight_dim.height(in_dim);
+  weight_dim.width(out_dim);
+  weight_dim.batch(1);
+
+  return {std::move(std::vector<nntrainer::TensorDim>{output_dim}),
+          std::move(std::vector<nntrainer::TensorDim>{weight_dim}),
+          {}};
+}
+
+std::array<std::vector<nntrainer::TensorDim>, 3>
+TieWordEmbedding::getLMheadDimensions(nntrainer::InitLayerContext &context) {
+  auto &disable_bias =
+    std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+
+  auto unit = std::get<nntrainer::props::Unit>(tieword_embedding_props).get();
+
+  std::vector<ml::train::TensorDim> output_dims(1);
+
+  /// @todo fc actaully supports multidimensions.
+  /// EffDimFlag shouldn't be fixed like this.
+  context.setEffDimFlagInputDimension(0, 0b1001);
+  context.setDynDimFlagInputDimension(0, 0b1000);
+  bool is_nchw = (context.getFormat() == nntrainer::Tformat::NCHW);
+
+  /** set output dimensions */
+  auto const &in_dim = context.getInputDimensions()[SINGLE_INOUT_IDX];
+  output_dims[SINGLE_INOUT_IDX] = in_dim;
+  is_nchw ? output_dims[SINGLE_INOUT_IDX].width(unit)
+          : output_dims[SINGLE_INOUT_IDX].channel(unit);
+  output_dims[SINGLE_INOUT_IDX].height(1);
+
+  output_dims[SINGLE_INOUT_IDX].setTensorType(
+    {context.getFormat(), context.getActivationDataType()});
+
+  std::vector<nntrainer::TensorDim> weight_dims;
+
+  ///@note TieWordEmbedding layer's tensor dim is transposed dim of user-defined
+  /// dim
+  /// so it can reuse embedding layer.
+  ml::train::TensorDim weight_dim(
+    1, is_nchw ? 1 : in_dim.channel(), is_nchw ? unit : 1,
+    is_nchw ? in_dim.width() : unit,
+    ml::train::TensorDim::TensorType(context.getFormat(),
+                                     context.getWeightDataType()),
+    is_nchw ? 0b0011 : 0b0101);
+  weight_dims.push_back(weight_dim);
+
+  if (disable_bias.empty() || disable_bias.get() == false) {
+    /** set weight specifications */
+    ml::train::TensorDim bias_dim(
+      1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
+      ml::train::TensorDim::TensorType(context.getFormat(),
+                                       context.getWeightDataType()),
+      is_nchw ? 0b0001 : 0b0100);
+    weight_dims.push_back(bias_dim);
+  }
+
+  return {output_dims, weight_dims, {}};
+}
+
 #ifdef PLUGGABLE
 
 nntrainer::Layer *create_tie_word_embedding() {

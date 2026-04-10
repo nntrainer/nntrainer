@@ -200,4 +200,69 @@ void QKVLayer::updateTensorsByInputDimensions(
   context.updateOutput(QKVParams::K, Koutput_dim);
   context.updateOutput(QKVParams::V, Voutput_dim);
 }
+
+std::array<std::vector<nntrainer::TensorDim>, 3>
+QKVLayer::getLayerDimensions(nntrainer::InitLayerContext &context) {
+  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
+    << "Fully connected layer takes only one input";
+
+  const auto &q_unit = std::get<props::QUnit>(qkv_props).get();
+  const auto &k_unit = std::get<props::KUnit>(qkv_props).get();
+  const auto &v_unit = std::get<props::VUnit>(qkv_props).get();
+
+  std::vector<nntrainer::TensorDim> output_dims(3);
+  std::vector<nntrainer::TensorDim> weight_dims(3);
+
+  /// @todo fc actaully supports multidimensions. EffDimFlag shouldn't be fixed
+  /// like this.
+  context.setEffDimFlagInputDimension(0, 0b1001);
+  context.setDynDimFlagInputDimension(0, 0b1000);
+
+  bool is_nchw = (context.getFormat() == nntrainer::Tformat::NCHW);
+  /** set output dimensions */
+  auto const &in_dim = context.getInputDimensions()[SINGLE_INOUT_IDX];
+
+  /** Q out */
+  output_dims[QKVParams::Q] = in_dim;
+  is_nchw ? output_dims[QKVParams::Q].width(q_unit)
+          : output_dims[QKVParams::Q].channel(q_unit);
+  output_dims[QKVParams::Q].setTensorType(
+    {context.getFormat(), context.getActivationDataType()});
+
+  /** K out */
+  output_dims[QKVParams::K] = in_dim;
+  is_nchw ? output_dims[QKVParams::K].width(k_unit)
+          : output_dims[QKVParams::K].channel(k_unit);
+  output_dims[QKVParams::K].setTensorType(
+    {context.getFormat(), context.getActivationDataType()});
+
+  /** V out */
+  output_dims[QKVParams::V] = in_dim;
+  is_nchw ? output_dims[QKVParams::V].width(v_unit)
+          : output_dims[QKVParams::V].channel(v_unit);
+  output_dims[QKVParams::V].setTensorType(
+    {context.getFormat(), context.getActivationDataType()});
+
+  /** Q */
+  nntrainer::TensorDim q_weight_dim(
+    1, is_nchw ? 1 : q_unit, is_nchw ? in_dim.width() : 1,
+    is_nchw ? q_unit : in_dim.channel(),
+    nntrainer::TensorDim::TensorType(context.getFormat(),
+                                     context.getWeightDataType()),
+    is_nchw ? 0b0011 : 0b0101);
+  weight_dims[QKVParams::Q] = q_weight_dim;
+
+  /** K */
+  nntrainer::TensorDim k_weight_dim = q_weight_dim;
+  k_weight_dim.width(k_unit);
+  weight_dims[QKVParams::K] = k_weight_dim;
+
+  /** V */
+  nntrainer::TensorDim v_weight_dim = q_weight_dim;
+  v_weight_dim.width(v_unit);
+  weight_dims[QKVParams::V] = v_weight_dim;
+
+  return {output_dims, weight_dims, {}};
+}
+
 } // namespace causallm

@@ -93,6 +93,26 @@ void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   std::throw_with_nested(std::runtime_error("Training is not supported yet."));
 }
 
+std::array<std::vector<nntrainer::TensorDim>, 3>
+RMSNormLayer::getLayerDimensions(nntrainer::InitLayerContext &context) {
+  std::vector<nntrainer::TensorDim> output_dims = context.getInputDimensions();
+
+  if (output_dims[SINGLE_INOUT_IDX].getDataType() ==
+      ml::train::TensorDim::DataType::FP16) {
+    ml::train::TensorDim in_out_fp32_dim = output_dims[SINGLE_INOUT_IDX];
+    in_out_fp32_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+    input_fp32 = std::make_shared<nntrainer::Tensor>(in_out_fp32_dim);
+    output_fp32 = std::make_shared<nntrainer::Tensor>(in_out_fp32_dim);
+  }
+
+  nntrainer::TensorDim gamma_dim(
+    1, 1, 1, output_dims[SINGLE_INOUT_IDX].width(),
+    nntrainer::TensorDim::TensorType(context.getFormat(),
+                                     context.getWeightDataType()));
+
+  return {output_dims, {gamma_dim}, {}};
+}
+
 #ifdef PLUGGABLE
 
 nntrainer::Layer *create_rms_norm_layer() {
