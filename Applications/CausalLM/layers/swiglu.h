@@ -87,7 +87,7 @@ public:
    */
   WIN_EXPORT void
   exportTo(nntrainer::Exporter &exporter,
-           const ml::train::ExportMethods &method) const override{};
+           const ml::train::ExportMethods &method) const override {};
 
   /**
    * @copydoc Layer::getType()
@@ -99,8 +99,8 @@ public:
   /**
    * @copydoc Layer::setProperty(const std::vector<std::string> &values)
    */
-  WIN_EXPORT void
-  setProperty(const std::vector<std::string> &values) override{};
+  WIN_EXPORT void setProperty(const std::vector<std::string> &values) override {
+  };
 
   WIN_EXPORT void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,

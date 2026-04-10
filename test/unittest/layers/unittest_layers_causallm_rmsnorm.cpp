@@ -17,9 +17,8 @@
 #include <rms_norm.h>
 
 auto causallm_rms_golden = LayerGoldenTestParamType(
-  nntrainer::createLayer<causallm::RMSNormLayer>, {"epsilon=0.001"},
-  "2:3:3:3", "causallm_rmsnorm.nnlayergolden",
-  LayerGoldenTestParamOptions::SKIP_CALC_GRAD,
+  nntrainer::createLayer<causallm::RMSNormLayer>, {"epsilon=0.001"}, "2:3:3:3",
+  "causallm_rmsnorm.nnlayergolden", LayerGoldenTestParamOptions::SKIP_CALC_GRAD,
   "nchw", "fp32", "fp32");
 
 GTEST_PARAMETER_TEST(CausalLMRMSNorm, LayerGoldenTest,

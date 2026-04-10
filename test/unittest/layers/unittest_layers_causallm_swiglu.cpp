@@ -18,8 +18,8 @@
 
 auto causallm_swiglu_golden = LayerGoldenTestParamType(
   nntrainer::createLayer<causallm::SwiGLULayer>, {}, "2:1:1:10,2:1:1:10",
-  "causallm_swiglu.nnlayergolden",
-  LayerGoldenTestParamOptions::SKIP_CALC_GRAD, "nchw", "fp32", "fp32");
+  "causallm_swiglu.nnlayergolden", LayerGoldenTestParamOptions::SKIP_CALC_GRAD,
+  "nchw", "fp32", "fp32");
 
 GTEST_PARAMETER_TEST(CausalLMSwiGLU, LayerGoldenTest,
                      ::testing::Values(causallm_swiglu_golden));

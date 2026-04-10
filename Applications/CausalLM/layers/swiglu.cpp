@@ -32,10 +32,10 @@ float swiglu(float x) { return x / (1 + nntrainer::exp_util(-x)); }
 
 void SwiGLULayer::finalize(nntrainer::InitLayerContext &context) {
   context.setOutputDimensions({context.getInputDimensions()[0]});
-  tensor_idx[SwiGLUParams::sigmoid_gate] = context.requestTensor(
-    context.getInputDimensions()[0], "sigmoid_gate",
-    nntrainer::Initializer::NONE, false,
-    nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+  tensor_idx[SwiGLUParams::sigmoid_gate] =
+    context.requestTensor(context.getInputDimensions()[0], "sigmoid_gate",
+                          nntrainer::Initializer::NONE, false,
+                          nntrainer::TensorLifespan::ITERATION_LIFESPAN);
 }
 
 void SwiGLULayer::forwarding(nntrainer::RunLayerContext &context,
@@ -105,35 +105,42 @@ void SwiGLULayer::updateTensorsByInputDimensions(
 
 void SwiGLULayer::calcDerivative(nntrainer::RunLayerContext &context) {
 
-  const nntrainer::Tensor &incoming_deriv = context.getIncomingDerivative(OUT_IDX);
+  const nntrainer::Tensor &incoming_deriv =
+    context.getIncomingDerivative(OUT_IDX);
   nntrainer::Tensor &d_gate = context.getOutgoingDerivative(INPUT_IDX_1);
   nntrainer::Tensor &d_up = context.getOutgoingDerivative(INPUT_IDX_2);
   nntrainer::Tensor &gate = context.getInput(INPUT_IDX_1);
   nntrainer::Tensor &up = context.getInput(INPUT_IDX_2);
-  nntrainer::Tensor &sig_gate = context.getTensor(tensor_idx[SwiGLUParams::sigmoid_gate]);
+  nntrainer::Tensor &sig_gate =
+    context.getTensor(tensor_idx[SwiGLUParams::sigmoid_gate]);
 
   if (gate.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    // Generate sig_gate on-the-fly, as forwarding now bypasses it for SIMD speed
-    gate.apply<float>([](float x) { return 1.0f / (1.0f + nntrainer::exp_util(-x)); }, sig_gate);
+    // Generate sig_gate on-the-fly, as forwarding now bypasses it for SIMD
+    // speed
+    gate.apply<float>(
+      [](float x) { return 1.0f / (1.0f + nntrainer::exp_util(-x)); },
+      sig_gate);
     // d_up = Swish(gate) * dy
     gate.multiply(sig_gate, d_up);
     d_up.multiply_i(incoming_deriv);
 
     // Swish'(gate) = sig_gate + gate * sig_gate * (1 - sig_gate)
-    // We use d_gate as a memory-safe buffer to calculate (1 - sig_gate) to avoid allocations
+    // We use d_gate as a memory-safe buffer to calculate (1 - sig_gate) to
+    // avoid allocations
     d_gate.copyData(sig_gate);
     d_gate.multiply_i(-1.0f);
-    d_gate.add_i(1.0f); 
+    d_gate.add_i(1.0f);
 
     // d_gate is now (1 - sig_gate)
-    d_gate.multiply_i(gate); 
+    d_gate.multiply_i(gate);
     d_gate.multiply_i(sig_gate); // gate * sig_gate * (1 - sig_gate)
     d_gate.add_i(sig_gate);      // Swish'(gate)
 
     d_gate.multiply_i(up);
     d_gate.multiply_i(incoming_deriv);
   } else if (gate.getDataType() == ml::train::TensorDim::DataType::FP16) {
-    throw std::invalid_argument("SwiGLULayer calcDerivative for FP16 is not yet implemented");
+    throw std::invalid_argument(
+      "SwiGLULayer calcDerivative for FP16 is not yet implemented");
   }
 }
 

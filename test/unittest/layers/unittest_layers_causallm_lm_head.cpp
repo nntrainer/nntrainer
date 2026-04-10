@@ -18,8 +18,7 @@
 
 auto causallm_lmhead_golden = LayerGoldenTestParamType(
   nntrainer::createLayer<causallm::LmHeadLayer>,
-  {"unit=5", "disable_bias=true"}, "2:1:1:10",
-  "causallm_lmhead.nnlayergolden",
+  {"unit=5", "disable_bias=true"}, "2:1:1:10", "causallm_lmhead.nnlayergolden",
   LayerGoldenTestParamOptions::SKIP_CALC_GRAD, "nchw", "fp32", "fp32");
 
 GTEST_PARAMETER_TEST(CausalLMLmHead, LayerGoldenTest,

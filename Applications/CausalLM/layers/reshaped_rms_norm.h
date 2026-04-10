@@ -25,8 +25,8 @@
 #include <node_exporter.h>
 #include <utility>
 
-#include <base_properties.h>
 #include "causallm_common_properties.h"
+#include <base_properties.h>
 #include <connection.h>
 #include <tensor.h>
 #include <tensor_wrap_specs.h>
@@ -96,7 +96,7 @@ public:
    */
   WIN_EXPORT void
   exportTo(nntrainer::Exporter &exporter,
-           const ml::train::ExportMethods &method) const override{};
+           const ml::train::ExportMethods &method) const override {};
 
   /**
    * @copydoc Layer::getType()

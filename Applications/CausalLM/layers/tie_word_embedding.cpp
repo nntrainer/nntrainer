@@ -199,7 +199,6 @@ void TieWordEmbedding::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
 
-
   if (mode_ == mode::embedding)
     incremental_forwarding_embedding(context, from, to, training);
   else if (mode_ == mode::lm_head)
@@ -211,7 +210,6 @@ void TieWordEmbedding::incremental_forwarding(
 void TieWordEmbedding::incremental_forwarding_embedding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-
 
   /// @todo get input and output dimension from input_ and hidden itself
   unsigned int in_dim =
@@ -293,7 +291,6 @@ void TieWordEmbedding::incremental_forwarding_embedding(
 void TieWordEmbedding::incremental_forwarding_lmhead(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-
 
   nntrainer::Tensor weight =
     context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
@@ -408,9 +405,8 @@ void TieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
       // Get dy for this batch: [1, 1, 1, vocab_size]
       nntrainer::TensorDim dy_batch_dim(1, 1, 1, dy.width(),
                                         dy.getTensorType());
-      nntrainer::Tensor dy_batch =
-        dy.getSharedDataTensor(dy_batch_dim, b * dy.getDim().getFeatureLen(),
-                               true);
+      nntrainer::Tensor dy_batch = dy.getSharedDataTensor(
+        dy_batch_dim, b * dy.getDim().getFeatureLen(), true);
 
       // dx_last = dy_batch @ weight: [1, vocab_size] × [vocab_size, hidden_dim]
       dy_batch.dot(weight, dx_last, false, false);
@@ -419,7 +415,6 @@ void TieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
 }
 
 void TieWordEmbedding::calcGradient(nntrainer::RunLayerContext &context) {
-
 
   if (mode_ == mode::embedding) {
     nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);

@@ -18,9 +18,9 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include "rms_norm.h"
 #include <cmath>
 #include <iostream>
-#include "rms_norm.h"
 
 namespace causallm {
 
@@ -42,8 +42,8 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
     nntrainer::TensorDim::TensorType(context.getFormat(),
                                      context.getWeightDataType()));
   wt_idx[RMSParams::gamma] = context.requestWeight(
-    gamma_dim, nntrainer::Initializer::ONES,
-    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
+    gamma_dim, nntrainer::Initializer::ONES, nntrainer::WeightRegularizer::NONE,
+    1.0f, 0.0f, "gamma", true);
 
   // inv_rms cache: one scalar per (batch, channel, height) row.
   // shape: (batch, channel, height, 1)
@@ -53,9 +53,9 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
     dim[0].batch(), dim[0].channel(), dim[0].height(), 1,
     nntrainer::TensorDim::TensorType(context.getFormat(),
                                      context.getWeightDataType()));
-  wt_idx[RMSParams::inv_rms] = context.requestTensor(
-    inv_rms_dim, "inv_rms", nntrainer::Initializer::NONE, false,
-    nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+  wt_idx[RMSParams::inv_rms] =
+    context.requestTensor(inv_rms_dim, "inv_rms", nntrainer::Initializer::NONE,
+                          false, nntrainer::TensorLifespan::ITERATION_LIFESPAN);
 }
 
 // ---------------------------------------------------------------------------
@@ -105,21 +105,21 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
   auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
 
-  nntrainer::Tensor &in      = context.getInput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &out     = context.getOutput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &gamma   = context.getWeight(wt_idx[RMSParams::gamma]);
+  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
   nntrainer::Tensor &inv_rms = context.getTensor(wt_idx[RMSParams::inv_rms]);
 
-  ml::train::TensorDim in_dim      = in.getDim();
-  ml::train::TensorDim out_dim     = out.getDim();
+  ml::train::TensorDim in_dim = in.getDim();
+  ml::train::TensorDim out_dim = out.getDim();
   ml::train::TensorDim inv_rms_dim = inv_rms.getDim();
 
   unsigned int step_height = to - from;
-  unsigned int b_size      = in_dim.batch();
+  unsigned int b_size = in_dim.batch();
 
   // Step-sized slice dimensions
-  ml::train::TensorDim in_step_dim      = in_dim;
-  ml::train::TensorDim out_step_dim     = out_dim;
+  ml::train::TensorDim in_step_dim = in_dim;
+  ml::train::TensorDim out_step_dim = out_dim;
   ml::train::TensorDim inv_rms_step_dim = inv_rms_dim;
 
   in_step_dim.batch(1);
@@ -133,34 +133,29 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // Correct from offset applied so multi-step generation reads/writes
     // the right position rather than always starting from 0.
     nntrainer::Tensor in_step = in.getSharedDataTensor(
-      in_step_dim,
-      b * in_dim.getFeatureLen() + from * in_dim.width(), true);
+      in_step_dim, b * in_dim.getFeatureLen() + from * in_dim.width(), true);
     nntrainer::Tensor out_step = out.getSharedDataTensor(
-      out_step_dim,
-      b * out_dim.getFeatureLen() + from * out_dim.width(), true);
+      out_step_dim, b * out_dim.getFeatureLen() + from * out_dim.width(), true);
     nntrainer::Tensor inv_rms_step = inv_rms.getSharedDataTensor(
-      inv_rms_step_dim,
-      b * inv_rms_dim.getFeatureLen() + from, true);
+      inv_rms_step_dim, b * inv_rms_dim.getFeatureLen() + from, true);
 
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
       // Compute inv_rms and write into cache slice
-      in_step.multiply(in_step, out_step);       // out_step = x²
-      out_step.average(3, inv_rms_step);         // inv_rms_step = mean(x²)
-      inv_rms_step.add_i(epsilon);               // + ε
-      inv_rms_step.inv_sqrt_i();                 // 1/sqrt(...)
+      in_step.multiply(in_step, out_step); // out_step = x²
+      out_step.average(3, inv_rms_step);   // inv_rms_step = mean(x²)
+      inv_rms_step.add_i(epsilon);         // + ε
+      inv_rms_step.inv_sqrt_i();           // 1/sqrt(...)
 
-      in_step.multiply(inv_rms_step, out_step);  // out_step = x * inv_rms
+      in_step.multiply(inv_rms_step, out_step); // out_step = x * inv_rms
     } else {
       throw std::invalid_argument(
         "RMSNorm incremental_forwarding: only FP32 is currently supported");
     }
-    out_step.multiply_i(gamma);  // out_step = x * inv_rms * γ
+    out_step.multiply_i(gamma); // out_step = x * inv_rms * γ
 
 #ifdef DEBUG
-    std::cout << context.getName()
-              << "\n input:"   << in_step
-              << "\n output:"  << out_step
-              << "\n gamma:"   << gamma << std::endl;
+    std::cout << context.getName() << "\n input:" << in_step
+              << "\n output:" << out_step << "\n gamma:" << gamma << std::endl;
 #endif
   }
 }
@@ -183,10 +178,8 @@ void RMSNormLayer::updateTensorsByInputDimensions(
 
   // Keep inv_rms shape consistent with (batch, channel, height, 1)
   nntrainer::TensorDim new_inv_rms_dim(
-    input_dimensions[0].batch(),
-    input_dimensions[0].channel(),
-    input_dimensions[0].height(), 1,
-    input_dimensions[0].getTensorType());
+    input_dimensions[0].batch(), input_dimensions[0].channel(),
+    input_dimensions[0].height(), 1, input_dimensions[0].getTensorType());
   context.updateTensor(wt_idx[RMSParams::inv_rms], new_inv_rms_dim);
 }
 
@@ -215,21 +208,21 @@ void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
     context.getIncomingDerivative(SINGLE_INOUT_IDX);
   nntrainer::Tensor &outgoing_deriv =
     context.getOutgoingDerivative(SINGLE_INOUT_IDX);
-  const nntrainer::Tensor &input    = context.getInput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &gamma          = context.getWeight(wt_idx[RMSParams::gamma]);
+  const nntrainer::Tensor &input = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
   nntrainer::Tensor &inv_rms_tensor =
     context.getTensor(wt_idx[RMSParams::inv_rms]);
 
-  const float *in_data      = input.getData<float>();
-  const float *dy_data      = incoming_deriv.getData<float>();
-  float       *dx_data      = outgoing_deriv.getData<float>();
-  const float *gamma_data   = gamma.getData<float>();
+  const float *in_data = input.getData<float>();
+  const float *dy_data = incoming_deriv.getData<float>();
+  float *dx_data = outgoing_deriv.getData<float>();
+  const float *gamma_data = gamma.getData<float>();
   const float *inv_rms_data = inv_rms_tensor.getData<float>();
 
-  unsigned int batch   = input.getDim().batch();
+  unsigned int batch = input.getDim().batch();
   unsigned int channel = input.getDim().channel();
-  unsigned int height  = input.getDim().height();
-  unsigned int width   = input.getDim().width();
+  unsigned int height = input.getDim().height();
+  unsigned int width = input.getDim().width();
 
   // Flatten batch/channel/height into a single row index.
   // inv_rms_data is indexed by row (one value per row) and hoisted outside
@@ -237,9 +230,9 @@ void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   unsigned int total_rows = batch * channel * height;
 
   for (unsigned int row = 0; row < total_rows; ++row) {
-    unsigned int offset       = row * width;
-    float        inv_rms_val  = inv_rms_data[row];
-    float        inv_rms_sq   = inv_rms_val * inv_rms_val;
+    unsigned int offset = row * width;
+    float inv_rms_val = inv_rms_data[row];
+    float inv_rms_sq = inv_rms_val * inv_rms_val;
 
     // c = mean(gamma * dy * x) over width
     float c = 0.0f;
@@ -251,9 +244,8 @@ void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
     // dx[w] = inv_rms * (gamma[w]*dy[w] - x[w] * c * inv_rms²)
     for (unsigned int w = 0; w < width; ++w) {
       dx_data[offset + w] =
-        inv_rms_val *
-        (gamma_data[w] * dy_data[offset + w] -
-         in_data[offset + w] * c * inv_rms_sq);
+        inv_rms_val * (gamma_data[w] * dy_data[offset + w] -
+                       in_data[offset + w] * c * inv_rms_sq);
     }
   }
 }
@@ -276,9 +268,9 @@ void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
  */
 void RMSNormLayer::calcGradient(nntrainer::RunLayerContext &context) {
 
-  const nntrainer::Tensor &in  = context.getInput(SINGLE_INOUT_IDX);
-  const nntrainer::Tensor &dy  = context.getIncomingDerivative(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &dgamma    = context.getWeightGrad(wt_idx[RMSParams::gamma]);
+  const nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &dgamma = context.getWeightGrad(wt_idx[RMSParams::gamma]);
   const nntrainer::Tensor &inv_rms_tensor =
     context.getTensor(wt_idx[RMSParams::inv_rms]);
 
@@ -289,25 +281,24 @@ void RMSNormLayer::calcGradient(nntrainer::RunLayerContext &context) {
 
   dgamma.setZero();
 
-  const float *in_data      = in.getData<float>();
-  const float *dy_data      = dy.getData<float>();
-  float       *dgamma_data  = dgamma.getData<float>();
+  const float *in_data = in.getData<float>();
+  const float *dy_data = dy.getData<float>();
+  float *dgamma_data = dgamma.getData<float>();
   const float *inv_rms_data = inv_rms_tensor.getData<float>();
 
-  unsigned int batch   = in.getDim().batch();
+  unsigned int batch = in.getDim().batch();
   unsigned int channel = in.getDim().channel();
-  unsigned int height  = in.getDim().height();
-  unsigned int width   = in.getDim().width();
+  unsigned int height = in.getDim().height();
+  unsigned int width = in.getDim().width();
 
   unsigned int total_rows = batch * channel * height;
 
   for (unsigned int row = 0; row < total_rows; ++row) {
-    unsigned int offset      = row * width;
-    float        inv_rms_val = inv_rms_data[row];  // hoisted: one read per row
+    unsigned int offset = row * width;
+    float inv_rms_val = inv_rms_data[row]; // hoisted: one read per row
 
     for (unsigned int w = 0; w < width; ++w) {
-      dgamma_data[w] +=
-        dy_data[offset + w] * in_data[offset + w] * inv_rms_val;
+      dgamma_data[w] += dy_data[offset + w] * in_data[offset + w] * inv_rms_val;
     }
   }
 }

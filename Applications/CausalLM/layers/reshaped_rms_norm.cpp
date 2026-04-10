@@ -16,9 +16,9 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include "reshaped_rms_norm.h"
 #include <cmath>
 #include <cpu_backend.h>
-#include "reshaped_rms_norm.h"
 
 namespace causallm {
 
@@ -46,23 +46,22 @@ void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
     nntrainer::TensorDim::TensorType(context.getFormat(),
                                      context.getWeightDataType()));
   wt_idx[RMSParams::gamma] = context.requestWeight(
-    gamma_dim, nntrainer::Initializer::ONES,
-    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
+    gamma_dim, nntrainer::Initializer::ONES, nntrainer::WeightRegularizer::NONE,
+    1.0f, 0.0f, "gamma", true);
 
   // inv_rms cache: one scalar per chunk per (batch, channel, height) row.
   //   num_chunks = height * (width / feature_size)
   //   shape: (batch, channel, num_chunks, 1)
   // ITERATION_LIFESPAN: lives from forwarding() through calcDerivative/
   // calcGradient, then freed. Not needed during inference.
-  unsigned int num_chunks =
-    dim[0].height() * (dim[0].width() / feature_size);
+  unsigned int num_chunks = dim[0].height() * (dim[0].width() / feature_size);
   nntrainer::TensorDim inv_rms_dim(
     dim[0].batch(), dim[0].channel(), num_chunks, 1,
     nntrainer::TensorDim::TensorType(context.getFormat(),
                                      context.getWeightDataType()));
-  wt_idx[RMSParams::inv_rms] = context.requestTensor(
-    inv_rms_dim, "inv_rms", nntrainer::Initializer::NONE, false,
-    nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+  wt_idx[RMSParams::inv_rms] =
+    context.requestTensor(inv_rms_dim, "inv_rms", nntrainer::Initializer::NONE,
+                          false, nntrainer::TensorLifespan::ITERATION_LIFESPAN);
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +103,8 @@ static inline float rms_norm_chunk(const float *in, float *out,
  * calcGradient can reuse it without recomputing sqrt.
  *
  * For inference mode: delegates to incremental_forwarding() to use SIMD
- * intrinsics, ensuring consistency between forwarding and incremental_forwarding.
+ * intrinsics, ensuring consistency between forwarding and
+ * incremental_forwarding.
  */
 void ReshapedRMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
                                       bool training) {
@@ -112,20 +112,19 @@ void ReshapedRMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
     // Training path: scalar kernel + cache inv_rms for backward
     auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
 
-    nntrainer::Tensor &in    = context.getInput(SINGLE_INOUT_IDX);
-    nntrainer::Tensor &out   = context.getOutput(SINGLE_INOUT_IDX);
+    nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+    nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
     nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
 
-    const float *in_data    = in.getData<float>();
-    float       *out_data   = out.getData<float>();
+    const float *in_data = in.getData<float>();
+    float *out_data = out.getData<float>();
     const float *gamma_data = gamma.getData<float>();
 
-    unsigned int batch       = in.getDim().batch();
-    unsigned int channel     = in.getDim().channel();
-    unsigned int height      = in.getDim().height();
-    unsigned int width       = in.getDim().width();
+    unsigned int batch = in.getDim().batch();
+    unsigned int channel = in.getDim().channel();
+    unsigned int height = in.getDim().height();
+    unsigned int width = in.getDim().width();
     unsigned int num_features = width / feature_size;
-
 
     nntrainer::Tensor &inv_rms_tensor =
       context.getTensor(wt_idx[RMSParams::inv_rms]);
@@ -141,9 +140,9 @@ void ReshapedRMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
             unsigned int offset =
               (b * channel + c) * height * width + h * width + f * feature_size;
 
-            inv_rms_data[row] = rms_norm_chunk(
-              in_data + offset, out_data + offset, gamma_data,
-              feature_size, epsilon);
+            inv_rms_data[row] =
+              rms_norm_chunk(in_data + offset, out_data + offset, gamma_data,
+                             feature_size, epsilon);
           }
         }
       }
@@ -174,21 +173,21 @@ void ReshapedRMSNormLayer::incremental_forwarding(
   bool training) {
   auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
 
-  nntrainer::Tensor &in    = context.getInput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &out   = context.getOutput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
 
-  ml::train::TensorDim in_dim  = in.getDim();
+  ml::train::TensorDim in_dim = in.getDim();
   ml::train::TensorDim out_dim = out.getDim();
 
-  unsigned int step_height  = to - from;
-  unsigned int width        = in_dim.width();
+  unsigned int step_height = to - from;
+  unsigned int width = in_dim.width();
   unsigned int num_features = width / feature_size;
-  unsigned int full_height  = in_dim.height();
-  unsigned int b_size       = in_dim.batch();
-  unsigned int channel      = in_dim.channel();
+  unsigned int full_height = in_dim.height();
+  unsigned int b_size = in_dim.batch();
+  unsigned int channel = in_dim.channel();
 
-  ml::train::TensorDim in_step_dim  = in_dim;
+  ml::train::TensorDim in_step_dim = in_dim;
   ml::train::TensorDim out_step_dim = out_dim;
   in_step_dim.batch(1);
   in_step_dim.height(step_height);
@@ -214,14 +213,14 @@ void ReshapedRMSNormLayer::incremental_forwarding(
       for (unsigned int c = 0; c < channel; ++c) {
         for (unsigned int h = from; h < to; ++h) {
           for (unsigned int f = 0; f < num_features; ++f) {
-            unsigned int row =
-              (b * channel + c) * full_height * num_features + h * num_features + f;
-            unsigned int offset =
-              (b * channel + c) * full_height * width + h * width + f * feature_size;
+            unsigned int row = (b * channel + c) * full_height * num_features +
+                               h * num_features + f;
+            unsigned int offset = (b * channel + c) * full_height * width +
+                                  h * width + f * feature_size;
 
-            inv_rms_data[row] = rms_norm_chunk(
-              in_data + offset, out_data + offset, gamma_data,
-              feature_size, epsilon);
+            inv_rms_data[row] =
+              rms_norm_chunk(in_data + offset, out_data + offset, gamma_data,
+                             feature_size, epsilon);
           }
         }
       }
@@ -230,9 +229,10 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     // Inference path: SIMD intrinsics
     for (unsigned int b = 0; b < b_size; ++b) {
       // Create tensor views starting from each batch.
-      // The in_step_dim with height(to-from) automatically views the correct range.
-      nntrainer::Tensor in_step = in.getSharedDataTensor(
-        in_step_dim, b * in_dim.getFeatureLen(), true);
+      // The in_step_dim with height(to-from) automatically views the correct
+      // range.
+      nntrainer::Tensor in_step =
+        in.getSharedDataTensor(in_step_dim, b * in_dim.getFeatureLen(), true);
       nntrainer::Tensor out_step = out.getSharedDataTensor(
         out_step_dim, b * out_dim.getFeatureLen(), true);
 
@@ -241,13 +241,13 @@ void ReshapedRMSNormLayer::incremental_forwarding(
 
       if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
 #ifdef ENABLE_FP16
-      nntrainer::rms_norm_wrt_width_fp16_intrinsic(
-        in_step.getData<float>(), out_step.getData<float>(),
-        in_step.getDim().height(), in_step.getDim().width(), epsilon);
+        nntrainer::rms_norm_wrt_width_fp16_intrinsic(
+          in_step.getData<float>(), out_step.getData<float>(),
+          in_step.getDim().height(), in_step.getDim().width(), epsilon);
 #else
-      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
-        in_step.getData<float>(), out_step.getData<float>(),
-        in_step.getDim().height(), in_step.getDim().width(), epsilon);
+        nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+          in_step.getData<float>(), out_step.getData<float>(),
+          in_step.getDim().height(), in_step.getDim().width(), epsilon);
 #endif
       } else {
         throw std::invalid_argument(
@@ -258,10 +258,9 @@ void ReshapedRMSNormLayer::incremental_forwarding(
       out_step.reshape(out_step_dim);
 
 #ifdef DEBUG
-      std::cout << context.getName()
-                << "\n input:"  << in_step
-                << "\n output:" << out_step
-                << "\n gamma:"  << gamma << std::endl;
+      std::cout << context.getName() << "\n input:" << in_step
+                << "\n output:" << out_step << "\n gamma:" << gamma
+                << std::endl;
 #endif
     }
   }
@@ -279,14 +278,14 @@ void ReshapedRMSNormLayer::updateTensorsByInputDimensions(
 
   // Update inv_rms cache shape to match the new input dimensions.
   // Without this, inv_rms height goes stale if input height changes.
-  unsigned int new_height      = input_dimensions[0].height();
-  unsigned int new_batch       = input_dimensions[0].batch();
-  unsigned int new_channel     = input_dimensions[0].channel();
-  unsigned int new_num_chunks  = new_height * (input_dimensions[0].width() / feature_size);
+  unsigned int new_height = input_dimensions[0].height();
+  unsigned int new_batch = input_dimensions[0].batch();
+  unsigned int new_channel = input_dimensions[0].channel();
+  unsigned int new_num_chunks =
+    new_height * (input_dimensions[0].width() / feature_size);
 
-  nntrainer::TensorDim new_inv_rms_dim(
-    new_batch, new_channel, new_num_chunks, 1,
-    input_dimensions[0].getTensorType());
+  nntrainer::TensorDim new_inv_rms_dim(new_batch, new_channel, new_num_chunks,
+                                       1, input_dimensions[0].getTensorType());
   context.updateTensor(wt_idx[RMSParams::inv_rms], new_inv_rms_dim);
 }
 
@@ -314,20 +313,20 @@ void ReshapedRMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   nntrainer::Tensor &outgoing_deriv =
     context.getOutgoingDerivative(SINGLE_INOUT_IDX);
   const nntrainer::Tensor &input = context.getInput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &gamma       = context.getWeight(wt_idx[RMSParams::gamma]);
+  nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
   nntrainer::Tensor &inv_rms_tensor =
     context.getTensor(wt_idx[RMSParams::inv_rms]);
 
-  const float *in_data      = input.getData<float>();
-  const float *dy_data      = incoming_deriv.getData<float>();
-  float       *dx_data      = outgoing_deriv.getData<float>();
-  const float *gamma_data   = gamma.getData<float>();
+  const float *in_data = input.getData<float>();
+  const float *dy_data = incoming_deriv.getData<float>();
+  float *dx_data = outgoing_deriv.getData<float>();
+  const float *gamma_data = gamma.getData<float>();
   const float *inv_rms_data = inv_rms_tensor.getData<float>();
 
-  unsigned int batch        = input.getDim().batch();
-  unsigned int channel      = input.getDim().channel();
-  unsigned int height       = input.getDim().height();
-  unsigned int width        = input.getDim().width();
+  unsigned int batch = input.getDim().batch();
+  unsigned int channel = input.getDim().channel();
+  unsigned int height = input.getDim().height();
+  unsigned int width = input.getDim().width();
   unsigned int num_features = width / feature_size;
 
   for (unsigned int b = 0; b < batch; ++b) {
@@ -341,23 +340,20 @@ void ReshapedRMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
 
           // Read cached inv_rms — computed once during forwarding()
           float inv_rms_val = inv_rms_data[row];
-          float inv_rms_sq  = inv_rms_val * inv_rms_val;
+          float inv_rms_sq = inv_rms_val * inv_rms_val;
 
           // c = mean(gamma * dy * x) over this chunk
           float c_val = 0.0f;
           for (unsigned int j = 0; j < feature_size; ++j) {
-            c_val += gamma_data[j] *
-                     dy_data[offset + j] *
-                     in_data[offset + j];
+            c_val += gamma_data[j] * dy_data[offset + j] * in_data[offset + j];
           }
           c_val /= static_cast<float>(feature_size);
 
           // dx[j] = inv_rms * (gamma[j]*dy[j] - x[j] * c * inv_rms²)
           for (unsigned int j = 0; j < feature_size; ++j) {
             dx_data[offset + j] =
-              inv_rms_val *
-              (gamma_data[j] * dy_data[offset + j] -
-               in_data[offset + j] * c_val * inv_rms_sq);
+              inv_rms_val * (gamma_data[j] * dy_data[offset + j] -
+                             in_data[offset + j] * c_val * inv_rms_sq);
           }
         }
       }
@@ -379,9 +375,9 @@ void ReshapedRMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
  */
 void ReshapedRMSNormLayer::calcGradient(nntrainer::RunLayerContext &context) {
 
-  const nntrainer::Tensor &in  = context.getInput(SINGLE_INOUT_IDX);
-  const nntrainer::Tensor &dy  = context.getIncomingDerivative(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &dgamma    = context.getWeightGrad(wt_idx[RMSParams::gamma]);
+  const nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &dgamma = context.getWeightGrad(wt_idx[RMSParams::gamma]);
   const nntrainer::Tensor &inv_rms_tensor =
     context.getTensor(wt_idx[RMSParams::inv_rms]);
 
@@ -392,15 +388,15 @@ void ReshapedRMSNormLayer::calcGradient(nntrainer::RunLayerContext &context) {
 
   dgamma.setZero();
 
-  const float *in_data      = in.getData<float>();
-  const float *dy_data      = dy.getData<float>();
-  float       *dgamma_data  = dgamma.getData<float>();
+  const float *in_data = in.getData<float>();
+  const float *dy_data = dy.getData<float>();
+  float *dgamma_data = dgamma.getData<float>();
   const float *inv_rms_data = inv_rms_tensor.getData<float>();
 
-  unsigned int batch        = in.getDim().batch();
-  unsigned int channel      = in.getDim().channel();
-  unsigned int height       = in.getDim().height();
-  unsigned int width        = in.getDim().width();
+  unsigned int batch = in.getDim().batch();
+  unsigned int channel = in.getDim().channel();
+  unsigned int height = in.getDim().height();
+  unsigned int width = in.getDim().width();
   unsigned int num_features = width / feature_size;
 
   // Flatten batch/channel/height into a single chunk index to avoid
@@ -415,7 +411,7 @@ void ReshapedRMSNormLayer::calcGradient(nntrainer::RunLayerContext &context) {
             (b * channel + c) * height * num_features + h * num_features + f;
           unsigned int offset =
             (b * channel + c) * height * width + h * width + f * feature_size;
-          float inv_rms_val = inv_rms_data[row];  // hoisted: one read per chunk
+          float inv_rms_val = inv_rms_data[row]; // hoisted: one read per chunk
 
           for (unsigned int j = 0; j < feature_size; ++j) {
             dgamma_data[j] +=

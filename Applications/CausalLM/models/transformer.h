@@ -264,9 +264,9 @@ protected:
   bool IS_CAUSAL = true;
 
   /** LoRA parameters */
-  unsigned int LORA_RANK = 0;             /**< LoRA rank (0 = disabled) */
-  unsigned int LORA_ALPHA = 0;            /**< LoRA alpha for scaling */
-  std::vector<std::string> LORA_TARGETS;  /**< Target layer names for LoRA */
+  unsigned int LORA_RANK = 0;            /**< LoRA rank (0 = disabled) */
+  unsigned int LORA_ALPHA = 0;           /**< LoRA alpha for scaling */
+  std::vector<std::string> LORA_TARGETS; /**< Target layer names for LoRA */
 
   /**
    * @brief Check if LoRA should be applied to a layer
