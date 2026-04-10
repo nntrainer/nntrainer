@@ -22,7 +22,6 @@
 
 #include <embedding_layer.h>
 #include <mha_core.h>
-#include <rms_norm.h>
 #include <swiglu.h>
 #include <tie_word_embedding.h>
 
@@ -500,8 +499,6 @@ void Transformer::registerCustomLayers() {
 
   try {
     app_context->registerFactory(nntrainer::createLayer<causallm::SwiGLULayer>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::RMSNormLayer>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::MHACoreLayer>);
     app_context->registerFactory(
