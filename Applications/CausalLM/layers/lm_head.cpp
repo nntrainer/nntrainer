@@ -49,59 +49,19 @@ void LmHeadLayer::finalize(nntrainer::InitLayerContext &context) {
   auto &disable_bias =
     std::get<nntrainer::props::DisableBias>(*layer_impl_props);
 
-  auto unit = std::get<nntrainer::props::Unit>(lmhead_props).get();
-
-  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
-    << "lm head layer takes only one input";
-
-  std::vector<ml::train::TensorDim> output_dims(1);
-
-  /// @todo fc actaully supports multidimensions.
-  /// EffDimFlag shouldn't be fixed like this.
-  context.setEffDimFlagInputDimension(0, 0b1001);
-  context.setDynDimFlagInputDimension(0, 0b1000);
-  bool is_nchw = (context.getFormat() == nntrainer::Tformat::NCHW);
-
-  /** set output dimensions */
-  ///@note lm_head's output dimension (height is always 1 !)
-  auto const &in_dim = context.getInputDimensions()[0];
-  output_dims[0] = in_dim;
-  if (is_nchw)
-    output_dims[0].width(unit);
-  else
-    output_dims[0].channel(unit);
-  output_dims[0].height(1);
-
-  output_dims[0].setTensorType(
-    {context.getFormat(), context.getActivationDataType()});
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
 
   context.setOutputDimensions(output_dims);
 
-  /** set weight specifications */
-  ml::train::TensorDim bias_dim(
-    1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
-    ml::train::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()),
-    is_nchw ? 0b0001 : 0b0100);
-
-  ///@note LMHead layer's tensor dim is transposed dim of user-defined
-  /// dim
-  /// so it can reuse embedding layer.
-  ml::train::TensorDim weight_dim(
-    1, is_nchw ? 1 : unit, is_nchw ? in_dim.width() : 1,
-    is_nchw ? unit : in_dim.channel(),
-    ml::train::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()),
-    is_nchw ? 0b0011 : 0b0101);
-
   weight_idx[LmHeadParams::weight] = context.requestWeight(
-    weight_dim, weight_initializer, weight_regularizer,
+    weight_dims[LmHeadParams::weight], weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "weight", true);
 
   if (disable_bias.empty() || disable_bias.get() == false) {
     weight_idx[LmHeadParams::bias] = context.requestWeight(
-      bias_dim, bias_initializer, nntrainer::WeightRegularizer::NONE, 1.0f,
-      bias_decay, "bias", true);
+      weight_dims[LmHeadParams::bias], bias_initializer,
+      nntrainer::WeightRegularizer::NONE, 1.0f, bias_decay, "bias", true);
   }
 }
 

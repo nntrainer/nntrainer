@@ -32,17 +32,8 @@ EmbeddingLayer::EmbeddingLayer() :
   weight_idx(std::numeric_limits<unsigned>::max()) {}
 
 void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
-  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
-    << "Embedding layer takes only one input";
-
-  const nntrainer::TensorDim &input_dim =
-    context.getInputDimensions()[SINGLE_INOUT_IDX];
-  NNTR_THROW_IF(input_dim.channel() != 1, std::invalid_argument)
-    << "Embedding layer takes only one for channel size";
-
-  NNTR_THROW_IF(input_dim.getDataType() != nntrainer::TensorDim::DataType::FP32,
-                std::invalid_argument)
-    << "Embedding layer takes only FP32 input data";
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
 
   auto &weight_regularizer =
     std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
@@ -52,31 +43,12 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   auto &weight_decay =
     std::get<nntrainer::props::WeightDecay>(*layer_impl_props);
 
-  size_t in_dim =
-    static_cast<size_t>(std::get<nntrainer::props::InDim>(embedding_props));
-  size_t out_dim =
-    static_cast<size_t>(std::get<nntrainer::props::OutDim>(embedding_props));
+  context.setOutputDimensions(output_dims);
 
-  nntrainer::TensorDim output_dim = input_dim;
-
-  // output_dim expected as hidden x num input (batch size)
-  output_dim.height(input_dim.width());
-  output_dim.width(out_dim);
-  output_dim.setTensorType(
-    {context.getFormat(), context.getActivationDataType()});
-  context.setOutputDimensions({output_dim});
-
-  nntrainer::TensorDim dim = output_dim;
-
-  dim.setTensorType({context.getFormat(), context.getWeightDataType()});
-
-  dim.height(in_dim);
-  dim.width(out_dim);
-  dim.batch(1);
-
-  weight_idx = context.requestWeight(
-    dim, weight_initializer, weight_regularizer, weight_regularizer_constant,
-    weight_decay, "Embedding", true);
+  weight_idx = context.requestWeight(weight_dims[EmbeddingParams::weight],
+                                     weight_initializer, weight_regularizer,
+                                     weight_regularizer_constant, weight_decay,
+                                     "Embedding", true);
 }
 
 void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {

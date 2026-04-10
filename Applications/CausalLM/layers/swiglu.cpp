@@ -31,7 +31,9 @@ float swiglu(float x) { return x / (1 + nntrainer::exp_util(-x)); }
 } // namespace ActivationOp
 
 void SwiGLULayer::finalize(nntrainer::InitLayerContext &context) {
-  context.setOutputDimensions({context.getInputDimensions()[0]});
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
+  context.setOutputDimensions(output_dims);
 }
 
 void SwiGLULayer::forwarding(nntrainer::RunLayerContext &context,

@@ -132,25 +132,7 @@ MHACoreLayer::~MHACoreLayer() {}
 
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
-  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
-                std::invalid_argument)
-    << "Multi head Attention layer needs 3, 4, or 5 inputs. "
-       "(query, key, value; mask is optional; external cache_key + cache_value "
-       "for external cache mode)";
-
   use_external_cache = (context.getNumInputs() >= 5);
-  ml::train::TensorDim::TensorType activation_type = {
-    context.getFormat(), context.getActivationDataType()};
-  ml::train::TensorDim empty_dim(activation_type);
-
-  const std::vector<ml::train::TensorDim> &input_dims =
-    context.getInputDimensions();
-  const ml::train::TensorDim &query_dim = input_dims[INOUT_INDEX::QUERY];
-  const ml::train::TensorDim &key_dim = input_dims[INOUT_INDEX::KEY];
-
-  /** max time step of this model */
-  const unsigned int max_timestep =
-    std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
 
   /** max position embeddings */
   max_position_embeddings =
@@ -166,12 +148,6 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     original_max_position_embeddings =
       std::get<props::RopeScalingMaxPositionEmbeddings>(mha_core_props).get();
 
-  /** query_dim = (B, 1, seq_len, H_Q * Head_Dim ) */
-  const unsigned int batch_size = query_dim.batch();
-  const unsigned int query_width = query_dim.width();
-  /** key_dim = (B, 1, max_seq_len, H_KV * Head_Dim ) */
-  const unsigned int key_width = key_dim.width();
-
   /**
    *  @note If NumHeads_KV is set, then use the value. Otherwise,
    *        we initialize num_heads_KV with num_heads_Q.
@@ -183,74 +159,39 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
       ? num_heads_Q
       : static_cast<size_t>(std::get<props::NumHeads_KV>(mha_core_props).get());
 
-  // head_dim
-  head_dim = static_cast<size_t>(query_width) / num_heads_Q;
-  NNTR_THROW_IF(head_dim != key_width / num_heads_KV, std::invalid_argument)
-    << "num_heads_Q and num_heads_KV are not properly given. Please check the "
-       "num_heads_* are set correctly so that the `head_dim`s are all same for "
-       "query / key / value";
-
-  /** Weight for Sink */
-  use_sink = std::get<props::UseSink>(mha_core_props).get();
-  if (use_sink) {
-#if ENABLE_FP16 && defined(__ANDROID__)
-    nntrainer::TensorDim sink_dim(
-      1, 1, 1, num_heads_Q,
-      nntrainer::TensorDim::TensorType(context.getFormat(),
-                                       ml::train::TensorDim::DataType::FP16));
-#else
-    nntrainer::TensorDim sink_dim(
-      1, 1, 1, num_heads_Q,
-      nntrainer::TensorDim::TensorType(context.getFormat(),
-                                       context.getActivationDataType()));
-#endif
-    sink_idx = context.requestWeight(sink_dim, nntrainer::Initializer::ZEROS,
-                                     nntrainer::WeightRegularizer::NONE, 0.0f,
-                                     0.0f, "sink");
-  }
-
   attn_logit_softcapping =
     std::get<props::AttnLogitSoftcapping>(mha_core_props).get();
 
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
 
+  theta = (float)std::get<props::RopeTheta>(mha_core_props).get();
+
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
+
+  context.setOutputDimensions(output_dims);
+
+  /** Weight for Sink */
+  use_sink = std::get<props::UseSink>(mha_core_props).get();
+  if (use_sink) {
+    sink_idx = context.requestWeight(
+      weight_dims[0], nntrainer::Initializer::ZEROS,
+      nntrainer::WeightRegularizer::NONE, 0.0f, 0.0f, "sink");
+  }
+
   /** Tensor for KV-Cache (only allocate internally when not using external
    * cache) */
   if (!use_external_cache) {
-#ifdef ENABLE_FP16
-    ml::train::TensorDim cache_key_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::FP16});
-    ml::train::TensorDim cache_value_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::FP16});
-#else
-    ml::train::TensorDim cache_key_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
-    ml::train::TensorDim cache_value_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
-#endif
-
-    tensor_idx[AttentionParams::cache_key] = context.requestTensor(
-      cache_key_dim, "cache_key", nntrainer::Initializer::NONE, false,
-      nntrainer::TensorLifespan::MAX_LIFESPAN);
-    tensor_idx[AttentionParams::cache_value] = context.requestTensor(
-      cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
-      nntrainer::TensorLifespan::MAX_LIFESPAN);
+    tensor_idx[AttentionParams::cache_key] =
+      context.requestTensor(tensor_dims[AttentionParams::cache_key],
+                            "cache_key", nntrainer::Initializer::NONE, false,
+                            nntrainer::TensorLifespan::MAX_LIFESPAN);
+    tensor_idx[AttentionParams::cache_value] =
+      context.requestTensor(tensor_dims[AttentionParams::cache_value],
+                            "cache_value", nntrainer::Initializer::NONE, false,
+                            nntrainer::TensorLifespan::MAX_LIFESPAN);
   }
-
-  theta = (float)std::get<props::RopeTheta>(mha_core_props).get();
-
-  /** set Output dimension! - one output */
-  std::vector<nntrainer::TensorDim> output_dims(1);
-  output_dims[0] = input_dims[0];
-  output_dims[0].width(head_dim * num_heads_Q);
-  output_dims[0].setTensorType(
-    {context.getFormat(), context.getActivationDataType()});
-  context.setOutputDimensions(output_dims);
 }
 
 /************************************************************** */
@@ -1532,10 +1473,11 @@ size_t MHACoreLayer::calc_attn_index(size_t i) { return (i * (i + 1)) / 2; };
 
 std::array<std::vector<nntrainer::TensorDim>, 3>
 MHACoreLayer::getLayerDimensions(nntrainer::InitLayerContext &context) {
-  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 4,
+  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
                 std::invalid_argument)
-    << "Multi head Attention layer needs 3 or 4 inputs. (query, key, value and "
-       "mask is optional)";
+    << "Multi head Attention layer needs 3, 4, or 5 inputs. (query, key, "
+       "value; mask is optional; external cache_key + cache_value for "
+       "external cache mode)";
 
   const std::vector<ml::train::TensorDim> &input_dims =
     context.getInputDimensions();

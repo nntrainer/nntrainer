@@ -75,31 +75,15 @@ void TieWordEmbedding::finalize_embedding(
   auto &weight_decay =
     std::get<nntrainer::props::WeightDecay>(*layer_impl_props);
 
-  unsigned int in_dim =
-    std::get<nntrainer::props::InDim>(tieword_embedding_props);
-  unsigned int out_dim =
-    std::get<nntrainer::props::OutDim>(tieword_embedding_props);
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getEmbeddingDimensions(context);
 
-  nntrainer::TensorDim output_dim = input_dim;
-
-  // output_dim expected as hidden x num input (batch size)
-  output_dim.height(input_dim.width());
-  output_dim.width(out_dim);
-  output_dim.setTensorType(
-    {context.getFormat(), context.getActivationDataType()});
-  context.setOutputDimensions({output_dim});
-
-  nntrainer::TensorDim dim = output_dim;
-
-  dim.setTensorType({context.getFormat(), context.getWeightDataType()});
-
-  dim.height(in_dim);
-  dim.width(out_dim);
-  dim.batch(1);
+  context.setOutputDimensions(output_dims);
 
   weight_idx[TieWordEmbeddingParams::weight] = context.requestWeight(
-    dim, weight_initializer, weight_regularizer, weight_regularizer_constant,
-    weight_decay, "Embedding", true);
+    weight_dims[TieWordEmbeddingParams::weight], weight_initializer,
+    weight_regularizer, weight_regularizer_constant, weight_decay, "Embedding",
+    true);
 }
 
 void TieWordEmbedding::finalize_lmhead(nntrainer::InitLayerContext &context) {
@@ -116,55 +100,23 @@ void TieWordEmbedding::finalize_lmhead(nntrainer::InitLayerContext &context) {
   auto &disable_bias =
     std::get<nntrainer::props::DisableBias>(*layer_impl_props);
 
-  auto unit = std::get<nntrainer::props::Unit>(tieword_embedding_props).get();
-
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
     << "lm head layer takes only one input";
 
-  std::vector<ml::train::TensorDim> output_dims(1);
-
-  /// @todo fc actaully supports multidimensions.
-  /// EffDimFlag shouldn't be fixed like this.
-  context.setEffDimFlagInputDimension(0, 0b1001);
-  context.setDynDimFlagInputDimension(0, 0b1000);
-  bool is_nchw = (context.getFormat() == nntrainer::Tformat::NCHW);
-
-  /** set output dimensions */
-  auto const &in_dim = context.getInputDimensions()[0];
-  output_dims[0] = in_dim;
-  is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
-  output_dims[0].height(1);
-
-  output_dims[0].setTensorType(
-    {context.getFormat(), context.getActivationDataType()});
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLMheadDimensions(context);
 
   context.setOutputDimensions(output_dims);
 
-  /** set weight specifications */
-  ml::train::TensorDim bias_dim(
-    1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
-    ml::train::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()),
-    is_nchw ? 0b0001 : 0b0100);
-
-  ///@note TieWordEmbedding layer's tensor dim is transposed dim of user-defined
-  /// dim
-  /// so it can reuse embedding layer.
-  ml::train::TensorDim weight_dim(
-    1, is_nchw ? 1 : in_dim.channel(), is_nchw ? unit : 1,
-    is_nchw ? in_dim.width() : unit,
-    ml::train::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()),
-    is_nchw ? 0b0011 : 0b0101);
-
   weight_idx[TieWordEmbeddingParams::weight] = context.requestWeight(
-    weight_dim, weight_initializer, weight_regularizer,
-    weight_regularizer_constant, weight_decay, "Embedding", true);
+    weight_dims[TieWordEmbeddingParams::weight], weight_initializer,
+    weight_regularizer, weight_regularizer_constant, weight_decay, "Embedding",
+    true);
 
   if (disable_bias.empty() || disable_bias.get() == false) {
     weight_idx[TieWordEmbeddingParams::bias] = context.requestWeight(
-      bias_dim, bias_initializer, nntrainer::WeightRegularizer::NONE, 1.0f,
-      bias_decay, "bias", true);
+      weight_dims[TieWordEmbeddingParams::bias], bias_initializer,
+      nntrainer::WeightRegularizer::NONE, 1.0f, bias_decay, "bias", true);
   }
 }
 

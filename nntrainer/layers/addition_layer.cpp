@@ -24,7 +24,9 @@ namespace nntrainer {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 void AdditionLayer::finalize(InitLayerContext &context) {
-  context.setOutputDimensions({context.getInputDimensions()[0]});
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
+  context.setOutputDimensions(output_dims);
 }
 
 void AdditionLayer::forwarding(RunLayerContext &context, bool training) {

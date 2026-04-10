@@ -21,14 +21,14 @@ namespace causallm {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
-  std::vector<nntrainer::TensorDim> dim = context.getInputDimensions();
-  context.setOutputDimensions(dim);
-  nntrainer::TensorDim gamma_dim(
-    1, 1, 1, dim[0].width(),
-    nntrainer::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()));
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
+
+  context.setOutputDimensions(output_dims);
+
   wt_idx[RMSParams::gamma] = context.requestWeight(
-    gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
+    weight_dims[RMSParams::gamma],
+    nntrainer::props::InitializerInfo::Enum::NONE,
     nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", false);
 }
 
