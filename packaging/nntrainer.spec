@@ -690,6 +690,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/mman_windows.h
 %{_includedir}/nntrainer/loss_layer.h
 %{_includedir}/nntrainer/acti_func.h
+%{_includedir}/nntrainer/reshaped_rms_norm.h
 # model headers
 %{_includedir}/nntrainer/neuralnet.h
 ## neuralnet.h

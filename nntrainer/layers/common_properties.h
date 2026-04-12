@@ -1512,6 +1512,17 @@ public:
 };
 
 /**
+ * @brief FeatureSize property, used for reshaped RMS normalization
+ * to specify the feature dimension for normalization
+ */
+class FeatureSize : public PositiveIntegerProperty {
+public:
+  static constexpr const char *key =
+    "feature_size";               /**< unique key to access */
+  using prop_tag = uint_prop_tag; /**< property type */
+};
+
+/**
  * @brief properties for getting the clipping value to clip the gradient by norm
  *
  */

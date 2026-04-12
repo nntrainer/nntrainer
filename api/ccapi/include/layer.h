@@ -115,7 +115,9 @@ enum LayerType {
                                                        Softmax Loss Layer type
                                                      */
   LAYER_RMSNORM = ML_TRAIN_LAYER_TYPE_RMSNORM,      /**<RMS NORM Layer */
-  LAYER_TRANSPOSE = ML_TRAIN_LAYER_TYPE_TRANSPOSE,  /**< Transpose Layer type */
+  LAYER_RESHAPED_RMSNORM =
+    ML_TRAIN_LAYER_TYPE_RESHAPED_RMSNORM, /**< Reshaped RMS NORM Layer */
+  LAYER_TRANSPOSE = ML_TRAIN_LAYER_TYPE_TRANSPOSE, /**< Transpose Layer type */
   LAYER_CHANNEL_SHUFFLE =
     ML_TRAIN_LAYER_TYPE_CHANNEL_SHUFFLE, /**< Channel Shuffle Layer type */
   LAYER_REDUCE_SUM =

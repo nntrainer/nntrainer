@@ -26,7 +26,6 @@
 
 #include <app_context.h>
 #include <engine.h>
-#include <reshaped_rms_norm.h>
 
 namespace causallm {
 
@@ -102,18 +101,7 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
 }
 
 void Qwen3Transformer::registerCustomLayers() {
-  ///
-  auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
-
-  try {
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
-  }
+  // ReshapedRMSNormLayer is now registered in the core nntrainer library
 }
 
 void Qwen3CausalLM::registerCustomLayers() {

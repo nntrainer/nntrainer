@@ -105,8 +105,9 @@ typedef enum {
                                        Sigmoid Loss Layer type (Since 6.5) */
   ML_TRAIN_LAYER_TYPE_LOSS_CROSS_ENTROPY_SOFTMAX = 502, /**< Cross Entropy with
                                        Softmax Loss Layer type (Since 6.5) */
-  ML_TRAIN_LAYER_TYPE_RMSNORM = 503, /**< Cross Entropy with */
-  ML_TRAIN_LAYER_TYPE_UNKNOWN = 999  /**< Unknown Layer */
+  ML_TRAIN_LAYER_TYPE_RMSNORM = 503,                    /**< RMS Norm Layer */
+  ML_TRAIN_LAYER_TYPE_RESHAPED_RMSNORM = 504, /**< Reshaped RMS Norm Layer */
+  ML_TRAIN_LAYER_TYPE_UNKNOWN = 999           /**< Unknown Layer */
 } ml_train_layer_type_e;
 
 /**

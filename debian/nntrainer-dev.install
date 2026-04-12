@@ -43,6 +43,7 @@
 /usr/include/nntrainer/operation_layer.h
 /usr/include/nntrainer/acti_func.h
 /usr/include/nntrainer/loss_layer.h
+/usr/include/nntrainer/reshaped_rms_norm.h
 # custom layer kits
 /usr/include/nntrainer/app_context.h
 /usr/include/nntrainer/context.h

@@ -87,6 +87,7 @@
 #include <preprocess_translate_layer.h>
 #include <reduce_mean_layer.h>
 #include <reduce_sum_layer.h>
+#include <reshaped_rms_norm.h>
 #include <rnn.h>
 #include <rnncell.h>
 #include <sine_layer.h>
@@ -401,6 +402,9 @@ void AppContext::add_default_object() {
 
   registerFactory(nntrainer::createLayer<ChannelShuffle>, ChannelShuffle::type,
                   LayerType::LAYER_CHANNEL_SHUFFLE);
+  registerFactory(nntrainer::createLayer<ReshapedRMSNormLayer>,
+                  ReshapedRMSNormLayer::type,
+                  LayerType::LAYER_RESHAPED_RMSNORM);
 
 #ifdef ENABLE_NNSTREAMER_BACKBONE
   registerFactory(nntrainer::createLayer<NNStreamerLayer>,

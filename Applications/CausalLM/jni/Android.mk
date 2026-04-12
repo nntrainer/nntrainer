@@ -84,7 +84,6 @@ LOCAL_SRC_FILES := \
     ../layers/mha_core.cpp \
     ../layers/lm_head.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
-    ../layers/reshaped_rms_norm.cpp \
     ../layers/rms_norm.cpp \
     ../layers/swiglu.cpp \
     ../layers/tie_word_embedding.cpp \
@@ -213,7 +212,6 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
-    ../layers/reshaped_rms_norm.cpp \
     ../layers/rms_norm.cpp \
     ../layers/swiglu.cpp \
     ../layers/tie_word_embedding.cpp\

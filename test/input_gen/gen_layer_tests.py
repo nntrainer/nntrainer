@@ -955,6 +955,46 @@ if __name__ == "__main__":
     record_single(rms_normtest,(2,3,3,3),"rms_normtest")
     record_single_fp16(rms_normtest_fp16,(2,3,3,3),"rms_normtest_fp16_new")
 
+    class ReshapedRMSNorm(tf.keras.layers.Layer):
+        def __init__(self, feature_size, epsilon=1e-3, **kwargs):
+            super(ReshapedRMSNorm, self).__init__(**kwargs)
+            self.epsilon = epsilon
+            self.feature_size = feature_size
+
+        def build(self, input_shape):
+            # Initialize gamma as trainable parameters with shape (feature_size,)
+            self.gamma = self.add_weight(
+                shape=(self.feature_size,),
+                initializer=tf.keras.initializers.Ones(),
+                trainable=True,
+                name='gamma'
+            )
+            super(ReshapedRMSNorm, self).build(input_shape)
+
+        def call(self, inputs):
+            # Get input shape: (batch, channel, height, width)
+            batch = tf.shape(inputs)[0]
+            channel = inputs.shape[1]
+            height = inputs.shape[2]
+            width = inputs.shape[3]
+            
+            # Reshape to (batch, channel, height * (width / feature_size), feature_size)
+            reshaped_height = height * (width // self.feature_size)
+            reshaped = tf.reshape(inputs, [batch, channel, reshaped_height, self.feature_size])
+            
+            # Compute RMS norm along the last dimension (feature_size)
+            mean_square = tf.reduce_mean(tf.square(reshaped), axis=[-1], keepdims=True)
+            rms_value = tf.sqrt(mean_square + self.epsilon)
+            normalized = reshaped / rms_value * self.gamma
+            
+            # Reshape back to original shape
+            output = tf.reshape(normalized, [batch, channel, height, width])
+            return output
+
+    # Test with width=9, feature_size=3 (9 is divisible by 3)
+    reshaped_rms_norm_test = ReshapedRMSNorm(feature_size=3)
+    record_single(reshaped_rms_norm_test, (2, 3, 3, 9), "reshaped_rms_norm_test")
+
     def transpose_axis0(tensor, batch_size, input_channel, input_height, input_width):
         output_shape = (batch_size, input_channel, input_height, input_width)
         return tf.transpose(tensor, perm=[0, 2, 1, 3])
