@@ -54,6 +54,14 @@ static bool g_verbose = false;
 static std::string g_last_output = "";
 static double g_initialization_duration_ms = 0.0;
 static std::unique_ptr<causallm::ChatTemplate> g_chat_template;
+static std::string g_formatted_template;
+
+namespace {
+struct ChatMessage {
+  std::string role;
+  std::string content;
+};
+} // namespace
 
 static std::map<std::string, std::string> g_model_path_map = {
   {"QWEN3-0.6B", "qwen3-0.6b"},
@@ -625,4 +633,131 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
   }
 
   return CAUSAL_LM_ERROR_NONE;
+}
+
+/*****************************************************************************
+ * Chat Template API - role + content message support
+ *****************************************************************************/
+
+/**
+ * @brief Convert C message array to C++ ChatMessage vector
+ */
+static std::vector<ChatMessage>
+convertMessages(const CausalLMChatMessage *messages, size_t num_messages) {
+  std::vector<ChatMessage> result;
+  result.reserve(num_messages);
+  for (size_t i = 0; i < num_messages; ++i) {
+    ChatMessage msg;
+    msg.role = messages[i].role ? messages[i].role : "";
+    msg.content = messages[i].content ? messages[i].content : "";
+    result.push_back(std::move(msg));
+  }
+  return result;
+}
+
+/**
+ * @brief Apply chat template to messages with hardcoded fallback
+ */
+static std::string
+apply_chat_template_messages(const std::string &architecture,
+                             const std::vector<ChatMessage> &messages,
+                             bool add_generation_prompt) {
+  if (g_chat_template) {
+    nlohmann::json request = nlohmann::json::array();
+    for (const auto &msg : messages) {
+      request.push_back({{"role", msg.role}, {"content", msg.content}});
+    }
+    return g_chat_template->apply(request);
+  }
+
+  std::string result;
+
+  if (architecture == "LlamaForCausalLM") {
+    for (const auto &msg : messages) {
+      if (msg.role == "system") {
+        result += "<<SYS>>\n" + msg.content + "\n<</SYS>>\n\n";
+      } else if (msg.role == "user") {
+        result += "[INST] " + msg.content + " [/INST]";
+      } else if (msg.role == "assistant") {
+        result += msg.content + "\n";
+      }
+    }
+  } else if (architecture == "Qwen2ForCausalLM" ||
+             architecture == "Qwen3ForCausalLM" ||
+             architecture == "Qwen3MoeForCausalLM" ||
+             architecture == "Qwen3SlimMoeForCausalLM" ||
+             architecture == "Qwen3CachedSlimMoeForCausalLM") {
+    for (const auto &msg : messages) {
+      result +=
+        "<|im_start|>" + msg.role + "\n" + msg.content + "<|im_end|>\n";
+    }
+    if (add_generation_prompt) {
+      result += "<|im_start|>assistant\n";
+    }
+  } else if (architecture == "Gemma3ForCausalLM") {
+    for (const auto &msg : messages) {
+      if (msg.role == "user") {
+        result += "<start_of_turn>user\n" + msg.content + "<end_of_turn>\n";
+      } else if (msg.role == "assistant") {
+        result +=
+          "<start_of_turn>model\n" + msg.content + "<end_of_turn>\n";
+      }
+    }
+    if (add_generation_prompt) {
+      result += "<start_of_turn>model\n";
+    }
+  } else {
+    for (const auto &msg : messages) {
+      result += msg.content + "\n";
+    }
+  }
+
+  return result;
+}
+
+ErrorCode applyChatTemplate(const CausalLMChatMessage *messages,
+                            size_t num_messages, bool add_generation_prompt,
+                            const char **formattedText) {
+  if (messages == nullptr || num_messages == 0 || formattedText == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+
+  try {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    auto chat_messages = convertMessages(messages, num_messages);
+    g_formatted_template = apply_chat_template_messages(
+      g_architecture, chat_messages, add_generation_prompt);
+
+    *formattedText = g_formatted_template.c_str();
+
+  } catch (const std::exception &e) {
+    std::cerr << "Exception in applyChatTemplate: " << e.what() << std::endl;
+    return CAUSAL_LM_ERROR_UNKNOWN;
+  }
+
+  return CAUSAL_LM_ERROR_NONE;
+}
+
+ErrorCode runModelWithMessages(const CausalLMChatMessage *messages,
+                               size_t num_messages, bool add_generation_prompt,
+                               const char **outputText) {
+  if (!g_initialized || !g_model) {
+    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+  }
+  if (outputText == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+
+  // Apply chat template to format the prompt
+  const char *formattedInput = nullptr;
+  ErrorCode err =
+    applyChatTemplate(messages, num_messages, add_generation_prompt,
+                      &formattedInput);
+  if (err != CAUSAL_LM_ERROR_NONE) {
+    return err;
+  }
+
+  // Run inference with the formatted prompt
+  return runModel(formattedInput, outputText);
 }
