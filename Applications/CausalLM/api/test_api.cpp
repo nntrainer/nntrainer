@@ -12,8 +12,10 @@
  */
 
 #include "causal_lm_api.h"
+#include "../json.hpp"
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -90,6 +92,9 @@ void printUsage(const char *program_name) {
   std::cout << COLOR_YELLOW << "Usage:" << COLOR_RESET << "\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
             << " <model_name> [prompt] [use_chat_template] [quantization] "
+               "[verbose] \n";
+  std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
+            << " <model_name> --chat-file <path.json> [quantization] "
                "[verbose] \n\n";
 
   std::cout << COLOR_CYAN << "Arguments:" << COLOR_RESET << "\n";
@@ -98,6 +103,9 @@ void printUsage(const char *program_name) {
   std::cout << "  prompt            " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET
             << "  - Input prompt (default: 'Hello, how are you?')\n";
+  std::cout << "  --chat-file       " << COLOR_GREEN << "OPTIONAL"
+            << COLOR_RESET
+            << "  - JSON file with chat messages [{role, content}, ...]\n";
   std::cout << "  use_chat_template " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET << "  - 0/1 or true/false (default: 1)\n";
   std::cout << "  quantization      " << COLOR_GREEN << "OPTIONAL"
@@ -110,7 +118,15 @@ void printUsage(const char *program_name) {
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
             << " QWEN3-0.6B \"Tell me a joke\" 1 W4A32\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
-            << " QWEN3-0.6B \"Write a poem\" 1 W32A32 1\n\n";
+            << " QWEN3-0.6B --chat-file chat.json W32A32 1\n\n";
+
+  std::cout << COLOR_YELLOW << "Chat file format (JSON):" << COLOR_RESET << "\n";
+  std::cout << "  [\n";
+  std::cout << "    {\"role\": \"system\",    \"content\": \"You are a helpful assistant.\"},\n";
+  std::cout << "    {\"role\": \"user\",      \"content\": \"Hello!\"},\n";
+  std::cout << "    {\"role\": \"assistant\", \"content\": \"Hi there!\"},\n";
+  std::cout << "    {\"role\": \"user\",      \"content\": \"How are you?\"}\n";
+  std::cout << "  ]\n\n";
 }
 } // namespace
 
@@ -124,30 +140,51 @@ int main(int argc, char *argv[]) {
   }
 
   const char *model_name = argv[1];
-  const char *prompt = (argc >= 3) ? argv[2] : "Hello, how are you?";
+  const char *prompt = "Hello, how are you?";
   bool use_chat_template = true;
-  if (argc >= 4) {
-    use_chat_template =
-      (std::string(argv[3]) == "1" || std::string(argv[3]) == "true");
-  }
-
+  std::string chat_file_path = "";
   std::string quant_str = "UNKNOWN";
   ModelQuantizationType quant_type = CAUSAL_LM_QUANTIZATION_UNKNOWN;
-  if (argc >= 5) {
-    quant_str = std::string(argv[4]);
-    if (quant_str == "W4A32")
-      quant_type = CAUSAL_LM_QUANTIZATION_W4A32;
-    else if (quant_str == "W16A16")
-      quant_type = CAUSAL_LM_QUANTIZATION_W16A16;
-    else if (quant_str == "W8A16")
-      quant_type = CAUSAL_LM_QUANTIZATION_W8A16;
-    else if (quant_str == "W32A32")
-      quant_type = CAUSAL_LM_QUANTIZATION_W32A32;
-  }
-
   bool verbose = true;
-  if (argc >= 6) {
-    verbose = (std::string(argv[5]) == "1" || std::string(argv[5]) == "true");
+
+  // Parse --chat-file mode: <model> --chat-file <path> [quant] [verbose]
+  if (argc >= 4 && std::string(argv[2]) == "--chat-file") {
+    chat_file_path = argv[3];
+    use_chat_template = true;
+    if (argc >= 5) {
+      quant_str = std::string(argv[4]);
+      if (quant_str == "W4A32")
+        quant_type = CAUSAL_LM_QUANTIZATION_W4A32;
+      else if (quant_str == "W16A16")
+        quant_type = CAUSAL_LM_QUANTIZATION_W16A16;
+      else if (quant_str == "W8A16")
+        quant_type = CAUSAL_LM_QUANTIZATION_W8A16;
+      else if (quant_str == "W32A32")
+        quant_type = CAUSAL_LM_QUANTIZATION_W32A32;
+    }
+    if (argc >= 6) {
+      verbose = (std::string(argv[5]) == "1" || std::string(argv[5]) == "true");
+    }
+  } else {
+    // Normal mode: <model> [prompt] [chat_template] [quant] [verbose]
+    if (argc >= 3)
+      prompt = argv[2];
+    if (argc >= 4)
+      use_chat_template =
+        (std::string(argv[3]) == "1" || std::string(argv[3]) == "true");
+    if (argc >= 5) {
+      quant_str = std::string(argv[4]);
+      if (quant_str == "W4A32")
+        quant_type = CAUSAL_LM_QUANTIZATION_W4A32;
+      else if (quant_str == "W16A16")
+        quant_type = CAUSAL_LM_QUANTIZATION_W16A16;
+      else if (quant_str == "W8A16")
+        quant_type = CAUSAL_LM_QUANTIZATION_W8A16;
+      else if (quant_str == "W32A32")
+        quant_type = CAUSAL_LM_QUANTIZATION_W32A32;
+    }
+    if (argc >= 6)
+      verbose = (std::string(argv[5]) == "1" || std::string(argv[5]) == "true");
   }
 
   printSection("Configuration");
@@ -155,6 +192,9 @@ int main(int argc, char *argv[]) {
   printInfo("Use Chat Template", use_chat_template ? "true" : "false");
   printInfo("Quantization", quant_str);
   printInfo("Verbose", verbose ? "true" : "false");
+  if (!chat_file_path.empty()) {
+    printInfo("Chat File", chat_file_path);
+  }
   std::cout << "\n";
 
   printSection("Initialization");
@@ -196,7 +236,130 @@ int main(int argc, char *argv[]) {
   }
   printSuccess("Model loaded successfully");
 
-  printSection("Inference");
+  // ── --chat-file mode: load messages from JSON file ──
+  using json = nlohmann::json;
+  std::vector<CausalLMChatMessage> file_msgs;
+  std::vector<std::string> role_strs, content_strs;
+
+  if (!chat_file_path.empty()) {
+    printSection("Test: Chat Template from File");
+    std::ifstream chat_file(chat_file_path);
+    if (!chat_file.is_open()) {
+      printError("Cannot open chat file: " + chat_file_path);
+      return 1;
+    }
+
+    json chat_json;
+    try {
+      chat_file >> chat_json;
+    } catch (const json::parse_error &e) {
+      printError("JSON parse error: " + std::string(e.what()));
+      return 1;
+    }
+
+    // Support both formats:
+    //   Array:  [{"role":"user","content":"Hi"}]
+    //   Object: {"chat": [{"role":"user","content":"Hi"}]}
+    json messages_json;
+    if (chat_json.is_array()) {
+      messages_json = chat_json;
+    } else if (chat_json.is_object() && chat_json.contains("chat") &&
+               chat_json["chat"].is_array()) {
+      messages_json = chat_json["chat"];
+    } else {
+      printError("Chat file must contain a JSON array or {\"chat\": [...]}");
+      return 1;
+    }
+
+    // Store strings to keep pointers valid
+    for (const auto &msg : messages_json) {
+      if (msg.contains("role") && msg.contains("content")) {
+        role_strs.push_back(msg["role"].get<std::string>());
+        content_strs.push_back(msg["content"].get<std::string>());
+      }
+    }
+    for (size_t i = 0; i < role_strs.size(); ++i) {
+      file_msgs.push_back({role_strs[i].c_str(), content_strs[i].c_str()});
+    }
+
+    std::cout << COLOR_CYAN << "📝 " << COLOR_RESET << "Messages from "
+              << chat_file_path << ":\n";
+    for (size_t i = 0; i < file_msgs.size(); ++i) {
+      std::cout << COLOR_YELLOW << "  [" << file_msgs[i].role << "] "
+                << COLOR_RESET << file_msgs[i].content << "\n";
+    }
+    std::cout << "\n";
+
+    // Test applyChatTemplate with file messages
+    const char *formattedText = nullptr;
+    err = applyChatTemplate(file_msgs.data(), file_msgs.size(), true,
+                            &formattedText);
+    if (err == CAUSAL_LM_ERROR_NONE && formattedText) {
+      std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Formatted prompt:\n";
+      std::cout << COLOR_BOLD << COLOR_YELLOW << formattedText << COLOR_RESET
+                << "\n\n";
+      printSuccess("applyChatTemplate works");
+    } else {
+      printError("applyChatTemplate failed");
+      std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+    }
+
+    // Test runModelWithMessages with file messages
+    printSection("Test: runModelWithMessages from File");
+    std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET
+              << "Running inference with messages...\n\n";
+
+    const char *msgOutput = nullptr;
+    if (verbose) {
+      std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
+      std::cout << COLOR_BOLD << COLOR_GRAY;
+    }
+
+    err = runModelWithMessages(file_msgs.data(), file_msgs.size(), true,
+                               &msgOutput);
+
+    if (verbose) {
+      std::cout << COLOR_RESET << "\n\n";
+    }
+
+    if (err == CAUSAL_LM_ERROR_NONE && msgOutput) {
+      std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Output:\n";
+      std::cout << COLOR_BOLD << COLOR_GREEN << "  " << msgOutput << COLOR_RESET
+                << "\n\n";
+      printSuccess("runModelWithMessages works");
+    } else {
+      printError("runModelWithMessages failed");
+      std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+    }
+
+    // Skip to performance metrics
+    goto print_metrics;
+  }
+
+  // ── Test 1: applyChatTemplate (no inference, format only) ──
+  {
+  printSection("Test: applyChatTemplate");
+  std::cout << COLOR_CYAN << "📝 " << COLOR_RESET
+            << "Testing chat template formatting (no inference)...\n\n";
+
+  CausalLMChatMessage tmpl_msgs[] = {
+    {"system", "You are a helpful AI assistant."},
+    {"user", prompt}};
+
+  const char *formattedText = nullptr;
+  err = applyChatTemplate(tmpl_msgs, 2, true, &formattedText);
+  if (err == CAUSAL_LM_ERROR_NONE && formattedText) {
+    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Formatted prompt:\n";
+    std::cout << COLOR_BOLD << COLOR_YELLOW << formattedText << COLOR_RESET
+              << "\n\n";
+    printSuccess("applyChatTemplate works");
+  } else {
+    printError("applyChatTemplate failed");
+    std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+  }
+
+  // ── Test 2: runModel (single prompt, existing API) ──
+  printSection("Test: runModel (single prompt)");
   std::cout << COLOR_CYAN << "📝 " << COLOR_RESET << "Input Prompt:\n";
   std::cout << COLOR_BOLD << COLOR_YELLOW << "  " << prompt << COLOR_RESET
             << "\n\n";
@@ -246,6 +409,48 @@ int main(int argc, char *argv[]) {
     printWarning("No output generated");
   }
 
+  // ── Test 3: runModelWithMessages (chat template with messages) ──
+  printSection("Test: runModelWithMessages");
+  CausalLMChatMessage chat_msgs[] = {
+    {"system", "You are a helpful AI assistant."},
+    {"user", prompt}};
+
+  std::cout << COLOR_CYAN << "📝 " << COLOR_RESET
+            << "Messages:\n";
+  for (size_t i = 0; i < 2; ++i) {
+    std::cout << COLOR_YELLOW << "  [" << chat_msgs[i].role << "] "
+              << COLOR_RESET << chat_msgs[i].content << "\n";
+  }
+  std::cout << "\n";
+
+  std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET
+            << "Running inference with messages...\n\n";
+
+  const char *msgOutput = nullptr;
+
+  if (verbose) {
+    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
+    std::cout << COLOR_BOLD << COLOR_GRAY;
+  }
+
+  err = runModelWithMessages(chat_msgs, 2, true, &msgOutput);
+
+  if (verbose) {
+    std::cout << COLOR_RESET << "\n\n";
+  }
+
+  if (err == CAUSAL_LM_ERROR_NONE && msgOutput) {
+    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Output:\n";
+    std::cout << COLOR_BOLD << COLOR_GREEN << "  " << msgOutput << COLOR_RESET
+              << "\n\n";
+    printSuccess("runModelWithMessages works");
+  } else {
+    printError("runModelWithMessages failed");
+    std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+  }
+  } // end of normal mode tests
+
+print_metrics:
   printSection("Performance Metrics");
   PerformanceMetrics metrics;
   err = getPerformanceMetrics(&metrics);
