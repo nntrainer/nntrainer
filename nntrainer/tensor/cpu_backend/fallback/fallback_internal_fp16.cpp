@@ -485,12 +485,66 @@ void __fallback_gemm_q6_K(const unsigned int M, const unsigned int N,
   throw std::runtime_error("NYI : __fallback_gemm_q6_K");
 }
 
+static inline __fp16 hsumv_f16(float16x4_t v) {
+  return vaddvq_f32(vcvt_f32_f16(v));
+}
+
+static inline __fp16 hsumvq_f16(float16x8_t v) {
+  return vaddvq_f32(vaddq_f32(vcvt_f32_f16(vget_low_f16(v)), vcvt_f32_f16(vget_high_f16(v))));
+}
+
 template <>
 void __fallback_rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
                                                   _FP16 *__restrict Y, size_t H,
                                                   size_t W, float epsilon) {
-  throw std::runtime_error(
-    "NYI : __fallback_rms_norm_wrt_width_fp16_intrinsic");
+  const float eps_h = (float)epsilon;
+
+  for (size_t h = 0; h < H; ++h) {
+    const _FP16 *rowX = X + h * W;
+    _FP16 *rowY = Y + h * W;
+
+    size_t i = 0;
+    float sum = 0.0F;
+
+    for (; i + 8 <= W; i += 8) {
+      float16x8_t f0 = vld1q_f16(rowX + i);
+      float16x8_t mul = vmulq_f16(f0, f0);
+      sum += hsumvq_f16(mul);
+    }
+
+    if (i + 4 <= W) {
+      float16x4_t f = vld1_f16(rowX + i);
+      float16x4_t mul = vmul_f16(f, f);
+      sum += hsumv_f16(mul);
+      i += 4;
+    }
+
+    for (; i < W; ++i) {
+      float hx = rowX[i];
+      sum = sum + hx * hx;
+    }
+
+    float mean_single = sum / W;
+    float scale_single = 1.F / std::sqrt(mean_single + eps_h);
+    float16x8_t scale_v = vdupq_n_f16(scale_single);
+
+    i = 0;
+    for (; i + 8 <= W; i += 8) {
+      float16x8_t f0 = vld1q_f16(rowX + i);
+      float16x8_t yh = vmulq_f16(f0, scale_v);
+
+      vst1q_f16(rowY + i, yh);
+    }
+    if (i + 4 <= W) {
+      float16x4_t f = vld1_f16(rowX + i);
+      float16x4_t y4 = vmul_f16(f, vget_low_f16(scale_v));
+      vst1_f16(rowY + i, y4);
+      i += 4;
+    }
+    for (; i < W; ++i) {
+      rowY[i] = rowX[i] * scale_single;
+    }
+  }
 }
 
 template <>
