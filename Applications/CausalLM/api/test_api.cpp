@@ -13,6 +13,8 @@
 
 #include "../json.hpp"
 #include "causal_lm_api.h"
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -92,7 +94,7 @@ void printUsage(const char *program_name) {
   std::cout << COLOR_YELLOW << "Usage:" << COLOR_RESET << "\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
             << " <model_name> [prompt] [use_chat_template] [quantization] "
-               "[verbose] \n";
+               "[verbose] [--verify-memory|--multi-turn]\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
             << " <model_name> --chat-file <path.json> [quantization] "
                "[verbose] \n\n";
@@ -114,9 +116,23 @@ void printUsage(const char *program_name) {
   std::cout << "  verbose           " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET << "  - 0/1 or true/false (default: 0)\n\n";
 
+  std::cout << COLOR_CYAN << "Modes:" << COLOR_RESET << "\n";
+  std::cout << "  --verify-memory   " << COLOR_GREEN << "OPTIONAL"
+            << COLOR_RESET
+            << "  - Scripted 2-turn regression test, then reset+recheck\n";
+  std::cout << "  --multi-turn      " << COLOR_GREEN << "OPTIONAL"
+            << COLOR_RESET
+            << "  - Interactive REPL (/reset, /quit supported)\n\n";
+
   std::cout << COLOR_YELLOW << "Examples:" << COLOR_RESET << "\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
             << " QWEN3-0.6B \"Tell me a joke\" 1 W4A32\n";
+  std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
+            << " QWEN3-0.6B \"Write a poem\" 1 W32A32 1\n";
+  std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
+            << " QWEN3-0.6B \"\" 1 W4A32 0 --verify-memory\n";
+  std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
+            << " QWEN3-0.6B \"\" 1 W4A32 0 --multi-turn\n";
   std::cout << "  " << COLOR_BOLD << program_name << COLOR_RESET
             << " QWEN3-0.6B --chat-file chat.json W32A32 1\n\n";
 
@@ -130,10 +146,290 @@ void printUsage(const char *program_name) {
   std::cout << "    {\"role\": \"user\",      \"content\": \"How are you?\"}\n";
   std::cout << "  ]\n\n";
 }
+
+/**
+ * @brief Run a single inference turn and (optionally) print metrics.
+ * @param prompt        Input user prompt for this turn.
+ * @param verbose       Whether to stream tokens (matches global verbose flag).
+ * @param show_metrics  Whether to dump performance metrics for this turn.
+ * @param[out] out_text If non-null, receives the generated assistant text.
+ * @return ErrorCode from runModel().
+ */
+ErrorCode run_turn(const char *prompt, bool verbose, bool show_metrics,
+                   std::string *out_text = nullptr) {
+  std::cout << COLOR_CYAN << "📝 " << COLOR_RESET << "Input Prompt:\n";
+  std::cout << COLOR_BOLD << COLOR_YELLOW << "  " << prompt << COLOR_RESET
+            << "\n\n";
+
+  std::cout << COLOR_CYAN << "⚡ " << COLOR_RESET << "Running inference...\n\n";
+
+  const char *outputText = nullptr;
+
+  if (verbose) {
+    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Streaming Output:\n";
+    std::cout << COLOR_BOLD << COLOR_GRAY;
+  }
+
+  ErrorCode err = runModel(prompt, &outputText);
+
+  if (verbose) {
+    std::cout << COLOR_RESET << "\n\n";
+  }
+
+  if (err != CAUSAL_LM_ERROR_NONE) {
+    printError("Failed to run model");
+    std::cerr << "  Error code: " << static_cast<int>(err) << "\n";
+    return err;
+  }
+
+  if (outputText) {
+    if (out_text)
+      *out_text = outputText;
+    std::cout << COLOR_CYAN << "💬 " << COLOR_RESET << "Output:\n";
+    std::cout << COLOR_BOLD << COLOR_GREEN << "  ";
+    std::string out(outputText);
+    size_t pos = 0;
+    while (pos < out.length()) {
+      size_t newlinePos = out.find('\n', pos);
+      if (newlinePos == std::string::npos) {
+        newlinePos = out.length();
+      }
+      std::string line = out.substr(pos, newlinePos - pos);
+      std::cout << line;
+      if (newlinePos < out.length()) {
+        std::cout << "\n  ";
+        pos = newlinePos + 1;
+      } else {
+        pos = out.length();
+      }
+    }
+    std::cout << COLOR_RESET << "\n\n";
+  } else {
+    printWarning("No output generated");
+  }
+
+  if (!show_metrics)
+    return err;
+
+  PerformanceMetrics metrics;
+  ErrorCode merr = getPerformanceMetrics(&metrics);
+  if (merr != CAUSAL_LM_ERROR_NONE) {
+    printWarning("Failed to get metrics");
+    std::cout << "  Error code: " << static_cast<int>(merr) << "\n";
+    return err;
+  }
+
+  double prefill_tps =
+    metrics.prefill_duration_ms > 0
+      ? (metrics.prefill_tokens / metrics.prefill_duration_ms * 1000.0)
+      : 0.0;
+  double gen_tps =
+    metrics.generation_duration_ms > 0
+      ? (metrics.generation_tokens / metrics.generation_duration_ms * 1000.0)
+      : 0.0;
+
+  std::cout << COLOR_CYAN << "  📊 " << COLOR_RESET << COLOR_BOLD
+            << "Prefill" << COLOR_RESET << "  tokens="
+            << metrics.prefill_tokens << "  "
+            << std::fixed << std::setprecision(2)
+            << metrics.prefill_duration_ms << " ms  "
+            << COLOR_GREEN << std::setprecision(1) << prefill_tps
+            << COLOR_RESET << " tok/s\n";
+  std::cout << COLOR_CYAN << "  📊 " << COLOR_RESET << COLOR_BOLD
+            << "Generation" << COLOR_RESET << " tokens="
+            << metrics.generation_tokens << "  "
+            << std::fixed << std::setprecision(2)
+            << metrics.generation_duration_ms << " ms  "
+            << COLOR_GREEN << std::setprecision(1) << gen_tps
+            << COLOR_RESET << " tok/s\n\n";
+
+  return err;
+}
+
+/**
+ * @brief Lower-case a string in-place.
+ */
+std::string to_lower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return s;
+}
+
+/**
+ * @brief Trim ASCII whitespace from both ends.
+ */
+std::string trim(const std::string &s) {
+  size_t b = 0, e = s.size();
+  while (b < e && std::isspace(static_cast<unsigned char>(s[b])))
+    ++b;
+  while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1])))
+    --e;
+  return s.substr(b, e - b);
+}
+
+/**
+ * @brief Scripted multi-turn regression: ensure the model remembers
+ *        a name across turns, and forgets it after resetConversation().
+ * @return 0 on success, non-zero on assertion failure.
+ */
+int run_verify_memory(bool verbose) {
+  printSection("Verify Memory: Multi-Turn Regression");
+
+  const char *turn1 = "My name is Alice. Please remember my name.";
+  const char *turn2 = "What is my name?";
+
+  std::cout << COLOR_BOLD << "Turn 1 (set context)" << COLOR_RESET << "\n";
+  std::string out1;
+  if (run_turn(turn1, verbose, true, &out1) != CAUSAL_LM_ERROR_NONE) {
+    printError("Turn 1 failed");
+    return 1;
+  }
+
+  std::cout << COLOR_BOLD << "Turn 2 (recall)" << COLOR_RESET << "\n";
+  std::string out2;
+  if (run_turn(turn2, verbose, true, &out2) != CAUSAL_LM_ERROR_NONE) {
+    printError("Turn 2 failed");
+    return 1;
+  }
+
+  bool remembered = to_lower(out2).find("alice") != std::string::npos;
+  if (!remembered) {
+    printError("Turn 2 output did not contain 'Alice' — multi-turn context "
+               "was NOT preserved.");
+    return 2;
+  }
+  printSuccess("Turn 2 recalled 'Alice' — multi-turn context preserved.");
+
+  std::cout << COLOR_BOLD << "Calling resetConversation()..." << COLOR_RESET
+            << "\n";
+  ErrorCode rerr = resetConversation();
+  if (rerr != CAUSAL_LM_ERROR_NONE) {
+    printError("resetConversation() failed");
+    std::cerr << "  Error code: " << static_cast<int>(rerr) << "\n";
+    return 3;
+  }
+  printSuccess("Conversation state reset.");
+
+  std::cout << COLOR_BOLD << "Turn 3 (post-reset recall, should NOT know)"
+            << COLOR_RESET << "\n";
+  std::string out3;
+  if (run_turn(turn2, verbose, true, &out3) != CAUSAL_LM_ERROR_NONE) {
+    printError("Turn 3 failed");
+    return 4;
+  }
+
+  // Accept any output that does NOT strongly assert the name is Alice.
+  // Small models may still emit the token "alice" while hedging (e.g.
+  // "I'm not sure — could it be Alice?"). We only flag a true leak:
+  // a confident affirmative statement such as "your name is alice" or
+  // "you are alice".
+  const std::string out3_lc = to_lower(out3);
+  const char *leak_patterns[] = {
+    "your name is alice",
+    "you are alice",
+    "you're alice",
+    "name is alice",
+    "you said your name is alice",
+  };
+  bool leaked = false;
+  for (const char *p : leak_patterns) {
+    if (out3_lc.find(p) != std::string::npos) {
+      leaked = true;
+      break;
+    }
+  }
+  if (leaked) {
+    printError("Turn 3 affirmatively stated the name is Alice AFTER reset — "
+               "resetConversation() did not clear context.");
+    return 5;
+  }
+  if (out3_lc.find("alice") != std::string::npos) {
+    printWarning("Turn 3 mentions 'alice' but does not affirmatively claim "
+                 "the name — accepted as hedged response.");
+  }
+  printSuccess("Turn 3 did not assert 'Alice' — reset cleared context.");
+
+  printLine("═", 63);
+  std::cout << COLOR_BOLD << COLOR_GREEN
+            << "  ✓ verify-memory PASSED" << COLOR_RESET << "\n";
+  printLine("═", 63);
+  std::cout << "\n";
+  return 0;
+}
+
+/**
+ * @brief Interactive multi-turn REPL.
+ *        Commands: /reset (clear context), /quit (exit), EOF -> exit.
+ */
+int run_multi_turn_repl(bool verbose) {
+  printSection("Multi-Turn REPL");
+  std::cout << "Commands: " << COLOR_BOLD << "/reset" << COLOR_RESET
+            << " clears context, " << COLOR_BOLD << "/quit" << COLOR_RESET
+            << " (or EOF) exits.\n\n";
+
+  while (true) {
+    std::cout << COLOR_BOLD << COLOR_CYAN << "you> " << COLOR_RESET
+              << std::flush;
+    std::string line;
+    if (!std::getline(std::cin, line)) {
+      std::cout << "\n[EOF] exiting.\n";
+      return 0;
+    }
+    std::string cmd = trim(line);
+    if (cmd.empty())
+      continue;
+    if (cmd == "/quit" || cmd == "/exit") {
+      std::cout << "Bye.\n";
+      return 0;
+    }
+    if (cmd == "/reset") {
+      ErrorCode rerr = resetConversation();
+      if (rerr != CAUSAL_LM_ERROR_NONE) {
+        printError("resetConversation() failed");
+        std::cerr << "  Error code: " << static_cast<int>(rerr) << "\n";
+      } else {
+        printSuccess("Conversation state reset.");
+      }
+      continue;
+    }
+    std::string out;
+    ErrorCode err = run_turn(cmd.c_str(), verbose, true, &out);
+    if (err != CAUSAL_LM_ERROR_NONE) {
+      printError("Turn failed; you may want to /reset.");
+    }
+  }
+  return 0;
+}
 } // namespace
 
 int main(int argc, char *argv[]) {
   printLogo();
+
+  // Strip mode flags (--verify-memory / --multi-turn) out of argv before
+  // the existing positional-argument parser runs, so older invocations
+  // remain byte-identical.
+  bool mode_verify_memory = false;
+  bool mode_multi_turn = false;
+  std::vector<char *> filtered_argv;
+  filtered_argv.reserve(argc);
+  for (int i = 0; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--verify-memory") {
+      mode_verify_memory = true;
+      continue;
+    }
+    if (a == "--multi-turn") {
+      mode_multi_turn = true;
+      continue;
+    }
+    filtered_argv.push_back(argv[i]);
+  }
+  if (mode_verify_memory && mode_multi_turn) {
+    printError("--verify-memory and --multi-turn are mutually exclusive.");
+    return 1;
+  }
+  argc = static_cast<int>(filtered_argv.size());
+  argv = filtered_argv.data();
 
   if (argc < 2) {
     printSection("ERROR: Missing Required Arguments");
@@ -142,7 +438,9 @@ int main(int argc, char *argv[]) {
   }
 
   const char *model_name = argv[1];
-  const char *prompt = "Hello, how are you?";
+  const char *prompt = (argc >= 3 && argv[2][0] != '\0')
+                         ? argv[2]
+                         : "Hello, how are you?";
   bool use_chat_template = true;
   std::string chat_file_path = "";
   std::string quant_str = "UNKNOWN";
@@ -255,6 +553,18 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   printSuccess("Model loaded successfully");
+
+  // Mode dispatch: --verify-memory and --multi-turn run on top of the
+  // already-loaded model and exit; otherwise fall back to the default
+  // test flow below (applyChatTemplate + runModel + runModelWithMessages).
+  if (mode_verify_memory) {
+    int rc = run_verify_memory(verbose);
+    return rc;
+  }
+  if (mode_multi_turn) {
+    return run_multi_turn_repl(verbose);
+  }
+
 
   // ── --chat-file mode: load messages from JSON file ──
   using json = nlohmann::json;
