@@ -347,6 +347,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   has_run_ = false;
 
+  // Multi-turn safety: drop any decoder state left over from a previous run.
+  // If a prior turn ended mid-punctuation or mid-UTF-8 token, pending_ids_
+  // would leak into this turn's decoding and corrupt output.
+  pending_ids_.clear();
+
   output_list.clear();
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
     output_list.push_back("");
@@ -517,6 +522,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   allocateAndBindKVCache();
   const unsigned int prefill_from = SYS_PROMP_LEN + global_token_len;
   const unsigned int prefill_to = prefill_from + input_len;
+
+  if (prefill_from + init_len + NUM_TO_GENERATE > MAX_SEQ_LEN) {
+    free(input_sample);
+    std::cerr << "[CausalLM] context overflow: base_pos=" << prefill_from
+              << " input=" << init_len << " gen=" << NUM_TO_GENERATE
+              << " max_seq_len=" << MAX_SEQ_LEN
+              << ". Call resetConversation() to start a new conversation."
+              << std::endl;
+    throw std::runtime_error("CausalLM context overflow");
+  }
+
   setKVCachePosition(prefill_from);
   output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
                                         prefill_from, prefill_to, false);
@@ -541,7 +557,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    * TOKEN GENERATION
    */
 
-  input_len += SYS_PROMP_LEN;
+  // Shift input_len into absolute-position space so that token_generation_idx
+  // below indexes the cache in the same frame as the prefill call above.
+  input_len += prefill_from;
 
   // Update generated token by prefill as an input
   for (unsigned int b = 0; b < BATCH_SIZE; ++b)
@@ -557,8 +575,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     allocateAndBindKVCache();
     auto output_interval =
       model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                   token_generation_idx - 1 + global_token_len,
-                                   token_generation_idx + global_token_len);
+                                   token_generation_idx - 1,
+                                   token_generation_idx);
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
 
     // Feed the newly generated token back as the next input token.
