@@ -97,6 +97,7 @@
 #include <tangent_layer.h>
 #include <tensor_layer.h>
 #include <time_dist.h>
+#include <tie_word_embedding.h>
 #include <upsample2d_layer.h>
 #include <weight_layer.h>
 #include <zoneout_lstmcell.h>
@@ -438,6 +439,10 @@ void AppContext::add_default_object() {
 
   registerFactory(nntrainer::createLayer<TimeDistLayer>, TimeDistLayer::type,
                   LayerType::LAYER_TIME_DIST);
+
+  registerFactory(nntrainer::createLayer<causallm::TieWordEmbedding>,
+                  causallm::TieWordEmbedding::type,
+                  LayerType::LAYER_CUSTOM_TIE_WORD_EMBEDDING);
 
   registerFactory(AppContext::unknownFactory<nntrainer::Layer>, "unknown",
                   LayerType::LAYER_UNKNOWN);

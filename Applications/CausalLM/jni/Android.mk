@@ -87,7 +87,6 @@ LOCAL_SRC_FILES := \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/rms_norm.cpp \
     ../layers/swiglu.cpp \
-    ../layers/tie_word_embedding.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../layers/qkv_layer.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \

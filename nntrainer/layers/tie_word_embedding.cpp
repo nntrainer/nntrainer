@@ -71,7 +71,7 @@ void TieWordEmbedding::finalize_embedding(
     std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
   auto &weight_regularizer_constant =
     std::get<nntrainer::props::WeightRegularizerConstant>(*layer_impl_props);
-  auto weight_initializer = nntrainer::props::InitializerInfo::Enum::NONE;
+  auto weight_initializer = nntrainer::Initializer::ONES;
   auto &weight_decay =
     std::get<nntrainer::props::WeightDecay>(*layer_impl_props);
 
@@ -107,7 +107,7 @@ void TieWordEmbedding::finalize_lmhead(nntrainer::InitLayerContext &context) {
     std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
   auto &weight_regularizer_constant =
     std::get<nntrainer::props::WeightRegularizerConstant>(*layer_impl_props);
-  auto weight_initializer = nntrainer::props::InitializerInfo::Enum::NONE;
+  auto weight_initializer = nntrainer::Initializer::ONES;
   auto &weight_decay =
     std::get<nntrainer::props::WeightDecay>(*layer_impl_props);
   auto &bias_decay = std::get<nntrainer::props::BiasDecay>(*layer_impl_props);
@@ -174,11 +174,53 @@ void TieWordEmbedding::setProperty(const std::vector<std::string> &values) {
 }
 
 void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
-                                  bool training) {}
+                                  bool training) {
+  printf("TieWordEmbedding::forwarding() entered - mode: %s, layer_name: %s\n",
+         mode_ == mode::embedding ? "embedding" : "lm_head", context.getName().c_str());
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  
+  printf("  input tensor name: %s\n", input_.getName().c_str());
+  printf("  input tensor object: %p\n", &input_);
+  printf("  input tensor dim: batch=%zu, channel=%zu, height=%zu, width=%zu\n",
+         input_.getDim().batch(), input_.getDim().channel(),
+         input_.getDim().height(), input_.getDim().width());
+  
+  if (context.getNumWeights() > 0) {
+    nntrainer::Tensor &weight = context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
+    printf("  weight tensor name: %s\n", weight.getName().c_str());
+    printf("  weight tensor object: %p\n", &weight);
+    printf("  weight tensor dim: batch=%zu, channel=%zu, height=%zu, width=%zu\n",
+           weight.getDim().batch(), weight.getDim().channel(),
+           weight.getDim().height(), weight.getDim().width());
+  }
+
+  if (mode_ == mode::embedding) {
+    unsigned int seq_len = input_.getDim().width();
+    incremental_forwarding(context, 0, seq_len, training);
+  } else if (mode_ == mode::lm_head) {
+    nntrainer::Tensor &weight = context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
+    nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+
+    std::cout << "LM Head Input: " << input_ << std::endl;
+    std::cout << "LM Head Weight: " << weight << std::endl;
+    // output = input @ weight^T (weight is stored transposed)
+    input_.dot(weight, hidden_, false, true);
+
+    if (auto &disable_bias = std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+        disable_bias.empty() || disable_bias.get() == false) {
+      nntrainer::Tensor &bias = context.getWeight(weight_idx[TieWordEmbeddingParams::bias]);
+      hidden_.add_i(bias);
+    }
+  } else {
+    throw std::invalid_argument("Unknown mode in TieWordEmbedding forwarding");
+  }
+}
 
 void TieWordEmbedding::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
+  printf("TieWordEmbedding::incremental_forwarding() entered - mode: %s, from: %u, to: %u\n",
+         mode_ == mode::embedding ? "embedding" : "lm_head", from, to);
 
   if (mode_ == mode::embedding)
     incremental_forwarding_embedding(context, from, to, training);
@@ -191,6 +233,8 @@ void TieWordEmbedding::incremental_forwarding(
 void TieWordEmbedding::incremental_forwarding_embedding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
+  printf("TieWordEmbedding::incremental_forwarding_embedding() entered\n");
+
   /// @todo get input and output dimension from input_ and hidden itself
   unsigned int in_dim =
     std::get<nntrainer::props::InDim>(tieword_embedding_props);
@@ -271,6 +315,8 @@ void TieWordEmbedding::incremental_forwarding_embedding(
 void TieWordEmbedding::incremental_forwarding_lmhead(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
+  printf("TieWordEmbedding::incremental_forwarding_lmhead() entered\n");
+
   nntrainer::Tensor weight =
     context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
 
@@ -290,9 +336,11 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
   unsigned int b_size = input_dim.batch();
 
   for (unsigned int b = 0; b < b_size; ++b) {
+    // For multi-token chunk processing, we shift to the last token of the active chunk.
     nntrainer::Tensor input_step = input_.getSharedDataTensor(
       input_step_dim,
-      b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
+      b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(),
+      true);
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
@@ -352,11 +400,87 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
 }
 
 void TieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
-  throw nntrainer::exception::not_supported(
-    "calcDerivative for Embedding layer is not supported");
+  printf("TieWordEmbedding::calcDerivative() entered - mode: %s\n",
+         mode_ == mode::embedding ? "embedding" : "lm_head");
+
+  if (mode_ == mode::lm_head) {
+    nntrainer::Tensor weight = context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
+    nntrainer::Tensor &dx = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
+    const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
+
+    // dx = dy @ weight (No transpose on weight!)
+    dy.dot(weight, dx, false, false);
+  }
 }
 
-void TieWordEmbedding::calcGradient(nntrainer::RunLayerContext &context) {}
+void TieWordEmbedding::calcGradient(nntrainer::RunLayerContext &context) {
+  printf("TieWordEmbedding::calcGradient() entered - mode: %s\n",
+         mode_ == mode::embedding ? "embedding" : "lm_head");
+
+  if (mode_ == mode::embedding) {
+    nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+    const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
+    nntrainer::Tensor &dweight = context.getWeightGrad(weight_idx[TieWordEmbeddingParams::weight]);
+    
+    float scale = std::get<nntrainer::props::Scale>(tieword_embedding_props).empty()
+      ? 1.0f : std::get<nntrainer::props::Scale>(tieword_embedding_props).get();
+
+    size_t batch = in.batch();
+    size_t seq_len = in.getDim().getFeatureLen();
+    unsigned int out_dim = std::get<nntrainer::props::OutDim>(tieword_embedding_props);
+    unsigned int in_dim = std::get<nntrainer::props::InDim>(tieword_embedding_props);
+    float *dw_data = dweight.getData<float>();
+    const float *dy_data = dy.getData<float>();
+
+    dweight.setZero();
+
+    for (size_t b = 0; b < batch; ++b) {
+      const float *in_data = in.getAddress<float>(b * in.getDim().getFeatureLen());
+      const float *dy_batch_data = dy_data + b * dy.getDim().getFeatureLen();
+      for (size_t i = 0; i < seq_len; ++i) {
+        unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
+        if (embed_idx >= in_dim) continue;
+        
+        float *dw_row = dw_data + embed_idx * out_dim;
+        const float *dy_row = dy_batch_data + i * out_dim;
+        for (size_t j = 0; j < out_dim; ++j) {
+           dw_row[j] += dy_row[j] * scale;
+        }
+      }
+    }
+  } else if (mode_ == mode::lm_head) {
+    nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+    const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
+    nntrainer::Tensor &dweight = context.getWeightGrad(weight_idx[TieWordEmbeddingParams::weight]);
+
+    // dweight = dy^T @ in = (out_dim, seq) @ (seq, in_dim) = (out_dim, in_dim)
+    dy.dot(in, dweight, true, false);
+
+    if (auto &disable_bias = std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+        disable_bias.empty() || disable_bias.get() == false) {
+      nntrainer::Tensor &dbias = context.getWeightGrad(weight_idx[TieWordEmbeddingParams::bias]);
+      dbias.setZero();
+      float *db_data = dbias.getData<float>();
+      const float *dy_data = dy.getData<float>();
+      
+      size_t batch = dy.batch();
+      size_t channel = dy.channel();
+      size_t height = dy.height();
+      size_t width = dy.width();
+      
+      for (size_t b = 0; b < batch; ++b) {
+        for (size_t c = 0; c < channel; ++c) {
+          for (size_t h = 0; h < height; ++h) {
+            size_t offset = b * channel * height * width + c * height * width + h * width;
+            for (size_t w = 0; w < width; ++w) {
+              db_data[w] += dy_data[offset + w];
+            }
+          }
+        }
+      }
+    }
+  }
+}
 
 void TieWordEmbedding::exportTo(nntrainer::Exporter &exporter,
                                 const ml::train::ExportMethods &method) const {
@@ -394,7 +518,7 @@ void TieWordEmbedding::read(
     for (unsigned int i = 0; i < context.getNumWeights(); ++i) {
       /// @note shared weights are only be read at the first acecss
       if (context.isGradientFirstAccess(i)) {
-        context.getWeight(i).read(file, start_offset, read_from_offset);
+        context.getWeight(i).read(file);
         if (context.isMixedPrecision(i) && trainable &&
             !context.getWeightFP32(i).empty()) {
           context.getWeightFP32(i).copyData(context.getWeight(i));

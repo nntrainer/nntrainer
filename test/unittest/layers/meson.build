@@ -103,6 +103,7 @@ test_target = [
   'unittest_layers_preprocess_flip.cpp',
   'unittest_layers_split.cpp',
   'unittest_layers_embedding.cpp',
+  'unittest_layers_tiewordembedding.cpp',
   'unittest_layers_concat.cpp',
   'unittest_layers_permute.cpp',
   'unittest_layers_attention.cpp',
