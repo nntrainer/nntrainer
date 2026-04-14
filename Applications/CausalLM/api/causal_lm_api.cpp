@@ -55,6 +55,7 @@ static std::string g_last_output = "";
 static double g_initialization_duration_ms = 0.0;
 static std::unique_ptr<causallm::ChatTemplate> g_chat_template;
 static std::string g_formatted_template;
+static std::string g_chat_template_name = "default";
 
 namespace {
 struct ChatMessage {
@@ -311,6 +312,9 @@ ErrorCode setOptions(Config config) {
   // Currently no options are being handled
   g_use_chat_template = config.use_chat_template;
   g_verbose = config.verbose;
+  g_chat_template_name =
+    (config.chat_template_name != nullptr) ? config.chat_template_name
+                                           : "default";
   if (config.debug_mode) {
     // Ensure models are registered so we can validate them
     register_models();
@@ -667,7 +671,9 @@ apply_chat_template_messages(const std::string &architecture,
     for (const auto &msg : messages) {
       request.push_back({{"role", msg.role}, {"content", msg.content}});
     }
-    return g_chat_template->apply(request);
+    causallm::ChatTemplate::Options opts;
+    opts.template_name = g_chat_template_name;
+    return g_chat_template->apply(request, opts);
   }
 
   std::string result;
