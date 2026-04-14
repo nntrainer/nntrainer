@@ -255,6 +255,29 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
 /************************************************************** */
 
+void MHACoreLayer::resetCache(nntrainer::RunLayerContext &context) {
+  cache_index = 0;
+  // Cache tensors are requested via requestTensor() during finalize but are
+  // not actually allocated until the first incremental_inference() call that
+  // triggers model_graph tensor allocation. resetConversation() may be
+  // invoked (by test harnesses, or by a user who resets before ever running
+  // a turn) before any inference has happened, in which case the cache
+  // tensors carry no backing memory yet and setZero() would crash. Zeroing
+  // is defense-in-depth anyway (cache_index=0 alone is sufficient because
+  // the attention read range is bounded by cache_index + step_size), so skip
+  // it when the tensor is not yet allocated.
+  nntrainer::Tensor &cache_key =
+    context.getTensor(tensor_idx[AttentionParams::cache_key]);
+  nntrainer::Tensor &cache_value =
+    context.getTensor(tensor_idx[AttentionParams::cache_value]);
+  if (cache_key.isAllocated())
+    cache_key.setZero();
+  if (cache_value.isAllocated())
+    cache_value.setZero();
+}
+
+/************************************************************** */
+
 /**
  * @note In external KV cache mode (use_external_cache == true), this
  *       implements the inference forward pass using cache tensors supplied

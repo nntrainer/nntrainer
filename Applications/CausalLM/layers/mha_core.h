@@ -309,6 +309,26 @@ public:
    */
   WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
 
+  /**
+   * @brief Reset KV cache write position to 0.
+   * @note  Rewinds the write pointer only. The cache tensor data is left
+   *        in place; subsequent incremental forwards overwrite the range
+   *        that is read during attention.
+   */
+  WIN_EXPORT void resetCache() { cache_index = 0; }
+
+  /**
+   * @brief Reset KV cache write position to 0 and zero the cache tensors.
+   * @param context Run-time layer context holding the cache tensors.
+   * @note  Defense-in-depth variant used when starting a fresh multi-turn
+   *        conversation. In addition to rewinding the write pointer, the
+   *        underlying cache_key / cache_value tensors are zero-filled so
+   *        that any stale KV entries from the previous conversation can
+   *        never be read, even if a future code path were to read beyond
+   *        the freshly-written range.
+   */
+  WIN_EXPORT void resetCache(nntrainer::RunLayerContext &context);
+
   inline static const std::string type = "mha_core";
 
 private:
