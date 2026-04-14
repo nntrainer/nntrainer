@@ -75,8 +75,9 @@ typedef struct {
   bool use_chat_template; /// < @brief Whether to apply chat template to input
   bool debug_mode; /// < @brief Check model file validity during initialization
   bool verbose;    /// < @brief Whether to print output during generation
-  const char *chat_template_name; /// < @brief Template name to select from array
-                                  ///  (e.g., "default", "tool_use"). NULL for "default".
+  const char
+    *chat_template_name; /// < @brief Template name to select from array
+                         ///  (e.g., "default", "tool_use"). NULL for "default".
 } Config;
 
 /**

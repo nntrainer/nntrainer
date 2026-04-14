@@ -312,9 +312,9 @@ ErrorCode setOptions(Config config) {
   // Currently no options are being handled
   g_use_chat_template = config.use_chat_template;
   g_verbose = config.verbose;
-  g_chat_template_name =
-    (config.chat_template_name != nullptr) ? config.chat_template_name
-                                           : "default";
+  g_chat_template_name = (config.chat_template_name != nullptr)
+                           ? config.chat_template_name
+                           : "default";
   if (config.debug_mode) {
     // Ensure models are registered so we can validate them
     register_models();
