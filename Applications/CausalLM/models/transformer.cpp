@@ -20,7 +20,6 @@
 #include <tokenizers_cpp.h>
 #include <transformer.h>
 
-#include <embedding_layer.h>
 #include <mha_core.h>
 #include <rms_norm.h>
 #include <swiglu.h>
@@ -507,7 +506,7 @@ void Transformer::registerCustomLayers() {
     app_context->registerFactory(
       nntrainer::createLayer<causallm::TieWordEmbedding>);
     app_context->registerFactory(
-      nntrainer::createLayer<causallm::EmbeddingLayer>);
+      nntrainer::createLayer<nntrainer::EmbeddingLayer>);
 
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()

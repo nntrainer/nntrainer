@@ -117,7 +117,9 @@ enum LayerType {
   LAYER_RMSNORM = ML_TRAIN_LAYER_TYPE_RMSNORM,      /**<RMS NORM Layer */
   LAYER_TRANSPOSE = ML_TRAIN_LAYER_TYPE_TRANSPOSE,  /**< Transpose Layer type */
   LAYER_CHANNEL_SHUFFLE =
-    ML_TRAIN_LAYER_TYPE_CHANNEL_SHUFFLE, /**< Channel Shuffle Layer type */
+    ML_TRAIN_LAYER_TYPE_CHANNEL_SHUFFLE,     /**< Channel Shuffle Layer type */
+  LAYER_EMBEDDING_LAYER =
+    ML_TRAIN_LAYER_TYPE_EMBEDDING_LAYER, /**< Embedding Layer type */
   LAYER_REDUCE_SUM =
     ML_TRAIN_LAYER_TYPE_REDUCE_SUM, /**< Reduce sum Layer type */
   LAYER_REDUCE_MEAN =
