@@ -599,6 +599,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/cpu_backend.h
 %{_includedir}/nntrainer/compute_ops.h
 %{_includedir}/nntrainer/context_data.h
+%{_includedir}/nntrainer/turboquant_utils.h
 %{_includedir}/nntrainer/fallback_internal.h
 %{_includedir}/nntrainer/fallback_kleidiai.h
 %if 0%{?use_cblas}

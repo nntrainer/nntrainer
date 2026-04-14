@@ -1502,6 +1502,35 @@ void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
                                        size_t scale_group_size,
                                        void *dst_q4_0x);
 
+/**
+ * @copydoc quantize_kv_turboquant in cpu_backend.h
+ */
+void quantize_kv_turboquant(const float *input, uint8_t *out_packed,
+                            float *out_norms, const float *rot_signs,
+                            int head_dim, int num_heads);
+
+/**
+ * @copydoc compute_kcaches_packed4 in cpu_backend.h
+ */
+void compute_kcaches_packed4(const float *query, const uint8_t *kcache_packed,
+                             const float *kcache_norms, float *output,
+                             int num_rows, int num_cache_head, int head_dim,
+                             int gqa_size, int tile_size,
+                             const float *rot_signs,
+                             size_t local_window_size = UINT_MAX,
+                             int head_start = 0, int head_end = -1);
+
+/**
+ * @copydoc compute_vcache_packed4 in cpu_backend.h
+ */
+void compute_vcache_packed4(int row_num, const float *attn_weights,
+                            const uint8_t *vcache_packed,
+                            const float *vcache_norms, float *output,
+                            int num_cache_head, int gqa_size, int head_dim,
+                            const float *rot_signs,
+                            size_t local_window_size = UINT_MAX,
+                            int head_start = 0, int head_end = -1);
+
 } /* namespace nntrainer */
 #endif /* __cplusplus */
 #endif /* __ARM_COMPUTE_BACKEND_H__ */

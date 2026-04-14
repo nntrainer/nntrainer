@@ -1,6 +1,7 @@
 cpu_backend_headers = [
   'cpu_backend.h',
   'compute_ops.h',
+  'turboquant_utils.h',
 ]
 
 nntrainer_sources += meson.current_source_dir() / 'compute_ops.cpp'
