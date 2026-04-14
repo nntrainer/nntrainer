@@ -81,6 +81,24 @@ public:
    */
   std::string getOutput(int batch_idx = 0) const;
 
+
+  /**
+   * @brief get the status of run
+   */
+  bool hasRun() const { return has_run_; }
+
+  /**
+   * @brief Reset multi-turn conversation state so the next run() starts a
+   *        fresh conversation on the same loaded model.
+   * @note  Clears accumulated token count, pending decoder tokens, the
+   *        last-turn output buffer, and resets the KV-cache write position
+   *        (cache_index) on every MHACoreLayer. The KV-cache tensor data
+   *        itself is not zeroed; subsequent writes overwrite the positions
+   *        that are read.
+   */
+  void resetConversation();
+
+
 protected:
   /**
    * @brief Setup the parameters for the CausalLM model
@@ -147,6 +165,8 @@ protected:
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
   unsigned int global_token_len;
+
+  bool has_run_ = false; /**< True after at least one successful run() */
 
   std::mt19937 rng; /**< Random Number Gen */
 

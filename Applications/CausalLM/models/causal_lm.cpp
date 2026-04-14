@@ -34,6 +34,7 @@
 
 #include <common.h>
 #include <layer_context.h>
+#include <layer_node.h>
 #include <lm_head.h>
 #include <mha_core.h>
 #include <nntrainer_error.h>
@@ -242,6 +243,42 @@ void CausalLM::registerOutputs(
       }
     }
   }
+}
+
+void CausalLM::resetConversation() {
+  global_token_len = 0;
+  SYS_PROMP_LEN = 0;
+  pending_ids_.clear();
+  output_list.clear();
+  has_run_ = false;
+
+  if (!model)
+    return;
+
+  // Reset cache_index in every MHACoreLayer and zero the underlying
+  // cache_key / cache_value tensors so no stale KV entries from the
+  // previous conversation can influence the next run.
+  //
+  // NeuralNetwork::forEachLayer hands us a reference to the LayerNode (which
+  // inherits from ml::train::Layer), not the concrete layer implementation.
+  // A direct dynamic_cast from ml::train::Layer& to MHACoreLayer* therefore
+  // always fails silently, which was the real root cause of cache_index
+  // leaking across turns (observed as cache_index(277) != _from(0) after a
+  // resetConversation()). Go through LayerNode::getLayer() to reach the
+  // wrapped implementation.
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context,
+            void * /*user_data*/) {
+      if (l.getType() != causallm::MHACoreLayer::type)
+        return;
+      auto *node = dynamic_cast<nntrainer::LayerNode *>(&l);
+      if (!node)
+        return;
+      auto *mha = dynamic_cast<causallm::MHACoreLayer *>(node->getLayer());
+      if (mha)
+        mha->resetCache(context);
+    };
+  model->forEachLayer(fn, nullptr);
 }
 
 void CausalLM::save_kvcache(std::string path, int to_) {
