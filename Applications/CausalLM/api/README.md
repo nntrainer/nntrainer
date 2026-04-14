@@ -96,7 +96,10 @@ Supported quantization formats.
 
 #### `ErrorCode setOptions(Config config)`
 Sets global configuration options.
-- **config**: Structure containing options like `use_chat_template` and `debug_mode`.
+- **config.use_chat_template**: Whether to apply chat template in `runModel()`.
+- **config.debug_mode**: Validate model files during initialization.
+- **config.verbose**: Print output during generation.
+- **config.chat_template_name**: Template name to select when `chat_template` is an array (e.g., `"default"`, `"tool_use"`). `NULL` defaults to `"default"`.
 
 #### `ErrorCode loadModel(BackendType compute, ModelType modeltype, ModelQuantizationType quant_type)`
 Loads a registered model.
@@ -237,3 +240,32 @@ int main() {
     // <|im_start|>assistant
 ```
 
+### 5. Named Template Selection (default / tool_use)
+
+When `tokenizer_config.json` contains an array of named templates, select by name:
+
+```c
+    // Use "default" template (normal conversation)
+    Config config;
+    config.use_chat_template = true;
+    config.chat_template_name = "default";
+    setOptions(config);
+    loadModel(...);
+
+    // Use "tool_use" template (function calling)
+    Config config;
+    config.use_chat_template = true;
+    config.chat_template_name = "tool_use";
+    setOptions(config);
+    loadModel(...);
+```
+
+Supported by models like Gemma3 that provide multiple templates:
+```json
+"chat_template": [
+    {"name": "default",  "template": "..."},
+    {"name": "tool_use", "template": "..."}
+]
+```
+
+If the requested name is not found, falls back to the first template with a warning.
