@@ -65,6 +65,7 @@ typedef enum {
  */
 typedef enum {
   CAUSAL_LM_MODEL_QWEN3_0_6B = 0,
+  CAUSAL_LM_MODEL_QWEN3_1_7B = 1,
 } ModelType;
 
 /**

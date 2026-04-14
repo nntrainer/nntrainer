@@ -99,7 +99,7 @@ void printUsage(const char *program_name) {
 
   std::cout << COLOR_CYAN << "Arguments:" << COLOR_RESET << "\n";
   std::cout << "  model_name        " << COLOR_BOLD << "REQUIRED" << COLOR_RESET
-            << "  - Model name (e.g., QWEN3-0.6B)\n";
+            << "  - Model name (e.g., QWEN3-0.6B, QWEN3-1.7B)\n";
   std::cout << "  prompt            " << COLOR_GREEN << "OPTIONAL"
             << COLOR_RESET
             << "  - Input prompt (default: 'Hello, how are you?')\n";
@@ -239,6 +239,8 @@ int main(int argc, char *argv[]) {
   std::string model_name_str(model_name);
   if (model_name_str == "QWEN3-0.6B") {
     model_type = CAUSAL_LM_MODEL_QWEN3_0_6B;
+  } else if (model_name_str == "QWEN3-1.7B") {
+    model_type = CAUSAL_LM_MODEL_QWEN3_1_7B;
   } else {
     std::cout << COLOR_YELLOW << "⚠ Warning: Unknown model name '"
               << model_name_str << "'. Defaulting to QWEN3-0.6B." << COLOR_RESET
