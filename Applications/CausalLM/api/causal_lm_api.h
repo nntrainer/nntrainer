@@ -135,6 +135,20 @@ WIN_EXPORT ErrorCode runModel(const char *inputTextPrompt,
                               const char **outputText);
 
 /**
+ * @brief Reset multi-turn conversation state.
+ *
+ * After this call, the next runModel() invocation starts a fresh
+ * conversation on the same loaded model: the KV-cache write position is
+ * rewound, accumulated token count is zeroed, and any pending decoder
+ * tokens from a prior turn are dropped. The loaded model weights and
+ * tokenizer are NOT touched.
+ *
+ * @return CAUSAL_LM_ERROR_NONE on success,
+ *         CAUSAL_LM_ERROR_NOT_INITIALIZED if no model is loaded.
+ */
+WIN_EXPORT ErrorCode resetConversation(void);
+
+/**
  * @brief Run inference with chat template formatted messages
  * @param messages Array of chat messages with role and content
  * @param num_messages Number of messages in the array

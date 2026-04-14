@@ -53,6 +53,7 @@ static bool g_use_chat_template = false;
 static bool g_verbose = false;
 static std::string g_last_output = "";
 static double g_initialization_duration_ms = 0.0;
+static unsigned int g_turn_count = 0;
 static std::unique_ptr<causallm::ChatTemplate> g_chat_template;
 static std::string g_formatted_template;
 static std::string g_chat_template_name = "default";
@@ -185,6 +186,48 @@ static std::string apply_chat_template(const std::string &architecture,
            "<end_of_turn>\n<start_of_turn>model\n";
   }
   return input;
+}
+
+/**
+ * @brief Turn a freshly-rendered chat template into a continuation snippet
+ *        that splices cleanly onto an existing KV cache.
+ *
+ * Chat templates always re-render the full preamble (an auto-inserted
+ * system block, if no explicit system message was provided, followed by
+ * the user block and the generation prompt). On turn 0 that's exactly
+ * what we want. On turn N>0 the KV cache already contains the system
+ * preamble plus every prior user/assistant exchange, so we must:
+ *   1. strip the system prefix that the template re-emitted, and
+ *   2. insert a leading "\n" so the transition from the previous turn's
+ *      end-of-turn token to the new user block matches the pattern the
+ *      template itself uses between turns (e.g. Qwen's
+ *      "<|im_end|>\n<|im_start|>user").
+ *
+ * Unknown templates are returned unchanged with a leading "\n" — the
+ * newline is the minimal separator that is safe across ChatML, Gemma,
+ * and Llama-style formats.
+ */
+static std::string to_continuation(const std::string &templated) {
+  struct Marker {
+    const char *sys;
+    const char *user;
+  };
+  static const Marker markers[] = {
+    {"<|im_start|>system", "<|im_start|>user"},       // Qwen / ChatML
+    {"<start_of_turn>system", "<start_of_turn>user"}, // Gemma
+    {"<<SYS>>", "[INST]"},                            // Llama-2 style
+  };
+  for (const auto &m : markers) {
+    const size_t sys_len = std::strlen(m.sys);
+    if (templated.size() >= sys_len &&
+        templated.compare(0, sys_len, m.sys) == 0) {
+      const auto pos = templated.find(m.user);
+      if (pos != std::string::npos)
+        return "\n" + templated.substr(pos);
+      break;
+    }
+  }
+  return "\n" + templated;
 }
 
 static std::string get_quantization_suffix(ModelQuantizationType type) {
@@ -555,6 +598,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
 
     g_initialized = true;
     g_architecture = architecture;
+    g_turn_count = 0;
 
     auto finish_init = std::chrono::high_resolution_clock::now();
     auto init_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -587,6 +631,14 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
 
     if (g_use_chat_template) {
       input = apply_chat_template(g_architecture, input);
+      // On continuation turns, the KV cache already holds the system
+      // preamble and all prior Q/A pairs. Splice the freshly-rendered
+      // template onto that state by stripping the re-emitted system
+      // prefix and inserting a leading "\n" separator. resetConversation()
+      // zeroes g_turn_count, so turn 0 of a fresh dialogue is unaffected.
+      if (g_turn_count > 0) {
+        input = to_continuation(input);
+      }
     }
 
     // We assume single batch request for this API.
@@ -600,9 +652,33 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
 
     *outputText = g_last_output.c_str();
 
+    ++g_turn_count;
+
   } catch (const std::exception &e) {
     std::cerr << "Exception in runModel: " << e.what() << std::endl;
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
+  }
+
+  return CAUSAL_LM_ERROR_NONE;
+}
+
+ErrorCode resetConversation(void) {
+  if (!g_initialized || !g_model) {
+    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+  }
+
+  try {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
+    if (!causal_lm_model) {
+      return CAUSAL_LM_ERROR_UNKNOWN;
+    }
+    causal_lm_model->resetConversation();
+    g_last_output.clear();
+    g_turn_count = 0;
+  } catch (const std::exception &e) {
+    std::cerr << "Exception in resetConversation: " << e.what() << std::endl;
+    return CAUSAL_LM_ERROR_UNKNOWN;
   }
 
   return CAUSAL_LM_ERROR_NONE;
