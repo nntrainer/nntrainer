@@ -616,6 +616,35 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
   return CAUSAL_LM_ERROR_NONE;
 }
 
+// Run inference on a fully-prepared prompt string. Caller is responsible
+// for any chat-template formatting and continuation splicing - this helper
+// must NOT re-apply them, otherwise paths that pre-format the prompt (e.g.
+// runModelWithMessages) end up double-wrapping the entire transcript as a
+// new user message and corrupt multi-turn behavior.
+//
+// Caller MUST hold g_mutex.
+static ErrorCode runModelInternal(const std::string &input,
+                                  const char **outputText) {
+// We assume single batch request for this API
+#if defined(_WIN32)
+  g_model->run(std::wstring(input.begin(), input.end()), false, L"", L"",
+               g_verbose);
+#else
+  g_model->run(input, false, "", "", g_verbose);
+#endif
+
+  auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
+  g_last_output = ""; // Reset last output
+  if (causal_lm_model) {
+    g_last_output = causal_lm_model->getOutput(0);
+  }
+
+  *outputText = g_last_output.c_str();
+
+  ++g_turn_count;
+  return CAUSAL_LM_ERROR_NONE;
+}
+
 ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
   if (!g_initialized || !g_model) {
     return CAUSAL_LM_ERROR_NOT_INITIALIZED;
@@ -641,25 +670,12 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
       }
     }
 
-    // We assume single batch request for this API.
-    g_model->run(input, false, "", "", g_verbose);
-
-    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
-    g_last_output = ""; // Reset last output
-    if (causal_lm_model) {
-      g_last_output = causal_lm_model->getOutput(0);
-    }
-
-    *outputText = g_last_output.c_str();
-
-    ++g_turn_count;
+    return runModelInternal(input, outputText);
 
   } catch (const std::exception &e) {
     std::cerr << "Exception in runModel: " << e.what() << std::endl;
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   }
-
-  return CAUSAL_LM_ERROR_NONE;
 }
 
 ErrorCode resetConversation(void) {
@@ -828,18 +844,27 @@ ErrorCode runModelWithMessages(const CausalLMChatMessage *messages,
   if (!g_initialized || !g_model) {
     return CAUSAL_LM_ERROR_NOT_INITIALIZED;
   }
-  if (outputText == nullptr) {
+  if (messages == nullptr || num_messages == 0 || outputText == nullptr) {
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
 
-  // Apply chat template to format the prompt
-  const char *formattedInput = nullptr;
-  ErrorCode err = applyChatTemplate(messages, num_messages,
-                                    add_generation_prompt, &formattedInput);
-  if (err != CAUSAL_LM_ERROR_NONE) {
-    return err;
-  }
+  try {
+    std::lock_guard<std::mutex> lock(g_mutex);
 
-  // Run inference with the formatted prompt
-  return runModel(formattedInput, outputText);
+    // The caller passes the entire conversation as a message array, so the
+    // chat template is applied exactly once here. We MUST NOT funnel the
+    // result back through runModel() - that would invoke
+    // apply_chat_template() a second time and wrap the already-rendered
+    // transcript as a brand new user turn, breaking multi-turn behavior.
+    auto chat_messages = convertMessages(messages, num_messages);
+    std::string formatted = apply_chat_template_messages(
+      g_architecture, chat_messages, add_generation_prompt);
+
+    return runModelInternal(formatted, outputText);
+
+  } catch (const std::exception &e) {
+    std::cerr << "Exception in runModelWithMessages: " << e.what()
+              << std::endl;
+    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
+  }
 }
