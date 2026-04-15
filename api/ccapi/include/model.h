@@ -203,13 +203,6 @@ public:
   virtual int initialize(ExecutionMode exec_mode_ = ExecutionMode::TRAIN) = 0;
 
   /**
-   * @brief     Reinitialize Network. This should be called after initialize
-   * @retval #ML_ERROR_NONE Successful.
-   * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
-   */
-  virtual int reinitialize() = 0;
-
-  /**
    * @brief  save model states and training parameters from a file
    * @param[in] file_path file_path to save the model, if full path is not
    * given, it should be saved inside working directory

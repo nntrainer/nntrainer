@@ -122,13 +122,6 @@ TEST_P(nntrainerGraphTest, loadConfig) {
     EXPECT_EQ(status, ML_ERROR_NONE);
   }
 
-  status = NN.reinitialize();
-  if (failAtLoad()) {
-    EXPECT_NE(status, ML_ERROR_NONE);
-  } else {
-    EXPECT_EQ(status, ML_ERROR_NONE);
-  }
-
   status = NN.allocate();
   if (failAtLoad()) {
     EXPECT_NE(status, ML_ERROR_NONE);

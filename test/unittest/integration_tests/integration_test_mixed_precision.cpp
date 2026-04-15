@@ -46,7 +46,6 @@ TEST(mixed_precision, input_only_model_test) {
 
   EXPECT_EQ(nn->compile(), ML_ERROR_NONE);
   EXPECT_EQ(nn->initialize(), ML_ERROR_NONE);
-  EXPECT_EQ(nn->reinitialize(), ML_ERROR_NONE);
 }
 
 TEST(mixed_precision, conv1d_model_test) {
@@ -72,7 +71,6 @@ TEST(mixed_precision, conv1d_model_test) {
 
   EXPECT_EQ(nn->compile(), ML_ERROR_NONE);
   EXPECT_EQ(nn->initialize(), ML_ERROR_NONE);
-  EXPECT_EQ(nn->reinitialize(), ML_ERROR_NONE);
 }
 
 TEST(mixed_precision, lstm_test) {
@@ -99,7 +97,6 @@ TEST(mixed_precision, lstm_test) {
 
   EXPECT_EQ(nn->compile(), ML_ERROR_NONE);
   EXPECT_EQ(nn->initialize(), ML_ERROR_NONE);
-  EXPECT_EQ(nn->reinitialize(), ML_ERROR_NONE);
 }
 
 TEST(mixed_precision, loss_scale_test) {

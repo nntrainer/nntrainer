@@ -276,22 +276,6 @@ public:
            std::array<std::string, 3> tensor_type = {"NCHW", "FP32", "FP32"},
            ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN);
 
-  /**
-   * @brief     Refinalize creating the layer node
-   *
-   * @param   input_dims input dimension provided to be used to set output
-   * dimensions. if empty function This function must set output dimensions in
-   * the given context. Further, context can be used to request weights for the
-   * layer, and any extra tensor required for the operation of the layer.
-   * @note      After calling this it is not allowed to
-   * change properties.
-   * @note      No memory allocation must be performed in the reinitialization
-   * step. Any tensor memory required must be requested to the context which
-   * will be made available during execution of the layer with the context.
-   * @note configureRunContext() is expected to called right after this.
-   */
-  InitLayerContext refinalize(const std::vector<TensorDim> &input_dims = {});
-
   void initialize() override { layer->initialize(*run_context); }
 
   /**

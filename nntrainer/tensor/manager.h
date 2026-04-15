@@ -519,11 +519,6 @@ public:
   void UnloadTensors(unsigned int order);
 
   /**
-   * @brief     reinitialize manager
-   */
-  void reinitialize();
-
-  /**
    * @brief     set Execution Mode
    */
   void setExecutionMode(ExecutionMode mode = ExecutionMode::TRAIN) {

@@ -297,41 +297,6 @@ int NeuralNetwork::initialize(ExecutionMode mode) {
   return status;
 }
 
-int NeuralNetwork::reinitialize() {
-  int status = ML_ERROR_NONE;
-
-  if (!initialized) {
-    ml_loge("Error: Need to initialize first");
-    return ML_ERROR_NOT_SUPPORTED;
-  }
-
-  unsigned int n_layers = (unsigned int)model_graph.size();
-
-  ml_logd("reinitializing neural network, layer size: %d", n_layers);
-  PROFILE_MEM_ANNOTATE("Reinitialize");
-
-  auto &input_conn_prop =
-    std::get<std::vector<props::InputConnection>>(model_props);
-  auto &label_layer_prop =
-    std::get<std::vector<props::LabelLayer>>(model_props);
-
-  std::vector<Connection> input_conn(input_conn_prop.begin(),
-                                     input_conn_prop.end());
-  std::vector<std::string> label_layers;
-
-  if (!label_layer_prop.empty()) {
-    label_layers = std::vector<std::string>(label_layer_prop.begin(),
-                                            label_layer_prop.end());
-  }
-
-  status = model_graph.reinitialize(
-    input_conn,
-    std::vector<Connection>(label_layers.begin(), label_layers.end()));
-  NN_RETURN_STATUS();
-
-  return status;
-}
-
 /**
  * @brief     free layers
  */

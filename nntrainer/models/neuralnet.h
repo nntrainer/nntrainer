@@ -181,13 +181,6 @@ public:
   int initialize(ExecutionMode mode = ExecutionMode::TRAIN) override;
 
   /**
-   * @brief     Reinitialize Network. This should be called after initialize
-   * @retval #ML_ERROR_NONE Successful.
-   * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
-   */
-  int reinitialize() override;
-
-  /**
    * @brief     Allocate memory for the model. This should be called after
    * initialize.
    * @param[in] exec_mode allocate memory based on the given execution mode
