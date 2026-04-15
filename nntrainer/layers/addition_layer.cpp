@@ -29,6 +29,20 @@ void AdditionLayer::finalize(InitLayerContext &context) {
   context.setOutputDimensions(output_dims);
 }
 
+std::vector<TensorDim>
+AdditionLayer::updateTensorsByInputDimensions(InitLayerContext &init_context,
+                                              RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  for (size_t i = 0; i < run_context.getNumInputs(); ++i) {
+    run_context.updateInput(i, init_context.getInputDimensions()[i]);
+  }
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
+
+  return output_dims;
+}
+
 void AdditionLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
 
@@ -97,15 +111,6 @@ void AdditionLayer::setProperty(const std::vector<std::string> &values) {
                       std::to_string(values.size());
     throw exception::not_supported(msg);
   }
-}
-
-void AdditionLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  for (size_t i = 0; i < context.getNumInputs(); ++i) {
-    context.updateInput(i, input_dimensions[0]);
-  }
-  context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
 }
 
 std::array<std::vector<TensorDim>, 3>

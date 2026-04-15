@@ -63,6 +63,14 @@ public:
   WIN_EXPORT void finalize(nntrainer::InitLayerContext &context) override;
 
   /**
+   * @copydoc Layer::updateTensorsByInputDimensions(InitLayerContext
+   * &init_context, RunLayerContext &context)
+   */
+  WIN_EXPORT std::vector<nntrainer::TensorDim> updateTensorsByInputDimensions(
+    nntrainer::InitLayerContext &init_context,
+    nntrainer::RunLayerContext &run_context) override;
+
+  /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
    */
   WIN_EXPORT void forwarding(nntrainer::RunLayerContext &context,
@@ -105,10 +113,6 @@ public:
    * @copydoc Layer::supportBackwarding()
    */
   WIN_EXPORT bool supportBackwarding() const override { return false; }
-
-  WIN_EXPORT void updateTensorsByInputDimensions(
-    nntrainer::RunLayerContext &context,
-    std::vector<nntrainer::TensorDim> input_dimensions) override;
 
   /**
    * @copydoc Layer::read()

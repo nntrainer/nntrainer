@@ -122,6 +122,18 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   }
 }
 
+std::vector<TensorDim> FullyConnectedLayer::updateTensorsByInputDimensions(
+  InitLayerContext &init_context, RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
+
+  return output_dims;
+}
+
 void FullyConnectedLayer::exportTo(
   Exporter &exporter, const ml::train::ExportMethods &method) const {
   LayerImpl::exportTo(exporter, method);

@@ -65,6 +65,19 @@ void LmHeadLayer::finalize(nntrainer::InitLayerContext &context) {
   }
 }
 
+std::vector<nntrainer::TensorDim> LmHeadLayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
+
+  return output_dims;
+}
+
 void LmHeadLayer::setProperty(const std::vector<std::string> &values) {
   auto remain_props = loadProperties(values, lmhead_props);
   LayerImpl::setProperty(remain_props);
@@ -131,18 +144,6 @@ void LmHeadLayer::exportTo(nntrainer::Exporter &exporter,
                            const ml::train::ExportMethods &method) const {
   LayerImpl::exportTo(exporter, method);
   exporter.saveResult(lmhead_props, method, this);
-}
-
-void LmHeadLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  nntrainer::TensorDim in_dim = context.getInput(SINGLE_INOUT_IDX).getDim();
-
-  unsigned int height = input_dimensions[0].height();
-
-  // output dim's height is always 1 !
-  in_dim.height(height);
-  context.updateInput(SINGLE_INOUT_IDX, in_dim);
 }
 
 std::array<std::vector<nntrainer::TensorDim>, 3>

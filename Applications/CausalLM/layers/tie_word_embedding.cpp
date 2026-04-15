@@ -120,6 +120,21 @@ void TieWordEmbedding::finalize_lmhead(nntrainer::InitLayerContext &context) {
   }
 }
 
+std::vector<nntrainer::TensorDim>
+TieWordEmbedding::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
+
+  return output_dims;
+}
+
 void TieWordEmbedding::setProperty(const std::vector<std::string> &values) {
   auto remain_props = loadProperties(values, tieword_embedding_props);
   LayerImpl::setProperty(remain_props);
@@ -314,25 +329,6 @@ void TieWordEmbedding::exportTo(nntrainer::Exporter &exporter,
                                 const ml::train::ExportMethods &method) const {
   LayerImpl::exportTo(exporter, method);
   exporter.saveResult(tieword_embedding_props, method, this);
-}
-
-void TieWordEmbedding::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  nntrainer::TensorDim in_dim = context.getInput(SINGLE_INOUT_IDX).getDim();
-  nntrainer::TensorDim out_dim = context.getOutput(SINGLE_INOUT_IDX).getDim();
-
-  unsigned int height = input_dimensions[0].height();
-
-  if (mode_ == mode::embedding) {
-    in_dim.width(height);
-  } else {
-    in_dim.height(height);
-  }
-  out_dim.height(height);
-
-  context.updateInput(SINGLE_INOUT_IDX, in_dim);
-  context.updateOutput(SINGLE_INOUT_IDX, out_dim);
 }
 
 void TieWordEmbedding::read(

@@ -331,15 +331,54 @@ void NetworkGraph::setBatchSize(unsigned int batch_size) {
     label_dims_[idx] = tensor_manager->getTensor(label_list[idx])->getDim();
 }
 
-void NetworkGraph::resetInputDimension(std::vector<TensorDim> dims) {
+void NetworkGraph::resetInputDimension(
+  std::vector<TensorDim> model_input_dims) {
   auto allocated = tensor_manager->isAllocated();
 
   if (allocated)
     deallocateTensors();
 
-  for (auto iter = cbegin(); iter != cend(); iter++) {
-    if ((*iter)->isFinalized()) {
-      (*iter)->updateTensorsByInputDimensions(dims);
+  std::unordered_map<std::string, std::vector<TensorDim>> input_map;
+
+  auto is_input_node = [](const LayerNode *node) -> bool {
+    return node->getInputConnections().empty();
+  };
+
+  size_t cnt = 0;
+
+  for (unsigned int idx = 0; idx < graph.size() - 1; ++idx) {
+    auto const &lnode = getSortedLayerNode(idx);
+    std::vector<TensorDim> input_dims = {};
+    if (!is_input_node(lnode.get())) {
+      input_dims = input_map.at(getSortedLayerNode(idx)->getName());
+    } else {
+      input_dims = {model_input_dims[cnt++]};
+    }
+
+    auto output_dims = lnode->updateTensorsByInputDimensions(input_dims);
+
+    for (auto i = 0u, num_node = lnode->getNumOutputConnections(); i < num_node;
+         ++i) {
+      auto conn = lnode->getOutputConnection(i);
+      if (!conn) {
+        ml_logi("out connection not defined for  %s, %u",
+                lnode->getName().c_str(), i);
+        continue;
+      }
+
+      auto sink_node = getLayerNode(conn->getName());
+      [[maybe_unused]] auto [it, b] =
+        input_map.try_emplace({sink_node->getName(), {}});
+
+      NNTR_THROW_IF(sink_node->getInputConnectionName(conn->getIndex()) !=
+                      lnode->getName(),
+                    std::invalid_argument)
+        << "node pair does not match between " << lnode->getName() << ' '
+        << sink_node->getName();
+
+      auto &sink_tensors = it->second;
+      sink_tensors.resize(sink_node->getNumInputConnections());
+      sink_tensors[conn->getIndex()] = output_dims[i];
     }
   }
 

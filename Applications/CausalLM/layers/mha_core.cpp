@@ -194,6 +194,40 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   }
 }
 
+std::vector<nntrainer::TensorDim> MHACoreLayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(
+    INOUT_INDEX::QUERY, init_context.getInputDimensions()[INOUT_INDEX::QUERY]);
+  run_context.updateInput(INOUT_INDEX::KEY,
+                          init_context.getInputDimensions()[INOUT_INDEX::KEY]);
+  run_context.updateInput(
+    INOUT_INDEX::VALUE, init_context.getInputDimensions()[INOUT_INDEX::VALUE]);
+  run_context.updateOutput(INOUT_INDEX::OUTPUT,
+                           output_dims[INOUT_INDEX::OUTPUT]);
+
+  unsigned int height = init_context.getInputDimensions()[0].height();
+  unsigned int &max_timestep =
+    std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
+  unsigned int &max_new_tokens =
+    std::get<props::MaxNewTokens>(mha_core_props).get();
+
+  max_timestep = height + max_new_tokens;
+
+  tensor_dims[AttentionParams::cache_key].height(max_timestep);
+  tensor_dims[AttentionParams::cache_value].height(max_timestep);
+
+  run_context.updateTensor(tensor_idx[AttentionParams::cache_key],
+                           tensor_dims[AttentionParams::cache_key]);
+  run_context.updateTensor(tensor_idx[AttentionParams::cache_value],
+                           tensor_dims[AttentionParams::cache_value]);
+
+  return output_dims;
+}
+
 /************************************************************** */
 
 /**
@@ -1407,38 +1441,6 @@ void MHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
   if (dropout_rate > epsilon) {
     context.updateTensor(tensor_idx[AttentionParams::dropout_mask], batch);
   }
-}
-
-void MHACoreLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  unsigned int height = input_dimensions[0].height();
-  unsigned int &max_timestep =
-    std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
-  unsigned int &max_new_tokens =
-    std::get<props::MaxNewTokens>(mha_core_props).get();
-  max_position_embeddings =
-    std::get<props::MaxPositionEmbeddings>(mha_core_props).get();
-  max_timestep = height + max_new_tokens;
-
-  ml::train::TensorDim kv_dim = input_dimensions[0];
-  kv_dim.width(kv_dim.width() / (num_heads_Q / num_heads_KV));
-
-  ml::train::TensorDim kv_cache_dim = kv_dim;
-#ifdef ENABLE_FP16
-  kv_cache_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-#else
-  kv_cache_dim.setDataType(ml::train::TensorDim::DataType::UINT16);
-#endif
-  kv_cache_dim.height(max_timestep);
-
-  context.updateInput(INOUT_INDEX::QUERY, input_dimensions[0]);
-  context.updateInput(INOUT_INDEX::KEY, kv_dim);
-  context.updateInput(INOUT_INDEX::VALUE, kv_dim);
-  context.updateOutput(0, input_dimensions[0]);
-
-  context.updateTensor(tensor_idx[AttentionParams::cache_key], kv_cache_dim);
-  context.updateTensor(tensor_idx[AttentionParams::cache_value], kv_cache_dim);
 }
 
 void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {}

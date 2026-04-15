@@ -84,11 +84,17 @@ void InputLayer::finalize(InitLayerContext &context) {
     is_inplace = false;
 }
 
-void InputLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
-  context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
+std::vector<TensorDim>
+InputLayer::updateTensorsByInputDimensions(InitLayerContext &init_context,
+                                           RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
+
+  return output_dims;
 }
 
 std::array<std::vector<TensorDim>, 3>

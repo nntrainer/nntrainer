@@ -28,6 +28,21 @@ void MultiOutLayer::finalize(InitLayerContext &context) {
   context.setOutputDimensions(output_dims);
 }
 
+std::vector<TensorDim>
+MultiOutLayer::updateTensorsByInputDimensions(InitLayerContext &init_context,
+                                              RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  for (size_t i = 0; i < run_context.getNumOutputs(); ++i) {
+    run_context.updateOutput(i, output_dims[i]);
+  }
+
+  return output_dims;
+}
+
 void MultiOutLayer::forwarding(RunLayerContext &context, bool training) {
   if (!context.getInPlace()) {
     const Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
@@ -84,16 +99,6 @@ void MultiOutLayer::setProperty(const std::vector<std::string> &values) {
     std::string msg = "[MultioutLayer] Unknown Layer Properties count " +
                       std::to_string(values.size());
     throw exception::not_supported(msg);
-  }
-}
-
-void MultiOutLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
-
-  for (size_t i = 0; i < context.getNumOutputs(); ++i) {
-    context.updateOutput(i, input_dimensions[0]);
   }
 }
 

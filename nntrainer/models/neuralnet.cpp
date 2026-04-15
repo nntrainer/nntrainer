@@ -1420,8 +1420,11 @@ std::vector<float *> NeuralNetwork::incremental_inference(
   return output;
 }
 
-void NeuralNetwork::resetInputDimension(std::vector<TensorDim> dims) {
-  model_graph.resetInputDimension(dims);
+void NeuralNetwork::resetInputDimension(
+  std::vector<TensorDim> model_input_dims) {
+  if (initialized) {
+    model_graph.resetInputDimension(model_input_dims);
+  }
 }
 
 int NeuralNetwork::setDataset(const DatasetModeType &mode,

@@ -116,10 +116,6 @@ public:
    */
   bool supportBackwarding() const override { return false; }
 
-  void updateTensorsByInputDimensions(
-    nntrainer::RunLayerContext &context,
-    std::vector<nntrainer::TensorDim> input_dimensions) override;
-
   static constexpr const char *type =
     "moe_cached_slim"; /**< type of the layer */
 

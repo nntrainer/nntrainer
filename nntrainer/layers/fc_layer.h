@@ -54,6 +54,14 @@ public:
   void finalize(InitLayerContext &context) override;
 
   /**
+   * @copydoc Layer::updateTensorsByInputDimensions(InitLayerContext
+   * &init_context, RunLayerContext &context)
+   */
+  std::vector<TensorDim>
+  updateTensorsByInputDimensions(InitLayerContext &init_context,
+                                 RunLayerContext &context) override;
+
+  /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
    */
   void forwarding(RunLayerContext &context, bool training) override;

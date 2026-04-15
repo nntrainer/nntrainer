@@ -72,6 +72,21 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
     weight_regularizer_constant, weight_decay, "vweight", true);
 }
 
+std::vector<nntrainer::TensorDim> QKVLayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(QKVParams::Q, output_dims[QKVParams::Q]);
+  run_context.updateOutput(QKVParams::K, output_dims[QKVParams::K]);
+  run_context.updateOutput(QKVParams::V, output_dims[QKVParams::V]);
+
+  return output_dims;
+}
+
 void QKVLayer::exportTo(nntrainer::Exporter &exporter,
                         const ml::train::ExportMethods &method) const {
   LayerImpl::exportTo(exporter, method);
@@ -137,25 +152,6 @@ void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 void QKVLayer::calcDerivative(nntrainer::RunLayerContext &context) { return; }
 
 void QKVLayer::calcGradient(nntrainer::RunLayerContext &context) { return; }
-
-void QKVLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  ml::train::TensorDim input_dim = context.getInput(SINGLE_INOUT_IDX).getDim();
-  ml::train::TensorDim Qoutput_dim = context.getOutput(QKVParams::Q).getDim();
-  ml::train::TensorDim Koutput_dim = context.getOutput(QKVParams::K).getDim();
-  ml::train::TensorDim Voutput_dim = context.getOutput(QKVParams::V).getDim();
-
-  input_dim.height(input_dimensions[0].height());
-  Qoutput_dim.height(input_dimensions[0].height());
-  Koutput_dim.height(input_dimensions[0].height());
-  Voutput_dim.height(input_dimensions[0].height());
-
-  context.updateInput(SINGLE_INOUT_IDX, input_dim);
-  context.updateOutput(QKVParams::Q, Qoutput_dim);
-  context.updateOutput(QKVParams::K, Koutput_dim);
-  context.updateOutput(QKVParams::V, Voutput_dim);
-}
 
 std::array<std::vector<nntrainer::TensorDim>, 3>
 QKVLayer::getLayerDimensions(nntrainer::InitLayerContext &context) {

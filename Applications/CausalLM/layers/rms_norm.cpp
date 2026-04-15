@@ -32,6 +32,19 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
     nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", false);
 }
 
+std::vector<nntrainer::TensorDim> RMSNormLayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
+
+  return output_dims;
+}
+
 void RMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {}
 
@@ -80,13 +93,6 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
               << "output:" << out_step << "gamma:" << gamma << std::endl;
 #endif
   }
-}
-
-void RMSNormLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
-  context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
 }
 
 void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {

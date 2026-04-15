@@ -668,9 +668,7 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
 
   layer->finalize(context);
 
-#ifdef ENABLE_TEST
   init_context = std::make_unique<InitLayerContext>(context);
-#endif // ENABLE_TEST
 
 #ifdef PROFILE
   auto profile_name = [this](const char *suffix) {
@@ -891,12 +889,15 @@ void LayerNode::setBatch(unsigned int batch) {
   getLayer()->setBatch(*run_context, batch);
 }
 
-void LayerNode::updateTensorsByInputDimensions(
+std::vector<TensorDim> LayerNode::updateTensorsByInputDimensions(
   std::vector<TensorDim> input_dimensions) {
   NNTR_THROW_IF(!run_context, std::invalid_argument)
     << " update tensors not supported before initialization";
 
-  getLayer()->updateTensorsByInputDimensions(*run_context, input_dimensions);
+  init_context->setInputDimension(input_dimensions);
+
+  return getLayer()->updateTensorsByInputDimensions(*init_context,
+                                                    *run_context);
 }
 
 /**
