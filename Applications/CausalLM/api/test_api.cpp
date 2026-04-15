@@ -514,7 +514,9 @@ int main(int argc, char *argv[]) {
 
   printSection("Initialization");
   std::cout << COLOR_CYAN << "⏳ " << COLOR_RESET << "Configuring options...\n";
-  Config config;
+  // Value-initialize so any field not explicitly assigned (now or after a
+  // future Config extension) is zero / NULL rather than indeterminate.
+  Config config = {};
   config.use_chat_template = use_chat_template;
   config.debug_mode = true;
   config.verbose = verbose;

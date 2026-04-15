@@ -70,6 +70,16 @@ typedef enum {
 
 /**
  * @brief Configuration structure
+ *
+ * @warning Callers MUST value-initialize this struct before populating it
+ *          (e.g. `Config config = {};` in C++ or `Config config = {0};` in
+ *          C). The struct contains pointer fields whose indeterminate value
+ *          would otherwise be dereferenced by setOptions(); leaving any
+ *          field uninitialized is undefined behavior. This is especially
+ *          important for callers compiled before a new field was added -
+ *          value-initialization gives newly introduced pointer fields a
+ *          defined NULL default that setOptions() interprets as "use the
+ *          built-in default".
  */
 typedef struct {
   // Add configuration options here as needed
