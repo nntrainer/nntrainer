@@ -90,6 +90,9 @@ enum LayerType {
   LAYER_MULTI_HEAD_ATTENTION =
     ML_TRAIN_LAYER_TYPE_MULTI_HEAD_ATTENTION, /**< Multi Head Attention Layer
                                                  type */
+  LAYER_CUSTOM_MHA_CORE =
+    ML_TRAIN_LAYER_TYPE_MULTI_HEAD_ATTENTION + 1, /**< Custom MHA Core Layer
+                                                 type */
   LAYER_LAYER_NORMALIZATION =
     ML_TRAIN_LAYER_TYPE_LAYER_NORMALIZATION, /**< Layer Normalization Layer type
                                               */

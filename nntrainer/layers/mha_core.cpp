@@ -20,9 +20,9 @@
 
 static std::mutex rope_init_mtx;
 
+#include <mha_core.h>
 #include <fp16.h>
 #include <layer_context.h>
-#include <mha_core.h>
 #include <nntrainer_error.h>
 #include <node_exporter.h>
 #include <thread_manager.h>
@@ -251,6 +251,40 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   output_dims[0].setTensorType(
     {context.getFormat(), context.getActivationDataType()});
   context.setOutputDimensions(output_dims);
+
+  /** Allocate training tensors for backward pass */
+  if (context.getExecutionMode() == ml::train::ExecutionMode::TRAIN) {
+    const unsigned int batch_size = query_dim.batch();
+    const unsigned int seq_len = query_dim.height();
+
+    // RoPE-applied Q: (batch, num_heads_Q, seq_len, head_dim)
+    ml::train::TensorDim train_q_dim(batch_size, num_heads_Q, seq_len, head_dim,
+                                     activation_type);
+    tensor_idx[AttentionParams::train_query] = context.requestTensor(
+      train_q_dim, "train_query", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+
+    // RoPE-applied K: (batch, num_heads_KV, seq_len, head_dim)
+    ml::train::TensorDim train_k_dim(batch_size, num_heads_KV, seq_len,
+                                     head_dim, activation_type);
+    tensor_idx[AttentionParams::train_key] = context.requestTensor(
+      train_k_dim, "train_key", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+
+    // V: (batch, num_heads_KV, seq_len, head_dim)
+    ml::train::TensorDim train_v_dim(batch_size, num_heads_KV, seq_len,
+                                     head_dim, activation_type);
+    tensor_idx[AttentionParams::train_value] = context.requestTensor(
+      train_v_dim, "train_value", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+
+    // Attention weights after softmax: (batch*num_heads_Q, 1, seq_len, seq_len)
+    ml::train::TensorDim train_aw_dim(batch_size * num_heads_Q, 1, seq_len,
+                                      seq_len, activation_type);
+    tensor_idx[AttentionParams::train_attn_wt] = context.requestTensor(
+      train_aw_dim, "train_attn_wt", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+  }
 }
 
 /************************************************************** */
@@ -276,15 +310,13 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
  */
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
-  if (!use_external_cache) {
-    return;
-  }
-
+  unsigned int gqa_size = num_heads_Q / num_heads_KV;
   nntrainer::Tensor &query = context.getInput(INOUT_INDEX::QUERY);
   nntrainer::Tensor &key = context.getInput(INOUT_INDEX::KEY);
   nntrainer::Tensor &value = context.getInput(INOUT_INDEX::VALUE);
   nntrainer::Tensor &output = context.getOutput(INOUT_INDEX::OUTPUT);
 
+  if (use_external_cache) {
   nntrainer::Tensor &cache_key = context.getInput(3);
   nntrainer::Tensor &cache_value = context.getInput(4);
 
@@ -385,6 +417,124 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
   }
 
   cache_index += step_size;
+  } else {
+  const unsigned int batch_size = query.batch();
+  const unsigned int seq_len = query.height();
+
+  // Get training cache tensors
+  nntrainer::Tensor &train_q =
+    context.getTensor(tensor_idx[AttentionParams::train_query]);
+  nntrainer::Tensor &train_k =
+    context.getTensor(tensor_idx[AttentionParams::train_key]);
+  nntrainer::Tensor &train_v =
+    context.getTensor(tensor_idx[AttentionParams::train_value]);
+  nntrainer::Tensor &train_attn_wt =
+    context.getTensor(tensor_idx[AttentionParams::train_attn_wt]);
+
+  // Step 1: Apply RoPE to copies of Q and K, then reshape to per-head format
+  // Must not modify input tensors (test framework checks inputs after forward)
+  // Copy Q and K, apply RoPE to copies
+  nntrainer::Tensor q_rope = query.clone();
+  nntrainer::Tensor k_rope = key.clone();
+  apply_rotary_emb_tensor_v2(q_rope, q_rope, head_dim, 0, false);
+  apply_rotary_emb_tensor_v2(k_rope, k_rope, head_dim, 0, false);
+
+  // Reshape Q to per-head: (B, H_Q, seq_len, D)
+  for (unsigned int b = 0; b < batch_size; b++) {
+    for (unsigned int h = 0; h < seq_len; h++) {
+      for (unsigned int n = 0; n < num_heads_Q; n++) {
+        float *src = q_rope.getAddress<float>(b, 0, h, n * head_dim);
+        float *dst = train_q.getAddress<float>(b, n, h, 0);
+        std::copy(src, src + head_dim, dst);
+      }
+    }
+  }
+
+  // Reshape K to per-head: (B, H_KV, seq_len, D)
+  for (unsigned int b = 0; b < batch_size; b++) {
+    for (unsigned int h = 0; h < seq_len; h++) {
+      for (unsigned int n = 0; n < num_heads_KV; n++) {
+        float *src = k_rope.getAddress<float>(b, 0, h, n * head_dim);
+        float *dst = train_k.getAddress<float>(b, n, h, 0);
+        std::copy(src, src + head_dim, dst);
+      }
+    }
+  }
+
+  // Reshape V to per-head: (B, H_KV, seq_len, D)
+  for (unsigned int b = 0; b < batch_size; b++) {
+    for (unsigned int h = 0; h < seq_len; h++) {
+      for (unsigned int n = 0; n < num_heads_KV; n++) {
+        float *src = value.getAddress<float>(b, 0, h, n * head_dim);
+        float *dst = train_v.getAddress<float>(b, n, h, 0);
+        std::copy(src, src + head_dim, dst);
+      }
+    }
+  }
+
+  // Step 2: Compute attention for each batch and Q head
+  float scale_factor = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  for (unsigned int b = 0; b < batch_size; b++) {
+    for (unsigned int q_head = 0; q_head < num_heads_Q; q_head++) {
+      unsigned int kv_head = q_head / gqa_size;
+      unsigned int flat_idx = b * num_heads_Q + q_head;
+
+      // Q_h: (1, 1, seq_len, head_dim) view
+      nntrainer::TensorDim head_dim_t(1, 1, seq_len, head_dim,
+                                      query.getTensorType());
+      nntrainer::Tensor q_h = train_q.getSharedDataTensor(
+        head_dim_t, (b * num_heads_Q + q_head) * seq_len * head_dim);
+      nntrainer::Tensor k_h = train_k.getSharedDataTensor(
+        head_dim_t, (b * num_heads_KV + kv_head) * seq_len * head_dim);
+      nntrainer::Tensor v_h = train_v.getSharedDataTensor(
+        head_dim_t, (b * num_heads_KV + kv_head) * seq_len * head_dim);
+
+      // scores = Q_h @ K_h^T: (1, 1, seq_len, seq_len)
+      nntrainer::TensorDim score_dim(1, 1, seq_len, seq_len,
+                                     query.getTensorType());
+      nntrainer::Tensor scores = train_attn_wt.getSharedDataTensor(
+        score_dim, flat_idx * seq_len * seq_len);
+
+      q_h.dot(k_h, scores, false, true);
+      scores.multiply_i(scale_factor);
+
+      // Apply causal mask: set upper triangle to -inf
+      if (is_causal) {
+        float *scores_data = scores.getData<float>();
+        for (unsigned int i = 0; i < seq_len; i++) {
+          for (unsigned int j = i + 1; j < seq_len; j++) {
+            scores_data[i * seq_len + j] = -std::numeric_limits<float>::max();
+          }
+        }
+      }
+
+      // Softmax along last dimension
+      sm.run_fn(scores, scores);
+
+      // attn_output = scores @ V_h: (1, 1, seq_len, head_dim)
+      nntrainer::TensorDim out_dim(1, 1, seq_len, head_dim,
+                                   query.getTensorType());
+
+      // Write directly to the output tensor at the right head offset
+      float *out_base = output.getAddress<float>(b, 0, 0, 0);
+      for (unsigned int h = 0; h < seq_len; h++) {
+        float *attn_row = scores.getAddress<float>(0, 0, h, 0);
+        float *v_data = v_h.getAddress<float>(0, 0, 0, 0);
+        float *out_row =
+          out_base + h * (num_heads_Q * head_dim) + q_head * head_dim;
+
+        // out_row = sum_j(attn[h,j] * V[j,:])
+        std::fill(out_row, out_row + head_dim, 0.0f);
+        for (unsigned int j = 0; j < seq_len; j++) {
+          float w = attn_row[j];
+          float *v_row = v_data + j * head_dim;
+          for (unsigned int d = 0; d < head_dim; d++) {
+            out_row[d] += w * v_row[d];
+          }
+        }
+      }
+    }
+  }
 }
 
 /**
@@ -1500,9 +1650,159 @@ void MHACoreLayer::updateTensorsByInputDimensions(
   context.updateTensor(tensor_idx[AttentionParams::cache_value], kv_cache_dim);
 }
 
-void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {}
+void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
+  printf("Entering Derivative\n");
+  unsigned int gqa_size = num_heads_Q / num_heads_KV;
+  const nntrainer::Tensor &incoming_deriv =
+    context.getIncomingDerivative(INOUT_INDEX::OUTPUT);
+  nntrainer::Tensor &d_query =
+    context.getOutgoingDerivative(INOUT_INDEX::QUERY);
+  nntrainer::Tensor &d_key = context.getOutgoingDerivative(INOUT_INDEX::KEY);
+  nntrainer::Tensor &d_value =
+    context.getOutgoingDerivative(INOUT_INDEX::VALUE);
 
-void MHACoreLayer::calcGradient(nntrainer::RunLayerContext &context) {}
+  nntrainer::Tensor &train_q =
+    context.getTensor(tensor_idx[AttentionParams::train_query]);
+  nntrainer::Tensor &train_k =
+    context.getTensor(tensor_idx[AttentionParams::train_key]);
+  nntrainer::Tensor &train_v =
+    context.getTensor(tensor_idx[AttentionParams::train_value]);
+  nntrainer::Tensor &train_attn_wt =
+    context.getTensor(tensor_idx[AttentionParams::train_attn_wt]);
+
+  const unsigned int batch_size = incoming_deriv.batch();
+  const unsigned int seq_len = incoming_deriv.height();
+  float scale_factor = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  // Temporary per-head tensors for gradient accumulation
+  nntrainer::TensorDim head_dim_t(1, 1, seq_len, head_dim,
+                                  incoming_deriv.getTensorType());
+  nntrainer::TensorDim score_dim(1, 1, seq_len, seq_len,
+                                 incoming_deriv.getTensorType());
+
+  // Allocate per-head gradient buffers for KV (accumulated across Q head group)
+  nntrainer::Tensor d_k_head(head_dim_t, true);
+  nntrainer::Tensor d_v_head(head_dim_t, true);
+  nntrainer::Tensor d_scores(score_dim, true);
+  nntrainer::Tensor d_out_head(head_dim_t, true);
+
+  // Initialize output gradients to zero
+  d_query.setValue(0.0f);
+  d_key.setValue(0.0f);
+  d_value.setValue(0.0f);
+
+  for (unsigned int b = 0; b < batch_size; b++) {
+    // Process per KV head group
+    for (unsigned int kv_head = 0; kv_head < num_heads_KV; kv_head++) {
+      d_k_head.setValue(0.0f);
+      d_v_head.setValue(0.0f);
+
+      nntrainer::Tensor k_h = train_k.getSharedDataTensor(
+        head_dim_t, (b * num_heads_KV + kv_head) * seq_len * head_dim);
+      nntrainer::Tensor v_h = train_v.getSharedDataTensor(
+        head_dim_t, (b * num_heads_KV + kv_head) * seq_len * head_dim);
+
+      for (unsigned int g = 0; g < gqa_size; g++) {
+        unsigned int q_head = kv_head * gqa_size + g;
+        unsigned int flat_idx = b * num_heads_Q + q_head;
+
+        nntrainer::Tensor q_h = train_q.getSharedDataTensor(
+          head_dim_t, (b * num_heads_Q + q_head) * seq_len * head_dim);
+        nntrainer::Tensor attn_wt = train_attn_wt.getSharedDataTensor(
+          score_dim, flat_idx * seq_len * seq_len);
+
+        // Extract d_output for this head from incoming_deriv
+        // incoming_deriv: (B, 1, seq_len, H_Q*D)
+        const float *in_deriv_base =
+          incoming_deriv.getAddress<float>(b, 0, 0, 0);
+        float *d_out_data = d_out_head.getData<float>();
+        for (unsigned int h = 0; h < seq_len; h++) {
+          const float *src =
+            in_deriv_base + h * (num_heads_Q * head_dim) + q_head * head_dim;
+          std::copy(src, src + head_dim, d_out_data + h * head_dim);
+        }
+
+        // d_attn_weights = d_output @ V^T: (seq_len, seq_len)
+        d_out_head.dot(v_h, d_scores, false, true);
+
+        // d_V += attn_weights^T @ d_output: (seq_len, head_dim)
+        // beta=1.0 to accumulate across Q heads in the group
+        attn_wt.dot(d_out_head, d_v_head, true, false, 1.0f);
+
+        // Softmax backward: d_scores_pre_softmax = softmax' * d_scores
+        // dL/dX_i = Y_i * (dL/dY_i - sum(Y_j * dL/dY_j)) * scale_factor
+        float *aw_ptr = attn_wt.getData<float>();
+        float *ds_ptr = d_scores.getData<float>();
+        for (unsigned int i = 0; i < seq_len; i++) {
+          float dot_sum = 0.0f;
+          for (unsigned int j = 0; j < seq_len; j++) {
+            dot_sum += aw_ptr[i * seq_len + j] * ds_ptr[i * seq_len + j];
+          }
+          for (unsigned int j = 0; j < seq_len; j++) {
+            float y = aw_ptr[i * seq_len + j];
+            float dy = ds_ptr[i * seq_len + j];
+            ds_ptr[i * seq_len + j] = y * (dy - dot_sum) * scale_factor;
+          }
+        }
+
+        // d_Q for this head: d_scores @ K: (seq_len, head_dim)
+        // Write directly into d_query
+        float *dq_base = d_query.getAddress<float>(b, 0, 0, 0);
+        float *ds_data = d_scores.getData<float>();
+        float *k_data = k_h.getData<float>();
+        for (unsigned int i = 0; i < seq_len; i++) {
+          float *dq_row =
+            dq_base + i * (num_heads_Q * head_dim) + q_head * head_dim;
+          for (unsigned int j = 0; j < seq_len; j++) {
+            float s = ds_data[i * seq_len + j];
+            float *k_row = k_data + j * head_dim;
+            for (unsigned int d = 0; d < head_dim; d++) {
+              dq_row[d] += s * k_row[d];
+            }
+          }
+        }
+
+        // d_K += d_scores^T @ Q: accumulate
+        // d_K[j,d] += sum_i(d_scores[i,j] * Q[i,d])
+        float *dk_data = d_k_head.getData<float>();
+        float *q_data = q_h.getData<float>();
+        for (unsigned int j = 0; j < seq_len; j++) {
+          for (unsigned int i = 0; i < seq_len; i++) {
+            float s = ds_data[i * seq_len + j];
+            float *q_row = q_data + i * head_dim;
+            float *dk_row = dk_data + j * head_dim;
+            for (unsigned int d = 0; d < head_dim; d++) {
+              dk_row[d] += s * q_row[d];
+            }
+          }
+        }
+      }
+
+      // Write accumulated d_K and d_V into d_key and d_value
+      float *dk_base = d_key.getAddress<float>(b, 0, 0, 0);
+      float *dv_base = d_value.getAddress<float>(b, 0, 0, 0);
+      float *dk_data = d_k_head.getData<float>();
+      float *dv_data = d_v_head.getData<float>();
+      for (unsigned int h = 0; h < seq_len; h++) {
+        float *dk_dst =
+          dk_base + h * (num_heads_KV * head_dim) + kv_head * head_dim;
+        float *dv_dst =
+          dv_base + h * (num_heads_KV * head_dim) + kv_head * head_dim;
+        std::copy(dk_data + h * head_dim, dk_data + (h + 1) * head_dim, dk_dst);
+        std::copy(dv_data + h * head_dim, dv_data + (h + 1) * head_dim, dv_dst);
+      }
+    }
+  }
+
+  // Apply inverse RoPE to d_query and d_key
+  apply_inverse_rotary_emb(d_query, head_dim, 0);
+  apply_inverse_rotary_emb(d_key, head_dim, 0);
+}
+
+void MHACoreLayer::calcGradient(nntrainer::RunLayerContext &context) {
+  // MHA Core has no trainable weights (Q/K/V/O projections are separate FC
+  // layers)
+}
 
 void MHACoreLayer::exportTo(nntrainer::Exporter &exporter,
                             const ml::train::ExportMethods &method) const {
@@ -1529,6 +1829,46 @@ void MHACoreLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 size_t MHACoreLayer::calc_attn_index(size_t i) { return (i * (i + 1)) / 2; };
+
+void MHACoreLayer::apply_inverse_rotary_emb(nntrainer::Tensor &tensor,
+                                            unsigned int dim,
+                                            unsigned int from) {
+  unsigned int half_ = dim / 2;
+  unsigned int max_timestep =
+    std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
+
+  if (freqs_cos == nullptr) {
+    const std::lock_guard<std::mutex> lock(rope_init_mtx);
+    if (freqs_cos == nullptr) {
+      precompute_freqs(head_dim, max_position_embeddings, theta, false);
+    }
+  }
+
+  // Inverse RoPE: rotate by -θ
+  // out_first_half  = in_first_half * cos(θ) + in_second_half * sin(θ)
+  // out_second_half = -in_first_half * sin(θ) + in_second_half * cos(θ)
+  for (unsigned int b = 0; b < tensor.batch(); b++) {
+    for (unsigned int c = 0; c < tensor.channel(); c++) {
+      for (unsigned int h = 0; h < tensor.height(); h++) {
+        unsigned int pos = from + h;
+        if (pos >= max_timestep)
+          continue;
+        std::vector<float> &cos_v = (*freqs_cos)[pos];
+        std::vector<float> &sin_v = (*freqs_sin)[pos];
+        float *ptr = tensor.getAddress<float>(b, c, h, 0);
+        for (unsigned int w = 0; w < tensor.width(); w += dim) {
+          for (unsigned int k = 0; k < half_; k++) {
+            float a = ptr[w + k];
+            float b_val = ptr[w + k + half_];
+            // Inverse rotation: transpose of rotation matrix
+            ptr[w + k] = a * cos_v[k] + b_val * sin_v[k];
+            ptr[w + k + half_] = -a * sin_v[k] + b_val * cos_v[k];
+          }
+        }
+      }
+    }
+  }
+}
 
 #ifdef PLUGGABLE
 

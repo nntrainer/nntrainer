@@ -86,13 +86,14 @@ typedef enum {
   ML_TRAIN_LAYER_TYPE_NEG = 46,    /**< Negative Layer type (Since 9.0)*/
   ML_TRAIN_LAYER_TYPE_GATHER = 47, /**< Gather Layer type (Since 9.0)*/
   ML_TRAIN_LAYER_TYPE_REDUCE_SUM = 48, /**< ReduceSum Layer type (Since 9.0) */
-  ML_TRAIN_LAYER_TYPE_SLICE = 49,      /**< SQRT Layer type (Since 9.0)*/
+  ML_TRAIN_LAYER_TYPE_SLICE = 49,      /**< Slice Layer type (Since 9.0)*/
   ML_TRAIN_LAYER_TYPE_CAST = 50,       /**< Cast Layer type (Since 9.0)*/
   ML_TRAIN_LAYER_TYPE_REDUCE_MEAN =
     51,                             /**< ReduceMean Layer type (Since 10.0) */
   ML_TRAIN_LAYER_TYPE_RESHAPE = 52, /**< Reshape Layer type (Since 10.0) */
   ML_TRAIN_LAYER_TYPE_UPSAMPLE2D =
     53, /**< Upsample2D Layer type (Since 10.0) */
+  ML_TRAIN_LAYER_TYPE_CUSTOM_MHA_CORE = 54, /**< Custom MHA Core Layer type */
   ML_TRAIN_LAYER_TYPE_PREPROCESS_FLIP =
     300, /**< Preprocess flip Layer (Since 6.5) */
   ML_TRAIN_LAYER_TYPE_PREPROCESS_TRANSLATE =
@@ -105,7 +106,7 @@ typedef enum {
                                        Sigmoid Loss Layer type (Since 6.5) */
   ML_TRAIN_LAYER_TYPE_LOSS_CROSS_ENTROPY_SOFTMAX = 502, /**< Cross Entropy with
                                        Softmax Loss Layer type (Since 6.5) */
-  ML_TRAIN_LAYER_TYPE_RMSNORM = 503, /**< Cross Entropy with */
+  ML_TRAIN_LAYER_TYPE_RMSNORM = 503, /**< RMSNorm Layer type */
   ML_TRAIN_LAYER_TYPE_UNKNOWN = 999  /**< Unknown Layer */
 } ml_train_layer_type_e;
 

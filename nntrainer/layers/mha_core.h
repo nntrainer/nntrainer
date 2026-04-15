@@ -257,6 +257,15 @@ public:
   WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
 
   /**
+   * @brief apply inverse rotary embedding
+   * @param[in] tensor tensor to apply
+   * @param[in] dim dimension of head
+   * @param[in] from sequence order
+   */
+  void apply_inverse_rotary_emb(nntrainer::Tensor &tensor, unsigned int dim,
+                                unsigned int from);
+
+  /**
    * @copydoc Layer::calcGradient(RunLayerContext &context)
    */
   WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
@@ -373,8 +382,12 @@ private:
     attention_weight,
     dropout_mask,
     attention_output,
+    train_query,
+    train_key,
+    train_value,
+    train_attn_wt,
   };
-  std::array<unsigned int, 7> tensor_idx;
+  std::array<unsigned int, 11> tensor_idx;
   unsigned int sink_idx;
 
   /** attention parameters */

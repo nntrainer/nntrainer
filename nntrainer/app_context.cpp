@@ -69,6 +69,7 @@
 #include <lstm.h>
 #include <lstmcell.h>
 #include <matmul_layer.h>
+#include <mha_core.h>
 #include <mol_attention_layer.h>
 #include <mse_loss_layer.h>
 #include <multi_head_attention_layer.h>
@@ -387,6 +388,9 @@ void AppContext::add_default_object() {
   registerFactory(nntrainer::createLayer<MultiHeadAttentionLayer>,
                   MultiHeadAttentionLayer::type,
                   LayerType::LAYER_MULTI_HEAD_ATTENTION);
+  registerFactory(nntrainer::createLayer<causallm::MHACoreLayer>,
+                  causallm::MHACoreLayer::type,
+                  LayerType::LAYER_CUSTOM_MHA_CORE);
   registerFactory(nntrainer::createLayer<ReduceMeanLayer>,
                   ReduceMeanLayer::type, LayerType::LAYER_REDUCE_MEAN);
   registerFactory(nntrainer::createLayer<ReduceSumLayer>, ReduceSumLayer::type,
