@@ -29,6 +29,7 @@
 /usr/include/nntrainer/cpu_backend.h
 /usr/include/nntrainer/compute_ops.h
 /usr/include/nntrainer/context_data.h
+/usr/include/nntrainer/turboquant_utils.h
 /usr/include/nntrainer/var_grad.h
 /usr/include/nntrainer/weight.h
 /usr/include/nntrainer/quantizer.h
