@@ -172,6 +172,18 @@ public:
   using prop_tag = nntrainer::uint_prop_tag; /**< property type */
 };
 
+/**
+ * @brief UseTurboQuant property - enable 4-bit packed KV cache
+ *        (3-bit quantized data + 1-bit QJL signature)
+ */
+class UseTurboQuant : public nntrainer::Property<bool> {
+public:
+  UseTurboQuant(bool value = false) { set(value); };
+  static constexpr const char *key =
+    "use_turboquant";                        /**< unique key to access */
+  using prop_tag = nntrainer::bool_prop_tag; /**< property type */
+};
+
 }; // namespace props
 
 /**
@@ -321,7 +333,7 @@ private:
     props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
-    props::AttnLogitSoftcapping, props::IsCausal>
+    props::AttnLogitSoftcapping, props::IsCausal, props::UseTurboQuant>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -349,6 +361,8 @@ private:
   bool use_sink = false;
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
+  bool use_turboquant = false;
+  std::vector<float> tq_rot_signs; /** < rotation signs for TurboQuant */
 
   enum INOUT_INDEX {
     /** input index */
@@ -373,8 +387,11 @@ private:
     attention_weight,
     dropout_mask,
     attention_output,
+    // turbo-quant
+    cache_key_scales,
+    cache_value_scales,
   };
-  std::array<unsigned int, 7> tensor_idx;
+  std::array<unsigned int, 9> tensor_idx;
   unsigned int sink_idx;
 
   /** attention parameters */
@@ -481,6 +498,21 @@ private:
   void calcCommonDerivative(nntrainer::RunLayerContext &context);
 
   size_t calc_attn_index(size_t i);
+
+  /**
+   * @brief TurboQuant 4-bit packed KV cache forwarding path.
+   *        Quantizes K/V to 4-bit, stores in packed cache, computes attention.
+   */
+  void one_batch_incremental_forwarding_turboquant(
+    const unsigned int batch, const unsigned int _from, const unsigned int from,
+    const unsigned int to, nntrainer::Tensor &query_step,
+    nntrainer::Tensor &key_step, nntrainer::Tensor &value_step,
+    nntrainer::Tensor &attention_output_step, nntrainer::Tensor &cache_key,
+    nntrainer::Tensor &cache_value, nntrainer::Tensor &cache_key_scales,
+    nntrainer::Tensor &cache_value_scales, ml::train::TensorDim &cache_key_dim,
+    ml::train::TensorDim &cache_key_step_dim,
+    ml::train::TensorDim &cache_value_dim,
+    ml::train::TensorDim &cache_value_step_dim);
 
 }; // end of class MHACoreLayer
 } // namespace causallm

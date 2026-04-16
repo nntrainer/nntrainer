@@ -236,6 +236,7 @@ protected:
   unsigned int FSU_LOOKAHEAD;
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
+  bool USE_TURBOQUANT = false; /** < enable 4-bit packed KV cache */
 
   // Performance metrics
   TransformerPerformanceMetrics performance_metrics;
