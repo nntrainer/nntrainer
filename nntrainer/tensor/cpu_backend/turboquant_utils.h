@@ -24,6 +24,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace nntrainer {
@@ -114,10 +116,20 @@ static constexpr LloydMaxCodebook CODEBOOK_D128 = {
    -0.04596127f, -0.02272669f, 0.0f, 0.02272669f, 0.04596127f, 0.07029944f,
    0.09655728f, 0.12604554f, 0.16131932f, 0.20924874f}};
 
+/**
+ * @brief  Return the Lloyd-Max codebook for the requested head dimension.
+ *         Only the precomputed codebooks (head_dim == 64 or 128) are valid;
+ *         any other head_dim is explicitly rejected to avoid silently using a
+ *         mismatched quantizer that would degrade attention quality.
+ */
 inline const LloydMaxCodebook &get_codebook(int head_dim) {
   if (head_dim == 64)
     return CODEBOOK_D64;
-  return CODEBOOK_D128;
+  if (head_dim == 128)
+    return CODEBOOK_D128;
+  throw std::invalid_argument("TurboQuant get_codebook: unsupported head_dim=" +
+                              std::to_string(head_dim) +
+                              " (only 64 and 128 are supported)");
 }
 
 /** Lloyd-Max quantize: boundary search for optimal bin index (4-bit). */

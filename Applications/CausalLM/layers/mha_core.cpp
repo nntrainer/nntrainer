@@ -526,6 +526,17 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   unsigned int batch_size = (_from) ? 1 : query_dim.batch();
 
   if (use_turboquant) {
+    // The naive TurboQuant kernels operate on FP32 data only. Reject any
+    // non-FP32 tensors up-front instead of reinterpreting their bytes via
+    // getData<float>() (which would corrupt KV cache for FP16 activations).
+    if (query.getDataType() != ml::train::TensorDim::DataType::FP32 ||
+        key.getDataType() != ml::train::TensorDim::DataType::FP32 ||
+        value.getDataType() != ml::train::TensorDim::DataType::FP32 ||
+        output.getDataType() != ml::train::TensorDim::DataType::FP32) {
+      throw std::invalid_argument(
+        "TurboQuant path currently supports FP32 tensors only");
+    }
+
     // TurboQuant 4-bit packed KV cache path
     nntrainer::Tensor &cache_key_scales =
       context.getTensor(tensor_idx[AttentionParams::cache_key_scales]);
