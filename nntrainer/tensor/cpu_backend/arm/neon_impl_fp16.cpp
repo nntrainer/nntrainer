@@ -1876,16 +1876,17 @@ void compute_fp16vcache_transposed(int row_num, const __fp16 *in,
     << actual_head_end << ")";
 
   // Iterating over each cache head (N) within the specified range
+  int num_blocks = head_dim / 8; // Process 8 FP16 elements at a time using NEON
+  int rem = head_dim % 8;        // Handle remaining elements
   // This loop structure handles heads for parallelization
+  std::vector<float16x8_t> sumVec(num_blocks * gqa_size);
+  std::vector<__fp16> sumRem(gqa_size * rem);
   for (int n = head_start; n < actual_head_end; ++n) {
-    int num_blocks =
-      head_dim / 8;         // Process 8 FP16 elements at a time using NEON
-    int rem = head_dim % 8; // Handle remaining elements
+    std::fill(sumVec.begin(), sumVec.end(), vdupq_n_f16(0.0f));
+    std::fill(sumRem.begin(), sumRem.end(), 0.0f);
 
     // Initialize accumulators for the dot product results
     // sumVec stores vectorized sums, sumRem stores scalar sums for remainders
-    std::vector<float16x8_t> sumVec(num_blocks * gqa_size, vdupq_n_f16(0.0f));
-    std::vector<__fp16> sumRem(gqa_size * rem, 0.0f);
 
     // Calculate start row based on local window size (Sliding Window Attention)
     // Only consider tokens within the window
@@ -2020,6 +2021,56 @@ void compute_kcaches(const __fp16 *in, const __fp16 *kcache, __fp16 *output,
   // No other negative values are accepted for head_end.
   int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
 
+  if (head_start == -1) {
+    auto r_start = num_rows;
+    auto r_end = r_start + tile_size;
+    float sqrt_d = std::sqrt(head_dim);
+    for (int r = r_start; r < r_end; r++) {
+      for (int h = 0; h < num_cache_head; h++) {
+        const __fp16 *k_row = kcache + (r * num_cache_head + h) * head_dim;
+        for (int g = 0; g < gqa_size; g++) {
+          const __fp16 *in_ptr = in + (h * gqa_size + g) * head_dim;
+
+          // Compute Dot Product: Query, Key
+          __fp16 sum = 0.0f;
+          int i = 0;
+          float16x8_t acc = vdupq_n_f16(0.0);
+
+          // Main NEON loop for dot product (8 elements at a time)
+          for (; i + 8 <= head_dim; i += 8) {
+            float16x8_t va = vld1q_f16(in_ptr + i); // Load Query
+            float16x8_t vb = vld1q_f16(k_row + i);  // Load Key
+            acc = vfmaq_f16(acc, va, vb);
+          }
+
+          // Horizontal sum of the vector accumulator
+          // Reduces [x0, x1, ... , x7] to scalar sum
+          // vpaddq_f16(a, b): Pairwise add
+          // [a0+a1, a2+a3, ..., b0+b1, ...]
+          // Step 1: 8 elems -> 4 pair sums (duplicated)
+          acc = vpaddq_f16(acc, acc);
+          // Step 2: 4 elems -> 2 pair sums
+          acc = vpaddq_f16(acc, acc);
+          // Step 3: 2 elems -> 1 pair sums (in lane 0)
+          acc = vpaddq_f16(acc, acc);
+          // vgetq_lane_f16(vec, lane_idx): Extract scalar from vector lane
+          sum += vgetq_lane_f16(acc, 0);
+
+          // Handle remaining elements
+          for (; i < head_dim; ++i)
+            sum += in_ptr[i] * k_row[i];
+
+          // Apply scaling factor (1/sqrt(head_dim)) and store result
+          // This is the "Scaled" Dot-Product Attention
+          output[r * num_cache_head * gqa_size + h * gqa_size + g] =
+            sum / sqrt_d;
+        }
+      }
+    }
+
+    return;
+  }
+
   // Validate head range: head_start must be less than actual_head_end
   NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
     << "head_start (" << head_start << ") must be less than head_end ("
@@ -2094,6 +2145,56 @@ void compute_kcaches(const __fp16 *in, const __fp16 *kcache, __fp16 *output,
                  g] = sum / sqrt((float)head_dim);
         }
       }
+    }
+  }
+}
+
+void compute_kcaches_row(const __fp16 *in, const __fp16 *kcache, __fp16 *output,
+                         int num_cache_head, int head_dim, int gqa_size,
+                         size_t local_window_size, int head_start,
+                         int head_end) {
+  // If head_end is -1, process all heads from head_start to num_cache_head.
+  // No other negative values are accepted for head_end.
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+
+  // Validate head range: head_start must be less than actual_head_end
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
+
+  for (int h = 0; h < num_cache_head; h++) {
+    const __fp16 *k = kcache + h * head_dim;
+    for (int g = 0; g < gqa_size; g++) {
+      const __fp16 *q = in + (h * gqa_size + g) * head_dim;
+
+      __fp16 sum = 0.0f;
+      float16x8_t acc = vdupq_n_f16(0.0);
+
+      int d = 0;
+      for (; d < head_dim; d += 8) {
+        float16x8_t va = vld1q_f16(q + d); // Load Query
+        float16x8_t vb = vld1q_f16(k + d); // Load Key
+        acc = vfmaq_f16(acc, va, vb);
+      }
+
+      // Horizontal sum of the vector accumulator
+      // Reduces [x0, x1, ... , x7] to scalar sum
+      // vpaddq_f16(a, b): Pairwise add
+      // [a0+a1, a2+a3, ..., b0+b1, ...]
+      // Step 1: 8 elems -> 4 pair sums (duplicated)
+      acc = vpaddq_f16(acc, acc);
+      // Step 2: 4 elems -> 2 pair sums
+      acc = vpaddq_f16(acc, acc);
+      // Step 3: 2 elems -> 1 pair sums (in lane 0)
+      acc = vpaddq_f16(acc, acc);
+      // vgetq_lane_f16(vec, lane_idx): Extract scalar from vector lane
+      sum += vgetq_lane_f16(acc, 0);
+
+      // Handle remaining elements
+      for (; d < head_dim; ++d)
+        sum += q[d] * k[d];
+
+      output[h * gqa_size + g] = sum;
     }
   }
 }

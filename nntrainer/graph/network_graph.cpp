@@ -423,7 +423,13 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
     auto &ln = *iter;
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
+    // auto s = std::chrono::steady_clock().now();
     forwarding_op(*iter, training);
+    // auto t = std::chrono::steady_clock().now();
+    // std::cout
+    //   << ln->getName() << " "
+    //   << std::chrono::duration_cast<std::chrono::nanoseconds>(t - s).count()
+    //   << std::endl;
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
   }
 

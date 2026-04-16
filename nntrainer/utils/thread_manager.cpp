@@ -221,6 +221,19 @@ ThreadManagerConfig ThreadManager::config_ = {};
 ThreadManager::ThreadManager() {}
 
 ThreadManager::~ThreadManager() {
+
+  active_threads_.store(compute_workers_.size(), std::memory_order_relaxed);
+  has_active_threads_.store(1, std::memory_order_relaxed);
+
+  command_.store(threadpool_command::SHUTDOWN, std::memory_order_release);
+  futex_wake(&command_);
+
+  for(auto &t : compute_workers_){
+    t.join();
+  }
+
+  return;
+
   stop_.store(true, std::memory_order_release);
 
   if (spin_mode_) {
@@ -283,6 +296,10 @@ void ThreadManager::initialize() noexcept {
   // total compute_threads = one main thread + compute_workers
   unsigned int num_additional_threads = config.compute_threads - 1;
 
+  thread_infos_ = std::make_unique<thread_info[]>(config.compute_threads);
+  has_active_threads_.store(1, std::memory_order_relaxed);
+  active_threads_.store(config.compute_threads - 1, std::memory_order_relaxed);
+
   compute_workers_.reserve(num_additional_threads);
 
   // start compute workers with appropriate loop
@@ -290,20 +307,16 @@ void ThreadManager::initialize() noexcept {
     int core_id = config.enable_affinity
                     ? static_cast<int>(core_map[(idx++) % core_map.size()])
                     : -1;
-    if (spin_mode_) {
-      compute_workers_.emplace_back([this, i, core_id] {
-        if (core_id >= 0)
-          pinSelfToCore(static_cast<unsigned int>(core_id));
-        computeWorkerLoopSpin(i);
-      });
-    } else {
-      compute_workers_.emplace_back([this, i, core_id] {
-        if (core_id >= 0)
-          pinSelfToCore(static_cast<unsigned int>(core_id));
-        computeWorkerLoopCondvar(i);
-      });
-    }
+    compute_workers_.emplace_back([this, i, core_id] {
+      if (core_id >= 0)
+        pinSelfToCore(static_cast<unsigned int>(core_id));
+      thread_main((size_t)i + 1);
+    });
   }
+
+  wait_worker_threads();
+
+  return;
 
   // wait for all spin workers to be ready before allowing dispatches
   if (spin_mode_) {

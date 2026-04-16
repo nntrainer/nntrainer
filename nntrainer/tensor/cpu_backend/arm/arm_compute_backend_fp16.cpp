@@ -395,6 +395,15 @@ void compute_kcaches(const _FP16 *in, const _FP16 *kcache, _FP16 *output,
                                    local_window_size, head_start, head_end);
 }
 
+void compute_kcaches_row(const _FP16 *in, const _FP16 *kcache, _FP16 *output,
+                         int num_cache_head, int head_dim, int gqa_size,
+                         size_t local_window_size, int head_start,
+                         int head_end) {
+  nntrainer::neon::compute_kcaches_row(in, kcache, output, num_cache_head,
+                                       head_dim, gqa_size, local_window_size,
+                                       head_start, head_end);
+}
+
 void compute_rotary_emb_value(unsigned int width, unsigned int dim,
                               unsigned int half_, _FP16 *inout, _FP16 *output,
                               const _FP16 *cos_, const _FP16 *sin_) {

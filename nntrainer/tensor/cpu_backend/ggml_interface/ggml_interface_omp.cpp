@@ -41,20 +41,30 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
     std::vector<char> QA = std::vector<char>(qa_size);
     nntr_quantize_row_q8_0(A, QA.data(), K);
 
-    tm.parallel_for_chunked(thread_num, [=](size_t thread_idx) {
-      unsigned int M_step_start = (thread_idx * N) / thread_num;
-      unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
+    // tm.parallel_for_chunked(thread_num, [=](size_t thread_idx) {
+    //   unsigned int M_step_start = (thread_idx * N) / thread_num;
+    //   unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
 
-      M_step_start = (M_step_start % NB_COLS)
-                       ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                       : M_step_start;
-      M_step_end = (M_step_end % NB_COLS)
-                     ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                     : M_step_end;
+    //   M_step_start = (M_step_start % NB_COLS)
+    //                    ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
+    //                    : M_step_start;
+    //   M_step_end = (M_step_end % NB_COLS)
+    //                  ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
+    //                  : M_step_end;
+
+    //   nntr_gemv_q4_0_4x8_q8_0(K, (float *)((C) + M_step_start), N,
+    //                           (void *)((char *)B + M_step_start * B_step),
+    //                           QA.data(), M, M_step_end - M_step_start);
+    // });
+    unsigned int tile_size = 4;
+    unsigned int loop = (N + tile_size - 1) / tile_size;
+    tm.parallel_for(0, loop, [=](size_t i) {
+      unsigned int M_step_start = i * tile_size;
+      unsigned int M_step_end = std::min((unsigned int)(i + 1) * tile_size, N);
 
       nntr_gemv_q4_0_4x8_q8_0(K, (float *)((C) + M_step_start), N,
                               (void *)((char *)B + M_step_start * B_step),
-                              QA.data(), M, M_step_end - M_step_start);
+                              QA.data(), M, tile_size);
     });
   } else if (M % 4 != 0) {
     unsigned int blocks_per_4_rows = (K + QK8_0 - 1) / QK8_0;
@@ -126,22 +136,34 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
     }
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
-    tm.parallel_for_chunked(thread_num, [=](size_t i) {
-      unsigned int src0_start = (i * N) / thread_num;
-      unsigned int src0_end = ((i + 1) * N) / thread_num;
+    unsigned int tile_size = 4;
+    unsigned int loop = (N + tile_size - 1) / tile_size;
 
-      src0_start = (src0_start % NB_COLS)
-                     ? src0_start + NB_COLS - (src0_start % NB_COLS)
-                     : src0_start;
-      src0_end = (src0_end % NB_COLS)
-                   ? src0_end + NB_COLS - (src0_end % NB_COLS)
-                   : src0_end;
+    tm.parallel_for(0, loop, [=](size_t i) {
+      unsigned int src0_start = i * tile_size;
+      unsigned int src0_end = std::min((unsigned int)(i + 1) * tile_size, N);
 
       nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + src0_start), ldc,
                               (void *)((char *)B + src0_start * B_step),
                               QA.data(), M, src0_end - src0_start);
     });
   }
+  //   tm.parallel_for_chunked(thread_num, [=](size_t i) {
+  //     unsigned int src0_start = (i * N) / thread_num;
+  //     unsigned int src0_end = ((i + 1) * N) / thread_num;
+
+  //     src0_start = (src0_start % NB_COLS)
+  //                    ? src0_start + NB_COLS - (src0_start % NB_COLS)
+  //                    : src0_start;
+  //     src0_end = (src0_end % NB_COLS)
+  //                  ? src0_end + NB_COLS - (src0_end % NB_COLS)
+  //                  : src0_end;
+
+  //     nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + src0_start), ldc,
+  //                             (void *)((char *)B + src0_start * B_step),
+  //                             QA.data(), M, src0_end - src0_start);
+  //   });
+  // }
 }
 
 template <>
@@ -509,6 +531,19 @@ void __ggml_gemm_q6_K(const unsigned int M, const unsigned int N,
       nntr_vec_dot_q6_K_q8_K(K, &C[thread_job], bs, B_data, bx,
                              quantized_A_data, by, nrc);
     });
+
+    // unsigned int t = tm.getComputeThreadCount();
+
+    // tm.parallel_for_chunked(t, [=](size_t thread_idx) {
+    //   unsigned int M_step_start = (thread_idx * N) / t;
+    //   unsigned int M_step_end = ((thread_idx + 1) * N) / t;
+
+    //   for (unsigned int i = M_step_start; i < M_step_end; i++) {
+    //     nntr_vec_dot_q6_K_q8_K(K, &C[i], bs,
+    //                            (void *)((char *)B + B_row_size * i), bx,
+    //                            quantized_A_data, by, nrc);
+    //   }
+    // });
   } else { // GEMM
     const int32_t A_total_size = A_row_size * M;
     std::vector<char> quantized_A(A_total_size);

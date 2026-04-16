@@ -440,6 +440,11 @@ void compute_kcaches(const _FP16 *in, const _FP16 *kcache, _FP16 *output,
                      size_t local_window_size = UINT_MAX, int head_start = 0,
                      int head_end = -1);
 
+void compute_kcaches_row(const _FP16 *in, const _FP16 *kcache, _FP16 *output,
+                         int num_cache_head, int head_dim, int gqa_size,
+                         size_t local_window_size = UINT_MAX,
+                         int head_start = 0, int head_end = -1);
+
 /**
  * @brief Compute rotary embedding value
  * @param[in] width current w value from b, c, h, w

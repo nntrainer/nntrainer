@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -423,34 +424,99 @@ void MHACoreLayer::compute_kcaches(nntrainer::Tensor &in,
       _FP16 *out_data = out.getData<_FP16>();
 
       auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(
-        0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-          nntrainer::compute_kcaches(
-            in_data, cache_data, out_data, num_rows, num_cache_head, head_dim,
-            group_size, tile_size, local_window_size, head_kv, head_kv + 1);
-        });
+
+      tm.parallel_for(0, num_rows, [=](size_t i) {
+        nntrainer::compute_kcaches(in_data, cache_data, out_data, i,
+                                   num_cache_head, head_dim, group_size, 1,
+                                   local_window_size, -1, num_heads_KV);
+      });
+      // unsigned int num_threads = tm.getComputeThreadCount();
+
+      // tm.parallel_for_chunked(num_threads, [=](size_t thread_idx) {
+      //   unsigned int start = thread_idx * num_rows / num_threads;
+      //   unsigned int end = (thread_idx + 1) * num_rows / num_threads;
+      //   nntrainer::compute_kcaches(
+      //     in_data, cache_data, out_data, start, num_cache_head, head_dim,
+      //     group_size, end - start, local_window_size, -1, num_heads_KV);
+      // });
     } else {
       unsigned int seq_start =
         sequence_len < local_window_size ? 0 : sequence_len - local_window_size;
 
-      auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(
-        static_cast<size_t>(seq_start), static_cast<size_t>(sequence_len),
-        [=](size_t i) {
-          _FP16 *input_addr = in.getData<_FP16>() + num_head * head_dim * i;
-          _FP16 *cache_addr = cache.getData<_FP16>();
-          int row_to_compute = is_causal ? from + i + 1 : from + sequence_len;
-          size_t out_start_row =
-            is_causal ? calc_attn_index(from + i) - calc_attn_index(from)
-                      : i * (from + sequence_len);
+      if (is_causal) {
+        if (seq_start != 0) {
+          throw std::runtime_error{"NYI"};
+        }
 
-          _FP16 *output_addr = out.getData<_FP16>() + out_start_row * num_head;
+        // compute order
+        // k0q0, k0q1, ..., k0qn-1   n
+        // k1q1, k1q2, ..., k1qn-1   n-1
+        // ...
+        // kn-1 qn-1                 1
 
-          nntrainer::compute_kcaches(input_addr, cache_addr, output_addr,
-                                     row_to_compute, num_head / group_size,
-                                     head_dim, group_size, tile_size,
-                                     local_window_size);
+        // save order
+        // q0k0                      1
+        // q1k0 q1k1                 2
+        // ...
+        // qn-1k0 ... qn-1kn-1       n
+
+        unsigned int loop = sequence_len * (sequence_len + 1) / 2;
+
+        // std::cout << "a\n";
+
+        auto find_k_row = [sequence_len](size_t i) {
+          double root = std::sqrt(
+            (sequence_len * 2 + 1) * (sequence_len * 2 + 1) - 8 * i - 8);
+          double i_double = (2 * sequence_len - 1 - root) / 2;
+          return (unsigned int)std::ceil(i_double);
+        };
+
+        // for (unsigned int i = 0; i < loop; i++) {
+        //   unsigned int k_row = find_k_row(i);
+        //   unsigned int q_row =
+        //     k_row + i - k_row * (2 * sequence_len - k_row + 1) / 2;
+
+        //   std::cout << i << " q " << q_row << " k " << k_row << "\n";
+        // }
+
+        auto &tm = nntrainer::ThreadManager::Global();
+        tm.parallel_for(0, static_cast<size_t>(loop), [=](size_t i) {
+          unsigned int k_row = find_k_row(i);
+          unsigned int q_row =
+            k_row + i - k_row * (2 * sequence_len - k_row + 1) / 2;
+
+          unsigned int o_row = q_row * (q_row + 1) / 2 + k_row;
+
+          _FP16 *input_addr = in.getData<_FP16>() + num_head * head_dim * q_row;
+          _FP16 *cache_addr =
+            cache.getData<_FP16>() + num_head / group_size * head_dim * k_row;
+          _FP16 *output_addr = out.getData<_FP16>() + num_heads_Q * o_row;
+
+          nntrainer::compute_kcaches_row(input_addr, cache_addr, output_addr,
+                                         num_head / group_size, head_dim,
+                                         group_size, local_window_size);
         });
+      } else {
+        auto &tm = nntrainer::ThreadManager::Global();
+        tm.parallel_for(
+          static_cast<size_t>(seq_start), static_cast<size_t>(sequence_len),
+          [=](size_t i) {
+            _FP16 *input_addr = in.getData<_FP16>() + num_head * head_dim * i;
+            _FP16 *cache_addr = cache.getData<_FP16>();
+            int row_to_compute = is_causal ? from + i + 1 : from + sequence_len;
+            size_t out_start_row =
+              is_causal ? calc_attn_index(from + i) - calc_attn_index(from)
+                        : i * (from + sequence_len);
+
+            _FP16 *output_addr =
+              out.getData<_FP16>() + out_start_row * num_head;
+
+            nntrainer::compute_kcaches(input_addr, cache_addr, output_addr,
+                                       row_to_compute, num_head / group_size,
+                                       head_dim, group_size, tile_size,
+                                       local_window_size);
+          });
+      }
     }
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
@@ -533,14 +599,30 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
+  // auto s0 = std::chrono::steady_clock().now();
+
   compute_kcaches(query_step, b_cached_key, out_, cache_from,
                   cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
+  // auto s1 = std::chrono::steady_clock().now();
 
   softmax_triangle(out_, step_size, num_heads_Q, cache_from);
 
+  // auto s2 = std::chrono::steady_clock().now();
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 cache_from, num_heads_KV, gqa_size, head_dim,
                                 cache_to);
+  // auto s3 = std::chrono::steady_clock().now();
+
+  // auto t0 =
+  //   std::chrono::duration_cast<std::chrono::nanoseconds>(s1 - s0).count();
+  // auto t1 =
+  //   std::chrono::duration_cast<std::chrono::nanoseconds>(s2 - s1).count();
+  // auto t2 =
+  //   std::chrono::duration_cast<std::chrono::nanoseconds>(s3 - s2).count();
+
+  // std::cout << "compute_kcaches " << t0 << std::endl;
+  // std::cout << "softmax_triangle " << t1 << std::endl;
+  // std::cout << "compute_fp16vcache_transposed " << t2 << std::endl;
 }
 
 void MHACoreLayer::one_batch_incremental_forwarding(
@@ -1178,13 +1260,23 @@ void MHACoreLayer::compute_fp16vcache_transposed(
       const _FP16 *vcache_data = vcache.getData<_FP16>();
       _FP16 *output_data = output.getData<_FP16>();
 
-      auto &tm_fp16 = nntrainer::ThreadManager::Global();
-      tm_fp16.parallel_for(
-        0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
-          nntrainer::compute_fp16vcache_transposed(
-            row_num, in_data, vcache_data, output_data, num_cache_head,
-            gqa_size, head_dim, local_window_size, head_kv, head_kv + 1);
-        });
+      auto &tm = nntrainer::ThreadManager::Global();
+      unsigned int num_threads = tm.getComputeThreadCount();
+
+      tm.parallel_for(0, num_cache_head, [=](size_t head_kv) {
+        nntrainer::compute_fp16vcache_transposed(
+          row_num, in_data, vcache_data, output_data, num_cache_head, gqa_size,
+          head_dim, local_window_size, head_kv, head_kv + 1);
+        // unsigned int num_threads = tm.getComputeThreadCount();
+
+        // tm.parallel_for_chunked(num_threads, [=](size_t idx) {
+        //   unsigned int start = idx * num_cache_head / num_threads;
+        //   unsigned int end = (idx + 1) * num_cache_head / num_threads;
+
+        //   nntrainer::compute_fp16vcache_transposed(
+        //     row_num, in_data, vcache_data, output_data, num_cache_head,
+        //     gqa_size, head_dim, local_window_size, start, end);
+      });
     }
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
