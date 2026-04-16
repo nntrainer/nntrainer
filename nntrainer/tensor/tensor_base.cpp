@@ -431,32 +431,34 @@ Tensor TensorBase::multiply_strided(Tensor const &m, Tensor &output,
                               getStringDataType());
 }
 
-int TensorBase::multiply_i(float const &value) {
+int TensorBase::multiply_i(float const &value, ComputeOps *) {
   throw std::invalid_argument(
     "Tensor::multiply_i() is currently not supported in tensor data type " +
     getStringDataType());
 }
 
-Tensor &TensorBase::multiply(float const &value, Tensor &output) const {
+Tensor &TensorBase::multiply(float const &value, Tensor &output,
+                             ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::multiply() is currently not supported in tensor data type " +
     getStringDataType());
 }
 
 Tensor &TensorBase::multiply(Tensor const &m, Tensor &output,
-                             const float beta) const {
+                             const float beta, ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::multiply() is currently not supported in tensor data type " +
     getStringDataType());
 }
 
-Tensor &TensorBase::divide(float const &value, Tensor &output) const {
+Tensor &TensorBase::divide(float const &value, Tensor &output,
+                           ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::divide() is currently not supported in tensor data type " +
     getStringDataType());
 }
 
-Tensor &TensorBase::divide(Tensor const &m, Tensor &output) const {
+Tensor &TensorBase::divide(Tensor const &m, Tensor &output, ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::divide() is currently not supported in tensor data type " +
     getStringDataType());
@@ -471,20 +473,22 @@ Tensor &TensorBase::add_strided(Tensor const &input, Tensor &output,
 
 int TensorBase::add_i_partial(unsigned int len, unsigned int addr_idx,
                               Tensor &m, unsigned int incX, unsigned int incY,
-                              const Tensor alphas, unsigned int alpha_idx) {
+                              const Tensor alphas, unsigned int alpha_idx,
+                               ComputeOps *) {
   throw std::invalid_argument(
     "Tensor::add_i_partial() is currently not supported in tensor data type " +
     getStringDataType());
 }
 
-Tensor &TensorBase::add(float const &value, Tensor &output) const {
+Tensor &TensorBase::add(float const &value, Tensor &output,
+                        ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::add() is currently not supported in tensor data type " +
     getStringDataType());
 }
 
 Tensor &TensorBase::add(Tensor const &m, Tensor &output,
-                        float const alpha) const {
+                        float const alpha, ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::add() is currently not supported in tensor data type " +
     getStringDataType());
@@ -496,7 +500,7 @@ Tensor &TensorBase::subtract(float const &value, Tensor &output) const {
     getStringDataType());
 }
 
-void TensorBase::sum_by_batch(Tensor &output) const {
+void TensorBase::sum_by_batch(Tensor &output, ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::sum_by_batch() is currently not supported in tensor data type " +
     getStringDataType());
@@ -509,13 +513,13 @@ Tensor &TensorBase::sum(unsigned int axis, Tensor &output, float alpha,
     getStringDataType());
 }
 
-Tensor &TensorBase::abs(Tensor &output) const {
+Tensor &TensorBase::abs(Tensor &output, ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::abs() is currently not supported in tensor data type " +
     getStringDataType());
 }
 
-float TensorBase::l2norm() const {
+float TensorBase::l2norm(ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::l2norm() is currently not supported in tensor data type " +
     getStringDataType());
@@ -545,6 +549,24 @@ Tensor &TensorBase::erf(Tensor &output) const {
     getStringDataType());
 }
 
+Tensor &TensorBase::exp(Tensor &output) const {
+  throw std::invalid_argument(
+    "Tensor::exp() is currently not supported in tensor data type " +
+    getStringDataType());
+}
+
+Tensor &TensorBase::log(Tensor &output) const {
+  throw std::invalid_argument(
+    "Tensor::log() is currently not supported in tensor data type " +
+    getStringDataType());
+}
+
+Tensor &TensorBase::clamp(float min, float max, Tensor &output) const {
+  throw std::invalid_argument(
+    "Tensor::clamp() is currently not supported in tensor data type " +
+    getStringDataType());
+}
+
 void TensorBase::sin(Tensor &out, float alpha) {
   throw std::invalid_argument(
     "Tensor::sin() is currently not supported in tensor data type " +
@@ -563,14 +585,14 @@ void TensorBase::tan(Tensor &output, float alpha) {
     getStringDataType());
 }
 
-void TensorBase::inv_sqrt(Tensor &out) {
+void TensorBase::inv_sqrt(Tensor &out, ComputeOps *) {
   throw std::invalid_argument(
     "Tensor::inv_sqrt() is currently not supported in tensor data type " +
     getStringDataType());
 }
 
 Tensor &TensorBase::dot(Tensor const &input, Tensor &output, bool trans,
-                        bool trans_in, float beta) const {
+                        bool trans_in, float beta, ComputeOps *ops) const {
   throw std::invalid_argument(
     "Tensor::dot() is currently not supported in tensor data type " +
     getStringDataType());
@@ -648,7 +670,8 @@ void TensorBase::topK(unsigned int k, void *output_data, uint32_t *indices) {
     getStringDataType());
 }
 
-Tensor &TensorBase::transpose(const std::string &direction, Tensor &out) const {
+Tensor &TensorBase::transpose(const std::string &direction, Tensor &out,
+                              ComputeOps *) const {
   throw std::invalid_argument(
     "Tensor::transpose() is currently not supported in tensor data type " +
     getStringDataType());

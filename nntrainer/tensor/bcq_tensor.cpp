@@ -12,7 +12,6 @@
 #include <iostream>
 
 #include <bcq_tensor.h>
-#include <cpu_backend.h>
 #include <tensor.h>
 #include <util_func.h>
 
@@ -199,19 +198,19 @@ void BCQTensor::initialize(Initializer init) {
 }
 
 Tensor &BCQTensor::dot(Tensor const &input, Tensor &output, bool trans,
-                       bool trans_in, float beta) const {
+                       bool trans_in, float beta, ComputeOps *ops) const {
   BiQGEMM::matrixDotMatrix(output.getData(), *bcq_weight_.get(),
                            input.getData(),
                            trans_in ? input.width() : input.height());
   return output;
 }
 
-void BCQTensor::copy(const Tensor &from) {
+void BCQTensor::copy(const Tensor &from, ComputeOps *ops) {
   reshape(from.getDim());
   copy(from.getData());
 }
 
-void BCQTensor::copyData(const Tensor &from) {
+void BCQTensor::copyData(const Tensor &from, ComputeOps *ops) {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -320,7 +319,7 @@ size_t BCQTensor::size() const {
   return quantized_bit_size_ * dim.width() * ((dim.height() + 31) / 32);
 }
 
-float BCQTensor::max_abs() const { return maxValue(); }
+float BCQTensor::max_abs(ComputeOps *ops) const { return maxValue(); }
 
 float BCQTensor::maxValue() const {
   const uint32_t *data = (uint32_t *)getData();

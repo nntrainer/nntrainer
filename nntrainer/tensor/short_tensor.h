@@ -192,12 +192,12 @@ public:
   /**
    * @copydoc Tensor::copy(const Tensor &from)
    */
-  void copy(const Tensor &from) override;
+  void copy(const Tensor &from, ComputeOps *ops = nullptr) override;
 
   /**
    * @copydoc Tensor::copyData(const Tensor &from)
    */
-  void copyData(const Tensor &from) override;
+  void copyData(const Tensor &from, ComputeOps *ops = nullptr) override;
 
   /**
    * @copydoc Tensor::copy_with_stride()
@@ -228,7 +228,7 @@ public:
   /**
    * @copydoc Tensor::max_abs()
    */
-  float max_abs() const override;
+  float max_abs(ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::maxValue()
@@ -294,7 +294,7 @@ private:
   /**
    * @copydoc Tensor::isValid()
    */
-  bool isValid() const override { return true; };
+  bool isValid(ComputeOps *ops = nullptr) const override { return true; };
 };
 
 } // namespace nntrainer

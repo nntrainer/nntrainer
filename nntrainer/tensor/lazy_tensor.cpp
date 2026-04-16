@@ -103,6 +103,184 @@ LazyTensor &LazyTensor::divide_i(Tensor const &m) {
 }
 
 /**
+ * @brief     Wrapper method of pow_i. see tensor.h for more detail
+ * @param[in] exponent exponent value
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::pow_i(float exponent) {
+  auto f = [exponent](Tensor &t) mutable -> int { return t.pow_i(exponent); };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of sqrt_i. see tensor.h for more detail
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::sqrt_i() {
+  auto f = [](Tensor &t) mutable -> int { return t.sqrt_i(); };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of erf_i. see tensor.h for more detail
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::erf_i() {
+  auto f = [](Tensor &t) mutable -> int { return t.erf_i(); };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of exp_i. see tensor.h for more detail
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::exp_i() {
+  auto f = [](Tensor &t) mutable -> int { return t.exp_i(); };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of log_i. see tensor.h for more detail
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::log_i() {
+  auto f = [](Tensor &t) mutable -> int { return t.log_i(); };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of clamp_i. see tensor.h for more detail
+ * @param[in] min minimum value
+ * @param[in] max maximum value
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::clamp_i(float min, float max) {
+  auto f = [min, max](Tensor &t) mutable -> int {
+    return t.clamp_i(min, max);
+  };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of inv_sqrt_i. see tensor.h for more detail
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::inv_sqrt_i() {
+  auto f = [](Tensor &t) mutable -> int {
+    try {
+      t.inv_sqrt_i();
+      return ML_ERROR_NONE;
+    } catch (std::runtime_error &e) {
+      return ML_ERROR_INVALID_PARAMETER;
+    }
+  };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of neg. (memcopy happens)
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::neg() {
+  auto f = [](Tensor &t) mutable -> int {
+    try {
+      t = t.neg();
+      return ML_ERROR_NONE;
+    } catch (std::runtime_error &e) {
+      return ML_ERROR_INVALID_PARAMETER;
+    }
+  };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of abs. (memcopy happens)
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::abs() {
+  auto f = [](Tensor &t) mutable -> int {
+    try {
+      Tensor out(t.getDim());
+      t.abs(out);
+      t = out;
+      return ML_ERROR_NONE;
+    } catch (std::runtime_error &e) {
+      return ML_ERROR_INVALID_PARAMETER;
+    }
+  };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of sin. (memcopy happens)
+ * @param[in] alpha scale factor
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::sin(float alpha) {
+  auto f = [alpha](Tensor &t) mutable -> int {
+    try {
+      Tensor out(t.getDim());
+      t.sin(out, alpha);
+      t = out;
+      return ML_ERROR_NONE;
+    } catch (std::runtime_error &e) {
+      return ML_ERROR_INVALID_PARAMETER;
+    }
+  };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of cos. (memcopy happens)
+ * @param[in] alpha scale factor
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::cos(float alpha) {
+  auto f = [alpha](Tensor &t) mutable -> int {
+    try {
+      Tensor out(t.getDim());
+      t.cos(out, alpha);
+      t = out;
+      return ML_ERROR_NONE;
+    } catch (std::runtime_error &e) {
+      return ML_ERROR_INVALID_PARAMETER;
+    }
+  };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
+ * @brief     Wrapper method of tan. (memcopy happens)
+ * @param[in] alpha scale factor
+ * @retval    LazyTensor *this
+ */
+LazyTensor &LazyTensor::tan(float alpha) {
+  auto f = [alpha](Tensor &t) mutable -> int {
+    try {
+      Tensor out(t.getDim());
+      t.tan(out, alpha);
+      t = out;
+      return ML_ERROR_NONE;
+    } catch (std::runtime_error &e) {
+      return ML_ERROR_INVALID_PARAMETER;
+    }
+  };
+  call_chain.push_back(f);
+  return *this;
+}
+
+/**
  * @brief     Wrapper method of dot. see tensor.h for more detail (memcopy
  * happens)
  * @param[in] m Tensor

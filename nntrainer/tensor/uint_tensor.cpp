@@ -319,12 +319,12 @@ template <typename T> void UIntTensor<T>::initialize(Initializer init) {
   initialize();
 }
 
-template <typename T> void UIntTensor<T>::copy(const Tensor &from) {
+template <typename T> void UIntTensor<T>::copy(const Tensor &from, ComputeOps *ops) {
   reshape(from.getDim());
   copy(from.getData());
 }
 
-template <typename T> void UIntTensor<T>::copyData(const Tensor &from) {
+template <typename T> void UIntTensor<T>::copyData(const Tensor &from, ComputeOps *ops) {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -384,7 +384,12 @@ void UIntTensor<T>::read(std::ifstream &file, size_t start_offset,
   if (start_offset == std::numeric_limits<size_t>::max()) {
     start_offset = file_offset;
   }
+#ifdef ENABLE_NPU
+  start_offset = 0;
+  read_from_offset = false;
+#else
   read_quantization_info(file, start_offset, read_from_offset);
+#endif
 
   std::streamsize sz = static_cast<std::streamsize>(getMemoryBytes());
 
@@ -457,7 +462,7 @@ template <typename T> std::vector<unsigned int> UIntTensor<T>::argmin() const {
   return result;
 }
 
-template <typename T> float UIntTensor<T>::max_abs() const {
+template <typename T> float UIntTensor<T>::max_abs(ComputeOps *ops) const {
   return maxValue();
 }
 
@@ -600,6 +605,9 @@ template <typename T> void UIntTensor<T>::copy(const void *buf) {
     const uint16_t *data = (const uint16_t *)buf;
     uint16_t *rdata = (uint16_t *)getData();
     copy_u16((const unsigned int)size(), data, rdata);
+#ifdef ENABLE_NPU
+    return;
+#endif
   } else {
     /// @todo need to optimize
     memcpy(getData(), buf, size() * (sizeof(T)));

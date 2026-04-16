@@ -262,6 +262,69 @@ float __ggml_vec_dot_q6_K_f32(const unsigned int K, const void *v_q6_K,
                               const float *f);
 
 /**
+ * @brief Quantize float to Q1_0 (1-bit, group size 128) format
+ *
+ * @param src input src to be quantized
+ * @param dst output destination for quantized data
+ * @param nrow number of rows
+ * @param n_per_row number of elements per row
+ * @param quant_weights additional information for quantization (unused)
+ * @return size_t total size of quantized data
+ */
+size_t __ggml_quantize_q1_0(const float *src, void *dst, int64_t nrow,
+                            int64_t n_per_row, const float *quant_weights);
+
+/**
+ * @brief Q1_0 to float dequantize
+ *
+ * @param x_raw input src to be dequantized
+ * @param y output destination for dequantized data
+ * @param k data length
+ */
+void __ggml_dequantize_row_q1_0(const void *x_raw, float *y, int64_t k);
+
+/**
+ * @brief (1xK)*(Kx1) dot product for Q1_0 weights and Q8_0 activations
+ *
+ * @param K Length of vectors
+ * @param v_q1_0 lhs vector - data stored in Q1_0 format
+ * @param v_q8_0 rhs vector - data stored in Q8_0 format
+ * @return float Result of dot product
+ */
+float __ggml_vec_dot_q1_0_q8_0(const unsigned int K, const void *v_q1_0,
+                               const void *v_q8_0);
+
+/**
+ * @brief (1xK)*(Kx1) dot product for Q1_0 weights and float activations
+ *
+ * @param K Length of vectors
+ * @param v_q1_0 lhs vector - data stored in Q1_0 format
+ * @param f rhs vector - data stored in float
+ * @return float Result of dot product
+ */
+float __ggml_vec_dot_q1_0_f32(const unsigned int K, const void *v_q1_0,
+                              const float *f);
+
+/**
+ * @brief A(M, K) * W.T(N, K) = (M, N) for Q1_0 weights
+ *
+ * @param M rows of A
+ * @param N rows of W (columns of output)
+ * @param K columns of A / W
+ * @param A Activation (float)
+ * @param lda leading dimension of A
+ * @param B Q1_0 quantized weight
+ * @param ldb leading dimension of B
+ * @param C output matrix (float)
+ * @param ldc leading dimension of C
+ */
+void __ggml_q1_0_GEMM(const unsigned int M, const unsigned int N,
+                      const unsigned int K, const float *A,
+                      const unsigned int lda, const void *B,
+                      const unsigned int ldb, float *C,
+                      const unsigned int ldc);
+
+/**
  * @brief q4_0 to float dequantize
  *
  * @param x_raw input src to be dequantized

@@ -13,7 +13,10 @@
 
 #include <assert.h>
 #include <cmath>
+#include <compute_ops.h>
+#include <cpu_backend.h>
 #include <fallback_internal.h>
+#include <ggml_interface.h>
 #include <nntrainer_error.h>
 
 namespace nntrainer {
@@ -271,6 +274,15 @@ void dequantize_row_q4_0(const void *x_raw, float *y, int64_t k) {
   return __fallback_dequantize_row_q4_0(x_raw, y, k);
 }
 
+size_t quantize_q1_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights) {
+  return __ggml_quantize_q1_0(src, dst, nrow, n_per_row, quant_weights);
+}
+
+void dequantize_row_q1_0(const void *x_raw, float *y, int64_t k) {
+  return __ggml_dequantize_row_q1_0(x_raw, y, k);
+}
+
 void dequantize_row_q6_K(const void *x, float *y, int64_t k) {
   return __fallback_dequantize_row_q6_K(x, y, k);
 }
@@ -374,5 +386,6 @@ void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
   __fallback_transform_int4_osv32_isv2_to_q4_0(
     N, K, osv32_weights, osv32_scales, scale_group_size, 8, dst_q4_0x);
 }
+
 
 } /* namespace nntrainer */

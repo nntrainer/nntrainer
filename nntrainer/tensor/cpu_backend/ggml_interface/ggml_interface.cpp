@@ -106,6 +106,61 @@ float __ggml_vec_dot_q6_K(const unsigned int K, const void *__restrict v_q6_K,
   return result;
 }
 
+size_t __ggml_quantize_q1_0(const float *src, void *dst, int64_t nrow,
+                            int64_t n_per_row, const float *quant_weights) {
+  return nntr_quantize_q1_0(src, dst, nrow, n_per_row, quant_weights);
+}
+
+void __ggml_dequantize_row_q1_0(const void *x_raw, float *y, int64_t k) {
+  nntr_dequantize_row_q1_0(x_raw, y, k);
+}
+
+float __ggml_vec_dot_q1_0_q8_0(const unsigned int K, const void *v_q1_0,
+                               const void *v_q8_0) {
+  float result;
+  nntr_vec_dot_q1_0_q8_0(K, &result, v_q1_0, v_q8_0);
+  return result;
+}
+
+float __ggml_vec_dot_q1_0_f32(const unsigned int K, const void *v_q1_0,
+                              const float *f) {
+  float result;
+  nntr_vec_dot_q1_0_f32(K, &result, v_q1_0, f);
+  return result;
+}
+
+void __ggml_q1_0_GEMM(const unsigned int M, const unsigned int N,
+                      const unsigned int K, const float *A,
+                      const unsigned int lda, const void *B,
+                      const unsigned int ldb, float *C,
+                      const unsigned int ldc) {
+  // C(M,N) = A(M,K) * W^T(N,K)
+  // nntr_gemm_q1_0_f32: nr=weight_rows(N), nc=activation_rows(M)
+  // output: s[weight_row * bs + act_row] so we need bs=M
+  // Then C is stored as C[n][m], we transpose after
+  //
+  // Simpler: directly compute in M×N layout
+  const int nb = K / 128;
+  const block_q1_0 *weights = (const block_q1_0 *)B;
+  for (unsigned int m = 0; m < M; m++) {
+    for (unsigned int n = 0; n < N; n++) {
+      float sumf = 0.0f;
+      const block_q1_0 *row_w = weights + n * nb;
+      const float *row_a = A + m * K;
+      for (int i = 0; i < nb; i++) {
+        const float d = nntr_fp16_to_fp32(row_w[i].d);
+        float block_sum = 0.0f;
+        for (int j = 0; j < 128; j++) {
+          const int bit = (row_w[i].qs[j / 8] >> (j % 8)) & 1;
+          block_sum += (bit ? d : -d) * row_a[i * 128 + j];
+        }
+        sumf += block_sum;
+      }
+      C[m * ldc + n] = sumf;
+    }
+  }
+}
+
 void __ggml_repack_q4_0_to_q4_0_4(void *dst, void *src, size_t data_size,
                                   const unsigned int M, const unsigned int N) {
   nntr_repack_q4_0_to_q4_0_4_bl(dst, 8, src, data_size, M, N);

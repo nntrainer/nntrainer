@@ -17,6 +17,8 @@
 #ifdef USE_BLAS
 #include <cblas_interface.h>
 #endif
+#include <compute_ops.h>
+#include <cpu_backend.h>
 #include <fallback_internal.h>
 #include <ggml_interface.h>
 #include <nntrainer_error.h>
@@ -30,8 +32,11 @@ namespace nntrainer {
 
 void init_backend() {
   __ggml_init();
+#ifdef USE_BLAS
   // Do not repeatedly call set_num_threads. It's a global config.
   __openblas_set_num_threads(-1); // -1 = BLAS_NUM_THREADS if defined.
+#endif
+  g_compute_ops = get_x86_ops();
 }
 
 void scopy_int4_to_float32(const unsigned int N, const uint8_t *X,
@@ -396,6 +401,15 @@ void dequantize_row_q4_0(const void *x_raw, float *y, int64_t k) {
   __ggml_dequantize_row_q4_0(x_raw, y, k);
 }
 
+size_t quantize_q1_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights) {
+  return __ggml_quantize_q1_0(src, dst, nrow, n_per_row, quant_weights);
+}
+
+void dequantize_row_q1_0(const void *x_raw, float *y, int64_t k) {
+  __ggml_dequantize_row_q1_0(x_raw, y, k);
+}
+
 void dequantize_row_q6_K(const void *x, float *y, int64_t k) {
   __ggml_dequantize_row_q6_K(x, y, k);
 }
@@ -503,4 +517,5 @@ void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
     N, K, osv32_weights, osv32_scales, scale_group_size, 8, dst_q4_0x);
 #endif
 }
+
 } /* namespace nntrainer */

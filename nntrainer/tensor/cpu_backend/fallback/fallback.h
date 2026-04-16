@@ -581,6 +581,20 @@ void nntr_gemm_qai8dxp_qsi4cxp_packed(
   T upper_bound = std::numeric_limits<T>::max());
 #endif
 
+// Channel-wise int4 (qsi4cxp) public wrappers — pure FP32, no FP16.
+#ifndef ENABLE_FP16
+void nntr_quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
+                          void *rhs_native_mtx_qs4cx, void *rhs_scales_f32,
+                          bool transB = true);
+
+template <typename T = float>
+uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales, T *dst_mtx, bool transB = true,
+  T lower_bound = std::numeric_limits<T>::lowest(),
+  T upper_bound = std::numeric_limits<T>::max());
+#endif
+
 /**
  * @copydoc unpack_q4_0x8_transpose16 in cpu_backend.h
  */
@@ -1190,6 +1204,11 @@ void dequantize_row_q4_K(const void *x, float *y, int64_t k);
  */
 void dequantize_row_q4_0(const void *x, float *y, int64_t k);
 
+size_t quantize_q1_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights);
+
+void dequantize_row_q1_0(const void *x, float *y, int64_t k);
+
 /**
  * @brief dequantize row of q6_K data to float
  *
@@ -1330,6 +1349,13 @@ void compute_kcaches(const float *in, const BType *kcache, float *output,
                      int gqa_size, int tile_size,
                      size_t local_window_size = UINT_MAX, int head_start = 0,
                      int head_end = -1);
+
+template <>
+void compute_kcaches<uint16_t>(const float *in, const uint16_t *kcache,
+                               float *output, int num_rows, int num_cache_head,
+                               int head_dim, int gqa_size, int tile_size,
+                               size_t local_window_size, int head_start,
+                               int head_end);
 
 /**
  * @brief Compute rotary embedding value

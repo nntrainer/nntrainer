@@ -1474,3 +1474,470 @@ void nntr_dequantize_row_q8_K(const void *__restrict x, float *__restrict y,
                               int64_t k) {
   dequantize_row_q8_K_impl((const block_q8_K *)x, y, k);
 }
+
+// =====================================================================
+// Q1_0 (1-bit quantization with group size 128)
+// =====================================================================
+// Each block: 2 bytes FP16 scale + 16 bytes (128 bits, 1 bit per weight)
+// bit=1 -> +scale, bit=0 -> -scale
+
+/**
+ * @brief Quantize a row of floats to Q1_0 format.
+ * For each group of 128 weights, compute scale = max(|w|),
+ * then store each weight as 1 bit: bit=1 if w >= 0, bit=0 if w < 0.
+ */
+static void quantize_row_q1_0_ref(const float *__restrict x,
+                                  block_q1_0 *__restrict y, int64_t k) {
+  assert(k % QK1_0 == 0);
+  const int nb = k / QK1_0;
+
+  for (int i = 0; i < nb; i++) {
+    const float *block_x = x + i * QK1_0;
+
+#if defined(__AVX2__)
+    // Find max absolute value using AVX2
+    __m256 vmax = _mm256_setzero_ps();
+    for (int j = 0; j < QK1_0; j += 8) {
+      __m256 v = _mm256_loadu_ps(block_x + j);
+      // abs: clear sign bit
+      __m256 va = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), v);
+      vmax = _mm256_max_ps(vmax, va);
+    }
+    // Horizontal max
+    __m128 hi = _mm256_extractf128_ps(vmax, 1);
+    __m128 lo = _mm256_castps256_ps128(vmax);
+    lo = _mm_max_ps(lo, hi);
+    lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_max_ss(lo, _mm_movehdup_ps(lo));
+    float amax = _mm_cvtss_f32(lo);
+
+    y[i].d = nntr_fp32_to_fp16(amax);
+
+    // Pack sign bits using AVX2 movemask
+    const __m256 zero = _mm256_setzero_ps();
+    for (int chunk = 0; chunk < 4; chunk++) {
+      // Process 32 floats per chunk, extracting sign bits
+      // movemask gives 8 bits from 8 floats (sign bits)
+      uint32_t bits = 0;
+      for (int g = 0; g < 4; g++) {
+        __m256 v = _mm256_loadu_ps(block_x + chunk * 32 + g * 8);
+        // cmpge: >= 0 → all 1s (bit = 1 for non-negative)
+        __m256 cmp = _mm256_cmp_ps(v, zero, _CMP_GE_OQ);
+        uint32_t mask = _mm256_movemask_ps(cmp);
+        bits |= (mask << (g * 8));
+      }
+      memcpy(&y[i].qs[chunk * 4], &bits, 4);
+    }
+
+#elif defined(__ARM_NEON) && !defined(ARMV7)
+    // Find max absolute value using NEON
+    float32x4_t vmax4 = vdupq_n_f32(0.0f);
+    for (int j = 0; j < QK1_0; j += 4) {
+      float32x4_t v = vld1q_f32(block_x + j);
+      vmax4 = vmaxq_f32(vmax4, vabsq_f32(v));
+    }
+    float amax = vmaxvq_f32(vmax4);
+
+    y[i].d = nntr_fp32_to_fp16(amax);
+
+    // Pack sign bits
+    memset(y[i].qs, 0, QK1_0 / 8);
+    for (int j = 0; j < QK1_0; j++) {
+      if (block_x[j] >= 0.0f) {
+        y[i].qs[j / 8] |= (1 << (j % 8));
+      }
+    }
+
+#else
+    // Scalar fallback
+    float amax = 0.0f;
+    for (int j = 0; j < QK1_0; j++) {
+      amax = MAX(amax, fabsf(block_x[j]));
+    }
+
+    y[i].d = nntr_fp32_to_fp16(amax);
+
+    memset(y[i].qs, 0, QK1_0 / 8);
+    for (int j = 0; j < QK1_0; j++) {
+      if (block_x[j] >= 0.0f) {
+        y[i].qs[j / 8] |= (1 << (j % 8));
+      }
+    }
+#endif
+  }
+}
+
+size_t nntr_quantize_q1_0(const float *__restrict src, void *__restrict dst,
+                          int64_t nrows, int64_t n_per_row,
+                          const float *imatrix) {
+  (void)imatrix;
+  assert(n_per_row % QK1_0 == 0);
+  const int blocks_per_row = n_per_row / QK1_0;
+  block_q1_0 *out = (block_q1_0 *)dst;
+
+  for (int64_t row = 0; row < nrows; row++) {
+    quantize_row_q1_0_ref(src + row * n_per_row,
+                          out + row * blocks_per_row, n_per_row);
+  }
+
+  return nrows * blocks_per_row * sizeof(block_q1_0);
+}
+
+/**
+ * @brief Dequantize a row of Q1_0 data to float.
+ * For each block: scale = FP16_to_FP32(d), then for each bit:
+ *   bit=1 -> +scale, bit=0 -> -scale
+ */
+static void dequantize_row_q1_0_impl(const block_q1_0 *__restrict x,
+                                     float *__restrict y, int64_t k) {
+  assert(k % QK1_0 == 0);
+  const int nb = k / QK1_0;
+
+#if defined(__AVX2__)
+  for (int i = 0; i < nb; i++) {
+    const float d = nntr_fp16_to_fp32(x[i].d);
+    const __m256 vd = _mm256_set1_ps(d);
+    const __m256 vnd = _mm256_set1_ps(-d);
+
+    // Process 128 bits = 16 bytes, 32 floats at a time (4 iterations of 32)
+    for (int chunk = 0; chunk < 4; chunk++) {
+      // Load 4 bytes = 32 bits
+      uint32_t bits;
+      memcpy(&bits, &x[i].qs[chunk * 4], 4);
+
+      // Expand 32 bits to 32 bytes of 0x00/0xFF mask
+      const __m256i mask = bytes_from_bits_32(&x[i].qs[chunk * 4]);
+
+      // Use blendv: if mask byte is 0xFF (bit=1) pick +d, else -d
+      const __m256 lo = _mm256_blendv_ps(vnd, vd,
+        _mm256_castsi256_ps(mask));
+
+      // For upper 16 bits (bytes 16-31 of mask are for upper bits)
+      // Actually bytes_from_bits_32 already handles all 32 bits
+      // Store first 8 floats
+      _mm256_storeu_ps(y + i * QK1_0 + chunk * 32, lo);
+
+      // Need to handle remaining 24 floats from the same 32-bit chunk
+      // bytes_from_bits_32 gives 32 bytes, each 0x00 or 0xFF
+      // We need to process them 8 at a time for float conversion
+      // Extract individual bit groups
+      __m128i mask_lo = _mm256_castsi256_si128(mask);
+      __m128i mask_hi = _mm256_extracti128_si256(mask, 1);
+
+      // Bytes 0-7 → floats 0-7 (already done above with blendv on full 256)
+      // Redo properly: extract each 8-byte lane
+      // Lane 0: bits 0-7 → bytes 0-7
+      __m256 sel0 = _mm256_blendv_ps(vnd, vd,
+        _mm256_castsi256_ps(_mm256_cvtepi8_epi32(mask_lo)));
+      _mm256_storeu_ps(y + i * QK1_0 + chunk * 32 + 0, sel0);
+
+      // Lane 1: bits 8-15 → bytes 8-15
+      __m256 sel1 = _mm256_blendv_ps(vnd, vd,
+        _mm256_castsi256_ps(_mm256_cvtepi8_epi32(
+          _mm_srli_si128(mask_lo, 8))));
+      _mm256_storeu_ps(y + i * QK1_0 + chunk * 32 + 8, sel1);
+
+      // Lane 2: bits 16-23 → bytes 16-23
+      __m256 sel2 = _mm256_blendv_ps(vnd, vd,
+        _mm256_castsi256_ps(_mm256_cvtepi8_epi32(mask_hi)));
+      _mm256_storeu_ps(y + i * QK1_0 + chunk * 32 + 16, sel2);
+
+      // Lane 3: bits 24-31 → bytes 24-31
+      __m256 sel3 = _mm256_blendv_ps(vnd, vd,
+        _mm256_castsi256_ps(_mm256_cvtepi8_epi32(
+          _mm_srli_si128(mask_hi, 8))));
+      _mm256_storeu_ps(y + i * QK1_0 + chunk * 32 + 24, sel3);
+    }
+  }
+#elif defined(__ARM_NEON) && !defined(ARMV7)
+  for (int i = 0; i < nb; i++) {
+    const float d = nntr_fp16_to_fp32(x[i].d);
+    const float32x4_t vd = vdupq_n_f32(d);
+    const float32x4_t vnd = vdupq_n_f32(-d);
+
+    // Process 128 bits = 16 bytes, 4 floats at a time (32 iterations)
+    for (int byte_idx = 0; byte_idx < 16; byte_idx++) {
+      uint8_t bits = x[i].qs[byte_idx];
+      for (int bit_idx = 0; bit_idx < 8; bit_idx += 4) {
+        // Process 4 bits at a time
+        uint32x4_t bit_vec = {
+          (uint32_t)((bits >> (bit_idx + 0)) & 1),
+          (uint32_t)((bits >> (bit_idx + 1)) & 1),
+          (uint32_t)((bits >> (bit_idx + 2)) & 1),
+          (uint32_t)((bits >> (bit_idx + 3)) & 1)
+        };
+        // Compare to create mask: bit==1 -> 0xFFFFFFFF
+        uint32x4_t mask = vceqq_u32(bit_vec, vdupq_n_u32(1));
+        // Select +d or -d based on mask
+        float32x4_t result = vbslq_f32(mask, vd, vnd);
+        vst1q_f32(y + i * QK1_0 + byte_idx * 8 + bit_idx, result);
+      }
+    }
+  }
+#else
+  // Scalar fallback
+  for (int i = 0; i < nb; i++) {
+    const float d = nntr_fp16_to_fp32(x[i].d);
+
+    for (int j = 0; j < QK1_0; j++) {
+      const int bit = (x[i].qs[j / 8] >> (j % 8)) & 1;
+      y[i * QK1_0 + j] = bit ? d : -d;
+    }
+  }
+#endif
+}
+
+void nntr_dequantize_row_q1_0(const void *__restrict x, float *__restrict y,
+                              int64_t k) {
+  dequantize_row_q1_0_impl((const block_q1_0 *)x, y, k);
+}
+
+/**
+ * @brief Dot product of Q1_0 weights and Q8_0 activations.
+ * For 1-bit weights, multiplication reduces to sign selection:
+ *   sum += (bit ? +scale : -scale) * q8_val * q8_scale
+ *
+ * AVX2 optimization: Use bit expansion to create sign masks,
+ *   then _mm256_sign_epi8 to conditionally negate Q8 values.
+ */
+void nntr_vec_dot_q1_0_q8_0(int n, float *__restrict s,
+                            const void *__restrict vx,
+                            const void *__restrict vy) {
+  assert(n % QK1_0 == 0);
+  const block_q1_0 *__restrict x = (const block_q1_0 *)vx;
+  const block_q8_0 *__restrict y = (const block_q8_0 *)vy;
+
+  const int nb_q1 = n / QK1_0;
+
+#if defined(__AVX2__)
+  __m256 acc = _mm256_setzero_ps();
+
+  for (int i = 0; i < nb_q1; i++) {
+    const float d_q1 = nntr_fp16_to_fp32(x[i].d);
+
+    // Process 4 Q8_0 blocks per Q1_0 block
+    for (int q8_idx = 0; q8_idx < 4; q8_idx++) {
+      const block_q8_0 *y_block = &y[i * 4 + q8_idx];
+      const float d_q8 = nntr_fp16_to_fp32(y_block->d);
+      const float d_prod = d_q1 * d_q8;
+
+      // Get 4 bytes of bits for this Q8_0 block (32 bits for 32 Q8 values)
+      const uint8_t *bit_ptr = &x[i].qs[q8_idx * 4];
+
+      // Expand 32 bits to 32 bytes: 0x00 (bit=0) or 0xFF (bit=1)
+      const __m256i bit_mask = bytes_from_bits_32(bit_ptr);
+      // Convert to sign: bit=1 → +1, bit=0 → -1
+      const __m256i ones = _mm256_set1_epi8(1);
+      const __m256i neg_ones = _mm256_set1_epi8(-1);
+      const __m256i sign_vec = _mm256_or_si256(
+        _mm256_and_si256(bit_mask, ones),
+        _mm256_andnot_si256(bit_mask, neg_ones));
+
+      // Load Q8 values (32 int8)
+      const __m256i q8_vals = _mm256_loadu_si256((const __m256i *)y_block->qs);
+
+      // Multiply sign * q8: use _mm256_sign_epi8
+      const __m256i prod = _mm256_sign_epi8(q8_vals, sign_vec);
+
+      // Horizontal sum of int8 products → int32
+      // Use maddubs: pairs of unsigned*signed → int16, then madd → int32
+      const __m256i abs_prod = _mm256_abs_epi8(prod);
+      const __m256i sign_prod = _mm256_cmpgt_epi8(
+        _mm256_setzero_si256(), prod);
+      // Simple approach: convert to int16 pairs then sum
+      const __m256i prod_16lo = _mm256_cvtepi8_epi16(
+        _mm256_castsi256_si128(prod));
+      const __m256i prod_16hi = _mm256_cvtepi8_epi16(
+        _mm256_extracti128_si256(prod, 1));
+      const __m256i ones_16 = _mm256_set1_epi16(1);
+      const __m256i sum32lo = _mm256_madd_epi16(prod_16lo, ones_16);
+      const __m256i sum32hi = _mm256_madd_epi16(prod_16hi, ones_16);
+      const __m256i sum32 = _mm256_add_epi32(sum32lo, sum32hi);
+      const int32_t sumi = hsum_i32_8(sum32);
+
+      acc = _mm256_fmadd_ps(
+        _mm256_set1_ps(d_prod),
+        _mm256_set1_ps((float)sumi),
+        acc);
+    }
+  }
+
+  // Only need first element since we accumulated a scalar product
+  *s = hsum_float_8(acc);
+
+#else
+  // Scalar fallback
+  float sumf = 0.0f;
+
+  for (int i = 0; i < nb_q1; i++) {
+    const float d_q1 = nntr_fp16_to_fp32(x[i].d);
+
+    for (int q8_idx = 0; q8_idx < 4; q8_idx++) {
+      const block_q8_0 *y_block = &y[i * 4 + q8_idx];
+      const float d_q8 = nntr_fp16_to_fp32(y_block->d);
+      int32_t sumi = 0;
+
+      for (int j = 0; j < QK8_0; j++) {
+        const int bit_pos = q8_idx * QK8_0 + j;
+        const int bit = (x[i].qs[bit_pos / 8] >> (bit_pos % 8)) & 1;
+        const int sign = 2 * bit - 1;
+        sumi += sign * (int32_t)y_block->qs[j];
+      }
+
+      sumf += d_q1 * d_q8 * (float)sumi;
+    }
+  }
+
+  *s = sumf;
+#endif
+}
+
+/**
+ * @brief Dot product of Q1_0 weights and float activations.
+ *
+ * AVX2 optimization strategy:
+ *   For each 32-bit chunk (32 weights), expand bits to sign masks,
+ *   then compute: sum += scale * dot(sign_vec, activation_vec)
+ *   where sign_vec[i] = bit ? +1.0 : -1.0
+ *
+ * NEON optimization strategy:
+ *   Similar bit expansion, 4 floats at a time with vbslq_f32.
+ */
+void nntr_vec_dot_q1_0_f32(int n, float *__restrict s,
+                           const void *__restrict vx,
+                           const float *__restrict vy) {
+  assert(n % QK1_0 == 0);
+  const block_q1_0 *__restrict x = (const block_q1_0 *)vx;
+
+  const int nb = n / QK1_0;
+
+#if defined(__AVX2__)
+  __m256 acc = _mm256_setzero_ps();
+
+  for (int i = 0; i < nb; i++) {
+    const float d = nntr_fp16_to_fp32(x[i].d);
+    const __m256 vd = _mm256_set1_ps(d);
+    const __m256 vnd = _mm256_set1_ps(-d);
+
+    // Process 128 weights in 4 chunks of 32
+    for (int chunk = 0; chunk < 4; chunk++) {
+      // Expand 32 bits to 32 bytes of 0x00/0xFF
+      const __m256i mask = bytes_from_bits_32(&x[i].qs[chunk * 4]);
+      const __m128i mask_lo = _mm256_castsi256_si128(mask);
+      const __m128i mask_hi = _mm256_extracti128_si256(mask, 1);
+
+      const float *act = vy + i * QK1_0 + chunk * 32;
+
+      // 8 floats at a time, 4 groups of 8
+      // Group 0: bits 0-7
+      __m256 sign0 = _mm256_blendv_ps(vnd, vd,
+        _mm256_castsi256_ps(_mm256_cvtepi8_epi32(mask_lo)));
+      __m256 a0 = _mm256_loadu_ps(act + 0);
+      acc = _mm256_fmadd_ps(sign0, a0, acc);
+
+      // Group 1: bits 8-15
+      __m256 sign1 = _mm256_blendv_ps(vnd, vd,
+        _mm256_castsi256_ps(_mm256_cvtepi8_epi32(
+          _mm_srli_si128(mask_lo, 8))));
+      __m256 a1 = _mm256_loadu_ps(act + 8);
+      acc = _mm256_fmadd_ps(sign1, a1, acc);
+
+      // Group 2: bits 16-23
+      __m256 sign2 = _mm256_blendv_ps(vnd, vd,
+        _mm256_castsi256_ps(_mm256_cvtepi8_epi32(mask_hi)));
+      __m256 a2 = _mm256_loadu_ps(act + 16);
+      acc = _mm256_fmadd_ps(sign2, a2, acc);
+
+      // Group 3: bits 24-31
+      __m256 sign3 = _mm256_blendv_ps(vnd, vd,
+        _mm256_castsi256_ps(_mm256_cvtepi8_epi32(
+          _mm_srli_si128(mask_hi, 8))));
+      __m256 a3 = _mm256_loadu_ps(act + 24);
+      acc = _mm256_fmadd_ps(sign3, a3, acc);
+    }
+  }
+
+  *s = hsum_float_8(acc);
+
+#elif defined(__ARM_NEON) && !defined(ARMV7)
+  float32x4_t acc0 = vdupq_n_f32(0.0f);
+  float32x4_t acc1 = vdupq_n_f32(0.0f);
+
+  for (int i = 0; i < nb; i++) {
+    const float d = nntr_fp16_to_fp32(x[i].d);
+    const float32x4_t vd = vdupq_n_f32(d);
+    const float32x4_t vnd = vdupq_n_f32(-d);
+
+    for (int byte_idx = 0; byte_idx < 16; byte_idx++) {
+      uint8_t bits = x[i].qs[byte_idx];
+      const float *act = vy + i * QK1_0 + byte_idx * 8;
+
+      // Process 8 bits (2 groups of 4)
+      for (int g = 0; g < 2; g++) {
+        uint32x4_t bit_vec = {
+          (uint32_t)((bits >> (g * 4 + 0)) & 1),
+          (uint32_t)((bits >> (g * 4 + 1)) & 1),
+          (uint32_t)((bits >> (g * 4 + 2)) & 1),
+          (uint32_t)((bits >> (g * 4 + 3)) & 1)
+        };
+        uint32x4_t mask = vceqq_u32(bit_vec, vdupq_n_u32(1));
+        float32x4_t sign = vbslq_f32(mask, vd, vnd);
+        float32x4_t a = vld1q_f32(act + g * 4);
+        acc0 = vfmaq_f32(acc0, sign, a);
+      }
+    }
+  }
+
+  float32x4_t sum4 = vaddq_f32(acc0, acc1);
+  *s = vaddvq_f32(sum4);
+
+#else
+  // Scalar fallback
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; i++) {
+    const float d = nntr_fp16_to_fp32(x[i].d);
+    float block_sum = 0.0f;
+
+    for (int j = 0; j < QK1_0; j++) {
+      const int bit = (x[i].qs[j / 8] >> (j % 8)) & 1;
+      const float w = bit ? d : -d;
+      block_sum += w * vy[i * QK1_0 + j];
+    }
+
+    sumf += block_sum;
+  }
+
+  *s = sumf;
+#endif
+}
+
+/**
+ * @brief GEMM for Q1_0 weights and float activations.
+ * Reuses nntr_vec_dot_q1_0_f32 for the inner dot product.
+ *
+ * @param n number of elements per row (K dimension)
+ * @param s output matrix C (nr x nc)
+ * @param bs leading dimension of C
+ * @param vx Q1_0 quantized weight matrix (nr rows)
+ * @param vy float activation matrix (nc rows, each of length n)
+ * @param nr number of weight rows (output rows)
+ * @param nc number of activation rows (output columns)
+ */
+void nntr_gemm_q1_0_f32(int n, float *__restrict s, size_t bs,
+                        const void *__restrict vx, const float *__restrict vy,
+                        int nr, int nc) {
+  assert(n % QK1_0 == 0);
+  const int nb = n / QK1_0;
+  const block_q1_0 *__restrict x = (const block_q1_0 *)vx;
+
+  for (int m = 0; m < nr; m++) {
+    const block_q1_0 *row_w = x + m * nb;
+
+    for (int col = 0; col < nc; col++) {
+      const float *row_a = vy + col * n;
+      float dot_result;
+      nntr_vec_dot_q1_0_f32(n, &dot_result, row_w, row_a);
+      s[m * bs + col] = dot_result;
+    }
+  }
+}

@@ -23,7 +23,7 @@
 
 #include <cstddef>
 
-#include <cpu_backend.h>
+#include <compute_ops.h>
 #include <nntrainer_log.h>
 #include <tensor_base.h>
 
@@ -860,7 +860,7 @@ public:
    * @retval    #ML_ERROR_INVALID_PARAMETER Tensor dimension is not right
    * @retval    #ML_ERROR_NONE Successful
    */
-  int multiply_i(float const &value);
+  int multiply_i(float const &value, ComputeOps *ops = nullptr);
 
   /**
    * @brief     Multiply value element by element
@@ -875,7 +875,8 @@ public:
    * @param[out] out out tensor to store the result
    * @retval     Calculated Tensor
    */
-  Tensor &multiply(float const &value, Tensor &out) const;
+  Tensor &multiply(float const &value, Tensor &out,
+                   ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     Multiply Tensor Elementwise
@@ -901,7 +902,7 @@ public:
    * @retval     Calculated Tensor
    */
   Tensor &multiply(Tensor const &m, Tensor &output,
-                   const float beta = 0.0) const;
+                   const float beta = 0.0, ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     Divide value element by element immediately
@@ -924,7 +925,8 @@ public:
    * @param[out] output Tensor to store the result
    * @retval    Calculated Tensor
    */
-  Tensor &divide(float const &value, Tensor &output) const;
+  Tensor &divide(float const &value, Tensor &output,
+                 ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     divide Tensor Elementwise
@@ -946,7 +948,7 @@ public:
    * @param[out] output Tensor to store the result
    * @retval    Calculated Tensor
    */
-  Tensor &divide(Tensor const &m, Tensor &output) const;
+  Tensor &divide(Tensor const &m, Tensor &output, ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     Add Tensor Elementwise
@@ -1010,7 +1012,8 @@ public:
    * @param[out] output Tensor to save output without allocating new memory
    * @retval     Calculated Tensor
    */
-  Tensor &add(float const &value, Tensor &output) const;
+  Tensor &add(float const &value, Tensor &output,
+              ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     Add Tensor Element by Element without mem copy
@@ -1036,7 +1039,7 @@ public:
    */
   int add_i_partial(unsigned int len, unsigned int addr_idx, Tensor &m,
                     unsigned int incX, unsigned int incY, const Tensor alphas,
-                    unsigned int alpha_idx);
+                    unsigned int alpha_idx, ComputeOps *ops = nullptr);
 
   /**
    * @brief     Add Tensor Element by Element
@@ -1053,7 +1056,7 @@ public:
    * @param[in]  alpha Values to be scaled
    * @retval     Calculated Tensor
    */
-  Tensor &add(Tensor const &m, Tensor &output, float const alpha = 1) const;
+  Tensor &add(Tensor const &m, Tensor &output, float const alpha = 1, ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     memcpyless version of subtract
@@ -1104,7 +1107,7 @@ public:
    * @brief     sum all the Tensor elements according to the batch
    * @retval    Calculated Tensor(batch, 1, 1, 1)
    */
-  Tensor sum_by_batch() const;
+  Tensor sum_by_batch(ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     sum all the Tensor elements according to the axis
@@ -1156,7 +1159,7 @@ public:
    * @brief  return absolute value
    * @retval Calculated Tensor
    */
-  Tensor &abs(Tensor &output) const;
+  Tensor &abs(Tensor &output, ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     Averaging the Tensor elements according to the axis
@@ -1293,6 +1296,69 @@ public:
   void tan(Tensor &output, float alpha = 1.0) const;
 
   /**
+   * @brief     Compute exponential element-wise (in-place)
+   * @retval    #ML_ERROR_NONE  Successful
+   */
+  int exp_i();
+
+  /**
+   * @brief     Compute exponential element-wise
+   * @retval    Calculated Tensor
+   */
+  Tensor exp() const;
+
+  /**
+   * @brief      Compute exponential element-wise
+   * @param[out] output out to store the result
+   * @retval     Calculated Tensor
+   */
+  Tensor &exp(Tensor &output) const;
+
+  /**
+   * @brief     Compute natural logarithm element-wise (in-place)
+   * @retval    #ML_ERROR_NONE  Successful
+   */
+  int log_i();
+
+  /**
+   * @brief     Compute natural logarithm element-wise
+   * @retval    Calculated Tensor
+   */
+  Tensor log() const;
+
+  /**
+   * @brief      Compute natural logarithm element-wise
+   * @param[out] output out to store the result
+   * @retval     Calculated Tensor
+   */
+  Tensor &log(Tensor &output) const;
+
+  /**
+   * @brief     Clamp tensor values to [min, max] (in-place)
+   * @param[in] min minimum value
+   * @param[in] max maximum value
+   * @retval    #ML_ERROR_NONE  Successful
+   */
+  int clamp_i(float min, float max);
+
+  /**
+   * @brief     Clamp tensor values to [min, max]
+   * @param[in] min minimum value
+   * @param[in] max maximum value
+   * @retval    Calculated Tensor
+   */
+  Tensor clamp(float min, float max) const;
+
+  /**
+   * @brief      Clamp tensor values to [min, max]
+   * @param[in]  min minimum value
+   * @param[in]  max maximum value
+   * @param[out] output out to store the result
+   * @retval     Calculated Tensor
+   */
+  Tensor &clamp(float min, float max, Tensor &output) const;
+
+  /**
    * @brief inverse squared root function (in-place)
    */
   void inv_sqrt_i();
@@ -1301,7 +1367,7 @@ public:
    * @brief inverse squared root function
    * @param[in] out output Tensor
    */
-  Tensor inv_sqrt(Tensor &out) const;
+  Tensor inv_sqrt(Tensor &out, ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     Anchor a starting point to defer following evaluation
@@ -1313,7 +1379,7 @@ public:
    * @brief     l2norm the Tensor elements
    * @retval    Calculated l2norm
    */
-  float l2norm() const;
+  float l2norm(ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     Normalize the Tensor elements
@@ -1371,7 +1437,8 @@ public:
    * @retval    Calculated Tensor
    */
   Tensor &dot(Tensor const &input, Tensor &output, bool trans = false,
-              bool trans_in = false, float beta = 0.0f) const;
+              bool trans_in = false, float beta = 0.0f,
+              ComputeOps *ops = nullptr) const;
 
   void dot(std::vector<Tensor *> inputs, std::vector<Tensor *> outputs,
            bool trans = false, bool trans_in = false, float beta = 0.0f) const;
@@ -1564,14 +1631,14 @@ public:
    * @note copy can reshape the tensor to match the shape
    * @note support copying data from multiple data type
    */
-  void copy(const Tensor &from);
+  void copy(const Tensor &from, ComputeOps *ops = nullptr);
 
   /**
    * @brief     Copy the Tensor
    * @param[in] from Tensor to be copied
    * @note      support copying data from multiple data type
    */
-  void copyData(const Tensor &from);
+  void copyData(const Tensor &from, ComputeOps *ops = nullptr);
 
   /**
    * @brief     Copy the Tensor
@@ -1706,7 +1773,7 @@ public:
    * @brief     return max of the absolute values of the tensor
    * @retval    maximum absolute value
    */
-  float max_abs() const;
+  float max_abs(ComputeOps *ops = nullptr) const;
 
   /**
    * @brief  return maximum value
@@ -1733,7 +1800,8 @@ public:
    * @param[out] Tensor to save to, dimension is always reshaped.
    * @retval     Tensor& reference to the out
    */
-  Tensor &transpose(const std::string &direction, Tensor &out) const;
+  Tensor &transpose(const std::string &direction, Tensor &out,
+                    ComputeOps *ops = nullptr) const;
 
   /**
    * @brief     set Tensor Dim
@@ -1927,6 +1995,17 @@ public:
   QScheme q_scheme() const;
 
   /**
+   * @brief     return the quantization group size for grouped per-channel
+   *            quantized tensors (e.g. Int4QTensor PER_CHANNEL_AFFINE).
+   *            Returns 0 for non-quantized tensors. For Int4QTensor, a
+   *            value of 0 also signals pure per-channel (qsi4cxp: one
+   *            scale per output channel); any non-zero value means
+   *            "group_size elements share one scale" within each channel.
+   * @retval    group size in elements, 0 if not applicable
+   */
+  size_t group_size() const;
+
+  /**
    * @brief Merge the given two axis for tensor at second axis inplace
    *
    * @param axis1 first axis to merge
@@ -1976,7 +2055,7 @@ public:
    * @brief      check if there is NaN or Inf element
    * @param[out] bool false if there is NaN or Inf else false
    */
-  bool isValid() const { return itensor_->isValid(); };
+  bool isValid(ComputeOps *ops = nullptr) const { return itensor_->isValid(ops); };
 
   /**
    * @brief check if tensor is virtual

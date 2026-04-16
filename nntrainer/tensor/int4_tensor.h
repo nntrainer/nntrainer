@@ -21,13 +21,53 @@ namespace nntrainer {
  * @class Int4QTensor class
  * @brief Int4QTensor class for quantized 4-bit integer calculation
  *
- * @note Int4QTensor store int4 data within the int8 memory space.
- * Specifically, each int8 value contains two int4 values packed together.
- * The first four bits represent the first int4 value, while the last four bits
- * represent the second int4 value.
- * E.g., 01011001 (89) represents 0101 (+5) and 1001 (-1)
+ * @note Int4QTensor stores symmetric signed int4 data inside int8 memory
+ * space. Each int8 byte carries two int4 values packed together; the high
+ * nibble is the element at even index, the low nibble is the element at
+ * odd index. E.g. the byte 01011001 (0x59) represents 0101 (+5) at index
+ * 2*i and 1001 (-1, two's complement) at index 2*i+1. The class supports
+ * both PER_TENSOR_AFFINE (one scale for the entire tensor) and
+ * PER_CHANNEL_AFFINE (grouped per-channel) via QScheme.
  *
- * @todo Remove variable `group_size` and add PER_GROUP_AFFINE_32,64,128
+ * @note CANONICAL IN-MEMORY / ON-DISK LAYOUT (must match all three
+ * backends: KleidiAI CPU, LiteRT-LM/Adreno GPU repackers, QNN HTP):
+ *
+ *   Offset                               | Content
+ *   -------------------------------------+-------------------------------
+ *   0 .. ceil(N/2) - 1                   | packed int4 values, row-major
+ *                                        | in the tensor's natural order
+ *                                        | (output-channel first). Two
+ *                                        | nibbles per byte, high nibble
+ *                                        | = even index.
+ *   ceil(N/2) .. ceil(N/2) + 4*S - 1     | per-scale fp32 array of
+ *                                        | length S = scale_size(),
+ *                                        | contiguous, row-major.
+ *
+ * NOTE on scale dtype: scales are fp32, not fp16. This matches (a) the
+ * memory that Int4QTensor::allocate() actually reserves via
+ * `sizeof(float) * scale_size()`, (b) KleidiAI's qai8dxp_qsi4cxp_unpacked
+ * variant which takes `rhs_scales_f32`, and (c) the existing
+ * char_tensor/quantizer code that accesses scales via getScale<float>().
+ * Using 2 bytes/scale (fp16) would save memory but would conflict with
+ * all three existing consumers and break the round-trip test suite.
+ *
+ * Where N = dim.getDataLen() and S is determined by the QScheme:
+ *   PER_TENSOR_AFFINE  -> S = 1
+ *   PER_CHANNEL_AFFINE -> S = height * width / group_size_
+ *                         (if group_size_ == row_width, this collapses
+ *                          to S = height, i.e. one scale per output
+ *                          channel = pure per-channel / qsi4cxp)
+ *
+ * group_size_ is a PER-INSTANCE member so one process can hold tensors
+ * with different group sizes (e.g. 0 / pure, 32, 64, 128) simultaneously.
+ * The previous implementation used a static class member, which forced
+ * all Int4QTensors in a process to share a single group size and made
+ * mixed-quantization models impossible.
+ *
+ * This canonical layout is also what safetensors schema_version 2 writes
+ * for dtype "I4" + quant.encoding == "axis_scale_offset". See
+ * neuralnet.cpp::NeuralNetwork::save for the writer and the
+ * documentation note in P4 for details.
  */
 class Int4QTensor : public TensorBase {
 public:
@@ -36,7 +76,7 @@ public:
    */
   Int4QTensor(std::string name_ = "", Tformat fm = Tformat::NCHW,
               QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
-              size_t g_size = 32);
+              size_t g_size = 0);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -50,7 +90,7 @@ public:
   Int4QTensor(const TensorDim &d, bool alloc_now,
               Initializer init = Initializer::NONE, std::string name = "",
               QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
-              size_t g_size = 32);
+              size_t g_size = 0);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -61,7 +101,7 @@ public:
    */
   Int4QTensor(const TensorDim &d, const void *buf = nullptr,
               QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
-              size_t g_size = 32);
+              size_t g_size = 0);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -74,7 +114,7 @@ public:
   Int4QTensor(
     std::vector<std::vector<std::vector<std::vector<int8_t>>>> const &d,
     std::vector<float> const &scales, Tformat fm, QScheme qscheme_,
-    size_t g_size = 32);
+    size_t g_size = 0);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -209,12 +249,12 @@ public:
   /**
    * @copydoc Tensor::copy(const Tensor &from)
    */
-  void copy(const Tensor &from) override;
+  void copy(const Tensor &from, ComputeOps *ops = nullptr) override;
 
   /**
    * @copydoc Tensor::copyData(const Tensor &from)
    */
-  void copyData(const Tensor &from) override;
+  void copyData(const Tensor &from, ComputeOps *ops = nullptr) override;
 
   /**
    * @copydoc Tensor::copy_with_stride()
@@ -252,7 +292,7 @@ public:
   /**
    * @copydoc Tensor::max_abs()
    */
-  float max_abs() const override;
+  float max_abs(ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::maxValue()
@@ -301,9 +341,46 @@ public:
   QScheme q_scheme() const override;
 
   /**
-   * @brief Returns quantization group size
+   * @brief     return the quantization group size stored on this instance.
+   * @retval    group size in elements
+   * @note      This is the number of elements that share one fp16 scale
+   *            factor within a channel (or across the whole tensor when
+   *            scheme == PER_TENSOR_AFFINE). See the CANONICAL LAYOUT
+   *            note on the class for full semantics.
    */
-  static size_t getGroupSize();
+  size_t group_size() const override { return group_size_; }
+
+  /**
+   * @brief Build a Q4_0 interleaved repack cache from the canonical
+   *        qsi4cxp kxn data. This enables fast GEMM on x86 (via the
+   *        GGML AVX2 kernel) without KleidiAI. The cache is persistent
+   *        — call once at load time and reuse across all forward() calls.
+   *
+   * Layout produced (matches GGML gemm_q4_0):
+   *   N rows of (K/32) block_q4_0 each. Each block = 2B fp16 scale +
+   *   16B packed nibbles (32 int4 values). Total = N * (K/32) * 18 bytes.
+   *
+   * The per-output-column fp32 scale is TRUNCATED to fp16 and duplicated
+   * into every block within that column (since the original data is
+   * pure per-channel = same scale for all K elements in one column).
+   *
+   * @pre width() must be divisible by 32 (K%32==0 for Q4_0 blocks).
+   *      Throws std::invalid_argument otherwise.
+   * @note Thread-safe for concurrent reads after build (const accessor).
+   */
+  void buildQ4_0RepackCache();
+
+  /**
+   * @brief Return the Q4_0 repack buffer (nullptr if not built).
+   */
+  const void *getQ4_0RepackData() const {
+    return q4_0_repack_cache_.empty() ? nullptr : q4_0_repack_cache_.data();
+  }
+
+  /**
+   * @brief Check whether the Q4_0 repack cache has been built.
+   */
+  bool hasQ4_0RepackCache() const { return !q4_0_repack_cache_.empty(); }
 
 private:
   /**
@@ -312,11 +389,25 @@ private:
   QScheme qscheme;
 
   /**
-   * @brief Quantization group size
-   *
-   * @note need to properly define this
+   * @brief per-instance quantization group size (elements per scale).
+   *        Default 0, which is the canonical signal for "pure per-channel"
+   *        (= one scale per output row, a.k.a. qsi4cxp / QNN
+   *        AXIS_SCALE_OFFSET with numScaleOffsets == height). A non-zero
+   *        value means "group_size_ elements share one scale" within
+   *        each output row (e.g. 32 -> qsi4c32p / GGML Q4_0 block layout).
+   *        Set via constructor argument g_size; no longer static so
+   *        multiple Int4QTensors with different group sizes can coexist
+   *        in one process (required for per-layer mixed quant and for
+   *        safetensors schema_version 2 round-tripping).
    */
-  static size_t group_size;
+  size_t group_size_ = 0;
+
+  /**
+   * @brief Cached Q4_0 interleaved repack for x86 GGML GEMM. Built
+   *        once at load time via buildQ4_0RepackCache(), then used by
+   *        FloatTensor::dotQInteger on non-KleidiAI platforms.
+   */
+  std::vector<uint8_t> q4_0_repack_cache_;
 
   /**
    * @brief copy a buffer to @a this, the caller has to ensure that @a this is
@@ -335,7 +426,7 @@ private:
   /**
    * @copydoc Tensor::isValid()
    */
-  bool isValid() const override { return true; };
+  bool isValid(ComputeOps *ops = nullptr) const override { return true; };
 };
 
 } // namespace nntrainer

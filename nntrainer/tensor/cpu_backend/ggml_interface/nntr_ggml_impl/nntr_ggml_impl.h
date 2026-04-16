@@ -102,4 +102,25 @@ void nntr_vec_dot_q6_K_q8_K(int n, float *__restrict s, size_t bs,
                             const void *__restrict vx, size_t bx,
                             const void *__restrict vy, size_t by, int nrc);
 
+// -------- Q1_0 (1-bit, group size 128) -----------------
+
+size_t nntr_quantize_q1_0(const float *__restrict src, void *__restrict dst,
+                          int64_t nrows, int64_t n_per_row,
+                          const float *imatrix);
+
+void nntr_dequantize_row_q1_0(const void *__restrict x, float *__restrict y,
+                              int64_t k);
+
+void nntr_vec_dot_q1_0_q8_0(int n, float *__restrict s,
+                            const void *__restrict vx,
+                            const void *__restrict vy);
+
+void nntr_vec_dot_q1_0_f32(int n, float *__restrict s,
+                           const void *__restrict vx,
+                           const float *__restrict vy);
+
+void nntr_gemm_q1_0_f32(int n, float *__restrict s, size_t bs,
+                        const void *__restrict vx, const float *__restrict vy,
+                        int nr, int nc);
+
 #endif

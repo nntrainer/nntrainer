@@ -33,6 +33,7 @@
 #endif
 #include <fallback_internal.h>
 #include <nntrainer_error.h>
+#include <thread_manager.h>
 #include <util_func.h>
 #include <vector>
 
@@ -441,16 +442,12 @@ void unpack_q4_0x8_transpose16(const void *src, unsigned short *__restrict dT,
   // --------
   const int groups_pairs = groups_N8 / 2;
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4849)
-#endif
-#pragma omp parallel for collapse(2) schedule(static)
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
-  for (int c0 = 0; c0 < cols_scales; c0 += CT) {
-    for (int bp = 0; bp < groups_pairs; ++bp) {
+  {
+    const int cols_chunks = (cols_scales + CT - 1) / CT;
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(cols_chunks * groups_pairs), [&](size_t idx) {
+      int c0 = (static_cast<int>(idx) / groups_pairs) * CT;
+      int bp = static_cast<int>(idx) % groups_pairs;
       const int b0 = 2 * bp;
       const int b1 = b0 + 1;
       const int r0 = b0 * 8; // 16 rows: r0..r0+15
@@ -502,7 +499,7 @@ void unpack_q4_0x8_transpose16(const void *src, unsigned short *__restrict dT,
         store256_u16(base + 6 * S, _mm256_set_m128i(Cb6, Ca6));
         store256_u16(base + 7 * S, _mm256_set_m128i(Cb7, Ca7));
       }
-    }
+    });
   }
 
   // -------- tail: if odd number of 8-row groups, process the last one (8 rows)
@@ -511,8 +508,10 @@ void unpack_q4_0x8_transpose16(const void *src, unsigned short *__restrict dT,
     const int b = groups_N8 - 1;
     const int r0 = b * 8;
 
-#pragma omp parallel for schedule(static)
-    for (int c0 = 0; c0 < cols_scales; c0 += CT) {
+    const int cols_chunks = (cols_scales + CT - 1) / CT;
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(cols_chunks), [&](size_t chunk_idx) {
+      int c0 = static_cast<int>(chunk_idx) * CT;
       const int c1 = std::min(c0 + CT, cols_scales);
       for (int c = c0; c < c1; ++c) {
         const block_q4_0x8 &A = x[b * cols_scales + c];
@@ -545,7 +544,7 @@ void unpack_q4_0x8_transpose16(const void *src, unsigned short *__restrict dT,
         _mm_storeu_si128((__m128i *)(base + 6 * S), C6);
         _mm_storeu_si128((__m128i *)(base + 7 * S), C7);
       }
-    }
+    });
   }
 
 #if defined(USE_NONTEMPORAL_STORES)
@@ -605,16 +604,11 @@ static inline void convert_q4_0x8_noshuffle(const void *src,
   const block_q4_0x8 *x = (const block_q4_0x8 *)src;
   const __m256i bias256 = _mm256_set1_epi8((char)0x88);
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4849)
-#endif
-#pragma omp parallel for collapse(2) schedule(static)
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
-  for (int b = 0; b < GROUPS; ++b) {
-    for (int offset = 0; offset < 8; ++offset) {
+  {
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(GROUPS * 8), [&](size_t idx) {
+      int b = static_cast<int>(idx) / 8;
+      int offset = static_cast<int>(idx) % 8;
 
       // ---- D slice ----
       {
@@ -696,7 +690,7 @@ static inline void convert_q4_0x8_noshuffle(const void *src,
         // second half (same d0/d1 pattern)
         do_half((base_q + UNIT) >> 4);
       }
-    }
+    });
   }
 
 #if Q4X8_USE_STREAMING_STORES
@@ -2216,11 +2210,12 @@ void transform_int4_osv32_isv2_to_q4_0x8(size_t N, size_t K,
   const size_t bytes_per_row_block_span = column_blocks_count * ROW_BLOCK_SIZE;
   const int column_blocks_cnt = K / QK4_0;
 
-  alignas(32) static thread_local __m256i dst_tmp[dst_tmp_size];
-  alignas(32) static thread_local uint8_t mx16x16[16 * 16];
-
-#pragma omp parallel for schedule(guided)
-  for (int row_id = 0; row_id < (int)N; row_id += 16) {
+  const size_t row_iters = (N + 15) / 16;
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(0, row_iters, [&](size_t iter) {
+    alignas(32) __m256i dst_tmp_local[dst_tmp_size];
+    alignas(32) uint8_t mx16x16_local[16 * 16];
+    int row_id = static_cast<int>(iter) * 16;
     const size_t row_in_block_id = row_id / ROW_BLOCK_SIZE;
     size_t i_in_block = row_id % ROW_BLOCK_SIZE;
     for (int column_out_block_id = 0; column_out_block_id < column_blocks_cnt;
@@ -2232,23 +2227,23 @@ void transform_int4_osv32_isv2_to_q4_0x8(size_t N, size_t K,
       int src_offset =
         row_block_base + column_out_block_id * 16 * ROW_BLOCK_SIZE;
       transpose_matrix_16x16(&osv32_weights[src_offset], ROW_BLOCK_SIZE,
-                             mx16x16, 16);
+                             mx16x16_local, 16);
       int max_r = std::min((size_t)16, N - row_id);
       size_t row_out_block_id = row_id / NUM_Q4_0_BLOCKS;
       int dst_offset =
         (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) *
         (column_out_block_id + row_out_block_id * column_blocks_cnt);
       for (int r = 0; r < max_r; r += NUM_Q4_0_BLOCKS) {
-        create_q4_0_weights_x8(&mx16x16[16 * r], dst_tmp);
+        create_q4_0_weights_x8(&mx16x16_local[16 * r], dst_tmp_local);
 
-        nntr_make_block_q4_0x8(dst_tmp, (block_q4_0x8 *)(dst_ + dst_offset),
+        nntr_make_block_q4_0x8(dst_tmp_local, (block_q4_0x8 *)(dst_ + dst_offset),
                                &osv32_scales[scale_offset + row_id + r]);
         row_out_block_id++;
         dst_offset +=
           (NUM_Q4_0_BLOCKS * sizeof(block_q4_0)) * column_blocks_cnt;
       }
     }
-  }
+  });
 }
 
 } // namespace nntrainer::avx2

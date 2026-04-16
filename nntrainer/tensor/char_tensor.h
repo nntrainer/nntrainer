@@ -199,7 +199,7 @@ public:
   /**
    * @copydoc Tensor::multiply_i(float const &value)
    */
-  int multiply_i(float const &value) override;
+  int multiply_i(float const &value, ComputeOps *ops = nullptr) override;
 
   /**
    * @copydoc Tensor::multiply(Tensor const &m, Tensor &output, const
@@ -213,23 +213,24 @@ public:
    * 4. only per-tensor quantization qscheme is supported
    */
   Tensor &multiply(Tensor const &m, Tensor &output,
-                   const float scale = 0.0) const override;
+                   const float scale = 0.0,
+                   ComputeOps *ops = nullptr) const override;
   /**
    * @copydoc Tensor::add(Tensor const &m, Tensor &output, float const
    * alpha)
    */
   Tensor &add(Tensor const &m, Tensor &output,
-              float const scale) const override;
+              float const scale, ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::copy(const Tensor &from)
    */
-  void copy(const Tensor &from) override;
+  void copy(const Tensor &from, ComputeOps *ops = nullptr) override;
 
   /**
    * @copydoc Tensor::copyData(const Tensor &from)
    */
-  void copyData(const Tensor &from) override;
+  void copyData(const Tensor &from, ComputeOps *ops = nullptr) override;
 
   /**
    * @copydoc Tensor::copy_with_stride()
@@ -260,7 +261,7 @@ public:
   /**
    * @copydoc Tensor::max_abs()
    */
-  float max_abs() const override;
+  float max_abs(ComputeOps *ops = nullptr) const override;
 
   /**
    * @copydoc Tensor::maxValue()
@@ -315,7 +316,7 @@ private:
    *
    * @param buf buffer to copy from
    */
-  void copy(const void *buf);
+  void copy(const void *buf, ComputeOps *ops = nullptr);
 
   /**
    * @brief  Get the Data Type String object
@@ -326,7 +327,7 @@ private:
   /**
    * @copydoc Tensor::isValid()
    */
-  bool isValid() const override { return true; }; // NYI
+  bool isValid(ComputeOps *ops = nullptr) const override { return true; }; // NYI
 };
 
 } // namespace nntrainer

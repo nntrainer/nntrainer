@@ -781,25 +781,9 @@ bool Manager::checkLoadComplete(unsigned int order) {
 }
 
 bool Manager::checkUnloadComplete(unsigned int order) {
-  if (async_unload_tensor.count(order)) {
-    auto &tasks = async_unload_tensor[order];
-    std::unique_lock<std::mutex> lock(completed_unload_mutex);
-    if (exec_mode == ExecutionMode::TRAIN) {
-      auto w_fut = completed_unload_tensor[std::get<0>(tasks)].get_future();
-      auto t_fut = completed_unload_tensor[std::get<1>(tasks)].get_future();
-      lock.unlock();
-      if (std::get<0>(tasks) != 0)
-        w_fut.wait();
-      if (std::get<1>(tasks) != 0)
-        t_fut.wait();
-    } else {
-      auto w_fut = completed_unload_tensor[std::get<0>(tasks)].get_future();
-      lock.unlock();
-      if (std::get<0>(tasks) != 0)
-        w_fut.wait();
-    }
-    async_unload_tensor.erase(order);
-  }
+  // CompletionToken in CacheElem handles completion tracking.
+  // Unload completion is checked via CacheElem::waitUnload() in TensorPool.
+  async_unload_tensor.erase(order);
   return true;
 }
 
@@ -807,12 +791,7 @@ void Manager::LoadTensors(unsigned int order,
                           unsigned int remainder_lookahead) {
 
   auto loadTensorsAsync = [&](TensorPool &pool, unsigned int order) {
-    return pool.loadCacheExecAsync(
-      order, [&](int id, TaskExecutor::CompleteStatus status,
-                 std::future<TaskExecutor::CompleteStatus> fut) {
-        std::scoped_lock<std::mutex> lock(completed_load_mutex);
-        completed_load_fut[id] = std::move(fut);
-      });
+    return pool.loadCacheExecAsync(order);
   };
 
   auto enqueTasks = [&](unsigned int o) {
@@ -836,12 +815,7 @@ void Manager::LoadTensors(unsigned int order,
 void Manager::UnloadTensors(unsigned int order) {
 
   auto unloadTensorsAsync = [&](TensorPool &pool, unsigned int order) {
-    return pool.flushCacheExecAsync(
-      order, [&](int id, TaskExecutor::CompleteStatus status,
-                 std::future<TaskExecutor::CompleteStatus> fut) {
-        std::scoped_lock<std::mutex> lock(completed_unload_mutex);
-        completed_unload_tensor[id].set_value(true);
-      });
+    return pool.flushCacheExecAsync(order);
   };
 
   auto enqueTasks = [&](unsigned int o) {
@@ -866,26 +840,15 @@ void Manager::UnloadTensors(unsigned int order) {
 
 void Manager::flushCacheExcept(unsigned int order) {
   auto loadAsync = [&](TensorPool &pool, unsigned int order) {
-    return pool.loadCacheExecAsync(
-
-      order, [&](int id, TaskExecutor::CompleteStatus status,
-                 std::future<TaskExecutor::CompleteStatus> fu) {
-        std::scoped_lock<std::mutex> lock(completed_mutex);
-        completed[id].set_value(true);
-      });
+    return pool.loadCacheExecAsync(order);
   };
 
   auto waitComplete = [&](unsigned int o) {
-    auto &tasks = async_task_eos[o];
-
-    std::unique_lock<std::mutex> lock(completed_mutex);
-    auto w_fut = completed[std::get<0>(tasks)].get_future();
-    auto t_fut = completed[std::get<1>(tasks)].get_future();
-    lock.unlock();
-
-    w_fut.wait();
-    t_fut.wait();
-
+    // Completion is tracked by CompletionToken in CacheElem.
+    // checkLoadComplete waits via CacheElem::waitLoad().
+    weight_pool.checkLoadComplete(o);
+    if (exec_mode != ml::train::ExecutionMode::INFERENCE)
+      tensor_pool.checkLoadComplete(o);
     async_task_eos.erase(o);
   };
 

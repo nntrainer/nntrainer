@@ -14,6 +14,7 @@
 #ifndef __CACHE_ELEM_H__
 #define __CACHE_ELEM_H__
 
+#include <completion_token.h>
 #include <memory_data.h>
 #include <swap_device.h>
 
@@ -126,30 +127,45 @@ public:
   void reset() { initial_opt = Options::FIRST_ACCESS_WRITE; }
 
   /**
-   * @brief set Load Task ID for Unload
-   *
+   * @brief set Load Task ID for Unload (legacy, kept for compatibility)
    */
   void setLoadTaskID(int id) { load_task_id = id; }
 
-  /**
-   * @brief getter of Load Task ID
-   *
-   * @return load Task id
-   */
+  /** @brief getter of Load Task ID (legacy) */
   int getLoadTaskID() { return load_task_id; }
 
-  /**
-   * @brief set Unload Task ID for Load
-   *
-   */
+  /** @brief set Unload Task ID for Load (legacy) */
   void setUnloadTaskID(int id) { unload_task_id = id; }
 
-  /**
-   * @brief getter of Unload Task ID
-   *
-   * @return unload Task id
-   */
+  /** @brief getter of Unload Task ID (legacy) */
   int getUnloadTaskID() { return unload_task_id; }
+
+  /**
+   * @brief Set the load completion token (ThreadManager path)
+   */
+  void setLoadToken(CompletionToken token) { load_token_ = std::move(token); }
+
+  /**
+   * @brief Wait for async load to complete
+   */
+  void waitLoad() { load_token_.wait(); }
+
+  /**
+   * @brief Check if async load is done
+   */
+  bool isLoadDone() const { return load_token_.isDone(); }
+
+  /**
+   * @brief Set the unload completion token (ThreadManager path)
+   */
+  void setUnloadToken(CompletionToken token) {
+    unload_token_ = std::move(token);
+  }
+
+  /**
+   * @brief Wait for async unload to complete
+   */
+  void waitUnload() { unload_token_.wait(); }
 
 private:
   Options initial_opt;                  /**< accessed */
@@ -161,8 +177,10 @@ private:
   CachePolicy policy;                   /**< cache policy */
   std::shared_ptr<MemoryData> mem_data; /**< allocated memory data */
   void *memory_ptr;                     /** memory ptr*/
-  int load_task_id;                     /** load task id*/
-  int unload_task_id;                   /** unload task id*/
+  int load_task_id;                     /** load task id (legacy) */
+  int unload_task_id;                   /** unload task id (legacy) */
+  CompletionToken load_token_;          /** async load token */
+  CompletionToken unload_token_;        /** async unload token */
 };
 
 } // namespace nntrainer

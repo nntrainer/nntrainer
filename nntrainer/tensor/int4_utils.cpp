@@ -13,7 +13,6 @@
 #include <cassert>
 #include <cmath>
 
-#include "cpu_backend.h"
 #include "fp16.h"
 #include "nntrainer_error.h"
 #include "util_func.h"

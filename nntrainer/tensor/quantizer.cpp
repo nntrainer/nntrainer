@@ -8,6 +8,7 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <compute_ops.h>
 #include <cpu_backend.h>
 #include <math.h>
 #include <quantizer.h>
@@ -264,6 +265,9 @@ Tensor GgmlQuantizer::quantize(const Tensor &input, Tdatatype qtype) {
   case QScheme::Q4_0:
     out_dtype = Tdatatype::Q4_0;
     break;
+  case QScheme::Q1_0:
+    out_dtype = Tdatatype::Q1_0;
+    break;
   default:
     throw std::invalid_argument(
       "[GgmlQuantizer::quantize] Unsupported QScheme.");
@@ -291,7 +295,10 @@ Tensor GgmlQuantizer::quantize(const Tensor &input, Tdatatype qtype) {
     quantize_q6_K(src, tmp.data(), N, K, nullptr);
     break;
   case QScheme::Q4_0:
-    quantize_q4_0(src, tmp.data(), N, K, nullptr);
+    getComputeOps()->quantize_q4_0(src, tmp.data(), N, K, nullptr);
+    break;
+  case QScheme::Q1_0:
+    quantize_q1_0(src, tmp.data(), N, K, nullptr);
     break;
   default:
     break;
@@ -301,9 +308,9 @@ Tensor GgmlQuantizer::quantize(const Tensor &input, Tdatatype qtype) {
   if (scheme_ == QScheme::Q4_Kx8) {
     repack_q4_K(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
   } else if (scheme_ == QScheme::Q4_0) {
-    repack_q4_0(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
+    getComputeOps()->repack_q4_0(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
   } else {
-    // Q6_K: copy directly (no repacking needed)
+    // Q6_K, Q1_0: copy directly (no repacking needed)
     memcpy(output.getData<uint8_t>(), tmp.data(), out_size);
   }
 
@@ -340,7 +347,10 @@ Tensor &GgmlQuantizer::quantize(const Tensor &input, Tensor &output,
     quantize_q6_K(src, tmp.data(), N, K, nullptr);
     break;
   case QScheme::Q4_0:
-    quantize_q4_0(src, tmp.data(), N, K, nullptr);
+    getComputeOps()->quantize_q4_0(src, tmp.data(), N, K, nullptr);
+    break;
+  case QScheme::Q1_0:
+    quantize_q1_0(src, tmp.data(), N, K, nullptr);
     break;
   default:
     throw std::invalid_argument(
@@ -350,8 +360,9 @@ Tensor &GgmlQuantizer::quantize(const Tensor &input, Tensor &output,
   if (scheme_ == QScheme::Q4_Kx8) {
     repack_q4_K(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
   } else if (scheme_ == QScheme::Q4_0) {
-    repack_q4_0(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
+    getComputeOps()->repack_q4_0(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
   } else {
+    // Q6_K, Q1_0: copy directly (no repacking needed)
     memcpy(output.getData<uint8_t>(), tmp.data(), out_size);
   }
 
@@ -386,7 +397,10 @@ Tensor GgmlQuantizer::dequantize(const Tensor &input, Tdatatype dtype) {
     break;
   case QScheme::Q4_0:
     unpack_q4_0(src, tmp.data(), data_size, N, K);
-    dequantize_row_q4_0(tmp.data(), output.getData(), total_elems);
+    getComputeOps()->dequantize_row_q4_0(tmp.data(), output.getData(), total_elems);
+    break;
+  case QScheme::Q1_0:
+    dequantize_row_q1_0(src, output.getData(), total_elems);
     break;
   default:
     throw std::invalid_argument(

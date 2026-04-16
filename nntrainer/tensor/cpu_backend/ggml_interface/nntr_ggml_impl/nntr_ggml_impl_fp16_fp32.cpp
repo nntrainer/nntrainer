@@ -68,15 +68,13 @@ static inline nntr_fp16_t nntr_compute_fp32_to_fp16_impl(float f) {
 
 #elif defined(__F16C__)
 
-#ifdef _MSC_VER
+// Use _mm_cvtph_ps intrinsic for all compilers to avoid GCC generating
+// AVX-512FP16 vmovw instructions from _cvtsh_ss on AVX-512VL-capable CPUs
+// that lack AVX-512FP16 support (GCC 13+ bug).
 #define NNTR_COMPUTE_FP16_TO_FP32(x)                                           \
   _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x)))
 #define NNTR_COMPUTE_FP32_TO_FP16(x)                                           \
   _mm_extract_epi16(_mm_cvtps_ph(_mm_set_ss(x), 0), 0)
-#else
-#define NNTR_COMPUTE_FP16_TO_FP32(x) _cvtsh_ss(x)
-#define NNTR_COMPUTE_FP32_TO_FP16(x) _cvtss_sh(x, 0)
-#endif
 
 #elif defined(__POWER9_VECTOR__)
 

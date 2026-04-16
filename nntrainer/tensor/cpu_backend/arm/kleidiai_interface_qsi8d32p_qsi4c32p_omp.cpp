@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <kleidiai_interface.h>
 #include <string>
+#include <thread_manager.h>
 
 #include "kai/kai_common.h"
 
@@ -77,8 +78,8 @@ void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp_parallel(
   int n_threads = 4;
   assert(n % n_threads == 0);
   size_t n_ukernel = n / n_threads;
-#pragma omp parallel for num_threads(n_threads)
-  for (int current_thread = 0; current_thread < n_threads; ++current_thread) {
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(n_threads), static_cast<unsigned int>(n_threads), [&](size_t current_thread) {
     const size_t dst_stride = n * sizeof(float);
     const size_t lhs_offset =
       ukernel_variants_qsi8d32p[idx_variant].ukernel.get_lhs_packed_offset(0, k,
@@ -105,7 +106,7 @@ void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp_parallel(
       sizeof(float),           // DST stride (col)
       lower_bound, upper_bound // Min and max for the clamp operation
     );
-  }
+  });
 
   delete[] lhs_packed_mtx;
 }
@@ -146,13 +147,13 @@ void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp_parallel_m1(
   const size_t n_per_thread_raw = (n + n_threads - 1) / n_threads;
   const size_t n_per_thread = ((n_per_thread_raw + nr - 1) / nr) * nr;
 
-#pragma omp parallel for num_threads(n_threads)
-  for (int current_thread = 0; current_thread < n_threads; ++current_thread) {
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(n_threads), static_cast<unsigned int>(n_threads), [&](size_t current_thread) {
     const size_t n_start = current_thread * n_per_thread;
 
     // Check if this thread has work to do
     if (n_start >= n) {
-      continue;
+      return;
     }
 
     // Calculate actual n for this thread (may be less for last thread)
@@ -184,7 +185,7 @@ void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp_parallel_m1(
       dst_stride,        // DST stride (row)
       sizeof(float),     // DST stride (col)
       lower_bound, upper_bound);
-  }
+  });
 
   delete[] lhs_packed_mtx;
 }

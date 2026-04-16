@@ -90,6 +90,84 @@ public:
   LazyTensor &divide_i(Tensor const &m);
 
   /**
+   * @brief     Wrapper method of pow_i. see tensor.h for more detail
+   * @param[in] exponent exponent value
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &pow_i(float exponent);
+
+  /**
+   * @brief     Wrapper method of sqrt_i. see tensor.h for more detail
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &sqrt_i();
+
+  /**
+   * @brief     Wrapper method of erf_i. see tensor.h for more detail
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &erf_i();
+
+  /**
+   * @brief     Wrapper method of exp_i. see tensor.h for more detail
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &exp_i();
+
+  /**
+   * @brief     Wrapper method of log_i. see tensor.h for more detail
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &log_i();
+
+  /**
+   * @brief     Wrapper method of clamp_i. see tensor.h for more detail
+   * @param[in] min minimum value
+   * @param[in] max maximum value
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &clamp_i(float min, float max);
+
+  /**
+   * @brief     Wrapper method of inv_sqrt_i. see tensor.h for more detail
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &inv_sqrt_i();
+
+  /**
+   * @brief     Wrapper method of neg. (memcopy happens)
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &neg();
+
+  /**
+   * @brief     Wrapper method of abs. (memcopy happens)
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &abs();
+
+  /**
+   * @brief     Wrapper method of sin. (memcopy happens)
+   * @param[in] alpha scale factor (default 1.0)
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &sin(float alpha = 1.0);
+
+  /**
+   * @brief     Wrapper method of cos. (memcopy happens)
+   * @param[in] alpha scale factor (default 1.0)
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &cos(float alpha = 1.0);
+
+  /**
+   * @brief     Wrapper method of tan. (memcopy happens)
+   * @param[in] alpha scale factor (default 1.0)
+   * @retval    LazyTensor *this
+   */
+  LazyTensor &tan(float alpha = 1.0);
+
+  /**
    * @brief     Wrapper method of dot. see tensor.h for more detail (memcopy
    * happens)
    * @param[in] m Tensor

@@ -116,7 +116,11 @@ static inline __m256 mul_sum_us8_pairs_float(const __m256i ax,
                                              const __m256i sy) {
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
   const __m256i zero = _mm256_setzero_si256();
-  const __m256i summed_pairs = _mm256_dpbusd_epi32(zero, ax, sy);
+  // Use inline asm to guarantee EVEX-encoded vpdpbusd. GCC 13+ with
+  // -march=native may downconvert _mm256_dpbusd_epi32 to VEX-encoded
+  // form (AVXVNNI) which requires a separate CPU feature flag.
+  __m256i summed_pairs;
+  __asm__("vpdpbusd %2, %1, %0" : "=v"(summed_pairs) : "v"(ax), "v"(sy), "0"(zero));
   return _mm256_cvtepi32_ps(summed_pairs);
 #elif defined(__AVXVNNI__)
   const __m256i zero = _mm256_setzero_si256();
@@ -710,7 +714,10 @@ static inline __m256i mul_sum_us8_pairs_acc_int32x8(const __m256i acc,
                                                     const __m256i ax,
                                                     const __m256i sy) {
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__)
-  return _mm256_dpbusd_epi32(acc, ax, sy);
+  // Use inline asm to guarantee EVEX encoding (see mul_sum_us8_pairs_float).
+  __m256i result;
+  __asm__("vpdpbusd %2, %1, %0" : "=v"(result) : "v"(ax), "v"(sy), "0"(acc));
+  return result;
 #elif defined(__AVXVNNI__)
   return _mm256_dpbusd_avx_epi32(acc, ax, sy);
 #else

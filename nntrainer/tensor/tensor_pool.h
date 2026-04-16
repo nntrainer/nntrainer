@@ -23,8 +23,8 @@
 #include <variant>
 #include <vector>
 
-#include <cache_loader.h>
 #include <cache_pool.h>
+#include <thread_manager.h>
 #include <common.h>
 #include <tensor.h>
 #include <tensor_wrap_specs.h>
@@ -43,8 +43,7 @@ public:
   /**
    * @brief     Constructor of TensorPool
    */
-  TensorPool() :
-    mem_pool(std::make_unique<MemoryPool>()), cache_loader(nullptr) {}
+  TensorPool() : mem_pool(std::make_unique<MemoryPool>()) {}
 
   /**
    * @brief     Constructor of TensorPool
@@ -54,10 +53,8 @@ public:
     const std::string &fsu_name = "",
     ml::train::ExecutionMode execution_mode = ml::train::ExecutionMode::TRAIN) {
     if (enable_fsu) {
-      auto cache_pool =
+      mem_pool =
         std::make_shared<CachePool>(fsu_path, fsu_name, execution_mode);
-      cache_loader = std::make_unique<CacheLoader>(cache_pool);
-      mem_pool = cache_pool;
     } else {
       mem_pool = std::make_shared<MemoryPool>();
     }
@@ -162,6 +159,25 @@ public:
    * @note returns empty tensor which must be filled by the caller before use.
    */
   Tensor *placeholder(const std::string &name, const TensorDim &dim);
+
+  /**
+   * @brief Request a tensor or a placeholder depending on whether it is
+   * externally managed.
+   *
+   * @param name Name of this tensor.
+   * @param dim Tensor dimension.
+   * @param exec_order The execution orders for this tensor.
+   * @param lifespan Lifespan of this tensor (used only when is_external=false).
+   * @param is_external If true, creates a placeholder (UNMANAGED, no
+   *        MemoryPool allocation); if false, creates a normal managed tensor.
+   * @param init Initializer of the tensor (used only when is_external=false).
+   *
+   * @return ptr to the created tensor
+   */
+  Tensor *requestOrPlaceholder(const std::string &name, const TensorDim &dim,
+                               const std::vector<unsigned int> &exec_order,
+                               TensorLifespan lifespan, bool is_external,
+                               const Initializer &init = Initializer::NONE);
 
   /**
    * @brief     create a new tensor with the given spec.
@@ -290,7 +306,7 @@ public:
    * @return async task id
    */
   int loadCacheExecAsync(unsigned int order,
-                         TaskExecutor::CompleteCallback complete_callback);
+                         std::function<void(int)> complete_callback = nullptr);
 
   /**
    * @brief check if tensors are loaded for the given execution order.
@@ -307,7 +323,7 @@ public:
    * @return async task id
    */
   int flushCacheExecAsync(unsigned int order,
-                          TaskExecutor::CompleteCallback complete_callback);
+                          std::function<void(int)> complete_callback = nullptr);
 
   /**
    * @brief load cache data by execution order
@@ -441,7 +457,6 @@ private:
   std::unordered_map<std::string, unsigned int>
     name_map;                           /**< indexing of requested tensors */
   std::shared_ptr<MemoryPool> mem_pool; /**< memory pool for the tensors */
-  std::unique_ptr<CacheLoader> cache_loader; /**< memory pool for the tensors */
 
   /**
    * @brief     Check if the lifespan leads to long term valitidy

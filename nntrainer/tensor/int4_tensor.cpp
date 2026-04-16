@@ -8,27 +8,25 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 
-#include <cpu_backend.h>
+#include <compute_ops.h>
 #include <int4_tensor.h>
 #include <tensor.h>
 
 namespace nntrainer {
 
-size_t Int4QTensor::group_size = 32;
-
 Int4QTensor::Int4QTensor(std::string name_, Tformat fm, QScheme qscheme_,
                          size_t g_size) :
-  TensorBase(name_, fm, Tdatatype::QINT4), qscheme(qscheme_) {
-  group_size = g_size;
-}
+  TensorBase(name_, fm, Tdatatype::QINT4), qscheme(qscheme_),
+  group_size_(g_size) {}
 
 Int4QTensor::Int4QTensor(const TensorDim &d, bool alloc_now, Initializer init,
                          std::string name, QScheme qscheme_, size_t g_size) :
-  TensorBase(d, alloc_now, init, name), qscheme(qscheme_) {
-  group_size = g_size;
+  TensorBase(d, alloc_now, init, name), qscheme(qscheme_),
+  group_size_(g_size) {
   if (alloc_now)
     allocate();
 }
@@ -46,8 +44,7 @@ Int4QTensor::Int4QTensor(
   std::vector<std::vector<std::vector<std::vector<int8_t>>>> const &d,
   std::vector<float> const &scales, Tformat fm, QScheme qscheme_,
   size_t g_size) :
-  qscheme(qscheme_) {
-  group_size = g_size;
+  qscheme(qscheme_), group_size_(g_size) {
   if (d.empty() || d[0].empty() || d[0][0].empty() || d[0][0][0].empty()) {
     throw std::out_of_range(
       "[Tensor] trying to initialize Int4QTensor from empty vector");
@@ -101,7 +98,7 @@ Int4QTensor::Int4QTensor(
   }
 
   // copy scale factors
-  scopy(scale_size(), scales.data(), 1, (float *)getScale(), 1);
+  getComputeOps()->scopy_fp32(scale_size(), scales.data(), 1, (float *)getScale(), 1);
 }
 
 bool Int4QTensor::operator==(const Int4QTensor &rhs) const {
@@ -304,12 +301,12 @@ void Int4QTensor::initialize(Initializer init) {
   initialize();
 }
 
-void Int4QTensor::copy(const Tensor &from) {
+void Int4QTensor::copy(const Tensor &from, ComputeOps *ops) {
   reshape(from.getDim());
   copy(from.getData());
 }
 
-void Int4QTensor::copyData(const Tensor &from) {
+void Int4QTensor::copyData(const Tensor &from, ComputeOps *ops) {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
@@ -446,7 +443,7 @@ std::vector<unsigned int> Int4QTensor::argmin() const {
   return result;
 }
 
-float Int4QTensor::max_abs() const {
+float Int4QTensor::max_abs(ComputeOps *ops) const {
   int8_t abs_max_val = 0;
   int8_t curr_val;
   for (unsigned int idx = 0; idx < size(); ++idx) {
@@ -554,8 +551,19 @@ void Int4QTensor::print(std::ostream &out) const {
 }
 
 size_t Int4QTensor::getMemoryBytes() const {
+  // Scales are stored as fp32 (sizeof(float)) per the canonical layout
+  // documented on the class header. allocate() already reserves
+  // `sizeof(float) * scale_size()` bytes for the scale section, and the
+  // KleidiAI qai8dxp_qsi4cxp_unpacked kernel consumes fp32 scales. Before
+  // P6b this function reported `sizeof(uint16_t) * scale_size()` which
+  // caused save() and read() to transfer only the low 2 bytes of each
+  // fp32 scale (= garbage), while the in-memory buffer actually held
+  // correct fp32 values. That silent data corruption on round-trip
+  // never surfaced because the FC layer's old dequantize path worked
+  // entirely in memory and the test coverage for saved-then-reloaded
+  // QINT4 weights was effectively zero. Align with the allocator here.
   return ((size() + 1) / 2) * dim.getDataTypeSize() +
-         scale_size() * sizeof(uint16_t);
+         scale_size() * sizeof(float);
 }
 
 size_t Int4QTensor::scale_size() const {
@@ -564,7 +572,25 @@ size_t Int4QTensor::scale_size() const {
     return 1;
     break;
   case QScheme::PER_CHANNEL_AFFINE:
-    return height() * width() / group_size;
+    // group_size_ == 0 is the canonical signal for "pure per-channel":
+    // exactly one scale per output column. For nntrainer's FC weight
+    // layout TensorDim(1, 1, K=in_features, N=out_features) where
+    // height() is K (input features) and width() is N (output
+    // features), the natural per-output-channel quantization produces
+    // N scales = width(). This matches:
+    //   - KleidiAI qsi4cxp kxn: rhs_scales_f32[n_idx], indexed by
+    //     output column, length N.
+    //   - HuggingFace / PyTorch per-channel quant: one scale per
+    //     output feature.
+    //   - QNN AXIS_SCALE_OFFSET with axis=1 (output dim) and
+    //     numScaleOffsets=N.
+    //
+    // group_size_ == height() (= K, the row length along the
+    // reduction axis) is semantically identical to pure per-channel:
+    // "all K elements in one output column share one scale".
+    if (group_size_ == 0 || group_size_ == height())
+      return width();
+    return height() * width() / group_size_;
     break;
   default:
     break;
@@ -582,11 +608,11 @@ void Int4QTensor::copy(const void *buf) {
     return;
   }
   // copy tensor data
-  scopy((size() + 1) / 2, (int8_t *)buf, 1, (int8_t *)getData(), 1);
+  getComputeOps()->scopy_s8((size() + 1) / 2, (int8_t *)buf, 1, (int8_t *)getData(), 1);
 
   // copy scale factor data
   float *scales = (float *)(((int8_t *)buf) + (size() + 1) / 2);
-  scopy(scale_size(), scales, 1, (float *)getScale(), 1);
+  getComputeOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
 }
 
 void Int4QTensor::save_quantization_info(std::ostream &file) {
@@ -600,7 +626,16 @@ void Int4QTensor::read_quantization_info(std::ifstream &file,
   checkedRead(file, (char *)&qscheme, sizeof(uint16_t),
               "[Int4QTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
-  group_size = 32; /// Remove me
+  // NOTE: group_size_ is NOT reset here. The previous implementation did
+  // `group_size = 32;` because the static class member was shared across
+  // all instances and needed to be restored to the "default" after each
+  // read. Now that group_size_ is a per-instance member, we keep whatever
+  // value the constructor established (typically via a TensorDim hint
+  // from the model config, or the default 32). The on-disk header still
+  // only contains the 2-byte QScheme enum for backward compatibility
+  // with schema_version 1 .bin files; schema_version 2 safetensors
+  // carries group_size via the quant object and the loader is expected
+  // to pass it to the Int4QTensor constructor at allocation time.
 }
 
 void Int4QTensor::read_quantization_info(ReadSource src, size_t start_offset,
@@ -608,9 +643,87 @@ void Int4QTensor::read_quantization_info(ReadSource src, size_t start_offset,
   checkedRead(src, (char *)&qscheme, sizeof(uint16_t),
               "[Int4QTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
-  group_size = 32; /// Remove me
+  // See note above in the std::ifstream overload.
 }
 
-size_t Int4QTensor::getGroupSize() { return group_size; }
+void Int4QTensor::buildQ4_0RepackCache() {
+  const size_t K = height(); // reduction axis (input features)
+  const size_t N = width();  // output axis (output features)
+
+  NNTR_THROW_IF(K % 32 != 0, std::invalid_argument)
+    << "Int4QTensor::buildQ4_0RepackCache requires height (K=" << K
+    << ") divisible by 32 for Q4_0 block alignment";
+
+  // Q4_0 layout: N rows of (K/32) blocks. Each block = 18 bytes:
+  //   [2B fp16 scale] [16B packed nibbles: 32 int4 values]
+  const size_t blocks_per_row = K / 32;
+  const size_t block_size = 18; // sizeof(block_q4_0)
+  const size_t total_bytes = N * blocks_per_row * block_size;
+  q4_0_repack_cache_.resize(total_bytes);
+
+  const uint8_t *src = (const uint8_t *)getData();
+  const float *scales_fp32 = (const float *)getScale();
+  const size_t src_row_stride = (N + 1) / 2; // bytes per K-row in qsi4cxp
+
+  uint8_t *dst = q4_0_repack_cache_.data();
+
+  for (size_t n = 0; n < N; ++n) {
+    // fp16 scale for this output channel (same for all blocks in row)
+    // Use the _Float16 / __fp16 if available, else simple conversion.
+    const float s = scales_fp32[n];
+    uint16_t fp16_scale;
+    {
+      // IEEE 754 fp32 -> fp16 conversion (round-to-nearest-even).
+      // Handles the common range; overflow clamps to inf, underflow to 0.
+      uint32_t f32;
+      std::memcpy(&f32, &s, 4);
+      uint32_t sign = (f32 >> 16) & 0x8000;
+      int32_t exp = ((f32 >> 23) & 0xFF) - 127 + 15;
+      uint32_t mant = (f32 >> 13) & 0x03FF;
+      if (exp <= 0) {
+        fp16_scale = static_cast<uint16_t>(sign); // underflow → ±0
+      } else if (exp >= 31) {
+        fp16_scale = static_cast<uint16_t>(sign | 0x7C00); // overflow → ±inf
+      } else {
+        fp16_scale = static_cast<uint16_t>(sign | (exp << 10) | mant);
+      }
+    }
+
+    for (size_t b = 0; b < blocks_per_row; ++b) {
+      size_t dst_offset = (n * blocks_per_row + b) * block_size;
+
+      // Write fp16 scale (little-endian)
+      dst[dst_offset + 0] = static_cast<uint8_t>(fp16_scale & 0xFF);
+      dst[dst_offset + 1] = static_cast<uint8_t>(fp16_scale >> 8);
+
+      // Pack 32 nibbles from qsi4cxp kxn into Q4_0 block layout.
+      // Source: for k = 32*b .. 32*b+31, column n.
+      //   qsi4cxp kxn: byte at (k * src_row_stride + n/2)
+      //     even n → low nibble,  odd n → high nibble
+      // Dest: Q4_0 block qs[j/2] where j = k - 32*b
+      //     even j → low nibble,  odd j → high nibble
+      uint8_t *qs = &dst[dst_offset + 2];
+      const size_t k_start = 32 * b;
+
+      for (size_t j = 0; j < 32; j += 2) {
+        const size_t k0 = k_start + j;
+        const size_t k1 = k_start + j + 1;
+
+        // Extract nibble for (k0, n) from source
+        uint8_t src_byte0 = src[k0 * src_row_stride + n / 2];
+        uint8_t nib0 = (n % 2 == 0) ? (src_byte0 & 0x0F)
+                                     : ((src_byte0 >> 4) & 0x0F);
+
+        // Extract nibble for (k1, n) from source
+        uint8_t src_byte1 = src[k1 * src_row_stride + n / 2];
+        uint8_t nib1 = (n % 2 == 0) ? (src_byte1 & 0x0F)
+                                     : ((src_byte1 >> 4) & 0x0F);
+
+        // Pack into Q4_0: even j → low nibble, odd j → high nibble
+        qs[j / 2] = nib0 | (nib1 << 4);
+      }
+    }
+  }
+}
 
 } // namespace nntrainer

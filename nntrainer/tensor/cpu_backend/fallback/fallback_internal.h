@@ -544,6 +544,25 @@ _FP16 __fallback_max(const unsigned int N, _FP16 *X);
 void __fallback_softmax(const unsigned int N, _FP16 *X, _FP16 *Y);
 #endif
 
+// =========================================================================
+// Channel-wise int4 (qsi4cxp) fallback declarations — pure FP32, no FP16.
+// When ENABLE_FP16 is on these are already declared above inside the guard.
+// When off, we still need them for the ops table qsi4cxp slot.
+// =========================================================================
+#ifndef ENABLE_FP16
+void __fallback_nntr_quant_qs4cx_f32(size_t n, size_t k,
+                                     void *rhs_native_mtx_f32,
+                                     void *rhs_native_mtx_qs4cx,
+                                     void *rhs_scales_f32, bool transB = true);
+
+template <typename T = float>
+uint32_t __fallback_nntr_gemm_qai8dxp_qsi4cxp_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales, T *dst_mtx, bool transB = true,
+  T lower_bound = std::numeric_limits<T>::lowest(),
+  T upper_bound = std::numeric_limits<T>::max());
+#endif
+
 /**
  * @copydoc unpack_q4_0x8_transpose16 in cpu_backend.h
  */

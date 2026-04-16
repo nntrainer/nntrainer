@@ -11,7 +11,10 @@
  *
  */
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wredundant-decls"
 #include <cblas.h>
+#pragma GCC diagnostic pop
 #include <cblas_interface.h>
 
 namespace nntrainer {

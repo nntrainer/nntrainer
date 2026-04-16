@@ -11,7 +11,8 @@
 #include <cassert>
 #include <cmath>
 
-#include "cpu_backend.h"
+#include <compute_ops.h>
+#include <cpu_backend.h>
 #include "fp16.h"
 #include "int4_utils.h"
 #include "nntrainer_error.h"
@@ -75,7 +76,7 @@ void Q4_0Utils::dequantizeQ4_0x4(const void *q4_weight_repacked, int N, int K,
   unpackBlocksQ4_0x4((block_q4_0x4 *)q4_weight_repacked, data_size, N, K,
                      (block_q4_0 *)q4_weight_out.data());
 
-  nntrainer::dequantize_row_q4_0((const void *)q4_weight_out.data(),
+  nntrainer::getComputeOps()->dequantize_row_q4_0((const void *)q4_weight_out.data(),
                                  dequantized_weights, K * N);
 }
 
@@ -134,7 +135,7 @@ void Q4_0Utils::dequantizeQ4_0x8(const void *q4_weight_repacked, int N, int K,
   unpackBlocksQ4_0x8((block_q4_0x8 *)q4_weight_repacked, data_size, N, K,
                      (block_q4_0 *)q4_weight_out.data());
 
-  nntrainer::dequantize_row_q4_0((const void *)q4_weight_out.data(),
+  nntrainer::getComputeOps()->dequantize_row_q4_0((const void *)q4_weight_out.data(),
                                  dequantized_weights, K * N);
 }
 

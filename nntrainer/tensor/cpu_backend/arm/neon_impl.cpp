@@ -29,6 +29,7 @@
 #endif
 #include "nntr_ggml_impl_common.h"
 #include <fallback_internal.h>
+#include <thread_manager.h>
 #include <util_func.h>
 
 #include "nntr_ggml_impl_common.h"
@@ -2119,9 +2120,8 @@ void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
   const size_t bytes_per_row_block_span = column_blocks_count * ROW_BLOCK_SIZE;
   const int column_blocks_cnt = K / QK4_0;
 
-#pragma omp parallel for schedule(dynamic)
-  for (int column_out_block_id = 0; column_out_block_id < column_blocks_cnt;
-       column_out_block_id++) {
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(column_blocks_cnt), [&](size_t column_out_block_id) {
     uint8_t mx8x16[8 * 16];
     const int column_idx = column_out_block_id * QK4_0;
     const int scale_offset = (column_idx / scale_group_size) * rows_count_pad;
@@ -2157,7 +2157,7 @@ void transform_int4_osv32_isv2_to_q4_0x4(size_t N, size_t K,
       out->d[3] = s_ptr[7];
       neon_transform_transposed_4rows_to_q4_0x4(&mx8x16[64], out);
     }
-  }
+  });
 }
 
 #if defined(__aarch64__) || defined(_M_ARM64)

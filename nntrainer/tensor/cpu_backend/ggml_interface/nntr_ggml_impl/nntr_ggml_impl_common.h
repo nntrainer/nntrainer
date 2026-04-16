@@ -114,6 +114,20 @@ typedef struct {
   int8_t qs[QK8_0]; // quants
 } block_q8_0;
 
+#define QK1_0 128
+
+/**
+ * @brief block_q1_0_g128
+ * @note 1-bit quantization with group size 128.
+ * Each weight is a single bit: 0 maps to -scale, 1 maps to +scale.
+ * Every group of 128 weights shares one FP16 scale factor.
+ * Effective bits per weight: 1.125 (1 sign bit + 16-bit scale / 128).
+ */
+typedef struct {
+  nntr_half d;            // FP16 scale factor
+  uint8_t qs[QK1_0 / 8]; // 128 bits = 16 bytes (1 bit per weight)
+} block_q1_0;
+
 /**
  * @brief block of q4_0 or q8_0 block
  *
@@ -175,7 +189,8 @@ enum ggml_type {
   GGML_TYPE_Q4_K = 12,
   GGML_TYPE_Q6_K = 14,
   GGML_TYPE_Q8_K = 15,
-  GGML_TYPE_COUNT = 39,
+  GGML_TYPE_Q1_0 = 41,
+  GGML_TYPE_COUNT = 42,
 };
 
 inline int64_t ggml_blck_size(enum ggml_type type) {
@@ -195,6 +210,9 @@ inline int64_t ggml_blck_size(enum ggml_type type) {
   }
   case GGML_TYPE_Q8_K: {
     return QK_K;
+  }
+  case GGML_TYPE_Q1_0: {
+    return QK1_0;
   }
   default: {
     break;
@@ -221,6 +239,9 @@ inline size_t ggml_type_size(enum ggml_type type) {
   }
   case GGML_TYPE_Q8_K: {
     return sizeof(block_q8_K);
+  }
+  case GGML_TYPE_Q1_0: {
+    return sizeof(block_q1_0);
   }
   default: {
     break;

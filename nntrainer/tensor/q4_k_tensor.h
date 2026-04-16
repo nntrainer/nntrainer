@@ -109,7 +109,7 @@ private:
   /**
    * @copydoc Tensor::isValid()
    */
-  bool isValid() const override { return true; }
+  bool isValid(ComputeOps *ops = nullptr) const override { return true; }
 
 }; // class Q4_K_Tensor
 

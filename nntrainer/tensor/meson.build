@@ -1,6 +1,5 @@
 tensor_sources = [
   'cache_elem.cpp',
-  'cache_loader.cpp',
   'cache_pool.cpp',
   'lazy_tensor.cpp',
   'manager.cpp',
@@ -16,6 +15,7 @@ tensor_sources = [
   'q4_k_tensor.cpp',
   'q6_k_tensor.cpp',
   'q4_0_tensor.cpp',
+  'q1_0_tensor.cpp',
   'q4_0_utils.cpp',
   'tensor_dim.cpp',
   'var_grad.cpp',
@@ -28,7 +28,6 @@ tensor_sources = [
   'optimized_v1_planner.cpp',
   'optimized_v2_planner.cpp',
   'optimized_v3_planner.cpp',
-  'task_executor.cpp',
 ]
 
 tensor_headers = [
@@ -45,6 +44,7 @@ tensor_headers = [
   'uint_tensor.h',
   'q4_k_tensor.h',
   'q4_0_tensor.h',
+  'q1_0_tensor.h',
   'q4_0_utils.h',
   'weight.h',
   'var_grad.h',    
@@ -54,13 +54,10 @@ tensor_headers = [
   'basic_planner.h',
   'memory_planner.h',
   'tensor_pool.h',
-  'cache_loader.h',
-  'task_executor.h',
   'cache_pool.h',
   'cache_elem.h',
   'memory_pool.h',
-  'swap_device.h',
-  'task.h'
+  'swap_device.h'
 ]
 
 subdir('cpu_backend')

@@ -584,23 +584,7 @@ private:
    * completed id>>
    */
   std::map<unsigned int, std::tuple<int, int>> async_load_tensor;
-
   std::map<unsigned int, std::tuple<int, int>> async_unload_tensor;
-
-  std::map<int, std::promise<bool>> completed;
-
-  std::map<int, std::promise<bool>> completed_load_tensor;
-
-  std::map<int, std::future<TaskExecutor::CompleteStatus>> completed_load_fut;
-
-  std::map<int, std::promise<bool>> completed_unload_tensor;
-
-  /**< async tasks completion <task id, promise> */
-  std::mutex completed_mutex; /**< mutex for async tasks completion */
-
-  std::mutex completed_load_mutex; /**< mutex for async tasks completion */
-
-  std::mutex completed_unload_mutex; /**< mutex for async tasks completion */
 
   bool enable_fsu; /**< to enable fsu */
 

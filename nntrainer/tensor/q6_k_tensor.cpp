@@ -8,7 +8,7 @@
  * @bug		No known bugs except for NYI items
  */
 
-#include <cpu_backend.h>
+#include <compute_ops.h>
 #include <q6_k_tensor.h>
 #include <tensor.h>
 
@@ -83,7 +83,7 @@ void Q6_K_Tensor::copy_q6k(const void *buf) {
     return;
   }
   // copy tensor data
-  scopy(size(), (uint8_t *)buf, 1, (uint8_t *)getData(), 1);
+  getComputeOps()->scopy_u8(size(), (uint8_t *)buf, 1, (uint8_t *)getData(), 1);
 }
 
 void Q6_K_Tensor::setZero() {

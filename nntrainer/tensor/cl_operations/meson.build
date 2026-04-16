@@ -3,7 +3,8 @@ cl_op_sources = [
   'blas_kernel_interface.cpp',
   'attention_kernel_interface.cpp',
   'attention_kernels.cpp',
-  'clblast_interface.cpp'
+  'clblast_interface.cpp',
+  'cl_compute_ops.cpp'
 ]
 
 cl_op_headers = [
