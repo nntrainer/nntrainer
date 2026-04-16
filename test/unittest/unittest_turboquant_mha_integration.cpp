@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * @file   unittest_turboquant_mha_integration.cpp
+ * @date   28 March 2026
  * @brief  Integration test: MHACoreLayer with use_turboquant=true
  *         Instantiates the layer, runs incremental_forwarding, verifies no
  * crash.
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Eunju Yang <ej.yang@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #include <cpu_backend.h>

@@ -5,6 +5,7 @@
  * @brief  Unit tests for TurboQuant (norm + rotation + Lloyd-Max codebook)
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #include <cpu_backend.h>
