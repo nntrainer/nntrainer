@@ -38,6 +38,25 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <tokenizers_cpp.h>
+
+/**
+ * @brief Load bytes from a file
+ */
+std::string LoadBytesFromFile(const std::string &path) {
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  if (!file.is_open()) {
+    throw std::runtime_error("Failed to open file: " + path);
+  }
+  std::streamsize size = file.tellg();
+  file.seekg(0, std::ios::beg);
+
+  std::string buffer(size, ' ');
+  if (!file.read(&buffer[0], size)) {
+    throw std::runtime_error("Failed to read file: " + path);
+  }
+  return buffer;
+}
 
 using json = nlohmann::json;
 
@@ -230,9 +249,8 @@ int main(int argc, char *argv[]) {
 
     // Load weights
     std::cout << "\nLoading weights from: " << weight_file << std::endl;
-    // Note: The Qwen3CausalLM class needs a load_weight method
-    // For now, we'll just print a message
-    std::cout << "Note: Weight loading needs to be implemented in Qwen3CausalLM class." << std::endl;
+    model.load_weight(weight_file);
+    std::cout << "Weights loaded successfully." << std::endl;
 
     auto finish_time = std::chrono::high_resolution_clock::now();
     auto e2e_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -243,6 +261,39 @@ int main(int argc, char *argv[]) {
     std::cout << "[e2e time]: " << e2e_duration.count() << " ms" << std::endl;
     printMemoryUsage();
     std::cout << "========================================" << std::endl;
+
+    // Load and set tokenizer
+    std::cout << "\nLoading tokenizer..." << std::endl;
+    std::string tokenizer_path = model_path + "/tokenizer.json";
+    auto tokenizer = tokenizers::Tokenizer::FromBlobJSON(LoadBytesFromFile(tokenizer_path));
+    model.setTokenizer(std::move(tokenizer));
+    std::cout << "Tokenizer loaded successfully." << std::endl;
+
+    // Run the model with sample input
+    std::string input_text = "Hello, how are you?";
+    bool do_sample = true;
+    std::string system_head_prompt = "";
+    std::string system_tail_prompt = "";
+    if (nntr_cfg.contains("system_prompt")) {
+      system_head_prompt =
+        nntr_cfg["system_prompt"]["head_prompt"].get<std::string>();
+      system_tail_prompt =
+        nntr_cfg["system_prompt"]["tail_prompt"].get<std::string>();
+    }
+    if (argc >= 3) {
+      input_text = argv[2];
+    } 
+    else {
+      input_text = nntr_cfg["sample_input"].get<std::string>();
+    }
+    
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "Running inference..." << std::endl;
+    std::cout << "========================================" << std::endl;
+    
+    model.run(input_text, do_sample, system_head_prompt, system_tail_prompt);
+
+    std::cout << "\nrun completed successfully!" << std::endl;
 
   } catch (const std::exception &e) {
     std::cerr << "\n[!] FATAL ERROR: " << e.what() << "\n";

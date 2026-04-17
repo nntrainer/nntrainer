@@ -329,3 +329,315 @@ void Qwen3CausalLM::initialize() {
 
   is_initialized = true;
 }
+
+void Qwen3CausalLM::load_weight(const std::string &weight_path) {
+
+  if (!is_initialized) {
+    throw std::runtime_error(
+      "Qwen3CausalLM model is not initialized. Please call "
+      "initialize() before load_weight().");
+  }
+
+  try {
+    model->load(weight_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
+  } catch (const std::exception &e) {
+    throw std::runtime_error("Failed to load model weights: " +
+                             std::string(e.what()));
+  }
+}
+
+void Qwen3CausalLM::run(const std::string &prompt, bool do_sample,
+                        const std::string &system_prompt,
+                        const std::string &tail_prompt, bool log_output) {
+
+  auto start_total = std::chrono::high_resolution_clock::now();
+
+  if (!is_initialized) {
+    throw std::runtime_error(
+      "Qwen3CausalLM model is not initialized. Please call "
+      "initialize() before run().");
+  }
+
+  if (!tokenizer) {
+    throw std::runtime_error(
+      "Tokenizer is not set. Please call setTokenizer() before run().");
+  }
+
+  // Clear output
+  output_text_.clear();
+  pending_ids_.clear();
+
+  // Allocate history buffer if needed
+  if (!ids_history) {
+    ids_history = (unsigned int *)malloc(sizeof(unsigned int) * BATCH_SIZE * MAX_SEQ_LEN);
+  }
+
+  /**
+   * Variables for Log
+   */
+  unsigned int generation_cnt = 0;
+
+  /**
+   * INPUT PREPARATION
+   */
+  std::vector<float *> input;
+  std::vector<float *> label;
+
+  // Print input text
+  if (log_output) {
+    std::cout << system_prompt << prompt << tail_prompt << std::endl;
+  }
+
+  // Prepare prompt
+  std::string prompt_ = system_prompt + prompt + tail_prompt;
+  auto _input = tokenizer->Encode(prompt_);
+
+  // | <------------------- MAX_SEQ_LEN -------------------> |
+  //                       ||             ||
+  // |<-- System prompt -->||<-- input -->||<-- generate -->|
+
+  std::vector<int64_t> init_input;
+  unsigned int _len = _input.size();
+  unsigned int num_allow_str = MAX_SEQ_LEN - NUM_TO_GENERATE;
+  unsigned int text_len = _len;
+
+  if (_len > num_allow_str) {
+    text_len = num_allow_str;
+  }
+
+  // Feed only available length
+  for (unsigned int i = 0; i < text_len; ++i) {
+    init_input.push_back(_input[i]);
+  }
+
+  _input.clear();
+
+  unsigned int init_len = init_input.size();
+  float *input_sample = (float *)malloc(sizeof(float) * BATCH_SIZE * MAX_SEQ_LEN);
+  std::vector<bool> eos_list(BATCH_SIZE, false);
+
+  unsigned int input_len = init_len;
+  unsigned int token_generation_idx = input_len + 1;
+
+  for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+    for (unsigned int i = 0; i < input_len; ++i) {
+      input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + i] =
+        static_cast<float>(init_input[i]);
+      ids_history[static_cast<size_t>(b) * MAX_SEQ_LEN + i] = init_input[i];
+    }
+  }
+
+  /**
+   * PREFILL
+   */
+  input.push_back(input_sample);
+
+  auto start_prefill = std::chrono::high_resolution_clock::now();
+
+  std::vector<float *> output = model->incremental_inference(
+    BATCH_SIZE, input, label, init_len, 0, init_len, false);
+
+  // Generate first token from prefill
+  std::vector<unsigned int> id_list;
+  id_list.push_back(generate(output[0], do_sample));
+
+  if (init_len < static_cast<unsigned int>(INIT_SEQ_LEN)) {
+    registerOutputs(id_list, init_len, log_output);
+  }
+
+  // Deallocate output
+  for (auto &out : output) {
+    delete[] out;
+  }
+
+  auto finish_prefill = std::chrono::high_resolution_clock::now();
+  auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    finish_prefill - start_prefill);
+
+  /**
+   * TOKEN GENERATION
+   */
+
+  // Update generated token by prefill as an input
+  for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+    input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+      static_cast<float>(id_list[b]);
+  }
+
+  auto start_generation = std::chrono::high_resolution_clock::now();
+
+  for (token_generation_idx = input_len + 1;
+       token_generation_idx < input_len + 1 + NUM_TO_GENERATE;
+       ++token_generation_idx) {
+
+    auto output_interval = model->incremental_inference(
+      BATCH_SIZE, input, label, input_len,
+      token_generation_idx - 1, token_generation_idx);
+
+    std::vector<unsigned int> ids_list;
+    ids_list.push_back(generate(output_interval[0], do_sample));
+
+    if (token_generation_idx < input_len) {
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+        input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+          static_cast<float>(init_input[token_generation_idx]);
+      }
+      registerOutputs(ids_list, token_generation_idx, log_output);
+    } else {
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
+        input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+          static_cast<float>(ids_list[b]);
+      }
+      registerOutputs(ids_list, token_generation_idx, log_output);
+    }
+    ++generation_cnt;
+
+    // Deallocate output
+    for (auto out : output_interval) {
+      delete[] out;
+    }
+
+    // Check for EOS
+    for (unsigned int j = 0; j < BATCH_SIZE; ++j) {
+      if (!eos_list[j] && (std::find(EOS_TOKEN_ID.begin(), EOS_TOKEN_ID.end(),
+                                     ids_list[j]) != EOS_TOKEN_ID.end())) {
+        eos_list[j] = true;
+      }
+    }
+
+    // Check if all batches finished
+    bool is_finish = true;
+    for (unsigned int j = 0; j < BATCH_SIZE; ++j) {
+      if (!eos_list[j]) {
+        is_finish = false;
+        break;
+      }
+    }
+
+    if (is_finish) {
+      free(input_sample);
+      break;
+    }
+  }
+
+  global_token_len += (generation_cnt + init_len);
+
+  auto finish_generation = std::chrono::high_resolution_clock::now();
+  auto generation_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    finish_generation - start_generation);
+
+  auto finish_total = std::chrono::high_resolution_clock::now();
+  auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+    finish_total - start_total);
+
+  if (log_output) {
+    std::cout << "\n\n";
+    std::cout << "=================[ LLM with NNTrainer ]===================\n";
+    std::cout << "prefill: " << init_len << " tokens, "
+              << prefill_duration.count() << " ms, "
+              << ((double)init_len / prefill_duration.count() * 1000)
+              << " TPS\n";
+    std::cout << "generation: " << generation_cnt << " tokens, "
+              << generation_duration.count() << " ms, "
+              << ((double)generation_cnt / generation_duration.count() * 1000)
+              << " TPS\n";
+    std::cout << "total: " << total_duration.count() << " ms\n";
+    std::cout << "==========================================================\n";
+  }
+}
+
+unsigned int Qwen3CausalLM::generate(float *logits, bool do_sample) {
+  // Apply temperature
+  if (do_sample && TEMPERATURE > 0) {
+    for (unsigned int i = 0; i < static_cast<unsigned int>(NUM_VOCAB); ++i) {
+      logits[i] /= TEMPERATURE;
+    }
+  }
+
+  // Apply top-k filtering
+  if (do_sample && TOP_K > 0) {
+    std::vector<std::pair<float, unsigned int>> indexed_logits;
+    for (unsigned int i = 0; i < static_cast<unsigned int>(NUM_VOCAB); ++i) {
+      indexed_logits.push_back({logits[i], i});
+    }
+    std::partial_sort(indexed_logits.begin(), indexed_logits.begin() + TOP_K,
+                      indexed_logits.end(),
+                      [](const auto &a, const auto &b) { return a.first > b.first; });
+
+    // Set non-top-k to -inf
+    for (unsigned int i = TOP_K; i < static_cast<unsigned int>(NUM_VOCAB); ++i) {
+      logits[indexed_logits[i].second] = -std::numeric_limits<float>::infinity();
+    }
+  }
+
+  unsigned int output_id;
+
+  if (do_sample) {
+    // Apply softmax
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (unsigned int i = 0; i < static_cast<unsigned int>(NUM_VOCAB); ++i) {
+      if (logits[i] > max_logit) {
+        max_logit = logits[i];
+      }
+    }
+
+    float sum_exp = 0;
+    for (unsigned int i = 0; i < static_cast<unsigned int>(NUM_VOCAB); ++i) {
+      float exp_x = std::exp(logits[i] - max_logit);
+      sum_exp += exp_x;
+      logits[i] = exp_x;
+    }
+
+    for (unsigned int i = 0; i < static_cast<unsigned int>(NUM_VOCAB); ++i) {
+      logits[i] /= sum_exp;
+    }
+
+    // Sample from distribution
+    std::discrete_distribution<int> dist(logits, logits + NUM_VOCAB);
+    output_id = static_cast<unsigned int>(dist(rng));
+  } else {
+    // Greedy: argmax
+    unsigned int argmax_idx = 0;
+    float max_val = logits[0];
+    for (unsigned int i = 1; i < static_cast<unsigned int>(NUM_VOCAB); ++i) {
+      if (logits[i] > max_val) {
+        max_val = logits[i];
+        argmax_idx = i;
+      }
+    }
+    output_id = argmax_idx;
+  }
+
+  return output_id;
+}
+
+void Qwen3CausalLM::registerOutputs(std::vector<unsigned int> ids, unsigned int pos, bool log_output) {
+  static const std::vector<char> puncts{',', '!', ':', ';', '?'};
+
+  for (size_t b = 0; b < ids.size(); ++b) {
+    pending_ids_.push_back(static_cast<int>(ids[b]));
+    ids_history[b * MAX_SEQ_LEN + pos] = ids[b];
+
+    std::string decoded_str = tokenizer->Decode(pending_ids_);
+
+    // Check if we should flush the output
+    bool should_flush = true;
+    if (std::find(puncts.begin(), puncts.end(), decoded_str.back()) != puncts.end()) {
+      // Last symbol is a punctuation, hold on
+      should_flush = false;
+    } else if (decoded_str.size() >= 3 &&
+               decoded_str.compare(decoded_str.size() - 3, 3, "") == 0) {
+      // Ends with an incomplete token, hold on
+      should_flush = false;
+    }
+
+    if (should_flush) {
+      if (log_output) {
+        std::cout << decoded_str;
+        std::cout.flush();
+      }
+      output_text_.append(decoded_str);
+      pending_ids_.clear();
+    }
+  }
+}

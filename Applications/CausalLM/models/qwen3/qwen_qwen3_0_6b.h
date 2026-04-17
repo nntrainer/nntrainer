@@ -9,6 +9,14 @@
 #include <model.h>
 #include <string>
 #include <vector>
+#include <random>
+#include <memory>
+#include <chrono>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+#include <tokenizers_cpp.h>
 
 // Model configuration constants for Qwen3-0.6B
 // These are declared as extern to allow runtime configuration
@@ -37,6 +45,22 @@ public:
   ~Qwen3CausalLM() = default;
 
   void initialize();
+  void load_weight(const std::string &weight_path);
+  void run(const std::string &prompt, bool do_sample = false,
+           const std::string &system_prompt = "", const std::string &tail_prompt = "",
+           bool log_output = true);
+
+  /**
+   * @brief Get the generated output text
+   */
+  std::string getOutput() const { return output_text_; }
+
+  /**
+   * @brief Set tokenizer
+   */
+  void setTokenizer(std::unique_ptr<tokenizers::Tokenizer> tok) {
+    tokenizer = std::move(tok);
+  }
 
 private:
   void constructModel();
@@ -54,8 +78,39 @@ private:
   std::vector<LayerHandle> createMlp(const int layer_id, int dim,
                                      int hidden_dim, std::string input_name);
 
+  /**
+   * @brief Generate next token from logits
+   */
+  unsigned int generate(float *logits, bool do_sample);
+
+  /**
+   * @brief Register outputs during generation
+   */
+  void registerOutputs(std::vector<unsigned int> ids, unsigned int pos, bool log_output);
+
   ModelHandle model;
   bool is_initialized = false;
+
+  // Tokenizer
+  std::unique_ptr<tokenizers::Tokenizer> tokenizer;
+
+  // Generation parameters
+  unsigned int BATCH_SIZE = 1;
+  unsigned int MAX_SEQ_LEN = 4096;
+  std::vector<unsigned int> EOS_TOKEN_ID = {151645, 151643};
+  unsigned int BOS_TOKEN_ID = 151643;
+  float TEMPERATURE = 0.7f;
+  unsigned int TOP_K = 20;
+  float TOP_P = 0.95f;
+
+  // Internal buffers
+  std::string output_text_;
+  std::vector<int> pending_ids_;
+  unsigned int *ids_history = nullptr;
+  unsigned int global_token_len = 0;
+
+  // Random number generator
+  std::mt19937 rng;
 };
 
 #endif // __QWEN_QWEN3_0_6B_H__
