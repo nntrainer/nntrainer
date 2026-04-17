@@ -2,30 +2,17 @@
 
 // Model: qwen3 (decoder_only)
 
-
 #include "qwen_qwen3_0_6b.h"
-#include <model.h>
-#include <tensor_api.h>
 
 #include <app_context.h>
 #include <engine.h>
-#include <embedding_layer.h>
-#include <mha_core.h>
-#include <rms_norm.h>
-#include <reshaped_rms_norm.h>
-#include <swiglu.h>
-#include <tie_word_embedding.h>
-
 
 using ml::train::createLayer;
-using ml::train::Tensor;
-using LayerHandle = ml::train::LayerHandle;
 
 template <typename T>
 static std::string withKey(const std::string &key, T val) {
   return key + "=" + std::to_string(val);
 }
-
 
 template <>
 std::string withKey(const std::string &key, std::string val) {
@@ -40,97 +27,117 @@ std::string withKey(const std::string &key, const char *val) {
 Qwen3CausalLM::Qwen3CausalLM() = default;
 
 void Qwen3CausalLM::constructModel() {
-  using ml::train::createLayer;
+  // Layers used in the model
+  std::vector<LayerHandle> layers;
+
   // Create model
   model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
 
-  model->setProperty({
-    withKey("batch_size", 1),
-    withKey("epochs", "1"),
-    withKey("model_tensor_type", "FP32-FP32")
-  });
-
-  // Input layer
-  LayerHandle input_layer(createLayer("input", {
+  // Create input layer
+  layers.push_back(createLayer("input", {
     withKey("name", "input0"),
     withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))
   }));
-  Tensor input = input_layer(Tensor());
-  // Embedding layer
+
+  // Create embedding layer
   const std::string embedding_type = TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
-  LayerHandle embedding(createLayer(embedding_type, {
+  layers.push_back(createLayer(embedding_type, {
     withKey("name", "embedding0"),
     withKey("in_dim", NUM_VOCAB),
     withKey("out_dim", DIM)
   }));
-  Tensor emb_out = embedding(input);
 
-  // Transformer blocks
-  Tensor x = emb_out;
+  // Create transformer blocks
   for (int i = 0; i < NUM_LAYERS; ++i) {
-    x = createTransformerDecoderBlock(i, x);
+    std::vector<LayerHandle> transformer;
+    if (i == 0) {
+      transformer = createTransformerDecoderBlock(0, "embedding0");
+    } else {
+      transformer = createTransformerDecoderBlock(i, 
+        "layer" + std::to_string(i - 1) + "_decoder_output");
+    }
+    layers.insert(layers.end(), transformer.begin(), transformer.end());
   }
-  // Final normalization
-  LayerHandle output_norm(createLayer("rms_norm", {
+
+  // Create final RMS norm
+  layers.push_back(createLayer("rms_norm", {
     withKey("name", "output_norm"),
-    withKey("epsilon", NORM_EPS),
+    withKey("epsilon", std::to_string(NORM_EPS)),
+    withKey("input_layers", "layer" + std::to_string(NUM_LAYERS - 1) + "_decoder_output"),
     withKey("packed", "false")
   }));
-  Tensor output_norm_out = output_norm(x);
-  Tensor norm_out = output_norm_out;
-  // LM head
+
+  // Create LM head
   const std::string lmhead_type = TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "fully_connected";
-  std::vector<std::string> lmhead_props = {
+  layers.push_back(createLayer(lmhead_type, {
     withKey("name", "lm_head"),
     withKey("unit", NUM_VOCAB),
-    withKey("disable_bias", "true")
-    , withKey("shared_from", "embedding0")
-  };
+    withKey("disable_bias", "true"),
+    withKey("input_layers", "output_norm"),
+    withKey("shared_from", "embedding0")
+  }));
 
-  LayerHandle lmhead(createLayer(lmhead_type, lmhead_props));
-  Tensor output = lmhead(norm_out);
-  // Compile model from symbolic tensor graph
-  model->compile(input, output, ml::train::ExecutionMode::INFERENCE);
+  // Add all layers to the model
+  for (auto &layer : layers) {
+    model->addLayer(layer);
+  }
 }
-Tensor 
-Qwen3CausalLM::createTransformerDecoderBlock(const int layer_id,
-  Tensor input) {
 
-  using ml::train::createLayer;
-  auto prefix = "layer" + std::to_string(layer_id);
+
+std::vector<LayerHandle>
+Qwen3CausalLM::createTransformerDecoderBlock(const int layer_id,
+                                             std::string input_name) {
+  std::vector<LayerHandle> layers;
+
   // Pre-attention normalization
-  LayerHandle att_norm(createLayer("rms_norm", {
-    withKey("name", prefix + "_attention_norm"),
-    withKey("epsilon", NORM_EPS),
+  layers.push_back(createLayer("rms_norm", {
+    withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
+    withKey("input_layers", input_name),
+    withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("packed", "false")
   }));
-  Tensor att_norm_out = att_norm(input);
 
   // Self attention
-  Tensor att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
-                    att_norm_out, att_norm_out, att_norm_out);
-  // Attention residual connection
-  Tensor residual = input.add(att_out);
+  auto att_layer = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
+    "layer" + std::to_string(layer_id) + "_attention_norm",
+    "layer" + std::to_string(layer_id) + "_attention_norm",
+    "layer" + std::to_string(layer_id) + "_attention_norm");
+  layers.insert(layers.end(), att_layer.begin(), att_layer.end());
+
+  // Attention residual connection (addition)
+  layers.push_back(createLayer("addition", {
+    withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add"),
+    withKey("input_layers", input_name + ",layer" + std::to_string(layer_id) + "_attention_out")
+  }));
+
   // Pre-FFN normalization
-  LayerHandle ffn_norm(createLayer("rms_norm", {
-    withKey("name", prefix + "_ffn_norm"),
-    withKey("epsilon", NORM_EPS),
+  layers.push_back(createLayer("rms_norm", {
+    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
+    withKey("input_layers", "layer" + std::to_string(layer_id) + "_decoder_add"),
+    withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("packed", "false")
   }));
 
-  Tensor ffn_norm_out = ffn_norm(residual);
   // Feed forward
-  Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_norm_out);
-  // FFN residual connection
-  Tensor block_out = residual.add(ffn_out);
-  return block_out;
+  auto ffn_layer = createMlp(layer_id, DIM, INTERMEDIATE_SIZE,
+    "layer" + std::to_string(layer_id) + "_ffn_norm");
+  layers.insert(layers.end(), ffn_layer.begin(), ffn_layer.end());
+
+  // FFN residual connection (addition)
+  layers.push_back(createLayer("addition", {
+    withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output"),
+    withKey("input_layers", "layer" + std::to_string(layer_id) + "_decoder_add,layer" + 
+      std::to_string(layer_id) + "_ffn_down")
+  }));
+
+  return layers;
 }
 
-Tensor
+std::vector<LayerHandle>
 Qwen3CausalLM::createAttention(const int layer_id, int seq_len, int n_heads,
-                         int head_dim, Tensor query,
-                         Tensor key, Tensor value) {
-  using ml::train::createLayer;
+                               int head_dim, std::string query_name,
+                               std::string key_name, std::string value_name) {
+  std::vector<LayerHandle> layers;
 
   auto V_name = "layer" + std::to_string(layer_id) + "_wv";
   auto K_name = "layer" + std::to_string(layer_id) + "_wk";
@@ -140,145 +147,162 @@ Qwen3CausalLM::createAttention(const int layer_id, int seq_len, int n_heads,
   auto A_name = "layer" + std::to_string(layer_id) + "_attention";
   auto O_name = "layer" + std::to_string(layer_id) + "_attention_out";
 
-  // V projection
-  LayerHandle v_proj(createLayer("fully_connected", {
-    withKey("name", V_name),
-    withKey("unit", head_dim * n_heads / GQA_SIZE),
-    withKey("disable_bias", "true")
-  }));
-  Tensor v_proj_out = v_proj(value);
-
-
-  // K projection
-  LayerHandle k_proj(createLayer("fully_connected", {
-    withKey("name", K_name),
-    withKey("unit", head_dim * n_heads / GQA_SIZE),
-    withKey("disable_bias", "true")
-  }));
-  Tensor k_proj_out = k_proj(key);
-
   // Q projection
-  LayerHandle q_proj(createLayer("fully_connected", {
+  layers.push_back(createLayer("fully_connected", {
     withKey("name", Q_name),
     withKey("unit", head_dim * n_heads),
-    withKey("disable_bias", "true")
-  }));
-  Tensor q_proj_out = q_proj(query);
-
-  // K norm (reshaped RMS norm)
-  LayerHandle k_norm(createLayer("reshaped_rms_norm", {
-    withKey("name", K_norm_name),
-    withKey("packed", "false"),
-    withKey("epsilon", NORM_EPS),
-    withKey("feature_size", head_dim)
+    withKey("disable_bias", "true"),
+    withKey("input_layers", query_name),
+    withKey("weight_initializer", "ones")
   }));
 
-  Tensor k_norm_out = k_norm(k_proj_out);
-
-
-  // Q norm (reshaped RMS norm)
-  LayerHandle q_norm(createLayer("reshaped_rms_norm", {
+  // Q norm (reshaped RMS norm) - for Qwen3 style attention
+  layers.push_back(createLayer("reshaped_rms_norm", {
     withKey("name", Q_norm_name),
+    withKey("input_layers", Q_name),
     withKey("packed", "false"),
-    withKey("epsilon", NORM_EPS),
+    withKey("epsilon", std::to_string(NORM_EPS)),
     withKey("feature_size", head_dim)
   }));
 
-  Tensor q_norm_out = q_norm(q_proj_out);
+  // K projection
+  layers.push_back(createLayer("fully_connected", {
+    withKey("name", K_name),
+    withKey("unit", head_dim * n_heads / GQA_SIZE),
+    withKey("disable_bias", "true"),
+    withKey("input_layers", key_name),
+    withKey("weight_initializer", "ones")
+  }));
+
+  // K norm (reshaped RMS norm) - for Qwen3 style attention
+  layers.push_back(createLayer("reshaped_rms_norm", {
+    withKey("name", K_norm_name),
+    withKey("input_layers", K_name),
+    withKey("packed", "false"),
+    withKey("epsilon", std::to_string(NORM_EPS)),
+    withKey("feature_size", head_dim)
+  }));
+
+  // V projection
+  layers.push_back(createLayer("fully_connected", {
+    withKey("name", V_name),
+    withKey("unit", head_dim * n_heads / GQA_SIZE),
+    withKey("disable_bias", "true"),
+    withKey("input_layers", value_name),
+    withKey("weight_initializer", "ones")
+  }));
 
   // Attention core layer
-  LayerHandle attn(createLayer("mha_core", {
+  layers.push_back(createLayer("mha_core", {
     withKey("name", A_name),
     withKey("num_heads", n_heads),
     withKey("num_heads_kv", n_heads / GQA_SIZE),
     withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
     withKey("rope_theta", ROPE_THETA),
     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
-    withKey("max_new_tokens", NUM_TO_GENERATE)
+    withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+    withKey("input_layers", Q_norm_name + std::string(",") + K_norm_name + std::string(",") + V_name)
   }));
-  Tensor attn_out = attn({q_norm_out, k_norm_out, v_proj_out});
 
   // O projection
-  LayerHandle o_proj(createLayer("fully_connected", {
+  layers.push_back(createLayer("fully_connected", {
     withKey("name", O_name),
     withKey("unit", DIM),
-    withKey("disable_bias", "true")
+    withKey("disable_bias", "true"),
+    withKey("input_layers", A_name),
+    withKey("weight_initializer", "ones")
   }));
 
-  Tensor o_proj_out = o_proj(attn_out);
-  return o_proj_out;
+  return layers;
 }
 
+std::vector<LayerHandle>
+Qwen3CausalLM::createMlp(const int layer_id, int dim, int hidden_dim,
+                         std::string input_name) {
+  std::vector<LayerHandle> layers;
 
-Tensor Qwen3CausalLM::createMlp(
-
-  const int layer_id, int dim, int hidden_dim,
-  Tensor input) {
-  using ml::train::createLayer;
-  LayerHandle ffn_up(createLayer("fully_connected", {
+  // FFN up projection
+  layers.push_back(createLayer("fully_connected", {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
     withKey("unit", hidden_dim),
-    withKey("disable_bias", "true")
+    withKey("disable_bias", "true"),
+    withKey("input_layers", input_name),
+    withKey("weight_initializer", "ones")
   }));
 
-  Tensor ffn_up_out = ffn_up(input);
-  LayerHandle ffn_gate(createLayer("fully_connected", {
+  // FFN gate projection
+  layers.push_back(createLayer("fully_connected", {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
     withKey("unit", hidden_dim),
-    withKey("disable_bias", "true")
+    withKey("disable_bias", "true"),
+    withKey("input_layers", input_name),
+    withKey("weight_initializer", "ones")
   }));
 
-  Tensor ffn_gate_out = ffn_gate(input);
-  LayerHandle swiglu(createLayer("swiglu", {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
-  Tensor swiglu_out = swiglu({ffn_up_out, ffn_gate_out});
-  LayerHandle ffn_down(createLayer("fully_connected", {
+  // SwiGLU activation
+  layers.push_back(createLayer("swiglu", {
+    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
+    withKey("input_layers", "layer" + std::to_string(layer_id) + "_ffn_gate," +
+      "layer" + std::to_string(layer_id) + "_ffn_up")
+  }));
+
+  // FFN down projection
+  layers.push_back(createLayer("fully_connected", {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
     withKey("unit", dim),
-    withKey("disable_bias", "true")
+    withKey("disable_bias", "true"),
+    withKey("input_layers", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
+    withKey("weight_initializer", "ones")
   }));
 
-  Tensor ffn_down_out = ffn_down(swiglu_out);
-  return ffn_down_out;
+  return layers;
 }
-
 
 void Qwen3CausalLM::registerCustomLayers() {
+  const auto &ct_engine = nntrainer::Engine::Global();
+  const auto app_context = static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
 
-  auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context = static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
   try {
-
     app_context->registerFactory(nntrainer::createLayer<causallm::EmbeddingLayer>);
-
     app_context->registerFactory(nntrainer::createLayer<causallm::MHACoreLayer>);
-
     app_context->registerFactory(nntrainer::createLayer<causallm::RMSNormLayer>);
-
     app_context->registerFactory(nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
-
     app_context->registerFactory(nntrainer::createLayer<causallm::SwiGLULayer>);
-
     app_context->registerFactory(nntrainer::createLayer<causallm::TieWordEmbedding>);
-
   } catch (std::invalid_argument &e) {
-
     std::cerr << "failed to register factory, reason: " << e.what() << std::endl;
-
   }
 }
 
-
 void Qwen3CausalLM::initialize() {
-
   // Set default sequence length if not configured
   if (INIT_SEQ_LEN == 0) {
-
     INIT_SEQ_LEN = 8;
-
   }
+
+  // Register custom layers
   registerCustomLayers();
-  // constructModel() builds symbolic tensor graph,
-  // compile and initialize are done internally by
-  // model->compile(input, output, mode)
+
+  // Construct model
   constructModel();
+
+  // Set model properties
+  std::vector<std::string> model_props = {
+    withKey("batch_size", 1),
+    withKey("epochs", "1"),
+    withKey("model_tensor_type", "FP32-FP32")
+  };
+  model->setProperty(model_props);
+
+  // Compile model
+  if (model->compile(ml::train::ExecutionMode::INFERENCE)) {
+    throw std::invalid_argument("Model compilation failed.");
+  }
+
+  // Initialize model
+  if (model->initialize(ml::train::ExecutionMode::INFERENCE)) {
+    throw std::invalid_argument("Model initialization failed.");
+  }
+
+  is_initialized = true;
 }

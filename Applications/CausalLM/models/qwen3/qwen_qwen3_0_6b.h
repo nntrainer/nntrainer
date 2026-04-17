@@ -5,10 +5,17 @@
 #ifndef __QWEN_QWEN3_0_6B_H__
 #define __QWEN_QWEN3_0_6B_H__
 
+#include <layer.h>
 #include <model.h>
-#include <tensor_api.h>
-
 #include <string>
+#include <vector>
+
+#include <embedding_layer.h>
+#include <mha_core.h>
+#include <rms_norm.h>
+#include <reshaped_rms_norm.h>
+#include <swiglu.h>
+#include <tie_word_embedding.h>
 
 // Model configuration constants
 // TODO: Update these values based on actual model configuration
@@ -22,22 +29,13 @@ static int HEAD_DIM = 64;
 static int INTERMEDIATE_SIZE = 4864;
 static float NORM_EPS = 1e-6;
 static int GQA_SIZE = 4;
-static float ROPE_THETA = 1000000.0;
+static unsigned int ROPE_THETA = 1000000;
 static int MAX_POSITION_EMBEDDINGS = 40960;
 static bool TIE_WORD_EMBEDDINGS = true;
 
-namespace nntrainer {
-class AppContext;
-}
-
-namespace causallm {
-class EmbeddingLayer;
-class MHACoreLayer;
-class RMSNormLayer;
-class ReshapedRMSNormLayer;
-class SwiGLULayer;
-class TieWordEmbedding;
-} // namespace causallm
+// Type alias following the nntrainer pattern
+using LayerHandle = std::shared_ptr<ml::train::Layer>;
+using ModelHandle = std::unique_ptr<ml::train::Model>;
 
 class Qwen3CausalLM {
 public:
@@ -50,19 +48,20 @@ private:
   void constructModel();
   void registerCustomLayers();
 
-  ml::train::Tensor createTransformerDecoderBlock(const int layer_id,
-                                                  ml::train::Tensor input);
+  std::vector<LayerHandle> createTransformerDecoderBlock(const int layer_id,
+                                                         std::string input_name);
 
-  ml::train::Tensor createAttention(const int layer_id, int seq_len,
-                                    int n_heads, int head_dim,
-                                    ml::train::Tensor query,
-                                    ml::train::Tensor key,
-                                    ml::train::Tensor value);
+  std::vector<LayerHandle> createAttention(const int layer_id, int seq_len,
+                                           int n_heads, int head_dim,
+                                           std::string query_name,
+                                           std::string key_name,
+                                           std::string value_name);
 
-  ml::train::Tensor createMlp(const int layer_id, int dim, int hidden_dim,
-                              ml::train::Tensor input);
+  std::vector<LayerHandle> createMlp(const int layer_id, int dim,
+                                     int hidden_dim, std::string input_name);
 
-  std::unique_ptr<ml::train::Model> model;
+  ModelHandle model;
+  bool is_initialized = false;
 };
 
 #endif // __QWEN_QWEN3_0_6B_H__

@@ -11,8 +11,8 @@
  * @note   This layer only supports inference mode.
  */
 
-#ifndef __RMS_NORM_LAYER_H__
-#define __RMS_NORM_LAYER_H__
+#ifndef __RESHAPED_RMS_NORM_LAYER_H__
+#define __RESHAPED_RMS_NORM_LAYER_H__
 
 #pragma once
 #ifdef _WIN32
@@ -128,4 +128,4 @@ private:
 
 } // namespace causallm
 
-#endif /* __CAUSALLM_RMS_NORM_LAYER_H__ */
+#endif /* __CAUSALLM_RESHAPED_RMS_NORM_LAYER_H__ */
