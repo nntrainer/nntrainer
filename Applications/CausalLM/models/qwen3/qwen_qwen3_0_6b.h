@@ -10,28 +10,22 @@
 #include <string>
 #include <vector>
 
-#include <embedding_layer.h>
-#include <mha_core.h>
-#include <rms_norm.h>
-#include <reshaped_rms_norm.h>
-#include <swiglu.h>
-#include <tie_word_embedding.h>
-
-// Model configuration constants
-// TODO: Update these values based on actual model configuration
-static int INIT_SEQ_LEN = 8;
-static int NUM_TO_GENERATE = 64;
-static int NUM_VOCAB = 151936;
-static int DIM = 896;
-static int NUM_LAYERS = 24;
-static int NUM_HEADS = 14;
-static int HEAD_DIM = 64;
-static int INTERMEDIATE_SIZE = 4864;
-static float NORM_EPS = 1e-6;
-static int GQA_SIZE = 4;
-static unsigned int ROPE_THETA = 1000000;
-static int MAX_POSITION_EMBEDDINGS = 40960;
-static bool TIE_WORD_EMBEDDINGS = true;
+// Model configuration constants for Qwen3-0.6B
+// These are declared as extern to allow runtime configuration
+extern int INIT_SEQ_LEN;
+extern int NUM_TO_GENERATE;
+extern int NUM_VOCAB;
+extern int DIM;
+extern int NUM_LAYERS;
+extern int NUM_HEADS;
+extern int NUM_KEY_VALUE_HEADS;
+extern int HEAD_DIM;
+extern int INTERMEDIATE_SIZE;
+extern float NORM_EPS;
+extern int GQA_SIZE;
+extern unsigned int ROPE_THETA;
+extern int MAX_POSITION_EMBEDDINGS;
+extern bool TIE_WORD_EMBEDDINGS;
 
 // Type alias following the nntrainer pattern
 using LayerHandle = std::shared_ptr<ml::train::Layer>;

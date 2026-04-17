@@ -1,4 +1,5 @@
 qwen3_src = [
+    meson.current_source_dir() / 'qwen_qwen3_0_6b.cpp',
     meson.current_source_dir() / 'qwen3_causallm.cpp',
     meson.current_source_dir() / 'qwen3_embedding.cpp',
 ]

@@ -6,8 +6,31 @@
 
 #include <app_context.h>
 #include <engine.h>
+#include <embedding_layer.h>
+#include <mha_core.h>
+#include <rms_norm.h>
+#include <reshaped_rms_norm.h>
+#include <swiglu.h>
+#include <tie_word_embedding.h>
 
 using ml::train::createLayer;
+
+// Model configuration constants - definitions
+// Default values for Qwen3-0.6B
+int INIT_SEQ_LEN = 8;
+int NUM_TO_GENERATE = 64;
+int NUM_VOCAB = 151936;
+int DIM = 1024;
+int NUM_LAYERS = 28;
+int NUM_HEADS = 16;
+int NUM_KEY_VALUE_HEADS = 8;
+int HEAD_DIM = 128;
+int INTERMEDIATE_SIZE = 3072;
+float NORM_EPS = 1e-6;
+int GQA_SIZE = 2;
+unsigned int ROPE_THETA = 1000000;
+int MAX_POSITION_EMBEDDINGS = 40960;
+bool TIE_WORD_EMBEDDINGS = true;
 
 template <typename T>
 static std::string withKey(const std::string &key, T val) {

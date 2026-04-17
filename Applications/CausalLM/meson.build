@@ -6,11 +6,11 @@ causallm_src = [
 ]
 
 executable_src = [
-    meson.current_source_dir() / 'main.cpp',
+    meson.current_source_dir() / 'main2.cpp',
 ]
 
 causallm_inc_abs = [meson.current_source_dir()]
-causallm_inc = [include_directories('.')]
+causallm_inc = [include_directories('.'), include_directories('models/qwen3')]
 
 # Build layer dependency
 causallm_layer_dependencies = []
