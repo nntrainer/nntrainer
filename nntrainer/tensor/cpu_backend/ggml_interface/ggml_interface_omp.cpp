@@ -41,16 +41,12 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
     std::vector<char> QA = std::vector<char>(qa_size);
     nntr_quantize_row_q8_0(A, QA.data(), K);
 
-    tm.parallel_for_chunked(thread_num, [=](size_t thread_idx) {
-      unsigned int M_step_start = (thread_idx * N) / thread_num;
-      unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
+    unsigned int chunk_size = 4;
+    unsigned int loop = (N + chunk_size - 1) / chunk_size;
 
-      M_step_start = (M_step_start % NB_COLS)
-                       ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                       : M_step_start;
-      M_step_end = (M_step_end % NB_COLS)
-                     ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                     : M_step_end;
+    tm.parallel_for(0, loop, [=](size_t idx) {
+      unsigned int M_step_start = chunk_size * idx;
+      unsigned int M_step_end = std::min(chunk_size * (idx + 1), (size_t)N);
 
       nntr_gemv_q4_0_4x8_q8_0(K, (float *)((C) + M_step_start), N,
                               (void *)((char *)B + M_step_start * B_step),
@@ -76,16 +72,12 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
         (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
     }
     // Compute 4-divisible-M row portion with multithreaded GEMM
-    tm.parallel_for_chunked(thread_num, [=](size_t i) {
-      unsigned int src0_start = (i * N) / thread_num;
-      unsigned int src0_end = ((i + 1) * N) / thread_num;
+    unsigned int chunk_size = 4;
+    unsigned int loop = (N + chunk_size - 1) / chunk_size;
 
-      src0_start = (src0_start % NB_COLS)
-                     ? src0_start + NB_COLS - (src0_start % NB_COLS)
-                     : src0_start;
-      src0_end = (src0_end % NB_COLS)
-                   ? src0_end + NB_COLS - (src0_end % NB_COLS)
-                   : src0_end;
+    tm.parallel_for(0, loop, [=](size_t i) {
+      unsigned int src0_start = i * chunk_size;
+      unsigned int src0_end = std::min(chunk_size * (i + 1), (size_t)N);
 
       nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + src0_start), ldc,
                               (void *)((char *)B + src0_start * B_step),
@@ -126,16 +118,12 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
     }
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
-    tm.parallel_for_chunked(thread_num, [=](size_t i) {
-      unsigned int src0_start = (i * N) / thread_num;
-      unsigned int src0_end = ((i + 1) * N) / thread_num;
+    unsigned int chunk_size = 4;
+    unsigned int loop = (N + chunk_size - 1) / chunk_size;
 
-      src0_start = (src0_start % NB_COLS)
-                     ? src0_start + NB_COLS - (src0_start % NB_COLS)
-                     : src0_start;
-      src0_end = (src0_end % NB_COLS)
-                   ? src0_end + NB_COLS - (src0_end % NB_COLS)
-                   : src0_end;
+    tm.parallel_for(0, loop, [=](size_t i) {
+      unsigned int src0_start = i * chunk_size;
+      unsigned int src0_end = std::min(chunk_size * (i + 1), (size_t)N);
 
       nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + src0_start), ldc,
                               (void *)((char *)B + src0_start * B_step),
