@@ -519,7 +519,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from decomposer import AdaptiveConverter
 from emitter_ini import emit_ini
-from emitter_cpp import emit_cpp_source, emit_cpp_header
+from emitter_cpp import emit_cpp_source, emit_cpp_header, emit_legacy_cpp_source
 from nntrainer_layers import NNTrainerLayerDef
 
 
@@ -968,9 +968,14 @@ def main():
     cpp_source = ""
     ini_config = ""
     try:
-        cpp_source = emit_cpp_source(layers, structure, model_name=model_name)
+        # Try legacy emitter first for compatibility with existing format
+        cpp_source = emit_legacy_cpp_source(layers, structure, model_name=model_name)
     except Exception as e:
-        print(f"Warning: C++ emission failed: {e}", file=sys.stderr)
+        print(f"Warning: Legacy C++ emission failed, trying standard emitter: {e}", file=sys.stderr)
+        try:
+            cpp_source = emit_cpp_source(layers, structure, model_name=model_name)
+        except Exception as e:
+            print(f"Warning: C++ emission failed: {e}", file=sys.stderr)
     try:
         ini_config = emit_ini(layers, structure, batch_size=args.batch_size)
     except Exception as e:
