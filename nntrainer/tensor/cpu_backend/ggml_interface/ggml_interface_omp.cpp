@@ -30,27 +30,24 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int lda, const void *B,
                                const unsigned int ldb, float *C,
                                const unsigned int ldc) {
-  int NB_COLS = 4;
   auto &tm = ThreadManager::Global();
-  unsigned int thread_num = tm.getComputeThreadCount();
 
   if (M == 1) { // GEMV
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
     unsigned int blocks_per_row = (K + QK8_0 - 1) / QK8_0;
     unsigned int qa_size = sizeof(block_q8_0) * blocks_per_row;
     std::vector<char> QA = std::vector<char>(qa_size);
+
+    // online quantization for fp32 activation with no packing
     nntr_quantize_row_q8_0(A, QA.data(), K);
 
-    tm.parallel_for_chunked(thread_num, [=](size_t thread_idx) {
-      unsigned int M_step_start = (thread_idx * N) / thread_num;
-      unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
+    unsigned int chunk_size = 16;
+    unsigned int loop = (N + chunk_size - 1) / chunk_size;
 
-      M_step_start = (M_step_start % NB_COLS)
-                       ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                       : M_step_start;
-      M_step_end = (M_step_end % NB_COLS)
-                     ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                     : M_step_end;
+    // compute multithreaded GEMV
+    tm.parallel_for(0, loop, [=](size_t idx) {
+      unsigned int M_step_start = chunk_size * idx;
+      unsigned int M_step_end = std::min(chunk_size * (idx + 1), (size_t)N);
 
       nntr_gemv_q4_0_4x8_q8_0(K, (float *)((C) + M_step_start), N,
                               (void *)((char *)B + M_step_start * B_step),
@@ -59,51 +56,59 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
   } else if (M % 4 != 0) {
     unsigned int blocks_per_4_rows = (K + QK8_0 - 1) / QK8_0;
     unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * blocks_per_4_rows;
-    const size_t qa_row_size = (sizeof(block_q8_0) * K) / QK8_0;
-    unsigned int M4 = ((M - M % 4) / 4);
-    int B_step = sizeof(block_q4_0) * (K / QK4_0);
+    const size_t qa_row_size =
+      (sizeof(block_q8_0) * K) / QK8_0; // ignore remainder
+    unsigned int M4 = M / 4;
 
-    unsigned int qa_size = qa_4_rows_size * (((M >> 2) << 2) / 4 + 1);
+    unsigned int qa_size = qa_4_rows_size * M4 + qa_row_size * (M % 4);
     std::vector<char> QA = std::vector<char>(qa_size);
 
+    // online quantization for M4 * 4 rows
     for (unsigned int i = 0; i < M4; i++) {
       nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
                                  K);
     }
+
+    // online quantization for remainder
     for (unsigned int i = M4 * 4; i < M; i++) {
       nntr_quantize_row_q8_0(
         (float *)A + i * K,
         (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
     }
+
     // Compute 4-divisible-M row portion with multithreaded GEMM
-    tm.parallel_for_chunked(thread_num, [=](size_t i) {
-      unsigned int src0_start = (i * N) / thread_num;
-      unsigned int src0_end = ((i + 1) * N) / thread_num;
+    unsigned int row_chunk_size = 16;
+    unsigned int row_loop = (M4 * 4 + row_chunk_size - 1) / row_chunk_size;
+    unsigned int A_step = sizeof(block_q8_0) * (K / QK8_0);
 
-      src0_start = (src0_start % NB_COLS)
-                     ? src0_start + NB_COLS - (src0_start % NB_COLS)
-                     : src0_start;
-      src0_end = (src0_end % NB_COLS)
-                   ? src0_end + NB_COLS - (src0_end % NB_COLS)
-                   : src0_end;
+    unsigned int col_chunk_size = 16;
+    unsigned int col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+    unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
-      nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + src0_start), ldc,
-                              (void *)((char *)B + src0_start * B_step),
-                              QA.data(), M4 * 4, src0_end - src0_start);
+    tm.parallel_for(0, col_loop * row_loop, [=](size_t i) {
+      unsigned int r = i / col_loop;
+      unsigned int c = i % col_loop;
+
+      unsigned int r_start = r * row_chunk_size;
+      unsigned int r_end = std::min(row_chunk_size * (r + 1), M4 * 4);
+
+      unsigned int c_start = c * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+
+      nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + r_start * N + c_start), ldc,
+                              (void *)((char *)B + c_start * B_step),
+                              (void *)(QA.data() + r_start * A_step),
+                              r_end - r_start, c_end - c_start);
     });
 
     // Compute leftover 1 ~ 3 rows with multithreaded GEMV
     for (unsigned int pb = M4 * 4; pb < M; pb++) {
-      tm.parallel_for_chunked(thread_num, [=](size_t thread_idx) {
-        unsigned int M_step_start = (thread_idx * N) / thread_num;
-        unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
+      unsigned int chunk_size = 16;
+      unsigned int loop = (N + chunk_size - 1) / chunk_size;
 
-        M_step_start = (M_step_start % NB_COLS)
-                         ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                         : M_step_start;
-        M_step_end = (M_step_end % NB_COLS)
-                       ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                       : M_step_end;
+      tm.parallel_for(0, loop, [=](size_t idx) {
+        unsigned int M_step_start = chunk_size * idx;
+        unsigned int M_step_end = std::min(chunk_size * (idx + 1), (size_t)N);
 
         nntr_gemv_q4_0_4x8_q8_0(
           K, (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
@@ -115,7 +120,7 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
   } else { // GEMM
     unsigned int blocks_per_4_rows = (K + QK8_0 - 1) / QK8_0;
     unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * blocks_per_4_rows;
-    unsigned int M4 = ((M + 3) / 4);
+    unsigned int M4 = M / 4; // M % 4 == 0
 
     unsigned int qa_size = qa_4_rows_size * M4;
     std::vector<char> QA = std::vector<char>(qa_size);
@@ -124,22 +129,29 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
       nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
                                  K);
     }
+
+    unsigned int row_chunk_size = 16;
+    unsigned int row_loop = (M + row_chunk_size - 1) / row_chunk_size;
+    unsigned int A_step = sizeof(block_q8_0) * (K / QK8_0);
+
+    unsigned int col_chunk_size = 16;
+    unsigned int col_loop = (N + col_chunk_size - 1) / col_chunk_size;
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
-    tm.parallel_for_chunked(thread_num, [=](size_t i) {
-      unsigned int src0_start = (i * N) / thread_num;
-      unsigned int src0_end = ((i + 1) * N) / thread_num;
+    tm.parallel_for(0, col_loop * row_loop, [=](size_t i) {
+      unsigned int r = i / col_loop;
+      unsigned int c = i % col_loop;
 
-      src0_start = (src0_start % NB_COLS)
-                     ? src0_start + NB_COLS - (src0_start % NB_COLS)
-                     : src0_start;
-      src0_end = (src0_end % NB_COLS)
-                   ? src0_end + NB_COLS - (src0_end % NB_COLS)
-                   : src0_end;
+      unsigned int r_start = r * row_chunk_size;
+      unsigned int r_end = std::min(row_chunk_size * (r + 1), M);
 
-      nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + src0_start), ldc,
-                              (void *)((char *)B + src0_start * B_step),
-                              QA.data(), M, src0_end - src0_start);
+      unsigned int c_start = c * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+
+      nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + r_start * N + c_start), ldc,
+                              (void *)((char *)B + c_start * B_step),
+                              (void *)(QA.data() + r_start * A_step),
+                              r_end - r_start, c_end - c_start);
     });
   }
 }
