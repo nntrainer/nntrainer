@@ -60,7 +60,7 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
       (sizeof(block_q8_0) * K) / QK8_0; // ignore remainder
     unsigned int M4 = M / 4;
 
-    unsigned int qa_size = qa_4_rows_size * M4;
+    unsigned int qa_size = qa_4_rows_size * M4 + qa_row_size * (M % 4);
     std::vector<char> QA = std::vector<char>(qa_size);
 
     // online quantization for M4 * 4 rows
