@@ -8,6 +8,7 @@ cl_op_kernels = [
   'convert_block_q4_0.cl',
   'copy.cl',
   'dot.cl',
+  'flash_attention_fp32.cl',
   'int4_gemv.cl',
   'int4_quantize_input.cl',
   'int4_gemm.cl',
@@ -31,6 +32,7 @@ cl_op_kernels = [
   'transpose_axis_2.cl',
 ]
 
+
 if get_option('enable-fp16')
   cl_op_kernels += [
     'addition_fp16.cl',
@@ -39,6 +41,7 @@ if get_option('enable-fp16')
     'concat_axis_3_fp16.cl',
     'copy_fp16.cl',
     'dot_fp16.cl',
+    'flash_attention_fp16.cl',
     'hgemm_no_trans.cl',
     'hgemm_trans_a.cl',
     'hgemm_trans_ab.cl',
@@ -54,6 +57,7 @@ if get_option('enable-fp16')
     'transpose_axis_2_fp16.cl',
   ]
 endif
+
 
 all_includes = ''
 foreach k : cl_op_kernels
