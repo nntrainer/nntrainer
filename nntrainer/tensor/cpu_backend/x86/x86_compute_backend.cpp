@@ -33,6 +33,7 @@ void init_backend() {
   __ggml_init();
 #ifdef USE_BLAS
   // Do not repeatedly call set_num_threads. It's a global config.
+#ifdef USE_BLAS
   __openblas_set_num_threads(-1); // -1 = BLAS_NUM_THREADS if defined.
 #endif
   g_compute_ops = get_cpu_ops();

@@ -80,6 +80,7 @@ void flash_attention_fp32_cl(float *query, float *key, float *value, float *outp
                              float scale);
 
 
+#ifdef ENABLE_FP16
 /**
  * @brief Flash Attention FP16 computation with GQA support
  * @param[in] query _FP16 * for Query matrix
@@ -99,6 +100,7 @@ void flash_attention_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value, _FP16 *outp
                              unsigned int head_dim, unsigned int num_heads_q,
                              unsigned int num_heads_kv, unsigned int batch,
                              float scale);
+#endif /* ENABLE_FP16 */
 
 
 } // namespace nntrainer

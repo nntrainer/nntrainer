@@ -4,9 +4,12 @@ set -e
 # Script to build and run flash attention FP16 OpenCL kernel tests
 # Optimized for Qualcomm Adreno GPUs
 
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/storage_data/snap/anup/android-ndk-r26d/
-export PATH=$PATH:/storage_data/snap/anup/android-ndk-r26d/
-export ANDROID_NDK=/storage_data/snap/anup/android-ndk-r26d/
+# Activate build virtual environment
+source "$(dirname "$0")/build_venv/bin/activate"
+
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/Android/android-ndk-r28c/
+export PATH=$PATH:$HOME/Android/android-ndk-r28c/
+export ANDROID_NDK=$HOME/Android/android-ndk-r28c/
 
 echo "Building NNTrainer with OpenCL and FP16 support..."
 ./tools/package_android.sh -Denable-opencl=true -Denable-fp16=true
