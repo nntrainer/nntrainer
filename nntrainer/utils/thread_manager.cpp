@@ -64,6 +64,10 @@ ThreadManager::~ThreadManager() {
 void ThreadManager::initialize() noexcept {
   auto config = config_;
 
+  // Don't initialize for 1 thread(0 worker)
+  if (config.compute_threads <= 1u)
+    return;
+
   uint32_t hw_threads = getPhysicalCoreCount();
 
   // Don't initialize for single core system
