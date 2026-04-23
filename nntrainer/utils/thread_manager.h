@@ -147,23 +147,14 @@ public:
     if (begin >= end) {
       return;
     }
-    parallelize_1d(begin, end, std::forward<F>(fn));
-  }
 
-  /**
-   * @brief parallize loop for given function
-   */
-  template <typename F>
-  void parallel_for(size_t begin, size_t end, size_t n_workers, F &&fn) {
-    parallel_for(begin, end, std::forward<F>(fn));
-  }
+    if (end - begin == 1 || compute_workers_.empty()) {
+      for (size_t i = begin; i < end; i++)
+        fn(i);
+      return;
+    }
 
-  /**
-   * @brief parallize loop for given function
-   */
-  template <typename F> void parallel_for_chunked(size_t n_threads, F &&fn) {
-    // todo: divie chunk inside this method
-    parallelize_1d(0, n_threads, std::forward<F>(fn));
+    parallelize(begin, end, std::forward<F>(fn));
   }
 
   /**
@@ -238,32 +229,12 @@ private:
   /**
    * @brief callback function for each thread
    */
-  void thread_parallelize_1d(size_t my_tid);
-
-  /**
-   * @brief
-   */
-  template <typename F>
-  void parallelize_1d(size_t begin, size_t end, F &&task) {
-    if (end - begin == 1 || compute_workers_.empty()) {
-      for (size_t i = begin; i < end; i++)
-        task(i);
-      return;
-    }
-
-    std::function<void(size_t)> thread_function = [this](size_t i) {
-      this->thread_parallelize_1d(i);
-    };
-
-    parallelize(thread_function, begin, end, std::forward<F>(task));
-  }
+  void thread_parallelize(size_t my_tid);
 
   /**
    * @brief do parallelize and compute with workers
    */
-  template <typename F>
-  void parallelize(std::function<void(size_t)> thread_function, size_t begin,
-                   size_t end, F &&task) {
+  template <typename F> void parallelize(size_t begin, size_t end, F &&task) {
     std::lock_guard<std::mutex> lock(execution_mutex_);
 
 #if defined(_WIN32)
@@ -271,7 +242,6 @@ private:
 #endif
 
     task_ = std::move(task);
-    thread_function_ = thread_function;
 
     // set active thread numbers
     size_t threads_count = compute_workers_.size() + 1;
@@ -313,7 +283,7 @@ private:
 #endif
 
     // main thread also works
-    thread_function_(0);
+    thread_parallelize(0);
 
     wait_worker_threads();
 
@@ -328,7 +298,6 @@ private:
 
   std::unique_ptr<thread_info[]> thread_infos_;
   std::mutex execution_mutex_;
-  std::function<void(size_t)> thread_function_;
   std::function<void(size_t)> task_;
 
   CACHELINE_ALIGNED std::atomic<uint32_t> command_;

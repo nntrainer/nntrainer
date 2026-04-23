@@ -214,7 +214,7 @@ void ThreadManager::thread_main(size_t tid) {
 
     switch (command & COMMAND_MASK) {
     case RUN: {
-      thread_function_(tid);
+      thread_parallelize(tid);
       break;
     }
     case SHUTDOWN:
@@ -239,7 +239,7 @@ inline bool ThreadManager::try_decrement(std::atomic<size_t> &value) {
   return false;
 }
 
-void ThreadManager::thread_parallelize_1d(size_t my_tid) {
+void ThreadManager::thread_parallelize(size_t my_tid) {
 
   // process my job
   size_t range_start =

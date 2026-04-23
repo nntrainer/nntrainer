@@ -412,7 +412,7 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_BSTP(
 
   ///@todo Dynamic thread-number selection for GEMM problem size
   unsigned int thread_num = tm.getComputeThreadCount();
-  tm.parallel_for_chunked(thread_num, [=](size_t i) {
+  tm.parallel_for(0, thread_num, [=](size_t i) {
     unsigned int M_step_start = (i * N) / thread_num;
     unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
@@ -429,7 +429,7 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_BSTP(
   });
 
   for (unsigned int pb = M4 * 4; pb < M; pb++) {
-    tm.parallel_for_chunked(thread_num, [=](size_t i) {
+    tm.parallel_for(0, thread_num, [=](size_t i) {
       unsigned int M_step_start = (i * N) / thread_num;
       unsigned int M_step_end = ((i + 1) * N) / thread_num;
 

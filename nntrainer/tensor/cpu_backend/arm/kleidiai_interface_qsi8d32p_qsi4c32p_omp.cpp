@@ -75,40 +75,39 @@ void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp_parallel(
     k * sizeof(float),                 // LHS stride
     lhs_packed_mtx);                   // LHS packed output
 
-  int n_threads = 4;
-  assert(n % n_threads == 0);
-  size_t n_ukernel = n / n_threads;
+  // TODO find optimal chunk size
+  size_t chunk_size = 4;
+  assert(n % chunk_size == 0);
+  size_t loop = n / chunk_size;
   auto &tm = nntrainer::ThreadManager::Global();
-  tm.parallel_for(
-    0, static_cast<size_t>(n_threads), static_cast<unsigned int>(n_threads),
-    [&](size_t current_thread) {
-      const size_t dst_stride = n * sizeof(float);
-      const size_t lhs_offset =
-        ukernel_variants_qsi8d32p[idx_variant].ukernel.get_lhs_packed_offset(
-          0, k, bl);
-      const size_t rhs_offset =
-        ukernel_variants_qsi8d32p[idx_variant].ukernel.get_rhs_packed_offset(
-          n_ukernel * current_thread, k, bl);
-      const size_t dst_offset =
-        ukernel_variants_qsi8d32p[idx_variant].ukernel.get_dst_offset(
-          0, n_ukernel * current_thread, dst_stride);
+  tm.parallel_for(0, loop, [&](size_t i) {
+    const size_t dst_stride = n * sizeof(float);
+    const size_t lhs_offset =
+      ukernel_variants_qsi8d32p[idx_variant].ukernel.get_lhs_packed_offset(0, k,
+                                                                           bl);
+    const size_t rhs_offset =
+      ukernel_variants_qsi8d32p[idx_variant].ukernel.get_rhs_packed_offset(
+        chunk_size * i, k, bl);
+    const size_t dst_offset =
+      ukernel_variants_qsi8d32p[idx_variant].ukernel.get_dst_offset(
+        0, chunk_size * i, dst_stride);
 
-      const void *lhs_ptr =
-        (const void *)((const char *)lhs_packed_mtx + lhs_offset);
-      const void *rhs_ptr =
-        (const void *)((const char *)rhs_packed_mtx + rhs_offset);
-      float *dst_ptr = (float *)((uint8_t *)dst_act_mtx_f32 + dst_offset);
+    const void *lhs_ptr =
+      (const void *)((const char *)lhs_packed_mtx + lhs_offset);
+    const void *rhs_ptr =
+      (const void *)((const char *)rhs_packed_mtx + rhs_offset);
+    float *dst_ptr = (float *)((uint8_t *)dst_act_mtx_f32 + dst_offset);
 
-      ukernel_variants_qsi8d32p[idx_variant].ukernel.run_matmul(
-        m, n / n_threads, k, bl, // Dimensions
-        lhs_ptr,                 // LHS packed
-        rhs_ptr,                 // RHS packed
-        dst_ptr,                 // DST
-        dst_stride,              // DST stride (row)
-        sizeof(float),           // DST stride (col)
-        lower_bound, upper_bound // Min and max for the clamp operation
-      );
-    });
+    ukernel_variants_qsi8d32p[idx_variant].ukernel.run_matmul(
+      m, chunk_size, k, bl,    // Dimensions
+      lhs_ptr,                 // LHS packed
+      rhs_ptr,                 // RHS packed
+      dst_ptr,                 // DST
+      dst_stride,              // DST stride (row)
+      sizeof(float),           // DST stride (col)
+      lower_bound, upper_bound // Min and max for the clamp operation
+    );
+  });
 
   delete[] lhs_packed_mtx;
 }
@@ -144,52 +143,39 @@ void nntr_kai_gemm_qsi8d32p_qsi4c32p_olp_parallel_m1(
     k * sizeof(float),                 // LHS stride
     lhs_packed_mtx);                   // LHS packed output
 
-  int n_threads = 4;
-  // Round up n/n_threads to the nearest multiple of nr for proper RHS tiling
-  const size_t n_per_thread_raw = (n + n_threads - 1) / n_threads;
-  const size_t n_per_thread = ((n_per_thread_raw + nr - 1) / nr) * nr;
+  // TODO find optimal chunk size
+  size_t chunk_size = nr;
+  size_t loop = (n + chunk_size - 1) / chunk_size;
 
   auto &tm = nntrainer::ThreadManager::Global();
-  tm.parallel_for(
-    0, static_cast<size_t>(n_threads), static_cast<unsigned int>(n_threads),
-    [&](size_t current_thread) {
-      const size_t n_start = current_thread * n_per_thread;
+  tm.parallel_for(0, loop, [&](size_t i) {
+    const size_t n_start = i * chunk_size;
+    const size_t n_end = std::min((i + 1) * chunk_size, (size_t)n);
 
-      // Check if this thread has work to do
-      if (n_start >= n) {
-        return;
-      }
+    const size_t dst_stride = n * sizeof(float);
+    const size_t lhs_offset =
+      ukernel_variants_qsi8d32p[idx_variant].ukernel.get_lhs_packed_offset(0, k,
+                                                                           bl);
+    const size_t rhs_offset =
+      ukernel_variants_qsi8d32p[idx_variant].ukernel.get_rhs_packed_offset(
+        n_start, k, bl);
 
-      // Calculate actual n for this thread (may be less for last thread)
-      size_t n_chunk = n_per_thread;
-      if (n_start + n_chunk > n) {
-        n_chunk = n - n_start;
-      }
+    const void *lhs_ptr =
+      (const void *)((const char *)lhs_packed_mtx + lhs_offset);
+    const void *rhs_ptr =
+      (const void *)((const char *)rhs_packed_mtx + rhs_offset);
+    // For m=1, dst is a vector, so offset by n_start floats
+    float *dst_ptr = dst_act_mtx_f32 + n_start;
 
-      const size_t dst_stride = n * sizeof(float);
-      const size_t lhs_offset =
-        ukernel_variants_qsi8d32p[idx_variant].ukernel.get_lhs_packed_offset(
-          0, k, bl);
-      const size_t rhs_offset =
-        ukernel_variants_qsi8d32p[idx_variant].ukernel.get_rhs_packed_offset(
-          n_start, k, bl);
-
-      const void *lhs_ptr =
-        (const void *)((const char *)lhs_packed_mtx + lhs_offset);
-      const void *rhs_ptr =
-        (const void *)((const char *)rhs_packed_mtx + rhs_offset);
-      // For m=1, dst is a vector, so offset by n_start floats
-      float *dst_ptr = dst_act_mtx_f32 + n_start;
-
-      ukernel_variants_qsi8d32p[idx_variant].ukernel.run_matmul(
-        1, n_chunk, k, bl, // m=1, this thread's n chunk
-        lhs_ptr,           // LHS packed (shared)
-        rhs_ptr,           // RHS packed (this thread's portion)
-        dst_ptr,           // DST (this thread's portion)
-        dst_stride,        // DST stride (row)
-        sizeof(float),     // DST stride (col)
-        lower_bound, upper_bound);
-    });
+    ukernel_variants_qsi8d32p[idx_variant].ukernel.run_matmul(
+      1, n_end - n_start, k, bl, // m=1, this thread's n chunk
+      lhs_ptr,                   // LHS packed (shared)
+      rhs_ptr,                   // RHS packed (this thread's portion)
+      dst_ptr,                   // DST (this thread's portion)
+      dst_stride,                // DST stride (row)
+      sizeof(float),             // DST stride (col)
+      lower_bound, upper_bound);
+  });
 
   delete[] lhs_packed_mtx;
 }

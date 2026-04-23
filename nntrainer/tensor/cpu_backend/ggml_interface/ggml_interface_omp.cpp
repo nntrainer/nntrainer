@@ -237,7 +237,7 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M,
         (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
     }
 
-    tm.parallel_for_chunked(thread_num, [&](size_t i) {
+    tm.parallel_for(0, thread_num, [&](size_t i) {
       for (unsigned int num_w = 0; num_w < Ns.size(); ++num_w) {
         unsigned int N = Ns[num_w];
         unsigned int ldc = ldcs[num_w];
@@ -263,7 +263,7 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M,
     });
 
     if (M4 * 4 != M) {
-      tm.parallel_for_chunked(thread_num, [&](size_t thread_idx) {
+      tm.parallel_for(0, thread_num, [&](size_t thread_idx) {
         for (unsigned int num_w = 0; num_w < Ns.size(); ++num_w) {
           unsigned int N = Ns[num_w];
           unsigned int ldc = ldcs[num_w];
@@ -309,7 +309,7 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
     std::vector<char> QA = std::vector<char>(qa_size);
     nntr_quantize_row_q8_0(A, QA.data(), K);
 
-    tm.parallel_for_chunked(thread_num, [=](size_t thread_idx) {
+    tm.parallel_for(0, thread_num, [=](size_t thread_idx) {
       unsigned int M_step_start = (thread_idx * N) / thread_num;
       unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
 
@@ -345,7 +345,7 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
     }
 
     // Compute 4-divisible-M row portion with multithreaded GEMM
-    tm.parallel_for_chunked(thread_num, [=](size_t i) {
+    tm.parallel_for(0, thread_num, [=](size_t i) {
       unsigned int src0_start = (i * N) / thread_num;
       unsigned int src0_end = ((i + 1) * N) / thread_num;
 
@@ -360,7 +360,7 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
 
     // Compute leftover 1 ~ 3 rows with multithreaded GEMV
     for (unsigned int pb = M4 * 4; pb < M; pb++) {
-      tm.parallel_for_chunked(thread_num, [=](size_t thread_idx) {
+      tm.parallel_for(0, thread_num, [=](size_t thread_idx) {
         unsigned int M_step_start = (thread_idx * N) / thread_num;
         unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
 
@@ -409,7 +409,7 @@ void __ggml_q4_K_8x8_q8_K_GEMM(const unsigned int M, const unsigned int N,
 
     nntr_quantize_row_q8_K(A, QA.data(), K);
 
-    tm.parallel_for_chunked(thread_num, [=](size_t thread_idx) {
+    tm.parallel_for(0, thread_num, [=](size_t thread_idx) {
       unsigned int M_step_start = (thread_idx * N) / thread_num;
       unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
 
@@ -443,7 +443,7 @@ void __ggml_q4_K_8x8_q8_K_GEMM(const unsigned int M, const unsigned int N,
     }
 
     // Compute 4-divisible-M row portion with multithreaded GEMM
-    tm.parallel_for_chunked(thread_num, [=](size_t i) {
+    tm.parallel_for(0, thread_num, [=](size_t i) {
       unsigned int src0_start = (i * N) / thread_num;
       unsigned int src0_end = ((i + 1) * N) / thread_num;
 
@@ -458,7 +458,7 @@ void __ggml_q4_K_8x8_q8_K_GEMM(const unsigned int M, const unsigned int N,
 
     // Compute leftover 1 ~ 3 rows with multithreaded GEMV
     for (unsigned int pb = M4 * 4; pb < M; pb++) {
-      tm.parallel_for_chunked(thread_num, [=](size_t thread_idx) {
+      tm.parallel_for(0, thread_num, [=](size_t thread_idx) {
         unsigned int M_step_start = (thread_idx * N) / thread_num;
         unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
 
