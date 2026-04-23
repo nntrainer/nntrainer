@@ -15,7 +15,7 @@ __kernel void flash_attention_fp16(__global const half *query,
                                    const int num_heads_q,
                                    const int num_heads_kv,
                                    const int batch,
-                                   const half scale) {
+                                   const float scale) {
   
   const int total_work_items = batch * num_heads_q * seqlen_q;
   const int global_id = get_global_id(0);

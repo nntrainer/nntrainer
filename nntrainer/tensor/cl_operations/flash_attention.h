@@ -60,7 +60,10 @@ void flash_attention_cpu(const float *query, const float *key,
                          float scale);
 
 /**
- * @brief Flash Attention FP32 computation with GQA support
+ * @brief Flash Attention FP32 dispatch — selects prefill or decode kernel
+ * @detail Top-level dispatch function that routes to the appropriate kernel
+ *         based on seqlen_q. For seqlen_q == 1 (decode), uses the decode-optimized
+ *         path. For seqlen_q > 1 (prefill), uses the prefill-optimized path.
  * @param[in] query float * for Query matrix
  * @param[in] key float * for Key matrix
  * @param[in] value float * for Value matrix
@@ -79,10 +82,59 @@ void flash_attention_fp32_cl(float *query, float *key, float *value, float *outp
                              unsigned int num_heads_kv, unsigned int batch,
                              float scale);
 
+/**
+ * @brief Flash Attention FP32 prefill kernel — optimized for many Q tokens
+ * @detail Uses tiled GEMM approach for KQ and VKQ computation with online softmax.
+ *         Each work-group processes multiple Q tokens (ncols1) against tiles of K/V.
+ * @param[in] query float * for Query matrix
+ * @param[in] key float * for Key matrix
+ * @param[in] value float * for Value matrix
+ * @param[out] output float * for Output matrix
+ * @param[in] seqlen_q sequence length of query
+ * @param[in] seqlen_k sequence length of key
+ * @param[in] head_dim dimension of each attention head
+ * @param[in] num_heads_q number of query attention heads
+ * @param[in] num_heads_kv number of key/value attention heads
+ * @param[in] batch batch size
+ * @param[in] scale scaling factor for attention scores
+ */
+void flash_attention_prefill_fp32_cl(float *query, float *key, float *value,
+                                     float *output, unsigned int seqlen_q,
+                                     unsigned int seqlen_k, unsigned int head_dim,
+                                     unsigned int num_heads_q,
+                                     unsigned int num_heads_kv,
+                                     unsigned int batch, float scale);
+
+/**
+ * @brief Flash Attention FP32 decode kernel — optimized for single Q token
+ * @detail Uses split-KV approach where KV sequence is split across work-groups,
+ *         each computing partial (max, sum, VKQ), then reduced via log-sum-exp.
+ * @param[in] query float * for Query matrix
+ * @param[in] key float * for Key matrix
+ * @param[in] value float * for Value matrix
+ * @param[out] output float * for Output matrix
+ * @param[in] seqlen_q sequence length of query (must be 1 for decode)
+ * @param[in] seqlen_k sequence length of key
+ * @param[in] head_dim dimension of each attention head
+ * @param[in] num_heads_q number of query attention heads
+ * @param[in] num_heads_kv number of key/value attention heads
+ * @param[in] batch batch size
+ * @param[in] scale scaling factor for attention scores
+ */
+void flash_attention_decode_fp32_cl(float *query, float *key, float *value,
+                                    float *output, unsigned int seqlen_q,
+                                    unsigned int seqlen_k, unsigned int head_dim,
+                                    unsigned int num_heads_q,
+                                    unsigned int num_heads_kv,
+                                    unsigned int batch, float scale);
+
 
 #ifdef ENABLE_FP16
 /**
- * @brief Flash Attention FP16 computation with GQA support
+ * @brief Flash Attention FP16 dispatch — selects prefill or decode kernel
+ * @detail Top-level dispatch function that routes to the appropriate kernel
+ *         based on seqlen_q. For seqlen_q == 1 (decode), uses the decode-optimized
+ *         path. For seqlen_q > 1 (prefill), uses the prefill-optimized path.
  * @param[in] query _FP16 * for Query matrix
  * @param[in] key _FP16 * for Key matrix
  * @param[in] value _FP16 * for Value matrix
@@ -100,6 +152,52 @@ void flash_attention_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value, _FP16 *outp
                              unsigned int head_dim, unsigned int num_heads_q,
                              unsigned int num_heads_kv, unsigned int batch,
                              float scale);
+
+/**
+ * @brief Flash Attention FP16 prefill kernel — optimized for many Q tokens
+ * @detail Uses tiled GEMM approach with FP16 storage and FP32 accumulation.
+ *         Each work-group processes multiple Q tokens against tiles of K/V.
+ * @param[in] query _FP16 * for Query matrix
+ * @param[in] key _FP16 * for Key matrix
+ * @param[in] value _FP16 * for Value matrix
+ * @param[out] output _FP16 * for Output matrix
+ * @param[in] seqlen_q sequence length of query
+ * @param[in] seqlen_k sequence length of key
+ * @param[in] head_dim dimension of each attention head
+ * @param[in] num_heads_q number of query attention heads
+ * @param[in] num_heads_kv number of key/value attention heads
+ * @param[in] batch batch size
+ * @param[in] scale scaling factor for attention scores
+ */
+void flash_attention_prefill_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
+                                     _FP16 *output, unsigned int seqlen_q,
+                                     unsigned int seqlen_k, unsigned int head_dim,
+                                     unsigned int num_heads_q,
+                                     unsigned int num_heads_kv,
+                                     unsigned int batch, float scale);
+
+/**
+ * @brief Flash Attention FP16 decode kernel — optimized for single Q token
+ * @detail Uses split-KV approach where KV sequence is split across work-groups,
+ *         each computing partial (max, sum, VKQ), then reduced via log-sum-exp.
+ * @param[in] query _FP16 * for Query matrix
+ * @param[in] key _FP16 * for Key matrix
+ * @param[in] value _FP16 * for Value matrix
+ * @param[out] output _FP16 * for Output matrix
+ * @param[in] seqlen_q sequence length of query (must be 1 for decode)
+ * @param[in] seqlen_k sequence length of key
+ * @param[in] head_dim dimension of each attention head
+ * @param[in] num_heads_q number of query attention heads
+ * @param[in] num_heads_kv number of key/value attention heads
+ * @param[in] batch batch size
+ * @param[in] scale scaling factor for attention scores
+ */
+void flash_attention_decode_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
+                                    _FP16 *output, unsigned int seqlen_q,
+                                    unsigned int seqlen_k, unsigned int head_dim,
+                                    unsigned int num_heads_q,
+                                    unsigned int num_heads_kv,
+                                    unsigned int batch, float scale);
 #endif /* ENABLE_FP16 */
 
 
