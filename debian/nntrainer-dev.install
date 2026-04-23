@@ -65,6 +65,8 @@
 /usr/include/nntrainer/util_simd.h
 /usr/include/nntrainer/dynamic_library_loader.h
 /usr/include/nntrainer/mman_windows.h
+/usr/include/nntrainer/thread_manager.h
+/usr/include/nntrainer/thread_manager_util.h
 # model
 /usr/include/nntrainer/neuralnet.h
 ## neuralnet.h : forwarding() / backwarding() support
