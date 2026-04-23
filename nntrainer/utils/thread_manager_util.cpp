@@ -3,7 +3,7 @@
  * Copyright (C) 2025 Jaemin Shin <jaemin2.shin@samsung.com>
  *
  * @file   thread_manager_util.cpp
- * @date   20 April 2026
+ * @date   23 April 2026
  * @brief  Utils for unified thread manager
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jaemin Shin <jaemin2.shin@samsung.com>
@@ -13,13 +13,14 @@
 #include "thread_manager_util.h"
 
 namespace {
-constexpr static bool is_x86 =
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) ||             \
   defined(_M_IX86)
-  true;
+constexpr static bool is_x86 = true;
 #elif defined(__aarch64__) || defined(_M_ARM64) || defined(__arm__) ||         \
   defined(_M_ARM)
-  false;
+constexpr static bool is_x86 = false;
+#else
+#error "Unknown architecture!"
 #endif
 } // namespace
 

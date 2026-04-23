@@ -3,7 +3,7 @@
  * Copyright (C) 2025 Jijoong Moon <jijoong.moon@samsung.com>
  * Copyright (C) 2025 Jaemin Shin <jaemin2.shin@samsung.com>
  * @file   thread_manager.cpp
- * @date   20 March 2026
+ * @date   23 April 2026
  * @brief  Unified thread manager: spin-wait (affinity) or condvar (default)
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>

@@ -4,7 +4,7 @@
  * Copyright (C) 2025 Jaemin Shin <jaemin2.shin@samsung.com>
  *
  * @file   thread_manager.h
- * @date   20 March 2026
+ * @date   23 April 2026
  * @brief  Unified thread manager for compute, inspired by pthreadpool
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
@@ -134,6 +134,9 @@ enum threadpool_command {
  * With enable_affinity=false:
  *   Workers are not pinned to cores.
  *   Let OS scheduler control cores.
+ *
+ * How to use?
+ *   Just wrap the loop body with parallel_for(). Check it for details.
  */
 class ThreadManager : public Singleton<ThreadManager> {
 public:
@@ -142,6 +145,13 @@ public:
 
   /**
    * @brief parallize loop for given function
+   * @param begin loop start index
+   * @param end loop end index
+   * @param fn callback to run in parallel
+   * @details This method parallelizes the following for loop.
+   * for(i = begin ; i < end ; i++) { fn(i); }
+   * @warning callback should not contain another parallel_for()
+   * i.e. nested parallel_for is forbidden.
    */
   template <typename F> void parallel_for(size_t begin, size_t end, F &&fn) {
     if (begin >= end) {
@@ -167,6 +177,7 @@ public:
 
   /**
    * @brief set config with given parameter
+   * @warning It should be called before first call of thread manager.
    */
   static void setConfig(const ThreadManagerConfig &config) { config_ = config; }
 
@@ -300,7 +311,7 @@ private:
   std::mutex execution_mutex_;
   std::function<void(size_t)> task_;
 
-  CACHELINE_ALIGNED std::atomic<uint32_t> command_;
+  CACHELINE_ALIGNED std::atomic<uint32_t> command_{threadpool_command::INIT};
   CACHELINE_ALIGNED std::atomic<size_t> active_threads_;
 #if defined(__linux__) || defined(__ANDROID__)
   CACHELINE_ALIGNED std::atomic<uint32_t> has_active_threads_;

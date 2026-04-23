@@ -3,7 +3,7 @@
  * Copyright (C) 2025 Jaemin Shin <jaemin2.shin@samsung.com>
  *
  * @file   thread_manager_util.h
- * @date   20 April 2026
+ * @date   23 April 2026
  * @brief  Utils for unified thread manager
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jaemin Shin <jaemin2.shin@samsung.com>

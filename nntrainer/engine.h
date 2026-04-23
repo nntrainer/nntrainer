@@ -141,8 +141,6 @@ public:
 
   /**
    *
-  /**
-   *
    * @brief Parse compute Engine keywords in properties : eg) engine = cpu
    *  default is "cpu"
    * @return Context name
@@ -279,7 +277,6 @@ private:
     allocator;
 
   std::string working_path_base;
-
 };
 
 namespace plugin {}
