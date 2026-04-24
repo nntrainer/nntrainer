@@ -13,8 +13,10 @@
 
 #include "flash_attention.h"
 #include <cl_kernels/flash_attention_fp32.h>
+#include <cl_kernels/flash_attention_prefill_fp32.h>
 #ifdef ENABLE_FP16
 #include <cl_kernels/flash_attention_fp16.h>
+#include <cl_kernels/flash_attention_prefill_fp16.h>
 #endif
 
 namespace nntrainer {
@@ -127,13 +129,17 @@ void flash_attention_prefill_fp32_cl(float *query, float *key, float *value, flo
     return;
   }
 
+  // FP32 prefill: Use the original row-by-row kernel which is well-optimized
+  // for this device (40 ms vs 152 ms with tiled GEMM on Mali).
+  // The tiled GEMM kernel has low work-item utilization and high local memory
+  // usage for FP32, making the row-by-row approach faster.
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
 
   ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
     flash_attention_fp32_kernel, "flash_attention_fp32");
   if (!kernel_ptr) {
-    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_fp32");
+    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_prefill_fp32");
     return;
   }
 
@@ -142,55 +148,56 @@ void flash_attention_prefill_fp32_cl(float *query, float *key, float *value, flo
 
   result = kernel_ptr->SetKernelSVMArguments(arg++, query);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_fp32");
+    throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_prefill_fp32");
 
   result = kernel_ptr->SetKernelSVMArguments(arg++, key);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_fp32");
+    throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_prefill_fp32");
 
   result = kernel_ptr->SetKernelSVMArguments(arg++, value);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_fp32");
+    throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_prefill_fp32");
 
   result = kernel_ptr->SetKernelSVMArguments(arg++, output);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_fp32");
+    throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_prefill_fp32");
 
   result = kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_fp32");
+    throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_prefill_fp32");
 
   result = kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_fp32");
+    throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_prefill_fp32");
 
   result = kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_fp32");
+    throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_prefill_fp32");
 
   result = kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_fp32");
+    throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_prefill_fp32");
 
   result = kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_fp32");
+    throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_prefill_fp32");
 
   result = kernel_ptr->SetKernelArguments(arg++, &batch, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_fp32");
+    throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_prefill_fp32");
 
   result = kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_fp32");
+    throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_prefill_fp32");
 
+  // Dispatch: original row-by-row kernel — one work-item per (batch, head, q_token)
   const int work_groups_count[3] = {(int)total_work_items, 1, 1};
   const int work_group_size[3] = {64, 1, 1};
 
   result = blas_cc->command_queue_inst_.DispatchCommand(
     kernel_ptr, work_groups_count, work_group_size);
   if (!result) {
-    throw std::runtime_error("Failed to dispatch kernel for flash_attention_fp32");
+    throw std::runtime_error("Failed to dispatch kernel for flash_attention_prefill_fp32");
     return;
   }
 
@@ -198,7 +205,7 @@ void flash_attention_prefill_fp32_cl(float *query, float *key, float *value, flo
                                              batch * num_heads_q * seqlen_q * head_dim * sizeof(float),
                                              true);
   if (!result) {
-    throw std::runtime_error("Failed to read output data for flash_attention_fp32");
+    throw std::runtime_error("Failed to read output data for flash_attention_prefill_fp32");
     return;
   }
 }
@@ -368,13 +375,25 @@ void flash_attention_prefill_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
     return;
   }
 
+  // Phase 2: Tiled GEMM prefill kernel configuration
+  // NCOLS1: Q tokens per work-group, NBATCH_FA: KV rows per tile
+  static const unsigned int NCOLS1 = 4;
+  static const unsigned int NBATCH_FA = 16;
+
+  // Work-group size: must be large enough to cooperatively load tiles
+  static const unsigned int PREFILL_WORK_GROUP_SIZE = 128;
+
+  // Number of work-groups: batch * num_heads_q * ceil(seqlen_q / NCOLS1)
+  const unsigned int num_q_groups = (seqlen_q + NCOLS1 - 1) / NCOLS1;
+  const unsigned int total_groups = batch * num_heads_q * num_q_groups;
+
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
 
   ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
-    flash_attention_fp16_kernel, "flash_attention_fp16");
+    flash_attention_prefill_fp16_kernel, "flash_attention_prefill_fp16");
   if (!kernel_ptr) {
-    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_fp16");
+    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_prefill_fp16");
     return;
   }
 
@@ -383,55 +402,56 @@ void flash_attention_prefill_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
 
   result = kernel_ptr->SetKernelSVMArguments(arg++, query);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_fp16");
+    throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_prefill_fp16");
 
   result = kernel_ptr->SetKernelSVMArguments(arg++, key);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_fp16");
+    throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_prefill_fp16");
 
   result = kernel_ptr->SetKernelSVMArguments(arg++, value);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_fp16");
+    throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_prefill_fp16");
 
   result = kernel_ptr->SetKernelSVMArguments(arg++, output);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_fp16");
+    throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_prefill_fp16");
 
   result = kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_fp16");
+    throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_prefill_fp16");
 
   result = kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_fp16");
+    throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_prefill_fp16");
 
   result = kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_fp16");
+    throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_prefill_fp16");
 
   result = kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_fp16");
+    throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_prefill_fp16");
 
   result = kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_fp16");
+    throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_prefill_fp16");
 
   result = kernel_ptr->SetKernelArguments(arg++, &batch, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_fp16");
+    throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_prefill_fp16");
 
   result = kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_fp16");
+    throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_prefill_fp16");
 
-  const int work_groups_count[3] = {(int)total_work_items, 1, 1};
-  const int work_group_size[3] = {64, 1, 1};
+  // Dispatch: total_groups work-groups, each with PREFILL_WORK_GROUP_SIZE work-items
+  const int work_groups_count[3] = {(int)(total_groups * PREFILL_WORK_GROUP_SIZE), 1, 1};
+  const int work_group_size[3] = {(int)PREFILL_WORK_GROUP_SIZE, 1, 1};
 
   result = blas_cc->command_queue_inst_.DispatchCommand(
     kernel_ptr, work_groups_count, work_group_size);
   if (!result) {
-    throw std::runtime_error("Failed to dispatch kernel for flash_attention_fp16");
+    throw std::runtime_error("Failed to dispatch kernel for flash_attention_prefill_fp16");
     return;
   }
 
@@ -439,7 +459,7 @@ void flash_attention_prefill_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
                                              batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16),
                                              true);
   if (!result) {
-    throw std::runtime_error("Failed to read output data for flash_attention_fp16");
+    throw std::runtime_error("Failed to read output data for flash_attention_prefill_fp16");
     return;
   }
 }
