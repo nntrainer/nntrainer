@@ -7,16 +7,15 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
  * @bug    No known bugs except for NYI items
- * @brief  This is MNIST Example with
+ * @brief  MNIST CNN example using symbolic tensor graph construction.
  *
  * Input 28x28
- * Conv2D 5 x 5 : 6 filters, stride 1x1, padding=0,0
- * Pooling2D : 2 x 2, Average pooling, stride 1x1
- * Conv2D 6 x 5 x 5 : 12 filters, stride 1x1, padding=0,0
- * Pooling2D : 2 x 2, Average Pooling, stride 1x1
+ * Conv2D 5x5 : 6 filters, stride 1x1, padding=0,0, sigmoid
+ * Pooling2D : 2x2, Average pooling, stride 2x2
+ * Conv2D 5x5 : 12 filters, stride 1x1, padding=0,0, sigmoid
+ * Pooling2D : 2x2, Average Pooling, stride 2x2
  * Flatten
- * Fully Connected Layer with 10 unit
- *
+ * Fully Connected Layer with 10 units, softmax
  */
 
 #if defined(ENABLE_TEST)
@@ -42,9 +41,10 @@
 #include <dataset.h>
 #include <model.h>
 #include <optimizer.h>
+#include <tensor_api.h>
 
 #ifdef PROFILE
-#include <profiler.h> // disable including this in android as profiler is not exposed yet to devel header
+#include <profiler.h>
 #endif
 
 #define TRAINING true
@@ -54,32 +54,17 @@
 constexpr unsigned int SEED = 0;
 
 #if VALIDATION
-/**
- * @brief     Data size for each category
- */
 const unsigned int total_train_data_size = 32;
-
 const unsigned int total_val_data_size = 32;
-
 const unsigned int total_test_data_size = 32;
-
 const unsigned int batch_size = 32;
-
 #else
-
 const unsigned int total_train_data_size = 100;
-
 const unsigned int total_val_data_size = 100;
-
 const unsigned int total_test_data_size = 100;
-
 const unsigned int batch_size = 32;
-
 #endif
 
-/**
- * @brief     Number of category : Three
- */
 const unsigned int total_label_size = 10;
 
 unsigned int train_count = 0;
@@ -96,31 +81,14 @@ float validation_loss = 0.0f;
 
 std::string filename = "mnist_trainingSet.dat";
 
-/**
- * @brief     step function
- * @param[in] x value to be distinguished
- * @retval 0.0 or 1.0
- */
 float stepFunction(float x) {
-  if (x + tolerance > 1.0) {
+  if (x + tolerance > 1.0)
     return 1.0;
-  }
-
-  if (x - tolerance < 0.0) {
+  if (x - tolerance < 0.0)
     return 0.0;
-  }
-
   return x;
 }
 
-/**
- * @brief     load data at specific position of file
- * @param[in] F  ifstream (input file)
- * @param[out] input input
- * @param[out] label label
- * @param[in] id th data to get
- * @retval true/false false : end of data
- */
 bool getData(std::ifstream &F, float *input, float *label, unsigned int id) {
   F.clear();
   F.seekg(0, std::ios_base::end);
@@ -128,28 +96,17 @@ bool getData(std::ifstream &F, float *input, float *label, unsigned int id) {
   uint64_t position = (uint64_t)((feature_size + total_label_size) *
                                  (uint64_t)id * sizeof(float));
 
-  if (position > file_length) {
+  if (position > file_length)
     return false;
-  }
+
   F.seekg(position, std::ios::beg);
   F.read((char *)input, sizeof(float) * feature_size);
   F.read((char *)label, sizeof(float) * total_label_size);
-
   return true;
 }
 
-/**
- * @brief UserData which stores information used to feed data from data callback
- *
- */
 class DataInformation {
 public:
-  /**
-   * @brief Construct a new Data Information object
-   *
-   * @param num_samples number of data
-   * @param filename file name to read from
-   */
   DataInformation(unsigned int num_samples, const std::string &filename);
   unsigned int count;
   unsigned int num_samples;
@@ -173,14 +130,6 @@ DataInformation::DataInformation(unsigned int num_samples,
   }
 }
 
-/**
- * @brief      get data which size is batch for train
- * @param[out] outInput input vectors
- * @param[out] outLabel label vectors
- * @param[out] last if the data is finished
- * @param[in] user_data private data for the callback
- * @retval status for handling error
- */
 int getSample(float **outVec, float **outLabel, bool *last, void *user_data) {
   auto data = reinterpret_cast<DataInformation *>(user_data);
 
@@ -205,10 +154,52 @@ TEST(MNIST_training, verify_accuracy) {
 #endif
 
 /**
- * @brief     create model
- *            Get Feature from tflite & run forward & back propagation
- * @param[in]  arg 1 : configuration file path
- * @param[in]  arg 2 : resource path
+ * @brief Build the MNIST CNN model using symbolic tensor graph.
+ *
+ * Returns {input_tensor, output_tensor} for compile(Tensor, Tensor).
+ */
+static std::pair<ml::train::Tensor, ml::train::Tensor> buildGraph() {
+  using ml::train::createLayer;
+  using ml::train::LayerHandle;
+  using ml::train::Tensor;
+
+  auto x = Tensor({1, 1, 28, 28}, "inputlayer");
+
+  LayerHandle conv1(createLayer(
+    "conv2d", {"name=conv2d_c1_layer", "kernel_size=5,5",
+               "bias_initializer=zeros", "activation=sigmoid",
+               "weight_initializer=xavier_uniform", "filters=6",
+               "stride=1,1", "padding=0,0"}));
+  LayerHandle pool1(createLayer(
+    "pooling2d", {"name=pooling2d_p1", "pool_size=2,2", "stride=2,2",
+                  "padding=0,0", "pooling=average"}));
+  LayerHandle conv2(createLayer(
+    "conv2d", {"name=conv2d_c2_layer", "kernel_size=5,5",
+               "bias_initializer=zeros", "activation=sigmoid",
+               "weight_initializer=xavier_uniform", "filters=12",
+               "stride=1,1", "padding=0,0"}));
+  LayerHandle pool2(createLayer(
+    "pooling2d", {"name=pooling2d_p2", "pool_size=2,2", "stride=2,2",
+                  "padding=0,0", "pooling=average"}));
+  LayerHandle flat(createLayer("flatten", {"name=flatten"}));
+  LayerHandle fc(createLayer(
+    "fully_connected", {"name=outputlayer", "unit=10",
+                        "weight_initializer=xavier_uniform",
+                        "bias_initializer=zeros", "activation=softmax"}));
+
+  auto h = conv1(x);
+  h = pool1(h);
+  h = conv2(h);
+  h = pool2(h);
+  h = flat(h);
+  auto y = fc(h);
+
+  return {x, y};
+}
+
+/**
+ * @brief     create model and train on MNIST
+ * @param[in]  arg 1 : resource path (dataset.dat)
  */
 int main(int argc, char *argv[]) {
   int status = 0;
@@ -218,8 +209,8 @@ int main(int argc, char *argv[]) {
     std::cout << "Pre-existing model file doesn't exist.\n";
   }
 #endif
-  if (argc < 3) {
-    std::cout << "./nntrainer_mnist mnist.ini dataset.dat\n";
+  if (argc < 2) {
+    std::cout << "./nntrainer_mnist dataset.dat\n";
     exit(0);
   }
 
@@ -230,8 +221,7 @@ int main(int argc, char *argv[]) {
 #endif
 
   const std::vector<std::string> args(argv + 1, argv + argc);
-  std::string config = args[0];
-  filename = args[1];
+  filename = args[0];
 
   std::unique_ptr<DataInformation> train_user_data;
   std::unique_ptr<DataInformation> valid_user_data;
@@ -246,31 +236,23 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  /**
-   * @brief     Data buffer Create & Initialization
-   */
   std::shared_ptr<ml::train::Dataset> dataset_train, dataset_val;
   try {
-    dataset_train = createDataset(ml::train::DatasetType::GENERATOR, getSample,
-                                  train_user_data.get());
-    dataset_val = createDataset(ml::train::DatasetType::GENERATOR, getSample,
-                                valid_user_data.get());
+    dataset_train = ml::train::createDataset(
+      ml::train::DatasetType::GENERATOR, getSample, train_user_data.get());
+    dataset_val = ml::train::createDataset(
+      ml::train::DatasetType::GENERATOR, getSample, valid_user_data.get());
   } catch (const std::exception &e) {
     std::cerr << "Error creating dataset" << e.what() << std::endl;
     return 1;
   }
 
-  std::unique_ptr<ml::train::Model> model;
-  try {
-    /**
-     * @brief     Neural Network Create & Initialization
-     */
-    model = createModel(ml::train::ModelType::NEURAL_NET);
-    model->load(config, ml::train::ModelFormat::MODEL_FORMAT_INI_WITH_BIN);
-  } catch (const std::exception &e) {
-    std::cerr << "Error during loadFromConfig " << e.what() << std::endl;
-    return 1;
-  }
+  // Build symbolic graph
+  auto [x, y] = buildGraph();
+
+  auto model = ml::train::createModel(ml::train::ModelType::NEURAL_NET,
+                                      {"epochs=1500", "loss=cross",
+                                       "batch_size=32"});
 
   try {
     auto optimizer = ml::train::createOptimizer("adam");
@@ -287,8 +269,8 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    model->compile();
-    model->initialize();
+    // compile(Tensor, Tensor) internally calls compile + initialize + allocate
+    model->compile(x, y, ml::train::ExecutionMode::TRAIN);
     model->setDataset(ml::train::DatasetModeType::MODE_TRAIN, dataset_train);
     model->setDataset(ml::train::DatasetModeType::MODE_VALID, dataset_val);
   } catch (const std::exception &e) {
@@ -305,9 +287,6 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
-  /**
-   * @brief     Neural Network Train & validation
-   */
   try {
     model->train();
     training_loss = model->getTrainingLoss();
@@ -336,8 +315,5 @@ int main(int argc, char *argv[]) {
   }
 #endif
 
-  /**
-   * @brief     Finalize model
-   */
   return status;
 }

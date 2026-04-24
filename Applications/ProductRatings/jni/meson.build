@@ -15,13 +15,12 @@ endif
 
 e = executable('nntrainer_product_ratings',
   'main.cpp',
-  dependencies: [iniparser_dep, nntrainer_ccapi_dep, gtest_dep, nntrainer_dep],
+  dependencies: [nntrainer_ccapi_dep, nntrainer_dep],
   install: get_option('install-app'),
   install_dir: application_install_dir
 )
 
-# test split example
+# test split example (no INI config needed — model built via ccapi)
 test('app_product_ratings', e, args: ['train',
-  build_app_res_dir / 'product_ratings_model.ini',
   build_app_res_dir / 'sample_product_ratings.txt']
 )

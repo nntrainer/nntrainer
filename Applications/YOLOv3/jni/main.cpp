@@ -21,15 +21,17 @@
 #include <app_context.h>
 #include <det_dataloader.h>
 #include <engine.h>
-#include <layer.h>
 #include <model.h>
 #include <optimizer.h>
+#include <tensor_api.h>
 #include <util_func.h>
 
 #include <upsample_layer.h>
 #include <yolo_v3_loss.h>
 
-using LayerHandle = std::shared_ptr<ml::train::Layer>;
+using ml::train::createLayer;
+using ml::train::LayerHandle;
+using ml::train::Tensor;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
 using UserDataType = std::unique_ptr<nntrainer::util::DirDataLoader>;
 
@@ -74,298 +76,167 @@ std::array<UserDataType, 1> createDetDataGenerator(const char *train_dir,
 }
 
 /**
- * @brief Convolution block
- *
- * @param block_name name of the block
- * @param input_name name of the input
- * @param kernel_size kernel size
- * @param num_filters number of filters
- * @param stride stride
- * @param padding padding
- * @return std::vector<LayerHandle> vector of layers
+ * @brief Convolution block using symbolic tensor graph
  */
-std::vector<LayerHandle> convBlock(const std::string &block_name,
-                                   const std::string &input_layer,
-                                   int kernel_size, int num_filters, int stride,
-                                   int padding) {
-  using ml::train::createLayer;
-
+Tensor convBlock(const std::string &block_name, Tensor input, int kernel_size,
+                 int num_filters, int stride, int padding) {
   auto scoped_name = [&block_name](const std::string &layer_name) {
     return block_name + "/" + layer_name;
   };
-
   auto with_name = [&scoped_name](const std::string &layer_name) {
     return nntrainer::withKey("name", scoped_name(layer_name));
   };
 
-  auto createConv = [&with_name, &kernel_size, &num_filters, &stride, &padding](
-                      const std::string &name, const std::string &input_layer) {
-    std::vector<std::string> props{
-      with_name(name),
-      nntrainer::withKey("kernel_size", {kernel_size, kernel_size}),
-      nntrainer::withKey("filters", num_filters),
-      nntrainer::withKey("stride", {stride, stride}),
-      nntrainer::withKey("padding", padding),
-      nntrainer::withKey("disable_bias", "true"),
-      nntrainer::withKey("input_layers", input_layer)};
+  LayerHandle conv(createLayer(
+    "conv2d", {with_name("conv"),
+               nntrainer::withKey("kernel_size", {kernel_size, kernel_size}),
+               nntrainer::withKey("filters", num_filters),
+               nntrainer::withKey("stride", {stride, stride}),
+               nntrainer::withKey("padding", padding),
+               nntrainer::withKey("disable_bias", "true")}));
+  auto h = conv(input);
 
-    return createLayer("conv2d", props);
-  };
-
-  LayerHandle conv = createConv("conv", input_layer);
-  LayerHandle bn_act = createLayer(
+  LayerHandle bn_act(createLayer(
     "batch_normalization", {nntrainer::withKey("name", block_name),
                             nntrainer::withKey("momentum", "0.9"),
-                            nntrainer::withKey("activation", "leaky_relu")});
-  return {conv, bn_act};
+                            nntrainer::withKey("activation", "leaky_relu")}));
+  return bn_act(h);
 }
 
 /**
- * @brief Darknet block
- *
- * @param block_name name of the block
- * @param input_name name of the input
- * @param kernel_size kernel size
- * @param num_filters number of filters
- * @param stride stride
- * @param padding padding
- * @return Vector of layers that construct darknet block
+ * @brief Darknet block using symbolic tensor graph
  */
-std::vector<LayerHandle> darknetBlock(const std::string &block_name,
-                                      std::string input_layer, int num_filters,
-                                      int repeat) {
+Tensor darknetBlock(const std::string &block_name, Tensor input,
+                    int num_filters, int repeat) {
   auto scoped_name = [&block_name](const std::string &layer_name, int uid) {
     return block_name + "/" + layer_name + "_" + std::to_string(uid);
   };
-  using ml::train::createLayer;
-  std::string output_layer_name;
-  std::vector<std::vector<LayerHandle>> blocks;
+
+  Tensor h = input;
   for (int i = 0; i < repeat; i++) {
-    blocks.push_back(
-      convBlock(scoped_name("c1", i), input_layer, 1, num_filters / 2, 1, 0));
-    blocks.push_back(convBlock(scoped_name("c2", i), scoped_name("c1", i), 3,
-                               num_filters, 1, 1));
-    output_layer_name = (repeat - 1 != i) ? scoped_name("res", i) : block_name;
-    blocks.push_back({createLayer(
-      "addition",
-      {nntrainer::withKey("name", output_layer_name),
-       nntrainer::withKey("input_layers",
-                          input_layer + ", " + scoped_name("c2", i))})});
-    input_layer = scoped_name("res", i);
+    auto c1 = convBlock(scoped_name("c1", i), h, 1, num_filters / 2, 1, 0);
+    auto c2 = convBlock(scoped_name("c2", i), c1, 3, num_filters, 1, 1);
+
+    std::string add_name =
+      (repeat - 1 != i) ? scoped_name("res", i) : block_name;
+    LayerHandle add(createLayer(
+      "addition", {nntrainer::withKey("name", add_name)}));
+    h = add({h, c2});
   }
 
-  std::vector<LayerHandle> layers;
-  for (auto &block : blocks) {
-    layers.insert(layers.end(), block.begin(), block.end());
-  }
-
-  return layers;
+  return h;
 }
 
 /**
- * @brief Create DarkNet53 backbone
- *
- * @return Vector of layers that contain full graph of darknet53 backbone
+ * @brief Create a detection head (conv → conv → permute → reshape → loss)
  */
-std::vector<LayerHandle> Darknet53() {
-  using ml::train::createLayer;
+Tensor createHead(const std::string &prefix, Tensor fp, int conv_filters,
+                  int grid_size, int scale) {
+  auto h = convBlock(prefix + "_1", fp, 3, conv_filters, 1, 1);
+  h = convBlock(prefix, h, 1, 3 * (5 + CLASS_NUMBER), 1, 0);
 
-  std::vector<LayerHandle> layers;
+  LayerHandle permute(createLayer(
+    "permute", {nntrainer::withKey("name", prefix.substr(4) + "_permute"),
+                nntrainer::withKey("direction", {2, 3, 1})}));
+  h = permute(h);
 
-  layers.push_back(createLayer(
-    "input", {nntrainer::withKey("name", "input0"),
-              nntrainer::withKey("input_shape",
-                                 "3:" + std::to_string(IMAGE_HEIGHT_SIZE) +
-                                   ":" + std::to_string(IMAGE_WIDTH_SIZE))}));
+  LayerHandle reshape(createLayer(
+    "reshape",
+    {nntrainer::withKey("name", prefix.substr(4) + "_reshape"),
+     nntrainer::withKey(
+       "target_shape",
+       std::to_string(grid_size * grid_size) + ":" + std::to_string(3) + ":" +
+         std::to_string(5 + CLASS_NUMBER))}));
+  h = reshape(h);
 
-  std::vector<std::vector<LayerHandle>> blocks;
-  blocks.push_back(convBlock("conv1", "input0", 3, 32, 1, 1));
-  blocks.push_back(convBlock("conv2", "conv1", 3, 64, 2, 1));
-  blocks.push_back(darknetBlock("block1", "conv2", 64, 1));
-  blocks.push_back(convBlock("conv3", "block1", 3, 128, 2, 1));
-  blocks.push_back(darknetBlock("block2", "conv3", 128, 2));
-  blocks.push_back(convBlock("conv4", "block2", 3, 256, 2, 1));
-  blocks.push_back(darknetBlock("block3", "conv4", 256, 8));
-  blocks.push_back(convBlock("conv5", "block3", 3, 512, 2, 1));
-  blocks.push_back(darknetBlock("block4", "conv5", 512, 8));
-  blocks.push_back(convBlock("conv6", "block4", 3, 1024, 2, 1));
-  blocks.push_back(darknetBlock("block5", "conv6", 1024, 4));
+  std::string loss_name;
+  if (scale == 1)
+    loss_name = "loss_for_large";
+  else if (scale == 2)
+    loss_name = "loss_for_medium";
+  else
+    loss_name = "loss_for_small";
 
-  for (auto &block : blocks) {
-    layers.insert(layers.end(), block.begin(), block.end());
-  }
-
-  return layers;
+  LayerHandle loss(createLayer(
+    "yolo_v3_loss",
+    {nntrainer::withKey("name", loss_name),
+     nntrainer::withKey("max_object_number", MAX_OBJECT_NUMBER),
+     nntrainer::withKey("class_number", CLASS_NUMBER),
+     nntrainer::withKey("grid_height_number", grid_size),
+     nntrainer::withKey("grid_width_number", grid_size),
+     nntrainer::withKey("scale", scale)}));
+  return loss(h);
 }
 
 /**
- * @brief Create YOLOv3 backbone
- *
- * @return Model handle of YOLOv3
+ * @brief Build YOLOv3 symbolic tensor graph
+ * @return {input, {output_large, output_medium, output_small}}
  */
-ModelHandle YOLOv3() {
-  using ml::train::createLayer;
+std::pair<Tensor, std::vector<Tensor>> buildYOLOv3Graph() {
+  auto x = Tensor({1, 3, IMAGE_HEIGHT_SIZE, IMAGE_WIDTH_SIZE}, "input0");
 
-  ModelHandle model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+  // DarkNet53 backbone
+  auto h = convBlock("conv1", x, 3, 32, 1, 1);
+  h = convBlock("conv2", h, 3, 64, 2, 1);
+  h = darknetBlock("block1", h, 64, 1);
+  h = convBlock("conv3", h, 3, 128, 2, 1);
+  h = darknetBlock("block2", h, 128, 2);
+  h = convBlock("conv4", h, 3, 256, 2, 1);
+  auto block3 = darknetBlock("block3", h, 256, 8);
+  h = convBlock("conv5", block3, 3, 512, 2, 1);
+  auto block4 = darknetBlock("block4", h, 512, 8);
+  h = convBlock("conv6", block4, 3, 1024, 2, 1);
+  auto block5 = darknetBlock("block5", h, 1024, 4);
 
-  std::vector<LayerHandle> layers = Darknet53();
-  std::vector<std::vector<LayerHandle>> fp3, fp2, fp1, neck3_2, neck2_1;
-  std::vector<std::vector<LayerHandle>> head3, head2, head1;
+  // Feature pyramid for large object
+  auto fp3 = convBlock("fp3_1", block5, 1, 512, 1, 0);
+  fp3 = convBlock("fp3_2", fp3, 3, 1024, 1, 1);
+  fp3 = convBlock("fp3_3", fp3, 1, 512, 1, 0);
+  fp3 = convBlock("fp3_4", fp3, 3, 1024, 1, 1);
+  fp3 = convBlock("fp3", fp3, 1, 512, 1, 0);
 
-  // feature pyramid for large object
-  fp3.push_back(convBlock("fp3_1", "block5", 1, 512, 1, 0));
-  fp3.push_back(convBlock("fp3_2", "fp3_1", 3, 1024, 1, 1));
-  fp3.push_back(convBlock("fp3_3", "fp3_2", 1, 512, 1, 0));
-  fp3.push_back(convBlock("fp3_4", "fp3_3", 3, 1024, 1, 1));
-  fp3.push_back(convBlock("fp3", "fp3_4", 1, 512, 1, 0));
+  // Neck: fp3 → upsample → concat with block4
+  auto neck3_2 = convBlock("neck3_2_1", fp3, 1, 256, 1, 0);
+  LayerHandle upsample1(
+    createLayer("upsample", {nntrainer::withKey("name", "neck3_2")}));
+  neck3_2 = upsample1(neck3_2);
 
-  for (auto &block : fp3) {
-    layers.insert(layers.end(), block.begin(), block.end());
-  }
+  LayerHandle concat1(
+    createLayer("concat", {nntrainer::withKey("name", "fp2_1"),
+                           nntrainer::withKey("axis", "1")}));
+  auto fp2 = concat1({neck3_2, block4});
 
-  // connection for medium object
-  neck3_2.push_back(convBlock("neck3_2_1", "fp3", 1, 256, 1, 0));
-  neck3_2.push_back({createLayer(
-    "upsample", {nntrainer::withKey("name", "neck3_2"),
-                 nntrainer::withKey("input_layers", "neck3_2_1")})});
+  // Feature pyramid for medium object
+  fp2 = convBlock("fp2_2", fp2, 1, 256, 1, 0);
+  fp2 = convBlock("fp2_3", fp2, 3, 512, 1, 1);
+  fp2 = convBlock("fp2_4", fp2, 1, 256, 1, 0);
+  fp2 = convBlock("fp2_5", fp2, 3, 512, 1, 1);
+  fp2 = convBlock("fp2", fp2, 1, 256, 1, 0);
 
-  for (auto &block : neck3_2) {
-    layers.insert(layers.end(), block.begin(), block.end());
-  }
+  // Neck: fp2 → upsample → concat with block3
+  auto neck2_1 = convBlock("neck2_1_1", fp2, 1, 128, 1, 0);
+  LayerHandle upsample2(
+    createLayer("upsample", {nntrainer::withKey("name", "neck2_1")}));
+  neck2_1 = upsample2(neck2_1);
 
-  // feature pyramid for medium object
-  fp2.push_back({createLayer(
-    "concat", {nntrainer::withKey("name", "fp2_1"),
-               nntrainer::withKey("input_layers", "neck3_2, block4"),
-               nntrainer::withKey("axis", "1")})});
-  fp2.push_back(convBlock("fp2_2", "fp2_1", 1, 256, 1, 0));
-  fp2.push_back(convBlock("fp2_3", "fp2_2", 3, 512, 1, 1));
-  fp2.push_back(convBlock("fp2_4", "fp2_3", 1, 256, 1, 0));
-  fp2.push_back(convBlock("fp2_5", "fp2_4", 3, 512, 1, 1));
-  fp2.push_back(convBlock("fp2", "fp2_5", 1, 256, 1, 0));
+  LayerHandle concat2(
+    createLayer("concat", {nntrainer::withKey("name", "fp1_1"),
+                           nntrainer::withKey("axis", "1")}));
+  auto fp1 = concat2({neck2_1, block3});
 
-  for (auto &block : fp2) {
-    layers.insert(layers.end(), block.begin(), block.end());
-  }
+  // Feature pyramid for small object
+  fp1 = convBlock("fp1_2", fp1, 1, 128, 1, 0);
+  fp1 = convBlock("fp1_3", fp1, 3, 256, 1, 1);
+  fp1 = convBlock("fp1_4", fp1, 1, 128, 1, 0);
+  fp1 = convBlock("fp1_5", fp1, 3, 256, 1, 1);
+  fp1 = convBlock("fp1", fp1, 1, 128, 1, 0);
 
-  // connection for small object
-  neck2_1.push_back(convBlock("neck2_1_1", "fp2", 1, 128, 1, 0));
-  neck2_1.push_back({createLayer(
-    "upsample", {nntrainer::withKey("name", "neck2_1"),
-                 nntrainer::withKey("input_layers", "neck2_1_1")})});
+  // Detection heads
+  auto y_large = createHead("head3", fp3, 1024, 13, 1);
+  auto y_medium = createHead("head2", fp2, 512, 26, 2);
+  auto y_small = createHead("head1", fp1, 256, 52, 3);
 
-  for (auto &block : neck2_1) {
-    layers.insert(layers.end(), block.begin(), block.end());
-  }
-
-  // feature pyramid for small object
-  fp1.push_back({createLayer(
-    "concat", {nntrainer::withKey("name", "fp1_1"),
-               nntrainer::withKey("input_layers", "neck2_1, block3"),
-               nntrainer::withKey("axis", "1")})});
-  fp1.push_back(convBlock("fp1_2", "fp1_1", 1, 128, 1, 0));
-  fp1.push_back(convBlock("fp1_3", "fp1_2", 3, 256, 1, 1));
-  fp1.push_back(convBlock("fp1_4", "fp1_3", 1, 128, 1, 0));
-  fp1.push_back(convBlock("fp1_5", "fp1_4", 3, 256, 1, 1));
-  fp1.push_back(convBlock("fp1", "fp1_5", 1, 128, 1, 0));
-
-  for (auto &block : fp1) {
-    layers.insert(layers.end(), block.begin(), block.end());
-  }
-
-  // head for large object
-  head3.push_back(convBlock("head3_1", "fp3", 3, 1024, 1, 1));
-  head3.push_back(
-    convBlock("head3", "head3_1", 1, 3 * (5 + CLASS_NUMBER), 1, 0));
-  head3.push_back(
-    {createLayer("permute", {
-                              nntrainer::withKey("name", "h3_permute"),
-                              nntrainer::withKey("direction", {2, 3, 1}),
-                            })});
-  head3.push_back({createLayer(
-    "reshape",
-    {
-      nntrainer::withKey("name", "h3_reshape"),
-      nntrainer::withKey("target_shape", // grid : anchor : 5 + num_classes
-                         std::to_string(13 * 13) + ":" + std::to_string(3) +
-                           ":" + std::to_string(5 + CLASS_NUMBER)),
-    })});
-  head3.push_back({createLayer(
-    "yolo_v3_loss", {nntrainer::withKey("name", "loss_for_large"),
-                     nntrainer::withKey("max_object_number", MAX_OBJECT_NUMBER),
-                     nntrainer::withKey("class_number", CLASS_NUMBER),
-                     nntrainer::withKey("grid_height_number", 13),
-                     nntrainer::withKey("grid_width_number", 13),
-                     nntrainer::withKey("scale", 1)})});
-
-  for (auto &block : head3) {
-    layers.insert(layers.end(), block.begin(), block.end());
-  }
-
-  // head for medium object
-  head2.push_back(convBlock("head2_1", "fp2", 3, 512, 1, 1));
-  head2.push_back(
-    convBlock("head2", "head2_1", 1, 3 * (5 + CLASS_NUMBER), 1, 0));
-  head2.push_back(
-    {createLayer("permute", {
-                              nntrainer::withKey("name", "h2_permute"),
-                              nntrainer::withKey("direction", {2, 3, 1}),
-                            })});
-  head2.push_back({createLayer(
-    "reshape",
-    {
-      nntrainer::withKey("name", "h2_reshape"),
-      nntrainer::withKey("target_shape", // grid : anchor : 5 + num_classes
-                         std::to_string(26 * 26) + ":" + std::to_string(3) +
-                           ":" + std::to_string(5 + CLASS_NUMBER)),
-    })});
-  head2.push_back({createLayer(
-    "yolo_v3_loss", {nntrainer::withKey("name", "loss_for_medium"),
-                     nntrainer::withKey("max_object_number", MAX_OBJECT_NUMBER),
-                     nntrainer::withKey("class_number", CLASS_NUMBER),
-                     nntrainer::withKey("grid_height_number", 26),
-                     nntrainer::withKey("grid_width_number", 26),
-                     nntrainer::withKey("scale", 2)})});
-
-  for (auto &block : head2) {
-    layers.insert(layers.end(), block.begin(), block.end());
-  }
-
-  // head for small object
-  head1.push_back(convBlock("head1_1", "fp1", 3, 256, 1, 1));
-  head1.push_back(
-    convBlock("head1", "head1_1", 1, 3 * (5 + CLASS_NUMBER), 1, 0));
-  head1.push_back(
-    {createLayer("permute", {
-                              nntrainer::withKey("name", "h1_permute"),
-                              nntrainer::withKey("direction", {2, 3, 1}),
-                            })});
-  head1.push_back({createLayer(
-    "reshape",
-    {
-      nntrainer::withKey("name", "h1_reshape"),
-      nntrainer::withKey("target_shape", // grid : anchor : 5 + num_classes
-                         std::to_string(52 * 52) + ":" + std::to_string(3) +
-                           ":" + std::to_string(5 + CLASS_NUMBER)),
-    })});
-  head1.push_back({createLayer(
-    "yolo_v3_loss", {nntrainer::withKey("name", "loss_for_small"),
-                     nntrainer::withKey("max_object_number", MAX_OBJECT_NUMBER),
-                     nntrainer::withKey("class_number", CLASS_NUMBER),
-                     nntrainer::withKey("grid_height_number", 52),
-                     nntrainer::withKey("grid_width_number", 52),
-                     nntrainer::withKey("scale", 3)})});
-
-  for (auto &block : head1) {
-    layers.insert(layers.end(), block.begin(), block.end());
-  }
-
-  // Regist layers to model
-  for (auto &layer : layers) {
-    model->addLayer(layer);
-  }
-
-  return model;
+  return {x, {y_large, y_medium, y_small}};
 }
 
 int main(int argc, char *argv[]) {
@@ -404,8 +275,10 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    // create YOLOv3 model
-    ModelHandle model = YOLOv3();
+    // build YOLOv3 symbolic graph
+    auto [input_t, output_ts] = buildYOLOv3Graph();
+
+    ModelHandle model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
     model->setProperty({nntrainer::withKey("batch_size", BATCH_SIZE),
                         nntrainer::withKey("epochs", EPOCHS),
                         nntrainer::withKey("save_path", "darknet53.bin")});
@@ -418,9 +291,11 @@ int main(int argc, char *argv[]) {
       throw std::invalid_argument("failed to set optimizer");
     }
 
-    // compile and initialize model
-    model->compile();
-    model->initialize();
+    // compile with symbolic tensors (multi-output)
+    status = model->compile(input_t, output_ts);
+    if (status) {
+      throw std::invalid_argument("model compilation failed!");
+    }
 
     model->summarize(std::cout,
                      ml_train_summary_type_e::ML_TRAIN_SUMMARY_MODEL);

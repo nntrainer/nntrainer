@@ -18,51 +18,43 @@
 #include <sstream>
 #include <vector>
 
-#include <layer.h>
 #include <model.h>
 #include <optimizer.h>
+#include <tensor_api.h>
 #include <util_func.h>
 
 #include <multi_loader.h>
 
-using LayerHandle = std::shared_ptr<ml::train::Layer>;
+using ml::train::createLayer;
+using ml::train::LayerHandle;
+using ml::train::Tensor;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
 using UserDataType = std::unique_ptr<nntrainer::util::DataLoader>;
 
-ModelHandle createMultiInputModel() {
-  using ml::train::createLayer;
-  ModelHandle model = ml::train::createModel(
-    ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "mse")});
-  std::vector<LayerHandle> layers;
+/**
+ * @brief Build multi-input model using symbolic tensor graph
+ * @return {vector of inputs, output}
+ */
+std::pair<std::vector<Tensor>, Tensor> buildMultiInputGraph() {
+  auto input0 = Tensor({1, 1, 2, 2}, "input0");
+  auto input1 = Tensor({1, 1, 4, 2}, "input1");
+  auto input2 = Tensor({1, 1, 8, 2}, "input2");
 
-  layers.push_back(
-    createLayer("input", {nntrainer::withKey("name", "input0"),
-                          nntrainer::withKey("input_shape", "1:2:2")}));
-  layers.push_back(
-    createLayer("input", {nntrainer::withKey("name", "input1"),
-                          nntrainer::withKey("input_shape", "1:4:2")}));
-  layers.push_back(
-    createLayer("input", {nntrainer::withKey("name", "input2"),
-                          nntrainer::withKey("input_shape", "1:8:2")}));
+  LayerHandle concat(createLayer(
+    "concat", {nntrainer::withKey("name", "concat0"),
+               nntrainer::withKey("axis", "2")}));
+  auto h = concat({input0, input1, input2});
 
-  layers.push_back(createLayer(
-    "concat",
-    {nntrainer::withKey("name", "concat0"), nntrainer::withKey("axis", "2"),
-     nntrainer::withKey("input_layers", "input0, input1, input2")}));
+  LayerHandle flatten(createLayer(
+    "flatten", {nntrainer::withKey("name", "flatten0")}));
+  h = flatten(h);
 
-  layers.push_back(
-    createLayer("flatten", {nntrainer::withKey("name", "flatten0"),
-                            nntrainer::withKey("input_layers", "concat0")}));
+  LayerHandle fc(createLayer("fully_connected",
+                             {nntrainer::withKey("unit", 5),
+                              nntrainer::withKey("activation", "softmax")}));
+  auto y = fc(h);
 
-  layers.push_back(createLayer("fully_connected",
-                               {nntrainer::withKey("unit", 5),
-                                nntrainer::withKey("activation", "softmax")}));
-
-  for (auto &layer : layers) {
-    model->addLayer(layer);
-  }
-
-  return model;
+  return {{input0, input1, input2}, y};
 }
 
 int trainData_cb(float **input, float **label, bool *last, void *user_data) {
@@ -74,7 +66,10 @@ int trainData_cb(float **input, float **label, bool *last, void *user_data) {
 void createAndRun(unsigned int epochs, unsigned int batch_size,
                   UserDataType &train_user_data) {
 
-  ModelHandle model = createMultiInputModel();
+  auto [inputs, output] = buildMultiInputGraph();
+
+  ModelHandle model = ml::train::createModel(
+    ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "mse")});
 
   model->setProperty({nntrainer::withKey("batch_size", batch_size),
                       nntrainer::withKey("epochs", epochs),
@@ -86,14 +81,10 @@ void createAndRun(unsigned int epochs, unsigned int batch_size,
     throw std::invalid_argument("failed to set optimizer!");
   };
 
-  status = model->compile();
+  std::vector<Tensor> outputs = {output};
+  status = model->compile(inputs, outputs);
   if (status) {
     throw std::invalid_argument("model compilation failed!");
-  }
-
-  status = model->initialize();
-  if (status) {
-    throw std::invalid_argument("model initialization failed!");
   }
 
   auto dataset_train = ml::train::createDataset(

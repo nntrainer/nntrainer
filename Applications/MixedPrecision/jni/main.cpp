@@ -18,14 +18,16 @@
 #include <sstream>
 #include <vector>
 
-#include <layer.h>
 #include <model.h>
 #include <optimizer.h>
+#include <tensor_api.h>
 #include <util_func.h>
 
 #include <cifar_dataloader.h>
 
-using LayerHandle = std::shared_ptr<ml::train::Layer>;
+using ml::train::createLayer;
+using ml::train::LayerHandle;
+using ml::train::Tensor;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
 using UserDataType = std::unique_ptr<nntrainer::util::DataLoader>;
 
@@ -33,15 +35,14 @@ using UserDataType = std::unique_ptr<nntrainer::util::DataLoader>;
 float training_loss = 0.0;
 float validation_loss = 0.0;
 
-std::vector<LayerHandle> createGraph() {
-  using ml::train::createLayer;
+/**
+ * @brief Build mixed precision graph using symbolic tensor API
+ * @return {input, output}
+ */
+std::pair<Tensor, Tensor> buildGraph() {
+  auto x = Tensor({1, 3, 32, 32}, "input0");
 
-  std::vector<LayerHandle> layers;
-  layers.push_back(
-    createLayer("input", {nntrainer::withKey("name", "input0"),
-                          nntrainer::withKey("input_shape", "3:32:32")}));
-
-  layers.push_back(createLayer(
+  LayerHandle conv0(createLayer(
     "conv2d",
     {nntrainer::withKey("name", "conv0"), nntrainer::withKey("filters", 64),
      nntrainer::withKey("kernel_size", {3, 3}),
@@ -49,35 +50,33 @@ std::vector<LayerHandle> createGraph() {
      nntrainer::withKey("padding", "same"),
      nntrainer::withKey("bias_initializer", "zeros"),
      nntrainer::withKey("weight_initializer", "xavier_uniform")}));
+  auto h = conv0(x);
 
-  layers.push_back(createLayer("batch_normalization",
-                               {nntrainer::withKey("name", "first_bn_relu"),
-                                nntrainer::withKey("activation", "relu"),
-                                nntrainer::withKey("momentum", "0.9"),
-                                nntrainer::withKey("epsilon", "0.00001")}));
+  LayerHandle bn_relu(createLayer(
+    "batch_normalization",
+    {nntrainer::withKey("name", "first_bn_relu"),
+     nntrainer::withKey("activation", "relu"),
+     nntrainer::withKey("momentum", "0.9"),
+     nntrainer::withKey("epsilon", "0.00001")}));
+  h = bn_relu(h);
 
-  layers.push_back(
-    createLayer("pooling2d", {nntrainer::withKey("name", "last_p1"),
-                              nntrainer::withKey("pooling", "average"),
-                              nntrainer::withKey("pool_size", {4, 4}),
-                              nntrainer::withKey("stride", "4,4")}));
+  LayerHandle pool(createLayer(
+    "pooling2d", {nntrainer::withKey("name", "last_p1"),
+                  nntrainer::withKey("pooling", "average"),
+                  nntrainer::withKey("pool_size", {4, 4}),
+                  nntrainer::withKey("stride", "4,4")}));
+  h = pool(h);
 
-  layers.push_back(
+  LayerHandle flatten(
     createLayer("flatten", {nntrainer::withKey("name", "last_f1")}));
-  layers.push_back(createLayer("fully_connected",
-                               {nntrainer::withKey("unit", 100),
-                                nntrainer::withKey("activation", "softmax")}));
+  h = flatten(h);
 
-  return layers;
-}
+  LayerHandle fc(createLayer("fully_connected",
+                             {nntrainer::withKey("unit", 100),
+                              nntrainer::withKey("activation", "softmax")}));
+  auto y = fc(h);
 
-ModelHandle createModel() {
-  ModelHandle model = ml::train::createModel(
-    ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "mse")});
-  for (auto &layer : createGraph()) {
-    model->addLayer(layer);
-  }
-  return model;
+  return {x, y};
 }
 
 int trainData_cb(float **input, float **label, bool *last, void *user_data) {
@@ -97,8 +96,11 @@ int validData_cb(float **input, float **label, bool *last, void *user_data) {
 void createAndRun(unsigned int epochs, unsigned int batch_size,
                   UserDataType &train_user_data,
                   UserDataType &valid_user_data) {
-  // setup model
-  ModelHandle model = createModel();
+  // build symbolic graph
+  auto [x, y] = buildGraph();
+
+  ModelHandle model = ml::train::createModel(
+    ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "mse")});
   model->setProperty({nntrainer::withKey("batch_size", batch_size),
                       nntrainer::withKey("epochs", epochs),
                       nntrainer::withKey("save_path", "mixed_model.bin")});
@@ -114,14 +116,9 @@ void createAndRun(unsigned int epochs, unsigned int batch_size,
     throw std::invalid_argument("failed to set optimizer!");
   }
 
-  status = model->compile();
+  status = model->compile(x, y);
   if (status) {
     throw std::invalid_argument("model compilation failed!");
-  }
-
-  status = model->initialize();
-  if (status) {
-    throw std::invalid_argument("model initialization failed!");
   }
 
   auto dataset_train = ml::train::createDataset(

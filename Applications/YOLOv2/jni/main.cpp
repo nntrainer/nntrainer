@@ -22,16 +22,18 @@
 #include <app_context.h>
 #include <det_dataloader.h>
 #include <engine.h>
-#include <layer.h>
 #include <model.h>
 #include <optimizer.h>
+#include <tensor_api.h>
 #include <util_func.h>
 
 #include "yolo_v2_loss.h"
 
 #include <reorg_layer.h>
 
-using LayerHandle = std::shared_ptr<ml::train::Layer>;
+using ml::train::createLayer;
+using ml::train::LayerHandle;
+using ml::train::Tensor;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
 using UserDataType = std::unique_ptr<nntrainer::util::DirDataLoader>;
 
@@ -76,20 +78,17 @@ std::array<UserDataType, 2> createDetDataGenerator(const char *train_dir,
 }
 
 /**
- * @brief yolo block
+ * @brief yolo block using symbolic tensor graph
  *
  * @param block_name name of the block
- * @param input_name name of the input
+ * @param input input tensor
  * @param filters number of filters
  * @param kernel_size number of kernel_size
  * @param downsample downsample to make output size 0
- * @return std::vector<LayerHandle> vectors of layers
+ * @return Tensor output tensor
  */
-std::vector<LayerHandle> yoloBlock(const std::string &block_name,
-                                   const std::string &input_name, int filters,
-                                   int kernel_size, bool downsample) {
-  using ml::train::createLayer;
-
+Tensor yoloBlock(const std::string &block_name, Tensor input, int filters,
+                 int kernel_size, bool downsample) {
   auto scoped_name = [&block_name](const std::string &layer_name) {
     return block_name + "/" + layer_name;
   };
@@ -97,156 +96,127 @@ std::vector<LayerHandle> yoloBlock(const std::string &block_name,
     return nntrainer::withKey("name", scoped_name(layer_name));
   };
 
-  auto createConv = [&with_name, filters](const std::string &name,
-                                          int kernel_size, int stride,
-                                          const std::string &padding,
-                                          const std::string &input_layer) {
-    std::vector<std::string> props{
-      with_name(name),
-      nntrainer::withKey("stride", {stride, stride}),
-      nntrainer::withKey("filters", filters),
-      nntrainer::withKey("kernel_size", {kernel_size, kernel_size}),
-      nntrainer::withKey("padding", padding),
-      nntrainer::withKey("disable_bias", "true"),
-      nntrainer::withKey("input_layers", input_layer)};
-
-    return createLayer("conv2d", props);
-  };
-
-  /** construct basic layer **/
-  LayerHandle a1 = createConv("a1", kernel_size, 1, "same", input_name);
+  LayerHandle conv(createLayer(
+    "conv2d", {with_name("a1"),
+               nntrainer::withKey("stride", {1, 1}),
+               nntrainer::withKey("filters", filters),
+               nntrainer::withKey("kernel_size", {kernel_size, kernel_size}),
+               nntrainer::withKey("padding", "same"),
+               nntrainer::withKey("disable_bias", "true")}));
+  auto h = conv(input);
 
   if (downsample) {
-    LayerHandle a2 =
+    LayerHandle bn(
       createLayer("batch_normalization",
                   {with_name("a2"), nntrainer::withKey("momentum", "0.9"),
                    nntrainer::withKey("epsilon", 0.00001),
-                   nntrainer::withKey("activation", "leaky_relu")});
+                   nntrainer::withKey("activation", "leaky_relu")}));
+    h = bn(h);
 
-    LayerHandle a3 =
+    LayerHandle pool(
       createLayer("pooling2d", {nntrainer::withKey("name", block_name),
                                 nntrainer::withKey("stride", {2, 2}),
                                 nntrainer::withKey("pooling", "max"),
-                                nntrainer::withKey("pool_size", {2, 2})});
-
-    return {a1, a2, a3};
+                                nntrainer::withKey("pool_size", {2, 2})}));
+    h = pool(h);
   } else {
-    LayerHandle a2 = createLayer(
+    LayerHandle bn(createLayer(
       "batch_normalization", {nntrainer::withKey("name", block_name),
                               nntrainer::withKey("momentum", "0.9"),
                               nntrainer::withKey("epsilon", 0.00001),
-                              nntrainer::withKey("activation", "leaky_relu")});
-
-    return {a1, a2};
+                              nntrainer::withKey("activation", "leaky_relu")}));
+    h = bn(h);
   }
+
+  return h;
 }
 
 /**
- * @brief Create yolo v2 light
+ * @brief Build yolo v2 symbolic tensor graph
  *
- * @return vector of layers that contain full graph of yolo v2 light
+ * @return {input_tensor, output_tensor}
  */
-ModelHandle YOLO() {
-  using ml::train::createLayer;
+std::pair<Tensor, Tensor> buildYOLOGraph() {
+  auto x = Tensor({1, 3, IMAGE_HEIGHT_SIZE, IMAGE_WIDTH_SIZE}, "input0");
 
-  ModelHandle model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+  // backbone conv blocks
+  auto h = yoloBlock("conv1", x, 32, 3, true);
+  h = yoloBlock("conv2", h, 64, 3, true);
+  h = yoloBlock("conv3", h, 128, 3, false);
+  h = yoloBlock("conv4", h, 64, 1, false);
+  h = yoloBlock("conv5", h, 128, 3, true);
+  h = yoloBlock("conv6", h, 256, 3, false);
+  h = yoloBlock("conv7", h, 128, 1, false);
+  h = yoloBlock("conv8", h, 256, 3, true);
+  h = yoloBlock("conv9", h, 512, 3, false);
+  h = yoloBlock("conv10", h, 256, 1, false);
+  h = yoloBlock("conv11", h, 512, 3, false);
+  h = yoloBlock("conv12", h, 256, 1, false);
+  auto conv13 = yoloBlock("conv13", h, 512, 3, false);
 
-  std::vector<LayerHandle> layers;
+  // branch A: conv13 -> pool -> conv_a1..a7
+  LayerHandle pool_a(
+    createLayer("pooling2d", {nntrainer::withKey("name", "conv_a_pool"),
+                              nntrainer::withKey("stride", {2, 2}),
+                              nntrainer::withKey("pooling", "max"),
+                              nntrainer::withKey("pool_size", {2, 2})}));
+  auto branch_a = pool_a(conv13);
+  branch_a = yoloBlock("conv_a1", branch_a, 1024, 3, false);
+  branch_a = yoloBlock("conv_a2", branch_a, 512, 1, false);
+  branch_a = yoloBlock("conv_a3", branch_a, 1024, 3, false);
+  branch_a = yoloBlock("conv_a4", branch_a, 512, 1, false);
+  branch_a = yoloBlock("conv_a5", branch_a, 1024, 3, false);
+  branch_a = yoloBlock("conv_a6", branch_a, 1024, 3, false);
+  branch_a = yoloBlock("conv_a7", branch_a, 1024, 3, false);
 
-  layers.push_back(createLayer(
-    "input", {nntrainer::withKey("name", "input0"),
-              nntrainer::withKey("input_shape",
-                                 "3:" + std::to_string(IMAGE_HEIGHT_SIZE) +
-                                   ":" + std::to_string(IMAGE_WIDTH_SIZE))}));
+  // branch B: conv13 -> conv_b -> reorg
+  auto branch_b = yoloBlock("conv_b", conv13, 64, 1, false);
 
-  std::vector<std::vector<LayerHandle>> blocks;
+  LayerHandle reorg(
+    createLayer("reorg_layer", {nntrainer::withKey("name", "re_organization")}));
+  branch_b = reorg(branch_b);
 
-  blocks.push_back(yoloBlock("conv1", "input0", 32, 3, true));
-  blocks.push_back(yoloBlock("conv2", "conv1", 64, 3, true));
-  blocks.push_back(yoloBlock("conv3", "conv2", 128, 3, false));
-  blocks.push_back(yoloBlock("conv4", "conv3", 64, 1, false));
-  blocks.push_back(yoloBlock("conv5", "conv4", 128, 3, true));
-  blocks.push_back(yoloBlock("conv6", "conv5", 256, 3, false));
-  blocks.push_back(yoloBlock("conv7", "conv6", 128, 1, false));
-  blocks.push_back(yoloBlock("conv8", "conv7", 256, 3, true));
-  blocks.push_back(yoloBlock("conv9", "conv8", 512, 3, false));
-  blocks.push_back(yoloBlock("conv10", "conv9", 256, 1, false));
-  blocks.push_back(yoloBlock("conv11", "conv10", 512, 3, false));
-  blocks.push_back(yoloBlock("conv12", "conv11", 256, 1, false));
-  blocks.push_back(yoloBlock("conv13", "conv12", 512, 3, false));
+  // concat branches
+  LayerHandle concat(
+    createLayer("concat", {nntrainer::withKey("name", "concat"),
+                           nntrainer::withKey("axis", 1)}));
+  h = concat({branch_a, branch_b});
 
-  blocks.push_back(
-    {createLayer("pooling2d", {nntrainer::withKey("name", "conv_a_pool"),
-                               nntrainer::withKey("stride", {2, 2}),
-                               nntrainer::withKey("pooling", "max"),
-                               nntrainer::withKey("pool_size", {2, 2}),
-                               nntrainer::withKey("input_layers", "conv13")})});
-  blocks.push_back(yoloBlock("conv_a1", "conv_a_pool", 1024, 3, false));
-  blocks.push_back(yoloBlock("conv_a2", "conv_a1", 512, 1, false));
-  blocks.push_back(yoloBlock("conv_a3", "conv_a2", 1024, 3, false));
-  blocks.push_back(yoloBlock("conv_a4", "conv_a3", 512, 1, false));
-  blocks.push_back(yoloBlock("conv_a5", "conv_a4", 1024, 3, false));
-  blocks.push_back(yoloBlock("conv_a6", "conv_a5", 1024, 3, false));
-  blocks.push_back(yoloBlock("conv_a7", "conv_a6", 1024, 3, false));
+  // output layers
+  h = yoloBlock("conv_out1", h, 1024, 3, false);
 
-  blocks.push_back(yoloBlock("conv_b", "conv13", 64, 1, false));
+  LayerHandle conv_out2(createLayer(
+    "conv2d", {nntrainer::withKey("name", "conv_out2"),
+               nntrainer::withKey("filters", 5 * (5 + CLASS_NUMBER)),
+               nntrainer::withKey("kernel_size", {1, 1}),
+               nntrainer::withKey("stride", {1, 1}),
+               nntrainer::withKey("padding", "same")}));
+  h = conv_out2(h);
 
-  blocks.push_back({createLayer(
-    "reorg_layer", {nntrainer::withKey("name", "re_organization"),
-                    nntrainer::withKey("input_layers", "conv_b")})});
+  LayerHandle permute(
+    createLayer("permute", {nntrainer::withKey("name", "permute"),
+                            nntrainer::withKey("direction", {2, 3, 1})}));
+  h = permute(h);
 
-  blocks.push_back({createLayer(
-    "concat", {nntrainer::withKey("name", "concat"),
-               nntrainer::withKey("input_layers", "conv_a7, re_organization"),
-               nntrainer::withKey("axis", 1)})});
-
-  blocks.push_back(yoloBlock("conv_out1", "concat", 1024, 3, false));
-
-  blocks.push_back({createLayer(
-    "conv2d", {
-                nntrainer::withKey("name", "conv_out2"),
-                nntrainer::withKey("filters", 5 * (5 + CLASS_NUMBER)),
-                nntrainer::withKey("kernel_size", {1, 1}),
-                nntrainer::withKey("stride", {1, 1}),
-                nntrainer::withKey("padding", "same"),
-                nntrainer::withKey("input_layers", "conv_out1"),
-              })});
-
-  for (auto &block : blocks) {
-    layers.insert(layers.end(), block.begin(), block.end());
-  }
-
-  layers.push_back(
-    createLayer("permute", {
-                             nntrainer::withKey("name", "permute"),
-                             nntrainer::withKey("direction", {2, 3, 1}),
-                           }));
-
-  layers.push_back(createLayer(
+  LayerHandle reshape(createLayer(
     "reshape",
-    {
-      nntrainer::withKey("name", "reshape"),
-      nntrainer::withKey(
-        "target_shape", std::to_string(GRID_HEIGHT_NUMBER * GRID_WIDTH_NUMBER) +
-                          ":" + std::to_string(ANCHOR_NUMBER) + ":" +
-                          std::to_string(5 + CLASS_NUMBER)),
-    }));
+    {nntrainer::withKey("name", "reshape"),
+     nntrainer::withKey(
+       "target_shape", std::to_string(GRID_HEIGHT_NUMBER * GRID_WIDTH_NUMBER) +
+                         ":" + std::to_string(ANCHOR_NUMBER) + ":" +
+                         std::to_string(5 + CLASS_NUMBER))}));
+  h = reshape(h);
 
-  layers.push_back(
-    createLayer("yolo_v2_loss",
-                {
-                  nntrainer::withKey("name", "yolo_v2_loss"),
-                  nntrainer::withKey("max_object_number", MAX_OBJECT_NUMBER),
-                  nntrainer::withKey("class_number", CLASS_NUMBER),
-                  nntrainer::withKey("grid_height_number", GRID_HEIGHT_NUMBER),
-                  nntrainer::withKey("grid_width_number", GRID_WIDTH_NUMBER),
-                }));
+  LayerHandle yolo_loss(createLayer(
+    "yolo_v2_loss",
+    {nntrainer::withKey("name", "yolo_v2_loss"),
+     nntrainer::withKey("max_object_number", MAX_OBJECT_NUMBER),
+     nntrainer::withKey("class_number", CLASS_NUMBER),
+     nntrainer::withKey("grid_height_number", GRID_HEIGHT_NUMBER),
+     nntrainer::withKey("grid_width_number", GRID_WIDTH_NUMBER)}));
+  auto y = yolo_loss(h);
 
-  for (auto &layer : layers) {
-    model->addLayer(layer);
-  }
-
-  return model;
+  return {x, y};
 }
 
 int main(int argc, char *argv[]) {
@@ -276,8 +246,10 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    // create YOLO v2 model
-    ModelHandle model = YOLO();
+    // build YOLO v2 symbolic graph
+    auto [input_t, output_t] = buildYOLOGraph();
+
+    ModelHandle model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
     model->setProperty({nntrainer::withKey("batch_size", BATCH_SIZE),
                         nntrainer::withKey("epochs", EPOCHS),
                         nntrainer::withKey("save_path", "yolov2.bin")});
@@ -290,14 +262,10 @@ int main(int argc, char *argv[]) {
       throw std::invalid_argument("failed to set optimizer");
     }
 
-    // compile and initialize model
-    status = model->compile();
+    // compile with symbolic tensors
+    status = model->compile(input_t, output_t);
     if (status) {
       throw std::invalid_argument("model compilation failed!");
-    }
-    status = model->initialize();
-    if (status) {
-      throw std::invalid_argument("model initialization failed!");
     }
     model->save("./yolov2.ini", ml::train::ModelFormat::MODEL_FORMAT_INI);
     // model->load(MODEL_INIT_BIN_PATH);

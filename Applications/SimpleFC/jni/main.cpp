@@ -18,56 +18,46 @@
 #include <sstream>
 #include <vector>
 
-#include <layer.h>
 #include <model.h>
 #include <optimizer.h>
+#include <tensor_api.h>
 #include <util_func.h>
 
 #ifdef PROFILE
 #include <profiler.h>
 #endif
 
-using LayerHandle = std::shared_ptr<ml::train::Layer>;
+using ml::train::createLayer;
+using ml::train::LayerHandle;
+using ml::train::Tensor;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
 
 /**
- * @brief Create network
+ * @brief Build symbolic tensor graph for SimpleFC
  *
- * @return vector of layers that contain full graph of asynch
+ * @return {input_tensor, output_tensor}
  */
-std::vector<LayerHandle> createGraph() {
-  using ml::train::createLayer;
+std::pair<Tensor, Tensor> buildGraph() {
+  auto x = Tensor({1, 1, 1024, 1024}, "input0");
 
-  std::vector<LayerHandle> layers;
-
-  layers.push_back(
-    createLayer("input", {nntrainer::withKey("name", "input0"),
-                          nntrainer::withKey("input_shape", "1:1:1024:1024")}));
-
+  auto h = x;
   for (int i = 0; i < 56; i++) {
-    layers.push_back(
-      createLayer("fully_connected",
-                  {nntrainer::withKey("unit", 1024),
-                   nntrainer::withKey("weight_initializer", "xavier_uniform"),
-                   nntrainer::withKey("disable_bias", "true")}));
+    LayerHandle fc(createLayer(
+      "fully_connected",
+      {nntrainer::withKey("unit", 1024),
+       nntrainer::withKey("weight_initializer", "xavier_uniform"),
+       nntrainer::withKey("disable_bias", "true")}));
+    h = fc(h);
   }
 
-  return layers;
-}
-
-ModelHandle create() {
-  ModelHandle model = ml::train::createModel(
-    ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "mse")});
-
-  for (auto &layer : createGraph()) {
-    model->addLayer(layer);
-  }
-
-  return model;
+  return {x, h};
 }
 
 void saveBin(unsigned int epochs, unsigned int batch_size) {
-  ModelHandle model = create();
+  auto [x, y] = buildGraph();
+
+  ModelHandle model = ml::train::createModel(
+    ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "mse")});
   model->setProperty({nntrainer::withKey("batch_size", batch_size),
                       nntrainer::withKey("epochs", epochs),
                       nntrainer::withKey("model_tensor_type", "FP16-FP16")});
@@ -77,15 +67,11 @@ void saveBin(unsigned int epochs, unsigned int batch_size) {
     throw std::invalid_argument("failed to set optimizer!");
   }
 
-  status = model->compile();
+  status = model->compile(x, y, ml::train::ExecutionMode::TRAIN);
   if (status) {
     throw std::invalid_argument("model compilation failed!");
   }
 
-  status = model->initialize();
-  if (status) {
-    throw std::invalid_argument("model initialization failed!");
-  }
   std::string filePath = "FSU_WEIGHT.bin";
   model->save(filePath, ml::train::ModelFormat::MODEL_FORMAT_BIN);
 }
@@ -94,8 +80,11 @@ void createAndRun(unsigned int epochs, unsigned int batch_size,
                   std::string fsu_on_off, std::string look_ahaed,
                   std::string file_path) {
   saveBin(epochs, batch_size);
-  // setup model
-  ModelHandle model = create();
+
+  auto [x, y] = buildGraph();
+
+  ModelHandle model = ml::train::createModel(
+    ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "mse")});
   model->setProperty({nntrainer::withKey("batch_size", batch_size),
                       nntrainer::withKey("epochs", epochs),
                       nntrainer::withKey("model_tensor_type", "FP16-FP16")});
@@ -111,14 +100,9 @@ void createAndRun(unsigned int epochs, unsigned int batch_size,
     throw std::invalid_argument("failed to set optimizer!");
   }
 
-  status = model->compile(ml::train::ExecutionMode::INFERENCE);
+  status = model->compile(x, y, ml::train::ExecutionMode::INFERENCE);
   if (status) {
     throw std::invalid_argument("model compilation failed!");
-  }
-
-  status = model->initialize(ml::train::ExecutionMode::INFERENCE);
-  if (status) {
-    throw std::invalid_argument("model initialization failed!");
   }
 
   const unsigned int feature_size = 1 * 1024 * 1024;
