@@ -95,6 +95,14 @@ void flash_attention_cpu(const float *query, const float *key,
  */
 static const unsigned int DECODE_SEQLEN_THRESHOLD = 1;
 
+/**
+ * @brief Maximum NCOLS2 (Q heads per KV head) supported by the kernel
+ * @detail The FP16 kernel is compiled with NCOLS2=2, so we can group up to 2 Q heads
+ *         per work-group. The actual ncols2 used at runtime may be less.
+ *         For GQA-4+ models, multiple dispatches handle the remaining Q heads.
+ */
+static const unsigned int MAX_NCOLS2 = 2;
+
 void flash_attention_fp32_cl(float *query, float *key, float *value, float *output,
                              unsigned int seqlen_q, unsigned int seqlen_k,
                              unsigned int head_dim, unsigned int num_heads_q,
@@ -375,6 +383,23 @@ void flash_attention_prefill_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
     return;
   }
 
+  // Phase 4: GQA grouping — compute adaptive ncols2
+  // ncols2 = number of Q heads per KV head processed together in one work-group
+  // This reuses K/V tiles across multiple Q heads, saving global memory bandwidth
+  const unsigned int gqa_ratio = num_heads_q / num_heads_kv;
+
+  // Adaptive ncols2 selection based on GQA ratio and sequence length
+  // Only use GQA grouping for ratio >= 4 — ratio 2 doesn't benefit enough
+  // from K/V reuse to offset the reduced parallelism and increased local memory
+  unsigned int ncols2 = 1;
+  if (gqa_ratio >= 4 && seqlen_q > 4) {
+    ncols2 = 2;  // Group 2 Q heads per work-group (with multi-dispatch for ratio > 2)
+  }
+  // Cap at MAX_NCOLS2 (kernel compile-time limit)
+  if (ncols2 > MAX_NCOLS2) {
+    ncols2 = MAX_NCOLS2;
+  }
+
   // Phase 2: Tiled GEMM prefill kernel configuration
   // NCOLS1: Q tokens per work-group, NBATCH_FA: KV rows per tile
   static const unsigned int NCOLS1 = 4;
@@ -383,9 +408,13 @@ void flash_attention_prefill_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
   // Work-group size: must be large enough to cooperatively load tiles
   static const unsigned int PREFILL_WORK_GROUP_SIZE = 128;
 
-  // Number of work-groups: batch * num_heads_q * ceil(seqlen_q / NCOLS1)
+  // Number of Q groups (tiles along the sequence dimension)
   const unsigned int num_q_groups = (seqlen_q + NCOLS1 - 1) / NCOLS1;
-  const unsigned int total_groups = batch * num_heads_q * num_q_groups;
+
+  // Phase 4: We may need multiple dispatches if gqa_ratio > ncols2
+  // Each dispatch handles `ncols2` Q heads per KV head
+  // Number of dispatches = ceil(gqa_ratio / ncols2)
+  const unsigned int num_dispatches = (gqa_ratio + ncols2 - 1) / ncols2;
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
@@ -397,71 +426,88 @@ void flash_attention_prefill_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
     return;
   }
 
-  int arg = 0;
-  bool result = false;
+  // Dispatch multiple times if gqa_ratio > ncols2
+  // Each dispatch processes a subset of Q heads for each KV head
+  for (unsigned int dispatch = 0; dispatch < num_dispatches; dispatch++) {
+    const unsigned int head_group_offset = dispatch * ncols2;
+    // Actual ncols2 for this dispatch (may be less at boundary)
+    const unsigned int dispatch_ncols2 = std::min(ncols2, gqa_ratio - head_group_offset);
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, query);
-  if (!result)
-    throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_prefill_fp16");
+    // Total work-groups: batch * num_heads_kv * num_q_groups
+    // (Note: iterate over KV heads, not Q heads — each work-group handles dispatch_ncols2 Q heads)
+    const unsigned int total_groups = batch * num_heads_kv * num_q_groups;
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, key);
-  if (!result)
-    throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_prefill_fp16");
+    int arg = 0;
+    bool result = false;
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, value);
-  if (!result)
-    throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_prefill_fp16");
+    result = kernel_ptr->SetKernelSVMArguments(arg++, query);
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_prefill_fp16");
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, output);
-  if (!result)
-    throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_prefill_fp16");
+    result = kernel_ptr->SetKernelSVMArguments(arg++, key);
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_prefill_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
-  if (!result)
-    throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_prefill_fp16");
+    result = kernel_ptr->SetKernelSVMArguments(arg++, value);
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_prefill_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
-  if (!result)
-    throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_prefill_fp16");
+    result = kernel_ptr->SetKernelSVMArguments(arg++, output);
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_prefill_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
-  if (!result)
-    throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_prefill_fp16");
+    result = kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_prefill_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
-  if (!result)
-    throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_prefill_fp16");
+    result = kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_prefill_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
-  if (!result)
-    throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_prefill_fp16");
+    result = kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_prefill_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &batch, sizeof(int));
-  if (!result)
-    throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_prefill_fp16");
+    result = kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_prefill_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
-  if (!result)
-    throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_prefill_fp16");
+    result = kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_prefill_fp16");
 
-  // Dispatch: total_groups work-groups, each with PREFILL_WORK_GROUP_SIZE work-items
-  const int work_groups_count[3] = {(int)(total_groups * PREFILL_WORK_GROUP_SIZE), 1, 1};
-  const int work_group_size[3] = {(int)PREFILL_WORK_GROUP_SIZE, 1, 1};
+    result = kernel_ptr->SetKernelArguments(arg++, &batch, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_prefill_fp16");
 
-  result = blas_cc->command_queue_inst_.DispatchCommand(
-    kernel_ptr, work_groups_count, work_group_size);
-  if (!result) {
-    throw std::runtime_error("Failed to dispatch kernel for flash_attention_prefill_fp16");
-    return;
+    result = kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_prefill_fp16");
+
+    // Phase 4: New kernel arguments for GQA grouping
+    result = kernel_ptr->SetKernelArguments(arg++, &dispatch_ncols2, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 11 (ncols2) for flash_attention_prefill_fp16");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &head_group_offset, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 12 (head_group_offset) for flash_attention_prefill_fp16");
+
+    // Dispatch: total_groups work-groups, each with PREFILL_WORK_GROUP_SIZE work-items
+    const int work_groups_count[3] = {(int)(total_groups * PREFILL_WORK_GROUP_SIZE), 1, 1};
+    const int work_group_size[3] = {(int)PREFILL_WORK_GROUP_SIZE, 1, 1};
+
+    result = blas_cc->command_queue_inst_.DispatchCommand(
+      kernel_ptr, work_groups_count, work_group_size);
+    if (!result) {
+      throw std::runtime_error("Failed to dispatch kernel for flash_attention_prefill_fp16");
+      return;
+    }
   }
 
   blas_cc->command_queue_inst_.enqueueSVMMap(output, 
                                              batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16),
                                              true);
-  if (!result) {
-    throw std::runtime_error("Failed to read output data for flash_attention_prefill_fp16");
-    return;
-  }
 }
 
 void flash_attention_decode_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
