@@ -103,6 +103,47 @@ static const unsigned int DECODE_SEQLEN_THRESHOLD = 1;
  */
 static const unsigned int MAX_NCOLS2 = 2;
 
+/**
+ * @brief Maximum NCOLS1 (Q tokens per work-group) supported by the kernel
+ * @detail The kernel is compiled with NCOLS1=4, which determines the local memory
+ *         allocation. The actual ncols1 used at runtime may be less (adaptive sizing).
+ */
+static const unsigned int MAX_NCOLS1 = 4;
+
+/**
+ * @brief Select adaptive ncols1 (Q tokens per work-group) based on seqlen_q and ncols2
+ * @detail Phase 5 optimization: larger ncols1 for longer sequences reduces kernel launch
+ *         overhead and improves work-item utilization. Smaller ncols1 for short sequences
+ *         avoids wasted local memory and compute on padding rows.
+ *         The selection also accounts for ncols2 (GQA grouping) to keep total Q rows
+ *         per work-group (ncols1 * ncols2) reasonable for local memory constraints.
+ * @param seqlen_q Query sequence length
+ * @param ncols2 Number of Q heads per KV head in this dispatch
+ * @return Selected ncols1 value (must be <= MAX_NCOLS1)
+ */
+static unsigned int select_ncols1(unsigned int seqlen_q, unsigned int ncols2) {
+  // Adaptive sizing: larger ncols1 for longer sequences
+  // Account for ncols2 to keep total Q rows (ncols1 * ncols2) manageable
+  // Local memory usage scales with ncols1 * ncols2, so reduce ncols1 when ncols2 > 1
+  unsigned int ncols1;
+  if (seqlen_q > 16 / ncols2) {
+    ncols1 = 32;
+  } else if (seqlen_q > 8 / ncols2) {
+    ncols1 = 16;
+  } else if (seqlen_q > 4 / ncols2) {
+    ncols1 = 8;
+  } else if (seqlen_q > 2 / ncols2) {
+    ncols1 = 4;
+  } else {
+    ncols1 = 2;
+  }
+  // Cap at MAX_NCOLS1 (kernel compile-time limit)
+  if (ncols1 > MAX_NCOLS1) {
+    ncols1 = MAX_NCOLS1;
+  }
+  return ncols1;
+}
+
 void flash_attention_fp32_cl(float *query, float *key, float *value, float *output,
                              unsigned int seqlen_q, unsigned int seqlen_k,
                              unsigned int head_dim, unsigned int num_heads_q,
@@ -400,16 +441,20 @@ void flash_attention_prefill_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
     ncols2 = MAX_NCOLS2;
   }
 
+  // Phase 5: Adaptive cols_per_block — select ncols1 based on seqlen_q and ncols2
+  // Larger ncols1 for longer sequences reduces kernel launch overhead and improves
+  // work-item utilization. Smaller ncols1 for short sequences avoids wasted compute.
+  const unsigned int ncols1 = select_ncols1(seqlen_q, ncols2);
+
   // Phase 2: Tiled GEMM prefill kernel configuration
-  // NCOLS1: Q tokens per work-group, NBATCH_FA: KV rows per tile
-  static const unsigned int NCOLS1 = 4;
+  // NBATCH_FA: KV rows per tile
   static const unsigned int NBATCH_FA = 16;
 
   // Work-group size: must be large enough to cooperatively load tiles
   static const unsigned int PREFILL_WORK_GROUP_SIZE = 128;
 
-  // Number of Q groups (tiles along the sequence dimension)
-  const unsigned int num_q_groups = (seqlen_q + NCOLS1 - 1) / NCOLS1;
+  // Number of Q groups (tiles along the sequence dimension) — uses runtime ncols1
+  const unsigned int num_q_groups = (seqlen_q + ncols1 - 1) / ncols1;
 
   // Phase 4: We may need multiple dispatches if gqa_ratio > ncols2
   // Each dispatch handles `ncols2` Q heads per KV head
@@ -484,7 +529,7 @@ void flash_attention_prefill_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
     if (!result)
       throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_prefill_fp16");
 
-    // Phase 4: New kernel arguments for GQA grouping
+    // Phase 4: Kernel arguments for GQA grouping
     result = kernel_ptr->SetKernelArguments(arg++, &dispatch_ncols2, sizeof(int));
     if (!result)
       throw std::runtime_error("Failed to set kernel argument 11 (ncols2) for flash_attention_prefill_fp16");
@@ -492,6 +537,11 @@ void flash_attention_prefill_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
     result = kernel_ptr->SetKernelArguments(arg++, &head_group_offset, sizeof(int));
     if (!result)
       throw std::runtime_error("Failed to set kernel argument 12 (head_group_offset) for flash_attention_prefill_fp16");
+
+    // Phase 5: Runtime ncols1 argument (adaptive cols_per_block)
+    result = kernel_ptr->SetKernelArguments(arg++, &ncols1, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 13 (ncols1) for flash_attention_prefill_fp16");
 
     // Dispatch: total_groups work-groups, each with PREFILL_WORK_GROUP_SIZE work-items
     const int work_groups_count[3] = {(int)(total_groups * PREFILL_WORK_GROUP_SIZE), 1, 1};
