@@ -334,8 +334,9 @@ Tensor createAttentionLayer(const int layer_id, int seq_len, int n_heads,
       "reshape",
       {nntrainer::withKey("name", "layer" + std::to_string(layer_id) +
                                     "_attention_flatten"),
-       nntrainer::withKey("target_shape", "1:" + std::to_string(seq_len) + ":" +
-                                            std::to_string(n_heads * head_dim))}));
+       nntrainer::withKey("target_shape",
+                          "1:" + std::to_string(seq_len) + ":" +
+                            std::to_string(n_heads * head_dim))}));
     auto flat = flatten(concatenated);
 
     // linear transformation of attention output
@@ -379,17 +380,16 @@ Tensor createFeedForwardLayer(const int layer_id, int dim,
   auto h2 = ffn_2(input);
 
   LayerHandle swiglu(createLayer(
-    "swiglu",
-    {nntrainer::withKey("name",
-                        "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
+    "swiglu", {nntrainer::withKey("name", "layer" + std::to_string(layer_id) +
+                                            "_ffn_swiglu")}));
   auto h = swiglu({h1, h2});
 
-  LayerHandle ffn_out(createLayer(
-    "fully_connected",
-    {nntrainer::withKey("name",
-                        "layer" + std::to_string(layer_id) + "_ffn_output"),
-     nntrainer::withKey("unit", dim),
-     nntrainer::withKey("disable_bias", "true")}));
+  LayerHandle ffn_out(
+    createLayer("fully_connected",
+                {nntrainer::withKey("name", "layer" + std::to_string(layer_id) +
+                                              "_ffn_output"),
+                 nntrainer::withKey("unit", dim),
+                 nntrainer::withKey("disable_bias", "true")}));
 
   return ffn_out(h);
 }
@@ -415,11 +415,10 @@ Tensor createTransformerDecoder(const int layer_id, Tensor input) {
   auto residual = decoder_add({input, att_out});
 
   LayerHandle ffn_norm(createLayer(
-    "rms_norm",
-    {nntrainer::withKey("name",
-                        "layer" + std::to_string(layer_id) + "_ffn_norm"),
-     nntrainer::withKey("epsilon", std::to_string(NORM_EPS)),
-     nntrainer::withKey("packed", "false")}));
+    "rms_norm", {nntrainer::withKey("name", "layer" + std::to_string(layer_id) +
+                                              "_ffn_norm"),
+                 nntrainer::withKey("epsilon", std::to_string(NORM_EPS)),
+                 nntrainer::withKey("packed", "false")}));
   auto ffn_normed = ffn_norm(residual);
 
   auto ffn_out =
@@ -449,17 +448,16 @@ std::pair<Tensor, Tensor> buildLLaMAGraph() {
   }
 
   LayerHandle out_norm(createLayer(
-    "rms_norm",
-    {nntrainer::withKey("name", "output_norm"),
-     nntrainer::withKey("epsilon", std::to_string(NORM_EPS)),
-     nntrainer::withKey("packed", "false")}));
+    "rms_norm", {nntrainer::withKey("name", "output_norm"),
+                 nntrainer::withKey("epsilon", std::to_string(NORM_EPS)),
+                 nntrainer::withKey("packed", "false")}));
   h = out_norm(h);
 
-  LayerHandle out_fc(createLayer(
-    "fully_connected", {nntrainer::withKey("name", "output_of_llama"),
-                        nntrainer::withKey("unit", NUM_VOCAB),
-                        nntrainer::withKey("disable_bias", "true"),
-                        nntrainer::withKey("packed", "false")}));
+  LayerHandle out_fc(createLayer("fully_connected",
+                                 {nntrainer::withKey("name", "output_of_llama"),
+                                  nntrainer::withKey("unit", NUM_VOCAB),
+                                  nntrainer::withKey("disable_bias", "true"),
+                                  nntrainer::withKey("packed", "false")}));
   auto y = out_fc(h);
 
   return {x, y};

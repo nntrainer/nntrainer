@@ -99,13 +99,13 @@ Tensor Tensor::reshape(const TensorDim &new_shape) const {
   std::string target = std::to_string(new_shape.channel()) + ":" +
                        std::to_string(new_shape.height()) + ":" +
                        std::to_string(new_shape.width());
-  LayerHandle layer = createLayer(
-    "reshape", {"name=" + nextImplicitName("reshape"),
-                "target_shape=" + target});
+  LayerHandle layer =
+    createLayer("reshape", {"name=" + nextImplicitName("reshape"),
+                            "target_shape=" + target});
   Tensor output = layer({*this});
   // Override shape to match requested dimensions
   output.impl_->dim = TensorDim({shape().batch(), new_shape.channel(),
-                                  new_shape.height(), new_shape.width()});
+                                 new_shape.height(), new_shape.width()});
   return output;
 }
 
@@ -310,7 +310,8 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
                   // Input layer's sentinel leaf — skip, no input_layers needed
                   continue;
                 }
-              } catch (...) {}
+              } catch (...) {
+              }
             }
             leaf_name = "ext_input_" + std::to_string(unnamed_leaf_counter++);
           }
@@ -343,17 +344,17 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
   for (auto &li : layers_in_order) {
     try {
       discovered_layer_names.insert(li.layer->getName());
-    } catch (...) {}
+    } catch (...) {
+    }
   }
 
   int status;
   for (auto &inp : inputs) {
     std::string inp_name = inp.name();
     if (inp_name.empty()) {
-      inp_name =
-        (inputs.size() == 1)
-          ? "graph_input"
-          : "graph_input_" + std::to_string(&inp - &inputs[0]);
+      inp_name = (inputs.size() == 1)
+                   ? "graph_input"
+                   : "graph_input_" + std::to_string(&inp - &inputs[0]);
     }
 
     // If this input's producing layer was already discovered by DFS, skip
@@ -362,34 +363,38 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
       std::string prod_name;
       try {
         prod_name = inp.impl_->graph_edge->producing_layer->getName();
-      } catch (...) {}
+      } catch (...) {
+      }
       if (!prod_name.empty() && discovered_layer_names.count(prod_name)) {
-        continue;  // Input layer already in the graph
+        continue; // Input layer already in the graph
       }
     }
 
     // Also skip if a layer with the same name was already discovered
-    // (handles the case where inp_name matches an output name like "input0:output")
+    // (handles the case where inp_name matches an output name like
+    // "input0:output")
     bool already_has_input = false;
     for (auto &li : layers_in_order) {
       try {
-        if (li.layer->getType() == "input" &&
-            li.layer->getName() == inp_name) {
+        if (li.layer->getType() == "input" && li.layer->getName() == inp_name) {
           already_has_input = true;
           break;
         }
-      } catch (...) {}
+      } catch (...) {
+      }
     }
-    if (already_has_input) continue;
+    if (already_has_input)
+      continue;
 
-    if (!inp.isValid()) continue;  // skip invalid tensors
+    if (!inp.isValid())
+      continue; // skip invalid tensors
 
     const TensorDim &dim = inp.shape();
     std::string shape_str = std::to_string(dim.channel()) + ":" +
-                             std::to_string(dim.height()) + ":" +
-                             std::to_string(dim.width());
-    auto input_layer = createLayer(
-      "input", {"name=" + inp_name, "input_shape=" + shape_str});
+                            std::to_string(dim.height()) + ":" +
+                            std::to_string(dim.width());
+    auto input_layer =
+      createLayer("input", {"name=" + inp_name, "input_shape=" + shape_str});
     status = addLayer(std::move(input_layer));
     if (status != ML_ERROR_NONE) {
       return status;
@@ -399,10 +404,10 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
   // 1b. Create input layers for additional leaf tensors
   for (auto &[leaf_name, leaf_info] : additional_leaves) {
     std::string leaf_shape = std::to_string(leaf_info.dim.channel()) + ":" +
-                              std::to_string(leaf_info.dim.height()) + ":" +
-                              std::to_string(leaf_info.dim.width());
-    auto leaf_layer = createLayer(
-      "input", {"name=" + leaf_name, "input_shape=" + leaf_shape});
+                             std::to_string(leaf_info.dim.height()) + ":" +
+                             std::to_string(leaf_info.dim.width());
+    auto leaf_layer =
+      createLayer("input", {"name=" + leaf_name, "input_shape=" + leaf_shape});
     status = addLayer(std::move(leaf_layer));
     if (status != ML_ERROR_NONE) {
       return status;
@@ -448,10 +453,9 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
   for (auto &inp : inputs) {
     std::string inp_name = inp.name();
     if (inp_name.empty()) {
-      inp_name =
-        (inputs.size() == 1)
-          ? "graph_input"
-          : "graph_input_" + std::to_string(&inp - &inputs[0]);
+      inp_name = (inputs.size() == 1)
+                   ? "graph_input"
+                   : "graph_input_" + std::to_string(&inp - &inputs[0]);
     }
     const TensorDim &in_dim = inp.shape();
     inp.impl_->eager_data = std::make_shared<nntrainer::Tensor>(

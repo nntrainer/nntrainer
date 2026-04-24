@@ -119,8 +119,8 @@ Tensor darknetBlock(const std::string &block_name, Tensor input,
 
     std::string add_name =
       (repeat - 1 != i) ? scoped_name("res", i) : block_name;
-    LayerHandle add(createLayer(
-      "addition", {nntrainer::withKey("name", add_name)}));
+    LayerHandle add(
+      createLayer("addition", {nntrainer::withKey("name", add_name)}));
     h = add({h, c2});
   }
 
@@ -143,10 +143,9 @@ Tensor createHead(const std::string &prefix, Tensor fp, int conv_filters,
   LayerHandle reshape(createLayer(
     "reshape",
     {nntrainer::withKey("name", prefix.substr(4) + "_reshape"),
-     nntrainer::withKey(
-       "target_shape",
-       std::to_string(grid_size * grid_size) + ":" + std::to_string(3) + ":" +
-         std::to_string(5 + CLASS_NUMBER))}));
+     nntrainer::withKey("target_shape", std::to_string(grid_size * grid_size) +
+                                          ":" + std::to_string(3) + ":" +
+                                          std::to_string(5 + CLASS_NUMBER))}));
   h = reshape(h);
 
   std::string loss_name;
@@ -158,13 +157,12 @@ Tensor createHead(const std::string &prefix, Tensor fp, int conv_filters,
     loss_name = "loss_for_small";
 
   LayerHandle loss(createLayer(
-    "yolo_v3_loss",
-    {nntrainer::withKey("name", loss_name),
-     nntrainer::withKey("max_object_number", MAX_OBJECT_NUMBER),
-     nntrainer::withKey("class_number", CLASS_NUMBER),
-     nntrainer::withKey("grid_height_number", grid_size),
-     nntrainer::withKey("grid_width_number", grid_size),
-     nntrainer::withKey("scale", scale)}));
+    "yolo_v3_loss", {nntrainer::withKey("name", loss_name),
+                     nntrainer::withKey("max_object_number", MAX_OBJECT_NUMBER),
+                     nntrainer::withKey("class_number", CLASS_NUMBER),
+                     nntrainer::withKey("grid_height_number", grid_size),
+                     nntrainer::withKey("grid_width_number", grid_size),
+                     nntrainer::withKey("scale", scale)}));
   return loss(h);
 }
 
@@ -278,7 +276,8 @@ int main(int argc, char *argv[]) {
     // build YOLOv3 symbolic graph
     auto [input_t, output_ts] = buildYOLOv3Graph();
 
-    ModelHandle model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+    ModelHandle model =
+      ml::train::createModel(ml::train::ModelType::NEURAL_NET);
     model->setProperty({nntrainer::withKey("batch_size", BATCH_SIZE),
                         nntrainer::withKey("epochs", EPOCHS),
                         nntrainer::withKey("save_path", "darknet53.bin")});

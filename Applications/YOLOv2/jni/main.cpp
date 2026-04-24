@@ -97,8 +97,7 @@ Tensor yoloBlock(const std::string &block_name, Tensor input, int filters,
   };
 
   LayerHandle conv(createLayer(
-    "conv2d", {with_name("a1"),
-               nntrainer::withKey("stride", {1, 1}),
+    "conv2d", {with_name("a1"), nntrainer::withKey("stride", {1, 1}),
                nntrainer::withKey("filters", filters),
                nntrainer::withKey("kernel_size", {kernel_size, kernel_size}),
                nntrainer::withKey("padding", "same"),
@@ -172,8 +171,8 @@ std::pair<Tensor, Tensor> buildYOLOGraph() {
   // branch B: conv13 -> conv_b -> reorg
   auto branch_b = yoloBlock("conv_b", conv13, 64, 1, false);
 
-  LayerHandle reorg(
-    createLayer("reorg_layer", {nntrainer::withKey("name", "re_organization")}));
+  LayerHandle reorg(createLayer(
+    "reorg_layer", {nntrainer::withKey("name", "re_organization")}));
   branch_b = reorg(branch_b);
 
   // concat branches
@@ -201,19 +200,19 @@ std::pair<Tensor, Tensor> buildYOLOGraph() {
   LayerHandle reshape(createLayer(
     "reshape",
     {nntrainer::withKey("name", "reshape"),
-     nntrainer::withKey(
-       "target_shape", std::to_string(GRID_HEIGHT_NUMBER * GRID_WIDTH_NUMBER) +
-                         ":" + std::to_string(ANCHOR_NUMBER) + ":" +
-                         std::to_string(5 + CLASS_NUMBER))}));
+     nntrainer::withKey("target_shape",
+                        std::to_string(GRID_HEIGHT_NUMBER * GRID_WIDTH_NUMBER) +
+                          ":" + std::to_string(ANCHOR_NUMBER) + ":" +
+                          std::to_string(5 + CLASS_NUMBER))}));
   h = reshape(h);
 
-  LayerHandle yolo_loss(createLayer(
-    "yolo_v2_loss",
-    {nntrainer::withKey("name", "yolo_v2_loss"),
-     nntrainer::withKey("max_object_number", MAX_OBJECT_NUMBER),
-     nntrainer::withKey("class_number", CLASS_NUMBER),
-     nntrainer::withKey("grid_height_number", GRID_HEIGHT_NUMBER),
-     nntrainer::withKey("grid_width_number", GRID_WIDTH_NUMBER)}));
+  LayerHandle yolo_loss(
+    createLayer("yolo_v2_loss",
+                {nntrainer::withKey("name", "yolo_v2_loss"),
+                 nntrainer::withKey("max_object_number", MAX_OBJECT_NUMBER),
+                 nntrainer::withKey("class_number", CLASS_NUMBER),
+                 nntrainer::withKey("grid_height_number", GRID_HEIGHT_NUMBER),
+                 nntrainer::withKey("grid_width_number", GRID_WIDTH_NUMBER)}));
   auto y = yolo_loss(h);
 
   return {x, y};
@@ -249,7 +248,8 @@ int main(int argc, char *argv[]) {
     // build YOLO v2 symbolic graph
     auto [input_t, output_t] = buildYOLOGraph();
 
-    ModelHandle model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+    ModelHandle model =
+      ml::train::createModel(ml::train::ModelType::NEURAL_NET);
     model->setProperty({nntrainer::withKey("batch_size", BATCH_SIZE),
                         nntrainer::withKey("epochs", EPOCHS),
                         nntrainer::withKey("save_path", "yolov2.bin")});

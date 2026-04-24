@@ -42,11 +42,11 @@ std::pair<Tensor, Tensor> buildGraph() {
 
   auto h = x;
   for (int i = 0; i < 56; i++) {
-    LayerHandle fc(createLayer(
-      "fully_connected",
-      {nntrainer::withKey("unit", 1024),
-       nntrainer::withKey("weight_initializer", "xavier_uniform"),
-       nntrainer::withKey("disable_bias", "true")}));
+    LayerHandle fc(
+      createLayer("fully_connected",
+                  {nntrainer::withKey("unit", 1024),
+                   nntrainer::withKey("weight_initializer", "xavier_uniform"),
+                   nntrainer::withKey("disable_bias", "true")}));
     h = fc(h);
   }
 

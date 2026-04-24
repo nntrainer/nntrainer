@@ -68,12 +68,12 @@ std::shared_ptr<ml::train::Model> genModel() {
   Tensor wpe_in({1, 1, 1, 1}, "wpe_input");
 
   // Embedding layers
-  LayerHandle wte = createLayer("embedding",
-    {"name=wte", "in_dim=" + std::to_string(NUM_VOCAB),
-     "out_dim=" + std::to_string(MODEL_DIM)});
-  LayerHandle wpe = createLayer("embedding",
-    {"name=wpe", "in_dim=" + std::to_string(NUM_CTX),
-     "out_dim=" + std::to_string(MODEL_DIM)});
+  LayerHandle wte =
+    createLayer("embedding", {"name=wte", "in_dim=" + std::to_string(NUM_VOCAB),
+                              "out_dim=" + std::to_string(MODEL_DIM)});
+  LayerHandle wpe =
+    createLayer("embedding", {"name=wpe", "in_dim=" + std::to_string(NUM_CTX),
+                              "out_dim=" + std::to_string(MODEL_DIM)});
   auto wte_out = wte(wte_in);
   auto wpe_out = wpe(wpe_in);
 
@@ -85,8 +85,9 @@ std::shared_ptr<ml::train::Model> genModel() {
     std::string prefix = "layer" + std::to_string(i);
 
     // Layer Norm 1
-    LayerHandle ln1 = createLayer("layer_normalization",
-      {"name=" + prefix + "/ln1", "axis=3", "epsilon=1e-5"});
+    LayerHandle ln1 =
+      createLayer("layer_normalization",
+                  {"name=" + prefix + "/ln1", "axis=3", "epsilon=1e-5"});
     auto ln1_out = ln1(prev);
 
     Tensor attn_out;
@@ -96,24 +97,27 @@ std::shared_ptr<ml::train::Model> genModel() {
 
       for (unsigned int j = 0; j < NUM_HEADS; ++j) {
         unsigned int idx = NUM_HEADS - 1 - j;
-        std::string head_prefix =
-          prefix + "/multi_head_attention";
+        std::string head_prefix = prefix + "/multi_head_attention";
 
-        LayerHandle v_fc = createLayer("fully_connected",
-          {"name=" + head_prefix + "/v_fc" + std::to_string(idx),
-           "unit=" + std::to_string(MODEL_DIM / NUM_HEADS)});
-        LayerHandle k_fc = createLayer("fully_connected",
-          {"name=" + head_prefix + "/k_fc" + std::to_string(idx),
-           "unit=" + std::to_string(MODEL_DIM / NUM_HEADS)});
-        LayerHandle q_fc = createLayer("fully_connected",
-          {"name=" + head_prefix + "/q_fc" + std::to_string(idx),
-           "unit=" + std::to_string(MODEL_DIM / NUM_HEADS)});
+        LayerHandle v_fc =
+          createLayer("fully_connected",
+                      {"name=" + head_prefix + "/v_fc" + std::to_string(idx),
+                       "unit=" + std::to_string(MODEL_DIM / NUM_HEADS)});
+        LayerHandle k_fc =
+          createLayer("fully_connected",
+                      {"name=" + head_prefix + "/k_fc" + std::to_string(idx),
+                       "unit=" + std::to_string(MODEL_DIM / NUM_HEADS)});
+        LayerHandle q_fc =
+          createLayer("fully_connected",
+                      {"name=" + head_prefix + "/q_fc" + std::to_string(idx),
+                       "unit=" + std::to_string(MODEL_DIM / NUM_HEADS)});
 
         auto v = v_fc(ln1_out);
         auto k = k_fc(ln1_out);
         auto q = q_fc(ln1_out);
 
-        LayerHandle attn = createLayer("attention",
+        LayerHandle attn = createLayer(
+          "attention",
           {"name=" + head_prefix + "/attention" + std::to_string(idx),
            "scaled_dot_product=true", "causal_mask=true"});
         attn_heads.push_back(attn({q, v, k}));
@@ -122,55 +126,57 @@ std::shared_ptr<ml::train::Model> genModel() {
       // Reverse so concat order is attention0, attention1, ..., attention11
       std::reverse(attn_heads.begin(), attn_heads.end());
 
-      LayerHandle concat = createLayer("concat",
+      LayerHandle concat = createLayer(
+        "concat",
         {"name=" + prefix + "/multi_head_attention/concat", "axis=3"});
       auto concat_out = concat(attn_heads);
 
-      LayerHandle attn_fc = createLayer("fully_connected",
-        {"name=" + prefix + "/multi_head_attention/fc",
-         "unit=" + std::to_string(MODEL_DIM)});
+      LayerHandle attn_fc = createLayer(
+        "fully_connected", {"name=" + prefix + "/multi_head_attention/fc",
+                            "unit=" + std::to_string(MODEL_DIM)});
       auto fc_out = attn_fc(concat_out);
 
-      LayerHandle identity = createLayer("identity",
-        {"name=" + prefix + "/multi_head_attention"});
+      LayerHandle identity =
+        createLayer("identity", {"name=" + prefix + "/multi_head_attention"});
       attn_out = identity(fc_out);
     } else {
       LayerHandle mha = createLayer("multi_head_attention",
-        {"name=" + prefix + "/multi_head_attention",
-         "num_heads=" + std::to_string(NUM_HEADS)});
+                                    {"name=" + prefix + "/multi_head_attention",
+                                     "num_heads=" + std::to_string(NUM_HEADS)});
       attn_out = mha({ln1_out, ln1_out, ln1_out});
     }
 
     // Skip connection 1: prev + attention output
-    LayerHandle add1 = createLayer("Addition",
-      {"name=" + prefix + "/add1"});
+    LayerHandle add1 = createLayer("Addition", {"name=" + prefix + "/add1"});
     auto add1_out = add1({prev, attn_out});
 
     // Layer Norm 2
-    LayerHandle ln2 = createLayer("layer_normalization",
-      {"name=" + prefix + "/ln2", "axis=3", "epsilon=1e-5"});
+    LayerHandle ln2 =
+      createLayer("layer_normalization",
+                  {"name=" + prefix + "/ln2", "axis=3", "epsilon=1e-5"});
     auto ln2_out = ln2(add1_out);
 
     // FFN
-    LayerHandle fc1 = createLayer("fully_connected",
-      {"name=" + prefix + "/fc1",
-       "unit=" + std::to_string(FC_UNIT), "activation=gelu"});
+    LayerHandle fc1 =
+      createLayer("fully_connected",
+                  {"name=" + prefix + "/fc1", "unit=" + std::to_string(FC_UNIT),
+                   "activation=gelu"});
     auto fc1_out = fc1(ln2_out);
 
-    LayerHandle fc2 = createLayer("fully_connected",
-      {"name=" + prefix + "/fc2",
-       "unit=" + std::to_string(MODEL_DIM)});
+    LayerHandle fc2 =
+      createLayer("fully_connected", {"name=" + prefix + "/fc2",
+                                      "unit=" + std::to_string(MODEL_DIM)});
     auto fc2_out = fc2(fc1_out);
 
     // Skip connection 2: add1_out + fc2_out
-    LayerHandle add2 = createLayer("Addition",
-      {"name=" + prefix + "/add2"});
+    LayerHandle add2 = createLayer("Addition", {"name=" + prefix + "/add2"});
     prev = add2({add1_out, fc2_out});
   }
 
   // Final Layer Norm
-  LayerHandle final_ln = createLayer("layer_normalization",
-    {"name=layer_normalization", "axis=3", "epsilon=1e-5"});
+  LayerHandle final_ln =
+    createLayer("layer_normalization",
+                {"name=layer_normalization", "axis=3", "epsilon=1e-5"});
   auto output = final_ln(prev);
 
   int status = model->setOptimizer(
@@ -243,26 +249,26 @@ int main(int argc, char *argv[]) {
     model->getLayer("wte", &wte_embedding_layer);
     const std::vector<float *> wte_weights_buf =
       wte_embedding_layer->getWeights();
-    auto wte_weight = ml::train::Tensor::fromData(
-      {NUM_VOCAB, MODEL_DIM}, wte_weights_buf[0]);
+    auto wte_weight =
+      ml::train::Tensor::fromData({NUM_VOCAB, MODEL_DIM}, wte_weights_buf[0]);
 
     for (unsigned int i = 1; i < init_input_seq_len + NUM_TOKENS_TO_GENERATE;
          ++i) {
       output_bufs = model->incremental_inference(
         BATCH_SIZE, {wte_input, wpe_input}, {}, init_input_seq_len, i - 1, i);
 
-      auto output = ml::train::Tensor::fromData(
-        {BATCH_SIZE, 1, i, MODEL_DIM}, output_bufs[0]);
+      auto output = ml::train::Tensor::fromData({BATCH_SIZE, 1, i, MODEL_DIM},
+                                                output_bufs[0]);
 
       std::shared_ptr<ml::train::Layer> wte_embedding_layer;
       model->getLayer("wte", &wte_embedding_layer);
       const std::vector<float *> wte_weights_buf =
         wte_embedding_layer->getWeights();
-      auto wte_weight = ml::train::Tensor::fromData(
-        {NUM_VOCAB, MODEL_DIM}, wte_weights_buf[0]);
+      auto wte_weight =
+        ml::train::Tensor::fromData({NUM_VOCAB, MODEL_DIM}, wte_weights_buf[0]);
       auto logits = output.dot(wte_weight, false, true);
-      auto next = logits.getSharedDataTensor(
-        {1, NUM_VOCAB}, BATCH_SIZE * (i - 1) * NUM_VOCAB);
+      auto next = logits.getSharedDataTensor({1, NUM_VOCAB},
+                                             BATCH_SIZE * (i - 1) * NUM_VOCAB);
 
       std::vector<unsigned int> ids = next.argmax();
 

@@ -65,25 +65,23 @@ Tensor resnetBlock(const std::string &block_name, Tensor input, int filters,
                        const std::string &padding) -> LayerHandle {
     std::string k = std::to_string(ks) + "," + std::to_string(ks);
     std::string s = std::to_string(stride) + "," + std::to_string(stride);
-    return LayerHandle(createLayer(
-      "conv2d", {"name=" + scoped(name), "filters=" + f, "kernel_size=" + k,
-                 "stride=" + s, "padding=" + padding,
-                 "trainable=" + trainable}));
+    return LayerHandle(
+      createLayer("conv2d", {"name=" + scoped(name), "filters=" + f,
+                             "kernel_size=" + k, "stride=" + s,
+                             "padding=" + padding, "trainable=" + trainable}));
   };
 
   /** residual path */
 #if defined(ENABLE_TFLITE_INTERPRETER)
-  auto a1 =
-    make_conv("a1", kernel_size, downsample ? 2 : 1, "same");
+  auto a1 = make_conv("a1", kernel_size, downsample ? 2 : 1, "same");
 #else
-  auto a1 =
-    make_conv("a1", kernel_size, downsample ? 2 : 1,
-              downsample ? "1,1" : "same");
+  auto a1 = make_conv("a1", kernel_size, downsample ? 2 : 1,
+                      downsample ? "1,1" : "same");
 #endif
-  LayerHandle a2(createLayer(
-    "batch_normalization",
-    {"name=" + scoped("a2"), "activation=relu", "momentum=0.9",
-     "epsilon=0.00001", "trainable=" + trainable}));
+  LayerHandle a2(
+    createLayer("batch_normalization",
+                {"name=" + scoped("a2"), "activation=relu", "momentum=0.9",
+                 "epsilon=0.00001", "trainable=" + trainable}));
   auto a3 = make_conv("a3", kernel_size, 1, "same");
 
   auto h = a1(input);
@@ -102,14 +100,13 @@ Tensor resnetBlock(const std::string &block_name, Tensor input, int filters,
   }
 
   /** addition + final bn */
-  LayerHandle add_layer(
-    createLayer("Addition", {"name=" + scoped("c1")}));
+  LayerHandle add_layer(createLayer("Addition", {"name=" + scoped("c1")}));
   auto merged = add_layer({h, skip});
 
-  LayerHandle bn(createLayer(
-    "batch_normalization",
-    {"name=" + block_name, "activation=relu", "momentum=0.9",
-     "epsilon=0.00001", "trainable=false"}));
+  LayerHandle bn(
+    createLayer("batch_normalization",
+                {"name=" + block_name, "activation=relu", "momentum=0.9",
+                 "epsilon=0.00001", "trainable=false"}));
 
   return bn(merged);
 }
@@ -125,15 +122,14 @@ Tensor buildResnet18Graph(Tensor input, bool pre_trained) {
   std::string trainable = pre_trained ? "true" : "false";
 
   LayerHandle conv0(createLayer(
-    "conv2d",
-    {"name=conv0", "filters=64", "kernel_size=3,3", "stride=1,1",
-     "padding=same", "bias_initializer=zeros",
-     "weight_initializer=xavier_uniform", "trainable=" + trainable}));
+    "conv2d", {"name=conv0", "filters=64", "kernel_size=3,3", "stride=1,1",
+               "padding=same", "bias_initializer=zeros",
+               "weight_initializer=xavier_uniform", "trainable=" + trainable}));
 
-  LayerHandle first_bn(createLayer(
-    "batch_normalization",
-    {"name=first_bn_relu", "activation=relu", "momentum=0.9",
-     "epsilon=0.00001", "trainable=" + trainable}));
+  LayerHandle first_bn(
+    createLayer("batch_normalization",
+                {"name=first_bn_relu", "activation=relu", "momentum=0.9",
+                 "epsilon=0.00001", "trainable=" + trainable}));
 
   auto h = conv0(input);
   h = first_bn(h);
@@ -147,12 +143,11 @@ Tensor buildResnet18Graph(Tensor input, bool pre_trained) {
   h = resnetBlock("conv4_0", h, 512, 3, true, pre_trained);
   h = resnetBlock("conv4_1", h, 512, 3, false, pre_trained);
 
-  LayerHandle pool(createLayer(
-    "pooling2d",
-    {"name=last_p1", "pooling=average", "pool_size=4,4", "stride=4,4"}));
+  LayerHandle pool(createLayer("pooling2d", {"name=last_p1", "pooling=average",
+                                             "pool_size=4,4", "stride=4,4"}));
   LayerHandle flat(createLayer("flatten", {"name=last_f1"}));
-  LayerHandle fc(createLayer(
-    "fully_connected", {"unit=100", "activation=softmax"}));
+  LayerHandle fc(
+    createLayer("fully_connected", {"unit=100", "activation=softmax"}));
 
   h = pool(h);
   h = flat(h);
@@ -196,11 +191,11 @@ void createAndRun(unsigned int epochs, unsigned int batch_size,
   // Create model and compile from symbolic graph
 /// @todo support "LOSS : cross" for TF_Lite Exporter
 #if (defined(ENABLE_TFLITE_INTERPRETER) && !defined(ENABLE_TEST))
-  ModelHandle model = ml::train::createModel(
-    ml::train::ModelType::NEURAL_NET, {"loss=mse"});
+  ModelHandle model =
+    ml::train::createModel(ml::train::ModelType::NEURAL_NET, {"loss=mse"});
 #else
-  ModelHandle model = ml::train::createModel(
-    ml::train::ModelType::NEURAL_NET, {"loss=cross"});
+  ModelHandle model =
+    ml::train::createModel(ml::train::ModelType::NEURAL_NET, {"loss=cross"});
 #endif
 
   model->setProperty({"batch_size=" + std::to_string(batch_size),

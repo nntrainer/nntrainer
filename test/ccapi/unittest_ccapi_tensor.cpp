@@ -680,7 +680,8 @@ TEST(nntrainer_ccapi_graph, multi_layer_compile_p) {
   using namespace ml::train;
   auto x = Tensor({1, 1, 1, 784}, "input");
   LayerHandle fc1 = createLayer("fully_connected", {"unit=128", "name=fc1"});
-  LayerHandle relu = createLayer("activation", {"activation=relu", "name=relu1"});
+  LayerHandle relu =
+    createLayer("activation", {"activation=relu", "name=relu1"});
   LayerHandle fc2 = createLayer("fully_connected", {"unit=10", "name=fc2"});
 
   auto h = fc1(x);
@@ -700,7 +701,8 @@ TEST(nntrainer_ccapi_graph, residual_compile_p) {
   LayerHandle fc1 = createLayer("fully_connected", {"unit=256", "name=fc1"});
   auto h = fc1(x);
   auto out = x.add(h);
-  LayerHandle fc_out = createLayer("fully_connected", {"unit=10", "name=fc_out"});
+  LayerHandle fc_out =
+    createLayer("fully_connected", {"unit=10", "name=fc_out"});
   auto y = fc_out(out);
 
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
@@ -713,8 +715,7 @@ TEST(nntrainer_ccapi_graph, residual_compile_p) {
 TEST(nntrainer_ccapi_graph, existing_add_layer_still_works_p) {
   using namespace ml::train;
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
-  model->addLayer(
-    createLayer("input", {"name=in", "input_shape=1:1:784"}));
+  model->addLayer(createLayer("input", {"name=in", "input_shape=1:1:784"}));
   model->addLayer(
     createLayer("fully_connected", {"name=fc", "unit=10", "input_layers=in"}));
   EXPECT_EQ(model->compile(), ML_ERROR_NONE);
@@ -813,7 +814,7 @@ TEST(nntrainer_ccapi_graph, multi_layer_bind_p) {
 TEST(nntrainer_ccapi_tensor, lazy_chain_p) {
   auto t = ml::train::Tensor::ones({1, 1, 2, 2});
   t.chain().multiply_i(2.0f).add_i(1.0f).eval();
-  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 3.0f);  // 1*2+1
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 3.0f); // 1*2+1
   EXPECT_FLOAT_EQ(t.getValue(0, 0, 1, 1), 3.0f);
 }
 
@@ -823,7 +824,7 @@ TEST(nntrainer_ccapi_tensor, lazy_chain_p) {
 TEST(nntrainer_ccapi_tensor, lazy_chain_order_p) {
   auto t = ml::train::Tensor::ones({1, 1, 1, 1});
   t.chain().add_i(3.0f).multiply_i(2.0f).eval();
-  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 8.0f);  // (1+3)*2
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 8.0f); // (1+3)*2
 }
 
 /**
@@ -840,9 +841,9 @@ TEST(nntrainer_ccapi_tensor, lazy_eval_on_symbolic_n) {
  */
 TEST(nntrainer_ccapi_tensor, lazy_chain_reset_p) {
   auto t = ml::train::Tensor::ones({1, 1, 1, 1});
-  t.chain().add_i(100.0f);  // queued but not eval'd
-  t.chain().add_i(5.0f).eval();  // chain() clears, only +5 applied
-  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 6.0f);  // 1+5
+  t.chain().add_i(100.0f);      // queued but not eval'd
+  t.chain().add_i(5.0f).eval(); // chain() clears, only +5 applied
+  EXPECT_FLOAT_EQ(t.getValue(0, 0, 0, 0), 6.0f); // 1+5
 }
 
 /**
@@ -897,10 +898,12 @@ TEST(nntrainer_ccapi_graph, picogpt_style_transformer_p) {
   Tensor wte_in({1, 1, 1, 1}, "wte_input");
   Tensor wpe_in({1, 1, 1, 1}, "wpe_input");
 
-  LayerHandle wte = createLayer("embedding",
-    {"name=wte", "in_dim=100", "out_dim=" + std::to_string(MODEL_DIM)});
-  LayerHandle wpe = createLayer("embedding",
-    {"name=wpe", "in_dim=100", "out_dim=" + std::to_string(MODEL_DIM)});
+  LayerHandle wte =
+    createLayer("embedding", {"name=wte", "in_dim=100",
+                              "out_dim=" + std::to_string(MODEL_DIM)});
+  LayerHandle wpe =
+    createLayer("embedding", {"name=wpe", "in_dim=100",
+                              "out_dim=" + std::to_string(MODEL_DIM)});
   auto wte_out = wte(wte_in);
   auto wpe_out = wpe(wpe_in);
 
@@ -909,13 +912,13 @@ TEST(nntrainer_ccapi_graph, picogpt_style_transformer_p) {
 
   // Single transformer block
   LayerHandle ln1 = createLayer("layer_normalization",
-    {"name=layer0/ln1", "axis=3", "epsilon=1e-5"});
+                                {"name=layer0/ln1", "axis=3", "epsilon=1e-5"});
   auto ln1_out = ln1(prev);
 
   // MHA with same tensor as Q, K, V (fan-out test)
   LayerHandle mha = createLayer("multi_head_attention",
-    {"name=layer0/multi_head_attention",
-     "num_heads=" + std::to_string(NUM_HEADS)});
+                                {"name=layer0/multi_head_attention",
+                                 "num_heads=" + std::to_string(NUM_HEADS)});
   auto attn_out = mha({ln1_out, ln1_out, ln1_out});
 
   // Skip connection 1: prev + attn_out (prev used twice = fan-out)
@@ -923,23 +926,26 @@ TEST(nntrainer_ccapi_graph, picogpt_style_transformer_p) {
   auto add1_out = add1({prev, attn_out});
 
   LayerHandle ln2 = createLayer("layer_normalization",
-    {"name=layer0/ln2", "axis=3", "epsilon=1e-5"});
+                                {"name=layer0/ln2", "axis=3", "epsilon=1e-5"});
   auto ln2_out = ln2(add1_out);
 
-  LayerHandle fc1 = createLayer("fully_connected",
+  LayerHandle fc1 = createLayer(
+    "fully_connected",
     {"name=layer0/fc1", "unit=" + std::to_string(FF_DIM), "activation=gelu"});
   auto fc1_out = fc1(ln2_out);
 
-  LayerHandle fc2 = createLayer("fully_connected",
-    {"name=layer0/fc2", "unit=" + std::to_string(MODEL_DIM)});
+  LayerHandle fc2 =
+    createLayer("fully_connected",
+                {"name=layer0/fc2", "unit=" + std::to_string(MODEL_DIM)});
   auto fc2_out = fc2(fc1_out);
 
   // Skip connection 2: add1_out + fc2_out (add1_out used twice = fan-out)
   LayerHandle add2 = createLayer("Addition", {"name=layer0/add2"});
   auto block_out = add2({add1_out, fc2_out});
 
-  LayerHandle final_ln = createLayer("layer_normalization",
-    {"name=layer_normalization", "axis=3", "epsilon=1e-5"});
+  LayerHandle final_ln =
+    createLayer("layer_normalization",
+                {"name=layer_normalization", "axis=3", "epsilon=1e-5"});
   auto output = final_ln(block_out);
 
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
@@ -964,10 +970,12 @@ TEST(nntrainer_ccapi_graph, picogpt_style_inference_p) {
   Tensor wte_in({1, 1, 1, 1}, "wte_input");
   Tensor wpe_in({1, 1, 1, 1}, "wpe_input");
 
-  LayerHandle wte = createLayer("embedding",
-    {"name=wte", "in_dim=50", "out_dim=" + std::to_string(MODEL_DIM)});
-  LayerHandle wpe = createLayer("embedding",
-    {"name=wpe", "in_dim=50", "out_dim=" + std::to_string(MODEL_DIM)});
+  LayerHandle wte =
+    createLayer("embedding", {"name=wte", "in_dim=50",
+                              "out_dim=" + std::to_string(MODEL_DIM)});
+  LayerHandle wpe =
+    createLayer("embedding", {"name=wpe", "in_dim=50",
+                              "out_dim=" + std::to_string(MODEL_DIM)});
   auto wte_out = wte(wte_in);
   auto wpe_out = wpe(wpe_in);
 
@@ -976,33 +984,36 @@ TEST(nntrainer_ccapi_graph, picogpt_style_inference_p) {
 
   // 1 transformer block
   LayerHandle ln1 = createLayer("layer_normalization",
-    {"name=layer0/ln1", "axis=3", "epsilon=1e-5"});
+                                {"name=layer0/ln1", "axis=3", "epsilon=1e-5"});
   auto ln1_out = ln1(prev);
 
-  LayerHandle mha = createLayer("multi_head_attention",
-    {"name=layer0/mha", "num_heads=" + std::to_string(NUM_HEADS)});
+  LayerHandle mha =
+    createLayer("multi_head_attention",
+                {"name=layer0/mha", "num_heads=" + std::to_string(NUM_HEADS)});
   auto attn_out = mha({ln1_out, ln1_out, ln1_out});
 
   LayerHandle add1 = createLayer("Addition", {"name=layer0/add1"});
   auto add1_out = add1({prev, attn_out});
 
   LayerHandle ln2 = createLayer("layer_normalization",
-    {"name=layer0/ln2", "axis=3", "epsilon=1e-5"});
+                                {"name=layer0/ln2", "axis=3", "epsilon=1e-5"});
   auto ln2_out = ln2(add1_out);
 
-  LayerHandle fc1 = createLayer("fully_connected",
+  LayerHandle fc1 = createLayer(
+    "fully_connected",
     {"name=layer0/fc1", "unit=" + std::to_string(FF_DIM), "activation=gelu"});
   auto fc1_out = fc1(ln2_out);
 
-  LayerHandle fc2 = createLayer("fully_connected",
-    {"name=layer0/fc2", "unit=" + std::to_string(MODEL_DIM)});
+  LayerHandle fc2 =
+    createLayer("fully_connected",
+                {"name=layer0/fc2", "unit=" + std::to_string(MODEL_DIM)});
   auto fc2_out = fc2(fc1_out);
 
   LayerHandle add2 = createLayer("Addition", {"name=layer0/add2"});
   auto block_out = add2({add1_out, fc2_out});
 
-  LayerHandle final_ln = createLayer("layer_normalization",
-    {"name=final_ln", "axis=3", "epsilon=1e-5"});
+  LayerHandle final_ln = createLayer(
+    "layer_normalization", {"name=final_ln", "axis=3", "epsilon=1e-5"});
   auto output = final_ln(block_out);
 
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
@@ -1016,8 +1027,8 @@ TEST(nntrainer_ccapi_graph, picogpt_style_inference_p) {
   std::memcpy(wpe_input_data, &wpe_token, sizeof(unsigned int));
 
   std::vector<float *> output_bufs;
-  EXPECT_NO_THROW(
-    output_bufs = model->inference(1, {wte_input_data, wpe_input_data}));
+  EXPECT_NO_THROW(output_bufs =
+                    model->inference(1, {wte_input_data, wpe_input_data}));
   EXPECT_FALSE(output_bufs.empty());
 }
 
@@ -1374,24 +1385,21 @@ TEST(nntrainer_ccapi_graph, causallm_style_multi_input_p) {
     std::string prefix = "layer" + std::to_string(layer_id);
 
     // Attention norm
-    LayerHandle att_norm = createLayer(
-      "layer_normalization",
-      {"name=" + prefix + "_att_norm", "axis=3", "epsilon=1e-5"});
+    LayerHandle att_norm =
+      createLayer("layer_normalization",
+                  {"name=" + prefix + "_att_norm", "axis=3", "epsilon=1e-5"});
     Tensor normed = att_norm(x);
 
     // Q/K/V projections (self-attention: all from same normed input)
     LayerHandle q_proj = createLayer(
-      "fully_connected",
-      {"name=" + prefix + "_wq", "unit=" + std::to_string(DIM),
-       "disable_bias=true"});
+      "fully_connected", {"name=" + prefix + "_wq",
+                          "unit=" + std::to_string(DIM), "disable_bias=true"});
     LayerHandle k_proj = createLayer(
-      "fully_connected",
-      {"name=" + prefix + "_wk", "unit=" + std::to_string(DIM),
-       "disable_bias=true"});
+      "fully_connected", {"name=" + prefix + "_wk",
+                          "unit=" + std::to_string(DIM), "disable_bias=true"});
     LayerHandle v_proj = createLayer(
-      "fully_connected",
-      {"name=" + prefix + "_wv", "unit=" + std::to_string(DIM),
-       "disable_bias=true"});
+      "fully_connected", {"name=" + prefix + "_wv",
+                          "unit=" + std::to_string(DIM), "disable_bias=true"});
     Tensor q = q_proj(normed);
     Tensor k = k_proj(normed);
     Tensor v = v_proj(normed);
@@ -1402,29 +1410,28 @@ TEST(nntrainer_ccapi_graph, causallm_style_multi_input_p) {
     Tensor combined = qkv_combine({q, k, v});
 
     LayerHandle o_proj = createLayer(
-      "fully_connected",
-      {"name=" + prefix + "_wo", "unit=" + std::to_string(DIM),
-       "disable_bias=true"});
+      "fully_connected", {"name=" + prefix + "_wo",
+                          "unit=" + std::to_string(DIM), "disable_bias=true"});
     Tensor att_out = o_proj(combined);
 
     // Residual add (Tensor::add creates implicit Addition layer)
     Tensor residual = x.add(att_out);
 
     // FFN norm
-    LayerHandle ffn_norm = createLayer(
-      "layer_normalization",
-      {"name=" + prefix + "_ffn_norm", "axis=3", "epsilon=1e-5"});
+    LayerHandle ffn_norm =
+      createLayer("layer_normalization",
+                  {"name=" + prefix + "_ffn_norm", "axis=3", "epsilon=1e-5"});
     Tensor ffn_normed = ffn_norm(residual);
 
     // MLP: up → gate → multiply → down
-    LayerHandle ffn_up = createLayer(
-      "fully_connected",
-      {"name=" + prefix + "_ffn_up", "unit=" + std::to_string(FF_DIM),
-       "disable_bias=true"});
-    LayerHandle ffn_gate = createLayer(
-      "fully_connected",
-      {"name=" + prefix + "_ffn_gate", "unit=" + std::to_string(FF_DIM),
-       "disable_bias=true"});
+    LayerHandle ffn_up =
+      createLayer("fully_connected",
+                  {"name=" + prefix + "_ffn_up",
+                   "unit=" + std::to_string(FF_DIM), "disable_bias=true"});
+    LayerHandle ffn_gate =
+      createLayer("fully_connected",
+                  {"name=" + prefix + "_ffn_gate",
+                   "unit=" + std::to_string(FF_DIM), "disable_bias=true"});
     Tensor up = ffn_up(ffn_normed);
     Tensor gate = ffn_gate(ffn_normed);
 
@@ -1432,9 +1439,8 @@ TEST(nntrainer_ccapi_graph, causallm_style_multi_input_p) {
     Tensor activated = up.multiply(gate);
 
     LayerHandle ffn_down = createLayer(
-      "fully_connected",
-      {"name=" + prefix + "_ffn_down", "unit=" + std::to_string(DIM),
-       "disable_bias=true"});
+      "fully_connected", {"name=" + prefix + "_ffn_down",
+                          "unit=" + std::to_string(DIM), "disable_bias=true"});
     Tensor ffn_out = ffn_down(activated);
 
     // Residual add
@@ -1447,10 +1453,10 @@ TEST(nntrainer_ccapi_graph, causallm_style_multi_input_p) {
   x = output_norm(x);
 
   // --- LM Head ---
-  LayerHandle lmhead = createLayer(
-    "fully_connected",
-    {"name=output_of_causallm", "unit=" + std::to_string(VOCAB_SIZE),
-     "disable_bias=true"});
+  LayerHandle lmhead =
+    createLayer("fully_connected",
+                {"name=output_of_causallm",
+                 "unit=" + std::to_string(VOCAB_SIZE), "disable_bias=true"});
   Tensor output = lmhead(x);
 
   // --- Compile from symbolic tensor graph (includes initialize) ---

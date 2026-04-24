@@ -34,8 +34,8 @@ Tensor Tensor::subtract(float value) const {
 }
 
 Tensor Tensor::subtract(const Tensor &other) const {
-  auto r = asInternal(getInternalPtr())->subtract(
-    *asInternal(other.getInternalPtr()));
+  auto r =
+    asInternal(getInternalPtr())->subtract(*asInternal(other.getInternalPtr()));
   return wrapResult(&r);
 }
 
@@ -50,14 +50,14 @@ Tensor Tensor::divide(float value) const {
 }
 
 Tensor Tensor::divide(const Tensor &other) const {
-  auto r = asInternal(getInternalPtr())->divide(
-    *asInternal(other.getInternalPtr()));
+  auto r =
+    asInternal(getInternalPtr())->divide(*asInternal(other.getInternalPtr()));
   return wrapResult(&r);
 }
 
 Tensor Tensor::dot(const Tensor &other, bool trans, bool trans_in) const {
-  auto r = asInternal(getInternalPtr())->dot(
-    *asInternal(other.getInternalPtr()), trans, trans_in);
+  auto r = asInternal(getInternalPtr())
+             ->dot(*asInternal(other.getInternalPtr()), trans, trans_in);
   return wrapResult(&r);
 }
 
@@ -86,9 +86,7 @@ Tensor Tensor::average() const {
   return wrapResult(&r);
 }
 
-float Tensor::l2norm() const {
-  return asInternal(getInternalPtr())->l2norm();
-}
+float Tensor::l2norm() const { return asInternal(getInternalPtr())->l2norm(); }
 
 std::vector<unsigned int> Tensor::argmax() const {
   return asInternal(getInternalPtr())->argmax();
@@ -101,8 +99,7 @@ Tensor Tensor::getBatchSlice(unsigned int offset, unsigned int size) const {
   return wrapResult(&r);
 }
 
-Tensor Tensor::getSharedDataTensor(const TensorDim &dim,
-                                    size_t offset) const {
+Tensor Tensor::getSharedDataTensor(const TensorDim &dim, size_t offset) const {
   auto r =
     asInternal(getInternalPtr())->getSharedDataTensor(dim, offset, false);
   return wrapResult(&r);

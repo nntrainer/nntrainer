@@ -105,6 +105,9 @@ bool getData(std::ifstream &F, float *input, float *label, unsigned int id) {
   return true;
 }
 
+/**
+ * @brief Per-dataset bookkeeping for random sample ordering.
+ */
 class DataInformation {
 public:
   DataInformation(unsigned int num_samples, const std::string &filename);
@@ -165,27 +168,27 @@ static std::pair<ml::train::Tensor, ml::train::Tensor> buildGraph() {
 
   auto x = Tensor({1, 1, 28, 28}, "inputlayer");
 
-  LayerHandle conv1(createLayer(
-    "conv2d", {"name=conv2d_c1_layer", "kernel_size=5,5",
-               "bias_initializer=zeros", "activation=sigmoid",
-               "weight_initializer=xavier_uniform", "filters=6",
-               "stride=1,1", "padding=0,0"}));
-  LayerHandle pool1(createLayer(
-    "pooling2d", {"name=pooling2d_p1", "pool_size=2,2", "stride=2,2",
-                  "padding=0,0", "pooling=average"}));
-  LayerHandle conv2(createLayer(
-    "conv2d", {"name=conv2d_c2_layer", "kernel_size=5,5",
-               "bias_initializer=zeros", "activation=sigmoid",
-               "weight_initializer=xavier_uniform", "filters=12",
-               "stride=1,1", "padding=0,0"}));
-  LayerHandle pool2(createLayer(
-    "pooling2d", {"name=pooling2d_p2", "pool_size=2,2", "stride=2,2",
-                  "padding=0,0", "pooling=average"}));
+  LayerHandle conv1(
+    createLayer("conv2d", {"name=conv2d_c1_layer", "kernel_size=5,5",
+                           "bias_initializer=zeros", "activation=sigmoid",
+                           "weight_initializer=xavier_uniform", "filters=6",
+                           "stride=1,1", "padding=0,0"}));
+  LayerHandle pool1(
+    createLayer("pooling2d", {"name=pooling2d_p1", "pool_size=2,2",
+                              "stride=2,2", "padding=0,0", "pooling=average"}));
+  LayerHandle conv2(
+    createLayer("conv2d", {"name=conv2d_c2_layer", "kernel_size=5,5",
+                           "bias_initializer=zeros", "activation=sigmoid",
+                           "weight_initializer=xavier_uniform", "filters=12",
+                           "stride=1,1", "padding=0,0"}));
+  LayerHandle pool2(
+    createLayer("pooling2d", {"name=pooling2d_p2", "pool_size=2,2",
+                              "stride=2,2", "padding=0,0", "pooling=average"}));
   LayerHandle flat(createLayer("flatten", {"name=flatten"}));
-  LayerHandle fc(createLayer(
-    "fully_connected", {"name=outputlayer", "unit=10",
-                        "weight_initializer=xavier_uniform",
-                        "bias_initializer=zeros", "activation=softmax"}));
+  LayerHandle fc(createLayer("fully_connected",
+                             {"name=outputlayer", "unit=10",
+                              "weight_initializer=xavier_uniform",
+                              "bias_initializer=zeros", "activation=softmax"}));
 
   auto h = conv1(x);
   h = pool1(h);
@@ -238,10 +241,10 @@ int main(int argc, char *argv[]) {
 
   std::shared_ptr<ml::train::Dataset> dataset_train, dataset_val;
   try {
-    dataset_train = ml::train::createDataset(
-      ml::train::DatasetType::GENERATOR, getSample, train_user_data.get());
-    dataset_val = ml::train::createDataset(
-      ml::train::DatasetType::GENERATOR, getSample, valid_user_data.get());
+    dataset_train = ml::train::createDataset(ml::train::DatasetType::GENERATOR,
+                                             getSample, train_user_data.get());
+    dataset_val = ml::train::createDataset(ml::train::DatasetType::GENERATOR,
+                                           getSample, valid_user_data.get());
   } catch (const std::exception &e) {
     std::cerr << "Error creating dataset" << e.what() << std::endl;
     return 1;
@@ -250,9 +253,9 @@ int main(int argc, char *argv[]) {
   // Build symbolic graph
   auto [x, y] = buildGraph();
 
-  auto model = ml::train::createModel(ml::train::ModelType::NEURAL_NET,
-                                      {"epochs=1500", "loss=cross",
-                                       "batch_size=32"});
+  auto model =
+    ml::train::createModel(ml::train::ModelType::NEURAL_NET,
+                           {"epochs=1500", "loss=cross", "batch_size=32"});
 
   try {
     auto optimizer = ml::train::createOptimizer("adam");

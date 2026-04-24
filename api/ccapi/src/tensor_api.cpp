@@ -37,11 +37,13 @@ Tensor::Tensor(Tensor &&rhs) noexcept = default;
 Tensor &Tensor::operator=(Tensor &&rhs) noexcept = default;
 
 Tensor::Tensor(const Tensor &rhs) :
-  impl_(rhs.impl_ ? std::make_unique<Impl>(*rhs.impl_) : std::make_unique<Impl>()) {}
+  impl_(rhs.impl_ ? std::make_unique<Impl>(*rhs.impl_)
+                  : std::make_unique<Impl>()) {}
 
 Tensor &Tensor::operator=(const Tensor &rhs) {
   if (this != &rhs) {
-    impl_ = rhs.impl_ ? std::make_unique<Impl>(*rhs.impl_) : std::make_unique<Impl>();
+    impl_ =
+      rhs.impl_ ? std::make_unique<Impl>(*rhs.impl_) : std::make_unique<Impl>();
   }
   return *this;
 }
@@ -60,9 +62,7 @@ Tensor Tensor::clone() const {
 
 // --- Accessors ---
 
-bool Tensor::isValid() const {
-  return impl_ && impl_->valid;
-}
+bool Tensor::isValid() const { return impl_ && impl_->valid; }
 
 const TensorDim &Tensor::shape() const {
   if (!impl_ || !impl_->valid) {
@@ -87,12 +87,11 @@ TensorDim::DataType Tensor::dtype() const {
 
 // --- State queries ---
 
-bool Tensor::isExternal() const {
-  return impl_ && impl_->external;
-}
+bool Tensor::isExternal() const { return impl_ && impl_->external; }
 
 bool Tensor::isMaterialized() const {
-  return impl_ && (impl_->eager_data != nullptr || impl_->bound_tensor != nullptr);
+  return impl_ &&
+         (impl_->eager_data != nullptr || impl_->bound_tensor != nullptr);
 }
 
 // --- Data access ---
@@ -182,10 +181,9 @@ void Tensor::setData(void *new_ptr) {
     throw std::invalid_argument("setData: pointer must not be null");
   }
   impl_->external_ptr = new_ptr;
-  impl_->eager_data->setData(
-    std::make_shared<nntrainer::MemoryData>(new_ptr), 0, false);
+  impl_->eager_data->setData(std::make_shared<nntrainer::MemoryData>(new_ptr),
+                             0, false);
 }
-
 
 // --- Private helpers ---
 
@@ -206,27 +204,20 @@ Tensor Tensor::wrapResult(const void *internal_tensor) {
   result.impl_->dim = internal.getDim();
   result.impl_->valid = true;
   result.impl_->external = false;
-  result.impl_->eager_data =
-    std::make_shared<nntrainer::Tensor>(internal);
+  result.impl_->eager_data = std::make_shared<nntrainer::Tensor>(internal);
   return result;
 }
 
-
-
 // --- Immediate in-place operations ---
 
-void Tensor::setZero() {
-  asInternal(getInternalPtr())->setZero();
-}
+void Tensor::setZero() { asInternal(getInternalPtr())->setZero(); }
 
 void Tensor::fill(const Tensor &from) {
-  asInternal(getInternalPtr())->fill(
-    *asInternal(from.getInternalPtr()));
+  asInternal(getInternalPtr())->fill(*asInternal(from.getInternalPtr()));
 }
 
 void Tensor::copyData(const Tensor &from) {
-  asInternal(getInternalPtr())->copyData(
-    *asInternal(from.getInternalPtr()));
+  asInternal(getInternalPtr())->copyData(*asInternal(from.getInternalPtr()));
 }
 
 // --- Convenience dimension accessors ---
@@ -242,21 +233,13 @@ bool Tensor::empty() const {
   return !impl_ || !impl_->valid || impl_->dim.getDataLen() == 0;
 }
 
-size_t Tensor::batch() const {
-  return shape().batch();
-}
+size_t Tensor::batch() const { return shape().batch(); }
 
-size_t Tensor::channel() const {
-  return shape().channel();
-}
+size_t Tensor::channel() const { return shape().channel(); }
 
-size_t Tensor::height() const {
-  return shape().height();
-}
+size_t Tensor::height() const { return shape().height(); }
 
-size_t Tensor::width() const {
-  return shape().width();
-}
+size_t Tensor::width() const { return shape().width(); }
 
 // --- Factory methods ---
 
@@ -272,10 +255,9 @@ Tensor Tensor::fromData(const TensorDim &dim, void *data,
   t.impl_->external = true;
   t.impl_->external_ptr = data;
   // Create internal tensor structure, then point to external memory (zero-copy)
-  t.impl_->eager_data =
-    std::make_shared<nntrainer::Tensor>(dim, true);
-  t.impl_->eager_data->setData(
-    std::make_shared<nntrainer::MemoryData>(data), 0, false);
+  t.impl_->eager_data = std::make_shared<nntrainer::Tensor>(dim, true);
+  t.impl_->eager_data->setData(std::make_shared<nntrainer::MemoryData>(data), 0,
+                               false);
   return t;
 }
 
@@ -285,8 +267,8 @@ Tensor Tensor::zeros(const TensorDim &dim, const std::string &name) {
   t.impl_->name = name;
   t.impl_->valid = true;
   t.impl_->external = false;
-  t.impl_->eager_data =
-    std::make_shared<nntrainer::Tensor>(dim, true, nntrainer::Initializer::ZEROS, name);
+  t.impl_->eager_data = std::make_shared<nntrainer::Tensor>(
+    dim, true, nntrainer::Initializer::ZEROS, name);
   t.impl_->eager_data->initialize();
   return t;
 }
@@ -297,8 +279,8 @@ Tensor Tensor::ones(const TensorDim &dim, const std::string &name) {
   t.impl_->name = name;
   t.impl_->valid = true;
   t.impl_->external = false;
-  t.impl_->eager_data =
-    std::make_shared<nntrainer::Tensor>(dim, true, nntrainer::Initializer::ONES, name);
+  t.impl_->eager_data = std::make_shared<nntrainer::Tensor>(
+    dim, true, nntrainer::Initializer::ONES, name);
   t.impl_->eager_data->initialize();
   return t;
 }
@@ -317,4 +299,3 @@ std::shared_ptr<Layer> Tensor::getSrcLayer() const {
 
 } // namespace train
 } // namespace ml
-

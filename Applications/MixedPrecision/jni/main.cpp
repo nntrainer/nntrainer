@@ -52,19 +52,18 @@ std::pair<Tensor, Tensor> buildGraph() {
      nntrainer::withKey("weight_initializer", "xavier_uniform")}));
   auto h = conv0(x);
 
-  LayerHandle bn_relu(createLayer(
-    "batch_normalization",
-    {nntrainer::withKey("name", "first_bn_relu"),
-     nntrainer::withKey("activation", "relu"),
-     nntrainer::withKey("momentum", "0.9"),
-     nntrainer::withKey("epsilon", "0.00001")}));
+  LayerHandle bn_relu(createLayer("batch_normalization",
+                                  {nntrainer::withKey("name", "first_bn_relu"),
+                                   nntrainer::withKey("activation", "relu"),
+                                   nntrainer::withKey("momentum", "0.9"),
+                                   nntrainer::withKey("epsilon", "0.00001")}));
   h = bn_relu(h);
 
-  LayerHandle pool(createLayer(
-    "pooling2d", {nntrainer::withKey("name", "last_p1"),
-                  nntrainer::withKey("pooling", "average"),
-                  nntrainer::withKey("pool_size", {4, 4}),
-                  nntrainer::withKey("stride", "4,4")}));
+  LayerHandle pool(
+    createLayer("pooling2d", {nntrainer::withKey("name", "last_p1"),
+                              nntrainer::withKey("pooling", "average"),
+                              nntrainer::withKey("pool_size", {4, 4}),
+                              nntrainer::withKey("stride", "4,4")}));
   h = pool(h);
 
   LayerHandle flatten(

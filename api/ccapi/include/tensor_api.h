@@ -19,12 +19,12 @@
 #error "CPP versions c++17 or over are only supported"
 #endif // __cpluscplus
 
-#include <layer.h>
 #include <functional>
+#include <layer.h>
 #include <memory>
 #include <string>
-#include <vector>
 #include <tensor_dim.h>
+#include <vector>
 
 namespace ml {
 namespace train {
@@ -167,8 +167,8 @@ public:
    * @param value value to set
    * @throws std::runtime_error if tensor is not materialized
    */
-  void setValue(unsigned int b, unsigned int c, unsigned int h,
-                unsigned int w, float value);
+  void setValue(unsigned int b, unsigned int c, unsigned int h, unsigned int w,
+                float value);
 
   /**
    * @brief Copy data from external buffer into this tensor
@@ -195,7 +195,7 @@ public:
    * @return Tensor wrapping the external buffer
    */
   static Tensor fromData(const TensorDim &dim, void *data,
-                          const std::string &name = "");
+                         const std::string &name = "");
 
   /**
    * @brief Create a zero-initialized eager tensor

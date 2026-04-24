@@ -40,13 +40,13 @@ std::pair<std::vector<Tensor>, Tensor> buildMultiInputGraph() {
   auto input1 = Tensor({1, 1, 4, 2}, "input1");
   auto input2 = Tensor({1, 1, 8, 2}, "input2");
 
-  LayerHandle concat(createLayer(
-    "concat", {nntrainer::withKey("name", "concat0"),
-               nntrainer::withKey("axis", "2")}));
+  LayerHandle concat(
+    createLayer("concat", {nntrainer::withKey("name", "concat0"),
+                           nntrainer::withKey("axis", "2")}));
   auto h = concat({input0, input1, input2});
 
-  LayerHandle flatten(createLayer(
-    "flatten", {nntrainer::withKey("name", "flatten0")}));
+  LayerHandle flatten(
+    createLayer("flatten", {nntrainer::withKey("name", "flatten0")}));
   h = flatten(h);
 
   LayerHandle fc(createLayer("fully_connected",

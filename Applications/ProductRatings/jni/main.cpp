@@ -9,10 +9,11 @@
  * @bug    No known bugs except for NYI items
  * @brief  Product ratings recommendation system using the ccapi Tensor API.
  *
- *         Training set (embedding_input.txt): 3 columns (user_id product_id rating)
- *         Model: split → dual embedding → concat → FC(128) → FC(32) → FC(1)
+ *         Training set (embedding_input.txt): 3 columns (user_id product_id
+ * rating) Model: split → dual embedding → concat → FC(128) → FC(32) → FC(1)
  */
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -20,14 +21,14 @@
 #include <random>
 #include <sstream>
 
-#include <model.h>
 #include <dataset.h>
+#include <model.h>
 #include <optimizer.h>
 #include <tensor_api.h>
 
+using ml::train::createDataset;
 using ml::train::createLayer;
 using ml::train::createModel;
-using ml::train::createDataset;
 using ml::train::createOptimizer;
 using ml::train::LayerHandle;
 using ml::train::Tensor;
@@ -122,13 +123,13 @@ static std::pair<Tensor, Tensor> buildGraph() {
   auto product_id = split_out.output(1);
 
   // user embedding: vocab=6, dim=5
-  LayerHandle user_embed(createLayer(
-    "embedding", {"name=user_embed", "in_dim=6", "out_dim=5"}));
+  LayerHandle user_embed(
+    createLayer("embedding", {"name=user_embed", "in_dim=6", "out_dim=5"}));
   auto user_emb = user_embed(user_id);
 
   // product embedding: vocab=6, dim=5
-  LayerHandle product_embed(createLayer(
-    "embedding", {"name=product_embed", "in_dim=6", "out_dim=5"}));
+  LayerHandle product_embed(
+    createLayer("embedding", {"name=product_embed", "in_dim=6", "out_dim=5"}));
   auto prod_emb = product_embed(product_id);
 
   // concat user + product embeddings
@@ -140,19 +141,19 @@ static std::pair<Tensor, Tensor> buildGraph() {
   h = flatten(h);
 
   // fc1: 128 units, relu
-  LayerHandle fc1(createLayer(
-    "fully_connected", {"name=fc1", "unit=128", "activation=relu"}));
+  LayerHandle fc1(createLayer("fully_connected",
+                              {"name=fc1", "unit=128", "activation=relu"}));
   h = fc1(h);
 
   // fc2: 32 units, relu
-  LayerHandle fc2(createLayer(
-    "fully_connected", {"name=fc2", "unit=32", "activation=relu"}));
+  LayerHandle fc2(
+    createLayer("fully_connected", {"name=fc2", "unit=32", "activation=relu"}));
   h = fc2(h);
 
   // output: 1 unit
-  LayerHandle output_fc(createLayer(
-    "fully_connected",
-    {"name=outputlayer", "unit=1", "bias_initializer=zeros"}));
+  LayerHandle output_fc(
+    createLayer("fully_connected",
+                {"name=outputlayer", "unit=1", "bias_initializer=zeros"}));
   auto y = output_fc(h);
 
   return {x, y};
@@ -169,8 +170,7 @@ static std::pair<Tensor, Tensor> buildGraph() {
  */
 int main(int argc, char *argv[]) {
   if (argc < 3) {
-    std::cout
-      << "./nntrainer_product_ratings train (| inference) data.txt\n";
+    std::cout << "./nntrainer_product_ratings train (| inference) data.txt\n";
     exit(1);
   }
 
@@ -192,9 +192,9 @@ int main(int argc, char *argv[]) {
     auto model = createModel(ml::train::ModelType::NEURAL_NET,
                              {"epochs=100", "loss=mse", "batch_size=20"});
 
-    auto optimizer = createOptimizer(
-      "adam", {"learning_rate=0.001", "beta1=0.9", "beta2=0.999",
-               "epsilon=1e-7"});
+    auto optimizer =
+      createOptimizer("adam", {"learning_rate=0.001", "beta1=0.9",
+                               "beta2=0.999", "epsilon=1e-7"});
     model->setOptimizer(std::move(optimizer));
 
     auto status = model->compile(x, y, ml::train::ExecutionMode::TRAIN);
@@ -235,8 +235,7 @@ int main(int argc, char *argv[]) {
           }
         }
 
-        auto fc_golden =
-          ml::train::Tensor::zeros({1, 1, 32, 1}, "fc_golden");
+        auto fc_golden = ml::train::Tensor::zeros({1, 1, 32, 1}, "fc_golden");
         {
           std::ifstream file("fc_weight_golden.out");
           if (file.good()) {
@@ -246,10 +245,10 @@ int main(int argc, char *argv[]) {
           }
         }
 
-        std::cout << "Embedding golden weights loaded ("
-                  << embed_golden.size() << " elements)\n";
-        std::cout << "FC golden weights loaded ("
-                  << fc_golden.size() << " elements)\n";
+        std::cout << "Embedding golden weights loaded (" << embed_golden.size()
+                  << " elements)\n";
+        std::cout << "FC golden weights loaded (" << fc_golden.size()
+                  << " elements)\n";
       } catch (...) {
         std::cerr << "Warning: during loading golden data\n";
       }
@@ -264,16 +263,15 @@ int main(int argc, char *argv[]) {
         getData(dataFile, o.data(), l.data(), j);
 
         // Wrap input data as ml::train::Tensor for inference
-        auto input_tensor =
-          ml::train::Tensor::fromData({1, 1, 1, feature_size}, o.data(),
-                                      "inference_input");
+        auto input_tensor = ml::train::Tensor::fromData(
+          {1, 1, 1, feature_size}, o.data(), "inference_input");
 
-        auto results = model->inference(
-          1, {input_tensor.mutable_data<float>()}, {});
+        auto results =
+          model->inference(1, {input_tensor.mutable_data<float>()}, {});
 
         // Wrap output and apply step function
         auto output = ml::train::Tensor::fromData({1, 1, 1, 1}, results[0],
-                                                   "inference_output");
+                                                  "inference_output");
         float answer = stepFunction(output.getValue(0, 0, 0, 0));
 
         std::cout << answer << " : " << l[0] << std::endl;
