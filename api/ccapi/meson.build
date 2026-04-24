@@ -8,6 +8,10 @@ ccapi_inc_abs = [
 
 ccapi_src = []
 ccapi_src += meson.current_source_dir() / 'src' / 'factory.cpp'
+ccapi_src += meson.current_source_dir() / 'src' / 'tensor_api.cpp'
+ccapi_src += meson.current_source_dir() / 'src' / 'tensor_api_lazy.cpp'
+ccapi_src += meson.current_source_dir() / 'src' / 'tensor_api_ops.cpp'
+ccapi_src += meson.current_source_dir() / 'src' / 'tensor_api_graph.cpp'
 
 ccapi_headers = []
 ccapi_headers += meson.current_source_dir() / 'include' / 'common.h'
