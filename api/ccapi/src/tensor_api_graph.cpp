@@ -467,11 +467,19 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
     if (!output_producer)
       continue;
     std::string output_layer_name = output_producer->getName();
+    // Respect the per-output index chosen by Tensor::output(i). For tensors
+    // produced by calling the layer directly (non-indexed), the index stays
+    // at -1 and we fall back to output 0.
+    int out_idx = (output.impl_ && output.impl_->graph_edge &&
+                   output.impl_->graph_edge->output_index >= 0)
+                    ? output.impl_->graph_edge->output_index
+                    : 0;
     TensorDim out_dim;
     forEachLayer(
       [&](Layer &layer, nntrainer::RunLayerContext &rc, void *) {
-        if (layer.getName() == output_layer_name && rc.getNumOutputs() > 0) {
-          out_dim = rc.getOutput(0).getDim();
+        if (layer.getName() == output_layer_name &&
+            rc.getNumOutputs() > static_cast<unsigned int>(out_idx)) {
+          out_dim = rc.getOutput(out_idx).getDim();
         }
       },
       nullptr);

@@ -157,7 +157,7 @@ public:
    * @retval #ML_ERROR_NONE Successful.
    */
   int compile(Tensor &input, Tensor &output,
-              ExecutionMode mode = ExecutionMode::INFERENCE);
+              ExecutionMode mode = ExecutionMode::TRAIN);
 
   /**
    * @brief     Compile from symbolic tensor graph with multiple outputs.
@@ -172,7 +172,7 @@ public:
    * @retval #ML_ERROR_NONE Successful.
    */
   int compile(Tensor &input, std::vector<Tensor> &outputs,
-              ExecutionMode mode = ExecutionMode::INFERENCE);
+              ExecutionMode mode = ExecutionMode::TRAIN);
 
   /**
    * @brief     Compile from symbolic tensor graph with multiple inputs and
@@ -188,7 +188,7 @@ public:
    * @retval #ML_ERROR_NONE Successful.
    */
   int compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
-              ExecutionMode mode = ExecutionMode::INFERENCE);
+              ExecutionMode mode = ExecutionMode::TRAIN);
 
   /**
    * @brief     Initialize Network. This should be called after setting the

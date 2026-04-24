@@ -115,7 +115,7 @@ void createAndRun(unsigned int epochs, unsigned int batch_size,
     throw std::invalid_argument("failed to set optimizer!");
   }
 
-  status = model->compile(x, y);
+  status = model->compile(x, y, ml::train::ExecutionMode::INFERENCE);
   if (status) {
     throw std::invalid_argument("model compilation failed!");
   }

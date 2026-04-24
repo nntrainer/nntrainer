@@ -670,7 +670,8 @@ TEST(nntrainer_ccapi_graph, simple_fc_compile_p) {
   auto y = fc(x);
 
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
-  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+  EXPECT_EQ(model->compile(x, y, ml::train::ExecutionMode::INFERENCE),
+            ML_ERROR_NONE);
 }
 
 /**
@@ -689,7 +690,8 @@ TEST(nntrainer_ccapi_graph, multi_layer_compile_p) {
   auto y = fc2(h);
 
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
-  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+  EXPECT_EQ(model->compile(x, y, ml::train::ExecutionMode::INFERENCE),
+            ML_ERROR_NONE);
 }
 
 /**
@@ -706,7 +708,8 @@ TEST(nntrainer_ccapi_graph, residual_compile_p) {
   auto y = fc_out(out);
 
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
-  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+  EXPECT_EQ(model->compile(x, y, ml::train::ExecutionMode::INFERENCE),
+            ML_ERROR_NONE);
 }
 
 /**
@@ -733,7 +736,8 @@ TEST(nntrainer_ccapi_graph, data_injection_after_compile_p) {
   auto y = fc(x);
 
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
-  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+  EXPECT_EQ(model->compile(x, y, ml::train::ExecutionMode::INFERENCE),
+            ML_ERROR_NONE);
 
   // After compile (which includes initialize + bind), x is materialized
   EXPECT_TRUE(x.isMaterialized());
@@ -756,7 +760,8 @@ TEST(nntrainer_ccapi_graph, set_get_value_bound_p) {
   auto y = fc(x);
 
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
-  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+  EXPECT_EQ(model->compile(x, y, ml::train::ExecutionMode::INFERENCE),
+            ML_ERROR_NONE);
 
   x.setValue(0, 0, 0, 0, 42.0f);
   EXPECT_FLOAT_EQ(x.getValue(0, 0, 0, 0), 42.0f);
@@ -795,7 +800,8 @@ TEST(nntrainer_ccapi_graph, multi_layer_bind_p) {
   auto y = fc2(h);
 
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
-  EXPECT_EQ(model->compile(x, y), ML_ERROR_NONE);
+  EXPECT_EQ(model->compile(x, y, ml::train::ExecutionMode::INFERENCE),
+            ML_ERROR_NONE);
 
   EXPECT_TRUE(x.isMaterialized());
   EXPECT_TRUE(y.isMaterialized());
@@ -874,7 +880,8 @@ TEST(nntrainer_ccapi_graph, multiple_leaf_inputs_p) {
   auto y = fc(sum);
 
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
-  EXPECT_EQ(model->compile(x1, y), ML_ERROR_NONE);
+  EXPECT_EQ(model->compile(x1, y, ml::train::ExecutionMode::INFERENCE),
+            ML_ERROR_NONE);
 
   EXPECT_TRUE(x1.isMaterialized());
   EXPECT_TRUE(y.isMaterialized());
@@ -949,7 +956,8 @@ TEST(nntrainer_ccapi_graph, picogpt_style_transformer_p) {
   auto output = final_ln(block_out);
 
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
-  EXPECT_EQ(model->compile(wte_in, output), ML_ERROR_NONE);
+  EXPECT_EQ(model->compile(wte_in, output, ml::train::ExecutionMode::INFERENCE),
+            ML_ERROR_NONE);
 
   EXPECT_TRUE(wte_in.isMaterialized());
   EXPECT_TRUE(output.isMaterialized());
@@ -1017,7 +1025,8 @@ TEST(nntrainer_ccapi_graph, picogpt_style_inference_p) {
   auto output = final_ln(block_out);
 
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
-  ASSERT_EQ(model->compile(wte_in, output), ML_ERROR_NONE);
+  ASSERT_EQ(model->compile(wte_in, output, ml::train::ExecutionMode::INFERENCE),
+            ML_ERROR_NONE);
 
   // Run inference with dummy input (token id=1 for both inputs)
   float wte_input_data[1];

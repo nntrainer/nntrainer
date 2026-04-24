@@ -585,7 +585,7 @@ void createAndRun(unsigned int epochs, unsigned int batch_size,
   }
 
   // compile(Tensor, Tensor) internally calls compile + initialize + allocate
-  status = g_model->compile(x, y);
+  status = g_model->compile(x, y, ml::train::ExecutionMode::INFERENCE);
   if (status) {
     throw std::invalid_argument("model compilation failed!");
   }

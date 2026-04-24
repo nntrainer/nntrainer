@@ -42,11 +42,13 @@ Tensor &Tensor::add_i(const Tensor &other, float alpha) {
   if (!impl_) {
     throw std::runtime_error("Cannot add_i on invalid tensor");
   }
-  auto other_impl = other.impl_.get();
-  impl_->call_chain.push_back([other_impl, alpha](nntrainer::Tensor &t) {
-    nntrainer::Tensor *src = other_impl->bound_tensor
-                               ? other_impl->bound_tensor
-                               : other_impl->eager_data.get();
+  // Capture `other` by value so the lambda keeps its Impl (and the
+  // shared_ptr<nntrainer::Tensor> eager_data it owns) alive even if
+  // the caller-side Tensor goes out of scope before eval().
+  impl_->call_chain.push_back([other, alpha](nntrainer::Tensor &t) {
+    const auto *oi = other.impl_.get();
+    nntrainer::Tensor *src =
+      oi->bound_tensor ? oi->bound_tensor : oi->eager_data.get();
     if (!src)
       throw std::runtime_error("add_i: other tensor not materialized");
     t.add_i(*src, alpha);
@@ -67,11 +69,10 @@ Tensor &Tensor::subtract_i(const Tensor &other) {
   if (!impl_) {
     throw std::runtime_error("Cannot subtract_i on invalid tensor");
   }
-  auto other_impl = other.impl_.get();
-  impl_->call_chain.push_back([other_impl](nntrainer::Tensor &t) {
-    nntrainer::Tensor *src = other_impl->bound_tensor
-                               ? other_impl->bound_tensor
-                               : other_impl->eager_data.get();
+  impl_->call_chain.push_back([other](nntrainer::Tensor &t) {
+    const auto *oi = other.impl_.get();
+    nntrainer::Tensor *src =
+      oi->bound_tensor ? oi->bound_tensor : oi->eager_data.get();
     if (!src)
       throw std::runtime_error("subtract_i: other tensor not materialized");
     t.subtract_i(*src);
@@ -92,11 +93,10 @@ Tensor &Tensor::multiply_i(const Tensor &other) {
   if (!impl_) {
     throw std::runtime_error("Cannot multiply_i on invalid tensor");
   }
-  auto other_impl = other.impl_.get();
-  impl_->call_chain.push_back([other_impl](nntrainer::Tensor &t) {
-    nntrainer::Tensor *src = other_impl->bound_tensor
-                               ? other_impl->bound_tensor
-                               : other_impl->eager_data.get();
+  impl_->call_chain.push_back([other](nntrainer::Tensor &t) {
+    const auto *oi = other.impl_.get();
+    nntrainer::Tensor *src =
+      oi->bound_tensor ? oi->bound_tensor : oi->eager_data.get();
     if (!src)
       throw std::runtime_error("multiply_i: other tensor not materialized");
     t.multiply_i(*src);
@@ -117,11 +117,10 @@ Tensor &Tensor::divide_i(const Tensor &other) {
   if (!impl_) {
     throw std::runtime_error("Cannot divide_i on invalid tensor");
   }
-  auto other_impl = other.impl_.get();
-  impl_->call_chain.push_back([other_impl](nntrainer::Tensor &t) {
-    nntrainer::Tensor *src = other_impl->bound_tensor
-                               ? other_impl->bound_tensor
-                               : other_impl->eager_data.get();
+  impl_->call_chain.push_back([other](nntrainer::Tensor &t) {
+    const auto *oi = other.impl_.get();
+    nntrainer::Tensor *src =
+      oi->bound_tensor ? oi->bound_tensor : oi->eager_data.get();
     if (!src)
       throw std::runtime_error("divide_i: other tensor not materialized");
     t.divide_i(*src);
