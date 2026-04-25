@@ -19,6 +19,12 @@
  * NCOLS1 remains as the compile-time maximum for local memory allocation.
  * float2 vectorized loads for 2× memory bandwidth on global and local access.
  *
+ * Round 2 Optimization - Phase A: Parallel Online Softmax
+ * - Replaces single-writer softmax with parallel reduction across all work-items
+ * - Each work-item processes a subset of KV rows for max/exp computation
+ * - Uses work_group_reduce_max and work_group_reduce_add for parallel reduction
+ * - Eliminates serialization bottleneck in softmax computation
+ *
  * Local memory layout (NCOLS1=4, NCOLS2=2, NBATCH_FA=16, HEAD_DIM=128):
  *   Q_tile:   4*2 x 128 x 4 = 4 KB   (NCOLS1*NCOLS2 rows)
  *   K_tile:  16   x 128 x 4 = 8 KB   (shared across Q heads)
@@ -60,6 +66,49 @@
 
 #define HEAD_DIM2 (HEAD_DIM / 2)
 #define NQ (NCOLS1 * NCOLS2)  // Total Q rows per work-group (maximum)
+
+// Round 2 Phase A: Helper function for parallel max reduction
+// Uses iterative halving until all work-items have the same max value
+float work_group_reduce_max_fp32(float value) {
+  // Use OpenCL 2.0 work_group_reduce_max if available, otherwise manual reduction
+  // Manual parallel reduction using local memory
+  __local float l_max_tmp[128];  // Support up to 128 work-items
+  const int local_id = get_local_id(0);
+  const int local_size = get_local_size(0);
+  
+  l_max_tmp[local_id] = value;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  
+  // Parallel reduction - each iteration halves the number of active work-items
+  for (int stride = local_size / 2; stride > 0; stride >>= 1) {
+    if (local_id < stride) {
+      l_max_tmp[local_id] = fmax(l_max_tmp[local_id], l_max_tmp[local_id + stride]);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  
+  return l_max_tmp[0];
+}
+
+// Round 2 Phase A: Helper function for parallel sum reduction
+float work_group_reduce_add_fp32(float value) {
+  __local float l_sum_tmp[128];  // Support up to 128 work-items
+  const int local_id = get_local_id(0);
+  const int local_size = get_local_size(0);
+  
+  l_sum_tmp[local_id] = value;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  
+  // Parallel reduction - each iteration halves the number of active work-items
+  for (int stride = local_size / 2; stride > 0; stride >>= 1) {
+    if (local_id < stride) {
+      l_sum_tmp[local_id] += l_sum_tmp[local_id + stride];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  
+  return l_sum_tmp[0];
+}
 
 __kernel void flash_attention_prefill_fp32(
     __global const float *query,
@@ -209,43 +258,54 @@ __kernel void flash_attention_prefill_fp32(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Online softmax — Phase 1: work-item 0 computes softmax for all Q rows
-    if (local_id == 0) {
-      for (int h = 0; h < actual_ncols2; h++) {
-        for (int i = 0; i < valid_ncols1; i++) {
-          const int qi = h * NCOLS1 + i;
-          // Find new max for this Q row across the current K tile
-          float new_max = l_max_val[qi];
-          for (int j = 0; j < nrows_kv; j++) {
-            new_max = fmax(new_max, KQ_tile[qi][j]);
-          }
-
-          // Compute correction factor for rescaling VKQ
-          if (new_max != l_max_val[qi]) {
-            l_correction[qi] = exp(l_max_val[qi] - new_max);
-            l_exp_sum[qi] *= l_correction[qi];
-            l_max_val[qi] = new_max;
-          } else {
-            l_correction[qi] = 1.0f;
-          }
-
-          // Compute exp(KQ - max) and accumulate exp_sum
-          for (int j = 0; j < nrows_kv; j++) {
-            const float exp_val = exp(KQ_tile[qi][j] - l_max_val[qi]);
-            KQ_tile[qi][j] = exp_val;
-            l_exp_sum[qi] += exp_val;
-          }
-        }
-      }
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    // Online softmax — Phase 2: all work-items cooperatively rescale VKQ
+    // Round 2 Phase A: Parallel Online Softmax
+    // All work-items cooperatively compute softmax for each Q row
+    // Each work-item handles a subset of KV rows, then parallel reduction combines results
     for (int h = 0; h < actual_ncols2; h++) {
       for (int i = 0; i < valid_ncols1; i++) {
         const int qi = h * NCOLS1 + i;
+        
+        // Phase A.1: Parallel max reduction across work-items
+        // Each work-item finds max in its assigned subset of KV rows
+        float local_max = SOFTMAX_MIN;
+        for (int j = local_id; j < nrows_kv; j += local_size) {
+          local_max = fmax(local_max, KQ_tile[qi][j]);
+        }
+        // Parallel reduction to find global max across all work-items
+        float new_max = work_group_reduce_max_fp32(local_max);
+        
+        // Combine with previous running max
+        float prev_max = l_max_val[qi];
+        new_max = fmax(new_max, prev_max);
+        
+        // Phase A.2: Compute correction factor and update state
+        float correction = 1.0f;
+        if (new_max != prev_max) {
+          correction = exp(prev_max - new_max);
+        }
+        
+        // Phase A.3: Parallel exp computation and sum reduction
+        // Each work-item computes exp for its subset and accumulates local sum
+        float local_exp_sum = 0.0f;
+        for (int j = local_id; j < nrows_kv; j += local_size) {
+          float exp_val = exp(KQ_tile[qi][j] - new_max);
+          KQ_tile[qi][j] = exp_val;  // Store exp value for VKQ computation
+          local_exp_sum += exp_val;
+        }
+        // Parallel reduction to get total exp sum
+        float tile_exp_sum = work_group_reduce_add_fp32(local_exp_sum);
+        
+        // Update global state (single writer to avoid race condition)
+        if (local_id == 0) {
+          l_correction[qi] = correction;
+          l_exp_sum[qi] = l_exp_sum[qi] * correction + tile_exp_sum;
+          l_max_val[qi] = new_max;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        
+        // Phase A.4: Apply correction to VKQ accumulator (parallel across work-items)
         for (int d = local_id; d < HEAD_DIM; d += local_size) {
-          VKQ[qi][d] *= l_correction[qi];
+          VKQ[qi][d] *= correction;
         }
       }
     }
