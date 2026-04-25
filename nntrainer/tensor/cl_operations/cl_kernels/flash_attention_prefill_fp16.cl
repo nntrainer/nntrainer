@@ -18,16 +18,16 @@
  * the dispatch code to select optimal Q tokens per work-group based on seqlen_q.
  * NCOLS1 remains as the compile-time maximum for local memory allocation.
  *
- * Local memory layout (NCOLS1=4, NCOLS2=2, NBATCH_FA=16, HEAD_DIM=128):
- *   Q_tile:   4*2 x 128 x 2 = 2 KB   (half — NCOLS1*NCOLS2 rows)
+ * Local memory layout (NCOLS1=4, NCOLS2=1, NBATCH_FA=16, HEAD_DIM=128):
+ *   Q_tile:   4*1 x 128 x 2 = 1 KB   (half — NCOLS1*NCOLS2 rows)
  *   K_tile:  16   x 128 x 2 = 4 KB   (half — shared across Q heads)
  *   V_tile:  16   x 128 x 2 = 4 KB   (half — shared across Q heads)
- *   KQ_tile:  4*2 x  16 x 2 = 256 B  (half — NCOLS1*NCOLS2 rows)
- *   VKQ:      4*2 x 128 x 4 = 4 KB   (float accumulator)
- *   l_max_val:    4*2 x 4 = 32 B
- *   l_exp_sum:    4*2 x 4 = 32 B
- *   l_correction: 4*2 x 4 = 32 B
- *   Total: ~14.3 KB (fits in 32KB local memory)
+ *   KQ_tile:  4*1 x  16 x 2 = 128 B  (half — NCOLS1*NCOLS2 rows)
+ *   VKQ:      4*1 x 128 x 4 = 2 KB   (float accumulator)
+ *   l_max_val:    4*1 x 4 = 16 B
+ *   l_exp_sum:    4*1 x 4 = 16 B
+ *   l_correction: 4*1 x 4 = 16 B
+ *   Total: ~11.2 KB (fits in 32KB local memory)
  *
  * When NCOLS2=1, this kernel behaves identically to the pre-Phase-4 version.
  */
@@ -214,45 +214,55 @@ __kernel void flash_attention_prefill_fp16(
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Online softmax — Phase 1: work-item 0 computes softmax for all Q rows
-    // Only process valid Q rows (actual_ncols2 * valid_ncols1)
+    // Online softmax (Phase 2-4): Single-writer approach
+    // Work-item 0 computes softmax for each Q row to avoid race conditions
+    // Note: Parallel softmax optimization is applied to FP32 kernel only
+    // due to OpenCL compiler limitations on some devices
     if (local_id == 0) {
       for (int h = 0; h < actual_ncols2; h++) {
         for (int i = 0; i < valid_ncols1; i++) {
           const int qi = h * NCOLS1 + i;
-          // Find new max for this Q row across the current K tile
-          float new_max = l_max_val[qi];
+          
+          // Find max in current KQ tile
+          float tile_max = SOFTMAX_MIN;
           for (int j = 0; j < nrows_kv; j++) {
-            new_max = fmax(new_max, (float)KQ_tile[qi][j]);
+            tile_max = fmax(tile_max, (float)KQ_tile[qi][j]);
           }
-
-          // Compute correction factor for rescaling VKQ
-          if (new_max != l_max_val[qi]) {
-            l_correction[qi] = exp(l_max_val[qi] - new_max);
-            l_exp_sum[qi] *= l_correction[qi];
-            l_max_val[qi] = new_max;
-          } else {
-            l_correction[qi] = 1.0f;
+          
+          // Combine with previous running max
+          float prev_max = l_max_val[qi];
+          float new_max = fmax(tile_max, prev_max);
+          
+          // Compute correction factor
+          float correction = 1.0f;
+          if (new_max != prev_max) {
+            correction = exp(prev_max - new_max);
           }
-
-          // Compute exp(KQ - max) and accumulate exp_sum
-          // Replace KQ_tile values with exp values for VKQ accumulation
+          
+          // Compute exp and accumulate sum
+          float tile_exp_sum = 0.0f;
           for (int j = 0; j < nrows_kv; j++) {
-            const float exp_val = exp((float)KQ_tile[qi][j] - l_max_val[qi]);
+            float exp_val = exp((float)KQ_tile[qi][j] - new_max);
             KQ_tile[qi][j] = (half)exp_val;
-            l_exp_sum[qi] += exp_val;
+            tile_exp_sum += exp_val;
           }
+          
+          // Update softmax state
+          l_correction[qi] = correction;
+          l_exp_sum[qi] = l_exp_sum[qi] * correction + tile_exp_sum;
+          l_max_val[qi] = new_max;
         }
       }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-
-    // Online softmax — Phase 2: all work-items cooperatively rescale VKQ (FP32)
+    
+    // Apply correction to VKQ accumulator (parallel across work-items)
     for (int h = 0; h < actual_ncols2; h++) {
       for (int i = 0; i < valid_ncols1; i++) {
         const int qi = h * NCOLS1 + i;
+        const float correction = l_correction[qi];
         for (int d = local_id; d < HEAD_DIM; d += local_size) {
-          VKQ[qi][d] *= l_correction[qi];
+          VKQ[qi][d] *= correction;
         }
       }
     }
