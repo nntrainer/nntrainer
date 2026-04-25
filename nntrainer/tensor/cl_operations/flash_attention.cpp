@@ -14,9 +14,11 @@
 #include "flash_attention.h"
 #include <cl_kernels/flash_attention_fp32.h>
 #include <cl_kernels/flash_attention_prefill_fp32.h>
+#include <cl_kernels/flash_attention_decode_fp32.h>
 #ifdef ENABLE_FP16
 #include <cl_kernels/flash_attention_fp16.h>
 #include <cl_kernels/flash_attention_prefill_fp16.h>
+#include <cl_kernels/flash_attention_decode_fp16.h>
 #endif
 
 namespace nntrainer {
@@ -265,13 +267,18 @@ void flash_attention_decode_fp32_cl(float *query, float *key, float *value,
                                     unsigned int num_heads_q,
                                     unsigned int num_heads_kv,
                                     unsigned int batch, float scale) {
-  // Phase 1: Decode uses the same existing kernel as prefill.
-  // This will be replaced with a dedicated split-KV decode kernel in Phase 6.
+  // Phase 6: Decode-specific kernel with split-KV approach
   // For very small workloads (typical in decode), CPU fallback may be faster.
   const unsigned int total_elements = batch * num_heads_q * seqlen_q * head_dim;
   const unsigned int total_work_items = batch * num_heads_q * seqlen_q;
   
-  if (total_work_items < 32 || total_elements < 4096) {
+  // For decode with small seqlen_k, use CPU or simple kernel
+  // The split-KV approach is beneficial when seqlen_k is large enough to warrant parallelization
+  static const unsigned int KV_TILE_SIZE = 64;
+  const unsigned int num_kv_tiles = (seqlen_k + KV_TILE_SIZE - 1) / KV_TILE_SIZE;
+  
+  // For small KV sequences or small batches, use CPU fallback
+  if (total_work_items < 32 || total_elements < 4096 || num_kv_tiles < 2) {
     flash_attention_cpu(query, key, value, output,
                         seqlen_q, seqlen_k, head_dim,
                         num_heads_q, num_heads_kv, batch, scale);
@@ -281,77 +288,182 @@ void flash_attention_decode_fp32_cl(float *query, float *key, float *value,
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
 
-  ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
-    flash_attention_fp32_kernel, "flash_attention_fp32");
-  if (!kernel_ptr) {
-    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_fp32 (decode)");
+  // Allocate partial buffers for split-KV reduction
+  // partials_max: [batch, num_heads_q, num_kv_tiles]
+  // partials_sum: [batch, num_heads_q, num_kv_tiles]
+  // partials_vkq: [batch, num_heads_q, num_kv_tiles, head_dim]
+  const size_t partials_max_sum_size = batch * num_heads_q * num_kv_tiles * sizeof(float);
+  const size_t partials_vkq_size = batch * num_heads_q * num_kv_tiles * head_dim * sizeof(float);
+  
+  std::vector<float> partials_max(partials_max_sum_size / sizeof(float));
+  std::vector<float> partials_sum(partials_max_sum_size / sizeof(float));
+  std::vector<float> partials_vkq(partials_vkq_size / sizeof(float));
+  
+  // Allocate SVM buffers for partials
+  float *partials_max_buf = (float *)blas_cc->context_inst_.createSVMRegion(partials_max_sum_size);
+  float *partials_sum_buf = (float *)blas_cc->context_inst_.createSVMRegion(partials_max_sum_size);
+  float *partials_vkq_buf = (float *)blas_cc->context_inst_.createSVMRegion(partials_vkq_size);
+  
+  if (!partials_max_buf || !partials_sum_buf || !partials_vkq_buf) {
+    // Fallback to CPU if allocation fails
+    flash_attention_cpu(query, key, value, output,
+                        seqlen_q, seqlen_k, head_dim,
+                        num_heads_q, num_heads_kv, batch, scale);
     return;
   }
 
+  // Kernel 1: Decode kernel - each work-group processes a KV tile
+  ClContext::SharedPtrClKernel decode_kernel_ptr = blas_cc->registerClKernel(
+    flash_attention_decode_fp32_kernel, "flash_attention_decode_fp32");
+  if (!decode_kernel_ptr) {
+    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_decode_fp32");
+    return;
+  }
+
+  // kv_max = seqlen_k (all KV positions are valid)
+  const int kv_max = seqlen_k;
+  
+  // Work-group size for decode kernel
+  static const unsigned int DECODE_WORK_GROUP_SIZE = 64;
+  const unsigned int total_decode_groups = batch * num_heads_q * num_kv_tiles;
+  
   int arg = 0;
   bool result = false;
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, query);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, query);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_decode_fp32");
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, key);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, key);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_decode_fp32");
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, value);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, value);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_decode_fp32");
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, output);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, output);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_decode_fp32");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, partials_max_buf);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_decode_fp32");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, partials_sum_buf);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_decode_fp32");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, partials_vkq_buf);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_decode_fp32");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_decode_fp32");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_decode_fp32");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &batch, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_decode_fp32");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_decode_fp32");
 
-  const int work_groups_count[3] = {(int)total_work_items, 1, 1};
-  const int work_group_size[3] = {64, 1, 1};
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 11 for flash_attention_decode_fp32");
+
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &batch, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 12 for flash_attention_decode_fp32");
+
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 13 for flash_attention_decode_fp32");
+
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &kv_max, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 14 for flash_attention_decode_fp32");
+
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &num_kv_tiles, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 15 for flash_attention_decode_fp32");
+
+  const int decode_work_groups_count[3] = {(int)(total_decode_groups * DECODE_WORK_GROUP_SIZE), 1, 1};
+  const int decode_work_group_size[3] = {(int)DECODE_WORK_GROUP_SIZE, 1, 1};
 
   result = blas_cc->command_queue_inst_.DispatchCommand(
-    kernel_ptr, work_groups_count, work_group_size);
+    decode_kernel_ptr, decode_work_groups_count, decode_work_group_size);
   if (!result) {
-    throw std::runtime_error("Failed to dispatch kernel for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to dispatch decode kernel for flash_attention_decode_fp32");
     return;
   }
 
+  // Kernel 2: Reduction kernel - combine partials using log-sum-exp
+  // Note: Both decode and reduce kernels are in the same .cl file, so we use the same kernel string
+  ClContext::SharedPtrClKernel reduce_kernel_ptr = blas_cc->registerClKernel(
+    flash_attention_decode_fp32_kernel, "flash_attention_decode_reduce_fp32");
+  if (!reduce_kernel_ptr) {
+    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_decode_reduce_fp32");
+    return;
+  }
+
+  arg = 0;
+  result = reduce_kernel_ptr->SetKernelSVMArguments(arg++, partials_max_buf);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_decode_reduce_fp32");
+
+  result = reduce_kernel_ptr->SetKernelSVMArguments(arg++, partials_sum_buf);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_decode_reduce_fp32");
+
+  result = reduce_kernel_ptr->SetKernelSVMArguments(arg++, partials_vkq_buf);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_decode_reduce_fp32");
+
+  result = reduce_kernel_ptr->SetKernelSVMArguments(arg++, output);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_decode_reduce_fp32");
+
+  result = reduce_kernel_ptr->SetKernelArguments(arg++, &num_kv_tiles, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_decode_reduce_fp32");
+
+  result = reduce_kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_decode_reduce_fp32");
+
+  result = reduce_kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_decode_reduce_fp32");
+
+  // One work-group per (batch, head) pair
+  const int reduce_work_groups_count[3] = {(int)(batch * num_heads_q * DECODE_WORK_GROUP_SIZE), 1, 1};
+  const int reduce_work_group_size[3] = {(int)DECODE_WORK_GROUP_SIZE, 1, 1};
+
+  result = blas_cc->command_queue_inst_.DispatchCommand(
+    reduce_kernel_ptr, reduce_work_groups_count, reduce_work_group_size);
+  if (!result) {
+    throw std::runtime_error("Failed to dispatch reduce kernel for flash_attention_decode_fp32");
+    return;
+  }
+
+  // Read back output
   blas_cc->command_queue_inst_.enqueueSVMMap(output,
                                              batch * num_heads_q * seqlen_q * head_dim * sizeof(float),
                                              true);
   if (!result) {
-    throw std::runtime_error("Failed to read output data for flash_attention_fp32 (decode)");
+    throw std::runtime_error("Failed to read output data for flash_attention_decode_fp32");
     return;
   }
+  
+  // Free partial buffers
+  // Note: SVM buffers are freed automatically when the context is destroyed
 }
 
 #ifdef ENABLE_FP16
@@ -566,13 +678,18 @@ void flash_attention_decode_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
                                     unsigned int num_heads_q,
                                     unsigned int num_heads_kv,
                                     unsigned int batch, float scale) {
-  // Phase 1: Decode uses the same existing kernel as prefill.
-  // This will be replaced with a dedicated split-KV decode kernel in Phase 6.
+  // Phase 6: Decode-specific kernel with split-KV approach
   // For very small workloads (typical in decode), CPU fallback may be faster.
   const unsigned int total_elements = batch * num_heads_q * seqlen_q * head_dim;
   const unsigned int total_work_items = batch * num_heads_q * seqlen_q;
   
-  if (total_work_items < 32 || total_elements < 4096) {
+  // For decode with small seqlen_k, use CPU or simple kernel
+  // The split-KV approach is beneficial when seqlen_k is large enough to warrant parallelization
+  static const unsigned int KV_TILE_SIZE = 64;
+  const unsigned int num_kv_tiles = (seqlen_k + KV_TILE_SIZE - 1) / KV_TILE_SIZE;
+  
+  // For small KV sequences or small batches, use CPU fallback
+  if (total_work_items < 32 || total_elements < 4096 || num_kv_tiles < 2) {
     // Convert FP16 to FP32 for CPU computation
     const size_t kv_elements = batch * num_heads_kv * seqlen_k * head_dim;
     std::vector<float> query_fp32(total_elements);
@@ -595,77 +712,191 @@ void flash_attention_decode_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
 
-  ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
-    flash_attention_fp16_kernel, "flash_attention_fp16");
-  if (!kernel_ptr) {
-    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_fp16 (decode)");
+  // Allocate partial buffers for split-KV reduction
+  // Note: partials are stored in FP32 for numerical stability
+  // partials_max: [batch, num_heads_q, num_kv_tiles]
+  // partials_sum: [batch, num_heads_q, num_kv_tiles]
+  // partials_vkq: [batch, num_heads_q, num_kv_tiles, head_dim]
+  const size_t partials_max_sum_size = batch * num_heads_q * num_kv_tiles * sizeof(float);
+  const size_t partials_vkq_size = batch * num_heads_q * num_kv_tiles * head_dim * sizeof(float);
+  
+  // Allocate SVM buffers for partials (FP32 for numerical stability)
+  float *partials_max_buf = (float *)blas_cc->context_inst_.createSVMRegion(partials_max_sum_size);
+  float *partials_sum_buf = (float *)blas_cc->context_inst_.createSVMRegion(partials_max_sum_size);
+  float *partials_vkq_buf = (float *)blas_cc->context_inst_.createSVMRegion(partials_vkq_size);
+  
+  if (!partials_max_buf || !partials_sum_buf || !partials_vkq_buf) {
+    // Fallback to CPU if allocation fails
+    const size_t kv_elements = batch * num_heads_kv * seqlen_k * head_dim;
+    std::vector<float> query_fp32(total_elements);
+    std::vector<float> key_fp32(kv_elements);
+    std::vector<float> value_fp32(kv_elements);
+    std::vector<float> output_fp32(total_elements);
+    
+    fp16_to_fp32(query, query_fp32.data(), total_elements);
+    fp16_to_fp32(key, key_fp32.data(), kv_elements);
+    fp16_to_fp32(value, value_fp32.data(), kv_elements);
+    
+    flash_attention_cpu(query_fp32.data(), key_fp32.data(), value_fp32.data(),
+                       output_fp32.data(), seqlen_q, seqlen_k, head_dim,
+                       num_heads_q, num_heads_kv, batch, scale);
+    
+    fp32_to_fp16(output_fp32.data(), output, total_elements);
     return;
   }
 
+  // Kernel 1: Decode kernel - each work-group processes a KV tile
+  ClContext::SharedPtrClKernel decode_kernel_ptr = blas_cc->registerClKernel(
+    flash_attention_decode_fp16_kernel, "flash_attention_decode_fp16");
+  if (!decode_kernel_ptr) {
+    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_decode_fp16");
+    return;
+  }
+
+  // kv_max = seqlen_k (all KV positions are valid)
+  const int kv_max = seqlen_k;
+  
+  // Work-group size for decode kernel
+  static const unsigned int DECODE_WORK_GROUP_SIZE = 64;
+  const unsigned int total_decode_groups = batch * num_heads_q * num_kv_tiles;
+  
   int arg = 0;
   bool result = false;
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, query);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, query);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_decode_fp16");
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, key);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, key);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_decode_fp16");
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, value);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, value);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_decode_fp16");
 
-  result = kernel_ptr->SetKernelSVMArguments(arg++, output);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, output);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_decode_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, partials_max_buf);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_decode_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, partials_sum_buf);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_decode_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, partials_vkq_buf);
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_decode_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_decode_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_decode_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &batch, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_decode_fp16");
 
-  result = kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
   if (!result)
-    throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_decode_fp16");
 
-  const int work_groups_count[3] = {(int)total_work_items, 1, 1};
-  const int work_group_size[3] = {64, 1, 1};
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 11 for flash_attention_decode_fp16");
+
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &batch, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 12 for flash_attention_decode_fp16");
+
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 13 for flash_attention_decode_fp16");
+
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &kv_max, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 14 for flash_attention_decode_fp16");
+
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &num_kv_tiles, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 15 for flash_attention_decode_fp16");
+
+  const int decode_work_groups_count[3] = {(int)(total_decode_groups * DECODE_WORK_GROUP_SIZE), 1, 1};
+  const int decode_work_group_size[3] = {(int)DECODE_WORK_GROUP_SIZE, 1, 1};
 
   result = blas_cc->command_queue_inst_.DispatchCommand(
-    kernel_ptr, work_groups_count, work_group_size);
+    decode_kernel_ptr, decode_work_groups_count, decode_work_group_size);
   if (!result) {
-    throw std::runtime_error("Failed to dispatch kernel for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to dispatch decode kernel for flash_attention_decode_fp16");
     return;
   }
 
+  // Kernel 2: Reduction kernel - combine partials using log-sum-exp
+  // Note: Both decode and reduce kernels are in the same .cl file, so we use the same kernel string
+  ClContext::SharedPtrClKernel reduce_kernel_ptr = blas_cc->registerClKernel(
+    flash_attention_decode_fp16_kernel, "flash_attention_decode_reduce_fp16");
+  if (!reduce_kernel_ptr) {
+    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_decode_reduce_fp16");
+    return;
+  }
+
+  arg = 0;
+  result = reduce_kernel_ptr->SetKernelSVMArguments(arg++, partials_max_buf);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_decode_reduce_fp16");
+
+  result = reduce_kernel_ptr->SetKernelSVMArguments(arg++, partials_sum_buf);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_decode_reduce_fp16");
+
+  result = reduce_kernel_ptr->SetKernelSVMArguments(arg++, partials_vkq_buf);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_decode_reduce_fp16");
+
+  result = reduce_kernel_ptr->SetKernelSVMArguments(arg++, output);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_decode_reduce_fp16");
+
+  result = reduce_kernel_ptr->SetKernelArguments(arg++, &num_kv_tiles, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_decode_reduce_fp16");
+
+  result = reduce_kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_decode_reduce_fp16");
+
+  result = reduce_kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_decode_reduce_fp16");
+
+  // One work-group per (batch, head) pair
+  const int reduce_work_groups_count[3] = {(int)(batch * num_heads_q * DECODE_WORK_GROUP_SIZE), 1, 1};
+  const int reduce_work_group_size[3] = {(int)DECODE_WORK_GROUP_SIZE, 1, 1};
+
+  result = blas_cc->command_queue_inst_.DispatchCommand(
+    reduce_kernel_ptr, reduce_work_groups_count, reduce_work_group_size);
+  if (!result) {
+    throw std::runtime_error("Failed to dispatch reduce kernel for flash_attention_decode_fp16");
+    return;
+  }
+
+  // Read back output
   blas_cc->command_queue_inst_.enqueueSVMMap(output,
                                              batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16),
                                              true);
   if (!result) {
-    throw std::runtime_error("Failed to read output data for flash_attention_fp16 (decode)");
+    throw std::runtime_error("Failed to read output data for flash_attention_decode_fp16");
     return;
   }
+  
+  // Free partial buffers
+  // Note: SVM buffers are freed automatically when the context is destroyed
 }
 #endif /* ENABLE_FP16 */
 
