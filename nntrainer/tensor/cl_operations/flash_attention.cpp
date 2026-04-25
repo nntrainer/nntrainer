@@ -12,12 +12,14 @@
  */
 
 #include "flash_attention.h"
+#include <algorithm>
 #include <cl_kernels/flash_attention_fp32.h>
 #include <cl_kernels/flash_attention_prefill_fp32.h>
 #include <cl_kernels/flash_attention_decode_fp32.h>
 #ifdef ENABLE_FP16
 #include <cl_kernels/flash_attention_fp16.h>
 #include <cl_kernels/flash_attention_prefill_fp16.h>
+#include <cl_kernels/flash_attention_prefill_fp16_adreno.h>
 #include <cl_kernels/flash_attention_decode_fp16.h>
 #endif
 
@@ -469,6 +471,30 @@ void flash_attention_decode_fp32_cl(float *query, float *key, float *value,
 #ifdef ENABLE_FP16
 
 /**
+ * @brief Check if the current GPU device is an Adreno (Qualcomm) GPU
+ * @detail Queries the OpenCL device vendor to determine if the GPU is Adreno.
+ *         Adreno GPUs support features not available on Mali (e.g., parallel
+ *         softmax with barriers + cl_khr_fp16, cl_qcom_subgroups, larger local memory).
+ * @return true if the device is an Adreno GPU, false otherwise
+ */
+static bool is_adreno_device() {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  const auto *device_info = blas_cc->context_inst_.getDeviceInfo();
+  if (!device_info) {
+    return false;
+  }
+
+  const std::string &vendor = device_info->getDeviceVendor();
+  // Qualcomm Adreno GPUs report vendor as "QUALCOMM" (uppercase) or contain "Adreno"
+  // Use case-insensitive comparison
+  std::string vendor_lower = vendor;
+  std::transform(vendor_lower.begin(), vendor_lower.end(), vendor_lower.begin(), ::tolower);
+  return (vendor_lower.find("qualcomm") != std::string::npos ||
+          vendor_lower.find("adreno") != std::string::npos);
+}
+
+/**
  * @brief Helper to convert FP16 buffers to FP32 for CPU fallback
  */
 static void fp16_to_fp32(const _FP16 *src, float *dst, size_t count) {
@@ -497,9 +523,16 @@ void flash_attention_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value, _FP16 *outp
                                   seqlen_q, seqlen_k, head_dim,
                                   num_heads_q, num_heads_kv, batch, scale);
   } else {
-    flash_attention_prefill_fp16_cl(query, key, value, output,
-                                   seqlen_q, seqlen_k, head_dim,
-                                   num_heads_q, num_heads_kv, batch, scale);
+    // On Adreno GPUs, use the Adreno-optimized prefill kernel with parallel softmax
+    if (is_adreno_device()) {
+      flash_attention_prefill_fp16_adreno_cl(query, key, value, output,
+                                             seqlen_q, seqlen_k, head_dim,
+                                             num_heads_q, num_heads_kv, batch, scale);
+    } else {
+      flash_attention_prefill_fp16_cl(query, key, value, output,
+                                     seqlen_q, seqlen_k, head_dim,
+                                     num_heads_q, num_heads_kv, batch, scale);
+    }
   }
 }
 
@@ -663,6 +696,145 @@ void flash_attention_prefill_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
       kernel_ptr, work_groups_count, work_group_size);
     if (!result) {
       throw std::runtime_error("Failed to dispatch kernel for flash_attention_prefill_fp16");
+      return;
+    }
+  }
+
+  blas_cc->command_queue_inst_.enqueueSVMMap(output, 
+                                             batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16),
+                                             true);
+}
+
+void flash_attention_prefill_fp16_adreno_cl(_FP16 *query, _FP16 *key, _FP16 *value,
+                                            _FP16 *output, unsigned int seqlen_q,
+                                            unsigned int seqlen_k, unsigned int head_dim,
+                                            unsigned int num_heads_q,
+                                            unsigned int num_heads_kv,
+                                            unsigned int batch, float scale) {
+  // For very small workloads, use CPU implementation to avoid GPU overhead
+  const unsigned int total_elements = batch * num_heads_q * seqlen_q * head_dim;
+  const unsigned int total_work_items = batch * num_heads_q * seqlen_q;
+  
+  if (total_work_items < 32 || total_elements < 4096) {
+    const size_t kv_elements = batch * num_heads_kv * seqlen_k * head_dim;
+    std::vector<float> query_fp32(total_elements);
+    std::vector<float> key_fp32(kv_elements);
+    std::vector<float> value_fp32(kv_elements);
+    std::vector<float> output_fp32(total_elements);
+    
+    fp16_to_fp32(query, query_fp32.data(), total_elements);
+    fp16_to_fp32(key, key_fp32.data(), kv_elements);
+    fp16_to_fp32(value, value_fp32.data(), kv_elements);
+    
+    flash_attention_cpu(query_fp32.data(), key_fp32.data(), value_fp32.data(),
+                       output_fp32.data(), seqlen_q, seqlen_k, head_dim,
+                       num_heads_q, num_heads_kv, batch, scale);
+    
+    fp32_to_fp16(output_fp32.data(), output, total_elements);
+    return;
+  }
+
+  // GQA grouping — same logic as Mali kernel
+  const unsigned int gqa_ratio = num_heads_q / num_heads_kv;
+  unsigned int ncols2 = 1;
+  if (gqa_ratio >= 4 && seqlen_q > 4) {
+    ncols2 = 2;
+  }
+  if (ncols2 > MAX_NCOLS2) {
+    ncols2 = MAX_NCOLS2;
+  }
+
+  const unsigned int ncols1 = select_ncols1(seqlen_q, ncols2);
+
+  // Adreno kernel uses larger NBATCH_FA (32 vs 16 for Mali)
+  static const unsigned int NBATCH_FA_ADRENO = 32;
+  static const unsigned int PREFILL_WORK_GROUP_SIZE = 128;
+
+  const unsigned int num_q_groups = (seqlen_q + ncols1 - 1) / ncols1;
+  const unsigned int num_dispatches = (gqa_ratio + ncols2 - 1) / ncols2;
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+
+  // Register the Adreno-optimized kernel
+  ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
+    flash_attention_prefill_fp16_adreno_kernel, "flash_attention_prefill_fp16_adreno");
+  if (!kernel_ptr) {
+    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_prefill_fp16_adreno");
+    return;
+  }
+
+  for (unsigned int dispatch = 0; dispatch < num_dispatches; dispatch++) {
+    const unsigned int head_group_offset = dispatch * ncols2;
+    const unsigned int dispatch_ncols2 = std::min(ncols2, gqa_ratio - head_group_offset);
+    const unsigned int total_groups = batch * num_heads_kv * num_q_groups;
+
+    int arg = 0;
+    bool result = false;
+
+    result = kernel_ptr->SetKernelSVMArguments(arg++, query);
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelSVMArguments(arg++, key);
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelSVMArguments(arg++, value);
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelSVMArguments(arg++, output);
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &batch, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &dispatch_ncols2, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 11 (ncols2) for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &head_group_offset, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 12 (head_group_offset) for flash_attention_prefill_fp16_adreno");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &ncols1, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 13 (ncols1) for flash_attention_prefill_fp16_adreno");
+
+    const int work_groups_count[3] = {(int)(total_groups * PREFILL_WORK_GROUP_SIZE), 1, 1};
+    const int work_group_size[3] = {(int)PREFILL_WORK_GROUP_SIZE, 1, 1};
+
+    result = blas_cc->command_queue_inst_.DispatchCommand(
+      kernel_ptr, work_groups_count, work_group_size);
+    if (!result) {
+      throw std::runtime_error("Failed to dispatch kernel for flash_attention_prefill_fp16_adreno");
       return;
     }
   }

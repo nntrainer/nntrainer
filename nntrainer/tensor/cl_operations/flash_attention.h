@@ -177,6 +177,32 @@ void flash_attention_prefill_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
                                      unsigned int batch, float scale);
 
 /**
+ * @brief Flash Attention FP16 prefill kernel — Adreno-optimized variant
+ * @detail Adreno-optimized variant with parallel online softmax (Phase A),
+ *         sub-group reductions (cl_qcom_subgroups), larger NBATCH_FA (32),
+ *         half4 vectorized loads, and native FP16 FMA for KQ dot product.
+ *         Automatically selected when running on Adreno GPU (Qualcomm vendor).
+ *         Falls back to flash_attention_prefill_fp16_cl on non-Adreno devices.
+ * @param[in] query _FP16 * for Query matrix
+ * @param[in] key _FP16 * for Key matrix
+ * @param[in] value _FP16 * for Value matrix
+ * @param[out] output _FP16 * for Output matrix
+ * @param[in] seqlen_q sequence length of query
+ * @param[in] seqlen_k sequence length of key
+ * @param[in] head_dim dimension of each attention head
+ * @param[in] num_heads_q number of query attention heads
+ * @param[in] num_heads_kv number of key/value attention heads
+ * @param[in] batch batch size
+ * @param[in] scale scaling factor for attention scores
+ */
+void flash_attention_prefill_fp16_adreno_cl(_FP16 *query, _FP16 *key, _FP16 *value,
+                                            _FP16 *output, unsigned int seqlen_q,
+                                            unsigned int seqlen_k, unsigned int head_dim,
+                                            unsigned int num_heads_q,
+                                            unsigned int num_heads_kv,
+                                            unsigned int batch, float scale);
+
+/**
  * @brief Flash Attention FP16 decode kernel — optimized for single Q token
  * @detail Uses split-KV approach where KV sequence is split across work-groups,
  *         each computing partial (max, sum, VKQ), then reduced via log-sum-exp.
