@@ -38,10 +38,15 @@
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
-// Enable Qualcomm sub-group extension if available (for hardware-accelerated reductions)
+// Enable sub-group extension if available (for hardware-accelerated reductions)
+// Adreno 6xx uses cl_qcom_subgroups, Adreno 7xx+/8xx uses cl_khr_subgroups
+// Both provide sub_group_reduce_max/sub_group_reduce_add with identical APIs
 #ifdef CL_QCOM_SUBGROUPS
 #pragma OPENCL EXTENSION cl_qcom_subgroups : enable
-#define USE_QCOM_SUBGROUPS 1
+#define USE_SUBGROUPS 1
+#elif defined(CL_KHR_SUBGROUPS)
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+#define USE_SUBGROUPS 1
 #endif
 
 #define SOFTMAX_MIN -1e30f
@@ -79,8 +84,64 @@
 // Note: __local arrays must be declared at kernel function scope in OpenCL.
 // These functions take __local pointers to reduction buffers allocated in the kernel.
 
-// Manual parallel max reduction using local memory
-// Used when cl_qcom_subgroups is not available
+#ifdef USE_SUBGROUPS
+// Sub-group accelerated max reduction for Adreno GPUs
+// Uses hardware sub-group reduce, then combines across sub-groups if needed
+float reduce_max_impl(float value, __local float *l_max_tmp) {
+  // Step 1: Reduce within each sub-group (hardware-accelerated, no barriers needed)
+  float sg_max = sub_group_reduce_max(value);
+
+  // Step 2: First lane in each sub-group writes result to local memory
+  if (get_sub_group_local_id() == 0) {
+    l_max_tmp[get_sub_group_id()] = sg_max;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // Step 3: First sub-group reduces across sub-group results
+  const int num_sg = get_num_sub_groups();
+  if (get_sub_group_id() == 0) {
+    float cross_sg = (get_sub_group_local_id() < num_sg)
+                         ? l_max_tmp[get_sub_group_local_id()]
+                         : SOFTMAX_MIN;
+    cross_sg = sub_group_reduce_max(cross_sg);
+    if (get_local_id(0) == 0) {
+      l_max_tmp[0] = cross_sg;
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  return l_max_tmp[0];
+}
+
+// Sub-group accelerated sum reduction for Adreno GPUs
+float reduce_add_impl(float value, __local float *l_sum_tmp) {
+  // Step 1: Reduce within each sub-group (hardware-accelerated, no barriers needed)
+  float sg_sum = sub_group_reduce_add(value);
+
+  // Step 2: First lane in each sub-group writes result to local memory
+  if (get_sub_group_local_id() == 0) {
+    l_sum_tmp[get_sub_group_id()] = sg_sum;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // Step 3: First sub-group reduces across sub-group results
+  const int num_sg = get_num_sub_groups();
+  if (get_sub_group_id() == 0) {
+    float cross_sg = (get_sub_group_local_id() < num_sg)
+                         ? l_sum_tmp[get_sub_group_local_id()]
+                         : 0.0f;
+    cross_sg = sub_group_reduce_add(cross_sg);
+    if (get_local_id(0) == 0) {
+      l_sum_tmp[0] = cross_sg;
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  return l_sum_tmp[0];
+}
+
+#else
+// Manual parallel max reduction using local memory (fallback for non-Adreno)
 float reduce_max_impl(float value, __local float *l_max_tmp) {
   const int lid = get_local_id(0);
   const int lsize = get_local_size(0);
@@ -98,8 +159,7 @@ float reduce_max_impl(float value, __local float *l_max_tmp) {
   return l_max_tmp[0];
 }
 
-// Manual parallel sum reduction using local memory
-// Used when cl_qcom_subgroups is not available
+// Manual parallel sum reduction using local memory (fallback for non-Adreno)
 float reduce_add_impl(float value, __local float *l_sum_tmp) {
   const int lid = get_local_id(0);
   const int lsize = get_local_size(0);
@@ -116,6 +176,7 @@ float reduce_add_impl(float value, __local float *l_sum_tmp) {
 
   return l_sum_tmp[0];
 }
+#endif
 
 __kernel void flash_attention_prefill_fp16_adreno(
     __global const half *query,
