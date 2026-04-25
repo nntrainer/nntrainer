@@ -14,6 +14,8 @@
  * - Larger NBATCH_FA (32) leveraging Adreno's 64+ KB local memory
  * - half4 vectorized loads for 4× memory bandwidth
  * - Native FP16 FMA for KQ dot product (2× throughput on Adreno 6xx+)
+ * - Eliminated unnecessary zero-filling of unused K/V rows
+ * - KQ computation limited to valid rows only (nrows_kv instead of NBATCH_FA)
  *
  * This kernel cannot be used on Mali GPUs due to compiler limitations:
  * the Mali OpenCL compiler fails to compile the parallel reduction with
@@ -21,15 +23,15 @@
  *
  * Local memory layout (NCOLS1=4, NCOLS2=1, NBATCH_FA=32, HEAD_DIM=128):
  *   Q_tile:    4 x 128 x 2 = 1 KB    (half)
- *   K_tile:   32 x 128 x 2 = 8 KB   (half — shared across Q heads)
- *   V_tile:   32 x 128 x 2 = 8 KB   (half — shared across Q heads)
- *   KQ_tile:   4 x  32 x 4 = 512 B  (float — parallel softmax needs float)
- *   VKQ:       4 x 128 x 4 = 2 KB   (float accumulator)
+ *   K_tile:   32 x 128 x 2 = 8 KB    (half — shared across Q heads)
+ *   V_tile:   32 x 128 x 2 = 8 KB    (half — shared across Q heads)
+ *   KQ_tile:   4 x  32 x 4 = 512 B   (float — parallel softmax needs float)
+ *   VKQ:       4 x 128 x 4 = 2 KB    (float accumulator)
  *   l_max_val:     4 x 4 = 16 B
  *   l_exp_sum:     4 x 4 = 16 B
  *   l_correction:  4 x 4 = 16 B
  *   Reduction buffers: 256 x 4 = 1 KB (l_max_tmp + l_sum_tmp)
- *   Total: ~20.6 KB (fits in 64 KB Adreno local memory)
+ *   Total: ~20.5 KB (fits in 64 KB Adreno local memory)
  *
  * When NCOLS2=1, this kernel behaves identically to the non-GQA version.
  */
@@ -55,6 +57,7 @@
 #endif
 
 // Adreno has more local memory (64+ KB), so we can use larger NBATCH_FA
+// NBATCH_FA=32 tested optimal on Adreno (Phase C: NBATCH_FA=16 showed 9% regression)
 #ifndef NBATCH_FA
 #define NBATCH_FA 32
 #endif
@@ -133,12 +136,12 @@ __kernel void flash_attention_prefill_fp16_adreno(
 
   // Local memory tiles — declared inside kernel function for OpenCL compliance
   // Q/K/V stored as half for compact storage; KQ_tile stored as float for parallel softmax
-  __local half Q_tile[NQ][HEAD_DIM];           // Q tile: NQ x HEAD_DIM (half)
-  __local half K_tile[NBATCH_FA][HEAD_DIM];     // K tile: NBATCH_FA x HEAD_DIM (half) — shared!
-  __local half V_tile[NBATCH_FA][HEAD_DIM];     // V tile: NBATCH_FA x HEAD_DIM (half) — shared!
-  __local float KQ_tile[NQ][NBATCH_FA];         // KQ dot products: NQ x NBATCH_FA (float! — for parallel softmax)
+  __local half Q_tile[NQ][HEAD_DIM];             // Q tile: NQ x HEAD_DIM (half)
+  __local half K_tile[NBATCH_FA][HEAD_DIM];      // K tile: NBATCH_FA x HEAD_DIM (half) — shared!
+  __local half V_tile[NBATCH_FA][HEAD_DIM];      // V tile: NBATCH_FA x HEAD_DIM (half) — shared!
+  __local float KQ_tile[NQ][NBATCH_FA];          // KQ dot products: NQ x NBATCH_FA (float! — for parallel softmax)
   // VKQ accumulator in FP32 — critical for numerical accuracy
-  __local float VKQ[NQ][HEAD_DIM];              // VKQ accumulator: NQ x HEAD_DIM (float!)
+  __local float VKQ[NQ][HEAD_DIM];               // VKQ accumulator: NQ x HEAD_DIM (float)
   __local float l_max_val[NQ];                  // Running max per Q row (float)
   __local float l_exp_sum[NQ];                  // Running exp_sum per Q row (float)
   __local float l_correction[NQ];               // Correction factor (float)
@@ -233,6 +236,7 @@ __kernel void flash_attention_prefill_fp16_adreno(
     const int nrows_kv = min(seqlen_k - kv_start, NBATCH_FA);
 
     // Load K tile cooperatively using half4 vectorized loads (ONCE per KV head!)
+    // No need to zero unused rows — all computation loops use nrows_kv
     for (int j = 0; j < nrows_kv; j++) {
       const int k_row_offset = kv_head_offset + (kv_start + j) * head_dim;
       for (int d4 = local_id; d4 < HEAD_DIM4; d4 += local_size) {
@@ -240,18 +244,13 @@ __kernel void flash_attention_prefill_fp16_adreno(
         *((__local half4*)&K_tile[j][d4 * 4]) = val;
       }
     }
-    // Zero out unused K rows
-    for (int j = nrows_kv; j < NBATCH_FA; j++) {
-      for (int d4 = local_id; d4 < HEAD_DIM4; d4 += local_size) {
-        *((__local half4*)&K_tile[j][d4 * 4]) = (half4)(0.0h, 0.0h, 0.0h, 0.0h);
-      }
-    }
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Compute KQ tile: KQ_tile[qi][j] = dot(Q_tile[qi], K_tile[j]) * scale
+    // Only compute for valid KV rows (nrows_kv) — unused rows not zero-filled
     // Adreno optimization: Use native FP16 FMA for 2× throughput, then accumulate in FP32
     for (int qi = 0; qi < NQ; qi++) {
-      for (int j = local_id; j < NBATCH_FA; j += local_size) {
+      for (int j = local_id; j < nrows_kv; j += local_size) {
         // Native FP16 dot product with FP32 final accumulation
         // Adreno 6xx+ executes half multiply at 2× FP32 rate
         half4 kq_acc4 = (half4)(0.0h, 0.0h, 0.0h, 0.0h);
@@ -320,17 +319,12 @@ __kernel void flash_attention_prefill_fp16_adreno(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Load V tile cooperatively using half4 vectorized loads (ONCE per KV head!)
+    // No need to zero unused rows — VKQ accumulation loop uses nrows_kv
     for (int j = 0; j < nrows_kv; j++) {
       const int v_row_offset = kv_head_offset + (kv_start + j) * head_dim;
       for (int d4 = local_id; d4 < HEAD_DIM4; d4 += local_size) {
         const half4 val = *((__global const half4*)(value + v_row_offset + d4 * 4));
         *((__local half4*)&V_tile[j][d4 * 4]) = val;
-      }
-    }
-    // Zero out unused V rows
-    for (int j = nrows_kv; j < NBATCH_FA; j++) {
-      for (int d4 = local_id; d4 < HEAD_DIM4; d4 += local_size) {
-        *((__local half4*)&V_tile[j][d4 * 4]) = (half4)(0.0h, 0.0h, 0.0h, 0.0h);
       }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
