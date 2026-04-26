@@ -348,6 +348,36 @@ static bool supports_subgroups() {
 }
 
 /**
+ * @brief Select optimal work-group size based on device properties
+ * @detail Opt 11: Runtime work-group size optimization. Adreno GPUs with 64+ KB
+ *         local memory can run 128 work-items per group. For devices with less
+ *         local memory or where occupancy is limited, 64 may be better.
+ *         The work-group size must be a multiple of the sub-group size (32 or 64).
+ * @param local_mem_used Estimated local memory usage per work-group (bytes)
+ * @return Selected work-group size (64 or 128)
+ */
+static unsigned int select_work_group_size(unsigned int local_mem_used) {
+  // Opt 11: Runtime work-group size optimization based on device type
+  // Adreno GPUs have 64+ KB local memory — 128 work-items per group is optimal
+  // For non-Adreno (Mali with 32 KB), use 64 if local memory is tight
+  if (is_adreno_device()) {
+    // Adreno has 64+ KB local memory — 128 is always optimal
+    return 128;
+  }
+  
+  // For Mali and other GPUs with 32 KB local memory:
+  // If local memory usage exceeds 16 KB, only 1 work-group fits → use 64
+  // to allow 2 work-groups and improve occupancy
+  if (local_mem_used > 16 * 1024) {
+    ml_logi("Opt 11: Reducing work-group size to 64 (non-Adreno, used=%u KB > 16 KB)",
+            local_mem_used / 1024);
+    return 64;
+  }
+  
+  return 128;  // Default — sufficient local memory for 2+ work-groups
+}
+
+/**
  * @brief Get the compile option to enable sub-group support
  */
 static std::string get_subgroup_compile_option() {
@@ -931,7 +961,9 @@ void flash_attention_prefill_fp16_adreno_cl(_FP16 *query, _FP16 *key, _FP16 *val
 
   // Adreno kernel uses larger NBATCH_FA (32 vs 16 for Mali)
   static const unsigned int NBATCH_FA_ADRENO = 32;
-  static const unsigned int PREFILL_WORK_GROUP_SIZE = 128;
+  // Opt 11: Runtime work-group size selection based on device local memory
+  // FP16 Adreno local memory: ~20 KB (NCOLS1=4, NBATCH_FA=32) — 128 is optimal
+  const unsigned int PREFILL_WORK_GROUP_SIZE = select_work_group_size(20 * 1024);
 
   const unsigned int num_q_groups = (seqlen_q + ncols1 - 1) / ncols1;
   const unsigned int num_dispatches = (gqa_ratio + ncols2 - 1) / ncols2;

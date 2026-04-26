@@ -276,21 +276,9 @@ __kernel void flash_attention_prefill_fp16_adreno(
         *((__local half4*)&Q_tile[h * NCOLS1 + i][d4 * 4]) = val;
       }
     }
-    // Zero out unused Q rows
-    for (int i = valid_ncols1; i < NCOLS1; i++) {
-      for (int d4 = local_id; d4 < HEAD_DIM4; d4 += local_size) {
-        *((__local half4*)&Q_tile[h * NCOLS1 + i][d4 * 4]) = (half4)(0.0h, 0.0h, 0.0h, 0.0h);
-      }
-    }
   }
-  // Zero out unused Q head slots
-  for (int h = actual_ncols2; h < NCOLS2; h++) {
-    for (int i = 0; i < NCOLS1; i++) {
-      for (int d4 = local_id; d4 < HEAD_DIM4; d4 += local_size) {
-        *((__local half4*)&Q_tile[h * NCOLS1 + i][d4 * 4]) = (half4)(0.0h, 0.0h, 0.0h, 0.0h);
-      }
-    }
-  }
+  // Opt 13: No Q row zero-filling — KQ computation only processes valid Q rows
+  // (actual_ncols2 * valid_ncols1), so unused rows are never read
   barrier(CLK_LOCAL_MEM_FENCE);
 
   // Process KV in tiles of NBATCH_FA
@@ -325,24 +313,28 @@ __kernel void flash_attention_prefill_fp16_adreno(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Compute KQ tile: KQ_tile[qi][j] = dot(Q_tile[qi], K_tile[j]) * scale
-    // Only compute for valid KV rows (nrows_kv) — unused rows not zero-filled
+    // Opt 13: Only compute for valid Q rows (actual_ncols2 * valid_ncols1)
+    // and valid KV rows (nrows_kv) — no zero-filling needed
     // Adreno optimization: Use native FP16 FMA for 2× throughput, then accumulate in FP32
-    for (int qi = 0; qi < NQ; qi++) {
-      for (int j = local_id; j < nrows_kv; j += local_size) {
-        // Native FP16 dot product with FP32 final accumulation
-        // Adreno 6xx+ executes half multiply at 2× FP32 rate
-        half4 kq_acc4 = (half4)(0.0h, 0.0h, 0.0h, 0.0h);
-        for (int d4 = 0; d4 < HEAD_DIM4; d4++) {
-          const half4 q_val = *((__local half4*)&Q_tile[qi][d4 * 4]);
-          const half4 k_val = *((__local half4*)&K_tile[j][d4 * 4]);
-          // Native FP16 FMA — 2× throughput on Adreno
-          kq_acc4 += q_val * k_val;
+    for (int h = 0; h < actual_ncols2; h++) {
+      for (int i = 0; i < valid_ncols1; i++) {
+        const int qi = h * NCOLS1 + i;
+        for (int j = local_id; j < nrows_kv; j += local_size) {
+          // Native FP16 dot product with FP32 final accumulation
+          // Adreno 6xx+ executes half multiply at 2× FP32 rate
+          half4 kq_acc4 = (half4)(0.0h, 0.0h, 0.0h, 0.0h);
+          for (int d4 = 0; d4 < HEAD_DIM4; d4++) {
+            const half4 q_val = *((__local half4*)&Q_tile[qi][d4 * 4]);
+            const half4 k_val = *((__local half4*)&K_tile[j][d4 * 4]);
+            // Native FP16 FMA — 2× throughput on Adreno
+            kq_acc4 += q_val * k_val;
+          }
+          // Final accumulate in FP32 for numerical accuracy
+          // Note: Adreno compiler requires .s0/.s1/.s2/.s3 instead of .x/.y/.z/.w for half4
+          float kq_acc = (float)kq_acc4.s0 + (float)kq_acc4.s1 +
+                         (float)kq_acc4.s2 + (float)kq_acc4.s3;
+          KQ_tile[qi][j] = kq_acc * scale;
         }
-        // Final accumulate in FP32 for numerical accuracy
-        // Note: Adreno compiler requires .s0/.s1/.s2/.s3 instead of .x/.y/.z/.w for half4
-        float kq_acc = (float)kq_acc4.s0 + (float)kq_acc4.s1 +
-                       (float)kq_acc4.s2 + (float)kq_acc4.s3;
-        KQ_tile[qi][j] = kq_acc * scale;
       }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
