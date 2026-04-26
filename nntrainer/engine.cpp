@@ -54,6 +54,16 @@ void Engine::add_default_object() {
 
   registerContext("gpu", &cl_context);
 #endif
+
+#if defined(ENABLE_NPU) && ENABLE_NPU == 1
+  // QNN context is loaded as a plugin .so for decoupling from QNN SDK.
+  // libqnn_context.so exports ml_train_context_pluggable symbol.
+  try {
+    registerContext("libqnn_context.so", "");
+  } catch (std::exception &e) {
+    ml_logw("QNN context plugin not available: %s", e.what());
+  }
+#endif
 }
 
 void Engine::initialize() noexcept {
