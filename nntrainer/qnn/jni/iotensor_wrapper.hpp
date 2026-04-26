@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Jijoong Moon <jijoong.moon@samsung.com>
+ *
+ * @file   iotensor_wrapper.hpp
+ * @date   08 Jan 2025
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @bug    No known bugs except for NYI items
+ * @brief  nntrainer-side adapter around the Qualcomm QNN sample
+ *         IOTensor / DataUtil utilities. Headers it pulls in
+ *         (DataUtil.hpp, IOTensor.hpp, PAL/StringOp.hpp,
+ *         QnnTypeMacros.hpp) are part of the QNN SDK supplied via
+ *         -Dqnn-sdk-root; they are NOT shipped in-tree.
+ */
+
 #ifndef __QNN_IOTENSOR_WRAPPER_H__
 #define __QNN_IOTENSOR_WRAPPER_H__
 #include "DataUtil.hpp"

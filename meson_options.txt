@@ -20,6 +20,13 @@ option('test-timeout', type: 'integer', value: 90)
 option('opencl-kernel-path', type: 'string', value: 'nntrainer_opencl_kernels')
 option('enable-mmap', type: 'boolean', value: true)
 option('enable-npu', type: 'boolean', value: false)
+# Path to a locally-installed Qualcomm QNN SDK. REQUIRED when enable-npu=true.
+# The QNN SDK is "Confidential and Proprietary" Qualcomm code that we cannot
+# carry in this repository. Obtain it from Qualcomm Software Center
+# (https://qpm.qualcomm.com/) and pass the extracted SDK root, e.g.:
+#   meson setup build -Denable-npu=true -Dqnn-sdk-root=/opt/qcom/aistack/qnn-2.x.x
+# See docs/backend_guide/QNN_BUILD.md for details.
+option('qnn-sdk-root', type: 'string', value: '')
 option('mmap-read', type: 'boolean', value: true)
 option('enable-kernel-caching', type: 'boolean', value: false)
 

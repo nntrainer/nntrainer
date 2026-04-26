@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2025 Jijoong Moon <jijoong.moon@samsung.com>
+ *
+ * @file   QNNLinear.h
+ * @date   17 Jan 2025
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @bug    No known bugs except for NYI items
+ * @brief  Fully-connected Layer for QNN graph capture.
+ */
+
 #ifndef __NNTR_QNNLINEAR_H__
 #define __NNTR_QNNLINEAR_H__
 

@@ -1,6 +1,11 @@
-# QNN context is built as a plugin shared library (libqnn_context.so).
-# It is loaded dynamically by Engine::registerContext("libqnn_context.so").
-# This decouples the QNN SDK dependency from the main nntrainer library.
+# nntrainer's own QNN integration plugin. The Qualcomm QNN SDK headers
+# are pulled in via -Dqnn-sdk-root (see ../meson.build). The proprietary
+# Qualcomm sample utility code that previously lived in qnn/{Log,PAL,Utils,
+# WrapperUtils} and qnn-api/ is NOT shipped — users must rely on the SDK
+# tree they obtain from Qualcomm. See docs/backend_guide/QNN_BUILD.md.
+#
+# The plugin is built as a separate shared library (libqnn_context.so) so
+# that the QNN SDK dependency stays out of the main libnntrainer.
 
 qnn_context_sources = [
   meson.current_source_dir() / 'qnn_rpc_manager.cpp',
@@ -10,9 +15,9 @@ qnn_context_sources = [
 qnn_context_headers = [
   meson.current_source_dir() / 'qnn_rpc_manager.h',
   meson.current_source_dir() / 'qnn_context_var.h',
+  meson.current_source_dir() / 'iotensor_wrapper.hpp',
 ]
 
-# Build as shared library plugin
 shared_library('qnn_context',
   qnn_context_sources,
   dependencies: nntrainer_dep,
@@ -22,17 +27,9 @@ shared_library('qnn_context',
   install_dir: nntrainer_libdir,
 )
 
-# Include directories for QNN
+# Make the kept nntrainer-side QNN headers reachable from elsewhere.
 nntrainer_inc += include_directories('.')
 nntrainer_inc_abs += meson.current_source_dir()
 
-# Add include paths so #include <IOTensor.hpp> works
-nntrainer_inc += include_directories('qnn', 'qnn/Utils', 'qnn/Log', 'qnn/PAL/include')
-nntrainer_inc_abs += meson.current_source_dir() / 'qnn'
-nntrainer_inc_abs += meson.current_source_dir() / 'qnn' / 'Utils'
-nntrainer_inc_abs += meson.current_source_dir() / 'qnn' / 'Log'
-nntrainer_inc_abs += meson.current_source_dir() / 'qnn' / 'PAL' / 'include'
-
-# Include QNN subdirectories
+# Layer-level QNN integration (QNNGraph / QNNLinear) and shared properties.
 subdir('qnn')
-subdir('qnn-api')

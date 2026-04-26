@@ -1,3 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2024 Jijoong Moon <jijoong.moon@samsung.com>
+ *
+ * @file   qnn_properties.cpp
+ * @date   08 Jan 2025
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @bug    No known bugs except for NYI items
+ * @brief  Property converters for QNN-specific layer attributes
+ *         (quantization params, tensor shapes, etc.) used by
+ *         QNNLinear / QNNGraph layers.
+ */
+
 #include "qnn_properties.h"
 
 namespace nntrainer {

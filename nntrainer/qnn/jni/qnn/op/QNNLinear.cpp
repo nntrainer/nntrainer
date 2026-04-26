@@ -1,3 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2025 Jijoong Moon <jijoong.moon@samsung.com>
+ *
+ * @file   QNNLinear.cpp
+ * @date   17 Jan 2025
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @bug    No known bugs except for NYI items
+ * @brief  Layer-level QNN integration for fully-connected ops. The
+ *         forwarding() method is intentionally a stub — the real
+ *         execution is captured into a QNN graph by QNNGraph::compile()
+ *         and submitted to the NPU as a single compiled blob.
+ */
+
 #include "QNNLinear.h"
 #include "QnnTypes.h"
 #include <cstdint>
