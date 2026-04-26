@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cl_kernels/flash_attention_fp32.h>
 #include <cl_kernels/flash_attention_prefill_fp32.h>
+#include <cl_kernels/flash_attention_prefill_fp32_adreno.h>
 #include <cl_kernels/flash_attention_decode_fp32.h>
 #ifdef ENABLE_FP16
 #include <cl_kernels/flash_attention_fp16.h>
@@ -148,6 +149,11 @@ static unsigned int select_ncols1(unsigned int seqlen_q, unsigned int ncols2) {
   return ncols1;
 }
 
+// Forward declarations for Adreno helper functions (defined after flash_attention_prefill_fp32_cl)
+static bool is_adreno_device();
+static bool supports_subgroups();
+static std::string get_subgroup_compile_option();
+
 void flash_attention_fp32_cl(float *query, float *key, float *value, float *output,
                              unsigned int seqlen_q, unsigned int seqlen_k,
                              unsigned int head_dim, unsigned int num_heads_q,
@@ -159,9 +165,16 @@ void flash_attention_fp32_cl(float *query, float *key, float *value, float *outp
                                   seqlen_q, seqlen_k, head_dim,
                                   num_heads_q, num_heads_kv, batch, scale);
   } else {
-    flash_attention_prefill_fp32_cl(query, key, value, output,
-                                   seqlen_q, seqlen_k, head_dim,
-                                   num_heads_q, num_heads_kv, batch, scale);
+    // On Adreno GPUs, use the Adreno-optimized prefill kernel
+    if (is_adreno_device()) {
+      flash_attention_prefill_fp32_adreno_cl(query, key, value, output,
+                                             seqlen_q, seqlen_k, head_dim,
+                                             num_heads_q, num_heads_kv, batch, scale);
+    } else {
+      flash_attention_prefill_fp32_cl(query, key, value, output,
+                                     seqlen_q, seqlen_k, head_dim,
+                                     num_heads_q, num_heads_kv, batch, scale);
+    }
   }
 }
 
@@ -261,6 +274,155 @@ void flash_attention_prefill_fp32_cl(float *query, float *key, float *value, flo
     throw std::runtime_error("Failed to read output data for flash_attention_prefill_fp32");
     return;
   }
+}
+
+/**
+ * @brief Check if the current GPU device is an Adreno (Qualcomm) GPU
+ * @detail Queries the OpenCL device vendor to determine if the GPU is Adreno.
+ *         Adreno GPUs support features not available on Mali (e.g., parallel
+ *         softmax with barriers, sub-groups, larger local memory).
+ * @return true if the device is an Adreno GPU, false otherwise
+ */
+static bool is_adreno_device() {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  const auto *device_info = blas_cc->context_inst_.getDeviceInfo();
+  if (!device_info) {
+    return false;
+  }
+
+  const std::string &vendor = device_info->getDeviceVendor();
+  std::string vendor_lower = vendor;
+  std::transform(vendor_lower.begin(), vendor_lower.end(), vendor_lower.begin(), ::tolower);
+  return (vendor_lower.find("qualcomm") != std::string::npos ||
+          vendor_lower.find("adreno") != std::string::npos);
+}
+
+/**
+ * @brief Check if the device supports sub-group operations
+ */
+static bool supports_subgroups() {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  const auto *device_info = blas_cc->context_inst_.getDeviceInfo();
+  if (!device_info) {
+    return false;
+  }
+
+  const std::string &extensions = device_info->getDeviceExtensions();
+  return extensions.find("cl_qcom_subgroups") != std::string::npos ||
+         extensions.find("cl_khr_subgroups") != std::string::npos;
+}
+
+/**
+ * @brief Get the compile option to enable sub-group support
+ */
+static std::string get_subgroup_compile_option() {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  const auto *device_info = blas_cc->context_inst_.getDeviceInfo();
+  if (!device_info) {
+    return "";
+  }
+
+  const std::string &extensions = device_info->getDeviceExtensions();
+  if (extensions.find("cl_qcom_subgroups") != std::string::npos) {
+    return "-DCL_QCOM_SUBGROUPS";
+  }
+  if (extensions.find("cl_khr_subgroups") != std::string::npos) {
+    return "-DCL_KHR_SUBGROUPS";
+  }
+  return "";
+}
+
+void flash_attention_prefill_fp32_adreno_cl(float *query, float *key, float *value,
+                                            float *output, unsigned int seqlen_q,
+                                            unsigned int seqlen_k, unsigned int head_dim,
+                                            unsigned int num_heads_q,
+                                            unsigned int num_heads_kv,
+                                            unsigned int batch, float scale) {
+  const unsigned int total_elements = batch * num_heads_q * seqlen_q * head_dim;
+  const unsigned int total_work_items = batch * num_heads_q * seqlen_q;
+
+  if (total_work_items < 32 || total_elements < 4096) {
+    flash_attention_cpu(query, key, value, output,
+                        seqlen_q, seqlen_k, head_dim,
+                        num_heads_q, num_heads_kv, batch, scale);
+    return;
+  }
+
+  const unsigned int gqa_ratio = num_heads_q / num_heads_kv;
+  unsigned int ncols2 = 1;
+  if (gqa_ratio >= 4 && seqlen_q > 4) {
+    ncols2 = 2;
+  }
+  if (ncols2 > MAX_NCOLS2) {
+    ncols2 = MAX_NCOLS2;
+  }
+
+  const unsigned int ncols1 = select_ncols1(seqlen_q, ncols2);
+  static const unsigned int PREFILL_WORK_GROUP_SIZE = 128;
+  const unsigned int num_q_groups = (seqlen_q + ncols1 - 1) / ncols1;
+  const unsigned int num_dispatches = (gqa_ratio + ncols2 - 1) / ncols2;
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+
+  std::string adreno_compile_options = get_subgroup_compile_option();
+  if (supports_subgroups()) {
+    ml_logi("Adreno FP32 prefill: sub-group extension detected (%s), "
+            "enabling hardware sub-group reductions",
+            adreno_compile_options.c_str() + 2);
+  } else {
+    ml_logi("Adreno FP32 prefill: no sub-group extension detected, "
+            "using manual barrier-based reductions");
+  }
+
+  ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
+    flash_attention_prefill_fp32_adreno_kernel, "flash_attention_prefill_fp32_adreno",
+    adreno_compile_options);
+  if (!kernel_ptr) {
+    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_prefill_fp32_adreno");
+    return;
+  }
+
+  for (unsigned int dispatch = 0; dispatch < num_dispatches; dispatch++) {
+    const unsigned int head_group_offset = dispatch * ncols2;
+    const unsigned int dispatch_ncols2 = std::min(ncols2, gqa_ratio - head_group_offset);
+    const unsigned int total_groups = batch * num_heads_kv * num_q_groups;
+
+    int arg = 0;
+    bool result = false;
+
+    result = kernel_ptr->SetKernelSVMArguments(arg++, query);
+    result = kernel_ptr->SetKernelSVMArguments(arg++, key);
+    result = kernel_ptr->SetKernelSVMArguments(arg++, value);
+    result = kernel_ptr->SetKernelSVMArguments(arg++, output);
+    result = kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
+    result = kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
+    result = kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
+    result = kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
+    result = kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
+    result = kernel_ptr->SetKernelArguments(arg++, &batch, sizeof(int));
+    result = kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
+    result = kernel_ptr->SetKernelArguments(arg++, &dispatch_ncols2, sizeof(int));
+    result = kernel_ptr->SetKernelArguments(arg++, &head_group_offset, sizeof(int));
+    result = kernel_ptr->SetKernelArguments(arg++, &ncols1, sizeof(int));
+
+    const int work_groups_count[3] = {(int)(total_groups * PREFILL_WORK_GROUP_SIZE), 1, 1};
+    const int work_group_size[3] = {(int)PREFILL_WORK_GROUP_SIZE, 1, 1};
+
+    result = blas_cc->command_queue_inst_.DispatchCommand(
+      kernel_ptr, work_groups_count, work_group_size);
+    if (!result) {
+      throw std::runtime_error("Failed to dispatch kernel for flash_attention_prefill_fp32_adreno");
+      return;
+    }
+  }
+
+  blas_cc->command_queue_inst_.enqueueSVMMap(output,
+                                             batch * num_heads_q * seqlen_q * head_dim * sizeof(float),
+                                             true);
 }
 
 void flash_attention_decode_fp32_cl(float *query, float *key, float *value,
@@ -469,85 +631,6 @@ void flash_attention_decode_fp32_cl(float *query, float *key, float *value,
 }
 
 #ifdef ENABLE_FP16
-
-/**
- * @brief Check if the current GPU device is an Adreno (Qualcomm) GPU
- * @detail Queries the OpenCL device vendor to determine if the GPU is Adreno.
- *         Adreno GPUs support features not available on Mali (e.g., parallel
- *         softmax with barriers + cl_khr_fp16, cl_qcom_subgroups, larger local memory).
- * @return true if the device is an Adreno GPU, false otherwise
- */
-static bool is_adreno_device() {
-  auto *blas_cc =
-    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  const auto *device_info = blas_cc->context_inst_.getDeviceInfo();
-  if (!device_info) {
-    return false;
-  }
-
-  const std::string &vendor = device_info->getDeviceVendor();
-  // Qualcomm Adreno GPUs report vendor as "QUALCOMM" (uppercase) or contain "Adreno"
-  // Use case-insensitive comparison
-  std::string vendor_lower = vendor;
-  std::transform(vendor_lower.begin(), vendor_lower.end(), vendor_lower.begin(), ::tolower);
-  return (vendor_lower.find("qualcomm") != std::string::npos ||
-          vendor_lower.find("adreno") != std::string::npos);
-}
-
-/**
- * @brief Check if the device supports sub-group operations
- * @detail Queries the OpenCL device extensions for sub-group support.
- *         Adreno GPUs may expose either:
- *         - cl_qcom_subgroups (older Qualcomm-specific extension, Adreno 6xx)
- *         - cl_khr_subgroups (standard Khronos extension, Adreno 7xx+/8xx)
- *         Both provide hardware-accelerated sub-group reductions
- *         (sub_group_reduce_max, sub_group_reduce_add) that are significantly
- *         faster than manual local memory reductions.
- *         The kernel uses #ifdef USE_SUBGROUPS to conditionally enable
- *         sub-group code paths. The appropriate -D flag is passed as a
- *         compile option based on which extension is available.
- * @return true if any sub-group extension is supported, false otherwise
- */
-static bool supports_subgroups() {
-  auto *blas_cc =
-    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  const auto *device_info = blas_cc->context_inst_.getDeviceInfo();
-  if (!device_info) {
-    return false;
-  }
-
-  const std::string &extensions = device_info->getDeviceExtensions();
-  // Check for both Qualcomm-specific and standard Khronos sub-group extensions
-  // cl_qcom_subgroups: older Adreno 6xx GPUs
-  // cl_khr_subgroups: standard extension, Adreno 7xx+/8xx and other GPUs
-  return extensions.find("cl_qcom_subgroups") != std::string::npos ||
-         extensions.find("cl_khr_subgroups") != std::string::npos;
-}
-
-/**
- * @brief Get the compile option to enable sub-group support
- * @detail Returns the appropriate -D flag based on which sub-group extension
- *         the device supports. The kernel uses #ifdef CL_QCOM_SUBGROUPS or
- *         #ifdef CL_KHR_SUBGROUPS to enable the correct pragma and code path.
- * @return compile option string, or empty string if no sub-group support
- */
-static std::string get_subgroup_compile_option() {
-  auto *blas_cc =
-    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  const auto *device_info = blas_cc->context_inst_.getDeviceInfo();
-  if (!device_info) {
-    return "";
-  }
-
-  const std::string &extensions = device_info->getDeviceExtensions();
-  if (extensions.find("cl_qcom_subgroups") != std::string::npos) {
-    return "-DCL_QCOM_SUBGROUPS";
-  }
-  if (extensions.find("cl_khr_subgroups") != std::string::npos) {
-    return "-DCL_KHR_SUBGROUPS";
-  }
-  return "";
-}
 
 /**
  * @brief Helper to convert FP16 buffers to FP32 for CPU fallback

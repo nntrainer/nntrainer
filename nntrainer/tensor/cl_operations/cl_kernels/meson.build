@@ -10,6 +10,7 @@ cl_op_kernels = [
   'dot.cl',
   'flash_attention_fp32.cl',
   'flash_attention_prefill_fp32.cl',
+  'flash_attention_prefill_fp32_adreno.cl',
   'flash_attention_decode_fp32.cl',
   'int4_gemv.cl',
   'int4_quantize_input.cl',

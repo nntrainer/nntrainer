@@ -121,6 +121,13 @@ void flash_attention_prefill_fp32_cl(float *query, float *key, float *value,
  * @param[in] batch batch size
  * @param[in] scale scaling factor for attention scores
  */
+void flash_attention_prefill_fp32_adreno_cl(float *query, float *key, float *value,
+                                            float *output, unsigned int seqlen_q,
+                                            unsigned int seqlen_k, unsigned int head_dim,
+                                            unsigned int num_heads_q,
+                                            unsigned int num_heads_kv,
+                                            unsigned int batch, float scale);
+
 void flash_attention_decode_fp32_cl(float *query, float *key, float *value,
                                     float *output, unsigned int seqlen_q,
                                     unsigned int seqlen_k, unsigned int head_dim,
