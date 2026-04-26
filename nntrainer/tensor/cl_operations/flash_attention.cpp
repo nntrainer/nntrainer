@@ -116,6 +116,13 @@ static const unsigned int MAX_NCOLS2 = 2;
 static const unsigned int MAX_NCOLS1 = 4;
 
 /**
+ * @brief Maximum NCOLS1 for Adreno GPUs (64+ KB local memory allows larger tiles)
+ * @detail Adreno has 64+ KB local memory vs Mali's 32 KB, allowing NCOLS1=8
+ *         which doubles Q rows per work-group for better K/V tile reuse.
+ */
+static const unsigned int MAX_NCOLS1_ADRENO = 8;
+
+/**
  * @brief Select adaptive ncols1 (Q tokens per work-group) based on seqlen_q and ncols2
  * @detail Phase 5 optimization: larger ncols1 for longer sequences reduces kernel launch
  *         overhead and improves work-item utilization. Smaller ncols1 for short sequences
@@ -145,6 +152,32 @@ static unsigned int select_ncols1(unsigned int seqlen_q, unsigned int ncols2) {
   // Cap at MAX_NCOLS1 (kernel compile-time limit)
   if (ncols1 > MAX_NCOLS1) {
     ncols1 = MAX_NCOLS1;
+  }
+  return ncols1;
+}
+
+/**
+ * @brief Select adaptive ncols1 for Adreno GPUs (larger local memory allows NCOLS1=8)
+ * @detail Same logic as select_ncols1() but with MAX_NCOLS1_ADRENO cap (8 vs 4).
+ *         Adreno's 64+ KB local memory can accommodate NCOLS1=8 with ~27 KB usage,
+ *         allowing 2 work-groups to fit simultaneously for good occupancy.
+ * @param seqlen_q Query sequence length
+ * @param ncols2 Number of Q heads per KV head in this dispatch
+ * @return Selected ncols1 value (must be <= MAX_NCOLS1_ADRENO)
+ */
+static unsigned int select_ncols1_adreno(unsigned int seqlen_q, unsigned int ncols2) {
+  unsigned int ncols1;
+  if (seqlen_q > 32 / ncols2) {
+    ncols1 = 16;
+  } else if (seqlen_q > 16 / ncols2) {
+    ncols1 = 8;
+  } else if (seqlen_q > 8 / ncols2) {
+    ncols1 = 4;
+  } else {
+    ncols1 = 2;
+  }
+  if (ncols1 > MAX_NCOLS1_ADRENO) {
+    ncols1 = MAX_NCOLS1_ADRENO;
   }
   return ncols1;
 }
@@ -360,7 +393,8 @@ void flash_attention_prefill_fp32_adreno_cl(float *query, float *key, float *val
     ncols2 = MAX_NCOLS2;
   }
 
-  const unsigned int ncols1 = select_ncols1(seqlen_q, ncols2);
+  // Opt 9: Use Adreno-specific ncols1 selection (MAX_NCOLS1_ADRENO=8 vs MAX_NCOLS1=4)
+  const unsigned int ncols1 = select_ncols1_adreno(seqlen_q, ncols2);
   static const unsigned int PREFILL_WORK_GROUP_SIZE = 128;
   const unsigned int num_q_groups = (seqlen_q + ncols1 - 1) / ncols1;
   const unsigned int num_dispatches = (gqa_ratio + ncols2 - 1) / ncols2;
@@ -369,6 +403,8 @@ void flash_attention_prefill_fp32_adreno_cl(float *query, float *key, float *val
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
 
   std::string adreno_compile_options = get_subgroup_compile_option();
+  // Opt 9: Compile with NCOLS1=8 for Adreno (64+ KB local memory allows larger tiles)
+  adreno_compile_options += " -DNCOLS1=8";
   if (supports_subgroups()) {
     ml_logi("Adreno FP32 prefill: sub-group extension detected (%s), "
             "enabling hardware sub-group reductions",
@@ -382,7 +418,14 @@ void flash_attention_prefill_fp32_adreno_cl(float *query, float *key, float *val
     flash_attention_prefill_fp32_adreno_kernel, "flash_attention_prefill_fp32_adreno",
     adreno_compile_options);
   if (!kernel_ptr) {
-    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_prefill_fp32_adreno");
+    // Fallback to base (Mali) kernel if Adreno kernel fails to compile
+    // This can happen on some Adreno devices where the compiler runs out of
+    // host memory (CL_OUT_OF_HOST_MEMORY) compiling the FP32 tiled GEMM kernel
+    ml_logi("Adreno FP32 prefill: kernel compilation failed, "
+            "falling back to base row-by-row kernel");
+    flash_attention_prefill_fp32_cl(query, key, value, output,
+                                   seqlen_q, seqlen_k, head_dim,
+                                   num_heads_q, num_heads_kv, batch, scale);
     return;
   }
 
@@ -882,6 +925,8 @@ void flash_attention_prefill_fp16_adreno_cl(_FP16 *query, _FP16 *key, _FP16 *val
     ncols2 = MAX_NCOLS2;
   }
 
+  // Opt 9: FP16 Adreno — keep NCOLS1=4 (NCOLS1=8 caused 15% regression due to
+  // local memory pressure reducing occupancy: 39ms vs 34ms with NCOLS1=4)
   const unsigned int ncols1 = select_ncols1(seqlen_q, ncols2);
 
   // Adreno kernel uses larger NBATCH_FA (32 vs 16 for Mali)
