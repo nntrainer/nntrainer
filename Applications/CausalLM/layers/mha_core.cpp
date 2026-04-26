@@ -68,10 +68,13 @@ MHACoreLayer::~MHACoreLayer() {}
 
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
-  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 4,
+  NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
                 std::invalid_argument)
-    << "Multi head Attention layer needs 3 or 4 inputs. (query, key, value and "
-       "mask is optional)";
+    << "Multi head Attention layer needs 3, 4, or 5 inputs. "
+       "(query, key, value; mask is optional; external cache_key + cache_value "
+       "for external cache mode)";
+
+  use_external_cache = (context.getNumInputs() >= 5);
   ml::train::TensorDim::TensorType activation_type = {
     context.getFormat(), context.getActivationDataType()};
   ml::train::TensorDim empty_dim(activation_type);
@@ -148,29 +151,32 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
 
-  /** Tensor for KV-Cache */
+  /** Tensor for KV-Cache (only allocate internally when not using external
+   * cache) */
+  if (!use_external_cache) {
 #ifdef ENABLE_FP16
-  ml::train::TensorDim cache_key_dim(
-    {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-    {context.getFormat(), ml::train::TensorDim::DataType::FP16});
-  ml::train::TensorDim cache_value_dim(
-    {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-    {context.getFormat(), ml::train::TensorDim::DataType::FP16});
+    ml::train::TensorDim cache_key_dim(
+      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+      {context.getFormat(), ml::train::TensorDim::DataType::FP16});
+    ml::train::TensorDim cache_value_dim(
+      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+      {context.getFormat(), ml::train::TensorDim::DataType::FP16});
 #else
-  ml::train::TensorDim cache_key_dim(
-    {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-    {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
-  ml::train::TensorDim cache_value_dim(
-    {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-    {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
+    ml::train::TensorDim cache_key_dim(
+      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+      {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
+    ml::train::TensorDim cache_value_dim(
+      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+      {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
 #endif
 
-  tensor_idx[AttentionParams::cache_key] = context.requestTensor(
-    cache_key_dim, "cache_key", nntrainer::Initializer::NONE, false,
-    nntrainer::TensorLifespan::MAX_LIFESPAN);
-  tensor_idx[AttentionParams::cache_value] = context.requestTensor(
-    cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
-    nntrainer::TensorLifespan::MAX_LIFESPAN);
+    tensor_idx[AttentionParams::cache_key] = context.requestTensor(
+      cache_key_dim, "cache_key", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::MAX_LIFESPAN);
+    tensor_idx[AttentionParams::cache_value] = context.requestTensor(
+      cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::MAX_LIFESPAN);
+  }
 
   theta = (float)std::get<props::RopeTheta>(mha_core_props).get();
 
@@ -186,12 +192,134 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 /************************************************************** */
 
 /**
- * @note This forwarding function is used for training mode.
- *       This will be implemented ASAP.
- * @date 2024-09-02
+ * @note In external KV cache mode (use_external_cache == true), this
+ *       implements the inference forward pass using cache tensors supplied
+ *       as input[3] (cache_key) and input[4] (cache_value). The host (e.g.
+ *       KVCacheManager via setExternalTensors) is responsible for owning
+ *       these buffers and for calling setCacheIndex() before each step to
+ *       set the write position. After this call cache_index is advanced by
+ *       input.height().
+ *
+ *       In legacy 3/4-input mode (use_external_cache == false) training is
+ *       NYI and incremental_forwarding() is the inference path.
+ *
+ *       Input layout for external cache mode:
+ *         input[0] = Q   (B, 1, step_size, num_heads_Q  * head_dim)
+ *         input[1] = K   (B, 1, step_size, num_heads_KV * head_dim)
+ *         input[2] = V   (B, 1, step_size, num_heads_KV * head_dim)
+ *         input[3] = cache_key   (B, 1, max_seq_len, num_heads_KV * head_dim)
+ *         input[4] = cache_value (B, 1, max_seq_len, num_heads_KV * head_dim)
  */
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
-                              bool training) {}
+                              bool training) {
+  if (!use_external_cache) {
+    return;
+  }
+
+  nntrainer::Tensor &query = context.getInput(INOUT_INDEX::QUERY);
+  nntrainer::Tensor &key = context.getInput(INOUT_INDEX::KEY);
+  nntrainer::Tensor &value = context.getInput(INOUT_INDEX::VALUE);
+  nntrainer::Tensor &output = context.getOutput(INOUT_INDEX::OUTPUT);
+
+  nntrainer::Tensor &cache_key = context.getInput(3);
+  nntrainer::Tensor &cache_value = context.getInput(4);
+
+  nntrainer::Tensor sink;
+  if (use_sink) {
+    sink = context.getWeight(sink_idx);
+  }
+
+  unsigned int step_size = query.height();
+  unsigned int from = cache_index;
+  unsigned int to = cache_index + step_size;
+
+  auto get_step_dim = [step_size](const ml::train::TensorDim &dim) {
+    auto step_dim = dim;
+    step_dim.batch(1);
+    step_dim.height(step_size);
+    return step_dim;
+  };
+
+  ml::train::TensorDim query_dim = query.getDim();
+  ml::train::TensorDim key_dim = key.getDim();
+  ml::train::TensorDim value_dim = value.getDim();
+  ml::train::TensorDim output_dim = output.getDim();
+  ml::train::TensorDim cache_key_dim = cache_key.getDim();
+  ml::train::TensorDim cache_value_dim = cache_value.getDim();
+
+  ml::train::TensorDim query_step_dim = get_step_dim(query_dim);
+  ml::train::TensorDim key_step_dim = get_step_dim(key_dim);
+  ml::train::TensorDim value_step_dim = get_step_dim(value_dim);
+  ml::train::TensorDim output_step_dim = get_step_dim(output_dim);
+  ml::train::TensorDim cache_key_step_dim = get_step_dim(cache_key_dim);
+  ml::train::TensorDim cache_value_step_dim = get_step_dim(cache_value_dim);
+
+  unsigned int batch_size = query_dim.batch();
+  for (unsigned int batch = 0; batch < batch_size; ++batch) {
+    nntrainer::Tensor query_step = query.getSharedDataTensor(
+      query_step_dim, batch * query_dim.getFeatureLen(), true);
+    nntrainer::Tensor key_step = key.getSharedDataTensor(
+      key_step_dim, batch * key_dim.getFeatureLen(), true);
+    nntrainer::Tensor value_step = value.getSharedDataTensor(
+      value_step_dim, batch * value_dim.getFeatureLen(), true);
+    nntrainer::Tensor output_step = output.getSharedDataTensor(
+      output_step_dim, batch * output_dim.getFeatureLen(), true);
+
+    if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+#if ENABLE_FP16 && defined(__ANDROID__)
+      nntrainer::TensorDim Q_step_dim = query_step_dim;
+      nntrainer::TensorDim K_step_dim = key_step_dim;
+      nntrainer::TensorDim V_step_dim = value_step_dim;
+      nntrainer::TensorDim O_step_dim = output_step_dim;
+      Q_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+      K_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+      V_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+      O_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+
+      nntrainer::Tensor Q_step = nntrainer::Tensor(Q_step_dim, true);
+      nntrainer::Tensor K_step = nntrainer::Tensor(K_step_dim, true);
+      nntrainer::Tensor V_step = nntrainer::Tensor(V_step_dim, true);
+      nntrainer::Tensor O_step = nntrainer::Tensor(O_step_dim, true);
+
+      Q_step.copyData(query_step);
+      K_step.copyData(key_step);
+      V_step.copyData(value_step);
+
+      if (use_sink) {
+        one_batch_incremental_forwarding(
+          batch, from, from, to, Q_step, K_step, V_step, O_step, cache_key,
+          cache_value, cache_key_dim, cache_key_step_dim, cache_value_dim,
+          cache_value_step_dim, sink);
+      } else {
+        one_batch_incremental_forwarding(batch, from, from, to, Q_step, K_step,
+                                         V_step, O_step, cache_key, cache_value,
+                                         cache_key_dim, cache_key_step_dim,
+                                         cache_value_dim, cache_value_step_dim);
+      }
+      output_step.copyData(O_step);
+#else
+      if (use_sink) {
+        one_batch_incremental_forwarding(
+          batch, from, from, to, query_step, key_step, value_step, output_step,
+          cache_key, cache_value, cache_key_dim, cache_key_step_dim,
+          cache_value_dim, cache_value_step_dim, sink);
+      } else {
+        one_batch_incremental_forwarding(
+          batch, from, from, to, query_step, key_step, value_step, output_step,
+          cache_key, cache_value, cache_key_dim, cache_key_step_dim,
+          cache_value_dim, cache_value_step_dim);
+      }
+#endif
+    } else {
+      one_batch_incremental_forwarding(
+        batch, from, from, to, query_step, key_step, value_step, output_step,
+        cache_key, cache_value, cache_key_dim, cache_key_step_dim,
+        cache_value_dim, cache_value_step_dim);
+    }
+  }
+
+  cache_index += step_size;
+}
 
 /**
  * @note This incremental_forwarding method is invoked for inference mode.
@@ -201,6 +329,15 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int _from, unsigned int _to,
                                           bool training) {
+  // External KV cache path: from/to are interpreted as the absolute write
+  // position; route through forwarding() which reads cache_key/cache_value
+  // from input slots 3/4. forwarding() advances cache_index internally.
+  if (use_external_cache) {
+    cache_index = _from;
+    forwarding(context, training);
+    return;
+  }
+
   /// @todo replace step_size into input height
   unsigned int step_size = _to - _from;
 

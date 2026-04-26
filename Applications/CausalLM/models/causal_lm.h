@@ -39,6 +39,7 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <kv_cache_manager.h>
 #include <transformer.h>
 
 namespace causallm {
@@ -156,6 +157,33 @@ protected:
   bool has_run_ = false;
 
   std::mt19937 rng; /**< Random Number Gen */
+
+  /**
+   * @brief Externalized KV cache (host-owned). Allocated by allocateKVCache()
+   *        once the model has been compiled (so we have the layer count,
+   *        head count, etc.) and bound to mha_core's input slots
+   *        cache_k_l<i> / cache_v_l<i> via Model::setExternalTensors.
+   */
+  KVCacheManager kv_cache;
+
+  /**
+   * @brief Allocate kv_cache and bind it to all mha_core layers via
+   *        Model::setExternalTensors. Idempotent — safe to call once after
+   *        initialize().
+   */
+  void allocateAndBindKVCache();
+
+  /**
+   * @brief Reset all mha_core layers' cache_index to @p pos and the
+   *        KVCacheManager's tracked write position.
+   */
+  void setKVCachePosition(unsigned int pos);
+
+  /**
+   * @brief Advance all mha_core layers' cache_index by @p step_size and
+   *        update the KVCacheManager's tracked write position.
+   */
+  void advanceKVCachePosition(unsigned int step_size);
 };
 
 } // namespace causallm

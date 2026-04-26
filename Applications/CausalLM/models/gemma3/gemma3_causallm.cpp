@@ -175,6 +175,10 @@ Tensor Gemma3Transformer::createAttention(const int layer_id, int seq_len,
     }
   }
 
+  // External KV cache placeholders (per-layer). Storage is owned by the host
+  // (KVCacheManager) and bound at runtime via setExternalTensors.
+  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
+
   LayerHandle mha(createLayer(
     "mha_core",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
@@ -185,7 +189,7 @@ Tensor Gemma3Transformer::createAttention(const int layer_id, int seq_len,
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
-  Tensor a = mha({q_normed, k_normed, v});
+  Tensor a = mha({q_normed, k_normed, v, cache_k, cache_v});
 
   // O layer
   LayerHandle wo(createLayer(

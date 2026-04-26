@@ -62,6 +62,10 @@ Tensor GptOssForCausalLM::createAttention(const int layer_id, int seq_len,
      withKey("disable_bias", "false"), withKey("weight_initializer", "ones")}));
   Tensor v = wv(value);
 
+  // External KV cache placeholders (per-layer). Storage is owned by the host
+  // (KVCacheManager) and bound at runtime via setExternalTensors.
+  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
+
   // Attention core layer
   unsigned sliding_window =
     (LAYER_TYPES[layer_id] == "sliding_attention") ? SLIDING_WINDOW : UINT_MAX;
@@ -79,7 +83,7 @@ Tensor GptOssForCausalLM::createAttention(const int layer_id, int seq_len,
      withKey("rope_scaling_factor", ATTENTION_ROPE_SCALING_FACTOR),
      withKey("rope_scaling_type", "yarn"),
      withKey("rope_scaling_max_position_embeddings", 4096)}));
-  Tensor a = mha({q, k, v});
+  Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer
   LayerHandle wo(createLayer(

@@ -166,6 +166,20 @@ protected:
                            Tensor input);
 
   /**
+   * @brief Create the per-layer external KV-cache placeholder Tensors that
+   *        feed mha_core's input slots 3 and 4. The actual storage is owned
+   *        by the host (e.g. KVCacheManager) and is bound at runtime via
+   *        Model::setExternalTensors using the names
+   *          "cache_k_l<layer_id>" and "cache_v_l<layer_id>".
+   * @param layer_id  attention layer index
+   * @param n_heads   total query heads (used together with GQA_SIZE to derive
+   *                  the KV head count)
+   * @return {cache_k, cache_v} symbolic placeholder tensors
+   */
+  std::pair<Tensor, Tensor> createKVCachePlaceholders(const int layer_id,
+                                                      int n_heads);
+
+  /**
    * @brief register CustomLayers
    */
   virtual void registerCustomLayers();

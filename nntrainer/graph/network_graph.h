@@ -695,15 +695,23 @@ private:
    */
   void setExecutionOrder();
 
+public:
   /**
    * @brief Set external data to the given tensors with name
    *
-   * @param data External data
-   * @param names Names of the tensor to set the data to
+   * Bind externally-owned tensors into the graph by input layer name (or
+   * label name). Each name must match an input layer that was declared in
+   * the symbolic graph; the matching tensor is wired into the layer's
+   * placeholder zero-copy. The caller retains ownership of the data.
+   *
+   * @param data  External data; size must match @p names (or be 1 for
+   *              broadcast).
+   * @param names Input-layer names to bind to.
    */
   void setExternalTensors(const std::vector<Tensor> &data,
                           const std::vector<std::string> names);
 
+private:
   /**
    * @brief     Optimize the graph memory utilization for in-place operations
    */

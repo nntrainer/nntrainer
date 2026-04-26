@@ -33,6 +33,7 @@
 #include <layer_context.h>
 #include <lm_head.h>
 #include <mha_core.h>
+#include <nntrainer_error.h>
 #include <tensor.h>
 
 #include <causal_lm.h>
@@ -101,6 +102,63 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   global_token_len = 0;
 }
 
+void CausalLM::allocateAndBindKVCache() {
+  if (kv_cache.isAllocated())
+    return;
+
+    // dtype matches mha_core's internal cache choice (kept consistent so
+    // saved caches stay binary-compatible across the 3-input/5-input modes).
+#ifdef ENABLE_FP16
+  const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
+#else
+  const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+
+  const unsigned int max_timestep =
+    static_cast<unsigned int>(INIT_SEQ_LEN + NUM_TO_GENERATE);
+
+  kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
+                    max_timestep,
+                    static_cast<unsigned int>(NUM_KEY_VALUE_HEADS),
+                    static_cast<unsigned int>(HEAD_DIM), cache_dtype);
+
+  // Bind each (layer, K|V) buffer into the corresponding input layer
+  // declared by Transformer::createKVCachePlaceholders(). The names here
+  // must match what createKVCachePlaceholders() registers with the model.
+  // We look up each placeholder by name and point it at our cache slab —
+  // this is the same wiring Model::setExternalTensors used to do, just
+  // without going through that API.
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    auto &kc = kv_cache.getKeyCache(i);
+    auto &vc = kv_cache.getValueCache(i);
+
+    auto *kp = model->getTensor("cache_k_l" + std::to_string(i));
+    auto *vp = model->getTensor("cache_v_l" + std::to_string(i));
+    NNTR_THROW_IF(kp == nullptr || vp == nullptr, std::runtime_error)
+      << "allocateAndBindKVCache: cache_k_l" << i << " / cache_v_l" << i
+      << " input placeholder not found in compiled graph";
+
+    kp->setData(kc.getMemoryData(), kc.getOffset(), false);
+    vp->setData(vc.getMemoryData(), vc.getOffset(), false);
+  }
+}
+
+void CausalLM::setKVCachePosition(unsigned int pos) {
+  kv_cache.setPosition(pos);
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [pos](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
+      if (l.getType() == causallm::MHACoreLayer::type)
+        dynamic_cast<causallm::MHACoreLayer &>(l).setCacheIndex(pos);
+    };
+  model->forEachLayer(fn, nullptr);
+}
+
+void CausalLM::advanceKVCachePosition(unsigned int step_size) {
+  // mha_core advances its own cache_index inside forwarding(), so the host
+  // only has to keep KVCacheManager's tracked position in sync.
+  kv_cache.advance(step_size);
+}
+
 std::pair<Tensor, Tensor> CausalLM::constructModel() {
 
   // base transformer (input, output_norm)
@@ -161,61 +219,21 @@ void CausalLM::registerOutputs(
 }
 
 void CausalLM::save_kvcache(std::string path, int to_) {
-  auto f = nntrainer::checkedOpenStream<std::ofstream>(
-    path, std::ios::out | std::ios::binary | std::ios::trunc);
-
-  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&f](ml::train::Layer &l, nntrainer::RunLayerContext &context,
-              void *idx) {
-      if (l.getType() == causallm::MHACoreLayer::type) {
-        int to = static_cast<int>(reinterpret_cast<intptr_t>(idx));
-        auto k_cache = context.getTensor(0);
-        auto v_cache = context.getTensor(1);
-        ml::train::TensorDim k_dim = k_cache.getDim();
-        ml::train::TensorDim v_dim = v_cache.getDim();
-        k_dim.height(to);
-        v_dim.height(to);
-        nntrainer::Tensor k_cache_prompt =
-          k_cache.getSharedDataTensor(k_dim, 0, true);
-        nntrainer::Tensor v_cache_prompt =
-          v_cache.getSharedDataTensor(v_dim, 0, true);
-        k_cache_prompt.save(f);
-        v_cache_prompt.save(f);
-      }
-    };
-  void *arg = reinterpret_cast<void *>(static_cast<intptr_t>(to_));
-  model->forEachLayer(fn, arg);
-  f.close();
+  if (!kv_cache.isAllocated()) {
+    throw std::runtime_error(
+      "save_kvcache called before allocateAndBindKVCache()");
+  }
+  kv_cache.save(path, static_cast<unsigned int>(to_));
 }
 
 void CausalLM::load_kvcache(std::string path, int to_) {
-  auto f = nntrainer::checkedOpenStream<std::ifstream>(
-    path, std::ios::in | std::ios::binary);
-
-  model->allocate(ml::train::ExecutionMode::INFERENCE);
-
-  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [&f](ml::train::Layer &l, nntrainer::RunLayerContext &context,
-              void *idx) {
-      if (l.getType() == causallm::MHACoreLayer::type) {
-        auto k_cache = context.getTensor(0);
-        auto v_cache = context.getTensor(1);
-        int to = static_cast<int>(reinterpret_cast<intptr_t>(idx));
-        ml::train::TensorDim k_dim = k_cache.getDim();
-        ml::train::TensorDim v_dim = v_cache.getDim();
-        k_dim.height(to);
-        v_dim.height(to);
-        nntrainer::Tensor k_cache_prompt =
-          k_cache.getSharedDataTensor(k_dim, 0, true);
-        nntrainer::Tensor v_cache_prompt =
-          v_cache.getSharedDataTensor(v_dim, 0, true);
-        k_cache_prompt.read(f);
-        v_cache_prompt.read(f);
-      }
-    };
-  void *arg = reinterpret_cast<void *>(static_cast<intptr_t>(to_));
-  model->forEachLayer(fn, arg);
-  f.close();
+  if (!kv_cache.isAllocated()) {
+    allocateAndBindKVCache();
+  }
+  kv_cache.load(path, static_cast<unsigned int>(to_));
+  // mha_core layers each track their own cache_index; sync them all to the
+  // newly-loaded position so the next forwarding() writes at the right slot.
+  setKVCachePosition(static_cast<unsigned int>(to_));
 }
 
 std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
@@ -294,6 +312,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     throw std::runtime_error("CausalLM model is not initialized. Please call "
                              "initialize() before run().");
   }
+
+  // Allocate the host-owned KV cache and bind it to mha_core's external cache
+  // input slots. Idempotent — only the first call does work; subsequent runs
+  // reuse the same buffers and reset write position from the load_kvcache /
+  // setKVCachePosition call below.
+  allocateAndBindKVCache();
+  setKVCachePosition(0);
 
   has_run_ = false;
 

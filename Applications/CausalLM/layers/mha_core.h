@@ -295,6 +295,18 @@ public:
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
+  /**
+   * @brief Set the cache index for external cache mode.
+   *        Must be called before forwarding() when use_external_cache is true.
+   * @param[in] idx current write position in the KV cache
+   */
+  WIN_EXPORT void setCacheIndex(unsigned int idx) { cache_index = idx; }
+
+  /**
+   * @brief Get the current cache index
+   */
+  WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
+
   inline static const std::string type = "mha_core";
 
 private:
@@ -315,6 +327,15 @@ private:
 
   float epsilon;            /** to avoid overflow */
   unsigned int cache_index; /** idx of kv cache */
+
+  /**
+   * @brief Whether to use externally provided cache tensors
+   *        (true when num_inputs >= 5, i.e., Q, K, V + cache_key + cache_value)
+   *        In external mode mha_core does not allocate its own cache tensors,
+   *        and reads cache slots from input[3] (cache_key) and input[4]
+   *        (cache_value) which are bound by the host via setExternalTensors.
+   */
+  bool use_external_cache = false;
 
   /** intermal info */
   size_t num_heads_Q;

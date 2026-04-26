@@ -297,6 +297,28 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
   return decoder_output({residual, ffn_out});
 }
 
+std::pair<Tensor, Tensor>
+Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
+  const unsigned int max_timestep =
+    static_cast<unsigned int>(INIT_SEQ_LEN + NUM_TO_GENERATE);
+  const unsigned int kv_width =
+    static_cast<unsigned int>(HEAD_DIM * n_heads / GQA_SIZE);
+
+#ifdef ENABLE_FP16
+  ml::train::TensorDim cache_dim(
+    {BATCH_SIZE, 1, max_timestep, kv_width},
+    {ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::FP16});
+#else
+  ml::train::TensorDim cache_dim({BATCH_SIZE, 1, max_timestep, kv_width},
+                                 {ml::train::TensorDim::Format::NCHW,
+                                  ml::train::TensorDim::DataType::UINT16});
+#endif
+
+  Tensor cache_k(cache_dim, "cache_k_l" + std::to_string(layer_id));
+  Tensor cache_v(cache_dim, "cache_v_l" + std::to_string(layer_id));
+  return {cache_k, cache_v};
+}
+
 Tensor Transformer::createAttention(const int layer_id, int seq_len,
                                     int n_heads, int head_dim, Tensor query,
                                     Tensor key, Tensor value) {
@@ -325,6 +347,10 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
      withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
   Tensor v = wv(value);
 
+  // External KV cache placeholders (per-layer). Their actual storage is owned
+  // by the host (KVCacheManager) and bound at runtime via setExternalTensors.
+  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
+
   // Attention core layer
   LayerHandle mha(createLayer(
     "mha_core",
@@ -337,7 +363,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
      withKey("rope_theta", ROPE_THETA),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
-  Tensor a = mha({q, k, v});
+  Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer
   LayerHandle wo(createLayer(
