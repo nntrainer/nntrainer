@@ -31,87 +31,77 @@
 
 namespace causallm {
 
-std::vector<LayerHandle> GptOssCachedSlimCausalLM::createAttention(
-  const int layer_id, int seq_len, int n_heads, int head_dim,
-  std::string query_name, std::string key_name, std::string value_name) {
-
-  std::vector<LayerHandle> layers;
+Tensor GptOssCachedSlimCausalLM::createAttention(const int layer_id,
+                                                 int seq_len, int n_heads,
+                                                 int head_dim, Tensor query,
+                                                 Tensor key, Tensor value) {
 
   ///@note Q/K/V/O has bias!
-  auto Q = "layer" + std::to_string(layer_id) + "_wq";
-  auto K = "layer" + std::to_string(layer_id) + "_wk";
-  auto V = "layer" + std::to_string(layer_id) + "_wv";
-  auto A = "layer" + std::to_string(layer_id) + "_attention";
-  auto O = "layer" + std::to_string(layer_id) + "_attention_out";
 
   // V layer
-  std::vector<std::string> v_params = {
-    withKey("name", V), withKey("unit", head_dim * n_heads / GQA_SIZE),
-    withKey("disable_bias", "false"), withKey("input_layers", value_name),
-    withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", v_params));
+  LayerHandle wv(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
+     withKey("unit", head_dim * n_heads / GQA_SIZE),
+     withKey("disable_bias", "false"), withKey("weight_initializer", "ones")}));
+  Tensor v = wv(value);
 
   // K layer
-  std::vector<std::string> k_params = {
-    withKey("name", K), withKey("unit", head_dim * n_heads / GQA_SIZE),
-    withKey("disable_bias", "false"), withKey("input_layers", key_name),
-    withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", k_params));
+  LayerHandle wk(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
+     withKey("unit", head_dim * n_heads / GQA_SIZE),
+     withKey("disable_bias", "false"), withKey("weight_initializer", "ones")}));
+  Tensor k = wk(key);
 
   // Q layer
-  std::vector<std::string> q_params = {
-    withKey("name", Q), withKey("unit", head_dim * n_heads),
-    withKey("disable_bias", "false"), withKey("input_layers", query_name),
-    withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", q_params));
+  LayerHandle wq(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
+     withKey("unit", head_dim * n_heads), withKey("disable_bias", "false"),
+     withKey("weight_initializer", "ones")}));
+  Tensor q = wq(query);
 
   // Attention core layer
-  // layer_types[layer_id] == "sliding_attention"
-  // layer_types[layer_id] == "full_attention"
   unsigned sliding_window =
     (LAYER_TYPES[layer_id] == "sliding_attention") ? SLIDING_WINDOW : UINT_MAX;
-  // this attention use sink!
-  std::vector<std::string> a_params = {
-    withKey("name", A),
-    withKey("num_heads", n_heads),
-    withKey("num_heads_kv", n_heads / GQA_SIZE),
-    withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
-    withKey("sliding_window", sliding_window),
-    withKey("rope_theta", ROPE_THETA),
-    withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
-    withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-    withKey("use_sink", "true"),
-    withKey("rope_scaling_factor", ATTENTION_ROPE_SCALING_FACTOR),
-    withKey("rope_scaling_type", "yarn"),
-    withKey("rope_scaling_max_position_embeddings", 4096),
-    withKey("input_layers", {Q, K, V})};
-  layers.push_back(createLayer("mha_core", a_params));
+  // this attention uses sink!
+  LayerHandle mha(createLayer(
+    "mha_core",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
+     withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
+     withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
+     withKey("sliding_window", sliding_window),
+     withKey("rope_theta", ROPE_THETA),
+     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
+     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+     withKey("use_sink", "true"),
+     withKey("rope_scaling_factor", ATTENTION_ROPE_SCALING_FACTOR),
+     withKey("rope_scaling_type", "yarn"),
+     withKey("rope_scaling_max_position_embeddings", 4096)}));
+  Tensor a = mha({q, k, v});
 
   // O layer
-  std::vector<std::string> o_params = {
-    withKey("name", O), withKey("unit", DIM), withKey("disable_bias", "false"),
-    withKey("input_layers", A), withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", o_params));
-
-  return layers;
+  LayerHandle wo(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
+     withKey("unit", DIM), withKey("disable_bias", "false"),
+     withKey("weight_initializer", "ones")}));
+  return wo(a);
 }
 
-std::vector<LayerHandle>
-GptOssCachedSlimCausalLM::createMlp(const int layer_id, int dim, int hidden_dim,
-                                    std::string input_name) {
+Tensor GptOssCachedSlimCausalLM::createMlp(const int layer_id, int dim,
+                                           int hidden_dim, Tensor input) {
 
-  std::vector<LayerHandle> layers;
-  layers.push_back(createLayer(
+  LayerHandle moe(createLayer(
     "gpt_oss_moe_slim_cached",
     {
       withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
-      withKey("input_layers", input_name),
       withKey("unit", hidden_dim),
       withKey("num_experts", NUM_EXPERTS),
       withKey("num_experts_per_token", NUM_EXPERTS_PER_TOK),
     }));
-
-  return layers;
+  return moe(input);
 }
 
 void GptOssCachedSlimCausalLM::setupParameters(json &cfg, json &generation_cfg,

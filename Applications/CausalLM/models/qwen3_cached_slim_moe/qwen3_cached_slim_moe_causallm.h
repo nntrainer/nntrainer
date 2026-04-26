@@ -35,9 +35,8 @@ public:
 
   virtual ~Qwen3CachedSlimMoECausalLM() = default;
 
-  std::vector<LayerHandle> createMlp(const int layer_id, int dim,
-                                     int hidden_dim,
-                                     std::string input_name) override;
+  Tensor createMlp(const int layer_id, int dim, int hidden_dim,
+                   Tensor input) override;
 
   void setupParameters(json &cfg, json &generation_cfg,
                        json &nntr_cfg) override;

@@ -101,27 +101,28 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   global_token_len = 0;
 }
 
-void CausalLM::constructModel() {
+std::pair<Tensor, Tensor> CausalLM::constructModel() {
 
-  // It adds all transformer model's block to model
-  Transformer::constructModel();
+  // base transformer (input, output_norm)
+  auto [x, h] = Transformer::constructModel();
 
   const std::string lmhead_type =
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
 
-  // add lmhead
   std::vector<std::string> lmhead_prop = {
     withKey("name", "output_of_causallm"),
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true"),
-    withKey("input_layers", "output_norm"),
     withKey("weight_dtype", LMHEAD_DTYPE),
   };
 
   if (TIE_WORD_EMBEDDINGS)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
 
-  model->addLayer(createLayer(lmhead_type, lmhead_prop));
+  LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));
+  Tensor y = lmhead(h);
+
+  return {x, y};
 }
 
 void CausalLM::registerOutputs(

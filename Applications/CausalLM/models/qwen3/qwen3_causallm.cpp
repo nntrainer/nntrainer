@@ -30,76 +30,70 @@
 
 namespace causallm {
 
-std::vector<LayerHandle> Qwen3Transformer::createAttention(
-  const int layer_id, int seq_len, int n_heads, int head_dim,
-  std::string query_name, std::string key_name, std::string value_name) {
-
-  std::vector<LayerHandle> layers;
-  auto Q = "layer" + std::to_string(layer_id) + "_wq";
-  auto Q_norm = "layer" + std::to_string(layer_id) + "_q_norm";
-  auto K = "layer" + std::to_string(layer_id) + "_wk";
-  auto K_norm = "layer" + std::to_string(layer_id) + "_k_norm";
-  auto V = "layer" + std::to_string(layer_id) + "_wv";
-  auto A = "layer" + std::to_string(layer_id) + "_attention";
-  auto O = "layer" + std::to_string(layer_id) + "_attention_out";
+Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
+                                         int n_heads, int head_dim,
+                                         Tensor query, Tensor key,
+                                         Tensor value) {
 
   // Q layer
-  std::vector<std::string> q_params = {
-    withKey("name", Q), withKey("unit", head_dim * n_heads),
-    withKey("disable_bias", "true"), withKey("input_layers", query_name),
-    withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", q_params));
+  LayerHandle wq(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
+     withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
+     withKey("weight_initializer", "ones")}));
+  Tensor q = wq(query);
 
-  // Q-reshaped-norm layer
-  // q_norm(q_proj.view(hidden_shape))
-  std::vector<std::string> q_norm_params = {
-    withKey("name", Q_norm), withKey("input_layers", Q),
-    withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(head_dim))};
-  layers.push_back(createLayer("reshaped_rms_norm", q_norm_params));
+  // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape)))
+  LayerHandle q_norm(createLayer(
+    "reshaped_rms_norm",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
+     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("feature_size", std::to_string(head_dim))}));
+  Tensor q_normed = q_norm(q);
 
   // K layer
-  std::vector<std::string> k_params = {
-    withKey("name", K), withKey("unit", head_dim * n_heads / GQA_SIZE),
-    withKey("disable_bias", "true"), withKey("input_layers", key_name),
-    withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", k_params));
+  LayerHandle wk(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
+     withKey("unit", head_dim * n_heads / GQA_SIZE),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+  Tensor k = wk(key);
 
-  // K-reshaped-norm layer
-  // k_norm(k_proj.view(hidden_shape))
-  std::vector<std::string> k_norm_params = {
-    withKey("name", K_norm), withKey("input_layers", K),
-    withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-    withKey("feature_size", std::to_string(head_dim))};
-  layers.push_back(createLayer("reshaped_rms_norm", k_norm_params));
+  // K-reshaped-norm layer (k_norm(k_proj.view(hidden_shape)))
+  LayerHandle k_norm(createLayer(
+    "reshaped_rms_norm",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
+     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
+     withKey("feature_size", std::to_string(head_dim))}));
+  Tensor k_normed = k_norm(k);
 
   // V layer
-  std::vector<std::string> v_params = {
-    withKey("name", V), withKey("unit", head_dim * n_heads / GQA_SIZE),
-    withKey("disable_bias", "true"), withKey("input_layers", value_name),
-    withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", v_params));
+  LayerHandle wv(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
+     withKey("unit", head_dim * n_heads / GQA_SIZE),
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+  Tensor v = wv(value);
 
   // Attention core layer
-  std::vector<std::string> a_params = {
-    withKey("name", A),
-    withKey("num_heads", n_heads),
-    withKey("num_heads_kv", n_heads / GQA_SIZE),
-    withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
-    withKey("sliding_window", SLIDING_WINDOW),
-    withKey("rope_theta", ROPE_THETA),
-    withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
-    withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-    withKey("input_layers", {Q_norm, K_norm, V})};
-  layers.push_back(createLayer("mha_core", a_params));
+  LayerHandle mha(createLayer(
+    "mha_core",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
+     withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
+     withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
+     withKey("sliding_window", SLIDING_WINDOW),
+     withKey("rope_theta", ROPE_THETA),
+     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
+     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE))}));
+  Tensor a = mha({q_normed, k_normed, v});
 
   // O layer
-  std::vector<std::string> o_params = {
-    withKey("name", O), withKey("unit", DIM), withKey("disable_bias", "true"),
-    withKey("input_layers", A), withKey("weight_initializer", "ones")};
-  layers.push_back(createLayer("fully_connected", o_params));
-
-  return layers;
+  LayerHandle wo(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
+     withKey("unit", DIM), withKey("disable_bias", "true"),
+     withKey("weight_initializer", "ones")}));
+  return wo(a);
 }
 
 void Qwen3Transformer::registerCustomLayers() {

@@ -98,7 +98,11 @@ void SentenceTransformer::setupParameters(json &cfg, json &generation_cfg,
   }
 }
 
-void SentenceTransformer::constructModel() {
+std::pair<Tensor, Tensor> SentenceTransformer::constructModel() {
+
+  Tensor x;
+  Tensor h;
+
   for (auto &module : modules) {
     if (!module.contains("type")) {
       continue;
@@ -107,21 +111,30 @@ void SentenceTransformer::constructModel() {
     std::string component = getLastComponent(type);
 
     if (component == "Transformer") {
-      Transformer::constructModel();
+      auto result = Transformer::constructModel();
+      x = result.first;
+      h = result.second;
     } else {
       if (module.contains("idx")) {
+        if (!h.isValid()) {
+          throw std::runtime_error(
+            "SentenceTransformer: encountered module '" + type +
+            "' before any Transformer module — input tensor is undefined.");
+        }
         int idx = module["idx"].get<int>();
-        // Add module layer using properties from loaded config
-        addModule(type, idx);
+        h = addModule(type, idx, h);
       } else {
         std::cerr << "Warning: Module does not have idx field, skipping: "
                   << type << std::endl;
       }
     }
   }
+
+  return {x, h};
 }
 
-void SentenceTransformer::addModule(const std::string &type, int idx) {
+Tensor SentenceTransformer::addModule(const std::string &type, int idx,
+                                      Tensor input) {
   json config;
   if (module_configs.find(idx) != module_configs.end()) {
     config = module_configs[idx];
@@ -142,8 +155,9 @@ void SentenceTransformer::addModule(const std::string &type, int idx) {
 
   if (layer_name.empty()) {
     std::cerr << "Warning: No layer mapping found for module type: " << type
-              << " (component: " << component << "). Skipping." << std::endl;
-    return;
+              << " (component: " << component
+              << "). Skipping (passing input through)." << std::endl;
+    return input;
   }
 
   // Convert JSON config to nntrainer property format (key=value strings)
@@ -174,8 +188,8 @@ void SentenceTransformer::addModule(const std::string &type, int idx) {
     }
   }
 
-  LayerHandle layer = ml::train::createLayer(layer_name, props);
-  model->addLayer(layer);
+  LayerHandle layer(ml::train::createLayer(layer_name, props));
+  return layer(input);
 }
 
 void SentenceTransformer::run(const WSTR prompt, bool do_sample,

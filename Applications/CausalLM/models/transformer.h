@@ -38,6 +38,8 @@
 #include <map>
 #include <model.h>
 #include <random>
+#include <tensor_api.h>
+#include <utility>
 
 #include <limits.h>
 
@@ -50,7 +52,8 @@
 namespace causallm {
 
 /*** ALIAS ****/
-using LayerHandle = std::shared_ptr<ml::train::Layer>;
+using LayerHandle = ml::train::LayerHandle;
+using Tensor = ml::train::Tensor;
 using ModelHandle = std::unique_ptr<ml::train::Model>;
 
 using json = nlohmann::json;
@@ -130,29 +133,37 @@ protected:
 
   /**
    * @brief Construct Model
+   * @return {input_tensor, output_tensor} pair representing the symbolic
+   *         tensor graph. Derived classes can extend by taking the output
+   *         and feeding additional layers before returning.
    */
-  virtual void constructModel();
+  virtual std::pair<Tensor, Tensor> constructModel();
 
   /**
-   * @brief create Attention Layer
+   * @brief Create one Transformer decoder block (norm + attention + residual +
+   *        norm + ffn + residual)
+   * @param layer_id index of the decoder block
+   * @param input    symbolic input tensor for this block
+   * @return symbolic output tensor of the block
    */
-  virtual std::vector<LayerHandle>
-  createTransformerDecoderBlock(const int layer_id, std::string input_name);
+  virtual Tensor createTransformerDecoderBlock(const int layer_id,
+                                               Tensor input);
 
   /**
-   * @brief create Attention Layer
+   * @brief Create the attention sub-graph (Q/K/V projections + mha_core +
+   *        output projection)
+   * @return symbolic output tensor of the attention sub-graph
    */
-  virtual std::vector<LayerHandle>
-  createAttention(const int layer_id, int seq_len, int n_heads, int head_dim,
-                  std::string query_name, std::string key_name,
-                  std::string value_name);
+  virtual Tensor createAttention(const int layer_id, int seq_len, int n_heads,
+                                 int head_dim, Tensor query, Tensor key,
+                                 Tensor value);
 
   /**
-   * @brief create Feed Forward Layer
+   * @brief Create the feed-forward sub-graph
+   * @return symbolic output tensor of the FFN sub-graph
    */
-  virtual std::vector<LayerHandle> createMlp(const int layer_id, int dim,
-                                             int hidden_dim,
-                                             std::string input_name);
+  virtual Tensor createMlp(const int layer_id, int dim, int hidden_dim,
+                           Tensor input);
 
   /**
    * @brief register CustomLayers

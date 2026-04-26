@@ -46,20 +46,16 @@ void Qwen3CachedSlimMoECausalLM::setupParameters(json &cfg,
   }
 }
 
-std::vector<LayerHandle>
-Qwen3CachedSlimMoECausalLM::createMlp(const int layer_id, int dim,
-                                      int hidden_dim, std::string input_name) {
+Tensor Qwen3CachedSlimMoECausalLM::createMlp(const int layer_id, int dim,
+                                             int hidden_dim, Tensor input) {
 
-  std::vector<LayerHandle> layers;
-  layers.push_back(createLayer(
+  LayerHandle moe(createLayer(
     "moe_cached_slim",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
-     withKey("input_layers", input_name), withKey("unit", hidden_dim),
-     withKey("num_experts", NUM_EXPERTS),
+     withKey("unit", hidden_dim), withKey("num_experts", NUM_EXPERTS),
      withKey("num_experts_per_token", NUM_EXPERTS_PER_TOK),
      withKey("moe_activation", "swish")}));
-
-  return layers;
+  return moe(input);
 }
 
 void Qwen3CachedSlimMoECausalLM::registerCustomLayers() {

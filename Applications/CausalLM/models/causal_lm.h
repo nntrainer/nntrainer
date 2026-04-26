@@ -93,9 +93,10 @@ protected:
                                json &nntr_cfg) override;
 
   /**
-   * @brief Construct Model
+   * @brief Construct Model — extends Transformer's symbolic graph with the
+   *        LM-head and returns the final {input, logits} pair.
    */
-  virtual void constructModel() override;
+  virtual std::pair<Tensor, Tensor> constructModel() override;
 
   /**
    * @brief register Outputs
