@@ -11,10 +11,13 @@
  * @bug No known bugs except for NYI items
  */
 
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <random>
 #include <vector>
+
+#include <mem_allocator.h>
 
 #include <gtest/gtest.h>
 
@@ -440,3 +443,83 @@ GTEST_PARAMETER_TEST(
   MemoryPool, MemoryPoolTest,
   ::testing::Values(std::make_shared<nntrainer::MemoryPool>(),
                     std::make_shared<nntrainer::CachePool>("tmp pool")));
+
+namespace {
+
+/**
+ * @brief Test allocator that records every alloc/free call so the
+ *        unit test can assert MemoryPool routes through it instead
+ *        of going around to libc.
+ */
+class CountingAllocator : public nntrainer::MemAllocator {
+public:
+  std::atomic<int> alloc_count{0};
+  std::atomic<int> free_count{0};
+
+  void alloc(void **ptr, size_t size, size_t alignment) override {
+    alloc_count++;
+    nntrainer::MemAllocator::alloc(ptr, size, alignment);
+  }
+  void free(void *ptr) override {
+    if (ptr != nullptr)
+      free_count++;
+    nntrainer::MemAllocator::free(ptr);
+  }
+  std::string getName() override { return "counting"; }
+};
+
+} // namespace
+
+/**
+ * @brief MemoryPool routes allocate()/deallocate() through the
+ *        injected MemAllocator (1 alloc, 1 matching free).
+ */
+TEST(MemoryPoolAllocator, allocate_routes_through_injected_allocator) {
+  auto counter = std::make_shared<CountingAllocator>();
+  nntrainer::MemoryPool pool(counter);
+
+  EXPECT_NO_THROW(pool.requestMemory(1024, 4, 5));
+  EXPECT_NO_THROW(pool.planLayout(nntrainer::BasicPlanner()));
+
+  EXPECT_EQ(counter->alloc_count.load(), 0);
+  EXPECT_NO_THROW(pool.allocate());
+  EXPECT_EQ(counter->alloc_count.load(), 1);
+  EXPECT_EQ(counter->free_count.load(), 0);
+
+  EXPECT_NO_THROW(pool.deallocate());
+  EXPECT_EQ(counter->free_count.load(), 1);
+}
+
+/**
+ * @brief getAllocator() returns the injected allocator.
+ */
+TEST(MemoryPoolAllocator, get_allocator_returns_injected) {
+  auto counter = std::make_shared<CountingAllocator>();
+  nntrainer::MemoryPool pool(counter);
+  EXPECT_EQ(pool.getAllocator().get(), counter.get());
+  EXPECT_EQ(pool.getAllocator()->getName(), "counting");
+}
+
+/**
+ * @brief deallocate() is a no-op on a never-allocated pool — must
+ *        not call free() on a null mem_pool. Regression test for
+ *        the rewrite that replaced the explicit `if (mem_pool)`
+ *        gate with owned_buffers_ tracking.
+ */
+TEST(MemoryPoolAllocator, deallocate_without_allocate_is_safe) {
+  auto counter = std::make_shared<CountingAllocator>();
+  nntrainer::MemoryPool pool(counter);
+
+  EXPECT_NO_THROW(pool.deallocate());
+  EXPECT_EQ(counter->free_count.load(), 0);
+}
+
+/**
+ * @brief Default-constructed MemoryPool keeps using base CPU
+ *        MemAllocator (backward compatibility).
+ */
+TEST(MemoryPoolAllocator, default_pool_uses_cpu_allocator) {
+  nntrainer::MemoryPool pool;
+  ASSERT_NE(pool.getAllocator(), nullptr);
+  EXPECT_EQ(pool.getAllocator()->getName(), "cpu");
+}

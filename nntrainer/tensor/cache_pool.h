@@ -16,6 +16,7 @@
 
 #include <list>
 #include <mutex>
+#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -43,14 +44,19 @@ public:
    * @brief CachePool default constructor
    *
    * @param name name of the cache pool
+   * @param allocator backend allocator forwarded to MemoryPool
    */
-  explicit CachePool(const std::string &name);
+  explicit CachePool(
+    const std::string &name,
+    std::shared_ptr<MemAllocator> allocator = std::make_shared<MemAllocator>());
 
   /**
    * @brief CachePool constructor with cache path
    *
    */
-  explicit CachePool(const std::string &path, const std::string &name);
+  explicit CachePool(
+    const std::string &path, const std::string &name,
+    std::shared_ptr<MemAllocator> allocator = std::make_shared<MemAllocator>());
 
   /**
    * @brief CachePool constructor with cache path & ExecutionMode
@@ -58,7 +64,8 @@ public:
    */
   explicit CachePool(
     const std::string &path, const std::string &name,
-    ml::train::ExecutionMode exec_mode = ml::train::ExecutionMode::TRAIN);
+    ml::train::ExecutionMode exec_mode = ml::train::ExecutionMode::TRAIN,
+    std::shared_ptr<MemAllocator> allocator = std::make_shared<MemAllocator>());
 
   /**
    * @brief MemoryPool destructor

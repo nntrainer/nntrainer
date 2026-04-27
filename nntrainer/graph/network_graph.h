@@ -21,6 +21,7 @@
 #include <stack>
 #include <vector>
 
+#include <engine.h>
 #include <graph_core.h>
 #include <layer_node.h>
 #include <manager.h>
@@ -64,13 +65,19 @@ public:
    * (default NCHW)
    * @param[in] tensor_type It says weight type and activation type (default
    * FP32-FP32)
+   * @param[in] engine_name name of the registered Context whose
+   *            MemAllocator the graph's Manager should use for tensor
+   *            buffer allocation (default "cpu"). Resolves once at
+   *            construction; a missing engine throws.
    */
   NetworkGraph(bool enable_fsu, ExecutionMode mode = ExecutionMode::TRAIN,
                const std::string &fsu_path = "", unsigned int lookahead = 0,
                const std::string &tensor_format_ = "NCHW",
-               const std::string &tensor_dtype_ = "FP32-FP32") :
+               const std::string &tensor_dtype_ = "FP32-FP32",
+               const std::string &engine_name = "cpu") :
     tensor_manager(std::make_shared<Manager>(
-      enable_fsu, fsu_path, lookahead, tensor_format_, tensor_dtype_, mode)),
+      enable_fsu, fsu_path, lookahead, tensor_format_, tensor_dtype_, mode,
+      Engine::Global().getRegisteredContext(engine_name)->getMemAllocator())),
     graph(),
     compiled(false),
     batch_size(0),

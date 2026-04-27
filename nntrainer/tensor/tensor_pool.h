@@ -44,22 +44,31 @@ public:
    * @brief     Constructor of TensorPool
    */
   TensorPool() :
-    mem_pool(std::make_unique<MemoryPool>()), cache_loader(nullptr) {}
+    allocator_(std::make_shared<MemAllocator>()),
+    mem_pool(std::make_unique<MemoryPool>(allocator_)),
+    cache_loader(nullptr) {}
 
   /**
    * @brief     Constructor of TensorPool
+   *
+   * @param allocator backend allocator forwarded to the underlying
+   *        MemoryPool / CachePool. When omitted, uses host CPU memory
+   *        for tests and legacy callers.
    */
   TensorPool(
     bool enable_fsu, const std::string &fsu_path = "",
     const std::string &fsu_name = "",
-    ml::train::ExecutionMode execution_mode = ml::train::ExecutionMode::TRAIN) {
+    ml::train::ExecutionMode execution_mode = ml::train::ExecutionMode::TRAIN,
+    std::shared_ptr<MemAllocator> allocator =
+      std::make_shared<MemAllocator>()) :
+    allocator_(std::move(allocator)) {
     if (enable_fsu) {
-      auto cache_pool =
-        std::make_shared<CachePool>(fsu_path, fsu_name, execution_mode);
+      auto cache_pool = std::make_shared<CachePool>(fsu_path, fsu_name,
+                                                    execution_mode, allocator_);
       cache_loader = std::make_unique<CacheLoader>(cache_pool);
       mem_pool = cache_pool;
     } else {
-      mem_pool = std::make_shared<MemoryPool>();
+      mem_pool = std::make_shared<MemoryPool>(allocator_);
     }
   }
 
@@ -73,7 +82,7 @@ public:
    */
   void reinitialize() {
     name_map.clear();
-    mem_pool = std::make_shared<MemoryPool>();
+    mem_pool = std::make_shared<MemoryPool>(allocator_);
   }
 
   /**
@@ -439,8 +448,13 @@ private:
    */
   std::vector<RequestSpec> pool; /**< list of requested tensors */
   std::unordered_map<std::string, unsigned int>
-    name_map;                           /**< indexing of requested tensors */
-  std::shared_ptr<MemoryPool> mem_pool; /**< memory pool for the tensors */
+    name_map; /**< indexing of requested tensors */
+  std::shared_ptr<MemAllocator>
+    allocator_; /**< backend allocator threaded down to MemoryPool/
+                     CachePool. Stored on TensorPool so reinitialize()
+                     can recreate the pool with the same backend
+                     without re-resolving from the engine. */
+  std::shared_ptr<MemoryPool> mem_pool;      /**< memory pool for the tensors */
   std::unique_ptr<CacheLoader> cache_loader; /**< memory pool for the tensors */
 
   /**

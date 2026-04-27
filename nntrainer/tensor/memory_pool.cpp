@@ -10,14 +10,10 @@
  * @brief  This is Memory Pool Class
  */
 
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
-
-#include <numeric>
-#include <vector>
-
 #include <map>
-
 #include <memory_pool.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -26,34 +22,37 @@
 #include <vector>
 
 #if defined(_WIN32)
-#define GET_SYSTEM_ALIGMENT()                                                  \
-  ([]() -> size_t {                                                            \
-    SYSTEM_INFO sysInfo;                                                       \
-    GetSystemInfo(&sysInfo);                                                   \
-    return sysInfo.dwPageSize;                                                 \
-  })()
-
-#define ALIGNED_ALLOC(size) _aligned_malloc(size, GET_SYSTEM_ALIGMENT())
-#define ALIGNED_FREE(ptr) _aligned_free(ptr)
-#elif defined(__ANDROID__) && ENABLE_NPU
-#define RPCMEM_HEAP_ID_SYSTEM 25
-#define RPCMEM_DEFAULT_FLAGS 1
-#define ALIGNED_ALLOC(size)                                                    \
-  rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size)
-#define ALIGNED_FREE(ptr) rpcmem_free(ptr)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <sysinfoapi.h>
+#include <windows.h>
 #else
-#define GET_SYSTEM_ALIGMENT()                                                  \
-  ([]() -> size_t { return sysconf(_SC_PAGE_SIZE); })()
-#define ALIGNED_ALLOC(size) std::aligned_alloc(GET_SYSTEM_ALIGMENT(), size)
-#define ALIGNED_FREE(ptr) free(ptr)
+#include <unistd.h>
 #endif
 
 namespace nntrainer {
 
+namespace {
+
 /**
- * @brief Request Memory from memory pool
- * @note start_time is inclusive, but end_time is exclusive
+ * @brief Page size used as the default alignment for pool allocations.
+ *
+ * Page-aligned buffers are required by RPC / SVM backends and don't
+ * hurt the host case (aligned_alloc rounds up the request).
  */
+size_t system_page_size() {
+#if defined(_WIN32)
+  SYSTEM_INFO sys_info;
+  GetSystemInfo(&sys_info);
+  return sys_info.dwPageSize;
+#else
+  return static_cast<size_t>(sysconf(_SC_PAGE_SIZE));
+#endif
+}
+
+} // namespace
+
 unsigned int MemoryPool::requestMemory(size_t bytes, unsigned int start_time,
                                        unsigned int end_time,
                                        std::vector<unsigned int> exec_order,
@@ -61,7 +60,7 @@ unsigned int MemoryPool::requestMemory(size_t bytes, unsigned int start_time,
   if (bytes == 0)
     throw std::invalid_argument("Requesting memory of 0 size");
 
-  if (mem_pool != nullptr)
+  if (mem_pool != nullptr || !owned_buffers_.empty())
     throw std::invalid_argument(
       "Deallocate memory pool before requesting more memory");
 
@@ -82,17 +81,6 @@ unsigned int MemoryPool::requestMemory(size_t bytes, unsigned int start_time,
   return memory_size.size();
 }
 
-/**
- * @brief Planner the layout with memory planner
- *
- * @details The efficiency of the planner is calculated as the ratio of the
- * theoretical minimum memory requirement divided by the memory requirement
- * given by the memory planner.
- *
- * @details planLayout can be called multiple times as this does not perform
- * any allocation but rather just plans the layout and stores the layout.
- * Subsequent call to this function will overwrite any existing layout.
- */
 double MemoryPool::planLayout(const MemoryPlanner &planner) {
   if (mem_pool != nullptr)
     /** mem_pool must be deallocated when planLayout is being called */
@@ -113,10 +101,6 @@ double MemoryPool::planLayout(const MemoryPlanner &planner) {
   return double(min_pool_size) / double(pool_size);
 }
 
-/**
- * @brief Do the allocation of memory
- *
- */
 void MemoryPool::allocate() {
   if (pool_size == 0)
     throw std::runtime_error("Allocating memory pool with size 0");
@@ -124,76 +108,24 @@ void MemoryPool::allocate() {
   if (mem_pool != nullptr)
     throw std::runtime_error("Memory pool is already allocated");
 
-  ml_logi("MemoryPool::allocate size: %zu", pool_size);
+  ml_logi("MemoryPool::allocate size: %zu allocator: %s", pool_size,
+          allocator_->getName().c_str());
 
-#if defined(__ANDROID__) && ENABLE_NPU
-  int i = 0;
-#define RPCMEM_HEAP_ID_SYSTEM 25
-#define RPCMEM_DEFAULT_FLAGS 1
-  std::map<size_t, void *> offset_ptr;     // offset : ptr
-  std::map<size_t, size_t> allocated_size; // offset : memory size
-  std::map<size_t, std::vector<int>>
-    offset_indices; // offset : list of index which has same offset
+  // Single contiguous buffer routed through the per-vendor allocator.
+  // For ClSVMAllocator this returns SVM memory directly addressable
+  // by both host and device; for QNNRpcManager it returns rpcmem; the
+  // base allocator returns page-aligned, zero-initialised host memory.
+  allocator_->alloc(&mem_pool, pool_size, system_page_size());
+  owned_buffers_.push_back(mem_pool);
 
-  for (auto &s : memory_offset) {
-    size_t current_size = memory_size.at(i);
-    auto it = offset_ptr.find(s);
-    if (it == offset_ptr.end()) {
-      void *ptr =
-        rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, current_size);
-      memory_ptrs.push_back(ptr);
-      offset_ptr[s] = ptr;
-      allocated_size[s] = current_size;
-      offset_indices[s].push_back(i);
-    } else {
-      void *existing_ptr = it->second;
-      size_t max_size = allocated_size[s];
-      if (max_size < current_size) {
-        void *new_ptr = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
-                                     RPCMEM_DEFAULT_FLAGS, current_size);
-
-        for (int idx : offset_indices[s]) {
-          memory_ptrs[idx] = new_ptr;
-        }
-        rpcmem_free(existing_ptr);
-        offset_ptr[s] = new_ptr;
-        allocated_size[s] = current_size;
-      }
-      memory_ptrs.push_back(offset_ptr[s]);
-      offset_indices[s].push_back(i);
-    }
-    i++;
-  }
-
-  mem_pool = calloc(1, 1);
-
-#else
-
-#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
-  auto *cl_context =
-    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-  mem_pool = cl_context->context_inst_.createSVMRegion(pool_size);
-
-  // If SVM allocation fails, use calloc()
-  if (mem_pool != nullptr) {
-    svm_allocation = true;
-  }
-#endif
-
-  if (mem_pool == nullptr)
-    mem_pool = calloc(pool_size, 1);
-
-  unsigned int idx = 1;
-  for (auto &s : memory_offset) {
-    char *ptr = static_cast<char *>(mem_pool) + memory_offset.at(idx - 1);
+  // Hand out per-token slices off the same buffer at planned offsets.
+  for (size_t i = 0; i < memory_offset.size(); ++i) {
+    char *ptr = static_cast<char *>(mem_pool) + memory_offset[i];
     memory_ptrs.push_back(ptr);
-    idx++;
   }
-#endif
 
 #ifdef PROFILE
   static long long seq = 0;
-
   std::string msg("MemoryPool #");
   msg.append(std::to_string(seq++));
   PROFILE_MEM_ALLOC(mem_pool, pool_size, msg);
@@ -204,37 +136,54 @@ void MemoryPool::allocateFSU() {
   if (pool_size == 0)
     throw std::runtime_error("Allocating memory pool with size 0");
 
-  ml_logi("MemoryPool::allocateFSU size: %zu", pool_size);
-
-  if (mem_pool != nullptr)
+  if (mem_pool != nullptr || !owned_buffers_.empty())
     throw std::runtime_error("Memory pool is already allocated");
 
-  int i = 0;
+  ml_logi("MemoryPool::allocateFSU size: %zu allocator: %s", pool_size,
+          allocator_->getName().c_str());
+
+  // FSU path allocates a separate buffer per distinct offset and
+  // shares it across all tokens that map to that offset (typical for
+  // double-buffered weight reuse). Earlier code used ALIGNED_ALLOC
+  // macros and never freed these — fixed here by tracking unique
+  // buffers in owned_buffers_.
   std::map<size_t, void *> offset_ptr;     // offset : ptr
   std::map<size_t, size_t> allocated_size; // offset : memory size
   std::map<size_t, std::vector<int>>
-    offset_indices; // offset : list of index which has same offset
+    offset_indices; // offset : indices that share this offset
 
+  const size_t alignment = system_page_size();
+
+  int i = 0;
   for (auto &s : memory_offset) {
     size_t current_size = memory_size.at(i);
     auto it = offset_ptr.find(s);
     if (it == offset_ptr.end()) {
-      void *ptr = ALIGNED_ALLOC(current_size);
+      void *ptr = nullptr;
+      allocator_->alloc(&ptr, current_size, alignment);
       memory_ptrs.push_back(ptr);
+      owned_buffers_.push_back(ptr);
       offset_ptr[s] = ptr;
       allocated_size[s] = current_size;
       offset_indices[s].push_back(i);
-
     } else {
       void *existing_ptr = it->second;
       size_t max_size = allocated_size[s];
       if (max_size < current_size) {
-        void *new_ptr = ALIGNED_ALLOC(current_size);
-
+        // A larger request lands on the same offset — reallocate the
+        // shared buffer and remap every aliasing entry.
+        void *new_ptr = nullptr;
+        allocator_->alloc(&new_ptr, current_size, alignment);
         for (int idx : offset_indices[s]) {
           memory_ptrs[idx] = new_ptr;
         }
-        ALIGNED_FREE(existing_ptr);
+        // Replace in owned_buffers_ so deallocate() releases the new
+        // one, not the old one we're about to free.
+        auto pos =
+          std::find(owned_buffers_.begin(), owned_buffers_.end(), existing_ptr);
+        if (pos != owned_buffers_.end())
+          *pos = new_ptr;
+        allocator_->free(existing_ptr);
         offset_ptr[s] = new_ptr;
         allocated_size[s] = current_size;
       }
@@ -243,68 +192,42 @@ void MemoryPool::allocateFSU() {
     }
     i++;
   }
-
-  mem_pool = calloc(1, 1);
-
-  if (mem_pool == nullptr)
-    throw std::runtime_error(
-      "Failed to allocate memory: " + std::to_string(pool_size) + "bytes");
 }
 
-/**
- * @brief Get the allocated memory
- *
- */
 std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
-  if (mem_pool == nullptr)
+  if (mem_pool == nullptr && owned_buffers_.empty())
     throw std::invalid_argument("Getting memory before allocation");
 
   auto mem_data = std::make_shared<MemoryData>((void *)memory_ptrs.at(idx - 1));
-  mem_data->setSVM(svm_allocation);
+  // SVM-ness propagates implicitly through the allocator name now;
+  // callers that need to know inspect getAllocator()->getName().
+  mem_data->setSVM(allocator_->getName() == "gpu-svm");
   return mem_data;
 }
 
-/**
- * @brief Free all the allocated memory
- *
- */
 void MemoryPool::deallocate() {
-  if (mem_pool != nullptr) {
-#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
-    if (svm_allocation) {
-      auto *cl_context =
-        static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
-      cl_context->context_inst_.releaseSVMRegion(mem_pool);
-    } else {
-      free(mem_pool);
-    }
-#else
-    free(mem_pool);
-#endif
-    memory_size.clear();
-    memory_validity.clear();
-    memory_exec_order.clear();
-    memory_is_wgrad.clear();
-
+  // Symmetric to allocate/allocateFSU: free every uniquely-owned
+  // buffer through the same allocator. Mismatching alloc/free
+  // backends would corrupt the heap (e.g. clSVMFree on host memory),
+  // so the allocator_ shared_ptr is the single source of truth.
+  for (void *buf : owned_buffers_) {
+    allocator_->free(buf);
 #ifdef PROFILE
-    PROFILE_MEM_DEALLOC(mem_pool);
+    PROFILE_MEM_DEALLOC(buf);
 #endif
-
-    memory_ptrs.clear();
   }
+  owned_buffers_.clear();
+
   mem_pool = nullptr;
+  memory_size.clear();
+  memory_validity.clear();
+  memory_exec_order.clear();
+  memory_is_wgrad.clear();
+  memory_ptrs.clear();
 }
 
-/**
- * @brief Get the maximum real memory requirement
- *
- */
 size_t MemoryPool::size() { return pool_size; }
 
-/**
- * @brief Get the minimum theoretical memory requirement
- *
- */
 size_t MemoryPool::minMemoryRequirement() {
   if (memory_size.size() && min_pool_size == 0)
     min_pool_size = calcMinMemoryRequirement();
@@ -312,10 +235,6 @@ size_t MemoryPool::minMemoryRequirement() {
   return min_pool_size;
 }
 
-/**
- * @brief Validate the provided layout so that no two memories to be used at
- * overlap interval has overlapping memories
- */
 bool MemoryPool::validateLayout() {
   if (memory_offset.size() != memory_size.size())
     return false;
@@ -326,10 +245,6 @@ bool MemoryPool::validateLayout() {
   return validateOverflow() && validateOverlap();
 }
 
-/**
- * @brief Validate the provided layout does not overflow outside the given
- * size of the memory pool
- */
 bool MemoryPool::validateOverflow() {
   for (unsigned int idx = 0; idx < memory_size.size(); idx++)
     if (memory_offset[idx] + memory_size[idx] > pool_size)
@@ -338,18 +253,6 @@ bool MemoryPool::validateOverflow() {
   return true;
 }
 
-/**
- * @brief check if the two given intervals overlap
- *
- * @param s1 start of interval 1
- * @param e1 end of interval 1
- * @param s2 start of interval 2
- * @param e2 end of interval 2
- *
- * @return true if overlap else false
- *
- * @note overlap check assumes are start is inclusive and end is exclusive
- */
 template <typename T> static bool overlap(T s1, T e1, T s2, T e2) {
 #if DEBUG
   if (e1 <= s1 || e2 <= s2)
@@ -359,15 +262,9 @@ template <typename T> static bool overlap(T s1, T e1, T s2, T e2) {
   return !(e1 <= s2 || e2 <= s1);
 }
 
-/**
- * @brief Validate the provided layout so that no two memories to be used at
- * overlap interval has overlapping memories
- */
 bool MemoryPool::validateOverlap() {
-  /** get sorted permutation */
   std::vector<unsigned int> perm = getSortedPermutation();
 
-  /** iterate over sorted array view and check overlap of memories */
   size_t len = perm.size();
   for (unsigned int i = 0; i < len; i++) {
     unsigned int idx = perm[i];
@@ -377,18 +274,10 @@ bool MemoryPool::validateOverlap() {
     for (unsigned int match = idx + 1; match < len; match++) {
       if (overlap(mem_start, mem_start + mem_size, memory_offset[match],
                   memory_offset[match] + memory_size[match])) {
-        /**
-         * if the memories given to two requests overlap, then their valid
-         * range should not overlap
-         */
         if (overlap(valid_start, valid_end, memory_validity[match].first,
                     memory_validity[match].second))
           return false;
       } else {
-        /**
-         * as the list memories are sorted by offset, we can safely assume that
-         * memory allocations after idx will not overlap as well
-         */
         break;
       }
     }
@@ -397,16 +286,9 @@ bool MemoryPool::validateOverlap() {
   return true;
 }
 
-/**
- * @brief Get sorted permutation for the memory requests
- *
- * @details Performs sorting based on the memory overlap using memory offset
- * as the start and the memory offset + memory size as the end of the interval.
- */
 std::vector<unsigned int> MemoryPool::getSortedPermutation() {
   std::vector<unsigned int> perm(memory_size.size());
   std::iota(perm.begin(), perm.end(), 0);
-  /** sorted by memory_offset first and then memory_offset + memory_size next */
   std::sort(perm.begin(), perm.end(), [&](auto const &idx1, auto const &idx2) {
     if (memory_offset[idx1] == memory_offset[idx2])
       return memory_size[idx1] < memory_size[idx2];
@@ -417,14 +299,6 @@ std::vector<unsigned int> MemoryPool::getSortedPermutation() {
   return perm;
 }
 
-/**
- * @brief Calculate the minimum memory requirement for the given memory requests
- *
- * @note This will be theoretical minimum memory requirement ensuring that the
- * memory usages at the same time do not overlap with their validity. This does
- * not consider about the fragmentation which comes from the actual memory
- * layout.
- */
 size_t MemoryPool::calcMinMemoryRequirement() {
   auto max_interval =
     *std::max_element(memory_validity.begin(), memory_validity.end(),
@@ -432,10 +306,6 @@ size_t MemoryPool::calcMinMemoryRequirement() {
                         return val1.second < val2.second;
                       });
   unsigned int last_interval = max_interval.second;
-  /**
-   * as weights stay valid for max duration, ignore this value and get the real
-   * max value
-   */
   if (last_interval == (std::numeric_limits<unsigned int>::max)()) {
     max_interval = *std::max_element(
       memory_validity.begin(), memory_validity.end(),
@@ -443,21 +313,11 @@ size_t MemoryPool::calcMinMemoryRequirement() {
         return ((val2.second != last_interval) && (val1.second < val2.second));
       });
     last_interval = max_interval.second;
-    /**
-     * if the second largest number is also numeric_limit, implies that all the
-     * elements are max values. In this case, last_interval is set to 1
-     */
     if (last_interval == (std::numeric_limits<unsigned int>::max)())
       last_interval = 1;
   }
 
   std::vector<size_t> interval_req(last_interval + 1, 0);
-  /**
-   * @note This method fills requirement for each value in the interval. This is
-   * efficient for the current use case as there is going to be atleast 1 new
-   * memory request for each interval because each interval is mapped to a node
-   * in the graph.
-   */
   for (unsigned int idx = 0; idx < memory_size.size(); idx++) {
     for (unsigned int interval = memory_validity[idx].first;
          interval < std::min(memory_validity[idx].second, last_interval);
@@ -469,12 +329,8 @@ size_t MemoryPool::calcMinMemoryRequirement() {
   return *std::max_element(interval_req.begin(), interval_req.end());
 }
 
-/**
- * @brief Clear the memory pool
- *
- */
 void MemoryPool::clear() {
-  if (mem_pool != nullptr)
+  if (mem_pool != nullptr || !owned_buffers_.empty())
     throw std::invalid_argument("Cannot clear allocated memory pool");
 
   memory_size.clear();
@@ -488,11 +344,8 @@ void MemoryPool::clear() {
   n_wgrad = 0;
 }
 
-/**
- * @brief Is the memory pool allocated
- *
- * @return true if the memory is allocated, else false
- */
-bool MemoryPool::isAllocated() const { return mem_pool != nullptr; }
+bool MemoryPool::isAllocated() const {
+  return mem_pool != nullptr || !owned_buffers_.empty();
+}
 
 } // namespace nntrainer

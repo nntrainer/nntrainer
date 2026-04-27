@@ -94,14 +94,19 @@ std::atomic_int pool_id = 0;
 
 } // namespace
 
-CachePool::CachePool(const std::string &n) :
+CachePool::CachePool(const std::string &n,
+                     std::shared_ptr<MemAllocator> allocator) :
+  MemoryPool(std::move(allocator)),
   name(n),
   execution_mode_(ml::train::ExecutionMode::TRAIN),
   swap_device(std::make_shared<SwapDevice>(n + "_" + std::to_string(getpid()) +
                                            "_" + std::to_string(pool_id++))) {}
 
-CachePool::CachePool(const std::string &path, const std::string &n) :
-  name(n), execution_mode_(ml::train::ExecutionMode::TRAIN) {
+CachePool::CachePool(const std::string &path, const std::string &n,
+                     std::shared_ptr<MemAllocator> allocator) :
+  MemoryPool(std::move(allocator)),
+  name(n),
+  execution_mode_(ml::train::ExecutionMode::TRAIN) {
   if (path.empty())
     swap_device = std::make_shared<SwapDevice>(
       n + "_" + std::to_string(getpid()) + "_" + std::to_string(pool_id++));
@@ -112,8 +117,9 @@ CachePool::CachePool(const std::string &path, const std::string &n) :
 }
 
 CachePool::CachePool(const std::string &path, const std::string &name_,
-                     ml::train::ExecutionMode exec_mode_) :
-  name(name_), execution_mode_(exec_mode_) {
+                     ml::train::ExecutionMode exec_mode_,
+                     std::shared_ptr<MemAllocator> allocator) :
+  MemoryPool(std::move(allocator)), name(name_), execution_mode_(exec_mode_) {
   if (path.empty())
     swap_device = std::make_shared<SwapDevice>(
       name_ + "_" + std::to_string(getpid()) + "_" + std::to_string(pool_id++));

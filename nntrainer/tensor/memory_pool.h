@@ -9,11 +9,10 @@
  * @bug    No known bugs except for NYI items
  * @brief  This is Memory Pool Class
  *
- * @todo   Support an external allocator for different backends and alignment
  * @todo   Support releaseMemory(token) - this need not release actual memory
- * until deallocate
+ *         until deallocate
  * @todo   Support maximum memory size for the memory pool as an argument
- * @todo support late memory request without optimization
+ * @todo   support late memory request without optimization
  */
 
 #ifndef __MEMORY_POOL_H__
@@ -23,93 +22,46 @@
 #include <memory>
 #include <vector>
 
-#include <engine.h>
+#include <mem_allocator.h>
 #include <memory_data.h>
 #include <memory_planner.h>
 #include <tensor_wrap_specs.h>
-
-#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
-#include <cl_context.h>
-#endif
-
-#include <cstdlib>
-#include <dynamic_library_loader.h>
-#include <functional>
-#include <memory>
-#include <vector>
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#ifdef max
-#undef max
-#undef min
-#endif
-#define NOMINMAX
-#endif
-#define O_SYNC 0UL
-#include <io.h>
-#include <sysinfoapi.h>
-#include <windows.h>
-#else
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
-
-#include <dynamic_library_loader.h>
-#include <engine.h>
-#include <iostream>
-#include <mem_allocator.h>
-#include <set>
-
-static const std::string func_tag = "[MemoryPool] ";
-typedef void *(*RpcMemAllocFn_t)(int, uint32_t, int);
-typedef void (*RpcMemFreeFn_t)(void *);
-
-enum {
-  DL_NOW = 0x0001,
-  DL_LOCAL = 0x0002,
-  DL_GLOBAL = 0x0004,
-};
 
 namespace nntrainer {
 
 /**
  * @class   MemoryPool
  * @brief   Memory Pool provides a common pool for all the tensor memory
+ *
+ * Allocation and deallocation are routed through an injected
+ * MemAllocator so per-vendor backends (CPU, GPU-SVM, NPU-RPC) plug in
+ * without #ifdef branches inside the pool. The default ctor uses the
+ * base MemAllocator (page-aligned host memory, zero-initialised); CL
+ * and QNN install ClSVMAllocator / QNNRpcManager via their Context.
  */
 class MemoryPool {
 public:
   /**
-   * @brief MemoryPool default constructor
+   * @brief MemoryPool default constructor (uses base MemAllocator).
    *
+   * Kept for backward-compatibility with tests and callers that don't
+   * thread an engine through.
    */
-  explicit MemoryPool() :
+  explicit MemoryPool() : MemoryPool(std::make_shared<MemAllocator>()) {}
+
+  /**
+   * @brief MemoryPool constructor with an explicit allocator.
+   *
+   * @param allocator backend allocator (CPU / SVM / RPC). Held by
+   *        shared_ptr so the pool keeps the allocator alive even if
+   *        the originating Context unwinds early. Must be non-null.
+   */
+  explicit MemoryPool(std::shared_ptr<MemAllocator> allocator) :
     mem_pool(nullptr),
     pool_size(0),
     min_pool_size(0),
     n_wgrad(0),
-    svm_allocation(false) {
-
-#if defined(__ANDROID__) && ENABLE_NPU
-    void *handle =
-      DynamicLibraryLoader::loadLibrary("libcdsprpc.so", DL_NOW | DL_LOCAL);
-    const char *error_msg = DynamicLibraryLoader::getLastError();
-
-    rpcmem_alloc =
-      (RpcMemAllocFn_t)DynamicLibraryLoader::loadSymbol(handle, "rpcmem_alloc");
-    rpcmem_free =
-      (RpcMemFreeFn_t)DynamicLibraryLoader::loadSymbol(handle, "rpcmem_free");
-
-    auto close_dl = [handle] { DynamicLibraryLoader::freeLibrary(handle); };
-
-    if (rpcmem_alloc == nullptr || rpcmem_free == nullptr) {
-      NNTR_THROW_IF_CLEANUP(rpcmem_alloc == nullptr || rpcmem_free == nullptr,
-                            std::invalid_argument, close_dl)
-        << func_tag << "open rpc mem failed";
-    }
-#else
-    allocators = Engine::Global().getAllocators();
-#endif
-  }
+    allocator_(std::move(allocator)) {}
 
   /**
    * @brief MemoryPool destructor
@@ -239,13 +191,19 @@ public:
   virtual void
   setWeightOffset(std::vector<std::pair<size_t, size_t>> offsets){};
 
+  /**
+   * @brief Get the allocator used by this pool.
+   *
+   * @return shared_ptr<MemAllocator>
+   */
+  std::shared_ptr<MemAllocator> getAllocator() const { return allocator_; }
+
 protected:
   /**
    * @brief  Get memory offset
    */
   std::vector<size_t> &getMemoryOffset() { return memory_offset; }
 
-protected:
   /**
    * @brief  Get file offset
    */
@@ -318,7 +276,9 @@ private:
   std::vector<bool>
     memory_is_wgrad; /**< index for identification of weight gradient */
 
-  void *mem_pool; /**< memory pool allocated at once */
+  void *mem_pool; /**< single contiguous pool buffer (allocate path); for
+                       allocateFSU() this stays null and per-element
+                       buffers live in owned_buffers_ */
 
   size_t pool_size; /**< memory requirement for this pool */
 
@@ -326,14 +286,18 @@ private:
 
   size_t n_wgrad;
 
-  bool svm_allocation; /**< flag if memory is a shared virtual memory */
+  std::shared_ptr<MemAllocator>
+    allocator_; /**< backend allocator: routes alloc/free through the
+                      vendor that owns this pool. Never null. */
 
-  std::unordered_map<std::string, std::shared_ptr<nntrainer::MemAllocator>>
-    allocators;
-#if defined(__ANDROID__) && ENABLE_NPU
-  RpcMemAllocFn_t rpcmem_alloc;
-  RpcMemFreeFn_t rpcmem_free;
-#endif
+  std::vector<void *>
+    owned_buffers_; /**< unique buffers we must release in deallocate().
+                         For allocate(): one entry (mem_pool). For
+                         allocateFSU(): one entry per distinct offset
+                         (the multi-tenant entries in memory_ptrs alias
+                         these). Tracking unique buffers fixes a
+                         pre-existing leak where allocateFSU() never
+                         freed its per-element ptrs. */
 };
 
 } // namespace nntrainer
