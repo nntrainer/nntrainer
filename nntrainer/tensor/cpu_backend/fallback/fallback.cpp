@@ -13,10 +13,18 @@
 
 #include <assert.h>
 #include <cmath>
+#include <compute_ops.h>
 #include <fallback_internal.h>
 #include <nntrainer_error.h>
 
 namespace nntrainer {
+
+void init_backend() {
+  // Fallback build has no GGML / OpenBLAS to set up — bind the CPU
+  // ops table directly. Same shape as the ARM / x86 init_backend
+  // entry points so callers can use ensureComputeOps() uniformly.
+  g_compute_ops = get_cpu_ops();
+}
 
 void scopy_int4_to_float32(const unsigned int N, const uint8_t *X,
                            const unsigned int incX, float *Y,

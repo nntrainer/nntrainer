@@ -743,10 +743,7 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
                               unsigned int half_, float *inout, void *output,
                               const float *cos_, const float *sin_,
                               bool only_convert_to_fp16);
-/**
- * @brief Initialization of ggml backend
- */
-void init_backend();
+// init_backend() is declared in compute_ops.h (canonical location).
 
 /**
  * @copydoc unpack_q4_0x8_transpose16 in cpu_backend.h

@@ -25,6 +25,10 @@
 #include <fallback.h>
 #endif
 
+// Expose the ComputeOps dispatch table (and init_backend declaration) to any
+// consumer that already includes cpu_backend.h.
+#include <compute_ops.h>
+
 #include <cstdint>
 #include <tensor_dim.h>
 
@@ -624,10 +628,7 @@ extern void nntr_gemm_qsi8d32p_qsi4c32p_packed(
   bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
   T upper_bound = std::numeric_limits<T>::max());
 #endif
-/**
- * @brief Initialization of ggml backend
- */
-extern void init_backend();
+// init_backend() is declared in compute_ops.h (canonical location).
 
 /**
  * @brief Unpack Q4_0x8 data

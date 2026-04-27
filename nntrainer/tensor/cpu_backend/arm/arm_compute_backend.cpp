@@ -15,6 +15,7 @@
 #ifdef USE_BLAS
 #include <cblas_interface.h>
 #endif
+#include <compute_ops.h>
 #include <fallback_internal.h>
 #include <ggml_interface.h>
 #include <neon_impl.h>
@@ -25,8 +26,11 @@ namespace nntrainer {
 
 void init_backend() {
   __ggml_init();
+#ifdef USE_BLAS
   // Do not repeatedly call set_num_threads. It's a global config.
   __openblas_set_num_threads(-1); // -1 = BLAS_NUM_THREADS if defined.
+#endif
+  g_compute_ops = get_cpu_ops();
 }
 
 void unpack_q4_0x8_transpose16(const void *src, uint16_t *d_out,

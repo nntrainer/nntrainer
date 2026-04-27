@@ -18,6 +18,7 @@ nntrainer_headers = [
    meson.current_source_dir() / 'nntrainer_error.h',
    meson.current_source_dir() / 'app_context.h',
    meson.current_source_dir() / 'context.h',
+   meson.current_source_dir() / 'context_data.h',
    meson.current_source_dir() / 'engine.h',
    meson.current_source_dir() / 'mem_allocator.h',
 ]
@@ -76,7 +77,9 @@ nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'ruy'
 
 if get_option('enable-opencl')
   nntrainer_headers += meson.current_source_dir() / 'cl_context.h'
+  nntrainer_headers += meson.current_source_dir() / 'cl_svm_allocator.h'
   nntrainer_common_sources += 'cl_context.cpp'
+  nntrainer_common_sources += 'cl_svm_allocator.cpp'
 endif
 
 foreach s : nntrainer_common_sources

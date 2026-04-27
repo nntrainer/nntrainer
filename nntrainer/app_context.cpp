@@ -21,6 +21,7 @@
 #include <iniparser.h>
 
 #include <app_context.h>
+#include <compute_ops.h>
 #include <layer.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -241,7 +242,21 @@ std::once_flag global_app_context_init_flag;
 
 void AppContext::initialize() noexcept {
   try {
+    // Ensure the CPU compute-ops table is bound before anything else. Engine
+    // also routes through ensureComputeOps() at startup, but calling it here
+    // guarantees g_compute_ops is available when AppContext runs ahead of
+    // Engine in some tests. ensureComputeOps() is std::call_once-guarded so
+    // multi-threaded init paths cannot race init_backend().
+    ensureComputeOps();
+
     setMemAllocator(std::make_shared<MemAllocator>());
+
+    // Expose the ops table through this context's ContextData so that callers
+    // can reach it via context.getContextData()->getComputeOps() instead of
+    // the global pointer.
+    if (auto cd = getContextData(); cd && g_compute_ops) {
+      cd->setComputeOps(g_compute_ops);
+    }
 
     add_default_object();
     add_extension_object();

@@ -27,6 +27,8 @@
 /usr/include/nntrainer/cblas_interface.h
 /usr/include/nntrainer/x86_compute_backend.h
 /usr/include/nntrainer/cpu_backend.h
+/usr/include/nntrainer/compute_ops.h
+/usr/include/nntrainer/context_data.h
 /usr/include/nntrainer/var_grad.h
 /usr/include/nntrainer/weight.h
 /usr/include/nntrainer/quantizer.h
