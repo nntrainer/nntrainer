@@ -12,7 +12,7 @@
 #include <iomanip>
 #include <iostream>
 
-#include <cpu_backend.h>
+#include <compute_ops.h>
 #include <tensor.h>
 #include <uint4_tensor.h>
 
@@ -96,7 +96,7 @@ Uint4QTensor::Uint4QTensor(
   }
 
   // copy scale factors
-  scopy(scale_size(), scales.data(), 1, (float *)getScale(), 1);
+  getOps()->scopy_fp32(scale_size(), scales.data(), 1, (float *)getScale(), 1);
 
   unsigned int *zps = getZeroPoint();
 
@@ -622,11 +622,12 @@ void Uint4QTensor::copy(const void *buf) {
     return;
   }
   // copy tensor data
-  scopy((size() + 1) / 2, (uint8_t *)buf, 1, (uint8_t *)getData(), 1);
+  getOps()->scopy_u8((size() + 1) / 2, (uint8_t *)buf, 1, (uint8_t *)getData(),
+                     1);
 
   // copy scale factor data
   float *scales = (float *)(((uint8_t *)buf) + (size() + 1) / 2);
-  scopy(scale_size(), scales, 1, (float *)getScale(), 1);
+  getOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
 
   // copy zero points
   unsigned int *zps =

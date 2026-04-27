@@ -14,6 +14,14 @@
 
 namespace nntrainer {
 
+ComputeOps *TensorBase::getOps() const {
+  if (ct_data_) {
+    if (auto *o = ct_data_->getComputeOps())
+      return o;
+  }
+  return nntrainer::getComputeOps();
+}
+
 TensorBase::TensorBase(const TensorDim &d, bool alloc_now, Initializer init,
                        std::string name_) :
   TensorBase(name_, d.getFormat()) {

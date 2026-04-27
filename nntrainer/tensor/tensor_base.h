@@ -52,6 +52,8 @@
 
 namespace nntrainer {
 
+class ComputeOps;
+class ContextData;
 using TensorDim = ml::train::TensorDim;
 using Tformat = ml::train::TensorDim::Format;
 using Tdatatype = ml::train::TensorDim::DataType;
@@ -140,6 +142,7 @@ public:
     offset = rhs.offset;
     file_offset = rhs.file_offset;
     src_tensor = rhs.src_tensor;
+    ct_data_ = rhs.ct_data_;
   }
 
   /**
@@ -302,6 +305,33 @@ public:
    * @copydoc Tensor::initialize(Initializer init)
    */
   virtual void initialize(Initializer init) = 0;
+
+  /**
+   * @brief Attach a per-Context ComputeOps dispatch table to this tensor.
+   *
+   * After this call, every op invoked on this tensor (dot/multiply/...)
+   * uses ct_data->getComputeOps() rather than the global table. Result
+   * tensors from binary ops inherit the ContextData via the same path.
+   */
+  void setContextData(std::shared_ptr<ContextData> ct_data) {
+    ct_data_ = std::move(ct_data);
+  }
+
+  /**
+   * @brief Get the attached ContextData (nullable).
+   */
+  const std::shared_ptr<ContextData> &getContextData() const {
+    return ct_data_;
+  }
+
+  /**
+   * @brief Resolve the ComputeOps to dispatch on for this tensor.
+   *
+   * Priority: attached ContextData > global g_compute_ops fallback.
+   * Defined out-of-line in tensor_base.cpp so the header does not need
+   * to pull in <context_data.h> + <compute_ops.h>.
+   */
+  ComputeOps *getOps() const;
 
   /**
    * @copydoc Tensor::multiply_strided(Tensor const &m, Tensor &output,
@@ -867,6 +897,7 @@ protected:
   Initializer initializer;
   std::string name; /**< name of the tensor */
   std::shared_ptr<MemoryData> data;
+  std::shared_ptr<ContextData> ct_data_; /**< per-Context dispatch table */
   size_t offset;
   size_t file_offset; /**< offset of the tensor in the file */
 

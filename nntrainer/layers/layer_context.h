@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <common_properties.h>
+#include <context_data.h>
 #include <layer.h>
 #include <tensor.h>
 #include <tensor_dim.h>
@@ -28,7 +29,6 @@
 namespace nntrainer {
 
 class Var_Grad;
-class ContextData;
 
 /**
  * @class   Layer Context class for all layers
@@ -907,6 +907,17 @@ public:
   }
 
   std::shared_ptr<ContextData> getContextData() { return ct_data; }
+
+  /**
+   * @brief Get the ComputeOps table for this layer's backend (may be null).
+   *
+   * Shortcut for `getContextData()->getComputeOps()`. Returns nullptr if
+   * no ContextData is attached, in which case callers fall back to the
+   * global table via nntrainer::getComputeOps().
+   */
+  ComputeOps *getComputeOps() const {
+    return ct_data ? ct_data->getComputeOps() : nullptr;
+  }
 
   /**
    * @brief   get name by the layer

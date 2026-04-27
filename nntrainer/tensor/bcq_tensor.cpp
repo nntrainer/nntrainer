@@ -12,7 +12,6 @@
 #include <iostream>
 
 #include <bcq_tensor.h>
-#include <cpu_backend.h>
 #include <tensor.h>
 #include <util_func.h>
 

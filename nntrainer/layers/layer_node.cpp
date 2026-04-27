@@ -941,6 +941,26 @@ void LayerNode::configureRunContext(const std::vector<Weight *> &weights,
                                     const std::vector<Var_Grad *> &tensors,
                                     float loss_scale,
                                     std::shared_ptr<ContextData> ct_data) {
+  // Attach the layer's ContextData to every Tensor it owns so that all
+  // subsequent ops (dot/multiply/...) dispatch to the correct vendor
+  // backend without per-call ops parameter threading.
+  if (ct_data) {
+    auto attach = [&ct_data](Var_Grad *vg) {
+      if (vg == nullptr)
+        return;
+      vg->getVariableRef().setContextData(ct_data);
+      if (vg->hasGradient())
+        vg->getGradientRef().setContextData(ct_data);
+    };
+    for (auto *w : weights)
+      attach(w);
+    for (auto *in : inputs)
+      attach(in);
+    for (auto *out : outputs)
+      attach(out);
+    for (auto *t : tensors)
+      attach(t);
+  }
   run_context = std::make_unique<RunLayerContext>(
     getName(), getTrainable(), 0.0f, getInPlaceType() != InPlaceType::NONE,
     loss_scale, ct_data, false, weights, inputs, outputs, tensors);

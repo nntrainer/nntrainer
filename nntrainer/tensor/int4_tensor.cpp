@@ -11,7 +11,7 @@
 #include <iomanip>
 #include <iostream>
 
-#include <cpu_backend.h>
+#include <compute_ops.h>
 #include <int4_tensor.h>
 #include <tensor.h>
 
@@ -101,7 +101,7 @@ Int4QTensor::Int4QTensor(
   }
 
   // copy scale factors
-  scopy(scale_size(), scales.data(), 1, (float *)getScale(), 1);
+  getOps()->scopy_fp32(scale_size(), scales.data(), 1, (float *)getScale(), 1);
 }
 
 bool Int4QTensor::operator==(const Int4QTensor &rhs) const {
@@ -582,11 +582,12 @@ void Int4QTensor::copy(const void *buf) {
     return;
   }
   // copy tensor data
-  scopy((size() + 1) / 2, (int8_t *)buf, 1, (int8_t *)getData(), 1);
+  getOps()->scopy_s8((size() + 1) / 2, (int8_t *)buf, 1, (int8_t *)getData(),
+                     1);
 
   // copy scale factor data
   float *scales = (float *)(((int8_t *)buf) + (size() + 1) / 2);
-  scopy(scale_size(), scales, 1, (float *)getScale(), 1);
+  getOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
 }
 
 void Int4QTensor::save_quantization_info(std::ostream &file) {

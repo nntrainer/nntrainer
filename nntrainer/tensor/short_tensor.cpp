@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <iostream>
 
+#include <compute_ops.h>
 #include <cpu_backend.h>
 #include <short_tensor.h>
 #include <tensor.h>
@@ -90,7 +91,7 @@ ShortTensor::ShortTensor(
   }
 
   // copy scale factors
-  scopy(scale_size(), scales.data(), 1, (float *)getScale(), 1);
+  getOps()->scopy_fp32(scale_size(), scales.data(), 1, (float *)getScale(), 1);
 }
 
 bool ShortTensor::operator==(const ShortTensor &rhs) const {
@@ -286,7 +287,8 @@ void ShortTensor::copyData(const Tensor &from) {
     copy(from.getData());
     break;
   case ml::train::TensorDim::DataType::FP32:
-    copy_fp32(from.size(), from.getData<float>(), (int16_t *)getData());
+    getOps()->copy_fp32_s16(from.size(), from.getData<float>(),
+                            (int16_t *)getData());
     break;
   default:
     throw std::invalid_argument("Error: Unsupported data type");
@@ -493,7 +495,7 @@ void ShortTensor::copy(const void *buf) {
   copy_s16(size(), (int16_t *)buf, (int16_t *)getData());
 
   float *scales = (float *)(((int16_t *)buf) + size());
-  scopy(scale_size(), scales, 1, (float *)getScale(), 1);
+  getOps()->scopy_fp32(scale_size(), scales, 1, (float *)getScale(), 1);
 }
 
 void ShortTensor::save_quantization_info(std::ostream &file) {

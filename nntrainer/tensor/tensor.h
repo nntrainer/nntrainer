@@ -23,6 +23,8 @@
 
 #include <cstddef>
 
+#include <compute_ops.h>
+#include <context_data.h>
 #include <cpu_backend.h>
 #include <nntrainer_log.h>
 #include <tensor_base.h>
@@ -2007,6 +2009,88 @@ public:
   void deactivate();
 
   static constexpr float epsilon = 1e-5f;
+
+  /**
+   * @brief Attach ContextData carrying the per-vendor ComputeOps table.
+   *
+   * The state lives on the underlying TensorBase impl; Tensor is a
+   * thin Pimpl handle that just forwards. After this call, every op
+   * invoked on the tensor (dot/multiply/...) dispatches via
+   * ct_data->getComputeOps() instead of the global table. Binary-op
+   * result tensors inherit the ContextData via TensorBase helpers.
+   */
+  void setContextData(std::shared_ptr<ContextData> ct_data) {
+    itensor_->setContextData(std::move(ct_data));
+  }
+
+  /**
+   * @brief Get the ContextData attached to this tensor (may be null).
+   */
+  const std::shared_ptr<ContextData> &getContextData() const {
+    return itensor_->getContextData();
+  }
+
+  /**
+   * @brief Propagate this tensor's ContextData to a result tensor.
+   *
+   * Used by binary/unary ops so that subsequent calls on the result
+   * dispatch to the same vendor backend as the receiver. Caller-supplied
+   * ContextData on `out` is preserved. Must be called AFTER the kernel
+   * runs because CREATE_IF_EMPTY_DIMS may reallocate `out` mid-kernel
+   * and discard whatever ContextData was set before.
+   */
+  void inheritContextTo(Tensor &out) const {
+    const auto &ct = itensor_->getContextData();
+    if (ct && !out.getContextData())
+      out.setContextData(ct);
+  }
+
+  /**
+   * @brief Verify two operands of a binary op live on the same vendor.
+   *
+   * If both tensors have a ContextData attached AND they point to
+   * different ones, that means a CPU-resident tensor is about to be
+   * combined with a GPU/NPU-resident tensor (or two different GPU
+   * contexts) — the underlying memory is incompatible and the op
+   * would silently produce garbage. Throw early with a clear message
+   * so the caller knows to migrate one of them via `Tensor::to()`.
+   *
+   * If either side has no ContextData (default state), the check
+   * is permissive — fall through to the global g_compute_ops path
+   * as before. That preserves backward compatibility for code that
+   * never touches ContextData.
+   */
+  void checkContextCompatibility(const Tensor &other,
+                                 const char *op_name) const {
+    const auto &lhs = itensor_->getContextData();
+    const auto &rhs = other.itensor_->getContextData();
+    if (lhs && rhs && lhs.get() != rhs.get()) {
+      throw std::invalid_argument(
+        std::string("Tensor::") + op_name +
+        ": operands belong to different vendor contexts. "
+        "Migrate one operand with Tensor::to(target_ctx) before the op.");
+    }
+  }
+
+  /**
+   * @brief Migrate this tensor to a different ContextData (vendor).
+   *
+   * Skeleton: in the current host-shared-memory regime (CPU ↔ CPU,
+   * or CPU ↔ OpenCL where both can map the same buffer), this
+   * just deep-copies the tensor and re-tags the copy with
+   * `target_ct`. When real device-only memory backends land
+   * (CUDA, NPU with DMA-only buffers), this is the single place
+   * that grows the host↔device or device↔device transfer logic.
+   *
+   * @param target_ct the destination ContextData (may be null to
+   *                  detach back to the global ops fallback).
+   * @return a new Tensor with identical data and the new context.
+   */
+  Tensor to(std::shared_ptr<ContextData> target_ct) const {
+    Tensor migrated = *this; // deep copy via Tensor copy ctor
+    migrated.setContextData(std::move(target_ct));
+    return migrated;
+  }
 
 private:
   std::unique_ptr<TensorBase> itensor_;

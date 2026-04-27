@@ -25,6 +25,7 @@
 #include "model.h"
 #include "model_common_properties.h"
 #include <cmath>
+#include <compute_ops.h>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -1197,8 +1198,8 @@ std::vector<float *> NeuralNetwork::incremental_inference(
     if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
 
-      nntrainer::scopy(buf_size, out_t.getData<_FP16>(), 1, last_out_buf_data,
-                       1);
+      nntrainer::getComputeOps()->scopy_fp16_to_fp32(
+        buf_size, out_t.getData<_FP16>(), 1, last_out_buf_data, 1);
 #else
       throw std::invalid_argument("Error: enable-fp16 is not set");
 #endif
