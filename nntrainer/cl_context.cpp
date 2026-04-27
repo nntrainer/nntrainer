@@ -17,8 +17,11 @@
 #include <addition_layer_cl.h>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
+#include <cl_svm_allocator.h>
+#include <compute_ops.h>
 #include <concat_cl.h>
 #include <fc_layer_cl.h>
+#include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
 #include <swiglu_cl.h>
@@ -80,7 +83,19 @@ void ClContext::initialize() noexcept {
     initBlasClKernels();
     initAttentionClKernels();
     add_default_object();
-    setMemAllocator(std::make_shared<MemAllocator>());
+    // SVM-backed allocator so MemoryPool buffers are device-visible
+    // without an explicit copy. Falls back to host memory inside
+    // ClSVMAllocator when the driver lacks SVM support.
+    setMemAllocator(
+      std::make_shared<ClSVMAllocator>(opencl::ContextManager::Global()));
+
+    // Install the OpenCL ComputeOps subclass so tensors created from
+    // this Context dispatch their accelerator-only ops (Q4_0/INT4
+    // batch & accel GEMM/GEMV) to the existing OpenCL kernels in
+    // cl_operations/blas_kernels.cpp instead of throwing or silently
+    // taking the CPU path. CPU-only ops on a CL-attached tensor still
+    // throw via base default — by design, those stay on a CPU context.
+    getContextData()->setComputeOps(get_cl_ops());
 
   } catch (std::exception &e) {
     ml_loge("cl_context: registering layers failed!!, reason: %s", e.what());
