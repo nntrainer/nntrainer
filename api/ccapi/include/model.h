@@ -32,7 +32,8 @@
 
 namespace nntrainer {
 class RunLayerContext;
-}
+class Tensor;
+} // namespace nntrainer
 /** Define more aliases for the model in the API */
 namespace ml {
 namespace train {
@@ -324,6 +325,20 @@ public:
                                   void * /**< user_data */)>
                  fn,
                void *user_data = nullptr) = 0;
+
+  /**
+   * @brief Look up a graph-managed tensor by name.
+   *
+   * Used by the symbolic ml::train::Tensor API to wire a user-facing
+   * Tensor handle to its corresponding graph placeholder after compile.
+   * Once wired, host-side updates flow through `tensor.setData(buf)` instead
+   * of going through a separate setExternalTensors call by name.
+   *
+   * @param name tensor or input-layer name
+   * @return Tensor* pointer to the graph-owned tensor, or nullptr if no
+   *         such tensor exists in the compiled graph.
+   */
+  virtual nntrainer::Tensor *getTensor(const std::string &name) = 0;
 
   /**
    * @brief     set optimizer for the neural network model

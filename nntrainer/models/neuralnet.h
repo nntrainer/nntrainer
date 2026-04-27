@@ -458,6 +458,13 @@ public:
     void *user_data = nullptr) override;
 
   /**
+   * @copydoc ml::train::Model::getTensor(const std::string &)
+   */
+  Tensor *getTensor(const std::string &name) override {
+    return model_graph.getTensor(name);
+  }
+
+  /**
    * @brief     Run NeuralNetwork train with callback function by user
    * @param[in] dt datatype (mode) where it should be
    * @param[in] databuffer set the databuffer

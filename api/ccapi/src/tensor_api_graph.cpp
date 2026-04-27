@@ -449,7 +449,16 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
     return status;
   }
 
-  // 6. Materialize API tensors with allocated buffers
+  // 6. Wire each input Tensor handle to the graph-owned placeholder so the
+  //    caller can update data via `inp.setData(host_buf)` instead of going
+  //    through Model::setExternalTensors({inp}, {name}). The placeholder
+  //    name is the input layer name we registered in step 1 (or the name a
+  //    user-supplied input layer was created with).
+  //
+  //    Falls back to creating a fresh eager_data tensor when the lookup
+  //    misses — covers tests that compile a model without going through the
+  //    full input-layer creation path. Production code should always hit the
+  //    bound_tensor branch.
   for (auto &inp : inputs) {
     std::string inp_name = inp.name();
     if (inp_name.empty()) {
@@ -457,10 +466,16 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
                    ? "graph_input"
                    : "graph_input_" + std::to_string(&inp - &inputs[0]);
     }
-    const TensorDim &in_dim = inp.shape();
-    inp.impl_->eager_data = std::make_shared<nntrainer::Tensor>(
-      in_dim, true, nntrainer::Initializer::ZEROS, inp_name);
-    inp.impl_->eager_data->initialize();
+    nntrainer::Tensor *placeholder = getTensor(inp_name);
+    if (placeholder != nullptr) {
+      inp.impl_->bound_tensor = placeholder;
+      inp.impl_->dim = placeholder->getDim();
+    } else {
+      const TensorDim &in_dim = inp.shape();
+      inp.impl_->eager_data = std::make_shared<nntrainer::Tensor>(
+        in_dim, true, nntrainer::Initializer::ZEROS, inp_name);
+      inp.impl_->eager_data->initialize();
+    }
   }
   for (auto &output : outputs) {
     auto output_producer = output.getProducingLayer();

@@ -174,15 +174,37 @@ void Tensor::copyFrom(const void *src) {
 }
 
 void Tensor::setData(void *new_ptr) {
-  if (!impl_ || !impl_->external) {
-    throw std::runtime_error("setData: only supported for fromData tensors");
+  if (!impl_) {
+    throw std::runtime_error("setData: tensor is not materialized");
   }
   if (!new_ptr) {
     throw std::invalid_argument("setData: pointer must not be null");
   }
-  impl_->external_ptr = new_ptr;
-  impl_->eager_data->setData(std::make_shared<nntrainer::MemoryData>(new_ptr),
-                             0, false);
+
+  // Bound case: this Tensor is wired to a graph-owned placeholder by
+  // Model::compile(inputs, outputs, mode). Pointing the placeholder's
+  // MemoryData at the host buffer turns subsequent forward()/inference
+  // calls into a zero-copy read of the caller's memory — no separate
+  // setExternalTensors() round trip needed.
+  if (impl_->bound_tensor) {
+    impl_->external_ptr = new_ptr;
+    impl_->bound_tensor->setData(
+      std::make_shared<nntrainer::MemoryData>(new_ptr), 0, false);
+    return;
+  }
+
+  // fromData (eager external) case: same idea but on the user-side
+  // eager_data tensor that was created at fromData() time.
+  if (impl_->external && impl_->eager_data) {
+    impl_->external_ptr = new_ptr;
+    impl_->eager_data->setData(std::make_shared<nntrainer::MemoryData>(new_ptr),
+                               0, false);
+    return;
+  }
+
+  throw std::runtime_error(
+    "setData: tensor is neither bound to a graph placeholder nor a fromData "
+    "external tensor");
 }
 
 // --- Private helpers ---

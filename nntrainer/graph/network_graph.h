@@ -549,6 +549,33 @@ public:
     tensor_manager->setWeightOffset(offsets);
   }
 
+  /**
+   * @brief Look up a graph tensor by name.
+   *
+   * Used by the ml::train::Tensor symbolic API to wire each input Tensor
+   * handle to its corresponding graph placeholder right after
+   * compile/initialize/allocate, so post-compile updates can flow through
+   * `tensor.setData(host_buf)` instead of an external by-name binding.
+   *
+   * Returns nullptr (rather than throwing) when the name is missing. Manager
+   * itself throws std::out_of_range from the underlying unordered_map::at;
+   * the binding loop in tensor_api_graph wants a yes/no answer to decide
+   * between bound_tensor and a fallback eager_data tensor, so the throw
+   * gets absorbed here.
+   *
+   * @param name tensor or input-layer name
+   * @return Tensor* pointer to the graph-owned tensor; nullptr if not found.
+   */
+  Tensor *getTensor(const std::string &name) {
+    if (!tensor_manager)
+      return nullptr;
+    try {
+      return tensor_manager->getTensor(name);
+    } catch (...) {
+      return nullptr;
+    }
+  }
+
 private:
   std::map<std::string, std::string> sub_in_out; /** This is map to identify
                  input and output layer name of subgraph */
