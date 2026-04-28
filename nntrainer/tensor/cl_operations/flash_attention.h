@@ -233,6 +233,32 @@ void flash_attention_decode_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
                                     unsigned int batch, float scale);
 
 /**
+ * @brief Flash Attention FP16 decode kernel — Adreno-optimized variant
+ * @detail Adreno-optimized variant with sub-group reductions (cl_qcom_subgroups),
+ *         half4 vectorized loads, work-group size 128, and native_exp() for faster
+ *         exp computation. Score caching eliminates redundant Q·K computation.
+ *         Automatically selected when running on Adreno GPU (Qualcomm vendor).
+ *         Falls back to flash_attention_decode_fp16_cl on non-Adreno devices.
+ * @param[in] query _FP16 * for Query matrix
+ * @param[in] key _FP16 * for Key matrix
+ * @param[in] value _FP16 * for Value matrix
+ * @param[out] output _FP16 * for Output matrix
+ * @param[in] seqlen_q sequence length of query (must be 1 for decode)
+ * @param[in] seqlen_k sequence length of key
+ * @param[in] head_dim dimension of each attention head
+ * @param[in] num_heads_q number of query attention heads
+ * @param[in] num_heads_kv number of key/value attention heads
+ * @param[in] batch batch size
+ * @param[in] scale scaling factor for attention scores
+ */
+void flash_attention_decode_fp16_adreno_cl(_FP16 *query, _FP16 *key, _FP16 *value,
+                                           _FP16 *output, unsigned int seqlen_q,
+                                           unsigned int seqlen_k, unsigned int head_dim,
+                                           unsigned int num_heads_q,
+                                           unsigned int num_heads_kv,
+                                           unsigned int batch, float scale);
+
+/**
  * @brief L4-1: FlashAttention-v2 style prefill kernel with per-WI Q row processing
  * @detail This kernel uses a fundamentally different architecture from the cooperative
  *         processing model. Each work-item processes ONE Q row independently, eliminating

@@ -24,6 +24,7 @@
 #include <cl_kernels/flash_attention_prefill_fp16_adreno_v2.h>
 #include <cl_kernels/flash_attention_prefill_fp16_adreno_image.h>
 #include <cl_kernels/flash_attention_decode_fp16.h>
+#include <cl_kernels/flash_attention_decode_fp16_adreno.h>
 #endif
 
 namespace nntrainer {
@@ -729,9 +730,17 @@ void flash_attention_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value, _FP16 *outp
                              float scale) {
   // Dispatch to prefill or decode kernel based on query sequence length
   if (seqlen_q <= DECODE_SEQLEN_THRESHOLD) {
-    flash_attention_decode_fp16_cl(query, key, value, output,
-                                  seqlen_q, seqlen_k, head_dim,
-                                  num_heads_q, num_heads_kv, batch, scale);
+    // On Adreno GPUs, use the Adreno-optimized decode kernel with sub-groups,
+    // half4 vectorized loads, and work-group size 128
+    if (is_adreno_device()) {
+      flash_attention_decode_fp16_adreno_cl(query, key, value, output,
+                                            seqlen_q, seqlen_k, head_dim,
+                                            num_heads_q, num_heads_kv, batch, scale);
+    } else {
+      flash_attention_decode_fp16_cl(query, key, value, output,
+                                     seqlen_q, seqlen_k, head_dim,
+                                     num_heads_q, num_heads_kv, batch, scale);
+    }
   } else {
     // On Adreno GPUs, use the v1 kernel (parallel softmax, half4 loads)
     // Note: L4-1 v2 kernel (per-WI Q row) tested 15.7× slower (520ms vs 33ms)
@@ -1299,6 +1308,166 @@ void flash_attention_decode_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
   
   // Free partial buffers
   // Note: SVM buffers are freed automatically when the context is destroyed
+}
+
+/**
+ * @brief Flash Attention FP16 decode kernel — Adreno-optimized variant
+ * @detail Uses Adreno-specific optimizations:
+ *         - Sub-group reductions (cl_qcom_subgroups/cl_khr_subgroups)
+ *         - half4 vectorized loads for 4× memory bandwidth
+ *         - Work-group size 128 (Adreno optimal)
+ *         - Score caching to eliminate redundant Q·K computation
+ *         - native_exp() for faster exp computation
+ */
+void flash_attention_decode_fp16_adreno_cl(_FP16 *query, _FP16 *key, _FP16 *value,
+                                           _FP16 *output, unsigned int seqlen_q,
+                                           unsigned int seqlen_k, unsigned int head_dim,
+                                           unsigned int num_heads_q,
+                                           unsigned int num_heads_kv,
+                                           unsigned int batch, float scale) {
+  // Phase 6: Decode-specific kernel with split-KV approach
+  const unsigned int total_elements = batch * num_heads_q * seqlen_q * head_dim;
+  const unsigned int total_work_items = batch * num_heads_q * seqlen_q;
+  
+  static const unsigned int KV_TILE_SIZE = 64;
+  const unsigned int num_kv_tiles = (seqlen_k + KV_TILE_SIZE - 1) / KV_TILE_SIZE;
+  
+  // For small KV sequences or small batches, use CPU fallback
+  if (total_work_items < 32 || total_elements < 4096 || num_kv_tiles < 2) {
+    const size_t kv_elements = batch * num_heads_kv * seqlen_k * head_dim;
+    std::vector<float> query_fp32(total_elements);
+    std::vector<float> key_fp32(kv_elements);
+    std::vector<float> value_fp32(kv_elements);
+    std::vector<float> output_fp32(total_elements);
+    
+    fp16_to_fp32(query, query_fp32.data(), total_elements);
+    fp16_to_fp32(key, key_fp32.data(), kv_elements);
+    fp16_to_fp32(value, value_fp32.data(), kv_elements);
+    
+    flash_attention_cpu(query_fp32.data(), key_fp32.data(), value_fp32.data(),
+                       output_fp32.data(), seqlen_q, seqlen_k, head_dim,
+                       num_heads_q, num_heads_kv, batch, scale);
+    
+    fp32_to_fp16(output_fp32.data(), output, total_elements);
+    return;
+  }
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+
+  const size_t partials_max_sum_size = batch * num_heads_q * num_kv_tiles * sizeof(float);
+  const size_t partials_vkq_size = batch * num_heads_q * num_kv_tiles * head_dim * sizeof(float);
+  
+  float *partials_max_buf = (float *)blas_cc->context_inst_.createSVMRegion(partials_max_sum_size);
+  float *partials_sum_buf = (float *)blas_cc->context_inst_.createSVMRegion(partials_max_sum_size);
+  float *partials_vkq_buf = (float *)blas_cc->context_inst_.createSVMRegion(partials_vkq_size);
+  
+  if (!partials_max_buf || !partials_sum_buf || !partials_vkq_buf) {
+    const size_t kv_elements = batch * num_heads_kv * seqlen_k * head_dim;
+    std::vector<float> query_fp32(total_elements);
+    std::vector<float> key_fp32(kv_elements);
+    std::vector<float> value_fp32(kv_elements);
+    std::vector<float> output_fp32(total_elements);
+    
+    fp16_to_fp32(query, query_fp32.data(), total_elements);
+    fp16_to_fp32(key, key_fp32.data(), kv_elements);
+    fp16_to_fp32(value, value_fp32.data(), kv_elements);
+    
+    flash_attention_cpu(query_fp32.data(), key_fp32.data(), value_fp32.data(),
+                       output_fp32.data(), seqlen_q, seqlen_k, head_dim,
+                       num_heads_q, num_heads_kv, batch, scale);
+    
+    fp32_to_fp16(output_fp32.data(), output, total_elements);
+    return;
+  }
+
+  // Build compile options with sub-group support
+  std::string adreno_compile_options = get_subgroup_compile_option();
+  if (supports_subgroups()) {
+    ml_logi("Adreno decode: sub-group extension detected (%s), "
+            "enabling hardware sub-group reductions",
+            adreno_compile_options.c_str() + 2);
+  }
+
+  // Kernel 1: Decode kernel - each work-group processes a KV tile
+  ClContext::SharedPtrClKernel decode_kernel_ptr = blas_cc->registerClKernel(
+    flash_attention_decode_fp16_adreno_kernel, "flash_attention_decode_fp16_adreno",
+    adreno_compile_options);
+  if (!decode_kernel_ptr) {
+    ml_logi("Adreno decode: kernel compilation failed, falling back to base decode kernel");
+    // Fallback to base decode kernel
+    flash_attention_decode_fp16_cl(query, key, value, output,
+                                   seqlen_q, seqlen_k, head_dim,
+                                   num_heads_q, num_heads_kv, batch, scale);
+    return;
+  }
+
+  const int kv_max = seqlen_k;
+  static const unsigned int DECODE_WORK_GROUP_SIZE = 128;  // Adreno optimal
+  const unsigned int total_decode_groups = batch * num_heads_q * num_kv_tiles;
+  
+  int arg = 0;
+  bool result = false;
+
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, query);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, key);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, value);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, output);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, partials_max_buf);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, partials_sum_buf);
+  result = decode_kernel_ptr->SetKernelSVMArguments(arg++, partials_vkq_buf);
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &batch, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &kv_max, sizeof(int));
+  result = decode_kernel_ptr->SetKernelArguments(arg++, &num_kv_tiles, sizeof(int));
+
+  const int decode_work_groups_count[3] = {(int)(total_decode_groups * DECODE_WORK_GROUP_SIZE), 1, 1};
+  const int decode_work_group_size[3] = {(int)DECODE_WORK_GROUP_SIZE, 1, 1};
+
+  result = blas_cc->command_queue_inst_.DispatchCommand(
+    decode_kernel_ptr, decode_work_groups_count, decode_work_group_size);
+  if (!result) {
+    throw std::runtime_error("Failed to dispatch decode kernel for flash_attention_decode_fp16_adreno");
+    return;
+  }
+
+  // Kernel 2: Reduction kernel - combine partials using log-sum-exp
+  ClContext::SharedPtrClKernel reduce_kernel_ptr = blas_cc->registerClKernel(
+    flash_attention_decode_fp16_adreno_kernel, "flash_attention_decode_reduce_fp16_adreno",
+    adreno_compile_options);
+  if (!reduce_kernel_ptr) {
+    throw std::runtime_error("Failed to get kernel_ptr for flash_attention_decode_reduce_fp16_adreno");
+    return;
+  }
+
+  arg = 0;
+  result = reduce_kernel_ptr->SetKernelSVMArguments(arg++, partials_max_buf);
+  result = reduce_kernel_ptr->SetKernelSVMArguments(arg++, partials_sum_buf);
+  result = reduce_kernel_ptr->SetKernelSVMArguments(arg++, partials_vkq_buf);
+  result = reduce_kernel_ptr->SetKernelSVMArguments(arg++, output);
+  result = reduce_kernel_ptr->SetKernelArguments(arg++, &num_kv_tiles, sizeof(int));
+  result = reduce_kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
+  result = reduce_kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
+
+  const int reduce_work_groups_count[3] = {(int)(batch * num_heads_q * DECODE_WORK_GROUP_SIZE), 1, 1};
+  const int reduce_work_group_size[3] = {(int)DECODE_WORK_GROUP_SIZE, 1, 1};
+
+  result = blas_cc->command_queue_inst_.DispatchCommand(
+    reduce_kernel_ptr, reduce_work_groups_count, reduce_work_group_size);
+  if (!result) {
+    throw std::runtime_error("Failed to dispatch reduce kernel for flash_attention_decode_fp16_adreno");
+    return;
+  }
+
+  // Read back output
+  blas_cc->command_queue_inst_.enqueueSVMMap(output,
+                                             batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16),
+                                             true);
 }
 
 /**
