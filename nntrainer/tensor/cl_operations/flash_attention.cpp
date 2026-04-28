@@ -21,6 +21,8 @@
 #include <cl_kernels/flash_attention_fp16.h>
 #include <cl_kernels/flash_attention_prefill_fp16.h>
 #include <cl_kernels/flash_attention_prefill_fp16_adreno.h>
+#include <cl_kernels/flash_attention_prefill_fp16_adreno_v2.h>
+#include <cl_kernels/flash_attention_prefill_fp16_adreno_image.h>
 #include <cl_kernels/flash_attention_decode_fp16.h>
 #endif
 
@@ -734,7 +736,9 @@ void flash_attention_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value, _FP16 *outp
                                   seqlen_q, seqlen_k, head_dim,
                                   num_heads_q, num_heads_kv, batch, scale);
   } else {
-    // On Adreno GPUs, use the Adreno-optimized prefill kernel with parallel softmax
+    // On Adreno GPUs, use the v1 kernel (parallel softmax, half4 loads)
+    // Note: L4-1 v2 kernel (per-WI Q row) tested 15.7× slower (520ms vs 33ms)
+    // The per-WI architecture doesn't map well to Adreno's SIMD execution model
     if (is_adreno_device()) {
       flash_attention_prefill_fp16_adreno_cl(query, key, value, output,
                                              seqlen_q, seqlen_k, head_dim,
@@ -1298,6 +1302,383 @@ void flash_attention_decode_fp16_cl(_FP16 *query, _FP16 *key, _FP16 *value,
   
   // Free partial buffers
   // Note: SVM buffers are freed automatically when the context is destroyed
+}
+
+/**
+ * @brief L4-1: FlashAttention-v2 style prefill kernel with per-WI Q row processing
+ * @detail This kernel uses a fundamentally different architecture from the cooperative
+ *         processing model. Each work-item processes ONE Q row independently, eliminating
+ *         all barriers inside the KV loop. Expected improvement: 30-50% prefill.
+ * @param[in] query _FP16 * for Query matrix
+ * @param[in] key _FP16 * for Key matrix
+ * @param[in] value _FP16 * for Value matrix
+ * @param[out] output _FP16 * for Output matrix
+ * @param[in] seqlen_q sequence length of query
+ * @param[in] seqlen_k sequence length of key
+ * @param[in] head_dim dimension of each attention head
+ * @param[in] num_heads_q number of query attention heads
+ * @param[in] num_heads_kv number of key/value attention heads
+ * @param[in] batch batch size
+ * @param[in] scale scaling factor for attention scores
+ */
+void flash_attention_prefill_fp16_adreno_v2_cl(_FP16 *query, _FP16 *key, _FP16 *value,
+                                               _FP16 *output, unsigned int seqlen_q,
+                                               unsigned int seqlen_k, unsigned int head_dim,
+                                               unsigned int num_heads_q,
+                                               unsigned int num_heads_kv,
+                                               unsigned int batch, float scale) {
+  // For very small workloads, use CPU implementation to avoid GPU overhead
+  const unsigned int total_elements = batch * num_heads_q * seqlen_q * head_dim;
+  const unsigned int total_work_items = batch * num_heads_q * seqlen_q;
+  
+  if (total_work_items < 32 || total_elements < 4096) {
+    const size_t kv_elements = batch * num_heads_kv * seqlen_k * head_dim;
+    std::vector<float> query_fp32(total_elements);
+    std::vector<float> key_fp32(kv_elements);
+    std::vector<float> value_fp32(kv_elements);
+    std::vector<float> output_fp32(total_elements);
+    
+    fp16_to_fp32(query, query_fp32.data(), total_elements);
+    fp16_to_fp32(key, key_fp32.data(), kv_elements);
+    fp16_to_fp32(value, value_fp32.data(), kv_elements);
+    
+    flash_attention_cpu(query_fp32.data(), key_fp32.data(), value_fp32.data(),
+                       output_fp32.data(), seqlen_q, seqlen_k, head_dim,
+                       num_heads_q, num_heads_kv, batch, scale);
+    
+    fp32_to_fp16(output_fp32.data(), output, total_elements);
+    return;
+  }
+
+  // L4-1: Per-WI Q row processing architecture
+  // BLOCK_SIZE_M = 64: Each work-group processes 64 Q rows (1 WI per Q row)
+  // BLOCK_SIZE_N = 32: Each KV tile has 32 rows
+  static const unsigned int BLOCK_SIZE_M = 64;
+  static const unsigned int BLOCK_SIZE_N = 32;
+  static const unsigned int V2_WORK_GROUP_SIZE = 64;  // Must match BLOCK_SIZE_M
+  
+  const unsigned int gqa_ratio = num_heads_q / num_heads_kv;
+  
+  // Number of Q blocks (work-groups along sequence dimension)
+  const unsigned int num_q_blocks = (seqlen_q + BLOCK_SIZE_M - 1) / BLOCK_SIZE_M;
+  
+  // Total work-groups: batch * num_heads_q * num_q_blocks
+  const unsigned int total_groups = batch * num_heads_q * num_q_blocks;
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+
+  // Register the v2 kernel
+  ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
+    flash_attention_prefill_fp16_adreno_v2_kernel, "flash_attention_prefill_fp16_adreno_v2");
+  if (!kernel_ptr) {
+    ml_logi("L4-1 v2 kernel: compilation failed, falling back to v1");
+    // Fallback to v1 kernel
+    flash_attention_prefill_fp16_adreno_cl(query, key, value, output,
+                                           seqlen_q, seqlen_k, head_dim,
+                                           num_heads_q, num_heads_kv, batch, scale);
+    return;
+  }
+
+  int arg = 0;
+  bool result = false;
+
+  result = kernel_ptr->SetKernelSVMArguments(arg++, query);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_prefill_fp16_adreno_v2");
+
+  result = kernel_ptr->SetKernelSVMArguments(arg++, key);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 1 for flash_attention_prefill_fp16_adreno_v2");
+
+  result = kernel_ptr->SetKernelSVMArguments(arg++, value);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 2 for flash_attention_prefill_fp16_adreno_v2");
+
+  result = kernel_ptr->SetKernelSVMArguments(arg++, output);
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_prefill_fp16_adreno_v2");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_prefill_fp16_adreno_v2");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_prefill_fp16_adreno_v2");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_prefill_fp16_adreno_v2");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_prefill_fp16_adreno_v2");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_prefill_fp16_adreno_v2");
+
+  result = kernel_ptr->SetKernelArguments(arg++, &gqa_ratio, sizeof(int));
+  if (!result)
+    throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_prefill_fp16_adreno_v2");
+
+  // Dispatch: 3D grid
+  // dim0: num_q_blocks (Q sequence tiles)
+  // dim1: num_heads_q
+  // dim2: batch
+  const int work_groups_count[3] = {(int)(num_q_blocks * V2_WORK_GROUP_SIZE), 
+                                    (int)num_heads_q, 
+                                    (int)batch};
+  const int work_group_size[3] = {(int)V2_WORK_GROUP_SIZE, 1, 1};
+
+  result = blas_cc->command_queue_inst_.DispatchCommand(
+    kernel_ptr, work_groups_count, work_group_size);
+  if (!result) {
+    throw std::runtime_error("Failed to dispatch kernel for flash_attention_prefill_fp16_adreno_v2");
+    return;
+  }
+
+  blas_cc->command_queue_inst_.enqueueSVMMap(output, 
+                                             batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16),
+                                             true);
+}
+
+/**
+ * @brief L4-2: Flash Attention using image objects for texture cache optimization
+ * @detail Creates OpenCL image objects from K/V buffers and dispatches the image-based kernel.
+ *         Image objects route reads through the Adreno Texture Processor (TP) cache,
+ *         providing a separate cache path from L2 for K/V data.
+ *         
+ *         Image creation approach:
+ *         - Uses clCreateImage with CL_MEM_USE_HOST_PTR to wrap existing SVM buffers
+ *         - Image format: CL_RGBA / CL_HALF_FLOAT (4 half values per pixel)
+ *         - Image width: HEAD_DIM/4 (32 for HEAD_DIM=128)
+ *         - Image height: batch * num_heads_kv * seqlen_k
+ */
+void flash_attention_prefill_fp16_adreno_image_cl(_FP16 *query, _FP16 *key, _FP16 *value,
+                                                  _FP16 *output, unsigned int seqlen_q,
+                                                  unsigned int seqlen_k, unsigned int head_dim,
+                                                  unsigned int num_heads_q,
+                                                  unsigned int num_heads_kv,
+                                                  unsigned int batch, float scale) {
+  // For very small workloads, use CPU implementation to avoid GPU overhead
+  const unsigned int total_elements = batch * num_heads_q * seqlen_q * head_dim;
+  const unsigned int total_work_items = batch * num_heads_q * seqlen_q;
+  
+  if (total_work_items < 32 || total_elements < 4096) {
+    const size_t kv_elements = batch * num_heads_kv * seqlen_k * head_dim;
+    std::vector<float> query_fp32(total_elements);
+    std::vector<float> key_fp32(kv_elements);
+    std::vector<float> value_fp32(kv_elements);
+    std::vector<float> output_fp32(total_elements);
+    
+    fp16_to_fp32(query, query_fp32.data(), total_elements);
+    fp16_to_fp32(key, key_fp32.data(), kv_elements);
+    fp16_to_fp32(value, value_fp32.data(), kv_elements);
+    
+    flash_attention_cpu(query_fp32.data(), key_fp32.data(), value_fp32.data(),
+                       output_fp32.data(), seqlen_q, seqlen_k, head_dim,
+                       num_heads_q, num_heads_kv, batch, scale);
+    
+    fp32_to_fp16(output_fp32.data(), output, total_elements);
+    return;
+  }
+
+  // GQA grouping — same logic as v1 kernel
+  const unsigned int gqa_ratio = num_heads_q / num_heads_kv;
+  unsigned int ncols2 = 1;
+  if (gqa_ratio >= 4 && seqlen_q > 4) {
+    ncols2 = 2;
+  }
+  if (ncols2 > MAX_NCOLS2) {
+    ncols2 = MAX_NCOLS2;
+  }
+
+  const unsigned int ncols1 = select_ncols1(seqlen_q, ncols2);
+  const unsigned int PREFILL_WORK_GROUP_SIZE = select_work_group_size(20 * 1024);
+  const unsigned int num_q_groups = (seqlen_q + ncols1 - 1) / ncols1;
+  const unsigned int num_dispatches = (gqa_ratio + ncols2 - 1) / ncols2;
+
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+
+  // Get OpenCL context and device for image creation
+  cl_context cl_ctx = blas_cc->context_inst_.GetContext();
+  cl_command_queue cl_queue = blas_cc->command_queue_inst_.GetCommandQueue();
+
+  // Image dimensions
+  // Width = HEAD_DIM/4 (each pixel stores 4 half values = 8 bytes)
+  // Height = batch * num_heads_kv * seqlen_k (flattened batch/head/seq)
+  const size_t img_width = head_dim / 4;
+  const size_t img_height = batch * num_heads_kv * seqlen_k;
+  const size_t kv_row_pitch = head_dim * sizeof(_FP16);  // Row pitch in bytes
+
+  // Image format: RGBA channels, each half, so 4 half values per pixel
+  cl_image_format img_format;
+  img_format.image_channel_order = CL_RGBA;
+  img_format.image_channel_data_type = CL_HALF_FLOAT;
+
+  // Image descriptor for 2D image from buffer
+  cl_image_desc img_desc;
+  memset(&img_desc, 0, sizeof(cl_image_desc));
+  img_desc.image_type = CL_MEM_OBJECT_IMAGE2D;
+  img_desc.image_width = img_width;
+  img_desc.image_height = img_height;
+  img_desc.image_row_pitch = kv_row_pitch;
+  // Note: For CL_MEM_USE_HOST_PTR, the host_ptr must be the buffer itself
+  // We set the buffer in clCreateImage, not in the descriptor
+
+  cl_int err = CL_SUCCESS;
+
+  // Create K image from existing buffer
+  cl_mem K_img = clCreateImage(
+    cl_ctx,
+    CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+    &img_format,
+    &img_desc,
+    key,  // host_ptr = existing SVM buffer
+    &err
+  );
+
+  if (err != CL_SUCCESS || !K_img) {
+    ml_logi("L4-2 image kernel: failed to create K image (err=%d), falling back to v1", err);
+    flash_attention_prefill_fp16_adreno_cl(query, key, value, output,
+                                           seqlen_q, seqlen_k, head_dim,
+                                           num_heads_q, num_heads_kv, batch, scale);
+    return;
+  }
+
+  // Create V image from existing buffer
+  cl_mem V_img = clCreateImage(
+    cl_ctx,
+    CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+    &img_format,
+    &img_desc,
+    value,  // host_ptr = existing SVM buffer
+    &err
+  );
+
+  if (err != CL_SUCCESS || !V_img) {
+    ml_logi("L4-2 image kernel: failed to create V image (err=%d), falling back to v1", err);
+    clReleaseMemObject(K_img);
+    flash_attention_prefill_fp16_adreno_cl(query, key, value, output,
+                                           seqlen_q, seqlen_k, head_dim,
+                                           num_heads_q, num_heads_kv, batch, scale);
+    return;
+  }
+
+  // Build compile options
+  std::string adreno_compile_options = get_subgroup_compile_option();
+  if (supports_subgroups()) {
+    ml_logi("L4-2 image kernel: sub-group extension detected (%s)",
+            adreno_compile_options.c_str() + 2);
+  }
+
+  // Register the image-based kernel
+  ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
+    flash_attention_prefill_fp16_adreno_image_kernel, "flash_attention_prefill_fp16_adreno_image",
+    adreno_compile_options);
+
+  if (!kernel_ptr) {
+    ml_logi("L4-2 image kernel: compilation failed, falling back to v1");
+    clReleaseMemObject(K_img);
+    clReleaseMemObject(V_img);
+    flash_attention_prefill_fp16_adreno_cl(query, key, value, output,
+                                           seqlen_q, seqlen_k, head_dim,
+                                           num_heads_q, num_heads_kv, batch, scale);
+    return;
+  }
+
+  for (unsigned int dispatch = 0; dispatch < num_dispatches; dispatch++) {
+    const unsigned int head_group_offset = dispatch * ncols2;
+    const unsigned int dispatch_ncols2 = std::min(ncols2, gqa_ratio - head_group_offset);
+    const unsigned int total_groups = batch * num_heads_kv * num_q_groups;
+
+    int arg = 0;
+    bool result = false;
+
+    // Arg 0: query (buffer)
+    result = kernel_ptr->SetKernelSVMArguments(arg++, query);
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 0 for flash_attention_prefill_fp16_adreno_image");
+
+    // Arg 1: K_img (image)
+    result = kernel_ptr->SetKernelArguments(arg++, &K_img, sizeof(cl_mem));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 1 (K_img) for flash_attention_prefill_fp16_adreno_image");
+
+    // Arg 2: V_img (image)
+    result = kernel_ptr->SetKernelArguments(arg++, &V_img, sizeof(cl_mem));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 2 (V_img) for flash_attention_prefill_fp16_adreno_image");
+
+    // Arg 3: output (buffer)
+    result = kernel_ptr->SetKernelSVMArguments(arg++, output);
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 3 for flash_attention_prefill_fp16_adreno_image");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &seqlen_q, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 4 for flash_attention_prefill_fp16_adreno_image");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &seqlen_k, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 5 for flash_attention_prefill_fp16_adreno_image");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &head_dim, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 6 for flash_attention_prefill_fp16_adreno_image");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &num_heads_q, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 7 for flash_attention_prefill_fp16_adreno_image");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &num_heads_kv, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 8 for flash_attention_prefill_fp16_adreno_image");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &batch, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 9 for flash_attention_prefill_fp16_adreno_image");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &scale, sizeof(float));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 10 for flash_attention_prefill_fp16_adreno_image");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &dispatch_ncols2, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 11 (ncols2) for flash_attention_prefill_fp16_adreno_image");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &head_group_offset, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 12 (head_group_offset) for flash_attention_prefill_fp16_adreno_image");
+
+    result = kernel_ptr->SetKernelArguments(arg++, &ncols1, sizeof(int));
+    if (!result)
+      throw std::runtime_error("Failed to set kernel argument 13 (ncols1) for flash_attention_prefill_fp16_adreno_image");
+
+    const int work_groups_count[3] = {(int)(total_groups * PREFILL_WORK_GROUP_SIZE), 1, 1};
+    const int work_group_size[3] = {(int)PREFILL_WORK_GROUP_SIZE, 1, 1};
+
+    result = blas_cc->command_queue_inst_.DispatchCommand(
+      kernel_ptr, work_groups_count, work_group_size);
+    if (!result) {
+      clReleaseMemObject(K_img);
+      clReleaseMemObject(V_img);
+      throw std::runtime_error("Failed to dispatch kernel for flash_attention_prefill_fp16_adreno_image");
+      return;
+    }
+  }
+
+  // Read back output
+  blas_cc->command_queue_inst_.enqueueSVMMap(output, 
+                                             batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16),
+                                             true);
+
+  // Release image objects
+  clReleaseMemObject(K_img);
+  clReleaseMemObject(V_img);
 }
 #endif /* ENABLE_FP16 */
 

@@ -23,7 +23,7 @@ mkdir -p libs/arm64-v8a
 cp builddir/android_build_result/lib/arm64-v8a/*.so libs/arm64-v8a
 
 echo "Building flash attention FP16 unittest..."
-ndk-build -C test/jni -j$(nproc) MESON_ENABLE_OPENCL=1 MESON_ENABLE_FP16=1 q NDK_DEBUG=0
+ndk-build -C test/jni -j$(nproc) MESON_ENABLE_OPENCL=1 MESON_ENABLE_FP16=1 NDK_DEBUG=0
 
 echo "Deploying to device..."
 adb shell "mkdir -p /data/local/tmp/nntrainer/test"

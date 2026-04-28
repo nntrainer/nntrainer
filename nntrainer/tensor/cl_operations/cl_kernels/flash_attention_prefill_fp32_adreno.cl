@@ -387,10 +387,8 @@ __kernel void flash_attention_prefill_fp32_adreno(
           for (int j = 0; j < nrows_kv; j++) {
             const float kq_exp = KQ_tile[qi][j];
             const float4 v_val = *((__local float4*)&V_tile[j][d4 * 4]);
-            vkq_acc.x += kq_exp * v_val.x;
-            vkq_acc.y += kq_exp * v_val.y;
-            vkq_acc.z += kq_exp * v_val.z;
-            vkq_acc.w += kq_exp * v_val.w;
+            // L4-6: Vector FMA — single vector multiply-add instruction instead of 4 scalar
+            vkq_acc += kq_exp * v_val;
           }
           VKQ[qi][d4 * 4]     += vkq_acc.x;
           VKQ[qi][d4 * 4 + 1] += vkq_acc.y;

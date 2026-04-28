@@ -47,6 +47,8 @@ if get_option('enable-fp16')
     'flash_attention_fp16.cl',
     'flash_attention_prefill_fp16.cl',
     'flash_attention_prefill_fp16_adreno.cl',
+    'flash_attention_prefill_fp16_adreno_v2.cl',
+    'flash_attention_prefill_fp16_adreno_image.cl',
     'flash_attention_decode_fp16.cl',
     'hgemm_no_trans.cl',
     'hgemm_trans_a.cl',

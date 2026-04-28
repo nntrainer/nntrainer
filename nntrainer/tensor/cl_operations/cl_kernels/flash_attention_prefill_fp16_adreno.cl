@@ -71,11 +71,12 @@
 #define HEAD_DIM 128
 #endif
 
-// Ensure HEAD_DIM is multiple of 4 for half4 vectorized access
-#if (HEAD_DIM % 4) != 0
-#error "HEAD_DIM must be multiple of 4 for half4 vectorized access on Adreno"
+// Ensure HEAD_DIM is multiple of 8 for half8 vectorized access (L4-3)
+#if (HEAD_DIM % 8) != 0
+#error "HEAD_DIM must be multiple of 8 for half8 vectorized access on Adreno"
 #endif
 
+#define HEAD_DIM8 (HEAD_DIM / 8)
 #define HEAD_DIM4 (HEAD_DIM / 4)
 #define HEAD_DIM2 (HEAD_DIM / 2)
 #define NQ (NCOLS1 * NCOLS2)  // Total Q rows per work-group (maximum)
@@ -313,26 +314,24 @@ __kernel void flash_attention_prefill_fp16_adreno(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Compute KQ tile: KQ_tile[qi][j] = dot(Q_tile[qi], K_tile[j]) * scale
-    // Opt 13: Only compute for valid Q rows (actual_ncols2 * valid_ncols1)
-    // and valid KV rows (nrows_kv) — no zero-filling needed
-    // Adreno optimization: Use native FP16 FMA for 2× throughput, then accumulate in FP32
+    // L4-3: Use half8 vectorized loads + dot() intrinsic for hardware-accelerated dot product
+    // Only compute for valid Q rows (actual_ncols2 * valid_ncols1) and valid KV rows (nrows_kv)
     for (int h = 0; h < actual_ncols2; h++) {
       for (int i = 0; i < valid_ncols1; i++) {
         const int qi = h * NCOLS1 + i;
         for (int j = local_id; j < nrows_kv; j += local_size) {
-          // Native FP16 dot product with FP32 final accumulation
-          // Adreno 6xx+ executes half multiply at 2× FP32 rate
-          half4 kq_acc4 = (half4)(0.0h, 0.0h, 0.0h, 0.0h);
-          for (int d4 = 0; d4 < HEAD_DIM4; d4++) {
-            const half4 q_val = *((__local half4*)&Q_tile[qi][d4 * 4]);
-            const half4 k_val = *((__local half4*)&K_tile[j][d4 * 4]);
-            // Native FP16 FMA — 2× throughput on Adreno
-            kq_acc4 += q_val * k_val;
+          // L4-3: half8 vectorized loads + dot() intrinsic
+          // Each dot() computes 4-element dot product in 1 hardware instruction
+          // Adreno 6xx+ has hardware dot() acceleration
+          float kq_acc = 0.0f;
+          for (int d8 = 0; d8 < HEAD_DIM8; d8++) {
+            const half8 q_val = *((__local half8*)&Q_tile[qi][d8 * 8]);
+            const half8 k_val = *((__local half8*)&K_tile[j][d8 * 8]);
+            // dot() intrinsic: computes dot product of two half4 vectors
+            // We split half8 into two half4 and sum the results
+            kq_acc += dot(q_val.lo, k_val.lo);  // First 4 elements
+            kq_acc += dot(q_val.hi, k_val.hi);  // Second 4 elements
           }
-          // Final accumulate in FP32 for numerical accuracy
-          // Note: Adreno compiler requires .s0/.s1/.s2/.s3 instead of .x/.y/.z/.w for half4
-          float kq_acc = (float)kq_acc4.s0 + (float)kq_acc4.s1 +
-                         (float)kq_acc4.s2 + (float)kq_acc4.s3;
           KQ_tile[qi][j] = kq_acc * scale;
         }
       }
@@ -399,11 +398,10 @@ __kernel void flash_attention_prefill_fp16_adreno(
           for (int j = 0; j < nrows_kv; j++) {
             const float kq_exp = KQ_tile[qi][j];
             const half4 v_val = *((__local half4*)&V_tile[j][d4 * 4]);
-            // Note: Adreno compiler requires .s0/.s1/.s2/.s3 for half4 subscript access
-            vkq_acc.x += kq_exp * (float)v_val.s0;
-            vkq_acc.y += kq_exp * (float)v_val.s1;
-            vkq_acc.z += kq_exp * (float)v_val.s2;
-            vkq_acc.w += kq_exp * (float)v_val.s3;
+            // L4-6: Vector FMA — convert half4 to float4, then use single vector multiply-add
+            // This generates 1 vector FMA instruction on Adreno instead of 4 scalar instructions
+            const float4 v_f = convert_float4(v_val);
+            vkq_acc += kq_exp * v_f;
           }
           VKQ[qi][d4 * 4]     += vkq_acc.x;
           VKQ[qi][d4 * 4 + 1] += vkq_acc.y;

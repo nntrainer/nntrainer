@@ -21,8 +21,8 @@
 
 #define SOFTMAX_MIN -1e30f
 
-// Local memory size for Q cache (head_dim typically 128)
-#define LOCAL_SIZE 256
+// L4-8: Use HEAD_DIM instead of LOCAL_SIZE=256 (saves 768 bytes for FP32, 1536 bytes for FP16)
+#define HEAD_DIM 128
 
 // KV rows processed per work-group (tile size)
 #define KV_TILE_SIZE 64
@@ -59,10 +59,14 @@ __kernel void flash_attention_decode_fp32(
     const int num_kv_tiles               // Number of KV tiles
 ) {
     // Local memory for Q cache
-    __local float local_q[LOCAL_SIZE];
+    // L4-8: Use HEAD_DIM instead of LOCAL_SIZE=256 (saves 768 bytes)
+    __local float local_q[HEAD_DIM];
     
     // Local memory for partial VKQ accumulation (reduced at end)
-    __local float local_vkq[LOCAL_SIZE];
+    __local float local_vkq[HEAD_DIM];
+    
+    // L4-4: Local memory for score caching (eliminates redundant Q·K computation)
+    __local float local_scores[KV_TILE_SIZE];
     
     const int global_id = get_global_id(0);
     const int local_id = get_local_id(0);
@@ -132,7 +136,9 @@ __kernel void flash_attention_decode_fp32(
     // We'll accumulate VKQ directly in local_vkq with proper synchronization
     
     // Process KV rows assigned to this work-item
+    // L4-4: Cache scores in local memory to eliminate redundant Q·K computation
     for (int k = kv_start + local_id; k < kv_end; k += local_size) {
+        const int idx = k - kv_start;
         const int k_offset = kv_head_offset + k * head_dim;
         
         // Compute Q·K for this KV row
@@ -141,6 +147,9 @@ __kernel void flash_attention_decode_fp32(
             score += local_q[d] * key[k_offset + d];
         }
         score *= scale;
+        
+        // L4-4: Cache score for reuse in second pass
+        local_scores[idx] = score;
         
         // Track max for this thread
         thread_max = fmax(thread_max, score);
@@ -170,20 +179,14 @@ __kernel void flash_attention_decode_fp32(
     const float tile_max = local_max[0];
     barrier(CLK_LOCAL_MEM_FENCE);
     
-    // Second pass: compute exp(scores - tile_max) and accumulate
+    // Second pass: use cached scores (L4-4: no Q·K recomputation, no K re-read)
     for (int k = kv_start + local_id; k < kv_end; k += local_size) {
-        const int k_offset = kv_head_offset + k * head_dim;
-        const int v_offset = k_offset;  // Same layout for K and V
+        const int idx = k - kv_start;
+        const int v_offset = kv_head_offset + k * head_dim;
         
-        // Compute Q·K for this KV row
-        float score = 0.0f;
-        for (int d = 0; d < head_dim; d++) {
-            score += local_q[d] * key[k_offset + d];
-        }
-        score *= scale;
-        
-        // Compute exp(score - tile_max)
-        const float exp_score = exp(score - tile_max);
+        // L4-4: Use cached score instead of recomputing Q·K
+        // L4-11: Use native_exp for faster exp computation on GPU
+        const float exp_score = native_exp(local_scores[idx] - tile_max);
         thread_sum += exp_score;
         
         // Accumulate weighted V into local VKQ

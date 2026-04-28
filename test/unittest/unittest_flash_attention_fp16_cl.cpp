@@ -236,6 +236,185 @@ static void run_flash_attention_fp16_test(const int seqlen_q, const int seqlen_k
 }
 
 /**
+ * @brief Test L4-2 image kernel (texture cache optimization) for GQA with FP16
+ */
+TEST(nntrainer_opencl_kernels_flash_attention, flash_attention_test_fp16_image_kernel_l4_2) {
+  const int seqlen_q = 512;
+  const int seqlen_k = 512;
+  const int head_dim = 128;
+  const int num_heads_q = 16;
+  const int num_heads_kv = 8;
+  const int batch = 1;
+  
+  auto *blas_cc = static_cast<nntrainer::ClContext *>(
+    nntrainer::Engine::Global().getRegisteredContext("gpu"));
+
+  const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  const float alpha = 1e-3f;
+  const int MOD = 10;
+
+  // Allocate host memory for GQA
+  std::vector<_FP16> query_h(batch * num_heads_q * seqlen_q * head_dim);
+  std::vector<_FP16> key_h(batch * num_heads_kv * seqlen_k * head_dim);
+  std::vector<_FP16> value_h(batch * num_heads_kv * seqlen_k * head_dim);
+  std::vector<float> output_h_ref(batch * num_heads_q * seqlen_q * head_dim, 0.0f);
+  std::vector<_FP16> output_h_v1(batch * num_heads_q * seqlen_q * head_dim, 0.0f);
+  std::vector<_FP16> output_h_image(batch * num_heads_q * seqlen_q * head_dim, 0.0f);
+
+  // Initialize input data
+  for (size_t i = 0; i < query_h.size(); ++i) {
+    query_h[i] = static_cast<_FP16>(((static_cast<float>(i % MOD) - MOD/2.0f) * alpha));
+  }
+  for (size_t i = 0; i < key_h.size(); ++i) {
+    key_h[i] = static_cast<_FP16>(((static_cast<float>(i % MOD) - MOD/2.0f) * alpha));
+  }
+  for (size_t i = 0; i < value_h.size(); ++i) {
+    value_h[i] = static_cast<_FP16>(((static_cast<float>(i % MOD) - MOD/2.0f) * alpha));
+  }
+
+  // Compute reference output using CPU
+  std::vector<float> query_fp32(query_h.size());
+  std::vector<float> key_fp32(key_h.size());
+  std::vector<float> value_fp32(value_h.size());
+  
+  for (size_t i = 0; i < query_h.size(); ++i) {
+    query_fp32[i] = static_cast<float>(query_h[i]);
+  }
+  for (size_t i = 0; i < key_h.size(); ++i) {
+    key_fp32[i] = static_cast<float>(key_h[i]);
+  }
+  for (size_t i = 0; i < value_h.size(); ++i) {
+    value_fp32[i] = static_cast<float>(value_h[i]);
+  }
+  
+  // Run CPU computation for reference
+  flash_attention_cpu(query_fp32.data(), key_fp32.data(), value_fp32.data(),
+                      output_h_ref.data(), seqlen_q, seqlen_k, head_dim,
+                      num_heads_q, num_heads_kv, batch, scale);
+
+  // Allocate GPU memory
+  _FP16 *query_d = (_FP16 *)allocateSVM(batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16));
+  _FP16 *key_d = (_FP16 *)allocateSVM(batch * num_heads_kv * seqlen_k * head_dim * sizeof(_FP16));
+  _FP16 *value_d = (_FP16 *)allocateSVM(batch * num_heads_kv * seqlen_k * head_dim * sizeof(_FP16));
+  _FP16 *output_d = (_FP16 *)allocateSVM(batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16));
+
+  // Copy data to GPU
+  blas_cc->command_queue_inst_.enqueueSVMMap(query_d, batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16), false);
+  blas_cc->command_queue_inst_.enqueueSVMMap(key_d, batch * num_heads_kv * seqlen_k * head_dim * sizeof(_FP16), false);
+  blas_cc->command_queue_inst_.enqueueSVMMap(value_d, batch * num_heads_kv * seqlen_k * head_dim * sizeof(_FP16), false);
+  blas_cc->command_queue_inst_.enqueueSVMMap(output_d, batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16), false);
+
+  for (size_t i = 0; i < query_h.size(); ++i) {
+    query_d[i] = query_h[i];
+  }
+  for (size_t i = 0; i < key_h.size(); ++i) {
+    key_d[i] = key_h[i];
+  }
+  for (size_t i = 0; i < value_h.size(); ++i) {
+    value_d[i] = value_h[i];
+  }
+
+  blas_cc->command_queue_inst_.enqueueSVMUnmap(query_d);
+  blas_cc->command_queue_inst_.enqueueSVMUnmap(key_d);
+  blas_cc->command_queue_inst_.enqueueSVMUnmap(value_d);
+  blas_cc->command_queue_inst_.enqueueSVMUnmap(output_d);
+
+  // Warmup and timing for v1 kernel (buffer-based)
+  nntrainer::flash_attention_prefill_fp16_adreno_cl(query_d, key_d, value_d, output_d, 
+                                                    seqlen_q, seqlen_k, head_dim, 
+                                                    num_heads_q, num_heads_kv, batch, scale);
+  
+  const int num_iterations = 100;
+  long long total_v1_time = 0;
+  
+  for (int i = 0; i < num_iterations; ++i) {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    nntrainer::flash_attention_prefill_fp16_adreno_cl(query_d, key_d, value_d, output_d, 
+                                                      seqlen_q, seqlen_k, head_dim, 
+                                                      num_heads_q, num_heads_kv, batch, scale);
+    auto t2 = std::chrono::high_resolution_clock::now();
+    auto dt = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+    total_v1_time += dt;
+  }
+  
+  // Copy v1 result
+  blas_cc->command_queue_inst_.enqueueSVMMap(output_d, batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16), true);
+  for (size_t i = 0; i < output_h_v1.size(); ++i) {
+    output_h_v1[i] = output_d[i];
+  }
+  blas_cc->command_queue_inst_.enqueueSVMUnmap(output_d);
+
+  // Warmup and timing for L4-2 image kernel (texture cache)
+  nntrainer::flash_attention_prefill_fp16_adreno_image_cl(query_d, key_d, value_d, output_d, 
+                                                          seqlen_q, seqlen_k, head_dim, 
+                                                          num_heads_q, num_heads_kv, batch, scale);
+  
+  long long total_image_time = 0;
+  
+  for (int i = 0; i < num_iterations; ++i) {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    nntrainer::flash_attention_prefill_fp16_adreno_image_cl(query_d, key_d, value_d, output_d, 
+                                                            seqlen_q, seqlen_k, head_dim, 
+                                                            num_heads_q, num_heads_kv, batch, scale);
+    auto t2 = std::chrono::high_resolution_clock::now();
+    auto dt = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+    total_image_time += dt;
+  }
+  
+  // Copy image kernel result
+  blas_cc->command_queue_inst_.enqueueSVMMap(output_d, batch * num_heads_q * seqlen_q * head_dim * sizeof(_FP16), true);
+  for (size_t i = 0; i < output_h_image.size(); ++i) {
+    output_h_image[i] = output_d[i];
+  }
+  blas_cc->command_queue_inst_.enqueueSVMUnmap(output_d);
+
+  // Calculate average times
+  auto avg_v1_time = total_v1_time / num_iterations;
+  auto avg_image_time = total_image_time / num_iterations;
+
+  // Compare results
+  std::vector<float> output_h_v1_fp32(output_h_v1.size());
+  std::vector<float> output_h_image_fp32(output_h_image.size());
+  for (size_t i = 0; i < output_h_v1.size(); ++i) {
+    output_h_v1_fp32[i] = static_cast<float>(output_h_v1[i]);
+    output_h_image_fp32[i] = static_cast<float>(output_h_image[i]);
+  }
+  
+  float mse_v1 = mse<float>(output_h_ref.data(), output_h_v1_fp32.data(), output_h_ref.size());
+  float mse_image = mse<float>(output_h_ref.data(), output_h_image_fp32.data(), output_h_ref.size());
+  double cos_sim_v1 = cosine_similarity<float>(output_h_ref.data(), output_h_v1_fp32.data(), output_h_ref.size());
+  double cos_sim_image = cosine_similarity<float>(output_h_ref.data(), output_h_image_fp32.data(), output_h_ref.size());
+
+  std::cout << "\n===== L4-2 Image Kernel Benchmark =====" << std::endl;
+  std::cout << "v1 Kernel (buffer):    " << avg_v1_time / 1000 << " ms avg (" << num_iterations << " runs)" << std::endl;
+  std::cout << "L4-2 Kernel (image):   " << avg_image_time / 1000 << " ms avg (" << num_iterations << " runs)" << std::endl;
+  
+  float speedup = (float)avg_v1_time / (float)avg_image_time;
+  if (speedup >= 1.0f) {
+    std::cout << "L4-2 Speedup:          " << speedup << "x FASTER" << std::endl;
+  } else {
+    std::cout << "L4-2 Speedup:          " << (1.0f/speedup) << "x SLOWER (REGRESSION)" << std::endl;
+  }
+  
+  std::cout << "\nv1 MSE:                 " << mse_v1 << std::endl;
+  std::cout << "L4-2 MSE:               " << mse_image << std::endl;
+  std::cout << "v1 Cosine Sim:          " << cos_sim_v1 << std::endl;
+  std::cout << "L4-2 Cosine Sim:        " << cos_sim_image << std::endl;
+  std::cout << "=========================================" << std::endl;
+
+  // Verify correctness
+  const float epsilon = 1e-2f;
+  EXPECT_IN_RANGE(mse_image, 0, epsilon);
+  EXPECT_IN_RANGE((float)cos_sim_image, 0.95, 1);
+
+  // Cleanup
+  freeSVM(query_d);
+  freeSVM(key_d);
+  freeSVM(value_d);
+  freeSVM(output_d);
+}
+
+/**
  * @brief Main function for the test
  */
 GTEST_API_ int main(int argc, char **argv) {
