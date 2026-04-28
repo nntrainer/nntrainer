@@ -200,16 +200,13 @@ void flash_attention_fp32_cl(float *query, float *key, float *value, float *outp
                                   seqlen_q, seqlen_k, head_dim,
                                   num_heads_q, num_heads_kv, batch, scale);
   } else {
-    // On Adreno GPUs, use the Adreno-optimized prefill kernel
-    if (is_adreno_device()) {
-      flash_attention_prefill_fp32_adreno_cl(query, key, value, output,
-                                             seqlen_q, seqlen_k, head_dim,
-                                             num_heads_q, num_heads_kv, batch, scale);
-    } else {
-      flash_attention_prefill_fp32_cl(query, key, value, output,
-                                     seqlen_q, seqlen_k, head_dim,
-                                     num_heads_q, num_heads_kv, batch, scale);
-    }
+    // FP32 prefill: Use the original row-by-row kernel which is well-optimized
+    // for both Mali and Adreno GPUs (40 ms vs 117 ms with tiled GEMM on Adreno).
+    // The tiled GEMM kernel has low work-item utilization and high local memory
+    // usage for FP32, making the row-by-row approach faster.
+    flash_attention_prefill_fp32_cl(query, key, value, output,
+                                   seqlen_q, seqlen_k, head_dim,
+                                   num_heads_q, num_heads_kv, batch, scale);
   }
 }
 
