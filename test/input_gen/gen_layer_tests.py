@@ -898,6 +898,13 @@ if __name__ == "__main__":
         input_type="float",
     )
     
+    record_single(
+        swiglu_layer,
+        [(1, 3, 3, 3), (1, 3, 3, 3)],
+        "swiglu_batch1",
+        input_type="float",
+    )
+    
     added = K.layers.Add()
     record_single_fp16(added, [(2, 3, 3, 3), (2, 3, 3, 3)], "added_w16a16")
     
@@ -911,6 +918,13 @@ if __name__ == "__main__":
         swiglu_layer,
         [(2, 3, 3, 3), (2, 3, 3, 3)],
         "swiglufp16",
+        input_type="float",
+    )
+    
+    record_single_fp16(
+        swiglu_layer,
+        [(1, 3, 3, 3), (1, 3, 3, 3)],
+        "swiglufp16_batch1",
         input_type="float",
     )
 

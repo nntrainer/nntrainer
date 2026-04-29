@@ -14,9 +14,23 @@
 #include <swiglu.h>
 #include <tuple>
 
+// Test for FP32 (forward and backward both)
 auto swiglu_golden = LayerGoldenTestParamType(
-  nntrainer::createLayer<nntrainer::SwiGLULayer>, {}, "2:3:3:3,2:3:3:3",
-  "swiglu.nnlayergolden", LayerGoldenTestParamOptions::DEFAULT, "nchw", "fp32",
-  "fp32");
+  nntrainer::createLayer<nntrainer::SwiGLULayer>, {}, "1:3:3:3,1:3:3:3",
+  "swiglu_batch1.nnlayergolden", LayerGoldenTestParamOptions::DEFAULT, "nchw",
+  "fp32", "fp32");
 
 GTEST_PARAMETER_TEST(SwiGLU, LayerGoldenTest, ::testing::Values(swiglu_golden));
+
+#ifdef ENABLE_FP16
+// Test for FP16 forward (backward not implemented yet)
+auto swiglufp16_golden =
+  LayerGoldenTestParamType(nntrainer::createLayer<nntrainer::SwiGLULayer>, {},
+                           "1:3:3:3,1:3:3:3", "swiglufp16_batch1.nnlayergolden",
+                           LayerGoldenTestParamOptions::DEFAULT |
+                             LayerGoldenTestParamOptions::SKIP_CALC_DERIV,
+                           "nchw", "fp16", "fp16");
+
+GTEST_PARAMETER_TEST(SwiGLU16, LayerGoldenTest,
+                     ::testing::Values(swiglufp16_golden));
+#endif

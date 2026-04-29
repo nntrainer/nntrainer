@@ -35,9 +35,17 @@ void SwiGLULayer::finalize(InitLayerContext &context) {
 }
 
 void SwiGLULayer::forwarding(RunLayerContext &context, bool training) {
+  // TODO: Currently only supports batch size = 1
   // For batch size = 1 training, call incremental_forwarding with the actual
   // input length
   const nntrainer::Tensor &in1 = context.getInput(INPUT_IDX_1);
+
+  // Check batch size assumption
+  if (in1.batch() != 1) {
+    throw std::invalid_argument(
+      "SwiGLULayer currently only supports batch size = 1");
+  }
+
   auto to = in1.getDim().height();
   incremental_forwarding(context, 0, to, training);
 }

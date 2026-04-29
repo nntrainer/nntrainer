@@ -4,7 +4,7 @@
  *
  * @file   swiglu.h
  * @date   14 July 2023
- * @brief  Implementation of custom SwiGLU activation function
+ * @brief  Implementation of SwiGLU activation function
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @bug    No known bugs except for NYI items
@@ -21,7 +21,7 @@
 namespace nntrainer {
 
 /**
- * @brief A SwiGLU layer for llama.
+ * @brief A general-purpose SwiGLU activation layer.
  *
  */
 class SwiGLULayer final : public Layer {
@@ -36,7 +36,7 @@ public:
    * @brief Destroy the custom SwiGLU layer object
    *
    */
-  ~SwiGLULayer() {}
+  ~SwiGLULayer() = default;
 
   /**
    * @copydoc Layer::finalize(InitLayerContext &context)

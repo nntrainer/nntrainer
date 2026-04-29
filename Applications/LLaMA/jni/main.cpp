@@ -30,7 +30,6 @@
 #include <optional>
 #include <rms_norm.h>
 #include <rotary_embedding.h>
-#include <swiglu.h>
 #include <transpose_layer.h>
 
 #if defined(ENABLE_TRANSFORMER)
@@ -638,14 +637,6 @@ int main(int argc, char *argv[]) {
   try {
     app_context->registerFactory(
       nntrainer::createLayer<custom::MultiHeadAttentionLayer>);
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
-    return 1;
-  }
-
-  try {
-    app_context->registerFactory(nntrainer::createLayer<custom::SwiGLULayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
