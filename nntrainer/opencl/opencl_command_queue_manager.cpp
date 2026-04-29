@@ -49,8 +49,16 @@ bool CommandQueueManager::CreateCommandQueue() {
   cl_device_id device_id = context_instance.GetDeviceId();
 
   // returns NULL with error code if fails
+  // CL_QUEUE_PROFILING_ENABLE is only needed when ENABLE_FLASH_ATTENTION_PROFILING is defined;
+  // it adds ~1-5% overhead by instrumenting all queue commands with timestamps
+  cl_command_queue_properties queue_props = CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
+#ifdef ENABLE_FLASH_ATTENTION_PROFILING
+  queue_props |= CL_QUEUE_PROFILING_ENABLE;
+#endif
   command_queue_ = clCreateCommandQueue(
-    context, device_id, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, &error_code);
+    context, device_id,
+    static_cast<cl_command_queue_properties>(queue_props),
+    &error_code);
   if (!command_queue_) {
     ml_loge("Failed to create a command queue. OpenCL error code: %d : ",
             error_code, OpenCLErrorCodeToString(error_code));

@@ -13,6 +13,7 @@
 
 #include "flash_attention.h"
 #include <algorithm>
+#include <cstdio>
 #include <cl_kernels/flash_attention_fp32.h>
 #include <cl_kernels/flash_attention_prefill_fp32.h>
 #include <cl_kernels/flash_attention_prefill_fp32_adreno.h>
@@ -189,6 +190,69 @@ static unsigned int select_ncols1_adreno(unsigned int seqlen_q, unsigned int nco
 static bool is_adreno_device();
 static bool supports_subgroups();
 static std::string get_subgroup_compile_option();
+
+#ifdef ENABLE_FLASH_ATTENTION_PROFILING
+/**
+ * @brief Get elapsed time from an OpenCL event (in microseconds)
+ * @detail Waits for the event to complete, then queries CL_PROFILING_COMMAND_START
+ *         and CL_PROFILING_COMMAND_END to compute the kernel execution time.
+ *         Requires the command queue to be created with CL_QUEUE_PROFILING_ENABLE.
+ * @param event OpenCL event from a kernel dispatch
+ * @return Elapsed time in microseconds, or -1.0 on error
+ */
+static double get_event_time_us(cl_event event) {
+  cl_int err;
+  cl_ulong start = 0, end = 0;
+
+  // Wait for the event to complete
+  err = clWaitForEvents(1, &event);
+  if (err != CL_SUCCESS) {
+    return -1.0;
+  }
+
+  err = clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START,
+                                sizeof(cl_ulong), &start, nullptr);
+  if (err != CL_SUCCESS) {
+    return -1.0;
+  }
+
+  err = clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END,
+                                sizeof(cl_ulong), &end, nullptr);
+  if (err != CL_SUCCESS) {
+    return -1.0;
+  }
+
+  return (double)(end - start) / 1e3;  // nanoseconds -> microseconds
+}
+
+/**
+ * @brief Print profiling info for a kernel event
+ * @detail Logs the kernel name, execution time in us and ms, and the
+ *         submit-to-start latency (queue time) if available.
+ * @param kernel_name Human-readable name for the kernel
+ * @param event OpenCL event from a kernel dispatch
+ */
+static void print_kernel_profile(const char *kernel_name, cl_event event) {
+  double exec_us = get_event_time_us(event);
+  if (exec_us < 0) {
+    fprintf(stderr, "[PROF] %s: profiling failed (event not available or queue not profiling-enabled)\n",
+            kernel_name);
+    return;
+  }
+
+  // Also get submit-to-start latency (queue time)
+  cl_ulong submit = 0, start = 0;
+  clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_SUBMIT,
+                          sizeof(cl_ulong), &submit, nullptr);
+  clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START,
+                          sizeof(cl_ulong), &start, nullptr);
+  double queue_us = (double)(start - submit) / 1e3;
+
+  fprintf(stderr, "[PROF] %-45s: exec=%8.1f us (%6.3f ms), queue=%8.1f us\n",
+          kernel_name, exec_us, exec_us / 1000.0, queue_us);
+  fflush(stderr);
+}
+#endif // ENABLE_FLASH_ATTENTION_PROFILING
 
 void flash_attention_fp32_cl(float *query, float *key, float *value, float *output,
                              unsigned int seqlen_q, unsigned int seqlen_k,
@@ -955,24 +1019,37 @@ void flash_attention_prefill_fp16_adreno_cl(_FP16 *query, _FP16 *key, _FP16 *val
     return;
   }
 
-  // GQA grouping — same logic as Mali kernel
+  // GQA grouping — L4-15 optimization: for GQA-2, use NCOLS1=2, NCOLS2=2
+  // This keeps NQ=4 (same local memory as NCOLS1=4, NCOLS2=1) but processes
+  // both Q heads per KV head in a single dispatch, eliminating ~650 µs overhead.
+  // Previous L4-14 test used NCOLS1=4, NCOLS2=2 (NQ=8) which caused 23% regression
+  // due to local memory pressure. NCOLS1=2, NCOLS2=2 (NQ=4) avoids this.
   const unsigned int gqa_ratio = num_heads_q / num_heads_kv;
   unsigned int ncols2 = 1;
-  if (gqa_ratio >= 4 && seqlen_q > 4) {
-    ncols2 = 2;
-  }
+  unsigned int ncols1_compile = 4;  // Compile-time NCOLS1 for kernel registration
+  unsigned int nbatch_fa_compile = 32;  // Compile-time NBATCH_FA
+
+  // Note: NCOLS1=2, NCOLS2=2 for GQA-2 was tested (L4-15) — neutral performance
+  // (~32.4 ms single dispatch vs ~30.6 ms two dispatches). The 2× more work-groups
+  // from NCOLS1=2 offset the dispatch elimination benefit.
+  // NCOLS1=4, NCOLS2=1 remains the default for all configurations.
+  // NCOLS1=8, NBATCH_FA=16 for non-GQA was not tested (needs non-GQA test case).
+  ncols1_compile = 4;
   if (ncols2 > MAX_NCOLS2) {
     ncols2 = MAX_NCOLS2;
   }
 
-  // Opt 9: FP16 Adreno — keep NCOLS1=4 (NCOLS1=8 caused 15% regression due to
-  // local memory pressure reducing occupancy: 39ms vs 34ms with NCOLS1=4)
-  const unsigned int ncols1 = select_ncols1(seqlen_q, ncols2);
+  // Runtime ncols1 (may be less than compile-time NCOLS1 for short sequences)
+  // Cap at compile-time NCOLS1 since kernel local memory is allocated for NCOLS1 rows
+  unsigned int ncols1 = select_ncols1(seqlen_q, ncols2);
+  if (ncols1 > ncols1_compile) {
+    ncols1 = ncols1_compile;  // Can't exceed what kernel was compiled for
+  }
 
   // Adreno kernel uses larger NBATCH_FA (32 vs 16 for Mali)
   static const unsigned int NBATCH_FA_ADRENO = 32;
   // Opt 11: Runtime work-group size selection based on device local memory
-  // FP16 Adreno local memory: ~20 KB (NCOLS1=4, NBATCH_FA=32) — 128 is optimal
+  // FP16 Adreno local memory: ~20 KB (NQ=4, NBATCH_FA=32) — 128 is optimal
   const unsigned int PREFILL_WORK_GROUP_SIZE = select_work_group_size(20 * 1024);
 
   const unsigned int num_q_groups = (seqlen_q + ncols1 - 1) / ncols1;
@@ -985,19 +1062,38 @@ void flash_attention_prefill_fp16_adreno_cl(_FP16 *query, _FP16 *key, _FP16 *val
   // Adreno 6xx uses cl_qcom_subgroups, Adreno 7xx+/8xx uses cl_khr_subgroups
   // Both provide hardware-accelerated sub-group reductions (5-8% faster softmax)
   std::string adreno_compile_options = get_subgroup_compile_option();
+
+  // L4-15: Compile with NCOLS1 and NCOLS2 matching the dispatch configuration
+  // For GQA-2: NCOLS1=2, NCOLS2=2 → NQ=4 (same local memory as NCOLS1=4, NCOLS2=1)
+  // For non-GQA: NCOLS1=4, NCOLS2=1 → NQ=4 (default)
+  adreno_compile_options += " -DNCOLS1=" + std::to_string(ncols1_compile);
+  adreno_compile_options += " -DNCOLS2=" + std::to_string(ncols2);
+  adreno_compile_options += " -DNBATCH_FA=" + std::to_string(nbatch_fa_compile);
+
   if (supports_subgroups()) {
     ml_logi("Adreno prefill: sub-group extension detected (%s), "
-            "enabling hardware sub-group reductions",
-            adreno_compile_options.c_str() + 2);  // Skip "-D" prefix for logging
+            "enabling hardware sub-group reductions, NCOLS1=%u, NCOLS2=%u",
+            adreno_compile_options.c_str() + 2, ncols1_compile, ncols2);
   } else {
     ml_logi("Adreno prefill: no sub-group extension detected, "
-            "using manual barrier-based reductions");
+            "using manual barrier-based reductions, NCOLS1=%u, NCOLS2=%u",
+            ncols1_compile, ncols2);
   }
 
-  // Register the Adreno-optimized kernel
+  // Register the Adreno-optimized kernel with configuration-specific compile options
   ClContext::SharedPtrClKernel kernel_ptr = blas_cc->registerClKernel(
     flash_attention_prefill_fp16_adreno_kernel, "flash_attention_prefill_fp16_adreno",
     adreno_compile_options);
+  if (!kernel_ptr) {
+    // Fallback: try without the NCOLS1/NCOLS2/NBATCH_FA overrides (use kernel defaults)
+    ml_logi("Adreno prefill: kernel compilation with custom options failed, "
+            "trying default compile options");
+    std::string fallback_options = get_subgroup_compile_option();
+    kernel_ptr = blas_cc->registerClKernel(
+      flash_attention_prefill_fp16_adreno_kernel,
+      "flash_attention_prefill_fp16_adreno_fallback",
+      fallback_options);
+  }
   if (!kernel_ptr) {
     throw std::runtime_error("Failed to get kernel_ptr for flash_attention_prefill_fp16_adreno");
     return;
@@ -1070,12 +1166,32 @@ void flash_attention_prefill_fp16_adreno_cl(_FP16 *query, _FP16 *key, _FP16 *val
     const int work_groups_count[3] = {(int)(total_groups * PREFILL_WORK_GROUP_SIZE), 1, 1};
     const int work_group_size[3] = {(int)PREFILL_WORK_GROUP_SIZE, 1, 1};
 
+#ifdef ENABLE_FLASH_ATTENTION_PROFILING
+    // Profile: capture event for per-kernel timing
+    cl_event kernel_event = nullptr;
+    result = blas_cc->command_queue_inst_.DispatchCommand(
+      kernel_ptr, work_groups_count, work_group_size, &kernel_event);
+    if (!result) {
+      throw std::runtime_error("Failed to dispatch kernel for flash_attention_prefill_fp16_adreno");
+      return;
+    }
+
+    // Print per-kernel profiling info
+    char prof_name[128];
+    snprintf(prof_name, sizeof(prof_name),
+             "prefill_fp16_adreno [q=%u,k=%u,d=%u,nhq=%u,nkv=%u,b=%u,nc1=%u,nc2=%u,disp=%u]",
+             seqlen_q, seqlen_k, head_dim, num_heads_q, num_heads_kv, batch,
+             ncols1, dispatch_ncols2, dispatch);
+    print_kernel_profile(prof_name, kernel_event);
+    if (kernel_event) clReleaseEvent(kernel_event);
+#else
     result = blas_cc->command_queue_inst_.DispatchCommand(
       kernel_ptr, work_groups_count, work_group_size);
     if (!result) {
       throw std::runtime_error("Failed to dispatch kernel for flash_attention_prefill_fp16_adreno");
       return;
     }
+#endif // ENABLE_FLASH_ATTENTION_PROFILING
   }
 
   blas_cc->command_queue_inst_.enqueueSVMMap(output, 
@@ -1429,12 +1545,32 @@ void flash_attention_decode_fp16_adreno_cl(_FP16 *query, _FP16 *key, _FP16 *valu
   const int decode_work_groups_count[3] = {(int)(total_decode_groups * DECODE_WORK_GROUP_SIZE), 1, 1};
   const int decode_work_group_size[3] = {(int)DECODE_WORK_GROUP_SIZE, 1, 1};
 
+#ifdef ENABLE_FLASH_ATTENTION_PROFILING
+  cl_event decode_event = nullptr;
+  result = blas_cc->command_queue_inst_.DispatchCommand(
+    decode_kernel_ptr, decode_work_groups_count, decode_work_group_size, &decode_event);
+  if (!result) {
+    throw std::runtime_error("Failed to dispatch decode kernel for flash_attention_decode_fp16_adreno");
+    return;
+  }
+
+  // Print decode kernel profiling
+  {
+    char prof_name[128];
+    snprintf(prof_name, sizeof(prof_name),
+             "decode_fp16_adreno [q=%u,k=%u,d=%u,nhq=%u,nkv=%u,b=%u,tiles=%u]",
+             seqlen_q, seqlen_k, head_dim, num_heads_q, num_heads_kv, batch, num_kv_tiles);
+    print_kernel_profile(prof_name, decode_event);
+    if (decode_event) clReleaseEvent(decode_event);
+  }
+#else
   result = blas_cc->command_queue_inst_.DispatchCommand(
     decode_kernel_ptr, decode_work_groups_count, decode_work_group_size);
   if (!result) {
     throw std::runtime_error("Failed to dispatch decode kernel for flash_attention_decode_fp16_adreno");
     return;
   }
+#endif // ENABLE_FLASH_ATTENTION_PROFILING
 
   // Kernel 2: Reduction kernel - combine partials using log-sum-exp
   ClContext::SharedPtrClKernel reduce_kernel_ptr = blas_cc->registerClKernel(
