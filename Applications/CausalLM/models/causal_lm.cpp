@@ -23,10 +23,12 @@
 #include <algorithm>
 #include <app_context.h>
 #include <cmath>
+#include <codecvt>
 #include <engine.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <locale>
 #include <vector>
 
 #include <common.h>
@@ -39,6 +41,13 @@
 #include <llm_util.hpp>
 
 namespace causallm {
+
+#if defined(_WIN32)
+static std::wstring utf8_to_wstring(const std::string &str) {
+  std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+  return converter.from_bytes(str);
+}
+#endif
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
@@ -323,15 +332,19 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    *  if USE_KVCACHE && system_prompt is given && but the
    * PRE_COMPUTED_CACHE_PATH does not exist
    */
-  SAVE_KVCACHE = (USE_KVCACHE && system_prompt != "" &&
+  SAVE_KVCACHE = (USE_KVCACHE && !system_prompt.empty() &&
                   !std::filesystem::exists(PRE_COMPUTED_CACHE_PATH));
 
 #if defined(_WIN32)
   if (log_output)
-    std::wcout << L"" << system_prompt << L"" << text_ << std::endl;
-  std::wstring prompt_ = prompt;
-  if (!SAVE_KVCACHE)
-    prompt_ += TAIL_PROMPT;
+    std::wcout << system_prompt << prompt << tail_prompt << std::endl;
+
+  std::wstring prompt_;
+  if (USE_KVCACHE) {
+    prompt_ = SAVE_KVCACHE ? system_prompt : (prompt + tail_prompt);
+  } else {
+    prompt_ = system_prompt + prompt + tail_prompt;
+  }
   std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
   auto _input = tokenizer->Encode(converter.to_bytes(prompt_));
 #else

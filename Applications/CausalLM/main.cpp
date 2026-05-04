@@ -34,6 +34,7 @@
 #include "gemma3_causallm.h"
 #include "gptoss_cached_slim_causallm.h"
 #include "gptoss_causallm.h"
+#include "lfm2_causallm.h"
 #include "qwen2_causallm.h"
 #include "qwen2_embedding.h"
 #include "qwen3_cached_slim_moe_causallm.h"
@@ -42,7 +43,9 @@
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include <models/gemma3/function.h>
+#if !defined(_WIN32)
 #include <sys/resource.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -54,13 +57,21 @@ std::atomic<size_t> peak_rss_kb{0};
 std::atomic<bool> tracking_enabled{true};
 
 void printMemoryUsage() {
+#if defined(_WIN32)
+  std::cout << "Max Resident Set Size: " << getPeakMemoryKb() << " KB"
+            << std::endl;
+#else
   struct rusage usage;
   getrusage(RUSAGE_SELF, &usage);
   std::cout << "Max Resident Set Size: " << usage.ru_maxrss << " KB"
             << std::endl;
+#endif
 }
 
 size_t read_vm_rss_kb() {
+#if defined(_WIN32)
+  return getPeakMemoryKb();
+#else
   std::ifstream status("/proc/self/status");
   std::string line;
   while (std::getline(status, line)) {
@@ -71,9 +82,13 @@ size_t read_vm_rss_kb() {
     }
   }
   return 0;
+#endif
 }
 
 size_t read_private_rss_kb() {
+#if defined(_WIN32)
+  return getPeakMemoryKb();
+#else
   std::ifstream smaps("/proc/self/smaps_rollup");
   std::string line;
   size_t total = 0;
@@ -85,6 +100,7 @@ size_t read_private_rss_kb() {
     }
   }
   return total;
+#endif
 }
 
 void start_peak_tracker() {
@@ -196,6 +212,11 @@ int main(int argc, char *argv[]) {
     "EmbeddingGemma", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::EmbeddingGemma>(cfg, generation_cfg,
                                                         nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Lfm2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Lfm2CausalLM>(cfg, generation_cfg,
+                                                      nntr_cfg);
     });
 
   // Validate arguments

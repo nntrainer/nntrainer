@@ -70,7 +70,7 @@ public:
    * @brief run the CausalLM model
    */
   void run(const WSTR prompt, bool do_sample = false,
-           const WSTR system_prompt = "", const WSTR tail_prompt = "",
+           const WSTR system_prompt = WSTR(), const WSTR tail_prompt = WSTR(),
            bool log_output = true) override;
 
   /**

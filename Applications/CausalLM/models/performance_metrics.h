@@ -39,8 +39,8 @@ typedef struct {
 #ifdef __cplusplus
 
 #ifdef _WIN32
-#include <psapi.h>
 #include <windows.h>
+#include <psapi.h>
 #else
 #include <sys/resource.h>
 #endif

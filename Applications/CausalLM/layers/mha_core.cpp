@@ -370,7 +370,7 @@ void MHACoreLayer::compute_kcaches(
       // Single token processing (common during generation)
       // Parallelize over KV heads for decoding since Q direction is always 1
       int row_to_compute = is_causal ? from + 1 : from + sequence_len;
-      unsigned int num_cache_head = num_head / group_size;
+      int num_cache_head = num_head / group_size;
 
       // Use OpenMP for lower overhead parallelization during decoding
       const float *in_data = in.getData<float>();
@@ -378,7 +378,7 @@ void MHACoreLayer::compute_kcaches(
       float *out_data = out.getData<float>();
 
 #pragma omp parallel for schedule(static)
-      for (unsigned int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
+      for (int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
         nntrainer::compute_kcaches<uint16_t>(
           in_data, cache_data, out_data, row_to_compute, num_cache_head,
           head_dim, group_size, tile_size, local_window_size, head_kv,

@@ -44,7 +44,7 @@ public:
    * @brief run the SentenceTransformer model
    */
   void run(const WSTR prompt, bool do_sample = false,
-           const WSTR system_prompt = "", const WSTR tail_prmopt = "",
+           const WSTR system_prompt = WSTR(), const WSTR tail_prmopt = WSTR(),
            bool log_output = true) override;
 
   /**
@@ -54,8 +54,9 @@ public:
    * @param tail_prompt Tail prompt
    * @return SentenceTransformer output from the model
    */
-  std::vector<float *> encode(const WSTR prompt, const WSTR system_prompt = "",
-                              const WSTR tail_prompt = "");
+  std::vector<float *> encode(const WSTR prompt,
+                              const WSTR system_prompt = WSTR(),
+                              const WSTR tail_prompt = WSTR());
 
 protected:
   /**
