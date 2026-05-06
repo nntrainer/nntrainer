@@ -22,6 +22,7 @@
  */
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,8 @@
 #include <factory.h>
 
 #include "causal_lm.h"
+#include "qwen35_causallm.h"
+#if !defined(_WIN32)
 #include "embedding_gemma.h"
 #include "gemma3_causallm.h"
 #include "gptoss_cached_slim_causallm.h"
@@ -42,7 +45,11 @@
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include <models/gemma3/function.h>
+#endif
+#include <performance_metrics.h>
+#if !defined(_WIN32)
 #include <sys/resource.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -54,13 +61,21 @@ std::atomic<size_t> peak_rss_kb{0};
 std::atomic<bool> tracking_enabled{true};
 
 void printMemoryUsage() {
+#if defined(_WIN32)
+  std::cout << "Peak memory usage: " << getPeakMemoryKb() << " KB"
+            << std::endl;
+#else
   struct rusage usage;
   getrusage(RUSAGE_SELF, &usage);
   std::cout << "Max Resident Set Size: " << usage.ru_maxrss << " KB"
             << std::endl;
+#endif
 }
 
 size_t read_vm_rss_kb() {
+#if defined(_WIN32)
+  return getPeakMemoryKb();
+#else
   std::ifstream status("/proc/self/status");
   std::string line;
   while (std::getline(status, line)) {
@@ -71,9 +86,13 @@ size_t read_vm_rss_kb() {
     }
   }
   return 0;
+#endif
 }
 
 size_t read_private_rss_kb() {
+#if defined(_WIN32)
+  return getPeakMemoryKb();
+#else
   std::ifstream smaps("/proc/self/smaps_rollup");
   std::string line;
   size_t total = 0;
@@ -85,6 +104,7 @@ size_t read_private_rss_kb() {
     }
   }
   return total;
+#endif
 }
 
 void start_peak_tracker() {
@@ -134,6 +154,7 @@ int main(int argc, char *argv[]) {
   auto start_time = std::chrono::high_resolution_clock::now();
 
   /** Register all runnable causallm models to factory */
+#if !defined(_WIN32)
   causallm::Factory::Instance().registerModel(
     "LlamaForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::CausalLM>(cfg, generation_cfg,
@@ -154,6 +175,14 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::Qwen3CausalLM>(cfg, generation_cfg,
                                                        nntr_cfg);
     });
+#endif
+  causallm::Factory::Instance().registerModel(
+    "Qwen3_5ForConditionalGeneration",
+    [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Qwen35CausalLM>(cfg, generation_cfg,
+                                                        nntr_cfg);
+    });
+#if !defined(_WIN32)
   causallm::Factory::Instance().registerModel(
     "Qwen3MoeForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Qwen3MoECausalLM>(cfg, generation_cfg,
@@ -197,6 +226,7 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::EmbeddingGemma>(cfg, generation_cfg,
                                                         nntr_cfg);
     });
+#endif
 
   // Validate arguments
   if (argc < 2) {
@@ -247,18 +277,34 @@ int main(int argc, char *argv[]) {
     if (argc >= 3) {
       input_text = argv[2];
     } else {
-      if (nntr_cfg.contains("chat_input")) {
+      const bool disable_tokenizer =
+        nntr_cfg.value("disable_tokenizer", false);
+      if (disable_tokenizer && nntr_cfg.contains("sample_input_ids")) {
+        std::ostringstream oss;
+        const auto input_ids =
+          nntr_cfg["sample_input_ids"].get<std::vector<int64_t>>();
+        for (size_t i = 0; i < input_ids.size(); ++i) {
+          if (i > 0)
+            oss << ' ';
+          oss << input_ids[i];
+        }
+        input_text = oss.str();
+      } else if (nntr_cfg.contains("chat_input")) {
+#if !defined(_WIN32)
         if (architecture == "Gemma3ForCausalLM") {
           input_text = causallm::gemma3::apply_function_gemma_template(
             nntr_cfg["chat_input"]);
         } else {
+#endif
           std::cerr << "[Warning] 'chat_input' is set but support for model "
                        "architecture '"
                     << architecture
                     << "' is not implemented. Falling back to 'sample_input'."
                     << std::endl;
           input_text = nntr_cfg["sample_input"].get<std::string>();
+#if !defined(_WIN32)
         }
+#endif
       } else {
         input_text = nntr_cfg["sample_input"].get<std::string>();
       }
@@ -282,8 +328,11 @@ int main(int argc, char *argv[]) {
     start_peak_tracker();
 #endif
 #if defined(_WIN32)
-    model->run(input_text.c_str(), do_sample, system_head_prompt.c_str(),
-               system_tail_prompt.c_str());
+    auto to_wstring = [](const std::string &text) {
+      return std::wstring(text.begin(), text.end());
+    };
+    model->run(to_wstring(input_text), do_sample, to_wstring(system_head_prompt),
+               to_wstring(system_tail_prompt));
 #else
     model->run(input_text, do_sample, system_head_prompt, system_tail_prompt);
 #endif

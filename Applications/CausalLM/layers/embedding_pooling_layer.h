@@ -13,6 +13,12 @@
 #ifndef __EMBEDDING_POOLING_LAYER_H__
 #define __EMBEDDING_POOLING_LAYER_H__
 
+#ifdef _WIN32
+#define WIN_EXPORT __declspec(dllexport)
+#else
+#define WIN_EXPORT
+#endif
+
 #include <base_properties.h>
 #include <common_properties.h>
 #include <layer_impl.h>
@@ -114,56 +120,58 @@ public:
  * implemented. Other pooling modes are defined as properties but their logic is
  * not yet implemented.
  */
-class EmbeddingPoolingLayer : public nntrainer::LayerImpl {
+WIN_EXPORT class EmbeddingPoolingLayer : public nntrainer::LayerImpl {
 public:
   /**
    * @brief Construct a new Embedding Pooling Layer object
    */
-  EmbeddingPoolingLayer();
+  WIN_EXPORT EmbeddingPoolingLayer();
 
   /**
    * @brief Destroy the Embedding Pooling Layer object
    */
-  ~EmbeddingPoolingLayer() {}
+  WIN_EXPORT ~EmbeddingPoolingLayer() {}
 
   /**
    * @copydoc Layer::finalize(InitLayerContext &context)
    */
-  void finalize(nntrainer::InitLayerContext &context) override;
+  WIN_EXPORT void finalize(nntrainer::InitLayerContext &context) override;
 
   /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
    */
-  void forwarding(nntrainer::RunLayerContext &context, bool training) override;
+  WIN_EXPORT void forwarding(nntrainer::RunLayerContext &context,
+                             bool training) override;
 
   /**
    * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
    * int from, unsigned int to, bool training)
    */
-  void incremental_forwarding(nntrainer::RunLayerContext &context,
-                              unsigned int from, unsigned int to,
-                              bool training) override;
+  WIN_EXPORT void incremental_forwarding(nntrainer::RunLayerContext &context,
+                                         unsigned int from, unsigned int to,
+                                         bool training) override;
 
   /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
    */
-  void calcDerivative(nntrainer::RunLayerContext &context) override;
+  WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
 
   /**
    * @copydoc Layer::calcGradient(RunLayerContext &context)
    */
-  void calcGradient(nntrainer::RunLayerContext &context) override;
+  WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
 
   /**
    * @copydoc Layer::exportTo(Exporter &exporter, const ExportMethods &method)
    */
-  void exportTo(nntrainer::Exporter &exporter,
-                const ml::train::ExportMethods &method) const override;
+  WIN_EXPORT void
+  exportTo(nntrainer::Exporter &exporter,
+           const ml::train::ExportMethods &method) const override;
 
   /**
    * @copydoc Layer::setProperty(const std::vector<std::string> &values)
    */
-  void setProperty(const std::vector<std::string> &values) override;
+  WIN_EXPORT void setProperty(const std::vector<std::string> &values) override;
 
   /**
    * @copydoc Layer::getType()

@@ -40,6 +40,8 @@
 #endif
 
 #include <transformer.h>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace causallm {
 
@@ -70,8 +72,8 @@ public:
    * @brief run the CausalLM model
    */
   void run(const WSTR prompt, bool do_sample = false,
-           const WSTR system_prompt = "", const WSTR tail_prompt = "",
-           bool log_output = true) override;
+           const WSTR system_prompt = WSTR{},
+           const WSTR tail_prompt = WSTR{}, bool log_output = true) override;
 
   /**
    * @brief Get the generated output text
@@ -104,6 +106,16 @@ protected:
   registerOutputs(std::unique_ptr<tokenizers::Tokenizer> &tokenizer,
                   std::vector<unsigned int> ids, unsigned int pos,
                   const std::vector<bool> &eos_list, bool log_output = true);
+
+  /**
+   * @brief Setup a lightweight token-id decoder from tokenizer.json
+   */
+  void setupFallbackTokenDecoder(json &nntr_cfg);
+
+  /**
+   * @brief Decode token IDs using the lightweight tokenizer.json decoder
+   */
+  std::string decodeFallbackTokens(const std::vector<int> &ids) const;
 
   /**
    * @brief save kv cache
@@ -155,6 +167,10 @@ protected:
   bool has_run_ = false;
 
   std::mt19937 rng; /**< Random Number Gen */
+
+  std::unordered_map<unsigned int, std::string> fallback_token_id_to_piece_;
+  std::unordered_set<unsigned int> fallback_special_token_ids_;
+  bool has_fallback_token_decoder_ = false;
 };
 
 } // namespace causallm

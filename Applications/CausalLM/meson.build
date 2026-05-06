@@ -1,9 +1,14 @@
 causallm_src = [
-    meson.current_source_dir() / 'huggingface_tokenizer.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
-    meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
-    meson.current_source_dir() / 'api' / 'model_config.cpp',
 ]
+
+if host_machine.system() != 'windows'
+    causallm_src += [
+        meson.current_source_dir() / 'huggingface_tokenizer.cpp',
+        meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
+        meson.current_source_dir() / 'api' / 'model_config.cpp',
+    ]
+endif
 
 executable_src = [
     meson.current_source_dir() / 'main.cpp',
@@ -27,6 +32,7 @@ causallm_layer_dependencies += [
     causallm_lm_head_dep,
     causallm_reshaped_rms_norm_dep,
     causallm_qkv_layer_dep,
+    causallm_qwen35_layers_dep,
     causallm_embedding_pooling_layer_dep,
     causallm_embedding_normalize_layer_dep,
 ]
@@ -40,7 +46,10 @@ elif get_option('platform') != 'tizen'
 endif
 
 tokenizer_dependencies = []
-tokenizer_path = meson.current_source_dir() / 'lib' / 'libtokenizers_c.a'
+tokenizer_link_args = []
+if host_machine.system() != 'windows'
+    tokenizer_link_args += [meson.current_source_dir() / 'lib' / 'libtokenizers_c.a']
+endif
 
 cpp_args = []
 
@@ -48,21 +57,37 @@ if get_option('default_library') == 'shared'
     cpp_args += [ '-DPLUGGABLE' ]
 endif
 
-causallm = shared_library('causallm',
-    causallm_src,
-    dependencies: [
-        nntrainer_dep,
-        nntrainer_ccapi_dep,
-        causallm_layer_dependencies, 
-        tokenizer_dependencies,
-        openmp_dep
-    ],
-    include_directories: causallm_inc,
-    install: true,
-    install_dir: application_install_dir,
-    link_args: [tokenizer_path],
-    cpp_args: cpp_args
-)
+if host_machine.system() == 'windows'
+    causallm = static_library('causallm',
+        causallm_src,
+        dependencies: [
+            nntrainer_dep,
+            nntrainer_ccapi_dep,
+            causallm_layer_dependencies,
+            tokenizer_dependencies,
+            openmp_dep
+        ],
+        include_directories: causallm_inc,
+        install: false,
+        cpp_args: cpp_args
+    )
+else
+    causallm = shared_library('causallm',
+        causallm_src,
+        dependencies: [
+            nntrainer_dep,
+            nntrainer_ccapi_dep,
+            causallm_layer_dependencies,
+            tokenizer_dependencies,
+            openmp_dep
+        ],
+        include_directories: causallm_inc,
+        install: true,
+        install_dir: application_install_dir,
+        link_args: tokenizer_link_args,
+        cpp_args: cpp_args
+    )
+endif
 
 causallm_dep = declare_dependency(
     link_with: [causallm],
@@ -75,6 +100,7 @@ e = executable('nntr_causallm',
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
 )
 
+if host_machine.system() != 'windows'
 
 quantize_src = [
     meson.current_source_dir() / 'quantize.cpp',
@@ -98,3 +124,5 @@ test_api = executable('test_api',
     build_by_default: true,
     install: false,
 )
+
+endif

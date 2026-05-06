@@ -23,10 +23,15 @@
 #include <algorithm>
 #include <app_context.h>
 #include <cmath>
+#include <codecvt>
+#include <cstdint>
 #include <engine.h>
 #include <fstream>
 #include <iostream>
+#include <locale>
 #include <limits>
+#include <sstream>
+#include <unordered_map>
 #include <vector>
 
 #include <common.h>
@@ -40,6 +45,150 @@
 
 namespace causallm {
 
+#if defined(_WIN32)
+static std::wstring utf8_to_wstring(const std::string &text) {
+  std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+  return converter.from_bytes(text);
+}
+
+static std::string wstring_to_utf8(const std::wstring &text) {
+  std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+  return converter.to_bytes(text);
+}
+#endif
+
+static std::vector<int32_t> parse_input_ids(const std::string &text) {
+  std::string normalized = text;
+  for (char &ch : normalized) {
+    if (ch == ',' || ch == ';' || ch == '[' || ch == ']')
+      ch = ' ';
+  }
+
+  std::vector<int32_t> ids;
+  std::istringstream iss(normalized);
+  int64_t value;
+  while (iss >> value) {
+    ids.push_back(static_cast<int32_t>(value));
+  }
+  return ids;
+}
+
+static bool read_utf8_codepoint(const std::string &text, size_t pos,
+                                uint32_t &codepoint, size_t &length) {
+  const unsigned char first = static_cast<unsigned char>(text[pos]);
+  if (first < 0x80) {
+    codepoint = first;
+    length = 1;
+    return true;
+  }
+
+  auto is_continuation = [](unsigned char ch) {
+    return (ch & 0xC0) == 0x80;
+  };
+
+  if ((first & 0xE0) == 0xC0 && pos + 1 < text.size()) {
+    const unsigned char b1 = static_cast<unsigned char>(text[pos + 1]);
+    if (!is_continuation(b1))
+      return false;
+    codepoint = ((first & 0x1F) << 6) | (b1 & 0x3F);
+    length = 2;
+    return true;
+  }
+
+  if ((first & 0xF0) == 0xE0 && pos + 2 < text.size()) {
+    const unsigned char b1 = static_cast<unsigned char>(text[pos + 1]);
+    const unsigned char b2 = static_cast<unsigned char>(text[pos + 2]);
+    if (!is_continuation(b1) || !is_continuation(b2))
+      return false;
+    codepoint = ((first & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+    length = 3;
+    return true;
+  }
+
+  if ((first & 0xF8) == 0xF0 && pos + 3 < text.size()) {
+    const unsigned char b1 = static_cast<unsigned char>(text[pos + 1]);
+    const unsigned char b2 = static_cast<unsigned char>(text[pos + 2]);
+    const unsigned char b3 = static_cast<unsigned char>(text[pos + 3]);
+    if (!is_continuation(b1) || !is_continuation(b2) ||
+        !is_continuation(b3))
+      return false;
+    codepoint = ((first & 0x07) << 18) | ((b1 & 0x3F) << 12) |
+                ((b2 & 0x3F) << 6) | (b3 & 0x3F);
+    length = 4;
+    return true;
+  }
+
+  return false;
+}
+
+static bool is_valid_utf8_string(const std::string &text) {
+  for (size_t pos = 0; pos < text.size();) {
+    uint32_t codepoint = 0;
+    size_t length = 0;
+    if (!read_utf8_codepoint(text, pos, codepoint, length))
+      return false;
+    pos += length;
+  }
+  return true;
+}
+
+static const std::unordered_map<uint32_t, unsigned char> &
+get_byte_level_decoder() {
+  static const std::unordered_map<uint32_t, unsigned char> decoder = [] {
+    std::vector<unsigned int> bytes;
+    for (unsigned int ch = static_cast<unsigned int>('!');
+         ch <= static_cast<unsigned int>('~'); ++ch)
+      bytes.push_back(ch);
+    for (unsigned int ch = 0xA1; ch <= 0xAC; ++ch)
+      bytes.push_back(ch);
+    for (unsigned int ch = 0xAE; ch <= 0xFF; ++ch)
+      bytes.push_back(ch);
+
+    std::vector<unsigned int> chars = bytes;
+    unsigned int n = 0;
+    for (unsigned int byte = 0; byte < 256; ++byte) {
+      if (std::find(bytes.begin(), bytes.end(), byte) == bytes.end()) {
+        bytes.push_back(byte);
+        chars.push_back(256 + n);
+        ++n;
+      }
+    }
+
+    std::unordered_map<uint32_t, unsigned char> byte_decoder;
+    for (size_t i = 0; i < bytes.size(); ++i)
+      byte_decoder[chars[i]] = static_cast<unsigned char>(bytes[i]);
+    return byte_decoder;
+  }();
+  return decoder;
+}
+
+static void append_byte_level_piece(const std::string &piece,
+                                    std::string &decoded) {
+  const auto &byte_decoder = get_byte_level_decoder();
+
+  for (size_t pos = 0; pos < piece.size();) {
+    uint32_t codepoint = 0;
+    size_t length = 0;
+    if (!read_utf8_codepoint(piece, pos, codepoint, length)) {
+      decoded.push_back(piece[pos++]);
+      continue;
+    }
+
+    auto it = byte_decoder.find(codepoint);
+    if (it != byte_decoder.end()) {
+      decoded.push_back(static_cast<char>(it->second));
+    } else {
+      decoded.append(piece, pos, length);
+    }
+    pos += length;
+  }
+}
+
+static bool is_special_token_piece(const std::string &piece) {
+  return piece.size() >= 4 && piece.rfind("<|", 0) == 0 &&
+         piece.compare(piece.size() - 2, 2, "|>") == 0;
+}
+
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
   setupParameters(cfg, generation_cfg, nntr_cfg);
@@ -47,6 +196,11 @@ CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
 
 void CausalLM::setupParameters(json &cfg, json &generation_cfg,
                                json &nntr_cfg) {
+  json &model_cfg =
+    (cfg.contains("text_config") && cfg["text_config"].is_object())
+      ? cfg["text_config"]
+      : cfg;
+
   // Initialize output list
   for (unsigned int i = 0; i < BATCH_SIZE; ++i)
     output_list.push_back("");
@@ -77,18 +231,31 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
           .get<unsigned int>();
   }
 
-  if (generation_cfg["eos_token_id"].is_array()) {
+  if (!generation_cfg.contains("eos_token_id") ||
+      generation_cfg["eos_token_id"].is_null()) {
+    if (model_cfg["eos_token_id"].is_array()) {
+      EOS_TOKEN_ID = model_cfg["eos_token_id"].get<std::vector<unsigned int>>();
+    } else {
+      EOS_TOKEN_ID.clear();
+      EOS_TOKEN_ID.push_back(model_cfg["eos_token_id"].get<unsigned int>());
+    }
+  } else if (generation_cfg["eos_token_id"].is_array()) {
     EOS_TOKEN_ID =
       generation_cfg["eos_token_id"].empty()
-        ? cfg["eos_token_id"].get<std::vector<unsigned int>>()
+        ? model_cfg["eos_token_id"].get<std::vector<unsigned int>>()
         : generation_cfg["eos_token_id"].get<std::vector<unsigned int>>();
   } else {
     EOS_TOKEN_ID.clear();
     EOS_TOKEN_ID.push_back(generation_cfg["eos_token_id"].get<unsigned int>());
   }
-  BOS_TOKEN_ID = generation_cfg["bos_token_id"].empty()
-                   ? cfg["bos_token_id"].get<unsigned int>()
-                   : generation_cfg["bos_token_id"].get<unsigned int>();
+  BOS_TOKEN_ID =
+    (!generation_cfg.contains("bos_token_id") ||
+     generation_cfg["bos_token_id"].is_null() ||
+     generation_cfg["bos_token_id"].empty())
+      ? (model_cfg.contains("bos_token_id") && !model_cfg["bos_token_id"].is_null()
+           ? model_cfg["bos_token_id"].get<unsigned int>()
+           : EOS_TOKEN_ID.front())
+      : generation_cfg["bos_token_id"].get<unsigned int>();
   TOP_K = generation_cfg.contains("top_k")
             ? generation_cfg["top_k"].get<unsigned int>()
             : 20;
@@ -99,6 +266,86 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
                   ? generation_cfg["temperature"].get<float>()
                   : 0.7;
   global_token_len = 0;
+  setupFallbackTokenDecoder(nntr_cfg);
+}
+
+void CausalLM::setupFallbackTokenDecoder(json &nntr_cfg) {
+  fallback_token_id_to_piece_.clear();
+  fallback_special_token_ids_.clear();
+  has_fallback_token_decoder_ = false;
+
+  if (tokenizer)
+    return;
+
+  if (!nntr_cfg.contains("tokenizer_file"))
+    return;
+
+  try {
+    const std::string tokenizer_file =
+      nntr_cfg["tokenizer_file"].get<std::string>();
+    json tokenizer_json = LoadJsonFile(tokenizer_file);
+
+    auto add_piece = [this](int64_t id, const std::string &piece,
+                            bool is_special) {
+      if (id < 0 ||
+          id > static_cast<int64_t>(std::numeric_limits<unsigned int>::max()))
+        return;
+
+      const auto token_id = static_cast<unsigned int>(id);
+      fallback_token_id_to_piece_[token_id] = piece;
+      if (is_special)
+        fallback_special_token_ids_.insert(token_id);
+    };
+
+    if (tokenizer_json.contains("model") &&
+        tokenizer_json["model"].contains("vocab") &&
+        tokenizer_json["model"]["vocab"].is_object()) {
+      for (auto it = tokenizer_json["model"]["vocab"].begin();
+           it != tokenizer_json["model"]["vocab"].end(); ++it) {
+        if (!it.value().is_number_integer() &&
+            !it.value().is_number_unsigned())
+          continue;
+        add_piece(it.value().get<int64_t>(), it.key(),
+                  is_special_token_piece(it.key()));
+      }
+    }
+
+    if (tokenizer_json.contains("added_tokens") &&
+        tokenizer_json["added_tokens"].is_array()) {
+      for (const auto &token : tokenizer_json["added_tokens"]) {
+        if (!token.contains("id") || !token.contains("content"))
+          continue;
+        add_piece(token["id"].get<int64_t>(), token["content"].get<std::string>(),
+                  token.value("special", false));
+      }
+    }
+
+    has_fallback_token_decoder_ = !fallback_token_id_to_piece_.empty();
+  } catch (const std::exception &e) {
+    std::cerr << "[Warning] Failed to setup tokenizer.json fallback decoder: "
+              << e.what() << std::endl;
+  }
+}
+
+std::string CausalLM::decodeFallbackTokens(const std::vector<int> &ids) const {
+  std::string decoded;
+  for (int id : ids) {
+    if (id < 0)
+      continue;
+
+    const auto token_id = static_cast<unsigned int>(id);
+    if (fallback_special_token_ids_.find(token_id) !=
+        fallback_special_token_ids_.end())
+      continue;
+
+    auto it = fallback_token_id_to_piece_.find(token_id);
+    if (it == fallback_token_id_to_piece_.end())
+      continue;
+
+    append_byte_level_piece(it->second, decoded);
+  }
+
+  return decoded;
 }
 
 void CausalLM::constructModel() {
@@ -134,7 +381,32 @@ void CausalLM::registerOutputs(
     if (!eos_list[b]) {
       pending_ids_.push_back(static_cast<int>(ids[b]));
       ids_history[b * MAX_SEQ_LEN + pos] = ids[b];
-      std::string decoded_str = tokenizer->Decode(pending_ids_);
+
+      if (!tokenizer && !has_fallback_token_decoder_) {
+        std::string decoded_str = std::to_string(ids[b]);
+        if (log_output) {
+          std::cout << decoded_str << " ";
+          std::cout.flush();
+        }
+        if (!output_list[b].empty())
+          output_list[b].append(" ");
+        output_list[b].append(decoded_str);
+        pending_ids_.clear();
+        continue;
+      }
+
+      std::string decoded_str = tokenizer ? tokenizer->Decode(pending_ids_)
+                                          : decodeFallbackTokens(pending_ids_);
+
+      if (decoded_str.empty()) {
+        pending_ids_.clear();
+        continue;
+      }
+
+      if (!tokenizer && has_fallback_token_decoder_ &&
+          !is_valid_utf8_string(decoded_str)) {
+        continue;
+      }
 
       if (std::find(puncts.begin(), puncts.end(), decoded_str.back()) !=
           puncts.end()) {
@@ -323,17 +595,52 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    *  if USE_KVCACHE && system_prompt is given && but the
    * PRE_COMPUTED_CACHE_PATH does not exist
    */
-  SAVE_KVCACHE = (USE_KVCACHE && system_prompt != "" &&
+  SAVE_KVCACHE = (USE_KVCACHE && system_prompt != WSTR{} &&
                   !std::filesystem::exists(PRE_COMPUTED_CACHE_PATH));
 
 #if defined(_WIN32)
-  if (log_output)
-    std::wcout << L"" << system_prompt << L"" << text_ << std::endl;
-  std::wstring prompt_ = prompt;
-  if (!SAVE_KVCACHE)
-    prompt_ += TAIL_PROMPT;
-  std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-  auto _input = tokenizer->Encode(converter.to_bytes(prompt_));
+  std::vector<int32_t> _input;
+
+  std::wstring prompt_;
+
+  if (USE_KVCACHE) {
+    prompt_ = SAVE_KVCACHE ? system_prompt : (prompt + tail_prompt);
+  } else {
+    prompt_ = system_prompt + prompt + tail_prompt;
+  }
+
+  if (log_output) {
+    bool printed_decoded_prompt = false;
+    if (!tokenizer && has_fallback_token_decoder_) {
+      const std::vector<int32_t> prompt_ids =
+        parse_input_ids(wstring_to_utf8(prompt_));
+      if (!prompt_ids.empty()) {
+        const std::vector<int> display_ids(prompt_ids.begin(),
+                                           prompt_ids.end());
+        const std::string decoded_prompt = decodeFallbackTokens(display_ids);
+        if (!decoded_prompt.empty()) {
+          std::wcout << utf8_to_wstring(decoded_prompt) << std::endl;
+          printed_decoded_prompt = true;
+        }
+      }
+    }
+
+    if (!printed_decoded_prompt)
+      std::wcout << prompt_ << std::endl;
+  }
+
+  if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0) {
+    SYS_PROMP_LEN =
+      tokenizer
+        ? tokenizer->Encode(wstring_to_utf8(system_prompt)).size()
+        : parse_input_ids(wstring_to_utf8(system_prompt)).size();
+  }
+
+  if (tokenizer) {
+    _input = tokenizer->Encode(wstring_to_utf8(prompt_));
+  } else {
+    _input = parse_input_ids(wstring_to_utf8(prompt_));
+  }
 #else
   // print input text
   if (log_output)
@@ -351,7 +658,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0)
     SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
 
-  auto _input = tokenizer->Encode(prompt_);
+  std::vector<int32_t> _input;
+  if (tokenizer) {
+    _input = tokenizer->Encode(prompt_);
+  } else {
+    _input = parse_input_ids(prompt_);
+  }
   ///@note insert bos token at the beginning of the input
   // _input.insert(_input.begin(), BOS_TOKEN_ID);
 #endif
