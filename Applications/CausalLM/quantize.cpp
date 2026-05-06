@@ -78,6 +78,7 @@
 #include "qwen3_embedding.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
+#include "qwen35_causallm.h"
 
 using json = nlohmann::json;
 using DataType = ml::train::TensorDim::DataType;
@@ -220,6 +221,11 @@ void registerAllModels() {
   factory.registerModel("Qwen3ForCausalLM",
                         [](json cfg, json generation_cfg, json nntr_cfg) {
                           return std::make_unique<causallm::Qwen3CausalLM>(
+                            cfg, generation_cfg, nntr_cfg);
+                        });
+  factory.registerModel("Qwen3_5ForConditionalGeneration",
+                        [](json cfg, json generation_cfg, json nntr_cfg) {
+                          return std::make_unique<causallm::Qwen35CausalLM>(
                             cfg, generation_cfg, nntr_cfg);
                         });
   factory.registerModel("Qwen3MoeForCausalLM",

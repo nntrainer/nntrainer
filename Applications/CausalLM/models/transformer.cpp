@@ -11,6 +11,7 @@
  */
 
 #include <fstream>
+#include <sstream>
 
 #include <app_context.h>
 #include <engine.h>
@@ -82,13 +83,23 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
   // This is where you would set up the model layers, parameters, etc.
   setupParameters(cfg, generation_cfg, nntr_cfg);
 
-  // prep tokenizer
-  tokenizer = tokenizers::Tokenizer::FromBlobJSON(
-    LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+#if !defined(_WIN32)
+  if (!nntr_cfg.value("disable_tokenizer", false) &&
+      nntr_cfg.contains("tokenizer_file")) {
+    tokenizer = tokenizers::Tokenizer::FromBlobJSON(
+      LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+  }
+#else
+  tokenizer = nullptr;
+#endif
 };
 
 void Transformer::setupParameters(json &cfg, json &generation_cfg,
                                   json &nntr_cfg) {
+  json &model_cfg =
+    (cfg.contains("text_config") && cfg["text_config"].is_object())
+      ? cfg["text_config"]
+      : cfg;
 
   /** Initialize nntr prameters */
   BATCH_SIZE = nntr_cfg["batch_size"].get<unsigned int>();
@@ -104,34 +115,41 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
 
-  if (cfg.contains("is_causal")) {
-    IS_CAUSAL = cfg["is_causal"].get<bool>();
-  } else if (cfg.contains("use_bidirectional_attention")) {
-    IS_CAUSAL = !cfg["use_bidirectional_attention"].get<bool>();
+  if (model_cfg.contains("is_causal")) {
+    IS_CAUSAL = model_cfg["is_causal"].get<bool>();
+  } else if (model_cfg.contains("use_bidirectional_attention")) {
+    IS_CAUSAL = !model_cfg["use_bidirectional_attention"].get<bool>();
   }
 
-  NUM_VOCAB = cfg["vocab_size"];
-  DIM = cfg["hidden_size"];
-  INTERMEDIATE_SIZE = cfg["intermediate_size"];
-  NUM_LAYERS = cfg["num_hidden_layers"];
-  NUM_HEADS = cfg["num_attention_heads"];
-  HEAD_DIM = cfg.contains("head_dim")
-               ? cfg["head_dim"].get<int>()
+  NUM_VOCAB = model_cfg["vocab_size"];
+  DIM = model_cfg["hidden_size"];
+  INTERMEDIATE_SIZE = model_cfg["intermediate_size"];
+  NUM_LAYERS = model_cfg["num_hidden_layers"];
+  NUM_HEADS = model_cfg["num_attention_heads"];
+  HEAD_DIM = model_cfg.contains("head_dim")
+               ? model_cfg["head_dim"].get<int>()
                : DIM / NUM_HEADS; // default value is hidden_size / num_heads
-  NUM_KEY_VALUE_HEADS = cfg.contains("num_key_value_heads")
-                          ? cfg["num_key_value_heads"].get<int>()
+  NUM_KEY_VALUE_HEADS = model_cfg.contains("num_key_value_heads")
+                          ? model_cfg["num_key_value_heads"].get<int>()
                           : NUM_HEADS;
   SLIDING_WINDOW =
-    cfg.contains("sliding_window") && !cfg["sliding_window"].is_null()
-      ? cfg["sliding_window"].get<unsigned int>()
+    model_cfg.contains("sliding_window") && !model_cfg["sliding_window"].is_null()
+      ? model_cfg["sliding_window"].get<unsigned int>()
       : UINT_MAX;
-  SLIDING_WINDOW_PATTERN = cfg.contains("sliding_window_pattern")
-                             ? cfg["sliding_window_pattern"].get<unsigned int>()
+  SLIDING_WINDOW_PATTERN = model_cfg.contains("sliding_window_pattern")
+                             ? model_cfg["sliding_window_pattern"].get<unsigned int>()
                              : 1;
-  MAX_POSITION_EMBEDDINGS = cfg["max_position_embeddings"].get<unsigned int>();
-  ROPE_THETA = cfg["rope_theta"].get<unsigned int>();
-  TIE_WORD_EMBEDDINGS = cfg["tie_word_embeddings"].get<bool>();
-  NORM_EPS = cfg["rms_norm_eps"];
+  MAX_POSITION_EMBEDDINGS =
+    model_cfg["max_position_embeddings"].get<unsigned int>();
+  if (model_cfg.contains("rope_theta")) {
+    ROPE_THETA = model_cfg["rope_theta"].get<unsigned int>();
+  } else if (model_cfg.contains("rope_parameters") &&
+             model_cfg["rope_parameters"].contains("rope_theta")) {
+    ROPE_THETA =
+      model_cfg["rope_parameters"]["rope_theta"].get<unsigned int>();
+  }
+  TIE_WORD_EMBEDDINGS = model_cfg["tie_word_embeddings"].get<bool>();
+  NORM_EPS = model_cfg["rms_norm_eps"];
   GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
 
   return;

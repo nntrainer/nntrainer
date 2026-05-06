@@ -112,8 +112,8 @@ public:
    * @brief run the Transformer model
    */
   virtual void run(const WSTR prompt, bool do_sample = false,
-                   const WSTR system_prompt = "", const WSTR tail_prompt = "",
-                   bool log_output = true);
+                   const WSTR system_prompt = WSTR{},
+                   const WSTR tail_prompt = WSTR{}, bool log_output = true);
 
   /**
    * @brief Get PerformanceMetrics
