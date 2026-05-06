@@ -60,7 +60,8 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
       (sizeof(block_q8_0) * K) / QK8_0; // ignore remainder
     unsigned int M4 = M / 4;
 
-    unsigned int qa_size = qa_4_rows_size * M4 + qa_row_size * (M % 4);
+    unsigned int qa_size =
+      qa_4_rows_size * M4 + static_cast<unsigned int>(qa_row_size) * (M % 4);
     std::vector<char> QA = std::vector<char>(qa_size);
 
     // online quantization for M4 * 4 rows
@@ -78,11 +79,11 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
 
     // Compute 4-divisible-M row portion with multithreaded GEMM
     unsigned int row_chunk_size = 16;
-    unsigned int row_loop = (M4 * 4 + row_chunk_size - 1) / row_chunk_size;
+    size_t row_loop = (M4 * 4 + row_chunk_size - 1) / row_chunk_size;
     unsigned int A_step = sizeof(block_q8_0) * (K / QK8_0);
 
     unsigned int col_chunk_size = 16;
-    unsigned int col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+    size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
     tm.parallel_for(0, col_loop * row_loop, [=](size_t i) {
@@ -131,11 +132,11 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
     }
 
     unsigned int row_chunk_size = 16;
-    unsigned int row_loop = (M + row_chunk_size - 1) / row_chunk_size;
+    size_t row_loop = (M + row_chunk_size - 1) / row_chunk_size;
     unsigned int A_step = sizeof(block_q8_0) * (K / QK8_0);
 
     unsigned int col_chunk_size = 16;
-    unsigned int col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+    size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
     tm.parallel_for(0, col_loop * row_loop, [=](size_t i) {
