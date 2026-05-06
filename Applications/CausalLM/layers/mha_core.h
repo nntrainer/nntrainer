@@ -171,6 +171,17 @@ public:
   using prop_tag = nntrainer::uint_prop_tag; /**< property type */
 };
 
+/**
+ * @brief Partial rotary factor.
+ */
+class PartialRotaryFactor : public nntrainer::Property<float> {
+public:
+  PartialRotaryFactor(float value = 1.0f) { set(value); };
+  static constexpr const char *key =
+    "partial_rotary_factor";                 /**< unique key to access */
+  using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
 }; // namespace props
 
 /**
@@ -308,7 +319,7 @@ private:
     props::SlidingWindow, props::MaxNewTokens, props::RopeTheta,
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopeScalingMaxPositionEmbeddings,
-    props::AttnLogitSoftcapping, props::IsCausal>
+    props::PartialRotaryFactor, props::AttnLogitSoftcapping, props::IsCausal>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -321,6 +332,7 @@ private:
   size_t num_heads_Q;
   size_t num_heads_KV;
   size_t head_dim;
+  size_t rotary_dim;
   bool cache_shift;
   float theta;
   size_t local_window_size;
@@ -370,6 +382,7 @@ private:
   inline static std::vector<std::vector<float>> *freqs_cos = {};
   inline static std::vector<std::vector<float>> *freqs_sin = {};
   inline static std::vector<float> thetas;
+  inline static unsigned int freqs_dim = 0;
 #ifdef ENABLE_FP16
   inline static std::vector<std::vector<_FP16>> *freqs_cos_fp16 = {};
   inline static std::vector<std::vector<_FP16>> *freqs_sin_fp16 = {};

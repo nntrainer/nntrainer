@@ -52,13 +52,15 @@ MHACoreLayer::MHACoreLayer() :
     props::SlidingWindow(), props::MaxNewTokens(), props::RopeTheta(),
     props::MaxPositionEmbeddings(), props::UseSink(), props::RopeScalingType(),
     props::RopeScalingFactor(), props::RopeScalingMaxPositionEmbeddings(),
-    props::AttnLogitSoftcapping(), props::IsCausal()),
+    props::PartialRotaryFactor(), props::AttnLogitSoftcapping(),
+    props::IsCausal()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
   num_heads_Q(0),
   num_heads_KV(0),
   head_dim(0),
+  rotary_dim(0),
   cache_shift(false) {
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
@@ -123,6 +125,16 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     << "num_heads_Q and num_heads_KV are not properly given. Please check the "
        "num_heads_* are set correctly so that the `head_dim`s are all same for "
        "query / key / value";
+
+  const float partial_rotary_factor =
+    std::get<props::PartialRotaryFactor>(mha_core_props).get();
+  NNTR_THROW_IF(partial_rotary_factor <= 0.0f || partial_rotary_factor > 1.0f,
+                std::invalid_argument)
+    << "partial_rotary_factor should be in (0, 1]";
+  rotary_dim = static_cast<size_t>(head_dim * partial_rotary_factor);
+  rotary_dim -= rotary_dim % 2;
+  NNTR_THROW_IF(rotary_dim == 0, std::invalid_argument)
+    << "rotary dimension must be positive";
 
   /** Weight for Sink */
   use_sink = std::get<props::UseSink>(mha_core_props).get();
@@ -378,11 +390,13 @@ void MHACoreLayer::compute_kcaches(
       float *out_data = out.getData<float>();
 
 #pragma omp parallel for schedule(static)
-      for (unsigned int head_kv = 0; head_kv < num_cache_head; ++head_kv) {
+      for (int head_kv = 0; head_kv < static_cast<int>(num_cache_head);
+           ++head_kv) {
         nntrainer::compute_kcaches<uint16_t>(
           in_data, cache_data, out_data, row_to_compute, num_cache_head,
-          head_dim, group_size, tile_size, local_window_size, head_kv,
-          head_kv + 1);
+          head_dim, group_size, tile_size, local_window_size,
+          static_cast<unsigned int>(head_kv),
+          static_cast<unsigned int>(head_kv + 1));
       }
 
     } else {
@@ -496,11 +510,12 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                     true);
 
   // apply rotary embedding for query
-  apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
+  apply_rotary_emb_tensor_v2(query_step, query_step, rotary_dim, cache_index,
                              false);
 
   // append kcache with rotary embedding
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, cache_index,
+  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, rotary_dim,
+                             cache_index,
                              false);
 
   // append vcache without rotary embedding
@@ -586,9 +601,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     batch * cache_value_dim.getFeatureLen() + from * cache_value_dim.width(),
     true);
 
-  apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, _from, false);
+  apply_rotary_emb_tensor_v2(query_step, query_step, rotary_dim, _from, false);
 
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, _from,
+  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, rotary_dim, _from,
                              false);
 
   if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
@@ -640,6 +655,21 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
                                     float theta, bool is_fp16) {
   // compute the freqs only when it is the first time to call this function
+  if (freqs_dim != static_cast<unsigned int>(head_dim)) {
+    delete freqs_cos;
+    delete freqs_sin;
+    freqs_cos = nullptr;
+    freqs_sin = nullptr;
+#ifdef ENABLE_FP16
+    delete freqs_cos_fp16;
+    delete freqs_sin_fp16;
+    freqs_cos_fp16 = nullptr;
+    freqs_sin_fp16 = nullptr;
+#endif
+    thetas.clear();
+    freqs_dim = static_cast<unsigned int>(head_dim);
+  }
+
 #ifdef ENABLE_FP16
   if (freqs_cos_fp16 != nullptr && freqs_cos_fp16->size() == seq_len)
     return;
@@ -847,10 +877,10 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
 
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    if (freqs_cos == nullptr) {
+    if (freqs_cos == nullptr || freqs_dim != dim) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      if (freqs_cos == nullptr) {
-        precompute_freqs(head_dim, max_position_embeddings, theta, false);
+      if (freqs_cos == nullptr || freqs_dim != dim) {
+        precompute_freqs(dim, max_position_embeddings, theta, false);
       }
     }
     std::vector<float> *cos_ = nullptr;
@@ -869,9 +899,24 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
 
           if (out.getDataType() == ml::train::TensorDim::DataType::FP32) {
 
-            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                                nullptr, cos_->data(),
-                                                sin_->data(), convert_only);
+            if (dim == head_dim) {
+              nntrainer::compute_rotary_emb_value(
+                in.width(), dim, half_, in_ptr, nullptr, cos_->data(),
+                sin_->data(), convert_only);
+            } else if (!convert_only) {
+              for (unsigned int w = 0; w < in.width(); w += head_dim) {
+                for (unsigned int k = 0; k < half_; ++k) {
+                  const unsigned int i0 = w + k;
+                  const unsigned int i1 = w + k + half_;
+                  const float a = in_ptr[i0];
+                  const float b = in_ptr[i1];
+                  const float c_val = (*cos_)[k];
+                  const float s_val = (*sin_)[k];
+                  in_ptr[i0] = a * c_val - b * s_val;
+                  in_ptr[i1] = a * s_val + b * c_val;
+                }
+              }
+            }
           } else if (out.getDataType() ==
                        ml::train::TensorDim::DataType::UINT16 ||
                      out.getDataType() ==
@@ -881,19 +926,44 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                                 c * out.height() * out.width() +
                                 h * out.width();
 
-            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                                out_ptr, cos_->data(),
-                                                sin_->data(), convert_only);
+            if (dim == head_dim) {
+              nntrainer::compute_rotary_emb_value(
+                in.width(), dim, half_, in_ptr, out_ptr, cos_->data(),
+                sin_->data(), convert_only);
+            } else {
+              for (unsigned int w = 0; w < in.width(); w += head_dim) {
+                unsigned int k = 0;
+                if (!convert_only) {
+                  for (; k < half_; ++k) {
+                    const unsigned int i0 = w + k;
+                    const unsigned int i1 = w + k + half_;
+                    const float a = in_ptr[i0];
+                    const float b = in_ptr[i1];
+                    const float c_val = (*cos_)[k];
+                    const float s_val = (*sin_)[k];
+                    out_ptr[i0] =
+                      nntrainer::compute_fp32_to_fp16(a * c_val - b * s_val);
+                    out_ptr[i1] =
+                      nntrainer::compute_fp32_to_fp16(a * s_val + b * c_val);
+                  }
+                }
+                for (unsigned int i = convert_only ? 0 : dim; i < head_dim;
+                     ++i) {
+                  out_ptr[w + i] =
+                    nntrainer::compute_fp32_to_fp16(in_ptr[w + i]);
+                }
+              }
+            }
           }
         }
       }
     }
   } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    if (freqs_cos_fp16 == nullptr) {
+    if (freqs_cos_fp16 == nullptr || freqs_dim != dim) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      if (freqs_cos_fp16 == nullptr) {
-        precompute_freqs(head_dim, max_position_embeddings, theta, true);
+      if (freqs_cos_fp16 == nullptr || freqs_dim != dim) {
+        precompute_freqs(dim, max_position_embeddings, theta, true);
       }
     }
     std::vector<_FP16> *cos_ = nullptr;
@@ -913,9 +983,27 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                            b * out.channel() * out.height() * out.width() +
                            c * out.height() * out.width() + h * out.width();
 
-          nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
-                                              out_ptr, cos_->data(),
-                                              sin_->data());
+          if (dim == head_dim) {
+            nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
+                                                out_ptr, cos_->data(),
+                                                sin_->data());
+          } else {
+            for (unsigned int w = 0; w < in.width(); w += head_dim) {
+              for (unsigned int k = 0; k < half_; ++k) {
+                const unsigned int i0 = w + k;
+                const unsigned int i1 = w + k + half_;
+                const float a = static_cast<float>(in_ptr[i0]);
+                const float b = static_cast<float>(in_ptr[i1]);
+                const float c_val = static_cast<float>((*cos_)[k]);
+                const float s_val = static_cast<float>((*sin_)[k]);
+                out_ptr[i0] = static_cast<_FP16>(a * c_val - b * s_val);
+                out_ptr[i1] = static_cast<_FP16>(a * s_val + b * c_val);
+              }
+              for (unsigned int i = dim; i < head_dim; ++i) {
+                out_ptr[w + i] = in_ptr[w + i];
+              }
+            }
+          }
         }
       }
     }
