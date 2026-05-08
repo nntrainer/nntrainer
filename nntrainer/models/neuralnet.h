@@ -286,7 +286,7 @@ public:
    */
   void load(const std::string &file_path,
             ml::train::ModelFormat format =
-              ml::train::ModelFormat::MODEL_FORMAT_BIN) override;
+              ml::train::ModelFormat::MODEL_FORMAT_BIN, const std::string &lora_file_path = "") override;
 
   /**
    * @brief     get Epochs

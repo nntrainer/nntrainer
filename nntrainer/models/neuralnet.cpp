@@ -637,7 +637,8 @@ void NeuralNetwork::save(
   /// @todo this switch case should be delegating the function call only. It's
   /// not delegating for now as required logics are manageable for now.
   switch (format) {
-  case ml::train::ModelFormat::MODEL_FORMAT_BIN: {
+  case(ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN):
+  case (ml::train::ModelFormat::MODEL_FORMAT_BIN): {
     auto model_file = checkedOpenStream<std::ofstream>(
       file_path, std::ios::out | std::ios::binary | std::ios::trunc);
 
@@ -645,10 +646,27 @@ void NeuralNetwork::save(
       const auto &layer_node = *iter;
       auto it = layer_dtype_map.find(layer_node->getName());
       auto target_dtype = (it != layer_dtype_map.end()) ? it->second : dtype;
-      layer_node->save(model_file, false, exec_mode, target_dtype, target_isa);
+      if (format == ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN &&
+          layer_node->getType() == "fully_connected") {
+        bool lora_enabled = false;
+        for (unsigned int i = 0; i < layer_node->getNumWeights(); i++) {
+          if (layer_node->getWeight(i).getName().find("lora") !=
+              std::string::npos) {
+            lora_enabled = true;
+            break;
+          }
+        }
+        if (lora_enabled) {
+          layer_node->save(model_file, false, exec_mode, target_dtype,
+                           target_isa);
+        }
+      } else if (format != ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN) {
+        layer_node->save(model_file, false, exec_mode, target_dtype,
+                         target_isa);
+      }
     }
 
-    if (opt && istrequal(opt->getType(), "adam")) {
+    if (opt && istrequal(opt->getType(), "adam") && format != ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN) {
       std::string adam = "adam";
       model_file.write(adam.c_str(), 4);
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
@@ -657,7 +675,7 @@ void NeuralNetwork::save(
       }
     }
 
-    if (exec_mode == ml::train::ExecutionMode::TRAIN) {
+    if (exec_mode == ml::train::ExecutionMode::TRAIN && format != ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN) {
       model_file.write((char *)&epoch_idx, sizeof(epoch_idx));
       model_file.write((char *)&iter, sizeof(iter));
     }
@@ -741,7 +759,7 @@ void NeuralNetwork::save(
 }
 
 void NeuralNetwork::load(const std::string &file_path,
-                         ml::train::ModelFormat format) {
+                         ml::train::ModelFormat format, const std::string &lora_file_path) {
   /// @todo this switch case should be delegating the function call only. It's
   /// not delegating for now as required logics are manageable for now.
 
@@ -750,7 +768,7 @@ void NeuralNetwork::load(const std::string &file_path,
   const std::regex reg_("\\s*\\;\\s*");
   auto v = split(file_path, reg_);
 
-  size_t start_from = 0;
+  size_t start_from = 0, lora_start_from = 0;
   std::vector<std::pair<size_t, size_t>> file_offset;
   std::unordered_set<const Tensor *> visited_weights;
   for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
@@ -767,7 +785,12 @@ void NeuralNetwork::load(const std::string &file_path,
       }
       size_t size = weight->getVariable().getMemoryBytes();
       auto tensor_data_type = weight->getDim().getDataType();
-      weight->getVariableRef().setFileOffset(start_from);
+      if (weight->getName().find("lora") != std::string::npos) {
+        weight->getVariableRef().setFileOffset(lora_start_from);
+      }
+      else {
+        weight->getVariableRef().setFileOffset(start_from);
+      }
       ///@todo instead of checking the data type,
       /// we may need to create a common parent class for
       /// quantized tensors, requiring qparam to be saved
@@ -780,8 +803,15 @@ void NeuralNetwork::load(const std::string &file_path,
         // for tensor with qparam
         size += sizeof(uint16_t);
       }
-      file_offset.emplace_back(std::make_pair(start_from, size));
-      start_from += size;
+
+      if (weight->getName().find("lora") != std::string::npos) {
+        file_offset.emplace_back(std::make_pair(lora_start_from, size));
+        lora_start_from += size;
+      }
+      else {
+        file_offset.emplace_back(std::make_pair(start_from, size));
+        start_from += size;
+      }
     }
   }
 
@@ -852,7 +882,8 @@ void NeuralNetwork::load(const std::string &file_path,
             auto local_model_file = checkedOpenStream<std::ifstream>(
               (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
             node->read(local_model_file, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+                       std::numeric_limits<size_t>::max(), true,
+                       model_file_fd, lora_file_path);
           } else {
 #if defined(_WIN32)
             // Map per-ask, then unmap immediately after: enables early release
@@ -885,7 +916,8 @@ void NeuralNetwork::load(const std::string &file_path,
             // mmap/munmap — see the comment on shared_mmap_ptr above.
             char *view = static_cast<char *>(shared_mmap_ptr);
             node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+                       std::numeric_limits<size_t>::max(), true, model_file_fd,
+                       lora_file_path);
 #endif
           }
         });
@@ -905,7 +937,9 @@ void NeuralNetwork::load(const std::string &file_path,
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
            ++iter) {
-        (*iter)->read(model_file, false, exec_mode, fsu_mode);
+        (*iter)->read(model_file, false, exec_mode, fsu_mode,
+                      std::numeric_limits<size_t>::max(), true, model_file_fd,
+                      lora_file_path);
       }
 
       try {

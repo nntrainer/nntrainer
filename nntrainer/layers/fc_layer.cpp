@@ -112,12 +112,12 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
 
   weight_idx[FCParams::weight] = context.requestWeight(
     weight_dim, weight_initializer, weight_regularizer,
-    weight_regularizer_constant, weight_decay, "weight", true);
+    weight_regularizer_constant, weight_decay, "weight", (lora_rank == 0));
 
   if (disable_bias.empty() || disable_bias.get() == false) {
     weight_idx[FCParams::bias] =
       context.requestWeight(bias_dim, bias_initializer, WeightRegularizer::NONE,
-                            1.0f, bias_decay, "bias", true);
+                            1.0f, bias_decay, "bias", (lora_rank == 0));
   }
 
   /** create weights for LoRA */

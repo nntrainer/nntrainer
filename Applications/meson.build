@@ -61,3 +61,6 @@ if get_option('enable-transformer')
 endif
 
 subdir('Optimizers/jni')
+
+# lora training example
+subdir('LoRA/jni')

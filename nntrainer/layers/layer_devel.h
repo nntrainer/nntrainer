@@ -373,12 +373,29 @@ public:
       }
     } else {
       // @note shared weights are only be saved at the first access
+      bool lora_enabled = false;
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
         if (run_context.isGradientFirstAccess(i)) {
           auto &weight = run_context.getWeight(i);
           if (dtype == TensorDim::DataType::NONE ||
-              weight.getDataType() == dtype)
-            weight.save(file);
+            weight.getDataType() == dtype) {
+              if(weight.getName().find("lora") != std::string::npos) {
+                lora_enabled = true;
+                break;
+              }
+          }
+        }
+      }
+
+      for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
+        if (run_context.isGradientFirstAccess(i)) {
+          auto &weight = run_context.getWeight(i);
+          if (dtype == TensorDim::DataType::NONE ||
+            weight.getDataType() == dtype) {
+              if(!lora_enabled || weight.getName().find("lora") != std::string::npos) {
+                  weight.save(file);
+                }
+              }
           else {
             if (dtype == TensorDim::DataType::Q4_0) {
               NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
@@ -436,7 +453,14 @@ public:
                     bool opt_var, ml::train::ExecutionMode mode, bool trainable,
                     TensorDim::DataType defineWeightDataType, bool fsu,
                     size_t start_offset = 0, bool read_from_offset = false,
-                    int file_fd = -1) {
+                    int file_fd = -1, const std::string &lora_path = "") {
+    std::ifstream lora_file;
+    bool lora_enabled = false;
+    if(lora_path != "") {
+      lora_enabled = true;
+      lora_file = checkedOpenStream<std::ifstream>(lora_path, std::ios::in | std::ios::binary);
+    }
+ 
     if (fsu) {
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
         if (run_context.getWeight(i).getDataType() ==
@@ -459,8 +483,17 @@ public:
         for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
           /// @note shared weights are only be read at the first acecss
           if (run_context.isGradientFirstAccess(i)) {
-            run_context.getWeight(i).read(file, start_offset, read_from_offset,
-                                          file_fd);
+            if(run_context.getWeight(i).getName().find("lora") != std::string::npos) {
+              if(lora_enabled) {
+                run_context.getWeight(i).read(lora_file, start_offset, read_from_offset,
+                                                file_fd);
+              }
+            }
+            else {
+              run_context.getWeight(i).read(file, start_offset, read_from_offset,
+                                              file_fd);
+                run_context.getWeight(i).print(std::cout);
+            }
             if (run_context.isMixedPrecision(i) && trainable &&
                 !run_context.getWeightFP32(i).empty()) {
               run_context.getWeightFP32(i).copyData(run_context.getWeight(i));
@@ -486,7 +519,14 @@ public:
                     ml::train::ExecutionMode mode, bool trainable,
                     TensorDim::DataType defineWeightDataType, bool fsu,
                     size_t start_offset = 0, bool read_from_offset = false,
-                    int file_fd = -1) {
+                    int file_fd = -1, const std::string &lora_path = "") {
+    std::ifstream lora_file;
+    bool lora_enabled = false;
+    if (lora_path != "") {
+      lora_enabled = true;
+      lora_file = checkedOpenStream<std::ifstream>(
+        lora_path, std::ios::in | std::ios::binary);
+    }
     if (fsu) {
       for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
         if (run_context.getWeight(i).getDataType() ==
@@ -509,11 +549,20 @@ public:
         for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
           /// @note shared weights are only be read at the first acecss
           if (run_context.isGradientFirstAccess(i)) {
-            // file_fd is forwarded so virtual weights (e.g. SlimMoE expert
-            // tensors) can capture a long-lived fd for later mmap-on-demand
-            // in activate(); non-virtual weights ignore it.
-            run_context.getWeight(i).read(src, start_offset, read_from_offset,
-                                          file_fd);
+            if (run_context.getWeight(i).getName().find("lora") !=
+                std::string::npos) {
+              if (lora_enabled) {
+                run_context.getWeight(i).read(lora_file, start_offset,
+                                              read_from_offset);
+              }
+            } else {
+              // file_fd is forwarded so virtual weights (e.g. SlimMoE expert
+              // tensors) can capture a long-lived fd for later mmap-on-demand
+              // in activate(); non-virtual weights ignore it.
+              run_context.getWeight(i).read(src, start_offset, read_from_offset,
+                                            file_fd);
+              run_context.getWeight(i).print(std::cout);
+            }
             if (run_context.isMixedPrecision(i) && trainable &&
                 !run_context.getWeightFP32(i).empty()) {
               run_context.getWeightFP32(i).copyData(run_context.getWeight(i));

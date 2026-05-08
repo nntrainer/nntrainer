@@ -499,24 +499,25 @@ void LayerNode::exportTo(Exporter &exporter,
 
 void LayerNode::read(std::ifstream &file, bool opt_var,
                      ml::train::ExecutionMode mode, bool fsu,
-                     size_t start_offset, bool read_from_offset, int file_fd) {
+                     size_t start_offset, bool read_from_offset, int file_fd, const std::string &lora_path) {
   NNTR_THROW_IF(!run_context, std::runtime_error)
     << __func__ << " layer needs to be finalized first!";
   getLayer()->read(file, *run_context, opt_var, mode,
                    (getTrainable() && mode == ml::train::ExecutionMode::TRAIN),
                    getWeightDataType(), fsu, start_offset, read_from_offset,
-                   file_fd);
+                   file_fd, lora_path);
 }
 
 void LayerNode::read(ReadSource src, bool opt_var,
                      ml::train::ExecutionMode mode, bool fsu,
-                     size_t start_offset, bool read_from_offset, int file_fd) {
+                     size_t start_offset, bool read_from_offset, int file_fd,
+                     const std::string &lora_path) {
   NNTR_THROW_IF(!run_context, std::runtime_error)
     << __func__ << " layer needs to be finalized first!";
   getLayer()->read(src, *run_context, opt_var, mode,
                    (getTrainable() && mode == ml::train::ExecutionMode::TRAIN),
                    getWeightDataType(), fsu, start_offset, read_from_offset,
-                   file_fd);
+                   file_fd, lora_path);
 }
 
 void LayerNode::save(std::ofstream &file, bool opt_var,

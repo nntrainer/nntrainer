@@ -119,7 +119,7 @@ public:
                        nntrainer::TensorDim::DataType definedWeightDataType,
                        bool fsu = false, size_t start_offset = 0,
                        bool read_from_offset = false,
-                       int file_fd = -1) override;
+                       int file_fd = -1, const std::string &lora_path = "") override;
 
   /**
    * @copydoc Layer::read() (ReadSource/mmap variant)
@@ -130,7 +130,8 @@ public:
                        nntrainer::TensorDim::DataType definedWeightDataType,
                        bool fsu, size_t start_offset = 0,
                        bool read_from_offset = false,
-                       int file_fd = -1) override;
+                       int file_fd = -1,
+                       const std::string &lora_path = "") override;
 
   /**
    * @copydoc Layer::save()
