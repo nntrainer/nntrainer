@@ -33,18 +33,26 @@
 #include "chat_template.h"
 #include "embedding_gemma.h"
 #include "gemma3_causallm.h"
+#if !defined(_WIN32)
 #include "gptoss_cached_slim_causallm.h"
+#endif
 #include "gptoss_causallm.h"
+#if !defined(_WIN32) && !defined(__ANDROID__)
 #include "multilingual_tinybert_16mb.h"
+#endif
 #include "qwen2_causallm.h"
 #include "qwen2_embedding.h"
+#if !defined(_WIN32)
 #include "qwen3_cached_slim_moe_causallm.h"
+#endif
 #include "qwen3_causallm.h"
 #include "qwen3_embedding.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include <models/gemma3/function.h>
+#if !defined(_WIN32)
 #include <sys/resource.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -57,13 +65,20 @@ std::atomic<size_t> peak_rss_kb{0};
 std::atomic<bool> tracking_enabled{true};
 
 void printMemoryUsage() {
+#if defined(_WIN32)
+  std::cout << "Max Resident Set Size: unavailable on Windows" << std::endl;
+#else
   struct rusage usage;
   getrusage(RUSAGE_SELF, &usage);
   std::cout << "Max Resident Set Size: " << usage.ru_maxrss << " KB"
             << std::endl;
+#endif
 }
 
 size_t read_vm_rss_kb() {
+#if defined(_WIN32)
+  return 0;
+#else
   std::ifstream status("/proc/self/status");
   std::string line;
   while (std::getline(status, line)) {
@@ -74,9 +89,13 @@ size_t read_vm_rss_kb() {
     }
   }
   return 0;
+#endif
 }
 
 size_t read_private_rss_kb() {
+#if defined(_WIN32)
+  return 0;
+#else
   std::ifstream smaps("/proc/self/smaps_rollup");
   std::string line;
   size_t total = 0;
@@ -88,6 +107,7 @@ size_t read_private_rss_kb() {
     }
   }
   return total;
+#endif
 }
 
 void start_peak_tracker() {
@@ -170,12 +190,14 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::Qwen3SlimMoECausalLM>(
         cfg, generation_cfg, nntr_cfg);
     });
+#if !defined(_WIN32)
   causallm::Factory::Instance().registerModel(
     "Qwen3CachedSlimMoeForCausalLM",
     [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Qwen3CachedSlimMoECausalLM>(
         cfg, generation_cfg, nntr_cfg);
     });
+#endif
   causallm::Factory::Instance().registerModel(
     "Qwen3Embedding", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Qwen3Embedding>(cfg, generation_cfg,
@@ -186,12 +208,14 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::GptOssForCausalLM>(cfg, generation_cfg,
                                                            nntr_cfg);
     });
+#if !defined(_WIN32)
   causallm::Factory::Instance().registerModel(
     "GptOssCachedSlimCausalLM",
     [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::GptOssCachedSlimCausalLM>(
         cfg, generation_cfg, nntr_cfg);
     });
+#endif
   causallm::Factory::Instance().registerModel(
     "Gemma3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
@@ -202,11 +226,13 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::EmbeddingGemma>(cfg, generation_cfg,
                                                         nntr_cfg);
     });
+#if !defined(_WIN32) && !defined(__ANDROID__)
   causallm::Factory::Instance().registerModel(
     "MultilingualTinyBert", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::MultilingualTinyBert>(
         cfg, generation_cfg, nntr_cfg);
     });
+#endif
 
   // Validate arguments
   if (argc < 2) {

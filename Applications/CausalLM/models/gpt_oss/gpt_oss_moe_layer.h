@@ -15,6 +15,15 @@
 #define __GPT_OSS_MOE_LAYER_H__
 #ifdef __cplusplus
 
+#pragma once
+#ifndef WIN_EXPORT
+#ifdef _WIN32
+#define WIN_EXPORT __declspec(dllexport)
+#else
+#define WIN_EXPORT
+#endif
+#endif
+
 #include <acti_func.h>
 #include <causallm_common_properties.h>
 #include <common_properties.h>
@@ -26,7 +35,7 @@ namespace causallm {
  * @class   GptOssMoELayer
  * @brief   Mixture of Expert Layer
  */
-class GptOssMoELayer : public nntrainer::LayerImpl {
+class WIN_EXPORT GptOssMoELayer : public nntrainer::LayerImpl {
 public:
   /**
    * @brief     Constructor of Mixture of Expert Layer

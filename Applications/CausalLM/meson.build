@@ -43,6 +43,14 @@ endif
 
 tokenizer_dependencies = []
 tokenizer_path = meson.current_source_dir() / 'lib' / 'libtokenizers_c.a'
+tokenizer_windows_path = meson.build_root() / 'tokenizers_c_win' / 'target' / 'release' / 'tokenizers_c.lib'
+tokenizer_windows_link_args = [
+    tokenizer_windows_path,
+    'bcrypt.lib',
+    'ntdll.lib',
+    'userenv.lib',
+    'ws2_32.lib'
+]
 
 cpp_args = []
 
@@ -50,24 +58,40 @@ if get_option('default_library') == 'shared'
     cpp_args += [ '-DPLUGGABLE' ]
 endif
 
-causallm = shared_library('causallm',
-    causallm_src,
-    dependencies: [
-        nntrainer_dep,
-        nntrainer_ccapi_dep,
-        causallm_layer_dependencies, 
-        tokenizer_dependencies
-    ],
-    include_directories: causallm_inc,
-    install: true,
-    install_dir: application_install_dir,
-    link_args: [tokenizer_path],
-    cpp_args: cpp_args
-)
+if get_option('platform') == 'windows'
+    causallm = static_library('causallm',
+        causallm_src,
+        dependencies: [
+            nntrainer_dep,
+            nntrainer_ccapi_dep,
+            causallm_layer_dependencies,
+            tokenizer_dependencies
+        ],
+        include_directories: causallm_inc,
+        install: true,
+        cpp_args: cpp_args
+    )
+else
+    causallm = shared_library('causallm',
+        causallm_src,
+        dependencies: [
+            nntrainer_dep,
+            nntrainer_ccapi_dep,
+            causallm_layer_dependencies,
+            tokenizer_dependencies
+        ],
+        include_directories: causallm_inc,
+        install: true,
+        install_dir: application_install_dir,
+        link_args: [tokenizer_path],
+        cpp_args: cpp_args
+    )
+endif
 
 causallm_dep = declare_dependency(
     link_with: [causallm],
-    include_directories: causallm_inc
+    include_directories: causallm_inc,
+    link_args: get_option('platform') == 'windows' ? tokenizer_windows_link_args : []
 )
 
 e = executable('nntr_causallm',

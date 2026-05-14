@@ -23,19 +23,25 @@
 #include "causal_lm.h"
 #include "chat_template.h"
 #include "gemma3_causallm.h"
+#if !defined(_WIN32)
 #include "gptoss_cached_slim_causallm.h"
+#endif
 #include "gptoss_causallm.h"
 #include "json.hpp"
 #include "model_config_internal.h"
 #include "qwen2_causallm.h"
+#if !defined(_WIN32)
 #include "qwen3_cached_slim_moe_causallm.h"
+#endif
 #include "qwen3_causallm.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include <factory.h>
 #include <fstream>
 #include <sys/stat.h>
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 
 using json = nlohmann::json;
 
@@ -97,23 +103,27 @@ static void register_models() {
         return std::make_unique<causallm::Qwen3SlimMoECausalLM>(
           cfg, generation_cfg, nntr_cfg);
       });
+#if !defined(_WIN32)
     causallm::Factory::Instance().registerModel(
       "Qwen3CachedSlimMoeForCausalLM",
       [](json cfg, json generation_cfg, json nntr_cfg) {
         return std::make_unique<causallm::Qwen3CachedSlimMoECausalLM>(
           cfg, generation_cfg, nntr_cfg);
       });
+#endif
     causallm::Factory::Instance().registerModel(
       "GptOssForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
         return std::make_unique<causallm::GptOssForCausalLM>(
           cfg, generation_cfg, nntr_cfg);
       });
+#if !defined(_WIN32)
     causallm::Factory::Instance().registerModel(
       "GptOssCachedSlimCausalLM",
       [](json cfg, json generation_cfg, json nntr_cfg) {
         return std::make_unique<causallm::GptOssCachedSlimCausalLM>(
           cfg, generation_cfg, nntr_cfg);
       });
+#endif
     causallm::Factory::Instance().registerModel(
       "Gemma3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
         return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
@@ -563,13 +573,8 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
       input = apply_chat_template(g_architecture, input);
     }
 
-// We assume single batch request for this API
-#if defined(_WIN32)
-    g_model->run(std::wstring(input.begin(), input.end()), false, L"", L"",
-                 g_verbose);
-#else
+    // We assume single batch request for this API.
     g_model->run(input, false, "", "", g_verbose);
-#endif
 
     auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
     g_last_output = ""; // Reset last output

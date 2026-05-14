@@ -14,6 +14,15 @@
 #ifndef __EMBEDDING_NORMALIZE_LAYER_H__
 #define __EMBEDDING_NORMALIZE_LAYER_H__
 
+#pragma once
+#ifndef WIN_EXPORT
+#ifdef _WIN32
+#define WIN_EXPORT __declspec(dllexport)
+#else
+#define WIN_EXPORT
+#endif
+#endif
+
 #include <layer_impl.h>
 
 namespace causallm {
@@ -22,7 +31,7 @@ namespace causallm {
  * @class   EmbeddingNormalizeLayer
  * @brief   Embedding Normalize Layer
  */
-class EmbeddingNormalizeLayer : public nntrainer::LayerImpl {
+class WIN_EXPORT EmbeddingNormalizeLayer : public nntrainer::LayerImpl {
 public:
   /**
    * @brief     Constructor of EmbeddingNormalizeLayer

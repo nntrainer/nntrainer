@@ -69,11 +69,15 @@
 #include "causal_lm.h"
 #include "embedding_gemma.h"
 #include "gemma3_causallm.h"
+#if !defined(_WIN32)
 #include "gptoss_cached_slim_causallm.h"
+#endif
 #include "gptoss_causallm.h"
 #include "qwen2_causallm.h"
 #include "qwen2_embedding.h"
+#if !defined(_WIN32)
 #include "qwen3_cached_slim_moe_causallm.h"
+#endif
 #include "qwen3_causallm.h"
 #include "qwen3_embedding.h"
 #include "qwen3_moe_causallm.h"
@@ -233,12 +237,14 @@ void registerAllModels() {
     return std::make_unique<causallm::Qwen3SlimMoECausalLM>(cfg, generation_cfg,
                                                             nntr_cfg);
   });
+#if !defined(_WIN32)
   factory.registerModel(
     "Qwen3CachedSlimMoeForCausalLM",
     [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Qwen3CachedSlimMoECausalLM>(
         cfg, generation_cfg, nntr_cfg);
     });
+#endif
   factory.registerModel("Qwen3Embedding",
                         [](json cfg, json generation_cfg, json nntr_cfg) {
                           return std::make_unique<causallm::Qwen3Embedding>(
@@ -249,12 +255,14 @@ void registerAllModels() {
                           return std::make_unique<causallm::GptOssForCausalLM>(
                             cfg, generation_cfg, nntr_cfg);
                         });
+#if !defined(_WIN32)
   factory.registerModel(
     "GptOssCachedSlimCausalLM",
     [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::GptOssCachedSlimCausalLM>(
         cfg, generation_cfg, nntr_cfg);
     });
+#endif
   factory.registerModel("Gemma3ForCausalLM",
                         [](json cfg, json generation_cfg, json nntr_cfg) {
                           return std::make_unique<causallm::Gemma3CausalLM>(

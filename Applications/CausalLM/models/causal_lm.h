@@ -31,8 +31,8 @@
 #pragma once
 #ifdef _WIN32
 #define WIN_EXPORT __declspec(dllexport)
-#define WSTR std::wstring
-#define WCHAR_P wchar_t *
+#define WSTR std::string
+#define WCHAR_P std::string &
 #else
 #define WIN_EXPORT
 #define WSTR std::string

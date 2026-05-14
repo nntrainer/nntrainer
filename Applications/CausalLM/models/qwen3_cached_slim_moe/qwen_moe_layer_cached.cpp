@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <deque>
 #include <node_exporter.h>
 #include <qwen_moe_layer_cached.h>
 #include <stdexcept>

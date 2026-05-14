@@ -13,6 +13,15 @@
 #ifndef __EMBEDDING_POOLING_LAYER_H__
 #define __EMBEDDING_POOLING_LAYER_H__
 
+#pragma once
+#ifndef WIN_EXPORT
+#ifdef _WIN32
+#define WIN_EXPORT __declspec(dllexport)
+#else
+#define WIN_EXPORT
+#endif
+#endif
+
 #include <base_properties.h>
 #include <common_properties.h>
 #include <layer_impl.h>
@@ -114,7 +123,7 @@ public:
  * implemented. Other pooling modes are defined as properties but their logic is
  * not yet implemented.
  */
-class EmbeddingPoolingLayer : public nntrainer::LayerImpl {
+class WIN_EXPORT EmbeddingPoolingLayer : public nntrainer::LayerImpl {
 public:
   /**
    * @brief Construct a new Embedding Pooling Layer object

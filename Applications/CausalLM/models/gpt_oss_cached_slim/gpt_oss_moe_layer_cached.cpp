@@ -24,6 +24,7 @@
 #include <acti_func.h>
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <gpt_oss_moe_layer_cached.h>
 #include <node_exporter.h>
 #include <stdexcept>
