@@ -62,135 +62,120 @@ void BertTransformer::setupParameters(json &cfg, json &generation_cfg,
   Transformer::setupParameters(cfg, generation_cfg, nntr_cfg);
 }
 
-void BertTransformer::constructModel() {
+void BertTransformer::initialize() {
+  registerCustomLayers();
 
-  std::vector<LayerHandle> layers;
-
-  // create model
   model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+  model->setProperty({withKey("batch_size", BATCH_SIZE), withKey("epochs", "1"),
+                      withKey("model_tensor_type", MODEL_TENSOR_TYPE)});
 
+  auto [inputs, output] = constructBertGraph();
+  std::vector<Tensor> outputs = {output};
+  if (model->compile(inputs, outputs, ml::train::ExecutionMode::INFERENCE)) {
+    throw std::invalid_argument("Model compilation failed.");
+  }
+
+  is_initialized = true;
+}
+
+std::pair<Tensor, Tensor> BertTransformer::constructModel() {
+  auto [inputs, output] = constructBertGraph();
+  return {inputs.front(), output};
+}
+
+std::pair<std::vector<Tensor>, Tensor> BertTransformer::constructBertGraph() {
   /** --------- Inputs --------- */
-  layers.push_back(createLayer(
-    "input", {withKey("name", "input0"),
-              withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))}));
-
-  layers.push_back(createLayer(
-    "input", {withKey("name", "position_ids"),
-              withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))}));
-
-  layers.push_back(createLayer(
-    "input", {withKey("name", "token_type_ids"),
-              withKey("input_shape", "1:1:" + std::to_string(INIT_SEQ_LEN))}));
+  Tensor input({1, 1, 1, static_cast<unsigned int>(INIT_SEQ_LEN)}, "input0");
+  Tensor position_ids({1, 1, 1, static_cast<unsigned int>(INIT_SEQ_LEN)},
+                      "position_ids");
+  Tensor token_type_ids({1, 1, 1, static_cast<unsigned int>(INIT_SEQ_LEN)},
+                        "token_type_ids");
 
   /** --------- Token / Position / TokenType Embeddings --------- */
   const std::string embedding_type =
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
 
-  layers.push_back(
-    createLayer(embedding_type,
-                {withKey("name", "embedding0"), withKey("in_dim", NUM_VOCAB),
-                 withKey("weight_dtype", EMBEDDING_DTYPE),
-                 withKey("out_dim", DIM), withKey("input_layers", "input0")}));
+  LayerHandle word_embedding(createLayer(
+    embedding_type,
+    {withKey("name", "embedding0"), withKey("in_dim", NUM_VOCAB),
+     withKey("weight_dtype", EMBEDDING_DTYPE), withKey("out_dim", DIM)}));
+  Tensor word = word_embedding(input);
 
-  layers.push_back(
+  LayerHandle position_embedding(
     createLayer("embedding_layer", {withKey("name", "position_embedding"),
                                     withKey("in_dim", MAX_POSITION_EMBEDDINGS),
                                     withKey("weight_dtype", EMBEDDING_DTYPE),
-                                    withKey("out_dim", DIM),
-                                    withKey("input_layers", "position_ids")}));
+                                    withKey("out_dim", DIM)}));
+  Tensor position = position_embedding(position_ids);
 
-  layers.push_back(createLayer("embedding_layer",
-                               {withKey("name", "token_type_embedding"),
-                                withKey("in_dim", TYPE_VOCAB_SIZE),
-                                withKey("weight_dtype", EMBEDDING_DTYPE),
-                                withKey("out_dim", DIM),
-                                withKey("input_layers", "token_type_ids")}));
+  LayerHandle token_type_embedding(
+    createLayer("embedding_layer", {withKey("name", "token_type_embedding"),
+                                    withKey("in_dim", TYPE_VOCAB_SIZE),
+                                    withKey("weight_dtype", EMBEDDING_DTYPE),
+                                    withKey("out_dim", DIM)}));
+  Tensor token_type = token_type_embedding(token_type_ids);
 
-  layers.push_back(createLayer(
-    "addition",
-    {withKey("name", "embedding_sum"),
-     withKey("input_layers",
-             "embedding0,position_embedding,token_type_embedding")}));
+  LayerHandle embedding_sum(
+    createLayer("addition", {withKey("name", "embedding_sum")}));
+  Tensor h = embedding_sum({word, position, token_type});
 
-  layers.push_back(createLayer("layer_normalization",
-                               {withKey("name", "embedding_norm"),
-                                withKey("epsilon", toStringPrecise(NORM_EPS)),
-                                withKey("axis", 3), withKey("packed", "false"),
-                                withKey("input_layers", "embedding_sum")}));
+  LayerHandle embedding_norm(createLayer(
+    "layer_normalization", {withKey("name", "embedding_norm"),
+                            withKey("epsilon", toStringPrecise(NORM_EPS)),
+                            withKey("axis", 3), withKey("packed", "false")}));
+  h = embedding_norm(h);
 
   /** --------- Encoder blocks --------- */
   for (int i = 0; i < NUM_LAYERS; ++i) {
-    std::vector<LayerHandle> block;
-    if (i == 0)
-      block = createTransformerDecoderBlock(0, "embedding_norm");
-    else
-      block = createTransformerDecoderBlock(i, "layer" + std::to_string(i - 1) +
-                                                 "_ffn_norm");
-    layers.insert(layers.end(), block.begin(), block.end());
+    h = createTransformerDecoderBlock(i, h);
   }
 
-  for (auto &layer : layers) {
-    model->addLayer(layer);
-  }
+  return {{input, position_ids, token_type_ids}, h};
 }
 
-std::vector<LayerHandle>
-BertTransformer::createTransformerDecoderBlock(const int layer_id,
-                                               std::string input_name) {
-
-  std::vector<LayerHandle> layers;
+Tensor BertTransformer::createTransformerDecoderBlock(const int layer_id,
+                                                      Tensor input) {
 
   // Self-attention sub-block
-  auto att_layers = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
-                                    input_name, input_name, input_name);
-  layers.insert(layers.end(), att_layers.begin(), att_layers.end());
+  Tensor att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
+                                   input, input, input);
 
   // Residual (input + attention_out) + post LayerNorm
-  layers.push_back(createLayer(
+  LayerHandle attention_res(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_res"),
-     withKey("input_layers", input_name + ",layer" + std::to_string(layer_id) +
-                               "_attention_out")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_res")}));
+  Tensor attention_residual = attention_res({input, att_out});
 
-  layers.push_back(createLayer(
+  LayerHandle attention_norm(createLayer(
     "layer_normalization",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
      withKey("epsilon", toStringPrecise(NORM_EPS)), withKey("axis", 3),
-     withKey("packed", "false"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) + "_attention_res")}));
+     withKey("packed", "false")}));
+  Tensor attention_normed = attention_norm(attention_residual);
 
   // Feed-forward sub-block
   auto ffn_layers =
-    createMlp(layer_id, DIM, INTERMEDIATE_SIZE,
-              "layer" + std::to_string(layer_id) + "_attention_norm");
-  layers.insert(layers.end(), ffn_layers.begin(), ffn_layers.end());
+    createMlp(layer_id, DIM, INTERMEDIATE_SIZE, attention_normed);
 
   // Residual (normed + ffn_down) + post LayerNorm
-  layers.push_back(createLayer(
+  LayerHandle ffn_res(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_res"),
-     withKey("input_layers", "layer" + std::to_string(layer_id) +
-                               "_attention_norm,layer" +
-                               std::to_string(layer_id) + "_ffn_down")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_res")}));
+  Tensor ffn_residual = ffn_res({attention_normed, ffn_layers});
 
-  layers.push_back(createLayer(
+  LayerHandle ffn_norm(createLayer(
     "layer_normalization",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
      withKey("epsilon", toStringPrecise(NORM_EPS)), withKey("axis", 3),
-     withKey("packed", "false"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) + "_ffn_res")}));
+     withKey("packed", "false")}));
 
-  return layers;
+  return ffn_norm(ffn_residual);
 }
 
-std::vector<LayerHandle>
-BertTransformer::createAttention(const int layer_id, int seq_len, int n_heads,
-                                 int head_dim, std::string query_name,
-                                 std::string key_name, std::string value_name) {
+Tensor BertTransformer::createAttention(const int layer_id, int seq_len,
+                                        int n_heads, int head_dim, Tensor query,
+                                        Tensor key, Tensor value) {
 
-  std::vector<LayerHandle> layers;
   auto Q = "layer" + std::to_string(layer_id) + "_wq";
   auto K = "layer" + std::to_string(layer_id) + "_wk";
   auto V = "layer" + std::to_string(layer_id) + "_wv";
@@ -198,25 +183,25 @@ BertTransformer::createAttention(const int layer_id, int seq_len, int n_heads,
   auto O = "layer" + std::to_string(layer_id) + "_attention_out";
 
   // Q layer (bias enabled for BERT)
-  layers.push_back(createLayer(
+  LayerHandle wq(createLayer(
     "fully_connected",
     {withKey("name", Q), withKey("unit", head_dim * n_heads),
-     withKey("disable_bias", "false"), withKey("input_layers", query_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "false"), withKey("weight_initializer", "ones")}));
+  Tensor q = wq(query);
 
   // K layer (bias enabled for BERT)
-  layers.push_back(createLayer(
+  LayerHandle wk(createLayer(
     "fully_connected",
     {withKey("name", K), withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "false"), withKey("input_layers", key_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "false"), withKey("weight_initializer", "ones")}));
+  Tensor k = wk(key);
 
   // V layer (bias enabled for BERT)
-  layers.push_back(createLayer(
+  LayerHandle wv(createLayer(
     "fully_connected",
     {withKey("name", V), withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "false"), withKey("input_layers", value_name),
-     withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "false"), withKey("weight_initializer", "ones")}));
+  Tensor v = wv(value);
 
   // Attention core layer (bidirectional, no RoPE)
   std::vector<std::string> a_params = {
@@ -225,47 +210,41 @@ BertTransformer::createAttention(const int layer_id, int seq_len, int n_heads,
     withKey("num_heads_kv", n_heads / GQA_SIZE),
     withKey("max_timestep", std::to_string(INIT_SEQ_LEN)),
     withKey("rope_theta", ROPE_THETA),
-    withKey("is_causal", "false"),
-    withKey("input_layers", {Q, K, V})};
-  layers.push_back(createLayer("mha_core", a_params));
+    withKey("is_causal", "false")};
+  LayerHandle mha(createLayer("mha_core", a_params));
+  Tensor a = mha({q, k, v});
 
   // O layer (bias enabled for BERT)
-  layers.push_back(createLayer(
-    "fully_connected",
-    {withKey("name", O), withKey("unit", DIM), withKey("disable_bias", "false"),
-     withKey("input_layers", A), withKey("weight_initializer", "ones")}));
+  LayerHandle wo(
+    createLayer("fully_connected", {withKey("name", O), withKey("unit", DIM),
+                                    withKey("disable_bias", "false"),
+                                    withKey("weight_initializer", "ones")}));
 
-  return layers;
+  return wo(a);
 }
 
-std::vector<LayerHandle> BertTransformer::createMlp(const int layer_id, int dim,
-                                                    int hidden_dim,
-                                                    std::string input_name) {
-
-  std::vector<LayerHandle> layers;
-
-  layers.push_back(createLayer(
+Tensor BertTransformer::createMlp(const int layer_id, int dim, int hidden_dim,
+                                  Tensor input) {
+  LayerHandle fc1(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_fc1"),
      withKey("unit", hidden_dim), withKey("disable_bias", "false"),
-     withKey("input_layers", input_name),
      withKey("weight_initializer", "ones")}));
+  Tensor fc1_out = fc1(input);
 
-  layers.push_back(createLayer(
+  LayerHandle act(createLayer(
     "activation",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_act"),
-     withKey("activation", "gelu"),
-     withKey("input_layers",
-             "layer" + std::to_string(layer_id) + "_ffn_fc1")}));
+     withKey("activation", "gelu")}));
+  Tensor activated = act(fc1_out);
 
-  layers.push_back(createLayer(
+  LayerHandle down(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "false"),
-     withKey("input_layers", "layer" + std::to_string(layer_id) + "_ffn_act"),
      withKey("weight_initializer", "ones")}));
 
-  return layers;
+  return down(activated);
 }
 
 void BertTransformer::run(const WSTR prompt, bool do_sample,

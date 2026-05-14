@@ -16,8 +16,10 @@
 #include <engine.h>
 #include <sentence_transformer.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
+#include <utility>
 
 namespace causallm {
 
@@ -122,7 +124,9 @@ std::pair<Tensor, Tensor> SentenceTransformer::constructModel() {
             "' before any Transformer module — input tensor is undefined.");
         }
         int idx = module["idx"].get<int>();
-        h = addModule(type, idx, h);
+        std::string module_name =
+          module.contains("name") ? module["name"].get<std::string>() : "";
+        h = addModule(type, idx, module_name, h);
       } else {
         std::cerr << "Warning: Module does not have idx field, skipping: "
                   << type << std::endl;
@@ -134,6 +138,7 @@ std::pair<Tensor, Tensor> SentenceTransformer::constructModel() {
 }
 
 Tensor SentenceTransformer::addModule(const std::string &type, int idx,
+                                      const std::string &module_name,
                                       Tensor input) {
   json config;
   if (module_configs.find(idx) != module_configs.end()) {
@@ -162,6 +167,7 @@ Tensor SentenceTransformer::addModule(const std::string &type, int idx,
 
   // Convert JSON config to nntrainer property format (key=value strings)
   std::vector<std::string> props;
+  bool has_name = false;
   for (auto &el : config.items()) {
     std::string val_str;
     if (el.value().is_string())
@@ -183,13 +189,70 @@ Tensor SentenceTransformer::addModule(const std::string &type, int idx,
       }
     } else if (el.key() == "in_features") {
       // Ignore in_features as nntrainer infers it
+    } else if (el.key() == "name") {
+      has_name = true;
+      props.push_back(el.key() + "=" + val_str);
     } else {
       props.push_back(el.key() + "=" + val_str);
     }
   }
 
+  if (!has_name) {
+    const std::string layer_name =
+      module_name.empty()
+        ? "sentence_module_" + std::to_string(idx) + "_" + component
+        : module_name;
+    props.insert(props.begin(), "name=" + layer_name);
+  }
+
   LayerHandle layer(ml::train::createLayer(layer_name, props));
   return layer(input);
+}
+
+void SentenceTransformer::allocateAndBindKVCache() {
+  if (!kv_cache.isAllocated()) {
+#ifdef ENABLE_FP16
+    const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
+#else
+    const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
+#endif
+    kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
+                      static_cast<unsigned int>(MAX_SEQ_LEN),
+                      static_cast<unsigned int>(NUM_KEY_VALUE_HEADS),
+                      static_cast<unsigned int>(HEAD_DIM), cache_dtype);
+  }
+
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    auto &kc = kv_cache.getKeyCache(i);
+    auto &vc = kv_cache.getValueCache(i);
+
+    auto find_cache_placeholder = [this](const std::string &base_name) {
+      for (const auto &suffix : {":0", ":input0", ":out0", ""}) {
+        auto *tensor = model->getTensor(base_name + suffix);
+        if (tensor != nullptr)
+          return tensor;
+      }
+      return static_cast<nntrainer::Tensor *>(nullptr);
+    };
+
+    auto *kp =
+      model->getTensor("layer" + std::to_string(i) + "_attention:input3");
+    auto *vp =
+      model->getTensor("layer" + std::to_string(i) + "_attention:input4");
+    if (kp == nullptr)
+      kp = find_cache_placeholder("cache_k_l" + std::to_string(i));
+    if (vp == nullptr)
+      vp = find_cache_placeholder("cache_v_l" + std::to_string(i));
+
+    if (kp == nullptr || vp == nullptr) {
+      throw std::runtime_error(
+        "SentenceTransformer: KV cache placeholder not found for layer " +
+        std::to_string(i));
+    }
+
+    kp->setData(kc.getMemoryData(), kc.getOffset(), false);
+    vp->setData(vc.getMemoryData(), vc.getOffset(), false);
+  }
 }
 
 void SentenceTransformer::run(const WSTR prompt, bool do_sample,
@@ -235,14 +298,8 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
       "initialize() before encode().");
   }
 
-#if defined(_WIN32)
-  std::wstring prompt_ = system_prompt + prompt + tail_prompt;
-  std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-  auto _input = tokenizer->Encode(converter.to_bytes(prompt_), true);
-#else
   std::string prompt_ = system_prompt + prompt + tail_prompt;
   auto _input = tokenizer->Encode(prompt_, true);
-#endif
 
   std::vector<int64_t> init_input;
   unsigned int input_len =
@@ -252,8 +309,8 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
   for (unsigned int i = 0; i < input_len; ++i)
     init_input.push_back(_input[i]);
 
-  float *input_sample =
-    (float *)malloc(sizeof(float) * BATCH_SIZE * MAX_SEQ_LEN);
+  std::vector<float> input_sample(static_cast<size_t>(BATCH_SIZE) * MAX_SEQ_LEN,
+                                  0.0f);
 
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
     for (unsigned int i = 0; i < input_len; ++i) {
@@ -263,9 +320,35 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
   }
 
   std::vector<float *> input;
-  input.push_back(input_sample);
+  input.push_back(input_sample.data());
 
   std::vector<float *> label; // Empty label for inference
+
+  allocateAndBindKVCache();
+  auto build_inference_inputs = [&]() {
+    std::vector<std::pair<std::string, float *>> cache_inputs;
+    cache_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
+    for (int i = 0; i < NUM_LAYERS; ++i) {
+      cache_inputs.emplace_back(
+        "cache_k_l" + std::to_string(i),
+        reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
+      cache_inputs.emplace_back(
+        "cache_v_l" + std::to_string(i),
+        reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
+    }
+
+    std::sort(
+      cache_inputs.begin(), cache_inputs.end(),
+      [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+
+    std::vector<float *> inference_inputs;
+    inference_inputs.reserve(1 + cache_inputs.size());
+    inference_inputs.push_back(input_sample.data());
+    for (const auto &cache_input : cache_inputs)
+      inference_inputs.push_back(cache_input.second);
+    return inference_inputs;
+  };
+  input = build_inference_inputs();
 
   // Run incremental inference for the prefill stage
   // start: 0, end: input_len (process all tokens at once)
@@ -273,8 +356,6 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
   // embeddings.
   std::vector<float *> output = model->incremental_inference(
     BATCH_SIZE, input, label, input_len, 0, input_len, false);
-
-  free(input_sample);
 
   return output;
 }

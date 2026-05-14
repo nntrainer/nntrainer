@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <kv_cache_manager.h>
 #include <map>
 #include <transformer.h>
 
@@ -90,7 +91,8 @@ protected:
    * @return the module's output tensor (or @p input unchanged if the type
    *         cannot be mapped, so the chain continues)
    */
-  Tensor addModule(const std::string &type, int idx, Tensor input);
+  Tensor addModule(const std::string &type, int idx,
+                   const std::string &module_name, Tensor input);
 
   /**
    * @brief register CustomLayers
@@ -98,6 +100,14 @@ protected:
   void registerCustomLayers() override;
 
 private:
+  /**
+   * @brief Allocate and bind external KV cache placeholders for attention
+   * layers.
+   */
+  void allocateAndBindKVCache();
+
+  KVCacheManager kv_cache;
+
   /**
    * @brief Module metadata list (from modules.json)
    */

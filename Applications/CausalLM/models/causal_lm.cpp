@@ -23,10 +23,13 @@
 #include <algorithm>
 #include <app_context.h>
 #include <cmath>
+#include <cstdlib>
 #include <engine.h>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #include <common.h>
@@ -103,37 +106,55 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
 }
 
 void CausalLM::allocateAndBindKVCache() {
-  if (kv_cache.isAllocated())
-    return;
-
+  if (!kv_cache.isAllocated()) {
     // dtype matches mha_core's internal cache choice (kept consistent so
     // saved caches stay binary-compatible across the 3-input/5-input modes).
 #ifdef ENABLE_FP16
-  const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
+    const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
+#elif defined(_WIN32)
+    // Qwen3 generation currently produces invalid tokens on Windows with the
+    // UINT16 KV cache path. Keep the host-side cache in FP32 on Windows until
+    // that path is fixed.
+    const auto cache_dtype = ml::train::TensorDim::DataType::FP32;
 #else
-  const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
+    const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
 #endif
 
-  const unsigned int max_timestep =
-    static_cast<unsigned int>(INIT_SEQ_LEN + NUM_TO_GENERATE);
+    const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
 
-  kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
-                    max_timestep,
-                    static_cast<unsigned int>(NUM_KEY_VALUE_HEADS),
-                    static_cast<unsigned int>(HEAD_DIM), cache_dtype);
+    kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
+                      max_timestep,
+                      static_cast<unsigned int>(NUM_KEY_VALUE_HEADS),
+                      static_cast<unsigned int>(HEAD_DIM), cache_dtype);
+  }
 
   // Bind each (layer, K|V) buffer into the corresponding input layer
   // declared by Transformer::createKVCachePlaceholders(). The names here
   // must match what createKVCachePlaceholders() registers with the model.
-  // We look up each placeholder by name and point it at our cache slab —
+  // We look up each placeholder by name and point it at our cache slab;
   // this is the same wiring Model::setExternalTensors used to do, just
   // without going through that API.
   for (int i = 0; i < NUM_LAYERS; ++i) {
     auto &kc = kv_cache.getKeyCache(i);
     auto &vc = kv_cache.getValueCache(i);
 
-    auto *kp = model->getTensor("cache_k_l" + std::to_string(i));
-    auto *vp = model->getTensor("cache_v_l" + std::to_string(i));
+    auto find_cache_placeholder = [this](const std::string &base_name) {
+      for (const auto &suffix : {":0", ":input0", ":out0", ""}) {
+        auto *tensor = model->getTensor(base_name + suffix);
+        if (tensor != nullptr)
+          return tensor;
+      }
+      return static_cast<nntrainer::Tensor *>(nullptr);
+    };
+
+    auto *kp =
+      model->getTensor("layer" + std::to_string(i) + "_attention:input3");
+    auto *vp =
+      model->getTensor("layer" + std::to_string(i) + "_attention:input4");
+    if (kp == nullptr)
+      kp = find_cache_placeholder("cache_k_l" + std::to_string(i));
+    if (vp == nullptr)
+      vp = find_cache_placeholder("cache_v_l" + std::to_string(i));
     NNTR_THROW_IF(kp == nullptr || vp == nullptr, std::runtime_error)
       << "allocateAndBindKVCache: cache_k_l" << i << " / cache_v_l" << i
       << " input placeholder not found in compiled graph";
@@ -145,6 +166,12 @@ void CausalLM::allocateAndBindKVCache() {
 
 void CausalLM::setKVCachePosition(unsigned int pos) {
   kv_cache.setPosition(pos);
+#if defined(_WIN32)
+  if (pos == 0)
+    return;
+  throw std::runtime_error(
+    "loading a non-zero KV cache position is not supported on Windows yet");
+#endif
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [pos](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
       if (l.getType() == causallm::MHACoreLayer::type)
@@ -195,6 +222,10 @@ void CausalLM::registerOutputs(
       ids_history[b * MAX_SEQ_LEN + pos] = ids[b];
       std::string decoded_str = tokenizer->Decode(pending_ids_);
 
+      if (decoded_str.empty()) {
+        continue;
+      }
+
       if (std::find(puncts.begin(), puncts.end(), decoded_str.back()) !=
           puncts.end()) {
         // last symbol is a punctuation, hold on
@@ -203,13 +234,8 @@ void CausalLM::registerOutputs(
         // ends with an incomplete token, hold on
       } else {
         if (log_output) {
-#if defined(_WIN32)
-          std::wcout << L"" << utf8_to_wstring(decoded_str);
-          std::wcout.flush();
-#else
           std::cout << decoded_str;
           std::cout.flush();
-#endif
         }
         output_list[b].append(decoded_str);
         pending_ids_.clear();
@@ -314,11 +340,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   }
 
   // Allocate the host-owned KV cache and bind it to mha_core's external cache
-  // input slots. Idempotent — only the first call does work; subsequent runs
-  // reuse the same buffers and reset write position from the load_kvcache /
-  // setKVCachePosition call below.
+  // input slots. Idempotent: only the first call does work; subsequent runs
+  // reuse the same buffers and continue from the computed absolute token
+  // position below.
   allocateAndBindKVCache();
-  setKVCachePosition(0);
 
   has_run_ = false;
 
@@ -352,15 +377,6 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   SAVE_KVCACHE = (USE_KVCACHE && system_prompt != "" &&
                   !std::filesystem::exists(PRE_COMPUTED_CACHE_PATH));
 
-#if defined(_WIN32)
-  if (log_output)
-    std::wcout << L"" << system_prompt << L"" << text_ << std::endl;
-  std::wstring prompt_ = prompt;
-  if (!SAVE_KVCACHE)
-    prompt_ += TAIL_PROMPT;
-  std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-  auto _input = tokenizer->Encode(converter.to_bytes(prompt_));
-#else
   // print input text
   if (log_output)
     std::cout << system_prompt << prompt << tail_prompt << std::endl;
@@ -380,7 +396,6 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   auto _input = tokenizer->Encode(prompt_);
   ///@note insert bos token at the beginning of the input
   // _input.insert(_input.begin(), BOS_TOKEN_ID);
-#endif
 
   // | <------------------- MAX_SEQ_LEN -------------------> |
   //                       ||             ||
@@ -425,6 +440,30 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    */
   std::vector<int64_t> token_ids;
   input.push_back(input_sample);
+  auto build_inference_inputs = [&]() {
+    std::vector<std::pair<std::string, float *>> cache_inputs;
+    cache_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
+    for (int i = 0; i < NUM_LAYERS; ++i) {
+      cache_inputs.emplace_back(
+        "cache_k_l" + std::to_string(i),
+        reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
+      cache_inputs.emplace_back(
+        "cache_v_l" + std::to_string(i),
+        reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
+    }
+
+    std::sort(
+      cache_inputs.begin(), cache_inputs.end(),
+      [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+
+    std::vector<float *> inference_inputs;
+    inference_inputs.reserve(1 + cache_inputs.size());
+    inference_inputs.push_back(input_sample);
+    for (const auto &cache_input : cache_inputs)
+      inference_inputs.push_back(cache_input.second);
+    return inference_inputs;
+  };
+  input = build_inference_inputs();
 
   ///@note contains possible bug
   // std::vector<ml::train::TensorDim> input_dims;
@@ -450,9 +489,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     if (log_output)
       std::cout << "\n==============[KV CACHE SAVE MODE]================\n";
+    allocateAndBindKVCache();
+    setKVCachePosition(0);
     output = model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                          0 + global_token_len,
-                                          input_len + global_token_len, false);
+                                          0, input_len, false);
 
     SYS_PROMP_LEN = input_len;
     save_kvcache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
@@ -474,13 +514,16 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   } else {
     SYS_PROMP_LEN = 0;
   }
+  allocateAndBindKVCache();
+  const unsigned int prefill_from = SYS_PROMP_LEN + global_token_len;
+  const unsigned int prefill_to = prefill_from + input_len;
+  setKVCachePosition(prefill_from);
   output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
-                                        SYS_PROMP_LEN,
-                                        SYS_PROMP_LEN + input_len, false);
+                                        prefill_from, prefill_to, false);
 
   // post process of model output
-  std::vector<unsigned int> id_list(generate_multi_tokens(
-    output[0], NUM_VOCAB, BATCH_SIZE, 1, ids_history, _len));
+  std::vector<unsigned int> id_list(
+    generate(output[0], do_sample, 1, ids_history, _len));
 
   if (init_len < INIT_SEQ_LEN)
     registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
@@ -511,6 +554,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
        token_generation_idx < input_len + 1 + NUM_TO_GENERATE;
        ++token_generation_idx) {
 
+    allocateAndBindKVCache();
     auto output_interval =
       model->incremental_inference(BATCH_SIZE, input, label, input_len,
                                    token_generation_idx - 1 + global_token_len,

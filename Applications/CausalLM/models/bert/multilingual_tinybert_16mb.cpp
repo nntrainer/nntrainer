@@ -35,14 +35,8 @@ std::vector<float *> MultilingualTinyBert::encode(const WSTR prompt,
       "initialize() before encode().");
   }
 
-#if defined(_WIN32)
-  std::wstring prompt_ = system_prompt + prompt + tail_prompt;
-  std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
-  auto tokenized = tokenizer->Encode(converter.to_bytes(prompt_), true);
-#else
   std::string prompt_ = system_prompt + prompt + tail_prompt;
   auto tokenized = tokenizer->Encode(prompt_, true);
-#endif
 
   unsigned int input_len =
     std::min(static_cast<unsigned int>(tokenized.size()), INIT_SEQ_LEN);

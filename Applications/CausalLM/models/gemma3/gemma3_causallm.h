@@ -68,7 +68,8 @@ public:
 
   Gemma3CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
     Transformer(sanitizeConfig(cfg),
-                sanitizeGenerationConfig(generation_cfg, cfg), nntr_cfg),
+                sanitizeGenerationConfig(generation_cfg, cfg), nntr_cfg,
+                ModelType::CAUSALLM),
     CausalLM(sanitizeConfig(cfg), sanitizeGenerationConfig(generation_cfg, cfg),
              nntr_cfg),
     Gemma3Transformer(sanitizeConfig(cfg),

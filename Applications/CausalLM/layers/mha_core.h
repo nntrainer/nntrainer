@@ -421,11 +421,12 @@ private:
    * @param[out] out output tensor
    * @param[in] dim hidden dim size
    * @param[in] from sequence order
-   * @param[in] convert_only - conversion only
+   * @param[in] apply_rope true to apply rotary embedding, false to only store
+   *                       the tensor into the cache dtype
    */
   void apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
                                   unsigned int dim, unsigned int from,
-                                  bool convert_only = false);
+                                  bool apply_rope = true);
 
   template <typename BType>
   void compute(const float *A, const BType *B, float *output, int num_rows,

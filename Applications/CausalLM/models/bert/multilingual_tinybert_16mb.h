@@ -47,7 +47,9 @@ public:
     BertTransformer::setupParameters(cfg, generation_cfg, nntr_cfg);
   }
 
-  void constructModel() override { BertTransformer::constructModel(); }
+  std::pair<Tensor, Tensor> constructModel() override {
+    return BertTransformer::constructModel();
+  }
 
   void registerCustomLayers() override {
     BertTransformer::registerCustomLayers();
