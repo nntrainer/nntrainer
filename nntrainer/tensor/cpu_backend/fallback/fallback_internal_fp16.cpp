@@ -497,8 +497,22 @@ template <>
 void __fallback_rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
                                                   _FP16 *__restrict Y, size_t H,
                                                   size_t W, float epsilon) {
-  throw std::runtime_error(
-    "NYI : __fallback_rms_norm_wrt_width_fp16_intrinsic");
+  for (size_t h = 0; h < H; ++h) {
+    const _FP16 *row_x = X + h * W;
+    _FP16 *row_y = Y + h * W;
+
+    float ss = 0.0f;
+    for (size_t w = 0; w < W; ++w) {
+      const float x = static_cast<float>(row_x[w]);
+      ss += x * x;
+    }
+
+    const float inv_rms =
+      1.0f / std::sqrt(ss / static_cast<float>(W) + epsilon);
+    for (size_t w = 0; w < W; ++w) {
+      row_y[w] = static_cast<_FP16>(static_cast<float>(row_x[w]) * inv_rms);
+    }
+  }
 }
 
 template <>
