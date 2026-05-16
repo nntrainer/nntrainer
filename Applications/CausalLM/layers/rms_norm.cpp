@@ -12,6 +12,7 @@
  */
 
 #include <cmath>
+#include <cpu_backend.h>
 #include <iostream>
 
 #include "rms_norm.h"
@@ -66,9 +67,19 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen(), true);
 
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-      auto t = in_step.multiply(in_step).average(3).add(epsilon);
-      t.inv_sqrt_i();
-      in_step.multiply(t, out_step);
+      const auto &dim = in_step.getDim();
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+        in_step.getData<float>(), out_step.getData<float>(),
+        dim.getDataLen() / dim.width(), dim.width(), epsilon);
+    } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+      const auto &dim = in_step.getDim();
+      nntrainer::rms_norm_wrt_width_fp16_intrinsic(
+        in_step.getData<_FP16>(), out_step.getData<_FP16>(),
+        dim.getDataLen() / dim.width(), dim.width(), epsilon);
+#else
+      throw std::invalid_argument("Error: enable-fp16 is not set");
+#endif
     } else {
       throw std::invalid_argument(
         "Error: not yet implemented for this data type");
