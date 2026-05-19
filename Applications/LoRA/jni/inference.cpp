@@ -146,6 +146,8 @@ int main(int argc, char **argv) {
   std::string images_path = "train-images-idx3-ubyte";
   std::string labels_path = "train-labels-idx1-ubyte";
   std::string model_path = "mnist_model.bin";
+  std::string lora_path =
+    ""; // Optional MODEL_FORMAT_LORA_BIN file with adapter weights
   unsigned int lora_rank = 16; // Default LoRA rank
   float lora_alpha = 1.0f;     // Default LoRA alpha
   if (argc >= 3) {
@@ -155,11 +157,16 @@ int main(int argc, char **argv) {
   if (argc >= 4) {
     model_path = argv[3];
   }
+  if (argc >= 5) {
+    lora_path = argv[4];
+  }
 
   std::cout << "\nConfiguration:" << std::endl;
   std::cout << "  Images: " << images_path << std::endl;
   std::cout << "  Labels: " << labels_path << std::endl;
   std::cout << "  Model Path: " << model_path << std::endl;
+  std::cout << "  LoRA Path: " << (lora_path.empty() ? "(none)" : lora_path)
+            << std::endl;
 
   // Load MNIST dataset or generate fake data for testing
   std::vector<float> images, labels;
@@ -222,7 +229,8 @@ int main(int argc, char **argv) {
 
   // Load the trained model AFTER initialization
   try {
-    model->load(model_path, ml::train::ModelFormat::MODEL_FORMAT_BIN, "/workspace/nntrainer_korea/nntrainer/Applications/LoRA/lora_1.bin");
+    model->load(model_path, ml::train::ModelFormat::MODEL_FORMAT_BIN,
+                lora_path);
     std::cout << "Model loaded from " << model_path << std::endl;
   } catch (const std::exception &e) {
     std::cerr << "Error loading model: " << e.what() << std::endl;
