@@ -16,6 +16,7 @@
 
 #include <neuralnet.h>
 #include <stdexcept>
+#include <vector>
 
 /**
  * @brief Simple fixed-pattern data generator used by gradient checkpointing
@@ -29,12 +30,16 @@ public:
     num_batches(_num_batches),
     current_batch(0) {
 
+    const auto data_size =
+      static_cast<std::vector<float>::size_type>(batch_size) *
+      static_cast<std::vector<float>::size_type>(seq_len);
+
     // Allocate memory for input and label
-    input_data.resize(batch_size * seq_len);
-    label_data.resize(batch_size * seq_len);
+    input_data.resize(data_size);
+    label_data.resize(data_size);
 
     // Initialize with simple pattern
-    for (int i = 0; i < batch_size * seq_len; i++) {
+    for (std::vector<float>::size_type i = 0; i < data_size; i++) {
       input_data[i] = static_cast<float>(i % 10) / 10.0f;
       label_data[i] = static_cast<float>((i + 1) % 10) / 10.0f;
     }
