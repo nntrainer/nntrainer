@@ -116,7 +116,7 @@ void NetworkGraph::setExecutionOrder() {
        iter++) {
     auto &node = *iter;
     auto order_idx = getBackwardingEndIter() - iter - 1;
-    auto forward_order = order_idx;
+    const unsigned int forward_order = static_cast<unsigned int>(order_idx);
 
     if (node->isCheckpointed()) {
       const std::string &block_id = node->getCheckpointBlockId();
