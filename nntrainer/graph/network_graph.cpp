@@ -662,9 +662,9 @@ LayerNode *NetworkGraph::computeBackwardEnd() {
     int cur_order = std::get<0>(exec_order);
     if (ln->needsCalcDerivative() || ln->needsCalcGradient()) {
 #ifdef ENABLE_TEST
-      cur_order = std::get<3>(exec_order);
+      cur_order = std::get<4>(exec_order);
 #else
-      cur_order = std::get<2>(exec_order);
+      cur_order = std::get<3>(exec_order);
 #endif
     }
 
@@ -1883,8 +1883,8 @@ int NetworkGraph::reinitialize(
   for (unsigned int idx = 0; idx < graph.size(); ++idx) {
     auto const &lnode = getSortedLayerNode(idx);
     auto &rc = lnode->getRunContext();
-    auto first_grad_access = std::get<1>(lnode->getExecutionOrder());
-    auto last_grad_access = std::get<3>(lnode->getExecutionOrder());
+    auto first_grad_access = std::get<2>(lnode->getExecutionOrder());
+    auto last_grad_access = std::get<4>(lnode->getExecutionOrder());
     for (unsigned i = 0; i < rc.getNumWeights(); ++i) {
       if (!rc.weightHasGradient(i)) {
         /// @todo this is duck taping that MUST BE REMOVED. We will need to

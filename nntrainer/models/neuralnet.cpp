@@ -536,7 +536,7 @@ void NeuralNetwork::backwarding(int iteration,
      * 4. gradientClippingOnLastAccess
      */
 
-    model_graph.flushCacheExcept(std::get<1>(node->getExecutionOrder()));
+    model_graph.flushCacheExcept(std::get<2>(node->getExecutionOrder()));
     PROFILE_MEM_ANNOTATE("CalcGradient: " + node->getName());
 
     bool apply_gradient = true;
@@ -575,7 +575,7 @@ void NeuralNetwork::backwarding(int iteration,
       }
     }
 
-    model_graph.flushCacheExcept(std::get<2>(node->getExecutionOrder()));
+    model_graph.flushCacheExcept(std::get<3>(node->getExecutionOrder()));
     PROFILE_MEM_ANNOTATE("CalcDerivative: " + node->getName());
 
     if (stop_cb(userdata)) {
@@ -586,7 +586,7 @@ void NeuralNetwork::backwarding(int iteration,
       node->calcDerivative();
     }
 
-    model_graph.flushCacheExcept(std::get<3>(node->getExecutionOrder()));
+    model_graph.flushCacheExcept(std::get<4>(node->getExecutionOrder()));
     PROFILE_MEM_ANNOTATE("ApplyGradient: " + node->getName());
 
     if (apply_gradient) {
