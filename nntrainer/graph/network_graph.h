@@ -21,8 +21,8 @@
 #include <stack>
 #include <vector>
 
-#include <engine.h>
 #include <checkpoint_block.h>
+#include <engine.h>
 #include <graph_core.h>
 #include <layer_node.h>
 #include <manager.h>

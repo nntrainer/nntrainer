@@ -108,7 +108,7 @@ int addCheckpointBlock(const std::vector<std::string> &layer_names);
 
 ### How It Works
 
-1. **Forward Pass**: 
+1. **Forward Pass**:
    - First layer input is saved with `FORWARD_GRAD_LIFESPAN | RECOMPUTE`
    - Intermediate activations use `CALC_GRAD_DERIV_LIFESPAN | RECOMPUTE` (discarded after forward)
    - Last layer output is saved with `FORWARD_GRAD_LIFESPAN | RECOMPUTE`
@@ -134,20 +134,20 @@ auto model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
 // Add transformer layers
 for (int i = 0; i < num_layers; i++) {
     std::string prefix = "layer" + std::to_string(i);
-    
-    model->addLayer(createLayer("multi_head_attention", 
+
+    model->addLayer(createLayer("multi_head_attention",
         {"name=" + prefix + "_attn", "num_heads=8"}));
-    model->addLayer(createLayer("layer_normalization", 
+    model->addLayer(createLayer("layer_normalization",
         {"name=" + prefix + "_ln1"}));
-    model->addLayer(createLayer("fully_connected", 
+    model->addLayer(createLayer("fully_connected",
         {"name=" + prefix + "_ffn1", "unit=2048"}));
-    model->addLayer(createLayer("activation", 
+    model->addLayer(createLayer("activation",
         {"name=" + prefix + "_act", "activation=gelu"}));
-    model->addLayer(createLayer("fully_connected", 
+    model->addLayer(createLayer("fully_connected",
         {"name=" + prefix + "_ffn2", "unit=512"}));
-    model->addLayer(createLayer("layer_normalization", 
+    model->addLayer(createLayer("layer_normalization",
         {"name=" + prefix + "_ln2"}));
-    
+
     // Checkpoint each transformer block
     model->addCheckpointBlock({
         prefix + "_attn", prefix + "_ln1",
