@@ -204,7 +204,7 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   }
 
   // Apply checkpoint blocks before compile
-  if (!checkpoint_blocks.empty()) {
+  if (!checkpoint_blocks.empty() && mode != ExecutionMode::INFERENCE) {
     model_graph.applyCheckpointBlocks(checkpoint_blocks);
   }
 
@@ -1530,6 +1530,7 @@ void swap(NeuralNetwork &lhs, NeuralNetwork &rhs) {
     swap(lhs.initialized, rhs.initialized);
     swap(lhs.model_graph, rhs.model_graph);
     swap(lhs.graph_representation, rhs.graph_representation);
+    swap(lhs.checkpoint_blocks, rhs.checkpoint_blocks);
     swap(lhs.compiled, rhs.compiled);
     swap(lhs.loadedFromConfig, rhs.loadedFromConfig);
   }
@@ -1551,8 +1552,8 @@ int NeuralNetwork::addLayer(NodeType layer) {
 
 int NeuralNetwork::addCheckpointBlock(
   const std::vector<std::string> &layer_names) {
-  if (initialized) {
-    ml_loge("Cannot add checkpoint block after initialization");
+  if (compiled || initialized) {
+    ml_loge("Cannot add checkpoint block after compilation or initialization");
     return ML_ERROR_NOT_SUPPORTED;
   }
 
@@ -1584,6 +1585,7 @@ NeuralNetwork &NeuralNetwork::copyConfiguration(NeuralNetwork &from) {
     model_flex_props = from.model_flex_props;
     loss = from.loss;
     opt = from.opt;
+    checkpoint_blocks = from.checkpoint_blocks;
 
     NetworkGraph f_graph = from.getNetworkGraph();
     for (auto &l_node : f_graph.getLayerNodes()) {

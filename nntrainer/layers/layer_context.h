@@ -15,6 +15,7 @@
 #ifndef __LAYER_CONTEXT_H__
 #define __LAYER_CONTEXT_H__
 
+#include <map>
 #include <memory>
 #include <vector>
 

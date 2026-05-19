@@ -2166,13 +2166,23 @@ void NetworkGraph::applyCheckpointBlocks(
       }
     }
 
-    // BFS to verify all layers are reachable from start layers
-    // Start layers: layers whose inputs are all from outside the block
-    // End layers: layers whose outputs are all to outside the block
-    std::set<std::string> reachable_layers;
+    // Build reverse connection map (output -> inputs) from input connections.
+    // Output connections are not set before NetworkGraph::compile().
+    std::map<std::string, std::set<std::string>> reverse_connections;
+    for (const auto &layer_name : layer_names) {
+      auto layer_node = getLayerNode(layer_name);
+      const auto &input_connections = layer_node->getInputConnections();
+      for (const auto &input : input_connections) {
+        if (block_layer_set.find(input) != block_layer_set.end()) {
+          reverse_connections[input].insert(layer_name);
+        }
+      }
+    }
+
+    // Start layers: layers whose inputs are all from outside the block.
+    // End layers: layers whose outputs are all to outside the block.
     std::set<std::string> start_layers;
     std::set<std::string> end_layers;
-    std::queue<std::string> to_visit;
 
     for (const auto &layer_name : layer_names) {
       auto layer_node = getLayerNode(layer_name);
@@ -2187,21 +2197,10 @@ void NetworkGraph::applyCheckpointBlocks(
         }
       }
       if (!has_internal_input) {
-        to_visit.push(layer_name);
-        reachable_layers.insert(layer_name);
         start_layers.insert(layer_name);
       }
 
-      // Check if this is an end layer (no internal outputs)
-      const auto &output_connections = layer_node->getOutputConnections();
-      bool has_internal_output = false;
-      for (const auto &output : output_connections) {
-        if (block_layer_set.find(output) != block_layer_set.end()) {
-          has_internal_output = true;
-          break;
-        }
-      }
-      if (!has_internal_output) {
+      if (reverse_connections.find(layer_name) == reverse_connections.end()) {
         end_layers.insert(layer_name);
       }
     }
@@ -2210,19 +2209,6 @@ void NetworkGraph::applyCheckpointBlocks(
       throw std::invalid_argument(
         "Checkpoint block '" + block_id +
         "': Could not find a start layer (cycle detected or invalid block)");
-    }
-
-    // Build reverse connection map (output -> inputs) from input connections
-    // This is needed because output connections are not set before compile()
-    std::map<std::string, std::set<std::string>> reverse_connections;
-    for (const auto &layer_name : layer_names) {
-      auto layer_node = getLayerNode(layer_name);
-      const auto &input_connections = layer_node->getInputConnections();
-      for (const auto &input : input_connections) {
-        if (block_layer_set.find(input) != block_layer_set.end()) {
-          reverse_connections[input].insert(layer_name);
-        }
-      }
     }
 
     // Verify that all layers form a single connected subgraph
