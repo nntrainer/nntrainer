@@ -642,9 +642,30 @@ bool RunLayerContext::validate(bool skip_input, bool skip_label) {
 #ifdef DEBUG
   std::function<bool(const Var_Grad *, bool)> matcher;
 
-  if (tensor_map.empty() || !tensor_map[inputs[0]->getName()]) {
+  const auto &active_inputs =
+    is_initial_forward && !initial_inputs.empty() ? initial_inputs : inputs;
+  const auto &active_outputs =
+    is_initial_forward && !initial_outputs.empty() ? initial_outputs : outputs;
+  const auto &active_tensors =
+    is_initial_forward && !initial_tensors.empty() ? initial_tensors : tensors;
+
+  auto has_tensor_record = [this](const auto &vec) {
+    return vec.empty() || vec[0] == nullptr ||
+           tensor_map.find(vec[0]->getName()) != tensor_map.end();
+  };
+
+  const bool needs_initial_records =
+    is_initial_forward &&
+    (!has_tensor_record(active_inputs) || !has_tensor_record(active_outputs) ||
+     !has_tensor_record(active_tensors));
+
+  if (tensor_map.empty() || !tensor_map[inputs[0]->getName()] ||
+      needs_initial_records) {
     auto filler = [this](const auto &vec) {
       for (auto const &val : vec) {
+        if (val == nullptr)
+          continue;
+
         if (val->getVariableRef().getTensorType().data_type ==
             TensorDim::DataType::FP32) {
           tensor_map[val->getName()] = val->getVariableRef().getData();
@@ -673,9 +694,15 @@ bool RunLayerContext::validate(bool skip_input, bool skip_label) {
     filler(inputs);
     filler(outputs);
     filler(tensors);
+    filler(initial_inputs);
+    filler(initial_outputs);
+    filler(initial_tensors);
   }
 
   matcher = [this](const Var_Grad *val, bool skip_grad) -> bool {
+    if (val == nullptr)
+      return true;
+
     if (val->getName().empty() ||
         (val->hasGradient() && val->getGradientName().empty()))
       return false;
@@ -706,10 +733,10 @@ bool RunLayerContext::validate(bool skip_input, bool skip_label) {
   };
 
   /** match the tensor map from the next validations */
-  ret =
-    matcher_w(weights) & matcher_vw(tensors) & matcher_vw(outputs, skip_label);
+  ret = matcher_w(weights) & matcher_vw(active_tensors) &
+        matcher_vw(active_outputs, skip_label);
   if (!skip_input)
-    ret &= matcher_vw(inputs);
+    ret &= matcher_vw(active_inputs);
 #endif
 
   return ret;

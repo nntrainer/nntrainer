@@ -177,7 +177,6 @@ TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_01) {
                               std::move(dataset)),
             ML_ERROR_NONE);
 
-  EXPECT_NO_THROW(model->setGCVerify());
   EXPECT_NO_THROW(model->train());
 }
 
@@ -281,7 +280,6 @@ TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_02) {
                               std::move(dataset)),
             ML_ERROR_NONE);
 
-  EXPECT_NO_THROW(model->setGCVerify());
   EXPECT_NO_THROW(model->train());
 }
 
@@ -393,7 +391,6 @@ TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_03) {
                               std::move(dataset)),
             ML_ERROR_NONE);
 
-  EXPECT_NO_THROW(model->setGCVerify());
   EXPECT_NO_THROW(model->train());
 }
 

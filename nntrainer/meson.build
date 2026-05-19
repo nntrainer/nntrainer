@@ -41,10 +41,6 @@ if get_option('platform') == 'tizen'
   nntrainer_base_deps += dependency('dlog')
 endif
 
-if get_option('enable-test')
-  nntrainer_base_deps += gtest_dep
-endif
-
 nntrainer_elements = [
   'compiler',
   'schema',

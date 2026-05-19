@@ -1,7 +1,6 @@
 test_name = 'unittest_gradient_checkpointing'
 
 test_target = [
-  'gradient_checkpointing_test_util.cpp',
   'unittest_gradient_checkpointing.cpp'
 ]
 

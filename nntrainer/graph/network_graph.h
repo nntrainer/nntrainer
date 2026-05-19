@@ -28,10 +28,6 @@
 #include <manager.h>
 #include <tensor.h>
 
-#ifdef ENABLE_TEST
-#include <gradient_checkpointing_test_util.h>
-#endif
-
 namespace nntrainer {
 using ExecutionMode = ml::train::ExecutionMode;
 
@@ -60,9 +56,6 @@ public:
     is_clip_grad(false),
     loss_scale(1.0f) {
     nan_count = 0;
-#ifdef ENABLE_TEST
-    gc_verify = false;
-#endif
   }
 
   /**
@@ -100,9 +93,6 @@ public:
     is_clip_grad(false),
     loss_scale(1.0f) {
     nan_count = 0;
-#ifdef ENABLE_TEST
-    gc_verify = false;
-#endif
   }
 
   /**
@@ -603,13 +593,6 @@ public:
     }
   }
 
-#ifdef ENABLE_TEST
-  /**
-   * @brief Enable gradient checkpointing verification hooks for tests.
-   */
-  void setGCVerify() { gc_verify = true; }
-#endif
-
 private:
   std::map<std::string, std::string> sub_in_out; /** This is map to identify
                  input and output layer name of subgraph */
@@ -651,12 +634,6 @@ private:
   bool is_clip_grad;
   float loss_scale;
   unsigned int nan_count;
-
-#ifdef ENABLE_TEST
-  GradientCheckpointingVerifier gc_verifier;
-
-  bool gc_verify;
-#endif
 
   /**
    * @brief     topological sort

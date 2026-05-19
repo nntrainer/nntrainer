@@ -506,10 +506,6 @@ public:
    */
   virtual void exports(const ExportMethods &method,
                        const std::string file_path) = 0;
-
-#ifdef ENABLE_TEST
-  virtual void setGCVerify() = 0;
-#endif
 };
 
 /**

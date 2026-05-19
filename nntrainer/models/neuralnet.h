@@ -665,10 +665,6 @@ public:
   void exports(const ml::train::ExportMethods &method,
                const std::string file_path) override;
 
-#ifdef ENABLE_TEST
-  void setGCVerify() override { model_graph.setGCVerify(); }
-#endif
-
 private:
   using FlexiblePropTypes =
     std::tuple<props::Epochs, props::TrainingBatchSize, props::SavePath,
