@@ -492,7 +492,6 @@ public:
             else {
               run_context.getWeight(i).read(file, start_offset, read_from_offset,
                                               file_fd);
-                run_context.getWeight(i).print(std::cout);
             }
             if (run_context.isMixedPrecision(i) && trainable &&
                 !run_context.getWeightFP32(i).empty()) {
@@ -561,7 +560,6 @@ public:
               // in activate(); non-virtual weights ignore it.
               run_context.getWeight(i).read(src, start_offset, read_from_offset,
                                             file_fd);
-              run_context.getWeight(i).print(std::cout);
             }
             if (run_context.isMixedPrecision(i) && trainable &&
                 !run_context.getWeightFP32(i).empty()) {

@@ -1,6 +1,6 @@
 #include "mnist_loader.h"
 
-#include <arpa/inet.h>
+#include <cstdint>
 #include <fstream>
 #include <nntrainer_log.h>
 #include <stdexcept>
@@ -11,10 +11,16 @@ namespace lora {
 static constexpr float MNIST_MEAN = 0.1307f;
 static constexpr float MNIST_STD = 0.3081f;
 
+// Read a 32-bit big-endian unsigned int from a binary stream.
+// Implemented manually so the loader works on both POSIX and Windows
+// without depending on <arpa/inet.h> / Winsock for ntohl().
 static uint32_t read_u32_be(std::ifstream &ifs) {
-  uint32_t val = 0;
-  ifs.read(reinterpret_cast<char *>(&val), sizeof(val));
-  return ntohl(val);
+  unsigned char buf[4] = {0, 0, 0, 0};
+  ifs.read(reinterpret_cast<char *>(buf), sizeof(buf));
+  return (static_cast<uint32_t>(buf[0]) << 24) |
+         (static_cast<uint32_t>(buf[1]) << 16) |
+         (static_cast<uint32_t>(buf[2]) << 8) |
+         (static_cast<uint32_t>(buf[3]));
 }
 
 bool loadMNIST(const std::string &images_path, const std::string &labels_path,

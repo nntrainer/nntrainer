@@ -649,7 +649,7 @@ void NeuralNetwork::save(
       if (format == ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN &&
           layer_node->getType() == "fully_connected") {
         bool lora_enabled = false;
-        for (unsigned int i = 0; i < layer_node->getNumWeights(); i++) {
+        for (unsigned int i = 0; i < layer_node->getNumWeights(); ++i) {
           if (layer_node->getWeight(i).getName().find("lora") !=
               std::string::npos) {
             lora_enabled = true;
@@ -905,7 +905,8 @@ void NeuralNetwork::load(const std::string &file_path,
               << "MapViewOfFile failed";
 
             node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+                       std::numeric_limits<size_t>::max(), true, model_file_fd,
+                       lora_file_path);
 
             // Early unmap: let the OS reclaim the working set ASAP
             UnmapViewOfFile(view);
