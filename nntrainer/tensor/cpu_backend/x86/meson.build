@@ -1,6 +1,8 @@
 simd_interface_x86_headers = [
   'x86_compute_backend.h',
   'avx2_impl.h',
+  'avx2_mathfun.h',
+  'avx2_mathfun.hxx',
 ]
 simd_interface_x86_sources = [
   'x86_compute_backend.cpp',
