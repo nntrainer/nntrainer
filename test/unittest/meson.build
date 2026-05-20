@@ -121,6 +121,19 @@ foreach target: test_target
   )
 endforeach
 
+# Benchmark binary — build only, not registered as a test.
+# Run manually: ./benchmark_x86_backend --bench_iters=100
+if get_option('enable-test')
+  executable(
+    'benchmark_x86_backend',
+    'benchmark_x86_backend.cpp',
+    include_directories: include_directories('models'),
+    dependencies: unittest_nntrainer_deps,
+    install: get_option('enable-test'),
+    install_dir: application_install_dir
+  )
+endif
+
 unittest_inc = include_directories('.')
 
 # subdir('memory')
