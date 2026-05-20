@@ -2261,42 +2261,40 @@ void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
     float *rowY = Y + h * W;
 
     size_t i = 0;
-    float16x8_t acc = vdupq_n_f16(0.F);
+    // Use FP32 accumulator instead of FP16 to avoid overflow
+    float32x4_t acc0 = vdupq_n_f32(0.F);
+    float32x4_t acc1 = vdupq_n_f32(0.F);
 
     for (; i + 8 <= W; i += 8) {
       float32x4_t f0 = vld1q_f32(rowX + i + 0);
       float32x4_t f1 = vld1q_f32(rowX + i + 4);
-      float16x4_t h0 = vcvt_f16_f32(f0);
-      float16x4_t h1 = vcvt_f16_f32(f1);
-      float16x8_t h8 = vcombine_f16(h0, h1);
-      acc = vfmaq_f16(acc, h8, h8);
+      // Accumulate x² in FP32 — no overflow risk
+      acc0 = vfmaq_f32(acc0, f0, f0);
+      acc1 = vfmaq_f32(acc1, f1, f1);
     }
 
     if (i + 4 <= W) {
       float32x4_t f = vld1q_f32(rowX + i);
-      float16x4_t h4 = vcvt_f16_f32(f);
-      float16x4_t p4 = vmul_f16(h4, h4);
-      acc = vaddq_f16(acc, vcombine_f16(p4, vdup_n_f16(0.F)));
+      acc0 = vfmaq_f32(acc0, f, f);
       i += 4;
     }
 
-    __fp16 sum_h = hsumq_f16(acc);
+    float sum_sq = vaddvq_f32(vaddq_f32(acc0, acc1));
     for (; i < W; ++i) {
-      float hx = (float)rowX[i];
-      sum_h = sum_h + hx * hx;
+      sum_sq += rowX[i] * rowX[i];
     }
 
-    float mean_single = sum_h / W;
+    float mean_single = sum_sq / W;
     float scale_single = 1.F / std::sqrt(mean_single + eps_h);
-    float16x8_t scale_v = vdupq_n_f16(scale_single);
 
+    // Apply scaling (can still use FP16 for the element-wise multiply)
     i = 0;
+    float16x8_t scale_v = vdupq_n_f16(scale_single);
     for (; i + 8 <= W; i += 8) {
       float32x4_t f0 = vld1q_f32(rowX + i + 0);
       float32x4_t f1 = vld1q_f32(rowX + i + 4);
       float16x8_t xh = vcombine_f16(vcvt_f16_f32(f0), vcvt_f16_f32(f1));
       float16x8_t yh = vmulq_f16(xh, scale_v);
-
       vst1q_f32(rowY + i + 0, vcvt_f32_f16(vget_low_f16(yh)));
       vst1q_f32(rowY + i + 4, vcvt_f32_f16(vget_high_f16(yh)));
     }
@@ -2308,6 +2306,66 @@ void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
     }
     for (; i < W; ++i) {
       rowY[i] = rowX[i] * scale_single;
+    }
+  }
+}
+
+template <>
+void rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
+                                       _FP16 *__restrict Y, size_t H, size_t W,
+                                       float epsilon) {
+  const float eps_h = (float)epsilon;
+
+  for (size_t h = 0; h < H; ++h) {
+    const _FP16 *rowX = X + h * W;
+    _FP16 *rowY = Y + h * W;
+
+    size_t i = 0;
+    // Use FP32 accumulator instead of FP16 to avoid overflow
+    float32x4_t acc0 = vdupq_n_f32(0.F);
+    float32x4_t acc1 = vdupq_n_f32(0.F);
+
+    for (; i + 8 <= W; i += 8) {
+      float16x8_t x8 = vld1q_f16(rowX + i);
+      float32x4_t f0 = vcvt_f32_f16(vget_low_f16(x8));
+      float32x4_t f1 = vcvt_high_f32_f16(x8);
+      // Accumulate x² in FP32 — no overflow risk
+      acc0 = vfmaq_f32(acc0, f0, f0);
+      acc1 = vfmaq_f32(acc1, f1, f1);
+    }
+
+    if (i + 4 <= W) {
+      float16x4_t x4 = vld1_f16(rowX + i);
+      float32x4_t f = vcvt_f32_f16(x4);
+      acc0 = vfmaq_f32(acc0, f, f);
+      i += 4;
+    }
+
+    float sum_sq = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; i < W; ++i) {
+      float fx = static_cast<float>(rowX[i]);
+      sum_sq += fx * fx;
+    }
+
+    float mean_single = sum_sq / W;
+    float scale_single = 1.F / std::sqrt(mean_single + eps_h);
+
+    // Apply scaling
+    i = 0;
+    float16x8_t scale_v = vdupq_n_f16(scale_single);
+    for (; i + 8 <= W; i += 8) {
+      float16x8_t xh = vld1q_f16(rowX + i);
+      float16x8_t yh = vmulq_f16(xh, scale_v);
+      vst1q_f16(rowY + i, yh);
+    }
+    if (i + 4 <= W) {
+      float16x4_t xh = vld1_f16(rowX + i);
+      float16x4_t yh = vmul_f16(xh, vget_low_f16(scale_v));
+      vst1_f16(rowY + i, yh);
+      i += 4;
+    }
+    for (; i < W; ++i) {
+      rowY[i] = static_cast<_FP16>(static_cast<float>(rowX[i]) * scale_single);
     }
   }
 }
