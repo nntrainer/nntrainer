@@ -78,6 +78,7 @@
 /usr/include/nntrainer/graph_node.h
 /usr/include/nntrainer/model_common_properties.h
 /usr/include/nntrainer/network_graph.h
+/usr/include/nntrainer/checkpoint_block.h
 /usr/include/nntrainer/graph_core.h
 /usr/include/nntrainer/graph_node.h
 /usr/include/nntrainer/manager.h
