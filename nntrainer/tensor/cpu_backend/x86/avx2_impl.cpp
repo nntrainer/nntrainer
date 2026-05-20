@@ -328,6 +328,10 @@ avx2_approx_swiglu_alpha(__m256 x, __m256 s, __m256 alpha) noexcept -> __m256 {
 
 namespace nntrainer::avx2 {
 
+// Forward declarations for internal helpers used across the file
+static inline __m256 exp256_ps(__m256 x);
+static float hsum_avx(__m256 v);
+
 /**
  * @brief struct of q4_0x8 block
  */
@@ -701,16 +705,25 @@ static inline void convert_q4_0x8_noshuffle(const void *src,
 
 // ================== wrappers for your K,N combinations ==================
 // K = 3072 (UNIT = 768)
+/**
+ * @brief convert_q4_0x8_shuffle for K=3072 N=98304
+ */
 void convert_q4_0x8_shuffle_K3072_N98304(const void *src, uint16_t *d_out,
                                          uint8_t *qs_out) {
   // groups = (N*8)/UNIT = 1024
   convert_q4_0x8_noshuffle<768, 1024>(src, d_out, qs_out);
 }
+/**
+ * @brief convert_q4_0x8_shuffle for K=3072 N=36864
+ */
 void convert_q4_0x8_shuffle_K3072_N36864(const void *src, uint16_t *d_out,
                                          uint8_t *qs_out) {
   // groups = 384
   convert_q4_0x8_noshuffle<768, 384>(src, d_out, qs_out);
 }
+/**
+ * @brief convert_q4_0x8_shuffle for K=3072 N=3072
+ */
 void convert_q4_0x8_shuffle_K3072_N3072(const void *src, uint16_t *d_out,
                                         uint8_t *qs_out) {
   // groups = 32
@@ -718,16 +731,25 @@ void convert_q4_0x8_shuffle_K3072_N3072(const void *src, uint16_t *d_out,
 }
 
 // K = 8192 (UNIT = 2048)
+/**
+ * @brief convert_q4_0x8_shuffle for K=8192 N=98304
+ */
 void convert_q4_0x8_shuffle_K8192_N98304(const void *src, uint16_t *d_out,
                                          uint8_t *qs_out) {
   // groups = 384
   convert_q4_0x8_noshuffle<2048, 384>(src, d_out, qs_out);
 }
+/**
+ * @brief convert_q4_0x8_shuffle for K=8192 N=36864
+ */
 void convert_q4_0x8_shuffle_K8192_N36864(const void *src, uint16_t *d_out,
                                          uint8_t *qs_out) {
   // groups = 144
   convert_q4_0x8_noshuffle<2048, 144>(src, d_out, qs_out);
 }
+/**
+ * @brief convert_q4_0x8_shuffle for K=8192 N=3072
+ */
 void convert_q4_0x8_shuffle_K8192_N3072(const void *src, uint16_t *d_out,
                                         uint8_t *qs_out) {
   // groups = 12
@@ -1140,6 +1162,223 @@ void gelu_v2(const unsigned int N, const float *X, float *Y) {
   }
 }
 
+void tanh_gelu(const unsigned int N, const float *X, float *Y) {
+  unsigned int i = 0;
+
+  for (; i + 8 <= N; i += 8) {
+    __m256 x = _mm256_loadu_ps(&X[i]);
+    __m256 y = poly_gelu_tanh_avx2(x);
+    _mm256_storeu_ps(&Y[i], y);
+  }
+
+  for (; i < N; ++i) {
+    const float x = X[i];
+    Y[i] = 0.5f * x *
+           (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+  }
+}
+
+void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z) {
+  unsigned int i = 0;
+
+  for (; i + 8 <= N; i += 8) {
+    __m256 y = _mm256_loadu_ps(&Y[i]);
+    __m256 g = poly_gelu_tanh_avx2(y);
+    __m256 z = _mm256_loadu_ps(&Z[i]);
+    _mm256_storeu_ps(&X[i], _mm256_mul_ps(g, z));
+  }
+
+  for (; i < N; ++i) {
+    const float y = Y[i];
+    float gelu_y =
+      0.5f * y *
+      (1.0f + std::tanh(0.7978845608f * (y + 0.044715f * y * y * y)));
+    X[i] = gelu_y * Z[i];
+  }
+}
+
+void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z) {
+  tanh_gelu_mul(N, X, Y, Z);
+}
+
+float max_val(const unsigned int N, float *X) {
+  unsigned int i = 0;
+  __m256 vmax = _mm256_set1_ps(-std::numeric_limits<float>::infinity());
+
+  for (; i + 8 <= N; i += 8) {
+    __m256 x = _mm256_loadu_ps(&X[i]);
+    vmax = _mm256_max_ps(vmax, x);
+  }
+
+  // Horizontal max reduction
+  __m128 hi = _mm256_extractf128_ps(vmax, 1);
+  __m128 lo = _mm256_castps256_ps128(vmax);
+  lo = _mm_max_ps(lo, hi);
+  __m128 shuf = _mm_movehl_ps(lo, lo);
+  lo = _mm_max_ps(lo, shuf);
+  shuf = _mm_movehdup_ps(lo);
+  lo = _mm_max_ss(lo, shuf);
+  float result = _mm_cvtss_f32(lo);
+
+  for (; i < N; ++i) {
+    result = std::max(result, X[i]);
+  }
+  return result;
+}
+
+void softmax(const unsigned int N, float *X, float *Y) {
+  // Step 1: find max
+  float max_x = max_val(N, X);
+  __m256 vmax = _mm256_set1_ps(max_x);
+
+  // Step 2: exp(x - max) and accumulate sum
+  unsigned int i = 0;
+  unsigned int N8 = (N & ~(7));
+  __m256 vsum = _mm256_setzero_ps();
+
+  for (; i < N8; i += 8) {
+    __m256 x = _mm256_loadu_ps(&X[i]);
+    __m256 e = exp256_ps(_mm256_sub_ps(x, vmax));
+    _mm256_storeu_ps(&Y[i], e);
+    vsum = _mm256_add_ps(vsum, e);
+  }
+
+  float sum = hsum_avx(vsum);
+  for (; i < N; ++i) {
+    float e = std::exp(X[i] - max_x);
+    Y[i] = e;
+    sum += e;
+  }
+
+  // Step 3: normalize
+  float inv_sum = 1.0f / sum;
+  __m256 vinv = _mm256_set1_ps(inv_sum);
+
+  i = 0;
+  for (; i < N8; i += 8) {
+    __m256 y = _mm256_loadu_ps(&Y[i]);
+    _mm256_storeu_ps(&Y[i], _mm256_mul_ps(y, vinv));
+  }
+  for (; i < N; ++i) {
+    Y[i] *= inv_sum;
+  }
+}
+
+void inv_sqrt_inplace(const unsigned int N, float *X) {
+  unsigned int i = 0;
+  const __m256 zero = _mm256_setzero_ps();
+  const __m256 inf_val = _mm256_set1_ps(INFINITY);
+  const __m256 three_half = _mm256_set1_ps(1.5f);
+  const __m256 half = _mm256_set1_ps(0.5f);
+
+  for (; i + 8 <= N; i += 8) {
+    __m256 x = _mm256_loadu_ps(&X[i]);
+    __m256 is_zero = _mm256_cmp_ps(x, zero, _CMP_EQ_OQ);
+    __m256 est = _mm256_rsqrt_ps(x);
+    // Newton-Raphson: y = y * (1.5 - 0.5 * x * y * y)
+    __m256 half_x = _mm256_mul_ps(half, x);
+    __m256 yy = _mm256_mul_ps(est, est);
+    __m256 refined =
+      _mm256_mul_ps(est, _mm256_fnmadd_ps(half_x, yy, three_half));
+    refined = _mm256_blendv_ps(refined, inf_val, is_zero);
+    _mm256_storeu_ps(&X[i], refined);
+  }
+
+  for (; i < N; ++i) {
+    X[i] = 1.0f / std::sqrt(X[i]);
+  }
+}
+
+void sine(const unsigned int N, float *X, float *Y, float alpha, float beta) {
+  unsigned int i = 0;
+  const __m256 v_alpha = _mm256_set1_ps(alpha);
+  const __m256 v_beta = _mm256_set1_ps(beta);
+  const bool need_alpha = (alpha != 1.0f);
+  const bool need_beta = (beta != 1.0f);
+
+  for (; i + 8 <= N; i += 8) {
+    __m256 x = _mm256_loadu_ps(&X[i]);
+    if (need_alpha)
+      x = _mm256_mul_ps(x, v_alpha);
+    __m256 result = sin256_ps(x);
+    if (need_beta)
+      result = _mm256_mul_ps(result, v_beta);
+    _mm256_storeu_ps(&Y[i], result);
+  }
+
+  for (; i < N; ++i) {
+    Y[i] =
+      std::sin(static_cast<float>(alpha) * X[i]) * static_cast<float>(beta);
+  }
+}
+
+void cosine(const unsigned int N, float *X, float *Y, float alpha, float beta) {
+  unsigned int i = 0;
+  const __m256 v_alpha = _mm256_set1_ps(alpha);
+  const __m256 v_beta = _mm256_set1_ps(beta);
+  const bool need_alpha = (alpha != 1.0f);
+  const bool need_beta = (beta != 1.0f);
+
+  for (; i + 8 <= N; i += 8) {
+    __m256 x = _mm256_loadu_ps(&X[i]);
+    if (need_alpha)
+      x = _mm256_mul_ps(x, v_alpha);
+    __m256 result = cos256_ps(x);
+    if (need_beta)
+      result = _mm256_mul_ps(result, v_beta);
+    _mm256_storeu_ps(&Y[i], result);
+  }
+
+  for (; i < N; ++i) {
+    Y[i] =
+      std::cos(static_cast<float>(alpha) * X[i]) * static_cast<float>(beta);
+  }
+}
+
+void calc_trigonometric_vals_dup(unsigned int N_half, float *angle, float *cos_,
+                                 float *sin_, unsigned int from,
+                                 float attention_scaling) {
+  unsigned int i = 0;
+  const __m256 v_from = _mm256_set1_ps(static_cast<float>(from));
+  const __m256 v_scale = _mm256_set1_ps(attention_scaling);
+  const bool need_scale = (attention_scaling != 1.0f);
+
+  for (; i + 8 <= N_half; i += 8) {
+    __m256 x = _mm256_loadu_ps(&angle[i]);
+    x = _mm256_mul_ps(x, v_from);
+    __m256 s, c;
+    sincos256_ps(x, &s, &c);
+    if (need_scale) {
+      s = _mm256_mul_ps(s, v_scale);
+      c = _mm256_mul_ps(c, v_scale);
+    }
+    _mm256_storeu_ps(&cos_[i], c);
+    _mm256_storeu_ps(&sin_[i], s);
+  }
+
+  for (; i < N_half; ++i) {
+    cos_[i] = std::cos(static_cast<float>(from) * angle[i]) * attention_scaling;
+    sin_[i] = std::sin(static_cast<float>(from) * angle[i]) * attention_scaling;
+  }
+
+  unsigned int N = 2 * N_half;
+
+  // Copy first half to second half (duplicate)
+  unsigned int j = N_half;
+  unsigned int j_half = 0;
+
+  for (; j + 8 <= N && j_half + 8 <= N_half; j += 8, j_half += 8) {
+    __m256 c = _mm256_loadu_ps(&cos_[j_half]);
+    __m256 s = _mm256_loadu_ps(&sin_[j_half]);
+    _mm256_storeu_ps(&cos_[j], c);
+    _mm256_storeu_ps(&sin_[j], s);
+  }
+  for (; j < N && j_half < N_half; ++j, ++j_half) {
+    cos_[j] = cos_[j_half];
+    sin_[j] = sin_[j_half];
+  }
+}
+
 void ele_mul(const unsigned int N, const float *X, const float *Y, float *Z,
              float alpha, float beta, unsigned int i_stride,
              unsigned int o_stride) {
@@ -1174,12 +1413,53 @@ void ele_mul(const unsigned int N, const float *X, const float *Y, float *Z,
       Z++;
     }
   } else {
-    // TODO: AVX2 implementation if used
-    for (unsigned int i = 0; i < N; ++i) {
-      *Z = *X * alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
-      X += o_stride;
-      Y += i_stride;
-      Z += o_stride;
+    if (o_stride == 1 && (i_stride == 0 || i_stride == 1)) {
+      unsigned int N8 = (N & ~(7));
+      auto alpha_v = _mm256_set1_ps(alpha);
+      auto beta_v = _mm256_set1_ps(beta);
+
+      if (i_stride == 0) {
+        auto y = _mm256_set1_ps(Y[0]);
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto z = _mm256_mul_ps(_mm256_mul_ps(x, y), alpha_v);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Z += 8;
+        }
+      } else {
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto y = _mm256_loadu_ps(Y);
+          auto z = _mm256_mul_ps(_mm256_mul_ps(x, y), alpha_v);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Y += 8;
+          Z += 8;
+        }
+      }
+
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X * alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X * alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X += o_stride;
+        Y += i_stride;
+        Z += o_stride;
+      }
     }
   }
 }
@@ -1218,12 +1498,245 @@ void ele_add(const unsigned int N, const float *X, const float *Y, float *Z,
       Z++;
     }
   } else {
-    // TODO: AVX2 implementation if used
-    for (unsigned int i = 0; i < N; ++i) {
-      *Z = *X + alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
-      X += o_stride;
-      Y += i_stride;
-      Z += o_stride;
+    if (o_stride == 1 && (i_stride == 0 || i_stride == 1)) {
+      unsigned int N8 = (N & ~(7));
+      auto alpha_v = _mm256_set1_ps(alpha);
+      auto beta_v = _mm256_set1_ps(beta);
+
+      if (i_stride == 0) {
+        auto y = _mm256_set1_ps(Y[0]);
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto z = _mm256_fmadd_ps(alpha_v, y, x);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Z += 8;
+        }
+      } else {
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto y = _mm256_loadu_ps(Y);
+          auto z = _mm256_fmadd_ps(alpha_v, y, x);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Y += 8;
+          Z += 8;
+        }
+      }
+
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X + alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X + alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X += o_stride;
+        Y += i_stride;
+        Z += o_stride;
+      }
+    }
+  }
+}
+
+void ele_sub(const unsigned int N, const float *X, const float *Y, float *Z,
+             float alpha, float beta, unsigned int i_stride,
+             unsigned int o_stride) {
+  if (alpha == 1.0f && beta == 0.0f && o_stride == 1) {
+    unsigned int N8 = (N & ~(7));
+    if (i_stride == 0) {
+      auto y = _mm256_set1_ps(Y[0]);
+      for (unsigned int i = 0; i < N8; i += 8) {
+        auto x = _mm256_loadu_ps(X);
+        auto z = _mm256_sub_ps(x, y);
+        _mm256_storeu_ps(Z, z);
+        X += 8;
+        Z += 8;
+      }
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X - Y[0];
+        X++;
+        Z++;
+      }
+    } else if (i_stride == 1) {
+      for (unsigned int i = 0; i < N8; i += 8) {
+        auto x = _mm256_loadu_ps(X);
+        auto y = _mm256_loadu_ps(Y);
+        auto z = _mm256_sub_ps(x, y);
+        _mm256_storeu_ps(Z, z);
+        X += 8;
+        Y += 8;
+        Z += 8;
+      }
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X - *Y;
+        X++;
+        Y++;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X - *Y;
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    }
+  } else {
+    if (o_stride == 1 && (i_stride == 0 || i_stride == 1)) {
+      unsigned int N8 = (N & ~(7));
+      auto alpha_v = _mm256_set1_ps(alpha);
+      auto beta_v = _mm256_set1_ps(beta);
+
+      if (i_stride == 0) {
+        auto y = _mm256_set1_ps(Y[0]);
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto z = _mm256_fnmadd_ps(alpha_v, y, x);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Z += 8;
+        }
+      } else {
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto y = _mm256_loadu_ps(Y);
+          auto z = _mm256_fnmadd_ps(alpha_v, y, x);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Y += 8;
+          Z += 8;
+        }
+      }
+
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X - alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X - alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X += o_stride;
+        Y += i_stride;
+        Z += o_stride;
+      }
+    }
+  }
+}
+
+void ele_div(const unsigned int N, const float *X, const float *Y, float *Z,
+             float alpha, float beta, unsigned int i_stride,
+             unsigned int o_stride) {
+  if (alpha == 1.0f && beta == 0.0f && o_stride == 1) {
+    unsigned int N8 = (N & ~(7));
+    if (i_stride == 0) {
+      auto y = _mm256_set1_ps(Y[0]);
+      for (unsigned int i = 0; i < N8; i += 8) {
+        auto x = _mm256_loadu_ps(X);
+        auto z = _mm256_div_ps(x, y);
+        _mm256_storeu_ps(Z, z);
+        X += 8;
+        Z += 8;
+      }
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X / Y[0];
+        X++;
+        Z++;
+      }
+    } else if (i_stride == 1) {
+      for (unsigned int i = 0; i < N8; i += 8) {
+        auto x = _mm256_loadu_ps(X);
+        auto y = _mm256_loadu_ps(Y);
+        auto z = _mm256_div_ps(x, y);
+        _mm256_storeu_ps(Z, z);
+        X += 8;
+        Y += 8;
+        Z += 8;
+      }
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X / *Y;
+        X++;
+        Y++;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X / *Y;
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    }
+  } else {
+    if (o_stride == 1 && (i_stride == 0 || i_stride == 1)) {
+      unsigned int N8 = (N & ~(7));
+      auto alpha_v = _mm256_set1_ps(alpha);
+      auto beta_v = _mm256_set1_ps(beta);
+
+      if (i_stride == 0) {
+        auto y = _mm256_set1_ps(Y[0]);
+        auto denom = _mm256_mul_ps(alpha_v, y);
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto z = _mm256_div_ps(x, denom);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Z += 8;
+        }
+      } else {
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto y = _mm256_loadu_ps(Y);
+          auto denom = _mm256_mul_ps(alpha_v, y);
+          auto z = _mm256_div_ps(x, denom);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Y += 8;
+          Z += 8;
+        }
+      }
+
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X / (alpha * *Y) + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X / (alpha * *Y) + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X += o_stride;
+        Y += i_stride;
+        Z += o_stride;
+      }
     }
   }
 }
@@ -1791,10 +2304,8 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
         __m256 cos_v = _mm256_loadu_ps(&cos_[k]);
         __m256 sin_v = _mm256_loadu_ps(&sin_[k]);
 
-        __m256 out0 =
-          _mm256_sub_ps(_mm256_mul_ps(a, cos_v), _mm256_mul_ps(b, sin_v));
-        __m256 out1 =
-          _mm256_add_ps(_mm256_mul_ps(a, sin_v), _mm256_mul_ps(b, cos_v));
+        __m256 out0 = _mm256_fnmadd_ps(b, sin_v, _mm256_mul_ps(a, cos_v));
+        __m256 out1 = _mm256_fmadd_ps(a, sin_v, _mm256_mul_ps(b, cos_v));
 
         if (out_type == OutputType::FP16) {
           __m128i out0_fp16 = convert_vector_f32_to_f16(out0);

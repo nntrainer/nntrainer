@@ -409,9 +409,18 @@ void __fallback_calc_trigonometric_vals_dup(unsigned int N_half, float *angle,
                                             float *cos_, float *sin_,
                                             unsigned int from,
                                             float attention_scaling) {
-  throw std::runtime_error(
-    "Error: No implementation of rotary embedding layer incremental_forwarding "
-    "with SIMD acceleration except for NEON!");
+  const float from_f = static_cast<float>(from);
+  for (unsigned int i = 0; i < N_half; ++i) {
+    const float a = from_f * angle[i];
+    cos_[i] = std::cos(a) * attention_scaling;
+    sin_[i] = std::sin(a) * attention_scaling;
+  }
+  const unsigned int N = 2 * N_half;
+  for (unsigned int j = N_half, j_half = 0; j < N && j_half < N_half;
+       ++j, ++j_half) {
+    cos_[j] = cos_[j_half];
+    sin_[j] = sin_[j_half];
+  }
 }
 
 void __fallback_swiglu(const unsigned int N, float *X, float *Y, float *Z) {

@@ -15,6 +15,7 @@
 #define __AVX2_IMPL_H_
 #ifdef __cplusplus
 
+#include "avx2_mathfun.h"
 #include <cstdint>
 #include <limits.h>
 #include <limits>
@@ -102,6 +103,98 @@ void transpose_matrix(const unsigned int M, const unsigned int N,
                       unsigned int ld_dst);
 
 /**
+ * @brief tanh_gelu function with AVX2 polynomial approximation
+ *        Y = 0.5 * X * (1 + tanh(sqrt(2/pi) * (X + 0.044715 * X^3)))
+ *
+ * @param N number of elements in X
+ * @param X const float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+void tanh_gelu(const unsigned int N, const float *X, float *Y);
+
+/**
+ * @brief tanh_gelu_mul function with AVX2: X = GELU(Y) * Z
+ *
+ * @param N number of elements
+ * @param X float * for output
+ * @param Y float * for GELU input
+ * @param Z float * for multiply input
+ */
+void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z);
+
+/**
+ * @brief tanh_gelu_v2_mul function with AVX2: X = GELU(Y) * Z
+ *
+ * @param N number of elements
+ * @param X float * for output
+ * @param Y float * for GELU input
+ * @param Z float * for multiply input
+ */
+void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z);
+
+/**
+ * @brief returns maximum value of the vector X
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X
+ * @return float maximum value of vector X
+ */
+float max_val(const unsigned int N, float *X);
+
+/**
+ * @brief softmax function y_i = exp(x_i) / sum( exp(x_i) )
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+void softmax(const unsigned int N, float *X, float *Y);
+
+/**
+ * @brief inversed squared root transformation inplace : X[i] = 1 / sqrt(X[i])
+ *
+ * @param N size of X
+ * @param X float * for Vector X
+ */
+void inv_sqrt_inplace(const unsigned int N, float *X);
+
+/**
+ * @brief sine function : Y[i] = sin(alpha * X[i]) * beta
+ *
+ * @param N number of elements
+ * @param X float * input
+ * @param Y float * output
+ * @param alpha scaling for input
+ * @param beta scaling for output
+ */
+void sine(const unsigned int N, float *X, float *Y, float alpha, float beta);
+
+/**
+ * @brief cosine function : Y[i] = cos(alpha * X[i]) * beta
+ *
+ * @param N number of elements
+ * @param X float * input
+ * @param Y float * output
+ * @param alpha scaling for input
+ * @param beta scaling for output
+ */
+void cosine(const unsigned int N, float *X, float *Y, float alpha, float beta);
+
+/**
+ * @brief compute cos and sin of angles, then duplicate to second half
+ *
+ * @param N_half half size of output arrays
+ * @param angle float * input angles
+ * @param cos_ float * output cosines (size 2*N_half)
+ * @param sin_ float * output sines (size 2*N_half)
+ * @param from starting index for angle calculation
+ * @param attention_scaling scaling factor for cos and sin values
+ */
+void calc_trigonometric_vals_dup(unsigned int N_half, float *angle, float *cos_,
+                                 float *sin_, unsigned int from,
+                                 float attention_scaling);
+
+/**
  * @brief swiglu function with AVX : X = (Y / (1 + exp( -Y ))) * Z
  *
  * @param N number of elements in X
@@ -176,6 +269,37 @@ void ele_add(const unsigned int N, const float *X, const float *Y, float *Z,
              unsigned int o_stride);
 
 /**
+ * @brief     elementwise vector subtraction : Z = X - alpha * Y + beta * Z
+ * @param[in] N  length of the vector
+ * @param[in] X float * for Vector X
+ * @param[in] Y float * for Vector Y
+ * @param[in] Z float * for Vector Z
+ * @param[in] alpha scalar multiplier for input
+ * @param[in] beta scalar multiplier for output
+ * @param[in] i_stride input stride
+ * @param[in] o_stride output stride
+ */
+void ele_sub(const unsigned int N, const float *X, const float *Y, float *Z,
+             float alpha = 1.f, float beta = 0.f, unsigned int i_stride = 1,
+             unsigned int o_stride = 1);
+
+/**
+ * @brief     elementwise vector division : Z = X / (alpha * Y) + beta * Z
+ * @note ZeroDivisionError is not guaranteed in this function
+ * @param[in] N  length of the vector
+ * @param[in] X float * for Vector X
+ * @param[in] Y float * for Vector Y
+ * @param[in] Z float * for Vector Z
+ * @param[in] alpha scalar multiplier for input
+ * @param[in] beta scalar multiplier for output
+ * @param[in] i_stride input stride
+ * @param[in] o_stride output stride
+ */
+void ele_div(const unsigned int N, const float *X, const float *Y, float *Z,
+             float alpha = 1.f, float beta = 0.f, unsigned int i_stride = 1,
+             unsigned int o_stride = 1);
+
+/**
  * @brief Multihead softmax, exp(x_i) / sum(exp(x_i)), inplace version
  * @param[in/out] qk_out float* input/output values
  * @param[in] start_row start row number
@@ -186,7 +310,7 @@ template <typename T = float>
 void softmax_row_inplace(T *qk_out, size_t start_row, size_t end_row,
                          size_t num_heads, T *sink = nullptr);
 
-/**f
+/**
  * @brief Multihead softmax, exp(x_i) / sum(exp(x_i))
  * @param[in/out] qk_out float* input/output values
  * @param[in] start_row start row number
