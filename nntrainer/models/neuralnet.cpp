@@ -637,7 +637,7 @@ void NeuralNetwork::save(
   /// @todo this switch case should be delegating the function call only. It's
   /// not delegating for now as required logics are manageable for now.
   switch (format) {
-  case(ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN):
+  case (ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN):
   case (ml::train::ModelFormat::MODEL_FORMAT_BIN): {
     auto model_file = checkedOpenStream<std::ofstream>(
       file_path, std::ios::out | std::ios::binary | std::ios::trunc);
@@ -666,7 +666,8 @@ void NeuralNetwork::save(
       }
     }
 
-    if (opt && istrequal(opt->getType(), "adam") && format != ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN) {
+    if (opt && istrequal(opt->getType(), "adam") &&
+        format != ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN) {
       std::string adam = "adam";
       model_file.write(adam.c_str(), 4);
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
@@ -675,7 +676,8 @@ void NeuralNetwork::save(
       }
     }
 
-    if (exec_mode == ml::train::ExecutionMode::TRAIN && format != ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN) {
+    if (exec_mode == ml::train::ExecutionMode::TRAIN &&
+        format != ml::train::ModelFormat::MODEL_FORMAT_LORA_BIN) {
       model_file.write((char *)&epoch_idx, sizeof(epoch_idx));
       model_file.write((char *)&iter, sizeof(iter));
     }
@@ -759,7 +761,8 @@ void NeuralNetwork::save(
 }
 
 void NeuralNetwork::load(const std::string &file_path,
-                         ml::train::ModelFormat format, const std::string &lora_file_path) {
+                         ml::train::ModelFormat format,
+                         const std::string &lora_file_path) {
   /// @todo this switch case should be delegating the function call only. It's
   /// not delegating for now as required logics are manageable for now.
 
@@ -787,8 +790,7 @@ void NeuralNetwork::load(const std::string &file_path,
       auto tensor_data_type = weight->getDim().getDataType();
       if (weight->getName().find("lora") != std::string::npos) {
         weight->getVariableRef().setFileOffset(lora_start_from);
-      }
-      else {
+      } else {
         weight->getVariableRef().setFileOffset(start_from);
       }
       ///@todo instead of checking the data type,
@@ -807,8 +809,7 @@ void NeuralNetwork::load(const std::string &file_path,
       if (weight->getName().find("lora") != std::string::npos) {
         file_offset.emplace_back(std::make_pair(lora_start_from, size));
         lora_start_from += size;
-      }
-      else {
+      } else {
         file_offset.emplace_back(std::make_pair(start_from, size));
         start_from += size;
       }
@@ -882,8 +883,8 @@ void NeuralNetwork::load(const std::string &file_path,
             auto local_model_file = checkedOpenStream<std::ifstream>(
               (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
             node->read(local_model_file, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true,
-                       model_file_fd, lora_file_path);
+                       std::numeric_limits<size_t>::max(), true, model_file_fd,
+                       lora_file_path);
           } else {
 #if defined(_WIN32)
             // Map per-ask, then unmap immediately after: enables early release

@@ -387,7 +387,8 @@ void TieWordEmbedding::read(
   std::ifstream &file, nntrainer::RunLayerContext &context, bool opt_var,
   ml::train::ExecutionMode mode, bool trainable,
   nntrainer::TensorDim::DataType definedWeightDataType, bool fsu,
-  size_t start_offset, bool read_from_offset, int file_fd, const std::string &lora_path) {
+  size_t start_offset, bool read_from_offset, int file_fd,
+  const std::string &lora_path) {
 
   // Only read when mode is embedding
   if (mode_ == mode::embedding) {

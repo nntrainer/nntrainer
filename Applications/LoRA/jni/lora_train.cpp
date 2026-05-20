@@ -15,6 +15,8 @@
  * @date    April 2026
  * @brief   LoRA fine-tuning example on MNIST (loads pre-trained model)
  * @see     https://github.com/nntrainer/nntrainer
+ * @author  Sumon Nath <sumon.nath@samsung.com>
+ * @bug     No known bugs except for NYI items
  */
 
 #include "mnist_loader.h"
@@ -129,14 +131,13 @@ std::vector<LayerHandle> createSimpleGraph(unsigned int lora_rank,
                           nntrainer::withKey("input_shape", "1:1:784")}));
 
   // Hidden layer
-  layers.push_back(
-    createLayer("fully_connected",
-                {nntrainer::withKey("unit", 256),
-                 nntrainer::withKey("weight_initializer", "xavier_uniform"),
-                 nntrainer::withKey("activation", "relu"),
-                 nntrainer::withKey("lora_rank", std::to_string(lora_rank)),
-                 nntrainer::withKey("lora_alpha", std::to_string(lora_alpha))
-                }));
+  layers.push_back(createLayer(
+    "fully_connected",
+    {nntrainer::withKey("unit", 256),
+     nntrainer::withKey("weight_initializer", "xavier_uniform"),
+     nntrainer::withKey("activation", "relu"),
+     nntrainer::withKey("lora_rank", std::to_string(lora_rank)),
+     nntrainer::withKey("lora_alpha", std::to_string(lora_alpha))}));
 
   // Output layer with softmax activation for classification
   layers.push_back(
@@ -319,8 +320,8 @@ int main(int argc, char **argv) {
 
   //     // Print the entire image data (784 pixels)
   //     for (int i = 0; i < 784; ++i) {
-  //       // Convert normalized value back to approximate pixel value for display
-  //       float pixel_value = images[sample_idx * 784 + i] * 0.3081f +
+  //       // Convert normalized value back to approximate pixel value for
+  //       display float pixel_value = images[sample_idx * 784 + i] * 0.3081f +
   //                           0.1307f; // Reverse normalization
   //       int display_value = static_cast<int>(pixel_value * 255.0f);
   //       std::cout << std::setw(4) << display_value;

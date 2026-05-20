@@ -245,7 +245,8 @@ public:
    * @param format format to save parameters
    */
   virtual void load(const std::string &file_path,
-                    ModelFormat format = ModelFormat::MODEL_FORMAT_BIN, const std::string &lora_path = "") = 0;
+                    ModelFormat format = ModelFormat::MODEL_FORMAT_BIN,
+                    const std::string &lora_path = "") = 0;
 
   /**
    * @brief     Run Model training and validation

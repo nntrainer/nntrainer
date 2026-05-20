@@ -48,6 +48,9 @@
 #include <nntrainer_error.h>
 #include <node_exporter.h>
 
+/**
+ * @brief Forward declarations for ml::train types used by NeuralNetwork.
+ */
 namespace ml::train {
 class DataSet;
 enum class DatasetType;
@@ -55,6 +58,9 @@ enum class DatasetModeType;
 enum class ExecutionMode;
 } // namespace ml::train
 
+/**
+ * @brief nntrainer model declarations.
+ */
 namespace nntrainer {
 
 class Exporter;
@@ -284,9 +290,10 @@ public:
    * @copydoc Model::load(const std::string &file_path, ml::train::ModelFormat
    * format);
    */
-  void load(const std::string &file_path,
-            ml::train::ModelFormat format =
-              ml::train::ModelFormat::MODEL_FORMAT_BIN, const std::string &lora_file_path = "") override;
+  void
+  load(const std::string &file_path,
+       ml::train::ModelFormat format = ml::train::ModelFormat::MODEL_FORMAT_BIN,
+       const std::string &lora_file_path = "") override;
 
   /**
    * @brief     get Epochs

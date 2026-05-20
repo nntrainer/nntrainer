@@ -770,7 +770,8 @@ public:
   void read(std::ifstream &file, bool opt_var = false,
             ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN,
             bool fsu = false, size_t start_offset = 0,
-            bool read_from_offset = false, int file_fd = -1, const std::string &lora_path = "");
+            bool read_from_offset = false, int file_fd = -1,
+            const std::string &lora_path = "");
 
   /**
    * @brief read layer Weight & Bias data from file
