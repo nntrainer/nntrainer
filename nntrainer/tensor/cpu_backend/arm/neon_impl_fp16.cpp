@@ -2310,66 +2310,6 @@ void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
   }
 }
 
-template <>
-void rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
-                                       _FP16 *__restrict Y, size_t H, size_t W,
-                                       float epsilon) {
-  const float eps_h = (float)epsilon;
-
-  for (size_t h = 0; h < H; ++h) {
-    const _FP16 *rowX = X + h * W;
-    _FP16 *rowY = Y + h * W;
-
-    size_t i = 0;
-    // Use FP32 accumulator instead of FP16 to avoid overflow
-    float32x4_t acc0 = vdupq_n_f32(0.F);
-    float32x4_t acc1 = vdupq_n_f32(0.F);
-
-    for (; i + 8 <= W; i += 8) {
-      float16x8_t x8 = vld1q_f16(rowX + i);
-      float32x4_t f0 = vcvt_f32_f16(vget_low_f16(x8));
-      float32x4_t f1 = vcvt_high_f32_f16(x8);
-      // Accumulate x² in FP32 — no overflow risk
-      acc0 = vfmaq_f32(acc0, f0, f0);
-      acc1 = vfmaq_f32(acc1, f1, f1);
-    }
-
-    if (i + 4 <= W) {
-      float16x4_t x4 = vld1_f16(rowX + i);
-      float32x4_t f = vcvt_f32_f16(x4);
-      acc0 = vfmaq_f32(acc0, f, f);
-      i += 4;
-    }
-
-    float sum_sq = vaddvq_f32(vaddq_f32(acc0, acc1));
-    for (; i < W; ++i) {
-      float fx = static_cast<float>(rowX[i]);
-      sum_sq += fx * fx;
-    }
-
-    float mean_single = sum_sq / W;
-    float scale_single = 1.F / std::sqrt(mean_single + eps_h);
-
-    // Apply scaling
-    i = 0;
-    float16x8_t scale_v = vdupq_n_f16(scale_single);
-    for (; i + 8 <= W; i += 8) {
-      float16x8_t xh = vld1q_f16(rowX + i);
-      float16x8_t yh = vmulq_f16(xh, scale_v);
-      vst1q_f16(rowY + i, yh);
-    }
-    if (i + 4 <= W) {
-      float16x4_t xh = vld1_f16(rowX + i);
-      float16x4_t yh = vmul_f16(xh, vget_low_f16(scale_v));
-      vst1_f16(rowY + i, yh);
-      i += 4;
-    }
-    for (; i < W; ++i) {
-      rowY[i] = static_cast<_FP16>(static_cast<float>(rowX[i]) * scale_single);
-    }
-  }
-}
-
 static inline float16x8_t vbslq_f16_u16(uint16x8_t m, float16x8_t a,
                                         float16x8_t b) {
   return vbslq_f16(m, a, b);

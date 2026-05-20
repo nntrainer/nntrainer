@@ -68,16 +68,16 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
       const auto &dim = in_step.getDim();
-      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
-        in_step.getData<float>(), out_step.getData<float>(),
-        dim.getDataLen() / dim.width(), dim.width(), epsilon);
-    } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-      const auto &dim = in_step.getDim();
       nntrainer::rms_norm_wrt_width_fp16_intrinsic(
-        in_step.getData<_FP16>(), out_step.getData<_FP16>(),
-        dim.getDataLen() / dim.width(), dim.width(), epsilon);
+        in_step.getData<float>(), out_step.getData<float>(), dim.height(),
+        dim.width(), epsilon);
 #else
+
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+        in_step.getData<float>(), out_step.getData<float>(), dim.height(),
+        dim.width(), epsilon);
+
       throw std::invalid_argument("Error: enable-fp16 is not set");
 #endif
     } else {
