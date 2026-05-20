@@ -52,6 +52,57 @@ void vcvt_f32_f16(unsigned int N, const float *input, _Float16 *output);
  * @param[out] false if it has NaN or inf
  */
 bool is_valid(const unsigned int N, const _Float16 *X);
+
+void ele_mul(const unsigned int N, const _Float16 *X, const _Float16 *Y,
+             _Float16 *Z, float alpha, float beta, unsigned int i_stride,
+             unsigned int o_stride);
+void ele_add(const unsigned int N, const _Float16 *X, const _Float16 *Y,
+             _Float16 *Z, float alpha, float beta, unsigned int i_stride,
+             unsigned int o_stride);
+void ele_sub(const unsigned int N, const _Float16 *X, const _Float16 *Y,
+             _Float16 *Z, float alpha, float beta, unsigned int i_stride,
+             unsigned int o_stride);
+void ele_div(const unsigned int N, const _Float16 *X, const _Float16 *Y,
+             _Float16 *Z, float alpha, float beta, unsigned int i_stride,
+             unsigned int o_stride);
+
+void saxpy(const unsigned int N, const float alpha, const _Float16 *X,
+           const unsigned int incX, _Float16 *Y, const unsigned int incY);
+_Float16 sdot(const unsigned int N, const _Float16 *X, const unsigned int incX,
+              const _Float16 *Y, const unsigned int incY);
+_Float16 snrm2(const unsigned int N, const _Float16 *X,
+               const unsigned int incX);
+void sscal(const unsigned int N, const float alpha, _Float16 *X,
+           const unsigned int incX);
+void custom_scopy(const unsigned int N, const _Float16 *X,
+                  const unsigned int incX, _Float16 *Y,
+                  const unsigned int incY);
+
+_Float16 max_val(const unsigned int N, _Float16 *X);
+void softmax(const unsigned int N, _Float16 *X, _Float16 *Y);
+void inv_sqrt_inplace(const unsigned int N, _Float16 *X);
+void swiglu(const unsigned int N, _Float16 *X, _Float16 *Y, _Float16 *Z);
+void rms_norm_wrt_width_fp16(const _Float16 *__restrict X,
+                             _Float16 *__restrict Y, size_t H, size_t W,
+                             float epsilon);
+void compute_rotary_embedding_value(unsigned int dim, unsigned int half_,
+                                    unsigned int w, _Float16 *in, _Float16 *out,
+                                    float *cos_, float *sin_);
+
+unsigned int isamax(const unsigned int N, const _Float16 *X,
+                    const unsigned int incX);
+void transpose_matrix(const unsigned int M, const unsigned int N,
+                      const _Float16 *src, unsigned int ld_src, _Float16 *dst,
+                      unsigned int ld_dst);
+void scopy_int4_to_float16(const unsigned int N, const uint8_t *X,
+                           const unsigned int incX, _Float16 *Y,
+                           const unsigned int incY);
+void scopy_int8_to_float16(const unsigned int N, const uint8_t *X,
+                           const unsigned int incX, _Float16 *Y,
+                           const unsigned int incY);
+void scopy_int8_to_float16(const unsigned int N, const int8_t *X,
+                           const unsigned int incX, _Float16 *Y,
+                           const unsigned int incY);
 #endif
 
 /**
