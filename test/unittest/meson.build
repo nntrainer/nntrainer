@@ -121,9 +121,10 @@ foreach target: test_target
   )
 endforeach
 
-# Benchmark binary — build only, not registered as a test.
+# Benchmark binary - build only, not registered as a test.
 # Run manually: ./benchmark_x86_backend --bench_iters=100
-if get_option('enable-test')
+benchmark_x86_cpus = ['x86', 'x86_64']
+if get_option('enable-test') and benchmark_x86_cpus.contains(host_machine.cpu_family())
   executable(
     'benchmark_x86_backend',
     'benchmark_x86_backend.cpp',

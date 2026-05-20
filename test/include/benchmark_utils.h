@@ -54,9 +54,9 @@ struct Stats {
  * omitted from the output.
  */
 struct Metrics {
-  size_t num_elements = 0; /**< element count → throughput (elem/s) */
-  size_t total_bytes = 0; /**< bytes read+written → memory bandwidth (GB/s) */
-  double flop_count = 0.0; /**< FP operations → GFLOPS */
+  size_t num_elements = 0; /**< element count -> throughput (elem/s) */
+  size_t total_bytes = 0;  /**< bytes read+written -> memory bandwidth (GB/s) */
+  double flop_count = 0.0; /**< FP operations -> GFLOPS */
 };
 
 /**
@@ -143,6 +143,50 @@ Stats measure(Func &&func, unsigned int warmup = 10,
 }
 
 /**
+ * @brief Measure execution time while excluding per-iteration setup cost
+ *
+ * @tparam SetupFunc setup callable type
+ * @tparam Func benchmark callable type
+ * @param setup function to run before each iteration without timing it
+ * @param func function to benchmark
+ * @param warmup number of warmup iterations (not measured)
+ * @param iters number of measured iterations
+ * @return Stats average, min, max latency in nanoseconds
+ */
+template <typename SetupFunc, typename Func>
+Stats measure_with_setup(SetupFunc &&setup, Func &&func,
+                         unsigned int warmup = 10, unsigned int iters = 1000) {
+  using clock = std::chrono::steady_clock;
+
+  if (iters == 0)
+    iters = 1;
+
+  for (unsigned int i = 0; i < warmup; ++i) {
+    setup();
+    func();
+  }
+
+  double total_ns = 0.0;
+  double min_ns = std::numeric_limits<double>::max();
+  double max_ns = 0.0;
+
+  for (unsigned int i = 0; i < iters; ++i) {
+    setup();
+    auto start = clock::now();
+    func();
+    auto end = clock::now();
+    double ns = static_cast<double>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
+        .count());
+    total_ns += ns;
+    min_ns = std::min(min_ns, ns);
+    max_ns = std::max(max_ns, ns);
+  }
+
+  return {total_ns / iters, min_ns, max_ns};
+}
+
+/**
  * @brief Print a table header for benchmark reports
  *
  * Call once before a group of report() calls for aligned output.
@@ -182,12 +226,12 @@ inline void report(const std::string &name, const std::string &type,
             << format_time(stats.max_ns);
 
   // Throughput
-  if (metrics.flop_count > 0) {
+  if (metrics.flop_count > 0 && stats.avg_ns > 0) {
     double gflops = metrics.flop_count / stats.avg_ns;
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(2) << gflops << " GFLOPS";
     std::cout << std::setw(15) << oss.str();
-  } else if (metrics.num_elements > 0) {
+  } else if (metrics.num_elements > 0 && stats.avg_ns > 0) {
     double tput =
       static_cast<double>(metrics.num_elements) / (stats.avg_ns * 1e-9);
     std::cout << std::setw(15) << format_throughput(tput);
@@ -196,7 +240,7 @@ inline void report(const std::string &name, const std::string &type,
   }
 
   // Memory Bandwidth
-  if (metrics.total_bytes > 0) {
+  if (metrics.total_bytes > 0 && stats.avg_ns > 0) {
     double bw = static_cast<double>(metrics.total_bytes) / stats.avg_ns;
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(1) << bw << " GB/s";

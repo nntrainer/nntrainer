@@ -22,6 +22,7 @@
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -57,37 +58,108 @@ convert_f32_to_f16_u16(const std::vector<float> &f32_vec) {
 /**
  * @brief Test fixture for element-wise operation benchmarks
  */
-class Bench_EleOps : public ::testing::TestWithParam<unsigned int> {};
+class Bench_EleOps : public ::testing::Test {};
 
-TEST_P(Bench_EleOps, ele_sub) {
-  const unsigned int N = GetParam();
+TEST_F(Bench_EleOps, ele_sub) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
 
-  {
-    auto X = generate_random_vector<float>(N);
-    auto Y = generate_random_vector<float>(N, 0.1f, 1.0f);
-    std::vector<float> Z(N);
+    {
+      auto X = generate_random_vector<float>(N);
+      auto Y = generate_random_vector<float>(N, 0.1f, 1.0f);
+      std::vector<float> Z(N);
 
-    auto stats = bench::measure(
-      [&]() {
-        nntrainer::ele_sub(N, X.data(), Y.data(), Z.data(), 1.f, 0.f, 1, 1);
-      },
-      g_bench_warmup, g_bench_iters);
+      auto stats = bench::measure(
+        [&]() {
+          nntrainer::ele_sub(N, X.data(), Y.data(), Z.data(), 1.f, 0.f, 1, 1);
+        },
+        g_bench_warmup, g_bench_iters);
 
-    bench::Metrics m;
-    m.num_elements = N;
-    m.total_bytes = 3 * N * sizeof(float);
-    bench::report("ele_sub", "FP32", "N=" + std::to_string(N), stats, m);
-  }
+      bench::Metrics m;
+      m.num_elements = N;
+      m.total_bytes = 3 * N * sizeof(float);
+      bench::report("ele_sub", "FP32", "N=" + std::to_string(N), stats, m);
+    }
 
 #ifdef ENABLE_FP16
-  {
+    {
+      auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
+      auto Y_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
+      std::vector<uint16_t> Z(N);
+
+      auto stats = bench::measure(
+        [&]() {
+          nntrainer::ele_sub(N, (const _FP16 *)X_u16.data(),
+                             (const _FP16 *)Y_u16.data(), (_FP16 *)Z.data(),
+                             1.f, 0.f, 1, 1);
+        },
+        g_bench_warmup, g_bench_iters);
+
+      bench::Metrics m;
+      m.num_elements = N;
+      m.total_bytes = 3 * N * sizeof(uint16_t);
+      bench::report("ele_sub", "FP16", "N=" + std::to_string(N), stats, m);
+    }
+#endif
+  }
+}
+
+TEST_F(Bench_EleOps, ele_div) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
+
+    {
+      auto X = generate_random_vector<float>(N);
+      auto Y = generate_random_vector<float>(N, 0.1f, 2.0f);
+      std::vector<float> Z(N);
+
+      auto stats = bench::measure(
+        [&]() {
+          nntrainer::ele_div(N, X.data(), Y.data(), Z.data(), 1.f, 0.f, 1, 1);
+        },
+        g_bench_warmup, g_bench_iters);
+
+      bench::Metrics m;
+      m.num_elements = N;
+      m.total_bytes = 3 * N * sizeof(float);
+      bench::report("ele_div", "FP32", "N=" + std::to_string(N), stats, m);
+    }
+
+#ifdef ENABLE_FP16
+    {
+      auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
+      auto Y_u16 =
+        convert_f32_to_f16_u16(generate_random_vector<float>(N, 0.1f, 2.0f));
+      std::vector<uint16_t> Z(N);
+
+      auto stats = bench::measure(
+        [&]() {
+          nntrainer::ele_div(N, (const _FP16 *)X_u16.data(),
+                             (const _FP16 *)Y_u16.data(), (_FP16 *)Z.data(),
+                             1.f, 0.f, 1, 1);
+        },
+        g_bench_warmup, g_bench_iters);
+
+      bench::Metrics m;
+      m.num_elements = N;
+      m.total_bytes = 3 * N * sizeof(uint16_t);
+      bench::report("ele_div", "FP16", "N=" + std::to_string(N), stats, m);
+    }
+#endif
+  }
+}
+
+#ifdef ENABLE_FP16
+TEST_F(Bench_EleOps, ele_mul) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
     auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
     auto Y_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
     std::vector<uint16_t> Z(N);
 
     auto stats = bench::measure(
       [&]() {
-        nntrainer::ele_sub(N, (const _FP16 *)X_u16.data(),
+        nntrainer::ele_mul(N, (const _FP16 *)X_u16.data(),
                            (const _FP16 *)Y_u16.data(), (_FP16 *)Z.data(), 1.f,
                            0.f, 1, 1);
       },
@@ -96,41 +168,20 @@ TEST_P(Bench_EleOps, ele_sub) {
     bench::Metrics m;
     m.num_elements = N;
     m.total_bytes = 3 * N * sizeof(uint16_t);
-    bench::report("ele_sub", "FP16", "N=" + std::to_string(N), stats, m);
+    bench::report("ele_mul", "FP16", "N=" + std::to_string(N), stats, m);
   }
-#endif
 }
 
-TEST_P(Bench_EleOps, ele_div) {
-  const unsigned int N = GetParam();
-
-  {
-    auto X = generate_random_vector<float>(N);
-    auto Y = generate_random_vector<float>(N, 0.1f, 2.0f);
-    std::vector<float> Z(N);
-
-    auto stats = bench::measure(
-      [&]() {
-        nntrainer::ele_div(N, X.data(), Y.data(), Z.data(), 1.f, 0.f, 1, 1);
-      },
-      g_bench_warmup, g_bench_iters);
-
-    bench::Metrics m;
-    m.num_elements = N;
-    m.total_bytes = 3 * N * sizeof(float);
-    bench::report("ele_div", "FP32", "N=" + std::to_string(N), stats, m);
-  }
-
-#ifdef ENABLE_FP16
-  {
+TEST_F(Bench_EleOps, ele_add) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
     auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-    auto Y_u16 =
-      convert_f32_to_f16_u16(generate_random_vector<float>(N, 0.1f, 2.0f));
+    auto Y_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
     std::vector<uint16_t> Z(N);
 
     auto stats = bench::measure(
       [&]() {
-        nntrainer::ele_div(N, (const _FP16 *)X_u16.data(),
+        nntrainer::ele_add(N, (const _FP16 *)X_u16.data(),
                            (const _FP16 *)Y_u16.data(), (_FP16 *)Z.data(), 1.f,
                            0.f, 1, 1);
       },
@@ -139,55 +190,10 @@ TEST_P(Bench_EleOps, ele_div) {
     bench::Metrics m;
     m.num_elements = N;
     m.total_bytes = 3 * N * sizeof(uint16_t);
-    bench::report("ele_div", "FP16", "N=" + std::to_string(N), stats, m);
+    bench::report("ele_add", "FP16", "N=" + std::to_string(N), stats, m);
   }
-#endif
-}
-
-#ifdef ENABLE_FP16
-TEST_P(Bench_EleOps, ele_mul) {
-  const unsigned int N = GetParam();
-  auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-  auto Y_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-  std::vector<uint16_t> Z(N);
-
-  auto stats = bench::measure(
-    [&]() {
-      nntrainer::ele_mul(N, (const _FP16 *)X_u16.data(),
-                         (const _FP16 *)Y_u16.data(), (_FP16 *)Z.data(), 1.f,
-                         0.f, 1, 1);
-    },
-    g_bench_warmup, g_bench_iters);
-
-  bench::Metrics m;
-  m.num_elements = N;
-  m.total_bytes = 3 * N * sizeof(uint16_t);
-  bench::report("ele_mul", "FP16", "N=" + std::to_string(N), stats, m);
-}
-
-TEST_P(Bench_EleOps, ele_add) {
-  const unsigned int N = GetParam();
-  auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-  auto Y_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-  std::vector<uint16_t> Z(N);
-
-  auto stats = bench::measure(
-    [&]() {
-      nntrainer::ele_add(N, (const _FP16 *)X_u16.data(),
-                         (const _FP16 *)Y_u16.data(), (_FP16 *)Z.data(), 1.f,
-                         0.f, 1, 1);
-    },
-    g_bench_warmup, g_bench_iters);
-
-  bench::Metrics m;
-  m.num_elements = N;
-  m.total_bytes = 3 * N * sizeof(uint16_t);
-  bench::report("ele_add", "FP16", "N=" + std::to_string(N), stats, m);
 }
 #endif
-
-GTEST_PARAMETER_TEST(Sizes, Bench_EleOps,
-                     ::testing::ValuesIn(g_bench_sizes));
 
 // ============================================================================
 // Activation / Reduction Benchmarks (FP32 vs FP16 interleaved)
@@ -196,165 +202,172 @@ GTEST_PARAMETER_TEST(Sizes, Bench_EleOps,
 /**
  * @brief Test fixture for activation and reduction benchmarks
  */
-class Bench_Activations : public ::testing::TestWithParam<unsigned int> {};
+class Bench_Activations : public ::testing::Test {};
 
-TEST_P(Bench_Activations, softmax) {
-  const unsigned int N = GetParam();
+TEST_F(Bench_Activations, softmax) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
 
-  {
+    {
+      auto X = generate_random_vector<float>(N);
+      std::vector<float> Y(N);
+
+      auto stats =
+        bench::measure([&]() { nntrainer::softmax(N, X.data(), Y.data()); },
+                       g_bench_warmup, g_bench_iters);
+
+      bench::Metrics m;
+      m.num_elements = N;
+      bench::report("softmax", "FP32", "N=" + std::to_string(N), stats, m);
+    }
+
+#ifdef ENABLE_FP16
+    {
+      auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
+      std::vector<uint16_t> Y(N);
+
+      auto stats = bench::measure(
+        [&]() {
+          nntrainer::softmax(N, (_FP16 *)X_u16.data(), (_FP16 *)Y.data());
+        },
+        g_bench_warmup, g_bench_iters);
+
+      bench::Metrics m;
+      m.num_elements = N;
+      bench::report("softmax", "FP16", "N=" + std::to_string(N), stats, m);
+    }
+#endif
+  }
+}
+
+TEST_F(Bench_Activations, tanh_gelu) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
     auto X = generate_random_vector<float>(N);
     std::vector<float> Y(N);
 
     auto stats =
-      bench::measure([&]() { nntrainer::softmax(N, X.data(), Y.data()); },
+      bench::measure([&]() { nntrainer::tanh_gelu(N, X.data(), Y.data()); },
                      g_bench_warmup, g_bench_iters);
 
     bench::Metrics m;
     m.num_elements = N;
-    bench::report("softmax", "FP32", "N=" + std::to_string(N), stats, m);
+    bench::report("tanh_gelu", "FP32", "N=" + std::to_string(N), stats, m);
   }
+}
 
-#ifdef ENABLE_FP16
-  {
-    auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-    std::vector<uint16_t> Y(N);
+TEST_F(Bench_Activations, tanh_gelu_mul) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
+    auto Y_in = generate_random_vector<float>(N);
+    auto Z_in = generate_random_vector<float>(N);
+    std::vector<float> X(N);
 
     auto stats = bench::measure(
       [&]() {
-        nntrainer::softmax(N, (_FP16 *)X_u16.data(), (_FP16 *)Y.data());
+        nntrainer::tanh_gelu_mul(N, X.data(), Y_in.data(), Z_in.data());
       },
       g_bench_warmup, g_bench_iters);
 
     bench::Metrics m;
     m.num_elements = N;
-    bench::report("softmax", "FP16", "N=" + std::to_string(N), stats, m);
+    bench::report("tanh_gelu_mul", "FP32", "N=" + std::to_string(N), stats, m);
   }
+}
+
+TEST_F(Bench_Activations, inv_sqrt_inplace) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
+
+    {
+      auto X_orig = generate_random_vector<float>(N, 0.01f, 10.0f);
+      auto X_tmp = X_orig;
+
+      auto stats = bench::measure_with_setup(
+        [&]() { std::copy(X_orig.begin(), X_orig.end(), X_tmp.begin()); },
+        [&]() { nntrainer::inv_sqrt_inplace(N, X_tmp.data()); }, g_bench_warmup,
+        g_bench_iters);
+
+      bench::Metrics m;
+      m.num_elements = N;
+      bench::report("inv_sqrt_inplace", "FP32", "N=" + std::to_string(N), stats,
+                    m);
+    }
+
+#ifdef ENABLE_FP16
+    {
+      auto X_orig =
+        convert_f32_to_f16_u16(generate_random_vector<float>(N, 0.01f, 10.0f));
+      auto X_u16 = X_orig;
+
+      auto stats = bench::measure_with_setup(
+        [&]() { X_u16 = X_orig; },
+        [&]() { nntrainer::inv_sqrt_inplace(N, (_FP16 *)X_u16.data()); },
+        g_bench_warmup, g_bench_iters);
+
+      bench::Metrics m;
+      m.num_elements = N;
+      bench::report("inv_sqrt_inplace", "FP16", "N=" + std::to_string(N), stats,
+                    m);
+    }
 #endif
+  }
 }
 
-TEST_P(Bench_Activations, tanh_gelu) {
-  const unsigned int N = GetParam();
-  auto X = generate_random_vector<float>(N);
-  std::vector<float> Y(N);
+TEST_F(Bench_Activations, max_val) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
 
-  auto stats =
-    bench::measure([&]() { nntrainer::tanh_gelu(N, X.data(), Y.data()); },
-                   g_bench_warmup, g_bench_iters);
+    {
+      auto X = generate_random_vector<float>(N);
 
-  bench::Metrics m;
-  m.num_elements = N;
-  bench::report("tanh_gelu", "FP32", "N=" + std::to_string(N), stats, m);
+      float val = 0.0f;
+      auto stats =
+        bench::measure([&]() { val = nntrainer::max_val(N, X.data()); },
+                       g_bench_warmup, g_bench_iters);
+
+      bench::Metrics m;
+      m.num_elements = N;
+      bench::report("max_val", "FP32", "N=" + std::to_string(N), stats, m);
+    }
+
+#ifdef ENABLE_FP16
+    {
+      auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
+
+      auto stats =
+        bench::measure([&]() { nntrainer::max_val(N, (_FP16 *)X_u16.data()); },
+                       g_bench_warmup, g_bench_iters);
+
+      bench::Metrics m;
+      m.num_elements = N;
+      bench::report("max_val", "FP16", "N=" + std::to_string(N), stats, m);
+    }
+#endif
+  }
 }
 
-TEST_P(Bench_Activations, tanh_gelu_mul) {
-  const unsigned int N = GetParam();
-  auto Y_in = generate_random_vector<float>(N);
-  auto Z_in = generate_random_vector<float>(N);
-  std::vector<float> X(N);
-
-  auto stats = bench::measure(
-    [&]() { nntrainer::tanh_gelu_mul(N, X.data(), Y_in.data(), Z_in.data()); },
-    g_bench_warmup, g_bench_iters);
-
-  bench::Metrics m;
-  m.num_elements = N;
-  bench::report("tanh_gelu_mul", "FP32", "N=" + std::to_string(N), stats, m);
-}
-
-TEST_P(Bench_Activations, inv_sqrt_inplace) {
-  const unsigned int N = GetParam();
-
-  {
-    auto X_orig = generate_random_vector<float>(N, 0.01f, 10.0f);
-    auto X_tmp = X_orig;
+#ifdef ENABLE_FP16
+TEST_F(Bench_Activations, swiglu) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
+    auto Y_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
+    auto Z_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
+    std::vector<uint16_t> X(N);
 
     auto stats = bench::measure(
       [&]() {
-        std::copy(X_orig.begin(), X_orig.end(), X_tmp.begin());
-        nntrainer::inv_sqrt_inplace(N, X_tmp.data());
+        nntrainer::swiglu(N, (_FP16 *)X.data(), (_FP16 *)Y_u16.data(),
+                          (_FP16 *)Z_u16.data());
       },
       g_bench_warmup, g_bench_iters);
 
     bench::Metrics m;
     m.num_elements = N;
-    bench::report("inv_sqrt_inplace", "FP32", "N=" + std::to_string(N), stats,
-                  m);
+    bench::report("swiglu", "FP16", "N=" + std::to_string(N), stats, m);
   }
-
-#ifdef ENABLE_FP16
-  {
-    auto X_orig =
-      convert_f32_to_f16_u16(generate_random_vector<float>(N, 0.01f, 10.0f));
-    auto X_u16 = X_orig;
-
-    auto stats = bench::measure(
-      [&]() {
-        X_u16 = X_orig;
-        nntrainer::inv_sqrt_inplace(N, (_FP16 *)X_u16.data());
-      },
-      g_bench_warmup, g_bench_iters);
-
-    bench::Metrics m;
-    m.num_elements = N;
-    bench::report("inv_sqrt_inplace", "FP16", "N=" + std::to_string(N), stats,
-                  m);
-  }
-#endif
-}
-
-TEST_P(Bench_Activations, max_val) {
-  const unsigned int N = GetParam();
-
-  {
-    auto X = generate_random_vector<float>(N);
-
-    float val = 0.0f;
-    auto stats =
-      bench::measure([&]() { val = nntrainer::max_val(N, X.data()); },
-                     g_bench_warmup, g_bench_iters);
-
-    bench::Metrics m;
-    m.num_elements = N;
-    bench::report("max_val", "FP32", "N=" + std::to_string(N), stats, m);
-  }
-
-#ifdef ENABLE_FP16
-  {
-    auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-
-    auto stats =
-      bench::measure([&]() { nntrainer::max_val(N, (_FP16 *)X_u16.data()); },
-                     g_bench_warmup, g_bench_iters);
-
-    bench::Metrics m;
-    m.num_elements = N;
-    bench::report("max_val", "FP16", "N=" + std::to_string(N), stats, m);
-  }
-#endif
-}
-
-#ifdef ENABLE_FP16
-TEST_P(Bench_Activations, swiglu) {
-  const unsigned int N = GetParam();
-  auto Y_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-  auto Z_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-  std::vector<uint16_t> X(N);
-
-  auto stats = bench::measure(
-    [&]() {
-      nntrainer::swiglu(N, (_FP16 *)X.data(), (_FP16 *)Y_u16.data(),
-                        (_FP16 *)Z_u16.data());
-    },
-    g_bench_warmup, g_bench_iters);
-
-  bench::Metrics m;
-  m.num_elements = N;
-  bench::report("swiglu", "FP16", "N=" + std::to_string(N), stats, m);
 }
 #endif
-
-GTEST_PARAMETER_TEST(Sizes, Bench_Activations,
-                     ::testing::ValuesIn(g_bench_sizes));
 
 // ============================================================================
 // Multihead Row-Softmax Benchmarks (FP32 vs FP16 interleaved)
@@ -372,16 +385,16 @@ class Bench_SoftmaxRow
 TEST_P(Bench_SoftmaxRow, softmax_row_inplace) {
   auto [num_rows, num_heads] = GetParam();
   const unsigned int N = num_rows * num_heads;
-  std::string sz = "rows=" + std::to_string(num_rows) +
-                   ",heads=" + std::to_string(num_heads);
+  std::string sz =
+    "rows=" + std::to_string(num_rows) + ",heads=" + std::to_string(num_heads);
 
   {
     auto X_orig = generate_random_vector<float>(N);
     auto X = X_orig;
 
-    auto stats = bench::measure(
+    auto stats = bench::measure_with_setup(
+      [&]() { std::copy(X_orig.begin(), X_orig.end(), X.begin()); },
       [&]() {
-        std::copy(X_orig.begin(), X_orig.end(), X.begin());
         nntrainer::softmax_row_inplace(X.data(), size_t{0},
                                        static_cast<size_t>(num_rows),
                                        static_cast<size_t>(num_heads));
@@ -398,15 +411,15 @@ TEST_P(Bench_SoftmaxRow, softmax_row_inplace) {
     auto X_orig = convert_f32_to_f16_u16(generate_random_vector<float>(N));
     auto X = X_orig;
 
-    auto stats = bench::measure(
-      [&]() {
-        X = X_orig;
-        nntrainer::softmax_row_inplace((_FP16 *)X.data(), size_t{0},
-                                       static_cast<size_t>(num_rows),
-                                       static_cast<size_t>(num_heads),
-                                       /*sink=*/nullptr);
-      },
-      g_bench_warmup, g_bench_iters);
+    auto stats = bench::measure_with_setup([&]() { X = X_orig; },
+                                           [&]() {
+                                             nntrainer::softmax_row_inplace(
+                                               (_FP16 *)X.data(), size_t{0},
+                                               static_cast<size_t>(num_rows),
+                                               static_cast<size_t>(num_heads),
+                                               /*sink=*/nullptr);
+                                           },
+                                           g_bench_warmup, g_bench_iters);
 
     bench::Metrics m;
     m.num_elements = N;
@@ -492,66 +505,67 @@ GTEST_PARAMETER_TEST(
 /**
  * @brief Test fixture for FP16 BLAS operation benchmarks
  */
-class Bench_FP16_BLAS : public ::testing::TestWithParam<unsigned int> {};
+class Bench_FP16_BLAS : public ::testing::Test {};
 
-TEST_P(Bench_FP16_BLAS, sdot) {
-  const unsigned int N = GetParam();
-  auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-  auto Y_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
+TEST_F(Bench_FP16_BLAS, sdot) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
+    auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
+    auto Y_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
 
-  auto stats = bench::measure(
-    [&]() {
-      nntrainer::sdot(N, (const _FP16 *)X_u16.data(), 1,
-                      (const _FP16 *)Y_u16.data(), 1);
-    },
-    g_bench_warmup, g_bench_iters);
+    auto stats = bench::measure(
+      [&]() {
+        nntrainer::sdot(N, (const _FP16 *)X_u16.data(), 1,
+                        (const _FP16 *)Y_u16.data(), 1);
+      },
+      g_bench_warmup, g_bench_iters);
 
-  bench::Metrics m;
-  m.num_elements = N;
-  m.total_bytes = 2 * N * sizeof(uint16_t);
-  bench::report("sdot", "FP16", "N=" + std::to_string(N), stats, m);
+    bench::Metrics m;
+    m.num_elements = N;
+    m.total_bytes = 2 * N * sizeof(uint16_t);
+    bench::report("sdot", "FP16", "N=" + std::to_string(N), stats, m);
+  }
 }
 
-TEST_P(Bench_FP16_BLAS, saxpy) {
-  const unsigned int N = GetParam();
-  auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-  auto Y_orig = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-  auto Y_u16 = Y_orig;
+TEST_F(Bench_FP16_BLAS, saxpy) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
+    auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
+    auto Y_orig = convert_f32_to_f16_u16(generate_random_vector<float>(N));
+    auto Y_u16 = Y_orig;
 
-  auto stats = bench::measure(
-    [&]() {
-      Y_u16 = Y_orig;
-      nntrainer::saxpy(N, 2.0f, (const _FP16 *)X_u16.data(), 1,
-                       (_FP16 *)Y_u16.data(), 1);
-    },
-    g_bench_warmup, g_bench_iters);
+    auto stats = bench::measure_with_setup(
+      [&]() { Y_u16 = Y_orig; },
+      [&]() {
+        nntrainer::saxpy(N, 2.0f, (const _FP16 *)X_u16.data(), 1,
+                         (_FP16 *)Y_u16.data(), 1);
+      },
+      g_bench_warmup, g_bench_iters);
 
-  bench::Metrics m;
-  m.num_elements = N;
-  m.total_bytes = 3 * N * sizeof(uint16_t);
-  bench::report("saxpy", "FP16", "N=" + std::to_string(N), stats, m);
+    bench::Metrics m;
+    m.num_elements = N;
+    m.total_bytes = 3 * N * sizeof(uint16_t);
+    bench::report("saxpy", "FP16", "N=" + std::to_string(N), stats, m);
+  }
 }
 
-TEST_P(Bench_FP16_BLAS, sscal) {
-  const unsigned int N = GetParam();
-  auto X_orig = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-  auto X_u16 = X_orig;
+TEST_F(Bench_FP16_BLAS, sscal) {
+  for (const unsigned int N : g_bench_sizes) {
+    SCOPED_TRACE("N=" + std::to_string(N));
+    auto X_orig = convert_f32_to_f16_u16(generate_random_vector<float>(N));
+    auto X_u16 = X_orig;
 
-  auto stats = bench::measure(
-    [&]() {
-      X_u16 = X_orig;
-      nntrainer::sscal(N, 0.5f, (_FP16 *)X_u16.data(), 1);
-    },
-    g_bench_warmup, g_bench_iters);
+    auto stats = bench::measure_with_setup(
+      [&]() { X_u16 = X_orig; },
+      [&]() { nntrainer::sscal(N, 0.5f, (_FP16 *)X_u16.data(), 1); },
+      g_bench_warmup, g_bench_iters);
 
-  bench::Metrics m;
-  m.num_elements = N;
-  m.total_bytes = N * sizeof(uint16_t);
-  bench::report("sscal", "FP16", "N=" + std::to_string(N), stats, m);
+    bench::Metrics m;
+    m.num_elements = N;
+    m.total_bytes = N * sizeof(uint16_t);
+    bench::report("sscal", "FP16", "N=" + std::to_string(N), stats, m);
+  }
 }
-
-GTEST_PARAMETER_TEST(Sizes, Bench_FP16_BLAS,
-                     ::testing::ValuesIn(g_bench_sizes));
 
 // ============================================================================
 // GEMM Benchmarks (Performance)
@@ -564,9 +578,8 @@ using GemvParams = std::tuple<unsigned int, unsigned int>;
 static std::string make_hgemm_size_label(unsigned int M, unsigned int N,
                                          unsigned int K, bool TransA,
                                          bool TransB) {
-  return std::to_string(M) + "x" + std::to_string(N) + "x" +
-         std::to_string(K) + " " + (TransA ? "T" : "N") +
-         (TransB ? "T" : "N");
+  return std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K) +
+         " " + (TransA ? "T" : "N") + (TransB ? "T" : "N");
 }
 
 /**
@@ -579,10 +592,8 @@ TEST_P(Bench_X86_FP16_HGEMM, via_sgemm_dispatch) {
   const unsigned int lda = TransA ? M : K;
   const unsigned int ldb = TransB ? K : N;
   const unsigned int ldc = N;
-  const std::size_t a_size =
-    static_cast<std::size_t>(TransA ? K : M) * lda;
-  const std::size_t b_size =
-    static_cast<std::size_t>(TransB ? N : K) * ldb;
+  const std::size_t a_size = static_cast<std::size_t>(TransA ? K : M) * lda;
+  const std::size_t b_size = static_cast<std::size_t>(TransB ? N : K) * ldb;
   const std::size_t c_size = static_cast<std::size_t>(M) * ldc;
 
   auto A_fp32 = generate_random_vector<float>(a_size, -0.25f, 0.25f);
@@ -602,10 +613,9 @@ TEST_P(Bench_X86_FP16_HGEMM, via_sgemm_dispatch) {
   auto fp16_stats = bench::measure(
     [&]() {
       // The public FP16 sgemm path dispatches to the x86 hgemm implementation.
-      nntrainer::sgemm(0, TransA, TransB, M, N, K, 1.0f,
-                       (const _FP16 *)A_u16.data(), lda,
-                       (const _FP16 *)B_u16.data(), ldb, 0.0f,
-                       (_FP16 *)C_u16.data(), ldc);
+      nntrainer::sgemm(
+        0, TransA, TransB, M, N, K, 1.0f, (const _FP16 *)A_u16.data(), lda,
+        (const _FP16 *)B_u16.data(), ldb, 0.0f, (_FP16 *)C_u16.data(), ldc);
     },
     g_bench_warmup, g_bench_iters);
 
@@ -646,29 +656,28 @@ TEST_P(Bench_FP16_GEMV, sgemv) {
   bench::report("sgemv", "FP16", sz, stats, m);
 }
 
-GTEST_PARAMETER_TEST(HgemmDims, Bench_X86_FP16_HGEMM,
-                     ::testing::Values(
-                       HgemmParams{64, 64, 64, false, false},
-                       HgemmParams{256, 256, 256, false, false},
-                       HgemmParams{1024, 1024, 1024, false, false},
-                       HgemmParams{97, 53, 71, false, false},
-                       HgemmParams{7, 17, 33, false, false},
-                       HgemmParams{1, 768, 1024, false, false},
-                       HgemmParams{1, 3072, 512, false, false},
-                       HgemmParams{1, 4096, 4096, false, false},
-                       HgemmParams{16, 1024, 1024, false, false},
-                       HgemmParams{16, 4096, 4096, false, false},
-                       HgemmParams{128, 4096, 4096, false, false},
-                       HgemmParams{256, 1024, 1024, false, false},
-                       HgemmParams{256, 3072, 3072, false, false},
-                       HgemmParams{1024, 3072, 3072, false, false},
-                       HgemmParams{64, 64, 64, false, true},
-                       HgemmParams{64, 64, 64, true, false},
-                       HgemmParams{64, 64, 64, true, true}));
+GTEST_PARAMETER_TEST(
+  HgemmDims, Bench_X86_FP16_HGEMM,
+  ::testing::Values(HgemmParams{64, 64, 64, false, false},
+                    HgemmParams{256, 256, 256, false, false},
+                    HgemmParams{1024, 1024, 1024, false, false},
+                    HgemmParams{97, 53, 71, false, false},
+                    HgemmParams{7, 17, 33, false, false},
+                    HgemmParams{1, 768, 1024, false, false},
+                    HgemmParams{1, 3072, 512, false, false},
+                    HgemmParams{1, 4096, 4096, false, false},
+                    HgemmParams{16, 1024, 1024, false, false},
+                    HgemmParams{16, 4096, 4096, false, false},
+                    HgemmParams{128, 4096, 4096, false, false},
+                    HgemmParams{256, 1024, 1024, false, false},
+                    HgemmParams{256, 3072, 3072, false, false},
+                    HgemmParams{1024, 3072, 3072, false, false},
+                    HgemmParams{64, 64, 64, false, true},
+                    HgemmParams{64, 64, 64, true, false},
+                    HgemmParams{64, 64, 64, true, true}));
 
 GTEST_PARAMETER_TEST(GemvDims, Bench_FP16_GEMV,
-                     ::testing::Values(GemvParams{1, 768},
-                                       GemvParams{16, 1024},
+                     ::testing::Values(GemvParams{1, 768}, GemvParams{16, 1024},
                                        GemvParams{256, 1024},
                                        GemvParams{256, 3072},
                                        GemvParams{1024, 3072}));
@@ -683,12 +692,12 @@ GTEST_PARAMETER_TEST(GemvDims, Bench_FP16_GEMV,
 // ============================================================================
 
 using AttnParams = std::tuple<int, int, int, size_t>;
-static const auto kAttnConfigs = ::testing::Values(
-  AttnParams{64, 8, 1, 128}, AttnParams{64, 8, 4, 128},
-  AttnParams{128, 8, 1, 128}, AttnParams{128, 8, 4, 128},
-  AttnParams{128, 8, 8, 128}, AttnParams{128, 16, 1, 512},
-  AttnParams{128, 16, 4, 512}, AttnParams{128, 32, 1, 1024},
-  AttnParams{128, 32, 4, 1024}, AttnParams{128, 8, 4, 2048});
+static const auto kAttnConfigs =
+  ::testing::Values(AttnParams{64, 8, 1, 128}, AttnParams{64, 8, 4, 128},
+                    AttnParams{128, 8, 1, 128}, AttnParams{128, 8, 4, 128},
+                    AttnParams{128, 8, 8, 128}, AttnParams{128, 16, 1, 512},
+                    AttnParams{128, 16, 4, 512}, AttnParams{128, 32, 1, 1024},
+                    AttnParams{128, 32, 4, 1024}, AttnParams{128, 8, 4, 2048});
 
 // compute_kcaches needs to vary seq_len (=num_rows) and tile_size to actually
 // stress the kernel; head_dim is fixed at 128 (typical for current LLMs) and
@@ -697,13 +706,14 @@ static const auto kAttnConfigs = ::testing::Values(
 using KCacheParams = std::tuple<int, int, int, int>;
 static constexpr int kKCacheHeadDim = 128;
 static const auto kKCacheConfigs = ::testing::Values(
-  KCacheParams{128, 8, 1, 4},   KCacheParams{128, 8, 4, 4},
-  KCacheParams{512, 8, 1, 4},   KCacheParams{512, 8, 4, 4},
+  KCacheParams{128, 8, 1, 4}, KCacheParams{128, 8, 4, 4},
+  KCacheParams{512, 8, 1, 4}, KCacheParams{512, 8, 4, 4},
   KCacheParams{1024, 16, 1, 4}, KCacheParams{1024, 16, 4, 4},
   KCacheParams{2048, 32, 1, 4}, KCacheParams{2048, 32, 4, 4},
   KCacheParams{1024, 16, 1, 8}, KCacheParams{1024, 16, 1, 16});
 
-// ---- Set A: FP32 Q + uint16(FP16-bits) KV cache (available in all builds) ----
+// ---- Set A: FP32 Q + uint16(FP16-bits) KV cache (available in all builds)
+// ----
 
 /**
  * @brief Test fixture for compute_kcaches benchmarks (FP32 Q, uint16 KV)
@@ -749,9 +759,10 @@ class Bench_Attention : public ::testing::TestWithParam<AttnParams> {};
 TEST_P(Bench_Attention, compute_fp16vcache) {
   auto [head_dim, num_cache_head, gqa_size, window_size] = GetParam();
   int total_heads = num_cache_head * gqa_size;
-  int row_num = (int)window_size;
+  int row_num = static_cast<int>(window_size) - 1;
+  const int attention_rows = row_num + 1;
 
-  auto in_f32 = generate_random_vector<float>(total_heads * row_num);
+  auto in_f32 = generate_random_vector<float>(total_heads * attention_rows);
   auto vcache_f32 =
     generate_random_vector<float>(num_cache_head * (int)window_size * head_dim);
   auto vcache_u16 = convert_f32_to_f16_u16(vcache_f32);
@@ -791,8 +802,8 @@ TEST_P(Bench_KCache_FP16, compute_kcaches) {
   const int total_heads = num_cache_head * gqa_size;
   const size_t local_window_size = static_cast<size_t>(seq_len);
 
-  auto in_u16 =
-    convert_f32_to_f16_u16(generate_random_vector<float>(total_heads * head_dim));
+  auto in_u16 = convert_f32_to_f16_u16(
+    generate_random_vector<float>(total_heads * head_dim));
   auto kcache_u16 = convert_f32_to_f16_u16(
     generate_random_vector<float>(num_cache_head * seq_len * head_dim));
   std::vector<uint16_t> output(total_heads * seq_len, 0);
@@ -825,20 +836,21 @@ class Bench_Attention_FP16 : public ::testing::TestWithParam<AttnParams> {};
 TEST_P(Bench_Attention_FP16, compute_fp16vcache_transposed) {
   auto [head_dim, num_cache_head, gqa_size, window_size] = GetParam();
   int total_heads = num_cache_head * gqa_size;
-  int row_num = (int)window_size;
+  int row_num = static_cast<int>(window_size) - 1;
+  const int attention_rows = row_num + 1;
 
-  auto in_u16 =
-    convert_f32_to_f16_u16(generate_random_vector<float>(total_heads * row_num));
-  auto vcache_u16 = convert_f32_to_f16_u16(
-    generate_random_vector<float>(num_cache_head * (int)window_size * head_dim));
+  auto in_u16 = convert_f32_to_f16_u16(
+    generate_random_vector<float>(total_heads * attention_rows));
+  auto vcache_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(
+    num_cache_head * (int)window_size * head_dim));
   std::vector<uint16_t> output(total_heads * head_dim, 0);
 
   auto stats = bench::measure(
     [&]() {
       nntrainer::compute_fp16vcache_transposed(
-        row_num, (const _FP16 *)in_u16.data(),
-        (const _FP16 *)vcache_u16.data(), (_FP16 *)output.data(),
-        num_cache_head, gqa_size, head_dim, window_size);
+        row_num, (const _FP16 *)in_u16.data(), (const _FP16 *)vcache_u16.data(),
+        (_FP16 *)output.data(), num_cache_head, gqa_size, head_dim,
+        window_size);
     },
     g_bench_warmup, g_bench_iters);
 
@@ -871,14 +883,16 @@ static void parse_bench_args(int *argc, char **argv) {
       if (v >= 0)
         g_bench_warmup = static_cast<unsigned int>(v);
     } else if (strncmp(argv[i], "--bench_sizes=", 14) == 0) {
-      g_bench_sizes.clear();
+      std::vector<unsigned int> parsed_sizes;
       std::istringstream ss(argv[i] + 14);
       std::string token;
       while (std::getline(ss, token, ',')) {
         int v = atoi(token.c_str());
         if (v > 0)
-          g_bench_sizes.push_back(static_cast<unsigned int>(v));
+          parsed_sizes.push_back(static_cast<unsigned int>(v));
       }
+      if (!parsed_sizes.empty())
+        g_bench_sizes = parsed_sizes;
     } else {
       argv[out++] = argv[i];
     }
