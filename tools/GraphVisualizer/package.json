@@ -1,0 +1,121 @@
+{
+  "name": "nntrainer-graph-visualizer",
+  "displayName": "NNTrainer Graph Visualizer",
+  "description": "Visualize and verify TorchFXConverter results: compare PyTorch FX graphs with NNTrainer converted graphs",
+  "version": "0.1.0",
+  "publisher": "nntrainer",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nntrainer/nntrainer.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization",
+    "Machine Learning"
+  ],
+  "activationEvents": [
+    "onCommand:nntrainerGraph.convert",
+    "onCommand:nntrainerGraph.convertLocalModel",
+    "onCommand:nntrainerGraph.openVisualizer",
+    "onCommand:nntrainerGraph.profile",
+    "onCommand:nntrainerGraph.profileLocalModel",
+    "onCommand:nntrainerGraph.loadProfile"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "nntrainerGraph.convert",
+        "title": "NNTrainer: Convert Model",
+        "icon": "$(play)"
+      },
+      {
+        "command": "nntrainerGraph.convertLocalModel",
+        "title": "NNTrainer: Convert Local PyTorch Model (.py)",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "nntrainerGraph.openVisualizer",
+        "title": "NNTrainer: Open Graph Visualizer",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "nntrainerGraph.profile",
+        "title": "NNTrainer: Profile Model",
+        "icon": "$(dashboard)"
+      },
+      {
+        "command": "nntrainerGraph.profileLocalModel",
+        "title": "NNTrainer: Profile Local PyTorch Model (.py)",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "nntrainerGraph.loadProfile",
+        "title": "NNTrainer: Load Profiler Results",
+        "icon": "$(file-symlink-file)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "nntrainer-graph",
+          "title": "NNTrainer Graph",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "nntrainer-graph": [
+        {
+          "id": "nntrainerGraph.modelExplorer",
+          "name": "Model Explorer"
+        },
+        {
+          "id": "nntrainerGraph.nodeProperties",
+          "name": "Node Properties"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "NNTrainer Graph Visualizer",
+      "properties": {
+        "nntrainerGraph.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Path to Python interpreter with torch and transformers installed"
+        },
+        "nntrainerGraph.converterPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to TorchFXConverter directory (auto-detected if in nntrainer repo)"
+        },
+        "nntrainerGraph.defaultSeqLen": {
+          "type": "number",
+          "default": 8,
+          "description": "Default sequence length for model tracing"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "@vscode/vsce": "^2.32.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12",
+    "undici": "^6.20.1"
+  }
+}

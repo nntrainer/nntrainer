@@ -1,0 +1,341 @@
+Qwen3 Tiny Config Graph Dump
+Config: hidden=64, layers=2, heads=4, kv_heads=2
+head_dim=16, intermediate=128
+
+====================================================================================================
+LEAF MODULE NODES:
+====================================================================================================
+  model.embed_tokens                                 type=Embedding
+    args: ['input_ids']
+    meta.output_shape = (1, 8, 64)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.num_embeddings = 151936
+    meta.embedding_dim = 64
+    meta.producer_module = model.embed_tokens
+    meta.consumer_module = [('model.rotary_emb', 0), ('model.layers.0', 0), ('model.layers.0.input_layernorm', 0)]
+  model.layers.0.input_layernorm                     type=Qwen3RMSNorm
+    args: ['model_embed_tokens']
+    meta.output_shape = (1, 8, 64)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.is_rmsnorm = True
+    meta.eps = 1e-06
+    meta.producer_module = model.layers.0.input_layernorm
+    meta.consumer_module = [('model.layers.0.self_attn', 'hidden_states'), ('model.layers.0.self_attn.q_proj', 0), ('model.layers.0.self_attn.k_proj', 0), ('model.layers.0.self_attn.v_proj', 0)]
+  model.layers.0.self_attn.q_proj                    type=Linear
+    args: ['model_layers_0_input_layernorm']
+    meta.output_shape = (1, 8, 64)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 64
+    meta.producer_module = model.layers.0.self_attn.q_proj
+  model.layers.0.self_attn.q_norm                    type=Qwen3RMSNorm
+    args: ['model_layers_0_self_attn_view']
+    meta.output_shape = (1, 8, 4, 16)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.is_rmsnorm = True
+    meta.eps = 1e-06
+    meta.producer_module = model.layers.0.self_attn.q_norm
+  model.layers.0.self_attn.k_proj                    type=Linear
+    args: ['model_layers_0_input_layernorm']
+    meta.output_shape = (1, 8, 32)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 32
+    meta.producer_module = model.layers.0.self_attn.k_proj
+  model.layers.0.self_attn.k_norm                    type=Qwen3RMSNorm
+    args: ['model_layers_0_self_attn_view_1']
+    meta.output_shape = (1, 8, 2, 16)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.is_rmsnorm = True
+    meta.eps = 1e-06
+    meta.producer_module = model.layers.0.self_attn.k_norm
+  model.layers.0.self_attn.v_proj                    type=Linear
+    args: ['model_layers_0_input_layernorm']
+    meta.output_shape = (1, 8, 32)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 32
+    meta.producer_module = model.layers.0.self_attn.v_proj
+  model.layers.0.self_attn.o_proj                    type=Linear
+    args: ['model_layers_0_self_attn_contiguous_1']
+    meta.output_shape = (1, 8, 64)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 64
+    meta.producer_module = model.layers.0.self_attn.o_proj
+  model.layers.0.post_attention_layernorm            type=Qwen3RMSNorm
+    args: ['model_layers_0_add']
+    meta.output_shape = (1, 8, 64)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.is_rmsnorm = True
+    meta.eps = 1e-06
+    meta.producer_module = model.layers.0.post_attention_layernorm
+    meta.consumer_module = [('model.layers.0.mlp', 0), ('model.layers.0.mlp.gate_proj', 0), ('model.layers.0.mlp.up_proj', 0)]
+  model.layers.0.mlp.gate_proj                       type=Linear
+    args: ['model_layers_0_post_attention_layernorm']
+    meta.output_shape = (1, 8, 128)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 128
+    meta.producer_module = model.layers.0.mlp.gate_proj
+    meta.consumer_module = [('model.layers.0.mlp.act_fn', 0)]
+  model.layers.0.mlp.up_proj                         type=Linear
+    args: ['model_layers_0_post_attention_layernorm']
+    meta.output_shape = (1, 8, 128)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 128
+    meta.producer_module = model.layers.0.mlp.up_proj
+  model.layers.0.mlp.down_proj                       type=Linear
+    args: ['model_layers_0_mlp_mul']
+    meta.output_shape = (1, 8, 64)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 128
+    meta.out_features = 64
+    meta.producer_module = model.layers.0.mlp.down_proj
+  model.layers.1.input_layernorm                     type=Qwen3RMSNorm
+    args: ['model_layers_0_add_1']
+    meta.output_shape = (1, 8, 64)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.is_rmsnorm = True
+    meta.eps = 1e-06
+    meta.producer_module = model.layers.1.input_layernorm
+    meta.consumer_module = [('model.layers.1.self_attn', 'hidden_states'), ('model.layers.1.self_attn.q_proj', 0), ('model.layers.1.self_attn.k_proj', 0), ('model.layers.1.self_attn.v_proj', 0)]
+  model.layers.1.self_attn.q_proj                    type=Linear
+    args: ['model_layers_1_input_layernorm']
+    meta.output_shape = (1, 8, 64)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 64
+    meta.producer_module = model.layers.1.self_attn.q_proj
+  model.layers.1.self_attn.q_norm                    type=Qwen3RMSNorm
+    args: ['model_layers_1_self_attn_view']
+    meta.output_shape = (1, 8, 4, 16)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.is_rmsnorm = True
+    meta.eps = 1e-06
+    meta.producer_module = model.layers.1.self_attn.q_norm
+  model.layers.1.self_attn.k_proj                    type=Linear
+    args: ['model_layers_1_input_layernorm']
+    meta.output_shape = (1, 8, 32)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 32
+    meta.producer_module = model.layers.1.self_attn.k_proj
+  model.layers.1.self_attn.k_norm                    type=Qwen3RMSNorm
+    args: ['model_layers_1_self_attn_view_1']
+    meta.output_shape = (1, 8, 2, 16)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.is_rmsnorm = True
+    meta.eps = 1e-06
+    meta.producer_module = model.layers.1.self_attn.k_norm
+  model.layers.1.self_attn.v_proj                    type=Linear
+    args: ['model_layers_1_input_layernorm']
+    meta.output_shape = (1, 8, 32)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 32
+    meta.producer_module = model.layers.1.self_attn.v_proj
+  model.layers.1.self_attn.o_proj                    type=Linear
+    args: ['model_layers_1_self_attn_contiguous_1']
+    meta.output_shape = (1, 8, 64)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 64
+    meta.producer_module = model.layers.1.self_attn.o_proj
+  model.layers.1.post_attention_layernorm            type=Qwen3RMSNorm
+    args: ['model_layers_1_add']
+    meta.output_shape = (1, 8, 64)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.is_rmsnorm = True
+    meta.eps = 1e-06
+    meta.producer_module = model.layers.1.post_attention_layernorm
+    meta.consumer_module = [('model.layers.1.mlp', 0), ('model.layers.1.mlp.gate_proj', 0), ('model.layers.1.mlp.up_proj', 0)]
+  model.layers.1.mlp.gate_proj                       type=Linear
+    args: ['model_layers_1_post_attention_layernorm']
+    meta.output_shape = (1, 8, 128)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 128
+    meta.producer_module = model.layers.1.mlp.gate_proj
+    meta.consumer_module = [('model.layers.1.mlp.act_fn', 0)]
+  model.layers.1.mlp.up_proj                         type=Linear
+    args: ['model_layers_1_post_attention_layernorm']
+    meta.output_shape = (1, 8, 128)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 128
+    meta.producer_module = model.layers.1.mlp.up_proj
+  model.layers.1.mlp.down_proj                       type=Linear
+    args: ['model_layers_1_mlp_mul']
+    meta.output_shape = (1, 8, 64)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 128
+    meta.out_features = 64
+    meta.producer_module = model.layers.1.mlp.down_proj
+  model.norm                                         type=Qwen3RMSNorm
+    args: ['model_layers_1_add_1']
+    meta.output_shape = (1, 8, 64)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.is_rmsnorm = True
+    meta.eps = 1e-06
+    meta.producer_module = model.norm
+  lm_head                                            type=Linear
+    args: ['getitem']
+    meta.output_shape = (1, 8, 151936)
+    meta.has_weight = True
+    meta.has_bias = False
+    meta.in_features = 64
+    meta.out_features = 151936
+    meta.producer_module = lm_head
+
+====================================================================================================
+ALL NODES:
+====================================================================================================
+  [call_function  ] _set_grad_enabled                        target=_set_grad_enabled                        args=(False)
+  [placeholder    ] input_ids                                target=input_ids                                args=()
+  [call_module    ] model_embed_tokens                       target=model.embed_tokens                       args=(input_ids)
+  [call_function  ] model_arange                             target=arange                                   args=(8)
+  [call_method    ] model_add                                target=add                                      args=(model_arange, 0)
+  [call_method    ] model_unsqueeze                          target=unsqueeze                                args=(model_add, 0)
+  [call_function  ] model_rotary_emb__set_grad_enabled       target=_set_grad_enabled                        args=(False)
+  [get_attr       ] model_rotary_emb_inv_freq                target=model.rotary_emb.inv_freq                args=()
+  [call_method    ] model_rotary_emb___getitem__             target=__getitem__                              args=(model_rotary_emb_inv_freq, (None, slice(None, None, None), None))
+  [call_method    ] model_rotary_emb_float                   target=float                                    args=(model_rotary_emb___getitem__)
+  [call_method    ] model_rotary_emb_expand                  target=expand                                   args=(model_rotary_emb_float, 1, -1, 1)
+  [call_method    ] model_rotary_emb_to                      target=to                                       args=(model_rotary_emb_expand, cpu)
+  [call_method    ] model_rotary_emb___getitem___1           target=__getitem__                              args=(model_unsqueeze, (slice(None, None, None), None, slice(None, None, None)))
+  [call_method    ] model_rotary_emb_float_1                 target=float                                    args=(model_rotary_emb___getitem___1)
+  [call_method    ] model_rotary_emb_float_2                 target=float                                    args=(model_rotary_emb_to)
+  [call_method    ] model_rotary_emb_float_3                 target=float                                    args=(model_rotary_emb_float_1)
+  [call_method    ] model_rotary_emb_matmul                  target=matmul                                   args=(model_rotary_emb_float_2, model_rotary_emb_float_3)
+  [call_method    ] model_rotary_emb_transpose               target=transpose                                args=(model_rotary_emb_matmul, 1, 2)
+  [call_function  ] model_rotary_emb_cat                     target=cat                                      args=((model_rotary_emb_transpose, model_rotary_emb_transpose))
+  [call_method    ] model_rotary_emb_cos                     target=cos                                      args=(model_rotary_emb_cat)
+  [call_method    ] model_rotary_emb_mul                     target=mul                                      args=(model_rotary_emb_cos, 1.0)
+  [call_method    ] model_rotary_emb_sin                     target=sin                                      args=(model_rotary_emb_cat)
+  [call_method    ] model_rotary_emb_mul_1                   target=mul                                      args=(model_rotary_emb_sin, 1.0)
+  [call_method    ] model_rotary_emb_to_1                    target=to                                       args=(model_rotary_emb_mul)
+  [call_method    ] model_rotary_emb_to_2                    target=to                                       args=(model_rotary_emb_mul_1)
+  [call_function  ] model_rotary_emb__set_grad_enabled_1     target=_set_grad_enabled                        args=(False)
+  [call_module    ] model_layers_0_input_layernorm           target=model.layers.0.input_layernorm           args=(model_embed_tokens)
+  [call_module    ] model_layers_0_self_attn_q_proj          target=model.layers.0.self_attn.q_proj          args=(model_layers_0_input_layernorm)
+  [call_method    ] model_layers_0_self_attn_view            target=view                                     args=(model_layers_0_self_attn_q_proj, (1, 8, -1, 16))
+  [call_module    ] model_layers_0_self_attn_q_norm          target=model.layers.0.self_attn.q_norm          args=(model_layers_0_self_attn_view)
+  [call_method    ] model_layers_0_self_attn_transpose       target=transpose                                args=(model_layers_0_self_attn_q_norm, 1, 2)
+  [call_module    ] model_layers_0_self_attn_k_proj          target=model.layers.0.self_attn.k_proj          args=(model_layers_0_input_layernorm)
+  [call_method    ] model_layers_0_self_attn_view_1          target=view                                     args=(model_layers_0_self_attn_k_proj, (1, 8, -1, 16))
+  [call_module    ] model_layers_0_self_attn_k_norm          target=model.layers.0.self_attn.k_norm          args=(model_layers_0_self_attn_view_1)
+  [call_method    ] model_layers_0_self_attn_transpose_1     target=transpose                                args=(model_layers_0_self_attn_k_norm, 1, 2)
+  [call_module    ] model_layers_0_self_attn_v_proj          target=model.layers.0.self_attn.v_proj          args=(model_layers_0_input_layernorm)
+  [call_method    ] model_layers_0_self_attn_view_2          target=view                                     args=(model_layers_0_self_attn_v_proj, (1, 8, -1, 16))
+  [call_method    ] model_layers_0_self_attn_transpose_2     target=transpose                                args=(model_layers_0_self_attn_view_2, 1, 2)
+  [call_method    ] model_layers_0_self_attn_unsqueeze       target=unsqueeze                                args=(model_rotary_emb_to_1, 1)
+  [call_method    ] model_layers_0_self_attn_unsqueeze_1     target=unsqueeze                                args=(model_rotary_emb_to_2, 1)
+  [call_method    ] model_layers_0_self_attn_mul             target=mul                                      args=(model_layers_0_self_attn_transpose, model_layers_0_self_attn_unsqueeze)
+  [call_method    ] model_layers_0_self_attn___getitem__     target=__getitem__                              args=(model_layers_0_self_attn_transpose, (Ellipsis, slice(None, 8, None)))
+  [call_method    ] model_layers_0_self_attn___getitem___1   target=__getitem__                              args=(model_layers_0_self_attn_transpose, (Ellipsis, slice(8, None, None)))
+  [call_method    ] model_layers_0_self_attn_neg             target=neg                                      args=(model_layers_0_self_attn___getitem___1)
+  [call_function  ] model_layers_0_self_attn_cat             target=cat                                      args=((model_layers_0_self_attn_neg, model_layers_0_self_attn___getitem__))
+  [call_method    ] model_layers_0_self_attn_mul_1           target=mul                                      args=(model_layers_0_self_attn_cat, model_layers_0_self_attn_unsqueeze_1)
+  [call_method    ] model_layers_0_self_attn_add             target=add                                      args=(model_layers_0_self_attn_mul, model_layers_0_self_attn_mul_1)
+  [call_method    ] model_layers_0_self_attn_mul_2           target=mul                                      args=(model_layers_0_self_attn_transpose_1, model_layers_0_self_attn_unsqueeze)
+  [call_method    ] model_layers_0_self_attn___getitem___2   target=__getitem__                              args=(model_layers_0_self_attn_transpose_1, (Ellipsis, slice(None, 8, None)))
+  [call_method    ] model_layers_0_self_attn___getitem___3   target=__getitem__                              args=(model_layers_0_self_attn_transpose_1, (Ellipsis, slice(8, None, None)))
+  [call_method    ] model_layers_0_self_attn_neg_1           target=neg                                      args=(model_layers_0_self_attn___getitem___3)
+  [call_function  ] model_layers_0_self_attn_cat_1           target=cat                                      args=((model_layers_0_self_attn_neg_1, model_layers_0_self_attn___getitem___2))
+  [call_method    ] model_layers_0_self_attn_mul_3           target=mul                                      args=(model_layers_0_self_attn_cat_1, model_layers_0_self_attn_unsqueeze_1)
+  [call_method    ] model_layers_0_self_attn_add_1           target=add                                      args=(model_layers_0_self_attn_mul_2, model_layers_0_self_attn_mul_3)
+  [call_function  ] model_layers_0_self_attn_tensor          target=tensor                                   args=([])
+  [call_function  ] model_layers_0_self_attn_tensor_1        target=tensor                                   args=([])
+  [call_function  ] model_layers_0_self_attn_cat_2           target=cat                                      args=([model_layers_0_self_attn_tensor, model_layers_0_self_attn_add_1])
+  [call_function  ] model_layers_0_self_attn_cat_3           target=cat                                      args=([model_layers_0_self_attn_tensor_1, model_layers_0_self_attn_transpose_2])
+  [call_function  ] model_layers_0_self_attn_scaled_dot_product_attention target=scaled_dot_product_attention             args=(model_layers_0_self_attn_add, model_layers_0_self_attn_cat_2, model_layers_0_self_attn_cat_3)
+  [call_method    ] model_layers_0_self_attn_transpose_3     target=transpose                                args=(model_layers_0_self_attn_scaled_dot_product_attention, 1, 2)
+  [call_method    ] model_layers_0_self_attn_contiguous      target=contiguous                               args=(model_layers_0_self_attn_transpose_3)
+  [call_method    ] model_layers_0_self_attn_reshape         target=reshape                                  args=(model_layers_0_self_attn_contiguous, 1, 8, -1)
+  [call_method    ] model_layers_0_self_attn_contiguous_1    target=contiguous                               args=(model_layers_0_self_attn_reshape)
+  [call_module    ] model_layers_0_self_attn_o_proj          target=model.layers.0.self_attn.o_proj          args=(model_layers_0_self_attn_contiguous_1)
+  [call_method    ] model_layers_0_add                       target=add                                      args=(model_embed_tokens, model_layers_0_self_attn_o_proj)
+  [call_module    ] model_layers_0_post_attention_layernorm  target=model.layers.0.post_attention_layernorm  args=(model_layers_0_add)
+  [call_module    ] model_layers_0_mlp_gate_proj             target=model.layers.0.mlp.gate_proj             args=(model_layers_0_post_attention_layernorm)
+  [call_function  ] model_layers_0_mlp_act_fn_silu           target=silu                                     args=(model_layers_0_mlp_gate_proj)
+  [call_module    ] model_layers_0_mlp_up_proj               target=model.layers.0.mlp.up_proj               args=(model_layers_0_post_attention_layernorm)
+  [call_method    ] model_layers_0_mlp_mul                   target=mul                                      args=(model_layers_0_mlp_act_fn_silu, model_layers_0_mlp_up_proj)
+  [call_module    ] model_layers_0_mlp_down_proj             target=model.layers.0.mlp.down_proj             args=(model_layers_0_mlp_mul)
+  [call_method    ] model_layers_0_add_1                     target=add                                      args=(model_layers_0_add, model_layers_0_mlp_down_proj)
+  [call_module    ] model_layers_1_input_layernorm           target=model.layers.1.input_layernorm           args=(model_layers_0_add_1)
+  [call_module    ] model_layers_1_self_attn_q_proj          target=model.layers.1.self_attn.q_proj          args=(model_layers_1_input_layernorm)
+  [call_method    ] model_layers_1_self_attn_view            target=view                                     args=(model_layers_1_self_attn_q_proj, (1, 8, -1, 16))
+  [call_module    ] model_layers_1_self_attn_q_norm          target=model.layers.1.self_attn.q_norm          args=(model_layers_1_self_attn_view)
+  [call_method    ] model_layers_1_self_attn_transpose       target=transpose                                args=(model_layers_1_self_attn_q_norm, 1, 2)
+  [call_module    ] model_layers_1_self_attn_k_proj          target=model.layers.1.self_attn.k_proj          args=(model_layers_1_input_layernorm)
+  [call_method    ] model_layers_1_self_attn_view_1          target=view                                     args=(model_layers_1_self_attn_k_proj, (1, 8, -1, 16))
+  [call_module    ] model_layers_1_self_attn_k_norm          target=model.layers.1.self_attn.k_norm          args=(model_layers_1_self_attn_view_1)
+  [call_method    ] model_layers_1_self_attn_transpose_1     target=transpose                                args=(model_layers_1_self_attn_k_norm, 1, 2)
+  [call_module    ] model_layers_1_self_attn_v_proj          target=model.layers.1.self_attn.v_proj          args=(model_layers_1_input_layernorm)
+  [call_method    ] model_layers_1_self_attn_view_2          target=view                                     args=(model_layers_1_self_attn_v_proj, (1, 8, -1, 16))
+  [call_method    ] model_layers_1_self_attn_transpose_2     target=transpose                                args=(model_layers_1_self_attn_view_2, 1, 2)
+  [call_method    ] model_layers_1_self_attn_unsqueeze       target=unsqueeze                                args=(model_rotary_emb_to_1, 1)
+  [call_method    ] model_layers_1_self_attn_unsqueeze_1     target=unsqueeze                                args=(model_rotary_emb_to_2, 1)
+  [call_method    ] model_layers_1_self_attn_mul             target=mul                                      args=(model_layers_1_self_attn_transpose, model_layers_1_self_attn_unsqueeze)
+  [call_method    ] model_layers_1_self_attn___getitem__     target=__getitem__                              args=(model_layers_1_self_attn_transpose, (Ellipsis, slice(None, 8, None)))
+  [call_method    ] model_layers_1_self_attn___getitem___1   target=__getitem__                              args=(model_layers_1_self_attn_transpose, (Ellipsis, slice(8, None, None)))
+  [call_method    ] model_layers_1_self_attn_neg             target=neg                                      args=(model_layers_1_self_attn___getitem___1)
+  [call_function  ] model_layers_1_self_attn_cat             target=cat                                      args=((model_layers_1_self_attn_neg, model_layers_1_self_attn___getitem__))
+  [call_method    ] model_layers_1_self_attn_mul_1           target=mul                                      args=(model_layers_1_self_attn_cat, model_layers_1_self_attn_unsqueeze_1)
+  [call_method    ] model_layers_1_self_attn_add             target=add                                      args=(model_layers_1_self_attn_mul, model_layers_1_self_attn_mul_1)
+  [call_method    ] model_layers_1_self_attn_mul_2           target=mul                                      args=(model_layers_1_self_attn_transpose_1, model_layers_1_self_attn_unsqueeze)
+  [call_method    ] model_layers_1_self_attn___getitem___2   target=__getitem__                              args=(model_layers_1_self_attn_transpose_1, (Ellipsis, slice(None, 8, None)))
+  [call_method    ] model_layers_1_self_attn___getitem___3   target=__getitem__                              args=(model_layers_1_self_attn_transpose_1, (Ellipsis, slice(8, None, None)))
+  [call_method    ] model_layers_1_self_attn_neg_1           target=neg                                      args=(model_layers_1_self_attn___getitem___3)
+  [call_function  ] model_layers_1_self_attn_cat_1           target=cat                                      args=((model_layers_1_self_attn_neg_1, model_layers_1_self_attn___getitem___2))
+  [call_method    ] model_layers_1_self_attn_mul_3           target=mul                                      args=(model_layers_1_self_attn_cat_1, model_layers_1_self_attn_unsqueeze_1)
+  [call_method    ] model_layers_1_self_attn_add_1           target=add                                      args=(model_layers_1_self_attn_mul_2, model_layers_1_self_attn_mul_3)
+  [call_function  ] model_layers_1_self_attn_tensor          target=tensor                                   args=([])
+  [call_function  ] model_layers_1_self_attn_tensor_1        target=tensor                                   args=([])
+  [call_function  ] model_layers_1_self_attn_cat_2           target=cat                                      args=([model_layers_1_self_attn_tensor, model_layers_1_self_attn_add_1])
+  [call_function  ] model_layers_1_self_attn_cat_3           target=cat                                      args=([model_layers_1_self_attn_tensor_1, model_layers_1_self_attn_transpose_2])
+  [call_function  ] model_layers_1_self_attn_scaled_dot_product_attention target=scaled_dot_product_attention             args=(model_layers_1_self_attn_add, model_layers_1_self_attn_cat_2, model_layers_1_self_attn_cat_3)
+  [call_method    ] model_layers_1_self_attn_transpose_3     target=transpose                                args=(model_layers_1_self_attn_scaled_dot_product_attention, 1, 2)
+  [call_method    ] model_layers_1_self_attn_contiguous      target=contiguous                               args=(model_layers_1_self_attn_transpose_3)
+  [call_method    ] model_layers_1_self_attn_reshape         target=reshape                                  args=(model_layers_1_self_attn_contiguous, 1, 8, -1)
+  [call_method    ] model_layers_1_self_attn_contiguous_1    target=contiguous                               args=(model_layers_1_self_attn_reshape)
+  [call_module    ] model_layers_1_self_attn_o_proj          target=model.layers.1.self_attn.o_proj          args=(model_layers_1_self_attn_contiguous_1)
+  [call_method    ] model_layers_1_add                       target=add                                      args=(model_layers_0_add_1, model_layers_1_self_attn_o_proj)
+  [call_module    ] model_layers_1_post_attention_layernorm  target=model.layers.1.post_attention_layernorm  args=(model_layers_1_add)
+  [call_module    ] model_layers_1_mlp_gate_proj             target=model.layers.1.mlp.gate_proj             args=(model_layers_1_post_attention_layernorm)
+  [call_function  ] model_layers_1_mlp_act_fn_silu           target=silu                                     args=(model_layers_1_mlp_gate_proj)
+  [call_module    ] model_layers_1_mlp_up_proj               target=model.layers.1.mlp.up_proj               args=(model_layers_1_post_attention_layernorm)
+  [call_method    ] model_layers_1_mlp_mul                   target=mul                                      args=(model_layers_1_mlp_act_fn_silu, model_layers_1_mlp_up_proj)
+  [call_module    ] model_layers_1_mlp_down_proj             target=model.layers.1.mlp.down_proj             args=(model_layers_1_mlp_mul)
+  [call_method    ] model_layers_1_add_1                     target=add                                      args=(model_layers_1_add, model_layers_1_mlp_down_proj)
+  [call_module    ] model_norm                               target=model.norm                               args=(model_layers_1_add_1)
+  [call_method    ] getitem                                  target=__getitem__                              args=(model_norm, (slice(None, None, None), slice(0, None, None), slice(None, None, None)))
+  [call_module    ] lm_head                                  target=lm_head                                  args=(getitem)
+  [output         ] output                                   target=output                                   args=({'logits': lm_head, 'past_key_values': DynamicCache(layers=[DynamicLayer, DynamicLayer])})
+  [call_function  ] _set_grad_enabled_1                      target=_set_grad_enabled                        args=(True)

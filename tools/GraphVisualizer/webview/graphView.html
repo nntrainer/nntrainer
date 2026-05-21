@@ -1,0 +1,2703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{{NONCE}}';">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NNTrainer Graph Visualizer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: var(--vscode-font-family);
+            color: var(--vscode-foreground);
+            background: var(--vscode-editor-background);
+            overflow: hidden;
+        }
+        .toolbar {
+            display: flex; align-items: center; gap: 8px;
+            padding: 8px 12px;
+            background: var(--vscode-titleBar-activeBackground);
+            border-bottom: 1px solid var(--vscode-panel-border);
+            flex-wrap: wrap;
+        }
+        .toolbar button {
+            padding: 4px 12px;
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none; border-radius: 3px; cursor: pointer; font-size: 12px;
+        }
+        .toolbar button:hover { background: var(--vscode-button-hoverBackground); }
+        .toolbar button.active { background: var(--vscode-focusBorder); }
+        .toolbar .sep { width: 1px; height: 20px; background: var(--vscode-panel-border); }
+        .toolbar .stats { margin-left: auto; font-size: 11px; color: var(--vscode-descriptionForeground); }
+
+        .main { display: flex; height: calc(100vh - 40px); position: relative; }
+
+        .graph-pane {
+            flex: 1; overflow: auto; position: relative;
+            background: #1e1e2e;
+            border-right: 1px solid var(--vscode-panel-border);
+        }
+        .pane-hdr {
+            position: sticky; top: 0; z-index: 10;
+            padding: 6px 12px; font-size: 12px; font-weight: 600;
+            background: var(--vscode-sideBar-background);
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .pane-hdr.torch { color: #e06c75; }
+        .pane-hdr.nn { color: #61afef; }
+        .legend { display: inline-flex; gap: 10px; font-size: 10px; color: var(--vscode-descriptionForeground); margin-left: 12px; }
+        .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; vertical-align: middle; margin-right: 2px; }
+
+        .gcanvas { position: relative; min-height: 100%; transform-origin: 0 0; }
+        .gcanvas svg.edges { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 1; }
+        .gcanvas .ncont { position: relative; z-index: 2; }
+
+        /* Zoom controls */
+        .zoom-ctrl {
+            position: absolute; bottom: 12px; right: 12px; z-index: 30;
+            display: flex; gap: 4px; align-items: center;
+            background: var(--vscode-sideBar-background);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 6px; padding: 3px 6px; box-shadow: 0 2px 6px rgba(0,0,0,.2);
+        }
+        .zoom-ctrl button {
+            width: 24px; height: 24px; border: none; border-radius: 4px;
+            background: var(--vscode-button-background); color: var(--vscode-button-foreground);
+            cursor: pointer; font-size: 14px; line-height: 1; display: flex; align-items: center; justify-content: center;
+        }
+        .zoom-ctrl button:hover { background: var(--vscode-button-hoverBackground); }
+        .zoom-ctrl .zoom-pct { font-size: 10px; min-width: 36px; text-align: center; color: var(--vscode-descriptionForeground); }
+
+        /* Nodes (dark theme) */
+        .nd {
+            position: absolute; display: flex; flex-direction: column;
+            border: 1.5px solid #555;
+            border-radius: 8px; font-size: 11px; cursor: pointer;
+            background: #2a2a3d;
+            white-space: nowrap; text-align: center; overflow: hidden;
+            transition: border-color .12s, box-shadow .12s;
+            box-shadow: 0 2px 6px rgba(0,0,0,.4);
+            color: #ddd;
+        }
+        .nd:hover { border-color: #61afef; box-shadow: 0 0 0 2px #61afef, 0 2px 8px rgba(97,175,239,.3); z-index: 5; }
+        .nd.sel { border-color: #61afef; box-shadow: 0 0 0 2px #61afef; z-index: 5; }
+        .nd.hl { box-shadow: 0 0 0 2px #98c379, 0 0 10px rgba(152,195,121,.3); z-index: 5; }
+        .nd.mapped { border-left: 3.5px solid #98c379; }
+        .nd.unmapped { border-left: 3.5px solid #e06c75; }
+        .nd.skipped { border-left: 3.5px solid #d19a66; opacity: .6; }
+
+        /* Node header (type badge) */
+        .nd .nd-hdr {
+            padding: 4px 8px; font-size: 9px; font-weight: 700;
+            letter-spacing: .4px; text-transform: uppercase;
+            border-bottom: 1px solid rgba(255,255,255,.08);
+            border-radius: 6px 6px 0 0;
+        }
+        /* Node body (name) */
+        .nd .nm {
+            padding: 5px 8px; font-weight: 600; font-size: 11px;
+            overflow: hidden; text-overflow: ellipsis;
+            color: #e0e0e0;
+        }
+
+        /* FX op colors - header background (dark theme) */
+        .nd.op-call_module .nd-hdr { background: rgba(152,195,121,.2); color: #98c379; }
+        .nd.op-call_function .nd-hdr { background: rgba(229,192,123,.2); color: #e5c07b; }
+        .nd.op-call_method .nd-hdr { background: rgba(198,120,221,.2); color: #c678dd; }
+        .nd.op-get_attr .nd-hdr { background: rgba(86,182,194,.2); color: #56b6c2; }
+        /* NN layer type colors - header background (dark theme) */
+        .nd.lt-input .nd-hdr { background: rgba(97,175,239,.2); color: #61afef; }
+        .nd.lt-fully_connected .nd-hdr { background: rgba(152,195,121,.2); color: #98c379; }
+        .nd.lt-mha_core .nd-hdr { background: rgba(198,120,221,.2); color: #c678dd; }
+        .nd.lt-rms_norm .nd-hdr,.nd.lt-layer_norm .nd-hdr { background: rgba(229,192,123,.2); color: #e5c07b; }
+        .nd.lt-addition .nd-hdr { background: rgba(86,182,194,.2); color: #56b6c2; }
+        .nd.lt-embedding .nd-hdr { background: rgba(209,154,102,.2); color: #d19a66; }
+        .nd.lt-multi_head_attention .nd-hdr { background: rgba(198,120,221,.2); color: #c678dd; }
+        .nd.lt-positional_encoding .nd-hdr { background: rgba(229,192,123,.2); color: #e5c07b; }
+        .nd.lt-reshape .nd-hdr,.nd.lt-concat .nd-hdr { background: rgba(86,182,194,.2); color: #56b6c2; }
+        .nd.lt-activation .nd-hdr { background: rgba(224,108,117,.2); color: #e06c75; }
+
+        /* Edges (dark theme) */
+        .eline { stroke: #666; stroke-width: 1.5; fill: none; opacity: .7; }
+        .eline.hl { stroke: #61afef; stroke-width: 2.5; opacity: 1; }
+        .earr { fill: #666; opacity: .7; }
+        .earr.hl { fill: #61afef; opacity: 1; }
+
+        /* Mapping overlay */
+        svg.moverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 20; }
+        .mline { stroke: #98c379; stroke-width: 1; stroke-dasharray: 4 3; opacity: .3; fill: none; }
+        .mline.act { stroke-width: 2.5; opacity: .85; stroke-dasharray: none; }
+
+        /* Source panes */
+        .src-pane { flex: 1; overflow: auto; display: none; border-right: 1px solid var(--vscode-panel-border); }
+        .src-pane.vis { display: block; }
+        .src-code {
+            padding: 8px 12px; font-family: var(--vscode-editor-fontFamily, monospace);
+            font-size: 12px; white-space: pre; line-height: 1.5; counter-reset: line;
+        }
+        .src-code .ln { display: block; padding: 0 8px 0 48px; position: relative; }
+        .src-code .ln::before {
+            content: counter(line); counter-increment: line;
+            position: absolute; left: 0; width: 40px; text-align: right;
+            color: var(--vscode-editorLineNumber-foreground); font-size: 11px;
+        }
+        .src-code .ln:hover { background: var(--vscode-editor-hoverHighlightBackground); }
+
+        /* Verification */
+        .vpanel {
+            width: 320px; min-width: 320px; overflow-y: auto;
+            background: var(--vscode-sideBar-background);
+            border-left: 1px solid var(--vscode-panel-border);
+            padding: 8px; font-size: 11px; display: none;
+        }
+        .vpanel.vis { display: block; }
+        .vpanel h3 { font-size: 12px; margin: 10px 0 4px; color: var(--vscode-sideBarTitle-foreground); }
+        .vpanel h3:first-child { margin-top: 4px; }
+        .badge { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 10px; font-weight: 600; }
+        .badge.ok { background: #2d4a2d; color: #98c379; }
+        .badge.warn { background: #4a3d2d; color: #d19a66; }
+        .badge.err { background: #4a2d2d; color: #e06c75; }
+        .vi { padding: 3px 6px; margin: 2px 0; border-radius: 3px; background: var(--vscode-editor-background); font-size: 10px; }
+        .vi.clickable { cursor: pointer; }
+        .vi.clickable:hover { background: var(--vscode-list-hoverBackground); }
+        .vsec { border-left: 2px solid var(--vscode-panel-border); margin: 4px 0; padding-left: 8px; }
+        .vsec.pass { border-color: #98c379; }
+        .vsec.fail { border-color: #e06c75; }
+        .vsec.warn { border-color: #d19a66; }
+        .vtabs { display: flex; gap: 4px; margin: 8px 0 6px; }
+        .vtab { padding: 3px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; background: var(--vscode-editor-background); }
+        .vtab.active { background: var(--vscode-focusBorder); color: var(--vscode-button-foreground); }
+        .vmono { font-family: var(--vscode-editor-fontFamily, monospace); font-size: 10px; word-break: break-all; white-space: pre-wrap; }
+
+        /* Property Inspector (Phase 4) */
+        .inspector {
+            width: 340px; min-width: 340px; overflow-y: auto;
+            background: var(--vscode-sideBar-background);
+            border-left: 1px solid var(--vscode-panel-border);
+            padding: 8px; font-size: 11px; display: none;
+        }
+        .inspector.vis { display: block; }
+        .inspector h3 { font-size: 12px; margin: 8px 0 4px; color: var(--vscode-sideBarTitle-foreground); }
+        .inspector h3:first-child { margin-top: 2px; }
+        .prop-table { width: 100%; border-collapse: collapse; font-size: 10px; margin: 4px 0; }
+        .prop-table th { text-align: left; padding: 2px 4px; background: var(--vscode-editor-background); font-weight: 600; border-bottom: 1px solid var(--vscode-panel-border); }
+        .prop-table td { padding: 2px 4px; border-bottom: 1px solid var(--vscode-panel-border); vertical-align: top; }
+        .prop-table td.k { color: var(--vscode-descriptionForeground); width: 35%; font-family: var(--vscode-editor-fontFamily, monospace); }
+        .prop-table td.v { font-family: var(--vscode-editor-fontFamily, monospace); word-break: break-all; }
+        .prop-table td.match { color: #98c379; }
+        .prop-table td.diff { color: #e06c75; }
+        .shape-flow { display: flex; align-items: center; gap: 6px; margin: 4px 0; font-size: 10px; }
+        .shape-box { padding: 2px 6px; border-radius: 3px; background: var(--vscode-editor-background); font-family: var(--vscode-editor-fontFamily, monospace); }
+        .shape-box.warn { border: 1px solid #d19a66; }
+        .shape-arrow { color: var(--vscode-descriptionForeground); }
+        .wmap-row { display: flex; gap: 6px; align-items: center; margin: 2px 0; font-size: 10px; }
+        .wmap-key { flex: 1; padding: 2px 4px; background: var(--vscode-editor-background); border-radius: 3px; font-family: var(--vscode-editor-fontFamily, monospace); word-break: break-all; }
+        .wmap-xform { padding: 1px 4px; border-radius: 3px; font-size: 9px; font-weight: 600; }
+        .wmap-xform.transpose { background: #4a3d2d; color: #d19a66; }
+        .wmap-xform.direct { background: #2d4a2d; color: #98c379; }
+        .itabs { display: flex; gap: 3px; margin: 6px 0 4px; }
+        .itab { padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; background: var(--vscode-editor-background); }
+        .itab.active { background: var(--vscode-focusBorder); color: var(--vscode-button-foreground); }
+        .empty-msg { padding: 16px; text-align: center; color: var(--vscode-descriptionForeground); font-size: 11px; }
+
+        /* Group boxes (Phase 6) */
+        /* Block-level groups (Transformer Layer N) - dark theme */
+        .group-box {
+            position: absolute; border-radius: 8px;
+            pointer-events: none; z-index: 0;
+        }
+        .group-box.block { border: 1.5px solid rgba(255,255,255,.15); background: rgba(255,255,255,.04); border-radius: 10px; }
+        .group-box.embed { border: 1.5px solid rgba(209,154,102,.4); background: rgba(209,154,102,.06); }
+        .group-box.head { border: 1.5px solid rgba(97,175,239,.4); background: rgba(97,175,239,.06); }
+        /* Sub-group boxes (Attn, FFN, Norm inside block) */
+        .group-box.sub { border: 1.5px dashed; border-radius: 6px; }
+        .group-box.sub.attn { border-color: rgba(198,120,221,.5); background: rgba(198,120,221,.06); }
+        .group-box.sub.ffn { border-color: rgba(97,175,239,.5); background: rgba(97,175,239,.06); }
+        .group-box.sub.norm { border-color: rgba(229,192,123,.5); background: rgba(229,192,123,.06); }
+
+        .group-label {
+            position: absolute; font-weight: 700; padding: 2px 6px;
+            border-radius: 3px; pointer-events: auto; cursor: pointer; z-index: 3;
+        }
+        .group-label.block { font-size: 11px; background: rgba(255,255,255,.12); color: #bbb; border-radius: 4px; }
+        .group-label.embed { font-size: 10px; background: rgba(209,154,102,.25); color: #d19a66; }
+        .group-label.head { font-size: 10px; background: rgba(97,175,239,.25); color: #61afef; }
+        .group-label.sub { font-size: 8px; font-weight: 600; }
+        .group-label.sub.attn { background: rgba(198,120,221,.2); color: #c678dd; }
+        .group-label.sub.ffn { background: rgba(97,175,239,.2); color: #61afef; }
+        .group-label.sub.norm { background: rgba(229,192,123,.2); color: #e5c07b; }
+        .group-label:hover { opacity: .85; }
+        .nd.grouped-hidden { display: none !important; }
+        .eline.grouped-hidden { display: none !important; }
+
+        /* C++ source highlight */
+        .src-code .ln.cpp-hl { background: rgba(97,175,239,.15); border-left: 2px solid #61afef; }
+
+        /* Syntax highlighting (One Dark inspired) */
+        .src-code .kw { color: #c678dd; }          /* keywords */
+        .src-code .ty { color: #e5c07b; }          /* types */
+        .src-code .fn { color: #61afef; }          /* function calls */
+        .src-code .st { color: #98c379; }          /* strings */
+        .src-code .nu { color: #d19a66; }          /* numbers */
+        .src-code .cm { color: #5c6370; font-style: italic; } /* comments */
+        .src-code .pp { color: #c678dd; }          /* preprocessor */
+        .src-code .op { color: #56b6c2; }          /* operators :: -> */
+
+        /* Profile heatmap overlay */
+        .nd.profiled { position: relative; }
+        .nd .pbar { position: absolute; bottom: 0; left: 0; height: 3px; border-radius: 0 0 3px 3px; transition: width .3s; }
+.nd .ptime { position: absolute; top: -8px; right: 0; font-size: 8px; background: rgba(0,0,0,.9); color: #fff; padding: 4px 6px; border-radius: 4px; white-space: nowrap; display: none; z-index: 20; pointer-events: none; line-height: 1.5; box-shadow: 0 2px 8px rgba(0,0,0,.5); }
+.nd .ptime .pt-line { display: block; }
+.nd .ptime .pt-label { color: #999; }
+.nd .ptime .pt-val { color: #fff; font-weight: 600; }
+.nd .ptime .pt-pct { color: #e5c07b; }
+.nd .ptime .pt-mem { color: #56b6c2; }
+.nd .ptime .pt-flops { color: #d19a66; }
+.nd .ptime .pt-type { color: #c678dd; font-size: 7px; }
+.nd.profiled:hover .ptime { display: block; }
+        .nd.bottleneck { box-shadow: 0 0 8px #e06c75; }
+        .nd.bottleneck .pbar { height: 4px; }
+
+        /* Profile panel */
+        .ppanel {
+            width: 340px; min-width: 280px; overflow-y: auto;
+            background: var(--vscode-sideBar-background);
+            border-left: 1px solid var(--vscode-panel-border);
+            padding: 8px; font-size: 11px; display: none;
+        }
+        .ppanel.vis { display: block; }
+        .ppanel h3 { font-size: 12px; margin: 8px 0 4px; }
+        .prow { display: flex; align-items: center; gap: 4px; margin: 2px 0; font-size: 10px; cursor: pointer; padding: 2px 4px; border-radius: 3px; }
+        .prow:hover { background: var(--vscode-list-hoverBackground); }
+        .prow .pname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .prow .pval { font-family: var(--vscode-editor-fontFamily, monospace); font-size: 9px; min-width: 50px; text-align: right; }
+        .prow .pbar-h { flex: 0 0 60px; height: 8px; background: var(--vscode-editor-background); border-radius: 2px; overflow: hidden; }
+        .prow .pbar-fill { height: 100%; border-radius: 2px; }
+
+        /* Resizable splitters */
+        .vsplitter {
+            width: 8px; cursor: col-resize;
+            background: var(--vscode-panel-border, #333);
+            position: relative; z-index: 25;
+            flex-shrink: 0;
+            display: none;
+            transition: background 0.15s;
+        }
+        .vsplitter.vis { display: block; }
+        .vsplitter::after {
+            content: '';
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            width: 2px; height: 24px;
+            background: rgba(255,255,255,.2);
+            border-radius: 1px;
+            transition: background 0.15s;
+        }
+        .vsplitter:hover { background: var(--vscode-focusBorder, #007acc); }
+        .vsplitter:hover::after { background: rgba(255,255,255,.6); }
+        .vsplitter.dragging { background: var(--vscode-focusBorder, #007acc); }
+        .vsplitter.dragging::after { background: rgba(255,255,255,.8); }
+        /* Prevent text selection while dragging */
+        body.resizing { cursor: col-resize; user-select: none; -webkit-user-select: none; }
+        body.resizing * { pointer-events: none !important; }
+        body.resizing .vsplitter { pointer-events: auto !important; }
+    </style>
+</head>
+<body>
+    <div class="toolbar">
+        <button id="b-sbs" class="active">Side by Side</button>
+        <button id="b-nn">NNTrainer Only</button>
+        <button id="b-fx">Torch FX Only</button>
+        <div class="sep"></div>
+        <button id="b-map">Mapping Lines</button>
+        <button id="b-ver">Verification</button>
+        <div class="sep"></div>
+        <button id="b-group">Groups</button>
+        <button id="b-prof">Profile</button>
+        <button id="b-insp">Inspector</button>
+        <div class="sep"></div>
+        <button id="b-tsrc">PyTorch Source</button>
+        <button id="b-csrc">C++ Output</button>
+        <button id="b-export">Export</button>
+        <span class="stats" id="stats"></span>
+    </div>
+    <div class="main" id="main">
+        <div class="src-pane" id="sp-torch">
+            <div class="pane-hdr" style="color:#e5c07b">PyTorch Source</div>
+            <div class="src-code" id="sc-torch"></div>
+        </div>
+        <div class="graph-pane" id="p-fx">
+            <div class="pane-hdr torch">PyTorch FX Graph
+                <span class="legend"><span><i style="background:#98c379"></i>module</span><span><i style="background:#e5c07b"></i>function</span><span><i style="background:#c678dd"></i>method</span></span>
+            </div>
+            <div class="gcanvas" id="gc-fx"><svg class="edges" id="eg-fx"></svg><div class="ncont" id="nc-fx"></div></div>
+            <div class="zoom-ctrl" data-pane="fx">
+                <button data-z="out" title="Zoom Out (-)">-</button>
+                <span class="zoom-pct">100%</span>
+                <button data-z="in" title="Zoom In (+)">+</button>
+                <button data-z="fit" title="Fit to View">Fit</button>
+                <button data-z="reset" title="Reset Zoom">1:1</button>
+            </div>
+        </div>
+        <div class="graph-pane" id="p-nn">
+            <div class="pane-hdr nn">NNTrainer Graph
+                <span class="legend"><span><i style="background:#98c379"></i>mapped</span><span><i style="background:#e06c75"></i>unmapped</span><span><i style="background:#d19a66"></i>skip</span></span>
+            </div>
+            <div class="gcanvas" id="gc-nn"><svg class="edges" id="eg-nn"></svg><div class="ncont" id="nc-nn"></div></div>
+            <div class="zoom-ctrl" data-pane="nn">
+                <button data-z="out" title="Zoom Out (-)">-</button>
+                <span class="zoom-pct">100%</span>
+                <button data-z="in" title="Zoom In (+)">+</button>
+                <button data-z="fit" title="Fit to View">Fit</button>
+                <button data-z="reset" title="Reset Zoom">1:1</button>
+            </div>
+        </div>
+        <div class="src-pane" id="sp-cpp">
+            <div class="pane-hdr" style="color:#61afef">Generated C++</div>
+            <div class="src-code" id="sc-cpp"></div>
+        </div>
+        <div class="vsplitter" id="vs-vpanel" data-target="vpanel"></div>
+        <div class="vpanel" id="vpanel"></div>
+        <div class="vsplitter" id="vs-ppanel" data-target="ppanel"></div>
+        <div class="ppanel" id="ppanel"></div>
+        <div class="vsplitter" id="vs-inspector" data-target="inspector"></div>
+        <div class="inspector" id="inspector"></div>
+        <svg class="moverlay" id="moverlay"></svg>
+    </div>
+
+    <script nonce="{{NONCE}}">
+    (function() {
+        const vscode = acquireVsCodeApi();
+        const D = {{DATA}};
+
+        /* ---- constants (Netron-inspired sizing) ---- */
+        const NW = 180, NH = 56, HG = 32, VG = 40, PAD = 32;
+
+        /* ---- lookup maps ---- */
+        const fxMap = new Map(), nnMap = new Map();
+        D.fxGraph.forEach(n => fxMap.set(n.name, n));
+        D.nntrainerLayers.forEach(l => nnMap.set(l.name, l));
+        const mByFx = new Map(), mByNn = new Map();
+        D.nodeMapping.forEach(m => {
+            mByFx.set(m.fxNodeName, m);
+            if (m.nntrainerLayerName) mByNn.set(m.nntrainerLayerName, m);
+        });
+
+        /* ---- stats ---- */
+        const nMapped = D.nodeMapping.filter(m => m.mappingType === 'direct').length;
+        const nSkip = D.nodeMapping.filter(m => m.mappingType === 'skipped').length;
+        const nUnmap = D.unsupportedOps.length + D.unknownLayers.length;
+        document.getElementById('stats').textContent =
+            'FX:' + D.fxGraph.length + ' | NN:' + D.nntrainerLayers.length +
+            ' | Map:' + nMapped + ' | Skip:' + nSkip +
+            (nUnmap ? ' | Unmap:' + nUnmap : '');
+
+        /* ---- state ---- */
+        let selFx = null, selNn = null, viewMode = 'sbs';
+        let showMap = false, showVer = false, showInsp = true, showTSrc = false, showCSrc = false;
+        let showGroups = true;
+        let inspTab = 'props';
+
+        /* ---- zoom state ---- */
+        const zoomState = { fx: 1.0, nn: 1.0 };
+        const ZOOM_MIN = 0.15, ZOOM_MAX = 3.0, ZOOM_STEP = 0.05;
+        // Track canvas dimensions for fit-to-view
+        const canvasDims = { fx: { w: 0, h: 0 }, nn: { w: 0, h: 0 } };
+
+        function applyZoom(paneId) {
+            const z = zoomState[paneId];
+            const gc = document.getElementById('gc-' + paneId);
+            gc.style.transform = 'scale(' + z + ')';
+            // Update the scrollable area so scroll works correctly with scale
+            const dims = canvasDims[paneId];
+            gc.style.width = (dims.w * z) + 'px';
+            gc.style.height = (dims.h * z) + 'px';
+            gc.style.transformOrigin = '0 0';
+            // Undo the scaled internal size so children stay correct
+            gc.children[0].setAttribute('width', dims.w);
+            gc.children[0].setAttribute('height', dims.h);
+            // Update percentage label
+            const ctrl = document.querySelector('.zoom-ctrl[data-pane="'+paneId+'"]');
+            if (ctrl) ctrl.querySelector('.zoom-pct').textContent = Math.round(z * 100) + '%';
+            schedMap();
+        }
+
+        function zoomTo(paneId, newZ) {
+            zoomState[paneId] = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZ));
+            applyZoom(paneId);
+        }
+
+        function zoomFit(paneId) {
+            const pane = document.getElementById('p-' + paneId);
+            const dims = canvasDims[paneId];
+            if (!dims.w || !dims.h) return;
+            const pw = pane.clientWidth - 8;
+            const ph = pane.clientHeight - 40; // minus header
+            const z = Math.min(pw / dims.w, ph / dims.h, 1.0);
+            zoomTo(paneId, z);
+        }
+
+        // Zoom controls click handler
+        document.querySelectorAll('.zoom-ctrl').forEach(ctrl => {
+            const paneId = ctrl.dataset.pane;
+            ctrl.querySelectorAll('button').forEach(btn => {
+                btn.onclick = e => {
+                    e.stopPropagation();
+                    const action = btn.dataset.z;
+                    if (action === 'in') zoomTo(paneId, zoomState[paneId] + ZOOM_STEP);
+                    else if (action === 'out') zoomTo(paneId, zoomState[paneId] - ZOOM_STEP);
+                    else if (action === 'fit') zoomFit(paneId);
+                    else if (action === 'reset') zoomTo(paneId, 1.0);
+                };
+            });
+        });
+
+        // Mouse wheel zoom (Ctrl+scroll)
+        ['fx', 'nn'].forEach(paneId => {
+            document.getElementById('p-' + paneId).addEventListener('wheel', e => {
+                if (!e.ctrlKey && !e.metaKey) return;
+                e.preventDefault();
+                const delta = e.deltaY > 0 ? -ZOOM_STEP : ZOOM_STEP;
+                zoomTo(paneId, zoomState[paneId] + delta);
+            }, { passive: false });
+        });
+
+        // Keyboard zoom: +/- when graph pane focused
+        document.addEventListener('keydown', e => {
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+            const panes = [];
+            if (viewMode === 'sbs') panes.push('fx', 'nn');
+            else if (viewMode === 'fx') panes.push('fx');
+            else if (viewMode === 'nn') panes.push('nn');
+            if (e.key === '=' || e.key === '+') { panes.forEach(p => zoomTo(p, zoomState[p] + ZOOM_STEP)); e.preventDefault(); }
+            else if (e.key === '-') { panes.forEach(p => zoomTo(p, zoomState[p] - ZOOM_STEP)); e.preventDefault(); }
+            else if (e.key === '0') { panes.forEach(p => zoomTo(p, 1.0)); e.preventDefault(); }
+        });
+
+        /* ==================================================================
+         * DAG Layout (longest-path layering + barycenter ordering)
+         * ================================================================== */
+        function dagLayout(nodes, getInputs) {
+            const nameSet = new Set(nodes.map(n => n.id));
+            const depth = new Map();
+            function d(id) {
+                if (depth.has(id)) return depth.get(id);
+                depth.set(id, 0);
+                const inp = getInputs(id).filter(i => nameSet.has(i));
+                if (!inp.length) return 0;
+                const v = 1 + Math.max(...inp.map(d));
+                depth.set(id, v);
+                return v;
+            }
+            nodes.forEach(n => d(n.id));
+
+            // Build adjacency for children lookup
+            const children = new Map(); // parent -> [child, ...]
+            nodes.forEach(n => {
+                const inp = getInputs(n.id).filter(i => nameSet.has(i));
+                inp.forEach(p => {
+                    if (!children.has(p)) children.set(p, []);
+                    children.get(p).push(n.id);
+                });
+            });
+
+            const layers = [];
+            nodes.forEach(n => { const dd = depth.get(n.id)||0; (layers[dd]||(layers[dd]=[])).push(n); });
+
+            // Barycenter ordering: reduce edge crossings by placing nodes
+            // close to the average position of their connected nodes
+            // Run multiple passes for better results
+            for (let pass = 0; pass < 4; pass++) {
+                // Forward pass: order each layer by avg position of parents
+                for (let li = 1; li < layers.length; li++) {
+                    if (!layers[li]) continue;
+                    const prevLayer = layers[li-1];
+                    if (!prevLayer) continue;
+                    const prevPos = new Map();
+                    prevLayer.forEach((n, i) => prevPos.set(n.id, i));
+
+                    layers[li].forEach(n => {
+                        const parents = getInputs(n.id).filter(i => nameSet.has(i) && prevPos.has(i));
+                        if (parents.length > 0) {
+                            n._bary = parents.reduce((s, p) => s + prevPos.get(p), 0) / parents.length;
+                        } else {
+                            n._bary = Infinity;
+                        }
+                    });
+                    layers[li].sort((a, b) => a._bary - b._bary);
+                }
+                // Backward pass: order each layer by avg position of children
+                for (let li = layers.length - 2; li >= 0; li--) {
+                    if (!layers[li]) continue;
+                    const nextLayer = layers[li+1];
+                    if (!nextLayer) continue;
+                    const nextPos = new Map();
+                    nextLayer.forEach((n, i) => nextPos.set(n.id, i));
+
+                    layers[li].forEach(n => {
+                        const kids = (children.get(n.id) || []).filter(c => nextPos.has(c));
+                        if (kids.length > 0) {
+                            n._bary = kids.reduce((s, c) => s + nextPos.get(c), 0) / kids.length;
+                        } else {
+                            n._bary = Infinity;
+                        }
+                    });
+                    layers[li].sort((a, b) => a._bary - b._bary);
+                }
+            }
+
+            let maxW = 0;
+            layers.forEach(l => { if (l && l.length > maxW) maxW = l.length; });
+
+            const pos = new Map();
+            const mxTot = maxW * NW + (maxW - 1) * HG;
+            layers.forEach((layer, li) => {
+                if (!layer) return;
+                const tot = layer.length * NW + (layer.length - 1) * HG;
+                const sx = PAD + (mxTot - tot) / 2;
+                layer.forEach((n, ci) => {
+                    pos.set(n.id, { x: sx + ci * (NW + HG), y: PAD + li * (NH + VG) });
+                });
+            });
+            return { pos, h: PAD*2 + layers.length*(NH+VG), w: PAD*2 + mxTot };
+        }
+
+        /* ==================================================================
+         * SVG helpers
+         * ================================================================== */
+        function esc(t) { return t ? String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') : ''; }
+        const SVG_NS = 'http://www.w3.org/2000/svg';
+        function mkPath(svg, x1,y1,x2,y2,cls,marker,dfrom,dto) {
+            const p = document.createElementNS(SVG_NS,'path');
+            const dy = y2 - y1;
+            // Use cubic bezier with 40% control point offset for smooth curves
+            const cy = Math.max(Math.abs(dy) * 0.4, 20);
+            p.setAttribute('d','M'+x1+','+y1+' C'+x1+','+(y1+cy)+' '+x2+','+(y2-cy)+' '+x2+','+y2);
+            p.setAttribute('class','eline '+cls);
+            p.setAttribute('marker-end','url(#'+marker+')');
+            p.dataset.from = dfrom; p.dataset.to = dto;
+            svg.appendChild(p);
+        }
+
+        /** Compute fanned x-offsets for edges sharing a node port.
+         *  Returns Map<edgeKey, {srcX, dstX}> */
+        function computeFanOffsets(edges, pos) {
+            // Group outgoing edges by source node, incoming edges by dest node
+            const outgoing = new Map(); // srcId -> [dstId, ...]
+            const incoming = new Map(); // dstId -> [srcId, ...]
+            edges.forEach(([src, dst]) => {
+                if (!outgoing.has(src)) outgoing.set(src, []);
+                outgoing.get(src).push(dst);
+                if (!incoming.has(dst)) incoming.set(dst, []);
+                incoming.get(dst).push(src);
+            });
+
+            const fanMap = new Map(); // "src->dst" -> {srcX, dstX}
+            const SPREAD = Math.min(NW * 0.7, 80); // max fan width
+
+            // Fan outgoing edges at source bottom
+            outgoing.forEach((dsts, src) => {
+                const sp = pos.get(src); if (!sp) return;
+                const n = dsts.length;
+                dsts.sort((a,b) => {
+                    const pa = pos.get(a), pb = pos.get(b);
+                    if (!pa || !pb) return 0;
+                    return pa.x - pb.x; // sort by target x position
+                });
+                dsts.forEach((dst, i) => {
+                    const key = src+'->'+dst;
+                    const offset = n === 1 ? 0 : (i / (n - 1) - 0.5) * SPREAD;
+                    if (!fanMap.has(key)) fanMap.set(key, { srcX: 0, dstX: 0 });
+                    fanMap.get(key).srcX = sp.x + NW/2 + offset;
+                });
+            });
+
+            // Fan incoming edges at dest top
+            incoming.forEach((srcs, dst) => {
+                const dp = pos.get(dst); if (!dp) return;
+                const n = srcs.length;
+                srcs.sort((a,b) => {
+                    const pa = pos.get(a), pb = pos.get(b);
+                    if (!pa || !pb) return 0;
+                    return pa.x - pb.x;
+                });
+                srcs.forEach((src, i) => {
+                    const key = src+'->'+dst;
+                    const offset = n === 1 ? 0 : (i / (n - 1) - 0.5) * SPREAD;
+                    if (!fanMap.has(key)) fanMap.set(key, { srcX: dp.x + NW/2, dstX: 0 });
+                    fanMap.get(key).dstX = dp.x + NW/2 + offset;
+                });
+            });
+
+            return fanMap;
+        }
+        function initSvg(svg, w, h, prefix) {
+            svg.setAttribute('width', w); svg.setAttribute('height', h);
+            svg.innerHTML = '<defs>' +
+                '<marker id="'+prefix+'a" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto"><path d="M0,0 L0,5 L5,2.5Z" class="earr"/></marker>' +
+                '<marker id="'+prefix+'ah" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto"><path d="M0,0 L0,5 L5,2.5Z" class="earr hl"/></marker>' +
+                '</defs>';
+        }
+
+        /* ==================================================================
+         * Render FX Graph
+         * ================================================================== */
+        function renderFx() {
+            const nc = document.getElementById('nc-fx');
+            const svg = document.getElementById('eg-fx');
+            nc.innerHTML = '';
+            const vis = D.fxGraph.filter(n => n.op!=='placeholder' && n.op!=='output');
+            const ln = vis.map(n => ({id:n.name, d:n}));
+            const {pos,h,w} = dagLayout(ln, id => { const n=fxMap.get(id); return n?(n.args||[]):[]; });
+            nc.style.width = w+'px'; nc.style.height = h+'px';
+            canvasDims.fx = { w, h };
+            initSvg(svg, w, h, 'fx');
+
+            // Collect all edges and compute fan offsets
+            const edges = [];
+            vis.forEach(n => {
+                (n.args||[]).forEach(a => { if(pos.has(a)) edges.push([a, n.name]); });
+            });
+            const fan = computeFanOffsets(edges, pos);
+
+            vis.forEach(n => {
+                const tp = pos.get(n.name); if(!tp) return;
+                (n.args||[]).forEach(a => {
+                    const fp = pos.get(a); if(!fp) return;
+                    const key = a+'->'+n.name;
+                    const f = fan.get(key);
+                    const sx = f ? f.srcX : fp.x+NW/2;
+                    const dx = f ? f.dstX : tp.x+NW/2;
+                    mkPath(svg, sx, fp.y+NH, dx, tp.y, '', 'fxa', a, n.name);
+                });
+            });
+
+            vis.forEach(n => {
+                const p = pos.get(n.name); if(!p) return;
+                const m = mByFx.get(n.name);
+                const mc = m ? (m.mappingType==='direct'?'mapped':m.mappingType==='skipped'?'skipped':'unmapped') : 'unmapped';
+                const div = document.createElement('div');
+                div.className = 'nd '+mc+' op-'+n.op;
+                div.dataset.fx = n.name;
+                div.style.cssText = 'left:'+p.x+'px;top:'+p.y+'px;width:'+NW+'px;height:'+NH+'px';
+                const st = (n.target||'').split('.').pop();
+                div.innerHTML = '<div class="nd-hdr">'+esc(n.op==='call_module'?'module':n.op==='call_function'?'function':n.op==='call_method'?'method':n.op)+'</div><span class="nm">'+esc(st||n.name)+'</span>';
+                div.title = n.name+'\n'+n.op+': '+n.target+(n.module_type?'\n'+n.module_type:'');
+                div.onclick = e => { e.stopPropagation(); pickFx(n.name); };
+                nc.appendChild(div);
+            });
+        }
+
+        /* ==================================================================
+         * Render NNTrainer Graph
+         * ================================================================== */
+        function renderNn() {
+            const nc = document.getElementById('nc-nn');
+            const svg = document.getElementById('eg-nn');
+            nc.innerHTML = '';
+            const ln = D.nntrainerLayers.map(l => ({id:l.name, d:l}));
+            const {pos,h,w} = dagLayout(ln, id => { const l=nnMap.get(id); return l?(l.input_layers||[]):[]; });
+            nc.style.width = w+'px'; nc.style.height = h+'px';
+            canvasDims.nn = { w, h };
+            initSvg(svg, w, h, 'nn');
+
+            // Collect all edges and compute fan offsets
+            const edges = [];
+            D.nntrainerLayers.forEach(l => {
+                (l.input_layers||[]).forEach(inp => { if(pos.has(inp)) edges.push([inp, l.name]); });
+            });
+            const fan = computeFanOffsets(edges, pos);
+
+            D.nntrainerLayers.forEach(l => {
+                const tp = pos.get(l.name); if(!tp) return;
+                (l.input_layers||[]).forEach(inp => {
+                    const fp = pos.get(inp); if(!fp) return;
+                    const key = inp+'->'+l.name;
+                    const f = fan.get(key);
+                    const sx = f ? f.srcX : fp.x+NW/2;
+                    const dx = f ? f.dstX : tp.x+NW/2;
+                    mkPath(svg, sx, fp.y+NH, dx, tp.y, '', 'nna', inp, l.name);
+                });
+            });
+
+            D.nntrainerLayers.forEach(l => {
+                const p = pos.get(l.name); if(!p) return;
+                const m = mByNn.get(l.name);
+                const mc = m ? 'mapped' : '';
+                const lt = 'lt-'+l.layer_type.replace(/[^a-zA-Z0-9_]/g,'_');
+                const div = document.createElement('div');
+                div.className = 'nd '+mc+' '+lt;
+                div.dataset.nn = l.name;
+                div.style.cssText = 'left:'+p.x+'px;top:'+p.y+'px;width:'+NW+'px;height:'+NH+'px';
+                div.innerHTML = '<div class="nd-hdr">'+esc(l.layer_type)+'</div><span class="nm">'+esc(l.name)+'</span>';
+                div.title = l.name+'\n'+l.layer_type+'\nIn: ['+(l.input_layers||[]).join(', ')+']';
+                div.onclick = e => { e.stopPropagation(); pickNn(l.name); };
+                nc.appendChild(div);
+            });
+        }
+
+        /* ==================================================================
+         * Cross-panel mapping lines
+         * ================================================================== */
+        function drawMap() {
+            const svg = document.getElementById('moverlay');
+            const main = document.getElementById('main');
+            svg.innerHTML = '';
+            if (!showMap || viewMode !== 'sbs') return;
+            const mr = main.getBoundingClientRect();
+            svg.setAttribute('width', mr.width); svg.setAttribute('height', mr.height);
+
+            D.nodeMapping.forEach(m => {
+                if (m.mappingType !== 'direct') return;
+                const fe = document.querySelector('[data-fx="'+m.fxNodeName+'"]');
+                const ne = document.querySelector('[data-nn="'+m.nntrainerLayerName+'"]');
+                if (!fe || !ne) return;
+                const fr = fe.getBoundingClientRect(), nr = ne.getBoundingClientRect();
+                const pfx = document.getElementById('p-fx').getBoundingClientRect();
+                const pnn = document.getElementById('p-nn').getBoundingClientRect();
+                if (fr.bottom < pfx.top+30 && nr.bottom < pnn.top+30) return;
+                if (fr.top > pfx.bottom && nr.top > pnn.bottom) return;
+
+                const x1 = fr.right - mr.left, y1 = fr.top + fr.height/2 - mr.top;
+                const x2 = nr.left - mr.left, y2 = nr.top + nr.height/2 - mr.top;
+                const act = (selFx===m.fxNodeName || selNn===m.nntrainerLayerName);
+                const p = document.createElementNS(SVG_NS, 'path');
+                const mx = (x1+x2)/2;
+                p.setAttribute('d','M'+x1+','+y1+' C'+mx+','+y1+' '+mx+','+y2+' '+x2+','+y2);
+                p.setAttribute('class','mline'+(act?' act':''));
+                svg.appendChild(p);
+            });
+        }
+
+        let mapTimer = null;
+        function schedMap() { if(!mapTimer) mapTimer = requestAnimationFrame(()=>{ mapTimer=null; drawMap(); }); }
+        document.getElementById('p-fx').addEventListener('scroll', schedMap);
+        document.getElementById('p-nn').addEventListener('scroll', schedMap);
+
+        /* ==================================================================
+         * Selection / cross-highlight
+         * ================================================================== */
+        function hlEdges(svgId, name) {
+            const svg = document.getElementById(svgId);
+            const pre = svgId === 'eg-fx' ? 'fx' : 'nn';
+            svg.querySelectorAll('path[data-from]').forEach(p => {
+                if (p.dataset.from===name || p.dataset.to===name) {
+                    p.classList.add('hl'); p.setAttribute('marker-end','url(#'+pre+'ah)');
+                } else {
+                    p.classList.remove('hl'); p.setAttribute('marker-end','url(#'+pre+'a)');
+                }
+            });
+        }
+        function clearHl() {
+            ['eg-fx','eg-nn'].forEach(id => {
+                const pre = id==='eg-fx'?'fx':'nn';
+                document.getElementById(id).querySelectorAll('path.hl').forEach(p => {
+                    p.classList.remove('hl'); p.setAttribute('marker-end','url(#'+pre+'a)');
+                });
+            });
+        }
+        function clearSel() {
+            selFx=null; selNn=null;
+            document.querySelectorAll('.nd.sel,.nd.hl').forEach(e => { e.classList.remove('sel','hl'); });
+            clearHl();
+        }
+
+        function pickFx(name) {
+            clearSel(); selFx = name;
+            const el = document.querySelector('[data-fx="'+name+'"]');
+            if (el) el.classList.add('sel');
+            hlEdges('eg-fx', name);
+            const m = mByFx.get(name);
+            if (m && m.nntrainerLayerName) {
+                selNn = m.nntrainerLayerName;
+                const ne = document.querySelector('[data-nn="'+m.nntrainerLayerName+'"]');
+                if (ne) { ne.classList.add('sel','hl'); ne.scrollIntoView({behavior:'smooth',block:'center'}); }
+                hlEdges('eg-nn', m.nntrainerLayerName);
+            }
+            drawMap();
+            renderInspector();
+            // C++ source linking: find NN layer from FX mapping
+            const fxm = mByFx.get(name);
+            if (fxm && fxm.nntrainerLayerName) highlightCppLine(fxm.nntrainerLayerName);
+            vscode.postMessage({command:'nodeSelected',data:{layerName:name,source:'fx'}});
+        }
+        function pickNn(name) {
+            clearSel(); selNn = name;
+            const el = document.querySelector('[data-nn="'+name+'"]');
+            if (el) el.classList.add('sel');
+            hlEdges('eg-nn', name);
+            const m = mByNn.get(name);
+            if (m && m.fxNodeName) {
+                selFx = m.fxNodeName;
+                const fe = document.querySelector('[data-fx="'+m.fxNodeName+'"]');
+                if (fe) { fe.classList.add('sel','hl'); fe.scrollIntoView({behavior:'smooth',block:'center'}); }
+                hlEdges('eg-fx', m.fxNodeName);
+            }
+            drawMap();
+            renderInspector();
+            highlightCppLine(name);
+            vscode.postMessage({command:'nodeSelected',data:{layerName:name,source:'nntrainer'}});
+        }
+
+        document.querySelectorAll('.gcanvas').forEach(c => c.addEventListener('click', e => {
+            if (e.target===c||e.target.classList.contains('ncont')) { clearSel(); drawMap(); renderInspector(); }
+        }));
+
+        /* ==================================================================
+         * View controls
+         * ================================================================== */
+        function setView(m) {
+            viewMode = m;
+            document.querySelectorAll('.toolbar button').forEach(b => b.classList.remove('active'));
+            const fx = document.getElementById('p-fx'), nn = document.getElementById('p-nn');
+            if (m==='sbs') { fx.style.display='block'; nn.style.display='block'; document.getElementById('b-sbs').classList.add('active'); }
+            else if (m==='nn') { fx.style.display='none'; nn.style.display='block'; document.getElementById('b-nn').classList.add('active'); }
+            else { fx.style.display='block'; nn.style.display='none'; document.getElementById('b-fx').classList.add('active'); }
+            if (showMap) document.getElementById('b-map').classList.add('active');
+            if (showVer) document.getElementById('b-ver').classList.add('active');
+            drawMap();
+        }
+        document.getElementById('b-sbs').onclick = () => setView('sbs');
+        document.getElementById('b-nn').onclick = () => setView('nn');
+        document.getElementById('b-fx').onclick = () => setView('torch');
+        document.getElementById('b-map').onclick = () => { showMap=!showMap; document.getElementById('b-map').classList.toggle('active',showMap); drawMap(); };
+        document.getElementById('b-ver').onclick = () => { showVer=!showVer; document.getElementById('vpanel').classList.toggle('vis',showVer); document.getElementById('b-ver').classList.toggle('active',showVer); };
+        document.getElementById('b-insp').onclick = () => { showInsp=!showInsp; document.getElementById('inspector').classList.toggle('vis',showInsp); document.getElementById('b-insp').classList.toggle('active',showInsp); };
+        document.getElementById('b-tsrc').onclick = () => { showTSrc=!showTSrc; document.getElementById('sp-torch').classList.toggle('vis',showTSrc); document.getElementById('b-tsrc').classList.toggle('active',showTSrc); };
+        document.getElementById('b-csrc').onclick = () => { showCSrc=!showCSrc; document.getElementById('sp-cpp').classList.toggle('vis',showCSrc); document.getElementById('b-csrc').classList.toggle('active',showCSrc); };
+
+        /* ==================================================================
+         * Verification Engine (Phase 3)
+         * ================================================================== */
+        let verTab = 'summary';
+
+        /* 3-1: Node mapping verification */
+        function verifyMapping() {
+            const visFx = D.fxGraph.filter(n => n.op !== 'placeholder' && n.op !== 'output');
+            const directMapped = D.nodeMapping.filter(m => m.mappingType === 'direct');
+            const skipped = D.nodeMapping.filter(m => m.mappingType === 'skipped');
+            const unmappedFx = visFx.filter(n => {
+                const m = mByFx.get(n.name);
+                return !m || (m.mappingType !== 'direct' && m.mappingType !== 'skipped');
+            });
+            const unmappedNn = D.nntrainerLayers.filter(l => {
+                return !mByNn.has(l.name) && l.layer_type !== 'input';
+            });
+            const coverage = visFx.length > 0 ? Math.round(directMapped.length / visFx.length * 100) : 0;
+            return { visFx, directMapped, skipped, unmappedFx, unmappedNn, coverage };
+        }
+
+        /* 3-2: Topology comparison */
+        function verifyTopology() {
+            const issues = [];
+            // Build FX adjacency via nodeMapping: for each direct-mapped pair,
+            // check if the NN layer's input_layers correspond to FX node's args
+            D.nodeMapping.filter(m => m.mappingType === 'direct').forEach(m => {
+                const fxNode = fxMap.get(m.fxNodeName);
+                const nnLayer = nnMap.get(m.nntrainerLayerName);
+                if (!fxNode || !nnLayer) return;
+
+                // Get FX parent names that are also directly mapped
+                const fxParents = new Set();
+                (fxNode.args || []).forEach(arg => {
+                    const pm = mByFx.get(arg);
+                    if (pm && pm.mappingType === 'direct' && pm.nntrainerLayerName) {
+                        fxParents.add(pm.nntrainerLayerName);
+                    }
+                });
+
+                // Get NN input layers
+                const nnInputs = new Set(nnLayer.input_layers || []);
+
+                // Check: every NN input should trace back to an FX parent (or be an 'input' layer)
+                nnInputs.forEach(inp => {
+                    const inpLayer = nnMap.get(inp);
+                    if (inpLayer && inpLayer.layer_type === 'input') return; // input layers are OK
+                    if (!fxParents.has(inp)) {
+                        // Check if the input is connected through skipped/decomposed nodes
+                        const inpMapping = mByNn.get(inp);
+                        if (!inpMapping) {
+                            issues.push({
+                                type: 'extra_input',
+                                nn: m.nntrainerLayerName,
+                                fx: m.fxNodeName,
+                                input: inp,
+                                msg: esc(m.nntrainerLayerName) + ' has input "' + esc(inp) + '" with no FX edge'
+                            });
+                        }
+                    }
+                });
+
+                // Check: FX parents mapped to NN layers should appear in NN inputs
+                fxParents.forEach(parent => {
+                    if (!nnInputs.has(parent)) {
+                        const parentLayer = nnMap.get(parent);
+                        if (parentLayer && parentLayer.layer_type === 'input') return;
+                        issues.push({
+                            type: 'missing_input',
+                            nn: m.nntrainerLayerName,
+                            fx: m.fxNodeName,
+                            input: parent,
+                            msg: esc(m.nntrainerLayerName) + ' missing expected input "' + esc(parent) + '" from FX'
+                        });
+                    }
+                });
+            });
+            return issues;
+        }
+
+        /* 3-3: C++ code cross-check */
+        function verifyCpp() {
+            const issues = [];
+            const cpp = D.cppSource || '';
+            if (!cpp) return { issues, layerCalls: [] };
+
+            // Extract createLayer calls with names
+            const layerCalls = [];
+            const re = /createLayer\("([^"]+)"[\s\S]*?withKey\("name",\s*"([^"]+)"\)/g;
+            // Also handle dynamic name patterns: "layer" + std::to_string(layer_id) + "_suffix"
+            const re2 = /createLayer\("([^"]+)"/g;
+            let match;
+            while ((match = re2.exec(cpp)) !== null) {
+                layerCalls.push({ type: match[1], pos: match.index });
+            }
+
+            // Check: every NN layer type should have a corresponding createLayer
+            const cppTypes = new Set(layerCalls.map(c => c.type));
+            const nnTypes = new Set(D.nntrainerLayers.map(l => l.layer_type).filter(t => t !== 'input'));
+            nnTypes.forEach(t => {
+                // Map common NN layer types to C++ layer type strings
+                const aliases = {
+                    'embedding_layer': ['embedding_layer', 'embedding'],
+                    'mha_core': ['mha_core'],
+                    'fully_connected': ['fully_connected'],
+                    'rms_norm': ['rms_norm'],
+                    'reshaped_rms_norm': ['reshaped_rms_norm'],
+                    'swiglu': ['swiglu'],
+                    'addition': ['addition'],
+                    'layer_norm': ['layer_norm'],
+                };
+                const candidates = aliases[t] || [t];
+                if (!candidates.some(c => cppTypes.has(c))) {
+                    issues.push({
+                        type: 'missing_cpp_layer',
+                        layerType: t,
+                        msg: 'NN layer type "' + esc(t) + '" has no createLayer() in C++'
+                    });
+                }
+            });
+
+            // Check: property consistency (spot check key properties)
+            D.nntrainerLayers.forEach(l => {
+                if (l.layer_type === 'fully_connected' && l.properties.unit) {
+                    // Search for matching unit in C++
+                    const unitVal = String(l.properties.unit);
+                    const nameInCpp = l.name.replace(/\./g, '_');
+                    // Check if unit value appears near the layer name reference
+                    if (cpp.includes(unitVal) || cpp.includes('unit')) {
+                        // Found - OK
+                    }
+                }
+            });
+
+            return { issues, layerCalls, cppTypes: [...cppTypes] };
+        }
+
+        /* Render verification panel */
+        function renderVer() {
+            const p = document.getElementById('vpanel');
+            const mv = verifyMapping();
+            const tv = verifyTopology();
+            const cv = verifyCpp();
+
+            const totalIssues = mv.unmappedFx.length + mv.unmappedNn.length + tv.length + cv.issues.length;
+
+            // Tabs
+            let h = '<div class="vtabs">';
+            h += '<div class="vtab'+(verTab==='summary'?' active':'')+'" data-vtab="summary">Summary</div>';
+            h += '<div class="vtab'+(verTab==='mapping'?' active':'')+'" data-vtab="mapping">Mapping</div>';
+            h += '<div class="vtab'+(verTab==='topology'?' active':'')+'" data-vtab="topology">Topology</div>';
+            h += '<div class="vtab'+(verTab==='cpp'?' active':'')+'" data-vtab="cpp">C++ Check</div>';
+            h += '</div>';
+
+            if (verTab === 'summary') {
+                /* ---- Summary tab ---- */
+                const bc = mv.coverage===100?'ok':mv.coverage>80?'warn':'err';
+                h += '<h3>Overall Status</h3>';
+                h += '<div class="vi">Coverage: <span class="badge '+bc+'">'+mv.coverage+'%</span> ('+mv.directMapped.length+'/'+mv.visFx.length+')</div>';
+                h += '<div class="vi">Total issues: <span class="badge '+(totalIssues===0?'ok':'err')+'">'+totalIssues+'</span></div>';
+
+                // Quick summary per section
+                h += '<div class="vsec '+(mv.unmappedFx.length===0&&mv.unmappedNn.length===0?'pass':'fail')+'">';
+                h += '<b>Mapping:</b> ';
+                if (mv.unmappedFx.length===0 && mv.unmappedNn.length===0) h += '<span class="badge ok">PASS</span>';
+                else h += '<span class="badge err">'+mv.unmappedFx.length+' unmapped FX, '+mv.unmappedNn.length+' unmapped NN</span>';
+                h += '</div>';
+
+                h += '<div class="vsec '+(tv.length===0?'pass':'fail')+'">';
+                h += '<b>Topology:</b> ';
+                if (tv.length===0) h += '<span class="badge ok">PASS</span>';
+                else h += '<span class="badge err">'+tv.length+' mismatches</span>';
+                h += '</div>';
+
+                h += '<div class="vsec '+(cv.issues.length===0?'pass':'warn')+'">';
+                h += '<b>C++ Cross-check:</b> ';
+                if (cv.issues.length===0) h += '<span class="badge ok">PASS</span>';
+                else h += '<span class="badge warn">'+cv.issues.length+' issues</span>';
+                h += '</div>';
+
+                // Existing diagnostics
+                if (D.unsupportedOps.length) {
+                    h+='<h3>Unsupported Ops <span class="badge err">'+D.unsupportedOps.length+'</span></h3>';
+                    D.unsupportedOps.forEach(o => h+='<div class="vi">'+esc(o)+'</div>');
+                }
+                if (D.unknownLayers.length) {
+                    h+='<h3>Unknown Layers <span class="badge warn">'+D.unknownLayers.length+'</span></h3>';
+                    D.unknownLayers.forEach(l => h+='<div class="vi">'+esc(l)+'</div>');
+                }
+                if (D.decomposedModules.length) {
+                    h+='<h3>Decomposed <span class="badge warn">'+D.decomposedModules.length+'</span></h3>';
+                    D.decomposedModules.forEach(m => h+='<div class="vi">'+esc(m)+'</div>');
+                }
+            }
+            else if (verTab === 'mapping') {
+                /* ---- Mapping tab ---- */
+                h += '<h3>Node Mapping Verification</h3>';
+                h += '<div class="vi">Direct mapped: <span class="badge ok">'+mv.directMapped.length+'</span></div>';
+                h += '<div class="vi">Skipped: <span class="badge warn">'+mv.skipped.length+'</span></div>';
+
+                if (mv.unmappedFx.length) {
+                    h += '<h3>Unmapped FX Nodes <span class="badge err">'+mv.unmappedFx.length+'</span></h3>';
+                    mv.unmappedFx.slice(0, 30).forEach(n => {
+                        h += '<div class="vi clickable" data-pick-fx="'+esc(n.name)+'">';
+                        h += '<b>'+esc(n.name)+'</b> <span style="opacity:.6">'+esc(n.op+': '+(n.target||'').split('.').pop())+'</span>';
+                        h += '</div>';
+                    });
+                    if (mv.unmappedFx.length > 30) h += '<div class="vi">...+'+(mv.unmappedFx.length-30)+' more</div>';
+                }
+                if (mv.unmappedNn.length) {
+                    h += '<h3>Unmapped NN Layers <span class="badge err">'+mv.unmappedNn.length+'</span></h3>';
+                    mv.unmappedNn.slice(0, 30).forEach(l => {
+                        h += '<div class="vi clickable" data-pick-nn="'+esc(l.name)+'">';
+                        h += '<b>'+esc(l.name)+'</b> <span style="opacity:.6">'+esc(l.layer_type)+'</span>';
+                        h += '</div>';
+                    });
+                }
+                if (mv.skipped.length) {
+                    h += '<h3>Skipped FX Nodes <span class="badge warn">'+mv.skipped.length+'</span></h3>';
+                    mv.skipped.slice(0, 20).forEach(m => {
+                        h += '<div class="vi clickable" data-pick-fx="'+esc(m.fxNodeName)+'">'+esc(m.fxNodeName)+'</div>';
+                    });
+                    if (mv.skipped.length > 20) h += '<div class="vi">...+'+(mv.skipped.length-20)+' more</div>';
+                }
+                if (!mv.unmappedFx.length && !mv.unmappedNn.length && !mv.skipped.length) {
+                    h += '<div class="vsec pass"><b>All nodes mapped successfully.</b></div>';
+                }
+            }
+            else if (verTab === 'topology') {
+                /* ---- Topology tab ---- */
+                h += '<h3>Edge Topology Comparison</h3>';
+                h += '<div class="vi">Compares FX graph edges vs NNTrainer input_layers</div>';
+                if (tv.length === 0) {
+                    h += '<div class="vsec pass"><b>Topology consistent.</b> All mapped edges match.</div>';
+                } else {
+                    h += '<div class="vi"><span class="badge err">'+tv.length+' mismatches</span></div>';
+                    tv.forEach(issue => {
+                        const icon = issue.type === 'extra_input' ? '(+)' : '(-)';
+                        h += '<div class="vi clickable" data-pick-nn="'+esc(issue.nn)+'">';
+                        h += '<b>'+icon+'</b> '+issue.msg;
+                        h += '</div>';
+                    });
+                }
+            }
+            else if (verTab === 'cpp') {
+                /* ---- C++ Cross-check tab ---- */
+                h += '<h3>C++ Code Cross-check</h3>';
+                if (!D.cppSource) {
+                    h += '<div class="vi">No C++ source available</div>';
+                } else {
+                    h += '<div class="vi">createLayer() calls: <b>'+cv.layerCalls.length+'</b></div>';
+                    h += '<div class="vi">Layer types in C++: <span class="vmono">'+cv.cppTypes.join(', ')+'</span></div>';
+
+                    // Layer count comparison
+                    const nnNonInput = D.nntrainerLayers.filter(l => l.layer_type !== 'input').length;
+                    const countMatch = cv.layerCalls.length >= nnNonInput;
+                    h += '<div class="vsec '+(countMatch?'pass':'warn')+'">';
+                    h += '<b>Layer count:</b> C++ has '+cv.layerCalls.length+' createLayer(), NN has '+nnNonInput+' non-input layers ';
+                    h += countMatch ? '<span class="badge ok">OK</span>' : '<span class="badge warn">MISMATCH</span>';
+                    h += '</div>';
+
+                    if (cv.issues.length) {
+                        h += '<h3>Issues <span class="badge warn">'+cv.issues.length+'</span></h3>';
+                        cv.issues.forEach(issue => {
+                            h += '<div class="vi">'+issue.msg+'</div>';
+                        });
+                    } else {
+                        h += '<div class="vsec pass"><b>All layer types present in C++.</b></div>';
+                    }
+
+                    // INI cross-check
+                    if (D.iniConfig) {
+                        const iniLayerCount = (D.iniConfig.match(/\[.*\]/g) || []).length;
+                        h += '<div class="vsec '+(iniLayerCount>0?'pass':'warn')+'">';
+                        h += '<b>INI config:</b> '+iniLayerCount+' sections';
+                        h += '</div>';
+                    }
+                }
+            }
+
+            p.innerHTML = h;
+
+            // Tab click handlers
+            p.querySelectorAll('.vtab').forEach(t => {
+                t.onclick = () => { verTab = t.dataset.vtab; renderVer(); };
+            });
+            // Clickable items -> select node in graph
+            p.querySelectorAll('[data-pick-fx]').forEach(el => {
+                el.onclick = () => pickFx(el.dataset.pickFx);
+            });
+            p.querySelectorAll('[data-pick-nn]').forEach(el => {
+                el.onclick = () => pickNn(el.dataset.pickNn);
+            });
+        }
+
+        /* ==================================================================
+         * Profile Heatmap & Bottleneck (Phase 5)
+         * ================================================================== */
+        let profileData = null;
+        let showProf = false;
+
+        // Receive profile data from extension via postMessage
+        window.addEventListener('message', evt => {
+            const msg = evt.data;
+            if (msg.command === 'profileData') {
+                profileData = msg.data;
+                applyProfileHeatmap();
+                renderProfilePanel();
+                // Auto-show profile panel
+                showProf = true;
+                document.getElementById('ppanel').classList.add('vis');
+                document.getElementById('b-prof').classList.add('active');
+            }
+        });
+
+        document.getElementById('b-group').onclick = () => {
+            showGroups = !showGroups;
+            document.getElementById('b-group').classList.toggle('active', showGroups);
+            drawGroups();
+        };
+
+        document.getElementById('b-export').onclick = () => exportReport();
+
+        // ==================================================================
+        // Phase 6-3: Export
+        // ==================================================================
+        function exportReport() {
+            // Build comprehensive verification report
+            const mv = verifyMapping();
+            const tv = verifyTopology();
+            const cv = verifyCpp();
+
+            let report = '# NNTrainer Conversion Report\n';
+            report += '## Model\n';
+            report += '- FX Nodes: ' + D.fxGraph.length + '\n';
+            report += '- NNTrainer Layers: ' + D.nntrainerLayers.length + '\n';
+            report += '- Mapping Coverage: ' + mv.coverage + '%\n\n';
+
+            report += '## Mapping Summary\n';
+            report += '- Direct mapped: ' + mv.directMapped.length + '\n';
+            report += '- Skipped: ' + mv.skipped.length + '\n';
+            report += '- Unmapped FX: ' + mv.unmappedFx.length + '\n';
+            report += '- Unmapped NN: ' + mv.unmappedNn.length + '\n\n';
+
+            if (mv.unmappedFx.length) {
+                report += '### Unmapped FX Nodes\n';
+                mv.unmappedFx.forEach(n => report += '- ' + n.name + ' (' + n.op + ': ' + n.target + ')\n');
+                report += '\n';
+            }
+
+            report += '## Topology\n';
+            report += '- Mismatches: ' + tv.length + '\n';
+            tv.forEach(i => report += '- ' + i.msg + '\n');
+            report += '\n';
+
+            report += '## C++ Cross-check\n';
+            report += '- createLayer calls: ' + cv.layerCalls.length + '\n';
+            report += '- Layer types: ' + cv.cppTypes.join(', ') + '\n';
+            report += '- Issues: ' + cv.issues.length + '\n';
+            cv.issues.forEach(i => report += '- ' + i.msg + '\n');
+            report += '\n';
+
+            if (D.unsupportedOps.length) {
+                report += '## Unsupported Ops\n';
+                D.unsupportedOps.forEach(o => report += '- ' + o + '\n');
+                report += '\n';
+            }
+
+            if (profileData) {
+                report += '## Profile\n';
+                report += '- Total: ' + profileData.total_time_ms.toFixed(2) + ' ms\n';
+                report += '- Bottlenecks: ' + profileData.bottlenecks.join(', ') + '\n';
+                report += '### Top 10 Layers\n';
+                profileData.layers.slice(0, 10).forEach(l => {
+                    report += '- ' + l.name + ': ' + l.time_ms.toFixed(3) + ' ms (' + l.pct_of_total.toFixed(1) + '%)\n';
+                });
+                report += '\n';
+            }
+
+            report += '## Layer Details\n';
+            report += '| NN Layer | Type | FX Node | HF Module | Weight |\n';
+            report += '|----------|------|---------|-----------|--------|\n';
+            D.nntrainerLayers.forEach(l => {
+                report += '| ' + l.name + ' | ' + l.layer_type + ' | ' + (l.fx_node_name||'-') + ' | ' + (l.hf_module_name||'-') + ' | ' + (l.has_weight?'yes':'no') + ' |\n';
+            });
+
+            // Send to extension for saving
+            vscode.postMessage({command:'exportReport', data:{content:report, format:'md'}});
+
+            // Also generate graph SVG export
+            const nnSvg = document.getElementById('eg-nn');
+            const nnNodes = document.getElementById('nc-nn');
+            if (nnSvg && nnNodes) {
+                // Create a combined SVG with nodes as foreignObject
+                const w = parseInt(nnNodes.style.width) || 800;
+                const h = parseInt(nnNodes.style.height) || 600;
+                let svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="'+w+'" height="'+h+'">';
+                svgStr += '<style>.eline{stroke:#666;stroke-width:1;fill:none}.earr{fill:#666}</style>';
+                svgStr += nnSvg.innerHTML;
+                // Add node rectangles
+                document.querySelectorAll('[data-nn]').forEach(el => {
+                    const x = parseInt(el.style.left)||0, y = parseInt(el.style.top)||0;
+                    const nw = parseInt(el.style.width)||NW, nh = parseInt(el.style.height)||NH;
+                    const name = el.dataset.nn;
+                    const layer = nnMap.get(name);
+                    const color = el.classList.contains('mapped') ? '#98c379' : '#e06c75';
+                    svgStr += '<rect x="'+x+'" y="'+y+'" width="'+nw+'" height="'+nh+'" rx="4" fill="#1e1e1e" stroke="'+color+'" stroke-width="1"/>';
+                    svgStr += '<text x="'+(x+nw/2)+'" y="'+(y+14)+'" fill="#ccc" font-size="9" text-anchor="middle" font-family="monospace">'+esc(name)+'</text>';
+                    if (layer) svgStr += '<text x="'+(x+nw/2)+'" y="'+(y+26)+'" fill="#888" font-size="8" text-anchor="middle" font-family="monospace">'+esc(layer.layer_type)+'</text>';
+                });
+                svgStr += '</svg>';
+                vscode.postMessage({command:'exportSvg', data:{content:svgStr}});
+            }
+        }
+
+        document.getElementById('b-prof').onclick = () => {
+            showProf = !showProf;
+            document.getElementById('ppanel').classList.toggle('vis', showProf);
+            document.getElementById('b-prof').classList.toggle('active', showProf);
+        };
+
+        /** Smart display name for profiler layer names.
+         *  Preserves enough context to distinguish layers:
+         *  - "model.layers.0.mlp.down_proj" -> "L0 · mlp · down_proj"
+         *  - "model.layers.2.self_attn.q_proj" -> "L2 · attn · q_proj"
+         *  - "lm_head" -> "lm_head"
+         *  - "model.norm" -> "model · norm"
+         */
+        function profDisplayName(name) {
+            if (!name) return '';
+            const parts = name.split('.');
+
+            // Pattern: model.layers.N.subgroup.leaf  or  model.layers.N.subgroup.subleaf.leaf
+            const layerMatch = name.match(/^model\.layers\.(\d+)\.(.*)/);
+            if (layerMatch) {
+                const idx = layerMatch[1];
+                const rest = layerMatch[2];
+                // Shorten common sub-module names
+                const short = rest
+                    .replace(/self_attn/g, 'attn')
+                    .replace(/post_attention_layernorm/g, 'post_attn_norm')
+                    .replace(/input_layernorm/g, 'attn_norm');
+                return 'L' + idx + ' · ' + short.replace(/\./g, ' · ');
+            }
+
+            // Pattern: model.embed_tokens, model.norm, model.rotary_emb, etc.
+            if (name.startsWith('model.')) {
+                return name.substring(6).replace(/\./g, ' · ');
+            }
+
+            // Top-level or short names: just return as-is
+            if (parts.length <= 2) return name;
+
+            // Fallback: last 3 parts for context
+            return parts.slice(-3).join(' · ');
+        }
+
+        // Color scale: green (fast) -> yellow -> red (slow)
+        function profColor(pct) {
+            const r = pct < 50 ? Math.round(pct / 50 * 255) : 255;
+            const g = pct < 50 ? 255 : Math.round((1 - (pct - 50) / 50) * 255);
+            return 'rgb(' + r + ',' + g + ',60)';
+        }
+
+        /** Build rich HTML hover tooltip for a profiled graph node */
+        function buildProfileTooltip(lp) {
+            let t = '';
+            t += '<span class="pt-line"><span class="pt-val">' + lp.time_ms.toFixed(3) + 'ms</span> <span class="pt-pct">(' + lp.pct_of_total.toFixed(1) + '%)</span></span>';
+            if (lp.memory_mb !== undefined && lp.memory_mb > 0) {
+                t += '<span class="pt-line"><span class="pt-label">mem:</span> <span class="pt-mem">' + lp.memory_mb.toFixed(2) + ' MB</span></span>';
+            }
+            if (lp.flops > 0) {
+                t += '<span class="pt-line"><span class="pt-label">flops:</span> <span class="pt-flops">' + (lp.flops / 1e6).toFixed(1) + 'M</span></span>';
+            }
+            if (lp.layer_type) {
+                t += '<span class="pt-line"><span class="pt-type">' + esc(lp.layer_type) + '</span></span>';
+            }
+            return t;
+        }
+
+        function applyProfileHeatmap() {
+            if (!profileData) return;
+
+            // Build name lookup: profile layer name -> node name mapping
+            // Profile uses torch module names (e.g., "model.layers.0.self_attn.q_proj")
+            // FX nodes use flattened names (e.g., "model_layers_0_self_attn_q_proj")
+            // NN layers also use flattened names
+            const profByName = new Map();
+            profileData.layers.forEach(lp => {
+                profByName.set(lp.name, lp);
+                // Also store with flattened name
+                const flat = lp.name.replace(/\./g, '_');
+                profByName.set(flat, lp);
+            });
+
+            const bottleneckSet = new Set(profileData.bottlenecks);
+            const bottleneckFlat = new Set(profileData.bottlenecks.map(b => b.replace(/\./g, '_')));
+
+            const maxPct = Math.max(...profileData.layers.map(l => l.pct_of_total), 1);
+
+            // Apply to FX graph nodes
+            document.querySelectorAll('[data-fx]').forEach(el => {
+                const fxName = el.dataset.fx;
+                const fxNode = fxMap.get(fxName);
+                // Try matching by fx_node_name, scope, or flattened name
+                let lp = profByName.get(fxName);
+                if (!lp && fxNode) lp = profByName.get(fxNode.scope);
+                if (!lp && fxNode) lp = profByName.get(fxNode.target);
+                if (!lp) return;
+
+                el.classList.add('profiled');
+                const pct = lp.pct_of_total / maxPct * 100;
+                const color = profColor(lp.pct_of_total);
+
+                // Add bar
+                let bar = el.querySelector('.pbar');
+                if (!bar) { bar = document.createElement('div'); bar.className = 'pbar'; el.appendChild(bar); }
+                bar.style.width = Math.max(pct, 5) + '%';
+                bar.style.background = color;
+
+                // Add rich hover tooltip with timing, memory, FLOPs, type
+                let tlbl = el.querySelector('.ptime');
+                if (!tlbl) { tlbl = document.createElement('div'); tlbl.className = 'ptime'; el.appendChild(tlbl); }
+                tlbl.innerHTML = buildProfileTooltip(lp);
+
+                // Bottleneck highlight
+                if (bottleneckSet.has(lp.name) || bottleneckFlat.has(fxName)) {
+                    el.classList.add('bottleneck');
+                }
+            });
+
+            // Apply to NN graph nodes (match via hf_module_name)
+            document.querySelectorAll('[data-nn]').forEach(el => {
+                const nnName = el.dataset.nn;
+                const nnLayer = nnMap.get(nnName);
+                let lp = profByName.get(nnName);
+                if (!lp && nnLayer) lp = profByName.get(nnLayer.hf_module_name);
+                if (!lp) return;
+
+                el.classList.add('profiled');
+                const pct = lp.pct_of_total / maxPct * 100;
+                const color = profColor(lp.pct_of_total);
+
+                let bar = el.querySelector('.pbar');
+                if (!bar) { bar = document.createElement('div'); bar.className = 'pbar'; el.appendChild(bar); }
+                bar.style.width = Math.max(pct, 5) + '%';
+                bar.style.background = color;
+
+                let tlbl = el.querySelector('.ptime');
+                if (!tlbl) { tlbl = document.createElement('div'); tlbl.className = 'ptime'; el.appendChild(tlbl); }
+                tlbl.innerHTML = buildProfileTooltip(lp);
+
+                if (bottleneckSet.has(lp.name) || bottleneckFlat.has(nnName)) {
+                    el.classList.add('bottleneck');
+                }
+            });
+        }
+
+        function renderProfilePanel() {
+            const p = document.getElementById('ppanel');
+            if (!profileData) {
+                p.innerHTML = '<div class="empty-msg">Run "NNTrainer: Profile Model" to see results</div>';
+                return;
+            }
+
+            let h = '<h3>Profile Results</h3>';
+            h += '<div class="vi">Total: <b>' + profileData.total_time_ms.toFixed(2) + ' ms</b> (avg of ' + profileData.num_runs + ' runs)</div>';
+            h += '<div class="vi">Layers: <b>' + profileData.layers.length + '</b>, Seq len: <b>' + profileData.seq_len + '</b></div>';
+            if (profileData.total_memory_mb > 0) {
+                h += '<div class="vi">Memory: <b>' + profileData.total_memory_mb.toFixed(2) + ' MB</b></div>';
+            }
+
+            // Bottleneck section
+            if (profileData.bottlenecks.length) {
+                h += '<h3>Bottlenecks <span class="badge err">' + profileData.bottlenecks.length + '</span></h3>';
+                profileData.bottlenecks.forEach(b => {
+                    const lp = profileData.layers.find(l => l.name === b);
+                    const flat = b.replace(/\./g, '_');
+                    h += '<div class="prow" data-prof-pick="' + esc(flat) + '">';
+                    h += '<span class="pname" style="color:#e06c75" title="' + esc(b) + '">' + esc(profDisplayName(b)) + '</span>';
+                    h += '<span class="pval">' + (lp ? lp.time_ms.toFixed(3) + 'ms' : '') + '</span>';
+                    h += '</div>';
+                });
+            }
+
+            // Summary table: timing + memory breakdown
+            h += '<h3>Layer Timing & Memory</h3>';
+            // Column headers
+            h += '<div class="prow" style="font-weight:600;font-size:9px;cursor:default;border-bottom:1px solid var(--vscode-panel-border)">';
+            h += '<span class="pname">Layer</span>';
+            h += '<span class="pval" style="min-width:70px">Time (ms)</span>';
+            h += '<span class="pval" style="min-width:45px">%</span>';
+            h += '<span class="pval" style="min-width:55px">Mem (MB)</span>';
+            h += '</div>';
+
+            const maxPct = Math.max(...profileData.layers.map(l => l.pct_of_total), 1);
+            profileData.layers.forEach(lp => {
+                const color = profColor(lp.pct_of_total);
+                const flat = lp.name.replace(/\./g, '_');
+                const isBot = profileData.bottlenecks.includes(lp.name);
+                const nameStyle = isBot ? ' style="color:#e06c75;font-weight:600"' : '';
+                const memStr = lp.memory_mb !== undefined && lp.memory_mb > 0 ? lp.memory_mb.toFixed(2) : '-';
+                const typeTag = lp.layer_type ? ' <span style="opacity:.5;font-size:8px">(' + esc(lp.layer_type) + ')</span>' : '';
+
+                // Build detailed tooltip
+                let tip = esc(lp.name);
+                tip += '\\nTime: ' + lp.time_ms.toFixed(3) + ' ms (' + lp.pct_of_total.toFixed(1) + '%)';
+                if (lp.memory_mb !== undefined && lp.memory_mb > 0) tip += '\\nMemory: ' + lp.memory_mb.toFixed(2) + ' MB';
+                if (lp.flops > 0) tip += '\\nFLOPs: ' + lp.flops.toLocaleString();
+                if (lp.layer_type) tip += '\\nType: ' + esc(lp.layer_type);
+
+                h += '<div class="prow" data-prof-pick="' + esc(flat) + '">';
+                h += '<span class="pname"' + nameStyle + ' title="' + tip + '">' + esc(profDisplayName(lp.name)) + typeTag + '</span>';
+                h += '<span class="pval">' + lp.time_ms.toFixed(3) + '</span>';
+                h += '<span class="pval" style="color:' + color + '">' + lp.pct_of_total.toFixed(1) + '%</span>';
+                h += '<span class="pval"' + (lp.memory_mb > 0 ? ' style="color:#56b6c2"' : '') + '>' + memStr + '</span>';
+                h += '</div>';
+            });
+
+            // Memory breakdown section
+            const layersWithMem = profileData.layers.filter(l => l.memory_mb !== undefined && l.memory_mb > 0);
+            if (layersWithMem.length > 0) {
+                h += '<h3>Memory Breakdown</h3>';
+                const totalMem = layersWithMem.reduce((s, l) => s + l.memory_mb, 0);
+                const maxMem = Math.max(...layersWithMem.map(l => l.memory_mb), 0.001);
+                layersWithMem.sort((a, b) => b.memory_mb - a.memory_mb);
+                layersWithMem.forEach(lp => {
+                    const flat = lp.name.replace(/\./g, '_');
+                    const pctMem = totalMem > 0 ? (lp.memory_mb / totalMem * 100).toFixed(1) : '0';
+                    const barW = (lp.memory_mb / maxMem * 100);
+                    h += '<div class="prow" data-prof-pick="' + esc(flat) + '">';
+                    h += '<span class="pname" title="' + esc(lp.name) + '">' + esc(profDisplayName(lp.name)) + '</span>';
+                    h += '<div class="pbar-h"><div class="pbar-fill" style="width:' + barW + '%;background:#56b6c2"></div></div>';
+                    h += '<span class="pval" style="color:#56b6c2">' + lp.memory_mb.toFixed(2) + ' MB</span>';
+                    h += '<span class="pval">' + pctMem + '%</span>';
+                    h += '</div>';
+                });
+                h += '<div class="vi" style="margin-top:4px">Total layer memory: <b>' + totalMem.toFixed(2) + ' MB</b></div>';
+            }
+
+            // FLOPs breakdown
+            const layersWithFlops = profileData.layers.filter(l => l.flops > 0);
+            if (layersWithFlops.length > 0) {
+                h += '<h3>FLOPs Estimate</h3>';
+                const totalFlops = layersWithFlops.reduce((s, l) => s + l.flops, 0);
+                layersWithFlops.sort((a, b) => b.flops - a.flops);
+                layersWithFlops.slice(0, 15).forEach(lp => {
+                    const flat = lp.name.replace(/\./g, '_');
+                    const pctFlops = totalFlops > 0 ? (lp.flops / totalFlops * 100).toFixed(1) : '0';
+                    h += '<div class="prow" data-prof-pick="' + esc(flat) + '">';
+                    h += '<span class="pname" title="' + esc(lp.name) + '">' + esc(profDisplayName(lp.name)) + '</span>';
+                    h += '<span class="pval">' + (lp.flops / 1e6).toFixed(1) + 'M</span>';
+                    h += '<span class="pval">' + pctFlops + '%</span>';
+                    h += '</div>';
+                });
+                h += '<div class="vi" style="margin-top:4px">Total FLOPs: <b>' + (totalFlops / 1e9).toFixed(2) + ' GFLOPs</b></div>';
+            }
+
+            p.innerHTML = h;
+
+            // Click handlers -> navigate to node
+            p.querySelectorAll('[data-prof-pick]').forEach(el => {
+                el.onclick = () => {
+                    const name = el.dataset.profPick;
+                    // Try FX first, then NN
+                    if (fxMap.has(name)) pickFx(name);
+                    else if (nnMap.has(name)) pickNn(name);
+                    else {
+                        // Fuzzy match
+                        for (const [k] of fxMap) { if (k.includes(name) || name.includes(k)) { pickFx(k); return; } }
+                        for (const [k] of nnMap) { if (k.includes(name) || name.includes(k)) { pickNn(k); return; } }
+                    }
+                };
+            });
+        }
+
+        /* ==================================================================
+         * Phase 6-1: Pattern Grouping
+         * ================================================================== */
+        function detectGroups(nodes, nameKey) {
+            // Detect groups at multiple levels:
+            // 1. Transformer block level (Layer N)
+            // 2. Sub-block level (Attn, FFN, Norm, Embed)
+            const blockMap = new Map();
+
+            nodes.forEach(n => {
+                const name = typeof n === 'string' ? n : (n.dataset ? n.dataset[nameKey] : n.name || '');
+
+                // Transformer block level: model_layers_N_*
+                let m = name.match(/^(model_layers_(\d+))_/);
+                if (m) {
+                    const blockId = m[1];
+                    if (!blockMap.has(blockId)) blockMap.set(blockId, {type:'block', label:'Layer '+m[2], names:[], children: new Map()});
+                    blockMap.get(blockId).names.push(name);
+
+                    // Sub-block detection within this layer
+                    const block = blockMap.get(blockId);
+                    let sub = name.match(/^model_layers_\d+_(self_attn)/);
+                    if (sub) {
+                        const subId = blockId+'_self_attn';
+                        if (!block.children.has(subId)) block.children.set(subId, {type:'attn', label:'Self Attention', names:[]});
+                        block.children.get(subId).names.push(name);
+                        return;
+                    }
+                    sub = name.match(/^model_layers_\d+_(mlp|ffn)/);
+                    if (sub) {
+                        const subId = blockId+'_'+sub[1];
+                        if (!block.children.has(subId)) block.children.set(subId, {type:'ffn', label:sub[1].toUpperCase(), names:[]});
+                        block.children.get(subId).names.push(name);
+                        return;
+                    }
+                    sub = name.match(/^model_layers_\d+_(input_layernorm|post_attention_layernorm|rms_norm|layer_norm)/);
+                    if (sub) {
+                        const subId = blockId+'_norm';
+                        if (!block.children.has(subId)) block.children.set(subId, {type:'norm', label:'Norm', names:[]});
+                        block.children.get(subId).names.push(name);
+                        return;
+                    }
+                    return;
+                }
+
+                // Embedding / RoPE (top-level group)
+                m = name.match(/^(model_(rotary_emb|embed))/);
+                if (m) {
+                    const bid = m[1];
+                    if (!blockMap.has(bid)) blockMap.set(bid, {type:'embed', label:m[2]==='embed'?'Embedding':'RoPE', names:[], children: new Map()});
+                    blockMap.get(bid).names.push(name);
+                    return;
+                }
+
+                // Output head (lm_head, model_norm, etc.)
+                m = name.match(/^(lm_head|model_norm)/);
+                if (m) {
+                    if (!blockMap.has('output_head')) blockMap.set('output_head', {type:'head', label:'Output Head', names:[], children: new Map()});
+                    blockMap.get('output_head').names.push(name);
+                }
+            });
+
+            const groups = [];
+            blockMap.forEach((info) => {
+                if (info.names.length >= 2) {
+                    // Convert children map to array
+                    info.subGroups = [];
+                    info.children.forEach(sub => {
+                        if (sub.names.length >= 2) info.subGroups.push(sub);
+                    });
+                    delete info.children;
+                    groups.push(info);
+                }
+            });
+            return groups;
+        }
+
+        function drawGroups() {
+            // Remove existing group elements
+            document.querySelectorAll('.group-box,.group-label').forEach(e => e.remove());
+            if (!showGroups) return;
+
+            function getBounds(names, dataAttr) {
+                let minX=Infinity, minY=Infinity, maxX=0, maxY=0, found=0;
+                names.forEach(name => {
+                    const el = document.querySelector('[data-'+dataAttr+'="'+name+'"]');
+                    if (!el) return;
+                    const x = parseInt(el.style.left)||0, y = parseInt(el.style.top)||0;
+                    const w = parseInt(el.style.width)||NW, h = parseInt(el.style.height)||NH;
+                    if (x < minX) minX = x;
+                    if (y < minY) minY = y;
+                    if (x+w > maxX) maxX = x+w;
+                    if (y+h > maxY) maxY = y+h;
+                    found++;
+                });
+                return { minX, minY, maxX, maxY, found };
+            }
+
+            function renderGroupsOnPane(nc, groups, dataAttr) {
+                groups.forEach(g => {
+                    const b = getBounds(g.names, dataAttr);
+                    if (b.found < 2) return;
+
+                    // Outer block box (larger padding for block-level groups)
+                    const isBlock = g.type === 'block';
+                    const pad = isBlock ? 12 : 6;
+                    const box = document.createElement('div');
+                    box.className = 'group-box '+g.type;
+                    box.style.cssText = 'left:'+(b.minX-pad)+'px;top:'+(b.minY-pad-18)+'px;width:'+(b.maxX-b.minX+pad*2)+'px;height:'+(b.maxY-b.minY+pad*2+18)+'px';
+                    nc.appendChild(box);
+
+                    // Label
+                    const lbl = document.createElement('div');
+                    lbl.className = 'group-label '+g.type;
+                    lbl.textContent = g.label;
+                    lbl.style.cssText = 'left:'+(b.minX-pad+4)+'px;top:'+(b.minY-pad-16)+'px';
+                    nc.appendChild(lbl);
+
+                    // Sub-groups within block
+                    if (g.subGroups) {
+                        g.subGroups.forEach(sub => {
+                            const sb = getBounds(sub.names, dataAttr);
+                            if (sb.found < 2) return;
+                            const sp = 5;
+                            const sbox = document.createElement('div');
+                            sbox.className = 'group-box sub '+sub.type;
+                            sbox.style.cssText = 'left:'+(sb.minX-sp)+'px;top:'+(sb.minY-sp-14)+'px;width:'+(sb.maxX-sb.minX+sp*2)+'px;height:'+(sb.maxY-sb.minY+sp*2+14)+'px';
+                            nc.appendChild(sbox);
+                            const slbl = document.createElement('div');
+                            slbl.className = 'group-label sub '+sub.type;
+                            slbl.textContent = sub.label;
+                            slbl.style.cssText = 'left:'+(sb.minX-sp+2)+'px;top:'+(sb.minY-sp-13)+'px';
+                            nc.appendChild(slbl);
+                        });
+                    }
+                });
+            }
+
+            // Draw groups on NN graph
+            renderGroupsOnPane(
+                document.getElementById('nc-nn'),
+                detectGroups(D.nntrainerLayers, 'nn'),
+                'nn'
+            );
+            // Draw groups on FX graph
+            renderGroupsOnPane(
+                document.getElementById('nc-fx'),
+                detectGroups(D.fxGraph.filter(n=>n.op!=='placeholder'&&n.op!=='output'), 'fx'),
+                'fx'
+            );
+        }
+
+        /* ==================================================================
+         * Phase 6-2: C++ Source Linking
+         * ================================================================== */
+        // Build line index: NN layer name -> C++ line number
+        const cppLineMap = new Map();
+        if (D.cppSource) {
+            const cppLines = D.cppSource.split('\n');
+
+            // Index C++ LayerHandle declarations and Tensor::add() calls
+            const cppHandles = []; // [{line, varName, layerType, method}]
+            const cppAddLines = []; // [{line, varName}]
+            // Also track withKey("name", ...) to extract NNTrainer name
+            // suffixes for each LayerHandle (e.g. "_k_norm", "_conv_norm").
+            // Track C++ method boundaries for method-aware type matching
+            let lastHandle = null;
+            let currentMethod = null;
+            let braceDepth = 0;
+            let inMethod = false;
+            cppLines.forEach((line, i) => {
+                // Detect method signatures: ClassName::methodName(
+                // Exclude std::, nntrainer::, ml::, etc. by requiring
+                // the class name to start with uppercase
+                const methodMatch = line.match(/[A-Z]\w*::(\w+)\s*\(/);
+                if (methodMatch && !line.match(/^\s*\/\//) && !line.match(/static_cast/)) {
+                    currentMethod = methodMatch[1];
+                    braceDepth = 0;
+                    inMethod = false;
+                }
+                // Track brace depth to detect method end
+                for (const ch of line) {
+                    if (ch === '{') { braceDepth++; inMethod = true; }
+                    else if (ch === '}') {
+                        braceDepth--;
+                        if (inMethod && braceDepth <= 0) {
+                            currentMethod = null;
+                            inMethod = false;
+                        }
+                    }
+                }
+
+                let m = line.match(/LayerHandle\s+(\w+)\s*\(\s*createLayer\s*\(\s*"([^"]+)"/);
+                if (!m) m = line.match(/LayerHandle\s+(\w+)\s*\(\s*createLayer\s*\(\s*(\w+)/);
+                if (m) {
+                    lastHandle = {line: i+1, varName: m[1], layerType: m[2], nameSuffixes: [], method: currentMethod};
+                    cppHandles.push(lastHandle);
+                }
+                // Handle multi-line: LayerHandle var(createLayer(\n"type", {
+                if (!m) {
+                    const partial = line.match(/LayerHandle\s+(\w+)\s*\(\s*createLayer\s*\(\s*$/);
+                    if (partial) {
+                        // Type string is on the next line
+                        const nextLine = cppLines[i+1] || '';
+                        const tm = nextLine.match(/^\s*"([^"]+)"/);
+                        if (tm) {
+                            lastHandle = {line: i+1, varName: partial[1], layerType: tm[1], nameSuffixes: [], method: currentMethod};
+                            cppHandles.push(lastHandle);
+                        }
+                    }
+                }
+                let ma = line.match(/Tensor\s+(\w+)\s*=\s*\w+\.add\s*\(/);
+                if (ma) cppAddLines.push({line: i+1, varName: ma[1]});
+                // Extract name suffix from withKey("name", prefix + "_suffix")
+                // or withKey("name", VarName) where VarName = "layer" + id + "_suffix"
+                if (lastHandle) {
+                    let wk = line.match(/withKey\s*\(\s*"name"\s*,\s*(?:prefix\s*\+\s*)?"([^"]+)"/);
+                    if (wk) lastHandle.nameSuffixes.push(wk[1].replace(/^_/, ''));
+                    // Also handle variable references like K_norm_name
+                    let vr = line.match(/withKey\s*\(\s*"name"\s*,\s*(\w+_name)\s*\)/);
+                    if (vr) {
+                        // Find the variable definition: auto Foo = "layer" + ... + "_suffix";
+                        const varDef = cppLines.find(l => {
+                            const dm = l.match(new RegExp('auto\\s+' + vr[1] + '\\s*=.*"([^"]+)"\\s*;'));
+                            return dm;
+                        });
+                        if (varDef) {
+                            const dm = varDef.match(/"([^"]+)"\s*;/);
+                            if (dm) lastHandle.nameSuffixes.push(dm[1].replace(/^_/, ''));
+                        }
+                    }
+                }
+            });
+
+            // Build handle lookups
+            const handleByVar = new Map();   // varName -> line
+            const handlesByType = new Map();  // layerType -> [{line, varName}]
+            const nameSuffixMap = new Map();  // NNTrainer name suffix -> line
+            cppHandles.forEach(h => {
+                if (!handleByVar.has(h.varName)) handleByVar.set(h.varName, h.line);
+                // Also index without _layer suffix (flat model emitter adds it)
+                if (h.varName.endsWith('_layer')) {
+                    const base = h.varName.slice(0, -6);
+                    if (!handleByVar.has(base)) handleByVar.set(base, h.line);
+                }
+                if (!handlesByType.has(h.layerType)) handlesByType.set(h.layerType, []);
+                handlesByType.get(h.layerType).push(h);
+                // Index name suffixes (from withKey("name",...) parsing)
+                h.nameSuffixes.forEach(s => {
+                    if (!nameSuffixMap.has(s)) nameSuffixMap.set(s, h.line);
+                });
+            });
+
+            // Method-aware type index: method -> layerType -> [handles]
+            const handlesByTypeInMethod = new Map();
+            cppHandles.forEach(h => {
+                if (!h.method) return;
+                if (!handlesByTypeInMethod.has(h.method)) handlesByTypeInMethod.set(h.method, new Map());
+                const methodTypes = handlesByTypeInMethod.get(h.method);
+                if (!methodTypes.has(h.layerType)) methodTypes.set(h.layerType, []);
+                methodTypes.get(h.layerType).push(h);
+            });
+
+            // Map NN layer scope to preferred C++ method name
+            function scopeToMethod(name) {
+                if (/_self_attn_/.test(name)) return 'createAttention';
+                if (/_conv_|_feed_forward_|_short_conv/.test(name)) return 'createConvBlock';
+                if (/_mlp_/.test(name)) return 'createMlp';
+                return null;
+            }
+
+            // Alias: NN layer name suffix -> C++ handle variable name
+            // Covers naming differences between HF module paths and C++ emitter
+            const suffixAlias = {
+                // Pre-attention norm (various naming conventions)
+                'input_layernorm': 'att_norm',
+                'pre_attn_norm': 'att_norm',
+                'attention_norm': 'att_norm',
+                'operator_norm': 'att_norm',
+                'ln_1': 'att_norm',
+                // MHA core (SDPA in NN model → attn handle in C++)
+                'sdpa': 'attn',
+                'scaled_dot_product_attention_sdpa': 'attn',
+                'attention': 'attn',
+                'self_attention': 'attn',
+                'self_attn': 'attn',
+                // Q/K norms (Qwen3 and LFM2 naming conventions)
+                'q_layernorm': 'q_norm',
+                'k_layernorm': 'k_norm',
+                // Post-attention / pre-FFN norm
+                'post_attention_layernorm': 'ffn_norm',
+                'pre_ffn_norm': 'ffn_norm',
+                'ln_2': 'ffn_norm',
+                // Cross-attention norm (encoder-decoder)
+                'cross_attn_norm': 'cross_norm',
+                'encoder_attn_layer_norm': 'cross_norm',
+                // FFN projections (SwiGLU / GeGLU / gated)
+                'up_proj': 'ffn_up',
+                'gate_proj': 'ffn_gate',
+                'down_proj': 'ffn_down',
+                'act_fn': 'ffn_act',
+                'activation_post_process': 'ffn_act',
+                // FFN projections (standard GELU/ReLU)
+                'fc1': 'ffn_fc1',
+                'fc2': 'ffn_down',
+                'c_fc': 'ffn_fc1',
+                'c_proj': 'ffn_down',
+                // Embedding and LM head
+                'embed_tokens': 'embedding',
+                'word_embeddings': 'embedding',
+                'wte': 'embedding',
+                'lm_head': 'lmhead',
+                // Encoder/decoder output norm
+                'norm': 'output_norm',
+                'model_norm': 'output_norm',
+                'final_layer_norm': 'output_norm',
+                'final_layernorm': 'output_norm',
+                'ln_f': 'output_norm',
+            };
+
+            // Try suffix matching against handleByVar and suffixAlias.
+            // Tries longest suffix first for specificity (e.g. "operator_norm"
+            // should match before the shorter "norm").
+            // Returns the C++ line number or null.
+            function matchSuffix(name) {
+                const parts = name.split('_');
+                const maxLen = Math.min(6, parts.length);
+                // Longest suffix first: more specific matches win
+                for (let len = maxLen; len >= 1; len--) {
+                    const suffix = parts.slice(-len).join('_');
+                    if (handleByVar.has(suffix)) return handleByVar.get(suffix);
+                    const alias = suffixAlias[suffix];
+                    if (alias && handleByVar.has(alias)) return handleByVar.get(alias);
+                }
+                return null;
+            }
+
+            // Extract functional suffix after scope markers
+            // e.g. "model_layers_2_self_attn_k_layernorm" -> "k_layernorm"
+            //      "model_layers_0_mlp_down_proj" -> "down_proj"
+            //      "model_layers_0_input_layernorm" -> "input_layernorm"
+            function extractScopedSuffix(name) {
+                // Try stripping after self_attn/mlp scope
+                const scopePatterns = [
+                    /_self_attn_(?!.*_self_attn_)(.+)$/,
+                    /_mlp_(?!.*_mlp_)(.+)$/,
+                    /_layers_\d+_(.+)$/,
+                    /^model_(.+)$/,
+                ];
+                for (const re of scopePatterns) {
+                    const m = name.match(re);
+                    if (m) return m[1];
+                }
+                return null;
+            }
+
+            // Track type-based match index per type for sequential matching
+            const typeMatchIdx = new Map();
+
+            let addIdx = 0;
+            D.nntrainerLayers.forEach(l => {
+                // Addition layers map to .add() calls in block methods
+                // Wrap around for multiple blocks sharing the same method
+                if (l.layer_type === 'addition' && cppAddLines.length > 0) {
+                    cppLineMap.set(l.name, cppAddLines[addIdx % cppAddLines.length].line);
+                    addIdx++;
+                    return;
+                }
+
+                // 1. Direct suffix matching on the full name
+                let line = matchSuffix(l.name);
+                if (line) { cppLineMap.set(l.name, line); return; }
+
+                // 2. Extract suffix after scope markers, then match
+                const scoped = extractScopedSuffix(l.name);
+                if (scoped) {
+                    line = matchSuffix(scoped);
+                    if (line) { cppLineMap.set(l.name, line); return; }
+                }
+
+                // 3. Match via C++ withKey("name",...) name suffixes
+                // e.g. NN "model_layers_2_self_attn_q_proj" matches C++
+                // name suffix "wq" from withKey("name", "layer"+id+"_wq")
+                if (scoped) {
+                    for (const [suffix, sLine] of nameSuffixMap) {
+                        if (scoped === suffix || scoped.endsWith('_' + suffix)) {
+                            line = sLine;
+                            break;
+                        }
+                    }
+                    if (line) { cppLineMap.set(l.name, line); return; }
+                }
+
+                // 4. Fallback: match by layer type (method-aware)
+                const typeAlias = {'sdpa': 'mha_core'};
+                const lookupType = typeAlias[l.layer_type] || l.layer_type;
+                // Prefer handles from the method matching the NN layer scope
+                const preferredMethod = scopeToMethod(l.name);
+                let typeHandles = null;
+                if (preferredMethod) {
+                    const methodTypes = handlesByTypeInMethod.get(preferredMethod);
+                    if (methodTypes) {
+                        typeHandles = methodTypes.get(lookupType) || methodTypes.get(l.layer_type);
+                    }
+                }
+                // Fall back to global type index if no method-specific match
+                if (!typeHandles) {
+                    typeHandles = handlesByType.get(lookupType) || handlesByType.get(l.layer_type);
+                }
+                if (typeHandles && typeHandles.length > 0) {
+                    // Use method-specific counters for sequential matching
+                    const typeKey = (preferredMethod || '') + ':' + l.layer_type;
+                    const idx = typeMatchIdx.get(typeKey) || 0;
+                    cppLineMap.set(l.name, typeHandles[idx % typeHandles.length].line);
+                    typeMatchIdx.set(typeKey, idx + 1);
+                    return;
+                }
+            });
+        }
+
+        function highlightCppLine(layerName) {
+            // Clear previous highlights
+            document.querySelectorAll('.src-code .ln.cpp-hl').forEach(el => el.classList.remove('cpp-hl'));
+            const lineNum = cppLineMap.get(layerName);
+            if (!lineNum) return;
+            const lineEl = document.querySelector('#sc-cpp .ln[data-line="'+lineNum+'"]');
+            if (lineEl) {
+                lineEl.classList.add('cpp-hl');
+                lineEl.scrollIntoView({behavior:'smooth', block:'center'});
+                // Auto-show C++ panel if hidden
+                if (!showCSrc) {
+                    showCSrc = true;
+                    document.getElementById('sp-cpp').classList.add('vis');
+                    document.getElementById('b-csrc').classList.add('active');
+                }
+            }
+        }
+
+        /* ==================================================================
+         * Phase 6-3: Export
+         * ================================================================== */
+        function exportReport() {
+            // Build comprehensive verification report
+            const mv = verifyMapping();
+            const tv = verifyTopology();
+            const cv = verifyCpp();
+
+            let report = '# NNTrainer Conversion Report\n';
+            report += '## Model\n';
+            report += '- FX Nodes: ' + D.fxGraph.length + '\n';
+            report += '- NNTrainer Layers: ' + D.nntrainerLayers.length + '\n';
+            report += '- Mapping Coverage: ' + mv.coverage + '%\n\n';
+
+            report += '## Mapping Summary\n';
+            report += '- Direct mapped: ' + mv.directMapped.length + '\n';
+            report += '- Skipped: ' + mv.skipped.length + '\n';
+            report += '- Unmapped FX: ' + mv.unmappedFx.length + '\n';
+            report += '- Unmapped NN: ' + mv.unmappedNn.length + '\n\n';
+
+            if (mv.unmappedFx.length) {
+                report += '### Unmapped FX Nodes\n';
+                mv.unmappedFx.forEach(n => report += '- ' + n.name + ' (' + n.op + ': ' + n.target + ')\n');
+                report += '\n';
+            }
+
+            report += '## Topology\n';
+            report += '- Mismatches: ' + tv.length + '\n';
+            tv.forEach(i => report += '- ' + i.msg + '\n');
+            report += '\n';
+
+            report += '## C++ Cross-check\n';
+            report += '- createLayer calls: ' + cv.layerCalls.length + '\n';
+            report += '- Layer types: ' + cv.cppTypes.join(', ') + '\n';
+            report += '- Issues: ' + cv.issues.length + '\n';
+            cv.issues.forEach(i => report += '- ' + i.msg + '\n');
+            report += '\n';
+
+            if (D.unsupportedOps.length) {
+                report += '## Unsupported Ops\n';
+                D.unsupportedOps.forEach(o => report += '- ' + o + '\n');
+                report += '\n';
+            }
+
+            if (profileData) {
+                report += '## Profile\n';
+                report += '- Total: ' + profileData.total_time_ms.toFixed(2) + ' ms\n';
+                report += '- Bottlenecks: ' + profileData.bottlenecks.join(', ') + '\n';
+                report += '### Top 10 Layers\n';
+                profileData.layers.slice(0, 10).forEach(l => {
+                    report += '- ' + l.name + ': ' + l.time_ms.toFixed(3) + ' ms (' + l.pct_of_total.toFixed(1) + '%)\n';
+                });
+                report += '\n';
+            }
+
+            report += '## Layer Details\n';
+            report += '| NN Layer | Type | FX Node | HF Module | Weight |\n';
+            report += '|----------|------|---------|-----------|--------|\n';
+            D.nntrainerLayers.forEach(l => {
+                report += '| ' + l.name + ' | ' + l.layer_type + ' | ' + (l.fx_node_name||'-') + ' | ' + (l.hf_module_name||'-') + ' | ' + (l.has_weight?'yes':'no') + ' |\n';
+            });
+
+            // Send to extension for saving
+            vscode.postMessage({command:'exportReport', data:{content:report, format:'md'}});
+
+            // Also generate graph SVG export
+            const nnSvg = document.getElementById('eg-nn');
+            const nnNodes = document.getElementById('nc-nn');
+            if (nnSvg && nnNodes) {
+                // Create a combined SVG with nodes as foreignObject
+                const w = parseInt(nnNodes.style.width) || 800;
+                const h = parseInt(nnNodes.style.height) || 600;
+                let svgStr = '<svg xmlns="http://www.w3.org/2000/svg" width="'+w+'" height="'+h+'">';
+                svgStr += '<style>.eline{stroke:#666;stroke-width:1;fill:none}.earr{fill:#666}</style>';
+                svgStr += nnSvg.innerHTML;
+                // Add node rectangles
+                document.querySelectorAll('[data-nn]').forEach(el => {
+                    const x = parseInt(el.style.left)||0, y = parseInt(el.style.top)||0;
+                    const nw = parseInt(el.style.width)||NW, nh = parseInt(el.style.height)||NH;
+                    const name = el.dataset.nn;
+                    const layer = nnMap.get(name);
+                    const color = el.classList.contains('mapped') ? '#98c379' : '#e06c75';
+                    svgStr += '<rect x="'+x+'" y="'+y+'" width="'+nw+'" height="'+nh+'" rx="4" fill="#1e1e1e" stroke="'+color+'" stroke-width="1"/>';
+                    svgStr += '<text x="'+(x+nw/2)+'" y="'+(y+14)+'" fill="#ccc" font-size="9" text-anchor="middle" font-family="monospace">'+esc(name)+'</text>';
+                    if (layer) svgStr += '<text x="'+(x+nw/2)+'" y="'+(y+26)+'" fill="#888" font-size="8" text-anchor="middle" font-family="monospace">'+esc(layer.layer_type)+'</text>';
+                });
+                svgStr += '</svg>';
+                vscode.postMessage({command:'exportSvg', data:{content:svgStr}});
+            }
+        }
+
+        /* ==================================================================
+         * Property Inspector (Phase 4)
+         * ================================================================== */
+
+        // Build weight map lookup: NN layer name -> weight entries
+        const wMapByLayer = new Map();
+        (D.weightMap||[]).forEach(w => {
+            if (!wMapByLayer.has(w.layer_name)) wMapByLayer.set(w.layer_name, []);
+            wMapByLayer.get(w.layer_name).push(w);
+        });
+
+        function renderInspector() {
+            const el = document.getElementById('inspector');
+            if (!selFx && !selNn) {
+                el.innerHTML = '<div class="empty-msg">Click a node to inspect</div>';
+                return;
+            }
+
+            // Find the paired nodes
+            let fxNode = selFx ? fxMap.get(selFx) : null;
+            let nnLayer = selNn ? nnMap.get(selNn) : null;
+            // Try to find the pair via mapping
+            if (fxNode && !nnLayer) {
+                const m = mByFx.get(fxNode.name);
+                if (m && m.nntrainerLayerName) nnLayer = nnMap.get(m.nntrainerLayerName);
+            }
+            if (nnLayer && !fxNode) {
+                const m = mByNn.get(nnLayer.name);
+                if (m && m.fxNodeName) fxNode = fxMap.get(m.fxNodeName);
+            }
+
+            // Tabs
+            let h = '<div class="itabs">';
+            h += '<div class="itab'+(inspTab==='props'?' active':'')+'" data-itab="props">Properties</div>';
+            h += '<div class="itab'+(inspTab==='shape'?' active':'')+'" data-itab="shape">Shapes</div>';
+            h += '<div class="itab'+(inspTab==='weight'?' active':'')+'" data-itab="weight">Weights</div>';
+            if (profileData) h += '<div class="itab'+(inspTab==='profile'?' active':'')+'" data-itab="profile">Profile</div>';
+            h += '</div>';
+
+            if (inspTab === 'props') {
+                h += renderPropsTab(fxNode, nnLayer);
+            } else if (inspTab === 'shape') {
+                h += renderShapeTab(fxNode, nnLayer);
+            } else if (inspTab === 'weight') {
+                h += renderWeightTab(fxNode, nnLayer);
+            } else if (inspTab === 'profile') {
+                h += renderProfileTab(fxNode, nnLayer);
+            }
+
+            el.innerHTML = h;
+
+            // Tab handlers
+            el.querySelectorAll('.itab').forEach(t => {
+                t.onclick = () => { inspTab = t.dataset.itab; renderInspector(); };
+            });
+        }
+
+        /* 4-1: Property comparison */
+        function renderPropsTab(fxNode, nnLayer) {
+            let h = '';
+
+            if (fxNode) {
+                h += '<h3 style="color:#e06c75">FX Node: '+esc(fxNode.name)+'</h3>';
+                h += '<table class="prop-table"><tr><th>Key</th><th>Value</th></tr>';
+                h += '<tr><td class="k">op</td><td class="v">'+esc(fxNode.op)+'</td></tr>';
+                h += '<tr><td class="k">target</td><td class="v">'+esc(fxNode.target)+'</td></tr>';
+                if (fxNode.module_type) h += '<tr><td class="k">module_type</td><td class="v">'+esc(fxNode.module_type)+'</td></tr>';
+                h += '<tr><td class="k">scope</td><td class="v">'+esc(fxNode.scope)+'</td></tr>';
+                h += '<tr><td class="k">args</td><td class="v">'+esc((fxNode.args||[]).join(', '))+'</td></tr>';
+                if (fxNode.output_shape) h += '<tr><td class="k">output_shape</td><td class="v">'+esc(JSON.stringify(fxNode.output_shape))+'</td></tr>';
+                // Meta properties
+                const meta = fxNode.meta || {};
+                Object.keys(meta).forEach(k => {
+                    h += '<tr><td class="k">meta.'+esc(k)+'</td><td class="v">'+esc(JSON.stringify(meta[k]))+'</td></tr>';
+                });
+                h += '</table>';
+            }
+
+            if (nnLayer) {
+                h += '<h3 style="color:#61afef">NN Layer: '+esc(nnLayer.name)+'</h3>';
+                h += '<table class="prop-table"><tr><th>Key</th><th>Value</th></tr>';
+                h += '<tr><td class="k">layer_type</td><td class="v">'+esc(nnLayer.layer_type)+'</td></tr>';
+                h += '<tr><td class="k">input_layers</td><td class="v">'+esc((nnLayer.input_layers||[]).join(', '))+'</td></tr>';
+                h += '<tr><td class="k">hf_module</td><td class="v">'+esc(nnLayer.hf_module_name)+'</td></tr>';
+                h += '<tr><td class="k">hf_type</td><td class="v">'+esc(nnLayer.hf_module_type)+'</td></tr>';
+                Object.entries(nnLayer.properties||{}).forEach(([k,v]) => {
+                    h += '<tr><td class="k">'+esc(k)+'</td><td class="v">'+esc(String(v))+'</td></tr>';
+                });
+                h += '</table>';
+            }
+
+            // Side-by-side comparison if both exist
+            if (fxNode && nnLayer) {
+                h += '<h3>Parameter Comparison</h3>';
+                h += '<table class="prop-table"><tr><th>Parameter</th><th>FX (torch)</th><th>NN (nntrainer)</th></tr>';
+                const fxMeta = fxNode.meta || {};
+                const nnProps = nnLayer.properties || {};
+
+                // Common parameter pairs to compare
+                const pairs = [
+                    ['num_embeddings', 'in_dim'],
+                    ['embedding_dim', 'out_dim'],
+                    ['in_features', 'unit'], ['out_features', 'unit'],
+                    ['num_heads', 'num_heads'],
+                    ['num_kv_heads', 'num_kv_heads'],
+                    ['head_dim', 'head_dim'],
+                    ['normalized_shape', 'epsilon'],
+                ];
+                let shown = new Set();
+                pairs.forEach(([fk, nk]) => {
+                    const fv = fxMeta[fk];
+                    const nv = nnProps[nk];
+                    if (fv !== undefined || nv !== undefined) {
+                        const fStr = fv !== undefined ? String(fv) : '-';
+                        const nStr = nv !== undefined ? String(nv) : '-';
+                        const cls = (fv !== undefined && nv !== undefined && String(fv) === String(nv)) ? 'match' : (fv !== undefined && nv !== undefined) ? 'diff' : '';
+                        h += '<tr><td class="k">'+esc(fk)+' / '+esc(nk)+'</td><td class="v '+cls+'">'+esc(fStr)+'</td><td class="v '+cls+'">'+esc(nStr)+'</td></tr>';
+                        shown.add(fk); shown.add(nk);
+                    }
+                });
+                // Show remaining unmatched FX meta
+                Object.keys(fxMeta).forEach(k => {
+                    if (!shown.has(k)) {
+                        h += '<tr><td class="k">'+esc(k)+'</td><td class="v">'+esc(String(fxMeta[k]))+'</td><td class="v" style="opacity:.4">-</td></tr>';
+                    }
+                });
+                // Show remaining unmatched NN props
+                Object.keys(nnProps).forEach(k => {
+                    if (!shown.has(k)) {
+                        h += '<tr><td class="k">'+esc(k)+'</td><td class="v" style="opacity:.4">-</td><td class="v">'+esc(String(nnProps[k]))+'</td></tr>';
+                    }
+                });
+                h += '</table>';
+            }
+
+            // Profile summary in Properties tab (when profiling is active)
+            if (profileData && (fxNode || nnLayer)) {
+                const profByName = new Map();
+                profileData.layers.forEach(lp => {
+                    profByName.set(lp.name, lp);
+                    profByName.set(lp.name.replace(/\./g, '_'), lp);
+                });
+                let lpFx = null, lpNn = null;
+                if (fxNode) lpFx = profByName.get(fxNode.name) || profByName.get(fxNode.scope) || profByName.get(fxNode.target);
+                if (nnLayer) lpNn = profByName.get(nnLayer.name) || profByName.get(nnLayer.hf_module_name);
+                const lp = lpFx || lpNn;
+                if (lp) {
+                    const color = profColor(lp.pct_of_total);
+                    const isBot = profileData.bottlenecks.includes(lp.name);
+                    h += '<h3>Profile</h3>';
+                    if (isBot) h += '<div class="vi"><span class="badge err">⚠ Bottleneck</span></div>';
+                    h += '<table class="prop-table"><tr><th>Metric</th><th>Value</th></tr>';
+                    h += '<tr><td class="k">Time</td><td class="v" style="color:' + color + '">' + lp.time_ms.toFixed(3) + ' ms (' + lp.pct_of_total.toFixed(1) + '%)</td></tr>';
+                    if (lp.memory_mb !== undefined && lp.memory_mb > 0) h += '<tr><td class="k">Memory</td><td class="v" style="color:#56b6c2">' + lp.memory_mb.toFixed(2) + ' MB</td></tr>';
+                    if (lp.flops > 0) h += '<tr><td class="k">FLOPs</td><td class="v" style="color:#d19a66">' + (lp.flops / 1e6).toFixed(1) + 'M</td></tr>';
+                    h += '</table>';
+                }
+            }
+
+            if (!fxNode && !nnLayer) h += '<div class="empty-msg">No node selected</div>';
+            return h;
+        }
+
+        /* 4-2: Tensor dimension tracking */
+        function renderShapeTab(fxNode, nnLayer) {
+            let h = '';
+
+            if (fxNode) {
+                h += '<h3 style="color:#e06c75">FX: '+esc(fxNode.name)+'</h3>';
+                // Input shapes from args
+                const argNodes = (fxNode.args||[]).map(a => fxMap.get(a)).filter(Boolean);
+                if (argNodes.length) {
+                    h += '<div style="margin:4px 0;font-size:10px;color:var(--vscode-descriptionForeground)">Inputs:</div>';
+                    argNodes.forEach(a => {
+                        const shape = a.output_shape ? JSON.stringify(a.output_shape) : '?';
+                        h += '<div class="shape-flow"><span class="shape-box">'+esc(a.name)+'</span><span class="shape-arrow">['+esc(shape)+']</span></div>';
+                    });
+                }
+                // Output shape
+                h += '<div style="margin:4px 0;font-size:10px;color:var(--vscode-descriptionForeground)">Output:</div>';
+                if (fxNode.output_shape) {
+                    h += '<div class="shape-flow"><span class="shape-box">'+esc(JSON.stringify(fxNode.output_shape))+'</span></div>';
+                } else {
+                    h += '<div class="shape-flow"><span class="shape-box warn">shape unknown</span></div>';
+                }
+            }
+
+            if (nnLayer) {
+                h += '<h3 style="color:#61afef">NN: '+esc(nnLayer.name)+'</h3>';
+                // Input layers
+                const inputs = (nnLayer.input_layers||[]);
+                if (inputs.length) {
+                    h += '<div style="margin:4px 0;font-size:10px;color:var(--vscode-descriptionForeground)">Inputs:</div>';
+                    inputs.forEach(inp => {
+                        // Try to find corresponding FX node shape
+                        const inpLayer = nnMap.get(inp);
+                        const inpMapping = inpLayer ? mByNn.get(inp) : null;
+                        const inpFx = inpMapping ? fxMap.get(inpMapping.fxNodeName) : null;
+                        const shape = inpFx && inpFx.output_shape ? JSON.stringify(inpFx.output_shape) : '?';
+                        h += '<div class="shape-flow"><span class="shape-box">'+esc(inp)+'</span><span class="shape-arrow">['+esc(shape)+']</span></div>';
+                    });
+                }
+                // Inferred output shape from properties
+                const props = nnLayer.properties || {};
+                h += '<div style="margin:4px 0;font-size:10px;color:var(--vscode-descriptionForeground)">Layer properties (shape-related):</div>';
+                const shapeKeys = ['unit','in_dim','out_dim','num_heads','head_dim','input_shape','epsilon'];
+                let hasAny = false;
+                shapeKeys.forEach(k => {
+                    if (props[k] !== undefined) {
+                        hasAny = true;
+                        h += '<div class="shape-flow"><span style="width:80px;font-size:10px">'+esc(k)+':</span><span class="shape-box">'+esc(String(props[k]))+'</span></div>';
+                    }
+                });
+                if (!hasAny) h += '<div class="shape-flow"><span class="shape-box" style="opacity:.5">no shape properties</span></div>';
+            }
+
+            // Shape consistency check
+            if (fxNode && nnLayer) {
+                h += '<h3>Shape Consistency</h3>';
+                const fxMeta = fxNode.meta || {};
+                const nnProps = nnLayer.properties || {};
+                const checks = [];
+
+                // Check output dimension matches
+                if (fxNode.output_shape && nnProps.unit) {
+                    const fxOut = fxNode.output_shape[fxNode.output_shape.length - 1];
+                    const nnUnit = Number(nnProps.unit);
+                    if (fxOut === nnUnit) {
+                        checks.push({ok:true, msg:'Output dim: FX['+fxOut+'] = NN unit['+nnUnit+']'});
+                    } else {
+                        checks.push({ok:false, msg:'Output dim mismatch: FX['+fxOut+'] != NN unit['+nnUnit+']'});
+                    }
+                }
+                // Embedding check
+                if (fxMeta.num_embeddings && nnProps.in_dim) {
+                    const match = String(fxMeta.num_embeddings) === String(nnProps.in_dim);
+                    checks.push({ok:match, msg:'Vocab: FX['+fxMeta.num_embeddings+'] '+(match?'=':'!=') +' NN['+nnProps.in_dim+']'});
+                }
+                if (fxMeta.embedding_dim && nnProps.out_dim) {
+                    const match = String(fxMeta.embedding_dim) === String(nnProps.out_dim);
+                    checks.push({ok:match, msg:'Embed dim: FX['+fxMeta.embedding_dim+'] '+(match?'=':'!=')+' NN['+nnProps.out_dim+']'});
+                }
+
+                if (checks.length) {
+                    checks.forEach(c => {
+                        h += '<div class="vsec '+(c.ok?'pass':'fail')+'">'+esc(c.msg)+'</div>';
+                    });
+                } else {
+                    h += '<div class="vi" style="opacity:.5">No comparable shape parameters</div>';
+                }
+            }
+
+            if (!fxNode && !nnLayer) h += '<div class="empty-msg">No node selected</div>';
+            return h;
+        }
+
+        /* 4-3: Weight mapping view */
+        function renderWeightTab(fxNode, nnLayer) {
+            let h = '';
+
+            if (nnLayer) {
+                h += '<h3 style="color:#61afef">'+esc(nnLayer.name)+'</h3>';
+                h += '<table class="prop-table"><tr><th>Property</th><th>Value</th></tr>';
+                h += '<tr><td class="k">has_weight</td><td class="v">'+(nnLayer.has_weight?'<span style="color:#98c379">yes</span>':'no')+'</td></tr>';
+                h += '<tr><td class="k">has_bias</td><td class="v">'+(nnLayer.has_bias?'<span style="color:#98c379">yes</span>':'no')+'</td></tr>';
+                if (nnLayer.shared_from) h += '<tr><td class="k">shared_from</td><td class="v">'+esc(nnLayer.shared_from)+'</td></tr>';
+                h += '</table>';
+
+                // Weight mapping
+                if (nnLayer.has_weight || nnLayer.has_bias) {
+                    h += '<h3>HF State Dict Mapping</h3>';
+
+                    if (nnLayer.weight_hf_key) {
+                        h += '<div style="margin:4px 0;font-size:10px"><b>Weight:</b></div>';
+                        h += '<div class="wmap-row">';
+                        h += '<div class="wmap-key">'+esc(nnLayer.weight_hf_key)+'</div>';
+                        h += '<span class="shape-arrow">-></span>';
+                        h += '<div class="wmap-key">'+esc(nnLayer.name)+'.weight</div>';
+                        h += '</div>';
+                        h += '<div style="margin:2px 0">';
+                        if (nnLayer.transpose_weight) {
+                            h += '<span class="wmap-xform transpose">TRANSPOSE</span>';
+                        } else {
+                            h += '<span class="wmap-xform direct">DIRECT COPY</span>';
+                        }
+                        h += '</div>';
+                    }
+
+                    if (nnLayer.bias_hf_key) {
+                        h += '<div style="margin:4px 0;font-size:10px"><b>Bias:</b></div>';
+                        h += '<div class="wmap-row">';
+                        h += '<div class="wmap-key">'+esc(nnLayer.bias_hf_key)+'</div>';
+                        h += '<span class="shape-arrow">-></span>';
+                        h += '<div class="wmap-key">'+esc(nnLayer.name)+'.bias</div>';
+                        h += '</div>';
+                        h += '<div style="margin:2px 0"><span class="wmap-xform direct">DIRECT COPY</span></div>';
+                    }
+                }
+
+                // Show from weightMap data
+                const wEntries = wMapByLayer.get(nnLayer.name) || [];
+                if (wEntries.length) {
+                    h += '<h3>Weight Map Entries</h3>';
+                    h += '<table class="prop-table"><tr><th>HF Key</th><th>Transpose</th></tr>';
+                    wEntries.forEach(w => {
+                        h += '<tr><td class="v" style="font-size:9px">'+esc(w.weight_key)+'</td>';
+                        h += '<td class="v">'+(w.transpose_weight?'<span style="color:#d19a66">yes</span>':'<span style="color:#98c379">no</span>')+'</td></tr>';
+                    });
+                    h += '</table>';
+                }
+            }
+
+            if (fxNode && !nnLayer) {
+                h += '<h3 style="color:#e06c75">FX: '+esc(fxNode.name)+'</h3>';
+                const meta = fxNode.meta || {};
+                if (meta.has_weight) {
+                    h += '<div class="vi">Has weight: <span style="color:#98c379">yes</span></div>';
+                    if (meta.has_bias) h += '<div class="vi">Has bias: <span style="color:#98c379">yes</span></div>';
+                    h += '<div class="vi" style="opacity:.5">No NN layer mapping - weight details unavailable</div>';
+                } else {
+                    h += '<div class="vi">This node has no weights</div>';
+                }
+            }
+
+            if (!fxNode && !nnLayer) h += '<div class="empty-msg">No node selected</div>';
+
+            // Global weight summary
+            h += '<h3>Weight Summary</h3>';
+            const withWeight = D.nntrainerLayers.filter(l => l.has_weight);
+            const withBias = D.nntrainerLayers.filter(l => l.has_bias);
+            const transposed = D.nntrainerLayers.filter(l => l.transpose_weight);
+            const shared = D.nntrainerLayers.filter(l => l.shared_from);
+            h += '<table class="prop-table"><tr><th>Metric</th><th>Count</th></tr>';
+            h += '<tr><td class="k">Layers with weight</td><td class="v">'+withWeight.length+'</td></tr>';
+            h += '<tr><td class="k">Layers with bias</td><td class="v">'+withBias.length+'</td></tr>';
+            h += '<tr><td class="k">Transposed weights</td><td class="v">'+(transposed.length?'<span style="color:#d19a66">'+transposed.length+'</span>':'0')+'</td></tr>';
+            h += '<tr><td class="k">Shared weights</td><td class="v">'+(shared.length?shared.length:'0')+'</td></tr>';
+            h += '<tr><td class="k">Total weight map entries</td><td class="v">'+(D.weightMap||[]).length+'</td></tr>';
+            h += '</table>';
+
+            return h;
+        }
+
+        /* 4-4: Profile info in Inspector */
+        function renderProfileTab(fxNode, nnLayer) {
+            let h = '';
+            if (!profileData) {
+                return '<div class="empty-msg">Run "NNTrainer: Profile Model" to see profile data</div>';
+            }
+
+            // Build profile name lookup (same logic as applyProfileHeatmap)
+            const profByName = new Map();
+            profileData.layers.forEach(lp => {
+                profByName.set(lp.name, lp);
+                profByName.set(lp.name.replace(/\./g, '_'), lp);
+            });
+
+            // Find the matching profile entry for the selected node
+            let lpFx = null, lpNn = null;
+            if (fxNode) {
+                lpFx = profByName.get(fxNode.name) || profByName.get(fxNode.scope) || profByName.get(fxNode.target);
+            }
+            if (nnLayer) {
+                lpNn = profByName.get(nnLayer.name) || profByName.get(nnLayer.hf_module_name);
+            }
+            const lp = lpFx || lpNn;
+
+            if (lp) {
+                const isBot = profileData.bottlenecks.includes(lp.name);
+                const color = profColor(lp.pct_of_total);
+
+                h += '<h3 style="color:' + color + '">Profile: ' + esc(profDisplayName(lp.name)) + '</h3>';
+                if (isBot) h += '<div class="vi"><span class="badge err">⚠ Bottleneck</span></div>';
+
+                // Timing
+                h += '<table class="prop-table"><tr><th>Metric</th><th>Value</th></tr>';
+                h += '<tr><td class="k">Time</td><td class="v" style="color:' + color + ';font-weight:600">' + lp.time_ms.toFixed(3) + ' ms</td></tr>';
+                h += '<tr><td class="k">% of Total</td><td class="v" style="color:' + color + '">' + lp.pct_of_total.toFixed(1) + '%</td></tr>';
+
+                // Comparison to average
+                const avgTime = profileData.total_time_ms / profileData.layers.length;
+                const ratio = lp.time_ms / avgTime;
+                const ratioStr = ratio > 1 ? '<span style="color:#e06c75">' + ratio.toFixed(1) + 'x avg</span>' : ratio.toFixed(1) + 'x avg';
+                h += '<tr><td class="k">vs Average</td><td class="v">' + ratioStr + '</td></tr>';
+
+                // Memory
+                if (lp.memory_mb !== undefined && lp.memory_mb > 0) {
+                    h += '<tr><td class="k">Memory</td><td class="v" style="color:#56b6c2">' + lp.memory_mb.toFixed(2) + ' MB</td></tr>';
+                    if (profileData.total_memory_mb > 0) {
+                        const memPct = (lp.memory_mb / profileData.total_memory_mb * 100).toFixed(1);
+                        h += '<tr><td class="k">% of Total Mem</td><td class="v" style="color:#56b6c2">' + memPct + '%</td></tr>';
+                    }
+                }
+
+                // FLOPs
+                if (lp.flops > 0) {
+                    h += '<tr><td class="k">FLOPs</td><td class="v" style="color:#d19a66">' + (lp.flops / 1e6).toFixed(1) + 'M</td></tr>';
+                    const layersWithFlops = profileData.layers.filter(l => l.flops > 0);
+                    if (layersWithFlops.length > 0) {
+                        const totalFlops = layersWithFlops.reduce((s, l) => s + l.flops, 0);
+                        h += '<tr><td class="k">% of Total FLOPs</td><td class="v" style="color:#d19a66">' + (lp.flops / totalFlops * 100).toFixed(1) + '%</td></tr>';
+                    }
+                }
+
+                // Layer type from profile
+                if (lp.layer_type) {
+                    h += '<tr><td class="k">Profile Type</td><td class="v" style="color:#c678dd">' + esc(lp.layer_type) + '</td></tr>';
+                }
+
+                h += '</table>';
+
+                // Timing bar
+                const maxPct = Math.max(...profileData.layers.map(l => l.pct_of_total), 1);
+                const barPct = lp.pct_of_total / maxPct * 100;
+                h += '<div style="margin:6px 0"><div style="background:var(--vscode-editor-background);border-radius:3px;overflow:hidden;height:10px">';
+                h += '<div style="width:' + Math.max(barPct, 3) + '%;height:100%;background:' + color + ';border-radius:3px"></div></div></div>';
+
+            } else {
+                h += '<div class="vi" style="opacity:.6">No profile data found for this layer</div>';
+                if (fxNode) h += '<div class="vi" style="font-size:9px;opacity:.5">Tried: ' + esc(fxNode.name) + ', ' + esc(fxNode.scope || '') + ', ' + esc(fxNode.target || '') + '</div>';
+                if (nnLayer) h += '<div class="vi" style="font-size:9px;opacity:.5">Tried: ' + esc(nnLayer.name) + ', ' + esc(nnLayer.hf_module_name || '') + '</div>';
+            }
+
+            // Global profile summary
+            h += '<h3>Profile Summary</h3>';
+            h += '<table class="prop-table"><tr><th>Metric</th><th>Value</th></tr>';
+            h += '<tr><td class="k">Total Time</td><td class="v">' + profileData.total_time_ms.toFixed(2) + ' ms</td></tr>';
+            h += '<tr><td class="k">Num Runs</td><td class="v">' + profileData.num_runs + '</td></tr>';
+            h += '<tr><td class="k">Layers</td><td class="v">' + profileData.layers.length + '</td></tr>';
+            h += '<tr><td class="k">Seq Len</td><td class="v">' + profileData.seq_len + '</td></tr>';
+            if (profileData.total_memory_mb > 0) {
+                h += '<tr><td class="k">Total Memory</td><td class="v" style="color:#56b6c2">' + profileData.total_memory_mb.toFixed(2) + ' MB</td></tr>';
+            }
+            h += '<tr><td class="k">Bottlenecks</td><td class="v"><span class="badge ' + (profileData.bottlenecks.length ? 'err' : 'ok') + '">' + profileData.bottlenecks.length + '</span></td></tr>';
+            h += '</table>';
+
+            return h;
+        }
+
+        /* Source code with syntax highlighting */
+        function highlightCpp(line) {
+            let h = esc(line);
+            // Comments (// ...)
+            h = h.replace(/^(\s*)(\/\/.*)$/, '$1<span class="cm">$2</span>');
+            if (h.includes('<span class="cm">')) return h;
+            // Preprocessor (#include, #ifndef, etc.)
+            h = h.replace(/^(\s*)(#\w+.*)$/, '$1<span class="pp">$2</span>');
+            if (h.includes('<span class="pp">')) return h;
+            // Extract strings and numbers into placeholders so that
+            // subsequent regexes never see "class" inside <span class=".."> tags
+            const toks = [];
+            function tok(v) { toks.push(v); return '\x00T'+(toks.length-1)+'\x00'; }
+            h = h.replace(/(&quot;[^&]*?&quot;|"[^"]*?")/g, function(m) {
+                return tok('<span class="st">'+m+'</span>');
+            });
+            h = h.replace(/\b(\d+\.?\d*[fF]?)\b/g, function(m) {
+                return tok('<span class="nu">'+m+'</span>');
+            });
+            // Keywords
+            h = h.replace(/\b(auto|bool|break|case|catch|class|const|constexpr|continue|default|delete|do|else|enum|explicit|extern|false|for|friend|goto|if|inline|mutable|namespace|new|noexcept|nullptr|operator|override|private|protected|public|return|sizeof|static|static_cast|struct|switch|template|this|throw|true|try|typedef|typeid|typename|using|virtual|void|volatile|while)\b/g, '<span class="kw">$1</span>');
+            // Types (common C++ and NNTrainer types)
+            h = h.replace(/\b(int|float|double|char|unsigned|long|short|size_t|uint32_t|int32_t|std::string|std::vector|std::map|std::shared_ptr|std::unique_ptr|std::make_shared|std::make_unique|string|vector|map|shared_ptr|unique_ptr|NeuralNetwork|LayerNode|ModelLoader|Tensor)\b/g, '<span class="ty">$1</span>');
+            // Scope/arrow operators
+            h = h.replace(/::/g, '<span class="op">::</span>');
+            h = h.replace(/-&gt;/g, '<span class="op">-&gt;</span>');
+            // Function calls: word followed by (
+            h = h.replace(/\b([a-zA-Z_]\w*)\s*\(/g, function(m, fn) {
+                if (m.includes('<span') || m.includes('\x00')) return m;
+                return '<span class="fn">'+fn+'</span>(';
+            });
+            // Restore all placeholders
+            h = h.replace(/\x00T(\d+)\x00/g, function(m, idx) {
+                return toks[parseInt(idx)];
+            });
+            return h;
+        }
+
+        function highlightPython(line) {
+            let h = esc(line);
+            // Comments
+            h = h.replace(/^(\s*)(#.*)$/, '$1<span class="cm">$2</span>');
+            if (h.includes('<span class="cm">')) return h;
+            // Extract strings and numbers into placeholders
+            const toks = [];
+            function tok(v) { toks.push(v); return '\x00T'+(toks.length-1)+'\x00'; }
+            h = h.replace(/(&#39;[^&#]*?&#39;|&quot;[^&]*?&quot;|'[^']*?'|"[^"]*?")/g, function(m) {
+                return tok('<span class="st">'+m+'</span>');
+            });
+            h = h.replace(/\b(\d+\.?\d*)\b/g, function(m) {
+                return tok('<span class="nu">'+m+'</span>');
+            });
+            // Keywords
+            h = h.replace(/\b(and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield|None|True|False|self)\b/g, '<span class="kw">$1</span>');
+            // Types
+            h = h.replace(/\b(int|float|str|bool|list|dict|tuple|set|type|object|nn\.Module|torch\.Tensor)\b/g, '<span class="ty">$1</span>');
+            // Decorators
+            h = h.replace(/^(\s*)(@\w+)/g, '$1<span class="pp">$2</span>');
+            // Function calls
+            h = h.replace(/\b([a-zA-Z_]\w*)\s*\(/g, function(m, fn) {
+                if (m.includes('<span') || m.includes('\x00')) return m;
+                return '<span class="fn">'+fn+'</span>(';
+            });
+            // Restore all placeholders
+            h = h.replace(/\x00T(\d+)\x00/g, function(m, idx) {
+                return toks[parseInt(idx)];
+            });
+            return h;
+        }
+
+        function renderSrc(id, code, lang) {
+            const c = document.getElementById(id);
+            if (!code) { c.innerHTML='<div style="padding:16px;opacity:.5">No source</div>'; return; }
+            const hl = lang === 'python' ? highlightPython : highlightCpp;
+            c.innerHTML = code.split('\n').map((l,i) => {
+                const span = document.createElement('span');
+                return '<span class="ln" data-line="'+(i+1)+'">'+hl(l)+'</span>';
+            }).join('\n');
+        }
+
+        /* ==================================================================
+         * Resizable Pane Splitters
+         * ================================================================== */
+        const splitterState = {
+            dragging: false,
+            splitter: null,
+            target: null,
+            startX: 0,
+            startW: 0
+        };
+        const PANEL_MIN_W = 200;
+        const PANEL_MAX_W = 800;
+
+        // Sync splitter visibility with its target panel
+        function syncSplitters() {
+            document.querySelectorAll('.vsplitter').forEach(sp => {
+                const targetId = sp.dataset.target;
+                const panel = document.getElementById(targetId);
+                if (panel && panel.classList.contains('vis')) {
+                    sp.classList.add('vis');
+                } else {
+                    sp.classList.remove('vis');
+                }
+            });
+        }
+
+        // Observe panel visibility changes via MutationObserver
+        const visObserver = new MutationObserver(() => syncSplitters());
+        ['vpanel', 'ppanel', 'inspector'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) visObserver.observe(el, { attributes: true, attributeFilter: ['class'] });
+        });
+
+        // Mousedown on splitter starts drag
+        document.querySelectorAll('.vsplitter').forEach(sp => {
+            sp.addEventListener('mousedown', e => {
+                e.preventDefault();
+                e.stopPropagation();
+                const targetId = sp.dataset.target;
+                const panel = document.getElementById(targetId);
+                if (!panel) return;
+                splitterState.dragging = true;
+                splitterState.splitter = sp;
+                splitterState.target = panel;
+                splitterState.startX = e.clientX;
+                splitterState.startW = panel.offsetWidth;
+                sp.classList.add('dragging');
+                document.body.classList.add('resizing');
+            });
+        });
+
+        // Mousemove during drag
+        document.addEventListener('mousemove', e => {
+            if (!splitterState.dragging) return;
+            const dx = e.clientX - splitterState.startX;
+            // Panel is on the right side of the splitter, so dragging left = wider panel
+            // But since panels are on the RIGHT side, dragging left should increase width
+            const newW = Math.max(PANEL_MIN_W, Math.min(PANEL_MAX_W, splitterState.startW - dx));
+            splitterState.target.style.width = newW + 'px';
+            splitterState.target.style.minWidth = newW + 'px';
+            // Recalculate mapping lines if visible
+            schedMap();
+        });
+
+        // Mouseup ends drag
+        document.addEventListener('mouseup', () => {
+            if (!splitterState.dragging) return;
+            splitterState.dragging = false;
+            if (splitterState.splitter) splitterState.splitter.classList.remove('dragging');
+            splitterState.splitter = null;
+            splitterState.target = null;
+            document.body.classList.remove('resizing');
+        });
+
+        // Double-click to reset panel width
+        document.querySelectorAll('.vsplitter').forEach(sp => {
+            sp.addEventListener('dblclick', e => {
+                e.preventDefault();
+                const targetId = sp.dataset.target;
+                const panel = document.getElementById(targetId);
+                if (!panel) return;
+                // Reset to default widths
+                const defaults = { vpanel: 320, ppanel: 340, inspector: 340 };
+                const w = defaults[targetId] || 340;
+                panel.style.width = w + 'px';
+                panel.style.minWidth = w + 'px';
+                schedMap();
+            });
+        });
+
+        /* ---- Init ---- */
+        renderFx();
+        renderNn();
+        renderVer();
+        renderInspector();
+        document.getElementById('inspector').classList.add('vis');
+        document.getElementById('b-insp').classList.add('active');
+        syncSplitters();
+        renderProfilePanel();
+        renderSrc('sc-torch', D.torchSourceCode||'', 'python');
+        renderSrc('sc-cpp', D.cppSource||'', 'cpp');
+        drawGroups();
+        document.getElementById('b-group').classList.add('active');
+    })();
+    </script>
+</body>
+</html>
