@@ -922,9 +922,9 @@ bool is_valid(const unsigned int N, const float *X);
  * @param M Original row size of output
  * @param N Original col size of output
  * @param K Hidden size
- * @param A Input activation to be online-runtime quantized to q8_K_MxN format
+ * @param A Input activation to be online-runtime quantized to q8_0 format
  * @param lda Leading dimension of A
- * @param B (void*) (block_q4_K*) for Offline-quantized transposed weight
+ * @param B Offline-quantized transposed weight in block_q4_0x8
  * @param ldb Leading dimenstion of B
  * @param C T* output
  * @param ldc Leading dimension of C
