@@ -17,8 +17,8 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -42,6 +42,51 @@ static std::vector<unsigned int> g_bench_sizes = {256, 1024, 4096};
 // Helpers
 // ============================================================================
 
+/**
+ * @brief Parse an unsigned integer benchmark option.
+ *
+ * @param text input option value
+ * @param value parsed output value
+ * @param allow_zero true if zero is accepted
+ * @return true if parsing succeeded
+ */
+static bool parse_uint_arg(const std::string &text, unsigned int &value,
+                           bool allow_zero) {
+  if (text.empty()) {
+    return false;
+  }
+
+  unsigned long long parsed = 0;
+  char extra = '\0';
+  std::istringstream ss(text);
+  if (!(ss >> parsed) || (ss >> extra)) {
+    return false;
+  }
+  if ((!allow_zero && parsed == 0) ||
+      parsed > std::numeric_limits<unsigned int>::max()) {
+    return false;
+  }
+
+  value = static_cast<unsigned int>(parsed);
+  return true;
+}
+
+/**
+ * @brief Format a numeric GoogleTest property value without integer narrowing.
+ *
+ * @param value numeric value to record
+ * @return string-formatted property value
+ */
+static std::string make_record_property_value(double value) {
+  return std::to_string(value);
+}
+
+/**
+ * @brief Convert FP32 values to raw FP16 bit-pattern values.
+ *
+ * @param f32_vec input FP32 vector
+ * @return converted FP16 bit-pattern vector
+ */
 static inline std::vector<uint16_t>
 convert_f32_to_f16_u16(const std::vector<float> &f32_vec) {
   std::vector<uint16_t> vec(f32_vec.size());
@@ -411,15 +456,14 @@ TEST_P(Bench_SoftmaxRow, softmax_row_inplace) {
     auto X_orig = convert_f32_to_f16_u16(generate_random_vector<float>(N));
     auto X = X_orig;
 
-    auto stats = bench::measure_with_setup([&]() { X = X_orig; },
-                                           [&]() {
-                                             nntrainer::softmax_row_inplace(
-                                               (_FP16 *)X.data(), size_t{0},
-                                               static_cast<size_t>(num_rows),
-                                               static_cast<size_t>(num_heads),
-                                               /*sink=*/nullptr);
-                                           },
-                                           g_bench_warmup, g_bench_iters);
+    auto stats = bench::measure_with_setup(
+      [&]() { X = X_orig; },
+      [&]() {
+        nntrainer::softmax_row_inplace((_FP16 *)X.data(), size_t{0},
+                                       static_cast<size_t>(num_rows),
+                                       static_cast<size_t>(num_heads), nullptr);
+      },
+      g_bench_warmup, g_bench_iters);
 
     bench::Metrics m;
     m.num_elements = N;
@@ -575,6 +619,16 @@ using HgemmParams =
   std::tuple<unsigned int, unsigned int, unsigned int, bool, bool>;
 using GemvParams = std::tuple<unsigned int, unsigned int>;
 
+/**
+ * @brief Make a compact GEMM dimension label for benchmark output.
+ *
+ * @param M output row count
+ * @param N output column count
+ * @param K reduction dimension
+ * @param TransA transpose flag for matrix A
+ * @param TransB transpose flag for matrix B
+ * @return formatted benchmark dimension label
+ */
 static std::string make_hgemm_size_label(unsigned int M, unsigned int N,
                                          unsigned int K, bool TransA,
                                          bool TransB) {
@@ -626,9 +680,14 @@ TEST_P(Bench_X86_FP16_HGEMM, via_sgemm_dispatch) {
   bench::report("x86_fp16_hgemm", "FP16", sz, fp16_stats, m);
   bench::compare("x86_fp16_hgemm", "FP16", sz, fp32_stats, fp16_stats);
 
-  RecordProperty("fp32_gflops", 2.0 * M * N * K / fp32_stats.avg_ns);
-  RecordProperty("fp16_gflops", 2.0 * M * N * K / fp16_stats.avg_ns);
-  RecordProperty("fp16_speedup", fp32_stats.avg_ns / fp16_stats.avg_ns);
+  RecordProperty("fp32_gflops",
+                 make_record_property_value(
+                   (2.0 * M * N * K / (fp32_stats.avg_ns * 1e-9)) / 1e9));
+  RecordProperty("fp16_gflops",
+                 make_record_property_value(
+                   (2.0 * M * N * K / (fp16_stats.avg_ns * 1e-9)) / 1e9));
+  RecordProperty("fp16_speedup", make_record_property_value(fp32_stats.avg_ns /
+                                                            fp16_stats.avg_ns));
 }
 
 /**
@@ -746,7 +805,7 @@ TEST_P(Bench_KCache, compute_kcaches) {
                    ",tile=" + std::to_string(tile_size);
   bench::report("compute_kcaches", "FP32", sz, stats);
 
-  RecordProperty("latency_ns", stats.avg_ns);
+  RecordProperty("latency_ns", make_record_property_value(stats.avg_ns));
 }
 
 GTEST_PARAMETER_TEST(Configs, Bench_KCache, kKCacheConfigs);
@@ -782,7 +841,7 @@ TEST_P(Bench_Attention, compute_fp16vcache) {
                    ",w=" + std::to_string(window_size);
   bench::report("compute_fp16vcache", "FP32", sz, stats);
 
-  RecordProperty("latency_ns", stats.avg_ns);
+  RecordProperty("latency_ns", make_record_property_value(stats.avg_ns));
 }
 
 GTEST_PARAMETER_TEST(Configs, Bench_Attention, kAttnConfigs);
@@ -823,7 +882,7 @@ TEST_P(Bench_KCache_FP16, compute_kcaches) {
                    ",tile=" + std::to_string(tile_size);
   bench::report("compute_kcaches", "FP16", sz, stats);
 
-  RecordProperty("latency_ns", stats.avg_ns);
+  RecordProperty("latency_ns", make_record_property_value(stats.avg_ns));
 }
 
 GTEST_PARAMETER_TEST(Configs, Bench_KCache_FP16, kKCacheConfigs);
@@ -860,7 +919,7 @@ TEST_P(Bench_Attention_FP16, compute_fp16vcache_transposed) {
                    ",w=" + std::to_string(window_size);
   bench::report("compute_fp16vcache_transposed", "FP16", sz, stats);
 
-  RecordProperty("latency_ns", stats.avg_ns);
+  RecordProperty("latency_ns", make_record_property_value(stats.avg_ns));
 }
 
 GTEST_PARAMETER_TEST(Configs, Bench_Attention_FP16, kAttnConfigs);
@@ -871,28 +930,38 @@ GTEST_PARAMETER_TEST(Configs, Bench_Attention_FP16, kAttnConfigs);
 // Main
 // ============================================================================
 
+/**
+ * @brief Parse benchmark-specific command-line arguments.
+ *
+ * @param argc argument count, updated after removing benchmark options
+ * @param argv argument array, compacted in-place for GoogleTest
+ */
 static void parse_bench_args(int *argc, char **argv) {
   int out = 1;
   for (int i = 1; i < *argc; ++i) {
     if (strncmp(argv[i], "--bench_iters=", 14) == 0) {
-      int v = atoi(argv[i] + 14);
-      if (v > 0)
-        g_bench_iters = static_cast<unsigned int>(v);
+      unsigned int v = 0;
+      if (parse_uint_arg(argv[i] + 14, v, false)) {
+        g_bench_iters = v;
+      }
     } else if (strncmp(argv[i], "--bench_warmup=", 15) == 0) {
-      int v = atoi(argv[i] + 15);
-      if (v >= 0)
-        g_bench_warmup = static_cast<unsigned int>(v);
+      unsigned int v = 0;
+      if (parse_uint_arg(argv[i] + 15, v, true)) {
+        g_bench_warmup = v;
+      }
     } else if (strncmp(argv[i], "--bench_sizes=", 14) == 0) {
       std::vector<unsigned int> parsed_sizes;
       std::istringstream ss(argv[i] + 14);
       std::string token;
       while (std::getline(ss, token, ',')) {
-        int v = atoi(token.c_str());
-        if (v > 0)
-          parsed_sizes.push_back(static_cast<unsigned int>(v));
+        unsigned int v = 0;
+        if (parse_uint_arg(token, v, false)) {
+          parsed_sizes.push_back(v);
+        }
       }
-      if (!parsed_sizes.empty())
+      if (!parsed_sizes.empty()) {
         g_bench_sizes = parsed_sizes;
+      }
     } else {
       argv[out++] = argv[i];
     }
@@ -900,6 +969,13 @@ static void parse_bench_args(int *argc, char **argv) {
   *argc = out;
 }
 
+/**
+ * @brief Benchmark binary entry point.
+ *
+ * @param argc argument count
+ * @param argv argument array
+ * @return GoogleTest result code
+ */
 int main(int argc, char **argv) {
   parse_bench_args(&argc, argv);
 

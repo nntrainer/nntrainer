@@ -36,6 +36,9 @@
 #include <sstream>
 #include <string>
 
+/**
+ * @brief Benchmark measurement and reporting helpers.
+ */
 namespace bench {
 
 /**
@@ -227,7 +230,7 @@ inline void report(const std::string &name, const std::string &type,
 
   // Throughput
   if (metrics.flop_count > 0 && stats.avg_ns > 0) {
-    double gflops = metrics.flop_count / stats.avg_ns;
+    double gflops = (metrics.flop_count / (stats.avg_ns * 1e-9)) / 1e9;
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(2) << gflops << " GFLOPS";
     std::cout << std::setw(15) << oss.str();
@@ -241,7 +244,8 @@ inline void report(const std::string &name, const std::string &type,
 
   // Memory Bandwidth
   if (metrics.total_bytes > 0 && stats.avg_ns > 0) {
-    double bw = static_cast<double>(metrics.total_bytes) / stats.avg_ns;
+    double bw =
+      (static_cast<double>(metrics.total_bytes) / (stats.avg_ns * 1e-9)) / 1e9;
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(1) << bw << " GB/s";
     std::cout << std::setw(12) << oss.str();
