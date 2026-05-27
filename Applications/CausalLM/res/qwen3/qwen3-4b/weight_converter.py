@@ -44,7 +44,7 @@ def save_qwen3_for_nntrainer(params, config, dtype, file):
         save_weight(params[f"{layer_name}post_attention_layernorm.weight"])  
           
         # Save MLP projections using helper  
-        for proj in ["gate_proj", "up_proj", "down_proj"]:
+        for proj in ["up_proj", "gate_proj", "down_proj"]:
             save_projection(layer_name, f"mlp.{proj}")  
 
     # Save embedding layer  
