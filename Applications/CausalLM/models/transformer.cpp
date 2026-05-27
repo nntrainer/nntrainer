@@ -476,10 +476,15 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
      withKey("weight_initializer", "ones")}));
   Tensor gate = ffn_gate(input);
 
+  /// @note nntrainer binary stores mlp weights in up, gate order.
+  /// For backward compatibility,
+  /// * layers are in up, gate order
+  /// * swiglu input[0] = gate
+  /// * swiglu input[1] = up
   LayerHandle swiglu(createLayer(
     "swiglu",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
-  Tensor act = swiglu({gate, up});
+  Tensor act = swiglu({up, gate}, {1, 0});
 
   LayerHandle ffn_down(createLayer(
     "fully_connected",

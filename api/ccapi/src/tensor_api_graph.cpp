@@ -43,6 +43,7 @@ Tensor Tensor::output(unsigned int index) const {
   if (impl_ && impl_->graph_edge) {
     indexed_edge->producing_layer = impl_->graph_edge->producing_layer;
     indexed_edge->inputs = impl_->graph_edge->inputs;
+    indexed_edge->input_indices = impl_->graph_edge->input_indices;
     indexed_edge->dim = impl_->graph_edge->dim;
     indexed_edge->name = impl_->graph_edge->name;
   }
@@ -225,6 +226,66 @@ Tensor LayerHandle::operator()(const std::vector<Tensor> &inputs) {
   return output;
 }
 
+Tensor LayerHandle::operator()(const std::vector<Tensor> &inputs,
+                               std::vector<unsigned int> &&input_indices) {
+  if (!ptr_) {
+    throw std::runtime_error("LayerHandle: layer is null");
+  }
+  if (inputs.empty()) {
+    throw std::invalid_argument("LayerHandle: at least one input required");
+  }
+  if (input_indices.size() != inputs.size()) {
+    throw std::invalid_argument(
+      "LayerHandle: input_indices size must match inputs size");
+  }
+
+  // Infer output dimensions
+  TensorDim out_dim = inferOutputDim(ptr_, inputs);
+
+  // Build output name from layer name
+  std::string out_name;
+  try {
+    out_name = ptr_->getName();
+    if (!out_name.empty()) {
+      out_name += ":output";
+    }
+  } catch (...) {
+    // getName() might throw if layer isn't fully initialized
+  }
+
+  // Create symbolic output tensor
+  Tensor output;
+  if (out_dim.batch() > 0 && out_dim.width() > 0) {
+    output = Tensor(out_dim, out_name);
+  } else {
+    // Couldn't infer shape — create a valid but shapeless tensor
+    output = Tensor(TensorDim(), out_name);
+  }
+
+  // Record graph edge (shared, no deep copies)
+  auto edge = std::make_shared<SymbolicGraphNode>();
+  edge->producing_layer = ptr_;
+  edge->dim = out_dim;
+  edge->name = out_name;
+  for (unsigned int i = 0; i < inputs.size(); ++i) {
+    if (inputs[i].impl_ && inputs[i].impl_->graph_edge) {
+      edge->inputs.push_back(inputs[i].impl_->graph_edge);
+    } else {
+      // Leaf tensor — create a leaf edge with no producer
+      auto leaf = std::make_shared<SymbolicGraphNode>();
+      if (inputs[i].isValid()) {
+        leaf->dim = inputs[i].shape();
+        leaf->name = inputs[i].name();
+      }
+      edge->inputs.push_back(leaf);
+    }
+  }
+  edge->input_indices = std::move(input_indices);
+  output.impl_->graph_edge = edge;
+
+  return output;
+}
+
 // --- Model::compile(Tensor, Tensor) — graph extraction ---
 
 int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode) {
@@ -287,15 +348,20 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
         dfs(inp);
       }
 
-      // Build input_layers names
-      std::vector<std::string> input_names;
-      for (auto &inp : edge->inputs) {
+      // Build input_layers names, respecting input_indices for slot mapping.
+      // First, collect (name, target_slot) pairs for each input.
+      std::vector<std::pair<std::string, unsigned int>> name_slot_pairs;
+      for (unsigned int i = 0; i < edge->inputs.size(); ++i) {
+        auto &inp = edge->inputs[i];
+        unsigned int target_slot =
+          (i < edge->input_indices.size()) ? edge->input_indices[i] : i;
+
         if (inp && inp->producing_layer) {
           std::string layer_ref = inp->producing_layer->getName();
           if (inp->output_index >= 0) {
             layer_ref += "(" + std::to_string(inp->output_index) + ")";
           }
-          input_names.push_back(layer_ref);
+          name_slot_pairs.push_back({layer_ref, target_slot});
         } else {
           // Leaf tensor
           std::string leaf_name = inp ? inp->name : "";
@@ -307,7 +373,6 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
             if (edge->producing_layer) {
               try {
                 if (edge->producing_layer->getType() == "input") {
-                  // Input layer's sentinel leaf — skip, no input_layers needed
                   continue;
                 }
               } catch (...) {
@@ -316,14 +381,20 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
             leaf_name = "ext_input_" + std::to_string(unnamed_leaf_counter++);
           }
           if (input_leaf_names.count(leaf_name)) {
-            input_names.push_back(leaf_name);
+            name_slot_pairs.push_back({leaf_name, target_slot});
           } else {
             if (additional_leaves.find(leaf_name) == additional_leaves.end()) {
               additional_leaves[leaf_name] = {inp ? inp->dim : TensorDim()};
             }
-            input_names.push_back(leaf_name);
+            name_slot_pairs.push_back({leaf_name, target_slot});
           }
         }
+      }
+
+      // Place names into input_names at their target slots
+      std::vector<std::string> input_names(name_slot_pairs.size());
+      for (auto &[name, slot] : name_slot_pairs) {
+        input_names[slot] = name;
       }
 
       layers_in_order.push_back({edge->producing_layer, input_names});

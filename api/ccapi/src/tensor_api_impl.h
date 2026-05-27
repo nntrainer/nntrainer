@@ -39,6 +39,13 @@ namespace train {
 struct SymbolicGraphNode {
   std::shared_ptr<Layer> producing_layer;
   std::vector<std::shared_ptr<SymbolicGraphNode>> inputs;
+  std::vector<unsigned int> input_indices;
+  /**
+   * input_indices maps each input to its runtime slot index.
+   * input_indices[i] = j means inputs[i] should be
+   * connected as input_layers[j].
+   * If its size() == 0, it means [0,1,2,...].
+   */
   TensorDim dim;
   std::string name;
   int output_index = -1; ///< >=0 means indexed output, e.g. split(0)
