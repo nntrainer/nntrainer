@@ -77,11 +77,11 @@ fi
 # meson build will unzip golden data for the unit tests
 popd
 if [ ! -d build ]; then
-  meson build -Dopenblas-num-threads=1  -Denable-tflite-interpreter=false -Denable-tflite-backbone=false -Denable-fp16=true -Domp-num-threads=1 -Denable-opencl=true -Dhgemm-experimental-kernel=false
+  meson build -Dopenblas-num-threads=1  -Denable-tflite-interpreter=false -Denable-tflite-backbone=false -Denable-fp16=true -Dnntr-num-threads=1 -Denable-opencl=true -Dhgemm-experimental-kernel=false
 else
   echo "warning: build has already been taken, this script tries to reconfigure and try building"
   pushd build
-  meson configure -Dopenblas-num-threads=1  -Denable-tflite-interpreter=false -Denable-tflite-backbone=false -Denable-fp16=true -Domp-num-threads=1 -Denable-opencl=true -Dhgemm-experimental-kernel=false
+  meson configure -Dopenblas-num-threads=1  -Denable-tflite-interpreter=false -Denable-tflite-backbone=false -Denable-fp16=true -Dnntr-num-threads=1 -Denable-opencl=true -Dhgemm-experimental-kernel=false
   popd
 fi
 
