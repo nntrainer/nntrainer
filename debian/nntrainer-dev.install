@@ -33,6 +33,8 @@
 /usr/include/nntrainer/weight.h
 /usr/include/nntrainer/quantizer.h
 /usr/include/nntrainer/avx2_impl.h
+/usr/include/nntrainer/avx2_mathfun.h
+/usr/include/nntrainer/avx2_mathfun.hxx
 # todo: update dataset headers
 /usr/include/nntrainer/databuffer.h
 /usr/include/nntrainer/databuffer_factory.h
