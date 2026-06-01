@@ -14,7 +14,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
+
 #include <neuralnet.h>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -175,9 +178,10 @@ TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_01) {
 
   EXPECT_EQ(model->initialize(), ML_ERROR_NONE);
 
+  auto generator = std::make_unique<SimpleDataGenerator>(4, 32, 8);
   EXPECT_NO_THROW(dataset = ml::train::createDataset(
                     ml::train::DatasetType::GENERATOR, dataset_cb,
-                    new SimpleDataGenerator(4, 32, 8)));
+                    generator.get()));
   EXPECT_EQ(model->setDataset(ml::train::DatasetModeType::MODE_TRAIN,
                               std::move(dataset)),
             ML_ERROR_NONE);
@@ -278,9 +282,10 @@ TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_02) {
 
   EXPECT_EQ(model->initialize(), ML_ERROR_NONE);
 
+  auto generator = std::make_unique<SimpleDataGenerator>(4, 32, 8);
   EXPECT_NO_THROW(dataset = ml::train::createDataset(
                     ml::train::DatasetType::GENERATOR, dataset_cb,
-                    new SimpleDataGenerator(4, 32, 8)));
+                    generator.get()));
   EXPECT_EQ(model->setDataset(ml::train::DatasetModeType::MODE_TRAIN,
                               std::move(dataset)),
             ML_ERROR_NONE);
@@ -389,9 +394,10 @@ TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_03) {
 
   EXPECT_EQ(model->initialize(), ML_ERROR_NONE);
 
+  auto generator = std::make_unique<SimpleDataGenerator>(4, 32, 8);
   EXPECT_NO_THROW(dataset = ml::train::createDataset(
                     ml::train::DatasetType::GENERATOR, dataset_cb,
-                    new SimpleDataGenerator(4, 32, 8)));
+                    generator.get()));
   EXPECT_EQ(model->setDataset(ml::train::DatasetModeType::MODE_TRAIN,
                               std::move(dataset)),
             ML_ERROR_NONE);
@@ -430,6 +436,112 @@ TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_verification_04) {
   EXPECT_NO_THROW(model->setOptimizer(std::move(optimizer)));
 
   EXPECT_THROW(model->compile(), std::invalid_argument);
+}
+
+TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_correctness_01) {
+  // Train an identical small model with and without gradient checkpointing.
+  // Both models use weight_initializer=ones and bias_initializer=zeros so they
+  // start from the same deterministic weights. The final losses must match
+  // within a relative tolerance of 1e-3.
+
+  auto make_model = [](bool with_checkpoint) -> std::unique_ptr<ml::train::Model> {
+    std::unique_ptr<ml::train::Model> model;
+    model = ml::train::createModel(ml::train::ModelType::NEURAL_NET, {"loss=mse"});
+
+    model->addLayer(ml::train::createLayer(
+      "input", {"input_shape=1:1:8", "name=in"}));
+
+    model->addLayer(ml::train::createLayer(
+      "fully_connected",
+      {"unit=16", "activation=gelu", "name=fc1",
+       "weight_initializer=ones", "bias_initializer=zeros"}));
+
+    model->addLayer(ml::train::createLayer(
+      "fully_connected",
+      {"unit=8", "name=fc2",
+       "weight_initializer=ones", "bias_initializer=zeros"}));
+
+    if (with_checkpoint) {
+      EXPECT_NO_THROW(model->addCheckpointBlock(
+        {"fc1", "fc1/activation_realized", "fc2"}));
+    }
+
+    model->setProperty({"batch_size=4", "epochs=1"});
+
+    auto optimizer =
+      ml::train::createOptimizer("sgd", {"learning_rate=0.01"});
+    model->setOptimizer(std::move(optimizer));
+
+    return model;
+  };
+
+  auto model_ref = make_model(false);
+  auto model_ckpt = make_model(true);
+
+  EXPECT_EQ(model_ref->compile(), ML_ERROR_NONE);
+  EXPECT_EQ(model_ref->initialize(), ML_ERROR_NONE);
+
+  EXPECT_EQ(model_ckpt->compile(), ML_ERROR_NONE);
+  EXPECT_EQ(model_ckpt->initialize(), ML_ERROR_NONE);
+
+  // Fixed deterministic input/label data (same for both models).
+  std::vector<float> input_buf(4 * 8);
+  std::vector<float> label_buf(4 * 8);
+  for (int i = 0; i < 4 * 8; ++i) {
+    input_buf[i] = static_cast<float>(i % 8) * 0.1f;
+    label_buf[i] = static_cast<float>((i + 1) % 8) * 0.1f;
+  }
+
+  // Dataset callback using local buffers via raw pointer capture.
+  struct DataCtx {
+    float *input;
+    float *label;
+    int calls;
+    int max_calls;
+  };
+  DataCtx ctx_ref{input_buf.data(), label_buf.data(), 0, 4};
+  DataCtx ctx_ckpt{input_buf.data(), label_buf.data(), 0, 4};
+
+  auto gen_cb = [](float **in, float **lbl, bool *last,
+                   void *ud) -> int {
+    auto *c = static_cast<DataCtx *>(ud);
+    *in = c->input;
+    *lbl = c->label;
+    *last = (c->calls >= c->max_calls - 1);
+    c->calls++;
+    if (c->calls >= c->max_calls)
+      c->calls = 0;
+    return 0;
+  };
+
+  auto ds_ref =
+    ml::train::createDataset(ml::train::DatasetType::GENERATOR, gen_cb, &ctx_ref);
+  auto ds_ckpt =
+    ml::train::createDataset(ml::train::DatasetType::GENERATOR, gen_cb, &ctx_ckpt);
+
+  EXPECT_EQ(model_ref->setDataset(ml::train::DatasetModeType::MODE_TRAIN,
+                                   std::move(ds_ref)),
+            ML_ERROR_NONE);
+  EXPECT_EQ(model_ckpt->setDataset(ml::train::DatasetModeType::MODE_TRAIN,
+                                    std::move(ds_ckpt)),
+            ML_ERROR_NONE);
+
+  EXPECT_NO_THROW(model_ref->train());
+  EXPECT_NO_THROW(model_ckpt->train());
+
+  float loss_ref = model_ref->getLoss();
+  float loss_ckpt = model_ckpt->getLoss();
+
+  // Both must have converged to a finite, positive loss.
+  EXPECT_TRUE(std::isfinite(loss_ref));
+  EXPECT_TRUE(std::isfinite(loss_ckpt));
+  EXPECT_GT(loss_ref, 0.0f);
+
+  // Losses must match within 1e-3 relative tolerance.
+  float rel_err = std::abs(loss_ref - loss_ckpt) /
+                  (std::abs(loss_ref) + 1e-8f);
+  EXPECT_LT(rel_err, 1e-3f)
+    << "loss_ref=" << loss_ref << " loss_ckpt=" << loss_ckpt;
 }
 
 /**
