@@ -464,7 +464,7 @@ TEST_P(Bench_SoftmaxRow, softmax_row_inplace) {
         nntrainer::softmax_row_inplace((_FP16 *)X.data(), size_t{0},
                                        static_cast<size_t>(num_rows_v),
                                        static_cast<size_t>(num_heads_v),
-                                       static_cast<float *>(nullptr));
+                                       static_cast<_FP16 *>(nullptr));
       },
       g_bench_warmup, g_bench_iters);
 
