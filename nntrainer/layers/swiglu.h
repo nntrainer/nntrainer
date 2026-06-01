@@ -57,11 +57,15 @@ public:
 
   /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
+   * @note FP16 backward pass is not yet implemented and will throw
+   *       std::invalid_argument. Callers must not invoke this with FP16
+   *       tensors even though supportBackwarding() returns true.
    */
   void calcDerivative(RunLayerContext &context) override;
 
   /**
    * @copydoc bool supportBackwarding() const
+   * @note Returns true only for FP32. FP16 backward is NYI and throws.
    */
   bool supportBackwarding() const override { return true; };
 
