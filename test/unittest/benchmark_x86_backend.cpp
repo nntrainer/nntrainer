@@ -462,8 +462,9 @@ TEST_P(Bench_SoftmaxRow, softmax_row_inplace) {
       [&]() { X = X_orig; },
       [&]() {
         nntrainer::softmax_row_inplace((_FP16 *)X.data(), size_t{0},
-                                       static_cast<size_t>(num_rows),
-                                       static_cast<size_t>(num_heads), nullptr);
+                                       static_cast<size_t>(num_rows_v),
+                                       static_cast<size_t>(num_heads_v),
+                                       static_cast<float *>(nullptr));
       },
       g_bench_warmup, g_bench_iters);
 
@@ -523,7 +524,7 @@ TEST_P(Bench_RmsNorm, rms_norm) {
     auto stats = bench::measure(
       [&]() {
         nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(
-          (const _FP16 *)X_u16.data(), (_FP16 *)Y.data(), H, W, epsilon);
+          (const _FP16 *)X_u16.data(), (_FP16 *)Y.data(), H_v, W_v, epsilon);
       },
       g_bench_warmup, g_bench_iters);
 
@@ -647,6 +648,11 @@ class Bench_X86_FP16_HGEMM : public ::testing::TestWithParam<HgemmParams> {};
 
 TEST_P(Bench_X86_FP16_HGEMM, via_sgemm_dispatch) {
   auto [M, N, K, TransA, TransB] = GetParam();
+  const unsigned int M_v     = M;
+  const unsigned int N_v     = N;
+  const unsigned int K_v     = K;
+  const bool         TransA_v = TransA;
+  const bool         TransB_v = TransB;
   const unsigned int lda = TransA ? M : K;
   const unsigned int ldb = TransB ? K : N;
   const unsigned int ldc = N;
@@ -663,17 +669,19 @@ TEST_P(Bench_X86_FP16_HGEMM, via_sgemm_dispatch) {
 
   auto fp32_stats = bench::measure(
     [&]() {
-      nntrainer::sgemm(0, TransA, TransB, M, N, K, 1.0f, A_fp32.data(), lda,
-                       B_fp32.data(), ldb, 0.0f, C_fp32.data(), ldc);
+      nntrainer::sgemm(0, TransA_v, TransB_v, M_v, N_v, K_v, 1.0f,
+                       A_fp32.data(), lda, B_fp32.data(), ldb, 0.0f,
+                       C_fp32.data(), ldc);
     },
     g_bench_warmup, g_bench_iters);
 
   auto fp16_stats = bench::measure(
     [&]() {
       // The public FP16 sgemm path dispatches to the x86 hgemm implementation.
-      nntrainer::sgemm(
-        0, TransA, TransB, M, N, K, 1.0f, (const _FP16 *)A_u16.data(), lda,
-        (const _FP16 *)B_u16.data(), ldb, 0.0f, (_FP16 *)C_u16.data(), ldc);
+      nntrainer::sgemm(0, TransA_v, TransB_v, M_v, N_v, K_v, 1.0f,
+                       (const _FP16 *)A_u16.data(), lda,
+                       (const _FP16 *)B_u16.data(), ldb, 0.0f,
+                       (_FP16 *)C_u16.data(), ldc);
     },
     g_bench_warmup, g_bench_iters);
 
@@ -701,14 +709,16 @@ class Bench_FP16_GEMV : public ::testing::TestWithParam<GemvParams> {};
 
 TEST_P(Bench_FP16_GEMV, sgemv) {
   auto [M, N] = GetParam();
+  const unsigned int M_v = M;
+  const unsigned int N_v = N;
   auto A_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(M * N));
   auto X_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(N));
   auto Y_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(M));
 
   auto stats = bench::measure(
     [&]() {
-      nntrainer::sgemv(0, false, M, N, 1.0f, (const _FP16 *)A_u16.data(), N,
-                       (const _FP16 *)X_u16.data(), 1, 0.0f,
+      nntrainer::sgemv(0, false, M_v, N_v, 1.0f, (const _FP16 *)A_u16.data(),
+                       N_v, (const _FP16 *)X_u16.data(), 1, 0.0f,
                        (_FP16 *)Y_u16.data(), 1);
     },
     g_bench_warmup, g_bench_iters);
@@ -869,6 +879,10 @@ class Bench_KCache_FP16 : public ::testing::TestWithParam<KCacheParams> {};
 
 TEST_P(Bench_KCache_FP16, compute_kcaches) {
   auto [seq_len, num_cache_head, gqa_size, tile_size] = GetParam();
+  const int seq_len_v        = seq_len;
+  const int num_cache_head_v = num_cache_head;
+  const int gqa_size_v       = gqa_size;
+  const int tile_size_v      = tile_size;
   const int head_dim = kKCacheHeadDim;
   const int total_heads = num_cache_head * gqa_size;
   const size_t local_window_size = static_cast<size_t>(seq_len);
@@ -883,8 +897,8 @@ TEST_P(Bench_KCache_FP16, compute_kcaches) {
     [&]() {
       nntrainer::compute_kcaches(
         (const _FP16 *)in_u16.data(), (const _FP16 *)kcache_u16.data(),
-        (_FP16 *)output.data(), seq_len, num_cache_head, head_dim, gqa_size,
-        tile_size, local_window_size);
+        (_FP16 *)output.data(), seq_len_v, num_cache_head_v, head_dim,
+        gqa_size_v, tile_size_v, local_window_size);
     },
     g_bench_warmup, g_bench_iters);
 
@@ -906,6 +920,10 @@ class Bench_Attention_FP16 : public ::testing::TestWithParam<AttnParams> {};
 
 TEST_P(Bench_Attention_FP16, compute_fp16vcache_transposed) {
   auto [head_dim, num_cache_head, gqa_size, window_size] = GetParam();
+  const int    head_dim_v       = head_dim;
+  const int    num_cache_head_v = num_cache_head;
+  const int    gqa_size_v       = gqa_size;
+  const size_t window_size_v    = window_size;
   int total_heads = num_cache_head * gqa_size;
   int row_num = static_cast<int>(window_size) - 1;
   const int attention_rows = row_num + 1;
@@ -920,8 +938,8 @@ TEST_P(Bench_Attention_FP16, compute_fp16vcache_transposed) {
     [&]() {
       nntrainer::compute_fp16vcache_transposed(
         row_num, (const _FP16 *)in_u16.data(), (const _FP16 *)vcache_u16.data(),
-        (_FP16 *)output.data(), num_cache_head, gqa_size, head_dim,
-        window_size);
+        (_FP16 *)output.data(), num_cache_head_v, gqa_size_v, head_dim_v,
+        window_size_v);
     },
     g_bench_warmup, g_bench_iters);
 
