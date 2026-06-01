@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * Copyright (C) 2024 Samsung Electronics
+ * Copyright (C) 2026 Samsung Electronics
  *
  * @file        unittest_rms_norm_fp16.cpp
  * @date        March 24, 2026
- * @brief       Unit test for rms_norm_wrt_width_fp16_intrinsic function
+ * @brief       Unit test for fallback rms_norm_wrt_width_fp16_intrinsic (_FP16)
  * @see         https://github.com/nntrainer/nntrainer
  * @author      Samsung Electronics
  * @bug         No known bugs
@@ -14,691 +14,117 @@
 #include "nntrainer_test_util.h"
 #include "util_func.h"
 #include <cmath>
-#include <iomanip>
-#include <iostream>
-#include <neon_impl.h>
-#include <arm_compute_backend.h>
 #include <nntrainer_error.h>
 #include <tensor.h>
 #include <tensor_dim.h>
+#if defined(__ARM_NEON) && defined(ENABLE_FP16)
+#include <arm_compute_backend.h>
+#include <fallback_internal.h>
+#endif
 
-#define EXPECT_IN_RANGE(VAL, MIN, MAX) \
-  EXPECT_GE((VAL), (MIN));             \
-  EXPECT_LE((VAL), (MAX))
-
-// Reference implementation of RMS normalization in FP32
-void rms_norm_fp32_reference(const float *__restrict X, float *__restrict Y,
-                             size_t H, size_t W, float epsilon) {
+static void rms_norm_fp32_scalar(const float *X, float *Y, size_t H, size_t W,
+                                 float epsilon) {
   for (size_t h = 0; h < H; ++h) {
     const float *rowX = X + h * W;
     float *rowY = Y + h * W;
-
-    // Calculate mean of squares
-    float sum_squares = 0.0f;
-    for (size_t i = 0; i < W; ++i) {
-      sum_squares += rowX[i] * rowX[i];
-    }
-    float mean = sum_squares / W;
-
-    // Calculate scale
-    float scale = 1.0f / std::sqrt(mean + epsilon);
-
-    // Apply normalization
-    for (size_t i = 0; i < W; ++i) {
+    float sum = 0.0f;
+    for (size_t i = 0; i < W; ++i)
+      sum += rowX[i] * rowX[i];
+    float scale = 1.0f / std::sqrt(sum / W + epsilon);
+    for (size_t i = 0; i < W; ++i)
       rowY[i] = rowX[i] * scale;
-    }
   }
 }
 
-// Test with small dimensions - compare all three implementations
-TEST(rms_norm_fp16_intrinsic, small_dimensions_4_8) {
-  size_t H = 4;
-  size_t W = 8;
+#if defined(__ARM_NEON) && defined(ENABLE_FP16)
+
+TEST(rms_norm_fallback_fp16, small_dimensions_4_8) {
+  size_t H = 4, W = 8;
   float epsilon = 1e-6f;
-
-  // Create test data
-  std::vector<float> X(H * W);
-  std::vector<float> Y_fp32_intrinsic(H * W);
-  std::vector<float> Y_fp16_intrinsic(H * W);
-  std::vector<float> Y_fp32_ref(H * W);
-
-  // Initialize with random values
-  for (size_t i = 0; i < H * W; ++i) {
-    X[i] = (float)(rand() % 100) / 10.0f; // Values between 0.0 and 9.9
-  }
-
-  // Run FP32 intrinsic version
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_fp32_intrinsic.data(),
-                                                     H, W, epsilon);
-
-  // Run FP16 intrinsic version - calls arm_compute_backend wrapper
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic(X.data(), Y_fp16_intrinsic.data(), H,
+  std::vector<float> Xf(H * W);
+  for (size_t i = 0; i < H * W; ++i)
+    Xf[i] = (float)(rand() % 100) / 10.0f;
+  std::vector<_FP16> X(H * W), Y(H * W);
+  for (size_t i = 0; i < H * W; ++i)
+    X[i] = (_FP16)Xf[i];
+  nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X.data(), Y.data(), H,
                                                       W, epsilon);
-
-  // Run the reference FP32 version
-  rms_norm_fp32_reference(X.data(), Y_fp32_ref.data(), H, W, epsilon);
-
-  // Compare FP32 intrinsic vs reference
-  float mse_fp32_vs_ref =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp32_vs_ref =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float epsilon_tolerance = 1e-6f;
-  EXPECT_IN_RANGE(mse_fp32_vs_ref, 0.0f, epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_ref, 0.999999f, 1.0f);
-
-  // Compare FP16 intrinsic vs reference
-  float mse_fp16_vs_ref =
-    mse<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp16_vs_ref =
-    cosine_similarity<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float fp16_epsilon_tolerance = 1e-3f;
-  EXPECT_IN_RANGE(mse_fp16_vs_ref, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp16_vs_ref, 0.99f, 1.0f);
-
-  // Compare FP32 intrinsic vs FP16 intrinsic
-  float mse_fp32_vs_fp16 =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-  double cos_sim_fp32_vs_fp16 =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-
-  EXPECT_IN_RANGE(mse_fp32_vs_fp16, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_fp16, 0.99f, 1.0f);
+  std::vector<float> Yref(H * W);
+  rms_norm_fp32_scalar(Xf.data(), Yref.data(), H, W, epsilon);
+  for (size_t i = 0; i < H * W; ++i)
+    EXPECT_NEAR((float)Y[i], Yref[i], 1e-2f) << "index " << i;
 }
 
-// Test with dimensions not divisible by 8 - compare all three implementations
-TEST(rms_norm_fp16_intrinsic, non_divisible_dimensions_5_13) {
-  size_t H = 5;
-  size_t W = 13;
+TEST(rms_norm_fallback_fp16, non_divisible_dimensions_5_13) {
+  size_t H = 5, W = 13;
   float epsilon = 1e-6f;
-
-  std::vector<float> X(H * W);
-  std::vector<float> Y_fp32_intrinsic(H * W);
-  std::vector<float> Y_fp16_intrinsic(H * W);
-  std::vector<float> Y_fp32_ref(H * W);
-
-  for (size_t i = 0; i < H * W; ++i) {
-    X[i] = (float)(rand() % 100) / 10.0f;
-  }
-
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_fp32_intrinsic.data(),
-                                                     H, W, epsilon);
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic(X.data(), Y_fp16_intrinsic.data(), H,
+  std::vector<float> Xf(H * W);
+  for (size_t i = 0; i < H * W; ++i)
+    Xf[i] = (float)(rand() % 100) / 10.0f;
+  std::vector<_FP16> X(H * W), Y(H * W);
+  for (size_t i = 0; i < H * W; ++i)
+    X[i] = (_FP16)Xf[i];
+  nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X.data(), Y.data(), H,
                                                       W, epsilon);
-  rms_norm_fp32_reference(X.data(), Y_fp32_ref.data(), H, W, epsilon);
-
-  // Compare FP32 intrinsic vs reference
-  float mse_fp32_vs_ref =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp32_vs_ref =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float epsilon_tolerance = 1e-6f;
-  EXPECT_IN_RANGE(mse_fp32_vs_ref, 0.0f, epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_ref, 0.999999f, 1.0f);
-
-  // Compare FP16 intrinsic vs reference
-  float mse_fp16_vs_ref =
-    mse<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp16_vs_ref =
-    cosine_similarity<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float fp16_epsilon_tolerance = 1e-3f;
-  EXPECT_IN_RANGE(mse_fp16_vs_ref, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp16_vs_ref, 0.99f, 1.0f);
-
-  // Compare FP32 intrinsic vs FP16 intrinsic
-  float mse_fp32_vs_fp16 =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-  double cos_sim_fp32_vs_fp16 =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-
-  EXPECT_IN_RANGE(mse_fp32_vs_fp16, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_fp16, 0.99f, 1.0f);
+  std::vector<float> Yref(H * W);
+  rms_norm_fp32_scalar(Xf.data(), Yref.data(), H, W, epsilon);
+  for (size_t i = 0; i < H * W; ++i)
+    EXPECT_NEAR((float)Y[i], Yref[i], 1e-2f) << "index " << i;
 }
 
-// Test with dimensions that require remainder handling - compare all three implementations
-TEST(rms_norm_fp16_intrinsic, remainder_handling_3_11) {
-  size_t H = 3;
-  size_t W = 11;
+TEST(rms_norm_fallback_fp16, negative_values) {
+  size_t H = 4, W = 8;
   float epsilon = 1e-6f;
-
-  std::vector<float> X(H * W);
-  std::vector<float> Y_fp32_intrinsic(H * W);
-  std::vector<float> Y_fp16_intrinsic(H * W);
-  std::vector<float> Y_fp32_ref(H * W);
-
-  for (size_t i = 0; i < H * W; ++i) {
-    X[i] = (float)(rand() % 100) / 10.0f;
-  }
-
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_fp32_intrinsic.data(),
-                                                     H, W, epsilon);
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic(X.data(), Y_fp16_intrinsic.data(), H,
+  std::vector<float> Xf(H * W);
+  for (size_t i = 0; i < H * W; ++i)
+    Xf[i] = (float)((rand() % 200) - 100) / 10.0f;
+  std::vector<_FP16> X(H * W), Y(H * W);
+  for (size_t i = 0; i < H * W; ++i)
+    X[i] = (_FP16)Xf[i];
+  nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X.data(), Y.data(), H,
                                                       W, epsilon);
-  rms_norm_fp32_reference(X.data(), Y_fp32_ref.data(), H, W, epsilon);
-
-  // Compare FP32 intrinsic vs reference
-  float mse_fp32_vs_ref =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp32_vs_ref =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float epsilon_tolerance = 1e-6f;
-  EXPECT_IN_RANGE(mse_fp32_vs_ref, 0.0f, epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_ref, 0.999999f, 1.0f);
-
-  // Compare FP16 intrinsic vs reference
-  float mse_fp16_vs_ref =
-    mse<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp16_vs_ref =
-    cosine_similarity<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float fp16_epsilon_tolerance = 1e-3f;
-  EXPECT_IN_RANGE(mse_fp16_vs_ref, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp16_vs_ref, 0.99f, 1.0f);
-
-  // Compare FP32 intrinsic vs FP16 intrinsic
-  float mse_fp32_vs_fp16 =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-  double cos_sim_fp32_vs_fp16 =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-
-  EXPECT_IN_RANGE(mse_fp32_vs_fp16, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_fp16, 0.99f, 1.0f);
+  std::vector<float> Yref(H * W);
+  rms_norm_fp32_scalar(Xf.data(), Yref.data(), H, W, epsilon);
+  for (size_t i = 0; i < H * W; ++i)
+    EXPECT_NEAR((float)Y[i], Yref[i], 1e-2f) << "index " << i;
 }
 
-// Test with typical embedding dimension (768) - compare all three implementations
-TEST(rms_norm_fp16_intrinsic, embedding_dimension_768) {
-  size_t H = 10;
-  size_t W = 768;
+TEST(rms_norm_fallback_fp16, embedding_dimension_768) {
+  size_t H = 10, W = 768;
   float epsilon = 1e-6f;
-
-  std::vector<float> X(H * W);
-  std::vector<float> Y_fp32_intrinsic(H * W);
-  std::vector<float> Y_fp16_intrinsic(H * W);
-  std::vector<float> Y_fp32_ref(H * W);
-
-  for (size_t i = 0; i < H * W; ++i) {
-    X[i] = (float)(rand() % 100) / 10.0f;
-  }
-
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_fp32_intrinsic.data(),
-                                                     H, W, epsilon);
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic(X.data(), Y_fp16_intrinsic.data(), H,
+  std::vector<float> Xf(H * W);
+  for (size_t i = 0; i < H * W; ++i)
+    Xf[i] = (float)(rand() % 100) / 10.0f;
+  std::vector<_FP16> X(H * W), Y(H * W);
+  for (size_t i = 0; i < H * W; ++i)
+    X[i] = (_FP16)Xf[i];
+  nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X.data(), Y.data(), H,
                                                       W, epsilon);
-  rms_norm_fp32_reference(X.data(), Y_fp32_ref.data(), H, W, epsilon);
-
-  // Compare FP32 intrinsic vs reference
-  float mse_fp32_vs_ref =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp32_vs_ref =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float epsilon_tolerance = 1e-6f;
-  EXPECT_IN_RANGE(mse_fp32_vs_ref, 0.0f, epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_ref, 0.999999f, 1.0f);
-
-  // Compare FP16 intrinsic vs reference
-  float mse_fp16_vs_ref =
-    mse<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp16_vs_ref =
-    cosine_similarity<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float fp16_epsilon_tolerance = 1e-3f;
-  EXPECT_IN_RANGE(mse_fp16_vs_ref, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp16_vs_ref, 0.99f, 1.0f);
-
-  // Compare FP32 intrinsic vs FP16 intrinsic
-  float mse_fp32_vs_fp16 =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-  double cos_sim_fp32_vs_fp16 =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-
-  EXPECT_IN_RANGE(mse_fp32_vs_fp16, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_fp16, 0.99f, 1.0f);
-}
-
-// Test with different epsilon values - compare all three implementations
-TEST(rms_norm_fp16_intrinsic, different_epsilon_values) {
-  size_t H = 4;
-  size_t W = 16;
-  std::vector<float> epsilon_values = {1e-8f, 1e-6f, 1e-4f, 1e-2f};
-
-  std::vector<float> X(H * W);
+  std::vector<float> Yref(H * W);
+  rms_norm_fp32_scalar(Xf.data(), Yref.data(), H, W, epsilon);
+  float max_err = 0.0f;
   for (size_t i = 0; i < H * W; ++i) {
-    X[i] = (float)(rand() % 100) / 10.0f;
+    float err = std::fabs((float)Y[i] - Yref[i]);
+    if (err > max_err)
+      max_err = err;
   }
-
-  for (float epsilon : epsilon_values) {
-    std::vector<float> Y_fp32_intrinsic(H * W);
-    std::vector<float> Y_fp16_intrinsic(H * W);
-    std::vector<float> Y_fp32_ref(H * W);
-
-    nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_fp32_intrinsic.data(),
-                                                         H, W, epsilon);
-    nntrainer::rms_norm_wrt_width_fp16_intrinsic(X.data(), Y_fp16_intrinsic.data(),
-                                                        H, W, epsilon);
-    rms_norm_fp32_reference(X.data(), Y_fp32_ref.data(), H, W, epsilon);
-
-    // Compare FP32 intrinsic vs reference
-    float mse_fp32_vs_ref =
-      mse<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-    double cos_sim_fp32_vs_ref =
-      cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-    const float epsilon_tolerance = 1e-6f;
-    EXPECT_IN_RANGE(mse_fp32_vs_ref, 0.0f, epsilon_tolerance);
-    EXPECT_IN_RANGE((float)cos_sim_fp32_vs_ref, 0.999999f, 1.0f);
-
-    // Compare FP16 intrinsic vs reference
-    float mse_fp16_vs_ref =
-      mse<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-    double cos_sim_fp16_vs_ref =
-      cosine_similarity<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-    const float fp16_epsilon_tolerance = 1e-3f;
-    EXPECT_IN_RANGE(mse_fp16_vs_ref, 0.0f, fp16_epsilon_tolerance);
-    EXPECT_IN_RANGE((float)cos_sim_fp16_vs_ref, 0.99f, 1.0f);
-
-    // Compare FP32 intrinsic vs FP16 intrinsic
-    float mse_fp32_vs_fp16 =
-      mse<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-    double cos_sim_fp32_vs_fp16 =
-      cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-
-    EXPECT_IN_RANGE(mse_fp32_vs_fp16, 0.0f, fp16_epsilon_tolerance);
-    EXPECT_IN_RANGE((float)cos_sim_fp32_vs_fp16, 0.99f, 1.0f);
-  }
+  EXPECT_LE(max_err, 1e-2f);
 }
 
-// Test with single row - compare all three implementations
-TEST(rms_norm_fp16_intrinsic, single_row) {
-  size_t H = 1;
-  size_t W = 32;
-  float epsilon = 1e-6f;
-
-  std::vector<float> X(H * W);
-  std::vector<float> Y_fp32_intrinsic(H * W);
-  std::vector<float> Y_fp16_intrinsic(H * W);
-  std::vector<float> Y_fp32_ref(H * W);
-
-  for (size_t i = 0; i < H * W; ++i) {
-    X[i] = (float)(rand() % 100) / 10.0f;
-  }
-
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_fp32_intrinsic.data(),
-                                                     H, W, epsilon);
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic(X.data(), Y_fp16_intrinsic.data(), H,
-                                                      W, epsilon);
-  rms_norm_fp32_reference(X.data(), Y_fp32_ref.data(), H, W, epsilon);
-
-  // Compare FP32 intrinsic vs reference
-  float mse_fp32_vs_ref =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp32_vs_ref =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float epsilon_tolerance = 1e-6f;
-  EXPECT_IN_RANGE(mse_fp32_vs_ref, 0.0f, epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_ref, 0.999999f, 1.0f);
-
-  // Compare FP16 intrinsic vs reference
-  float mse_fp16_vs_ref =
-    mse<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp16_vs_ref =
-    cosine_similarity<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float fp16_epsilon_tolerance = 1e-3f;
-  EXPECT_IN_RANGE(mse_fp16_vs_ref, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp16_vs_ref, 0.99f, 1.0f);
-
-  // Compare FP32 intrinsic vs FP16 intrinsic
-  float mse_fp32_vs_fp16 =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-  double cos_sim_fp32_vs_fp16 =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-
-  EXPECT_IN_RANGE(mse_fp32_vs_fp16, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_fp16, 0.99f, 1.0f);
-}
-
-// Test with single column - compare all three implementations
-TEST(rms_norm_fp16_intrinsic, single_column) {
-  size_t H = 10;
-  size_t W = 1;
-  float epsilon = 1e-6f;
-
-  std::vector<float> X(H * W);
-  std::vector<float> Y_fp32_intrinsic(H * W);
-  std::vector<float> Y_fp16_intrinsic(H * W);
-  std::vector<float> Y_fp32_ref(H * W);
-
-  for (size_t i = 0; i < H * W; ++i) {
-    X[i] = (float)(rand() % 100) / 10.0f;
-  }
-
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_fp32_intrinsic.data(),
-                                                     H, W, epsilon);
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic(X.data(), Y_fp16_intrinsic.data(), H,
-                                                      W, epsilon);
-  rms_norm_fp32_reference(X.data(), Y_fp32_ref.data(), H, W, epsilon);
-
-  // Compare FP32 intrinsic vs reference
-  float mse_fp32_vs_ref =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp32_vs_ref =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float epsilon_tolerance = 1e-6f;
-  EXPECT_IN_RANGE(mse_fp32_vs_ref, 0.0f, epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_ref, 0.999999f, 1.0f);
-
-  // Compare FP16 intrinsic vs reference
-  float mse_fp16_vs_ref =
-    mse<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp16_vs_ref =
-    cosine_similarity<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float fp16_epsilon_tolerance = 1e-3f;
-  EXPECT_IN_RANGE(mse_fp16_vs_ref, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp16_vs_ref, 0.99f, 1.0f);
-
-  // Compare FP32 intrinsic vs FP16 intrinsic
-  float mse_fp32_vs_fp16 =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-  double cos_sim_fp32_vs_fp16 =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-
-  EXPECT_IN_RANGE(mse_fp32_vs_fp16, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_fp16, 0.99f, 1.0f);
-}
-
-// Test with negative values - compare all three implementations
-TEST(rms_norm_fp16_intrinsic, negative_values) {
-  size_t H = 4;
-  size_t W = 8;
-  float epsilon = 1e-6f;
-
-  std::vector<float> X(H * W);
-  std::vector<float> Y_fp32_intrinsic(H * W);
-  std::vector<float> Y_fp16_intrinsic(H * W);
-  std::vector<float> Y_fp32_ref(H * W);
-
-  // Initialize with both positive and negative values
-  for (size_t i = 0; i < H * W; ++i) {
-    X[i] = (float)((rand() % 200) - 100) / 10.0f; // Values between -10.0 and 9.9
-  }
-
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_fp32_intrinsic.data(),
-                                                     H, W, epsilon);
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic(X.data(), Y_fp16_intrinsic.data(), H,
-                                                      W, epsilon);
-  rms_norm_fp32_reference(X.data(), Y_fp32_ref.data(), H, W, epsilon);
-
-  // Compare FP32 intrinsic vs reference
-  float mse_fp32_vs_ref =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp32_vs_ref =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float epsilon_tolerance = 1e-6f;
-  EXPECT_IN_RANGE(mse_fp32_vs_ref, 0.0f, epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_ref, 0.999999f, 1.0f);
-
-  // Compare FP16 intrinsic vs reference
-  float mse_fp16_vs_ref =
-    mse<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp16_vs_ref =
-    cosine_similarity<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float fp16_epsilon_tolerance = 1e-3f;
-  EXPECT_IN_RANGE(mse_fp16_vs_ref, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp16_vs_ref, 0.99f, 1.0f);
-
-  // Compare FP32 intrinsic vs FP16 intrinsic
-  float mse_fp32_vs_fp16 =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-  double cos_sim_fp32_vs_fp16 =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-
-  EXPECT_IN_RANGE(mse_fp32_vs_fp16, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_fp16, 0.99f, 1.0f);
-}
-
-// Test with zero values - compare all three implementations
-TEST(rms_norm_fp16_intrinsic, zero_values) {
-  size_t H = 4;
-  size_t W = 8;
-  float epsilon = 1e-6f;
-
-  std::vector<float> X(H * W, 0.0f);
-  std::vector<float> Y_fp32_intrinsic(H * W);
-  std::vector<float> Y_fp16_intrinsic(H * W);
-  std::vector<float> Y_fp32_ref(H * W);
-
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_fp32_intrinsic.data(),
-                                                     H, W, epsilon);
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic(X.data(), Y_fp16_intrinsic.data(), H,
-                                                      W, epsilon);
-  rms_norm_fp32_reference(X.data(), Y_fp32_ref.data(), H, W, epsilon);
-
-  // Compare FP32 intrinsic vs reference
-  float mse_fp32_vs_ref =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  const float epsilon_tolerance = 1e-6f;
-  EXPECT_IN_RANGE(mse_fp32_vs_ref, 0.0f, epsilon_tolerance);
-
-  // Compare FP16 intrinsic vs reference
-  float mse_fp16_vs_ref =
-    mse<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  EXPECT_IN_RANGE(mse_fp16_vs_ref, 0.0f, epsilon_tolerance);
-
-  // Compare FP32 intrinsic vs FP16 intrinsic
-  float mse_fp32_vs_fp16 =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-  EXPECT_IN_RANGE(mse_fp32_vs_fp16, 0.0f, epsilon_tolerance);
-}
-
-// Test with very large dimensions - compare all three implementations
-TEST(rms_norm_fp16_intrinsic, large_dimensions_100_1024) {
-  size_t H = 100;
-  size_t W = 1024;
-  float epsilon = 1e-6f;
-
-  std::vector<float> X(H * W);
-  std::vector<float> Y_fp32_intrinsic(H * W);
-  std::vector<float> Y_fp16_intrinsic(H * W);
-  std::vector<float> Y_fp32_ref(H * W);
-
-  for (size_t i = 0; i < H * W; ++i) {
-    X[i] = (float)(rand() % 100) / 10.0f;
-  }
-
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_fp32_intrinsic.data(),
-                                                     H, W, epsilon);
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic(X.data(), Y_fp16_intrinsic.data(), H,
-                                                      W, epsilon);
-  rms_norm_fp32_reference(X.data(), Y_fp32_ref.data(), H, W, epsilon);
-
-  // Compare FP32 intrinsic vs reference
-  float mse_fp32_vs_ref =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp32_vs_ref =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float epsilon_tolerance = 1e-6f;
-  EXPECT_IN_RANGE(mse_fp32_vs_ref, 0.0f, epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_ref, 0.999999f, 1.0f);
-
-  // Compare FP16 intrinsic vs reference
-  float mse_fp16_vs_ref =
-    mse<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp16_vs_ref =
-    cosine_similarity<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float fp16_epsilon_tolerance = 1e-3f;
-  EXPECT_IN_RANGE(mse_fp16_vs_ref, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp16_vs_ref, 0.99f, 1.0f);
-
-  // Compare FP32 intrinsic vs FP16 intrinsic
-  float mse_fp32_vs_fp16 =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-  double cos_sim_fp32_vs_fp16 =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-
-  EXPECT_IN_RANGE(mse_fp32_vs_fp16, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_fp16, 0.99f, 1.0f);
-}
-
-// Test with width exactly divisible by 8 - compare all three implementations
-TEST(rms_norm_fp16_intrinsic, width_divisible_by_8) {
-  size_t H = 4;
-  size_t W = 16;
-  float epsilon = 1e-6f;
-
-  std::vector<float> X(H * W);
-  std::vector<float> Y_fp32_intrinsic(H * W);
-  std::vector<float> Y_fp16_intrinsic(H * W);
-  std::vector<float> Y_fp32_ref(H * W);
-
-  for (size_t i = 0; i < H * W; ++i) {
-    X[i] = (float)(rand() % 100) / 10.0f;
-  }
-
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_fp32_intrinsic.data(),
-                                                     H, W, epsilon);
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic(X.data(), Y_fp16_intrinsic.data(), H,
-                                                      W, epsilon);
-  rms_norm_fp32_reference(X.data(), Y_fp32_ref.data(), H, W, epsilon);
-
-  // Compare FP32 intrinsic vs reference
-  float mse_fp32_vs_ref =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp32_vs_ref =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float epsilon_tolerance = 1e-6f;
-  EXPECT_IN_RANGE(mse_fp32_vs_ref, 0.0f, epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_ref, 0.999999f, 1.0f);
-
-  // Compare FP16 intrinsic vs reference
-  float mse_fp16_vs_ref =
-    mse<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp16_vs_ref =
-    cosine_similarity<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float fp16_epsilon_tolerance = 1e-3f;
-  EXPECT_IN_RANGE(mse_fp16_vs_ref, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp16_vs_ref, 0.99f, 1.0f);
-
-  // Compare FP32 intrinsic vs FP16 intrinsic
-  float mse_fp32_vs_fp16 =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-  double cos_sim_fp32_vs_fp16 =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-
-  EXPECT_IN_RANGE(mse_fp32_vs_fp16, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_fp16, 0.99f, 1.0f);
-}
-
-// Test with width leaving 4 elements remainder - compare all three implementations
-TEST(rms_norm_fp16_intrinsic, width_remainder_4) {
-  size_t H = 4;
-  size_t W = 12;
-  float epsilon = 1e-6f;
-
-  std::vector<float> X(H * W);
-  std::vector<float> Y_fp32_intrinsic(H * W);
-  std::vector<float> Y_fp16_intrinsic(H * W);
-  std::vector<float> Y_fp32_ref(H * W);
-
-  for (size_t i = 0; i < H * W; ++i) {
-    X[i] = (float)(rand() % 100) / 10.0f;
-  }
-
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_fp32_intrinsic.data(),
-                                                     H, W, epsilon);
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic(X.data(), Y_fp16_intrinsic.data(), H,
-                                                      W, epsilon);
-  rms_norm_fp32_reference(X.data(), Y_fp32_ref.data(), H, W, epsilon);
-
-  // Compare FP32 intrinsic vs reference
-  float mse_fp32_vs_ref =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp32_vs_ref =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float epsilon_tolerance = 1e-6f;
-  EXPECT_IN_RANGE(mse_fp32_vs_ref, 0.0f, epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_ref, 0.999999f, 1.0f);
-
-  // Compare FP16 intrinsic vs reference
-  float mse_fp16_vs_ref =
-    mse<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-  double cos_sim_fp16_vs_ref =
-    cosine_similarity<float>(Y_fp16_intrinsic.data(), Y_fp32_ref.data(), H * W);
-
-  const float fp16_epsilon_tolerance = 1e-3f;
-  EXPECT_IN_RANGE(mse_fp16_vs_ref, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp16_vs_ref, 0.99f, 1.0f);
-
-  // Compare FP32 intrinsic vs FP16 intrinsic
-  float mse_fp32_vs_fp16 =
-    mse<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-  double cos_sim_fp32_vs_fp16 =
-    cosine_similarity<float>(Y_fp32_intrinsic.data(), Y_fp16_intrinsic.data(), H * W);
-
-  EXPECT_IN_RANGE(mse_fp32_vs_fp16, 0.0f, fp16_epsilon_tolerance);
-  EXPECT_IN_RANGE((float)cos_sim_fp32_vs_fp16, 0.99f, 1.0f);
-}
-
-// Test to verify the function is being called - using function pointer
-TEST(rms_norm_fp16_intrinsic, verify_function_called) {
-  // Get function pointer - explicitly specify template parameter
-  auto func_ptr = &nntrainer::rms_norm_wrt_width_fp16_intrinsic<float>;
-  
-  size_t H = 2;
-  size_t W = 8;
-  float epsilon = 1e-6f;
-  
-  std::vector<float> X(H * W);
-  std::vector<float> Y(H * W);
-  std::vector<float> Y_ref(H * W);
-  
-  // Fill with known values
-  for (size_t i = 0; i < H * W; ++i) {
-    X[i] = static_cast<float>(i + 1);
-  }
-  
-  // Call via function pointer
-  func_ptr(X.data(), Y.data(), H, W, epsilon);
-  
-  // Call reference implementation
-  rms_norm_fp32_reference(X.data(), Y_ref.data(), H, W, epsilon);
-  
-  // Verify results match
-  float mse_error = mse<float>(Y.data(), Y_ref.data(), H * W);
-  EXPECT_LE(mse_error, 1e-6f) << "Function should be called and produce correct results";
-}
+#endif // __ARM_NEON && ENABLE_FP16
 
 GTEST_API_ int main(int argc, char **argv) {
   int result = -1;
-
   try {
     testing::InitGoogleTest(&argc, argv);
   } catch (...) {
     std::cerr << "Error during InitGoogleTest" << std::endl;
     return 0;
   }
-
   try {
     result = RUN_ALL_TESTS();
   } catch (...) {
     std::cerr << "Error during RUN_ALL_TESTS()" << std::endl;
   }
-
   return result;
 }

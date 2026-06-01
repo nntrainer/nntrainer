@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * Copyright (C) 2024 Samsung Electronics
+ * Copyright (C) 2026 Samsung Electronics
  *
  * @file        unittest_rms_norm_fp32.cpp
  * @date        March 24, 2026
@@ -16,10 +16,12 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
-#include <neon_impl.h>
 #include <nntrainer_error.h>
 #include <tensor.h>
 #include <tensor_dim.h>
+
+#if defined(__ARM_NEON)
+#include <neon_impl.h>
 
 #define EXPECT_IN_RANGE(VAL, MIN, MAX) \
   EXPECT_GE((VAL), (MIN));             \
@@ -391,6 +393,8 @@ TEST(rms_norm_fp32_intrinsic, verify_function_called) {
   float mse_error = mse<float>(Y.data(), Y_ref.data(), H * W);
   EXPECT_LE(mse_error, 1e-6f) << "Function should be called and produce correct results";
 }
+
+#endif // __ARM_NEON
 
 GTEST_API_ int main(int argc, char **argv) {
   int result = -1;

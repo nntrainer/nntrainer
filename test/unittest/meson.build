@@ -95,6 +95,14 @@ if get_option('enable-fp16')
   test_target += [['unittest_nntrainer_tensor_pool_fp16', []]]
 endif
 
+if get_option('enable-fp16') and (arch == 'arm' or arch == 'aarch64')
+  test_target += [['unittest_rms_norm_fp16', []]]
+endif
+
+if arch == 'arm' or arch == 'aarch64'
+  test_target += [['unittest_rms_norm_fp32', []]]
+endif
+
 if get_option('enable-profile')
   if gmock_dep.version().version_compare('>=1.10.0')
     test_target += [['unittest_nntrainer_profiler', []]]
