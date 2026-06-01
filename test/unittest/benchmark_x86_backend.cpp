@@ -848,7 +848,7 @@ GTEST_PARAMETER_TEST(Configs, Bench_Attention, kAttnConfigs);
 
 // ---- Set B: FP16 Q + FP16 KV cache (enable-fp16=true only) ----
 
-#ifdef ENABLE_FP16
+#if defined(ENABLE_FP16) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
 
 /**
  * @brief Test fixture for compute_kcaches benchmarks (FP16 Q, FP16 KV)
@@ -924,7 +924,7 @@ TEST_P(Bench_Attention_FP16, compute_fp16vcache_transposed) {
 
 GTEST_PARAMETER_TEST(Configs, Bench_Attention_FP16, kAttnConfigs);
 
-#endif // ENABLE_FP16
+#endif // defined(ENABLE_FP16) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
 
 // ============================================================================
 // Main
