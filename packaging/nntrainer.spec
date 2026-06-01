@@ -600,7 +600,6 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/compute_ops.h
 %{_includedir}/nntrainer/context_data.h
 %{_includedir}/nntrainer/fallback_internal.h
-%{_includedir}/nntrainer/fallback_kleidiai.h
 %if 0%{?use_cblas}
 %{_includedir}/nntrainer/cblas_interface.h
 %endif
