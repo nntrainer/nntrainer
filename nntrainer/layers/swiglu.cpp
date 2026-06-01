@@ -57,8 +57,6 @@ void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
   nntrainer::Tensor &in2 = context.getInput(INPUT_IDX_2);
   nntrainer::Tensor &out = context.getOutput(OUT_IDX);
 
-  unsigned int _from = from;
-
   int iter = to - from;
 
   if (in1.getDataType() == ml::train::TensorDim::DataType::FP32) {
@@ -66,9 +64,9 @@ void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
       for (unsigned int c = 0; c < in1.channel(); c++) {
         for (unsigned int h = 0; h < iter; h++) {
           nntrainer::swiglu(in1.width(),
-                            out.getData<float>() + out.getIndex(b, c, h, 0),
-                            in1.getData<float>() + in1.getIndex(b, c, h, 0),
-                            in2.getData<float>() + in2.getIndex(b, c, h, 0));
+                            out.getData<float>() + out.getIndex(b, c, from + h, 0),
+                            in1.getData<float>() + in1.getIndex(b, c, from + h, 0),
+                            in2.getData<float>() + in2.getIndex(b, c, from + h, 0));
         }
       }
     }
@@ -78,9 +76,9 @@ void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
       for (unsigned int c = 0; c < in1.channel(); c++) {
         for (unsigned int h = 0; h < iter; h++) {
           nntrainer::swiglu(in1.width(),
-                            out.getData<_FP16>() + out.getIndex(b, c, h, 0),
-                            in1.getData<_FP16>() + in1.getIndex(b, c, h, 0),
-                            in2.getData<_FP16>() + in2.getIndex(b, c, h, 0));
+                            out.getData<_FP16>() + out.getIndex(b, c, from + h, 0),
+                            in1.getData<_FP16>() + in1.getIndex(b, c, from + h, 0),
+                            in2.getData<_FP16>() + in2.getIndex(b, c, from + h, 0));
         }
       }
     }
