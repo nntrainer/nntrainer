@@ -59,7 +59,8 @@ void LmHeadLayer::finalize(InitLayerContext &context) {
   bool is_nchw = (context.getFormat() == Tformat::NCHW);
 
   /** set output dimensions */
-  ///@note lm_head's output dimension: width (or channel for NHWC) is vocab size; height follows input height
+  ///@note lm_head's output dimension: width (or channel for NHWC) is vocab
+  /// size; height follows input height
   auto const &in_dim = context.getInputDimensions()[0];
   output_dims[0] = in_dim;
   if (is_nchw)
@@ -175,8 +176,9 @@ void LmHeadLayer::calcGradient(RunLayerContext &context) {
   Tensor &dweight = context.getWeightGrad(weight_idx[LmHeadParams::weight]);
 
   // dweight = in^T . dy  (accumulate correctly across multiple backward passes)
-  in.dot_deriv_wrt_2(dweight, dy, false, false,
-                     !context.isGradientFirstAccess(weight_idx[LmHeadParams::weight]));
+  in.dot_deriv_wrt_2(
+    dweight, dy, false, false,
+    !context.isGradientFirstAccess(weight_idx[LmHeadParams::weight]));
 
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
