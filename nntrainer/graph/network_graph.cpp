@@ -15,12 +15,12 @@
 #include <activation_layer.h>
 #include <addition_layer.h>
 #include <bn_layer.h>
-#include <dropout.h>
 #include <concat_layer.h>
 #include <connection.h>
 #include <cross_entropy_loss_layer.h>
 #include <cross_entropy_sigmoid_loss_layer.h>
 #include <cross_entropy_softmax_loss_layer.h>
+#include <dropout.h>
 #include <engine.h>
 #include <flatten_layer.h>
 #include <grucell.h>
@@ -2258,15 +2258,16 @@ void NetworkGraph::applyCheckpointBlocks(
         // All layers in the block are checkpointed
         // Reject stateful layers: BatchNormalization and Dropout update
         // internal state (running stats / RNG) on every forwarding() call, so
-        // recompute would double-apply that update and corrupt the backward pass.
-        // Gradient checkpointing here targets stateless layers only.
+        // recompute would double-apply that update and corrupt the backward
+        // pass. Gradient checkpointing here targets stateless layers only.
         const std::string &layer_type = layer_node->getType();
         if (layer_type == BatchNormalizationLayer::type ||
             layer_type == DropOutLayer::type) {
           throw std::invalid_argument(
             "Checkpoint block '" + block_id + "': layer '" + layer_name +
             "' (type=" + layer_type +
-            ") is stateful and cannot be placed in a gradient checkpoint block. "
+            ") is stateful and cannot be placed in a gradient checkpoint "
+            "block. "
             "Gradient checkpointing supports stateless layers only (e.g. "
             "fully_connected, relu, gelu, layer_normalization).");
         }
