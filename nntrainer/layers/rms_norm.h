@@ -10,8 +10,8 @@
  * @bug    No known bugs except for NYI items
  */
 
-#ifndef __RMS_NORM_LAYER_H__
-#define __RMS_NORM_LAYER_H__
+#ifndef __NNTRAINER_RMS_NORM_LAYER_H__
+#define __NNTRAINER_RMS_NORM_LAYER_H__
 
 #include <layer_context.h>
 #include <layer_devel.h>
@@ -113,4 +113,4 @@ private:
 
 } // namespace nntrainer
 
-#endif /* __RMS_NORM_LAYER_H__ */
+#endif /* __NNTRAINER_RMS_NORM_LAYER_H__ */
