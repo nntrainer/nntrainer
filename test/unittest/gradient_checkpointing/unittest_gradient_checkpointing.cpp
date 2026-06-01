@@ -544,6 +544,72 @@ TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_correctness_01) {
     << "loss_ref=" << loss_ref << " loss_ckpt=" << loss_ckpt;
 }
 
+TEST(nntrainer_gradient_checkpointing,
+     gradient_checkpointing_stateful_layer_rejection_01) {
+  // BatchNormalization is stateful (updates running mean/var) and must be
+  // rejected at compile() when placed inside a checkpoint block.
+  std::unique_ptr<ml::train::Model> model;
+  std::unique_ptr<ml::train::Optimizer> optimizer;
+
+  EXPECT_NO_THROW(model = ml::train::createModel(
+                    ml::train::ModelType::NEURAL_NET, {"loss=mse"}));
+
+  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
+    "input", {"input_shape=1:1:8", "name=in"})));
+
+  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
+    "fully_connected", {"unit=8", "name=fc1"})));
+
+  EXPECT_NO_THROW(model->addLayer(
+    ml::train::createLayer("batch_normalization", {"name=bn1"})));
+
+  EXPECT_NO_THROW(model->addLayer(
+    ml::train::createLayer("fully_connected", {"unit=1", "name=fc2"})));
+
+  EXPECT_EQ(model->addCheckpointBlock({"fc1", "bn1", "fc2"}), ML_ERROR_NONE);
+
+  model->setProperty({"batch_size=4", "epochs=1"});
+
+  EXPECT_NO_THROW(
+    optimizer = ml::train::createOptimizer("sgd", {"learning_rate=0.01"}));
+  EXPECT_NO_THROW(model->setOptimizer(std::move(optimizer)));
+
+  EXPECT_THROW(model->compile(), std::invalid_argument);
+}
+
+TEST(nntrainer_gradient_checkpointing,
+     gradient_checkpointing_stateful_layer_rejection_02) {
+  // Dropout is stateful (RNG state changes on each forward) and must be
+  // rejected at compile() when placed inside a checkpoint block.
+  std::unique_ptr<ml::train::Model> model;
+  std::unique_ptr<ml::train::Optimizer> optimizer;
+
+  EXPECT_NO_THROW(model = ml::train::createModel(
+                    ml::train::ModelType::NEURAL_NET, {"loss=mse"}));
+
+  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
+    "input", {"input_shape=1:1:8", "name=in"})));
+
+  EXPECT_NO_THROW(model->addLayer(ml::train::createLayer(
+    "fully_connected", {"unit=8", "name=fc1"})));
+
+  EXPECT_NO_THROW(model->addLayer(
+    ml::train::createLayer("dropout", {"dropout_rate=0.5", "name=drop1"})));
+
+  EXPECT_NO_THROW(model->addLayer(
+    ml::train::createLayer("fully_connected", {"unit=1", "name=fc2"})));
+
+  EXPECT_EQ(model->addCheckpointBlock({"fc1", "drop1", "fc2"}), ML_ERROR_NONE);
+
+  model->setProperty({"batch_size=4", "epochs=1"});
+
+  EXPECT_NO_THROW(
+    optimizer = ml::train::createOptimizer("sgd", {"learning_rate=0.01"}));
+  EXPECT_NO_THROW(model->setOptimizer(std::move(optimizer)));
+
+  EXPECT_THROW(model->compile(), std::invalid_argument);
+}
+
 /**
  * @brief Main gtest
  */

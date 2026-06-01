@@ -544,6 +544,9 @@ void RunLayerContext::setBatch(unsigned int batch) {
   for (auto &vg : initial_outputs)
     if (vg)
       vg->setBatchSize(batch);
+  for (auto &vg : initial_tensors)
+    if (vg)
+      vg->setBatchSize(batch);
 }
 
 /**
