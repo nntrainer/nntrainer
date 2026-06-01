@@ -59,14 +59,14 @@ void LmHeadLayer::finalize(InitLayerContext &context) {
   bool is_nchw = (context.getFormat() == Tformat::NCHW);
 
   /** set output dimensions */
-  ///@note lm_head's output dimension (height is always 1 !)
+  ///@note lm_head's output dimension: width (or channel for NHWC) is vocab size; height follows input height
   auto const &in_dim = context.getInputDimensions()[0];
   output_dims[0] = in_dim;
   if (is_nchw)
     output_dims[0].width(unit);
   else
     output_dims[0].channel(unit);
-  output_dims[0].height(1);
+  output_dims[0].height(in_dim.height());
 
   output_dims[0].setTensorType(
     {context.getFormat(), context.getActivationDataType()});
