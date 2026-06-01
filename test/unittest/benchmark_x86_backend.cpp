@@ -429,6 +429,8 @@ class Bench_SoftmaxRow
 
 TEST_P(Bench_SoftmaxRow, softmax_row_inplace) {
   auto [num_rows, num_heads] = GetParam();
+  const unsigned int num_rows_v = num_rows;
+  const unsigned int num_heads_v = num_heads;
   const unsigned int N = num_rows * num_heads;
   std::string sz =
     "rows=" + std::to_string(num_rows) + ",heads=" + std::to_string(num_heads);
@@ -441,8 +443,8 @@ TEST_P(Bench_SoftmaxRow, softmax_row_inplace) {
       [&]() { std::copy(X_orig.begin(), X_orig.end(), X.begin()); },
       [&]() {
         nntrainer::softmax_row_inplace(X.data(), size_t{0},
-                                       static_cast<size_t>(num_rows),
-                                       static_cast<size_t>(num_heads));
+                                       static_cast<size_t>(num_rows_v),
+                                       static_cast<size_t>(num_heads_v));
       },
       g_bench_warmup, g_bench_iters);
 
@@ -490,6 +492,8 @@ class Bench_RmsNorm
 
 TEST_P(Bench_RmsNorm, rms_norm) {
   auto [H, W] = GetParam();
+  const unsigned int H_v = H;
+  const unsigned int W_v = W;
   const unsigned int N = H * W;
   float epsilon = 1e-6f;
   std::string sz = "H=" + std::to_string(H) + ",W=" + std::to_string(W);
@@ -500,8 +504,8 @@ TEST_P(Bench_RmsNorm, rms_norm) {
 
     auto stats = bench::measure(
       [&]() {
-        nntrainer::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y.data(), H, W,
-                                                     epsilon);
+        nntrainer::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y.data(), H_v,
+                                                     W_v, epsilon);
       },
       g_bench_warmup, g_bench_iters);
 
@@ -781,6 +785,10 @@ class Bench_KCache : public ::testing::TestWithParam<KCacheParams> {};
 
 TEST_P(Bench_KCache, compute_kcaches) {
   auto [seq_len, num_cache_head, gqa_size, tile_size] = GetParam();
+  const int seq_len_v = seq_len;
+  const int num_cache_head_v = num_cache_head;
+  const int gqa_size_v = gqa_size;
+  const int tile_size_v = tile_size;
   const int head_dim = kKCacheHeadDim;
   const int total_heads = num_cache_head * gqa_size;
   const size_t local_window_size = static_cast<size_t>(seq_len);
@@ -794,8 +802,8 @@ TEST_P(Bench_KCache, compute_kcaches) {
   auto stats = bench::measure(
     [&]() {
       nntrainer::compute_kcaches<uint16_t>(
-        in_f32.data(), kcache_u16.data(), output.data(), seq_len,
-        num_cache_head, head_dim, gqa_size, tile_size, local_window_size);
+        in_f32.data(), kcache_u16.data(), output.data(), seq_len_v,
+        num_cache_head_v, head_dim, gqa_size_v, tile_size_v, local_window_size);
     },
     g_bench_warmup, g_bench_iters);
 
@@ -817,6 +825,10 @@ class Bench_Attention : public ::testing::TestWithParam<AttnParams> {};
 
 TEST_P(Bench_Attention, compute_fp16vcache) {
   auto [head_dim, num_cache_head, gqa_size, window_size] = GetParam();
+  const int head_dim_v = head_dim;
+  const int num_cache_head_v = num_cache_head;
+  const int gqa_size_v = gqa_size;
+  const size_t window_size_v = window_size;
   int total_heads = num_cache_head * gqa_size;
   int row_num = static_cast<int>(window_size) - 1;
   const int attention_rows = row_num + 1;
@@ -831,7 +843,7 @@ TEST_P(Bench_Attention, compute_fp16vcache) {
     [&]() {
       nntrainer::compute_fp16vcache_fp32_transposed(
         row_num, in_f32.data(), vcache_u16.data(), output.data(),
-        num_cache_head, gqa_size, head_dim, window_size);
+        num_cache_head_v, gqa_size_v, head_dim_v, window_size_v);
     },
     g_bench_warmup, g_bench_iters);
 
