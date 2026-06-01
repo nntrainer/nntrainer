@@ -47,8 +47,8 @@ TEST(rms_norm_fallback_fp16, small_dimensions_4_8) {
   std::vector<_FP16> X(H * W), Y(H * W);
   for (size_t i = 0; i < H * W; ++i)
     X[i] = (_FP16)Xf[i];
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X.data(), Y.data(), H,
-                                                      W, epsilon);
+  nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X.data(), Y.data(), H, W,
+                                                      epsilon);
   std::vector<float> Yref(H * W);
   rms_norm_fp32_scalar(Xf.data(), Yref.data(), H, W, epsilon);
   for (size_t i = 0; i < H * W; ++i)
@@ -64,8 +64,8 @@ TEST(rms_norm_fallback_fp16, non_divisible_dimensions_5_13) {
   std::vector<_FP16> X(H * W), Y(H * W);
   for (size_t i = 0; i < H * W; ++i)
     X[i] = (_FP16)Xf[i];
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X.data(), Y.data(), H,
-                                                      W, epsilon);
+  nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X.data(), Y.data(), H, W,
+                                                      epsilon);
   std::vector<float> Yref(H * W);
   rms_norm_fp32_scalar(Xf.data(), Yref.data(), H, W, epsilon);
   for (size_t i = 0; i < H * W; ++i)
@@ -81,8 +81,8 @@ TEST(rms_norm_fallback_fp16, negative_values) {
   std::vector<_FP16> X(H * W), Y(H * W);
   for (size_t i = 0; i < H * W; ++i)
     X[i] = (_FP16)Xf[i];
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X.data(), Y.data(), H,
-                                                      W, epsilon);
+  nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X.data(), Y.data(), H, W,
+                                                      epsilon);
   std::vector<float> Yref(H * W);
   rms_norm_fp32_scalar(Xf.data(), Yref.data(), H, W, epsilon);
   for (size_t i = 0; i < H * W; ++i)
@@ -98,8 +98,8 @@ TEST(rms_norm_fallback_fp16, embedding_dimension_768) {
   std::vector<_FP16> X(H * W), Y(H * W);
   for (size_t i = 0; i < H * W; ++i)
     X[i] = (_FP16)Xf[i];
-  nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X.data(), Y.data(), H,
-                                                      W, epsilon);
+  nntrainer::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X.data(), Y.data(), H, W,
+                                                      epsilon);
   std::vector<float> Yref(H * W);
   rms_norm_fp32_scalar(Xf.data(), Yref.data(), H, W, epsilon);
   float max_err = 0.0f;
