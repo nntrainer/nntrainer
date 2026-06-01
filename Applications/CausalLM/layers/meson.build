@@ -13,8 +13,6 @@ causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_
 causallm_deberta_attention_src_abs = [meson.current_source_dir() / 'deberta_attention_layer.cpp']
 causallm_shared_fully_connected_src_abs = [meson.current_source_dir() / 'shared_fully_connected_layer.cpp']
 
-openmp_dep = dependency('openmp')
-
 causallm_swiglu = shared_library(
     'swiglu_layer',
     causallm_swiglu_src_abs,

@@ -101,6 +101,9 @@ public:
            std::to_string(values.size());
   };
 
+  /**
+   * @copydoc Layer::updateTensorsByInputDimensions
+   */
   void updateTensorsByInputDimensions(
     RunLayerContext &context, std::vector<TensorDim> input_dimensions) override;
 

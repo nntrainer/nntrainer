@@ -942,10 +942,8 @@ if __name__ == "__main__":
         def call(self, inputs):
             # Compute the mean of the squares of the inputs along the last dimension
             mean_square = tf.reduce_mean(tf.square(inputs), axis=[-1], keepdims=True)
-            print(mean_square)
             # Compute the RMS value with epsilon for numerical stability
             rms_value = tf.sqrt(mean_square + self.epsilon)
-            print(rms_value)
             # Normalize inputs and scale by gamma
             normalized_inputs = inputs / rms_value * self.gamma
             return normalized_inputs
@@ -968,10 +966,8 @@ if __name__ == "__main__":
         def call(self, inputs):
             # Compute the mean of the squares of the inputs along the last dimension
             mean_square = tf.reduce_mean(tf.square(inputs), axis=[-1], keepdims=True)
-            print(mean_square)
             # Compute the RMS value with epsilon for numerical stability
             rms_value = tf.sqrt(mean_square + self.epsilon)
-            print(rms_value)
             # Normalize inputs and scale by gamma
             normalized_inputs = inputs / rms_value * self.gamma
             return normalized_inputs
