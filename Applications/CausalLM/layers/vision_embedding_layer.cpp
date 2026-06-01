@@ -118,16 +118,14 @@ void VisionEmbeddingLayer::forwarding(nntrainer::RunLayerContext &context,
 
     size_t image_start_token_idx = 0;
 
-#pragma omp parallel for
-    for (int i = 0; i < tokens.width(); ++i) {
+    for (int i = 0; i < (int)tokens.width(); ++i) {
       size_t embed_idx = static_cast<size_t>(tokens_data[i]);
       if (embed_idx == image_start_token) {
         image_start_token_idx = i;
       }
     }
 
-#pragma omp parallel for
-    for (int i = 0; i < tokens.width(); ++i) {
+    for (int i = 0; i < (int)tokens.width(); ++i) {
       size_t embed_idx = static_cast<size_t>(tokens_data[i]);
       if (embed_idx >= in_dim) {
         throw std::invalid_argument("input word index is greater than in_dim");
@@ -190,8 +188,6 @@ void VisionEmbeddingLayer::incremental_forwarding(
     std::get<nntrainer::props::Scale>(vision_embedding_props).empty()
       ? 1.0f
       : std::get<nntrainer::props::Scale>(vision_embedding_props).get();
-  unsigned int _from = from;
-
   nntrainer::Tensor &weight = context.getWeight(weight_idx);
   nntrainer::Tensor &hidden_ = context.getOutput(OUT_IDX);
   nntrainer::Tensor &tokens = context.getInput(TOKEN_IDX);
@@ -213,25 +209,24 @@ void VisionEmbeddingLayer::incremental_forwarding(
 
     size_t image_start_token_idx = 0;
 
-#pragma omp parallel for
-    for (int i = 0; i < tokens.width(); ++i) {
+    for (int i = 0; i < (int)tokens.width(); ++i) {
       size_t embed_idx = static_cast<size_t>(tokens_data[i]);
       if (embed_idx == image_start_token) {
         image_start_token_idx = i;
       }
     }
 
-#pragma omp parallel for
     for (int i = 0; i < iter; ++i) {
-      size_t embed_idx = static_cast<size_t>(tokens_data[i]);
+      size_t embed_idx = static_cast<size_t>(tokens_data[from + i]);
       if (embed_idx >= in_dim) {
         throw std::invalid_argument("input word index is greater than in_dim");
       }
 
+      unsigned int out_slot = from + i;
       nntrainer::Tensor out_tensor = batchsliced_hidden.getSharedDataTensor(
-        out_token_dim, i <= image_start_token_idx
-                         ? i * out_dim
-                         : (i + image.height()) * out_dim);
+        out_token_dim, out_slot <= image_start_token_idx
+                         ? out_slot * out_dim
+                         : (out_slot + image.height()) * out_dim);
       nntrainer::Tensor cur_weight =
         weight.getSharedDataTensor(out_token_dim, out_dim * embed_idx);
 
@@ -260,7 +255,7 @@ void VisionEmbeddingLayer::incremental_forwarding(
       if (embed_idx == image_start_token) {
         nntrainer::Tensor out_image_tensor =
           batchsliced_hidden.getSharedDataTensor(out_image_dim,
-                                                 (i + 1) * out_dim);
+                                                 (out_slot + 1) * out_dim);
         out_image_tensor.copyData(image);
 
         if (scale != 1.0f) {
@@ -288,7 +283,8 @@ void VisionEmbeddingLayer::save(std::ofstream &file,
                                 nntrainer::RunLayerContext &run_context,
                                 bool opt_var, ml::train::ExecutionMode mode,
                                 bool trainable,
-                                nntrainer::TensorDim::DataType dtype) const {
+                                nntrainer::TensorDim::DataType dtype,
+                                ml::train::ISA target_isa) const {
   // @note shared weights are only be saved at the first access
   for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
     if (run_context.isGradientFirstAccess(i)) {

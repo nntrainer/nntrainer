@@ -97,7 +97,7 @@ causallm_vision_embedding_layer = shared_library(
     'vision_embedding_layer',
     causallm_vision_embedding_src_abs,
     include_directories: causallm_layer_inc,
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, openmp_dep],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
     install_dir: application_install_dir
 )

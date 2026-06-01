@@ -135,7 +135,9 @@ public:
                        nntrainer::RunLayerContext &run_context, bool opt_var,
                        ml::train::ExecutionMode mode, bool trainable,
                        nntrainer::TensorDim::DataType dtype =
-                         nntrainer::TensorDim::DataType::NONE) const override;
+                         nntrainer::TensorDim::DataType::NONE,
+                       ml::train::ISA target_isa =
+                         ml::train::ISA::DEFAULT) const override;
 
   WIN_EXPORT void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,
@@ -152,4 +154,4 @@ private:
 } // namespace causallm
 
 #endif /* __cplusplus */
-#endif /* __VISION_EMBEDDING_H__ */
+#endif /* __VISION_EMBEDDING_LAYER_H__ */
