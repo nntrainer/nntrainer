@@ -79,7 +79,7 @@
 #define _nnt_ATTR_ALWAYS_INLINE [[gnu::always_inline]]
 #endif
 
-#if __has_cpp_attribute(unikely)
+#if __has_cpp_attribute(unlikely)
 #define UNLIKELY [[unlikely]]
 #else
 #define UNLIKELY
