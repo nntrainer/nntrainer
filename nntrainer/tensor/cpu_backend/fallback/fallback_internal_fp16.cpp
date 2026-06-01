@@ -485,12 +485,17 @@ void __fallback_gemm_q6_K(const unsigned int M, const unsigned int N,
   throw std::runtime_error("NYI : __fallback_gemm_q6_K");
 }
 
-static inline __fp16 hsumv_f16(float16x4_t v) {
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+
+static inline float hsumv_f16(float16x4_t v) {
   return vaddvq_f32(vcvt_f32_f16(v));
 }
 
-static inline __fp16 hsumvq_f16(float16x8_t v) {
-  return vaddvq_f32(vaddq_f32(vcvt_f32_f16(vget_low_f16(v)), vcvt_f32_f16(vget_high_f16(v))));
+static inline float hsumvq_f16(float16x8_t v) {
+  float32x4_t lo = vcvt_f32_f16(vget_low_f16(v));
+  float32x4_t hi = vcvt_f32_f16(vget_high_f16(v));
+  return vaddvq_f32(vaddq_f32(lo, hi));
 }
 
 template <>
@@ -546,6 +551,15 @@ void __fallback_rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
     }
   }
 }
+#else
+template <>
+void __fallback_rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
+                                                  _FP16 *__restrict Y, size_t H,
+                                                  size_t W, float epsilon) {
+  throw std::runtime_error(
+    "NYI : __fallback_rms_norm_wrt_width_fp16_intrinsic");
+}
+#endif // __ARM_NEON
 
 template <>
 void __fallback_clamp(const _FP16 *input, _FP16 *output, size_t length,
