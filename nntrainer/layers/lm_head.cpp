@@ -107,13 +107,17 @@ void LmHeadLayer::setProperty(const std::vector<std::string> &values) {
 }
 
 void LmHeadLayer::forwarding(RunLayerContext &context, bool training) {
+  Tensor &weight = context.getWeight(weight_idx[LmHeadParams::weight]);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-  unsigned int height = input_.getDim().height();
+  Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
 
-  // Process the full sequence by calling incremental_forwarding once with
-  // from=0 and to=height. This unifies the implementation and ensures
-  // training/inference consistency.
-  incremental_forwarding(context, 0, height, training);
+  input_.dot(weight, hidden_, false, false);
+
+  if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
+      disable_bias.empty() || disable_bias.get() == false) {
+    Tensor &bias = context.getWeight(weight_idx[LmHeadParams::bias]);
+    hidden_.add_i(bias);
+  }
 }
 
 void LmHeadLayer::incremental_forwarding(RunLayerContext &context,
@@ -170,18 +174,19 @@ void LmHeadLayer::calcGradient(RunLayerContext &context) {
   const Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
   Tensor &dweight = context.getWeightGrad(weight_idx[LmHeadParams::weight]);
 
-  // dweight = in^T . dy
-  in.dot(dy, dweight, true, false);
+  // dweight = in^T . dy  (accumulate correctly across multiple backward passes)
+  in.dot_deriv_wrt_2(dweight, dy, false, false,
+                     !context.isGradientFirstAccess(weight_idx[LmHeadParams::weight]));
 
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &dbias = context.getWeightGrad(weight_idx[LmHeadParams::bias]);
-    dbias.setZero();
-
-    // Use dtype-safe tensor operations for bias gradient accumulation
-    // Sum over all dimensions except the last (width/unit dimension)
-    Tensor dy_sum = dy.sum({0, 1, 2});
-    dbias.add_i(dy_sum);
+    if (context.isGradientFirstAccess(weight_idx[LmHeadParams::bias])) {
+      dy.sum({0, 1, 2}, dbias);
+    } else {
+      Tensor t = dy.sum({0, 1, 2});
+      dbias.add_i(t);
+    }
   }
 }
 
@@ -194,12 +199,14 @@ void LmHeadLayer::exportTo(Exporter &exporter,
 void LmHeadLayer::updateTensorsByInputDimensions(
   RunLayerContext &context, std::vector<TensorDim> input_dimensions) {
   TensorDim in_dim = context.getInput(SINGLE_INOUT_IDX).getDim();
-
   unsigned int height = input_dimensions[0].height();
 
-  // output dim's height is always 1 !
   in_dim.height(height);
   context.updateInput(SINGLE_INOUT_IDX, in_dim);
+
+  TensorDim out_dim = context.getOutput(SINGLE_INOUT_IDX).getDim();
+  out_dim.height(height);
+  context.updateOutput(SINGLE_INOUT_IDX, out_dim);
 }
 
 #ifdef PLUGGABLE
