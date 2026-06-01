@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * Copyright (C) 2023 Seungbaek Hong <sb92.hong@samsung.com>
+ * Copyright (C) 2024 Niket Agarwal <niket.a@samsung.com>
  *
- * @file   custom_rms_norm.cpp
- * @date   19 July 2023
- * @brief  Implementation of custom RMS normalization function
+ * @file   reshaped_rms_norm.cpp
+ * @date   25 November 2024
+ * @brief  Implementation of ReshapedRMSNorm layer
  * @see    https://github.com/nntrainer/nntrainer
- * @author Seungbaek Hong <sb92.hong@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  */
 
 #include <cmath>
+#ifdef DEBUG
 #include <iostream>
+#endif
 
-#include "reshaped_rms_norm.h"
+#include <reshaped_rms_norm.h>
 
 namespace nntrainer {
 
