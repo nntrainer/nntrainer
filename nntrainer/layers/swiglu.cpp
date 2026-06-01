@@ -63,10 +63,10 @@ void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
     for (unsigned int b = 0; b < in1.batch(); b++) {
       for (unsigned int c = 0; c < in1.channel(); c++) {
         for (unsigned int h = 0; h < iter; h++) {
-          nntrainer::swiglu(in1.width(),
-                            out.getData<float>() + out.getIndex(b, c, from + h, 0),
-                            in1.getData<float>() + in1.getIndex(b, c, from + h, 0),
-                            in2.getData<float>() + in2.getIndex(b, c, from + h, 0));
+          nntrainer::swiglu(
+            in1.width(), out.getData<float>() + out.getIndex(b, c, from + h, 0),
+            in1.getData<float>() + in1.getIndex(b, c, from + h, 0),
+            in2.getData<float>() + in2.getIndex(b, c, from + h, 0));
         }
       }
     }
@@ -75,10 +75,10 @@ void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
     for (unsigned int b = 0; b < in1.batch(); b++) {
       for (unsigned int c = 0; c < in1.channel(); c++) {
         for (unsigned int h = 0; h < iter; h++) {
-          nntrainer::swiglu(in1.width(),
-                            out.getData<_FP16>() + out.getIndex(b, c, from + h, 0),
-                            in1.getData<_FP16>() + in1.getIndex(b, c, from + h, 0),
-                            in2.getData<_FP16>() + in2.getIndex(b, c, from + h, 0));
+          nntrainer::swiglu(
+            in1.width(), out.getData<_FP16>() + out.getIndex(b, c, from + h, 0),
+            in1.getData<_FP16>() + in1.getIndex(b, c, from + h, 0),
+            in2.getData<_FP16>() + in2.getIndex(b, c, from + h, 0));
         }
       }
     }
