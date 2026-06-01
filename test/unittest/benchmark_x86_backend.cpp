@@ -453,7 +453,7 @@ TEST_P(Bench_SoftmaxRow, softmax_row_inplace) {
     bench::report("softmax_row_inplace", "FP32", sz, stats, m);
   }
 
-#ifdef ENABLE_FP16
+#if defined(ENABLE_FP16) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
   {
     auto X_orig = convert_f32_to_f16_u16(generate_random_vector<float>(N));
     auto X = X_orig;
@@ -461,10 +461,9 @@ TEST_P(Bench_SoftmaxRow, softmax_row_inplace) {
     auto stats = bench::measure_with_setup(
       [&]() { X = X_orig; },
       [&]() {
-        nntrainer::softmax_row_inplace((_FP16 *)X.data(), size_t{0},
-                                       static_cast<size_t>(num_rows_v),
-                                       static_cast<size_t>(num_heads_v),
-                                       static_cast<_FP16 *>(nullptr));
+        nntrainer::softmax_row_inplace(
+          (_FP16 *)X.data(), size_t{0}, static_cast<size_t>(num_rows_v),
+          static_cast<size_t>(num_heads_v), static_cast<_FP16 *>(nullptr));
       },
       g_bench_warmup, g_bench_iters);
 
@@ -648,11 +647,11 @@ class Bench_X86_FP16_HGEMM : public ::testing::TestWithParam<HgemmParams> {};
 
 TEST_P(Bench_X86_FP16_HGEMM, via_sgemm_dispatch) {
   auto [M, N, K, TransA, TransB] = GetParam();
-  const unsigned int M_v     = M;
-  const unsigned int N_v     = N;
-  const unsigned int K_v     = K;
-  const bool         TransA_v = TransA;
-  const bool         TransB_v = TransB;
+  const unsigned int M_v = M;
+  const unsigned int N_v = N;
+  const unsigned int K_v = K;
+  const bool TransA_v = TransA;
+  const bool TransB_v = TransB;
   const unsigned int lda = TransA ? M : K;
   const unsigned int ldb = TransB ? K : N;
   const unsigned int ldc = N;
@@ -879,10 +878,10 @@ class Bench_KCache_FP16 : public ::testing::TestWithParam<KCacheParams> {};
 
 TEST_P(Bench_KCache_FP16, compute_kcaches) {
   auto [seq_len, num_cache_head, gqa_size, tile_size] = GetParam();
-  const int seq_len_v        = seq_len;
+  const int seq_len_v = seq_len;
   const int num_cache_head_v = num_cache_head;
-  const int gqa_size_v       = gqa_size;
-  const int tile_size_v      = tile_size;
+  const int gqa_size_v = gqa_size;
+  const int tile_size_v = tile_size;
   const int head_dim = kKCacheHeadDim;
   const int total_heads = num_cache_head * gqa_size;
   const size_t local_window_size = static_cast<size_t>(seq_len);
@@ -920,10 +919,10 @@ class Bench_Attention_FP16 : public ::testing::TestWithParam<AttnParams> {};
 
 TEST_P(Bench_Attention_FP16, compute_fp16vcache_transposed) {
   auto [head_dim, num_cache_head, gqa_size, window_size] = GetParam();
-  const int    head_dim_v       = head_dim;
-  const int    num_cache_head_v = num_cache_head;
-  const int    gqa_size_v       = gqa_size;
-  const size_t window_size_v    = window_size;
+  const int head_dim_v = head_dim;
+  const int num_cache_head_v = num_cache_head;
+  const int gqa_size_v = gqa_size;
+  const size_t window_size_v = window_size;
   int total_heads = num_cache_head * gqa_size;
   int row_num = static_cast<int>(window_size) - 1;
   const int attention_rows = row_num + 1;
