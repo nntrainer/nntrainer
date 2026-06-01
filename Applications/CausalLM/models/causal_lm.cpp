@@ -174,7 +174,7 @@ void CausalLM::setKVCachePosition(unsigned int pos) {
   kv_cache.setPosition(pos);
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [pos](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
-      if (l.getType() == causallm::MHACoreLayer::type)
+      if (l.getType() == nntrainer::MHACoreLayer::type)
         l.setProperty({"cache_index=" + std::to_string(pos)});
     };
   model->forEachLayer(fn, nullptr);

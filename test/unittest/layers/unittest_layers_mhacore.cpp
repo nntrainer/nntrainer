@@ -13,11 +13,11 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../Applications/CausalLM/layers/mha_core.h"
+#include <mha_core.h>
 #include <layers_common_tests.h>
 
 auto causallm_mhacore_golden = LayerGoldenTestParamType(
-  nntrainer::createLayer<causallm::MHACoreLayer>,
+  nntrainer::createLayer<nntrainer::MHACoreLayer>,
   {"num_heads=4", "num_heads_kv=2", "max_timestep=16", "is_causal=true",
    "rope_theta=10000", "max_position_embeddings=128"},
   "2:1:4:32,2:1:4:16,2:1:4:16", "causallm_mhacore.nnlayergolden",

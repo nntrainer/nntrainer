@@ -210,7 +210,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/embedding_layer.cpp \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
-    ../layers/mha_core.cpp \
+    $(LOCAL_PATH)/../../../nntrainer/layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/rms_norm.cpp \

@@ -44,7 +44,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace causallm {
+namespace nntrainer {
 
 namespace props {
 
@@ -496,6 +496,6 @@ private:
   size_t calc_attn_index(size_t i);
 
 }; // end of class MHACoreLayer
-} // namespace causallm
+} // namespace nntrainer
 
 #endif

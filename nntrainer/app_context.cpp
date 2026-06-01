@@ -388,8 +388,8 @@ void AppContext::add_default_object() {
   registerFactory(nntrainer::createLayer<MultiHeadAttentionLayer>,
                   MultiHeadAttentionLayer::type,
                   LayerType::LAYER_MULTI_HEAD_ATTENTION);
-  registerFactory(nntrainer::createLayer<causallm::MHACoreLayer>,
-                  causallm::MHACoreLayer::type,
+  registerFactory(nntrainer::createLayer<nntrainer::MHACoreLayer>,
+                  nntrainer::MHACoreLayer::type,
                   LayerType::LAYER_CUSTOM_MHA_CORE);
   registerFactory(nntrainer::createLayer<ReduceMeanLayer>,
                   ReduceMeanLayer::type, LayerType::LAYER_REDUCE_MEAN);

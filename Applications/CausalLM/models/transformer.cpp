@@ -503,7 +503,7 @@ void Transformer::registerCustomLayers() {
     app_context->registerFactory(
       nntrainer::createLayer<causallm::RMSNormLayer>);
     app_context->registerFactory(
-      nntrainer::createLayer<causallm::MHACoreLayer>);
+      nntrainer::createLayer<nntrainer::MHACoreLayer>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::TieWordEmbedding>);
     app_context->registerFactory(
