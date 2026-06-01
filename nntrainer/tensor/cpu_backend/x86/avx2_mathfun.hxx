@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /**
  * @file   avx2_mathfun.hxx
  * @date   03 Apr 2026
