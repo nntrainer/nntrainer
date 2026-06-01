@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2023 Donghyeon Jeong <dhyeon.jeong@samsung.com>
  *
- * @file   avx2_impl.cpp
+ * @file   avx2_impl_fp16.cpp
  * @date   20 Feb 2024
  * @see    https://github.com/nntrainer/nntrainer
  * @author Donghyeon Jeong <dhyeon.jeong@samsung.com>
