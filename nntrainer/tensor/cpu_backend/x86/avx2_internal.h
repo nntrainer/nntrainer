@@ -158,7 +158,8 @@ struct Exp2Table {
 };
 
 #if !__has_constexpr_builtin(__builtin_exp2) || !(__cpp_consteval >= 201811L)
-/** @brief Exp2 lookup table explicit specialization for 8-entry float table on platforms lacking consteval */
+/** @brief Exp2 lookup table explicit specialization for 8-entry float table on
+ * platforms lacking consteval */
 template <> struct Exp2Table<8, uint32_t, float> {
   [[nodiscard]] static constexpr auto calculate() noexcept {
     std::array<uint32_t, 8> t = {0x3f800000U, 0x3f7b95c2U, 0x3f7837f0U,

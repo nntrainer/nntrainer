@@ -12,8 +12,8 @@
  *
  */
 
-#include <avx2_impl.h>
 #include "avx2_internal.h"
+#include <avx2_impl.h>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -209,7 +209,8 @@ void ele_mul(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         __m256 z_hi = _mm256_mul_ps(x_hi, vy);
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -233,7 +234,8 @@ void ele_mul(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         __m256 z_hi = _mm256_mul_ps(x_hi, y_hi);
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -275,7 +277,8 @@ void ele_mul(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         }
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -308,7 +311,8 @@ void ele_mul(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         }
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -327,7 +331,8 @@ void ele_mul(const unsigned int N, const _Float16 *X, const _Float16 *Y,
     for (; i < N; ++i) {
       float xf = static_cast<float>(X[i]);
       float yf = static_cast<float>(Y[i * i_stride]);
-      float zf = xf * alpha * yf + ((0.0f == beta) ? 0.0f : beta * static_cast<float>(Z[i]));
+      float zf = xf * alpha * yf +
+                 ((0.0f == beta) ? 0.0f : beta * static_cast<float>(Z[i]));
       Z[i] = static_cast<_Float16>(zf);
     }
   } else {
@@ -359,7 +364,8 @@ void ele_add(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         __m256 z_hi = _mm256_add_ps(x_hi, vy);
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -384,7 +390,8 @@ void ele_add(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         __m256 z_hi = _mm256_add_ps(x_hi, y_hi);
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -426,7 +433,8 @@ void ele_add(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         }
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -459,7 +467,8 @@ void ele_add(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         }
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -478,16 +487,16 @@ void ele_add(const unsigned int N, const _Float16 *X, const _Float16 *Y,
     for (; i < N; ++i) {
       float xf = static_cast<float>(X[i]);
       float yf = static_cast<float>(Y[i * i_stride]);
-      float zf = xf + alpha * yf + ((0.0f == beta) ? 0.0f : beta * static_cast<float>(Z[i]));
+      float zf = xf + alpha * yf +
+                 ((0.0f == beta) ? 0.0f : beta * static_cast<float>(Z[i]));
       Z[i] = static_cast<_Float16>(zf);
     }
   } else {
     for (unsigned int i = 0; i < N; ++i) {
       float xf = static_cast<float>(*X);
       float yf = static_cast<float>(*Y);
-      float zf =
-        xf + alpha * yf +
-        ((0.0f == beta) ? 0.0f : beta * static_cast<float>(*Z));
+      float zf = xf + alpha * yf +
+                 ((0.0f == beta) ? 0.0f : beta * static_cast<float>(*Z));
       *Z = static_cast<_Float16>(zf);
       X += o_stride;
       Y += i_stride;
@@ -511,7 +520,8 @@ void ele_sub(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         __m256 z_hi = _mm256_sub_ps(x_hi, vy);
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -536,7 +546,8 @@ void ele_sub(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         __m256 z_hi = _mm256_sub_ps(x_hi, y_hi);
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -578,7 +589,8 @@ void ele_sub(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         }
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -611,7 +623,8 @@ void ele_sub(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         }
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -630,16 +643,16 @@ void ele_sub(const unsigned int N, const _Float16 *X, const _Float16 *Y,
     for (; i < N; ++i) {
       float xf = static_cast<float>(X[i]);
       float yf = static_cast<float>(Y[i * i_stride]);
-      float zf = xf - alpha * yf + ((0.0f == beta) ? 0.0f : beta * static_cast<float>(Z[i]));
+      float zf = xf - alpha * yf +
+                 ((0.0f == beta) ? 0.0f : beta * static_cast<float>(Z[i]));
       Z[i] = static_cast<_Float16>(zf);
     }
   } else {
     for (unsigned int i = 0; i < N; ++i) {
       float xf = static_cast<float>(*X);
       float yf = static_cast<float>(*Y);
-      float zf =
-        xf - alpha * yf +
-        ((0.0f == beta) ? 0.0f : beta * static_cast<float>(*Z));
+      float zf = xf - alpha * yf +
+                 ((0.0f == beta) ? 0.0f : beta * static_cast<float>(*Z));
       *Z = static_cast<_Float16>(zf);
       X += o_stride;
       Y += i_stride;
@@ -660,7 +673,8 @@ void ele_div(const unsigned int N, const _Float16 *X, const _Float16 *Y,
       // Precompute refined reciprocal of Y[0] once (rcp + Newton-Raphson)
       __m256 vy = _mm256_set1_ps(static_cast<float>(Y[0]));
       __m256 rcp_est = _mm256_rcp_ps(vy);
-      __m256 vy_inv = _mm256_mul_ps(rcp_est, _mm256_fnmadd_ps(vy, rcp_est, two));
+      __m256 vy_inv =
+        _mm256_mul_ps(rcp_est, _mm256_fnmadd_ps(vy, rcp_est, two));
 
       for (; i + 16 <= N; i += 16) {
         __m256i xd = _mm256_loadu_si256((const __m256i *)(X + i));
@@ -670,7 +684,8 @@ void ele_div(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         __m256 z_hi = _mm256_mul_ps(x_hi, vy_inv);
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -693,14 +708,17 @@ void ele_div(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         __m256 y_hi = _mm256_cvtph_ps(_mm256_extracti128_si256(yd, 1));
         // rcp + Newton-Raphson for per-element reciprocal
         __m256 rcp_lo = _mm256_rcp_ps(y_lo);
-        __m256 inv_lo = _mm256_mul_ps(rcp_lo, _mm256_fnmadd_ps(y_lo, rcp_lo, two));
+        __m256 inv_lo =
+          _mm256_mul_ps(rcp_lo, _mm256_fnmadd_ps(y_lo, rcp_lo, two));
         __m256 rcp_hi = _mm256_rcp_ps(y_hi);
-        __m256 inv_hi = _mm256_mul_ps(rcp_hi, _mm256_fnmadd_ps(y_hi, rcp_hi, two));
+        __m256 inv_hi =
+          _mm256_mul_ps(rcp_hi, _mm256_fnmadd_ps(y_hi, rcp_hi, two));
         __m256 z_lo = _mm256_mul_ps(x_lo, inv_lo);
         __m256 z_hi = _mm256_mul_ps(x_hi, inv_hi);
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -729,7 +747,8 @@ void ele_div(const unsigned int N, const _Float16 *X, const _Float16 *Y,
 
     if (i_stride == 0) {
       // Precompute refined reciprocal of (alpha * Y[0])
-      __m256 denom = _mm256_mul_ps(alpha_v, _mm256_set1_ps(static_cast<float>(Y[0])));
+      __m256 denom =
+        _mm256_mul_ps(alpha_v, _mm256_set1_ps(static_cast<float>(Y[0])));
       __m256 rcp_d = _mm256_rcp_ps(denom);
       __m256 inv_d = _mm256_mul_ps(rcp_d, _mm256_fnmadd_ps(denom, rcp_d, two));
 
@@ -748,7 +767,8 @@ void ele_div(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         }
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -774,9 +794,11 @@ void ele_div(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         __m256 d_hi = _mm256_mul_ps(alpha_v, y_hi);
         // rcp + Newton-Raphson for per-element reciprocal
         __m256 rcp_lo = _mm256_rcp_ps(d_lo);
-        __m256 inv_lo = _mm256_mul_ps(rcp_lo, _mm256_fnmadd_ps(d_lo, rcp_lo, two));
+        __m256 inv_lo =
+          _mm256_mul_ps(rcp_lo, _mm256_fnmadd_ps(d_lo, rcp_lo, two));
         __m256 rcp_hi = _mm256_rcp_ps(d_hi);
-        __m256 inv_hi = _mm256_mul_ps(rcp_hi, _mm256_fnmadd_ps(d_hi, rcp_hi, two));
+        __m256 inv_hi =
+          _mm256_mul_ps(rcp_hi, _mm256_fnmadd_ps(d_hi, rcp_hi, two));
         __m256 z_lo = _mm256_mul_ps(x_lo, inv_lo);
         __m256 z_hi = _mm256_mul_ps(x_hi, inv_hi);
         if (beta != 0.0f) {
@@ -788,7 +810,8 @@ void ele_div(const unsigned int N, const _Float16 *X, const _Float16 *Y,
         }
         __m128i r_lo = _mm256_cvtps_ph(z_lo, _MM_FROUND_TO_NEAREST_INT);
         __m128i r_hi = _mm256_cvtps_ph(z_hi, _MM_FROUND_TO_NEAREST_INT);
-        _mm256_storeu_si256((__m256i *)(Z + i),
+        _mm256_storeu_si256(
+          (__m256i *)(Z + i),
           _mm256_inserti128_si256(_mm256_castsi128_si256(r_lo), r_hi, 1));
       }
       for (; i + 8 <= N; i += 8) {
@@ -810,7 +833,8 @@ void ele_div(const unsigned int N, const _Float16 *X, const _Float16 *Y,
     for (; i < N; ++i) {
       float xf = static_cast<float>(X[i]);
       float yf = static_cast<float>(Y[i * i_stride]);
-      float zf = xf / (alpha * yf) + ((0.0f == beta) ? 0.0f : beta * static_cast<float>(Z[i]));
+      float zf = xf / (alpha * yf) +
+                 ((0.0f == beta) ? 0.0f : beta * static_cast<float>(Z[i]));
       Z[i] = static_cast<_Float16>(zf);
     }
   } else {
@@ -858,8 +882,8 @@ void saxpy(const unsigned int N, const float alpha, const _Float16 *X,
 
       __m128i out_lo = _mm256_cvtps_ph(r0, _MM_FROUND_TO_NEAREST_INT);
       __m128i out_hi = _mm256_cvtps_ph(r1, _MM_FROUND_TO_NEAREST_INT);
-      __m256i out = _mm256_inserti128_si256(_mm256_castsi128_si256(out_lo),
-                                           out_hi, 1);
+      __m256i out =
+        _mm256_inserti128_si256(_mm256_castsi128_si256(out_lo), out_hi, 1);
       _mm256_storeu_si256((__m256i *)(Y + i), out);
     }
 
@@ -880,9 +904,9 @@ void saxpy(const unsigned int N, const float alpha, const _Float16 *X,
     }
   } else {
     for (unsigned int i = 0; i < N; ++i) {
-      Y[i * incY] = static_cast<_Float16>(
-        static_cast<float>(Y[i * incY]) +
-        alpha * static_cast<float>(X[i * incX]));
+      Y[i * incY] =
+        static_cast<_Float16>(static_cast<float>(Y[i * incY]) +
+                              alpha * static_cast<float>(X[i * incX]));
     }
   }
 }
@@ -1006,8 +1030,8 @@ void sscal(const unsigned int N, const float alpha, _Float16 *X,
 
       __m128i out_lo = _mm256_cvtps_ph(r0, _MM_FROUND_TO_NEAREST_INT);
       __m128i out_hi = _mm256_cvtps_ph(r1, _MM_FROUND_TO_NEAREST_INT);
-      __m256i out = _mm256_inserti128_si256(_mm256_castsi128_si256(out_lo),
-                                           out_hi, 1);
+      __m256i out =
+        _mm256_inserti128_si256(_mm256_castsi128_si256(out_lo), out_hi, 1);
       _mm256_storeu_si256((__m256i *)(X + i), out);
     }
 
@@ -1026,7 +1050,8 @@ void sscal(const unsigned int N, const float alpha, _Float16 *X,
     }
   } else {
     for (unsigned int i = 0; i < N; ++i) {
-      X[i * incX] = static_cast<_Float16>(alpha * static_cast<float>(X[i * incX]));
+      X[i * incX] =
+        static_cast<_Float16>(alpha * static_cast<float>(X[i * incX]));
     }
   }
 }
@@ -1038,8 +1063,7 @@ void custom_scopy(const unsigned int N, const _Float16 *X,
     unsigned int i = 0;
     unsigned int N16 = (N & ~15u);
     for (; i < N16; i += 16) {
-      __m256i data =
-        _mm256_loadu_si256((const __m256i *)(X + i));
+      __m256i data = _mm256_loadu_si256((const __m256i *)(X + i));
       _mm256_storeu_si256((__m256i *)(Y + i), data);
     }
     for (; i < N; ++i) {
@@ -1115,7 +1139,8 @@ void softmax(const unsigned int N, _Float16 *X, _Float16 *Y) {
     __m256 e1 = exp256_ps(_mm256_sub_ps(x1, vmax));
     __m128i out_lo = _mm256_cvtps_ph(e0, _MM_FROUND_TO_NEAREST_INT);
     __m128i out_hi = _mm256_cvtps_ph(e1, _MM_FROUND_TO_NEAREST_INT);
-    _mm256_storeu_si256((__m256i *)(Y + i),
+    _mm256_storeu_si256(
+      (__m256i *)(Y + i),
       _mm256_inserti128_si256(_mm256_castsi128_si256(out_lo), out_hi, 1));
     vsum0 = _mm256_add_ps(vsum0, e0);
     vsum1 = _mm256_add_ps(vsum1, e1);
@@ -1151,7 +1176,8 @@ void softmax(const unsigned int N, _Float16 *X, _Float16 *Y) {
     __m256 r1 = _mm256_mul_ps(y1, vinv);
     __m128i out_lo = _mm256_cvtps_ph(r0, _MM_FROUND_TO_NEAREST_INT);
     __m128i out_hi = _mm256_cvtps_ph(r1, _MM_FROUND_TO_NEAREST_INT);
-    _mm256_storeu_si256((__m256i *)(Y + i),
+    _mm256_storeu_si256(
+      (__m256i *)(Y + i),
       _mm256_inserti128_si256(_mm256_castsi128_si256(out_lo), out_hi, 1));
   }
   if (i + 8 <= N) {
@@ -1190,15 +1216,18 @@ void inv_sqrt_inplace(const unsigned int N, _Float16 *X) {
     __m256 half_x1 = _mm256_mul_ps(half, x1);
     __m256 yy0 = _mm256_mul_ps(est0, est0);
     __m256 yy1 = _mm256_mul_ps(est1, est1);
-    __m256 ref0 = _mm256_mul_ps(est0, _mm256_fnmadd_ps(half_x0, yy0, three_half));
-    __m256 ref1 = _mm256_mul_ps(est1, _mm256_fnmadd_ps(half_x1, yy1, three_half));
+    __m256 ref0 =
+      _mm256_mul_ps(est0, _mm256_fnmadd_ps(half_x0, yy0, three_half));
+    __m256 ref1 =
+      _mm256_mul_ps(est1, _mm256_fnmadd_ps(half_x1, yy1, three_half));
 
     ref0 = _mm256_blendv_ps(ref0, inf_val, is_zero0);
     ref1 = _mm256_blendv_ps(ref1, inf_val, is_zero1);
 
     __m128i out_lo = _mm256_cvtps_ph(ref0, _MM_FROUND_TO_NEAREST_INT);
     __m128i out_hi = _mm256_cvtps_ph(ref1, _MM_FROUND_TO_NEAREST_INT);
-    _mm256_storeu_si256((__m256i *)(X + i),
+    _mm256_storeu_si256(
+      (__m256i *)(X + i),
       _mm256_inserti128_si256(_mm256_castsi128_si256(out_lo), out_hi, 1));
   }
 
@@ -1209,7 +1238,8 @@ void inv_sqrt_inplace(const unsigned int N, _Float16 *X) {
     __m256 est = _mm256_rsqrt_ps(x);
     __m256 half_x = _mm256_mul_ps(half, x);
     __m256 yy = _mm256_mul_ps(est, est);
-    __m256 refined = _mm256_mul_ps(est, _mm256_fnmadd_ps(half_x, yy, three_half));
+    __m256 refined =
+      _mm256_mul_ps(est, _mm256_fnmadd_ps(half_x, yy, three_half));
     refined = _mm256_blendv_ps(refined, inf_val, is_zero);
     _mm_storeu_si128((__m128i *)(X + i),
                      _mm256_cvtps_ph(refined, _MM_FROUND_TO_NEAREST_INT));
@@ -1238,11 +1268,12 @@ void swiglu(const unsigned int N, _Float16 *X, _Float16 *Y, _Float16 *Z) {
     __m256 z0 = _mm256_cvtph_ps(_mm256_castsi256_si128(z_raw));
     __m256 z1 = _mm256_cvtph_ps(_mm256_extracti128_si256(z_raw, 1));
 
-    __m128i out_lo = _mm256_cvtps_ph(avx2_approx_swiglu(y0, z0),
-                                     _MM_FROUND_TO_NEAREST_INT);
-    __m128i out_hi = _mm256_cvtps_ph(avx2_approx_swiglu(y1, z1),
-                                     _MM_FROUND_TO_NEAREST_INT);
-    _mm256_storeu_si256((__m256i *)(X + i),
+    __m128i out_lo =
+      _mm256_cvtps_ph(avx2_approx_swiglu(y0, z0), _MM_FROUND_TO_NEAREST_INT);
+    __m128i out_hi =
+      _mm256_cvtps_ph(avx2_approx_swiglu(y1, z1), _MM_FROUND_TO_NEAREST_INT);
+    _mm256_storeu_si256(
+      (__m256i *)(X + i),
       _mm256_inserti128_si256(_mm256_castsi128_si256(out_lo), out_hi, 1));
   }
 
@@ -1260,8 +1291,7 @@ void swiglu(const unsigned int N, _Float16 *X, _Float16 *Y, _Float16 *Z) {
   for (; i < N; ++i) {
     float yf = static_cast<float>(Y[i]);
     float zf = static_cast<float>(Z[i]);
-    X[i] = static_cast<_Float16>(
-      (yf / (1.0f + std::exp(-yf))) * zf);
+    X[i] = static_cast<_Float16>((yf / (1.0f + std::exp(-yf))) * zf);
   }
 
   _mm_setcsr(oldcsr);
@@ -1308,8 +1338,7 @@ void rms_norm_wrt_width_fp16(const _Float16 *__restrict X,
     }
     // 8-wide tail
     if (i + 8 <= W) {
-      __m256 x =
-        _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(rowX + i)));
+      __m256 x = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(rowX + i)));
       acc0 = _mm256_fmadd_ps(x, x, acc0);
       i += 8;
     }
@@ -1333,13 +1362,19 @@ void rms_norm_wrt_width_fp16(const _Float16 *__restrict X,
       __m256 x1 = _mm256_cvtph_ps(_mm256_extracti128_si256(raw0, 1));
       __m256 x2 = _mm256_cvtph_ps(_mm256_castsi256_si128(raw1));
       __m256 x3 = _mm256_cvtph_ps(_mm256_extracti128_si256(raw1, 1));
-      __m128i r0 = _mm256_cvtps_ph(_mm256_mul_ps(x0, vscale), _MM_FROUND_TO_NEAREST_INT);
-      __m128i r1 = _mm256_cvtps_ph(_mm256_mul_ps(x1, vscale), _MM_FROUND_TO_NEAREST_INT);
-      __m128i r2 = _mm256_cvtps_ph(_mm256_mul_ps(x2, vscale), _MM_FROUND_TO_NEAREST_INT);
-      __m128i r3 = _mm256_cvtps_ph(_mm256_mul_ps(x3, vscale), _MM_FROUND_TO_NEAREST_INT);
-      _mm256_storeu_si256((__m256i *)(rowY + i),
+      __m128i r0 =
+        _mm256_cvtps_ph(_mm256_mul_ps(x0, vscale), _MM_FROUND_TO_NEAREST_INT);
+      __m128i r1 =
+        _mm256_cvtps_ph(_mm256_mul_ps(x1, vscale), _MM_FROUND_TO_NEAREST_INT);
+      __m128i r2 =
+        _mm256_cvtps_ph(_mm256_mul_ps(x2, vscale), _MM_FROUND_TO_NEAREST_INT);
+      __m128i r3 =
+        _mm256_cvtps_ph(_mm256_mul_ps(x3, vscale), _MM_FROUND_TO_NEAREST_INT);
+      _mm256_storeu_si256(
+        (__m256i *)(rowY + i),
         _mm256_inserti128_si256(_mm256_castsi128_si256(r0), r1, 1));
-      _mm256_storeu_si256((__m256i *)(rowY + i + 16),
+      _mm256_storeu_si256(
+        (__m256i *)(rowY + i + 16),
         _mm256_inserti128_si256(_mm256_castsi128_si256(r2), r3, 1));
     }
     // 16-wide tail
@@ -1347,16 +1382,18 @@ void rms_norm_wrt_width_fp16(const _Float16 *__restrict X,
       __m256i raw = _mm256_loadu_si256((const __m256i *)(rowX + i));
       __m256 x0 = _mm256_cvtph_ps(_mm256_castsi256_si128(raw));
       __m256 x1 = _mm256_cvtph_ps(_mm256_extracti128_si256(raw, 1));
-      __m128i r0 = _mm256_cvtps_ph(_mm256_mul_ps(x0, vscale), _MM_FROUND_TO_NEAREST_INT);
-      __m128i r1 = _mm256_cvtps_ph(_mm256_mul_ps(x1, vscale), _MM_FROUND_TO_NEAREST_INT);
-      _mm256_storeu_si256((__m256i *)(rowY + i),
+      __m128i r0 =
+        _mm256_cvtps_ph(_mm256_mul_ps(x0, vscale), _MM_FROUND_TO_NEAREST_INT);
+      __m128i r1 =
+        _mm256_cvtps_ph(_mm256_mul_ps(x1, vscale), _MM_FROUND_TO_NEAREST_INT);
+      _mm256_storeu_si256(
+        (__m256i *)(rowY + i),
         _mm256_inserti128_si256(_mm256_castsi128_si256(r0), r1, 1));
       i += 16;
     }
     // 8-wide tail
     if (i + 8 <= W) {
-      __m256 x =
-        _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(rowX + i)));
+      __m256 x = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(rowX + i)));
       _mm_storeu_si128(
         (__m128i *)(rowY + i),
         _mm256_cvtps_ph(_mm256_mul_ps(x, vscale), _MM_FROUND_TO_NEAREST_INT));
@@ -1385,12 +1422,10 @@ void compute_rotary_embedding_value(unsigned int dim, unsigned int half_,
     __m256 out0 = _mm256_fmsub_ps(a, cos_v, _mm256_mul_ps(b, sin_v));
     __m256 out1 = _mm256_fmadd_ps(a, sin_v, _mm256_mul_ps(b, cos_v));
 
-    _mm_storeu_si128(
-      (__m128i *)(out + i0),
-      _mm256_cvtps_ph(out0, _MM_FROUND_TO_NEAREST_INT));
-    _mm_storeu_si128(
-      (__m128i *)(out + i1),
-      _mm256_cvtps_ph(out1, _MM_FROUND_TO_NEAREST_INT));
+    _mm_storeu_si128((__m128i *)(out + i0),
+                     _mm256_cvtps_ph(out0, _MM_FROUND_TO_NEAREST_INT));
+    _mm_storeu_si128((__m128i *)(out + i1),
+                     _mm256_cvtps_ph(out1, _MM_FROUND_TO_NEAREST_INT));
   }
 
   for (; k < dim; ++k) {
@@ -1502,7 +1537,8 @@ void scopy_int8_to_float16(const unsigned int N, const uint8_t *X,
     unsigned int i = 0;
     unsigned int N8 = (N & ~7u);
     for (; i < N8; i += 8) {
-      __m256i xi = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(X + i)));
+      __m256i xi =
+        _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(X + i)));
       __m256 xf = _mm256_cvtepi32_ps(xi);
       _mm_storeu_si128((__m128i *)(Y + i),
                        _mm256_cvtps_ph(xf, _MM_FROUND_TO_NEAREST_INT));
@@ -1524,7 +1560,8 @@ void scopy_int8_to_float16(const unsigned int N, const int8_t *X,
     unsigned int i = 0;
     unsigned int N8 = (N & ~7u);
     for (; i < N8; i += 8) {
-      __m256i xi = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(X + i)));
+      __m256i xi =
+        _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(X + i)));
       __m256 xf = _mm256_cvtepi32_ps(xi);
       _mm_storeu_si128((__m128i *)(Y + i),
                        _mm256_cvtps_ph(xf, _MM_FROUND_TO_NEAREST_INT));

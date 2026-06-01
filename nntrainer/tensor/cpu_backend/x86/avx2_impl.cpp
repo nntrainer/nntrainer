@@ -19,13 +19,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fallback_internal.h>
 #include <fp16.h>
 #include <immintrin.h>
 #include <limits>
-#include <type_traits>
-#include <fallback_internal.h>
 #include <nntrainer_error.h>
 #include <thread_manager.h>
+#include <type_traits>
 #include <util_func.h>
 #include <vector>
 
@@ -731,8 +731,8 @@ void swiglu(const unsigned int N, float *X, const float *Y, const float *Z,
 }
 
 // poly_gelu_tanh_avx2 / poly_gelu_erf_avx2 are defined in avx2_internal.h
-using nntrainer::avx2::internal::poly_gelu_tanh_avx2;
 using nntrainer::avx2::internal::poly_gelu_erf_avx2;
+using nntrainer::avx2::internal::poly_gelu_tanh_avx2;
 
 // exp256_ps, hsum_avx, rcp_ps are also in avx2_internal.h
 using nntrainer::avx2::internal::exp256_ps;

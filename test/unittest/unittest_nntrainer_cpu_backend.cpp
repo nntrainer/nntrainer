@@ -2251,10 +2251,8 @@ TEST(nntrainer_cpu_backend_standalone, swiglu_fp16_3072) {
   const int TEST_CNT = 20;
   for (int i = 0; i < TEST_CNT; i++) {
     std::vector<_FP16> X(N), X_ref(N);
-    std::vector<_FP16> Y =
-      generate_random_vector<_FP16, false>(N, -2.0f, 2.0f);
-    std::vector<_FP16> Z =
-      generate_random_vector<_FP16, false>(N, -2.0f, 2.0f);
+    std::vector<_FP16> Y = generate_random_vector<_FP16, false>(N, -2.0f, 2.0f);
+    std::vector<_FP16> Z = generate_random_vector<_FP16, false>(N, -2.0f, 2.0f);
     std::vector<_FP16> Y_ref = Y, Z_ref = Z;
 
     nntrainer::__fallback_swiglu(N, X_ref.data(), Y_ref.data(), Z_ref.data());
@@ -2270,10 +2268,8 @@ TEST(nntrainer_cpu_backend_standalone, swiglu_fp16_7) {
   const int TEST_CNT = 20;
   for (int i = 0; i < TEST_CNT; i++) {
     std::vector<_FP16> X(N), X_ref(N);
-    std::vector<_FP16> Y =
-      generate_random_vector<_FP16, false>(N, -2.0f, 2.0f);
-    std::vector<_FP16> Z =
-      generate_random_vector<_FP16, false>(N, -2.0f, 2.0f);
+    std::vector<_FP16> Y = generate_random_vector<_FP16, false>(N, -2.0f, 2.0f);
+    std::vector<_FP16> Z = generate_random_vector<_FP16, false>(N, -2.0f, 2.0f);
     std::vector<_FP16> Y_ref = Y, Z_ref = Z;
 
     nntrainer::__fallback_swiglu(N, X_ref.data(), Y_ref.data(), Z_ref.data());
@@ -2344,9 +2340,8 @@ static void run_rotary_emb_fp16_test(unsigned int dim, unsigned int half_) {
 
     nntrainer::__fallback_compute_rotary_embedding_value(
       dim, half_, w, in.data(), out_ref.data(), cos_v.data(), sin_v.data());
-    nntrainer::compute_rotary_embedding_value(dim, half_, w, in.data(),
-                                              out.data(), cos_v.data(),
-                                              sin_v.data());
+    nntrainer::compute_rotary_embedding_value(
+      dim, half_, w, in.data(), out.data(), cos_v.data(), sin_v.data());
 
     auto mse_val = mse<_FP16, _FP16>(out_ref.data(), out.data(), dim);
     ASSERT_LE(mse_val, 0.005f);
