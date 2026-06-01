@@ -796,17 +796,23 @@ void MHACoreLayer::compute_kcaches(nntrainer::Tensor &in,
       _FP16 *out_data = out.getData<_FP16>();
 
       auto &tm = nntrainer::ThreadManager::Global();
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64)
       tm.parallel_for(
         0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
           nntrainer::compute_kcaches(
             in_data, cache_data, out_data, num_rows, num_cache_head, head_dim,
             group_size, tile_size, local_window_size, head_kv, head_kv + 1);
         });
+#else
+      NNTR_THROW_IF(true, std::invalid_argument)
+        << "FP16 KV-cache compute_kcaches requires ARM backend";
+#endif
     } else {
       unsigned int seq_start =
         sequence_len < local_window_size ? 0 : sequence_len - local_window_size;
 
       auto &tm = nntrainer::ThreadManager::Global();
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64)
       tm.parallel_for(
         static_cast<size_t>(seq_start), static_cast<size_t>(sequence_len),
         [=](size_t i) {
@@ -824,6 +830,10 @@ void MHACoreLayer::compute_kcaches(nntrainer::Tensor &in,
                                      head_dim, group_size, tile_size,
                                      local_window_size);
         });
+#else
+      NNTR_THROW_IF(true, std::invalid_argument)
+        << "FP16 KV-cache compute_kcaches requires ARM backend";
+#endif
     }
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
@@ -1301,9 +1311,14 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
                            b * out.channel() * out.height() * out.width() +
                            c * out.height() * out.width() + h * out.width();
 
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64)
           nntrainer::compute_rotary_emb_value(in.width(), dim, half_, in_ptr,
                                               out_ptr, cos_->data(),
                                               sin_->data());
+#else
+          NNTR_THROW_IF(true, std::invalid_argument)
+            << "FP16 rotary embedding requires ARM backend";
+#endif
         }
       }
     }
@@ -1578,9 +1593,14 @@ void MHACoreLayer::compute_fp16vcache_transposed(
         _FP16 *out =
           output.getData<_FP16>() + i * (num_cache_head * gqa_size * head_dim);
         int row_num = is_causal ? (to - seq + i) : to - 1;
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64)
         nntrainer::compute_fp16vcache_transposed(
           row_num, input, vcache.getData<_FP16>(), out, num_cache_head,
           gqa_size, head_dim, local_window_size);
+#else
+        NNTR_THROW_IF(true, std::invalid_argument)
+          << "FP16 vcache transposed requires ARM backend";
+#endif
       });
     } else {
       // Single token processing (common during generation)
@@ -1595,9 +1615,14 @@ void MHACoreLayer::compute_fp16vcache_transposed(
       auto &tm_fp16 = nntrainer::ThreadManager::Global();
       tm_fp16.parallel_for(
         0, static_cast<size_t>(num_cache_head), [=](size_t head_kv) {
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM) || defined(_M_ARM64)
           nntrainer::compute_fp16vcache_transposed(
             row_num, in_data, vcache_data, output_data, num_cache_head,
             gqa_size, head_dim, local_window_size, head_kv, head_kv + 1);
+#else
+          NNTR_THROW_IF(true, std::invalid_argument)
+            << "FP16 vcache transposed requires ARM backend";
+#endif
         });
     }
 #else
