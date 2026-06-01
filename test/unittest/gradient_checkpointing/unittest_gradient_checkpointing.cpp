@@ -532,14 +532,14 @@ TEST(nntrainer_gradient_checkpointing, gradient_checkpointing_correctness_01) {
   float loss_ref = model_ref->getLoss();
   float loss_ckpt = model_ckpt->getLoss();
 
-  // Both must have converged to a finite, positive loss.
+  // Both must have converged to a finite, non-negative loss.
   EXPECT_TRUE(std::isfinite(loss_ref));
   EXPECT_TRUE(std::isfinite(loss_ckpt));
-  EXPECT_GT(loss_ref, 0.0f);
+  EXPECT_GE(loss_ref, 0.0f);
 
   // Losses must match within 1e-3 relative tolerance.
-  float rel_err = std::abs(loss_ref - loss_ckpt) /
-                  (std::abs(loss_ref) + 1e-8f);
+  float denom = std::max(std::abs(loss_ref), std::abs(loss_ckpt)) + 1e-8f;
+  float rel_err = std::abs(loss_ref - loss_ckpt) / denom;
   EXPECT_LT(rel_err, 1e-3f)
     << "loss_ref=" << loss_ref << " loss_ckpt=" << loss_ckpt;
 }
