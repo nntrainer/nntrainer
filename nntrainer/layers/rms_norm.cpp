@@ -118,7 +118,7 @@ void RMSNormLayer::calcDerivative(RunLayerContext &context) {
     input.multiply(input, x_sq); // x_sq = x^2 (separate scratch buffer)
     x_sq.average(3, inv_rms);    // inv_rms = mean(x^2) along width
     inv_rms.add_i(epsilon);      // inv_rms = mean(x^2) + epsilon
-    inv_rms.inv_sqrt_i(); // inv_rms = 1 / sqrt(mean(x^2) + epsilon)
+    inv_rms.inv_sqrt_i();        // inv_rms = 1 / sqrt(mean(x^2) + epsilon)
 
     // Now compute the derivative
     // dx = inv_rms * (gamma*dy - x * mean(gamma*dy*x) * inv_rms²)
