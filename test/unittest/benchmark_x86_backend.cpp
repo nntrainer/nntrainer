@@ -803,8 +803,8 @@ TEST_P(Bench_KCache, compute_kcaches) {
   const size_t local_window_size = static_cast<size_t>(seq_len);
 
   auto in_f32 = generate_random_vector<float>(total_heads * head_dim);
-  auto kcache_f32 =
-    generate_random_vector<float>(static_cast<size_t>(num_cache_head) * seq_len * head_dim);
+  auto kcache_f32 = generate_random_vector<float>(
+    static_cast<size_t>(num_cache_head) * seq_len * head_dim);
   auto kcache_u16 = convert_f32_to_f16_u16(kcache_f32);
   std::vector<float> output(static_cast<size_t>(total_heads) * seq_len, 0.0f);
 
@@ -843,8 +843,8 @@ TEST_P(Bench_Attention, compute_fp16vcache) {
   const int attention_rows = row_num + 1;
 
   auto in_f32 = generate_random_vector<float>(total_heads * attention_rows);
-  auto vcache_f32 =
-    generate_random_vector<float>(static_cast<size_t>(num_cache_head) * (size_t)window_size * head_dim);
+  auto vcache_f32 = generate_random_vector<float>(
+    static_cast<size_t>(num_cache_head) * (size_t)window_size * head_dim);
   auto vcache_u16 = convert_f32_to_f16_u16(vcache_f32);
   std::vector<float> output(static_cast<size_t>(total_heads) * head_dim, 0.0f);
 
