@@ -83,7 +83,8 @@ public:
             bool opt_var, ml::train::ExecutionMode mode, bool trainable,
             nntrainer::TensorDim::DataType definedWeightDataType,
             bool fsu = false, size_t start_offset = 0,
-            bool read_from_offset = false, int file_fd = -1) override;
+            bool read_from_offset = false, int file_fd = -1,
+            const std::string &lora_path = "") override;
 
   /**
    * @copydoc Layer::save()

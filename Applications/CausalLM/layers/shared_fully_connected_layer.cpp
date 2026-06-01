@@ -188,7 +188,8 @@ void SharedFullyConnectedLayer::read(
   std::ifstream &file, nntrainer::RunLayerContext &context, bool opt_var,
   ml::train::ExecutionMode mode, bool trainable,
   nntrainer::TensorDim::DataType definedWeightDataType, bool fsu,
-  size_t start_offset, bool read_from_offset, int file_fd) {
+  size_t start_offset, bool read_from_offset, int file_fd,
+  const std::string &lora_path) {
   if (!shared_mode_) {
     size_t current_offset = start_offset;
     for (unsigned int i = 0; i < context.getNumWeights(); ++i) {
