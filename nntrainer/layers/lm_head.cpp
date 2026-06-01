@@ -209,24 +209,4 @@ void LmHeadLayer::updateTensorsByInputDimensions(
   context.updateOutput(SINGLE_INOUT_IDX, out_dim);
 }
 
-#ifdef PLUGGABLE
-
-Layer *create_tie_word_embedding() {
-  auto layer = new LmHeadLayer();
-  std::cout << "embedding layer created\n";
-  return layer;
-}
-
-void destroy_tie_word_embedding(Layer *layer) {
-  std::cout << "embeddinglayer is deleted\n";
-  delete layer;
-}
-
-extern "C" {
-LayerPluggable ml_train_layer_pluggable{create_tie_word_embedding,
-                                        destroy_tie_word_embedding};
-}
-
-#endif
-
 } // namespace nntrainer

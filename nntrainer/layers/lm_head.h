@@ -15,13 +15,6 @@
 #define __LM_HEAD_H__
 #ifdef __cplusplus
 
-#pragma once
-#ifdef _WIN32
-#define WIN_EXPORT __declspec(dllexport)
-#else
-#define WIN_EXPORT
-#endif
-
 #include <common_properties.h>
 #include <layer_devel.h>
 #include <layer_impl.h>
@@ -35,12 +28,12 @@ namespace nntrainer {
 class LmHeadLayer : public LayerImpl {
 public:
   /**
-   * @brief     Constructor of Embedding Layer
+   * @brief     Constructor of LmHead Layer
    */
   LmHeadLayer();
 
   /**
-   * @brief     Destructor of Embedding Layer
+   * @brief     Destructor of LmHead Layer
    */
   ~LmHeadLayer() = default;
 
@@ -67,9 +60,9 @@ public:
   void forwarding(RunLayerContext &context, bool training) override;
 
   /**
-￼   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
-￼   * int from, unsigned int to, bool training)
-￼   */
+   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
+   * int from, unsigned int to, bool training)
+   */
   void incremental_forwarding(RunLayerContext &context, unsigned int from,
                               unsigned int to, bool training) override;
 
