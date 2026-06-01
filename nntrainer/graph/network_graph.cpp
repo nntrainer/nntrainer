@@ -15,6 +15,7 @@
 #include <activation_layer.h>
 #include <addition_layer.h>
 #include <bn_layer.h>
+#include <dropout.h>
 #include <concat_layer.h>
 #include <connection.h>
 #include <cross_entropy_loss_layer.h>
@@ -974,16 +975,14 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
 
   bool needs_initial_outputs = is_checkpointed_layer;
   if (!needs_initial_outputs) {
-    if (!needs_initial_outputs) {
-      for (unsigned int i = 0; i < lnode->getNumOutputConnections(); ++i) {
-        auto conn = lnode->getOutputConnection(i);
-        if (!conn)
-          continue;
-        auto sink_node = getLayerNode(conn->getName());
-        if (sink_node && sink_node->isCheckpointed()) {
-          needs_initial_outputs = true;
-          break;
-        }
+    for (unsigned int i = 0; i < lnode->getNumOutputConnections(); ++i) {
+      auto conn = lnode->getOutputConnection(i);
+      if (!conn)
+        continue;
+      auto sink_node = getLayerNode(conn->getName());
+      if (sink_node && sink_node->isCheckpointed()) {
+        needs_initial_outputs = true;
+        break;
       }
     }
   }
@@ -2257,6 +2256,21 @@ void NetworkGraph::applyCheckpointBlocks(
         auto layer_node = getLayerNode(layer_name);
 
         // All layers in the block are checkpointed
+        // Reject stateful layers: BatchNormalization and Dropout update
+        // internal state (running stats / RNG) on every forwarding() call, so
+        // recompute would double-apply that update and corrupt the backward pass.
+        // Gradient checkpointing here targets stateless layers only.
+        const std::string &layer_type = layer_node->getType();
+        if (layer_type == BatchNormalizationLayer::type ||
+            layer_type == DropOutLayer::type) {
+          throw std::invalid_argument(
+            "Checkpoint block '" + block_id + "': layer '" + layer_name +
+            "' (type=" + layer_type +
+            ") is stateful and cannot be placed in a gradient checkpoint block. "
+            "Gradient checkpointing supports stateless layers only (e.g. "
+            "fully_connected, relu, gelu, layer_normalization).");
+        }
+
         layer_node->setCheckpointed(true);
         layer_node->setCheckpointBlockId(block_id);
 

@@ -57,8 +57,8 @@ enum class TensorLifespan {
     0b1101, /**< Forward + grad + apply gradient lifespan */
   FORWARD_DERIV_LIFESPAN = 0b011, /**< Forward + deriv lifespan */
   FORWARD_RECOMPUTE_LIFESPAN =
-    0b10000, /**< Forward to recompute lifespan for checkpoint block boundaries
-              */
+    0b1000000, /**< Forward to recompute lifespan for checkpoint block
+                    boundaries */
   BACKWARD_FUNC_LIFESPAN =
     CALC_GRAD_DERIV_AGRAD_LIFESPAN, /**< Alias of CALC_GRAD_DERIV_AGRAD_LIFESPAN
                                      */

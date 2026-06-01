@@ -338,7 +338,7 @@ Tensor &RunLayerContext::getInput(unsigned int idx) {
   if (is_initial_forward) {
     if (idx < initial_inputs.size() && initial_inputs[idx] != nullptr) {
       auto &tensor = initial_inputs[idx]->getVariableRef();
-      return tensor; // Initial forward: use initial outputs from previous layer
+      return tensor; // Initial forward: use saved copy of input tensor
     }
   }
   auto &tensor = inputs[idx]->getVariableRef();
@@ -539,9 +539,11 @@ void RunLayerContext::setBatch(unsigned int batch) {
   for (auto &vg : outputs)
     vg->setBatchSize(batch);
   for (auto &vg : initial_inputs)
-    vg->setBatchSize(batch);
+    if (vg)
+      vg->setBatchSize(batch);
   for (auto &vg : initial_outputs)
-    vg->setBatchSize(batch);
+    if (vg)
+      vg->setBatchSize(batch);
 }
 
 /**
