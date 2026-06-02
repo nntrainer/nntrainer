@@ -126,7 +126,8 @@ enum LayerType {
   LAYER_UPSAMPLE2D =
     ML_TRAIN_LAYER_TYPE_UPSAMPLE2D, /**< Upsample 2D Layer type */
   LAYER_CUSTOM_TIE_WORD_EMBEDDING =
-    ML_TRAIN_LAYER_TYPE_CUSTOM_TIE_WORD_EMBEDDING, /**< Custom Tie Word Embedding Layer */
+    ML_TRAIN_LAYER_TYPE_CUSTOM_TIE_WORD_EMBEDDING, /**< Custom Tie Word
+                                                      Embedding Layer */
 
   LAYER_UNKNOWN = ML_TRAIN_LAYER_TYPE_UNKNOWN, /**< Unknown */
 

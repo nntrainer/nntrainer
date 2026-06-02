@@ -181,15 +181,18 @@ void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
     unsigned int seq_len = input_.getDim().width();
     incremental_forwarding(context, 0, seq_len, training);
   } else if (mode_ == mode::lm_head) {
-    nntrainer::Tensor &weight = context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
+    nntrainer::Tensor &weight =
+      context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
     nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
 
     // output = input @ weight^T (weight is stored transposed)
     input_.dot(weight, hidden_, false, true);
 
-    if (auto &disable_bias = std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+    if (auto &disable_bias =
+          std::get<nntrainer::props::DisableBias>(*layer_impl_props);
         disable_bias.empty() || disable_bias.get() == false) {
-      nntrainer::Tensor &bias = context.getWeight(weight_idx[TieWordEmbeddingParams::bias]);
+      nntrainer::Tensor &bias =
+        context.getWeight(weight_idx[TieWordEmbeddingParams::bias]);
       hidden_.add_i(bias);
     }
   } else {
@@ -310,11 +313,11 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
   unsigned int b_size = input_dim.batch();
 
   for (unsigned int b = 0; b < b_size; ++b) {
-    // For multi-token chunk processing, we shift to the last token of the active chunk.
+    // For multi-token chunk processing, we shift to the last token of the
+    // active chunk.
     nntrainer::Tensor input_step = input_.getSharedDataTensor(
       input_step_dim,
-      b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(),
-      true);
+      b * input_dim.getFeatureLen() + (to - from - 1) * input_.width(), true);
     nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
@@ -375,9 +378,11 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
 
 void TieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
   if (mode_ == mode::lm_head) {
-    nntrainer::Tensor weight = context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
+    nntrainer::Tensor weight =
+      context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
     nntrainer::Tensor &dx = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
-    const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
+    const nntrainer::Tensor &dy =
+      context.getIncomingDerivative(SINGLE_INOUT_IDX);
 
     // dx = dy @ weight (No transpose on weight!)
     dy.dot(weight, dx, false, false);
@@ -387,59 +392,72 @@ void TieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
 void TieWordEmbedding::calcGradient(nntrainer::RunLayerContext &context) {
   if (mode_ == mode::embedding) {
     nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
-    const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
-    nntrainer::Tensor &dweight = context.getWeightGrad(weight_idx[TieWordEmbeddingParams::weight]);
-    
-    float scale = std::get<nntrainer::props::Scale>(tieword_embedding_props).empty()
-      ? 1.0f : std::get<nntrainer::props::Scale>(tieword_embedding_props).get();
+    const nntrainer::Tensor &dy =
+      context.getIncomingDerivative(SINGLE_INOUT_IDX);
+    nntrainer::Tensor &dweight =
+      context.getWeightGrad(weight_idx[TieWordEmbeddingParams::weight]);
+
+    float scale =
+      std::get<nntrainer::props::Scale>(tieword_embedding_props).empty()
+        ? 1.0f
+        : std::get<nntrainer::props::Scale>(tieword_embedding_props).get();
 
     size_t batch = in.batch();
     size_t seq_len = in.getDim().getFeatureLen();
-    unsigned int out_dim = std::get<nntrainer::props::OutDim>(tieword_embedding_props);
-    unsigned int in_dim = std::get<nntrainer::props::InDim>(tieword_embedding_props);
+    unsigned int out_dim =
+      std::get<nntrainer::props::OutDim>(tieword_embedding_props);
+    unsigned int in_dim =
+      std::get<nntrainer::props::InDim>(tieword_embedding_props);
     float *dw_data = dweight.getData<float>();
     const float *dy_data = dy.getData<float>();
 
     dweight.setZero();
 
     for (size_t b = 0; b < batch; ++b) {
-      const float *in_data = in.getAddress<float>(b * in.getDim().getFeatureLen());
+      const float *in_data =
+        in.getAddress<float>(b * in.getDim().getFeatureLen());
       const float *dy_batch_data = dy_data + b * dy.getDim().getFeatureLen();
       for (size_t i = 0; i < seq_len; ++i) {
         unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
-        if (embed_idx >= in_dim) continue;
-        
+        if (embed_idx >= in_dim)
+          continue;
+
         float *dw_row = dw_data + embed_idx * out_dim;
         const float *dy_row = dy_batch_data + i * out_dim;
         for (size_t j = 0; j < out_dim; ++j) {
-           dw_row[j] += dy_row[j] * scale;
+          dw_row[j] += dy_row[j] * scale;
         }
       }
     }
   } else if (mode_ == mode::lm_head) {
     nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
-    const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
-    nntrainer::Tensor &dweight = context.getWeightGrad(weight_idx[TieWordEmbeddingParams::weight]);
+    const nntrainer::Tensor &dy =
+      context.getIncomingDerivative(SINGLE_INOUT_IDX);
+    nntrainer::Tensor &dweight =
+      context.getWeightGrad(weight_idx[TieWordEmbeddingParams::weight]);
 
     // dweight = dy^T @ in = (out_dim, seq) @ (seq, in_dim) = (out_dim, in_dim)
     dy.dot(in, dweight, true, false);
 
-    if (auto &disable_bias = std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+    if (auto &disable_bias =
+          std::get<nntrainer::props::DisableBias>(*layer_impl_props);
         disable_bias.empty() || disable_bias.get() == false) {
-      nntrainer::Tensor &dbias = context.getWeightGrad(weight_idx[TieWordEmbeddingParams::bias]);
+      nntrainer::Tensor &dbias =
+        context.getWeightGrad(weight_idx[TieWordEmbeddingParams::bias]);
       dbias.setZero();
       float *db_data = dbias.getData<float>();
       const float *dy_data = dy.getData<float>();
-      
+
       size_t batch = dy.batch();
       size_t channel = dy.channel();
       size_t height = dy.height();
       size_t width = dy.width();
-      
+
       for (size_t b = 0; b < batch; ++b) {
         for (size_t c = 0; c < channel; ++c) {
           for (size_t h = 0; h < height; ++h) {
-            size_t offset = b * channel * height * width + c * height * width + h * width;
+            size_t offset =
+              b * channel * height * width + c * height * width + h * width;
             for (size_t w = 0; w < width; ++w) {
               db_data[w] += dy_data[offset + w];
             }

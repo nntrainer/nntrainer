@@ -106,8 +106,9 @@ typedef enum {
   ML_TRAIN_LAYER_TYPE_LOSS_CROSS_ENTROPY_SOFTMAX = 502, /**< Cross Entropy with
                                        Softmax Loss Layer type (Since 6.5) */
   ML_TRAIN_LAYER_TYPE_RMSNORM = 503, /**< Cross Entropy with */
-  ML_TRAIN_LAYER_TYPE_CUSTOM_TIE_WORD_EMBEDDING = 504, /**< Custom Tie Word Embedding Layer */
-  ML_TRAIN_LAYER_TYPE_UNKNOWN = 999  /**< Unknown Layer */
+  ML_TRAIN_LAYER_TYPE_CUSTOM_TIE_WORD_EMBEDDING =
+    504,                            /**< Custom Tie Word Embedding Layer */
+  ML_TRAIN_LAYER_TYPE_UNKNOWN = 999 /**< Unknown Layer */
 } ml_train_layer_type_e;
 
 /**

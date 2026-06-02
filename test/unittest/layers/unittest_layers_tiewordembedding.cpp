@@ -14,13 +14,12 @@
 
 #include <gtest/gtest.h>
 
-#include <layers_common_tests.h>
 #include "tie_word_embedding.h"
+#include <layers_common_tests.h>
 
 auto causallm_tiewordembedding_golden = LayerGoldenTestParamType(
   nntrainer::createLayer<causallm::TieWordEmbedding>,
-  {"in_dim=100", "out_dim=10"}, "2:1:1:10",
-  "tiewordembedding.nnlayergolden",
+  {"in_dim=100", "out_dim=10"}, "2:1:1:10", "tiewordembedding.nnlayergolden",
   LayerGoldenTestParamOptions::DEFAULT, "nchw", "fp32", "fp32");
 
 GTEST_PARAMETER_TEST(CausalLMTieWordEmbedding, LayerGoldenTest,

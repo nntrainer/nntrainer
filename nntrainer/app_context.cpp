@@ -96,8 +96,8 @@
 #include <subtract_layer.h>
 #include <tangent_layer.h>
 #include <tensor_layer.h>
-#include <time_dist.h>
 #include <tie_word_embedding.h>
+#include <time_dist.h>
 #include <upsample2d_layer.h>
 #include <weight_layer.h>
 #include <zoneout_lstmcell.h>

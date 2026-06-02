@@ -35,10 +35,10 @@
 #include <common.h>
 #include <layer_context.h>
 #include <lm_head.h>
-#include <tie_word_embedding.h>
 #include <mha_core.h>
 #include <nntrainer_error.h>
 #include <tensor.h>
+#include <tie_word_embedding.h>
 
 #include <causal_lm.h>
 #include <llm_util.hpp>

@@ -37,7 +37,7 @@ foreach target: unzip_target
     if not fs.exists (_dest_path_win)
       run_command([prog_win_cmd, '/C', 'mkdir', _dest_path_win], check: true)
     endif
-    run_command([prog_win_cmd, '/C', 'tar', '--force-local', '-xzf', _src_path, '-C', _dest_path], check: true)
+    run_command([prog_win_cmd, '/C', 'tar', 'xzf', _src_path_win, '-C', _dest_path_win], check: true)
   else
     run_command(['mkdir', '-p', _dest_path], check: true)
     run_command(['tar', 'xzf', _src_path, '-C', _dest_path], check: true)
