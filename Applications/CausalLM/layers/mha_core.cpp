@@ -320,224 +320,224 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &output = context.getOutput(INOUT_INDEX::OUTPUT);
 
   if (!training) {
-  nntrainer::Tensor &cache_key = context.getInput(3);
-  nntrainer::Tensor &cache_value = context.getInput(4);
+    nntrainer::Tensor &cache_key = context.getInput(3);
+    nntrainer::Tensor &cache_value = context.getInput(4);
 
-  nntrainer::Tensor sink;
-  if (use_sink) {
-    sink = context.getWeight(sink_idx);
-  }
+    nntrainer::Tensor sink;
+    if (use_sink) {
+      sink = context.getWeight(sink_idx);
+    }
 
-  unsigned int step_size = (incremental_step_size > 0)
-                             ? incremental_step_size
-                             : (unsigned int)query.height();
-  unsigned int from = cache_index;
-  unsigned int to = cache_index + step_size;
+    unsigned int step_size = (incremental_step_size > 0)
+                               ? incremental_step_size
+                               : (unsigned int)query.height();
+    unsigned int from = cache_index;
+    unsigned int to = cache_index + step_size;
 
-  auto get_step_dim = [step_size](const ml::train::TensorDim &dim) {
-    auto step_dim = dim;
-    step_dim.batch(1);
-    step_dim.height(step_size);
-    return step_dim;
-  };
+    auto get_step_dim = [step_size](const ml::train::TensorDim &dim) {
+      auto step_dim = dim;
+      step_dim.batch(1);
+      step_dim.height(step_size);
+      return step_dim;
+    };
 
-  ml::train::TensorDim query_dim = query.getDim();
-  ml::train::TensorDim key_dim = key.getDim();
-  ml::train::TensorDim value_dim = value.getDim();
-  ml::train::TensorDim output_dim = output.getDim();
-  ml::train::TensorDim cache_key_dim = cache_key.getDim();
-  ml::train::TensorDim cache_value_dim = cache_value.getDim();
+    ml::train::TensorDim query_dim = query.getDim();
+    ml::train::TensorDim key_dim = key.getDim();
+    ml::train::TensorDim value_dim = value.getDim();
+    ml::train::TensorDim output_dim = output.getDim();
+    ml::train::TensorDim cache_key_dim = cache_key.getDim();
+    ml::train::TensorDim cache_value_dim = cache_value.getDim();
 
-  ml::train::TensorDim query_step_dim = get_step_dim(query_dim);
-  ml::train::TensorDim key_step_dim = get_step_dim(key_dim);
-  ml::train::TensorDim value_step_dim = get_step_dim(value_dim);
-  ml::train::TensorDim output_step_dim = get_step_dim(output_dim);
-  ml::train::TensorDim cache_key_step_dim = get_step_dim(cache_key_dim);
-  ml::train::TensorDim cache_value_step_dim = get_step_dim(cache_value_dim);
+    ml::train::TensorDim query_step_dim = get_step_dim(query_dim);
+    ml::train::TensorDim key_step_dim = get_step_dim(key_dim);
+    ml::train::TensorDim value_step_dim = get_step_dim(value_dim);
+    ml::train::TensorDim output_step_dim = get_step_dim(output_dim);
+    ml::train::TensorDim cache_key_step_dim = get_step_dim(cache_key_dim);
+    ml::train::TensorDim cache_value_step_dim = get_step_dim(cache_value_dim);
 
-  unsigned int batch_size = query_dim.batch();
-  for (unsigned int batch = 0; batch < batch_size; ++batch) {
-    nntrainer::Tensor query_step = query.getSharedDataTensor(
-      query_step_dim, batch * query_dim.getFeatureLen(), true);
-    nntrainer::Tensor key_step = key.getSharedDataTensor(
-      key_step_dim, batch * key_dim.getFeatureLen(), true);
-    nntrainer::Tensor value_step = value.getSharedDataTensor(
-      value_step_dim, batch * value_dim.getFeatureLen(), true);
-    nntrainer::Tensor output_step = output.getSharedDataTensor(
-      output_step_dim, batch * output_dim.getFeatureLen(), true);
+    unsigned int batch_size = query_dim.batch();
+    for (unsigned int batch = 0; batch < batch_size; ++batch) {
+      nntrainer::Tensor query_step = query.getSharedDataTensor(
+        query_step_dim, batch * query_dim.getFeatureLen(), true);
+      nntrainer::Tensor key_step = key.getSharedDataTensor(
+        key_step_dim, batch * key_dim.getFeatureLen(), true);
+      nntrainer::Tensor value_step = value.getSharedDataTensor(
+        value_step_dim, batch * value_dim.getFeatureLen(), true);
+      nntrainer::Tensor output_step = output.getSharedDataTensor(
+        output_step_dim, batch * output_dim.getFeatureLen(), true);
 
-    if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
 #if ENABLE_FP16 && defined(__ANDROID__)
-      nntrainer::TensorDim Q_step_dim = query_step_dim;
-      nntrainer::TensorDim K_step_dim = key_step_dim;
-      nntrainer::TensorDim V_step_dim = value_step_dim;
-      nntrainer::TensorDim O_step_dim = output_step_dim;
-      Q_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-      K_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-      V_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-      O_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+        nntrainer::TensorDim Q_step_dim = query_step_dim;
+        nntrainer::TensorDim K_step_dim = key_step_dim;
+        nntrainer::TensorDim V_step_dim = value_step_dim;
+        nntrainer::TensorDim O_step_dim = output_step_dim;
+        Q_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+        K_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+        V_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+        O_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
 
-      nntrainer::Tensor Q_step = nntrainer::Tensor(Q_step_dim, true);
-      nntrainer::Tensor K_step = nntrainer::Tensor(K_step_dim, true);
-      nntrainer::Tensor V_step = nntrainer::Tensor(V_step_dim, true);
-      nntrainer::Tensor O_step = nntrainer::Tensor(O_step_dim, true);
+        nntrainer::Tensor Q_step = nntrainer::Tensor(Q_step_dim, true);
+        nntrainer::Tensor K_step = nntrainer::Tensor(K_step_dim, true);
+        nntrainer::Tensor V_step = nntrainer::Tensor(V_step_dim, true);
+        nntrainer::Tensor O_step = nntrainer::Tensor(O_step_dim, true);
 
-      Q_step.copyData(query_step);
-      K_step.copyData(key_step);
-      V_step.copyData(value_step);
+        Q_step.copyData(query_step);
+        K_step.copyData(key_step);
+        V_step.copyData(value_step);
 
-      if (use_sink) {
-        one_batch_incremental_forwarding(
-          batch, from, from, to, Q_step, K_step, V_step, O_step, cache_key,
-          cache_value, cache_key_dim, cache_key_step_dim, cache_value_dim,
-          cache_value_step_dim, sink);
-      } else {
-        one_batch_incremental_forwarding(batch, from, from, to, Q_step, K_step,
-                                         V_step, O_step, cache_key, cache_value,
-                                         cache_key_dim, cache_key_step_dim,
-                                         cache_value_dim, cache_value_step_dim);
-      }
-      output_step.copyData(O_step);
+        if (use_sink) {
+          one_batch_incremental_forwarding(
+            batch, from, from, to, Q_step, K_step, V_step, O_step, cache_key,
+            cache_value, cache_key_dim, cache_key_step_dim, cache_value_dim,
+            cache_value_step_dim, sink);
+        } else {
+          one_batch_incremental_forwarding(
+            batch, from, from, to, Q_step, K_step, V_step, O_step, cache_key,
+            cache_value, cache_key_dim, cache_key_step_dim, cache_value_dim,
+            cache_value_step_dim);
+        }
+        output_step.copyData(O_step);
 #else
-      if (use_sink) {
-        one_batch_incremental_forwarding(
-          batch, from, from, to, query_step, key_step, value_step, output_step,
-          cache_key, cache_value, cache_key_dim, cache_key_step_dim,
-          cache_value_dim, cache_value_step_dim, sink);
+        if (use_sink) {
+          one_batch_incremental_forwarding(
+            batch, from, from, to, query_step, key_step, value_step,
+            output_step, cache_key, cache_value, cache_key_dim,
+            cache_key_step_dim, cache_value_dim, cache_value_step_dim, sink);
+        } else {
+          one_batch_incremental_forwarding(
+            batch, from, from, to, query_step, key_step, value_step,
+            output_step, cache_key, cache_value, cache_key_dim,
+            cache_key_step_dim, cache_value_dim, cache_value_step_dim);
+        }
+#endif
       } else {
         one_batch_incremental_forwarding(
           batch, from, from, to, query_step, key_step, value_step, output_step,
           cache_key, cache_value, cache_key_dim, cache_key_step_dim,
           cache_value_dim, cache_value_step_dim);
       }
-#endif
-    } else {
-      one_batch_incremental_forwarding(
-        batch, from, from, to, query_step, key_step, value_step, output_step,
-        cache_key, cache_value, cache_key_dim, cache_key_step_dim,
-        cache_value_dim, cache_value_step_dim);
     }
-  }
 
-  cache_index += step_size;
+    cache_index += step_size;
   } else {
-  const unsigned int batch_size = query.batch();
-  const unsigned int seq_len = query.height();
+    const unsigned int batch_size = query.batch();
+    const unsigned int seq_len = query.height();
 
-  // Get training cache tensors
-  nntrainer::Tensor &train_q =
-    context.getTensor(tensor_idx[AttentionParams::train_query]);
-  nntrainer::Tensor &train_k =
-    context.getTensor(tensor_idx[AttentionParams::train_key]);
-  nntrainer::Tensor &train_v =
-    context.getTensor(tensor_idx[AttentionParams::train_value]);
-  nntrainer::Tensor &train_attn_wt =
-    context.getTensor(tensor_idx[AttentionParams::train_attn_wt]);
+    // Get training cache tensors
+    nntrainer::Tensor &train_q =
+      context.getTensor(tensor_idx[AttentionParams::train_query]);
+    nntrainer::Tensor &train_k =
+      context.getTensor(tensor_idx[AttentionParams::train_key]);
+    nntrainer::Tensor &train_v =
+      context.getTensor(tensor_idx[AttentionParams::train_value]);
+    nntrainer::Tensor &train_attn_wt =
+      context.getTensor(tensor_idx[AttentionParams::train_attn_wt]);
 
-  // Step 1: Apply RoPE to copies of Q and K, then reshape to per-head format
-  // Must not modify input tensors (test framework checks inputs after forward)
-  // Copy Q and K, apply RoPE to copies
-  nntrainer::Tensor q_rope = query.clone();
-  nntrainer::Tensor k_rope = key.clone();
-  apply_rotary_emb_tensor_v2(q_rope, q_rope, head_dim, 0, false);
-  apply_rotary_emb_tensor_v2(k_rope, k_rope, head_dim, 0, false);
+    // Step 1: Apply RoPE to copies of Q and K, then reshape to per-head format
+    // Must not modify input tensors (test framework checks inputs after
+    // forward) Copy Q and K, apply RoPE to copies
+    nntrainer::Tensor q_rope = query.clone();
+    nntrainer::Tensor k_rope = key.clone();
+    apply_rotary_emb_tensor_v2(q_rope, q_rope, head_dim, 0, false);
+    apply_rotary_emb_tensor_v2(k_rope, k_rope, head_dim, 0, false);
 
-  // Reshape Q to per-head: (B, H_Q, seq_len, D)
-  for (unsigned int b = 0; b < batch_size; b++) {
-    for (unsigned int h = 0; h < seq_len; h++) {
-      for (unsigned int n = 0; n < num_heads_Q; n++) {
-        float *src = q_rope.getAddress<float>(b, 0, h, n * head_dim);
-        float *dst = train_q.getAddress<float>(b, n, h, 0);
-        std::copy(src, src + head_dim, dst);
-      }
-    }
-  }
-
-  // Reshape K to per-head: (B, H_KV, seq_len, D)
-  for (unsigned int b = 0; b < batch_size; b++) {
-    for (unsigned int h = 0; h < seq_len; h++) {
-      for (unsigned int n = 0; n < num_heads_KV; n++) {
-        float *src = k_rope.getAddress<float>(b, 0, h, n * head_dim);
-        float *dst = train_k.getAddress<float>(b, n, h, 0);
-        std::copy(src, src + head_dim, dst);
-      }
-    }
-  }
-
-  // Reshape V to per-head: (B, H_KV, seq_len, D)
-  for (unsigned int b = 0; b < batch_size; b++) {
-    for (unsigned int h = 0; h < seq_len; h++) {
-      for (unsigned int n = 0; n < num_heads_KV; n++) {
-        float *src = value.getAddress<float>(b, 0, h, n * head_dim);
-        float *dst = train_v.getAddress<float>(b, n, h, 0);
-        std::copy(src, src + head_dim, dst);
-      }
-    }
-  }
-
-  // Step 2: Compute attention for each batch and Q head
-  float scale_factor = 1.0f / std::sqrt(static_cast<float>(head_dim));
-  for (unsigned int b = 0; b < batch_size; b++) {
-    for (unsigned int q_head = 0; q_head < num_heads_Q; q_head++) {
-      unsigned int kv_head = q_head / gqa_size;
-      unsigned int flat_idx = b * num_heads_Q + q_head;
-
-      // Q_h: (1, 1, seq_len, head_dim) view
-      nntrainer::TensorDim head_dim_t(1, 1, seq_len, head_dim,
-                                      query.getTensorType());
-      nntrainer::Tensor q_h = train_q.getSharedDataTensor(
-        head_dim_t, (b * num_heads_Q + q_head) * seq_len * head_dim);
-      nntrainer::Tensor k_h = train_k.getSharedDataTensor(
-        head_dim_t, (b * num_heads_KV + kv_head) * seq_len * head_dim);
-      nntrainer::Tensor v_h = train_v.getSharedDataTensor(
-        head_dim_t, (b * num_heads_KV + kv_head) * seq_len * head_dim);
-
-      // scores = Q_h @ K_h^T: (1, 1, seq_len, seq_len)
-      nntrainer::TensorDim score_dim(1, 1, seq_len, seq_len,
-                                     query.getTensorType());
-      nntrainer::Tensor scores = train_attn_wt.getSharedDataTensor(
-        score_dim, flat_idx * seq_len * seq_len);
-
-      q_h.dot(k_h, scores, false, true);
-      scores.multiply_i(scale_factor);
-
-      // Apply causal mask: set upper triangle to -inf
-      if (is_causal) {
-        float *scores_data = scores.getData<float>();
-        for (unsigned int i = 0; i < seq_len; i++) {
-          for (unsigned int j = i + 1; j < seq_len; j++) {
-            scores_data[i * seq_len + j] = -std::numeric_limits<float>::max();
-          }
-        }
-      }
-
-      // Softmax along last dimension
-      sm.run_fn(scores, scores);
-
-      // attn_output = scores @ V_h: (1, 1, seq_len, head_dim)
-      nntrainer::TensorDim out_dim(1, 1, seq_len, head_dim,
-                                   query.getTensorType());
-
-      // Write directly to the output tensor at the right head offset
-      float *out_base = output.getAddress<float>(b, 0, 0, 0);
+    // Reshape Q to per-head: (B, H_Q, seq_len, D)
+    for (unsigned int b = 0; b < batch_size; b++) {
       for (unsigned int h = 0; h < seq_len; h++) {
-        float *attn_row = scores.getAddress<float>(0, 0, h, 0);
-        float *v_data = v_h.getAddress<float>(0, 0, 0, 0);
-        float *out_row =
-          out_base + h * (num_heads_Q * head_dim) + q_head * head_dim;
+        for (unsigned int n = 0; n < num_heads_Q; n++) {
+          float *src = q_rope.getAddress<float>(b, 0, h, n * head_dim);
+          float *dst = train_q.getAddress<float>(b, n, h, 0);
+          std::copy(src, src + head_dim, dst);
+        }
+      }
+    }
 
-        // out_row = sum_j(attn[h,j] * V[j,:])
-        std::fill(out_row, out_row + head_dim, 0.0f);
-        for (unsigned int j = 0; j < seq_len; j++) {
-          float w = attn_row[j];
-          float *v_row = v_data + j * head_dim;
-          for (unsigned int d = 0; d < head_dim; d++) {
-            out_row[d] += w * v_row[d];
+    // Reshape K to per-head: (B, H_KV, seq_len, D)
+    for (unsigned int b = 0; b < batch_size; b++) {
+      for (unsigned int h = 0; h < seq_len; h++) {
+        for (unsigned int n = 0; n < num_heads_KV; n++) {
+          float *src = k_rope.getAddress<float>(b, 0, h, n * head_dim);
+          float *dst = train_k.getAddress<float>(b, n, h, 0);
+          std::copy(src, src + head_dim, dst);
+        }
+      }
+    }
+
+    // Reshape V to per-head: (B, H_KV, seq_len, D)
+    for (unsigned int b = 0; b < batch_size; b++) {
+      for (unsigned int h = 0; h < seq_len; h++) {
+        for (unsigned int n = 0; n < num_heads_KV; n++) {
+          float *src = value.getAddress<float>(b, 0, h, n * head_dim);
+          float *dst = train_v.getAddress<float>(b, n, h, 0);
+          std::copy(src, src + head_dim, dst);
+        }
+      }
+    }
+
+    // Step 2: Compute attention for each batch and Q head
+    float scale_factor = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    for (unsigned int b = 0; b < batch_size; b++) {
+      for (unsigned int q_head = 0; q_head < num_heads_Q; q_head++) {
+        unsigned int kv_head = q_head / gqa_size;
+        unsigned int flat_idx = b * num_heads_Q + q_head;
+
+        // Q_h: (1, 1, seq_len, head_dim) view
+        nntrainer::TensorDim head_dim_t(1, 1, seq_len, head_dim,
+                                        query.getTensorType());
+        nntrainer::Tensor q_h = train_q.getSharedDataTensor(
+          head_dim_t, (b * num_heads_Q + q_head) * seq_len * head_dim);
+        nntrainer::Tensor k_h = train_k.getSharedDataTensor(
+          head_dim_t, (b * num_heads_KV + kv_head) * seq_len * head_dim);
+        nntrainer::Tensor v_h = train_v.getSharedDataTensor(
+          head_dim_t, (b * num_heads_KV + kv_head) * seq_len * head_dim);
+
+        // scores = Q_h @ K_h^T: (1, 1, seq_len, seq_len)
+        nntrainer::TensorDim score_dim(1, 1, seq_len, seq_len,
+                                       query.getTensorType());
+        nntrainer::Tensor scores = train_attn_wt.getSharedDataTensor(
+          score_dim, flat_idx * seq_len * seq_len);
+
+        q_h.dot(k_h, scores, false, true);
+        scores.multiply_i(scale_factor);
+
+        // Apply causal mask: set upper triangle to -inf
+        if (is_causal) {
+          float *scores_data = scores.getData<float>();
+          for (unsigned int i = 0; i < seq_len; i++) {
+            for (unsigned int j = i + 1; j < seq_len; j++) {
+              scores_data[i * seq_len + j] = -std::numeric_limits<float>::max();
+            }
+          }
+        }
+
+        // Softmax along last dimension
+        sm.run_fn(scores, scores);
+
+        // attn_output = scores @ V_h: (1, 1, seq_len, head_dim)
+        nntrainer::TensorDim out_dim(1, 1, seq_len, head_dim,
+                                     query.getTensorType());
+
+        // Write directly to the output tensor at the right head offset
+        float *out_base = output.getAddress<float>(b, 0, 0, 0);
+        for (unsigned int h = 0; h < seq_len; h++) {
+          float *attn_row = scores.getAddress<float>(0, 0, h, 0);
+          float *v_data = v_h.getAddress<float>(0, 0, 0, 0);
+          float *out_row =
+            out_base + h * (num_heads_Q * head_dim) + q_head * head_dim;
+
+          // out_row = sum_j(attn[h,j] * V[j,:])
+          std::fill(out_row, out_row + head_dim, 0.0f);
+          for (unsigned int j = 0; j < seq_len; j++) {
+            float w = attn_row[j];
+            float *v_row = v_data + j * head_dim;
+            for (unsigned int d = 0; d < head_dim; d++) {
+              out_row[d] += w * v_row[d];
+            }
           }
         }
       }
     }
-  }
   }
 }
 

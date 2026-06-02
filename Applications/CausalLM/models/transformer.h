@@ -140,6 +140,8 @@ public:
 
   /**
    * @brief Configure dataset for the model
+   * @param mode Dataset mode type (TRAIN / VALID / TEST)
+   * @param dataset Shared pointer to the dataset to attach
    */
   virtual void setDataset(ml::train::DatasetModeType mode,
                           std::shared_ptr<ml::train::Dataset> dataset) {
@@ -150,6 +152,8 @@ public:
 
   /**
    * @brief Train the model
+   * @param values Optional key=value configuration overrides passed to the
+   * training loop
    */
   virtual void train(const std::vector<std::string> &values = {}) {
     if (!model)
