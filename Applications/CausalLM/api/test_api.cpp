@@ -228,20 +228,16 @@ ErrorCode run_turn(const char *prompt, bool verbose, bool show_metrics,
       ? (metrics.generation_tokens / metrics.generation_duration_ms * 1000.0)
       : 0.0;
 
-  std::cout << COLOR_CYAN << "  📊 " << COLOR_RESET << COLOR_BOLD
-            << "Prefill" << COLOR_RESET << "  tokens="
-            << metrics.prefill_tokens << "  "
-            << std::fixed << std::setprecision(2)
-            << metrics.prefill_duration_ms << " ms  "
-            << COLOR_GREEN << std::setprecision(1) << prefill_tps
+  std::cout << COLOR_CYAN << "  📊 " << COLOR_RESET << COLOR_BOLD << "Prefill"
+            << COLOR_RESET << "  tokens=" << metrics.prefill_tokens << "  "
+            << std::fixed << std::setprecision(2) << metrics.prefill_duration_ms
+            << " ms  " << COLOR_GREEN << std::setprecision(1) << prefill_tps
             << COLOR_RESET << " tok/s\n";
-  std::cout << COLOR_CYAN << "  📊 " << COLOR_RESET << COLOR_BOLD
-            << "Generation" << COLOR_RESET << " tokens="
-            << metrics.generation_tokens << "  "
+  std::cout << COLOR_CYAN << "  📊 " << COLOR_RESET << COLOR_BOLD << "Generation"
+            << COLOR_RESET << " tokens=" << metrics.generation_tokens << "  "
             << std::fixed << std::setprecision(2)
-            << metrics.generation_duration_ms << " ms  "
-            << COLOR_GREEN << std::setprecision(1) << gen_tps
-            << COLOR_RESET << " tok/s\n\n";
+            << metrics.generation_duration_ms << " ms  " << COLOR_GREEN
+            << std::setprecision(1) << gen_tps << COLOR_RESET << " tok/s\n\n";
 
   return err;
 }
@@ -350,8 +346,8 @@ int run_verify_memory(bool verbose) {
   printSuccess("Turn 3 did not assert 'Alice' — reset cleared context.");
 
   printLine("═", 63);
-  std::cout << COLOR_BOLD << COLOR_GREEN
-            << "  ✓ verify-memory PASSED" << COLOR_RESET << "\n";
+  std::cout << COLOR_BOLD << COLOR_GREEN << "  ✓ verify-memory PASSED"
+            << COLOR_RESET << "\n";
   printLine("═", 63);
   std::cout << "\n";
   return 0;
@@ -438,9 +434,8 @@ int main(int argc, char *argv[]) {
   }
 
   const char *model_name = argv[1];
-  const char *prompt = (argc >= 3 && argv[2][0] != '\0')
-                         ? argv[2]
-                         : "Hello, how are you?";
+  const char *prompt =
+    (argc >= 3 && argv[2][0] != '\0') ? argv[2] : "Hello, how are you?";
   bool use_chat_template = true;
   std::string chat_file_path = "";
   std::string quant_str = "UNKNOWN";
@@ -566,7 +561,6 @@ int main(int argc, char *argv[]) {
   if (mode_multi_turn) {
     return run_multi_turn_repl(verbose);
   }
-
 
   // ── --chat-file mode: load messages from JSON file ──
   using json = nlohmann::json;

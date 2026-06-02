@@ -863,8 +863,7 @@ ErrorCode runModelWithMessages(const CausalLMChatMessage *messages,
     return runModelInternal(formatted, outputText);
 
   } catch (const std::exception &e) {
-    std::cerr << "Exception in runModelWithMessages: " << e.what()
-              << std::endl;
+    std::cerr << "Exception in runModelWithMessages: " << e.what() << std::endl;
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   }
 }

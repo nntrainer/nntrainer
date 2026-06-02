@@ -81,7 +81,6 @@ public:
    */
   std::string getOutput(int batch_idx = 0) const;
 
-
   /**
    * @brief get the status of run
    */
@@ -97,7 +96,6 @@ public:
    *        that are read.
    */
   void resetConversation();
-
 
 protected:
   /**

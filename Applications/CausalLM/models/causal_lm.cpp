@@ -610,10 +610,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
        ++token_generation_idx) {
 
     allocateAndBindKVCache();
-    auto output_interval =
-      model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                   token_generation_idx - 1,
-                                   token_generation_idx);
+    auto output_interval = model->incremental_inference(
+      BATCH_SIZE, input, label, input_len, token_generation_idx - 1,
+      token_generation_idx);
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
 
     // Feed the newly generated token back as the next input token.
