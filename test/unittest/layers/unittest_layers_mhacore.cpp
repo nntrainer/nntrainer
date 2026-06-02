@@ -13,8 +13,8 @@
 
 #include <gtest/gtest.h>
 
-#include <mha_core.h>
 #include <layers_common_tests.h>
+#include <mha_core.h>
 
 auto causallm_mhacore_golden = LayerGoldenTestParamType(
   nntrainer::createLayer<nntrainer::MHACoreLayer>,
