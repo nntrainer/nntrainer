@@ -24,6 +24,7 @@
 #include <mha_core.h>
 #include <rms_norm.h>
 #include <swiglu.h>
+#include <tie_word_embedding.h>
 
 namespace causallm {
 
@@ -504,7 +505,7 @@ void Transformer::registerCustomLayers() {
     app_context->registerFactory(
       nntrainer::createLayer<causallm::MHACoreLayer>);
     app_context->registerFactory(
-      nntrainer::createLayer<nntrainer::TieWordEmbedding>);
+      nntrainer::createLayer<causallm::TieWordEmbedding>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::EmbeddingLayer>);
 

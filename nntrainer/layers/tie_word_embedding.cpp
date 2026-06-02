@@ -175,24 +175,7 @@ void TieWordEmbedding::setProperty(const std::vector<std::string> &values) {
 
 void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
                                   bool training) {
-  printf("TieWordEmbedding::forwarding() entered - mode: %s, layer_name: %s\n",
-         mode_ == mode::embedding ? "embedding" : "lm_head", context.getName().c_str());
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-  
-  printf("  input tensor name: %s\n", input_.getName().c_str());
-  printf("  input tensor object: %p\n", &input_);
-  printf("  input tensor dim: batch=%zu, channel=%zu, height=%zu, width=%zu\n",
-         input_.getDim().batch(), input_.getDim().channel(),
-         input_.getDim().height(), input_.getDim().width());
-  
-  if (context.getNumWeights() > 0) {
-    nntrainer::Tensor &weight = context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
-    printf("  weight tensor name: %s\n", weight.getName().c_str());
-    printf("  weight tensor object: %p\n", &weight);
-    printf("  weight tensor dim: batch=%zu, channel=%zu, height=%zu, width=%zu\n",
-           weight.getDim().batch(), weight.getDim().channel(),
-           weight.getDim().height(), weight.getDim().width());
-  }
 
   if (mode_ == mode::embedding) {
     unsigned int seq_len = input_.getDim().width();
@@ -201,8 +184,6 @@ void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
     nntrainer::Tensor &weight = context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
     nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
 
-    std::cout << "LM Head Input: " << input_ << std::endl;
-    std::cout << "LM Head Weight: " << weight << std::endl;
     // output = input @ weight^T (weight is stored transposed)
     input_.dot(weight, hidden_, false, true);
 
@@ -219,9 +200,6 @@ void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
 void TieWordEmbedding::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  printf("TieWordEmbedding::incremental_forwarding() entered - mode: %s, from: %u, to: %u\n",
-         mode_ == mode::embedding ? "embedding" : "lm_head", from, to);
-
   if (mode_ == mode::embedding)
     incremental_forwarding_embedding(context, from, to, training);
   else if (mode_ == mode::lm_head)
@@ -233,8 +211,6 @@ void TieWordEmbedding::incremental_forwarding(
 void TieWordEmbedding::incremental_forwarding_embedding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  printf("TieWordEmbedding::incremental_forwarding_embedding() entered\n");
-
   /// @todo get input and output dimension from input_ and hidden itself
   unsigned int in_dim =
     std::get<nntrainer::props::InDim>(tieword_embedding_props);
@@ -315,8 +291,6 @@ void TieWordEmbedding::incremental_forwarding_embedding(
 void TieWordEmbedding::incremental_forwarding_lmhead(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  printf("TieWordEmbedding::incremental_forwarding_lmhead() entered\n");
-
   nntrainer::Tensor weight =
     context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
 
@@ -400,9 +374,6 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
 }
 
 void TieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
-  printf("TieWordEmbedding::calcDerivative() entered - mode: %s\n",
-         mode_ == mode::embedding ? "embedding" : "lm_head");
-
   if (mode_ == mode::lm_head) {
     nntrainer::Tensor weight = context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
     nntrainer::Tensor &dx = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
@@ -414,9 +385,6 @@ void TieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
 }
 
 void TieWordEmbedding::calcGradient(nntrainer::RunLayerContext &context) {
-  printf("TieWordEmbedding::calcGradient() entered - mode: %s\n",
-         mode_ == mode::embedding ? "embedding" : "lm_head");
-
   if (mode_ == mode::embedding) {
     nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
     const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
