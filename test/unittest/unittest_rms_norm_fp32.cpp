@@ -23,8 +23,8 @@
 #if defined(__ARM_NEON)
 #include <neon_impl.h>
 
-#define EXPECT_IN_RANGE(VAL, MIN, MAX) \
-  EXPECT_GE((VAL), (MIN));             \
+#define EXPECT_IN_RANGE(VAL, MIN, MAX)                                         \
+  EXPECT_GE((VAL), (MIN));                                                     \
   EXPECT_LE((VAL), (MAX))
 
 // Reference implementation of RMS normalization in FP32
@@ -68,15 +68,16 @@ TEST(rms_norm_fp32_intrinsic, small_dimensions_4_8) {
   }
 
   // Run FP32 intrinsic version
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_intrinsic.data(),
-                                                     H, W, epsilon);
+  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(
+    X.data(), Y_intrinsic.data(), H, W, epsilon);
 
   // Run reference FP32 version
   rms_norm_fp32_reference(X.data(), Y_reference.data(), H, W, epsilon);
 
   // Compare results
   float mse_error = mse<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
-  double cos_sim = cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
+  double cos_sim =
+    cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
 
   const float epsilon_tolerance = 1e-6f;
   EXPECT_IN_RANGE(mse_error, 0.0f, epsilon_tolerance);
@@ -97,12 +98,13 @@ TEST(rms_norm_fp32_intrinsic, non_divisible_dimensions_5_13) {
     X[i] = (float)(rand() % 100) / 10.0f;
   }
 
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_intrinsic.data(),
-                                                     H, W, epsilon);
+  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(
+    X.data(), Y_intrinsic.data(), H, W, epsilon);
   rms_norm_fp32_reference(X.data(), Y_reference.data(), H, W, epsilon);
 
   float mse_error = mse<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
-  double cos_sim = cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
+  double cos_sim =
+    cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
 
   const float epsilon_tolerance = 1e-6f;
   EXPECT_IN_RANGE(mse_error, 0.0f, epsilon_tolerance);
@@ -123,12 +125,13 @@ TEST(rms_norm_fp32_intrinsic, remainder_handling_3_11) {
     X[i] = (float)(rand() % 100) / 10.0f;
   }
 
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_intrinsic.data(),
-                                                     H, W, epsilon);
+  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(
+    X.data(), Y_intrinsic.data(), H, W, epsilon);
   rms_norm_fp32_reference(X.data(), Y_reference.data(), H, W, epsilon);
 
   float mse_error = mse<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
-  double cos_sim = cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
+  double cos_sim =
+    cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
 
   const float epsilon_tolerance = 1e-6f;
   EXPECT_IN_RANGE(mse_error, 0.0f, epsilon_tolerance);
@@ -149,12 +152,13 @@ TEST(rms_norm_fp32_intrinsic, embedding_dimension_768) {
     X[i] = (float)(rand() % 100) / 10.0f;
   }
 
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_intrinsic.data(),
-                                                     H, W, epsilon);
+  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(
+    X.data(), Y_intrinsic.data(), H, W, epsilon);
   rms_norm_fp32_reference(X.data(), Y_reference.data(), H, W, epsilon);
 
   float mse_error = mse<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
-  double cos_sim = cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
+  double cos_sim =
+    cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
 
   const float epsilon_tolerance = 1e-6f;
   EXPECT_IN_RANGE(mse_error, 0.0f, epsilon_tolerance);
@@ -176,12 +180,13 @@ TEST(rms_norm_fp32_intrinsic, different_epsilon_values) {
     std::vector<float> Y_intrinsic(H * W);
     std::vector<float> Y_reference(H * W);
 
-    nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_intrinsic.data(),
-                                                         H, W, epsilon);
+    nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(
+      X.data(), Y_intrinsic.data(), H, W, epsilon);
     rms_norm_fp32_reference(X.data(), Y_reference.data(), H, W, epsilon);
 
     float mse_error = mse<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
-    double cos_sim = cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
+    double cos_sim =
+      cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
 
     const float epsilon_tolerance = 1e-6f;
     EXPECT_IN_RANGE(mse_error, 0.0f, epsilon_tolerance);
@@ -203,12 +208,13 @@ TEST(rms_norm_fp32_intrinsic, single_row) {
     X[i] = (float)(rand() % 100) / 10.0f;
   }
 
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_intrinsic.data(),
-                                                     H, W, epsilon);
+  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(
+    X.data(), Y_intrinsic.data(), H, W, epsilon);
   rms_norm_fp32_reference(X.data(), Y_reference.data(), H, W, epsilon);
 
   float mse_error = mse<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
-  double cos_sim = cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
+  double cos_sim =
+    cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
 
   const float epsilon_tolerance = 1e-6f;
   EXPECT_IN_RANGE(mse_error, 0.0f, epsilon_tolerance);
@@ -229,12 +235,13 @@ TEST(rms_norm_fp32_intrinsic, single_column) {
     X[i] = (float)(rand() % 100) / 10.0f;
   }
 
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_intrinsic.data(),
-                                                     H, W, epsilon);
+  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(
+    X.data(), Y_intrinsic.data(), H, W, epsilon);
   rms_norm_fp32_reference(X.data(), Y_reference.data(), H, W, epsilon);
 
   float mse_error = mse<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
-  double cos_sim = cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
+  double cos_sim =
+    cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
 
   const float epsilon_tolerance = 1e-6f;
   EXPECT_IN_RANGE(mse_error, 0.0f, epsilon_tolerance);
@@ -253,15 +260,17 @@ TEST(rms_norm_fp32_intrinsic, negative_values) {
 
   // Initialize with both positive and negative values
   for (size_t i = 0; i < H * W; ++i) {
-    X[i] = (float)((rand() % 200) - 100) / 10.0f; // Values between -10.0 and 9.9
+    X[i] =
+      (float)((rand() % 200) - 100) / 10.0f; // Values between -10.0 and 9.9
   }
 
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_intrinsic.data(),
-                                                     H, W, epsilon);
+  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(
+    X.data(), Y_intrinsic.data(), H, W, epsilon);
   rms_norm_fp32_reference(X.data(), Y_reference.data(), H, W, epsilon);
 
   float mse_error = mse<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
-  double cos_sim = cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
+  double cos_sim =
+    cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
 
   const float epsilon_tolerance = 1e-6f;
   EXPECT_IN_RANGE(mse_error, 0.0f, epsilon_tolerance);
@@ -278,8 +287,8 @@ TEST(rms_norm_fp32_intrinsic, zero_values) {
   std::vector<float> Y_intrinsic(H * W);
   std::vector<float> Y_reference(H * W);
 
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_intrinsic.data(),
-                                                     H, W, epsilon);
+  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(
+    X.data(), Y_intrinsic.data(), H, W, epsilon);
   rms_norm_fp32_reference(X.data(), Y_reference.data(), H, W, epsilon);
 
   float mse_error = mse<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
@@ -301,12 +310,13 @@ TEST(rms_norm_fp32_intrinsic, large_dimensions_100_1024) {
     X[i] = (float)(rand() % 100) / 10.0f;
   }
 
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_intrinsic.data(),
-                                                     H, W, epsilon);
+  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(
+    X.data(), Y_intrinsic.data(), H, W, epsilon);
   rms_norm_fp32_reference(X.data(), Y_reference.data(), H, W, epsilon);
 
   float mse_error = mse<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
-  double cos_sim = cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
+  double cos_sim =
+    cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
 
   const float epsilon_tolerance = 1e-6f;
   EXPECT_IN_RANGE(mse_error, 0.0f, epsilon_tolerance);
@@ -327,12 +337,13 @@ TEST(rms_norm_fp32_intrinsic, width_divisible_by_8) {
     X[i] = (float)(rand() % 100) / 10.0f;
   }
 
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_intrinsic.data(),
-                                                     H, W, epsilon);
+  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(
+    X.data(), Y_intrinsic.data(), H, W, epsilon);
   rms_norm_fp32_reference(X.data(), Y_reference.data(), H, W, epsilon);
 
   float mse_error = mse<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
-  double cos_sim = cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
+  double cos_sim =
+    cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
 
   const float epsilon_tolerance = 1e-6f;
   EXPECT_IN_RANGE(mse_error, 0.0f, epsilon_tolerance);
@@ -353,12 +364,13 @@ TEST(rms_norm_fp32_intrinsic, width_remainder_4) {
     X[i] = (float)(rand() % 100) / 10.0f;
   }
 
-  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(X.data(), Y_intrinsic.data(),
-                                                     H, W, epsilon);
+  nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic(
+    X.data(), Y_intrinsic.data(), H, W, epsilon);
   rms_norm_fp32_reference(X.data(), Y_reference.data(), H, W, epsilon);
 
   float mse_error = mse<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
-  double cos_sim = cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
+  double cos_sim =
+    cosine_similarity<float>(Y_intrinsic.data(), Y_reference.data(), H * W);
 
   const float epsilon_tolerance = 1e-6f;
   EXPECT_IN_RANGE(mse_error, 0.0f, epsilon_tolerance);
@@ -369,29 +381,30 @@ TEST(rms_norm_fp32_intrinsic, width_remainder_4) {
 TEST(rms_norm_fp32_intrinsic, verify_function_called) {
   // Get function pointer
   auto func_ptr = &nntrainer::neon::rms_norm_wrt_width_fp32_intrinsic;
-  
+
   size_t H = 2;
   size_t W = 8;
   float epsilon = 1e-6f;
-  
+
   std::vector<float> X(H * W);
   std::vector<float> Y(H * W);
   std::vector<float> Y_ref(H * W);
-  
+
   // Fill with known values
   for (size_t i = 0; i < H * W; ++i) {
     X[i] = static_cast<float>(i + 1);
   }
-  
+
   // Call via function pointer
   func_ptr(X.data(), Y.data(), H, W, epsilon);
-  
+
   // Call reference implementation
   rms_norm_fp32_reference(X.data(), Y_ref.data(), H, W, epsilon);
-  
+
   // Verify results match
   float mse_error = mse<float>(Y.data(), Y_ref.data(), H * W);
-  EXPECT_LE(mse_error, 1e-6f) << "Function should be called and produce correct results";
+  EXPECT_LE(mse_error, 1e-6f)
+    << "Function should be called and produce correct results";
 }
 
 #endif // __ARM_NEON
