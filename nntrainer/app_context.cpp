@@ -403,7 +403,8 @@ void AppContext::add_default_object() {
   registerFactory(nntrainer::createLayer<ChannelShuffle>, ChannelShuffle::type,
                   LayerType::LAYER_CHANNEL_SHUFFLE);
 
-  registerFactory(nntrainer::createLayer<EmbeddingLayer>, EmbeddingLayer::type,
+  registerFactory(nntrainer::createLayer<causallm::EmbeddingLayer>,
+                  causallm::EmbeddingLayer::type,
                   LayerType::LAYER_EMBEDDING_LAYER);
 
 #ifdef ENABLE_NNSTREAMER_BACKBONE

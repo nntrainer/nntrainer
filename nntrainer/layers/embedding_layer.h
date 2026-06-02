@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2021 Jijoong Moon <jijoong.moon@samsung.com>
  *
- * @file   embedding.h
+ * @file   embedding_layer.h
  * @date   04 March 2021
  * @brief  This is Embedding Layer Class of Neural Network
  * @see    https://github.com/nntrainer/nntrainer
@@ -134,4 +134,4 @@ private:
 } // namespace causallm
 
 #endif /* __cplusplus */
-#endif /* __EMBEDDING_H__ */
+#endif /* __EMBEDDING_LAYER_H__ */

@@ -506,7 +506,7 @@ void Transformer::registerCustomLayers() {
     app_context->registerFactory(
       nntrainer::createLayer<causallm::TieWordEmbedding>);
     app_context->registerFactory(
-      nntrainer::createLayer<nntrainer::EmbeddingLayer>);
+      nntrainer::createLayer<causallm::EmbeddingLayer>);
 
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
