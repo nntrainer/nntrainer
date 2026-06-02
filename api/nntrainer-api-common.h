@@ -92,7 +92,7 @@ typedef enum {
     51,                             /**< ReduceMean Layer type (Since 10.0) */
   ML_TRAIN_LAYER_TYPE_RESHAPE = 52, /**< Reshape Layer type (Since 10.0) */
   ML_TRAIN_LAYER_TYPE_UPSAMPLE2D =
-    53,                            /**< Upsample2D Layer type (Since 10.0) */
+    53, /**< Upsample2D Layer type (Since 10.0) */
   ML_TRAIN_LAYER_TYPE_EMBEDDING_LAYER =
     55, /**< Embedding Layer type (Since 10.0) */
   ML_TRAIN_LAYER_TYPE_PREPROCESS_FLIP =

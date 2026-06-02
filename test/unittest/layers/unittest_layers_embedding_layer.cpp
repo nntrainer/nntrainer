@@ -14,14 +14,14 @@
 
 #include <gtest/gtest.h>
 
-#include <layers_common_tests.h>
 #include "embedding_layer.h"
+#include <layers_common_tests.h>
 
 auto causallm_embedding_golden = LayerGoldenTestParamType(
-  nntrainer::createLayer<causallm::EmbeddingLayer>, {"in_dim=100", "out_dim=10"},
-  "2:1:1:10", "causallm_embedding_layer.nnlayergolden",
-  LayerGoldenTestParamOptions::USE_INC_FORWARD,
-  "nchw", "fp32", "fp32");
+  nntrainer::createLayer<causallm::EmbeddingLayer>,
+  {"in_dim=100", "out_dim=10"}, "2:1:1:10",
+  "causallm_embedding_layer.nnlayergolden",
+  LayerGoldenTestParamOptions::USE_INC_FORWARD, "nchw", "fp32", "fp32");
 
 GTEST_PARAMETER_TEST(CausalLMEmbedding, LayerGoldenTest,
                      ::testing::Values(causallm_embedding_golden));

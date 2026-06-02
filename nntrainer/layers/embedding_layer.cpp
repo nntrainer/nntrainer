@@ -126,8 +126,8 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
       nntrainer::Tensor cur_weight =
         weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
-      nntrainer::Tensor out_tensor =
-        batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (from + i));
+      nntrainer::Tensor out_tensor = batchsliced_hidden.getSharedDataTensor(
+        out_tensor_dim, out_dim * (from + i));
 
       if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K) {
         ///@note this should be replaced with quantizer operation
@@ -168,9 +168,10 @@ void EmbeddingLayer::calcGradient(nntrainer::RunLayerContext &context) {
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   const nntrainer::Tensor &dy = context.getIncomingDerivative(SINGLE_INOUT_IDX);
   nntrainer::Tensor &dweight = context.getWeightGrad(weight_idx);
-  
+
   float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
-    ? 1.0f : std::get<nntrainer::props::Scale>(embedding_props).get();
+                  ? 1.0f
+                  : std::get<nntrainer::props::Scale>(embedding_props).get();
 
   size_t batch = in.batch();
   size_t seq_len = in.getDim().getFeatureLen();
@@ -182,16 +183,18 @@ void EmbeddingLayer::calcGradient(nntrainer::RunLayerContext &context) {
   dweight.setZero();
 
   for (size_t b = 0; b < batch; ++b) {
-    const float *in_data = in.getAddress<float>(b * in.getDim().getFeatureLen());
+    const float *in_data =
+      in.getAddress<float>(b * in.getDim().getFeatureLen());
     const float *dy_batch_data = dy_data + b * dy.getDim().getFeatureLen();
     for (size_t i = 0; i < seq_len; ++i) {
       unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
-      if (embed_idx >= in_dim) continue;
-      
+      if (embed_idx >= in_dim)
+        continue;
+
       float *dw_row = dw_data + embed_idx * out_dim;
       const float *dy_row = dy_batch_data + i * out_dim;
       for (size_t j = 0; j < out_dim; ++j) {
-         dw_row[j] += dy_row[j] * scale;
+        dw_row[j] += dy_row[j] * scale;
       }
     }
   }
