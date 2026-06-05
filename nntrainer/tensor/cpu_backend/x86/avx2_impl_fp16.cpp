@@ -13,6 +13,7 @@
  */
 
 #include "avx2_internal.h"
+#include <algorithm>
 #include <avx2_impl.h>
 #include <cassert>
 #include <cmath>
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <immintrin.h>
 #include <limits>
+#include <nntrainer_error.h>
 #include <type_traits>
 #include <util_func.h>
 #include <vector>
@@ -1813,6 +1815,258 @@ void scopy_int8_to_float16(const unsigned int N, const int8_t *X,
       Y[idx * incY] = static_cast<_Float16>(X[idx * incX]);
     }
   }
+}
+
+/*****************************************************************************
+ * FP16-input attention kernels (AVX2 + F16C).
+ *
+ * x86 has no native FP16 arithmetic, so every operation is done in FP32:
+ * operands are widened with F16C on load and narrowed on store. These mirror
+ * the ARM NEON FP16 kernels in neon_impl_fp16.cpp but accumulate in FP32 for
+ * accuracy. Scratch buffers are static thread_local for zero per-call
+ * allocations (each ThreadManager worker owns its own copy).
+ *****************************************************************************/
+
+/// Load 8 contiguous FP16 values and widen to FP32.
+static inline __m256 load8_f16_to_f32(const _Float16 *p) {
+  return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(p)));
+}
+
+/// Narrow 8 FP32 values to FP16 and store contiguously.
+static inline void store8_f32_to_f16(_Float16 *p, __m256 v) {
+  _mm_storeu_si128(reinterpret_cast<__m128i *>(p),
+                   _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT));
+}
+
+void compute_kcaches(const _Float16 *in, const _Float16 *kcache,
+                     _Float16 *output, int num_rows, int num_cache_head,
+                     int head_dim, int gqa_size, int tile_size,
+                     size_t local_window_size, int head_start, int head_end) {
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
+
+  int start_row =
+    num_rows < local_window_size ? 0 : num_rows - local_window_size;
+  int row_cnt = num_rows < local_window_size ? num_rows : local_window_size;
+  const int tile_count = (row_cnt + tile_size - 1) / tile_size;
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int t = 0; t < tile_count; ++t) {
+      int row_tile_start = t * tile_size;
+      int tile_rows = std::min(tile_size, row_cnt - row_tile_start);
+
+      for (int g = 0; g < gqa_size; ++g) {
+        const _Float16 *in_ptr = in + (n * gqa_size + g) * head_dim;
+        for (int t_row = 0; t_row < tile_rows; ++t_row) {
+          int row = start_row + row_tile_start + t_row;
+          if (t_row + 1 < tile_rows) {
+            const _Float16 *next_kptr =
+              kcache + ((row + 1) * num_cache_head + n) * head_dim;
+            _mm_prefetch(reinterpret_cast<const char *>(next_kptr),
+                         _MM_HINT_T0);
+          }
+          const _Float16 *k_row =
+            kcache + (row * num_cache_head + n) * head_dim;
+
+          // Dot product of the FP16 query and key rows, widened to FP32.
+          float sum = 0.0f;
+          int i = 0;
+          __m256 acc = _mm256_setzero_ps();
+          for (; i + 8 <= head_dim; i += 8) {
+            acc = _mm256_fmadd_ps(load8_f16_to_f32(in_ptr + i),
+                                  load8_f16_to_f32(k_row + i), acc);
+          }
+          sum += hsum_avx(acc);
+          for (; i < head_dim; ++i)
+            sum += static_cast<float>(in_ptr[i]) * static_cast<float>(k_row[i]);
+
+          output[(row - start_row) * num_cache_head * gqa_size + n * gqa_size +
+                 g] =
+            static_cast<_Float16>(sum /
+                                  std::sqrt(static_cast<float>(head_dim)));
+        }
+      }
+    }
+  }
+}
+
+void compute_fp16vcache_transposed(int row_num, const _Float16 *in,
+                                   const _Float16 *vcache, _Float16 *output,
+                                   int num_cache_head, int gqa_size,
+                                   int head_dim, size_t local_window_size,
+                                   int head_start, int head_end) {
+  int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
+  NNTR_THROW_IF(head_start >= actual_head_end, std::invalid_argument)
+    << "head_start (" << head_start << ") must be less than head_end ("
+    << actual_head_end << ")";
+
+  const int num_blocks = head_dim / 8;
+  const int rem = head_dim % 8;
+
+  // Reusable thread-local FP32 accumulators (0 per-call allocations).
+  static thread_local std::vector<float> sumVec;
+  static thread_local std::vector<float> sumRem;
+  sumVec.resize((size_t)std::max(1, num_blocks * gqa_size) * 8);
+  sumRem.resize((size_t)gqa_size * rem);
+
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int i = 0; i < num_blocks * gqa_size; ++i) {
+      _mm256_storeu_ps(&sumVec[(size_t)i * 8], _mm256_setzero_ps());
+    }
+    std::fill(sumRem.begin(), sumRem.end(), 0.0f);
+
+    for (int j = row_num < local_window_size ? 0
+                                             : row_num + 1 - local_window_size;
+         j <= row_num; ++j) {
+      const _Float16 *vptr = vcache + (j * num_cache_head + n) * head_dim;
+
+      for (int h = 0; h < gqa_size; ++h) {
+        float a_val = static_cast<float>(
+          in[(row_num < local_window_size
+                ? (size_t)j
+                : (size_t)(j - (row_num + 1 - local_window_size))) *
+               (size_t)(gqa_size * num_cache_head) +
+             (size_t)(n * gqa_size) + h]);
+
+        __m256 inVec = _mm256_set1_ps(a_val);
+        for (int b = 0; b < num_blocks; ++b) {
+          __m256 bVec = load8_f16_to_f32(vptr + b * 8);
+          float *accPtr = &sumVec[(size_t)(h * num_blocks + b) * 8];
+          _mm256_storeu_ps(
+            accPtr, _mm256_fmadd_ps(inVec, bVec, _mm256_loadu_ps(accPtr)));
+        }
+
+        float *remPtr = &sumRem[(size_t)h * rem];
+        int base = num_blocks * 8;
+        for (int r = 0; r < rem; ++r) {
+          remPtr[r] += a_val * static_cast<float>(vptr[base + r]);
+        }
+      }
+    }
+
+    for (int h = 0; h < gqa_size; ++h) {
+      for (int b = 0; b < num_blocks; ++b) {
+        int out_base = (n * gqa_size + h) * head_dim + b * 8;
+        store8_f32_to_f16(
+          &output[out_base],
+          _mm256_loadu_ps(&sumVec[(size_t)(h * num_blocks + b) * 8]));
+      }
+      float *remPtr = &sumRem[(size_t)h * rem];
+      int base = num_blocks * 8;
+      for (int r = 0; r < rem; ++r) {
+        output[(n * gqa_size + h) * head_dim + base + r] =
+          static_cast<_Float16>(remPtr[r]);
+      }
+    }
+  }
+}
+
+/// FP32-precision multi-head softmax over FP16 rows. `sink16`/`sink32` are
+/// mutually exclusive; both null means the no-sink variant.
+static void softmax_row_fp16_core(_Float16 *qk_out, size_t start_row,
+                                  size_t end_row, size_t num_heads,
+                                  const _Float16 *sink16, const float *sink32) {
+  const size_t vec_end = num_heads & ~((size_t)7);
+  const bool has_sink = (sink16 != nullptr) || (sink32 != nullptr);
+
+  static thread_local std::vector<float> max_buf;
+  static thread_local std::vector<float> sum_buf;
+  max_buf.resize(num_heads);
+  sum_buf.resize(num_heads);
+  float *max_vals = max_buf.data();
+  float *sum_vals = sum_buf.data();
+
+  // 1. find max per head (seed from sink, else from the first row)
+  size_t max_start = start_row;
+  if (has_sink) {
+    for (size_t c = 0; c < num_heads; ++c)
+      max_vals[c] = sink16 ? static_cast<float>(sink16[c]) : sink32[c];
+  } else {
+    const _Float16 *row0 = qk_out + start_row * num_heads;
+    for (size_t c = 0; c < num_heads; ++c)
+      max_vals[c] = static_cast<float>(row0[c]);
+    max_start = start_row + 1;
+  }
+  for (size_t r = max_start; r < end_row; ++r) {
+    const _Float16 *row = qk_out + num_heads * r;
+    size_t c = 0;
+    for (; c < vec_end; c += 8) {
+      __m256 m =
+        _mm256_max_ps(load8_f16_to_f32(row + c), _mm256_loadu_ps(max_vals + c));
+      _mm256_storeu_ps(max_vals + c, m);
+    }
+    for (; c < num_heads; ++c)
+      max_vals[c] = std::max(max_vals[c], static_cast<float>(row[c]));
+  }
+
+  // 2. exp(x - max), store back as FP16, accumulate sum (seed with
+  // exp(sink-max))
+  if (has_sink) {
+    size_t c = 0;
+    for (; c < vec_end; c += 8) {
+      __m256 v =
+        sink16 ? load8_f16_to_f32(sink16 + c) : _mm256_loadu_ps(sink32 + c);
+      __m256 e = exp256_ps(_mm256_sub_ps(v, _mm256_loadu_ps(max_vals + c)));
+      _mm256_storeu_ps(sum_vals + c, e);
+    }
+    for (; c < num_heads; ++c) {
+      float s = sink16 ? static_cast<float>(sink16[c]) : sink32[c];
+      sum_vals[c] = std::exp(s - max_vals[c]);
+    }
+  } else {
+    std::fill(sum_buf.begin(), sum_buf.end(), 0.0f);
+  }
+
+  for (size_t r = start_row; r < end_row; ++r) {
+    _Float16 *row = qk_out + num_heads * r;
+    size_t c = 0;
+    for (; c < vec_end; c += 8) {
+      __m256 e = exp256_ps(_mm256_sub_ps(load8_f16_to_f32(row + c),
+                                         _mm256_loadu_ps(max_vals + c)));
+      store8_f32_to_f16(row + c, e);
+      _mm256_storeu_ps(sum_vals + c,
+                       _mm256_add_ps(_mm256_loadu_ps(sum_vals + c), e));
+    }
+    for (; c < num_heads; ++c) {
+      float e = std::exp(static_cast<float>(row[c]) - max_vals[c]);
+      row[c] = static_cast<_Float16>(e);
+      sum_vals[c] += e;
+    }
+  }
+
+  // 3. reciprocal of the sum (multiply is faster than divide)
+  {
+    size_t c = 0;
+    for (; c < vec_end; c += 8)
+      _mm256_storeu_ps(sum_vals + c, rcp_ps(_mm256_loadu_ps(sum_vals + c)));
+    for (; c < num_heads; ++c)
+      sum_vals[c] = 1.0f / sum_vals[c];
+  }
+
+  // 4. normalize: exp(x - max) * (1/sum)
+  for (size_t r = start_row; r < end_row; ++r) {
+    _Float16 *row = qk_out + num_heads * r;
+    size_t c = 0;
+    for (; c < vec_end; c += 8) {
+      store8_f32_to_f16(row + c, _mm256_mul_ps(load8_f16_to_f32(row + c),
+                                               _mm256_loadu_ps(sum_vals + c)));
+    }
+    for (; c < num_heads; ++c)
+      row[c] = static_cast<_Float16>(static_cast<float>(row[c]) * sum_vals[c]);
+  }
+}
+
+template <>
+void softmax_row_inplace(_Float16 *qk_out, size_t start_row, size_t end_row,
+                         size_t num_heads, _Float16 *sink) {
+  softmax_row_fp16_core(qk_out, start_row, end_row, num_heads, sink, nullptr);
+}
+
+void softmax_row_inplace(_Float16 *qk_out, size_t start_row, size_t end_row,
+                         size_t num_heads, float *sink) {
+  softmax_row_fp16_core(qk_out, start_row, end_row, num_heads, nullptr, sink);
 }
 
 } // namespace nntrainer::avx2

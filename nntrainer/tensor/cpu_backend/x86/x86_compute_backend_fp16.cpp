@@ -326,6 +326,50 @@ void softmax(const unsigned int N, _FP16 *X, _FP16 *Y) {
   avx2::softmax(N, X, Y);
 }
 
+// FP16-input attention kernels (delegate to the AVX2+F16C implementations).
+// softmax_row shares semantics with the in-place variant, mirroring the ARM
+// backend.
+template <>
+void softmax_row_inplace(_FP16 *qk_out, size_t start_row, size_t end_row,
+                         size_t num_heads, _FP16 *sink) {
+  avx2::softmax_row_inplace<_FP16>(qk_out, start_row, end_row, num_heads, sink);
+}
+
+void softmax_row_inplace(_FP16 *qk_out, size_t start_row, size_t end_row,
+                         size_t num_heads, float *sink) {
+  avx2::softmax_row_inplace(qk_out, start_row, end_row, num_heads, sink);
+}
+
+template <>
+void softmax_row(_FP16 *qk_out, size_t start_row, size_t end_row,
+                 size_t num_heads, _FP16 *sink) {
+  avx2::softmax_row_inplace<_FP16>(qk_out, start_row, end_row, num_heads, sink);
+}
+
+void softmax_row(_FP16 *qk_out, size_t start_row, size_t end_row,
+                 size_t num_heads, float *sink) {
+  avx2::softmax_row_inplace(qk_out, start_row, end_row, num_heads, sink);
+}
+
+void compute_fp16vcache_transposed(int row_num, const _FP16 *in,
+                                   const _FP16 *vcache, _FP16 *output,
+                                   int num_cache_head, int gqa_size,
+                                   int head_dim, size_t local_window_size,
+                                   int head_start, int head_end) {
+  avx2::compute_fp16vcache_transposed(row_num, in, vcache, output,
+                                      num_cache_head, gqa_size, head_dim,
+                                      local_window_size, head_start, head_end);
+}
+
+void compute_kcaches(const _FP16 *in, const _FP16 *kcache, _FP16 *output,
+                     int num_rows, int num_cache_head, int head_dim,
+                     int gqa_size, int tile_size, size_t local_window_size,
+                     int head_start, int head_end) {
+  avx2::compute_kcaches(in, kcache, output, num_rows, num_cache_head, head_dim,
+                        gqa_size, tile_size, local_window_size, head_start,
+                        head_end);
+}
+
 template <> void dequantize_row_q8_0(const void *x_raw, _FP16 *y, int64_t k) {
   __ggml_dequantize_row_q8_0(x_raw, y, k);
 }

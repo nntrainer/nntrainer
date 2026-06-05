@@ -1256,6 +1256,137 @@ TEST(nntrainer_cpu_backend_standalone, compute_fp16vcache_transposed_fp16) {
 }
 #endif
 
+// x86 AVX2+F16C FP16-input attention kernels. The x86 path computes in FP32
+// internally (no native FP16 arithmetic), so rather than depend on the ARM
+// FP16-rounded golden values above we verify against an in-test FP32 software
+// reference within FP16 tolerance.
+#if defined(ENABLE_FP16) && defined(__AVX2__)
+namespace {
+// Per-head softmax across rows [start_row, end_row). sink (optional) seeds the
+// running max/sum, matching the kernel semantics.
+static std::vector<float> softmax_row_ref(const std::vector<float> &qk,
+                                          size_t start_row, size_t end_row,
+                                          size_t num_heads,
+                                          const std::vector<float> *sink) {
+  std::vector<float> out = qk;
+  for (size_t c = 0; c < num_heads; ++c) {
+    float m = sink ? (*sink)[c] : qk[start_row * num_heads + c];
+    for (size_t r = (sink ? start_row : start_row + 1); r < end_row; ++r)
+      m = std::max(m, qk[r * num_heads + c]);
+    float sum = sink ? std::exp((*sink)[c] - m) : 0.0f;
+    for (size_t r = start_row; r < end_row; ++r)
+      sum += std::exp(qk[r * num_heads + c] - m);
+    for (size_t r = start_row; r < end_row; ++r)
+      out[r * num_heads + c] = std::exp(qk[r * num_heads + c] - m) / sum;
+  }
+  return out;
+}
+
+static std::vector<float> to_f32(const std::vector<_FP16> &v) {
+  return std::vector<float>(v.begin(), v.end());
+}
+} // namespace
+
+TEST(nntrainer_cpu_backend_standalone, compute_softmax_row_inplace_fp16_x86) {
+  size_t start_row = 0, end_row = 3, num_heads = 10;
+  auto qk_f = generate_random_vector<float>(num_heads * end_row, -8.0f, 8.0f);
+  std::vector<_FP16> qk(qk_f.begin(), qk_f.end());
+  auto ref =
+    softmax_row_ref(to_f32(qk), start_row, end_row, num_heads, nullptr);
+
+  nntrainer::softmax_row_inplace(qk.data(), start_row, end_row, num_heads);
+
+  for (size_t i = 0; i < qk.size(); i++)
+    EXPECT_NEAR(ref[i], static_cast<float>(qk[i]), 5e-3f);
+}
+
+TEST(nntrainer_cpu_backend_standalone,
+     compute_softmax_row_inplace_fp16_sink_x86) {
+  size_t start_row = 0, end_row = 2, num_heads = 10;
+  auto qk_f = generate_random_vector<float>(num_heads * end_row, -8.0f, 8.0f);
+  auto sink_f = generate_random_vector<float>(num_heads, -8.0f, 8.0f);
+  std::vector<_FP16> qk(qk_f.begin(), qk_f.end());
+  std::vector<_FP16> sink(sink_f.begin(), sink_f.end());
+  auto sink32 = to_f32(sink);
+  auto ref =
+    softmax_row_ref(to_f32(qk), start_row, end_row, num_heads, &sink32);
+
+  nntrainer::softmax_row_inplace(qk.data(), start_row, end_row, num_heads,
+                                 sink.data());
+
+  for (size_t i = 0; i < qk.size(); i++)
+    EXPECT_NEAR(ref[i], static_cast<float>(qk[i]), 5e-3f);
+}
+
+TEST(nntrainer_cpu_backend_standalone,
+     compute_softmax_row_inplace_fp32sink_x86) {
+  size_t start_row = 0, end_row = 2, num_heads = 10;
+  auto qk_f = generate_random_vector<float>(num_heads * end_row, -8.0f, 8.0f);
+  auto sink32 = generate_random_vector<float>(num_heads, -8.0f, 8.0f);
+  std::vector<_FP16> qk(qk_f.begin(), qk_f.end());
+  auto ref =
+    softmax_row_ref(to_f32(qk), start_row, end_row, num_heads, &sink32);
+
+  nntrainer::softmax_row_inplace(qk.data(), start_row, end_row, num_heads,
+                                 sink32.data());
+
+  for (size_t i = 0; i < qk.size(); i++)
+    EXPECT_NEAR(ref[i], static_cast<float>(qk[i]), 5e-3f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, compute_kcaches_fp16_x86) {
+  int num_rows = 5, N = 2, head_dim = 10, gqa = 4, tile_size = 16;
+  auto in_f = generate_random_vector<float>(N * gqa * head_dim, -1.0f, 1.0f);
+  auto kc_f =
+    generate_random_vector<float>(num_rows * N * head_dim, -1.0f, 1.0f);
+  std::vector<_FP16> in(in_f.begin(), in_f.end());
+  std::vector<_FP16> kcache(kc_f.begin(), kc_f.end());
+  std::vector<_FP16> output((size_t)num_rows * N * gqa, (_FP16)0.0f);
+  auto inq = to_f32(in), kcq = to_f32(kcache);
+
+  nntrainer::compute_kcaches(in.data(), kcache.data(), output.data(), num_rows,
+                             N, head_dim, gqa, tile_size);
+
+  const float scale = 1.0f / std::sqrt((float)head_dim);
+  for (int row = 0; row < num_rows; ++row)
+    for (int n = 0; n < N; ++n)
+      for (int g = 0; g < gqa; ++g) {
+        float sum = 0.0f;
+        for (int i = 0; i < head_dim; ++i)
+          sum += inq[(n * gqa + g) * head_dim + i] *
+                 kcq[(row * N + n) * head_dim + i];
+        float ref = sum * scale;
+        float got = static_cast<float>(output[row * N * gqa + n * gqa + g]);
+        EXPECT_NEAR(ref, got, 5e-3f);
+      }
+}
+
+TEST(nntrainer_cpu_backend_standalone, compute_fp16vcache_transposed_fp16_x86) {
+  int row_num = 3, N = 2, gqa = 2, head_dim = 9;
+  int rows = row_num + 1;
+  auto in_f = generate_random_vector<float>(rows * gqa * N, -1.0f, 1.0f);
+  auto vc_f = generate_random_vector<float>(rows * N * head_dim, -1.0f, 1.0f);
+  std::vector<_FP16> in(in_f.begin(), in_f.end());
+  std::vector<_FP16> vcache(vc_f.begin(), vc_f.end());
+  std::vector<_FP16> output((size_t)N * gqa * head_dim, (_FP16)0.0f);
+  auto inq = to_f32(in), vcq = to_f32(vcache);
+
+  nntrainer::compute_fp16vcache_transposed(row_num, in.data(), vcache.data(),
+                                           output.data(), N, gqa, head_dim);
+
+  for (int n = 0; n < N; ++n)
+    for (int h = 0; h < gqa; ++h)
+      for (int d = 0; d < head_dim; ++d) {
+        float acc = 0.0f;
+        for (int j = 0; j <= row_num; ++j)
+          acc +=
+            inq[j * gqa * N + n * gqa + h] * vcq[(j * N + n) * head_dim + d];
+        float got = static_cast<float>(output[(n * gqa + h) * head_dim + d]);
+        EXPECT_NEAR(acc, got, 5e-3f);
+      }
+}
+#endif
+
 static void run_clamp_test(const unsigned int N, float lower_bound,
                            float upper_bound, bool print = false) {
   const int TEST_CNT = 20;

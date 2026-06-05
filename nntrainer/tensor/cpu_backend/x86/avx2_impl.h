@@ -473,6 +473,44 @@ void compute_kcaches(const float *in, const BType *kcache, float *output,
                      size_t local_window_size = UINT_MAX, int head_start = 0,
                      int head_end = -1);
 
+#ifdef ENABLE_FP16
+/**
+ * @brief FP16-input multi-head softmax (in-place). FP16 sink variant; sink may
+ * be nullptr. Math is done in FP32 internally.
+ */
+template <>
+void softmax_row_inplace(_Float16 *qk_out, size_t start_row, size_t end_row,
+                         size_t num_heads, _Float16 *sink);
+
+/**
+ * @brief FP16-input multi-head softmax (in-place), mixed-precision FP32 sink.
+ */
+void softmax_row_inplace(_Float16 *qk_out, size_t start_row, size_t end_row,
+                         size_t num_heads, float *sink);
+
+/**
+ * @brief FP16-input scaled dot product Q*K^T (kcache). See the FP32 overload
+ * for parameter semantics; all operands and the output are FP16.
+ */
+void compute_kcaches(const _Float16 *in, const _Float16 *kcache,
+                     _Float16 *output, int num_rows, int num_cache_head,
+                     int head_dim, int gqa_size, int tile_size,
+                     size_t local_window_size = UINT_MAX, int head_start = 0,
+                     int head_end = -1);
+
+/**
+ * @brief FP16-input attention-weighted value aggregation (softmax_out * V).
+ * See compute_fp16vcache_fp32_transposed for parameter semantics; all operands
+ * and the output are FP16.
+ */
+void compute_fp16vcache_transposed(int row_num, const _Float16 *in,
+                                   const _Float16 *vcache, _Float16 *output,
+                                   int num_cache_head, int gqa_size,
+                                   int head_dim,
+                                   size_t local_window_size = UINT_MAX,
+                                   int head_start = 0, int head_end = -1);
+#endif
+
 /**
  * @brief Compute rotary embedding value
  * @param[in] width current w value from b, c, h, w

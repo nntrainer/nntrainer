@@ -1355,8 +1355,12 @@ static void softmax_row_inplace(float *qk_out, size_t start_row, size_t end_row,
                                 size_t num_heads) {
   const size_t vec_end = num_heads & ~((size_t)7); // floor(num_heads / 8) * 8
 
-  // 1. find max for each head
-  float *max_vals = new float[num_heads];
+  // 1. find max for each head (reusable thread-local scratch: 0 per-call alloc)
+  static thread_local std::vector<float> max_vals_buf;
+  static thread_local std::vector<float> sum_vals_buf;
+  max_vals_buf.resize(num_heads);
+  sum_vals_buf.resize(num_heads);
+  float *max_vals = max_vals_buf.data();
 
   // initialize max_vals with first row of qk_out
   std::memcpy(max_vals, qk_out + start_row * num_heads,
@@ -1377,7 +1381,7 @@ static void softmax_row_inplace(float *qk_out, size_t start_row, size_t end_row,
   }
 
   // 2. calc exp(x - max) and sum
-  float *sum_vals = new float[num_heads];
+  float *sum_vals = sum_vals_buf.data();
   std::memset(sum_vals, 0, num_heads * sizeof(float));
 
   for (size_t r = start_row; r < end_row; ++r) {
@@ -1424,9 +1428,6 @@ static void softmax_row_inplace(float *qk_out, size_t start_row, size_t end_row,
       row[c] *= sum_vals[c];
     }
   }
-
-  delete[] max_vals;
-  delete[] sum_vals;
 }
 
 static void softmax_row_with_sink_inplace(float *qk_out, size_t start_row,
@@ -1434,8 +1435,12 @@ static void softmax_row_with_sink_inplace(float *qk_out, size_t start_row,
                                           float *sink) {
   const size_t vec_end = num_heads & ~((size_t)7); // floor(num_heads / 8) * 8
 
-  // 1. find max for each head
-  float *max_vals = new float[num_heads];
+  // 1. find max for each head (reusable thread-local scratch: 0 per-call alloc)
+  static thread_local std::vector<float> max_vals_buf;
+  static thread_local std::vector<float> sum_vals_buf;
+  max_vals_buf.resize(num_heads);
+  sum_vals_buf.resize(num_heads);
+  float *max_vals = max_vals_buf.data();
 
   // initialize max_vals with sink
   std::memcpy(max_vals, sink, num_heads * sizeof(float));
@@ -1455,7 +1460,7 @@ static void softmax_row_with_sink_inplace(float *qk_out, size_t start_row,
   }
 
   // 2. calc exp(x - max) and sum
-  float *sum_vals = new float[num_heads];
+  float *sum_vals = sum_vals_buf.data();
   // init sum_vals with exp(sink - max)
   {
     for (size_t c = 0; c < vec_end; c += 8) {
@@ -1515,9 +1520,6 @@ static void softmax_row_with_sink_inplace(float *qk_out, size_t start_row,
       row[c] *= sum_vals[c];
     }
   }
-
-  delete[] max_vals;
-  delete[] sum_vals;
 }
 
 template <>
@@ -1641,22 +1643,26 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
     << "head_start (" << head_start << ") must be less than head_end ("
     << actual_head_end << ")";
 
-  std::vector<float> tmp_fp32(head_dim);
-  int num_blocks = head_dim / 8;
-  __m256 *sumVec = new __m256[std::max(1, num_blocks * gqa_size)];
+  const int num_blocks = head_dim / 8;
+  const int rem = head_dim % 8;
+
+  // Reusable thread-local scratch so the kernel performs zero per-call
+  // allocations after warm-up (ThreadManager::parallel_for gives each worker
+  // its own thread_local copy). sumVec holds num_blocks*gqa_size accumulator
+  // vectors as a flat float buffer (8 floats each) to avoid the
+  // -Wignored-attributes warning that a std::vector<__m256> would raise.
+  static thread_local std::vector<float> tmp_fp32;
+  static thread_local std::vector<float> sumVec;
+  static thread_local std::vector<float> sumRem;
+  tmp_fp32.resize(head_dim);
+  sumVec.resize((size_t)std::max(1, num_blocks * gqa_size) * 8);
+  sumRem.resize((size_t)gqa_size * rem);
 
   for (int n = head_start; n < actual_head_end; ++n) {
-    int rem = head_dim % 8;
-
-    /* Declaration: std::vector<__m256> sumVec(num_blocks * gqa_size,
-     * _mm256_setzero_ps()); caused warning: ignoring attributes on template
-     * argument ‘__m256’ [-Wignored-attributes].
-     * So it is implemented that way.
-     */
     for (int i = 0; i < num_blocks * gqa_size; i++) {
-      sumVec[i] = _mm256_setzero_ps();
+      _mm256_storeu_ps(&sumVec[(size_t)i * 8], _mm256_setzero_ps());
     }
-    std::vector<float> sumRem((size_t)gqa_size * rem, 0.0f);
+    std::fill(sumRem.begin(), sumRem.end(), 0.0f);
 
     for (int j = row_num < local_window_size ? 0
                                              : row_num + 1 - local_window_size;
@@ -1676,8 +1682,9 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
 
         for (int b = 0; b < num_blocks; ++b) {
           __m256 bVec = _mm256_loadu_ps(&tmp_fp32[b * 8]);
-          sumVec[h * num_blocks + b] =
-            _mm256_fmadd_ps(inVec, bVec, sumVec[h * num_blocks + b]);
+          float *accPtr = &sumVec[(size_t)(h * num_blocks + b) * 8];
+          _mm256_storeu_ps(
+            accPtr, _mm256_fmadd_ps(inVec, bVec, _mm256_loadu_ps(accPtr)));
         }
 
         float *remPtr = &sumRem.data()[h * rem];
@@ -1691,11 +1698,12 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
     for (int h = 0; h < gqa_size; ++h) {
       for (int b = 0; b < num_blocks; ++b) {
         int out_base = (n * gqa_size + h) * head_dim + b * 8;
-        _mm256_storeu_ps(&output[out_base], sumVec[h * num_blocks + b]);
+        _mm256_storeu_ps(
+          &output[out_base],
+          _mm256_loadu_ps(&sumVec[(size_t)(h * num_blocks + b) * 8]));
       }
 
       float *remPtr = &sumRem.data()[h * rem];
-      // float *remPtr = &sumRem[h * rem];
       int base = num_blocks * 8;
       for (int r = 0; r < rem; ++r) {
         int out_idx = (n * gqa_size + h) * head_dim + base + r;
@@ -1703,7 +1711,6 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
       }
     }
   }
-  delete[] sumVec;
 }
 
 template <>
@@ -1711,8 +1718,6 @@ void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
                      int num_rows, int num_cache_head, int head_dim,
                      int gqa_size, int tile_size, size_t local_window_size,
                      int head_start, int head_end) {
-  std::vector<float> tmp_fp32(head_dim);
-
   // If head_end is -1, process all heads from head_start to num_cache_head.
   // No other negative values are accepted for head_end.
   int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
@@ -1743,16 +1748,16 @@ void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
                          _MM_HINT_T0);
           }
           const uint16_t *kptr = kcache + (row * num_cache_head + n) * head_dim;
-          load_fp16_8_to_chunk(kptr, tmp_fp32.data(), head_dim);
 
-          const float *k_row = tmp_fp32.data();
-
+          // Convert the FP16 key row to FP32 on the fly inside the dot product
+          // (8 lanes via F16C) instead of staging it in a temporary buffer.
           float sum = 0.0f;
           int i = 0;
           __m256 acc = _mm256_setzero_ps();
           for (; i + 8 <= head_dim; i += 8) {
             __m256 va = _mm256_loadu_ps(in_ptr + i);
-            __m256 vb = _mm256_loadu_ps(k_row + i);
+            __m256 vb = convert_vector_f16_to_f32(
+              _mm_loadu_si128(reinterpret_cast<const __m128i *>(kptr + i)));
             acc = _mm256_fmadd_ps(va, vb, acc);
           }
 
@@ -1764,7 +1769,7 @@ void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
           sum += _mm_cvtss_f32(sum128);
 
           for (; i < head_dim; ++i)
-            sum += in_ptr[i] * k_row[i];
+            sum += in_ptr[i] * nntrainer::compute_fp16_to_fp32(kptr[i]);
 
           output[(row - start_row) * num_cache_head * gqa_size + n * gqa_size +
                  g] = sum / sqrt((float)head_dim);

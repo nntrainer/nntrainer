@@ -1193,6 +1193,43 @@ template <typename T = float>
 void softmax_row(T *qk_out, size_t start_row, size_t end_row, size_t num_heads,
                  T *sink = nullptr);
 
+#ifdef ENABLE_FP16
+/**
+ * @brief Multihead softmax with mixed precision, inplace version (overload).
+ * FP16 in/out with an FP32 sink (can be nullptr).
+ */
+void softmax_row_inplace(_FP16 *qk_out, size_t start_row, size_t end_row,
+                         size_t num_heads, float *sink);
+
+/**
+ * @brief Multihead softmax with mixed precision (overload). FP16 in/out with an
+ * FP32 sink (can be nullptr).
+ */
+void softmax_row(_FP16 *qk_out, size_t start_row, size_t end_row,
+                 size_t num_heads, float *sink);
+
+/**
+ * @brief FP16-input attention-weighted value aggregation (softmax_out * V).
+ * Mirrors compute_fp16vcache_fp32_transposed but with FP16 in/vcache/output.
+ */
+void compute_fp16vcache_transposed(int row_num, const _FP16 *in,
+                                   const _FP16 *vcache, _FP16 *output,
+                                   int num_cache_head, int gqa_size,
+                                   int head_dim,
+                                   size_t local_window_size = UINT_MAX,
+                                   int head_start = 0, int head_end = -1);
+
+/**
+ * @brief FP16-input scaled dot product Q*K^T. Mirrors the FP32 compute_kcaches
+ * but with FP16 in/kcache/output.
+ */
+void compute_kcaches(const _FP16 *in, const _FP16 *kcache, _FP16 *output,
+                     int num_rows, int num_cache_head, int head_dim,
+                     int gqa_size, int tile_size,
+                     size_t local_window_size = UINT_MAX, int head_start = 0,
+                     int head_end = -1);
+#endif
+
 /**
  * @brief Compute vcache for one row transposed
  * @param[in] row_num row number
