@@ -20,7 +20,9 @@
 #include <cstring>
 #include <immintrin.h>
 #include <limits>
+#include <type_traits>
 #include <util_func.h>
+#include <vector>
 
 using namespace nntrainer::avx2::internal;
 
@@ -1006,6 +1008,243 @@ _Float16 snrm2(const unsigned int N, const _Float16 *X,
     }
     return static_cast<_Float16>(std::sqrt(sum));
   }
+}
+
+namespace {
+
+/// Load 8 contiguous elements and widen to FP32 (F16C for _Float16, plain load
+/// for float). Lets one GEMV body serve FP16 and mixed-precision operands.
+template <typename T> inline __m256 gemv_load8(const T *p) {
+  if constexpr (std::is_same_v<T, float>) {
+    return _mm256_loadu_ps(p);
+  } else {
+    return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
+  }
+}
+
+/// Load 16 contiguous elements into two FP32 vectors.
+template <typename T>
+inline void gemv_load16(const T *p, __m256 &lo, __m256 &hi) {
+  if constexpr (std::is_same_v<T, float>) {
+    lo = _mm256_loadu_ps(p);
+    hi = _mm256_loadu_ps(p + 8);
+  } else {
+    __m256i raw = _mm256_loadu_si256((const __m256i *)p);
+    lo = _mm256_cvtph_ps(_mm256_castsi256_si128(raw));
+    hi = _mm256_cvtph_ps(_mm256_extracti128_si256(raw, 1));
+  }
+}
+
+/// Narrow an FP32 vector and store 8 elements (F16C for _Float16, plain store
+/// for float).
+template <typename T> inline void gemv_store8(T *p, __m256 v) {
+  if constexpr (std::is_same_v<T, float>) {
+    _mm256_storeu_ps(p, v);
+  } else {
+    _mm_storeu_si128((__m128i *)p,
+                     _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT));
+  }
+}
+
+template <typename OutT>
+void gemv_apply_beta(unsigned int out_len, float beta, OutT *Y,
+                     unsigned int incY) {
+  if (beta == 1.0f) {
+    return;
+  }
+
+  for (unsigned int i = 0; i < out_len; ++i) {
+    const std::size_t idx = static_cast<std::size_t>(i) * incY;
+    if (beta == 0.0f) {
+      Y[idx] = static_cast<OutT>(0.0f);
+    } else {
+      Y[idx] = static_cast<OutT>(beta * static_cast<float>(Y[idx]));
+    }
+  }
+}
+
+template <typename MatT, typename XContigT, typename OutT>
+void gemv_no_trans_contiguous_x(const unsigned int M, const unsigned int N,
+                                const float alpha, const MatT *A,
+                                const unsigned int lda, const XContigT *X,
+                                const float beta, OutT *Y,
+                                const unsigned int incY) {
+  const unsigned int N16 = N & ~15u;
+  for (unsigned int i = 0; i < M; ++i) {
+    const MatT *a_row = A + static_cast<std::size_t>(i) * lda;
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    unsigned int j = 0;
+    for (; j < N16; j += 16) {
+      __m256 af0, af1, xf0, xf1;
+      gemv_load16<MatT>(a_row + j, af0, af1);
+      gemv_load16<XContigT>(X + j, xf0, xf1);
+      acc0 = _mm256_fmadd_ps(af0, xf0, acc0);
+      acc1 = _mm256_fmadd_ps(af1, xf1, acc1);
+    }
+    __m256 acc = _mm256_add_ps(acc0, acc1);
+    if (j + 8 <= N) {
+      __m256 a32 = gemv_load8<MatT>(a_row + j);
+      __m256 x32 = gemv_load8<XContigT>(X + j);
+      acc = _mm256_fmadd_ps(a32, x32, acc);
+      j += 8;
+    }
+    float sum = hsum_avx(acc);
+    for (; j < N; ++j) {
+      sum += static_cast<float>(a_row[j]) * static_cast<float>(X[j]);
+    }
+
+    const std::size_t y_idx = static_cast<std::size_t>(i) * incY;
+    float y_new = alpha * sum;
+    if (beta != 0.0f) {
+      y_new += beta * static_cast<float>(Y[y_idx]);
+    }
+    Y[y_idx] = static_cast<OutT>(y_new);
+  }
+}
+
+/**
+ * @brief Shared row-major GEMV: Y = alpha * op(A) * X + beta * Y.
+ *
+ * @tparam MatT A element type (_Float16 or float)
+ * @tparam VecT X element type (_Float16 or float)
+ * @tparam OutT Y element type (_Float16 or float)
+ */
+template <typename MatT, typename VecT, typename OutT>
+void gemv_impl(bool TransA, const unsigned int M, const unsigned int N,
+               const float alpha, const MatT *A, const unsigned int lda,
+               const VecT *X, const unsigned int incX, const float beta,
+               OutT *Y, const unsigned int incY) {
+  assert(incX > 0 && incY > 0);
+  if (M == 0 || N == 0) {
+    return;
+  }
+
+  if (alpha == 0.0f) {
+    gemv_apply_beta<OutT>(TransA ? N : M, beta, Y, incY);
+    return;
+  }
+
+  if (TransA) {
+    // Y[0..N) = beta * Y + alpha * A^T * X.
+    // Stage the output in an FP32 scratch buffer so the row sweep over A
+    // does not pay a FP16<->FP32 round trip on Y every iteration.
+    const unsigned int out_len = N;
+    static thread_local std::vector<float> y32_scratch;
+    y32_scratch.resize(out_len);
+    float *Y32 = y32_scratch.data();
+
+    if (beta == 0.0f) {
+      std::memset(Y32, 0, out_len * sizeof(float));
+    } else if (incY == 1) {
+      const __m256 vbeta = _mm256_set1_ps(beta);
+      unsigned int j = 0;
+      for (; j + 8 <= out_len; j += 8) {
+        __m256 y32 = gemv_load8<OutT>(Y + j);
+        y32 = _mm256_mul_ps(y32, vbeta);
+        _mm256_storeu_ps(Y32 + j, y32);
+      }
+      for (; j < out_len; ++j) {
+        Y32[j] = beta * static_cast<float>(Y[j]);
+      }
+    } else {
+      for (unsigned int j = 0; j < out_len; ++j) {
+        Y32[j] = beta * static_cast<float>(Y[j * incY]);
+      }
+    }
+
+    // Per row i, Y32[0..N) += (alpha * X[i]) * A[i, 0..N).
+    for (unsigned int i = 0; i < M; ++i) {
+      const float scale = alpha * static_cast<float>(X[i * incX]);
+      if (scale == 0.0f) {
+        continue;
+      }
+      const __m256 vs = _mm256_set1_ps(scale);
+      const MatT *a_row = A + i * lda;
+      unsigned int j = 0;
+      for (; j + 8 <= out_len; j += 8) {
+        __m256 a32 = gemv_load8<MatT>(a_row + j);
+        __m256 y32 = _mm256_loadu_ps(Y32 + j);
+        y32 = _mm256_fmadd_ps(a32, vs, y32);
+        _mm256_storeu_ps(Y32 + j, y32);
+      }
+      for (; j < out_len; ++j) {
+        Y32[j] += scale * static_cast<float>(a_row[j]);
+      }
+    }
+
+    if (incY == 1) {
+      unsigned int j = 0;
+      for (; j + 8 <= out_len; j += 8) {
+        __m256 y32 = _mm256_loadu_ps(Y32 + j);
+        gemv_store8<OutT>(Y + j, y32);
+      }
+      for (; j < out_len; ++j) {
+        Y[j] = static_cast<OutT>(Y32[j]);
+      }
+    } else {
+      for (unsigned int j = 0; j < out_len; ++j) {
+        Y[j * incY] = static_cast<OutT>(Y32[j]);
+      }
+    }
+    return;
+  }
+
+  // TransA == false: per output row, dot product of A[i, :] with X[:].
+  // The dot length (N) is the contraction; A rows are unit-stride which
+  // matches the SIMD reduction pattern from sdot.
+  const unsigned int dot_len = N;
+  if (incX == 1) {
+    gemv_no_trans_contiguous_x<MatT, VecT, OutT>(M, dot_len, alpha, A, lda, X,
+                                                 beta, Y, incY);
+  } else if (dot_len >= 8) {
+    static thread_local std::vector<float> x32_scratch;
+    x32_scratch.resize(dot_len);
+    for (unsigned int j = 0; j < dot_len; ++j) {
+      x32_scratch[j] = static_cast<float>(X[j * incX]);
+    }
+    gemv_no_trans_contiguous_x<MatT, float, OutT>(
+      M, dot_len, alpha, A, lda, x32_scratch.data(), beta, Y, incY);
+  } else {
+    for (unsigned int i = 0; i < M; ++i) {
+      const MatT *a_row = A + i * lda;
+      float sum = 0.0f;
+      for (unsigned int j = 0; j < dot_len; ++j) {
+        sum += static_cast<float>(a_row[j]) * static_cast<float>(X[j * incX]);
+      }
+      float y_new = alpha * sum;
+      if (beta != 0.0f) {
+        y_new += beta * static_cast<float>(Y[i * incY]);
+      }
+      Y[i * incY] = static_cast<OutT>(y_new);
+    }
+  }
+}
+
+} // namespace
+
+void hgemv(bool TransA, const unsigned int M, const unsigned int N,
+           const float alpha, const _Float16 *A, const unsigned int lda,
+           const _Float16 *X, const unsigned int incX, const float beta,
+           _Float16 *Y, const unsigned int incY) {
+  gemv_impl<_Float16, _Float16, _Float16>(TransA, M, N, alpha, A, lda, X, incX,
+                                          beta, Y, incY);
+}
+
+void shgemv(bool TransA, const unsigned int M, const unsigned int N,
+            const float alpha, const float *A, const unsigned int lda,
+            const _Float16 *X, const unsigned int incX, const float beta,
+            float *Y, const unsigned int incY) {
+  gemv_impl<float, _Float16, float>(TransA, M, N, alpha, A, lda, X, incX, beta,
+                                    Y, incY);
+}
+
+void hsgemv(bool TransA, const unsigned int M, const unsigned int N,
+            const float alpha, const _Float16 *A, const unsigned int lda,
+            const float *X, const unsigned int incX, const float beta, float *Y,
+            const unsigned int incY) {
+  gemv_impl<_Float16, float, float>(TransA, M, N, alpha, A, lda, X, incX, beta,
+                                    Y, incY);
 }
 
 void sscal(const unsigned int N, const float alpha, _Float16 *X,

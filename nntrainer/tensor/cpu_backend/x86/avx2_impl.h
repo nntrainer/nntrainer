@@ -78,6 +78,55 @@ void custom_scopy(const unsigned int N, const _Float16 *X,
                   const unsigned int incX, _Float16 *Y,
                   const unsigned int incY);
 
+/**
+ * @brief FP16 GEMV with FP32 accumulation (row-major A only).
+ *
+ * Computes Y := alpha * op(A) * X + beta * Y where op(A) is A or A^T.
+ *   TransA == false: A is (M x N), Y length M, X length N.
+ *   TransA == true : A is (M x N), Y length N, X length M.
+ *
+ * Internals: F16C convert + FP32 FMA. TransA=false uses dot-product per row
+ * with a horizontal reduction. TransA=true uses an AXPY-style accumulation
+ * into a temporary FP32 buffer so Y avoids repeated FP16<->FP32 round trips
+ * across the M iterations. Honors alpha/beta and the BLAS rule "do not read
+ * Y when beta == 0".
+ *
+ * @param[in] TransA whether to transpose A.
+ * @param[in] M number of rows of A.
+ * @param[in] N number of cols of A.
+ * @param[in] alpha scalar multiplier for op(A) * X.
+ * @param[in] A row-major matrix of shape (M, N) with row stride lda.
+ * @param[in] lda row stride of A in elements (>= N).
+ * @param[in] X input vector. Length is N if !TransA else M.
+ * @param[in] incX stride between consecutive X elements (>= 1).
+ * @param[in] beta scalar multiplier for the existing Y. When 0, Y is
+ *                 overwritten without being read first.
+ * @param[in,out] Y output vector. Length is M if !TransA else N.
+ * @param[in] incY stride between consecutive Y elements (>= 1).
+ */
+void hgemv(bool TransA, const unsigned int M, const unsigned int N,
+           const float alpha, const _Float16 *A, const unsigned int lda,
+           const _Float16 *X, const unsigned int incX, const float beta,
+           _Float16 *Y, const unsigned int incY);
+
+/**
+ * @brief Mixed-precision GEMV with FP32 matrix, FP16 vector and FP32 output
+ * (shgemv). Shares gemv_impl with hgemv; see hgemv for parameter semantics.
+ */
+void shgemv(bool TransA, const unsigned int M, const unsigned int N,
+            const float alpha, const float *A, const unsigned int lda,
+            const _Float16 *X, const unsigned int incX, const float beta,
+            float *Y, const unsigned int incY);
+
+/**
+ * @brief Mixed-precision GEMV with FP16 matrix, FP32 vector and FP32 output
+ * (hsgemv). Shares gemv_impl with hgemv; see hgemv for parameter semantics.
+ */
+void hsgemv(bool TransA, const unsigned int M, const unsigned int N,
+            const float alpha, const _Float16 *A, const unsigned int lda,
+            const float *X, const unsigned int incX, const float beta, float *Y,
+            const unsigned int incY);
+
 _Float16 max_val(const unsigned int N, _Float16 *X);
 void softmax(const unsigned int N, _Float16 *X, _Float16 *Y);
 void inv_sqrt_inplace(const unsigned int N, _Float16 *X);
