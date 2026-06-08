@@ -96,6 +96,7 @@ endif
 if get_option('enable-fp16')
   test_target += [['unittest_nntrainer_tensor_fp16', []]]
   test_target += [['unittest_nntrainer_tensor_pool_fp16', []]]
+  test_target += [['unittest_nntrainer_cpu_backend_fp16', []]]
 endif
 
 if get_option('enable-profile')

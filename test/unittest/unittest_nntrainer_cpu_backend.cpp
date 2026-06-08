@@ -15,6 +15,7 @@
 #include <fallback_internal.h>
 #include <fp16.h>
 #include <gtest/gtest.h>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -2143,6 +2144,80 @@ TEST(nntrainer_cpu_backend_standalone, scopy_fp16_5) {
   }
 }
 
+TEST(nntrainer_cpu_backend_standalone, scopy_float_to_fp16_contiguous) {
+  const unsigned int N = 3072;
+  const int TEST_CNT = 20;
+  for (int i = 0; i < TEST_CNT; i++) {
+    std::vector<float> X = generate_random_vector<float, false>(N, -2.0f, 2.0f);
+    std::vector<_FP16> Y(N, (_FP16)0);
+    std::vector<_FP16> Y_ref(N, (_FP16)0);
+
+    nntrainer::__fallback_scopy(N, X.data(), 1, Y_ref.data(), 1);
+    nntrainer::scopy(N, X.data(), 1, Y.data(), 1);
+
+    for (unsigned int j = 0; j < N; j++) {
+      ASSERT_EQ(static_cast<float>(Y[j]), static_cast<float>(Y_ref[j]));
+    }
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone, scopy_fp16_to_float_contiguous) {
+  const unsigned int N = 3072;
+  const int TEST_CNT = 20;
+  for (int i = 0; i < TEST_CNT; i++) {
+    std::vector<_FP16> X = generate_random_vector<_FP16, false>(N);
+    std::vector<float> Y(N, 0.0F);
+    std::vector<float> Y_ref(N, 0.0F);
+
+    nntrainer::__fallback_scopy(N, X.data(), 1, Y_ref.data(), 1);
+    nntrainer::scopy(N, X.data(), 1, Y.data(), 1);
+
+    for (unsigned int j = 0; j < N; j++) {
+      ASSERT_EQ(Y[j], Y_ref[j]);
+    }
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone, scopy_float_to_fp16_stride) {
+  const unsigned int N = 257;
+  const unsigned int incX = 2;
+  const unsigned int incY = 3;
+  const int TEST_CNT = 20;
+  for (int i = 0; i < TEST_CNT; i++) {
+    std::vector<float> X =
+      generate_random_vector<float, false>(N * incX, -2.0f, 2.0f);
+    std::vector<_FP16> Y = generate_random_vector<_FP16, false>(N * incY);
+    std::vector<_FP16> Y_ref = Y;
+
+    nntrainer::__fallback_scopy(N, X.data(), incX, Y_ref.data(), incY);
+    nntrainer::scopy(N, X.data(), incX, Y.data(), incY);
+
+    for (unsigned int j = 0; j < N * incY; j++) {
+      ASSERT_EQ(static_cast<float>(Y[j]), static_cast<float>(Y_ref[j]));
+    }
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone, scopy_fp16_to_float_stride) {
+  const unsigned int N = 257;
+  const unsigned int incX = 2;
+  const unsigned int incY = 3;
+  const int TEST_CNT = 20;
+  for (int i = 0; i < TEST_CNT; i++) {
+    std::vector<_FP16> X = generate_random_vector<_FP16, false>(N * incX);
+    std::vector<float> Y =
+      generate_random_vector<float, false>(N * incY, -2.0f, 2.0f);
+    std::vector<float> Y_ref = Y;
+
+    nntrainer::__fallback_scopy(N, X.data(), incX, Y_ref.data(), incY);
+    nntrainer::scopy(N, X.data(), incX, Y.data(), incY);
+
+    for (unsigned int j = 0; j < N * incY; j++) {
+      ASSERT_EQ(Y[j], Y_ref[j]);
+    }
+  }
+}
+
 TEST(nntrainer_cpu_backend_standalone, max_val_fp16_3072) {
   const unsigned int N = 3072;
   const int TEST_CNT = 20;
@@ -2384,6 +2459,28 @@ TEST(nntrainer_cpu_backend_standalone, isamax_fp16_5) {
   }
 }
 
+TEST(nntrainer_cpu_backend_standalone, is_valid_fp16_finite_and_nonfinite) {
+  std::vector<_FP16> finite = {(_FP16)0.0F, (_FP16)-1.0F, (_FP16)0.5F,
+                               (_FP16)2.0F, (_FP16)-3.0F};
+  EXPECT_TRUE(nntrainer::is_valid(static_cast<unsigned int>(finite.size()),
+                                  finite.data()));
+
+  std::vector<_FP16> with_nan = finite;
+  with_nan[2] = static_cast<_FP16>(std::numeric_limits<float>::quiet_NaN());
+  EXPECT_FALSE(nntrainer::is_valid(static_cast<unsigned int>(with_nan.size()),
+                                   with_nan.data()));
+
+  std::vector<_FP16> with_pos_inf = finite;
+  with_pos_inf[1] = static_cast<_FP16>(std::numeric_limits<float>::infinity());
+  EXPECT_FALSE(nntrainer::is_valid(
+    static_cast<unsigned int>(with_pos_inf.size()), with_pos_inf.data()));
+
+  std::vector<_FP16> with_neg_inf = finite;
+  with_neg_inf[3] = static_cast<_FP16>(-std::numeric_limits<float>::infinity());
+  EXPECT_FALSE(nntrainer::is_valid(
+    static_cast<unsigned int>(with_neg_inf.size()), with_neg_inf.data()));
+}
+
 TEST(nntrainer_cpu_backend_standalone, transpose_matrix_fp16) {
   const unsigned int M = 32;
   const unsigned int N = 64;
@@ -2482,6 +2579,75 @@ TEST(nntrainer_cpu_backend_standalone, scopy_int4_to_fp16) {
       ASSERT_EQ(static_cast<float>(Y[j]), static_cast<float>(Y_ref[j]));
     }
   }
+}
+
+/// Exercises padded leading dimensions (lda > tight, ldb > tight, ldc > N) on
+/// the FP16 sgemm path. Each row of A / B / C is laid out with a gap; the gap
+/// bytes are touched by neither the FP32 reference nor the FP16 SUT, so the
+/// comparison window stays at [0..M, 0..N]. This guards against the regression
+/// where x86::hgemm recomputes strides from (M, N, K) instead of honoring the
+/// caller's lda/ldb/ldc.
+static void run_sgemm_fp16_strided_lda_test(unsigned int M, unsigned int N,
+                                            unsigned int K, bool TransA,
+                                            bool TransB, float alpha,
+                                            float beta, unsigned int lda_extra,
+                                            unsigned int ldb_extra,
+                                            unsigned int ldc_extra) {
+  nntrainer::init_backend();
+
+  const unsigned int lda = (TransA ? M : K) + lda_extra;
+  const unsigned int ldb = (TransB ? K : N) + ldb_extra;
+  const unsigned int ldc = N + ldc_extra;
+  const std::size_t a_size = static_cast<std::size_t>(TransA ? K : M) * lda;
+  const std::size_t b_size = static_cast<std::size_t>(TransB ? N : K) * ldb;
+  const std::size_t c_size = static_cast<std::size_t>(M) * ldc;
+
+  auto A_fp16 = generate_random_vector<_FP16>(a_size);
+  auto B_fp16 = generate_random_vector<_FP16>(b_size);
+  auto C_fp16 = generate_random_vector<_FP16>(c_size);
+
+  std::vector<float> A_fp32(a_size);
+  std::vector<float> B_fp32(b_size);
+  std::vector<float> C_fp32_ref(c_size);
+  nntrainer::scopy(a_size, A_fp16.data(), 1, A_fp32.data(), 1);
+  nntrainer::scopy(b_size, B_fp16.data(), 1, B_fp32.data(), 1);
+  nntrainer::scopy(c_size, C_fp16.data(), 1, C_fp32_ref.data(), 1);
+
+  nntrainer::sgemm(0, TransA, TransB, M, N, K, alpha, A_fp32.data(), lda,
+                   B_fp32.data(), ldb, beta, C_fp32_ref.data(), ldc);
+  nntrainer::sgemm(0, TransA, TransB, M, N, K, alpha, A_fp16.data(), lda,
+                   B_fp16.data(), ldb, beta, C_fp16.data(), ldc);
+
+  for (unsigned int m = 0; m < M; ++m) {
+    for (unsigned int n = 0; n < N; ++n) {
+      const std::size_t i = static_cast<std::size_t>(m) * ldc + n;
+      float got = static_cast<float>(C_fp16[i]);
+      float ref = C_fp32_ref[i];
+      EXPECT_NEAR(got, ref, 0.01f * (std::abs(ref) + 1.0f))
+        << "mismatch at m=" << m << " n=" << n << " M=" << M << " N=" << N
+        << " K=" << K << " TransA=" << TransA << " TransB=" << TransB
+        << " alpha=" << alpha << " beta=" << beta << " lda=" << lda
+        << " ldb=" << ldb << " ldc=" << ldc;
+    }
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone,
+     sgemm_fp16_noTrans_strided_lda_ldb_ldc_13x33x65) {
+  run_sgemm_fp16_strided_lda_test(13, 33, 65, false, false, 1.0F, 0.0F, 4, 7,
+                                  5);
+}
+
+TEST(nntrainer_cpu_backend_standalone,
+     sgemm_fp16_transA_strided_lda_ldb_ldc_13x33x65) {
+  run_sgemm_fp16_strided_lda_test(13, 33, 65, true, false, 0.75F, -0.25F, 3, 8,
+                                  4);
+}
+
+TEST(nntrainer_cpu_backend_standalone,
+     sgemm_fp16_transB_strided_lda_ldb_ldc_13x33x65) {
+  run_sgemm_fp16_strided_lda_test(13, 33, 65, false, true, -0.5F, 0.125F, 6, 2,
+                                  1);
 }
 
 #endif // ENABLE_FP16

@@ -13,6 +13,10 @@ simd_interface_x86_sources = [
 if get_option('enable-fp16')
     simd_interface_x86_sources += 'avx2_impl_fp16.cpp'
     simd_interface_x86_sources += 'x86_compute_backend_fp16.cpp'
+
+    subdir('hgemm')
+    nntrainer_inc += include_directories('hgemm')
+    nntrainer_inc_abs += meson.current_source_dir() / 'hgemm'
 endif
 
 foreach s : simd_interface_x86_sources
