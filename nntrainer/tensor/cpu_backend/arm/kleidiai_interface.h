@@ -25,73 +25,110 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <cfloat>
 #include <cstdint>
-#include <stddef.h>
+#include <string>
+
+namespace nntrainer {
+/**
+ * matmul_clamp_f32_qai8dxp_qsi4cxp
+ */
 
 /**
- * @brief get size of memory to allocate for rhs weight packing of qsi4cxp to
- * qs4cxs1s0
+ * @brief get name of ukernel
  *
- * @param n row length if not transposed
- * @param k col length if not transposed
+ * @param[in] idx_variant index of ukernel
+ * @return std::string name of ukernel
+ */
+std::string __kai_get_num_ukernel_name_qai8dxp_qsi4cxp(size_t idx_variant);
+
+/**
+ * @brief get number of ukernels
+ *
+ * @return size_t number of ukernels
+ */
+size_t __kai_get_num_ukernel_variants_qai8dxp_qsi4cxp();
+
+/**
+ * @brief get size of memory to allocate for packed rhs from nxk qs4cxs1s0 to
+ * qsi4cxp
+ * Note that nxk is the format of quantized rhs, not the shape of rhs
+ *
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] is_nxk true if rhs is in nxk format
  * @return size_t size of memory to allocate
  */
-size_t nntr_kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
-                                                      uint32_t idx_variant,
-                                                      bool transB);
+size_t __kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                                   size_t idx_variant,
+                                                   bool is_nxk);
 
 /**
- * @brief rhs matrix packing for qsi4cxp format
+ * @brief rhs matrix packing from nxk qs4cxs1s0 to qsi4cxp
+ * Note that rhs_qs4cx must be stored with UINT4 shape (zero point = 8)
  *
- * @param n row length if not transposed
- * @param k col length if not transposed
- * @param rhs_packed_mtx_qs4cx dst* to store results
- * @param rhs_native_mtx_qs4cx input matrix data
- * @param rhs_scales_f32 input qparam data
- * @param transB rather the matrix is transposed or not
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[out] rhs_packed_mtx_qs4cx packed rhs
+ * @param[in] rhs_native_mtx_qs4cx quantized matrix data
+ * @param[in] rhs_scales_f32 qparam data
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] is_nxk true if rhs is in nxk format
  */
-void nntr_kai_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
-                                         void *rhs_packed_mtx_qs4cx,
-                                         void *rhs_native_mtx_qs4cx,
-                                         void *rhs_scales_f32,
-                                         uint32_t idx_variant, bool transB);
+void __kai_rhs_pack_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                      void *rhs_packed_mtx_qs4cx,
+                                      void *rhs_native_mtx_qs4cx,
+                                      void *rhs_scales_f32, size_t idx_variant,
+                                      bool is_nxk);
+
 /**
- * @brief run qai8dxp_qsi4cxp GEMM with runtime weight packing
+ * @brief run qai8dxp_qsi4cxp GEMM with online rhs packing
  *
- * @param m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
- * @param n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
- * @param k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
- * @param lhs_native_mtx_f32 activation
- * @param rhs_native_mtx_qs4cx qs4cx quantized weight matrix data
- * @param rhs_scales_f32 qs4cx quantized weight matrix scale data
- * @param dst_act_mtx_f32 dst data
- * @param transB rather the weight matrix is transposed or not
- * @param lower_bound clipping param
- * @param upper_bound clipping param
+ * @param[in] m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] lhs_native_mtx_f32 matrix data
+ * @param[in] rhs_native_mtx_qs4cx quantized matrix data
+ * @param[in] rhs_scales_f32 qparam data
+ * @param[out] dst_act_mtx_f32 output data
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] is_nxk true if rhs is in nxk format
+ * @param[in] lower_bound clipping param
+ * @param[in] upper_bound clipping param
  */
-uint32_t nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
+void __kai_gemm_qai8dxp_qsi4cxp_rhs_unpacked(
   size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
   void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
-  bool transB, float lower_bound, float upper_bound);
+  size_t idx_variant, bool is_nxk, float lower_bound = -FLT_MAX,
+  float upper_bound = FLT_MAX);
+
 /**
- * @brief run qai8dxp_qsi4cxp GEMM with offline weight packing
+ * @brief run qai8dxp_qsi4cxp GEMM with offline packed rhs
  *
- * @param m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
- * @param n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
- * @param k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
- * @param lhs_native_mtx_f32 activation
- * @param rhs_packed_mtx_qs4cx qs4cx quantized weight, packed already
- * @param dst_act_mtx_f32 dst data
- * @param transB rather the weight matrix is transposed or not
- * @param lower_bound clipping param
- * @param upper_bound clipping param
+ * @param[in] m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] lhs_native_mtx_f32 matrix data
+ * @param[in] rhs_packed_mtx_qs4cx quantized matrix data, packed already
+ * @param[out] dst_act_mtx_f32 output data
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] lower_bound clipping param
+ * @param[in] upper_bound clipping param
  */
-void nntr_kai_gemm_qai8dxp_qsi4cxp_olp(size_t m, size_t n, size_t k,
-                                       void *lhs_native_mtx_f32,
-                                       void *rhs_packed_mtx_qs4cx,
-                                       float *dst_act_mtx_f32,
-                                       uint32_t idx_variant, bool transB,
-                                       float lower_bound, float upper_bound);
+void __kai_gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
+                                void *lhs_native_mtx_f32,
+                                void *rhs_packed_mtx_qs4cx,
+                                float *dst_act_mtx_f32, size_t idx_variant,
+                                float lower_bound = -FLT_MAX,
+                                float upper_bound = FLT_MAX);
+
+} // namespace nntrainer
+
+/**
+ * matmul_clamp_f32_qsi8dx32p_qsi4cx32p
+ * @todo refactor likewise qai8dxp_qsi4cxp
+ */
 
 /**
  * @brief get size of memory to allocate for rhs weight packing of qsi8d32p to

@@ -32,55 +32,37 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#include <assert.h>
-#include <cassert>
-#include <cfloat>
-#include <cmath>
-#include <cstdint>
-#include <cstring>
 #include <kleidiai_interface.h>
-#include <limits>
-#include <string>
 #include <thread_manager.h>
 
-#include <chrono>
-#include <iostream>
-using std::chrono::duration_cast;
-using std::chrono::high_resolution_clock;
-using std::chrono::microseconds; // or microseconds
-using std::chrono::milliseconds; // or microseconds
-using std::chrono::nanoseconds;  // or microseconds
-using std::chrono::seconds;      // or microseconds
+#include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp_qsi4cxp_interface.h"
 
 // Include micro-kernel variants
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod.h"
+
+#if defined(__ARM_FEATURE_MATMUL_INT8)
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x8_8x4x32_neon_i8mm.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_4x8x32_neon_i8mm.h"
 #include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm.h"
-#include "kai/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp_qsi4cxp_interface.h"
+#endif
+
+// Include packinng kernels
 #include "kai/pack/kai_lhs_quant_pack_qai8dxp_f32.h"
 #include "kai/pack/kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0.h"
 #include "kai/pack/kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.h"
 
 #define INT4_MIN (-8)
 #define INT4_MAX (7)
-/**
- * @brief rhs_format
- *
- */
-enum class rhs_format {
-  nxk,
-  kxn,
-};
+
+namespace {
 
 // Micro-kernel interface
 /**
  * @brief kai_matmul_ukernel_f32_qa8dxp_qs4cxp
- *
  */
 struct kai_matmul_ukernel_f32_qa8dxp_qs4cxp {
   kai_matmul_clamp_f32_qai8dxp_qsi4cxp_ukernel ukernel;
@@ -112,6 +94,31 @@ kai_matmul_ukernel_f32_qa8dxp_qs4cxp ukernel_variants[] = {
    kai_get_dst_size_matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod,
    kai_run_matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod,
    "matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod"},
+  {kai_get_m_step_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
+   kai_get_n_step_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
+   kai_get_mr_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
+   kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
+   kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
+   kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
+   kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
+   kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
+   kai_get_dst_offset_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
+   kai_get_dst_size_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
+   kai_run_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
+   "matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod"},
+  {kai_get_m_step_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
+   kai_get_n_step_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
+   kai_get_mr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
+   kai_get_nr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
+   kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
+   kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
+   kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
+   kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
+   kai_get_dst_offset_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
+   kai_get_dst_size_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
+   kai_run_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
+   "matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod"},
+#if defined(__ARM_FEATURE_MATMUL_INT8)
   {kai_get_m_step_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm,
    kai_get_n_step_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm,
    kai_get_mr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm,
@@ -160,160 +167,34 @@ kai_matmul_ukernel_f32_qa8dxp_qs4cxp ukernel_variants[] = {
    kai_get_dst_size_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm,
    kai_run_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm,
    "matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm"},
-  {kai_get_m_step_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
-   kai_get_n_step_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
-   kai_get_mr_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
-   kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
-   kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
-   kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
-   kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
-   kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
-   kai_get_dst_offset_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
-   kai_get_dst_size_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
-   kai_run_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod,
-   "matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod"},
-  {kai_get_m_step_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
-   kai_get_n_step_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
-   kai_get_mr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
-   kai_get_nr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
-   kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
-   kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
-   kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
-   kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
-   kai_get_dst_offset_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
-   kai_get_dst_size_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
-   kai_run_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod,
-   "matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod"},
+#endif
 
 };
 
-static size_t roundup(size_t a, size_t b) { return ((a + b - 1) / b) * b; }
+const size_t num_ukernel_variants =
+  sizeof(ukernel_variants) / sizeof(ukernel_variants[0]);
 
-uint32_t nntr_kai_gemm_qai8dxp_qsi4cxp_rtp(
-  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
-  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
-  bool transB, float lower_bound, float upper_bound) {
-  uint32_t ret_idx = 0;
-  uint64_t min_latency = INT64_MAX;
-  ///@todo check for optimal variant, or check for optimal variant config for
-  /// specific M-N-K combination
-  for (int idx_variant = 0; idx_variant < 8; idx_variant++) {
-    rhs_format format = rhs_format::nxk;
-    if (!transB) {
-      format = rhs_format::kxn;
-    }
+size_t roundup(size_t a, size_t b) { return ((a + b - 1) / b) * b; }
 
-    const size_t mr = ukernel_variants[idx_variant].ukernel.get_mr();
-    const size_t nr = ukernel_variants[idx_variant].ukernel.get_nr();
-    const size_t kr = ukernel_variants[idx_variant].ukernel.get_kr();
-    const size_t sr = ukernel_variants[idx_variant].ukernel.get_sr();
+} // namespace
 
-    // Get the size in bytes for the packed matrices
-    const size_t lhs_packed_size =
-      kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f32(m, k, mr, kr, sr);
-    size_t rhs_packed_size = 0;
-
-    if (format == rhs_format::nxk) {
-      rhs_packed_size = kai_get_rhs_packed_size_rhs_pack_nxk_qsi4cxp_qs4cxs1s0(
-        n, k, nr, kr, sr);
-
-    } else {
-      rhs_packed_size = kai_get_rhs_packed_size_rhs_pack_kxn_qsi4cxp_qs4cxs1s0(
-        n, k, nr, kr, sr);
-    }
-
-    // Allocate the matrices
-    uint8_t *lhs_packed_mtx_qa8dx = new uint8_t[lhs_packed_size];
-    uint8_t *rhs_packed_mtx_qs4cx = new uint8_t[rhs_packed_size];
-
-    // If the RHS matrix contains constant values, the packing can be performed
-    // only once
-    if (format == rhs_format::nxk) {
-      struct kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_params nxk_params;
-
-      nxk_params.lhs_zero_point = 1;
-      nxk_params.rhs_zero_point = 8;
-      // RHS packing
-      kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0(
-        1, n, k, nr, kr, sr,                     // Packing arguments
-        (const uint8_t *)(rhs_native_mtx_qs4cx), // RHS
-        NULL,                                    // Bias
-        (const float *)(rhs_scales_f32),         // Scale
-        rhs_packed_mtx_qs4cx,                    // RHS packed
-        0, &nxk_params);
-
-    } else {
-      struct kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0_params kxn_params;
-      kxn_params.lhs_zero_point = 1;
-      kxn_params.rhs_zero_point = 8;
-      // RHS packing
-      kai_run_rhs_pack_kxn_qsi4cxp_qs4cxs1s0(
-        1, n, k, nr, kr, sr,                     // Packing arguments
-        (const uint8_t *)(rhs_native_mtx_qs4cx), // RHS
-        NULL,                                    // Bias
-        (const float *)(rhs_scales_f32),         // Scale
-        rhs_packed_mtx_qs4cx,                    // RHS packed
-        0, &kxn_params);
-    }
-    auto t2 = high_resolution_clock::now();
-
-    // LHS packing
-    kai_run_lhs_quant_pack_qai8dxp_f32(m, k, mr, kr, sr, 0, // Packing arguments
-                                       (const float *)lhs_native_mtx_f32, // LHS
-                                       k * sizeof(float),     // LHS stride
-                                       lhs_packed_mtx_qa8dx); // LHS packed
-
-    {
-      const size_t dst_stride = n * sizeof(float);
-      const size_t lhs_offset =
-        ukernel_variants[idx_variant].ukernel.get_lhs_packed_offset(0, k);
-      const size_t rhs_offset =
-        ukernel_variants[idx_variant].ukernel.get_rhs_packed_offset(0, k);
-      const size_t dst_offset =
-        ukernel_variants[idx_variant].ukernel.get_dst_offset(0, 0, dst_stride);
-
-      const void *lhs_ptr =
-        (const void *)((const char *)lhs_packed_mtx_qa8dx + lhs_offset);
-      const void *rhs_ptr =
-        (const void *)((const char *)rhs_packed_mtx_qs4cx + rhs_offset);
-      float *dst_ptr = (float *)((uint8_t *)dst_act_mtx_f32 + dst_offset);
-
-      ukernel_variants[idx_variant].ukernel.run_matmul(
-        m, n, k,                 // Dimensions
-        lhs_ptr,                 // LHS packed
-        rhs_ptr,                 // RHS packed
-        dst_ptr,                 // DST
-        dst_stride,              // DST stride (row)
-        sizeof(float),           // DST stride (col)
-        lower_bound, upper_bound // Min and max for the clamp operation
-      );
-    }
-
-    auto t3 = high_resolution_clock::now();
-    auto dt2 = duration_cast<nanoseconds>(t3 - t2);
-    // std::cout << "  ukernel duration for kernel# " << idx_variant << " | "
-    //           << dt2.count() << " ns " << dt2.count() / 1'000 << " us "
-    //           << dt2.count() / 1'000'000 << " ms " << std::endl;
-
-    uint64_t casted_time = static_cast<uint64_t>(dt2.count());
-    ret_idx = (min_latency > casted_time) ? idx_variant : ret_idx;
-    min_latency = (min_latency > casted_time) ? casted_time : min_latency;
-
-    delete[] lhs_packed_mtx_qa8dx;
-    delete[] rhs_packed_mtx_qs4cx;
-  }
-
-  return ret_idx;
+namespace nntrainer {
+std::string __kai_get_num_ukernel_name_qai8dxp_qsi4cxp(size_t idx_variant) {
+  return ukernel_variants[idx_variant].name;
 }
 
-size_t nntr_kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
-                                                      uint32_t idx_variant,
-                                                      bool transB) {
-  ///@note Packing arguments are identical among all ukernel idx_variants
+size_t __kai_get_num_ukernel_variants_qai8dxp_qsi4cxp() {
+  return num_ukernel_variants;
+}
+
+size_t __kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                                   size_t idx_variant,
+                                                   bool is_nxk) {
   const size_t nr = ukernel_variants[idx_variant].ukernel.get_nr();
   const size_t kr = ukernel_variants[idx_variant].ukernel.get_kr();
   const size_t sr = ukernel_variants[idx_variant].ukernel.get_sr();
-  if (transB) {
+
+  if (is_nxk) {
     return kai_get_rhs_packed_size_rhs_pack_nxk_qsi4cxp_qs4cxs1s0(n, k, nr, kr,
                                                                   sr);
   } else {
@@ -322,24 +203,17 @@ size_t nntr_kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
   }
 }
 
-void nntr_kai_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
-                                         void *rhs_packed_mtx_qs4cx,
-                                         void *rhs_native_mtx_qs4cx,
-                                         void *rhs_scales_f32,
-                                         uint32_t idx_variant, bool transB) {
-  ///@note Packing arguments are identical among all ukernel idx_variants
-  rhs_format format = rhs_format::nxk;
-  if (!transB) {
-    format = rhs_format::kxn;
-  }
-
+void __kai_rhs_pack_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                      void *rhs_packed_mtx_qs4cx,
+                                      void *rhs_native_mtx_qs4cx,
+                                      void *rhs_scales_f32, size_t idx_variant,
+                                      bool is_nxk) {
   const size_t nr = ukernel_variants[idx_variant].ukernel.get_nr();
   const size_t kr = ukernel_variants[idx_variant].ukernel.get_kr();
   const size_t sr = ukernel_variants[idx_variant].ukernel.get_sr();
 
-  if (format == rhs_format::nxk) {
+  if (is_nxk) {
     struct kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_params nxk_params;
-
     nxk_params.lhs_zero_point = 1;
     nxk_params.rhs_zero_point = 8;
     // RHS packing
@@ -350,7 +224,6 @@ void nntr_kai_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
       (const float *)(rhs_scales_f32),         // Scale
       rhs_packed_mtx_qs4cx,                    // RHS packed
       0, &nxk_params);
-
   } else {
     struct kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0_params kxn_params;
     kxn_params.lhs_zero_point = 1;
@@ -366,66 +239,43 @@ void nntr_kai_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
   }
 }
 
-void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_single_thread(
+void __kai_gemm_qai8dxp_qsi4cxp_rhs_unpacked(
   size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
-  void *rhs_packed_mtx_qs4cx, float *dst_act_mtx_f32, uint32_t idx_variant,
-  bool transB, float lower_bound, float upper_bound) {
-  rhs_format format = rhs_format::nxk;
-  if (!transB) {
-    format = rhs_format::kxn;
-  }
-
+  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
+  size_t idx_variant, bool is_nxk, float lower_bound, float upper_bound) {
   const size_t mr = ukernel_variants[idx_variant].ukernel.get_mr();
   const size_t nr = ukernel_variants[idx_variant].ukernel.get_nr();
   const size_t kr = ukernel_variants[idx_variant].ukernel.get_kr();
   const size_t sr = ukernel_variants[idx_variant].ukernel.get_sr();
 
-  // LHS packing
+  // Get the size in bytes for the packed matrices
   const size_t lhs_packed_size =
     kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f32(m, k, mr, kr, sr);
+  const size_t rhs_packed_size =
+    __kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(n, k, idx_variant, is_nxk);
+
+  // Allocate the matrices
   uint8_t *lhs_packed_mtx_qa8dx = new uint8_t[lhs_packed_size];
-  kai_run_lhs_quant_pack_qai8dxp_f32(m, k, mr, kr, sr, 0, // Packing arguments
-                                     (const float *)lhs_native_mtx_f32, // LHS
-                                     k * sizeof(float),     // LHS stride
-                                     lhs_packed_mtx_qa8dx); // LHS packed
-  {
-    const size_t dst_stride = n * sizeof(float);
-    const size_t lhs_offset =
-      ukernel_variants[idx_variant].ukernel.get_lhs_packed_offset(0, k);
-    const size_t rhs_offset =
-      ukernel_variants[idx_variant].ukernel.get_rhs_packed_offset(0, k);
-    const size_t dst_offset =
-      ukernel_variants[idx_variant].ukernel.get_dst_offset(0, 0, dst_stride);
+  uint8_t *rhs_packed_mtx_qs4cx = new uint8_t[rhs_packed_size];
 
-    const void *lhs_ptr =
-      (const void *)((const char *)lhs_packed_mtx_qa8dx + lhs_offset);
-    const void *rhs_ptr =
-      (const void *)((const char *)rhs_packed_mtx_qs4cx + rhs_offset);
-    float *dst_ptr = (float *)((uint8_t *)dst_act_mtx_f32 + dst_offset);
+  // RHS packing
+  __kai_rhs_pack_qsi4cxp_qs4cxs1s0(n, k, rhs_packed_mtx_qs4cx,
+                                   rhs_native_mtx_qs4cx, rhs_scales_f32,
+                                   idx_variant, is_nxk);
 
-    ukernel_variants[idx_variant].ukernel.run_matmul(
-      m, n, k,                 // Dimensions
-      lhs_ptr,                 // LHS packed
-      rhs_ptr,                 // RHS packed
-      dst_ptr,                 // DST
-      dst_stride,              // DST stride (row)
-      sizeof(float),           // DST stride (col)
-      lower_bound, upper_bound // Min and max for the clamp operation
-    );
-  }
+  // call packed gemm
+  __kai_gemm_qai8dxp_qsi4cxp(m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx,
+                             dst_act_mtx_f32, idx_variant);
 
   delete[] lhs_packed_mtx_qa8dx;
+  delete[] rhs_packed_mtx_qs4cx;
 }
 
-void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_n_parallel(
-  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
-  void *rhs_packed_mtx_qs4cx, float *dst_act_mtx_f32, uint32_t idx_variant,
-  bool transB, float lower_bound, float upper_bound) {
-  rhs_format format = rhs_format::nxk;
-  if (!transB) {
-    format = rhs_format::kxn;
-  }
-
+void __kai_gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
+                                void *lhs_native_mtx_f32,
+                                void *rhs_packed_mtx_qs4cx,
+                                float *dst_act_mtx_f32, size_t idx_variant,
+                                float lower_bound, float upper_bound) {
   const size_t mr = ukernel_variants[idx_variant].ukernel.get_mr();
   const size_t nr = ukernel_variants[idx_variant].ukernel.get_nr();
   const size_t kr = ukernel_variants[idx_variant].ukernel.get_kr();
@@ -435,60 +285,109 @@ void nntr_kai_gemm_qai8dxp_qsi4cxp_olp_n_parallel(
   const size_t lhs_packed_size =
     kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f32(m, k, mr, kr, sr);
   uint8_t *lhs_packed_mtx_qa8dx = new uint8_t[lhs_packed_size];
-  kai_run_lhs_quant_pack_qai8dxp_f32(m, k, mr, kr, sr, 0, // Packing arguments
-                                     (const float *)lhs_native_mtx_f32, // LHS
-                                     k * sizeof(float),     // LHS stride
-                                     lhs_packed_mtx_qa8dx); // LHS packed
 
-  // TODO find optimal chunk size
-  size_t chunk_size = 4;
-  assert(n % chunk_size == 0);
-  size_t loop = n / chunk_size;
+  size_t m_step = ukernel_variants[idx_variant].ukernel.get_m_step();
+  size_t m_loop = (m + m_step - 1) / m_step;
+
+  size_t n_step = ukernel_variants[idx_variant].ukernel.get_n_step();
+  size_t n_loop = (n + n_step - 1) / n_step;
+
   auto &tm = nntrainer::ThreadManager::Global();
-  tm.parallel_for(0, loop, [&](size_t i) {
-    const size_t dst_stride = n * sizeof(float);
-    const size_t lhs_offset =
-      ukernel_variants[idx_variant].ukernel.get_lhs_packed_offset(0, k);
-    const size_t rhs_offset =
-      ukernel_variants[idx_variant].ukernel.get_rhs_packed_offset(
-        chunk_size * i, k);
-    const size_t dst_offset =
-      ukernel_variants[idx_variant].ukernel.get_dst_offset(0, chunk_size * i,
-                                                           dst_stride);
 
-    const void *lhs_ptr =
-      (const void *)((const char *)lhs_packed_mtx_qa8dx + lhs_offset);
-    const void *rhs_ptr =
-      (const void *)((const char *)rhs_packed_mtx_qs4cx + rhs_offset);
-    float *dst_ptr = (float *)((uint8_t *)dst_act_mtx_f32 + dst_offset);
+  /// @todo find better heuristic
+  if (m_step > n_step) {
+    // parallelize over m
+    tm.parallel_for(0, m_loop, [&](size_t i) {
+      size_t m_start = i * m_step;
+      size_t m_to_process = std::min(m_step, m - m_start);
 
-    ukernel_variants[idx_variant].ukernel.run_matmul(
-      m, chunk_size, k,        // Dimensions
-      lhs_ptr,                 // LHS packed
-      rhs_ptr,                 // RHS packed
-      dst_ptr,                 // DST
-      dst_stride,              // DST stride (row)
-      sizeof(float),           // DST stride (col)
-      lower_bound, upper_bound // Min and max for the clamp operation
-    );
-  });
+      size_t lhs_offset = m_start * k;
+      float *lhs_ptr = (float *)lhs_native_mtx_f32 + lhs_offset;
+
+      const size_t lhs_packed_offset =
+        ukernel_variants[idx_variant].ukernel.get_lhs_packed_offset(m_start, k);
+      uint8_t *lhs_packed_ptr = lhs_packed_mtx_qa8dx + lhs_packed_offset;
+
+      // LHS packing
+      kai_run_lhs_quant_pack_qai8dxp_f32(m_to_process, k,   // Dimensions
+                                         mr, kr, sr, 0,     // Packing arguments
+                                         lhs_ptr,           // LHS
+                                         k * sizeof(float), // LHS stride
+                                         lhs_packed_ptr);   // LHS packed
+
+      const size_t rhs_packed_offset =
+        ukernel_variants[idx_variant].ukernel.get_rhs_packed_offset(0, k);
+      const void *rhs_packed_ptr =
+        (const void *)((const char *)rhs_packed_mtx_qs4cx + rhs_packed_offset);
+
+      const size_t dst_stride = n * sizeof(float);
+      const size_t dst_offset =
+        ukernel_variants[idx_variant].ukernel.get_dst_offset(m_start, 0,
+                                                             dst_stride);
+      float *dst_ptr = (float *)((uint8_t *)dst_act_mtx_f32 + dst_offset);
+
+      ukernel_variants[idx_variant].ukernel.run_matmul(
+        m_to_process, n, k,      // Dimensions
+        lhs_packed_ptr,          // LHS packed
+        rhs_packed_ptr,          // RHS packed
+        dst_ptr,                 // DST
+        dst_stride,              // DST stride (row)
+        sizeof(float),           // DST stride (col)
+        lower_bound, upper_bound // Min and max for the clamp operation
+      );
+    });
+  } else {
+    // parallelize over m
+    tm.parallel_for(0, m_loop, [&](size_t i) {
+      size_t m_start = i * m_step;
+      size_t m_to_process = std::min(m_step, m - m_start);
+
+      size_t lhs_offset = m_start * k;
+      float *lhs_ptr = (float *)lhs_native_mtx_f32 + lhs_offset;
+
+      const size_t lhs_packed_offset =
+        ukernel_variants[idx_variant].ukernel.get_lhs_packed_offset(m_start, k);
+      uint8_t *lhs_packed_ptr = lhs_packed_mtx_qa8dx + lhs_packed_offset;
+
+      // LHS packing
+      kai_run_lhs_quant_pack_qai8dxp_f32(m_to_process, k,   // Dimensions
+                                         mr, kr, sr, 0,     // Packing arguments
+                                         lhs_ptr,           // LHS
+                                         k * sizeof(float), // LHS stride
+                                         lhs_packed_ptr);   // LHS packed
+    });
+
+    // parallelize over n
+    tm.parallel_for(0, n_loop, [&](size_t i) {
+      size_t n_start = i * n_step;
+      size_t n_to_process = std::min(n_step, n - n_start);
+
+      uint8_t *lhs_packed_ptr = lhs_packed_mtx_qa8dx;
+
+      const size_t rhs_packed_offset =
+        ukernel_variants[idx_variant].ukernel.get_rhs_packed_offset(n_start, k);
+      const void *rhs_packed_ptr =
+        (const void *)((const char *)rhs_packed_mtx_qs4cx + rhs_packed_offset);
+
+      const size_t dst_stride = n * sizeof(float);
+      const size_t dst_offset =
+        ukernel_variants[idx_variant].ukernel.get_dst_offset(0, n_start,
+                                                             dst_stride);
+      float *dst_ptr = (float *)((uint8_t *)dst_act_mtx_f32 + dst_offset);
+
+      ukernel_variants[idx_variant].ukernel.run_matmul(
+        m, n_to_process, k,      // Dimensions
+        lhs_packed_ptr,          // LHS packed
+        rhs_packed_ptr,          // RHS packed
+        dst_ptr,                 // DST
+        dst_stride,              // DST stride (row)
+        sizeof(float),           // DST stride (col)
+        lower_bound, upper_bound // Min and max for the clamp operation
+      );
+    });
+  }
 
   delete[] lhs_packed_mtx_qa8dx;
 }
 
-void nntr_kai_gemm_qai8dxp_qsi4cxp_olp(size_t m, size_t n, size_t k,
-                                       void *lhs_native_mtx_f32,
-                                       void *rhs_packed_mtx_qs4cx,
-                                       float *dst_act_mtx_f32,
-                                       uint32_t idx_variant, bool transB,
-                                       float lower_bound, float upper_bound) {
-  if (m == 1) {
-    return nntr_kai_gemm_qai8dxp_qsi4cxp_olp_single_thread(
-      m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx, dst_act_mtx_f32,
-      idx_variant, transB, lower_bound, upper_bound);
-  } else {
-    return nntr_kai_gemm_qai8dxp_qsi4cxp_olp_n_parallel(
-      m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx, dst_act_mtx_f32,
-      idx_variant, transB, lower_bound, upper_bound);
-  }
-}
+} // namespace nntrainer
