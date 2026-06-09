@@ -1019,20 +1019,27 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
                                M, N, K, Int4QTensor::getGroupSize());
     }
   } else {
-#ifdef ENABLE_FP16
-    if (input.q_scheme() == QScheme::PER_CHANNEL_AFFINE) {
-      uint32_t opt_kernel_idx = (M == 1) ? 1 : 5;
-      nntr_gemm_qai8dxp_qsi4cxp_packed(
-        M, N, K, (void *)data, (void *)mdata, rdata, opt_kernel_idx,
-        true); /// @todo kernel supports both trans / noTrans situation
-    } else {
-      throw std::runtime_error(
-        "Error: QINT4 Dot on CPU only supports PER_CHANNEL_AFFINE scheme");
-    }
-#else
-    /// @todo Replace with standard CPU INT4 computation
-    o->gemm_q4_0_fp32(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
-#endif
+    /**
+     * @note INT4 weight gemm for CPU
+     * As of now, QINT4 tensor denotes per channel quantization with group
+     * length 32. But it will be a tensor for kleidiai only format.
+     * Below code assumes that weight tensor is quantized in qs4cx and unpacked.
+     * @todo rewrite QINT4 tensor and below code
+     */
+
+    /**
+     * GEMV
+     * matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod
+     * GEMM
+     * matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm
+     * @todo update kernel index for SVE, SME
+     */
+    size_t opt_kernel_idx = (M == 1) ? 2 : 8;
+
+    float *scale = input.getScale();
+
+    gemm_qai8dxp_qsi4cxp_rhs_unpacked(M, N, K, data, mdata, scale, rdata,
+                                      opt_kernel_idx, true);
   }
 
   return output;
