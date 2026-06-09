@@ -12,6 +12,7 @@
  */
 
 #include <assert.h>
+#include <fallback.h>
 #include <fallback_internal.h>
 #include <nntrainer_error.h>
 
@@ -237,73 +238,6 @@ template <>
 void clamp(const _FP16 *input, _FP16 *output, size_t length, _FP16 lower_bound,
            _FP16 upper_bound) {
   __fallback_clamp<_FP16>(input, output, length, lower_bound, upper_bound);
-}
-
-void nntr_quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
-                          void *rhs_native_mtx_qs4cx, void *rhs_scales_f32,
-                          bool transB) {
-  if (!transB)
-    throw std::invalid_argument{"Only [n,k] shape available"};
-
-  __fallback_quant_nxk_qs4cx_f32(n, k, (const float *)rhs_native_mtx_f32,
-                                 (uint8_t *)rhs_native_mtx_qs4cx,
-                                 (float *)rhs_scales_f32);
-  // @todo enable kxn quant
-}
-
-template <>
-uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
-  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
-  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_mtx_f32,
-  bool transB, float lower_bound, float upper_bound) {
-  if (!transB)
-    throw std::invalid_argument{"Only [n,k] shape available"};
-
-  // online quant lhs
-  const size_t lhs_ref_size_qa8dx = m * (k + sizeof(int32_t) + sizeof(float));
-
-  std::vector<uint8_t> lhs_qa8dx(lhs_ref_size_qa8dx);
-
-  __fallback_quant_qa8dx_f32(m, k, (const float *)lhs_native_mtx_f32,
-                             (int8_t *)lhs_qa8dx.data());
-
-  // do matmul
-  __fallback_matmul_mxn_mxk_nxk_f32_qa8dx_qs4cx(
-    m, n, k, (const int8_t *)lhs_qa8dx.data(),
-    (const uint8_t *)rhs_native_mtx_qs4cx, (const float *)rhs_scales_f32,
-    dst_mtx_f32, lower_bound, upper_bound);
-  // @todo enable kxn matmul
-
-  return 1;
-}
-
-size_t nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
-                                                  uint32_t idx_variant,
-                                                  bool transB) {
-  return __fallback_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(n, k, idx_variant,
-                                                          transB);
-}
-
-void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
-                                     void *rhs_packed_mtx_qs4cx,
-                                     void *rhs_native_mtx_qs4cx,
-                                     void *rhs_scales_f32, uint32_t idx_variant,
-                                     bool transB) {
-  __fallback_rhs_pack_qsi4cxp_qs4cxs1s0(n, k, rhs_packed_mtx_qs4cx,
-                                        rhs_native_mtx_qs4cx, rhs_scales_f32,
-                                        idx_variant, transB);
-}
-
-template <>
-void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
-                                      void *lhs_native_mtx_f32,
-                                      void *rhs_packed_mtx_qs4cx,
-                                      float *dst_act_mtx_f32,
-                                      uint32_t idx_variant, bool transB,
-                                      float lower_bound, float upper_bound) {
-  __fallback_gemm_qai8dxp_qsi4cxp_packed(m, n, k, lhs_native_mtx_f32,
-                                         rhs_packed_mtx_qs4cx, dst_act_mtx_f32,
-                                         idx_variant, lower_bound, upper_bound);
 }
 
 } /* namespace nntrainer */

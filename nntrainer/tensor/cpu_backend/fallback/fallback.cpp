@@ -14,6 +14,7 @@
 #include <assert.h>
 #include <cmath>
 #include <compute_ops.h>
+#include <fallback.h>
 #include <fallback_internal.h>
 #include <nntrainer_error.h>
 
@@ -389,6 +390,70 @@ void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
                                        void *dst_q4_0x) {
   __fallback_transform_int4_osv32_isv2_to_q4_0(
     N, K, osv32_weights, osv32_scales, scale_group_size, 8, dst_q4_0x);
+}
+
+void quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
+                     void *rhs_native_mtx_qs4cx, void *rhs_scales_f32,
+                     bool is_nxk) {
+  if (is_nxk) {
+    __fallback_quant_nxk_qs4cx_f32(n, k, (const float *)rhs_native_mtx_f32,
+                                   (uint8_t *)rhs_native_mtx_qs4cx,
+                                   (float *)rhs_scales_f32);
+  } else {
+    __fallback_quant_kxn_qs4cx_f32(n, k, (const float *)rhs_native_mtx_f32,
+                                   (uint8_t *)rhs_native_mtx_qs4cx,
+                                   (float *)rhs_scales_f32);
+  }
+}
+
+size_t get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                             size_t idx_variant, bool is_nxk) {
+  return __fallback_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(n, k, idx_variant,
+                                                          is_nxk);
+}
+
+void rhs_pack_qsi4cxp_qs4cxs1s0(size_t n, size_t k, void *rhs_packed_mtx_qs4cx,
+                                void *rhs_native_mtx_qs4cx,
+                                void *rhs_scales_f32, size_t idx_variant,
+                                bool is_nxk) {
+  __fallback_rhs_pack_qsi4cxp_qs4cxs1s0(n, k, rhs_packed_mtx_qs4cx,
+                                        rhs_native_mtx_qs4cx, rhs_scales_f32,
+                                        idx_variant, is_nxk);
+}
+
+void gemm_qai8dxp_qsi4cxp_rhs_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_act_mtx_f32,
+  size_t idx_variant, bool is_nxk, float lower_bound, float upper_bound) {
+  // online quant lhs
+  const size_t lhs_ref_size_qa8dx = m * (k + sizeof(int32_t) + sizeof(float));
+
+  std::vector<uint8_t> lhs_qa8dx(lhs_ref_size_qa8dx);
+
+  __fallback_quant_qa8dx_f32(m, k, (const float *)lhs_native_mtx_f32,
+                             (int8_t *)lhs_qa8dx.data());
+
+  // do matmul
+  if (is_nxk) {
+    __fallback_matmul_mxn_mxk_nxk_f32_qa8dx_qs4cx(
+      m, n, k, (const int8_t *)lhs_qa8dx.data(),
+      (const uint8_t *)rhs_native_mtx_qs4cx, (const float *)rhs_scales_f32,
+      dst_act_mtx_f32, lower_bound, upper_bound);
+  } else {
+    __fallback_matmul_mxn_mxk_kxn_f32_qa8dx_qs4cx(
+      m, n, k, (const int8_t *)lhs_qa8dx.data(),
+      (const uint8_t *)rhs_native_mtx_qs4cx, (const float *)rhs_scales_f32,
+      dst_act_mtx_f32, lower_bound, upper_bound);
+  }
+}
+
+void gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
+                          void *lhs_native_mtx_f32, void *rhs_packed_mtx_qs4cx,
+                          float *dst_act_mtx_f32, size_t idx_variant,
+                          float lower_bound, float upper_bound) {
+  __fallback_gemm_qai8dxp_qsi4cxp_packed(m, n, k, lhs_native_mtx_f32,
+                                         rhs_packed_mtx_qs4cx, dst_act_mtx_f32,
+                                         idx_variant, lower_bound, upper_bound);
 }
 
 } /* namespace nntrainer */
