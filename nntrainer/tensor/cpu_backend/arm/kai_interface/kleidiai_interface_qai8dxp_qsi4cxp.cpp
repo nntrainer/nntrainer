@@ -186,9 +186,6 @@ kai_matmul_ukernel_f32_qa8dxp_qs4cxp ukernel_variants[] = {
 
 const size_t num_ukernel_variants =
   sizeof(ukernel_variants) / sizeof(ukernel_variants[0]);
-
-size_t roundup(size_t a, size_t b) { return ((a + b - 1) / b) * b; }
-
 } // namespace
 
 namespace nntrainer {

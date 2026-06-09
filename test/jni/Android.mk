@@ -32,6 +32,7 @@ NNTRAINER_INCLUDES := $(NNTRAINER_ROOT)/nntrainer \
 	$(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend \
 	$(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/fallback \
 	$(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/arm \
+	$(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/arm/kai_interface \
 	$(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/ggml_interface \
 	$(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/ggml_interface/nntr_ggml_impl \
 	$(NNTRAINER_ROOT)/nntrainer/utils \

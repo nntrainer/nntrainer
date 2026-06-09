@@ -104,6 +104,10 @@ if get_option('enable-profile')
   endif
 endif
 
+if host_machine.cpu_family() == 'aarch64'
+  test_target += [['unittest_nntrainer_kleidiai', []]]
+endif
+
 foreach target: test_target
   exe = executable(
     target[0],

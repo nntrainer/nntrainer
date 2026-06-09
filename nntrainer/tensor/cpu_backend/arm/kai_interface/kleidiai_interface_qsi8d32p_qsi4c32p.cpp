@@ -196,8 +196,6 @@ kai_matmul_ukernel_f32_qsi8d32p_qsi4c32p ukernel_variants_qsi8d32p[] = {
 #endif
 };
 
-static size_t roundup(size_t a, size_t b) { return ((a + b - 1) / b) * b; }
-
 static inline size_t num_blocks_per_row(size_t k, size_t bl) { return k / bl; }
 
 static inline size_t num_bytes_per_block_qs4c32(size_t bl) {

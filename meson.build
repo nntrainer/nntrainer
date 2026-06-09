@@ -5,7 +5,7 @@ project('nntrainer', 'c', 'cpp',
   default_options: [
     'werror=true',
     'warning_level=1',
-    'c_std=gnu89',
+    'c_std=gnu11',
     'cpp_std=c++17',
     'buildtype=release'
   ]
@@ -99,11 +99,12 @@ warning_c_flags = [
   '-Wnested-externs',
   '-Waggregate-return',
   '-Wold-style-definition',
-  '-Wdeclaration-after-statement',
   '-Wno-error=varargs'
 ]
 
 arch = host_machine.cpu_family()
+
+message(arch)
 
 target = target_machine.cpu_family()
 
@@ -152,6 +153,11 @@ if get_option('enable-kernel-caching')
   extra_defines += '-DKERNEL_CACHE=1'
 else
   extra_defines += '-DKERNEL_CACHE=0'
+endif
+
+if get_option('platform') != 'android' and host_machine.cpu_family() == 'aarch64'
+  extra_defines += '-D__ARM_FEATURE_DOTPROD=1'
+  extra_defines += '-D__ARM_FEATURE_MATMUL_INT8=1'
 endif
 
 if get_option('enable-fp16')
@@ -213,7 +219,11 @@ if get_option('enable-fp16')
      error ('RISCV64 RVV support and fp16 support is not yet implemented.')
    else
      error ('FP16 support for this arch is not yet implemented.')
-   endif  
+   endif
+else
+  if arch == 'aarch64'
+    add_project_arguments('-march=armv8.2-a+dotprod+i8mm', language: ['c', 'cpp'])
+  endif
 endif
 
 if get_option('enable-mmap')
