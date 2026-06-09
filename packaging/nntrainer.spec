@@ -621,6 +621,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/neon_mathfun.hxx
 %{_includedir}/nntrainer/matrix_transpose_neon.h
 %{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp_qsi4cxp_interface.h
+%{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4x4_1x4_neon_dotprod.h
 %{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod.h
 %{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod.h
 %{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod.h

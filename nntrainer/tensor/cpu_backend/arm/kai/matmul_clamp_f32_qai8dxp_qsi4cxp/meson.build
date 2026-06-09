@@ -1,5 +1,6 @@
 matmul_clamp_f32_qai8dxp_qsi4cxp_headers = [
     'kai_matmul_clamp_f32_qai8dxp_qsi4cxp_interface.h',
+    'kai_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4x4_1x4_neon_dotprod.h',
     'kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod.h',
     'kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod.h',
     'kai_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod.h',
@@ -11,6 +12,7 @@ matmul_clamp_f32_qai8dxp_qsi4cxp_headers = [
 ]
 
 matmul_clamp_f32_qai8dxp_qsi4cxp_sources = [
+    'kai_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4x4_1x4_neon_dotprod.c',
     'kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod.c',
     'kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod.c',
     'kai_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod.c',
