@@ -8,7 +8,7 @@ title: Getting Started
 
 The following dependencies are needed to compile/build/run.
 
-* gcc/g++ >= 7 ( std=c++17 is used )
+* gcc/g++ >= 8 ( std=gnu17, std=c++17 is used )
    - (note)  >= 13 is recommended to enable fp16 support
 * meson >= 0.55.0
 * libopenblas-dev and base
@@ -29,6 +29,8 @@ sudo apt install nntrainer
 ```
 
 ## Clean build with pdebuild (Ubuntu 18.04)
+> [!WARNING]  
+> Ubuntu 18.04 is deprecated! Information below may be outdated.
 
 Use the NNStreamer PPA to resolve additional build-dependencies (Tensorflow/Tensorflow-Lite).
 
