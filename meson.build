@@ -5,7 +5,7 @@ project('nntrainer', 'c', 'cpp',
   default_options: [
     'werror=true',
     'warning_level=1',
-    'c_std=gnu89',
+    'c_std=gnu17',
     'cpp_std=c++17',
     'buildtype=release'
   ]
@@ -75,7 +75,6 @@ warning_flags = [
   '-Wno-error=varargs',
   '-Wno-error=ignored-attributes',
   '-Wno-error=sign-compare',
-  '-Wdefaulted-function-deleted',
   '-ftree-vectorize',
   '-Wno-unused-variable',
   '-Wno-comment',
@@ -92,15 +91,16 @@ else
   warning_flags += '-Wno-maybe-uninitialized'
 endif
 
+warning_cxx_flags = [
+  '-Wdefaulted-function-deleted'
+]
+
 warning_c_flags = [
   '-Wmissing-declarations',
   '-Wmissing-include-dirs',
   '-Wmissing-prototypes',
   '-Wnested-externs',
-  '-Waggregate-return',
-  '-Wold-style-definition',
-  '-Wdeclaration-after-statement',
-  '-Wno-error=varargs'
+  '-Wold-style-definition'
 ]
 
 arch = host_machine.cpu_family()
@@ -287,6 +287,12 @@ if cc.get_id() != 'msvc' and cxx.get_id() != 'msvc'
     if cc.has_argument (extra_arg)
       add_project_arguments([extra_arg], language: 'c')
     endif
+    if cxx.has_argument (extra_arg)
+      add_project_arguments([extra_arg], language: 'cpp')
+    endif
+  endforeach
+
+  foreach extra_arg : warning_cxx_flags
     if cxx.has_argument (extra_arg)
       add_project_arguments([extra_arg], language: 'cpp')
     endif
