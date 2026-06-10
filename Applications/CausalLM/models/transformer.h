@@ -80,6 +80,13 @@ public:
               ModelType model_type = ModelType::MODEL);
 
   /**
+   * @brief Empty constructor for Transformer.
+   * @brief Child Class Needs to implement all features of the original
+   * Transformer constructor
+   */
+  Transformer() {}
+
+  /**
    * @brief Destroy the Transformer object
    */
   virtual ~Transformer() {}

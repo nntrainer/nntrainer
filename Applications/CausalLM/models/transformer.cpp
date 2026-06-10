@@ -139,7 +139,8 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();
-  } else if (cfg.contains("use_bidirectional_attention")) {
+  } else if (cfg.contains("use_bidirectional_attention") &&
+             !cfg["use_bidirectional_attention"].is_null()) {
     IS_CAUSAL = !cfg["use_bidirectional_attention"].get<bool>();
   } else if (nntr_cfg.contains("model_type") &&
              strToModelType(nntr_cfg["model_type"].get<std::string>()) ==
@@ -174,6 +175,12 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   } else if (cfg.contains("rope_parameters") &&
              cfg["rope_parameters"].contains("rope_theta")) {
     ROPE_THETA = cfg["rope_parameters"]["rope_theta"].get<unsigned int>();
+  } else if (cfg.contains("rope_parameters") &&
+             cfg["rope_parameters"].contains("sliding_attention")) {
+    json &rope_cfg = cfg["rope_parameters"]["sliding_attention"];
+    ROPE_THETA = rope_cfg.value("rope_theta", 10000);
+  } else {
+    ROPE_THETA = cfg.value("rope_theta", 10000);
   }
   TIE_WORD_EMBEDDINGS = cfg["tie_word_embeddings"].get<bool>();
   NORM_EPS = cfg["rms_norm_eps"];
@@ -210,7 +217,6 @@ void Transformer::initialize() {
   }
 
   is_initialized = true;
-
 #ifdef DEBUG
   model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);
 #endif
@@ -255,7 +261,6 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
  * @brief Load model weights from a binary nntrainer model file.
  */
 void Transformer::load_weight(const std::string &weight_path) {
-
   if (!is_initialized) {
     throw std::runtime_error(
       "Transformer model is not initialized. Please call "
@@ -476,10 +481,15 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
      withKey("weight_initializer", "ones")}));
   Tensor gate = ffn_gate(input);
 
+  /// @note nntrainer binary stores mlp weights in up, gate order.
+  /// For backward compatibility,
+  /// * layers are in up, gate order
+  /// * swiglu input[0] = gate
+  /// * swiglu input[1] = up
   LayerHandle swiglu(createLayer(
     "swiglu",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
-  Tensor act = swiglu({gate, up});
+  Tensor act = swiglu({up, gate}, {1, 0});
 
   LayerHandle ffn_down(createLayer(
     "fully_connected",

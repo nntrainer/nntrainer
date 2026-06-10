@@ -63,7 +63,9 @@ protected:
 
   void add_default_object();
 
-  void registerContext(std::string name, nntrainer::Context *context) {
+  void registerContext(std::string name, nntrainer::Context *context,
+                       void *library_handle = nullptr,
+                       DestroyContextFunc destroy_func = nullptr) {
     const std::lock_guard<std::mutex> lock(engine_mutex);
     static int registerCount = 0;
 

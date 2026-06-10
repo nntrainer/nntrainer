@@ -43,6 +43,10 @@ TieWordEmbedding::TieWordEmbedding() :
 }
 
 void TieWordEmbedding::finalize(nntrainer::InitLayerContext &context) {
+  if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
+    skip_prefill =
+      std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).get();
+
   mode_ = std::get<nntrainer::props::Unit>(tieword_embedding_props).empty()
             ? mode::embedding
             : mode::lm_head;
@@ -271,6 +275,10 @@ void TieWordEmbedding::incremental_forwarding_embedding(
 void TieWordEmbedding::incremental_forwarding_lmhead(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
+  bool is_prefill = !from;
+  if (skip_prefill && is_prefill)
+    return;
+
   nntrainer::Tensor weight =
     context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
 

@@ -26,6 +26,7 @@
 #include "model_common_properties.h"
 #include <cmath>
 #include <compute_ops.h>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -68,6 +69,40 @@
 #define ML_TRAIN_SUMMARY_MODEL_VALID_ACCURACY 103
 
 namespace nntrainer {
+
+namespace {
+
+Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
+  const unsigned int bytes = static_cast<unsigned int>(
+    static_cast<size_t>(dim.getDataLen()) * dim.getDataTypeSize());
+
+  switch (dim.getDataType()) {
+  case TensorDim::DataType::FP16:
+  case TensorDim::DataType::UINT16:
+  case TensorDim::DataType::QINT16:
+    return Tensor::Map<uint16_t>(reinterpret_cast<uint16_t *>(buf), bytes, dim,
+                                 0);
+  case TensorDim::DataType::UINT8:
+  case TensorDim::DataType::UINT4:
+  case TensorDim::DataType::QINT8:
+  case TensorDim::DataType::QINT4:
+  case TensorDim::DataType::Q4_K:
+  case TensorDim::DataType::Q6_K:
+  case TensorDim::DataType::Q4_0:
+    return Tensor::Map<uint8_t>(reinterpret_cast<uint8_t *>(buf), bytes, dim,
+                                0);
+  case TensorDim::DataType::UINT32:
+  case TensorDim::DataType::BCQ:
+    return Tensor::Map<uint32_t>(reinterpret_cast<uint32_t *>(buf), bytes, dim,
+                                 0);
+  case TensorDim::DataType::FP32:
+  case TensorDim::DataType::NONE:
+  default:
+    return Tensor::Map<float>(buf, bytes, dim, 0);
+  }
+}
+
+} // namespace
 
 NeuralNetwork::NeuralNetwork() :
   model_props(props::LossType(), {}, {}, props::ClipGradByGlobalNorm(),
@@ -1272,8 +1307,8 @@ NeuralNetwork::inference(unsigned int batch_size,
   input_tensors.reserve(input.size());
   for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
     in_dim[idx].batch(batch_size);
-    input_tensors.emplace_back(MAKE_SHARED_TENSOR(Tensor::Map(
-      input[idx], in_dim[idx].getDataLen() * sizeof(float), in_dim[idx], 0)));
+    input_tensors.emplace_back(
+      MAKE_SHARED_TENSOR(mapExternalTensor(input[idx], in_dim[idx])));
   }
 
   if (!label.empty()) {
@@ -1282,9 +1317,8 @@ NeuralNetwork::inference(unsigned int batch_size,
     label_tensors.reserve(label.size());
     for (unsigned int idx = 0; idx < label_dim.size(); idx++) {
       label_dim[idx].batch(batch_size);
-      label_tensors.emplace_back(MAKE_SHARED_TENSOR(
-        Tensor::Map(label[idx], label_dim[idx].getDataLen() * sizeof(float),
-                    label_dim[idx], 0)));
+      label_tensors.emplace_back(
+        MAKE_SHARED_TENSOR(mapExternalTensor(label[idx], label_dim[idx])));
     }
     output_tensors = inference(input_tensors, label_tensors, false);
   } else {
@@ -1352,8 +1386,8 @@ std::vector<float *> NeuralNetwork::incremental_inference(
   input_tensors.reserve(input.size());
   for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
     in_dim[idx].batch(batch_size);
-    input_tensors.emplace_back(MAKE_SHARED_TENSOR(Tensor::Map(
-      input[idx], in_dim[idx].getDataLen() * sizeof(float), in_dim[idx], 0)));
+    input_tensors.emplace_back(
+      MAKE_SHARED_TENSOR(mapExternalTensor(input[idx], in_dim[idx])));
   }
 
   // auto start_increment = std::chrono::high_resolution_clock::now();
@@ -1363,9 +1397,8 @@ std::vector<float *> NeuralNetwork::incremental_inference(
     label_tensors.reserve(label.size());
     for (unsigned int idx = 0; idx < label_dim.size(); idx++) {
       label_dim[idx].batch(batch_size);
-      label_tensors.emplace_back(MAKE_SHARED_TENSOR(
-        Tensor::Map(label[idx], label_dim[idx].getDataLen() * sizeof(float),
-                    label_dim[idx], 0)));
+      label_tensors.emplace_back(
+        MAKE_SHARED_TENSOR(mapExternalTensor(label[idx], label_dim[idx])));
     }
     output_tensors = incremental_inference(input_tensors, label_tensors,
                                            init_seq_len, from, to);

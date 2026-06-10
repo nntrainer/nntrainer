@@ -29,7 +29,7 @@ public:
   /**
    * @brief     Constructor of Addition Layer
    */
-  AdditionLayer() : Layer(), add_props(props::Print()) {}
+  AdditionLayer() : Layer(), add_props(props::Print(), props::SkipPrefill()) {}
 
   /**
    * @brief     Destructor of Addition Layer
@@ -96,8 +96,9 @@ public:
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
-  std::tuple<props::Print>
+  std::tuple<props::Print, props::SkipPrefill>
     add_props; /**< fc layer properties : unit - number of output neurons */
+  bool skip_prefill = false;
 
   static constexpr const char *type = "addition";
 };

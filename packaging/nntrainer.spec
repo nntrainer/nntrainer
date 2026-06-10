@@ -600,7 +600,6 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/compute_ops.h
 %{_includedir}/nntrainer/context_data.h
 %{_includedir}/nntrainer/fallback_internal.h
-%{_includedir}/nntrainer/fallback_kleidiai.h
 %if 0%{?use_cblas}
 %{_includedir}/nntrainer/cblas_interface.h
 %endif
@@ -608,6 +607,11 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/nntr_ggml_impl.h
 %{_includedir}/nntrainer/nntr_ggml_impl_common.h
 %{_includedir}/nntrainer/nntr_ggml_impl_utils.h
+%{_includedir}/nntrainer/ddtree_types.h
+%{_includedir}/nntrainer/ddtree.h
+%{_includedir}/nntrainer/ddtree_sliding.h
+%{_includedir}/nntrainer/ddtree_compact.h
+%{_includedir}/nntrainer/ddtree_sampling.h
 %{_includedir}/nntrainer/thread_manager.h
 %{_includedir}/nntrainer/thread_manager_util.h
 %{_includedir}/nntrainer/safetensors_util.h
@@ -634,7 +638,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp4x8_1x4x32_neon_dotprod.h
 %{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod.h
 %{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod.h
-%{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod.h
+%{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod.h
 %{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x8_4x4x32_neon_i8mm.h
 %{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x8_8x4x32_neon_i8mm.h
 %{_includedir}/nntrainer/kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_4x8x32_neon_i8mm.h

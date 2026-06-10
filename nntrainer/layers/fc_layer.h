@@ -122,6 +122,7 @@ private:
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
   std::array<unsigned int, 4> lora_idx;   /**< indices of the lora weights */
   std::unique_ptr<nntrainer::Quantizer> quantizer;
+  bool skip_prefill = false;
 };
 } // namespace nntrainer
 

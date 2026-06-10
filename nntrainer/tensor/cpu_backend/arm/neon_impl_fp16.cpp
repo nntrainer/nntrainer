@@ -2254,62 +2254,8 @@ template <>
 void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,
                                        float epsilon) {
-  const float eps_h = (float)epsilon;
-
-  for (size_t h = 0; h < H; ++h) {
-    const float *rowX = X + h * W;
-    float *rowY = Y + h * W;
-
-    size_t i = 0;
-    float16x8_t acc = vdupq_n_f16(0.F);
-
-    for (; i + 8 <= W; i += 8) {
-      float32x4_t f0 = vld1q_f32(rowX + i + 0);
-      float32x4_t f1 = vld1q_f32(rowX + i + 4);
-      float16x4_t h0 = vcvt_f16_f32(f0);
-      float16x4_t h1 = vcvt_f16_f32(f1);
-      float16x8_t h8 = vcombine_f16(h0, h1);
-      acc = vfmaq_f16(acc, h8, h8);
-    }
-
-    if (i + 4 <= W) {
-      float32x4_t f = vld1q_f32(rowX + i);
-      float16x4_t h4 = vcvt_f16_f32(f);
-      float16x4_t p4 = vmul_f16(h4, h4);
-      acc = vaddq_f16(acc, vcombine_f16(p4, vdup_n_f16(0.F)));
-      i += 4;
-    }
-
-    __fp16 sum_h = hsumq_f16(acc);
-    for (; i < W; ++i) {
-      float hx = (float)rowX[i];
-      sum_h = sum_h + hx * hx;
-    }
-
-    float mean_single = sum_h / W;
-    float scale_single = 1.F / std::sqrt(mean_single + eps_h);
-    float16x8_t scale_v = vdupq_n_f16(scale_single);
-
-    i = 0;
-    for (; i + 8 <= W; i += 8) {
-      float32x4_t f0 = vld1q_f32(rowX + i + 0);
-      float32x4_t f1 = vld1q_f32(rowX + i + 4);
-      float16x8_t xh = vcombine_f16(vcvt_f16_f32(f0), vcvt_f16_f32(f1));
-      float16x8_t yh = vmulq_f16(xh, scale_v);
-
-      vst1q_f32(rowY + i + 0, vcvt_f32_f16(vget_low_f16(yh)));
-      vst1q_f32(rowY + i + 4, vcvt_f32_f16(vget_high_f16(yh)));
-    }
-    if (i + 4 <= W) {
-      float32x4_t f = vld1q_f32(rowX + i);
-      float16x4_t y4 = vmul_f16(vcvt_f16_f32(f), vget_low_f16(scale_v));
-      vst1q_f32(rowY + i, vcvt_f32_f16(y4));
-      i += 4;
-    }
-    for (; i < W; ++i) {
-      rowY[i] = rowX[i] * scale_single;
-    }
-  }
+  throw std::runtime_error("ERROR : rms_norm_wrt_width_fp16_intrinsic(float *) "
+                           "is deprecated due to overflow in fp16");
 }
 
 static inline float16x8_t vbslq_f16_u16(uint16x8_t m, float16x8_t a,

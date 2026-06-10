@@ -16,7 +16,6 @@
 #include <vector>
 
 #include <fallback_internal.h>
-#include <fallback_kleidiai.h>
 
 namespace {
 
@@ -860,39 +859,325 @@ TEST(nntrainer_fallback, clamp_basic) {
 // Tests for Kleidiai quantization functions
 //==============================================================================
 
-TEST(nntrainer_fallback_kleidiai, quant_qs4cx_f32_nxk_basic) {
+TEST(nntrainer_fallback_kleidiai, quant_nxk_qs4cx_f32_zero) {
   const size_t n = 4;
   const size_t k = 8;
-  std::vector<float> rhs_f32 = generate_random_vector<float>(n * k);
-  std::vector<uint8_t> rhs_qs4cx((n * (k + 1) / 2), 0);
+  const size_t rhs_qs4cx_stride = (k + 1) / 2;
+  std::vector<float> rhs_f32(n * k, 0.0f);
+  std::vector<uint8_t> rhs_qs4cx((n * rhs_qs4cx_stride), 0);
   std::vector<float> rhs_scales_f32(n, 0.0f);
 
-  quant_qs4cx_f32(n, k, rhs_format::nxk, rhs_f32.data(), rhs_qs4cx.data(),
-                  rhs_scales_f32.data());
+  nntrainer::__fallback_quant_nxk_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
 
   // Verify scales are computed (non-zero for non-zero input)
   for (size_t i = 0; i < n; ++i) {
-    EXPECT_TRUE(rhs_scales_f32[i] != 0.0f || rhs_f32[i * k] == 0.0f);
+    EXPECT_EQ(rhs_scales_f32[i], 1.0f);
+    for (size_t j = 0; j < rhs_qs4cx_stride; ++j) {
+      EXPECT_EQ((int)rhs_qs4cx[i * rhs_qs4cx_stride + j], 0x88);
+    }
   }
 }
 
-TEST(nntrainer_fallback_kleidiai, quant_qs4cx_f32_kxn_basic) {
+TEST(nntrainer_fallback_kleidiai, quant_kxn_qs4cx_f32_zero) {
   const size_t n = 4;
   const size_t k = 8;
-  std::vector<float> rhs_f32 = generate_random_vector<float>(n * k);
-  std::vector<uint8_t> rhs_qs4cx((k * (n + 1) / 2), 0);
+  const size_t rhs_qs4cx_stride = (n + 1) / 2;
+  std::vector<float> rhs_f32(n * k, 0.0f);
+  std::vector<uint8_t> rhs_qs4cx((k * rhs_qs4cx_stride), 0);
   std::vector<float> rhs_scales_f32(n, 0.0f);
 
-  quant_qs4cx_f32(n, k, rhs_format::kxn, rhs_f32.data(), rhs_qs4cx.data(),
-                  rhs_scales_f32.data());
+  nntrainer::__fallback_quant_kxn_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
+
+  // Verify scales are computed (non-zero for non-zero input)
+  for (size_t i = 0; i < n; ++i) {
+    EXPECT_EQ(rhs_scales_f32[i], 1.0f);
+    for (size_t j = 0; j < k; ++j) {
+      EXPECT_EQ((int)rhs_qs4cx[j * rhs_qs4cx_stride + i / 2], 0x88);
+    }
+  }
+}
+
+TEST(nntrainer_fallback_kleidiai, quant_nxk_qs4cx_f32_basic) {
+  const size_t n = 4;
+  const size_t k = 8;
+  const size_t rhs_qs4cx_stride = (k + 1) / 2;
+  std::vector<float> rhs_f32 = generate_random_vector<float>(n * k);
+  std::vector<uint8_t> rhs_qs4cx((n * rhs_qs4cx_stride), 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+
+  nntrainer::__fallback_quant_nxk_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
 
   // Verify scales are computed
   for (size_t i = 0; i < n; ++i) {
-    EXPECT_TRUE(rhs_scales_f32[i] != 0.0f || rhs_f32[i * k] == 0.0f);
+    float scale = rhs_scales_f32[i];
+    for (size_t j = 0; j < rhs_qs4cx_stride; ++j) {
+      uint8_t byte = rhs_qs4cx[i * rhs_qs4cx_stride + j];
+      int lo = (byte & 0xF);
+      int hi = (byte >> 4) & 0xF;
+
+      EXPECT_TRUE(lo >= 0 && lo <= 15);
+      EXPECT_TRUE(hi >= 0 && hi <= 15);
+
+      float lo_f = (lo - 8) * scale;
+      float hi_f = (hi - 8) * scale;
+
+      float lo_ref = rhs_f32[i * k + 2 * j];
+      float hi_ref = rhs_f32[i * k + 2 * j + 1];
+
+      if (lo_ref <= -8.0f * scale) {
+        EXPECT_EQ(lo, 0);
+      } else if (lo_ref >= +7.0f * scale) {
+        EXPECT_EQ(lo, 15);
+      } else {
+        EXPECT_NEAR(lo_f, lo_ref, scale / 2);
+      }
+
+      if (hi_ref <= -8.0f * scale) {
+        EXPECT_EQ(hi, 0);
+      } else if (hi_ref >= +7.0f * scale) {
+        EXPECT_EQ(hi, 15);
+      } else {
+        EXPECT_NEAR(hi_f, hi_ref, scale / 2);
+      }
+    }
   }
 }
 
-TEST(nntrainer_fallback_kleidiai, ref_quant_qa8dx_f32_basic) {
+TEST(nntrainer_fallback_kleidiai, quant_kxn_qs4cx_f32_basic) {
+  const size_t n = 4;
+  const size_t k = 8;
+  const size_t rhs_qs4cx_stride = (n + 1) / 2;
+  std::vector<float> rhs_f32 = generate_random_vector<float>(n * k);
+  std::vector<uint8_t> rhs_qs4cx((k * rhs_qs4cx_stride), 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+
+  nntrainer::__fallback_quant_kxn_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
+
+  // Verify scales are computed
+  for (size_t i = 0; i < rhs_qs4cx_stride; ++i) {
+    float scale_lo = rhs_scales_f32[2 * i];
+    float scale_hi = rhs_scales_f32[2 * i + 1];
+    for (size_t j = 0; j < k; ++j) {
+      uint8_t byte = rhs_qs4cx[j * rhs_qs4cx_stride + i];
+      int lo = (byte & 0xF);
+      int hi = (byte >> 4) & 0xF;
+
+      EXPECT_TRUE(lo >= 0 && lo <= 15);
+      EXPECT_TRUE(hi >= 0 && hi <= 15);
+
+      float lo_f = (lo - 8) * scale_lo;
+      float hi_f = (hi - 8) * scale_hi;
+
+      float lo_ref = rhs_f32[2 * i * k + j];
+      float hi_ref = rhs_f32[(2 * i + 1) * k + j];
+
+      if (lo_ref <= -8.0f * scale_lo) {
+        EXPECT_EQ(lo, 0);
+      } else if (lo_ref >= +7.0f * scale_lo) {
+        EXPECT_EQ(lo, 15);
+      } else {
+        EXPECT_NEAR(lo_f, lo_ref, scale_lo / 2);
+      }
+
+      if (hi_ref <= -8.0f * scale_hi) {
+        EXPECT_EQ(hi, 0);
+      } else if (hi_ref >= +7.0f * scale_hi) {
+        EXPECT_EQ(hi, 15);
+      } else {
+        EXPECT_NEAR(hi_f, hi_ref, scale_hi / 2);
+      }
+    }
+  }
+}
+
+TEST(nntrainer_fallback_kleidiai, quant_nxk_qs4cx_f32_odd_k) {
+  const size_t n = 4;
+  const size_t k = 9;
+  const size_t rhs_qs4cx_stride = (k + 1) / 2;
+  std::vector<float> rhs_f32 = generate_random_vector<float>(n * k);
+  std::vector<uint8_t> rhs_qs4cx((n * rhs_qs4cx_stride), 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+
+  nntrainer::__fallback_quant_nxk_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
+
+  // Verify scales are computed
+  for (size_t i = 0; i < n; ++i) {
+    float scale = rhs_scales_f32[i];
+    size_t j = 0;
+    for (; j < rhs_qs4cx_stride - 1; ++j) {
+      uint8_t byte = rhs_qs4cx[i * rhs_qs4cx_stride + j];
+      int lo = (byte & 0xF);
+      int hi = (byte >> 4) & 0xF;
+
+      EXPECT_TRUE(lo >= 0 && lo <= 15);
+      EXPECT_TRUE(hi >= 0 && hi <= 15);
+
+      float lo_f = (lo - 8) * scale;
+      float hi_f = (hi - 8) * scale;
+
+      float lo_ref = rhs_f32[i * k + 2 * j];
+      float hi_ref = rhs_f32[i * k + 2 * j + 1];
+
+      if (lo_ref <= -8.0f * scale) {
+        EXPECT_EQ(lo, 0);
+      } else if (lo_ref >= +7.0f * scale) {
+        EXPECT_EQ(lo, 15);
+      } else {
+        EXPECT_NEAR(lo_f, lo_ref, scale / 2);
+      }
+
+      if (hi_ref <= -8.0f * scale) {
+        EXPECT_EQ(hi, 0);
+      } else if (hi_ref >= +7.0f * scale) {
+        EXPECT_EQ(hi, 15);
+      } else {
+        EXPECT_NEAR(hi_f, hi_ref, scale / 2);
+      }
+    }
+
+    // last nibble should be zero
+    {
+      uint8_t byte = rhs_qs4cx[i * rhs_qs4cx_stride + j];
+      int lo = (byte & 0xF);
+      int hi = (byte >> 4) & 0xF;
+
+      EXPECT_TRUE(lo >= 0 && lo <= 15);
+      EXPECT_TRUE(hi == 0);
+
+      float lo_f = (lo - 8) * scale;
+      // float hi_f = (hi - 8) * scale;
+
+      float lo_ref = rhs_f32[i * k + 2 * j];
+      // float hi_ref = rhs_f32[i * k + 2 * j + 1];
+
+      if (lo_ref <= -8.0f * scale) {
+        EXPECT_EQ(lo, 0);
+      } else if (lo_ref >= +7.0f * scale) {
+        EXPECT_EQ(lo, 15);
+      } else {
+        EXPECT_NEAR(lo_f, lo_ref, scale / 2);
+      }
+    }
+  }
+}
+
+TEST(nntrainer_fallback_kleidiai, quant_kxn_qs4cx_f32_odd_n) {
+  const size_t n = 5;
+  const size_t k = 8;
+  const size_t rhs_qs4cx_stride = (n + 1) / 2;
+  std::vector<float> rhs_f32 = generate_random_vector<float>(n * k);
+  std::vector<uint8_t> rhs_qs4cx((k * rhs_qs4cx_stride), 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+
+  nntrainer::__fallback_quant_kxn_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
+
+  // Verify scales are computed
+  size_t i = 0;
+  for (; i < rhs_qs4cx_stride - 1; ++i) {
+    float scale_lo = rhs_scales_f32[2 * i];
+    float scale_hi = rhs_scales_f32[2 * i + 1];
+    for (size_t j = 0; j < k; ++j) {
+      uint8_t byte = rhs_qs4cx[j * rhs_qs4cx_stride + i];
+      int lo = (byte & 0xF);
+      int hi = (byte >> 4) & 0xF;
+
+      EXPECT_TRUE(lo >= 0 && lo <= 15);
+      EXPECT_TRUE(hi >= 0 && hi <= 15);
+
+      float lo_f = (lo - 8) * scale_lo;
+      float hi_f = (hi - 8) * scale_hi;
+
+      float lo_ref = rhs_f32[2 * i * k + j];
+      float hi_ref = rhs_f32[(2 * i + 1) * k + j];
+
+      if (lo_ref <= -8.0f * scale_lo) {
+        EXPECT_EQ(lo, 0);
+      } else if (lo_ref >= +7.0f * scale_lo) {
+        EXPECT_EQ(lo, 15);
+      } else {
+        EXPECT_NEAR(lo_f, lo_ref, scale_lo / 2);
+      }
+
+      if (hi_ref <= -8.0f * scale_hi) {
+        EXPECT_EQ(hi, 0);
+      } else if (hi_ref >= +7.0f * scale_hi) {
+        EXPECT_EQ(hi, 15);
+      } else {
+        EXPECT_NEAR(hi_f, hi_ref, scale_hi / 2);
+      }
+    }
+  }
+
+  // last nibble should be 0
+  {
+    float scale = rhs_scales_f32[2 * i];
+    for (size_t j = 0; j < k; ++j) {
+      uint8_t byte = rhs_qs4cx[j * rhs_qs4cx_stride + i];
+      int lo = (byte & 0xF);
+      int hi = (byte >> 4) & 0xF;
+
+      EXPECT_TRUE(lo >= 0 && lo <= 15);
+      EXPECT_TRUE(hi == 0);
+
+      float lo_f = (lo - 8) * scale;
+
+      float lo_ref = rhs_f32[2 * i * k + j];
+
+      if (lo_ref <= -8.0f * scale) {
+        EXPECT_EQ(lo, 0);
+      } else if (lo_ref >= +7.0f * scale) {
+        EXPECT_EQ(lo, 15);
+      } else {
+        EXPECT_NEAR(lo_f, lo_ref, scale / 2);
+      }
+    }
+  }
+}
+
+TEST(nntrainer_fallback_kleidiai, quant_qa8dx_zero) {
+  const size_t m = 2;
+  const size_t k = 8;
+  std::vector<float> lhs_f32(m * k, 0);
+
+  // Output: scale (float) + offset (int32) + quantized values (int8 * k) per
+  // row
+  const size_t dst_stride =
+    sizeof(float) + sizeof(int32_t) + k * sizeof(int8_t);
+  std::vector<int8_t> lhs_qa8dx(m * dst_stride, 0);
+
+  nntrainer::__fallback_quant_qa8dx_f32(m, k, lhs_f32.data(), lhs_qa8dx.data());
+
+  // Verify quantization was performed (output is not all zeros for non-zero
+  // input)
+  // Verify scales are computed
+  for (size_t i = 0; i < m; ++i) {
+    int8_t *row_ptr = lhs_qa8dx.data() + i * dst_stride;
+    float scale = *((float *)row_ptr);
+    row_ptr += sizeof(float);
+
+    EXPECT_EQ(scale, 1.0f);
+
+    int32_t zerop_neg = *((int32_t *)row_ptr);
+    row_ptr += sizeof(int32_t);
+
+    EXPECT_EQ(zerop_neg, -127);
+
+    for (size_t j = 0; j < k; ++j) {
+      int8_t q = *((int8_t *)row_ptr);
+      row_ptr += sizeof(int8_t);
+
+      EXPECT_EQ(q, 127);
+    }
+  }
+}
+
+TEST(nntrainer_fallback_kleidiai, quant_qa8dx_basic) {
   const size_t m = 2;
   const size_t k = 8;
   std::vector<float> lhs_f32 = generate_random_vector<float>(m * k);
@@ -903,102 +1188,143 @@ TEST(nntrainer_fallback_kleidiai, ref_quant_qa8dx_f32_basic) {
     sizeof(float) + sizeof(int32_t) + k * sizeof(int8_t);
   std::vector<int8_t> lhs_qa8dx(m * dst_stride, 0);
 
-  ref_quant_qa8dx_f32(m, k, lhs_f32.data(), lhs_qa8dx.data());
+  nntrainer::__fallback_quant_qa8dx_f32(m, k, lhs_f32.data(), lhs_qa8dx.data());
 
   // Verify quantization was performed (output is not all zeros for non-zero
   // input)
-  bool has_nonzero = false;
-  for (size_t i = 0; i < lhs_qa8dx.size(); ++i) {
-    if (lhs_qa8dx[i] != 0) {
-      has_nonzero = true;
-      break;
+  // Verify scales are computed
+  for (size_t i = 0; i < m; ++i) {
+    int8_t *row_ptr = lhs_qa8dx.data() + i * dst_stride;
+    float scale = *((float *)row_ptr);
+    row_ptr += sizeof(float);
+
+    int32_t zerop_neg = *((int32_t *)row_ptr);
+    row_ptr += sizeof(int32_t);
+
+    for (size_t j = 0; j < k; ++j) {
+      int8_t q = *((int8_t *)row_ptr);
+      row_ptr += sizeof(int8_t);
+
+      EXPECT_TRUE(q >= INT8_MIN && q <= INT8_MAX);
+
+      float x = (q + zerop_neg) * scale;
+
+      float x_ref = lhs_f32[i * k + j];
+
+      if (x_ref <= (INT8_MIN + zerop_neg) * scale) {
+        EXPECT_EQ(q, INT8_MIN);
+      } else if (x_ref >= (INT8_MAX + zerop_neg) * scale) {
+        EXPECT_EQ(q, INT8_MAX);
+      } else {
+        EXPECT_NEAR(x, x_ref, scale / 2);
+      }
     }
   }
-  EXPECT_TRUE(has_nonzero);
 }
 
-TEST(nntrainer_fallback_kleidiai, ref_matmul_f32_qa8dx_qs4cx_nxk) {
-  const size_t m = 2;
-  const size_t n = 2;
-  const size_t k = 8;
+TEST(nntrainer_fallback_kleidiai, matmul_mxn_mxk_nxk_f32_qa8dx_qs4cx) {
+  const size_t m = 32;
+  const size_t n = 32;
+  const size_t k = 64;
 
   // Generate input data
   std::vector<float> lhs_f32 = generate_random_vector<float>(m * k);
   std::vector<float> rhs_f32 = generate_random_vector<float>(n * k);
 
+  // Generate ref out
+  std::vector<float> ref_out(m * n, 0);
+  for (int i = 0; i < m; i++) {
+    for (int j = 0; j < n; j++) {
+      for (int kk = 0; kk < k; kk++) {
+        ref_out[i * n + j] += lhs_f32[i * k + kk] * rhs_f32[j * k + kk];
+      }
+    }
+  }
+
   // Quantize LHS
   const size_t lhs_stride =
     sizeof(float) + sizeof(int32_t) + k * sizeof(int8_t);
   std::vector<int8_t> lhs_qa8dx(m * lhs_stride, 0);
-  ref_quant_qa8dx_f32(m, k, lhs_f32.data(), lhs_qa8dx.data());
+  nntrainer::__fallback_quant_qa8dx_f32(m, k, lhs_f32.data(), lhs_qa8dx.data());
 
   // Quantize RHS
   std::vector<uint8_t> rhs_qs4cx((n * (k + 1) / 2), 0);
   std::vector<float> rhs_scales_f32(n, 0.0f);
-  quant_qs4cx_f32(n, k, rhs_format::nxk, rhs_f32.data(), rhs_qs4cx.data(),
-                  rhs_scales_f32.data());
+  nntrainer::__fallback_quant_nxk_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
 
   // Perform matmul
   std::vector<float> dst_f32(m * n, 0.0f);
-  ref_matmul_f32_qa8dx_qs4cx(m, n, k, rhs_format::nxk, lhs_qa8dx.data(),
-                             rhs_qs4cx.data(), rhs_scales_f32.data(),
-                             dst_f32.data(), -std::numeric_limits<float>::max(),
-                             std::numeric_limits<float>::max());
+  nntrainer::__fallback_matmul_mxn_mxk_nxk_f32_qa8dx_qs4cx(
+    m, n, k, lhs_qa8dx.data(), rhs_qs4cx.data(), rhs_scales_f32.data(),
+    dst_f32.data());
 
-  // Simply verify output is computed (not all zeros)
-  bool has_nonzero = false;
-  for (size_t i = 0; i < dst_f32.size(); ++i) {
-    if (dst_f32[i] != 0.0f) {
-      has_nonzero = true;
-      break;
-    }
+  // compare MSE
+  float mse = 0.0f;
+  for (int i = 0; i < m * n; i++) {
+    float diff = ref_out[i] - dst_f32[i];
+    mse += diff * diff;
   }
-  EXPECT_TRUE(has_nonzero);
+  mse /= m * n;
+
+  constexpr float eps = 1e-5;
+  EXPECT_LE(mse, eps * m * n * k);
 }
 
-TEST(nntrainer_fallback_kleidiai, ref_matmul_f32_qa8dx_qs4cx_kxn) {
-  const size_t m = 2;
-  const size_t n = 2;
-  const size_t k = 8;
+TEST(nntrainer_fallback_kleidiai, matmul_mxn_mxk_kxn_f32_qa8dx_qs4cx) {
+  const size_t m = 32;
+  const size_t n = 32;
+  const size_t k = 64;
 
   // Generate input data
   std::vector<float> lhs_f32 = generate_random_vector<float>(m * k);
   std::vector<float> rhs_f32 = generate_random_vector<float>(n * k);
 
+  // Generate ref out
+  std::vector<float> ref_out(m * n, 0);
+  for (int i = 0; i < m; i++) {
+    for (int j = 0; j < n; j++) {
+      for (int kk = 0; kk < k; kk++) {
+        ref_out[i * n + j] += lhs_f32[i * k + kk] * rhs_f32[j * k + kk];
+      }
+    }
+  }
+
   // Quantize LHS
   const size_t lhs_stride =
     sizeof(float) + sizeof(int32_t) + k * sizeof(int8_t);
   std::vector<int8_t> lhs_qa8dx(m * lhs_stride, 0);
-  ref_quant_qa8dx_f32(m, k, lhs_f32.data(), lhs_qa8dx.data());
+  nntrainer::__fallback_quant_qa8dx_f32(m, k, lhs_f32.data(), lhs_qa8dx.data());
 
   // Quantize RHS
   std::vector<uint8_t> rhs_qs4cx((k * (n + 1) / 2), 0);
   std::vector<float> rhs_scales_f32(n, 0.0f);
-  quant_qs4cx_f32(n, k, rhs_format::kxn, rhs_f32.data(), rhs_qs4cx.data(),
-                  rhs_scales_f32.data());
+  nntrainer::__fallback_quant_kxn_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
 
   // Perform matmul
   std::vector<float> dst_f32(m * n, 0.0f);
-  ref_matmul_f32_qa8dx_qs4cx(m, n, k, rhs_format::kxn, lhs_qa8dx.data(),
-                             rhs_qs4cx.data(), rhs_scales_f32.data(),
-                             dst_f32.data(), -std::numeric_limits<float>::max(),
-                             std::numeric_limits<float>::max());
+  nntrainer::__fallback_matmul_mxn_mxk_kxn_f32_qa8dx_qs4cx(
+    m, n, k, lhs_qa8dx.data(), rhs_qs4cx.data(), rhs_scales_f32.data(),
+    dst_f32.data());
 
-  // Verify output is computed (not all zeros)
-  bool has_nonzero = false;
-  for (size_t i = 0; i < dst_f32.size(); ++i) {
-    if (dst_f32[i] != 0.0f) {
-      has_nonzero = true;
-      break;
-    }
+  // compare MSE
+  float mse = 0.0f;
+  for (int i = 0; i < m * n; i++) {
+    float diff = ref_out[i] - dst_f32[i];
+    mse += diff * diff;
   }
-  EXPECT_TRUE(has_nonzero);
+  mse /= m * n;
+
+  constexpr float eps = 1e-5;
+  EXPECT_LE(mse, eps * m * n * k);
 }
 
-TEST(nntrainer_fallback_kleidiai, ref_matmul_f32_qa8dx_qs4cx_with_clamp) {
-  const size_t m = 2;
-  const size_t n = 2;
-  const size_t k = 8;
+TEST(nntrainer_fallback_kleidiai,
+     matmul_mxn_mxk_nxk_f32_qa8dx_qs4cx_with_clamp) {
+  const size_t m = 32;
+  const size_t n = 32;
+  const size_t k = 64;
 
   // Generate input data with larger values
   std::vector<float> lhs_f32 =
@@ -1006,31 +1332,120 @@ TEST(nntrainer_fallback_kleidiai, ref_matmul_f32_qa8dx_qs4cx_with_clamp) {
   std::vector<float> rhs_f32 =
     generate_random_vector<float>(n * k, -10.0f, 10.0f);
 
+  const float clamp_min = -5.0f;
+  const float clamp_max = 5.0f;
+
+  // Generate ref out
+  std::vector<float> ref_out(m * n, 0);
+  for (int i = 0; i < m; i++) {
+    for (int j = 0; j < n; j++) {
+      float *out = ref_out.data() + i * n + j;
+      for (int kk = 0; kk < k; kk++) {
+        *out += lhs_f32[i * k + kk] * rhs_f32[j * k + kk];
+      }
+      *out = std::max(*out, clamp_min);
+      *out = std::min(*out, clamp_max);
+    }
+  }
+
   // Quantize LHS
   const size_t lhs_stride =
     sizeof(float) + sizeof(int32_t) + k * sizeof(int8_t);
   std::vector<int8_t> lhs_qa8dx(m * lhs_stride, 0);
-  ref_quant_qa8dx_f32(m, k, lhs_f32.data(), lhs_qa8dx.data());
+  nntrainer::__fallback_quant_qa8dx_f32(m, k, lhs_f32.data(), lhs_qa8dx.data());
 
   // Quantize RHS
   std::vector<uint8_t> rhs_qs4cx((n * (k + 1) / 2), 0);
   std::vector<float> rhs_scales_f32(n, 0.0f);
-  quant_qs4cx_f32(n, k, rhs_format::nxk, rhs_f32.data(), rhs_qs4cx.data(),
-                  rhs_scales_f32.data());
+  nntrainer::__fallback_quant_nxk_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
 
   // Perform matmul with clamping
-  const float clamp_min = -5.0f;
-  const float clamp_max = 5.0f;
   std::vector<float> dst_f32(m * n, 0.0f);
-  ref_matmul_f32_qa8dx_qs4cx(m, n, k, rhs_format::nxk, lhs_qa8dx.data(),
-                             rhs_qs4cx.data(), rhs_scales_f32.data(),
-                             dst_f32.data(), clamp_min, clamp_max);
+  nntrainer::__fallback_matmul_mxn_mxk_nxk_f32_qa8dx_qs4cx(
+    m, n, k, lhs_qa8dx.data(), rhs_qs4cx.data(), rhs_scales_f32.data(),
+    dst_f32.data(), clamp_min, clamp_max);
 
   // Verify all outputs are within clamp range
   for (size_t i = 0; i < dst_f32.size(); ++i) {
     EXPECT_GE(dst_f32[i], clamp_min);
     EXPECT_LE(dst_f32[i], clamp_max);
   }
+
+  // compare MSE
+  float mse = 0.0f;
+  for (int i = 0; i < m * n; i++) {
+    float diff = ref_out[i] - dst_f32[i];
+    mse += diff * diff;
+  }
+  mse /= m * n;
+
+  constexpr float eps = 1e-3;
+  EXPECT_LE(mse, eps * m * n * k);
+}
+
+TEST(nntrainer_fallback_kleidiai,
+     matmul_mxn_mxk_kxn_f32_qa8dx_qs4cx_with_clamp) {
+  const size_t m = 32;
+  const size_t n = 32;
+  const size_t k = 64;
+
+  // Generate input data with larger values
+  std::vector<float> lhs_f32 =
+    generate_random_vector<float>(m * k, -10.0f, 10.0f);
+  std::vector<float> rhs_f32 =
+    generate_random_vector<float>(n * k, -10.0f, 10.0f);
+
+  const float clamp_min = -5.0f;
+  const float clamp_max = 5.0f;
+
+  // Generate ref out
+  std::vector<float> ref_out(m * n, 0);
+  for (int i = 0; i < m; i++) {
+    for (int j = 0; j < n; j++) {
+      float *out = ref_out.data() + i * n + j;
+      for (int kk = 0; kk < k; kk++) {
+        *out += lhs_f32[i * k + kk] * rhs_f32[j * k + kk];
+      }
+      *out = std::max(*out, clamp_min);
+      *out = std::min(*out, clamp_max);
+    }
+  }
+
+  // Quantize LHS
+  const size_t lhs_stride =
+    sizeof(float) + sizeof(int32_t) + k * sizeof(int8_t);
+  std::vector<int8_t> lhs_qa8dx(m * lhs_stride, 0);
+  nntrainer::__fallback_quant_qa8dx_f32(m, k, lhs_f32.data(), lhs_qa8dx.data());
+
+  // Quantize RHS
+  std::vector<uint8_t> rhs_qs4cx((k * (n + 1) / 2), 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+  nntrainer::__fallback_quant_kxn_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
+
+  // Perform matmul with clamping
+  std::vector<float> dst_f32(m * n, 0.0f);
+  nntrainer::__fallback_matmul_mxn_mxk_kxn_f32_qa8dx_qs4cx(
+    m, n, k, lhs_qa8dx.data(), rhs_qs4cx.data(), rhs_scales_f32.data(),
+    dst_f32.data(), clamp_min, clamp_max);
+
+  // Verify all outputs are within clamp range
+  for (size_t i = 0; i < dst_f32.size(); ++i) {
+    EXPECT_GE(dst_f32[i], clamp_min);
+    EXPECT_LE(dst_f32[i], clamp_max);
+  }
+
+  // compare MSE
+  float mse = 0.0f;
+  for (int i = 0; i < m * n; i++) {
+    float diff = ref_out[i] - dst_f32[i];
+    mse += diff * diff;
+  }
+  mse /= m * n;
+
+  constexpr float eps = 1e-3;
+  EXPECT_LE(mse, eps * m * n * k);
 }
 
 //==============================================================================

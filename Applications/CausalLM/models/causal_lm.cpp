@@ -66,6 +66,10 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
                    ? nntr_cfg["lmhead_dtype"]
                    : nntr_cfg["embedding_dtype"];
 
+  SKIP_PREFILL = nntr_cfg.contains("skip_prefill")
+                   ? nntr_cfg["skip_prefill"].get<bool>()
+                   : false;
+
   USE_KVCACHE = false;
   PRE_COMPUTED_CACHE_PATH = "";
   SYS_PROMP_LEN = 0;
@@ -516,18 +520,38 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   }
   allocateAndBindKVCache();
   const unsigned int prefill_from = SYS_PROMP_LEN + global_token_len;
-  const unsigned int prefill_to = prefill_from + input_len;
-  setKVCachePosition(prefill_from);
-  output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
-                                        prefill_from, prefill_to, false);
+  std::vector<unsigned int> id_list;
 
-  // post process of model output
-  std::vector<unsigned int> id_list(
-    generate(output[0], do_sample, 1, ids_history, init_len));
+  if (SKIP_PREFILL && init_len > 1) {
+    // Prefill only N-1 tokens; the last input token will be used as the first
+    // token in the generation phase (assigned directly, not sampled).
+    unsigned int skipped_token =
+      static_cast<unsigned int>(init_input[init_len - 1]);
 
-  if (init_len < INIT_SEQ_LEN)
-    registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
+    const unsigned int prefill_to = prefill_from + input_len - 1;
+    setKVCachePosition(prefill_from);
+    output = model->incremental_inference(
+      BATCH_SIZE, input, label, init_len - 1, prefill_from, prefill_to, false);
 
+    for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+      id_list.push_back(skipped_token);
+
+    // Adjust lengths so the generation loop processes the skipped token
+    // at the correct KV cache position.
+    input_len -= 1;
+    init_len -= 1;
+  } else {
+    const unsigned int prefill_to = prefill_from + input_len;
+    setKVCachePosition(prefill_from);
+    output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
+                                          prefill_from, prefill_to, false);
+
+    // post process of model output
+    id_list = generate(output[0], do_sample, 1, ids_history, init_len);
+
+    if (init_len < INIT_SEQ_LEN)
+      registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
+  }
   // output should be deallocated after use
   for (auto &out : output) {
     delete[] out;

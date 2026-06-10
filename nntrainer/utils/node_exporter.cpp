@@ -110,6 +110,15 @@ void Exporter::saveTflResult(
 
 template <>
 void Exporter::saveTflResult(
+  const std::tuple<props::WeightRegularizer, props::WeightRegularizerConstant,
+                   props::WeightInitializer, props::WeightDecay,
+                   props::BiasDecay, props::BiasInitializer, props::DisableBias,
+                   props::Print, props::SkipPrefill> &props,
+  const LayerImpl *self) { /// layer impl has nothing to serialize so do nothing
+}
+
+template <>
+void Exporter::saveTflResult(
   const std::tuple<props::Unit, props::LoraRank, props::LoraAlpha> &props,
   const FullyConnectedLayer *self) {
   createIfNull(tf_node);
@@ -122,6 +131,31 @@ void Exporter::saveTflResult(
 template <>
 void Exporter::saveTflResult(const std::tuple<props::Activation> &props,
                              const ActivationLayer *self) {
+  createIfNull(tf_node);
+
+  auto activation = std::get<props::Activation>(props);
+  switch (activation.get()) {
+  case ActivationType::ACT_RELU: {
+    tf_node->setOpType(tflite::BuiltinOperator_RELU);
+    tf_node->setBuiltinOptions(tflite::BuiltinOptions_NONE,
+                               flatbuffers::Offset<void>() /** no options **/);
+    break;
+  }
+  case ActivationType::ACT_SOFTMAX: {
+    tf_node->setOpType(tflite::BuiltinOperator_SOFTMAX);
+    auto options = tflite::CreateSoftmaxOptions(*fbb, 1.0).Union();
+    tf_node->setBuiltinOptions(tflite::BuiltinOptions_SoftmaxOptions, options);
+    break;
+  }
+  default:
+    throw std::runtime_error{"Unsupported activation type"};
+  }
+}
+
+template <>
+void Exporter::saveTflResult(
+  const std::tuple<props::Activation, props::SkipPrefill> &props,
+  const ActivationLayer *self) {
   createIfNull(tf_node);
 
   auto activation = std::get<props::Activation>(props);

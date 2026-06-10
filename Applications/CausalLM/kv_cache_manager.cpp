@@ -21,26 +21,51 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
                               unsigned int num_heads_kv, unsigned int head_dim,
                               ml::train::TensorDim::DataType dtype,
                               ml::train::TensorDim::Format format) {
-  if (num_layers == 0 || batch_size == 0 || max_seq_len == 0 ||
-      num_heads_kv == 0 || head_dim == 0) {
+  if (num_heads_kv == 0 || head_dim == 0) {
     throw std::invalid_argument(
       "KVCacheManager::allocate: all parameters must be > 0");
   }
 
-  batch_size_ = batch_size;
-  max_seq_len_ = max_seq_len;
+  allocate(num_layers, batch_size, max_seq_len,
+           std::vector<unsigned int>(num_layers, num_heads_kv * head_dim),
+           dtype, format);
+
   num_heads_kv_ = num_heads_kv;
   head_dim_ = head_dim;
-  kv_width_ = num_heads_kv * head_dim;
+}
+
+void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
+                              unsigned int max_seq_len,
+                              const std::vector<unsigned int> &kv_widths,
+                              ml::train::TensorDim::DataType dtype,
+                              ml::train::TensorDim::Format format) {
+  if (num_layers == 0 || batch_size == 0 || max_seq_len == 0 ||
+      kv_widths.size() != num_layers) {
+    throw std::invalid_argument(
+      "KVCacheManager::allocate: invalid layer, batch, or KV width count");
+  }
+
+  for (auto kv_width : kv_widths) {
+    if (kv_width == 0) {
+      throw std::invalid_argument(
+        "KVCacheManager::allocate: KV widths must be > 0");
+    }
+  }
+
+  batch_size_ = batch_size;
+  max_seq_len_ = max_seq_len;
+  num_heads_kv_ = 0;
+  head_dim_ = 0;
+  kv_width_ = kv_widths[0];
+  kv_widths_ = kv_widths;
   dtype_ = dtype;
   format_ = format;
   cache_pos_ = 0;
 
-  ml::train::TensorDim cache_dim({batch_size, 1, max_seq_len, kv_width_},
-                                 {format, dtype});
-
   layer_caches_.resize(num_layers);
   for (unsigned int i = 0; i < num_layers; ++i) {
+    ml::train::TensorDim cache_dim({batch_size, 1, max_seq_len, kv_widths_[i]},
+                                   {format, dtype});
     layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, true);
     layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
     layer_caches_[i].key_cache.setZero();
@@ -94,10 +119,10 @@ nntrainer::Tensor KVCacheManager::getKeyCacheWriteView(unsigned int layer_idx,
 
   auto &cache = layer_caches_[layer_idx].key_cache;
   ml::train::TensorDim cache_dim = cache.getDim();
-  ml::train::TensorDim step_dim({1, 1, step_size, kv_width_},
-                                {format_, dtype_});
+  const unsigned int kv_width = kv_widths_[layer_idx];
+  ml::train::TensorDim step_dim({1, 1, step_size, kv_width}, {format_, dtype_});
 
-  size_t offset = batch * cache_dim.getFeatureLen() + cache_pos_ * kv_width_;
+  size_t offset = batch * cache_dim.getFeatureLen() + cache_pos_ * kv_width;
   return cache.getSharedDataTensor(step_dim, offset, true);
 }
 
@@ -114,10 +139,10 @@ nntrainer::Tensor KVCacheManager::getValueCacheWriteView(
 
   auto &cache = layer_caches_[layer_idx].value_cache;
   ml::train::TensorDim cache_dim = cache.getDim();
-  ml::train::TensorDim step_dim({1, 1, step_size, kv_width_},
-                                {format_, dtype_});
+  const unsigned int kv_width = kv_widths_[layer_idx];
+  ml::train::TensorDim step_dim({1, 1, step_size, kv_width}, {format_, dtype_});
 
-  size_t offset = batch * cache_dim.getFeatureLen() + cache_pos_ * kv_width_;
+  size_t offset = batch * cache_dim.getFeatureLen() + cache_pos_ * kv_width;
   return cache.getSharedDataTensor(step_dim, offset, true);
 }
 
@@ -135,7 +160,8 @@ nntrainer::Tensor KVCacheManager::getKeyCacheReadView(unsigned int layer_idx,
 
   auto &cache = layer_caches_[layer_idx].key_cache;
   ml::train::TensorDim cache_dim = cache.getDim();
-  ml::train::TensorDim read_dim({1, 1, read_len, kv_width_}, {format_, dtype_});
+  const unsigned int kv_width = kv_widths_[layer_idx];
+  ml::train::TensorDim read_dim({1, 1, read_len, kv_width}, {format_, dtype_});
 
   size_t offset = batch * cache_dim.getFeatureLen();
   return cache.getSharedDataTensor(read_dim, offset, true);
@@ -155,7 +181,8 @@ nntrainer::Tensor KVCacheManager::getValueCacheReadView(unsigned int layer_idx,
 
   auto &cache = layer_caches_[layer_idx].value_cache;
   ml::train::TensorDim cache_dim = cache.getDim();
-  ml::train::TensorDim read_dim({1, 1, read_len, kv_width_}, {format_, dtype_});
+  const unsigned int kv_width = kv_widths_[layer_idx];
+  ml::train::TensorDim read_dim({1, 1, read_len, kv_width}, {format_, dtype_});
 
   size_t offset = batch * cache_dim.getFeatureLen();
   return cache.getSharedDataTensor(read_dim, offset, true);

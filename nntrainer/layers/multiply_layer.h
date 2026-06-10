@@ -33,7 +33,7 @@ public:
   MultiplyLayer() :
     BinaryOperationLayer(),
     multiply_props(props::Print(), props::InPlaceProp(),
-                   props::InPlaceDirectionProp()),
+                   props::InPlaceDirectionProp(), props::SkipPrefill()),
     support_backwarding(true) {}
 
   /**
@@ -67,6 +67,13 @@ public:
    */
   void forwarding_operation(const Tensor &input0, const Tensor &input1,
                             Tensor &hidden) final;
+
+  /**
+   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
+   * int from, unsigned int to, bool training)
+   */
+  void incremental_forwarding(RunLayerContext &context, unsigned int from,
+                              unsigned int to, bool training) final;
 
   /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
@@ -132,9 +139,11 @@ public:
    */
   const std::string getType() const final { return MultiplyLayer::type; };
 
-  std::tuple<props::Print, props::InPlaceProp, props::InPlaceDirectionProp>
+  std::tuple<props::Print, props::InPlaceProp, props::InPlaceDirectionProp,
+             props::SkipPrefill>
     multiply_props;
   bool support_backwarding; /**< support backwarding */
+  bool skip_prefill = false;
 
   static constexpr const char *type = "multiply";
 };

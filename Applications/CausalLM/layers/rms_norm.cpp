@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2023 Seungbaek Hong <sb92.hong@samsung.com>
  *
- * @file   custom_rms_norm.cpp
+ * @file   rms_norm.cpp
  * @date   19 July 2023
  * @brief  Implementation of custom RMS normalization function
  * @see    https://github.com/nntrainer/nntrainer
@@ -12,6 +12,7 @@
  */
 
 #include <cmath>
+#include <cpu_backend.h>
 #include <iostream>
 
 #include "rms_norm.h"
@@ -23,6 +24,10 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   std::vector<nntrainer::TensorDim> dim = context.getInputDimensions();
   context.setOutputDimensions(dim);
+
+  if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
+    skip_prefill = std::get<nntrainer::props::SkipPrefill>(rms_props).get();
+
   nntrainer::TensorDim gamma_dim(
     1, 1, 1, dim[0].width(),
     nntrainer::TensorDim::TensorType(context.getFormat(),
@@ -50,7 +55,9 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   ml::train::TensorDim in_step_dim = in_dim;
   ml::train::TensorDim out_step_dim = out_dim;
 
-  unsigned int _from = from;
+  bool is_prefill = !from;
+  if (skip_prefill && is_prefill)
+    return;
 
   in_step_dim.batch(1);
   in_step_dim.height(to - from);
@@ -66,9 +73,23 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen(), true);
 
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-      auto t = in_step.multiply(in_step).average(3).add(epsilon);
-      t.inv_sqrt_i();
-      in_step.multiply(t, out_step);
+      const auto &dim = in_step.getDim();
+#ifdef ENABLE_FP16
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+        in_step.getData<float>(), out_step.getData<float>(), dim.height(),
+        dim.width(), epsilon);
+
+      // DO NOT USE rms_norm_wrt_width_fp16_intrinsic. It causes overflow!
+
+      // nntrainer::rms_norm_wrt_width_fp16_intrinsic(
+      //   in_step.getData<float>(), out_step.getData<float>(), dim.height(),
+      //   dim.width(), epsilon);
+#else
+
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+        in_step.getData<float>(), out_step.getData<float>(), dim.height(),
+        dim.width(), epsilon);
+#endif
     } else {
       throw std::invalid_argument(
         "Error: not yet implemented for this data type");

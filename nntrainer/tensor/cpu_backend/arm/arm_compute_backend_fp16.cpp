@@ -13,7 +13,6 @@
 #include <arm_compute_backend.h>
 #include <assert.h>
 #include <fallback_internal.h>
-#include <fallback_kleidiai.h>
 #include <ggml_interface.h>
 #include <kleidiai_interface.h>
 #include <neon_impl.h>
@@ -436,8 +435,13 @@ void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
 void nntr_quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
                           void *rhs_native_mtx_qs4cx, void *rhs_scales_f32,
                           bool transB) {
-  __fallback_nntr_quant_qs4cx_f32(n, k, rhs_native_mtx_f32,
-                                  rhs_native_mtx_qs4cx, rhs_scales_f32, transB);
+  if (!transB)
+    throw std::invalid_argument{"Only [n,k] shape available"};
+
+  __fallback_quant_nxk_qs4cx_f32(n, k, (const float *)rhs_native_mtx_f32,
+                                 (uint8_t *)rhs_native_mtx_qs4cx,
+                                 (float *)rhs_scales_f32);
+  // @todo enable kxn quant
 }
 
 void nntr_quant_qs4c32_f32(size_t n, size_t k, size_t bl,

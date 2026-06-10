@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2023 Seungbaek Hong <sb92.hong@samsung.com>
  *
- * @file   custom_rms_norm.cpp
+ * @file   reshaped_rms_norm.cpp
  * @date   19 July 2023
  * @brief  Implementation of custom RMS normalization function
  * @see    https://github.com/nntrainer/nntrainer
@@ -23,17 +23,26 @@ void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   std::vector<nntrainer::TensorDim> dim = context.getInputDimensions();
   context.setOutputDimensions(dim);
   feature_size = std::get<props::FeatureSize>(rms_props);
+  use_gamma = std::get<props::UseGamma>(rms_props).get();
+
+  if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
+    skip_prefill = std::get<nntrainer::props::SkipPrefill>(rms_props).get();
+
+  if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
+    skip_prefill = std::get<nntrainer::props::SkipPrefill>(rms_props).get();
 
   NNTR_THROW_IF(dim[0].width() % feature_size != 0, std::invalid_argument)
     << "feature size must be a divisor of width";
 
-  nntrainer::TensorDim gamma_dim(
-    1, 1, 1, feature_size,
-    nntrainer::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()));
-  wt_idx[RMSParams::gamma] = context.requestWeight(
-    gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
-    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", false);
+  if (use_gamma) {
+    nntrainer::TensorDim gamma_dim(
+      1, 1, 1, feature_size,
+      nntrainer::TensorDim::TensorType(context.getFormat(),
+                                       context.getWeightDataType()));
+    wt_idx[RMSParams::gamma] = context.requestWeight(
+      gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
+      nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", false);
+  }
 }
 
 void ReshapedRMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
@@ -46,7 +55,6 @@ void ReshapedRMSNormLayer::incremental_forwarding(
 
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
 
   ml::train::TensorDim in_dim = in.getDim();
   ml::train::TensorDim out_dim = out.getDim();
@@ -54,7 +62,9 @@ void ReshapedRMSNormLayer::incremental_forwarding(
   ml::train::TensorDim in_step_dim = in_dim;
   ml::train::TensorDim out_step_dim = out_dim;
 
-  unsigned int _from = from;
+  bool is_prefill = !from;
+  if (skip_prefill && is_prefill)
+    return;
 
   in_step_dim.batch(1);
   in_step_dim.height(to - from);
@@ -85,9 +95,15 @@ void ReshapedRMSNormLayer::incremental_forwarding(
       ///@todo rms_norm_wrt_width_something() should be refactored to
       /// nntrainer::Tensor operation.
 #ifdef ENABLE_FP16
-      nntrainer::rms_norm_wrt_width_fp16_intrinsic(
+      nntrainer::rms_norm_wrt_width_fp32_intrinsic(
         in_step.getData<float>(), out_step.getData<float>(),
         in_step.getDim().height(), in_step.getDim().width(), epsilon);
+
+      // DO NOT USE rms_norm_wrt_width_fp16_intrinsic. It causes overflow!
+
+      // nntrainer::rms_norm_wrt_width_fp16_intrinsic(
+      //   in_step.getData<float>(), out_step.getData<float>(),
+      //   in_step.getDim().height(), in_step.getDim().width(), epsilon);
 #else
       nntrainer::rms_norm_wrt_width_fp32_intrinsic(
         in_step.getData<float>(), out_step.getData<float>(),
@@ -97,14 +113,17 @@ void ReshapedRMSNormLayer::incremental_forwarding(
       throw std::invalid_argument(
         "Error: not yet implemented for this data type");
     }
-    out_step.multiply_i(gamma);
+    if (use_gamma) {
+      nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
+      out_step.multiply_i(gamma);
+    }
 
     // reshape again out_step
     out_step.reshape(out_step_dim);
 
 #ifdef DEBUG
     std::cout << context.getName() << " \n input:" << in_step
-              << "output:" << out_step << "gamma:" << gamma << std::endl;
+              << "output:" << out_step << std::endl;
 #endif
   }
 }

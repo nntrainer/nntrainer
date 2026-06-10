@@ -18,7 +18,6 @@
 #include <cmath>
 #include <cstdint>
 #include <fallback_internal.h>
-#include <fallback_kleidiai.h>
 #include <stdexcept>
 #include <tensor_dim.h>
 
@@ -497,8 +496,9 @@ template <>
 void __fallback_rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
                                                   _FP16 *__restrict Y, size_t H,
                                                   size_t W, float epsilon) {
+
   throw std::runtime_error(
-    "NYI : __fallback_rms_norm_wrt_width_fp16_intrinsic");
+    "NYI : __fallback_rms_norm_wrt_width_fp16_intrinsic with FP16 type input");
 }
 
 template <>
@@ -509,65 +509,4 @@ void __fallback_clamp(const _FP16 *input, _FP16 *output, size_t length,
   }
 }
 
-void __fallback_nntr_quant_qs4cx_f32(size_t n, size_t k,
-                                     void *rhs_native_mtx_f32,
-                                     void *rhs_native_mtx_qs4cx,
-                                     void *rhs_scales_f32, bool transB) {
-  rhs_format format = rhs_format::nxk;
-  if (!transB) {
-    format = rhs_format::kxn;
-  }
-
-  quant_qs4cx_f32(n, k, format, (const float *)rhs_native_mtx_f32,
-                  (uint8_t *)rhs_native_mtx_qs4cx, (float *)rhs_scales_f32);
-}
-
-template <>
-uint32_t __fallback_nntr_gemm_qai8dxp_qsi4cxp_unpacked(
-  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
-  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_mtx_f32,
-  bool transB, float lower_bound, float upper_bound) {
-
-  rhs_format format = rhs_format::nxk;
-  if (!transB) {
-    format = rhs_format::kxn;
-  }
-
-  const size_t lhs_ref_size_qa8dx = m * (k + sizeof(int32_t) + sizeof(float));
-
-  uint8_t *lhs_ref_mtx_qa8dx = new uint8_t[lhs_ref_size_qa8dx];
-
-  ref_quant_qa8dx_f32(m, k, (const float *)lhs_native_mtx_f32,
-                      (int8_t *)lhs_ref_mtx_qa8dx);
-
-  ref_matmul_f32_qa8dx_qs4cx(m, n, k, format, (const int8_t *)lhs_ref_mtx_qa8dx,
-                             (const uint8_t *)rhs_native_mtx_qs4cx,
-                             (const float *)rhs_scales_f32,
-                             (float *)dst_mtx_f32, lower_bound, upper_bound);
-
-  delete[] lhs_ref_mtx_qa8dx;
-
-  return 1;
-}
-
-size_t __fallback_nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
-  size_t n, size_t k, uint32_t idx_variant, bool transB) {
-  throw std::runtime_error(
-    "NYI : __fallback_nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0");
-  return 1;
-}
-
-void __fallback_nntr_qsi4cxp_qs4cxs1s0_rhs_pack(
-  size_t n, size_t k, void *rhs_packed_mtx_qs4cx, void *rhs_native_mtx_qs4cx,
-  void *rhs_scales_f32, uint32_t idx_variant, bool transB) {
-  throw std::runtime_error("NYI : __fallback_nntr_qsi4cxp_qs4cxs1s0_rhs_pack");
-}
-
-template <>
-void __fallback_nntr_gemm_qai8dxp_qsi4cxp_packed(
-  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
-  void *rhs_packed_mtx_qs4cx, float *dst_act_mtx_f32, uint32_t idx_variant,
-  bool transB, float lower_bound, float upper_bound) {
-  throw std::runtime_error("NYI : __fallback_nntr_gemm_qai8dxp_qsi4cxp_packed");
-}
 } // namespace nntrainer

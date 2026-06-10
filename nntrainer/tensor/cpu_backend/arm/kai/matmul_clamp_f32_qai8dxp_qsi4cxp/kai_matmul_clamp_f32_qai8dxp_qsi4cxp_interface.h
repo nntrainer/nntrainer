@@ -57,7 +57,7 @@ struct kai_matmul_clamp_f32_qai8dxp_qsi4cxp_ukernel {
   kai_matmul_clamp_f32_qai8dxp_qsi4cxp_get_n_step_func_t get_n_step;
   kai_matmul_clamp_f32_qai8dxp_qsi4cxp_get_mr_func_t get_mr;
   kai_matmul_clamp_f32_qai8dxp_qsi4cxp_get_nr_func_t get_nr;
-  kai_matmul_clamp_f32_qai8dxp_qsi4cxp_get_nr_func_t get_kr;
+  kai_matmul_clamp_f32_qai8dxp_qsi4cxp_get_kr_func_t get_kr;
   kai_matmul_clamp_f32_qai8dxp_qsi4cxp_get_sr_func_t get_sr;
   kai_matmul_clamp_f32_qai8dxp_qsi4cxp_get_lhs_packed_offset_func_t
     get_lhs_packed_offset;

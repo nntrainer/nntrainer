@@ -32,7 +32,8 @@
 
 namespace nntrainer {
 ActivationLayer::ActivationLayer() :
-  Layer(), activation_props(new PropTypes(props::Activation())) {
+  Layer(),
+  activation_props(new PropTypes(props::Activation(), props::SkipPrefill())) {
   acti_func.setActiFunc(ActivationType::ACT_NONE);
 }
 
@@ -40,6 +41,8 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 void ActivationLayer::finalize(InitLayerContext &context) {
   auto &act = std::get<props::Activation>(*activation_props);
+  if (!std::get<props::SkipPrefill>(*activation_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(*activation_props).get();
   NNTR_THROW_IF(act.empty(), std::invalid_argument)
     << "activation has not been set!";
   if (context.getActivationDataType() == TensorDim::DataType::FP16) {
@@ -71,6 +74,41 @@ void ActivationLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   acti_func.run_fn(input_, hidden_);
+}
+
+void ActivationLayer::incremental_forwarding(RunLayerContext &context,
+                                             unsigned int from, unsigned int to,
+                                             bool training) {
+  (void)training;
+  bool is_prefill = !from;
+  if (skip_prefill && is_prefill)
+    return;
+
+  Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+  Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+
+  TensorDim input_dim = input_.getDim();
+  TensorDim hidden_dim = hidden_.getDim();
+
+  TensorDim input_step_dim = input_dim;
+  TensorDim hidden_step_dim = hidden_dim;
+
+  input_step_dim.batch(1);
+  hidden_step_dim.batch(1);
+
+  if (input_dim.height() > 1)
+    input_step_dim.height(to - from);
+  if (hidden_dim.height() > 1)
+    hidden_step_dim.height(to - from);
+
+  for (unsigned int b = 0; b < hidden_.batch(); ++b) {
+    Tensor input_step = input_.getSharedDataTensor(
+      input_step_dim, b * input_dim.getFeatureLen(), true);
+    Tensor hidden_step = hidden_.getSharedDataTensor(
+      hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
+
+    acti_func.run_fn(input_step, hidden_step);
+  }
 }
 
 void ActivationLayer::calcDerivative(RunLayerContext &context) {

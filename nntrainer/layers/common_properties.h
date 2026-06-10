@@ -126,6 +126,21 @@ public:
 };
 
 /**
+ * @brief Whether the layer should skip prefill or not
+ *
+ */
+class SkipPrefill : public nntrainer::Property<bool> {
+public:
+  /**
+   * @brief Construct a new SkipPrefill object
+   *
+   */
+  SkipPrefill() : nntrainer::Property<bool>() {}
+  static constexpr const char *key = "skip_prefill";
+  using prop_tag = bool_prop_tag;
+};
+
+/**
  * @brief Inplace operation property
  *
  */

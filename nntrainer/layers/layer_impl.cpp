@@ -27,8 +27,8 @@ LayerImpl::LayerImpl() :
     std::make_unique<
       std::tuple<props::WeightRegularizer, props::WeightRegularizerConstant,
                  props::WeightInitializer, props::WeightDecay, props::BiasDecay,
-                 props::BiasInitializer, props::DisableBias, props::Print>>()) {
-}
+                 props::BiasInitializer, props::DisableBias, props::Print,
+                 props::SkipPrefill>>()) {}
 
 void LayerImpl::setProperty(const std::vector<std::string> &values) {
   auto remain_props = loadProperties(values, *layer_impl_props);

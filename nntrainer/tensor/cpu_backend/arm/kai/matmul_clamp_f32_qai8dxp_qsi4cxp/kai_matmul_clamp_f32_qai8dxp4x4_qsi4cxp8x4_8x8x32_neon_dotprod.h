@@ -1,10 +1,10 @@
 /**
- * @file kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod.h
+ * @file kai_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod.h
  * @date   22 Septemer 2025
  * @see    https://github.com/ARM-software/kleidiai
  * @author Sungsik Kong <ss.kong@samsung.com>
  * @bug    No known bugs except for NYI items
- * @brief  kai_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod.h
+ * @brief  kai_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod.h
  * copied from kleidiai
  *
  */
@@ -38,7 +38,7 @@ extern "C" {
 ///
 /// @return the m step value
 size_t
-kai_get_m_step_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(void);
+kai_get_m_step_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod(void);
 
 /// Gets the n step value.
 /// The micro-kernel can process any N values. However, the starting N index to
@@ -46,34 +46,34 @@ kai_get_m_step_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(void);
 ///
 /// @return the n step
 size_t
-kai_get_n_step_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(void);
+kai_get_n_step_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod(void);
 
 /// Gets the mr value, which must be used to pack the LHS matrix
 ///
 /// @return the mr value
 size_t
-kai_get_mr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(void);
+kai_get_mr_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod(void);
 
 /// Gets the nr value, which must be used to pack the RHS matrix with
 /// the @ref kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0 micro-kernel
 ///
 /// @return the nr value
 size_t
-kai_get_nr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(void);
+kai_get_nr_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod(void);
 
 /// Gets the kr value, which must be used to pack the RHS matrix with
 /// the @ref kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0 micro-kernel
 ///
 /// @return the kr value
 size_t
-kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(void);
+kai_get_kr_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod(void);
 
 /// Gets the sr value, which must be used to pack the RHS matrix with
 /// the @ref kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0 micro-kernel
 ///
 /// @return the sr value
 size_t
-kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(void);
+kai_get_sr_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod(void);
 
 /// Gets the offset in bytes for the packed LHS matrix,
 /// which contains the packed Signed 8-bit quantized asymmetric per-row
@@ -88,7 +88,7 @@ kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(void);
 ///
 /// @return the offset in bytes to the packed LHS matrix
 size_t
-kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(
+kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod(
   size_t m_idx, size_t k);
 
 /// Gets the offset in bytes for the packed RHS matrix,
@@ -101,7 +101,7 @@ kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dot
 ///
 /// @return the offset in bytes to the packed RHS matrix
 size_t
-kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(
+kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod(
   size_t n_idx, //
   size_t k);
 
@@ -115,7 +115,7 @@ kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dot
 ///
 /// @return the DST offset in bytes
 size_t
-kai_get_dst_offset_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(
+kai_get_dst_offset_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod(
   size_t m_idx, //
   size_t n_idx, //
   size_t dst_stride);
@@ -127,7 +127,7 @@ kai_get_dst_offset_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(
 ///
 /// @return the destination (DST) matrix size in bytes
 size_t
-kai_get_dst_size_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(
+kai_get_dst_size_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod(
   size_t m, size_t n);
 
 /// Runs the matrix multiplication (matmul) micro-kernel followed by a clamp
@@ -158,7 +158,7 @@ kai_get_dst_size_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(
 /// matrix. It must be sizeof(float).
 /// @param[in]  scalar_min     Min value used to clamp the final result.
 /// @param[in]  scalar_max     Max value used to clamp the final result.
-void kai_run_matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x4_8x8x32_neon_dotprod(
+void kai_run_matmul_clamp_f32_qai8dxp4x4_qsi4cxp8x4_8x8x32_neon_dotprod(
   size_t m, size_t n, size_t k,
   const void *lhs_packed, //
   const void *rhs_packed, //

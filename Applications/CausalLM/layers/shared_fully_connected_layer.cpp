@@ -213,9 +213,8 @@ void SharedFullyConnectedLayer::save(
   nntrainer::TensorDim::DataType definedWeightDataType,
   ml::train::ISA target_isa) const {
   if (!shared_mode_) {
-    for (unsigned int i = 0; i < run_context.getNumWeights(); ++i) {
-      run_context.getWeight(i).save(file);
-    }
+    nntrainer::Layer::save(file, run_context, opt_var, mode, trainable,
+                           definedWeightDataType, target_isa);
   }
 }
 

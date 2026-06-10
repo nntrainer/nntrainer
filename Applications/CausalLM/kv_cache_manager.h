@@ -71,6 +71,21 @@ public:
     ml::train::TensorDim::Format format = ml::train::TensorDim::Format::NCHW);
 
   /**
+   * @brief Allocate KV cache with per-layer KV widths.
+   * @param[in] num_layers number of attention layers
+   * @param[in] batch_size batch size
+   * @param[in] max_seq_len maximum sequence length
+   * @param[in] kv_widths per-layer width (num_heads_kv * head_dim)
+   * @param[in] dtype data type for cache tensors
+   * @param[in] format tensor format
+   */
+  void allocate(
+    unsigned int num_layers, unsigned int batch_size, unsigned int max_seq_len,
+    const std::vector<unsigned int> &kv_widths,
+    ml::train::TensorDim::DataType dtype = ml::train::TensorDim::DataType::FP16,
+    ml::train::TensorDim::Format format = ml::train::TensorDim::Format::NCHW);
+
+  /**
    * @brief Check if the manager has been allocated
    */
   bool isAllocated() const { return !layer_caches_.empty(); }
@@ -217,6 +232,7 @@ private:
   unsigned int num_heads_kv_ = 0; /**< number of KV heads */
   unsigned int head_dim_ = 0;     /**< head dimension */
   unsigned int kv_width_ = 0;     /**< num_heads_kv * head_dim */
+  std::vector<unsigned int> kv_widths_;
 
   ml::train::TensorDim::DataType dtype_ = ml::train::TensorDim::DataType::FP16;
   ml::train::TensorDim::Format format_ = ml::train::TensorDim::Format::NCHW;

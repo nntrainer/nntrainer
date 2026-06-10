@@ -18,6 +18,7 @@
 #include <memory>
 
 #include <acti_func.h>
+#include <common_properties.h>
 #include <layer_devel.h>
 
 namespace nntrainer {
@@ -48,6 +49,13 @@ public:
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
    */
   void forwarding(RunLayerContext &context, bool training) override;
+
+  /**
+   * @copydoc Layer::incremental_forwarding(RunLayerContext &context, unsigned
+   * int from, unsigned int to, bool training)
+   */
+  void incremental_forwarding(RunLayerContext &context, unsigned int from,
+                              unsigned int to, bool training) override;
 
   /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
@@ -84,11 +92,12 @@ public:
   static constexpr const char *type = "activation";
 
 private:
-  using PropTypes = std::tuple<props::Activation>;
+  using PropTypes = std::tuple<props::Activation, props::SkipPrefill>;
 
   std::unique_ptr<PropTypes> activation_props; /**< activation props */
 
   ActiFunc acti_func; /**< activation function from activation type */
+  bool skip_prefill = false;
 };
 
 } // namespace nntrainer

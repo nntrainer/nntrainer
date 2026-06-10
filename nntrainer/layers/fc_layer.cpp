@@ -67,6 +67,8 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   lora_scaling = (lora_rank && !std::get<props::LoraAlpha>(fc_props).empty())
                    ? (float)std::get<props::LoraAlpha>(fc_props) / lora_rank
                    : 1;
+  if (!std::get<props::SkipPrefill>(*layer_impl_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(*layer_impl_props).get();
 
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
     << "Fully connected layer takes only one input";
@@ -244,6 +246,10 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor loraA, loraB, hidden_tmp_lora, hidden_out_lora;
+
+  bool is_prefill = !from;
+  if (skip_prefill && is_prefill)
+    return;
 
   if (!std::get<props::LoraRank>(fc_props).empty()) {
     loraA = context.getWeight(lora_idx[LORAParams::loraA]);

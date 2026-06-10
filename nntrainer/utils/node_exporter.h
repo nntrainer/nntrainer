@@ -284,6 +284,18 @@ void Exporter::saveTflResult(
                    props::Print> &props,
   const LayerImpl *self);
 
+/**
+ * @copydoc template <typename PropsType, typename NodeType> void
+ * Exporter::saveTflResult(const PropsType &props, const NodeType *self);
+ */
+template <>
+void Exporter::saveTflResult(
+  const std::tuple<props::WeightRegularizer, props::WeightRegularizerConstant,
+                   props::WeightInitializer, props::WeightDecay,
+                   props::BiasDecay, props::BiasInitializer, props::DisableBias,
+                   props::Print, props::SkipPrefill> &props,
+  const LayerImpl *self);
+
 class FullyConnectedLayer;
 /**
  * @copydoc template <typename PropsType, typename NodeType> void
@@ -302,6 +314,15 @@ class ActivationLayer;
 template <>
 void Exporter::saveTflResult(const std::tuple<props::Activation> &props,
                              const ActivationLayer *self);
+
+/**
+ * @copydoc template <typename PropsType, typename NodeType> void
+ * Exporter::saveTflResult(const PropsType &props, const NodeType *self);
+ */
+template <>
+void Exporter::saveTflResult(
+  const std::tuple<props::Activation, props::SkipPrefill> &props,
+  const ActivationLayer *self);
 
 class Conv2DLayer;
 /**

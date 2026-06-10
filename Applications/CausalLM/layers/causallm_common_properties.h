@@ -31,6 +31,7 @@
 #endif
 
 #include <base_properties.h>
+#include <common_properties.h>
 #include <tensor.h>
 #include <utility>
 
@@ -75,6 +76,16 @@ public:
   static constexpr const char *key =
     "feature_size";                          /**< unique key to access */
   using prop_tag = nntrainer::uint_prop_tag; /**< property type */
+};
+
+/**
+ * @brief UseGamma property for RMSNorm scale usage.
+ */
+class UseGamma : public nntrainer::Property<bool> {
+public:
+  static constexpr const char *key = "use_gamma";
+  using prop_tag = nntrainer::bool_prop_tag;
+  UseGamma(bool value = true) { set(value); }
 };
 
 /**

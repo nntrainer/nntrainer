@@ -146,6 +146,7 @@ protected:
   std::string PRE_COMPUTED_CACHE_PATH;
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
+  bool SKIP_PREFILL;
   unsigned int global_token_len;
 
   std::mt19937 rng; /**< Random Number Gen */
@@ -164,7 +165,7 @@ protected:
    *        Model::setExternalTensors. Idempotent — safe to call once after
    *        initialize().
    */
-  void allocateAndBindKVCache();
+  virtual void allocateAndBindKVCache();
 
   /**
    * @brief Reset all mha_core layers' cache_index to @p pos and the

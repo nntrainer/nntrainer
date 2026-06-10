@@ -22,12 +22,24 @@
 namespace nntrainer {
 
 void MultiplyLayer::finalize(InitLayerContext &context) {
+  if (!std::get<props::SkipPrefill>(multiply_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(multiply_props).get();
   context.setOutputDimensions({context.getInputDimensions()[0]});
 }
 
 void MultiplyLayer::forwarding_operation(const Tensor &input0,
                                          const Tensor &input1, Tensor &hidden) {
   input0.multiply(input1, hidden);
+}
+
+void MultiplyLayer::incremental_forwarding(RunLayerContext &context,
+                                           unsigned int from, unsigned int to,
+                                           bool training) {
+  bool is_prefill = !from;
+  if (skip_prefill && is_prefill)
+    return;
+
+  BinaryOperationLayer::incremental_forwarding(context, from, to, training);
 }
 
 void MultiplyLayer::calcDerivative(RunLayerContext &context) {

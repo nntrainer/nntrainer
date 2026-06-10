@@ -122,6 +122,7 @@ public:
 private:
   std::tuple<nntrainer::props::Unit> lmhead_props;
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
+  bool skip_prefill = false;
 };
 } // namespace causallm
 

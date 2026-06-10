@@ -638,6 +638,22 @@ public:
    */
   Tensor operator()(const std::vector<Tensor> &inputs);
 
+  /**
+   * @brief Call the layer with multiple inputs and explicit input slot mapping
+   *
+   * Decouples layer order from runtime input index assignment.
+   * inputs[i] is connected as input_layers[input_indices[i]].
+   *
+   * Example: layer({up, gate}, {1, 0}) will place layers in up, gate order, but
+   * at runtime context.getInput(0)=gate and context.getInput(1)=up.
+   *
+   * @param inputs Vector of input tensors (affects layer order)
+   * @param input_indices Maps each input to its runtime slot index
+   * @return Output tensor with graph edge info
+   */
+  Tensor operator()(const std::vector<Tensor> &inputs,
+                    std::vector<unsigned int> &&input_indices);
+
 private:
   std::shared_ptr<Layer> ptr_;
 };

@@ -24,6 +24,8 @@ namespace nntrainer {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 void AdditionLayer::finalize(InitLayerContext &context) {
+  if (!std::get<props::SkipPrefill>(add_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(add_props).get();
   context.setOutputDimensions({context.getInputDimensions()[0]});
 }
 
@@ -44,6 +46,10 @@ void AdditionLayer::forwarding(RunLayerContext &context, bool training) {
 void AdditionLayer::incremental_forwarding(RunLayerContext &context,
                                            unsigned int from, unsigned int to,
                                            bool training) {
+  bool is_prefill = !from;
+  if (skip_prefill && is_prefill)
+    return;
+
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   TensorDim hidden_dim = hidden_.getDim();
   TensorDim hidden_step_dim = hidden_dim;

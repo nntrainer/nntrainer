@@ -50,6 +50,7 @@ nntrainer_elements = [
   'optimizers',
   'tensor',
   'utils',
+  'utils/ddtree',
   'graph'
 ]
 

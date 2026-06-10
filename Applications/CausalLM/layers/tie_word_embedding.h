@@ -158,6 +158,7 @@ private:
   enum mode { embedding, lm_head };
   enum mode mode_;
   std::array<unsigned int, 4> weight_idx; /**< indices of the weights */
+  bool skip_prefill = false;
 
   WIN_EXPORT void finalize_embedding(nntrainer::InitLayerContext &context);
   WIN_EXPORT void finalize_lmhead(nntrainer::InitLayerContext &context);

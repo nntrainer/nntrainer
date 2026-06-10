@@ -36,6 +36,7 @@
 #include "deberta_v2.h"
 #include "embedding_gemma.h"
 #include "gemma3_causallm.h"
+#include "gemma4_causallm.h"
 #if !defined(_WIN32)
 #include "gptoss_cached_slim_causallm.h"
 #endif
@@ -185,6 +186,10 @@ std::string resolve_architecture(std::string model_type,
     return "TimmViT";
   }
 
+  if (architecture == "Gemma4ForConditionalGeneration") {
+    return "Gemma4ForCausalLM";
+  }
+
   return architecture;
 }
 
@@ -256,6 +261,11 @@ int main(int argc, char *argv[]) {
   causallm::Factory::Instance().registerModel(
     "Gemma3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
+                                                        nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Gemma4ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Gemma4CausalLM>(cfg, generation_cfg,
                                                         nntr_cfg);
     });
   causallm::Factory::Instance().registerModel(

@@ -135,6 +135,25 @@ if get_option('enable-test') and benchmark_x86_cpus.contains(host_machine.cpu_fa
   )
 endif
 
+# DDTree core tests embed the golden vectors (ddtree_golden/build_golden.h), so
+# this target is defined standalone to add that directory to its include path
+# (the shared loop above can't set per-target include dirs). Embedding avoids a
+# build-time data-file path that would not resolve when a cross-compiled binary
+# runs on a separate test runner.
+unittest_ddtree_exe = executable(
+  'unittest_ddtree',
+  'unittest_ddtree.cpp',
+  include_directories: include_directories('models', 'ddtree_golden'),
+  dependencies: unittest_nntrainer_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_ddtree', unittest_ddtree_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_ddtree')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
 unittest_inc = include_directories('.')
 
 # subdir('memory')
