@@ -415,72 +415,6 @@ TEST_F(Bench_Activations, swiglu) {
 #endif
 
 // ============================================================================
-// Multihead Row-Softmax Benchmarks (FP32 vs FP16 interleaved)
-// Production attention path uses softmax_row / softmax_row_inplace; both share
-// the same internal implementation, so benchmarking the inplace variant covers
-// both.
-// ============================================================================
-
-/**
- * @brief Test fixture for multihead row-softmax benchmarks
- */
-class Bench_SoftmaxRow
-  : public ::testing::TestWithParam<std::tuple<unsigned int, unsigned int>> {};
-
-TEST_P(Bench_SoftmaxRow, softmax_row_inplace) {
-  auto [num_rows, num_heads] = GetParam();
-  const unsigned int num_rows_v = num_rows;
-  const unsigned int num_heads_v = num_heads;
-  const unsigned int N = num_rows * num_heads;
-  std::string sz =
-    "rows=" + std::to_string(num_rows) + ",heads=" + std::to_string(num_heads);
-
-  {
-    auto X_orig = generate_random_vector<float>(N);
-    auto X = X_orig;
-
-    auto stats = bench::measure_with_setup(
-      [&]() { std::copy(X_orig.begin(), X_orig.end(), X.begin()); },
-      [&]() {
-        nntrainer::softmax_row_inplace(X.data(), size_t{0},
-                                       static_cast<size_t>(num_rows_v),
-                                       static_cast<size_t>(num_heads_v));
-      },
-      g_bench_warmup, g_bench_iters);
-
-    bench::Metrics m;
-    m.num_elements = N;
-    bench::report("softmax_row_inplace", "FP32", sz, stats, m);
-  }
-
-#if defined(ENABLE_FP16) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
-  {
-    auto X_orig = convert_f32_to_f16_u16(generate_random_vector<float>(N));
-    auto X = X_orig;
-
-    auto stats = bench::measure_with_setup(
-      [&]() { X = X_orig; },
-      [&]() {
-        nntrainer::softmax_row_inplace(
-          (_FP16 *)X.data(), size_t{0}, static_cast<size_t>(num_rows_v),
-          static_cast<size_t>(num_heads_v), static_cast<_FP16 *>(nullptr));
-      },
-      g_bench_warmup, g_bench_iters);
-
-    bench::Metrics m;
-    m.num_elements = N;
-    bench::report("softmax_row_inplace", "FP16", sz, stats, m);
-  }
-#endif
-}
-
-GTEST_PARAMETER_TEST(
-  Dims, Bench_SoftmaxRow,
-  ::testing::Values(std::make_tuple(1u, 32u), std::make_tuple(1u, 128u),
-                    std::make_tuple(64u, 32u), std::make_tuple(64u, 128u),
-                    std::make_tuple(512u, 32u), std::make_tuple(512u, 128u)));
-
-// ============================================================================
 // RMS Norm Benchmarks (FP32 vs FP16 interleaved)
 // ============================================================================
 
@@ -758,31 +692,74 @@ GTEST_PARAMETER_TEST(GemvDims, Bench_FP16_GEMV,
 
 // ============================================================================
 // Attention Kernel Benchmarks
+//
+// These model the real prefill attention dataflow of
+// MHACoreLayer::one_batch_incremental_forwarding: for every query row the three
+// leaf kernels run in sequence, chained through a shared score buffer:
+//
+//   Q [seq_len, num_q_heads, head_dim]
+//     --compute_kcaches (Q.K^T)------>  scores [T rows, num_q_heads]
+//     --softmax_row_inplace---------->  scores (in place)
+//     --compute_*vcache* (scores.V)-->  attn_out [seq_len, num_q_heads,
+//     head_dim]
+//
+// where num_q_heads = num_cache_head * gqa_size and the score-buffer row count
+//   T = seq_len*(seq_len+1)/2  (causal)   or   seq_len*seq_len  (non-causal).
+// For query row i the kernel reads/writes one row slice: the Q/attn_out offset
+// is i*num_q_heads*head_dim and the score offset is
+// calc_attn_index(i)*num_q_heads (causal) or i*seq_len*num_q_heads
+// (non-causal), matching mha_core exactly.
+//
+// At runtime this per-row loop is parallelized with ThreadManager; the
+// benchmark runs it serially to isolate per-kernel cost (the bench build is
+// NNTR_NUM_THREADS=1, and P4 measures per-kernel before/after). All three
+// kernels share the same parameter set for directly comparable shapes.
+//
+// NOTE: work scales with the full prefill (~O(seq_len) more than a single
+// call), so large seq_len configs may need a lower --bench_iters.
+//
 // KV cache is always kept as 16-bit regardless of enable-fp16:
 //   enable-fp16=false: Q=FP32, K/V=FP16 stored in uint16_t  (Set A below)
 //   enable-fp16=true : Q=FP16, K/V=FP16                     (Set B below)
 // ============================================================================
 
-using AttnParams = std::tuple<int, int, int, size_t>;
-static const auto kAttnConfigs =
-  ::testing::Values(AttnParams{64, 8, 1, 128}, AttnParams{64, 8, 4, 128},
-                    AttnParams{128, 8, 1, 128}, AttnParams{128, 8, 4, 128},
-                    AttnParams{128, 8, 8, 128}, AttnParams{128, 16, 1, 512},
-                    AttnParams{128, 16, 4, 512}, AttnParams{128, 32, 1, 1024},
-                    AttnParams{128, 32, 4, 1024}, AttnParams{128, 8, 4, 2048});
+// {seq_len, num_cache_head, gqa_size, head_dim, causal}
+using AttnParams = std::tuple<int, int, int, int, bool>;
 
-// compute_kcaches needs to vary seq_len (=num_rows) and tile_size to actually
-// stress the kernel; head_dim is fixed at 128 (typical for current LLMs) and
-// local_window_size is set to seq_len so the full Q range is processed.
-// Layout: [seq_len, num_cache_head, gqa_size, tile_size]
-using KCacheParams = std::tuple<int, int, int, int>;
-static constexpr int kKCacheHeadDim = 128;
-static const auto kKCacheConfigs = ::testing::Values(
-  KCacheParams{128, 8, 1, 4}, KCacheParams{128, 8, 4, 4},
-  KCacheParams{512, 8, 1, 4}, KCacheParams{512, 8, 4, 4},
-  KCacheParams{1024, 16, 1, 4}, KCacheParams{1024, 16, 4, 4},
-  KCacheParams{2048, 32, 1, 4}, KCacheParams{2048, 32, 4, 4},
-  KCacheParams{1024, 16, 1, 8}, KCacheParams{1024, 16, 1, 16});
+// Row-tile size for compute_kcaches: an internal tuning knob (not a model
+// dimension), kept fixed so the shared configs vary only model shapes.
+static constexpr int kAttnTileSize = 4;
+
+// Causal score rows preceding query row i: i*(i+1)/2 (== MHACoreLayer's
+// calc_attn_index, the offset into the packed triangular score buffer).
+static inline size_t attn_causal_index(int i) {
+  return static_cast<size_t>(i) * (static_cast<size_t>(i) + 1) / 2;
+}
+
+// Total score rows across all query rows for a given seq_len / causality.
+static inline size_t attn_score_rows(int seq_len, bool causal) {
+  const size_t s = static_cast<size_t>(seq_len);
+  return causal ? s * (s + 1) / 2 : s * s;
+}
+
+static std::string attn_size_str(int seq_len, int num_cache_head, int gqa_size,
+                                 int head_dim, bool causal) {
+  return "seq=" + std::to_string(seq_len) +
+         ",nch=" + std::to_string(num_cache_head) +
+         ",gqa=" + std::to_string(gqa_size) +
+         ",hd=" + std::to_string(head_dim) + (causal ? ",causal" : ",full");
+}
+
+static const auto kAttnConfigs = ::testing::Values(
+  // Causal (primary path: IsCausal defaults to true for decoder LLMs).
+  // {seq_len, num_cache_head, gqa_size, head_dim, causal}
+  AttnParams{128, 8, 1, 64, true}, AttnParams{128, 8, 4, 128, true},
+  AttnParams{512, 8, 1, 64, true}, AttnParams{512, 8, 4, 128, true},
+  AttnParams{1024, 8, 1, 128, true}, AttnParams{1024, 8, 4, 128, true},
+  AttnParams{2048, 8, 1, 128, true}, AttnParams{2048, 8, 4, 128, true},
+  // Non-causal (shape coverage); small seq_len bounds the seq_len^2 score
+  // buffer.
+  AttnParams{128, 8, 4, 128, false}, AttnParams{512, 8, 1, 128, false});
 
 // ---- Set A: FP32 Q + uint16(FP16-bits) KV cache (available in all builds)
 // ----
@@ -790,42 +767,131 @@ static const auto kKCacheConfigs = ::testing::Values(
 /**
  * @brief Test fixture for compute_kcaches benchmarks (FP32 Q, uint16 KV)
  */
-class Bench_KCache : public ::testing::TestWithParam<KCacheParams> {};
+class Bench_KCache : public ::testing::TestWithParam<AttnParams> {};
 
 TEST_P(Bench_KCache, compute_kcaches) {
-  auto [seq_len, num_cache_head, gqa_size, tile_size] = GetParam();
+  auto [seq_len, num_cache_head, gqa_size, head_dim, causal] = GetParam();
+  // Plain local copies: clang (-Werror) rejects capturing structured-binding
+  // names inside the [&] lambdas below.
   const int seq_len_v = seq_len;
   const int num_cache_head_v = num_cache_head;
   const int gqa_size_v = gqa_size;
-  const int tile_size_v = tile_size;
-  const int head_dim = kKCacheHeadDim;
+  const int head_dim_v = head_dim;
+  const bool causal_v = causal;
   const int total_heads = num_cache_head * gqa_size;
-  const size_t local_window_size = static_cast<size_t>(seq_len);
+  const size_t score_rows = attn_score_rows(seq_len, causal);
 
-  auto in_f32 = generate_random_vector<float>(total_heads * head_dim);
-  auto kcache_f32 = generate_random_vector<float>(
-    static_cast<size_t>(num_cache_head) * seq_len * head_dim);
-  auto kcache_u16 = convert_f32_to_f16_u16(kcache_f32);
-  std::vector<float> output(static_cast<size_t>(total_heads) * seq_len, 0.0f);
+  // Full attention input Q: [seq_len, num_q_heads, head_dim].
+  auto q_f32 = generate_random_vector<float>(static_cast<size_t>(seq_len) *
+                                             total_heads * head_dim);
+  auto kcache_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(
+    static_cast<size_t>(num_cache_head) * seq_len * head_dim));
+  // Scores (== softmax / vcache input): packed [T rows, num_q_heads].
+  std::vector<float> scores(score_rows * total_heads, 0.0f);
 
   auto stats = bench::measure(
     [&]() {
-      nntrainer::compute_kcaches<uint16_t>(
-        in_f32.data(), kcache_u16.data(), output.data(), seq_len_v,
-        num_cache_head_v, head_dim, gqa_size_v, tile_size_v, local_window_size);
+      for (int i = 0; i < seq_len_v; ++i) {
+        const int num_rows = causal_v ? i + 1 : seq_len_v;
+        const size_t in_off = static_cast<size_t>(i) * total_heads * head_dim_v;
+        const size_t out_off = (causal_v ? attn_causal_index(i)
+                                         : static_cast<size_t>(i) * seq_len_v) *
+                               total_heads;
+        nntrainer::compute_kcaches<uint16_t>(
+          q_f32.data() + in_off, kcache_u16.data(), scores.data() + out_off,
+          num_rows, num_cache_head_v, head_dim_v, gqa_size_v, kAttnTileSize,
+          static_cast<size_t>(num_rows));
+      }
     },
     g_bench_warmup, g_bench_iters);
 
-  std::string sz = "seq=" + std::to_string(seq_len) +
-                   ",nch=" + std::to_string(num_cache_head) +
-                   ",gqa=" + std::to_string(gqa_size) +
-                   ",tile=" + std::to_string(tile_size);
-  bench::report("compute_kcaches", "FP32", sz, stats);
+  bench::report(
+    "compute_kcaches", "FP32",
+    attn_size_str(seq_len, num_cache_head, gqa_size, head_dim, causal), stats);
 
   RecordProperty("latency_ns", make_record_property_value(stats.avg_ns));
 }
 
-GTEST_PARAMETER_TEST(Configs, Bench_KCache, kKCacheConfigs);
+GTEST_PARAMETER_TEST(Configs, Bench_KCache, kAttnConfigs);
+
+/**
+ * @brief Test fixture for multihead row-softmax benchmarks (between kcache and
+ * vcache in the attention dataflow)
+ */
+class Bench_SoftmaxRow : public ::testing::TestWithParam<AttnParams> {};
+
+TEST_P(Bench_SoftmaxRow, softmax_row_inplace) {
+  auto [seq_len, num_cache_head, gqa_size, head_dim, causal] = GetParam();
+  // Plain local copies: clang (-Werror) rejects capturing structured-binding
+  // names inside the [&] lambdas below.
+  const int seq_len_v = seq_len;
+  const bool causal_v = causal;
+  const int total_heads = num_cache_head * gqa_size;
+  const size_t score_rows = attn_score_rows(seq_len, causal);
+  const std::string sz =
+    attn_size_str(seq_len, num_cache_head, gqa_size, head_dim, causal);
+
+  // Softmax operates over the score buffer (== compute_kcaches output): each
+  // query row i normalizes its own [calc_attn_index(i), calc_attn_index(i+1))
+  // row range, mirroring MHACoreLayer::softmax_triangle.
+  {
+    auto scores_orig = generate_random_vector<float>(score_rows * total_heads);
+    auto scores = scores_orig;
+
+    auto stats = bench::measure_with_setup(
+      [&]() {
+        std::copy(scores_orig.begin(), scores_orig.end(), scores.begin());
+      },
+      [&]() {
+        for (int i = 0; i < seq_len_v; ++i) {
+          const size_t start_row = causal_v
+                                     ? attn_causal_index(i)
+                                     : static_cast<size_t>(i) * seq_len_v;
+          const size_t end_row = causal_v
+                                   ? attn_causal_index(i + 1)
+                                   : static_cast<size_t>(i + 1) * seq_len_v;
+          nntrainer::softmax_row_inplace(scores.data(), start_row, end_row,
+                                         static_cast<size_t>(total_heads));
+        }
+      },
+      g_bench_warmup, g_bench_iters);
+
+    bench::Metrics m;
+    m.num_elements = score_rows * total_heads;
+    bench::report("softmax_row_inplace", "FP32", sz, stats, m);
+  }
+
+#if defined(ENABLE_FP16) && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+  {
+    auto scores_orig = convert_f32_to_f16_u16(
+      generate_random_vector<float>(score_rows * total_heads));
+    auto scores = scores_orig;
+
+    auto stats = bench::measure_with_setup(
+      [&]() { scores = scores_orig; },
+      [&]() {
+        for (int i = 0; i < seq_len_v; ++i) {
+          const size_t start_row = causal_v
+                                     ? attn_causal_index(i)
+                                     : static_cast<size_t>(i) * seq_len_v;
+          const size_t end_row = causal_v
+                                   ? attn_causal_index(i + 1)
+                                   : static_cast<size_t>(i + 1) * seq_len_v;
+          nntrainer::softmax_row_inplace(
+            (_FP16 *)scores.data(), start_row, end_row,
+            static_cast<size_t>(total_heads), static_cast<_FP16 *>(nullptr));
+        }
+      },
+      g_bench_warmup, g_bench_iters);
+
+    bench::Metrics m;
+    m.num_elements = score_rows * total_heads;
+    bench::report("softmax_row_inplace", "FP16", sz, stats, m);
+  }
+#endif
+}
+
+GTEST_PARAMETER_TEST(Configs, Bench_SoftmaxRow, kAttnConfigs);
 
 /**
  * @brief Test fixture for attention kernel benchmarks (FP32 Q, uint16 KV)
@@ -833,34 +899,46 @@ GTEST_PARAMETER_TEST(Configs, Bench_KCache, kKCacheConfigs);
 class Bench_Attention : public ::testing::TestWithParam<AttnParams> {};
 
 TEST_P(Bench_Attention, compute_fp16vcache) {
-  auto [head_dim, num_cache_head, gqa_size, window_size] = GetParam();
-  const int head_dim_v = head_dim;
+  auto [seq_len, num_cache_head, gqa_size, head_dim, causal] = GetParam();
+  // Plain local copies: clang (-Werror) rejects capturing structured-binding
+  // names inside the [&] lambda below.
+  const int seq_len_v = seq_len;
   const int num_cache_head_v = num_cache_head;
   const int gqa_size_v = gqa_size;
-  const size_t window_size_v = window_size;
-  int total_heads = num_cache_head * gqa_size;
-  int row_num = static_cast<int>(window_size) - 1;
-  const int attention_rows = row_num + 1;
+  const int head_dim_v = head_dim;
+  const bool causal_v = causal;
+  const int total_heads = num_cache_head * gqa_size;
+  const size_t score_rows = attn_score_rows(seq_len, causal);
 
-  auto in_f32 = generate_random_vector<float>(total_heads * attention_rows);
-  auto vcache_f32 = generate_random_vector<float>(
-    static_cast<size_t>(num_cache_head) * (size_t)window_size * head_dim);
-  auto vcache_u16 = convert_f32_to_f16_u16(vcache_f32);
-  std::vector<float> output(static_cast<size_t>(total_heads) * head_dim, 0.0f);
+  // Attention weights (== compute_kcaches output): packed [T rows,
+  // num_q_heads].
+  auto scores_f32 = generate_random_vector<float>(score_rows * total_heads);
+  auto vcache_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(
+    static_cast<size_t>(num_cache_head) * seq_len * head_dim));
+  // Attention output: [seq_len, num_q_heads, head_dim].
+  std::vector<float> attn_out(
+    static_cast<size_t>(seq_len) * total_heads * head_dim, 0.0f);
 
   auto stats = bench::measure(
     [&]() {
-      nntrainer::compute_fp16vcache_fp32_transposed(
-        row_num, in_f32.data(), vcache_u16.data(), output.data(),
-        num_cache_head_v, gqa_size_v, head_dim_v, window_size_v);
+      for (int i = 0; i < seq_len_v; ++i) {
+        const int row_num = causal_v ? i : seq_len_v - 1;
+        const size_t in_off = (causal_v ? attn_causal_index(i)
+                                        : static_cast<size_t>(i) * seq_len_v) *
+                              total_heads;
+        const size_t out_off =
+          static_cast<size_t>(i) * total_heads * head_dim_v;
+        nntrainer::compute_fp16vcache_fp32_transposed(
+          row_num, scores_f32.data() + in_off, vcache_u16.data(),
+          attn_out.data() + out_off, num_cache_head_v, gqa_size_v, head_dim_v,
+          static_cast<size_t>(row_num + 1));
+      }
     },
     g_bench_warmup, g_bench_iters);
 
-  std::string sz = "hd=" + std::to_string(head_dim) +
-                   ",nch=" + std::to_string(num_cache_head) +
-                   ",gqa=" + std::to_string(gqa_size) +
-                   ",w=" + std::to_string(window_size);
-  bench::report("compute_fp16vcache", "FP32", sz, stats);
+  bench::report(
+    "compute_fp16vcache", "FP32",
+    attn_size_str(seq_len, num_cache_head, gqa_size, head_dim, causal), stats);
 
   RecordProperty("latency_ns", make_record_property_value(stats.avg_ns));
 }
@@ -874,43 +952,51 @@ GTEST_PARAMETER_TEST(Configs, Bench_Attention, kAttnConfigs);
 /**
  * @brief Test fixture for compute_kcaches benchmarks (FP16 Q, FP16 KV)
  */
-class Bench_KCache_FP16 : public ::testing::TestWithParam<KCacheParams> {};
+class Bench_KCache_FP16 : public ::testing::TestWithParam<AttnParams> {};
 
 TEST_P(Bench_KCache_FP16, compute_kcaches) {
-  auto [seq_len, num_cache_head, gqa_size, tile_size] = GetParam();
+  auto [seq_len, num_cache_head, gqa_size, head_dim, causal] = GetParam();
+  // Plain local copies: clang (-Werror) rejects capturing structured-binding
+  // names inside the [&] lambda below.
   const int seq_len_v = seq_len;
   const int num_cache_head_v = num_cache_head;
   const int gqa_size_v = gqa_size;
-  const int tile_size_v = tile_size;
-  const int head_dim = kKCacheHeadDim;
+  const int head_dim_v = head_dim;
+  const bool causal_v = causal;
   const int total_heads = num_cache_head * gqa_size;
-  const size_t local_window_size = static_cast<size_t>(seq_len);
+  const size_t score_rows = attn_score_rows(seq_len, causal);
 
-  auto in_u16 = convert_f32_to_f16_u16(
-    generate_random_vector<float>(total_heads * head_dim));
-  auto kcache_u16 = convert_f32_to_f16_u16(
-    generate_random_vector<float>(num_cache_head * seq_len * head_dim));
-  std::vector<uint16_t> output(total_heads * seq_len, 0);
+  auto q_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(
+    static_cast<size_t>(seq_len) * total_heads * head_dim));
+  auto kcache_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(
+    static_cast<size_t>(num_cache_head) * seq_len * head_dim));
+  std::vector<uint16_t> scores(score_rows * total_heads, 0);
 
   auto stats = bench::measure(
     [&]() {
-      nntrainer::compute_kcaches(
-        (const _FP16 *)in_u16.data(), (const _FP16 *)kcache_u16.data(),
-        (_FP16 *)output.data(), seq_len_v, num_cache_head_v, head_dim,
-        gqa_size_v, tile_size_v, local_window_size);
+      for (int i = 0; i < seq_len_v; ++i) {
+        const int num_rows = causal_v ? i + 1 : seq_len_v;
+        const size_t in_off = static_cast<size_t>(i) * total_heads * head_dim_v;
+        const size_t out_off = (causal_v ? attn_causal_index(i)
+                                         : static_cast<size_t>(i) * seq_len_v) *
+                               total_heads;
+        nntrainer::compute_kcaches(
+          (const _FP16 *)q_u16.data() + in_off,
+          (const _FP16 *)kcache_u16.data(), (_FP16 *)scores.data() + out_off,
+          num_rows, num_cache_head_v, head_dim_v, gqa_size_v, kAttnTileSize,
+          static_cast<size_t>(num_rows));
+      }
     },
     g_bench_warmup, g_bench_iters);
 
-  std::string sz = "seq=" + std::to_string(seq_len) +
-                   ",nch=" + std::to_string(num_cache_head) +
-                   ",gqa=" + std::to_string(gqa_size) +
-                   ",tile=" + std::to_string(tile_size);
-  bench::report("compute_kcaches", "FP16", sz, stats);
+  bench::report(
+    "compute_kcaches", "FP16",
+    attn_size_str(seq_len, num_cache_head, gqa_size, head_dim, causal), stats);
 
   RecordProperty("latency_ns", make_record_property_value(stats.avg_ns));
 }
 
-GTEST_PARAMETER_TEST(Configs, Bench_KCache_FP16, kKCacheConfigs);
+GTEST_PARAMETER_TEST(Configs, Bench_KCache_FP16, kAttnConfigs);
 
 /**
  * @brief Test fixture for attention kernel benchmarks (FP16 Q, FP16 KV)
@@ -918,35 +1004,45 @@ GTEST_PARAMETER_TEST(Configs, Bench_KCache_FP16, kKCacheConfigs);
 class Bench_Attention_FP16 : public ::testing::TestWithParam<AttnParams> {};
 
 TEST_P(Bench_Attention_FP16, compute_fp16vcache_transposed) {
-  auto [head_dim, num_cache_head, gqa_size, window_size] = GetParam();
-  const int head_dim_v = head_dim;
+  auto [seq_len, num_cache_head, gqa_size, head_dim, causal] = GetParam();
+  // Plain local copies: clang (-Werror) rejects capturing structured-binding
+  // names inside the [&] lambda below.
+  const int seq_len_v = seq_len;
   const int num_cache_head_v = num_cache_head;
   const int gqa_size_v = gqa_size;
-  const size_t window_size_v = window_size;
-  int total_heads = num_cache_head * gqa_size;
-  int row_num = static_cast<int>(window_size) - 1;
-  const int attention_rows = row_num + 1;
+  const int head_dim_v = head_dim;
+  const bool causal_v = causal;
+  const int total_heads = num_cache_head * gqa_size;
+  const size_t score_rows = attn_score_rows(seq_len, causal);
 
-  auto in_u16 = convert_f32_to_f16_u16(
-    generate_random_vector<float>(total_heads * attention_rows));
+  auto scores_u16 = convert_f32_to_f16_u16(
+    generate_random_vector<float>(score_rows * total_heads));
   auto vcache_u16 = convert_f32_to_f16_u16(generate_random_vector<float>(
-    num_cache_head * (int)window_size * head_dim));
-  std::vector<uint16_t> output(total_heads * head_dim, 0);
+    static_cast<size_t>(num_cache_head) * seq_len * head_dim));
+  std::vector<uint16_t> attn_out(
+    static_cast<size_t>(seq_len) * total_heads * head_dim, 0);
 
   auto stats = bench::measure(
     [&]() {
-      nntrainer::compute_fp16vcache_transposed(
-        row_num, (const _FP16 *)in_u16.data(), (const _FP16 *)vcache_u16.data(),
-        (_FP16 *)output.data(), num_cache_head_v, gqa_size_v, head_dim_v,
-        window_size_v);
+      for (int i = 0; i < seq_len_v; ++i) {
+        const int row_num = causal_v ? i : seq_len_v - 1;
+        const size_t in_off = (causal_v ? attn_causal_index(i)
+                                        : static_cast<size_t>(i) * seq_len_v) *
+                              total_heads;
+        const size_t out_off =
+          static_cast<size_t>(i) * total_heads * head_dim_v;
+        nntrainer::compute_fp16vcache_transposed(
+          row_num, (const _FP16 *)scores_u16.data() + in_off,
+          (const _FP16 *)vcache_u16.data(), (_FP16 *)attn_out.data() + out_off,
+          num_cache_head_v, gqa_size_v, head_dim_v,
+          static_cast<size_t>(row_num + 1));
+      }
     },
     g_bench_warmup, g_bench_iters);
 
-  std::string sz = "hd=" + std::to_string(head_dim) +
-                   ",nch=" + std::to_string(num_cache_head) +
-                   ",gqa=" + std::to_string(gqa_size) +
-                   ",w=" + std::to_string(window_size);
-  bench::report("compute_fp16vcache_transposed", "FP16", sz, stats);
+  bench::report(
+    "compute_fp16vcache_transposed", "FP16",
+    attn_size_str(seq_len, num_cache_head, gqa_size, head_dim, causal), stats);
 
   RecordProperty("latency_ns", make_record_property_value(stats.avg_ns));
 }
