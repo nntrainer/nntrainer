@@ -30,7 +30,6 @@
 #include <base_properties.h>
 #include <common.h>
 #include <cpu_backend.h>
-#include <kleidiai_interface.h>
 #include <layer_context.h>
 #include <tensor_dim.h>
 

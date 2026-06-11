@@ -27,7 +27,7 @@ namespace nntrainer {
  * represent the second int4 value.
  * E.g., 01011001 (89) represents 0101 (+5) and 1001 (-1)
  *
- * @todo Remove variable `group_size` and add PER_GROUP_AFFINE_32,64,128
+ * @todo Remove variable `group_size` and add PER_GROUP_AFFINE_1,64,128
  */
 class Int4QTensor : public TensorBase {
 public:
@@ -36,7 +36,7 @@ public:
    */
   Int4QTensor(std::string name_ = "", Tformat fm = Tformat::NCHW,
               QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
-              size_t g_size = 32);
+              size_t g_size = 1);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -50,7 +50,7 @@ public:
   Int4QTensor(const TensorDim &d, bool alloc_now,
               Initializer init = Initializer::NONE, std::string name = "",
               QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
-              size_t g_size = 32);
+              size_t g_size = 1);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -61,7 +61,7 @@ public:
    */
   Int4QTensor(const TensorDim &d, const void *buf = nullptr,
               QScheme qscheme_ = QScheme::PER_CHANNEL_AFFINE,
-              size_t g_size = 32);
+              size_t g_size = 1);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -74,7 +74,7 @@ public:
   Int4QTensor(
     std::vector<std::vector<std::vector<std::vector<int8_t>>>> const &d,
     std::vector<float> const &scales, Tformat fm, QScheme qscheme_,
-    size_t g_size = 32);
+    size_t g_size = 1);
 
   /**
    * @brief Construct a new Int4QTensor object
@@ -289,6 +289,8 @@ public:
    * @copydoc Tensor::getMemoryBytes()
    */
   size_t getMemoryBytes() const override;
+
+  size_t size() const override;
 
   /**
    * @copydoc Tensor::scale_size()

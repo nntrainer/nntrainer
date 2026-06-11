@@ -14,6 +14,7 @@
  * @todo   check before allocate that finalize is done
  */
 
+#include <cpu_backend.h>
 #include <memory_pool.h>
 #include <nntrainer_log.h>
 #include <tensor.h>

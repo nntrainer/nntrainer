@@ -1036,10 +1036,13 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
      */
     size_t opt_kernel_idx = (M == 1) ? 2 : 8;
 
-    float *scale = input.getScale();
+    // pack here or not?
+    gemm_qai8dxp_qsi4cxp(M, N, K, data, mdata, rdata, opt_kernel_idx);
 
-    gemm_qai8dxp_qsi4cxp_rhs_unpacked(M, N, K, data, mdata, scale, rdata,
-                                      opt_kernel_idx, true);
+    // float *scale = input.getScale();
+
+    // gemm_qai8dxp_qsi4cxp_rhs_unpacked(M, N, K, data, mdata, scale, rdata,
+    //                                   opt_kernel_idx, true);
   }
 
   return output;

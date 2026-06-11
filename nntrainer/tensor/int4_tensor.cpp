@@ -12,12 +12,13 @@
 #include <iostream>
 
 #include <compute_ops.h>
+#include <cpu_backend.h>
 #include <int4_tensor.h>
 #include <tensor.h>
 
 namespace nntrainer {
 
-size_t Int4QTensor::group_size = 32;
+size_t Int4QTensor::group_size = 1;
 
 Int4QTensor::Int4QTensor(std::string name_, Tformat fm, QScheme qscheme_,
                          size_t g_size) :
@@ -139,10 +140,14 @@ void Int4QTensor::allocate() {
     /// allocate new memory for the tensor data
     MemoryData *mem_data;
 
+    size_t opt_kernel_idx = 8;
+    const size_t K = height();
+    const size_t N = width();
+    size_t packed_size = nntrainer::get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
+      N, K, opt_kernel_idx, true);
+
     /// quantized 4-bit is stored as a 8-bit signed integer (int4x2)
-    mem_data =
-      new MemoryData((void *)(new int8_t[(dim.getDataLen() + 1) / 2 +
-                                         sizeof(float) * scale_size()]{}));
+    mem_data = new MemoryData((void *)(new int8_t[packed_size]{}));
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
       delete[] mem_data->template getAddr<int8_t>();
       delete mem_data;
@@ -178,8 +183,11 @@ void *Int4QTensor::getScale() const {
   if (!data)
     return nullptr;
 
+  const size_t K = height();
+  const size_t N = width();
+
   data->validate();
-  return ((int8_t *)getData()) + (size() + 1) / 2;
+  return ((int8_t *)getData()) + N * (K + 1) / 2;
 }
 
 void *Int4QTensor::getScale(size_t idx) const {
@@ -394,9 +402,18 @@ void Int4QTensor::read(ReadSource src, size_t start_offset,
     start_offset += sizeof(uint16_t);
   }
 
-  checkedRead(src, (char *)getData(), sz,
+  std::vector<uint8_t> tmp(getMemoryBytes());
+
+  checkedRead(src, (char *)tmp.data(), sz,
               "[Int4QTensor::read] operation failed", start_offset,
               read_from_offset);
+
+  const size_t N = width();
+  const size_t K = height();
+
+  nntrainer::rhs_pack_qsi4cxp_qs4cxs1s0(N, K, getData(), tmp.data(),
+                                        tmp.data() + N * (K + 1) / 2, 8, true);
+
   putData();
 }
 
@@ -553,9 +570,20 @@ void Int4QTensor::print(std::ostream &out) const {
   out << std::endl;
 }
 
+size_t Int4QTensor::size() const {
+  const size_t K = height();
+  const size_t N = width();
+  size_t data_size = N * (K + 1) / 2;
+  return data_size + scale_size();
+}
+
 size_t Int4QTensor::getMemoryBytes() const {
-  return ((size() + 1) / 2) * dim.getDataTypeSize() +
-         scale_size() * sizeof(uint16_t);
+  size_t opt_kernel_idx = 8;
+  const size_t K = height();
+  const size_t N = width();
+  size_t packed_size = nntrainer::get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
+    N, K, opt_kernel_idx, true);
+  return packed_size;
 }
 
 size_t Int4QTensor::scale_size() const {
@@ -564,7 +592,7 @@ size_t Int4QTensor::scale_size() const {
     return 1;
     break;
   case QScheme::PER_CHANNEL_AFFINE:
-    return height() * width() / group_size;
+    return width() / group_size * sizeof(float);
     break;
   default:
     break;
@@ -601,7 +629,7 @@ void Int4QTensor::read_quantization_info(std::ifstream &file,
   checkedRead(file, (char *)&qscheme, sizeof(uint16_t),
               "[Int4QTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
-  group_size = 32; /// Remove me
+  group_size = 1; /// Remove me
 }
 
 void Int4QTensor::read_quantization_info(ReadSource src, size_t start_offset,
@@ -609,7 +637,8 @@ void Int4QTensor::read_quantization_info(ReadSource src, size_t start_offset,
   checkedRead(src, (char *)&qscheme, sizeof(uint16_t),
               "[Int4QTensor::read] failed to read quantization information",
               start_offset, read_from_offset);
-  group_size = 32; /// Remove me
+  void *qp = &qscheme;
+  group_size = 1; /// Remove me
 }
 
 size_t Int4QTensor::getGroupSize() { return group_size; }
