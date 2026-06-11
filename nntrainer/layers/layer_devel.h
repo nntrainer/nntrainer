@@ -30,6 +30,7 @@
 #include <base_properties.h>
 #include <common.h>
 #include <cpu_backend.h>
+#include <kleidiai_interface.h>
 #include <layer_context.h>
 #include <tensor_dim.h>
 
@@ -411,6 +412,36 @@ public:
                             quant_weight.size(), N, K, target_isa);
                 quant_weight.save(file);
               }
+            } else if (dtype == TensorDim::DataType::QINT4) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with quantization only supports for FP32 weight.";
+              ///@note The codelines below can be replaced with quantizer's
+              /// quantize()
+              TensorDim dim = weight.getDim();
+              unsigned int K = dim.height();
+              unsigned int N = dim.width();
+              Tensor weight_t = weight.transpose("0:2:1");
+
+              /// @todo handle this hard coded idx
+              size_t opt_kernel_idx = 8;
+              size_t packed_size =
+                nntrainer::get_rhs_packed_size_qsi4cxp_qs4cxs1s0(
+                  N, K, opt_kernel_idx, true);
+
+              // allocate packed size, not an unpacked size
+              std::vector<uint8_t> rhs_q(packed_size);
+              uint8_t *data = rhs_q.data();
+
+              size_t rhs_qsi4cx_size = N * (K + 1) / 2;
+              uint8_t *scale = data + rhs_qsi4cx_size;
+
+              nntrainer::quant_qs4cx_f32(N, K, weight_t.getData(), data, scale,
+                                         true);
+
+              uint16_t code = 0x01;
+              file.write((const char *)&code, sizeof(uint16_t));
+              file.write((const char *)data, packed_size);
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";
