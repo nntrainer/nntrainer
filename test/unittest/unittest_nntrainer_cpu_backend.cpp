@@ -1283,14 +1283,26 @@ static std::vector<float> softmax_row_ref(const std::vector<float> &qk,
 }
 
 static std::vector<float> to_f32(const std::vector<_FP16> &v) {
-  return std::vector<float>(v.begin(), v.end());
+  std::vector<float> out;
+  out.reserve(v.size());
+  for (_FP16 x : v)
+    out.push_back(static_cast<float>(x));
+  return out;
+}
+
+static std::vector<_FP16> to_f16(const std::vector<float> &v) {
+  std::vector<_FP16> out;
+  out.reserve(v.size());
+  for (float x : v)
+    out.push_back(static_cast<_FP16>(x));
+  return out;
 }
 } // namespace
 
 TEST(nntrainer_cpu_backend_standalone, compute_softmax_row_inplace_fp16_x86) {
   size_t start_row = 0, end_row = 3, num_heads = 10;
   auto qk_f = generate_random_vector<float>(num_heads * end_row, -8.0f, 8.0f);
-  std::vector<_FP16> qk(qk_f.begin(), qk_f.end());
+  std::vector<_FP16> qk = to_f16(qk_f);
   auto ref =
     softmax_row_ref(to_f32(qk), start_row, end_row, num_heads, nullptr);
 
@@ -1305,8 +1317,8 @@ TEST(nntrainer_cpu_backend_standalone,
   size_t start_row = 0, end_row = 2, num_heads = 10;
   auto qk_f = generate_random_vector<float>(num_heads * end_row, -8.0f, 8.0f);
   auto sink_f = generate_random_vector<float>(num_heads, -8.0f, 8.0f);
-  std::vector<_FP16> qk(qk_f.begin(), qk_f.end());
-  std::vector<_FP16> sink(sink_f.begin(), sink_f.end());
+  std::vector<_FP16> qk = to_f16(qk_f);
+  std::vector<_FP16> sink = to_f16(sink_f);
   auto sink32 = to_f32(sink);
   auto ref =
     softmax_row_ref(to_f32(qk), start_row, end_row, num_heads, &sink32);
@@ -1323,7 +1335,7 @@ TEST(nntrainer_cpu_backend_standalone,
   size_t start_row = 0, end_row = 2, num_heads = 10;
   auto qk_f = generate_random_vector<float>(num_heads * end_row, -8.0f, 8.0f);
   auto sink32 = generate_random_vector<float>(num_heads, -8.0f, 8.0f);
-  std::vector<_FP16> qk(qk_f.begin(), qk_f.end());
+  std::vector<_FP16> qk = to_f16(qk_f);
   auto ref =
     softmax_row_ref(to_f32(qk), start_row, end_row, num_heads, &sink32);
 
@@ -1334,13 +1346,54 @@ TEST(nntrainer_cpu_backend_standalone,
     EXPECT_NEAR(ref[i], static_cast<float>(qk[i]), 5e-3f);
 }
 
+TEST(nntrainer_cpu_backend_standalone,
+     compute_fp16vcache_fp32_transposed_x86_rem0_local_window_head_slice) {
+  int row_num = 5, N = 3, gqa = 4, head_dim = 64;
+  size_t local_window_size = 3;
+  int head_start = 1, head_end = 2;
+  int input_rows = static_cast<int>(local_window_size);
+  int cache_rows = row_num + 1;
+  int cache_start = row_num + 1 - input_rows;
+  auto in = generate_random_vector<float>(input_rows * gqa * N, -1.0f, 1.0f);
+  auto vc_f =
+    generate_random_vector<float>(cache_rows * N * head_dim, -1.0f, 1.0f);
+  std::vector<uint16_t> vcache = convert_vector_f32_to_f16_as_uint16(vc_f);
+  auto vcq = convert_vector_f16_as_uint16_to_f32(vcache);
+  std::vector<float> output((size_t)N * gqa * head_dim, -77.0f);
+
+  nntrainer::compute_fp16vcache_fp32_transposed(
+    row_num, in.data(), vcache.data(), output.data(), N, gqa, head_dim,
+    local_window_size, head_start, head_end);
+
+  for (int n = head_start; n < head_end; ++n)
+    for (int h = 0; h < gqa; ++h)
+      for (int d = 0; d < head_dim; ++d) {
+        float acc = 0.0f;
+        for (int local_j = 0; local_j < input_rows; ++local_j) {
+          int cache_j = cache_start + local_j;
+          acc += in[local_j * gqa * N + n * gqa + h] *
+                 vcq[(cache_j * N + n) * head_dim + d];
+        }
+        size_t out_idx = ((size_t)n * gqa + h) * head_dim + d;
+        EXPECT_NEAR(acc, output[out_idx], 1e-4f);
+      }
+
+  for (int n = 0; n < N; ++n)
+    if (n < head_start || n >= head_end)
+      for (int h = 0; h < gqa; ++h)
+        for (int d = 0; d < head_dim; ++d) {
+          size_t out_idx = ((size_t)n * gqa + h) * head_dim + d;
+          EXPECT_EQ(output[out_idx], -77.0f);
+        }
+}
+
 TEST(nntrainer_cpu_backend_standalone, compute_kcaches_fp16_x86) {
   int num_rows = 5, N = 2, head_dim = 10, gqa = 4, tile_size = 16;
   auto in_f = generate_random_vector<float>(N * gqa * head_dim, -1.0f, 1.0f);
   auto kc_f =
     generate_random_vector<float>(num_rows * N * head_dim, -1.0f, 1.0f);
-  std::vector<_FP16> in(in_f.begin(), in_f.end());
-  std::vector<_FP16> kcache(kc_f.begin(), kc_f.end());
+  std::vector<_FP16> in = to_f16(in_f);
+  std::vector<_FP16> kcache = to_f16(kc_f);
   std::vector<_FP16> output((size_t)num_rows * N * gqa, (_FP16)0.0f);
   auto inq = to_f32(in), kcq = to_f32(kcache);
 
@@ -1361,13 +1414,54 @@ TEST(nntrainer_cpu_backend_standalone, compute_kcaches_fp16_x86) {
       }
 }
 
+TEST(nntrainer_cpu_backend_standalone,
+     compute_kcaches_fp16_x86_rem0_local_window_head_slice) {
+  int num_rows = 6, N = 3, head_dim = 64, gqa = 4, tile_size = 4;
+  size_t local_window_size = 3;
+  int head_start = 1, head_end = 2;
+  int start_row = num_rows - static_cast<int>(local_window_size);
+  int row_cnt = static_cast<int>(local_window_size);
+  auto in_f = generate_random_vector<float>(N * gqa * head_dim, -1.0f, 1.0f);
+  auto kc_f =
+    generate_random_vector<float>(num_rows * N * head_dim, -1.0f, 1.0f);
+  std::vector<_FP16> in = to_f16(in_f);
+  std::vector<_FP16> kcache = to_f16(kc_f);
+  std::vector<_FP16> output((size_t)row_cnt * N * gqa, (_FP16)-77.0f);
+  auto inq = to_f32(in), kcq = to_f32(kcache);
+
+  nntrainer::compute_kcaches(in.data(), kcache.data(), output.data(), num_rows,
+                             N, head_dim, gqa, tile_size, local_window_size,
+                             head_start, head_end);
+
+  const float scale = 1.0f / std::sqrt((float)head_dim);
+  for (int row = start_row; row < num_rows; ++row)
+    for (int n = head_start; n < head_end; ++n)
+      for (int g = 0; g < gqa; ++g) {
+        float sum = 0.0f;
+        for (int i = 0; i < head_dim; ++i)
+          sum += inq[(n * gqa + g) * head_dim + i] *
+                 kcq[(row * N + n) * head_dim + i];
+        size_t out_idx =
+          (size_t)(row - start_row) * N * gqa + (size_t)n * gqa + g;
+        EXPECT_NEAR(sum * scale, static_cast<float>(output[out_idx]), 5e-3f);
+      }
+
+  for (int row = 0; row < row_cnt; ++row)
+    for (int n = 0; n < N; ++n)
+      if (n < head_start || n >= head_end)
+        for (int g = 0; g < gqa; ++g) {
+          size_t out_idx = (size_t)row * N * gqa + (size_t)n * gqa + g;
+          EXPECT_EQ(static_cast<float>(output[out_idx]), -77.0f);
+        }
+}
+
 TEST(nntrainer_cpu_backend_standalone, compute_fp16vcache_transposed_fp16_x86) {
   int row_num = 3, N = 2, gqa = 2, head_dim = 9;
   int rows = row_num + 1;
   auto in_f = generate_random_vector<float>(rows * gqa * N, -1.0f, 1.0f);
   auto vc_f = generate_random_vector<float>(rows * N * head_dim, -1.0f, 1.0f);
-  std::vector<_FP16> in(in_f.begin(), in_f.end());
-  std::vector<_FP16> vcache(vc_f.begin(), vc_f.end());
+  std::vector<_FP16> in = to_f16(in_f);
+  std::vector<_FP16> vcache = to_f16(vc_f);
   std::vector<_FP16> output((size_t)N * gqa * head_dim, (_FP16)0.0f);
   auto inq = to_f32(in), vcq = to_f32(vcache);
 
@@ -1384,6 +1478,48 @@ TEST(nntrainer_cpu_backend_standalone, compute_fp16vcache_transposed_fp16_x86) {
         float got = static_cast<float>(output[(n * gqa + h) * head_dim + d]);
         EXPECT_NEAR(acc, got, 5e-3f);
       }
+}
+
+TEST(nntrainer_cpu_backend_standalone,
+     compute_fp16vcache_transposed_fp16_x86_rem0_local_window_head_slice) {
+  int row_num = 5, N = 3, gqa = 4, head_dim = 64;
+  size_t local_window_size = 3;
+  int head_start = 1, head_end = 2;
+  int input_rows = static_cast<int>(local_window_size);
+  int cache_rows = row_num + 1;
+  int cache_start = row_num + 1 - input_rows;
+  auto in_f = generate_random_vector<float>(input_rows * gqa * N, -1.0f, 1.0f);
+  auto vc_f =
+    generate_random_vector<float>(cache_rows * N * head_dim, -1.0f, 1.0f);
+  std::vector<_FP16> in = to_f16(in_f);
+  std::vector<_FP16> vcache = to_f16(vc_f);
+  std::vector<_FP16> output((size_t)N * gqa * head_dim, (_FP16)-77.0f);
+  auto inq = to_f32(in), vcq = to_f32(vcache);
+
+  nntrainer::compute_fp16vcache_transposed(
+    row_num, in.data(), vcache.data(), output.data(), N, gqa, head_dim,
+    local_window_size, head_start, head_end);
+
+  for (int n = head_start; n < head_end; ++n)
+    for (int h = 0; h < gqa; ++h)
+      for (int d = 0; d < head_dim; ++d) {
+        float acc = 0.0f;
+        for (int local_j = 0; local_j < input_rows; ++local_j) {
+          int cache_j = cache_start + local_j;
+          acc += inq[local_j * gqa * N + n * gqa + h] *
+                 vcq[(cache_j * N + n) * head_dim + d];
+        }
+        size_t out_idx = ((size_t)n * gqa + h) * head_dim + d;
+        EXPECT_NEAR(acc, static_cast<float>(output[out_idx]), 5e-3f);
+      }
+
+  for (int n = 0; n < N; ++n)
+    if (n < head_start || n >= head_end)
+      for (int h = 0; h < gqa; ++h)
+        for (int d = 0; d < head_dim; ++d) {
+          size_t out_idx = ((size_t)n * gqa + h) * head_dim + d;
+          EXPECT_EQ(static_cast<float>(output[out_idx]), -77.0f);
+        }
 }
 #endif
 

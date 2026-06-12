@@ -1851,6 +1851,8 @@ void compute_kcaches(const _Float16 *in, const _Float16 *kcache,
     num_rows < local_window_size ? 0 : num_rows - local_window_size;
   int row_cnt = num_rows < local_window_size ? num_rows : local_window_size;
   const int tile_count = (row_cnt + tile_size - 1) / tile_size;
+  const float inv_sqrt_head_dim =
+    1.0f / std::sqrt(static_cast<float>(head_dim));
 
   for (int n = head_start; n < actual_head_end; ++n) {
     for (int t = 0; t < tile_count; ++t) {
@@ -1883,9 +1885,7 @@ void compute_kcaches(const _Float16 *in, const _Float16 *kcache,
             sum += static_cast<float>(in_ptr[i]) * static_cast<float>(k_row[i]);
 
           output[(row - start_row) * num_cache_head * gqa_size + n * gqa_size +
-                 g] =
-            static_cast<_Float16>(sum /
-                                  std::sqrt(static_cast<float>(head_dim)));
+                 g] = static_cast<_Float16>(sum * inv_sqrt_head_dim);
         }
       }
     }
@@ -1938,10 +1938,12 @@ void compute_fp16vcache_transposed(int row_num, const _Float16 *in,
             accPtr, _mm256_fmadd_ps(inVec, bVec, _mm256_loadu_ps(accPtr)));
         }
 
-        float *remPtr = &sumRem[(size_t)h * rem];
-        int base = num_blocks * 8;
-        for (int r = 0; r < rem; ++r) {
-          remPtr[r] += a_val * static_cast<float>(vptr[base + r]);
+        if (rem > 0) {
+          float *remPtr = &sumRem[(size_t)h * rem];
+          int base = num_blocks * 8;
+          for (int r = 0; r < rem; ++r) {
+            remPtr[r] += a_val * static_cast<float>(vptr[base + r]);
+          }
         }
       }
     }
@@ -1953,11 +1955,13 @@ void compute_fp16vcache_transposed(int row_num, const _Float16 *in,
           &output[out_base],
           _mm256_loadu_ps(&sumVec[(size_t)(h * num_blocks + b) * 8]));
       }
-      float *remPtr = &sumRem[(size_t)h * rem];
-      int base = num_blocks * 8;
-      for (int r = 0; r < rem; ++r) {
-        output[(n * gqa_size + h) * head_dim + base + r] =
-          static_cast<_Float16>(remPtr[r]);
+      if (rem > 0) {
+        float *remPtr = &sumRem[(size_t)h * rem];
+        int base = num_blocks * 8;
+        for (int r = 0; r < rem; ++r) {
+          output[(n * gqa_size + h) * head_dim + base + r] =
+            static_cast<_Float16>(remPtr[r]);
+        }
       }
     }
   }
