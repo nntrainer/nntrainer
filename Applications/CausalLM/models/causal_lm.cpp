@@ -242,6 +242,68 @@ std::pair<Tensor, Tensor> CausalLM::constructModel() {
   return {x, y};
 }
 
+namespace {
+// Returns true if `s` ends with an incomplete UTF-8 byte sequence — i.e. a
+// multi-byte lead byte whose continuation bytes have not all arrived yet.
+// During streaming, a single multi-byte character (e.g. a Korean syllable such
+// as '똻', encoded as 3 UTF-8 bytes) can be split across consecutive BPE
+// tokens. Decoding each token's bytes individually yields a half-formed code
+// point that renders as broken glyphs (U+FFFD). We use this to hold the delta
+// until the character is fully decoded before emitting it to the streamer.
+bool endsWithIncompleteUtf8(const std::string &s) {
+  const size_t n = s.size();
+  if (n == 0)
+    return false;
+
+  // Walk back over trailing continuation bytes (10xxxxxx) to find the lead.
+  size_t lead = n - 1;
+  size_t trailing_cont = 0;
+  while ((static_cast<unsigned char>(s[lead]) & 0xc0) == 0x80) {
+    ++trailing_cont;
+    if (lead == 0 || trailing_cont >= 4)
+      return false; // no lead byte in range / malformed: don't hold
+    --lead;
+  }
+
+  const unsigned char head = static_cast<unsigned char>(s[lead]);
+  size_t expected;
+  if ((head & 0x80) == 0x00)
+    expected = 1; // ASCII, always complete
+  else if ((head & 0xe0) == 0xc0)
+    expected = 2;
+  else if ((head & 0xf0) == 0xe0)
+    expected = 3;
+  else if ((head & 0xf8) == 0xf0)
+    expected = 4;
+  else
+    return false; // invalid lead byte: don't hold
+
+  const size_t have = n - lead; // bytes present for the final character
+  return have < expected;       // incomplete -> hold until it completes
+}
+
+// Returns true if `s` ends with the UTF-8 replacement character U+FFFD
+// (bytes EF BF BD). The HuggingFace (Rust `tokenizers`) backend decodes via
+// String::from_utf8_lossy, which substitutes U+FFFD for byte-fallback bytes
+// that do not yet form a complete code point. So when a multi-byte character
+// (e.g. a Korean syllable) is split across consecutive <0xHH> byte-fallback
+// tokens, a partial Decode() returns a trailing U+FFFD rather than the raw
+// incomplete bytes that endsWithIncompleteUtf8() looks for. A trailing U+FFFD
+// therefore also signals "the character is still being assembled".
+bool endsWithReplacementChar(const std::string &s) {
+  return s.size() >= 3 && static_cast<unsigned char>(s[s.size() - 3]) == 0xef &&
+         static_cast<unsigned char>(s[s.size() - 2]) == 0xbf &&
+         static_cast<unsigned char>(s[s.size() - 1]) == 0xbd;
+}
+
+// Upper bound on how many byte-fallback tokens we hold while waiting for a
+// multi-byte character to complete. A UTF-8 code point is at most 4 bytes, so
+// a valid character always resolves within this window; the cap keeps
+// genuinely invalid model output (a stray byte that never completes) from
+// stalling the stream forever.
+constexpr size_t kMaxHeldByteTokens = 6;
+} // namespace
+
 void CausalLM::registerOutputs(
   std::unique_ptr<tokenizers::Tokenizer> &tokenizer,
   std::vector<unsigned int> ids, unsigned int pos,
@@ -261,9 +323,16 @@ void CausalLM::registerOutputs(
       if (std::find(puncts.begin(), puncts.end(), decoded_str.back()) !=
           puncts.end()) {
         // last symbol is a punctuation, hold on
-      } else if (decoded_str.size() >= 3 &&
-                 decoded_str.compare(decoded_str.size() - 3, 3, "") == 0) {
-        // ends with an incomplete token, hold on
+      } else if (pending_ids_.size() <= kMaxHeldByteTokens &&
+                 (endsWithIncompleteUtf8(decoded_str) ||
+                  endsWithReplacementChar(decoded_str))) {
+        // A multi-byte character (e.g. a Korean syllable like '똻') is split
+        // across consecutive byte-fallback tokens and not yet complete.
+        // Native BPE decode leaves the trailing bytes incomplete; the
+        // HuggingFace backend leaves a trailing U+FFFD. Either way, hold and
+        // keep accumulating pending_ids_ until the character finishes, so we
+        // never stream a half-formed glyph. Bounded by kMaxHeldByteTokens so
+        // genuinely invalid output still drains instead of stalling.
       } else {
         // Only print to stdout if we're not streaming (streamer handles output)
         if (log_output && streamer_ == nullptr) {
