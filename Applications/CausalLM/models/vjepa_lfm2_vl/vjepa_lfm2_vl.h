@@ -111,7 +111,7 @@ public:
    */
   void run_video(const std::vector<std::vector<float>> &frames,
                  const std::string &prompt, bool do_sample = false,
-                 bool log_output = true);
+                 bool log_output = true) override;
 
   /**
    * @brief Run with text-only prompt (no video). Delegates to LLM.

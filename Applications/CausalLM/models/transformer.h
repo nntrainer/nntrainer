@@ -209,6 +209,24 @@ public:
   virtual int imagePlaceholderTokenId() const { return -1; }
 
   /**
+   * @brief Run a full video→text pipeline from pre-loaded frames.
+   *
+   * Video-language models (e.g. Lfm2VLVJepa21BModel) own their vision encoder,
+   * projector and LM internally and expose this single entry point. @p frames
+   * holds @c num_frames tensors, each laid out [C, H, W]. Default
+   * implementation means "this model is not a video-language model".
+   */
+  virtual void run_video(const std::vector<std::vector<float>> &frames,
+                         const std::string &prompt, bool do_sample,
+                         bool log_output) {
+    (void)frames;
+    (void)prompt;
+    (void)do_sample;
+    (void)log_output;
+    throw std::runtime_error("run_video not supported by this model");
+  }
+
+  /**
    * @brief Get TransformerPerformanceMetrics
    */
   TransformerPerformanceMetrics getPerformanceMetrics() const {
