@@ -118,8 +118,7 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
       nntr_cfg["tokenizer_file"].is_null()) {
     tokenizer = nullptr; // No tokenizer for this model
   } else {
-    tokenizer = tokenizers::Tokenizer::FromBlobJSON(
-      LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+    tokenizer = LoadTokenizer(nntr_cfg);
   }
 };
 
