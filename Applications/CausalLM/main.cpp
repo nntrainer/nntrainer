@@ -485,10 +485,7 @@ int main(int argc, char *argv[]) {
 #ifdef PROFILE
       start_peak_tracker();
 #endif
-      vl_model.run_video_bin(video_path, static_cast<int>(num_frames),
-                             static_cast<int>(frame_height),
-                             static_cast<int>(frame_width), input_text,
-                             do_sample, true);
+      vl_model.run_video_bin(video_path, input_text, do_sample, true);
 #ifdef PROFILE
       stop_and_print_peak();
 #endif

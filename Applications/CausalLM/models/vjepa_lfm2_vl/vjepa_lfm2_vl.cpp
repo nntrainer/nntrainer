@@ -526,41 +526,85 @@ void VjepaLfm2ForConditionalGeneration::run_video(
 }
 
 /* -------------------------------------------------------------------------
+ * loadFramesFromBin (helper to convert binary data to frames)
+ * ---------------------------------------------------------------------- */
+
+std::vector<std::vector<float>>
+VjepaLfm2ForConditionalGeneration::loadFramesFromBin(
+  const std::string &video_bin_path) const {
+  auto [text_cfg, vision_cfg] = splitConfig(cfg_);
+  const unsigned int num_frames = vision_cfg.contains("num_frames")
+                                    ? vision_cfg["num_frames"].get<unsigned int>()
+                                    : 16u;
+  const unsigned int img_size = imageSizeFromVisionConfig(vision_cfg);
+  const size_t total_size = static_cast<size_t>(3) * num_frames * img_size * img_size;
+
+  // Load the raw float32 [C, T, H, W] binary file
+  std::ifstream bin_file(video_bin_path, std::ios::binary);
+  if (!bin_file.is_open()) {
+    throw std::runtime_error(
+      "VjepaLfm2ForConditionalGeneration::loadFramesFromBin: "
+      "cannot open binary file: " +
+      video_bin_path);
+  }
+
+  std::vector<float> video_buffer(total_size);
+  bin_file.read(reinterpret_cast<char *>(video_buffer.data()),
+                total_size * sizeof(float));
+
+  const size_t bytes_read = static_cast<size_t>(bin_file.gcount());
+  if (bytes_read != total_size * sizeof(float)) {
+    throw std::runtime_error(
+      "VjepaLfm2ForConditionalGeneration::loadFramesFromBin: "
+      "file size mismatch; got " +
+      std::to_string(bytes_read / sizeof(float)) + " floats, expected " +
+      std::to_string(total_size));
+  }
+  bin_file.close();
+
+  // Convert [T, C, H, W] to vector of [C*H*W] frames
+  std::vector<std::vector<float>> frames;
+  frames.reserve(num_frames);
+
+  const size_t frame_size = static_cast<size_t>(3) * img_size * img_size;
+  for (unsigned int t = 0; t < num_frames; ++t) {
+    const size_t frame_offset = static_cast<size_t>(t) * frame_size;
+    std::vector<float> frame(video_buffer.begin() + frame_offset,
+                             video_buffer.begin() + frame_offset + frame_size);
+    frames.push_back(std::move(frame));
+  }
+
+  return frames;
+}
+
+/* -------------------------------------------------------------------------
  * run_video_bin (with .bin file path)
  * ---------------------------------------------------------------------- */
 
 void VjepaLfm2ForConditionalGeneration::run_video_bin(
-  const std::string &video_bin_path, int numFrames, int frameHeight,
-  int frameWidth, const std::string &prompt, bool do_sample,
+  const std::string &video_bin_path, const std::string &prompt, bool do_sample,
   bool log_output) {
-  (void)numFrames;
-  (void)frameHeight;
-  (void)frameWidth;
-
   if (!initialized_) {
     throw std::runtime_error(
       "VjepaLfm2ForConditionalGeneration: call initialize() first");
   }
 
-  // ── 1. VJEPA2 ViT Encoder (loads bin, patchifies, runs inference) ──
-  auto [vision_ptr, vision_size] =
-    vjepa_->run_with_bin(video_bin_path, log_output);
+  if (video_bin_path.empty()) {
+    throw std::invalid_argument(
+      "VjepaLfm2ForConditionalGeneration::run_video_bin: "
+      "video_bin_path must not be empty");
+  }
 
-  // Compute num_patches from vision config
-  auto [text_cfg, vision_cfg] = splitConfig(cfg_);
-  const unsigned int num_frames = vision_cfg.contains("num_frames")
-                                    ? vision_cfg["num_frames"].get<unsigned int>()
-                                    : 16u;
-  const unsigned int tubelet_size = vision_cfg.value("tubelet_size", 2u);
-  const unsigned int img_size = imageSizeFromVisionConfig(vision_cfg);
-  const unsigned int patch_size = vision_cfg.value("patch_size", 16u);
-  const unsigned int grid_t = num_frames / tubelet_size;
-  const unsigned int grid_h = img_size / patch_size;
-  const unsigned int grid_w = img_size / patch_size;
-  const unsigned int num_patches = grid_t * grid_h * grid_w;
+  // Load binary as frames and delegate to run_video()
+  std::vector<std::vector<float>> frames = loadFramesFromBin(video_bin_path);
 
-  // ── 2. Projector + merge + LM ─────────────────────────────────────
-  runVisionToLM(vision_ptr, num_patches, prompt, do_sample, log_output);
+  if (log_output) {
+    std::cout << "[VJepaLFM2-VL] Loaded " << frames.size()
+              << " frames from binary: " << video_bin_path << std::endl;
+  }
+
+  // Delegate to run_video() which handles all processing
+  run_video(frames, prompt, do_sample, log_output);
 }
 
 /* -------------------------------------------------------------------------

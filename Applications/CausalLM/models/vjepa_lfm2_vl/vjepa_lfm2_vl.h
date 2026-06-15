@@ -8,8 +8,8 @@
  * @brief  V-JEPA 2.1 + Projector + LFM2 multimodal video-language model.
  *
  *         Pipeline:
- *           run_video():  frames → VJEPA2ViT::run_image()
- *           run_video_bin(): .bin → VJEPA2ViT::run_with_bin()
+ *           run_video_bin(): .bin → convert to frames → run_video()
+ *           run_video(): frames → VJEPA2ViT::run_image()
  *           → runVisionToLM() → VjepaProjector::run()
  *           → merge text+vision embeddings
  *           → Lfm2CausalLM::run_with_embeddings() → generate tokens
@@ -90,17 +90,14 @@ public:
    * @brief Run the full VL pipeline with a preprocessed .bin video file.
    *
    * The .bin file is raw float32 in [C, T, H, W] layout.
+   * Dimensions are automatically obtained from vision_config.
    *
    * @param video_bin_path  Path to preprocessed .bin video tensor file
-   * @param numFrames       Number of frames in the file
-   * @param frameHeight     Frame height (default 256)
-   * @param frameWidth      Frame width (default 256)
    * @param prompt          Text prompt
    * @param do_sample       Whether to sample during generation
    * @param log_output      Whether to log output
    */
-  void run_video_bin(const std::string &video_bin_path, int numFrames,
-                     int frameHeight, int frameWidth,
+  void run_video_bin(const std::string &video_bin_path,
                      const std::string &prompt, bool do_sample = false,
                      bool log_output = true);
 
@@ -182,6 +179,17 @@ private:
     const std::vector<std::string> &text_segments,
     const float *video_embeds, unsigned int num_video_tokens,
     unsigned int vision_tokens_per_video);
+
+  /**
+   * @brief Load frames from a preprocessed binary video file.
+   *
+   * Converts [C, T, H, W] layout to vector of [C*H*W] frames.
+   *
+   * @param video_bin_path  Path to preprocessed .bin video tensor file
+   * @return Vector of frames, each frame is [C*H*W] floats
+   */
+  std::vector<std::vector<float>>
+  loadFramesFromBin(const std::string &video_bin_path) const;
 
   /**
    * @brief Run the projector + merge + LM pipeline from vision encoder output.
