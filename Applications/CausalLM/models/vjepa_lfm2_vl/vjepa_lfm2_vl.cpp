@@ -562,15 +562,22 @@ VjepaLfm2ForConditionalGeneration::loadFramesFromBin(
   }
   bin_file.close();
 
-  // Convert [T, C, H, W] to vector of [C*H*W] frames
+  // Convert [C, T, H, W] to vector of [C*H*W] frames
+  // Layout: video[c * T * H * W + t * H * W + h * W + w]
   std::vector<std::vector<float>> frames;
   frames.reserve(num_frames);
 
-  const size_t frame_size = static_cast<size_t>(3) * img_size * img_size;
+  const size_t frame_plane = static_cast<size_t>(img_size) * img_size;
+  const size_t frame_size = static_cast<size_t>(3) * frame_plane;
+
   for (unsigned int t = 0; t < num_frames; ++t) {
-    const size_t frame_offset = static_cast<size_t>(t) * frame_size;
-    std::vector<float> frame(video_buffer.begin() + frame_offset,
-                             video_buffer.begin() + frame_offset + frame_size);
+    std::vector<float> frame(frame_size);
+    for (unsigned int c = 0; c < 3; ++c) {
+      const size_t src_offset = (static_cast<size_t>(c) * num_frames + t) * frame_plane;
+      const size_t dst_offset = static_cast<size_t>(c) * frame_plane;
+      std::copy_n(video_buffer.data() + src_offset, frame_plane,
+                  frame.data() + dst_offset);
+    }
     frames.push_back(std::move(frame));
   }
 
