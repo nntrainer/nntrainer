@@ -105,13 +105,15 @@ public:
    * @brief Run the full VL pipeline with pre-loaded frames.
    *
    * @param frames          Vector of frame tensors, each [C, H, W]
-   * @param prompt          Text prompt
+   * @param prompt          Text prompt (user turn)
+   * @param system_prompt   System-role text (empty ⇒ "You are a helpful
+   *                        assistant.")
    * @param do_sample       Whether to sample during generation
    * @param log_output      Whether to log output
    */
   void run_video(const std::vector<std::vector<float>> &frames,
-                 const std::string &prompt, bool do_sample = false,
-                 bool log_output = true) override;
+                 const std::string &prompt, const std::string &system_prompt,
+                 bool do_sample = false, bool log_output = true) override;
 
   /**
    * @brief Run with text-only prompt (no video). Delegates to LLM.
@@ -169,6 +171,7 @@ private:
    */
   std::vector<std::string>
   applyVideoChatTemplate(const std::string &prompt,
+                         const std::string &system_prompt,
                          float video_duration) const;
 
   /**
@@ -198,12 +201,14 @@ private:
    *
    * @param vision_ptr    Pointer to vision encoder output (NUM_PATCHES * DIM floats).
    * @param num_patches   Number of vision patches from the encoder.
-   * @param prompt        Text prompt.
+   * @param prompt        Text prompt (user turn).
+   * @param system_prompt System-role text (empty ⇒ default).
    * @param do_sample     Whether to sample during generation.
    * @param log_output    Whether to log output.
    */
   void runVisionToLM(const void *vision_ptr, unsigned int num_patches,
-                     const std::string &prompt, bool do_sample,
+                     const std::string &prompt,
+                     const std::string &system_prompt, bool do_sample,
                      bool log_output);
 };
 

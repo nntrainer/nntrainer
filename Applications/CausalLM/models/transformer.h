@@ -213,14 +213,17 @@ public:
    *
    * Video-language models (e.g. Lfm2VLVJepa21BModel) own their vision encoder,
    * projector and LM internally and expose this single entry point. @p frames
-   * holds @c num_frames tensors, each laid out [C, H, W]. Default
+   * holds @c num_frames tensors, each laid out [C, H, W]. @p system_prompt is
+   * the system-role text for the chat template (empty ⇒ model default). Default
    * implementation means "this model is not a video-language model".
    */
   virtual void run_video(const std::vector<std::vector<float>> &frames,
-                         const std::string &prompt, bool do_sample,
+                         const std::string &prompt,
+                         const std::string &system_prompt, bool do_sample,
                          bool log_output) {
     (void)frames;
     (void)prompt;
+    (void)system_prompt;
     (void)do_sample;
     (void)log_output;
     throw std::runtime_error("run_video not supported by this model");

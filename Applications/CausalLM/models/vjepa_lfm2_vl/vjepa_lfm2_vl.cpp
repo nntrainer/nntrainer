@@ -296,12 +296,16 @@ void VjepaLfm2ForConditionalGeneration::load_weight(
 
 std::vector<std::string>
 VjepaLfm2ForConditionalGeneration::applyVideoChatTemplate(
-  const std::string &prompt, float video_duration) const {
+  const std::string &prompt, const std::string &system_prompt,
+  float video_duration) const {
   std::vector<std::string> segments;
 
-  // First segment: system prompt + start of user
-  segments.push_back("<|startoftext|><|im_start|>system\nYou are a helpful "
-                     "assistant.<|im_end|>\n<|im_start|>user\n");
+  // First segment: system prompt + start of user. An empty system_prompt
+  // falls back to the default assistant persona.
+  const std::string sys =
+    system_prompt.empty() ? "You are a helpful assistant." : system_prompt;
+  segments.push_back("<|startoftext|><|im_start|>system\n" + sys +
+                     "<|im_end|>\n<|im_start|>user\n");
 
   // Segments between <video> tags (timestamps)
   const float time_per_video = video_duration / num_video_tags_;
@@ -404,7 +408,8 @@ VjepaLfm2ForConditionalGeneration::mergeTextVideoEmbeddings(
 
 void VjepaLfm2ForConditionalGeneration::runVisionToLM(
   const void *vision_ptr, unsigned int num_patches,
-  const std::string &prompt, bool do_sample, bool log_output) {
+  const std::string &prompt, const std::string &system_prompt, bool do_sample,
+  bool log_output) {
 
   auto [text_cfg, vision_cfg] = splitConfig(cfg_);
   const unsigned int num_frames = vision_cfg.contains("num_frames")
@@ -440,7 +445,8 @@ void VjepaLfm2ForConditionalGeneration::runVisionToLM(
     static_cast<float>(num_frames) / vision_cfg.value("target_fps", 4u);
   const unsigned int vision_tokens_per_video = output_tokens / num_video_tags_;
 
-  auto text_segments = applyVideoChatTemplate(prompt, video_duration);
+  auto text_segments =
+    applyVideoChatTemplate(prompt, system_prompt, video_duration);
 
   const float *proj_data = static_cast<const float *>(proj_ptr);
   auto [inputs_embeds, actual_total_tokens] = mergeTextVideoEmbeddings(
@@ -481,7 +487,8 @@ void VjepaLfm2ForConditionalGeneration::runVisionToLM(
 
 void VjepaLfm2ForConditionalGeneration::run_video(
   const std::vector<std::vector<float>> &frames,
-  const std::string &prompt, bool do_sample, bool log_output) {
+  const std::string &prompt, const std::string &system_prompt, bool do_sample,
+  bool log_output) {
   if (!initialized_) {
     throw std::runtime_error(
       "VjepaLfm2ForConditionalGeneration: call initialize() first");
@@ -522,7 +529,8 @@ void VjepaLfm2ForConditionalGeneration::run_video(
     vjepa_->run_image(frames, img_size, img_size, log_output);
 
   // ── 2. Projector + merge + LM ─────────────────────────────────────
-  runVisionToLM(vision_ptr, num_patches, prompt, do_sample, log_output);
+  runVisionToLM(vision_ptr, num_patches, prompt, system_prompt, do_sample,
+                log_output);
 }
 
 /* -------------------------------------------------------------------------
@@ -610,8 +618,10 @@ void VjepaLfm2ForConditionalGeneration::run_video_bin(
               << " frames from binary: " << video_bin_path << std::endl;
   }
 
-  // Delegate to run_video() which handles all processing
-  run_video(frames, prompt, do_sample, log_output);
+  // Delegate to run_video() which handles all processing. The .bin/CLI path
+  // keeps the default system persona (empty ⇒ "You are a helpful assistant.").
+  run_video(frames, prompt, /*system_prompt=*/std::string(), do_sample,
+            log_output);
 }
 
 /* -------------------------------------------------------------------------
