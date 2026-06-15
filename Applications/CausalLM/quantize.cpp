@@ -84,6 +84,9 @@
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include "vjepa2_vit/vjepa2_vit.h"
+#include "vjepa2_vit/vjepa_projector.h"
+#include "lfm2/lfm2_causallm.h"
+
 
 using json = nlohmann::json;
 using DataType = ml::train::TensorDim::DataType;
@@ -250,7 +253,6 @@ std::string resolve_architecture(std::string model_type,
   if (architecture == "Gemma4ForConditionalGeneration") {
     return "Gemma4ForCausalLM";
   }
-
   if (architecture == "vjepa2_1_vit_base_384")
     return "VJEPA2ViT";
 
@@ -346,10 +348,18 @@ void registerAllModels() {
                             cfg, generation_cfg, nntr_cfg);
                         });
   factory.registerModel("VJEPA2ViT",
-                        [](json cfg, json generation_cfg, json nntr_cfg) {
-                          return std::make_unique<causallm::VJEPA2ViT>(
-                            cfg, generation_cfg, nntr_cfg);
-                        });
+    [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::VJEPA2ViT>(
+        cfg, generation_cfg, nntr_cfg);
+    });
+  factory.registerModel(
+    "Lfm2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Lfm2CausalLM>(cfg, generation_cfg, nntr_cfg);
+    });
+  factory.registerModel(
+    "VjepaProjector", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::VjepaProjector>(cfg, generation_cfg, nntr_cfg);
+    });
 }
 
 /**
@@ -483,9 +493,19 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       // PLE - gemma4
       dtype_map[prefix + "_ple_projection"] = fc_dtype;
       dtype_map[prefix + "_ple_input_gate"] = fc_dtype;
+
+      // LFM FC layers
+      dtype_map[prefix + "_conv_in_proj"] = fc_dtype;
+      dtype_map[prefix + "_conv_out_proj"] = fc_dtype;
     }
   }
 
+  // VjepaProjector merger FC layers
+  if (fc_dtype != DataType::FP32 && fc_dtype != DataType::NONE) {
+    dtype_map["merger_fc1"] = fc_dtype;
+    dtype_map["merger_fc2"] = fc_dtype;
+    dtype_map["merger_fc3"] = fc_dtype;
+  }
   // LM Head layer
   if (include_lmhead && lmhead_dtype != DataType::FP32 &&
       lmhead_dtype != DataType::NONE) {

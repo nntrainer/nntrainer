@@ -23,6 +23,19 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc);
 
+#ifdef ENABLE_FP16
+// _FP16 is provided by tensor_dim.h (#define _FP16 __fp16) when ENABLE_FP16
+// is on. Use __fp16 directly here so the declaration is self-contained even
+// if a caller pulls this header in without tensor_dim.h.
+void nntr_gemm_q4_0_4x8_q8_0_fp16(int n, __fp16 *__restrict s, size_t bs,
+                                  const void *__restrict vx,
+                                  const void *__restrict vy, int nr, int nc);
+
+void nntr_gemv_q4_0_4x8_q8_0_fp16(int n, __fp16 *__restrict s, size_t bs,
+                                  const void *__restrict vx,
+                                  const void *__restrict vy, int nr, int nc);
+#endif
+
 void nntr_gemm_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc);

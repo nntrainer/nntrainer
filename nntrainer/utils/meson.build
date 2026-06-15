@@ -29,6 +29,7 @@ util_headers = [
   'thread_manager.h',
   'thread_manager_util.h',
   'safetensors_util.h',
+  'perf_profile.h',
 ]
 
 if get_option('enable-trace')

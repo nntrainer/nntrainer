@@ -132,9 +132,9 @@ void VjepaRopeLayer::forwarding(nntrainer::RunLayerContext &context,
   }
 }
 
-void VjepaRopeLayer::incremental_forwarding(
-  nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
-  bool training) {
+void VjepaRopeLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
+                                            unsigned int from, unsigned int to,
+                                            bool training) {
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
 

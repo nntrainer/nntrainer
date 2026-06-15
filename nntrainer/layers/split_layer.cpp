@@ -137,6 +137,41 @@ void SplitLayer::forwarding(RunLayerContext &context, bool training) {
   input_.reshape(in_dim);
 }
 
+void SplitLayer::incremental_forwarding(RunLayerContext &context,
+                                        unsigned int from, unsigned int to,
+                                        bool training) {
+  unsigned int split_number = std::get<props::SplitNumber>(split_props);
+  unsigned int split_dimension =
+    std::get<props::SplitDimension>(split_props).get();
+
+  // Only optimize the width-split (axis=3) case with a direct memcpy.
+  // For other axes (height, channel) or for prefill, fall back to forwarding().
+  if (split_dimension != 3) {
+    forwarding(context, training);
+    return;
+  }
+
+  Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  const unsigned int B = input_.batch();
+  const unsigned int num_steps = to - from; // 1 for decode
+  const unsigned int split_w = input_.width() / split_number;
+
+  // For each actual batch and each valid time step, copy only split_w floats
+  // from the chunk at [b, 0, s, idx*split_w] into output[b, 0, s, 0].
+  // This is O(B * num_steps * split_number * split_w) vs the full
+  // O(B * INIT_SEQ_LEN * split_number * split_w) of forwarding().
+  for (unsigned int b = 0; b < B; ++b) {
+    for (unsigned int s = 0; s < num_steps; ++s) {
+      for (unsigned int idx = 0; idx < split_number; ++idx) {
+        Tensor &output_ = context.getOutput(idx);
+        const float *src = input_.getAddress(b, 0, s, idx * split_w);
+        float *dst = output_.getAddress(b, 0, s, 0);
+        std::memcpy(dst, src, split_w * sizeof(float));
+      }
+    }
+  }
+}
+
 void SplitLayer::calcDerivative(RunLayerContext &context) {
   unsigned int split_number = std::get<props::SplitNumber>(split_props);
 

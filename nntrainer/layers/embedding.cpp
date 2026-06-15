@@ -40,6 +40,10 @@ void EmbeddingLayer::finalize(InitLayerContext &context) {
   NNTR_THROW_IF(input_dim.channel() != 1, std::invalid_argument)
     << "Embedding layer takes only one for channel size";
 
+  // Token-ID input expected (caller responsibility). Input dtype check
+  // removed so the layer can sit between an FP32 input layer and FP16
+  // activation downstream.
+
   auto &weight_regularizer =
     std::get<props::WeightRegularizer>(*layer_impl_props);
   auto &weight_regularizer_constant =

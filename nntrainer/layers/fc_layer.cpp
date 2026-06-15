@@ -28,6 +28,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <perf_profile.h>
 #include <util_func.h>
 
 #include <iostream>
@@ -96,14 +97,16 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   // global configuration
 
   /** Bias Dimension : (1, 1, 1, unit) */
-  /// @note bias is directly added to activation
-  /// since we have no dequantizer for add operation,
-  /// we have to set its data type as same as activation.
-  /// This should be updated when the dequantizer is supported.
-  TensorDim bias_dim(
-    1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
-    TensorDim::TensorType(context.getFormat(), context.getActivationDataType()),
-    is_nchw ? 0b0001 : 0b0100);
+  /// @note Bias is stored FP32 on disk (it is not quantized), so request it as
+  /// FP32 regardless of the activation dtype. Under an FP16 activation the bias
+  /// is cast down to FP16 at the add site below; declaring it FP16 here would
+  /// instead reinterpret the FP32 on-disk bytes as FP16 and corrupt every
+  /// biased FC (e.g. V-JEPA's patch-embed / qkv / ffn projections — Qwen3 has
+  /// no FC bias so this path was never exercised before).
+  TensorDim bias_dim(1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
+                     TensorDim::TensorType(context.getFormat(),
+                                           TensorDim::DataType::FP32),
+                     is_nchw ? 0b0001 : 0b0100);
 
   /** Weight Dimension : (1, 1, in_dim.width(), unit)*/
   TensorDim weight_dim(
@@ -234,7 +237,12 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
-    hidden_.add_i(bias);
+    if (bias.getDataType() != hidden_.getDataType()) {
+      Tensor bias_cast = bias.clone(hidden_.getDataType());
+      hidden_.add_i(bias_cast);
+    } else {
+      hidden_.add_i(bias);
+    }
   }
 }
 
@@ -245,6 +253,9 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+  PERF_SCOPE(input_.getDataType() == TensorDim::DataType::FP32
+               ? "FC.inc_fwd[fp32]"
+               : "FC.inc_fwd[fp16]");
   Tensor loraA, loraB, hidden_tmp_lora, hidden_out_lora;
 
   bool is_prefill = !from;
@@ -309,7 +320,12 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
     if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
         disable_bias.empty() || disable_bias.get() == false) {
       Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
-      hidden_step.add_i(bias);
+      if (bias.getDataType() != hidden_step.getDataType()) {
+        Tensor bias_cast = bias.clone(hidden_step.getDataType());
+        hidden_step.add_i(bias_cast);
+      } else {
+        hidden_step.add_i(bias);
+      }
     }
   }
 }

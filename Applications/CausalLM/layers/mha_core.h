@@ -391,18 +391,26 @@ private:
   bool use_gemm_attention = false;
 
   /**
-   * @brief GEMM-based non-causal attention for one batch (encoder path).
-   *        Computes, per head, scores = (Q Kᵀ)/sqrt(d) via (s)gemm, a row
-   *        softmax, then out = scores V via (s)gemm. Q is FP32; the K/V cache
-   *        may be FP16 (-> shgemm) or FP32 (-> sgemm). Uses one reusable
-   *        [seq x seq] FP32 score buffer (per head) instead of the full
-   *        [seq x seq x num_heads] buffer.
+   * @brief GEMM-based flash attention for one batch (covers both encoder
+   *        non-causal and causal-LLM prefill paths).
+   *        2-phase: (1) de-interleave Q (num_heads_Q heads) and K/V
+   *        (num_heads_KV heads) into shared contiguous [H,N,d] buffers; (2)
+   *        balanced parallel_for over (h_q, query_block) units with online
+   *        softmax over key-blocks (shgemm QK -> NEON exp -> shgemm AV).
+   *        GQA: h_kv = h_q / gqa_size. Causal: key-block upper-bound break
+   *        + in-block boundary mask. Sliding window: key-block lower-bound
+   *        skip + in-block lower mask.
+   * @param[in] N_kv      total cache length (= cache_to, keys [0, N_kv))
+   * @param[in] N_q       step length (= step_size, rows of the output)
+   * @param[in] cache_from absolute starting position of queries in the cache
+   *                      (so q_abs(i) = cache_from + i, k_abs(k) = k)
    */
-  void gemm_attention_noncausal(nntrainer::Tensor &query_step,
-                                nntrainer::Tensor &b_cached_key,
-                                nntrainer::Tensor &b_cached_value,
-                                nntrainer::Tensor &attention_output_step,
-                                unsigned int seq_len);
+  void gemm_attention(nntrainer::Tensor &query_step,
+                      nntrainer::Tensor &b_cached_key,
+                      nntrainer::Tensor &b_cached_value,
+                      nntrainer::Tensor &attention_output_step,
+                      unsigned int N_kv, unsigned int N_q,
+                      unsigned int cache_from);
 
   enum INOUT_INDEX {
     /** input index */

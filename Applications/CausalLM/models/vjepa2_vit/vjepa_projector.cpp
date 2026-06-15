@@ -49,6 +49,7 @@ void VjepaProjector::setupParameters(json &cfg, json &generation_cfg,
   INPUT_DIM = VISION_DIM * (DOWNSAMPLE_FACTOR * DOWNSAMPLE_FACTOR);
   MERGER_HIDDEN_1 = cfg.value("merger_hidden_1", 3072);
   MERGER_HIDDEN_2 = cfg.value("merger_hidden_2", 1536);
+  NUM_MERGER_FC = nntr_cfg.value("num_merger_fc", cfg.value("num_merger_fc", 2u));
   TEXT_DIM = cfg.value("hidden_size", 1024);
 
   // Token counts
@@ -86,7 +87,16 @@ void VjepaProjector::setupParameters(json &cfg, json &generation_cfg,
 /**
  * @brief Construct the symbolic projector graph.
  *
- * VoRA merger architecture:
+ * Supports two merger architectures controlled by NUM_MERGER_FC:
+ *
+ * NUM_MERGER_FC=2 (PyTorch reference, 2-FC merger):
+ *   input[B, 1, OUTPUT_TOKENS, INPUT_DIM]
+ *     → LayerNorm(INPUT_DIM)
+ *     → FC(INPUT_DIM → MERGER_HIDDEN_1, bias) → GELU
+ *     → FC(MERGER_HIDDEN_1 → TEXT_DIM, bias)
+ *   → output[B, 1, OUTPUT_TOKENS, TEXT_DIM]
+ *
+ * NUM_MERGER_FC=3 (legacy 3-FC merger):
  *   input[B, 1, OUTPUT_TOKENS, INPUT_DIM]
  *     → LayerNorm(INPUT_DIM)
  *     → FC(INPUT_DIM → MERGER_HIDDEN_1, bias) → GELU
@@ -121,40 +131,50 @@ std::pair<Tensor, Tensor> VjepaProjector::constructModel() {
     createLayer("vjepa_gelu", {withKey("name", "merger_gelu1")}));
   h = gelu1(h);
 
-  // FC2: MERGER_HIDDEN_1 → MERGER_HIDDEN_2
-  LayerHandle fc2(createLayer(
-    "fully_connected",
-    {withKey("name", "merger_fc2"),
-     withKey("unit", std::to_string(MERGER_HIDDEN_2)),
-     withKey("disable_bias", "false")}));
-  h = fc2(h);
+  if (NUM_MERGER_FC == 2) {
+    // 2-FC merger: FC2 goes directly to TEXT_DIM
+    LayerHandle fc2(createLayer(
+      "fully_connected",
+      {withKey("name", "merger_fc2"),
+       withKey("unit", std::to_string(TEXT_DIM)),
+       withKey("disable_bias", "false")}));
+    h = fc2(h);
+  } else {
+    // 3-FC merger (legacy): FC2 → GELU → LN → FC3 → LN
+    LayerHandle fc2(createLayer(
+      "fully_connected",
+      {withKey("name", "merger_fc2"),
+       withKey("unit", std::to_string(MERGER_HIDDEN_2)),
+       withKey("disable_bias", "false")}));
+    h = fc2(h);
 
-  // GELU
-  LayerHandle gelu2(
-    createLayer("vjepa_gelu", {withKey("name", "merger_gelu2")}));
-  h = gelu2(h);
+    // GELU
+    LayerHandle gelu2(
+      createLayer("vjepa_gelu", {withKey("name", "merger_gelu2")}));
+    h = gelu2(h);
 
-  // LayerNorm(MERGER_HIDDEN_2)
-  LayerHandle ln2(createLayer(
-    "vjepa_layernorm",
-    {withKey("name", "merger_ln2"),
-     withKey("epsilon", "1e-5")}));
-  h = ln2(h);
+    // LayerNorm(MERGER_HIDDEN_2)
+    LayerHandle ln2(createLayer(
+      "vjepa_layernorm",
+      {withKey("name", "merger_ln2"),
+       withKey("epsilon", "1e-5")}));
+    h = ln2(h);
 
-  // FC3: MERGER_HIDDEN_2 → TEXT_DIM
-  LayerHandle fc3(createLayer(
-    "fully_connected",
-    {withKey("name", "merger_fc3"),
-     withKey("unit", std::to_string(TEXT_DIM)),
-     withKey("disable_bias", "false")}));
-  h = fc3(h);
+    // FC3: MERGER_HIDDEN_2 → TEXT_DIM
+    LayerHandle fc3(createLayer(
+      "fully_connected",
+      {withKey("name", "merger_fc3"),
+       withKey("unit", std::to_string(TEXT_DIM)),
+       withKey("disable_bias", "false")}));
+    h = fc3(h);
 
-  // LayerNorm(TEXT_DIM)
-  LayerHandle ln3(createLayer(
-    "vjepa_layernorm",
-    {withKey("name", "merger_ln3"),
-     withKey("epsilon", "1e-5")}));
-  h = ln3(h);
+    // LayerNorm(TEXT_DIM)
+    LayerHandle ln3(createLayer(
+      "vjepa_layernorm",
+      {withKey("name", "merger_ln3"),
+       withKey("epsilon", "1e-5")}));
+    h = ln3(h);
+  }
 
   return {input, h};
 }

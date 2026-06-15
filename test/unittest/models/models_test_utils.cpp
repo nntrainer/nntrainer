@@ -136,9 +136,36 @@ public:
     auto in_dims = nn->getInputDimension();
     auto out_dims = nn->getOutputDimension();
 
+    // The golden-file recorder (recorder_v2.py) always writes inputs, labels,
+    // and outputs as float32 with a 4-byte (int32) element-count prefix.  When
+    // the model's input/output dtype is FP16 the tensors constructed directly
+    // from the model dims would be read with a 2-byte prefix + 2 bytes/element,
+    // causing a stream offset error and an uncaught exception.  Use FP32
+    // read-buffers for these tensors so the binary layout matches the file.
+    auto to_fp32_dims = [](const std::vector<TensorDim> &dims) {
+      std::vector<TensorDim> fp32_dims;
+      fp32_dims.reserve(dims.size());
+      for (auto d : dims) {
+        d.setDataType(ml::train::TensorDim::DataType::FP32);
+        fp32_dims.push_back(d);
+      }
+      return fp32_dims;
+    };
+
+    auto in_fp32_dims = to_fp32_dims(in_dims);
+    auto out_fp32_dims = to_fp32_dims(out_dims);
+
+    // Read-buffers: always FP32 to match the golden-file binary layout.
+    inputs_fp32 = std::vector<Tensor>(in_fp32_dims.begin(), in_fp32_dims.end());
+    labels_fp32 =
+      std::vector<Tensor>(out_fp32_dims.begin(), out_fp32_dims.end());
+    expected_outputs =
+      std::vector<Tensor>(out_fp32_dims.begin(), out_fp32_dims.end());
+
+    // Forwarding buffers: match the model's declared input/output dtype so
+    // that fillPlaceholder's raw memory-sharing does not misinterpret bytes.
     inputs = std::vector<Tensor>(in_dims.begin(), in_dims.end());
     labels = std::vector<Tensor>(out_dims.begin(), out_dims.end());
-    expected_outputs = std::vector<Tensor>(out_dims.begin(), out_dims.end());
 
     NetworkGraphType model_graph = nn->getNetworkGraph();
     for (auto it = model_graph.cbegin(); it != model_graph.cend(); ++it) {
@@ -185,8 +212,17 @@ public:
       return ts;
     };
 
-    read_tensors(inputs);
-    read_tensors(labels);
+    // Read inputs/labels from file into FP32 buffers (golden format is always
+    // float32 with int32 element-count prefix).  Then copy into model-dtype
+    // forwarding tensors so fillPlaceholder's memory-sharing stays type-safe.
+    read_tensors(inputs_fp32);
+    for (size_t i = 0; i < inputs.size(); ++i)
+      inputs.at(i).copyData(inputs_fp32.at(i));
+
+    read_tensors(labels_fp32);
+    for (size_t i = 0; i < labels.size(); ++i)
+      labels.at(i).copyData(labels_fp32.at(i));
+
     read_tensors(expected_weights);
     read_tensors(expected_outputs);
 
@@ -206,14 +242,30 @@ public:
     auto shared_labels = toSharedTensors(labels);
 
     auto out = nn->forwarding(shared_inputs, shared_labels);
-    verify(to_tensors(out), expected_outputs, " output");
+
+    // expected_outputs are read as FP32 from the golden file.  Convert actual
+    // outputs to FP32 before comparing so the verify() dtype checks pass when
+    // the model runs at FP16 activation precision.
+    auto out_tensors = to_tensors(out);
+    std::vector<Tensor> out_fp32;
+    out_fp32.reserve(out_tensors.size());
+    for (const auto &t : out_tensors) {
+      if (t.getDataType() != ml::train::TensorDim::DataType::FP32) {
+        out_fp32.push_back(t.clone(ml::train::TensorDim::DataType::FP32));
+      } else {
+        out_fp32.push_back(t);
+      }
+    }
+    verify(out_fp32, expected_outputs, " output");
     nn->backwarding(iteration);
   }
 
 private:
   NeuralNetwork *nn;
-  std::vector<Tensor> inputs;
-  std::vector<Tensor> labels;
+  std::vector<Tensor> inputs;      /**< model-dtype forwarding buffer */
+  std::vector<Tensor> labels;      /**< model-dtype forwarding buffer */
+  std::vector<Tensor> inputs_fp32; /**< FP32 read-buffer (golden layout) */
+  std::vector<Tensor> labels_fp32; /**< FP32 read-buffer (golden layout) */
   std::vector<Tensor> weights;
   std::vector<Tensor> weights32;
   std::vector<Tensor> expected_weights;

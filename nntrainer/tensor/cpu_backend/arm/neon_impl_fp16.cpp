@@ -2250,6 +2250,67 @@ static __fp16 hsumq_f16(float16x8_t v) {
   return vget_lane_f16(s1, 0);
 }
 
+// Native FP16-in / FP16-out RMS-norm-over-width.
+//
+// Sum-of-squares is accumulated in FP32 (two float32x4 vectors per 8-lane
+// load) instead of FP16: the residual stream of deep decoder layers can
+// reach magnitudes around 1e3, so squared accumulation across a 1024-wide
+// row would overflow FP16's 65504 ceiling. Scale derivation uses scalar
+// FP32 sqrt; the per-lane normalize multiply stays in FP16 with no
+// FP32<->FP16 conversion of the input/output buffers (the whole point of
+// having a native FP16 kernel here).
+template <>
+void rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
+                                       _FP16 *__restrict Y, size_t H, size_t W,
+                                       float epsilon) {
+  for (size_t h = 0; h < H; ++h) {
+    const _FP16 *rowX = X + h * W;
+    _FP16 *rowY = Y + h * W;
+
+    size_t i = 0;
+    float32x4_t acc0 = vdupq_n_f32(0.F);
+    float32x4_t acc1 = vdupq_n_f32(0.F);
+
+    for (; i + 8 <= W; i += 8) {
+      float16x8_t h8 = vld1q_f16(rowX + i);
+      float32x4_t f0 = vcvt_f32_f16(vget_low_f16(h8));
+      float32x4_t f1 = vcvt_f32_f16(vget_high_f16(h8));
+      acc0 = vfmaq_f32(acc0, f0, f0);
+      acc1 = vfmaq_f32(acc1, f1, f1);
+    }
+    if (i + 4 <= W) {
+      float16x4_t h4 = vld1_f16(rowX + i);
+      float32x4_t f = vcvt_f32_f16(h4);
+      acc0 = vfmaq_f32(acc0, f, f);
+      i += 4;
+    }
+    float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; i < W; ++i) {
+      float x = (float)rowX[i];
+      sum += x * x;
+    }
+
+    float mean_single = sum / (float)W;
+    float scale_single = 1.F / std::sqrt(mean_single + epsilon);
+    float16x8_t scale_v = vdupq_n_f16((__fp16)scale_single);
+    float16x4_t scale_v4 = vdup_n_f16((__fp16)scale_single);
+
+    i = 0;
+    for (; i + 8 <= W; i += 8) {
+      float16x8_t xh = vld1q_f16(rowX + i);
+      vst1q_f16(rowY + i, vmulq_f16(xh, scale_v));
+    }
+    if (i + 4 <= W) {
+      float16x4_t xh4 = vld1_f16(rowX + i);
+      vst1_f16(rowY + i, vmul_f16(xh4, scale_v4));
+      i += 4;
+    }
+    for (; i < W; ++i) {
+      rowY[i] = (__fp16)((float)rowX[i] * scale_single);
+    }
+  }
+}
+
 template <>
 void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,

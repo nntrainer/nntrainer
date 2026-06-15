@@ -42,6 +42,8 @@ public:
 };
 } // namespace props
 
+/** @brief LayerNorm over the last (width) axis, parallelized per-token over the
+ * thread pool. */
 WIN_EXPORT class VjepaLayerNormLayer final : public nntrainer::Layer {
 public:
   VjepaLayerNormLayer() : layernorm_props(props::VjepaLnEpsilon()) {}
@@ -68,8 +70,7 @@ public:
     return VjepaLayerNormLayer::type;
   };
 
-  WIN_EXPORT void
-  setProperty(const std::vector<std::string> &values) override;
+  WIN_EXPORT void setProperty(const std::vector<std::string> &values) override;
 
   WIN_EXPORT void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,

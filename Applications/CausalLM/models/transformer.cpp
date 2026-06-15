@@ -142,6 +142,9 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                     : 1;
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
+  USE_FLASH_ATTENTION = nntr_cfg.contains("use_flash_attention")
+                          ? nntr_cfg["use_flash_attention"].get<bool>()
+                          : true;
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();
@@ -157,8 +160,8 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
     IS_CAUSAL = false;
   }
 
-  NUM_VOCAB = cfg["vocab_size"];
-  DIM = cfg["hidden_size"];
+  NUM_VOCAB = cfg.value("vocab_size", 0);
+  DIM = cfg.value("hidden_size", 0);
   INTERMEDIATE_SIZE =
     cfg.contains("intermediate_size") ? cfg["intermediate_size"].get<int>() : 0;
   NUM_LAYERS = cfg["num_hidden_layers"];
@@ -473,7 +476,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
                                  : UINT_MAX),
      withKey("rope_theta", ROPE_THETA),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-     withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
+     withKey("is_causal", IS_CAUSAL ? "true" : "false"),
+     withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false")}));
   Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer

@@ -17,6 +17,7 @@
 #include <engine.h>
 #include <ggml_interface.h>
 #include <nntr_ggml_impl.h>
+#include <perf_profile.h>
 #include <nntr_ggml_impl_utils.h>
 #include <string>
 #include <thread>
@@ -73,35 +74,41 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_GEMM(
   unsigned int qa_size = qa_4_rows_size * (((M >> 2) << 2) / 4 + 1);
   std::vector<char> QA = std::vector<char>(qa_size);
 
-  // Quantize 4-divisible-M row portion with matrix-wise function
-  for (unsigned int i = 0; i < M4; i++) {
-    nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
-                               K);
-  }
-  // Quantize leftover 1 ~ 3 rows with row-wise function
-  for (unsigned int i = M4 * 4; i < M; i++) {
-    nntr_quantize_row_q8_0(
-      (float *)A + i * K,
-      (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
+  {
+    PERF_SCOPE("FP32.BSTP.quantize");
+    // Quantize 4-divisible-M row portion with matrix-wise function
+    for (unsigned int i = 0; i < M4; i++) {
+      nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
+                                 K);
+    }
+    // Quantize leftover 1 ~ 3 rows with row-wise function
+    for (unsigned int i = M4 * 4; i < M; i++) {
+      nntr_quantize_row_q8_0(
+        (float *)A + i * K,
+        (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
+    }
   }
 
   ///@todo Dynamic thread-number selection for GEMM problem size
   unsigned int thread_num = tm.getComputeThreadCount();
-  tm.parallel_for(0, thread_num, [=](size_t i) {
-    unsigned int M_step_start = (i * N) / thread_num;
-    unsigned int M_step_end = ((i + 1) * N) / thread_num;
+  {
+    PERF_SCOPE("FP32.BSTP.kernel");
+    tm.parallel_for(0, thread_num, [=](size_t i) {
+      unsigned int M_step_start = (i * N) / thread_num;
+      unsigned int M_step_end = ((i + 1) * N) / thread_num;
 
-    M_step_start = (M_step_start % NB_COLS)
-                     ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                     : M_step_start;
-    M_step_end = (M_step_end % NB_COLS)
-                   ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                   : M_step_end;
+      M_step_start = (M_step_start % NB_COLS)
+                       ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
+                       : M_step_start;
+      M_step_end = (M_step_end % NB_COLS)
+                     ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
+                     : M_step_end;
 
-    nntr_gemm_q4_0_4x8_q8_0(K, (C + (M_step_start)), ldc,
-                            ((char *)B + ((M_step_start)*B_step)), QA.data(),
-                            M4 * 4, (M_step_end) - (M_step_start));
-  });
+      nntr_gemm_q4_0_4x8_q8_0(K, (C + (M_step_start)), ldc,
+                              ((char *)B + ((M_step_start)*B_step)), QA.data(),
+                              M4 * 4, (M_step_end) - (M_step_start));
+    });
+  }
 
   for (unsigned int pb = M4 * 4; pb < M; pb++) {
     tm.parallel_for(0, thread_num, [=](size_t i) {

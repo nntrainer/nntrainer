@@ -15,6 +15,7 @@
 #include <ggml_interface.h>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
+#include <perf_profile.h>
 #include <thread_manager.h>
 
 #include <algorithm>
@@ -64,17 +65,21 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
       qa_4_rows_size * M4 + static_cast<unsigned int>(qa_row_size) * (M % 4);
     std::vector<char> QA = std::vector<char>(qa_size);
 
-    // online quantization for M4 * 4 rows
-    for (unsigned int i = 0; i < M4; i++) {
-      nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
-                                 K);
-    }
+    {
+      PERF_SCOPE("FP32.OMP.quantize");
+      // online quantization for M4 * 4 rows
+      for (unsigned int i = 0; i < M4; i++) {
+        nntr_quantize_mat_q8_0_4x8(A + 4 * i * K,
+                                   QA.data() + i * qa_4_rows_size, K);
+      }
 
-    // online quantization for remainder
-    for (unsigned int i = M4 * 4; i < M; i++) {
-      nntr_quantize_row_q8_0(
-        (float *)A + i * K,
-        (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
+      // online quantization for remainder
+      for (unsigned int i = M4 * 4; i < M; i++) {
+        nntr_quantize_row_q8_0(
+          (float *)A + i * K,
+          (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size),
+          K);
+      }
     }
 
     // Compute 4-divisible-M row portion with multithreaded GEMM
@@ -86,21 +91,24 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
     size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
-    tm.parallel_for(0, col_loop * row_loop, [=](size_t i) {
-      unsigned int r = i / col_loop;
-      unsigned int c = i % col_loop;
+    {
+      PERF_SCOPE("FP32.OMP.kernel");
+      tm.parallel_for(0, col_loop * row_loop, [=](size_t i) {
+        unsigned int r = i / col_loop;
+        unsigned int c = i % col_loop;
 
-      unsigned int r_start = r * row_chunk_size;
-      unsigned int r_end = std::min(row_chunk_size * (r + 1), M4 * 4);
+        unsigned int r_start = r * row_chunk_size;
+        unsigned int r_end = std::min(row_chunk_size * (r + 1), M4 * 4);
 
-      unsigned int c_start = c * col_chunk_size;
-      unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+        unsigned int c_start = c * col_chunk_size;
+        unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
 
-      nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + r_start * N + c_start), ldc,
-                              (void *)((char *)B + c_start * B_step),
-                              (void *)(QA.data() + r_start * A_step),
-                              r_end - r_start, c_end - c_start);
-    });
+        nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + r_start * N + c_start), ldc,
+                                (void *)((char *)B + c_start * B_step),
+                                (void *)(QA.data() + r_start * A_step),
+                                r_end - r_start, c_end - c_start);
+      });
+    }
 
     // Compute leftover 1 ~ 3 rows with multithreaded GEMV
     for (unsigned int pb = M4 * 4; pb < M; pb++) {

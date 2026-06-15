@@ -15,7 +15,12 @@
  *     [B, T, H, W, C] → [B, T, H/2, W/2, C*4]
  *     tokens: 4608 → 1152,  dim: 768 → 3072
  *
- *   merger (Sequential):
+ *   merger (NUM_MERGER_FC=2, default):
+ *     LayerNorm(3072)
+ *     FC(3072 → 3072, bias) → GELU
+ *     FC(3072 → 1024, bias)
+ *
+ *   merger (NUM_MERGER_FC=3, legacy):
  *     LayerNorm(3072)
  *     FC(3072 → 3072, bias) → GELU
  *     FC(3072 → 1536, bias) → GELU
@@ -115,7 +120,8 @@ private:
   unsigned int VISION_DIM = 768;       /**< Vision encoder hidden size */
   unsigned int DOWNSAMPLE_FACTOR = 2;  /**< Pixel unshuffle factor */
   unsigned int MERGER_HIDDEN_1 = 3072; /**< Merger FC1 hidden size */
-  unsigned int MERGER_HIDDEN_2 = 1536; /**< Merger FC2 hidden size */
+  unsigned int MERGER_HIDDEN_2 = 1536; /**< Merger FC2 hidden size (3-FC only) */
+  unsigned int NUM_MERGER_FC = 2;      /**< Number of merger FC layers (2 or 3) */
   unsigned int TEXT_DIM = 1024;        /**< Text model hidden size */
   unsigned int NUM_TOKENS = 4608;      /**< Number of input vision tokens */
   unsigned int OUTPUT_TOKENS = 1152;   /**< Number of output tokens after unshuffle */

@@ -29,6 +29,8 @@
 
 namespace causallm {
 
+/** @brief GELU activation parallelized over tokens via the ThreadManager pool.
+ */
 WIN_EXPORT class VjepaGeluLayer final : public nntrainer::Layer {
 public:
   VjepaGeluLayer() = default;
@@ -55,8 +57,7 @@ public:
     return VjepaGeluLayer::type;
   };
 
-  WIN_EXPORT void
-  setProperty(const std::vector<std::string> &values) override;
+  WIN_EXPORT void setProperty(const std::vector<std::string> &values) override;
 
   WIN_EXPORT void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,

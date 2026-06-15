@@ -962,7 +962,21 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
 
   float *data = (float *)getData();
   uint8_t *mdata = input.getData<uint8_t>();
-  float *rdata = output.getData<float>();
+  // When the destination activation is FP16 (e.g. the V-JEPA patch-embed FC --
+  // the FP32-input -> FP16-output boundary of a Q4_0-FP16 model) the Q4_0/Qn_K
+  // GEMMs below write FP32, so dot into an FP32 scratch and cast down. With an
+  // FP16 input the HalfTensor path (gemm_q4_0_fp16) is used instead and never
+  // reaches here.
+  const bool out_fp16 =
+    output.getDataType() == Tdatatype::FP16;
+  std::vector<float> r_scratch;
+  float *rdata;
+  if (out_fp16) {
+    r_scratch.resize(static_cast<size_t>(output.getDim().getDataLen()));
+    rdata = r_scratch.data();
+  } else {
+    rdata = output.getData<float>();
+  }
 
   unsigned int M, N, K;
   M = getDim().height();
@@ -992,6 +1006,15 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   default:
     throw std::invalid_argument("Error: unsupported datatype");
   }
+
+#ifdef ENABLE_FP16
+  if (out_fp16) {
+    _FP16 *out16 = output.getData<_FP16>();
+    const size_t n = static_cast<size_t>(output.getDim().getDataLen());
+    for (size_t i = 0; i < n; ++i)
+      out16[i] = static_cast<_FP16>(rdata[i]);
+  }
+#endif
 
   return output;
 }

@@ -245,16 +245,10 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
     << "Embedding layer takes only one input";
 
-  // Force the input dim dtype to FP32. The embedding layer is often the
-  // model entry point (no separate Input layer in front), so its input
-  // dim would otherwise inherit the model's activation dtype (e.g.
-  // UINT16 in QNN-style pipelines). Token IDs, however, are integer
-  // indices into a vocab that can exceed UINT16's range (e.g. Gemma
-  // vocab ~256K), so we represent them as 32-bit floats by convention.
-  // The embedding layer reads FP32 token IDs and writes the configured
-  // activation dtype (UINT16 here) into its output for downstream
-  // (e.g. QNN graph) consumption.
-  context.setInputDataType(nntrainer::TensorDim::DataType::FP32);
+  // Token IDs are integers — embedding caller is expected to provide FP32
+  // input (e.g., via an explicit input layer with input_dtype=FP32). The
+  // historical "must be FP32" check is removed so FP16-activation models
+  // still construct, but the actual lookup expects integer-valued data.
 
   const nntrainer::TensorDim &input_dim =
     context.getInputDimensions()[SINGLE_INOUT_IDX];

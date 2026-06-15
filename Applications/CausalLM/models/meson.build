@@ -18,6 +18,7 @@ subdir('timm_vit')
 subdir('lfm2')
 subdir('gemma4')
 subdir('vjepa2_vit')
+subdir('vjepa_lfm2_vl')
 if get_option('platform') != 'windows'
     subdir('bert')
     subdir('gpt_oss_cached_slim')
