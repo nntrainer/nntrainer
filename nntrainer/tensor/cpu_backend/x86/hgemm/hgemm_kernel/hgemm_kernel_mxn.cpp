@@ -12,7 +12,7 @@
 
 #include "hgemm_kernel.h"
 
-namespace nntrainer::avx2::internal {
+namespace nntrainer::hgemm::internal {
 
 void hgemm_kernel_mxn(unsigned int M, unsigned int N, unsigned int K,
                       const float *packed_A, const float *packed_B, float *C,
@@ -42,4 +42,4 @@ void hgemm_kernel_mxn(unsigned int M, unsigned int N, unsigned int K,
   }
 }
 
-} /* namespace nntrainer::avx2::internal */
+} /* namespace nntrainer::hgemm::internal */

@@ -13,7 +13,7 @@
 #ifndef __X86_HGEMM_KERNEL_H_
 #define __X86_HGEMM_KERNEL_H_
 
-namespace nntrainer::avx2::internal {
+namespace nntrainer::hgemm::internal {
 
 /**
  * @brief Primary 6x16 micro-kernel.
@@ -64,6 +64,6 @@ void hgemm_kernel_mxn(unsigned int M, unsigned int N, unsigned int K,
                       const float *packed_A, const float *packed_B, float *C,
                       unsigned int c_stride);
 
-} /* namespace nntrainer::avx2::internal */
+} /* namespace nntrainer::hgemm::internal */
 
 #endif /* __X86_HGEMM_KERNEL_H_ */

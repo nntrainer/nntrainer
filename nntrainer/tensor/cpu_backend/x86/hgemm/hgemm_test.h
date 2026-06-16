@@ -17,7 +17,7 @@
 
 #include <cstddef>
 
-namespace nntrainer::avx2::internal::testing {
+namespace nntrainer::hgemm::internal::testing {
 
 /**
  * @brief Test/benchmark-only snapshot of the internal hgemm workspace.
@@ -43,7 +43,7 @@ HgemmWorkspaceStats get_hgemm_workspace_stats();
 void reset_hgemm_workspace_stats();
 void clear_hgemm_workspace();
 
-} // namespace nntrainer::avx2::internal::testing
+} // namespace nntrainer::hgemm::internal::testing
 
 #endif // ENABLE_TEST
 

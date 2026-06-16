@@ -18,7 +18,7 @@
 #include <tensor_dim.h>
 #include <type_traits>
 
-namespace nntrainer::avx2::internal {
+namespace nntrainer::hgemm::internal {
 
 /**
  * @brief Allocate cache-line-aligned FP32 buffer.
@@ -132,6 +132,6 @@ inline unsigned int round_up(unsigned int v, unsigned int n) {
   return ((v + n - 1) / n) * n;
 }
 
-} /* namespace nntrainer::avx2::internal */
+} /* namespace nntrainer::hgemm::internal */
 
 #endif /* __X86_HGEMM_UTIL_H_ */

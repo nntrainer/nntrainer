@@ -17,7 +17,7 @@
 
 #include <tensor_dim.h>
 
-namespace nntrainer::avx2::internal {
+namespace nntrainer::hgemm::internal {
 
 template <typename AType, typename BType, typename CType>
 void run_hgemm_blocked(bool TransA, bool TransB, unsigned int M, unsigned int N,
@@ -26,6 +26,6 @@ void run_hgemm_blocked(bool TransA, bool TransB, unsigned int M, unsigned int N,
                        unsigned int b_stride, float beta, CType *C,
                        unsigned int c_stride, HgemmWorkspace &workspace);
 
-} /* namespace nntrainer::avx2::internal */
+} /* namespace nntrainer::hgemm::internal */
 
 #endif /* __X86_HGEMM_BLOCKED_H_ */

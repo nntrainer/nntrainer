@@ -15,7 +15,7 @@
 
 #include <tensor_dim.h>
 
-namespace nntrainer::avx2::internal {
+namespace nntrainer::hgemm::internal {
 
 /**
  * @brief Pack an MR-row stripe of A (row-major source) into FP32.
@@ -81,6 +81,6 @@ template <typename SrcT>
 void packing_B_N16_trans(unsigned int k_min, unsigned int n_actual,
                          const SrcT *src, unsigned int src_stride, float *dst);
 
-} /* namespace nntrainer::avx2::internal */
+} /* namespace nntrainer::hgemm::internal */
 
 #endif /* __X86_HGEMM_PACK_H_ */

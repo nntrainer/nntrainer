@@ -15,7 +15,7 @@
 
 #include <tensor_dim.h>
 
-namespace nntrainer::avx2 {
+namespace nntrainer::hgemm {
 
 /**
  * @brief Compute C = alpha * op(A) * op(B) + beta * C in FP16.
@@ -98,6 +98,6 @@ void hsgemm(const _FP16 *A, const float *B, float *C, unsigned int M,
             unsigned int ldc, float alpha, float beta, bool TransA,
             bool TransB);
 
-} /* namespace nntrainer::avx2 */
+} /* namespace nntrainer::hgemm */
 
 #endif /* __X86_HGEMM_H_ */

@@ -16,7 +16,7 @@
 #include <immintrin.h>
 #include <type_traits>
 
-namespace nntrainer::avx2::internal {
+namespace nntrainer::hgemm::internal {
 
 namespace {
 
@@ -286,4 +286,4 @@ template void packing_B_N16_trans<_FP16>(unsigned int, unsigned int,
 template void packing_B_N16_trans<float>(unsigned int, unsigned int,
                                          const float *, unsigned int, float *);
 
-} /* namespace nntrainer::avx2::internal */
+} /* namespace nntrainer::hgemm::internal */

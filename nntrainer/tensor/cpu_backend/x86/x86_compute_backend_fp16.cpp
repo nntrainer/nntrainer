@@ -34,8 +34,8 @@ void shgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
             const _FP16 *B, const unsigned int ldb, const float beta, float *C,
             const unsigned int ldc) {
   if (TStorageOrder == ROW_MAJOR) {
-    nntrainer::avx2::shgemm(A, B, C, M, N, K, lda, ldb, ldc, alpha, beta,
-                            TransA, TransB);
+    nntrainer::hgemm::shgemm(A, B, C, M, N, K, lda, ldb, ldc, alpha, beta,
+                             TransA, TransB);
     return;
   }
 
@@ -86,8 +86,8 @@ void hsgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
             const float *B, const unsigned int ldb, const float beta, float *C,
             const unsigned int ldc) {
   if (TStorageOrder == ROW_MAJOR) {
-    nntrainer::avx2::hsgemm(A, B, C, M, N, K, lda, ldb, ldc, alpha, beta,
-                            TransA, TransB);
+    nntrainer::hgemm::hsgemm(A, B, C, M, N, K, lda, ldb, ldc, alpha, beta,
+                             TransA, TransB);
     return;
   }
 
@@ -198,13 +198,36 @@ void sgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
            const float alpha, const _FP16 *A, const unsigned int lda,
            const _FP16 *B, const unsigned int ldb, const float beta, _FP16 *C,
            const unsigned int ldc) {
-  if (TStorageOrder) {
-    __fallback_sgemm(TStorageOrder, TransA, TransB, M, N, K, alpha, A, lda, B,
-                     ldb, beta, C, ldc);
-  } else {
-    nntrainer::avx2::hgemm(A, B, C, M, N, K, lda, ldb, ldc, alpha, beta, TransA,
-                           TransB);
+  if (TStorageOrder == ROW_MAJOR) {
+    nntrainer::hgemm::hgemm(A, B, C, M, N, K, lda, ldb, ldc, alpha, beta,
+                            TransA, TransB);
+    return;
   }
+
+  // The cache-blocked hgemm path is row-major only, so column-major inputs fall
+  // back to the legacy FP32-conversion path. CBLAS honors TStorageOrder;
+  // __fallback_sgemm does not, so it is only valid as the non-BLAS baseline.
+#ifdef USE_BLAS
+  float *A_ = new float[M * K];
+  float *B_ = new float[N * K];
+  float *C_ = new float[M * N];
+
+  scopy(M * K, A, 1, A_, 1);
+  scopy(N * K, B, 1, B_, 1);
+  scopy(M * N, C, 1, C_, 1);
+
+  __cblas_sgemm(TStorageOrder, TransA, TransB, M, N, K, alpha, A_, lda, B_, ldb,
+                beta, C_, ldc);
+
+  scopy(M * N, C_, 1, C, 1);
+
+  delete[] A_;
+  delete[] B_;
+  delete[] C_;
+#else
+  __fallback_sgemm(TStorageOrder, TransA, TransB, M, N, K, alpha, A, lda, B,
+                   ldb, beta, C, ldc);
+#endif
 }
 
 void sgemv(const unsigned int TStorageOrder, bool TransA, const unsigned int M,

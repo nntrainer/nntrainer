@@ -1,12 +1,6 @@
-x86_hgemm_headers = [
-  'hgemm.h',
-  'hgemm_blocked.h',
-  'hgemm_common.h',
-  'hgemm_fast_path.h',
-  'hgemm_pack.h',
-  'hgemm_util.h',
-  'hgemm_workspace.h',
-]
+# The x86 hgemm headers are internal (nntrainer::hgemm::internal) and are used
+# only through the cpu_backend dispatch inside this library, so they are added to
+# the include path below but intentionally not installed.
 
 subdir('hgemm_kernel')
 nntrainer_inc += include_directories('hgemm_kernel')
@@ -23,8 +17,4 @@ x86_hgemm_sources = [
 
 foreach s : x86_hgemm_sources
   nntrainer_sources += meson.current_source_dir() / s
-endforeach
-
-foreach h : x86_hgemm_headers
-  nntrainer_headers += meson.current_source_dir() / h
 endforeach

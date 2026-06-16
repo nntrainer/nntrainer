@@ -17,7 +17,7 @@
 
 #include <tensor_dim.h>
 
-namespace nntrainer::avx2::internal {
+namespace nntrainer::hgemm::internal {
 
 template <typename AType, typename BType, typename CType>
 bool try_hgemm_fast_path(bool TransA, bool TransB, unsigned int M,
@@ -26,6 +26,6 @@ bool try_hgemm_fast_path(bool TransA, bool TransB, unsigned int M,
                          unsigned int b_stride, float beta, CType *C,
                          unsigned int c_stride, HgemmWorkspace &workspace);
 
-} /* namespace nntrainer::avx2::internal */
+} /* namespace nntrainer::hgemm::internal */
 
 #endif /* __X86_HGEMM_FAST_PATH_H_ */

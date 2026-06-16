@@ -22,7 +22,7 @@
 #include <cstring>
 #include <thread_manager.h>
 
-namespace nntrainer::avx2::internal {
+namespace nntrainer::hgemm::internal {
 
 namespace {
 
@@ -243,4 +243,4 @@ template void run_hgemm_blocked<_FP16, float, float>(
   unsigned int, const float *, unsigned int, float, float *, unsigned int,
   HgemmWorkspace &);
 
-} /* namespace nntrainer::avx2::internal */
+} /* namespace nntrainer::hgemm::internal */

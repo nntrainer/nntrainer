@@ -14,7 +14,7 @@
 
 #include <immintrin.h>
 
-namespace nntrainer::avx2::internal {
+namespace nntrainer::hgemm::internal {
 
 void hgemm_kernel_4x16(unsigned int K, const float *packed_A,
                        const float *packed_B, float *C, unsigned int c_stride) {
@@ -66,4 +66,4 @@ void hgemm_kernel_4x16(unsigned int K, const float *packed_A,
   _mm256_storeu_ps(c3 + 8, c31);
 }
 
-} /* namespace nntrainer::avx2::internal */
+} /* namespace nntrainer::hgemm::internal */

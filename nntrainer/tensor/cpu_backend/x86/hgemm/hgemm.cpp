@@ -19,7 +19,7 @@
 
 #include <cmath>
 
-namespace nntrainer::avx2 {
+namespace nntrainer::hgemm {
 
 using namespace internal;
 
@@ -78,4 +78,4 @@ void hsgemm(const _FP16 *A, const float *B, float *C, unsigned int M,
                                      ldb, beta, C, ldc);
 }
 
-} /* namespace nntrainer::avx2 */
+} /* namespace nntrainer::hgemm */
