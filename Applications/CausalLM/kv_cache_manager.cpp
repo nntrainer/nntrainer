@@ -68,8 +68,6 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
                                    {format, dtype});
     layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, true);
     layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
-    layer_caches_[i].key_cache.setZero();
-    layer_caches_[i].value_cache.setZero();
   }
 }
 
