@@ -231,3 +231,17 @@ causallm_logit_softcapping_dep = declare_dependency(
     link_with: causallm_logit_softcapping,
     include_directories: causallm_layer_inc
 )
+
+causallm_per_layer_embedding_src_abs = [meson.current_source_dir() / 'per_layer_embedding.cpp']
+causallm_per_layer_embedding = shared_library(
+    'per_layer_embedding_layer',
+    causallm_per_layer_embedding_src_abs,
+    include_directories: [causallm_layer_inc, causallm_inc_nlohmann_inc],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_per_layer_embedding_dep = declare_dependency(
+    link_with: causallm_per_layer_embedding,
+    include_directories: causallm_layer_inc
+)
