@@ -63,7 +63,7 @@ void HalfTensor::allocate() {
     /// allocate new memory for the tensor data
     MemoryData *mem_data;
 
-    mem_data = new MemoryData((void *)(new _FP16[dim.getDataLen()]{}));
+    mem_data = new MemoryData((void *)(new _FP16[dim.getDataLen()]));
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
       delete[] mem_data->template getAddr<_FP16>();
       delete mem_data;

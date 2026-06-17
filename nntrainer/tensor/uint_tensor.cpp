@@ -155,7 +155,7 @@ template <typename T> void UIntTensor<T>::allocate() {
 
     mem_data = new MemoryData(
       (void *)(new T[dim.getDataLen() + (sizeof(float) + sizeof(unsigned int)) /
-                                          sizeof(T) * scale_size()]{}));
+                                          sizeof(T) * scale_size()]));
     data = std::shared_ptr<MemoryData>(mem_data, [](auto *mem_data) {
       delete[] mem_data->template getAddr<T>();
       delete mem_data;
@@ -297,12 +297,22 @@ template <typename T> void UIntTensor<T>::initialize() {
 
   /// @note Sampling from the normal/uniform distribution is invalid
   switch (initializer) {
-  case Initializer::ZEROS:
+  case Initializer::ZEROS: {
     setZero();
+    float *scale = (float *)getScale();
+    std::fill(scale, scale + scale_size(), 1.0f);
+    unsigned int *zerop = getZeroPoint();
+    std::fill(zerop, zerop + scale_size(), 0u);
     break;
-  case Initializer::ONES:
+  }
+  case Initializer::ONES: {
     setValue(1.0f);
+    float *scale = (float *)getScale();
+    std::fill(scale, scale + scale_size(), 1.0f);
+    unsigned int *zerop = getZeroPoint();
+    std::fill(zerop, zerop + scale_size(), 0u);
     break;
+  }
   case Initializer::NONE:
     break;
   default:
