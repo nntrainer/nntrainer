@@ -1651,16 +1651,21 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
   // its own thread_local copy). sumVec holds num_blocks*gqa_size accumulator
   // vectors as a flat float buffer (8 floats each) to avoid the
   // -Wignored-attributes warning that a std::vector<__m256> would raise.
+  // Resolve each thread_local data pointer once into a local so the hot loops
+  // do plain pointer arithmetic (no per-access TLS/vector indirection).
   static thread_local std::vector<float> tmp_fp32;
   static thread_local std::vector<float> sumVec;
   static thread_local std::vector<float> sumRem;
   tmp_fp32.resize(head_dim);
   sumVec.resize((size_t)std::max(1, num_blocks * gqa_size) * 8);
   sumRem.resize((size_t)gqa_size * rem);
+  float *tmp = tmp_fp32.data();
+  float *sv = sumVec.data();
+  float *rem_buf = sumRem.data();
 
   for (int n = head_start; n < actual_head_end; ++n) {
     for (int i = 0; i < num_blocks * gqa_size; i++) {
-      _mm256_storeu_ps(&sumVec[(size_t)i * 8], _mm256_setzero_ps());
+      _mm256_storeu_ps(&sv[(size_t)i * 8], _mm256_setzero_ps());
     }
     std::fill(sumRem.begin(), sumRem.end(), 0.0f);
 
@@ -1668,7 +1673,7 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
                                              : row_num + 1 - local_window_size;
          j <= row_num; ++j) {
       const uint16_t *vptr = vcache + (j * num_cache_head + n) * head_dim;
-      load_fp16_8_to_chunk(vptr, tmp_fp32.data(), head_dim);
+      load_fp16_8_to_chunk(vptr, tmp, head_dim);
 
       for (int h = 0; h < gqa_size; ++h) {
         float a_val =
@@ -1681,17 +1686,17 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
         __m256 inVec = _mm256_set1_ps(a_val);
 
         for (int b = 0; b < num_blocks; ++b) {
-          __m256 bVec = _mm256_loadu_ps(&tmp_fp32[b * 8]);
-          float *accPtr = &sumVec[(size_t)(h * num_blocks + b) * 8];
+          __m256 bVec = _mm256_loadu_ps(&tmp[b * 8]);
+          float *accPtr = &sv[(size_t)(h * num_blocks + b) * 8];
           _mm256_storeu_ps(
             accPtr, _mm256_fmadd_ps(inVec, bVec, _mm256_loadu_ps(accPtr)));
         }
 
         if (rem > 0) {
-          float *remPtr = &sumRem[(size_t)h * rem];
+          float *remPtr = &rem_buf[(size_t)h * rem];
           int base = num_blocks * 8;
           for (int r = 0; r < rem; ++r) {
-            remPtr[r] += a_val * tmp_fp32[base + r];
+            remPtr[r] += a_val * tmp[base + r];
           }
         }
       }
@@ -1702,11 +1707,11 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
         int out_base = (n * gqa_size + h) * head_dim + b * 8;
         _mm256_storeu_ps(
           &output[out_base],
-          _mm256_loadu_ps(&sumVec[(size_t)(h * num_blocks + b) * 8]));
+          _mm256_loadu_ps(&sv[(size_t)(h * num_blocks + b) * 8]));
       }
 
       if (rem > 0) {
-        float *remPtr = &sumRem[(size_t)h * rem];
+        float *remPtr = &rem_buf[(size_t)h * rem];
         int base = num_blocks * 8;
         for (int r = 0; r < rem; ++r) {
           int out_idx = (n * gqa_size + h) * head_dim + base + r;
