@@ -52,8 +52,8 @@ DDTreeStructure buildTree(const float *draftLogits, int depthLimit, int vocab,
   std::vector<std::vector<float>> topLogProbs(depthLimit);
   std::vector<std::vector<int32_t>> topTokenIds(depthLimit);
 
-  // Heap candidate; comparator orders "better" (higher logit, lower token on a
-  // tie) as greater so priority_queue::top() is the worst kept candidate.
+  // Top-k candidate; "better" == (higher logit, lower token on a tie), matching
+  // torch.topk's (logit desc, token index asc) total order.
   struct Cand {
     float logit;
     int32_t token;
@@ -68,20 +68,46 @@ DDTreeStructure buildTree(const float *draftLogits, int depthLimit, int vocab,
   tm.parallel_for(0, static_cast<size_t>(depthLimit), [&](size_t d) {
     const float *row = draftLogits + d * static_cast<size_t>(vocab);
 
-    // Single pass: running max (== full-row max) + bounded top-k heap.
-    std::priority_queue<Cand, std::vector<Cand>, decltype(better)> heap(better);
-    float maxLogit = -std::numeric_limits<float>::infinity();
+    // Single sequential pass top-k via a threshold + small array: the hot path
+    // is one well-predicted `x < thresh` compare that rejects the ~99.98% of
+    // tokens outside the top-k, so it avoids the per-element priority_queue
+    // push/pop and Cand churn. `thresh` is the worst kept logit once `buf` is
+    // full; ties (x == thresh) fall through to the full `better` comparison so
+    // the lower token index still wins. The selected set/order is identical to
+    // a partial_sort (logit/token is a total order), preserving golden parity.
+    std::vector<Cand> buf;
+    buf.reserve(topk);
+    float thresh = -std::numeric_limits<float>::infinity();
+    int worstPos = 0;
     for (int i = 0; i < vocab; ++i) {
       const float x = row[i];
-      maxLogit = std::max(maxLogit, x);
-      const Cand c{x, i};
-      if (static_cast<int>(heap.size()) < topk)
-        heap.push(c);
-      else if (better(c, heap.top())) {
-        heap.pop();
-        heap.push(c);
+      if (static_cast<int>(buf.size()) < topk) {
+        buf.push_back(Cand{x, i});
+        if (static_cast<int>(buf.size()) == topk) {
+          worstPos = 0;
+          for (int j = 1; j < topk; ++j)
+            if (better(buf[worstPos], buf[j]))
+              worstPos = j;
+          thresh = buf[worstPos].logit;
+        }
+        continue;
       }
+      if (x < thresh)
+        continue; // outside top-k: single-compare fast reject
+      const Cand c{x, i};
+      if (!better(c, buf[worstPos]))
+        continue; // x == thresh tie resolved by token index
+      buf[worstPos] = c;
+      worstPos = 0; // recompute worst (rare: only on an actual insertion)
+      for (int j = 1; j < topk; ++j)
+        if (better(buf[worstPos], buf[j]))
+          worstPos = j;
+      thresh = buf[worstPos].logit;
     }
+    std::sort(buf.begin(), buf.end(), better); // best-first (== partial_sort)
+    // The global max is always kept, so it is the best candidate; reuse it for
+    // logsumexp instead of a separate full-row max scan.
+    const float maxLogit = buf[0].logit;
 
     // logsumexp in double for accuracy (token-index order, parity §6.2);
     // result stored as fp32.
@@ -90,14 +116,11 @@ DDTreeStructure buildTree(const float *draftLogits, int depthLimit, int vocab,
       sumExp += std::exp(static_cast<double>(row[i]) - maxLogit);
     const float logZ = static_cast<float>(maxLogit + std::log(sumExp));
 
-    // Drain heap worst-first into best-first order (== partial_sort result).
     topLogProbs[d].resize(topk);
     topTokenIds[d].resize(topk);
-    for (int r = topk - 1; r >= 0; --r) {
-      const Cand c = heap.top();
-      heap.pop();
-      topTokenIds[d][r] = c.token;
-      topLogProbs[d][r] = c.logit - logZ; // fp32 subtraction
+    for (int r = 0; r < topk; ++r) {
+      topTokenIds[d][r] = buf[r].token;
+      topLogProbs[d][r] = buf[r].logit - logZ; // fp32 subtraction
     }
   });
 
