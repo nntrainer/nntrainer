@@ -14,8 +14,6 @@
 #ifndef __LLM_UTIL_HPP__
 #define __LLM_UTIL_HPP__ __LLM_UTIL_HPP__
 
-#include <algorithm> // sort
-#include <math.h>    // INFINITY
 #include <optional>
 
 #include <base_properties.h>
@@ -107,10 +105,10 @@ void applyBadWordsPenalty(float *logits, unsigned int *bad_words_ids,
                           unsigned int NUM_BAD_WORDS_IDS);
 
 /**
- * @brief Apply temperature & top-k & top-p to logits
- * @return Max logit for softmax
+ * @brief do sampling to logits with temperature, top-k, top-p
+ * @return Sampled token index
  */
-float applyTKP(float *logits, int len, float temperature, unsigned int top_k,
-               float top_p);
+unsigned int applyTKP(const float *logits, int len, float temperature,
+                      unsigned int top_k, float top_p, std::mt19937 &rng);
 
 #endif // __LLM_UTIL_HPP__

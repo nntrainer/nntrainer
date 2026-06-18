@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -291,25 +292,10 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
         std::distance(logits, std::max_element(logits, logits + NUM_VOCAB));
       outputs.push_back(argmax_idx);
     } else {
-      // apply temperature & top-k & top-p to logits
-      float max_logits = applyTKP(logits, NUM_VOCAB, TEMPERATURE, TOP_K, TOP_P);
-      // transform logits to softmax
-      float sum_exp_logits = 0;
-      for (unsigned int i = 0; i < NUM_VOCAB; i++) {
-        float exp_x = exp(logits[i] - max_logits);
-        sum_exp_logits += exp_x;
-        logits[i] = exp_x;
-      }
-
-      for (unsigned int i = 0; i < NUM_VOCAB; ++i) {
-        logits[i] /= sum_exp_logits;
-      }
-
-      // sample from final logits
-      std::discrete_distribution<int> dist(logits, logits + NUM_VOCAB);
-      unsigned int sampled_idx = dist(rng);
-
-      // add sampled word
+      // apply temperature & top-k & top-p and sample with original logits
+      // unchanged
+      unsigned int sampled_idx =
+        applyTKP(logits, NUM_VOCAB, TEMPERATURE, TOP_K, TOP_P, rng);
       outputs.push_back(sampled_idx);
     }
 
