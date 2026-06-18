@@ -83,6 +83,7 @@ LOCAL_SRC_FILES := \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
+    ../layers/per_layer_embedding.cpp \
     ../layers/scalar_multiply.cpp \
     ../layers/logit_softcapping.cpp \
     ../layers/mha_core.cpp \
@@ -219,6 +220,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
+    ../layers/per_layer_embedding.cpp \
     ../layers/scalar_multiply.cpp \
     ../layers/logit_softcapping.cpp \
     ../layers/mha_core.cpp \
