@@ -13,7 +13,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <queue>
+
+#include <thread_manager.h>
 
 namespace nntrainer {
 namespace ddtree {
@@ -37,37 +40,66 @@ DDTreeStructure buildTree(const float *draftLogits, int depthLimit, int vocab,
   // Per-row top-k: top_log_probs (fp32) and top_token_ids, sorted by
   // (logit desc, token index asc) to match torch.topk on CPU.
   // topLogProbs[d][r] = top_logit - logsumexp(row d). (ddtree.py 114-117)
+  //
+  // Each depth row is independent, so the rows are computed in parallel via the
+  // nntrainer ThreadManager. The math is byte-identical to the original
+  // sequential version (golden parity): the running max equals the full-row max,
+  // and logsumexp is still the double-precision exp accumulation in token-index
+  // order. Only the top-k *selection* changed — a bounded heap keyed by the same
+  // (logit desc, token asc) order replaces the O(vocab) index array +
+  // partial_sort, so it yields the identical top-k set and ordering in a single
+  // sequential pass (cache-friendly, no per-row vocab-sized allocation).
   std::vector<std::vector<float>> topLogProbs(depthLimit);
   std::vector<std::vector<int32_t>> topTokenIds(depthLimit);
-  for (int d = 0; d < depthLimit; ++d) {
-    const float *row = draftLogits + static_cast<size_t>(d) * vocab;
 
-    std::vector<int32_t> idx(vocab);
-    for (int i = 0; i < vocab; ++i)
-      idx[i] = i;
-    std::partial_sort(idx.begin(), idx.begin() + topk, idx.end(),
-                      [row](int32_t a, int32_t b) {
-                        if (row[a] != row[b])
-                          return row[a] > row[b]; // logit desc
-                        return a < b; // tie: lower token index first
-                      });
+  // Heap candidate; comparator orders "better" (higher logit, lower token on a
+  // tie) as greater so priority_queue::top() is the worst kept candidate.
+  struct Cand {
+    float logit;
+    int32_t token;
+  };
+  auto better = [](const Cand &a, const Cand &b) {
+    if (a.logit != b.logit)
+      return a.logit > b.logit; // higher logit is better
+    return a.token < b.token;   // tie: lower token index is better
+  };
 
-    // logsumexp in double for accuracy; result stored as fp32 (parity §6.2).
-    float maxLogit = row[0];
-    for (int i = 1; i < vocab; ++i)
-      maxLogit = std::max(maxLogit, row[i]);
+  auto &tm = ThreadManager::Global();
+  tm.parallel_for(0, static_cast<size_t>(depthLimit), [&](size_t d) {
+    const float *row = draftLogits + d * static_cast<size_t>(vocab);
+
+    // Single pass: running max (== full-row max) + bounded top-k heap.
+    std::priority_queue<Cand, std::vector<Cand>, decltype(better)> heap(better);
+    float maxLogit = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < vocab; ++i) {
+      const float x = row[i];
+      maxLogit = std::max(maxLogit, x);
+      const Cand c{x, i};
+      if (static_cast<int>(heap.size()) < topk)
+        heap.push(c);
+      else if (better(c, heap.top())) {
+        heap.pop();
+        heap.push(c);
+      }
+    }
+
+    // logsumexp in double for accuracy (token-index order, parity §6.2);
+    // result stored as fp32.
     double sumExp = 0.0;
     for (int i = 0; i < vocab; ++i)
       sumExp += std::exp(static_cast<double>(row[i]) - maxLogit);
     const float logZ = static_cast<float>(maxLogit + std::log(sumExp));
 
+    // Drain heap worst-first into best-first order (== partial_sort result).
     topLogProbs[d].resize(topk);
     topTokenIds[d].resize(topk);
-    for (int r = 0; r < topk; ++r) {
-      topTokenIds[d][r] = idx[r];
-      topLogProbs[d][r] = row[idx[r]] - logZ; // fp32 subtraction
+    for (int r = topk - 1; r >= 0; --r) {
+      const Cand c = heap.top();
+      heap.pop();
+      topTokenIds[d][r] = c.token;
+      topLogProbs[d][r] = c.logit - logZ; // fp32 subtraction
     }
-  }
+  });
 
   // Heap entry mirrors the Python tuple (-logw, ranks, parent, depth, rank,
   // logw). Comparison is the Python tuple order; ranks is variable-length
