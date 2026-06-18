@@ -11,9 +11,14 @@
  */
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <queue>
+#include <random>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <build_golden.h>
@@ -435,6 +440,175 @@ TEST(DDTreeBuild, MatchesPythonGolden) {
     for (size_t k = 0; k < t.visibility.size(); ++k)
       EXPECT_EQ(static_cast<int32_t>(t.visibility[k]), expVis[k])
         << name << " vis@" << k;
+  }
+}
+
+// Pre-optimization reference: the original sequential buildTree (index-array +
+// std::partial_sort top-k, single-threaded). The optimized buildTree must
+// reproduce this byte-for-byte on every input. Kept self-contained here so the
+// equivalence test pins the refactor's behavior independent of the shipped code.
+static DDTreeStructure buildTreeReference(const float *draftLogits,
+                                          int depthLimit, int vocab,
+                                          const DDTreeConfig &cfg) {
+  DDTreeStructure t;
+  if (cfg.budget <= 0 || depthLimit == 0) {
+    t.nodeCount = 0;
+    t.currentLength = 1;
+    t.parents = {-1};
+    t.childMaps.resize(1);
+    t.visibility = {1};
+    return t;
+  }
+
+  const int topk = std::min(cfg.budget, vocab);
+  std::vector<std::vector<float>> topLogProbs(depthLimit);
+  std::vector<std::vector<int32_t>> topTokenIds(depthLimit);
+  for (int d = 0; d < depthLimit; ++d) {
+    const float *row = draftLogits + static_cast<size_t>(d) * vocab;
+    std::vector<int32_t> idx(vocab);
+    for (int i = 0; i < vocab; ++i)
+      idx[i] = i;
+    std::partial_sort(idx.begin(), idx.begin() + topk, idx.end(),
+                      [row](int32_t a, int32_t b) {
+                        if (row[a] != row[b])
+                          return row[a] > row[b];
+                        return a < b;
+                      });
+    float maxLogit = row[0];
+    for (int i = 1; i < vocab; ++i)
+      maxLogit = std::max(maxLogit, row[i]);
+    double sumExp = 0.0;
+    for (int i = 0; i < vocab; ++i)
+      sumExp += std::exp(static_cast<double>(row[i]) - maxLogit);
+    const float logZ = static_cast<float>(maxLogit + std::log(sumExp));
+    topLogProbs[d].resize(topk);
+    topTokenIds[d].resize(topk);
+    for (int r = 0; r < topk; ++r) {
+      topTokenIds[d][r] = idx[r];
+      topLogProbs[d][r] = row[idx[r]] - logZ;
+    }
+  }
+
+  struct Entry {
+    double negLogw;
+    std::vector<int32_t> ranks;
+    int parentIndex;
+    int depth;
+    int rank;
+    double logw;
+  };
+  auto pythonLess = [](const Entry &a, const Entry &b) {
+    if (a.negLogw != b.negLogw)
+      return a.negLogw < b.negLogw;
+    if (a.ranks != b.ranks)
+      return a.ranks < b.ranks;
+    if (a.parentIndex != b.parentIndex)
+      return a.parentIndex < b.parentIndex;
+    if (a.depth != b.depth)
+      return a.depth < b.depth;
+    if (a.rank != b.rank)
+      return a.rank < b.rank;
+    return a.logw < b.logw;
+  };
+  auto comp = [&pythonLess](const Entry &x, const Entry &y) {
+    return pythonLess(y, x);
+  };
+  std::priority_queue<Entry, std::vector<Entry>, decltype(comp)> heap(comp);
+
+  const double firstLogw = static_cast<double>(topLogProbs[0][0]);
+  heap.push(Entry{-firstLogw, {0}, 0, 1, 0, firstLogw});
+
+  t.parents.assign(cfg.budget + 1, 0);
+  t.parents[0] = -1;
+  t.childMaps.clear();
+  t.childMaps.emplace_back();
+  t.nodeTokenIds.clear();
+  t.nodeDepths.clear();
+
+  int nodeCount = 0;
+  while (!heap.empty() && nodeCount < cfg.budget) {
+    Entry e = heap.top();
+    heap.pop();
+    const int32_t tokenId = topTokenIds[e.depth - 1][e.rank];
+    const int currentIndex = nodeCount + 1;
+    t.nodeTokenIds.push_back(tokenId);
+    t.nodeDepths.push_back(e.depth);
+    t.parents[currentIndex] = e.parentIndex;
+    t.childMaps.emplace_back();
+    t.childMaps[e.parentIndex][tokenId] = currentIndex;
+    ++nodeCount;
+    if (e.rank + 1 < topk) {
+      std::vector<int32_t> siblingRanks = e.ranks;
+      siblingRanks.back() = e.rank + 1;
+      const double siblingLogw =
+        e.logw - static_cast<double>(topLogProbs[e.depth - 1][e.rank]) +
+        static_cast<double>(topLogProbs[e.depth - 1][e.rank + 1]);
+      heap.push(Entry{-siblingLogw, std::move(siblingRanks), e.parentIndex,
+                      e.depth, e.rank + 1, siblingLogw});
+    }
+    if (e.depth < depthLimit) {
+      std::vector<int32_t> childRanks = e.ranks;
+      childRanks.push_back(0);
+      const double childLogw =
+        e.logw + static_cast<double>(topLogProbs[e.depth][0]);
+      heap.push(Entry{-childLogw, std::move(childRanks), currentIndex,
+                      e.depth + 1, 0, childLogw});
+    }
+  }
+
+  const int currentLength = 1 + nodeCount;
+  t.nodeCount = nodeCount;
+  t.currentLength = currentLength;
+  t.parents.resize(currentLength);
+  t.visibility.assign(static_cast<size_t>(currentLength) * currentLength, 0);
+  t.visibility[0] = 1;
+  for (int index = 1; index < currentLength; ++index) {
+    const int parent = t.parents[index];
+    for (int j = 0; j < index; ++j)
+      t.visibility[static_cast<size_t>(index) * currentLength + j] =
+        t.visibility[static_cast<size_t>(parent) * currentLength + j];
+    t.visibility[static_cast<size_t>(index) * currentLength + index] = 1;
+  }
+  return t;
+}
+
+// The optimized (parallel, heap-based top-k) buildTree must match the original
+// sequential reference byte-for-byte across many random large-vocab inputs that
+// the small embedded golden vectors do not exercise.
+TEST(DDTreeBuild, MatchesSequentialReferenceRandom) {
+  std::mt19937 rng(20260618u);
+  std::normal_distribution<float> nd(0.0f, 4.0f);
+
+  struct Dim {
+    int depth, vocab, budget;
+  };
+  // Includes a realistic config (depth 15, vocab 150272, budget 31) plus small
+  // and tie-prone cases. A few replicas of the big case catch nondeterminism.
+  const std::vector<Dim> dims = {
+    {15, 150272, 31}, {15, 150272, 31}, {7, 150272, 31}, {3, 50, 31},
+    {4, 33, 100},     {2, 7, 5},        {15, 150272, 1}, {8, 20000, 63},
+  };
+
+  for (size_t ci = 0; ci < dims.size(); ++ci) {
+    const Dim dm = dims[ci];
+    std::vector<float> logits(static_cast<size_t>(dm.depth) * dm.vocab);
+    for (auto &v : logits)
+      v = nd(rng);
+
+    DDTreeConfig cfg;
+    cfg.budget = dm.budget;
+    cfg.depthLimit = dm.depth - 1;
+
+    DDTreeStructure got = buildTree(logits.data(), dm.depth, dm.vocab, cfg);
+    DDTreeStructure ref =
+      buildTreeReference(logits.data(), dm.depth, dm.vocab, cfg);
+
+    EXPECT_EQ(got.nodeCount, ref.nodeCount) << "case " << ci;
+    EXPECT_EQ(got.currentLength, ref.currentLength) << "case " << ci;
+    EXPECT_EQ(got.nodeTokenIds, ref.nodeTokenIds) << "case " << ci;
+    EXPECT_EQ(got.nodeDepths, ref.nodeDepths) << "case " << ci;
+    EXPECT_EQ(got.parents, ref.parents) << "case " << ci;
+    EXPECT_EQ(got.visibility, ref.visibility) << "case " << ci;
   }
 }
 
