@@ -43,12 +43,9 @@ DDTreeStructure buildTree(const float *draftLogits, int depthLimit, int vocab,
   //
   // Each depth row is independent, so the rows are computed in parallel via the
   // nntrainer ThreadManager. The math is byte-identical to the original
-  // sequential version (golden parity): the running max equals the full-row max,
-  // and logsumexp is still the double-precision exp accumulation in token-index
-  // order. Only the top-k *selection* changed — a bounded heap keyed by the same
-  // (logit desc, token asc) order replaces the O(vocab) index array +
-  // partial_sort, so it yields the identical top-k set and ordering in a single
-  // sequential pass (cache-friendly, no per-row vocab-sized allocation).
+  // sequential version (golden parity): the max equals the full-row max, and
+  // logsumexp is still the double-precision exp accumulation in token-index
+  // order. Only the top-k selection method changed (see the scan below).
   std::vector<std::vector<float>> topLogProbs(depthLimit);
   std::vector<std::vector<int32_t>> topTokenIds(depthLimit);
 

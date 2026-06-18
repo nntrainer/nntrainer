@@ -446,7 +446,8 @@ TEST(DDTreeBuild, MatchesPythonGolden) {
 // Pre-optimization reference: the original sequential buildTree (index-array +
 // std::partial_sort top-k, single-threaded). The optimized buildTree must
 // reproduce this byte-for-byte on every input. Kept self-contained here so the
-// equivalence test pins the refactor's behavior independent of the shipped code.
+// equivalence test pins the refactor's behavior independent of the shipped
+// code.
 static DDTreeStructure buildTreeReference(const float *draftLogits,
                                           int depthLimit, int vocab,
                                           const DDTreeConfig &cfg) {
