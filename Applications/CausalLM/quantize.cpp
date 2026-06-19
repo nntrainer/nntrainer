@@ -619,7 +619,9 @@ std::map<std::string, DataType> buildEncoderLayerDtypeMap(int enc_layers,
  * Embeddings (-> embd_dtype): word_emb / pos_emb / type_emb embedding_layer
  * lookup tables. The embedding_layer supports Q4_0/Q8_0 and Q6_K lookup/save
  * (Q4_0/Q8_0 need width % 32 == 0 — BD_DIM = 256, OK), so embd_dtype is fully
- * configurable (FP32 / Q4_0 / Q8_0 / Q6_K) via --embd_dtype.
+ * configurable (FP32 / Q4_0 / Q8_0 / Q6_K) via --embd_dtype. The decoder graph
+ * is built with EMBEDDING_DTYPE = embd_dtype (wired from nntr_config via
+ * BertDecoder::setTensorTypes).
  *
  * Deliberately left FP32: all LayerNorms (emb_ln, *_self_ln, *_cross_ln,
  * *_ffn_ln, lmhead_ln), lm_head_proj (tied to word_emb) and lmhead_bias.
@@ -679,9 +681,10 @@ std::map<std::string, DataType> buildDecoderLayerDtypeMap(int dec_layers,
  * would write Q4_0 blocks the FP32 encoder graph cannot load. We quantize the
  * DECODER (pure FC, no conv) only.
  *
- * Deliberately left FP32 (NOT quantized):
- *   - the entire encoder (patch_embed_conv, all enc_layer{i}_* FCs,
- *     enc_to_dec_proj, pos_embedding, LayerNorms),
+ * Deliberately left FP32 (NOT quantized), regardless of fc/embd dtype:
+ *   - the entire encoder (patch_embed_conv [4D conv, explicitly weight_dtype
+ *     FP32], all enc_layer{i}_* FCs, enc_to_dec_proj, pos_embedding,
+ *     LayerNorms),
  *   - all decoder LayerNorms (emb_ln, *_self_ln, *_cross_ln, *_ffn_ln,
  *     lmhead_ln),
  *   - lm_head_proj (tied to word_emb, no own weight) and lmhead_bias.

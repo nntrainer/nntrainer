@@ -379,7 +379,8 @@ Tensor Siglip2VisionEncoder::createPatchEmbed(Tensor input) {
   // the FC layers (conv2d stores the filter as a [CRS, out_ch] matmul weight
   // and takes the im2col + dotQnK path on NCHW). It is deliberately NOT tied
   // to fc_layer_dtype so pre-existing quantized files (conv saved FP32) keep
-  // loading unchanged.
+  // loading unchanged. A Q4_0 weight type is rejected for this 4D kernel
+  // ("Q4_0_Tensor must be 2 dimensional"), so callers must not pass Q4_0 here.
   LayerHandle conv(createLayer(
     "conv2d", {withKey("name", "patch_embed_conv"),
                withKey("kernel_size", {std::to_string(PATCH_SIZE),

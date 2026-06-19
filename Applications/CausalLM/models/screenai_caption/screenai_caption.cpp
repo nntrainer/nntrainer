@@ -121,12 +121,16 @@ void ScreenAICaption::initialize() {
   //       its FC weight tensor type must follow nntr_config so a quantized
   //       (e.g. Q4_0-FP32) decoder graph is built to load quantized weights.
   //       The encoder already reads model_tensor_type from nntr_cfg in its
-  //       setupParameters(); mirror that for the decoder here. Embeddings stay
-  //       FP32 (only FC layers are quantized by nntr_quantize for caption).
+  //       setupParameters(); mirror that for the decoder here. The decoder
+  //       embedding lookup tables (word/pos/type) are built with
+  //       embedding_dtype from nntr_config, so a mixed-precision quantized
+  //       config (FC Q4_0 + embedding Q4_0/Q6_K) builds a decoder graph that
+  //       can load the quantized embeddings.
   decoder_ = std::make_unique<BertDecoder>();
   const std::string mtt = nntr_cfg_.value("model_tensor_type", "FP32-FP32");
   const std::string fcdt = nntr_cfg_.value("fc_layer_dtype", "FP32");
-  decoder_->setTensorTypes(mtt, fcdt);
+  const std::string embdt = nntr_cfg_.value("embedding_dtype", "FP32");
+  decoder_->setTensorTypes(mtt, fcdt, embdt);
   decoder_->initialize();
   // Allocate + bind the self-attention KV cache (cross-cache buffers are
   // allocated + filled per-image in prefillCrossCache during run()).
