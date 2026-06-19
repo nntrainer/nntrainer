@@ -20,6 +20,7 @@ if get_option('platform') != 'windows'
     subdir('bert')
     subdir('gpt_oss_cached_slim')
     subdir('qwen3_cached_slim_moe')
+    subdir('screenai_caption')
     subdir('bert_decoder')
 endif
 
