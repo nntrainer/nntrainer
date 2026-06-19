@@ -101,17 +101,17 @@ void ScreenAICaption::initialize() {
 
   // ----- Encoder: build a patched nntr_cfg that skips the (text) tokenizer
   //       and declares the MODEL type so the base Transformer ctor is happy.
-  // The encoder ALWAYS runs FP32: its patch_embed_conv is a 4D kernel and the
-  // conv2d layer forces the kernel dtype to the model's global weight dtype
-  // (no per-layer override), so a Q4_0 global type fails graph construction
-  // ("Q4_0_Tensor must be 2 dimensional ..."). nntr_quantize correspondingly
-  // leaves the encoder weights FP32 and quantizes only the decoder FCs.
+  // The encoder honors the quantized model_tensor_type / fc_layer_dtype from
+  // nntr_config exactly like the decoder: its 2D FC layers (enc_layer*_wq/_wk/
+  // _wv/_out/_fc1/_fc2 and enc_to_dec_proj) become Q4_0 when the config is
+  // quantized. The two 4D / pinned weights stay FP32 via explicit per-layer
+  // pins in Siglip2VisionEncoder::createPatchEmbed: patch_embed_conv has
+  // weight_dtype="FP32" (a Q4_0 tensor must be 2D — "Q4_0_Tensor must be 2
+  // dimensional ...") and pos_embedding has tensor_dtype="FP32". The encoder
+  // has no token embedding, so embedding_dtype is irrelevant here.
   json enc_nntr = nntr_cfg_;
   enc_nntr["model_type"] = "Model";
   enc_nntr["skip_tokenizer"] = true;
-  enc_nntr["model_tensor_type"] = "FP32-FP32";
-  enc_nntr["fc_layer_dtype"] = "FP32";
-  enc_nntr["embedding_dtype"] = "FP32";
   json enc_gen = generation_cfg_;
 
   encoder_ = std::make_unique<Siglip2VisionEncoder>(cfg_, enc_gen, enc_nntr);

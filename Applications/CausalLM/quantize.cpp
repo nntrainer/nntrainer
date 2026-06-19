@@ -668,23 +668,22 @@ std::map<std::string, DataType> buildDecoderLayerDtypeMap(int dec_layers,
  * ScreenAICaption is a two-sub-model pipeline (SigLIP2 vision encoder + BERT
  * decoder). The QWEN-style names produced by buildLayerDtypeMap() (layer{i}_wq,
  * output_of_causallm, ...) do NOT match the caption layer names, so nothing
- * would be quantized. This reuses buildDecoderLayerDtypeMap() for the decoder
- * half and deliberately leaves the encoder untouched.
+ * would be quantized. This builds the exact FC / embedding names emitted by
+ * siglip2_vision_encoder.cpp and bert_decoder.cpp.
  *
- * IMPORTANT — encoder is intentionally NOT quantized. The SigLIP2 encoder's
- * patch_embed_conv is a 4D conv kernel, and nntrainer's conv2d layer forces its
- * kernel dtype to the model's global weight dtype with no per-layer override.
- * A Q4_0 tensor must be 2D, so building the encoder with a Q4_0 global weight
- * type fails at graph construction ("Q4_0_Tensor must be 2 dimensional ...").
- * Therefore the encoder must run FP32; the orchestrator forces the encoder
- * sub-model to FP32 at initialize(), and quantizing encoder FC weights here
- * would write Q4_0 blocks the FP32 encoder graph cannot load. We quantize the
- * DECODER (pure FC, no conv) only.
+ * ENCODER FCs ARE QUANTIZED. The SigLIP2 encoder's FC layers (enc_layer{i}_wq/
+ * _wk/_wv/_out/_fc1/_fc2 and enc_to_dec_proj) are 2D, so they take fc_dtype
+ * (Q4_0) just like the decoder FCs — this is what shrinks the dominant ~343MB
+ * FP32 encoder bin. The two NON-2D / pinned encoder weights stay FP32 and are
+ * deliberately omitted from the map: patch_embed_conv is a 4D conv kernel (a
+ * Q4_0 tensor must be 2D — "Q4_0_Tensor must be 2 dimensional ...") and
+ * pos_embedding is FP32-pinned. The encoder graph pins both via explicit
+ * per-layer dtypes (weight_dtype/tensor_dtype="FP32") so the quantized encoder
+ * graph loads conv/pos as FP32 and the FCs as Q4_0.
  *
  * Deliberately left FP32 (NOT quantized), regardless of fc/embd dtype:
- *   - the entire encoder (patch_embed_conv [4D conv, explicitly weight_dtype
- *     FP32], all enc_layer{i}_* FCs, enc_to_dec_proj, pos_embedding,
- *     LayerNorms),
+ *   - encoder patch_embed_conv (4D conv, explicitly weight_dtype FP32),
+ *     pos_embedding (FP32-pinned), and all LayerNorms,
  *   - all decoder LayerNorms (emb_ln, *_self_ln, *_cross_ln, *_ffn_ln,
  *     lmhead_ln),
  *   - lm_head_proj (tied to word_emb, no own weight) and lmhead_bias.
@@ -693,8 +692,52 @@ std::map<std::string, DataType> buildCaptionLayerDtypeMap(int enc_layers,
                                                           int dec_layers,
                                                           DataType fc_dtype,
                                                           DataType embd_dtype) {
-  (void)enc_layers; // encoder kept FP32 (conv cannot be Q4_0) — see above
-  return buildDecoderLayerDtypeMap(dec_layers, fc_dtype, embd_dtype);
+  std::map<std::string, DataType> dtype_map;
+
+  const bool quant_fc =
+    fc_dtype != DataType::FP32 && fc_dtype != DataType::NONE;
+  const bool quant_embd =
+    embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE;
+
+  if (quant_fc) {
+    // ---- Encoder (SigLIP2) FCs (2D — patch_embed_conv/pos_embedding excluded,
+    //      they stay FP32 via the encoder graph's per-layer pins) ----
+    for (int i = 0; i < enc_layers; ++i) {
+      const std::string pfx = "enc_layer" + std::to_string(i);
+      dtype_map[pfx + "_wq"] = fc_dtype;
+      dtype_map[pfx + "_wk"] = fc_dtype;
+      dtype_map[pfx + "_wv"] = fc_dtype;
+      dtype_map[pfx + "_out"] = fc_dtype;
+      dtype_map[pfx + "_fc1"] = fc_dtype;
+      dtype_map[pfx + "_fc2"] = fc_dtype;
+    }
+    dtype_map["enc_to_dec_proj"] = fc_dtype;
+
+    // ---- Decoder (BERT) FCs ----
+    for (int i = 0; i < dec_layers; ++i) {
+      const std::string pfx = "dec_layer" + std::to_string(i);
+      dtype_map[pfx + "_self_q"] = fc_dtype;
+      dtype_map[pfx + "_self_k"] = fc_dtype;
+      dtype_map[pfx + "_self_v"] = fc_dtype;
+      dtype_map[pfx + "_self_out"] = fc_dtype;
+      dtype_map[pfx + "_cross_q"] = fc_dtype;
+      dtype_map[pfx + "_cross_k"] = fc_dtype;
+      dtype_map[pfx + "_cross_v"] = fc_dtype;
+      dtype_map[pfx + "_cross_out"] = fc_dtype;
+      dtype_map[pfx + "_ffn_inter"] = fc_dtype;
+      dtype_map[pfx + "_ffn_out"] = fc_dtype;
+    }
+    dtype_map["lmhead_dense"] = fc_dtype;
+  }
+
+  // ---- Decoder embedding lookup tables ----
+  if (quant_embd) {
+    dtype_map["word_emb"] = embd_dtype;
+    dtype_map["pos_emb"] = embd_dtype;
+    dtype_map["type_emb"] = embd_dtype;
+  }
+
+  return dtype_map;
 }
 
 /**
