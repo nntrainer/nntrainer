@@ -120,7 +120,7 @@ public:
    *        decoder graph can be built to load quantized weights.
    *
    * Must be called BEFORE initialize() (the dtypes are baked into the graph at
-   * compile time). The orchestrating caller invokes this with the values
+   * compile time). The ScreenAICaption orchestrator calls this with the values
    * from nntr_config when running a quantized model.
    *
    * @param model_tensor_type "<weight>-<activation>" (e.g. "Q4_0-FP32").

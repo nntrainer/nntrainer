@@ -89,6 +89,30 @@ public:
   void load_weight(const std::string &weight_path) override;
 
   /**
+   * @brief Save both sub-model weights with optional dtype conversion.
+   *
+   * The base Transformer::save_weight operates on a single `model` member that
+   * ScreenAICaption does not populate (it owns encoder_/decoder_ sub-models,
+   * each a Transformer with its own `model` + save_weight). This override
+   * DELEGATES: it derives encoder/decoder output paths (mirroring the
+   * encoder/decoder input naming with a dtype suffix from @p weight_path) and
+   * calls encoder_->save_weight() / decoder_->save_weight() with the same
+   * dtype / layer_dtype_map / isa. Used by nntr_quantize.
+   *
+   * @param weight_path Output path supplied by the caller (e.g. the quantize
+   *        tool's dst path). Its dtype suffix / extension is reused to name the
+   *        two derived encoder/decoder output files.
+   * @param dtype Global target dtype (NONE = keep original per-tensor dtype).
+   * @param layer_dtype_map Per-layer dtype overrides (the real quant driver).
+   * @param target_isa Target instruction set for the quantized weights.
+   */
+  void save_weight(const std::string &weight_path,
+                   ml::train::TensorDim::DataType dtype,
+                   const std::map<std::string, ml::train::TensorDim::DataType>
+                     &layer_dtype_map,
+                   ml::train::ISA target_isa) override;
+
+  /**
    * @brief Run captioning on an image path (encode via C++ resize) and emit.
    *
    * @param prompt        Image file path (reusing the prompt arg as the path).

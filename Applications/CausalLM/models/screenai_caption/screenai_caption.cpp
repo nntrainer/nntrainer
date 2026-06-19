@@ -101,16 +101,32 @@ void ScreenAICaption::initialize() {
 
   // ----- Encoder: build a patched nntr_cfg that skips the (text) tokenizer
   //       and declares the MODEL type so the base Transformer ctor is happy.
+  // The encoder ALWAYS runs FP32: its patch_embed_conv is a 4D kernel and the
+  // conv2d layer forces the kernel dtype to the model's global weight dtype
+  // (no per-layer override), so a Q4_0 global type fails graph construction
+  // ("Q4_0_Tensor must be 2 dimensional ..."). nntr_quantize correspondingly
+  // leaves the encoder weights FP32 and quantizes only the decoder FCs.
   json enc_nntr = nntr_cfg_;
   enc_nntr["model_type"] = "Model";
   enc_nntr["skip_tokenizer"] = true;
+  enc_nntr["model_tensor_type"] = "FP32-FP32";
+  enc_nntr["fc_layer_dtype"] = "FP32";
+  enc_nntr["embedding_dtype"] = "FP32";
   json enc_gen = generation_cfg_;
 
   encoder_ = std::make_unique<Siglip2VisionEncoder>(cfg_, enc_gen, enc_nntr);
   encoder_->initialize();
 
-  // ----- Decoder: BertDecoder hardcodes its own params (no JSON needed).
+  // ----- Decoder: BertDecoder hardcodes its own params (no JSON needed), but
+  //       its FC weight tensor type must follow nntr_config so a quantized
+  //       (e.g. Q4_0-FP32) decoder graph is built to load quantized weights.
+  //       The encoder already reads model_tensor_type from nntr_cfg in its
+  //       setupParameters(); mirror that for the decoder here. Embeddings stay
+  //       FP32 (only FC layers are quantized by nntr_quantize for caption).
   decoder_ = std::make_unique<BertDecoder>();
+  const std::string mtt = nntr_cfg_.value("model_tensor_type", "FP32-FP32");
+  const std::string fcdt = nntr_cfg_.value("fc_layer_dtype", "FP32");
+  decoder_->setTensorTypes(mtt, fcdt);
   decoder_->initialize();
   // Allocate + bind the self-attention KV cache (cross-cache buffers are
   // allocated + filled per-image in prefillCrossCache during run()).
@@ -143,6 +159,95 @@ void ScreenAICaption::load_weight(const std::string &weight_path) {
 
   encoder_->load_weight(encoder_weight_file_);
   decoder_->load_weight(decoder_weight_file_);
+}
+
+// ---------------------------------------------------------------------------
+// save_weight  (delegate to encoder_ / decoder_ sub-models)
+// ---------------------------------------------------------------------------
+//
+// ScreenAICaption owns two Transformer sub-models (encoder_/decoder_), each
+// with its own `model` and save_weight; the base ScreenAICaption itself never
+// populates the inherited `model` member. The quantize tool drives the
+// lifecycle factory.create -> initialize() -> load_weight(src) -> save_weight()
+// once on the orchestrator, so this override fans the single save out to both
+// sub-models, deriving each output path from the encoder/decoder input file
+// names plus the dtype suffix the caller embedded in @p weight_path.
+
+void ScreenAICaption::save_weight(
+  const std::string &weight_path, ml::train::TensorDim::DataType dtype,
+  const std::map<std::string, ml::train::TensorDim::DataType> &layer_dtype_map,
+  ml::train::ISA target_isa) {
+  if (!is_initialized)
+    throw std::runtime_error(
+      "ScreenAICaption::save_weight: call initialize() first");
+  if (!encoder_ || !decoder_)
+    throw std::runtime_error(
+      "ScreenAICaption::save_weight: sub-models not constructed");
+
+  // The caller (nntr_quantize) builds weight_path from model_file_name, which
+  // for the caption config is the ENCODER bin (the dtype-suffixed, ISA-tagged
+  // output name). So the encoder output is exactly weight_path. The decoder
+  // output reuses that same dtype/ISA-tagged basename, but with the encoder
+  // input stem swapped for the decoder input stem (e.g.
+  // nntr_siglip2_encoder_q40_..._DEFAULT.bin ->
+  // nntr_caption_decoder_q40_..._DEFAULT.bin), keeping both files in the same
+  // output directory.
+  const std::filesystem::path out_path(weight_path);
+  const std::filesystem::path out_dir = out_path.has_parent_path()
+                                          ? out_path.parent_path()
+                                          : std::filesystem::path(".");
+  const std::string out_name = out_path.filename().string();
+
+  const std::string enc_in =
+    nntr_cfg_.value("encoder_model_file_name", std::string());
+  const std::string dec_in =
+    nntr_cfg_.value("decoder_model_file_name", std::string());
+  if (enc_in.empty() || dec_in.empty())
+    throw std::runtime_error(
+      "ScreenAICaption::save_weight: encoder_model_file_name / "
+      "decoder_model_file_name missing from nntr_config");
+
+  // Strip a trailing source-dtype tag (e.g. "_fp32") so the encoder/decoder
+  // base names match how nntr_quantize's generateOutputBinName() rewrites them
+  // (it removes the old dtype suffix before appending the new one).
+  auto base_of = [](const std::string &name) {
+    std::string s = std::filesystem::path(name).stem().string();
+    for (const char *tag : {"_fp32", "_fp16", "_q40", "_q4_0", "_q6k", "_q6_k",
+                            "_q4k", "_q4_k"}) {
+      const std::string t(tag);
+      if (s.size() >= t.size() &&
+          s.compare(s.size() - t.size(), t.size(), t) == 0) {
+        s = s.substr(0, s.size() - t.size());
+        break;
+      }
+    }
+    return s;
+  };
+  const std::string enc_base = base_of(enc_in);
+  const std::string dec_base = base_of(dec_in);
+
+  // Encoder file == caller's weight_path. Derive the decoder file name by
+  // replacing the encoder base name with the decoder base name inside the
+  // generated output basename (e.g. nntr_siglip2_encoder_q40_..._DEFAULT.bin ->
+  // nntr_caption_decoder_q40_..._DEFAULT.bin). If the encoder base is not found
+  // (e.g. an explicit --output_bin unrelated to the encoder name), prefix the
+  // decoder base instead so the two files stay distinct.
+  const std::string enc_out = weight_path;
+  std::string dec_name;
+  auto pos = out_name.find(enc_base);
+  if (!enc_base.empty() && pos != std::string::npos) {
+    dec_name = out_name.substr(0, pos) + dec_base +
+               out_name.substr(pos + enc_base.size());
+  } else {
+    dec_name = dec_base + "_" + out_name;
+  }
+  const std::string dec_out = (out_dir / dec_name).string();
+
+  std::cout << "[ScreenAICaption] save_weight -> encoder: " << enc_out << "\n";
+  std::cout << "[ScreenAICaption] save_weight -> decoder: " << dec_out << "\n";
+
+  encoder_->save_weight(enc_out, dtype, layer_dtype_map, target_isa);
+  decoder_->save_weight(dec_out, dtype, layer_dtype_map, target_isa);
 }
 
 // ---------------------------------------------------------------------------

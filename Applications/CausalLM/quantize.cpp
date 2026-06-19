@@ -92,6 +92,7 @@
 #include "siglip2/siglip2_vision_encoder.h"
 #if !defined(_WIN32)
 #include "bert_decoder/bert_decoder.h"
+#include "screenai_caption/screenai_caption.h"
 #endif
 
 using json = nlohmann::json;
@@ -272,6 +273,12 @@ std::string resolve_architecture(std::string model_type,
     return "Gemma4ForCausalLM";
   }
 
+  // ScreenAI image-captioning model (SigLIP2 encoder + BERT decoder), exported
+  // by HuggingFace as a VisionEncoderDecoderModel. Mirrors main.cpp's mapping.
+  if (architecture == "VisionEncoderDecoderModel") {
+    return "ScreenAICaption";
+  }
+
   return architecture;
 }
 
@@ -391,6 +398,11 @@ void registerAllModels() {
                           nntr_cfg.value("embedding_dtype", "FP32"));
       return dec;
     });
+  factory.registerModel("ScreenAICaption",
+                        [](json cfg, json generation_cfg, json nntr_cfg) {
+                          return std::make_unique<causallm::ScreenAICaption>(
+                            cfg, generation_cfg, nntr_cfg);
+                        });
 #endif
 }
 
@@ -649,6 +661,40 @@ std::map<std::string, DataType> buildDecoderLayerDtypeMap(int dec_layers,
 }
 
 /**
+ * @brief Build the layer_dtype_map for the ScreenAICaption model.
+ *
+ * ScreenAICaption is a two-sub-model pipeline (SigLIP2 vision encoder + BERT
+ * decoder). The QWEN-style names produced by buildLayerDtypeMap() (layer{i}_wq,
+ * output_of_causallm, ...) do NOT match the caption layer names, so nothing
+ * would be quantized. This reuses buildDecoderLayerDtypeMap() for the decoder
+ * half and deliberately leaves the encoder untouched.
+ *
+ * IMPORTANT — encoder is intentionally NOT quantized. The SigLIP2 encoder's
+ * patch_embed_conv is a 4D conv kernel, and nntrainer's conv2d layer forces its
+ * kernel dtype to the model's global weight dtype with no per-layer override.
+ * A Q4_0 tensor must be 2D, so building the encoder with a Q4_0 global weight
+ * type fails at graph construction ("Q4_0_Tensor must be 2 dimensional ...").
+ * Therefore the encoder must run FP32; the orchestrator forces the encoder
+ * sub-model to FP32 at initialize(), and quantizing encoder FC weights here
+ * would write Q4_0 blocks the FP32 encoder graph cannot load. We quantize the
+ * DECODER (pure FC, no conv) only.
+ *
+ * Deliberately left FP32 (NOT quantized):
+ *   - the entire encoder (patch_embed_conv, all enc_layer{i}_* FCs,
+ *     enc_to_dec_proj, pos_embedding, LayerNorms),
+ *   - all decoder LayerNorms (emb_ln, *_self_ln, *_cross_ln, *_ffn_ln,
+ *     lmhead_ln),
+ *   - lm_head_proj (tied to word_emb, no own weight) and lmhead_bias.
+ */
+std::map<std::string, DataType> buildCaptionLayerDtypeMap(int enc_layers,
+                                                          int dec_layers,
+                                                          DataType fc_dtype,
+                                                          DataType embd_dtype) {
+  (void)enc_layers; // encoder kept FP32 (conv cannot be Q4_0) — see above
+  return buildDecoderLayerDtypeMap(dec_layers, fc_dtype, embd_dtype);
+}
+
+/**
  * @brief Add SentenceTransformer module dtype overrides to the dtype map
  */
 void addSentenceTransformerLayerDtypes(std::map<std::string, DataType> &map,
@@ -836,6 +882,12 @@ int main(int argc, char *argv[]) {
     // reused; fall back to the top-level field for a flat config.
     const bool is_encoder = (architecture == "Siglip2VisionEncoder");
     const bool is_decoder = (architecture == "BertDecoder");
+    // ScreenAICaption (VisionEncoderDecoderModel) nests its layer counts under
+    // cfg["encoder"]/cfg["decoder"]; there is no top-level num_hidden_layers.
+    const bool is_caption = (architecture == "VisionEncoderDecoderModel" ||
+                             architecture == "ScreenAICaption");
+    int enc_layers = 0;
+    int dec_layers = 0;
     int num_layers = 0;
     if (is_encoder) {
       num_layers = cfg.contains("encoder")
@@ -845,6 +897,10 @@ int main(int argc, char *argv[]) {
       num_layers = cfg.contains("decoder")
                      ? cfg.at("decoder").value("num_hidden_layers", 4)
                      : cfg.value("num_hidden_layers", 4);
+    } else if (is_caption) {
+      enc_layers = cfg.at("encoder").value("num_hidden_layers", 12);
+      dec_layers = cfg.at("decoder").value("num_hidden_layers", 4);
+      num_layers = enc_layers + dec_layers;
     } else {
       num_layers = cfg["num_hidden_layers"].get<int>();
     }
@@ -889,6 +945,12 @@ int main(int argc, char *argv[]) {
       }
     }
 
+    // Inject model_dir so image-only orchestrators (e.g. ScreenAICaption) can
+    // resolve their encoder/decoder weight files relative to the model dir
+    // (mirrors main.cpp). The base CausalLM models ignore this field.
+    if (!nntr_cfg.contains("model_dir"))
+      nntr_cfg["model_dir"] = model_path;
+
     auto model = causallm::Factory::Instance().create(architecture, cfg,
                                                       generation_cfg, nntr_cfg);
     if (!model) {
@@ -929,6 +991,9 @@ int main(int argc, char *argv[]) {
       // (Q4_0/Q8_0 or Q6_K), LayerNorms/tied-LM-head stay FP32.
       layer_dtype_map =
         buildDecoderLayerDtypeMap(num_layers, fc_dtype, embd_dtype);
+    } else if (is_caption) {
+      layer_dtype_map =
+        buildCaptionLayerDtypeMap(enc_layers, dec_layers, fc_dtype, embd_dtype);
     } else {
       layer_dtype_map = buildLayerDtypeMap(num_layers, fc_dtype, embd_dtype,
                                            lmhead_dtype, include_lmhead);
@@ -973,6 +1038,49 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["model_tensor_type"] =
       buildModelTensorType(dataTypeToStr(fc_dtype));
 
+    // model_dir was injected only to let the orchestrator resolve weight files
+    // during this run; drop it so the saved config is portable (the runtime
+    // re-injects it from the model directory).
+    new_nntr_cfg.erase("model_dir");
+
+    // For ScreenAICaption the runtime reads encoder_model_file_name /
+    // decoder_model_file_name (not model_file_name) to find the two sub-model
+    // weight files. ScreenAICaption::save_weight wrote them next to
+    // dst_weight_path using the same dtype/ISA-tagged basename (encoder ==
+    // output_bin_name; decoder == that name with the encoder base swapped for
+    // the decoder base). Point the new config at the quantized files.
+    if (is_caption) {
+      const std::string enc_in =
+        nntr_cfg.value("encoder_model_file_name", original_bin);
+      const std::string dec_in =
+        nntr_cfg.value("decoder_model_file_name", std::string());
+      auto base_of = [](const std::string &name) {
+        std::string s = std::filesystem::path(name).stem().string();
+        for (const char *tag : {"_fp32", "_fp16", "_q40", "_q4_0", "_q6k",
+                                "_q6_k", "_q4k", "_q4_k"}) {
+          const std::string t(tag);
+          if (s.size() >= t.size() &&
+              s.compare(s.size() - t.size(), t.size(), t) == 0) {
+            s = s.substr(0, s.size() - t.size());
+            break;
+          }
+        }
+        return s;
+      };
+      const std::string enc_base = base_of(enc_in);
+      const std::string dec_base = base_of(dec_in);
+      std::string dec_name;
+      auto pos = output_bin_name.find(enc_base);
+      if (!enc_base.empty() && pos != std::string::npos) {
+        dec_name = output_bin_name.substr(0, pos) + dec_base +
+                   output_bin_name.substr(pos + enc_base.size());
+      } else {
+        dec_name = dec_base + "_" + output_bin_name;
+      }
+      new_nntr_cfg["encoder_model_file_name"] = output_bin_name;
+      new_nntr_cfg["decoder_model_file_name"] = dec_name;
+    }
+
     std::string output_config_path = output_dir + "/nntr_config.json";
 
     // If output is same dir and we'd overwrite, save as
@@ -1003,7 +1111,8 @@ int main(int argc, char *argv[]) {
                                  "special_tokens_map.json",
                                  "vocab.json",
                                  "merges.txt",
-                                 "modules.json"};
+                                 "modules.json",
+                                 "sample.png"};
       for (const char *fname : aux_files) {
         std::filesystem::path src = std::filesystem::path(model_path) / fname;
         if (!std::filesystem::exists(src))
