@@ -258,8 +258,16 @@ void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
   // sum-of-squares. Used only for small row counts (decode, rows~1): the kernel
   // syncs per call, so for the wide prefill norm (rows=seq_len) the
   // multi-thread host norm wins -- gating by rows gives the decode speedup
-  // without a prefill regression.
-  static constexpr int gpu_max_rows = 32;
+  // without a prefill regression. NNTR_RMSNORM_CUDA_OFF disables; =all forces
+  // all rows.
+  static const int gpu_max_rows = []() {
+    const char *e = std::getenv("NNTR_RMSNORM_CUDA_OFF");
+    if (e && e[0] == 'a')
+      return 1 << 30; // "all"
+    if (e)
+      return 0; // off
+    return 32;  // decode-only default
+  }();
   if (dt == DT::FP16 && gt == DT::FP16 && out.getDataType() == DT::FP16 &&
       (int)rows <= gpu_max_rows) {
     const unsigned short *xi =
