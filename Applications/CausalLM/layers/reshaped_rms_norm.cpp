@@ -25,6 +25,11 @@
 #endif
 #include <memory_data.h>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_rmsnorm.h>
+#include <cuda_runtime.h>
+#endif
+
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -205,6 +210,41 @@ void ReshapedRMSNormLayer::incremental_forwarding(
       }
     }
 #endif // ENABLE_OPENCL
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // CUDA per-head norm: each feature_size chunk is one rmsnorm row, so reuse
+    // cuda_rmsnorm_fp16 with rows=n_rows, width=feature_size (gamma null for
+    // the gamma-free v_norm). Keeps q/k/v_norm on the device. Opt-in
+    // NNTR_CUDA_QKNORM.
+    if (!gpu_done &&
+        in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      static const bool gpu = std::getenv("NNTR_CUDA_QKNORM") != nullptr;
+      if (gpu) {
+        auto *ip =
+          reinterpret_cast<const unsigned short *>(in_step.getData<_FP16>());
+        auto *op =
+          reinterpret_cast<unsigned short *>(out_step.getData<_FP16>());
+        const unsigned short *gp =
+          gamma
+            ? reinterpret_cast<const unsigned short *>(gamma->getData<_FP16>())
+            : nullptr;
+        auto dev_ok = [](const void *p) {
+          if (!p)
+            return true;
+          cudaPointerAttributes a{};
+          bool ok =
+            cudaPointerGetAttributes(&a, p) == cudaSuccess &&
+            (a.type == cudaMemoryTypeManaged || a.type == cudaMemoryTypeDevice);
+          cudaGetLastError();
+          return ok;
+        };
+        if (dev_ok(ip) && dev_ok(op) && dev_ok(gp) &&
+            nntrainer::cuda::cuda_rmsnorm_fp16(ip, gp, op, epsilon, n_rows,
+                                               feature_size))
+          gpu_done = true;
+      }
+    }
+#endif
 
     if (!gpu_done) {
 #if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
