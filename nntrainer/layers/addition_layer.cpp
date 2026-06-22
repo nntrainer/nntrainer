@@ -18,6 +18,10 @@
 #include <tensor.h>
 #include <util_func.h>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#endif
 #include <layer_context.h>
 
 namespace nntrainer {
@@ -63,6 +67,42 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
   for (unsigned int b = 0; b < hidden_.batch(); ++b) {
     Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // GPU residual add (the common 2-input fp16 device case): out = in0 + in1
+    // in one kernel, keeping the residual on-device. Opt-in
+    // (NNTR_CUDA_ELTWISE).
+    if (context.getNumInputs() == 2 &&
+        hidden_.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      static const bool gpu = std::getenv("NNTR_CUDA_ELTWISE") != nullptr;
+      if (gpu) {
+        const Tensor &i0 = context.getInput(0);
+        const Tensor &i1 = context.getInput(1);
+        TensorDim sd0 = i0.getDim(), sd1 = i1.getDim();
+        sd0.batch(1);
+        sd0.height(to - from);
+        sd1.batch(1);
+        sd1.height(to - from);
+        Tensor s0 =
+          i0.getSharedDataTensor(sd0, b * i0.getDim().getFeatureLen(), true);
+        Tensor s1 =
+          i1.getSharedDataTensor(sd1, b * i1.getDim().getFeatureLen(), true);
+        auto *a = reinterpret_cast<const unsigned short *>(s0.getData<_FP16>());
+        auto *bb =
+          reinterpret_cast<const unsigned short *>(s1.getData<_FP16>());
+        auto *o =
+          reinterpret_cast<unsigned short *>(hidden_step.getData<_FP16>());
+        cudaPointerAttributes pa{};
+        bool dev =
+          cudaPointerGetAttributes(&pa, a) == cudaSuccess &&
+          (pa.type == cudaMemoryTypeManaged || pa.type == cudaMemoryTypeDevice);
+        cudaGetLastError();
+        if (dev &&
+            cuda::cuda_add_fp16(a, bb, o, (unsigned int)hidden_step.size()))
+          continue;
+      }
+    }
+#endif
 
     /** @todo check possibility for in-place of addition layer */
     for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {

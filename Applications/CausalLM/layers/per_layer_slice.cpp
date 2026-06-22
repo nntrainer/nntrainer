@@ -10,8 +10,14 @@
  * @brief  Selects per-layer input chunk from packed per-layer embedding tensor.
  */
 
+#include <cstdlib>
 #include <cstring>
 #include <per_layer_slice.h>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#endif
 
 namespace causallm {
 
@@ -83,12 +89,31 @@ void PerLayerSliceLayer::incremental_forwarding(
     } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       _FP16 *in_data = in_step.getData<_FP16>();
       _FP16 *out_data = out_step.getData<_FP16>();
-      for (unsigned int t = 0; t < tokens; ++t) {
-        const _FP16 *src =
-          in_data + t * in_dim.width() + layer_index * feature_size;
-        _FP16 *dst = out_data + t * feature_size;
-        std::memcpy(dst, src, sizeof(_FP16) * feature_size);
+      bool done = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // GPU slice-copy: keep the packed per-layer embedding slice on-device
+      // instead of the host memcpy loop. Opt-in (NNTR_CUDA_ELTWISE).
+      static const bool gpu = std::getenv("NNTR_CUDA_ELTWISE") != nullptr;
+      if (gpu) {
+        cudaPointerAttributes pa{};
+        bool dev =
+          cudaPointerGetAttributes(&pa, in_data) == cudaSuccess &&
+          (pa.type == cudaMemoryTypeManaged || pa.type == cudaMemoryTypeDevice);
+        cudaGetLastError();
+        if (dev && nntrainer::cuda::cuda_slice_copy_fp16(
+                     reinterpret_cast<const unsigned short *>(in_data),
+                     reinterpret_cast<unsigned short *>(out_data), tokens,
+                     in_dim.width(), layer_index * feature_size, feature_size))
+          done = true;
       }
+#endif
+      if (!done)
+        for (unsigned int t = 0; t < tokens; ++t) {
+          const _FP16 *src =
+            in_data + t * in_dim.width() + layer_index * feature_size;
+          _FP16 *dst = out_data + t * feature_size;
+          std::memcpy(dst, src, sizeof(_FP16) * feature_size);
+        }
 #endif
     } else {
       throw std::invalid_argument(
