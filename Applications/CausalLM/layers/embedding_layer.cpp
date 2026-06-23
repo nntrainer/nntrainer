@@ -32,6 +32,52 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+
+namespace {
+// NNTR_CUDA_ASYNC guard for the pinned embedding staging buffers: in async
+// mode nothing drains the stream per-op, so the NEXT token's host dequant can
+// rewrite (or cudaFreeHost) emb_stage while the PREVIOUS token's H2D from the
+// same buffer is still in flight -> the consumer kernel reads torn rows
+// (field: word-salad decode under ASYNC=1, coherent under sync). One event on
+// the single backend stream marks the most recent staging H2D; stream FIFO
+// means "last H2D done" implies every earlier one is done, so a single shared
+// event safely guards both instances (embedding0 + per_layer_input_embedding).
+// Skipped during graph capture: an in-capture cudaEventSynchronize is illegal
+// and the captured H2D is replay-ordered by the graph itself.
+cudaEvent_t g_emb_h2d_evt = nullptr;
+bool g_emb_h2d_pending = false;
+
+void emb_stage_h2d_record() {
+  auto &sm = nntrainer::cuda::StreamManager::Global();
+  if (sm.isCapturing())
+    return;
+  if (g_emb_h2d_evt == nullptr &&
+      cudaEventCreateWithFlags(&g_emb_h2d_evt, cudaEventDisableTiming) !=
+        cudaSuccess) {
+    g_emb_h2d_evt = nullptr;
+    cudaGetLastError();
+    return;
+  }
+  if (cudaEventRecord(g_emb_h2d_evt, sm.GetStream()) == cudaSuccess)
+    g_emb_h2d_pending = true;
+  else
+    cudaGetLastError();
+}
+
+void emb_stage_h2d_wait() {
+  if (!g_emb_h2d_pending ||
+      nntrainer::cuda::StreamManager::Global().isCapturing())
+    return;
+  cudaEventSynchronize(g_emb_h2d_evt);
+  g_emb_h2d_pending = false;
+}
+} // namespace
+#endif
+
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -654,6 +700,46 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     int iter = to - from;
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // Device-only activation pool (NNTR_CUDA_DEV_ACT): the embedding output is
+    // real device memory (not host-addressable). Dequant into a host staging
+    // buffer and push it H2D on the backend stream. Persistent + PINNED host
+    // staging: under CUDA-graph stream capture a local vector fails twice --
+    // (a) a pageable cudaMemcpyAsync is NOT capturable, and (b) the vector is
+    // freed when this function returns, but the captured graph REPLAYS
+    // afterwards, copying from freed memory => garbage. A layer-lifetime
+    // pinned (cudaHostAlloc) buffer is capturable and survives the replay.
+    // PER INSTANCE (member, NOT a function static): embedding0 and the PLE
+    // both run this method, and a shared static let the PLE overwrite
+    // embedding0's still-in-flight async copy. Grows monotonically (decode
+    // iter==1; prefill iter<=max_seq_len); single sequence (b_size==1).
+    _FP16 *&emb_stage = *reinterpret_cast<_FP16 **>(&cuda_stage);
+    size_t &emb_stage_cap = cuda_stage_cap;
+    bool emb_dev_only = false;
+    if (nntrainer::cuda::engine_selected() &&
+        hidden_.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+      cudaPointerAttributes pa{};
+      emb_dev_only =
+        cudaPointerGetAttributes(&pa, batchsliced_hidden.getData<_FP16>()) ==
+          cudaSuccess &&
+        pa.type == cudaMemoryTypeDevice;
+      cudaGetLastError();
+      if (emb_dev_only) {
+        // Async-mode: the previous token's H2D from this pinned buffer may
+        // still be in flight -- wait before the host rewrites or frees it.
+        emb_stage_h2d_wait();
+        size_t need = (size_t)iter * out_dim;
+        if (need > emb_stage_cap) {
+          if (emb_stage)
+            cudaFreeHost(emb_stage);
+          cudaHostAlloc((void **)&emb_stage, need * sizeof(_FP16),
+                        cudaHostAllocDefault);
+          emb_stage_cap = need;
+        }
+      }
+    }
+#endif
+
     auto &tm = nntrainer::ThreadManager::Global();
     tm.parallel_for(0, static_cast<size_t>(iter), [&](size_t i) {
       size_t embed_idx = static_cast<size_t>(in_data[i]);
@@ -684,7 +770,17 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                   nntrainer::TensorDim::DataType::FP32));
           nntrainer::Tensor tmp(fp32_dim, true);
           nntrainer::dequantize_row_q6_K(src, tmp.getData(), out_dim);
-          out_tensor.copyData(tmp);
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+          if (emb_dev_only) {
+            // device-only output: cast into the pinned staging (scale folded;
+            // the trailing multiply_i below is skipped on this path).
+            const float *tp = tmp.getData();
+            _FP16 *o = emb_stage + (size_t)i * out_dim;
+            for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
+              o[k] = static_cast<_FP16>(tp[k] * scale);
+          } else
+#endif
+            out_tensor.copyData(tmp);
         }
       } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0) {
         ///@note this should be replaced with quantizer operation
@@ -704,16 +800,72 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                   nntrainer::TensorDim::DataType::FP32));
           nntrainer::Tensor tmp(fp32_dim, true);
           nntrainer::dequantize_row_q4_0(src, tmp.getData(), out_dim);
-          out_tensor.copyData(tmp);
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+          if (emb_dev_only) {
+            const float *tp = tmp.getData();
+            _FP16 *o = emb_stage + (size_t)i * out_dim;
+            for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
+              o[k] = static_cast<_FP16>(tp[k] * scale);
+          } else
+#endif
+            out_tensor.copyData(tmp);
         }
       } else {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+        if (emb_dev_only &&
+            weight.getDataType() == nntrainer::TensorDim::DataType::FP32) {
+          // FP32 weight row -> FP16 device-only output: explicit narrowing
+          // cast into the pinned staging (copyData would byte-copy 2x and the
+          // host write would fault on the device-only buffer). Scale folded.
+          const float *src = cur_weight.getData<float>();
+          _FP16 *o = emb_stage + (size_t)i * out_dim;
+          for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
+            o[k] = static_cast<_FP16>(src[k] * scale);
+          return;
+        }
+#endif
         out_tensor.copyData(cur_weight);
       }
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+      if (emb_dev_only)
+        return; // scale already folded into the staging cast
+#endif
       if (scale != 1.0f) {
         out_tensor.multiply_i(scale);
       }
     });
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // Push the host-dequantized rows into the device-only output on the
+    // backend stream (ordered before the GPU consumer). Windows default is a
+    // fully-synchronous upload (the async H2D under DEV_ACT was the measured
+    // Windows divergence source); NNTR_CUDA_EMB_SYNCCOPY=0/1 overrides.
+    if (emb_dev_only) {
+      static const bool emb_synccopy = []() {
+        const char *e = std::getenv("NNTR_CUDA_EMB_SYNCCOPY");
+        if (e)
+          return e[0] == '1';
+#ifdef _WIN32
+        return true;
+#else
+        return false;
+#endif
+      }();
+      if (emb_synccopy &&
+          !nntrainer::cuda::StreamManager::Global().isCapturing()) {
+        cudaMemcpy(batchsliced_hidden.getData<_FP16>(), emb_stage,
+                   (size_t)iter * out_dim * sizeof(_FP16),
+                   cudaMemcpyHostToDevice);
+      } else {
+        cudaMemcpyAsync(batchsliced_hidden.getData<_FP16>(), emb_stage,
+                        (size_t)iter * out_dim * sizeof(_FP16),
+                        cudaMemcpyHostToDevice,
+                        nntrainer::cuda::StreamManager::Global().GetStream());
+        emb_stage_h2d_record();
+      }
+    }
+#endif
 
 #ifdef DEBUG
     std::cout << context.getName() << " : "

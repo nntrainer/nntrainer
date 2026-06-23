@@ -221,6 +221,13 @@ private:
     embedding_props;
   unsigned int weight_idx;
   std::shared_ptr<QuantLut> quant_lut;
+
+  /// Pinned host staging for the CUDA device-only activation pool
+  /// (NNTR_CUDA_DEV_ACT): per instance so embedding0 and
+  /// per_layer_input_embedding cannot overwrite each other's in-flight H2D.
+  /// Grows monotonically; process lifetime (freed only on regrow).
+  void *cuda_stage = nullptr;
+  size_t cuda_stage_cap = 0; ///< capacity in _FP16 elements
 };
 } // namespace causallm
 
