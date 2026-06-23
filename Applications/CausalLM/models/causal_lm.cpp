@@ -929,6 +929,22 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
             const unsigned short *uS = nullptr;
             nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
               wt.getScale<float>(), wt.width(), &uS);
+            // skip_prefill FC towers (their prefill is an early-return) and
+            // the untied lm_head (decodes at M=1) can never reach the M>=32
+            // cuBLAS-i8 gate -- their [K,N] int8 cache (2x the int4 payload;
+            // the untied lm_head alone is hundreds of MiB) is dead VRAM.
+            // Exempt them from the EAGER build; the lazy runtime build
+            // remains as the self-healing fallback.
+            bool i8_dead = l.getName() == "output_of_causallm";
+            if (!i8_dead) {
+              try {
+                i8_dead = l.getProperty("skip_prefill") == "true";
+              } catch (...) {
+              }
+            }
+            if (i8_dead)
+              nntrainer::cuda::cuda_fc_qs4cx_prewarm_exempt_i8(
+                wt.getData<uint8_t>());
             nntrainer::cuda::cuda_fc_qs4cx_prewarm(wt.getData<uint8_t>(),
                                                    wt.width(), wt.height());
           }

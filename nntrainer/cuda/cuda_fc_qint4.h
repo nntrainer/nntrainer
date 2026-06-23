@@ -113,6 +113,13 @@ bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
                            unsigned int K);
 
 /**
+ * @brief Mark a weight exempt from the eager load-time cuBLAS-i8 [K,N] cache
+ *        build (skip_prefill towers / untied lm_head cannot reach the M>=32
+ *        cuBLAS gate -- their int8 cache is dead VRAM). Lazy build self-heals.
+ */
+void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w);
+
+/**
  * @brief Pre-grow the dp4a activation-quant scratch to the given decode
  *        bounds so the M=1 decode FC never cudaMallocs inside a CUDA-graph
  *        capture. maxN is accepted for signature stability; the decode path

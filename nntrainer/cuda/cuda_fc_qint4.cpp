@@ -19,10 +19,14 @@
 
 #include <nntrainer_log.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <thread_manager.h>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <fp16.h>
@@ -763,6 +767,11 @@ struct DevWeightI8 {
   int *rowsum = nullptr;     // per-channel sum of int8 weight [N]
 };
 std::unordered_map<const void *, DevWeightI8> g_i8_weight_cache;
+// FCs exempted from the EAGER cuBLAS-i8 cache build (skip_prefill towers /
+// untied lm_head decode at M=1 never reach the M>=32 cuBLAS gate; their [K,N]
+// int8 cache would be dead VRAM). The lazy runtime build self-heals if one is
+// ever reached anyway.
+std::unordered_set<const void *> g_i8_exempt;
 int *g_i8_c = nullptr; // int32 GEMM output scratch [Mpad,N]
 size_t g_i8_c_cap = 0;
 // act-quant dedup (opt-in NNTR_QUANT_DEDUP): sibling FCs sharing an input
@@ -1258,16 +1267,110 @@ bool cuda_fc_qs4cx_prefetch_weight(const unsigned char *plain_w, unsigned int N,
 
 // --- load-time prewarm + teardown lifecycle -------------------------------
 
+// Mark a weight exempt from the eager load-time cuBLAS-i8 [K,N] build (see
+// g_i8_exempt). Called at load time before the prewarm walk.
+void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w) {
+  g_i8_exempt.insert(plain_w);
+}
+
 bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
                            unsigned int K) {
   if (plain_w == nullptr || N == 0 || K == 0)
     return true;
-  // The dp4a derived cache (packed int4 + per-channel rowsum) is built by the
-  // GPU repack kernels straight from the plain payload -- no host mirror is
-  // staged, so prewarming at load costs no transient host RSS. Idempotent
-  // (pointer-keyed); the lazy build in the GEMM path remains the fallback.
   std::lock_guard<std::mutex> lk(g_dp4a_mtx);
-  return ensure_dp4a_cache_locked(plain_w, N, K) != nullptr;
+  if (g_dp4a_plain_cache.count(plain_w))
+    return true; // already cached
+  const size_t Kh = (K + 1u) / 2u;
+  auto &tm = nntrainer::ThreadManager::Global();
+
+  // Build + upload in bounded chunks: a full host mirror of the untied
+  // lm_head (N=262144) is ~350MB packed + ~700MB int8 and those transients
+  // WERE the process peak RSS once the Section-A copy was gone (RSS timeline:
+  // a +1GB step right at the peak, late in load). ~64MB chunks keep the
+  // prewarm off the peak entirely; results are byte-identical (same values,
+  // same device offsets).
+  static constexpr size_t PREWARM_CHUNK_BYTES = 64u << 20;
+
+  DevWeightQ dw;
+  if (cudaMalloc(&dw.plain, (size_t)N * Kh) != cudaSuccess)
+    return false;
+  if (cudaMalloc(&dw.rowsum, sizeof(int) * (size_t)N) != cudaSuccess) {
+    cudaFree(dw.plain);
+    return false;
+  }
+  {
+    // packed int4 [N][Kh] in row chunks (rows are contiguous on both sides).
+    const size_t chunk_rows =
+      std::max<size_t>(1, std::min<size_t>(N, PREWARM_CHUNK_BYTES / Kh));
+    std::vector<signed char> packed(chunk_rows * Kh);
+    std::vector<int> rowsum(N, 0);
+    for (size_t n0 = 0; n0 < N; n0 += chunk_rows) {
+      const size_t rows = std::min(chunk_rows, (size_t)N - n0);
+      tm.parallel_for(0, rows, [&](size_t r) {
+        const unsigned char *src = plain_w + (n0 + r) * Kh;
+        signed char *prow = packed.data() + r * Kh;
+        long acc = 0;
+        for (size_t kb = 0; kb < Kh; ++kb) {
+          const unsigned char b = src[kb];
+          prow[kb] = (signed char)(b ^ 0x88);
+          // odd-K pad nibble is stored 8 (= int4 0), so it adds 0 here --
+          // same rowsum the old k1<K guard produced.
+          acc += ((int)(b & 0xF) - 8) + ((int)((b >> 4) & 0xF) - 8);
+        }
+        rowsum[n0 + r] = (int)acc;
+      });
+      cudaMemcpy(dw.plain + n0 * Kh, packed.data(), rows * Kh,
+                 cudaMemcpyHostToDevice);
+    }
+    cudaMemcpy(dw.rowsum, rowsum.data(), sizeof(int) * (size_t)N,
+               cudaMemcpyHostToDevice);
+  }
+  g_dp4a_plain_cache.emplace(plain_w, dw);
+
+  // Also prewarm the cuBLAS int8 [K,N] weight cache when the cuBLAS prefill FC
+  // path is on: otherwise its one-time GPU repack (repack_plain_i8_kn, ~32% of
+  // cold prefill GPU time) runs on the first prefill instead of at load.
+  // Mirrors repack_plain_i8_kn (w8[k*N+n]=int4(n,k)) + weight_rowsum_kn
+  // bit-exactly. Chunked along K ([k0,k1) rows of the [K,N] buffer are
+  // contiguous on both sides); the per-channel rowsum accumulates across
+  // chunks.
+  static const char *_cb = std::getenv("NNTR_FC_CUDA_CUBLAS");
+  if (_cb && _cb[0] != '0' && !i8_jit_on() &&
+      !g_i8_weight_cache.count(plain_w) && !g_i8_exempt.count(plain_w)) {
+    const size_t chunk_k =
+      std::max<size_t>(1, std::min<size_t>(K, PREWARM_CHUNK_BYTES / N));
+    std::vector<signed char> w8(chunk_k * (size_t)N);
+    std::vector<long> rs8(N, 0);
+    DevWeightI8 dw8;
+    if (cudaMalloc(&dw8.w8, (size_t)K * N) == cudaSuccess &&
+        cudaMalloc(&dw8.rowsum, sizeof(int) * (size_t)N) == cudaSuccess) {
+      for (size_t k0 = 0; k0 < K; k0 += chunk_k) {
+        const size_t ks = std::min(chunk_k, (size_t)K - k0);
+        tm.parallel_for(0, (size_t)N, [&](size_t n) {
+          const unsigned char *src = plain_w + n * Kh;
+          long acc = 0;
+          for (size_t kk = k0; kk < k0 + ks; ++kk) {
+            const unsigned char b = src[kk >> 1];
+            const int v = (int)((kk & 1) ? ((b >> 4) & 0xF) : (b & 0xF)) - 8;
+            w8[(kk - k0) * N + n] = (signed char)v;
+            acc += v;
+          }
+          rs8[n] += acc;
+        });
+        cudaMemcpy(dw8.w8 + k0 * N, w8.data(), ks * (size_t)N,
+                   cudaMemcpyHostToDevice);
+      }
+      std::vector<int> rs8i(N);
+      for (size_t n = 0; n < N; ++n)
+        rs8i[n] = (int)rs8[n];
+      cudaMemcpy(dw8.rowsum, rs8i.data(), sizeof(int) * (size_t)N,
+                 cudaMemcpyHostToDevice);
+      g_i8_weight_cache.emplace(plain_w, dw8);
+    } else if (dw8.w8) {
+      cudaFree(dw8.w8);
+    }
+  }
+  return true;
 }
 
 bool cuda_fc_qint4_dp4a_prewarm(unsigned int maxM, unsigned int maxK,
