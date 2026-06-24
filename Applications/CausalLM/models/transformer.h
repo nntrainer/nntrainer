@@ -64,6 +64,38 @@ using json = nlohmann::json;
 enum class ModelType { MODEL, CAUSALLM, EMBEDDING, UNKNOWN };
 
 /**
+ * @brief Non-owning logits processor hook for token generation
+ */
+class LogitsProcessor {
+public:
+  /**
+   * @brief Destroy the LogitsProcessor object
+   */
+  virtual ~LogitsProcessor() = default;
+
+  /**
+   * @brief Mutate one batch row of logits before token selection
+   * @param logits FP32 logits for a single batch row
+   * @param vocab_size Number of logits in the row
+   * @param batch_index Batch row index
+   */
+  virtual void process(float *logits, unsigned int vocab_size,
+                       unsigned int batch_index) = 0;
+
+  /**
+   * @brief Receive the selected token after token selection
+   * @param token_id Selected token id
+   * @param batch_index Batch row index
+   */
+  virtual void acceptToken(unsigned int token_id, unsigned int batch_index) = 0;
+
+  /**
+   * @brief Reset processor state when requested by the caller
+   */
+  virtual void reset() {}
+};
+
+/**
  * @brief Transformer Class
  */
 WIN_EXPORT class Transformer {
@@ -137,6 +169,23 @@ public:
    * @brief get the status of run
    */
   bool hasRun() const { return has_run_; }
+
+  /**
+   * @brief Get configured vocabulary size
+   * @return Vocabulary size
+   */
+  unsigned int getVocabSize() const { return NUM_VOCAB; }
+
+  /**
+   * @brief Attach a non-owning logits processor
+   * @param processor Processor pointer, or nullptr to detach
+   */
+  virtual void setLogitsProcessor(LogitsProcessor *) {}
+
+  /**
+   * @brief Reset attached logits processor state
+   */
+  virtual void resetLogitsProcessor() {}
 
 protected:
   /**

@@ -23,6 +23,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <utility>
@@ -414,6 +415,141 @@ protected:
                                                 GetParam().name);
   }
 };
+
+/**
+ * @brief Logits processor that forces one token and records callbacks
+ */
+class ForcingLogitsProcessor final : public causallm::LogitsProcessor {
+public:
+  explicit ForcingLogitsProcessor(unsigned int token) : token(token) {}
+
+  /**
+   * @brief Mask every logit except the forced token
+   */
+  void process(float *logits, unsigned int vocab_size,
+               unsigned int batch_index) override {
+    ++process_count;
+    last_batch_index = batch_index;
+    last_vocab_size = vocab_size;
+
+    for (unsigned int i = 0; i < vocab_size; ++i)
+      logits[i] = -std::numeric_limits<float>::infinity();
+    logits[token] = 100.0f;
+  }
+
+  /**
+   * @brief Record the accepted token
+   */
+  void acceptToken(unsigned int token_id, unsigned int batch_index) override {
+    ++accept_count;
+    accepted_token = token_id;
+    accepted_batch_index = batch_index;
+  }
+
+  /**
+   * @brief Record reset calls
+   */
+  void reset() override { ++reset_count; }
+
+  unsigned int token;
+  unsigned int process_count = 0;
+  unsigned int accept_count = 0;
+  unsigned int reset_count = 0;
+  unsigned int last_batch_index = 99;
+  unsigned int accepted_batch_index = 99;
+  unsigned int last_vocab_size = 0;
+  unsigned int accepted_token = 0;
+};
+
+/**
+ * @brief Make a direct tiny Qwen2 model for logits processor hook tests
+ */
+std::unique_ptr<TinyQwen2CausalLM>
+makeDirectTinyQwen2Model(
+  const causallm_test::TinyCausalLMFiles &files,
+  const causallm_test::TinyCausalLMCase &test_case,
+  const std::vector<unsigned int> &bad_word_ids = {}) {
+  auto config =
+    causallm_test::makeTinyCausalLMConfig(test_case, files.tokenizer_path);
+  config.nntrainer["bad_word_ids"] = bad_word_ids;
+  return std::make_unique<TinyQwen2CausalLM>(config.model, config.generation,
+                                             config.nntrainer);
+}
+
+/**
+ * @brief Test that Transformer exposes the configured vocabulary size
+ */
+TEST_P(Qwen2CausalLMTinyModelTest, TransformerReturnsConfiguredVocabSize) {
+  const auto files = makeFiles();
+  auto model = makeDirectTinyQwen2Model(files, GetParam());
+
+  EXPECT_EQ(model->getVocabSize(), 32u);
+}
+
+/**
+ * @brief Test that a logits processor can force greedy generation
+ */
+TEST_P(Qwen2CausalLMTinyModelTest,
+       LogitsProcessorForcesGreedyGenerationAndReceivesAcceptedToken) {
+  const auto files = makeFiles();
+  auto model = makeDirectTinyQwen2Model(files, GetParam(), {7});
+  ForcingLogitsProcessor processor(7);
+  std::vector<float> logits(32, -2.0f);
+  logits[3] = 5.0f;
+  unsigned int input_ids[4] = {1, 0, 0, 0};
+
+  model->setLogitsProcessor(&processor);
+  auto ids = model->generateFromLogits(logits.data(), false, 1.0f, input_ids,
+                                       1);
+
+  ASSERT_EQ(ids.size(), 1u);
+  EXPECT_EQ(ids[0], 7u);
+  EXPECT_EQ(processor.process_count, 1u);
+  EXPECT_EQ(processor.accept_count, 1u);
+  EXPECT_EQ(processor.last_vocab_size, 32u);
+  EXPECT_EQ(processor.last_batch_index, 0u);
+  EXPECT_EQ(processor.accepted_token, 7u);
+  EXPECT_EQ(processor.accepted_batch_index, 0u);
+}
+
+/**
+ * @brief Test that detaching a logits processor restores greedy argmax
+ */
+TEST_P(Qwen2CausalLMTinyModelTest,
+       DetachingLogitsProcessorRestoresGreedyArgmax) {
+  const auto files = makeFiles();
+  auto model = makeDirectTinyQwen2Model(files, GetParam());
+  ForcingLogitsProcessor processor(7);
+  unsigned int input_ids[4] = {1, 0, 0, 0};
+
+  model->setLogitsProcessor(&processor);
+  model->setLogitsProcessor(nullptr);
+
+  std::vector<float> logits(32, -2.0f);
+  logits[3] = 5.0f;
+  logits[7] = 4.0f;
+  auto ids = model->generateFromLogits(logits.data(), false, 1.0f, input_ids,
+                                       1);
+
+  ASSERT_EQ(ids.size(), 1u);
+  EXPECT_EQ(ids[0], 3u);
+  EXPECT_EQ(processor.process_count, 0u);
+  EXPECT_EQ(processor.accept_count, 0u);
+}
+
+/**
+ * @brief Test that resetLogitsProcessor forwards to the attached processor
+ */
+TEST_P(Qwen2CausalLMTinyModelTest, ResetLogitsProcessorForwardsReset) {
+  const auto files = makeFiles();
+  auto model = makeDirectTinyQwen2Model(files, GetParam());
+  ForcingLogitsProcessor processor(7);
+
+  model->setLogitsProcessor(&processor);
+  model->resetLogitsProcessor();
+
+  EXPECT_EQ(processor.reset_count, 1u);
+}
 
 /**
  * @brief Test that greedy generation chooses the argmax logit
