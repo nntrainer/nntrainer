@@ -156,7 +156,11 @@ endif
 
 if get_option('enable-fp16')
    if get_option('platform') == 'android'
-     add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
+     # NDK clang (and non-ARM host compilers used for the meson-built QNN
+     # plugin) reject -mfp16-format=ieee; only pass it when supported.
+     if cxx.has_argument('-mfp16-format=ieee')
+       add_project_arguments('-mfp16-format=ieee', language: ['c', 'cpp'])
+     endif
      extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
    elif arch == 'aarch64'

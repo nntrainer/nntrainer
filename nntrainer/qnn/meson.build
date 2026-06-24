@@ -23,6 +23,11 @@ qnn_sdk_inc = include_directories(
   is_system: true,
 )
 nntrainer_inc += qnn_sdk_inc
+# The Android ndk-build path (jni/Android.mk) builds the QNN layer ops into
+# libnntrainer.so and consumes the absolute include list (nntrainer_inc_abs),
+# not the include_directories object above. Expose the SDK headers there too,
+# otherwise ndk-build cannot find BackendExtensions.hpp / QnnTypes.h etc.
+nntrainer_inc_abs += [qnn_sdk_root / 'include', qnn_sdk_root / 'include' / 'QNN']
 
 # nntrainer's own QNN integration code (Apache-2.0).
 subdir('jni')
