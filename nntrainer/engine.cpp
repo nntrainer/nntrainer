@@ -37,6 +37,15 @@ std::once_flag global_engine_init_flag;
 nntrainer::Context
   *Engine::nntrainerRegisteredContext[Engine::RegisterContextMax];
 
+Engine &Engine::Global() {
+  // Single definition in libnntrainer.so → one Engine instance shared by every
+  // consumer .so (see declaration in engine.h). initializeOnce() registers the
+  // default contexts (cpu/gpu, and qnn when ENABLE_NPU) exactly once.
+  static Engine instance;
+  instance.initializeOnce();
+  return instance;
+}
+
 void Engine::add_default_object() {
   /// @note all layers should be added to the app_context to guarantee that
   /// createLayer/createOptimizer class is created
@@ -180,6 +189,16 @@ int Engine::registerContext(const std::string &library_path,
   auto type = context->getName();
   NNTR_THROW_IF_CLEANUP(type == "", std::invalid_argument, close_dl)
     << func_tag << "custom layer must specify type name, but it is empty";
+
+  // If this type is already registered (e.g. called again for a second
+  // sub-model in a multi-model handle), free the newly-created context
+  // immediately rather than leaking it. The name-based overload is the
+  // authoritative synchronized check; this is just an early-exit path.
+  if (engines.find(type) != engines.end()) {
+    pluggable->destroyfunc(context);
+    DynamicLibraryLoader::freeLibrary(handle);
+    return 0;
+  }
 
   registerContext(type, context);
 

@@ -11,6 +11,7 @@
  */
 
 #include <fstream>
+#include <mutex>
 
 #include <app_context.h>
 #include <engine.h>
@@ -529,12 +530,12 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
  * @brief Register custom CausalLM layers in the nntrainer app context.
  */
 void Transformer::registerCustomLayers() {
-  ///
-  const auto &ct_engine = nntrainer::Engine::Global();
-  const auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+  static std::once_flag registered;
+  std::call_once(registered, []() {
+    const auto &ct_engine = nntrainer::Engine::Global();
+    const auto app_context =
+      static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
 
-  try {
     app_context->registerFactory(nntrainer::createLayer<causallm::SwiGLULayer>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::RMSNormLayer>);
@@ -544,11 +545,7 @@ void Transformer::registerCustomLayers() {
       nntrainer::createLayer<causallm::TieWordEmbedding>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::EmbeddingLayer>);
-
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
-  }
+  });
 }
 
 } // namespace causallm
