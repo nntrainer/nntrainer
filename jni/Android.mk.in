@@ -260,7 +260,7 @@ LOCAL_MODULE_TAGS   := optional
 LOCAL_LDLIBS        := -llog -landroid
 LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384"
 
-LOCAL_SHARED_LIBRARIES += nntrainer ml-api-inference
+LOCAL_SHARED_LIBRARIES += nntrainer
 
 include $(BUILD_SHARED_LIBRARY)
 
