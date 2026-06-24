@@ -108,8 +108,11 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
     setupParameters(cfg, generation_cfg, nntr_cfg);
   }
 
-  // Skip tokenizer if specified (e.g., for vision encoder models)
-  if (skip_tokenizer) {
+  // Skip tokenizer if specified, or when no tokenizer_file is configured
+  // (e.g. vision-encoder sub-models composed into a multimodal handle, whose
+  // config carries no tokenizer). Avoids a json type_error on a null path.
+  if (skip_tokenizer || !nntr_cfg.contains("tokenizer_file") ||
+      nntr_cfg["tokenizer_file"].is_null()) {
     tokenizer = nullptr; // No tokenizer for this model
   } else {
     tokenizer = tokenizers::Tokenizer::FromBlobJSON(
