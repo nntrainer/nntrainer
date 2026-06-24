@@ -156,6 +156,21 @@ public:
     exec_mode(exec_mode_) {}
 
   /**
+   * @brief Route the weight / activation pools to specific backend allocators.
+   * @note  nullptr leaves that pool's allocator unchanged. Must be called
+   *        BEFORE allocateTensors()/allocateWeights(). Used to put ONLY the
+   *        activation pool on the QNN rpcmem allocator while weights stay on
+   *        CPU (weights are not DSP-registered, and rpcmem/CMA is scarce).
+   */
+  void setComputeBackend(std::shared_ptr<MemAllocator> weight_allocator,
+                         std::shared_ptr<MemAllocator> tensor_allocator) {
+    if (weight_allocator != nullptr)
+      weight_pool.setAllocator(std::move(weight_allocator));
+    if (tensor_allocator != nullptr)
+      tensor_pool.setAllocator(std::move(tensor_allocator));
+  }
+
+  /**
    * @brief Move Construct a new Manager object
    *
    */

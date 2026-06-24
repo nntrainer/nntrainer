@@ -141,6 +141,20 @@ test('unittest_ddtree', unittest_ddtree_exe,
   suite: 'unittests'
 )
 
+unittest_memory_pool_exe = executable(
+  'unittest_memory_pool',
+  'memory' / 'unittest_memory_pool.cpp',
+  include_directories: include_directories('models', 'memory'),
+  dependencies: nntrainer_test_main_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_memory_pool', unittest_memory_pool_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_memory_pool')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
 unittest_inc = include_directories('.')
 
 # subdir('memory')

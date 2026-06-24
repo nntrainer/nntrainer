@@ -100,6 +100,23 @@ public:
   ~NetworkGraph() = default;
 
   /**
+   * @brief Route the weight/activation pools to a registered compute-engine's
+   *        allocator (empty string = leave that pool unchanged). For QNN graphs
+   *        we route ONLY the activation pool to "qnn" (rpcmem) so the QNN graph
+   *        I/O tensors are DMA-registerable, while weights stay on CPU. Must be
+   *        called before allocateTensors()/allocateWeights().
+   */
+  void setComputeBackend(const std::string &weight_backend,
+                         const std::string &tensor_backend) {
+    std::shared_ptr<MemAllocator> w, t;
+    if (!weight_backend.empty())
+      w = Engine::Global().getRegisteredContext(weight_backend)->getMemAllocator();
+    if (!tensor_backend.empty())
+      t = Engine::Global().getRegisteredContext(tensor_backend)->getMemAllocator();
+    tensor_manager->setComputeBackend(std::move(w), std::move(t));
+  }
+
+  /**
    * @brief     Compile the graph
    * @param[in] loss_type loss for the graph
    * returns ML_ERROR_NONE on success, error on failure

@@ -68,6 +68,16 @@ unsigned int MemoryPool::requestMemory(size_t bytes, unsigned int start_time,
     throw std::invalid_argument(
       "Invalid validity range for the requested memory");
 
+  const bool starting_new_request_set = memory_size.empty();
+  if (starting_new_request_set)
+    n_wgrad = 0;
+
+  if (!memory_offset.empty()) {
+    memory_offset.clear();
+    planned_memory_size_.clear();
+    pool_size = 0;
+  }
+
   memory_size.push_back(bytes);
   memory_validity.push_back({start_time, end_time});
   memory_exec_order.push_back(exec_order);
@@ -82,8 +92,8 @@ unsigned int MemoryPool::requestMemory(size_t bytes, unsigned int start_time,
 }
 
 double MemoryPool::planLayout(const MemoryPlanner &planner) {
-  if (mem_pool != nullptr)
-    /** mem_pool must be deallocated when planLayout is being called */
+  if (mem_pool != nullptr || !owned_buffers_.empty())
+    /** allocated buffers must be deallocated before planLayout */
     throw std::runtime_error("Planning memory layout after allocation");
 
   if (memory_size.empty())
@@ -98,6 +108,8 @@ double MemoryPool::planLayout(const MemoryPlanner &planner) {
   if (pool_size < min_pool_size || !validateLayout())
     throw std::runtime_error("Planned layout is not feasible");
 
+  planned_memory_size_ = memory_size;
+
   return double(min_pool_size) / double(pool_size);
 }
 
@@ -105,16 +117,55 @@ void MemoryPool::allocate() {
   if (pool_size == 0)
     throw std::runtime_error("Allocating memory pool with size 0");
 
-  if (mem_pool != nullptr)
+  if (mem_pool != nullptr || !owned_buffers_.empty())
     throw std::runtime_error("Memory pool is already allocated");
 
   ml_logi("MemoryPool::allocate size: %zu allocator: %s", pool_size,
           allocator_->getName().c_str());
 
+  if (allocator_->getName() == "qnn") {
+    const auto &allocation_sizes =
+      memory_size.empty() ? planned_memory_size_ : memory_size;
+    NNTR_THROW_IF(allocation_sizes.size() != memory_offset.size(),
+                  std::runtime_error)
+      << "QNN memory layout metadata is stale; call planLayout() before "
+         "allocate()";
+
+    std::map<size_t, size_t> offset_size;
+    for (size_t i = 0; i < memory_offset.size(); ++i) {
+      auto it = offset_size.find(memory_offset[i]);
+      if (it == offset_size.end()) {
+        offset_size[memory_offset[i]] = allocation_sizes[i];
+      } else {
+        it->second = std::max(it->second, allocation_sizes[i]);
+      }
+    }
+
+    const size_t alignment = system_page_size();
+    std::map<size_t, void *> offset_ptr;
+    for (auto &entry : offset_size) {
+      void *ptr = nullptr;
+      allocator_->alloc(&ptr, entry.second, alignment);
+      owned_buffers_.push_back(ptr);
+      offset_ptr[entry.first] = ptr;
+#ifdef PROFILE
+      static long long seq = 0;
+      std::string msg("MemoryPool #");
+      msg.append(std::to_string(seq++));
+      PROFILE_MEM_ALLOC(ptr, entry.second, msg);
+#endif
+    }
+
+    for (auto &offset : memory_offset)
+      memory_ptrs.push_back(offset_ptr.at(offset));
+
+    return;
+  }
+
   // Single contiguous buffer routed through the per-vendor allocator.
   // For ClSVMAllocator this returns SVM memory directly addressable
-  // by both host and device; for QNNRpcManager it returns rpcmem; the
-  // base allocator returns page-aligned, zero-initialised host memory.
+  // by both host and device; the base allocator returns page-aligned,
+  // zero-initialised host memory.
   allocator_->alloc(&mem_pool, pool_size, system_page_size());
   owned_buffers_.push_back(mem_pool);
 
@@ -336,6 +387,7 @@ void MemoryPool::clear() {
   memory_size.clear();
   memory_validity.clear();
   memory_offset.clear();
+  planned_memory_size_.clear();
   file_offset.clear();
   memory_is_wgrad.clear();
 

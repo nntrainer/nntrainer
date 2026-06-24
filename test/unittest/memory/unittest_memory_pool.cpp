@@ -11,10 +11,13 @@
  * @bug No known bugs except for NYI items
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <memory>
 #include <random>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <mem_allocator.h>
@@ -25,6 +28,7 @@
 #include <cache_pool.h>
 #include <memory_pool.h>
 #include <nntrainer_test_util.h>
+#include <optimized_v2_planner.h>
 
 /**
  * @brief MemoryPool Test Class
@@ -455,17 +459,83 @@ class CountingAllocator : public nntrainer::MemAllocator {
 public:
   std::atomic<int> alloc_count{0};
   std::atomic<int> free_count{0};
+  std::vector<void *> allocated_ptrs;
+  std::vector<void *> freed_ptrs;
+  std::vector<size_t> allocated_sizes;
 
   void alloc(void **ptr, size_t size, size_t alignment) override {
     alloc_count++;
     nntrainer::MemAllocator::alloc(ptr, size, alignment);
+    allocated_ptrs.push_back(*ptr);
+    allocated_sizes.push_back(size);
   }
   void free(void *ptr) override {
-    if (ptr != nullptr)
+    if (ptr != nullptr) {
       free_count++;
+      freed_ptrs.push_back(ptr);
+    }
     nntrainer::MemAllocator::free(ptr);
   }
   std::string getName() override { return "counting"; }
+};
+
+class QnnCountingAllocator : public CountingAllocator {
+public:
+  std::string getName() override { return "qnn"; }
+};
+
+class ForcedOffsetPlanner : public nntrainer::MemoryPlanner {
+public:
+  explicit ForcedOffsetPlanner(std::vector<size_t> offsets_) :
+    offsets(std::move(offsets_)) {}
+
+  size_t planLayout(
+    const std::vector<size_t> &memory_size,
+    const std::vector<std::pair<unsigned int, unsigned int>> &,
+    std::vector<size_t> &memory_offset, std::vector<bool> &,
+    size_t) const override {
+    if (offsets.size() != memory_size.size())
+      throw std::runtime_error("ForcedOffsetPlanner offset count mismatch");
+
+    memory_offset = offsets;
+    size_t required_size = 0;
+    for (unsigned int idx = 0; idx < memory_size.size(); idx++)
+      required_size = std::max(required_size, offsets[idx] + memory_size[idx]);
+
+    return required_size;
+  }
+
+  const std::string getType() const override { return "forced-offset"; }
+
+private:
+  std::vector<size_t> offsets;
+};
+
+class ExpectWGradCountPlanner : public nntrainer::MemoryPlanner {
+public:
+  explicit ExpectWGradCountPlanner(size_t expected_n_wgrad_) :
+    expected_n_wgrad(expected_n_wgrad_) {}
+
+  size_t planLayout(
+    const std::vector<size_t> &memory_size,
+    const std::vector<std::pair<unsigned int, unsigned int>> &,
+    std::vector<size_t> &memory_offset, std::vector<bool> &,
+    size_t n_wgrad) const override {
+    if (n_wgrad != expected_n_wgrad)
+      throw std::runtime_error("unexpected weight-gradient request count");
+
+    memory_offset.assign(memory_size.size(), 0);
+    size_t required_size = 0;
+    for (size_t size : memory_size)
+      required_size = std::max(required_size, size);
+
+    return required_size;
+  }
+
+  const std::string getType() const override { return "expect-wgrad-count"; }
+
+private:
+  size_t expected_n_wgrad;
 };
 
 } // namespace
@@ -488,6 +558,225 @@ TEST(MemoryPoolAllocator, allocate_routes_through_injected_allocator) {
 
   EXPECT_NO_THROW(pool.deallocate());
   EXPECT_EQ(counter->free_count.load(), 1);
+}
+
+/**
+ * @brief QNN MemoryPool allocates one backend buffer per distinct planned
+ *        offset instead of returning interior pointers into a single pool.
+ */
+TEST(MemoryPoolAllocator, qnn_allocate_uses_distinct_planned_offsets) {
+  auto counter = std::make_shared<QnnCountingAllocator>();
+  nntrainer::MemoryPool pool(counter);
+
+  auto first = pool.requestMemory(64, 1, 2);
+  auto second = pool.requestMemory(64, 2, 3);
+  EXPECT_NO_THROW(pool.planLayout(ForcedOffsetPlanner({0, 16})));
+
+  EXPECT_NO_THROW(pool.allocate());
+
+  auto ptrs = pool.getMemoryPtrs();
+  ASSERT_EQ(ptrs.size(), 2u);
+  ASSERT_EQ(counter->allocated_ptrs.size(), 2u);
+  EXPECT_TRUE(pool.isAllocated());
+  EXPECT_EQ(counter->alloc_count.load(), 2);
+  EXPECT_EQ(counter->allocated_sizes[0], 64u);
+  EXPECT_EQ(counter->allocated_sizes[1], 64u);
+  EXPECT_EQ(pool.getMemoryPoolAddress(), nullptr);
+  EXPECT_EQ(ptrs[first - 1], counter->allocated_ptrs[0]);
+  EXPECT_EQ(ptrs[second - 1], counter->allocated_ptrs[1]);
+  EXPECT_NE(ptrs[second - 1],
+            static_cast<char *>(counter->allocated_ptrs[0]) + 16);
+
+  auto first_mem = pool.getMemory(first);
+  auto second_mem = pool.getMemory(second);
+  ASSERT_NE(first_mem, nullptr);
+  ASSERT_NE(second_mem, nullptr);
+  EXPECT_EQ(first_mem->getAddr<void>(), counter->allocated_ptrs[0]);
+  EXPECT_EQ(second_mem->getAddr<void>(), counter->allocated_ptrs[1]);
+
+  EXPECT_NO_THROW(pool.deallocate());
+  EXPECT_FALSE(pool.isAllocated());
+  EXPECT_EQ(counter->free_count.load(), 2);
+  ASSERT_EQ(counter->freed_ptrs.size(), 2u);
+  EXPECT_EQ(counter->freed_ptrs[0], counter->allocated_ptrs[0]);
+  EXPECT_EQ(counter->freed_ptrs[1], counter->allocated_ptrs[1]);
+}
+
+/**
+ * @brief QNN MemoryPool shares a backend allocation for requests that reuse
+ *        the same planned offset and sizes it for the largest alias.
+ */
+TEST(MemoryPoolAllocator, qnn_allocate_reuses_matching_planned_offset) {
+  auto counter = std::make_shared<QnnCountingAllocator>();
+  nntrainer::MemoryPool pool(counter);
+
+  auto first = pool.requestMemory(64, 1, 2);
+  auto second = pool.requestMemory(128, 2, 3);
+  EXPECT_NO_THROW(pool.planLayout(ForcedOffsetPlanner({0, 0})));
+
+  EXPECT_NO_THROW(pool.allocate());
+
+  auto ptrs = pool.getMemoryPtrs();
+  ASSERT_EQ(ptrs.size(), 2u);
+  ASSERT_EQ(counter->allocated_ptrs.size(), 1u);
+  ASSERT_EQ(counter->allocated_sizes.size(), 1u);
+  EXPECT_TRUE(pool.isAllocated());
+  EXPECT_EQ(counter->alloc_count.load(), 1);
+  EXPECT_EQ(counter->allocated_sizes[0], 128u);
+  EXPECT_EQ(pool.getMemoryPoolAddress(), nullptr);
+  EXPECT_EQ(ptrs[first - 1], counter->allocated_ptrs[0]);
+  EXPECT_EQ(ptrs[second - 1], counter->allocated_ptrs[0]);
+
+  auto first_mem = pool.getMemory(first);
+  auto second_mem = pool.getMemory(second);
+  ASSERT_NE(first_mem, nullptr);
+  ASSERT_NE(second_mem, nullptr);
+  EXPECT_EQ(first_mem->getAddr<void>(), counter->allocated_ptrs[0]);
+  EXPECT_EQ(second_mem->getAddr<void>(), counter->allocated_ptrs[0]);
+
+  EXPECT_NO_THROW(pool.deallocate());
+  EXPECT_FALSE(pool.isAllocated());
+  EXPECT_EQ(counter->free_count.load(), 1);
+}
+
+/**
+ * @brief QNN MemoryPool keeps mem_pool null, so allocate() must still reject
+ *        a second call while owned buffers exist.
+ */
+TEST(MemoryPoolAllocator, qnn_allocate_twice_throws_with_owned_buffers) {
+  auto counter = std::make_shared<QnnCountingAllocator>();
+  nntrainer::MemoryPool pool(counter);
+
+  EXPECT_NO_THROW(pool.requestMemory(64, 1, 2));
+  EXPECT_NO_THROW(pool.planLayout(ForcedOffsetPlanner({0})));
+
+  EXPECT_NO_THROW(pool.allocate());
+  EXPECT_EQ(pool.getMemoryPoolAddress(), nullptr);
+  EXPECT_THROW(pool.allocate(), std::runtime_error);
+
+  EXPECT_NO_THROW(pool.deallocate());
+}
+
+/**
+ * @brief QNN MemoryPool must reject re-planning while allocated even though
+ *        mem_pool remains null and ownership lives in owned_buffers_.
+ */
+TEST(MemoryPoolAllocator, qnn_plan_layout_after_allocate_throws) {
+  auto counter = std::make_shared<QnnCountingAllocator>();
+  nntrainer::MemoryPool pool(counter);
+
+  EXPECT_NO_THROW(pool.requestMemory(64, 1, 2));
+  EXPECT_NO_THROW(pool.planLayout(ForcedOffsetPlanner({0})));
+
+  EXPECT_NO_THROW(pool.allocate());
+  EXPECT_EQ(pool.getMemoryPoolAddress(), nullptr);
+  EXPECT_THROW(pool.planLayout(ForcedOffsetPlanner({0})), std::runtime_error);
+
+  EXPECT_NO_THROW(pool.deallocate());
+}
+
+/**
+ * @brief QNN MemoryPool can reuse an existing planned layout after
+ *        deallocate(), matching the default contiguous allocator lifecycle.
+ */
+TEST(MemoryPoolAllocator, qnn_allocate_after_deallocate_reuses_layout) {
+  auto counter = std::make_shared<QnnCountingAllocator>();
+  nntrainer::MemoryPool pool(counter);
+
+  auto first = pool.requestMemory(64, 1, 2);
+  auto second = pool.requestMemory(128, 2, 3);
+  EXPECT_NO_THROW(pool.planLayout(ForcedOffsetPlanner({0, 16})));
+
+  EXPECT_NO_THROW(pool.allocate());
+  auto first_ptrs = pool.getMemoryPtrs();
+  ASSERT_EQ(first_ptrs.size(), 2u);
+  EXPECT_EQ(first_ptrs[first - 1], counter->allocated_ptrs[0]);
+  EXPECT_EQ(first_ptrs[second - 1], counter->allocated_ptrs[1]);
+  EXPECT_NO_THROW(pool.deallocate());
+
+  EXPECT_NO_THROW(pool.allocate());
+  auto second_ptrs = pool.getMemoryPtrs();
+  ASSERT_EQ(second_ptrs.size(), 2u);
+  ASSERT_EQ(counter->allocated_ptrs.size(), 4u);
+  ASSERT_EQ(counter->allocated_sizes.size(), 4u);
+  EXPECT_EQ(counter->allocated_sizes[2], 64u);
+  EXPECT_EQ(counter->allocated_sizes[3], 128u);
+  EXPECT_EQ(second_ptrs[first - 1], counter->allocated_ptrs[2]);
+  EXPECT_EQ(second_ptrs[second - 1], counter->allocated_ptrs[3]);
+
+  EXPECT_NO_THROW(pool.deallocate());
+}
+
+/**
+ * @brief Adding a new memory request after deallocate() invalidates the old
+ *        planned layout; callers must run planLayout() again before allocate().
+ */
+TEST(MemoryPoolAllocator, qnn_request_after_deallocate_requires_new_layout) {
+  auto counter = std::make_shared<QnnCountingAllocator>();
+  nntrainer::MemoryPool pool(counter);
+
+  EXPECT_NO_THROW(pool.requestMemory(64, 1, 2));
+  EXPECT_NO_THROW(pool.planLayout(ForcedOffsetPlanner({0})));
+  EXPECT_NO_THROW(pool.allocate());
+  EXPECT_NO_THROW(pool.deallocate());
+
+  EXPECT_NO_THROW(pool.requestMemory(128, 3, 4));
+  EXPECT_THROW(pool.allocate(), std::runtime_error);
+
+  EXPECT_NO_THROW(pool.planLayout(ForcedOffsetPlanner({0})));
+  EXPECT_NO_THROW(pool.allocate());
+  EXPECT_NO_THROW(pool.deallocate());
+}
+
+/**
+ * @brief Starting a new request set after deallocate() resets stale
+ *        weight-gradient request counts before optimized replanning.
+ */
+TEST(MemoryPoolAllocator, request_after_deallocate_resets_wgrad_count) {
+  auto counter = std::make_shared<QnnCountingAllocator>();
+  nntrainer::MemoryPool pool(counter);
+
+  EXPECT_NO_THROW(pool.requestMemory(64, 1, 3, {},
+                                     nntrainer::TensorLifespan::MAX_LIFESPAN,
+                                     true));
+  EXPECT_NO_THROW(pool.requestMemory(64, 2, 4, {},
+                                     nntrainer::TensorLifespan::MAX_LIFESPAN,
+                                     true));
+  EXPECT_NO_THROW(pool.planLayout(nntrainer::BasicPlanner()));
+  EXPECT_NO_THROW(pool.allocate());
+  EXPECT_NO_THROW(pool.deallocate());
+
+  EXPECT_NO_THROW(pool.requestMemory(128, 3, 4));
+  EXPECT_NO_THROW(pool.planLayout(ExpectWGradCountPlanner(0)));
+  EXPECT_NO_THROW(pool.planLayout(nntrainer::OptimizedV2Planner()));
+  EXPECT_NO_THROW(pool.allocate());
+  EXPECT_NO_THROW(pool.deallocate());
+}
+
+/**
+ * @brief Starting a new request set after deallocate() also resets stale
+ *        weight-gradient counts when no layout had been planned yet.
+ */
+TEST(MemoryPoolAllocator,
+     request_after_unplanned_deallocate_resets_wgrad_count) {
+  {
+    nntrainer::MemoryPool check_pool;
+    EXPECT_NO_THROW(check_pool.requestMemory(
+      64, 1, 3, {}, nntrainer::TensorLifespan::MAX_LIFESPAN, true));
+    EXPECT_NO_THROW(check_pool.planLayout(ExpectWGradCountPlanner(1)));
+  }
+
+  nntrainer::MemoryPool pool;
+
+  EXPECT_NO_THROW(pool.requestMemory(64, 1, 3, {},
+                                     nntrainer::TensorLifespan::MAX_LIFESPAN,
+                                     true));
+  EXPECT_NO_THROW(pool.deallocate());
+
+  EXPECT_NO_THROW(pool.requestMemory(128, 3, 4));
+  EXPECT_NO_THROW(pool.planLayout(nntrainer::OptimizedV2Planner()));
+  EXPECT_NO_THROW(pool.allocate());
+  EXPECT_NO_THROW(pool.deallocate());
 }
 
 /**

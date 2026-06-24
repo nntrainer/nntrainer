@@ -224,8 +224,35 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   const std::string tensor_type =
     to_string(std::get<props::ModelTensorDataType>(model_flex_props));
 
+  bool has_qnn_engine = false;
+  for (auto &node : graph_representation) {
+    if (node->getComputeEngineType() == "qnn" ||
+        node->getType() == "qnn_graph") {
+      has_qnn_engine = true;
+      break;
+    }
+  }
+
   model_graph =
     NetworkGraph(fsu, mode, fsu_path, lookahead, tensor_format, tensor_type);
+
+  // QNN/HTP graphs register their I/O tensors with the DSP via rpcmem_to_fd(),
+  // which requires those buffers to be rpcmem (DMA/ION). Route ONLY the
+  // activation pool to the "qnn" (rpcmem) allocator; the weight pool stays on
+  // CPU. The nntrainer weight pool is NOT DSP-registered (QNN graph weights are
+  // loaded by the QNN context loader), so routing weights to rpcmem too would
+  // needlessly exhaust the scarce CMA pool — observed as rpcmem_to_fd failures
+  // after a few generated tokens once the app UI's GPU dmabuf also draws on CMA.
+  // Mirrors the upstream setComputeBackend("", "npu") tensor-only design
+  // (here the QNN context registers under the name "qnn").
+  if (has_qnn_engine)
+    model_graph.setComputeBackend("", "qnn");
+
+  // QNN activation tensors are rpcmem-backed and registered with the DSP, so
+  // their addresses must stay stable across decode tokens. Let inference()
+  // reuse the pool (allocate once) instead of reallocating per call. CPU/GPU
+  // keep the realloc-per-call behavior they need for correct tensor state.
+  reuse_inference_tensor_pool_ = has_qnn_engine;
 
   model_graph.setMemoryOptimizations(
     std::get<props::MemoryOptimization>(model_flex_props));
@@ -1404,7 +1431,21 @@ sharedConstTensors NeuralNetwork::inference(sharedConstTensors X,
   if (!validateInput(X))
     throw std::invalid_argument("Input validation failed.");
 
-  allocate(ExecutionMode::INFERENCE);
+  // QNN activation tensors are rpcmem-backed and registered with the DSP, so
+  // their address must stay stable across decode tokens. For QNN graphs reuse
+  // the already-allocated pool (allocate once) instead of the per-call
+  // deallocateTensors()+allocateTensors() that allocate() does: reallocating
+  // every token hands out NEW rpcmem addresses, defeats registerQnnTensor()'s
+  // findMatchingPtr cache (every token re-runs rpcmem_to_fd()+memRegister()),
+  // and churns the scarce contiguous CMA pool until rpcmem_to_fd fails under the
+  // app UI's GPU dmabuf pressure. allocateTensors() no-ops when already
+  // allocated; a free_mem=true caller deallocates at the end so the next call
+  // re-allocates. CPU/GPU keep the realloc-per-call behavior — reusing the pool
+  // there yields degenerate output (verified: gemma4 CPU loops "... is ... is").
+  if (reuse_inference_tensor_pool_)
+    model_graph.allocateTensors(ExecutionMode::INFERENCE);
+  else
+    allocate(ExecutionMode::INFERENCE);
 
   int nn_foward;
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");

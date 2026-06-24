@@ -716,6 +716,17 @@ private:
 
   NetworkGraph model_graph; /** Network Model Graph */
 
+  /**< Set in compile() for graphs that contain a QNN/HTP engine. When true,
+   * inference() reuses the already-allocated tensor pool across calls instead
+   * of deallocating+reallocating it every call. QNN registers each activation
+   * tensor's rpcmem buffer with the DSP (rpcmem_to_fd/memRegister), so the
+   * per-tensor address must stay stable across decode tokens; reallocating
+   * every token hands out new addresses, defeats the registration cache, and
+   * churns the scarce contiguous CMA pool (rpcmem_to_fd failures under app UI
+   * dmabuf pressure). CPU/GPU paths keep the realloc-per-call behavior, which
+   * they rely on for correct per-call tensor state. */
+  bool reuse_inference_tensor_pool_ = false;
+
   GraphRepresentation graph_representation; /** Unsorted graph representation */
 
   DynamicTrainingOptimization dynamic_training_opt; /**< Dynamic fine-tuning
