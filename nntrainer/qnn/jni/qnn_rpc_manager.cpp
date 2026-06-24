@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 #include <nntrainer_log.h>
 #include <utility>
 
@@ -109,7 +111,14 @@ void QNNRpcManager::alloc(void **ptr, size_t size, size_t alignment) {
     (uint8_t *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size);
   if (nullptr == memPointer) {
     ml_loge("rpcmem_alloc failed");
-    exit(-1);
+    // Was exit(-1): a hard process exit skips C++ destructors, so the QNN
+    // context / rpcmem registrations are never released and the DSP keeps the
+    // CMA pages — each crash leaks CMA and the next run fails sooner. Throw
+    // instead so the stack unwinds (run_on_handle catches it -> graceful
+    // CAUSAL_LM_ERROR_INFERENCE_FAILED) and teardown can free the buffers.
+    throw std::runtime_error(
+      "[QNNRpcManager] rpcmem_alloc failed for " + std::to_string(size) +
+      " bytes (CMA/ION exhausted)");
   }
   qnnMemPtrMap_.insert(memPointer);
 
@@ -157,8 +166,11 @@ void QNNRpcManager::registerQnnTensor(void *ptr, Qnn_Tensor_t &qnnTensor,
 
   if (-1 == memFd) {
     ml_loge("rpcmem_to_fd failed");
-    exit(-1);
-    return;
+    // Was exit(-1) (see alloc()): throw so the run fails gracefully and
+    // destructors release the QNN context instead of leaking it to the DSP.
+    throw std::runtime_error(
+      "[QNNRpcManager] rpcmem_to_fd failed (CMA/ION contiguous mapping "
+      "unavailable)");
   }
 
   Qnn_MemDescriptor_t memDescriptor = QNN_MEM_DESCRIPTOR_INIT;
@@ -173,8 +185,10 @@ void QNNRpcManager::registerQnnTensor(void *ptr, Qnn_Tensor_t &qnnTensor,
     context_, &memDescriptor, 1u, &(qnnTensor.v1.memHandle));
   if (registRet != QNN_SUCCESS) {
     ml_loge("qnnInterface memRegister failed");
-    exit(-1);
-    return;
+    // Was exit(-1) (see alloc()): throw for graceful failure + clean teardown.
+    throw std::runtime_error(
+      "[QNNRpcManager] qnnInterface memRegister failed (ret=" +
+      std::to_string(static_cast<unsigned long long>(registRet)) + ")");
   }
 
   ptrToFdAndMemHandleMap_.insert(std::make_pair(
