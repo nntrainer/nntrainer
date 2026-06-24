@@ -1,33 +1,59 @@
-# Qualcomm QNN backend integration. Gated entirely behind enable-npu.
-# The Qualcomm QNN SDK itself ("Confidential and Proprietary" code) is NOT
-# carried in this repository — users must supply it via -Dqnn-sdk-root=<path>.
-# See docs/backend_guide/QNN_BUILD.md for instructions.
+# nntrainer/nntrainer/qnn/meson.build
+# Defines qnn_sources_abs and qnn_inc_abs for the ndk-build Android.mk module.
+# Gated by the parent (enable-npu). No external -Dqnn-sdk-root: the QNN 2.47
+# headers + sample utilities are vendored under jni/vendor/.
 
-qnn_sdk_root = get_option('qnn-sdk-root')
+qnn_src_dir = meson.current_source_dir()
 
-if qnn_sdk_root == ''
-  error('enable-npu=true requires -Dqnn-sdk-root=<path-to-qcom-qnn-sdk>. ' +
-        'Obtain the QNN SDK from https://qpm.qualcomm.com/ and pass its root ' +
-        'directory. See docs/backend_guide/QNN_BUILD.md.')
-endif
+qnn_sources_abs = [
+  qnn_src_dir / 'jni/vendor/Log/Logger.cpp',
+  qnn_src_dir / 'jni/vendor/Log/LogUtils.cpp',
+  qnn_src_dir / 'jni/vendor/PAL/src/common/GetOpt.cpp',
+  qnn_src_dir / 'jni/vendor/PAL/src/common/StringOp.cpp',
+  qnn_src_dir / 'jni/vendor/PAL/src/linux/Directory.cpp',
+  qnn_src_dir / 'jni/vendor/PAL/src/linux/DynamicLoading.cpp',
+  qnn_src_dir / 'jni/vendor/PAL/src/linux/FileOp.cpp',
+  qnn_src_dir / 'jni/vendor/PAL/src/linux/Path.cpp',
+  qnn_src_dir / 'jni/vendor/Utils/DataUtil.cpp',
+  qnn_src_dir / 'jni/vendor/Utils/DynamicLoadUtil.cpp',
+  qnn_src_dir / 'jni/vendor/Utils/IOTensor.cpp',
+  qnn_src_dir / 'jni/vendor/Utils/QnnDlcUtils.cpp',
+  qnn_src_dir / 'jni/vendor/Utils/QnnSampleAppUtils.cpp',
+  qnn_src_dir / 'jni/vendor/WrapperUtils/QnnWrapperUtils.cpp',
+  qnn_src_dir / 'jni/vendor/qnn-api/dlwrap.cpp',
+  qnn_src_dir / 'jni/vendor/qnn-api/BackendExtensions.cpp',
+  qnn_src_dir / 'jni/vendor/qnn-api/ResourceManager.cpp',
+  qnn_src_dir / 'jni/QNNGraph.cpp',
+  qnn_src_dir / 'jni/qnn_properties.cpp',
+  qnn_src_dir / 'qnn_context.cpp',
+  qnn_src_dir / 'jni/qnn_rpc_manager.cpp',
+  qnn_src_dir / 'jni/rpc_mem.cpp',
+]
 
-if not import('fs').is_dir(qnn_sdk_root)
-  error('qnn-sdk-root does not exist or is not a directory: ' + qnn_sdk_root)
-endif
+qnn_inc_abs = [
+  qnn_src_dir,
+  qnn_src_dir / 'jni',
+  qnn_src_dir / 'jni/vendor',
+  qnn_src_dir / 'jni/vendor/QNN',
+  qnn_src_dir / 'jni/vendor/Log',
+  qnn_src_dir / 'jni/vendor/PAL/include',
+  qnn_src_dir / 'jni/vendor/Utils',
+  qnn_src_dir / 'jni/vendor/WrapperUtils',
+  qnn_src_dir / 'jni/vendor/qnn-api',
+]
 
-# QNN SDK include directories. Marked is_system to keep -Wall warnings from
-# the proprietary headers from polluting the build log.
-qnn_sdk_inc = include_directories(
-  qnn_sdk_root / 'include',
-  qnn_sdk_root / 'include' / 'QNN',
-  is_system: true,
+qnn_inc = include_directories(
+  '.',
+  'jni',
+  'jni/vendor',
+  'jni/vendor/QNN',
+  'jni/vendor/Log',
+  'jni/vendor/PAL/include',
+  'jni/vendor/Utils',
+  'jni/vendor/WrapperUtils',
+  'jni/vendor/qnn-api',
 )
-nntrainer_inc += qnn_sdk_inc
-# The Android ndk-build path (jni/Android.mk) builds the QNN layer ops into
-# libnntrainer.so and consumes the absolute include list (nntrainer_inc_abs),
-# not the include_directories object above. Expose the SDK headers there too,
-# otherwise ndk-build cannot find BackendExtensions.hpp / QnnTypes.h etc.
-nntrainer_inc_abs += [qnn_sdk_root / 'include', qnn_sdk_root / 'include' / 'QNN']
 
-# nntrainer's own QNN integration code (Apache-2.0).
-subdir('jni')
+# Expose qnn headers (qnn_context.h 등) to the rest of nntrainer.
+nntrainer_inc += qnn_inc
+nntrainer_inc_abs += qnn_src_dir

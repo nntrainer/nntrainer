@@ -1,19 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-/**
- * Copyright (C) 2024 Jijoong Moon <jijoong.moon@samsung.com>
- *
- * @file   iotensor_wrapper.hpp
- * @date   08 Jan 2025
- * @see    https://github.com/nntrainer/nntrainer
- * @author Jijoong Moon <jijoong.moon@samsung.com>
- * @bug    No known bugs except for NYI items
- * @brief  nntrainer-side adapter around the Qualcomm QNN sample
- *         IOTensor / DataUtil utilities. Headers it pulls in
- *         (DataUtil.hpp, IOTensor.hpp, PAL/StringOp.hpp,
- *         QnnTypeMacros.hpp) are part of the QNN SDK supplied via
- *         -Dqnn-sdk-root; they are NOT shipped in-tree.
- */
-
 #ifndef __QNN_IOTENSOR_WRAPPER_H__
 #define __QNN_IOTENSOR_WRAPPER_H__
 #include "DataUtil.hpp"
@@ -28,18 +12,12 @@ namespace nntrainer {
 using namespace qnn::tools;
 using namespace qnn::tools::iotensor;
 
-/**
- * @class   IOTensorWrapper
- * @brief   Wraps QNN IOTensor utilities for registering, populating, and
- *          tearing down per-graph input/output tensors.
- */
 class IOTensorWrapper {
 public:
   StatusCode
   setupInputAndOutputTensors(Qnn_Tensor_t **inputs, Qnn_Tensor_t **outputs,
                              qnn_wrapper_api::GraphInfo_t graphInfo) {
     auto returnStatus = StatusCode::SUCCESS;
-#ifdef ENABLE_NPU
     if (StatusCode::SUCCESS != setupTensorsNoCopy(inputs,
                                                   graphInfo.numInputTensors,
                                                   (graphInfo.inputTensors))) {
@@ -52,18 +30,6 @@ public:
       ml_loge("Failure in setting up output tensors");
       returnStatus = StatusCode::FAILURE;
     }
-#else
-    if (StatusCode::SUCCESS != setupTensors(inputs, graphInfo.numInputTensors,
-                                            (graphInfo.inputTensors))) {
-      ml_loge("Failure in setting up input tensors");
-      returnStatus = StatusCode::FAILURE;
-    }
-    if (StatusCode::SUCCESS != setupTensors(outputs, graphInfo.numOutputTensors,
-                                            (graphInfo.outputTensors))) {
-      ml_loge("Failure in setting up output tensors");
-      returnStatus = StatusCode::FAILURE;
-    }
-#endif
     if (StatusCode::SUCCESS != returnStatus) {
       ml_loge("Failure in setupInputAndOutputTensors, cleaning up resources");
       if (nullptr != *inputs) {
