@@ -73,9 +73,14 @@ protected:
                    [](unsigned char c) { return std::tolower(c); });
 
     if (engines.find(name) != engines.end()) {
-      std::stringstream ss;
-      ss << "Cannot register Context with name : " << name;
-      throw std::invalid_argument(ss.str().c_str());
+      // Re-registering an already-registered Context is a no-op, not an error.
+      // QuickAI QNN models register the process-global "qnn" Context once per
+      // model in Quick_Dot_AI_QNN::initialize(); a multi-model handle (e.g. the
+      // multimodal [vision, LLM] pair) therefore calls this more than once.
+      // Upstream main throws here, but pr/3963 (the working QNN reference)
+      // returns early so the 2nd+ models reuse the existing Context. Carried
+      // forward from pr/3963.
+      return;
     }
     engines.insert(std::make_pair(name, context));
 
@@ -90,6 +95,23 @@ protected:
   }
 
 public:
+  /**
+   * @brief   Get the single process-wide Engine instance.
+   * @note    Overrides Singleton<Engine>::Global() with an out-of-line
+   *          definition in engine.cpp so there is exactly ONE Engine instance
+   *          across all shared libraries. The inherited template Global() is an
+   *          inline method, which under -fvisibility=hidden / per-namespace
+   *          loading gets instantiated separately in each consumer .so
+   *          (libcausallm, libquick_dot_ai, libqnn_context, ...). That produced
+   *          multiple Engine instances: a context registered into one (e.g.
+   *          "qnn" via Quick_Dot_AI_QNN in libquick_dot_ai) was invisible to
+   *          another (NetworkGraph in libnntrainer), surfacing as
+   *          std::invalid_argument "[Engine] qnn Context is not registered".
+   *          A single out-of-line definition in libnntrainer.so makes every
+   *          Engine::Global() caller share the same instance.
+   */
+  static Engine &Global();
+
   /**
    * @brief   Default constructor
    */
