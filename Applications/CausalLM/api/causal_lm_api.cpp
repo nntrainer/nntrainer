@@ -12,12 +12,14 @@
 
 #include "causal_lm_api.h"
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "callback_streamer.h"
@@ -48,7 +50,11 @@ using json = nlohmann::json;
 
 static std::unique_ptr<causallm::Transformer> g_model;
 static std::mutex g_mutex;
-static bool g_initialized = false;
+// cancelModel() cannot take g_mutex, so this flag is the lock-free published
+// loaded-model predicate. It is set only after g_model is ready to run.
+static std::atomic<bool> g_initialized{false};
+static std::mutex g_active_model_mutex;
+static causallm::CausalLM *g_active_model = nullptr;
 static std::string g_architecture = "";
 static bool g_use_chat_template = false;
 static bool g_verbose = false;
@@ -69,6 +75,118 @@ struct RegisteredModel {
 };
 static std::map<std::string, RegisteredModel> g_model_registry;
 static std::map<std::string, ModelArchConfig> g_arch_config_map;
+
+#ifdef ENABLE_TEST
+namespace causal_lm_api_test {
+using ActiveRunPublishHook = void (*)(void *);
+using BeforeCancelRequestHook = void (*)(void *);
+}
+#endif
+
+namespace {
+
+#ifdef ENABLE_TEST
+causal_lm_api_test::ActiveRunPublishHook g_after_active_run_publish_hook =
+  nullptr;
+void *g_after_active_run_publish_user_data = nullptr;
+causal_lm_api_test::BeforeCancelRequestHook g_before_cancel_request_hook =
+  nullptr;
+void *g_before_cancel_request_user_data = nullptr;
+#endif
+
+class ActiveRunGuard {
+public:
+  explicit ActiveRunGuard(causallm::CausalLM *model) : model_(model) {
+    if (model_ != nullptr) {
+      std::lock_guard<std::mutex> lock(g_active_model_mutex);
+      g_active_model = model_;
+    }
+  }
+
+  ~ActiveRunGuard() {
+    if (model_ != nullptr) {
+      std::lock_guard<std::mutex> lock(g_active_model_mutex);
+      if (g_active_model == model_)
+        g_active_model = nullptr;
+    }
+  }
+
+  ActiveRunGuard(const ActiveRunGuard &) = delete;
+  ActiveRunGuard &operator=(const ActiveRunGuard &) = delete;
+
+private:
+  causallm::CausalLM *model_;
+};
+
+void notifyAfterActiveRunPublishForTest() {
+#ifdef ENABLE_TEST
+  auto *hook = g_after_active_run_publish_hook;
+  if (hook != nullptr)
+    hook(g_after_active_run_publish_user_data);
+#endif
+}
+
+void notifyBeforeCancelRequestForTest() {
+#ifdef ENABLE_TEST
+  auto *hook = g_before_cancel_request_hook;
+  if (hook != nullptr)
+    hook(g_before_cancel_request_user_data);
+#endif
+}
+
+} // namespace
+
+#ifdef ENABLE_TEST
+namespace causal_lm_api_test {
+
+void setAfterActiveRunPublishHookForTest(ActiveRunPublishHook hook,
+                                         void *user_data) {
+  g_after_active_run_publish_hook = hook;
+  g_after_active_run_publish_user_data = user_data;
+}
+
+void setBeforeCancelRequestHookForTest(BeforeCancelRequestHook hook,
+                                       void *user_data) {
+  g_before_cancel_request_hook = hook;
+  g_before_cancel_request_user_data = user_data;
+}
+
+void setModelForTest(std::unique_ptr<causallm::Transformer> model,
+                     const std::string &architecture) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  {
+    std::lock_guard<std::mutex> active_lock(g_active_model_mutex);
+    g_active_model = nullptr;
+  }
+  g_model = std::move(model);
+  g_initialized.store(g_model != nullptr, std::memory_order_release);
+  g_architecture = architecture;
+  g_last_output.clear();
+  g_chat_template.reset();
+}
+
+void resetForTest() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  {
+    std::lock_guard<std::mutex> active_lock(g_active_model_mutex);
+    g_active_model = nullptr;
+  }
+  g_model.reset();
+  g_initialized.store(false, std::memory_order_release);
+  g_architecture.clear();
+  g_use_chat_template = false;
+  g_verbose = false;
+  g_last_output.clear();
+  g_initialization_duration_ms = 0.0;
+  g_chat_template.reset();
+  g_after_active_run_publish_hook = nullptr;
+  g_after_active_run_publish_user_data = nullptr;
+  g_before_cancel_request_hook = nullptr;
+  g_before_cancel_request_user_data = nullptr;
+}
+
+} // namespace causal_lm_api_test
+#endif
 
 // Helper to register models (similar to main.cpp)
 // ensuring factory is populated.
@@ -530,6 +648,11 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
       return CAUSAL_LM_ERROR_INVALID_PARAMETER;
     }
 
+    {
+      std::lock_guard<std::mutex> active_lock(g_active_model_mutex);
+      g_active_model = nullptr;
+    }
+    g_initialized.store(false, std::memory_order_release);
     g_model = causallm::Factory::Instance().create(architecture, cfg,
                                                    generation_cfg, nntr_cfg);
     if (!g_model) {
@@ -539,7 +662,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
     g_model->initialize();
     g_model->load_weight(weight_file);
 
-    g_initialized = true;
+    g_initialized.store(true, std::memory_order_release);
     g_architecture = architecture;
 
     auto finish_init = std::chrono::high_resolution_clock::now();
@@ -559,7 +682,7 @@ ErrorCode loadModel(BackendType compute, ModelType modeltype,
 }
 
 ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
-  if (!g_initialized || !g_model) {
+  if (!g_initialized.load(std::memory_order_acquire)) {
     return CAUSAL_LM_ERROR_NOT_INITIALIZED;
   }
   if (inputTextPrompt == nullptr || outputText == nullptr) {
@@ -568,6 +691,11 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
 
   try {
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized.load(std::memory_order_acquire) || !g_model) {
+      return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+    }
+
+    auto *causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
 
     std::string input(inputTextPrompt);
 
@@ -575,10 +703,14 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
       input = apply_chat_template(g_architecture, input);
     }
 
+    if (causal_lm_model != nullptr)
+      causal_lm_model->prepareForRun();
+    ActiveRunGuard active_run_guard(causal_lm_model);
+    notifyAfterActiveRunPublishForTest();
+
     // We assume single batch request for this API.
     g_model->run(input, false, "", "", g_verbose);
 
-    auto causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
     g_last_output = ""; // Reset last output
     if (causal_lm_model) {
       g_last_output = causal_lm_model->getOutput(0);
@@ -601,12 +733,15 @@ ErrorCode runModelStreaming(const char *inputTextPrompt,
       callback == nullptr) {
     return CAUSAL_LM_ERROR_INVALID_PARAMETER;
   }
-  if (!g_initialized || !g_model) {
+  if (!g_initialized.load(std::memory_order_acquire)) {
     return CAUSAL_LM_ERROR_NOT_INITIALIZED;
   }
 
   try {
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized.load(std::memory_order_acquire) || !g_model) {
+      return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+    }
 
     auto *causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
     if (causal_lm_model == nullptr) {
@@ -628,6 +763,10 @@ ErrorCode runModelStreaming(const char *inputTextPrompt,
       ~StreamerDetachGuard() { model->setStreamer(nullptr); }
     } detach_guard{causal_lm_model};
 
+    causal_lm_model->prepareForRun();
+    ActiveRunGuard active_run_guard(causal_lm_model);
+    notifyAfterActiveRunPublishForTest();
+
     g_model->run(input, false, "", "", g_verbose);
 
     g_last_output = causal_lm_model->getOutput(0);
@@ -641,8 +780,22 @@ ErrorCode runModelStreaming(const char *inputTextPrompt,
   return CAUSAL_LM_ERROR_NONE;
 }
 
+ErrorCode cancelModel(void) {
+  if (!g_initialized.load(std::memory_order_acquire)) {
+    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+  }
+
+  std::lock_guard<std::mutex> active_lock(g_active_model_mutex);
+  if (g_active_model != nullptr) {
+    notifyBeforeCancelRequestForTest();
+    g_active_model->requestStop();
+  }
+
+  return CAUSAL_LM_ERROR_NONE;
+}
+
 ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
-  if (!g_initialized || !g_model) {
+  if (!g_initialized.load(std::memory_order_acquire)) {
     return CAUSAL_LM_ERROR_NOT_INITIALIZED;
   }
   if (metrics == nullptr) {
@@ -651,6 +804,9 @@ ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics) {
 
   try {
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_initialized.load(std::memory_order_acquire) || !g_model) {
+      return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+    }
 
     if (!g_model->hasRun()) {
       return CAUSAL_LM_ERROR_INFERENCE_NOT_RUN;

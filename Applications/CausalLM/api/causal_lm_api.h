@@ -141,6 +141,12 @@ WIN_EXPORT ErrorCode runModelStreaming(const char *inputTextPrompt,
                                        CausalLmTokenCallback callback,
                                        void *user_data);
 
+/**
+ * @brief Request cancellation of the active inference run, if any.
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode cancelModel(void);
+
 #ifdef __cplusplus
 }
 #endif
