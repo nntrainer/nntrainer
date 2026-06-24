@@ -64,6 +64,8 @@ typedef struct {
   char fc_layer_dtype[32];
   char model_file_name[256];
   char tokenizer_file[256];
+  char embedding_file_name[256];
+  char ple_file_name[256];
   unsigned int bad_word_ids[16];
   unsigned int num_bad_word_ids;
   char lmhead_dtype[32];

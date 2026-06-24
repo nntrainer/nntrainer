@@ -136,6 +136,8 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                     : 1;
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
+  EMBEDDING_FILE_NAME = nntr_cfg.value("embedding_file_name", std::string());
+  PLE_FILE_NAME = nntr_cfg.value("ple_file_name", std::string());
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();
@@ -235,11 +237,14 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
   const std::string embedding_type =
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
 
-  LayerHandle embedding(createLayer(
-    embedding_type,
-    {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
-     "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM),
-     "scale=" + std::to_string(EMBEDDING_SCALE)}));
+  NNTR_THROW_IF(TIE_WORD_EMBEDDINGS && !EMBEDDING_FILE_NAME.empty(),
+                std::invalid_argument)
+    << "embedding_file_name requires untied embedding_layer";
+  LayerHandle embedding(
+    createLayer(embedding_type,
+                buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM,
+                                              EMBEDDING_DTYPE, EMBEDDING_SCALE,
+                                              EMBEDDING_FILE_NAME)));
   Tensor h = embedding(x);
 
   // transformer decoder blocks
@@ -256,6 +261,24 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
 
   return {x, h};
 };
+
+std::vector<std::string> Transformer::buildEmbeddingLayerProperties(
+  const std::string &name, unsigned int in_dim, unsigned int out_dim,
+  const std::string &weight_dtype, float scale,
+  const std::string &quantized_lut_path) const {
+  std::vector<std::string> props = {
+    withKey("name", name),
+    withKey("in_dim", std::to_string(in_dim)),
+    withKey("weight_dtype", weight_dtype),
+    withKey("out_dim", std::to_string(out_dim)),
+    withKey("scale", std::to_string(scale)),
+  };
+
+  if (!quantized_lut_path.empty())
+    props.emplace_back(withKey("quantized_lut_path", quantized_lut_path));
+
+  return props;
+}
 
 /**
  * @brief Load model weights from a binary nntrainer model file.

@@ -59,6 +59,12 @@ public:
                                       const WSTR system_prompt = "",
                                       const WSTR tail_prompt = "");
 
+  /**
+   * @brief Get embedding output dimensionality
+   * @return number of floats per encoded embedding row
+   */
+  int getEmbeddingDim() const { return DIM; }
+
 protected:
   /**
    * @brief Setup the parameters for the SentenceTransformer model

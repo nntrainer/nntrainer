@@ -26,7 +26,92 @@
 #include <common_properties.h>
 #include <layer_impl.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
 namespace causallm {
+
+namespace props {
+
+/**
+ * @brief Path to a sidecar embedding LUT.
+ */
+class QuantizedLutPath final : public nntrainer::Property<std::string> {
+public:
+  static constexpr const char *key = "quantized_lut_path";
+  using prop_tag = nntrainer::str_prop_tag;
+};
+
+/**
+ * @brief Output requantization scale for sidecar LUT decoding.
+ */
+class OutputQuantScale final : public nntrainer::Property<float> {
+public:
+  static constexpr const char *key = "output_quant_scale";
+  using prop_tag = nntrainer::float_prop_tag;
+};
+
+/**
+ * @brief Output requantization offset for sidecar LUT decoding.
+ */
+class OutputQuantOffset final : public nntrainer::Property<int> {
+public:
+  static constexpr const char *key = "output_quant_offset";
+  using prop_tag = nntrainer::int_prop_tag;
+};
+
+} // namespace props
+
+/**
+ * @brief Shared sidecar embedding LUT loaded from raw UINT16 or JSON manifest.
+ */
+struct QuantLut {
+  std::vector<uint8_t> bytes;
+  std::vector<float> row_scales;
+
+  float scale = 1.0f;
+  int offset = 0;
+  size_t in_dim = 0;
+  size_t out_dim = 0;
+
+  bool is_raw_u16 = false;
+  bool is_signed4 = false;
+};
+
+/**
+ * @brief Load or return a cached sidecar embedding LUT by path.
+ */
+WIN_EXPORT std::shared_ptr<QuantLut>
+get_or_load_quant_lut(const std::string &path, size_t in_dim_hint = 0,
+                      size_t out_dim_hint = 0);
+
+/**
+ * @brief Decode one LUT row to FP32.
+ */
+WIN_EXPORT void decode_quant_lut_row_to_fp32(const QuantLut &lut,
+                                             size_t token_idx,
+                                             float layer_scale, float *output,
+                                             size_t output_len);
+
+/**
+ * @brief Decode one LUT row to UINT16 using naive float clamping.
+ */
+WIN_EXPORT void decode_quant_lut_row_to_uint16(const QuantLut &lut,
+                                               size_t token_idx,
+                                               float layer_scale,
+                                               uint16_t *output,
+                                               size_t output_len);
+
+/**
+ * @brief Decode one LUT row to UINT16 with output requantization.
+ */
+WIN_EXPORT void decode_quant_lut_row_to_uint16(
+  const QuantLut &lut, size_t token_idx, float layer_scale,
+  float output_quant_scale, int output_quant_offset, uint16_t *output,
+  size_t output_len);
 
 /**
  * @class   EmbeddingLayer
@@ -126,10 +211,15 @@ public:
   inline static const std::string type = "embedding_layer";
 
 private:
+  void forwardSidecarLut(nntrainer::RunLayerContext &context,
+                         unsigned int from, unsigned int to);
+
   std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
-             nntrainer::props::Scale>
+             nntrainer::props::Scale, props::QuantizedLutPath,
+             props::OutputQuantScale, props::OutputQuantOffset>
     embedding_props;
   unsigned int weight_idx;
+  std::shared_ptr<QuantLut> quant_lut;
 };
 } // namespace causallm
 

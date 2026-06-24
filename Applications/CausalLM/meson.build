@@ -213,6 +213,21 @@ if get_option('enable-test')
     '../../test/unittest/models'
   )
 
+  unittest_embedding_sidecar_lut = executable(
+    'unittest_embedding_sidecar_lut',
+    meson.current_source_dir() / 'layers' / 'unittest_embedding_sidecar_lut.cpp',
+    dependencies: [nntrainer_dep, gtest_main_dep, causallm_embedding_layer_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_embedding_sidecar_lut', unittest_embedding_sidecar_lut,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_embedding_sidecar_lut'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   unittest_kv_cache_manager = executable(
     'unittest_kv_cache_manager',
     meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_kv_cache_manager.cpp',

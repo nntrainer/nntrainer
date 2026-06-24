@@ -69,6 +69,22 @@ using json = nlohmann::json;
 std::atomic<size_t> peak_rss_kb{0};
 std::atomic<bool> tracking_enabled{true};
 
+namespace {
+
+void resolveNntrConfigPath(json &nntr_cfg, const std::string &key,
+                           const std::string &model_path) {
+  if (!nntr_cfg.contains(key) || !nntr_cfg[key].is_string())
+    return;
+
+  std::filesystem::path path = nntr_cfg[key].get<std::string>();
+  if (path.empty() || path.is_absolute())
+    return;
+
+  nntr_cfg[key] = (std::filesystem::path(model_path) / path).string();
+}
+
+} // namespace
+
 /**
  * @brief Print the maximum resident set size for the current process.
  */
@@ -316,6 +332,9 @@ int main(int argc, char *argv[]) {
       generation_cfg = causallm::LoadJsonFile(generation_config_path);
     }
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
+    resolveNntrConfigPath(nntr_cfg, "tokenizer_file", model_path);
+    resolveNntrConfigPath(nntr_cfg, "embedding_file_name", model_path);
+    resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_path);
 
     if (nntr_cfg.contains("system_prompt")) {
       system_head_prompt =
