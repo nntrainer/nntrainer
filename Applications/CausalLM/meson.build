@@ -267,6 +267,29 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  unittest_cancel_api = executable(
+    'unittest_cancel_api',
+    [
+      meson.current_source_dir() / 'api' / 'unittest_cancel_api.cpp',
+    ],
+    dependencies: [
+      nntrainer_dep,
+      nntrainer_ccapi_dep,
+      gtest_main_dep,
+      causallm_layer_dependencies,
+      causallm_dep
+    ],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_cancel_api', unittest_cancel_api,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_cancel_api'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   # Ubuntu native builds use platform=none.
   model_unittest_platforms = ['none', 'windows', 'android']
   platform = get_option('platform')

@@ -42,6 +42,8 @@
 #include <kv_cache_manager.h>
 #include <transformer.h>
 
+#include <atomic>
+
 extern "C" {
 struct BaseStreamer;
 }
@@ -62,6 +64,15 @@ public:
    * @param nntr_cfg Configuration for nntrainer (nntrainer_config.json)
    */
   CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg);
+
+#ifdef ENABLE_TEST
+protected:
+  /**
+   * @brief Construct a lightweight CausalLM test double base.
+   */
+  CausalLM() : Transformer() { output_list.push_back(""); }
+public:
+#endif
 
   /**
    * @brief Destroy the CausalLM object
@@ -90,6 +101,16 @@ public:
    * @param streamer Streamer owned by the caller, or nullptr to detach
    */
   void setStreamer(::BaseStreamer *streamer) { streamer_ = streamer; }
+
+  /**
+   * @brief Cooperatively request the active generation loop to stop.
+   */
+  void requestStop() { stop_requested_.store(true, std::memory_order_release); }
+
+  /**
+   * @brief Clear stale stop requests before publishing a new cancellable run.
+   */
+  void prepareForRun();
 
 protected:
   /**
@@ -135,15 +156,21 @@ protected:
    */
   void registerCustomLayers() override;
 
+  /**
+   * @brief Clear stale stop state at run start unless caller prepared it.
+   */
+  void prepareStopRequestForRun();
+
   /** internal buffer */
   std::vector<std::string>
     output_list;             /**< List of output names for the model */
-  unsigned int *ids_history; /**< History of input IDs for the model */
+  unsigned int *ids_history = nullptr; /**< History of input IDs for the model */
 
   std::vector<int> pending_ids_;
 
   ::BaseStreamer *streamer_ = nullptr;
-  bool stop_requested_ = false;
+  std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> stop_prepared_for_run_{false};
 
   std::string LMHEAD_DTYPE; /** embedding dtype */
   std::vector<unsigned int> EOS_TOKEN_ID;

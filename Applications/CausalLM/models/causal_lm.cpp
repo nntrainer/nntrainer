@@ -52,6 +52,17 @@ CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   setupParameters(cfg, generation_cfg, nntr_cfg);
 }
 
+void CausalLM::prepareForRun() {
+  stop_requested_.store(false, std::memory_order_release);
+  stop_prepared_for_run_.store(true, std::memory_order_release);
+}
+
+void CausalLM::prepareStopRequestForRun() {
+  if (!stop_prepared_for_run_.exchange(false, std::memory_order_acq_rel)) {
+    stop_requested_.store(false, std::memory_order_release);
+  }
+}
+
 void CausalLM::setupParameters(json &cfg, json &generation_cfg,
                                json &nntr_cfg) {
   // Initialize output list
@@ -247,7 +258,7 @@ void CausalLM::registerOutputs(
         output_list[b].append(decoded_str);
         if (streamer_ != nullptr &&
             streamer_put(streamer_, decoded_str.c_str()) != 0) {
-          stop_requested_ = true;
+          requestStop();
         }
         pending_ids_.clear();
       }
@@ -347,7 +358,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   allocateAndBindKVCache();
 
   has_run_ = false;
-  stop_requested_ = false;
+  prepareStopRequestForRun();
 
   output_list.clear();
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
@@ -574,7 +585,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   for (unsigned int token_generation_idx = input_len + 1;
        token_generation_idx < input_len + 1 + NUM_TO_GENERATE &&
-       !stop_requested_;
+       !stop_requested_.load(std::memory_order_acquire);
        ++token_generation_idx) {
 
     allocateAndBindKVCache();
@@ -620,7 +631,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       break;
     }
 
-    if (stop_requested_) {
+    if (stop_requested_.load(std::memory_order_acquire)) {
       break;
     }
   }
