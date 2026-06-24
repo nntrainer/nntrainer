@@ -42,6 +42,7 @@
 
 #include <causal_lm.h>
 #include <llm_util.hpp>
+#include <utf8_stream_util.h>
 
 #include "api/streamer.h"
 
@@ -256,9 +257,7 @@ void CausalLM::registerOutputs(
       if (std::find(puncts.begin(), puncts.end(), decoded_str.back()) !=
           puncts.end()) {
         // last symbol is a punctuation, hold on
-      } else if (decoded_str.size() >= 3 &&
-                 decoded_str.compare(decoded_str.size() - 3, 3, "") == 0) {
-        // ends with an incomplete token, hold on
+      } else if (utf8stream::shouldHold(decoded_str, pending_ids_.size())) {
       } else {
         if (log_output && streamer_ == nullptr) {
           std::cout << decoded_str;
