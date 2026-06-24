@@ -42,6 +42,10 @@
 #include <kv_cache_manager.h>
 #include <transformer.h>
 
+extern "C" {
+struct BaseStreamer;
+}
+
 namespace causallm {
 
 /**
@@ -80,6 +84,12 @@ public:
    * @return Generated text string
    */
   std::string getOutput(int batch_idx = 0) const;
+
+  /**
+   * @brief Attach or detach a non-owning streamer for decoded output deltas.
+   * @param streamer Streamer owned by the caller, or nullptr to detach
+   */
+  void setStreamer(::BaseStreamer *streamer) { streamer_ = streamer; }
 
 protected:
   /**
@@ -131,6 +141,9 @@ protected:
   unsigned int *ids_history; /**< History of input IDs for the model */
 
   std::vector<int> pending_ids_;
+
+  ::BaseStreamer *streamer_ = nullptr;
+  bool stop_requested_ = false;
 
   std::string LMHEAD_DTYPE; /** embedding dtype */
   std::vector<unsigned int> EOS_TOKEN_ID;

@@ -18,11 +18,16 @@
 #define WIN_EXPORT
 #endif
 
+#include "causal_lm_callback.h"
+
+#include <stddef.h>
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#include <stddef.h>
 
 /**
  * @brief Performance Metrics
@@ -120,6 +125,21 @@ WIN_EXPORT ErrorCode getPerformanceMetrics(PerformanceMetrics *metrics);
  */
 WIN_EXPORT ErrorCode runModel(const char *inputTextPrompt,
                               const char **outputText);
+
+/**
+ * @brief Run synchronous inference and stream decoded output deltas.
+ * @param inputTextPrompt Input prompt
+ * @param outputText Buffer to store final output text
+ * @param callback Token delta callback, returning non-zero to stop generation.
+ * The callback is invoked synchronously during generation and must not call the
+ * CausalLM C API reentrantly.
+ * @param user_data Opaque pointer passed to callback
+ * @return ErrorCode
+ */
+WIN_EXPORT ErrorCode runModelStreaming(const char *inputTextPrompt,
+                                       const char **outputText,
+                                       CausalLmTokenCallback callback,
+                                       void *user_data);
 
 #ifdef __cplusplus
 }

@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "callback_streamer.h"
 #include "causal_lm.h"
 #include "chat_template.h"
 #include "gemma3_causallm.h"
@@ -587,6 +588,53 @@ ErrorCode runModel(const char *inputTextPrompt, const char **outputText) {
 
   } catch (const std::exception &e) {
     std::cerr << "Exception in runModel: " << e.what() << std::endl;
+    return CAUSAL_LM_ERROR_INFERENCE_FAILED;
+  }
+
+  return CAUSAL_LM_ERROR_NONE;
+}
+
+ErrorCode runModelStreaming(const char *inputTextPrompt,
+                            const char **outputText,
+                            CausalLmTokenCallback callback, void *user_data) {
+  if (inputTextPrompt == nullptr || outputText == nullptr ||
+      callback == nullptr) {
+    return CAUSAL_LM_ERROR_INVALID_PARAMETER;
+  }
+  if (!g_initialized || !g_model) {
+    return CAUSAL_LM_ERROR_NOT_INITIALIZED;
+  }
+
+  try {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    auto *causal_lm_model = dynamic_cast<causallm::CausalLM *>(g_model.get());
+    if (causal_lm_model == nullptr) {
+      return CAUSAL_LM_ERROR_UNKNOWN;
+    }
+
+    std::string input(inputTextPrompt);
+
+    if (g_use_chat_template) {
+      input = apply_chat_template(g_architecture, input);
+    }
+
+    CallbackStreamer streamer;
+    callback_streamer_init(&streamer, callback, user_data);
+    causal_lm_model->setStreamer(&streamer.base);
+
+    struct StreamerDetachGuard {
+      causallm::CausalLM *model;
+      ~StreamerDetachGuard() { model->setStreamer(nullptr); }
+    } detach_guard{causal_lm_model};
+
+    g_model->run(input, false, "", "", g_verbose);
+
+    g_last_output = causal_lm_model->getOutput(0);
+    *outputText = g_last_output.c_str();
+
+  } catch (const std::exception &e) {
+    std::cerr << "Exception in runModelStreaming: " << e.what() << std::endl;
     return CAUSAL_LM_ERROR_INFERENCE_FAILED;
   }
 
