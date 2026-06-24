@@ -177,6 +177,11 @@ public:
   unsigned int getVocabSize() const { return NUM_VOCAB; }
 
   /**
+   * @brief Get tokenizer owned by this model, or nullptr if no tokenizer exists
+   */
+  tokenizers::Tokenizer *getTokenizer() { return tokenizer.get(); }
+
+  /**
    * @brief Attach a non-owning logits processor
    * @param processor Processor pointer, or nullptr to detach
    */
@@ -200,6 +205,22 @@ protected:
    *         and feeding additional layers before returning.
    */
   virtual std::pair<Tensor, Tensor> constructModel();
+
+  /**
+   * @brief Build common CausalLM embedding layer properties
+   * @param name Layer name
+   * @param in_dim Vocabulary/input dimension
+   * @param out_dim Embedding output dimension
+   * @param weight_dtype Layer weight dtype
+   * @param scale Embedding scale
+   * @param quantized_lut_path Optional sidecar LUT path
+   * @return Layer property strings
+   */
+  std::vector<std::string>
+  buildEmbeddingLayerProperties(const std::string &name, unsigned int in_dim,
+                                unsigned int out_dim,
+                                const std::string &weight_dtype, float scale,
+                                const std::string &quantized_lut_path) const;
 
   /**
    * @brief Create one Transformer decoder block (norm + attention + residual +
@@ -277,6 +298,8 @@ protected:
   std::string MODEL_TENSOR_TYPE;
   std::string EMBEDDING_DTYPE; /** embedding dtype */
   std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
+  std::string EMBEDDING_FILE_NAME;
+  std::string PLE_FILE_NAME;
 
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int SLIDING_WINDOW_PATTERN = 5;

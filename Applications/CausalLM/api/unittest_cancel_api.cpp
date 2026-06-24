@@ -29,6 +29,8 @@ void setBeforeCancelRequestHookForTest(BeforeCancelRequestHook hook,
 void setModelForTest(std::unique_ptr<causallm::Transformer> model,
                      const std::string &architecture);
 void resetForTest();
+std::string resolveNntrConfigPathForTest(const std::string &value,
+                                         const std::string &model_dir_path);
 } // namespace causal_lm_api_test
 
 namespace {
@@ -150,6 +152,18 @@ TEST(CausalLmCancelApiTest, CausalLmExposesCrossThreadStopRequest) {
   static_assert(std::is_same<decltype(&causallm::CausalLM::requestStop),
                              void (causallm::CausalLM::*)()>::value,
                 "CausalLM::requestStop must be a public void method");
+}
+
+TEST(CausalLmCancelApiTest, ResolvesRelativeNntrConfigPathsAgainstModelDir) {
+  EXPECT_EQ(causal_lm_api_test::resolveNntrConfigPathForTest(
+              "sidecars/embedding.bin", "/models/gemma4"),
+            "/models/gemma4/sidecars/embedding.bin");
+  EXPECT_EQ(causal_lm_api_test::resolveNntrConfigPathForTest(
+              "/absolute/embedding.bin", "/models/gemma4"),
+            "/absolute/embedding.bin");
+  EXPECT_EQ(causal_lm_api_test::resolveNntrConfigPathForTest(
+              "", "/models/gemma4"),
+            "");
 }
 
 TEST(CausalLmCancelApiTest, LoadedModelWithoutActiveRunCancelsAsNoOpSuccess) {

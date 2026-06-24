@@ -252,11 +252,14 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   const std::string embedding_type =
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
 
-  LayerHandle embedding(createLayer(
-    embedding_type,
-    {"name=embedding0", "in_dim=" + std::to_string(NUM_VOCAB),
-     "weight_dtype=" + EMBEDDING_DTYPE, "out_dim=" + std::to_string(DIM),
-     "scale=" + std::to_string(EMBEDDING_SCALE)}));
+  NNTR_THROW_IF(TIE_WORD_EMBEDDINGS && !EMBEDDING_FILE_NAME.empty(),
+                std::invalid_argument)
+    << "embedding_file_name requires untied embedding_layer";
+  LayerHandle embedding(
+    createLayer(embedding_type,
+                buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM,
+                                              EMBEDDING_DTYPE, EMBEDDING_SCALE,
+                                              EMBEDDING_FILE_NAME)));
   Tensor h = embedding(x);
 
   const unsigned int per_layer_total_dim =
@@ -265,11 +268,10 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   // try using same low bit precision as fc layers
   LayerHandle per_layer_embedding(
     createLayer("embedding_layer",
-                {withKey("name", "per_layer_input_embedding"),
-                 withKey("in_dim", std::to_string(VOCAB_SIZE_PER_LAYER_INPUT)),
-                 withKey("out_dim", std::to_string(per_layer_total_dim)),
-                 withKey("weight_dtype", FC_LAYER_DTYPE),
-                 withKey("scale", EMBEDDING_PER_LAYER_SCALE)}));
+                buildEmbeddingLayerProperties(
+                  "per_layer_input_embedding", VOCAB_SIZE_PER_LAYER_INPUT,
+                  per_layer_total_dim, FC_LAYER_DTYPE, EMBEDDING_PER_LAYER_SCALE,
+                  PLE_FILE_NAME)));
   Tensor per_layer_embedding_out = per_layer_embedding(x);
 
   LayerHandle per_layer_projection(createLayer(
