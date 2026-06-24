@@ -43,6 +43,8 @@
 #include <causal_lm.h>
 #include <llm_util.hpp>
 
+#include "api/streamer.h"
+
 namespace causallm {
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
@@ -238,11 +240,15 @@ void CausalLM::registerOutputs(
                  decoded_str.compare(decoded_str.size() - 3, 3, "") == 0) {
         // ends with an incomplete token, hold on
       } else {
-        if (log_output) {
+        if (log_output && streamer_ == nullptr) {
           std::cout << decoded_str;
           std::cout.flush();
         }
         output_list[b].append(decoded_str);
+        if (streamer_ != nullptr &&
+            streamer_put(streamer_, decoded_str.c_str()) != 0) {
+          stop_requested_ = true;
+        }
         pending_ids_.clear();
       }
     }
@@ -329,6 +335,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                              "initialize() before run().");
   }
 
+  struct StreamerEndGuard {
+    BaseStreamer *streamer;
+    ~StreamerEndGuard() { streamer_end(streamer); }
+  } streamer_end_guard{streamer_};
+
   // Allocate the host-owned KV cache and bind it to mha_core's external cache
   // input slots. Idempotent: only the first call does work; subsequent runs
   // reuse the same buffers and continue from the computed absolute token
@@ -336,6 +347,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   allocateAndBindKVCache();
 
   has_run_ = false;
+  stop_requested_ = false;
 
   output_list.clear();
   for (unsigned int b = 0; b < BATCH_SIZE; ++b) {
@@ -561,7 +573,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   auto start_generation = std::chrono::high_resolution_clock::now();
 
   for (unsigned int token_generation_idx = input_len + 1;
-       token_generation_idx < input_len + 1 + NUM_TO_GENERATE;
+       token_generation_idx < input_len + 1 + NUM_TO_GENERATE &&
+       !stop_requested_;
        ++token_generation_idx) {
 
     allocateAndBindKVCache();
@@ -604,6 +617,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     }
 
     if (is_finish) {
+      break;
+    }
+
+    if (stop_requested_) {
       break;
     }
   }
