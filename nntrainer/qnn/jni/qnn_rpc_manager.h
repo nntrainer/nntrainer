@@ -15,6 +15,7 @@
 #include "PAL/DynamicLoading.hpp"
 #include "QnnTypes.h"
 #include "Utils/DynamicLoadUtil.hpp"
+#include "rpc_mem.h"
 #include <cstddef>
 #include <dlfcn.h>
 #include <map>
@@ -24,18 +25,9 @@
 
 namespace nntrainer {
 
-typedef void *(*RpcMemAllocFn_t)(int, uint32_t, int);
-typedef void (*RpcMemFreeFn_t)(void *);
-typedef int (*RpcMemToFdFn_t)(void *);
 typedef Qnn_ErrorHandle_t (*QnnInterfaceGetProvidersFn_t)(
   const QnnInterface_t ***providerList, uint32_t *numProviders);
 
-/**
- * @class   QNNRpcManager
- * @brief   MemAllocator subclass that routes alloc/free through libcdsprpc's
- *          rpcmem_alloc/rpcmem_free. Installed on QNNContext so MemoryPool
- *          buffers live in DSP-shared memory without an extra copy.
- */
 class QNNRpcManager : public MemAllocator {
 public:
   QNNRpcManager();
@@ -64,10 +56,6 @@ private:
   std::map<void *,
            std::pair<Qnn_ContextHandle_t, std::pair<int, Qnn_MemHandle_t>>>
     ptrToFdAndMemHandleMap_;
-
-  RpcMemAllocFn_t rpcmem_alloc;
-  RpcMemFreeFn_t rpcmem_free;
-  RpcMemToFdFn_t rpcmem_to_fd;
 };
 
 } // namespace nntrainer

@@ -87,7 +87,7 @@ nntrainer_common_sources = [
 # and loaded dynamically by Engine. See qnn/jni/meson.build for the
 # shared_library target. The header is still needed for type definitions.
 if get_option('enable-npu')
-  nntrainer_headers += meson.current_source_dir() / 'qnn_context.h'
+  nntrainer_headers += meson.current_source_dir() / 'qnn' / 'qnn_context.h'
 endif
 
 nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'ruy'

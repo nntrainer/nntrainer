@@ -98,6 +98,16 @@ else
   error('ml api common dep is needed for the android build')
 endif
 
+if get_option('enable-npu')
+  and_conf.set('MESON_ENABLE_NPU', 1)
+  and_conf.set('MESON_QNN_SRCS', ' '.join(qnn_sources_abs))
+  and_conf.set('MESON_QNN_INCS', ' '.join(qnn_inc_abs))
+else
+  and_conf.set('MESON_ENABLE_NPU', 0)
+  and_conf.set('MESON_QNN_SRCS', '')
+  and_conf.set('MESON_QNN_INCS', '')
+endif
+
 configure_file(input: 'Android.mk.in', output: 'Android.mk',
   configuration: and_conf
 )
