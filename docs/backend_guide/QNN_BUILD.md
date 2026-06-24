@@ -17,7 +17,7 @@ This document describes how to do that.
 The SDK is distributed by Qualcomm via the *Qualcomm Software Center* /
 *Qualcomm Package Manager*:
 
-  https://qpm.qualcomm.com/
+  https://www.qualcomm.com/developer/software/qualcomm-ai-engine-direct-sdk
 
 Search for **Qualcomm AI Engine Direct SDK** (a.k.a. QNN SDK). Download
 requires a (free) Qualcomm developer account and acceptance of
