@@ -265,6 +265,12 @@ private:
 
   std::vector<size_t> memory_size; /**< various sizes memory requested */
   std::vector<void *> memory_ptrs; /**< various pointers memory requested */
+  std::vector<size_t>
+    planned_memory_size_; /**< request sizes captured by the last successful
+                               planLayout(). Kept across deallocate() so QNN's
+                               per-offset allocate path can reallocate an
+                               existing layout after request metadata is
+                               cleared. */
 
   std::vector<std::pair<unsigned int, unsigned int>>
     memory_validity; /**< validity intervals for each requested memory */
@@ -292,11 +298,11 @@ private:
 
   std::vector<void *>
     owned_buffers_; /**< unique buffers we must release in deallocate().
-                         For allocate(): one entry (mem_pool). For
-                         allocateFSU(): one entry per distinct offset
-                         (the multi-tenant entries in memory_ptrs alias
-                         these). Tracking unique buffers fixes a
-                         pre-existing leak where allocateFSU() never
+                         For CPU/gpu-svm allocate(): one entry (mem_pool).
+                         For QNN allocate() and allocateFSU(): one entry per
+                         distinct offset (the multi-tenant entries in
+                         memory_ptrs alias these). Tracking unique buffers
+                         fixes a pre-existing leak where allocateFSU() never
                          freed its per-element ptrs. */
 };
 

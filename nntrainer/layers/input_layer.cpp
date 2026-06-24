@@ -46,11 +46,24 @@ void InputLayer::forwarding(RunLayerContext &context, bool training) {
 
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   std::unique_ptr<nntrainer::Quantizer> quantizer;
-  if (!context.getInPlace()) {
-    Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-    ///@note: The following code simply copies incoming values (fp32) to the
-    // input tensor. Supported types include QINT4, QINT8, UINT8, UINT16,
-    // UINT32, FP16, and FP32.
+  Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  ///@note: The following code simply copies incoming values to the output
+  // tensor. Supported types include QINT4, QINT8, UINT8, UINT16, UINT32,
+  // FP16, and FP32.
+  //
+  // The copy is skipped only when input and output genuinely share the same
+  // backing memory. is_inplace is decided in finalize() purely from matching
+  // dims, which assumes the manager aliased input and output. That assumption
+  // breaks when the input is an external placeholder (Model::inference /
+  // setExternalTensors, UNMANAGED) and the output is a managed pool tensor —
+  // e.g. an rpcmem buffer that a downstream QNN-graph layer reads: the manager
+  // cannot alias an external buffer onto a managed one, so it allocates a
+  // separate output yet still reports in-place, and the (skipped) copy leaves
+  // the output all-zero. Guard on the real data pointer so genuine in-place
+  // input layers still skip the redundant self-copy, but externally-fed inputs
+  // get copied into the output the consumer actually reads.
+  if (input_.getData<char>() != nullptr &&
+      hidden_.getData<char>() != input_.getData<char>()) {
     hidden_.copyData(input_);
   }
 

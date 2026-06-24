@@ -86,6 +86,22 @@ public:
   }
 
   /**
+   * @brief Replace this pool's backend allocator BEFORE any allocation.
+   * @note  Used to route the activation pool to a specific backend (e.g. the
+   *        QNN/rpcmem allocator) while leaving the weight pool on CPU. Throws
+   *        if the pool has already been allocated.
+   */
+  void setAllocator(std::shared_ptr<MemAllocator> allocator) {
+    if (allocator == nullptr)
+      throw std::invalid_argument("[TensorPool] allocator must not be null");
+    if (mem_pool && mem_pool->isAllocated())
+      throw std::runtime_error(
+        "[TensorPool] cannot change allocator after allocation");
+    allocator_ = std::move(allocator);
+    mem_pool = std::make_shared<MemoryPool>(allocator_);
+  }
+
+  /**
    * @brief finalize the requested tensors
    * @param planner planner to layout the tensor memories
    * @param start_order start value for the order_exec (inclusive)
