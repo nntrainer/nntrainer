@@ -194,29 +194,32 @@ GTEST_PARAMETER_TEST(RegisterCreateCustomOptimizerTests, AppContextTest,
                                        std::make_tuple("custom_key", -1),
                                        std::make_tuple("custom_key", 5)));
 
-TEST(AppContextTest, RegisterFactoryWithClashingKey_n) {
+TEST(AppContextTest, RegisterFactoryWithClashingKey_p) {
   auto ac = nntrainer::AppContext();
 
-  ac.registerFactory(createCustomOptimizer, "custom_key");
+  int first_key = ac.registerFactory(createCustomOptimizer, "custom_key");
+  int second_key = ac.registerFactory(createCustomOptimizer, "custom_key");
 
-  EXPECT_THROW(ac.registerFactory(createCustomOptimizer, "custom_key"),
-               std::invalid_argument);
+  EXPECT_EQ(first_key, second_key);
 }
 
-TEST(AppContextTest, RegisterFactoryWithClashingIntKey_n) {
+TEST(AppContextTest, RegisterFactoryWithClashingIntKey_p) {
   auto ac = nntrainer::AppContext();
 
-  ac.registerFactory(createCustomOptimizer, "custom_key", 3);
-  EXPECT_THROW(ac.registerFactory(createCustomOptimizer, "custom_other_key", 3),
-               std::invalid_argument);
+  int first_key = ac.registerFactory(createCustomOptimizer, "custom_key", 3);
+  int second_key =
+    ac.registerFactory(createCustomOptimizer, "custom_other_key", 3);
+
+  EXPECT_EQ(first_key, second_key);
 }
 
-TEST(AppContextTest, RegisterFactoryWithClashingAutoKey_n) {
+TEST(AppContextTest, RegisterFactoryWithClashingAutoKey_p) {
   auto ac = nntrainer::AppContext();
 
-  ac.registerFactory(createCustomOptimizer);
-  EXPECT_THROW(ac.registerFactory(createCustomOptimizer),
-               std::invalid_argument);
+  int first_key = ac.registerFactory(createCustomOptimizer);
+  int second_key = ac.registerFactory(createCustomOptimizer);
+
+  EXPECT_EQ(first_key, second_key);
 }
 
 TEST(AppContextTest, createObjectNotExistingKey_n) {
