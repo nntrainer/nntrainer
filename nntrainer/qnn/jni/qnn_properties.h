@@ -29,6 +29,8 @@ namespace props {
  */
 struct quant_param_prop_tag {};
 
+/** @brief Property holding quantization scale and zero-point for an input
+ * tensor. */
 class InputQuantParam
   : public nntrainer::Property<std::pair<std::string, std::pair<float, int>>> {
 public:
@@ -37,6 +39,8 @@ public:
   using prop_tag = quant_param_prop_tag; /**< property type */
 };
 
+/** @brief Property holding quantization scale and zero-point for an output
+ * tensor. */
 class OutputQuantParam
   : public nntrainer::Property<std::pair<std::string, std::pair<float, int>>> {
 public:

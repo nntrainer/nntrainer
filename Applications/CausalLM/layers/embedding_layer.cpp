@@ -85,18 +85,17 @@ const nlohmann::json &requireJsonObjectField(const nlohmann::json &json,
                                              const std::string &path) {
   NNTR_THROW_IF(!json.contains(field) || !json.at(field).is_object(),
                 std::runtime_error)
-    << "Malformed LUT manifest " << path << ": expected object field '"
-    << field << "'";
+    << "Malformed LUT manifest " << path << ": expected object field '" << field
+    << "'";
   return json.at(field);
 }
 
 std::string requireJsonStringField(const nlohmann::json &json,
-                                   const char *field,
-                                   const std::string &path) {
+                                   const char *field, const std::string &path) {
   NNTR_THROW_IF(!json.contains(field) || !json.at(field).is_string(),
                 std::runtime_error)
-    << "Malformed LUT manifest " << path << ": expected string field '"
-    << field << "'";
+    << "Malformed LUT manifest " << path << ": expected string field '" << field
+    << "'";
   return json.at(field).get<std::string>();
 }
 
@@ -111,9 +110,8 @@ float requireJsonFloatField(const nlohmann::json &json, const char *field,
 
 int requireJsonIntField(const nlohmann::json &json, const char *field,
                         const std::string &path) {
-  NNTR_THROW_IF(!json.contains(field) ||
-                  !(json.at(field).is_number_integer() ||
-                    json.at(field).is_number_unsigned()),
+  NNTR_THROW_IF(!json.contains(field) || !(json.at(field).is_number_integer() ||
+                                           json.at(field).is_number_unsigned()),
                 std::runtime_error)
     << "Malformed LUT manifest " << path << ": expected integer field '"
     << field << "'";
@@ -129,9 +127,8 @@ int requireJsonIntField(const nlohmann::json &json, const char *field,
 
 size_t requireJsonSizeField(const nlohmann::json &json, const char *field,
                             const std::string &path) {
-  NNTR_THROW_IF(!json.contains(field) ||
-                  !(json.at(field).is_number_integer() ||
-                    json.at(field).is_number_unsigned()),
+  NNTR_THROW_IF(!json.contains(field) || !(json.at(field).is_number_integer() ||
+                                           json.at(field).is_number_unsigned()),
                 std::runtime_error)
     << "Malformed LUT manifest " << path << ": expected integer field '"
     << field << "'";
@@ -163,9 +160,8 @@ void derivePacked4BitDimensions(QuantLut &lut,
     << "LUT binary has no rows: " << manifest_path;
 }
 
-std::shared_ptr<QuantLut>
-loadUfixed8Manifest(const std::string &manifest_path,
-                    const nlohmann::json &json) {
+std::shared_ptr<QuantLut> loadUfixed8Manifest(const std::string &manifest_path,
+                                              const nlohmann::json &json) {
   const auto lut_path = requireJsonStringField(json, "lut-path", manifest_path);
   const auto &quant_param =
     requireJsonObjectField(json, "quant-param", manifest_path);
@@ -182,9 +178,8 @@ loadUfixed8Manifest(const std::string &manifest_path,
   return lut;
 }
 
-std::shared_ptr<QuantLut>
-loadSfixed4Manifest(const std::string &manifest_path,
-                    const nlohmann::json &json) {
+std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
+                                              const nlohmann::json &json) {
   const auto lut_path = requireJsonStringField(json, "lut-path", manifest_path);
   const auto &quant_param =
     requireJsonObjectField(json, "quant-param", manifest_path);
@@ -235,9 +230,9 @@ std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
     << ": top-level JSON must be an object";
 
   const std::string datatype =
-    json.contains("datatype") ? requireJsonStringField(json, "datatype",
-                                                       manifest_path)
-                              : std::string("ufixed8");
+    json.contains("datatype")
+      ? requireJsonStringField(json, "datatype", manifest_path)
+      : std::string("ufixed8");
 
   if (datatype == "ufixed8")
     return loadUfixed8Manifest(manifest_path, json);
@@ -251,13 +246,11 @@ std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
 }
 
 std::shared_ptr<QuantLut> loadRawU16(const std::string &path,
-                                     size_t in_dim_hint,
-                                     size_t out_dim_hint) {
+                                     size_t in_dim_hint, size_t out_dim_hint) {
   NNTR_THROW_IF(in_dim_hint == 0 || out_dim_hint == 0, std::invalid_argument)
     << "Raw UINT16 LUT requires non-zero in_dim/out_dim hints";
-  NNTR_THROW_IF(in_dim_hint >
-                  std::numeric_limits<size_t>::max() / out_dim_hint /
-                    sizeof(uint16_t),
+  NNTR_THROW_IF(in_dim_hint > std::numeric_limits<size_t>::max() /
+                                out_dim_hint / sizeof(uint16_t),
                 std::overflow_error)
     << "Raw UINT16 LUT size overflows size_t for " << path;
 
@@ -321,8 +314,8 @@ void validateDecodeArgs(const QuantLut &lut, size_t token_idx,
   NNTR_THROW_IF(token_idx >= lut.in_dim, std::invalid_argument)
     << "input word index is greater than in_dim";
   NNTR_THROW_IF(output_len != lut.out_dim, std::invalid_argument)
-    << "LUT decode output length " << output_len
-    << " does not match out_dim " << lut.out_dim;
+    << "LUT decode output length " << output_len << " does not match out_dim "
+    << lut.out_dim;
 }
 
 float decodePacked4BitValue(const QuantLut &lut, size_t token_idx,
@@ -334,8 +327,7 @@ float decodePacked4BitValue(const QuantLut &lut, size_t token_idx,
            lut.row_scales[token_idx] * layer_scale;
   }
 
-  return (static_cast<float>(nibble & 0x0fU) +
-          static_cast<float>(lut.offset)) *
+  return (static_cast<float>(nibble & 0x0fU) + static_cast<float>(lut.offset)) *
          lut.scale * layer_scale;
 }
 
@@ -354,12 +346,10 @@ void decodePacked4BitRowToFloatType(const QuantLut &lut, size_t token_idx,
 
   for (size_t i = 0; i < bytes_per_row; ++i) {
     const uint8_t byte = row[i];
-    output[i * 2] =
-      static_cast<T>(decodePacked4BitValue(lut, token_idx, byte & 0x0fU,
-                                           layer_scale));
-    output[i * 2 + 1] =
-      static_cast<T>(decodePacked4BitValue(lut, token_idx, byte >> 4,
-                                           layer_scale));
+    output[i * 2] = static_cast<T>(
+      decodePacked4BitValue(lut, token_idx, byte & 0x0fU, layer_scale));
+    output[i * 2 + 1] = static_cast<T>(
+      decodePacked4BitValue(lut, token_idx, byte >> 4, layer_scale));
   }
 }
 
@@ -379,9 +369,9 @@ std::shared_ptr<QuantLut> get_or_load_quant_lut(const std::string &path,
     quant_lut_cache.erase(cached);
   }
 
-  auto lut = hasJsonExtension(path) ? loadJsonManifest(path)
-                                    : loadRawU16(path, in_dim_hint,
-                                                 out_dim_hint);
+  auto lut = hasJsonExtension(path)
+               ? loadJsonManifest(path)
+               : loadRawU16(path, in_dim_hint, out_dim_hint);
   validateHintedDimensions(*lut, path, in_dim_hint, out_dim_hint);
   quant_lut_cache[path] = lut;
   return lut;
@@ -400,9 +390,8 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
   validateDecodeArgs(lut, token_idx, output_len);
 
   if (lut.is_raw_u16) {
-    const uint16_t *row =
-      reinterpret_cast<const uint16_t *>(lut.bytes.data()) +
-      token_idx * lut.out_dim;
+    const uint16_t *row = reinterpret_cast<const uint16_t *>(lut.bytes.data()) +
+                          token_idx * lut.out_dim;
     std::memcpy(output, row, lut.out_dim * sizeof(uint16_t));
     return;
   }
@@ -415,18 +404,15 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
 
   for (size_t i = 0; i < bytes_per_row; ++i) {
     const uint8_t byte = row[i];
-    output[i * 2] =
-      clampFloatToU16(decodePacked4BitValue(lut, token_idx, byte & 0x0fU,
-                                            layer_scale));
-    output[i * 2 + 1] =
-      clampFloatToU16(decodePacked4BitValue(lut, token_idx, byte >> 4,
-                                            layer_scale));
+    output[i * 2] = clampFloatToU16(
+      decodePacked4BitValue(lut, token_idx, byte & 0x0fU, layer_scale));
+    output[i * 2 + 1] = clampFloatToU16(
+      decodePacked4BitValue(lut, token_idx, byte >> 4, layer_scale));
   }
 }
 
 void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
-                                    float layer_scale,
-                                    float output_quant_scale,
+                                    float layer_scale, float output_quant_scale,
                                     int output_quant_offset, uint16_t *output,
                                     size_t output_len) {
   validateDecodeArgs(lut, token_idx, output_len);
@@ -452,14 +438,12 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
     const float hi =
       decodePacked4BitValue(lut, token_idx, byte >> 4, layer_scale);
 
-    output[i * 2] =
-      clampRoundedToU16(std::round(static_cast<double>(lo) /
-                                   output_quant_scale) -
-                        output_quant_offset);
-    output[i * 2 + 1] =
-      clampRoundedToU16(std::round(static_cast<double>(hi) /
-                                   output_quant_scale) -
-                        output_quant_offset);
+    output[i * 2] = clampRoundedToU16(
+      std::round(static_cast<double>(lo) / output_quant_scale) -
+      output_quant_offset);
+    output[i * 2 + 1] = clampRoundedToU16(
+      std::round(static_cast<double>(hi) / output_quant_scale) -
+      output_quant_offset);
   }
 }
 
@@ -474,8 +458,7 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
     << "Embedding layer takes only one input";
 
-  auto &quantized_lut_path =
-    std::get<props::QuantizedLutPath>(embedding_props);
+  auto &quantized_lut_path = std::get<props::QuantizedLutPath>(embedding_props);
   const bool has_quantized_lut = !quantized_lut_path.empty();
   if (has_quantized_lut)
     context.setInputDataType(nntrainer::TensorDim::DataType::FP32);
@@ -485,9 +468,8 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   NNTR_THROW_IF(input_dim.channel() != 1, std::invalid_argument)
     << "Embedding layer takes only one for channel size";
 
-  NNTR_THROW_IF(!has_quantized_lut &&
-                  input_dim.getDataType() !=
-                    nntrainer::TensorDim::DataType::FP32,
+  NNTR_THROW_IF(!has_quantized_lut && input_dim.getDataType() !=
+                                        nntrainer::TensorDim::DataType::FP32,
                 std::invalid_argument)
     << "Embedding layer takes only FP32 input data";
 
@@ -506,8 +488,8 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
 
   quant_lut.reset();
   if (has_quantized_lut) {
-    quant_lut = get_or_load_quant_lut(quantized_lut_path.get(), in_dim,
-                                      out_dim);
+    quant_lut =
+      get_or_load_quant_lut(quantized_lut_path.get(), in_dim, out_dim);
     NNTR_THROW_IF(quant_lut->in_dim != in_dim, std::invalid_argument)
       << "LUT in_dim mismatch: layer=" << in_dim
       << ", file=" << quant_lut->in_dim;
@@ -561,12 +543,11 @@ void EmbeddingLayer::forwardSidecarLut(nntrainer::RunLayerContext &context,
   const unsigned int out_dim =
     std::get<nntrainer::props::OutDim>(embedding_props);
   const unsigned int iter = to - from;
-  const float scale = std::get<nntrainer::props::Scale>(embedding_props).empty()
-                        ? 1.0f
-                        : std::get<nntrainer::props::Scale>(embedding_props)
-                            .get();
-  auto &output_quant_scale =
-    std::get<props::OutputQuantScale>(embedding_props);
+  const float scale =
+    std::get<nntrainer::props::Scale>(embedding_props).empty()
+      ? 1.0f
+      : std::get<nntrainer::props::Scale>(embedding_props).get();
+  auto &output_quant_scale = std::get<props::OutputQuantScale>(embedding_props);
   auto &output_quant_offset =
     std::get<props::OutputQuantOffset>(embedding_props);
   const bool has_output_quant_scale = !output_quant_scale.empty();

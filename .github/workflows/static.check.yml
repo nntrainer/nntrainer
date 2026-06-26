@@ -33,6 +33,11 @@ jobs:
           echo "::group::The list of changed files"
           for file in `cat ${tmpfile_pre}`; do
             if [[ -f $file ]]; then
+              # Skip third-party and vendor files
+              if [[ $file == */vendor/* || $file == */third_party/* ]]; then
+                echo "$file is a third-party file, skipping."
+                continue
+              fi
               echo "$file"
               echo "$file" >> $tmpfile
             else

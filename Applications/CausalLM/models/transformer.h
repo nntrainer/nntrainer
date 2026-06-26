@@ -205,12 +205,11 @@ public:
   /** Embedding-PRODUCER (vision): encode an image into LLM-space embeddings.
    *  Returns a heap buffer (caller frees) of size {bytes}; the default
    *  {nullptr,0} means "this model is not a vision producer". */
-  virtual multimodal_pointer run_image(const WSTR prompt, multimodal_pointer image,
-                                       int image_height, int image_width,
-                                       bool do_sample = false,
-                                       const WSTR system_prompt = WSTR(),
-                                       const WSTR tail_prompt = WSTR(),
-                                       bool log_output = true) {
+  virtual multimodal_pointer
+  run_image(const WSTR prompt, multimodal_pointer image, int image_height,
+            int image_width, bool do_sample = false,
+            const WSTR system_prompt = WSTR(), const WSTR tail_prompt = WSTR(),
+            bool log_output = true) {
     (void)prompt;
     (void)image;
     (void)image_height;

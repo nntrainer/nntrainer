@@ -108,10 +108,11 @@ WIN_EXPORT void decode_quant_lut_row_to_uint16(const QuantLut &lut,
 /**
  * @brief Decode one LUT row to UINT16 with output requantization.
  */
-WIN_EXPORT void decode_quant_lut_row_to_uint16(
-  const QuantLut &lut, size_t token_idx, float layer_scale,
-  float output_quant_scale, int output_quant_offset, uint16_t *output,
-  size_t output_len);
+WIN_EXPORT void
+decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
+                               float layer_scale, float output_quant_scale,
+                               int output_quant_offset, uint16_t *output,
+                               size_t output_len);
 
 /**
  * @class   EmbeddingLayer
@@ -211,8 +212,8 @@ public:
   inline static const std::string type = "embedding_layer";
 
 private:
-  void forwardSidecarLut(nntrainer::RunLayerContext &context,
-                         unsigned int from, unsigned int to);
+  void forwardSidecarLut(nntrainer::RunLayerContext &context, unsigned int from,
+                         unsigned int to);
 
   std::tuple<nntrainer::props::InDim, nntrainer::props::OutDim,
              nntrainer::props::Scale, props::QuantizedLutPath,

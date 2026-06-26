@@ -4,6 +4,8 @@
  *
  * @file    streamer.h
  * @brief   Minimal non-owning streamer abstraction for CausalLM decoded deltas.
+ * @author  Joonseok Oh <jrock.oh@samsung.com>
+ * @bug     No known bugs except for NYI items
  */
 
 #ifndef __CAUSAL_LM_STREAMER_H__

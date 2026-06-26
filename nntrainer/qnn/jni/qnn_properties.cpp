@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2025 Samsung Electronics Co., Ltd. All Rights Reserved.
+ *
+ * @file   qnn_properties.cpp
+ * @brief  QNN layer property string converters
+ * @author Joonseok Oh <jrock.oh@samsung.com>
+ * @bug    No known bugs except for NYI items
+ */
 #include "qnn_properties.h"
 
 namespace nntrainer {

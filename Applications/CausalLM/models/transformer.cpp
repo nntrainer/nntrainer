@@ -244,11 +244,10 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
   NNTR_THROW_IF(TIE_WORD_EMBEDDINGS && !EMBEDDING_FILE_NAME.empty(),
                 std::invalid_argument)
     << "embedding_file_name requires untied embedding_layer";
-  LayerHandle embedding(
-    createLayer(embedding_type,
-                buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM,
-                                              EMBEDDING_DTYPE, EMBEDDING_SCALE,
-                                              EMBEDDING_FILE_NAME)));
+  LayerHandle embedding(createLayer(
+    embedding_type,
+    buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM, EMBEDDING_DTYPE,
+                                  EMBEDDING_SCALE, EMBEDDING_FILE_NAME)));
   Tensor h = embedding(x);
 
   // transformer decoder blocks
@@ -533,8 +532,8 @@ void Transformer::registerCustomLayers() {
   static std::once_flag registered;
   std::call_once(registered, []() {
     const auto &ct_engine = nntrainer::Engine::Global();
-    const auto app_context =
-      static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+    const auto app_context = static_cast<nntrainer::AppContext *>(
+      ct_engine.getRegisteredContext("cpu"));
 
     app_context->registerFactory(nntrainer::createLayer<causallm::SwiGLULayer>);
     app_context->registerFactory(

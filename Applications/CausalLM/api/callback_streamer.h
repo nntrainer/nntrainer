@@ -4,6 +4,8 @@
  *
  * @file    callback_streamer.h
  * @brief   BaseStreamer implementation backed by a C token callback.
+ * @author  Joonseok Oh <jrock.oh@samsung.com>
+ * @bug     No known bugs except for NYI items
  */
 
 #ifndef __CAUSAL_LM_CALLBACK_STREAMER_H__

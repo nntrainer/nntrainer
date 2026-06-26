@@ -675,7 +675,8 @@ const int AppContext::registerFactory(const FactoryType<T> factory,
   }
 
   if (int_key != -1 && int_map.find(int_key) != int_map.end()) {
-    // Duplicate int key is likewise a no-op (reuse the existing one), per pr/3963.
+    // Duplicate int key is likewise a no-op (reuse the existing one), per
+    // pr/3963.
     return int_key;
   }
 

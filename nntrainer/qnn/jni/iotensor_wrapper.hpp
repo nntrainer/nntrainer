@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2025 Samsung Electronics Co., Ltd. All Rights Reserved.
+ *
+ * @file   iotensor_wrapper.hpp
+ * @brief  Wrapper around QNN IO tensor setup utilities
+ * @author Joonseok Oh <jrock.oh@samsung.com>
+ * @bug    No known bugs except for NYI items
+ */
 #ifndef __QNN_IOTENSOR_WRAPPER_H__
 #define __QNN_IOTENSOR_WRAPPER_H__
 #include "DataUtil.hpp"
@@ -12,6 +21,7 @@ namespace nntrainer {
 using namespace qnn::tools;
 using namespace qnn::tools::iotensor;
 
+/** @brief Wraps QNN IO tensor allocation and teardown without copying data. */
 class IOTensorWrapper {
 public:
   StatusCode

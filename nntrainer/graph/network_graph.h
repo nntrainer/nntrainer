@@ -110,9 +110,13 @@ public:
                          const std::string &tensor_backend) {
     std::shared_ptr<MemAllocator> w, t;
     if (!weight_backend.empty())
-      w = Engine::Global().getRegisteredContext(weight_backend)->getMemAllocator();
+      w = Engine::Global()
+            .getRegisteredContext(weight_backend)
+            ->getMemAllocator();
     if (!tensor_backend.empty())
-      t = Engine::Global().getRegisteredContext(tensor_backend)->getMemAllocator();
+      t = Engine::Global()
+            .getRegisteredContext(tensor_backend)
+            ->getMemAllocator();
     tensor_manager->setComputeBackend(std::move(w), std::move(t));
   }
 

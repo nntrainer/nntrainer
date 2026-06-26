@@ -17,9 +17,9 @@
  *
  *          The .cpp is compiled into both libqnn_context.so (for QNNRpcManager)
  *          and libquick_dot_ai.so (for allocate/deallocate). Both consumer
- *          libraries are loaded RTLD_LOCAL, so each keeps its own self-contained
- *          RpcMem instance; libcdsprpc.so itself is process-global, so buffers
- *          allocated by one library can be freed by the other.
+ *          libraries are loaded RTLD_LOCAL, so each keeps its own
+ * self-contained RpcMem instance; libcdsprpc.so itself is process-global, so
+ * buffers allocated by one library can be freed by the other.
  */
 #ifndef __QNN_RPC_MEM_H__
 #define __QNN_RPC_MEM_H__

@@ -81,7 +81,7 @@ static std::map<std::string, ModelArchConfig> g_arch_config_map;
 namespace causal_lm_api_test {
 using ActiveRunPublishHook = void (*)(void *);
 using BeforeCancelRequestHook = void (*)(void *);
-}
+} // namespace causal_lm_api_test
 #endif
 
 namespace {
@@ -95,6 +95,7 @@ causal_lm_api_test::BeforeCancelRequestHook g_before_cancel_request_hook =
 void *g_before_cancel_request_user_data = nullptr;
 #endif
 
+/** @brief RAII guard that tracks the currently active CausalLM run. */
 class ActiveRunGuard {
 public:
   explicit ActiveRunGuard(causallm::CausalLM *model) : model_(model) {

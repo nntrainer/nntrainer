@@ -71,6 +71,7 @@ protected:
    * @brief Construct a lightweight CausalLM test double base.
    */
   CausalLM() : Transformer() { output_list.push_back(""); }
+
 public:
 #endif
 
@@ -174,8 +175,9 @@ protected:
 
   /** internal buffer */
   std::vector<std::string>
-    output_list;             /**< List of output names for the model */
-  unsigned int *ids_history = nullptr; /**< History of input IDs for the model */
+    output_list; /**< List of output names for the model */
+  unsigned int *ids_history =
+    nullptr; /**< History of input IDs for the model */
 
   std::vector<int> pending_ids_;
 

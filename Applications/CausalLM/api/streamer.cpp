@@ -4,6 +4,8 @@
  *
  * @file    streamer.cpp
  * @brief   Null-safe BaseStreamer vtable helpers.
+ * @author  Joonseok Oh <jrock.oh@samsung.com>
+ * @bug     No known bugs except for NYI items
  */
 
 #include "streamer.h"

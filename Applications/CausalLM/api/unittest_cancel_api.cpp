@@ -4,10 +4,12 @@
  *
  * @file    unittest_cancel_api.cpp
  * @brief   Focused tests for CausalLM cancellation API contracts.
+ * @author  Joonseok Oh <jrock.oh@samsung.com>
+ * @bug     No known bugs except for NYI items
  */
 
-#include "causal_lm_api.h"
 #include "causal_lm.h"
+#include "causal_lm_api.h"
 
 #include <gtest/gtest.h>
 
@@ -35,6 +37,7 @@ std::string resolveNntrConfigPathForTest(const std::string &value,
 
 namespace {
 
+/** @brief Shared state for synchronising fake run and cancel threads. */
 struct FakeRunState {
   std::mutex mutex;
   std::condition_variable cv;
@@ -50,18 +53,17 @@ struct FakeRunState {
 
 FakeRunState *g_fake_run_state = nullptr;
 
+/** @brief Fake CausalLM implementation for cancel API unit tests. */
 class FakeCausalLM final : public causallm::CausalLM {
 public:
   FakeCausalLM() : CausalLM() {}
 
   void initialize() override { is_initialized = true; }
 
-  void load_weight(const std::string & /*weight_path*/) override {}
+  void load_weight(const std::string &) override {}
 
-  void run(const WSTR /*prompt*/, bool /*do_sample*/ = false,
-           const WSTR /*system_prompt*/ = "",
-           const WSTR /*tail_prompt*/ = "",
-           bool /*log_output*/ = true) override {
+  void run(const WSTR, bool = false, const WSTR = "", const WSTR = "",
+           bool = true) override {
     prepareStopRequestForRun();
 
     auto *state = g_fake_run_state;
@@ -109,9 +111,9 @@ void cancelFromPublishHook(void *user_data) {
 
 bool waitForCancelReadyToRequest(FakeRunState &state) {
   std::unique_lock<std::mutex> lock(state.mutex);
-  return state.cv.wait_for(
-    lock, std::chrono::seconds(5),
-    [&state]() { return state.cancel_ready_to_request; });
+  return state.cv.wait_for(lock, std::chrono::seconds(5), [&state]() {
+    return state.cancel_ready_to_request;
+  });
 }
 
 void blockBeforeCancelRequestHook(void *user_data) {
@@ -119,15 +121,14 @@ void blockBeforeCancelRequestHook(void *user_data) {
   std::unique_lock<std::mutex> lock(state->mutex);
   state->cancel_ready_to_request = true;
   state->cv.notify_all();
-  state->cv.wait(lock,
-                 [state]() { return state->allow_cancel_to_request; });
+  state->cv.wait(lock, [state]() { return state->allow_cancel_to_request; });
 }
 
 bool waitForReplacementCompleted(FakeRunState &state,
                                  std::chrono::milliseconds timeout) {
   std::unique_lock<std::mutex> lock(state.mutex);
-  return state.cv.wait_for(
-    lock, timeout, [&state]() { return state.replacement_completed; });
+  return state.cv.wait_for(lock, timeout,
+                           [&state]() { return state.replacement_completed; });
 }
 
 void allowCancelToRequest(FakeRunState &state) {
@@ -161,15 +162,13 @@ TEST(CausalLmCancelApiTest, ResolvesRelativeNntrConfigPathsAgainstModelDir) {
   EXPECT_EQ(causal_lm_api_test::resolveNntrConfigPathForTest(
               "/absolute/embedding.bin", "/models/gemma4"),
             "/absolute/embedding.bin");
-  EXPECT_EQ(causal_lm_api_test::resolveNntrConfigPathForTest(
-              "", "/models/gemma4"),
-            "");
+  EXPECT_EQ(
+    causal_lm_api_test::resolveNntrConfigPathForTest("", "/models/gemma4"), "");
 }
 
 TEST(CausalLmCancelApiTest, LoadedModelWithoutActiveRunCancelsAsNoOpSuccess) {
   causal_lm_api_test::resetForTest();
-  causal_lm_api_test::setModelForTest(makeFakeModel(),
-                                      "CancelApiTestCausalLM");
+  causal_lm_api_test::setModelForTest(makeFakeModel(), "CancelApiTestCausalLM");
 
   EXPECT_EQ(cancelModel(), CAUSAL_LM_ERROR_NONE);
 
@@ -178,8 +177,7 @@ TEST(CausalLmCancelApiTest, LoadedModelWithoutActiveRunCancelsAsNoOpSuccess) {
 
 TEST(CausalLmCancelApiTest, ActiveRunCanBeCancelledAcrossThreads) {
   causal_lm_api_test::resetForTest();
-  causal_lm_api_test::setModelForTest(makeFakeModel(),
-                                      "CancelApiTestCausalLM");
+  causal_lm_api_test::setModelForTest(makeFakeModel(), "CancelApiTestCausalLM");
 
   FakeRunState state;
   g_fake_run_state = &state;
@@ -210,13 +208,12 @@ TEST(CausalLmCancelApiTest, ActiveRunCanBeCancelledAcrossThreads) {
 
 TEST(CausalLmCancelApiTest, CancelAfterActivePublishIsNotClearedAtRunStart) {
   causal_lm_api_test::resetForTest();
-  causal_lm_api_test::setModelForTest(makeFakeModel(),
-                                      "CancelApiTestCausalLM");
+  causal_lm_api_test::setModelForTest(makeFakeModel(), "CancelApiTestCausalLM");
 
   FakeRunState state;
   g_fake_run_state = &state;
-  causal_lm_api_test::setAfterActiveRunPublishHookForTest(
-    cancelFromPublishHook, &state);
+  causal_lm_api_test::setAfterActiveRunPublishHookForTest(cancelFromPublishHook,
+                                                          &state);
 
   const char *output = nullptr;
   ErrorCode run_result = CAUSAL_LM_ERROR_UNKNOWN;
@@ -245,11 +242,9 @@ TEST(CausalLmCancelApiTest, CancelAfterActivePublishIsNotClearedAtRunStart) {
   causal_lm_api_test::resetForTest();
 }
 
-TEST(CausalLmCancelApiTest,
-     ModelReplacementWaitsForInFlightCancelDereference) {
+TEST(CausalLmCancelApiTest, ModelReplacementWaitsForInFlightCancelDereference) {
   causal_lm_api_test::resetForTest();
-  causal_lm_api_test::setModelForTest(makeFakeModel(),
-                                      "CancelApiTestCausalLM");
+  causal_lm_api_test::setModelForTest(makeFakeModel(), "CancelApiTestCausalLM");
 
   FakeRunState state;
   g_fake_run_state = &state;
@@ -294,7 +289,8 @@ TEST(CausalLmCancelApiTest,
     state.cv.notify_all();
   });
 
-  EXPECT_FALSE(waitForReplacementCompleted(state, std::chrono::milliseconds(50)))
+  EXPECT_FALSE(
+    waitForReplacementCompleted(state, std::chrono::milliseconds(50)))
     << "model replacement completed while cancelModel still held a selected "
        "active model pointer";
 

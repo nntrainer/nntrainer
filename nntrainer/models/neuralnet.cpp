@@ -242,8 +242,8 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   // CPU. The nntrainer weight pool is NOT DSP-registered (QNN graph weights are
   // loaded by the QNN context loader), so routing weights to rpcmem too would
   // needlessly exhaust the scarce CMA pool — observed as rpcmem_to_fd failures
-  // after a few generated tokens once the app UI's GPU dmabuf also draws on CMA.
-  // Mirrors the upstream setComputeBackend("", "npu") tensor-only design
+  // after a few generated tokens once the app UI's GPU dmabuf also draws on
+  // CMA. Mirrors the upstream setComputeBackend("", "npu") tensor-only design
   // (here the QNN context registers under the name "qnn").
   if (has_qnn_engine)
     model_graph.setComputeBackend("", "qnn");
@@ -1437,11 +1437,12 @@ sharedConstTensors NeuralNetwork::inference(sharedConstTensors X,
   // deallocateTensors()+allocateTensors() that allocate() does: reallocating
   // every token hands out NEW rpcmem addresses, defeats registerQnnTensor()'s
   // findMatchingPtr cache (every token re-runs rpcmem_to_fd()+memRegister()),
-  // and churns the scarce contiguous CMA pool until rpcmem_to_fd fails under the
-  // app UI's GPU dmabuf pressure. allocateTensors() no-ops when already
+  // and churns the scarce contiguous CMA pool until rpcmem_to_fd fails under
+  // the app UI's GPU dmabuf pressure. allocateTensors() no-ops when already
   // allocated; a free_mem=true caller deallocates at the end so the next call
   // re-allocates. CPU/GPU keep the realloc-per-call behavior — reusing the pool
-  // there yields degenerate output (verified: gemma4 CPU loops "... is ... is").
+  // there yields degenerate output (verified: gemma4 CPU loops "... is ...
+  // is").
   if (reuse_inference_tensor_pool_)
     model_graph.allocateTensors(ExecutionMode::INFERENCE);
   else

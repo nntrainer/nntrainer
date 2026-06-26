@@ -18,8 +18,8 @@ namespace nntrainer {
 
 RpcMem::RpcMem() {
 #ifdef ENABLE_QNN
-  void *handle = DynamicLibraryLoader::loadLibrary("libcdsprpc.so",
-                                                   RTLD_NOW | RTLD_LOCAL);
+  void *handle =
+    DynamicLibraryLoader::loadLibrary("libcdsprpc.so", RTLD_NOW | RTLD_LOCAL);
   if (handle == nullptr) {
     ml_loge("RpcMem: failed to dlopen libcdsprpc.so: %s",
             DynamicLibraryLoader::getLastError());

@@ -28,6 +28,7 @@ namespace nntrainer {
 typedef Qnn_ErrorHandle_t (*QnnInterfaceGetProvidersFn_t)(
   const QnnInterface_t ***providerList, uint32_t *numProviders);
 
+/** @brief Manages QNN RPC shared memory allocation via libcdsprpc. */
 class QNNRpcManager : public MemAllocator {
 public:
   QNNRpcManager();

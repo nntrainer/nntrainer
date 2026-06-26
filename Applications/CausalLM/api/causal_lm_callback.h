@@ -4,6 +4,8 @@
  *
  * @file    causal_lm_callback.h
  * @brief   Public callback types for the CausalLM C API.
+ * @author  Joonseok Oh <jrock.oh@samsung.com>
+ * @bug     No known bugs except for NYI items
  */
 
 #ifndef __CAUSAL_LM_CALLBACK_H__

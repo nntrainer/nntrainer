@@ -489,11 +489,10 @@ public:
   explicit ForcedOffsetPlanner(std::vector<size_t> offsets_) :
     offsets(std::move(offsets_)) {}
 
-  size_t planLayout(
-    const std::vector<size_t> &memory_size,
-    const std::vector<std::pair<unsigned int, unsigned int>> &,
-    std::vector<size_t> &memory_offset, std::vector<bool> &,
-    size_t) const override {
+  size_t planLayout(const std::vector<size_t> &memory_size,
+                    const std::vector<std::pair<unsigned int, unsigned int>> &,
+                    std::vector<size_t> &memory_offset, std::vector<bool> &,
+                    size_t) const override {
     if (offsets.size() != memory_size.size())
       throw std::runtime_error("ForcedOffsetPlanner offset count mismatch");
 
@@ -516,11 +515,10 @@ public:
   explicit ExpectWGradCountPlanner(size_t expected_n_wgrad_) :
     expected_n_wgrad(expected_n_wgrad_) {}
 
-  size_t planLayout(
-    const std::vector<size_t> &memory_size,
-    const std::vector<std::pair<unsigned int, unsigned int>> &,
-    std::vector<size_t> &memory_offset, std::vector<bool> &,
-    size_t n_wgrad) const override {
+  size_t planLayout(const std::vector<size_t> &memory_size,
+                    const std::vector<std::pair<unsigned int, unsigned int>> &,
+                    std::vector<size_t> &memory_offset, std::vector<bool> &,
+                    size_t n_wgrad) const override {
     if (n_wgrad != expected_n_wgrad)
       throw std::runtime_error("unexpected weight-gradient request count");
 
@@ -736,12 +734,10 @@ TEST(MemoryPoolAllocator, request_after_deallocate_resets_wgrad_count) {
   auto counter = std::make_shared<QnnCountingAllocator>();
   nntrainer::MemoryPool pool(counter);
 
-  EXPECT_NO_THROW(pool.requestMemory(64, 1, 3, {},
-                                     nntrainer::TensorLifespan::MAX_LIFESPAN,
-                                     true));
-  EXPECT_NO_THROW(pool.requestMemory(64, 2, 4, {},
-                                     nntrainer::TensorLifespan::MAX_LIFESPAN,
-                                     true));
+  EXPECT_NO_THROW(pool.requestMemory(
+    64, 1, 3, {}, nntrainer::TensorLifespan::MAX_LIFESPAN, true));
+  EXPECT_NO_THROW(pool.requestMemory(
+    64, 2, 4, {}, nntrainer::TensorLifespan::MAX_LIFESPAN, true));
   EXPECT_NO_THROW(pool.planLayout(nntrainer::BasicPlanner()));
   EXPECT_NO_THROW(pool.allocate());
   EXPECT_NO_THROW(pool.deallocate());
@@ -768,9 +764,8 @@ TEST(MemoryPoolAllocator,
 
   nntrainer::MemoryPool pool;
 
-  EXPECT_NO_THROW(pool.requestMemory(64, 1, 3, {},
-                                     nntrainer::TensorLifespan::MAX_LIFESPAN,
-                                     true));
+  EXPECT_NO_THROW(pool.requestMemory(
+    64, 1, 3, {}, nntrainer::TensorLifespan::MAX_LIFESPAN, true));
   EXPECT_NO_THROW(pool.deallocate());
 
   EXPECT_NO_THROW(pool.requestMemory(128, 3, 4));

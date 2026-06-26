@@ -4,15 +4,16 @@
  *
  * @file    callback_streamer.cpp
  * @brief   Callback-backed BaseStreamer implementation.
+ * @author  Joonseok Oh <jrock.oh@samsung.com>
+ * @bug     No known bugs except for NYI items
  */
 
 #include "callback_streamer.h"
 
 extern "C" {
 
-static int callback_streamer_put(BaseStreamer *self,
-                                 const char *decoded_utf8) {
-  auto *streamer = reinterpret_cast<CallbackStreamer *>(self);
+static int callback_streamer_put(BaseStreamer *self, const char *decoded_utf8) {
+  auto *streamer = reinterpret_cast<CallbackStreuamer *>(self);
   if (streamer == nullptr || streamer->callback == nullptr) {
     return 0;
   }
@@ -28,7 +29,7 @@ static int callback_streamer_put(BaseStreamer *self,
   return ret;
 }
 
-static void callback_streamer_end(BaseStreamer * /*self*/) {}
+static void callback_streamer_end(BaseStreamer *) {}
 
 static const BaseStreamerVTable callback_streamer_vtable = {
   &callback_streamer_put,
@@ -36,8 +37,7 @@ static const BaseStreamerVTable callback_streamer_vtable = {
 };
 
 void callback_streamer_init(CallbackStreamer *self,
-                            CausalLmTokenCallback callback,
-                            void *user_data) {
+                            CausalLmTokenCallback callback, void *user_data) {
   if (self == nullptr) {
     return;
   }

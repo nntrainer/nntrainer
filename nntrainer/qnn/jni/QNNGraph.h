@@ -22,6 +22,8 @@
 
 namespace nntrainer {
 
+/** @brief QNN Graph layer that wraps Qualcomm Neural Network graph execution.
+ */
 class QNNGraph : public LayerImpl {
 public:
   using BufferTypePtr =

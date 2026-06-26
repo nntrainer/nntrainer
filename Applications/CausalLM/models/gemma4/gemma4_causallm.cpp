@@ -255,23 +255,22 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   NNTR_THROW_IF(TIE_WORD_EMBEDDINGS && !EMBEDDING_FILE_NAME.empty(),
                 std::invalid_argument)
     << "embedding_file_name requires untied embedding_layer";
-  LayerHandle embedding(
-    createLayer(embedding_type,
-                buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM,
-                                              EMBEDDING_DTYPE, EMBEDDING_SCALE,
-                                              EMBEDDING_FILE_NAME)));
+  LayerHandle embedding(createLayer(
+    embedding_type,
+    buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM, EMBEDDING_DTYPE,
+                                  EMBEDDING_SCALE, EMBEDDING_FILE_NAME)));
   Tensor h = embedding(x);
 
   const unsigned int per_layer_total_dim =
     NUM_LAYERS * HIDDEN_SIZE_PER_LAYER_INPUT;
 
   // try using same low bit precision as fc layers
-  LayerHandle per_layer_embedding(
-    createLayer("embedding_layer",
-                buildEmbeddingLayerProperties(
-                  "per_layer_input_embedding", VOCAB_SIZE_PER_LAYER_INPUT,
-                  per_layer_total_dim, FC_LAYER_DTYPE, EMBEDDING_PER_LAYER_SCALE,
-                  PLE_FILE_NAME)));
+  LayerHandle per_layer_embedding(createLayer(
+    "embedding_layer",
+    buildEmbeddingLayerProperties("per_layer_input_embedding",
+                                  VOCAB_SIZE_PER_LAYER_INPUT,
+                                  per_layer_total_dim, FC_LAYER_DTYPE,
+                                  EMBEDDING_PER_LAYER_SCALE, PLE_FILE_NAME)));
   Tensor per_layer_embedding_out = per_layer_embedding(x);
 
   LayerHandle per_layer_projection(createLayer(

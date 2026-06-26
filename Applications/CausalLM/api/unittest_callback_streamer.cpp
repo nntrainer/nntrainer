@@ -4,6 +4,8 @@
  *
  * @file    unittest_callback_streamer.cpp
  * @brief   Focused tests for CausalLM callback streamer adapter behavior.
+ * @author  Joonseok Oh <jrock.oh@samsung.com>
+ * @bug     No known bugs except for NYI items
  */
 
 #include "callback_streamer.h"
@@ -14,6 +16,7 @@
 
 namespace {
 
+/** @brief State captured by the test token callback. */
 struct CallbackState {
   int calls = 0;
   std::string text;

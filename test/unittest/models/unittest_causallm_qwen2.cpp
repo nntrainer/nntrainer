@@ -465,10 +465,9 @@ public:
  * @brief Make a direct tiny Qwen2 model for logits processor hook tests
  */
 std::unique_ptr<TinyQwen2CausalLM>
-makeDirectTinyQwen2Model(
-  const causallm_test::TinyCausalLMFiles &files,
-  const causallm_test::TinyCausalLMCase &test_case,
-  const std::vector<unsigned int> &bad_word_ids = {}) {
+makeDirectTinyQwen2Model(const causallm_test::TinyCausalLMFiles &files,
+                         const causallm_test::TinyCausalLMCase &test_case,
+                         const std::vector<unsigned int> &bad_word_ids = {}) {
   auto config =
     causallm_test::makeTinyCausalLMConfig(test_case, files.tokenizer_path);
   config.nntrainer["bad_word_ids"] = bad_word_ids;
@@ -526,8 +525,8 @@ TEST_P(Qwen2CausalLMTinyModelTest,
   unsigned int input_ids[4] = {1, 0, 0, 0};
 
   model->setLogitsProcessor(&processor);
-  auto ids = model->generateFromLogits(logits.data(), false, 1.0f, input_ids,
-                                       1);
+  auto ids =
+    model->generateFromLogits(logits.data(), false, 1.0f, input_ids, 1);
 
   ASSERT_EQ(ids.size(), 1u);
   EXPECT_EQ(ids[0], 7u);
@@ -555,8 +554,8 @@ TEST_P(Qwen2CausalLMTinyModelTest,
   std::vector<float> logits(32, -2.0f);
   logits[3] = 5.0f;
   logits[7] = 4.0f;
-  auto ids = model->generateFromLogits(logits.data(), false, 1.0f, input_ids,
-                                       1);
+  auto ids =
+    model->generateFromLogits(logits.data(), false, 1.0f, input_ids, 1);
 
   ASSERT_EQ(ids.size(), 1u);
   EXPECT_EQ(ids[0], 3u);

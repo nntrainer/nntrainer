@@ -5,6 +5,8 @@
  * @file   unittest_embedding_sidecar_lut.cpp
  * @date   11 June 2026
  * @brief  CausalLM EmbeddingLayer sidecar LUT tests
+ * @author Joonseok Oh <jrock.oh@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #include <embedding_layer.h>
@@ -22,6 +24,7 @@
 
 namespace {
 
+/** @brief RAII helper that creates and removes a temporary directory. */
 class TempDir {
 public:
   explicit TempDir(const std::string &name) {
@@ -174,9 +177,9 @@ TEST(CausalLmEmbeddingSidecarLut, sfixed4ManifestParsesAndValidatesRowScale) {
     "quant-param": { "scale": [0.5] }
   })");
 
-  EXPECT_THROW(causallm::get_or_load_quant_lut(bad_manifest_path.string(), 2,
-                                               4),
-               std::invalid_argument);
+  EXPECT_THROW(
+    causallm::get_or_load_quant_lut(bad_manifest_path.string(), 2, 4),
+    std::invalid_argument);
 }
 
 TEST(CausalLmEmbeddingSidecarLut, unsupportedManifestDatatypeThrows) {
@@ -212,8 +215,7 @@ TEST(CausalLmEmbeddingSidecarLut, ufixed8DecodeRequantsToUint16) {
   auto lut = causallm::get_or_load_quant_lut(manifest_path.string(), 2, 4);
 
   uint16_t output[4] = {};
-  causallm::decode_quant_lut_row_to_uint16(*lut, 1, 2.0f, 0.25f, -3, output,
-                                           4);
+  causallm::decode_quant_lut_row_to_uint16(*lut, 1, 2.0f, 0.25f, -3, output, 4);
 
   EXPECT_EQ(output[0], 19);
   EXPECT_EQ(output[1], 23);
@@ -228,8 +230,8 @@ TEST(CausalLmEmbeddingSidecarLut,
   writeU16(raw_path, {10, 11, 12, 20, 21, 22, 30, 31, 32});
 
   causallm::EmbeddingLayer layer;
-  layer.setProperty({"in_dim=3", "out_dim=3",
-                     "quantized_lut_path=" + raw_path.string()});
+  layer.setProperty(
+    {"in_dim=3", "out_dim=3", "quantized_lut_path=" + raw_path.string()});
 
   nntrainer::InitLayerContext init_context(
     {makeInputDim(nntrainer::TensorDim::DataType::UINT16, 2)}, {true}, false,
@@ -367,12 +369,11 @@ TEST(CausalLmEmbeddingSidecarLut,
      rawUint16IncrementalForwardingUsesCompactStepInput) {
   TempDir dir("nntrainer_embedding_sidecar_incremental_raw_u16");
   const auto raw_path = dir.path() / "embedding.u16";
-  writeU16(raw_path,
-           {10, 11, 12, 20, 21, 22, 30, 31, 32, 40, 41, 42});
+  writeU16(raw_path, {10, 11, 12, 20, 21, 22, 30, 31, 32, 40, 41, 42});
 
   causallm::EmbeddingLayer layer;
-  layer.setProperty({"in_dim=4", "out_dim=3",
-                     "quantized_lut_path=" + raw_path.string()});
+  layer.setProperty(
+    {"in_dim=4", "out_dim=3", "quantized_lut_path=" + raw_path.string()});
 
   nntrainer::InitLayerContext init_context(
     {makeInputDim(nntrainer::TensorDim::DataType::UINT16, 3)}, {true}, false,

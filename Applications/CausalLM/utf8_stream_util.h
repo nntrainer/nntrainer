@@ -68,8 +68,7 @@ inline bool endsWithIncompleteUtf8(const std::string &s) {
 // that do not yet form a complete code point, so a trailing U+FFFD signals
 // "the character is still being assembled".
 inline bool endsWithReplacementChar(const std::string &s) {
-  return s.size() >= 3 &&
-         static_cast<unsigned char>(s[s.size() - 3]) == 0xef &&
+  return s.size() >= 3 && static_cast<unsigned char>(s[s.size() - 3]) == 0xef &&
          static_cast<unsigned char>(s[s.size() - 2]) == 0xbf &&
          static_cast<unsigned char>(s[s.size() - 1]) == 0xbd;
 }
