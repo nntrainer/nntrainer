@@ -112,6 +112,17 @@ public:
    */
   void prepareForRun();
 
+  /**
+   * @brief Attach a non-owning logits processor
+   * @param processor Processor pointer, or nullptr to detach
+   */
+  void setLogitsProcessor(LogitsProcessor *processor) override;
+
+  /**
+   * @brief Reset attached logits processor state
+   */
+  void resetLogitsProcessor() override;
+
 protected:
   /**
    * @brief Setup the parameters for the CausalLM model
@@ -190,6 +201,8 @@ protected:
   unsigned int global_token_len;
 
   std::mt19937 rng; /**< Random Number Gen */
+
+  LogitsProcessor *logits_processor = nullptr; /**< Non-owning processor */
 
   /**
    * @brief Externalized KV cache (host-owned). Allocated by allocateKVCache()

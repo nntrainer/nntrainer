@@ -63,6 +63,15 @@ void CausalLM::prepareStopRequestForRun() {
   }
 }
 
+void CausalLM::setLogitsProcessor(LogitsProcessor *processor) {
+  logits_processor = processor;
+}
+
+void CausalLM::resetLogitsProcessor() {
+  if (logits_processor != nullptr)
+    logits_processor->reset();
+}
+
 void CausalLM::setupParameters(json &cfg, json &generation_cfg,
                                json &nntr_cfg) {
   // Initialize output list
@@ -303,22 +312,30 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
       applyBadWordsPenalty(logits, BAD_WORD_IDS.data(), NUM_BADWORDS);
     }
 
+    if (logits_processor != nullptr)
+      logits_processor->process(logits, NUM_VOCAB, iteration);
+
+    unsigned int output_id;
+
     // return argmax if do_sample is false
     if (do_sample == false) {
-      unsigned int argmax_idx =
+      output_id =
         std::distance(logits, std::max_element(logits, logits + NUM_VOCAB));
-      outputs.push_back(argmax_idx);
     } else {
       // apply temperature & top-k & top-p and sample with original logits
       // unchanged
-      unsigned int sampled_idx =
-        applyTKP(logits, NUM_VOCAB, TEMPERATURE, TOP_K, TOP_P, rng);
-      outputs.push_back(sampled_idx);
+      output_id = applyTKP(logits, NUM_VOCAB, TEMPERATURE, TOP_K, TOP_P, rng);
     }
+
+    outputs.push_back(output_id);
+
+    if (logits_processor != nullptr)
+      logits_processor->acceptToken(output_id, iteration);
 
     // set batch offset
     logits = logits + NUM_VOCAB;
-    input_ids = input_ids + MAX_SEQ_LEN;
+    if (input_ids != nullptr)
+      input_ids = input_ids + MAX_SEQ_LEN;
   }
 
   return outputs;
