@@ -111,7 +111,7 @@ public:
   /**
    * @brief register pluggables from a directory.
    * @note if you have a clashing type with already registered pluggable, it
-   * will throw from `registerFactory` function
+   * will be a no-op (existing int_key is returned)
    *
    * @param base_path a directory path to search pluggables's
    * @return std::vector<int> list of integer key to create a pluggable
@@ -149,7 +149,9 @@ public:
    * @param int_key key to access the factory by integer, if it is -1(default),
    * the function automatically unsigned the key and return
    * @return const int unique integer value to access the current factory
-   * @throw invalid argument when key and/or int_key is already taken
+   * @note If key and/or int_key is already taken, the existing int_key is
+   * returned (no-op re-registration). This allows multi-model handles to
+   * safely re-register shared custom layers.
    */
   template <typename T>
   const int registerFactory(const PtrFactoryType<T> factory,
@@ -170,7 +172,9 @@ public:
    * @param int_key key to access the factory by integer, if it is -1(default),
    * the function automatically unsigned the key and return
    * @return const int unique integer value to access the current factory
-   * @throw invalid argument when key and/or int_key is already taken
+   * @note If key and/or int_key is already taken, the existing int_key is
+   * returned (no-op re-registration). This allows multi-model handles to
+   * safely re-register shared custom layers.
    */
   template <typename T>
   const int registerFactory(const FactoryType<T> factory,
