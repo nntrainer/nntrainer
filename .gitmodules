@@ -25,6 +25,3 @@
 [submodule "nntrainer-windows-resource"]
 	path = nntrainer-windows-resource
 	url = https://github.com/nnstreamer/nntrainer-windows-resource.git
-[submodule "Applications/CausalLM/third_party/minja"]
-	path = Applications/CausalLM/third_party/minja
-	url = https://github.com/google/minja
