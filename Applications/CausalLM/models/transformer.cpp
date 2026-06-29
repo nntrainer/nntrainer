@@ -6,12 +6,17 @@
  * @date   10 July 2025
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
+ * @author Sumon Nath <sumon.nath@samsung.com>
+ * @author Pranjal Thapliyal <p.thapliyal@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This file defines Transformer's basic actions
  */
 
+#include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <mutex>
+#include <unordered_set>
 
 #include <app_context.h>
 #include <engine.h>
@@ -194,8 +199,31 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   NORM_EPS = cfg["rms_norm_eps"];
   GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
 
+  LORA_RANK = nntr_cfg.contains("lora_rank")
+                ? nntr_cfg["lora_rank"].get<unsigned int>()
+                : 0;
+  LORA_ALPHA = nntr_cfg.contains("lora_alpha")
+                 ? nntr_cfg["lora_alpha"].get<unsigned int>()
+                 : 0;
+  LORA_TARGET = nntr_cfg.contains("lora_target")
+                  ? nntr_cfg["lora_target"].get<std::vector<std::string>>()
+                  : std::vector<std::string>{};
+
   return;
 };
+
+bool Transformer::hasLoRA(const std::string &module_type) const {
+  if (LORA_RANK == 0 || LORA_TARGET.empty())
+    return false;
+  return std::find(LORA_TARGET.begin(), LORA_TARGET.end(), module_type) !=
+         LORA_TARGET.end();
+}
+
+void Transformer::appendLoRAProps(std::vector<std::string> &props) const {
+  props.push_back(withKey("lora_rank", LORA_RANK));
+  if (LORA_ALPHA > 0)
+    props.push_back(withKey("lora_alpha", LORA_ALPHA));
+}
 
 /**
  * @brief Build and compile the symbolic transformer graph.
@@ -246,10 +274,12 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
   NNTR_THROW_IF(TIE_WORD_EMBEDDINGS && !EMBEDDING_FILE_NAME.empty(),
                 std::invalid_argument)
     << "embedding_file_name requires untied embedding_layer";
-  LayerHandle embedding(createLayer(
-    embedding_type,
+  auto emb_props =
     buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM, EMBEDDING_DTYPE,
-                                  EMBEDDING_SCALE, EMBEDDING_FILE_NAME)));
+                                  EMBEDDING_SCALE, EMBEDDING_FILE_NAME);
+  if (LORA_RANK > 0)
+    emb_props.push_back(withKey("trainable", "false"));
+  LayerHandle embedding(createLayer(embedding_type, emb_props));
   Tensor h = embedding(x);
 
   // transformer decoder blocks
@@ -257,12 +287,16 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
     h = createTransformerDecoderBlock(i, h);
   }
 
-  // final rms_norm
-  LayerHandle out_norm(
-    createLayer("rms_norm", {withKey("name", "output_norm"),
-                             withKey("epsilon", std::to_string(NORM_EPS)),
-                             withKey("packed", "false")}));
-  h = out_norm(h);
+  // final rms_norm (frozen in LoRA mode)
+  {
+    std::vector<std::string> norm_params = {
+      withKey("name", "output_norm"),
+      withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+    if (LORA_RANK > 0)
+      norm_params.push_back(withKey("trainable", "false"));
+    LayerHandle out_norm(createLayer("rms_norm", norm_params));
+    h = out_norm(h);
+  }
 
   return {x, h};
 };
@@ -285,6 +319,91 @@ std::vector<std::string> Transformer::buildEmbeddingLayerProperties(
   return props;
 }
 
+void Transformer::initializeForTraining(float lr, unsigned int epochs) {
+  registerCustomLayers();
+  constructModel();
+
+  try {
+    model->addLayer(ml::train::createLayer("cross_softmax", {"name=loss"}));
+  } catch (const std::exception &e) {
+    std::cerr << "[initializeForTraining] loss layer: " << e.what()
+              << std::endl;
+  }
+
+  std::vector<std::string> model_props = {
+    withKey("batch_size", BATCH_SIZE), withKey("epochs", epochs),
+    withKey("model_tensor_type", MODEL_TENSOR_TYPE)};
+  model->setProperty(model_props);
+
+  auto optimizer =
+    ml::train::createOptimizer("adam", {"learning_rate=" + std::to_string(lr)});
+  if (model->setOptimizer(std::move(optimizer)))
+    throw std::invalid_argument("Failed to set optimizer.");
+
+  int compile_ret = model->compile(ml::train::ExecutionMode::TRAIN);
+  if (compile_ret) {
+    std::cerr << "[initializeForTraining] compile() returned " << compile_ret
+              << std::endl;
+    throw std::invalid_argument("Model compilation for training failed.");
+  }
+
+  int init_ret = model->initialize(ml::train::ExecutionMode::TRAIN);
+  if (init_ret) {
+    std::cerr << "[initializeForTraining] initialize() returned " << init_ret
+              << std::endl;
+    throw std::invalid_argument("Model initialization for training failed.");
+  }
+
+  is_initialized = true;
+}
+
+// Returns the ordered layer names matching NeuralNetwork::save() graph
+// traversal. Used by load_weight, save_weight_lora, and load_weight_lora to
+// iterate weights in a consistent, deterministic order.
+static std::vector<std::string> buildOrderedLayerNames(int num_layers) {
+  std::vector<std::string> names;
+  names.push_back("embedding0");
+  for (int i = 0; i < num_layers; ++i) {
+    std::string p = "layer" + std::to_string(i);
+    names.push_back(p + "_attention_norm");
+    names.push_back(p + "_wq");
+    names.push_back(p + "_q_norm");
+    names.push_back(p + "_wk");
+    names.push_back(p + "_k_norm");
+    names.push_back(p + "_wv");
+    names.push_back(p + "_mha_core" + std::to_string(i));
+    names.push_back(p + "_attention_out");
+    names.push_back(p + "_ffn_norm");
+    names.push_back(p + "_ffn_up");
+    names.push_back(p + "_ffn_gate");
+    names.push_back(p + "_ffn_down");
+    names.push_back(p + "_swiglu");
+    names.push_back(p + "_attention_add");
+    names.push_back(p + "_ffn_add");
+  }
+  names.push_back("output_norm");
+  names.push_back("output_of_causallm");
+  return names;
+}
+
+// Returns the byte count that the nntrainer .bin serialiser writes for a
+// weight tensor.  Block-quantised formats have sub-byte per-element cost, so
+// getDataLen() * getDataTypeSize() is wrong for Q4_0, Q4_K, Q6_K.
+static size_t weight_bytes(const ml::train::TensorDim &dim) {
+  using DT = ml::train::TensorDim::DataType;
+  size_t n = static_cast<size_t>(dim.getDataLen());
+  switch (dim.getDataType()) {
+  case DT::Q4_0:
+    return (n / 32) * 18;
+  case DT::Q4_K:
+    return (n / 256) * 144;
+  case DT::Q6_K:
+    return (n / 256) * 210;
+  default:
+    return n * dim.getDataTypeSize();
+  }
+}
+
 /**
  * @brief Load model weights from a binary nntrainer model file.
  */
@@ -295,12 +414,62 @@ void Transformer::load_weight(const std::string &weight_path) {
       "initialize() before load_weight().");
   }
 
-  try {
-    model->load(weight_path, formatFromExtension(weight_path));
-  } catch (const std::exception &e) {
-    throw std::runtime_error("Failed to load model weights: " +
-                             std::string(e.what()));
+  // The pretrained BIN file was saved WITHOUT LoRA adapter slots.
+  // model->load() assigns offsets positionally, so every loraA/loraB weight
+  // in the LoRA model shifts subsequent base weights by ~32-64 KB, completely
+  // scrambling the loaded pretrained weights.
+  //
+  // Fix: read the file manually, advancing the file pointer only for base
+  // weights (not loraA/loraB), so each base weight reads from its correct
+  // position in the pretrained file.
+  std::ifstream f(weight_path, std::ios::binary);
+  if (!f.is_open())
+    throw std::runtime_error("Failed to open model weights: " + weight_path);
+
+  auto layer_names = buildOrderedLayerNames(NUM_LAYERS);
+
+  std::unordered_set<float *> visited;
+
+  for (const auto &lname : layer_names) {
+    std::shared_ptr<ml::train::Layer> layer;
+    try {
+      if (model->getLayer(lname.c_str(), &layer) != 0)
+        continue;
+    } catch (...) {
+      continue;
+    }
+
+    std::vector<float *> wdata;
+    std::vector<ml::train::TensorDim> wdims;
+    try {
+      layer->getWeights(wdata, wdims);
+    } catch (...) {
+      continue;
+    }
+
+    for (unsigned int wi = 0; wi < wdata.size(); ++wi) {
+      if (!wdata[wi])
+        continue;
+      // Deduplicate shared tensors (e.g. TieWordEmbedding "Embedding").
+      if (!visited.insert(wdata[wi]).second)
+        continue;
+
+      const std::string &wname = layer->getWeightName(wi);
+      bool is_lora = (wname.find(":loraA") != std::string::npos ||
+                      wname.find(":loraB") != std::string::npos);
+      if (is_lora)
+        continue; // Skip: not in pretrained file. Keeps initialized value.
+
+      size_t bytes = weight_bytes(wdims[wi]);
+      f.read(reinterpret_cast<char *>(wdata[wi]), bytes);
+      if (!f)
+        throw std::runtime_error("load_weight: read failed at weight '" +
+                                 wname + "' (offset " +
+                                 std::to_string(f.tellg()) + ")");
+    }
   }
+  std::cout << "[load_weight] Loaded base weights from " << weight_path
+            << " (LoRA adapters kept at initialized values)\n";
 };
 
 /**
@@ -374,6 +543,211 @@ void Transformer::repack_weight() {
   }
 };
 
+void Transformer::save_weight_lora(const std::string &weight_path) {
+  if (!is_initialized)
+    throw std::runtime_error(
+      "Model not initialized before save_weight_lora().");
+
+  std::ofstream f(weight_path, std::ios::binary);
+  if (!f.is_open())
+    throw std::runtime_error("Failed to open " + weight_path + " for writing.");
+
+  auto layer_names = buildOrderedLayerNames(NUM_LAYERS);
+  std::unordered_set<float *> visited;
+  size_t total_bytes = 0;
+
+  for (const auto &lname : layer_names) {
+    std::shared_ptr<ml::train::Layer> layer;
+    try {
+      if (model->getLayer(lname.c_str(), &layer) != 0)
+        continue;
+    } catch (...) {
+      continue;
+    }
+
+    std::vector<float *> wdata;
+    std::vector<ml::train::TensorDim> wdims;
+    try {
+      layer->getWeights(wdata, wdims);
+    } catch (...) {
+      continue;
+    }
+
+    for (unsigned int wi = 0; wi < wdata.size(); ++wi) {
+      if (!wdata[wi])
+        continue;
+      if (!visited.insert(wdata[wi]).second)
+        continue;
+
+      const std::string &wname = layer->getWeightName(wi);
+      if (wname.find(":loraA") == std::string::npos &&
+          wname.find(":loraB") == std::string::npos)
+        continue;
+
+      size_t bytes =
+        static_cast<size_t>(wdims[wi].getDataLen()) * sizeof(float);
+      f.write(reinterpret_cast<const char *>(wdata[wi]), bytes);
+      total_bytes += bytes;
+    }
+  }
+
+  std::cout << "[save_weight_lora] Saved LoRA adapters to " << weight_path
+            << " (" << (total_bytes / 1024 / 1024) << " MB)\n";
+}
+
+void Transformer::load_weight_lora(const std::string &base_path,
+                                   const std::string &lora_path) {
+  load_weight(base_path);
+
+  std::ifstream f(lora_path, std::ios::binary);
+  if (!f.is_open())
+    throw std::runtime_error("Failed to open LoRA adapters: " + lora_path);
+
+  auto layer_names = buildOrderedLayerNames(NUM_LAYERS);
+  std::unordered_set<float *> visited;
+
+  for (const auto &lname : layer_names) {
+    std::shared_ptr<ml::train::Layer> layer;
+    try {
+      if (model->getLayer(lname.c_str(), &layer) != 0)
+        continue;
+    } catch (...) {
+      continue;
+    }
+
+    std::vector<float *> wdata;
+    std::vector<ml::train::TensorDim> wdims;
+    try {
+      layer->getWeights(wdata, wdims);
+    } catch (...) {
+      continue;
+    }
+
+    for (unsigned int wi = 0; wi < wdata.size(); ++wi) {
+      if (!wdata[wi])
+        continue;
+      if (!visited.insert(wdata[wi]).second)
+        continue;
+
+      const std::string &wname = layer->getWeightName(wi);
+      if (wname.find(":loraA") == std::string::npos &&
+          wname.find(":loraB") == std::string::npos)
+        continue;
+
+      size_t bytes =
+        static_cast<size_t>(wdims[wi].getDataLen()) * sizeof(float);
+      f.read(reinterpret_cast<char *>(wdata[wi]), bytes);
+      if (!f)
+        throw std::runtime_error("load_weight_lora: read failed at '" + wname +
+                                 "'");
+    }
+  }
+
+  std::cout << "[load_weight_lora] Loaded LoRA adapters from " << lora_path
+            << "\n";
+}
+
+void Transformer::setDataset(const ml::train::DatasetModeType &mode,
+                             std::shared_ptr<ml::train::Dataset> dataset) {
+  if (!is_initialized)
+    throw std::runtime_error("Model not initialized before setDataset().");
+  if (model->setDataset(mode, dataset))
+    throw std::runtime_error("Failed to set dataset on model.");
+}
+
+void Transformer::train() {
+  if (!is_initialized)
+    throw std::runtime_error("Model not initialized before train().");
+  if (model->train())
+    throw std::runtime_error("model->train() returned error.");
+}
+
+void Transformer::train(std::function<void(void *)> epoch_cb, void *epoch_data,
+                        std::function<bool(void *)> stop_cb, void *stop_data) {
+  if (!is_initialized)
+    throw std::runtime_error("Model not initialized before train().");
+  auto actual_stop = stop_cb ? stop_cb : [](void *) -> bool { return false; };
+  if (model->train({}, actual_stop, stop_data, epoch_cb, epoch_data))
+    throw std::runtime_error("model->train() returned error.");
+}
+
+ml::train::RunStats Transformer::getTrainingStats() {
+  return model->getTrainingStats();
+}
+
+ml::train::RunStats Transformer::getValidStats() {
+  return model->getValidStats();
+}
+
+void Transformer::summarize(std::ostream &out, unsigned int type) {
+  if (!is_initialized)
+    throw std::runtime_error("Model not initialized before summarize().");
+  model->summarize(out, static_cast<ml_train_summary_type_e>(type));
+}
+
+void Transformer::exportWeightsToFile(const std::string &path) {
+  if (!is_initialized)
+    throw std::runtime_error(
+      "Model not initialized before exportWeightsToFile().");
+  std::ofstream f(path);
+  if (!f.is_open())
+    throw std::runtime_error("Cannot open " + path + " for weight export.");
+
+  std::vector<std::string> layer_names;
+  layer_names.push_back("embedding0");
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    std::string p = "layer" + std::to_string(i);
+    layer_names.push_back(p + "_attention_norm");
+    layer_names.push_back(p + "_wq");
+    layer_names.push_back(p + "_q_norm"); // Qwen3 QK norm
+    layer_names.push_back(p + "_wk");
+    layer_names.push_back(p + "_k_norm"); // Qwen3 QK norm
+    layer_names.push_back(p + "_wv");
+    layer_names.push_back(p + "_attention_out");
+    layer_names.push_back(p + "_ffn_norm");
+    layer_names.push_back(p + "_ffn_up");
+    layer_names.push_back(p + "_ffn_gate");
+    layer_names.push_back(p + "_ffn_down");
+  }
+  layer_names.push_back("output_norm");
+  layer_names.push_back("output_of_causallm");
+
+  for (const auto &lname : layer_names) {
+    std::shared_ptr<ml::train::Layer> layer;
+    try {
+      if (model->getLayer(lname.c_str(), &layer) != 0)
+        continue;
+    } catch (...) {
+      continue;
+    }
+
+    std::vector<float *> wdata;
+    std::vector<ml::train::TensorDim> wdims;
+    try {
+      layer->getWeights(wdata, wdims);
+    } catch (...) {
+      continue;
+    }
+
+    for (unsigned int wi = 0; wi < wdata.size(); ++wi) {
+      try {
+        const std::string &wname = layer->getWeightName(wi);
+        unsigned int n = wdims[wi].getDataLen();
+        double norm = 0.0;
+        if (wdata[wi]) {
+          for (unsigned int k = 0; k < n; ++k)
+            norm += static_cast<double>(wdata[wi][k]) * wdata[wi][k];
+          norm = std::sqrt(norm);
+        }
+        f << lname << "/" << wname << ": " << std::fixed << std::setprecision(6)
+          << norm << "\n";
+      } catch (...) {
+        continue;
+      }
+    }
+  }
+}
+
 /**
  * @brief Run a transformer model for a prompt.
  */
@@ -395,11 +769,12 @@ void Transformer::run(const WSTR prompt, bool do_sample,
 Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
                                                   Tensor input) {
 
-  LayerHandle attn_norm(createLayer(
-    "rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+  std::vector<std::string> attn_norm_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
+    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  if (LORA_RANK > 0)
+    attn_norm_props.push_back(withKey("trainable", "false"));
+  LayerHandle attn_norm(createLayer("rms_norm", attn_norm_props));
   Tensor normed = attn_norm(input);
 
   Tensor att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
@@ -410,11 +785,12 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
     {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add")}));
   Tensor residual = decoder_add({input, att_out});
 
-  LayerHandle ffn_norm(createLayer(
-    "rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+  std::vector<std::string> ffn_norm_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
+    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  if (LORA_RANK > 0)
+    ffn_norm_props.push_back(withKey("trainable", "false"));
+  LayerHandle ffn_norm(createLayer("rms_norm", ffn_norm_props));
   Tensor ffn_normed = ffn_norm(residual);
 
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed);
@@ -467,27 +843,39 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
                                     Tensor key, Tensor value) {
 
   // Q layer
-  LayerHandle wq(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
-     withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+  std::vector<std::string> wq_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
+    withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones")};
+  if (hasLoRA("wq"))
+    appendLoRAProps(wq_props);
+  else if (LORA_RANK > 0)
+    wq_props.push_back(withKey("trainable", "false"));
+  LayerHandle wq(createLayer("fully_connected", wq_props));
   Tensor q = wq(query);
 
   // K layer
-  LayerHandle wk(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
-     withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+  std::vector<std::string> wk_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
+    withKey("unit", head_dim * n_heads / GQA_SIZE),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones")};
+  if (hasLoRA("wk"))
+    appendLoRAProps(wk_props);
+  else if (LORA_RANK > 0)
+    wk_props.push_back(withKey("trainable", "false"));
+  LayerHandle wk(createLayer("fully_connected", wk_props));
   Tensor k = wk(key);
 
   // V layer
-  LayerHandle wv(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
-     withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+  std::vector<std::string> wv_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
+    withKey("unit", head_dim * n_heads / GQA_SIZE),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones")};
+  if (hasLoRA("wv"))
+    appendLoRAProps(wv_props);
+  else if (LORA_RANK > 0)
+    wv_props.push_back(withKey("trainable", "false"));
+  LayerHandle wv(createLayer("fully_connected", wv_props));
   Tensor v = wv(value);
 
   // External KV cache placeholders (per-layer). Their actual storage is owned
@@ -509,11 +897,15 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
   Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer
-  LayerHandle wo(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
-     withKey("unit", DIM), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+  std::vector<std::string> wo_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
+    withKey("unit", DIM), withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones")};
+  if (hasLoRA("wo"))
+    appendLoRAProps(wo_props);
+  else if (LORA_RANK > 0)
+    wo_props.push_back(withKey("trainable", "false"));
+  LayerHandle wo(createLayer("fully_connected", wo_props));
   return wo(a);
 }
 
@@ -523,18 +915,26 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
 Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
                               Tensor input) {
 
-  LayerHandle ffn_up(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
-     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+  std::vector<std::string> ffn_up_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
+    withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones")};
+  if (hasLoRA("ffn_up"))
+    appendLoRAProps(ffn_up_props);
+  else if (LORA_RANK > 0)
+    ffn_up_props.push_back(withKey("trainable", "false"));
+  LayerHandle ffn_up(createLayer("fully_connected", ffn_up_props));
   Tensor up = ffn_up(input);
 
-  LayerHandle ffn_gate(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
-     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+  std::vector<std::string> ffn_gate_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
+    withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones")};
+  if (hasLoRA("ffn_gate"))
+    appendLoRAProps(ffn_gate_props);
+  else if (LORA_RANK > 0)
+    ffn_gate_props.push_back(withKey("trainable", "false"));
+  LayerHandle ffn_gate(createLayer("fully_connected", ffn_gate_props));
   Tensor gate = ffn_gate(input);
 
   /// @note nntrainer binary stores mlp weights in up, gate order.
@@ -547,11 +947,15 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
   Tensor act = swiglu({up, gate}, {1, 0});
 
-  LayerHandle ffn_down(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
-     withKey("unit", dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+  std::vector<std::string> ffn_down_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
+    withKey("unit", dim), withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones")};
+  if (hasLoRA("ffn_down"))
+    appendLoRAProps(ffn_down_props);
+  else if (LORA_RANK > 0)
+    ffn_down_props.push_back(withKey("trainable", "false"));
+  LayerHandle ffn_down(createLayer("fully_connected", ffn_down_props));
   return ffn_down(act);
 }
 

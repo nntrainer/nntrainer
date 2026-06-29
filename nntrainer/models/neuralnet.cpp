@@ -17,6 +17,8 @@
  * @brief	This is Neural Network Class
  * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
+ * @author	Sumon Nath <sumon.nath@samsung.com>
+ * @author	Pranjal Thapliyal <p.thapliyal@samsung.com>
  * @bug		No known bugs except for NYI items
  *
  */
@@ -1064,7 +1066,7 @@ void NeuralNetwork::load(const std::string &file_path,
             NNTR_THROW_IF((fd == -1), std::invalid_argument)
               << "Cannot open file : " << f_path;
 
-            struct stat st {};
+            struct stat st{};
             NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
               << "Cannot get file info (fstat): " << f_path;
 
@@ -1289,7 +1291,7 @@ void NeuralNetwork::load(const std::string &file_path,
             NNTR_THROW_IF((fd == -1), std::invalid_argument)
               << "Cannot open safetensors file: " << f_path;
 
-            struct stat st {};
+            struct stat st{};
             NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
               << "Cannot stat safetensors file: " << f_path;
 
@@ -1823,8 +1825,10 @@ int NeuralNetwork::train_run(
         save(save_path, ml::train::ModelFormat::MODEL_FORMAT_BIN);
       }
 
+      // Clear any in-progress display (displayProgress uses \r, not \n)
+      std::cout << "\r\033[K";
       std::cout << "#" << epoch_idx << "/" << getEpochs()
-                << " - Training Loss: " << stat.loss;
+                << " - Training Loss: " << stat.loss << "\n";
       ml_logi("# %d / %d - Training Loss: %f", epoch_idx, getEpochs(),
               stat.loss);
       ml_logd("[NNTrainer] Training epoch %d / %d finished successfully.",
@@ -1879,8 +1883,9 @@ int NeuralNetwork::train_run(
         save(save_best_path);
       }
     }
-    std::cout << " >> [ Accuracy: " << stat.accuracy
-              << "% - Validation Loss : " << stat.loss << " ]";
+    std::cout << "\r\033[K";
+    std::cout << "  Eval | Accuracy: " << stat.accuracy
+              << "% - Validation Loss: " << stat.loss << "\n";
     ml_logi("[ Accuracy: %.2f %% - Validation Loss: %.5f", stat.accuracy,
             stat.loss);
   };
@@ -1900,7 +1905,6 @@ int NeuralNetwork::train_run(
       validation = run_epoch(valid_buffer.get(), false, eval_for_iteration,
                              update_eval_stat, eval_epoch_end, validation);
     }
-    std::cout << '\n';
     epoch_complete_cb(epoch_user_data);
   }
   PROFILE_MEM_ANNOTATE("TRAIN END");
