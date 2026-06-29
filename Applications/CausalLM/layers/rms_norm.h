@@ -7,6 +7,8 @@
  * @brief  Implementation of RMS normalization function
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
+ * @author Pranjal Thapliyal <p.thapliyal@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  * @note   This layer only supports inference mode.
  */
@@ -26,7 +28,7 @@
 #include <node_exporter.h>
 #include <utility>
 
-#include <causallm_common_properties.h>
+#include "causallm_common_properties.h"
 #include <connection.h>
 #include <tensor.h>
 #include <tensor_wrap_specs.h>
@@ -76,16 +78,21 @@ public:
   WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
 
   /**
+   * @copydoc Layer::calcGradient(RunLayerContext &context)
+   */
+  WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
+
+  /**
    * @copydoc bool supportBackwarding() const
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; };
+  WIN_EXPORT bool supportBackwarding() const override { return true; };
 
   /**
    * @copydoc Layer::exportTo(Exporter &exporter, ExportMethods method)
    */
   WIN_EXPORT void
   exportTo(nntrainer::Exporter &exporter,
-           const ml::train::ExportMethods &method) const override{};
+           const ml::train::ExportMethods &method) const override {};
 
   /**
    * @copydoc Layer::getType()
@@ -111,7 +118,7 @@ public:
   inline static const std::string type = "rms_norm";
 
 private:
-  std::array<unsigned int, 1> wt_idx;
+  std::array<unsigned int, 3> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
              nntrainer::props::SkipPrefill>
     rms_props;
