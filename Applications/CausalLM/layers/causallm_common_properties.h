@@ -17,6 +17,8 @@
  * @brief	This defines a qwen3 causal language model.
  * @see		https://github.com/nnstreamer/
  * @author	Eunju Yang <ej.yang@samsung.com>
+ * @author	Pranjal Thapliyal <p.thapliyal@samsung.com>
+ * @author	Anirudh <b.saianirud@samsung.com>
  * @bug		No known bugs except for NYI items
  *
  */
@@ -108,7 +110,7 @@ public:
 };
 }; // namespace props
 
-WIN_EXPORT enum RMSParams { gamma };
+WIN_EXPORT enum RMSParams { gamma, inv_rms };
 
 } // namespace causallm
 

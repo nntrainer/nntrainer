@@ -7,6 +7,8 @@
  * @brief  This is Tie_Word_Embedding Layer Class of Neural Network
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
+ * @author Pranjal Thapliyal <p.thapliyal@samsung.com>
+ * @author Anirudh <b.saianirud@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  */
@@ -104,7 +106,7 @@ public:
   /**
    * @copydoc Layer::supportBackwarding()
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; }
+  WIN_EXPORT bool supportBackwarding() const override { return true; }
 
   WIN_EXPORT void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,
