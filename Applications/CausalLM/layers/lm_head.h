@@ -7,6 +7,8 @@
  * @brief  This is LM_Head Layer Class of Neural Network
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
+ * @author Pranjal Thapliyal <p.thapliyal@samsung.com>
+ * @author Sumon Nath <sumon.nath@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  */
@@ -27,6 +29,15 @@
 #include <layer_impl.h>
 
 namespace causallm {
+
+/**
+ * Thread-local read-row override for LoRA training.
+ * UINT_MAX (default) = use the last row (height-1), i.e. inference / left-pad regime.
+ * Set by TrainingDataGenerator::dataCb to (use_len - 1) when right-padding so the
+ * lm_head reads the last *real* token rather than the first pad token.
+ * Persists across both forwarding() and calcDerivative() for the same sample.
+ */
+extern thread_local unsigned int g_lm_head_read_row;
 
 /**
  * @class   LMHead layer
@@ -103,7 +114,7 @@ public:
   /**
    * @copydoc Layer::supportBackwarding()
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; }
+  WIN_EXPORT bool supportBackwarding() const override { return true; }
 
   WIN_EXPORT void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,
