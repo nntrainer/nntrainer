@@ -7,12 +7,16 @@
  * @brief  Implementation of custom SwiGLU activation function
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
+ * @author Sumon Nath <sumon.nath@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  */
 
 #ifndef __SWIGLU_LAYER_H__
 #define __SWIGLU_LAYER_H__
+
+#include <array>
 
 #include <layer_context.h>
 #include <layer_devel.h>
@@ -33,13 +37,18 @@ namespace causallm {
  *
  */
 WIN_EXPORT class SwiGLULayer final : public nntrainer::Layer {
+private:
+  std::array<unsigned int, 1> tensor_idx;
+
 public:
   /**
    * @brief Construct a new custom SwiGLU layer object
    *
    */
   WIN_EXPORT SwiGLULayer() :
-    Layer(), swiglu_props(nntrainer::props::SkipPrefill()) {}
+    Layer(), swiglu_props(nntrainer::props::SkipPrefill()) {
+    tensor_idx.fill(std::numeric_limits<unsigned>::max());
+  }
 
   /**
    * @brief Destroy the custom SwiGLU layer object
@@ -81,7 +90,7 @@ public:
    */
   WIN_EXPORT void
   exportTo(nntrainer::Exporter &exporter,
-           const ml::train::ExportMethods &method) const override{};
+           const ml::train::ExportMethods &method) const override {};
 
   /**
    * @copydoc Layer::getType()
@@ -109,6 +118,7 @@ public:
 private:
   std::tuple<nntrainer::props::SkipPrefill> swiglu_props;
   bool skip_prefill = false;
+  enum SwiGLUParams { sigmoid_gate = 0 };
 };
 
 } // namespace causallm
