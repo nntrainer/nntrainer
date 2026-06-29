@@ -7,6 +7,8 @@
  * @see    https://github.com/nntrainer/nntrainer
  *         https://arxiv.org/abs/1706.03762
  * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @author Anirudh <b.saianirud@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is custom_mha_core layer supports
  *         the work of multi_head_attention.
@@ -394,13 +396,15 @@ private:
     cache_value,
     projected_key,
     projected_value,
-    /** intended comment for later use of attention_mask */
-    // attention_mask,
     attention_weight,
     dropout_mask,
     attention_output,
+    train_query,   // (B, H_Q, seq_len, head_dim) — cached for backward
+    train_key,     // (B, H_KV, seq_len, head_dim)
+    train_value,   // (B, H_KV, seq_len, head_dim)
+    train_attn_wt, // (B*H_Q, 1, seq_len, seq_len) — softmax weights
   };
-  std::array<unsigned int, 7> tensor_idx;
+  std::array<unsigned int, 11> tensor_idx;
   unsigned int sink_idx;
 
   /** attention parameters */
@@ -474,6 +478,9 @@ private:
    * @param[in] from sequence order
    * @param[in] convert_only true to only store the tensor into the cache dtype
    */
+  void apply_inverse_rotary_emb(nntrainer::Tensor &tensor, unsigned int dim,
+                               unsigned int from);
+
   void apply_rotary_emb_tensor_v2(nntrainer::Tensor &in, nntrainer::Tensor &out,
                                   unsigned int dim, unsigned int from,
                                   bool convert_only = false);
