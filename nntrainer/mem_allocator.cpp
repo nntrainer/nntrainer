@@ -57,11 +57,6 @@ void MemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
   NNTR_THROW_IF(*ptr == nullptr, std::runtime_error)
     << "MemAllocator::alloc: aligned_alloc(" << alignment << ", "
     << aligned_size << ") failed";
-
-  // MemoryPool callers historically expected zeroed buffers (calloc
-  // semantics). Preserve that — kernels that read uninitialised
-  // gradient slots would otherwise see garbage.
-  std::memset(*ptr, 0, aligned_size);
 }
 
 void MemAllocator::free(void *ptr) {
