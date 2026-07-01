@@ -24,6 +24,8 @@
 #include "layer_context.h"
 #include "model.h"
 #include "model_common_properties.h"
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <compute_ops.h>
 #include <cstdint>
@@ -33,6 +35,7 @@
 #include <future>
 #include <iomanip>
 #include <sstream>
+#include <thread>
 
 #include <activation_realizer.h>
 #include <adamw.h>
@@ -1006,40 +1009,23 @@ void NeuralNetwork::load(const std::string &file_path,
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open file : " << f_path;
 
-      // Share a single read-only mmap across load workers. Per-worker mmap of
-      // the full weight file can exceed Android's virtual memory or mmap-count
-      // limits for large models.
-      //
-      // Each worker reads from its own file_offset, so sharing the mapped
-      // region is safe. Drop the region only after all workers have joined.
-      void *shared_mmap_ptr = MAP_FAILED;
-      size_t shared_mmap_size = 0;
-#if !defined(_WIN32)
-      if (MMAP_READ) {
-        struct stat st {};
-        NNTR_THROW_IF((::fstat(model_file_fd, &st) == -1),
-                      std::invalid_argument)
-          << "Cannot get file info (fstat): " << f_path;
-        shared_mmap_size = static_cast<size_t>(st.st_size);
-        shared_mmap_ptr = ::mmap(nullptr, shared_mmap_size, PROT_READ,
-                                 MAP_PRIVATE, model_file_fd, 0);
-        NNTR_THROW_IF((shared_mmap_ptr == MAP_FAILED), std::runtime_error)
-          << "mmap failed for " << f_path << " (" << shared_mmap_size
-          << " bytes)";
-        (void)::posix_madvise(shared_mmap_ptr, shared_mmap_size,
-                              POSIX_MADV_RANDOM);
-      }
-#endif
+      // Load weights with bounded thread number not to exceed mmap limits
+      constexpr size_t MAX_LOAD_THREADS = 8;
+      std::vector<std::shared_ptr<LayerNode>> load_nodes(model_graph.cbegin(),
+                                                         model_graph.cend());
+      const size_t num_load_nodes = load_nodes.size();
+      const size_t num_load_threads =
+        std::min<size_t>(num_load_nodes, MAX_LOAD_THREADS);
 
-      // std::vector<std::future<void>> futures;
-      std::vector<std::thread> threads;
-      threads.reserve(model_graph.size());
-      for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
-           ++iter) {
-        auto node = *iter;
-        auto exec_order = std::get<0>((*iter)->getExecutionOrder());
+      std::atomic<size_t> next_load_index{0};
 
-        threads.emplace_back([&, node]() {
+      auto load_worker = [&]() {
+        for (size_t idx =
+               next_load_index.fetch_add(1, std::memory_order_relaxed);
+             idx < num_load_nodes;
+             idx = next_load_index.fetch_add(1, std::memory_order_relaxed)) {
+          auto node = load_nodes[idx];
+
           if (!MMAP_READ) {
             auto local_model_file = checkedOpenStream<std::ifstream>(
               (v.size() == 2) ? v[1] : v[0], std::ios::in | std::ios::binary);
@@ -1073,27 +1059,50 @@ void NeuralNetwork::load(const std::string &file_path,
             CloseHandle(hMap);
             CloseHandle(hFile);
 #else
-            // POSIX: read from the parent-owned shared mmap. No per-thread
-            // mmap/munmap — see the comment on shared_mmap_ptr above.
-            char *view = static_cast<char *>(shared_mmap_ptr);
+            // POSIX: map per-task, advise kernel, drop pages, unmap
+            int fd = ::open(f_path.c_str(), O_RDONLY);
+            NNTR_THROW_IF((fd == -1), std::invalid_argument)
+              << "Cannot open file : " << f_path;
+
+            struct stat st {};
+            NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
+              << "Cannot get file info (fstat): " << f_path;
+
+            size_t f_size = static_cast<size_t>(st.st_size);
+            void *mmap_ptr =
+              ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            ::close(fd); // fd not needed after mmap
+            NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+              << "mmap failed";
+
+            // Hint: many model loads touch scattered regions -> RANDOM helps
+            // reduce readahead
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+
+            char *view = static_cast<char *>(mmap_ptr);
             node->read(view, false, exec_mode, fsu_mode,
                        std::numeric_limits<size_t>::max(), true, model_file_fd);
+
+            // Early drop: pages no longer needed; helps lower peak RSS during
+            // overlap
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+
+            ::munmap(mmap_ptr, f_size);
 #endif
           }
-        });
+        }
+      };
+
+      std::vector<std::thread> threads;
+      threads.reserve(num_load_threads);
+      for (size_t t = 0; t < num_load_threads; ++t) {
+        threads.emplace_back(load_worker);
       }
       for (auto &t : threads) {
         if (t.joinable())
           t.join();
       }
 
-#if !defined(_WIN32)
-      if (shared_mmap_ptr != MAP_FAILED) {
-        (void)::posix_madvise(shared_mmap_ptr, shared_mmap_size,
-                              POSIX_MADV_DONTNEED);
-        ::munmap(shared_mmap_ptr, shared_mmap_size);
-      }
-#endif
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
            ++iter) {

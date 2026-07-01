@@ -99,6 +99,7 @@ void checkedRead(ReadSource src, char *array, std::streamsize size,
     (*f)->read(static_cast<char *>(array), static_cast<std::streamsize>(size));
     // checkFile((*f), error_msg);
   } else if (auto p = std::get_if<const char *>(&src)) {
+    /// @todo use mmap instead memcpy to reduce peak memory
     if (read_from_offset) {
       std::memcpy(array, (*p) + start_offset, size);
     } else {
