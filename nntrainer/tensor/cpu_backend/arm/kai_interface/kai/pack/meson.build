@@ -7,6 +7,7 @@ pack_sources = [
     'kai_lhs_quant_pack_qai8dxp_f32.c',
     'kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0.c',
     'kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.c',
+    'kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon.c',
 ]
 
 pack_headers = [
@@ -16,6 +17,7 @@ pack_headers = [
     'kai_lhs_quant_pack_qai8dxp_f32.h',
     'kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0.h',
     'kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.h',
+    'kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon.h',
 ]
 
 foreach s : pack_sources

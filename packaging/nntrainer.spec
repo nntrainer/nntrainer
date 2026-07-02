@@ -648,6 +648,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0.h
 %{_includedir}/nntrainer/kai_rhs_pack_nxk_qsi4c32pscalef16_qsu4c32s16s0.h
 %{_includedir}/nntrainer/kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.h
+%{_includedir}/nntrainer/kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon.h
 %{_includedir}/nntrainer/kai_common.h
 %{_includedir}/nntrainer/kleidiai_interface.h
 %if 0%{?enable_fp16}

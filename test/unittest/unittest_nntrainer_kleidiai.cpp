@@ -17,6 +17,8 @@
 #include <vector>
 
 #include "int4_utils.h"
+#include "kai/pack/kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.h"
+#include "kai/pack/kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon.h"
 #include "kleidiai_interface.h"
 #include "nntrainer_test_util.h"
 #include <cpu_backend.h>
@@ -347,6 +349,116 @@ TEST(nntrainer_kleidiai, gemm_benchmark_comparison_1x2560x4096) {
 TEST(nntrainer_kleidiai, gemm_benchmark_comparison_1024x2560x4096) {
   run_gemm_benchmark_comparison(1024, 2560, 4096);
 }
+
+/**
+ * @brief rhs_pack_nxk_qsi4cxp_qs4cxs1s0 NEON optimization test
+ *
+ * Checks that kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon produces a
+ * byte-identical packed buffer to the reference implementation for
+ * (nr, kr, sr) = (8, 16, 2), and measures the latency of both.
+ */
+class rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon
+  : public ::testing::TestWithParam<std::tuple<size_t, size_t>> {};
+
+TEST_P(rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon, correctness_and_perf) {
+  auto [N, K] = GetParam();
+
+  constexpr size_t nr = 8;
+  constexpr size_t kr = 16;
+  constexpr size_t sr = 2;
+  constexpr size_t warmup_iters = 5;
+  constexpr size_t test_iters = 20;
+
+  // Random 4-bit source data (two nibbles per byte), scales and bias
+  const size_t rhs_stride = (K + 1) / 2;
+  std::vector<uint8_t> rhs_native(N * rhs_stride);
+  std::mt19937 gen(42);
+  std::uniform_int_distribution<int> dist(0, 255);
+  for (auto &b : rhs_native) {
+    b = static_cast<uint8_t>(dist(gen));
+  }
+  std::vector<float> scales = generate_random_vector<float>(N, 0.001F, 1.0F);
+
+  const size_t packed_size =
+    kai_get_rhs_packed_size_rhs_pack_nxk_qsi4cxp_qs4cxs1s0(N, K, nr, kr, sr);
+  std::vector<uint8_t> packed_ref(packed_size, 0xA5);
+  std::vector<uint8_t> packed_opt(packed_size, 0x5A);
+
+  struct kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_params params;
+  params.lhs_zero_point = 1;
+  params.rhs_zero_point = 8;
+
+  // Correctness
+  kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0(1, N, K, nr, kr, sr, rhs_native.data(),
+                                         NULL, scales.data(), packed_ref.data(),
+                                         0, &params);
+  kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon(
+    1, N, K, nr, kr, sr, rhs_native.data(), NULL, scales.data(),
+    packed_opt.data(), 0, &params);
+
+  for (size_t i = 0; i < packed_size; i++) {
+    ASSERT_EQ(packed_ref[i], packed_opt[i])
+      << "first mismatch at byte " << i << " / " << packed_size;
+  }
+
+  // Performance
+  for (size_t i = 0; i < warmup_iters; ++i) {
+    kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0(
+      1, N, K, nr, kr, sr, rhs_native.data(), NULL, scales.data(),
+      packed_ref.data(), 0, &params);
+  }
+  nanoseconds time_ref = nanoseconds(0);
+  for (size_t i = 0; i < test_iters; ++i) {
+    auto t1 = steady_clock::now();
+    kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0(
+      1, N, K, nr, kr, sr, rhs_native.data(), NULL, scales.data(),
+      packed_ref.data(), 0, &params);
+    auto t2 = steady_clock::now();
+    time_ref += duration_cast<nanoseconds>(t2 - t1);
+  }
+
+  for (size_t i = 0; i < warmup_iters; ++i) {
+    kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon(
+      1, N, K, nr, kr, sr, rhs_native.data(), NULL, scales.data(),
+      packed_opt.data(), 0, &params);
+  }
+  nanoseconds time_opt = nanoseconds(0);
+  for (size_t i = 0; i < test_iters; ++i) {
+    auto t1 = steady_clock::now();
+    kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon(
+      1, N, K, nr, kr, sr, rhs_native.data(), NULL, scales.data(),
+      packed_opt.data(), 0, &params);
+    auto t2 = steady_clock::now();
+    time_opt += duration_cast<nanoseconds>(t2 - t1);
+  }
+
+  const auto avg_ref = time_ref.count() / test_iters;
+  const auto avg_opt = time_opt.count() / test_iters;
+  std::cout << "\n-----------------------------------------" << std::endl;
+  std::cout << "[RESULT] rhs_pack_nxk_qsi4cxp (n, k) = (" << N << ", " << K
+            << "), average over " << test_iters << " iterations:" << std::endl;
+  std::cout << "  reference: " << avg_ref << " ns (" << avg_ref / 1'000
+            << " us)" << std::endl;
+  std::cout << "  neon:      " << avg_opt << " ns (" << avg_opt / 1'000
+            << " us)" << std::endl;
+  std::cout << "  speedup:   " << static_cast<double>(avg_ref) / avg_opt << "x"
+            << std::endl;
+  std::cout << "-----------------------------------------" << std::endl;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  nntrainer_kleidiai, rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon,
+  ::testing::Values(std::make_tuple(1024, 1024), std::make_tuple(1024, 2048),
+                    std::make_tuple(1024, 3072), std::make_tuple(2048, 1024),
+                    std::make_tuple(3072, 1024),
+                    // edge cases: n % nr != 0, k % 32 != 0
+                    std::make_tuple(1000, 1000), std::make_tuple(9, 62)),
+  [](const ::testing::TestParamInfo<
+     rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon::ParamType> &info) {
+    size_t N = std::get<0>(info.param);
+    size_t K = std::get<1>(info.param);
+    return std::to_string(N) + "_" + std::to_string(K);
+  });
 
 int main(int argc, char **argv) {
   int result = -1;

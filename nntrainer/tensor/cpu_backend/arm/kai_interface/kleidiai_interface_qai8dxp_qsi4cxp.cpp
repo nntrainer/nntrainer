@@ -54,7 +54,7 @@
 // Include packinng kernels
 #include "kai/pack/kai_lhs_quant_pack_qai8dxp_f32.h"
 #include "kai/pack/kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0.h"
-#include "kai/pack/kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.h"
+#include "kai/pack/kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon.h"
 
 #define INT4_MIN (-8)
 #define INT4_MAX (7)
@@ -226,8 +226,9 @@ void __kai_rhs_pack_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
     struct kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_params nxk_params;
     nxk_params.lhs_zero_point = 1;
     nxk_params.rhs_zero_point = 8;
-    // RHS packing
-    kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0(
+
+    // use custom optimized rhs pack
+    kai_run_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon(
       1, n, k, nr, kr, sr,                     // Packing arguments
       (const uint8_t *)(rhs_native_mtx_qs4cx), // RHS
       NULL,                                    // Bias
