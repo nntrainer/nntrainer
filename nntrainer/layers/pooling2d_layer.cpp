@@ -191,7 +191,8 @@ void Pooling2DLayer::calcDerivative(RunLayerContext &context) {
 
   unsigned int out_map_size = deriv.height() * deriv.width();
   unsigned int in_map_size = height * width;
-  auto apply_max = [&]<typename T>(T *result_data) {
+  auto apply_max = [&](auto *result_data) {
+    using T = std::decay_t<decltype(*result_data)>;
     const int *iter = pool_helper.getData<int>();
     const T *deriv_data = deriv.getData<T>();
     for (unsigned int b = 0; b < batch; ++b) {
@@ -210,7 +211,8 @@ void Pooling2DLayer::calcDerivative(RunLayerContext &context) {
     }
   };
 
-  auto apply_average = [&]<typename T>(T *result_data) {
+  auto apply_average = [&](auto *result_data) {
+    using T = std::decay_t<decltype(*result_data)>;
     int height_stride_end = height - p_height + pt;
     int width_stride_end = width - p_width + pl;
     const int *iter = pool_helper.getData<int>();
@@ -242,7 +244,8 @@ void Pooling2DLayer::calcDerivative(RunLayerContext &context) {
     }
   };
 
-  auto apply_global_max = [&]<typename T>(T *result_data) {
+  auto apply_global_max = [&](auto *result_data) {
+    using T = std::decay_t<decltype(*result_data)>;
     const T *deriv_data = deriv.getData<T>();
     for (unsigned int b = 0; b < batch; b++) {
       for (unsigned int c = 0; c < channel; c++) {
@@ -349,8 +352,9 @@ void Pooling2DLayer::pooling2d(Tensor &in, bool training, Tensor &output,
 
   unsigned int max_idx_count = 0;
 
-  auto pool_fn_max = [&]<typename T>(const T *in_data, int channel_idx,
-                                     int start_h, int start_w) {
+  auto pool_fn_max = [&](const auto *in_data, int channel_idx, int start_h,
+                         int start_w) {
+    using T = std::decay_t<decltype(*in_data)>;
     int end_h = start_h + patch_height;
     int end_w = start_w + patch_width;
 
@@ -380,9 +384,9 @@ void Pooling2DLayer::pooling2d(Tensor &in, bool training, Tensor &output,
     return max_val;
   };
 
-  auto pool_fn_global_max = [&, this]<typename T>(const T *in_data,
-                                                  int channel_idx, int start_h,
-                                                  int start_w) {
+  auto pool_fn_global_max = [&, this](const auto *in_data, int channel_idx,
+                                      int start_h, int start_w) {
+    using T = std::decay_t<decltype(*in_data)>;
     int end_h = start_h + patch_height;
     int end_w = start_w + patch_width;
 
@@ -409,8 +413,9 @@ void Pooling2DLayer::pooling2d(Tensor &in, bool training, Tensor &output,
     return max_val;
   };
 
-  auto pool_fn_average = [&]<typename T>(const T *in_data, int channel_idx,
-                                         int start_h, int start_w) {
+  auto pool_fn_average = [&](const auto *in_data, int channel_idx, int start_h,
+                             int start_w) {
+    using T = std::decay_t<decltype(*in_data)>;
     int end_h = start_h + patch_height;
     int end_w = start_w + patch_width;
     T total = static_cast<T>(0.0f);
