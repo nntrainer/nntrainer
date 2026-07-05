@@ -12,6 +12,8 @@
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @author Hyeonseok Lee <hs89.lee@samsung.com>
  * @author Eunju Yang <ej.yang@samsung.com>
+ * @author Sumon Nath <sumon.nath@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This file defines CausalLM's basic actions
  * @note   This causal_lm.h constructs a class for Transformer-based Causal
@@ -231,6 +233,9 @@ std::pair<Tensor, Tensor> CausalLM::constructModel() {
 
   if (TIE_WORD_EMBEDDINGS)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
+
+  if (LORA_RANK > 0)
+    lmhead_prop.emplace_back(withKey("trainable", "false"));
 
   LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));
   Tensor y = lmhead(h);

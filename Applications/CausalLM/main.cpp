@@ -17,6 +17,8 @@
  * @brief	This is a main file for CausalLM application
  * @see		https://github.com/nnstreamer/
  * @author	Eunju Yang <ej.yang@samsung.com>
+ * @author	Sumon Nath <sumon.nath@samsung.com>
+ * @author	Niket Agarwal <niket.a@samsung.com>
  * @bug		No known bugs except for NYI items
  *
  */
@@ -398,6 +400,11 @@ int main(int argc, char *argv[]) {
       }
     }
 
+    // Inject lora_weight_q4 before model construction so fc_layer registers
+    // Q4_0 tensors for loraA/loraB (needed for the W4A8 kernel path).
+    if (nntr_cfg.contains("lora_q4_file_name"))
+      nntr_cfg["lora_weight_q4"] = true;
+
     auto model = causallm::Factory::Instance().create(architecture, cfg,
                                                       generation_cfg, nntr_cfg);
     if (!model) {
@@ -408,8 +415,22 @@ int main(int argc, char *argv[]) {
       return EXIT_FAILURE;
     }
     model->initialize();
-    model->load_weight(weight_file);
-    model->repack_weight();
+    if (nntr_cfg.contains("lora_q4_file_name")) {
+      const std::string lora_file =
+        model_path + "/" + nntr_cfg["lora_q4_file_name"].get<std::string>();
+      model->load_weight_lora_q4(weight_file, lora_file);
+    } else if (nntr_cfg.contains("lora_q6k_file_name")) {
+      const std::string lora_file =
+        model_path + "/" + nntr_cfg["lora_q6k_file_name"].get<std::string>();
+      model->load_weight_lora_q6k(weight_file, lora_file);
+    } else if (nntr_cfg.contains("lora_file_name")) {
+      const std::string lora_file =
+        model_path + "/" + nntr_cfg["lora_file_name"].get<std::string>();
+      model->load_weight_lora(weight_file, lora_file);
+    } else {
+      model->load_weight(weight_file);
+      model->repack_weight();
+    }
 
     bool do_sample = generation_cfg.value("do_sample", false);
 
