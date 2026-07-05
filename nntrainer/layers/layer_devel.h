@@ -16,6 +16,8 @@
  * @brief	This is Layer classes of Neural Network
  * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
+ * @author	Anirudh <b.saianirud@samsung.com>
+ * @author	Pranjal Thapliyal <p.thapliyal@samsung.com>
  * @bug		No known bugs except for NYI items
  *
  */
@@ -194,7 +196,7 @@ public:
   /**
    * @brief    Initialize the layer
    */
-  virtual void initialize(RunLayerContext &context){};
+  virtual void initialize(RunLayerContext &context) {};
 
   /**
    * @brief     Forward Propagation of a layer
@@ -434,6 +436,31 @@ public:
               nntrainer::quant_qs4cx_f32(N, K, weight_t.getData(), data, scale,
                                          true);
               file.write((const char *)data, q_size + scale_size);
+            } else if (dtype == TensorDim::DataType::Q6_K) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with quantization only supports for FP32 weight.";
+              TensorDim dim = weight.getDim();
+              unsigned int K = dim.height();
+              unsigned int N = dim.width();
+
+              // Skip quantization for bias-like tensors (1D with height == 1)
+              if (K == 1) {
+                weight.save(file);
+              } else {
+                NNTR_THROW_IF(K % 256 != 0, std::invalid_argument)
+                  << "Q6_K quantization requires height to be divisible by "
+                     "256, but got height="
+                  << K;
+
+                Tensor weight_t = weight.transpose("0:2:1");
+                Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                    {Tformat::NCHW, dtype});
+
+                quantize_q6_K(weight_t.getData<float>(),
+                              quant_weight.getData<uint8_t>(), N, K, nullptr);
+                quant_weight.save(file);
+              }
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";

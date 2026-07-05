@@ -6,6 +6,8 @@
  * @date   31 Dec 2025
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
+ * @author Anirudh <b.saianirud@samsung.com>
+ * @author Pranjal Thapliyal <p.thapliyal@samsung.com>
  * @bug    No known bugs except for NYI items
  * @note   This transformer.h constructs a class for Transformer model which can
  * be a parent of CausalLM and Encoder models with transformer structure.
@@ -34,6 +36,7 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <functional>
 #include <layer.h>
 #include <map>
 #include <model.h>
@@ -133,9 +136,17 @@ public:
   virtual ~Transformer() {}
 
   /**
-   * @brief Initialize and Construct the Transformer model
+   * @brief Initialize and Construct the Transformer model (inference mode)
    */
   virtual void initialize();
+
+  /**
+   * @brief Initialize model for LoRA fine-tuning (training mode).
+   *        Adds cross_softmax loss, Adam optimizer, compiles in TRAIN mode.
+   * @param lr   Learning rate for Adam optimizer
+   * @param epochs Number of training epochs
+   */
+  virtual void initializeForTraining(float lr, unsigned int epochs);
 
   /**
    * @brief Load the model weights from a file
@@ -153,6 +164,100 @@ public:
    * @brief Save the weight to a file
    */
   virtual void save_weight(const std::string &weight_path);
+  /**
+   * @brief Save only LoRA adapter weights (loraA/loraB) to a file.
+   *        For use after LoRA training.
+   */
+  virtual void save_weight_lora(const std::string &weight_path);
+
+  /**
+   * @brief Load base weights, then overlay LoRA adapter weights on top.
+   */
+  virtual void load_weight_lora(const std::string &base_path,
+                                const std::string &lora_path);
+
+  /**
+   * @brief Save LoRA adapters as Q6_K with force-fed scales from QAT EMA stats.
+   *        Only valid after QAT training (lora_qat=true).
+   *        File format per adapter: uint32_t N + ceil(N/256)*210 raw Q6_K
+   * bytes.
+   */
+  virtual void save_weight_lora_q6k(const std::string &path);
+
+  /**
+   * @brief Load base weights, then load Q6_K LoRA adapters and dequantize to
+   * FP32.
+   */
+  virtual void load_weight_lora_q6k(const std::string &base_path,
+                                    const std::string &lora_q6k_path);
+
+  /**
+   * @brief Save LoRA adapters as Q4_0 with force-fed scales from QAT EMA stats.
+   *        Only valid after QAT training with --lora_q4 (lora_qat +
+   * lora_weight_q4). File format per adapter: uint32_t N + (N/32)*18 raw Q4_0
+   * block bytes. Requires lora_rank % 32 == 0 (rank=32 recommended).
+   */
+  virtual void save_weight_lora_q4(const std::string &path);
+
+  /**
+   * @brief Load base weights, then load Q4_0 LoRA adapters directly into Q4_0
+   * tensors. No dequantization — the W4A8 kernel fires at runtime.
+   */
+  virtual void load_weight_lora_q4(const std::string &base_path,
+                                   const std::string &lora_q4_path);
+
+  /**
+   * @brief Set a dataset on the underlying nntrainer model.
+   */
+  virtual void setDataset(const ml::train::DatasetModeType &mode,
+                          std::shared_ptr<ml::train::Dataset> dataset);
+
+  /**
+   * @brief Run training on the model (wraps model->train()).
+   */
+  virtual void train();
+
+  /**
+   * @brief Run training with an epoch-end callback and optional early-stop
+   *        predicate.
+   * @param epoch_cb   Called at the end of each epoch (after stats are
+   * updated).
+   * @param epoch_data Passed as-is to epoch_cb.
+   * @param stop_cb    Returns true to stop training early. nullptr = never
+   * stop.
+   * @param stop_data  Passed as-is to stop_cb.
+   */
+  virtual void train(std::function<void(void *)> epoch_cb, void *epoch_data,
+                     std::function<bool(void *)> stop_cb = nullptr,
+                     void *stop_data = nullptr);
+
+  /**
+   * @brief Return training stats from the last completed epoch.
+   */
+  virtual ml::train::RunStats getTrainingStats();
+
+  /**
+   * @brief Return validation stats from the last completed epoch.
+   */
+  virtual ml::train::RunStats getValidStats();
+
+  /**
+   * @brief Print model summary to a stream.
+   */
+  virtual void summarize(std::ostream &out, unsigned int type);
+
+  /**
+   * @brief Export weight names and norms to a text file for debugging.
+   */
+  virtual void exportWeightsToFile(const std::string &path);
+
+  /**
+   * @brief Print per-epoch QAT calibration stats for the first transformer
+   * block's LoRA adapters (wq, wk, wv, wo, ffn_up, ffn_gate, ffn_down). No-op
+   * when LORA_QAT is false or LoRA not active.
+   */
+  virtual void printLoRAQATStats() const;
+
   /**
    * @brief Save the weight to a file with type conversion
    * @param weight_path Path to save the weight file
@@ -349,6 +454,17 @@ protected:
   formatFromExtension(const std::string &weight_path);
 
   /**
+   * @brief Returns true if module_type (e.g. "q_proj") is in LORA_TARGET and
+   * LORA_RANK > 0.
+   */
+  bool hasLoRA(const std::string &module_type) const;
+
+  /**
+   * @brief Append lora_rank (and lora_alpha if set) to a layer property list.
+   */
+  void appendLoRAProps(std::vector<std::string> &props) const;
+
+  /**
    * @brief register Outputs
    */
   bool is_initialized = false; /**< Flag to check if the model is initialized */
@@ -389,6 +505,15 @@ protected:
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
 
+  unsigned int LORA_RANK = 0;  /**< LoRA rank (0 = disabled) */
+  unsigned int LORA_ALPHA = 0; /**< LoRA alpha (0 = use scaling=1) */
+  bool LORA_QAT =
+    false; /**< enable fake-quant on LoRA adapters (QAT training) */
+  bool LORA_Q4 =
+    false; /**< Q4_0 LoRA: W4A8 inference + Q4_0 fake-quant range */
+  std::vector<std::string> LORA_TARGET; /**< module names to apply LoRA to,
+                                            e.g. {"q_proj","v_proj"} */
+
   // Performance metrics
   TransformerPerformanceMetrics performance_metrics;
 
@@ -400,6 +525,8 @@ protected:
  * @return JSON object
  * @throws std::runtime_error on file open or parse failure
  */
+std::string LoadBytesFromFile(const std::string &path);
+
 inline json LoadJsonFile(const std::string &file_path) {
   std::ifstream file(file_path);
   if (!file.is_open()) {

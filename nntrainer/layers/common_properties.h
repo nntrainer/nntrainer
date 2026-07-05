@@ -8,6 +8,8 @@
  * layers
  * @see	   https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
+ * @author Anirudh <b.saianirud@samsung.com>
+ * @author Pranjal Thapliyal <p.thapliyal@samsung.com>
  * @bug    No known bugs except for NYI items
  */
 #ifndef __COMMON_PROPERTIES_H__
@@ -1524,6 +1526,27 @@ class LoraAlpha : public PositiveIntegerProperty {
 public:
   static constexpr const char *key = "lora_alpha"; /**< unique key to access */
   using prop_tag = uint_prop_tag;                  /**< property type */
+};
+
+/**
+ * @brief Enable QAT (fake quantization) on LoRA adapters
+ */
+class LoraQAT : public Property<bool> {
+public:
+  static constexpr const char *key = "lora_qat"; /**< unique key to access */
+  using prop_tag = bool_prop_tag;                 /**< property type */
+};
+
+/**
+ * @brief Store LoRA adapters as Q4_0 (4-bit, block=32).
+ *        Inference: loraA/loraB registered as Q4_0 tensors (W4A8 kernel).
+ *        Training+QAT: fake-quantize range uses Q4_0 grid [-8, 7].
+ *        Requires lora_rank to be a multiple of 32.
+ */
+class LoraWeightQ4 : public Property<bool> {
+public:
+  static constexpr const char *key = "lora_weight_q4"; /**< unique key */
+  using prop_tag = bool_prop_tag;                       /**< property type */
 };
 
 /**
