@@ -18,6 +18,7 @@
 
 #include <compute_ops.h>
 #include <cpu_backend.h>
+#include <android/log.h>
 
 namespace nntrainer {
 

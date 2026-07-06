@@ -1,11 +1,13 @@
 arm_compute_backend_headers = [
     'arm_compute_backend.h',
+    'hexkl_backend.h',
     'neon_impl.h',
     'neon_mathfun.h',
     'neon_mathfun.hxx',
 ]
 arm_compute_backend_sources = [
     'arm_compute_backend.cpp',
+    'hexkl_backend.cpp',
     'neon_impl.cpp',
 ]
 

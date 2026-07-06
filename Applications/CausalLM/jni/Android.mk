@@ -43,6 +43,18 @@ LOCAL_MODULE := ccapi-nntrainer
 LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/android_build_result/lib/$(TARGET_ARCH_ABI)/libccapi-nntrainer.so
 include $(PREBUILT_SHARED_LIBRARY)
 
+# HMX (HexKL) prebuilt shared library
+ifeq ($(USE_HMX),1)
+  ifndef HEXKL_SDK_ROOT
+    $(error HEXKL_SDK_ROOT must be set when USE_HMX=1)
+  endif
+  include $(CLEAR_VARS)
+  LOCAL_MODULE := sdkl
+  LOCAL_SRC_FILES := $(HEXKL_SDK_ROOT)/lib/armv8_android26/libsdkl.so
+  LOCAL_EXPORT_C_INCLUDES := $(HEXKL_SDK_ROOT)/include
+  include $(PREBUILT_SHARED_LIBRARY)
+endif
+
 # Tokenizer library
 include $(CLEAR_VARS)
 LOCAL_MODULE := tokenizers_c
@@ -111,6 +123,14 @@ LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
 LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES)
+
+# HMX (HexKL) support
+ifeq ($(USE_HMX),1)
+  LOCAL_C_INCLUDES += $(HEXKL_SDK_ROOT)/include
+  LOCAL_CFLAGS += -DUSE_HMX=1
+  LOCAL_CXXFLAGS += -DUSE_HMX=1
+  LOCAL_SHARED_LIBRARIES += sdkl
+endif
 
 include $(BUILD_SHARED_LIBRARY)
 

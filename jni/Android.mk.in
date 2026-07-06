@@ -2,6 +2,15 @@ LOCAL_PATH := $(call my-dir)
 
 MESON_HAS_TFLITE := @MESON_HAS_TFLITE@
 
+# HMX (HexKL) support — pass USE_HMX=1 to ndk-build to enable
+ifeq ($(USE_HMX),1)
+  ifndef HEXKL_SDK_ROOT
+    $(error HEXKL_SDK_ROOT must be set when USE_HMX=1)
+  endif
+  HEXKL_INCLUDES := $(HEXKL_SDK_ROOT)/include
+  HEXKL_LIB_DIR := $(HEXKL_SDK_ROOT)/lib/armv8_android26
+endif
+
 ifeq ($(MESON_HAS_TFLITE),1)
 
 include $(CLEAR_VARS)
@@ -177,6 +186,15 @@ LOCAL_EXPORT_C_INCLUDES  := $(LOCAL_C_INCLUDES)
 include $(BUILD_STATIC_LIBRARY)
 endif
 
+# HMX (HexKL) prebuilt shared library
+ifeq ($(USE_HMX),1)
+include $(CLEAR_VARS)
+LOCAL_MODULE := sdkl
+LOCAL_SRC_FILES := $(HEXKL_LIB_DIR)/libsdkl.so
+LOCAL_EXPORT_C_INCLUDES := $(HEXKL_INCLUDES)
+include $(PREBUILT_SHARED_LIBRARY)
+endif
+
 include $(CLEAR_VARS)
 
 LOCAL_MODULE        := nntrainer
@@ -203,6 +221,14 @@ endif
 ifeq ($(MESON_HAS_TFLITE), 1)
   LOCAL_STATIC_LIBRARIES += tensorflow-lite
 endif # MESON_HAS_TFLITE
+
+# HMX (HexKL) support
+ifeq ($(USE_HMX),1)
+  LOCAL_C_INCLUDES += $(HEXKL_INCLUDES)
+  LOCAL_CFLAGS += -DUSE_HMX=1
+  LOCAL_CXXFLAGS += -DUSE_HMX=1
+  LOCAL_SHARED_LIBRARIES += sdkl
+endif
 
 include $(BUILD_SHARED_LIBRARY)
 

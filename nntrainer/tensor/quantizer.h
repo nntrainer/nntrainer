@@ -12,6 +12,7 @@
 #define __QUANTIZER_H__
 #ifdef __cplusplus
 
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <unordered_map>

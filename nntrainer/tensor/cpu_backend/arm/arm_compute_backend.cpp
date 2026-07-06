@@ -24,6 +24,10 @@
 #include <neon_impl.h>
 #include <nntrainer_error.h>
 #include <q4_0_utils.h>
+#ifdef USE_HMX
+#include <hexkl_backend.h>
+#include <android/log.h>
+#endif
 
 namespace nntrainer {
 
@@ -34,6 +38,9 @@ void init_backend() {
   __openblas_set_num_threads(-1); // -1 = BLAS_NUM_THREADS if defined.
 #endif
   g_compute_ops = get_cpu_ops();
+#ifdef USE_HMX
+  hexkl::initialize();
+#endif
 }
 
 void unpack_q4_0x8_transpose16(const void *src, uint16_t *d_out,
@@ -351,6 +358,22 @@ void sgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
            const float alpha, const float *A, const unsigned int lda,
            const float *B, const unsigned int ldb, const float beta, float *C,
            const unsigned int ldc) {
+#ifdef USE_HMX
+  if (TStorageOrder == 0 && !TransA &&
+      alpha == 1.0f && beta == 0.0f && lda == K && ldc == N) {
+    if (M > 1) {
+      // Prefill: dispatch to HMX (WH cache built on first call, reused after).
+      if (hexkl::sgemm_hmx_i8(TransB, M, N, K, A, lda, B, ldb, C, ldc))
+        return;
+      // Fall through to CPU on failure.
+    } else {
+      // Decode (M == 1): too small for HMX, but opportunistically warm the
+      // WH cache so the NEXT prefill skips the build cost entirely.
+      if (!hexkl::is_weight_cached(TransB, N, K, B))
+        hexkl::preload_weight_f32(TransB, N, K, B, ldb);
+    }
+  }
+#endif
 #ifdef USE_BLAS
   __cblas_sgemm(TStorageOrder, TransA, TransB, M, N, K, alpha, A, lda, B, ldb,
                 beta, C, ldc);

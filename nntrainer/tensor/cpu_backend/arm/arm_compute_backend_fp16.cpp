@@ -20,6 +20,9 @@
 #ifdef USE_BLAS
 #include <cblas_interface.h>
 #endif
+#ifdef USE_HMX
+#include <hexkl_backend.h>
+#endif
 
 #define ROW_MAJOR 0
 #define COL_MAJOR 1
@@ -30,6 +33,18 @@ void shgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
             const float alpha, const float *A, const unsigned int lda,
             const _FP16 *B, const unsigned int ldb, const float beta, float *C,
             const unsigned int ldc) {
+#ifdef USE_HMX
+  // Offload to HMX when conditions allow: row-major, no TransA,
+  // standard alpha/beta, and contiguous layout (lda==K, ldc==N).
+  if (M > 1 && TStorageOrder == ROW_MAJOR && !TransA &&
+      alpha == 1.0f && beta == 0.0f && lda == K && ldc == N) {
+    if (hexkl::shgemm_hmx(TransB, M, N, K, A, lda,
+                           reinterpret_cast<const __fp16 *>(B), ldb, C, ldc))
+      return;
+    // Fall through to CPU on failure.
+  }
+#endif
+
   float *B_ = new float[N * K];
   scopy(N * K, B, 1, B_, 1);
 
