@@ -198,7 +198,7 @@ graph-fusion optimisations the backend exists to provide.
 For these, the integration sits at the LAYER level rather than
 the ComputeOps level:
 * `QNNContext` registers QNN-specific layer factories
-  (`QNNGraph`, `QNNLinear`).
+  (`QNNGraph`).
 * Those layers' `forwarding()` methods are stubs by design — the
   real execution happens once `QNNGraph::compile()` flushes the
   captured subgraph.

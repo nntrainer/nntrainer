@@ -94,7 +94,6 @@
 /usr/include/nntrainer/swap_device.h
 /usr/include/nntrainer/optimizer_wrapped.h
 /usr/include/nntrainer/mem_allocator.h
-/usr/include/nntrainer/tensor_layer.h
 /usr/include/nntrainer/weight_layer.h
 /usr/include/nntrainer/ggml_interface.h
 /usr/include/nntrainer/nntr_ggml_impl.h

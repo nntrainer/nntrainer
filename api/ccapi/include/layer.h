@@ -37,7 +37,6 @@ namespace train {
 enum LayerType {
   LAYER_IN = ML_TRAIN_LAYER_TYPE_INPUT,          /**< Input Layer type */
   LAYER_WEIGHT = ML_TRAIN_LAYER_TYPE_WEIGHT,     /**< Weight Layer type */
-  LAYER_TENSOR = ML_TRAIN_LAYER_TYPE_TENSOR,     /**< Weight Layer type */
   LAYER_ADD = ML_TRAIN_LAYER_TYPE_ADD,           /**< Add Layer type */
   LAYER_SUBTRACT = ML_TRAIN_LAYER_TYPE_SUBTRACT, /**< Subtract Layer type */
   LAYER_MULTIPLY = ML_TRAIN_LAYER_TYPE_MULTIPLY, /**< Multiply Layer type */

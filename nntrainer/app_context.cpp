@@ -95,7 +95,6 @@
 #include <sqrt_layer.h>
 #include <subtract_layer.h>
 #include <tangent_layer.h>
-#include <tensor_layer.h>
 #include <time_dist.h>
 #include <upsample2d_layer.h>
 #include <weight_layer.h>

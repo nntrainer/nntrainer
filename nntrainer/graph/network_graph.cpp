@@ -36,7 +36,6 @@
 #include <rnn.h>
 #include <rnncell.h>
 #include <split_layer.h>
-#include <tensor_layer.h>
 #include <time_dist.h>
 #include <tracer.h>
 #include <util_func.h>
@@ -820,11 +819,6 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
           WeightSpec w_spec = init_context.getWeightsSpec()[i];
           s.variable_spec.reference_name = std::get<8>(w_spec);
           s.variable_spec.dim.setFormat(std::get<0>(w_spec).getFormat());
-        } else if (lnode->getType() == TensorLayer::type) {
-          InitLayerContext::TensorSpec t_spec =
-            init_context.getTensorsSpec()[i];
-          s.variable_spec.reference_name = std::get<3>(t_spec);
-          s.variable_spec.dim.setFormat(std::get<0>(t_spec).getFormat());
         } else {
           s.variable_spec.reference_name = inputs[0]->getName();
           s.variable_spec.dim.setFormat(inputs[0]->getDim().getFormat());
@@ -844,12 +838,6 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
           s.gradient_spec->reference_name =
             std::get<8>(w_spec) + Var_Grad::grad_suffix;
           s.gradient_spec->dim.setFormat(std::get<0>(w_spec).getFormat());
-        } else if (lnode->getType() == TensorLayer::type) {
-          InitLayerContext::TensorSpec t_spec =
-            init_context.getTensorsSpec()[i];
-          s.gradient_spec->reference_name =
-            std::get<3>(t_spec) + Var_Grad::grad_suffix;
-          s.gradient_spec->dim.setFormat(std::get<0>(t_spec).getFormat());
         } else {
           s.gradient_spec->reference_name = inputs[0]->getGradientName();
           s.gradient_spec->dim.setFormat(inputs[0]->getDim().getFormat());

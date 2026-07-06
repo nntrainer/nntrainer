@@ -75,7 +75,6 @@ typedef enum {
   ML_TRAIN_LAYER_TYPE_CONV2D_TRANSPOSE =
     37, /**< Convolution 2D Transpose Layer (Since 9.0) */
   ML_TRAIN_LAYER_TYPE_POW = 38,     /**< Pow Layer type (Since 9.0)*/
-  ML_TRAIN_LAYER_TYPE_TENSOR = 39,  /**< Tensor Layer type (Since 9.0)*/
   ML_TRAIN_LAYER_TYPE_SQRT = 40,    /**< SQRT Layer type (Since 9.0)*/
   ML_TRAIN_LAYER_TYPE_SINE = 41,    /**< Sine Layer type (Since 9.0)*/
   ML_TRAIN_LAYER_TYPE_COSINE = 42,  /**< Cosine Layer type (Since 9.0)*/
