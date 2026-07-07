@@ -482,6 +482,13 @@ void causallm::Quick_Dot_AI_QNN::initialize() {
                           model_inputs};
     std::cout << "----------------------- end graph" << std::endl;
   }
+
+  // QNN builds precompiled graphs here instead of a symbolic nntrainer graph,
+  // so it never calls Transformer::initialize() (which would compile an empty
+  // constructModel() graph). Mark the model initialized ourselves to satisfy
+  // the Transformer base contract: load_weight()/repack_weight()/save_weight()
+  // all guard on is_initialized and throw if it is still false.
+  is_initialized = true;
 }
 
 void causallm::Quick_Dot_AI_QNN::load_weight(const std::string &weight_path) {
@@ -491,6 +498,14 @@ void causallm::Quick_Dot_AI_QNN::load_weight(const std::string &weight_path) {
   for (auto &[key, value] : models) {
     value.model_handle->allocate(ExecutionMode::INFERENCE);
   }
+}
+
+void causallm::Quick_Dot_AI_QNN::repack_weight() {
+  // No-op. QNN runs precompiled graphs (stored in `models`); the base
+  // Transformer symbolic `model` is never constructed for QNN, so the base
+  // repack_weight()'s `model->forEachLayer(...)` would dereference a null
+  // pointer and segfault. QNN weights are baked into the serialized graph
+  // binary — there is nothing to repack here.
 }
 
 void causallm::Quick_Dot_AI_QNN::save_weight(const std::string &weight_path) {

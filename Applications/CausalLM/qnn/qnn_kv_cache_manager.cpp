@@ -206,6 +206,58 @@ void QnnKvCacheManager::appendGenerationOutputs(
                                : &kv_columns_per_layer_);
 }
 
+void QnnKvCacheManager::appendAcceptedGenerationOutputsRing(
+    const std::vector<IO_TensorType> &step_outputs,
+    const std::vector<int32_t> &accepted_indices, int base_position,
+    int src_row_length, const std::string &graph_name) {
+  for (const auto &binding : generation_output_kv_bindings_) {
+    if (binding.output_index < 0 ||
+        binding.output_index >= static_cast<int>(step_outputs.size()) ||
+        binding.kv_index < 0 ||
+        binding.kv_index >= static_cast<int>(generation_caches_.size()) ||
+        binding.layer_index < 0 ||
+        binding.layer_index >= static_cast<int>(layer_row_lengths_.size()) ||
+        (!kv_columns_per_layer_.empty() &&
+         binding.layer_index >=
+           static_cast<int>(kv_columns_per_layer_.size()))) {
+      throw std::runtime_error(graph_name +
+                               " output KV binding is out of range");
+    }
+  }
+
+  const int keep = static_cast<int>(accepted_indices.size());
+#pragma omp parallel for
+  for (int binding_idx = 0;
+       binding_idx < static_cast<int>(generation_output_kv_bindings_.size());
+       binding_idx++) {
+    const auto &binding = generation_output_kv_bindings_[binding_idx];
+    const int dest_row_length = layer_row_lengths_[binding.layer_index];
+    const int num_columns = kv_columns_per_layer_.empty()
+                              ? kKvNumColumns
+                              : kv_columns_per_layer_[binding.layer_index];
+    auto output = std::get<uint8_t *>(step_outputs[binding.output_index]);
+    auto dest = generation_caches_[binding.kv_index].data;
+
+    for (int k = 0; k < keep; k++) {
+      const int a = accepted_indices[k]; // node column in the verify batch
+      const int slot =
+        (base_position + k) % dest_row_length; // ring slot (sliding wrap)
+      if (binding.is_key) {
+        // head-major [num_columns=head_dim, dest_row_length=seq]: write one slot
+        // column, gathering verify-output column a from [head_dim, src_row_len].
+        for (int c = 0; c < num_columns; c++)
+          dest[static_cast<size_t>(c) * dest_row_length + slot] =
+            output[static_cast<size_t>(c) * src_row_length + a];
+      } else {
+        // seq-major [dest_row_length=seq, num_columns=head_dim]: write one slot
+        // row, gathering verify-output row a from [src_row_len, head_dim].
+        std::memcpy(dest + static_cast<size_t>(slot) * num_columns,
+                    output + static_cast<size_t>(a) * num_columns, num_columns);
+      }
+    }
+  }
+}
+
 void QnnKvCacheManager::save(const std::string &path,
                              const std::string &architecture) const {
   if (path.empty()) {

@@ -65,6 +65,13 @@ public:
 
   void load_weight(const std::string &weight_path) override;
 
+  // No-op: QNN runs precompiled graphs (the `models` map), so the base
+  // Transformer symbolic `model` is never built (stays null) and there are no
+  // QS4CX symbolic-graph weights to repack. The base repack_weight() would
+  // dereference the null `model` via model->forEachLayer() and segfault, so QNN
+  // models must override it away.
+  void repack_weight() override;
+
   void save_weight(const std::string &weight_path) override;
 
   virtual bool supportsKvCachePersistence() const { return false; }

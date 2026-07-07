@@ -53,6 +53,23 @@ public:
                                int src_row_length,
                                const std::string &graph_name);
 
+  // DDTree accept: append ONLY the accepted tree nodes to the TARGET cache at
+  // ring slots, so the committed length can grow past the sliding-window
+  // capacity. Accepted node k (verify-batch column accepted_indices[k]) is
+  // written at absolute position base_position+k, stored at slot
+  // (base_position+k) % seq_cap[layer] — the sliding layers wrap (dropping the
+  // oldest), the full layer never wraps in context. Keys are head-major
+  // [.,.,head_dim,seq] (one column gathered per head_dim from the verify output
+  // [head_dim, src_row_length]); values are seq-major [.,.,seq,head_dim] (one
+  // row gathered from [src_row_length, head_dim]). UFIXED8 (1 byte/elem) target
+  // path only. Mirrors gauss4.cpp sd_target.cpp acceptAndAppend(); replaces the
+  // append-whole-tree + compact_cache_by_indices() path (which cannot ring-wrap).
+  // Does NOT change kv_len_ (the caller sets the new length).
+  void appendAcceptedGenerationOutputsRing(
+    const std::vector<IO_TensorType> &step_outputs,
+    const std::vector<int32_t> &accepted_indices, int base_position,
+    int src_row_length, const std::string &graph_name);
+
   void save(const std::string &path, const std::string &architecture) const;
   void load(const std::string &path, const std::string &architecture,
             int max_length);
