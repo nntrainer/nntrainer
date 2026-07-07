@@ -2,7 +2,7 @@
 /**
  * Copyright (C) 2020 Jijoong Moon <jijoong.moon@samsung.com>
  *
- * @file   dropout_layer.cpp
+ * @file   dropout.cpp
  * @date   16 June 2020
  * @see    https://github.com/nntrainer/nntrainer
  * @author Jijoong Moon <jijoong.moon@samsung.com>
@@ -36,15 +36,13 @@ void DropOutLayer::finalize(InitLayerContext &context) {
 void DropOutLayer::forwarding(RunLayerContext &context, bool training) {
   auto &rate_ = std::get<props::DropOutRate>(dropout_rate).get();
 
-  // Assume it is in-place calculation. It means input and output share mem
-  // buffer. So if the training is false, the output is the same with input. In
-  // other words, there is nothing happen during inference.
-
+  // Dropout currently writes to the output tensor. During inference or when the
+  // dropout rate is effectively zero, dropout is a no-op and the input is copied
+  // to the output tensor.
   for (unsigned int i = 0; i < context.getNumInputs(); ++i) {
     Tensor &input_ = context.getInput(i);
     Tensor &output_ = context.getOutput(i);
 
-    /** @todo make this in-place */
     if (training && rate_ > epsilon) {
       Tensor &mask_ = context.getTensor(mask_idx[i]);
       if (!context.reStoreData()) {
@@ -59,14 +57,13 @@ void DropOutLayer::forwarding(RunLayerContext &context, bool training) {
 }
 
 void DropOutLayer::calcDerivative(RunLayerContext &context) {
-  // Assume it is in-place calculation
+  // Backpropagation also writes to the outgoing derivative tensor.
   auto &rate_ = std::get<props::DropOutRate>(dropout_rate).get();
 
   for (unsigned int i = 0; i < context.getNumInputs(); ++i) {
     const Tensor &derivative_ = context.getIncomingDerivative(i);
     Tensor &ret_ = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
 
-    /** @todo make this in-place */
     if (rate_ > epsilon) {
       Tensor &mask_ = context.getTensor(mask_idx[i]);
       derivative_.multiply(mask_, ret_);
