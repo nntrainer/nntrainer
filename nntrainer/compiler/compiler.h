@@ -52,21 +52,19 @@ class GraphCompiler {
 public:
   virtual ~GraphCompiler() {}
   /**
-   * @brief serialize graph to a file stream
-   * @todo consider adding delegates argument here when implementing it for
-   * real.
+   * @brief Compile a graph representation into an executable graph.
    *
-   * @param representation graph representation
-   * @param file ifstream to serialize graph
+   * @param representation graph representation to compile
+   * @return executable graph
    */
   virtual std::shared_ptr<ExecutableGraph>
   compile(std::shared_ptr<const GraphRepresentation> representation) = 0;
 
   /**
-   * @brief deserialize graph from a file stream
+   * @brief Decompile an executable graph into a graph representation.
    *
-   * @param executable executable graph
-   * @return GraphRepresentation graph representation
+   * @param executable executable graph to decompile
+   * @return graph representation
    */
   virtual std::shared_ptr<GraphRepresentation>
   decompile(std::shared_ptr<ExecutableGraph> executable) = 0;
