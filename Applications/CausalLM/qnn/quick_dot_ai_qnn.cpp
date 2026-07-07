@@ -205,8 +205,8 @@ std::string qnn_to_nntrainer_datatype(std::string qnn_dtype) {
   }
 }
 
-causallm::IO_TensorType
-get_qnn_input_data(TensorInfo tensor_object, std::set<void *> &allocated_ptrs) {
+causallm::IO_TensorType get_qnn_input_data(TensorInfo tensor_object,
+                                           std::set<void *> &allocated_ptrs) {
   int size = GraphParser::get_tensor_size(tensor_object);
   std::string qnn_dtype = tensor_object.data_type;
 

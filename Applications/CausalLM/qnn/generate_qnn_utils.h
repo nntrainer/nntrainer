@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * @file   generate_qnn_utils.h
+ * @brief  Helper utilities for QNN generation: KV cache bookkeeping,
+ *         attention mask/rope buffer prep, and sampling.
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ */
+
 #ifndef __GENERATE_QNN_UTILS_HPP__
 #define __GENERATE_QNN_UTILS_HPP__
 
@@ -53,6 +62,9 @@ run_qnn_inference(ModelHandle &model, unsigned int batch,
                   const std::vector<IO_TensorType> &inputs,
                   const GraphInfo &graph_info);
 
+/**
+ * @brief Maps a QNN graph output slot to its destination KV cache slot.
+ */
 struct QnnKvOutputBinding {
   int output_index;
   int kv_index;

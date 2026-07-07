@@ -63,8 +63,8 @@ public:
   // [head_dim, src_row_length]); values are seq-major [.,.,seq,head_dim] (one
   // row gathered from [src_row_length, head_dim]). UFIXED8 (1 byte/elem) target
   // path only. Mirrors gauss4.cpp sd_target.cpp acceptAndAppend(); replaces the
-  // append-whole-tree + compact_cache_by_indices() path (which cannot ring-wrap).
-  // Does NOT change kv_len_ (the caller sets the new length).
+  // append-whole-tree + compact_cache_by_indices() path (which cannot
+  // ring-wrap). Does NOT change kv_len_ (the caller sets the new length).
   void appendAcceptedGenerationOutputsRing(
     const std::vector<IO_TensorType> &step_outputs,
     const std::vector<int32_t> &accepted_indices, int base_position,
@@ -77,13 +77,13 @@ public:
   // ─── DDTree speculative decoding support ───
   void reserve_for_tree_tail(int num_tree_nodes);
   // Compact the appended verify window [past_length, past_length+window_length)
-  // of the TARGET cache, keeping only keep_indices (relative to the window, must
-  // be strictly increasing) at the front [past_length, past_length+keep). Layout
-  // aware: keys are head-major [.,.,head_dim,seq] (gathered per head_dim column),
-  // values are seq-major [.,.,seq,head_dim] (gathered as contiguous rows). Throws
-  // for ring-wrapped sliding layers (past+window > seq capacity) until
-  // sliding-window-aware compaction lands. kv_len_ is NOT changed (the caller
-  // sets the new length).
+  // of the TARGET cache, keeping only keep_indices (relative to the window,
+  // must be strictly increasing) at the front [past_length, past_length+keep).
+  // Layout aware: keys are head-major [.,.,head_dim,seq] (gathered per head_dim
+  // column), values are seq-major [.,.,seq,head_dim] (gathered as contiguous
+  // rows). Throws for ring-wrapped sliding layers (past+window > seq capacity)
+  // until sliding-window-aware compaction lands. kv_len_ is NOT changed (the
+  // caller sets the new length).
   void compact_cache_by_indices(const std::vector<int32_t> &keep_indices,
                                 int past_length, int window_length);
   void commit_tree_tail(int num_accepted_from_tree);
@@ -106,7 +106,8 @@ public:
   // keep_indices (relative to the appended window starting at
   // committed_length_) and shrinks kv_len_ accordingly. The mixed-layout target
   // cache uses compact_cache_by_indices() instead.
-  void compact_seq_major_appended_tail(const std::vector<int32_t> &keep_indices);
+  void
+  compact_seq_major_appended_tail(const std::vector<int32_t> &keep_indices);
 
 private:
   struct GenerationCache {
@@ -137,8 +138,8 @@ private:
   std::vector<int> kv_columns_per_layer_;
 
   // DDTree speculative decoding state
-  int committed_length_ = 0;  // KV rows up to this position are final (accepted)
-  int tree_tail_start_ = 0;   // Start position of unverified draft tree in cache
+  int committed_length_ = 0; // KV rows up to this position are final (accepted)
+  int tree_tail_start_ = 0;  // Start position of unverified draft tree in cache
 };
 
 } // namespace causallm

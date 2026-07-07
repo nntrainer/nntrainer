@@ -17,7 +17,8 @@ constexpr uint8_t kKvCacheFill = 128;
 constexpr int kKvNumColumns = 128;
 
 void write_bytes(std::ofstream &out, const void *data, std::size_t size) {
-  out.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
+  out.write(static_cast<const char *>(data),
+            static_cast<std::streamsize>(size));
   if (!out) {
     throw std::runtime_error("Failed to write QNN KV cache");
   }
@@ -83,8 +84,7 @@ int QnnKvCacheManager::addGenerationCache(const std::string &name,
                                           uint8_t *data, int byte_size,
                                           int row_length, bool is_key) {
   if (data == nullptr || byte_size <= 0 || row_length <= 0) {
-    throw std::runtime_error("Invalid QNN generation KV cache tensor: " +
-                             name);
+    throw std::runtime_error("Invalid QNN generation KV cache tensor: " + name);
   }
 
   const int index = static_cast<int>(generation_caches_.size());
@@ -103,16 +103,16 @@ void QnnKvCacheManager::addPrefillCache(uint8_t *data, int byte_size,
   }
 
   prefill_caches_.push_back(
-      {data, byte_size, row_length, generation_index, is_key});
+    {data, byte_size, row_length, generation_index, is_key});
 }
 
 void QnnKvCacheManager::setPrefillOutputBindings(
-    std::vector<QnnKvOutputBinding> bindings) {
+  std::vector<QnnKvOutputBinding> bindings) {
   prefill_output_kv_bindings_ = std::move(bindings);
 }
 
 void QnnKvCacheManager::setGenerationOutputBindings(
-    std::vector<QnnKvOutputBinding> bindings) {
+  std::vector<QnnKvOutputBinding> bindings) {
   generation_output_kv_bindings_ = std::move(bindings);
 }
 
@@ -165,51 +165,46 @@ void QnnKvCacheManager::syncGenerationToPrefill() {
       continue;
     }
 
-    copy_kv_cache_window(prefill.data, prefill.row_length,
-                         generation_caches_[generation_idx].data,
-                         layer_row_lengths_[generation_layer_idx], kv_len_,
-                         prefill.is_key);
+    copy_kv_cache_window(
+      prefill.data, prefill.row_length, generation_caches_[generation_idx].data,
+      layer_row_lengths_[generation_layer_idx], kv_len_, prefill.is_key);
   }
 }
 
 void QnnKvCacheManager::appendPrefillOutputs(
-    const std::vector<IO_TensorType> &step_outputs, int target_position,
-    int rows, int src_row_length, const std::string &graph_name) {
+  const std::vector<IO_TensorType> &step_outputs, int target_position, int rows,
+  int src_row_length, const std::string &graph_name) {
   std::vector<uint8_t *> kvs;
   kvs.reserve(generation_caches_.size());
   for (const auto &cache : generation_caches_) {
     kvs.push_back(cache.data);
   }
 
-  append_outputs_to_kv_cache(step_outputs, prefill_output_kv_bindings_, kvs,
-                             layer_row_lengths_, target_position, rows,
-                             src_row_length, graph_name,
-                             kv_columns_per_layer_.empty()
-                               ? nullptr
-                               : &kv_columns_per_layer_);
+  append_outputs_to_kv_cache(
+    step_outputs, prefill_output_kv_bindings_, kvs, layer_row_lengths_,
+    target_position, rows, src_row_length, graph_name,
+    kv_columns_per_layer_.empty() ? nullptr : &kv_columns_per_layer_);
 }
 
 void QnnKvCacheManager::appendGenerationOutputs(
-    const std::vector<IO_TensorType> &step_outputs, int target_position,
-    int rows, int src_row_length, const std::string &graph_name) {
+  const std::vector<IO_TensorType> &step_outputs, int target_position, int rows,
+  int src_row_length, const std::string &graph_name) {
   std::vector<uint8_t *> kvs;
   kvs.reserve(generation_caches_.size());
   for (const auto &cache : generation_caches_) {
     kvs.push_back(cache.data);
   }
 
-  append_outputs_to_kv_cache(step_outputs, generation_output_kv_bindings_, kvs,
-                             layer_row_lengths_, target_position, rows,
-                             src_row_length, graph_name,
-                             kv_columns_per_layer_.empty()
-                               ? nullptr
-                               : &kv_columns_per_layer_);
+  append_outputs_to_kv_cache(
+    step_outputs, generation_output_kv_bindings_, kvs, layer_row_lengths_,
+    target_position, rows, src_row_length, graph_name,
+    kv_columns_per_layer_.empty() ? nullptr : &kv_columns_per_layer_);
 }
 
 void QnnKvCacheManager::appendAcceptedGenerationOutputsRing(
-    const std::vector<IO_TensorType> &step_outputs,
-    const std::vector<int32_t> &accepted_indices, int base_position,
-    int src_row_length, const std::string &graph_name) {
+  const std::vector<IO_TensorType> &step_outputs,
+  const std::vector<int32_t> &accepted_indices, int base_position,
+  int src_row_length, const std::string &graph_name) {
   for (const auto &binding : generation_output_kv_bindings_) {
     if (binding.output_index < 0 ||
         binding.output_index >= static_cast<int>(step_outputs.size()) ||
@@ -243,8 +238,9 @@ void QnnKvCacheManager::appendAcceptedGenerationOutputsRing(
       const int slot =
         (base_position + k) % dest_row_length; // ring slot (sliding wrap)
       if (binding.is_key) {
-        // head-major [num_columns=head_dim, dest_row_length=seq]: write one slot
-        // column, gathering verify-output column a from [head_dim, src_row_len].
+        // head-major [num_columns=head_dim, dest_row_length=seq]: write one
+        // slot column, gathering verify-output column a from [head_dim,
+        // src_row_len].
         for (int c = 0; c < num_columns; c++)
           dest[static_cast<size_t>(c) * dest_row_length + slot] =
             output[static_cast<size_t>(c) * src_row_length + a];
@@ -378,10 +374,10 @@ void QnnKvCacheManager::set_kv_columns_per_layer(std::vector<int> columns) {
   // mismatch would be an out-of-bounds read.
   if (!layer_row_lengths_.empty() &&
       columns.size() != layer_row_lengths_.size()) {
-    throw std::runtime_error(
-      "KV columns-per-layer size (" + std::to_string(columns.size()) +
-      ") must equal the layer count (" +
-      std::to_string(layer_row_lengths_.size()) + ")");
+    throw std::runtime_error("KV columns-per-layer size (" +
+                             std::to_string(columns.size()) +
+                             ") must equal the layer count (" +
+                             std::to_string(layer_row_lengths_.size()) + ")");
   }
   for (const int c : columns) {
     if (c <= 0) {
@@ -413,8 +409,8 @@ void QnnKvCacheManager::compact_seq_major_appended_tail(
       "compact_seq_major_appended_tail requires set_kv_columns_per_layer()");
   }
 
-  const int past = committed_length_;     // appended window starts here
-  const int tail = kv_len_ - past;        // appended (tree) length
+  const int past = committed_length_; // appended window starts here
+  const int tail = kv_len_ - past;    // appended (tree) length
   const int keep = static_cast<int>(keep_indices.size());
   if (tail < 0) {
     throw std::runtime_error("compact_seq_major: kv_len_ < committed_length_");
@@ -551,9 +547,11 @@ void QnnKvCacheManager::compact_cache_by_indices(
           continue;
         for (int c = 0; c < kColumns; ++c) {
           uint8_t *dst =
-            cache.data + (static_cast<size_t>(c) * seq_cap + past_length + n) * elem;
+            cache.data +
+            (static_cast<size_t>(c) * seq_cap + past_length + n) * elem;
           const uint8_t *src =
-            cache.data + (static_cast<size_t>(c) * seq_cap + past_length + old) * elem;
+            cache.data +
+            (static_cast<size_t>(c) * seq_cap + past_length + old) * elem;
           std::memcpy(dst, src, elem);
         }
       }

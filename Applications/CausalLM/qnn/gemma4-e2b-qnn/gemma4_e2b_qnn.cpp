@@ -807,8 +807,7 @@ void Gemma4_E2B_QNN::initialize() {
 
   // ── PLE per-layer dst + scale/offset collection ──
   auto collect_per_layer =
-    [](const GraphInfo &gi,
-       std::vector<causallm::IO_TensorType> &inputs,
+    [](const GraphInfo &gi, std::vector<causallm::IO_TensorType> &inputs,
        std::vector<uint16_t *> &dsts, std::vector<float> &scales,
        std::vector<int> &offsets, std::vector<int> &model_indices) {
       std::map<int, std::tuple<uint16_t *, float, int>> by_index;
@@ -1214,7 +1213,8 @@ void Gemma4_E2B_QNN::run(const WSTR prompt, bool /*do_sample*/,
       swa_position_ids_cos, swa_position_ids_sin, swa_pos_dim, kv_len,
       rope_cache_seq_len);
     fill_generation_ple_(t);
-    auto term = run_qnn_inference(generation_model, 1, generation_inputs, models[generation_graph].graph_info);
+    auto term = run_qnn_inference(generation_model, 1, generation_inputs,
+                                  models[generation_graph].graph_info);
     std::vector<uint8_t *> kv_ptrs;
     for (auto *kv : kvs)
       kv_ptrs.push_back((uint8_t *)kv);
@@ -1290,7 +1290,8 @@ void Gemma4_E2B_QNN::run(const WSTR prompt, bool /*do_sample*/,
 
     fill_prefill_ple_chunk_(_input, c, chunk_len);
 
-    outputs = run_qnn_inference(prefill_model, 1, prefill_inputs, models[prefill_graph].graph_info);
+    outputs = run_qnn_inference(prefill_model, 1, prefill_inputs,
+                                models[prefill_graph].graph_info);
 
     // ── Debug: dump raw prefill output for value layer 0 (first chunk only) ──
     if (c == 0) {
@@ -1457,7 +1458,8 @@ void Gemma4_E2B_QNN::run(const WSTR prompt, bool /*do_sample*/,
                 << " ===" << std::endl;
     }
 
-    outputs = run_qnn_inference(generation_model, 1, generation_inputs, models[generation_graph].graph_info);
+    outputs = run_qnn_inference(generation_model, 1, generation_inputs,
+                                models[generation_graph].graph_info);
 
     // ── Debug: dump generation model outputs for first 3 steps ──
     if (idx - prefill_len < 3) {

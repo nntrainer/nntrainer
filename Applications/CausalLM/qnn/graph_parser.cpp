@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * @file   graph_parser.cpp
+ * @brief  Parses QNN graph-info JSON into tensor/graph metadata.
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ */
+
 #include "graph_parser.h"
 #include <algorithm>
 #include <exception>

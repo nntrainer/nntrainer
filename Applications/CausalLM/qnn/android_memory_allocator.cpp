@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * @file   android_memory_allocator.cpp
+ * @brief  RPCMEM-backed shared memory allocator for QNN buffers on Android.
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ */
+
 #include "android_memory_allocator.h"
 
 #include <dynamic_library_loader.h>

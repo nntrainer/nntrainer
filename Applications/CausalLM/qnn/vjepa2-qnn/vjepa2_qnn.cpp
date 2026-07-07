@@ -60,8 +60,9 @@ static std::string dirname_(const std::string &path) {
   return (pos == std::string::npos) ? std::string() : path.substr(0, pos);
 }
 
-static std::string rebase_relative_to_model_file(const std::string &path,
-                                                  const std::string &model_file) {
+static std::string
+rebase_relative_to_model_file(const std::string &path,
+                              const std::string &model_file) {
   if (path.empty() || is_absolute_path_(path))
     return path;
   auto base = dirname_(model_file);
@@ -128,8 +129,7 @@ TensorInfo causallm::VJEPA2_QNN::get_output_info() {
 }
 
 void causallm::VJEPA2_QNN::loadTensorFromFile(const std::string &path,
-                                              void *dest,
-                                              size_t expected_size,
+                                              void *dest, size_t expected_size,
                                               const std::string &name) {
   int fd = ::open(path.c_str(), O_RDONLY);
   NNTR_THROW_IF(fd == -1, std::invalid_argument)
@@ -145,12 +145,12 @@ void causallm::VJEPA2_QNN::loadTensorFromFile(const std::string &path,
   if (file_size != expected_size) {
     ::close(fd);
     throw std::invalid_argument(name + " file size " +
-                                std::to_string(file_size) +
-                                " != expected " + std::to_string(expected_size));
+                                std::to_string(file_size) + " != expected " +
+                                std::to_string(expected_size));
   }
 
-  void *ptr = ::mmap(nullptr, file_size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE, fd, 0);
+  void *ptr =
+    ::mmap(nullptr, file_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
   ::close(fd);
   NNTR_THROW_IF(ptr == MAP_FAILED, std::runtime_error)
     << "mmap failed for " << name << ": " << path;
@@ -175,8 +175,8 @@ void causallm::VJEPA2_QNN::loadRotationMatrix() {
   size_t expected_size =
     GraphParser::get_tensor_size(model_info.raw_inputs[idx]);
   loadTensorFromFile(rotation_matrix_path_,
-                     std::get<uint8_t *>(model_input[idx]),
-                     expected_size, "rotation_matrix");
+                     std::get<uint8_t *>(model_input[idx]), expected_size,
+                     "rotation_matrix");
   rotation_matrix_mmap_ptr_ = reinterpret_cast<void *>(1); // loaded sentinel
 }
 
@@ -227,24 +227,26 @@ void causallm::VJEPA2_QNN::initialize() {
     size_t cos_byte_size =
       GraphParser::get_tensor_size(model_info.raw_inputs[idx_cos]);
     if (!rope_cos_path_.empty()) {
-      loadTensorFromFile(rope_cos_path_, rope_cos_input_,
-                         cos_byte_size, "rope_cos");
+      loadTensorFromFile(rope_cos_path_, rope_cos_input_, cos_byte_size,
+                         "rope_cos");
     } else {
       std::memset(rope_cos_input_, 0, cos_byte_size);
       LOGD("VJEPA2_QNN: WARNING rope_cos missing --- zero-filled dummy"
-           " (%zu bytes)", cos_byte_size);
+           " (%zu bytes)",
+           cos_byte_size);
     }
   }
   if (idx_sin >= 0) {
     size_t sin_byte_size =
       GraphParser::get_tensor_size(model_info.raw_inputs[idx_sin]);
     if (!rope_sin_path_.empty()) {
-      loadTensorFromFile(rope_sin_path_, rope_sin_input_,
-                         sin_byte_size, "rope_sin");
+      loadTensorFromFile(rope_sin_path_, rope_sin_input_, sin_byte_size,
+                         "rope_sin");
     } else {
       std::memset(rope_sin_input_, 0, sin_byte_size);
       LOGD("VJEPA2_QNN: WARNING rope_sin missing --- zero-filled dummy"
-           " (%zu bytes)", sin_byte_size);
+           " (%zu bytes)",
+           sin_byte_size);
     }
   }
 }

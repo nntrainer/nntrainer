@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * @file   qnn_compat_types.h
- * @brief  QuickAI-owned compatibility type aliases for the main-based nntrainer.
+ * @brief  QuickAI-owned compatibility type aliases for the main-based
+ * nntrainer.
  *
  * @note   The in-house ("quickdotai_api_refact") nntrainer used to expose two
  *         types that QuickAI's QNN product models depend on but that the
@@ -17,6 +18,9 @@
  *         with the *exact* definitions copied from the OLD nntrainer. Usage
  *         sites that referenced `ml::train::TensorDim::IO_TensorType` are
  *         retargeted to `causallm::IO_TensorType`.
+ *
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #ifndef __QNN_COMPAT_TYPES_H__

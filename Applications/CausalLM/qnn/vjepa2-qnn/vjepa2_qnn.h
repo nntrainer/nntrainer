@@ -4,6 +4,8 @@
  * @brief  QNN model implementation for V-JEPA2 video encoder.
  * @note   This class is not to be executed alone.
  *
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #ifndef __VJEPA2_QNN_H__

@@ -21,8 +21,8 @@ class Gemma4_E2B_QNN : public Quick_Dot_AI_QNN {
 public:
   static constexpr const char *architectures = "Gemma4_E2B_QNN";
 
-  Gemma4_E2B_QNN(json &cfg, json &generation_cfg, json &nntr_cfg)
-      : Quick_Dot_AI_QNN(cfg, generation_cfg, nntr_cfg) {
+  Gemma4_E2B_QNN(json &cfg, json &generation_cfg, json &nntr_cfg) :
+    Quick_Dot_AI_QNN(cfg, generation_cfg, nntr_cfg) {
     LOGD("Gemma4 E2B parameters set up ");
     setupParameters(cfg, generation_cfg, nntr_cfg);
   }

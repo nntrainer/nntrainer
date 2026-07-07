@@ -1,3 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * @file   generate_qnn_utils.cpp
+ * @brief  Helper utilities for QNN generation: KV cache bookkeeping,
+ *         attention mask/rope buffer prep, and sampling.
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ */
+
 #include "generate_qnn_utils.h"
 #include "android_memory_allocator.h"
 
@@ -373,7 +382,8 @@ void fill_generation_inputs_common(
   // Self-attention slot: the current token's own KV position.
   // Using full_kv_past_length (= per-row elements - 1) rather than
   // attention_mask_elements - 1 ensures the slot lands in row 0 when the
-  // generation graph batches multiple sequence positions (generation_seq_len>1).
+  // generation graph batches multiple sequence positions
+  // (generation_seq_len>1).
   generation_attention_mask[generation_full_kv_past_length] =
     std::numeric_limits<uint16_t>::max();
   generation_sliding_attention_mask[generation_sliding_kv_past_length] =

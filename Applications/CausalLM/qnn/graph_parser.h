@@ -1,3 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * @file   graph_parser.h
+ * @brief  Parses QNN graph-info JSON into tensor/graph metadata.
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ */
+
 #ifndef GRAPH_PARSER_H
 #define GRAPH_PARSER_H
 
@@ -8,6 +16,9 @@
 
 using json = nlohmann::json;
 
+/**
+ * @brief Metadata for a single QNN graph input/output tensor.
+ */
 struct TensorInfo {
   std::string name;
   std::vector<int> dimensions;
@@ -18,12 +29,18 @@ struct TensorInfo {
 
 using TensorInfoList = std::vector<TensorInfo>;
 
+/**
+ * @brief Input/output tensor metadata for a single named QNN graph.
+ */
 struct GraphInfo {
   std::string graph_name;
   TensorInfoList raw_inputs;
   TensorInfoList raw_outputs;
 };
 
+/**
+ * @brief Parses a QNN graph-info JSON file into per-graph tensor metadata.
+ */
 class GraphParser {
 public:
   GraphParser();
