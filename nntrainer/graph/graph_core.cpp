@@ -80,3 +80,123 @@ void GraphCore::topologicalSort() {
   std::vector<bool> visited(node_list.size(), false);
 
   makeAdjacencyList(adj);
+  Sorted.clear();
+
+  // Quite likely this is not needed - verify this
+  // TODO : After make node list of graph, we have to find root. (That means it
+  // should be the only one input for now.). Need to support multiple input and
+  // support search.
+
+  for (int i = adj.size() - 1; i >= 0; --i) {
+    if (!visited[i]) {
+      topologicalSortUtil(adj, i, visited, dfs_stack);
+    }
+  }
+
+  while (dfs_stack.empty() == false) {
+    Sorted.push_back(dfs_stack.top());
+    dfs_stack.pop();
+  }
+
+  if (Sorted.size() != node_list.size())
+    throw std::runtime_error("Internal error in topologicalSort");
+  unsigned int idx = 0;
+  for (auto &n : Sorted) {
+    sorted_node_map[n->getName()] = idx;
+    idx++;
+  }
+}
+
+const std::shared_ptr<GraphNode> &
+GraphCore::getNode(const std::string &name) const {
+  return node_list.at(node_map.at(name));
+}
+
+void GraphCore::addNode(std::shared_ptr<GraphNode> node, bool ensure_name) {
+  /** Ensure that the node has a name and is unique */
+  if (ensure_name)
+    ensureName(*node);
+
+  /** Insert the node to the graph */
+  addGraphNode(node);
+}
+
+void GraphCore::ensureName(GraphNode &node, const std::string &prefix_,
+                           const std::string &postfix_, bool force_rename) {
+  auto to_lower = [](const std::string &str) -> std::string {
+    std::string ret = str;
+    std::transform(ret.begin(), ret.end(), ret.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return ret;
+  };
+
+  std::string orig_name = to_lower(node.getName());
+  std::string prefix = to_lower(prefix_);
+  std::string postfix = to_lower(postfix_);
+
+  bool orig_name_empty = orig_name.empty();
+  /** If node already has name which is unique and valid, and force is
+   * disabled, then nothing to do.
+   */
+  if (!orig_name_empty && !force_rename && !verifyNode(orig_name)) {
+    node.setName(orig_name);
+    node_names.emplace(orig_name);
+    return;
+  }
+
+  /** If just prefix with node name makes it unique - directly set the name */
+  if (!orig_name_empty) {
+    std::string direct_name = prefix + orig_name + postfix;
+    if (!verifyNode(direct_name)) {
+      node.setName(direct_name);
+      node_names.emplace(direct_name);
+      return;
+    }
+  }
+
+  std::unordered_set<std::string>::iterator iter;
+  std::string name;
+  if (orig_name_empty) {
+    orig_name = node.getType();
+  }
+
+  std::string direct_name = prefix + orig_name + postfix;
+
+  do {
+    name = direct_name + std::to_string(def_name_count++);
+    iter = node_names.find(name);
+  } while (iter != node_names.end());
+
+  node.setName(name);
+  node_names.emplace(name);
+}
+
+void GraphCore::replaceNode(std::shared_ptr<GraphNode> from,
+                            std::shared_ptr<GraphNode> to) {
+  if (node_map.find(from->getName()) == node_map.end())
+    throw std::invalid_argument("Graph node to be replaced is missing");
+  if (node_map.find(to->getName()) != node_map.end())
+    throw std::invalid_argument("Nodes in the graph must be unique");
+
+  unsigned int from_idx = getNodeIdx(from->getName());
+  node_list[from_idx] = to;
+  node_map.erase(from->getName());
+  node_map[to->getName()] = from_idx;
+}
+
+void GraphCore::realizeInputOutputNode() {
+  for (auto iter = cbegin(); iter != cend(); ++iter) {
+    if (iter->getInputConnections().size() == 0) {
+      input_list.push_back(*iter);
+    }
+    if (iter->getOutputConnections().size() == 0) {
+      output_list.push_back(*iter);
+    }
+  }
+}
+
+unsigned int GraphCore::getNodeIdx(const std::string &name) {
+  return node_map.at(name);
+}
+
+} /* namespace nntrainer */
