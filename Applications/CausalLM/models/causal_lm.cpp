@@ -47,6 +47,7 @@
 
 #include <causal_lm.h>
 #include <llm_util.hpp>
+#include <rms_reverse_norm.h>
 #include <utf8_stream_util.h>
 
 #include "api/streamer.h"
@@ -718,6 +719,19 @@ void CausalLM::registerCustomLayers() {
   // lm_head is a core layer now (nntrainer/layers/llm), registered by
   // AppContext itself.
   (void)app_context;
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // RMSReverseNorm (the PLE post_norm of the reverse-norm model family) on
+  // the cuda context: engine=cuda graphs construct this layer on the cuda
+  // context, and its incremental_forwarding carries the device path for
+  // NNTR_CUDA_DEV_ACT device-only activation pools.
+  try {
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::RMSReverseNormLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "cuda" context or already registered -- both benign.
+  }
+#endif
 }
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,

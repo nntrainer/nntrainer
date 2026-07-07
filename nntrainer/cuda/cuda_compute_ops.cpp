@@ -66,6 +66,105 @@ void CudaComputeOps::swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
   CpuComputeOps::swiglu(in1, in2, out, active_rows, row_offset);
 }
 
+// GeGLU: out = gelu_tanh(gate) * up. Device-resident fp16 kernel (opt-in via
+// NNTR_CUDA_GEGLU until the whole decode chain is on-GPU); otherwise the host
+// gelu loop on the host-coherent UVM tensors (CpuComputeOps::geglu).
+void CudaComputeOps::geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                           unsigned int active_rows, unsigned int row_offset) {
+  const unsigned int dim2 = in1.width();
+  const size_t elem_off = (size_t)row_offset * dim2;
+  const size_t n = (size_t)active_rows * dim2;
+  const auto dt = in1.getDataType();
+
+#ifdef ENABLE_FP16
+  // GPU geglu (device-resident fp16): one kernel instead of the host loop, so
+  // the FFN/PLE activation stays on the device. NNTR_CUDA_ASYNC governs the
+  // drain.
+  if (dt == ml::train::TensorDim::DataType::FP16) {
+    static const bool gpu = std::getenv("NNTR_CUDA_GEGLU") != nullptr;
+    if (gpu && n > 0) {
+      auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>() +
+                                                         elem_off);
+      auto *b = reinterpret_cast<const unsigned short *>(in2.getData<_FP16>() +
+                                                         elem_off);
+      auto *o =
+        reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
+      const bool dev = nntrainer::cuda::dev_accessible(a);
+      if (dev && nntrainer::cuda::cuda_geglu_fp16(a, b, o, (unsigned int)n))
+        return;
+    }
+  }
+#endif
+
+  // Host gelu fallback: sync first so the host read of GPU-produced gate/up
+  // is coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+  nntrainer::cuda::drain_if_async();
+  CpuComputeOps::geglu(in1, in2, out, active_rows, row_offset);
+}
+
+// Fused sigmoid gates on cuda (mirror of geglu above). A device-resident
+// activation pool makes the DEVICE kernel the primary path (the base
+// CpuComputeOps host loop faults on a device-only activation in runDecode).
+// Host loop only for genuinely host tensors.
+// Kill-switch: NNTR_CUDA_SIGMOID_GATE=0.
+void CudaComputeOps::sigmoid_glu(const Tensor &in1, const Tensor &in2,
+                                 Tensor &out, unsigned int active_rows,
+                                 unsigned int row_offset) {
+  const unsigned int dim2 = in1.width();
+  const size_t elem_off = (size_t)row_offset * dim2;
+  const size_t n = (size_t)active_rows * dim2;
+#ifdef ENABLE_FP16
+  if (in1.getDataType() == ml::train::TensorDim::DataType::FP16 && n > 0) {
+    static const bool gpu = []() {
+      const char *e = std::getenv("NNTR_CUDA_SIGMOID_GATE");
+      return !(e && e[0] == '0');
+    }();
+    if (gpu) {
+      auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>() +
+                                                         elem_off);
+      auto *b = reinterpret_cast<const unsigned short *>(in2.getData<_FP16>() +
+                                                         elem_off);
+      auto *o =
+        reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
+      if (nntrainer::cuda::dev_accessible(a) &&
+          nntrainer::cuda::cuda_sigmoid_glu_fp16(a, b, o, (unsigned int)n))
+        return;
+    }
+  }
+#endif
+  nntrainer::cuda::drain_if_async();
+  CpuComputeOps::sigmoid_glu(in1, in2, out, active_rows, row_offset);
+}
+
+void CudaComputeOps::sigmoid_add(const Tensor &in1, const Tensor &in2,
+                                 Tensor &out, unsigned int active_rows,
+                                 unsigned int row_offset) {
+  const unsigned int dim2 = in1.width();
+  const size_t elem_off = (size_t)row_offset * dim2;
+  const size_t n = (size_t)active_rows * dim2;
+#ifdef ENABLE_FP16
+  if (in1.getDataType() == ml::train::TensorDim::DataType::FP16 && n > 0) {
+    static const bool gpu = []() {
+      const char *e = std::getenv("NNTR_CUDA_SIGMOID_GATE");
+      return !(e && e[0] == '0');
+    }();
+    if (gpu) {
+      auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>() +
+                                                         elem_off);
+      auto *b = reinterpret_cast<const unsigned short *>(in2.getData<_FP16>() +
+                                                         elem_off);
+      auto *o =
+        reinterpret_cast<unsigned short *>(out.getData<_FP16>() + elem_off);
+      if (nntrainer::cuda::dev_accessible(a) &&
+          nntrainer::cuda::cuda_sigmoid_add_fp16(a, b, o, (unsigned int)n))
+        return;
+    }
+  }
+#endif
+  nntrainer::cuda::drain_if_async();
+  CpuComputeOps::sigmoid_add(in1, in2, out, active_rows, row_offset);
+}
+
 void CudaComputeOps::scalar_mul(const Tensor &in, Tensor &out, float scale) {
 #ifdef ENABLE_FP16
   if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {

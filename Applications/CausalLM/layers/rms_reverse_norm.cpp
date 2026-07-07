@@ -16,6 +16,12 @@
 
 #include "rms_reverse_norm.h"
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_rmsnorm.h>
+#include <cuda_stream_manager.h>
+#endif
+
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -130,6 +136,33 @@ void RMSReverseNormLayer::incremental_forwarding(
       // TODO : Implement Fast Route for FP16
     } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // engine=cuda device path: the FC-produced input lives on the device
+      // activation pool, so the host FP32-temp fallback below FAULTS reading
+      // it (measured SIGSEGV in avx2::vcvt_f16_f32 under NNTR_CUDA_DEV_ACT).
+      // Run the reverse-norm as a device kernel (cuda_rms_reverse_norm_fp16,
+      // FP32-accumulated, weight-before-norm + scalar out_scale read
+      // on-device).
+      if (weight.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+          out_scale.getDataType() == ml::train::TensorDim::DataType::FP16) {
+        auto *ip =
+          reinterpret_cast<const unsigned short *>(in_step.getData<_FP16>());
+        auto *wp =
+          reinterpret_cast<const unsigned short *>(weight.getData<_FP16>());
+        auto *osp =
+          reinterpret_cast<const unsigned short *>(out_scale.getData<_FP16>());
+        auto *op =
+          reinterpret_cast<unsigned short *>(out_step.getData<_FP16>());
+        auto dev_ok = [](const void *ptr) {
+          return ptr && nntrainer::cuda::dev_accessible(ptr);
+        };
+        if (dev_ok(ip) && dev_ok(wp) && dev_ok(osp) && dev_ok(op) &&
+            nntrainer::cuda::cuda_rms_reverse_norm_fp16(
+              ip, wp, osp, op, epsilon, in_step_dim.height(),
+              in_step_dim.width()))
+          continue;
+      }
+#endif
       ml::train::TensorDim instep_dim = in_step_dim;
       ml::train::TensorDim outstep_dim = out_step_dim;
 

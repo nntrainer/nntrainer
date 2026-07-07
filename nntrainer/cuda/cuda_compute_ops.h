@@ -43,6 +43,30 @@ public:
               unsigned int active_rows, unsigned int row_offset) override;
 
   /**
+   * @brief GeGLU whole-op: out = gelu_tanh(gate) * up. Opt-in
+   *        (NNTR_CUDA_GEGLU) device-resident fp16 kernel (cuda_geglu_fp16),
+   *        else drain-then-host fallback.
+   */
+  void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+             unsigned int active_rows, unsigned int row_offset) override;
+
+  /**
+   * @brief Fused sigmoid-GLU whole-op: fp16 device kernel
+   *        (cuda_sigmoid_glu_fp16) on device-accessible tensors, else
+   *        drain-then-host fallback. Kill-switch NNTR_CUDA_SIGMOID_GATE=0.
+   */
+  void sigmoid_glu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                   unsigned int active_rows, unsigned int row_offset) override;
+
+  /**
+   * @brief Fused sigmoid-add whole-op: fp16 device kernel
+   *        (cuda_sigmoid_add_fp16) on device-accessible tensors, else
+   *        drain-then-host fallback. Kill-switch NNTR_CUDA_SIGMOID_GATE=0.
+   */
+  void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
+                   unsigned int active_rows, unsigned int row_offset) override;
+
+  /**
    * @brief Scalar multiply whole-op: opt-in (NNTR_CUDA_ELTWISE) fp16 device
    *        kernel (cuda_scalar_mul_fp16), else drain-then-host fallback.
    */
