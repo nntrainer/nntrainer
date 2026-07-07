@@ -41,13 +41,13 @@ public:
 
   /**
    *  @brief  Move constructor of ReduceMeanLayer.
-   *  @param[in] ReduceMeanLayer &&
+   *  @param[in] rhs ReduceMeanLayer to be moved.
    */
   ReduceMeanLayer(ReduceMeanLayer &&rhs) noexcept = default;
 
   /**
    * @brief  Move assignment operator.
-   * @parma[in] rhs ReduceMeanLayer to be moved.
+   * @param[in] rhs ReduceMeanLayer to be moved.
    */
   ReduceMeanLayer &operator=(ReduceMeanLayer &&rhs) = default;
 
@@ -67,7 +67,7 @@ public:
   void calcDerivative(RunLayerContext &context) override;
 
   /**
-   * @copydoc bool supportBackwarding() const
+   * @copydoc Layer::supportBackwarding() const
    */
   bool supportBackwarding() const override { return true; };
 
