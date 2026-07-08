@@ -129,6 +129,21 @@ public:
 };
 
 /**
+ * @brief UseGemmAttention property
+ *
+ * Opt-in toggle for the GEMM / flash-attention path (built and verified for the
+ * ARM FP16 device build; forced off on x86 / non-FP16 builds). Defaults to the
+ * reference-attention path so existing behavior is preserved.
+ */
+class UseGemmAttention : public nntrainer::Property<bool> {
+public:
+  UseGemmAttention(bool value = false) { set(value); };
+  static constexpr const char *key =
+    "use_gemm_attention";                    /**< unique key to access */
+  using prop_tag = nntrainer::bool_prop_tag; /**< property type */
+};
+
+/**
  * @brief AttnLogitSoftcapping
  */
 class AttnLogitSoftcapping : public nntrainer::Property<float> {
@@ -267,6 +282,18 @@ public:
     ml::train::TensorDim &cache_key_step_dim,
     ml::train::TensorDim &cache_value_dim,
     ml::train::TensorDim &cache_value_step_dim, nntrainer::Tensor &sink_step);
+
+  /**
+   * @brief GEMM / flash-attention path for one attention step (ARM FP16 device
+   *        build; gated by use_gemm_attention). Falls back to the reference
+   *        per-row attention kernels elsewhere.
+   */
+  WIN_EXPORT void gemm_attention(nntrainer::Tensor &query_step,
+                                 nntrainer::Tensor &b_cached_key,
+                                 nntrainer::Tensor &b_cached_value,
+                                 nntrainer::Tensor &attention_output_step,
+                                 unsigned int N_kv, unsigned int N_q,
+                                 unsigned int cache_from);
   /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
    */
@@ -345,7 +372,7 @@ private:
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopePartialRotaryFactor,
     props::RopeScalingMaxPositionEmbeddings, props::AttnLogitSoftcapping,
-    props::IsCausal>
+    props::IsCausal, props::UseGemmAttention>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -374,6 +401,7 @@ private:
   bool use_rope = true;
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
+  bool use_gemm_attention = false;
   bool skip_prefill = false;
 
   enum INOUT_INDEX {

@@ -22,6 +22,7 @@
 #define __NNTR_CONV_INDIRECT_H__
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 
 #include <tensor_dim.h> // for _FP16 (defined under ENABLE_FP16)

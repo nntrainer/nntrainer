@@ -780,11 +780,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // minimum prefill length: for decode (step_size == 1) the per-row dot
   // path is preferred (no benefit from blocking + softmax bookkeeping).
   constexpr unsigned int FLASH_MIN_PREFILL = 32;
+#if (ENABLE_FP16 && defined(__ANDROID__))
+  // gemm_attention() is only built/verified for the ARM FP16 device build; on
+  // other builds use_gemm_attention is forced false above so this path is dead.
   if (use_gemm_attention && step_size >= FLASH_MIN_PREFILL) {
     gemm_attention(query_step, b_cached_key, b_cached_value,
                    attention_output_step, cache_to, step_size, cache_from);
     return;
   }
+#endif
 
   // out_ stores the output of Q * K
   nntrainer::Tensor out_(1, 1,
@@ -803,6 +807,11 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                 cache_to);
 }
 
+#if (ENABLE_FP16 && defined(__ANDROID__))
+// gemm_attention() (GEMM / flash-attention path) is built and verified only for
+// the ARM FP16 device build; it calls the FP16 AVX2/NEON micro-kernels that are
+// compiled only there. On other builds use_gemm_attention is forced false, so
+// the definition is compiled out to avoid an undefined-symbol link error.
 void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
                                   nntrainer::Tensor &b_cached_key,
                                   nntrainer::Tensor &b_cached_value,
@@ -1162,6 +1171,7 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
     }
   });
 }
+#endif
 
 void MHACoreLayer::one_batch_incremental_forwarding(
   const unsigned int batch, const unsigned int _from, const unsigned int from,
