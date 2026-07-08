@@ -8,6 +8,7 @@
 #ifndef TOKENIZERS_CPP_H_
 #define TOKENIZERS_CPP_H_
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -80,6 +81,14 @@ public:
    */
   virtual int32_t TokenToId(const std::string &token) = 0;
 
+  /**
+   * @brief Serialize tokenizer into a compact binary cache blob when supported.
+   *
+   * Tokenizer implementations that do not support binary caching return an
+   * empty string.
+   */
+  virtual std::string SerializeToCache() const { return ""; }
+
   //---------------------------------------------------
   // Factory functions from byte-blobs
   // These factory function takes in in-memory blobs
@@ -104,6 +113,40 @@ public:
   FromBlobByteLevelBPE(const std::string &vocab_blob,
                        const std::string &merges_blob,
                        const std::string &added_tokens = "");
+  /**
+   * @brief Create a compact native BPE tokenizer from a tokenizer.json blob.
+   *
+   * Unsupported BPE variants throw an exception so callers can fall back to the
+   * HuggingFace tokenizer.
+   */
+  static std::unique_ptr<Tokenizer>
+  FromBlobBPEJSON(const std::string &json_blob);
+
+  /**
+   * @brief Create a compact native BPE tokenizer from Quick.AI's cache blob.
+   */
+  static std::unique_ptr<Tokenizer>
+  FromBlobBPECache(const std::string &cache_blob);
+
+  /**
+   * @brief Create a WordPiece tokenizer from a vocab.txt-style blob.
+   *
+   * The vocabulary blob must contain one token per line. The line number is
+   * used as token id, matching BERT/TinyBERT vocab.txt files.
+   */
+  static std::unique_ptr<Tokenizer>
+  FromBlobWordPiece(const std::string &vocab_blob, bool do_lower_case = true,
+                    const std::string &unk_token = "[UNK]",
+                    const std::string &continuing_subword_prefix = "##",
+                    uint32_t max_input_chars_per_word = 100,
+                    const std::string &cls_token = "[CLS]",
+                    const std::string &sep_token = "[SEP]");
+
+  /**
+   * @brief Create a WordPiece tokenizer from Quick.AI's compact cache blob.
+   */
+  static std::unique_ptr<Tokenizer>
+  FromBlobWordPieceCache(const std::string &cache_blob);
   /**
    * @brief Create SentencePiece.
    *

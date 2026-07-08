@@ -1,6 +1,8 @@
 causallm_src = [
     meson.current_source_dir() / 'chat_template.cpp',
-    meson.current_source_dir() / 'huggingface_tokenizer.cpp',
+    meson.current_source_dir() / 'tokenizers' / 'huggingface_tokenizer.cpp',
+    meson.current_source_dir() / 'tokenizers' / 'bpe_tokenizer.cpp',
+    meson.current_source_dir() / 'tokenizers' / 'wordpiece_tokenizer.cpp',
     meson.current_source_dir() / 'llm_util.cpp',
     meson.current_source_dir() / 'api' / 'callback_streamer.cpp',
     meson.current_source_dir() / 'api' / 'causal_lm_api.cpp',
@@ -16,7 +18,7 @@ executable_src = [
 causallm_inc_abs = [meson.current_source_dir()]
 causallm_inc = [include_directories('.')]
 causallm_inc_minja_inc = include_directories('third_party/minja/include')
-causallm_inc_nlohmann_inc = include_directories('third_party')
+causallm_inc_nlohmann_inc = include_directories('third_party', 'third_party/nlohmann')
 
 # Build layer dependency
 causallm_layer_dependencies = []
