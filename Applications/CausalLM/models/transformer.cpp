@@ -10,7 +10,6 @@
  * @brief  This file defines Transformer's basic actions
  */
 
-#include <fstream>
 #include <mutex>
 
 #include <app_context.h>
@@ -18,7 +17,7 @@
 #include <model.h>
 
 #include <llm_util.hpp>
-#include <tokenizers_cpp.h>
+#include <tokenizer_loader.h>
 #include <transformer.h>
 
 #include <embedding_layer.h>
@@ -43,21 +42,6 @@ Transformer::formatFromExtension(const std::string &weight_path) {
       return ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS;
   }
   return ml::train::ModelFormat::MODEL_FORMAT_BIN;
-}
-
-std::string LoadBytesFromFile(const std::string &path) {
-  std::ifstream file(path, std::ios::binary | std::ios::ate);
-  if (!file.is_open()) {
-    throw std::runtime_error("Failed to open file: " + path);
-  }
-  std::streamsize size = file.tellg();
-  file.seekg(0, std::ios::beg);
-
-  std::string buffer(size, ' ');
-  if (!file.read(&buffer[0], size)) {
-    throw std::runtime_error("Failed to read file: " + path);
-  }
-  return buffer;
 }
 
 /**
@@ -118,8 +102,7 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
       nntr_cfg["tokenizer_file"].is_null()) {
     tokenizer = nullptr; // No tokenizer for this model
   } else {
-    tokenizer = tokenizers::Tokenizer::FromBlobJSON(
-      LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+    tokenizer = LoadTokenizer(nntr_cfg);
   }
 };
 
