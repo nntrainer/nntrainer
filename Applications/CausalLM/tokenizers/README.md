@@ -55,11 +55,13 @@ Caching applies only to the two formats implemented in this directory:
 `tokenizer_type` values are matched case-insensitively. When `tokenizer_type`
 is not set, the format is inferred from `tokenizer_file`: a `.txt` file or a
 filename containing `vocab` is treated as WordPiece; a `tokenizer.json` is
-inspected for a `WordPiece` or `BPE` model marker before either path is
-attempted. All other tokenizer formats (SentencePiece, RWKV World, generic
-byte-level BPE via `FromBlobByteLevelBPE`, or a `tokenizer.json` that does
-not match WordPiece/BPE) are handled by `huggingface_tokenizer.cpp` and are
-not cached.
+classified by reading its own `model.type` field directly (the same field
+the `tokenizers` library itself uses to decide how to parse the file), so
+detection matches the file's actual format rather than a filename or
+content heuristic. All other tokenizer formats (SentencePiece, RWKV World,
+generic byte-level BPE via `FromBlobByteLevelBPE`, or a `tokenizer.json`
+whose `model.type` is neither `WordPiece` nor `BPE`) are handled by
+`huggingface_tokenizer.cpp` and are not cached.
 
 ### Tokenizer format by model
 
@@ -92,7 +94,8 @@ The following keys are read from `nntr_config.json`, alongside
 | --- | --- | --- |
 | `tokenizer_file` | Yes | Path to the `tokenizer.json` or `vocab.txt` file. |
 | `tokenizer_type` | No | Forces `"wordpiece"` (or `"bert"` / `"tinybert"`) or `"bpe"` (or `"bytelevelbpe"`). If omitted, the type is detected automatically. |
-| `tokenizer_cache_file` | No | Overrides the cache file path. Defaults to `<tokenizer_file>.qaiwp` (WordPiece) or `<tokenizer_file>.qaibpe` (BPE). |
+| `tokenizer_cache` | No | Enables or disables caching entirely. Defaults to `true`. Set to `false` to always load from `tokenizer_file` and skip reading or writing a cache file. |
+| `tokenizer_cache_file` | No | Overrides the cache file path. Defaults to `<tokenizer_file>.qaiwp` (WordPiece) or `<tokenizer_file>.qaibpe` (BPE). Ignored when `tokenizer_cache` is `false`. |
 | `tokenizer_do_lower_case`, `tokenizer_unk_token`, `tokenizer_continuing_subword_prefix`, `tokenizer_max_input_chars_per_word`, `tokenizer_cls_token`, `tokenizer_sep_token` | No | WordPiece configuration overrides. Required only to override values already present in the tokenizer file. |
 
 Example, forcing WordPiece explicitly:
@@ -108,6 +111,19 @@ Example, forcing WordPiece explicitly:
 `tokenizer_type` is required only when automatic detection needs to be
 overridden; in most configurations it may be omitted.
 
+Example, disabling caching:
+
+```json
+{
+  "tokenizer_file": "tokenizer.json",
+  "tokenizer_cache": false
+}
+```
+
+This is useful when `tokenizer_file` lives on a read-only filesystem, or
+when a test/CI environment should not leave cache files behind as a side
+effect of running.
+
 ## Resetting the cache
 
 If the tokenizer file is edited or replaced in place and the change does
@@ -121,7 +137,9 @@ rm tokenizer.json.qaibpe   # or vocab.txt.qaiwp
 This step is not required under normal operation: the cache is rebuilt
 automatically whenever it is older than the tokenizer file, or whenever it
 fails to load (for example, due to corruption or a format mismatch).
-Manual deletion simply forces an immediate rebuild.
+Manual deletion simply forces an immediate rebuild. To stop cache files
+from being written at all, set `tokenizer_cache` to `false` instead (see
+Configuration above).
 
 ## Troubleshooting
 
@@ -165,19 +183,21 @@ Manual deletion simply forces an immediate rebuild.
 
 **Load order for a given `tokenizer_file`:**
 
-1. If a cache file exists and is not older than `tokenizer_file` (based on
-   an `mtime` comparison), it is deserialized directly, without any JSON
-   parsing.
-2. Otherwise, the tokenizer is built from source. For BPE, the native
-   tokenizer's output is cross-checked against the standard HF tokenizer
-   over a battery of conformance prompts before being trusted; on any
-   mismatch, the native result is discarded and the HF tokenizer is used
-   instead. WordPiece requires no such check, as the vocabulary format is
-   unambiguous.
-3. Once a native tokenizer is accepted, it is serialized and the cache
-   file is written for subsequent loads.
-4. If the tokenizer type cannot be confidently identified as WordPiece or
-   BPE, `LoadTokenizer` falls back directly to
+1. If `tokenizer_cache` is not `false`, and a cache file exists and is not
+   older than `tokenizer_file` (based on an `mtime` comparison), it is
+   deserialized directly, without any JSON parsing.
+2. Otherwise, the tokenizer is built from source. The format is chosen by
+   reading `tokenizer.json`'s own `model.type` field (or, for a non-JSON
+   file, by filename), not by `tokenizer_type` or any content heuristic.
+   For BPE, the native tokenizer's output is cross-checked against the
+   standard HF tokenizer over a battery of conformance prompts before
+   being trusted; on any mismatch, the native result is discarded and the
+   HF tokenizer is used instead. WordPiece requires no such check, as the
+   vocabulary format is unambiguous.
+3. If a native tokenizer is accepted and `tokenizer_cache` is not `false`,
+   it is serialized and the cache file is written for subsequent loads.
+4. If the tokenizer type cannot be identified as WordPiece or BPE,
+   `LoadTokenizer` falls back directly to
    `tokenizers::Tokenizer::FromBlobJSON()`, the same path used prior to
    the introduction of caching.
 
