@@ -220,6 +220,7 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     nntrainer::TensorDim({1, 1, 1, out_dim}, hidden_.getTensorType());
 
   if (!(weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0 ||
+        weight.getDataType() == nntrainer::TensorDim::DataType::Q8_0 ||
         weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K ||
         weight.getDataType() == nntrainer::TensorDim::DataType::FP32))
     throw std::invalid_argument(
@@ -278,6 +279,23 @@ void TieWordEmbedding::incremental_forwarding_embedding(
             nntrainer::dequantize_row_q6_K(src, tmp.getData(), out_dim);
           else
             nntrainer::dequantize_row_q4_0(src, tmp.getData(), out_dim);
+          out_tensor.copyData(tmp);
+        }
+      } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q8_0) {
+        ///@note this should be replaced with quantizer operation
+        // Each block_q8_0 is 34 bytes: one fp16 scale + 32 int8 quants.
+        const int num_blocks_per_row = (weight.width() + 32 - 1) / 32;
+        const void *src = (void *)((char *)weight.getData<uint8_t>() +
+                                   (34 * num_blocks_per_row) * embed_idx);
+        if (out_tensor.getDataType() == nntrainer::TensorDim::DataType::FP32) {
+          nntrainer::dequantize_row_q8_0(src, out_tensor.getData(), out_dim);
+        } else {
+          nntrainer::TensorDim fp32_dim(
+            {1, 1, 1, out_dim}, nntrainer::TensorDim::TensorType(
+                                  out_tensor_dim.getFormat(),
+                                  nntrainer::TensorDim::DataType::FP32));
+          nntrainer::Tensor tmp(fp32_dim, true);
+          nntrainer::dequantize_row_q8_0(src, tmp.getData(), out_dim);
           out_tensor.copyData(tmp);
         }
       } else {
@@ -385,6 +403,48 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
           const void *wrow =
             static_cast<const void *>(weight_data + row_stride * row);
           nntrainer::dequantize_row_q4_0(wrow, dequant_row.data(), hidden_size);
+          logits[row] =
+            nntrainer::sdot(hidden_size, input_data, 1, dequant_row.data(), 1);
+        }
+      });
+    } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q8_0) {
+      ///@note Like Q4_0, the Q8_0 Qn_K dot does NOT transpose the block data for
+      /// the [vocab, hidden] tied layout, so compute each vocab row explicitly:
+      /// logits[v] = dot(input, dequant(weight_row_v)).
+      const unsigned int hidden_size = input_step.width();
+      const unsigned int vocab_size = weight.height();
+      NNTR_THROW_IF(weight.width() != hidden_size ||
+                      hidden_step.width() != vocab_size,
+                    std::invalid_argument)
+        << "Q8_0 tie word embedding lmhead has mismatched dimensions";
+
+      const unsigned int num_blocks_per_row = (hidden_size + 32 - 1) / 32;
+      // Each block_q8_0 is 34 bytes: one fp16 scale + 32 int8 quants.
+      const size_t row_stride = (sizeof(uint16_t) + 32) * num_blocks_per_row;
+      const uint8_t *weight_data = weight.getData<uint8_t>();
+
+      // The activation may be FP16; sdot/dequant work in FP32, so cast the
+      // single input row up to FP32 once (no-op when already FP32).
+      nntrainer::Tensor input_fp32 =
+        (input_step.getDataType() == nntrainer::TensorDim::DataType::FP32)
+          ? input_step
+          : input_step.clone(nntrainer::TensorDim::DataType::FP32);
+      const float *input_data = input_fp32.getData<float>();
+      float *logits = hidden_step.getData<float>();
+
+      auto &tm = nntrainer::ThreadManager::Global();
+      const unsigned int compute_thread_num = tm.getComputeThreadCount();
+      const unsigned int thread_num =
+        compute_thread_num == 0 ? 1 : compute_thread_num;
+      tm.parallel_for(0, static_cast<size_t>(thread_num), [=](size_t t) {
+        const unsigned int start = (t * vocab_size) / thread_num;
+        const unsigned int end = ((t + 1) * vocab_size) / thread_num;
+        std::vector<float> dequant_row(hidden_size);
+
+        for (unsigned int row = start; row < end; ++row) {
+          const void *wrow =
+            static_cast<const void *>(weight_data + row_stride * row);
+          nntrainer::dequantize_row_q8_0(wrow, dequant_row.data(), hidden_size);
           logits[row] =
             nntrainer::sdot(hidden_size, input_data, 1, dequant_row.data(), 1);
         }
@@ -514,6 +574,21 @@ void TieWordEmbedding::save(std::ofstream &file,
               nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                              {nntrainer::Tformat::NCHW, dtype});
               nntrainer::quantize_q4_0(weight.getData<float>(),
+                                       quant_weight.getData<uint8_t>(), K, N,
+                                       nullptr);
+              quant_weight.save(file);
+            }
+          } else if (dtype == nntrainer::TensorDim::DataType::Q8_0) {
+            if (K == 1) {
+              weight.save(file);
+            } else {
+              NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
+                << "Q8_0 embedding quantization requires width to be "
+                   "divisible by 32, but got width="
+                << N;
+              nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                             {nntrainer::Tformat::NCHW, dtype});
+              nntrainer::quantize_q8_0(weight.getData<float>(),
                                        quant_weight.getData<uint8_t>(), K, N,
                                        nullptr);
               quant_weight.save(file);

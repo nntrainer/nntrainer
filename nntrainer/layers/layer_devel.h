@@ -411,6 +411,34 @@ public:
                             quant_weight.size(), N, K, target_isa);
                 quant_weight.save(file);
               }
+            } else if (dtype == TensorDim::DataType::Q8_0) {
+              NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
+                            std::runtime_error)
+                << "Save with quantization only supports for FP32 weight.";
+              TensorDim dim = weight.getDim();
+              unsigned int K = dim.height();
+              unsigned int N = dim.width();
+
+              // Skip quantization for bias-like tensors (1D with height == 1)
+              // as they are not suitable for Q8_0 block quantization
+              if (K == 1) {
+                weight.save(file);
+              } else {
+                NNTR_THROW_IF(N % 32 != 0 || K % 32 != 0, std::invalid_argument)
+                  << "Q8_0 quantization requires both width and height to be "
+                     "divisible by 32, but got height="
+                  << K << ", width=" << N;
+
+                Tensor weight_t = weight.transpose("0:2:1");
+                Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                    {Tformat::NCHW, dtype});
+                // Q8_0 uses the native GGML block_q8_0 row layout directly (no
+                // ISA-specific repack); the FP32-activation GEMM reads it via
+                // gemm_q8_0_fp32 (see FloatTensor::dotQnK).
+                quantize_q8_0(weight_t.getData<float>(),
+                              quant_weight.getData<uint8_t>(), N, K, nullptr);
+                quant_weight.save(file);
+              }
             } else if (dtype == TensorDim::DataType::QS4CX) {
               NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
                             std::runtime_error)

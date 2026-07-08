@@ -711,6 +711,27 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
           nntrainer::dequantize_row_q4_0(src, tmp.getData(), out_dim);
           out_tensor.copyData(tmp);
         }
+      } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q8_0) {
+        ///@note this should be replaced with quantizer operation
+        // Each block_q8_0 is 34 bytes: one fp16 scale + 32 int8 quants.
+        int num_blocks_per_row = (weight.width() + 32 - 1) / 32;
+        const void *src = (void *)((char *)weight.getData<uint8_t>() +
+                                   (34 * num_blocks_per_row) * embed_idx);
+        if (out_tensor.getDataType() == nntrainer::TensorDim::DataType::FP32) {
+          nntrainer::dequantize_row_q8_0(src, out_tensor.getData(), out_dim);
+        } else {
+          // dequantize_row_* writes FP32; under a non-FP32 (e.g. FP16)
+          // activation, writing straight into out_tensor corrupts the embedding
+          // (and overruns the buffer by 2x). Dequantize into an FP32 temp then
+          // cast into the activation dtype.
+          nntrainer::TensorDim fp32_dim(
+            {1, 1, 1, out_dim}, nntrainer::TensorDim::TensorType(
+                                  out_tensor_dim.getFormat(),
+                                  nntrainer::TensorDim::DataType::FP32));
+          nntrainer::Tensor tmp(fp32_dim, true);
+          nntrainer::dequantize_row_q8_0(src, tmp.getData(), out_dim);
+          out_tensor.copyData(tmp);
+        }
       } else {
         out_tensor.copyData(cur_weight);
       }
@@ -782,6 +803,28 @@ void EmbeddingLayer::save(std::ofstream &file,
             nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                            {nntrainer::Tformat::NCHW, dtype});
             nntrainer::quantize_q4_0(weight.getData<float>(),
+                                     quant_weight.getData<uint8_t>(), K, N,
+                                     nullptr);
+            quant_weight.save(file);
+          }
+        } else if (dtype == nntrainer::TensorDim::DataType::Q8_0) {
+
+          // Skip quantization for bias-like tensors (1D with height == 1)
+          // as they are not suitable for Q8_0 block quantization
+          if (K == 1) {
+            weight.save(file);
+          } else {
+            NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
+              << "Q8_0 embedding quantization requires width to be "
+                 "divisible by 32, but got width="
+              << N;
+            //////////////////////////////////////////////////////////////////
+            ///@note Please note that Embedding layer doesn't need to be
+            /// transposed!
+            //////////////////////////////////////////////////////////////////
+            nntrainer::Tensor quant_weight(dim.batch(), dim.channel(), K, N,
+                                           {nntrainer::Tformat::NCHW, dtype});
+            nntrainer::quantize_q8_0(weight.getData<float>(),
                                      quant_weight.getData<uint8_t>(), K, N,
                                      nullptr);
             quant_weight.save(file);
