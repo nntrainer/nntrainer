@@ -165,6 +165,24 @@ public:
 };
 
 /**
+ * @brief CrossAttention property
+ * @note When true, the layer runs in static read-only cross-attention mode
+ *       (Option B): inputs 3/4 (cache_key/cache_value) are treated as a
+ *       fully-populated encoder K/V cache of @c enc_len rows; the query
+ *       (input 0) attends over ALL @c enc_len cached rows, inputs 1/2 (K/V)
+ *       are NOT written into the cache, and cache_index is NOT advanced.
+ *       Only meaningful in external-cache (5-input) mode. Default false so
+ *       existing self-attention callers see byte-identical behaviour.
+ */
+class CrossAttention : public nntrainer::Property<bool> {
+public:
+  CrossAttention(bool value = false) { set(value); };
+  static constexpr const char *key =
+    "cross_attention";                       /**< unique key to access */
+  using prop_tag = nntrainer::bool_prop_tag; /**< property type */
+};
+
+/**
  * @brief RopeScalingType
  * - default
  * - yarn
@@ -372,7 +390,7 @@ private:
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopePartialRotaryFactor,
     props::RopeScalingMaxPositionEmbeddings, props::AttnLogitSoftcapping,
-    props::IsCausal, props::UseGemmAttention>
+    props::IsCausal, props::UseGemmAttention, props::CrossAttention>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -403,6 +421,12 @@ private:
   bool is_causal;
   bool use_gemm_attention = false;
   bool skip_prefill = false;
+  /**
+   * @brief static read-only cross-attention mode (Option B). See
+   *        props::CrossAttention. Default false; guards every cross-attn change
+   *        so self-attention callers are unaffected.
+   */
+  bool cross_attention = false;
 
   enum INOUT_INDEX {
     /** input index */

@@ -90,6 +90,9 @@
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include "siglip2/siglip2_vision_encoder.h"
+#if !defined(_WIN32)
+#include "bert_decoder/bert_decoder.h"
+#endif
 
 using json = nlohmann::json;
 using DataType = ml::train::TensorDim::DataType;
@@ -376,6 +379,19 @@ void registerAllModels() {
         cfg, generation_cfg, nntr_cfg);
     });
 #endif
+#if !defined(_WIN32)
+  factory.registerModel(
+    "BertDecoder", [](json cfg, json generation_cfg, json nntr_cfg) {
+      // BertDecoder hardcodes its dimensions; tensor dtypes come from
+      // nntr_config (FP32 for the source model). The graph is built FP32 to
+      // load FP32 weights; quantization happens at save via the dtype map.
+      auto dec = std::make_unique<causallm::BertDecoder>();
+      dec->setTensorTypes(nntr_cfg.value("model_tensor_type", "FP32-FP32"),
+                          nntr_cfg.value("fc_layer_dtype", "FP32"),
+                          nntr_cfg.value("embedding_dtype", "FP32"));
+      return dec;
+    });
+#endif
 }
 
 /**
@@ -569,6 +585,63 @@ std::map<std::string, DataType> buildEncoderLayerDtypeMap(int enc_layers,
 }
 
 /**
+ * @brief Build the layer_dtype_map for the BERT cross-attention decoder.
+ *
+ * The QWEN-style names produced by buildLayerDtypeMap() do NOT match the
+ * decoder layer names, so this builds the exact FC / embedding names emitted by
+ * bert_decoder.cpp.
+ *
+ * Decoder FCs (per layer i in [0, dec_layers), -> fc_dtype):
+ *   dec_layer{i}_self_q, _self_k, _self_v, _self_out,
+ *   dec_layer{i}_cross_q, _cross_k, _cross_v, _cross_out,
+ *   dec_layer{i}_ffn_inter, _ffn_out
+ * plus the LM-head transform FC lmhead_dense.
+ *
+ * Embeddings (-> embd_dtype): word_emb / pos_emb / type_emb embedding_layer
+ * lookup tables. The embedding_layer supports Q4_0/Q8_0 and Q6_K lookup/save
+ * (Q4_0/Q8_0 need width % 32 == 0 — BD_DIM = 256, OK), so embd_dtype is fully
+ * configurable (FP32 / Q4_0 / Q8_0 / Q6_K) via --embd_dtype.
+ *
+ * Deliberately left FP32: all LayerNorms (emb_ln, *_self_ln, *_cross_ln,
+ * *_ffn_ln, lmhead_ln), lm_head_proj (tied to word_emb) and lmhead_bias.
+ */
+std::map<std::string, DataType> buildDecoderLayerDtypeMap(int dec_layers,
+                                                          DataType fc_dtype,
+                                                          DataType embd_dtype) {
+  std::map<std::string, DataType> dtype_map;
+
+  const bool quant_fc =
+    fc_dtype != DataType::FP32 && fc_dtype != DataType::NONE;
+  const bool quant_embd =
+    embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE;
+
+  if (quant_fc) {
+    for (int i = 0; i < dec_layers; ++i) {
+      const std::string pfx = "dec_layer" + std::to_string(i);
+      dtype_map[pfx + "_self_q"] = fc_dtype;
+      dtype_map[pfx + "_self_k"] = fc_dtype;
+      dtype_map[pfx + "_self_v"] = fc_dtype;
+      dtype_map[pfx + "_self_out"] = fc_dtype;
+      dtype_map[pfx + "_cross_q"] = fc_dtype;
+      dtype_map[pfx + "_cross_k"] = fc_dtype;
+      dtype_map[pfx + "_cross_v"] = fc_dtype;
+      dtype_map[pfx + "_cross_out"] = fc_dtype;
+      dtype_map[pfx + "_ffn_inter"] = fc_dtype;
+      dtype_map[pfx + "_ffn_out"] = fc_dtype;
+    }
+    dtype_map["lmhead_dense"] = fc_dtype;
+  }
+
+  if (quant_embd) {
+    dtype_map["word_emb"] = embd_dtype;
+    dtype_map["pos_emb"] = embd_dtype;
+    dtype_map["type_emb"] = embd_dtype;
+  }
+
+  return dtype_map;
+}
+
+/**
  * @brief Add SentenceTransformer module dtype overrides to the dtype map
  */
 void addSentenceTransformerLayerDtypes(std::map<std::string, DataType> &map,
@@ -751,15 +824,20 @@ int main(int argc, char *argv[]) {
     std::string architecture =
       cfg["architectures"].get<std::vector<std::string>>()[0];
 
-    // The SigLIP2 vision encoder nests its layer count under cfg["encoder"]
-    // when a combined config.json is reused; fall back to the top-level field
-    // for a flat encoder config.
+    // The SigLIP2 vision encoder nests its layer count under cfg["encoder"] and
+    // the BERT decoder under cfg["decoder"] when a combined config.json is
+    // reused; fall back to the top-level field for a flat config.
     const bool is_encoder = (architecture == "Siglip2VisionEncoder");
+    const bool is_decoder = (architecture == "BertDecoder");
     int num_layers = 0;
     if (is_encoder) {
       num_layers = cfg.contains("encoder")
                      ? cfg.at("encoder").value("num_hidden_layers", 12)
                      : cfg.value("num_hidden_layers", 12);
+    } else if (is_decoder) {
+      num_layers = cfg.contains("decoder")
+                     ? cfg.at("decoder").value("num_hidden_layers", 4)
+                     : cfg.value("num_hidden_layers", 4);
     } else {
       num_layers = cfg["num_hidden_layers"].get<int>();
     }
@@ -839,6 +917,11 @@ int main(int argc, char *argv[]) {
       // FP32). embd_dtype is unused (the encoder has no embedding lookup
       // table).
       layer_dtype_map = buildEncoderLayerDtypeMap(num_layers, fc_dtype);
+    } else if (is_decoder) {
+      // BERT decoder: FCs -> fc_dtype, word/pos/type embeddings -> embd_dtype
+      // (Q4_0/Q8_0 or Q6_K), LayerNorms/tied-LM-head stay FP32.
+      layer_dtype_map =
+        buildDecoderLayerDtypeMap(num_layers, fc_dtype, embd_dtype);
     } else {
       layer_dtype_map = buildLayerDtypeMap(num_layers, fc_dtype, embd_dtype,
                                            lmhead_dtype, include_lmhead);
