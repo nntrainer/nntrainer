@@ -224,7 +224,16 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
     normalize_axes.size() == 1 &&
     normalize_axes[0] == ml::train::TensorDim::getNumDim() - 1;
 
-  if (deviation.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+  // The FP32 rms_norm_wrt_width_fp16_intrinsic overload is a deprecated stub on
+  // every backend (ARM neon_impl_fp16.cpp and x86 fallback both throw
+  // "deprecated due to overflow in fp16"). So it must never be taken for FP32
+  // tensors; force the generic, numerically-correct path. This makes FP32 Layer
+  // Normalization work on ENABLE_FP16 builds (e.g. Android arm64). The FP16
+  // (non-FP32) tensor case still uses the generic fallback below as before.
+  constexpr bool kFp32WidthNormIntrinsicAvailable = false;
+
+  if (kFp32WidthNormIntrinsicAvailable &&
+      deviation.getDataType() == ml::train::TensorDim::DataType::FP32 &&
       width_axis_only) {
     const unsigned int W = input_dim.width();
     const unsigned int row_dim_v = input_dim.height();

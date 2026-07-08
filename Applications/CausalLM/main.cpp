@@ -53,6 +53,7 @@
 #include "qwen3_embedding.h"
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
+#include "siglip2/siglip2_vision_encoder.h"
 #include "timm_vit/timm_vit_transformer.h"
 #include <models/gemma3/function.h>
 #if !defined(_WIN32)
@@ -210,6 +211,124 @@ std::string resolve_architecture(std::string model_type,
 }
 
 /**
+ * @brief Minimal .npy float32 reader (skips the header, reads `count` floats).
+ */
+static std::vector<float> readNpyF32(const std::string &path, size_t count) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in)
+    throw std::runtime_error("Cannot open npy: " + path);
+  char magic[8];
+  in.read(magic, 8);
+  if (magic[0] != '\x93' || std::string(magic + 1, 5) != "NUMPY")
+    throw std::runtime_error("Not a .npy file: " + path);
+  uint16_t hlen = 0;
+  in.read(reinterpret_cast<char *>(&hlen), 2);
+  in.seekg(hlen, std::ios::cur);
+  std::vector<float> data(count);
+  in.read(reinterpret_cast<char *>(data.data()),
+          static_cast<std::streamsize>(count * sizeof(float)));
+  if (!in)
+    throw std::runtime_error("Short read from npy: " + path);
+  return data;
+}
+
+/**
+ * @brief Minimal .npy float32 writer (C-order, shape given as e.g. "(1, 196,
+ *        256)"). Pads the header so the data block is 64-byte aligned.
+ */
+static void writeNpyF32(const std::string &path, const std::vector<float> &data,
+                        const std::string &shape) {
+  std::ofstream out(path, std::ios::binary);
+  out.write("\x93NUMPY\x01\x00", 8);
+  std::string header =
+    "{'descr': '<f4', 'fortran_order': False, 'shape': " + shape + ", }\n";
+  while ((8 + 2 + header.size()) % 64 != 0)
+    header.insert(header.size() - 1, 1, ' ');
+  uint16_t hlen = static_cast<uint16_t>(header.size());
+  out.write(reinterpret_cast<const char *>(&hlen), 2);
+  out.write(header.c_str(), static_cast<std::streamsize>(header.size()));
+  out.write(reinterpret_cast<const char *>(data.data()),
+            static_cast<std::streamsize>(data.size() * sizeof(float)));
+}
+
+/**
+ * @brief --dump-encoder handler: run Siglip2VisionEncoder and dump its
+ *        [1, num_patches, ENC_TO_DEC_DIM] output to nntr_encoder_hidden.npy.
+ *        Pixel/output shapes are derived from the model config (image_size) and
+ *        the projection dim, not a fixed resolution. Optional --input-pixels
+ *        <npy> feeds a [1, 3, image_size, image_size] tensor (bypassing the C++
+ *        resize) so the encoder math can be compared against a golden on
+ *        identical pixels.
+ * Usage: --dump-encoder <model_dir> [--input-pixels <npy>] [image]
+ */
+static int runDumpEncoder(int argc, char *argv[]) {
+  const std::string dir = argv[2];
+  std::string pixel_npy, image;
+  for (int i = 3; i < argc; ++i) {
+    if (std::string(argv[i]) == "--input-pixels" && i + 1 < argc)
+      pixel_npy = argv[++i];
+    else
+      image = argv[i];
+  }
+  if (image.empty())
+    image = dir + "/sample.png";
+
+  try {
+    json cfg = causallm::LoadJsonFile(dir + "/config.json");
+    json gen_cfg = json::object();
+    json nntr_cfg = causallm::LoadJsonFile(dir + "/nntr_config.json");
+    if (!nntr_cfg.contains("model_type"))
+      nntr_cfg["model_type"] = "Model";
+    if (!nntr_cfg.contains("skip_tokenizer"))
+      nntr_cfg["skip_tokenizer"] = true;
+
+    // Prefer model_file_name (the quantizer rewrites it to the quantized bin);
+    // fall back to encoder_model_file_name for the FP32 config.
+    const std::string weight_name =
+      nntr_cfg.contains("model_file_name")
+        ? nntr_cfg["model_file_name"].get<std::string>()
+        : nntr_cfg["encoder_model_file_name"].get<std::string>();
+
+    auto enc =
+      std::make_unique<causallm::Siglip2VisionEncoder>(cfg, gen_cfg, nntr_cfg);
+    enc->initialize();
+    enc->load_weight(dir + "/" + weight_name);
+
+    std::vector<float> out;
+    if (!pixel_npy.empty()) {
+      // [1,3,img,img] derived from the encoder's image_size (config-driven, not
+      // tied to any fixed checkpoint resolution).
+      const json &enc_cfg = cfg.contains("encoder") ? cfg["encoder"] : cfg;
+      const size_t img =
+        enc_cfg.value("image_size", nntr_cfg.value("img_size", 224u));
+      const size_t pixels = 3u * img * img;
+      auto px = readNpyF32(pixel_npy, pixels);
+      out = enc->encodePixels(px.data(), px.size());
+    } else {
+      out = enc->encode(image);
+    }
+
+    std::cout << "[dump-encoder] first 5:";
+    for (size_t i = 0; i < 5 && i < out.size(); ++i)
+      std::cout << " " << out[i];
+    std::cout << "\n";
+
+    // Output is [1, num_patches, ENC_TO_DEC_DIM]; derive the shape from the
+    // projection dim and the actual element count (no hardcoded resolution).
+    const size_t dim = causallm::Siglip2VisionEncoder::ENC_TO_DEC_DIM;
+    const std::string shape = "(1, " + std::to_string(out.size() / dim) + ", " +
+                              std::to_string(dim) + ")";
+    writeNpyF32("nntr_encoder_hidden.npy", out, shape);
+    std::cout << "Dumped encoder output to nntr_encoder_hidden.npy ("
+              << out.size() << " floats, shape " << shape << ")\n";
+    return EXIT_SUCCESS;
+  } catch (const std::exception &e) {
+    std::cerr << "[!] FATAL ERROR (--dump-encoder): " << e.what() << "\n";
+    return EXIT_FAILURE;
+  }
+}
+
+/**
  * @brief Entry point for loading, initializing, and running a CausalLM model.
  */
 int main(int argc, char *argv[]) {
@@ -306,6 +425,11 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::TimmViTTransformer>(cfg, generation_cfg,
                                                             nntr_cfg);
     });
+  causallm::Factory::Instance().registerModel(
+    "Siglip2VisionEncoder", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Siglip2VisionEncoder>(
+        cfg, generation_cfg, nntr_cfg);
+    });
 
   // Validate arguments
   if (argc < 2) {
@@ -315,6 +439,9 @@ int main(int argc, char *argv[]) {
                  "chat_input if omitted)\n";
     return EXIT_FAILURE;
   }
+
+  if (argc >= 3 && std::string(argv[1]) == "--dump-encoder")
+    return runDumpEncoder(argc, argv);
 
   const std::string model_path = argv[1];
   std::string input_text;
