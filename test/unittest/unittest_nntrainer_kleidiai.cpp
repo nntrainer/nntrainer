@@ -10,6 +10,7 @@
 
 #include <cfloat>
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <numeric>
 #include <random>
@@ -210,6 +211,20 @@ INSTANTIATE_TEST_SUITE_P(
   });
 
 /**
+ * @brief Clean and invalidate the given buffer from the caches.
+ */
+static void evict_from_caches(const void *buf, size_t bytes) {
+  // align down to the line base so the last line is covered even when
+  // buf is not 64B-aligned
+  uintptr_t p = reinterpret_cast<uintptr_t>(buf) & ~static_cast<uintptr_t>(63);
+  const uintptr_t end = reinterpret_cast<uintptr_t>(buf) + bytes;
+  for (; p < end; p += 64) {
+    __asm__ volatile("dc civac, %0" ::"r"(p) : "memory");
+  }
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+
+/**
  * @brief Benchmark comparison of three GEMM implementations
  *
  * Compares latency of:
@@ -271,14 +286,20 @@ void run_gemm_benchmark_comparison(const size_t M, const size_t N,
   // ============================================================
   // Benchmark: gemm_q4_0<float>
   // ============================================================
+
+  // Keep the RHS cold, LHS warm as in inference:
+  // - For each iteration, RHS will be evicted from caches before running gemm.
+  // - LHS will stay as it is.
   nanoseconds total_time_q4_0 = nanoseconds(0);
   for (size_t i = 0; i < warmup_iters; ++i) {
+    evict_from_caches(q4_0_repacked_qWeight.data(), q4_0_data_size);
     nntrainer::gemm_q4_0<float>(M, N, K, activation.data(), K,
                                 (void *)q4_0_repacked_qWeight.data(), N,
                                 dst_q4_0.data(), N);
   }
 
   for (size_t i = 0; i < test_iters; ++i) {
+    evict_from_caches(q4_0_repacked_qWeight.data(), q4_0_data_size);
     auto t1 = steady_clock::now();
     nntrainer::gemm_q4_0<float>(M, N, K, activation.data(), K,
                                 (void *)q4_0_repacked_qWeight.data(), N,
@@ -290,8 +311,7 @@ void run_gemm_benchmark_comparison(const size_t M, const size_t N,
   // ============================================================
   // Benchmark: qai8dxp_qsi4cxp_packed
   // ============================================================
-  std::vector<nanoseconds> total_time_qai8dxp;
-  total_time_qai8dxp.reserve(num_idx_variants);
+  std::vector<nanoseconds> total_time_qai8dxp(num_idx_variants, nanoseconds(0));
 
   for (size_t idx_variant = 0; idx_variant < num_idx_variants; idx_variant++) {
     // rhs pack
@@ -299,8 +319,13 @@ void run_gemm_benchmark_comparison(const size_t M, const size_t N,
       N, K, packed_weight_qai8dxp.data(), rhs_native_mtx_qs4cx.data(),
       rhs_scales_f32.data(), idx_variant, true);
 
+    // cold-RHS eviction, same scheme as the q4_0 benchmark above
+    const size_t rhs_packed_size =
+      nntrainer::get_rhs_packed_size_qsi4cxp_qs4cxs1s0(N, K, idx_variant, true);
+
     // warm up
     for (size_t i = 0; i < warmup_iters; ++i) {
+      evict_from_caches(packed_weight_qai8dxp.data(), rhs_packed_size);
       nntrainer::gemm_qai8dxp_qsi4cxp(M, N, K, activation.data(),
                                       packed_weight_qai8dxp.data(),
                                       dst_qai8dxp.data(), idx_variant);
@@ -309,6 +334,7 @@ void run_gemm_benchmark_comparison(const size_t M, const size_t N,
     nanoseconds local_time = nanoseconds(0);
 
     for (size_t i = 0; i < test_iters; ++i) {
+      evict_from_caches(packed_weight_qai8dxp.data(), rhs_packed_size);
       auto t1 = steady_clock::now();
       nntrainer::gemm_qai8dxp_qsi4cxp(M, N, K, activation.data(),
                                       packed_weight_qai8dxp.data(),
@@ -342,11 +368,13 @@ void run_gemm_benchmark_comparison(const size_t M, const size_t N,
   }
 }
 
-TEST(nntrainer_kleidiai, gemm_benchmark_comparison_1x2560x4096) {
+// Benchmarks, not correctness tests: DISABLED from the default
+// Run on demand with `--bench`
+TEST(nntrainer_kleidiai, DISABLED_gemm_benchmark_comparison_1x2560x4096) {
   run_gemm_benchmark_comparison(1, 2560, 4096);
 }
 
-TEST(nntrainer_kleidiai, gemm_benchmark_comparison_1024x2560x4096) {
+TEST(nntrainer_kleidiai, DISABLED_gemm_benchmark_comparison_1024x2560x4096) {
   run_gemm_benchmark_comparison(1024, 2560, 4096);
 }
 
@@ -468,6 +496,18 @@ int main(int argc, char **argv) {
   } catch (...) {
     std::cerr << "Error during InitGoogleTest" << std::endl;
     return 0;
+  }
+
+  // `--bench`: run the DISABLED_ benchmark tests
+  // When it is applied, filter is narrowed to the benchmarks only.
+  // It can be overriden by `--gtest_filter` option.
+  for (int i = 1; i < argc; i++) {
+    if (std::string(argv[i]) == "--bench") {
+      ::testing::GTEST_FLAG(also_run_disabled_tests) = true;
+      if (::testing::GTEST_FLAG(filter) == "*") {
+        ::testing::GTEST_FLAG(filter) = "*gemm_benchmark*";
+      }
+    }
   }
 
   try {
