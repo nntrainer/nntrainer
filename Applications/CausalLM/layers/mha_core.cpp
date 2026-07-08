@@ -225,11 +225,13 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
   use_gemm_attention = std::get<props::UseGemmAttention>(mha_core_props).get();
-#if !(ENABLE_FP16 && defined(__ANDROID__))
-  // The GEMM / flash-attention path (gemm_attention) is built and verified
-  // only for the ARM FP16 device build. On x86 / non-FP16 builds the AVX2
-  // flash path is unvalidated and NaNs on the wide V-JEPA encoder logits, so
-  // fall back to the reference attention kernels there.
+#if !defined(NNTR_ENABLE_GEMM_ATTENTION)
+  // The GEMM / flash-attention fast path (gemm_attention) depends on the FP16
+  // micro-kernels hgemm_f16xf16_f32_fmlal / hsgemm_fp16bits_avx2, which are
+  // only *declared* (cpu_backend_gemm_decl.h) and not yet defined in any build,
+  // so it cannot link on x86 or ARM. Keep it disabled (opt-in via
+  // NNTR_ENABLE_GEMM_ATTENTION once those kernels land) and always fall back to
+  // the reference attention kernels.
   use_gemm_attention = false;
 #endif
 
@@ -780,9 +782,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   // minimum prefill length: for decode (step_size == 1) the per-row dot
   // path is preferred (no benefit from blocking + softmax bookkeeping).
   constexpr unsigned int FLASH_MIN_PREFILL = 32;
-#if (ENABLE_FP16 && defined(__ANDROID__))
-  // gemm_attention() is only built/verified for the ARM FP16 device build; on
-  // other builds use_gemm_attention is forced false above so this path is dead.
+#if defined(NNTR_ENABLE_GEMM_ATTENTION)
+  // gemm_attention() depends on FP16 micro-kernels that are not yet defined in
+  // any build; use_gemm_attention is forced false above so this path is dead
+  // unless NNTR_ENABLE_GEMM_ATTENTION is defined once those kernels exist.
   if (use_gemm_attention && step_size >= FLASH_MIN_PREFILL) {
     gemm_attention(query_step, b_cached_key, b_cached_value,
                    attention_output_step, cache_to, step_size, cache_from);
@@ -807,11 +810,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                 cache_to);
 }
 
-#if (ENABLE_FP16 && defined(__ANDROID__))
-// gemm_attention() (GEMM / flash-attention path) is built and verified only for
-// the ARM FP16 device build; it calls the FP16 AVX2/NEON micro-kernels that are
-// compiled only there. On other builds use_gemm_attention is forced false, so
-// the definition is compiled out to avoid an undefined-symbol link error.
+#if defined(NNTR_ENABLE_GEMM_ATTENTION)
+// gemm_attention() (GEMM / flash-attention path) calls the FP16 micro-kernels
+// hgemm_f16xf16_f32_fmlal / hsgemm_fp16bits_avx2, which are only declared
+// (cpu_backend_gemm_decl.h) and not defined in any current build. The
+// definition is therefore compiled out by default to avoid an undefined-symbol
+// link error; define NNTR_ENABLE_GEMM_ATTENTION to build it once the kernels
+// are available.
 void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
                                   nntrainer::Tensor &b_cached_key,
                                   nntrainer::Tensor &b_cached_value,
