@@ -162,7 +162,9 @@ makeGptOssCase(const causallm_test::TinyCausalLMDataType &data_type) {
     "GptOss_" + data_type.name,
     data_type,
     {"hello tok4", makeExpectedGptOssLogits(),
-     data_type.name == "FP32" ? 1e-4f : 1e-3f},
+     data_type.name == "FP32"       ? 1e-4f
+     : data_type.name == "Q40_FP16" ? 2e-3f
+                                    : 1e-3f},
     makeTinyGptOssConfig,
     makeGptOssLayerDtypeMap,
     [](causallm::json &cfg, causallm::json &generation_cfg,
@@ -215,8 +217,9 @@ TEST_P(GptOssTinyModelTest, PromptProducesExpectedLogits) {
   causallm_test::expectPromptProducesExpectedLogits(GetParam(), files);
 }
 
-// Q4_0 variant is omitted — GptOssMoELayer uses ThreadManager::parallel_for
-// which deadlocks when four model instances run sequentially in the same
+// Q4_0 and Q4_0-FP16 variants are omitted — GptOssMoELayer uses
+// ThreadManager::parallel_for which deadlocks or produces non-deterministic
+// results when multiple model instances run inference sequentially in the same
 // process.  See unittest_causallm_qwen3_moe.cpp for details.
 INSTANTIATE_TEST_SUITE_P(
   GptOss, GptOssTinyModelTest,

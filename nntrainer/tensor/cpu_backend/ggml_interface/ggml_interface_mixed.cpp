@@ -31,7 +31,8 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_GEMV(
   int NB_COLS = 4;
   int blocks_per_row = (K + QK8_0 - 1) / QK8_0;
   int qa_size = sizeof(block_q8_0) * blocks_per_row;
-  std::vector<char> QA = std::vector<char>(qa_size);
+  thread_local std::vector<char> QA;
+  QA.resize(static_cast<size_t>(qa_size));
 
   auto qa_data = QA.data();
 
@@ -53,7 +54,7 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_GEMV(
 
     nntr_gemv_q4_0_4x8_q8_0(K, (float *)(C + M_step_start), N,
                             (void *)((char *)B + M_step_start * B_step),
-                            QA.data(), M, M_step_end - M_step_start);
+                            qa_data, M, M_step_end - M_step_start);
   });
 }
 
@@ -72,11 +73,11 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_GEMM(
   unsigned int qa_size = qa_4_rows_size * (((M >> 2) << 2) / 4 + 1);
   std::vector<char> QA = std::vector<char>(qa_size);
 
-  // Quantize 4-divisible-M row portion with matrix-wise function
-  for (unsigned int i = 0; i < M4; i++) {
+  // Quantize 4-divisible-M row portion with matrix-wise function (parallel)
+  tm.parallel_for(0, static_cast<size_t>(M4), [=, &QA](size_t i) {
     nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
                                K);
-  }
+  });
   // Quantize leftover 1 ~ 3 rows with row-wise function
   for (unsigned int i = M4 * 4; i < M; i++) {
     nntr_quantize_row_q8_0(
@@ -208,10 +209,10 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M,
 
     std::vector<char> QA = std::vector<char>(qa_size);
 
-    for (unsigned int i = 0; i < M4; i++) {
+    tm.parallel_for(0, static_cast<size_t>(M4), [=, &QA](size_t i) {
       nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
                                  K);
-    }
+    });
 
     for (unsigned int i = M4 * 4; i < M; i++) {
       nntr_quantize_row_q8_0(
@@ -280,7 +281,8 @@ static inline void __ggml_q4_0_8x8_q8_0_GEMM_GEMV(
   float *C, const unsigned int ldc) {
   int blocks_per_row = (K + QK8_0 - 1) / QK8_0;
   int qa_size = sizeof(block_q8_0) * blocks_per_row;
-  std::vector<char> QA = std::vector<char>(qa_size);
+  thread_local std::vector<char> QA;
+  QA.resize(static_cast<size_t>(qa_size));
 
   auto qa_data = QA.data();
 
@@ -300,7 +302,7 @@ static inline void __ggml_q4_0_8x8_q8_0_GEMM_GEMV(
 
     nntr_gemv_q4_0_8x8_q8_0(K, (float *)(C + M_step_start), N,
                             (void *)((char *)B + M_step_start * B_step),
-                            QA.data(), M, M_step_end - M_step_start);
+                            qa_data, M, M_step_end - M_step_start);
   });
 }
 
@@ -318,11 +320,11 @@ static inline void __ggml_q4_0_8x8_q8_0_GEMM_GEMM(
   unsigned int qa_size = qa_4_rows_size * (((M >> 2) << 2) / 4 + 1);
   std::vector<char> QA = std::vector<char>(qa_size);
 
-  // Quantize 4-divisible-M row portion with matrix-wise function
-  for (unsigned int i = 0; i < M4; i++) {
+  // Quantize 4-divisible-M row portion with matrix-wise function (parallel)
+  tm.parallel_for(0, static_cast<size_t>(M4), [=, &QA](size_t i) {
     nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
                                K);
-  }
+  });
   // Quantize leftover 1 ~ 3 rows with row-wise function
   for (unsigned int i = M4 * 4; i < M; i++) {
     nntr_quantize_row_q8_0(
@@ -446,10 +448,10 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M,
 
     std::vector<char> QA = std::vector<char>(qa_size);
 
-    for (unsigned int i = 0; i < M4; i++) {
+    tm.parallel_for(0, static_cast<size_t>(M4), [=, &QA](size_t i) {
       nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
                                  K);
-    }
+    });
 
     for (unsigned int i = M4 * 4; i < M; i++) {
       nntr_quantize_row_q8_0(

@@ -326,9 +326,6 @@ void __ggml_gemm_q6_K(const unsigned int M, const unsigned int N,
                       const unsigned int lda, const void *B,
                       const unsigned int ldb, _FP16 *C,
                       const unsigned int ldc) {
-  std::vector<float> C32 = std::vector<float>(M * N);
-  float *C32_ptr = C32.data();
-
   auto &tm = ThreadManager::Global();
 
   static constexpr const int32_t bs = 1;
@@ -340,7 +337,9 @@ void __ggml_gemm_q6_K(const unsigned int M, const unsigned int N,
   const int32_t A_row_size = sizeof(block_q8_K) * blocks_per_row;
   const int32_t B_row_size = sizeof(block_q6_K) * blocks_per_row;
 
-  // GEMV
+  // GEMV. The inner kernel writes one FP32 result per call; convert to FP16
+  // and store into C directly so we avoid the M*N FP32 scratch + final cast
+  // that the original FP16 wrapper used.
   if (M == 1) {
     std::vector<char> quantized_A(A_row_size);
     __ggml_quantize_row_q8_K(A, (void *)quantized_A.data(), K);
@@ -352,10 +351,13 @@ void __ggml_gemm_q6_K(const unsigned int M, const unsigned int N,
 
       const void *const B_data = (void *)((char *)B + B_row_data_offset);
 
-      nntr_vec_dot_q6_K_q8_K(K, &C32_ptr[thread_job], bs, B_data, bx,
-                             quantized_A_data, by, nrc);
+      float result;
+      nntr_vec_dot_q6_K_q8_K(K, &result, bs, B_data, bx, quantized_A_data, by,
+                             nrc);
+      C[thread_job] = (_FP16)result;
     });
-  } else { // GEMM
+  } else { // GEMM. Same idea per (row,col): one FP32 result, cast to FP16,
+           // store directly. No M*N FP32 scratch needed.
     const int32_t A_total_size = A_row_size * M;
     std::vector<char> quantized_A(A_total_size);
 
@@ -373,21 +375,23 @@ void __ggml_gemm_q6_K(const unsigned int M, const unsigned int N,
         const int32_t B_row_data_offset = B_row_size * j;
         const void *const B_data = (void *)((char *)B + B_row_data_offset);
 
-        nntr_vec_dot_q6_K_q8_K(K, &C32_ptr[thread_job * ldc + j], bs, B_data,
-                               bx, A_data, by, nrc);
+        float result;
+        nntr_vec_dot_q6_K_q8_K(K, &result, bs, B_data, bx, A_data, by, nrc);
+        C[thread_job * ldc + j] = (_FP16)result;
       }
     });
   }
-  __copy_f16_from_f32(C32_ptr, C, M * N);
 }
 
 static inline void __ggml_q4_0_4x8_q8_0_GEMM_BSTP(
   const unsigned int M, const unsigned int N, const unsigned int K,
   const _FP16 *A, const unsigned int lda, const void *B, const unsigned int ldb,
   _FP16 *C16, const unsigned int ldc) {
-  std::vector<float> C32 = std::vector<float>(M * N);
-  float *C = C32.data();
-  int NB_COLS = 4;
+  // Mirrors the FP32 OMP impl's 2D row+col chunking. The previous 1D
+  // column-only split gave each of 4 threads a full M-row strip per
+  // call, which hurt cache locality and load balance at long prefill
+  // lengths. Using 16x16 (row x col) chunks restores the parallelism
+  // granularity of the FP32 path while keeping FP16-direct stores.
   auto &tm = ThreadManager::Global();
   unsigned int blocks_per_4_rows = (K + QK8_0 - 1) / QK8_0;
   unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * blocks_per_4_rows;
@@ -398,56 +402,74 @@ static inline void __ggml_q4_0_4x8_q8_0_GEMM_BSTP(
   unsigned int qa_size = qa_4_rows_size * (((M >> 2) << 2) / 4 + 1);
   std::vector<char> QA = std::vector<char>(qa_size);
 
-  // Quantize 4-divisible-M row portion with matrix-wise function
-  for (unsigned int i = 0; i < M4; i++) {
+  tm.parallel_for(0, static_cast<size_t>(M4), [=, &QA](size_t i) {
     __ggml_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
                                  K);
-  }
-  // Quantize leftover 1 ~ 3 rows with row-wise function
+  });
   for (unsigned int i = M4 * 4; i < M; i++) {
     __ggml_quantize_row_q8_0(
       (_FP16 *)A + i * K,
       (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
   }
 
-  ///@todo Dynamic thread-number selection for GEMM problem size
-  unsigned int thread_num = tm.getComputeThreadCount();
-  tm.parallel_for(0, thread_num, [=](size_t i) {
-    unsigned int M_step_start = (i * N) / thread_num;
-    unsigned int M_step_end = ((i + 1) * N) / thread_num;
+  unsigned int row_chunk_size = 16;
+  size_t row_loop = (M4 * 4 + row_chunk_size - 1) / row_chunk_size;
+  unsigned int A_step = sizeof(block_q8_0) * (K / QK8_0);
 
-    M_step_start = (M_step_start % NB_COLS)
-                     ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                     : M_step_start;
-    M_step_end = (M_step_end % NB_COLS)
-                   ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                   : M_step_end;
+  unsigned int col_chunk_size = 16;
+  size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
 
-    nntr_gemm_q4_0_4x8_q8_0(K, (C + (M_step_start)), ldc,
-                            ((char *)B + ((M_step_start)*B_step)), QA.data(),
-                            M4 * 4, (M_step_end) - (M_step_start));
+  tm.parallel_for(0, col_loop * row_loop, [=](size_t i) {
+    unsigned int r = i / col_loop;
+    unsigned int c = i % col_loop;
+
+    unsigned int r_start = r * row_chunk_size;
+    unsigned int r_end = std::min(row_chunk_size * (r + 1), M4 * 4);
+
+    unsigned int c_start = c * col_chunk_size;
+    unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+
+#if defined(__ARM_NEON)
+    nntr_gemm_q4_0_4x8_q8_0_fp16(K, (_FP16 *)(C16 + r_start * N + c_start), ldc,
+                                 (void *)((char *)B + c_start * B_step),
+                                 (void *)(QA.data() + r_start * A_step),
+                                 r_end - r_start, c_end - c_start);
+#else
+    unsigned int t_rows = r_end - r_start;
+    unsigned int t_cols = c_end - c_start;
+    std::vector<float> tile(t_rows * t_cols);
+    nntr_gemm_q4_0_4x8_q8_0(K, tile.data(), t_cols,
+                             (void *)((char *)B + c_start * B_step),
+                             (void *)(QA.data() + r_start * A_step), t_rows,
+                             t_cols);
+    for (unsigned int ii = 0; ii < t_rows; ++ii)
+      __copy_f16_from_f32(&tile[ii * t_cols],
+                          C16 + (r_start + ii) * N + c_start, t_cols);
+#endif
   });
 
-  for (unsigned int pb = M4 * 4; pb < M; pb++) {
-    tm.parallel_for(0, thread_num, [=](size_t i) {
-      unsigned int M_step_start = (i * N) / thread_num;
-      unsigned int M_step_end = ((i + 1) * N) / thread_num;
+  // Leftover 1..3 rows still go through the FP32-output GEMV kernel into a
+  // small per-(M%4) scratch, then we cast just that tail back into C16.
+  unsigned int leftover_rows = M - M4 * 4;
+  if (leftover_rows > 0) {
+    std::vector<float> tail32(leftover_rows * (size_t)N);
+    unsigned int chunk_size = 16;
+    unsigned int loop = (N + chunk_size - 1) / chunk_size;
+    for (unsigned int pb = M4 * 4; pb < M; pb++) {
+      tm.parallel_for(0, loop, [=, &tail32](size_t idx) {
+        unsigned int M_step_start = chunk_size * idx;
+        unsigned int M_step_end = std::min(chunk_size * (idx + 1), (size_t)N);
 
-      // why 8 instead of NB_COLS?
-      M_step_start = (M_step_start % 8) ? M_step_start + 8 - (M_step_start % 8)
-                                        : M_step_start;
-      M_step_end =
-        (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
-
-      nntr_gemv_q4_0_4x8_q8_0(
-        K, (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
-        N, (void *)((char *)B + M_step_start * B_step),
-        QA.data() + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
-        M_step_end - M_step_start);
-    });
+        nntr_gemv_q4_0_4x8_q8_0(
+          K, (float *)(tail32.data() + (pb - M4 * 4) * N) + M_step_start, N,
+          (void *)((char *)B + M_step_start * B_step),
+          QA.data() + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
+          M_step_end - M_step_start);
+      });
+    }
+    __copy_f16_from_f32(tail32.data(), C16 + (size_t)M4 * 4 * N,
+                        (size_t)leftover_rows * N);
   }
-
-  __copy_f16_from_f32(C, C16, M * N);
 }
 
 template <>
@@ -456,35 +478,43 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int lda, const void *B,
                                const unsigned int ldb, _FP16 *C,
                                const unsigned int ldc) {
-  int NB_COLS = 4;
-  std::vector<float> C32 = std::vector<float>(M * N);
+  auto &tm = ThreadManager::Global();
 
-  // q40 GEMV accuracy explodes?
-  if (M == 1) { // GEMV
+  // GEMV: M=1, used by per-token decode and small prefill. Mirror the FP32
+  // OMP path's chunked parallel_for so the work is split across threads in
+  // chunk_size=16 column tiles instead of one giant kernel call.
+  if (M == 1) {
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
     unsigned int blocks_per_row = (K + QK8_0 - 1) / QK8_0;
     unsigned int qa_size = sizeof(block_q8_0) * blocks_per_row;
-    std::vector<char> QA = std::vector<char>(qa_size);
+    thread_local std::vector<char> QA;
+    QA.resize(qa_size);
     __ggml_quantize_row_q8_0(A, (void *)QA.data(), K);
+    auto qa_data = QA.data();
 
-    // Single-threaded GEMV (n_threads=1 in original)
-    unsigned int M_step_start = 0;
-    unsigned int M_step_end = N;
+    unsigned int chunk_size = 16;
+    unsigned int loop = (N + chunk_size - 1) / chunk_size;
 
-    M_step_start = (M_step_start % NB_COLS)
-                     ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                     : M_step_start;
-    M_step_end = (M_step_end % NB_COLS)
-                   ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                   : M_step_end;
+    tm.parallel_for(0, loop, [=](size_t idx) {
+      unsigned int M_step_start = chunk_size * idx;
+      unsigned int M_step_end = std::min(chunk_size * (idx + 1), (size_t)N);
 
-    nntr_gemv_q4_0_4x8_q8_0(K, (float *)((C32.data()) + M_step_start), N,
-                            (void *)((char *)B + M_step_start * B_step),
-                            QA.data(), M, M_step_end - M_step_start);
-  } else {
-    return __ggml_q4_0_4x8_q8_0_GEMM_BSTP(M, N, K, A, lda, B, ldb, C, ldc);
+#if defined(__ARM_NEON)
+      nntr_gemv_q4_0_4x8_q8_0_fp16(K, (_FP16 *)(C + M_step_start), N,
+                                   (void *)((char *)B + M_step_start * B_step),
+                                   qa_data, M, M_step_end - M_step_start);
+#else
+      unsigned int n_cols = M_step_end - M_step_start;
+      std::vector<float> out(n_cols);
+      nntr_gemv_q4_0_4x8_q8_0(K, out.data(), N,
+                               (void *)((char *)B + M_step_start * B_step),
+                               qa_data, M, n_cols);
+      __copy_f16_from_f32(out.data(), C + M_step_start, n_cols);
+#endif
+    });
+    return;
   }
-  __copy_f16_from_f32(C32.data(), C, M * N);
+  return __ggml_q4_0_4x8_q8_0_GEMM_BSTP(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
 } // namespace nntrainer

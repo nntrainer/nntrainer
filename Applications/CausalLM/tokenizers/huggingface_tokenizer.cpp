@@ -1,8 +1,11 @@
-
-/*!
- *  Copyright (c) 2023 by Contributors
- * \file huggingface_tokenizer.cc
- * \brief Huggingface tokenizer
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (c) 2023 by Contributors
+ *
+ * @file   huggingface_tokenizer.cpp
+ * @brief  Huggingface tokenizer
+ * @author mlc-ai tokenizers-cpp Contributors
+ * @bug    No known bugs except for NYI items
  */
 #include <tokenizers_c.h>
 #include <tokenizers_cpp.h>
@@ -10,8 +13,8 @@
 #include <cassert>
 
 namespace tokenizers {
-/*!
- * \brief A simple c++ header of tokenizer via C API.
+/**
+ * @brief A simple c++ header of tokenizer via C API.
  */
 class HFTokenizer : public Tokenizer {
 public:

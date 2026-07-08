@@ -78,4 +78,24 @@ TEST(GptOssCachedSlimTinyModelTest, GreedyGenerationSelectsArgmaxLogit) {
   causallm_test::expectGreedyGenerationSelectsArgmax(*model);
 }
 
+#ifdef ENABLE_FP16
+TEST(GptOssCachedSlimTinyModelTest,
+     GreedyGenerationSelectsArgmaxLogit_Q40FP16) {
+  auto tokenizer_path =
+    causallm_test::makeTinyCausalLMFiles("GptOssCachedSlimTinyModelTest",
+                                         "GreedyGenerationSelectsArgmaxLogit",
+                                         "GptOssCachedSlim_Q40_FP16")
+      .tokenizer_path;
+
+  auto model_cfg = makeTinyGptOssCachedSlimConfig();
+  auto gen_cfg = causallm_test::makeTinyGenerationConfig();
+  auto nntr_cfg = causallm_test::makeTinyNntrainerConfig(
+    tokenizer_path, causallm_test::makeTinyQ40Fp16DataType());
+
+  auto model = std::make_unique<TinyGptOssCachedSlimCausalLM>(
+    model_cfg, gen_cfg, nntr_cfg);
+  causallm_test::expectGreedyGenerationSelectsArgmax(*model);
+}
+#endif
+
 } // namespace

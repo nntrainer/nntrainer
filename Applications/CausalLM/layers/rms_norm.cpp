@@ -28,13 +28,17 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
     skip_prefill = std::get<nntrainer::props::SkipPrefill>(rms_props).get();
 
+  // gamma is unquantized and stored as FP32 in the bin. Request it as FP32
+  // regardless of the activation dtype; declaring it FP16 reinterprets the
+  // on-disk FP32 bytes as FP16 and corrupts gamma (≈FP16-max garbage). The
+  // FP16 forward path casts gamma down to FP16 at the multiply site.
   nntrainer::TensorDim gamma_dim(
     1, 1, 1, dim[0].width(),
     nntrainer::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()));
+                                     nntrainer::TensorDim::DataType::FP32));
   wt_idx[RMSParams::gamma] = context.requestWeight(
     gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
-    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", false);
+    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
 }
 
 void RMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
@@ -90,12 +94,27 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         in_step.getData<float>(), out_step.getData<float>(), dim.height(),
         dim.width(), epsilon);
 #endif
+#ifdef ENABLE_FP16
+    } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      const auto &dim = in_step.getDim();
+      // FP16 activation: this kernel accumulates the sum-of-squares in FP32
+      // (so a wide residual row cannot overflow FP16) and reads/writes FP16.
+      nntrainer::rms_norm_wrt_width_fp16_intrinsic(
+        in_step.getData<_FP16>(), out_step.getData<_FP16>(), dim.height(),
+        dim.width(), epsilon);
+#endif
     } else {
       throw std::invalid_argument(
         "Error: not yet implemented for this data type");
     }
-    out_step.multiply_i(gamma);
-
+    // gamma (unquantized) may be stored at a different dtype than the FP16
+    // activation; cast it to match before the elementwise multiply.
+    if (gamma.getDataType() != out_step.getDataType()) {
+      nntrainer::Tensor gamma_cast = gamma.clone(out_step.getDataType());
+      out_step.multiply_i(gamma_cast);
+    } else {
+      out_step.multiply_i(gamma);
+    }
 #ifdef DEBUG
     std::cout << context.getName() << " \n input:" << in_step
               << "output:" << out_step << "gamma:" << gamma << std::endl;

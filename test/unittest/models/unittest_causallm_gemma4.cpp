@@ -178,7 +178,9 @@ makeGemma4Case(const causallm_test::TinyCausalLMDataType &data_type) {
     "Gemma4_" + data_type.name,
     data_type,
     {"hello tok4", makeExpectedGemma4Logits(),
-     data_type.name == "FP32" ? 1e-4f : 1e-3f},
+     data_type.name == "FP32"       ? 1e-4f
+     : data_type.name == "Q40_FP16" ? 2e-2f
+                                    : 1e-3f},
     makeTinyGemma4Config,
     makeGemma4LayerDtypeMap,
     [](causallm::json &cfg, causallm::json &generation_cfg,
@@ -253,5 +255,14 @@ INSTANTIATE_TEST_SUITE_P(
   [](const ::testing::TestParamInfo<causallm_test::TinyCausalLMCase> &info) {
     return info.param.name;
   });
+
+#ifdef ENABLE_FP16
+INSTANTIATE_TEST_SUITE_P(
+  Gemma4Fp16, Gemma4TinyModelTest,
+  ::testing::Values(makeGemma4Case(causallm_test::makeTinyQ40Fp16DataType())),
+  [](const ::testing::TestParamInfo<causallm_test::TinyCausalLMCase> &info) {
+    return info.param.name;
+  });
+#endif
 
 } // namespace

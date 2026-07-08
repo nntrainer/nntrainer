@@ -404,7 +404,7 @@ template <>
 void rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
                                        _FP16 *__restrict Y, size_t H, size_t W,
                                        float epsilon) {
-  __fallback_rms_norm_wrt_width_fp16_intrinsic<_FP16>(X, Y, H, W, epsilon);
+  neon::rms_norm_wrt_width_fp16_intrinsic<_FP16>(X, Y, H, W, epsilon);
 }
 
 template <>

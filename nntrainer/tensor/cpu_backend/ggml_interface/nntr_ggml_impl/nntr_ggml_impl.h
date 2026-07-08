@@ -23,6 +23,24 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc);
 
+#ifdef ENABLE_FP16
+// Pick the half type the same way tensor_dim.h does, so this header stays
+// self-contained even if a caller pulls it in without tensor_dim.h. On
+// ARM/Android (USE__FP16) it is __fp16; on x86_64 fp16 builds it is _Float16.
+#ifdef USE__FP16
+#define NNTR_GGML_FP16 __fp16
+#else
+#define NNTR_GGML_FP16 _Float16
+#endif
+void nntr_gemm_q4_0_4x8_q8_0_fp16(int n, NNTR_GGML_FP16 *__restrict s,
+                                  size_t bs, const void *__restrict vx,
+                                  const void *__restrict vy, int nr, int nc);
+
+void nntr_gemv_q4_0_4x8_q8_0_fp16(int n, NNTR_GGML_FP16 *__restrict s,
+                                  size_t bs, const void *__restrict vx,
+                                  const void *__restrict vy, int nr, int nc);
+#endif
+
 void nntr_gemm_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc);

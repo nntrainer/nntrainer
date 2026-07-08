@@ -19,6 +19,7 @@
 #include <limits.h>
 #include <limits>
 #include <stddef.h>
+#include <tensor_dim.h>
 
 namespace nntrainer::avx2 {
 

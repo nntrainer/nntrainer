@@ -422,7 +422,9 @@ makeGemma3Case(const causallm_test::TinyCausalLMDataType &data_type) {
     "Gemma3_" + data_type.name,
     data_type,
     {"hello tok4", makeExpectedGemma3Logits(),
-     data_type.name == "FP32" ? 1e-4f : 1e-3f},
+     data_type.name == "FP32"       ? 1e-4f
+     : data_type.name == "Q40_FP16" ? 2e-3f
+                                    : 1e-3f},
     makeTinyGemma3Config,
     makeGemma3LayerDtypeMap,
     [](causallm::json &cfg, causallm::json &generation_cfg,
@@ -497,6 +499,15 @@ INSTANTIATE_TEST_SUITE_P(
   [](const ::testing::TestParamInfo<causallm_test::TinyCausalLMCase> &info) {
     return info.param.name;
   });
+
+#ifdef ENABLE_FP16
+INSTANTIATE_TEST_SUITE_P(
+  Gemma3Fp16, Gemma3TinyModelTest,
+  ::testing::Values(makeGemma3Case(causallm_test::makeTinyQ40Fp16DataType())),
+  [](const ::testing::TestParamInfo<causallm_test::TinyCausalLMCase> &info) {
+    return info.param.name;
+  });
+#endif
 
 /**
  * @brief Test that tiny EmbeddingGemma can save/load and encode

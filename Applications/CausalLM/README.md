@@ -21,6 +21,30 @@ It supports *inference* mode (text generation) on various devices, including And
 
 For more details, please refer to the [Model Documentation](models/README.md).
 
+## Performance
+
+Measured on a **Galaxy S26 Ultra (SM-S948U)**, CPU backend, with **Qwen3-0.6B**
+quantized to **Q4_0** FC weights + **Q6_K** embedding / LM head. `prefill` =
+prompt-encode throughput, `decode` = autoregressive generation throughput
+(32 new tokens). Flash (GEMM) attention engages for prompts ≥ 32 tokens.
+
+| Activation | Threads | Prompt | Prefill (tok/s) | Decode (tok/s) |
+| --- | --- | --- | --- | --- |
+| **Q4_0-FP16** | 8 | 437 | **755** | **80** |
+| Q4_0-FP16 | 8 | 1003 | 596 | 60 |
+| Q4_0-FP16 | 4 | 1003 | 423 | 52 |
+| Q4_0-FP32 | 8 | 437 | 329 | 77 |
+| Q4_0-FP32 | 8 | 1003 | 299 | 50 |
+| Q4_0-FP32 | 4 | 1003 | 206 | 45 |
+
+`Q4_0-FP16` (FP16 activation) is the recommended device config: ~2× the prefill
+throughput of the FP32-activation path on the FP16 build, and token-coherent with
+it. Prefill throughput drops as the prompt grows (attention is O(n²)); a very
+short prompt (e.g. the 18-token default `sample_input`) reports a much lower
+number (~240 tok/s) because it is below the flash-attention threshold and is
+dominated by fixed setup cost — not representative of sustained throughput.
+Peak RSS ≈ 0.94 GB.
+
 ## CausalLM API
 
 The CausalLM application exposes a C API for easy integration with other applications (e.g., Android JNI).

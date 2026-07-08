@@ -694,10 +694,14 @@ NetworkGraph::canExecuteInPlace(const std::shared_ptr<LayerNode> &lnode) {
     return inplace_type;
   }
 
-  if (lnode->getType() == InputLayer::type &&
-      !istrequal(getTensorType()[2], "FP32")) {
-    return InPlaceType::NONE;
-  }
+  // Historically, InputLayer was forced non-in-place under a non-FP32
+  // activation dtype because finalize() used to promote the output dim to
+  // the activation dtype, making input/output dtypes differ. With
+  // InputLayer::finalize now preserving the declared input dtype, output
+  // dim equals input dim and the in-place view is always safe. Keeping the
+  // override would break callers that bind an external buffer to the
+  // placeholder output (e.g. KVCacheManager.bind) and rely on the input
+  // sharing storage with that output.
 
   if (lnode->getType() == MultiOutLayer::type) {
     return InPlaceType::RESTRICTING;
