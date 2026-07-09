@@ -787,4 +787,47 @@ void __ggml_gemm_q6_K(const unsigned int M, const unsigned int N,
   }
 }
 
+/**
+ * @brief Q8_0 weights x FP32 activation GEMM/GEMV (plain block_q8_0 rows).
+ *
+ * Mirrors the Q4_0 GEMM threading in this file: the FP32 activation is
+ * online-quantised to block_q8_0, then the output columns are split evenly
+ * across the compute threads. The plain-block kernel computes an independent
+ * [M x cols] tile per call (weights are [N x K/QK8_0] blocks, one row per
+ * output channel), so B/C slice by column with no synchronisation. A Q8_0x8
+ * interleaved weight layout to match the Q4_0 8x8 micro-tile is a follow-up.
+ */
+void __ggml_q8_0_q8_0_GEMM(const unsigned int M, const unsigned int N,
+                           const unsigned int K, const float *A,
+                           const unsigned int lda, const void *B,
+                           const unsigned int ldb, float *C,
+                           const unsigned int ldc) {
+  (void)lda;
+  (void)ldb;
+
+  auto &tm = ThreadManager::Global();
+  unsigned int thread_num = tm.getComputeThreadCount();
+
+  const unsigned int blocks_per_row = (K + QK8_0 - 1) / QK8_0;
+  const size_t row_bytes = sizeof(block_q8_0) * blocks_per_row;
+
+  // online quantization for all M activation rows (plain block layout)
+  std::vector<char> QA = std::vector<char>((size_t)M * row_bytes);
+  for (unsigned int i = 0; i < M; i++) {
+    nntr_quantize_row_q8_0(A + (size_t)i * K, QA.data() + (size_t)i * row_bytes,
+                           K);
+  }
+
+  tm.parallel_for(0, thread_num, [=, &QA](size_t i) {
+    unsigned int c_start = (i * N) / thread_num;
+    unsigned int c_end = ((i + 1) * N) / thread_num;
+    if (c_end <= c_start)
+      return;
+
+    nntr_gemm_q8_0_q8_0(K, C + c_start, ldc,
+                        (void *)((char *)B + (size_t)c_start * row_bytes),
+                        QA.data(), M, c_end - c_start);
+  });
+}
+
 } // namespace nntrainer

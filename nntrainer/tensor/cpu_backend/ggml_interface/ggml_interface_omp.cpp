@@ -654,4 +654,76 @@ void __ggml_gemm_q6_K(const unsigned int M, const unsigned int N,
   }
 }
 
+/**
+ * @brief Q8_0 weights x FP32 activation GEMM/GEMV (plain block_q8_0 rows).
+ *
+ * Mirrors the Q4_0 GEMM threading in this file: the FP32 activation is
+ * online-quantised to block_q8_0, then the output is tiled across
+ * ThreadManager workers. The plain-block kernel computes an independent
+ * [rows x cols] tile per call (weights are [N x K/QK8_0] blocks, one row per
+ * output channel), so A/B/C slice with no synchronisation. A Q8_0x8
+ * interleaved weight layout to match the Q4_0 8x8 micro-tile is a follow-up.
+ */
+void __ggml_q8_0_q8_0_GEMM(const unsigned int M, const unsigned int N,
+                           const unsigned int K, const float *A,
+                           const unsigned int lda, const void *B,
+                           const unsigned int ldb, float *C,
+                           const unsigned int ldc) {
+  (void)lda;
+  (void)ldb;
+
+  auto &tm = ThreadManager::Global();
+
+  const unsigned int blocks_per_row = (K + QK8_0 - 1) / QK8_0;
+  const size_t row_bytes = sizeof(block_q8_0) * blocks_per_row;
+
+  if (M == 1) { // GEMV
+    std::vector<char> QA = std::vector<char>(row_bytes);
+    nntr_quantize_row_q8_0(A, QA.data(), K);
+
+    unsigned int chunk_size = 16;
+    size_t loop = (N + chunk_size - 1) / chunk_size;
+
+    // compute multithreaded GEMV over output-column chunks
+    tm.parallel_for(0, loop, [=, &QA](size_t idx) {
+      unsigned int c_start = chunk_size * idx;
+      unsigned int c_end = std::min(chunk_size * (idx + 1), (size_t)N);
+
+      nntr_gemm_q8_0_q8_0(K, C + c_start, ldc,
+                          (void *)((char *)B + (size_t)c_start * row_bytes),
+                          QA.data(), M, c_end - c_start);
+    });
+  } else { // GEMM
+    // online quantization for all M activation rows (plain block layout)
+    std::vector<char> QA = std::vector<char>((size_t)M * row_bytes);
+    for (unsigned int i = 0; i < M; i++) {
+      nntr_quantize_row_q8_0(A + (size_t)i * K, QA.data() + (size_t)i * row_bytes,
+                             K);
+    }
+
+    // Compute with multithreaded GEMM over 2D row x column tiles
+    unsigned int row_chunk_size = 16;
+    size_t row_loop = (M + row_chunk_size - 1) / row_chunk_size;
+
+    unsigned int col_chunk_size = 16;
+    size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+
+    tm.parallel_for(0, col_loop * row_loop, [=, &QA](size_t i) {
+      unsigned int r = i / col_loop;
+      unsigned int c = i % col_loop;
+
+      unsigned int r_start = r * row_chunk_size;
+      unsigned int r_end = std::min(row_chunk_size * (r + 1), M);
+
+      unsigned int c_start = c * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+
+      nntr_gemm_q8_0_q8_0(K, C + (size_t)r_start * ldc + c_start, ldc,
+                          (void *)((char *)B + (size_t)c_start * row_bytes),
+                          QA.data() + (size_t)r_start * row_bytes,
+                          r_end - r_start, c_end - c_start);
+    });
+  }
+}
+
 } // namespace nntrainer
