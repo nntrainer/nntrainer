@@ -76,18 +76,30 @@ namespace nntrainer {
 
 namespace {
 
-Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
+Tensor mapExternalTensor(float *buf, const TensorDim &dim,
+                         bool convert_fp32_to_fp16 = true) {
   const unsigned int bytes = static_cast<unsigned int>(
     static_cast<size_t>(dim.getDataLen()) * dim.getDataTypeSize());
 
   switch (dim.getDataType()) {
   case TensorDim::DataType::FP16: {
-    // The inference()/external-tensor API delivers FP32 data by contract
-    // (float *buf). For an FP16 graph input we must genuinely convert
-    // FP32->FP16 through the Tensor system, not reinterpret the FP32 bytes as
-    // half. Map the buffer as its real FP32 type, then copyData() into an
-    // owning FP16 tensor (HalfTensor::copyData performs the conversion). The
-    // returned tensor owns its buffer, so it stays valid after this call.
+    // Two incompatible contracts share this entry point:
+    //  * inference() (convert_fp32_to_fp16 == true): the API delivers FP32
+    //    data by contract (float *buf). For an FP16 graph input we must
+    //    genuinely convert FP32->FP16 through the Tensor system, not
+    //    reinterpret the FP32 bytes as half. Map the buffer as its real FP32
+    //    type, then copyData() into an owning FP16 tensor.
+    //  * incremental_inference() (convert_fp32_to_fp16 == false): callers
+    //    (CausalLM KV / cross-attention cache placeholders) pass buffers that
+    //    ALREADY hold fp16 bits, cast to float*. Converting would read
+    //    dataLen*4 bytes from a dataLen*2-byte buffer (a 2x out-of-bounds
+    //    read that faults on allocators with guard pages, e.g. Android
+    //    scudo), and the converted COPY would also break the external-cache
+    //    write-back contract (the graph must write K/V into the caller's
+    //    buffer). Reinterpret-map instead, which is the historical behavior.
+    if (!convert_fp32_to_fp16)
+      return Tensor::Map<uint16_t>(reinterpret_cast<uint16_t *>(buf), bytes,
+                                   dim, 0);
     TensorDim fp32_dim = dim;
     fp32_dim.setDataType(TensorDim::DataType::FP32);
     const unsigned int fp32_bytes = static_cast<unsigned int>(
@@ -1690,8 +1702,12 @@ std::vector<float *> NeuralNetwork::incremental_inference(
   input_tensors.reserve(input.size());
   for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
     in_dim[idx].batch(batch_size);
-    input_tensors.emplace_back(
-      MAKE_SHARED_TENSOR(mapExternalTensor(input[idx], in_dim[idx])));
+    // convert_fp32_to_fp16=false: incremental callers pass FP16 graph inputs
+    // (KV / cross-attention cache placeholders) as buffers that already hold
+    // fp16 bits; reinterpret-map them (see mapExternalTensor).
+    input_tensors.emplace_back(MAKE_SHARED_TENSOR(
+      mapExternalTensor(input[idx], in_dim[idx], /*convert_fp32_to_fp16=*/
+                        false)));
   }
 
   // auto start_increment = std::chrono::high_resolution_clock::now();
@@ -1701,8 +1717,9 @@ std::vector<float *> NeuralNetwork::incremental_inference(
     label_tensors.reserve(label.size());
     for (unsigned int idx = 0; idx < label_dim.size(); idx++) {
       label_dim[idx].batch(batch_size);
-      label_tensors.emplace_back(
-        MAKE_SHARED_TENSOR(mapExternalTensor(label[idx], label_dim[idx])));
+      label_tensors.emplace_back(MAKE_SHARED_TENSOR(
+        mapExternalTensor(label[idx], label_dim[idx], /*convert_fp32_to_fp16=*/
+                          false)));
     }
     output_tensors = incremental_inference(input_tensors, label_tensors,
                                            init_seq_len, from, to);
