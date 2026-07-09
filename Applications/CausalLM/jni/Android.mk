@@ -83,6 +83,7 @@ LOCAL_SRC_FILES := \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
+    ../layers/per_layer_embedding.cpp \
     ../layers/scalar_multiply.cpp \
     ../layers/logit_softcapping.cpp \
     ../layers/mha_core.cpp \
@@ -219,6 +220,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
+    ../layers/per_layer_embedding.cpp \
     ../layers/scalar_multiply.cpp \
     ../layers/logit_softcapping.cpp \
     ../layers/mha_core.cpp \
@@ -259,6 +261,7 @@ LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \
+    $(LOCAL_PATH)/../third_party \
 
 include $(BUILD_EXECUTABLE)
 
