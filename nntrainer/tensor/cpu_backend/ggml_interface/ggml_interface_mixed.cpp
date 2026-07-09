@@ -830,4 +830,95 @@ void __ggml_q8_0_q8_0_GEMM(const unsigned int M, const unsigned int N,
   });
 }
 
+/**
+ * @brief Q8_0x4-interleaved weights x FP32 activation GEMM/GEMV, FP32 output.
+ *
+ * Weights are the q8_0x4 interleaved layout produced at quantisation time by
+ * __ggml_repack_q8_0_to_q8_0_4 (ISA::ARM target), the FC analogue of the
+ * YOLO conv path's offline repack: single contiguous vld1q_s8 loads replace
+ * the plain layout's scattered per-row loads. The activation is
+ * online-quantised: packed q8_0x4 (nntr_quantize_mat_q8_0_4x8) for the
+ * 4-row-aligned bulk, plain rows for M == 1 / the M %% 4 tail (GEMV kernel).
+ * All column partitions are kept multiples of 4 so every kernel call sees
+ * whole weight super-blocks (N %% 32 == 0 is guaranteed by the quantiser).
+ */
+void __ggml_q8_0_4x4_q8_0_GEMM(const unsigned int M, const unsigned int N,
+                               const unsigned int K, const float *A,
+                               const unsigned int lda, const void *B,
+                               const unsigned int ldb, float *C,
+                               const unsigned int ldc) {
+  (void)lda;
+  (void)ldb;
+  assert(N % 4 == 0);
+
+  auto &tm = ThreadManager::Global();
+  unsigned int thread_num = tm.getComputeThreadCount();
+
+  const unsigned int nb = (K + QK8_0 - 1) / QK8_0;
+  const size_t row_bytes = sizeof(block_q8_0) * nb;   // plain act row
+  const size_t sb_bytes = sizeof(block_q8_0x4) * nb;  // 4-row/4-col super-row
+
+  // Column ranges are split evenly across the compute threads and aligned
+  // down to multiples of 4 so every call sees whole weight super-blocks.
+  auto col_range = [=](size_t i, unsigned int &c_start, unsigned int &c_end) {
+    c_start = (unsigned int)(((i * N) / thread_num) & ~3u);
+    c_end = (i + 1 == thread_num)
+              ? N
+              : (unsigned int)((((i + 1) * N) / thread_num) & ~3u);
+  };
+
+  if (M == 1) { // GEMV
+    std::vector<char> QA = std::vector<char>(row_bytes);
+    nntr_quantize_row_q8_0(A, QA.data(), K);
+
+    tm.parallel_for(0, thread_num, [=, &QA](size_t i) {
+      unsigned int c_start, c_end;
+      col_range(i, c_start, c_end);
+      if (c_end <= c_start)
+        return;
+      nntr_gemv_q8_0x4_q8_0(
+        K, C + c_start, ldc,
+        (void *)((char *)B + (size_t)(c_start / 4) * sb_bytes), QA.data(),
+        c_end - c_start);
+    });
+    return;
+  }
+
+  // GEMM: pack the 4-row-aligned bulk of the activation.
+  const unsigned int M4 = M / 4;
+  std::vector<char> QA = std::vector<char>((size_t)M4 * sb_bytes);
+  for (unsigned int i = 0; i < M4; i++) {
+    nntr_quantize_mat_q8_0_4x8(A + 4 * (size_t)i * K,
+                               QA.data() + (size_t)i * sb_bytes, K);
+  }
+
+  tm.parallel_for(0, thread_num, [=, &QA](size_t i) {
+    unsigned int c_start, c_end;
+    col_range(i, c_start, c_end);
+    if (c_end <= c_start)
+      return;
+    nntr_gemm_q8_0x4_q8_0x4(
+      K, C + c_start, ldc,
+      (void *)((char *)B + (size_t)(c_start / 4) * sb_bytes), QA.data(),
+      M4 * 4, c_end - c_start);
+  });
+
+  // M % 4 tail rows: plain-quantised row x interleaved weights GEMV.
+  for (unsigned int m = M4 * 4; m < M; ++m) {
+    std::vector<char> QR = std::vector<char>(row_bytes);
+    nntr_quantize_row_q8_0(A + (size_t)m * K, QR.data(), K);
+
+    tm.parallel_for(0, thread_num, [=, &QR](size_t i) {
+      unsigned int c_start, c_end;
+      col_range(i, c_start, c_end);
+      if (c_end <= c_start)
+        return;
+      nntr_gemv_q8_0x4_q8_0(
+        K, C + (size_t)m * ldc + c_start, ldc,
+        (void *)((char *)B + (size_t)(c_start / 4) * sb_bytes), QR.data(),
+        c_end - c_start);
+    });
+  }
+}
+
 } // namespace nntrainer

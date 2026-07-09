@@ -132,4 +132,9 @@ void __ggml_repack_q4_K_to_q4_K_8(void *dst, void *src, size_t data_size,
   nntr_repack_q4_K_to_q4_K_8_bl(dst, 8, src, data_size, M, N);
 }
 
+void __ggml_repack_q8_0_to_q8_0_4(void *dst, void *src, size_t data_size,
+                                  const unsigned int M, const unsigned int N) {
+  nntr_repack_q8_0_to_q8_0_4_bl(dst, 4, src, data_size, M, N);
+}
+
 } // namespace nntrainer

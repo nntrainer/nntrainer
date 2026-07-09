@@ -122,6 +122,28 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                                const unsigned int ldc);
 
 /**
+ * @brief Repack plain block_q8_0 rows to the q8_0x4 interleaved layout
+ *        (block_q8_0x4), byte-for-byte nntr_quantize_mat_q8_0_4x8's layout.
+ * @param M number of rows (output channels), must be divisible by 4
+ * @param N row length in elements (K), must be divisible by 32
+ */
+void __ggml_repack_q8_0_to_q8_0_4(void *dst, void *src, size_t data_size,
+                                  const unsigned int M, const unsigned int N);
+
+/**
+ * @brief Q8_0x4-interleaved weights x FP32 activation GEMM/GEMV, FP32 output.
+ *        The activation is online-quantised (packed q8_0x4 for M > 1, plain
+ *        row for M == 1) and multiplied with the interleaved SMMLA kernels.
+ *        Weights must be repacked with __ggml_repack_q8_0_to_q8_0_4 (done at
+ *        quantisation time for ISA::ARM). Requires N % 4 == 0.
+ */
+void __ggml_q8_0_4x4_q8_0_GEMM(const unsigned int M, const unsigned int N,
+                               const unsigned int K, const float *A,
+                               const unsigned int lda, const void *B,
+                               const unsigned int ldb, float *C,
+                               const unsigned int ldc);
+
+/**
  * @brief Q8_0 weight x Q8_0 activation GEMM dispatcher.
  */
 void __ggml_q8_0_q8_0_GEMM(const unsigned int M, const unsigned int N,

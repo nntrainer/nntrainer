@@ -3757,3 +3757,101 @@ void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
   (void)nr;
   nntr_gemm_q8_0_q8_0(n, s, bs, vx, vy, 1, nc);
 }
+
+int nntr_repack_q8_0_to_q8_0_4_bl(void *__restrict dst, int interleave_block,
+                                  const void *__restrict data, size_t data_size,
+                                  size_t nrow, size_t k) {
+  assert(interleave_block == 4);
+  constexpr size_t nrows_interleaved = 4;
+  const size_t nb = k / QK8_0;
+
+  block_q8_0x4 *dst_ = (block_q8_0x4 *)dst;
+  const block_q8_0 *src = (const block_q8_0 *)data;
+
+  assert(data_size == nrow * nb * sizeof(block_q8_0));
+  (void)data_size;
+  if (nrow % nrows_interleaved != 0 || k % QK8_0 != 0) {
+    return -1;
+  }
+
+  // dst qs[32*sub + row*8 + c] = src_row[block].qs[8*sub + c] -- byte-for-byte
+  // the layout of nntr_quantize_mat_q8_0_4x8 / the offline Python repack_q8_0.
+  for (size_t r = 0; r < nrow; r += nrows_interleaved) {
+    for (size_t x = 0; x < nb; x++) {
+      block_q8_0x4 out;
+      for (int row = 0; row < 4; row++) {
+        const block_q8_0 &b = src[(size_t)row * nb + x];
+        out.d[row] = b.d;
+        for (int sub = 0; sub < 4; sub++)
+          for (int c = 0; c < 8; c++)
+            out.qs[32 * sub + row * 8 + c] = b.qs[8 * sub + c];
+      }
+      *dst_++ = out;
+    }
+    src += nrows_interleaved * nb;
+  }
+  return 0;
+}
+
+void nntr_gemm_q8_0x4_q8_0x4(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+  const int qk = QK8_0;
+  const int nb = n / qk;
+  assert(n % qk == 0);
+  assert(nr % 4 == 0);
+
+  const block_q8_0x4 *a_sbase = (const block_q8_0x4 *)vy; // act    [nr/4][nb]
+  const block_q8_0x4 *b_sbase = (const block_q8_0x4 *)vx; // weight [nc/4][nb]
+
+  // Scalar reference of the NEON SMMLA kernel: per-block int32 accumulation in
+  // the same bi order, so results are bit-identical across implementations.
+  for (int m = 0; m < nr; ++m) {
+    const block_q8_0x4 *a = a_sbase + (size_t)(m / 4) * nb;
+    const int ar = m % 4;
+    for (int j = 0; j < nc; ++j) {
+      const block_q8_0x4 *b = b_sbase + (size_t)(j / 4) * nb;
+      const int wr = j % 4;
+      float acc = 0.0f;
+      for (int bi = 0; bi < nb; ++bi) {
+        int32_t si = 0;
+        for (int sub = 0; sub < 4; ++sub)
+          for (int c = 0; c < 8; ++c)
+            si += (int32_t)a[bi].qs[32 * sub + ar * 8 + c] *
+                  (int32_t)b[bi].qs[32 * sub + wr * 8 + c];
+        acc += nntr_fp16_to_fp32(a[bi].d[ar]) * nntr_fp16_to_fp32(b[bi].d[wr]) *
+               (float)si;
+      }
+      s[(size_t)m * bs + j] = acc;
+    }
+  }
+}
+
+void nntr_gemv_q8_0x4_q8_0(int n, float *__restrict s, size_t bs,
+                           const void *__restrict vx,
+                           const void *__restrict vy, int nc) {
+  (void)bs;
+  const int qk = QK8_0;
+  const int nb = n / qk;
+  assert(n % qk == 0);
+  assert(nc % 4 == 0);
+
+  const block_q8_0 *a = (const block_q8_0 *)vy; // one activation row [nb]
+  const block_q8_0x4 *b_sbase = (const block_q8_0x4 *)vx; // weights [nc/4][nb]
+
+  for (int j = 0; j < nc; ++j) {
+    const block_q8_0x4 *b = b_sbase + (size_t)(j / 4) * nb;
+    const int wr = j % 4;
+    float acc = 0.0f;
+    for (int bi = 0; bi < nb; ++bi) {
+      int32_t si = 0;
+      for (int sub = 0; sub < 4; ++sub)
+        for (int c = 0; c < 8; ++c)
+          si += (int32_t)a[bi].qs[8 * sub + c] *
+                (int32_t)b[bi].qs[32 * sub + wr * 8 + c];
+      acc += nntr_fp16_to_fp32(a[bi].d) * nntr_fp16_to_fp32(b[bi].d[wr]) *
+             (float)si;
+    }
+    s[j] = acc;
+  }
+}

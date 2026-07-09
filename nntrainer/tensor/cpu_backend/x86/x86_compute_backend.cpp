@@ -11,6 +11,7 @@
  *
  */
 
+#include <cstring>
 #include <assert.h>
 
 #include <avx2_impl.h>
@@ -468,6 +469,24 @@ void repack_q4_0(void *dst, void *src, size_t data_size, const unsigned int M,
     break;
   }
 }
+
+void repack_q8_0(void *dst, void *src, size_t data_size, const unsigned int M,
+                 const unsigned int N, ml::train::ISA target) {
+
+  switch (target) {
+  case ml::train::ISA::ARM:
+    // ARM FC runtime consumes the q8_0x4 interleaved layout (SMMLA kernels)
+    __ggml_repack_q8_0_to_q8_0_4(dst, src, data_size, M, N);
+    break;
+  case ml::train::ISA::X86:
+  case ml::train::ISA::DEFAULT:
+  default:
+    // x86 FC runtime consumes plain block_q8_0 rows
+    std::memcpy(dst, src, data_size);
+    break;
+  }
+}
+
 
 void repack_q4_0_to_q4_0_8(void *dst, void *src, size_t data_size,
                            const unsigned int M, const unsigned int N) {

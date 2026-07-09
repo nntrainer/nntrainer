@@ -10,6 +10,7 @@
  * @brief  Compute backend for arm
  *
  */
+#include <cstring>
 #include <arm_compute_backend.h>
 #include <assert.h>
 #ifdef USE_BLAS
@@ -391,7 +392,7 @@ template <>
 void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const float *A, const unsigned int lda, const void *B,
                const unsigned int ldb, float *C, const unsigned int ldc) {
-  return __ggml_q8_0_q8_0_GEMM(M, N, K, A, lda, B, ldb, C, ldc);
+  return __ggml_q8_0_4x4_q8_0_GEMM(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
@@ -553,6 +554,24 @@ void repack_q4_0(void *dst, void *src, size_t data_size, const unsigned int M,
     break;
   }
 }
+
+void repack_q8_0(void *dst, void *src, size_t data_size, const unsigned int M,
+                 const unsigned int N, ml::train::ISA target) {
+
+  switch (target) {
+  case ml::train::ISA::X86:
+    // x86 FC runtime consumes plain block_q8_0 rows
+    std::memcpy(dst, src, data_size);
+    break;
+  case ml::train::ISA::ARM:
+  case ml::train::ISA::DEFAULT:
+  default:
+    // ARM FC runtime consumes the q8_0x4 interleaved layout (SMMLA kernels)
+    __ggml_repack_q8_0_to_q8_0_4(dst, src, data_size, M, N);
+    break;
+  }
+}
+
 
 void repack_q4_K(void *dst, void *src, size_t data_size, const unsigned int M,
                  const unsigned int N) {

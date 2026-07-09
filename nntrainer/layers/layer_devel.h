@@ -432,11 +432,16 @@ public:
                 Tensor weight_t = weight.transpose("0:2:1");
                 Tensor quant_weight(dim.batch(), dim.channel(), K, N,
                                     {Tformat::NCHW, dtype});
-                // Q8_0 uses the native GGML block_q8_0 row layout directly (no
-                // ISA-specific repack); the FP32-activation GEMM reads it via
-                // gemm_q8_0_fp32 (see FloatTensor::dotQnK).
-                quantize_q8_0(weight_t.getData<float>(),
-                              quant_weight.getData<uint8_t>(), N, K, nullptr);
+                std::vector<char> tmp(quant_weight.size());
+
+                // Quantize to plain block_q8_0 rows, then repack for the
+                // target ISA: q8_0x4 interleaved for ARM (consumed by the
+                // SMMLA FC kernels via gemm_q8_0_fp32), plain pass-through
+                // for X86 (see FloatTensor::dotQnK).
+                quantize_q8_0(weight_t.getData<float>(), tmp.data(), N, K,
+                              nullptr);
+                repack_q8_0(quant_weight.getData<uint8_t>(), tmp.data(),
+                            quant_weight.size(), N, K, target_isa);
                 quant_weight.save(file);
               }
             } else if (dtype == TensorDim::DataType::QS4CX) {

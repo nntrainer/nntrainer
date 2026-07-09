@@ -109,6 +109,33 @@ void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
                          int nr, int nc);
 
 /**
+ * @brief Repack plain block_q8_0 rows [nrow x k/QK8_0] to the q8_0x4
+ *        interleaved layout (block_q8_0x4: d[4] + qs[32*sub + row*8 + c]).
+ *        Byte-for-byte the layout of nntr_quantize_mat_q8_0_4x8 and the
+ *        offline Python repack_q8_0 (YOLO conv path). Total bytes unchanged.
+ */
+int nntr_repack_q8_0_to_q8_0_4_bl(void *__restrict dst, int interleave_block,
+                                  const void *__restrict data, size_t data_size,
+                                  size_t nrow, size_t k);
+
+/**
+ * @brief Compute interleaved (q8_0x4) Q8_0 weights by q8_0x4 activations GEMM,
+ *        FP32 output (register-blocked 4x4 SMMLA on i8mm targets). FP32-output
+ *        port of nntr_gemm_q8_0_q8_0_4x4_fp16. Requires nr % 4 == 0.
+ */
+void nntr_gemm_q8_0x4_q8_0x4(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc);
+
+/**
+ * @brief One plain block_q8_0 activation row by interleaved (q8_0x4) Q8_0
+ *        weights GEMV, FP32 output. Requires nc % 4 == 0.
+ */
+void nntr_gemv_q8_0x4_q8_0(int n, float *__restrict s, size_t bs,
+                           const void *__restrict vx,
+                           const void *__restrict vy, int nc);
+
+/**
  * @brief Compute Q8_0 weights by Q8_0 activations GEMV
  */
 void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,

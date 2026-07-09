@@ -536,3 +536,54 @@ int nntr_repack_q4_K_to_q4_K_8_bl(void *__restrict dst, int interleave_block,
   }
   return 0;
 }
+
+int nntr_repack_q8_0_to_q8_0_4_bl(void *__restrict dst, int interleave_block,
+                                  const void *__restrict data, size_t data_size,
+                                  size_t nrow, size_t k) {
+  assert(interleave_block == 4);
+  constexpr size_t nrows_interleaved = 4;
+  const size_t nb = k / QK8_0;
+
+  block_q8_0x4 *dst_ = (block_q8_0x4 *)dst;
+  const block_q8_0 *src = (const block_q8_0 *)data;
+
+  assert(data_size == nrow * nb * sizeof(block_q8_0));
+  (void)data_size;
+  if (nrow % nrows_interleaved != 0 || k % QK8_0 != 0) {
+    return -1;
+  }
+
+  // dst qs[32*sub + row*8 + c] = src_row[block].qs[8*sub + c] -- byte-for-byte
+  // the layout of nntr_quantize_mat_q8_0_4x8 / the offline Python repack_q8_0.
+  for (size_t r = 0; r < nrow; r += nrows_interleaved) {
+    for (size_t x = 0; x < nb; x++) {
+      block_q8_0x4 out;
+      for (int row = 0; row < 4; row++) {
+        const block_q8_0 &b = src[(size_t)row * nb + x];
+        out.d[row] = b.d;
+        for (int sub = 0; sub < 4; sub++)
+          for (int c = 0; c < 8; c++)
+            out.qs[32 * sub + row * 8 + c] = b.qs[8 * sub + c];
+      }
+      *dst_++ = out;
+    }
+    src += nrows_interleaved * nb;
+  }
+  return 0;
+}
+
+void nntr_gemm_q8_0x4_q8_0x4(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+  (void)n; (void)s; (void)bs; (void)vx; (void)vy; (void)nr; (void)nc;
+  throw std::runtime_error("NYI: nntr_gemm_q8_0x4_q8_0x4 - use the AVX2 or "
+                           "NEON build for the interleaved Q8_0 path");
+}
+
+void nntr_gemv_q8_0x4_q8_0(int n, float *__restrict s, size_t bs,
+                           const void *__restrict vx,
+                           const void *__restrict vy, int nc) {
+  (void)n; (void)s; (void)bs; (void)vx; (void)vy; (void)nc;
+  throw std::runtime_error("NYI: nntr_gemv_q8_0x4_q8_0 - use the AVX2 or "
+                           "NEON build for the interleaved Q8_0 path");
+}
