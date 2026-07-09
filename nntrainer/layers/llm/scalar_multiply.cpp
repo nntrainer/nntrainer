@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <env_compat.h>
 #include <iostream>
 #include <string>
 

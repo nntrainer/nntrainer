@@ -12,6 +12,7 @@
  */
 
 #include <addition_layer.h>
+#include <env_compat.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
@@ -53,7 +54,7 @@ void AdditionLayer::forwarding(RunLayerContext &context, bool training) {
 void AdditionLayer::incremental_forwarding(RunLayerContext &context,
                                            unsigned int from, unsigned int to,
                                            bool training) {
-  bool is_prefill = !from || (to - from) > 1;
+  bool is_prefill = !from;
   if (skip_prefill && is_prefill)
     return;
 
@@ -74,7 +75,7 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
     // (NNTR_CUDA_ELTWISE).
     if (context.getNumInputs() == 2 &&
         hidden_.getDataType() == ml::train::TensorDim::DataType::FP16) {
-      static const bool gpu = std::getenv("NNTR_CUDA_ELTWISE") != nullptr;
+      static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
       if (gpu) {
         const Tensor &i0 = context.getInput(0);
         const Tensor &i1 = context.getInput(1);

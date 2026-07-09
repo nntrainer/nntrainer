@@ -15,6 +15,7 @@
 #include <cpu_backend.h>
 #include <cstdio>
 #include <cstdlib>
+#include <env_compat.h>
 #include <reshaped_rms_norm.h>
 
 #if defined(ENABLE_OPENCL)
@@ -85,7 +86,7 @@ void ReshapedRMSNormLayer::incremental_forwarding(
   ml::train::TensorDim in_step_dim = in_dim;
   ml::train::TensorDim out_step_dim = out_dim;
 
-  bool is_prefill = !from || (to - from) > 1;
+  bool is_prefill = !from;
   if (skip_prefill && is_prefill)
     return;
 
@@ -217,8 +218,13 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     // the gamma-free v_norm). Keeps q/k/v_norm on the device. Opt-in
     // NNTR_CUDA_QKNORM.
     if (!gpu_done &&
-        in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-      static const bool gpu = std::getenv("NNTR_CUDA_QKNORM") != nullptr;
+        in_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        (!gamma ||
+         gamma->getDataType() == ml::train::TensorDim::DataType::FP16)) {
+      // The kernel reads gamma as fp16; this tree requests gamma at the model
+      // weight dtype, so a differently-typed gamma keeps the host cast path
+      // (same rule as gamma_bindable on the OpenCL branch above).
+      static const bool gpu = nntr_env_on("NNTR_CUDA_QKNORM");
       if (gpu) {
         auto *ip =
           reinterpret_cast<const unsigned short *>(in_step.getData<_FP16>());

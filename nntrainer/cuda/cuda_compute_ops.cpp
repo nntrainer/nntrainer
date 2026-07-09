@@ -81,7 +81,7 @@ void CudaComputeOps::geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
   // the FFN/PLE activation stays on the device. NNTR_CUDA_ASYNC governs the
   // drain.
   if (dt == ml::train::TensorDim::DataType::FP16) {
-    static const bool gpu = std::getenv("NNTR_CUDA_GEGLU") != nullptr;
+    static const bool gpu = nntr_env_on("NNTR_CUDA_GEGLU");
     if (gpu && n > 0) {
       auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>() +
                                                          elem_off);
