@@ -922,17 +922,22 @@ void NeuralNetwork::save(
     std::map<std::string, std::string> metadata;
     bool any_quant = false;
     bool any_q4_0 = false;
+    bool any_q8_0 = false;
     for (const auto &e : entries) {
       any_quant = any_quant || !e.nntr_dtype.empty();
       any_q4_0 = any_q4_0 || e.nntr_dtype == "Q4_0";
+      any_q8_0 = any_q8_0 || e.nntr_dtype == "Q8_0";
     }
     if (any_quant)
       metadata["nntr_format"] = "nntr-safetensors-v1";
-    // Q4_0 is repacked into an ISA-specific layout (x86: q4_0x8, ARM: q4_0x4)
-    // that is indistinguishable from the header alone, so record which one was
+    // Q4_0 (x86: q4_0x8, ARM: q4_0x4) and Q8_0 FC weights (x86: plain rows,
+    // ARM: q8_0x4) are repacked into ISA-specific layouts that are
+    // indistinguishable from the header alone, so record which one was
     // produced. DEFAULT resolves to the build platform's layout. Only emitted
-    // when a Q4_0 tensor is present, since no other type depends on the ISA.
-    if (any_q4_0) {
+    // when a tensor of that type is present, since no other type depends on
+    // the ISA. (Q8_0 embedding lookup tables always stay in the plain row
+    // layout regardless of this tag; it describes the FC/GEMM weights.)
+    if (any_q4_0 || any_q8_0) {
       const char *isa_str;
       switch (target_isa) {
       case ml::train::ISA::X86:
@@ -949,7 +954,10 @@ void NeuralNetwork::save(
 #endif
         break;
       }
-      metadata["nntr_q4_0_isa"] = isa_str;
+      if (any_q4_0)
+        metadata["nntr_q4_0_isa"] = isa_str;
+      if (any_q8_0)
+        metadata["nntr_q8_0_isa"] = isa_str;
     }
 
     // Write: [8-byte header_size][header (padded to 8)][raw weight data]

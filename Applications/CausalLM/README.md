@@ -301,8 +301,9 @@ NNTrainer provides a quantization utility (`nntr_quantize`) that converts FP32 C
 | `Q4_0`    | 4-bit quantization (default for FC layers) |
 | `Q4_K`    | 4-bit K-quant quantization |
 | `Q6_K`    | 6-bit K-quant quantization |
+| `Q8_0`    | 8-bit block quantization |
 
-> **Note (Q4_0 platform dependency):** `Q4_0` quantization produces platform-specific binary formats — the output generated on x86 is **not compatible** with ARM, and vice versa. You must run `nntr_quantize` on the **same platform architecture** where the quantized model will be used for inference. Cross-platform quantization is not yet supported.
+> **Note (Q4_0 / Q8_0 platform dependency):** `Q4_0` and `Q8_0` quantization produce platform-specific binary layouts — FC weights are repacked for the target ISA (`Q4_0`: `q4_0x8` on x86 / `q4_0x4` on ARM; `Q8_0`: plain rows on x86 / `q8_0x4` interleaved on ARM). A file produced for one platform is **not compatible** with the other and silently yields garbage output (the bytes parse, the numbers are wrong). Either run `nntr_quantize` on the same platform architecture where the model will be used, or pass `--isa ARM` / `--isa X86` explicitly when cross-quantizing (with no `--isa`, `DEFAULT` resolves to the **build host's** layout — quantizing on an x86 host for an Android device requires `--isa ARM`).
 
 
 ### Prerequisites
@@ -457,12 +458,15 @@ tooling can still read the file, while the native nntrainer type and logical
 FP32/FP16 tensors are written with their standard `dtype`/`shape` and no
 extension fields, so plain (non-quantized) files stay fully standard.
 
-`Q4_0` is repacked into an ISA-specific layout (x86: `q4_0x8`, ARM: `q4_0x4`)
-that the header bytes alone cannot distinguish, so files containing a `Q4_0`
-tensor record `nntr_q4_0_isa` (`x86` / `arm`) under `__metadata__`. This is the
-layout chosen by `--isa` (with `DEFAULT` resolving to the build platform), so a
-file cross-quantized on x86 with `--isa ARM` is tagged `arm` and is identifiable
-before it is loaded on the wrong architecture.
+`Q4_0` (x86: `q4_0x8`, ARM: `q4_0x4`) and `Q8_0` FC weights (x86: plain rows,
+ARM: `q8_0x4` interleaved) are repacked into ISA-specific layouts that the
+header bytes alone cannot distinguish, so files containing such tensors record
+`nntr_q4_0_isa` / `nntr_q8_0_isa` (`x86` / `arm`) under `__metadata__`. This is
+the layout chosen by `--isa` (with `DEFAULT` resolving to the build platform),
+so a file cross-quantized on x86 with `--isa ARM` is tagged `arm` and is
+identifiable before it is loaded on the wrong architecture. (`Q8_0` embedding
+lookup tables always stay in the plain row layout; the tag describes the
+FC/GEMM weights.)
 
 ### Inspecting a file
 
