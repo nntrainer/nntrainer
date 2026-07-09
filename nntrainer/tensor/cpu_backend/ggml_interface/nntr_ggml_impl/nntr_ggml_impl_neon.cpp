@@ -1972,31 +1972,126 @@ void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
   const block_q8_0 *a_base = (const block_q8_0 *)vy; // activations [nr x nb]
   const block_q8_0 *b_base = (const block_q8_0 *)vx; // weights     [nc x nb]
 
-  for (int m = 0; m < nr; ++m) {
-    const block_q8_0 *a_row = a_base + (size_t)m * nb;
-    for (int j = 0; j < nc; ++j) {
-      const block_q8_0 *b_row = b_base + (size_t)j * nb;
-      float acc = 0.0f;
+  // Scalar (SDOT) dot of one activation row against one weight row -- used for
+  // the M%4 / N%4 edges and as the whole body on non-i8mm targets. Byte-for-
+  // byte the inner core of the pre-SMMLA version of this kernel, and the
+  // per-block accumulation order matches the 4x4 path below, so results are
+  // bit-identical regardless of which path computes an output.
+  auto dot_one = [&](const block_q8_0 *arow, const block_q8_0 *brow) -> float {
+    float acc = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+      int32x4_t sumi = vdupq_n_s32(0);
+      sumi = ggml_vdotq_s32(sumi, vld1q_s8(arow[b].qs), vld1q_s8(brow[b].qs));
+      sumi = ggml_vdotq_s32(sumi, vld1q_s8(arow[b].qs + 16),
+                            vld1q_s8(brow[b].qs + 16));
+      acc += nntr_fp16_to_fp32(arow[b].d) * nntr_fp16_to_fp32(brow[b].d) *
+             (float)vaddvq_s32(sumi);
+    }
+    return acc;
+  };
+
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+  // Register-blocked 4x4 SMMLA tiles over plain block_q8_0 rows -- the FP32-
+  // output port of nntr_gemm_q8_0_q8_0_fp16 (see nntr_ggml_impl_neon.cpp,
+  // conv path); only the stores differ.
+  const int nr4 = nr & ~3;
+  const int nc4 = nc & ~3;
+
+  for (int m = 0; m < nr4; m += 4) {
+    const block_q8_0 *a0 = a_base + (size_t)(m + 0) * nb;
+    const block_q8_0 *a1 = a_base + (size_t)(m + 1) * nb;
+    const block_q8_0 *a2 = a_base + (size_t)(m + 2) * nb;
+    const block_q8_0 *a3 = a_base + (size_t)(m + 3) * nb;
+
+    for (int j = 0; j < nc4; j += 4) {
+      const block_q8_0 *b0 = b_base + (size_t)(j + 0) * nb;
+      const block_q8_0 *b1 = b_base + (size_t)(j + 1) * nb;
+      const block_q8_0 *b2 = b_base + (size_t)(j + 2) * nb;
+      const block_q8_0 *b3 = b_base + (size_t)(j + 3) * nb;
+
+      float32x4_t fr0 = vdupq_n_f32(0.0f);
+      float32x4_t fr1 = vdupq_n_f32(0.0f);
+      float32x4_t fr2 = vdupq_n_f32(0.0f);
+      float32x4_t fr3 = vdupq_n_f32(0.0f);
+
       for (int b = 0; b < nb; ++b) {
-        // Each block holds 32 int8 quants; load as two int8x16 vectors.
-        const int8x16_t a0 = vld1q_s8(a_row[b].qs);
-        const int8x16_t a1 = vld1q_s8(a_row[b].qs + 16);
-        const int8x16_t b0 = vld1q_s8(b_row[b].qs);
-        const int8x16_t b1 = vld1q_s8(b_row[b].qs + 16);
+        // Per-block int32 accumulators (reset each block: block scales differ).
+        int32x4_t acc00 = vdupq_n_s32(0); // rows(0,1) x cols(0,1)
+        int32x4_t acc01 = vdupq_n_s32(0); // rows(0,1) x cols(2,3)
+        int32x4_t acc10 = vdupq_n_s32(0); // rows(2,3) x cols(0,1)
+        int32x4_t acc11 = vdupq_n_s32(0); // rows(2,3) x cols(2,3)
 
-        // SAME helper as the Q4_0 NEON path.
-        int32x4_t sumi = vdupq_n_s32(0);
-        sumi = ggml_vdotq_s32(sumi, a0, b0);
-        sumi = ggml_vdotq_s32(sumi, a1, b1);
+        for (int c = 0; c < qk; c += 8) {
+          const int8x16_t ar01 =
+            vcombine_s8(vld1_s8(a0[b].qs + c), vld1_s8(a1[b].qs + c));
+          const int8x16_t ar23 =
+            vcombine_s8(vld1_s8(a2[b].qs + c), vld1_s8(a3[b].qs + c));
+          const int8x16_t bc01 =
+            vcombine_s8(vld1_s8(b0[b].qs + c), vld1_s8(b1[b].qs + c));
+          const int8x16_t bc23 =
+            vcombine_s8(vld1_s8(b2[b].qs + c), vld1_s8(b3[b].qs + c));
+          // vmmlaq_s32(r,a,b): r[0]+=a_lo.b_lo, r[1]+=a_lo.b_hi,
+          //                    r[2]+=a_hi.b_lo, r[3]+=a_hi.b_hi
+          acc00 = vmmlaq_s32(acc00, ar01, bc01);
+          acc01 = vmmlaq_s32(acc01, ar01, bc23);
+          acc10 = vmmlaq_s32(acc10, ar23, bc01);
+          acc11 = vmmlaq_s32(acc11, ar23, bc23);
+        }
 
-        const int32_t isum = vaddvq_s32(sumi);
-        const float da = nntr_fp16_to_fp32(a_row[b].d);
-        const float db = nntr_fp16_to_fp32(b_row[b].d);
-        acc += da * db * (float)isum;
+        // Reassemble one int32x4 per row over cols j..j+3.
+        const int32x4_t ri0 =
+          vcombine_s32(vget_low_s32(acc00), vget_low_s32(acc01));
+        const int32x4_t ri1 =
+          vcombine_s32(vget_high_s32(acc00), vget_high_s32(acc01));
+        const int32x4_t ri2 =
+          vcombine_s32(vget_low_s32(acc10), vget_low_s32(acc11));
+        const int32x4_t ri3 =
+          vcombine_s32(vget_high_s32(acc10), vget_high_s32(acc11));
+
+        const float da0 = nntr_fp16_to_fp32(a0[b].d);
+        const float da1 = nntr_fp16_to_fp32(a1[b].d);
+        const float da2 = nntr_fp16_to_fp32(a2[b].d);
+        const float da3 = nntr_fp16_to_fp32(a3[b].d);
+        const float db_arr[4] = {
+          nntr_fp16_to_fp32(b0[b].d), nntr_fp16_to_fp32(b1[b].d),
+          nntr_fp16_to_fp32(b2[b].d), nntr_fp16_to_fp32(b3[b].d)};
+        const float32x4_t db = vld1q_f32(db_arr);
+
+        fr0 = vfmaq_f32(fr0, vmulq_n_f32(vcvtq_f32_s32(ri0), da0), db);
+        fr1 = vfmaq_f32(fr1, vmulq_n_f32(vcvtq_f32_s32(ri1), da1), db);
+        fr2 = vfmaq_f32(fr2, vmulq_n_f32(vcvtq_f32_s32(ri2), da2), db);
+        fr3 = vfmaq_f32(fr3, vmulq_n_f32(vcvtq_f32_s32(ri3), da3), db);
       }
-      s[(size_t)m * bs + j] = acc;
+
+      vst1q_f32(&s[(size_t)(m + 0) * bs + j], fr0);
+      vst1q_f32(&s[(size_t)(m + 1) * bs + j], fr1);
+      vst1q_f32(&s[(size_t)(m + 2) * bs + j], fr2);
+      vst1q_f32(&s[(size_t)(m + 3) * bs + j], fr3);
+    }
+
+    // Column remainder (nc % 4) for this 4-row block.
+    for (int j = nc4; j < nc; ++j) {
+      const block_q8_0 *brow = b_base + (size_t)j * nb;
+      s[(size_t)(m + 0) * bs + j] = dot_one(a0, brow);
+      s[(size_t)(m + 1) * bs + j] = dot_one(a1, brow);
+      s[(size_t)(m + 2) * bs + j] = dot_one(a2, brow);
+      s[(size_t)(m + 3) * bs + j] = dot_one(a3, brow);
     }
   }
+
+  // Row remainder (nr % 4).
+  for (int m = nr4; m < nr; ++m) {
+    const block_q8_0 *arow = a_base + (size_t)m * nb;
+    for (int j = 0; j < nc; ++j)
+      s[(size_t)m * bs + j] = dot_one(arow, b_base + (size_t)j * nb);
+  }
+#else
+  for (int m = 0; m < nr; ++m) {
+    const block_q8_0 *arow = a_base + (size_t)m * nb;
+    for (int j = 0; j < nc; ++j)
+      s[(size_t)m * bs + j] = dot_one(arow, b_base + (size_t)j * nb);
+  }
+#endif
 }
 
 void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
