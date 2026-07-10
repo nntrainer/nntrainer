@@ -816,7 +816,7 @@ std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
 
   // add lmhead
   std::vector<std::string> lmhead_prop = {
-    withKey("name", "output_of_causallm"),
+    withKey("name", "output_of_quick_ai"),
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true"),
     withKey("weight_dtype", LMHEAD_DTYPE),
@@ -831,7 +831,7 @@ std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
 
   if (FINAL_LOGIT_SOFTCAPPING > 0.0f) {
     std::vector<std::string> final_softcap_props = {
-      withKey("name", "output_of_causallm_softcapped"),
+      withKey("name", "output_of_quick_ai_softcapped"),
       withKey("activation_type", "tanh"), withKey("apply_rows", "1"),
       withKey("softcap_value", std::to_string(FINAL_LOGIT_SOFTCAPPING))};
     appendSkipPrefillIfNeeded(final_softcap_props, true);

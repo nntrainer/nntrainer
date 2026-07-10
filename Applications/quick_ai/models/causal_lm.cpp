@@ -229,7 +229,7 @@ std::pair<Tensor, Tensor> CausalLM::constructModel() {
     TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
 
   std::vector<std::string> lmhead_prop = {
-    withKey("name", "output_of_causallm"),
+    withKey("name", "output_of_quick_ai"),
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true"),
     withKey("weight_dtype", LMHEAD_DTYPE),

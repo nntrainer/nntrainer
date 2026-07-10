@@ -21,7 +21,7 @@
 ## - Double-wide MLP for KV-shared layers (shape is taken from the source tensor)
 ## - Per-layer input embedding / projection / norm (global, emitted with layer 0)
 ## - Tied word embeddings: the lm head shares embedding0, so the safetensors
-##   path emits no separate output_of_causallm entry, while the .bin path keeps
+##   path emits no separate output_of_quick_ai entry, while the .bin path keeps
 ##   the trailing duplicate that nntrainer's binary lm-head save expects.
 
 import argparse
@@ -200,7 +200,7 @@ def iter_gemma4_weight_specs(params, config):
 
     Tensors are yielded as references into the model state dict, so this holds
     no extra memory; callers convert each tensor to numpy one at a time and
-    release it before moving on. The tied lm head (output_of_causallm) is
+    release it before moving on. The tied lm head (output_of_quick_ai) is
     intentionally excluded here; the two output paths handle it themselves.
     """
     text_config = config.text_config
@@ -289,9 +289,9 @@ def lm_head_spec(params, tie_word_embeddings):
     """
     resolve = make_param_resolver(params)
     if tie_word_embeddings:
-        return ("output_of_causallm", SUFFIX_EMBEDDING,
+        return ("output_of_quick_ai", SUFFIX_EMBEDDING,
                 resolve("embed_tokens.weight"), False)
-    return ("output_of_causallm", SUFFIX_WEIGHT,
+    return ("output_of_quick_ai", SUFFIX_WEIGHT,
             resolve("lm_head.weight"), True)
 
 
@@ -353,7 +353,7 @@ def save_gemma4_safetensors(params, config, dtype, output_path,
     specs = list(iter_gemma4_weight_specs(params, config))
 
     # With tied embeddings the lm head shares embedding0's tensor, so nntrainer
-    # stores a single deduped entry and no separate output_of_causallm is added.
+    # stores a single deduped entry and no separate output_of_quick_ai is added.
     if not tie_word_embeddings:
         specs.append(lm_head_spec(params, tie_word_embeddings))
 
