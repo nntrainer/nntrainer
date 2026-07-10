@@ -16,8 +16,10 @@
 #define __ACTI_FUNC_H__
 #ifdef __cplusplus
 
+#include <algorithm>
 #include <common_properties.h>
 #include <cpu_backend.h>
+#include <thread_manager.h>
 
 #if defined(_WIN32)
 #define _USE_MATH_DEFINES
@@ -436,8 +438,26 @@ public:
    */
   template <typename T = float>
   static Tensor &gelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::gelu_v2(t_in.size(), t_in.getData<float>(),
-                       t_out.getData<float>());
+    const unsigned int N = t_in.size();
+    const float *x = t_in.getData<float>();
+    float *y = t_out.getData<float>();
+
+    // Elementwise, so chunks are independent: split large tensors (e.g. the
+    // encoder's [196, 3072] FFN activation) across the ThreadManager pool the
+    // same way the tensor ops do. Small tensors (decode-step rows) stay on
+    // the single-dispatch vectorized kernel.
+    constexpr unsigned int chunk = 1u << 14; // 16K floats per task
+    if (N >= 2 * chunk) {
+      auto &tm = ThreadManager::Global();
+      const size_t loops = (N + chunk - 1) / chunk;
+      tm.parallel_for(0, loops, [=](size_t li) {
+        const unsigned int start = (unsigned int)(li * chunk);
+        const unsigned int end = std::min(N, start + chunk);
+        nntrainer::gelu_v2(end - start, x + start, y + start);
+      });
+    } else {
+      nntrainer::gelu_v2(N, x, y);
+    }
     return t_out;
   }
 

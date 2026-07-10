@@ -23,6 +23,14 @@ auto semantic_layer_normalization = LayerSemanticsParamType(
 
 auto ln_option = LayerGoldenTestParamOptions::SKIP_COSINE_SIMILARITY;
 
+// Forward-only (training=false) variant: exercises the fused row-wise FP32
+// width-axis fast path in LayerNormalizationLayer::forwarding, which must be
+// numerically equivalent to the generic training path (same golden file).
+auto ln_inference_option = LayerGoldenTestParamOptions::SKIP_COSINE_SIMILARITY |
+                           LayerGoldenTestParamOptions::SKIP_CALC_GRAD |
+                           LayerGoldenTestParamOptions::SKIP_CALC_DERIV |
+                           LayerGoldenTestParamOptions::FORWARD_MODE_INFERENCE;
+
 GTEST_PARAMETER_TEST(LayerNormalization, LayerSemantics,
                      ::testing::Values(semantic_layer_normalization));
 
@@ -54,10 +62,17 @@ auto ln_axis_1_2_3 = LayerGoldenTestParamType(
   nntrainer::createLayer<nntrainer::LayerNormalizationLayer>, {"axis=1, 2, 3"},
   "2:4:2:3", "ln_axis_1_2_3.nnlayergolden", ln_option, "nchw", "fp32", "fp32");
 
+// axis=3 (width), FP32, forward-only: hits the fused row-wise inference fast
+// path; must reproduce the same golden output as the generic ln_axis_3 run.
+auto ln_axis_3_inference = LayerGoldenTestParamType(
+  nntrainer::createLayer<nntrainer::LayerNormalizationLayer>, {"axis=3"},
+  "2:4:2:3", "ln_axis_3.nnlayergolden", ln_inference_option, "nchw", "fp32",
+  "fp32");
+
 GTEST_PARAMETER_TEST(LayerNormalization, LayerGoldenTest,
                      ::testing::Values(ln_axis_1, ln_axis_2, ln_axis_3,
                                        ln_axis_1_2, ln_axis_2_3, ln_axis_1_3,
-                                       ln_axis_1_2_3));
+                                       ln_axis_1_2_3, ln_axis_3_inference));
 
 #ifdef ENABLE_FP16
 auto ln_axis_1_w16a16 = LayerGoldenTestParamType(

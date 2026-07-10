@@ -13,6 +13,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 
 #include <base_properties.h>
@@ -22,11 +23,97 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <thread_manager.h>
 #include <util_func.h>
 
 namespace nntrainer {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
+
+namespace {
+
+/**
+ * @brief Fused row-wise LayerNorm over the width axis (FP32, NCHW):
+ *        y = (x - mean(x)) / sqrt(var(x) + eps) * gamma + beta, one row at a
+ *        time. Replaces the generic 9-pass tensor-op chain (average, subtract,
+ *        pow, average, add, pow, multiply x2, add) with two read passes and one
+ *        write pass per row, threaded over rows via ThreadManager (the same
+ *        convention as FloatTensor::normalization_i). Rows are independent, so
+ *        the parallel result is identical to the serial one.
+ */
+void fusedWidthLayerNormFp32(const float *in, float *out, const float *gamma,
+                             const float *beta, size_t rows, size_t width,
+                             float epsilon) {
+  auto ln_row = [=](size_t r) {
+    const float *x = in + r * width;
+    float *y = out + r * width;
+
+    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+    size_t i = 0;
+    for (; i + 4 <= width; i += 4) {
+      s0 += x[i];
+      s1 += x[i + 1];
+      s2 += x[i + 2];
+      s3 += x[i + 3];
+    }
+    for (; i < width; ++i)
+      s0 += x[i];
+    const float mean = (s0 + s1 + s2 + s3) / (float)width;
+
+    float v0 = 0.f, v1 = 0.f, v2 = 0.f, v3 = 0.f;
+    i = 0;
+    for (; i + 4 <= width; i += 4) {
+      const float d0 = x[i] - mean, d1 = x[i + 1] - mean;
+      const float d2 = x[i + 2] - mean, d3 = x[i + 3] - mean;
+      v0 += d0 * d0;
+      v1 += d1 * d1;
+      v2 += d2 * d2;
+      v3 += d3 * d3;
+    }
+    for (; i < width; ++i) {
+      const float d = x[i] - mean;
+      v0 += d * d;
+    }
+    const float var = (v0 + v1 + v2 + v3) / (float)width;
+    const float inv_std = 1.0f / std::sqrt(var + epsilon);
+
+    for (i = 0; i < width; ++i)
+      y[i] = (x[i] - mean) * inv_std * gamma[i] + beta[i];
+  };
+
+  // Threading pays off only when there are enough independent rows of real
+  // work (e.g. encoder prefill: 196 x 768); a single decode-step row stays
+  // serial but still gets the fused single-dispatch path.
+  if (rows >= 4 && rows * width >= (size_t)1 << 14) {
+    auto &tm = ThreadManager::Global();
+    tm.parallel_for(0, rows, [&](size_t r) { ln_row(r); });
+  } else {
+    for (size_t r = 0; r < rows; ++r)
+      ln_row(r);
+  }
+}
+
+/**
+ * @brief True when the fused FP32 width-axis fast path can serve this call:
+ *        inference-style width-only normalization on contiguous FP32 NCHW
+ *        tensors (gamma/beta are [1,1,1,W] FP32).
+ */
+bool canUseFusedWidthLayerNorm(const std::vector<unsigned int> &normalize_axes,
+                               const Tensor &input, const Tensor &output,
+                               const Tensor &gamma, const Tensor &beta) {
+  const unsigned int width_axis = ml::train::TensorDim::getNumDim() - 1;
+  return normalize_axes.size() == 1 && normalize_axes[0] == width_axis &&
+         input.getDim().getFormat() == Tformat::NCHW &&
+         input.getDataType() == TensorDim::DataType::FP32 &&
+         output.getDataType() == TensorDim::DataType::FP32 &&
+         gamma.getDataType() == TensorDim::DataType::FP32 &&
+         beta.getDataType() == TensorDim::DataType::FP32 &&
+         input.getContiguous() && output.getContiguous() &&
+         gamma.size() == input.getDim().width() &&
+         beta.size() == input.getDim().width();
+}
+
+} // namespace
 
 enum LNParams {
   gamma,
@@ -144,6 +231,20 @@ void LayerNormalizationLayer::forwarding(RunLayerContext &context,
   Tensor &variance = context.getTensor(wt_idx[LNParams::variance]);
   Tensor &inv_std_dev = context.getTensor(wt_idx[LNParams::inv_std_dev]);
 
+  // Inference fast path: the deviation/variance/inv_std_dev caches are only
+  // consumed by calcDerivative/calcGradient, so a forward-only call can skip
+  // them and run the fused row-wise kernel instead of the 9-pass chain below.
+  if (!training &&
+      canUseFusedWidthLayerNorm(normalize_axes, input, output, gamma, beta)) {
+    const TensorDim &in_dim = input.getDim();
+    const size_t rows =
+      (size_t)in_dim.batch() * in_dim.channel() * in_dim.height();
+    fusedWidthLayerNormFp32(input.getData<float>(), output.getData<float>(),
+                            gamma.getData<float>(), beta.getData<float>(), rows,
+                            in_dim.width(), epsilon);
+    return;
+  }
+
   Tensor &temp_full_size = output;
   Tensor &temp_norm_size = inv_std_dev;
 
@@ -177,6 +278,21 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
   Tensor &deviation = context.getTensor(wt_idx[LNParams::deviation]);
   Tensor &variance = context.getTensor(wt_idx[LNParams::variance]);
   Tensor &inv_std_dev = context.getTensor(wt_idx[LNParams::inv_std_dev]);
+
+  // Inference fast path (same as forwarding()): the generic branch below
+  // normalizes the WHOLE input tensor regardless of [from, to), so the fused
+  // row-wise kernel over all rows computes the identical result in one
+  // dispatch instead of the 9-pass tensor-op chain.
+  if (!training &&
+      canUseFusedWidthLayerNorm(normalize_axes, input, output, gamma, beta)) {
+    const TensorDim &in_dim_fast = input.getDim();
+    const size_t rows =
+      (size_t)in_dim_fast.batch() * in_dim_fast.channel() * in_dim_fast.height();
+    fusedWidthLayerNormFp32(input.getData<float>(), output.getData<float>(),
+                            gamma.getData<float>(), beta.getData<float>(), rows,
+                            in_dim_fast.width(), epsilon);
+    return;
+  }
 
   // @todo: consider NHWC format
   bool is_height_normalize =
