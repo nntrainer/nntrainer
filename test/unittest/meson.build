@@ -107,6 +107,7 @@ endif
 
 if host_machine.cpu_family() == 'aarch64'
   test_target += [['unittest_nntrainer_kleidiai', []]]
+  test_target += [['unittest_nntrainer_ggml_arm', []]]
 endif
 
 foreach target: test_target

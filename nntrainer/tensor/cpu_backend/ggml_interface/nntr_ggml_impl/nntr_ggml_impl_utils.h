@@ -36,6 +36,22 @@
 #include <immintrin.h>
 #endif // !defined(__aarch64__)
 
+// Inline fp32 -> fp16 conversion for the hot quantization loops.
+// TODO: fold this into nntr_fp32_to_fp16 (make it inline) and drop this helper.
+#if defined(__ARM_NEON) && defined(ENABLE_FP16) &&                             \
+  !(defined(__CUDACC__) && __CUDACC_VER_MAJOR__ <= 11) && !defined(__MUSACC__)
+static inline nntr_fp16_t nntr_fp32_to_fp16_inline(float f) {
+  nntr_fp16_t res;
+  __fp16 tmp = f;
+  memcpy(&res, &tmp, sizeof(nntr_fp16_t));
+  return res;
+}
+#else
+static inline nntr_fp16_t nntr_fp32_to_fp16_inline(float f) {
+  return nntr_fp32_to_fp16(f);
+}
+#endif
+
 // some compilers don't provide _mm256_set_m128i, e.g. gcc 7
 #define MM256_SET_M128I(a, b)                                                  \
   _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)

@@ -53,7 +53,7 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                               (void *)((char *)B + M_step_start * B_step),
                               QA.data(), M, M_step_end - M_step_start);
     });
-  } else if (M % 4 != 0) {
+  } else { // GEMM
     unsigned int blocks_per_4_rows = (K + QK8_0 - 1) / QK8_0;
     unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * blocks_per_4_rows;
     const size_t qa_row_size =
@@ -63,11 +63,24 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
     unsigned int qa_size =
       qa_4_rows_size * M4 + static_cast<unsigned int>(qa_row_size) * (M % 4);
     std::vector<char> QA = std::vector<char>(qa_size);
+    char *qa_data = QA.data();
 
-    // online quantization for M4 * 4 rows
-    for (unsigned int i = 0; i < M4; i++) {
-      nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
-                                 K);
+    // online quantization for M4 * 4 rows; parallelize over 8-group chunks
+    // when there is enough work to amortize waking the pool
+    unsigned int quant_chunk = 8;
+    if (M4 >= 2 * quant_chunk) {
+      tm.parallel_for(0, (M4 + quant_chunk - 1) / quant_chunk, [=](size_t t) {
+        unsigned int q_end = std::min(quant_chunk * (t + 1), (size_t)M4);
+        for (unsigned int i = quant_chunk * t; i < q_end; i++) {
+          nntr_quantize_mat_q8_0_4x8(A + 4 * i * K,
+                                     qa_data + i * qa_4_rows_size, K);
+        }
+      });
+    } else {
+      for (unsigned int i = 0; i < M4; i++) {
+        nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, qa_data + i * qa_4_rows_size,
+                                   K);
+      }
     }
 
     // online quantization for remainder
@@ -78,11 +91,16 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
     }
 
     // Compute 4-divisible-M row portion with multithreaded GEMM
+    // Row chunk is fixed at 16 (L1-friendly for K=1k-8k range).
+    // Column chunk scales to maintain ~64 tasks per thread for balanced
+    // work-stealing across asymmetric cores.
     unsigned int row_chunk_size = 16;
     size_t row_loop = (M4 * 4 + row_chunk_size - 1) / row_chunk_size;
+    size_t col_chunk_size = (unsigned int)std::clamp<size_t>(
+      (size_t)N * row_loop / ((size_t)64 * tm.getComputeThreadCount()) / 4 * 4,
+      16, 64);
     unsigned int A_step = sizeof(block_q8_0) * (K / QK8_0);
 
-    unsigned int col_chunk_size = 16;
     size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
     unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
 
@@ -91,10 +109,12 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
       unsigned int c = i % col_loop;
 
       unsigned int r_start = r * row_chunk_size;
-      unsigned int r_end = std::min(row_chunk_size * (r + 1), M4 * 4);
+      unsigned int r_end = std::min((unsigned int)(row_chunk_size * (r + 1)),
+                                    (unsigned int)(M4 * 4));
 
       unsigned int c_start = c * col_chunk_size;
-      unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+      unsigned int c_end =
+        std::min((unsigned int)(col_chunk_size * (c + 1)), N);
 
       nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + r_start * N + c_start), ldc,
                               (void *)((char *)B + c_start * B_step),
@@ -118,42 +138,6 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
           M_step_end - M_step_start);
       });
     }
-  } else { // GEMM
-    unsigned int blocks_per_4_rows = (K + QK8_0 - 1) / QK8_0;
-    unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * blocks_per_4_rows;
-    unsigned int M4 = M / 4; // M % 4 == 0
-
-    unsigned int qa_size = qa_4_rows_size * M4;
-    std::vector<char> QA = std::vector<char>(qa_size);
-
-    for (int i = 0; i < static_cast<int>(M4); i++) {
-      nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
-                                 K);
-    }
-
-    unsigned int row_chunk_size = 16;
-    size_t row_loop = (M + row_chunk_size - 1) / row_chunk_size;
-    unsigned int A_step = sizeof(block_q8_0) * (K / QK8_0);
-
-    unsigned int col_chunk_size = 16;
-    size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
-    unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
-
-    tm.parallel_for(0, col_loop * row_loop, [=](size_t i) {
-      unsigned int r = i / col_loop;
-      unsigned int c = i % col_loop;
-
-      unsigned int r_start = r * row_chunk_size;
-      unsigned int r_end = std::min(row_chunk_size * (r + 1), M);
-
-      unsigned int c_start = c * col_chunk_size;
-      unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
-
-      nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + r_start * N + c_start), ldc,
-                              (void *)((char *)B + c_start * B_step),
-                              (void *)(QA.data() + r_start * A_step),
-                              r_end - r_start, c_end - c_start);
-    });
   }
 }
 

@@ -1452,61 +1452,22 @@ void nntr_quantize_mat_q8_0_4x8(const float *__restrict x, void *__restrict vy,
       const float d = amax / ((1 << 7) - 1);
       id[row_iter] = d ? 1.0f / d : 0.0f;
 
-      y[i].d[row_iter] = nntr_compute_fp32_to_fp16(d);
+      y[i].d[row_iter] = nntr_fp32_to_fp16_inline(d);
     }
 
     for (int j = 0; j < 4; j++) {
-      float32x4_t v = vmulq_n_f32(srcv[0][2 * j], id[0]);
-      int32x4_t vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 0] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 1] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 2] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 3] = vgetq_lane_s32(vi, 3);
-      v = vmulq_n_f32(srcv[0][2 * j + 1], id[0]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 4] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 5] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 6] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 7] = vgetq_lane_s32(vi, 3);
-
-      v = vmulq_n_f32(srcv[1][2 * j], id[1]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 8] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 9] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 10] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 11] = vgetq_lane_s32(vi, 3);
-      v = vmulq_n_f32(srcv[1][2 * j + 1], id[1]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 12] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 13] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 14] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 15] = vgetq_lane_s32(vi, 3);
-
-      v = vmulq_n_f32(srcv[2][2 * j], id[2]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 16] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 17] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 18] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 19] = vgetq_lane_s32(vi, 3);
-      v = vmulq_n_f32(srcv[2][2 * j + 1], id[2]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 20] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 21] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 22] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 23] = vgetq_lane_s32(vi, 3);
-
-      v = vmulq_n_f32(srcv[3][2 * j], id[3]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 24] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 25] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 26] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 27] = vgetq_lane_s32(vi, 3);
-      v = vmulq_n_f32(srcv[3][2 * j + 1], id[3]);
-      vi = vcvtnq_s32_f32(v);
-      y[i].qs[32 * j + 28] = vgetq_lane_s32(vi, 0);
-      y[i].qs[32 * j + 29] = vgetq_lane_s32(vi, 1);
-      y[i].qs[32 * j + 30] = vgetq_lane_s32(vi, 2);
-      y[i].qs[32 * j + 31] = vgetq_lane_s32(vi, 3);
+      // Quantized values fit in [-127, 127], so plain (non-saturating)
+      // narrowing matches the truncating int8 assignment of the scalar path.
+      int8x8_t q[4];
+      for (int row_iter = 0; row_iter < 4; row_iter++) {
+        const int32x4_t lo =
+          vcvtnq_s32_f32(vmulq_n_f32(srcv[row_iter][2 * j], id[row_iter]));
+        const int32x4_t hi =
+          vcvtnq_s32_f32(vmulq_n_f32(srcv[row_iter][2 * j + 1], id[row_iter]));
+        q[row_iter] = vmovn_s16(vcombine_s16(vmovn_s32(lo), vmovn_s32(hi)));
+      }
+      vst1q_s8(&y[i].qs[32 * j + 0], vcombine_s8(q[0], q[1]));
+      vst1q_s8(&y[i].qs[32 * j + 16], vcombine_s8(q[2], q[3]));
     }
   }
 }
