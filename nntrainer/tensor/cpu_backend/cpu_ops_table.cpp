@@ -21,6 +21,10 @@
 
 namespace nntrainer {
 
+/**
+ * @class CpuComputeOps
+ * @brief CPU compute operations implementation table.
+ */
 class CpuComputeOps : public ComputeOps {
 public:
   // FP32 BLAS
