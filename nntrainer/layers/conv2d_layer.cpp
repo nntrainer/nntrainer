@@ -864,7 +864,15 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
     // that never materialize a col buffer: the 1x1 path (im2col is an identity
     // handled by an input transpose) and, where the fused backend op exists,
     // the non-1x1 path (gather is fused into the q8_0 activation packing).
-    if (!(quant_matmul_filter && (is_1x1_s1 || NNTR_HAS_Q4_0_INDIRECT_CONV))) {
+    // EXCEPT: a non-1x1 Q8_0 filter on an NCHW input runs the materialized
+    // im2col + dotQnK fallback (the fused indirect gather is Q4_0-only), so it
+    // does need the col buffer even when the indirect op exists.
+    const bool q8_nchw_fallback =
+      quant_matmul_filter &&
+      in_t_type.data_type == nntrainer::Tdatatype::Q8_0 &&
+      in_dim.getFormat() == ml::train::TensorDim::Format::NCHW && !is_1x1_s1;
+    if (!(quant_matmul_filter && (is_1x1_s1 || NNTR_HAS_Q4_0_INDIRECT_CONV)) ||
+        q8_nchw_fallback) {
       // FP path or quant fallback: materialize the im2col column buffer
       // [batch, 1, CRS, OH*OW] once (planned into the activation arena). The
       // quant 1x1 path (identity input transpose) and the quant indirect path
@@ -1003,8 +1011,12 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
     // The quant 1x1 path (identity transpose) and the quant indirect path
     // (gather fused into the GEMM) requested no col buffer in finalize, so the
     // pointer stays null for them.
+    const bool q8_nchw_fallback =
+      weight_is_q8 &&
+      in_dim.getFormat() == ml::train::TensorDim::Format::NCHW && !is_1x1_s1;
     const bool use_im2col_scratch =
-      !(weight_is_quant && (is_1x1_s1 || NNTR_HAS_Q4_0_INDIRECT_CONV));
+      !(weight_is_quant && (is_1x1_s1 || NNTR_HAS_Q4_0_INDIRECT_CONV)) ||
+      q8_nchw_fallback;
     Tensor *col_scratch =
       use_im2col_scratch
         ? &context.getTensor(wt_idx[ConvParams::im2col_scratch])
@@ -1113,13 +1125,12 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
                 "indirect conv on ARM).");
             }
           } else {
-            // Q8_0 weights are only wired for the NHWC q8-activation indirect
-            // path; the NCHW quant matmul/indirect fallbacks below assume a
-            // Q4_0 weight operand, so reject Q8_0 here instead of silently
-            // dispatching to the Q4_0 kernels.
-            if (weight_is_q8) {
+            // NCHW Q8_0 matmul convs need an FP32 activation: they run through
+            // dotQnK (gemm_q8_0_fp32), which HalfTensor does not implement.
+            if (weight_is_q8 &&
+                in_sub.getDataType() != ml::train::TensorDim::DataType::FP32) {
               throw std::runtime_error(
-                "Q8_0 conv weights require the NHWC indirect path.");
+                "NCHW Q8_0 conv weights require FP32 activations.");
             }
             // Quantized conv as matmul: act [OH*OW, CRS] . weight [CRS, out_ch]
             // -> [OH*OW, out_ch] -> out [out_ch, OH*OW]. CRS = in_ch*kh*kw.
@@ -1129,19 +1140,20 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             Tensor tmp = qgemm_scratch->getBatchSlice(b, 1);
             tmp.reshape(
               TensorDim(1, 1, owoh, filter_size, in_sub.getTensorType()));
-            if (is_1x1_s1 && !weight_is_q8) {
+            if (is_1x1_s1) {
               // 1x1 stride-1: im2col is an identity. The raw input is laid out
               // as [in_ch, OH*OW] (NCHW), so transpose to the act layout
               // [OH*OW, CRS] (CRS == in_ch here).
               in_sub.reshape({in_dim.channel(), owoh});
               Tensor act = in_sub.transpose("0:2:1");
               act.dot(filter_kernel, tmp, false, false);
-            } else if (NNTR_HAS_Q4_0_INDIRECT_CONV) {
-              // Quantized 3x3+ indirect: fold im2col gather into the q8_0
-              // activation quantization so the activation matrix is never
-              // materialized (the FP16 input is gathered on the fly and
+            } else if (NNTR_HAS_Q4_0_INDIRECT_CONV && !weight_is_q8) {
+              // Quantized 3x3+ indirect (Q4_0 filters): fold im2col gather into
+              // the q8_0 activation quantization so the activation matrix is
+              // never materialized (the FP16 input is gathered on the fly and
               // quantized per tile inside the indirect GEMM). Output tmp is
-              // FP16 [OH*OW, out_ch].
+              // FP16 [OH*OW, out_ch]. Q8_0 filters take the materialized
+              // im2col + dotQnK fallback below instead (interleaved int8 GEMM).
               ConvGatherParams geom;
               geom.in_ch = in_dim.channel();
               geom.in_h = in_dim.height();
@@ -1681,11 +1693,13 @@ void Conv2DLayer::save(std::ofstream &file, RunLayerContext &run_context,
       continue;
     }
 
-    NNTR_THROW_IF(dtype != TensorDim::DataType::Q4_0, std::runtime_error)
+    NNTR_THROW_IF(dtype != TensorDim::DataType::Q4_0 &&
+                    dtype != TensorDim::DataType::Q8_0,
+                  std::runtime_error)
       << "[Conv2D] save: unsupported quantization dtype";
     NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
                   std::runtime_error)
-      << "[Conv2D] Q4_0 save only supports FP32 source weight.";
+      << "[Conv2D] quantized save only supports FP32 source weight.";
 
     // A conv FP32 filter is [out_ch, in_ch, kh, kw] in NCHW, i.e. already
     // row-major [out_ch, CRS] (CRS = in_ch*kh*kw) = [N rows, K cols]. This is
@@ -1698,8 +1712,8 @@ void Conv2DLayer::save(std::ofstream &file, RunLayerContext &run_context,
     const unsigned int CRS = dim.channel() * dim.height() * dim.width();
 
     if (out_ch <= 1 || CRS <= 1 || out_ch % 32 != 0 || CRS % 32 != 0) {
-      // Not Q4_0-eligible (bias, or block-misaligned): keep FP32 so the saved
-      // tensor still matches what the runtime layer allocates for it.
+      // Not block-quantizable (bias, or block-misaligned): keep FP32 so the
+      // saved tensor still matches what the runtime layer allocates for it.
       weight.save(file);
       continue;
     }
@@ -1709,9 +1723,15 @@ void Conv2DLayer::save(std::ofstream &file, RunLayerContext &run_context,
     Tensor quant_weight(1, 1, CRS, out_ch, {Tformat::NCHW, dtype});
     std::vector<char> tmp(quant_weight.size());
 
-    quantize_q4_0(weight.getData<float>(), tmp.data(), out_ch, CRS, nullptr);
-    repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
-                quant_weight.size(), out_ch, CRS, target_isa);
+    if (dtype == TensorDim::DataType::Q8_0) {
+      quantize_q8_0(weight.getData<float>(), tmp.data(), out_ch, CRS, nullptr);
+      repack_q8_0(quant_weight.getData<uint8_t>(), tmp.data(),
+                  quant_weight.size(), out_ch, CRS, target_isa);
+    } else {
+      quantize_q4_0(weight.getData<float>(), tmp.data(), out_ch, CRS, nullptr);
+      repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
+                  quant_weight.size(), out_ch, CRS, target_isa);
+    }
     quant_weight.save(file);
   }
 }
