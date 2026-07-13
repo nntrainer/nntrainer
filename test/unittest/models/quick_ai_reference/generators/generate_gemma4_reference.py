@@ -31,7 +31,7 @@
 ##  13. layerI_post_per_layer_input_norm
 ##  14. layerI_layer_scalar
 ##   N. output_norm
-##   N+1. output_of_causallm
+##   N+1. output_of_quick_ai
 ##
 ## NOTE: the global per-layer-input weights load INSIDE layer 0 (between the
 ## per_layer_input_gate and per_layer_input_proj), NOT before the decoder loop.
@@ -138,7 +138,7 @@ def convert_weights(model: Gemma4TextModel, bin_path: pathlib.Path) -> None:
         print(f"  {name:55s} shape={list(tensor.shape)}")
 
     with open(bin_path, "wb") as f:
-        # 1. embedding0  (tie_word_embeddings shares with output_of_causallm)
+        # 1. embedding0  (tie_word_embeddings shares with output_of_quick_ai)
         save(sd["embed_tokens.weight"], "embedding0")
 
         # Decoder layers 0..n_layers-1
@@ -213,8 +213,8 @@ def convert_weights(model: Gemma4TextModel, bin_path: pathlib.Path) -> None:
         # output_norm
         save(sd["norm.weight"], "output_norm")
 
-        # output_of_causallm (tie_word_embeddings: same weight as embedding0)
-        save(sd["embed_tokens.weight"], "output_of_causallm")
+        # output_of_quick_ai (tie_word_embeddings: same weight as embedding0)
+        save(sd["embed_tokens.weight"], "output_of_quick_ai")
 
     size_kb = bin_path.stat().st_size / 1024
     print(f"[converter] saved {bin_path} ({size_kb:.1f} KB, {total_bytes} bytes)")

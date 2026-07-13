@@ -1464,7 +1464,7 @@ TEST(nntrainer_ccapi_graph, causallm_style_multi_input_p) {
   // --- LM Head ---
   LayerHandle lmhead =
     createLayer("fully_connected",
-                {"name=output_of_causallm",
+                {"name=output_of_quick_ai",
                  "unit=" + std::to_string(VOCAB_SIZE), "disable_bias=true"});
   Tensor output = lmhead(x);
 
