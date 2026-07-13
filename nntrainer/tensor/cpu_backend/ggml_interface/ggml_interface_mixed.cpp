@@ -884,13 +884,14 @@ void __ggml_q8_0_4x4_q8_0_GEMM(const unsigned int M, const unsigned int N,
     return;
   }
 
-  // GEMM: pack the 4-row-aligned bulk of the activation.
+  // GEMM: pack the 4-row-aligned bulk of the activation. Each super-row is an
+  // independent [4 x K] quantize into its own QA region, so packing threads
+  // over super-rows (the encoder packs 49 of them per FC call).
   const unsigned int M4 = M / 4;
   std::vector<char> QA = std::vector<char>((size_t)M4 * sb_bytes);
-  for (unsigned int i = 0; i < M4; i++) {
-    nntr_quantize_mat_q8_0_4x8(A + 4 * (size_t)i * K,
-                               QA.data() + (size_t)i * sb_bytes, K);
-  }
+  tm.parallel_for(0, (size_t)M4, [=, &QA](size_t i) {
+    nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * sb_bytes, K);
+  });
 
   tm.parallel_for(0, thread_num, [=, &QA](size_t i) {
     unsigned int c_start, c_end;
