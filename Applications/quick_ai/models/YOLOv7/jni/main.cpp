@@ -78,11 +78,15 @@ inline float iou(const Detection &a, const Detection &b) {
   return inter / (area_a + area_b - inter);
 }
 
-// Standard YOLOv7 anchors (divided by stride, then mapped per scale)
+// YOLOv7 anchors in pixel space (model's stride-divided anchor buffer × stride),
+// extracted from weights/yolov7-package-apc-sstk-v001-ratio4.pt IDetect.anchors.
+// These are NOT the stock COCO anchors — this model was trained with its own
+// anchor set, so decoding with stock anchors shifts box w/h and produces spurious
+// boxes that diverge from the PyTorch reference.
 const float ANCHORS[3][3][2] = {
-  {{12.0f, 16.0f}, {19.0f, 36.0f}, {40.0f, 28.0f}},     // det0, stride 8
-  {{36.0f, 75.0f}, {76.0f, 55.0f}, {72.0f, 146.0f}},    // det1, stride 16
-  {{142.0f, 110.0f}, {92.0f, 243.0f}, {459.0f, 401.0f}} // det2, stride 32
+  {{10.0f, 13.0f}, {16.0f, 30.0f}, {33.0f, 23.0f}},   // det0, stride 8
+  {{30.0f, 61.0f}, {62.0f, 45.0f}, {59.0f, 119.0f}},  // det1, stride 16
+  {{116.0f, 90.0f}, {156.0f, 198.0f}, {373.0f, 326.0f}} // det2, stride 32
 };
 
 const float STRIDES[3] = {8.0f, 16.0f, 32.0f};
@@ -431,13 +435,6 @@ int main(int argc, char **argv) {
     }
     std::cout << "[YOLOv7] Inference done (" << outs.size() << " outputs)."
               << std::endl;
-
-    // Diagnostic print of raw values
-    std::cout << "=== C++ RAW scale 0 (det0) values at (a=0, y=0, x=0) ==="
-              << std::endl;
-    for (int c = 0; c < 10; ++c) {
-      std::cout << "c=" << c << ": " << outs[0][c * 40 * 40] << std::endl;
-    }
 
     std::cout << "[YOLOv7] Inference time: " << (total_ms / bench_iters)
               << " ms (avg over " << bench_iters << " iters)" << std::endl;

@@ -40,6 +40,8 @@ quick_ai_layer_dependencies += [
     causallm_per_layer_slice_dep,
     causallm_scalar_multiply_dep,
     causallm_logit_softcapping_dep,
+    causallm_causal_conv1d_dep,
+    causallm_custom_multiply_dep,
 ]
 
 subdir('models')

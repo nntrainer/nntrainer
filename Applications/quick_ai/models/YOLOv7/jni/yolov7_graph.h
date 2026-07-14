@@ -83,7 +83,11 @@ inline Tensor buildStemS1(const std::string &name, Tensor input,
 // DownConv helper
 inline Tensor downConv(const std::string &name, int in_ch, int out_ch,
                        Tensor input, bool conv_q40 = false) {
-  return convBnSilu(name + "/conv", in_ch, out_ch, 3, 2, 1, input, conv_q40);
+  // convBnSilu already appends "/conv" to the name it is given, so pass `name`
+  // directly. Passing `name + "/conv"` here would double it to ".../conv/conv",
+  // which no longer matches the safetensors weight key ".../conv:filter" and the
+  // weight loader silently skips it (random-init conv -> divergent backbone).
+  return convBnSilu(name, in_ch, out_ch, 3, 2, 1, input, conv_q40);
 }
 
 // DownSampleRouteS1 helper
