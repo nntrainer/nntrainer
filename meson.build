@@ -87,6 +87,9 @@ if cxx_compiler_id == 'clang'
   warning_flags += '-Wno-format-nonliteral'
   warning_flags += '-Wno-varargs'
   warning_flags += '-Wno-missing-braces'
+  # -march=native on newer AVX10.1-capable CPUs conflicts with the explicit
+  # -mavx2/-mfma below; clang treats that as a hard error under -Werror.
+  warning_flags += '-Wno-error=invalid-feature-combination'
 else
   warning_flags += '-Wno-maybe-uninitialized'
 endif
