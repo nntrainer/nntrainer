@@ -455,7 +455,8 @@ void BatchNormalizationLayer::read(std::ifstream &file,
           T_read.read(file);
           run_context.getWeight(i).copyData(T_read);
         } else {
-          run_context.getWeight(i).read(file, start_offset);
+          run_context.getWeight(i).read(file, start_offset, read_from_offset,
+                                        file_fd);
         }
 
         if (run_context.isMixedPrecision(i) && trainable &&
@@ -501,7 +502,8 @@ void BatchNormalizationLayer::read(ReadSource src, RunLayerContext &run_context,
           T_read.read(src);
           run_context.getWeight(i).copyData(T_read);
         } else {
-          run_context.getWeight(i).read(src, start_offset);
+          run_context.getWeight(i).read(src, start_offset, read_from_offset,
+                                        file_fd);
         }
 
         if (run_context.isMixedPrecision(i) && trainable &&
