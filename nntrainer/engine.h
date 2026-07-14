@@ -39,6 +39,12 @@
 
 #include "singleton.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+#define NNTR_VISIBILITY __attribute__((visibility("default")))
+#else
+#define NNTR_VISIBILITY
+#endif
+
 namespace nntrainer {
 
 extern std::mutex engine_mutex;
@@ -48,7 +54,7 @@ namespace {} // namespace
  * @class Engine contains user-dependent configuration
  * @brief App
  */
-class Engine : public Singleton<Engine> {
+class NNTR_VISIBILITY Engine : public Singleton<Engine> {
 protected:
   static const int RegisterContextMax = 16;
   static nntrainer::Context *nntrainerRegisteredContext[RegisterContextMax];

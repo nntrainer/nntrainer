@@ -19,6 +19,12 @@
 #include "noncopyable.h"
 #include "nonmovable.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+#define NNTR_VISIBILITY __attribute__((visibility("default")))
+#else
+#define NNTR_VISIBILITY
+#endif
+
 namespace nntrainer {
 
 /**
@@ -33,7 +39,7 @@ public:
    * once
    * @return Instance to singleton class reference
    */
-  static T &Global() {
+  NNTR_VISIBILITY static T &Global() {
     static T instance;
     instance.initializeOnce();
     return instance;

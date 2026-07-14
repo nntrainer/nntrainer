@@ -12,6 +12,13 @@
  */
 #ifndef __ARM_COMPUTE_BACKEND_H__
 #define __ARM_COMPUTE_BACKEND_H__
+
+#if defined(__GNUC__) || defined(__clang__)
+#define NNTR_VISIBILITY __attribute__((visibility("default")))
+#else
+#define NNTR_VISIBILITY
+#endif
+
 #ifdef __cplusplus
 
 #include <cfloat>
@@ -1598,9 +1605,10 @@ void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
  * @param[out] rhs_scales_f32 matrix quant scale after quantization
  * @param[in] is_nxk true if the quantized matrix in stored in nxk format
  */
-void quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
-                     void *rhs_native_mtx_qs4cx, void *rhs_scales_f32,
-                     bool is_nxk);
+NNTR_VISIBILITY void quant_qs4cx_f32(size_t n, size_t k,
+                                     void *rhs_native_mtx_f32,
+                                     void *rhs_native_mtx_qs4cx,
+                                     void *rhs_scales_f32, bool is_nxk);
 
 /**
  * @brief get size of memory to allocate for packed rhs from nxk qs4cxs1s0 to
