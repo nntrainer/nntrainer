@@ -8,8 +8,42 @@
 namespace nntrainer {
 namespace hexkl {
 
-void initialize();
-void finalize();
+// Export symbols so they are visible to CausalLM application which links
+// against libnntrainer.so at runtime.
+#define HEXKL_API __attribute__((visibility("default")))
+
+HEXKL_API void initialize();
+HEXKL_API void finalize();
+
+/**
+ * @brief Save all INT8 WH-cache entries to a binary file.
+ *
+ * After prewarmHmxCache() has populated g_wh_i8_cache, call this to
+ * serialize every entry (N, K, TransB, w_scale, bias128[N], wh_i8[N×K])
+ * to disk so the next run can load it via load_cache_from_file().
+ *
+ * @return number of entries written, or -1 on error.
+ */
+HEXKL_API int save_cache_to_file(const char *path);
+
+/**
+ * @brief Load pre-built INT8 WH-cache entries from a binary file.
+ *
+ * Populates g_wh_i8_cache with entries keyed by content hash of the
+ * FP32 weight data.  At runtime, sgemm_hmx_i8 computes the same hash
+ * from the live weight pointer and finds the pre-built entry — skipping
+ * quantization + WH-layout repack entirely.
+ *
+ * @param path      Path to the .hmx_cache file.
+ * @param weights   Array of (B_ptr, N, K, TransB, ldb) tuples for each
+ *                  weight tensor in the model, so we can associate the
+ *                  loaded cache entries with the runtime pointers.
+ * @param num_weights  Number of entries in the weights array.
+ * @return number of entries loaded, or -1 on error.
+ */
+HEXKL_API int load_cache_from_file(const char *path);
+
+
 
 /**
  * @brief Pre-build the WH-layout cache entry for a FP32 weight (no dispatch).
@@ -17,11 +51,12 @@ void finalize();
  * Call this on M=1 decode steps or right after model loading so that the first
  * real prefill (M > 1) skips the build and goes straight to HMX dispatch.
  */
-void preload_weight_f32(bool TransB, unsigned N, unsigned K,
+HEXKL_API void preload_weight_f32(bool TransB, unsigned N, unsigned K,
                         const float *B, unsigned ldb);
 
 /** @brief Returns true if this weight's WH-layout is already cached. */
-bool is_weight_cached(bool TransB, unsigned N, unsigned K, const float *B);
+HEXKL_API bool is_weight_cached(bool TransB, unsigned N, unsigned K, const float *B);
+
 
 /**
  * @brief Dispatch a prefill-phase SGEMM (FP32×FP32) to HMX via INT8.

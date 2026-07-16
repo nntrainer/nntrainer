@@ -44,6 +44,7 @@ LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/android_build_result/lib/$(TARGET_
 include $(PREBUILT_SHARED_LIBRARY)
 
 # HMX (HexKL) prebuilt shared library
+
 ifeq ($(USE_HMX),1)
   ifndef HEXKL_SDK_ROOT
     $(error HEXKL_SDK_ROOT must be set when USE_HMX=1)
@@ -122,15 +123,23 @@ LOCAL_SRC_FILES := \
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
+
 LOCAL_C_INCLUDES += $(NNTRAINER_INCLUDES) $(CAUSALLM_COMMON_INCLUDES)
 
 # HMX (HexKL) support
+
 ifeq ($(USE_HMX),1)
-  LOCAL_C_INCLUDES += $(HEXKL_SDK_ROOT)/include
+  LOCAL_C_INCLUDES += $(HEXKL_SDK_ROOT)/include \
+      $(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/arm
   LOCAL_CFLAGS += -DUSE_HMX=1
   LOCAL_CXXFLAGS += -DUSE_HMX=1
   LOCAL_SHARED_LIBRARIES += sdkl
+  # Compile hexkl_backend.cpp directly into causallm_core so the prewarm
+  # functions are available without relying on libnntrainer.so export.
+  LOCAL_SRC_FILES += \
+      $(NNTRAINER_ROOT)/nntrainer/tensor/cpu_backend/arm/hexkl_backend.cpp
 endif
+
 
 include $(BUILD_SHARED_LIBRARY)
 

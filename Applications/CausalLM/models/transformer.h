@@ -150,6 +150,44 @@ public:
   virtual void repack_weight();
 
   /**
+   * @brief Pre-build the HMX WH-layout cache for all FC weights
+   *
+   * Iterates over every layer in the compiled model, finds FP32 weight tensors
+   * (the FC projection weights), and calls hexkl::preload_weight_f32() on each.
+   * This moves the one-time INT8 quantization + WH-layout repack cost (~3.5s for
+   * Qwen3-0.6B) out of the prefill critical path. Must be called after
+   * load_weight() / repack_weight() and before run().
+   */
+  virtual void prewarmHmxCache();
+
+  /**
+   * @brief Save the HMX INT8 WH-cache to a file (after prewarmHmxCache).
+   *
+   * Serializes all pre-built INT8 WH-layout entries to a binary .hmx_cache
+   * file so the next run can load them via loadHmxCache() and skip the
+   * quantization + WH-layout repack entirely.
+   *
+   * @param cache_path Path to the output .hmx_cache file.
+   * @return Number of entries written, or -1 on error.
+   */
+  virtual int saveHmxCache(const std::string &cache_path);
+
+  /**
+   * @brief Load pre-built HMX INT8 WH-cache from a file.
+   *
+   * Loads entries from a .hmx_cache file into the hexkl backend's cache.
+   * Must be called after initialize() and before prewarmHmxCache()/run().
+   * When a cache file is loaded, prewarmHmxCache() will adopt the pre-built
+   * entries instead of building from scratch.
+   *
+   * @param cache_path Path to the .hmx_cache file.
+   * @return Number of entries loaded, or -1 on error.
+   */
+  virtual int loadHmxCache(const std::string &cache_path);
+
+
+
+  /**
    * @brief Save the weight to a file
    */
   virtual void save_weight(const std::string &weight_path);

@@ -29,6 +29,12 @@
 #include <swiglu.h>
 #include <tie_word_embedding.h>
 
+#ifdef USE_HMX
+#include <chrono>
+#include <hexkl_backend.h>
+#endif
+
+
 namespace causallm {
 
 /**
@@ -375,9 +381,127 @@ void Transformer::repack_weight() {
 };
 
 /**
+ * @brief Pre-build the HMX WH-layout cache for all FP32 FC weights.
+ *
+ * After model weights are loaded, iterate over every layer in the compiled
+ * model graph, find FP32 weight tensors, and call hexkl::preload_weight_f32()
+ * for each. This moves the one-time INT8 quantization + WH-layout repack cost
+ * out of the prefill critical path entirely. The first prefill then hits the
+ * cache on every call and goes straight to DSP dispatch.
+ *
+ * Dimension mapping (FC layer calls input_.dot(weight, hidden_, false, false)):
+ *   Weight tensor is [1, 1, input_dim, unit] = [1, 1, K, N] in NCHW.
+ *   calculateFlattenDot with !trans && !trans_in:
+ *     K = input_first_three_flat = weight.height() (input_dim)
+ *     N = input_last_axis        = weight.width()  (unit)
+ *     ldb = input_last_axis      = weight.width()  (= N)
+ *   sgemm(order=0, TransA=false, TransB=false, M, N, K, A, lda=K, B, ldb=N, ...)
+ *   HMX guard: TStorageOrder==0, !TransA, alpha==1, beta==0, lda==K, ldc==N
+ *   preload_weight_f32(TransB=false, N=width, K=height, B, ldb=width)
+ */
+void Transformer::prewarmHmxCache() {
+#ifdef USE_HMX
+  if (!is_initialized) {
+    throw std::runtime_error(
+      "Transformer model is not initialized. Please call "
+      "initialize() before prewarmHmxCache().");
+  }
+
+  // Ensure HexKL is initialized before pre-warming.
+  nntrainer::hexkl::initialize();
+
+  auto start = std::chrono::high_resolution_clock::now();
+
+  int weight_count = 0;
+
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [&weight_count](ml::train::Layer &l,
+                         nntrainer::RunLayerContext &context, void *) {
+      unsigned int num_weights = context.getNumWeights();
+      for (unsigned int idx = 0; idx < num_weights; ++idx) {
+        auto &w = context.getWeight(idx);
+        // Only pre-warm FP32 weights (FC projection weights)
+        if (w.getDataType() != ml::train::TensorDim::DataType::FP32)
+          continue;
+
+        const float *w_data = w.getData<float>();
+        if (!w_data)
+          continue;
+
+        // Weight is [1, 1, K=input_dim, N=unit] in NCHW.
+        // sgemm receives: TransB=false, N=width(unit), K=height(input_dim),
+        // B=weight_data, ldb=width(N).
+        unsigned int N = w.width();     // output unit (sgemm N)
+        unsigned int K = w.height();    // input dimension (sgemm K)
+        unsigned int ldb = N;           // row stride = width
+        nntrainer::hexkl::preload_weight_f32(false, N, K, w_data, ldb);
+
+        ++weight_count;
+      }
+    };
+
+  try {
+    model->forEachLayer(fn, nullptr);
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+      end - start);
+    ml_logd("HMX WH cache pre-warmed for %d weights in %lld ms",
+            weight_count, (long long)duration.count());
+  } catch (const std::exception &e) {
+    ml_logw("HMX cache pre-warming failed (non-fatal): %s", e.what());
+  }
+#else
+  // No-op when HMX is not enabled
+#endif
+};
+
+/**
+ * @brief Save the HMX INT8 WH-cache to a binary file.
+ */
+int Transformer::saveHmxCache(const std::string &cache_path) {
+#ifdef USE_HMX
+  int n = nntrainer::hexkl::save_cache_to_file(cache_path.c_str());
+  if (n < 0) {
+    ml_logw("Failed to save HMX cache to %s", cache_path.c_str());
+  } else {
+    ml_logd("Saved HMX cache (%d entries) to %s", n, cache_path.c_str());
+  }
+  return n;
+#else
+  (void)cache_path;
+  return -1;
+#endif
+}
+
+/**
+ * @brief Load pre-built HMX INT8 WH-cache from a binary file.
+ */
+int Transformer::loadHmxCache(const std::string &cache_path) {
+#ifdef USE_HMX
+  // Ensure HexKL is initialized so the loaded cache entries can be adopted
+  // during inference.
+  nntrainer::hexkl::initialize();
+  int n = nntrainer::hexkl::load_cache_from_file(cache_path.c_str());
+
+  if (n < 0) {
+    ml_logw("Failed to load HMX cache from %s", cache_path.c_str());
+  } else {
+    ml_logd("Loaded HMX cache (%d entries) from %s", n, cache_path.c_str());
+  }
+  return n;
+#else
+  (void)cache_path;
+  return -1;
+#endif
+}
+
+
+
+/**
  * @brief Run a transformer model for a prompt.
  */
 void Transformer::run(const WSTR prompt, bool do_sample,
+
                       const WSTR system_prompt, const WSTR tail_prompt,
                       bool log_output) {
   if (!is_initialized) {

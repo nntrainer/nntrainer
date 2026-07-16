@@ -307,21 +307,56 @@ int main(int argc, char *argv[]) {
                                                             nntr_cfg);
     });
 
+  // Parse optional flags
+  std::string save_cache_path;
+  std::string load_cache_path;
+
+  // Scan for --save-cache and --load-cache flags
+
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--save-cache" && i + 1 < argc) {
+      save_cache_path = argv[++i];
+    } else if (arg == "--load-cache" && i + 1 < argc) {
+      load_cache_path = argv[++i];
+    }
+  }
+
+  // Find the model_path (first non-flag argument)
+  std::string model_path;
+  std::string input_text_arg;
+  bool has_input_arg = false;
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--save-cache" || arg == "--load-cache") {
+      ++i; // skip the value
+      continue;
+    }
+    if (model_path.empty()) {
+      model_path = arg;
+    } else if (!has_input_arg) {
+      input_text_arg = arg;
+      has_input_arg = true;
+    }
+  }
+
   // Validate arguments
-  if (argc < 2) {
-    std::cerr << "Usage: " << argv[0] << " <model_path> [input_prompt]\n"
+  if (model_path.empty()) {
+    std::cerr << "Usage: " << argv[0] << " <model_path> [input_prompt] [--save-cache <path>] [--load-cache <path>]\n"
               << "  <model_path>   : Path to model directory\n"
               << "  [input_prompt] : Optional input text (uses sample_input or "
-                 "chat_input if omitted)\n";
+                 "chat_input if omitted)\n"
+              << "  --save-cache <path> : Save HMX INT8 WH-cache to file and exit\n"
+              << "  --load-cache <path> : Load HMX INT8 WH-cache from file (skip prewarm)\n";
     return EXIT_FAILURE;
   }
 
-  const std::string model_path = argv[1];
   std::string input_text;
   std::string system_head_prompt = "";
   std::string system_tail_prompt = "";
 
   std::cout << model_path << std::endl;
+
 
   try {
     // Load configuration files
@@ -377,9 +412,10 @@ int main(int argc, char *argv[]) {
     }
 
     // Determine input text
-    if (argc >= 3) {
-      input_text = argv[2];
+    if (has_input_arg) {
+      input_text = input_text_arg;
     } else {
+
       if (nntr_cfg.contains("chat_input")) {
         if (chat_template.has_value()) {
           input_text = chat_template->apply(nntr_cfg["chat_input"]);
@@ -411,7 +447,38 @@ int main(int argc, char *argv[]) {
     model->load_weight(weight_file);
     model->repack_weight();
 
+    // HMX cache: load from file if available, otherwise prewarm from scratch.
+    if (!load_cache_path.empty()) {
+      int n = model->loadHmxCache(load_cache_path);
+      if (n > 0) {
+        std::cout << "[HMX] Loaded " << n << " cache entries from "
+                  << load_cache_path << std::endl;
+      } else {
+        std::cout << "[HMX] Cache load failed, falling back to prewarm"
+                  << std::endl;
+        model->prewarmHmxCache();
+      }
+    } else {
+      model->prewarmHmxCache();
+    }
+
+    // If --save-cache was requested, save and exit (no inference run).
+    if (!save_cache_path.empty()) {
+      int n = model->saveHmxCache(save_cache_path);
+      if (n > 0) {
+        std::cout << "[HMX] Saved " << n << " cache entries to "
+                  << save_cache_path << std::endl;
+      } else {
+        std::cerr << "[HMX] Failed to save cache to " << save_cache_path
+                  << std::endl;
+        return EXIT_FAILURE;
+      }
+      return EXIT_SUCCESS;
+    }
+
     bool do_sample = generation_cfg.value("do_sample", false);
+
+
 
 #ifdef PROFILE
     start_peak_tracker();

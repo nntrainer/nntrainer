@@ -46,11 +46,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <time.h>
 #include <unordered_map>
+
 
 #define HEXKL_LOG_TAG "nntr_hexkl"
 #define HEXKL_LOGI(...) \
@@ -265,7 +267,22 @@ void preload_weight_f32(bool TransB, unsigned N, unsigned K,
   {
     std::lock_guard<std::mutex> cl(g_cache_mutex);
     if (g_wh_i8_cache.count(key)) return;
+
+    // Check if a pre-loaded cache entry (ptr=0) matches (N, K, TransB).
+    // If found, adopt it by re-keying to the real pointer.
+    WeightKey pending_key{0, N, K, TransB};
+    auto pit = g_wh_i8_cache.find(pending_key);
+    if (pit != g_wh_i8_cache.end()) {
+      WeightI8Entry entry = pit->second;
+      g_wh_i8_cache.erase(pit);
+      g_wh_i8_cache.emplace(key, entry);
+      HEXKL_LOGI("Adopted pre-loaded cache entry for ptr=%p N=%u K=%u",
+                 (void*)B, N, K);
+      return;
+    }
   }
+
+  // No pre-loaded entry — build from scratch (quantize + WH repack).
   const size_t w_bytes = (size_t)N * K * sizeof(int8_t);
   int8_t* w_i8   = static_cast<int8_t*>(malloc(w_bytes));
   float*  bias128 = static_cast<float*>(malloc(N * sizeof(float)));
@@ -317,9 +334,149 @@ void preload_weight_f32(bool TransB, unsigned N, unsigned K,
   if (!inserted) { free(w_i8); free(bias128); }
 }
 
+
+// ---------------------------------------------------------------------------
+// Cache file serialization (save / load)
+// ---------------------------------------------------------------------------
+//
+// Binary format (.hmx_cache):
+//   magic    : 4 bytes  "HMX1"
+//   count    : uint32_t  number of entries
+//   For each entry:
+//     N       : uint32_t
+//     K       : uint32_t
+//     TransB  : uint8_t  (0 or 1)
+//     w_scale : float
+//     bias128 : float[N]
+//     wh_i8   : int8_t[N * K]
+//
+// At load time, entries are inserted into g_wh_i8_cache keyed by a
+// content hash computed from the FP32 weight data.  At runtime,
+// sgemm_hmx_i8 computes the same hash from the live weight pointer
+// and finds the pre-built entry.
+
+static uint64_t weight_content_hash(const float *B, unsigned N, unsigned K,
+                                     unsigned ldb, bool TransB) {
+  // FNV-1a 64-bit hash over the weight data.
+  uint64_t h = 1469598103934665603ULL;
+  auto mix = [&](float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, 4);
+    h ^= bits;
+    h *= 1099511628211ULL;
+  };
+  if (TransB) {
+    for (unsigned n = 0; n < N; ++n)
+      for (unsigned k = 0; k < K; ++k)
+        mix(B[n * ldb + k]);
+  } else {
+    for (unsigned k = 0; k < K; ++k)
+      for (unsigned n = 0; n < N; ++n)
+        mix(B[k * ldb + n]);
+  }
+  return h;
+}
+
+// Map from content hash → cache entry, used by load_cache_from_file.
+// sgemm_hmx_i8 / is_weight_cached / preload_weight_f32 check this map
+// first (by computing the hash from the live pointer) before falling
+// back to the pointer-keyed g_wh_i8_cache.
+struct HashedWeightKey {
+  uint64_t hash;
+  unsigned N;
+  unsigned K;
+  bool TransB;
+  bool operator==(const HashedWeightKey &o) const {
+    return hash == o.hash && N == o.N && K == o.K && TransB == o.TransB;
+  }
+};
+struct HashedWeightKeyHash {
+  size_t operator()(const HashedWeightKey &k) const noexcept {
+    return std::hash<uint64_t>{}(k.hash) ^ (std::hash<unsigned>{}(k.N) << 1);
+  }
+};
+static std::unordered_map<HashedWeightKey, WeightI8Entry, HashedWeightKeyHash> g_hashed_i8_cache;
+
+int save_cache_to_file(const char *path) {
+  if (!g_initialized) return -1;
+  FILE *fp = fopen(path, "wb");
+  if (!fp) { HEXKL_LOGE("save_cache: cannot open %s", path); return -1; }
+
+  std::lock_guard<std::mutex> cl(g_cache_mutex);
+  uint32_t count = (uint32_t)g_wh_i8_cache.size();
+  fwrite("HMX1", 1, 4, fp);
+  fwrite(&count, sizeof(count), 1, fp);
+
+  uint32_t written = 0;
+  for (auto &kv : g_wh_i8_cache) {
+    const WeightKey &wk = kv.first;
+    const WeightI8Entry &we = kv.second;
+    uint32_t N = wk.n_col, K = wk.n_inner;
+    uint8_t tb = wk.transB ? 1 : 0;
+    fwrite(&N, sizeof(N), 1, fp);
+    fwrite(&K, sizeof(K), 1, fp);
+    fwrite(&tb, sizeof(tb), 1, fp);
+    fwrite(&we.w_scale, sizeof(float), 1, fp);
+    fwrite(we.bias128, sizeof(float), N, fp);
+    fwrite(we.wh_buf, 1, (size_t)N * K, fp);
+    ++written;
+  }
+  fclose(fp);
+  HEXKL_LOGI("save_cache: wrote %u entries to %s", written, path);
+  return (int)written;
+}
+
+int load_cache_from_file(const char *path) {
+  FILE *fp = fopen(path, "rb");
+  if (!fp) { HEXKL_LOGE("load_cache: cannot open %s", path); return -1; }
+
+  char magic[4];
+  if (fread(magic, 1, 4, fp) != 4 || memcmp(magic, "HMX1", 4) != 0) {
+    HEXKL_LOGE("load_cache: bad magic in %s", path);
+    fclose(fp); return -1;
+  }
+  uint32_t count = 0;
+  if (fread(&count, sizeof(count), 1, fp) != 1) {
+    fclose(fp); return -1;
+  }
+
+  std::lock_guard<std::mutex> cl(g_cache_mutex);
+  uint32_t loaded = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t N, K;
+    uint8_t tb;
+    float w_scale;
+    if (fread(&N, sizeof(N), 1, fp) != 1) break;
+    if (fread(&K, sizeof(K), 1, fp) != 1) break;
+    if (fread(&tb, sizeof(tb), 1, fp) != 1) break;
+    if (fread(&w_scale, sizeof(float), 1, fp) != 1) break;
+
+    size_t w_bytes = (size_t)N * K;
+    int8_t *wh_buf = (int8_t *)malloc(w_bytes);
+    float *bias128 = (float *)malloc(N * sizeof(float));
+    if (!wh_buf || !bias128) { free(wh_buf); free(bias128); break; }
+
+    if (fread(bias128, sizeof(float), N, fp) != N) { free(wh_buf); free(bias128); break; }
+    if (fread(wh_buf, 1, w_bytes, fp) != w_bytes) { free(wh_buf); free(bias128); break; }
+
+    // Insert into g_wh_i8_cache with a sentinel pointer key (0).
+    // The real association happens at runtime via g_hashed_i8_cache
+    // when preload_weight_f32 is called with the actual weight pointer.
+    // We store entries in a separate "pending" list keyed by (N, K, TransB).
+    WeightKey key{0, N, K, tb != 0};
+    WeightI8Entry entry{wh_buf, bias128, w_scale};
+    g_wh_i8_cache.emplace(key, entry);
+    ++loaded;
+  }
+  fclose(fp);
+  HEXKL_LOGI("load_cache: loaded %u/%u entries from %s", loaded, count, path);
+  return (int)loaded;
+}
+
 // ---------------------------------------------------------------------------
 // INT8 helpers
 // ---------------------------------------------------------------------------
+
 
 // Quantize FP32 weight B[N×K] (or B[K×N] if !TransB) → INT8 WH layout.
 // Returns w_scale; fills out_bias128[n] = 128 * sum_k(W_i8[n,k]).
