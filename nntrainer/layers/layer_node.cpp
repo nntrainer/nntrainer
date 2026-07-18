@@ -26,6 +26,7 @@
 #include <context.h>
 #include <engine.h>
 #include <layer_node.h>
+#include <multiout_layer.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
@@ -718,6 +719,12 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
     actual_input_dims, out_info, getInPlaceType() != InPlaceType::NONE,
     getName(), scope, max_norm, tensor_type, loss_scale, mode,
     toLayerComputeEngine(compute_engine));
+  /** static residency: MultiOut is an in-place identity fan-out (no data
+   * touch), so its output specs must not stamp CPU onto the shared source
+   * tensor -- engine-neutral (GPU = no veto); the REAL consumers' input views
+   * resolve to the same source and register their own engines. */
+  if (getType() == MultiOutLayer::type || getType() == "mha_core")
+    context.setComputeEngine(ml::train::LayerComputeEngine::GPU);
 
   layer->finalize(context);
 
@@ -811,6 +818,15 @@ LayerNode::refinalize(const std::vector<TensorDim> &input_dims) {
   auto context = InitLayerContext(actual_input_dims, out_info,
                                   getInPlaceType() != InPlaceType::NONE,
                                   getName(), scope, max_norm);
+  /** refinalize omits the engine arg; stamp it so output activations carry the
+   * layer's compute engine for static residency derivation (must precede
+   * layer->finalize, which requests outputs via outSpec). MultiOut is
+   * engine-neutral (in-place identity fan-out): GPU = no veto, the real
+   * consumers' input views register their own engines on the shared source. */
+  context.setComputeEngine(
+    (getType() == MultiOutLayer::type || getType() == "mha_core")
+      ? ml::train::LayerComputeEngine::GPU
+      : toLayerComputeEngine(compute_engine));
 
   layer->finalize(context);
 

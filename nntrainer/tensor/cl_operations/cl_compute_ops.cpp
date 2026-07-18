@@ -25,8 +25,10 @@
  */
 
 #include <cstdlib>
+#include <cstring>
 
 #include <acti_func.h>
+#include <attention_kernels.h> // gpu_copy_f16_cl
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h>
 #include <compute_ops.h>
@@ -92,6 +94,91 @@ public:
     nntrainer::sgemm_int4_cl(input, weight, scale, output, M, N, K, group_size);
   }
 
+  // Plain elementwise copy (Y = X). Tensor::copy() calls this unconditionally
+  // (no supports_*() guard), so the GPU backend must provide it or copy()
+  // throws "not implemented" -- which blocks any GPU layer that copies a
+  // tensor (e.g. the residual first-input copy). A host copy is correct for
+  // host and (host-coherent) SVM pointers.
+  void scopy_fp32(const unsigned int N, const float *X, const unsigned int incX,
+                  float *Y, const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = X[i * incX];
+  }
+
+#ifdef ENABLE_FP16
+  // fp16 counterpart (FP16-activation graphs).
+  void scopy_fp16(const unsigned int N, const _FP16 *X, const unsigned int incX,
+                  _FP16 *Y, const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = X[i * incX];
+  }
+  // Mixed-precision host copies: Tensor::copy()/copyData() across dtypes
+  // routes here on the GPU backend.
+  void scopy_fp32_to_fp16(const unsigned int N, const float *X,
+                          const unsigned int incX, _FP16 *Y,
+                          const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = static_cast<_FP16>(X[i * incX]);
+  }
+  void scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
+                          const unsigned int incX, float *Y,
+                          const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = static_cast<float>(X[i * incX]);
+  }
+#endif
+
+  // Residual-add operand on the GPU residency path: an FP32 host fast-path,
+  // else the FP16 cl_mem/SVM-resident copy/add.
+  void residual_op(Tensor &hidden, const Tensor &input,
+                   bool accumulate) override {
+    const bool fp32_fast =
+      hidden.getDataType() == ml::train::TensorDim::DataType::FP32;
+    if (fp32_fast && hidden.size() == input.size() &&
+        input.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      const size_t n = hidden.size();
+      if (!accumulate) {
+        std::memcpy(hidden.getData<uint8_t>(), input.getData<uint8_t>(),
+                    n * sizeof(float));
+      } else {
+        float *out = hidden.getData<float>();
+        const float *in = input.getData<float>();
+        for (size_t k = 0; k < n; ++k)
+          out[k] += in[k];
+      }
+    } else if (!accumulate) {
+      // First residual operand: copy input -> hidden.
+#ifdef ENABLE_FP16
+      if (nntrainer::clmem_residual_op_cl(hidden, input,
+                                          /** accumulate */ false))
+        return;
+      const bool svm16 =
+        hidden.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        hidden.getMemoryData() && hidden.getMemoryData()->isSVM() &&
+        input.getMemoryData() && input.getMemoryData()->isSVM() &&
+        hidden.size() == input.size();
+      static const bool add_drain = std::getenv("NNTR_ADD_DRAIN") != nullptr;
+      if (svm16 && nntrainer::gpu_copy_f16_cl(
+                     reinterpret_cast<const uint16_t *>(input.getData<_FP16>()),
+                     reinterpret_cast<uint16_t *>(hidden.getData<_FP16>()),
+                     (unsigned int)hidden.size(), /** svm */ true,
+                     /** in_clmem */ nullptr, /** out_clmem */ nullptr,
+                     /** drain */ add_drain)) {
+        // GPU copy done.
+      } else
+#endif
+        hidden.copy(input);
+    } else {
+#ifdef ENABLE_FP16
+      if (nntrainer::clmem_residual_op_cl(hidden, input,
+                                          /** accumulate */ true))
+        return;
+#endif
+      nntrainer::add_i_cl(hidden, input);
+    }
+  }
+
   // Whole-op (Tensor-level) GLU dispatches. The neutral GeGLU/SwiGLU layers
   // call in1.getOps()->geglu/swiglu(...), which lands here on a CL-attached
   // tensor and forwards to the OpenCL kernel dispatch.
@@ -122,6 +209,11 @@ public:
     if (!nntrainer::dotCl_v8c(input, weight, output)) {
       if (!fc_out_zero)
         output.setZero();
+      // Static GPU_CLMEM residency: the host/SVM fallbacks below read input
+      // and write output through host pointers only, so bridge a resident
+      // input down first and raise a resident output afterwards -- a v8c
+      // rejection must not leave a GPU_CLMEM tensor's planes inconsistent.
+      nntrainer::clmem_lower_cl(input, 0);
       auto wt = weight.getDataType();
       if (wt == ml::train::TensorDim::DataType::QINT4 ||
           wt == ml::train::TensorDim::DataType::QS4CX ||
@@ -132,6 +224,7 @@ public:
       } else {
         nntrainer::dotCl(input, weight, output);
       }
+      nntrainer::clmem_raise_cl(output, 0);
     }
   }
 

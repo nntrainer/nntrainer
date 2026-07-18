@@ -732,6 +732,9 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/optimizer_wrapped.h
 %{_includedir}/nntrainer/mem_allocator.h
 %{_includedir}/nntrainer/weight_layer.h
+# residency planner headers
+%{_includedir}/nntrainer/residency_policy.h
+%{_includedir}/nntrainer/residency_planner.h
 %if %{with gpu}
 %{_includedir}/nntrainer/CL/cl.h
 %{_includedir}/nntrainer/CL/cl_platform.h

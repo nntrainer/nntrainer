@@ -242,6 +242,14 @@ public:
   std::string getName() override { return "gpu"; }
 
   /**
+   * @copydoc Context::residencyEngine
+   * @brief OpenCL GPU tensors live on the GPU residency plane.
+   */
+  ml::train::LayerComputeEngine residencyEngine() const override {
+    return ml::train::LayerComputeEngine::GPU;
+  }
+
+  /**
    * @brief Device capability snapshot, probed once in initialize(). LOG-ONLY.
    */
   const DeviceCaps &caps() const override { return caps_; }

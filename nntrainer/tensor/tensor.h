@@ -37,6 +37,10 @@ namespace nntrainer {
 
 class LazyTensor;
 
+namespace tv {
+class TensorBacking;
+} // namespace tv
+
 /**
  * @class Tensor Class
  * @brief Tensor is a multidimensional matrix that contain elements of a single
@@ -1574,6 +1578,22 @@ public:
   size_t getOffset() const;
 
   /**
+   * @brief  True if this tensor's backing memory is device cl_mem (GPU_CLMEM
+   *         residency class), i.e. NOT host-addressable. A layer uses this to
+   *         decide how to bind the tensor to a kernel (cl_mem arg vs SVM/host
+   *         pointer). False for SVM/HOST tensors (the default), keeping all
+   *         current host-pointer callers unchanged.
+   */
+  bool isClMem() const;
+
+  /**
+   * @brief  Get the device cl_mem handle (as void*) backing this tensor, or
+   *         nullptr when it is not GPU_CLMEM-resident. Equivalent to
+   *         getMemoryData()->deviceMem() once residency is GPU_CLMEM.
+   */
+  void *getClMem() const;
+
+  /**
    * @brief     Copy the Tensor
    * @param[in] from Tensor to be copied
    *
@@ -2116,8 +2136,33 @@ public:
     return migrated;
   }
 
+  /**
+   * @brief Attach an opt-in GPU TensorBacking. Non-owning weak pointer; the
+   *        backing's lifetime is managed by TensorBackingPool. CPU layers
+   *        ignore this field. GPU layers set it after producing an output
+   *        that lives in cl_mem so downstream GPU layers can read it without
+   *        a host round-trip.
+   *
+   *        Not propagated by copy ctor / copy assign: a Tensor's backing is
+   *        bound to its identity in the layer graph, not to its data buffer.
+   *        Move semantics carry it (default).
+   */
+  void setBacking(tv::TensorBacking *backing) noexcept {
+    gpu_backing_ = backing;
+  }
+
+  /**
+   * @brief Retrieve the attached GPU TensorBacking, or nullptr if none was
+   *        set. Callers must treat the pointer as non-owning and may not
+   *        outlive the TensorBackingPool.
+   */
+  tv::TensorBacking *getBacking() const noexcept { return gpu_backing_; }
+
 private:
   std::unique_ptr<TensorBase> itensor_;
+
+  tv::TensorBacking *gpu_backing_ =
+    nullptr; /**< opt-in GPU backing (non-owning) */
 
   /**
    * @brief properties for virtual tensor

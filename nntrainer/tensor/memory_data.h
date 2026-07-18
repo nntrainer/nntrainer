@@ -21,6 +21,30 @@ namespace nntrainer {
 using MemoryDataValidateCallback = std::function<void(unsigned int)>;
 
 /**
+ * @brief  GPU residency class of a tensor's backing memory.
+ * @details Decided STATICALLY by the memory planner / pool at allocation time
+ *          (a tensor property), NOT a per-edge runtime flip: the engine and
+ *          role of each tensor are known before execution, so "this tensor
+ *          lives in cl_mem" is an allocation decision applied uniformly to all
+ *          of that tensor's producers and consumers.
+ *          - HOST: host-only (CPU) memory.
+ *          - SVM: shared virtual memory (device-visible AND host-addressable).
+ *          - GPU_CLMEM: device cl_mem, NOT host-addressable; layers bind it as
+ *            a cl_mem kernel argument (see Tensor::isClMem / getClMem).
+ *          - IMAGE2D: device image2d (texture-cached); reserved for the
+ *            role-driven KV->image crossover.
+ *          - RPCMEM: ION/rpcmem shared buffer for an NPU backend (DSP-
+ *            visible); reserved.
+ */
+enum class ResidencyClass : unsigned char {
+  HOST = 0,      /**< host-only (CPU) memory */
+  SVM = 1,       /**< shared virtual memory (device + host addressable) */
+  GPU_CLMEM = 2, /**< device cl_mem (not host-addressable) */
+  IMAGE2D = 3,   /**< device image2d texture; reserved */
+  RPCMEM = 4,    /**< ION/rpcmem NPU shared buffer; reserved */
+};
+
+/**
  * @brief  MemoryData Class
  */
 class MemoryData {
@@ -45,7 +69,8 @@ public:
     invalidate_cb([](unsigned int) {}),
     svm_allocation(false),
     device_valid(false),
-    device_mem(nullptr) {}
+    device_mem(nullptr),
+    residency_(ResidencyClass::HOST) {}
 
   /**
    * @brief  Constructor of Memory Data
@@ -63,7 +88,8 @@ public:
     invalidate_cb(i_cb),
     svm_allocation(false),
     device_valid(false),
-    device_mem(nullptr) {}
+    device_mem(nullptr),
+    residency_(ResidencyClass::HOST) {}
 
   /**
    * @brief  Deleted constructor of Memory Data
@@ -168,6 +194,29 @@ public:
    */
   void *deviceMem() const { return device_mem; }
 
+  /**
+   * @brief  Get the static residency class assigned by the planner/pool.
+   */
+  ResidencyClass residency() const { return residency_; }
+
+  /**
+   * @brief  Set the static residency class (planner/pool allocation decision).
+   * @note   Distinct from the per-edge device_valid runtime bit: residency_ is
+   *         a static tensor property set once at allocation; device_valid is
+   *         the runtime overlay. Storing it alone is inert (byte-identical)
+   *         until layers bind by class.
+   */
+  void setResidency(ResidencyClass r) { residency_ = r; }
+
+  /**
+   * @brief  True if this memory lives in device cl_mem (not host-addressable).
+   * @details Layers use this to decide HOW to bind: a cl_mem kernel argument
+   *          (SetKernelArguments) for GPU_CLMEM vs an SVM/host pointer
+   *          (SetKernelSVMArguments) otherwise. Host pointer arithmetic on a
+   *          GPU_CLMEM tensor is a bug by construction.
+   */
+  bool isClMem() const { return residency_ == ResidencyClass::GPU_CLMEM; }
+
 private:
   /**
    * @brief  Set SVM allocation flag (private - only accessible by MemoryPool)
@@ -193,6 +242,7 @@ private:
   bool host_addressable = true;
   bool device_valid; /**< device residency: freshest copy is in device_mem */
   void *device_mem;  /**< resident device buffer (non-owning, void*) */
+  ResidencyClass residency_; /**< static residency class (planner decision) */
 };
 
 } // namespace nntrainer

@@ -16,6 +16,7 @@
 #define __TENSOR_POOL_H__
 #ifdef __cplusplus
 
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -28,6 +29,10 @@
 #include <common.h>
 #include <tensor.h>
 #include <tensor_wrap_specs.h>
+
+// ClBufferPool is no longer referenced here — the device-pool decision moved
+// into ClSVMAllocator::makePool, decoupling tensor_pool.h from the
+// OpenCL pool type.
 
 namespace nntrainer {
 
@@ -69,10 +74,11 @@ public:
       mem_pool = cache_pool;
     } else {
       // The allocator owns the pool-KIND decision (a plain offset-planned
-      // MemoryPool vs a device-memory pool), so this site no longer branches
-      // on getName()=="gpu-svm" or #ifdef ENABLE_OPENCL: a backend allocator's
-      // makePool returns its device pool when applicable, the base returns a
-      // MemoryPool (byte-identical). No OpenCL pool type is referenced here.
+      // MemoryPool vs a device cl_mem ClBufferPool), so this site no longer
+      // branches on getName()=="gpu-svm" or #ifdef ENABLE_OPENCL:
+      // ClSVMAllocator::makePool returns the device pool when
+      // NNTR_GPU_CLMEM_POOL is set, the base returns a MemoryPool
+      // (byte-identical).
       mem_pool = allocator_->makePool(allocator_, fsu_name);
     }
   }
@@ -202,6 +208,8 @@ public:
    * @param lifespan Lifespan of this tensor.
    * @param init Initializer of the tensor.
    * @param is_weight_grad Identification of weight gradient
+   * @param engine compute engine of the requesting layer (for static residency
+   *        class derivation; CPU by default keeps non-GPU callers unchanged)
    *
    * @return ptr to the created tensor
    *
@@ -209,11 +217,12 @@ public:
    * @note we assume that the caller checks if the exec_order and lifespan are
    * compatible.
    */
-  Tensor *request(const std::string &name, const TensorDim &dim,
-                  const std::vector<unsigned int> &exec_order,
-                  TensorLifespan lifespan,
-                  const Initializer &init = Initializer::NONE,
-                  bool is_weight_grad = false);
+  Tensor *request(
+    const std::string &name, const TensorDim &dim,
+    const std::vector<unsigned int> &exec_order, TensorLifespan lifespan,
+    const Initializer &init = Initializer::NONE, bool is_weight_grad = false,
+    ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU,
+    TensorRole role = TensorRole::GENERIC);
 
   /**
    * @brief     Request tensor which is a view of already requested with the
@@ -225,6 +234,9 @@ public:
    * @param exec_order The execution orders for this tensors
    * @param lifespan Lifespan of this tensor
    * @param offset offset from the reference
+   * @param consumer_engine compute engine of the layer consuming this view;
+   *        AND-accumulated into the source's all_consumers_gpu for static
+   *        residency derivation (CPU by default = conservative downgrade)
    *
    * @return ptr to a tensor which is sharing the same data with
    * reference.
@@ -238,7 +250,9 @@ public:
   Tensor *view(const std::string &name, const std::string &reference,
                const TensorDim &dim,
                const std::vector<unsigned int> &exec_order,
-               TensorLifespan lifespan, const size_t offset = 0);
+               TensorLifespan lifespan, const size_t offset = 0,
+               ml::train::LayerComputeEngine consumer_engine =
+                 ml::train::LayerComputeEngine::CPU);
 
   /**
    * @brief extend a tensor life as tensor is being shared.
@@ -270,10 +284,12 @@ public:
    * @return Tensor* ptr to either to the existing tensor or newly created
    * tensor
    */
-  Tensor *requestOrExtend(const std::string &name, const TensorDim &dim,
-                          const std::vector<unsigned int> &exec_order,
-                          TensorLifespan lifespan,
-                          const Initializer &init = Initializer::NONE);
+  Tensor *requestOrExtend(
+    const std::string &name, const TensorDim &dim,
+    const std::vector<unsigned int> &exec_order, TensorLifespan lifespan,
+    const Initializer &init = Initializer::NONE,
+    ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU,
+    TensorRole role = TensorRole::GENERIC);
 
   /**
    * @brief reidentify the source of already created tensor (or view).
@@ -385,6 +401,29 @@ private:
     std::vector<unsigned int> exec_order; /**< exec order */
     std::vector<unsigned int>
       dependents; /**< list of dependents to the source */
+    ml::train::LayerComputeEngine engine =
+      ml::train::LayerComputeEngine::CPU; /**< compute engine of the requesting
+                            layer; drives static residency-class derivation at
+                            allocate(). Dependents (views) inherit the source's
+                            residency via the shared MemoryData. */
+    bool all_consumers_gpu =
+      true; /**< AND of every view-consumer's engine==GPU (accumulated at
+                 view()). A tensor is GPU_CLMEM only when its producer AND all
+                 consumers are GPU: a CPU/SVM reader (e.g. mha_core consuming
+                 the wq/wk/wv outputs via host SVM pointers) downgrades the
+                 source to SVM so no consumer is left reading a stale plane. */
+    unsigned int view_count =
+      0; /**< number of views registered on this source. Device-measured: a
+              FAN-OUT tensor (>1 view chain, i.e. consumed through the
+              auto-inserted multiout) corrupts on the cl_mem plane while every
+              single-consumer tensor is token-identical -- so GPU_CLMEM is
+              currently restricted to view_count<=1 (the verified-clean
+              partition) until the fan-out interaction is root-caused. */
+    TensorRole role =
+      TensorRole::GENERIC; /**< semantic role hint, threaded to
+              deriveResidency. GENERIC today -- no layer tags it yet -- so it is
+              byte-identical; the residency resolver will read it for per-role
+              crossovers (e.g. KV->image2d on Adreno) in a later step. */
   };
 
   /**

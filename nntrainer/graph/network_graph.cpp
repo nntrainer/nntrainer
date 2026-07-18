@@ -42,9 +42,19 @@
 #include <weight_layer.h>
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <vector>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_runtime.h>
+#endif
 
 #include "graph_node.h"
 #include "tensor.h"
@@ -280,6 +290,12 @@ void NetworkGraph::markNodesForBackwarding() {
   /** mark all the required nodes support backwarding */
   for (auto const &node_name : must_support_backwarding) {
     auto ln = LNODE(graph.getNode(node_name)).get();
+    NNTR_THROW_IF(!ln->supportBackwarding(), std::invalid_argument)
+      << "training requires backwarding through node '" << node_name
+      << "' (type: " << ln->getType()
+      << ") which does not support backwarding — an upstream layer is "
+         "trainable, so its gradient cannot flow. Set trainable=false on the "
+         "upstream layers or compile with ExecutionMode::INFERENCE.";
     ln->needsCalcDerivative(true);
   }
 }
@@ -419,11 +435,87 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
   unsigned int from, unsigned int to, bool training,
   std::function<void(std::shared_ptr<LayerNode>, bool)> forwarding_op,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
+  // NNTR_LAYER_HASH: per-layer output FNV-1a hash dump for the FIRST (prefill)
+  // forward, to pinpoint where two runs diverge -- e.g. an sm_87 GPU kernel vs
+  // the host path on the SAME machine+model, or Orin vs RTX4070. Compare the
+  // [LH] lines from two runs; the first mismatching layer is the culprit.
+  // Managed activations need a device sync before the host read (Tegra
+  // concurrentManagedAccess=0); a device-only pointer is mirrored to host.
+  static const bool _layer_hash = std::getenv("NNTR_LAYER_HASH") != nullptr;
+  unsigned int _lh_idx = 0;
   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
     auto &ln = *iter;
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
     forwarding_op(*iter, training);
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
+
+    if (_layer_hash && from == 0) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      if (nntrainer::cuda::engine_selected())
+        cudaDeviceSynchronize();
+#endif
+      for (unsigned int j = 0; j < ln->getNumOutputs(); ++j) {
+        Tensor &t = ln->getOutput(j);
+        const size_t n = t.bytes();
+        const uint8_t *src = t.getData<uint8_t>();
+        const uint8_t *p = src;
+        std::vector<uint8_t> mirror;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+        if (src && nntrainer::cuda::engine_selected()) {
+          cudaPointerAttributes a{};
+          if (cudaPointerGetAttributes(&a, src) == cudaSuccess &&
+              a.type == cudaMemoryTypeDevice) {
+            mirror.resize(n);
+            cudaMemcpy(mirror.data(), src, n, cudaMemcpyDeviceToHost);
+            p = mirror.data();
+          }
+          cudaGetLastError();
+        }
+#endif
+        unsigned long long h = 1469598103934665603ull;
+        if (p)
+          for (size_t i = 0; i < n; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ull;
+          }
+        // min/max (FP16 / FP32) to spot a layer whose output blew up / went
+        // abnormal (the divergence signature, e.g. an exploded norm) without a
+        // reference run.
+        float lo = 0.f, hi = 0.f;
+        const auto dt = t.getDataType();
+        if (p && n > 0) {
+          lo = 1e30f;
+          hi = -1e30f;
+#ifdef ENABLE_FP16
+          if (dt == ml::train::TensorDim::DataType::FP16) {
+            const _FP16 *q = reinterpret_cast<const _FP16 *>(p);
+            for (size_t i = 0; i < n / sizeof(_FP16); ++i) {
+              float v = static_cast<float>(q[i]);
+              if (v < lo)
+                lo = v;
+              if (v > hi)
+                hi = v;
+            }
+          } else
+#endif
+            if (dt == ml::train::TensorDim::DataType::FP32) {
+            const float *q = reinterpret_cast<const float *>(p);
+            for (size_t i = 0; i < n / sizeof(float); ++i) {
+              if (q[i] < lo)
+                lo = q[i];
+              if (q[i] > hi)
+                hi = q[i];
+            }
+          }
+        }
+        std::fprintf(stderr,
+                     "[LH] %3u %-28s out%u bytes=%zu min=%.3g max=%.3g "
+                     "fnv=%016llx\n",
+                     _lh_idx, ln->getName().c_str(), j, n, lo, hi, h);
+      }
+      std::fflush(stderr);
+    }
+    ++_lh_idx;
   }
 
   sharedConstTensors out;
@@ -693,14 +785,24 @@ NetworkGraph::canExecuteInPlace(const std::shared_ptr<LayerNode> &lnode) {
     return inplace_type;
   }
 
-  // Historically, InputLayer was forced non-in-place under a non-FP32
-  // activation dtype because finalize() used to promote the output dim to
-  // the activation dtype, making input/output dtypes differ. With
-  // InputLayer::finalize now preserving the declared input dtype, output
-  // dim equals input dim and the in-place view is always safe. Keeping the
-  // override would break callers that bind an external buffer to the
-  // placeholder output (e.g. KVCacheManager.bind) and rely on the input
-  // sharing storage with that output.
+  if (lnode->getType() == InputLayer::type &&
+      !istrequal(getTensorType()[2], "FP32")) {
+    /** Legacy veto from the implicit FP32->activation-dtype promotion era.
+     * InputLayer::finalize no longer promotes (output dims+dtype are always
+     * identical to the declared input dims+dtype), and the actual memory
+     * sharing at finalizeContext is still gated on the layer's own
+     * supportInPlace() (is_inplace = dims+dtype comparison in finalize), so
+     * trusting it is safe. Keeping an unconditional veto would also break
+     * callers that bind an external buffer to the placeholder output (e.g.
+     * KVCacheManager.bind) and rely on the input sharing storage with that
+     * output. The veto forced a full-tensor copyData per input layer per
+     * forwarding -- for CausalLM's external KV-cache placeholder inputs that
+     * is 52 x ~2MB of pure host copy per prefill (~54ms).
+     * NNTR_INPUT_INPLACE=0 restores the old unconditional veto. */
+    static const char *input_inplace_env = std::getenv("NNTR_INPUT_INPLACE");
+    if (input_inplace_env != nullptr && input_inplace_env[0] == '0')
+      return InPlaceType::NONE;
+  }
 
   if (lnode->getType() == MultiOutLayer::type) {
     return InPlaceType::RESTRICTING;
@@ -767,6 +869,53 @@ setInplaceSharedMemoryConfigByLayer(const std::shared_ptr<LayerNode> &lnode,
    */
 }
 
+// cl_mem activation-residency edge map (NNTR_RESIDENT_ACT overlay). Plain
+// string->string so it links in the CPU build; populated at finalizeContext.
+static std::unordered_map<std::string, std::string> &resident_edge_map() {
+  static std::unordered_map<std::string, std::string> m;
+  return m;
+}
+static std::mutex &resident_edge_mtx() {
+  static std::mutex m;
+  return m;
+}
+void registerResidentEdge(const std::string &consumer_input_name,
+                          const std::string &producer_output_name) {
+  std::lock_guard<std::mutex> lk(resident_edge_mtx());
+  resident_edge_map()[consumer_input_name] = producer_output_name;
+}
+std::string resolveResidentEdge(const std::string &consumer_input_name) {
+  std::lock_guard<std::mutex> lk(resident_edge_mtx());
+  auto it = resident_edge_map().find(consumer_input_name);
+  return it == resident_edge_map().end() ? std::string() : it->second;
+}
+
+// per-producer-output "are ALL consumers GPU?" stamp.
+// A producer activation may stay GPU-resident only if every consumer reads it
+// on the GPU; one CPU consumer forces a device->host sync at that edge. We
+// AND-accumulate consumer-GPU-ness here (string-keyed so it links in the CPU
+// build), populated at finalizeContext alongside the edge map. WRITTEN in S0
+// but not READ until S2 (boundary forcing) -> inert. Unknown producer (e.g. a
+// graph output like lm_head with no recorded consumer) resolves to false =
+// "needs host", the safe default.
+static std::unordered_map<std::string, bool> &consumer_gpu_map() {
+  static std::unordered_map<std::string, bool> m;
+  return m;
+}
+void registerConsumerEngine(const std::string &producer_output_name,
+                            bool consumer_is_gpu) {
+  std::lock_guard<std::mutex> lk(resident_edge_mtx());
+  auto &m = consumer_gpu_map();
+  auto it = m.find(producer_output_name);
+  m[producer_output_name] =
+    (it == m.end()) ? consumer_is_gpu : (it->second && consumer_is_gpu);
+}
+bool resolveProducerAllConsumersGpu(const std::string &producer_output_name) {
+  std::lock_guard<std::mutex> lk(resident_edge_mtx());
+  auto it = consumer_gpu_map().find(producer_output_name);
+  return it == consumer_gpu_map().end() ? false : it->second;
+}
+
 std::vector<Var_Grad *>
 NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
                               const std::vector<Var_Grad *> &prev_inputs) {
@@ -793,6 +942,20 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
     [](auto const &vg) -> const auto & { return vg->getName(); });
   const std::vector<Var_Grad *> &inputs = tensor_manager->requestInputs(
     gnode, init_context.getInputDimensions(), input_names);
+
+  // Record the producer->consumer activation edge for the cl_mem residency
+  // overlay: consumer's input view name (inputs[i]) -> producer's output name
+  // (input_names[i]). The runtime input Tensor only knows its own view name, so
+  // a GPU CL layer resolves its producing edge through this map to find the
+  // resident cl_mem backing. Inert unless NNTR_RESIDENT_ACT is set.
+  for (size_t i = 0; i < inputs.size() && i < input_names.size(); ++i)
+    registerResidentEdge(inputs[i]->getName(), input_names[i]);
+
+  // stamp this consumer's engine onto each producer output
+  // it reads. AND-accumulated across all consumers (inert; read at S2). lnode
+  // has been finalized above so its compute_engine is set.
+  for (const auto &producer_output_name : input_names)
+    registerConsumerEngine(producer_output_name, lnode->isComputeEngineGPU());
 
   /** In-Place optimizations */
   /**
@@ -975,6 +1138,20 @@ NetworkGraph::refinalizeContext(const std::shared_ptr<LayerNode> &lnode,
     [](auto const &vg) -> const auto & { return vg->getName(); });
   const std::vector<Var_Grad *> &inputs = tensor_manager->requestInputs(
     gnode, init_context.getInputDimensions(), input_names);
+
+  // Record the producer->consumer activation edge for the cl_mem residency
+  // overlay: consumer's input view name (inputs[i]) -> producer's output name
+  // (input_names[i]). The runtime input Tensor only knows its own view name, so
+  // a GPU CL layer resolves its producing edge through this map to find the
+  // resident cl_mem backing. Inert unless NNTR_RESIDENT_ACT is set.
+  for (size_t i = 0; i < inputs.size() && i < input_names.size(); ++i)
+    registerResidentEdge(inputs[i]->getName(), input_names[i]);
+
+  // stamp this consumer's engine onto each producer output
+  // it reads. AND-accumulated across all consumers (inert; read at S2). lnode
+  // has been finalized above so its compute_engine is set.
+  for (const auto &producer_output_name : input_names)
+    registerConsumerEngine(producer_output_name, lnode->isComputeEngineGPU());
 
   /** In-Place optimizations */
   /**
@@ -1175,6 +1352,21 @@ int NetworkGraph::initialize(ExecutionMode mode,
                              const std::vector<Connection> &model_label_names) {
   exec_mode = mode;
   tensor_manager->setExecutionMode(mode);
+
+  // [NNTR_INIT_TRACE] sub-dissection of the graph-initialize share of init
+  // latency.
+  static const bool init_trace = std::getenv("NNTR_INIT_TRACE") != nullptr;
+  const auto _gt0 = std::chrono::steady_clock::now();
+  auto _glap = [&](const char *what) {
+    if (!init_trace)
+      return;
+    std::fprintf(stderr, "[init-trace]   graph: %8.1f ms  %s\n",
+                 std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - _gt0)
+                   .count(),
+                 what);
+    std::fflush(stderr);
+  };
   /**
    * this contains the map from node name to its input tensor names
    * @note: these input tensors have already been allocated
@@ -1283,6 +1475,7 @@ int NetworkGraph::initialize(ExecutionMode mode,
       }
     }
   }
+  _glap("gradient first/last-access marking");
 
   /**** identify model input / output to be set externally later ****/
   auto identify_as_model_input = [this](LayerNode *node) {
@@ -1377,6 +1570,7 @@ int NetworkGraph::initialize(ExecutionMode mode,
       break;
     }
   }
+  _glap("io identify + backward marking + total");
   return ML_ERROR_NONE;
 }
 

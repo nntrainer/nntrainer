@@ -39,6 +39,11 @@
 #include "noncopyable.h"
 #include "nonmovable.h"
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cstdlib>
+#include <cuda_mem_allocator.h>
+#endif
+
 namespace nntrainer {
 using ExecutionMode = ml::train::ExecutionMode;
 
@@ -121,6 +126,28 @@ public:
     4; /**< number of tensor group type */
 
   /**
+   * @brief Pick the activation-pool allocator. Default = same allocator as the
+   *        weight pool. On engine=cuda with NNTR_CUDA_DEV_ACT enabled, return a
+   *        device-only (cudaMalloc) allocator so the activation (tensor) pool
+   * is real device memory -- no host<->device page migration / async thrash;
+   *        weights keep UVM (cuda-uvm) because the host writes them at load.
+   *        VALUE-checked: =0 disables. CudaContext auto-defaults it to 1 on
+   *        discrete GPUs (setenv overwrite=0), so an explicit =0 is the only
+   *        way to force the UVM activation pool there -- a presence check made
+   *        that impossible. Inert on non-CUDA builds (allocator unchanged).
+   */
+  static std::shared_ptr<MemAllocator>
+  activationAllocator(const std::shared_ptr<MemAllocator> &allocator) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    const char *dev_act = std::getenv("NNTR_CUDA_DEV_ACT");
+    if (allocator && allocator->getName() == "cuda-uvm" && dev_act != nullptr &&
+        dev_act[0] != '0')
+      return std::make_shared<CudaMemAllocator>(/** device_only */ true);
+#endif
+    return allocator;
+  }
+
+  /**
    * @brief     Constructor of Manager
    */
   Manager() :
@@ -147,7 +174,7 @@ public:
             std::make_shared<MemAllocator>()) :
     weight_pool(enable_fsu_, fsu_path, "weight_pool", exec_mode_, allocator),
     tensor_pool(enable_fsu_ && (exec_mode_ == ExecutionMode::TRAIN), fsu_path,
-                "tensor_pool", exec_mode_, allocator),
+                "tensor_pool", exec_mode_, activationAllocator(allocator)),
     enable_fsu(enable_fsu_),
     enable_optimizations(true),
     fsu_lookahead(lookahead),

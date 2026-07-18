@@ -105,3 +105,6 @@
 /usr/include/nntrainer/ddtree_sliding.h
 /usr/include/nntrainer/ddtree_compact.h
 /usr/include/nntrainer/ddtree_sampling.h
+# residency planner headers
+/usr/include/nntrainer/residency_policy.h
+/usr/include/nntrainer/residency_planner.h

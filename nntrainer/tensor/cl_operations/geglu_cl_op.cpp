@@ -23,6 +23,7 @@
 #include <cstring>
 #include <vector>
 
+#include <blas_kernel_interface.h> // get_or_create_resident_backing (residency)
 #include <cl_kernels/geglu.h>
 #include <engine.h> // Engine::Global().getRegisteredContext("gpu")
 #include <nntrainer_log.h>
@@ -385,13 +386,42 @@ void geglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &result,
     _FP16 *data1 = in1.getData<_FP16>() + elem_off;
     _FP16 *data2 = in2.getData<_FP16>() + elem_off;
     _FP16 *rdata = result.getData<_FP16>() + elem_off;
-    // cl_mem-resident operands (the *_clmem parameters) and the kernel-side
-    // row offset arrive with the residency planner; on the SVM pool every
-    // operand binds SVM-direct with the offset applied on the pointer.
-    geglu_cl_fp16(data1, data2, rdata, dim1, dim2, use_svm,
-                  /** resident_out */ nullptr, /** skip_out_map */ false,
-                  /** in1_clmem */ nullptr, /** in2_clmem */ nullptr,
-                  /** row_off */ 0u);
+    // Planner-decided STATIC residency: each of in1/in2/out binds the plane
+    // its ResidencyClass picked at allocation -- the gate/up FC outputs and
+    // the geglu output are GPU_CLMEM on the live path, so the kernel reads
+    // and writes the planner cl_mem sub-buffers directly (no SVM map at all
+    // on this op). Mixed cl_mem/SVM args are valid for partial classification.
+    void *in1_cl = (use_svm && in1.isClMem()) ? in1.getClMem() : nullptr;
+    void *in2_cl = (use_svm && in2.isClMem()) ? in2.getClMem() : nullptr;
+    void *out_cl = (use_svm && result.isClMem()) ? result.getClMem() : nullptr;
+    // Legacy runtime overlay (env-off by default): only when the static class
+    // did not already place the output in cl_mem.
+    void *res_backing = out_cl;
+    if (res_backing == nullptr) {
+      static const bool resident_act =
+        std::getenv("NNTR_RESIDENT_ACT") != nullptr;
+      const auto rmd = result.getMemoryData();
+      if (resident_act && use_svm && rmd && rmd->isSVM())
+        res_backing =
+          static_cast<void *>(nntrainer::get_or_create_resident_backing(
+            result.getName(), (unsigned int)result.size(), /** fp16 */ true));
+    }
+    static const bool devres_geglu = std::getenv("NNTR_DEVRES") != nullptr;
+    const bool resident_edge =
+      devres_geglu && use_svm && res_backing == nullptr;
+    // When every buffer is bound as a whole cl_mem (index 0, no pointer
+    // offset), the kernel applies elem_off itself so a single live row at
+    // row_offset is processed in place. SVM/host args carry the offset on
+    // their pointer, so row_off stays 0 there.
+    const unsigned int kern_row_off =
+      (in1_cl && in2_cl && res_backing) ? (unsigned int)elem_off : 0u;
+    geglu_cl_fp16(data1, data2, rdata, dim1, dim2, use_svm, res_backing,
+                  /** skip_out_map */ resident_edge, in1_cl, in2_cl,
+                  kern_row_off);
+    if (devres_geglu)
+      if (auto rmd = result.getMemoryData())
+        rmd->setDeviceValid(
+          resident_edge, resident_edge ? result.getData<uint8_t>() : nullptr);
 #else
     throw std::invalid_argument("Error: enable-fp16 is not enabled");
 #endif

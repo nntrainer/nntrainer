@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mem_allocator.h>
+#include <memory_data.h> // ResidencyClass
 #include <memory_pool.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -39,6 +40,24 @@ size_t round_up(size_t size, size_t alignment) {
 }
 
 } // namespace
+
+// Default residency-capability map; backends override to advertise IMAGE2D /
+// RPCMEM explicitly. Additive — no decision site consumes it yet.
+bool MemAllocator::supportsResidency(ResidencyClass cls) const {
+  switch (cls) {
+  case ResidencyClass::HOST:
+    return true;
+  case ResidencyClass::SVM:
+    return isSVM();
+  case ResidencyClass::GPU_CLMEM:
+  case ResidencyClass::IMAGE2D:
+    return supportsDevicePool();
+  case ResidencyClass::RPCMEM:
+    return needsRegister();
+  default:
+    return false;
+  }
+}
 
 void MemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
   NNTR_THROW_IF(size == 0, std::invalid_argument)

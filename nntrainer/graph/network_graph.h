@@ -756,6 +756,34 @@ private:
    */
   LayerNode *computeBackwardEnd();
 };
+
+/**
+ * @brief cl_mem activation-residency edge map (paper §3.2 GPU residency).
+ *        Records, at graph finalize, the producer-output name for each
+ *        consumer-input name so a GPU CL layer can look up the resident cl_mem
+ *        TensorBacking its input was produced into (the runtime input Tensor
+ *        only knows its own view name, not the producing edge). CL-free (plain
+ *        strings) so the CPU build links it without OpenCL. Used by the
+ *        NNTR_RESIDENT_ACT overlay; inert otherwise.
+ */
+void registerResidentEdge(const std::string &consumer_input_name,
+                          const std::string &producer_output_name);
+/** @brief Resolve a consumer-input name to its producer-output name, or "". */
+std::string resolveResidentEdge(const std::string &consumer_input_name);
+
+/**
+ * @brief record that a producer output is read by a consumer
+ *        running on the given engine. AND-accumulated across all consumers so
+ *        resolveProducerAllConsumersGpu() answers "is this activation consumed
+ *        ONLY on the GPU?" — the condition for keeping it device-resident.
+ *        CL-free; inert until a residency step reads it.
+ */
+void registerConsumerEngine(const std::string &producer_output_name,
+                            bool consumer_is_gpu);
+/** @brief True iff every recorded consumer of this producer output is GPU.
+ *         Unknown/graph-output producers resolve to false (needs host). */
+bool resolveProducerAllConsumersGpu(const std::string &producer_output_name);
+
 } // namespace nntrainer
 
 #endif /* __cplusplus */

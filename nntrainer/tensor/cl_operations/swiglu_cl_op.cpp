@@ -326,11 +326,17 @@ void swiglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &result,
     _FP16 *data1 = in1.getData<_FP16>() + elem_off;
     _FP16 *data2 = in2.getData<_FP16>() + elem_off;
     _FP16 *rdata = result.getData<_FP16>() + elem_off;
-    // cl_mem-resident operands (the *_clmem parameters) arrive with the
-    // residency planner; on the SVM pool every operand binds SVM-direct.
-    swiglu_cl_fp16(data1, data2, rdata, dim1, dim2, use_svm,
-                   /** out_clmem */ nullptr, /** skip_out_map */ false,
-                   /** in1_clmem */ nullptr, /** in2_clmem */ nullptr);
+    // Planner-decided STATIC cl_mem residency: under the cl_mem pool the
+    // gate/up FC outputs and the swiglu output are GPU_CLMEM, so getData() is
+    // NOT host-addressable -- bind the planner cl_mem sub-buffers directly.
+    // Without this the host-bounce path reads the cl_mem handle as a host
+    // pointer => the swiglu output is never written => the FFN contributes
+    // nothing to the residual.
+    void *in1_cl = (use_svm && in1.isClMem()) ? in1.getClMem() : nullptr;
+    void *in2_cl = (use_svm && in2.isClMem()) ? in2.getClMem() : nullptr;
+    void *out_cl = (use_svm && result.isClMem()) ? result.getClMem() : nullptr;
+    swiglu_cl_fp16(data1, data2, rdata, dim1, dim2, use_svm, out_cl,
+                   /** skip_out_map */ false, in1_cl, in2_cl);
 #else
     throw std::invalid_argument("Error: enable-fp16 is not enabled");
 #endif

@@ -12,6 +12,7 @@
 
 #include <cl_buffer_pool.h>
 #include <cl_svm_allocator.h>
+#include <cstdlib>
 #include <cstring>
 #include <env_compat.h>
 #include <memory_pool.h>
@@ -39,9 +40,29 @@ ClSVMAllocator::makePool(const std::shared_ptr<MemAllocator> &self,
   // OFF => the SVM-backed MemoryPool. The pool-KIND decision is owned by the
   // allocator (this override) instead of a getName() string test in
   // TensorPool.
-  (void)pool_name;
-  if (nntr_env_on("NNTR_GPU_CLMEM_POOL"))
-    return std::make_shared<ClBufferPool>(self);
+  if (nntr_env_on("NNTR_GPU_CLMEM_POOL")) {
+    // Weight-plane skip: no WEIGHT tensor ever binds its per-offset cl_mem
+    // (the quantized FCs read their own packed backing and the norms are
+    // host-read), yet a shadow plane can be fully committed by the driver.
+    // Give the never-consumed plane only to the pools that use it
+    // (activations); the weight pool keeps the plain SVM MemoryPool.
+    // Default: skip on x86 (field-verified never-bound); KEEP on ARM/Adreno
+    // until a device A/B clears it. Explicit env overrides both ways:
+    //   NNTR_CLMEM_WEIGHT_PLANE=1 -> keep the plane everywhere
+    //   NNTR_CLMEM_WEIGHT_PLANE=0 -> skip everywhere
+    static const char *wp_env = std::getenv("NNTR_CLMEM_WEIGHT_PLANE");
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
+  defined(_M_IX86)
+    const bool arch_default_skip = true;
+#else
+    const bool arch_default_skip = false;
+#endif
+    const bool skip_weight_plane =
+      pool_name == "weight_pool" &&
+      (wp_env ? wp_env[0] == '0' : arch_default_skip);
+    if (!skip_weight_plane)
+      return std::make_shared<ClBufferPool>(self);
+  }
   return std::make_shared<MemoryPool>(self);
 }
 

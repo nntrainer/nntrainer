@@ -1274,6 +1274,16 @@ const std::shared_ptr<MemoryData> Tensor::getMemoryData() const {
 
 size_t Tensor::getOffset() const { return itensor_->getOffset(); }
 
+bool Tensor::isClMem() const {
+  auto md = itensor_->getMemoryData();
+  return md && md->isClMem();
+}
+
+void *Tensor::getClMem() const {
+  auto md = itensor_->getMemoryData();
+  return md ? md->deviceMem() : nullptr;
+}
+
 void Tensor::copy(const Tensor &from) {
   /// @todo enable copy to non-contiguous tensor
   if (!itensor_->getContiguous() || !from.getContiguous()) {
@@ -1650,6 +1660,12 @@ Tensor Tensor::getSharedDataTensor(const TensorDim dim_, size_t offset,
   Tensor ret = *this;
   itensor_->getSharedDataTensor(dim_, offset, reset_stride, name_,
                                 ret.itensor_.get());
+  // Propagate the GPU backing pointer to the view: shared-data views share
+  // the same underlying buffer, so a downstream consumer that receives the
+  // view must see the same backing. The copy ctor invoked above resets
+  // gpu_backing_ to nullptr (by design — copies don't claim ownership);
+  // explicit propagation here is the share-data exception.
+  ret.gpu_backing_ = this->gpu_backing_;
   return ret;
 }
 
