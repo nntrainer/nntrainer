@@ -15,11 +15,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-// NOTE: the CUDA fast paths in this file are gated on NNTR_LLM_CUDA_FAST_PATH
-// (not ENABLE_CUDA directly): they call CUDA kernels that land in the later
-// CUDA-backend changes of this series. Those changes flip the gate back to
-// ENABLE_CUDA; until then an enable-cuda build compiles the host paths only.
-#if defined(NNTR_LLM_CUDA_FAST_PATH)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_runtime.h>
@@ -80,7 +76,7 @@ void LogitSoftCappingLayer::incremental_forwarding(
 
 void LogitSoftCappingLayer::applyOnRange(nntrainer::RunLayerContext &context,
                                          unsigned int from, unsigned int to) {
-#if defined(NNTR_LLM_CUDA_FAST_PATH)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Terminal drain for the selective-sync (NNTR_CUDA_ASYNC) path: this is the
   // first host read of the lm_head logits, so the one-per-token GPU pipeline
   // drains here. A no-op in default mode (every GPU op already drained).
@@ -121,7 +117,7 @@ void LogitSoftCappingLayer::applyOnRange(nntrainer::RunLayerContext &context,
       nntrainer::Tensor out_chunk =
         out.getSharedDataTensor(out_chunk_dim, 0, true);
 
-#if defined(NNTR_LLM_CUDA_FAST_PATH) && defined(ENABLE_FP16)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
       // Device-only activation pool: the logits are real device memory; the
       // host Tensor ops below would fault. softcap = cap*tanh(x/cap) in one GPU
       // kernel (mirrors the OpenCL GPU path). gemma4

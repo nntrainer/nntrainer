@@ -20,11 +20,7 @@
 
 #include "scalar_multiply.h"
 
-// NOTE: the CUDA fast paths in this file are gated on NNTR_LLM_CUDA_FAST_PATH
-// (not ENABLE_CUDA directly): they call CUDA kernels that land in the later
-// CUDA-backend changes of this series. Those changes flip the gate back to
-// ENABLE_CUDA; until then an enable-cuda build compiles the host paths only.
-#if defined(NNTR_LLM_CUDA_FAST_PATH)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
 #include <cuda_runtime.h>
@@ -159,7 +155,7 @@ void ScalarMultiplyLayer::incremental_forwarding(
       out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen(), true);
 
     bool done = false;
-#if defined(NNTR_LLM_CUDA_FAST_PATH) && defined(ENABLE_FP16)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
       if (gpu) {
@@ -175,7 +171,7 @@ void ScalarMultiplyLayer::incremental_forwarding(
     }
 #endif
     if (!done) {
-#if defined(NNTR_LLM_CUDA_FAST_PATH)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
       // Host multiply() reads the GPU-produced UVM input on the CPU; sync first
       // in async mode (no-op in default sync mode).
       nntrainer::cuda::drain_if_async();
