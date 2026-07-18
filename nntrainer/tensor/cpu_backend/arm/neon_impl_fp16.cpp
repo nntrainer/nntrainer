@@ -485,7 +485,7 @@ void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
         if (n < 4)
           Y32[idx + n] = y0_3[n];
         else
-          Y32[idx + n] = y4_7[n];
+          Y32[idx + n] = y4_7[n - 4];
       }
     }
   }
@@ -576,7 +576,7 @@ void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
         if (n < 4)
           Y32[idx + n] = y0_3[n];
         else
-          Y32[idx + n] = y4_7[n];
+          Y32[idx + n] = y4_7[n - 4];
       }
     }
   }
@@ -642,7 +642,7 @@ void hgemv_transpose(const __fp16 *A, const __fp16 *X, __fp16 *Y, uint32_t M,
         if (n < 4)
           Y32[idx + n] = y0_3[n];
         else
-          Y32[idx + n] = y4_7[n];
+          Y32[idx + n] = y4_7[n - 4];
       }
     }
   }
@@ -1314,18 +1314,23 @@ void swiglu(const unsigned int N, __fp16 *X, __fp16 *Y, __fp16 *Z) {
   for (; N - i >= 8; i += 8) {
     float16x8_t y0_7 = vld1q_f16(&Y[i]);
     float16x8_t z0_7 = vld1q_f16(&Z[i]);
-    float16x8_t y0_7_minus = vmulq_n_f16(y0_7, -1);
 
-    float32x4_t exp0_3 = exp_ps(vcvt_f32_f16(vget_low_f16(y0_7_minus)));
-    float32x4_t exp4_7 = exp_ps(vcvt_f32_f16(vget_high_f16(y0_7_minus)));
+    // Compute silu(Y) * Z entirely in FP32 and narrow to FP16 only on store.
+    // Doing the silu division and the * Z product in FP16 overflows fp16 max
+    // (65504) on large MLP intermediates -> Inf -> NaN downstream. The
+    // scalar tail below already computes in fp32; this matches it.
+    float32x4_t yl = vcvt_f32_f16(vget_low_f16(y0_7));
+    float32x4_t yh = vcvt_f32_f16(vget_high_f16(y0_7));
+    float32x4_t zl = vcvt_f32_f16(vget_low_f16(z0_7));
+    float32x4_t zh = vcvt_f32_f16(vget_high_f16(z0_7));
 
-    float16x8_t exp0_7 =
-      vcombine_f16(vcvt_f16_f32(exp0_3), vcvt_f16_f32(exp4_7));
-    exp0_7 = vaddq_f16(exp0_7, vmovq_n_f16(1.f));
-    exp0_7 = vdivq_f16(y0_7, exp0_7);
-    exp0_7 = vmulq_f16(exp0_7, z0_7);
+    float32x4_t one = vmovq_n_f32(1.f);
+    float32x4_t sl = vdivq_f32(yl, vaddq_f32(exp_ps(vnegq_f32(yl)), one));
+    float32x4_t sh = vdivq_f32(yh, vaddq_f32(exp_ps(vnegq_f32(yh)), one));
+    sl = vmulq_f32(sl, zl);
+    sh = vmulq_f32(sh, zh);
 
-    vst1q_f16(&X[i], exp0_7);
+    vst1q_f16(&X[i], vcombine_f16(vcvt_f16_f32(sl), vcvt_f16_f32(sh)));
   }
   while (i < N) {
     X[i] = (Y[i] / (1.f + std::exp(static_cast<float>(-Y[i])))) * Z[i];
