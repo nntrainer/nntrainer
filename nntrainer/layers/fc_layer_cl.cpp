@@ -2,25 +2,25 @@
 /**
  * Copyright (C) 2024 Debadri Samaddar <s.debadri@samsung.com>
  *
- * @file	fc_layer_cl.cpp
- * @date	7 May 2024
- * @brief	This is Fully Connected Layer Class for Neural Network with OpenCl
- * implementation
- * @see		https://github.com/nntrainer/nntrainer
- * @author	Debadri Samaddar <s.debadri@samsung.com>
- * @bug		No known bugs except for NYI items
- *
+ * @file   fc_layer_cl.cpp
+ * @date   7 May 2024
+ * @brief  Backend-neutral quantized Fully Connected layer (op-table dispatch).
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author Debadri Samaddar <s.debadri@samsung.com>
+ * @bug    No known bugs except for NYI items
  */
 
-#include <blas_kernel_interface.h>
-#include <common_properties.h>
 #include <fc_layer_cl.h>
-#include <layer_context.h>
-#include <lazy_tensor.h>
+
+#include <cstdlib>
 #include <limits>
+
+#include <common_properties.h>
+#include <layer_context.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <tensor.h>
 #include <util_func.h>
 
 namespace nntrainer {
@@ -30,12 +30,13 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 enum FCParams { weight, bias };
 
 FullyConnectedLayerCl::FullyConnectedLayerCl() :
-  LayerImplCl(), fc_props(props::Unit()) {
-  // weight_idx.fill(std::numeric_limits<unsigned>::max());
-  weight_idx.fill(2);
+  LayerImpl(), fc_props(props::Unit(), props::FusedActivation()) {
+  weight_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
 void FullyConnectedLayerCl::finalize(InitLayerContext &context) {
+  if (!std::get<props::SkipPrefill>(*layer_impl_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(*layer_impl_props).get();
   auto &weight_regularizer =
     std::get<props::WeightRegularizer>(*layer_impl_props);
   auto &weight_regularizer_constant =
@@ -54,8 +55,6 @@ void FullyConnectedLayerCl::finalize(InitLayerContext &context) {
 
   std::vector<TensorDim> output_dims(1);
 
-  /// @todo fc actaully supports multidimensions. EffDimFlag shouldn't be fixed
-  /// like this.
   context.setEffDimFlagInputDimension(0, 0b1001);
   context.setDynDimFlagInputDimension(0, 0b1000);
 
@@ -65,14 +64,26 @@ void FullyConnectedLayerCl::finalize(InitLayerContext &context) {
   output_dims[0] = in_dim;
   is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
 
+  // CausalLM lm_head (name "output_of_causallm"): an untied QINT4 vocab
+  // projection (unit=vocab) that is skip_prefill, so it only ever computes the
+  // last position (decode M=1). Planning its output at the full graph-build
+  // height makes a vocab-wide dead activation plane (~1GB) that uniformly slows
+  // every decode kernel via bandwidth pressure. Force height=1 (rows>0 are
+  // never produced). NNTR_LMHEAD_OUT_FULL restores the old full-height
+  // planning.
+  if (skip_prefill && context.getName() == "output_of_causallm") {
+    static const bool keep_full =
+      std::getenv("NNTR_LMHEAD_OUT_FULL") != nullptr;
+    if (!keep_full)
+      output_dims[0].height(1);
+  }
+
   output_dims[0].setTensorType(
     {context.getFormat(), context.getActivationDataType()});
 
   context.setOutputDimensions(output_dims);
 
   /** set weight specifications */
-  // @todo : This NCHW format setting is just temporal, it needs to be set by
-  // global configuration
   TensorDim bias_dim(
     1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
     TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
@@ -109,29 +120,40 @@ void FullyConnectedLayerCl::setProperty(
 
 void FullyConnectedLayerCl::forwarding(RunLayerContext &context,
                                        bool training) {
-
   Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
-  hidden_.setZero();
-  dotCl(input_, weight, hidden_);
+  // output = input * weight. The backend's ComputeOps owns the GEMM (OpenCL v8c
+  // / CUDA cuda_fc_qint4 / host dot). [T7]
+  input_.getOps()->fc(input_, weight, hidden_);
 
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
     hidden_.add_i(bias);
   }
+
+  // [T10] fused activation epilogue via the op table — same backend-neutral
+  // dispatch as the core FC (ClComputeOps on gpu, CudaComputeOps on cuda).
+  // Inert for the LLM stack (no fc+activation); fires only when a
+  // FusionRealizer sets fused_activation (a GPU CNN/MLP).
+  auto &fused_act = std::get<props::FusedActivation>(fc_props);
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE)
+    hidden_.getOps()->apply_activation(hidden_, (int)fused_act.get());
 }
 
 void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
                                                    unsigned int from,
                                                    unsigned int to,
                                                    bool training) {
-  Tensor w;
-  Tensor &weight = w;
-  context.getWeight(weight, weight_idx[FCParams::weight]);
+  if (skip_prefill && from == 0)
+    return;
 
+  // by-reference so a quantized weight keeps its instance across forwards (a
+  // Tensor::operator= on QINT4 deep-clones the Int4QTensor, wiping the
+  // assembled weight cache every token and tanking decode throughput).
+  Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
 
@@ -151,17 +173,52 @@ void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
   input_step_dim.height(to - from);
   hidden_step_dim.height(to - from);
 
-  // @todo: set reset stride as false. This implementation only works when
-  // batch size is 1
+  // @todo: only correct for batch size 1
   Tensor input_step = input_.getSharedDataTensor(input_step_dim, 0, true);
   Tensor hidden_step = hidden_.getSharedDataTensor(hidden_step_dim, 0, true);
 
-  dotCl(input_step, weight, hidden_step);
+  input_step.getOps()->fc(input_step, weight, hidden_step);
 
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
       disable_bias.empty() || disable_bias.get() == false) {
     Tensor &bias = context.getWeight(weight_idx[FCParams::bias]);
     hidden_step.add_i(bias);
+  }
+
+  // [T10] fused activation epilogue via the op table (see forwarding()).
+  auto &fused_act = std::get<props::FusedActivation>(fc_props);
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE)
+    hidden_step.getOps()->apply_activation(hidden_step, (int)fused_act.get());
+}
+
+void FullyConnectedLayerCl::read(std::ifstream &file,
+                                 RunLayerContext &run_context, bool opt_var,
+                                 ml::train::ExecutionMode mode, bool trainable,
+                                 TensorDim::DataType defineWeightDataType,
+                                 bool fsu, size_t start_offset,
+                                 bool read_from_offset, int file_fd) {
+  Layer::read(file, run_context, opt_var, mode, trainable, defineWeightDataType,
+              fsu, start_offset, read_from_offset, file_fd);
+  // Eager backend weight build at load (see header). Not under FSU: the weight
+  // data may be streamed back out, invalidating the host pointer the cache is
+  // keyed on. No-op on backends without a prebuild (CPU/CUDA).
+  if (!opt_var && !fsu) {
+    Tensor &w = run_context.getWeight(weight_idx[FCParams::weight]);
+    w.getOps()->fc_prebuild_weight(w);
+  }
+}
+
+void FullyConnectedLayerCl::read(ReadSource src, RunLayerContext &run_context,
+                                 bool opt_var, ml::train::ExecutionMode mode,
+                                 bool trainable,
+                                 TensorDim::DataType defineWeightDataType,
+                                 bool fsu, size_t start_offset,
+                                 bool read_from_offset, int file_fd) {
+  Layer::read(src, run_context, opt_var, mode, trainable, defineWeightDataType,
+              fsu, start_offset, read_from_offset, file_fd);
+  if (!opt_var && !fsu) {
+    Tensor &w = run_context.getWeight(weight_idx[FCParams::weight]);
+    w.getOps()->fc_prebuild_weight(w);
   }
 }
 

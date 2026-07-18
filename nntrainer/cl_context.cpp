@@ -20,12 +20,15 @@
 #include <cl_svm_allocator.h>
 #include <compute_ops.h>
 #include <concat_cl.h>
+#include <cstdlib>
+#include <env_compat.h>
 #include <fc_layer_cl.h>
 #include <mutex>
 #include <opencl_command_queue_manager.h>
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
+#include <string>
 #include <swiglu_cl.h>
 #include <transpose_cl.h>
 
@@ -138,6 +141,39 @@ void ClContext::initialize() noexcept {
       const bool svm_drain =
         (caps_.vendor_id == DeviceCaps::VENDOR_INTEL) && !caps_.svm_fine_grain;
       opencl::CommandQueueManager::Global().setSvmCoherenceDrain(svm_drain);
+
+      // HW-derived env DEFAULT. setenv(..., overwrite=0) means an
+      // explicitly-set env ALWAYS wins (and =0 still disables for A/B), so
+      // this is a default layer, not a mandate. Vendor_id is a stable
+      // vendor-wide attribute (not a brittle device_name match).
+      //
+      // Apply ONLY when OpenCL is the ACTIVE compute engine: on a
+      // multi-backend build another engine's run still initializes this CL
+      // context for the kernels it links, but its defaults must not leak into
+      // that run. Skip unless NNTR_ENGINE is unset (OpenCL is the default) or
+      // explicitly "gpu".
+      const char *active_engine = std::getenv("NNTR_ENGINE");
+      const bool opencl_is_active =
+        (active_engine == nullptr) || std::string(active_engine) == "gpu";
+      if (opencl_is_active && caps_.vendor_id == DeviceCaps::VENDOR_INTEL) {
+        // Some Intel in-order-queue drivers do not give kernel->kernel
+        // coarse-grain SVM coherence for the v8c int8 FC GEMM (its SVM output
+        // is read stale by the next kernel), and the global NNTR_XE3_SYNC
+        // drain misses it. Drain after the FC GEMM instead
+        // (blas_kernel_interface.cpp) -- needed for small-M prefill
+        // coherence at ~negligible prefill cost. Override NNTR_XE3_FC_SYNC=0.
+        //
+        // Windows (WDDM) default-OFF: an extensive battery (cold-boot goldens,
+        // token-class A/B, long-context summarize, all with FC_SYNC=0) found
+        // no coherence failure attributable to skipping the drain there, and
+        // the drain costs ~15-25% decode on that stack. Linux keeps default-ON
+        // (the stale read reproduces there). Explicit env wins either way.
+#ifdef _WIN32
+        setenv("NNTR_XE3_FC_SYNC", "0", 0);
+#else
+        setenv("NNTR_XE3_FC_SYNC", "1", 0);
+#endif
+      }
     }
 
     if (KERNEL_CACHE_ENABLED) {
@@ -169,11 +205,11 @@ void ClContext::initialize() noexcept {
 };
 
 void ClContext::add_default_object() {
-  if (FullyConnectedLayerCl::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
-                    FullyConnectedLayerCl::type,
-                    ml::train::LayerType::LAYER_FC);
-  }
+  // The quantized FC layer is backend-neutral now: the GEMM dispatches
+  // through the op table (ClComputeOps::fc), so there is no per-layer kernel
+  // registration to gate on.
+  registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
+                  FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
 
   if (AdditionLayerCL::registerClKernels(*this)) {
     registerFactory(nntrainer::createLayer<AdditionLayerCL>,
