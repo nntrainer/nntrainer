@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
+ *
+ * @file    cuda_fc_qint4.h
+ * @date    23 Jun 2026
+ * @see     https://github.com/nntrainer/nntrainer
+ * @author  Jijoong Moon <jijoong.moon@samsung.com>
+ * @bug     No known bugs except for NYI items
+ * @brief   Fused QS4CX dequant-GEMM for the CUDA FC layer:
+ *          Y[M,N] = X[M,K] * dequant(W), where W is the QS4CX PLAIN payload
+ *          (row-major [N][(K+1)/2] nibbles, uint4 = int4+8) with an
+ *          N-entry per-channel fp16 scale. The int4 weight is read and
+ *          dequantized inline in the kernel; float accumulation. Callers must
+ *          pass device-accessible (UVM) pointers.
+ */
+
+#ifndef __CUDA_FC_QINT4_H__
+#define __CUDA_FC_QINT4_H__
+
+namespace nntrainer::cuda {
+
+/**
+ * @brief Build (and cache) the N-entry UVM fp16 per-channel scale buffer from
+ *        the tensor's fp32 scales. The dequant kernels read the scale on device
+ *        every call; the tensor stores fp32, so the fp16 copy is made once at
+ *        first use and cached by the fp32-scale pointer (weights live for the
+ *        process lifetime). @p out_sc receives the cached device pointer.
+ * @return false on allocation failure (caller falls back to the host path).
+ */
+bool cuda_fc_qs4cx_scales_to_uvm_fp16(const float *fp32_scales, unsigned int N,
+                                      const unsigned short **out_sc);
+
+/**
+ * @brief Y[M,N] = X[M,K] * dequant(QS4CX W) where W is the PLAIN QS4CX payload
+ *        and @p scales_fp16 is the N-entry fp16 scale buffer (from
+ *        cuda_fc_qs4cx_scales_to_uvm_fp16). FP32 activation, FP32 output.
+ *        One thread per output element; float accumulation.
+ * @return true on success.
+ */
+bool cuda_fc_qs4cx_gemm_fp32(const float *X, const unsigned char *plain_w,
+                             const unsigned short *scales_fp16, float *Y,
+                             unsigned int M, unsigned int N, unsigned int K);
+
+/**
+ * @brief fp16-activation variant of cuda_fc_qs4cx_gemm_fp32: fp16 in / fp16
+ *        out, staged through fp32 for the plain-decode GEMM (float
+ *        accumulation, no int8 activation quantization -- the accuracy
+ *        reference for the int4 FC).
+ * @return true on success.
+ */
+bool cuda_fc_qs4cx_gemm_fp16_naive(const unsigned short *Xh,
+                                   const unsigned char *plain_w,
+                                   const unsigned short *scales_fp16,
+                                   unsigned short *Yh, unsigned int M,
+                                   unsigned int N, unsigned int K);
+
+} // namespace nntrainer::cuda
+
+#endif // __CUDA_FC_QINT4_H__

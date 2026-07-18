@@ -86,10 +86,11 @@ void CudaContext::initialize() noexcept {
     // separate copy step. Falls back to host memory if UVM is unavailable.
     setMemAllocator(std::make_shared<CudaMemAllocator>());
 
-    // Install the CUDA ComputeOps: the element-wise decode ops (swiglu /
-    // scalar_mul / softcap) take the device kernels under their residency
-    // gates; everything else inherits the CpuComputeOps bodies, which are
-    // correct over the host-coherent UVM tensors.
+    // Install the CUDA ComputeOps: the FC GEMM takes the device dequant-GEMM
+    // path (the QS4CX host dot is NYI on x86) and the element-wise decode ops
+    // (swiglu / scalar_mul / softcap) take their device kernels under the
+    // residency gates; everything else inherits the CpuComputeOps bodies,
+    // which are correct over the host-coherent UVM tensors.
     getContextData()->setComputeOps(get_cuda_ops());
 
   } catch (std::exception &e) {
@@ -101,9 +102,9 @@ void CudaContext::initialize() noexcept {
 
 void CudaContext::add_default_object() {
   // FC: the backend-neutral FullyConnectedLayerCl dispatches its GEMM through
-  // the installed CudaComputeOps table — at this change the inherited
-  // CpuComputeOps host dot on UVM (a CUDA quantized-GEMM fc() override is a
-  // later change). Same class as the gpu context.
+  // the installed CudaComputeOps table — CudaComputeOps::fc runs the QS4CX
+  // fused dequant-GEMM on device, else the inherited host dot on UVM. Same
+  // class as the gpu context.
   registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
                   FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
   // addition: the core CPU AdditionLayer is pure host Tensor ops -> correct on

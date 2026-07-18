@@ -69,6 +69,15 @@ public:
   void rms_norm(const Tensor &in, Tensor &out, const Tensor &gamma,
                 float epsilon, unsigned int active_rows,
                 unsigned int row_offset) override;
+
+  /**
+   * @brief FC GEMM whole-op: output = input * weight. QS4CX weight -> fused
+   *        dequant-GEMM on device, consuming the PLAIN nibble payload in
+   *        place (single weight copy, no UVM duplicate), else the inherited
+   *        host dot after the async coherence drain. QINT4 never reaches
+   *        here: layer_context coerces it to QS4CX at init.
+   */
+  void fc(Tensor &input, Tensor &weight, Tensor &output) override;
 };
 
 } // namespace nntrainer

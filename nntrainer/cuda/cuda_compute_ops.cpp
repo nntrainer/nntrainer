@@ -26,6 +26,7 @@
 
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
+#include <cuda_fc_qint4.h>
 #include <cuda_rmsnorm.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
@@ -207,6 +208,57 @@ void CudaComputeOps::rms_norm(const Tensor &in, Tensor &out,
     TensorDim(1, 1, active_rows, width, out.getDim().getTensorType()), elem_off,
     true);
   rmsnorm_dispatch(in_win, gamma, out_win, active_rows, width, epsilon);
+}
+
+// FC GEMM: output = input * weight. QS4CX weight -> fused dequant-GEMM on
+// device, consuming the PLAIN nibble payload in place (single weight copy, no
+// UVM copy). QINT4 never reaches here: layer_context coerces it to QS4CX at
+// init.
+void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
+  using DT = ml::train::TensorDim::DataType;
+  const DT wt = weight.getDataType();
+  const DT at = input.getDataType();
+
+  const auto &id = input.getDim();
+  const auto &od = output.getDim();
+  const int K = (int)id.width();
+  const int N = (int)od.width();
+  const int M = (int)(id.batch() * id.channel() * id.height());
+
+  if (wt == DT::QS4CX && M > 0 && N > 0 && K > 0 &&
+      (int)weight.getDim().height() == K) {
+    const uint8_t *W = weight.getData<uint8_t>();
+    // The per-weight fp16 scale buffer the dequant kernel reads every call.
+    const uint16_t *S = nullptr;
+    if (nntrainer::cuda::dev_accessible(W) &&
+        cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(weight.getScale<float>(),
+                                               (unsigned)N, &S)) {
+#ifdef ENABLE_FP16
+      if (at == DT::FP16 && output.getDataType() == DT::FP16) {
+        auto *Xh =
+          reinterpret_cast<const unsigned short *>(input.getData<_FP16>());
+        auto *Yh = reinterpret_cast<unsigned short *>(output.getData<_FP16>());
+        if (nntrainer::cuda::dev_accessible(Xh) &&
+            cuda::cuda_fc_qs4cx_gemm_fp16_naive(Xh, W, S, Yh, (unsigned)M,
+                                                (unsigned)N, (unsigned)K))
+          return;
+      }
+#endif
+      if (at == DT::FP32 && output.getDataType() == DT::FP32) {
+        const float *X = input.getData<float>();
+        float *Y = output.getData<float>();
+        if (nntrainer::cuda::dev_accessible(X) &&
+            cuda::cuda_fc_qs4cx_gemm_fp32(X, W, S, Y, (unsigned)M, (unsigned)N,
+                                          (unsigned)K))
+          return;
+      }
+    }
+  }
+
+  // Host fallback: the input is host-coherent UVM, so the CPU dot is correct.
+  // Drain first in async mode so the host read sees the produced input.
+  cuda::StreamManager::Global().finishIfAsync();
+  input.dot(weight, output, false, false);
 }
 
 ComputeOps *get_cuda_ops() {
