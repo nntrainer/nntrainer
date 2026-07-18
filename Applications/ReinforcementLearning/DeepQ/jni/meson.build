@@ -6,8 +6,20 @@ run_command(['cp', '-lr', res_path, nntr_deepq_resdir], check: true)
 
 env_dir='../../Environment'
 
-jsoncpp_dep = dependency('jsoncpp')
-libcurl_dep = dependency('libcurl')
+# DeepQ is the only Application that pulls in jsoncpp + libcurl. Make
+# those optional so a host without the dev packages can still build the
+# rest of the tree (libnntrainer, CausalLM, nntr_quantize). If either
+# dep is missing we skip the DeepQ executable build entirely; the
+# remaining Applications are unaffected.
+jsoncpp_dep = dependency('jsoncpp', required: false)
+libcurl_dep = dependency('libcurl', required: false)
+
+if not jsoncpp_dep.found() or not libcurl_dep.found()
+  warning('Applications/ReinforcementLearning/DeepQ: jsoncpp or libcurl ' +
+          'not found, skipping DeepQ build. Install libjsoncpp-dev / ' +
+          'libcurl4-openssl-dev to enable.')
+  subdir_done()
+endif
 
 deepq_sources = [
   'main.cpp',
