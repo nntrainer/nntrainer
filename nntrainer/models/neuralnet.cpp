@@ -30,6 +30,7 @@
 #include <compute_ops.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -227,6 +228,26 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   const std::string tensor_type =
     to_string(std::get<props::ModelTensorDataType>(model_flex_props));
 
+  // Select which registered Context's allocator backs the graph's tensor
+  // pool. GPU graphs route allocation to the gpu context's SVM allocator so
+  // its kernels can consume the pool's host pointers zero-copy, instead of
+  // the plain CPU allocator. Only takes effect for OpenCL builds whose graph
+  // actually contains a GPU-engine node; NNTR_GPU_SVM_POOL=0 opts back out to
+  // the legacy CPU allocator.
+  std::string engine_name = "cpu";
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+  const char *_svm_pool_env = std::getenv("NNTR_GPU_SVM_POOL");
+  const bool svm_pool_on = !_svm_pool_env || std::atoi(_svm_pool_env) != 0;
+  if (svm_pool_on) {
+    for (auto &n : graph_representation) {
+      if (n->isComputeEngineGPU()) {
+        engine_name = "gpu";
+        break;
+      }
+    }
+  }
+#endif
+
   bool has_qnn_engine = false;
   for (auto &node : graph_representation) {
     if (node->getComputeEngineType() == "qnn" ||
@@ -236,8 +257,8 @@ int NeuralNetwork::compile(ExecutionMode mode) {
     }
   }
 
-  model_graph =
-    NetworkGraph(fsu, mode, fsu_path, lookahead, tensor_format, tensor_type);
+  model_graph = NetworkGraph(fsu, mode, fsu_path, lookahead, tensor_format,
+                             tensor_type, engine_name);
 
   // QNN/HTP graphs register their I/O tensors with the DSP via rpcmem_to_fd(),
   // which requires those buffers to be rpcmem (DMA/ION). Route ONLY the

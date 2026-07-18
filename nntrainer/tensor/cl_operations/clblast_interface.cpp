@@ -12,14 +12,32 @@
 
 #include <stdexcept>
 
+#ifdef ENABLE_CLBLAST
 #define CL_EXT_SUFFIX__VERSION_2_0_DEPRECATED // to disable deprecation warnings
 #include "clblast.h"
+#endif
 #include "clblast_interface.h"
 
 #include "opencl_loader.h"
 
 namespace nntrainer {
 
+#ifndef ENABLE_CLBLAST
+// CLBlast was excluded from this build (-Denable-clblast=false). All
+// general-purpose BLAS-on-OpenCL routes throw if invoked. The paper-aligned
+// v8c int8/int4 GPU path does not depend on these routines — it has its own
+// dedicated kernels (gemm_int8_v8c_cl + quantize_act_v8c_*_cl).
+#define NNTR_CLBLAST_STUB(NAME)                                                \
+  do {                                                                         \
+    throw std::runtime_error(                                                  \
+      "nntrainer was built with -Denable-clblast=false: " NAME " is "          \
+      "unavailable. Re-build with -Denable-clblast=true to use the "           \
+      "CLBlast-backed OpenCL BLAS routes, or switch the caller to a "          \
+      "non-CLBlast GPU path.");                                                \
+  } while (0)
+#endif
+
+#ifdef ENABLE_CLBLAST
 void scal_cl(const unsigned int N, const float alpha, float *X,
              unsigned int incX) {
   auto *clblast_cc =
@@ -272,5 +290,59 @@ void im2col_cl(const unsigned int C, const unsigned int H, const unsigned int W,
                const float *input, float *output) {
   throw std::runtime_error("im2col_cl is not implemented");
 }
+#else  // ENABLE_CLBLAST
+
+void scal_cl(const unsigned int, const float, float *, unsigned int) {
+  NNTR_CLBLAST_STUB("scal_cl");
+}
+void copy_cl(const unsigned int, const float *, float *, unsigned int,
+             unsigned int) {
+  NNTR_CLBLAST_STUB("copy_cl");
+}
+void axpy_cl(const unsigned int, const float, const float *, float *,
+             unsigned int, unsigned int) {
+  NNTR_CLBLAST_STUB("axpy_cl");
+}
+float dot_cl(const unsigned int, const float *, const float *, unsigned int,
+             unsigned int) {
+  NNTR_CLBLAST_STUB("dot_cl");
+}
+float nrm2_cl(const unsigned int, const float *, unsigned int) {
+  NNTR_CLBLAST_STUB("nrm2_cl");
+}
+float asum_cl(const unsigned int, const float *, unsigned int) {
+  NNTR_CLBLAST_STUB("asum_cl");
+}
+int amax_cl(const unsigned int, const float *, unsigned int) {
+  NNTR_CLBLAST_STUB("amax_cl");
+}
+int amin_cl(const unsigned int, const float *, unsigned int) {
+  NNTR_CLBLAST_STUB("amin_cl");
+}
+void gemv_cl(const unsigned int, bool, const unsigned int, const unsigned int,
+             const float, const float *, const unsigned int, const float *,
+             const float, float *, unsigned int, unsigned int) {
+  NNTR_CLBLAST_STUB("gemv_cl");
+}
+void gemm_cl(const unsigned int, bool, bool, const unsigned int,
+             const unsigned int, const unsigned int, const float, const float *,
+             const unsigned int, const float *, const unsigned int, const float,
+             float *, const unsigned int) {
+  NNTR_CLBLAST_STUB("gemm_cl");
+}
+void gemm_batched_cl(const unsigned int, bool, bool, const unsigned int,
+                     const unsigned int, const unsigned int, const float *,
+                     const float *, const unsigned int, const float *,
+                     const unsigned int, const float *, float *,
+                     const unsigned int, const unsigned int) {
+  NNTR_CLBLAST_STUB("gemm_batched_cl");
+}
+void im2col_cl(const unsigned int, const unsigned int, const unsigned int,
+               const unsigned int, const unsigned int, const unsigned int,
+               const unsigned int, const unsigned int, const unsigned int,
+               const unsigned int, const unsigned int, const float *, float *) {
+  NNTR_CLBLAST_STUB("im2col_cl");
+}
+#endif // ENABLE_CLBLAST
 
 } // namespace nntrainer

@@ -71,6 +71,25 @@ public:
 
   std::string getName() override { return "gpu-svm"; }
 
+  // OpenCL SVM is a single pointer the device reads directly (no copy);
+  // host-addressable inherits the base default (true). host + device ->
+  // isSVM() derives true, matching the old getName()=="gpu-svm".
+  bool isDeviceVisible() const override { return true; }
+
+  // OpenCL SVM can be promoted to a device cl_mem ClBufferPool (GPU_CLMEM
+  // residency); CUDA UVM cannot, hence this is separate from isSVM().
+  bool supportsDevicePool() const override { return true; }
+
+  /**
+   * @copydoc MemAllocator::makePool
+   *
+   * Returns a device cl_mem ClBufferPool when NNTR_GPU_CLMEM_POOL is set
+   * (GPU-resident activations), else the SVM-backed MemoryPool.
+   */
+  std::shared_ptr<MemoryPool>
+  makePool(const std::shared_ptr<MemAllocator> &self,
+           const std::string &pool_name = "") override;
+
 private:
   opencl::ContextManager &ctx_;
   // Host-owned set: pointers that came from MemAllocator::alloc

@@ -21,6 +21,7 @@
 #include <compute_ops.h>
 #include <concat_cl.h>
 #include <fc_layer_cl.h>
+#include <mutex>
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
@@ -76,6 +77,52 @@ void ClContext::initialize() noexcept {
       ml_loge("Error: ClContext::initialize() failed");
       return;
     }
+
+    // Probe device capabilities once (log-only: no decision site reads this
+    // yet). Values come from the existing DeviceInfo queries.
+    if (const auto *di = context_inst_.getDeviceInfo()) {
+      caps_.backend = "gpu";
+      caps_.device_name = di->getDeviceName();
+      // CL_DEVICE_NAME is stored sized to include the query's trailing NUL; an
+      // embedded NUL would truncate the %s log line, so strip trailing NUL/ws.
+      while (!caps_.device_name.empty()) {
+        const char c = caps_.device_name.back();
+        if (c == '\0' || c == ' ' || c == '\n' || c == '\r' || c == '\t')
+          caps_.device_name.pop_back();
+        else
+          break;
+      }
+      caps_.vendor_id = di->getDeviceVendorId();
+      caps_.compute_units = di->getDeviceMaxComputeUnits();
+      caps_.max_alloc_bytes = di->getDeviceMaxMemAllocSize();
+      caps_.unified_memory = di->getDeviceSVMCapabilities() != 0;
+      caps_.subgroups = di->getDeviceExtensions().find("cl_intel_subgroups") !=
+                        std::string::npos;
+      // cl_intel_subgroups is advertised by every Intel GPU since Gen9
+      // (including non-DPAS Xe-LPG parts), so it cannot gate a DPAS/XMX
+      // matrix-engine kernel. The matrix-multiply-accumulate extension is
+      // DPAS-specific, so it is the real capability signal.
+      caps_.dpas =
+        di->getDeviceExtensions().find(
+          "cl_intel_subgroup_matrix_multiply_accumulate") != std::string::npos;
+      // image_v8c: whether the device should prefer an image2d-based path over
+      // a cl_mem buffer path. No clean device query distinguishes the two
+      // (both report CL_DEVICE_IMAGE_SUPPORT); the practical split is that
+      // Intel NEO's compiler rejects integer-coordinate read_imageui kernels.
+      // Keyed off vendor_id -- a stable, queryable, vendor-wide attribute (the
+      // quirk is a compiler trait, not a per-model one), not the brittle
+      // device_name. Intel (0x8086) => buffer; others keep the image default.
+      constexpr uint32_t INTEL_VENDOR_ID = 0x8086;
+      caps_.image_v8c = (caps_.vendor_id != INTEL_VENDOR_ID);
+      cl_bool host_unified = CL_FALSE;
+      caps_.integrated =
+        (clGetDeviceInfo(context_inst_.GetDeviceId(),
+                         CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof(host_unified),
+                         &host_unified, nullptr) == CL_SUCCESS) &&
+        (host_unified == CL_TRUE);
+      ml_logi("[ClContext] %s", caps_.toString().c_str());
+    }
+
     if (KERNEL_CACHE_ENABLED) {
       std::filesystem::create_directories(opencl::Program::DEFAULT_KERNEL_PATH);
     }
@@ -246,23 +293,31 @@ void ClContext::initAttentionClKernels() {
 }
 
 const ClContext::SharedPtrClKernel
-ClContext::registerClKernel(std::string kernel_string, std::string kernel_name,
-                            std::string compile_options) {
-  // check if created before
-  if (ocl_kernel_map.find(kernel_name + compile_options) !=
-      ocl_kernel_map.end()) {
-    return ocl_kernel_map[kernel_name + compile_options];
-  }
+ClContext::registerClKernel(const std::string &kernel_string,
+                            const std::string &kernel_name,
+                            const std::string &compile_options) {
+  // check if created before. Hot path: single key construction + one lookup,
+  // and (crucially) NO copy of the multi-10KB kernel source -- the previous
+  // by-value parameters copied the full source string on every cached lookup,
+  // which measured ~12ms per call on Adreno/Android (~36ms host issue tax per
+  // layer in the attention path alone; the GPU sat idle exactly that long).
+  const std::string key = kernel_name + compile_options;
 
-  // creating shared_ptr for kernel object
+  auto it = ocl_kernel_map.find(key);
+  if (it != ocl_kernel_map.end())
+    return it->second;
+
+  // creating shared_ptr for kernel object (cold path: copies are fine here,
+  // clCreateKernel takes mutable refs)
+  std::string ks = kernel_string, kn = kernel_name, co = compile_options;
   SharedPtrClKernel kernelPtr = std::make_shared<opencl::Kernel>();
-  if (!clCreateKernel(kernel_string, kernel_name, compile_options, kernelPtr)) {
+  if (!clCreateKernel(ks, kn, co, kernelPtr)) {
     ml_loge("Failed to register kernel %s", kernel_name.c_str());
     return nullptr;
   }
   // add to map
-  ocl_kernel_map.emplace(kernel_name + compile_options, kernelPtr);
-  return ocl_kernel_map[kernel_name + compile_options];
+  ocl_kernel_map.emplace(key, kernelPtr);
+  return ocl_kernel_map[key];
 }
 
 bool ClContext::clCreateKernel(std::string &kernel_string,
@@ -276,20 +331,56 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
 
   opencl::Program program;
 
-  // reading binary
+  // In-memory program cache: kernels that share one source+options reuse the
+  // built cl_program. Without this every kernel re-did its own binary-file
+  // read + clCreateProgramWithBinary (~300ms for the large sources on
+  // Adreno 840) -- e.g. 3 kernels of one program paid ~0.9s, all inside the
+  // first timed run (mis-read as a per-call issue tax).
+  static std::unordered_map<std::string, opencl::Program> program_cache;
+  static std::mutex program_cache_mtx;
+  const std::string pc_key =
+    std::to_string(program.GetKernelHash(kernel_string, "")) + "|" +
+    compile_options;
+  {
+    std::lock_guard<std::mutex> lk(program_cache_mtx);
+    auto it = program_cache.find(pc_key);
+    if (it != program_cache.end())
+      return kernel_ptr_->CreateKernelFromProgram(it->second, kernel_name);
+  }
+
+  // On-disk kernel binary cache. The cache key folds in the per-kernel
+  // compile_options AND the device signature (name + driver version): a stored
+  // binary is only valid for the exact source + options it was built from and
+  // for the same GPU/driver, so a binary from another device or a driver update
+  // must never be loaded as-is. clCreateProgramWithBinary still validates and
+  // can reject a stale binary, so a load failure falls back to a source compile
+  // (and re-caches), never a hard failure.
+  static const std::string device_sig =
+    opencl::ContextManager::Global().GetDeviceSignature();
   std::string binary_file_path =
     opencl::Program::DEFAULT_KERNEL_PATH + "/" +
-    std::to_string(program.GetKernelHash(kernel_string, "")) + ".cl.bin";
+    std::to_string(program.GetKernelHash(kernel_string,
+                                         compile_options + "|" + device_sig)) +
+    ".cl.bin";
   auto binary_data = KERNEL_CACHE_ENABLED ? readBinaryFile(binary_file_path)
                                           : std::vector<std::byte>();
 
+  bool loaded_from_binary = false;
   if (KERNEL_CACHE_ENABLED && !binary_data.empty()) {
     ml_logi("Using cached version of kernel: %s at path %s",
             kernel_name.c_str(), binary_file_path.c_str());
-    result = program.CreateCLProgramWithBinary(
+    loaded_from_binary = program.CreateCLProgramWithBinary(
       opencl::ContextManager::Global().GetContext(),
       opencl::ContextManager::Global().GetDeviceId(), binary_data,
       binary_file_path, "");
+    if (!loaded_from_binary)
+      ml_logw("Cached kernel binary %s rejected (stale device/driver?); "
+              "recompiling from source",
+              binary_file_path.c_str());
+  }
+
+  if (loaded_from_binary) {
+    result = true;
   } else {
     ml_logi("Binary for kernel %s not found, compiling from source...",
             kernel_name.c_str());
@@ -299,14 +390,16 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
                               kernel_string, compile_options);
 
     if (KERNEL_CACHE_ENABLED && result) {
+      // Best-effort cache write: a failure to persist must not fail the build,
+      // the freshly compiled program is already usable.
       auto binary = program.GetProgramBinary(
         opencl::ContextManager::Global().GetDeviceId());
-
       if (binary.empty()) {
-        ml_loge("Failed retrieving binary for kernel %s", kernel_name.c_str());
-        result = false;
-      } else {
-        result &= writeBinaryFile(binary_file_path, binary);
+        ml_logw("Failed retrieving binary for kernel %s; skipping cache write",
+                kernel_name.c_str());
+      } else if (!writeBinaryFile(binary_file_path, binary)) {
+        ml_logw("Failed writing kernel cache %s; continuing",
+                binary_file_path.c_str());
       }
     }
   }
@@ -315,6 +408,10 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
     return false;
   }
 
+  {
+    std::lock_guard<std::mutex> lk(program_cache_mtx);
+    program_cache.emplace(pc_key, program);
+  }
   result = kernel_ptr_->CreateKernelFromProgram(program, kernel_name);
 
   return result;
@@ -326,5 +423,13 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
 template const int ClContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
+
+// Non-template seam (Context::registerLayerFactory override): forwards to the
+// per-class registerFactory<Layer> here in the same TU so the explicit
+// instantiation is used and no template crosses the .so boundary.
+int ClContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                                    const std::string &key, const int int_key) {
+  return registerFactory<nntrainer::Layer>(factory, key, int_key);
+}
 
 } // namespace nntrainer

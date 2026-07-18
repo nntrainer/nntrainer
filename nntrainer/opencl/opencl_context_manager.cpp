@@ -13,6 +13,8 @@
 
 #include "opencl_context_manager.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -89,11 +91,48 @@ void ContextManager::ReleaseContext() {
  */
 const cl_device_id ContextManager::GetDeviceId() { return device_id_; }
 
+std::string ContextManager::GetDeviceSignature() {
+  if (device_id_ == nullptr)
+    return "unknown";
+  char name[256] = {0};
+  char drv[256] = {0};
+  clGetDeviceInfo(device_id_, CL_DEVICE_NAME, sizeof(name) - 1, name, nullptr);
+  clGetDeviceInfo(device_id_, CL_DRIVER_VERSION, sizeof(drv) - 1, drv, nullptr);
+  return std::string(name) + "|" + std::string(drv);
+}
+
 void *ContextManager::createSVMRegion(size_t size) {
-  if (context_)
-    return clSVMAlloc(context_, CL_MEM_READ_WRITE, size, 0);
-  else
+  if (!context_)
     return nullptr;
+  // NNTR_SVM_FINE=1: fine-grain SVM buffer (CL_MEM_SVM_FINE_GRAIN_BUFFER).
+  // Host<->device coherence is automatic (no clEnqueueSVMMap/Unmap needed), so
+  // consecutive GPU kernels chain on the shared inter-layer buffer with zero
+  // per-op coherence ops — realizing the layer-graph residency the coarse-grain
+  // path needs map/unmap for. Falls back to coarse-grain if fine-grain alloc is
+  // unsupported (returns null). Default off (coarse-grain, original behavior).
+  static const bool fine = std::getenv("NNTR_SVM_FINE") != nullptr;
+  if (fine) {
+    void *p = clSVMAlloc(
+      context_, CL_MEM_READ_WRITE | CL_MEM_SVM_FINE_GRAIN_BUFFER, size, 0);
+    static int logged = 0;
+    if (!logged) {
+      logged = 1;
+      std::fprintf(stderr, "[SVM-FINE] fine-grain alloc %s\n",
+                   p ? "SUPPORTED" : "FAILED -> coarse fallback");
+      std::fflush(stderr);
+    }
+    if (p)
+      return p;
+    // fine-grain unsupported for this size/device → coarse-grain fallback.
+  }
+  return clSVMAlloc(context_, CL_MEM_READ_WRITE, size, 0);
+}
+
+ContextManager &ContextManager::Global() {
+  // Out-of-line on purpose — single process-wide instance (see header note).
+  static ContextManager instance;
+  instance.initializeOnce();
+  return instance;
 }
 
 void ContextManager::releaseSVMRegion(void *svm_ptr) {
@@ -187,6 +226,30 @@ bool ContextManager::CreateDefaultGPUDevice() {
 
   ml_logi("Looking for suitable OpenCL platform and device ...");
 
+  // Explicit device pin: NNTR_CL_DEVICE_FILTER=<substring of CL_DEVICE_NAME>.
+  // A multi-ICD host (Windows: Intel AND NVIDIA OpenCL platforms both
+  // installed) makes the built-in name preference ambiguous; this selects the
+  // first enumerated device whose name contains the substring. Falls through
+  // to the default preference when nothing matches.
+  if (const char *dev_filter = std::getenv("NNTR_CL_DEVICE_FILTER")) {
+    for (const std::pair<cl_platform_id, cl_device_id> &platform_device :
+         platform_device_pairs) {
+      auto device_info = std::make_unique<DeviceInfo>();
+      if (!device_info->read(platform_device.second))
+        continue;
+      if (device_info->getDeviceName().find(dev_filter) != std::string::npos) {
+        platform_id_ = platform_device.first;
+        device_id_ = platform_device.second;
+        device_info_ = std::move(device_info);
+        break;
+      }
+    }
+    if (nullptr == platform_id_)
+      ml_loge("NNTR_CL_DEVICE_FILTER='%s' matched no device -- falling back "
+              "to the default device preference",
+              dev_filter);
+  }
+
   // Vendor ID of Intel : 0x8086
   // Vendor ID of NVidia : 0x10DE / 0x13B5
   constexpr static cl_uint intel_igpu_vendor_id = 0x8086;
@@ -197,13 +260,18 @@ bool ContextManager::CreateDefaultGPUDevice() {
 
   for (const std::pair<cl_platform_id, cl_device_id> &platform_device :
        platform_device_pairs) {
+    if (nullptr != platform_id_)
+      break; // already pinned via NNTR_CL_DEVICE_FILTER
+
     cl_platform_id platform = platform_device.first;
     cl_device_id device = platform_device.second;
 
     auto device_info = std::make_unique<DeviceInfo>();
     if (!device_info->read(device)) {
-      ml_loge("Failed to read device info");
-      return false;
+      // One unreadable device (e.g. a foreign ICD's entry on a multi-platform
+      // host) must not abort the whole selection -- skip it and keep looking.
+      ml_loge("Failed to read device info -- skipping this device");
+      continue;
     }
 
     const bool type_check =
@@ -257,15 +325,57 @@ bool ContextManager::CreateDefaultGPUDevice() {
  *
  * @return true if successful or false otherwise
  */
+// Qualcomm/Adreno hint enums (cl_qcom_perf_hint / cl_qcom_priority_hint).
+// Defined locally because the base CL/cl.h shipped in this tree does not carry
+// the vendor extension tokens; the Adreno 840 driver implements them. Values
+// from CL/cl_ext_qcom.h (Qualcomm AI stack).
+#ifndef CL_CONTEXT_PERF_HINT_QCOM
+#define CL_CONTEXT_PERF_HINT_QCOM 0x40C2
+#define CL_PERF_HINT_HIGH_QCOM 0x40C3
+#endif
+#ifndef CL_CONTEXT_PRIORITY_HINT_QCOM
+#define CL_CONTEXT_PRIORITY_HINT_QCOM 0x40C9
+#define CL_PRIORITY_HINT_HIGH_QCOM 0x40CA
+#endif
+
 bool ContextManager::CreateCLContext() {
   int error_code;
-  cl_context_properties properties[] = {CL_CONTEXT_PLATFORM,
+
+  // HIGH perf + HIGH priority context hints so the driver runs the GPU at a
+  // higher sustained clock / scheduling priority. Context-level properties (NOT
+  // queue). Default ON (opt-out with NNTR_QCOM_PERF_HINT=0): measured on Adreno
+  // 840 as token-identical, prefill-neutral, and decode +~2% with a much
+  // tighter run-to-run variance (the priority hint stops the clock from
+  // dropping during the longer decode phase). If the driver rejects the
+  // property we fall back to the plain context (the hint is purely advisory).
+  const bool qcom_hint = [] {
+    const char *e = std::getenv("NNTR_QCOM_PERF_HINT");
+    return !e || e[0] != '0';
+  }();
+
+  cl_context_properties base_props[] = {CL_CONTEXT_PLATFORM,
                                         (cl_context_properties)platform_id_, 0};
+  cl_context_properties hint_props[] = {CL_CONTEXT_PLATFORM,
+                                        (cl_context_properties)platform_id_,
+                                        CL_CONTEXT_PERF_HINT_QCOM,
+                                        CL_PERF_HINT_HIGH_QCOM,
+                                        CL_CONTEXT_PRIORITY_HINT_QCOM,
+                                        CL_PRIORITY_HINT_HIGH_QCOM,
+                                        0};
 
   // creating valid ARM GPU OpenCL context, will return NULL with error code if
   // fails
-  context_ =
-    clCreateContext(properties, 1, &device_id_, nullptr, nullptr, &error_code);
+  context_ = clCreateContext(qcom_hint ? hint_props : base_props, 1,
+                             &device_id_, nullptr, nullptr, &error_code);
+  if (!context_ && qcom_hint) {
+    ml_logw("clCreateContext with QCOM perf/priority hint failed (%d : %s); "
+            "retrying without the hint.",
+            error_code, OpenCLErrorCodeToString(error_code));
+    context_ = clCreateContext(base_props, 1, &device_id_, nullptr, nullptr,
+                               &error_code);
+  } else if (context_ && qcom_hint) {
+    ml_logi("OpenCL context created with QCOM HIGH perf+priority hints.");
+  }
   if (!context_) {
     ml_loge("Failed to create a compute context. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));

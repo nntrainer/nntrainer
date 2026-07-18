@@ -19,6 +19,13 @@
 
 namespace nntrainer::opencl {
 
+// Coherence hint for the Xe3 SVM drain. Set true whenever an SVM pointer arg is
+// bound, cleared at the start of each new binding cycle (arg_index == 0). Read
+// by CommandQueueManager at dispatch time to drain only after SVM-touching
+// dispatches. The GPU dispatch path is single-threaded, so a file-scope flag is
+// race-free (one kernel is fully bound then dispatched before the next).
+static bool s_bind_touched_svm = false;
+
 /**
  * @brief Create a Kernel From Program object
  *
@@ -79,6 +86,11 @@ bool Kernel::SetKernelArguments(cl_uint arg_index, const void *arg_value,
  * @return true if successful or false otherwise
  */
 bool Kernel::SetKernelSVMArguments(cl_uint arg_index, const void *arg_value) {
+  // This dispatch binds a coarse-grain SVM pointer -> its producer/consumer
+  // handoff needs an explicit flush on Xe3. The flag accumulates until the next
+  // dispatch consumes it (takeDispatchTouchedSVM), so binding order is
+  // irrelevant.
+  s_bind_touched_svm = true;
   int error_code;
   // returns NULL with error code if fails
   error_code = clSetKernelArgSVMPointer(kernel_, arg_index, arg_value);
@@ -97,5 +109,11 @@ bool Kernel::SetKernelSVMArguments(cl_uint arg_index, const void *arg_value) {
  * @return const cl_kernel
  */
 const cl_kernel Kernel::GetKernel() { return kernel_; }
+
+bool Kernel::takeDispatchTouchedSVM() {
+  const bool v = s_bind_touched_svm;
+  s_bind_touched_svm = false;
+  return v;
+}
 
 } // namespace nntrainer::opencl

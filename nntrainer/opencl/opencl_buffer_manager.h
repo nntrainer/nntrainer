@@ -123,6 +123,15 @@ public:
    * @brief Destroy Buffer pointers.
    *
    */
+  /**
+   * @brief Get the process-wide instance (out-of-line override of
+   *        Singleton<T>::Global() — guarantees one staging-buffer set per
+   *        process under shared linking, instead of one per module; see
+   *        opencl::ContextManager::Global() for the full static-vs-shared
+   *        note).
+   */
+  static ClBufferManager &Global();
+
   ~ClBufferManager();
 };
 } // namespace nntrainer

@@ -57,6 +57,8 @@ option('enable-blas', type: 'boolean', value: true)
 option('enable-fp16', type: 'boolean', value: false)
 option('enable-cublas', type: 'boolean', value: false)
 option('enable-opencl', type: 'boolean', value: false)
+option('enable-clblast', type: 'boolean', value: true,
+       description: 'Link the CLBlast subproject for general-purpose OpenCL BLAS routines. Disable when only the in-tree OpenCL kernels are needed — drops the multi-minute CLBlast compile.')
 option('enable-biqgemm', type: 'boolean', value: false)
 option('biqgemm-path', type: 'string', value: '../BiQGEMM')
 option('enable-benchmarks', type: 'boolean', value : false)

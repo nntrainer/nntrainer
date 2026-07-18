@@ -65,6 +65,28 @@ bool LoadOpenCL() {
     return true;
   }
 
+#if !defined(_WIN32)
+  // Android Qualcomm/Adreno: vendor's libOpenCL.so isn't always reachable via
+  // the default linker namespace from a shell-launched executable; try the
+  // well-known vendor paths explicitly so the GPU path works without the
+  // caller having to set LD_LIBRARY_PATH=/system/vendor/lib64 (which on some
+  // devices drags in libandroid_runtime.so with unresolved symbols).
+  static const char *kAndroidVendorPaths[] = {
+    "/vendor/lib64/libOpenCL.so",
+    "/system/vendor/lib64/libOpenCL.so",
+    "/vendor/lib/libOpenCL.so",
+    "/system/vendor/lib/libOpenCL.so",
+  };
+  for (const char *p : kAndroidVendorPaths) {
+    libopencl = DynamicLibraryLoader::loadLibrary(p, RTLD_NOW | RTLD_LOCAL);
+    if (libopencl) {
+      LoadOpenCLFunctions(libopencl);
+      open_cl_initialized = true;
+      return true;
+    }
+  }
+#endif
+
   // record error
   std::string error(DynamicLibraryLoader::getLastError());
   ml_loge("Cannot open OpenCL library on this device - %s", error.c_str());
@@ -207,6 +229,8 @@ void LoadOpenCLFunctions(void *libopencl) {
   LoadFunction(clEnqueueSVMUnmap);
   LoadFunction(clSetKernelArgSVMPointer);
   LoadFunction(clWaitForEvents);
+  LoadFunction(clGetKernelInfo);
+  LoadFunction(clReleaseEvent);
 }
 
 PFN_clGetPlatformIDs clGetPlatformIDs;
@@ -246,4 +270,6 @@ PFN_clEnqueueSVMMap clEnqueueSVMMap;
 PFN_clEnqueueSVMUnmap clEnqueueSVMUnmap;
 PFN_clSetKernelArgSVMPointer clSetKernelArgSVMPointer;
 PFN_clWaitForEvents clWaitForEvents;
+PFN_clGetKernelInfo clGetKernelInfo;
+PFN_clReleaseEvent clReleaseEvent;
 } // namespace nntrainer::opencl

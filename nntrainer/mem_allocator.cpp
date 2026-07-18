@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mem_allocator.h>
+#include <memory_pool.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 
@@ -57,6 +58,11 @@ void MemAllocator::alloc(void **ptr, size_t size, size_t alignment) {
   NNTR_THROW_IF(*ptr == nullptr, std::runtime_error)
     << "MemAllocator::alloc: aligned_alloc(" << alignment << ", "
     << aligned_size << ") failed";
+
+  // MemoryPool callers historically expected zeroed buffers (calloc
+  // semantics). Preserve that — kernels that read uninitialised
+  // gradient slots would otherwise see garbage.
+  std::memset(*ptr, 0, aligned_size);
 }
 
 void MemAllocator::free(void *ptr) {
@@ -67,6 +73,13 @@ void MemAllocator::free(void *ptr) {
 #else
   std::free(ptr);
 #endif
+}
+
+std::shared_ptr<MemoryPool>
+MemAllocator::makePool(const std::shared_ptr<MemAllocator> &self,
+                       const std::string &pool_name) {
+  (void)pool_name; // identity only matters to device-plane allocators
+  return std::make_shared<MemoryPool>(self);
 }
 
 } // namespace nntrainer

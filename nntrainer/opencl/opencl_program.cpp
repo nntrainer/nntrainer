@@ -124,6 +124,12 @@ std::string Program::GetProgramBuildInfo(cl_device_id device_id,
 }
 
 std::string Program::GetDefaultCompilerOptions() const {
+  // NNTR_NO_FASTMATH=1: drop fast/unsafe math (no fp reassociation, no
+  // mad-contraction, precise rsqrt/exp/tanh). A/B knob to measure the perf cost
+  // and to make fused kernels bit-identical to their separate-kernel form.
+  static const bool no_fastmath = std::getenv("NNTR_NO_FASTMATH") != nullptr;
+  if (no_fastmath)
+    return "-cl-std=CL3.0 ";
   return "-cl-std=CL3.0 -cl-mad-enable -cl-unsafe-math-optimizations "
          "-cl-finite-math-only -cl-fast-relaxed-math ";
 }

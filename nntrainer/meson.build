@@ -35,6 +35,7 @@ nntrainer_base_deps=[
 
 if get_option('enable-opencl')
   nntrainer_base_deps += clblast_dep
+  nntrainer_base_deps += opencl_loader_dep
 endif
 
 if get_option('platform') == 'tizen'

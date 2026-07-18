@@ -223,10 +223,14 @@ void add_i_cl(Tensor &result, Tensor const &input) {
     if (result.getDataType() == ml::train::TensorDim::DataType::FP32) {
       float *Y = result.getData();
       const float *X = input.getData();
+      const unsigned int size_input = input.size();
 
       for (unsigned int i = 0; i < result.batch() / input.batch(); ++i) {
-        axpy_cl(input.size(), 1.0f, X, Y);
-        Y += input.size();
+        // axpy with alpha=1 is just an elementwise add. Use the in-tree
+        // addition_cl kernel instead of the CLBlast axpy route so FP32 add
+        // works without CLBlast (FP16 already uses addition_cl below).
+        addition_cl(X, Y, size_input, size_input);
+        Y += size_input;
       }
     } else if (result.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16

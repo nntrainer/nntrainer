@@ -43,7 +43,9 @@ public:
     address(addr),
     validate_cb([](unsigned int) {}),
     invalidate_cb([](unsigned int) {}),
-    svm_allocation(false) {}
+    svm_allocation(false),
+    device_valid(false),
+    device_mem(nullptr) {}
 
   /**
    * @brief  Constructor of Memory Data
@@ -59,7 +61,9 @@ public:
     address(memory_ptr),
     validate_cb(v_cb),
     invalidate_cb(i_cb),
-    svm_allocation(false) {}
+    svm_allocation(false),
+    device_valid(false),
+    device_mem(nullptr) {}
 
   /**
    * @brief  Deleted constructor of Memory Data
@@ -124,6 +128,46 @@ public:
    */
   bool isSVM() const { return svm_allocation; }
 
+  /**
+   * @brief  True unless this memory is DEVICE-ONLY (e.g. cudaMalloc): the host
+   *         must not dereference the pointer and every host read/write has to
+   *         stage. Stamped from MemAllocator::isHostAddressable() at pool bind
+   *         (same pattern as the SVM stamp) so consumers ask the tensor, not
+   *         the driver -- replaces per-call driver probes such as
+   *         cudaPointerGetAttributes (layering rule: capability flows up
+   *         through the allocator; no consumer queries the driver directly).
+   *         Defaults true: plain host buffers / Tensor::Map are host memory.
+   */
+  bool isHostAddressable() const { return host_addressable; }
+
+  /**
+   * @brief  Device-residency bit of this memory.
+   * @details device_valid means "the freshest copy of this data lives in the
+   *          device buffer device_mem", DISTINCT from `valid` (which means
+   *          host-resident and is toggled by CachePool swapOut via setAddr).
+   *          A producer device op sets it after writing device_mem; a host
+   *          consumer clears it after syncing down. Default false => the bit
+   *          stays inert and every consumer falls through to the existing
+   *          SVM/host path until a device pool stamps it. device_mem is held
+   *          as a non-owning void* so this header stays OpenCL-free (CPU
+   *          build safe).
+   */
+  bool isDeviceValid() const { return device_valid; }
+
+  /**
+   * @brief  Set the device-residency bit and (optionally) the device buffer.
+   */
+  void setDeviceValid(bool v, void *dev = nullptr) {
+    device_valid = v;
+    if (dev != nullptr)
+      device_mem = dev;
+  }
+
+  /**
+   * @brief  Get the resident device buffer (cl_mem as void*), or null.
+   */
+  void *deviceMem() const { return device_mem; }
+
 private:
   /**
    * @brief  Set SVM allocation flag (private - only accessible by MemoryPool)
@@ -134,12 +178,21 @@ private:
    */
   void setSVM(bool is_svm) { svm_allocation = is_svm; }
 
+  /**
+   * @brief  Set host-addressability (private -- MemoryPool stamps it at bind,
+   *         mirroring setSVM).
+   */
+  void setHostAddressable(bool v) { host_addressable = v; }
+
   bool valid;
   unsigned int id;
   void *address;
   MemoryDataValidateCallback validate_cb;
   MemoryDataValidateCallback invalidate_cb;
   bool svm_allocation;
+  bool host_addressable = true;
+  bool device_valid; /**< device residency: freshest copy is in device_mem */
+  void *device_mem;  /**< resident device buffer (non-owning, void*) */
 };
 
 } // namespace nntrainer

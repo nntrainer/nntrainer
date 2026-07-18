@@ -119,6 +119,12 @@ public:
                             const int int_key = -1);
 
   /**
+   * @copydoc Context::registerLayerFactory
+   */
+  int registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                           const std::string &key, const int int_key) override;
+
+  /**
    * @brief Create an Object from the integer key
    *
    * @tparam T Type of Object, currently, Only Layer is supported
@@ -209,10 +215,16 @@ public:
    * @param kernel_string kernel implementation string
    * @param kernel_name kernel name
    * @return std::shared_ptr<opencl::Kernel>
+   * @note by-const-ref on purpose: kernel sources are tens of KB and the
+   *       previous by-value signature copied the full source on EVERY cached
+   *       lookup -- measured ~12ms per call on Adreno/Android (scudo
+   *       large-alloc), ~36ms host issue tax per layer in the attention hot
+   *       path alone.
    */
-  const SharedPtrClKernel registerClKernel(std::string kernel_string,
-                                           std::string kernel_name,
-                                           std::string compile_options = {});
+  const SharedPtrClKernel
+  registerClKernel(const std::string &kernel_string,
+                   const std::string &kernel_name,
+                   const std::string &compile_options = {});
 
   /**
    * @brief Initialize and register all blas OpenCl kernels
@@ -230,6 +242,11 @@ public:
   std::string getName() override { return "gpu"; }
 
   /**
+   * @brief Device capability snapshot, probed once in initialize(). LOG-ONLY.
+   */
+  const DeviceCaps &caps() const override { return caps_; }
+
+  /**
    * @brief Set the Mem Allocator object
    *
    * @param mem Memory allocator object
@@ -243,6 +260,9 @@ private:
    * @brief   Overriden initialization function
    */
   void initialize() noexcept override;
+
+  /** device capabilities probed once at initialize() (log-only) */
+  DeviceCaps caps_;
 
   void add_default_object();
 

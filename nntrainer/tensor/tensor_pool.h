@@ -68,7 +68,12 @@ public:
       cache_loader = std::make_unique<CacheLoader>(cache_pool);
       mem_pool = cache_pool;
     } else {
-      mem_pool = std::make_shared<MemoryPool>(allocator_);
+      // The allocator owns the pool-KIND decision (a plain offset-planned
+      // MemoryPool vs a device-memory pool), so this site no longer branches
+      // on getName()=="gpu-svm" or #ifdef ENABLE_OPENCL: a backend allocator's
+      // makePool returns its device pool when applicable, the base returns a
+      // MemoryPool (byte-identical). No OpenCL pool type is referenced here.
+      mem_pool = allocator_->makePool(allocator_, fsu_name);
     }
   }
 
