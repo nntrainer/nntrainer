@@ -93,15 +93,17 @@ Engine::parseComputeEngine(const std::vector<std::string> &props) const {
     std::string key, value;
     int status = nntrainer::getKeyValue(prop, key, value);
     if (nntrainer::istrequal(key, "engine")) {
-      constexpr const auto data =
-        std::data(props::ComputeEngineTypeInfo::EnumList);
-      for (unsigned int i = 0;
-           i < props::ComputeEngineTypeInfo::EnumList.size(); ++i) {
-        if (nntrainer::istrequal(value.c_str(),
-                                 props::ComputeEngineTypeInfo::EnumStr[i])) {
-          return props::ComputeEngineTypeInfo::EnumStr[i];
-        }
-      }
+      // Validate against the LIVE registered-context name set, not the closed
+      // LayerComputeEngine enum + string list. A vendor backend that
+      // self-registers a Context (e.g. "npu", "exynos") then resolves with no
+      // enum edit; an unknown/unavailable engine falls back to "cpu" instead of
+      // resolving to a name that getRegisteredContext would later reject.
+      // [docs/ARCHITECTURE_REFACTOR.md §10 T3]
+      std::string name = value;
+      std::transform(name.begin(), name.end(), name.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      if (engines.find(name) != engines.end())
+        return name;
     }
   }
 

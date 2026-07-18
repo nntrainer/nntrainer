@@ -97,6 +97,25 @@ typedef std::tuple<TensorDim, Initializer, bool, const std::string,
   VarGradSpec;
 
 /**
+ * @brief Semantic role of a tensor — a HINT for residency / placement
+ *        decisions (e.g. an attention KV cache wants image2d backing on Adreno;
+ *        weights stay device-resident). `GENERIC` by default; role-bearing
+ *        layers tag their tensors. Currently a FOUNDATION (Mem M3): carried on
+ *        the spec but NOT yet consumed — the residency resolver (M4) will read
+ *        it to replace the env/model-name heuristics. Inert today ⇒
+ *        byte-identical. [docs/ARCHITECTURE_REFACTOR.md §10 T5 / Mem M3]
+ */
+enum class TensorRole {
+  GENERIC, /**< no special role (default) */
+  WEIGHT,  /**< model weight */
+  ACT,     /**< layer-I/O activation */
+  KV,      /**< attention key/value cache */
+  QKV,     /**< q/k/v projection output */
+  EMB,     /**< token embedding */
+  NORM,    /**< normalization (rms/layer) gamma or output */
+};
+
+/**
  * @brief Tensor Specification which describes how this tensor should be
  * allocated and managed
  *
@@ -146,6 +165,16 @@ struct TensorSpecV2 {
   /** ONLY FOR THE GRANULAR CONTROL OF LIFE OUTSIDE OF LAYER NODE */
   /// @todo make this as an opaque information with PIMPL
   std::vector<unsigned> additional_exec_order = {};
+
+  /** compute engine of the producing layer; threaded to TensorPool so the
+   * static residency class (GPU_CLMEM vs SVM/HOST) can be derived at allocation
+   * for layer I/O activations. CPU by default => unchanged for non-GPU layers.
+   */
+  ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU;
+
+  /** semantic role hint for residency / placement (Mem M3). GENERIC by default;
+   * inert until the residency resolver (M4) consumes it ⇒ byte-identical. */
+  TensorRole role = TensorRole::GENERIC;
 };
 
 /**

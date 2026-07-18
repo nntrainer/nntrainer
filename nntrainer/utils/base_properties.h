@@ -811,19 +811,23 @@ public:
  */
 struct ComputeEngineTypeInfo {
   using Enum = ml::train::LayerComputeEngine;
-  static constexpr std::initializer_list<Enum> EnumList = {Enum::CPU, Enum::GPU,
-                                                           Enum::QNN};
-  static constexpr const char *EnumStr[] = {"cpu", "gpu", "qnn"};
+  static constexpr std::initializer_list<Enum> EnumList = {
+    Enum::CPU, Enum::GPU, Enum::QNN, Enum::CUDA};
+  static constexpr const char *EnumStr[] = {"cpu", "gpu", "qnn", "cuda"};
 };
 
 /**
- * @brief ComputeEngine Enumeration Information
- *
+ * @brief ComputeEngine name property — the node's backend as a registered
+ *        Context NAME (registry-open [ARCHITECTURE_REFACTOR.md §10 T3]: any
+ *        Engine-registered name is valid, e.g. "npu", not just the closed
+ *        LayerComputeEngine enum's four). Normalized against the live registry
+ *        in LayerNode::setProperty (lowercased; unknown name -> "cpu"
+ *        fallback, matching Engine::parseComputeEngine). ComputeEngineTypeInfo
+ *        above remains for mapping names onto the residency-plane enum.
  */
-class ComputeEngine final
-  : public EnumProperty<nntrainer::props::ComputeEngineTypeInfo> {
+class ComputeEngine final : public Property<std::string> {
 public:
-  using prop_tag = enum_class_prop_tag;
+  using prop_tag = str_prop_tag;
   static constexpr const char *key = "engine";
 };
 

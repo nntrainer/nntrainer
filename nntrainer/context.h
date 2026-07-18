@@ -15,6 +15,7 @@
 #define __CONTEXT_H__
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -39,6 +40,67 @@ namespace nntrainer {
 
 // ContextData lives in its own header so that layer_context.h / layer_node.h
 // can pull it in without triggering the context.h → layer_devel.h cycle.
+
+/**
+ * @struct DeviceCaps
+ * @brief Read-only snapshot of device capabilities, probed ONCE per backend at
+ *        Context init from real device queries (clGetDeviceInfo /
+ *        cudaGetDeviceProperties via the per-backend ContextManagers) rather
+ *        than from NNTR_* env flags. Currently LOG-ONLY — no decision site
+ *        reads it yet; it is the input the ExecPlan resolver will consume (see
+ *        docs/ARCHITECTURE_REFACTOR.md §10 T1/T4). Fields describe attributes
+ *        (what the device can do), never identity (who it is); unknown values
+ *        stay at the defaults below.
+ */
+struct DeviceCaps {
+  std::string backend = "cpu";  /**< "cpu" / "gpu" (OpenCL) / "cuda" */
+  std::string device_name = ""; /**< human-readable device name */
+  std::string arch = "";        /**< backend arch tag, e.g. "compute_120" */
+  uint32_t vendor_id = 0;       /**< OpenCL CL_DEVICE_VENDOR_ID; 0 = n/a */
+  bool integrated = true;       /**< host+device share one physical pool
+                                     (host-coherent); CPU = true */
+  bool unified_memory = false;  /**< single-pointer SVM/UVM available */
+  bool subgroups = false;       /**< OpenCL cl_intel_subgroups (XMX/DPAS) */
+  uint32_t compute_units = 0;   /**< OpenCL CL_DEVICE_MAX_COMPUTE_UNITS */
+  uint64_t max_alloc_bytes = 0; /**< per-alloc cap (CL MAX_MEM_ALLOC_SIZE);
+                                     0 = unknown/unbounded */
+  bool image_v8c = true;        /**< device uses the image2d v8c path (FC GEMM +
+                                     KV attention) rather than the cl_mem buffer
+                                     path. Both report CL_DEVICE_IMAGE_SUPPORT, so
+                                     this is not a clean query — it is set from
+                                     vendor_id at init (Intel NEO's compiler
+                                     rejects the integer-coord read_imageui v8c
+                                     kernel ⇒ buffer; Adreno/unknown ⇒ image). The
+                                     V8C_BUF cell of the resolver. [T8] */
+  bool dpas = false; /**< OpenCL cl_intel_subgroup_matrix_multiply_accumulate
+                          — the actual systolic-array/DPAS matrix engine
+                          (Xe2/Xe3 "Arc"/"Battlemage" and later). NOT the
+                          same as `subgroups`: cl_intel_subgroups is
+                          advertised by every Intel GPU since Gen9
+                          (Meteor-Lake Xe-LPG included) and has no matrix
+                          unit, so gating XMX on it silently ropes
+                          non-DPAS Intel iGPUs into the DPAS kernel
+                          (IGC emulates it — catastrophic slowdown). This
+                          is the real XMX-capability gate. Declared LAST
+                          so appending it leaves the other field offsets
+                          unmoved (ABI-safe for an app built against the
+                          old DeviceCaps). */
+
+  /**
+   * @brief One-line human-readable dump for the init-time log.
+   */
+  std::string toString() const {
+    std::ostringstream os;
+    os << "DeviceCaps{backend=" << backend << ", device=\"" << device_name
+       << "\", arch=" << (arch.empty() ? "-" : arch) << ", vendor_id=0x"
+       << std::hex << vendor_id << std::dec << ", integrated=" << integrated
+       << ", unified_memory=" << unified_memory << ", subgroups=" << subgroups
+       << ", image_v8c=" << image_v8c << ", dpas=" << dpas
+       << ", compute_units=" << compute_units
+       << ", max_alloc_bytes=" << max_alloc_bytes << "}";
+    return os.str();
+  }
+};
 
 /**
  * @class Context contains user-dependent configuration for  support
@@ -196,6 +258,65 @@ public:
    * @return return 0 for success
    */
   virtual int load(const std::string &file_path) { return 0; };
+
+  /**
+   * @brief Read-only device capability snapshot for this backend, probed once
+   *        at init. The base returns CPU caps (host-coherent, no accelerator);
+   *        ClContext / CudaContext override with a probed snapshot. LOG-ONLY
+   * for now (docs/ARCHITECTURE_REFACTOR.md §10 T1) — no decision site reads it
+   * yet, so adding/overriding it is byte-identical.
+   *
+   * @return const DeviceCaps& capabilities of the device backing this context
+   */
+  virtual const DeviceCaps &caps() const {
+    static const DeviceCaps
+      cpu_caps; // backend="cpu", integrated=true, defaults
+    return cpu_caps;
+  }
+
+  /**
+   * @brief Register a layer factory under this backend. The base default is
+   *        "unsupported" (returns -1); each concrete Context overrides it to
+   *        forward to its own registerFactory<Layer>. This is the non-template
+   *        seam that lets callers register a layer on any backend through
+   *        Engine::registerLayerFactory(engine, creator) WITHOUT a
+   *        static_cast to a concrete ClContext/CudaContext (whose
+   *        registerFactory is a per-class explicit template instantiation, an
+   *        ABI hazard across the .so boundary). [docs/ARCHITECTURE_REFACTOR.md
+   *        §10 T3 / §11 S1]
+   *
+   * @param factory layer creator (createLayer<T> result)
+   * @param key string key (empty ⇒ derived from the layer's getType())
+   * @param int_key integer key (-1 ⇒ auto-assigned)
+   * @return registered integer key, or -1 if the backend cannot register
+   */
+  virtual int registerLayerFactory(PtrFactoryType<nntrainer::Layer>,
+                                   const std::string & = "", const int = -1) {
+    ml_logw("[Context] this backend does not support layer registration");
+    return -1;
+  }
+
+  /**
+   * @brief Which residency plane (LayerComputeEngine) this backend's tensors
+   *        live on. This is the single authority the layer graph consults to
+   *        map a registered engine NAME onto the tensor/residency-plane enum
+   *        (toLayerComputeEngine, layer_node.cpp) — retiring the central
+   *        name→enum string table (ComputeEngineTypeInfo::EnumStr) in favour of
+   *        a per-context declaration. The base is CPU (host residency);
+   *        ClContext→GPU, CudaContext→CUDA, QNNContext→QNN override it. A new
+   *        aliased/added backend just declares its plane here, with no central
+   *        table to edit (add-only). [docs/ARCHITECTURE_REFACTOR.md §10 T3]
+   * @note  NEW vtable tail: appended after every pre-existing slot so a rebuilt
+   *        libnntrainer.so stays ABI-compatible with an app/ccapi built against
+   *        the old vtable. The QNN context lives in the libqnn_context.so
+   *        plugin, which subclasses Context, so that plugin must be rebuilt
+   *        alongside libnntrainer.so (an old plugin lacks this slot entirely —
+   *        calling residencyEngine() on it is UB).
+   * @return residency-plane enum backing this context's tensors
+   */
+  virtual ml::train::LayerComputeEngine residencyEngine() const {
+    return ml::train::LayerComputeEngine::CPU;
+  }
 
 private:
   /**
