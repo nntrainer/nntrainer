@@ -78,6 +78,26 @@ public:
    *        here: layer_context coerces it to QS4CX at init.
    */
   void fc(Tensor &input, Tensor &weight, Tensor &output) override;
+
+  // ── Copy ops (device-only aware) ───────────────────────────────────────
+  // Under the device-only activation pool (NNTR_CUDA_DEV_ACT) an activation is
+  // real device memory; Tensor::copy() -> the CpuComputeOps host loop would
+  // fault on it. Route contiguous device-only copies through a stream-ordered
+  // cudaMemcpyAsync; host / host-coherent UVM keep the CPU path.
+  void scopy_fp32(const unsigned int N, const float *X, const unsigned int incX,
+                  float *Y, const unsigned int incY) override;
+#ifdef ENABLE_FP16
+  void scopy_fp16(const unsigned int N, const _FP16 *X, const unsigned int incX,
+                  _FP16 *Y, const unsigned int incY) override;
+  // Converting copies with a device-only endpoint: stage through host temps
+  // (synchronous; these do not occur inside graph capture today).
+  void scopy_fp32_to_fp16(const unsigned int N, const float *X,
+                          const unsigned int incX, _FP16 *Y,
+                          const unsigned int incY) override;
+  void scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
+                          const unsigned int incX, float *Y,
+                          const unsigned int incY) override;
+#endif
 };
 
 } // namespace nntrainer

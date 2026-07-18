@@ -7,12 +7,14 @@
  * @see     https://github.com/nntrainer/nntrainer
  * @author  Jijoong Moon <jijoong.moon@samsung.com>
  * @bug     No known bugs except for NYI items
- * @brief   CUDA ComputeOps subclass (the element-wise decode dispatches for
- *          the cuda context). The device-kernel routing that used to be
- *          open-coded inside the neutral layers lives here, behind the same
- *          runtime gates; every contract miss lands in the inherited
- *          CpuComputeOps body, which is correct on the host-coherent UVM
- *          buffers.
+ * @brief   CUDA ComputeOps subclass for the cuda context. Inherits
+ *          CpuComputeOps: cuda tensors default to Unified Memory
+ *          (host-coherent), so every op the CUDA backend does not accelerate
+ *          runs correctly via the CPU implementation over the managed buffers.
+ *          Overrides the element-wise decode dispatches (behind the same
+ *          runtime gates the neutral layers used to open-code), the rms_norm
+ *          whole-op, the FC GEMM dispatch, and the copy ops (the latter so a
+ *          Tensor::copy is correct on the device-only activation pool).
  */
 
 #include "cuda_compute_ops.h"
@@ -23,6 +25,11 @@
 #include <compute_ops.h>
 #include <env_compat.h>
 #include <tensor.h>
+
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+#include <vector>
 
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
@@ -272,6 +279,121 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
   cuda::StreamManager::Global().finishIfAsync();
   input.dot(weight, output, false, false);
 }
+
+// ── Copy ops (device-only aware) ─────────────────────────────────────────
+// Under the device-only activation pool (NNTR_CUDA_DEV_ACT) an activation is
+// real device memory; Tensor::copy() -> the CpuComputeOps host loop would
+// fault on it. Route contiguous device-only copies through a stream-ordered
+// cudaMemcpyAsync; host / host-coherent UVM keep the CPU path.
+static bool device_copy(const void *X, void *Y, size_t bytes, bool contiguous) {
+  if (!(cuda::dev_only(X) || cuda::dev_only(Y)))
+    return false;
+  if (!contiguous)
+    throw std::runtime_error(
+      "CudaComputeOps: strided copy on device-only memory is unsupported");
+  auto &sm = cuda::StreamManager::Global();
+  if (cudaMemcpyAsync(Y, X, bytes, cudaMemcpyDefault, sm.GetStream()) !=
+      cudaSuccess) {
+    cudaGetLastError();
+    throw std::runtime_error(
+      "CudaComputeOps: device copy (cudaMemcpyAsync) failed");
+  }
+  if (!cuda::dev_only(Y)) {
+    if (sm.isCapturing())
+      std::fprintf(
+        stderr,
+        "[CAP-AUDIT] scopy D2H (host-consumed) during capture: %zu bytes\n",
+        bytes);
+    sm.finish(); // D2H: the host consumes the destination immediately
+  }
+  return true;
+}
+
+void CudaComputeOps::scopy_fp32(const unsigned int N, const float *X,
+                                const unsigned int incX, float *Y,
+                                const unsigned int incY) {
+  if (device_copy(X, Y, (size_t)N * sizeof(float), incX == 1 && incY == 1))
+    return;
+  for (unsigned int i = 0; i < N; ++i)
+    Y[i * incY] = X[i * incX];
+}
+
+#ifdef ENABLE_FP16
+void CudaComputeOps::scopy_fp16(const unsigned int N, const _FP16 *X,
+                                const unsigned int incX, _FP16 *Y,
+                                const unsigned int incY) {
+  if (device_copy(X, Y, (size_t)N * sizeof(_FP16), incX == 1 && incY == 1))
+    return;
+  for (unsigned int i = 0; i < N; ++i)
+    Y[i * incY] = X[i * incX];
+}
+// Converting copies with a device-only endpoint: stage through host temps
+// (synchronous; these do not occur inside graph capture today).
+void CudaComputeOps::scopy_fp32_to_fp16(const unsigned int N, const float *X,
+                                        const unsigned int incX, _FP16 *Y,
+                                        const unsigned int incY) {
+  if (cuda::dev_only(X) || cuda::dev_only(Y)) {
+    if (incX != 1 || incY != 1)
+      throw std::runtime_error(
+        "CudaComputeOps: strided converting copy on device-only memory");
+    if (cuda::StreamManager::Global().isCapturing())
+      std::fprintf(stderr,
+                   "[CAP-AUDIT] converting scopy fp32->fp16 during capture: "
+                   "N=%u (host convert frozen into graph)\n",
+                   N);
+    cuda::StreamManager::Global().finish();
+    std::vector<float> xs;
+    const float *xp = X;
+    if (cuda::dev_only(X)) {
+      xs.resize(N);
+      cuda::copy_any(xs.data(), X, (size_t)N * sizeof(float));
+      xp = xs.data();
+    }
+    std::vector<_FP16> ys(N);
+    for (unsigned int i = 0; i < N; ++i)
+      ys[i] = static_cast<_FP16>(xp[i]);
+    if (cuda::dev_only(Y))
+      cuda::copy_any(Y, ys.data(), (size_t)N * sizeof(_FP16));
+    else
+      std::memcpy(Y, ys.data(), (size_t)N * sizeof(_FP16));
+    return;
+  }
+  for (unsigned int i = 0; i < N; ++i)
+    Y[i * incY] = static_cast<_FP16>(X[i * incX]);
+}
+void CudaComputeOps::scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
+                                        const unsigned int incX, float *Y,
+                                        const unsigned int incY) {
+  if (cuda::dev_only(X) || cuda::dev_only(Y)) {
+    if (incX != 1 || incY != 1)
+      throw std::runtime_error(
+        "CudaComputeOps: strided converting copy on device-only memory");
+    if (cuda::StreamManager::Global().isCapturing())
+      std::fprintf(stderr,
+                   "[CAP-AUDIT] converting scopy fp16->fp32 during capture: "
+                   "N=%u (host convert frozen into graph)\n",
+                   N);
+    cuda::StreamManager::Global().finish();
+    std::vector<_FP16> xs;
+    const _FP16 *xp = X;
+    if (cuda::dev_only(X)) {
+      xs.resize(N);
+      cuda::copy_any(xs.data(), X, (size_t)N * sizeof(_FP16));
+      xp = xs.data();
+    }
+    std::vector<float> ys(N);
+    for (unsigned int i = 0; i < N; ++i)
+      ys[i] = static_cast<float>(xp[i]);
+    if (cuda::dev_only(Y))
+      cuda::copy_any(Y, ys.data(), (size_t)N * sizeof(float));
+    else
+      std::memcpy(Y, ys.data(), (size_t)N * sizeof(float));
+    return;
+  }
+  for (unsigned int i = 0; i < N; ++i)
+    Y[i * incY] = static_cast<float>(X[i * incX]);
+}
+#endif
 
 ComputeOps *get_cuda_ops() {
   static CudaComputeOps instance;
