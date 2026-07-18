@@ -441,8 +441,20 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   unsigned int num_allow_str = MAX_SEQ_LEN - NUM_TO_GENERATE;
   unsigned int text_len = _len;
 
-  if (_len > num_allow_str)
+  if (_len > num_allow_str) {
     text_len = num_allow_str;
+    // Truncation drops tokens from the tail of the prompt, which is where
+    // instructions in "summarize this document"-style prompts live: a
+    // silently truncated prompt can make the model continue the body
+    // instead of following a dropped trailing instruction. Always warn
+    // with the exact counts.
+    std::cerr << "[CausalLM] WARNING: prompt (" << _len
+              << " tokens) exceeds the max allowed prefill length ("
+              << num_allow_str
+              << " = max_seq_len - num_to_generate); "
+                 "truncating "
+              << (_len - num_allow_str) << " tail tokens." << std::endl;
+  }
 
   // feed only available length
   // if _input is allowed, it feeds all of the _input
