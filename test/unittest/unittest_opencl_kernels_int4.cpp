@@ -37,8 +37,8 @@ static void run_dequantization_test_(const uint32_t K, const uint32_t N) {
     generate_random_vector<float>(N * K, -2.0f, 2.0f);
 
   // Dequantization Q4_0
-  if (K % Q4_0 == 0 && N % 8 == 0) {
-    size_t q4_data_size = K * N / Q4_0 * sizeof(block_q4_0);
+  if (K % QK4_0 == 0 && N % 8 == 0) {
+    size_t q4_data_size = K * N / QK4_0 * sizeof(block_q4_0);
     std::vector<uint8_t> q4_weight(q4_data_size);
     std::vector<uint8_t> q4_weight_repack(q4_data_size);
     nntrainer::quantize_q4_0(weight_fp32.data(), q4_weight.data(), N, K,
@@ -127,8 +127,8 @@ static void run_int4_gemv_test_(const uint32_t K, const uint32_t N,
   // Reference Q4_0 GEMM
   std::vector<float> ref_dst(N, 0.0f);
   float mse_q4 = 0.0f;
-  if (K % Q4_0 == 0 && N % 8 == 0) {
-    size_t q4_data_size = K * N / Q4_0 * sizeof(block_q4_0);
+  if (K % QK4_0 == 0 && N % 8 == 0) {
+    size_t q4_data_size = K * N / QK4_0 * sizeof(block_q4_0);
     std::vector<float> q4_output_fp32(N);
     std::vector<uint8_t> q4_weight(q4_data_size);
     std::vector<uint8_t> q4_weight_repack(q4_data_size);
@@ -441,8 +441,8 @@ static void run_int4_gemm_test_(const uint32_t M, const uint32_t K,
 
   // Reference Q4_0 GEMM
   float mse_q4 = 0.0f;
-  if (K % Q4_0 == 0 && N % 8 == 0) {
-    size_t q4_data_size = K * N / Q4_0 * sizeof(block_q4_0);
+  if (K % QK4_0 == 0 && N % 8 == 0) {
+    size_t q4_data_size = K * N / QK4_0 * sizeof(block_q4_0);
     std::vector<float> q4_output_fp32(M * N);
     std::vector<uint8_t> q4_weight(q4_data_size);
     std::vector<uint8_t> q4_weight_repack(q4_data_size);
@@ -493,8 +493,8 @@ static void run_int4_gemm_test_(const uint32_t M, const uint32_t K,
   unsigned int run_count = 5;
   auto t_w1 = std::chrono::high_resolution_clock::now();
   for (unsigned int i = 0; i < run_count; ++i) {
-    nntrainer::openvino_gemm_cl(input_ptr, weight_ptr, scale_ptr, output_ptr, M,
-                                N, K, scale_group_size);
+    nntrainer::gemm_int4_cl(input_ptr, weight_ptr, scale_ptr, output_ptr, M, N,
+                            K, scale_group_size);
   }
   auto t_w2 = std::chrono::high_resolution_clock::now();
   double avg_time =
@@ -509,8 +509,8 @@ static void run_int4_gemm_test_(const uint32_t M, const uint32_t K,
   // GPU INT4 GEMM
   auto t3 = std::chrono::high_resolution_clock::now();
   for (unsigned int i = 0; i < run_count; ++i) {
-    nntrainer::openvino_gemm_cl(input_ptr, weight_ptr, scale_ptr, output_ptr, M,
-                                N, K, scale_group_size);
+    nntrainer::gemm_int4_cl(input_ptr, weight_ptr, scale_ptr, output_ptr, M, N,
+                            K, scale_group_size);
   }
 
   auto t4 = std::chrono::high_resolution_clock::now();
@@ -651,15 +651,12 @@ TEST(nntrainer_opencl_kernels_int4, int4_gemm_async_test) {
   unsigned int run_count = 5;
   auto t_w1 = std::chrono::high_resolution_clock::now();
   for (unsigned int i = 0; i < run_count; ++i) {
-    nntrainer::openvino_sgemm_cl(activations_f32_ptr, (char *)wq0,
-                                 (uint16_t *)ws0, out0, M, N0, K,
-                                 scale_group_size);
-    nntrainer::openvino_sgemm_cl(activations_f32_ptr, (char *)wq1,
-                                 (uint16_t *)ws1, out1, M, N1, K,
-                                 scale_group_size);
-    nntrainer::openvino_sgemm_cl(activations_f32_ptr, (char *)wq2,
-                                 (uint16_t *)ws2, out2, M, N1, K,
-                                 scale_group_size);
+    nntrainer::sgemm_int4_cl(activations_f32_ptr, (char *)wq0, (uint16_t *)ws0,
+                             out0, M, N0, K, scale_group_size);
+    nntrainer::sgemm_int4_cl(activations_f32_ptr, (char *)wq1, (uint16_t *)ws1,
+                             out1, M, N1, K, scale_group_size);
+    nntrainer::sgemm_int4_cl(activations_f32_ptr, (char *)wq2, (uint16_t *)ws2,
+                             out2, M, N1, K, scale_group_size);
   }
   auto t_w2 = std::chrono::high_resolution_clock::now();
   double avg_time =
@@ -674,15 +671,12 @@ TEST(nntrainer_opencl_kernels_int4, int4_gemm_async_test) {
   // In-order kernel execution
   auto t1 = std::chrono::high_resolution_clock::now();
   for (unsigned int i = 0; i < run_count; ++i) {
-    nntrainer::openvino_sgemm_cl(activations_f32_ptr, (char *)wq0,
-                                 (uint16_t *)ws0, out0, M, N0, K,
-                                 scale_group_size);
-    nntrainer::openvino_sgemm_cl(activations_f32_ptr, (char *)wq1,
-                                 (uint16_t *)ws1, out1, M, N1, K,
-                                 scale_group_size);
-    nntrainer::openvino_sgemm_cl(activations_f32_ptr, (char *)wq2,
-                                 (uint16_t *)ws2, out2, M, N1, K,
-                                 scale_group_size);
+    nntrainer::sgemm_int4_cl(activations_f32_ptr, (char *)wq0, (uint16_t *)ws0,
+                             out0, M, N0, K, scale_group_size);
+    nntrainer::sgemm_int4_cl(activations_f32_ptr, (char *)wq1, (uint16_t *)ws1,
+                             out1, M, N1, K, scale_group_size);
+    nntrainer::sgemm_int4_cl(activations_f32_ptr, (char *)wq2, (uint16_t *)ws2,
+                             out2, M, N1, K, scale_group_size);
   }
   auto t2 = std::chrono::high_resolution_clock::now();
   auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1);
@@ -700,9 +694,8 @@ TEST(nntrainer_opencl_kernels_int4, int4_gemm_async_test) {
   // Async
   auto t3 = std::chrono::high_resolution_clock::now();
   for (unsigned int i = 0; i < run_count; ++i) {
-    nntrainer::openvino_gemm_async_cl(activations_f32_ptr, weight_vec,
-                                      scale_vec, out_vec, M, n_vec, K,
-                                      scale_group_size);
+    nntrainer::gemm_int4_async_cl(activations_f32_ptr, weight_vec, scale_vec,
+                                  out_vec, M, n_vec, K, scale_group_size);
   }
   auto t4 = std::chrono::high_resolution_clock::now();
   auto gpu_dt = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3);
