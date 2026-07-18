@@ -189,9 +189,11 @@ void sgemm_cl(bool TransA, bool TransB, const float *A, const float *B,
  * @param[in] res float * for result/output
  * @param[in] size_input number of elements in input vector
  * @param[in] size_res number of elements in result vector
+ * @param[in] use_svm whether input/res are GPU-resident SVM pointers (bind
+ * directly and accumulate in place) vs host pointers (host round-trip)
  */
 void addition_cl(const float *input, float *res, unsigned int size_input,
-                 unsigned int size_res);
+                 unsigned int size_res, bool use_svm = false);
 
 /**
  * @brief rmsnorm each row of the tensor
@@ -206,6 +208,90 @@ void addition_cl(const float *input, float *res, unsigned int size_input,
 void rmsnorm_cl(const float *input, const float *gamma, float *result,
                 const float epsilon, unsigned int height, unsigned int width,
                 const bool use_svm = true);
+
+#ifdef ENABLE_FP16
+/**
+ * @brief FP16 SVM-direct rmsnorm (each row over width, scaled by gamma).
+ *        Mirrors rmsnorm_cl but for the FP16 residual stream; use_svm binds
+ *        in/out/gamma SVM-direct (residency) on the SVM pool, else host-bounce.
+ * @param[in] input/gamma/result _FP16* buffers
+ * @param[in] epsilon float epsilon (converted to half for the kernel)
+ * @param[in] height/width tensor shape; @param[in] use_svm SVM binding
+ */
+// NNTR_GPU_CLMEM_POOL: when out_clmem != nullptr the normed output is written
+// to that device cl_mem (the tensor's planner sub-buffer) with NO host map, so
+// a device-direct FC can consume it without the rmsnorm->FC SVM map/unmap
+// blocker. When in_clmem != nullptr the input is read from that device cl_mem
+// (a GPU_CLMEM-resident producer wrote it, e.g. the residual add); mixing a
+// cl_mem arg with SVM args in one kernel is valid. Coop path only (width % 8 ==
+// 0). skip_out_map: leave the SVM output GPU-owned -- no trailing blocking map,
+// clFlush instead (submission point). The caller owns the matching consumer
+// skip (a one-sided skip is asymmetric SVM state); only valid when every
+// consumer is a GPU kernel.
+void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
+                     const float epsilon, unsigned int height,
+                     unsigned int width, const bool use_svm = true,
+                     void *out_clmem = nullptr, void *in_clmem = nullptr,
+                     bool skip_out_map = false);
+
+/**
+ * @brief out[i] = in[i] * scalar over n elements (scalar_multiply GPU path).
+ *        cl_mem-resident (out_clmem/in_clmem) under GPU_CLMEM, else SVM.
+ */
+void scalar_mul_cl_fp16(const _FP16 *input, _FP16 *result, float scalar,
+                        unsigned int n, bool use_svm, void *out_clmem = nullptr,
+                        void *in_clmem = nullptr, unsigned int row_off = 0);
+
+/**
+ * @brief Block until the GPU command queue drains (clFinish). Host-coherence
+ *        barrier before a host op reads an SVM buffer that a prior GPU op
+ *        mapped asynchronously (e.g. lm_head reading the final RMSNorm output).
+ */
+void cl_queue_finish();
+
+/**
+ * @brief Force a blocking host-coherent SVM map (bypasses NNTR_SVM_RESIDENT).
+ *        Use at genuine GPU->host read boundaries when resident mode has
+ * skipped the per-op maps (e.g. lm_head reading the final RMSNorm output).
+ */
+void cl_svm_map_force(void *ptr, size_t bytes, bool read_only);
+
+/**
+ * @brief Force an SVM unmap (bypasses NNTR_SVM_RESIDENT). Use after a genuine
+ *        HOST write to an SVM activation (e.g. input embedding) so following
+ * GPU kernels read coherent data when resident mode skipped the per-op maps.
+ */
+void cl_svm_unmap_force(void *ptr);
+
+/**
+
+/**
+ * @brief Gemma4 per_layer_slice GPU path: out[r*fs+j] = in[r*in_width+off+j].
+ *        Gathers this layer's per-layer-input slice (off=layer_index*fs) from
+ *        the packed per-layer input. cl_mem-resident under GPU_CLMEM, else SVM.
+ */
+void per_layer_slice_cl_fp16(const _FP16 *input, _FP16 *result,
+                             unsigned int rows, unsigned int fs,
+                             unsigned int in_width, unsigned int off,
+                             bool use_svm, void *out_clmem = nullptr,
+                             void *in_clmem = nullptr);
+
+/**
+ * @brief Fused RMSNorm + residual add: out = rmsnorm(input)*gamma + residual,
+ *        in one kernel (removes the separate v8c_add_h2h residual-add + its
+ *        dispatch idle at the Gemma2 sandwich-norm boundary). Math is identical
+ *        to [rmsnorm_cl_fp16 then add] (gamma carries Gemma2's (1+w)).
+ * width%8==0
+ *        + use_svm required; each of in/out/residual may be a cl_mem sub-buffer
+ *        (GPU_CLMEM) or SVM. Returns false (caller falls back) on unsupported
+ * shape.
+ */
+bool rmsnorm_add_cl_fp16(const _FP16 *input, const _FP16 *gamma,
+                         const _FP16 *residual, _FP16 *result, float epsilon,
+                         unsigned int height, unsigned int width,
+                         bool use_svm = true, void *out_clmem = nullptr,
+                         void *in_clmem = nullptr, void *resid_clmem = nullptr);
+#endif
 
 /**
  * @brief     sscal value element by element immediately
@@ -336,7 +422,7 @@ void sgemm_cl(bool TransA, bool TransB, const _FP16 *A, const _FP16 *B,
  * @param[in] size_res number of elements in result vector
  */
 void addition_cl(const _FP16 *input, _FP16 *res, unsigned int size_input,
-                 unsigned int size_res);
+                 unsigned int size_res, bool use_svm = false);
 
 /**
  * @brief     fp16 sscal value element by element immediately
@@ -572,6 +658,14 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
  * V8C_BUF cell.
  */
 bool v8c_use_buffer_path();
+
+/**
+ * @brief Whether the GPU-resident SVM pool + in-order queue is active.
+ *        Default ON; NNTR_GPU_SVM_POOL=0 reverts to the legacy host-bounce /
+ *        out-of-order path. Mirrors the inline checks in neuralnet.cpp and the
+ *        command-queue manager.
+ */
+bool svm_pool_default_on();
 
 } // namespace nntrainer
 #endif /* __BLAS_KERNELS_H__ */

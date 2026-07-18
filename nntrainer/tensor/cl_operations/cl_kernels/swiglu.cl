@@ -3,12 +3,12 @@ __kernel void swiglu_cl(__global const float *restrict in1,
                         __global float *restrict out) {
   const int i = get_global_id(0);
 
-  const float in1_val = in1[i];
-  const float in2_val = in2[i];
+  // Numerically stable SiLU: x/(1+exp(-x)) == x*sigmoid(x). The
+  // x*exp(x)/(1+exp(x)) form overflows for x > ~88 (exp(x) = inf -> inf/inf
+  // = NaN). The sigmoid form never overflows (x << 0 -> exp(-x) = inf ->
+  // x/inf = 0).
+  const float x = in1[i];
+  const float swish = x / (1.0f + exp(-x));
 
-  const float in1_exp = exp(in1_val);
-
-  const float swish = in1_val * in1_exp / (1.0f + in1_exp);
-
-  out[i] = swish * in2_val;
+  out[i] = swish * in2[i];
 }

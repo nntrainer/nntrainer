@@ -30,6 +30,8 @@
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h>
 #include <compute_ops.h>
+#include <geglu_cl_op.h>
+#include <swiglu_cl_op.h>
 #include <tensor.h>
 
 namespace nntrainer {
@@ -88,6 +90,18 @@ public:
                              float *output, unsigned int M, unsigned int N,
                              unsigned int K, unsigned int group_size) override {
     nntrainer::sgemm_int4_cl(input, weight, scale, output, M, N, K, group_size);
+  }
+
+  // Whole-op (Tensor-level) GLU dispatches. The neutral GeGLU/SwiGLU layers
+  // call in1.getOps()->geglu/swiglu(...), which lands here on a CL-attached
+  // tensor and forwards to the OpenCL kernel dispatch.
+  void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+             unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::geglu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+  void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+              unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::swiglu_cl_op(in1, in2, out, active_rows, row_offset);
   }
 
   /**

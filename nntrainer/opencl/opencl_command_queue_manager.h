@@ -185,7 +185,8 @@ public:
    * @return true if mapping is successful, false otherwise.
    */
   bool enqueueSVMMap(void *svm_ptr, size_t size, bool read_only,
-                     bool async = false, cl_event *event = nullptr);
+                     bool async = false, cl_event *event = nullptr,
+                     bool force = false);
 
   /**
    * @brief Enqueue SVM memory unmap operation.
@@ -198,7 +199,8 @@ public:
    * blocking.
    * @return true if unmapping is successful, false otherwise.
    */
-  bool enqueueSVMUnmap(void *svm_ptr, cl_event *event = nullptr);
+  bool enqueueSVMUnmap(void *svm_ptr, cl_event *event = nullptr,
+                       bool force = false);
 
   /**
    * @brief Function to initiate execution of the command queue.

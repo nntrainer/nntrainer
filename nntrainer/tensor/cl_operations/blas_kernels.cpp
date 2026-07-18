@@ -1065,7 +1065,7 @@ void sgemm_cl(bool TransA, bool TransB, const float *A, const float *B,
 }
 
 void addition_cl(const float *input, float *res, unsigned int size_input,
-                 unsigned int size_res) {
+                 unsigned int size_res, bool use_svm) {
   bool result = false;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
@@ -1077,7 +1077,7 @@ void addition_cl(const float *input, float *res, unsigned int size_input,
   }
 
   addition_cl_internal<float>(kernel_addition_ptr, input, res, size_input,
-                              size_res);
+                              size_res, use_svm);
 }
 
 void rmsnorm_cl(const float *input, const float *gamma, float *result,
@@ -1095,6 +1095,383 @@ void rmsnorm_cl(const float *input, const float *gamma, float *result,
   rmsnorm_cl_internal<float>(kernel_rmsnorm_ptr, input, gamma, result, epsilon,
                              height, width, use_svm);
 }
+
+#ifdef ENABLE_FP16
+// out[i] = in[i] * scalar (Gemma4 scalar_multiply: q_scale / layer_scalar /
+// per_layer projection scales). cl_mem-resident (out_clmem/in_clmem) when the
+// graph uses the GPU_CLMEM pool, else SVM-direct. n = total element count
+// (height*width); a single linear pass keeps every activation on-device so the
+// next QINT4 GEMM reads a coherent buffer (no host round-trip that would break
+// residency -- the gemma4 incoherence root cause).
+static const std::string scalar_mul_fp16_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void scalar_mul_cl_fp16(__global const half *in, __global half *out,
+                                 float s, int n, int row_off) {
+  int i = get_global_id(0);
+  if (i < n)
+    out[i + row_off] = convert_half(convert_float(in[i + row_off]) * s);
+}
+)CL";
+
+// row_off: when cl_mem-bound (whole buffer at index 0) it offsets to the live
+// rows; SVM/host pointers are pre-offset by the caller so row_off stays 0.
+void scalar_mul_cl_fp16(const _FP16 *input, _FP16 *result, float scalar,
+                        unsigned int n, bool use_svm, void *out_clmem,
+                        void *in_clmem, unsigned int row_off) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  ClContext::SharedPtrClKernel kp =
+    blas_cc->registerClKernel(scalar_mul_fp16_kernel, "scalar_mul_cl_fp16");
+  if (!kp)
+    return;
+
+  cl_mem out_cl = static_cast<cl_mem>(out_clmem);
+  cl_mem in_cl = static_cast<cl_mem>(in_clmem);
+  const bool from_clmem = in_cl != nullptr;
+  const bool to_clmem = out_cl != nullptr && use_svm;
+
+  bool ok = true;
+  if (from_clmem) {
+    ok = ok && kp->SetKernelArguments(0, &in_cl, sizeof(cl_mem));
+  } else if (use_svm) {
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(const_cast<_FP16 *>(input));
+    ok = ok && kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input));
+  }
+  if (to_clmem) {
+    ok = ok && kp->SetKernelArguments(1, &out_cl, sizeof(cl_mem));
+  } else if (use_svm) {
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(result);
+    ok = ok && kp->SetKernelSVMArguments(1, result);
+  }
+  int ni = (int)n;
+  // cl_mem binds the whole buffer (apply row_off in-kernel); SVM/host pointers
+  // are pre-offset by the caller, so row_off stays 0 there.
+  int kern_row_off = (from_clmem && to_clmem) ? (int)row_off : 0;
+  ok = ok && kp->SetKernelArguments(2, &scalar, sizeof(float));
+  ok = ok && kp->SetKernelArguments(3, &ni, sizeof(int));
+  ok = ok && kp->SetKernelArguments(4, &kern_row_off, sizeof(int));
+  if (!ok)
+    return;
+
+  const int lws = 64;
+  const int gws = ((ni + lws - 1) / lws) * lws;
+  const int wgc[3] = {gws, 1, 1};
+  const int wgs[3] = {lws, 1, 1};
+  if (!blas_cc->command_queue_inst_.DispatchCommand(kp, wgc, wgs))
+    return;
+
+  if (!to_clmem && use_svm)
+    blas_cc->command_queue_inst_.enqueueSVMMap(result,
+                                               (size_t)n * sizeof(_FP16), true);
+}
+
+// Fused RMSNorm + residual add (Gemma2 sandwich-norm boundary): computes
+// out = rmsnorm(input)*gamma + residual in one kernel, removing the separate
+// v8c_add_h2h residual-add kernel (~42 ms/prefill GPU) AND the rmsnorm->add /
+// add->next dispatch idle. Mirrors rmsnorm_cl_fp16_coop exactly (LWS=64,
+// LDS-tree reduce, gamma carries Gemma2's (1+w)) then folds the residual add.
+// Inline string so no .cl regen step is needed.
+//
+// Bit-identity to the separate [rmsnorm_cl_fp16_coop then v8c_add_h2h] path:
+// `nv` is a named half8 intermediate, so norm*gamma rounds to fp16 (rounding
+// #1) before the residual add rounds again (rounding #2) -- exactly the two
+// roundings of the separate path (the norm kernel stores fp16, the add kernel
+// re-rounds). This holds when built without mad-contraction, i.e. under
+// NNTR_NO_FASTMATH=1, which is this fusion's intended/committed config. (An
+// earlier as_half8(as_ushort8(.)) bitcast meant to defeat fast-math contraction
+// tripped an Adreno arg-binding bug -- CL_INVALID_ARG_VALUE on the gamma SVM
+// arg; the plain named intermediate avoids it.)
+static const std::string rmsnorm_add_fp16_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__attribute__((reqd_work_group_size(64, 1, 1)))
+__kernel void rmsnorm_cl_fp16_coop_add(__global const half *input,
+                                       __global half *output,
+                                       __global const half *alpha,
+                                       half epsilon, int n_rows, int W,
+                                       __global const half *residual) {
+  const int row = get_group_id(0);
+  const int tid = get_local_id(0);   // 0..63
+  if (row >= n_rows)
+    return;
+  const long base = (long)row * (long)W;
+  const int W8 = W >> 3;
+  __global const half8 *in8 = (__global const half8 *)(input + base);
+  float partial = 0.0f;
+  for (int i = tid; i < W8; i += 64) {
+    const float8 v = convert_float8(in8[i]);
+    partial += dot(v.lo, v.lo) + dot(v.hi, v.hi);
+  }
+  __local float lsum[64];
+  lsum[tid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = 32; s > 0; s >>= 1) {
+    if (tid < s)
+      lsum[tid] += lsum[tid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float mean = lsum[0] / (float)W;
+  const float scale = rsqrt(mean + (float)epsilon);
+  __global half8 *out8 = (__global half8 *)(output + base);
+  __global const half8 *r8 = (__global const half8 *)(residual + base);
+  for (int i = tid; i < W8; i += 64) {
+    // Gemma4 large-gamma FP16 overflow guard (see rmsnorm_fp16.cl): gamma
+    // multiply in FP32 + clamp to FP16-safe range before the residual add.
+    // gamma (alpha) is a WEIGHT pointer with no 16-byte alignment guarantee
+    // (Gemma4 lands it 2-byte-aligned), so a half8 vector load reads garbage.
+    // Load it per-element (scalar gather) -- same fix as rmsnorm_cl_fp16_coop.
+    const float8 v = convert_float8(in8[i]) * scale;
+    const int gi = i << 3;
+    const float8 a = (float8)(
+      (float)alpha[gi + 0], (float)alpha[gi + 1], (float)alpha[gi + 2],
+      (float)alpha[gi + 3], (float)alpha[gi + 4], (float)alpha[gi + 5],
+      (float)alpha[gi + 6], (float)alpha[gi + 7]);
+    const float8 nv = clamp(v * a, -60000.0f, 60000.0f);
+    out8[i] = convert_half8(nv) + r8[i];
+  }
+}
+)CL";
+
+// width%8==0 (Gemma2 hidden=2304) coop fused norm+add. in/out/residual each may
+// be a cl_mem sub-buffer (GPU_CLMEM resident) or SVM; gamma stays SVM. Returns
+// false (caller falls back to separate norm+add) on unsupported shape.
+bool rmsnorm_add_cl_fp16(const _FP16 *input, const _FP16 *gamma,
+                         const _FP16 *residual, _FP16 *result, float epsilon,
+                         unsigned int height, unsigned int width, bool use_svm,
+                         void *out_clmem, void *in_clmem, void *resid_clmem) {
+  if ((width % 8u) != 0u || !use_svm)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc)
+    return false;
+  const cl_half eps_h = static_cast<cl_half>(0);
+  const _FP16 eps_f = static_cast<_FP16>(epsilon);
+  std::memcpy((void *)&eps_h, &eps_f, sizeof(cl_half));
+  cl_mem out_cl = static_cast<cl_mem>(out_clmem);
+  cl_mem in_cl = static_cast<cl_mem>(in_clmem);
+  cl_mem resid_cl = static_cast<cl_mem>(resid_clmem);
+  const int n_rows = (int)height, w = (int)width;
+
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    rmsnorm_add_fp16_kernel, "rmsnorm_cl_fp16_coop_add");
+  if (!kp)
+    return false;
+  // Arg order mirrors rmsnorm_cl_fp16_coop (in,out,alpha,eps,n_rows,W) with the
+  // residual pointer appended LAST.
+  bool ok = true;
+  bool a0 = in_cl ? kp->SetKernelArguments(0, &in_cl, sizeof(cl_mem))
+                  : kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input));
+  bool a1 = out_cl ? kp->SetKernelArguments(1, &out_cl, sizeof(cl_mem))
+                   : kp->SetKernelSVMArguments(1, result);
+  bool a2 = kp->SetKernelSVMArguments(2, const_cast<_FP16 *>(gamma));
+  bool a3 = kp->SetKernelArguments(3, &eps_h, sizeof(cl_half));
+  bool a4 = kp->SetKernelArguments(4, &n_rows, sizeof(int));
+  bool a5 = kp->SetKernelArguments(5, &w, sizeof(int));
+  bool a6 = resid_cl
+              ? kp->SetKernelArguments(6, &resid_cl, sizeof(cl_mem))
+              : kp->SetKernelSVMArguments(6, const_cast<_FP16 *>(residual));
+  ok = a0 && a1 && a2 && a3 && a4 && a5 && a6;
+  if (!ok)
+    return false;
+  constexpr int RMSN_LWS = 64;
+  const int gws[3] = {RMSN_LWS * n_rows, 1, 1};
+  const int lws[3] = {RMSN_LWS, 1, 1};
+  blas_cc->command_queue_inst_.setNextProfileLabel(":rmsnorm_add");
+  return blas_cc->command_queue_inst_.DispatchCommand(kp, gws, lws);
+}
+
+void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
+                     const float epsilon, unsigned int height,
+                     unsigned int width, bool use_svm, void *out_clmem,
+                     void *in_clmem, bool skip_out_map) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+
+  const _FP16 eps_h = static_cast<_FP16>(epsilon);
+  const size_t in_bytes = (size_t)height * width * sizeof(_FP16);
+
+  // NNTR_GPU_CLMEM_POOL (cl_mem residency): write the normed output to the
+  // tensor's planner cl_mem sub-buffer (out_clmem) instead of the SVM `result`,
+  // with NO host map -- the device-direct FC consumes it (no SVM map/unmap, the
+  // measured prefill blocker). in_clmem likewise reads the input from a
+  // GPU_CLMEM-resident producer's sub-buffer (mixed cl_mem/SVM args are valid).
+  // Only the coop path (width%8==0, Gemma2 hidden); gamma stays SVM.
+  cl_mem out_cl = static_cast<cl_mem>(out_clmem);
+  cl_mem in_cl = static_cast<cl_mem>(in_clmem);
+  const bool to_clmem = (out_cl != nullptr) && use_svm && (width % 8u == 0u);
+  const bool from_clmem = (in_cl != nullptr) && (width % 8u == 0u);
+
+  // The scalar rmsnorm_cl_fp16 kernel sets the OpenCL LOCAL work-group size to
+  // W (one WI loops the whole row). For full-hidden norms (Gemma2 hidden=2304)
+  // that exceeds CL_DEVICE_MAX_WORK_GROUP_SIZE (1024 on Intel Arc) =>
+  // CL_INVALID_WORK_GROUP_SIZE => the dispatch silently fails and the output is
+  // left stale (garbage). Use the cooperative kernel (RMSN_LWS=64 WIs per row,
+  // half8-vectorized, fp32 accumulation, gamma folded) whenever W%8==0 — it is
+  // the same kernel gpu_native uses. Fall back to the scalar kernel with a
+  // valid local size only for the rare W%8!=0 case.
+  const int n_rows = (int)height;
+  const int w = (int)width;
+  const bool use_coop = (width % 8u == 0u);
+
+  if (use_coop) {
+    constexpr int RMSN_LWS = 64;
+    // Gamma-free path (Gemma4 v_norm, use_gamma=false => gamma==nullptr): the
+    // _ng kernel keeps the same 6-arg signature but never reads alpha (arg 2),
+    // so bind arg 2 to a valid-but-unread pointer (input) instead of a null SVM
+    // gamma. Lets the v_norm run on the GPU rmsnorm coop kernel (fp32
+    // reduction, overflow-safe) instead of the host drain+map fallback.
+    const bool no_gamma = (gamma == nullptr);
+    ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+      rmsnorm_fp16_kernel,
+      no_gamma ? "rmsnorm_cl_fp16_coop_ng" : "rmsnorm_cl_fp16_coop");
+    if (!kp)
+      return;
+    if (to_clmem || from_clmem) {
+      // Mixed bind: each of in/out is its tensor's static plane (cl_mem
+      // sub-buffer when GPU_CLMEM, SVM otherwise); gamma stays SVM.
+      bool ok = true;
+      if (from_clmem)
+        ok = ok && kp->SetKernelArguments(0, &in_cl, sizeof(cl_mem));
+      else
+        ok = ok && kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input));
+      if (to_clmem)
+        ok = ok && kp->SetKernelArguments(1, &out_cl, sizeof(cl_mem));
+      else
+        ok = ok && kp->SetKernelSVMArguments(1, result);
+      ok = ok && kp->SetKernelSVMArguments(
+                   2, const_cast<_FP16 *>(no_gamma ? input : gamma));
+      if (!ok)
+        return;
+    } else if (use_svm) {
+      if (!kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input)) ||
+          !kp->SetKernelSVMArguments(1, result) ||
+          !kp->SetKernelSVMArguments(
+            2, const_cast<_FP16 *>(no_gamma ? input : gamma)))
+        return;
+    } else {
+      auto &clbuf = ClBufferManager::Global();
+      // no_gamma reaches here only via a non-SVM caller (v_norm is always SVM);
+      // the _ng kernel ignores arg 2, so skip the null-gamma write and bind
+      // InBufferA for it rather than crashing on a null source.
+      if (!clbuf.getInBufferA()->WriteDataRegion(blas_cc->command_queue_inst_,
+                                                 in_bytes, input) ||
+          (!no_gamma &&
+           !clbuf.getInBufferB()->WriteDataRegion(
+             blas_cc->command_queue_inst_, width * sizeof(_FP16), gamma)))
+        return;
+      if (!kp->SetKernelArguments(0, &clbuf.getInBufferA()->GetBuffer(),
+                                  sizeof(cl_mem)) ||
+          !kp->SetKernelArguments(1, &clbuf.getOutBufferA()->GetBuffer(),
+                                  sizeof(cl_mem)) ||
+          !kp->SetKernelArguments(
+            2,
+            &(no_gamma ? clbuf.getInBufferA() : clbuf.getInBufferB())
+               ->GetBuffer(),
+            sizeof(cl_mem)))
+        return;
+    }
+    if (!kp->SetKernelArguments(3, &eps_h, sizeof(cl_half)) ||
+        !kp->SetKernelArguments(4, &n_rows, sizeof(int)) ||
+        !kp->SetKernelArguments(5, &w, sizeof(int)))
+      return;
+    const int work_groups_count[3] = {RMSN_LWS * n_rows, 1, 1};
+    const int work_group_size[3] = {RMSN_LWS, 1, 1};
+    if (!blas_cc->command_queue_inst_.DispatchCommand(kp, work_groups_count,
+                                                      work_group_size))
+      return;
+  } else {
+    // Scalar fallback (W%8!=0): one WI per (n,h) row; local must be a valid
+    // size (NOT W). Bind the 8-arg [B,C,H,W] signature with local={1,1,1}.
+    ClContext::SharedPtrClKernel kp =
+      blas_cc->registerClKernel(rmsnorm_fp16_kernel, "rmsnorm_cl_fp16");
+    if (!kp)
+      return;
+    const int b = 1, c = 1, h = (int)height;
+    if (use_svm) {
+      if (!kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input)) ||
+          !kp->SetKernelSVMArguments(1, result) ||
+          !kp->SetKernelSVMArguments(2, const_cast<_FP16 *>(gamma)))
+        return;
+    } else {
+      auto &clbuf = ClBufferManager::Global();
+      if (!clbuf.getInBufferA()->WriteDataRegion(blas_cc->command_queue_inst_,
+                                                 in_bytes, input) ||
+          !clbuf.getInBufferB()->WriteDataRegion(blas_cc->command_queue_inst_,
+                                                 width * sizeof(_FP16), gamma))
+        return;
+      if (!kp->SetKernelArguments(0, &clbuf.getInBufferA()->GetBuffer(),
+                                  sizeof(cl_mem)) ||
+          !kp->SetKernelArguments(1, &clbuf.getOutBufferA()->GetBuffer(),
+                                  sizeof(cl_mem)) ||
+          !kp->SetKernelArguments(2, &clbuf.getInBufferB()->GetBuffer(),
+                                  sizeof(cl_mem)))
+        return;
+    }
+    if (!kp->SetKernelArguments(3, &eps_h, sizeof(cl_half)) ||
+        !kp->SetKernelArguments(4, &b, sizeof(int)) ||
+        !kp->SetKernelArguments(5, &c, sizeof(int)) ||
+        !kp->SetKernelArguments(6, &h, sizeof(int)) ||
+        !kp->SetKernelArguments(7, &w, sizeof(int)))
+      return;
+    const int work_groups_count[3] = {b * c, h, 1};
+    const int work_group_size[3] = {1, 1, 1};
+    if (!blas_cc->command_queue_inst_.DispatchCommand(kp, work_groups_count,
+                                                      work_group_size))
+      return;
+  }
+
+  if (use_svm) {
+    // NOTE: kept BLOCKING. rmsnorm output is consumed by the AdditionLayerCL
+    // residual add (post_attn_norm/post_ffn_norm), which has a host fast-path
+    // that reads the buffer on the CPU — an async map there races and corrupts
+    // output (verified: async here -> <pad>). Making this async requires the
+    // addition (and any other host consumer) to be GPU-resident first.
+    // NOTE(2026-06): even the all-GPU FP16 chain is NOT safe to async here —
+    // measured +5% prefill but the output diverged (base <eos> vs async
+    // garbage), i.e. a real coherence race. Closing the gpu_native residency
+    // gap requires removing the host map/unmap pair entirely (coordinated
+    // producer + consumer), not flipping this to async. NNTR_GPU_CLMEM_POOL:
+    // the normed output went to the cl_mem sub-buffer, not the SVM `result`;
+    // there is no host map to restore (the FC reads it direct). skip_out_map
+    // (NNTR_DEVRES pair-removal): the caller guarantees every consumer is a GPU
+    // kernel and flags the output device_valid, so the matching consumer-side
+    // unmap/map is skipped too (S4 mechanism). The blocking map here
+    // measured 16.9ms/call of cache-coherence stall on the fan-out pre-norms
+    // (attention_norm/ffn_norm = 912ms per 1K prefill). clFlush keeps the
+    // submission point the blocking map used to provide.
+    if (!to_clmem) {
+      if (skip_out_map) {
+        clFlush(blas_cc->command_queue_inst_.GetCommandQueue());
+      } else {
+        // NNTR_NORM_TPROF=1: time the blocking map (suspected ~7ms/call
+        // coherence stall on the 3.9MB fan-out norm outputs).
+        static const bool tprof = std::getenv("NNTR_NORM_TPROF") != nullptr;
+        static double acc = 0;
+        static int n = 0;
+        std::chrono::steady_clock::time_point t0, t1;
+        if (tprof)
+          t0 = std::chrono::steady_clock::now();
+        blas_cc->command_queue_inst_.enqueueSVMMap(result, in_bytes, false);
+        if (tprof) {
+          t1 = std::chrono::steady_clock::now();
+          acc += std::chrono::duration<double, std::milli>(t1 - t0).count();
+          if (++n % 54 == 0) {
+            std::fprintf(stderr, "[NORM-TPROF] n=%d map_total=%.2fms\n", n,
+                         acc);
+            std::fflush(stderr);
+            acc = 0;
+          }
+        }
+      }
+    }
+  } else {
+    auto &clbuf = ClBufferManager::Global();
+    clbuf.getOutBufferA()->ReadDataRegion(blas_cc->command_queue_inst_,
+                                          in_bytes, result);
+  }
+}
+
+#endif
 
 void sscal_cl(float *X, const unsigned int N, const float alpha) {
   auto *blas_cc =
@@ -1421,6 +1798,15 @@ bool v8c_use_buffer_path() {
     return !ClContext::Global().caps().image_v8c; // Intel ⇒ buffer
   }();
   return use_buf;
+}
+
+// The GPU-resident SVM pool + in-order queue is the GPU path's default;
+// NNTR_GPU_SVM_POOL=0 reverts to the legacy host-bounce/out-of-order path.
+// Single source mirrored by the inline checks in neuralnet.cpp (allocator)
+// and opencl_command_queue_manager.cpp (queue ordering).
+bool svm_pool_default_on() {
+  const char *e = std::getenv("NNTR_GPU_SVM_POOL");
+  return !e || std::atoi(e) != 0;
 }
 
 // Compile options for the buffer-load v8c program. -DV8C_BUFFER_ONLY excludes
@@ -2812,6 +3198,37 @@ bool lmhead_gemv_fp32w_cl(const void *w_fp32_host, const void *act_fp16_host,
                  announced, vocab, hidden);
   }
   return true;
+}
+
+void cl_queue_finish() {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc)
+    blas_cc->command_queue_inst_.finish();
+}
+
+void cl_svm_map_force(void *ptr, size_t bytes, bool read_only) {
+  // Force a blocking host-coherent SVM map even when NNTR_SVM_RESIDENT skips
+  // the per-op maps. Used at genuine GPU->host boundaries (e.g. lm_head reads
+  // the final RMSNorm output on the host) so the resident chain stays correct.
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc && ptr && bytes)
+    blas_cc->command_queue_inst_.enqueueSVMMap(ptr, bytes, read_only,
+                                               /** async */ false, nullptr,
+                                               /** force */ true);
+}
+
+void cl_svm_unmap_force(void *ptr) {
+  // Force an SVM unmap (hand the buffer back to the device) even under
+  // NNTR_SVM_RESIDENT. Used after a genuine HOST write to an SVM activation
+  // (e.g. the input token embedding) so the following GPU kernels read coherent
+  // data when the per-op maps are skipped.
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc && ptr)
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(ptr, nullptr,
+                                                 /** force */ true);
 }
 
 } // namespace nntrainer

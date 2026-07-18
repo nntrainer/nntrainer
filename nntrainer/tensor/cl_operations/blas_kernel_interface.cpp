@@ -226,6 +226,13 @@ void add_i_cl(Tensor &result, Tensor const &input) {
   NNTR_THROW_IF(result.getData() == nullptr, std::invalid_argument)
     << result.getName() << " is not allocated";
 
+  // Bind device memory directly (SVM-direct, in-place accumulate) only when
+  // both tensors are GPU-resident (SVM pool); otherwise fall back to the host
+  // round-trip. Keeps the residual on the GPU when residency is enabled.
+  const bool use_svm = result.getMemoryData() &&
+                       result.getMemoryData()->isSVM() &&
+                       input.getMemoryData() && input.getMemoryData()->isSVM();
+
   // Broadcasting done for the case where batch size vary for both inputs
   // If batch size vary, batch size of input must be 1
   if ((result.getDim() == input.getDim()) ||
@@ -242,7 +249,7 @@ void add_i_cl(Tensor &result, Tensor const &input) {
         // axpy with alpha=1 is just an elementwise add. Use the in-tree
         // addition_cl kernel instead of the CLBlast axpy route so FP32 add
         // works without CLBlast (FP16 already uses addition_cl below).
-        addition_cl(X, Y, size_input, size_input);
+        addition_cl(X, Y, size_input, size_input, use_svm);
         Y += size_input;
       }
     } else if (result.getDataType() == ml::train::TensorDim::DataType::FP16) {
@@ -252,7 +259,7 @@ void add_i_cl(Tensor &result, Tensor const &input) {
       _FP16 *data_res = result.getData<_FP16>();
       const _FP16 *data_input = input.getData<_FP16>();
 
-      addition_cl(data_input, data_res, size_input, size_res);
+      addition_cl(data_input, data_res, size_input, size_res, use_svm);
 
 #else
       throw std::invalid_argument("Error: enable-fp16 is not enabled");

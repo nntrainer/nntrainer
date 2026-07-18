@@ -378,9 +378,23 @@ void CommandQueueManager::finish() {
     clFinish(command_queue_);
 }
 
+// NNTR_SVM_RESIDENT: keep the activation chain fully GPU-resident. On the
+// in-order SVM queue consecutive GPU kernels are already device-coherent
+// without host map/unmap; the per-op maps exist only as a defensive
+// host-coherence guard that no all-GPU consumer needs. Skipping them removes
+// the coarse-grain SVM coherence ops (cache flush/invalidate) that serialize
+// the layer-graph forward. Genuine host boundaries (e.g. the lm_head input
+// read) pass force=true to map anyway. Default off (original behavior).
+static bool svm_resident_mode() {
+  static const bool v = std::getenv("NNTR_SVM_RESIDENT") != nullptr;
+  return v;
+}
+
 bool CommandQueueManager::enqueueSVMMap(void *svm_ptr, size_t size,
                                         bool read_only, bool async,
-                                        cl_event *event) {
+                                        cl_event *event, bool force) {
+  if (svm_resident_mode() && !force)
+    return true; // resident: stays device-coherent, no host map needed
   // managing read/write flags
   const cl_map_flags map_flag = read_only ? CL_MAP_READ : CL_MAP_WRITE;
 
@@ -403,7 +417,10 @@ bool CommandQueueManager::enqueueSVMMap(void *svm_ptr, size_t size,
   return true;
 }
 
-bool CommandQueueManager::enqueueSVMUnmap(void *svm_ptr, cl_event *event) {
+bool CommandQueueManager::enqueueSVMUnmap(void *svm_ptr, cl_event *event,
+                                          bool force) {
+  if (svm_resident_mode() && !force)
+    return true; // resident: stays device-coherent, no host unmap needed
   cl_int error_code =
     clEnqueueSVMUnmap(command_queue_, svm_ptr, 0, nullptr, event);
 

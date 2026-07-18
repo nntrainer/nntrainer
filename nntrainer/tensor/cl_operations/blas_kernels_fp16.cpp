@@ -86,7 +86,7 @@ void sgemm_cl(bool TransA, bool TransB, const _FP16 *A, const _FP16 *B,
 }
 
 void addition_cl(const _FP16 *input, _FP16 *res, unsigned int size_input,
-                 unsigned int size_res) {
+                 unsigned int size_res, bool use_svm) {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
 
@@ -97,7 +97,7 @@ void addition_cl(const _FP16 *input, _FP16 *res, unsigned int size_input,
   }
 
   addition_cl_internal<_FP16>(kernel_addition_fp16_ptr, input, res, size_input,
-                              size_res);
+                              size_res, use_svm);
 }
 
 void sscal_cl(_FP16 *X, const unsigned int N, const float alpha) {

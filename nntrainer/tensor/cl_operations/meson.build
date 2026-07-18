@@ -5,6 +5,8 @@ cl_op_sources = [
   'attention_kernels.cpp',
   'clblast_interface.cpp',
   'cl_compute_ops.cpp',
+  'geglu_cl_op.cpp',
+  'swiglu_cl_op.cpp',
   'cl_tensor_view.cpp',
   'cl_tensor_backing_pool.cpp',
   'cl_buffer_pool.cpp'
@@ -14,6 +16,8 @@ cl_op_headers = [
   'blas_kernel_interface.h',
   'attention_kernel_interface.h',
   'clblast_interface.h',
+  'geglu_cl_op.h',
+  'swiglu_cl_op.h',
   'cl_tensor_view.h',
   'cl_tensor_backing_pool.h',
   'cl_buffer_pool.h'

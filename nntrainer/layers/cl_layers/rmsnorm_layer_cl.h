@@ -134,8 +134,10 @@ public:
 
 private:
   std::array<unsigned int, 1> wt_idx;
+  bool skip_prefill =
+    false; /**< skip compute during prefill (Gemma4 KV-share) */
 
-  std::tuple<props::GammaInitializer, props::Epsilon>
+  std::tuple<props::GammaInitializer, props::Epsilon, props::SkipPrefill>
     rmsnorm_props; /**< rmsnorm layer properties */
 
   static std::vector<ClContext::SharedPtrClKernel> &getLayerKernelPtrs();

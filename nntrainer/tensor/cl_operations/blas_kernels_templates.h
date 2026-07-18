@@ -257,7 +257,8 @@ sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
 template <typename T = float>
 inline static void
 addition_cl_internal(ClContext::SharedPtrClKernel kernel, const T *input,
-                     T *res, unsigned int size_input, unsigned int size_res) {
+                     T *res, unsigned int size_input, unsigned int size_res,
+                     bool use_svm = false) {
   bool result = false;
 
   auto *blas_cc =
@@ -267,28 +268,42 @@ addition_cl_internal(ClContext::SharedPtrClKernel kernel, const T *input,
   size_t dim1_size = sizeof(T) * size_input;
   size_t dim2_size = sizeof(T) * size_res;
 
-  result = clbuffInstance.getInBufferA()->WriteDataRegion(
-    blas_cc->command_queue_inst_, dim1_size, input);
-  if (!result) {
-    return;
-  }
+  if (use_svm) {
+    // SVM-direct: input/res are GPU-resident pointers; accumulate in place
+    // (res += input) with no host round-trip (residency path). Coarse-grained
+    // SVM needs explicit coherence: release host mappings so the GPU sees the
+    // current host-side contents (res was just host-written by the copy of the
+    // first addend), then re-map res after the dispatch for the host read.
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(const_cast<T *>(input));
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(res);
+    if (!kernel->SetKernelSVMArguments(0, input))
+      return;
+    if (!kernel->SetKernelSVMArguments(1, res))
+      return;
+  } else {
+    result = clbuffInstance.getInBufferA()->WriteDataRegion(
+      blas_cc->command_queue_inst_, dim1_size, input);
+    if (!result) {
+      return;
+    }
 
-  result = clbuffInstance.getOutBufferA()->WriteDataRegion(
-    blas_cc->command_queue_inst_, dim2_size, res);
-  if (!result) {
-    return;
-  }
+    result = clbuffInstance.getOutBufferA()->WriteDataRegion(
+      blas_cc->command_queue_inst_, dim2_size, res);
+    if (!result) {
+      return;
+    }
 
-  result = kernel->SetKernelArguments(0, clbuffInstance.getInBufferA(),
-                                      sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
+    result = kernel->SetKernelArguments(0, clbuffInstance.getInBufferA(),
+                                        sizeof(cl_mem));
+    if (!result) {
+      return;
+    }
 
-  result = kernel->SetKernelArguments(1, clbuffInstance.getOutBufferA(),
-                                      sizeof(cl_mem));
-  if (!result) {
-    return;
+    result = kernel->SetKernelArguments(1, clbuffInstance.getOutBufferA(),
+                                        sizeof(cl_mem));
+    if (!result) {
+      return;
+    }
   }
 
   result = kernel->SetKernelArguments(2, &size_input, sizeof(int));
@@ -301,20 +316,34 @@ addition_cl_internal(ClContext::SharedPtrClKernel kernel, const T *input,
     return;
   }
 
-  const int work_groups_count[3] = {(int)size_res, 1, 1};
-  /// @todo: create a group size by device & input
-  const int work_group_size[3] = {1, 1, 1}; // test-value
+  // lws was {1,1,1} ("test-value") -> one work-item per work-group, i.e. ~1/64
+  // of the SIMD wave used (measured: addition_cl_fp16 at ~1.5 GB/s). Use a
+  // full work-group; round the global size up to a multiple of lws -- both
+  // addition_cl / addition_cl_fp16 guard `if (idx < size_res)` so the
+  // rounded-up tail work-items are no-ops.
+  const int add_lws = 64;
+  const int add_gws = (((int)size_res + add_lws - 1) / add_lws) * add_lws;
+  const int work_groups_count[3] = {add_gws, 1, 1};
+  const int work_group_size[3] = {add_lws, 1, 1};
   result = blas_cc->command_queue_inst_.DispatchCommand(
     kernel, work_groups_count, work_group_size);
   if (!result) {
     return;
   }
 
-  result = clbuffInstance.getOutBufferA()->ReadDataRegion(
-    blas_cc->command_queue_inst_, dim2_size, res);
+  if (!use_svm) {
+    result = clbuffInstance.getOutBufferA()->ReadDataRegion(
+      blas_cc->command_queue_inst_, dim2_size, res);
 
-  if (!result) {
-    return;
+    if (!result) {
+      return;
+    }
+  } else {
+    // re-map the in-place result so the host sees the GPU-written values.
+    // Kept BLOCKING: an async map here measured faster but corrupted output
+    // (coherence race) — removing the pair entirely needs a GPU-resident
+    // producer+consumer, not an async flip.
+    blas_cc->command_queue_inst_.enqueueSVMMap(res, dim2_size, true);
   }
 }
 
