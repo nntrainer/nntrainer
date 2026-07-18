@@ -57,6 +57,10 @@ option('enable-blas', type: 'boolean', value: true)
 option('enable-fp16', type: 'boolean', value: false)
 option('enable-cublas', type: 'boolean', value: false)
 option('enable-opencl', type: 'boolean', value: false)
+option('enable-cuda', type: 'boolean', value: false,
+       description: 'Build the additive NVIDIA CUDA GPU backend (NVRTC runtime kernel compilation + cudart + cuBLAS + driver API). Independent of and non-exclusive with enable-opencl; selected at runtime via engine=cuda. Desktop NVIDIA only (not android).')
+option('cuda-path', type: 'string', value: '/usr/local/cuda',
+       description: 'CUDA toolkit root used when enable-cuda is set (expects include/ and lib64/).')
 option('enable-clblast', type: 'boolean', value: true,
        description: 'Link the CLBlast subproject for general-purpose OpenCL BLAS routines. Disable when only the in-tree OpenCL kernels are needed — drops the multi-minute CLBlast compile.')
 option('enable-biqgemm', type: 'boolean', value: false)

@@ -522,6 +522,56 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
   return forwarding(training);
 }
 
+// The exec-engine seam base: one decode/prefill forward step is a plain graph
+// walk. CPU and OpenCL use this base unchanged, so they are byte-identical to
+// the pre-seam code; a backend with its own decode engine overrides it.
+sharedConstTensors Context::runDecode(NeuralNetwork &nn, unsigned int from,
+                                      unsigned int to,
+                                      const sharedConstTensors &input,
+                                      const sharedConstTensors &label) {
+  return nn.incremental_forwarding(from, to, input, label, false);
+}
+
+// Resolve (once, then cache) the context whose runDecode() drives decode. Only
+// a backend with its own decode engine overrides runDecode; every other
+// backend's base runDecode is the same plain walk (incremental_forwarding),
+// which dispatches each layer to the context named by its own engine=
+// property. So the decode seam must drive through "cuda" ONLY when the
+// graph's layers actually run on CUDA: a unified build registers BOTH a
+// "cuda" and a "gpu" context, and a blind "prefer cuda" would capture an
+// engine=gpu run's decode onto CUDA — the KV/hidden-state handoff then
+// crosses backends incoherently. Decide from the authoritative per-layer
+// engine property, NOT from a hardcoded backend order.
+Context *NeuralNetwork::getDecodeContext() {
+  if (decode_ctx_ != nullptr)
+    return decode_ctx_;
+  if (ct_engine == nullptr)
+    return nullptr;
+
+  bool graph_is_cuda = false;
+  for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); ++iter) {
+    if ((*iter)->isComputeEngineCUDA()) {
+      graph_is_cuda = true;
+      break;
+    }
+  }
+
+  // engine=cuda -> the CUDA decode context. engine=gpu/cpu -> the matching
+  // base context, whose runDecode is the per-layer plain walk; NEVER "cuda".
+  const std::vector<const char *> order =
+    graph_is_cuda ? std::vector<const char *>{"cuda", "cpu", "gpu"}
+                  : std::vector<const char *>{"cpu", "gpu"};
+  for (const char *name : order) {
+    try {
+      decode_ctx_ = ct_engine->getRegisteredContext(name);
+      if (decode_ctx_ != nullptr)
+        return decode_ctx_;
+    } catch (...) {
+    }
+  }
+  return decode_ctx_;
+}
+
 sharedConstTensors NeuralNetwork::incremental_forwarding(
   unsigned int from, unsigned int to, bool training,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
@@ -1564,7 +1614,14 @@ sharedConstTensors NeuralNetwork::incremental_inference(
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");
   PROFILE_TIME_START(nn_foward);
 
-  out = incremental_forwarding(from, to, X, label, false);
+  // The exec-engine seam: one decode/prefill forward step is dispatched
+  // through the resolved Context. The base runDecode is a plain walk
+  // (incremental_forwarding) — CPU/OpenCL are byte-identical; a backend with
+  // its own decode engine overrides it.
+  if (Context *dctx = getDecodeContext())
+    out = dctx->runDecode(*this, from, to, X, label);
+  else
+    out = incremental_forwarding(from, to, X, label, false);
 
   PROFILE_TIME_END(nn_foward);
 

@@ -38,6 +38,14 @@
 
 namespace nntrainer {
 
+// Forward decls for the runDecode seam — kept as forward declarations so
+// context.h does NOT pull in the heavy tensor.h / neuralnet.h. The seam's
+// tensor type is sharedConstTensors == std::vector<std::shared_ptr<const
+// Tensor>>, which only needs Tensor to be *declared* (shared_ptr of an
+// incomplete type is fine).
+class NeuralNetwork;
+class Tensor;
+
 // ContextData lives in its own header so that layer_context.h / layer_node.h
 // can pull it in without triggering the context.h → layer_devel.h cycle.
 
@@ -337,6 +345,24 @@ public:
   virtual ml::train::LayerComputeEngine residencyEngine() const {
     return ml::train::LayerComputeEngine::CPU;
   }
+
+  /**
+   * @brief Run ONE decode/prefill forward step for the model — the
+   *        exec-engine seam. The base is a plain graph walk
+   *        (`nn.incremental_forwarding(...)`), so CPU and OpenCL are
+   *        byte-identical; a backend with its own decode engine (e.g. a
+   *        CUDA-graph capture/replay state machine) overrides it.
+   * @note  Appended at the vtable tail (its slot follows every pre-existing
+   *        one) so a rebuilt libnntrainer.so stays ABI-compatible with an
+   *        app/ccapi built against the old vtable.
+   * @note  Return/param type is `sharedConstTensors`
+   *        (std::vector<std::shared_ptr<const Tensor>>); spelled out to keep
+   *        context.h free of tensor.h. Defined out-of-line in neuralnet.cpp.
+   */
+  virtual std::vector<std::shared_ptr<const Tensor>>
+  runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
+            const std::vector<std::shared_ptr<const Tensor>> &input,
+            const std::vector<std::shared_ptr<const Tensor>> &label);
 
 private:
   /**
