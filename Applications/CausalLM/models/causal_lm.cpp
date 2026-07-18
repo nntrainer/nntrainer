@@ -351,12 +351,9 @@ void CausalLM::registerCustomLayers() {
   const auto &ct_engine = nntrainer::Engine::Global();
   const auto app_context =
     static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
-  try {
-    app_context->registerFactory(nntrainer::createLayer<causallm::LmHeadLayer>);
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
-  }
+  // lm_head is a core layer now (nntrainer/layers/llm), registered by
+  // AppContext itself.
+  (void)app_context;
 }
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,

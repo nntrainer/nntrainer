@@ -27,13 +27,12 @@
 #include <node_exporter.h>
 #include <utility>
 
-#include <causallm_common_properties.h>
 #include <common_properties.h>
 #include <connection.h>
 #include <tensor.h>
 #include <tensor_wrap_specs.h>
 
-namespace causallm {
+namespace nntrainer {
 
 namespace props {
 
@@ -147,6 +146,6 @@ private:
   bool skip_prefill = false;
 };
 
-} // namespace causallm
+} // namespace nntrainer
 
 #endif /* __SCALAR_MULTIPLY_LAYER_H__ */

@@ -26,7 +26,7 @@
 #include <layer_devel.h>
 #include <layer_impl.h>
 
-namespace causallm {
+namespace nntrainer {
 
 /**
  * @class   TieWordEmbedding
@@ -171,7 +171,7 @@ private:
                                 unsigned int from, unsigned int to,
                                 bool training);
 };
-} // namespace causallm
+} // namespace nntrainer
 
 #endif /* __cplusplus */
 #endif /* __CUSTOM_TIE_WORD_EMBEDDING_H__ */

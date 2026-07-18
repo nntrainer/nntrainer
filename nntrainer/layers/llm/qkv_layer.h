@@ -26,22 +26,31 @@
 #include <common_properties.h>
 #include <layer_impl.h>
 
-namespace causallm {
+namespace nntrainer {
 
 namespace props {
 
+/**
+ * @brief Number of query projection units (property "q_unit").
+ */
 class QUnit : public nntrainer::PositiveIntegerProperty {
 public:
   static constexpr const char *key = "q_unit";
   using prop_tag = nntrainer::uint_prop_tag;
 };
 
+/**
+ * @brief Number of key projection units (property "k_unit").
+ */
 class KUnit : public nntrainer::PositiveIntegerProperty {
 public:
   static constexpr const char *key = "k_unit";
   using prop_tag = nntrainer::uint_prop_tag;
 };
 
+/**
+ * @brief Number of value projection units (property "v_unit").
+ */
 class VUnit : public nntrainer::PositiveIntegerProperty {
 public:
   static constexpr const char *key = "v_unit";
@@ -147,7 +156,7 @@ private:
   std::array<unsigned int, 3> weight_idx; /**< indices of the weights */
 };
 
-} // namespace causallm
+} // namespace nntrainer
 
 #endif /* __cplusplus */
 #endif /* __QKV_LAYER_H__ */

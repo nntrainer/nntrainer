@@ -1,5 +1,4 @@
 cl_layer_sources = [
-   'swiglu_cl.cpp',
    'reshape_cl.cpp',
    'rmsnorm_layer_cl.cpp',
    'concat_cl.cpp',

@@ -67,6 +67,7 @@ LOCAL_SRC_FILES := \
     ../models/causal_lm.cpp \
     ../models/transformer.cpp \
     ../models/sentence_transformer.cpp \
+    ../models/model_registry.cpp \
     ../kv_cache_manager.cpp \
     ../models/qwen2/qwen2_causallm.cpp \
     ../models/qwen2/qwen2_embedding.cpp \
@@ -83,19 +84,13 @@ LOCAL_SRC_FILES := \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
-    ../layers/scalar_multiply.cpp \
-    ../layers/logit_softcapping.cpp \
     ../layers/mha_core.cpp \
-    ../layers/lm_head.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/custom_multiply.cpp \
     ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_norm.cpp \
-    ../layers/swiglu.cpp \
-    ../layers/tie_word_embedding.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
-    ../layers/qkv_layer.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
@@ -200,19 +195,13 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
-    ../layers/scalar_multiply.cpp \
-    ../layers/logit_softcapping.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/custom_multiply.cpp \
     ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_norm.cpp \
-    ../layers/swiglu.cpp \
-    ../layers/tie_word_embedding.cpp\
-    ../layers/lm_head.cpp\
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
-    ../layers/qkv_layer.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \

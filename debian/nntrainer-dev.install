@@ -108,3 +108,13 @@
 # residency planner headers
 /usr/include/nntrainer/residency_policy.h
 /usr/include/nntrainer/residency_planner.h
+# LLM layer headers (promoted to core)
+/usr/include/nntrainer/layer_prof.h
+/usr/include/nntrainer/lm_head.h
+/usr/include/nntrainer/logit_softcapping.h
+/usr/include/nntrainer/scalar_multiply.h
+/usr/include/nntrainer/scalar_multiply_gpu.h
+/usr/include/nntrainer/tie_word_embedding.h
+/usr/include/nntrainer/qkv_layer.h
+/usr/include/nntrainer/geglu_layer.h
+/usr/include/nntrainer/swiglu_layer.h

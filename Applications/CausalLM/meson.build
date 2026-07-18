@@ -25,14 +25,9 @@ subdir('layers')
 # Add common layers to dependencies
 causallm_layer_dependencies += [
     causallm_rms_norm_dep,
-    causallm_tie_word_embedding_dep,
-    causallm_lm_head_dep,
-    causallm_swiglu_dep,
     causallm_mha_core_dep,
     causallm_embedding_layer_dep,
-    causallm_lm_head_dep,
     causallm_reshaped_rms_norm_dep,
-    causallm_qkv_layer_dep,
     causallm_embedding_pooling_layer_dep,
     causallm_embedding_normalize_layer_dep,
     causallm_causal_conv1d_dep,
@@ -40,8 +35,6 @@ causallm_layer_dependencies += [
     causallm_deberta_attention_layer_dep,
     causallm_shared_fully_connected_layer_dep,
     causallm_per_layer_slice_dep,
-    causallm_scalar_multiply_dep,
-    causallm_logit_softcapping_dep,
 ]
 
 subdir('models')

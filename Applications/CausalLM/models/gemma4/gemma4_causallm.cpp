@@ -798,8 +798,8 @@ void Gemma4Transformer::registerCustomLayers() {
 
   tryRegister(nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   tryRegister(nntrainer::createLayer<causallm::PerLayerSliceLayer>);
-  tryRegister(nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
-  tryRegister(nntrainer::createLayer<causallm::LogitSoftCappingLayer>);
+  // scalar_multiply / logit_softcapping are core layers now
+  // (nntrainer/layers/llm), registered by AppContext itself.
 }
 
 void Gemma4CausalLM::registerCustomLayers() {

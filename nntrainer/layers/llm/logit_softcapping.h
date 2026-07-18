@@ -26,11 +26,10 @@
 #include <node_exporter.h>
 #include <utility>
 
-#include <causallm_common_properties.h>
 #include <common_properties.h>
 #include <tensor.h>
 
-namespace causallm {
+namespace nntrainer {
 
 namespace props {
 
@@ -122,6 +121,6 @@ private:
   bool skip_prefill = false;
 };
 
-} // namespace causallm
+} // namespace nntrainer
 
 #endif /* __LOGIT_SOFTCAPPING_LAYER_H__ */

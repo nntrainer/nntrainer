@@ -15,7 +15,18 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace causallm {
+// NOTE: the CUDA fast paths in this file are gated on NNTR_LLM_CUDA_FAST_PATH
+// (not ENABLE_CUDA directly): they call CUDA kernels that land in the later
+// CUDA-backend changes of this series. Those changes flip the gate back to
+// ENABLE_CUDA; until then an enable-cuda build compiles the host paths only.
+#if defined(NNTR_LLM_CUDA_FAST_PATH)
+#include <cuda_context_manager.h>
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+#endif
+
+namespace nntrainer {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
@@ -69,6 +80,14 @@ void LogitSoftCappingLayer::incremental_forwarding(
 
 void LogitSoftCappingLayer::applyOnRange(nntrainer::RunLayerContext &context,
                                          unsigned int from, unsigned int to) {
+#if defined(NNTR_LLM_CUDA_FAST_PATH)
+  // Terminal drain for the selective-sync (NNTR_CUDA_ASYNC) path: this is the
+  // first host read of the lm_head logits, so the one-per-token GPU pipeline
+  // drains here. A no-op in default mode (every GPU op already drained).
+  // cuda runs only: StreamManager::Global() would CREATE the CUDA context.
+  if (nntrainer::cuda::engine_selected())
+    nntrainer::cuda::StreamManager::Global().finish();
+#endif
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
 
@@ -101,6 +120,36 @@ void LogitSoftCappingLayer::applyOnRange(nntrainer::RunLayerContext &context,
         in.getSharedDataTensor(in_chunk_dim, 0, true);
       nntrainer::Tensor out_chunk =
         out.getSharedDataTensor(out_chunk_dim, 0, true);
+
+#if defined(NNTR_LLM_CUDA_FAST_PATH) && defined(ENABLE_FP16)
+      // Device-only activation pool: the logits are real device memory; the
+      // host Tensor ops below would fault. softcap = cap*tanh(x/cap) in one GPU
+      // kernel (mirrors the OpenCL GPU path). gemma4
+      // final_logit_softcapping=30.
+      if (in_chunk.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+        unsigned short *ip =
+          reinterpret_cast<unsigned short *>(in_chunk.getData<_FP16>());
+        unsigned short *op =
+          reinterpret_cast<unsigned short *>(out_chunk.getData<_FP16>());
+        cudaPointerAttributes pa{};
+        // Accept Managed (UVM) too, not just Device: on integrated GPUs (Jetson
+        // Orin) the activation pool is cudaMallocManaged, so a Device-only gate
+        // sends the softcap to the host loop below -- which, inside a
+        // CUDA-graph capture, reads the not-yet-run lm_head logits (stale) and
+        // is itself not captured -> garbage output. Managed pointers run the
+        // GPU kernel fine.
+        if (nntrainer::cuda::engine_selected() &&
+            cudaPointerGetAttributes(&pa, ip) == cudaSuccess &&
+            (pa.type == cudaMemoryTypeDevice ||
+             pa.type == cudaMemoryTypeManaged) &&
+            nntrainer::cuda::cuda_softcap_fp16(
+              ip, op, (unsigned int)in_chunk.size(), softcap)) {
+          cudaGetLastError();
+          continue;
+        }
+        cudaGetLastError();
+      }
+#endif
       out_chunk.copyData(in_chunk);
 
       in_chunk.multiply(1.0f / softcap, out_chunk);
@@ -122,20 +171,4 @@ void LogitSoftCappingLayer::calcDerivative(
   std::throw_with_nested(std::runtime_error("Training is not supported yet."));
 }
 
-#ifdef PLUGGABLE
-
-nntrainer::Layer *create_logit_softcapping_layer() {
-  auto layer = new LogitSoftCappingLayer();
-  return layer;
-}
-
-void destroy_logit_softcapping_layer(nntrainer::Layer *layer) { delete layer; }
-
-extern "C" {
-nntrainer::LayerPluggable ml_train_layer_pluggable{
-  create_logit_softcapping_layer, destroy_logit_softcapping_layer};
-}
-
-#endif
-
-} // namespace causallm
+} // namespace nntrainer

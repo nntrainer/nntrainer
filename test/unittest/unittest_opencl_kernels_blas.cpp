@@ -18,7 +18,7 @@
 #include "int4_utils.h"
 #include "nntrainer_test_util.h"
 #include "q4_0_utils.h"
-#include "swiglu_cl.h"
+#include "swiglu_cl_op.h"
 #include "tensor_dim.h"
 #include "timer.h"
 #include <blas_kernel_interface.h>
@@ -693,12 +693,10 @@ TEST(blas_kernels, swiglu_layer_fp32_67_3072) {
 
   static constexpr uint32_t run_count = 500;
 
-  SwiGLULayerCl layer;
-
   auto t1_cl = std::chrono::high_resolution_clock::now();
   for (unsigned int i = 0; i < run_count; ++i) {
-    layer.swiglu_cl((float *)gpu_in1, (float *)gpu_in2, (float *)gpu_dst, width,
-                    height, true);
+    nntrainer::swiglu_cl((float *)gpu_in1, (float *)gpu_in2, (float *)gpu_dst,
+                         width, height, true);
   }
   auto t2_cl = std::chrono::high_resolution_clock::now();
 

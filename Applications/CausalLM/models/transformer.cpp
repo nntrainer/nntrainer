@@ -26,7 +26,7 @@
 #include <neuralnet.h>
 #include <qs4cx_tensor.h>
 #include <rms_norm.h>
-#include <swiglu.h>
+#include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
 namespace causallm {
@@ -573,13 +573,12 @@ void Transformer::registerCustomLayers() {
     const auto app_context = static_cast<nntrainer::AppContext *>(
       ct_engine.getRegisteredContext("cpu"));
 
-    app_context->registerFactory(nntrainer::createLayer<causallm::SwiGLULayer>);
+    // swiglu / tie_word_embedding are core layers now (nntrainer/layers/llm),
+    // registered by AppContext itself.
     app_context->registerFactory(
       nntrainer::createLayer<causallm::RMSNormLayer>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::MHACoreLayer>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::TieWordEmbedding>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::EmbeddingLayer>);
   });

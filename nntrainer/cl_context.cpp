@@ -25,13 +25,18 @@
 #include <cstdlib>
 #include <env_compat.h>
 #include <fc_layer_cl.h>
+#include <geglu_cl_op.h>
+#include <geglu_layer.h>
 #include <mutex>
 #include <opencl_command_queue_manager.h>
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
+#include <scalar_multiply_gpu.h>
 #include <string>
-#include <swiglu_cl.h>
+#include <swiglu_cl_op.h>
+#include <swiglu_layer.h>
+#include <tie_word_embedding.h>
 #include <transpose_cl.h>
 
 #include <filesystem>
@@ -231,9 +236,29 @@ void ClContext::add_default_object() {
   registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
                   ml::train::LayerType::LAYER_ADDITION);
 
-  if (SwiGLULayerCl::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<SwiGLULayerCl>, SwiGLULayerCl::type,
+  if (registerSwiGLUClKernels(*this)) {
+    // createLayer("swiglu", {engine=gpu}) routes to the backend-neutral
+    // SwiGLULayer, which dispatches via ClComputeOps::swiglu. (CPU/CUDA use
+    // the same neutral class registered on their contexts.)
+    registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type,
                     ml::train::LayerType::LAYER_SWIGLU);
+  }
+
+  if (registerGeGLUClKernels(*this)) {
+    // No dedicated LayerType enum for GeGLU; register by type string only
+    // (int_key auto-assigned). createLayer("geglu", {engine=gpu}) routes to
+    // the backend-neutral GeGLULayer, which dispatches via
+    // ClComputeOps::geglu.
+    registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+    // scalar_multiply GPU variant: the OpenCL-resident class for the
+    // "scalar_multiply" type on the gpu context (the CPU class stays on the
+    // cpu/cuda contexts).
+    registerFactory(nntrainer::createLayer<ScalarMultiplyLayerGPU>,
+                    ScalarMultiplyLayerGPU::type);
+    // tie_word_embedding: the lm_head (GPU Q6_K/Q4_0 GEMV on the gpu
+    // context, host loop otherwise). Same class on cpu/gpu/cuda.
+    registerFactory(nntrainer::createLayer<TieWordEmbedding>,
+                    TieWordEmbedding::type);
   }
 
   if (ReshapeLayerCl::registerClKernels(*this)) {

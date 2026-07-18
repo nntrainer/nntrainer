@@ -26,7 +26,7 @@
 #include <layer_devel.h>
 #include <layer_impl.h>
 
-namespace causallm {
+namespace nntrainer {
 
 /**
  * @class   LMHead layer
@@ -124,7 +124,7 @@ private:
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
   bool skip_prefill = false;
 };
-} // namespace causallm
+} // namespace nntrainer
 
 #endif
 #endif

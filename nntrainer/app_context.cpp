@@ -56,11 +56,14 @@
 #include <fc_layer.h>
 #include <flatten_layer.h>
 #include <gather_layer.h>
+#include <geglu_layer.h> // LLM layers promoted to core
 #include <gru.h>
 #include <grucell.h>
 #include <identity_layer.h>
 #include <input_layer.h>
 #include <layer_normalization_layer.h>
+#include <lm_head.h>
+#include <logit_softcapping.h>
 #include <lr_scheduler_constant.h>
 #include <lr_scheduler_cosine.h>
 #include <lr_scheduler_exponential.h>
@@ -85,16 +88,20 @@
 #include <preprocess_flip_layer.h>
 #include <preprocess_l2norm_layer.h>
 #include <preprocess_translate_layer.h>
+#include <qkv_layer.h>
 #include <reduce_mean_layer.h>
 #include <reduce_sum_layer.h>
 #include <rnn.h>
 #include <rnncell.h>
+#include <scalar_multiply.h>
 #include <sine_layer.h>
 #include <slice_layer.h>
 #include <split_layer.h>
 #include <sqrt_layer.h>
 #include <subtract_layer.h>
+#include <swiglu_layer.h>
 #include <tangent_layer.h>
+#include <tie_word_embedding.h>
 #include <time_dist.h>
 #include <upsample2d_layer.h>
 #include <weight_layer.h>
@@ -441,6 +448,30 @@ void AppContext::add_default_object() {
 
   registerFactory(nntrainer::createLayer<TimeDistLayer>, TimeDistLayer::type,
                   LayerType::LAYER_TIME_DIST);
+
+  // LLM layers promoted to core: string-keyed (no LayerType enum), like the
+  // GPU geglu/swiglu registered on the backend contexts.
+  registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,
+                  LogitSoftCappingLayer::type);
+  registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
+                  ScalarMultiplyLayer::type);
+  // qkv_layer: pure-host QKV projection (no GPU/OpenCL variant); a reusable
+  // layer (no in-tree model wires it yet, so its registration is
+  // inert/additive).
+  registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
+  // swiglu on cpu: the merged backend-neutral SwiGLULayer (getOps dispatch);
+  // replaces the former app-side SwiGLU layer.
+  registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
+  // geglu on cpu: the backend-neutral GeGLULayer (getOps ->
+  // CpuComputeOps::geglu), needed on cpu so engine=cpu graphs find it.
+  registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+  // lm_head (untied host lm_head FC): host-only; only untied models
+  // construct it.
+  registerFactory(nntrainer::createLayer<LmHeadLayer>, LmHeadLayer::type);
+  // tie_word_embedding: the GPU lm_head GEMV is internally #if ENABLE_OPENCL,
+  // so the layer compiles host-only without OpenCL — register unconditionally.
+  registerFactory(nntrainer::createLayer<TieWordEmbedding>,
+                  TieWordEmbedding::type);
 
   registerFactory(AppContext::unknownFactory<nntrainer::Layer>, "unknown",
                   LayerType::LAYER_UNKNOWN);

@@ -31,7 +31,7 @@
 #include <thread_manager.h>
 #include <util_func.h>
 
-namespace causallm {
+namespace nntrainer {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
@@ -200,4 +200,4 @@ void QKVLayer::updateTensorsByInputDimensions(
   context.updateOutput(QKVParams::K, Koutput_dim);
   context.updateOutput(QKVParams::V, Voutput_dim);
 }
-} // namespace causallm
+} // namespace nntrainer
