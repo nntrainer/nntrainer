@@ -102,6 +102,23 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
 bool cuda_fc_qs4cx_prefetch_weight(const unsigned char *plain_w, unsigned int N,
                                    unsigned int K);
 
+/**
+ * @brief Q6_K lm_head GEMV on the GPU (port of OpenCL kernel_mul_mv_q6_K_f32).
+ *        Reads the FP16 hidden + (managed) Q6_K weight on the device and writes
+ *        FP16 logits to the device output -- no host bounce, so the Q6_K
+ *        lm_head (gemma2/qwen3) works under a device-only activation pool
+ *        (NNTR_CUDA_DEV_ACT) where the host GEMV would fault.
+ * @param w_q6k_dev       Q6_K weight, [vocab, hidden] row-major, device/managed
+ * @param hidden_fp16_dev FP16 hidden (single row), device-resident, len=hidden
+ * @param logits_fp16_dev FP16 logits out, device-resident, len=vocab
+ * @return true on success; false (caller falls back to host) if hidden%256!=0
+ *         or the kernel could not be dispatched.
+ */
+bool lmhead_gemv_q6_k_cuda(const void *w_q6k_dev,
+                           const unsigned short *hidden_fp16_dev,
+                           unsigned short *logits_fp16_dev, int vocab,
+                           int hidden);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_FC_QINT4_H__

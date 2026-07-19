@@ -34,11 +34,7 @@
 #include <cstring>
 #include <vector>
 
-// NOTE: the CUDA fast paths in this file are gated on NNTR_LLM_CUDA_FAST_PATH
-// (not ENABLE_CUDA directly): they call CUDA kernels that land in the later
-// CUDA-backend changes of this series. Those changes flip the gate back to
-// ENABLE_CUDA; until then an enable-cuda build compiles the host paths only.
-#if defined(NNTR_LLM_CUDA_FAST_PATH)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
 #include <cuda_fc_qint4.h>
 #include <cuda_runtime.h>
@@ -291,7 +287,7 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
     int iter = to - from;
 
-#if defined(NNTR_LLM_CUDA_FAST_PATH) && defined(ENABLE_FP16)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     // Device-only activation pool (NNTR_CUDA_DEV_ACT): the output is real
     // device memory (cudaMalloc), NOT host-addressable. The host dequant below
     // cannot store into it directly (segfault). Dequant into a host staging
@@ -370,7 +366,7 @@ void TieWordEmbedding::incremental_forwarding_embedding(
         if (out_tensor.getDataType() == nntrainer::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
           _FP16 *o =
-#if defined(NNTR_LLM_CUDA_FAST_PATH)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
             emb_dev_only ? (emb_stage + (size_t)i * out_dim) :
 #endif
                          out_tensor.getData<_FP16>();
@@ -395,7 +391,7 @@ void TieWordEmbedding::incremental_forwarding_embedding(
 #ifdef ENABLE_FP16
         const float *src = cur_weight.getData<float>();
         _FP16 *o =
-#if defined(NNTR_LLM_CUDA_FAST_PATH)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
           emb_dev_only ? (emb_stage + (size_t)i * out_dim) :
 #endif
                        out_tensor.getData<_FP16>();
@@ -412,7 +408,7 @@ void TieWordEmbedding::incremental_forwarding_embedding(
       }
     });
 
-#if defined(NNTR_LLM_CUDA_FAST_PATH) && defined(ENABLE_FP16)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
     // push the host-dequantized embedding rows into the device-only output on
     // the backend stream (ordered before the first GPU layer consumes them).
     if (emb_dev_only) {
@@ -714,7 +710,7 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
 
       const uint8_t *weight_data = weight.getData<uint8_t>();
 
-#if defined(NNTR_LLM_CUDA_FAST_PATH)
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
       // engine=cuda GPU Q6_K lm_head: reads the device FP16 hidden + (managed)
       // Q6_K weight directly and writes FP16 logits to the device output -- no
       // host bounce, so it works with a device-only activation pool
