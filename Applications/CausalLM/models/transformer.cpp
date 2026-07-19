@@ -359,6 +359,18 @@ void Transformer::repack_weight() {
       "Transformer model is not initialized. Please call "
       "initialize() before repack_weight().");
   }
+
+  // The QS4CX weight repack (KAI rhs-pack) is only consumed by the ARM CPU
+  // (KAI) inference path; the "gpu" (OpenCL) and "cuda" engines consume the
+  // plain QS4CX blob directly. On a non-CPU run the whole loop is redundant
+  // single-threaded CPU work -- on a large model it can pin one core to a
+  // thermal shutdown -- so skip it unless the engine is CPU.
+  if (causallm_engine() != "cpu") {
+    ml_logd("repack_weight: skipped on %s engine (consumes plain QS4CX blob)",
+            causallm_engine().c_str());
+    return;
+  }
+
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
       auto weights = context.getWeights();

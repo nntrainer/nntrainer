@@ -14,6 +14,7 @@
 #ifndef __LLM_UTIL_HPP__
 #define __LLM_UTIL_HPP__ __LLM_UTIL_HPP__
 
+#include <cstdlib>
 #include <optional>
 
 #include <base_properties.h>
@@ -110,5 +111,37 @@ void applyBadWordsPenalty(float *logits, unsigned int *bad_words_ids,
  */
 unsigned int applyTKP(const float *logits, int len, float temperature,
                       unsigned int top_k, float top_p, std::mt19937 &rng);
+
+/**
+ * @brief Compute engine for CausalLM model layers.
+ * @return "gpu" by default (the v8c OpenCL inference path), or "cpu" when the
+ *         NNTR_ENGINE=cpu env var is set. engine=cpu runs the model on the
+ *         standard CPU layers + CpuComputeOps (e.g. Q4_0-FP32 host inference /
+ *         CPU-only deployment), instead of the engine=gpu Cl layers whose
+ *         ClComputeOps throws NI for plain CPU BLAS ops. An absent engine prop
+ *         already defaults to CPU in LayerNode; this keeps the explicit GPU
+ *         default for backward compatibility while making CPU one env away.
+ */
+[[maybe_unused]] static std::string causallm_engine() {
+  static const std::string eng = []() -> std::string {
+    const char *e = std::getenv("NNTR_ENGINE");
+    if (e != nullptr) {
+      const std::string s(e);
+      if (s == "cpu")
+        return "cpu";
+      if (s == "cuda") // additive NVIDIA CUDA backend (engine=cuda)
+        return "cuda";
+    }
+#if defined(ENABLE_OPENCL)
+    return "gpu";
+#else
+    // No OpenCL "gpu" Context is registered in this build (e.g. the FP32 CPU
+    // reference / unittest build), so default to cpu instead of throwing
+    // "[Engine] gpu Context is not registered" at model build. [T12]
+    return "cpu";
+#endif
+  }();
+  return eng;
+}
 
 #endif // __LLM_UTIL_HPP__
