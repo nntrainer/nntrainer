@@ -969,6 +969,104 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
   return true;
 }
 
+// [i8-jit] Optional transient JIT int8 weight unpack (NNTR_CUDA_I8_JIT): unpack
+// the resident dp4a packed-int4 weight to int8 on the GPU per-prefill into a
+// reusable scratch, instead of keeping a persistent per-weight int8 cache --
+// trades a small per-call unpack cost for the cache's VRAM. Opt-in, default
+// off.
+static inline bool i8_jit_on() {
+  static const bool v = []() {
+    const char *e = std::getenv("NNTR_CUDA_I8_JIT");
+    return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
+
+// Tiled transpose-unpack: dp4a packed [N, Kh] (byte = plain^0x88, nibbles =
+// two's-complement signed 4-bit) -> int8 [K, N]. Reads coalesced along Kh,
+// writes coalesced along N via the shared tile.
+static const char *I8_JIT_SRC = R"CU(
+extern "C" __global__ void i8_jit_unpack(const signed char *q4,
+                                         signed char *w8, int N, int K,
+                                         int Kh) {
+  __shared__ signed char t[32][65];
+  int nn0 = blockIdx.y * 32, kh0 = blockIdx.x * 32;
+  int nn = nn0 + threadIdx.y, kh = kh0 + threadIdx.x;
+  if (nn < N && kh < Kh) {
+    unsigned char b = (unsigned char)q4[(long long)nn * Kh + kh];
+    t[threadIdx.y][2 * threadIdx.x] =
+      (signed char)((((b & 0xF) ^ 8) & 0xF) - 8);
+    t[threadIdx.y][2 * threadIdx.x + 1] =
+      (signed char)(((((b >> 4) & 0xF) ^ 8) & 0xF) - 8);
+  }
+  __syncthreads();
+  int k0 = kh0 * 2, wn = nn0 + threadIdx.x;
+  for (int kk = threadIdx.y; kk < 64; kk += 32) {
+    int k = k0 + kk;
+    if (k < K && wn < N)
+      w8[(long long)k * N + wn] = t[threadIdx.x][kk];
+  }
+}
+
+// Vectorized variant (K%8==0 && N%4==0 -- every FC shape this path accepts):
+// 64n x 64k tile, 256 threads; uint (4-byte) global loads along Kh and int
+// (4-byte) coalesced global stores along N -- runs the ~1.8GB/prefill unpack
+// traffic at near-memcpy bandwidth instead of byte-granular transactions.
+extern "C" __global__ void i8_jit_unpack_v4(const unsigned char *q4,
+                                            signed char *w8, int N, int K,
+                                            int Kh) {
+  __shared__ signed char t[64][68]; // [k_local][n_local], row stride 68 (4B)
+  const int nn0 = blockIdx.y * 64;
+  const int kh0 = blockIdx.x * 32; // bytes of Kh covered by this tile
+  const int tid = threadIdx.x;     // 256 threads
+  for (int rep = 0; rep < 2; ++rep) {
+    int idx = tid + rep * 256;
+    int nn = idx >> 3;   // 0..63
+    int kb4 = idx & 7;   // which 4-byte group in the 32-byte span
+    int n = nn0 + nn;
+    int khb = kh0 + kb4 * 4;
+    if (n < N && khb + 3 < Kh) {
+      unsigned int v = *reinterpret_cast<const unsigned int *>(
+        q4 + (long long)n * Kh + khb);
+      int kl = kb4 * 8;
+      for (int j = 0; j < 4; ++j) {
+        unsigned int b = (v >> (8 * j)) & 0xFFu;
+        t[kl + 2 * j][nn] = (signed char)((((b & 0xF) ^ 8) & 0xF) - 8);
+        t[kl + 2 * j + 1][nn] =
+          (signed char)(((((b >> 4) & 0xF) ^ 8) & 0xF) - 8);
+      }
+    } else if (n < N) { // Kh tail (unused when K%8==0, kept for safety)
+      for (int j = 0; j < 4; ++j) {
+        int kb = khb + j;
+        if (kb < Kh) {
+          unsigned char b = q4[(long long)n * Kh + kb];
+          int kl = kb4 * 8 + 2 * j;
+          t[kl][nn] = (signed char)((((b & 0xF) ^ 8) & 0xF) - 8);
+          t[kl + 1][nn] = (signed char)(((((b >> 4) & 0xF) ^ 8) & 0xF) - 8);
+        }
+      }
+    }
+  }
+  __syncthreads();
+  const int k0 = kh0 * 2;
+  for (int rep = 0; rep < 4; ++rep) {
+    int idx = tid + rep * 256;
+    int kl = idx >> 4; // 0..63
+    int ni = idx & 15; // 16 ints cover 64 n
+    int k = k0 + kl;
+    int n = nn0 + ni * 4;
+    if (k < K && n + 3 < N) {
+      int val = *reinterpret_cast<const int *>(&t[kl][ni * 4]);
+      *reinterpret_cast<int *>(w8 + (long long)k * N + n) = val;
+    } else if (k < K) {
+      for (int j = 0; j < 4; ++j)
+        if (n + j < N)
+          w8[(long long)k * N + n + j] = t[kl][ni * 4 + j];
+    }
+  }
+}
+)CU";
+
 // w4a8 on the INT8 Tensor Cores via cuBLAS (prefill FC). Same quant scheme as
 // the dp4a path -- per-row asym int8 activation + symmetric int4 weight -- but
 // the int8xint8->int32 GEMM runs on IMMA Tensor Cores instead of __dp4a on the
@@ -1038,14 +1136,43 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
   // the persistent per-weight cache (one-time unpack).
   signed char *w8src = nullptr;
   int *rowsum = nullptr;
-  // int8 weight [K,N] + per-channel rowsum from the persistent per-weight
-  // cache (one-time unpack; weights are static). The transient JIT-unpack
-  // variant (NNTR_CUDA_I8_JIT) is a later change.
-  DevWeightI8 *dw8 = ensure_i8_cache_locked(plain_w, N, K);
-  if (!dw8)
-    return false;
-  w8src = dw8->w8;
-  rowsum = dw8->rowsum;
+  if (i8_jit_on()) {
+    DevWeightQ *dw4 = ensure_dp4a_cache_locked(plain_w, N, K);
+    if (!dw4)
+      return false;
+    static signed char *jit_w8 = nullptr;
+    static size_t jit_cap = 0;
+    if (!ensure_buf((void **)&jit_w8, &jit_cap, (size_t)K * N))
+      return false;
+    // Vectorized transpose for 8|K && 4|N (every eligible FC); byte-granular
+    // fallback otherwise.
+    const bool vec_ok = ((K & 7u) == 0u) && ((N & 3u) == 0u);
+    auto ku = CudaContext::Global().registerCudaKernel(
+      I8_JIT_SRC, vec_ok ? "i8_jit_unpack_v4" : "i8_jit_unpack");
+    if (!ku)
+      return false;
+    const int khi = (int)((K + 1u) / 2u);
+    ku->SetKernelArguments(0, &dw4->plain, sizeof(dw4->plain));
+    ku->SetKernelArguments(1, &jit_w8, sizeof(jit_w8));
+    ku->SetKernelArguments(2, &n, sizeof(n));
+    ku->SetKernelArguments(3, &k, sizeof(k));
+    ku->SetKernelArguments(4, &khi, sizeof(khi));
+    const int ub[3] = {vec_ok ? 256 : 32, vec_ok ? 1 : 32, 1};
+    const int ug[3] = {(khi + 31) / 32,
+                       vec_ok ? ((int)N + 63) / 64 : ((int)N + 31) / 32, 1};
+    if (!StreamManager::Global().DispatchCommand(*ku, ug, ub))
+      return false;
+    w8src = jit_w8;
+    rowsum = dw4->rowsum;
+  } else {
+    // int8 weight [K,N] + per-channel rowsum from the persistent per-weight
+    // cache (one-time unpack; weights are static).
+    DevWeightI8 *dw8 = ensure_i8_cache_locked(plain_w, N, K);
+    if (!dw8)
+      return false;
+    w8src = dw8->w8;
+    rowsum = dw8->rowsum;
+  }
 
   // 3) int32 GEMM output scratch [Mpad,N] (+tail pad: IMMA can write/read C in
   // wide vectorized tiles past the last element on large shapes).
