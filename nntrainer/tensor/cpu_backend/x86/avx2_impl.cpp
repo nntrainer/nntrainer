@@ -773,6 +773,8 @@ void gelu_v2(const unsigned int N, const float *X, float *Y) {
 void ele_mul(const unsigned int N, const float *X, const float *Y, float *Z,
              float alpha, float beta, unsigned int i_stride,
              unsigned int o_stride) {
+  if (N == 0)
+    return; // the i_stride == 0 broadcast paths read Y[0] unconditionally
   if (alpha == 1.0f && beta == 0.0f && o_stride == 1) {
     unsigned int N8 = (N & ~(7));
     if (i_stride == 0) {
@@ -804,12 +806,53 @@ void ele_mul(const unsigned int N, const float *X, const float *Y, float *Z,
       Z++;
     }
   } else {
-    // TODO: AVX2 implementation if used
-    for (unsigned int i = 0; i < N; ++i) {
-      *Z = *X * alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
-      X += o_stride;
-      Y += i_stride;
-      Z += o_stride;
+    if (o_stride == 1 && (i_stride == 0 || i_stride == 1)) {
+      unsigned int N8 = (N & ~(7));
+      auto alpha_v = _mm256_set1_ps(alpha);
+      auto beta_v = _mm256_set1_ps(beta);
+
+      if (i_stride == 0) {
+        auto y = _mm256_set1_ps(Y[0]);
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto z = _mm256_mul_ps(_mm256_mul_ps(x, alpha_v), y);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Z += 8;
+        }
+      } else {
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto y = _mm256_loadu_ps(Y);
+          auto z = _mm256_mul_ps(_mm256_mul_ps(x, alpha_v), y);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Y += 8;
+          Z += 8;
+        }
+      }
+
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X * alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X * alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X += o_stride;
+        Y += i_stride;
+        Z += o_stride;
+      }
     }
   }
 }
@@ -817,6 +860,8 @@ void ele_mul(const unsigned int N, const float *X, const float *Y, float *Z,
 void ele_add(const unsigned int N, const float *X, const float *Y, float *Z,
              float alpha, float beta, unsigned int i_stride,
              unsigned int o_stride) {
+  if (N == 0)
+    return; // the i_stride == 0 broadcast paths read Y[0] unconditionally
   if (alpha == 1.0f && beta == 0.0f && o_stride == 1) {
     unsigned int N8 = (N & ~(7));
     if (i_stride == 0) {
@@ -848,12 +893,249 @@ void ele_add(const unsigned int N, const float *X, const float *Y, float *Z,
       Z++;
     }
   } else {
-    // TODO: AVX2 implementation if used
-    for (unsigned int i = 0; i < N; ++i) {
-      *Z = *X + alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
-      X += o_stride;
-      Y += i_stride;
-      Z += o_stride;
+    if (o_stride == 1 && (i_stride == 0 || i_stride == 1)) {
+      unsigned int N8 = (N & ~(7));
+      auto alpha_v = _mm256_set1_ps(alpha);
+      auto beta_v = _mm256_set1_ps(beta);
+
+      if (i_stride == 0) {
+        auto y = _mm256_set1_ps(Y[0]);
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto z = _mm256_fmadd_ps(alpha_v, y, x);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Z += 8;
+        }
+      } else {
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto y = _mm256_loadu_ps(Y);
+          auto z = _mm256_fmadd_ps(alpha_v, y, x);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Y += 8;
+          Z += 8;
+        }
+      }
+
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X + alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X + alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X += o_stride;
+        Y += i_stride;
+        Z += o_stride;
+      }
+    }
+  }
+}
+
+void ele_sub(const unsigned int N, const float *X, const float *Y, float *Z,
+             float alpha, float beta, unsigned int i_stride,
+             unsigned int o_stride) {
+  if (N == 0)
+    return; // the i_stride == 0 broadcast paths read Y[0] unconditionally
+  if (alpha == 1.0f && beta == 0.0f && o_stride == 1) {
+    unsigned int N8 = (N & ~(7));
+    if (i_stride == 0) {
+      auto y = _mm256_set1_ps(Y[0]);
+      for (unsigned int i = 0; i < N8; i += 8) {
+        auto x = _mm256_loadu_ps(X);
+        auto z = _mm256_sub_ps(x, y);
+        _mm256_storeu_ps(Z, z);
+        X += 8;
+        Z += 8;
+      }
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X - Y[0];
+        X++;
+        Z++;
+      }
+    } else if (i_stride == 1) {
+      for (unsigned int i = 0; i < N8; i += 8) {
+        auto x = _mm256_loadu_ps(X);
+        auto y = _mm256_loadu_ps(Y);
+        auto z = _mm256_sub_ps(x, y);
+        _mm256_storeu_ps(Z, z);
+        X += 8;
+        Y += 8;
+        Z += 8;
+      }
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X - *Y;
+        X++;
+        Y++;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X - *Y;
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    }
+  } else {
+    if (o_stride == 1 && (i_stride == 0 || i_stride == 1)) {
+      unsigned int N8 = (N & ~(7));
+      auto alpha_v = _mm256_set1_ps(alpha);
+      auto beta_v = _mm256_set1_ps(beta);
+
+      if (i_stride == 0) {
+        auto y = _mm256_set1_ps(Y[0]);
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto z = _mm256_fnmadd_ps(alpha_v, y, x);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Z += 8;
+        }
+      } else {
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto y = _mm256_loadu_ps(Y);
+          auto z = _mm256_fnmadd_ps(alpha_v, y, x);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Y += 8;
+          Z += 8;
+        }
+      }
+
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X - alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X - alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X += o_stride;
+        Y += i_stride;
+        Z += o_stride;
+      }
+    }
+  }
+}
+
+void ele_div(const unsigned int N, const float *X, const float *Y, float *Z,
+             float alpha, float beta, unsigned int i_stride,
+             unsigned int o_stride) {
+  if (N == 0)
+    return; // the i_stride == 0 broadcast paths read Y[0] unconditionally
+  if (alpha == 1.0f && beta == 0.0f && o_stride == 1) {
+    unsigned int N8 = (N & ~(7));
+    if (i_stride == 0) {
+      auto y = _mm256_set1_ps(Y[0]);
+      for (unsigned int i = 0; i < N8; i += 8) {
+        auto x = _mm256_loadu_ps(X);
+        auto z = _mm256_div_ps(x, y);
+        _mm256_storeu_ps(Z, z);
+        X += 8;
+        Z += 8;
+      }
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X / Y[0];
+        X++;
+        Z++;
+      }
+    } else if (i_stride == 1) {
+      for (unsigned int i = 0; i < N8; i += 8) {
+        auto x = _mm256_loadu_ps(X);
+        auto y = _mm256_loadu_ps(Y);
+        auto z = _mm256_div_ps(x, y);
+        _mm256_storeu_ps(Z, z);
+        X += 8;
+        Y += 8;
+        Z += 8;
+      }
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X / *Y;
+        X++;
+        Y++;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X / *Y;
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    }
+  } else {
+    if (o_stride == 1 && (i_stride == 0 || i_stride == 1)) {
+      unsigned int N8 = (N & ~(7));
+      auto alpha_v = _mm256_set1_ps(alpha);
+      auto beta_v = _mm256_set1_ps(beta);
+
+      if (i_stride == 0) {
+        auto y = _mm256_set1_ps(Y[0]);
+        auto denom = _mm256_mul_ps(alpha_v, y);
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto z = _mm256_div_ps(x, denom);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Z += 8;
+        }
+      } else {
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto y = _mm256_loadu_ps(Y);
+          auto denom = _mm256_mul_ps(alpha_v, y);
+          auto z = _mm256_div_ps(x, denom);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Y += 8;
+          Z += 8;
+        }
+      }
+
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X / (alpha * *Y) + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X / (alpha * *Y) + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X += o_stride;
+        Y += i_stride;
+        Z += o_stride;
+      }
     }
   }
 }

@@ -797,7 +797,7 @@ static void run_ele_mul_test(const unsigned int N, float alpha, float beta,
       }
     }
 
-    auto mean_squared_error = compute_mse(1, N, Z_ref, Z, false);
+    auto mean_squared_error = compute_mse(1, N * o_stride, Z_ref, Z, false);
     ASSERT_LE(mean_squared_error, 0.00001f);
   }
 
@@ -835,6 +835,18 @@ TEST(nntrainer_cpu_backend_standalone, ele_mul_3072_istr_16_ostr_16) {
   const unsigned int i_stride = 16;
   const unsigned int o_stride = 16;
   run_ele_mul_test(N, alpha, beta, i_stride, o_stride);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_mul_3072_alpha3_beta2_istr_0) {
+  run_ele_mul_test(3072, 3.f, 2.f, 0, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_mul_3072_alpha3_beta2_istr_1) {
+  run_ele_mul_test(3072, 3.f, 2.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_mul_3079_alpha3_beta2_tail) {
+  run_ele_mul_test(3079, 3.f, 2.f, 1, 1);
 }
 
 /**
@@ -879,7 +891,7 @@ static void run_ele_add_test(const unsigned int N, float alpha, float beta,
         add_time += dt;
       }
     }
-    auto mean_squared_error = compute_mse(1, N, Z_ref, Z, false);
+    auto mean_squared_error = compute_mse(1, N * o_stride, Z_ref, Z, false);
     ASSERT_LE(mean_squared_error, 0.00001f);
   }
   if (print) {
@@ -916,6 +928,18 @@ TEST(nntrainer_cpu_backend_standalone, ele_add_3072_istr_16_ostrid_16) {
   const unsigned int i_stride = 16;
   const unsigned int o_stride = 16;
   run_ele_add_test(N, alpha, beta, i_stride, o_stride);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_add_3072_alpha3_beta2_istr_0) {
+  run_ele_add_test(3072, 3.f, 2.f, 0, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_add_3072_alpha3_beta2_istr_1) {
+  run_ele_add_test(3072, 3.f, 2.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_add_3079_alpha3_beta2_tail) {
+  run_ele_add_test(3079, 3.f, 2.f, 1, 1);
 }
 
 TEST(nntrainer_cpu_backend_standalone, softmax_row_inplace) {
@@ -1892,6 +1916,118 @@ TEST(nntrainer_cpu_backend_standalone, gelu_v2_3072) {
 
 TEST(nntrainer_cpu_backend_standalone, gelu_v2_3075_remainder) {
   run_gelu_v2_test(3075, 1.2e-4f);
+}
+
+// ============================================================================
+// P1: AVX2 replacement tests for formerly-fallback FP32 functions
+// ============================================================================
+
+static void run_ele_sub_test(const unsigned int N, float alpha, float beta,
+                             unsigned int i_stride, unsigned int o_stride) {
+  const int TEST_CNT = 20;
+  for (int i = 0; i < TEST_CNT; i++) {
+    std::vector<float> X =
+      generate_random_vector<float, false>((size_t)N * o_stride);
+    std::vector<float> Y = generate_random_vector<float, false>(
+      std::max<size_t>(1, (size_t)N * i_stride));
+    std::vector<float> Z =
+      generate_random_vector<float, false>((size_t)N * o_stride);
+    std::vector<float> Z_ref = Z;
+
+    nntrainer::__fallback_ele_sub(N, X.data(), Y.data(), Z_ref.data(), alpha,
+                                  beta, i_stride, o_stride);
+    nntrainer::ele_sub(N, X.data(), Y.data(), Z.data(), alpha, beta, i_stride,
+                       o_stride);
+
+    auto mean_squared_error = compute_mse(1, N * o_stride, Z_ref, Z, false);
+    ASSERT_LE(mean_squared_error, 0.00001f);
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3072_istr_0) {
+  run_ele_sub_test(3072, 1.f, 0.f, 0, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3072_istr_1) {
+  run_ele_sub_test(3072, 1.f, 0.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3072_istr_16_ostrid_16) {
+  run_ele_sub_test(3072, 3.f, 2.f, 16, 16);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3072_alpha1_beta0_istr_2) {
+  run_ele_sub_test(3072, 1.f, 0.f, 2, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3072_alpha3_beta2_istr_0) {
+  run_ele_sub_test(3072, 3.f, 2.f, 0, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3072_alpha3_beta2_istr_1) {
+  run_ele_sub_test(3072, 3.f, 2.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3079_tail) {
+  run_ele_sub_test(3079, 1.f, 0.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3079_alpha3_beta2_tail) {
+  run_ele_sub_test(3079, 3.f, 2.f, 1, 1);
+}
+
+static void run_ele_div_test(const unsigned int N, float alpha, float beta,
+                             unsigned int i_stride, unsigned int o_stride) {
+  const int TEST_CNT = 20;
+  for (int i = 0; i < TEST_CNT; i++) {
+    std::vector<float> X =
+      generate_random_vector<float, false>((size_t)N * o_stride);
+    std::vector<float> Y = generate_random_vector<float, false>(
+      std::max<size_t>(1, (size_t)N * i_stride), 0.1f, 1.0f);
+    std::vector<float> Z =
+      generate_random_vector<float, false>((size_t)N * o_stride);
+    std::vector<float> Z_ref = Z;
+
+    nntrainer::__fallback_ele_div(N, X.data(), Y.data(), Z_ref.data(), alpha,
+                                  beta, i_stride, o_stride);
+    nntrainer::ele_div(N, X.data(), Y.data(), Z.data(), alpha, beta, i_stride,
+                       o_stride);
+
+    auto mean_squared_error = compute_mse(1, N * o_stride, Z_ref, Z, false);
+    ASSERT_LE(mean_squared_error, 0.00001f);
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3072_istr_0) {
+  run_ele_div_test(3072, 1.f, 0.f, 0, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3072_istr_1) {
+  run_ele_div_test(3072, 1.f, 0.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3072_istr_16_ostrid_16) {
+  run_ele_div_test(3072, 3.f, 2.f, 16, 16);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3072_alpha1_beta0_istr_2) {
+  run_ele_div_test(3072, 1.f, 0.f, 2, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3072_alpha3_beta2_istr_0) {
+  run_ele_div_test(3072, 3.f, 2.f, 0, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3072_alpha3_beta2_istr_1) {
+  run_ele_div_test(3072, 3.f, 2.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3079_tail) {
+  run_ele_div_test(3079, 1.f, 0.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3079_alpha3_beta2_tail) {
+  run_ele_div_test(3079, 3.f, 2.f, 1, 1);
 }
 
 int main(int argc, char **argv) {

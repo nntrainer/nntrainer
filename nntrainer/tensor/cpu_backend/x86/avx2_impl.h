@@ -173,8 +173,39 @@ void ele_mul(const unsigned int N, const float *X, const float *Y, float *Z,
  * @param[in] o_stride output stride
  */
 void ele_add(const unsigned int N, const float *X, const float *Y, float *Z,
-             float alpha, float beta, unsigned int i_stride,
-             unsigned int o_stride);
+             float alpha = 1.f, float beta = 0.f, unsigned int i_stride = 1,
+             unsigned int o_stride = 1);
+
+/**
+ * @brief     elementwise vector subtraction : Z = X - alpha * Y + beta * Z
+ * @param[in] N  length of the vector
+ * @param[in] X float * for Vector X
+ * @param[in] Y float * for Vector Y
+ * @param[in] Z float * for Vector Z
+ * @param[in] alpha scalar multiplier for input
+ * @param[in] beta scalar multiplier for output
+ * @param[in] i_stride input stride
+ * @param[in] o_stride output stride
+ */
+void ele_sub(const unsigned int N, const float *X, const float *Y, float *Z,
+             float alpha = 1.f, float beta = 0.f, unsigned int i_stride = 1,
+             unsigned int o_stride = 1);
+
+/**
+ * @brief     elementwise vector division : Z = X / (alpha * Y) + beta * Z
+ * @note ZeroDivisionError is not guaranteed in this function
+ * @param[in] N  length of the vector
+ * @param[in] X float * for Vector X
+ * @param[in] Y float * for Vector Y
+ * @param[in] Z float * for Vector Z
+ * @param[in] alpha scalar multiplier for input
+ * @param[in] beta scalar multiplier for output
+ * @param[in] i_stride input stride
+ * @param[in] o_stride output stride
+ */
+void ele_div(const unsigned int N, const float *X, const float *Y, float *Z,
+             float alpha = 1.f, float beta = 0.f, unsigned int i_stride = 1,
+             unsigned int o_stride = 1);
 
 /**
  * @brief Multihead softmax, exp(x_i) / sum(exp(x_i)), inplace version
