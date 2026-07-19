@@ -1095,4 +1095,38 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
   }
   return true;
 }
+// [wprefetch] Migrate a QS4CX weight's managed plain payload (+ fp32 scale
+// tail) to the device with cudaMemPrefetchAsync, so the FC bytes leave host
+// RSS and the GEMM reads them from VRAM. Discrete only (managed pages migrate).
+bool cuda_fc_qs4cx_prefetch_weight(const unsigned char *plain_w, unsigned int N,
+                                   unsigned int K) {
+  if (plain_w == nullptr || N == 0 || K == 0)
+    return false;
+  if (ContextManager::Global().isIntegrated())
+    return false;
+  cudaPointerAttributes attr{};
+  if (cudaPointerGetAttributes(&attr, plain_w) != cudaSuccess ||
+      attr.type != cudaMemoryTypeManaged) {
+    cudaGetLastError();
+    return false;
+  }
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  const size_t bytes = (size_t)N * ((K + 1u) / 2u) + (size_t)N * sizeof(float);
+  // CUDA 13 signature (cudaMemLocation + flags).
+  cudaMemLocation loc{};
+  loc.type = cudaMemLocationTypeDevice;
+  loc.id = dev;
+  if (cudaMemPrefetchAsync(plain_w, bytes, loc, /** flags */ 0,
+                           StreamManager::Global().GetStream()) !=
+      cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  return true;
+}
+
 } // namespace nntrainer::cuda

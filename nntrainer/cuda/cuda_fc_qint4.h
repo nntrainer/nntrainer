@@ -91,6 +91,17 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
                                        unsigned short *Yh, unsigned int M,
                                        unsigned int N, unsigned int K);
 
+/**
+ * @brief [wprefetch] Migrate a QS4CX weight's managed plain payload (+ its
+ *        fp32 scale tail) to the device with cudaMemPrefetchAsync, so the FC
+ *        bytes leave host RSS and the GEMM reads them from VRAM. Discrete GPU
+ *        only (a no-op / false on integrated, where managed pages don't
+ *        migrate). @p plain_w must be a managed (UVM) pointer.
+ * @return true if the prefetch was issued.
+ */
+bool cuda_fc_qs4cx_prefetch_weight(const unsigned char *plain_w, unsigned int N,
+                                   unsigned int K);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_FC_QINT4_H__
