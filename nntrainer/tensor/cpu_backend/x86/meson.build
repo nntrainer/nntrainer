@@ -1,3 +1,6 @@
+# avx2_internal.h is intentionally NOT listed here: it holds TU-internal SIMD
+# primitives shared between avx2_impl.cpp and the FP16 kernels and must not be
+# installed with nntrainer_headers.
 simd_interface_x86_headers = [
   'x86_compute_backend.h',
   'avx2_impl.h',

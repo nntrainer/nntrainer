@@ -446,6 +446,9 @@ TEST(nntrainer_cpu_backend_standalone, q4_0_repack_unpack_dequantize) {
   }
 }
 
+/**
+ * @brief test for gemm_q4_0
+ */
 float test_gemm_q4_0(const uint32_t M, const uint32_t K, const uint32_t N,
                      const float *weights, const float *activations,
                      std::vector<float> &ref_dst, bool print = false) {
@@ -492,6 +495,9 @@ float test_gemm_q4_0(const uint32_t M, const uint32_t K, const uint32_t N,
   return mean_squared_error;
 }
 
+/**
+ * @brief test for gemm_q4_K
+ */
 float test_gemm_q4_K(const uint32_t M, const uint32_t K, const uint32_t N,
                      const float *weights, const float *activations,
                      std::vector<float> &ref_dst, bool print = false) {
@@ -535,6 +541,9 @@ float test_gemm_q4_K(const uint32_t M, const uint32_t K, const uint32_t N,
   return mean_squared_error;
 }
 
+/**
+ * @brief test for gemm_q6_K
+ */
 float test_gemm_q6_K(const uint32_t M, const uint32_t K, const uint32_t N,
                      const float *weights, const float *activations,
                      std::vector<float> &ref_dst, bool print = false) {
@@ -572,6 +581,9 @@ float test_gemm_q6_K(const uint32_t M, const uint32_t K, const uint32_t N,
   return mean_squared_error;
 }
 
+/**
+ * @brief run quantization tests
+ */
 static void run_quant_test(const uint32_t M, const uint32_t K, const uint32_t N,
                            float &q4_0_mse, float &q4_k_mse, float &q6_k_mse,
                            bool print = false) {
@@ -668,6 +680,9 @@ TEST(nntrainer_cpu_backend_standalone, quant_GEMV_1x512x512) {
   ASSERT_LE(q6_k_mse, q4_k_mse);
 }
 
+/**
+ * @brief run vec dot tests
+ */
 static void run_vec_dot_test(const uint32_t K, bool print = false) {
   const int TEST_CNT = 20;
   nanoseconds ref_time = (nanoseconds)0;
@@ -738,6 +753,9 @@ TEST(nntrainer_cpu_backend_standalone, quant_q_6_K_DOT_10240) {
   run_vec_dot_test(K);
 }
 
+/**
+ * @brief run elementwise multiplication test (Z = X ⊙ alpha * Y + beta * Z)
+ */
 static void run_ele_mul_test(const unsigned int N, float alpha, float beta,
                              unsigned int i_stride, unsigned int o_stride,
                              bool print = false) {
@@ -818,6 +836,9 @@ TEST(nntrainer_cpu_backend_standalone, ele_mul_3072_istr_16_ostr_16) {
   run_ele_mul_test(N, alpha, beta, i_stride, o_stride);
 }
 
+/**
+ * @brief run elementwise addition test (Z = X + alpha * Y + beta * Z)
+ */
 static void run_ele_add_test(const unsigned int N, float alpha, float beta,
                              unsigned int i_stride, unsigned int o_stride,
                              bool print = false) {
@@ -1562,6 +1583,102 @@ DECLARE_transform_int4_test_K_N(1024, 648, 32);
 DECLARE_transform_int4_test_K_N(1024, 648, 64);
 DECLARE_transform_int4_test_K_N(1024, 648, 128);
 DECLARE_transform_int4_test_K_N(3072, 8192, 32);
+
+/**
+ * @brief run swiglu accuracy test: cpu backend (AVX2 approximation on x86)
+ * against the scalar fallback reference
+ */
+static void run_swiglu_test(const unsigned int N, float alpha, bool use_alpha,
+                            float abs_tol) {
+  // y spans the sigmoid saturation range on both sides; z is kept moderate so
+  // the absolute tolerance stays meaningful for the product
+  std::vector<float> Y = generate_random_vector<float>(N, -8.0f, 8.0f);
+  std::vector<float> Z = generate_random_vector<float>(N, -2.0f, 2.0f);
+  std::vector<float> X(N, 0.0f);
+  std::vector<float> X_ref(N, 0.0f);
+
+  if (use_alpha) {
+    nntrainer::__fallback_swiglu(N, X_ref.data(), Y.data(), Z.data(), alpha);
+    nntrainer::swiglu(N, X.data(), Y.data(), Z.data(), alpha);
+  } else {
+    nntrainer::__fallback_swiglu(N, X_ref.data(), Y.data(), Z.data());
+    nntrainer::swiglu(N, X.data(), Y.data(), Z.data());
+  }
+
+  for (unsigned int i = 0; i < N; ++i) {
+    EXPECT_NEAR(X[i], X_ref[i], abs_tol)
+      << "swiglu mismatch at i=" << i << " y=" << Y[i] << " z=" << Z[i];
+  }
+}
+
+/**
+ * @brief run tanh-approximated gelu accuracy test: cpu backend (AVX2
+ * polynomial on x86) against the scalar fallback reference
+ */
+static void run_tanh_gelu_v2_test(const unsigned int N, float abs_tol) {
+  // range covers the polynomial region and both clamp branches (~ +-4.38)
+  std::vector<float> X = generate_random_vector<float>(N, -8.0f, 8.0f);
+  std::vector<float> Y(N, 0.0f);
+  std::vector<float> Y_ref(N, 0.0f);
+
+  nntrainer::__fallback_tanh_gelu(N, X.data(), Y_ref.data());
+  nntrainer::tanh_gelu_v2(N, X.data(), Y.data());
+
+  for (unsigned int i = 0; i < N; ++i) {
+    EXPECT_NEAR(Y[i], Y_ref[i], abs_tol)
+      << "tanh_gelu_v2 mismatch at i=" << i << " x=" << X[i];
+  }
+}
+
+/**
+ * @brief run erf-based gelu accuracy test: cpu backend (AVX2 polynomial on
+ * x86) against the scalar fallback reference
+ */
+static void run_gelu_v2_test(const unsigned int N, float abs_tol) {
+  // range covers the polynomial region and both clamp branches (~ +-4.59)
+  std::vector<float> X = generate_random_vector<float>(N, -8.0f, 8.0f);
+  std::vector<float> Y(N, 0.0f);
+  std::vector<float> Y_ref(N, 0.0f);
+
+  nntrainer::__fallback_gelu_v2(N, X.data(), Y_ref.data());
+  nntrainer::gelu_v2(N, X.data(), Y.data());
+
+  for (unsigned int i = 0; i < N; ++i) {
+    EXPECT_NEAR(Y[i], Y_ref[i], abs_tol)
+      << "gelu_v2 mismatch at i=" << i << " x=" << X[i];
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone, swiglu_3072) {
+  run_swiglu_test(3072, 1.0f, false, 1.0e-5f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, swiglu_3075_remainder) {
+  run_swiglu_test(3075, 1.0f, false, 1.0e-5f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, swiglu_3072_alpha) {
+  run_swiglu_test(3072, 1.7f, true, 1.0e-5f);
+}
+
+// Tolerances below are ~2x the measured max abs error of the AVX2 polynomial
+// approximations against the scalar references over a dense [-10, 10] sweep
+// (tanh_gelu_v2: 3.7e-5, gelu_v2: 5.7e-5, both at the clamp boundary).
+TEST(nntrainer_cpu_backend_standalone, tanh_gelu_v2_3072) {
+  run_tanh_gelu_v2_test(3072, 8.0e-5f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, tanh_gelu_v2_3075_remainder) {
+  run_tanh_gelu_v2_test(3075, 8.0e-5f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, gelu_v2_3072) {
+  run_gelu_v2_test(3072, 1.2e-4f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, gelu_v2_3075_remainder) {
+  run_gelu_v2_test(3075, 1.2e-4f);
+}
 
 int main(int argc, char **argv) {
   int result = -1;
