@@ -25,6 +25,7 @@
 
 #include <ggml_interface.h>
 #include <nntr_ggml_impl.h>
+#include <nntrainer_test_util.h>
 #include <thread_manager.h>
 
 // Convert a float to its fp16 bit pattern the same way the production kernels
@@ -423,6 +424,120 @@ TEST(nntrainer_ggml_arm, DISABLED_quantize_mat_q8_0_4x8_benchmark) {
             << iters << " iters)" << std::endl;
   print_latency_stats(st);
   print_samples_us(samples);
+}
+
+static float test_q8_0_4x4(const size_t M, const size_t N, const size_t K) {
+  nntr_ggml_init();
+
+  auto A = generate_activations(K, 11, M);
+  auto W = generate_activations(K, 22, N);
+
+  std::vector<float> C_ref(M * N, 0.0f);
+
+  for (size_t i = 0; i < M; i++) {
+    for (size_t j = 0; j < N; j++) {
+      for (size_t k = 0; k < K; k++) {
+        C_ref[i * N + j] += A[i * K + k] * W[j * K + k];
+      }
+    }
+  }
+
+  const size_t q4_size = (size_t)N * K / 32 * sizeof(block_q8_0_testonly);
+  std::vector<char> Q4(q4_size), B(q4_size);
+  nntr_quantize_q8_0(W.data(), Q4.data(), N, K, nullptr);
+  nntr_repack_q8_0_to_q8_0_4_bl(B.data(), 4, Q4.data(), q4_size, N, K);
+
+  std::vector<float> C(M * N, 0.0f);
+
+  nntrainer::__ggml_q8_0_4x4_q8_0_GEMM(M, N, K, A.data(), K, B.data(), N,
+                                       C.data(), N);
+
+  return cosine_similarity(C_ref.data(), C.data(), M * N);
+}
+
+static float test_q8_0_4x8(const size_t M, const size_t N, const size_t K) {
+  nntr_ggml_init();
+
+  auto A = generate_activations(K, 11, M);
+  auto W = generate_activations(K, 22, N);
+
+  std::vector<float> C_ref(M * N, 0.0f);
+
+  for (size_t i = 0; i < M; i++) {
+    for (size_t j = 0; j < N; j++) {
+      for (size_t k = 0; k < K; k++) {
+        C_ref[i * N + j] += A[i * K + k] * W[j * K + k];
+      }
+    }
+  }
+
+  const size_t q4_size = (size_t)N * K / 32 * sizeof(block_q8_0_testonly);
+  std::vector<char> Q4(q4_size), B(q4_size);
+  nntr_quantize_q8_0(W.data(), Q4.data(), N, K, nullptr);
+  nntr_repack_q8_0_to_q8_0_4_bl(B.data(), 8, Q4.data(), q4_size, N, K);
+
+  std::vector<float> C(M * N, 0.0f);
+
+  nntrainer::__ggml_q8_0_4x8_q8_0_GEMM(M, N, K, A.data(), K, B.data(), N,
+                                       C.data(), N);
+
+  return cosine_similarity(C_ref.data(), C.data(), M * N);
+}
+
+TEST(nntrainer_ggml_arm, gemv_q8_0_4x4_1x128x128) {
+  const size_t M = 1, N = 128, K = 128;
+  float cos = test_q8_0_4x4(M, N, K);
+
+  EXPECT_GT(cos, 0.999f);
+}
+
+TEST(nntrainer_ggml_arm, gemv_q8_0_4x8_1x128x128) {
+  const size_t M = 1, N = 128, K = 128;
+  float cos = test_q8_0_4x8(M, N, K);
+
+  EXPECT_GT(cos, 0.999f);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q8_0_4x4_32x128x128) {
+  const size_t M = 32, N = 128, K = 128;
+  float cos = test_q8_0_4x4(M, N, K);
+
+  EXPECT_GT(cos, 0.999f);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q8_0_4x8_32x128x128) {
+  const size_t M = 32, N = 128, K = 128;
+  float cos = test_q8_0_4x8(M, N, K);
+
+  EXPECT_GT(cos, 0.999f);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q8_0_4x4_35x128x128) {
+  const size_t M = 35, N = 128, K = 128;
+  float cos = test_q8_0_4x4(M, N, K);
+
+  EXPECT_GT(cos, 0.999f);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q8_0_4x8_35x128x128) {
+  const size_t M = 35, N = 128, K = 128;
+  float cos = test_q8_0_4x8(M, N, K);
+
+  EXPECT_GT(cos, 0.999f);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q8_0_4x4_128x128x128) {
+  const size_t M = 128, N = 128, K = 128;
+  float cos = test_q8_0_4x4(M, N, K);
+
+  EXPECT_GT(cos, 0.999f);
+}
+
+TEST(nntrainer_ggml_arm, gemm_q8_0_4x8_128x128x128) {
+  const size_t M = 128, N = 128, K = 128;
+  float cos = test_q8_0_4x8(M, N, K);
+
+  EXPECT_GT(cos, 0.999f);
 }
 
 TEST(nntrainer_ggml_arm, DISABLED_quantize_row_q8_0_benchmark) {

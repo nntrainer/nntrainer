@@ -939,6 +939,198 @@ void nntr_gemm_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
   }
 }
 
+//============================================================================
+// GEMM/GEMV - Q8_0 4x4
+//============================================================================
+
+void nntr_gemm_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+  const int qk = QK8_0;
+  const int nb = n / qk;
+  const int ncols_interleaved = 4;
+  const int blocklen = 4;
+
+  assert(n % qk == 0);
+  assert(nr % 4 == 0);
+  assert(nc % ncols_interleaved == 0);
+
+  float sumf[4][4];
+  int sumi;
+
+  for (int y = 0; y < nr / 4; y++) {
+    const block_q8_0x4 *a_ptr = (const block_q8_0x4 *)vy + (y * nb);
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+      const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (x * nb);
+      for (int m = 0; m < 4; m++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          sumf[m][j] = 0.0;
+        }
+      }
+      for (int l = 0; l < nb; l++) {
+        for (int k = 0; k < (qk / blocklen); k++) {
+          for (int m = 0; m < 4; m++) {
+            for (int j = 0; j < ncols_interleaved; j++) {
+              sumi = 0;
+              for (int i = 0; i < blocklen; ++i) {
+                const int v0 =
+                  b_ptr[l]
+                    .qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+                sumi += v0 * a_ptr[l].qs[k * 4 * blocklen + m * blocklen + i];
+              }
+              sumf[m][j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
+                            nntr_compute_fp16_to_fp32(a_ptr[l].d[m]);
+            }
+          }
+        }
+      }
+      for (int m = 0; m < 4; m++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
+        }
+      }
+    }
+  }
+}
+
+void nntr_gemv_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+  const int qk = QK8_0;
+  const int nb = n / qk;
+  const int ncols_interleaved = 4;
+  const int blocklen = 4;
+
+  assert(nr == 1);
+  assert(n % qk == 0);
+  assert(nc % ncols_interleaved == 0);
+
+  float sumf[4];
+  int sumi;
+
+  const block_q8_0 *a_ptr = (const block_q8_0 *)vy;
+  for (int x = 0; x < nc / ncols_interleaved; x++) {
+    const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (x * nb);
+
+    for (int j = 0; j < ncols_interleaved; j++) {
+      sumf[j] = 0.0;
+    }
+    for (int l = 0; l < nb; l++) {
+      for (int k = 0; k < (qk / blocklen); k++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          sumi = 0;
+          for (int i = 0; i < blocklen; ++i) {
+            const int v0 =
+              b_ptr[l].qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+            sumi += v0 * a_ptr[l].qs[k * blocklen + i];
+          }
+          sumf[j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
+                     nntr_compute_fp16_to_fp32(a_ptr[l].d);
+        }
+      }
+    }
+    for (int j = 0; j < ncols_interleaved; j++) {
+      s[x * ncols_interleaved + j] = sumf[j];
+    }
+  }
+}
+
+//============================================================================
+// GEMM/GEMV - Q8_0 4x8
+//============================================================================
+
+void nntr_gemm_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+  const int qk = QK8_0;
+  const int nb = n / qk;
+  const int ncols_interleaved = 4;
+  const int blocklen = 8;
+
+  assert(n % qk == 0);
+  assert(nr % 4 == 0);
+  assert(nc % ncols_interleaved == 0);
+
+  float sumf[4][4];
+  int sumi;
+
+  for (int y = 0; y < nr / 4; y++) {
+    const block_q8_0x4 *a_ptr = (const block_q8_0x4 *)vy + (y * nb);
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+      const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (x * nb);
+      for (int m = 0; m < 4; m++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          sumf[m][j] = 0.0;
+        }
+      }
+      for (int l = 0; l < nb; l++) {
+        for (int k = 0; k < (qk / blocklen); k++) {
+          for (int m = 0; m < 4; m++) {
+            for (int j = 0; j < ncols_interleaved; j++) {
+              sumi = 0;
+              for (int i = 0; i < blocklen; ++i) {
+                const int v0 =
+                  b_ptr[l]
+                    .qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+                sumi += v0 * a_ptr[l].qs[k * 4 * blocklen + m * blocklen + i];
+              }
+              sumf[m][j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
+                            nntr_compute_fp16_to_fp32(a_ptr[l].d[m]);
+            }
+          }
+        }
+      }
+      for (int m = 0; m < 4; m++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
+        }
+      }
+    }
+  }
+}
+
+void nntr_gemv_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc) {
+  const int qk = QK8_0;
+  const int nb = n / qk;
+  const int ncols_interleaved = 4;
+  const int blocklen = 8;
+
+  assert(nr == 1);
+  assert(n % qk == 0);
+  assert(nc % ncols_interleaved == 0);
+
+  float sumf[4];
+  int sumi;
+
+  const block_q8_0 *a_ptr = (const block_q8_0 *)vy;
+  for (int x = 0; x < nc / ncols_interleaved; x++) {
+    const block_q8_0x4 *b_ptr = (const block_q8_0x4 *)vx + (x * nb);
+
+    for (int j = 0; j < ncols_interleaved; j++) {
+      sumf[j] = 0.0;
+    }
+    for (int l = 0; l < nb; l++) {
+      for (int k = 0; k < (qk / blocklen); k++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          sumi = 0;
+          for (int i = 0; i < blocklen; ++i) {
+            const int v0 =
+              b_ptr[l].qs[k * ncols_interleaved * blocklen + j * blocklen + i];
+            sumi += v0 * a_ptr[l].qs[k * blocklen + i];
+          }
+          sumf[j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
+                     nntr_compute_fp16_to_fp32(a_ptr[l].d);
+        }
+      }
+    }
+    for (int j = 0; j < ncols_interleaved; j++) {
+      s[x * ncols_interleaved + j] = sumf[j];
+    }
+  }
+}
+
 void nntr_gemm_q4_K_8x8_q8_K(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc) {
@@ -3068,6 +3260,45 @@ void nntr_quantize_mat_q8_K_4x8(const float *__restrict x, void *__restrict vy,
   }
 }
 
+void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
+                                int64_t k) {
+  assert(QK8_0 == 32);
+  assert(k % QK8_0 == 0);
+  const int nb = k / QK8_0;
+
+  block_q8_0x4 *__restrict y = (block_q8_0x4 *)vy;
+
+  // scalar
+  const int blck_size_interleave = 4;
+  float srcv[4][QK8_0];
+  float id[4];
+
+  for (int i = 0; i < nb; i++) {
+    for (int row_iter = 0; row_iter < 4; row_iter++) {
+      float amax = 0.0f; // absolute max
+
+      for (int j = 0; j < QK8_0; j++) {
+        srcv[row_iter][j] = x[row_iter * k + i * QK8_0 + j];
+        amax = MAX(amax, fabsf(srcv[row_iter][j]));
+      }
+
+      const float d = amax / ((1 << 7) - 1);
+      id[row_iter] = d ? 1.0f / d : 0.0f;
+
+      y[i].d[row_iter] = nntr_compute_fp32_to_fp16(d);
+    }
+
+    for (int j = 0; j < QK8_0 * 4; j++) {
+      int src_offset = (j / (4 * blck_size_interleave)) * blck_size_interleave;
+      int src_id = (j % (4 * blck_size_interleave)) / blck_size_interleave;
+      src_offset += (j % blck_size_interleave);
+
+      float x0 = srcv[src_id][src_offset] * id[src_id];
+      y[i].qs[j] = roundf(x0);
+    }
+  }
+}
+
 void nntr_quantize_mat_q8_0_4x8(const float *__restrict x, void *__restrict vy,
                                 int64_t k) {
   assert(Q8_0 == 32);
@@ -3221,6 +3452,25 @@ static block_q4_0x8 nntr_make_block_q4_0x8(block_q4_0 *in,
   return out;
 }
 
+static block_q8_0x4 nntr_make_block_q8_0x4(block_q8_0 *in,
+                                           unsigned int blck_size_interleave) {
+  block_q8_0x4 out;
+
+  for (int i = 0; i < 4; i++) {
+    out.d[i] = in[i].d;
+  }
+
+  const int end = QK8_0 * 4 / blck_size_interleave;
+  for (int i = 0; i < end; ++i) {
+    int src_id = i % 4;
+    int src_offset = (i / 4) * blck_size_interleave;
+    int dst_offset = i * blck_size_interleave;
+    memcpy(&out.qs[dst_offset], &in[src_id].qs[src_offset],
+           blck_size_interleave);
+  }
+  return out;
+}
+
 static block_q4_Kx8 make_block_q4_Kx8(block_q4_K *in,
                                       unsigned int blck_size_interleave) {
   block_q4_Kx8 out;
@@ -3352,6 +3602,35 @@ int nntr_repack_q4_0_to_q4_0_8_bl(void *__restrict dst, int interleave_block,
         dst_tmp[i] = src[x + i * nblocks];
       }
       *dst_++ = nntr_make_block_q4_0x8(dst_tmp, interleave_block);
+    }
+    src += nrows_interleaved * nblocks;
+  }
+  return 0;
+}
+
+int nntr_repack_q8_0_to_q8_0_4_bl(void *__restrict dst, int interleave_block,
+                                  const void *__restrict data, size_t data_size,
+                                  size_t nrow, size_t k) {
+  assert(interleave_block == 4 || interleave_block == 8);
+  constexpr int nrows_interleaved = 4;
+
+  block_q8_0x4 *dst_ = (block_q8_0x4 *)dst;
+  const block_q8_0 *src = (const block_q8_0 *)data;
+  block_q8_0 dst_tmp[4];
+  int nblocks = k / QK8_0;
+
+  assert(data_size == nrow * nblocks * sizeof(block_q8_0));
+
+  if (nrow % nrows_interleaved != 0 || k % 8 != 0) {
+    return -1;
+  }
+
+  for (int b = 0; b < nrow; b += nrows_interleaved) {
+    for (int64_t x = 0; x < nblocks; x++) {
+      for (int i = 0; i < nrows_interleaved; i++) {
+        dst_tmp[i] = src[x + i * nblocks];
+      }
+      *dst_++ = nntr_make_block_q8_0x4(dst_tmp, interleave_block);
     }
     src += nrows_interleaved * nblocks;
   }

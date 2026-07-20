@@ -61,6 +61,25 @@ void nntr_gemv_q4_K_8x8_q8_K(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc);
 
+void nntr_gemm_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc);
+
+void nntr_gemv_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc);
+
+void nntr_gemm_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc);
+
+void nntr_gemv_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
+                             const void *__restrict vx,
+                             const void *__restrict vy, int nr, int nc);
+
+void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
+                                int64_t k);
+
 void nntr_quantize_mat_q8_0_4x8(const float *__restrict x, void *__restrict vy,
                                 int64_t k);
 
@@ -72,6 +91,10 @@ int nntr_repack_q4_0_to_q4_0_4_bl(void *__restrict dst, int interleave_block,
                                   size_t nrow, size_t k);
 
 int nntr_repack_q4_0_to_q4_0_8_bl(void *__restrict dst, int interleave_block,
+                                  const void *__restrict data, size_t data_size,
+                                  size_t nrow, size_t k);
+
+int nntr_repack_q8_0_to_q8_0_4_bl(void *__restrict dst, int interleave_block,
                                   const void *__restrict data, size_t data_size,
                                   size_t nrow, size_t k);
 
