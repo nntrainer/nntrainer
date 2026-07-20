@@ -582,6 +582,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/q6_k_tensor.h
 %{_includedir}/nntrainer/q4_0_tensor.h
 %{_includedir}/nntrainer/q4_0_utils.h
+%{_includedir}/nntrainer/q8_0_tensor.h
 %{_includedir}/nntrainer/qs4cx_tensor.h
 %{_includedir}/nntrainer/int4_tensor.h
 %{_includedir}/nntrainer/int4_utils.h
@@ -599,6 +600,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/tensor_wrap_specs.h
 %{_includedir}/nntrainer/cpu_backend.h
 %{_includedir}/nntrainer/compute_ops.h
+%{_includedir}/nntrainer/conv_indirect.h
 %{_includedir}/nntrainer/context_data.h
 %{_includedir}/nntrainer/fallback_internal.h
 %if 0%{?use_cblas}

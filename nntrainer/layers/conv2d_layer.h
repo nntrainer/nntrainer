@@ -74,11 +74,34 @@ public:
   void calcGradient(RunLayerContext &context) override;
 
   /**
+   * @copydoc Layer::setBatch(RunLayerContext &context, unsigned int batch)
+   */
+  void setBatch(RunLayerContext &context, unsigned int batch) override;
+
+  /**
    * @copydoc Layer::exportTo(Exporter &exporter, ml::train::ExportMethods
    * method)
    */
   void exportTo(Exporter &exporter,
                 const ml::train::ExportMethods &method) const override;
+
+  /**
+   * @copydoc Layer::save(std::ofstream &file, RunLayerContext &run_context,
+   * bool opt_var, ml::train::ExecutionMode mode, bool trainable,
+   * TensorDim::DataType dtype, ml::train::ISA target_isa)
+   *
+   * @note Overridden so a conv filter can be quantized to Q4_0 as a matmul
+   * weight. The FP32 filter is stored [out_ch, in_ch, kh, kw], which is already
+   * row-major [out_ch, CRS] (CRS = in_ch*kh*kw) = [N, K] with N=out_ch rows of
+   * K=CRS — exactly the layout quantize_q4_0 wants, so (unlike the FC path in
+   * the base class) it needs no transpose. Ineligible filters (out_ch or CRS
+   * not 32-aligned) and the bias stay FP32.
+   */
+  void save(
+    std::ofstream &file, RunLayerContext &run_context, bool opt_var,
+    ml::train::ExecutionMode mode, bool trainable,
+    ml::train::TensorDim::DataType dtype = ml::train::TensorDim::DataType::NONE,
+    ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const override;
 
   /**
    * @copydoc Layer::getType()
@@ -112,9 +135,13 @@ private:
   std::array<unsigned int, CONV2D_DIM * 2> padding;
   std::tuple<props::FilterSize, std::array<props::KernelSize, CONV2D_DIM>,
              std::array<props::Stride, CONV2D_DIM>, props::Padding2D,
-             std::array<props::Dilation, CONV2D_DIM>>
+             std::array<props::Dilation, CONV2D_DIM>, props::ConvGroups,
+             props::FusedActivation>
     conv_props;
 
+#ifdef ENABLE_FP16
+  std::vector<_FP16> repacked_conv0_weights_fp16;
+#endif
   std::array<unsigned int, 5> wt_idx; /**< indices of the weights and tensors */
 };
 

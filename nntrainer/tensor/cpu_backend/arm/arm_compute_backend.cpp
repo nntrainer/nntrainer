@@ -22,6 +22,7 @@
 #include <kleidiai_interface.h>
 #endif
 #include <neon_impl.h>
+#include <nntr_ggml_impl.h>
 #include <nntrainer_error.h>
 #include <q4_0_utils.h>
 
@@ -386,12 +387,63 @@ void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
   return __ggml_q4_0_4x8_q8_0_GEMM<float>(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
+template <>
+void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
+               const float *A, const unsigned int lda, const void *B,
+               const unsigned int ldb, float *C, const unsigned int ldc) {
+  return __ggml_q8_0_q8_0_GEMM(M, N, K, A, lda, B, ldb, C, ldc);
+}
+
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                const unsigned int K, const float *A, const unsigned int lda,
                std::vector<void *> Bs, std::vector<unsigned int> ldbs,
                std::vector<float *> Cs, std::vector<unsigned int> ldcs) {
   return __ggml_q4_0_4x8_q8_0_GEMM<float>(M, Ns, K, A, lda, Bs, ldbs, Cs, ldcs);
 }
+
+void gemm_q4_0_indirect_conv(const unsigned int M, const unsigned int N,
+                             const unsigned int K, const float *in,
+                             const ConvGatherParams &geom, const void *B,
+                             const unsigned int ldb, float *C,
+                             const unsigned int ldc) {
+  return __ggml_q4_0_4x8_q8_0_indirect_GEMM(M, N, K, in, geom, B, ldb, C, ldc);
+}
+
+#ifdef ENABLE_FP16
+void gemm_q4_0_indirect_conv_fp16(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const _FP16 *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc) {
+  return __ggml_q4_0_4x8_q8_0_indirect_GEMM_fp16(M, N, K, in, geom, B, ldb, C,
+                                                 ldc);
+}
+
+void gemm_q4_0_indirect_conv_q8_0(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const void *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc) {
+  return __ggml_q4_0_4x8_q8_0_indirect_GEMM_q8_0(M, N, K, in, geom, B, ldb, C,
+                                                 ldc);
+}
+
+void gemm_q8_0_indirect_conv_q8_0(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const void *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc) {
+  return __ggml_q8_0_q8_0_indirect_GEMM_q8_0(M, N, K, in, geom, B, ldb, C, ldc);
+}
+
+void gemm_q8_0_indirect_conv_fp16(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const _FP16 *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc) {
+  return __ggml_q8_0_q8_0_indirect_GEMM_fp16(M, N, K, in, geom, B, ldb, C, ldc);
+}
+#endif
 
 void gemm_q4_K(const unsigned int M, const unsigned int N, const unsigned int K,
                const float *A, const unsigned int lda, const void *B,
@@ -427,6 +479,11 @@ size_t quantize_q4_0(const float *src, void *dst, int64_t nrow,
   return __ggml_quantize_q4_0(src, dst, nrow, n_per_row, quant_weights);
 }
 
+size_t quantize_q8_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights) {
+  return __ggml_quantize_q8_0(src, dst, nrow, n_per_row, quant_weights);
+}
+
 size_t quantize_q4_K(const float *src, void *dst, int64_t nrow,
                      int64_t n_per_row, const float *quant_weights) {
   return __ggml_quantize_q4_K(src, dst, nrow, n_per_row, quant_weights);
@@ -453,6 +510,14 @@ void dequantize_row_q4_K(const void *x_raw, float *y, int64_t k) {
 
 void dequantize_row_q4_0(const void *x_raw, float *y, int64_t k) {
   __ggml_dequantize_row_q4_0(x_raw, y, k);
+}
+
+void dequantize_row_q8_0(const void *x_raw, float *y, int64_t k) {
+  __ggml_dequantize_row_q8_0(x_raw, y, k);
+}
+
+void quantize_row_q8_0(const float *src, void *dst, int64_t k) {
+  nntr_quantize_row_q8_0(src, dst, k);
 }
 
 void dequantize_row_q6_K(const void *x, float *y, int64_t k) {
@@ -523,6 +588,123 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
            float upper_bound) {
   neon::clamp(input, output, length, lower_bound, upper_bound);
 }
+
+void depthwise_conv2d_fp32(const float *input, const float *kernel,
+                           float *output, unsigned int batch,
+                           unsigned int channels, unsigned int in_h,
+                           unsigned int in_w, unsigned int out_h,
+                           unsigned int out_w, unsigned int kh, unsigned int kw,
+                           unsigned int stride_h, unsigned int stride_w,
+                           unsigned int pad_top, unsigned int pad_left,
+                           unsigned int dilation_h, unsigned int dilation_w) {
+  // TODO: NEON specialization
+  __fallback_depthwise_conv2d_fp32(
+    input, kernel, output, batch, channels, in_h, in_w, out_h, out_w, kh, kw,
+    stride_h, stride_w, pad_top, pad_left, dilation_h, dilation_w);
+}
+
+#ifdef ENABLE_FP16
+void depthwise_conv2d_fp16(const _FP16 *input, const float *kernel,
+                           _FP16 *output, unsigned int batch,
+                           unsigned int channels, unsigned int in_h,
+                           unsigned int in_w, unsigned int out_h,
+                           unsigned int out_w, unsigned int kh, unsigned int kw,
+                           unsigned int stride_h, unsigned int stride_w,
+                           unsigned int pad_top, unsigned int pad_left,
+                           unsigned int dilation_h, unsigned int dilation_w) {
+#ifdef USE_NEON
+  if (kh == 3 && kw == 3 && dilation_h == 1 && dilation_w == 1 &&
+      stride_w == 1) {
+    auto &tm = ThreadManager::Global();
+    tm.parallel_for(0, (size_t)batch * channels, [&](size_t bc) {
+      const unsigned int c = (unsigned int)(bc % channels);
+      const _FP16 *inc = input + bc * in_h * in_w;
+      const float *fc = kernel + (size_t)c * 9;
+      _FP16 *outc = output + bc * out_h * out_w;
+
+      float32x4_t k00 = vdupq_n_f32(fc[0]);
+      float32x4_t k01 = vdupq_n_f32(fc[1]);
+      float32x4_t k02 = vdupq_n_f32(fc[2]);
+      float32x4_t k10 = vdupq_n_f32(fc[3]);
+      float32x4_t k11 = vdupq_n_f32(fc[4]);
+      float32x4_t k12 = vdupq_n_f32(fc[5]);
+      float32x4_t k20 = vdupq_n_f32(fc[6]);
+      float32x4_t k21 = vdupq_n_f32(fc[7]);
+      float32x4_t k22 = vdupq_n_f32(fc[8]);
+
+      for (unsigned int oh = 0; oh < out_h; ++oh) {
+        int ih0 = (int)oh * (int)stride_h - (int)pad_top;
+        unsigned int ow = 0;
+
+        for (; ow + 3 < out_w; ow += 4) {
+          int iw0 = (int)ow - (int)pad_left;
+          float32x4_t acc = vdupq_n_f32(0.0f);
+
+          for (int ki = 0; ki < 3; ++ki) {
+            int ih = ih0 + ki;
+            if (ih >= 0 && ih < (int)in_h) {
+              float32x4_t k0 = (ki == 0) ? k00 : (ki == 1) ? k10 : k20;
+              float32x4_t k1 = (ki == 0) ? k01 : (ki == 1) ? k11 : k21;
+              float32x4_t k2 = (ki == 0) ? k02 : (ki == 1) ? k12 : k22;
+
+              if (iw0 >= 0 && iw0 + 7 < (int)in_w) {
+                const __fp16 *p = (const __fp16 *)(inc + ih * in_w + iw0);
+                float16x8_t load0 = vld1q_f16(p);
+                float16x4_t h0 = vget_low_f16(load0);
+                float16x4_t h1 = vget_low_f16(vextq_f16(load0, load0, 1));
+                float16x4_t h2 = vget_low_f16(vextq_f16(load0, load0, 2));
+                acc = vmlaq_f32(acc, vcvt_f32_f16(h0), k0);
+                acc = vmlaq_f32(acc, vcvt_f32_f16(h1), k1);
+                acc = vmlaq_f32(acc, vcvt_f32_f16(h2), k2);
+              } else {
+                float acc_arr[4] = {0};
+                for (unsigned int v = 0; v < 4; ++v) {
+                  int iw = iw0 + v;
+                  if (iw >= 0 && iw < (int)in_w)
+                    acc_arr[v] += (float)inc[ih * in_w + iw] * fc[ki * 3];
+                  if (iw + 1 >= 0 && iw + 1 < (int)in_w)
+                    acc_arr[v] +=
+                      (float)inc[ih * in_w + iw + 1] * fc[ki * 3 + 1];
+                  if (iw + 2 >= 0 && iw + 2 < (int)in_w)
+                    acc_arr[v] +=
+                      (float)inc[ih * in_w + iw + 2] * fc[ki * 3 + 2];
+                }
+                acc = vaddq_f32(acc, vld1q_f32(acc_arr));
+              }
+            }
+          }
+
+          vst1_f16((__fp16 *)&outc[oh * out_w + ow], vcvt_f16_f32(acc));
+        }
+
+        for (; ow < out_w; ++ow) {
+          int iw0 = (int)ow - (int)pad_left;
+          float acc = 0.0f;
+          for (unsigned int ki = 0; ki < 3; ++ki) {
+            int ih = ih0 + (int)ki;
+            if (ih < 0 || ih >= (int)in_h)
+              continue;
+            for (unsigned int kj = 0; kj < 3; ++kj) {
+              int iw = iw0 + (int)kj;
+              if (iw < 0 || iw >= (int)in_w)
+                continue;
+              acc += static_cast<float>(inc[ih * in_w + iw]) * fc[ki * 3 + kj];
+            }
+          }
+          outc[oh * out_w + ow] = static_cast<_FP16>(acc);
+        }
+      }
+    });
+    return;
+  }
+#endif
+  // TODO: NEON fp16 specialization (the scalar fallback already accumulates in
+  // float for parity and is channel-parallel).
+  __fallback_depthwise_conv2d_fp16(
+    input, kernel, output, batch, channels, in_h, in_w, out_h, out_w, kh, kw,
+    stride_h, stride_w, pad_top, pad_left, dilation_h, dilation_w);
+}
+#endif
 
 template <>
 void compute_kcaches(const float *in, const uint16_t *kcache, float *output,

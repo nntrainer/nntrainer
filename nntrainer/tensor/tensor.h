@@ -1393,6 +1393,18 @@ public:
            bool trans = false, bool trans_in = false, float beta = 0.0f) const;
 
   /**
+   * @brief q4_0 convolution forward with im2col gather fused into the GEMM
+   * activation packing (no FP32 im2col buffer is materialized). `this` is the
+   * NCHW FP32 input; @a weight is the Q4_0 filter [CRS, out_ch].
+   * @param[in] weight Q4_0 quantized filter
+   * @param[out] output result [OH*OW, out_ch]
+   * @param[in] geom convolution geometry describing the gather
+   * @retval reference to output
+   */
+  Tensor &convQ4_0Indirect(Tensor const &weight, Tensor &output,
+                           const ConvGatherParams &geom) const;
+
+  /**
    * @brief compute the derivative of this in the current tensor
    * @param input same as given to the dot()
    * @param output_deriv the derivative of the output

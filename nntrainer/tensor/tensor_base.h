@@ -77,6 +77,7 @@ enum class Initializer {
 
 class Tensor;
 class SrcSharedTensorBase;
+struct ConvGatherParams;
 
 /**
  * @class TensorBase class
@@ -490,6 +491,18 @@ public:
    */
   virtual Tensor &dot(Tensor const &input, Tensor &output, bool trans,
                       bool trans_in, float beta) const;
+
+  /**
+   * @brief q4_0 convolution forward with im2col gather fused into the GEMM
+   * activation packing (no FP32 im2col buffer is materialized). `this` is the
+   * NCHW FP32 input; @a weight is the Q4_0 filter laid out [CRS, out_ch].
+   * @param[in] weight Q4_0 quantized filter
+   * @param[out] output result [OH*OW, out_ch]
+   * @param[in] geom convolution geometry describing the gather
+   * @retval reference to output
+   */
+  virtual Tensor &convQ4_0Indirect(Tensor const &weight, Tensor &output,
+                                   const ConvGatherParams &geom) const;
 
   /**
    * @brief     Dot Product of Tensors ( equal MxMs )

@@ -23,6 +23,7 @@
 #include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <tensor_dim.h>
+#include <thread_manager.h>
 #include <util_func.h>
 
 namespace nntrainer {
@@ -40,6 +41,7 @@ void ConcatLayer::finalize(InitLayerContext &context) {
     context.getInputDimensions().front().channel() > 1 ? 3 : 1;
   if (!concat_dimension_prop.empty())
     concat_dimension = concat_dimension_prop.get();
+  concat_dimension_cache = concat_dimension;
 
   /**
    * The concat is only done along the axis dimension.
@@ -147,6 +149,57 @@ void ConcatLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &output = context.getOutput(SINGLE_INOUT_IDX);
 
   const TensorDim out_dim = output.getDim();
+
+  // NHWC path: channel is physical-innermost, so a channel-axis concat
+  // interleaves per-pixel channel runs. The NCHW reshape-helper path below
+  // assumes channel-major planes and would copy into the wrong physical
+  // offsets, so handle NHWC separately. Only the channel axis (logical 1) is
+  // supported here, matching the graph usage.
+  if (out_dim.getFormat() == ml::train::TensorDim::Format::NHWC &&
+      concat_dimension_cache == 1) {
+    const unsigned int B = out_dim.batch();
+    const unsigned int H = out_dim.height();
+    const unsigned int W = out_dim.width();
+    const size_t HW = (size_t)H * W;
+    unsigned int c_offset = 0;
+    for (unsigned int idx = 0; idx < context.getNumInputs(); idx++) {
+      Tensor &input = context.getInput(idx);
+      const unsigned int Ci = input.channel();
+      if (input.getDataType() == TensorDim::DataType::FP32) {
+        const float *src = input.getData<float>();
+        float *dst = output.getData<float>();
+        auto &tm = ThreadManager::Global();
+        for (unsigned int b = 0; b < B; ++b) {
+          const size_t base = (size_t)b * HW;
+          tm.parallel_for(0, HW, [&](size_t p) {
+            // src is packed with Ci channels per pixel; dst has out channels.
+            const float *s = src + (base + p) * Ci;
+            float *d = dst + (base + p) * out_dim.channel() + c_offset;
+            std::memcpy(d, s, (size_t)Ci * sizeof(float));
+          });
+        }
+      } else if (input.getDataType() == TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+        const _FP16 *src = input.getData<_FP16>();
+        _FP16 *dst = output.getData<_FP16>();
+        auto &tm = ThreadManager::Global();
+        for (unsigned int b = 0; b < B; ++b) {
+          const size_t base = (size_t)b * HW;
+          tm.parallel_for(0, HW, [&](size_t p) {
+            const _FP16 *s = src + (base + p) * Ci;
+            _FP16 *d = dst + (base + p) * out_dim.channel() + c_offset;
+            std::memcpy(d, s, (size_t)Ci * sizeof(_FP16));
+          });
+        }
+#else
+        throw std::invalid_argument("Error: enable-fp16 is not enabled");
+#endif
+      }
+      c_offset += Ci;
+    }
+    return;
+  }
+
   output.reshape(output_reshape_helper);
   unsigned int output_width_offset = 0;
   TensorDim::TensorType tensor_type = output.getTensorType();

@@ -151,6 +151,15 @@ void ComputeOps::transpose_matrix_fp32(unsigned int, unsigned int,
   NI(transpose_matrix_fp32);
 }
 
+void ComputeOps::depthwise_conv2d_fp32(const float *, const float *, float *,
+                                       unsigned int, unsigned int, unsigned int,
+                                       unsigned int, unsigned int, unsigned int,
+                                       unsigned int, unsigned int, unsigned int,
+                                       unsigned int, unsigned int, unsigned int,
+                                       unsigned int, unsigned int) {
+  NI(depthwise_conv2d_fp32);
+}
+
 void ComputeOps::scopy_u8(unsigned int, const uint8_t *, unsigned int,
                           uint8_t *, unsigned int) {
   NI(scopy_u8);
@@ -189,6 +198,17 @@ void ComputeOps::gemm_q4_0_fp32(unsigned int, unsigned int, unsigned int,
                                 const float *, unsigned int, const void *,
                                 unsigned int, float *, unsigned int) {
   NI(gemm_q4_0_fp32);
+}
+void ComputeOps::gemm_q8_0_fp32(unsigned int, unsigned int, unsigned int,
+                                const float *, unsigned int, const void *,
+                                unsigned int, float *, unsigned int) {
+  NI(gemm_q8_0_fp32);
+}
+void ComputeOps::quantize_row_q8_0(const float *, void *, int64_t) {
+  NI(quantize_row_q8_0);
+}
+void ComputeOps::dequantize_row_q8_0(const void *, float *, int64_t) {
+  NI(dequantize_row_q8_0);
 }
 void ComputeOps::gemm_q4_K_fp32(unsigned int, unsigned int, unsigned int,
                                 const float *, unsigned int, const void *,
@@ -243,6 +263,13 @@ void ComputeOps::gemm_q4_0_batch_fp32(std::vector<void *>, float *,
 void ComputeOps::gemm_q4_0_accel_fp32(void *, float *, float *, unsigned int,
                                       unsigned int, unsigned int) {
   NI(gemm_q4_0_accel_fp32);
+}
+void ComputeOps::gemm_q4_0_indirect_conv_fp32(unsigned int, unsigned int,
+                                              unsigned int, const float *,
+                                              const ConvGatherParams &,
+                                              const void *, unsigned int,
+                                              float *, unsigned int) {
+  NI(gemm_q4_0_indirect_conv_fp32);
 }
 void ComputeOps::gemv_int4_batch_fp32(std::vector<void *>,
                                       std::vector<uint16_t *>, float *,
@@ -393,6 +420,34 @@ void ComputeOps::gemm_q4_0_fp16(unsigned int, unsigned int, unsigned int,
                                 unsigned int, _FP16 *, unsigned int) {
   NI(gemm_q4_0_fp16);
 }
+void ComputeOps::gemm_q4_0_indirect_conv_fp16(unsigned int, unsigned int,
+                                              unsigned int, const _FP16 *,
+                                              const ConvGatherParams &,
+                                              const void *, unsigned int,
+                                              _FP16 *, unsigned int) {
+  NI(gemm_q4_0_indirect_conv_fp16);
+}
+void ComputeOps::gemm_q4_0_indirect_conv_q8_0(unsigned int, unsigned int,
+                                              unsigned int, const void *,
+                                              const ConvGatherParams &,
+                                              const void *, unsigned int,
+                                              _FP16 *, unsigned int) {
+  NI(gemm_q4_0_indirect_conv_q8_0);
+}
+void ComputeOps::gemm_q8_0_indirect_conv_q8_0(unsigned int, unsigned int,
+                                              unsigned int, const void *,
+                                              const ConvGatherParams &,
+                                              const void *, unsigned int,
+                                              _FP16 *, unsigned int) {
+  NI(gemm_q8_0_indirect_conv_q8_0);
+}
+void ComputeOps::gemm_q8_0_indirect_conv_fp16(unsigned int, unsigned int,
+                                              unsigned int, const _FP16 *,
+                                              const ConvGatherParams &,
+                                              const void *, unsigned int,
+                                              _FP16 *, unsigned int) {
+  NI(gemm_q8_0_indirect_conv_fp16);
+}
 void ComputeOps::gemm_q6_K_fp16(unsigned int, unsigned int, unsigned int,
                                 const _FP16 *, unsigned int, const void *,
                                 unsigned int, _FP16 *, unsigned int) {
@@ -403,6 +458,15 @@ void ComputeOps::compute_rotary_embedding_value(unsigned int, unsigned int,
                                                 unsigned int, _FP16 *, _FP16 *,
                                                 float *, float *) {
   NI(compute_rotary_embedding_value);
+}
+
+void ComputeOps::depthwise_conv2d_fp16(const _FP16 *, const float *, _FP16 *,
+                                       unsigned int, unsigned int, unsigned int,
+                                       unsigned int, unsigned int, unsigned int,
+                                       unsigned int, unsigned int, unsigned int,
+                                       unsigned int, unsigned int, unsigned int,
+                                       unsigned int, unsigned int) {
+  NI(depthwise_conv2d_fp16);
 }
 #endif // ENABLE_FP16
 

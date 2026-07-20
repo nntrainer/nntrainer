@@ -16,8 +16,22 @@
 #define __ACTI_FUNC_H__
 #ifdef __cplusplus
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
+#include <mutex>
+#include <string>
+#include <vector>
+
 #include <common_properties.h>
 #include <cpu_backend.h>
+#include <thread_manager.h>
+
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 #if defined(_WIN32)
 #define _USE_MATH_DEFINES
@@ -27,6 +41,146 @@
 namespace nntrainer {
 
 class Tensor;
+
+/**
+ * @brief Build (once) and return the FP16 SiLU/Swish lookup table covering
+ *        all 65536 representable FP16 bit patterns.
+ * @note  NaN/(-inf) inputs map to themselves/0 respectively, matching the
+ *        scalar fallback in applySwishInplace.
+ */
+#ifdef ENABLE_FP16
+inline const _FP16 *get_silu_lut_fp16() {
+  static std::vector<_FP16> lut;
+  static std::once_flag init_flag;
+  std::call_once(init_flag, []() {
+    lut.resize(65536);
+    for (uint32_t i = 0; i < 65536; ++i) {
+      uint16_t u = static_cast<uint16_t>(i);
+      _FP16 x = *reinterpret_cast<const _FP16 *>(&u);
+      float x_f = static_cast<float>(x);
+      if (std::isnan(x_f)) {
+        lut[i] = x;
+      } else if (std::isinf(x_f)) {
+        if (x_f > 0.0f)
+          lut[i] = x;
+        else
+          lut[i] = (_FP16)0.0f;
+      } else {
+        float silu = x_f / (1.0f + std::exp(-x_f));
+        lut[i] = static_cast<_FP16>(silu);
+      }
+    }
+  });
+  return lut.data();
+}
+#endif
+
+/**
+ * @brief In-place SiLU / swish (x * sigmoid(x)) over a contiguous buffer.
+ * @details FP16 uses a 64k-entry LUT; other types use a scalar (or, under
+ *          NNTR_APPROX_SILU=1 and ARM FP16, a NEON hard-swish approximation)
+ *          loop parallelized across the thread pool. Centralizing this here
+ *          keeps conv layers free of activation-specific code.
+ */
+template <typename T> inline void applySwishInplace(T *data, size_t n) {
+  auto &tm = ThreadManager::Global();
+  const size_t nthreads = std::max<size_t>(1, tm.getComputeThreadCount());
+  const size_t chunk = (n + nthreads - 1) / nthreads;
+
+#ifdef ENABLE_FP16
+  if constexpr (std::is_same_v<T, _FP16>) {
+    const _FP16 *lut = get_silu_lut_fp16();
+    tm.parallel_for(0, nthreads, [&](size_t t) {
+      const size_t start = t * chunk;
+      if (start >= n)
+        return;
+      const size_t end = std::min(start + chunk, n);
+      size_t i = start;
+      for (; i + 7 < end; i += 8) {
+        uint16_t u0 = *reinterpret_cast<const uint16_t *>(&data[i + 0]);
+        uint16_t u1 = *reinterpret_cast<const uint16_t *>(&data[i + 1]);
+        uint16_t u2 = *reinterpret_cast<const uint16_t *>(&data[i + 2]);
+        uint16_t u3 = *reinterpret_cast<const uint16_t *>(&data[i + 3]);
+        uint16_t u4 = *reinterpret_cast<const uint16_t *>(&data[i + 4]);
+        uint16_t u5 = *reinterpret_cast<const uint16_t *>(&data[i + 5]);
+        uint16_t u6 = *reinterpret_cast<const uint16_t *>(&data[i + 6]);
+        uint16_t u7 = *reinterpret_cast<const uint16_t *>(&data[i + 7]);
+        data[i + 0] = lut[u0];
+        data[i + 1] = lut[u1];
+        data[i + 2] = lut[u2];
+        data[i + 3] = lut[u3];
+        data[i + 4] = lut[u4];
+        data[i + 5] = lut[u5];
+        data[i + 6] = lut[u6];
+        data[i + 7] = lut[u7];
+      }
+      for (; i < end; ++i) {
+        uint16_t u = *reinterpret_cast<const uint16_t *>(&data[i]);
+        data[i] = lut[u];
+      }
+    });
+    return;
+  }
+#endif
+
+  static const bool use_approx = []() {
+    if (const char *env_p = std::getenv("NNTR_APPROX_SILU")) {
+      return std::string(env_p) == "1";
+    }
+    return false;
+  }();
+
+  tm.parallel_for(0, nthreads, [&](size_t t) {
+    const size_t start = t * chunk;
+    if (start >= n)
+      return;
+    const size_t end = std::min(start + chunk, n);
+    size_t i = start;
+
+    if (use_approx) {
+#if defined(__ARM_NEON) && defined(ENABLE_FP16)
+      if constexpr (std::is_same_v<T, _FP16>) {
+        const float32x4_t v_three = vdupq_n_f32(3.0f);
+        const float32x4_t v_six_inv = vdupq_n_f32(1.0f / 6.0f);
+        const float32x4_t v_zero = vdupq_n_f32(0.0f);
+        const float32x4_t v_six = vdupq_n_f32(6.0f);
+
+        for (; i + 7 < end; i += 8) {
+          float16x8_t vx =
+            vld1q_f16(reinterpret_cast<const __fp16 *>(&data[i]));
+
+          float32x4_t vx_lo = vcvt_f32_f16(vget_low_f16(vx));
+          float32x4_t v_add_lo = vaddq_f32(vx_lo, v_three);
+          float32x4_t v_relu6_lo =
+            vminq_f32(vmaxq_f32(v_add_lo, v_zero), v_six);
+          float32x4_t vres_lo =
+            vmulq_f32(vmulq_f32(vx_lo, v_relu6_lo), v_six_inv);
+
+          float32x4_t vx_hi = vcvt_f32_f16(vget_high_f16(vx));
+          float32x4_t v_add_hi = vaddq_f32(vx_hi, v_three);
+          float32x4_t v_relu6_hi =
+            vminq_f32(vmaxq_f32(v_add_hi, v_zero), v_six);
+          float32x4_t vres_hi =
+            vmulq_f32(vmulq_f32(vx_hi, v_relu6_hi), v_six_inv);
+
+          vst1q_f16(reinterpret_cast<__fp16 *>(&data[i]),
+                    vcombine_f16(vcvt_f16_f32(vres_lo), vcvt_f16_f32(vres_hi)));
+        }
+      }
+#endif
+      for (; i < end; ++i) {
+        const float x = static_cast<float>(data[i]);
+        float relu6 = std::max(0.0f, std::min(x + 3.0f, 6.0f));
+        data[i] = static_cast<T>(x * relu6 / 6.0f);
+      }
+    } else {
+      for (; i < end; ++i) {
+        const float x = static_cast<float>(data[i]);
+        data[i] = static_cast<T>(x / (1.0f + std::exp(-x)));
+      }
+    }
+  });
+}
 
 /**
  * @class   ActiFunc Class

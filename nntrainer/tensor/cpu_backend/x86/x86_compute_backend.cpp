@@ -14,6 +14,7 @@
 #include <assert.h>
 
 #include <avx2_impl.h>
+#include <nntr_ggml_impl.h>
 #ifdef USE_BLAS
 #include <cblas_interface.h>
 #endif
@@ -333,12 +334,62 @@ void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
   return __ggml_q4_0_8x8_q8_0_GEMM(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
+template <>
+void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
+               const float *A, const unsigned int lda, const void *B,
+               const unsigned int ldb, float *C, const unsigned int ldc) {
+  return __ggml_q8_0_q8_0_GEMM(M, N, K, A, lda, B, ldb, C, ldc);
+}
+
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                const unsigned int K, const float *A, const unsigned int lda,
                std::vector<void *> Bs, std::vector<unsigned int> ldbs,
                std::vector<float *> Cs, std::vector<unsigned int> ldcs) {
   throw std::runtime_error("Error: NYI for gemm_q4_0 with vectored weights");
 }
+
+void gemm_q4_0_indirect_conv(const unsigned int M, const unsigned int N,
+                             const unsigned int K, const float *in,
+                             const ConvGatherParams &geom, const void *B,
+                             const unsigned int ldb, float *C,
+                             const unsigned int ldc) {
+  throw std::runtime_error("Error: NYI for gemm_q4_0_indirect_conv on x86");
+}
+
+#ifdef ENABLE_FP16
+void gemm_q4_0_indirect_conv_fp16(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const _FP16 *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc) {
+  throw std::runtime_error(
+    "Error: NYI for gemm_q4_0_indirect_conv_fp16 on x86");
+}
+void gemm_q4_0_indirect_conv_q8_0(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const void *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc) {
+  throw std::runtime_error(
+    "Error: NYI for gemm_q4_0_indirect_conv_q8_0 on x86");
+}
+void gemm_q8_0_indirect_conv_q8_0(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const void *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc) {
+  throw std::runtime_error(
+    "Error: NYI for gemm_q8_0_indirect_conv_q8_0 on x86");
+}
+void gemm_q8_0_indirect_conv_fp16(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const _FP16 *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc) {
+  throw std::runtime_error(
+    "Error: NYI for gemm_q8_0_indirect_conv_fp16 on x86");
+}
+#endif
 
 void gemm_q4_K(const unsigned int M, const unsigned int N, const unsigned int K,
                const float *A, const unsigned int lda, const void *B,
@@ -374,6 +425,11 @@ size_t quantize_q4_0(const float *src, void *dst, int64_t nrow,
   return __ggml_quantize_q4_0(src, dst, nrow, n_per_row, quant_weights);
 }
 
+size_t quantize_q8_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights) {
+  return __ggml_quantize_q8_0(src, dst, nrow, n_per_row, quant_weights);
+}
+
 size_t quantize_q4_K(const float *src, void *dst, int64_t nrow,
                      int64_t n_per_row, const float *quant_weights) {
   return __ggml_quantize_q4_K(src, dst, nrow, n_per_row, quant_weights);
@@ -398,6 +454,14 @@ void dequantize_row_q4_K(const void *x_raw, float *y, int64_t k) {
 
 void dequantize_row_q4_0(const void *x_raw, float *y, int64_t k) {
   __ggml_dequantize_row_q4_0(x_raw, y, k);
+}
+
+void dequantize_row_q8_0(const void *x_raw, float *y, int64_t k) {
+  __ggml_dequantize_row_q8_0(x_raw, y, k);
+}
+
+void quantize_row_q8_0(const float *src, void *dst, int64_t k) {
+  nntr_quantize_row_q8_0(src, dst, k);
 }
 
 void dequantize_row_q6_K(const void *x, float *y, int64_t k) {
@@ -505,6 +569,36 @@ void clamp(const float *input, float *output, size_t length, float lower_bound,
            float upper_bound) {
   nntrainer::avx2::clamp(input, output, length, lower_bound, upper_bound);
 }
+
+void depthwise_conv2d_fp32(const float *input, const float *kernel,
+                           float *output, unsigned int batch,
+                           unsigned int channels, unsigned int in_h,
+                           unsigned int in_w, unsigned int out_h,
+                           unsigned int out_w, unsigned int kh, unsigned int kw,
+                           unsigned int stride_h, unsigned int stride_w,
+                           unsigned int pad_top, unsigned int pad_left,
+                           unsigned int dilation_h, unsigned int dilation_w) {
+  // TODO: AVX specialization
+  __fallback_depthwise_conv2d_fp32(
+    input, kernel, output, batch, channels, in_h, in_w, out_h, out_w, kh, kw,
+    stride_h, stride_w, pad_top, pad_left, dilation_h, dilation_w);
+}
+
+#ifdef ENABLE_FP16
+void depthwise_conv2d_fp16(const _FP16 *input, const float *kernel,
+                           _FP16 *output, unsigned int batch,
+                           unsigned int channels, unsigned int in_h,
+                           unsigned int in_w, unsigned int out_h,
+                           unsigned int out_w, unsigned int kh, unsigned int kw,
+                           unsigned int stride_h, unsigned int stride_w,
+                           unsigned int pad_top, unsigned int pad_left,
+                           unsigned int dilation_h, unsigned int dilation_w) {
+  // TODO: AVX fp16 specialization
+  __fallback_depthwise_conv2d_fp16(
+    input, kernel, output, batch, channels, in_h, in_w, out_h, out_w, kh, kw,
+    stride_h, stride_w, pad_top, pad_left, dilation_h, dilation_w);
+}
+#endif
 
 void create_q4_0_weights(const uint8_t *int4_weight, uint8_t *q4_0_weight) {
   nntrainer::avx2::create_q4_0_weights(int4_weight, q4_0_weight);

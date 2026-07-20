@@ -17,6 +17,8 @@
 #include <tensor.h>
 #include <util_func.h>
 
+#include <conv_indirect.h>
+
 namespace nntrainer {
 
 HalfTensor::HalfTensor(std::string name_, Tformat fm) :
@@ -727,6 +729,9 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
 
 Tensor &HalfTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
                            bool trans_in, float beta, Tdatatype dtype) const {
+  NNTR_THROW_IF(trans, std::invalid_argument)
+    << "dotQnK does not support trans";
+
   auto *o = getOps();
   _FP16 *data = (_FP16 *)getData();
   uint8_t *mdata = input.getData<uint8_t>();
@@ -746,6 +751,33 @@ Tensor &HalfTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   default:
     throw std::invalid_argument("Error: unsupported datatype");
   }
+  return output;
+}
+
+Tensor &HalfTensor::convQ4_0Indirect(Tensor const &weight, Tensor &output,
+                                     const ConvGatherParams &geom) const {
+  // `this` is the NCHW FP16 input (gathered on the fly in FP16), `weight` is
+  // the Q4_0 filter [CRS, out_ch], `output` is [OH*OW, out_ch] FP16. The fused
+  // backend op mirrors FloatTensor::convQ4_0Indirect: M = output rows (OH*OW),
+  // N = out_ch, K = CRS. The gather stays FP16 (no FP32 staging), the FP16 Q8_0
+  // quantizer (id-FP32-narrowing-fixed) feeds the FP16-output Q4_0xQ8_0 GEMM.
+  const _FP16 *in = (const _FP16 *)getData();
+  uint8_t *wdata = weight.getData<uint8_t>();
+  _FP16 *rdata = output.getData<_FP16>();
+
+  unsigned int M = output.getDim().height();
+  unsigned int N = output.getDim().width();
+  unsigned int K =
+    (unsigned int)geom.in_ch * (unsigned int)geom.k_h * (unsigned int)geom.k_w;
+
+  // Q8_0 weights use the plain-block Q8_0xQ8_0 kernel; Q4_0 uses the
+  // interleaved SMMLA kernel. Both quantize this FP16 activation identically.
+  if (weight.getDataType() == Tdatatype::Q8_0)
+    getOps()->gemm_q8_0_indirect_conv_fp16(M, N, K, in, geom, (void *)wdata, N,
+                                           rdata, N);
+  else
+    getOps()->gemm_q4_0_indirect_conv_fp16(M, N, K, in, geom, (void *)wdata, N,
+                                           rdata, N);
   return output;
 }
 

@@ -477,6 +477,19 @@ public:
 };
 
 /**
+ * @brief Groups property for grouped convolution.
+ *        Input and output channels are split into `groups` independent groups.
+ *        groups=1 (the default when unset) is a regular conv;
+ * groups=in_channels is a depthwise conv. Left empty by default so it is not
+ * serialized for ordinary (groups=1) convolutions.
+ */
+class ConvGroups : public nntrainer::PositiveIntegerProperty {
+public:
+  static constexpr const char *key = "groups"; /**< unique key to access */
+  using prop_tag = uint_prop_tag;              /**< property type */
+};
+
+/**
  * @brief KernelSize property, kernel size is used to measure the filter size
  *
  */
@@ -1013,6 +1026,22 @@ class Activation final
 public:
   using prop_tag = enum_class_prop_tag;
   static constexpr const char *key = "activation";
+};
+
+/**
+ * @brief FusedActivation Enumeration Information
+ *
+ * @note Unlike props::Activation (key "activation"), this property is NOT
+ * intercepted by LayerNode's realization props nor split off into a standalone
+ * activation node by ActivationRealizer. It lets a layer (e.g. Conv2D) fuse an
+ * elementwise activation directly into its output write, avoiding the extra
+ * full-tensor read+write pass a separate activation layer would cost.
+ */
+class FusedActivation final
+  : public EnumProperty<nntrainer::props::ActivationTypeInfo> {
+public:
+  using prop_tag = enum_class_prop_tag;
+  static constexpr const char *key = "fused_activation";
 };
 
 /**

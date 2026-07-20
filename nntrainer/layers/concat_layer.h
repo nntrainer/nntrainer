@@ -109,6 +109,9 @@ private:
     input_reshape_helper;          /** helper dimension to reshape inputs */
   TensorDim output_reshape_helper; /** helper dimension to reshape outputs */
   std::tuple<props::ConcatDimension> concat_props;
+  unsigned int concat_dimension_cache =
+    1; /**< resolved in finalize for
+      forwarding (NHWC channel-concat path) */
 
   /**
    * @brief set batch for the internal variables

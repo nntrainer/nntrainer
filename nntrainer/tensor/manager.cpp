@@ -909,12 +909,28 @@ void Manager::flushCacheExcept(unsigned int order) {
 void Manager::finalizeTensorPool(TensorPool &pool, unsigned int start,
                                  unsigned int end) {
   if (enable_optimizations) {
+#if defined(ENABLE_MEMORY_PLANNER_V3)
+    /**
+     * Opt-in (compile time -DENABLE_MEMORY_PLANNER_V3, meson
+     * -Dmemory-planner=v3 or ndk-build ENABLE_MEMORY_PLANNER_V3=1) lower
+     * peak-memory planner. The Android CausalLM inference build enables it.
+     */
+    pool.finalize(OptimizedV3Planner(), start, end);
+#elif defined(ENABLE_MEMORY_PLANNER_V2)
+    /**
+     * Opt-in OptimizedV2Planner (meson -Dmemory-planner=v2). Note: V2 is not
+     * part of the validated default path; selected explicitly for evaluation.
+     */
+    pool.finalize(OptimizedV2Planner(), start, end);
+#else
+    /// Default validated planner (OptimizedV1Planner), selected by 'auto'/'v1'.
     if (exec_mode == ExecutionMode::INFERENCE && enable_fsu) {
       //@todo change V3 and validate
       pool.finalize(OptimizedV1Planner(), start, end);
     } else {
       pool.finalize(OptimizedV1Planner(), start, end);
     }
+#endif
   } else {
     pool.finalize(BasicPlanner(), start, end);
   }

@@ -13,6 +13,9 @@
 #include <quantizer.h>
 #include <tensor.h>
 
+/**
+ * @brief Namespace for nntrainer core components
+ */
 namespace nntrainer {
 
 /**
@@ -264,6 +267,9 @@ Tensor GgmlQuantizer::quantize(const Tensor &input, Tdatatype qtype) {
   case QScheme::Q4_0:
     out_dtype = Tdatatype::Q4_0;
     break;
+  case QScheme::Q8_0:
+    out_dtype = Tdatatype::Q8_0;
+    break;
   default:
     throw std::invalid_argument(
       "[GgmlQuantizer::quantize] Unsupported QScheme.");
@@ -293,6 +299,9 @@ Tensor GgmlQuantizer::quantize(const Tensor &input, Tdatatype qtype) {
   case QScheme::Q4_0:
     quantize_q4_0(src, tmp.data(), N, K, nullptr);
     break;
+  case QScheme::Q8_0:
+    quantize_q8_0(src, tmp.data(), N, K, nullptr);
+    break;
   default:
     break;
   }
@@ -303,7 +312,7 @@ Tensor GgmlQuantizer::quantize(const Tensor &input, Tdatatype qtype) {
   } else if (scheme_ == QScheme::Q4_0) {
     repack_q4_0(output.getData<uint8_t>(), tmp.data(), out_size, N, K);
   } else {
-    // Q6_K: copy directly (no repacking needed)
+    // Q6_K and Q8_0 use their native GGML row layout directly.
     memcpy(output.getData<uint8_t>(), tmp.data(), out_size);
   }
 
@@ -341,6 +350,9 @@ Tensor &GgmlQuantizer::quantize(const Tensor &input, Tensor &output,
     break;
   case QScheme::Q4_0:
     quantize_q4_0(src, tmp.data(), N, K, nullptr);
+    break;
+  case QScheme::Q8_0:
+    quantize_q8_0(src, tmp.data(), N, K, nullptr);
     break;
   default:
     throw std::invalid_argument(
@@ -387,6 +399,9 @@ Tensor GgmlQuantizer::dequantize(const Tensor &input, Tdatatype dtype) {
   case QScheme::Q4_0:
     unpack_q4_0(src, tmp.data(), data_size, N, K);
     dequantize_row_q4_0(tmp.data(), output.getData(), total_elems);
+    break;
+  case QScheme::Q8_0:
+    dequantize_row_q8_0(src, output.getData(), total_elems);
     break;
   default:
     throw std::invalid_argument(
