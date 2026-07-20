@@ -55,6 +55,42 @@ bool cuda_fc_qs4cx_gemm_fp16_naive(const unsigned short *Xh,
                                    unsigned short *Yh, unsigned int M,
                                    unsigned int N, unsigned int K);
 
+/**
+ * @brief w4a8 dp4a fast path: Y[M,N] = X[M,K] * dequant(QS4CX W), FP32
+ *        activation. Per-row asymmetric int8 activation quant + symmetric int4
+ *        weight, int8xint8 dot via __dp4a on the int ALU. The int4 weight is
+ *        repacked to signed packed int4 once and cached on device (keyed by
+ *        @p plain_w). The int32 accumulate is exact.
+ * @return true on success.
+ */
+bool cuda_fc_qs4cx_dp4a_gemm_fp32(const float *X, const unsigned char *plain_w,
+                                  const unsigned short *scales_fp16, float *Y,
+                                  unsigned int M, unsigned int N,
+                                  unsigned int K);
+
+/** @brief fp16-activation variant of cuda_fc_qs4cx_dp4a_gemm_fp32: fp16 in /
+ *  fp16 out (the conversion folded into the GEMM epilogue). */
+bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
+                                  const unsigned char *plain_w,
+                                  const unsigned short *scales_fp16,
+                                  unsigned short *Yh, unsigned int M,
+                                  unsigned int N, unsigned int K);
+
+/**
+ * @brief w4a8 on the INT8 Tensor Cores via cuBLAS (prefill FC). Same quant
+ *        scheme as the dp4a path (per-row asym int8 activation x symmetric int4
+ *        weight) but the int8xint8->int32 GEMM runs on the IMMA Tensor Cores
+ *        (~10x the dp4a int-ALU GEMM at prefill M). The int32 accumulate is
+ *        exact, so the result is bit-identical to dp4a; the int4->int8 weight
+ *        unpack is cached once. Returns false (caller falls to dp4a) on any
+ *        cuBLAS/runtime failure.
+ */
+bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
+                                       const unsigned char *plain_w,
+                                       const unsigned short *scales_fp16,
+                                       unsigned short *Yh, unsigned int M,
+                                       unsigned int N, unsigned int K);
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_FC_QINT4_H__

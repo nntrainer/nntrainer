@@ -238,18 +238,30 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
         auto *Xh =
           reinterpret_cast<const unsigned short *>(input.getData<_FP16>());
         auto *Yh = reinterpret_cast<unsigned short *>(output.getData<_FP16>());
+        // Prefill (M>=32): w4a8 on the INT8 Tensor Cores via cuBLAS (~10x the
+        // dp4a int-ALU GEMM, bit-identical). Then the dp4a fast path, then
+        // the naive plain GEMM -- each falls to the next on failure.
+        const bool prefill = M >= 32;
         if (nntrainer::cuda::dev_accessible(Xh) &&
-            cuda::cuda_fc_qs4cx_gemm_fp16_naive(Xh, W, S, Yh, (unsigned)M,
-                                                (unsigned)N, (unsigned)K))
+            ((prefill &&
+              cuda::cuda_fc_qs4cx_cublas_i8_gemm_fp16(
+                Xh, W, S, Yh, (unsigned)M, (unsigned)N, (unsigned)K)) ||
+             cuda::cuda_fc_qs4cx_dp4a_gemm_fp16(Xh, W, S, Yh, (unsigned)M,
+                                                (unsigned)N, (unsigned)K) ||
+             cuda::cuda_fc_qs4cx_gemm_fp16_naive(Xh, W, S, Yh, (unsigned)M,
+                                                 (unsigned)N, (unsigned)K)))
           return;
       }
 #endif
       if (at == DT::FP32 && output.getDataType() == DT::FP32) {
         const float *X = input.getData<float>();
         float *Y = output.getData<float>();
+        // w4a8 dp4a fast path; falls to the naive plain GEMM on failure.
         if (nntrainer::cuda::dev_accessible(X) &&
-            cuda::cuda_fc_qs4cx_gemm_fp32(X, W, S, Y, (unsigned)M, (unsigned)N,
-                                          (unsigned)K))
+            (cuda::cuda_fc_qs4cx_dp4a_gemm_fp32(X, W, S, Y, (unsigned)M,
+                                                (unsigned)N, (unsigned)K) ||
+             cuda::cuda_fc_qs4cx_gemm_fp32(X, W, S, Y, (unsigned)M, (unsigned)N,
+                                           (unsigned)K)))
           return;
       }
     }
