@@ -522,6 +522,15 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
   return forwarding(training);
 }
 
+// CUDA M2-B embed-only feed flag (decoupled from the OpenCL recq skip): true
+// while the single-capture replay re-runs ONLY the embedding nodes to refresh
+// the pinned staging buffer for the new token id; the forwarding_op below then
+// skips every other node's host forward (the GPU work comes from the replayed
+// graph).
+static bool g_m2b_skip_all = false;
+
+void NeuralNetwork::setM2BSkipAll(bool v) { g_m2b_skip_all = v; }
+
 // The exec-engine seam base: one decode/prefill forward step is a plain graph
 // walk. CPU and OpenCL use this base unchanged, so they are byte-identical to
 // the pre-seam code; a backend with its own decode engine overrides it.

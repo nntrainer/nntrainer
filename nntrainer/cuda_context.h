@@ -184,6 +184,20 @@ public:
   }
 
   /**
+   * @copydoc Context::runDecode
+   * @brief CUDA override of the decode/prefill step: the CUDA-graph
+   *        capture/replay state machine (M1 decode graph / M2-B single-capture
+   *        coherent replay / prefill graph), gated by NNTR_CUDA_GRAPH /
+   *        NNTR_CUDA_M2B / NNTR_CUDA_PREFILL_GRAPH. With those unset it is a
+   * plain eager walk == the base, so engine=cuda without the graph flags stays
+   *        byte-identical. Relocated verbatim from neuralnet.cpp. [T9]
+   */
+  std::vector<std::shared_ptr<const Tensor>>
+  runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
+            const std::vector<std::shared_ptr<const Tensor>> &input,
+            const std::vector<std::shared_ptr<const Tensor>> &label) override;
+
+  /**
    * @brief Device capability snapshot, probed once in initialize(). LOG-ONLY.
    */
   const DeviceCaps &caps() const override { return caps_; }

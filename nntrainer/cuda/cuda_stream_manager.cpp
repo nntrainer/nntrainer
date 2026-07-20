@@ -17,8 +17,21 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <env_compat.h>
 
 namespace nntrainer::cuda {
+
+// [CAP-AUDIT] prints are opt-in diagnostics (NNTR_CUDA_CAP_AUDIT=1): with the
+// M2-B decode graph default-ON they fire on every capture (one per shared-
+// layer drain preamble, ~68 lines/run) and read as errors to SDK consumers,
+// while in sync mode (ASYNC off, the Windows default) the skipped drains are
+// no-ops to begin with. Correctness is covered by the replay validations
+// (byte-identical vs the sync path, 6-run determinism); flip the env on when
+// hunting a NEW capture-time host-fallback hazard.
+static bool cap_audit_on() {
+  static const bool on = nntr_env_on("NNTR_CUDA_CAP_AUDIT");
+  return on;
+}
 
 void StreamManager::initialize() noexcept {
   // make sure the device + primary context exist before creating a stream
@@ -72,7 +85,7 @@ void StreamManager::finish() {
     // that depended on this drain now consumes stale bytes -- audit-log the
     // skip so capture-time host fallbacks are visible.
     static int audit_n = 0;
-    if (++audit_n <= 32)
+    if (++audit_n <= 32 && cap_audit_on())
       std::fprintf(
         stderr, "[CAP-AUDIT] finish() skipped during capture (#%d)\n", audit_n);
     return;
@@ -157,7 +170,7 @@ void StreamManager::finishIfAsync() {
     // Same audit as finish(): callers of finishIfAsync are host-fallback
     // preambles -- a hit during capture means a host op ran inside the graph.
     static int audit_n = 0;
-    if (++audit_n <= 32)
+    if (++audit_n <= 32 && cap_audit_on())
       std::fprintf(stderr,
                    "[CAP-AUDIT] finishIfAsync() skipped during capture (#%d)\n",
                    audit_n);
