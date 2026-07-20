@@ -85,6 +85,70 @@ void CudaContext::initialize() noexcept {
     caps_.unified_memory = true; // cudaMallocManaged (UVM) is the default pool
     ml_logi("[CudaContext] %s", caps_.toString().c_str());
 
+    // HW-optimal CUDA env defaults (same rationale/semantics as ClContext):
+    // NNTR_ENGINE=cuda already selected this context (so no engine guard is
+    // needed here — this only runs on a CUDA run), fill the tuned GPU-op flag
+    // set so a bare CUDA run gets full-GPU residency without exporting ~15
+    // flags. setenv(..., 0): overwrite=0, so an explicit env ALWAYS wins (=0
+    // disables). These are the COMMON flags — "all models, both HW classes" —
+    // that move rope/attn/geglu/eltwise/qknorm/FC onto the GPU. Several of
+    // these gate app-side (rope/attn) or deferred (M2B just landed) paths, so
+    // they are inert until those consumers exist; harmless when unread.
+    setenv("NNTR_CUDA_ROPE", "1", 0);
+    setenv("NNTR_CUDA_ATTN", "1", 0);
+    setenv("NNTR_CUDA_KV_UVM", "1", 0);
+    setenv("NNTR_CUDA_GEGLU", "1", 0);
+    setenv("NNTR_CUDA_ELTWISE", "1", 0);
+    setenv("NNTR_CUDA_QKNORM", "1", 0);
+    setenv("NNTR_CUDA_FLASH_DECODE", "64", 0);
+    setenv("NNTR_CUDA_BLOCKQ", "1", 0);
+    setenv("NNTR_FC_CUDA_CUBLAS", "1", 0);
+    setenv("NNTR_CUDA_PREWARM", "1", 0);
+    if (!caps_.integrated && context_inst_.concurrentManagedAccess()) {
+      // Discrete (RTX/dGPU) residency + decode-CUDA-graph add-ons: device-only
+      // activations, prefill v-copy, ALL-rows CUDA RMSNorm (despite the env's
+      // name, "=all" RAISES the CUDA row cap to everything -- see
+      // cuda_rmsnorm_layer.cpp; a non-'a' value like =1 is what disables it),
+      // the M2-B decode graph, and async submission. On integrated
+      // (Tegra/Orin) these are skipped — managed activations are the right
+      // pool. Also skipped when concurrentManagedAccess==0 (Windows WDDM): each
+      // of these lets a HOST op touch managed/device pool memory around
+      // in-flight kernels (ASYNC drops the per-op drains outright;
+      // DEV_ACT+RMSNORM_OFF put host RMSNorm/staging reads mid-chain), which is
+      // only legal under cMA=1 — on WDDM the first such touch is a 0xC0000005
+      // host AV. The safe WDDM default is the base profile: managed pools +
+      // per-op drains.
+      setenv("NNTR_CUDA_DEV_ACT", "1", 0);
+      setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
+      setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
+      setenv("NNTR_CUDA_M2B", "1", 0);
+      // NNTR_DETERMINISTIC keeps the per-op drains: ASYNC removes them and
+      // is the one auto-set lever whose host/device overlap can turn a
+      // knife-edge logit into a run-to-run coin flip (round-15 audit).
+      {
+        const char *det = getenv("NNTR_DETERMINISTIC");
+        setenv("NNTR_CUDA_ASYNC", (det && det[0] == '1') ? "0" : "1", 0);
+      }
+    } else if (!caps_.integrated) {
+      // Windows WDDM (discrete, cMA==0): the per-token ~350-launch dispatch
+      // pays the WDDM submission tax (~94us/launch -> decode ~30 TPS on a
+      // 5070L). Default ON the same device-resident chain + M2-B decode
+      // graph as the cMA branch above -- all four are long field-proven on
+      // WDDM (the Windows a2 production stack) and the graph replay is ONE
+      // launch per token (measured 58-63 TPS, +93-100%, byte-identical,
+      // 6-run deterministic; packaged-SDK summary 30.6 -> 57.9). A FIXED
+      // replayed graph is deterministic by construction, so the
+      // default-determinism contract holds. Every setenv here is
+      // overwrite=0 and value-checked downstream, so =0 (or =1 for
+      // RMSNORM_CUDA_OFF) still opts out per lever. ASYNC stays off: drain
+      // removal is the round-15 knife-edge nondeterminism lever and adds
+      // nothing on top of the graph (58.5 vs 58.4 TPS).
+      setenv("NNTR_CUDA_DEV_ACT", "1", 0);
+      setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
+      setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
+      setenv("NNTR_CUDA_M2B", "1", 0);
+    }
+
     add_default_object();
 
     // Unified-Memory allocator: MemoryPool buffers for engine=cuda tensors are
