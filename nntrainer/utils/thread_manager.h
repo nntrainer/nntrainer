@@ -12,7 +12,7 @@
  * @bug    No known bugs except for NYI items
  */
 
-/*
+/**
 Copyright 2019 Google LLC
 Copyright (c) 2017 Facebook Inc.
 Copyright (c) 2015-2017 Georgia Institute of Technology
@@ -80,6 +80,9 @@ namespace nntrainer {
 #error "Platform-specific implementation of CACHELINE_ALIGNED required"
 #endif
 
+/**
+ * @brief Configuration for ThreadManager: compute threads and affinity settings
+ */
 struct ThreadManagerConfig {
   uint32_t compute_threads = defaultComputeThreads();
   bool enable_affinity = true;
@@ -108,6 +111,9 @@ private:
   }
 };
 
+/**
+ * @brief Per-thread range information for parallel work distribution
+ */
 struct CACHELINE_ALIGNED thread_info {
   CACHELINE_ALIGNED std::atomic<size_t> range_start;
   CACHELINE_ALIGNED std::atomic<size_t> range_end;
@@ -142,6 +148,14 @@ class ThreadManager : public Singleton<ThreadManager> {
 public:
   ThreadManager();
   ~ThreadManager();
+
+  /**
+   * @brief Get the process-wide instance (out-of-line override of
+   *        Singleton<T>::Global() — one worker pool per process under shared
+   *        linking; see opencl::ContextManager::Global() for the full
+   *        static-vs-shared note).
+   */
+  static ThreadManager &Global();
 
   /**
    * @brief parallize loop for given function

@@ -40,6 +40,13 @@ ThreadManagerConfig ThreadManager::config_ = {};
 
 ThreadManager::ThreadManager() {}
 
+ThreadManager &ThreadManager::Global() {
+  // Out-of-line on purpose — single process-wide instance (see header note).
+  static ThreadManager instance;
+  instance.initializeOnce();
+  return instance;
+}
+
 ThreadManager::~ThreadManager() {
 #if defined(__linux__) || defined(__ANDROID__)
   active_threads_.store(compute_workers_.size(), std::memory_order_relaxed);
