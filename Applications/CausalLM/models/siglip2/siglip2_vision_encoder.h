@@ -130,11 +130,6 @@ private:
   unsigned int NUM_PATCHES = 196; /**< Number of patches */
   unsigned int IMG_CHANNELS = 3;  /**< Image channels (RGB) */
 
-  /** patch_embed_conv weight dtype (nntr_config "patch_embed_dtype").
-   *  Defaults to FP32 so existing quantized files keep loading; the quantizer
-   *  writes "Q8_0" when it quantizes the patch conv. */
-  std::string PATCH_EMBED_DTYPE = "FP32";
-
   /** Owned buffer for the last encode() call output. */
   std::vector<float> enc_output_buf_;
 };

@@ -557,10 +557,9 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
  *   enc_layer{i}_wq, _wk, _wv, _out, _fc1, _fc2
  * plus the single enc_to_dec_proj FC. All are 2D, so they take fc_dtype (Q4_0).
  *
- * For Q8_0 the patch_embed_conv is quantized too (stored [CRS, out_ch] by
- * Conv2DLayer::save, run via NCHW im2col + the interleaved int8 GEMM); for
- * Q4_0 it stays FP32 (a Q4_0 tensor must be 2D). pos_embedding and all
- * LayerNorms stay FP32.
+ * Deliberately left FP32 (NOT quantized): patch_embed_conv is a 4D conv kernel
+ * (a Q4_0 tensor must be 2D) and pos_embedding is FP32-pinned; the encoder
+ * graph pins both via explicit per-layer dtypes. All LayerNorms stay FP32 too.
  */
 std::map<std::string, DataType> buildEncoderLayerDtypeMap(int enc_layers,
                                                           DataType fc_dtype) {
@@ -580,12 +579,6 @@ std::map<std::string, DataType> buildEncoderLayerDtypeMap(int enc_layers,
       dtype_map[pfx + "_fc2"] = fc_dtype;
     }
     dtype_map["enc_to_dec_proj"] = fc_dtype;
-    // Q8_0 also covers the 16x16 stride-16 patch conv: with no overlap it is a
-    // pure [196, 768] x [768, 768] matmul, stored [CRS, out_ch] by
-    // Conv2DLayer::save and consumed by the same interleaved int8 GEMM as the
-    // FCs (NCHW im2col + dotQnK). Q4_0 keeps the conv FP32 (unchanged).
-    if (fc_dtype == DataType::Q8_0)
-      dtype_map["patch_embed_conv"] = fc_dtype;
   }
 
   return dtype_map;
@@ -965,11 +958,6 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["fc_layer_dtype"] = dataTypeToStr(fc_dtype);
     new_nntr_cfg["embedding_dtype"] = dataTypeToStr(embd_dtype);
     new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
-    // The encoder's patch conv is quantized alongside the FCs for Q8_0 (the
-    // NCHW conv runs the same interleaved int8 GEMM); record its dtype so the
-    // runtime graph declares the matching weight tensor.
-    if (is_encoder && fc_dtype == DataType::Q8_0)
-      new_nntr_cfg["patch_embed_dtype"] = dataTypeToStr(fc_dtype);
     new_nntr_cfg["model_tensor_type"] =
       buildModelTensorType(dataTypeToStr(fc_dtype));
 
