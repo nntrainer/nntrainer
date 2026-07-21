@@ -320,6 +320,7 @@ void Siglip2VisionEncoder::setupParameters(json &cfg, json &generation_cfg,
   MODEL_TENSOR_TYPE = nntr_cfg.value("model_tensor_type", "FP32-FP32");
   EMBEDDING_DTYPE = nntr_cfg.value("embedding_dtype", "FP32");
   FC_LAYER_DTYPE = nntr_cfg.value("fc_layer_dtype", "FP32");
+  PATCH_EMBED_DTYPE = nntr_cfg.value("patch_embed_dtype", "FP32");
 
   // Encoder config may be nested under cfg["encoder"] in a combined
   // config.json, or at the top level (standalone encoder config.json).
@@ -372,12 +373,13 @@ Tensor Siglip2VisionEncoder::createPatchEmbed(Tensor input) {
   const int embed_dim = DIM;
 
   // Conv2D with bias (SigLIP2 delta from timm_vit which had disable_bias=true)
-  // Pin the conv kernel to FP32 explicitly. conv2d resolves its weight dtype
-  // from the model's global weight type (LayerNode applies the per-layer
-  // weight_dtype property to tensor_type[1], which conv2d reads via
-  // context.getWeightDataType()). A Q4_0 weight type is rejected for this 4D
-  // kernel ("Q4_0_Tensor must be 2 dimensional"), so even if the encoder were
-  // ever built with a quantized global type, this keeps the conv FP32.
+  // Weight dtype follows nntr_config "patch_embed_dtype" (default FP32): the
+  // 16x16 stride-16 patch conv is a pure [196, 768] x [768, 768] matmul (no
+  // overlap), so with Q8_0 it runs through the same interleaved int8 GEMM as
+  // the FC layers (conv2d stores the filter as a [CRS, out_ch] matmul weight
+  // and takes the im2col + dotQnK path on NCHW). It is deliberately NOT tied
+  // to fc_layer_dtype so pre-existing quantized files (conv saved FP32) keep
+  // loading unchanged.
   LayerHandle conv(createLayer(
     "conv2d", {withKey("name", "patch_embed_conv"),
                withKey("kernel_size", {std::to_string(PATCH_SIZE),
@@ -386,7 +388,7 @@ Tensor Siglip2VisionEncoder::createPatchEmbed(Tensor input) {
                withKey("stride", {std::to_string(PATCH_SIZE),
                                   std::to_string(PATCH_SIZE)}),
                withKey("padding", "valid"), withKey("disable_bias", "false"),
-               withKey("weight_dtype", "FP32")}));
+               withKey("weight_dtype", PATCH_EMBED_DTYPE)}));
   Tensor h = conv(input);
 
   // Reshape from [1, embed_dim, H/P, W/P] -> [1, 1, embed_dim, num_patches]
