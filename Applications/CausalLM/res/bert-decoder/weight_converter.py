@@ -124,11 +124,14 @@ def collect_decoder(sd, dtype):
     bp = "decoder.bert."
 
     # 1–4. Embeddings
-    add("word_emb:weight",
+    # NOTE tensor names must match the runtime weight names exactly: the
+    # safetensors loader matches by name and silently skips misses. The
+    # embedding_layer names its lookup table "Embedding" (not "weight").
+    add("word_emb:Embedding",
         sd[f"{bp}embeddings.word_embeddings.weight"])
-    add("pos_emb:weight",
+    add("pos_emb:Embedding",
         sd[f"{bp}embeddings.position_embeddings.weight"])
-    add("type_emb:weight",
+    add("type_emb:Embedding",
         sd[f"{bp}embeddings.token_type_embeddings.weight"])
     add("emb_ln:gamma",
         sd[f"{bp}embeddings.LayerNorm.weight"])
@@ -212,7 +215,8 @@ def collect_decoder(sd, dtype):
         sd[f"{cp}predictions.transform.LayerNorm.weight"])
     add("lmhead_ln:beta",
         sd[f"{cp}predictions.transform.LayerNorm.bias"])
-    add("lmhead_bias",
+    # weight layer "lm_head_bias/weights" with weight_name "lmhead_bias"
+    add("lm_head_bias/weights:lmhead_bias",
         sd[f"{cp}predictions.bias"])
 
     return weights

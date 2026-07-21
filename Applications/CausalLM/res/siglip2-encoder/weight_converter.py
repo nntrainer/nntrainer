@@ -119,7 +119,11 @@ def collect_encoder(sd, dtype):
     vp = "encoder.vision_model."
 
     # 1–2. Patch embedding (Conv2D — keep OIHW, no transpose)
-    add("patch_embed_conv:weight",
+    # NOTE tensor names must match the runtime weight names exactly: the
+    # safetensors loader matches by name and silently skips misses. conv2d
+    # names its kernel "filter" (not "weight"); the pos_embedding weight
+    # layer names its tensor after its weight_name property.
+    add("patch_embed_conv:filter",
         sd[f"{vp}embeddings.patch_embedding.weight"],
         transpose=False)
     add("patch_embed_conv:bias",
@@ -128,7 +132,7 @@ def collect_encoder(sd, dtype):
     # 3. Position embedding [196,768] → [1,1,196,768]
     pos = sd[f"{vp}embeddings.position_embedding.weight"]  # [196, 768]
     pos_reshaped = pos.unsqueeze(0).unsqueeze(0)           # [1, 1, 196, 768]
-    add("pos_embedding:weight", pos_reshaped, transpose=False)
+    add("pos_embedding:pos_embedding", pos_reshaped, transpose=False)
 
     # 4. Transformer layers
     for i in range(ENC_LAYERS):
