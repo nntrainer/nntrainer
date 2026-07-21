@@ -309,9 +309,15 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
   // which in turned" -- the exact same env-check split we swept everywhere
   // else; see env_compat.h).
   static const bool cuda_m2b = nntr_env_on("NNTR_CUDA_M2B");
-  if (cuda_m2b && from == 0 && _cg_cached_exec != nullptr) {
-    // new sequence (prefill boundary): drop the previous sequence's cached
-    // graph.
+  if (cuda_m2b && (from == 0 || (to - from) > 1) &&
+      _cg_cached_exec != nullptr) {
+    // Prefill boundary: a new sequence (from==0) OR a resumed-block prefill
+    // (from>0, M>1 — multi-turn / KV-restore under NNTR_RESUME_BLOCK). Drop
+    // the previous sequence's cached decode graph BEFORE the eager M>1
+    // forward: that forward may grow (free+realloc) the dp4a/i8/attention
+    // scratch the captured graph references, and replaying it afterwards
+    // launches with dangling device/pinned pointers (cudaGraphLaunch SEGV).
+    // The next decode recaptures against the fresh pointers anyway.
     cudaGraphExecDestroy(_cg_cached_exec);
     _cg_cached_exec = nullptr;
     _cg_cached_out = {};
