@@ -32,11 +32,27 @@ inline size_t modulo_decrement(size_t i, size_t n) {
   return i - 1;
 }
 
+class ParallelRegionGuard {
+public:
+  explicit ParallelRegionGuard(bool &in_parallel_region) :
+    in_parallel_region_(in_parallel_region),
+    previous_value_(in_parallel_region) {
+    in_parallel_region_ = true;
+  }
+
+  ~ParallelRegionGuard() { in_parallel_region_ = previous_value_; }
+
+private:
+  bool &in_parallel_region_;
+  bool previous_value_;
+};
+
 } // namespace
 
 namespace nntrainer {
 
 ThreadManagerConfig ThreadManager::config_ = {};
+thread_local bool ThreadManager::in_parallel_region_ = false;
 
 ThreadManager::ThreadManager() {}
 
@@ -244,6 +260,7 @@ inline bool ThreadManager::try_decrement(std::atomic<size_t> &value) {
 }
 
 void ThreadManager::thread_parallelize(size_t my_tid) {
+  ParallelRegionGuard parallel_region_guard(in_parallel_region_);
 
   // process my job
   size_t range_start =
