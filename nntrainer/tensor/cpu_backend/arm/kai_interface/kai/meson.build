@@ -2,6 +2,12 @@ kai_headers = [
     'kai_common.h'
 ]
 
+if get_option('enable-fp16')
+subdir('matmul_clamp_f16_qai8dxp_qsi4cxp')
+nntrainer_inc += include_directories('matmul_clamp_f16_qai8dxp_qsi4cxp')
+nntrainer_inc_abs += meson.current_source_dir() / 'matmul_clamp_f16_qai8dxp_qsi4cxp'
+endif
+
 subdir('matmul_clamp_f32_qai8dxp_qsi4cxp')
 nntrainer_inc += include_directories('matmul_clamp_f32_qai8dxp_qsi4cxp')
 nntrainer_inc_abs += meson.current_source_dir() / 'matmul_clamp_f32_qai8dxp_qsi4cxp'

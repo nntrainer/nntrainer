@@ -210,6 +210,105 @@ INSTANTIATE_TEST_SUITE_P(
     return ret;
   });
 
+#ifdef ENABLE_FP16
+
+void test_f16_qai8dxp_qsi4cxp_cosine_similarity(size_t M, size_t N, size_t K) {
+  constexpr double cosine_threshold = 0.99;
+
+  std::vector<float> activation_f32 = generate_random_vector<float>(M * K);
+  std::vector<__fp16> activation_f16(M * K);
+  for (size_t i = 0; i < M * K; i++) {
+    activation_f16[i] = static_cast<__fp16>(activation_f32[i]);
+  }
+
+  std::vector<float> weight = generate_random_vector<float>(N * K);
+  std::vector<float> ref_dst(M * N);
+  std::vector<__fp16> dst_f16(M * N);
+  std::vector<float> dst(M * N);
+
+  const size_t rhs_native_size_qs4cx = N * (K + 1) / 2 * sizeof(uint8_t);
+  const size_t rhs_scales_size_f32 = N * sizeof(float);
+
+  uint8_t *rhs_native_mtx_qs4cx = new uint8_t[rhs_native_size_qs4cx];
+  uint8_t *rhs_scales_f32 = new uint8_t[rhs_scales_size_f32];
+
+  nntrainer::quant_qs4cx_f32(N, K, weight.data(), rhs_native_mtx_qs4cx,
+                             rhs_scales_f32, true);
+
+  // Calculate reference output using pure F32xF32->F32 GEMM/GEMV
+  if (M == 1) {
+    // GEMV: ref_dst[n] = sum_k(activation_f32[k] * weight[n, k])
+    for (size_t n = 0; n < N; n++) {
+      float sum = 0.0f;
+      for (size_t k = 0; k < K; k++) {
+        sum += activation_f32[k] * weight[n * K + k];
+      }
+      ref_dst[n] = sum;
+    }
+  } else {
+    // GEMM: ref_dst[m, n] = sum_k(activation_f32[m, k] * weight[n, k])
+    for (size_t m = 0; m < M; m++) {
+      for (size_t n = 0; n < N; n++) {
+        float sum = 0.0f;
+        for (size_t k = 0; k < K; k++) {
+          sum += activation_f32[m * K + k] * weight[n * K + k];
+        }
+        ref_dst[m * N + n] = sum;
+      }
+    }
+  }
+
+  const size_t num_idx_variants =
+    nntrainer::__kai_get_num_ukernel_variants_f16_qai8dxp_qsi4cxp();
+  size_t max_rhs_packed_size = 0;
+  for (size_t idx_variant = 0; idx_variant < num_idx_variants; idx_variant++) {
+    size_t rhs_packed_size =
+      nntrainer::__kai_get_rhs_packed_size_f16_qsi4cxp_qs4cxs1s0(
+        N, K, idx_variant, true);
+    max_rhs_packed_size = std::max(max_rhs_packed_size, rhs_packed_size);
+  }
+
+  uint8_t *rhs_packed_mtx_qs4cx = new uint8_t[max_rhs_packed_size];
+
+  // Test each F16 variant
+  for (size_t idx_variant = 0; idx_variant < num_idx_variants; idx_variant++) {
+    nntrainer::__kai_rhs_pack_f16_qsi4cxp_qs4cxs1s0(
+      N, K, rhs_packed_mtx_qs4cx, rhs_native_mtx_qs4cx, rhs_scales_f32,
+      idx_variant, true);
+
+    // Direct F16 GEMM call (outputs __fp16)
+    nntrainer::__kai_gemm_f16_qai8dxp_qsi4cxp(M, N, K, activation_f16.data(),
+                                              rhs_packed_mtx_qs4cx,
+                                              dst_f16.data(), idx_variant);
+
+    // Convert F16 output to F32 for cosine similarity comparison
+    for (size_t i = 0; i < M * N; i++) {
+      dst[i] = static_cast<float>(dst_f16[i]);
+    }
+
+    // Compute cosine similarity
+    double cosine_sim = cosine_similarity(ref_dst.data(), dst.data(), M * N);
+
+    // Expect high cosine similarity (directional alignment)
+    EXPECT_GE(cosine_sim, cosine_threshold)
+      << "Low cosine similarity at F16 variant " << idx_variant;
+  }
+
+  delete[] rhs_packed_mtx_qs4cx;
+  delete[] rhs_native_mtx_qs4cx;
+  delete[] rhs_scales_f32;
+}
+
+TEST(nntrainer_kleidiai, gemv_f16_qai8dxp_qsi4cxp_cosine_similarity) {
+  test_f16_qai8dxp_qsi4cxp_cosine_similarity(1, 512, 3072);
+}
+
+TEST(nntrainer_kleidiai, gemm_f16_qai8dxp_qsi4cxp_cosine_similarity) {
+  test_f16_qai8dxp_qsi4cxp_cosine_similarity(768, 768, 768);
+}
+
+#endif
+
 /**
  * @brief Clean and invalidate the given buffer from the caches.
  */

@@ -20,6 +20,16 @@ pack_headers = [
     'kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon.h',
 ]
 
+if get_option('enable-fp16')
+pack_sources += [
+  'kai_lhs_quant_pack_qai8dxp_f16_neon.c',
+]
+
+pack_headers += [
+  'kai_lhs_quant_pack_qai8dxp_f16_neon.h',
+]
+endif
+
 foreach s : pack_sources
   nntrainer_sources += meson.current_source_dir() / s
 endforeach

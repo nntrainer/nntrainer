@@ -6,6 +6,12 @@ kai_interface_sources = [
     'kleidiai_interface_qsi8d32p_qsi4c32p.cpp',
 ]
 
+if get_option('enable-fp16')
+kai_interface_sources += [
+  'kleidiai_interface_f16_qai8dxp_qsi4cxp.cpp',
+]
+endif
+
 subdir('kai')
 nntrainer_inc += include_directories('kai')
 nntrainer_inc_abs += meson.current_source_dir() / 'kai'
