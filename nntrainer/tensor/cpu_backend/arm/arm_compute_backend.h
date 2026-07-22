@@ -1483,6 +1483,46 @@ void quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
                      bool is_nxk);
 
 /**
+ * @brief qs4cx dequantization of rhs matrix. Inverse of quant_qs4cx_f32.
+ * Converts quantized int4 back to float32 using per-channel scales.
+ * qs4cx refers to quantized symmetric 4-bit channel-wise quantization.
+ *
+ * @warning You should allocate memory for output before use:
+ *  - rhs_native_mtx_f32
+ *    n * k * sizeof(float)
+ *
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] rhs_native_mtx_qs4cx quantized matrix data
+ * @param[in] rhs_scales_f32 per-channel quantization scales
+ * @param[out] rhs_native_mtx_f32 dequantized matrix data in float32
+ * @param[in] is_nxk true if the quantized matrix is stored in nxk format
+ */
+void dequant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_qs4cx,
+                       void *rhs_scales_f32, void *rhs_native_mtx_f32,
+                       bool is_nxk);
+
+/**
+ * @brief qs4cx dequantization of a single channel (row) in nxk format.
+ * Reads the n_idx-th row from the full nxk quantized buffers and converts it
+ * back to float32 using its per-channel scale. The result is written compactly
+ * to the first k floats of rhs_native_mtx_f32.
+ * qs4cx refers to quantized symmetric 4-bit channel-wise quantization.
+ *
+ * @warning You should allocate memory for output before use:
+ *  - rhs_native_mtx_f32
+ *    k * sizeof(float)
+ *
+ * @param[in] n_idx channel (row) index to dequantize
+ * @param[in] k K length of the row (channel)
+ * @param[in] rhs_native_mtx_qs4cx full nxk quantized matrix data
+ * @param[in] rhs_scales_f32 per-channel quantization scales
+ * @param[out] rhs_native_mtx_f32 dequantized row data in float32 (k floats)
+ */
+void dequantize_row_qs4cx(size_t n_idx, size_t k, void *rhs_native_mtx_qs4cx,
+                          void *rhs_scales_f32, void *rhs_native_mtx_f32);
+
+/**
  * @brief get size of memory to allocate for packed rhs from nxk qs4cxs1s0 to
  * qsi4cxp
  * Note that nxk is the format of quantized rhs, not the shape of rhs

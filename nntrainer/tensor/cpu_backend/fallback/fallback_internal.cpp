@@ -832,6 +832,83 @@ void __fallback_quant_kxn_qs4cx_f32(size_t n, size_t k, const float *rhs_f32,
   }
 }
 
+void __fallback_dequantize_row_qs4cx_f32(size_t n_idx, size_t k,
+                                         const uint8_t *rhs_qs4cx,
+                                         const float *rhs_scales_f32,
+                                         float *rhs_f32) {
+  const size_t rhs_qs4cx_stride = (roundup(k, 2) / 2);
+  const uint8_t *src_ptr = rhs_qs4cx + n_idx * rhs_qs4cx_stride;
+  const float recip_scale = rhs_scales_f32[n_idx];
+
+  for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+    const uint8_t packed = src_ptr[k_idx / 2];
+
+    uint8_t v_u8;
+    if ((k_idx % 2) == 0) {
+      v_u8 = packed & 0x0F;
+    } else {
+      v_u8 = (packed >> 4) & 0x0F;
+    }
+
+    int32_t v_s32 = (int32_t)v_u8 - 8;
+    rhs_f32[k_idx] = (float)v_s32 * recip_scale;
+  }
+}
+
+void __fallback_dequant_nxk_qs4cx_f32(size_t n, size_t k,
+                                      const uint8_t *rhs_qs4cx,
+                                      const float *rhs_scales_f32,
+                                      float *rhs_f32) {
+  const size_t rhs_qs4cx_stride = (roundup(k, 2) / 2);
+
+  for (size_t n_idx = 0; n_idx < n; ++n_idx) {
+    float *dst_ptr = rhs_f32 + n_idx * k;
+    const float recip_scale = rhs_scales_f32[n_idx];
+
+    for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+      const size_t src_addr = (k_idx / 2) + n_idx * rhs_qs4cx_stride;
+      const uint8_t packed = rhs_qs4cx[src_addr];
+
+      uint8_t v_u8;
+      if ((k_idx % 2) == 0) {
+        v_u8 = packed & 0x0F;
+      } else {
+        v_u8 = (packed >> 4) & 0x0F;
+      }
+
+      int32_t v_s32 = (int32_t)v_u8 - 8;
+      dst_ptr[k_idx] = (float)v_s32 * recip_scale;
+    }
+  }
+}
+
+void __fallback_dequant_kxn_qs4cx_f32(size_t n, size_t k,
+                                      const uint8_t *rhs_qs4cx,
+                                      const float *rhs_scales_f32,
+                                      float *rhs_f32) {
+  const size_t rhs_qs4cx_stride = (roundup(n, 2) / 2);
+
+  for (size_t n_idx = 0; n_idx < n; ++n_idx) {
+    float *dst_ptr = rhs_f32 + n_idx * k;
+    const float recip_scale = rhs_scales_f32[n_idx];
+
+    for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+      const size_t src_addr = (n_idx / 2) + k_idx * rhs_qs4cx_stride;
+      const uint8_t packed = rhs_qs4cx[src_addr];
+
+      uint8_t v_u8;
+      if ((n_idx % 2) == 0) {
+        v_u8 = packed & 0x0F;
+      } else {
+        v_u8 = (packed >> 4) & 0x0F;
+      }
+
+      int32_t v_s32 = (int32_t)v_u8 - 8;
+      dst_ptr[k_idx] = (float)v_s32 * recip_scale;
+    }
+  }
+}
+
 void __fallback_quant_qa8dx_f32(size_t m, size_t k, const float *lhs_f32,
                                 int8_t *lhs_qa8dx) {
   const size_t dst_stride =

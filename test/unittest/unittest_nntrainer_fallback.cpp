@@ -1449,6 +1449,132 @@ TEST(nntrainer_fallback_kleidiai,
 }
 
 //==============================================================================
+// Tests for qs4cx dequantization
+//==============================================================================
+
+// Unpack the int4 code stored at (n_idx, k_idx) in nxk-packed layout and map
+// it back to a signed int in [-8, 7] for __fallback_quant_nxk_qs4cx_f32.
+static int unpack_nxk_qs4cx_nibble(const uint8_t *rhs_qs4cx, size_t n_idx,
+                                   size_t k_idx, size_t k) {
+  const size_t stride = (k + 1) / 2;
+  const uint8_t byte = rhs_qs4cx[(k_idx / 2) + n_idx * stride];
+  const uint8_t nibble =
+    (k_idx % 2 == 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+  return (int)nibble - 8;
+}
+
+// kxn-packed counterpart of unpack_nxk_qs4cx_nibble.
+static int unpack_kxn_qs4cx_nibble(const uint8_t *rhs_qs4cx, size_t n_idx,
+                                   size_t k_idx, size_t n) {
+  const size_t stride = (n + 1) / 2;
+  const uint8_t byte = rhs_qs4cx[(n_idx / 2) + k_idx * stride];
+  const uint8_t nibble =
+    (n_idx % 2 == 0) ? (byte & 0x0F) : ((byte >> 4) & 0x0F);
+  return (int)nibble - 8;
+}
+
+static void verify_dequant_nxk_qs4cx(size_t n, size_t k) {
+  std::vector<float> rhs_f32 =
+    generate_random_vector<float>(n * k, -10.0f, 10.0f);
+
+  const size_t rhs_qs4cx_size = n * (k + 1) / 2;
+  std::vector<uint8_t> rhs_qs4cx(rhs_qs4cx_size, 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+  nntrainer::__fallback_quant_nxk_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
+
+  std::vector<float> reconstructed(n * k, 0.0f);
+  nntrainer::__fallback_dequant_nxk_qs4cx_f32(
+    n, k, rhs_qs4cx.data(), rhs_scales_f32.data(), reconstructed.data());
+
+  for (size_t n_idx = 0; n_idx < n; ++n_idx) {
+    for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+      const int code =
+        unpack_nxk_qs4cx_nibble(rhs_qs4cx.data(), n_idx, k_idx, k);
+      const float expected = (float)code * rhs_scales_f32[n_idx];
+      EXPECT_FLOAT_EQ(reconstructed[n_idx * k + k_idx], expected);
+    }
+  }
+}
+
+static void verify_dequant_kxn_qs4cx(size_t n, size_t k) {
+  std::vector<float> rhs_f32 =
+    generate_random_vector<float>(n * k, -10.0f, 10.0f);
+
+  const size_t rhs_qs4cx_size = k * (n + 1) / 2;
+  std::vector<uint8_t> rhs_qs4cx(rhs_qs4cx_size, 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+  nntrainer::__fallback_quant_kxn_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
+
+  std::vector<float> reconstructed(n * k, 0.0f);
+  nntrainer::__fallback_dequant_kxn_qs4cx_f32(
+    n, k, rhs_qs4cx.data(), rhs_scales_f32.data(), reconstructed.data());
+
+  for (size_t n_idx = 0; n_idx < n; ++n_idx) {
+    for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+      const int code =
+        unpack_kxn_qs4cx_nibble(rhs_qs4cx.data(), n_idx, k_idx, n);
+      const float expected = (float)code * rhs_scales_f32[n_idx];
+      EXPECT_FLOAT_EQ(reconstructed[n_idx * k + k_idx], expected);
+    }
+  }
+}
+
+TEST(nntrainer_fallback, dequant_nxk_qs4cx_f32) {
+  verify_dequant_nxk_qs4cx(/*n=*/4, /*k=*/8);
+}
+
+TEST(nntrainer_fallback, dequant_kxn_qs4cx_f32) {
+  verify_dequant_kxn_qs4cx(/*n=*/4, /*k=*/8);
+}
+
+TEST(nntrainer_fallback, dequant_nxk_qs4cx_f32_odd_k) {
+  verify_dequant_nxk_qs4cx(/*n=*/4, /*k=*/7);
+}
+
+TEST(nntrainer_fallback, dequant_kxn_qs4cx_f32_odd_n) {
+  verify_dequant_kxn_qs4cx(/*n=*/5, /*k=*/8);
+}
+
+static void verify_dequantize_row_qs4cx(size_t n, size_t k) {
+  std::vector<float> rhs_f32 =
+    generate_random_vector<float>(n * k, -10.0f, 10.0f);
+
+  const size_t rhs_qs4cx_stride = (k + 1) / 2;
+  std::vector<uint8_t> rhs_qs4cx(n * rhs_qs4cx_stride, 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+  nntrainer::__fallback_quant_nxk_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
+
+  std::vector<float> tensor_ref(n * k, 0.0f);
+  nntrainer::__fallback_dequant_nxk_qs4cx_f32(
+    n, k, rhs_qs4cx.data(), rhs_scales_f32.data(), tensor_ref.data());
+
+  std::vector<float> row_out(k, 0.0f);
+  for (size_t n_idx = 0; n_idx < n; ++n_idx) {
+    nntrainer::__fallback_dequantize_row_qs4cx_f32(
+      n_idx, k, rhs_qs4cx.data(), rhs_scales_f32.data(), row_out.data());
+
+    for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+      const int code =
+        unpack_nxk_qs4cx_nibble(rhs_qs4cx.data(), n_idx, k_idx, k);
+      const float expected = (float)code * rhs_scales_f32[n_idx];
+      EXPECT_FLOAT_EQ(row_out[k_idx], expected);
+      EXPECT_FLOAT_EQ(row_out[k_idx], tensor_ref[n_idx * k + k_idx]);
+    }
+  }
+}
+
+TEST(nntrainer_fallback, dequantize_row_qs4cx_f32) {
+  verify_dequantize_row_qs4cx(/*n=*/4, /*k=*/8);
+}
+
+TEST(nntrainer_fallback, dequantize_row_qs4cx_f32_odd_k) {
+  verify_dequantize_row_qs4cx(/*n=*/4, /*k=*/7);
+}
+
+//==============================================================================
 // Main function
 //==============================================================================
 
