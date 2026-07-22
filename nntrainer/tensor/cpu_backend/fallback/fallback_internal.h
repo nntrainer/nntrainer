@@ -894,6 +894,15 @@ void __fallback_gemm_q4_0(const unsigned int M, const unsigned int N,
                           const unsigned int ldb, T *C, const unsigned int ldc);
 
 /**
+ * @brief q8_0 GEMM (scalar reference) : A (M,K) * W.T (N,K) = O (M,N)
+ */
+template <typename T = float>
+void __fallback_gemm_q8_0(const unsigned int M, const unsigned int N,
+                          const unsigned int K, const T *A,
+                          const unsigned int lda, const void *B,
+                          const unsigned int ldb, T *C, const unsigned int ldc);
+
+/**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *
  * @param M Original row size of output
@@ -1244,6 +1253,52 @@ void __fallback_clamp(const T *input, T *output, size_t length,
  */
 void __fallback_create_q4_0_weights(const uint8_t *int4_weight,
                                     uint8_t *q4_0_weight);
+
+/**
+ * @brief Depthwise convolution (groups == channels) scalar kernel.
+ *        Input  : [batch, channels, in_h,  in_w ] contiguous NCHW.
+ *        Kernel : [channels, 1, kh, kw]  — channel c at kernel + c*kh*kw.
+ *        Output : [batch, channels, out_h, out_w] contiguous NCHW.
+ *        No bias (added by the caller layer afterward).
+ *
+ * @param input      FP32 input data
+ * @param kernel     FP32 filter data
+ * @param output     FP32 output data
+ * @param batch      batch size
+ * @param channels   number of channels (== groups)
+ * @param in_h       input height
+ * @param in_w       input width
+ * @param out_h      output height
+ * @param out_w      output width
+ * @param kh         kernel height
+ * @param kw         kernel width
+ * @param stride_h   stride along height
+ * @param stride_w   stride along width
+ * @param pad_top    top padding
+ * @param pad_left   left padding
+ * @param dilation_h dilation along height
+ * @param dilation_w dilation along width
+ */
+void __fallback_depthwise_conv2d_fp32(
+  const float *input, const float *kernel, float *output, unsigned int batch,
+  unsigned int channels, unsigned int in_h, unsigned int in_w,
+  unsigned int out_h, unsigned int out_w, unsigned int kh, unsigned int kw,
+  unsigned int stride_h, unsigned int stride_w, unsigned int pad_top,
+  unsigned int pad_left, unsigned int dilation_h, unsigned int dilation_w);
+
+#ifdef ENABLE_FP16
+/**
+ * @brief FP16-activation depthwise conv (scalar, channel-parallel). Mirrors
+ *        __fallback_depthwise_conv2d_fp32 but reads/writes _FP16 and
+ *        accumulates each output in float for numerical parity.
+ */
+void __fallback_depthwise_conv2d_fp16(
+  const _FP16 *input, const float *kernel, _FP16 *output, unsigned int batch,
+  unsigned int channels, unsigned int in_h, unsigned int in_w,
+  unsigned int out_h, unsigned int out_w, unsigned int kh, unsigned int kw,
+  unsigned int stride_h, unsigned int stride_w, unsigned int pad_top,
+  unsigned int pad_left, unsigned int dilation_h, unsigned int dilation_w);
+#endif
 
 /**
  * @brief Transform data from in-memory layout osv32_isv2 to block_q4_0x8 or

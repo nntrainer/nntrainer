@@ -407,6 +407,13 @@ public:
            bool trans, bool trans_in, float beta) const override;
 
   /**
+   * @copydoc TensorBase::convQ4_0Indirect(Tensor const &weight, Tensor &output,
+   * const ConvGatherParams &geom)
+   */
+  Tensor &convQ4_0Indirect(Tensor const &weight, Tensor &output,
+                           const ConvGatherParams &geom) const override;
+
+  /**
    * @copydoc Tensor::dropout_mask(float dropout)
    */
   void dropout_mask(float dropout) override;

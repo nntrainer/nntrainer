@@ -528,6 +528,20 @@ private:
                  float beta, Tdatatype dtype) const;
 
   /**
+   * @copydoc Tensor::convQ4_0Indirect(Tensor const &, Tensor &, const
+   * ConvGatherParams &) const
+   *
+   * FP16-activation indirect (im2col-fused) Q4_0 conv. Mirrors
+   * FloatTensor::convQ4_0Indirect but the NCHW input and output are _FP16; the
+   * fused gather runs in FP16 (no FP32 staging) and the FP16-output Q4_0xQ8_0
+   * GEMM consumes it. Without this override an FP16 activation reaching the
+   * conv2d indirect branch would dispatch to TensorBase and throw. Available
+   * only under ENABLE_FP16 + NNTR_HAS_Q4_0_INDIRECT_CONV (ARM i8mm backend).
+   */
+  Tensor &convQ4_0Indirect(Tensor const &weight, Tensor &output,
+                           const ConvGatherParams &geom) const override;
+
+  /**
    * @copydoc Tensor::isValid()
    */
   bool isValid() const override;

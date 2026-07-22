@@ -21,6 +21,10 @@
 
 namespace nntrainer {
 
+/**
+ * @class CpuComputeOps
+ * @brief CPU compute operations implementation table.
+ */
 class CpuComputeOps : public ComputeOps {
 public:
   // FP32 BLAS
@@ -123,6 +127,21 @@ public:
     nntrainer::transpose_matrix(M, N, s, lds, d, ldd);
   }
 
+  // FP32 Convolution
+  void depthwise_conv2d_fp32(const float *input, const float *kernel,
+                             float *output, unsigned int batch,
+                             unsigned int channels, unsigned int in_h,
+                             unsigned int in_w, unsigned int out_h,
+                             unsigned int out_w, unsigned int kh,
+                             unsigned int kw, unsigned int stride_h,
+                             unsigned int stride_w, unsigned int pad_top,
+                             unsigned int pad_left, unsigned int dilation_h,
+                             unsigned int dilation_w) override {
+    nntrainer::depthwise_conv2d_fp32(
+      input, kernel, output, batch, channels, in_h, in_w, out_h, out_w, kh, kw,
+      stride_h, stride_w, pad_top, pad_left, dilation_h, dilation_w);
+  }
+
   // FP32 Data conversion / Copy
   void scopy_u8(unsigned int N, const uint8_t *X, unsigned int iX, uint8_t *Y,
                 unsigned int iY) override {
@@ -164,6 +183,17 @@ public:
                       unsigned int ldb, float *C, unsigned int ldc) override {
     nntrainer::gemm_q4_0(M, N, K, A, lda, B, ldb, C, ldc);
   }
+  void gemm_q8_0_fp32(unsigned int M, unsigned int N, unsigned int K,
+                      const float *A, unsigned int lda, const void *B,
+                      unsigned int ldb, float *C, unsigned int ldc) override {
+    nntrainer::gemm_q8_0(M, N, K, A, lda, B, ldb, C, ldc);
+  }
+  void quantize_row_q8_0(const float *src, void *dst, int64_t k) override {
+    nntrainer::quantize_row_q8_0(src, dst, k);
+  }
+  void dequantize_row_q8_0(const void *x, float *y, int64_t k) override {
+    nntrainer::dequantize_row_q8_0(x, y, k);
+  }
   void gemm_q4_K_fp32(unsigned int M, unsigned int N, unsigned int K,
                       const float *A, unsigned int lda, const void *B,
                       unsigned int ldb, float *C, unsigned int ldc) override {
@@ -173,6 +203,18 @@ public:
                       const float *A, unsigned int lda, const void *B,
                       unsigned int ldb, float *C, unsigned int ldc) override {
     nntrainer::gemm_q6_K(M, N, K, A, lda, B, ldb, C, ldc);
+  }
+  // im2col-fused q4_0 conv GEMM — only the ARM i8mm backend implements the
+  // fused gather+quantize path; elsewhere callers fall back via supports_*().
+  bool supports_gemm_q4_0_indirect_conv_fp32() const override {
+    return NNTR_HAS_Q4_0_INDIRECT_CONV;
+  }
+  void gemm_q4_0_indirect_conv_fp32(unsigned int M, unsigned int N,
+                                    unsigned int K, const float *in,
+                                    const ConvGatherParams &geom, const void *B,
+                                    unsigned int ldb, float *C,
+                                    unsigned int ldc) override {
+    nntrainer::gemm_q4_0_indirect_conv(M, N, K, in, geom, B, ldb, C, ldc);
   }
 
   // Quantization / Utility
@@ -342,6 +384,51 @@ public:
                       unsigned int ldb, _FP16 *C, unsigned int ldc) override {
     nntrainer::gemm_q4_0<_FP16>(M, N, K, A, lda, B, ldb, C, ldc);
   }
+  // im2col-fused q4_0 conv GEMM, FP16 activation — FP16 mirror of the FP32
+  // indirect conv above. Same availability gate (NNTR_HAS_Q4_0_INDIRECT_CONV);
+  // the FP16 backend op is provided under the same macro (see
+  // arm_compute_backend gemm_q4_0_indirect_conv_fp16 + the
+  // __ggml..._indirect_GEMM_fp16 specialization).
+  bool supports_gemm_q4_0_indirect_conv_fp16() const override {
+    return NNTR_HAS_Q4_0_INDIRECT_CONV;
+  }
+  void gemm_q4_0_indirect_conv_fp16(unsigned int M, unsigned int N,
+                                    unsigned int K, const _FP16 *in,
+                                    const ConvGatherParams &geom, const void *B,
+                                    unsigned int ldb, _FP16 *C,
+                                    unsigned int ldc) override {
+    nntrainer::gemm_q4_0_indirect_conv_fp16(M, N, K, in, geom, B, ldb, C, ldc);
+  }
+  bool supports_gemm_q4_0_indirect_conv_q8_0() const override {
+    return NNTR_HAS_Q4_0_INDIRECT_CONV;
+  }
+  void gemm_q4_0_indirect_conv_q8_0(unsigned int M, unsigned int N,
+                                    unsigned int K, const void *in,
+                                    const ConvGatherParams &geom, const void *B,
+                                    unsigned int ldb, _FP16 *C,
+                                    unsigned int ldc) override {
+    nntrainer::gemm_q4_0_indirect_conv_q8_0(M, N, K, in, geom, B, ldb, C, ldc);
+  }
+  bool supports_gemm_q8_0_indirect_conv_q8_0() const override {
+    return NNTR_HAS_Q4_0_INDIRECT_CONV;
+  }
+  void gemm_q8_0_indirect_conv_q8_0(unsigned int M, unsigned int N,
+                                    unsigned int K, const void *in,
+                                    const ConvGatherParams &geom, const void *B,
+                                    unsigned int ldb, _FP16 *C,
+                                    unsigned int ldc) override {
+    nntrainer::gemm_q8_0_indirect_conv_q8_0(M, N, K, in, geom, B, ldb, C, ldc);
+  }
+  bool supports_gemm_q8_0_indirect_conv_fp16() const override {
+    return NNTR_HAS_Q4_0_INDIRECT_CONV;
+  }
+  void gemm_q8_0_indirect_conv_fp16(unsigned int M, unsigned int N,
+                                    unsigned int K, const _FP16 *in,
+                                    const ConvGatherParams &geom, const void *B,
+                                    unsigned int ldb, _FP16 *C,
+                                    unsigned int ldc) override {
+    nntrainer::gemm_q8_0_indirect_conv_fp16(M, N, K, in, geom, B, ldb, C, ldc);
+  }
   void gemm_q6_K_fp16(unsigned int M, unsigned int N, unsigned int K,
                       const _FP16 *A, unsigned int lda, const void *B,
                       unsigned int ldb, _FP16 *C, unsigned int ldc) override {
@@ -353,6 +440,21 @@ public:
                                       float *cos_, float *sin_) override {
     nntrainer::compute_rotary_embedding_value(dim, half_, w, in, out, cos_,
                                               sin_);
+  }
+
+  // FP16 Convolution
+  void depthwise_conv2d_fp16(const _FP16 *input, const float *kernel,
+                             _FP16 *output, unsigned int batch,
+                             unsigned int channels, unsigned int in_h,
+                             unsigned int in_w, unsigned int out_h,
+                             unsigned int out_w, unsigned int kh,
+                             unsigned int kw, unsigned int stride_h,
+                             unsigned int stride_w, unsigned int pad_top,
+                             unsigned int pad_left, unsigned int dilation_h,
+                             unsigned int dilation_w) override {
+    nntrainer::depthwise_conv2d_fp16(
+      input, kernel, output, batch, channels, in_h, in_w, out_h, out_w, kh, kw,
+      stride_h, stride_w, pad_top, pad_left, dilation_h, dilation_w);
   }
 #endif // ENABLE_FP16
 };

@@ -12,10 +12,12 @@
  */
 #ifndef __ARM_COMPUTE_BACKEND_H__
 #define __ARM_COMPUTE_BACKEND_H__
+
 #ifdef __cplusplus
 
 #include <cfloat>
 #include <common.h>
+#include <conv_indirect.h>
 #include <cstdint>
 #include <limits.h>
 #include <limits>
@@ -1112,6 +1114,64 @@ void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                const unsigned int K, const float *A, const unsigned int lda,
                std::vector<void *> Bs, std::vector<unsigned int> ldbs,
                std::vector<float *> Cs, std::vector<unsigned int> ldc);
+
+/**
+ * @brief q8_0 GEMM (scalar fallback for now). See cpu_backend.h gemm_q8_0.
+ */
+template <typename T = float>
+void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
+               const T *A, const unsigned int lda, const void *B,
+               const unsigned int ldb, T *C, const unsigned int ldc);
+/**
+ * @brief q4_0 conv GEMM with im2col gather fused into q8_0 activation packing
+ * (no FP32 col materialization). See cpu_backend.h for parameter semantics.
+ */
+void gemm_q4_0_indirect_conv(const unsigned int M, const unsigned int N,
+                             const unsigned int K, const float *in,
+                             const ConvGatherParams &geom, const void *B,
+                             const unsigned int ldb, float *C,
+                             const unsigned int ldc);
+#ifdef ENABLE_FP16
+/**
+ * @brief FP16-activation q4_0 conv GEMM with im2col gather fused into q8_0
+ * activation packing (no FP16 col materialization). FP16 mirror of
+ * gemm_q4_0_indirect_conv above; used by HalfTensor::convQ4_0Indirect so a
+ * quant-weight conv can run on FP16 activations (W4A16) without throwing via
+ * TensorBase.
+ */
+void gemm_q4_0_indirect_conv_fp16(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const _FP16 *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc);
+
+/**
+ * @brief Pre-quantized Q8_0 activation indirect q4_0 conv GEMM (Task B2).
+ */
+void gemm_q4_0_indirect_conv_q8_0(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const void *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc);
+
+/**
+ * @brief Pre-quantized Q8_0 activation indirect q8_0 conv GEMM (Q8_0 weight).
+ */
+void gemm_q8_0_indirect_conv_q8_0(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const void *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc);
+
+/**
+ * @brief FP16-activation indirect q8_0 conv GEMM (Q8_0 weight, W8A16).
+ */
+void gemm_q8_0_indirect_conv_fp16(const unsigned int M, const unsigned int N,
+                                  const unsigned int K, const _FP16 *in,
+                                  const ConvGatherParams &geom, const void *B,
+                                  const unsigned int ldb, _FP16 *C,
+                                  const unsigned int ldc);
+#endif
 /**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *
@@ -1161,6 +1221,19 @@ void gemm_q6_K(const unsigned int M, const unsigned int N, const unsigned int K,
  * @return size_t size of total quantized data in bytes
  */
 size_t quantize_q4_0(const float *src, void *dst, int64_t nrow,
+                     int64_t n_per_row, const float *quant_weights);
+
+/**
+ * @brief quantize_q8_0 function (FP32 source). Non-template float overload.
+ *
+ * @param src float* to quantize
+ * @param dst q8_0* destination (34 bytes / 32 elements)
+ * @param nrow number of rows
+ * @param n_per_row number of elements per row (must be multiple of 32)
+ * @param quant_weights unused
+ * @return size_t size of total quantized data in bytes
+ */
+size_t quantize_q8_0(const float *src, void *dst, int64_t nrow,
                      int64_t n_per_row, const float *quant_weights);
 /**
  * @brief quantize_q4_K function
@@ -1234,6 +1307,24 @@ void dequantize_row_q4_K(const void *x, float *y, int64_t k);
  * @param k number of elements in x
  */
 void dequantize_row_q4_0(const void *x, float *y, int64_t k);
+
+/**
+ * @brief dequantize row of q8_0 data to float
+ *
+ * @param x input to be dequantized from q8_0 to float
+ * @param y dequantized data output
+ * @param k number of elements in x
+ */
+void dequantize_row_q8_0(const void *x, float *y, int64_t k);
+
+/**
+ * @brief quantize row to q8_0
+ *
+ * @param src float* to quantize
+ * @param dst q8_0* destination
+ * @param k number of elements
+ */
+void quantize_row_q8_0(const float *src, void *dst, int64_t k);
 
 /**
  * @brief dequantize row of q6_K data to float
@@ -1417,6 +1508,36 @@ template <typename T = float>
 void clamp(const T *input, T *output, size_t length,
            T lower_bound = std::numeric_limits<T>::lowest(),
            T upper_bound = std::numeric_limits<T>::max());
+
+/**
+ * @brief Depthwise convolution FP32 (ARM backend).
+ *        Correctness path delegates to __fallback_depthwise_conv2d_fp32.
+ *        TODO: NEON specialization.
+ *        See fallback_internal.h for full parameter documentation.
+ */
+void depthwise_conv2d_fp32(const float *input, const float *kernel,
+                           float *output, unsigned int batch,
+                           unsigned int channels, unsigned int in_h,
+                           unsigned int in_w, unsigned int out_h,
+                           unsigned int out_w, unsigned int kh, unsigned int kw,
+                           unsigned int stride_h, unsigned int stride_w,
+                           unsigned int pad_top, unsigned int pad_left,
+                           unsigned int dilation_h, unsigned int dilation_w);
+
+#ifdef ENABLE_FP16
+/**
+ * @brief Depthwise convolution FP16 (ARM backend). Delegates to
+ *        __fallback_depthwise_conv2d_fp16 (float-accumulating scalar path).
+ */
+void depthwise_conv2d_fp16(const _FP16 *input, const float *kernel,
+                           _FP16 *output, unsigned int batch,
+                           unsigned int channels, unsigned int in_h,
+                           unsigned int in_w, unsigned int out_h,
+                           unsigned int out_w, unsigned int kh, unsigned int kw,
+                           unsigned int stride_h, unsigned int stride_w,
+                           unsigned int pad_top, unsigned int pad_left,
+                           unsigned int dilation_h, unsigned int dilation_w);
+#endif
 
 /**
  * @brief     Create a Q4_0 weights (without XOR 0x88) from int4 weights

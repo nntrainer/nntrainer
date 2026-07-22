@@ -22,6 +22,7 @@
 #include <cstring>
 #include <math.h>
 #include <stddef.h>
+#include <stdexcept>
 #include <stdint.h>
 #include <tensor_dim.h>
 
@@ -1773,3 +1774,48 @@ void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
     return;
   }
 }
+
+// Q8_0 x Q8_0 GEMM/GEMV: SVE path is NYI (phase C-2 / C-3). Stubs so the
+// ARM SVE build links; the AVX2 path uses the real implementation on x86.
+void nntr_gemm_q8_0_q8_0(int n, float *__restrict s, size_t bs,
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc) {
+  (void)n;
+  (void)s;
+  (void)bs;
+  (void)vx;
+  (void)vy;
+  (void)nr;
+  (void)nc;
+  throw std::runtime_error("NYI: nntr_gemm_q8_0_q8_0 SVE path");
+}
+
+void nntr_gemv_q8_0_q8_0(int n, float *__restrict s, size_t bs,
+                         const void *__restrict vx, const void *__restrict vy,
+                         int nr, int nc) {
+  (void)n;
+  (void)s;
+  (void)bs;
+  (void)vx;
+  (void)vy;
+  (void)nr;
+  (void)nc;
+  throw std::runtime_error("NYI: nntr_gemv_q8_0_q8_0 SVE path");
+}
+
+#ifdef ENABLE_FP16
+void nntr_gemm_q8_0_q8_0_4x4_fp16(int n, NNTR_GGML_FP16 *__restrict s,
+                                  size_t bs, const void *__restrict vx,
+                                  const void *__restrict vy, int nr, int nc) {
+  (void)n;
+  (void)s;
+  (void)bs;
+  (void)vx;
+  (void)vy;
+  (void)nr;
+  (void)nc;
+  throw std::runtime_error(
+    "NYI: nntr_gemm_q8_0_q8_0_4x4_fp16 on SVE - FP16 Q8_0 GEMM is ARM/NEON "
+    "only; callers must gate on supports_gemm_q8_0_indirect_conv_q8_0()");
+}
+#endif // ENABLE_FP16

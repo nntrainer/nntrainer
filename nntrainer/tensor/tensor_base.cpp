@@ -591,6 +591,14 @@ void TensorBase::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
                               getStringDataType());
 }
 
+Tensor &TensorBase::convQ4_0Indirect(Tensor const &weight, Tensor &output,
+                                     const ConvGatherParams &geom) const {
+  throw std::invalid_argument(
+    "Tensor::convQ4_0Indirect() is currently not supported in tensor data "
+    "type " +
+    getStringDataType());
+}
+
 void TensorBase::dropout_mask(float dropout) {
   throw std::invalid_argument(
     "Tensor::dropout_mask() is currently not supported in tensor data type " +

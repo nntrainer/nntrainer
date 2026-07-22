@@ -20,6 +20,7 @@
 #include <q4_0_tensor.h>
 #include <q4_k_tensor.h>
 #include <q6_k_tensor.h>
+#include <q8_0_tensor.h>
 #include <qs4cx_tensor.h>
 #include <short_tensor.h>
 #include <tensor.h>
@@ -134,6 +135,8 @@ Tensor::Tensor(std::string name_, Tformat fm, Tdatatype d_type) {
     itensor_ = std::make_unique<Q6_K_Tensor>(name_, fm);
   } else if (d_type == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(name_, fm);
+  } else if (d_type == Tdatatype::Q8_0) {
+    itensor_ = std::make_unique<Q8_0_Tensor>(name_, fm);
   } else if (d_type == Tdatatype::QS4CX) {
     itensor_ = std::make_unique<QS4CX_Tensor>(name_, fm);
   } else if (d_type == Tdatatype::UINT4) {
@@ -184,6 +187,8 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
     itensor_ = std::make_unique<Q6_K_Tensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(d, alloc_now, init, name);
+  } else if (d.getDataType() == Tdatatype::Q8_0) {
+    itensor_ = std::make_unique<Q8_0_Tensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::QS4CX) {
     itensor_ = std::make_unique<QS4CX_Tensor>(d, alloc_now, init, name);
   } else if (d.getDataType() == Tdatatype::UINT4) {
@@ -238,6 +243,8 @@ Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
     itensor_ = std::make_unique<Q6_K_Tensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(d, buf);
+  } else if (d.getDataType() == Tdatatype::Q8_0) {
+    itensor_ = std::make_unique<Q8_0_Tensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::QS4CX) {
     itensor_ = std::make_unique<QS4CX_Tensor>(d, buf);
   } else if (d.getDataType() == Tdatatype::UINT4) {
@@ -287,6 +294,8 @@ Tensor::Tensor(const Tensor &rhs) {
     itensor_ = std::make_unique<Q6_K_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(*rhs.itensor_);
+  } else if (rhs.getDataType() == Tdatatype::Q8_0) {
+    itensor_ = std::make_unique<Q8_0_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::QS4CX) {
     itensor_ = std::make_unique<QS4CX_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT4) {
@@ -370,6 +379,8 @@ Tensor &Tensor::operator=(const Tensor &rhs) {
     itensor_ = std::make_unique<Q6_K_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(*rhs.itensor_);
+  } else if (rhs.getDataType() == Tdatatype::Q8_0) {
+    itensor_ = std::make_unique<Q8_0_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT8) {
@@ -421,6 +432,8 @@ bool Tensor::operator==(const Tensor &rhs) const {
       return itensorCompare<Q6_K_Tensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::Q4_0) {
       return itensorCompare<Q4_0_Tensor>(itensor_.get(), rhs.itensor_.get());
+    } else if (getDataType() == Tdatatype::Q8_0) {
+      return itensorCompare<Q8_0_Tensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::UINT4) {
       return itensorCompare<Uint4QTensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::UINT8) {
@@ -1046,6 +1059,17 @@ Tensor &Tensor::dot(Tensor const &input, Tensor &output, bool trans,
 
   checkContextCompatibility(input, "dot");
   itensor_->dot(input, output, trans, trans_in, beta);
+  inheritContextTo(output);
+  return output;
+}
+
+Tensor &Tensor::convQ4_0Indirect(Tensor const &weight, Tensor &output,
+                                 const ConvGatherParams &geom) const {
+  NNTR_THROW_IF(!getContiguous(), std::invalid_argument)
+    << getName() << " is not contiguous. Cannot run convQ4_0Indirect.";
+
+  checkContextCompatibility(weight, "convQ4_0Indirect");
+  itensor_->convQ4_0Indirect(weight, output, geom);
   inheritContextTo(output);
   return output;
 }

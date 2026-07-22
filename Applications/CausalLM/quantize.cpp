@@ -101,10 +101,10 @@ namespace {
  * @brief Map of string data type names to DataType enum values
  */
 const std::map<std::string, DataType> dtype_str_map = {
-  {"FP32", DataType::FP32}, {"FP16", DataType::FP16},
-  {"Q4_0", DataType::Q4_0}, {"Q6_K", DataType::Q6_K},
-  {"Q4_K", DataType::Q4_K}, {"QS4CX", DataType::QS4CX},
-  {"NONE", DataType::NONE}};
+  {"FP32", DataType::FP32},   {"FP16", DataType::FP16},
+  {"Q4_0", DataType::Q4_0},   {"Q8_0", DataType::Q8_0},
+  {"Q6_K", DataType::Q6_K},   {"Q4_K", DataType::Q4_K},
+  {"QS4CX", DataType::QS4CX}, {"NONE", DataType::NONE}};
 
 /**
  * @brief Map of string ISA names to ISA enum values
@@ -150,8 +150,9 @@ DataType strToDataType(const std::string &s) {
                  [](unsigned char c) { return std::toupper(c); });
   auto it = dtype_str_map.find(upper);
   if (it == dtype_str_map.end()) {
-    throw std::invalid_argument("Unsupported data type: " + s +
-                                ". Supported: FP32, FP16, Q4_0, Q6_K, Q4_K");
+    throw std::invalid_argument(
+      "Unsupported data type: " + s +
+      ". Supported: FP32, FP16, Q4_0, Q8_0, Q6_K, Q4_K");
   }
   return it->second;
 }
@@ -423,7 +424,7 @@ void printUsage(const char *prog) {
     << "                        from this config will be used.\n"
     << "  --help, -h            Show this help message\n"
     << "\n"
-    << "Supported data types: FP32, FP16, Q4_0, Q6_K, Q4_K\n"
+    << "Supported data types: FP32, FP16, Q4_0, Q8_0, Q6_K, Q4_K\n"
     << "Supported ISA options: DEFAULT (current platform), X86, ARM\n"
     << "\n"
     << "Examples:\n"
@@ -479,7 +480,8 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
   }
 
   // Gemma4 PLE layers - set to Q4_0 first
-  dtype_map["per_layer_input_embedding"] = fc_dtype;
+  dtype_map["per_layer_input_embedding"] =
+    (fc_dtype == DataType::Q8_0) ? DataType::FP32 : fc_dtype;
   // Gemma4 PLE projection
   dtype_map["per_layer_input_projection"] = fc_dtype;
 

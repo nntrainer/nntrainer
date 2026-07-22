@@ -13,6 +13,7 @@
 
 #ifndef __FALLBACK_H__
 #define __FALLBACK_H__
+
 #ifdef __cplusplus
 
 #include <cfloat>
@@ -1004,6 +1005,14 @@ template <typename T = float>
 void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const T *A, const unsigned int lda, const void *B,
                const unsigned int ldb, T *C, const unsigned int ldc);
+
+/**
+ * @brief q8_0 GEMM (scalar fallback). See __fallback_gemm_q8_0 for semantics.
+ */
+template <typename T = float>
+void gemm_q8_0(const unsigned int M, const unsigned int N, const unsigned int K,
+               const T *A, const unsigned int lda, const void *B,
+               const unsigned int ldb, T *C, const unsigned int ldc);
 /**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *
@@ -1306,6 +1315,36 @@ template <typename T = float>
 void clamp(const T *input, T *output, size_t length,
            T lower_bound = std::numeric_limits<T>::lowest(),
            T upper_bound = std::numeric_limits<T>::max());
+
+/**
+ * @brief Depthwise convolution FP32 free function (fallback backend).
+ *        Delegates to __fallback_depthwise_conv2d_fp32.
+ *        See fallback_internal.h for full parameter documentation.
+ */
+void depthwise_conv2d_fp32(const float *input, const float *kernel,
+                           float *output, unsigned int batch,
+                           unsigned int channels, unsigned int in_h,
+                           unsigned int in_w, unsigned int out_h,
+                           unsigned int out_w, unsigned int kh, unsigned int kw,
+                           unsigned int stride_h, unsigned int stride_w,
+                           unsigned int pad_top, unsigned int pad_left,
+                           unsigned int dilation_h, unsigned int dilation_w);
+
+#ifdef ENABLE_FP16
+/**
+ * @brief Depthwise convolution FP16 free function (fallback backend).
+ *        Delegates to __fallback_depthwise_conv2d_fp16.
+ */
+void depthwise_conv2d_fp16(const _FP16 *input, const float *kernel,
+                           _FP16 *output, unsigned int batch,
+                           unsigned int channels, unsigned int in_h,
+                           unsigned int in_w, unsigned int out_h,
+                           unsigned int out_w, unsigned int kh, unsigned int kw,
+                           unsigned int stride_h, unsigned int stride_w,
+                           unsigned int pad_top, unsigned int pad_left,
+                           unsigned int dilation_h, unsigned int dilation_w);
+#endif
+
 } /* namespace nntrainer */
 
 /**

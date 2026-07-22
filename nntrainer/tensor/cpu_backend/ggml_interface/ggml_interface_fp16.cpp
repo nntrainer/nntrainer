@@ -15,6 +15,13 @@
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_common.h>
 
+#include <conv_indirect.h>
+
+#if defined(_WIN32) || defined(_MSC_VER)
+#include <malloc.h>
+#else
+#include <alloca.h>
+#endif
 #include <algorithm>
 #include <assert.h>
 #include <cmath>
@@ -45,6 +52,27 @@ static inline void __copy_f16_from_f32(const float *src, _FP16 *dst,
   }
 #endif
 }
+
+#if defined(__ARM_NEON)
+/**
+ * @brief Scale 8 FP16 activations by the q8_0 inverse-scale `id` and round to
+ * int8, doing the multiply in the FP32 domain.
+ *
+ * `id` is the inverse scale `1/d` and can be very large for a block whose amax
+ * is small (e.g. amax 1e-3 -> id ~1.3e5). Applying it with vmulq_n_f16 narrows
+ * `id` to FP16, where anything above 65504 becomes +inf; src*inf then yields
+ * inf/NaN in the quantized activation and poisons the GEMM (observed as
+ * widespread NaN in W4A16 inference). The FP32 GEMM path and the scalar
+ * fallback both multiply in float, so mirror them: widen src to FP32, multiply
+ * by the float `id`, then convert to int8.
+ */
+static inline int16x8_t __q8_0_scale_f16x8(float16x8_t src, float id) {
+  float32x4_t lo = vmulq_n_f32(vcvt_f32_f16(vget_low_f16(src)), id);
+  float32x4_t hi = vmulq_n_f32(vcvt_f32_f16(vget_high_f16(src)), id);
+  return vcombine_s16(vmovn_s32(vcvtnq_s32_f32(lo)),
+                      vmovn_s32(vcvtnq_s32_f32(hi)));
+}
+#endif
 
 void __ggml_quantize_row_q8_0(const _FP16 *__restrict x, void *vy, int64_t k) {
   assert(QK8_0 == 32);
@@ -80,8 +108,7 @@ void __ggml_quantize_row_q8_0(const _FP16 *__restrict x, void *vy, int64_t k) {
     y[i].d = nntr_compute_fp32_to_fp16(d);
 
     for (int j = 0; j < 4; j++) {
-      const float16x8_t v = vmulq_n_f16(srcv[j], id);
-      const int16x8_t vi = vcvtnq_s16_f16(v);
+      const int16x8_t vi = __q8_0_scale_f16x8(srcv[j], id);
 
       y[i].qs[8 * j + 0] = vgetq_lane_s16(vi, 0);
       y[i].qs[8 * j + 1] = vgetq_lane_s16(vi, 1);
@@ -179,8 +206,7 @@ static void __ggml_quantize_mat_q8_0_4x8(const _FP16 *__restrict x,
     }
 
     for (int j = 0; j < 4; j++) {
-      float16x8_t v = vmulq_n_f16(srcv[0][j], id[0]);
-      int16x8_t vi = vcvtnq_s16_f16(v);
+      int16x8_t vi = __q8_0_scale_f16x8(srcv[0][j], id[0]);
       y[i].qs[32 * j + 0] = vgetq_lane_s16(vi, 0);
       y[i].qs[32 * j + 1] = vgetq_lane_s16(vi, 1);
       y[i].qs[32 * j + 2] = vgetq_lane_s16(vi, 2);
@@ -190,8 +216,7 @@ static void __ggml_quantize_mat_q8_0_4x8(const _FP16 *__restrict x,
       y[i].qs[32 * j + 6] = vgetq_lane_s16(vi, 6);
       y[i].qs[32 * j + 7] = vgetq_lane_s16(vi, 7);
 
-      v = vmulq_n_f16(srcv[1][j], id[1]);
-      vi = vcvtnq_s16_f16(v);
+      vi = __q8_0_scale_f16x8(srcv[1][j], id[1]);
       y[i].qs[32 * j + 8] = vgetq_lane_s16(vi, 0);
       y[i].qs[32 * j + 9] = vgetq_lane_s16(vi, 1);
       y[i].qs[32 * j + 10] = vgetq_lane_s16(vi, 2);
@@ -201,8 +226,7 @@ static void __ggml_quantize_mat_q8_0_4x8(const _FP16 *__restrict x,
       y[i].qs[32 * j + 14] = vgetq_lane_s16(vi, 6);
       y[i].qs[32 * j + 15] = vgetq_lane_s16(vi, 7);
 
-      v = vmulq_n_f16(srcv[2][j], id[2]);
-      vi = vcvtnq_s16_f16(v);
+      vi = __q8_0_scale_f16x8(srcv[2][j], id[2]);
       y[i].qs[32 * j + 16] = vgetq_lane_s16(vi, 0);
       y[i].qs[32 * j + 17] = vgetq_lane_s16(vi, 1);
       y[i].qs[32 * j + 18] = vgetq_lane_s16(vi, 2);
@@ -212,8 +236,7 @@ static void __ggml_quantize_mat_q8_0_4x8(const _FP16 *__restrict x,
       y[i].qs[32 * j + 22] = vgetq_lane_s16(vi, 6);
       y[i].qs[32 * j + 23] = vgetq_lane_s16(vi, 7);
 
-      v = vmulq_n_f16(srcv[3][j], id[3]);
-      vi = vcvtnq_s16_f16(v);
+      vi = __q8_0_scale_f16x8(srcv[3][j], id[3]);
       y[i].qs[32 * j + 24] = vgetq_lane_s16(vi, 0);
       y[i].qs[32 * j + 25] = vgetq_lane_s16(vi, 1);
       y[i].qs[32 * j + 26] = vgetq_lane_s16(vi, 2);
@@ -516,5 +539,408 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
   }
   return __ggml_q4_0_4x8_q8_0_GEMM_BSTP(M, N, K, A, lda, B, ldb, C, ldc);
 }
+
+#ifdef ENABLE_FP16
+void __ggml_q4_0_4x8_q8_0_indirect_GEMM_fp16(
+  const unsigned int M, const unsigned int N, const unsigned int K,
+  const _FP16 *in, const ConvGatherParams &geom, const void *B,
+  const unsigned int ldb, _FP16 *C, const unsigned int ldc) {
+  /// FP16-activation indirect (im2col-fused) variant of
+  /// __ggml_q4_0_4x8_q8_0_GEMM<_FP16>. The activation matrix A = [M=OH*OW,
+  /// K=CRS] is never materialized. Each Q8_0 activation tile is gathered
+  /// directly from the NCHW _FP16 input via gather_conv_act_rows_fp16
+  /// (byte-identical im2col rows, _FP16 typed — no FP32 staging copy, so the
+  /// indirect path's no-col-materialization memory win is preserved for FP16
+  /// activations) and quantized on the fly with the FP16-input quantizers, then
+  /// fed to the SAME FP16-output micro-kernels the non-indirect FP16 GEMM
+  /// (BSTP) uses. The FP16 Q8_0 quantizer here is the id-FP32-narrowing-fixed
+  /// variant (see __q8_0_scale_f16x8), so small-amax blocks no longer poison
+  /// the GEMM with Inf/NaN.
+  auto &tm = ThreadManager::Global();
+  (void)ldb;
+
+  const unsigned int blocks_per_4_rows = (K + QK8_0 - 1) / QK8_0;
+  const unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * blocks_per_4_rows;
+  const size_t qa_row_size =
+    (sizeof(block_q8_0) * K) / QK8_0; // ignore remainder
+  const unsigned int M4 = M / 4;
+  const unsigned int rem = M % 4;
+
+  const unsigned int qa_size =
+    qa_4_rows_size * M4 + static_cast<unsigned int>(qa_row_size) * rem;
+  std::vector<char> QA(qa_size);
+  char *QA_ptr = QA.data();
+
+  /// Fused gather + Q8_0 quantize, parallel over chunks. Gather feeds the
+  /// FP16-input quantizer __ggml_quantize_mat_q8_0_4x8(const _FP16*) one
+  /// 4-row tile at a time through a small L1/L2-resident _FP16 buffer (no FP32
+  /// staging). Byte-identical QA layout to the materialized FP16 path.
+  const unsigned int QCHUNK = 64; // multiple of 4
+  if (M4 > 0) {
+    const unsigned int rows4 = M4 * 4;
+    const size_t qloops = (rows4 + QCHUNK - 1) / QCHUNK;
+    tm.parallel_for(0, qloops, [=](size_t q) {
+      const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
+      const unsigned int r1 = std::min(r0 + QCHUNK, rows4);
+      _FP16 *tile = (_FP16 *)alloca(
+        4 * K * sizeof(_FP16)); // zero heap overhead stack buffer
+      for (unsigned int r = r0; r < r1; r += 4) {
+        gather_conv_act_rows_fp16(tile, in, geom, (int)r, 4);
+        __ggml_quantize_mat_q8_0_4x8(tile, QA_ptr + (r / 4) * qa_4_rows_size,
+                                     K);
+      }
+    });
+  }
+  /// Remainder rows (M % 4): single-row gather + quantize.
+  for (unsigned int i = M4 * 4; i < M; ++i) {
+    _FP16 *staging =
+      (_FP16 *)alloca(K * sizeof(_FP16)); // zero heap overhead stack buffer
+    gather_conv_act_rows_fp16(staging, in, geom, (int)i, 1);
+    __ggml_quantize_row_q8_0(
+      staging, QA_ptr + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size, K);
+  }
+
+  /// GEMM over the 4-row-divisible rows + GEMV over the remainder, mirroring
+  /// __ggml_q4_0_4x8_q8_0_GEMM_BSTP's output block (same QA addressing, same
+  /// FP16-output micro-kernels) — only the activation source changed above.
+  const unsigned int A_step = sizeof(block_q8_0) * (K / QK8_0);
+  const unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
+
+  if (M4 > 0) {
+    const unsigned int row_chunk_size = 16;
+    const size_t row_loop = (M4 * 4 + row_chunk_size - 1) / row_chunk_size;
+    const unsigned int col_chunk_size = 16;
+    const size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+
+    tm.parallel_for(0, col_loop * row_loop, [=](size_t i) {
+      unsigned int r = i / col_loop;
+      unsigned int c = i % col_loop;
+
+      unsigned int r_start = r * row_chunk_size;
+      unsigned int r_end = std::min(row_chunk_size * (r + 1), M4 * 4);
+
+      unsigned int c_start = c * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+
+#if defined(__ARM_NEON)
+      nntr_gemm_q4_0_4x8_q8_0_fp16(K, (_FP16 *)(C + r_start * N + c_start), ldc,
+                                   (void *)((char *)B + c_start * B_step),
+                                   (void *)(QA_ptr + r_start * A_step),
+                                   r_end - r_start, c_end - c_start);
+#else
+      unsigned int t_rows = r_end - r_start;
+      unsigned int t_cols = c_end - c_start;
+      std::vector<float> tile(t_rows * t_cols);
+      nntr_gemm_q4_0_4x8_q8_0(K, tile.data(), t_cols,
+                              (void *)((char *)B + c_start * B_step),
+                              (void *)(QA_ptr + r_start * A_step), t_rows,
+                              t_cols);
+      for (unsigned int ii = 0; ii < t_rows; ++ii)
+        __copy_f16_from_f32(&tile[ii * t_cols],
+                            C + (r_start + ii) * N + c_start, t_cols);
+#endif
+    });
+  }
+
+  /// Leftover 1..3 rows: FP32-output GEMV into a small per-(M%4) scratch, then
+  /// cast just that tail back into C (same as BSTP's leftover block).
+  if (rem > 0) {
+    std::vector<float> tail32(rem * (size_t)N);
+    unsigned int chunk_size = 16;
+    unsigned int loop = (N + chunk_size - 1) / chunk_size;
+    for (unsigned int pb = M4 * 4; pb < M; pb++) {
+      tm.parallel_for(0, loop, [=, &tail32](size_t idx) {
+        unsigned int M_step_start = chunk_size * idx;
+        unsigned int M_step_end = std::min(chunk_size * (idx + 1), (size_t)N);
+
+        nntr_gemv_q4_0_4x8_q8_0(
+          K, (float *)(tail32.data() + (pb - M4 * 4) * N) + M_step_start, N,
+          (void *)((char *)B + M_step_start * B_step),
+          QA_ptr + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
+          M_step_end - M_step_start);
+      });
+    }
+    __copy_f16_from_f32(tail32.data(), C + (size_t)M4 * 4 * N, (size_t)rem * N);
+  }
+}
+
+void __ggml_q4_0_4x8_q8_0_indirect_GEMM_q8_0(
+  const unsigned int M, const unsigned int N, const unsigned int K,
+  const void *in, const ConvGatherParams &geom, const void *B,
+  const unsigned int ldb, _FP16 *C, const unsigned int ldc) {
+  auto &tm = ThreadManager::Global();
+  (void)ldb;
+
+  const unsigned int blocks_per_4_rows = (K + QK8_0 - 1) / QK8_0;
+  const unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * blocks_per_4_rows;
+  const size_t qa_row_size =
+    (sizeof(block_q8_0) * K) / QK8_0; // ignore remainder
+  const unsigned int M4 = M / 4;
+  const unsigned int rem = M % 4;
+
+  const unsigned int qa_size =
+    qa_4_rows_size * M4 + static_cast<unsigned int>(qa_row_size) * rem;
+  std::vector<char> QA(qa_size);
+  char *QA_ptr = QA.data();
+
+  const unsigned int QCHUNK = 64; // multiple of 4
+  if (M4 > 0) {
+    const unsigned int rows4 = M4 * 4;
+    const size_t qloops = (rows4 + QCHUNK - 1) / QCHUNK;
+    tm.parallel_for(0, qloops, [=](size_t q) {
+      const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
+      const unsigned int r1 = std::min(r0 + QCHUNK, rows4);
+      for (unsigned int r = r0; r < r1; r += 4) {
+        gather_conv_act_rows_q8_0(QA_ptr + (r / 4) * qa_4_rows_size, in, geom,
+                                  (int)r, 4);
+      }
+    });
+  }
+
+  for (unsigned int i = M4 * 4; i < M; ++i) {
+    gather_conv_act_rows_q8_0_single(QA_ptr + (M4 * qa_4_rows_size) +
+                                       (i - M4 * 4) * qa_row_size,
+                                     in, geom, (int)i);
+  }
+
+  const unsigned int A_step = sizeof(block_q8_0) * (K / QK8_0);
+  const unsigned int B_step = sizeof(block_q4_0) * (K / QK4_0);
+
+  if (M4 > 0) {
+    const unsigned int row_chunk_size = 16;
+    const size_t row_loop = (M4 * 4 + row_chunk_size - 1) / row_chunk_size;
+    const unsigned int col_chunk_size = 16;
+    const size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+
+    tm.parallel_for(0, col_loop * row_loop, [=](size_t i) {
+      unsigned int r = i / col_loop;
+      unsigned int c = i % col_loop;
+
+      unsigned int r_start = r * row_chunk_size;
+      unsigned int r_end = std::min(row_chunk_size * (r + 1), M4 * 4);
+
+      unsigned int c_start = c * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+
+#if defined(__ARM_NEON)
+      nntr_gemm_q4_0_4x8_q8_0_fp16(K, (_FP16 *)(C + r_start * N + c_start), ldc,
+                                   (void *)((char *)B + c_start * B_step),
+                                   (void *)(QA_ptr + r_start * A_step),
+                                   r_end - r_start, c_end - c_start);
+#else
+      unsigned int t_rows = r_end - r_start;
+      unsigned int t_cols = c_end - c_start;
+      std::vector<float> tile(t_rows * t_cols);
+      nntr_gemm_q4_0_4x8_q8_0(K, tile.data(), t_cols,
+                              (void *)((char *)B + c_start * B_step),
+                              (void *)(QA_ptr + r_start * A_step), t_rows,
+                              t_cols);
+      for (unsigned int ii = 0; ii < t_rows; ++ii)
+        __copy_f16_from_f32(&tile[ii * t_cols],
+                            C + (r_start + ii) * N + c_start, t_cols);
+#endif
+    });
+  }
+
+  if (rem > 0) {
+    std::vector<float> tail32(rem * (size_t)N);
+    unsigned int chunk_size = 16;
+    unsigned int loop = (N + chunk_size - 1) / chunk_size;
+    for (unsigned int pb = M4 * 4; pb < M; pb++) {
+      tm.parallel_for(0, loop, [=, &tail32](size_t idx) {
+        unsigned int M_step_start = chunk_size * idx;
+        unsigned int M_step_end = std::min(chunk_size * (idx + 1), (size_t)N);
+
+        nntr_gemv_q4_0_4x8_q8_0(
+          K, (float *)(tail32.data() + (pb - M4 * 4) * N) + M_step_start, N,
+          (void *)((char *)B + M_step_start * B_step),
+          QA_ptr + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
+          M_step_end - M_step_start);
+      });
+    }
+    __copy_f16_from_f32(tail32.data(), C + (size_t)M4 * 4 * N, (size_t)rem * N);
+  }
+}
+
+/**
+ * @brief Q8_0-weight variant of the indirect conv GEMM.
+ *
+ * Mirrors __ggml_q4_0_4x8_q8_0_indirect_GEMM_q8_0 but the weight operand is a
+ * plain (non-interleaved) block_q8_0 array [N, K/32] instead of Q4_0x8. Both
+ * activation and weight are int8 Q8_0, so we reuse the proven plain-block
+ * primitive nntr_gemm_q8_0_q8_0 (int8 SDOT core, no nibble unpack, no repack)
+ * rather than a bespoke SMMLA kernel. The activation is gathered row-by-row as
+ * plain block_q8_0 via gather_conv_act_rows_q8_0_single (same gather the Q4_0
+ * path uses for its remainder rows). Output C is FP16.
+ */
+void __ggml_q8_0_q8_0_indirect_GEMM_q8_0(const unsigned int M,
+                                         const unsigned int N,
+                                         const unsigned int K, const void *in,
+                                         const ConvGatherParams &geom,
+                                         const void *B, const unsigned int ldb,
+                                         _FP16 *C, const unsigned int ldc) {
+  auto &tm = ThreadManager::Global();
+  (void)ldb;
+  (void)ldc;
+
+  const unsigned int nb = K / QK8_0; // blocks per row (K multiple of 32)
+  const size_t qa_row_size = (size_t)nb * sizeof(block_q8_0);
+
+  // 1) Gather all M activation rows as plain block_q8_0 [M, nb].
+  std::vector<char> QA((size_t)M * qa_row_size);
+  char *QA_ptr = QA.data();
+  {
+    const unsigned int QCHUNK = 64;
+    const size_t qloops = (M + QCHUNK - 1) / QCHUNK;
+    tm.parallel_for(0, qloops, [=](size_t q) {
+      const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
+      const unsigned int r1 = std::min(r0 + QCHUNK, M);
+      for (unsigned int r = r0; r < r1; ++r) {
+        gather_conv_act_rows_q8_0_single(QA_ptr + (size_t)r * qa_row_size, in,
+                                         geom, (int)r);
+      }
+    });
+  }
+
+  // 2) Tiled GEMM: plain Q8_0 weight [N, nb] x plain Q8_0 act [M, nb] -> FP16.
+  const size_t B_step = (size_t)nb * sizeof(block_q8_0);
+  const unsigned int row_chunk_size = 16;
+  const unsigned int col_chunk_size = 16;
+  const size_t row_loop = (M + row_chunk_size - 1) / row_chunk_size;
+  const size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+
+  tm.parallel_for(0, row_loop * col_loop, [=](size_t i) {
+    unsigned int r = static_cast<unsigned int>(i / col_loop);
+    unsigned int c = static_cast<unsigned int>(i % col_loop);
+
+    unsigned int r_start = r * row_chunk_size;
+    unsigned int r_end = std::min(row_chunk_size * (r + 1), M);
+    unsigned int c_start = c * col_chunk_size;
+    unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+
+    unsigned int t_rows = r_end - r_start;
+    unsigned int t_cols = c_end - c_start;
+
+    std::vector<float> tile((size_t)t_rows * t_cols);
+    nntr_gemm_q8_0_q8_0(
+      (int)K, tile.data(), t_cols,
+      (const void *)((const char *)B + (size_t)c_start * B_step),
+      (const void *)(QA_ptr + (size_t)r_start * qa_row_size), (int)t_rows,
+      (int)t_cols);
+
+    for (unsigned int ii = 0; ii < t_rows; ++ii)
+      __copy_f16_from_f32(&tile[(size_t)ii * t_cols],
+                          C + (size_t)(r_start + ii) * N + c_start, t_cols);
+  });
+}
+
+void __ggml_q8_0_q8_0_indirect_GEMM_fp16(const unsigned int M,
+                                         const unsigned int N,
+                                         const unsigned int K, const _FP16 *in,
+                                         const ConvGatherParams &geom,
+                                         const void *B, const unsigned int ldb,
+                                         _FP16 *C, const unsigned int ldc) {
+  /// Interleaved (q8_0x4) SMMLA path, mirroring the proven Q4_0 x8 FP16
+  /// indirect GEMM. The activation is gathered in 4-row tiles and quantized to
+  /// the interleaved block_q8_0x4 layout (same __ggml_quantize_mat_q8_0_4x8 the
+  /// Q4_0 path uses), and the weight is consumed pre-interleaved to q8_0x4 by
+  /// the C++ quantizer (Conv2DLayer::save calls repack_q8_0 at weight-export
+  /// time). A q8_0x4 super-block is exactly 4 plain block_q8_0 rows of bytes,
+  /// so the per-column weight stride B_step = nb*sizeof(block_q8_0) lands on
+  /// 4-col super-block boundaries -- identical addressing trick to the Q4_0
+  /// path. Both operands then feed the register-blocked 4x4 SMMLA kernel with
+  /// single contiguous loads (see nntr_gemm_q8_0_q8_0_4x4_fp16).
+  auto &tm = ThreadManager::Global();
+  (void)ldb;
+  (void)ldc;
+
+  const unsigned int nb = K / QK8_0; // blocks per row (K multiple of 32)
+  const unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * nb;
+  const unsigned int Mfull = (M / 4) * 4; // 4-row-divisible part
+  const unsigned int rem = M % 4;
+  const unsigned int M4 = M / 4;
+  const unsigned int M4c = (M + 3) / 4; // groups incl. padded tail
+
+  // 1) Fused gather + Q8_0 quantize to interleaved q8_0x4, 4 rows at a time.
+  //    To match the highly optimized Q4_0 path's chunked parallel_for:
+  //    we parallelize over larger chunks (QCHUNK = 64 rows / 16 tiles) instead
+  //    of individual 4-row groups, reducing thread manager dispatch overheads
+  //    drastically, and allocating our reusable tile buffer once per thread.
+  std::vector<char> QA((size_t)M4c * qa_4_rows_size);
+  char *QA_ptr = QA.data();
+
+  const unsigned int QCHUNK = 64; // multiple of 4
+  if (Mfull > 0) {
+    const size_t qloops = (Mfull + QCHUNK - 1) / QCHUNK;
+    tm.parallel_for(0, qloops, [=](size_t q) {
+      const unsigned int r0 = static_cast<unsigned int>(q) * QCHUNK;
+      const unsigned int r1 = std::min(r0 + QCHUNK, Mfull);
+      _FP16 *tile = (_FP16 *)alloca(
+        4 * K * sizeof(_FP16)); // zero heap overhead stack buffer
+      for (unsigned int r = r0; r < r1; r += 4) {
+        gather_conv_act_rows_fp16(tile, in, geom, (int)r, 4);
+        __ggml_quantize_mat_q8_0_4x8(
+          tile, QA_ptr + (size_t)(r / 4) * qa_4_rows_size, K);
+      }
+    });
+  }
+
+  // Handle M-tail (rem 1..3) gather and quantization
+  if (rem > 0) {
+    _FP16 *tile =
+      (_FP16 *)alloca(4 * K * sizeof(_FP16)); // zero heap overhead stack buffer
+    std::memset(tile, 0, 4 * K * sizeof(_FP16));
+    gather_conv_act_rows_fp16(tile, in, geom, (int)Mfull, (int)rem);
+    __ggml_quantize_mat_q8_0_4x8(tile, QA_ptr + (size_t)M4 * qa_4_rows_size, K);
+  }
+
+  // 2) Tiled 4x4 SMMLA GEMM over the 4-row-divisible part, direct to C.
+  const size_t B_step = (size_t)nb * sizeof(block_q8_0);
+  const size_t A_step = (size_t)nb * sizeof(block_q8_0); // 4 plain rows / super
+  const unsigned int row_chunk_size = 16;                // multiple of 4
+  const unsigned int col_chunk_size = 16;                // multiple of 4
+
+  if (Mfull > 0) {
+    const size_t row_loop = (Mfull + row_chunk_size - 1) / row_chunk_size;
+    const size_t col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+    tm.parallel_for(0, row_loop * col_loop, [=](size_t i) {
+      unsigned int r = static_cast<unsigned int>(i / col_loop);
+      unsigned int c = static_cast<unsigned int>(i % col_loop);
+      unsigned int r_start = r * row_chunk_size;
+      unsigned int r_end = std::min(row_chunk_size * (r + 1), Mfull);
+      unsigned int c_start = c * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * (c + 1), N);
+
+      nntr_gemm_q8_0_q8_0_4x4_fp16(
+        (int)K, C + (size_t)r_start * N + c_start, N,
+        (const void *)((const char *)B + (size_t)c_start * B_step),
+        (const void *)(QA_ptr + (size_t)(r_start / 4) * qa_4_rows_size),
+        (int)(r_end - r_start), (int)(c_end - c_start));
+    });
+  }
+
+  // 3) M-tail (rem 1..3): run the padded last group into a 4xN FP16 scratch,
+  //    then copy only the valid rem rows into C. (A_step unused; the tail
+  //    super-block is the last one in QA.)
+  (void)A_step;
+  if (rem > 0) {
+    _FP16 *scratch =
+      (_FP16 *)alloca(4 * N * sizeof(_FP16)); // zero heap overhead stack buffer
+    const char *tail_a = QA_ptr + (size_t)(M / 4) * qa_4_rows_size;
+    const unsigned int col_loop = (N + col_chunk_size - 1) / col_chunk_size;
+    tm.parallel_for(0, col_loop, [=](size_t c) {
+      unsigned int c_start = static_cast<unsigned int>(c) * col_chunk_size;
+      unsigned int c_end = std::min(col_chunk_size * ((unsigned int)c + 1), N);
+      nntr_gemm_q8_0_q8_0_4x4_fp16(
+        (int)K, scratch + c_start, N,
+        (const void *)((const char *)B + (size_t)c_start * B_step),
+        (const void *)tail_a, 4, (int)(c_end - c_start));
+    });
+    for (unsigned int rr = 0; rr < rem; ++rr)
+      std::memcpy(C + (size_t)(Mfull + rr) * N, scratch + (size_t)rr * N,
+                  (size_t)N * sizeof(_FP16));
+  }
+}
+#endif
 
 } // namespace nntrainer
