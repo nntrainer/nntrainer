@@ -2,6 +2,10 @@ name: C++ Format Checker
 
 on: pull_request
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   cpp-linter:
     runs-on: ubuntu-22.04
