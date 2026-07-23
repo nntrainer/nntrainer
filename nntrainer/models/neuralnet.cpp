@@ -26,6 +26,7 @@
 #include "model_common_properties.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <compute_ops.h>
 #include <cstdint>
@@ -537,17 +538,8 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
     auto f = std::get<0>(node->getExecutionOrder());
     if (exec_mode == ExecutionMode::TRAIN or
         (exec_mode == ExecutionMode::INFERENCE and !fsu_mode)) {
-      // auto start_layer =
-      //      std::chrono::high_resolution_clock::now(); // log the
-      //      start_prefill time
       model_graph.flushCacheExcept(f);
       node->incremental_forwarding(from, to, training);
-      // auto end_layer =
-      //  std::chrono::high_resolution_clock::now(); // log th
-      //   auto duration_ =
-      //   std::chrono::duration_cast<std::chrono::nanoseconds>(end_layer-start_layer);
-      // std::cout << node->getName() <<" : "<< duration_.count()<<"
-      // ns"<<std::endl;
     } else {
       model_graph.checkLoadComplete(f);
       node->incremental_forwarding(from, to, training);
@@ -1271,8 +1263,18 @@ void NeuralNetwork::load(const std::string &file_path,
           continue;
         const std::string &name = weight->getName();
         auto it = name_offset_map.find(name);
-        if (it == name_offset_map.end())
+        if (it == name_offset_map.end()) {
+          // The graph expects this weight but the safetensors file has no
+          // tensor of that name, so it silently keeps its uninitialized
+          // contents (garbage) -> the layer then computes NaN/inf downstream.
+          // Warn loudly: this is almost always a name-mismatch between the
+          // weight converter/quantizer output and the graph's weight names.
+          ml_logw("[load] weight '%s' not found in safetensors; it stays "
+                  "UNINITIALIZED (expect NaN). Check the converter/quantizer "
+                  "produced this exact tensor name.",
+                  name.c_str());
           continue;
+        }
         const size_t file_off = data_base + it->second.first;
         weight->getVariableRef().setFileOffset(file_off);
       }
