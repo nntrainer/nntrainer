@@ -47,9 +47,11 @@ enum class ExecutionMode {
  * @brief     Enumeration of layer compute engine
  */
 enum LayerComputeEngine {
-  CPU, /**< CPU as the compute engine */
-  GPU, /**< GPU as the compute engine */
-  QNN, /**< QNN as the compute engine */
+  CPU,  /**< CPU as the compute engine */
+  GPU,  /**< GPU as the compute engine */
+  QNN,  /**< QNN as the compute engine */
+  CDSP, /**< Hexagon cDSP (direct FastRPC/HVX/HMX, no QNN graph) as the
+           compute engine */
 };
 
 /**
@@ -62,7 +64,8 @@ enum LayerComputeEngine {
 enum class ISA {
   DEFAULT = 0, /**< Use the current compiled backend format */
   X86,         /**< Force x86 format (q4_0x8 for Q4_0) */
-  ARM          /**< Force ARM format (q4_0x4 for Q4_0) */
+  ARM,         /**< Force ARM format (q4_0x4 for Q4_0) */
+  HEXAGON      /**< Force Hexagon HTP tile format (q4x4x2 for Q4_0) */
 };
 
 /**
