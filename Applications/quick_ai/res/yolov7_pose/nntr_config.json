@@ -1,0 +1,5 @@
+{
+  "model_file_name": "yolov7_pose.safetensors",
+  "model_tensor_type": "FP32-FP32",
+  "conv_dtype": "Q8_0"
+}

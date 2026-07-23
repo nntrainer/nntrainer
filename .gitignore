@@ -23,6 +23,17 @@ Applications/**/*.bin
 # model weight checkpoints (*.pt at repo root are local/exported artifacts, not source)
 /*.pt
 Applications/**/res/*
+!Applications/quick_ai/res/yolov7_pose/
+Applications/quick_ai/res/yolov7_pose/*
+!Applications/quick_ai/res/yolov7_pose/models_pose/
+!Applications/quick_ai/res/yolov7_pose/models_pose/**
+!Applications/quick_ai/res/yolov7_pose/weight_converter.py
+!Applications/quick_ai/res/yolov7_pose/make_reference.py
+!Applications/quick_ai/res/yolov7_pose/make_input.py
+!Applications/quick_ai/res/yolov7_pose/verify_parity.py
+!Applications/quick_ai/res/yolov7_pose/inspect_q8_file.py
+!Applications/quick_ai/res/yolov7_pose/config.json
+!Applications/quick_ai/res/yolov7_pose/nntr_config.json
 !Applications/quick_ai/res/deberta_v2/
 Applications/quick_ai/res/deberta_v2/*
 !Applications/quick_ai/res/deberta_v2/weight_converter.py
