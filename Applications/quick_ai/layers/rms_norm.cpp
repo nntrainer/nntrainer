@@ -42,7 +42,14 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
 }
 
 void RMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
-                              bool training) {}
+                              bool training) {
+  // Full (non-incremental) forward: normalize every row. Delegates to the
+  // incremental path over the whole height so model->inference() (which calls
+  // forwarding, not incremental_forwarding) produces a computed output instead
+  // of leaving it uninitialized.
+  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  incremental_forwarding(context, 0, in.getDim().height(), training);
+}
 
 void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int from, unsigned int to,

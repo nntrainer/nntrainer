@@ -97,6 +97,7 @@
 #if !defined(_WIN32) && !defined(__ANDROID__)
 #include "timm_vit/timm_vit_transformer.h"
 #endif
+#include "YOLOv7Pose/yolov7_pose.h"
 
 using json = nlohmann::json;
 using DataType = ml::train::TensorDim::DataType;
@@ -412,6 +413,11 @@ void registerAllModels() {
                             cfg, generation_cfg, nntr_cfg);
                         });
 #endif
+  factory.registerModel(
+    "YOLOv7ReIDtiny", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<quick_ai::Yolov7Pose>(cfg, generation_cfg,
+                                                    nntr_cfg);
+    });
 }
 
 /**
