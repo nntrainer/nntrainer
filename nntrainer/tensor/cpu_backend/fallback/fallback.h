@@ -1306,7 +1306,6 @@ template <typename T = float>
 void clamp(const T *input, T *output, size_t length,
            T lower_bound = std::numeric_limits<T>::lowest(),
            T upper_bound = std::numeric_limits<T>::max());
-} /* namespace nntrainer */
 
 /**
  * @brief     Create a Q4_0 weights (without XOR 0x88) from int4 weights
@@ -1345,7 +1344,6 @@ void transform_int4_osv32_isv2_to_q4_0(size_t N, size_t K,
                                        size_t scale_group_size,
                                        void *dst_q4_0x);
 
-namespace nnatrainer {
 /**
  * kleidiai
  */
@@ -1412,6 +1410,27 @@ void dequant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_qs4cx,
  */
 void dequantize_row_qs4cx(size_t n_idx, size_t k, void *rhs_native_mtx_qs4cx,
                           void *rhs_scales_f32, void *rhs_native_mtx_f32);
+
+/**
+ * @brief qs8cx quantization of rhs matrix in nxk format. Typically a weight
+ * quantization, and the weight must be transposed in (N, K).
+ * qs8cx refers to quantized symmetric 8-bit channel-wise quantization.
+ * Note that the output is stored as signed int8.
+ *
+ * @warning You should allocate memory for outputs before use:
+ *  - rhs_native_mtx_qs8cx
+ *    n * k * sizeof(int8_t)
+ *  - rhs_scales_f32
+ *    n * sizeof(float)
+ *
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] rhs_native_mtx_f32 matrix data before quantization
+ * @param[out] rhs_native_mtx_qs8cx quantized matrix data after quantization
+ * @param[out] rhs_scales_f32 matrix quant scale after quantization
+ */
+void quant_qs8cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
+                     void *rhs_native_mtx_qs8cx, void *rhs_scales_f32);
 
 /**
  * @brief get size of memory to allocate for packed rhs from nxk qs4cxs1s0 to
@@ -1483,7 +1502,7 @@ void gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
                           float *dst_act_mtx_f32, size_t idx_variant,
                           float lower_bound = -FLT_MAX,
                           float upper_bound = FLT_MAX);
-} // namespace nnatrainer
+} // namespace nntrainer
 
 #endif /* __cplusplus */
 #endif /* __FALLBACK_H__ */

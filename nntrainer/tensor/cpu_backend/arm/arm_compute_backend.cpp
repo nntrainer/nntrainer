@@ -650,6 +650,13 @@ void dequantize_row_qs4cx(size_t n_idx, size_t k, void *rhs_native_mtx_qs4cx,
 #endif
 }
 
+void quant_qs8cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
+                     void *rhs_native_mtx_qs8cx, void *rhs_scales_f32) {
+  __fallback_quant_nxk_qs8cx_f32(n, k, (const float *)rhs_native_mtx_f32,
+                                 (int8_t *)rhs_native_mtx_qs8cx,
+                                 (float *)rhs_scales_f32);
+}
+
 size_t get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
                                              size_t idx_variant, bool is_nxk) {
 #ifndef ARMV7

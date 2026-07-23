@@ -1353,6 +1353,20 @@ void __fallback_dequant_kxn_qs4cx_f32(size_t n, size_t k,
                                       float *rhs_f32);
 
 /**
+ * @brief qs8cx quantization of (n,k) RHS matrix in nxk format
+ * qs8cx refers to quantized symmetric 8-bit per-channel quantization.
+ * Note that the output is stored as signed int8.
+ *
+ * @param[in] n N length of the matrix
+ * @param[in] k K length of the matrix
+ * @param[in] rhs_f32 matrix data before quantization
+ * @param[out] rhs_qs8cx matrix data in nxk format after quantization
+ * @param[out] rhs_scales_f32 matrix quant scale after quantization
+ */
+void __fallback_quant_nxk_qs8cx_f32(size_t n, size_t k, const float *rhs_f32,
+                                    int8_t *rhs_qs8cx, float *rhs_scales_f32);
+
+/**
  * @brief qa8dx quantization of (m,k) LHS matrix. qa8dx refer to quantized
  * asymmetric 8-bit per-dimension quantization. Note that qparams are embedded
  * at the beginning of the output matrix.

@@ -1523,6 +1523,27 @@ void dequantize_row_qs4cx(size_t n_idx, size_t k, void *rhs_native_mtx_qs4cx,
                           void *rhs_scales_f32, void *rhs_native_mtx_f32);
 
 /**
+ * @brief qs8cx quantization of rhs matrix in nxk format. Typically a weight
+ * quantization, and the weight must be transposed in (N, K).
+ * qs8cx refers to quantized symmetric 8-bit channel-wise quantization.
+ * Note that the output is stored as signed int8.
+ *
+ * @warning You should allocate memory for outputs before use:
+ *  - rhs_native_mtx_qs8cx
+ *    n * k * sizeof(int8_t)
+ *  - rhs_scales_f32
+ *    n * sizeof(float)
+ *
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] rhs_native_mtx_f32 matrix data before quantization
+ * @param[out] rhs_native_mtx_qs8cx quantized matrix data after quantization
+ * @param[out] rhs_scales_f32 matrix quant scale after quantization
+ */
+void quant_qs8cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
+                     void *rhs_native_mtx_qs8cx, void *rhs_scales_f32);
+
+/**
  * @brief get size of memory to allocate for packed rhs from nxk qs4cxs1s0 to
  * qsi4cxp
  * Note that nxk is the format of quantized rhs, not the shape of rhs

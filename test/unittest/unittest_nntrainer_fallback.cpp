@@ -1140,6 +1140,46 @@ TEST(nntrainer_fallback_kleidiai, quant_kxn_qs4cx_f32_odd_n) {
   }
 }
 
+/**
+ * @brief test __fallback_quant_nxk_qs8cx_f32 with (n, k) shaped random input
+ */
+static void test_quant_nxk_qs8cx_f32(size_t n, size_t k) {
+  std::vector<float> rhs_f32 = generate_random_vector<float>(n * k);
+  std::vector<int8_t> rhs_qs8cx(n * k, 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+
+  nntrainer::__fallback_quant_nxk_qs8cx_f32(
+    n, k, rhs_f32.data(), rhs_qs8cx.data(), rhs_scales_f32.data());
+
+  // Verify scales are computed
+  for (size_t i = 0; i < n; ++i) {
+    float scale = rhs_scales_f32[i];
+    EXPECT_GT(scale, 0.0f);
+    for (size_t j = 0; j < k; ++j) {
+      int q = rhs_qs8cx[i * k + j];
+
+      float q_f = q * scale;
+      float ref = rhs_f32[i * k + j];
+
+      if (ref <= (float)INT8_MIN * scale) {
+        EXPECT_EQ(q, INT8_MIN);
+      } else if (ref >= (float)INT8_MAX * scale) {
+        EXPECT_EQ(q, INT8_MAX);
+      } else {
+        EXPECT_NEAR(q_f, ref, scale / 2);
+      }
+    }
+  }
+}
+
+TEST(nntrainer_fallback_kleidiai, quant_nxk_qs8cx_f32_n1_k128) {
+  test_quant_nxk_qs8cx_f32(1, 128);
+}
+
+TEST(nntrainer_fallback_kleidiai, quant_nxk_qs8cx_f32_n32_k128) {
+  test_quant_nxk_qs8cx_f32(32, 128);
+}
+
 TEST(nntrainer_fallback_kleidiai, quant_qa8dx_zero) {
   const size_t m = 2;
   const size_t k = 8;
