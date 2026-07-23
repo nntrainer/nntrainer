@@ -18,6 +18,7 @@
 #include <compute_ops.h>
 #include <fallback_internal.h>
 #include <ggml_interface.h>
+#include <hexagon_repack.h>
 #ifndef ARMV7
 #include <kleidiai_interface.h>
 #endif
@@ -483,6 +484,11 @@ void repack_q4_0(void *dst, void *src, size_t data_size, const unsigned int M,
   case ml::train::ISA::DEFAULT:
     // Use ARM format (q4_0x4)
     __ggml_repack_q4_0_to_q4_0_4(dst, src, data_size, M, N);
+    break;
+  case ml::train::ISA::HEXAGON:
+    // Use Hexagon HTP tile format (q4x4x2), pre-packed for the cDSP matmul
+    // kernel so weight load is a plain byte copy at inference time.
+    repack_q4_0_to_htp_q4x4x2(dst, src, data_size, M, N);
     break;
   default:
     break;

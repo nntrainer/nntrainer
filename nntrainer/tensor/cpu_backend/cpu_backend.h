@@ -1261,7 +1261,8 @@ extern void quantize_row_q8_K(const T *src, void *dst, int64_t k);
  * @param M number of rows
  * @param N number of columns
  * @param target target ISA format (DEFAULT uses current backend, X86 forces
- * x86 format, ARM forces ARM format)
+ * x86 format, ARM forces ARM format, HEXAGON forces the Hexagon HTP q4x4x2
+ * tile format)
  */
 extern void repack_q4_0(void *dst, void *src, size_t data_size,
                         const unsigned int M, const unsigned int N,
