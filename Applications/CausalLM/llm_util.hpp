@@ -69,6 +69,38 @@ static std::string withKey(const std::string &key,
 }
 
 /**
+ * @brief Whether Q4_0 FC layers should be tagged engine=cdsp, so they
+ * dispatch their GEMM through HexagonComputeOps (see
+ * nntrainer/hexagon/hexagon_context.cpp) instead of the CPU NEON/AVX path.
+ * Checked once per process via NNTR_USE_HEXAGON_CDSP; only meaningful on a
+ * build with -Denable-hexagon-cdsp=true and libggml-hexagon.so reachable at
+ * runtime (see nntr-htp-bridge.cpp in the ggml-hexagon repo) - otherwise
+ * layer creation under the "cdsp" context, or the first accelerated GEMM
+ * call, will fail.
+ */
+inline bool useHexagonCdsp() {
+  static const bool use_cdsp = std::getenv("NNTR_USE_HEXAGON_CDSP") != nullptr;
+  return use_cdsp;
+}
+
+/**
+ * @brief Append engine=cdsp to a fully_connected layer's properties when
+ * useHexagonCdsp() is set. Only meant for FC layers that hold Q4_0 weights
+ * (the accel GEMM is Q4_0-specific - see
+ * ComputeOps::supports_gemm_q4_0_accel_fp32) - tagging an FP32/Q6_K-weight
+ * layer (e.g. embedding, lm_head) this way is harmless but pointless, since
+ * the dtype check in float_tensor.cpp's dotQnK will just fall through to the
+ * normal CPU path for it anyway.
+ */
+inline std::vector<std::string>
+withHexagonEngine(std::vector<std::string> props) {
+  if (useHexagonCdsp()) {
+    props.push_back(withKey("engine", "cdsp"));
+  }
+  return props;
+}
+
+/**
  * @brief
  */
 template <typename T>
