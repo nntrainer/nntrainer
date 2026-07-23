@@ -33,6 +33,12 @@ option('enable-npu', type: 'boolean', value: false)
 # Alternatively: export QNN_SDK_ROOT=/opt/qcom/aistack/qnn-2.47.0
 # See docs/backend_guide/QNN_BUILD.md for details.
 option('qnn-sdk-root', type: 'string', value: '')
+option('enable-hexagon-cdsp', type: 'boolean', value: false)
+# Hexagon cDSP compute engine ("engine=cdsp" layer property). Direct
+# FastRPC/HVX/HMX dispatch (via ggml-hexagon's cDSP session), not QNN's
+# graph compiler - see docs/nntrainer-htp-bridge.md. Currently a Stage 1
+# stub: registers the "cdsp" Context and Q4_0 HTP weight repack, but
+# gemm_q4_0_accel_fp32() throws until the FastRPC bridge is wired in.
 option('mmap-read', type: 'boolean', value: true)
 option('enable-kernel-caching', type: 'boolean', value: false)
 

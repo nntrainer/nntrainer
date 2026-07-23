@@ -61,6 +61,10 @@ if get_option('enable-opencl')
   nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
 endif
 
+if get_option('enable-hexagon-cdsp')
+  nntrainer_elements += 'hexagon'
+endif
+
 if get_option('enable-npu')
   nntrainer_elements += 'qnn'
   # Note: qnn subdir is NOT processed here with the other elements.

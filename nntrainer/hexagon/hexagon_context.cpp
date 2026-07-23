@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
+ *
+ * @file   hexagon_context.cpp
+ * @date   23 July 2026
+ * @see    https://github.com/nntrainer/nntrainer
+ * @brief  See hexagon_context.h.
+ */
+
+#include <hexagon_compute_ops.h>
+#include <hexagon_context.h>
+
+#include <fc_layer.h>
+
+namespace nntrainer {
+
+std::mutex hexagon_factory_mutex;
+
+template <typename T>
+const int HexagonContext::registerFactory(const FactoryType<T> factory,
+                                          const std::string &key,
+                                          const int int_key) {
+  static_assert(isSupported<T>::value,
+                "hexagon_context: given type is not supported for current "
+                "context");
+
+  auto &index = std::get<IndexType<T>>(factory_map);
+  auto &str_map = std::get<StrIndexType<T>>(index);
+  auto &int_map = std::get<IntIndexType>(index);
+
+  std::string assigned_key = key == "" ? factory({})->getType() : key;
+
+  std::transform(assigned_key.begin(), assigned_key.end(), assigned_key.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+
+  const std::lock_guard<std::mutex> lock(hexagon_factory_mutex);
+  if (str_map.find(assigned_key) != str_map.end()) {
+    std::stringstream ss;
+    ss << "hexagon_context: cannot register factory with already taken key: "
+       << key;
+    throw std::invalid_argument(ss.str().c_str());
+  }
+
+  if (int_key != -1 && int_map.find(int_key) != int_map.end()) {
+    std::stringstream ss;
+    ss << "hexagon_context: cannot register factory with already taken int "
+          "key: "
+       << int_key;
+    throw std::invalid_argument(ss.str().c_str());
+  }
+
+  int assigned_int_key = int_key == -1 ? str_map.size() + 1 : int_key;
+
+  str_map[assigned_key] = factory;
+  int_map[assigned_int_key] = assigned_key;
+
+  return assigned_int_key;
+}
+
+void HexagonContext::add_default_object() {
+  // Reuse the CPU FullyConnectedLayer as-is - the difference between
+  // "engine=cpu" and "engine=cdsp" is only which ComputeOps the layer's
+  // weight Tensor is handed (see initialize() below), not the layer class.
+  registerFactory(nntrainer::createLayer<FullyConnectedLayer>,
+                  FullyConnectedLayer::type, ml::train::LayerType::LAYER_FC);
+}
+
+void HexagonContext::initialize() noexcept {
+  try {
+    add_default_object();
+
+    // Every Q4_0 weight Tensor attached to this context's ContextData will
+    // dispatch its GEMM through HexagonComputeOps::gemm_q4_0_accel_fp32
+    // (float_tensor.cpp's dotQnK already checks supports_gemm_q4_0_accel_fp32()
+    // before falling back to the CPU NEON/AVX kernel - see compute_ops.h).
+    getContextData()->setComputeOps(get_hexagon_ops());
+  } catch (std::exception &e) {
+    ml_loge("hexagon_context: registering layers failed!!, reason: %s",
+            e.what());
+  } catch (...) {
+    ml_loge("hexagon_context: registering layer failed due to unknown reason");
+  }
+}
+
+template const int HexagonContext::registerFactory<nntrainer::Layer>(
+  const FactoryType<nntrainer::Layer> factory, const std::string &key,
+  const int int_key);
+
+} // namespace nntrainer
