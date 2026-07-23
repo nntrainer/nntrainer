@@ -8,6 +8,7 @@ pack_sources = [
     'kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0.c',
     'kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.c',
     'kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon.c',
+    'kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.c',
 ]
 
 pack_headers = [
@@ -18,6 +19,7 @@ pack_headers = [
     'kai_rhs_pack_kxn_qsi4cxp_qs4cxs1s0.h',
     'kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0.h',
     'kai_rhs_pack_nxk_qsi4cxp_qs4cxs1s0_neon.h',
+    'kai_rhs_pack_nxk_qsi8cxp_qsi8cx_neon.h',
 ]
 
 if get_option('enable-fp16')
