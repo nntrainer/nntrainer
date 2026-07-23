@@ -639,9 +639,15 @@ void dequant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_qs4cx,
 
 void dequantize_row_qs4cx(size_t n_idx, size_t k, void *rhs_native_mtx_qs4cx,
                           void *rhs_scales_f32, void *rhs_native_mtx_f32) {
+#ifdef __ARM_NEON
+  nntrainer::neon::dequantize_row_qs4cx_neon(
+    n_idx, k, (const uint8_t *)rhs_native_mtx_qs4cx,
+    (const float *)rhs_scales_f32, (float *)rhs_native_mtx_f32);
+#else
   __fallback_dequantize_row_qs4cx_f32(
     n_idx, k, (const uint8_t *)rhs_native_mtx_qs4cx,
     (const float *)rhs_scales_f32, (float *)rhs_native_mtx_f32);
+#endif
 }
 
 size_t get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,

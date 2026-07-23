@@ -2552,4 +2552,88 @@ void compute_rotary_emb_value_uint16(unsigned int width, unsigned int dim,
   }
 }
 #endif
+
+void dequantize_row_qs4cx_neon(size_t n_idx, size_t k, const uint8_t *qs4cx,
+                               const float *scales, float *out) {
+  const size_t qs4cx_stride = (k + 1) / 2;
+  const uint8_t *src = qs4cx + n_idx * qs4cx_stride;
+  const float scale = scales[n_idx];
+  const float32x4_t scale_v = vdupq_n_f32(scale);
+  const uint8x16_t mask = vdupq_n_u8(0x0F);
+  const int8x16_t offset_v = vdupq_n_s8(8);
+
+  size_t i = 0;
+  // Process 16 bytes -> 32 elements per iteration
+  for (; i + 32 <= k; i += 32) {
+    uint8x16_t packed = vld1q_u8(src + i / 2);
+
+    // Byte j holds elements 2j (low nibble) and 2j+1 (high nibble);
+    // zip restores element order: val[0] = e0..e15, val[1] = e16..e31
+    uint8x16x2_t nibbles =
+      vzipq_u8(vandq_u8(packed, mask), vshrq_n_u8(packed, 4));
+
+    // Subtract 8 in the s8 domain (values fit in [-8, 7])
+    int8x16_t v0 = vsubq_s8(vreinterpretq_s8_u8(nibbles.val[0]), offset_v);
+    int8x16_t v1 = vsubq_s8(vreinterpretq_s8_u8(nibbles.val[1]), offset_v);
+
+    int16x8_t w0 = vmovl_s8(vget_low_s8(v0));
+    int16x8_t w1 = vmovl_s8(vget_high_s8(v0));
+    int16x8_t w2 = vmovl_s8(vget_low_s8(v1));
+    int16x8_t w3 = vmovl_s8(vget_high_s8(v1));
+
+    float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0)));
+    float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0)));
+    float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1)));
+    float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)));
+    float32x4_t f4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w2)));
+    float32x4_t f5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w2)));
+    float32x4_t f6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w3)));
+    float32x4_t f7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w3)));
+
+    vst1q_f32(out + i, vmulq_f32(f0, scale_v));
+    vst1q_f32(out + i + 4, vmulq_f32(f1, scale_v));
+    vst1q_f32(out + i + 8, vmulq_f32(f2, scale_v));
+    vst1q_f32(out + i + 12, vmulq_f32(f3, scale_v));
+    vst1q_f32(out + i + 16, vmulq_f32(f4, scale_v));
+    vst1q_f32(out + i + 20, vmulq_f32(f5, scale_v));
+    vst1q_f32(out + i + 24, vmulq_f32(f6, scale_v));
+    vst1q_f32(out + i + 28, vmulq_f32(f7, scale_v));
+  }
+
+  // Process 8 bytes -> 16 elements
+  if (i + 16 <= k) {
+    uint8x8_t packed = vld1_u8(src + i / 2);
+    uint8x8x2_t nibbles =
+      vzip_u8(vand_u8(packed, vdup_n_u8(0x0F)), vshr_n_u8(packed, 4));
+
+    int8x16_t v =
+      vsubq_s8(vreinterpretq_s8_u8(vcombine_u8(nibbles.val[0], nibbles.val[1])),
+               offset_v);
+
+    int16x8_t w0 = vmovl_s8(vget_low_s8(v));
+    int16x8_t w1 = vmovl_s8(vget_high_s8(v));
+
+    float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w0)));
+    float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w0)));
+    float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w1)));
+    float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w1)));
+
+    vst1q_f32(out + i, vmulq_f32(f0, scale_v));
+    vst1q_f32(out + i + 4, vmulq_f32(f1, scale_v));
+    vst1q_f32(out + i + 8, vmulq_f32(f2, scale_v));
+    vst1q_f32(out + i + 12, vmulq_f32(f3, scale_v));
+
+    i += 16;
+  }
+
+  // Handle tail (< 16 elements) with scalar code; a vector load here would
+  // read past the (k + 1) / 2 bytes of the last row
+  for (; i < k; ++i) {
+    const uint8_t packed = src[i / 2];
+    uint8_t nibble = ((i % 2) == 0) ? (packed & 0x0F) : ((packed >> 4) & 0x0F);
+    int32_t v_s32 = (int32_t)nibble - 8;
+    out[i] = (float)v_s32 * scale;
+  }
+}
+
 } // namespace nntrainer::neon

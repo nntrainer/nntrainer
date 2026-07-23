@@ -25,6 +25,7 @@
 #include <cpu_backend.h>
 #include <fallback_internal.h>
 #include <gtest/gtest.h>
+#include <neon_impl.h>
 #include <thread_manager.h>
 
 using std::chrono::duration_cast;
@@ -487,6 +488,124 @@ INSTANTIATE_TEST_SUITE_P(
     size_t K = std::get<1>(info.param);
     return std::to_string(N) + "_" + std::to_string(K);
   });
+
+static void compare_dequantize_row_qs4cx_fallback_vs_neon(size_t n, size_t k) {
+  std::vector<float> rhs_f32 =
+    generate_random_vector<float>(n * k, -10.0f, 10.0f);
+
+  const size_t rhs_qs4cx_stride = (k + 1) / 2;
+  std::vector<uint8_t> rhs_qs4cx(n * rhs_qs4cx_stride, 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+
+  nntrainer::__fallback_quant_nxk_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
+
+  std::vector<float> row_out_fallback(k, 0.0f);
+  std::vector<float> row_out_neon(k, 0.0f);
+
+  for (size_t n_idx = 0; n_idx < n; ++n_idx) {
+    // Reference fallback implementation
+    nntrainer::__fallback_dequantize_row_qs4cx_f32(n_idx, k, rhs_qs4cx.data(),
+                                                   rhs_scales_f32.data(),
+                                                   row_out_fallback.data());
+
+    // Test NEON implementation
+    nntrainer::neon::dequantize_row_qs4cx_neon(
+      n_idx, k, rhs_qs4cx.data(), rhs_scales_f32.data(), row_out_neon.data());
+
+    // Compare results: should be byte-identical
+    for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+      EXPECT_FLOAT_EQ(row_out_fallback[k_idx], row_out_neon[k_idx])
+        << "Mismatch at n=" << n_idx << ", k=" << k_idx;
+      EXPECT_EQ(std::memcmp(&row_out_fallback[k_idx], &row_out_neon[k_idx],
+                            sizeof(float)),
+                0)
+        << "Not byte-identical at n=" << n_idx << ", k=" << k_idx;
+    }
+  }
+}
+
+TEST(nntrainer_arm_neon, dequantize_row_qs4cx_vs_fallback) {
+  compare_dequantize_row_qs4cx_fallback_vs_neon(/*n=*/4, /*k=*/8);
+}
+
+TEST(nntrainer_arm_neon, dequantize_row_qs4cx_vs_fallback_odd_k) {
+  compare_dequantize_row_qs4cx_fallback_vs_neon(/*n=*/4, /*k=*/7);
+}
+
+TEST(nntrainer_arm_neon, dequantize_row_qs4cx_vs_fallback_large) {
+  compare_dequantize_row_qs4cx_fallback_vs_neon(/*n=*/16, /*k=*/256);
+}
+
+TEST(nntrainer_arm_neon, dequantize_row_qs4cx_vs_fallback_large_odd) {
+  compare_dequantize_row_qs4cx_fallback_vs_neon(/*n=*/16, /*k=*/255);
+}
+
+TEST(nntrainer_arm_neon, DISABLED_dequantize_row_qs4cx_perf_vs_fallback) {
+  const size_t n = 64;
+  const size_t k = 4096;
+  const size_t warmup_iterations = 3;
+  const size_t iterations = 20;
+  const size_t n_idx = 31; // fix row to test
+
+  std::vector<float> rhs_f32 =
+    generate_random_vector<float>(n * k, -10.0f, 10.0f);
+
+  const size_t rhs_qs4cx_stride = (k + 1) / 2;
+  std::vector<uint8_t> rhs_qs4cx(n * rhs_qs4cx_stride, 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+
+  nntrainer::__fallback_quant_nxk_qs4cx_f32(
+    n, k, rhs_f32.data(), rhs_qs4cx.data(), rhs_scales_f32.data());
+
+  std::vector<float> out_fallback(k, 0.0f);
+  std::vector<float> out_neon(k, 0.0f);
+
+  auto run_fallback = [&]() {
+    nntrainer::__fallback_dequantize_row_qs4cx_f32(
+      n_idx, k, rhs_qs4cx.data(), rhs_scales_f32.data(), out_fallback.data());
+  };
+  auto run_neon = [&]() {
+    nntrainer::neon::dequantize_row_qs4cx_neon(
+      n_idx, k, rhs_qs4cx.data(), rhs_scales_f32.data(), out_neon.data());
+  };
+
+  for (size_t it = 0; it < warmup_iterations; ++it) {
+    run_fallback();
+    run_neon();
+  }
+
+  // Interleave the two implementations so DVFS / thermal drift affects both
+  // equally
+  int64_t fallback_ns = 0;
+  int64_t neon_ns = 0;
+  for (size_t it = 0; it < iterations; ++it) {
+    auto t1 = std::chrono::high_resolution_clock::now();
+    run_fallback();
+    auto t2 = std::chrono::high_resolution_clock::now();
+    run_neon();
+    auto t3 = std::chrono::high_resolution_clock::now();
+    fallback_ns +=
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+    neon_ns +=
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count();
+  }
+
+  EXPECT_EQ(
+    std::memcmp(out_fallback.data(), out_neon.data(), k * sizeof(float)), 0)
+    << "NEON output is not byte-identical to fallback";
+
+  const double iters = static_cast<double>(iterations);
+  std::cout << "[INFO] dequantize_row_qs4cx n=" << n << " k=" << k
+            << " (avg of " << iterations << " iters)" << std::endl;
+  std::cout << "[INFO] fallback: " << fallback_ns / iters / 1000.0 << " us, "
+            << std::endl;
+  std::cout << "[INFO] neon    : " << neon_ns / iters / 1000.0 << " us, "
+            << std::endl;
+  std::cout << "[INFO] speedup : "
+            << static_cast<double>(fallback_ns) / static_cast<double>(neon_ns)
+            << "x" << std::endl;
+}
 
 int main(int argc, char **argv) {
   int result = -1;

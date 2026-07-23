@@ -985,6 +985,20 @@ void compute_rotary_emb_value_uint16(unsigned int width, unsigned int dim,
                                      const float *sin_,
                                      bool only_convert_to_fp16);
 #endif
+
+/**
+ * @brief qs4cx dequantization of a single channel (row) with NEON optimization
+ * Converts quantized int4 back to float32 using per-channel scales.
+ *
+ * @param[in] n_idx channel (row) index to dequantize
+ * @param[in] k K length of the row (channel)
+ * @param[in] qs4cx full nxk quantized matrix data
+ * @param[in] scales per-channel quantization scales
+ * @param[out] out dequantized row data in float32 (k floats)
+ */
+void dequantize_row_qs4cx_neon(size_t n_idx, size_t k, const uint8_t *qs4cx,
+                               const float *scales, float *out);
+
 } // namespace nntrainer::neon
 
 #endif /* __cplusplus */
