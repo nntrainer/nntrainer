@@ -3,6 +3,7 @@ kai_interface_headers = [
 ]
 kai_interface_sources = [
     'kleidiai_interface_qai8dxp_qsi4cxp.cpp',
+    'kleidiai_interface_qai8dxp_qsi8cxp.cpp',
     'kleidiai_interface_qsi8d32p_qsi4c32p.cpp',
 ]
 
