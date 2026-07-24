@@ -87,6 +87,25 @@ void add_i_cl(Tensor &result, Tensor const &input);
 bool clmem_residual_op_cl(Tensor &dst, const Tensor &src, bool accumulate);
 
 /**
+ * @brief Non-invasive value probe for the cl_mem residency bring-up
+ *        (NNTR_CLMEM_PROBE=1). During the forward it only enqueues
+ *        DEVICE-SIDE copies of the probed buffer (cl_mem source ->
+ *        clEnqueueCopyBuffer, SVM source -> copy kernel) into dedicated debug
+ *        buffers -- NO host sync, no mid-pipeline readback (a blocking
+ *        readback corrupts the run on Adreno). When NNTR_CLMEM_PROBE_MAX
+ *        captures accumulate, ONE clFinish drains the queue and every entry
+ *        is read back and dumped to stderr as [probe] tag fnv=<hash> v0..v3,
+ *        in capture (= execution) order; diff two runs to find the first
+ *        divergent op.
+ * @param tag entry label (e.g. "layer3pre_ffn_norm:out")
+ * @param svm_ptr SVM/host pointer source (used when clmem == nullptr)
+ * @param clmem cl_mem source handle (takes precedence)
+ * @param bytes bytes to capture
+ */
+void clmem_probe_capture(const char *tag, const void *svm_ptr, void *clmem,
+                         unsigned int bytes);
+
+/**
  * @brief Explicit host->cl_mem RAISE for a boundary tensor (design §2.5 input
  *        boundary): a HOST producer (the embedding dequant loop) wrote the
  *        tensor's SVM shadow; upload the valid bytes into its planner cl_mem
@@ -291,6 +310,59 @@ void *get_or_create_resident_backing(const std::string &name,
  * @return true if backing existed and the read completed; false otherwise.
  */
 bool readback_backing_to_host(Tensor &t);
+
+/**
+ * @brief Fused RMSNorm + v8c activation quantization in a single GPU
+ *        dispatch (paper §3.6 fused-kernel idea, smallest unit that
+ *        eliminates the RMSNorm-output → FC-quant-input drift boundary
+ *        documented in `chain-robustification-dead`).
+ *
+ *        Math is byte-identical to (CPU RMSNorm(input, gamma, eps)
+ *        followed by v8c_act_quant_f32) — same KAI qai8dxp asymmetric
+ *        formula on normalized = x * inv_rms * gamma. The point of the
+ *        fusion is NOT a perf win on its own (kernel is bounded by the
+ *        same global-memory bandwidth as the unfused path); it is that
+ *        the intermediate normalized fp32 values never touch global
+ *        memory, so they cannot drift from one CPU/GPU run to another.
+ *
+ *        Outputs land in four TensorBackings registered in the global
+ *        TensorBackingPool under the names:
+ *          <output_name>:fused_i8     INT8  [M*K]
+ *          <output_name>:fused_scale  FP32  [M]
+ *          <output_name>:fused_zp     FP32  [M] (4 bytes per entry; int32 data)
+ *          <output_name>:fused_rs     FP32  [M] (4 bytes per entry; int32 data)
+ *        The encoding tag on _zp / _rs is FP32 (no INT32 enum yet); only
+ *        the byte count and offset matter to downstream consumers. When
+ *        output_host_ptr is non-null, the same four backings are ALSO
+ *        registered under ptr-keyed names ('ptr:<output_host_ptr>:fused_*')
+ *        so a downstream consumer that only has the output Tensor's data
+ *        pointer (not its name) can look them up.
+ *
+ *        Env-gated via NNTR_FUSED_RMSQ=1; without it, this is a no-op
+ *        that returns false. NNTR_FUSED_RMSQ_CHECK=1 additionally runs
+ *        the CPU reference path on a single probe row and prints the
+ *        max bit difference + relL2 — used to validate the kernel
+ *        before any callers depend on its outputs.
+ *
+ *        Precondition: K <= 2048 (the kernel uses a local-memory cache
+ *        of normalized values that's sized at compile time).
+ *
+ * @param[in]  input          [M, K] fp32 pre-norm activation tensor
+ * @param[in]  gamma          [K]    fp32 per-channel scale
+ * @param[in]  epsilon        RMSNorm epsilon
+ * @param[in]  M, K           shape
+ * @param[in]  output_name    base name for the four pool entries
+ * @param[in]  output_host_ptr optional output tensor data pointer; when
+ *             non-null, the four pool entries are also registered under
+ *             ptr-keyed names for pointer-based lookup by a consumer
+ * @return true if the fused kernel ran; false if env not set or any
+ *         precondition failed
+ */
+bool fused_rmsnorm_quant_resident_fp32(const Tensor &input, const Tensor &gamma,
+                                       float epsilon, unsigned int M,
+                                       unsigned int K,
+                                       const std::string &output_name,
+                                       const void *output_host_ptr = nullptr);
 
 } // namespace nntrainer
 #endif /* __BLAS_KERNEL_INTERFACE_H__ */

@@ -1165,6 +1165,75 @@ void scalar_mul_cl_fp16(const _FP16 *input, _FP16 *result, float scalar,
                                                (size_t)n * sizeof(_FP16), true);
 }
 
+// out[r*fs + j] = in[r*in_width + off + j] for r in [0,rows), j in [0,fs).
+// Gemma4 per_layer_slice: gather this layer's hidden_size_per_layer_input slice
+// (off = layer_index*fs) from the packed [.., num_layers*fs] per-layer input.
+// cl_mem-resident when both planes are GPU_CLMEM, else SVM-direct.
+static const std::string per_layer_slice_fp16_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+__kernel void per_layer_slice_cl_fp16(__global const half *in,
+                                      __global half *out, int fs, int in_width,
+                                      int off, int rows) {
+  int gid = get_global_id(0);
+  int total = rows * fs;
+  if (gid >= total)
+    return;
+  int r = gid / fs;
+  int j = gid - r * fs;
+  out[gid] = in[r * in_width + off + j];
+}
+)CL";
+
+void per_layer_slice_cl_fp16(const _FP16 *input, _FP16 *result,
+                             unsigned int rows, unsigned int fs,
+                             unsigned int in_width, unsigned int off,
+                             bool use_svm, void *out_clmem, void *in_clmem) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  ClContext::SharedPtrClKernel kp = blas_cc->registerClKernel(
+    per_layer_slice_fp16_kernel, "per_layer_slice_cl_fp16");
+  if (!kp)
+    return;
+
+  cl_mem out_cl = static_cast<cl_mem>(out_clmem);
+  cl_mem in_cl = static_cast<cl_mem>(in_clmem);
+  const bool from_clmem = in_cl != nullptr;
+  const bool to_clmem = out_cl != nullptr && use_svm;
+
+  bool ok = true;
+  if (from_clmem) {
+    ok = ok && kp->SetKernelArguments(0, &in_cl, sizeof(cl_mem));
+  } else if (use_svm) {
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(const_cast<_FP16 *>(input));
+    ok = ok && kp->SetKernelSVMArguments(0, const_cast<_FP16 *>(input));
+  }
+  if (to_clmem) {
+    ok = ok && kp->SetKernelArguments(1, &out_cl, sizeof(cl_mem));
+  } else if (use_svm) {
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(result);
+    ok = ok && kp->SetKernelSVMArguments(1, result);
+  }
+  int fsi = (int)fs, iwi = (int)in_width, offi = (int)off, rowsi = (int)rows;
+  ok = ok && kp->SetKernelArguments(2, &fsi, sizeof(int));
+  ok = ok && kp->SetKernelArguments(3, &iwi, sizeof(int));
+  ok = ok && kp->SetKernelArguments(4, &offi, sizeof(int));
+  ok = ok && kp->SetKernelArguments(5, &rowsi, sizeof(int));
+  if (!ok)
+    return;
+
+  const int total = (int)(rows * fs);
+  const int lws = 64;
+  const int gws = ((total + lws - 1) / lws) * lws;
+  const int wgc[3] = {gws, 1, 1};
+  const int wgs[3] = {lws, 1, 1};
+  if (!blas_cc->command_queue_inst_.DispatchCommand(kp, wgc, wgs))
+    return;
+
+  if (!to_clmem && use_svm)
+    blas_cc->command_queue_inst_.enqueueSVMMap(
+      result, (size_t)rows * fs * sizeof(_FP16), true);
+}
+
 // Fused RMSNorm + residual add (Gemma2 sandwich-norm boundary): computes
 // out = rmsnorm(input)*gamma + residual in one kernel, removing the separate
 // v8c_add_h2h residual-add kernel (~42 ms/prefill GPU) AND the rmsnorm->add /
