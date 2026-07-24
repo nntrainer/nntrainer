@@ -24,8 +24,10 @@
 #include <embedding_layer.h>
 #include <mha_core.h>
 #include <neuralnet.h>
+#include <per_layer_slice_gpu.h>
 #include <qs4cx_tensor.h>
 #include <rms_norm.h>
+#include <rms_norm_gpu.h>
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
@@ -594,6 +596,25 @@ void Transformer::registerCustomLayers() {
     app_context->registerFactory(
       nntrainer::createLayer<causallm::EmbeddingLayer>);
   });
+
+  // GPU variants: same type strings as the CPU classes but registered on the
+  // gpu context so engine=gpu createLayer routes there. The GPU classes use raw
+  // getData() pointers + GPU dispatches; they avoid any CPU-only Tensor ops
+  // (Tensor::multiply / add_i / dot) that crash on gpu-context tensors. Inert
+  // when there is no "gpu" context (CPU-only / NNTR_ENGINE=cpu builds).
+  const auto &ct_engine = nntrainer::Engine::Global();
+  try {
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::RMSNormLayerGPU>);
+    // Gemma4 GPU-resident per_layer_slice: same type string as the CPU class,
+    // registered here so engine=gpu routes to the GPU kernel (no host
+    // round-trip that would break residency).
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>);
+  } catch (std::invalid_argument &e) {
+    std::cerr << "failed to register GPU-routed layer on gpu ctx: " << e.what()
+              << std::endl;
+  }
 }
 
 } // namespace causallm

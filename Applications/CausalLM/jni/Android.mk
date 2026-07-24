@@ -84,12 +84,14 @@ LOCAL_SRC_FILES := \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
+    ../layers/per_layer_slice_gpu.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/custom_multiply.cpp \
     ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_norm.cpp \
+    ../layers/rms_norm_gpu.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
@@ -195,12 +197,14 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
+    ../layers/per_layer_slice_gpu.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/custom_multiply.cpp \
     ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_norm.cpp \
+    ../layers/rms_norm_gpu.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \

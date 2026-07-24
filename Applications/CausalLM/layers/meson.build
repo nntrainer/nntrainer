@@ -2,6 +2,7 @@ causallm_layer_inc_abs = [meson.current_source_dir()]
 causallm_layer_inc = [include_directories('.')]
 
 causallm_rms_norm_src_abs = [meson.current_source_dir() / 'rms_norm.cpp']
+causallm_rms_norm_gpu_src_abs = [meson.current_source_dir() / 'rms_norm_gpu.cpp']
 causallm_causal_conv1d_src_abs = [meson.current_source_dir() / 'causal_conv1d_layer.cpp']
 causallm_mha_core_abs = [meson.current_source_dir()/ 'mha_core.cpp']
 causallm_embedding_src_abs = [meson.current_source_dir() / 'embedding_layer.cpp']
@@ -11,7 +12,7 @@ causallm_embedding_pooling_src_abs = [meson.current_source_dir() / 'embedding_po
 causallm_embedding_normalize_src_abs = [meson.current_source_dir() / 'embedding_normalize_layer.cpp']
 causallm_deberta_attention_src_abs = [meson.current_source_dir() / 'deberta_attention_layer.cpp']
 causallm_shared_fully_connected_src_abs = [meson.current_source_dir() / 'shared_fully_connected_layer.cpp']
-causallm_per_layer_slice_src_abs = [meson.current_source_dir() / 'per_layer_slice.cpp']
+causallm_per_layer_slice_src_abs = [meson.current_source_dir() / 'per_layer_slice.cpp', meson.current_source_dir() / 'per_layer_slice_gpu.cpp']
 causallm_custom_multiply_layer_src_abs = [meson.current_source_dir() / 'custom_multiply.cpp']
 
 causallm_rms_norm = shared_library(
@@ -24,6 +25,21 @@ causallm_rms_norm = shared_library(
 )
 causallm_rms_norm_dep = declare_dependency(
     link_with: causallm_rms_norm,
+    include_directories: causallm_layer_inc
+)
+
+# GPU-routed RMSNorm (RMSNormLayerGPU). Referenced unconditionally by
+# transformer.cpp; the GPU dispatch inside it only fires under enable-opencl.
+causallm_rms_norm_gpu = shared_library(
+    'rms_norm_gpu_layer',
+    causallm_rms_norm_gpu_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_rms_norm_gpu_dep = declare_dependency(
+    link_with: causallm_rms_norm_gpu,
     include_directories: causallm_layer_inc
 )
 

@@ -25,6 +25,7 @@ subdir('layers')
 # Add common layers to dependencies
 causallm_layer_dependencies += [
     causallm_rms_norm_dep,
+    causallm_rms_norm_gpu_dep,
     causallm_mha_core_dep,
     causallm_embedding_layer_dep,
     causallm_reshaped_rms_norm_dep,
