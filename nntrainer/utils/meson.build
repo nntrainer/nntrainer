@@ -22,6 +22,7 @@ util_headers = [
   'fp16.h',
   'util_simd.h',
   'dynamic_library_loader.h',
+  'env_compat.h',
   'mman_windows.h',
   'singleton.h',
   'nonmovable.h',

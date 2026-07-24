@@ -705,6 +705,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/fp16.h
 %{_includedir}/nntrainer/util_simd.h
 %{_includedir}/nntrainer/dynamic_library_loader.h
+%{_includedir}/nntrainer/env_compat.h
 %{_includedir}/nntrainer/mman_windows.h
 %{_includedir}/nntrainer/loss_layer.h
 %{_includedir}/nntrainer/acti_func.h
