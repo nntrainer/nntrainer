@@ -2057,6 +2057,12 @@ TEST(TensorPool, createOrExtend_p) {
   EXPECT_EQ(t1, t2);
   pool.finalize(nntrainer::BasicPlanner(), 0, 2);
   pool.allocate();
+  /// t1 and t2 alias the same pool memory, which pool.allocate() leaves
+  /// uninitialized. Give it a deterministic, non-NaN value before comparing
+  /// contents: HalfTensor::operator== treats NaN as always-unequal (even to
+  /// itself), so comparing raw uninitialized memory is flaky depending on
+  /// what garbage bytes happen to land in the fp16 exponent field.
+  t1->setZero();
   EXPECT_EQ(*t1, *t2);
   pool.deallocate();
 }
