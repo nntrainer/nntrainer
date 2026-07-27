@@ -131,10 +131,10 @@ elif arch == 'x86' or arch == 'x86_64'
   if cxx_compiler_id == 'msvc'
     add_project_arguments(['/arch:AVX2'], language: ['c','cpp'])
     # Note: C runtime library (/MT or /MD) is controlled by b_vscrt option
+    message('/arch:AVX2 added for AVX hardware acceleration.')
   else
-    add_project_arguments(['-march=native'], language: ['c','cpp'])
-    add_project_arguments(['-mavx2', '-mfma'], language: ['c','cpp'])
-    message('-march=native added for AVX hardware acceleration.')
+    add_project_arguments(['-mavx2', '-mfma', '-mf16c'], language: ['c','cpp'])
+    message('-mavx2, -mfma, -mf16c added for AVX hardware acceleration.')
   endif
 endif
 
