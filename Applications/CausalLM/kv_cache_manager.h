@@ -19,6 +19,9 @@
 #include <string>
 #include <vector>
 
+#include <memory>
+
+#include <memory_pool.h>
 #include <tensor.h>
 #include <tensor_dim.h>
 
@@ -225,6 +228,15 @@ private:
   };
 
   std::vector<LayerCache> layer_caches_; /**< per-layer KV caches */
+
+  /**
+   * @brief Optional SVM-backed memory pool. When NNTR_GPU_SVM_POOL is set and
+   * the GPU (gpu-svm) allocator is available, the KV caches are allocated from
+   * this pool so their MemoryData reports isSVM()=true -- required for the GPU
+   * attention path in mha_core, and for the K/V plane to stay coherent between
+   * device producers and host consumers. Null on the host (CPU) path.
+   */
+  std::shared_ptr<nntrainer::MemoryPool> svm_pool_;
 
   unsigned int cache_pos_ = 0;    /**< current write position */
   unsigned int batch_size_ = 0;   /**< batch size */
