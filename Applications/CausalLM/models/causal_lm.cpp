@@ -491,9 +491,18 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0)
     SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
 
-  auto _input = tokenizer->Encode(prompt_);
-  ///@note insert bos token at the beginning of the input
-  // _input.insert(_input.begin(), BOS_TOKEN_ID);
+  ///@note add_special_tokens=true lets each model's OWN tokenizer decide
+  /// whether
+  /// to prepend a BOS, rather than hard-coding it. The 1-arg Encode skips
+  /// special tokens, so the leading BOS that Gemma2 (TemplateProcessing,
+  /// add_bos_token= true) needs was dropped -> short prompts degenerated into
+  /// pure repetition
+  /// ("The capital of France is" -> "is is is..."); long prompts masked it.
+  /// Verified to match HF add_special_tokens=True per model: Gemma2 gains its
+  /// BOS(2); models whose tokenizer adds no BOS (e.g. Qwen3 — ByteLevel post-
+  /// processor, add_bos_token=false) are byte-identical to the old behavior, so
+  /// they are unaffected. (sentence_transformer.cpp already encodes this way.)
+  auto _input = tokenizer->Encode(prompt_, /*add_special_tokens=*/true);
 
   // | <------------------- MAX_SEQ_LEN -------------------> |
   //                       ||             ||
