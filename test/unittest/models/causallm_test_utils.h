@@ -721,6 +721,18 @@ makeTinyNntrainerConfig(const std::filesystem::path &tokenizer_path,
                         const TinyCausalLMDataType &data_type);
 
 /**
+ * @brief Make a construct-only nntrainer config for config-plumbing tests
+ *
+ * Same FP32 shape as makeTinyNntrainerConfig, minus "tokenizer_file": a model
+ * whose constructor only has to parse parameters needs no tokenizer, and
+ * Transformer leaves `tokenizer` null (and spawns no async load) when the key
+ * is absent. Lets a test construct a model object with no tokenizer, no
+ * weights and no graph compile.
+ * @return nntrainer_config.json equivalent
+ */
+causallm::json makeTinyCtorOnlyNntrainerConfig();
+
+/**
  * @brief Make complete tiny configs for one model case
  * @param test_case Model case descriptor
  * @param tokenizer_path Tiny tokenizer path

@@ -243,6 +243,16 @@ makeTinyNntrainerConfig(const std::filesystem::path &tokenizer_path,
 }
 
 /**
+ * @brief Make a construct-only nntrainer config for config-plumbing tests
+ */
+causallm::json makeTinyCtorOnlyNntrainerConfig() {
+  auto nntr_cfg =
+    makeTinyNntrainerConfig(std::filesystem::path(), makeTinyFp32DataType());
+  nntr_cfg.erase("tokenizer_file");
+  return nntr_cfg;
+}
+
+/**
  * @brief Make complete tiny configs for one model case
  */
 TinyCausalLMConfig

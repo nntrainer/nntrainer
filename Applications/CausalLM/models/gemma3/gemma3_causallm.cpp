@@ -70,10 +70,7 @@ void Gemma3Transformer::setupParameters(json &cfg, json &generation_cfg,
   if (cfg.contains("layer_types")) {
     layer_types = cfg["layer_types"].get<std::vector<std::string>>();
   }
-  if (cfg.contains("attn_logit_softcapping") &&
-      !cfg["attn_logit_softcapping"].is_null()) {
-    ATTN_LOGIT_SOFTCAPPING = cfg["attn_logit_softcapping"].get<float>();
-  }
+  // attn_logit_softcapping now parsed in Transformer::setupParameters (base).
 }
 
 Tensor Gemma3Transformer::createTransformerDecoderBlock(const int layer_id,
