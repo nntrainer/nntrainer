@@ -361,6 +361,11 @@ void Transformer::repack_weight() {
   }
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
+      // repack FC layer only
+      if (l.getType() != "fully_connected" &&
+          l.getType() != "shared_fully_connected")
+        return;
+
       auto weights = context.getWeights();
       for (auto &w : weights) {
         if (w->getVariableRef().getDataType() ==
