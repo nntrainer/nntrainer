@@ -13,6 +13,8 @@
 
 #include <cmath>
 #include <cpu_backend.h>
+#include <cstdio>
+#include <cstdlib>
 #include <reshaped_rms_norm.h>
 
 #if defined(ENABLE_OPENCL)
@@ -146,7 +148,33 @@ void ReshapedRMSNormLayer::incremental_forwarding(
       const bool clmem_unbindable =
         (in_step.isClMem() && !in_cl) || (out_step.isClMem() && !out_cl);
 
-      if (io_svm && !clmem_unbindable) {
+      // NNTR_VNORM_HOST kill switch, same name and presence-check semantics as
+      // the reference tree's copy of this layer: force the host path so a
+      // suspected GPU-dispatch regression in this node can be isolated without
+      // a rebuild. It is the only per-node lever on this path -- the node is
+      // not engine-stamped (the dispatch triggers on buffer residency), so
+      // NNTR_ENGINE / NNTR_GPU_SVM_POOL cannot separate it from the rest of the
+      // graph. Load-bearing during verification: with it set, qwen3's GPU lane
+      // changes output, which is how this node was identified as a contributor.
+      static const bool vnorm_host = std::getenv("NNTR_VNORM_HOST") != nullptr;
+
+      // NNTR_RMSN_TRACE: which path each node took and why (ported from the
+      // reference). Every field here is a gate in the condition below.
+      if (std::getenv("NNTR_RMSN_TRACE")) {
+        std::fprintf(
+          stderr,
+          "[RMSN] %-30s dtype=%d gamma=%d gdtype=%d gbind=%d io_svm=%d "
+          "in.clmem=%d out.clmem=%d in_cl=%d out_cl=%d unbind=%d fs=%u "
+          "rows=%u b=%u\n",
+          context.getName().c_str(), (int)dtype, (int)(gamma != nullptr),
+          gamma ? (int)gamma->getDataType() : -1, (int)gamma_bindable,
+          (int)io_svm, (int)in_step.isClMem(), (int)out_step.isClMem(),
+          (int)(in_cl != nullptr), (int)(out_cl != nullptr),
+          (int)clmem_unbindable, feature_size, n_rows, b_size);
+        std::fflush(stderr);
+      }
+
+      if (io_svm && !clmem_unbindable && !vnorm_host) {
         if (dtype == ml::train::TensorDim::DataType::FP32 && gamma_bindable &&
             !in_cl && !out_cl) {
           // FP32 has no cl_mem-binding variant, hence the !in_cl && !out_cl.
