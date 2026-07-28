@@ -38,6 +38,7 @@
 #include <lm_head.h>
 #include <mha_core.h>
 #include <nntrainer_error.h>
+#include <residency_policy.h>
 #include <tensor.h>
 
 #include <causal_lm.h>
@@ -50,6 +51,33 @@ namespace causallm {
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
+  // Declare CausalLM's static-residency boundaries. Core ships the MECHANISM
+  // (ResidencyPolicy::global(), read by manager.cpp's engine_neutral test and
+  // tensor_pool.cpp's planner build) but deliberately carries no app-specific
+  // layer names; the POLICY is the application's to declare. Nothing populated
+  // it here, so `isEngineNeutral()` answered false for every type and the
+  // mechanism was dead code.
+  //
+  // `mha_core` is CPU-registered but binds and consumes Q/K/V on the GPU plane
+  // (it takes the cl_mem handles directly and bridges its host stages through
+  // clmem_lower_cl / clmem_raise_cl). Undeclared, it counts as a CPU consumer,
+  // so `all_consumers_gpu` is false for every wq/wk/wv output and the planner
+  // downgrades the whole attention neighbourhood GPU_CLMEM -> SVM. Observable
+  // proof the declaration is what arms the path: without it NNTR_CLMEM_MHA_OFF
+  // (which nulls exactly those handles) cannot change the output at all,
+  // because they are already null.
+  //
+  // NOT declared here, deliberately: the input-boundary RAISE
+  // ("embedding0:out0") and output-boundary LOWER ("output_norm:out0") that the
+  // reference tree also sets. Both are a REGRESSION on this tree -- measured
+  // 2026-07-28, gemma4 goes from the golden "**Seoul**" to <pad> spam -- so the
+  // raise/lower implementations they feed are not fully on the ladder yet. They
+  // are still reachable for A/B via NNTR_CLMEM_RAISE / NNTR_CLMEM_LOWER.
+  {
+    auto &rp = nntrainer::ResidencyPolicy::global();
+    if (rp.engine_neutral_types.empty())
+      rp.engine_neutral_types = {"mha_core"};
+  }
   setupParameters(cfg, generation_cfg, nntr_cfg);
 }
 
