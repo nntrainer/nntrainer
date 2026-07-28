@@ -16,6 +16,7 @@
 #include "causal_lm.h"
 #include "deberta_v2.h"
 #include "embedding_gemma.h"
+#include "gemma2_causallm.h"
 #include "gemma3_causallm.h"
 #include "gemma4_causallm.h"
 #if !defined(_WIN32)
@@ -100,6 +101,11 @@ void registerAllModels() {
           cfg, generation_cfg, nntr_cfg);
       });
 #endif
+    causallm::Factory::Instance().registerModel(
+      "Gemma2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+        return std::make_unique<causallm::Gemma2CausalLM>(cfg, generation_cfg,
+                                                          nntr_cfg);
+      });
     causallm::Factory::Instance().registerModel(
       "Gemma3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
         return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
