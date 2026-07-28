@@ -18,20 +18,32 @@ Two repos are involved:
 
 ---
 
-## Headline result
+## Current configuration
 
-| config | prefill | decode | total (469-tok prompt) |
-|---|---|---|---|
-| CPU only, 4 threads | 512.0 | 90.3 | 2765 ms |
-| NPU everything (first working version) | 137.4 | **1.37** | 93,790 ms |
-| NPU everything (after pooling rpcmem) | 428.6 | 25.2 | 5,294 ms |
-| **hybrid: prefill NPU, decode CPU** | **611.5** | **68–93** | **2644 ms** |
+Per instruction, **everything including decode runs on the DSP**
+(`gemm_q4_0_accel_min_rows() == 1`). This is a coverage choice, not the
+throughput-optimal setting. The threshold is a runtime knob
+(`NNTR_HEXAGON_MIN_ROWS`) and needs no requantization to change — see §9, §10,
+§13.
 
-Final state: enabling `NNTR_USE_HEXAGON_CDSP=1` is never slower than CPU, and
-gives **1.19× prefill / ~4% end-to-end** on long prompts.
+## Decode progression (Qwen3-0.6B, 4 threads, all matmuls on DSP)
 
-**Decode was never made competitive on the NPU and cannot be** — see §7. The
-hybrid's decode number is the CPU path; the DSP is idle during generation.
+| state | decode t/s | what changed |
+|---|---|---|
+| first working version | **1.37** | per-call rpcmem alloc/map/free + weight memcpy |
+| pooled rpcmem | 25.2 | §8 — hoist all of that out of the loop |
+| `OPPOLL` default | **30.3** | §14 — busy-poll instead of sleeping per op |
+| CPU reference | 90.5 | for comparison |
+
+## Prefill
+
+| config | prefill t/s (469 tok) |
+|---|---|
+| CPU, 4 threads | 512.0 |
+| DSP | **611.5** (1.19×) |
+
+**Decode on the DSP is ~3× slower than CPU and that is not fully closable** —
+see §7 and §12. Prefill on the DSP wins past ~215 tokens.
 
 ---
 
@@ -83,8 +95,13 @@ the DSP path (so no skel rebuild was needed) was unsupported — the device had 
 Both one-liners in `nntr-htp-bridge.cpp`, both from findings 7 and 8.
 
 - `buf->buft = nullptr` → `&sess->repack_buffer_type` (weight) /
-  `&sess->buffer_type` (staging). **Unblocks `GGML_HEXAGON_VERBOSE=1`**, which is
-  the only way to read the DSP's response status. Diagnosis was blocked on this.
+  `&sess->buffer_type` (staging). Intended to unblock `GGML_HEXAGON_VERBOSE=1`,
+  the only way to read the DSP's response status.
+  **Caveat discovered much later (§14): `GGML_HEXAGON_VERBOSE` was itself dead on
+  the bridge path at this point**, because the bridge never calls
+  `ggml_hexagon_init()`. So this fix was correct and necessary, but the claim
+  made at the time that a verbose run "confirmed" it was unfounded — the dump
+  path had never actually been exercised.
 - weight buffer `USAGE_COMPUTE` → **`USAGE_WEIGHTS`**. Removes a full DSP D-cache
   flush per GEMM.
 
@@ -359,9 +376,207 @@ Short prompts stay on CPU and are indistinguishable from it; long prompts get
 | `72af5fb2a` | pooled rpcmem, null `buft`, weight `usage` |
 | `bc7f55295` | split weight upload from the GEMM |
 
+(Later commits are listed in the sections that describe them — §13 for the
+`min_rows` change, §14 for the env-var resolver and the OPPOLL default.)
+
 ---
 
-## 12. What's left
+## 12. Framework comparison — why our ratios trail ggml-hexagon
+
+Measured with `llama-bench` (ggml-hexagon) and CausalLM (nntrainer) on the same
+device, same model family, 4 threads, at matching M. ggml-hexagon runs
+`-ngl 99`, i.e. the **whole graph** on the DSP.
+
+| M (prompt tok) | ggml CPU | ggml NPU | ggml ratio | nntr CPU | nntr NPU | nntr ratio |
+|---|---|---|---|---|---|---|
+| 22 | 732.9 | 219.3 | 0.30 | 301.4 | 93.2 | 0.31 |
+| 79 | 678.7 | 864.1 | 1.27 | 544.8 | 349.6 | 0.64 |
+| 157 | 700.0 | 1419.6 | 2.03 | 646.1 | 554.8 | 0.86 |
+| 196 | — | — | — | 662.2 | 612.5 | 0.93 |
+| 235 | 664.2 | 1590.5 | 2.39 | 605.7 | 691.2 | 1.14 |
+| 274 | — | — | — | 614.4 | 652.4 | 1.06 |
+| 313 | 644.0 | 1593.7 | 2.47 | 592.8 | **706.5** | 1.19 |
+| 391 | 554.0 | 1754.8 | 3.17 | 526.2 | 628.6 | 1.19 |
+| 469 | 535.5 | 1872.9 | **3.50** | 512.0 | 611.5 | 1.19 |
+| decode (128) | 156.2 | 34.6 | **0.22** | ~90.5 | ~25.4 | **0.28** |
+
+Two premise corrections worth recording:
+
+- **Our decode *ratio* is better, not worse** (0.28 vs 0.22). It is our
+  *absolute* decode that is lower (25.4 vs 34.6). Partly because our CPU
+  baseline is weaker, which flatters the ratio.
+- **ggml also loses at small M** — 0.30 at M=22, essentially identical to our
+  0.31. Their crossover is between 22 and 79 tokens; ours is ~215.
+
+### The curve shape is the real finding
+
+```
+ggml NPU:  219 -> 864 -> 1420 -> 1590 -> 1594 -> 1755 -> 1873   keeps climbing
+ours NPU:   93 -> 350 ->  555 ->  691 ->  707 ->  629 ->  612   peaks ~313, DECLINES
+```
+
+Dispatch overhead amortises *better* at larger M, so it cannot explain a curve
+that turns down. Something grows superlinearly with M — and that is **attention,
+which is on our CPU and is O(n^2)**. As the prompt grows it takes over total
+prefill time no matter how fast the matmuls get. ggml offloads attention too
+(`htp/flash-attn-ops.c`, `hmx-flash-attn-ops.c`), so their curve keeps scaling.
+
+### Reasons, ranked
+
+1. **Scope of offload.** `-ngl 99` moves attention, softmax, RoPE, RMSNorm and
+   elementwise to the DSP; we move only the Q4_0 FC matmuls. So per layer we
+   ping-pong DSP -> CPU -> DSP, their intermediates never leave the DSP, and the
+   part of prefill the CPU is *worst* at is never offloaded. Produces the
+   declining curve.
+2. **Dispatch granularity.** 196 blocking round trips per forward pass vs a
+   handful for a whole graph. They also keep up to 16 batches in flight
+   (`opt_opqueue`); we block on every op.
+3. **Data residency + activation requantization.** Per GEMM we memcpy the
+   activation in and the result out. And the DSP's `src1_spad` cache is
+   per-batch (`matmul-ops.c:4687`), so with one op per batch it re-quantizes the
+   shared Q/K/V activation 3x and gate/up 2x.
+
+Separately, **our CPU is also ~1.7x slower** (90.5 vs 156.2 decode) — different
+kernels and graph overhead, nothing to do with the NPU.
+
+Comparability caveats: our model is Q4_0 FC + **Q6_K** embedding/LM-head while
+the GGUF is essentially all Q4_0; and llama-bench `pp` is pure prompt-processing
+throughput where nntrainer's `prefill` is the whole prefill phase. Treat
+single-digit-percent gaps as noise; the 3x prefill gap and the curve shape are
+far too large to be artifacts.
+
+---
+
+## 13. Decode moved back onto the DSP (by instruction)
+
+`min_rows` 256 -> **1**, and the env-override clamp lowered from `>= 32` to
+`>= 1` — that clamp had been added specifically to stop decode reaching the DSP,
+so it was actively blocking this request.
+
+Verified all three settings on device, no rebuild between them:
+
+| `NNTR_HEXAGON_MIN_ROWS` | prefill t/s | decode t/s | effect |
+|---|---|---|---|
+| **1 (default)** | 93.2 | **25.7** | everything on DSP |
+| 32 | 314.3 | 93.6 | decode on CPU |
+| 256 | 293.3 | 93.1 | decode on CPU |
+
+Because the hybrid work (§9) moved the layout conversion in-process, weights
+arrive as ARM `q4_0x4` regardless and the q4x4x2 copy is derived on first use.
+So the threshold is a pure runtime knob — both paths stay correct at any value,
+with the same `.bin`. Had `--isa HEXAGON` models been kept, this comparison
+would have needed two separate weight files.
+
+---
+
+## 14. Every GGML_HEXAGON_* env var was dead on our path
+
+`ggml_hexagon_init()` (`ggml-hexagon.cpp:3975`) parses **all** of them, and it is
+called only from `ggml_backend_hexagon_reg()` (`:4093`). The bridge never touches
+the backend registry, so `VERBOSE`, `PROFILE`, `OPPOLL`, `NHVX`, `USE_HMX`,
+`OPBATCH`, `OPQUEUE` were all silently inert. Exactly the same trap as
+`opt_arch`, which the bridge already had to resolve by hand for this reason.
+
+**This invalidated an earlier claim in this log's history:** "VERBOSE=1 runs
+clean, confirming the buft fix" was wrong — verbose was never actually enabled,
+so the dump path that would trip `GGML_ASSERT(buft)` was never exercised. The
+fix (§3) is still correct and still necessary; it simply had not been proven at
+runtime at that point.
+
+Fixed by adding `nntr_htp_bridge_resolve_opts()`, parsing the subset meaningful
+without a registry. Order matters: `nhvx`/`use_hmx`/`vmem` feed
+`htp_iface_start()` and `profile` gates `htp_iface_profiler()`, so all of it must
+run *before* the session is constructed.
+
+### What that unlocked: the first real per-op breakdown
+
+`GGML_HEXAGON_PROFILE=1` prints `batch-dur-usec` (host-visible round trip) vs
+`htp-ops-usec` (DSP compute) per batch. Over a full CausalLM run, 25,088 decode
+ops:
+
+| phase | ops | round trip | DSP compute | overhead | DSP share |
+|---|---|---|---|---|---|
+| prefill (M=6) | 196 | 180.7 us | 92.0 us | 88.7 us | 50.9% |
+| **decode (M=1)** | 25,088 | **108.8 us** | **27.4 us** | **81.4 us** | **25.2%** |
+
+Decode DSP compute is remarkably consistent (p50 27 us, p90 37, p99 40). So
+**75% of decode time in the bridge is dispatch overhead, not DSP work** — the
+DSP finishes each GEMV in 27 us and we spend 109 us getting it there and back.
+
+Note first-touch ops are outliers (1674 us) — arena allocation, weight upload and
+the DSP-side `HAP_mmap` all land on the first GEMM of each weight.
+
+### OPPOLL: +20% for one line
+
+`opt_oppoll` makes `dspqueue_read` busy-poll (timeout 0) instead of sleeping on
+`DSPQUEUE_TIMEOUT`. ggml-hexagon defaults it off, correctly for its own usage:
+it submits a whole graph then waits a long time, where burning a core is
+wasteful. Our pattern is the opposite — one op per flush, calling thread idle
+until the result lands — so sleeping adds a scheduler wakeup to every op.
+
+| config | decode t/s |
+|---|---|
+| baseline | 25.27 |
+| **OPPOLL=1** | **30.28** (+20%) |
+| OPBATCH=4 OPQUEUE=2 | 25.65 (noise) |
+| OPPOLL=1 + OPBATCH=4 OPQUEUE=2 | 30.05 |
+
+Now the bridge default. Interesting detail: the *measured* round trip only moved
+108.8 -> 102.3 us, so most of the 20% came from **outside** the profiled window
+— it is the wakeup latency, not the queue read.
+
+Ring sizing does nothing. DSP thread count is already optimal at the default:
+
+| NHVX (with OPPOLL=1) | decode t/s |
+|---|---|
+| 0 = all (default) | **30.28** |
+| 4 | 30.05 |
+| 2 | 26.92 |
+| 1 | 21.38 |
+
+### Where decode time goes now (34.4 ms/token at 30.3 t/s)
+
+| | ms/token | note |
+|---|---|---|
+| measured DSP round trips | 20.1 | 196 ops x 102 us |
+| — of which actual DSP compute | 5.2 | 196 ops x 26.5 us |
+| everything else | 14.3 | nntrainer CPU work + bridge host-side work |
+
+That last row is the next target and does **not** need op batching. It is
+bridge-side per-call host work sitting *outside* the profiled window: the
+activation/output memcpys, rebuilding three tensor descriptors, and
+`add_tensor`/`add_op`'s dedup `unordered_multimap` lookups plus the 64-byte
+`op_params` copy — all per op. For reference CPU-only decode is 11.1 ms/token
+*in total*, so nntrainer's own non-matmul work cannot be more than a fraction of
+that 14.3 ms.
+
+---
+
+## 15. Next steps for single-prompt performance (no op batching)
+
+Ranked by expected value, given the §14 breakdown:
+
+1. **Cut bridge host-side per-call work (~14.3 ms/token bucket).** Bypass the
+   `opbatch` machinery for the single-op case and write the descriptor block
+   directly — it exists to dedup and pack many ops, and we always have exactly
+   three tensors and one op. Avoids two multimap lookups plus the pack/reset
+   cycle per GEMM.
+2. **Eliminate the activation and output memcpys.** Route nntrainer's
+   `MemoryPool` through an rpcmem `MemAllocator`
+   (`network_graph.h:105 setComputeBackend` already exists; QNN uses it at
+   `neuralnet.cpp:252`). Also needs `reuse_inference_tensor_pool_` set for cdsp,
+   or pool addresses churn every token and invalidate the arena keys.
+3. **The 75.8 us in-window round trip** is FastRPC/dspqueue IPC latency. OPPOLL
+   already took the easy part; the rest is close to a hardware floor for
+   one-op-per-submission.
+4. **Floor check.** Even at zero bridge overhead, decode is bounded by streaming
+   every weight from DDR per token. 27 us/op x 196 = 5.2 ms/token = ~190 t/s
+   ceiling, so the DSP is not intrinsically incapable at decode — the cost is
+   entirely in getting work to it one op at a time.
+
+---
+
+## 16. Longer-term / structural
 
 Prefill sits at **~31% of the reference** (611 vs 2046 t/s at ~500 tokens). All
 the remaining headroom is there, in order of value:
@@ -388,3 +603,5 @@ Known outstanding issues not yet addressed:
   any real `engine=gpu` layer today.
 - `nntr_q4_0_isa` metadata is still write-only; nothing validates weight layout
   at load, so a layout mismatch remains silent.
+
+---
