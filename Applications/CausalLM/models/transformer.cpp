@@ -146,6 +146,8 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
   EMBEDDING_FILE_NAME = nntr_cfg.value("embedding_file_name", std::string());
   PLE_FILE_NAME = nntr_cfg.value("ple_file_name", std::string());
+  LMHEAD_UNTIE =
+    nntr_cfg.contains("lmhead_untie") && nntr_cfg["lmhead_untie"].get<bool>();
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();

@@ -139,6 +139,15 @@ protected:
   virtual std::pair<Tensor, Tensor> constructModel() override;
 
   /**
+   * @brief Build the output_of_causallm lm_head from the transformer hidden
+   *        state @p h. Shared by the generic and the model-override
+   *        constructModel paths. The skip_prefill decision differs per path
+   *        (generic gates on SKIP_PREFILL; Gemma4 on ENABLE_SKIP_PREFILL_OPT),
+   *        so it is passed in rather than recomputed here.
+   */
+  Tensor buildLmHeadOutput(Tensor h, bool add_skip_prefill);
+
+  /**
    * @brief register Outputs
    */
   virtual void
