@@ -38,6 +38,7 @@
  */
 
 #include <compute_ops.h>
+#include <cpu_backend.h>
 #include <hexagon_compute_ops.h>
 #include <hexagon_repack.h>
 
@@ -105,6 +106,21 @@ bool run_case(const Case &c) {
   nntrainer::repack_q4_0_to_htp_q4x4x2(weight_htp.data(), weight_q4_0.data(),
                                         weight_q4_0.size(), c.N, c.K);
 
+  // The CPU reference needs its OWN repack, to a DIFFERENT layout. Each
+  // backend's gemm_q4_0_fp32 expects weights already in that backend's
+  // interleaved format, not plain block_q4_0: on ARM it is
+  // nntrainer::gemm_q4_0 -> __ggml_q4_0_4x8_q8_0_GEMM (q4_0x4, four rows
+  // interleaved), on x86 q4_0x8. Handing it the raw block_q4_0 bytes makes it
+  // read four rows' worth of nibbles out of one row's storage - it does not
+  // error, it silently returns garbage (observed: |values| ~1.7e6 and NaNs
+  // where the true dot products are O(sqrt(K)) ~ 20, which then swamps the
+  // comparison and reports the *Hexagon* side as the failure). This is why
+  // the earlier "all 3 cases failed" result was not diagnostic.
+  std::vector<uint8_t> weight_cpu(weight_q4_0.size());
+  nntrainer::repack_q4_0(weight_cpu.data(), weight_q4_0.data(),
+                         weight_q4_0.size(), c.N, c.K,
+                         ml::train::ISA::DEFAULT);
+
   // Random fp32 activation [M, K] (M rows) - see the shape note in
   // nntr-htp-bridge.cpp.
   std::vector<float> act((size_t)c.M * c.K);
@@ -116,7 +132,7 @@ bool run_case(const Case &c) {
 
   try {
     cpu_ops->gemm_q4_0_fp32(c.M, c.N, c.K, act.data(), c.K,
-                             weight_q4_0.data(), c.N, cpu_out.data(), c.N);
+                             weight_cpu.data(), c.N, cpu_out.data(), c.N);
   } catch (const std::exception &e) {
     std::printf("  CPU reference threw: %s\n", e.what());
     return false;
