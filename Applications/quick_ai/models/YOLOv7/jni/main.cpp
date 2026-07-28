@@ -340,6 +340,31 @@ int main(int argc, char **argv) {
         yolov7::quantWeightDtype() = "Q8_0";
         std::cout << "[YOLOv7] Preset = w8a16 (Q8_0 weights + FP16 act + NHWC)"
                   << std::endl;
+      } else if (tts == "w8a8" || tts == "W8A8") {
+        // W8A8: int8-resident activations between Q8_0 conv layers.
+        // Uses FP32-FP32 model_tensor_type (no FP16 dependency) with
+        // NNTR_W8A8 env flag enabling per-tensor int8 activation quantization.
+        // NNTR_W8A8_FP32W: keep conv weights FP32 in the file and let the
+        // per-channel path quantize them at load time (matches the pose model's
+        // approach for best accuracy).
+        setenv("NNTR_W8A8", "1", 1);
+        model->setProperty(
+          {nntrainer::withKey("model_tensor_type", "FP32-FP32")});
+        preset_nhwc = true;
+        preset_q40 = true;
+        const bool w8a8_fp32w = std::getenv("NNTR_W8A8_FP32W") != nullptr;
+        if (w8a8_fp32w) {
+          yolov7::quantWeightDtype() = "FP32";
+          std::cout << "[YOLOv7] Preset = w8a8 (FP32 weights, load-time "
+                       "per-channel int8 + int8 act + NHWC)"
+                    << std::endl;
+        } else {
+          yolov7::quantWeightDtype() = "Q8_0";
+          std::cout << "[YOLOv7] Preset = w8a8 (Q8_0 weights + int8 act + NHWC)"
+                    << std::endl;
+        }
+
+
       } else if (tts == "w8a32" || tts == "W8A32") {
         model->setProperty(
           {nntrainer::withKey("model_tensor_type", "FP32-FP32")});

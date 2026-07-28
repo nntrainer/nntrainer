@@ -1084,12 +1084,15 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
   } else if (out_dim.getDataType() == nntrainer::Tdatatype::QINT8) {
     // A conv NEVER passes int8 through: a Q8_0 conv emits int8 via the
     // quantize epilogue (handled above), any other conv dequantizes its
-    // input and produces FP32. Without this, an FP32-weight conv fed a QINT8
-    // activation would inherit QINT8 from its input dtype and write FP32
+    // input and produces FP. Without this, an FP-weight conv fed a QINT8
+    // activation would inherit QINT8 from its input dtype and write FP
     // bytes into an int8-typed tensor -- the next layer then reads a garbage
-    // per-tensor scale.
-    out_dim.setDataType(nntrainer::Tdatatype::FP32);
+    // per-tensor scale. The output dtype follows the model's activation
+    // dtype (FP16 for FP32-FP16 models) so the dequant and im2col paths
+    // use the correct precision.
+    out_dim.setDataType(context.getActivationDataType());
   }
+
 
   context.setOutputDimensions({out_dim});
 
@@ -1903,23 +1906,56 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             const bool out_qint8 =
               out.getDataType() == nntrainer::Tdatatype::QINT8;
             Tensor out_flat = out;
-            std::vector<float> w8a8_out_buf;
+            // W8A8 QINT8 output: the GEMM produces FP, then the fused epilogue
+            // (bias + SiLU + quantize) writes int8 into `out`. The GEMM output
+            // dtype must match what the GEMM kernel writes:
+            // - __ggml_q8_0_q8_0_indirect_GEMM_i8a (QINT8 activation input)
+            //   writes FP32.
+            // - convQ4_0Indirect (FP16 activation input) writes FP16.
+            // - dot (1x1 FP16 activation) writes FP16.
+            // So the scratch buffer dtype depends on the input dtype, not on
+            // the output dtype.
+            std::vector<float> w8a8_out_buf_f32;
+#ifdef ENABLE_FP16
+            std::vector<_FP16> w8a8_out_buf_f16;
+#endif
             if (out_qint8) {
-              // Dedicated FP32 GEMM-output buffer (heap-local: pool INFER
-              // scratch is not materialized for inference, and a FUNC scratch
-              // aliases live activation memory). The epilogue reads it back to
-              // quantize into `out`.
-              w8a8_out_buf.assign((size_t)owoh * filter_size, 0.f);
-              out_flat = Tensor::Map<float>(
-                w8a8_out_buf.data(), w8a8_out_buf.size() * sizeof(float),
-                TensorDim(1, 1, owoh, filter_size,
-                          {ml::train::TensorDim::Format::NCHW,
-                           nntrainer::Tdatatype::FP32}));
+              if (in_sub.getDataType() == nntrainer::Tdatatype::QINT8) {
+                // int8 activation -> i8a GEMM -> FP32 output
+                w8a8_out_buf_f32.assign((size_t)owoh * filter_size, 0.f);
+                out_flat = Tensor::Map<float>(
+                  w8a8_out_buf_f32.data(),
+                  w8a8_out_buf_f32.size() * sizeof(float),
+                  TensorDim(1, 1, owoh, filter_size,
+                            {ml::train::TensorDim::Format::NCHW,
+                             nntrainer::Tdatatype::FP32}));
+              } else {
+#ifdef ENABLE_FP16
+                // FP16 activation -> convQ4_0Indirect / dot -> FP16 output
+                w8a8_out_buf_f16.assign((size_t)owoh * filter_size, (_FP16)0);
+                out_flat = Tensor::Map<_FP16>(
+                  w8a8_out_buf_f16.data(),
+                  w8a8_out_buf_f16.size() * sizeof(_FP16),
+                  TensorDim(1, 1, owoh, filter_size,
+                            {ml::train::TensorDim::Format::NCHW,
+                             nntrainer::Tdatatype::FP16}));
+#else
+                // Without FP16 support, fall back to FP32 scratch
+                w8a8_out_buf_f32.assign((size_t)owoh * filter_size, 0.f);
+                out_flat = Tensor::Map<float>(
+                  w8a8_out_buf_f32.data(),
+                  w8a8_out_buf_f32.size() * sizeof(float),
+                  TensorDim(1, 1, owoh, filter_size,
+                            {ml::train::TensorDim::Format::NCHW,
+                             nntrainer::Tdatatype::FP32}));
+#endif
+              }
             } else {
               out_flat.reshape(TensorDim(
                 1, 1, owoh, filter_size,
                 {ml::train::TensorDim::Format::NCHW, out.getDataType()}));
             }
+
 
             const int in_ch_i = (int)in_dim.channel();
             // Q8_0-activation path is an env opt-in only. Q8_0 weights use the
@@ -2024,13 +2060,39 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
             // The generic bias/activation sections below are dtype-gated and
             // never touch a QINT8 output.
             if (out_qint8) {
-              float *f = out_flat.getData<float>();
               const size_t n_out = (size_t)owoh * filter_size;
               const float *bptr = nullptr;
               if (auto &db = std::get<props::DisableBias>(*layer_impl_props);
                   db.empty() || db.get() == false)
                 bptr = context.getWeight(wt_idx[ConvParams::bias])
                          .getData<float>();
+              // The GEMM output may be FP32 (i8a GEMM) or FP16
+              // (convQ4_0Indirect / dot). Convert to FP32 in-place for the
+              // bias + SiLU + quantize epilogue.
+              std::vector<float> epilogue_buf;
+              float *f;
+              if (out_flat.getDataType() == nntrainer::Tdatatype::FP32) {
+                f = out_flat.getData<float>();
+              } else {
+#ifdef ENABLE_FP16
+                // FP16 -> FP32 conversion
+                epilogue_buf.resize(n_out);
+                const _FP16 *src = out_flat.getData<_FP16>();
+                f = epilogue_buf.data();
+                auto &tmq = ThreadManager::Global();
+                const size_t chunk = 4096;
+                const size_t nchunk = (n_out + chunk - 1) / chunk;
+                tmq.parallel_for(0, nchunk, [=](size_t ci) {
+                  const size_t i0 = ci * chunk;
+                  const size_t i1 = std::min(i0 + chunk, n_out);
+                  for (size_t i = i0; i < i1; ++i)
+                    f[i] = static_cast<float>(src[i]);
+                });
+#else
+                // Without FP16, out_flat should already be FP32
+                f = out_flat.getData<float>();
+#endif
+              }
               if (bptr) {
                 auto &tmq = ThreadManager::Global();
                 const unsigned int C = filter_size;
@@ -2078,6 +2140,7 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
               });
               hidden_.getScale<float>()[0] = scale;
             }
+
           } else {
             // Q8_0 weights are only wired for the NHWC q8-activation indirect
             // path; the NCHW quant matmul/indirect fallbacks below assume a
