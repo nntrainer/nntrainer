@@ -44,15 +44,16 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
      withKey("engine", causallm_engine())}));
   Tensor q = wq(query);
 
-  // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape))). No engine=:
-  // "reshaped_rms_norm" is registered on the cpu context only, so stamping it
-  // would THROW at graph build. It therefore stays a host op between two
-  // device FCs -- the remaining per-layer host hop on this path.
+  // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape))). Now stamped:
+  // ReshapedRMSNormLayer is registered on the gpu context too, and its
+  // incremental_forwarding runs the rmsnorm kernel when the operands are
+  // SVM-resident, so this is no longer a host hop between two device FCs.
   LayerHandle q_norm(createLayer(
     "reshaped_rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
      withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
+     withKey("feature_size", std::to_string(head_dim)),
+     withKey("engine", causallm_engine())}));
   Tensor q_normed = q_norm(q);
 
   // K layer
@@ -69,7 +70,8 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
     "reshaped_rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
      withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
+     withKey("feature_size", std::to_string(head_dim)),
+     withKey("engine", causallm_engine())}));
   Tensor k_normed = k_norm(k);
 
   // V layer

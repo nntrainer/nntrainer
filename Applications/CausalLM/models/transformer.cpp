@@ -26,6 +26,7 @@
 #include <neuralnet.h>
 #include <per_layer_slice_gpu.h>
 #include <qs4cx_tensor.h>
+#include <reshaped_rms_norm.h>
 #include <rms_norm.h>
 #include <rms_norm_gpu.h>
 #include <swiglu_layer.h>
@@ -647,6 +648,13 @@ void Transformer::registerCustomLayers() {
     // round-trip that would break residency).
     ct_engine.registerLayerFactory(
       "gpu", nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>);
+    // Per-head q/k/v norms (Gemma4, Qwen3) on the gpu context. One class for
+    // both backends: its incremental_forwarding dispatches the rmsnorm kernels
+    // when the operands are SVM-resident and keeps the host pass otherwise, so
+    // registering it here is what lets a reshaped_rms_norm node carry engine=
+    // instead of sitting on the host between two device FCs.
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register GPU-routed layer on gpu ctx: " << e.what()
               << std::endl;
