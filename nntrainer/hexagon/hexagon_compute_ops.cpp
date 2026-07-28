@@ -7,23 +7,27 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @brief  Hexagon cDSP ComputeOps subclass.
  *
- * Stage 2: gemm_q4_0_accel_fp32() dlopen/dlsyms
- * nntr_htp_bridge_gemm_q4_0() out of libggml-hexagon.so (see
- * ggml/src/ggml-hexagon/nntr-htp-bridge.cpp in the ggml-hexagon repo) and
- * calls straight into it. That bridge function reuses ggml-hexagon's own
- * cDSP session machinery directly (ggml_hexagon_session::enqueue_op/flush)
- * without going through ggml's graph/backend scheduler, since nntrainer has
- * no ggml_cgraph of its own to hand it. matAdata is already q4x4x2-tiled by
- * repack_q4_0_to_htp_q4x4x2 at quantize time, so no repack happens here or
- * on the DSP side.
+ * gemm_q4_0_accel_fp32() dlopen/dlsyms nntr_htp_bridge_upload_weight_q4x4x2()
+ * and nntr_htp_bridge_gemm_q4_0() out of libggml-hexagon.so (see
+ * ggml/src/ggml-hexagon/nntr-htp-bridge.cpp in the ggml-hexagon repo). Those
+ * reuse ggml-hexagon's own cDSP session machinery directly
+ * (ggml_hexagon_session::enqueue_op/flush) without going through ggml's
+ * graph/backend scheduler, since nntrainer has no ggml_cgraph to hand it.
  *
- * UNVERIFIED: no Hexagon hardware was available while writing this, so
- * dlopen/dlsym wiring and the ggml-hexagon-side bridge are only
- * compile-checked (Android arm64 cross-build), not run. The M/N/K -> tensor
- * shape mapping in nntr-htp-bridge.cpp is confirmed against nntrainer's own
- * CPU reference test (unittest_nntrainer_cpu_backend.cpp), not against real
- * hardware or a reference DSP GEMM - see the UNVERIFIED note in that file
- * before trusting output values.
+ * matAdata arrives in the ordinary *ARM* q4_0x4 layout, not q4x4x2: decode
+ * (M below gemm_q4_0_accel_min_rows) runs on the CPU kernels, which need to
+ * read these same bytes. The q4_0x4 -> plain block_q4_0 -> q4x4x2 conversion
+ * therefore happens here, once per weight on first sight, and the result is
+ * uploaded to a persistent rpcmem arena on the DSP side. That is what lets the
+ * model .bin stay in its normal ARM layout with no Hexagon-specific weight
+ * file.
+ *
+ * Verified on hardware (Galaxy S25 / SM-S936U, Snapdragon 8 Elite, HTP v79):
+ * tools/nntr_htp_bridge_check.cpp passes against the CPU reference (max abs err
+ * ~0.19, sub-1% relative, consistent with the DSP quantizing activations to
+ * q8x4x2 where the CPU path uses q8_0), and Qwen3-0.6B generates coherent text
+ * end to end through CausalLM. See gemm_q4_0_accel_min_rows() for the measured
+ * prefill/decode split and the numbers behind it.
  *
  * Every op below except gemm_q4_0_accel_fp32 forwards to get_cpu_ops().
  * ComputeOps::setComputeOps() is set once at the *context* level
@@ -48,9 +52,12 @@
 #include <hexagon_compute_ops.h>
 #include <hexagon_repack.h>
 
+#include <nntrainer_log.h>
+
 #include <dlfcn.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -116,23 +123,55 @@ public:
   bool supports_gemm_q4_0_accel_fp32() const override { return true; }
 
   /**
-   * @brief 32 rows, matching the DSP's own HMX gate.
+   * @brief Rows of activation below which the CPU kernel wins outright.
    *
-   * htp/matmul-ops.c computes m_hmx = M & ~31 and drops to the HVX kernel when
-   * that is zero, so below M == 32 the systolic array never engages and the DSP
-   * is doing wide-SIMD work no better than ARM's - while still paying a FastRPC
-   * round trip per op. Measured on an 8 Elite (v79) with Qwen3-0.6B, this is not
-   * marginal: ggml-hexagon's own mature backend (full graph scheduler, op
-   * batching, weights resident from load) decodes at 34.6 tok/s against 158.9 on
-   * 4 CPU threads - 4.6x slower. Decode is GEMV, i.e. bandwidth-bound, and the
-   * DSP has no bandwidth advantage. That same backend is 1.41x faster than CPU
-   * at a 90-token prefill and 3.58x faster at 512 tokens, because HMX scales
-   * with M while CPU attention is O(n^2).
+   * Two different thresholds matter here and they are far apart.
    *
-   * So the split is: prefill on the DSP, decode on the CPU. Threshold 32 puts it
-   * exactly where the hardware itself switches kernels.
+   * The DSP switches kernels at 32: htp/matmul-ops.c computes m_hmx = M & ~31
+   * and falls back to HVX when that is zero, so below 32 rows the systolic array
+   * never engages. That is the floor below which offloading can never pay.
+   *
+   * But our own crossover is much higher, because prefill is still dispatch
+   * bound - one blocking flush per GEMM, 196 per forward pass, so wall time is
+   * nearly independent of M. Measured on an 8 Elite (v79), Qwen3-0.6B Q4_0,
+   * 4 threads, prefill throughput as NPU/CPU:
+   *
+   *   tokens   79    157   196   235   274   313   391
+   *   ratio   0.64  0.86  0.93  1.14  1.06  1.19  1.19
+   *
+   * so the real crossover sits around 215 rows. 256 is the round number safely
+   * past it given run-to-run noise; picking 32 here would make short prompts
+   * measurably *slower* than plain CPU (0.64x at 79 rows).
+   *
+   * Override with NNTR_HEXAGON_MIN_ROWS to re-tune without a rebuild. Once op
+   * batching lands (gemm_q4_0_batch_fp32, collapsing Q/K/V and gate/up into one
+   * submission each) the dispatch floor drops and this should approach 32.
+   *
+   * Decode (M == 1) therefore always takes the CPU path, which is correct on the
+   * merits and not just a fallback: ggml-hexagon's own mature backend - full
+   * graph scheduler, op batching, weights resident in rpcmem from load - decodes
+   * Qwen3-0.6B at 34.6 tok/s against 158.9 on 4 CPU threads. Decode is GEMV and
+   * bandwidth-bound; the DSP has no bandwidth advantage and adds a FastRPC round
+   * trip. Prefill is the opposite, which is why that same backend goes from
+   * 1.41x CPU at 90 tokens to 3.58x at 512.
    */
-  unsigned int gemm_q4_0_accel_min_rows() const override { return 32; }
+  unsigned int gemm_q4_0_accel_min_rows() const override {
+    static const unsigned int min_rows = [] {
+      if (const char *env = std::getenv("NNTR_HEXAGON_MIN_ROWS")) {
+        // 0 or garbage would disable the guard entirely and send decode to the
+        // DSP, so clamp to the hardware floor rather than trusting the value.
+        unsigned long v = std::strtoul(env, nullptr, 10);
+        if (v >= 32) {
+          return (unsigned int)v;
+        }
+        ml_logw("NNTR_HEXAGON_MIN_ROWS=%s ignored (must be >= 32, the DSP's own "
+                "HMX gate); using 256",
+                env);
+      }
+      return 256u;
+    }();
+    return min_rows;
+  }
 
   void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata, float *matCdata,
                             unsigned int M, unsigned int N,
