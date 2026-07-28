@@ -54,6 +54,30 @@ public:
 };
 
 /**
+ * @brief Tiny Gemma3 probe exposing config-derived attention parameters
+ *
+ * Construct-only: it never compiles a graph nor loads weights, so every
+ * assertion observes exactly what the constructor chain parsed out of cfg.
+ */
+class TinyGemma3ConfigProbe final : public causallm::Gemma3CausalLM {
+public:
+  /**
+   * @brief Construct a tiny Gemma3 config probe
+   */
+  TinyGemma3ConfigProbe(causallm::json &cfg, causallm::json &generation_cfg,
+                        causallm::json &nntr_cfg) :
+    causallm::Transformer(sanitizeConfig(cfg),
+                          sanitizeGenerationConfig(generation_cfg, cfg),
+                          nntr_cfg, causallm::ModelType::CAUSALLM),
+    causallm::Gemma3CausalLM(cfg, generation_cfg, nntr_cfg) {}
+
+  /**
+   * @brief Attention-logit soft-cap as parsed by the constructor chain
+   */
+  float attnLogitSoftcapping() const { return ATTN_LOGIT_SOFTCAPPING; }
+};
+
+/**
  * @brief Populate deterministic tiny Gemma3 weights for golden token tests
  */
 void setupGemma3DeterministicWeights(TinyGemma3CausalLM &model) {
@@ -529,6 +553,64 @@ TEST(EmbeddingGemmaTinyModelTest,
     has_non_zero = has_non_zero || std::abs(value) > 1e-5f;
   }
   EXPECT_TRUE(has_non_zero);
+}
+
+/**
+ * @brief Construct a tiny Gemma3 probe from a model config
+ */
+std::unique_ptr<TinyGemma3ConfigProbe> makeGemma3Probe(causallm::json cfg) {
+  auto generation_cfg = causallm_test::makeTinyGenerationConfig();
+  auto nntr_cfg = causallm_test::makeTinyCtorOnlyNntrainerConfig();
+  return std::make_unique<TinyGemma3ConfigProbe>(cfg, generation_cfg, nntr_cfg);
+}
+
+/**
+ * @brief config.json "attn_logit_softcapping" must reach the model object
+ *
+ * Asserts the CONTRACT -- a cfg key the model declares support for actually
+ * lands in the member every consumer reads -- not where the parse is written,
+ * so it stays valid if the parse moves again.
+ *
+ * Regression guard: the parse used to live only in
+ * Gemma3Transformer::setupParameters, which is unreachable. setupParameters is
+ * dispatched from base-class CONSTRUCTOR bodies (Transformer:: and CausalLM::),
+ * and a virtual call inside a base constructor resolves to the BASE override --
+ * never a derived one. Gemma3's ctor bodies add no call of their own, so the
+ * override never ran. Shipped gemma3 configs carry
+ * "attn_logit_softcapping": null, so gemma3 numerics never moved, but the
+ * plumbing was broken all the same -- and it is the same dead-override shape
+ * that silently disabled gemma2's soft-cap.
+ */
+TEST(Gemma3ConfigPlumbingTest, AttnLogitSoftcappingReachesModel) {
+  auto cfg = makeTinyGemma3Config();
+  cfg["attn_logit_softcapping"] = 50.0;
+
+  auto probe = makeGemma3Probe(cfg);
+
+  EXPECT_FLOAT_EQ(probe->attnLogitSoftcapping(), 50.0f);
+}
+
+/**
+ * @brief A config without the key keeps the no-soft-cap default
+ */
+TEST(Gemma3ConfigPlumbingTest, AbsentAttnLogitSoftcappingKeepsDefault) {
+  auto probe = makeGemma3Probe(makeTinyGemma3Config());
+
+  EXPECT_FLOAT_EQ(probe->attnLogitSoftcapping(), 0.0f);
+}
+
+/**
+ * @brief An explicitly null key keeps the no-soft-cap default
+ *
+ * This is the shape shipped gemma3 configs actually use.
+ */
+TEST(Gemma3ConfigPlumbingTest, NullAttnLogitSoftcappingKeepsDefault) {
+  auto cfg = makeTinyGemma3Config();
+  cfg["attn_logit_softcapping"] = nullptr;
+
+  auto probe = makeGemma3Probe(cfg);
+
+  EXPECT_FLOAT_EQ(probe->attnLogitSoftcapping(), 0.0f);
 }
 
 } // namespace
