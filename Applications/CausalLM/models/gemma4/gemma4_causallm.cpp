@@ -275,12 +275,18 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   const unsigned int per_layer_total_dim =
     NUM_LAYERS * HIDDEN_SIZE_PER_LAYER_INPUT;
 
-  // try using same low bit precision as fc layers
+  // The PLE table is a LOOKUP table owned by an EmbeddingLayer, not a matmul
+  // weight: it must carry EMBEDDING_DTYPE, not FC_LAYER_DTYPE. EmbeddingLayer
+  // only supports Q4_0/Q6_K/FP32 rows; the FC packings (QS4CX, QINT4) have a
+  // different in-memory footprint, so requesting one here sizes the weight
+  // record wrong and the per-token row copy aborts with "Size of tensor to copy
+  // must match" at load. The quantizer keys the same layer off embd_dtype
+  // (quantize.cpp), so fc_dtype here also disagreed with what is in the bin.
   LayerHandle per_layer_embedding(createLayer(
     "embedding_layer",
     buildEmbeddingLayerProperties("per_layer_input_embedding",
                                   VOCAB_SIZE_PER_LAYER_INPUT,
-                                  per_layer_total_dim, FC_LAYER_DTYPE,
+                                  per_layer_total_dim, EMBEDDING_DTYPE,
                                   EMBEDDING_PER_LAYER_SCALE, PLE_FILE_NAME)));
   Tensor per_layer_embedding_out = per_layer_embedding(x);
 
