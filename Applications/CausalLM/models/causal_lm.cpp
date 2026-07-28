@@ -220,26 +220,43 @@ void CausalLM::advanceKVCachePosition(unsigned int step_size) {
   kv_cache.advance(step_size);
 }
 
-std::pair<Tensor, Tensor> CausalLM::constructModel() {
-
-  // base transformer (input, output_norm)
-  auto [x, h] = Transformer::constructModel();
-
+/**
+ * [lmhead-untie] When nntr_config.json sets lmhead_untie, build
+ * output_of_causallm as an independent fully_connected layer with its own
+ * weight even for a tied-embedding model, so the lm_head can carry a
+ * different dtype than the embedding (untied-serialized packages such as
+ * gemma4_qs4cx_fp16 ship a separate transposed [hidden, vocab] head record
+ * that a tied graph cannot load). Untie is the config flag, NOT derived from
+ * LMHEAD_DTYPE: a quantizer constructs this same untied graph from the FP32
+ * source and quantizes output_of_causallm via the dtype map on save.
+ * skip_prefill keeps the FC lm_head decode-only, the same contract the tied
+ * lm_head types implement internally. Flag off = byte-identical graph.
+ */
+Tensor CausalLM::buildLmHeadOutput(Tensor h, bool add_skip_prefill) {
+  const bool lmhead_untied = LMHEAD_UNTIE;
   const std::string lmhead_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
-
+    lmhead_untied ? "fully_connected"
+                  : (TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head");
   std::vector<std::string> lmhead_prop = {
     withKey("name", "output_of_causallm"),
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true"),
     withKey("weight_dtype", LMHEAD_DTYPE),
   };
-
-  if (TIE_WORD_EMBEDDINGS)
+  if (add_skip_prefill)
+    lmhead_prop.emplace_back(withKey("skip_prefill", "true"));
+  if (TIE_WORD_EMBEDDINGS && !lmhead_untied)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
-
   LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));
-  Tensor y = lmhead(h);
+  return lmhead(h);
+}
+
+std::pair<Tensor, Tensor> CausalLM::constructModel() {
+
+  // base transformer (input, output_norm)
+  auto [x, h] = Transformer::constructModel();
+
+  Tensor y = buildLmHeadOutput(h, LMHEAD_UNTIE && SKIP_PREFILL);
 
   return {x, y};
 }

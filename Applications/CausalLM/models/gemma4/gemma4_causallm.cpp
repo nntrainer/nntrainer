@@ -247,10 +247,16 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
   Tensor x =
     Tensor({1, 1, 1, static_cast<unsigned int>(INIT_SEQ_LEN)}, "input0");
 
+  // TieWordEmbedding exists to share the table with a tied lm_head. With
+  // LMHEAD_UNTIE the head is a separate FC, so embedding0 is a plain
+  // embedding_layer — lookup-identical (same weight record) and it unlocks
+  // the mmap'd sidecar (embedding_file_name) that TieWordEmbedding
+  // structurally lacks.
+  const bool embedding_tied = TIE_WORD_EMBEDDINGS && !LMHEAD_UNTIE;
   const std::string embedding_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "embedding_layer";
+    embedding_tied ? "tie_word_embeddings" : "embedding_layer";
 
-  NNTR_THROW_IF(TIE_WORD_EMBEDDINGS && !EMBEDDING_FILE_NAME.empty(),
+  NNTR_THROW_IF(embedding_tied && !EMBEDDING_FILE_NAME.empty(),
                 std::invalid_argument)
     << "embedding_file_name requires untied embedding_layer";
   LayerHandle embedding(createLayer(
@@ -808,24 +814,11 @@ void Gemma4CausalLM::registerCustomLayers() {
 std::pair<Tensor, Tensor> Gemma4CausalLM::constructModel() {
   auto [x, h] = Gemma4Transformer::constructModel();
 
-  // create lm_head layer (using fully_connected option)
-  const std::string lmhead_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
-
-  // add lmhead
-  std::vector<std::string> lmhead_prop = {
-    withKey("name", "output_of_causallm"),
-    withKey("unit", NUM_VOCAB),
-    withKey("disable_bias", "true"),
-    withKey("weight_dtype", LMHEAD_DTYPE),
-  };
-  appendSkipPrefillIfNeeded(lmhead_prop, true);
-
-  if (TIE_WORD_EMBEDDINGS)
-    lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
-
-  LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));
-  Tensor y = lmhead(h);
+  // lm_head: shares CausalLM::buildLmHeadOutput, which honors LMHEAD_UNTIE
+  // (untied FC head with its own weight record — the layout the
+  // gemma4_qs4cx_fp16 packagings serialize). skip_prefill gates on
+  // ENABLE_SKIP_PREFILL_OPT here, matching every other Gemma4 layer.
+  Tensor y = buildLmHeadOutput(h, ENABLE_SKIP_PREFILL_OPT);
 
   if (FINAL_LOGIT_SOFTCAPPING > 0.0f) {
     std::vector<std::string> final_softcap_props = {

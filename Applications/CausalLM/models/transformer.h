@@ -375,6 +375,15 @@ protected:
   std::string EMBEDDING_FILE_NAME;
   std::string PLE_FILE_NAME;
 
+  /** untie lm_head from the input embedding (separate FC weight, not shared
+   *  with the embedding table). Lives here (not CausalLM) because embedding0's
+   *  layer-type choice — tied TieWordEmbedding vs untied embedding_layer —
+   *  happens in <model>Transformer::constructModel scope. A dedicated flag
+   *  (not derived from LMHEAD_DTYPE) so a quantizer can build the same untied
+   *  graph from FP32 source weights while the dtype map quantizes
+   *  output_of_causallm on save. */
+  bool LMHEAD_UNTIE = false;
+
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int SLIDING_WINDOW_PATTERN = 5;
   unsigned int ROPE_THETA = 10000; /**< RoPE theta value */
