@@ -74,7 +74,7 @@ inline Tensor convGelu(const std::string &name, int in_ch, int out_ch, int k,
     nntrainer::withKey("stride", {stride, stride}),
     nntrainer::withKey("padding", padding),
     nntrainer::withKey("groups", groups)};
-  if (conv_q40)
+  if (conv_q40 && out_ch % 32 == 0 && (in_ch / groups * k * k) % 32 == 0)
     conv_props.push_back(
       nntrainer::withKey("weight_dtype", quantWeightDtype()));
   LayerHandle conv(createLayer("conv2d", conv_props));
@@ -97,7 +97,7 @@ inline Tensor convOnly(const std::string &name, int in_ch, int out_ch, int k,
     nntrainer::withKey("stride", {stride, stride}),
     nntrainer::withKey("padding", padding),
     nntrainer::withKey("groups", groups)};
-  if (conv_q40)
+  if (conv_q40 && out_ch % 32 == 0 && (in_ch / groups * k * k) % 32 == 0)
     conv_props.push_back(
       nntrainer::withKey("weight_dtype", quantWeightDtype()));
   LayerHandle conv(createLayer("conv2d", conv_props));
@@ -119,7 +119,7 @@ inline Tensor conv1x1Gelu(const std::string &name, int in_ch, int out_ch,
     nntrainer::withKey("kernel_size", {1, 1}),
     nntrainer::withKey("filters", out_ch), nntrainer::withKey("stride", {1, 1}),
     nntrainer::withKey("padding", 0)};
-  if (conv_q40)
+  if (conv_q40 && out_ch % 32 == 0 && in_ch % 32 == 0)
     conv_props.push_back(
       nntrainer::withKey("weight_dtype", quantWeightDtype()));
   LayerHandle conv(createLayer("conv2d", conv_props));
@@ -144,7 +144,7 @@ inline Tensor conv1x1Only(const std::string &name, int in_ch, int out_ch,
     nntrainer::withKey("padding", 0)};
   if (no_bias)
     conv_props.push_back(nntrainer::withKey("disable_bias", "true"));
-  if (conv_q40)
+  if (conv_q40 && out_ch % 32 == 0 && in_ch % 32 == 0)
     conv_props.push_back(
       nntrainer::withKey("weight_dtype", quantWeightDtype()));
   LayerHandle conv(createLayer("conv2d", conv_props));

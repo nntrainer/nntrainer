@@ -120,29 +120,29 @@ int main(int argc, char *argv[]) {
     bool preset_q40 = false;
     if (const char *tt = std::getenv("FASTVIT_TENSOR_TYPE")) {
       std::string tts = tt;
-      if (tts == "w8a8" || tts == "W8A8") {
+      if (tts == "w8a16" || tts == "W8A16") {
+        model->setProperty(
+          {nntrainer::withKey("model_tensor_type", "FP32-FP16")});
+        preset_nhwc = true;
+        preset_q40 = true;
+        fastvit::quantWeightDtype() = "Q8_0";
+        std::cout << "[FastViT] Preset = w8a16 (Q8_0 weights + FP16 act + NHWC)"
+                  << std::endl;
+      } else if (tts == "w8a8" || tts == "W8A8") {
         // W8A8: int8-resident activations between conv layers.
         // Uses FP32-FP32 model_tensor_type (no FP16 dependency) with
-        // NNTR_W8A8 env flag enabling per-tensor int8 activation quantization.
-        // NNTR_W8A8_FP32W: keep conv weights FP32 in the file and let the
-        // per-channel path quantize them at load time (best accuracy).
-        setenv("NNTR_W8A8", "1", 1);
+        // NNTR_CONV_Q8ACT env flag enabling per-tensor int8 activation
+        // quantization. Conv weights are kept FP32 in the file and quantized
+        // at load time (per-channel int8) for best accuracy.
+        setenv("NNTR_CONV_Q8ACT", "1", 1);
         model->setProperty(
           {nntrainer::withKey("model_tensor_type", "FP32-FP32")});
         preset_nhwc = true;
         preset_q40 = true;
-        const bool w8a8_fp32w = std::getenv("NNTR_W8A8_FP32W") != nullptr;
-        if (w8a8_fp32w) {
-          fastvit::quantWeightDtype() = "FP32";
-          std::cout << "[FastViT] Preset = w8a8 (FP32 weights, load-time "
-                       "per-channel int8 + int8 act + NHWC)"
-                    << std::endl;
-        } else {
-          fastvit::quantWeightDtype() = "Q8_0";
-          std::cout
-            << "[FastViT] Preset = w8a8 (Q8_0 weights + int8 act + NHWC)"
-            << std::endl;
-        }
+        fastvit::quantWeightDtype() = "FP32";
+        std::cout << "[FastViT] Preset = w8a8 (FP32 weights, load-time "
+                     "per-channel int8 + int8 act + NHWC)"
+                  << std::endl;
       } else if (tts == "w8a32" || tts == "W8A32") {
         model->setProperty(
           {nntrainer::withKey("model_tensor_type", "FP32-FP32")});
@@ -162,9 +162,21 @@ int main(int argc, char *argv[]) {
       std::cout << "[FastViT] tensor_format = NHWC" << std::endl;
     }
 
+    // Determine input dtype: FP16 for w8a16/w4a16 presets, FP32 otherwise.
+    bool fp16_act = (preset_q40 &&
+                     (std::getenv("FASTVIT_TENSOR_TYPE") != nullptr));
+    if (const char *tt = std::getenv("FASTVIT_TENSOR_TYPE")) {
+      std::string tts = tt;
+      fp16_act = (tts == "w8a16" || tts == "W8A16" || tts == "w4a16" ||
+                  tts == "W4A16" || tts == "w4a8" || tts == "W4A8");
+    }
+    auto input_dtype = fp16_act ? ml::train::TensorDim::DataType::FP16
+                                : ml::train::TensorDim::DataType::FP32;
+
+    auto input_format = preset_nhwc ? ml::train::TensorDim::Format::NHWC
+                                    : ml::train::TensorDim::Format::NCHW;
     auto x = Tensor(ml::train::TensorDim(1, 3, imgsz, imgsz,
-                                         ml::train::TensorDim::Format::NCHW,
-                                         ml::train::TensorDim::DataType::FP32),
+                                         input_format, input_dtype),
                     "input0");
 
     auto backbone_out = fastvit::buildBackbone(x, preset_q40);
@@ -175,6 +187,15 @@ int main(int argc, char *argv[]) {
 
     // Load weights
     std::string weights_path = RES_DIR + "/fastvit_backbone.safetensors";
+    // W8A16 uses a pre-converted Q8_0 safetensors file.
+    // W8A8 uses FP32 weights with load-time per-channel quantization.
+    if (preset_q40 && fastvit::quantWeightDtype() == "Q8_0" &&
+        !(std::getenv("NNTR_W8A8") != nullptr)) {
+      std::string q_path = RES_DIR + "/fastvit_backbone_q8_0.safetensors";
+      std::ifstream test(q_path);
+      if (test.good())
+        weights_path = q_path;
+    }
     if (const char *wenv = std::getenv("FASTVIT_WEIGHTS")) {
       weights_path =
         (wenv[0] == '/') ? std::string(wenv) : RES_DIR + "/" + wenv;
@@ -183,11 +204,30 @@ int main(int argc, char *argv[]) {
     std::cout << "Model built and weights loaded (" << weights_path << ")."
               << std::endl;
 
-    // Load input
+    // Load input (NCHW format from file)
     auto input = loadBin(input_path);
     std::cout << "Input loaded from: " << input_path
               << " (size=" << input.size() << ")" << std::endl;
-    std::vector<float *> in_ptr = {input.data()};
+
+    std::vector<float *> in_ptr;
+    if (preset_nhwc) {
+      // Transpose NCHW -> NHWC for NHWC model format
+      std::vector<float> nhwc(input.size());
+      for (int c = 0; c < 3; ++c) {
+        for (int h = 0; h < imgsz; ++h) {
+          for (int w = 0; w < imgsz; ++w) {
+            nhwc[h * imgsz * 3 + w * 3 + c] =
+              input[c * imgsz * imgsz + h * imgsz + w];
+          }
+        }
+      }
+      // Keep nhwc alive for the inference call
+      static std::vector<float> nhwc_buf;
+      nhwc_buf = std::move(nhwc);
+      in_ptr = {nhwc_buf.data()};
+    } else {
+      in_ptr = {input.data()};
+    }
 
     // Inference timing
     int bench_iters =
