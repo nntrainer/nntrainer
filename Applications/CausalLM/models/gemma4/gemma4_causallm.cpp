@@ -438,23 +438,16 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     createLayer("fully_connected", per_layer_input_gate_props));
   Tensor per_layer_input_gate_out = per_layer_input_gate(decoder_output_base);
 
-  std::vector<std::string> per_layer_input_act_props = {
-    withKey("name",
-            "layer" + std::to_string(layer_id) + "_per_layer_input_act"),
-    withKey("activation", "tanh_gelu")};
-  appendSkipPrefillIfNeeded(per_layer_input_act_props, is_kv_shared_layer);
-  LayerHandle per_layer_input_act(
-    createLayer("activation", per_layer_input_act_props));
-  Tensor per_layer_input_activated =
-    per_layer_input_act(per_layer_input_gate_out);
-
+  // Fused GeGLU again: gelu_tanh(gate) * per_layer_input_slice. Structurally
+  // the same gelu(a) * b the FFN does, so the same node type applies; the
+  // gate is input[0] and the slice input[1].
   std::vector<std::string> per_layer_input_mul_props = {withKey(
     "name", "layer" + std::to_string(layer_id) + "_per_layer_input_mul")};
   appendSkipPrefillIfNeeded(per_layer_input_mul_props, is_kv_shared_layer);
   LayerHandle per_layer_input_mul(
-    createLayer("multiply", per_layer_input_mul_props));
+    createLayer("geglu", per_layer_input_mul_props));
   Tensor per_layer_input_multiplied =
-    per_layer_input_mul({per_layer_input_activated, per_layer_input_slice});
+    per_layer_input_mul({per_layer_input_gate_out, per_layer_input_slice});
 
   std::vector<std::string> per_layer_input_proj_props = {
     withKey("name",
@@ -753,13 +746,6 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   LayerHandle ffn_gate(createLayer("fully_connected", ffn_gate_props));
   Tensor gate = ffn_gate(input);
 
-  std::vector<std::string> ffn_gate_gelu_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate_gelu"),
-    withKey("activation", "tanh_gelu")};
-  appendSkipPrefillIfNeeded(ffn_gate_gelu_props, is_kv_shared_layer);
-  LayerHandle ffn_gate_gelu(createLayer("activation", ffn_gate_gelu_props));
-  Tensor gate_gelu = ffn_gate_gelu(gate);
-
   std::vector<std::string> ffn_up_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
     withKey("unit", curr_hidden_dim), withKey("disable_bias", "true"),
@@ -769,11 +755,16 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   LayerHandle ffn_up(createLayer("fully_connected", ffn_up_props));
   Tensor up = ffn_up(input);
 
+  // Fused GeGLU: gelu_tanh(gate) * up in one node, the same collapse gemma2
+  // uses. It replaces a separate tanh_gelu "activation" + "multiply" pair;
+  // GeGLULayer computes exactly gelu_tanh(in1) * in2 with the same
+  // gelu_pytorch_tanh constants, and unlike ActiFunc::tanhGelu it is
+  // dtype-correct for an FP16 activation stream.
   std::vector<std::string> ffn_geglu_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_geglu")};
   appendSkipPrefillIfNeeded(ffn_geglu_props, is_kv_shared_layer);
-  LayerHandle ffn_geglu(createLayer("multiply", ffn_geglu_props));
-  Tensor geglu = ffn_geglu({gate_gelu, up});
+  LayerHandle ffn_geglu(createLayer("geglu", ffn_geglu_props));
+  Tensor geglu = ffn_geglu({gate, up});
 
   std::vector<std::string> ffn_down_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
