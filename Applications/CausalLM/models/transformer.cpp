@@ -261,6 +261,10 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
   NNTR_THROW_IF(TIE_WORD_EMBEDDINGS && !EMBEDDING_FILE_NAME.empty(),
                 std::invalid_argument)
     << "embedding_file_name requires untied embedding_layer";
+  // No engine= on embedding0: "embedding_layer" has no gpu-context
+  // registration, and createLayer on an unregistered type THROWS (it is not a
+  // silent cpu fallback), so an untied model would fail at graph build. The
+  // lookup is a gather, not a GEMM -- nothing to gain on the device.
   LayerHandle embedding(createLayer(
     embedding_type,
     buildEmbeddingLayerProperties("embedding0", NUM_VOCAB, DIM, EMBEDDING_DTYPE,
@@ -272,11 +276,15 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
     h = createTransformerDecoderBlock(i, h);
   }
 
-  // final rms_norm
+  // final rms_norm. NOTE: stays on CausalLM's custom RMSNormLayer ("rms_norm"
+  // type) so engine=gpu routes to RMSNormLayerGPU, registered on the gpu
+  // context by registerCustomLayers below. The nntrainer core RMSNormLayerCl
+  // uses type "rmsnorm" (a different key) and is not what this resolves to.
   LayerHandle out_norm(
     createLayer("rms_norm", {withKey("name", "output_norm"),
                              withKey("epsilon", std::to_string(NORM_EPS)),
-                             withKey("packed", "false")}));
+                             withKey("packed", "false"),
+                             withKey("engine", causallm_engine())}));
   h = out_norm(h);
 
   return {x, h};
@@ -425,8 +433,8 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
   LayerHandle attn_norm(createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false"),
+     withKey("engine", causallm_engine())}));
   Tensor normed = attn_norm(input);
 
   Tensor att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
@@ -434,21 +442,23 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
 
   LayerHandle decoder_add(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add"),
+     withKey("engine", causallm_engine())}));
   Tensor residual = decoder_add({input, att_out});
 
   LayerHandle ffn_norm(createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false"),
+     withKey("engine", causallm_engine())}));
   Tensor ffn_normed = ffn_norm(residual);
 
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed);
 
   LayerHandle decoder_output(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output"),
+     withKey("engine", causallm_engine())}));
   return decoder_output({residual, ffn_out});
 }
 
@@ -478,6 +488,9 @@ Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
   const char *cache_dtype = "UINT16";
 #endif
 
+  // No engine= on the cache placeholders: "input" has no gpu-context
+  // registration, and their storage is host-owned by KVCacheManager and bound
+  // via setExternalTensors, so the graph's allocator never backs them.
   LayerHandle cache_k_input(createLayer(
     "input", {withKey("name", "cache_k_l" + std::to_string(layer_id)),
               withKey("input_shape", cache_shape),
@@ -502,7 +515,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
      withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor q = wq(query);
 
   // K layer
@@ -510,7 +524,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor k = wk(key);
 
   // V layer
@@ -518,14 +533,17 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor v = wv(value);
 
   // External KV cache placeholders (per-layer). Their actual storage is owned
   // by the host (KVCacheManager) and bound at runtime via setExternalTensors.
   auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
 
-  // Attention core layer
+  // Attention core layer. No engine= here: "mha_core" is registered on the
+  // cpu context only, and mha_core dispatches its own GPU work internally
+  // (its kernels are selected per-path, not by the node's engine).
   LayerHandle mha(createLayer(
     "mha_core",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
@@ -544,7 +562,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
      withKey("unit", DIM), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   return wo(a);
 }
 
@@ -558,14 +577,16 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor up = ffn_up(input);
 
   LayerHandle ffn_gate(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor gate = ffn_gate(input);
 
   /// @note nntrainer binary stores mlp weights in up, gate order.
@@ -575,14 +596,16 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   /// * swiglu input[1] = up
   LayerHandle swiglu(createLayer(
     "swiglu",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
+     withKey("engine", causallm_engine())}));
   Tensor act = swiglu({up, gate}, {1, 0});
 
   LayerHandle ffn_down(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   return ffn_down(act);
 }
 
