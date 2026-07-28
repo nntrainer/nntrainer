@@ -540,7 +540,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   unsigned int init_len = init_input.size();
   float *input_sample =
-    (float *)malloc(sizeof(float) * BATCH_SIZE * MAX_SEQ_LEN);
+    (float *)calloc(BATCH_SIZE * MAX_SEQ_LEN, sizeof(float));
   std::vector<bool> eos_list(BATCH_SIZE, false);
 
   unsigned int input_len = init_len;
