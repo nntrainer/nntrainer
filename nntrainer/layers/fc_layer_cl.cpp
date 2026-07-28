@@ -147,7 +147,14 @@ void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
                                                    unsigned int from,
                                                    unsigned int to,
                                                    bool training) {
-  if (skip_prefill && from == 0)
+  // [prefill-chunk] Multi-token steps count as prefill: a chunked prefill
+  // arrives as a from>0 block call with to-from == the chunk length, and a
+  // skip_prefill FC (a KV-shared attention projection) must skip it
+  // exactly like the from==0 first chunk. Without the `(to - from) > 1` arm
+  // chunk 2 fell through and asked for a to-from-row view of an activation
+  // that is only sized for decode -- "Creating shared tensor of size bigger
+  // than tensor memory", the very error that blocked every long prompt.
+  if (skip_prefill && (from == 0 || (to - from) > 1))
     return;
 
   // by-reference so a quantized weight keeps its instance across forwards (a
@@ -164,10 +171,15 @@ void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
   TensorDim hidden_step_dim = hidden_dim;
 
   if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
+    // [prefill-chunk] Normalize to 0-based while PRESERVING the step size: a
+    // chunked prefill (NNTR_PREFILL_CHUNK) calls this with from == the
+    // absolute chunk start and to-from == the chunk length. The producers
+    // write the live rows at the buffer base, so only the KV/attention layers
+    // care about the absolute position. The old `from = 0; to = 1;` silently
+    // collapsed a C-token chunk to one row (and the assert above it threw
+    // first), which is why every chunked prefill died here.
+    to = to - from;
     from = 0;
-    to = 1;
   }
 
   input_step_dim.height(to - from);

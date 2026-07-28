@@ -48,16 +48,21 @@ void GeGLULayer::forwarding(RunLayerContext &context, bool training) {
 void GeGLULayer::incremental_forwarding(RunLayerContext &context,
                                         unsigned int from, unsigned int to,
                                         bool training) {
-  if (skip_prefill && from == 0)
+  // [prefill-chunk] skip-prefill gate: multi-token steps count as prefill (a
+  // chunked prefill arrives as a from>0 block call), so they are skipped
+  // exactly like the from==0 first chunk. Mirrors the other three GLU layers.
+  if (skip_prefill && (from == 0 || (to - from) > 1))
     return;
   Tensor &in1 = context.getInput(INPUT_IDX_1);
   Tensor &in2 = context.getInput(INPUT_IDX_2);
   Tensor &out = context.getOutput(OUT_IDX);
 
-  if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
-  }
+  // [prefill-chunk] from>0 no longer implies a single-token step: a chunked
+  // prefill (NNTR_PREFILL_CHUNK) arrives as a block call with
+  // from == the absolute chunk start and to-from == the chunk length. The
+  // producers write the live rows at the buffer BASE on every backend
+  // regardless of `from`, so the row math below is step-count-agnostic --
+  // which is why the old `to - from != 1` assert could simply go.
 
   // active-row decision (unifies the former GeGLULayerCl / CudaGeGLULayer
   // forks; CUDA/CPU tensors are never cl_mem so they fall to the `else`):
@@ -67,10 +72,6 @@ void GeGLULayer::incremental_forwarding(RunLayerContext &context,
   //  - SVM/host/UVM: process the live rows [from, to) from the base (=1 at
   //    decode; the live token is at row 0 of the rebased activation buffers).
   // row_offset stays 0 on every path (see geglu_cl_op for why).
-  const bool any_clmem = in1.isClMem() || in2.isClMem() || out.isClMem();
-  const bool all_clmem = in1.isClMem() && in2.isClMem() && out.isClMem();
-  const bool is_fp16 =
-    in1.getDataType() == ml::train::TensorDim::DataType::FP16;
 
   // Rows are (batch*channel*height) flattened — scale the count like
   // forwarding() does, or batch/channel>1 shapes only process the first
@@ -80,13 +81,13 @@ void GeGLULayer::incremental_forwarding(RunLayerContext &context,
   // row span and stays unsupported.
   const unsigned int bc = in1.batch() * in1.channel();
 
-  unsigned int active_rows;
-  if (from && all_clmem && is_fp16)
-    active_rows = bc;
-  else if (any_clmem)
-    active_rows = to * bc;
-  else
-    active_rows = (to - from) * bc;
+  // [prefill-chunk] (to-from)*bc replaces the former three-way branch: for
+  // from==0 prefill `to == to-from` (identical to the old `to * bc` cl_mem
+  // window), for decode `to-from == 1` (identical to the old all-cl_mem-fp16
+  // `bc` fast path, which also avoided the one-row-out-of-bounds cl_mem write
+  // a [0,to) window could trigger), and a chunked prefill (from>0, to-from>1)
+  // processes exactly its to-from rows at the base.
+  const unsigned int active_rows = (to - from) * bc;
 
   in1.getOps()->geglu(in1, in2, out, active_rows, /** row_offset */ 0);
 }

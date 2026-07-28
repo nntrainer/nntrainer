@@ -66,10 +66,12 @@ void SigmoidAddLayer::incremental_forwarding(RunLayerContext &context,
   if (skip_prefill && (from == 0 || (to - from) > 1))
     return;
 
-  if (from) {
-    NNTR_THROW_IF(to - from != 1, std::invalid_argument)
-      << "incremental step size is not 1";
-  }
+    // [prefill-chunk] from>0 no longer implies a single-token step: a chunked
+    // prefill (NNTR_PREFILL_CHUNK) arrives as a block call with
+    // from == the absolute chunk start and to-from == the chunk length. The
+    // producers write the live rows at the buffer BASE on every backend
+    // regardless of `from`, so the row math below is step-count-agnostic --
+    // which is why the old `to - from != 1` assert could simply go.
 
 // TODO(#14): CUDA fp16 fast-path — enable once the cuda_sigmoid_add_fp16
 // wrapper lands in cuda_elementwise. Until then a CUDA build must not reference
@@ -99,23 +101,19 @@ void SigmoidAddLayer::incremental_forwarding(RunLayerContext &context,
   //    the one-row-out-of-bounds cl_mem write a [0,to) window could trigger).
   //  - any other cl_mem (mixed / fp32): the whole [0,to) window.
   //  - SVM/host: [0, to-from) (== row 0 for decode, the live token's slot).
-  const bool any_clmem = in1.isClMem() || in2.isClMem() || out.isClMem();
-  const bool all_clmem = in1.isClMem() && in2.isClMem() && out.isClMem();
-  const bool is_fp16 =
-    in1.getDataType() == ml::train::TensorDim::DataType::FP16;
 
   // Rows are (batch*channel*height) flattened -- scale the count like
   // forwarding() does, or batch/channel>1 shapes only process the first
   // (to-from) rows. Production decode has batch=channel=1 (a no-op).
   const unsigned int bc = in1.batch() * in1.channel();
 
-  unsigned int active_rows;
-  if (from && all_clmem && is_fp16)
-    active_rows = bc;
-  else if (any_clmem)
-    active_rows = to * bc;
-  else
-    active_rows = (to - from) * bc;
+  // [prefill-chunk] (to-from)*bc replaces the former three-way branch: for
+  // from==0 prefill `to == to-from` (identical to the old `to * bc` cl_mem
+  // window), for decode `to-from == 1` (identical to the old all-cl_mem-fp16
+  // `bc` fast path, which also avoided the one-row-out-of-bounds cl_mem write
+  // a [0,to) window could trigger), and a chunked prefill (from>0, to-from>1)
+  // processes exactly its to-from rows at the base.
+  const unsigned int active_rows = (to - from) * bc;
 
   in1.getOps()->sigmoid_add(in1, in2, out, active_rows, /*row_offset=*/0);
 }
