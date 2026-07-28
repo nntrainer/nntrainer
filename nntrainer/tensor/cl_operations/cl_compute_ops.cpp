@@ -24,6 +24,7 @@
  *   -> nntrainer::gemm_q4_0_async_cl(...) -> OpenCL kernel queue.
  */
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -207,6 +208,55 @@ public:
     if (fc_out_zero)
       output.setZero();
     if (!nntrainer::dotCl_v8c(input, weight, output)) {
+      // [divert tripwire] NNTR_FC_DIVERT_TRACE=1: one line per FC that leaves
+      // the GPU path, naming the tensor and the condition that diverted it. A
+      // host bounce is a defect to be NAMED, not hidden: it reads the input and
+      // writes the output through host pointers (hence the lower/raise bridge
+      // below), and until this existed "no FC diverts on this model" could only
+      // be argued from a code reading, never measured.
+      static const bool divert_trace = []() {
+        const char *e = std::getenv("NNTR_FC_DIVERT_TRACE");
+        return e && e[0] != '0';
+      }();
+      if (divert_trace) {
+        // Local namer: safetensors_util's nntrDtypeName maps every dtype it
+        // does not enumerate (QS4CX included) to "FP32", which would misreport
+        // exactly the weights this trace exists for.
+        auto dt_name = [](ml::train::TensorDim::DataType d) -> const char * {
+          using DT = ml::train::TensorDim::DataType;
+          switch (d) {
+          case DT::FP32:
+            return "FP32";
+          case DT::FP16:
+            return "FP16";
+          case DT::QS4CX:
+            return "QS4CX";
+          case DT::QINT4:
+            return "QINT4";
+          case DT::Q4_0:
+            return "Q4_0";
+          case DT::Q4_K:
+            return "Q4_K";
+          case DT::Q6_K:
+            return "Q6_K";
+          default:
+            return "other";
+          }
+        };
+        const auto &id = input.getDim();
+        const auto &wd = weight.getDim();
+        std::fprintf(
+          stderr,
+          "[fc-divert] %s <- %s in[%ux%ux%ux%u %s] w[%ux%u %s] out[%s] "
+          "out_clmem=%d reason=%s\n",
+          output.getName().c_str(), weight.getName().c_str(), id.batch(),
+          id.channel(), id.height(), id.width(), dt_name(input.getDataType()),
+          wd.height(), wd.width(), dt_name(weight.getDataType()),
+          dt_name(output.getDataType()),
+          (output.getMemoryData() && output.getMemoryData()->isClMem()) ? 1 : 0,
+          nntrainer::v8c_last_reject_reason());
+        std::fflush(stderr);
+      }
       if (!fc_out_zero)
         output.setZero();
       // Static GPU_CLMEM residency: the host/SVM fallbacks below read input

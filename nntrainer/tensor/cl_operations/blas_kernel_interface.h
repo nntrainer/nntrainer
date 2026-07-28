@@ -200,6 +200,15 @@ int aminCl(const Tensor &input);
 bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output);
 
 /**
+ * @brief Why the last dotCl_v8c call on THIS thread returned false, as a static
+ *        string ("none" if it never has). Set at every reject site; read by the
+ *        FC divert tripwire (ClComputeOps::fc, NNTR_FC_DIVERT_TRACE=1) so a
+ *        host bounce names its own cause. Only meaningful immediately after a
+ *        false return.
+ */
+const char *v8c_last_reject_reason();
+
+/**
  * @brief Eagerly build the v8c GPU weight entry (nibble permute + upload +
  *        image view) for a freshly READ int4 FC weight, so the first prefill
  *        does not pay the lazy per-weight build. Called by the CL FC layer

@@ -1406,13 +1406,31 @@ void clmem_probe_capture(const char *tag, const void *svm_ptr, void *clmem,
   }
 }
 
+// [divert tripwire] Why the last dotCl_v8c call on this thread handed the FC
+// back to its caller. Every `return false` in dotCl_v8c goes through
+// V8C_REJECT so the host bounce it causes can be NAMED (printed by
+// ClComputeOps::fc under NNTR_FC_DIVERT_TRACE=1) instead of being silent --
+// the reject taxonomy was previously recoverable only by reading the function.
+// Thread-local: the eager weight prebuild runs on the loader pool.
+static const char *&v8c_reject_slot() {
+  static thread_local const char *r = "none";
+  return r;
+}
+#define V8C_REJECT(why)                                                        \
+  do {                                                                         \
+    v8c_reject_slot() = (why);                                                 \
+    return false;                                                              \
+  } while (0)
+
+const char *v8c_last_reject_reason() { return v8c_reject_slot(); }
+
 // NNTR_FC_TPROF=1: host wall time of the dotCl_v8c hot path, split at the
 // input-staging boundary (decomposes the rmsnorm->v8c_copy_h2h GPU idle).
 bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   if (!v8c_env_enabled())
-    return false;
+    V8C_REJECT("env NNTR_FC_INT8_GPU=0");
   if (weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
-    return false;
+    V8C_REJECT("weight dtype != QS4CX");
   // Derive M, K, N from tensor dims (no-transpose case only).
   unsigned int M, K, N;
   if (input.getFormat() == Tformat::NHWC) {
@@ -1424,12 +1442,12 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   }
   N = weight.width();
   if (K != weight.height())
-    return false;
+    V8C_REJECT("K != weight.height()");
   if (N % 8 != 0 || K % 32 != 0)
-    return false;
+    V8C_REJECT("shape N%8 != 0 or K%32 != 0");
   if (input.getDataType() != ml::train::TensorDim::DataType::FP32 &&
       input.getDataType() != ml::train::TensorDim::DataType::FP16)
-    return false;
+    V8C_REJECT("activation dtype not FP32/FP16");
 
   // Round M up to the kernel's tile size (V8C_TM=4). Padded rows produce
   // throwaway output that we never read back to the caller. Skips the
@@ -1472,7 +1490,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
 
   V8cWeightEntry *w = v8c_get_or_build_weight(weight, K, N);
   if (!w)
-    return false;
+    V8C_REJECT("no v8c weight backing (shape / null scale / build threw)");
 
   // Imageless v8c weight (N > image2d height cap, e.g. the untied int4 lm_head
   // with N=vocab=262144): the image GEMM path cannot run, so dispatch the
@@ -1501,7 +1519,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
         return true;
     }
 #endif
-    return false;
+    V8C_REJECT("huge_n weight and not the M==1 lm-head GEMV case");
   }
 
   // Reused scratch buffers (grow-only pool). The weight backing + scale are
@@ -1739,7 +1757,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
                         sizeof(int) * M_pad, CL_MEM_READ_WRITE) ||
         !v8c_ensure_buf(ctx, &sc.act_zp[act_slot], &sc.act_zp_bytes[act_slot],
                         sizeof(int) * M_pad, CL_MEM_READ_WRITE))
-      return false;
+      V8C_REJECT("act-quant scratch alloc failed");
     act_i8_arg = sc.act_i8[act_slot];
     act_scale_arg = sc.act_scale[act_slot];
     act_zp_arg = sc.act_zp[act_slot];
@@ -1778,7 +1796,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   if (!skip_upload_and_quant && !quant_direct_clmem &&
       !v8c_ensure_buf(ctx, &sc.act_in, &sc.act_in_bytes,
                       (size_t)M_pad * K * act_elem, CL_MEM_READ_ONLY))
-    return false;
+    V8C_REJECT("act_in scratch alloc failed");
 
   if (!skip_upload_and_quant) {
     if (device_clmem_in) {
@@ -1792,7 +1810,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
           clEnqueueCopyBuffer(q, clmem_in, sc.act_in, 0, 0,
                               (size_t)M * K * act_elem, 0, nullptr,
                               nullptr) != CL_SUCCESS)
-        return false;
+        V8C_REJECT("CopyBuffer clmem_in -> act_in failed");
     } else if (use_resident_input) {
       // GPU→GPU copy of the resident FP32/FP16 activation into sc.act_in.
       // Same shape as a host upload would produce, just without crossing
@@ -1800,7 +1818,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       if (clEnqueueCopyBuffer(q, in_backing->buffer(), sc.act_in, 0, 0,
                               (size_t)M * K * act_elem, 0, nullptr,
                               nullptr) != CL_SUCCESS)
-        return false;
+        V8C_REJECT("CopyBuffer resident act -> act_in failed");
     } else if (in_svm) {
       // GPU copy of the SVM-resident activation into sc.act_in -- no host
       // upload. Downstream quant/image/GEMM see the same sc.act_in as before.
@@ -1811,7 +1829,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       if (clEnqueueWriteBuffer(q, sc.act_in, CL_FALSE, 0,
                                (size_t)M * K * act_elem, cur_in_ptr, 0, nullptr,
                                nullptr) != CL_SUCCESS)
-        return false;
+        V8C_REJECT("WriteBuffer host act -> act_in failed");
     }
     if (M_pad > M && !quant_direct_clmem) {
       const size_t pad_bytes = (size_t)(M_pad - M) * K * act_elem;
@@ -1819,7 +1837,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       if (clEnqueueWriteBuffer(q, sc.act_in, CL_FALSE, (size_t)M * K * act_elem,
                                pad_bytes, zeros.data(), 0, nullptr,
                                nullptr) != CL_SUCCESS)
-        return false;
+        V8C_REJECT("WriteBuffer act pad rows failed");
     }
   }
 
@@ -1937,7 +1955,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     if (!direct_out && !v8c_ensure_buf(ctx, &sc.y_fp16, &sc.y_fp16_bytes,
                                        sizeof(uint16_t) * (size_t)M_pad * N,
                                        CL_MEM_READ_WRITE))
-      return false;
+      V8C_REJECT("y_fp16 scratch alloc failed");
     cl_mem gemm_y_arg =
       direct_out ? static_cast<cl_mem>(output.getMemoryData()->deviceMem())
                  : sc.y_fp16;
@@ -2027,7 +2045,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       if (clEnqueueReadBuffer(q, sc.y_fp16, CL_TRUE, 0,
                               sizeof(uint16_t) * y_host.size(), y_host.data(),
                               0, nullptr, nullptr) != CL_SUCCESS)
-        return false;
+        V8C_REJECT("host-bounce ReadBuffer failed (GEMM already ran)");
       if (output.getDataType() == ml::train::TensorDim::DataType::FP32) {
         float *out = output.getData<float>();
         for (size_t i = 0; i < y_host.size(); ++i)
@@ -2089,7 +2107,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       std::fflush(stderr);
     }
   } catch (...) {
-    return false;
+    V8C_REJECT("exception inside the v8c path");
   }
   return true;
 }
