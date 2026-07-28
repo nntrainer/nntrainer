@@ -210,6 +210,21 @@ public:
                                     unsigned int K);
 
   virtual bool supports_gemm_q4_0_accel_fp32() const { return false; }
+  /**
+   * @brief Minimum activation row count (M) at which gemm_q4_0_accel_fp32 is
+   * worth using over the plain CPU gemm_q4_0_fp32/GEMV path.
+   *
+   * Backend-declared rather than hardcoded in float_tensor.cpp, because the
+   * right threshold is a property of the accelerator, not of the caller:
+   *   - OpenCL (ClComputeOps) wants M >= 2, the long-standing behaviour when
+   *     this was a literal `M > 1` test at the call site.
+   *   - Hexagon cDSP wants M >= 1, because its weights are repacked into the
+   *     HTP q4x4x2 layout, which the CPU kernel cannot read - falling back to
+   *     the CPU for M == 1 would silently misinterpret those bytes as
+   *     q4_0x4/x8 and emit garbage, so there is no valid fallback to take.
+   * Defaults to 2 so no existing backend changes behaviour.
+   */
+  virtual unsigned int gemm_q4_0_accel_min_rows() const { return 2; }
   virtual void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata,
                                     float *matCdata, unsigned int M,
                                     unsigned int N, unsigned int K);

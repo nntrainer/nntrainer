@@ -997,7 +997,12 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     M = getDim().height();
     K = getDim().width();
     N = input.getDim().width();
-    if (o->supports_gemm_q4_0_accel_fp32() && M > 1) {
+    // The M threshold is the backend's to declare (see
+    // ComputeOps::gemm_q4_0_accel_min_rows) - it defaults to 2, preserving the
+    // `M > 1` behaviour this used to hardcode. Hexagon cDSP lowers it to 1
+    // because its q4x4x2 weights have no valid CPU fallback.
+    if (o->supports_gemm_q4_0_accel_fp32() &&
+        M >= o->gemm_q4_0_accel_min_rows()) {
       o->gemm_q4_0_accel_fp32((void *)mdata, data, rdata, M, N, K);
     } else {
       o->gemm_q4_0_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);

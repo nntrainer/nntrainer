@@ -96,6 +96,15 @@ nntr_htp_bridge_gemm_q4_0_fn get_bridge_fn() {
 class HexagonComputeOps : public ComputeOps {
 public:
   bool supports_gemm_q4_0_accel_fp32() const override { return true; }
+  // 1, not the default 2: the weights this context sees are in the HTP
+  // q4x4x2 layout, which the CPU gemm_q4_0_fp32/GEMV kernels cannot read
+  // (they expect q4_0x4 on ARM / q4_0x8 on x86). So for M == 1 there is no
+  // correct CPU fallback to drop to - taking it would silently emit garbage
+  // for every decode token. Note this means decode runs on the DSP's HVX
+  // path, not HMX: htp/matmul-ops.c only engages HMX at M >= 32
+  // (m_hmx = M & ~31), so expect per-op FastRPC latency to dominate here
+  // until the bridge batches ops and stops re-uploading weights per call.
+  unsigned int gemm_q4_0_accel_min_rows() const override { return 1; }
   void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata, float *matCdata,
                             unsigned int M, unsigned int N,
                             unsigned int K) override {
