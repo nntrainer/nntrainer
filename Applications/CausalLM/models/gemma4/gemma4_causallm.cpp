@@ -115,10 +115,8 @@ void Gemma4Transformer::setupParameters(json &cfg, json &generation_cfg,
     layer_types = cfg["layer_types"].get<std::vector<std::string>>();
   }
 
-  if (cfg.contains("attn_logit_softcapping") &&
-      !cfg["attn_logit_softcapping"].is_null()) {
-    ATTN_LOGIT_SOFTCAPPING = cfg["attn_logit_softcapping"].get<float>();
-  }
+  // attn_logit_softcapping now parsed in Transformer::setupParameters (base);
+  // final_logit_softcapping stays here (gemma4-specific member).
   if (cfg.contains("final_logit_softcapping") &&
       !cfg["final_logit_softcapping"].is_null()) {
     FINAL_LOGIT_SOFTCAPPING = cfg["final_logit_softcapping"].get<float>();
