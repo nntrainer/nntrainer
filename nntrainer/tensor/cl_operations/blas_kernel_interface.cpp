@@ -1336,8 +1336,17 @@ void clmem_probe_capture(const char *tag, const void *svm_ptr, void *clmem,
   if (err != CL_SUCCESS || dbg == nullptr)
     return;
   if (clmem != nullptr) {
-    if (clEnqueueCopyBuffer(q, static_cast<cl_mem>(clmem), dbg, 0, 0, bytes, 0,
-                            nullptr, nullptr) != CL_SUCCESS) {
+    const cl_int cerr = clEnqueueCopyBuffer(q, static_cast<cl_mem>(clmem), dbg,
+                                            0, 0, bytes, 0, nullptr, nullptr);
+    if (cerr != CL_SUCCESS) {
+      // NEVER silent: a dropped capture reads as "this op was not
+      // instrumented" in the dump and cost a full investigation round. The
+      // usual cause is a source smaller than `bytes` (a shared scratch sized
+      // by an earlier, narrower FC).
+      std::fprintf(stderr,
+                   "[probe] %s capture-SKIPPED (CopyBuffer err=%d, bytes=%u)\n",
+                   tag, (int)cerr, bytes);
+      std::fflush(stderr);
       clReleaseMemObject(dbg);
       return;
     }
@@ -1360,6 +1369,14 @@ void clmem_probe_capture(const char *tag, const void *svm_ptr, void *clmem,
       return;
     }
   } else {
+    // Neither a cl_mem nor an SVM source: nothing to snapshot. Reached when the
+    // caller hands over a scratch that the current output path never allocated
+    // (the direct-store FC path leaves sc.y_fp16 null -- see y_dbg_consumer).
+    std::fprintf(stderr,
+                 "[probe] %s capture-SKIPPED (no source: clmem and svm both "
+                 "null)\n",
+                 tag);
+    std::fflush(stderr);
     clReleaseMemObject(dbg);
     return;
   }
@@ -1905,8 +1922,18 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       const char *e = std::getenv("NNTR_V8C_DIRECT_OUT");
       return !(e && e[0] == '0');
     }();
-    const bool direct_out = direct_out_enabled && out_clmem;
-    // y_fp16 only backs the non-direct output paths (SVM/host bounce).
+    // Any debug consumer of sc.y_fp16 must force the NON-direct path: under
+    // direct_out the GEMM stores into the output's planner sub-buffer and
+    // y_fp16 is never allocated, so the consumer silently observes nothing.
+    // Only NNTR_CLMEM_PROBE has such a consumer on this tree; the reference
+    // additionally lists NNTR_CLMEM_DUALOUT / _OUTCHECK / _OUTBAR /
+    // NNTR_V8C_TRACE -- extend this expression when porting any of them, or
+    // that instrument will observe the wrong buffer.
+    static const bool y_dbg_consumer =
+      std::getenv("NNTR_CLMEM_PROBE") != nullptr;
+    const bool direct_out = direct_out_enabled && out_clmem && !y_dbg_consumer;
+    // y_fp16 only backs the non-direct output paths (SVM/host bounce, plus the
+    // debug consumers forced here by y_dbg_consumer).
     if (!direct_out && !v8c_ensure_buf(ctx, &sc.y_fp16, &sc.y_fp16_bytes,
                                        sizeof(uint16_t) * (size_t)M_pad * N,
                                        CL_MEM_READ_WRITE))
@@ -1953,8 +1980,15 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       !out_clmem && output.getMemoryData() && output.getMemoryData()->isSVM() &&
       (output.getDataType() == ml::train::TensorDim::DataType::FP32 ||
        output.getDataType() == ml::train::TensorDim::DataType::FP16);
-    // NNTR_CLMEM_PROBE: capture the raw fp16 GEMM result for the gate/up/qkv
-    // FCs (sc.y_fp16 is cl_mem in BOTH modes -- directly comparable).
+    // NNTR_CLMEM_PROBE: capture the raw fp16 GEMM result for the qkv / o-proj /
+    // gate-up FCs. y_dbg_consumer above forces !direct_out whenever the probe
+    // is on, so sc.y_fp16 IS the buffer this GEMM just wrote for every output
+    // class -- which is what makes these hashes comparable between trees. It is
+    // NOT the buffer the model consumes under direct_out (there the GEMM stores
+    // into the planner sub-buffer), i.e. the probe changes the write path, and
+    // a hash taken here characterises the !direct_out path only.
+    // attention_out is in the filter because it is the o-projection FC -- the
+    // first plane observed to diverge, and previously uncovered.
     {
       static const bool probe_on = std::getenv("NNTR_CLMEM_PROBE") != nullptr;
       if (probe_on) {
@@ -1963,7 +1997,8 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
             on_.find("ffn_up") != std::string::npos ||
             on_.find("_wq") != std::string::npos ||
             on_.find("_wk") != std::string::npos ||
-            on_.find("_wv") != std::string::npos)
+            on_.find("_wv") != std::string::npos ||
+            on_.find("attention_out") != std::string::npos)
           clmem_probe_capture((on_ + ":y").c_str(), nullptr, sc.y_fp16,
                               (unsigned int)(sizeof(uint16_t) * (size_t)M * N));
       }

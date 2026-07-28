@@ -688,6 +688,42 @@ void MHACoreLayer::ensure_rope_flat_lut() {
  *         input[3] = cache_key   (B, 1, max_seq_len, num_heads_KV * head_dim)
  *         input[4] = cache_value (B, 1, max_seq_len, num_heads_KV * head_dim)
  */
+namespace {
+#if defined(ENABLE_OPENCL)
+/**
+ * @brief NNTR_CLMEM_PROBE: device-side snapshot of this layer's OWN output.
+ *
+ * mha_core is a HOST island whose inputs (q/k/v) and consumer (the
+ * o-projection FC) are device-resident, so it is the one op between a matching
+ * wq/wk/wv capture and a diverging residual-add capture that nothing observed.
+ * Capturing here from the DEVICE's point of view (cl_mem copy, or the SVM copy
+ * kernel for an SVM plane) separates "the host attention wrote the wrong
+ * bytes" from "the bytes were right and the o-projection read them wrong".
+ *
+ * @param name layer name (tagged "<name>:mha_out")
+ * @param out this layer's output tensor
+ * @param rows rows actually written by this call (step_size); the rest of the
+ *        plane is stale/engine-dependent and must not be hashed
+ */
+void mha_probe_capture_out(const std::string &name, nntrainer::Tensor &out,
+                           unsigned int rows) {
+  static const bool probe_on = std::getenv("NNTR_CLMEM_PROBE") != nullptr;
+  if (!probe_on || rows == 0)
+    return;
+  const size_t elem =
+    (out.getDataType() == ml::train::TensorDim::DataType::FP32) ? 4u : 2u;
+  const size_t bytes = (size_t)rows * out.getDim().width() * elem;
+  void *cl = out.isClMem() ? out.getClMem() : nullptr;
+  nntrainer::clmem_probe_capture((name + ":mha_out").c_str(),
+                                 out.getData<uint8_t>(), cl,
+                                 (unsigned int)bytes);
+}
+#else
+void mha_probe_capture_out(const std::string &, nntrainer::Tensor &,
+                           unsigned int) {}
+#endif
+} // namespace
+
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
   if (!use_external_cache) {
@@ -823,6 +859,8 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
         cache_value_dim, cache_value_step_dim);
     }
   }
+
+  mha_probe_capture_out(context.getName(), output, step_size);
 
   cache_index += step_size;
 }
@@ -988,6 +1026,8 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         cache_value_dim, cache_value_step_dim);
     }
   }
+
+  mha_probe_capture_out(context.getName(), output, step_size);
 
   // increase cache size
   cache_index += step_size;
