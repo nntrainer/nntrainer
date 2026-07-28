@@ -113,6 +113,12 @@ const std::map<std::string, ml::train::ISA> isa_str_map = {
   {"DEFAULT", ml::train::ISA::DEFAULT},
   {"X86", ml::train::ISA::X86},
   {"ARM", ml::train::ISA::ARM},
+  // Hexagon HTP q4x4x2 tile layout, for FC layers that will run on the cDSP
+  // (engine=cdsp / NNTR_USE_HEXAGON_CDSP). Not interchangeable with ARM/X86:
+  // a HEXAGON-quantized weight is unreadable by the NEON/AVX Q4_0 kernels and
+  // vice versa, so a model quantized this way must be run with the cDSP
+  // engine enabled.
+  {"HEXAGON", ml::train::ISA::HEXAGON},
 };
 
 /**
@@ -125,7 +131,7 @@ ml::train::ISA strToISA(const std::string &s) {
   auto it = isa_str_map.find(upper);
   if (it == isa_str_map.end()) {
     throw std::invalid_argument("Unsupported ISA: " + s +
-                                ". Supported: DEFAULT, X86, ARM");
+                                ". Supported: DEFAULT, X86, ARM, HEXAGON");
   }
   return it->second;
 }
@@ -412,7 +418,10 @@ void printUsage(const char *prog) {
     << "  --isa <arch>          Target instruction set architecture for "
        "quantized weights\n"
     << "                        (default: DEFAULT). Options: DEFAULT, X86, "
-       "ARM.\n"
+       "ARM,\n"
+    << "                        HEXAGON (q4x4x2, for FC layers run on the "
+       "Hexagon cDSP;\n"
+    << "                        requires the cdsp engine at inference time).\n"
     << "  --output_bin <name>   Output weight filename (auto-generated if "
        "omitted)\n"
     << "  --output_format <fmt> Output container: 'bin' (default) or "

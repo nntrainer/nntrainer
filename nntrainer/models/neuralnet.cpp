@@ -883,10 +883,11 @@ void NeuralNetwork::save(
     }
     if (any_quant)
       metadata["nntr_format"] = "nntr-safetensors-v1";
-    // Q4_0 is repacked into an ISA-specific layout (x86: q4_0x8, ARM: q4_0x4)
-    // that is indistinguishable from the header alone, so record which one was
-    // produced. DEFAULT resolves to the build platform's layout. Only emitted
-    // when a Q4_0 tensor is present, since no other type depends on the ISA.
+    // Q4_0 is repacked into an ISA-specific layout (x86: q4_0x8, ARM: q4_0x4,
+    // Hexagon cDSP: q4x4x2) that is indistinguishable from the header alone, so
+    // record which one was produced. DEFAULT resolves to the build platform's
+    // layout. Only emitted when a Q4_0 tensor is present, since no other type
+    // depends on the ISA.
     if (any_q4_0) {
       const char *isa_str;
       switch (target_isa) {
@@ -895,6 +896,12 @@ void NeuralNetwork::save(
         break;
       case ml::train::ISA::ARM:
         isa_str = "arm";
+        break;
+      case ml::train::ISA::HEXAGON:
+        // Previously fell through to `default:` and was tagged "arm" on an
+        // aarch64 host - actively misleading, since a q4x4x2 weight is exactly
+        // what an ARM-tagged file must NOT contain.
+        isa_str = "hexagon";
         break;
       default: // DEFAULT -> the compiled backend's layout
 #if defined(__aarch64__) || defined(__arm__)

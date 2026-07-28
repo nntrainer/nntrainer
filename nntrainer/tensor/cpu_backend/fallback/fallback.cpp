@@ -16,6 +16,7 @@
 #include <compute_ops.h>
 #include <fallback.h>
 #include <fallback_internal.h>
+#include <hexagon_repack.h>
 #include <nntrainer_error.h>
 
 namespace nntrainer {
@@ -298,6 +299,16 @@ void repack_q4_0(void *W, void *repacked_W, size_t data_size,
   switch (target) {
   case ml::train::ISA::ARM:
     return __fallback_repack_q4_0_to_q4_0_4(W, repacked_W, data_size, M, N);
+  case ml::train::ISA::HEXAGON:
+    // Without this case HEXAGON fell through to `default:` and dispatched to
+    // __fallback_repack_q4_0_to_q4_0_8 - which throws NYI, so the failure was
+    // loud rather than silent, but it was still the wrong target. Unlike its
+    // q4_0_4/q4_0_8 siblings the q4x4x2 repack is real (not NYI) and
+    // platform-independent, so the fallback backend can use the very same
+    // function arm/x86 use and all three agree.
+    // NB: first param is dst, second src (see fallback_internal.h; this
+    // function's own param names read backwards).
+    return repack_q4_0_to_htp_q4x4x2(W, repacked_W, data_size, M, N);
   case ml::train::ISA::X86:
   case ml::train::ISA::DEFAULT:
   default:
