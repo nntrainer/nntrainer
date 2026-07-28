@@ -243,6 +243,27 @@ Tensor CausalLM::buildLmHeadOutput(Tensor h, bool add_skip_prefill) {
     withKey("disable_bias", "true"),
     withKey("weight_dtype", LMHEAD_DTYPE),
   };
+  // The head must carry the graph's engine. It is the LAST node, so it reads
+  // output_norm's activation -- which, once the rest of the graph is
+  // engine-stamped (38de03c46 / 2c2b0d96e), lives on the gpu context's
+  // cl_mem/SVM plane. A host head reads the stale host shadow of that plane, so
+  // the logits are garbage and every model degenerates to one repeated token.
+  // Measured on this tree: unstamped gemma4 answered "<pad>"-class garbage at
+  // 0.23 TPS decode (a 262144-row QS4CX head on the host); stamped it answers
+  // "The capital of South Korea is **Seoul**." at 20.6 TPS.
+  // Both reachable types have a real gpu-context factory, so neither throws
+  // exception::not_supported from createLayer:
+  //   fully_connected     -> FullyConnectedLayerCl (cl_context.cpp
+  //                          add_default_object)
+  //   tie_word_embeddings -> TieWordEmbedding      (cl_context.cpp, gated on
+  //                          registerGeGLUClKernels; same class on
+  //                          cpu/gpu/cuda, it selects its Q6_K/Q4_0 GPU GEMV
+  //                          internally)
+  // "lm_head" (untied via config.json tie_word_embeddings=false, i.e. NOT
+  // LMHEAD_UNTIE) has NO gpu registration and stays unstamped -- no in-tree
+  // package reaches it, and stamping it would throw.
+  if (lmhead_type != "lm_head")
+    lmhead_prop.emplace_back(withKey("engine", causallm_engine()));
   if (add_skip_prefill)
     lmhead_prop.emplace_back(withKey("skip_prefill", "true"));
   if (TIE_WORD_EMBEDDINGS && !lmhead_untied)
