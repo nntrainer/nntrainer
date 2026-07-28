@@ -97,4 +97,4 @@ jobs:
         run: Get-ChildItem -Path build_cross\test\unittest -Recurse
 
       - name: Run Test Suite
-        run: meson test -C build_cross --no-rebuild
+        run: meson test -C build_cross --no-rebuild --print-errorlogs

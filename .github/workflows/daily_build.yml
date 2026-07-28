@@ -65,6 +65,6 @@ jobs:
             build
       - run: ninja -C build
       - name: run App Tests
-        run: meson test -C build --no-suite unittests
+        run: meson test -C build --no-suite unittests --print-errorlogs
       - name: run Unittests
-        run: meson test -C build --suite unittests
+        run: meson test -C build --suite unittests --print-errorlogs

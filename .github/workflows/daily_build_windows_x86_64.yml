@@ -30,4 +30,4 @@ jobs:
       - name: Run Build
         run: meson compile -C builddir
       - name: Run Test Suite
-        run: meson test -C builddir
+        run: meson test -C builddir --print-errorlogs
