@@ -99,13 +99,6 @@ bool run_case(const Case &c) {
   cpu_ops->quantize_q4_0(weight_fp32.data(), weight_q4_0.data(), c.N, c.K,
                           nullptr);
 
-  // Repack to the HTP q4x4x2 tile layout the bridge expects as input -
-  // this is what nntrainer's real quantize-time repack already does; here
-  // we do it inline since this tool starts from freshly quantized bytes.
-  std::vector<uint8_t> weight_htp(weight_q4_0.size());
-  nntrainer::repack_q4_0_to_htp_q4x4x2(weight_htp.data(), weight_q4_0.data(),
-                                        weight_q4_0.size(), c.N, c.K);
-
   // The CPU reference needs its OWN repack, to a DIFFERENT layout. Each
   // backend's gemm_q4_0_fp32 expects weights already in that backend's
   // interleaved format, not plain block_q4_0: on ARM it is
@@ -138,8 +131,12 @@ bool run_case(const Case &c) {
     return false;
   }
 
+  // Feed the accel path the *ARM* weight, same as the real FC layer does.
+  // HexagonComputeOps now owns the q4_0x4 -> plain -> q4x4x2 conversion and
+  // uploads the result to the DSP once, so this tool exercises that path too
+  // rather than pre-converting behind its back.
   try {
-    hexagon_ops->gemm_q4_0_accel_fp32(weight_htp.data(), act.data(),
+    hexagon_ops->gemm_q4_0_accel_fp32(weight_cpu.data(), act.data(),
                                        hexagon_out.data(), c.M, c.N, c.K);
   } catch (const std::exception &e) {
     std::printf("  Hexagon bridge threw: %s\n", e.what());

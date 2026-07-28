@@ -46,12 +46,16 @@
 
 #include <compute_ops.h>
 #include <hexagon_compute_ops.h>
+#include <hexagon_repack.h>
 
 #include <dlfcn.h>
 
+#include <cstdint>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
+#include <vector>
 
 namespace nntrainer {
 
@@ -60,15 +64,22 @@ namespace {
 using nntr_htp_bridge_gemm_q4_0_fn = int (*)(const void *, const float *,
                                               float *, unsigned int,
                                               unsigned int, unsigned int);
+using nntr_htp_bridge_upload_fn = int (*)(const void *, const void *,
+                                           unsigned int, unsigned int);
+
+struct BridgeApi {
+  nntr_htp_bridge_upload_fn upload = nullptr;
+  nntr_htp_bridge_gemm_q4_0_fn gemm = nullptr;
+};
 
 /**
- * @brief Lazily dlopen libggml-hexagon.so and dlsym the bridge entry point.
+ * @brief Lazily dlopen libggml-hexagon.so and dlsym the bridge entry points.
  * Cached for the process lifetime - dlopen/dlsym cost is not worth paying
  * per GEMM call, and ggml-hexagon's own session (kept alive across calls on
  * its side) already assumes one long-lived library handle.
  */
-nntr_htp_bridge_gemm_q4_0_fn get_bridge_fn() {
-  static nntr_htp_bridge_gemm_q4_0_fn fn = [] {
+const BridgeApi &get_bridge_api() {
+  static BridgeApi api = [] {
     void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
     if (!handle) {
       std::ostringstream oss;
@@ -77,18 +88,25 @@ nntr_htp_bridge_gemm_q4_0_fn get_bridge_fn() {
       throw std::runtime_error(oss.str());
     }
 
-    void *sym = dlsym(handle, "nntr_htp_bridge_gemm_q4_0");
-    if (!sym) {
-      std::ostringstream oss;
-      oss << "HexagonComputeOps: dlsym(nntr_htp_bridge_gemm_q4_0) failed: "
-          << dlerror();
-      throw std::runtime_error(oss.str());
-    }
+    auto sym = [handle](const char *name) {
+      void *s = dlsym(handle, name);
+      if (!s) {
+        std::ostringstream oss;
+        oss << "HexagonComputeOps: dlsym(" << name << ") failed: " << dlerror();
+        throw std::runtime_error(oss.str());
+      }
+      return s;
+    };
 
-    return reinterpret_cast<nntr_htp_bridge_gemm_q4_0_fn>(sym);
+    BridgeApi a;
+    a.upload = reinterpret_cast<nntr_htp_bridge_upload_fn>(
+      sym("nntr_htp_bridge_upload_weight_q4x4x2"));
+    a.gemm = reinterpret_cast<nntr_htp_bridge_gemm_q4_0_fn>(
+      sym("nntr_htp_bridge_gemm_q4_0"));
+    return a;
   }();
 
-  return fn;
+  return api;
 }
 
 } // namespace
@@ -96,30 +114,73 @@ nntr_htp_bridge_gemm_q4_0_fn get_bridge_fn() {
 class HexagonComputeOps : public ComputeOps {
 public:
   bool supports_gemm_q4_0_accel_fp32() const override { return true; }
-  // 1, not the default 2: the weights this context sees are in the HTP
-  // q4x4x2 layout, which the CPU gemm_q4_0_fp32/GEMV kernels cannot read
-  // (they expect q4_0x4 on ARM / q4_0x8 on x86). So for M == 1 there is no
-  // correct CPU fallback to drop to - taking it would silently emit garbage
-  // for every decode token. Note this means decode runs on the DSP's HVX
-  // path, not HMX: htp/matmul-ops.c only engages HMX at M >= 32
-  // (m_hmx = M & ~31), so expect per-op FastRPC latency to dominate here
-  // until the bridge batches ops and stops re-uploading weights per call.
-  unsigned int gemm_q4_0_accel_min_rows() const override { return 1; }
+
+  /**
+   * @brief 32 rows, matching the DSP's own HMX gate.
+   *
+   * htp/matmul-ops.c computes m_hmx = M & ~31 and drops to the HVX kernel when
+   * that is zero, so below M == 32 the systolic array never engages and the DSP
+   * is doing wide-SIMD work no better than ARM's - while still paying a FastRPC
+   * round trip per op. Measured on an 8 Elite (v79) with Qwen3-0.6B, this is not
+   * marginal: ggml-hexagon's own mature backend (full graph scheduler, op
+   * batching, weights resident from load) decodes at 34.6 tok/s against 158.9 on
+   * 4 CPU threads - 4.6x slower. Decode is GEMV, i.e. bandwidth-bound, and the
+   * DSP has no bandwidth advantage. That same backend is 1.41x faster than CPU
+   * at a 90-token prefill and 3.58x faster at 512 tokens, because HMX scales
+   * with M while CPU attention is O(n^2).
+   *
+   * So the split is: prefill on the DSP, decode on the CPU. Threshold 32 puts it
+   * exactly where the hardware itself switches kernels.
+   */
+  unsigned int gemm_q4_0_accel_min_rows() const override { return 32; }
+
   void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata, float *matCdata,
                             unsigned int M, unsigned int N,
                             unsigned int K) override {
     static std::mutex bridge_init_mutex;
-    nntr_htp_bridge_gemm_q4_0_fn fn;
+    const BridgeApi *api;
     {
-      // get_bridge_fn()'s static-local init is already thread-safe (C++11
+      // get_bridge_api()'s static-local init is already thread-safe (C++11
       // magic statics); the mutex here only serializes the dlopen/dlsym
       // path itself against concurrent first-callers so a failed attempt
       // from one thread can't race a second attempt from another.
       std::lock_guard<std::mutex> lock(bridge_init_mutex);
-      fn = get_bridge_fn();
+      api = &get_bridge_api();
     }
 
-    int rc = fn(matAdata, matBdata, matCdata, M, N, K);
+    // matAdata is in the *ARM* q4_0x4 layout, because the CPU kernels still read
+    // these same bytes for every decode step (M < 32, see
+    // gemm_q4_0_accel_min_rows). The DSP needs q4x4x2, so convert on first
+    // sight only: q4_0x4 -> plain block_q4_0 -> q4x4x2, then hand the result to
+    // the bridge, which copies it into a persistent rpcmem arena keyed on
+    // matAdata. All three layouts are 9K/16 bytes per row, so the scratches are
+    // exactly one weight each and get reused across weights - peak extra host
+    // memory is 2x the largest FC weight, not 2x the model.
+    //
+    // This is what lets the model .bin stay in its ordinary ARM layout: the
+    // q4x4x2 copy exists only in rpcmem, derived at load, and no
+    // Hexagon-specific weight file is needed.
+    if (uploaded_.find(matAdata) == uploaded_.end()) {
+      const size_t nbytes = (size_t)N * ((size_t)K / 32) * 18;
+
+      if (unpack_scratch_.size() < nbytes) {
+        unpack_scratch_.resize(nbytes);
+        htp_scratch_.resize(nbytes);
+      }
+
+      cpu_->unpack_q4_0(matAdata, unpack_scratch_.data(), nbytes, N, K);
+      repack_q4_0_to_htp_q4x4x2(htp_scratch_.data(), unpack_scratch_.data(),
+                                nbytes, N, K);
+
+      if (api->upload(matAdata, htp_scratch_.data(), N, K) != 0) {
+        throw std::runtime_error(
+          "HexagonComputeOps::gemm_q4_0_accel_fp32: "
+          "nntr_htp_bridge_upload_weight_q4x4x2 failed (see log for details)");
+      }
+      uploaded_.insert(matAdata);
+    }
+
+    int rc = api->gemm(matAdata, matBdata, matCdata, M, N, K);
     if (rc != 0) {
       throw std::runtime_error(
         "HexagonComputeOps::gemm_q4_0_accel_fp32: "
@@ -571,6 +632,17 @@ public:
 
 private:
   ComputeOps *cpu_ = get_cpu_ops();
+
+  // Weights already converted and uploaded to the DSP, keyed on the ARM-layout
+  // weight pointer. nntrainer allocates its weight pool once with
+  // MAX_LIFESPAN, so these addresses are stable for the process lifetime.
+  // Mirrors the bridge's own map (which is the real source of truth) purely so
+  // we can skip the unpack/repack work when it would be discarded anyway.
+  std::unordered_set<const void *> uploaded_;
+
+  // Reused across weights; sized to the largest seen so far.
+  std::vector<uint8_t> unpack_scratch_;
+  std::vector<uint8_t> htp_scratch_;
 };
 
 ComputeOps *get_hexagon_ops() {
