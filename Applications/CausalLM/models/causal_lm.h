@@ -233,6 +233,35 @@ protected:
   virtual void allocateAndBindKVCache();
 
   /**
+   * @brief Same contract as NeuralNetwork::incremental_inference(float* ...),
+   *        except that an input whose raw pointer belongs to a KVCacheManager
+   *        cache tensor is fed as the REAL tensor (sharing its MemoryData) so
+   *        that isSVM(), set when the cache comes from the gpu-svm MemoryPool,
+   *        survives the per-call fillPlaceholder()/syncDependents().
+   *
+   * A fresh Tensor::Map of the same host pointer builds a brand-new
+   * MemoryData with svm_allocation=false; fillPlaceholder() then installs
+   * that MemoryData on the placeholder and propagates it to every dependent
+   * view (mha_core's cache_k/cache_v views are dependents of the input
+   * placeholder). mha_core gates its whole GPU/flash attention chain on
+   * `svm_ok` = q && k && v && o all isSVM(), so the clobbered flag silently
+   * drops attention onto the host GEMM, which then reads a device-written
+   * K/V plane through host pointers.
+   *
+   * @param batch_size batch size
+   * @param input input buffers, in getInputDimension() order
+   * @param init_seq_len initial sequence length
+   * @param from start position of this step
+   * @param to end position of this step
+   * @return newly allocated host buffers holding the model outputs; the
+   *         caller owns them (delete[]), exactly as with the base API.
+   */
+  std::vector<float *> incrementalInference(unsigned int batch_size,
+                                            const std::vector<float *> &input,
+                                            unsigned int init_seq_len,
+                                            unsigned int from, unsigned int to);
+
+  /**
    * @brief Reset all mha_core layers' cache_index to @p pos and the
    *        KVCacheManager's tracked write position.
    */
