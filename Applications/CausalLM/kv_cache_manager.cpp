@@ -12,7 +12,15 @@
 
 #include "kv_cache_manager.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
+
+#include <basic_planner.h>
+#include <engine.h>
+#include <llm_util.hpp> // causallm_engine() - the RESOLVED engine name
+#include <mem_allocator.h>
 
 namespace causallm {
 
@@ -63,6 +71,104 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   cache_pos_ = 0;
 
   layer_caches_.resize(num_layers);
+
+  // GPU-resident KV cache: when this model's engine has an allocator that can
+  // hand its pointers to an OpenCL kernel, allocate the per-layer K/V out of a
+  // MemoryPool on that allocator so their MemoryData reports isSVM()=true.
+  // NNTR_GPU_SVM_POOL=0 reverts to the host cache for A/B.
+  //
+  // This is NOT an optimisation, it is a correctness precondition. mha_core
+  // gates its whole GPU attention chain on `svm_ok` (every one of q/k/v/o
+  // SVM-resident); with a plain-host cache that gate can never pass, so
+  // attention always falls to the host GEMM -- and the host GEMM reads the
+  // cache through host pointers while the K/V *producers* (the wk/wv FC
+  // outputs, class GPU_CLMEM once any node is engine-stamped) write on the
+  // device. The result is a coherent-looking but stale KV plane.
+  //
+  // The plane is chosen by CAPABILITY, never by backend name. MemAllocator::
+  // isSVM() is the predicate core itself uses for exactly this question
+  // (memory_pool.cpp stamps residency with allocator_->isSVM()), and its
+  // contract is narrower than "unified memory": it means "this pointer may be
+  // handed to an OpenCL kernel via clSetKernelArgSVMPointer" -- which is
+  // precisely what mha_core's svm_ok gate requires. So:
+  //   * ClSVMAllocator derives true (host-addressable && device-visible), and
+  //     its own comment records that this is what replaced the former
+  //     getName()=="gpu-svm" test. The gpu engine therefore selects the same
+  //     allocator object it selected before, and the measured
+  //     svm(q/k/v/o) 1001 -> 1111 result is preserved by construction.
+  //   * CudaMemAllocator overrides isSVM() to false on purpose even though
+  //     CUDA UVM is host-coherent, so engine=cuda keeps the host cache without
+  //     this file ever spelling "cuda".
+  //   * the plain host MemAllocator is not device-visible, so engine=cpu keeps
+  //     the host cache for the same structural reason.
+  //   * any future backend answers for itself instead of being enumerated
+  //     here, which is what makes this win portable rather than OpenCL-only.
+  //
+  // The engine name is the RESOLVED one from causallm_engine() -- the same
+  // value every node's engine= property carries -- not a raw getenv, so the
+  // cache plane cannot disagree with the graph the caches are attached to
+  // (a raw NNTR_ENGINE read also treats "gpu on a build without OpenCL" as
+  // gpu, which the resolver refuses loudly).
+  std::shared_ptr<nntrainer::MemAllocator> svm_alloc;
+  const char *_svm_pool_env = std::getenv("NNTR_GPU_SVM_POOL");
+  const bool svm_pool_on = !_svm_pool_env || std::atoi(_svm_pool_env) != 0;
+  if (svm_pool_on) {
+    const std::string engine = causallm_engine();
+    auto allocs = nntrainer::Engine::Global().getAllocators();
+    auto it = allocs.find(engine);
+    if (it != allocs.end() && it->second && it->second->isSVM())
+      svm_alloc = it->second;
+
+    if (std::getenv("NNTR_KVSVM_TRACE")) {
+      std::fprintf(
+        stderr,
+        "[kvsvm] engine=%s allocators=%zu found=%d name=%s "
+        "isSVM=%d selected=%d\n",
+        engine.c_str(), allocs.size(), (int)(it != allocs.end()),
+        (it != allocs.end() && it->second) ? it->second->getName().c_str()
+                                           : "(none)",
+        (int)(it != allocs.end() && it->second && it->second->isSVM()),
+        (int)(svm_alloc != nullptr));
+      for (auto &kv : allocs)
+        std::fprintf(stderr, "[kvsvm]   key=%s name=%s isSVM=%d\n",
+                     kv.first.c_str(),
+                     kv.second ? kv.second->getName().c_str() : "(null)",
+                     (int)(kv.second && kv.second->isSVM()));
+      std::fflush(stderr);
+    }
+  }
+
+  const size_t elem_size =
+    (dtype == ml::train::TensorDim::DataType::FP16) ? 2u : 4u;
+
+  if (svm_alloc) {
+    svm_pool_ = std::make_shared<nntrainer::MemoryPool>(svm_alloc);
+    std::vector<unsigned int> tokens;
+    tokens.reserve((size_t)num_layers * 2);
+    // All caches are live for the whole run; BasicPlanner gives each its own
+    // (non-overlapping) region so the total pool is the sum of them.
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      const size_t bytes =
+        (size_t)batch_size * max_seq_len * kv_widths_[i] * elem_size;
+      tokens.push_back(svm_pool_->requestMemory(bytes, 1, 2)); // key
+      tokens.push_back(svm_pool_->requestMemory(bytes, 1, 2)); // value
+    }
+    svm_pool_->planLayout(nntrainer::BasicPlanner());
+    svm_pool_->allocate();
+
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      ml::train::TensorDim cache_dim(
+        {batch_size, 1, max_seq_len, kv_widths_[i]}, {format, dtype});
+      layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
+      layer_caches_[i].key_cache.setData(svm_pool_->getMemory(tokens[2 * i]), 0,
+                                         false);
+      layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
+      layer_caches_[i].value_cache.setData(
+        svm_pool_->getMemory(tokens[2 * i + 1]), 0, false);
+    }
+    return;
+  }
+
   for (unsigned int i = 0; i < num_layers; ++i) {
     ml::train::TensorDim cache_dim({batch_size, 1, max_seq_len, kv_widths_[i]},
                                    {format, dtype});
