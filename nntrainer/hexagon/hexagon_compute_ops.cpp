@@ -123,52 +123,55 @@ public:
   bool supports_gemm_q4_0_accel_fp32() const override { return true; }
 
   /**
-   * @brief Rows of activation below which the CPU kernel wins outright.
+   * @brief Rows of activation at or above which the Q4_0 GEMM goes to the cDSP.
    *
-   * Two different thresholds matter here and they are far apart.
+   * Currently 1, i.e. *everything* including decode is offloaded. This is a
+   * deliberate configuration choice, not the throughput-optimal setting - see
+   * the numbers below before changing it, and prefer the
+   * NNTR_HEXAGON_MIN_ROWS env var over editing this default.
    *
-   * The DSP switches kernels at 32: htp/matmul-ops.c computes m_hmx = M & ~31
-   * and falls back to HVX when that is zero, so below 32 rows the systolic array
-   * never engages. That is the floor below which offloading can never pay.
+   * Three regimes, measured on an 8 Elite (v79) with Qwen3-0.6B Q4_0, 4 threads:
    *
-   * But our own crossover is much higher, because prefill is still dispatch
-   * bound - one blocking flush per GEMM, 196 per forward pass, so wall time is
-   * nearly independent of M. Measured on an 8 Elite (v79), Qwen3-0.6B Q4_0,
-   * 4 threads, prefill throughput as NPU/CPU:
+   *   M == 1 (decode). DSP ~25 tok/s vs ~88 on CPU, so ~3.5x slower. Decode is
+   *   GEMV and bandwidth-bound; the DSP has no bandwidth advantage over the CPU
+   *   and adds a FastRPC round trip per op. This is not a gap we can close by
+   *   tuning: ggml-hexagon's own mature backend - full graph scheduler, op
+   *   batching, weights resident in rpcmem from load - decodes at 34.6 tok/s
+   *   against 158.9 on CPU, i.e. 4.6x slower.
    *
-   *   tokens   79    157   196   235   274   313   391
-   *   ratio   0.64  0.86  0.93  1.14  1.06  1.19  1.19
+   *   1 < M < ~215. Above 32 the DSP's HMX array engages (htp/matmul-ops.c:
+   *   m_hmx = M & ~31, HVX below that), but our prefill is still dispatch bound
+   *   - one blocking flush per GEMM, 196 per forward pass - so wall time is
+   *   nearly independent of M and the CPU still wins. Swept NPU/CPU prefill:
    *
-   * so the real crossover sits around 215 rows. 256 is the round number safely
-   * past it given run-to-run noise; picking 32 here would make short prompts
-   * measurably *slower* than plain CPU (0.64x at 79 rows).
+   *     tokens   79    157   196   235   274   313   391
+   *     ratio   0.64  0.86  0.93  1.14  1.06  1.19  1.19
    *
-   * Override with NNTR_HEXAGON_MIN_ROWS to re-tune without a rebuild. Once op
-   * batching lands (gemm_q4_0_batch_fp32, collapsing Q/K/V and gate/up into one
-   * submission each) the dispatch floor drops and this should approach 32.
+   *   M >= ~215. The DSP wins and keeps pulling ahead, because HMX scales with
+   *   M while CPU attention is O(n^2). The reference backend goes from 1.41x CPU
+   *   at 90 tokens to 3.58x at 512.
    *
-   * Decode (M == 1) therefore always takes the CPU path, which is correct on the
-   * merits and not just a fallback: ggml-hexagon's own mature backend - full
-   * graph scheduler, op batching, weights resident in rpcmem from load - decodes
-   * Qwen3-0.6B at 34.6 tok/s against 158.9 on 4 CPU threads. Decode is GEMV and
-   * bandwidth-bound; the DSP has no bandwidth advantage and adds a FastRPC round
-   * trip. Prefill is the opposite, which is why that same backend goes from
-   * 1.41x CPU at 90 tokens to 3.58x at 512.
+   * So 256 is the throughput-optimal default (never a loss versus CPU), 1
+   * maximises DSP coverage, and 32 becomes reasonable once op batching lands
+   * (gemm_q4_0_batch_fp32 collapsing Q/K/V and gate/up into one submission each)
+   * and the dispatch floor drops.
+   *
+   * Note the weights arriving here are ARM q4_0x4 either way; the q4x4x2 copy in
+   * the DSP arena is derived on first use. So flipping this threshold needs no
+   * requantization and no rebuild - both paths stay correct at any value.
    */
   unsigned int gemm_q4_0_accel_min_rows() const override {
     static const unsigned int min_rows = [] {
       if (const char *env = std::getenv("NNTR_HEXAGON_MIN_ROWS")) {
-        // 0 or garbage would disable the guard entirely and send decode to the
-        // DSP, so clamp to the hardware floor rather than trusting the value.
         unsigned long v = std::strtoul(env, nullptr, 10);
-        if (v >= 32) {
+        if (v >= 1) {
           return (unsigned int)v;
         }
-        ml_logw("NNTR_HEXAGON_MIN_ROWS=%s ignored (must be >= 32, the DSP's own "
-                "HMX gate); using 256",
+        ml_logw("NNTR_HEXAGON_MIN_ROWS=%s ignored (must be >= 1); using default",
                 env);
       }
-      return 256u;
+      // 1 == offload everything, decode included. See the comment above.
+      return 1u;
     }();
     return min_rows;
   }
