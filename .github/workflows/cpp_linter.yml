@@ -11,6 +11,13 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: check whitespace errors on changed lines
+        run: |
+          echo "Checking whitespace errors on changed lines"
+          git diff --check ${{ github.event.pull_request.base.sha }}...HEAD \
+            -- . ':(exclude).github' ':(exclude)Applications/CausalLM/third_party'
       - name: install dev packages
         run: |
           echo "Install mandatory dev packages to avoid false-positive reports from cpp-linter"
