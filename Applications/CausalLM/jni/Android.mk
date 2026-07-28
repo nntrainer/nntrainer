@@ -24,6 +24,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
+    $(LOCAL_PATH)/../models/gemma2 \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/bert \
     $(LOCAL_PATH)/../models/timm_vit \
@@ -96,6 +97,7 @@ LOCAL_SRC_FILES := \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
+    ../models/gemma2/gemma2_causallm.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
@@ -209,6 +211,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
+    ../models/gemma2/gemma2_causallm.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
@@ -235,6 +238,7 @@ LOCAL_C_INCLUDES += \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
+    $(LOCAL_PATH)/../models/gemma2 \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/bert \
     $(LOCAL_PATH)/../models/deberta_v2 \
@@ -288,6 +292,7 @@ LOCAL_LDLIBS := -llog -landroid
 UNITTEST_MODELS_DIR := ../../../test/unittest/models
 LOCAL_SRC_FILES := \
     $(UNITTEST_MODELS_DIR)/causallm_test_utils.cpp \
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_gemma2.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_gemma3.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_gemma3_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_gemma4.cpp \
