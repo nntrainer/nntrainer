@@ -1834,14 +1834,17 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
         for (unsigned int g = 0; g < groups; ++g) {
           TensorDim ing_dim({1, icg, in_dim.height(), in_dim.width()});
           ing_dim.setDataType(in_dt);
+          ing_dim.setFormat(in_sub.getFormat());
           Tensor in_g =
             in_sub.getSharedDataTensor(ing_dim, (size_t)g * icg * ihw);
           TensorDim filtg_dim({ocg, (size_t)icg * fh * fw});
           filtg_dim.setDataType(filt_dt);
+          filtg_dim.setFormat(filter_kernel.getFormat());
           Tensor filt_g = filter_kernel.getSharedDataTensor(
             filtg_dim, (size_t)g * ocg * icg * fh * fw);
           TensorDim outg_dim({ocg, owoh});
           outg_dim.setDataType(out_dt);
+          outg_dim.setFormat(out.getFormat());
           Tensor out_g =
             out.getSharedDataTensor(outg_dim, (size_t)g * ocg * owoh);
           result.setZero();

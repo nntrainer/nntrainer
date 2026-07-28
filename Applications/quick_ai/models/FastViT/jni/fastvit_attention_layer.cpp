@@ -34,7 +34,8 @@ void FastViTAttentionLayer::finalize(nntrainer::InitLayerContext &context) {
   head_dim_ = C / num_heads_;
 
   nntrainer::TensorDim out_dim(in_dim.batch(), C, in_dim.height(),
-                               in_dim.width());
+                               in_dim.width(), in_dim.getFormat(),
+                               in_dim.getDataType());
   context.setOutputDimensions({out_dim});
 }
 
@@ -53,10 +54,35 @@ void FastViTAttentionLayer::forwarding(nntrainer::RunLayerContext &context,
   int head_dim = C / num_heads; // 32
   float scale = 1.0f / std::sqrt((float)head_dim);
 
-  const float *in_data = in.getData();
-  float *out_data = out.getData();
+  // The attention computation assumes NCHW memory layout.
+  // If the tensor is NHWC, convert to NCHW first, then back.
+  if (in_dim.getFormat() == nntrainer::TensorDim::Format::NHWC) {
+    nntrainer::Tensor in_nchw(
+      in_dim.batch(), in_dim.channel(), in_dim.height(), in_dim.width(),
+      nntrainer::TensorDim::Format::NCHW, in_dim.getDataType());
+    in_nchw.copyData(in);
 
-  multiHeadAttention(in_data, out_data, B, C, H, W, num_heads, head_dim, scale);
+    nntrainer::Tensor &out_ref = context.getOutput(0);
+    nntrainer::Tensor out_nchw(
+      out_ref.getDim().batch(), out_ref.getDim().channel(),
+      out_ref.getDim().height(), out_ref.getDim().width(),
+      nntrainer::TensorDim::Format::NCHW, out_ref.getDim().getDataType());
+
+    const float *in_data = in_nchw.getData();
+    float *out_data = out_nchw.getData();
+
+    multiHeadAttention(in_data, out_data, B, C, H, W, num_heads, head_dim,
+                       scale);
+
+    // Copy back to NHWC output
+    out_ref.copyData(out_nchw);
+  } else {
+    const float *in_data = in.getData();
+    float *out_data = out.getData();
+
+    multiHeadAttention(in_data, out_data, B, C, H, W, num_heads, head_dim,
+                       scale);
+  }
 }
 
 void FastViTAttentionLayer::multiHeadAttention(const float *qkv, float *out,

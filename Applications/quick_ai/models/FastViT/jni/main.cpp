@@ -7,9 +7,9 @@
  * @brief  FastViT-S12 backbone inference example on nntrainer.
  *
  * Builds the general FastViT-S12 backbone (stem + 4 stages + final_conv),
- * loads converted weights, runs one forward pass, and outputs the [1,1024,10,10]
- * feature map. When FASTVIT_VERIFY=1 (or KEYWORD_VERIFY=1), compares the
- * backbone output against a PyTorch reference .bin file.
+ * loads converted weights, runs one forward pass, and outputs the
+ * [1,1024,10,10] feature map. When FASTVIT_VERIFY=1 (or KEYWORD_VERIFY=1),
+ * compares the backbone output against a PyTorch reference .bin file.
  *
  * Usage: fastvit_backbone_infer [RES_DIR] [INPUT_BIN]
  *   RES_DIR   dir with weights/ and input bins
@@ -115,12 +115,59 @@ int main(int argc, char *argv[]) {
       ml::train::createModel(ml::train::ModelType::NEURAL_NET);
     model->setProperty({nntrainer::withKey("batch_size", "1")});
 
+    // --- Tensor type / quantization presets ---
+    bool preset_nhwc = false;
+    bool preset_q40 = false;
+    if (const char *tt = std::getenv("FASTVIT_TENSOR_TYPE")) {
+      std::string tts = tt;
+      if (tts == "w8a8" || tts == "W8A8") {
+        // W8A8: int8-resident activations between conv layers.
+        // Uses FP32-FP32 model_tensor_type (no FP16 dependency) with
+        // NNTR_W8A8 env flag enabling per-tensor int8 activation quantization.
+        // NNTR_W8A8_FP32W: keep conv weights FP32 in the file and let the
+        // per-channel path quantize them at load time (best accuracy).
+        setenv("NNTR_W8A8", "1", 1);
+        model->setProperty(
+          {nntrainer::withKey("model_tensor_type", "FP32-FP32")});
+        preset_nhwc = true;
+        preset_q40 = true;
+        const bool w8a8_fp32w = std::getenv("NNTR_W8A8_FP32W") != nullptr;
+        if (w8a8_fp32w) {
+          fastvit::quantWeightDtype() = "FP32";
+          std::cout << "[FastViT] Preset = w8a8 (FP32 weights, load-time "
+                       "per-channel int8 + int8 act + NHWC)"
+                    << std::endl;
+        } else {
+          fastvit::quantWeightDtype() = "Q8_0";
+          std::cout
+            << "[FastViT] Preset = w8a8 (Q8_0 weights + int8 act + NHWC)"
+            << std::endl;
+        }
+      } else if (tts == "w8a32" || tts == "W8A32") {
+        model->setProperty(
+          {nntrainer::withKey("model_tensor_type", "FP32-FP32")});
+        preset_nhwc = true;
+        preset_q40 = true;
+        fastvit::quantWeightDtype() = "Q8_0";
+        std::cout << "[FastViT] Preset = w8a32 (Q8_0 weights + FP32 act + NHWC)"
+                  << std::endl;
+      } else {
+        model->setProperty({nntrainer::withKey("model_tensor_type", tts)});
+        std::cout << "[FastViT] model_tensor_type = " << tts << std::endl;
+      }
+    }
+
+    if (preset_nhwc || std::getenv("FASTVIT_NHWC")) {
+      model->setProperty({nntrainer::withKey("tensor_format", "NHWC")});
+      std::cout << "[FastViT] tensor_format = NHWC" << std::endl;
+    }
+
     auto x = Tensor(ml::train::TensorDim(1, 3, imgsz, imgsz,
                                          ml::train::TensorDim::Format::NCHW,
                                          ml::train::TensorDim::DataType::FP32),
                     "input0");
 
-    auto backbone_out = fastvit::buildBackbone(x);
+    auto backbone_out = fastvit::buildBackbone(x, preset_q40);
 
     if (int ret = model->compile(x, {backbone_out},
                                  ml::train::ExecutionMode::INFERENCE))
@@ -163,12 +210,13 @@ int main(int argc, char *argv[]) {
     const float *feat = outs[0];
     size_t feat_n = 1024 * 10 * 10;
     std::cout << "\n[Backbone feature] shape=[1,1024,10,10]"
-              << " mean=" << [&] {
-                   double s = 0.0;
-                   for (size_t i = 0; i < feat_n; ++i)
-                     s += feat[i];
-                   return s / feat_n;
-                 }() << std::endl;
+              << " mean=" <<
+      [&] {
+        double s = 0.0;
+        for (size_t i = 0; i < feat_n; ++i)
+          s += feat[i];
+        return s / feat_n;
+      }() << std::endl;
 
     // Verification
 
