@@ -200,6 +200,17 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
     cfg.contains("rms_norm_eps") ? cfg["rms_norm_eps"].get<float>() : 1e-5;
   GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
 
+  // Attention-logit soft-capping (Gemma family). Parsed here -- the one
+  // setupParameters the base constructors provably reach -- so it cannot be
+  // stranded in a derived override that never runs. Gated on cfg presence, so
+  // a model without the key keeps the 0.0f default (no soft-cap). Consolidated
+  // from the per-model setupParameters (gemma3/gemma4 held byte-identical
+  // copies of this block).
+  if (cfg.contains("attn_logit_softcapping") &&
+      !cfg["attn_logit_softcapping"].is_null()) {
+    ATTN_LOGIT_SOFTCAPPING = cfg["attn_logit_softcapping"].get<float>();
+  }
+
   return;
 };
 
