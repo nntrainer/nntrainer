@@ -250,6 +250,18 @@ public:
 
 private:
   /**
+   * @brief [kv-window-ring] One-time witness of the rows actually allocated
+   *        vs the full-max_seq baseline. Emitted from BOTH allocate() branches
+   *        (SVM pool and host) so a measurement can never assume the ring
+   *        engaged on the branch it happens to be running.
+   * @param where "svm-pool" or "host" -- which allocate() branch produced it
+   */
+  void reportWindowRing(unsigned int num_layers, unsigned int batch_size,
+                        unsigned int max_seq_len,
+                        ml::train::TensorDim::DataType dtype,
+                        const char *where);
+
+  /**
    * @brief Per-layer cache storage
    */
   struct LayerCache {

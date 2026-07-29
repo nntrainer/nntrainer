@@ -147,9 +147,17 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     tokens.reserve((size_t)num_layers * 2);
     // All caches are live for the whole run; BasicPlanner gives each its own
     // (non-overlapping) region so the total pool is the sum of them.
+    //
+    // [kv-window-ring] The row count is getLayerCap(i), NOT max_seq_len --
+    // exactly as in the host branch below. This path did not exist when the
+    // ring was written, so it used to size every layer at max_seq while
+    // Transformer::createKVCachePlaceholders shaped the sliding layers at
+    // Wcap; on the default GPU lane (NNTR_GPU_SVM_POOL=1) the bind then threw
+    // "allocateAndBindKVCache: shape mismatch for layer 0
+    //  (k placeholder 1:1:3072:256 vs cache 1:1:32768:256)".
     for (unsigned int i = 0; i < num_layers; ++i) {
       const size_t bytes =
-        (size_t)batch_size * max_seq_len * kv_widths_[i] * elem_size;
+        (size_t)batch_size * getLayerCap(i) * kv_widths_[i] * elem_size;
       tokens.push_back(svm_pool_->requestMemory(bytes, 1, 2)); // key
       tokens.push_back(svm_pool_->requestMemory(bytes, 1, 2)); // value
     }
@@ -158,7 +166,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
 
     for (unsigned int i = 0; i < num_layers; ++i) {
       ml::train::TensorDim cache_dim(
-        {batch_size, 1, max_seq_len, kv_widths_[i]}, {format, dtype});
+        {batch_size, 1, getLayerCap(i), kv_widths_[i]}, {format, dtype});
       layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
       layer_caches_[i].key_cache.setData(svm_pool_->getMemory(tokens[2 * i]), 0,
                                          false);
@@ -166,6 +174,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
       layer_caches_[i].value_cache.setData(
         svm_pool_->getMemory(tokens[2 * i + 1]), 0, false);
     }
+    reportWindowRing(num_layers, batch_size, max_seq_len, dtype, "svm-pool");
     return;
   }
 
@@ -179,6 +188,14 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
   }
 
+  reportWindowRing(num_layers, batch_size, max_seq_len, dtype, "host");
+}
+
+void KVCacheManager::reportWindowRing(unsigned int num_layers,
+                                      unsigned int batch_size,
+                                      unsigned int max_seq_len,
+                                      ml::train::TensorDim::DataType dtype,
+                                      const char *where) {
   {
     // one-time memory witness, only when the ring engaged:
     // KV rows actually allocated vs the full-max_seq baseline.
@@ -197,9 +214,9 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
         bytes += (size_t)batch_size * getLayerCap(i) * kv_widths_[i] * es * 2u;
       }
       std::fprintf(stderr,
-                   "[kvcache] window-ring: %u layers, KV rows %zu (vs %zu "
+                   "[kvcache] window-ring (%s): %u layers, KV rows %zu (vs %zu "
                    "full), %.1f MB\n",
-                   num_layers, rows, (size_t)num_layers * max_seq_len,
+                   where, num_layers, rows, (size_t)num_layers * max_seq_len,
                    bytes / (1024.0 * 1024.0));
       std::fflush(stderr);
     }
