@@ -11,7 +11,7 @@
  *
  * Relocated verbatim from swiglu_cl.cpp (SwiGLULayerCl::swigluProcess /
  * swiglu_cl / swiglu_cl_fp16 / registerClKernels) into free functions so the
- * SwiGLU layer can be a single backend-neutral Layer. [T7]
+ * SwiGLU layer can be a single backend-neutral Layer.
  */
 
 #include "swiglu_cl_op.h"

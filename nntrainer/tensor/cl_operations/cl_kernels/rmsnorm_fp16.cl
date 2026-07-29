@@ -123,7 +123,7 @@ __kernel void rmsnorm_cl_fp16_coop(__global const half *input,
 // rmsnorm_cl_fp16_coop but skips the per-element gamma fold (pure normalization),
 // so the host fallback (cl_queue_finish + 2x blocking SVM map + FP32 intrinsic +
 // unmap, ~0.18 ms/call x ~30 calls/token) is avoided when the attention path is
-// GPU-resident (NNTR_MHA_GPU_DECODE). Keeps the SAME 6-arg signature as the coop
+// GPU-resident. Keeps the SAME 6-arg signature as the coop
 // kernel (input, output, alpha, epsilon, n_rows, W) so the host wrapper's dispatch
 // is unchanged -- alpha is bound (to the input pointer) but never read here. The
 // sum-of-squares is in fp32 (convert_float8 before squaring), matching the host

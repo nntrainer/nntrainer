@@ -879,7 +879,8 @@ __kernel void sv_matmul_f16_ohwi_img(
     __read_only image2d_t V_img,      // see comment above
     __global       half *O,           // [M, HD_Q] fp16, row-major
     const int M, const int N_kv, const int d,
-    const int HD_Q, const int S_max, const int gqa) {
+    const int HD_Q, const int S_max, const int gqa,
+    const int causal) {
   // Tiled over the output d/x axis: each WI computes TDX=8 consecutive
   // output channels x0..x0+7. The scores chunk depends only on (m, n_tex),
   // NOT on x, so it is loaded ONCE per n_tex and reused across all 8 x's —
@@ -901,11 +902,15 @@ __kernel void sv_matmul_f16_ohwi_img(
   // M positions of the N_kv context -> q_abs = (N_kv-M)+m. For prefill M==N_kv
   // (q_off=0, the old (m>>3)+1); for decode M=1 the single query at N-1 must sum
   // ALL N_kv keys (else it sums only V[0..7] -> garbage). Paired with
-  // qk_matmul_f16_ohwi_img's q_off causal mask.
-  const int q_off = N_kv - M;
+  // qk_matmul_f16_ohwi_img's q_off causal mask. The cap is a work-skip over
+  // scores the QK mask already zeroed, so a non-causal call simply keeps the
+  // full range.
   int N_kv_tex = (N_kv + 7) >> 3;
-  const int N_kv_tex_causal = ((q_off + m) >> 3) + 1;
-  if (N_kv_tex_causal < N_kv_tex) N_kv_tex = N_kv_tex_causal;
+  if (causal) {
+    const int q_off = N_kv - M;
+    const int N_kv_tex_causal = ((q_off + m) >> 3) + 1;
+    if (N_kv_tex_causal < N_kv_tex) N_kv_tex = N_kv_tex_causal;
+  }
 
   float acc[8];
   #pragma unroll
@@ -951,7 +956,8 @@ __kernel void sv_matmul_f16_ohwi_img_tm2(
     __read_only image2d_t V_img,
     __global       half *O,
     const int M, const int N_kv, const int d,
-    const int HD_Q, const int S_max, const int gqa) {
+    const int HD_Q, const int S_max, const int gqa,
+    const int causal) {
   const int x0 = get_global_id(0) * 8;
   const int m0 = get_global_id(1) * 2;
   const int head_q = get_global_id(2);
@@ -965,12 +971,15 @@ __kernel void sv_matmul_f16_ohwi_img_tm2(
   const long sb0 = (long)head_q * (long)M * (long)N_kv + (long)m0 * (long)N_kv;
   const long sb1 = (long)head_q * (long)M * (long)N_kv + (long)m1 * (long)N_kv;
   // Causal cap on the query's ABSOLUTE position (q_off=N_kv-M); decode (M=1)
-  // sits at N-1 and must sum ALL keys, not just V[0..7]. See the non-tm2 kernel.
-  const int q_off = N_kv - M;
+  // sits at N-1 and must sum ALL keys, not just V[0..7]. See the non-tm2
+  // kernel; a non-causal call keeps the full range.
   int N_kv_tex = (N_kv + 7) >> 3;
-  const int cap_m = has1 ? m1 : m0;
-  const int N_kv_tex_causal = ((q_off + cap_m) >> 3) + 1;
-  if (N_kv_tex_causal < N_kv_tex) N_kv_tex = N_kv_tex_causal;
+  if (causal) {
+    const int q_off = N_kv - M;
+    const int cap_m = has1 ? m1 : m0;
+    const int N_kv_tex_causal = ((q_off + cap_m) >> 3) + 1;
+    if (N_kv_tex_causal < N_kv_tex) N_kv_tex = N_kv_tex_causal;
+  }
 
   float acc0[8], acc1[8];
   #pragma unroll

@@ -2313,12 +2313,14 @@ static bool two_conv_attention_prefill_f16_ohwi_img_impl(
     int Mi = (int)M, Nkvi = (int)N_kv, di = (int)head_dim;
     int hdq = (int)HD_Q, smax = (int)max_seq_len;
     int gqa = (int)(num_heads_Q / num_heads_KV);
+    int causal_i = causal ? 1 : 0;
     if (!kp->SetKernelArguments(3, &Mi, sizeof(int)) ||
         !kp->SetKernelArguments(4, &Nkvi, sizeof(int)) ||
         !kp->SetKernelArguments(5, &di, sizeof(int)) ||
         !kp->SetKernelArguments(6, &hdq, sizeof(int)) ||
         !kp->SetKernelArguments(7, &smax, sizeof(int)) ||
-        !kp->SetKernelArguments(8, &gqa, sizeof(int)))
+        !kp->SetKernelArguments(8, &gqa, sizeof(int)) ||
+        !kp->SetKernelArguments(9, &causal_i, sizeof(int)))
       return false;
     // TDX=8 tiled: each WI computes 8 output channels, so the x grid is
     // head_dim/8 work-items. Workgroup (LWS_X x's, LWS_Y=4 m's).

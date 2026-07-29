@@ -207,9 +207,9 @@ bool two_conv_attention_prefill_f16_img_cl(
 ///   max_seq_len: the allocated S_max (head stride in the OHWI layout).
 ///                The kernel only reads N_kv rows.
 ///
-/// Opt-in by setting BOTH NNTR_KV_OHWI=1 AND NNTR_MHA_GPU=1. Unlike
-/// the concat _f16_cl wrapper, this path has no "force-broken" gate:
-/// turning both env vars on is the explicit opt-in.
+/// Opt-in: the caller selects this entry point explicitly (the GPU MHA path
+/// with an OHWI-laid-out KV cache). Unlike the concat _f16_cl wrapper, this
+/// path has no "force-broken" gate.
 bool two_conv_attention_prefill_f16_ohwi_cl(
   const uint16_t *Q_host, const uint16_t *K_host, const uint16_t *V_host,
   uint16_t *O_host, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,

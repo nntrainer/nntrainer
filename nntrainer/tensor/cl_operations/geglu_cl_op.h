@@ -14,7 +14,7 @@
  * ComputeOps (ClComputeOps::geglu forwards here). The CL kernels (geglu_cl /
  * geglu_cl_fp16) are registered once at ClContext init via
  * registerGeGLUClKernels(). The residency logic (cl_mem/SVM binding, the
- * resident-act overlay, the all-cl_mem row_off decode path) is unchanged. [T7]
+ * resident-act overlay, the all-cl_mem row_off decode path) is unchanged.
  */
 
 #ifndef __GEGLU_CL_OP_H__

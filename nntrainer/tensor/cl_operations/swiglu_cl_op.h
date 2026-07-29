@@ -14,7 +14,7 @@
  * ComputeOps (ClComputeOps::swiglu forwards here). The CL kernels (swiglu_cl /
  * swiglu_cl_fp16) are registered once at ClContext init via
  * registerSwiGLUClKernels(). The residency logic (cl_mem/SVM binding, the
- * all-cl_mem decode live-row path) is unchanged. [T7]
+ * all-cl_mem decode live-row path) is unchanged.
  */
 
 #ifndef __SWIGLU_CL_OP_H__

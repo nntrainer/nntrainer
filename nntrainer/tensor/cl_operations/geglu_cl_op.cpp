@@ -11,7 +11,7 @@
  *
  * Relocated verbatim from geglu_cl.cpp (GeGLULayerCl::gegluProcess /
  * geglu_cl / geglu_cl_fp16 / registerClKernels) into free functions so the
- * GeGLU layer can be a single backend-neutral Layer. [T7]
+ * GeGLU layer can be a single backend-neutral Layer.
  */
 
 #include "geglu_cl_op.h"
