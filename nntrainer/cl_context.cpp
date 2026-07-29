@@ -33,6 +33,10 @@
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
 #include <scalar_multiply_gpu.h>
+#include <sigmoid_add_cl_op.h>
+#include <sigmoid_add_layer.h>
+#include <sigmoid_glu_cl_op.h>
+#include <sigmoid_glu_layer.h>
 #include <string>
 #include <swiglu_cl_op.h>
 #include <swiglu_layer.h>
@@ -280,6 +284,24 @@ void ClContext::add_default_object() {
     registerFactory(nntrainer::createLayer<TransposeLayerCl>,
                     TransposeLayerCl::type,
                     ml::train::LayerType::LAYER_TRANSPOSE);
+  }
+
+  // Fused sigmoid gates: sigmoid_glu (attn output gate = sigmoid(gate)*x) and
+  // sigmoid_add (PLE mix = sigmoid(gate)+emb). Registered LAST with EXPLICIT
+  // high int_keys: the auto int_key (str_map.size()+1) is fragile -- inserting
+  // these mid-list shifted later auto-keys so scalar_multiply's auto-key
+  // collided with addition's explicit int_key (7), corrupting int_map and
+  // aborting ClContext init BEFORE setMemAllocator (null gpu allocator ->
+  // TensorPool ctor crash for every model, gemma4 included). Gated on the CL
+  // kernels registering (mirrors GeGLU); backend-neutral layer ->
+  // ClComputeOps::sigmoid_glu/sigmoid_add.
+  if (registerSigmoidGluClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<SigmoidGluLayer>,
+                    SigmoidGluLayer::type, /*int_key=*/9001);
+  }
+  if (registerSigmoidAddClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
+                    SigmoidAddLayer::type, /*int_key=*/9002);
   }
 }
 

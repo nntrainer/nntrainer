@@ -33,6 +33,8 @@
 #include <blas_kernels.h>
 #include <compute_ops.h>
 #include <geglu_cl_op.h>
+#include <sigmoid_add_cl_op.h>
+#include <sigmoid_glu_cl_op.h>
 #include <swiglu_cl_op.h>
 #include <tensor.h>
 
@@ -189,6 +191,18 @@ public:
   void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
               unsigned int active_rows, unsigned int row_offset) override {
     nntrainer::swiglu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+  // Fused sigmoid gates on the GPU residency path: sigmoid_glu (attn output
+  // gate = sigmoid(gate)*x) and sigmoid_add (PLE mix = sigmoid(gate)+emb).
+  // Without these overrides the base ComputeOps::sigmoid_glu/sigmoid_add throw
+  // NI, so engine=gpu could not build a graph that contains these nodes.
+  void sigmoid_glu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                   unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::sigmoid_glu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+  void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
+                   unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::sigmoid_add_cl_op(in1, in2, out, active_rows, row_offset);
   }
 
   /**

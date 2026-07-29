@@ -7,6 +7,8 @@ llm_layer_sources = [
   'qkv_layer.cpp',
   'geglu_layer.cpp',
   'swiglu_layer.cpp',
+  'sigmoid_glu_layer.cpp', # attention output gate (fused sigmoid*x)
+  'sigmoid_add_layer.cpp', # PLE gating mix (fused sigmoid+x)
   'lm_head.cpp', # untied host lm_head FC (no OpenCL)
   # tie_word_embedding's OpenCL lm_head GEMV is #if defined(ENABLE_OPENCL)-guarded
   # internally, so it compiles host-only without OpenCL (the FP32 unittest build).
@@ -23,6 +25,8 @@ llm_layer_headers = [
   'qkv_layer.h',
   'geglu_layer.h',
   'swiglu_layer.h',
+  'sigmoid_glu_layer.h',
+  'sigmoid_add_layer.h',
 ]
 
 # scalar_multiply's GPU variant uses OpenCL directly (cl_mem / ClContext), so it
