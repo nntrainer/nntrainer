@@ -675,3 +675,100 @@ remaining opportunity on the single-prompt path.
 **This puts the current constraints in conflict:** "maximise single-prompt
 performance" and "no op batching" cannot both hold any further. Everything
 reachable without batching has been taken.
+
+---
+
+## 18. Multi-batch as a decode lever - tested, and a batch-handling bug found along the way
+
+Question: since HMX needs M >= 32, could running N independent sequences in
+parallel (batch_size = N) reach that threshold during *decode* without
+touching prefill at all - M = N rows per decode GEMM, one row per sequence?
+
+### ggml-hexagon: `llama-batched-bench -npl`
+
+Directly answers this - N parallel sequences, aggregate decode t/s across all
+of them. Qwen3-0.6B Q4_0, 4 threads:
+
+| B (=M at decode) | CPU aggregate tg t/s | NPU aggregate tg t/s | NPU/CPU |
+|---|---|---|---|
+| 1 | 122.0 | 12.9 | 0.11 |
+| 4 | 329.3 | 14.9 | 0.05 |
+| 8 | 309.0 | 15.5 | 0.05 |
+| 16 | 383.9 | 15.7 | 0.04 |
+| 32 | 425.9 | 15.8 | 0.04 |
+| 64 | 423.7 | 16.0 | 0.04 |
+
+**Batching does not help NPU decode, at all**, despite crossing M=32 at B=32.
+CPU aggregate throughput scales 3.5x with batch; NPU aggregate throughput moves
+1.24x. The ratio gets *worse* as B grows, not better. Load log explains why:
+
+```
+sched_reserve: layer 0 is assigned to device HTP0 but the Flash Attention
+tensor is assigned to device CPU (usually due to missing support)
+Flash Attention was auto, set to disabled
+```
+
+Attention stays on the CPU even with `-ngl 99`. As B grows, CPU-side
+attention/KV-cache work scales with it and dominates the step time regardless
+of how fast HMX makes the FC matmuls - the same "attention isn't offloaded"
+mechanism as SS12, now showing up as a batch-scaling ceiling instead of a
+prompt-length one. NPU prefill throughput *also* falls with B (462 -> 230
+t/s), likely VTCM/cache pressure from more concurrent KV state.
+
+**Conclusion: multi-batch is not a free path to HMX-accelerated decode on this
+device**, in ggml-hexagon's own mature backend. No reason to expect nntrainer's
+bridge to fare better - it offloads a strict subset of what ggml-hexagon does.
+
+### nntrainer: found and fixed a real pre-existing bug, then hit a second one
+
+Before this could even be tested, found: `FloatTensor::dotQnK` (and
+`dotQInteger`, `dotQs4cx`, the batched-weights `dot()`, and `HalfTensor`'s FP16
+twin) computed `M = getDim().height()`, never reading `batch()` or `channel()`.
+The standard FP32 path (`dotFloat`, via `TensorBase::calculateFlattenDot`)
+already uses the correct convention -
+`M = batch()*channel()*height()` for NCHW. So any activation with
+`batch()*channel() > 1` through one of these quantized paths would compute
+only the first slot and leave the rest of the output stale - on CPU and NPU
+alike. Predates this project; never exercised because CausalLM has always run
+`batch_size: 1`.
+
+Fixed at all five call sites, mirroring `calculateFlattenDot`'s convention.
+Verified two ways:
+
+- `unittest_nntrainer_cpu_backend` (host x86): 12/12 unchanged - expected,
+  since those tests call the kernels directly and never exercise `Tensor::
+  dot()`'s M computation, so they could not have caught this.
+- A new standalone tool (`verify_batch_fix.cpp`, not in the test suite, same
+  spirit as `tools/nntr_htp_bridge_check.cpp`): builds a real Q4_0-weight
+  `Tensor`, replicates one activation row across `batch=5` slots, sentinel-fills
+  the output with NaN, calls the real `Tensor::dot()` -> `dotQnK` path. All 5
+  rows came back identical to a batch=1 reference and NaN-free. The sentinel
+  matters: before the fix this would have failed decisively (rows 1-4 still
+  NaN), not just numerically.
+
+Then tried to actually measure it: rebuilt for Android, set `batch_size: 32`,
+ran on device. **Segfault, on plain CPU, before Hexagon or even the FC layer is
+reached:**
+
+```
+#00 RunLayerContext::updateTensor
+#01 MHACoreLayer::setBatch          (Applications/CausalLM/layers/mha_core.cpp:1502)
+#02 LayerNode::setBatch
+#03 NetworkGraph::setBatchSize
+#04 NeuralNetwork::initialize
+```
+
+Fault address `0x7fffffff8` is almost exactly `0xFFFFFFFF * 8` - the signature
+of an uninitialized/sentinel tensor index used before assignment. This is
+inside CausalLM's own attention/KV-cache layer, a different subsystem from the
+tensor fix above and unrelated to Hexagon. It means `batch_size > 1` has
+apparently never been exercised end-to-end in this app before.
+
+**Decision: stop here, do not chase the MHACoreLayer bug.** The ggml-hexagon
+result already answers the original question - batching is not a useful lever
+for decode on this device, because attention is CPU-bound and scales with
+batch regardless of accelerator. The `dotQnK` fix stands on its own
+correctness merits (a latent bug, now fixed and verified) rather than as a
+prerequisite for a decode-throughput win that the reference implementation
+shows will not materialize. Logged as a known, out-of-scope issue if
+multi-sequence batching is ever wanted for a different reason.
