@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
+ *
+ * @file    cuda_compute_ops.h
+ * @date    29 Jul 2026
+ * @see     https://github.com/nntrainer/nntrainer
+ * @author  Jijoong Moon <jijoong.moon@samsung.com>
+ * @bug     No known bugs except for NYI items
+ * @brief   CUDA ComputeOps subclass: the op table the cuda context installs
+ *          via ContextData::setComputeOps(), so the backend-neutral layers
+ *          dispatch device work through getOps() instead of calling CUDA
+ *          kernels directly. Inherits CpuComputeOps (not the abstract
+ *          ComputeOps base): engine=cuda tensors are Unified Memory
+ *          (host-coherent), so every op the CUDA backend does not accelerate
+ *          runs correctly via the CPU implementation over the managed
+ *          buffers. This class overrides only the element-wise decode ops
+ *          (swiglu / scalar_mul / softcap); each override falls back to the
+ *          inherited host body when its device contract is not met.
+ */
+
+#ifndef __CUDA_COMPUTE_OPS_H__
+#define __CUDA_COMPUTE_OPS_H__
+
+#include <cpu_ops_table.h>
+
+namespace nntrainer {
+
+/**
+ * @brief CUDA op table: CpuComputeOps plus device overrides for the
+ *        element-wise decode kernels. The host bodies stay correct on the
+ *        UVM buffers, so an override is only added where a device kernel
+ *        exists; everything else inherits.
+ */
+class CudaComputeOps : public CpuComputeOps {
+public:
+  /**
+   * @brief SwiGLU whole-op: device-resident fp16 one-kernel fast path
+   *        (cuda_swiglu_fp16) under the residency gates, else the inherited
+   *        host body.
+   */
+  void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+              unsigned int active_rows, unsigned int row_offset) override;
+
+  /**
+   * @brief Scalar multiply whole-op: opt-in (NNTR_CUDA_ELTWISE) fp16 device
+   *        kernel (cuda_scalar_mul_fp16), else drain-then-host fallback.
+   */
+  void scalar_mul(const Tensor &in, Tensor &out, float scale) override;
+
+  /**
+   * @brief Logit soft-capping whole-op: fp16 device kernel
+   *        (cuda_softcap_fp16) on device-accessible logits, else the
+   *        inherited host body. Carries the terminal pipeline drain for the
+   *        selective-sync path (first host-read point of the logits).
+   */
+  void softcap(const Tensor &in, Tensor &out, float cap, int act_type) override;
+};
+
+} // namespace nntrainer
+
+#endif // __CUDA_COMPUTE_OPS_H__

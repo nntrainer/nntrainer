@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 Jijoong Moon <jijoong.moon@samsung.com>
+ *
+ * @file    cuda_compute_ops.cpp
+ * @date    29 Jul 2026
+ * @see     https://github.com/nntrainer/nntrainer
+ * @author  Jijoong Moon <jijoong.moon@samsung.com>
+ * @bug     No known bugs except for NYI items
+ * @brief   CUDA ComputeOps subclass (the element-wise decode dispatches for
+ *          the cuda context). The device-kernel routing that used to be
+ *          open-coded inside the neutral layers lives here, behind the same
+ *          runtime gates; every contract miss lands in the inherited
+ *          CpuComputeOps body, which is correct on the host-coherent UVM
+ *          buffers.
+ */
+
+#include "cuda_compute_ops.h"
+
+#include <compute_ops.h>
+#include <env_compat.h>
+#include <tensor.h>
+
+#include <cuda_context_manager.h>
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+
+namespace nntrainer {
+
+void CudaComputeOps::swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                            unsigned int active_rows, unsigned int row_offset) {
+#ifdef ENABLE_FP16
+  // engine=cuda device-resident fp16: one kernel instead of the host loop
+  // (the host body below would fault on the device-only activation pool
+  // under NNTR_CUDA_DEV_ACT). Gated on FP16 + batch/channel==1 +
+  // row_offset==0 -- the batch/channel==1 gate mirrors the layer-side gate
+  // this override replaces (with it, active_rows * width() equals the
+  // (to - from) * width() element count the layer's former open-coded block
+  // launched); falls through to the host body for non-device tensors.
+  if (in1.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+      in1.batch() == 1 && in1.channel() == 1 && row_offset == 0) {
+    const size_t n = (size_t)active_rows * in1.width();
+    auto *a = reinterpret_cast<const unsigned short *>(in1.getData<_FP16>());
+    auto *b = reinterpret_cast<const unsigned short *>(in2.getData<_FP16>());
+    auto *o = reinterpret_cast<unsigned short *>(out.getData<_FP16>());
+    const bool dev = a && nntrainer::cuda::dev_accessible(a);
+    if (dev && n > 0 &&
+        nntrainer::cuda::cuda_swiglu_fp16(a, b, o, (unsigned int)n))
+      return;
+  }
+#endif
+  CpuComputeOps::swiglu(in1, in2, out, active_rows, row_offset);
+}
+
+void CudaComputeOps::scalar_mul(const Tensor &in, Tensor &out, float scale) {
+#ifdef ENABLE_FP16
+  if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
+    if (gpu) {
+      auto *ip = reinterpret_cast<const unsigned short *>(in.getData<_FP16>());
+      auto *op = reinterpret_cast<unsigned short *>(out.getData<_FP16>());
+      const bool dev = nntrainer::cuda::dev_accessible(ip);
+      if (dev && nntrainer::cuda::cuda_scalar_mul_fp16(
+                   ip, op, (unsigned int)in.size(), scale))
+        return;
+    }
+  }
+#endif
+  // Host multiply reads the GPU-produced UVM input on the CPU; sync first
+  // in async mode (no-op in default sync mode).
+  nntrainer::cuda::drain_if_async();
+  CpuComputeOps::scalar_mul(in, out, scale);
+}
+
+void CudaComputeOps::softcap(const Tensor &in, Tensor &out, float cap,
+                             int act_type) {
+  // Terminal drain for the selective-sync (NNTR_CUDA_ASYNC) path: the softcap
+  // input is the first host-read point of the lm_head logits, so the
+  // one-per-token GPU pipeline drains here. Per call (the layer chunks are
+  // per batch/channel); the drain is idempotent and a no-op in default mode
+  // (every GPU op already drained). cuda runs only: StreamManager::Global()
+  // would CREATE the CUDA context.
+  if (nntrainer::cuda::engine_selected())
+    nntrainer::cuda::StreamManager::Global().finish();
+#ifdef ENABLE_FP16
+  // Device-only activation pool: the logits are real device memory; the host
+  // Tensor ops in the fallback would fault. out = cap * tanh(in / cap) in one
+  // GPU kernel -- the kernel realizes tanh, the activation every reachable
+  // configuration sets; the routing (device kernel regardless of act_type) is
+  // the same the layer's former open-coded block applied.
+  if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    auto *ip = reinterpret_cast<const unsigned short *>(in.getData<_FP16>());
+    auto *op = reinterpret_cast<unsigned short *>(out.getData<_FP16>());
+    cudaPointerAttributes pa{};
+    // Accept Managed (UVM) too, not just Device: on integrated GPUs the
+    // activation pool is cudaMallocManaged, so a Device-only gate sends the
+    // softcap to the host fallback -- which, inside a CUDA-graph capture,
+    // reads the not-yet-run lm_head logits (stale) and is itself not
+    // captured -> garbage output. Managed pointers run the GPU kernel fine.
+    if (nntrainer::cuda::engine_selected() &&
+        cudaPointerGetAttributes(&pa, ip) == cudaSuccess &&
+        (pa.type == cudaMemoryTypeDevice || pa.type == cudaMemoryTypeManaged) &&
+        nntrainer::cuda::cuda_softcap_fp16(ip, op, (unsigned int)in.size(),
+                                           cap)) {
+      cudaGetLastError();
+      return;
+    }
+    cudaGetLastError();
+  }
+#endif
+  CpuComputeOps::softcap(in, out, cap, act_type);
+}
+
+ComputeOps *get_cuda_ops() {
+  static CudaComputeOps instance;
+  return &instance;
+}
+
+} // namespace nntrainer

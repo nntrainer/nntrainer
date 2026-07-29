@@ -461,6 +461,27 @@ public:
    */
   virtual void apply_activation(Tensor &out, int act_type);
 
+  /**
+   * @brief Whole-tensor scalar multiply: out = in * scale. The neutral
+   *        scalar-multiply layer owns the chunk/step bookkeeping and calls
+   *        this once per chunk, so an accelerator backend can run the
+   *        multiply as one device kernel on a device-resident activation
+   *        instead of the host loop. in/out share shape and dtype.
+   */
+  virtual void scalar_mul(const Tensor &in, Tensor &out, float scale);
+
+  /**
+   * @brief Logit soft-capping: out = cap * act(in / cap). @p act_type is an
+   *        nntrainer::ActivationType cast to int (the apply_activation
+   *        convention, so this header stays free of the layers headers);
+   *        every reachable configuration sets tanh. The neutral
+   *        logit-softcapping layer owns the row-window bookkeeping and calls
+   *        this once per chunk, so an accelerator backend can run the cap as
+   *        one device kernel on device-resident logits. in/out share shape
+   *        and dtype.
+   */
+  virtual void softcap(const Tensor &in, Tensor &out, float cap, int act_type);
+
 protected:
   /**
    * @brief Helper used by default impls to throw a uniform "not
@@ -516,6 +537,11 @@ ComputeOps *get_cpu_ops();
 /** @brief OpenCL accelerator ComputeOps singleton. Defined when
  *  enable-opencl is on, in cl_operations/cl_compute_ops.cpp. */
 ComputeOps *get_cl_ops();
+#endif
+#ifdef ENABLE_CUDA
+/** @brief CUDA accelerator ComputeOps singleton. Defined when enable-cuda is
+ *  on, in cuda/cuda_compute_ops.cpp. */
+ComputeOps *get_cuda_ops();
 #endif
 
 } // namespace nntrainer

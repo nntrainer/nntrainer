@@ -17,6 +17,7 @@
 #include <mutex>
 
 #include <addition_layer.h>
+#include <compute_ops.h>
 #include <cuda_mem_allocator.h>
 #include <fc_layer_cl.h>
 #include <geglu_layer.h>
@@ -84,6 +85,12 @@ void CudaContext::initialize() noexcept {
     // separate copy step. Falls back to host memory if UVM is unavailable.
     setMemAllocator(std::make_shared<CudaMemAllocator>());
 
+    // Install the CUDA ComputeOps: the element-wise decode ops (swiglu /
+    // scalar_mul / softcap) take the device kernels under their residency
+    // gates; everything else inherits the CpuComputeOps bodies, which are
+    // correct over the host-coherent UVM tensors.
+    getContextData()->setComputeOps(get_cuda_ops());
+
   } catch (std::exception &e) {
     ml_loge("cuda_context: initialization failed!!, reason: %s", e.what());
   } catch (...) {
@@ -92,29 +99,34 @@ void CudaContext::initialize() noexcept {
 }
 
 void CudaContext::add_default_object() {
-  // FC: the backend-neutral FullyConnectedLayerCl dispatches its GEMM via
-  // CudaComputeOps::fc (cuda_fc_qint4 / cuBLAS / host dot). Same class as the
-  // gpu context.
+  // FC: the backend-neutral FullyConnectedLayerCl dispatches its GEMM through
+  // the installed CudaComputeOps table — at this change the inherited
+  // CpuComputeOps host dot on UVM (a CUDA quantized-GEMM fc() override is a
+  // later change). Same class as the gpu context.
   registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
                   FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
   // addition: the core CPU AdditionLayer is pure host Tensor ops -> correct on
   // the host-coherent UVM tensors (do NOT use the OpenCL AdditionLayerCL).
   registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
                   ml::train::LayerType::LAYER_ADDITION);
-  // geglu: the backend-neutral GeGLULayer dispatches via CudaComputeOps::geglu
-  // (device-resident fp16 kernel when available, else host-on-UVM).
+  // geglu: the backend-neutral GeGLULayer dispatches via the installed table;
+  // no CUDA geglu override exists at this change, so it resolves to the
+  // inherited CpuComputeOps host body on UVM.
   registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
   // swiglu: the merged backend-neutral SwiGLULayer dispatches via
-  // CudaComputeOps::swiglu, with the device-resident fp16 one-kernel fast path
-  // (cuda_swiglu_fp16) for the qwen3 FFN. Replaces the app
-  // causallm::SwiGLULayer.
+  // CudaComputeOps::swiglu — the device-resident fp16 one-kernel decode fast
+  // path (cuda_swiglu_fp16) under its residency gates, else the inherited
+  // host body. Replaces the former app-side SwiGLU fork.
   registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
-  // logit_softcapping (promoted to core): host op on UVM-resident logits;
-  // the CUDA-only device-softcap path lives inside the layer (ENABLE_CUDA).
+  // logit_softcapping (promoted to core): dispatches via
+  // CudaComputeOps::softcap — the fp16 device kernel on device-accessible
+  // logits (carrying the terminal pipeline drain), else the inherited host
+  // body on UVM.
   registerFactory(nntrainer::createLayer<LogitSoftCappingLayer>,
                   LogitSoftCappingLayer::type);
-  // scalar_multiply (promoted): host op on UVM (the CPU class on cuda, like
-  // the gemma4 tryRegister it replaces; the _gpu variant is OpenCL-only).
+  // scalar_multiply (promoted): dispatches via CudaComputeOps::scalar_mul —
+  // the opt-in (NNTR_CUDA_ELTWISE) fp16 device kernel, else the inherited
+  // host body on UVM (the _gpu variant is OpenCL-only).
   registerFactory(nntrainer::createLayer<ScalarMultiplyLayer>,
                   ScalarMultiplyLayer::type);
   // tie_word_embedding (promoted): host lm_head on UVM (the GPU GEMV is the

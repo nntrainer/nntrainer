@@ -206,4 +206,36 @@ void CpuComputeOps::apply_activation(Tensor &out, int act_type) {
   }
 }
 
+// out = in * scale on the host. The whole-op half of the neutral
+// scalar-multiply layer: the layer keeps the chunk/step bookkeeping and this
+// runs one chunk (the layer's former open-coded host body, unchanged).
+void CpuComputeOps::scalar_mul(const Tensor &in, Tensor &out, float scale) {
+  in.multiply(scale, out);
+}
+
+// out = cap * act(in / cap) on the host -- the neutral logit-softcapping
+// layer's former open-coded chunk body, statement for statement: copy, scale
+// down, activation, scale back up. The ActiFunc is rebuilt from act_type keyed
+// on the chunk dtype (the apply_activation convention), which matches the
+// activation the layer configured at finalize (the chunk dtype IS the
+// activation dtype).
+void CpuComputeOps::softcap(const Tensor &in, Tensor &out, float cap,
+                            int act_type) {
+  const auto at = static_cast<ActivationType>(act_type);
+  ActiFunc f;
+  if (out.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    f.setActiFunc<_FP16>(at);
+#else
+    throw std::invalid_argument("softcap: fp16 needs enable-fp16");
+#endif
+  } else {
+    f.setActiFunc<float>(at);
+  }
+  out.copyData(in);
+  in.multiply(1.0f / cap, out);
+  f.run_fn(out, out);
+  out.multiply(cap, out);
+}
+
 } // namespace nntrainer

@@ -384,6 +384,13 @@ public:
   void fc(Tensor &input, Tensor &weight, Tensor &output) override;
 
   void apply_activation(Tensor &out, int act_type) override;
+
+  // out = in * scale via the host Tensor multiply (correct for host and
+  // host-coherent SVM/UVM buffers).
+  void scalar_mul(const Tensor &in, Tensor &out, float scale) override;
+  // out = cap * act(in / cap) via host Tensor ops + ActiFunc (logit
+  // soft-capping; act_type is an ActivationType cast to int).
+  void softcap(const Tensor &in, Tensor &out, float cap, int act_type) override;
 };
 
 } // namespace nntrainer

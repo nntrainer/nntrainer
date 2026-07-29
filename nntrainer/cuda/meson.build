@@ -6,6 +6,7 @@ cuda_sources = [
   'cuda_module.cpp',
   'cuda_kernel.cpp',
   'cuda_elementwise.cpp',
+  'cuda_compute_ops.cpp',
 ]
 
 cuda_headers = [

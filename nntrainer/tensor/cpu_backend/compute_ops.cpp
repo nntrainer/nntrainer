@@ -435,6 +435,8 @@ void ComputeOps::residual_op(Tensor &, const Tensor &, bool) {
 }
 void ComputeOps::fc(Tensor &, Tensor &, Tensor &) { NI(fc); }
 void ComputeOps::apply_activation(Tensor &, int) { NI(apply_activation); }
+void ComputeOps::scalar_mul(const Tensor &, Tensor &, float) { NI(scalar_mul); }
+void ComputeOps::softcap(const Tensor &, Tensor &, float, int) { NI(softcap); }
 
 #undef NI
 

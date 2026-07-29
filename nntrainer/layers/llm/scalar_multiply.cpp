@@ -14,18 +14,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <env_compat.h>
 #include <iostream>
 #include <string>
 
 #include "scalar_multiply.h"
-
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-#include <cuda_context_manager.h>
-#include <cuda_elementwise.h>
-#include <cuda_runtime.h>
-#include <cuda_stream_manager.h>
-#endif
 
 namespace nntrainer {
 
@@ -154,30 +146,11 @@ void ScalarMultiplyLayer::incremental_forwarding(
     nntrainer::Tensor out_step =
       out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen(), true);
 
-    bool done = false;
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
-    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-      static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
-      if (gpu) {
-        auto *ip =
-          reinterpret_cast<const unsigned short *>(in_step.getData<_FP16>());
-        auto *op =
-          reinterpret_cast<unsigned short *>(out_step.getData<_FP16>());
-        const bool dev = nntrainer::cuda::dev_accessible(ip);
-        if (dev && nntrainer::cuda::cuda_scalar_mul_fp16(
-                     ip, op, (unsigned int)in_step.size(), multiplier))
-          done = true;
-      }
-    }
-#endif
-    if (!done) {
-#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-      // Host multiply() reads the GPU-produced UVM input on the CPU; sync first
-      // in async mode (no-op in default sync mode).
-      nntrainer::cuda::drain_if_async();
-#endif
-      in_step.multiply(multiplier, out_step);
-    }
+    // Whole-op dispatch: the layer keeps the chunk/step bookkeeping; the
+    // attached ComputeOps table runs one chunk (an accelerator table may take
+    // a device kernel under its own gates, the host table runs the plain
+    // multiply).
+    in_step.getOps()->scalar_mul(in_step, out_step, multiplier);
 
     static const bool dump_layers = std::getenv("NNTR_DUMP_LAYERS") != nullptr;
     if (dump_layers) {
