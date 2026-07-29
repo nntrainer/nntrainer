@@ -62,8 +62,8 @@ TEST_P(gemm_qai8dxp_qsi4cxp_rhs_unpacked, check_ukernels) {
 
   // quantize rhs weight
   const size_t rhs_native_size_qs4cx = is_nxk
-                                         ? N * (K + 1) / 2 * sizeof(uint8_t)
-                                         : K * (N + 1) / 2 * sizeof(uint8_t);
+                                         ? N * ((K + 1) / 2) * sizeof(uint8_t)
+                                         : K * ((N + 1) / 2) * sizeof(uint8_t);
   const size_t rhs_scales_size_f32 = N * sizeof(float);
 
   uint8_t *rhs_native_mtx_qs4cx = new uint8_t[rhs_native_size_qs4cx];
@@ -144,7 +144,7 @@ TEST_P(gemm_qai8dxp_qsi4cxp, check_ukernels) {
   std::vector<float> dst(M * N);
 
   // quantize rhs weight
-  const size_t rhs_native_size_qs4cx = N * (K + 1) / 2 * sizeof(uint8_t);
+  const size_t rhs_native_size_qs4cx = N * ((K + 1) / 2) * sizeof(uint8_t);
   const size_t rhs_scales_size_f32 = N * sizeof(float);
 
   uint8_t *rhs_native_mtx_qs4cx = new uint8_t[rhs_native_size_qs4cx];
@@ -227,7 +227,7 @@ void test_f16_qai8dxp_qsi4cxp_cosine_similarity(size_t M, size_t N, size_t K) {
   std::vector<__fp16> dst_f16(M * N);
   std::vector<float> dst(M * N);
 
-  const size_t rhs_native_size_qs4cx = N * (K + 1) / 2 * sizeof(uint8_t);
+  const size_t rhs_native_size_qs4cx = N * ((K + 1) / 2) * sizeof(uint8_t);
   const size_t rhs_scales_size_f32 = N * sizeof(float);
 
   uint8_t *rhs_native_mtx_qs4cx = new uint8_t[rhs_native_size_qs4cx];

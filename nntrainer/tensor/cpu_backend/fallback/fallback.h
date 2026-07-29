@@ -1357,8 +1357,8 @@ namespace nnatrainer {
  *
  * @warning You should allocate memory for outputs before use:
  *  - rhs_native_mtx_qs4cx
- *    - is_nxk == true: n * (k + 1) / 2
- *    - is_nxk == false: k * (n + 1) / 2
+ *    - is_nxk == true: n * ((k + 1) / 2)
+ *    - is_nxk == false: k * ((n + 1) / 2)
  *  - rhs_scales_f32
  *    n * sizeof(float)
  *

@@ -81,7 +81,7 @@ void QS4CX_Tensor::pack() {
 
   nntrainer::rhs_pack_qsi4cxp_qs4cxs1s0(
     N, K, packed_data.get(), getData(),
-    ((uint8_t *)getData()) + N * (K + 1) / 2, opt_kernel_idx, true);
+    ((uint8_t *)getData()) + N * ((K + 1) / 2), opt_kernel_idx, true);
 
   if (!packed_data) {
     throw std::runtime_error{"something wrong"};
@@ -99,7 +99,7 @@ void *QS4CX_Tensor::getPackedData() const {
 size_t QS4CX_Tensor::size() const {
   const size_t K = height();
   const size_t N = width();
-  return N * (K + 1) / 2 + N * sizeof(float);
+  return N * ((K + 1) / 2) + N * sizeof(float);
 }
 
 size_t QS4CX_Tensor::getMemoryBytes() const { return size() * sizeof(uint8_t); }
@@ -113,7 +113,7 @@ void *QS4CX_Tensor::getScale() const {
   const size_t K = height();
   const size_t N = width();
 
-  return ((int8_t *)getData()) + N * (K + 1) / 2;
+  return ((int8_t *)getData()) + N * ((K + 1) / 2);
 }
 
 void QS4CX_Tensor::copy_qs4cx(const void *buf) {

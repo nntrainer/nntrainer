@@ -418,11 +418,11 @@ public:
               ///@note The codelines below can be replaced with quantizer's
               /// quantize()
               TensorDim dim = weight.getDim();
-              unsigned int K = dim.height();
-              unsigned int N = dim.width();
+              size_t K = dim.height();
+              size_t N = dim.width();
               Tensor weight_t = weight.transpose("0:2:1");
 
-              size_t q_size = N * (K + 1) / 2;
+              size_t q_size = N * ((K + 1) / 2);
               size_t scale_size = N * sizeof(float);
 
               // allocate packed size, not an unpacked size
