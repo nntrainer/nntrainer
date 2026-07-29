@@ -482,6 +482,20 @@ public:
    */
   virtual void softcap(const Tensor &in, Tensor &out, float cap, int act_type);
 
+  /**
+   * @brief RMS normalization over the first `active_rows` rows starting at
+   *        `row_offset`: out = in * rsqrt(mean(in^2) + epsilon) * gamma,
+   *        row-wise over width(). in/out share shape; width() is the per-row
+   *        element count; gamma is {1,1,1,width} (per-feature scale, possibly
+   *        stored at a different dtype than the activation). Contract every
+   *        impl must keep: the sum of squares is accumulated in FP32 even for
+   *        FP16 activations — a wide residual row squares past the FP16 max
+   *        and zeroes the row otherwise.
+   */
+  virtual void rms_norm(const Tensor &in, Tensor &out, const Tensor &gamma,
+                        float epsilon, unsigned int active_rows,
+                        unsigned int row_offset);
+
 protected:
   /**
    * @brief Helper used by default impls to throw a uniform "not

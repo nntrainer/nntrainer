@@ -68,7 +68,6 @@ endif
 
 if get_option('enable-cuda')
   nntrainer_elements += 'cuda'
-  nntrainer_elements += 'layers/cuda_layers'
 endif
 
 if get_option('enable-npu')

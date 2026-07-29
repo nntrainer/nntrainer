@@ -55,6 +55,20 @@ public:
    *        selective-sync path (first host-read point of the logits).
    */
   void softcap(const Tensor &in, Tensor &out, float cap, int act_type) override;
+
+  /**
+   * @brief RMSNorm whole-op: block-per-row fp16 device kernel
+   *        (cuda_rmsnorm_fp16, FP32 sum-of-squares) for decode-sized row
+   *        counts on device-accessible tensors, else this backend's own
+   *        fused host fallback (also FP32-accumulated) after the async
+   *        coherence drain. Deliberately does NOT delegate to the inherited
+   *        CpuComputeOps::rms_norm: the fallback here is the fused
+   *        normalize*gamma loop this backend has always run, kept
+   *        bit-for-bit.
+   */
+  void rms_norm(const Tensor &in, Tensor &out, const Tensor &gamma,
+                float epsilon, unsigned int active_rows,
+                unsigned int row_offset) override;
 };
 
 } // namespace nntrainer

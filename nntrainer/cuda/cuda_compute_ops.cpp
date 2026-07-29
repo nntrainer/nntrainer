@@ -17,12 +17,16 @@
 
 #include "cuda_compute_ops.h"
 
+#include <cmath>
+#include <stdexcept>
+
 #include <compute_ops.h>
 #include <env_compat.h>
 #include <tensor.h>
 
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
+#include <cuda_rmsnorm.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 
@@ -110,6 +114,99 @@ void CudaComputeOps::softcap(const Tensor &in, Tensor &out, float cap,
   }
 #endif
   CpuComputeOps::softcap(in, out, cap, act_type);
+}
+
+namespace {
+// x * rsqrt(mean(x^2)+eps) * gamma, sum-of-squares accumulated in FP32 (no
+// fp16 overflow). rows = leading dims folded, width = feature size.
+template <typename T, typename G>
+void rmsnorm_rows(const T *x, const G *g, T *y, unsigned int rows,
+                  unsigned int width, float eps) {
+  for (unsigned int r = 0; r < rows; ++r) {
+    const T *xr = x + (size_t)r * width;
+    T *yr = y + (size_t)r * width;
+    float ss = 0.f;
+    for (unsigned int k = 0; k < width; ++k) {
+      float v = (float)xr[k];
+      ss += v * v;
+    }
+    float inv = 1.0f / std::sqrt(ss / (float)width + eps);
+    for (unsigned int k = 0; k < width; ++k)
+      yr[k] = (T)(((float)xr[k] * inv) * (float)g[k]);
+  }
+}
+
+#ifdef ENABLE_FP16
+bool dev_ok(const void *p) { return nntrainer::cuda::dev_accessible(p); }
+#endif
+
+void rmsnorm_dispatch(const Tensor &in, const Tensor &gamma, Tensor &out,
+                      unsigned int rows, unsigned int width, float eps) {
+  using DT = ml::train::TensorDim::DataType;
+  const DT dt = in.getDataType();
+  const DT gt = gamma.getDataType();
+#ifdef ENABLE_FP16
+  // GPU path: fp16 in/out/gamma all device-resident (UVM). Block-per-row, FP32
+  // sum-of-squares. Used only for small row counts (decode, rows~1): the kernel
+  // syncs per call, so for the wide prefill norm (rows=seq_len) the
+  // multi-thread host norm wins -- gating by rows gives the decode speedup
+  // without a prefill regression.
+  static constexpr int gpu_max_rows = 32;
+  if (dt == DT::FP16 && gt == DT::FP16 && out.getDataType() == DT::FP16 &&
+      (int)rows <= gpu_max_rows) {
+    const unsigned short *xi =
+      reinterpret_cast<const unsigned short *>(in.getData<_FP16>());
+    const unsigned short *gi =
+      reinterpret_cast<const unsigned short *>(gamma.getData<_FP16>());
+    unsigned short *yi =
+      reinterpret_cast<unsigned short *>(out.getData<_FP16>());
+    if (dev_ok(xi) && dev_ok(gi) && dev_ok(yi) &&
+        cuda::cuda_rmsnorm_fp16(xi, gi, yi, eps, rows, width))
+      return;
+  }
+#endif
+  // Host rmsnorm fallback: sync first so the host read of GPU-produced input is
+  // coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+  cuda::StreamManager::Global().finishIfAsync();
+  if (dt == DT::FP32 && gt == DT::FP32) {
+    rmsnorm_rows(in.getData<float>(), gamma.getData<float>(),
+                 out.getData<float>(), rows, width, eps);
+#ifdef ENABLE_FP16
+  } else if (dt == DT::FP16 && gt == DT::FP16) {
+    rmsnorm_rows(in.getData<_FP16>(), gamma.getData<_FP16>(),
+                 out.getData<_FP16>(), rows, width, eps);
+  } else if (dt == DT::FP16 && gt == DT::FP32) {
+    rmsnorm_rows(in.getData<_FP16>(), gamma.getData<float>(),
+                 out.getData<_FP16>(), rows, width, eps);
+  } else if (dt == DT::FP32 && gt == DT::FP16) {
+    rmsnorm_rows(in.getData<float>(), gamma.getData<_FP16>(),
+                 out.getData<float>(), rows, width, eps);
+#endif
+  } else {
+    throw std::invalid_argument(
+      "CudaComputeOps::rms_norm: unsupported data type");
+  }
+}
+} // namespace
+
+void CudaComputeOps::rms_norm(const Tensor &in, Tensor &out,
+                              const Tensor &gamma, float epsilon,
+                              unsigned int active_rows,
+                              unsigned int row_offset) {
+  // rmsnorm_dispatch consumes base pointers + a row count, so the
+  // (active_rows, row_offset) window becomes a shared-data view at the row
+  // offset. Every in-tree caller passes row_offset 0, where the views alias
+  // the arguments' own buffers -- the same pointers the former per-backend
+  // layer handed the dispatch.
+  const unsigned int width = in.width();
+  const size_t elem_off = (size_t)row_offset * width;
+  Tensor in_win = in.getSharedDataTensor(
+    TensorDim(1, 1, active_rows, width, in.getDim().getTensorType()), elem_off,
+    true);
+  Tensor out_win = out.getSharedDataTensor(
+    TensorDim(1, 1, active_rows, width, out.getDim().getTensorType()), elem_off,
+    true);
+  rmsnorm_dispatch(in_win, gamma, out_win, active_rows, width, epsilon);
 }
 
 ComputeOps *get_cuda_ops() {

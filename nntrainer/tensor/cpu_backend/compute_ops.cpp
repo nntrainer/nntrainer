@@ -437,6 +437,10 @@ void ComputeOps::fc(Tensor &, Tensor &, Tensor &) { NI(fc); }
 void ComputeOps::apply_activation(Tensor &, int) { NI(apply_activation); }
 void ComputeOps::scalar_mul(const Tensor &, Tensor &, float) { NI(scalar_mul); }
 void ComputeOps::softcap(const Tensor &, Tensor &, float, int) { NI(softcap); }
+void ComputeOps::rms_norm(const Tensor &, Tensor &, const Tensor &, float,
+                          unsigned int, unsigned int) {
+  NI(rms_norm);
+}
 
 #undef NI
 
