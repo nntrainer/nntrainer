@@ -438,7 +438,8 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
   // NNTR_LAYER_HASH: per-layer output FNV-1a hash dump for the FIRST (prefill)
   // forward, to pinpoint where two runs diverge -- e.g. an sm_87 GPU kernel vs
   // the host path on the SAME machine+model, or Orin vs RTX4070. Compare the
-  // [LH] lines from two runs; the first mismatching layer is the culprit.
+  // "[LH]" lines it prints from two runs; the first mismatching layer is the
+  // culprit.
   // Managed activations need a device sync before the host read (Tegra
   // concurrentManagedAccess=0); a device-only pointer is mirrored to host.
   static const bool _layer_hash = std::getenv("NNTR_LAYER_HASH") != nullptr;

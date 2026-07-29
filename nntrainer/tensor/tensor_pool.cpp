@@ -18,7 +18,7 @@
 #include <memory_pool.h>
 #include <nntrainer_log.h>
 #ifdef ENABLE_OPENCL
-#include <cl_buffer_pool.h> // [W3] ensureZeroFilled after classification
+#include <cl_buffer_pool.h> // ensureZeroFilled after classification
 #endif
 #include <residency_planner.h>
 #include <residency_policy.h>
@@ -285,9 +285,9 @@ void TensorPool::allocate(bool init) {
    * the ClBufferPool was selected (same condition as the factory): class ⟺
    * handle. With the pool off every tensor derives SVM/HOST and all binding
    * sites fall through to today's paths (byte-identical). */
-  // [r21] The r19 DETERMINISTIC pool-off override is gone: the real culprit
-  // was the embedding0 boundary-raise upload (causal_lm.cpp), fixed at zero
-  // cost — the pool stays on under the determinism contract.
+  // The pool stays on under the determinism contract: the run-to-run
+  // divergence once blamed on it was the embedding0 boundary-raise upload
+  // (causal_lm.cpp), fixed at zero cost.
   static const bool clmem_pool_on = nntr_env_on("NNTR_GPU_CLMEM_POOL");
   // Capability, not name: can this allocator back a device cl_mem pool
   // (ClBufferPool)? True only for ClSVMAllocator — same set as the old
@@ -365,7 +365,7 @@ void TensorPool::allocate(bool init) {
         details->role, spec.tensor->getName(), details->view_count);
       md->setResidency(cls);
 #ifdef ENABLE_OPENCL
-      /** [W3] Zero-fill the tensor's per-offset cl_mem only when something
+      /** Zero-fill the tensor's per-offset cl_mem only when something
        * will actually bind it (class == GPU_CLMEM). ClBufferPool::allocate no
        * longer fills eagerly: an untouched cl_mem never becomes WS-resident
        * under WDDM, and the eager fill committed ~172MB of never-bound

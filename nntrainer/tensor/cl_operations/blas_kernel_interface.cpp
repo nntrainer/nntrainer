@@ -450,7 +450,7 @@ struct V8cWeightEntry {
 
 // Buffer-path (NNTR_V8C_BUF): on Intel NEO the v8c GEMM uses the *_buf kernels
 // whose args are declared __global uint4* — they must be bound to raw cl_mem
-// BUFFERS, not image2d objects. [T8] single source of truth is
+// BUFFERS, not image2d objects. The single source of truth is
 // blas_kernels.cpp::v8c_use_buffer_path() (caps-derived from vendor_id; the env
 // flag still overrides); this file-local name forwards to it.
 static bool v8c_buffer_path() { return v8c_use_buffer_path(); }
@@ -552,8 +552,9 @@ struct V8cScratch {
   unsigned long long last_quant_resident_generation = 0;
 
   // [FC->FC chained edge] Identity + ACTUAL cl_mem store target of the last
-  // v8c FC's cl_mem-plane output. gauss4 uniquely chains two v8c FCs with no
-  // op in between (attention_gate_down->gate_up, ffn_gate_up->ffn_gate_down);
+  // v8c FC's cl_mem-plane output. A model whose graph chains two v8c FCs with
+  // no op in between (e.g. attention gate_down->gate_up, ffn
+  // gate_up->gate_down) needs this:
   // the consumer's act-quant source derived via input.getMemoryData()->
   // deviceMem() must resolve to the exact buffer the producer stored to
   // (direct_out GEMM store or the kernel writer). Recording the producer's
@@ -654,7 +655,6 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   // int4 weights are QS4CX: row-major plain nibbles (uint4 = int4+8, no XOR) +
   // per-output-channel fp32 scale. A legacy QINT4 .bin is re-laid-out to this
   // form at load (QS4CX_Tensor::read), so the v8c backing has a single source.
-  // [Phase C Path B]
   if (weight.getDataType() != ml::train::TensorDim::DataType::QS4CX)
     return nullptr;
   V8cWeightEntry e;
@@ -1449,10 +1449,10 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   // bind the producer's ACTUAL store target instead of the re-derived handle.
   // ClBufferPool's per-padded-offset cl_mem dedup can resolve the two
   // derivations to different buffers, making the consumer's act-quant read
-  // zero-initialized pool bytes the producer never wrote (gauss4
-  // gate_down->gate_up / ffn_gate_up->ffn_gate_down; fluent-but-wrong text).
-  // No-op when the derivations already agree; structurally never fires for
-  // models without FC->FC edges (gemma4/qwen3/gemma2). All-GPU, no drains.
+  // zero-initialized pool bytes the producer never wrote (gate_down->gate_up
+  // / ffn_gate_up->ffn_gate_down; fluent-but-wrong text). No-op when the
+  // derivations already agree; structurally never fires for models without
+  // FC->FC edges. All-GPU, no drains.
   if (device_clmem_in && input.getMemoryData() &&
       sc.last_fc_out_md ==
         static_cast<const void *>(input.getMemoryData().get()) &&
@@ -1517,7 +1517,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
   cl_mem act_zp_arg = nullptr;
   cl_mem act_rs_arg = nullptr;
 
-  // [Lever 1] NNTR_FC_QUANT_DIRECT: on the cl_mem residency edge, quantize the
+  // NNTR_FC_QUANT_DIRECT: on the cl_mem residency edge, quantize the
   // producer's (rmsnorm) cl_mem output IN PLACE, skipping the cl_mem->sc.act_in
   // staging copy (the v8c_copy_h2h kernel) and the padded-row zero write. The
   // act-quant kernel reads exactly M real rows from clmem_in (gws=M*64, bounded
@@ -1601,7 +1601,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
     // FC) -- the submit-split output perturbation it caused is a race
     // pattern, not a math change (drained-capture proof), and the
     // re-baselined reference outputs absorb it. +15%-class idle recovery.
-    return v8c_use_buffer_path() ? 0 : 1; // [T8] Intel buffer ⇒ mode 0
+    return v8c_use_buffer_path() ? 0 : 1; // buffer path ⇒ mode 0
   }();
   if (fc_flush_mode == 2 && !skip_upload_and_quant)
     clFlush(q);
@@ -1619,7 +1619,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       // (the normed activation, written device-direct by the converted rmsnorm)
       // into sc.act_in. No SVM map/unmap -- the in-order SVM-pool queue orders
       // this copy after the rmsnorm coop write of the same cl_mem.
-      // [Lever 1] quant_direct_clmem skips this copy: the act-quant below reads
+      // quant_direct_clmem skips this copy: the act-quant below reads
       // clmem_in directly.
       if (!quant_direct_clmem &&
           clEnqueueCopyBuffer(q, clmem_in, sc.act_in, 0, 0,
@@ -1658,7 +1658,7 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
 
   try {
     if (!skip_upload_and_quant) {
-      // [Lever 1] quant the producer cl_mem (M real rows) directly when
+      // Quant the producer cl_mem (M real rows) directly when
       // quant_direct_clmem; otherwise the staged sc.act_in (M_pad rows incl.
       // the zero pad). Padded act_i8/scale/zp/rs rows [M, M_pad) are left stale
       // in the direct case -- they feed only discarded padded GEMM output rows.
