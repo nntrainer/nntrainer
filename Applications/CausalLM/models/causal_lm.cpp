@@ -630,7 +630,18 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   std::vector<int64_t> init_input;
   unsigned int _len = _input.size();
-  unsigned int num_allow_str = MAX_SEQ_LEN - NUM_TO_GENERATE;
+  // [prefill-chunk] One forward pass cannot process more than INIT_SEQ_LEN
+  // query rows without overflowing the shared activation tensor (built at
+  // {1,1,1,INIT_SEQ_LEN} in constructModel; resetInputDimension is disabled).
+  // Without chunking that caps the prompt at INIT_SEQ_LEN. With chunking the
+  // prefill is fed FORWARD in chunks of <= INIT_SEQ_LEN rows -- each chunk fits
+  // the buffer -- so the prompt is bounded by the KV budget alone, and the
+  // activation plane stays INIT_SEQ_LEN-sized regardless of prompt length.
+  const bool _prefill_chunking = effectivePrefillChunk() > 0;
+  unsigned int num_allow_str =
+    _prefill_chunking
+      ? (MAX_SEQ_LEN - NUM_TO_GENERATE)
+      : std::min<unsigned int>(INIT_SEQ_LEN, MAX_SEQ_LEN - NUM_TO_GENERATE);
   unsigned int text_len = _len;
 
   if (_len > num_allow_str) {
@@ -756,16 +767,62 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   const unsigned int prefill_from = SYS_PROMP_LEN + global_token_len;
   std::vector<unsigned int> id_list;
 
+  // [prefill-chunk] NNTR_PREFILL_CHUNK=C (>0) drives the prefill FORWARD in
+  // C-token chunks instead of one M-token block. Each chunk feeds its tokens at
+  // input row 0 and writes KV at the absolute range [from, from+clen); the next
+  // chunk attends over the accumulated cache. For causal (and sliding-window)
+  // attention each query sees the identical causal prefix whether computed in
+  // one block or in forward chunks, so the output is bit-identical at a fixed
+  // chunk size. This is the exact token-feed pattern the decode call shape
+  // already uses (tokens at input row 0, absolute KV position via `from`),
+  // generalized from chunk=1 to chunk=C -- not a new execution model.
+  // C=0 (ring opt-out / ARM) is the single-block behaviour verbatim.
+  //
+  // Each chunk must fit the INIT_SEQ_LEN-height activation buffer, so clamp the
+  // requested chunk to INIT_SEQ_LEN (a larger request would overflow it).
+  const unsigned int prefill_chunk =
+    _prefill_chunking
+      ? std::min<unsigned int>(effectivePrefillChunk(), INIT_SEQ_LEN)
+      : 0u;
+  auto do_prefill = [&](unsigned int n_tok,
+                        unsigned int from_pos) -> std::vector<float *> {
+    // Single block (default) when chunking is off or the prompt fits one chunk.
+    // NOTE: this must go through CausalLM::incrementalInference, not
+    // NeuralNetwork::incremental_inference -- the wrapper feeds KVCacheManager
+    // tensors as the REAL tensor so their isSVM() flag survives the per-call
+    // fillPlaceholder/syncDependents (see its contract comment). Calling the
+    // raw model method here drops attention to the host path.
+    if (prefill_chunk == 0 || n_tok <= prefill_chunk) {
+      return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
+                                  from_pos + n_tok);
+    }
+    // Chunked forward prefill.
+    std::vector<float *> out;
+    for (unsigned int o = 0; o < n_tok; o += prefill_chunk) {
+      const unsigned int clen = std::min(prefill_chunk, n_tok - o);
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+        for (unsigned int j = 0; j < clen; ++j)
+          input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =
+            static_cast<float>(init_input[o + j]);
+      const unsigned int cf = from_pos + o;
+      auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
+      if (o + clen < n_tok)
+        for (auto &oo : so)
+          delete[] oo;
+      else
+        out = std::move(so);
+    }
+    return out;
+  };
+
   if (SKIP_PREFILL && init_len > 1) {
     // Prefill only N-1 tokens; the last input token will be used as the first
     // token in the generation phase (assigned directly, not sampled).
     unsigned int skipped_token =
       static_cast<unsigned int>(init_input[init_len - 1]);
 
-    const unsigned int prefill_to = prefill_from + input_len - 1;
     setKVCachePosition(prefill_from);
-    output = incrementalInference(BATCH_SIZE, input, init_len - 1, prefill_from,
-                                  prefill_to);
+    output = do_prefill(init_len - 1, prefill_from);
 
     for (unsigned int b = 0; b < BATCH_SIZE; ++b)
       id_list.push_back(skipped_token);
@@ -775,10 +832,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     input_len -= 1;
     init_len -= 1;
   } else {
-    const unsigned int prefill_to = prefill_from + input_len;
     setKVCachePosition(prefill_from);
-    output = incrementalInference(BATCH_SIZE, input, init_len, prefill_from,
-                                  prefill_to);
+    output = do_prefill(init_len, prefill_from);
 
     // post process of model output
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);
