@@ -605,3 +605,73 @@ Known outstanding issues not yet addressed:
   at load, so a layout mismatch remains silent.
 
 ---
+
+---
+
+## 17. The §15 plan was wrong — measured, not guessed
+
+§15 proposed two decode optimisations on the assumption that the 14.3 ms/token
+sitting outside `GGML_HEXAGON_PROFILE`'s window was bridge host-side work.
+Added `NNTR_HTP_BRIDGE_PROF=1` to split our own per-call cost before building
+either. Over 25,000 decode ops (us/op):
+
+| phase | us/op |
+|---|---|
+| weight cache lookup | 0.0 |
+| staging alloc + activation memcpy **in** | 0.1 |
+| descriptor build + `enqueue_op` (all the opbatch machinery) | **0.4** |
+| **`flush()` — the DSP round trip** | **125.3** |
+| result memcpy **out** | 0.2 |
+| total | 126.1 |
+
+**Both planned fixes are worth ~0.4 us and ~0.3 us respectively.** Bypassing
+`opbatch` to write the descriptor block directly would save 0.4 us on a 126 us
+operation. Eliminating the memcpys would save 0.3 us — obvious in hindsight,
+since a decode activation is 1 x 1024 x 4 = 4 KB.
+
+The 14.3 ms/token is therefore almost entirely **nntrainer's own CPU work**
+(attention, norms, Q6_K LM head, sampling), not ours: 126.1 us x 196 ops =
+24.7 ms/token in the bridge, against 33 ms/token measured, leaving ~8.3 ms —
+consistent with CPU-only decode being 11.1 ms/token in total.
+
+Lesson for the log: the profiled window boundary was doing the arguing, not the
+data. Two days of work avoided by twenty lines of timing.
+
+### Everything else is already at its optimum
+
+| lever | result |
+|---|---|
+| DSP clock | already pinned — `htp/main.c` sets DCVS v3 to `HAP_DCVS_VCORNER_MAX`, `sleep_disable` |
+| `NHVX` (DSP threads) | default (all) 30.28 > 4: 30.05 > 2: 26.92 > 1: 21.38 |
+| ring sizing (`OPBATCH`/`OPQUEUE`) | inert |
+| FastRPC QoS mode | `RPC_POLL_QOS` +1% (30.27 -> 30.62); applies to sync RPC, our path is dspqueue |
+| `OPPOLL` | already taken, §14, +20% |
+
+Incidental bug found and fixed: `ggml_hexagon_session::allocate()` assigned only
+`.enable` on its `remote_rpc_control_latency`, leaving `.latency` as stack
+garbage. `remote.h` documents it as required for every mode but
+`RPC_DISABLE_QOS`.
+
+### So decode is at its floor for one-op-per-submission
+
+Per-op cost decomposes as ~27 us DSP compute + ~98 us IPC round trip, and the
+IPC part is a driver/hardware floor. **The only remaining lever is fewer round
+trips, which is exactly op batching.** Projecting from the measured constants
+(dispatch ~98 us per submission, compute 196 x 27 us = 5.3 ms/token, nntrainer
+CPU 8.3 ms/token):
+
+| submissions/token | bridge ms | total ms | decode t/s |
+|---|---|---|---|
+| 196 (today, one op per flush) | 24.7 | 33.0 | **30.4** |
+| 112 (fuse Q/K/V and gate/up) | 16.3 | 24.6 | ~41 |
+| 28 (fuse whole layer) | 8.0 | 16.3 | ~61 |
+| 1 (whole forward pass) | 5.4 | 13.7 | ~73 |
+| CPU reference | — | 11.1 | 90.5 |
+
+Note even perfect batching lands at ~73 t/s, still short of CPU — consistent
+with §7 and §12. But it moves decode from 30 to 41-61 t/s, which is the whole
+remaining opportunity on the single-prompt path.
+
+**This puts the current constraints in conflict:** "maximise single-prompt
+performance" and "no op batching" cannot both hold any further. Everything
+reachable without batching has been taken.
