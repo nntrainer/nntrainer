@@ -247,6 +247,30 @@ int NeuralNetwork::compile(ExecutionMode mode) {
     }
   }
 #endif
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // CUDA analogue of the SVM-pool routing above: a graph with engine=cuda
+  // nodes routes the pool to the cuda context's Unified-Memory allocator
+  // (cudaMallocManaged), so pool tensors are device-visible AND
+  // host-addressable. Without this the pool stays on the plain CPU allocator
+  // and every CudaComputeOps device fast path silently self-disables on its
+  // dev_accessible() guard (host dot at ~3 TPS prefill; the trap
+  // GPU_CHECKLIST.md items 14/15 describe). isComputeEngineCUDA() reads the
+  // engine property directly, so it is valid here pre-finalize.
+  // NNTR_CUDA_UVM_POOL=0 opts back out to the CPU allocator (mirrors
+  // NNTR_GPU_SVM_POOL). The OpenCL routing above wins on a mixed graph.
+  if (engine_name == "cpu") {
+    const char *_uvm_pool_env = std::getenv("NNTR_CUDA_UVM_POOL");
+    const bool uvm_pool_on = !_uvm_pool_env || std::atoi(_uvm_pool_env) != 0;
+    if (uvm_pool_on) {
+      for (auto &n : graph_representation) {
+        if (n->isComputeEngineCUDA()) {
+          engine_name = "cuda";
+          break;
+        }
+      }
+    }
+  }
+#endif
 
   bool has_qnn_engine = false;
   for (auto &node : graph_representation) {
