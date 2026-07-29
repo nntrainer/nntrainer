@@ -955,3 +955,45 @@ polished the dispatch is. That is a hardware property, not a software gap,
 and it is exactly why the sensible design - prefill on NPU, decode on CPU -
 is the one both this project's hybrid (SS9/SS13) and the physical evidence
 above independently arrive at, rather than "NPU for everything."
+
+---
+
+## 22. Correction to S18: it is not "attention falls to CPU," it is a 20x DSP-side compute blowup
+
+User's question, precisely stated: since batched decode at M=32 and single-sequence
+prefill at M=32 present the same row count to the FC matmuls, shouldn't they
+compute the same way? Tested directly rather than re-asserting S18's looser
+explanation ("attention stays on CPU, that pulls the aggregate down").
+
+`GGML_HEXAGON_PROFILE=1 -v`, same device, same model:
+
+| config | n-ops | DSP compute (htp-ops-usec) |
+|---|---|---|
+| single-sequence prefill, M=32 | 535 | **96,600us** |
+| batched decode, npl=32 (M=32 via 32 sequences x 1 token) | 647 | **1,941,000us** |
+
+**20x slower on the DSP itself**, not a CPU-fallback effect - op count only grew
+~20% (535 -> 647), so a proportional per-op slowdown cannot explain a 20x time
+increase; a small number of ops must be enormously more expensive in the batched
+config. (Sanity check: 32 seqs x 8 tg tokens / (8 x 1.941s) = 16.5 tok/s, matching
+S18's directly-measured npl=32 aggregate of 15.8 tok/s.)
+
+**Why "same M" does not mean "same shape."** FC/MLP layers are shared-weight
+matmuls: 32 rows through the *same* weight matrix costs the same whether those
+rows are 32 positions of one prompt or 32 independent decode steps. Attention is
+not shared-weight. Prefill's M=32 is 32 positions of *one* sequence attending to
+one common, causal-masked, growing KV cache - exactly the shape the fused
+flash-attention kernel is built for. Batched decode's M=32 is 32 *independent*
+sequences, each with its own separate KV history - there is no shared structure
+to fuse over, which is precisely why `ggml_hexagon_supported_flash_attn_ext`'s
+`dst->ne[3] != 1` gate (S19) rejects it. The decomposed fallback, even for the
+ops that still land on the DSP, is dramatically more expensive per row for 32
+independent small attentions than one fused kernel over 32 shared positions.
+
+**Correction to S18: M>=32 is necessary for HMX to help but not sufficient - the
+op also needs "more rows" to mean "more of the same shared work."** FC layers
+qualify unconditionally. Attention only qualifies when the rows share one KV
+history, which single-sequence prefill has and multi-sequence batched decode
+does not. This is a sharper, quantified replacement for S18's explanation, not
+a reversal of its conclusion (batching still does not help decode on this
+device) - the mechanism is a 20x DSP-side compute cost, not a CPU handoff.
