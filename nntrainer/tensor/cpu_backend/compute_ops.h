@@ -382,7 +382,7 @@ public:
   // Layer owns structure/shape/orchestration while ComputeOps owns the whole
   // kernel. Unlike the raw-pointer ops above, these take Tensors so the backend
   // impl can introspect residency (isClMem/getClMem/isSVM) and bind device
-  // buffers directly. Default throws; CPU/CL/CUDA subclasses override. [T7]
+  // buffers directly. Default throws; CPU/CL/CUDA subclasses override.
   // ===========================================================================
 
   /**

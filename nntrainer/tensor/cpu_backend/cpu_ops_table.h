@@ -13,7 +13,7 @@
  * UVM is host-coherent, so CudaComputeOps derives from CpuComputeOps to reuse
  * the CPU op implementations and only override what it accelerates. The class
  * is a thin forwarding wrapper (each method calls the arch-dispatched
- * nntrainer::sgemm etc.), so it stays header-inline. [T6]
+ * nntrainer::sgemm etc.), so it stays header-inline.
  */
 
 #ifndef __NNTRAINER_CPU_OPS_TABLE_H__
@@ -365,10 +365,10 @@ public:
 
   // Whole-op (Tensor-level). Out-of-line in cpu_ops_table.cpp so this header
   // stays free of <tensor.h>. Pure host gelu_tanh(gate)*up over the live rows
-  // (correct for host and host-coherent SVM/UVM pointers). [T7]
+  // (correct for host and host-coherent SVM/UVM pointers).
   void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
              unsigned int active_rows, unsigned int row_offset) override;
-  // out = silu(gate) * up over the live rows (numerically stable SiLU). [T7]
+  // out = silu(gate) * up over the live rows (numerically stable SiLU).
   void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
               unsigned int active_rows, unsigned int row_offset) override;
   // out = sigmoid(gate) * up over the live rows (fp32-accumulated).
@@ -377,10 +377,10 @@ public:
   // out = sigmoid(gate) + emb over the live rows (fp32-accumulated).
   void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
                    unsigned int active_rows, unsigned int row_offset) override;
-  // hidden = input (copy) / hidden += input (add) via host Tensor ops. [T7]
+  // hidden = input (copy) / hidden += input (add) via host Tensor ops.
   void residual_op(Tensor &hidden, const Tensor &input,
                    bool accumulate) override;
-  // output = input * weight via host Tensor::dot (the CPU FC matmul). [T7]
+  // output = input * weight via host Tensor::dot (the CPU FC matmul).
   void fc(Tensor &input, Tensor &weight, Tensor &output) override;
 
   void apply_activation(Tensor &out, int act_type) override;

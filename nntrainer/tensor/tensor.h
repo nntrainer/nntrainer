@@ -2050,7 +2050,7 @@ public:
    * Priority: attached ContextData (per-vendor ops, e.g. ClComputeOps /
    * CudaComputeOps) > the global CPU table. This is how a neutral Layer
    * reaches the right backend's whole-op kernel without an #ifdef: e.g.
-   * `in1.getOps()->geglu(...)`. [T7]
+   * `in1.getOps()->geglu(...)`.
    */
   ComputeOps *getOps() const { return itensor_->getOps(); }
 

@@ -251,7 +251,7 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
     }
   }
 
-  // [T10] fused activation epilogue dispatched through the op table, so the
+  // Fused activation epilogue dispatched through the op table, so the
   // fusion is backend-neutral: CpuComputeOps runs the host ActiFunc, a GPU
   // ComputeOps can fuse it into the GEMM epilogue. Eliminates the separate
   // ActivationLayer node; value-identical to it.

@@ -1021,7 +1021,7 @@ public:
  *        ActivationLayer node. Distinct key from `activation` (which is a
  *        LayerNode *realization* property consumed by ActivationRealizer) so
  * the FusionRealizer can move the activation onto the compute layer without it
- *        being split back out into a node. [T10]
+ *        being split back out into a node.
  */
 class FusedActivation final
   : public EnumProperty<nntrainer::props::ActivationTypeInfo> {

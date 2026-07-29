@@ -477,7 +477,7 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
     }
   }
 
-  // [T10] fused activation epilogue dispatched through the op table (backend-
+  // Fused activation epilogue dispatched through the op table (backend-
   // neutral: CPU host ActiFunc / GPU kernel). Value-identical to the standalone
   // ActivationLayer node it replaces.
   auto &fused_act = std::get<props::FusedActivation>(conv_props);
