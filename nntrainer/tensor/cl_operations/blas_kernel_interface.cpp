@@ -1154,6 +1154,8 @@ bool clmem_residual_op_cl(Tensor &dst, const Tensor &src, bool accumulate) {
                             static_cast<cl_mem>(dst_cl), 0, 0, bytes, 0,
                             nullptr, nullptr) != CL_SUCCESS)
       throw std::runtime_error("clmem_residual_op_cl: clEnqueueCopyBuffer");
+    clmem_probe_capture((dst.getName() + ":cp").c_str(), nullptr, dst_cl,
+                        (unsigned int)bytes);
     return true;
   }
 
@@ -1245,6 +1247,11 @@ bool clmem_residual_op_cl(Tensor &dst, const Tensor &src, bool accumulate) {
   if (dst_cl == nullptr)
     cc->command_queue_inst_.enqueueSVMMap(dst_svm, bytes, true,
                                           /** async */ true);
+  // NNTR_CLMEM_PROBE: capture the residual dst after the op (copy/add) for
+  // the fan-out bisect; cl_mem captures are reliable.
+  clmem_probe_capture((dst.getName() + (accumulate ? ":add" : ":cp")).c_str(),
+                      dst_cl == nullptr ? dst_svm : nullptr, dst_cl,
+                      (unsigned int)bytes);
   return true;
 }
 
@@ -1946,6 +1953,21 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       !out_clmem && output.getMemoryData() && output.getMemoryData()->isSVM() &&
       (output.getDataType() == ml::train::TensorDim::DataType::FP32 ||
        output.getDataType() == ml::train::TensorDim::DataType::FP16);
+    // NNTR_CLMEM_PROBE: capture the raw fp16 GEMM result for the gate/up/qkv
+    // FCs (sc.y_fp16 is cl_mem in BOTH modes -- directly comparable).
+    {
+      static const bool probe_on = std::getenv("NNTR_CLMEM_PROBE") != nullptr;
+      if (probe_on) {
+        const std::string &on_ = output.getName();
+        if (on_.find("ffn_gate") != std::string::npos ||
+            on_.find("ffn_up") != std::string::npos ||
+            on_.find("_wq") != std::string::npos ||
+            on_.find("_wk") != std::string::npos ||
+            on_.find("_wv") != std::string::npos)
+          clmem_probe_capture((on_ + ":y").c_str(), nullptr, sc.y_fp16,
+                              (unsigned int)(sizeof(uint16_t) * (size_t)M * N));
+      }
+    }
     if (out_clmem) {
       cl_mem out_sub = static_cast<cl_mem>(output.getMemoryData()->deviceMem());
       // KERNEL writer (not clEnqueueCopyBuffer): see the note inside
