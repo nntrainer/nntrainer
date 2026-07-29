@@ -71,7 +71,7 @@ struct DeviceCaps {
                                      vendor_id at init (Intel NEO's compiler
                                      rejects the integer-coord read_imageui v8c
                                      kernel ⇒ buffer; Adreno/unknown ⇒ image). The
-                                     V8C_BUF cell of the resolver. [T8] */
+                                     V8C_BUF cell of the resolver. */
   bool dpas = false; /**< OpenCL cl_intel_subgroup_matrix_multiply_accumulate
                           — the actual systolic-array/DPAS matrix engine
                           (Xe2/Xe3 "Arc"/"Battlemage" and later). NOT the

@@ -710,7 +710,7 @@ template const int AppContext::registerFactory<nntrainer::Layer>(
 
 // Non-template seam (Context::registerLayerFactory override): forwards to the
 // per-class registerFactory<Layer> here in the same TU so the explicit
-// instantiation is used and no template crosses the .so boundary. [T3]
+// instantiation is used and no template crosses the .so boundary.
 int AppContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
                                      const std::string &key,
                                      const int int_key) {

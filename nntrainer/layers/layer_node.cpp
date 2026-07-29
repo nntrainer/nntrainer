@@ -339,25 +339,28 @@ void LayerNode::setComputeEngine(
   this->compute_engine = "cpu";
 }
 
-bool LayerNode::isComputeEngineGPU() const {
+ml::train::LayerComputeEngine LayerNode::residencyEngine() const {
   if (!layer_node_props)
-    return false;
+    return ml::train::LayerComputeEngine::CPU;
   auto &ce = std::get<props::ComputeEngine>(*layer_node_props);
-  return !ce.empty() && istrequal(ce.get(), "gpu");
+  if (ce.empty())
+    return ml::train::LayerComputeEngine::CPU;
+  // The engine tag is a registered Context NAME, so the plane is whatever that
+  // Context declares (Context::residencyEngine()) -- not something decided
+  // here by comparing the name against a hardcoded spelling.
+  return toLayerComputeEngine(ce.get());
+}
+
+bool LayerNode::isComputeEngineGPU() const {
+  return residencyEngine() == ml::train::LayerComputeEngine::GPU;
 }
 
 bool LayerNode::isComputeEngineCUDA() const {
-  if (!layer_node_props)
-    return false;
-  auto &ce = std::get<props::ComputeEngine>(*layer_node_props);
-  return !ce.empty() && istrequal(ce.get(), "cuda");
+  return residencyEngine() == ml::train::LayerComputeEngine::CUDA;
 }
 
 bool LayerNode::isComputeEngineCPU() const {
-  if (!layer_node_props)
-    return true;
-  auto &ce = std::get<props::ComputeEngine>(*layer_node_props);
-  return ce.empty() || istrequal(ce.get(), "cpu");
+  return residencyEngine() == ml::train::LayerComputeEngine::CPU;
 }
 
 const std::string LayerNode::getName() const {

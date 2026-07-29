@@ -1000,30 +1000,50 @@ public:
   std::string getComputeEngineType() { return compute_engine; }
 
   /**
-   * @brief Query whether this node requests the GPU compute engine via its
-   *        `engine` property. Unlike getComputeEngineType() (which reflects the
-   *        cached member set only during finalize()), this reads the property
-   *        directly and is therefore valid earlier, e.g. when choosing the
-   *        graph-wide memory allocator at NetworkGraph construction.
-   * @return true iff the `engine` property is set and equals GPU
+   * @brief Which residency plane this node's tensors live on, resolved from
+   *        its `engine` property.
+   *
+   * An engine tag is a registered Context NAME, not a device taxonomy: names
+   * are flat map keys bound one-per-Context by registerContext(), so "gpu" and
+   * "cuda" are disjoint by construction and neither is a superset of the
+   * other. The name is therefore not something to pattern-match on; the
+   * Context it resolves to declares its own plane via
+   * Context::residencyEngine(), and this query reports that declaration. A
+   * vendor backend that self-registers under any name (e.g. "npu", "exynos")
+   * resolves here with no edit to this class.
+   *
+   * Unlike getComputeEngineType() (which reflects the cached member set only
+   * during finalize()), this reads the property directly and is therefore
+   * valid earlier, e.g. when choosing the graph-wide memory allocator at
+   * NetworkGraph construction.
+   *
+   * @return residency plane of this node (CPU when the property is unset)
+   */
+  ml::train::LayerComputeEngine residencyEngine() const;
+
+  /**
+   * @brief Query whether this node's tensors live on the OpenCL residency
+   *        plane. Shorthand for `residencyEngine() == GPU`; a CUDA node
+   *        reports CUDA, not GPU, because the two are separate planes with
+   *        separate allocators - see residencyEngine() for the contract.
+   * @return true iff this node's engine resolves to the GPU plane
    */
   bool isComputeEngineGPU() const;
 
   /**
-   * @brief Query whether this node requests the CUDA compute engine via its
-   *        `engine` property (the additive NVIDIA backend). Same direct-read
-   *        rationale as isComputeEngineGPU(); used to route the graph's memory
-   *        allocator to CUDA Unified Memory.
-   * @return true iff the `engine` property is set and equals CUDA
+   * @brief Query whether this node's tensors live on the CUDA residency plane
+   *        (the additive NVIDIA backend); used to route the graph's memory
+   *        allocator to CUDA Unified Memory. Shorthand for
+   *        `residencyEngine() == CUDA`.
+   * @return true iff this node's engine resolves to the CUDA plane
    */
   bool isComputeEngineCUDA() const;
 
   /**
-   * @brief Query whether this node runs on the CPU compute engine (the
-   *        `engine` property is unset — CPU is the default — or explicitly
-   *        CPU). Same direct-read rationale as isComputeEngineGPU(): valid
-   *        before finalize(), e.g. for compile-time graph realizers.
-   * @return true iff the node's engine resolves to CPU
+   * @brief Query whether this node runs on the host residency plane (the
+   *        `engine` property is unset — CPU is the default — or resolves to a
+   *        host-resident Context). Shorthand for `residencyEngine() == CPU`.
+   * @return true iff this node's engine resolves to CPU
    */
   bool isComputeEngineCPU() const;
 

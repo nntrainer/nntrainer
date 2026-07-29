@@ -98,6 +98,10 @@ Engine::parseComputeEngine(const std::vector<std::string> &props) const {
       // self-registers a Context (e.g. "npu", "exynos") then resolves with no
       // enum edit; an unknown/unavailable engine falls back to "cpu" instead of
       // resolving to a name that getRegisteredContext would later reject.
+      // An engine tag is therefore a registered Context NAME, not a device
+      // taxonomy: names are flat keys bound one-per-Context, so "gpu" and
+      // "cuda" are disjoint by construction and no tag is a superset of
+      // another. Nothing downstream should read a hierarchy into them.
       // [docs/ARCHITECTURE_REFACTOR.md §10 T3]
       std::string name = value;
       std::transform(name.begin(), name.end(), name.begin(),
