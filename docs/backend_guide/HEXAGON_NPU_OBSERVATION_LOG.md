@@ -997,3 +997,59 @@ history, which single-sequence prefill has and multi-sequence batched decode
 does not. This is a sharper, quantified replacement for S18's explanation, not
 a reversal of its conclusion (batching still does not help decode on this
 device) - the mechanism is a 20x DSP-side compute cost, not a CPU handoff.
+
+---
+
+## 23. Clean side-by-side matrix: prefill / single decode / batched decode, both frameworks
+
+Requested explicitly: one consistent pass, valid (not tiny) prefill length,
+single vs. batched decode measured separately, both ggml-hexagon and
+nntrainer. Rebuilt `libggml-hexagon.so` fresh from the current tree first and
+pushed the identical binary (md5 `a38bb97489c441aedc4d544776e21c03`) to all
+three device targets (`llamabench`, `htpbridge`,
+`nntrainer/causallm`) - eliminates any doubt about whether earlier llama-bench
+runs used a pre- or post- S17 QoS-fix binary (the uninitialized
+`remote_rpc_control_latency.latency` fix is in shared `allocate()` code, so it
+silently affected every caller, llama-bench included, from the moment it was
+committed).
+
+**Branch check (requested): neither `self-build` nor `self-build-jz` has moved.**
+`origin/self-build` is exactly the commit this whole log has treated as "the
+reference" since S7 - we are 4 commits ahead locally, unpushed, nothing new
+landed upstream. `self-build-jz` is the identical `56507c2bb` already analyzed
+in S20. Nothing new to account for from either branch.
+
+### ggml-hexagon reference (llama-bench / llama-batched-bench, Qwen3-0.6B-Q4_0.gguf, 4 threads)
+
+| test | CPU | NPU (HTP0) | ratio |
+|---|---|---|---|
+| Prefill, 512 tok, single sequence | 576.5 | **2044.3** | 3.55x faster |
+| Decode, single sequence, 128 tok | 155.7 | 34.6 | 0.22x (4.5x slower) |
+| Decode, batched (npl=32), aggregate | 445.1 | 16.1 | 0.036x (27.6x slower) |
+
+### nntrainer (CausalLM hybrid bridge, ARM-layout .bin, 4 threads)
+
+| test | CPU | cdsp | ratio |
+|---|---|---|---|
+| Prefill, 547 tok, single sequence | 495.9 | **588.8** | 1.19x faster |
+| Decode, single sequence, 128 tok (`min_rows=1`, current default - all on DSP) | 68.0 | 26.8 | 0.39x (2.5x slower) |
+| Decode, single sequence, 128 tok (`min_rows=256`, hybrid - decode on CPU) | 68.0 | 67.7 | ~1.0x (this *is* the CPU path) |
+| Decode, batched | - | **blocked** | `MHACoreLayer::setBatch` crash (S18) - pre-existing, unfixed, left alone per direction at the time |
+
+### Reading the two matrices side by side
+
+- **Prefill**: both win on the DSP; ggml-hexagon's margin is far larger
+  (3.55x vs 1.19x) because it offloads the *whole graph* (S19), while our
+  bridge only offloads the FC matmuls - everything else (attention, norms,
+  RoPE) still round-trips through nntrainer's CPU every layer.
+- **Single decode**: both lose to CPU, but proportionally we lose less
+  (2.5x vs 4.5x) - consistent with S17/S21: the decode floor is a hardware
+  property (HVX-only, bandwidth-bound GEMV) neither implementation escapes,
+  and the reference's superior dispatch efficiency (S21: 1.79us/op vs our
+  ~98us/op) does not buy it back on decode either, because the floor is
+  compute/bandwidth, not dispatch.
+- **Batched decode**: catastrophic in the reference (27.6x slower) for the
+  S22 reason - attention loses fused-kernel eligibility once sequences are
+  independent, a 20x DSP-side compute cost, not a CPU handoff. Cannot be
+  measured for nntrainer at all - genuinely missing data point, not a small
+  gap, since `batch_size > 1` crashes before any forward pass runs.
