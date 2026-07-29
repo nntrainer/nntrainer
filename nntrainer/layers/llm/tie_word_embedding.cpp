@@ -778,7 +778,17 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
 #if defined(ENABLE_OPENCL)
       // GPU Q6_K lm_head GEMV; falls through to the host loop (gpu_done=false)
       // on the no-OpenCL build.
-      if (lmhead_gpu != 0 && (hidden_size % 256) == 0) {
+      // Engine gate: only when THIS layer runs on the OpenCL ("gpu") plane.
+      // On a unified (opencl+cuda) build the env default alone let an
+      // NNTR_ENGINE=cuda run enqueue this OpenCL kernel on a second device
+      // mid-decode — a cross-backend dispatch whose fp32 summation order
+      // diverges from the host loop (measured: flips a knife-edge token on
+      // qwen3/RTX) and whose output depends on an unrelated GPU being
+      // present. The run context's engine stamp is the authority; CPU/CUDA
+      // stamped runs keep the host loop.
+      const bool on_cl_plane =
+        context.getRunComputeEngine() == ml::train::LayerComputeEngine::GPU;
+      if (on_cl_plane && lmhead_gpu != 0 && (hidden_size % 256) == 0) {
         std::vector<float> logits_f32(vocab_size);
         gpu_done = nntrainer::lmhead_gemv_q6_k_cl(
           weight_data, input_data, logits_f32.data(), vocab_size, hidden_size);
@@ -841,7 +851,12 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
       // CPU/HTP libnntrainer) compiling — gpu_done stays false and the host
       // lm_head path below runs.
 #if defined(ENABLE_FP16) && defined(ENABLE_OPENCL)
-      if (lmhead_gpu_fp32 != 0 &&
+      // Engine gate: OpenCL lm_head only when this layer runs on the CL
+      // ("gpu") plane — same cross-backend-hijack rationale as the Q6_K
+      // branch above.
+      const bool on_cl_plane_fp32 =
+        context.getRunComputeEngine() == ml::train::LayerComputeEngine::GPU;
+      if (on_cl_plane_fp32 && lmhead_gpu_fp32 != 0 &&
           input_step.getDataType() == nntrainer::TensorDim::DataType::FP16 &&
           weight.width() == hidden_size && hidden_step.width() == vocab_size) {
         std::vector<float> logits_f32(vocab_size);
