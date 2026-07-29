@@ -137,7 +137,7 @@ unsigned int applyTKP(const float *logits, int len, float temperature,
 #else
     // No OpenCL "gpu" Context is registered in this build (e.g. the FP32 CPU
     // reference / unittest build), so default to cpu instead of throwing
-    // "[Engine] gpu Context is not registered" at model build. [T12]
+    // "[Engine] gpu Context is not registered" at model build.
     return "cpu";
 #endif
   }();
