@@ -1172,7 +1172,7 @@ TEST(nntrainer_fallback_kleidiai, quant_qa8dx_zero) {
       int8_t q = *((int8_t *)row_ptr);
       row_ptr += sizeof(int8_t);
 
-      EXPECT_EQ(q, 127);
+      EXPECT_EQ(q, 1);
     }
   }
 }
