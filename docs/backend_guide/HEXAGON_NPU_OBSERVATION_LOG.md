@@ -1053,3 +1053,33 @@ in S20. Nothing new to account for from either branch.
   independent, a 20x DSP-side compute cost, not a CPU handoff. Cannot be
   measured for nntrainer at all - genuinely missing data point, not a small
   gap, since `batch_size > 1` crashes before any forward pass runs.
+
+---
+
+## 24. The core structural difference, and a leveled menu of what to do about it
+
+Asked explicitly: how does ggml-hexagon's whole-graph offload actually work
+mechanically, and what does that tell us about improving nntrainer's design
+(multi-batch set aside for this). Investigated with a fork grounded in exact
+code citations (self-build branch), not inference from timing alone.
+
+### Three things ggml-hexagon has that nntrainer's bridge structurally cannot, today
+
+1. **A graph object seen all at once -> fusion + one flush.**
+   `ggml_backend_hexagon_graph_compute` (`:3302-3345`) enqueues every
+   HTP0-assigned node in the whole graph, then calls `flush()` **exactly
+   once**, after the loop - not per split, not per node. Before that,
+   `ggml_backend_hexagon_graph_optimize` (`:3403-3461`) walks the graph and
+   **merges** consecutive compatible nodes (RMS_NORM+MUL -> one `htp_opnode`
+   with `.fused` populated); `add_op` (`:1980-2000`) writes **one** wire-level
+   op for the whole fused chain. This is real op-merging, distinct from the
+   already-known `stackable()`/`same_input()` reordering (SS4/SS8), which only
+   regroups independent MUL_MATs for `src1_spad` quant-cache reuse.
+2. **A generic graph allocator gives it stable buffers for free.**
+   `ggml-alloc.c`'s `ggml_gallocr_alloc_graph` skips reallocation and reuses
+   the *same addresses* across calls when the graph shape is unchanged
+   (`ggml_gallocr_needs_realloc`). Decode's shape never changes token to
+   token, so `rpcmem_alloc2`/`fastrpc_mmap` for activations run once at
+   `sched_reserve`, never again. **This is the exact problem SS8's pooled-arena
+   rewrite solved by hand** - ggml solves it generically, for every backend,
+   via its own allocator; we had to solve it ourselves becaus
