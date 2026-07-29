@@ -121,7 +121,18 @@ void CudaContext::initialize() noexcept {
       setenv("NNTR_CUDA_DEV_ACT", "1", 0);
       setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
       setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
-      setenv("NNTR_CUDA_M2B", "1", 0);
+      // NNTR_CUDA_M2B is NOT auto-defaulted in this tree. The M2-B decode
+      // graph (c1fa0171e) shipped as opt-in with two hard correctness
+      // dependencies that are not present here: (a) the g_m2b_skip_all
+      // embed-only feed is set by runDecode but no graph-walk consumer was
+      // ported (neuralnet.cpp declares the flag; nothing reads it), so every
+      // replay token re-runs the full eager forward on top of the replayed
+      // graph; (b) the decode chain still has host/OpenCL segments (Q6_K
+      // tie_word lm_head — trackC5e absent), which read mid-capture UVM
+      // garbage while the stream is capturing. Measured on qwen3 (RTX 5060,
+      // 2026-07-30): M2B=1 -> deterministic decode garbage (" is is are you
+      // in"), M2B=0 -> coherent golden. Explicit NNTR_CUDA_M2B=1 remains an
+      // opt-in for trees that carry both halves.
       // NNTR_DETERMINISTIC keeps the per-op drains: ASYNC removes them and
       // is the one auto-set lever whose host/device overlap can turn a
       // knife-edge logit into a run-to-run coin flip (measured).
@@ -146,7 +157,8 @@ void CudaContext::initialize() noexcept {
       setenv("NNTR_CUDA_DEV_ACT", "1", 0);
       setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
       setenv("NNTR_RMSNORM_CUDA_OFF", "all", 0);
-      setenv("NNTR_CUDA_M2B", "1", 0);
+      // NNTR_CUDA_M2B: not auto-defaulted — same missing-dependency rationale
+      // as the cMA branch above (no g_m2b_skip_all consumer, no CUDA lm_head).
     }
 
     add_default_object();
