@@ -308,6 +308,19 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
     << "Convolution layer takes only one input";
 
+  // The fusion is a forward-only epilogue: calcDerivative()/calcGradient() do
+  // not chain the activation derivative. Reject it wherever a backward pass
+  // can run instead of silently dropping that term, the same posture the
+  // tflite exporter takes at its own boundary (node_exporter.cpp).
+  if (auto &fused_act = std::get<props::FusedActivation>(conv_props);
+      !fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
+    if (context.getExecutionMode() != ml::train::ExecutionMode::INFERENCE)
+      throw exception::not_supported(
+        "fused_activation on conv2d is inference-only: the backward pass does "
+        "not chain the activation derivative. Use a standalone activation "
+        "layer for training.");
+  }
+
   const TensorDim &in_dim = context.getInputDimensions()[0];
 
   auto &weight_regularizer =
