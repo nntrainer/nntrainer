@@ -27,6 +27,7 @@
 #include <tensor.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -394,6 +395,32 @@ void CudaComputeOps::scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
     Y[i * incY] = static_cast<float>(X[i * incX]);
 }
 #endif
+
+// Load-time device-residency action, executed through the op-table prebuild
+// seam: FullyConnectedLayerCl::read() calls w.getOps()->fc_prebuild_weight(w)
+// per weight inside the parallel load worker, right after the weight bytes
+// are read (skipped under FSU/opt_var). Only engine=cuda tensors resolve to
+// this table, so no engine scan is needed to keep the call off gpu/cpu runs.
+// Prebuild contract: a prebuild may create derived device state but must NOT
+// invalidate the host payload -- cudaMemPrefetchAsync is a migration of the
+// managed pages to the device, never an invalidation; the pointer stays
+// host-accessible.
+void CudaComputeOps::fc_prebuild_weight(Tensor &w) {
+  if (w.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+    return;
+  // NNTR_CUDA_WPREFETCH >= 2 opts in; unset -> 0 (default off).
+  static const int wpf = []() {
+    const char *e = std::getenv("NNTR_CUDA_WPREFETCH");
+    return e ? atoi(e) : 0;
+  }();
+  if (wpf < 2)
+    return;
+  // The primitive is self-guarding (cuda_fc_qint4.cpp): integrated GPU ->
+  // false, non-managed pointer -> false, and it computes its own byte extent
+  // (the N*(K+1)/2 nibble payload + the N*4 fp32 scale tail).
+  (void)cuda::cuda_fc_qs4cx_prefetch_weight(w.getData<uint8_t>(), w.width(),
+                                            w.height());
+}
 
 ComputeOps *get_cuda_ops() {
   static CudaComputeOps instance;

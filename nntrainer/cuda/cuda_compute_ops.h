@@ -79,6 +79,15 @@ public:
    */
   void fc(Tensor &input, Tensor &weight, Tensor &output) override;
 
+  /**
+   * @brief Load-time QS4CX weight prefetch to device (opt-in,
+   *        NNTR_CUDA_WPREFETCH >= 2), executed through the op-table prebuild
+   *        seam from FullyConnectedLayerCl::read() inside the parallel load
+   *        worker. Creates derived device residency only; never invalidates
+   *        the host payload.
+   */
+  void fc_prebuild_weight(Tensor &w) override;
+
   // ── Copy ops (device-only aware) ───────────────────────────────────────
   // Under the device-only activation pool (NNTR_CUDA_DEV_ACT) an activation is
   // real device memory; Tensor::copy() -> the CpuComputeOps host loop would
