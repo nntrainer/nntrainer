@@ -269,18 +269,34 @@ public:
 
 protected:
   /**
-   * @brief Per-layer sliding-window size, i.e. exactly the value this
-   *        layer's `sliding_window` mha_core property receives. UINT_MAX
-   *        means full attention.
+   * @brief Per-layer sliding-window size, i.e. exactly the
+   *        value this layer's `sliding_window` mha_core property receives.
+   *        UINT_MAX means full attention.
    *
    * This is the SINGLE source of truth for "is layer i a sliding layer, and
-   * how wide". Models that derive the pattern from config `layer_types`
+   * how wide". Every ring site (KV placeholder shape, KVCacheManager capacity,
+   * mha_core's own modulo index) must agree, because a placeholder sized to a
+   * Wcap ring while the layer believes it is a full linear cache writes past
+   * the buffer. Models that derive the pattern from config `layer_types`
    * instead of SLIDING_WINDOW_PATTERN MUST override this.
    *
    * @param layer_id decoder block index
    * @return sliding window in tokens, or UINT_MAX for full attention
    */
   virtual unsigned int getLayerSlidingWindow(int layer_id) const;
+
+  /**
+   * @brief Per-layer physical KV row capacity for
+   *        KVCacheManager::setLayerCaps(). caps[i] = Wcap for a ringed sliding
+   *        layer, 0 for "keep the full max_seq". Emits a one-time
+   *        "[kv-ring]" line via ml_logi describing the resolved chunk, the
+   *        derived cap and whether the ring actually engaged -- a measurement
+   *        must never have to ASSUME the ring is on.
+   *
+   * @param max_seq KV capacity the model was built with (MAX_SEQ_LEN)
+   * @return per-layer capacity vector of size NUM_LAYERS
+   */
+  std::vector<unsigned int> computeKVRingCaps(unsigned int max_seq) const;
 
   /**
    * @brief Setup the parameters for the Transformer model
@@ -492,6 +508,53 @@ inline unsigned int effectivePrefillChunk() {
 #else
   return 4096u;
 #endif
+}
+
+/**
+ * Sliding-window KV ring capacity (NNTR_KV_WINDOW_RING, default ON,
+ * NNTR_KV_WINDOW_RING=0 opts out).
+ *
+ * A sliding-window attention layer (local window W) only ever attends to the
+ * last W keys, so with chunked prefill (effectivePrefillChunk() = C, which
+ * bounds one launch's live key span to W+C) the KV storage can be a ring of
+ * Wcap rows instead of the full max_seq. Returns Wcap -- the physical row
+ * capacity to allocate and modulo-index -- for a sliding layer, or 0 meaning
+ * "no ring, keep full max_seq".
+ *
+ * Wcap is a multiple of C and >= W + C:
+ *  - a multiple of C means a C-aligned chunk write never straddles the wrap
+ *    seam, so one step write stays a single contiguous slice;
+ *  - >= W + C means the live window [pos-W+1, pos+C) never self-collides
+ *    mod Wcap.
+ *
+ * Returns 0 (bit-identical legacy behaviour) when:
+ *  - the ring is explicitly off;
+ *  - the layer is full attention (W == 0 or W >= max_seq);
+ *  - there is no chunking (C == 0) -- the ring REQUIRES a bounded live span;
+ *  - the derived cap would not shrink anything (cap >= max_seq).
+ *
+ * ! That last clause is a documented foot-gun. With the default C=4096 and
+ *   an example W=1024 the derived cap is (1024/4096 + 2) * 4096 = 8192, so any
+ *   package whose max_seq_len is <= 8192 silently runs ring-OFF. A 200+ run
+ *   matrix was measured that way before the collapse was noticed (the smoke
+ *   package ships max_seq 2048). The ring is a LONG-CONTEXT lever; always read
+ *   the "[kv-ring]" line (computeKVRingCaps) before claiming it engaged.
+ *
+ * Every site (placeholder shape, KV allocation, cache write, attention kernel
+ * dispatch) computes Wcap from THIS one function so they stay consistent.
+ */
+inline unsigned int kvRingCap(unsigned int local_window, unsigned int max_seq) {
+  const char *g = std::getenv("NNTR_KV_WINDOW_RING");
+  if (g && g[0] == '0')
+    return 0; // explicit opt-out -> full max_seq (bit-identical legacy)
+  if (local_window == 0 || local_window >= max_seq)
+    return 0; // full-attention layer -> no ring
+  const unsigned int C = effectivePrefillChunk();
+  if (C == 0)
+    return 0; // the ring requires chunked prefill to bound the live span
+  // multiple of C, >= W + C (headroom so the window never wraps onto itself).
+  const unsigned int cap = (local_window / C + 2u) * C;
+  return (cap < max_seq) ? cap : 0u; // no benefit if it would not shrink
 }
 } // namespace causallm
 

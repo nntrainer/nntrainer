@@ -326,7 +326,7 @@ bool flash_attention_prefill_f16_cl(
   uint16_t *O_host, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
   bool causal, bool svm_inputs = false, float attn_softcap = 0.0f,
-  unsigned int local_window = 0u);
+  unsigned int local_window = 0u, unsigned int ring_cap = 0u);
 
 /// Flash-decoding (split-KV) for M=1 decode: KV axis split into chunks so
 /// gws = num_heads_Q * n_chunks workgroups (restores parallelism the single
@@ -339,7 +339,8 @@ bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
                          unsigned int num_heads_KV, unsigned int head_dim,
                          unsigned int max_seq_len, bool svm_inputs = false,
                          float attn_softcap = 0.0f,
-                         unsigned int local_window = 0u);
+                         unsigned int local_window = 0u,
+                         unsigned int ring_cap = 0u);
 
 /**
  * @brief Pre-build the rope/scatter/copy kernel PROGRAM (rope_inplace source,

@@ -224,6 +224,14 @@ protected:
    */
   KVCacheManager kv_cache;
   bool kv_cache_bound = false; /**< True once KV cache tensors are bound */
+  /**
+   * @brief Per-layer KV ring capacity resolved at allocation
+   *        (computeKVRingCaps): Wcap for a ringed sliding-window layer, 0 for a
+   *        full-attention / ring-off layer. Kept so the bind step can enforce
+   *        that a ringed layer's graph placeholder really was built at the same
+   *        Wcap height. Empty until allocateAndBindKVCache() has allocated.
+   */
+  std::vector<unsigned int> kv_ring_caps_;
 
   /**
    * @brief Allocate kv_cache and bind it to all mha_core layers via

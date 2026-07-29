@@ -222,9 +222,15 @@ std::pair<Tensor, Tensor>
 Gemma4Transformer::createGemma4KVCachePlaceholders(const int layer_id,
                                                    unsigned int kv_width) {
   const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
+  // see Transformer::createKVCachePlaceholders. gemma4 derives
+  // sliding-ness from the config `layer_types` array, which is exactly what the
+  // Gemma4Transformer::getLayerSlidingWindow override returns.
+  const unsigned int ring_cap =
+    kvRingCap(getLayerSlidingWindow(layer_id), max_timestep);
+  const unsigned int cache_rows = ring_cap ? ring_cap : max_timestep;
 #ifdef ENABLE_FP16
   ml::train::TensorDim cache_dim(
-    {BATCH_SIZE, 1, max_timestep, kv_width},
+    {BATCH_SIZE, 1, cache_rows, kv_width},
     {ml::train::TensorDim::Format::NCHW, ml::train::TensorDim::DataType::FP16});
 
   Tensor cache_k(cache_dim, "cache_k_l" + std::to_string(layer_id));
@@ -232,7 +238,7 @@ Gemma4Transformer::createGemma4KVCachePlaceholders(const int layer_id,
   return {cache_k, cache_v};
 #else
   const std::string cache_shape = std::to_string(BATCH_SIZE) +
-                                  ":1:" + std::to_string(max_timestep) + ":" +
+                                  ":1:" + std::to_string(cache_rows) + ":" +
                                   std::to_string(kv_width);
 
   // No engine= on the KV placeholders: "input" has no gpu registration and the
@@ -918,9 +924,15 @@ void Gemma4CausalLM::allocateAndBindKVCache() {
       kv_widths.push_back(getKVCacheWidth(i));
     }
 
-    kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
-                      static_cast<unsigned int>(MAX_SEQ_LEN), kv_widths,
-                      cache_dtype);
+    // Per-layer ring capacity for the `layer_types`-derived
+    // sliding layers (gemma4 sliding blocks are the d=256 ones); the
+    // full-attention blocks keep the linear max_seq cache. Same
+    // getLayerSlidingWindow() hook the placeholders use.
+    const unsigned int max_ts = static_cast<unsigned int>(MAX_SEQ_LEN);
+    kv_cache.setLayerCaps(computeKVRingCaps(max_ts));
+
+    kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE, max_ts,
+                      kv_widths, cache_dtype);
     kv_cache_bound = false;
   }
 

@@ -221,6 +221,13 @@ void CausalLM::allocateAndBindKVCache() {
 
     const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
 
+    // Per-layer ring capacity: sliding-window layers store a
+    // Wcap-row ring, full-attention layers keep max_seq. Derived from the same
+    // getLayerSlidingWindow() hook that shapes the KV placeholders in
+    // createKVCachePlaceholders(), so the bind below cannot mismatch.
+    kv_ring_caps_ = computeKVRingCaps(max_timestep);
+    kv_cache.setLayerCaps(kv_ring_caps_);
+
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
                       max_timestep,
                       static_cast<unsigned int>(NUM_KEY_VALUE_HEADS),
@@ -272,6 +279,18 @@ void CausalLM::allocateAndBindKVCache() {
                   std::runtime_error)
       << "allocateAndBindKVCache: cache placeholder dtype mismatch for layer "
       << i;
+    // For a ringed layer the graph placeholder MUST have been
+    // built at the same Wcap height as the allocation (both come from
+    // computeKVRingCaps / kvRingCap). A mismatch means the layer would write
+    // absolute rows into a short buffer -- check it explicitly. Only enforced
+    // for ringed layers so non-ring models keep today's (dtype-only) contract.
+    NNTR_THROW_IF(
+      static_cast<size_t>(i) < kv_ring_caps_.size() && kv_ring_caps_[i] != 0 &&
+        (kp->getDim() != kc.getDim() || vp->getDim() != vc.getDim()),
+      std::runtime_error)
+      << "allocateAndBindKVCache: window-ring shape mismatch for layer " << i
+      << " (placeholder " << kp->getDim().height() << " rows vs cache "
+      << kc.getDim().height() << " rows)";
 
     kp->setData(kc.getMemoryData(), kc.getOffset(), false);
     vp->setData(vc.getMemoryData(), vc.getOffset(), false);

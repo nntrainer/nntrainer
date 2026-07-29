@@ -2493,7 +2493,8 @@ bool flash_attention_prefill_f16_cl(
   const uint16_t *Q_host, const uint16_t *K_host, const uint16_t *V_host,
   uint16_t *O_host, unsigned int M, unsigned int N_kv, unsigned int num_heads_Q,
   unsigned int num_heads_KV, unsigned int head_dim, unsigned int max_seq_len,
-  bool causal, bool svm_inputs, float attn_softcap, unsigned int local_window) {
+  bool causal, bool svm_inputs, float attn_softcap, unsigned int local_window,
+  unsigned int ring_cap) {
   if (num_heads_Q == 0 || num_heads_KV == 0 || head_dim == 0 || M == 0 ||
       N_kv == 0)
     return false;
@@ -2767,6 +2768,13 @@ bool flash_attention_prefill_f16_cl(
     if (!kp->SetKernelArguments(13, &attn_softcap, sizeof(float)) ||
         !kp->SetKernelArguments(14, &win_i, sizeof(int)))
       return false;
+    // ring_cap (arg 15): >0 tells the Block-Q kernel that N_kv is the LOGICAL
+    // key count while the K/V buffers only hold ring_cap rows, so it must read
+    // physical row (n % ring_cap). The window / causal masks stay in absolute
+    // space, which is why ring-on == ring-off at a fixed chunk.
+    int ring_cap_i = (int)ring_cap;
+    if (!kp->SetKernelArguments(15, &ring_cap_i, sizeof(int)))
+      return false;
   }
 
   std::array<size_t, 1> gws;
@@ -2826,7 +2834,8 @@ bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
                          unsigned int N_kv, unsigned int num_heads_Q,
                          unsigned int num_heads_KV, unsigned int head_dim,
                          unsigned int max_seq_len, bool svm_inputs,
-                         float attn_softcap, unsigned int local_window) {
+                         float attn_softcap, unsigned int local_window,
+                         unsigned int ring_cap) {
   if (num_heads_Q == 0 || num_heads_KV == 0 || head_dim == 0 || N_kv == 0)
     return false;
   if (num_heads_Q % num_heads_KV != 0)
@@ -2910,6 +2919,11 @@ bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
       !kp->SetKernelArguments(13, &ck, sizeof(int)) ||
       !kp->SetKernelArguments(14, &nc, sizeof(int)))
     return false;
+  {
+    int ring_cap_i = (int)ring_cap; // ring: physical row = n % cap
+    if (!kp->SetKernelArguments(15, &ring_cap_i, sizeof(int)))
+      return false;
+  }
   {
     std::array<size_t, 1> gws = {(size_t)num_heads_Q * (size_t)n_chunks *
                                  (size_t)lws};

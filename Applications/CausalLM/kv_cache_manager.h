@@ -218,6 +218,36 @@ public:
    */
   unsigned int getKVWidth() const { return num_heads_kv_ * head_dim_; }
 
+  /**
+   * @brief Set the per-layer physical row capacity. A
+   *        sliding-window layer stores only Wcap rows (a ring) instead of
+   *        max_seq_len; pass caps[i]=Wcap for those layers and caps[i]=0 (or
+   *        max_seq_len) for full-attention ones. Compute the values with
+   *        Transformer::computeKVRingCaps() so they match the graph's KV
+   *        placeholder shapes and mha_core's modulo index.
+   *
+   *        MUST be called BEFORE allocate(). An empty vector (the default)
+   *        means every layer keeps the full max_seq_len -- bit-identical to the
+   *        pre-ring behaviour.
+   *
+   * @param[in] caps per-layer capacity (0 = full max_seq_len)
+   */
+  void setLayerCaps(std::vector<unsigned int> caps) {
+    layer_caps_ = std::move(caps);
+  }
+
+  /**
+   * @brief Physical row capacity of a layer's cache: Wcap for
+   *        a ringed layer, else max_seq_len. The write/read paths modulo-index
+   *        against this.
+   * @param[in] layer_idx attention layer index
+   */
+  unsigned int getLayerCap(unsigned int layer_idx) const {
+    if (layer_idx < layer_caps_.size() && layer_caps_[layer_idx] > 0)
+      return layer_caps_[layer_idx];
+    return max_seq_len_;
+  }
+
 private:
   /**
    * @brief Per-layer cache storage
@@ -245,6 +275,8 @@ private:
   unsigned int head_dim_ = 0;     /**< head dimension */
   unsigned int kv_width_ = 0;     /**< num_heads_kv * head_dim */
   std::vector<unsigned int> kv_widths_;
+  std::vector<unsigned int>
+    layer_caps_; /**< per-layer ring capacity (0=full) */
 
   ml::train::TensorDim::DataType dtype_ = ml::train::TensorDim::DataType::FP16;
   ml::train::TensorDim::Format format_ = ml::train::TensorDim::Format::NCHW;
