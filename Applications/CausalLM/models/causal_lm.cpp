@@ -51,9 +51,32 @@
 
 #include "api/streamer.h"
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+#endif
+
 namespace causallm {
 
 namespace {
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+// NNTR_CUDA_ARGMAX on-GPU greedy argmax (opt-in). incrementalInference()
+// stashes the DEVICE-resident lm_head logits pointer + dtype here (the tensor
+// data, before the host copy), so generate() can reduce it to the 4-byte token
+// id on the GPU instead of running host std::max_element over the full-vocab
+// D->H copy. One batch row (BATCH_SIZE==1 only, like the CL argmax gating).
+// Reset every call; valid only when the FP32/FP16 output was confirmed
+// device-accessible.
+const void *g_cuda_logits_dev = nullptr;
+bool g_cuda_logits_fp16 = false;
+bool cuda_argmax_enabled() {
+  static const bool on = std::getenv("NNTR_CUDA_ARGMAX") != nullptr;
+  return on;
+}
+#endif
 
 /**
  * @brief Wrap an external host buffer as a Tensor of @p dim.
@@ -348,6 +371,14 @@ std::vector<float *> CausalLM::incrementalInference(
   // Output conversion identical to the float* overload in neuralnet.cpp.
   std::vector<float *> output;
   output.reserve(output_tensors.size());
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // NNTR_CUDA_ARGMAX: invalidate any stale device-logits stash; re-armed below
+  // only when this call's first output is device-accessible (UVM / managed /
+  // device) so generate() can run the on-GPU argmax instead of host
+  // max_element.
+  g_cuda_logits_dev = nullptr;
+#endif
+  bool first_output = true;
   for (auto &out : output_tensors) {
     auto out_t = *out.get();
     const size_t buf_size =
@@ -356,15 +387,99 @@ std::vector<float *> CausalLM::incrementalInference(
 
     if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-      nntrainer::getComputeOps()->scopy_fp16_to_fp32(
-        buf_size, out_t.getData<_FP16>(), 1, last_out_buf_data, 1);
+      const _FP16 *out_src = out_t.getData<_FP16>();
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Per-token cudart touches (pointer probes + stream drains) are cuda-run
+      // only: on a non-cuda run of the unified binary the first cudart call
+      // boots the statically-linked runtime inside this (timed) path.
+      std::vector<_FP16> out_host;
+      if (causallm_engine() == "cuda") {
+        // NNTR_CUDA_ARGMAX: stash the device logits pointer (before the D2H
+        // copy) when device-accessible, for generate()'s on-GPU argmax.
+        // batch_size==1 only (the argmax reduces a single [vocab] row).
+        if (cuda_argmax_enabled() && first_output && batch_size == 1) {
+          cudaPointerAttributes pa0{};
+          if (cudaPointerGetAttributes(&pa0, out_src) == cudaSuccess &&
+              (pa0.type == cudaMemoryTypeDevice ||
+               pa0.type == cudaMemoryTypeManaged)) {
+            g_cuda_logits_dev = out_src;
+            g_cuda_logits_fp16 = true;
+          }
+          cudaGetLastError();
+        }
+        // Device-only activation pool (NNTR_CUDA_DEV_ACT): the model output is
+        // real device memory, not host-addressable. Drain the backend stream
+        // and copy it D2H into a host buffer before the host fp16->fp32
+        // convert (=the one sync-per-token boundary). For UVM the pointer is
+        // host-coherent so this is skipped.
+        cudaPointerAttributes pa{};
+        if (cudaPointerGetAttributes(&pa, out_src) == cudaSuccess &&
+            pa.type == cudaMemoryTypeDevice) {
+          nntrainer::cuda::StreamManager::Global().finish();
+          out_host.resize(buf_size);
+          cudaMemcpy(out_host.data(), out_src, buf_size * sizeof(_FP16),
+                     cudaMemcpyDeviceToHost);
+          out_src = out_host.data();
+        } else {
+          // UVM/managed pointer: host-coherent for ADDRESSING, but under
+          // NNTR_CUDA_ASYNC the producing kernel may still be in flight --
+          // reading now is a torn-read (determinism audit; the fp32 branch
+          // already drains). No-op in sync mode.
+          nntrainer::cuda::StreamManager::Global().finishIfAsync();
+        }
+        cudaGetLastError();
+      }
+#endif
+      nntrainer::getComputeOps()->scopy_fp16_to_fp32(buf_size, out_src, 1,
+                                                     last_out_buf_data, 1);
 #else
       delete[] last_out_buf_data;
       throw std::invalid_argument("Error: enable-fp16 is not set");
 #endif
     } else if (out->getDataType() == ml::train::TensorDim::DataType::FP32) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Per-token cudart touches are cuda-run only (see the fp16 branch note).
+      if (causallm_engine() == "cuda") {
+        // NNTR_CUDA_ARGMAX: stash the device logits pointer (the tensor data,
+        // before the host memcpy below) when device-accessible. UVM/managed
+        // pointers are host-coherent, so this same pointer feeds both the
+        // on-GPU argmax kernel and -- as the fallback -- the host memcpy.
+        if (cuda_argmax_enabled() && first_output && batch_size == 1) {
+          const float *out_src = out_t.getData();
+          cudaPointerAttributes pa0{};
+          if (cudaPointerGetAttributes(&pa0, out_src) == cudaSuccess &&
+              (pa0.type == cudaMemoryTypeDevice ||
+               pa0.type == cudaMemoryTypeManaged)) {
+            g_cuda_logits_dev = out_src;
+            g_cuda_logits_fp16 = false;
+          }
+          cudaGetLastError();
+        }
+        // Host read of the GPU-produced logits: sync first so the read is
+        // coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+        nntrainer::cuda::StreamManager::Global().finishIfAsync();
+      }
+      // Device-only activation pool (NNTR_CUDA_DEV_ACT): fp32 logits are real
+      // device memory the raw memcpy below cannot read -- drain and stage D2H,
+      // symmetric to the fp16 branch above (without this the fp32 branch
+      // would fault under DEV_ACT).
+      if (out_t.getMemoryData() &&
+          !out_t.getMemoryData()->isHostAddressable()) {
+        nntrainer::cuda::StreamManager::Global().finish();
+        if (!nntrainer::cuda::copy_any((void *)last_out_buf_data,
+                                       (const void *)out_t.getData(),
+                                       sizeof(float) * buf_size))
+          throw std::runtime_error(
+            "CausalLM: D2H staging of the fp32 logits failed");
+      } else {
+        std::memcpy(last_out_buf_data, out_t.getData(),
+                    sizeof(float) * buf_size);
+      }
+#else
       std::memcpy(last_out_buf_data, out_t.getData(), sizeof(float) * buf_size);
+#endif
     }
+    first_output = false;
 
     output.push_back(last_out_buf_data);
   }
@@ -511,6 +626,41 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
 
   std::vector<unsigned int> outputs;
   for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // CUDA on-GPU greedy argmax (NNTR_CUDA_ARGMAX): reduce the device-resident
+    // lm_head logits to the token id on the GPU and read back only 4 bytes,
+    // skipping the host std::max_element over the full-vocab buffer. Gated to
+    // pure greedy (no sampling, no repetition penalty, no bad words, no logits
+    // processor -- those mutate or consume logits on the host) and only when
+    // incrementalInference stashed a device-accessible logits pointer for this
+    // (single, BATCH_SIZE==1) row.
+    if (cuda_argmax_enabled() && g_cuda_logits_dev != nullptr &&
+        do_sample == false && logits_processor == nullptr &&
+        (repetition_penalty == 1 || input_ids == nullptr ||
+         NUM_INPUT_IDS == 0) &&
+        (BAD_WORD_IDS.size() == 0 || NUM_BADWORDS == 0)) {
+      unsigned int tok = 0;
+      bool ok =
+        g_cuda_logits_fp16
+          ? nntrainer::cuda::cuda_argmax_fp16(
+              reinterpret_cast<const unsigned short *>(g_cuda_logits_dev),
+              NUM_VOCAB, &tok)
+          : nntrainer::cuda::cuda_argmax_fp32(
+              reinterpret_cast<const float *>(g_cuda_logits_dev), NUM_VOCAB,
+              &tok);
+      // Consume the stash regardless (it belongs to this call's logits row).
+      g_cuda_logits_dev = nullptr;
+      if (ok) {
+        outputs.push_back(tok);
+        logits = logits + NUM_VOCAB;
+        if (input_ids != nullptr)
+          input_ids = input_ids + MAX_SEQ_LEN;
+        continue;
+      }
+      // else: fall through to the host path below (host buffer still valid).
+    }
+#endif
 
     // apply repetition penalty
     if (repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0) {
