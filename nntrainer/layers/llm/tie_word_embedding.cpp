@@ -36,7 +36,7 @@
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
-#include <cuda_fc_qint4.h>
+#include <cuda_gemv_q6k.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 

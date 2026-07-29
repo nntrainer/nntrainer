@@ -9,6 +9,7 @@ cuda_sources = [
   'cuda_compute_ops.cpp',
   'cuda_rmsnorm.cpp',
   'cuda_fc_qint4.cpp',
+  'cuda_gemv_q6k.cpp',
   'cuda_blas_manager.cpp',
 ]
 
@@ -23,6 +24,7 @@ cuda_headers = [
   'cuda_elementwise.h',
   'cuda_rmsnorm.h',
   'cuda_fc_qint4.h',
+  'cuda_gemv_q6k.h',
   'cuda_blas_manager.h',
 ]
 
