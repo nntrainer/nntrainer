@@ -14,7 +14,7 @@
  * (in1.getOps()->geglu(...)): OpenCL -> ClComputeOps::geglu (cl_mem/SVM
  * residency), CUDA -> CudaComputeOps::geglu (device fp16 / host-on-UVM), CPU ->
  * CpuComputeOps::geglu (host loop). Replaces the former GeGLULayerCl and
- * CudaGeGLULayer forks. Two inputs {gate, up}; type "geglu". [T7]
+ * CudaGeGLULayer forks. Two inputs {gate, up}; type "geglu".
  */
 
 #ifndef __GEGLU_LAYER_H__

@@ -416,7 +416,7 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     // push the host-dequantized embedding rows into the device-only output on
     // the backend stream (ordered before the first GPU layer consumes them).
     if (emb_dev_only) {
-      // [r22] Windows default: synchronous upload — sibling of the
+      // Windows default: synchronous upload — sibling of the
       // embedding_layer.cpp emb H2D, the measured Windows divergence source
       // (see the verdict comment there). NNTR_CUDA_EMB_SYNCCOPY=0 restores
       // the async copy; non-Windows keeps async.

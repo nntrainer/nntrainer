@@ -80,7 +80,7 @@ void SwiGLULayer::incremental_forwarding(RunLayerContext &context,
   // engine=cuda device-resident fp16: one kernel instead of the host loop (the
   // getOps host path below would fault on the device-only activation pool under
   // NNTR_CUDA_DEV_ACT). Gated on FP16 + batch/channel==1; falls through for
-  // OpenCL/CPU (cl_mem / host) and non-device tensors. [merged from app fork]
+  // OpenCL/CPU (cl_mem / host) and non-device tensors.
   if (in1.getDataType() == ml::train::TensorDim::DataType::FP16 &&
       in1.batch() == 1 && in1.channel() == 1) {
     const size_t n = (size_t)(to - from) * in1.width();

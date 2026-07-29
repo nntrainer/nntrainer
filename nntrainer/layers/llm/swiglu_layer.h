@@ -15,7 +15,7 @@
  * residency), CPU -> CpuComputeOps::swiglu (host loop). Replaces the former
  * OpenCL SwiGLULayerCl. Two inputs {gate, up}; type "swiglu". Registered on the
  * "gpu" context only — the CPU/CUDA engines use the app-side causallm::SwiGLU
- * layer (a separate registration), so this collapse is OpenCL-scoped. [T7]
+ * layer (a separate registration), so this collapse is OpenCL-scoped.
  */
 
 #ifndef __SWIGLU_LAYER_H__
