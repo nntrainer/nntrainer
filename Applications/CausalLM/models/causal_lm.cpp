@@ -52,8 +52,10 @@
 #include "api/streamer.h"
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_attention.h>
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
+#include <cuda_fc_qint4.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
@@ -888,6 +890,63 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // ml::train::TensorDim input_dim(1, 1, input_len, DIM);
   // input_dims.push_back(input_dim);
   // model->resetInputDimension(input_dims);
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Prewarm the QS4CX dp4a weight caches at load: the one-time plain ->
+  // packed int4 repack is a large slice of the cold first prefill; doing it
+  // here -- once, before start_prefill is taken -- keeps it off the timed
+  // path. Idempotent (per-weight pointer-keyed cache; a reloaded model's new
+  // weight pointers rebuild lazily even though this latch stays set),
+  // value-gated by NNTR_CUDA_PREWARM (auto-defaulted "1" by the cuda context;
+  // an explicit =0 disables). cuda engine ONLY: on a dual-enabled
+  // (CUDA+OpenCL) binary an ungated walk would build every FC's derived cache
+  // on the NVIDIA device during OpenCL runs.
+  {
+    static const char *_pw = std::getenv("NNTR_CUDA_PREWARM");
+    static const bool cuda_prewarm_on = !(_pw && _pw[0] == '0');
+    static bool s_cuda_prewarmed = false;
+    if (!s_cuda_prewarmed && cuda_prewarm_on && causallm_engine() == "cuda") {
+      s_cuda_prewarmed = true;
+      std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
+                         void *)>
+        fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &ctx, void *) {
+          if (l.getType() != "fully_connected")
+            return;
+          for (unsigned int w = 0; w < ctx.getNumWeights(); ++w) {
+            nntrainer::Tensor &wt = ctx.getWeight(w);
+            if (wt.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+              continue;
+            // Build the fp16-scale UVM side buffer here too so the first
+            // forward (and any CUDA-graph capture) is a pure cache hit. The
+            // scale conversion host-READS the fp32 tail, so it must run
+            // before any weight migration a later lever might add.
+            const unsigned short *uS = nullptr;
+            nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
+              wt.getScale<float>(), wt.width(), &uS);
+            nntrainer::cuda::cuda_fc_qs4cx_prewarm(wt.getData<uint8_t>(),
+                                                   wt.width(), wt.height());
+          }
+        };
+      model->forEachLayer(fn, nullptr);
+      // Pre-grow the split-KV decode scratch so the M=1 flash-decode path
+      // never cudaMallocs inside a CUDA-graph capture. 2*HEAD_DIM covers a
+      // model whose global-attention head_dim doubles the base; the
+      // over-allocation is a few hundred KB and ensure_sk's isCapturing()
+      // guard is the safety net if a model exceeds these bounds.
+      nntrainer::cuda::cuda_attention_splitkv_prewarm(
+        static_cast<int>(MAX_SEQ_LEN), NUM_HEADS, 2 * HEAD_DIM);
+      // Pre-grow the dp4a decode FC scratch: decode is M=1; K (the FC
+      // contraction dim) is bounded by max(hidden DIM, FFN intermediate) --
+      // the down-projection FC reads the FFN intermediate activation, so DIM
+      // alone under-sizes the activation-quant staging.
+      nntrainer::cuda::cuda_fc_qint4_dp4a_prewarm(
+        1u,
+        std::max(static_cast<unsigned int>(DIM),
+                 static_cast<unsigned int>(INTERMEDIATE_SIZE)),
+        std::max(NUM_VOCAB, static_cast<unsigned int>(INTERMEDIATE_SIZE)));
+    }
+  }
+#endif
 
   auto start_prefill = std::chrono::high_resolution_clock::now();
 

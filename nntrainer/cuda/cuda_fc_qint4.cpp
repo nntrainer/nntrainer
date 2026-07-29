@@ -1256,4 +1256,53 @@ bool cuda_fc_qs4cx_prefetch_weight(const unsigned char *plain_w, unsigned int N,
   return true;
 }
 
+// --- load-time prewarm + teardown lifecycle -------------------------------
+
+bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
+                           unsigned int K) {
+  if (plain_w == nullptr || N == 0 || K == 0)
+    return true;
+  // The dp4a derived cache (packed int4 + per-channel rowsum) is built by the
+  // GPU repack kernels straight from the plain payload -- no host mirror is
+  // staged, so prewarming at load costs no transient host RSS. Idempotent
+  // (pointer-keyed); the lazy build in the GEMM path remains the fallback.
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  return ensure_dp4a_cache_locked(plain_w, N, K) != nullptr;
+}
+
+bool cuda_fc_qint4_dp4a_prewarm(unsigned int maxM, unsigned int maxK,
+                                unsigned int maxN) {
+  // Pre-grow the activation-quant scratch (q8 + per-row scale/zero-point) to
+  // the given decode bounds so the M=1 decode FC never cudaMallocs inside a
+  // CUDA-graph capture (an in-capture malloc aborts the capture). maxN is
+  // accepted for signature stability with the prefill-side scratch but the
+  // decode dp4a path writes into the caller's output tensor -- there is no
+  // N-sized scratch to grow here; the in-path isCapturing() guards remain the
+  // safety net for anything outside these bounds.
+  (void)maxN;
+  if (maxM == 0 || maxK == 0)
+    return true;
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  return dp4a_stage_scratch(maxM, maxK);
+}
+
+void cuda_fc_qs4cx_release_weight_caches() {
+  // Teardown for a model reload lifecycle: free every pointer-keyed derived
+  // weight cache (dp4a packed int4 + cuBLAS int8) so a reloaded model does not
+  // leak the previous generation's VRAM. The fp16-scale UVM side buffers stay
+  // by design -- their cache is documented process-lifetime (keyed by the fp32
+  // scale pointer, no erase).
+  std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+  for (auto &kv : g_dp4a_plain_cache) {
+    cudaFree(kv.second.plain);
+    cudaFree(kv.second.rowsum);
+  }
+  g_dp4a_plain_cache.clear();
+  for (auto &kv : g_i8_weight_cache) {
+    cudaFree(kv.second.w8);
+    cudaFree(kv.second.rowsum);
+  }
+  g_i8_weight_cache.clear();
+}
+
 } // namespace nntrainer::cuda

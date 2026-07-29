@@ -102,6 +102,32 @@ bool cuda_fc_qs4cx_cublas_i8_gemm_fp16(const unsigned short *Xh,
 bool cuda_fc_qs4cx_prefetch_weight(const unsigned char *plain_w, unsigned int N,
                                    unsigned int K);
 
+/**
+ * @brief Build the dp4a derived weight cache (packed int4 + rowsum) for one
+ *        QS4CX plain payload at load time, off the first prefill. GPU repack,
+ *        no host transient; idempotent (pointer-keyed). Returns false only on
+ *        a device allocation / dispatch failure (the lazy in-path build then
+ *        remains the fallback).
+ */
+bool cuda_fc_qs4cx_prewarm(const unsigned char *plain_w, unsigned int N,
+                           unsigned int K);
+
+/**
+ * @brief Pre-grow the dp4a activation-quant scratch to the given decode
+ *        bounds so the M=1 decode FC never cudaMallocs inside a CUDA-graph
+ *        capture. maxN is accepted for signature stability; the decode path
+ *        has no N-sized scratch.
+ */
+bool cuda_fc_qint4_dp4a_prewarm(unsigned int maxM, unsigned int maxK,
+                                unsigned int maxN);
+
+/**
+ * @brief Free every pointer-keyed derived weight cache (dp4a packed int4 +
+ *        cuBLAS int8) -- the model-reload teardown. The fp16-scale UVM side
+ *        buffers are process-lifetime by design and are not freed.
+ */
+void cuda_fc_qs4cx_release_weight_caches();
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_FC_QINT4_H__
