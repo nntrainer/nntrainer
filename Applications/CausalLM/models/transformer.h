@@ -35,6 +35,7 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <cstdlib>
 #include <layer.h>
 #include <map>
 #include <model.h>
@@ -425,6 +426,58 @@ inline json LoadJsonFile(const std::string &file_path) {
     throw std::runtime_error("JSON parse error in " + file_path +
                              " | Details: " + e.what());
   }
+}
+
+/**
+ * Effective prefill chunk size in tokens (0 = no chunking / single-block
+ * prefill).
+ *
+ * The prefill activation plane is sized to INIT_SEQ_LEN, because the shared
+ * activation tensors are built at {1,1,1,INIT_SEQ_LEN} (Transformer::
+ * constructModel) and resetInputDimension is disabled. Without chunking, a
+ * whole-document prefill therefore needs INIT_SEQ_LEN >= the document, and the
+ * activation plane grows linearly with context -- it is the DOMINANT
+ * long-context memory term, ahead of the KV cache.
+ *
+ * With chunking, the prefill is fed FORWARD in C-token chunks, so one forward
+ * pass never processes more than C (<= INIT_SEQ_LEN) query rows while the KV
+ * cache still spans the whole document. This decouples the two:
+ *   INIT_SEQ_LEN = activation/chunk height (small)
+ *   MAX_SEQ_LEN  = KV capacity (large)
+ *
+ * Resolution order:
+ * - NNTR_PREFILL_CHUNK is the chunk rung's ONE knob: an explicit value ALWAYS
+ *   wins (user override; per-GPU tuning), and NNTR_PREFILL_CHUNK=0 is the sole
+ *   opt-out => the legacy single-block prefill, byte-identical to the
+ *   pre-chunking behaviour. (It also disables the KV ring transitively --
+ *   kvRingCap requires C > 0 to bound the live span. The ring's own opt-out,
+ *   NNTR_KV_WINDOW_RING=0, lives in kvRingCap and does NOT alter chunking:
+ *   each knob owns exactly its own rung.)
+ * - Otherwise the default is 4096 for both backends -- the equal-thermal
+ *   ring-on sweep on Xe3 32K is monotone
+ *   (1024 -> 1117.1, 2048 -> 1125.4, 4096 -> 1136.0, 8192 -> 1146.3 TPS with
+ *   peak WS 2696/2950/3419/4511 MB), so 4096 takes +1.7% prefill for +723 MB
+ *   and 8192's further +0.9%p costs another 1.1 GB; CUDA independently wants
+ *   4096 for tensor-core-efficient prefill GEMMs.
+ *
+ * ARM/Adreno returns 0 (no auto-chunk): the per-layer OHWI V-mirror keeps a
+ * texture-pitch-aligned image sized to the FIRST call's cache_to, and a second
+ * chunk whose cache_to crosses that stride's rounding boundary re-scatters
+ * EVERY already-cached KV row of EVERY layer. Measured on a packed-model
+ * prompt_1p2k: auto-chunk splitting a 1073-token prompt into 1024+49 gave
+ * 845 TPS against the single-block path's 1277 TPS (-34%). An explicit
+ * NNTR_PREFILL_CHUNK is still always honoured (early return above).
+ */
+inline unsigned int effectivePrefillChunk() {
+  const char *pc = std::getenv("NNTR_PREFILL_CHUNK");
+  if (pc && pc[0])
+    return static_cast<unsigned int>(std::atoi(pc)); // explicit override wins
+#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) ||           \
+  defined(_M_ARM)
+  return 0u; // Adreno V-mirror restride, see above
+#else
+  return 4096u;
+#endif
 }
 } // namespace causallm
 
