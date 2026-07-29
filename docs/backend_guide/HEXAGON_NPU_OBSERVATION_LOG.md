@@ -902,3 +902,56 @@ separate DSP-side skel), not a patch on top of `htp/`. The one architectural
 idea in it that is real - a single ION pool with offset addressing instead of
 per-buffer allocation - is something we already arrived at independently in
 the SS8 pooled-arena rewrite.
+
+---
+
+## 21. The decisive measurement: even at near-zero dispatch overhead, decode still loses
+
+Prompted by "if ggml-hexagon delegates the whole graph unlike our per-op
+bridge, does it actually avoid the round-trip problem - and if the NPU is
+slower, why build this at all?" Answered both with one direct measurement
+rather than argument: `GGML_HEXAGON_PROFILE=1 -v` on real llama-bench decode
+(Qwen3-0.6B, tg-only, `-p 0 -n 32`, HTP0, `-ngl 99`):
+
+```
+n-ops 535   batch-dur-usec ~18716   htp-ops-usec ~17759   (avg over 15 tokens)
+```
+
+**535 ops in ONE FastRPC/dspqueue round trip** - essentially the entire
+per-token transformer body (28 layers x ~19 ops), matching SS19's
+device-assignment trace exactly (everything except the tiny embedding lookup
+and the LM head runs on HTP0). Overhead per op: `(18716-17759)/535 = 1.79us`.
+Ours, one op per flush: ~98us (SS17) - **55x worse, purely from dispatch
+granularity**, exactly as expected from "1 round trip vs. 196."
+
+**And it still loses to CPU.** DSP compute alone for that 535-op batch is
+17.76ms/token -> a **56.3 tok/s ceiling from compute time alone, with zero
+dispatch overhead assumed**. Measured CPU is 158.9 tok/s. So even the
+*already-optimal* dispatch case - which is not a hypothetical, it is what is
+actually shipping - is ~2.8x too slow at the arithmetic itself. There is also
+a further ~10.2ms/token gap between the 18.7ms DSP round trip and the
+measured 28.9ms/token total (1e6/34.58), consistent with SS19's CPU-side
+LM-head + embedding + sampling + host bookkeeping cost.
+
+**This is the number that separates "dispatch-fixable" from "hardware-fixed"
+for us specifically.** Our 196 round trips x ~98us =~19.2ms/token of pure
+dispatch waste is comparable in size to the reference implementation's
+*entire* DSP compute time for the whole model body - so batching (SS17's
+queued gemm_q4_0_batch_fp32 work) is a real, large win for us (30 -> ~73
+tok/s projected). But the destination of that work is "behind CPU for a
+physical reason" (56 tok/s HVX-only compute ceiling vs. CPU's 158.9), not
+"ahead of CPU" - matching almost exactly where the reference implementation
+already sits (34.6 vs 158.9, SS7).
+
+**Why build an NPU backend at all, then, if decode loses:** it is not
+uniformly slower. Prefill is 1.4-3.6x faster and the advantage grows with
+prompt length (SS7), because HMX is compute-density hardware that pays off
+when there is enough arithmetic per byte moved to keep a systolic array fed.
+Decode is the opposite: one token at a time means streaming the *entire*
+weight matrix from DRAM to produce *one* output row - bandwidth-bound, not
+compute-bound - and the Hexagon DSP shares the same DRAM controller as the
+ARM cores, so it has no bandwidth advantage to exploit regardless of how
+polished the dispatch is. That is a hardware property, not a software gap,
+and it is exactly why the sensible design - prefill on NPU, decode on CPU -
+is the one both this project's hybrid (SS9/SS13) and the physical evidence
+above independently arrive at, rather than "NPU for everything."
