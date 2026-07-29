@@ -24,7 +24,7 @@
 #include "rms_norm_gpu.h"
 
 #if defined(ENABLE_OPENCL)
-// [T12] OpenCL GPU rmsnorm dispatch headers (rmsnorm_cl / rmsnorm_cl_fp16 /
+// OpenCL GPU rmsnorm dispatch headers (rmsnorm_cl / rmsnorm_cl_fp16 /
 // clmem_*). Guarded so the no-OpenCL CPU build compiles with the host norm.
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h>
@@ -174,7 +174,7 @@ void RMSNormLayerGPU::incremental_forwarding(
     gamma.getDataType() == ml::train::TensorDim::DataType::FP32 &&
     out.getDataType() == ml::train::TensorDim::DataType::FP32;
 
-// [T12] FP16 residency path is GPU-only -> also requires ENABLE_OPENCL.
+// FP16 residency path is GPU-only -> also requires ENABLE_OPENCL.
 #if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
   // FP16 residual stream (Gemma2 / gpu_native parity path): run the norm as a
   // GPU kernel (rmsnorm_cl_fp16, SVM-direct when the graph uses the SVM pool),
@@ -355,10 +355,9 @@ void RMSNormLayerGPU::incremental_forwarding(
 
   // Try the fused-rmsq path first (paper §3.6 #2): it writes int8 +
   // scale + zp + row_sum into pool backings keyed by
-  // ptr:<out_host>:fused_{i8,scale,zp,rs}. The v8c FC consumer
-  // (NNTR_V8C_CONSUME_FUSED_RMSQ=1) picks those up directly,
-  // bypassing the rmsnorm→FC fp32 boundary. Falls back to plain
-  // GPU rmsnorm or host rmsnorm depending on env.
+  // ptr:<out_host>:fused_{i8,scale,zp,rs}. A v8c FC consumer picks
+  // those up directly, bypassing the rmsnorm→FC fp32 boundary. Falls back to
+  // plain GPU rmsnorm or host rmsnorm depending on env.
   for (unsigned int b = 0; b < b_size; ++b) {
     // Sliced views: in and out are shared with the parent at offset
     // b * featureLen. Operate on the raw float* with explicit offsets
@@ -407,7 +406,7 @@ void RMSNormLayerGPU::incremental_forwarding(
       rms_norm_host_fp32(in_p, gamma_p, out_p, epsilon, H, W);
     }
 #else
-    // [T12] No-OpenCL build: host CPU RMSNorm is the only path.
+    // No-OpenCL build: host CPU RMSNorm is the only path.
     rms_norm_host_fp32(in_p, gamma_p, out_p, epsilon, H, W);
 #endif
   }
