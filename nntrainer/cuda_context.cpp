@@ -24,6 +24,8 @@
 #include <logit_softcapping.h>
 #include <rms_norm_layer.h>
 #include <scalar_multiply.h>
+#include <sigmoid_add_layer.h>
+#include <sigmoid_glu_layer.h>
 #include <swiglu_layer.h>
 #include <tie_word_embedding.h>
 
@@ -236,6 +238,22 @@ void CudaContext::add_default_object() {
   // without OpenCL). Register unconditionally.
   registerFactory(nntrainer::createLayer<TieWordEmbedding>,
                   TieWordEmbedding::type);
+  // Fused sigmoid gates: sigmoid_glu (attn output gate = sigmoid(gate)*x) and
+  // sigmoid_add (PLE mix = sigmoid(gate)+emb). Backend-neutral layers whose
+  // getOps() dispatch lands on the inherited CpuComputeOps bodies here:
+  // engine=cuda tensors are host-coherent UVM, so the host loops are
+  // numerically correct (same host-class-on-cuda precedent as addition /
+  // scalar_multiply above). Without these factories any model that stamps
+  // engine= on a fused gate aborts at graph construction with
+  //   "Key is not found for the object. Key: sigmoid_glu".
+  // Registered LAST with EXPLICIT high int_keys (mirroring ClContext /
+  // AppContext): the auto int_key is str_map.size()+1, so a mid-list insertion
+  // shifts every later auto-key and can collide with an explicit key; explicit
+  // keys are collision-checked at registration.
+  registerFactory(nntrainer::createLayer<SigmoidGluLayer>,
+                  SigmoidGluLayer::type, /*int_key=*/9001);
+  registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
+                  SigmoidAddLayer::type, /*int_key=*/9002);
 }
 
 template <typename T>
