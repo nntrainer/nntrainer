@@ -772,3 +772,73 @@ correctness merits (a latent bug, now fixed and verified) rather than as a
 prerequisite for a decode-throughput win that the reference implementation
 shows will not materialize. Logged as a known, out-of-scope issue if
 multi-sequence batching is ever wanted for a different reason.
+
+---
+
+## 19. Correction: what ggml-hexagon actually puts on CPU vs DSP
+
+SS12 and SS18 left an ambiguous impression - that ggml-hexagon generally leaves
+attention on the CPU. Checked directly with `GGML_SCHED_DEBUG=2 -v` (llama.cpp's
+own per-node device-assignment dump; requires `-v` because llama-bench raises
+its own log threshold to DEBUG only then - GGML_SCHED_DEBUG alone is not
+enough, the message is emitted at GGML_LOG_LEVEL_DEBUG and the CLI's default
+callback filters it out otherwise).
+
+### Single-sequence (npl=1 - the basis for every pp/tg number in this log)
+
+| op | count | device |
+|---|---|---|
+| MUL_MAT (all 7 FC per layer) | 2744 | HTP0 |
+| RMS_NORM / MUL (norm weight) | 1582 / 1582 | HTP0 |
+| SET_ROWS (KV cache write) | 784 | HTP0 |
+| ROPE | 784 | HTP0 |
+| ADD (residual) | 784 | HTP0 |
+| SWIGLU | 392 | HTP0 |
+| **FLASH_ATTN** | 392 | **HTP0** |
+| GET_ROWS | 28 | HTP0 |
+| GET_ROWS (token embedding, 1/call) | 14 | CPU |
+| MUL_MAT (LM head, 1/call) | 14 | CPU |
+
+Confirmed directly (`node #25 (FLASH_ATTN): __fattn__-0 [ HTP0 ]`) and by the
+load log (`Flash Attention was auto, set to enabled`). **Correction to SS12/
+SS18: attention is NOT generally left on the CPU in ggml-hexagon - only in the
+batched case (see below).** Practically the entire graph runs on the DSP for a
+single sequence; only two things stay on CPU per forward pass:
+
+1. The very first token-embedding `GET_ROWS` - tiny, negligible.
+2. The LM-head `MUL_MAT` (vocab x hidden) - and this one has a precise, known
+   cause: `ggml_hexagon_supported_mul_mat`'s `nrows(src0) > 16*1024` VTCM-size
+   guard (comment: "typically the lm-head which would be too large for VTCM").
+   Qwen3's ~152K vocab is far past that. **nntrainer's own bridge mirrors this
+   identical guard** (`nntr-htp-bridge.cpp`'s `N > 16*1024` check), so our LM
+   head stays on CPU for the same hardware reason, not a gap in our design.
+
+### Multi-sequence (npl>1, SS18's batched test) - attention IS pinned to CPU, and here is exactly why
+
+`ggml_hexagon_supported_flash_attn_ext` (`ggml-hexagon.cpp:2578`):
+```cpp
+if (dst->ne[3] != 1) { return false; }
+```
+`ne[3]` is the sequence-batch dimension. The DSP's flash-attention kernel only
+supports one sequence per call, by explicit design, not a general capability
+gap. Confirmed directly: rerunning `llama-batched-bench -npl 4` with the same
+`-v` trace reproduces the mismatch warning verbatim
+(`sched_reserve: layer 0 is assigned to device HTP0 but the Flash Attention
+tensor is assigned to device CPU`), and llama_context::sched_reserve
+(src/llama-context.cpp:479) is where a single such mismatch anywhere in the
+reserved graph disables FA **globally** for the whole run (`cparams.
+flash_attn = false`), not just for the offending layer.
+
+So SS18's explanation stands, precisely scoped: multi-sequence batching pins
+attention to the CPU because of this one `ne[3] == 1` gate, and that (not a
+general "attention isn't offloaded") is why NPU decode throughput does not
+scale with batch size even past the HMX M>=32 threshold.
+
+### HMX, restated precisely
+
+Confirmed to engage for ggml-hexagon exactly as documented for our own bridge
+(SS9/SS10) - `m_hmx = M & ~31`, needs `N % 32 == 0` and `K % 256 == 0` for
+quantized weights. This is a DSP-side, not framework-side, property: it
+applies identically whether the matmul was dispatched by ggml-hexagon's
+scheduler or by our one-op-at-a-time bridge. Prefill's large M engages it in
+both; decode's M=1 does not, in both.
