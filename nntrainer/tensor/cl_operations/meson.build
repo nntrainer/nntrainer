@@ -7,6 +7,8 @@ cl_op_sources = [
   'cl_compute_ops.cpp',
   'geglu_cl_op.cpp',
   'swiglu_cl_op.cpp',
+  'sigmoid_glu_cl_op.cpp',
+  'sigmoid_add_cl_op.cpp',
   'cl_tensor_view.cpp',
   'cl_tensor_backing_pool.cpp',
   'cl_buffer_pool.cpp'
@@ -18,6 +20,8 @@ cl_op_headers = [
   'clblast_interface.h',
   'geglu_cl_op.h',
   'swiglu_cl_op.h',
+  'sigmoid_glu_cl_op.h',
+  'sigmoid_add_cl_op.h',
   'cl_tensor_view.h',
   'cl_tensor_backing_pool.h',
   'cl_buffer_pool.h'
