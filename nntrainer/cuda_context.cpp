@@ -124,7 +124,7 @@ void CudaContext::initialize() noexcept {
       setenv("NNTR_CUDA_M2B", "1", 0);
       // NNTR_DETERMINISTIC keeps the per-op drains: ASYNC removes them and
       // is the one auto-set lever whose host/device overlap can turn a
-      // knife-edge logit into a run-to-run coin flip (round-15 audit).
+      // knife-edge logit into a run-to-run coin flip (measured).
       {
         const char *det = getenv("NNTR_DETERMINISTIC");
         setenv("NNTR_CUDA_ASYNC", (det && det[0] == '1') ? "0" : "1", 0);
@@ -141,7 +141,7 @@ void CudaContext::initialize() noexcept {
       // default-determinism contract holds. Every setenv here is
       // overwrite=0 and value-checked downstream, so =0 (or =1 for
       // RMSNORM_CUDA_OFF) still opts out per lever. ASYNC stays off: drain
-      // removal is the round-15 knife-edge nondeterminism lever and adds
+      // removal is the measured knife-edge nondeterminism lever and adds
       // nothing on top of the graph (58.5 vs 58.4 TPS).
       setenv("NNTR_CUDA_DEV_ACT", "1", 0);
       setenv("NNTR_CUDA_VCOPY_PREFILL", "1", 0);
