@@ -125,7 +125,7 @@ void FullyConnectedLayerCl::forwarding(RunLayerContext &context,
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
   // output = input * weight. The backend's ComputeOps owns the GEMM (OpenCL v8c
-  // / CUDA cuda_fc_qint4 / host dot). [T7]
+  // / CUDA cuda_fc_qint4 / host dot).
   input_.getOps()->fc(input_, weight, hidden_);
 
   if (auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
@@ -134,7 +134,7 @@ void FullyConnectedLayerCl::forwarding(RunLayerContext &context,
     hidden_.add_i(bias);
   }
 
-  // [T10] fused activation epilogue via the op table — same backend-neutral
+  // Fused activation epilogue via the op table — same backend-neutral
   // dispatch as the core FC (ClComputeOps on gpu, CudaComputeOps on cuda).
   // Inert for the LLM stack (no fc+activation); fires only when a
   // FusionRealizer sets fused_activation (a GPU CNN/MLP).
@@ -185,7 +185,7 @@ void FullyConnectedLayerCl::incremental_forwarding(RunLayerContext &context,
     hidden_step.add_i(bias);
   }
 
-  // [T10] fused activation epilogue via the op table (see forwarding()).
+  // Fused activation epilogue via the op table (see forwarding()).
   auto &fused_act = std::get<props::FusedActivation>(fc_props);
   if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE)
     hidden_step.getOps()->apply_activation(hidden_step, (int)fused_act.get());

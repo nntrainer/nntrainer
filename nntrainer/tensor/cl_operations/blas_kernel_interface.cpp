@@ -731,15 +731,24 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
   }
   auto inserted = cache.emplace(key, std::move(e));
 
-  // [NNTR_V8C_DROP_PLAIN=1, x86-only EXPERIMENT] The device backing + scale
-  // buf + row-sum built above are the ONLY things the v8c GPU path reads from
-  // now on; on x86 the sole remaining consumer of the plain QS4CX payload is
-  // the HalfTensor::dot host fallback, which is NYI (dead) there. Dropping the
-  // plain pages after the build reclaims ~the whole FC weight footprint from
-  // host RSS. INWARD page alignment so pages shared
-  // with neighboring pool tensors are never touched. Dropped pages read back
-  // as zeros -- do NOT enable where a host consumer exists (ARM/KAI!). May
-  // silently no-op if the driver pinned the SVM pages (result is logged).
+  // [NNTR_V8C_DROP_PLAIN=1, x86-only, OPT-IN] The device backing + scale buf +
+  // row-sum built above are the only things the v8c GPU path reads from now
+  // on, so dropping the plain QS4CX pages after the build reclaims ~the whole
+  // FC weight footprint from host RSS. INWARD page alignment so pages shared
+  // with neighboring pool tensors are never touched. May silently no-op if the
+  // driver pinned the SVM pages (result is logged).
+  //
+  // DANGEROUS, hence opt-in everywhere: dropped pages read back as ZEROS, and
+  // a live host consumer of the plain payload still exists on x86 -- the
+  // ClComputeOps QS4CX fallback calls Tensor::dot, and FloatTensor::dot
+  // dispatches QS4CX to dotQs4cx(), which reads exactly these nibbles plus the
+  // fp32 scale tail (float_tensor.cpp). That fallback is reachable: dotCl_v8c
+  // returns false from ~10 sites AFTER the weight has been built, cached and
+  // dropped (allocation failures, kernel-registration failures, and the huge_n
+  // untied-lm_head branch, which returns false unconditionally on an
+  // fp16-disabled build). The result would be a well-formed, entirely wrong
+  // output with no exception and no log. Re-enabling by default needs the
+  // fallback to fail loudly on a dropped weight first.
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
   defined(_M_IX86)
   {
@@ -747,16 +756,12 @@ static V8cWeightEntry *v8c_get_or_build_weight(const Tensor &weight,
       const char *v = std::getenv("NNTR_V8C_DROP_PLAIN");
       if (v != nullptr)
         return v[0] == '1';
-#if defined(_WIN32)
-      // Default ON for Windows x86: DiscardVirtualMemory works on the WDDM
+      // Opt-in on every platform. DiscardVirtualMemory does work on the WDDM
       // SVM host shadow (verified on every weight, goldens byte-identical),
-      // and the only host consumer of the plain payload is NYI/dead on x86.
-      // Linux stays opt-in: the driver refuses the drop (madvise EINVAL),
-      // so a default would only add log noise.
-      return true;
-#else
+      // but the win is throughput/footprint while the failure mode is silent
+      // wrong output through the host fallback described above, so it must not
+      // be the default until that fallback rejects a dropped weight.
       return false;
-#endif
     }();
     if (drop_plain) {
       const size_t payload = (size_t)N * (((size_t)K + 1) / 2) // nibbles

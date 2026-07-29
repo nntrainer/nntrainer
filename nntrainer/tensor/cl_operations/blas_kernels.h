@@ -566,7 +566,7 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
 
 /**
  * @brief Whether the v8c FC GEMM / KV attention use the cl_mem BUFFER path
- *        (Intel NEO) instead of the image2d path (Adreno). [T8] env
+ *        (Intel NEO) instead of the image2d path (Adreno). The env var
  * NNTR_V8C_BUF overrides; unset ⇒ derived from DeviceCaps::image_v8c
  * (vendor_id). Resolved once per process. Single source of truth for the
  * V8C_BUF cell.

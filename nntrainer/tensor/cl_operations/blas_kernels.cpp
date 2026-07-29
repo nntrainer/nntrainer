@@ -1436,7 +1436,7 @@ static const char *kV8cBufCompileOpts = "-DV8C_BUFFER_ONLY -cl-std=CL3.0";
  * image path (caps.image_v8c, i.e. non-Intel) the weight backing rows are
  * padded up to a 256-byte multiple so image2d-from-buffer creation
  * satisfies CL_DEVICE_IMAGE_PITCH_ALIGNMENT (an unaligned K/2, e.g.
- * gauss4's K=192 PLE projection -> 96 B, otherwise fails clCreateImage and
+ * a K=192 projection -> 96 B, otherwise fails clCreateImage and
  * mis-routes the FC to the lm-head GEMV). Intel NEO (buffer path) has no
  * image and keeps the tight K/2 stride UNCHANGED -- padding it breaks the
  * 2D-block weight reads of the matrix-engine kernel stacked on this path.
@@ -1462,11 +1462,11 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
     M_valid = M; // legacy: store every (padded) row
   // [M=2..4 row-gap fix] The m1/coop GEMV kernels compute ONLY row 0. That is
   // correct for the M=1 decode (M_pad=4, M_valid=1) they were built for, but
-  // a REAL 2-4-row call must compute every valid row: gauss4's 5-token prompt
-  // prefills at M=4, and the old "M_pad <= 4 means the real input had 1 valid
-  // row" assumption (below) silently left rows 1..M-1 of EVERY FC output as
-  // stale garbage (KV cache poisoned -> deterministic fluent-but-off-topic
-  // text; gemma4/qwen3/gemma2 prompts all prefill at M>4 and never hit this).
+  // a REAL 2-4-row call must compute every valid row: a short (e.g. 5-token)
+  // prompt prefills at M=4, and the old "M_pad <= 4 means the real input had 1
+  // valid row" assumption (below) silently left rows 1..M-1 of EVERY FC output
+  // as stale garbage (KV cache poisoned -> deterministic fluent-but-off-topic
+  // text; longer prompts prefill at M>4 and never hit this).
   // Route by the REAL row count (M_valid): single-row -> GEMV/m1 (fast decode
   // path unchanged); multi-row -> the TM=4 tiled kernel, which takes the
   // M_valid store guard. (When !direct_out the caller passes M_valid=M_pad;
@@ -1478,8 +1478,8 @@ void gemm_int8_v8c_cl(cl_mem act_image, cl_mem weight_image, cl_mem scale_act,
   // For the M=1 (M_pad=4) decode case the default TM=4 kernel burns ~4×
   // the work needed (3 zero-padded rows). Dispatch a TM=1 variant
   // instead. (HISTORICAL BUG, fixed above: the caller passes M_pad here, and
-  // this used to assume M_pad <= 4 implies "1 valid row" -- false for gauss4's
-  // M=4 prefill. Routing now keys on M_valid, not M_pad.)
+  // this used to assume M_pad <= 4 implies "1 valid row" -- false for a
+  // 4-row prefill. Routing now keys on M_valid, not M_pad.)
   // Buffer path (NNTR_V8C_BUF=1): act_image/weight_image carry the raw cl_mem
   // buffers; widths derived from K (int4 weight texel = 32 K, act texel = 16
   // K).
@@ -1948,7 +1948,7 @@ make_v8c_weight_backing(const uint8_t *osv32_packed,
 // NNTR_V8C_HOSTPTR: allocate the v8c weight backing as CL_MEM_ALLOC_HOST_PTR
 // (host-visible, GPU reads it in place) instead of a device clCreateBuffer.
 // MEASURED WORSE and therefore default OFF: on Xe3/Windows it does not remove a
-// copy, it ADDS one -- gauss4 peak WS 3797 -> 5231 MB (+1434, i.e. a second
+// copy, it ADDS one -- peak working set 3797 -> 5231 MB (+1434, i.e. a second
 // full weight image) with prefill 1588 -> 1461 TPS. So a plain device
 // clCreateBuffer is already the single copy; keep it. Kept as an A/B lever (and
 // a warning) for the next driver/platform where the zero-copy assumption might
@@ -1975,7 +1975,7 @@ std::unique_ptr<tv::TensorBacking> make_v8c_weight_backing_from_qs4cx(
   const size_t k_blocks = K / 32;
   // [Adreno pitch fix] image2d-from-buffer requires the row pitch to be a
   // multiple of the device CL_DEVICE_IMAGE_PITCH_ALIGNMENT; on Adreno an
-  // unaligned pitch (e.g. gauss4's K=192 PLE projection -> K/2=96 B) fails
+  // unaligned pitch (e.g. a K=192 projection -> K/2=96 B) fails
   // clCreateImage, forcing a wrong fallback (the lm-head GEMV) that corrupts a
   // normal per-layer FC. Pad each weight row up to a 256-byte multiple so the
   // image always builds and the FC stays on the correct v8c GPU path. The

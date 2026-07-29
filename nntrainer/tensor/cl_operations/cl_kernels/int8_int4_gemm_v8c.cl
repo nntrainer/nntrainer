@@ -135,8 +135,7 @@ __kernel void v8c_act_quant_f32(
 // ============================================================
 // Parallel-reduction variant of v8c_act_quant_f32. LWS=64 work-items
 // collaborate on a single row's K=1024 channels. Replaces the 1-WI-per-row
-// scalar pass that dominated 71% of prefill cost (cf. NNTR_V8C_PROFILE
-// breakdown on Adreno 830). Math is byte-identical to v8c_act_quant_f32:
+// scalar pass that dominated 71% of prefill cost (measured on Adreno 830). Math is byte-identical to v8c_act_quant_f32:
 // same KAI qai8dxp_f32 asymmetric formula, just split across WIs and
 // reduced through local memory.
 //

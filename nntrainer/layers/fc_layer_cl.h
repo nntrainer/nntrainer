@@ -16,7 +16,7 @@
  * ClComputeOps::fc (v8c w4a8 GPU GEMM) / CudaComputeOps::fc (cuda_fc_qint4) /
  * CpuComputeOps::fc (host Tensor::dot). The eager weight transform at load is
  * fc_prebuild_weight(). Registered for both the "gpu" and "cuda" engines; the
- * general FullyConnectedLayer (LoRA/quantizer) stays separate for cpu. [T7]
+ * general FullyConnectedLayer (LoRA/quantizer) stays separate for cpu.
  */
 
 #ifndef __FC_LAYER_CL_H__
