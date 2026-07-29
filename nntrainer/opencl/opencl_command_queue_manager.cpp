@@ -29,52 +29,6 @@
 namespace nntrainer::opencl {
 
 namespace {
-// NNTR_XE3_SYNC, CAPS-DERIVED. The Xe3 (Panther Lake / NEO 26.22)
-// in-order queue does not preserve kernel->kernel coherence for the
-// COARSE-grain SVM handoffs the residency model relies on; Meteor's FINE-grain
-// SVM is auto-coherent. The distinguishing factor is a queryable attribute —
-// CL_DEVICE_SVM_FINE_GRAIN_BUFFER — so the per-dispatch clFinish no longer
-// needs the mandatory NNTR_XE3_SYNC flag: an Intel device WITHOUT fine-grain
-// SVM gets it, a fine-grain Intel (Meteor) and non-Intel devices do not. The
-// env flag still overrides. Scoped to vendor=Intel so a coarse-grain Adreno
-// (which is coherent without the hammer and would only lose throughput) is
-// unaffected. Resolved once per process.
-inline bool xe3_needs_sync() {
-  static const bool sync = []() {
-    const char *e = std::getenv("NNTR_XE3_SYNC");
-    if (e) {
-      const bool ov = std::atoi(e) != 0;
-      fprintf(stderr, "[XE3_SYNC] env override NNTR_XE3_SYNC=%s -> drain %s\n",
-              e, ov ? "ON" : "OFF");
-      return ov; // explicit override
-    }
-    const auto *di = ContextManager::Global().getDeviceInfo();
-    if (!di) {
-      // Resolved before DeviceInfo was populated: a possible platform-specific
-      // init-order gap. Fail safe to OFF but say so, since it silently disables
-      // the coherence drain.
-      fprintf(stderr, "[XE3_SYNC] DeviceInfo null at resolve time -> drain OFF "
-                      "(set NNTR_XE3_SYNC=1 if the GPU output races)\n");
-      return false;
-    }
-    const cl_device_svm_capabilities svm = di->getDeviceSVMCapabilities();
-    const unsigned vendor = (unsigned)di->getDeviceVendorId();
-    const bool fine_grain = (svm & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) != 0;
-    const bool decision =
-      vendor == 0x8086u && !fine_grain; // Intel coarse-grain
-    // Bring-up banner (what flips Linux fine_grain=0 -> drain ON vs a
-    // fine-grain driver): NNTR_GPU_VERBOSE only — it printed once per DLL
-    // module (7x on Windows) and an SDK surface must stay quiet by default.
-    if (std::getenv("NNTR_GPU_VERBOSE"))
-      fprintf(stderr,
-              "[XE3_SYNC] vendor=0x%x svm_caps=0x%x fine_grain_buffer=%d -> "
-              "auto drain %s (override with NNTR_XE3_SYNC=1)\n",
-              vendor, (unsigned)svm, (int)fine_grain, decision ? "ON" : "OFF");
-    return decision;
-  }();
-  return sync;
-}
-
 /**
  * @brief Per-kernel GPU profiling registry entry, populated by
  * enqueueKernel when NNTR_OPENCL_PROFILING is set. Each entry owns one
@@ -97,6 +51,33 @@ bool profEnabled() {
 }
 
 } // namespace
+
+void CommandQueueManager::setSvmCoherenceDrain(bool enable) {
+  svm_coherence_drain_ = enable ? 1 : 0;
+  ml_logi("[CL] SVM coherence drain %s", enable ? "ON" : "OFF");
+}
+
+bool CommandQueueManager::needsSvmCoherenceDrain() const {
+  // The override is an environment variable, so it cannot change under us and
+  // is safe to read once; the device-derived answer is NOT cached here - it is
+  // set by the Context (setSvmCoherenceDrain) once the device is known.
+  static const int env_override = []() {
+    const char *e = std::getenv("NNTR_XE3_SYNC");
+    if (!e)
+      return -1;
+    const int ov = (std::atoi(e) != 0) ? 1 : 0;
+    ml_logi("[CL] NNTR_XE3_SYNC=%s overrides the SVM coherence drain -> %s", e,
+            ov ? "ON" : "OFF");
+    return ov;
+  }();
+  if (env_override >= 0)
+    return env_override != 0;
+
+  // Not decided yet (no Context has enumerated a device on this module):
+  // fail CLOSED. A missing drain on a device that needs one silently corrupts
+  // the consuming kernel's input; a superfluous drain only costs throughput.
+  return svm_coherence_drain_ != 0;
+}
 
 /**
  * @brief Create a Command Queue object
@@ -499,14 +480,14 @@ bool CommandQueueManager::DispatchCommand(
   }
   next_prof_label_.clear();
 
-  // NNTR_XE3_SYNC: coarse-grain-SVM Intel devices do not honor in-order
-  // kernel->kernel memory consistency for GPU-resident SVM handoffs. Drain
-  // only after dispatches that bound an SVM pointer — the real producer->
-  // consumer boundary — instead of after every dispatch. Always consume the
-  // flag so it never leaks onto the next dispatch (cl_mem-only dispatches
-  // read false and skip).
+  // A device without fine-grain SVM does not honor in-order kernel->kernel
+  // memory consistency for GPU-resident SVM handoffs (see
+  // needsSvmCoherenceDrain). Drain only after dispatches that bound an SVM
+  // pointer — the real producer->consumer boundary — instead of after every
+  // dispatch. Always consume the flag so it never leaks onto the next
+  // dispatch (cl_mem-only dispatches read false and skip).
   const bool touched_svm = Kernel::takeDispatchTouchedSVM();
-  if (xe3_needs_sync() && touched_svm)
+  if (needsSvmCoherenceDrain() && touched_svm)
     clFinish(command_queue_);
 
   return true;
@@ -561,14 +542,14 @@ bool CommandQueueManager::DispatchCommand(
   }
   next_prof_label_.clear();
 
-  // NNTR_XE3_SYNC: coarse-grain-SVM Intel devices do not honor in-order
-  // kernel->kernel memory consistency for GPU-resident SVM handoffs. Drain
-  // only after dispatches that bound an SVM pointer — the real producer->
-  // consumer boundary — instead of after every dispatch. Always consume the
-  // flag so it never leaks onto the next dispatch (cl_mem-only dispatches
-  // read false and skip).
+  // A device without fine-grain SVM does not honor in-order kernel->kernel
+  // memory consistency for GPU-resident SVM handoffs (see
+  // needsSvmCoherenceDrain). Drain only after dispatches that bound an SVM
+  // pointer — the real producer->consumer boundary — instead of after every
+  // dispatch. Always consume the flag so it never leaks onto the next
+  // dispatch (cl_mem-only dispatches read false and skip).
   const bool touched_svm = Kernel::takeDispatchTouchedSVM();
-  if (xe3_needs_sync() && touched_svm)
+  if (needsSvmCoherenceDrain() && touched_svm)
     clFinish(command_queue_);
 
   return true;
@@ -617,7 +598,7 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
   // when this dispatch bound an SVM pointer; always consume the flag so it
   // never leaks.
   const bool touched_svm = Kernel::takeDispatchTouchedSVM();
-  if (xe3_needs_sync() && touched_svm)
+  if (needsSvmCoherenceDrain() && touched_svm)
     clFinish(command_queue_);
 
   // consume the per-call shape label regardless of tracking, so it never

@@ -22,6 +22,7 @@
 #include <concat_cl.h>
 #include <fc_layer_cl.h>
 #include <mutex>
+#include <opencl_command_queue_manager.h>
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
@@ -96,6 +97,8 @@ void ClContext::initialize() noexcept {
       caps_.compute_units = di->getDeviceMaxComputeUnits();
       caps_.max_alloc_bytes = di->getDeviceMaxMemAllocSize();
       caps_.unified_memory = di->getDeviceSVMCapabilities() != 0;
+      caps_.svm_fine_grain =
+        (di->getDeviceSVMCapabilities() & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) != 0;
       caps_.subgroups = di->getDeviceExtensions().find("cl_intel_subgroups") !=
                         std::string::npos;
       // cl_intel_subgroups is advertised by every Intel GPU since Gen9
@@ -111,9 +114,8 @@ void ClContext::initialize() noexcept {
       // Intel NEO's compiler rejects integer-coordinate read_imageui kernels.
       // Keyed off vendor_id -- a stable, queryable, vendor-wide attribute (the
       // quirk is a compiler trait, not a per-model one), not the brittle
-      // device_name. Intel (0x8086) => buffer; others keep the image default.
-      constexpr uint32_t INTEL_VENDOR_ID = 0x8086;
-      caps_.image_v8c = (caps_.vendor_id != INTEL_VENDOR_ID);
+      // device_name. Intel => buffer; others keep the image default.
+      caps_.image_v8c = (caps_.vendor_id != DeviceCaps::VENDOR_INTEL);
       cl_bool host_unified = CL_FALSE;
       caps_.integrated =
         (clGetDeviceInfo(context_inst_.GetDeviceId(),
@@ -121,6 +123,21 @@ void ClContext::initialize() noexcept {
                          &host_unified, nullptr) == CL_SUCCESS) &&
         (host_unified == CL_TRUE);
       ml_logi("[ClContext] %s", caps_.toString().c_str());
+
+      // Decide the SVM coherence drain HERE - after device enumeration, where
+      // the caps are known - and push it into the queue manager, rather than
+      // letting the queue manager resolve it lazily on first use (it can be
+      // reached before any device exists, and would then have to guess).
+      //
+      // An in-order queue on a device without fine-grain SVM does not keep a
+      // coarse-grain SVM allocation coherent across a kernel->kernel handoff,
+      // so the consuming dispatch needs a host-side drain first. Fine-grain
+      // devices are coherent on their own. Scoped to Intel because a
+      // coarse-grain Adreno is coherent in practice and would only lose
+      // throughput. NNTR_XE3_SYNC still overrides both ways.
+      const bool svm_drain =
+        (caps_.vendor_id == DeviceCaps::VENDOR_INTEL) && !caps_.svm_fine_grain;
+      opencl::CommandQueueManager::Global().setSvmCoherenceDrain(svm_drain);
     }
 
     if (KERNEL_CACHE_ENABLED) {

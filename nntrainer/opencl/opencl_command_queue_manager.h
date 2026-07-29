@@ -45,7 +45,37 @@ class CommandQueueManager : public Singleton<CommandQueueManager> {
    */
   std::string next_prof_label_;
 
+  /**
+   * @brief tri-state SVM coherence drain policy: -1 = not decided yet, 0 =
+   * off, 1 = on. Decided by the owning Context after device enumeration
+   * (setSvmCoherenceDrain) and never resolved here, so there is no window in
+   * which this class has to guess from a device that may not exist yet.
+   */
+  int svm_coherence_drain_ = -1;
+
+  /**
+   * @brief Whether a dispatch that touched SVM must be drained (clFinish)
+   * before the next one may consume its output.
+   *
+   * NNTR_XE3_SYNC overrides in both directions. Until the owning Context has
+   * decided, this answers YES: a missing drain on a device that needs one
+   * corrupts output silently, while an unnecessary drain only costs
+   * throughput, so the unknown state must fail CLOSED.
+   */
+  bool needsSvmCoherenceDrain() const;
+
 public:
+  /**
+   * @brief Set the SVM coherence drain policy for this queue.
+   *
+   * Called by the owning Context once its DeviceCaps are known
+   * (svm_fine_grain + vendor), so the decision is taken where the capability
+   * lives and this class stays free of device knowledge.
+   *
+   * @param enable true to drain after every SVM-touching dispatch
+   */
+  void setSvmCoherenceDrain(bool enable);
+
   /**
    * @brief Create a Command Queue object
    *
