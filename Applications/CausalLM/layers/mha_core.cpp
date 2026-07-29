@@ -25,6 +25,15 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_attention.h>
+#include <cuda_context_manager.h>
+#include <cuda_elementwise.h>
+#include <cuda_rope.h>
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+#endif
+
 static std::mutex rope_init_mtx;
 
 // Minimum prefill step_size for routing attention/RoPE onto the GPU paths.
@@ -295,6 +304,37 @@ static inline void gather_k_ohwi_to_concat_fp16(
 }
 
 namespace causallm {
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+// Upload a vector<vector<_FP16>> RoPE LUT to a flat device buffer ONCE (cached
+// by table identity), [num_positions * half] row-major. The per-call host LUT
+// row would otherwise force a blocking host->device cudaMemcpy in cuda_rope --
+// nsys showed that at 74% of API time under NNTR_CUDA_ASYNC. There are only a
+// couple of distinct tables (one per head_dim), so this is a few MB, uploaded
+// once. Returns a device pointer; cuda_rope's dev check then skips the mirror.
+static const unsigned short *
+rope_lut_device(std::vector<std::vector<_FP16>> *table, int half) {
+  static std::unordered_map<const void *, unsigned short *> cache;
+  static std::mutex mtx;
+  std::lock_guard<std::mutex> lk(mtx);
+  auto it = cache.find(table);
+  if (it != cache.end())
+    return it->second;
+  const size_t npos = table->size();
+  std::vector<unsigned short> flat(npos * (size_t)half);
+  for (size_t p = 0; p < npos; ++p)
+    std::memcpy(&flat[p * half], (*table)[p].data(),
+                (size_t)half * sizeof(unsigned short));
+  unsigned short *dev = nullptr;
+  if (cudaMalloc(&dev, flat.size() * sizeof(unsigned short)) != cudaSuccess)
+    dev = nullptr;
+  else
+    cudaMemcpy(dev, flat.data(), flat.size() * sizeof(unsigned short),
+               cudaMemcpyHostToDevice);
+  cache[table] = dev;
+  return dev;
+}
+#endif
 
 #define tile_size 4
 
@@ -1758,8 +1798,77 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         }
       }
       // apply rotary embedding for query
-      apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
-                                 true);
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+      // GPU RoPE (decode, device-resident query): split-half rotation on the
+      // device matching apply_rotary_emb_tensor_v2, keeping the query off the
+      // host. Opt-in (NNTR_CUDA_ROPE) until the whole decode chain is on-GPU.
+      bool q_rope_gpu = false;
+      {
+        static const bool cuda_rope = nntr_env_on("NNTR_CUDA_ROPE");
+        if (cuda_rope &&
+            query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+          if (cached_freqs_cos_fp16 == nullptr ||
+              cached_freqs_sin_fp16 == nullptr) {
+            const std::lock_guard<std::mutex> lock(rope_init_mtx);
+            // Cap the RoPE trig table to the live max sequence length
+            // (rope_lut_positions() = MaxTimestep ~= max_seq_len) instead of
+            // the model's max_position_embeddings (131072 for gemma4). The
+            // table is already shared across layers via precompute_freqs'
+            // rope_freq_cache (only the 2 distinct (head_dim, theta) configs
+            // are built), but each build was the full 128K positions => ~376ms
+            // of prefill host time for the 2 trig builds + ~113ms flatten/H2D,
+            // when prefill only touches <=max_seq_len positions. The OpenCL
+            // GPU-RoPE path already caps via rope_lut_positions(); this mirrors
+            // it for the CUDA path.
+            precompute_freqs(head_dim, rope_lut_positions(), theta, true);
+            cached_freqs_cos_fp16 = freqs_cos_fp16;
+            cached_freqs_sin_fp16 = freqs_sin_fp16;
+          }
+          const unsigned int nrows = query_step.height();
+          if ((size_t)cache_index + nrows <= (*cached_freqs_cos_fp16).size()) {
+            unsigned short *q =
+              reinterpret_cast<unsigned short *>(query_step.getData<_FP16>());
+            const bool dev = nntrainer::cuda::dev_accessible(q);
+            if (dev) {
+              const int half = head_dim / 2;
+              const unsigned short *cosd =
+                rope_lut_device(cached_freqs_cos_fp16, half);
+              const unsigned short *sind =
+                rope_lut_device(cached_freqs_sin_fp16, half);
+              if (cosd && sind) {
+                // M2-B: read the RoPE position from the device d_pos buffer so
+                // a captured decode graph stays valid across tokens. Set d_pos
+                // here only when NOT capturing (non-graph decode); under
+                // capture the neuralnet scaffold sets it once per token before
+                // the replay.
+                static const bool m2b = nntr_env_on("NNTR_CUDA_M2B");
+                if (m2b) {
+                  if (!nntrainer::cuda::StreamManager::Global().isCapturing())
+                    nntrainer::cuda::cuda_set_pos((int)cache_index,
+                                                  (int)cache_index + 1);
+                  q_rope_gpu = nntrainer::cuda::cuda_rope_fp16_dpos(
+                    q, q, cosd, sind, query_step.width() / head_dim, head_dim,
+                    (int)nrows, /*out_slot_dpos=*/0);
+                } else {
+                  q_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
+                    q, q, cosd, sind, query_step.width() / head_dim, head_dim,
+                    (int)nrows, (int)cache_index);
+                }
+              }
+            }
+          }
+        }
+      }
+      if (!q_rope_gpu) {
+        // host RoPE fallback (prefill height>1): sync first so the host read of
+        // GPU-produced q is coherent under NNTR_CUDA_ASYNC.
+        nntrainer::cuda::drain_if_async();
+#endif
+        apply_rotary_emb_tensor_v2(query_step, query_step, head_dim,
+                                   cache_index, true);
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+      }
+#endif
 
       // append kcache with rotary embedding. §3.8 OHWI write path: when
       // enabled and on the FP16 cache path, rotate K in-place on key_step then
@@ -1788,7 +1897,64 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // kernel and a device-resident cache, neither of which this change set
         // provides; the checks below gate it.
         bool k_rope_gpu = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+        {
+          static const bool cuda_rope = nntr_env_on("NNTR_CUDA_ROPE");
+          auto dev = [](const void *p) {
+            return nntrainer::cuda::dev_accessible(p);
+          };
+          const unsigned int knrows = key_step.height();
+          if (cuda_rope &&
+              key_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+              cached_freqs_cos_fp16 != nullptr &&
+              (size_t)cache_index + knrows <= (*cached_freqs_cos_fp16).size()) {
+            auto *kin =
+              reinterpret_cast<unsigned short *>(key_step.getData<_FP16>());
+            auto *kout = reinterpret_cast<unsigned short *>(
+              b_cache_key_step.getData<_FP16>());
+            if (dev(kin) && dev(kout)) {
+              const int half = head_dim / 2;
+              const unsigned short *cosd =
+                rope_lut_device(cached_freqs_cos_fp16, half);
+              const unsigned short *sind =
+                rope_lut_device(cached_freqs_sin_fp16, half);
+              static const bool m2b_k = nntr_env_on("NNTR_CUDA_M2B");
+              if (cosd && sind && m2b_k) {
+                // M2-B: write RoPE'd K into the cache at the live slot computed
+                // on-device from d_pos[0] (kbase = cache BASE for this batch,
+                // not the host pre-offset b_cache_key_step) -> correct slot on
+                // replay.
+                unsigned short *kbase =
+                  reinterpret_cast<unsigned short *>(
+                    cache_key.getData<_FP16>()) +
+                  (size_t)batch * cache_key_dim.getFeatureLen();
+                k_rope_gpu = nntrainer::cuda::cuda_rope_fp16_dpos(
+                  kin, kbase, cosd, sind, key_step.width() / head_dim, head_dim,
+                  (int)knrows, /*out_slot_dpos=*/1,
+                  /*ring_cap=*/(int)kv_ring_cap);
+              } else if (cosd && sind) {
+                k_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
+                  kin, kout, cosd, sind, key_step.width() / head_dim, head_dim,
+                  (int)knrows, (int)cache_index);
+              }
+            }
+          }
+        }
+#endif
         if (!k_rope_gpu) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+          nntrainer::cuda::drain_if_async();
+#if defined(ENABLE_FP16)
+          NNTR_THROW_IF(
+            b_cache_key_step.getMemoryData() &&
+              !b_cache_key_step.getMemoryData()->isHostAddressable(),
+            std::runtime_error)
+            << "device-only KV (NNTR_CUDA_KV_DEV) requires GPU RoPE for K; the "
+               "host fallback would fault (NNTR_CUDA_ROPE off or RoPE LUT "
+               "range miss at cache_index="
+            << cache_index << ")";
+#endif
+#endif
           apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
                                      cache_index, true);
         }
@@ -1802,7 +1968,63 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                  ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
         bool v_copy_gpu = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+        {
+          static const bool cuda_elt = nntr_env_on("NNTR_CUDA_ROPE");
+          // V-copy historically stayed host for the prefill big-step (height>1)
+          // because a host attention path could read the V cache unsynced. With
+          // GPU attention (NNTR_CUDA_ATTN) + UVM KV cache (NNTR_CUDA_KV_UVM),
+          // prefill attention reads the cache on the GPU (same stream), so a
+          // GPU V copy is a GPU->GPU handoff -- no host read, no drain. Gated
+          // by NNTR_CUDA_VCOPY_PREFILL while validating; removes the per-layer
+          // finishIfAsync bubble that made async-on prefill slow.
+          static const bool vcopy_prefill =
+            nntr_env_on("NNTR_CUDA_VCOPY_PREFILL");
+          auto *vin =
+            reinterpret_cast<unsigned short *>(value_step.getData<_FP16>());
+          auto *vout = reinterpret_cast<unsigned short *>(
+            b_cache_value_step.getData<_FP16>());
+          const bool dev = nntrainer::cuda::dev_accessible(vout);
+          // Device-only KV (NNTR_CUDA_KV_DEV): the host copyData fallback
+          // below would dereference a cudaMalloc pointer -- always take the
+          // GPU copy for a device-only destination, independent of the
+          // VCOPY_PREFILL opt-in. Asked via the MemoryData residency stamp
+          // (pool-bind time), not a per-call driver query -- layering rule.
+          const auto v_md = b_cache_value_step.getMemoryData();
+          const bool v_dev_only = v_md && !v_md->isHostAddressable();
+          static const bool m2b_v = nntr_env_on("NNTR_CUDA_M2B");
+          if (cuda_elt && dev &&
+              (value_step.height() == 1 || vcopy_prefill || v_dev_only)) {
+            if (m2b_v) {
+              // M2-B: write V into the cache at the live slot d_pos[0] computed
+              // on-device (vbase = cache BASE for this batch) -> correct on
+              // replay.
+              unsigned short *vbase =
+                reinterpret_cast<unsigned short *>(
+                  cache_value.getData<_FP16>()) +
+                (size_t)batch * cache_value_dim.getFeatureLen();
+              if (nntrainer::cuda::cuda_scalar_mul_fp16_slot(
+                    vin, vbase, (unsigned int)value_step.size(), 1.0f,
+                    (int)cache_value_dim.width(),
+                    /*ring_cap=*/(int)kv_ring_cap))
+                v_copy_gpu = true;
+            } else if (nntrainer::cuda::cuda_scalar_mul_fp16(
+                         vin, vout, (unsigned int)value_step.size(), 1.0f)) {
+              v_copy_gpu = true;
+            }
+          }
+        }
+#endif
         if (!v_copy_gpu) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+          nntrainer::cuda::drain_if_async();
+          NNTR_THROW_IF(
+            b_cache_value_step.getMemoryData() &&
+              !b_cache_value_step.getMemoryData()->isHostAddressable(),
+            std::runtime_error)
+            << "device-only KV (NNTR_CUDA_KV_DEV) requires the GPU V-copy; the "
+               "host copyData fallback would fault -- check NNTR_CUDA_ROPE";
+#endif
           b_cache_value_step.copyData(value_step);
         }
 #else
@@ -2471,6 +2693,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   // Host decode attention reads GPU-produced Q/K on the host: sync first so the
   // read is coherent under NNTR_CUDA_ASYNC (no-op in sync mode).
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  nntrainer::cuda::drain_if_async();
+#endif
   mha_ring_assert_linear_read(kv_ring_cap, cache_to,
                               "host compute_kcaches (decode)");
   compute_kcaches(query_step, b_cached_key, out_, cache_from,
@@ -2784,6 +3009,39 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
 #else
   Kbase = b_cached_key.getData<uint16_t>();
   Vbase = b_cached_value.getData<uint16_t>();
+#endif
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // GPU attention (engine=cuda, UVM): the interleaved fp16 query + fp16 KV
+  // cache feed a flash core on the device, replacing the host O(M^2) loop
+  // below. Matches this host path exactly (scale 1/sqrt(d), causal + sliding
+  // mask, GQA, softcap, ring row mapping n % kv_ring_cap). NNTR_CUDA_ATTN is
+  // auto-defaulted to 1 by the cuda-context SAFE profile (cuda runs only,
+  // overwrite=0); an explicit =0 opts out. Falls through to the host path
+  // when off / not device-resident. (The int8-KV read branch is a separate
+  // rung -- this tree has no int8 KV plane.)
+  {
+    static const bool cuda_attn = nntr_env_on("NNTR_CUDA_ATTN");
+    if (cuda_attn && q_fp16 && o_fp16 && Q_fp16_src && O_fp16) {
+      auto dev_ok = [](const void *p) {
+        return nntrainer::cuda::dev_accessible(p);
+      };
+      // Query + output must be device-resident (the kernel uses them directly);
+      // the KV cache may be host-heap (it is, on engine=cuda) -- the launcher
+      // mirrors it to the device. A device kernel touching host memory faults
+      // and corrupts the context, so this guard is required.
+      bool dev = dev_ok(Q_fp16_src) && dev_ok(O_fp16);
+      if (dev) {
+        const int win = windowed ? (int)local_window_size : INT_MAX;
+        if (nntrainer::cuda::cuda_attention_interleaved_fp16(
+              Q_fp16_src, Kbase, Vbase, O_fp16, (int)num_heads_Q,
+              (int)num_heads_KV, (int)N_q, (int)N_kv, (int)cache_from, (int)d,
+              win, (float)attn_logit_softcapping,
+              /*ring_cap=*/(int)kv_ring_cap))
+          return;
+      }
+    }
+  }
 #endif
 
   // Phase 1: de-interleave heads once into shared contiguous buffers.

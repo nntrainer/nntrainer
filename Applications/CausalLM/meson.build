@@ -38,6 +38,14 @@ causallm_layer_dependencies += [
     causallm_per_layer_slice_dep,
 ]
 
+# Additive CUDA backend: the app TUs (mha_core / kv_cache_manager) include the
+# CUDA kernel wrappers, which pull cuda_runtime.h -> they need the CUDA toolkit
+# include path. cuda_dep is defined in the root meson.build only when
+# enable-cuda is set.
+if get_option('enable-cuda')
+    causallm_layer_dependencies += cuda_dep
+endif
+
 subdir('models')
 
 if (get_option('platform') == 'windows') and (build_machine.system() == 'windows')
