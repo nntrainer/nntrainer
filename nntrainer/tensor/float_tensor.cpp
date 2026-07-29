@@ -771,7 +771,13 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
 void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
                       bool trans, bool trans_in, float beta) const {
   float *data = (float *)getData();
-  unsigned int M = getDim().height();
+  // batch()*channel()*height() flattened into one row count, matching
+  // calculateFlattenDot's NCHW convention (tensor_base.cpp) - not height()
+  // alone. This tensor's data buffer is batch*channel*height*width contiguous
+  // floats; treating only height() as M silently drops every batch/channel
+  // beyond the first when batch()*channel() > 1.
+  unsigned int M =
+    getDim().batch() * getDim().channel() * getDim().height();
   unsigned int K = getDim().width();
   Tdatatype input_dtype = input[0]->getDataType();
 
@@ -981,7 +987,10 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   }
 
   unsigned int M, N, K;
-  M = getDim().height();
+  // batch()*channel()*height() flattened, per calculateFlattenDot's NCHW
+  // convention (tensor_base.cpp) - height() alone silently dropped every
+  // batch/channel beyond the first whenever batch()*channel() > 1.
+  M = getDim().batch() * getDim().channel() * getDim().height();
   K = getDim().width();
   N = trans_in ? input.getDim().height() : input.getDim().width();
 
@@ -994,7 +1003,7 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     o->gemm_q6_K_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
     break;
   case Tdatatype::Q4_0: {
-    M = getDim().height();
+    M = getDim().batch() * getDim().channel() * getDim().height();
     K = getDim().width();
     N = input.getDim().width();
     // The M threshold is the backend's to declare (see
@@ -1034,7 +1043,10 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
   char *mdata = input.getData<char>();
   float *rdata = output.getData<float>();
 
-  unsigned int M = getDim().height();
+  // See dotQnK above - batch()*channel()*height() flattened, not height()
+  // alone.
+  unsigned int M =
+    getDim().batch() * getDim().channel() * getDim().height();
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
 
@@ -1059,7 +1071,10 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
 Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
                               bool trans_in, float beta,
                               Tdatatype dtype) const {
-  unsigned int M = getDim().height();
+  // See dotQnK above - batch()*channel()*height() flattened, not height()
+  // alone.
+  unsigned int M =
+    getDim().batch() * getDim().channel() * getDim().height();
   unsigned int K = getDim().width();
   unsigned int N = output.getDim().width();
 #if defined(__aarch64__) || defined(__ARM_ARCH_7A__) ||                        \

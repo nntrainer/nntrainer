@@ -733,7 +733,10 @@ Tensor &HalfTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   _FP16 *rdata = output.getData<_FP16>();
 
   unsigned int M, N, K;
-  M = getDim().height();
+  // batch()*channel()*height() flattened, matching FloatTensor::dotQnK (see
+  // that function's comment) - height() alone silently dropped every
+  // batch/channel beyond the first whenever batch()*channel() > 1.
+  M = getDim().batch() * getDim().channel() * getDim().height();
   K = getDim().width();
   N = trans_in ? input.getDim().height() : input.getDim().width();
   switch (dtype) {
