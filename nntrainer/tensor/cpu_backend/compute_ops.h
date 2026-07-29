@@ -406,7 +406,7 @@ public:
    * @brief Sigmoid-GLU over the first `active_rows` rows starting at
    *        `row_offset`: out = sigmoid(in1) * in2 ({gate, up} -> result).
    *        in1/in2/out share shape; width() is the per-row element count.
-   *        gauss4 attention output gate.
+   *        E.g. a sigmoid-gated attention output gate.
    */
   virtual void sigmoid_glu(const Tensor &in1, const Tensor &in2, Tensor &out,
                            unsigned int active_rows, unsigned int row_offset);
@@ -415,7 +415,7 @@ public:
    * @brief Sigmoid-add over the first `active_rows` rows starting at
    *        `row_offset`: out = sigmoid(in1) + in2 ({gate, emb} -> result).
    *        in1/in2/out share shape; width() is the per-row element count.
-   *        gauss4 PLE mix (method=1).
+   *        E.g. a per-layer-embedding (PLE) mix path (method=1).
    */
   virtual void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
                            unsigned int active_rows, unsigned int row_offset);

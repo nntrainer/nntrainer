@@ -103,8 +103,8 @@ void CpuComputeOps::swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
 }
 
 // out = sigmoid(in1) * in2 over rows [row_offset, row_offset+active_rows).
-// gauss4 attention output gate. FP32 accumulation (upcast fp16 -> float) so the
-// LRA-MLP intermediates do not overflow fp16.
+// A sigmoid-gated attention output gate is one example. FP32 accumulation
+// (upcast fp16 -> float) so the LRA-MLP intermediates do not overflow fp16.
 void CpuComputeOps::sigmoid_glu(const Tensor &in1, const Tensor &in2,
                                 Tensor &out, unsigned int active_rows,
                                 unsigned int row_offset) {
@@ -134,7 +134,8 @@ void CpuComputeOps::sigmoid_glu(const Tensor &in1, const Tensor &in2,
 }
 
 // out = sigmoid(in1) + in2 over rows [row_offset, row_offset+active_rows).
-// gauss4 PLE mix (method=1). FP32 accumulation as above.
+// A per-layer-embedding (PLE) mix path (method=1) is one example. FP32
+// accumulation as above.
 void CpuComputeOps::sigmoid_add(const Tensor &in1, const Tensor &in2,
                                 Tensor &out, unsigned int active_rows,
                                 unsigned int row_offset) {

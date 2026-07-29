@@ -371,10 +371,10 @@ public:
   // out = silu(gate) * up over the live rows (numerically stable SiLU). [T7]
   void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
               unsigned int active_rows, unsigned int row_offset) override;
-  // out = sigmoid(gate) * up over the live rows (fp32-accumulated). [gauss4]
+  // out = sigmoid(gate) * up over the live rows (fp32-accumulated).
   void sigmoid_glu(const Tensor &in1, const Tensor &in2, Tensor &out,
                    unsigned int active_rows, unsigned int row_offset) override;
-  // out = sigmoid(gate) + emb over the live rows (fp32-accumulated). [gauss4]
+  // out = sigmoid(gate) + emb over the live rows (fp32-accumulated).
   void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
                    unsigned int active_rows, unsigned int row_offset) override;
   // hidden = input (copy) / hidden += input (add) via host Tensor ops. [T7]
