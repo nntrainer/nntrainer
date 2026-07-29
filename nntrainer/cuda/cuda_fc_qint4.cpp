@@ -110,7 +110,7 @@ __global__ void cvt_h2f(const unsigned short *src, float *dst, int n) {
 }
 )CU";
 
-// [weight 한벌] The QS4CX plain payload is consumed by the CUDA FC path
+// [single weight copy] The QS4CX plain payload is consumed by the CUDA FC path
 // directly (the OpenCL v8c kernel consumes it the same way) -- no host/UVM copy
 // of the nibble payload. The only per-weight side allocation is this N-entry
 // fp16 scale buffer: the dequant kernel reads the per-channel scale on device
