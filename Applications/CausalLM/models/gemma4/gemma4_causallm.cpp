@@ -39,6 +39,12 @@ bool Gemma4Transformer::isSlidingAttentionLayer(int layer_id) const {
   return true;
 }
 
+unsigned int Gemma4Transformer::getLayerSlidingWindow(int layer_id) const {
+  // Mirrors the `sliding_window` property createAttention() sets from
+  // isSlidingAttentionLayer() (config `layer_types`; default sliding).
+  return isSlidingAttentionLayer(layer_id) ? SLIDING_WINDOW : UINT_MAX;
+}
+
 unsigned int Gemma4Transformer::getAttentionHeadDim(int layer_id) const {
   return isSlidingAttentionLayer(layer_id) ? static_cast<unsigned int>(HEAD_DIM)
                                            : GLOBAL_HEAD_DIM;
@@ -585,7 +591,8 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
      withKey("engine", causallm_engine())}));
   Tensor q_scaled = q_scale(q_normed);
 
-  unsigned int window_size = is_sliding ? SLIDING_WINDOW : UINT_MAX;
+  // One source of truth -- see getLayerSlidingWindow().
+  const unsigned int window_size = getLayerSlidingWindow(layer_id);
   unsigned int rope_theta =
     is_sliding ? SLIDING_ATTENTION_ROPE_THETA : FULL_ATTENTION_ROPE_THETA;
 
@@ -745,7 +752,8 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   layer_k_norms[layer_id] = k_normed;
   layer_v_norms[layer_id] = v_normed;
 
-  unsigned int window_size = is_sliding ? SLIDING_WINDOW : UINT_MAX;
+  // One source of truth -- see getLayerSlidingWindow().
+  const unsigned int window_size = getLayerSlidingWindow(layer_id);
   unsigned int rope_theta =
     is_sliding ? SLIDING_ATTENTION_ROPE_THETA : FULL_ATTENTION_ROPE_THETA;
   const std::string &rope_type =

@@ -269,6 +269,20 @@ public:
 
 protected:
   /**
+   * @brief Per-layer sliding-window size, i.e. exactly the value this
+   *        layer's `sliding_window` mha_core property receives. UINT_MAX
+   *        means full attention.
+   *
+   * This is the SINGLE source of truth for "is layer i a sliding layer, and
+   * how wide". Models that derive the pattern from config `layer_types`
+   * instead of SLIDING_WINDOW_PATTERN MUST override this.
+   *
+   * @param layer_id decoder block index
+   * @return sliding window in tokens, or UINT_MAX for full attention
+   */
+  virtual unsigned int getLayerSlidingWindow(int layer_id) const;
+
+  /**
    * @brief Setup the parameters for the Transformer model
    */
   virtual void setupParameters(json &cfg, json &generation_cfg, json &nntr_cfg);

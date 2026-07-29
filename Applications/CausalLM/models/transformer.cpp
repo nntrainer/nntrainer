@@ -467,6 +467,16 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
   return decoder_output({residual, ffn_out});
 }
 
+unsigned int Transformer::getLayerSlidingWindow(int layer_id) const {
+  // Mirrors the `sliding_window` property createAttention() sets below: every
+  // layer whose 1-based index is NOT a multiple of the pattern is a sliding
+  // layer. Models that read an explicit per-layer `layer_types` array from the
+  // config override this.
+  // Expression copied verbatim from createAttention() (unsigned modulo, as
+  // before) so this refactor is semantics-preserving.
+  return (layer_id + 1) % SLIDING_WINDOW_PATTERN ? SLIDING_WINDOW : UINT_MAX;
+}
+
 /**
  * @brief Create external KV-cache placeholder tensors for one layer.
  */
@@ -554,9 +564,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
      withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
      withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
-     withKey("sliding_window", (layer_id + 1) % SLIDING_WINDOW_PATTERN
-                                 ? SLIDING_WINDOW
-                                 : UINT_MAX),
+     withKey("sliding_window", getLayerSlidingWindow(layer_id)),
      withKey("rope_theta", ROPE_THETA),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false")}));

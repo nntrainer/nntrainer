@@ -120,6 +120,19 @@ Tensor Gemma3Transformer::createTransformerDecoderBlock(const int layer_id,
   return decoder_output({post_attn, post_ffn});
 }
 
+unsigned int Gemma3Transformer::getLayerSlidingWindow(int layer_id) const {
+  // Mirrors the window this layer's `sliding_window` property gets below: an
+  // explicit `layer_types` array decides per layer; with no array every layer
+  // is sliding (the historical Gemma3 default).
+  if (!layer_types.empty()) {
+    if (layer_id < static_cast<int>(layer_types.size()))
+      return (layer_types[layer_id] == "sliding_attention") ? SLIDING_WINDOW
+                                                            : UINT_MAX;
+    return UINT_MAX;
+  }
+  return SLIDING_WINDOW;
+}
+
 Tensor Gemma3Transformer::createAttention(const int layer_id, int seq_len,
                                           int n_heads, int head_dim,
                                           Tensor query, Tensor key,
@@ -169,16 +182,8 @@ Tensor Gemma3Transformer::createAttention(const int layer_id, int seq_len,
   Tensor k_normed = k_norm(k);
 
   // Attention core layer
-  unsigned int window_size = UINT_MAX;
-  if (!layer_types.empty()) {
-    if (layer_id < layer_types.size()) {
-      if (layer_types[layer_id] == "sliding_attention") {
-        window_size = SLIDING_WINDOW;
-      }
-    }
-  } else {
-    window_size = SLIDING_WINDOW;
-  }
+  // One source of truth -- see getLayerSlidingWindow().
+  const unsigned int window_size = getLayerSlidingWindow(layer_id);
 
   float rope_theta = ROPE_THETA; // Default global
   if (!layer_types.empty() && layer_id < layer_types.size()) {

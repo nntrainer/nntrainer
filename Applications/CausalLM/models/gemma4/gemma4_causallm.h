@@ -67,6 +67,14 @@ protected:
 
   bool isKVSharedLayer(int layer_id) const;
   bool isSlidingAttentionLayer(int layer_id) const;
+
+  /**
+   * @brief Gemma4 derives sliding-ness from the config `layer_types` array,
+   *        not from SLIDING_WINDOW_PATTERN. Returning the exact window this
+   *        layer's `sliding_window` property receives keeps every consumer
+   *        of the per-layer window in agreement.
+   */
+  unsigned int getLayerSlidingWindow(int layer_id) const override;
   unsigned int getAttentionHeadDim(int layer_id) const;
   unsigned int getKVHeadCount(int layer_id) const;
   unsigned int getKVCacheWidth(int layer_id) const;

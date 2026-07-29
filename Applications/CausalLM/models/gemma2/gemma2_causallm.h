@@ -53,6 +53,14 @@ protected:
 
   std::vector<std::string> layer_types;
 
+  /**
+   * @brief Gemma2 derives sliding-ness from the config `layer_types` array,
+   *        not from SLIDING_WINDOW_PATTERN. Returning the exact window this
+   *        layer's `sliding_window` property receives keeps every consumer
+   *        of the per-layer window in agreement.
+   */
+  unsigned int getLayerSlidingWindow(int layer_id) const override;
+
 public:
   Tensor createAttention(const int layer_id, int seq_len, int n_heads,
                          int head_dim, Tensor query, Tensor key,
