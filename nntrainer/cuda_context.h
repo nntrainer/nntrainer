@@ -190,7 +190,7 @@ public:
    *        coherent replay / prefill graph), gated by NNTR_CUDA_GRAPH /
    *        NNTR_CUDA_M2B / NNTR_CUDA_PREFILL_GRAPH. With those unset it is a
    * plain eager walk == the base, so engine=cuda without the graph flags stays
-   *        byte-identical. Relocated verbatim from neuralnet.cpp. [T9]
+   *        byte-identical. Relocated verbatim from neuralnet.cpp.
    */
   std::vector<std::shared_ptr<const Tensor>>
   runDecode(NeuralNetwork &nn, unsigned int from, unsigned int to,
