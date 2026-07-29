@@ -842,3 +842,63 @@ quantized weights. This is a DSP-side, not framework-side, property: it
 applies identically whether the matmul was dispatched by ggml-hexagon's
 scheduler or by our one-op-at-a-time bridge. Prefill's large M engages it in
 both; decode's M=1 does not, in both.
+
+---
+
+## 20. Checked zhouwg's self-build-jz rewrite - no new lever, but independent corroboration
+
+User pointed at https://github.com/zhouwg/ggml-hexagon/discussions/18 and the
+`self-build-jz` branch (already present as a remote-tracking branch on our
+fork, commit `56507c2bb`) asking whether it explains why our performance is
+slow. Checked the actual code via a git worktree, not just the discussion.
+
+**The discussion thread oversold what's shipped.** Three specific claims
+checked against `56507c2bb`, all either wrong or unconfirmed:
+
+1. **"JZ's dispatch avoids dspqueue overhead, faster."** His IDL
+   (`kernels/ggmlop.idl:44-49`) defines a real batch call
+   (`dsp_execute_batch`), but it is **not wired up** - the hot path calls
+   `ggmlop_dsp_execute_task` once per op (`ggml-hexagon.cpp:5829`), same
+   granularity as the official dspqueue path, just a different IPC primitive
+   (raw synchronous FastRPC vs. a ring buffer). His own code says so:
+   `:6698` "TODO: offload cgraph or multiple op via ggmlop_dsp_execute_batch."
+2. **"JZ offloads the LM head to the DSP, ~214MB session-resident weight."**
+   Zero hits for any VTCM-size guard, any `lm_head`/`output.weight`
+   special-casing, anywhere in his ~11K lines of DSP-side code. Not found -
+   reported as unconfirmed, not as shipped.
+3. **"dsp_cache_mode / ion_sync_mode give fine-grained coherency control."**
+   Neither name exists anywhere in the tree. The only cache-related call
+   (`HAP_compute_res_attr_set_cache_mode(&attr, 1)`, `kernels/entry.c:172`)
+   is identical to what the official backend already does
+   (`htp/main.c:325`, same value). No software flush mechanism at all beyond
+   an `l2fetch` prefetch hint, which is not a coherency primitive. Our own
+   USAGE_WEIGHTS/USAGE_COMPUTE distinction has no counterpart here.
+
+**One claim from the discussion turned out to be independently verifiable and
+correct, from the primary source itself** (`self-build-jz`'s own README.md,
+~line 617): JZ states plainly that PP (prefill) in the official backend - the
+one we have been benchmarking against all session as "the reference" - is
+**faster** than his own rewrite's PP, and asks for help fixing it. So the
+branch we compared ourselves against throughout SS7/SS12 is already the
+faster one on the metric where we have the largest gap (SS12: ~31% of
+reference). An earlier auto-summary of the discussion thread claimed the
+opposite (JZ 1.58x faster on PP) - that summary was wrong, likely conflating
+which side's numbers were which; do not repeat it.
+
+**Why this matters more than "no new trick found":** JZ tried swapping the
+IPC transport for the exact same one-op-per-round-trip pattern we use, and it
+did not move prefill. That is independent corroboration - from a completely
+separate implementation, arrived at independently - of SS17's conclusion:
+the bottleneck was never *which* IPC primitive carries a dispatch, it is *how
+many round trips per forward pass*. His own unshipped TODO
+(`ggmlop_dsp_execute_batch`) targets exactly what our queued
+`gemm_q4_0_batch_fp32` work targets. Nobody, including a second independent
+implementation of this backend, has shipped the fix yet.
+
+Structural note for anyone revisiting this: `self-build-jz` is a genuine
+from-scratch reimplementation (`ggml-hexagon.cpp` 7445 lines +
+`kernels/ggml-dsp.c` 7366 lines + `kernels/mulmat.c` 3786 lines, separate IDL,
+separate DSP-side skel), not a patch on top of `htp/`. The one architectural
+idea in it that is real - a single ION pool with offset addressing instead of
+per-buffer allocation - is something we already arrived at independently in
+the SS8 pooled-arena rewrite.
