@@ -157,7 +157,7 @@ bool dev_accessible(const void *p);
  * @brief True iff the pointer is DEVICE-ONLY memory (cudaMalloc): the host
  *        cannot dereference it, so every host read/write must stage. False for
  *        managed/pinned/host memory. Companion of dev_accessible() for the
- *        device-resident (NNTR_CUDA_DEV_ACT / NNTR_CUDA_KV_DEV) pools -- the
+ *        device-resident activation/KV pools (opt-in) -- the
  *        gate for "auto-route to the GPU kernel / staged copy instead of the
  *        host fallback" decisions.
  */

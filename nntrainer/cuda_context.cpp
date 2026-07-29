@@ -102,7 +102,7 @@ void CudaContext::add_default_object() {
   registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
                   ml::train::LayerType::LAYER_ADDITION);
   // geglu: the backend-neutral GeGLULayer dispatches via CudaComputeOps::geglu
-  // (device-resident fp16 kernel under NNTR_CUDA_GEGLU, else host-on-UVM).
+  // (device-resident fp16 kernel when available, else host-on-UVM).
   registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
   // swiglu: the merged backend-neutral SwiGLULayer dispatches via
   // CudaComputeOps::swiglu, with the device-resident fp16 one-kernel fast path

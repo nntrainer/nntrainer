@@ -70,7 +70,7 @@ extern "C" const PfnDliHook __pfnDliFailureHook2 = nntr_dli_failure_hook;
 void ContextManager::initialize() noexcept {
   initialized_ok_ = CreateDefaultGPUDevice();
 #ifdef _WIN32
-  // [W2 delay-load follow-up] The unified binary delay-loads cuBLAS/NVRTC
+  // The unified binary delay-loads cuBLAS/NVRTC
   // (meson cuda_delayload_args) so XMX runs never map their DLL images. On
   // CUDA runs the deferred LoadLibrary then landed inside the first in-forward
   // call, i.e. mid-prefill: +67ms inside the timed 1K window (measured

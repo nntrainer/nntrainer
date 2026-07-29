@@ -88,7 +88,7 @@ public:
    *        (an in-capture cudaStreamSynchronize is illegal -- drains are
    * deferred to after the graph replay). Returns false if the stream is missing
    * / begin fails.
-   * @note  Decode CUDA-graph (NNTR_CUDA_GRAPH) foundation. Capturing the whole
+   * @note  Decode CUDA-graph foundation. Capturing the whole
    *        per-token forward additionally needs the embedding host-staging
    *        buffers (embedding_layer.cpp / tie_word_embedding.cpp `emb_stage`)
    * to be PERSISTENT + PINNED (a local std::vector is freed before the graph
