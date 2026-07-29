@@ -277,6 +277,27 @@ void CudaComputeOps::fc(Tensor &input, Tensor &weight, Tensor &output) {
 
   // Host fallback: the input is host-coherent UVM, so the CPU dot is correct.
   // Drain first in async mode so the host read sees the produced input.
+  // NNTR_CUDA_FC_DBG=1 prints WHY a call fell off the device fast paths --
+  // the fall-through above is silent by design (checklist B.15: a CUDA op
+  // falling to the host loop is invisible without a runtime trace).
+  static const bool fc_dbg = []() {
+    const char *e = std::getenv("NNTR_CUDA_FC_DBG");
+    return e && e[0] == '1';
+  }();
+  if (fc_dbg) {
+    static int n_prints = 0;
+    if (n_prints < 64) {
+      ++n_prints;
+      std::fprintf(
+        stderr,
+        "[CUDA-FC-DBG] host-dot fallback: wdt=%d adt=%d odt=%d M=%d N=%d "
+        "K=%d w_h=%d dev(W)=%d dev(X)=%d\n",
+        (int)wt, (int)at, (int)output.getDataType(), M, N, K,
+        (int)weight.getDim().height(),
+        (int)nntrainer::cuda::dev_accessible(weight.getData<uint8_t>()),
+        (int)nntrainer::cuda::dev_accessible(input.getData<char>()));
+    }
+  }
   cuda::StreamManager::Global().finishIfAsync();
   input.dot(weight, output, false, false);
 }
