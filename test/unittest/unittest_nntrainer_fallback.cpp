@@ -1615,6 +1615,75 @@ TEST(nntrainer_fallback, dequantize_row_qs4cx_f32_odd_k) {
 }
 
 //==============================================================================
+// Tests for qs8cx dequantization
+//==============================================================================
+
+static void verify_dequant_nxk_qs8cx(size_t n, size_t k) {
+  std::vector<float> rhs_f32 =
+    generate_random_vector<float>(n * k, -10.0f, 10.0f);
+
+  std::vector<int8_t> rhs_qs8cx(n * k, 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+  nntrainer::__fallback_quant_nxk_qs8cx_f32(
+    n, k, rhs_f32.data(), rhs_qs8cx.data(), rhs_scales_f32.data());
+
+  std::vector<float> reconstructed(n * k, 0.0f);
+  nntrainer::__fallback_dequant_nxk_qs8cx_f32(
+    n, k, rhs_qs8cx.data(), rhs_scales_f32.data(), reconstructed.data());
+
+  for (size_t n_idx = 0; n_idx < n; ++n_idx) {
+    for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+      const int code = (int)rhs_qs8cx[n_idx * k + k_idx];
+      const float expected = (float)code * rhs_scales_f32[n_idx];
+      EXPECT_FLOAT_EQ(reconstructed[n_idx * k + k_idx], expected);
+    }
+  }
+}
+
+TEST(nntrainer_fallback, dequant_nxk_qs8cx_f32) {
+  verify_dequant_nxk_qs8cx(/*n=*/4, /*k=*/8);
+}
+
+TEST(nntrainer_fallback, dequant_nxk_qs8cx_f32_odd_k) {
+  verify_dequant_nxk_qs8cx(/*n=*/4, /*k=*/7);
+}
+
+static void verify_dequantize_row_qs8cx(size_t n, size_t k) {
+  std::vector<float> rhs_f32 =
+    generate_random_vector<float>(n * k, -10.0f, 10.0f);
+
+  std::vector<int8_t> rhs_qs8cx(n * k, 0);
+  std::vector<float> rhs_scales_f32(n, 0.0f);
+  nntrainer::__fallback_quant_nxk_qs8cx_f32(
+    n, k, rhs_f32.data(), rhs_qs8cx.data(), rhs_scales_f32.data());
+
+  std::vector<float> tensor_ref(n * k, 0.0f);
+  nntrainer::__fallback_dequant_nxk_qs8cx_f32(
+    n, k, rhs_qs8cx.data(), rhs_scales_f32.data(), tensor_ref.data());
+
+  std::vector<float> row_out(k, 0.0f);
+  for (size_t n_idx = 0; n_idx < n; ++n_idx) {
+    nntrainer::__fallback_dequantize_row_qs8cx_f32(
+      n_idx, k, rhs_qs8cx.data(), rhs_scales_f32.data(), row_out.data());
+
+    for (size_t k_idx = 0; k_idx < k; ++k_idx) {
+      const int code = (int)rhs_qs8cx[n_idx * k + k_idx];
+      const float expected = (float)code * rhs_scales_f32[n_idx];
+      EXPECT_FLOAT_EQ(row_out[k_idx], expected);
+      EXPECT_FLOAT_EQ(row_out[k_idx], tensor_ref[n_idx * k + k_idx]);
+    }
+  }
+}
+
+TEST(nntrainer_fallback, dequantize_row_qs8cx_f32) {
+  verify_dequantize_row_qs8cx(/*n=*/4, /*k=*/8);
+}
+
+TEST(nntrainer_fallback, dequantize_row_qs8cx_f32_odd_k) {
+  verify_dequantize_row_qs8cx(/*n=*/4, /*k=*/7);
+}
+
+//==============================================================================
 // Main function
 //==============================================================================
 

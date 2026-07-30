@@ -657,6 +657,23 @@ void quant_qs8cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
                                  (float *)rhs_scales_f32);
 }
 
+void dequant_qs8cx_f32(size_t n, size_t k, void *rhs_native_mtx_qs8cx,
+                       void *rhs_scales_f32, void *rhs_native_mtx_f32) {
+  __fallback_dequant_nxk_qs8cx_f32(n, k, (const int8_t *)rhs_native_mtx_qs8cx,
+                                   (const float *)rhs_scales_f32,
+                                   (float *)rhs_native_mtx_f32);
+}
+
+void dequantize_row_qs8cx(size_t n_idx, size_t k, void *rhs_native_mtx_qs8cx,
+                          void *rhs_scales_f32, void *rhs_native_mtx_f32) {
+  // qs8cx dequantization is a memory-bound int8->f32 widening. The compiler
+  // auto-vectorizes the scalar fallback into NEON at -O2/-O3, so a hand-written
+  // NEON kernel offered no speedup over the fallback and was dropped.
+  __fallback_dequantize_row_qs8cx_f32(
+    n_idx, k, (const int8_t *)rhs_native_mtx_qs8cx,
+    (const float *)rhs_scales_f32, (float *)rhs_native_mtx_f32);
+}
+
 size_t get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
                                              size_t idx_variant, bool is_nxk) {
 #ifndef ARMV7

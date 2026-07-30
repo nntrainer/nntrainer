@@ -1367,6 +1367,37 @@ void __fallback_quant_nxk_qs8cx_f32(size_t n, size_t k, const float *rhs_f32,
                                     int8_t *rhs_qs8cx, float *rhs_scales_f32);
 
 /**
+ * @brief qs8cx dequantization of a single channel (row) in nxk format
+ * @note a row holds k contiguous int8 codes sharing one per-channel scale. The
+ * n_idx-th row is read from the full nxk buffers and written compactly to the
+ * first k floats of rhs_f32.
+ *
+ * @param[in] n_idx channel (row) index to dequantize
+ * @param[in] k K length of the row
+ * @param[in] rhs_qs8cx full nxk quantized matrix data
+ * @param[in] rhs_scales_f32 per-channel quantization scales
+ * @param[out] rhs_f32 dequantized row data (k floats)
+ */
+void __fallback_dequantize_row_qs8cx_f32(size_t n_idx, size_t k,
+                                         const int8_t *rhs_qs8cx,
+                                         const float *rhs_scales_f32,
+                                         float *rhs_f32);
+
+/**
+ * @brief qs8cx dequantization of (n,k) RHS matrix in nxk format
+ *
+ * @param[in] n N length of the matrix
+ * @param[in] k K length of the matrix
+ * @param[in] rhs_qs8cx quantized matrix data in nxk format
+ * @param[in] rhs_scales_f32 per-channel quantization scales
+ * @param[out] rhs_f32 dequantized matrix data after dequantization
+ */
+void __fallback_dequant_nxk_qs8cx_f32(size_t n, size_t k,
+                                      const int8_t *rhs_qs8cx,
+                                      const float *rhs_scales_f32,
+                                      float *rhs_f32);
+
+/**
  * @brief qa8dx quantization of (m,k) LHS matrix. qa8dx refer to quantized
  * asymmetric 8-bit per-dimension quantization. Note that qparams are embedded
  * at the beginning of the output matrix.
