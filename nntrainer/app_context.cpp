@@ -95,6 +95,8 @@
 #include <rnn.h>
 #include <rnncell.h>
 #include <scalar_multiply.h>
+#include <sigmoid_add_layer.h> // fused sigmoid+x (PLE gating mix)
+#include <sigmoid_glu_layer.h> // fused sigmoid*x (attention output gate)
 #include <sine_layer.h>
 #include <slice_layer.h>
 #include <split_layer.h>
@@ -478,6 +480,16 @@ void AppContext::add_default_object() {
   // so the layer compiles host-only without OpenCL — register unconditionally.
   registerFactory(nntrainer::createLayer<TieWordEmbedding>,
                   TieWordEmbedding::type);
+  // Fused sigmoid gates on cpu: sigmoid_glu (attention output gate =
+  // sigmoid(g)*x) and sigmoid_add (per-layer-embedding mix = sigmoid(g)+emb).
+  // Backend-neutral getOps dispatch -> CpuComputeOps::sigmoid_glu /
+  // ::sigmoid_add. Registered LAST with EXPLICIT int_keys (mirroring
+  // ClContext): the auto int_key is str_map.size()+1, so a mid-list insertion
+  // shifts every later auto-key and can collide with an explicit key.
+  registerFactory(nntrainer::createLayer<SigmoidGluLayer>,
+                  SigmoidGluLayer::type, /*int_key=*/9001);
+  registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
+                  SigmoidAddLayer::type, /*int_key=*/9002);
 
   registerFactory(AppContext::unknownFactory<nntrainer::Layer>, "unknown",
                   LayerType::LAYER_UNKNOWN);
