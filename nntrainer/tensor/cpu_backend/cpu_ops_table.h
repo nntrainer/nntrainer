@@ -384,6 +384,19 @@ public:
   void fc(Tensor &input, Tensor &weight, Tensor &output) override;
 
   void apply_activation(Tensor &out, int act_type) override;
+
+  // out = in * scale via the host Tensor multiply (correct for host and
+  // host-coherent SVM/UVM buffers).
+  void scalar_mul(const Tensor &in, Tensor &out, float scale) override;
+  // out = cap * act(in / cap) via host Tensor ops + ActiFunc (logit
+  // soft-capping; act_type is an ActivationType cast to int).
+  void softcap(const Tensor &in, Tensor &out, float cap, int act_type) override;
+  // out = in * rsqrt(mean(in^2)+eps) * gamma over the live rows, via the
+  // arch-dispatched width-wise rms_norm intrinsics (FP32-accumulated sum of
+  // squares in both the FP32 and FP16 kernels).
+  void rms_norm(const Tensor &in, Tensor &out, const Tensor &gamma,
+                float epsilon, unsigned int active_rows,
+                unsigned int row_offset) override;
 };
 
 } // namespace nntrainer

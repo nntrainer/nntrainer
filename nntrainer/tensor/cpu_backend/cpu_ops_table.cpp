@@ -206,4 +206,79 @@ void CpuComputeOps::apply_activation(Tensor &out, int act_type) {
   }
 }
 
+// out = in * scale on the host. The whole-op half of the neutral
+// scalar-multiply layer: the layer keeps the chunk/step bookkeeping and this
+// runs one chunk (the layer's former open-coded host body, unchanged).
+void CpuComputeOps::scalar_mul(const Tensor &in, Tensor &out, float scale) {
+  in.multiply(scale, out);
+}
+
+// out = cap * act(in / cap) on the host -- the neutral logit-softcapping
+// layer's former open-coded chunk body, statement for statement: copy, scale
+// down, activation, scale back up. The ActiFunc is rebuilt from act_type keyed
+// on the chunk dtype (the apply_activation convention), which matches the
+// activation the layer configured at finalize (the chunk dtype IS the
+// activation dtype).
+void CpuComputeOps::softcap(const Tensor &in, Tensor &out, float cap,
+                            int act_type) {
+  const auto at = static_cast<ActivationType>(act_type);
+  ActiFunc f;
+  if (out.getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+    f.setActiFunc<_FP16>(at);
+#else
+    throw std::invalid_argument("softcap: fp16 needs enable-fp16");
+#endif
+  } else {
+    f.setActiFunc<float>(at);
+  }
+  out.copyData(in);
+  in.multiply(1.0f / cap, out);
+  f.run_fn(out, out);
+  out.multiply(cap, out);
+}
+
+// out = in * rsqrt(mean(in^2)+eps) * gamma over rows
+// [row_offset, row_offset+active_rows). The normalize half runs through the
+// arch-dispatched width-wise intrinsics; both dtypes accumulate the sum of
+// squares in FP32 — the FP16 kernel converts each lane up and FMAs in float
+// ("squared accumulation across a 1024-wide row would overflow FP16's 65504
+// ceiling", its own rationale) — so the whole-op contract holds on every CPU
+// arch. The gamma half is the broadcast per-row multiply on the live window
+// only, with gamma cloned to the activation dtype when the bin stores it at a
+// different one (unquantized gamma is FP32 in FP32-weight bins).
+void CpuComputeOps::rms_norm(const Tensor &in, Tensor &out, const Tensor &gamma,
+                             float epsilon, unsigned int active_rows,
+                             unsigned int row_offset) {
+  const unsigned int width = in.width();
+  const size_t elem_off = (size_t)row_offset * width;
+  const auto dt = in.getDataType();
+
+  if (dt == ml::train::TensorDim::DataType::FP32) {
+    nntrainer::rms_norm_wrt_width_fp32_intrinsic(
+      in.getData<float>() + elem_off, out.getData<float>() + elem_off,
+      active_rows, width, epsilon);
+#ifdef ENABLE_FP16
+  } else if (dt == ml::train::TensorDim::DataType::FP16) {
+    nntrainer::rms_norm_wrt_width_fp16_intrinsic(
+      in.getData<_FP16>() + elem_off, out.getData<_FP16>() + elem_off,
+      active_rows, width, epsilon);
+#endif
+  } else {
+    throw std::invalid_argument(
+      "CpuComputeOps::rms_norm: unsupported data type");
+  }
+
+  // gamma multiply over the live window only (rows outside it stay untouched).
+  Tensor out_win = out.getSharedDataTensor(
+    TensorDim(1, 1, active_rows, width, out.getDim().getTensorType()), elem_off,
+    true);
+  if (gamma.getDataType() != out.getDataType()) {
+    Tensor gamma_cast = gamma.clone(out.getDataType());
+    out_win.multiply_i(gamma_cast);
+  } else {
+    out_win.multiply_i(gamma);
+  }
+}
+
 } // namespace nntrainer

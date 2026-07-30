@@ -14,12 +14,14 @@
  *         preprocessor branches at the call site).
  */
 
+#include <common_properties.h>
 #include <compute_ops.h>
 #include <context_data.h>
 #include <gtest/gtest.h>
 #include <tensor.h>
 
 #include <atomic>
+#include <cmath>
 #include <memory>
 
 namespace {
@@ -37,6 +39,9 @@ struct CallCounters {
   std::atomic<int> ele_mul{0};
   std::atomic<int> ele_add{0};
   std::atomic<int> scopy{0};
+  std::atomic<int> scalar_mul{0};
+  std::atomic<int> softcap{0};
+  std::atomic<int> rms_norm{0};
 };
 
 /**
@@ -83,6 +88,22 @@ public:
                   unsigned int iY) override {
     counters_->scopy++;
     real_->scopy_fp32(N, X, iX, Y, iY);
+  }
+  void scalar_mul(const nntrainer::Tensor &in, nntrainer::Tensor &out,
+                  float scale) override {
+    counters_->scalar_mul++;
+    real_->scalar_mul(in, out, scale);
+  }
+  void softcap(const nntrainer::Tensor &in, nntrainer::Tensor &out, float cap,
+               int act_type) override {
+    counters_->softcap++;
+    real_->softcap(in, out, cap, act_type);
+  }
+  void rms_norm(const nntrainer::Tensor &in, nntrainer::Tensor &out,
+                const nntrainer::Tensor &gamma, float epsilon,
+                unsigned int active_rows, unsigned int row_offset) override {
+    counters_->rms_norm++;
+    real_->rms_norm(in, out, gamma, epsilon, active_rows, row_offset);
   }
 
 private:
@@ -324,6 +345,78 @@ TEST_F(ComputeOpsDispatchTest, ToMigratesContextDataAndUnblocksOp) {
 
   // Now a.multiply(b_migrated) is on the same context — no throw.
   EXPECT_NO_THROW(a.multiply(b_migrated, out));
+}
+
+/**
+ * @brief The scalar-multiply whole-op dispatches through the attached
+ *        ContextData ops — the dispatch seam the layer's former open-coded
+ *        body structurally could not test — and the Cpu impl computes the
+ *        exact product.
+ */
+TEST_F(ComputeOpsDispatchTest, ScalarMulDispatchesThroughAttachedContextOps) {
+  nntrainer::Tensor in(1, 1, 2, 4);
+  nntrainer::Tensor out(1, 1, 2, 4);
+  in.setValue(2.0f);
+  out.setValue(0.0f);
+
+  in.setContextData(ct_data);
+  in.getOps()->scalar_mul(in, out, 3.0f);
+
+  EXPECT_GT(counters->scalar_mul.load(), 0);
+  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 0, 0), 6.0f);
+  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 1, 3), 6.0f);
+}
+
+/**
+ * @brief The logit-softcapping whole-op dispatches through the attached
+ *        ContextData ops, and the Cpu impl computes cap * tanh(in / cap)
+ *        (tanh is the activation every shipped configuration sets).
+ */
+TEST_F(ComputeOpsDispatchTest, SoftcapDispatchesThroughAttachedContextOps) {
+  nntrainer::Tensor in(1, 1, 1, 8);
+  nntrainer::Tensor out(1, 1, 1, 8);
+  in.setValue(1.0f);
+  out.setValue(0.0f);
+
+  in.setContextData(ct_data);
+  in.getOps()->softcap(in, out, /*cap=*/2.0f,
+                       static_cast<int>(nntrainer::ActivationType::ACT_TANH));
+
+  EXPECT_GT(counters->softcap.load(), 0);
+  // out = cap * tanh(in / cap) = 2 * tanh(0.5). The ActiFunc tanh is the
+  // algebraically-identical 2*sigmoid(2x)-1 form, so allow a few float ULPs.
+  EXPECT_NEAR(out.getValue<float>(0, 0, 0, 0), 2.0f * std::tanh(0.5f), 1e-5f);
+  EXPECT_NEAR(out.getValue<float>(0, 0, 0, 7), 2.0f * std::tanh(0.5f), 1e-5f);
+}
+
+/**
+ * @brief The RMS-normalization whole-op dispatches through the attached
+ *        ContextData ops, the Cpu impl computes the analytic value, and the
+ *        (active_rows, row_offset) window is honored — rows outside the
+ *        window stay untouched.
+ */
+TEST_F(ComputeOpsDispatchTest, RmsNormDispatchesThroughAttachedContextOps) {
+  nntrainer::Tensor in(1, 1, 3, 4);
+  nntrainer::Tensor out(1, 1, 3, 4);
+  nntrainer::Tensor gamma(1, 1, 1, 4);
+  in.setValue(2.0f);
+  gamma.setValue(2.0f);
+  out.setValue(0.0f);
+
+  in.setContextData(ct_data);
+  // Window: normalize only the first 2 of 3 rows.
+  in.getOps()->rms_norm(in, out, gamma, /*epsilon=*/0.0f, /*active_rows=*/2,
+                        /*row_offset=*/0);
+
+  EXPECT_GT(counters->rms_norm.load(), 0);
+  // Constant row: rms = sqrt(mean(2^2)) = 2, so each element normalizes to
+  // 1.0; gamma = 2 scales it to 2.0 (all powers of two — exact in fp32 on
+  // every arch path).
+  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 0, 0), 2.0f);
+  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 1, 3), 2.0f);
+  // Row 2 is outside the active window: still the 0.0 sentinel.
+  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 2, 0), 0.0f);
+  EXPECT_FLOAT_EQ(out.getValue<float>(0, 0, 2, 3), 0.0f);
 }
 
 int main(int argc, char **argv) {

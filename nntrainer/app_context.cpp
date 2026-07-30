@@ -91,6 +91,7 @@
 #include <qkv_layer.h>
 #include <reduce_mean_layer.h>
 #include <reduce_sum_layer.h>
+#include <rms_norm_layer.h>
 #include <rnn.h>
 #include <rnncell.h>
 #include <scalar_multiply.h>
@@ -464,6 +465,11 @@ void AppContext::add_default_object() {
   // swiglu on cpu: the merged backend-neutral SwiGLULayer (getOps dispatch);
   // replaces the former app-side SwiGLU layer.
   registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type);
+  // rms_norm on cpu: the backend-neutral RMSNormLayer (getOps ->
+  // CpuComputeOps::rms_norm, FP32-accumulated sum of squares). Registered at
+  // context init, so a later runtime registration of an app-side rms_norm
+  // under the same key is the documented re-registration no-op.
+  registerFactory(nntrainer::createLayer<RMSNormLayer>, RMSNormLayer::type);
   // geglu on cpu: the backend-neutral GeGLULayer (getOps ->
   // CpuComputeOps::geglu), needed on cpu so engine=cpu graphs find it.
   registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);

@@ -329,6 +329,23 @@ public:
       f.run_fn(in_copy, out);
     }
   }
+
+  /**
+   * @brief scalar_mul / softcap on a CL-attached tensor: forward to the CPU
+   * host bodies. Before these became whole-ops, the neutral scalar-multiply
+   * and logit-softcapping layers ran exactly this host math open-coded on
+   * whatever tensor reached them (correct for host and SVM-resident
+   * buffers); forwarding keeps that behavior — without these overrides a
+   * CL-attached operand would hit the base-class throw. A GPU kernel for
+   * either is a perf follow-up.
+   */
+  void scalar_mul(const Tensor &in, Tensor &out, float scale) override {
+    get_cpu_ops()->scalar_mul(in, out, scale);
+  }
+  void softcap(const Tensor &in, Tensor &out, float cap,
+               int act_type) override {
+    get_cpu_ops()->softcap(in, out, cap, act_type);
+  }
 };
 
 ComputeOps *get_cl_ops() {

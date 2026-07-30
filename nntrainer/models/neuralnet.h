@@ -423,6 +423,37 @@ public:
                         bool output_hidden_state = false) override;
 
   /**
+   * @brief Disable the CUDA prefill-graph capture for the next forward(s).
+   * @note Used by the load-time warmup: the warmup must run EAGER so its FCs
+   * can grow the prefill scratch via cudaMalloc (a malloc inside capture
+   * invalidates the graph and makes the FC bail to the host i8mm path -> SIGILL
+   * on Orin). After the warmup grows all scratch, re-enable so the timed
+   * prefill captures.
+   */
+  void setPrefillCaptureDisabled(bool v) { prefill_capture_disabled_ = v; }
+  bool isPrefillCaptureDisabled() const { return prefill_capture_disabled_; }
+
+  /**
+   * @brief Accessors used by the runDecode seam (Context::runDecode / its
+   *        CudaContext override, T9) so the relocated CUDA-graph state machine
+   *        can drive a forward step without reaching into NeuralNetwork
+   * privates.
+   */
+  /// set the M2-B "feed only, skip the heavy compute" flag (read inside
+  /// incremental_forwarding); used by the M2-B per-token embedding refresh.
+  void setM2BSkipAll(bool v);
+  /// look up a graph node by name (M2-B light embedding refresh).
+  std::shared_ptr<LayerNode> getLayerNode(const std::string &name) const {
+    return model_graph.getLayerNode(name);
+  }
+  /// bind the current step's inputs/labels to the graph (M2-B light refresh).
+  void feedInputsLabels(const sharedConstTensors &inputs,
+                        const sharedConstTensors &labels) {
+    sharedConstTensors in = inputs, lb = labels;
+    model_graph.setInputsLabels(in, lb);
+  }
+
+  /**
    * @brief     reset input dimensions of a model
    * @param[in] dims input dimensions
    * @note Similar to reinitialize, the resetInputDimension API is used for
@@ -658,6 +689,9 @@ public:
                const std::string file_path) override;
 
 private:
+  bool prefill_capture_disabled_ =
+    false; /**< gate for the CUDA prefill-graph capture (warmup runs eager) */
+
   using FlexiblePropTypes =
     std::tuple<props::Epochs, props::TrainingBatchSize, props::SavePath,
                props::ContinueTrain, props::SaveBestPath,
@@ -713,6 +747,19 @@ private:
 
   const Engine *ct_engine =
     nullptr; /** Configurations bound to current engine */
+
+  Context *decode_ctx_ = nullptr; /**< resolved-once Context for the runDecode
+                                     seam; see getDecodeContext() */
+
+  /**
+   * @brief Resolve (once, then cache) the Context whose runDecode() drives the
+   *        decode/prefill forward. A backend with its own decode engine
+   *        overrides runDecode; every other backend uses the base plain walk,
+   *        so any registered context gives a byte-identical forward.
+   * @return the decode Context, or nullptr if none is registered (caller then
+   *         walks directly).
+   */
+  Context *getDecodeContext();
 
   NetworkGraph model_graph; /** Network Model Graph */
 
