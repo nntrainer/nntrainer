@@ -379,8 +379,12 @@ std::vector<float *> CausalLM::incrementalInference(
   // device) so generate() can run the on-GPU argmax instead of host
   // max_element.
   g_cuda_logits_dev = nullptr;
-#endif
+  // first_output gates the NNTR_CUDA_ARGMAX stash below to this call's first
+  // output tensor; it has no reader outside the ENABLE_CUDA branches, so it
+  // is declared (and reset) only when they are compiled in -- otherwise it
+  // is a set-but-unused local on every non-CUDA build.
   bool first_output = true;
+#endif
   for (auto &out : output_tensors) {
     auto out_t = *out.get();
     const size_t buf_size =
@@ -481,7 +485,9 @@ std::vector<float *> CausalLM::incrementalInference(
       std::memcpy(last_out_buf_data, out_t.getData(), sizeof(float) * buf_size);
 #endif
     }
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
     first_output = false;
+#endif
 
     output.push_back(last_out_buf_data);
   }
