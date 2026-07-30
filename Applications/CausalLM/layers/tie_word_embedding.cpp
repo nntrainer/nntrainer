@@ -304,7 +304,7 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
   if (skip_prefill && is_prefill)
     return;
 
-  nntrainer::Tensor weight =
+  nntrainer::Tensor &weight =
     context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
 
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);

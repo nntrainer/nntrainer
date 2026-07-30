@@ -476,7 +476,7 @@ void GptOssMoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // routing
     nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
     input.dot(gate_weights, router_logits);
-    nntrainer::Tensor gate_bias = context.getWeight(gate_bias_idx);
+    nntrainer::Tensor &gate_bias = context.getWeight(gate_bias_idx);
     router_logits.add_i(gate_bias);
 
     router_logits.apply(nntrainer::ActiFunc::softmax<float>, router_logits);

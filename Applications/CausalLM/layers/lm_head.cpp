@@ -126,7 +126,7 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   if (skip_prefill && is_prefill)
     return;
 
-  nntrainer::Tensor weight =
+  nntrainer::Tensor &weight =
     context.getWeight(weight_idx[LmHeadParams::weight]);
 
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
