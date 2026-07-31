@@ -1691,3 +1691,129 @@ the same batched-M=1 caveat as QKVLayer, so it stays behind the hybrid split.
 `attention_out` have no activation-sharing partner, so 4/layer is the floor
 for this approach). The remaining prefill headroom is entirely in scope of
 offload - norm/RoPE/elementwise, then attention - per S24's menu.
+
+---
+
+## 28. Where prefill time actually goes: attention is 57% of it
+
+Measured rather than argued, in response to "how is ggml-hexagon much faster".
+Two decompositions, both on the same device in the same thermal window, with
+the **identical** `libggml-hexagon.so` pushed to both `llamabench/` and
+`nntrainer/causallm/` (S23's lesson).
+
+### Cross-framework readings, 308-token prompt, 4 threads
+
+| | CPU | NPU | ratio |
+|---|---|---|---|
+| ggml-hexagon (`llama-bench -r 3`, mean±sd) | 586.5 ± 31.7 | **1636.6 ± 40.6** | **2.79x** |
+| nntrainer (interleaved pairs) | 341-629 | 542-830 | **~1.4x** (1.15-1.61) |
+
+Methodology notes that matter more than the absolutes here:
+
+- `llama-bench` does internal repetitions and reports mean±sd (tight, 2-5%);
+  our harness is single-shot per invocation. Our absolutes swung **35%**
+  within one 5-run batch purely from throttling, so cross-batch
+  median-vs-median is not a valid comparison at this granularity. The
+  **ratios** (each framework's own CPU baseline taken adjacent to its NPU
+  run) and the breakdowns below are the trustworthy parts.
+- Interleaving CPU/cdsp runs pairwise revealed something useful on its own:
+  **the cdsp/CPU ratio *rises* as the device heats** (1.32 -> 1.58 across four
+  pairs, as absolutes fell 629->341 CPU / 830->542 cdsp). The CPU throttles
+  harder than the DSP, so NPU offload is worth *more* on a hot device - i.e.
+  in realistic sustained use, not less.
+- Our CPU baselines are broadly comparable to llama.cpp's (586 vs 341-629),
+  so the gap is in the NPU path, not in a weaker CPU reference.
+
+### Our prefill, split DSP vs CPU (bridge profiler, GGML_HEXAGON_PROFILE=1)
+
+Summed over the 112 prefill flushes of one 308-token forward pass:
+
+```
+prefill wall time      : 353 ms
+  DSP path (196 GEMMs) :  58.4 ms  (17%)
+    - DSP compute      :  49.1 ms
+    - dispatch overhead:   9.4 ms   <- only 2.7% of total prefill
+  everything else      : 294.6 ms  (83%)
+```
+
+This retroactively explains S27's null gate/up result exactly: dispatch
+overhead is 2.7% of prefill, so cutting round trips 20% could not possibly
+have shown up. It also bounds the whole matmul-side effort - making the Q4_0
+GEMMs *infinitely fast* would only reach 1.20x.
+
+### Our prefill, split per layer type (temporary instrumentation, since removed)
+
+Wall time per layer type across the first forward pass. nntrainer's built-in
+`PROFILE_TIME` hooks in `NetworkGraph::incremental_forwarding` already key on
+`ln->getType()` and would give this, but wiring them up needs
+`-Denable-profile=true` on *both* the core and the app plus a
+`GenericProfileListener` subscription that CausalLM does not have (SimpleFC/
+Resnet/MNIST do). A throwaway `std::chrono` loop in the same place was
+cheaper, and let the diagnostic ride in `libnntrainer.so` alone - so it could
+be pushed as a single library with no app rebuild.
+
+| layer | ms | % | runs on |
+|---|---|---|---|
+| **mha_core** (attention + RoPE + KV cache) | **190.2** | **56.7%** | CPU |
+| fully_connected (attention_out + ffn_down, n=56) | 33.2 | 9.9% | DSP |
+| gate_up_layer | 32.3 | 9.6% | DSP |
+| qkv_layer | 28.4 | 8.5% | DSP |
+| swiglu | 17.6 | 5.3% | CPU |
+| tie_word_embeddings (embedding + LM head, n=2) | 15.9 | 4.7% | CPU |
+| reshaped_rms_norm (q_norm/k_norm, n=56) | 8.5 | 2.5% | CPU |
+| addition (residuals, n=56) | 4.5 | 1.3% | CPU |
+| rms_norm | 4.4 | 1.3% | CPU |
+| multiout / input | ~0 | 0% | - |
+
+(The DSP-dispatching layers total 93.9 ms of *layer* wall time against 58.4 ms
+of measured DSP round trip - the ~35 ms difference is nntrainer-side per-layer
+overhead around the dispatch: tensor setup, the `getSharedDataTensor`
+windowing in `incremental_forwarding`, etc. Worth a look eventually, but it is
+10% of prefill, not the story.)
+
+### This kills the plan S27 closed with
+
+S27 ended by recommending "offload norm/RoPE/elementwise via ComputeOps" as
+the next lever. **That was wrong, and the numbers say so plainly.** Two
+independent reasons:
+
+1. **The cheap ops are only 10.4% combined** (swiglu 5.3 + reshaped_rms_norm
+   2.5 + addition 1.3 + rms_norm 1.3). Offloading *all* of them perfectly caps
+   out at 1.12x.
+2. **Per-op offload would make it worse, not better.** A round trip is ~100 us
+   (S17/S21); an RMSNorm over 308x1024 fp32 is arithmetically trivial and
+   cheaper than that on CPU. Dispatching each one separately would take us
+   from 112 flushes to ~280 and *add* time. The gain was only ever in removing
+   the CPU handoff, which per-op offload does not do - it needs contiguous
+   runs of ops kept resident on the DSP, which is what ggml-hexagon's
+   single-flush graph offload plus RMS_NORM+MUL fusion (S24) actually
+   achieves, and which our per-tensor-op `ComputeOps` seam cannot express.
+
+Also corrected: RoPE is **not** independently offloadable. There is no
+standalone rope layer - it lives inside `mha_core.cpp` (45 references) together
+with attention and the KV cache. It comes bundled with the attention work.
+
+### So attention is the entire remaining opportunity
+
+Amdahl, from the 335.2 ms measured pass:
+
+| change | prefill | vs now |
+|---|---|---|
+| all cheap ops -> 0 (unachievable, see above) | 300.2 ms | 1.12x |
+| mha_core halved | 240.1 ms | 1.40x |
+| mha_core -> 0 | 145.0 ms | **2.31x** (~2120 TPS, past ggml's 1637) |
+
+`tie_word_embeddings`'s 15.9 ms is *not* addressable: the LM head exceeds the
+DSP's VTCM guard (`N > 16*1024`), which our bridge mirrors from
+ggml-hexagon's own `ggml_hexagon_supported_mul_mat` - they leave it on CPU for
+the identical hardware reason (S19).
+
+Which means the answer to "how is ggml-hexagon 2.8x where we are 1.4x" is
+fully quantified and singular: **they run attention on the DSP as a fused
+FLASH_ATTN kernel; we run it on the CPU, and that one op is over half our
+prefill.** Not dispatch count, not kernels, not memory layout - all of those
+are now measured and bounded well under what attention alone costs.
+
+The next step is therefore the one S24 flagged as a founding-premise decision,
+with no cheaper intermediate step left standing: offload attention, which
+brings RoPE and a DSP-resident KV cache with it.
