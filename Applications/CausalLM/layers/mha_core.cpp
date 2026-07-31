@@ -7,6 +7,7 @@
  * @see    https://github.com/nntrainer/nntrainer
  *         https://arxiv.org/abs/1706.03762
  * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @author Anirudh Bocha <b.saianirud@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This code is based on custom_multi_head_attention_layer.cpp.
  *         This code is a part of the break down version of the mha layer.
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -229,28 +231,75 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** Tensor for KV-Cache (only allocate internally when not using external
    * cache) */
   if (!use_external_cache) {
+    const bool for_training =
+      (context.getExecutionMode() == ml::train::ExecutionMode::TRAIN);
+
+    /**
+     * @note The KV cache exists purely to serve incremental (one-token-at-a-
+     * time) decoding. Training always consumes the whole fixed-length
+     * sequence in a single forward pass (see trainForwarding()), so the
+     * cache is dead weight there — skip it rather than reserving
+     * max_timestep * num_heads_KV * head_dim per layer for nothing.
+     */
+    if (!for_training) {
 #ifdef ENABLE_FP16
-    ml::train::TensorDim cache_key_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::FP16});
-    ml::train::TensorDim cache_value_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::FP16});
+      ml::train::TensorDim cache_key_dim(
+        {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+        {context.getFormat(), ml::train::TensorDim::DataType::FP16});
+      ml::train::TensorDim cache_value_dim(
+        {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+        {context.getFormat(), ml::train::TensorDim::DataType::FP16});
 #else
-    ml::train::TensorDim cache_key_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
-    ml::train::TensorDim cache_value_dim(
-      {batch_size, 1, max_timestep, num_heads_KV * head_dim},
-      {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
+      ml::train::TensorDim cache_key_dim(
+        {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+        {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
+      ml::train::TensorDim cache_value_dim(
+        {batch_size, 1, max_timestep, num_heads_KV * head_dim},
+        {context.getFormat(), ml::train::TensorDim::DataType::UINT16});
 #endif
 
-    tensor_idx[AttentionParams::cache_key] = context.requestTensor(
-      cache_key_dim, "cache_key", nntrainer::Initializer::NONE, false,
-      nntrainer::TensorLifespan::MAX_LIFESPAN);
-    tensor_idx[AttentionParams::cache_value] = context.requestTensor(
-      cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
-      nntrainer::TensorLifespan::MAX_LIFESPAN);
+      tensor_idx[AttentionParams::cache_key] = context.requestTensor(
+        cache_key_dim, "cache_key", nntrainer::Initializer::NONE, false,
+        nntrainer::TensorLifespan::MAX_LIFESPAN);
+      tensor_idx[AttentionParams::cache_value] = context.requestTensor(
+        cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
+        nntrainer::TensorLifespan::MAX_LIFESPAN);
+      internal_cache_requested = true;
+    }
+
+    if (for_training) {
+      train_tensors_requested = true;
+
+      /**
+       * @note Sized from the actual training sequence length (query height),
+       * NOT max_timestep. max_timestep budgets for prompt + all generated
+       * tokens during decode, which training never grows into — and the
+       * attention-weight cache is quadratic in that length, so using
+       * max_timestep here would waste
+       * num_heads_Q * (max_timestep^2 - seq_len^2) * 4 bytes per layer.
+       */
+      const unsigned int train_seq_len = query_dim.height();
+
+      ml::train::TensorDim q_roped_dim(
+        {batch_size, 1, train_seq_len, num_heads_Q * head_dim},
+        {context.getFormat(), ml::train::TensorDim::DataType::FP32});
+      ml::train::TensorDim k_roped_dim(
+        {batch_size, 1, train_seq_len, num_heads_KV * head_dim},
+        {context.getFormat(), ml::train::TensorDim::DataType::FP32});
+      ml::train::TensorDim attn_wt_dim(
+        {batch_size, num_heads_Q, train_seq_len, train_seq_len},
+        {context.getFormat(), ml::train::TensorDim::DataType::FP32});
+
+      tensor_idx[AttentionParams::train_q_roped] = context.requestTensor(
+        q_roped_dim, "train_q_roped", nntrainer::Initializer::NONE, false,
+        nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+      tensor_idx[AttentionParams::train_k_roped] = context.requestTensor(
+        k_roped_dim, "train_k_roped", nntrainer::Initializer::NONE, false,
+        nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+      tensor_idx[AttentionParams::train_attn_wt] = context.requestTensor(
+        attn_wt_dim, "train_attn_wt", nntrainer::Initializer::NONE, false,
+        nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+    }
   }
 
   theta = (float)std::get<props::RopeTheta>(mha_core_props).get();
@@ -288,6 +337,18 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
   if (!use_external_cache) {
+    /**
+     * @note Gated on the training tensors existing, NOT on the `training`
+     * flag: validation also comes through forwarding() (with
+     * training=false) and must still compute attention, otherwise it scores
+     * a stale output buffer. The caches are only requested when the graph
+     * was finalized for TRAIN, and inference never uses forwarding() at all
+     * (it goes through incremental_forwarding), so this is the complete
+     * condition.
+     */
+    if (train_tensors_requested) {
+      trainForwarding(context);
+    }
     return;
   }
 
@@ -1499,8 +1560,10 @@ void MHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
 
   const float dropout_rate =
     std::get<nntrainer::props::DropOutRate>(mha_core_props).get();
-  context.updateTensor(tensor_idx[AttentionParams::cache_key], batch);
-  context.updateTensor(tensor_idx[AttentionParams::cache_value], batch);
+  if (internal_cache_requested) {
+    context.updateTensor(tensor_idx[AttentionParams::cache_key], batch);
+    context.updateTensor(tensor_idx[AttentionParams::cache_value], batch);
+  }
   // context.updateTensor(tensor_idx[AttentionParams::attention_weight], batch);
   if (dropout_rate > epsilon) {
     context.updateTensor(tensor_idx[AttentionParams::dropout_mask], batch);
@@ -1535,11 +1598,311 @@ void MHACoreLayer::updateTensorsByInputDimensions(
   context.updateInput(INOUT_INDEX::VALUE, kv_dim);
   context.updateOutput(0, input_dimensions[0]);
 
-  context.updateTensor(tensor_idx[AttentionParams::cache_key], kv_cache_dim);
-  context.updateTensor(tensor_idx[AttentionParams::cache_value], kv_cache_dim);
+  if (internal_cache_requested) {
+    context.updateTensor(tensor_idx[AttentionParams::cache_key], kv_cache_dim);
+    context.updateTensor(tensor_idx[AttentionParams::cache_value],
+                         kv_cache_dim);
+  }
+
+  if (train_tensors_requested) {
+    // Sized from the actual sequence length, not max_timestep — see the
+    // matching note in finalize().
+    ml::train::TensorDim q_roped_dim = input_dimensions[0];
+    q_roped_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+
+    ml::train::TensorDim k_roped_dim = kv_dim;
+    k_roped_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+
+    ml::train::TensorDim attn_wt_dim(
+      {input_dimensions[0].batch(), num_heads_Q, height, height},
+      {input_dimensions[0].getFormat(), ml::train::TensorDim::DataType::FP32});
+
+    context.updateTensor(tensor_idx[AttentionParams::train_q_roped],
+                         q_roped_dim);
+    context.updateTensor(tensor_idx[AttentionParams::train_k_roped],
+                         k_roped_dim);
+    context.updateTensor(tensor_idx[AttentionParams::train_attn_wt],
+                         attn_wt_dim);
+  }
 }
 
-void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {}
+/**
+ * @brief Full-sequence dense causal multi-head attention with GQA, used as
+ *        the training forward for the internal-cache (!use_external_cache)
+ *        path. See header for scope limitations.
+ */
+void MHACoreLayer::trainForwarding(nntrainer::RunLayerContext &context) {
+  NNTR_THROW_IF(!train_tensors_requested, std::invalid_argument)
+    << "[mha_core] training forward requires the layer to have been "
+       "finalized in ExecutionMode::TRAIN (the Q/K/attention caches it "
+       "needs are only requested then)";
+  NNTR_THROW_IF(!is_causal, std::invalid_argument)
+    << "[mha_core] training forward only supports causal attention for now";
+  NNTR_THROW_IF(local_window_size != std::numeric_limits<unsigned int>::max(),
+                std::invalid_argument)
+    << "[mha_core] training forward does not support sliding window "
+       "attention yet";
+  NNTR_THROW_IF(use_sink, std::invalid_argument)
+    << "[mha_core] training forward does not support attention sink yet";
+  NNTR_THROW_IF(attn_logit_softcapping > 0.0f, std::invalid_argument)
+    << "[mha_core] training forward does not support logit softcapping yet";
+
+  nntrainer::Tensor &query = context.getInput(INOUT_INDEX::QUERY);
+  nntrainer::Tensor &key = context.getInput(INOUT_INDEX::KEY);
+  nntrainer::Tensor &value = context.getInput(INOUT_INDEX::VALUE);
+  nntrainer::Tensor &output = context.getOutput(INOUT_INDEX::OUTPUT);
+
+  NNTR_THROW_IF(query.getDataType() != ml::train::TensorDim::DataType::FP32,
+                std::invalid_argument)
+    << "[mha_core] training forward only supports FP32 for now";
+
+  const unsigned int batch = query.getDim().batch();
+  const unsigned int seq_len = query.getDim().height();
+  const unsigned int gqa_size = num_heads_Q / num_heads_KV;
+  const float scale = 1.0f / std::sqrt((float)head_dim);
+
+  nntrainer::Tensor &train_q =
+    context.getTensor(tensor_idx[AttentionParams::train_q_roped]);
+  nntrainer::Tensor &train_k =
+    context.getTensor(tensor_idx[AttentionParams::train_k_roped]);
+  nntrainer::Tensor &train_attn =
+    context.getTensor(tensor_idx[AttentionParams::train_attn_wt]);
+
+  // Apply RoPE to Q, K into the persistent training caches, leaving the
+  // original input tensors (query/key) untouched — calcDerivative reads raw
+  // V straight from context.getInput(VALUE), and undoes RoPE on dQ/dK
+  // itself rather than relying on any in-place mutation of the inputs.
+  apply_rotary_emb_tensor_v2(query, train_q, head_dim, 0, false);
+  apply_rotary_emb_tensor_v2(key, train_k, head_dim, 0, false);
+
+  const ml::train::TensorDim q_dim = train_q.getDim();    // (B,1,max_ts,HQ*D)
+  const ml::train::TensorDim k_dim = train_k.getDim();    // (B,1,max_ts,HKV*D)
+  const ml::train::TensorDim v_dim = value.getDim();      // (B,1,seq,HKV*D)
+  const ml::train::TensorDim o_dim = output.getDim();     // (B,1,seq,HQ*D)
+  const ml::train::TensorDim attn_dim = train_attn.getDim(); // (B,HQ,max_ts,max_ts)
+
+  const float *q_data = train_q.getData<float>();
+  const float *k_data = train_k.getData<float>();
+  const float *v_data = value.getData<float>();
+  float *out_data = output.getData<float>();
+  float *attn_data = train_attn.getData<float>();
+
+  const size_t q_row_stride = q_dim.width();
+  const size_t k_row_stride = k_dim.width();
+  const size_t v_row_stride = v_dim.width();
+  const size_t o_row_stride = o_dim.width();
+  const size_t attn_row_stride = attn_dim.width();
+
+  std::vector<float> scores(seq_len);
+
+  for (unsigned int b = 0; b < batch; ++b) {
+    const float *q_b = q_data + b * q_dim.getFeatureLen();
+    const float *k_b = k_data + b * k_dim.getFeatureLen();
+    const float *v_b = v_data + b * v_dim.getFeatureLen();
+    float *o_b = out_data + b * o_dim.getFeatureLen();
+    float *attn_b = attn_data + b * attn_dim.getFeatureLen();
+
+    for (unsigned int qh = 0; qh < num_heads_Q; ++qh) {
+      const unsigned int kv = qh / gqa_size;
+      float *attn_h = attn_b + qh * attn_dim.height() * attn_row_stride;
+
+      for (unsigned int i = 0; i < seq_len; ++i) {
+        const float *q_row = q_b + i * q_row_stride + qh * head_dim;
+        float *attn_row = attn_h + i * attn_row_stride;
+
+        float max_score = -std::numeric_limits<float>::infinity();
+        for (unsigned int j = 0; j <= i; ++j) {
+          const float *k_row = k_b + j * k_row_stride + kv * head_dim;
+          float s = 0.0f;
+          for (unsigned int d = 0; d < head_dim; ++d)
+            s += q_row[d] * k_row[d];
+          s *= scale;
+          scores[j] = s;
+          if (s > max_score)
+            max_score = s;
+        }
+
+        float sum = 0.0f;
+        for (unsigned int j = 0; j <= i; ++j) {
+          float e = std::exp(scores[j] - max_score);
+          attn_row[j] = e;
+          sum += e;
+        }
+        float inv_sum = 1.0f / sum;
+        for (unsigned int j = 0; j <= i; ++j)
+          attn_row[j] *= inv_sum;
+
+        float *out_row = o_b + i * o_row_stride + qh * head_dim;
+        for (unsigned int d = 0; d < head_dim; ++d)
+          out_row[d] = 0.0f;
+        for (unsigned int j = 0; j <= i; ++j) {
+          const float *v_row = v_b + j * v_row_stride + kv * head_dim;
+          float w = attn_row[j];
+          for (unsigned int d = 0; d < head_dim; ++d)
+            out_row[d] += w * v_row[d];
+        }
+      }
+    }
+  }
+}
+
+void MHACoreLayer::apply_inverse_rotary_emb(float *grad, unsigned int width,
+                                            unsigned int dim,
+                                            unsigned int height,
+                                            unsigned int from) {
+  if (!use_rope)
+    return;
+
+  const unsigned int half_ = dim / 2;
+  for (unsigned int h = 0; h < height; ++h) {
+    const std::vector<float> &cos_ = freqs_fp32->cos[from + h];
+    const std::vector<float> &sin_ = freqs_fp32->sin[from + h];
+    float *row = grad + h * width;
+    for (unsigned int w = 0; w < width; w += dim) {
+      for (unsigned int k = 0; k < half_; ++k) {
+        unsigned int i0 = w + k;
+        unsigned int i1 = w + k + half_;
+        float d_i0 = row[i0];
+        float d_i1 = row[i1];
+        row[i0] = cos_[k] * d_i0 + sin_[k] * d_i1;
+        row[i1] = -sin_[k] * d_i0 + cos_[k] * d_i1;
+      }
+    }
+  }
+}
+
+/**
+ * @brief calcDerivative for the internal-cache (training) path.
+ * @details Standard scaled-dot-product-attention backward (with GQA
+ *          grouping and causal masking) against the Q/K (post-RoPE) and
+ *          attention-weight caches populated by trainForwarding(), followed
+ *          by undoing RoPE on dQ/dK (dV needs no inverse rotation since no
+ *          rotation was applied to V). No-op in external-cache (inference)
+ *          mode, where backward is never invoked.
+ *
+ * @note nntrainer aliases each outgoing derivative onto its input's own
+ *       buffer, so dV IS the V input. V is still needed to form d_attn, so
+ *       it must be snapshotted before dV is zeroed. dQ/dK are safe to zero
+ *       directly because the backward pass reads the post-RoPE Q/K from the
+ *       layer's own training caches rather than from those inputs.
+ */
+void MHACoreLayer::calcDerivative(nntrainer::RunLayerContext &context) {
+  if (use_external_cache || !train_tensors_requested)
+    return;
+
+  const nntrainer::Tensor &dy =
+    context.getIncomingDerivative(INOUT_INDEX::OUTPUT);
+  nntrainer::Tensor &dQ = context.getOutgoingDerivative(INOUT_INDEX::QUERY);
+  nntrainer::Tensor &dK = context.getOutgoingDerivative(INOUT_INDEX::KEY);
+  nntrainer::Tensor &dV = context.getOutgoingDerivative(INOUT_INDEX::VALUE);
+
+  nntrainer::Tensor &train_q =
+    context.getTensor(tensor_idx[AttentionParams::train_q_roped]);
+  nntrainer::Tensor &train_k =
+    context.getTensor(tensor_idx[AttentionParams::train_k_roped]);
+  nntrainer::Tensor &train_attn =
+    context.getTensor(tensor_idx[AttentionParams::train_attn_wt]);
+  // Snapshot V before dV.setZero() below; see the aliasing note above.
+  const nntrainer::Tensor value = context.getInput(INOUT_INDEX::VALUE).clone();
+
+  const unsigned int batch = dQ.getDim().batch();
+  const unsigned int seq_len = dQ.getDim().height();
+  const unsigned int gqa_size = num_heads_Q / num_heads_KV;
+  const float scale = 1.0f / std::sqrt((float)head_dim);
+
+  dQ.setZero();
+  dK.setZero();
+  dV.setZero();
+
+  const ml::train::TensorDim dy_dim = dy.getDim(); // (B,1,seq,HQ*D)
+  const ml::train::TensorDim dq_dim = dQ.getDim(); // (B,1,seq,HQ*D)
+  const ml::train::TensorDim dk_dim = dK.getDim(); // (B,1,seq,HKV*D)
+  const ml::train::TensorDim dv_dim = dV.getDim(); // (B,1,seq,HKV*D)
+  const ml::train::TensorDim q_dim = train_q.getDim();       // (B,1,max_ts,HQ*D)
+  const ml::train::TensorDim k_dim = train_k.getDim();       // (B,1,max_ts,HKV*D)
+  const ml::train::TensorDim v_dim = value.getDim();         // (B,1,seq,HKV*D)
+  const ml::train::TensorDim attn_dim = train_attn.getDim(); // (B,HQ,max_ts,max_ts)
+
+  const float *dy_data = dy.getData<float>();
+  const float *q_data = train_q.getData<float>();
+  const float *k_data = train_k.getData<float>();
+  const float *v_data = value.getData<float>();
+  const float *attn_data = train_attn.getData<float>();
+  float *dq_data = dQ.getData<float>();
+  float *dk_data = dK.getData<float>();
+  float *dv_data = dV.getData<float>();
+
+  const size_t dy_row_stride = dy_dim.width();
+  const size_t q_row_stride = q_dim.width();
+  const size_t k_row_stride = k_dim.width();
+  const size_t v_row_stride = v_dim.width();
+  const size_t attn_row_stride = attn_dim.width();
+
+  std::vector<float> d_attn(seq_len);
+  std::vector<float> d_score(seq_len);
+
+  for (unsigned int b = 0; b < batch; ++b) {
+    const float *dy_b = dy_data + b * dy_dim.getFeatureLen();
+    const float *q_b = q_data + b * q_dim.getFeatureLen();
+    const float *k_b = k_data + b * k_dim.getFeatureLen();
+    const float *v_b = v_data + b * v_dim.getFeatureLen();
+    const float *attn_b = attn_data + b * attn_dim.getFeatureLen();
+    float *dq_b = dq_data + b * dq_dim.getFeatureLen();
+    float *dk_b = dk_data + b * dk_dim.getFeatureLen();
+    float *dv_b = dv_data + b * dv_dim.getFeatureLen();
+
+    for (unsigned int qh = 0; qh < num_heads_Q; ++qh) {
+      const unsigned int kv = qh / gqa_size;
+      const float *attn_h = attn_b + qh * attn_dim.height() * attn_row_stride;
+
+      for (unsigned int i = 0; i < seq_len; ++i) {
+        const float *dy_row = dy_b + i * dy_row_stride + qh * head_dim;
+        const float *attn_row = attn_h + i * attn_row_stride;
+        const float *q_row = q_b + i * q_row_stride + qh * head_dim;
+
+        float dot_sum = 0.0f; // sum_j attn[i][j] * d_attn[i][j]
+        for (unsigned int j = 0; j <= i; ++j) {
+          const float *v_row = v_b + j * v_row_stride + kv * head_dim;
+          float da = 0.0f;
+          for (unsigned int d = 0; d < head_dim; ++d)
+            da += dy_row[d] * v_row[d];
+          d_attn[j] = da;
+          dot_sum += attn_row[j] * da;
+
+          float *dv_row = dv_b + j * v_row_stride + kv * head_dim;
+          float w = attn_row[j];
+          for (unsigned int d = 0; d < head_dim; ++d)
+            dv_row[d] += w * dy_row[d];
+        }
+
+        // softmax backward
+        for (unsigned int j = 0; j <= i; ++j)
+          d_score[j] = attn_row[j] * (d_attn[j] - dot_sum);
+
+        float *dq_row = dq_b + i * q_row_stride + qh * head_dim;
+        for (unsigned int j = 0; j <= i; ++j) {
+          const float *k_row = k_b + j * k_row_stride + kv * head_dim;
+          float ds = d_score[j] * scale;
+          for (unsigned int d = 0; d < head_dim; ++d)
+            dq_row[d] += ds * k_row[d];
+
+          float *dk_row = dk_b + j * k_row_stride + kv * head_dim;
+          for (unsigned int d = 0; d < head_dim; ++d)
+            dk_row[d] += ds * q_row[d];
+        }
+      }
+    }
+  }
+
+  // undo RoPE on dQ, dK (dV needs no inverse rotation: no rotation was
+  // applied to V in trainForwarding).
+  for (unsigned int b = 0; b < batch; ++b) {
+    apply_inverse_rotary_emb(dq_data + b * dq_dim.getFeatureLen(),
+                             dq_dim.width(), head_dim, seq_len, 0);
+    apply_inverse_rotary_emb(dk_data + b * dk_dim.getFeatureLen(),
+                             dk_dim.width(), head_dim, seq_len, 0);
+  }
+}
 
 void MHACoreLayer::calcGradient(nntrainer::RunLayerContext &context) {}
 
