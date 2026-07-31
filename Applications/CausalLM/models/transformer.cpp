@@ -537,21 +537,22 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
 Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
                               Tensor input) {
 
-  LayerHandle ffn_up(createLayer(
-    "fully_connected",
+  // Up/gate batched into one gate_up_layer: two independent Q4_0 matmuls
+  // sharing the same input activation, dispatched together so a Hexagon
+  // cDSP ComputeOps can collapse them into one FastRPC round trip
+  // (gemm_q4_0_batch_fp32) instead of two. Weight request order inside
+  // GateUpLayer (Up, then Gate) matches the "up, gate" .bin order noted
+  // below, so existing .bin files load unchanged.
+  LayerHandle ffn_gateup(createLayer(
+    "gate_up_layer",
     withHexagonEngine(
-      {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
-       withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+      {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gateup"),
+       withKey("up_unit", hidden_dim), withKey("gate_unit", hidden_dim),
+       withKey("disable_bias", "true"),
        withKey("weight_initializer", "ones")})));
-  Tensor up = ffn_up(input);
-
-  LayerHandle ffn_gate(createLayer(
-    "fully_connected",
-    withHexagonEngine(
-      {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
-       withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-       withKey("weight_initializer", "ones")})));
-  Tensor gate = ffn_gate(input);
+  Tensor gateup_out = ffn_gateup(input);
+  Tensor up = gateup_out.output(0);
+  Tensor gate = gateup_out.output(1);
 
   /// @note nntrainer binary stores mlp weights in up, gate order.
   /// For backward compatibility,
