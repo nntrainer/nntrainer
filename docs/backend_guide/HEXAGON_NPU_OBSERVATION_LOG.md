@@ -1817,3 +1817,107 @@ are now measured and bounded well under what attention alone costs.
 The next step is therefore the one S24 flagged as a founding-premise decision,
 with no cheaper intermediate step left standing: offload attention, which
 brings RoPE and a DSP-resident KV cache with it.
+
+---
+
+## 29. Attention decomposed, and the DSP already has every kernel we need
+
+Follow-up to S28, which established `mha_core` as 57% of prefill. Two
+questions had to be answered before choosing an offload strategy: what inside
+attention actually costs, and what the DSP can already do.
+
+### Confirmed first: ggml-hexagon really does run attention on the DSP
+
+Re-verified directly rather than trusting the log, because S18 and S19 say
+different-sounding things and the distinction decides whether "offload
+attention" is even the right target. `GGML_SCHED_DEBUG=2 ... -v`:
+
+```
+node # 25 (FLASH_ATTN): __fattn__-0 (8K) [ HTP0 ] use=1,c=1:
+    Qcur-0 (view) (permu (8K) [ HTP0 ]
+    cache_k_l0 (view) (p (512K) [ HTP0 ]
+    cache_v_l0 (view) (p (512K) [ HTP0 ]
+```
+
+Every layer's FLASH_ATTN is on HTP0, **and so are `cache_k_l*`/`cache_v_l*`** -
+the KV cache is DSP-resident, as S24 said. S18's "attention stays on CPU"
+applies **only to multi-sequence batched decode** (`npl>1`), where
+`ggml_hexagon_supported_flash_attn_ext`'s `dst->ne[3] != 1` gate rejects it;
+S19 scoped this correctly. For single-sequence - every pp/tg number in this
+log - their attention is on the DSP and ours is not.
+
+### Attention's internal phases (temporary instrumentation, since removed)
+
+Accumulated across all 28 layers of one 308-token prefill pass, inside
+`MHACoreLayer::one_batch_incremental_forwarding` (the non-`sink_step`
+overload - the other is gpt-oss only):
+
+| phase | ms | % of attention | % of prefill (349 ms) |
+|---|---|---|---|
+| RoPE + KV-cache write (3x `apply_rotary_emb_tensor_v2`) | 50.1 | 26.0% | 14.4% |
+| **Q.K^T** (`compute_kcaches`) | **68.0** | **35.4%** | 19.5% |
+| softmax, causal-masked (`softmax_triangle`) | 10.4 | 5.4% | 3.0% |
+| **scores.V** (`compute_fp16vcache_transposed`) | **63.7** | **33.2%** | 18.3% |
+| total | 192.2 | | 55.1% |
+
+Cross-validates S28's 190.2 ms layer-level figure from a completely separate
+measurement, which is reassuring for both.
+
+**The two matmuls are 131.7 ms = 68.5% of attention and 38% of all prefill.**
+Softmax is only 10.4 ms - so the *fusion* in "flash attention" is worth far
+less here than the *matmuls*. That matters: it means a plain-GEMM offload
+captures most of the win without needing flash-attention semantics (mask
+handling, online softmax, tiling) to be reproduced exactly.
+
+### The DSP skel already implements everything we run on CPU
+
+Checked `htp/htp-ops.h`'s opcode enum. The skel we are *already loading*
+(`libggml-htp-v79.so`) implements:
+
+`HTP_OP_MUL_MAT`, `HTP_OP_FLASH_ATTN_EXT`, `HTP_OP_ROPE`, `HTP_OP_SOFTMAX`,
+`HTP_OP_RMS_NORM`, `HTP_OP_RMS_NORM_MUL` (fused), `HTP_OP_GLU_SWIGLU`,
+`HTP_OP_ADD`, `HTP_OP_SET_ROWS` (KV-cache write), `HTP_OP_SCALE`,
+`HTP_OP_CPY`, `HTP_OP_GET_ROWS`, ...
+
+i.e. **a DSP kernel exists for every single op we currently run on CPU.** We
+have never dispatched any of them - our bridge only ever emits
+`HTP_OP_MUL_MAT` with Q4_0 weights. So all remaining work is bridge + nntrainer
+wiring, **not DSP kernel development**, which is a much better position than
+S24 implied.
+
+And `MUL_MAT` is not quantized-only: `ggml_hexagon_supported_mul_mat`
+(`ggml-hexagon.cpp:~2715`) accepts `src0` of `GGML_TYPE_F16` or
+`GGML_TYPE_F32` (with `dst` F32, `src1` F32/F16), subject to
+`ggml_nrows(src1) <= 1024` - our 308 prefill rows are fine. So the attention
+matmuls need no new kernel and no new opcode.
+
+### Shared prerequisite for any attention offload: the KV cache must be DSP-visible
+
+Both candidate paths need the DSP to read K and V. Today the KV cache is host
+memory owned by CausalLM's `KVCacheManager` and bound into the graph as
+external tensors, so it is invisible to the DSP. Two options: memcpy K/V into
+rpcmem per layer per call (~1.26 MB per layer per tensor at 308 tokens, ~35 MB
+per forward pass - measurable but not fatal), or allocate the cache in rpcmem
+once and register it with the bridge.
+
+The second is clearly right and the machinery already exists: S27's
+`nntr_htp_bridge_register_activation_pool` plus `wrap_external`/`init_external`
+were built exactly for "someone else allocated this rpcmem, please map it".
+The cache is allocated once and lives for the session, which is the ideal case
+for a pinned registered pool.
+
+### Two paths, and why the smaller one is likely right first
+
+| | addressable | needs |
+|---|---|---|
+| **A. offload Q.K^T and scores.V as F16/F32 MUL_MAT** | 131.7 ms (38% of prefill) | KV cache in rpcmem; a bridge entry point for non-Q4_0 GEMM; per-head dispatch |
+| **B. offload all of attention as FLASH_ATTN_EXT** | 192.2 ms (55% of prefill) | all of the above, plus reproducing ggml's exact Q/K/V/mask tensor layout and semantics, and matching KV layout |
+
+A captures 69% of what B does for materially less risk, and is a strict
+stepping stone - it forces the KV-cache-in-rpcmem work and a non-Q4_0 GEMM
+path, both of which B also needs. RoPE (50.1 ms) can then be taken separately
+via the existing `HTP_OP_ROPE`, again without touching B's semantics.
+
+One sizing note for A: attention is per-head - 16 heads of
+`[308,128] x [128,308]` per layer. `NNTR_HTP_MAX_BATCH` is currently 8, so
+16-head dispatch either raises that cap or issues two batches per matmul.
