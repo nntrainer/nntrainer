@@ -175,6 +175,18 @@ e = executable('nntr_causallm',
 )
 
 
+lora_train_src = [
+    meson.current_source_dir() / 'lora_train.cpp',
+    meson.current_source_dir() / 'train_qwen3_lora.cpp',
+]
+
+e_lora_train = executable('nntr_lora_train',
+    lora_train_src,
+    include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+)
+
+
 quantize_src = [
     meson.current_source_dir() / 'quantize.cpp',
 ]
