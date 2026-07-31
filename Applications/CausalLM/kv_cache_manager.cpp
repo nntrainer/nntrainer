@@ -164,36 +164,65 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     useHexagonCdsp() && KVCacheRpcMem::global().usable();
 
   layer_caches_.resize(num_layers);
+
+  // ONE rpcmem region for every layer's K and V, sub-allocated by offset -
+  // deliberately not one allocation per tensor. HTP_OP_MAX_BUFS and
+  // HTP_MAX_MMAPS are both 16 (S2 finding 9), so 2*num_layers separate
+  // registrations is the exact anti-pattern S8's pooled weight arenas exist
+  // to avoid: it burns a DSP mapping-cache slot per tensor and a
+  // fastrpc_mmap per tensor. The bridge's find_ext_pool() matches any pointer
+  // *inside* a registered range and add_tensor derives its wire offset as
+  // (data - sbuf->base), so sub-allocated pointers need no extra registration.
+  std::shared_ptr<nntrainer::MemoryData> pool;
+  std::vector<size_t> k_off(num_layers), v_off(num_layers);
+  if (use_rpcmem) {
+    const size_t elem_sz = ml::train::TensorDim({1, 1, 1, 1}, {format, dtype})
+                             .getDataTypeSize();
+    // 128-byte (HVX) alignment between sub-allocations, expressed in elements.
+    const size_t align_elems = elem_sz ? (128 / elem_sz) : 1;
+    auto round_up = [align_elems](size_t n) {
+      return align_elems ? ((n + align_elems - 1) / align_elems) * align_elems
+                         : n;
+    };
+
+    size_t total_elems = 0;
+    for (unsigned int i = 0; i < num_layers; ++i) {
+      const size_t per =
+        round_up(static_cast<size_t>(batch_size) * max_seq_len * kv_widths_[i]);
+      k_off[i] = total_elems;
+      total_elems += per;
+      v_off[i] = total_elems;
+      total_elems += per;
+    }
+
+    if (void *base =
+          KVCacheRpcMem::global().allocAndRegister(total_elems * elem_sz)) {
+      pool = std::make_shared<nntrainer::MemoryData>(base);
+      ml_logi("KVCacheManager: KV cache in rpcmem, one %zu MiB pool for %u "
+              "layers (DSP-visible)",
+              (total_elems * elem_sz) / (1024 * 1024), num_layers);
+    } else {
+      ml_logw("KVCacheManager: falling back to host memory for the KV cache; "
+              "attention cannot be offloaded to the cDSP");
+    }
+  }
+
   for (unsigned int i = 0; i < num_layers; ++i) {
     ml::train::TensorDim cache_dim({batch_size, 1, max_seq_len, kv_widths_[i]},
                                    {format, dtype});
 
-    if (use_rpcmem) {
-      const size_t bytes = cache_dim.getDataLen() * cache_dim.getDataTypeSize();
-      void *k = KVCacheRpcMem::global().allocAndRegister(bytes);
-      void *v = k ? KVCacheRpcMem::global().allocAndRegister(bytes) : nullptr;
-      if (k && v) {
-        // alloc_now=false: the buffer comes from setData below, so do not let
-        // the Tensor allocate host memory it would then leak.
-        layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
-        layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
-        layer_caches_[i].key_cache.setData(
-          std::make_shared<nntrainer::MemoryData>(k), 0, /*init=*/true);
-        layer_caches_[i].value_cache.setData(
-          std::make_shared<nntrainer::MemoryData>(v), 0, /*init=*/true);
-        continue;
-      }
-      // Partial failure (k succeeded, v did not) leaks k deliberately: the
-      // rpcmem pool was already handed to the bridge and pinned, so freeing
-      // it would invalidate a DSP mapping (see S8's pinned-buffer finding in
-      // docs/backend_guide/HEXAGON_NPU_OBSERVATION_LOG.md). One-time, at most
-      // once per process, and only on an allocation failure that is fatal to
-      // offload anyway.
-      ml_logw("KVCacheManager: falling back to host memory for layer %u", i);
+    if (pool) {
+      // alloc_now=false: the buffer comes from setData below, so do not let
+      // the Tensor allocate host memory it would then leak. offset is in
+      // elements, not bytes (see FloatTensor::getData).
+      layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
+      layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
+      layer_caches_[i].key_cache.setData(pool, k_off[i], /*init=*/true);
+      layer_caches_[i].value_cache.setData(pool, v_off[i], /*init=*/true);
+    } else {
+      layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, true);
+      layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
     }
-
-    layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, true);
-    layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
   }
 }
 
