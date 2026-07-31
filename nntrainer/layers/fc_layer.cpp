@@ -17,6 +17,7 @@
  * @brief	This is Fully Connected Layer Class for Neural Network
  * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
+ * @author	Anirudh Bocha <b.saianirud@samsung.com>
  * @bug		No known bugs except for NYI items
  *
  */
@@ -266,17 +267,30 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
-  Tensor loraA, loraB, hidden_tmp_lora, hidden_out_lora;
+  Tensor loraA, loraB;
+  TensorDim hidden_tmp_lora_dim, hidden_out_lora_dim;
 
   bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
 
-  if (!std::get<props::LoraRank>(fc_props).empty()) {
+  const bool has_lora = !std::get<props::LoraRank>(fc_props).empty();
+  if (has_lora) {
     loraA = context.getWeight(lora_idx[LORAParams::loraA]);
     loraB = context.getWeight(lora_idx[LORAParams::loraB]);
-    hidden_tmp_lora = context.getTensor(lora_idx[LORAParams::loraTmp]);
-    hidden_out_lora = context.getTensor(lora_idx[LORAParams::loraOut]);
+    /**
+     * @note loraTmp/loraOut are requested with FORWARD_GRAD_LIFESPAN /
+     * FORWARD_FUNC_LIFESPAN, which are not allocated when the graph is
+     * compiled without a backward pass (pure inference). This function is
+     * the inference/decode path, so only shape metadata is read from them
+     * here (always valid, independent of data allocation); the actual
+     * scratch computation below uses freshly-allocated local tensors rather
+     * than a shared-data view into this possibly-unallocated storage.
+     */
+    hidden_tmp_lora_dim =
+      context.getTensor(lora_idx[LORAParams::loraTmp]).getDim();
+    hidden_out_lora_dim =
+      context.getTensor(lora_idx[LORAParams::loraOut]).getDim();
   }
 
   TensorDim input_dim = input_.getDim();
@@ -301,25 +315,19 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
 
     input_step.dot(weight, hidden_step, false, false);
 
-    if (!std::get<props::LoraRank>(fc_props).empty()) {
-      nntrainer::TensorDim hidden_tmp_lora_step_dim = hidden_tmp_lora.getDim();
+    if (has_lora) {
+      nntrainer::TensorDim hidden_tmp_lora_step_dim = hidden_tmp_lora_dim;
       hidden_tmp_lora_step_dim.batch(1);
       if (hidden_tmp_lora_step_dim.height() > 1)
         hidden_tmp_lora_step_dim.height(to - from);
 
-      nntrainer::TensorDim hidden_out_lora_step_dim = hidden_out_lora.getDim();
+      nntrainer::TensorDim hidden_out_lora_step_dim = hidden_out_lora_dim;
       hidden_out_lora_step_dim.batch(1);
       if (hidden_out_lora_step_dim.height() > 1)
         hidden_out_lora_step_dim.height(to - from);
 
-      nntrainer::Tensor hidden_tmp_lora_step =
-        hidden_tmp_lora.getSharedDataTensor(
-          hidden_tmp_lora_step_dim,
-          b * hidden_tmp_lora.height() * hidden_tmp_lora.width(), true);
-      nntrainer::Tensor hidden_out_lora_step =
-        hidden_out_lora.getSharedDataTensor(
-          hidden_out_lora_step_dim,
-          b * hidden_out_lora.height() * hidden_out_lora.width(), true);
+      nntrainer::Tensor hidden_tmp_lora_step(hidden_tmp_lora_step_dim, true);
+      nntrainer::Tensor hidden_out_lora_step(hidden_out_lora_step_dim, true);
 
       input_step.dot(loraA, hidden_tmp_lora_step, false, false);
       hidden_tmp_lora_step.dot(loraB, hidden_out_lora_step, false, false);
