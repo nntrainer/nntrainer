@@ -501,6 +501,9 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       dtype_map[prefix + "_wq"] = fc_dtype;
       dtype_map[prefix + "_wk"] = fc_dtype;
       dtype_map[prefix + "_wv"] = fc_dtype;
+      // QKVLayer: Q/K/V batched into one node (nntrainer/layers/qkv_layer.h) -
+      // same fc_dtype applies to all three of its weights.
+      dtype_map[prefix + "_wqkv"] = fc_dtype;
       dtype_map[prefix + "_attention_out"] = fc_dtype;
 
       // Attention Gates
@@ -520,6 +523,8 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       dtype_map[prefix + "_ffn_gate"] = fc_dtype;
       dtype_map[prefix + "_ffn_up"] = fc_dtype;
       dtype_map[prefix + "_ffn_down"] = fc_dtype;
+      // GateUpLayer: up/gate batched into one node (nntrainer/layers/gate_up_layer.h).
+      dtype_map[prefix + "_ffn_gateup"] = fc_dtype;
 
       dtype_map[prefix + "_ffn_output"] = fc_dtype;
 

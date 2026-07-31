@@ -12,6 +12,8 @@
 #include <hexagon_context.h>
 
 #include <fc_layer.h>
+#include <gate_up_layer.h>
+#include <qkv_layer.h>
 
 namespace nntrainer {
 
@@ -64,6 +66,17 @@ void HexagonContext::add_default_object() {
   // weight Tensor is handed (see initialize() below), not the layer class.
   registerFactory(nntrainer::createLayer<FullyConnectedLayer>,
                   FullyConnectedLayer::type, ml::train::LayerType::LAYER_FC);
+  // QKVLayer/GateUpLayer batch several Q4_0 weights sharing one activation
+  // through Tensor::dot(vector<Tensor*>, ...), which dispatches to
+  // gemm_q4_0_batch_fp32 - collapsing what would be 3 (or 2) separate cDSP
+  // round trips into 1. Engine::createLayerObject resolves engine=cdsp by
+  // looking up the layer's type string in *this* context's own factory map
+  // (not AppContext's), so these need their own registration here even
+  // though they are already registered under "cpu" in app_context.cpp -
+  // without this, tagging a qkv_layer/gate_up_layer with engine=cdsp would
+  // throw "Key is not found for the object".
+  registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
+  registerFactory(nntrainer::createLayer<GateUpLayer>, GateUpLayer::type);
 }
 
 void HexagonContext::initialize() noexcept {
@@ -75,6 +88,7 @@ void HexagonContext::initialize() noexcept {
     // (float_tensor.cpp's dotQnK already checks supports_gemm_q4_0_accel_fp32()
     // before falling back to the CPU NEON/AVX kernel - see compute_ops.h).
     getContextData()->setComputeOps(get_hexagon_ops());
+
   } catch (std::exception &e) {
     ml_loge("hexagon_context: registering layers failed!!, reason: %s",
             e.what());

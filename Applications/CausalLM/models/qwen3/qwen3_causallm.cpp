@@ -35,14 +35,26 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
                                          Tensor query, Tensor key,
                                          Tensor value) {
 
-  // Q layer
-  LayerHandle wq(createLayer(
-    "fully_connected",
+  // Q/K/V layers batched into one qkv_layer: three independent Q4_0
+  // matmuls sharing the same activation (query == key == value going in -
+  // see Transformer::createAttention's callers), dispatched together so a
+  // Hexagon cDSP ComputeOps can collapse them into one FastRPC round trip
+  // (gemm_q4_0_batch_fp32) instead of three. Weight request order inside
+  // QKVLayer (Q, then K, then V) matches the three-separate-layer order this
+  // replaces, so existing .bin files load unchanged.
+  LayerHandle wqkv(createLayer(
+    "qkv_layer",
     withHexagonEngine(
-      {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
-       withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
+      {withKey("name", "layer" + std::to_string(layer_id) + "_wqkv"),
+       withKey("q_unit", head_dim * n_heads),
+       withKey("k_unit", head_dim * n_heads / GQA_SIZE),
+       withKey("v_unit", head_dim * n_heads / GQA_SIZE),
+       withKey("disable_bias", "true"),
        withKey("weight_initializer", "ones")})));
-  Tensor q = wq(query);
+  Tensor qkv_out = wqkv(query);
+  Tensor q = qkv_out.output(0);
+  Tensor k = qkv_out.output(1);
+  Tensor v = qkv_out.output(2);
 
   // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape)))
   LayerHandle q_norm(createLayer(
@@ -52,16 +64,6 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
      withKey("feature_size", std::to_string(head_dim))}));
   Tensor q_normed = q_norm(q);
 
-  // K layer
-  LayerHandle wk(createLayer(
-    "fully_connected",
-    withHexagonEngine(
-      {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
-       withKey("unit", head_dim * n_heads / GQA_SIZE),
-       withKey("disable_bias", "true"),
-       withKey("weight_initializer", "ones")})));
-  Tensor k = wk(key);
-
   // K-reshaped-norm layer (k_norm(k_proj.view(hidden_shape)))
   LayerHandle k_norm(createLayer(
     "reshaped_rms_norm",
@@ -69,16 +71,6 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
      withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
      withKey("feature_size", std::to_string(head_dim))}));
   Tensor k_normed = k_norm(k);
-
-  // V layer
-  LayerHandle wv(createLayer(
-    "fully_connected",
-    withHexagonEngine(
-      {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
-       withKey("unit", head_dim * n_heads / GQA_SIZE),
-       withKey("disable_bias", "true"),
-       withKey("weight_initializer", "ones")})));
-  Tensor v = wv(value);
 
   // External KV cache placeholders (per-layer). Storage is owned by the host
   // (KVCacheManager) and bound at runtime via setExternalTensors.

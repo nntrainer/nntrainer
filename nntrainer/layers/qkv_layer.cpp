@@ -14,7 +14,6 @@
  *
  * @file	qkv_layer.cpp
  * @date	14 May 2020
- * @brief	This is Fully Connected Layer Class for Neural Network
  * @see		https://github.com/nntrainer/nntrainer
  * @author	Eunju Yang <ej.yang@samsung.com>
  * @bug		No known bugs except for NYI items
@@ -23,15 +22,13 @@
 
 #include <qkv_layer.h>
 
-#include <engine.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
-#include <thread_manager.h>
 #include <util_func.h>
 
-namespace causallm {
+namespace nntrainer {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
@@ -42,30 +39,29 @@ QKVLayer::QKVLayer() :
   weight_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
-void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
+void QKVLayer::finalize(InitLayerContext &context) {
   NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
-    << "Fully connected layer takes only one input";
+    << "QKVLayer takes only one input";
 
   auto &weight_regularizer =
-    std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
+    std::get<props::WeightRegularizer>(*layer_impl_props);
   auto &weight_regularizer_constant =
-    std::get<nntrainer::props::WeightRegularizerConstant>(*layer_impl_props);
-  auto weight_initializer = nntrainer::props::InitializerInfo::Enum::NONE;
-  auto &weight_decay =
-    std::get<nntrainer::props::WeightDecay>(*layer_impl_props);
+    std::get<props::WeightRegularizerConstant>(*layer_impl_props);
+  auto weight_initializer = props::InitializerInfo::Enum::NONE;
+  auto &weight_decay = std::get<props::WeightDecay>(*layer_impl_props);
 
   const auto &q_unit = std::get<props::QUnit>(qkv_props).get();
   const auto &k_unit = std::get<props::KUnit>(qkv_props).get();
   const auto &v_unit = std::get<props::VUnit>(qkv_props).get();
 
-  std::vector<nntrainer::TensorDim> output_dims(3);
+  std::vector<TensorDim> output_dims(3);
 
   /// @todo fc actaully supports multidimensions. EffDimFlag shouldn't be fixed
   /// like this.
   context.setEffDimFlagInputDimension(0, 0b1001);
   context.setDynDimFlagInputDimension(0, 0b1000);
 
-  bool is_nchw = (context.getFormat() == nntrainer::Tformat::NCHW);
+  bool is_nchw = (context.getFormat() == Tformat::NCHW);
   /** set output dimensions */
   auto const &in_dim = context.getInputDimensions()[0];
 
@@ -92,31 +88,34 @@ void QKVLayer::finalize(nntrainer::InitLayerContext &context) {
 
   context.setOutputDimensions(output_dims);
 
-  /** Q */
-  nntrainer::TensorDim weight_dim(
+  /** Q - requested first: matches wq being created before wk/wv in the
+   * three-separate-layer version this replaces (weight loading reads
+   * context.getWeight(i) strictly in request order, see Layer::read in
+   * layer_devel.h - request order here must be preserved for .bin
+   * compatibility). */
+  TensorDim weight_dim(
     1, is_nchw ? 1 : q_unit, is_nchw ? in_dim.width() : 1,
     is_nchw ? q_unit : in_dim.channel(),
-    nntrainer::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()),
+    TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
     is_nchw ? 0b0011 : 0b0101);
   weight_idx[QKVParams::Q] = context.requestWeight(
     weight_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "qweight", true);
 
-  /** K */
+  /** K - requested second. */
   weight_dim.width(k_unit);
   weight_idx[QKVParams::K] = context.requestWeight(
     weight_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "kweight", true);
 
-  /** V */
+  /** V - requested third. */
   weight_dim.width(v_unit);
   weight_idx[QKVParams::V] = context.requestWeight(
     weight_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "vweight", true);
 }
 
-void QKVLayer::exportTo(nntrainer::Exporter &exporter,
+void QKVLayer::exportTo(Exporter &exporter,
                         const ml::train::ExportMethods &method) const {
   LayerImpl::exportTo(exporter, method);
   exporter.saveResult(qkv_props, method, this);
@@ -127,68 +126,77 @@ void QKVLayer::setProperty(const std::vector<std::string> &values) {
   LayerImpl::setProperty(remain_props);
 }
 
-void QKVLayer::forwarding(nntrainer::RunLayerContext &context, bool training) {
-  return;
+void QKVLayer::forwarding(RunLayerContext &context, bool training) {
+  Tensor &Qweight = context.getWeight(weight_idx[QKVParams::Q]);
+  Tensor &Kweight = context.getWeight(weight_idx[QKVParams::K]);
+  Tensor &Vweight = context.getWeight(weight_idx[QKVParams::V]);
+  Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  Tensor &Qhidden_ = context.getOutput(QKVParams::Q);
+  Tensor &Khidden_ = context.getOutput(QKVParams::K);
+  Tensor &Vhidden_ = context.getOutput(QKVParams::V);
+
+  std::vector<Tensor *> Weights({&Qweight, &Kweight, &Vweight});
+  std::vector<Tensor *> Outputs({&Qhidden_, &Khidden_, &Vhidden_});
+
+  input_.dot(Weights, Outputs);
 }
 
-void QKVLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
-                                      unsigned int from, unsigned int to,
-                                      bool training) {
-  nntrainer::Tensor &Qweight = context.getWeight(weight_idx[QKVParams::Q]);
-  nntrainer::Tensor &Kweight = context.getWeight(weight_idx[QKVParams::K]);
-  nntrainer::Tensor &Vweight = context.getWeight(weight_idx[QKVParams::V]);
-  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-  nntrainer::Tensor &Qhidden_ = context.getOutput(QKVParams::Q);
-  nntrainer::Tensor &Khidden_ = context.getOutput(QKVParams::K);
-  nntrainer::Tensor &Vhidden_ = context.getOutput(QKVParams::V);
+void QKVLayer::incremental_forwarding(RunLayerContext &context,
+                                     unsigned int from, unsigned int to,
+                                     bool training) {
+  Tensor &Qweight = context.getWeight(weight_idx[QKVParams::Q]);
+  Tensor &Kweight = context.getWeight(weight_idx[QKVParams::K]);
+  Tensor &Vweight = context.getWeight(weight_idx[QKVParams::V]);
+  Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  Tensor &Qhidden_ = context.getOutput(QKVParams::Q);
+  Tensor &Khidden_ = context.getOutput(QKVParams::K);
+  Tensor &Vhidden_ = context.getOutput(QKVParams::V);
 
-  nntrainer::TensorDim input_dim = input_.getDim();
-  nntrainer::TensorDim input_step_dim = input_dim;
+  TensorDim input_dim = input_.getDim();
+  TensorDim input_step_dim = input_dim;
   input_step_dim.batch(1);
   input_step_dim.height(to - from);
 
-  nntrainer::Tensor input_step =
-    input_.getSharedDataTensor(input_step_dim, 0, true);
+  Tensor input_step = input_.getSharedDataTensor(input_step_dim, 0, true);
 
-  nntrainer::TensorDim Qhidden_dim = Qhidden_.getDim();
-  nntrainer::TensorDim Qhidden_step_dim = Qhidden_.getDim();
+  TensorDim Qhidden_step_dim = Qhidden_.getDim();
   Qhidden_step_dim.batch(1);
   Qhidden_step_dim.height(to - from);
-  nntrainer::Tensor Qhidden_step =
-    Qhidden_.getSharedDataTensor(Qhidden_step_dim, 0, true);
+  Tensor Qhidden_step = Qhidden_.getSharedDataTensor(Qhidden_step_dim, 0, true);
 
-  nntrainer::TensorDim Khidden_dim = Khidden_.getDim();
-  nntrainer::TensorDim Khidden_step_dim = Khidden_.getDim();
+  TensorDim Khidden_step_dim = Khidden_.getDim();
   Khidden_step_dim.batch(1);
   Khidden_step_dim.height(to - from);
-  nntrainer::Tensor Khidden_step =
-    Khidden_.getSharedDataTensor(Khidden_step_dim, 0, true);
+  Tensor Khidden_step = Khidden_.getSharedDataTensor(Khidden_step_dim, 0, true);
 
-  nntrainer::TensorDim Vhidden_dim = Vhidden_.getDim();
-  nntrainer::TensorDim Vhidden_step_dim = Vhidden_.getDim();
+  TensorDim Vhidden_step_dim = Vhidden_.getDim();
   Vhidden_step_dim.batch(1);
   Vhidden_step_dim.height(to - from);
-  nntrainer::Tensor Vhidden_step =
-    Vhidden_.getSharedDataTensor(Vhidden_step_dim, 0, true);
+  Tensor Vhidden_step = Vhidden_.getSharedDataTensor(Vhidden_step_dim, 0, true);
 
-  std::vector<nntrainer::Tensor *> Weights({&Qweight, &Kweight, &Vweight});
-  std::vector<nntrainer::Tensor *> Outputs(
+  std::vector<Tensor *> Weights({&Qweight, &Kweight, &Vweight});
+  std::vector<Tensor *> Outputs(
     {&Qhidden_step, &Khidden_step, &Vhidden_step});
 
   input_step.dot(Weights, Outputs);
 }
 
-void QKVLayer::calcDerivative(nntrainer::RunLayerContext &context) { return; }
+void QKVLayer::calcDerivative(RunLayerContext &context) {
+  throw std::runtime_error(
+    "QKVLayer::calcDerivative not supported (inference-only layer)");
+}
 
-void QKVLayer::calcGradient(nntrainer::RunLayerContext &context) { return; }
+void QKVLayer::calcGradient(RunLayerContext &context) {
+  throw std::runtime_error(
+    "QKVLayer::calcGradient not supported (inference-only layer)");
+}
 
 void QKVLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  ml::train::TensorDim input_dim = context.getInput(SINGLE_INOUT_IDX).getDim();
-  ml::train::TensorDim Qoutput_dim = context.getOutput(QKVParams::Q).getDim();
-  ml::train::TensorDim Koutput_dim = context.getOutput(QKVParams::K).getDim();
-  ml::train::TensorDim Voutput_dim = context.getOutput(QKVParams::V).getDim();
+  RunLayerContext &context, std::vector<TensorDim> input_dimensions) {
+  TensorDim input_dim = context.getInput(SINGLE_INOUT_IDX).getDim();
+  TensorDim Qoutput_dim = context.getOutput(QKVParams::Q).getDim();
+  TensorDim Koutput_dim = context.getOutput(QKVParams::K).getDim();
+  TensorDim Voutput_dim = context.getOutput(QKVParams::V).getDim();
 
   input_dim.height(input_dimensions[0].height());
   Qoutput_dim.height(input_dimensions[0].height());
@@ -200,4 +208,5 @@ void QKVLayer::updateTensorsByInputDimensions(
   context.updateOutput(QKVParams::K, Koutput_dim);
   context.updateOutput(QKVParams::V, Voutput_dim);
 }
-} // namespace causallm
+
+} // namespace nntrainer

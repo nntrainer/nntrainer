@@ -801,7 +801,14 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
 
   auto *o = getOps();
   if (input_dtype == Tdatatype::Q4_0) {
-    if (o->supports_gemm_q4_0_batch_fp32() && M > 1) {
+    // Same M threshold as the single-weight path (dotQnK) - the backend's to
+    // declare via gemm_q4_0_accel_min_rows(), not a hardcoded `M > 1`. Hexagon
+    // cDSP lowers this to 1 (decode included, see
+    // HexagonComputeOps::gemm_q4_0_accel_min_rows), so QKVLayer/GateUpLayer's
+    // batched dot() collapses into one dispatch at decode too - the M == 1
+    // regime that is actually the whole point of batching Q/K/V and gate/up.
+    if (o->supports_gemm_q4_0_batch_fp32() &&
+        M >= o->gemm_q4_0_accel_min_rows()) {
       o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
     } else {
       for (unsigned int i = 0; i < input.size(); ++i) {

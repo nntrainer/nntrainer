@@ -73,10 +73,14 @@ using nntr_htp_bridge_gemm_q4_0_fn = int (*)(const void *, const float *,
                                               unsigned int, unsigned int);
 using nntr_htp_bridge_upload_fn = int (*)(const void *, const void *,
                                            unsigned int, unsigned int);
+using nntr_htp_bridge_gemm_q4_0_batch_fn =
+  int (*)(const void *const *, const float *, float *const *,
+          const unsigned int *, unsigned int, unsigned int, unsigned int);
 
 struct BridgeApi {
   nntr_htp_bridge_upload_fn upload = nullptr;
   nntr_htp_bridge_gemm_q4_0_fn gemm = nullptr;
+  nntr_htp_bridge_gemm_q4_0_batch_fn gemm_batch = nullptr;
 };
 
 /**
@@ -110,6 +114,8 @@ const BridgeApi &get_bridge_api() {
       sym("nntr_htp_bridge_upload_weight_q4x4x2"));
     a.gemm = reinterpret_cast<nntr_htp_bridge_gemm_q4_0_fn>(
       sym("nntr_htp_bridge_gemm_q4_0"));
+    a.gemm_batch = reinterpret_cast<nntr_htp_bridge_gemm_q4_0_batch_fn>(
+      sym("nntr_htp_bridge_gemm_q4_0_batch"));
     return a;
   }();
 
@@ -179,54 +185,42 @@ public:
   void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata, float *matCdata,
                             unsigned int M, unsigned int N,
                             unsigned int K) override {
-    static std::mutex bridge_init_mutex;
-    const BridgeApi *api;
-    {
-      // get_bridge_api()'s static-local init is already thread-safe (C++11
-      // magic statics); the mutex here only serializes the dlopen/dlsym
-      // path itself against concurrent first-callers so a failed attempt
-      // from one thread can't race a second attempt from another.
-      std::lock_guard<std::mutex> lock(bridge_init_mutex);
-      api = &get_bridge_api();
-    }
-
-    // matAdata is in the *ARM* q4_0x4 layout, because the CPU kernels still read
-    // these same bytes for every decode step (M < 32, see
-    // gemm_q4_0_accel_min_rows). The DSP needs q4x4x2, so convert on first
-    // sight only: q4_0x4 -> plain block_q4_0 -> q4x4x2, then hand the result to
-    // the bridge, which copies it into a persistent rpcmem arena keyed on
-    // matAdata. All three layouts are 9K/16 bytes per row, so the scratches are
-    // exactly one weight each and get reused across weights - peak extra host
-    // memory is 2x the largest FC weight, not 2x the model.
-    //
-    // This is what lets the model .bin stay in its ordinary ARM layout: the
-    // q4x4x2 copy exists only in rpcmem, derived at load, and no
-    // Hexagon-specific weight file is needed.
-    if (uploaded_.find(matAdata) == uploaded_.end()) {
-      const size_t nbytes = (size_t)N * ((size_t)K / 32) * 18;
-
-      if (unpack_scratch_.size() < nbytes) {
-        unpack_scratch_.resize(nbytes);
-        htp_scratch_.resize(nbytes);
-      }
-
-      cpu_->unpack_q4_0(matAdata, unpack_scratch_.data(), nbytes, N, K);
-      repack_q4_0_to_htp_q4x4x2(htp_scratch_.data(), unpack_scratch_.data(),
-                                nbytes, N, K);
-
-      if (api->upload(matAdata, htp_scratch_.data(), N, K) != 0) {
-        throw std::runtime_error(
-          "HexagonComputeOps::gemm_q4_0_accel_fp32: "
-          "nntr_htp_bridge_upload_weight_q4x4x2 failed (see log for details)");
-      }
-      uploaded_.insert(matAdata);
-    }
+    const BridgeApi *api = get_locked_bridge_api();
+    ensure_uploaded(*api, matAdata, N, K);
 
     int rc = api->gemm(matAdata, matBdata, matCdata, M, N, K);
     if (rc != 0) {
       throw std::runtime_error(
         "HexagonComputeOps::gemm_q4_0_accel_fp32: "
         "nntr_htp_bridge_gemm_q4_0 failed (see log for details)");
+    }
+  }
+
+  // Q/K/V (3 weights) and gate/up (2 weights) sharing one activation - see
+  // QKVLayer/GateUpLayer (nntrainer/layers/) and float_tensor.cpp's
+  // FloatTensor::dot(vector<Tensor*>, ...). Collapses what would be N
+  // separate gemm_q4_0_accel_fp32 calls (N FastRPC round trips) into one
+  // nntr_htp_bridge_gemm_q4_0_batch call (one round trip).
+  bool supports_gemm_q4_0_batch_fp32() const override { return true; }
+
+  void gemm_q4_0_batch_fp32(std::vector<void *> matAdata, float *matBdata,
+                            std::vector<float *> matCdata, unsigned int M,
+                            std::vector<unsigned int> N,
+                            unsigned int K) override {
+    const BridgeApi *api = get_locked_bridge_api();
+
+    std::vector<const void *> keys(matAdata.size());
+    for (size_t i = 0; i < matAdata.size(); ++i) {
+      ensure_uploaded(*api, matAdata[i], N[i], K);
+      keys[i] = matAdata[i];
+    }
+
+    int rc = api->gemm_batch(keys.data(), matBdata, matCdata.data(), N.data(),
+                             (unsigned int)matAdata.size(), M, K);
+    if (rc != 0) {
+      throw std::runtime_error(
+        "HexagonComputeOps::gemm_q4_0_batch_fp32: "
+        "nntr_htp_bridge_gemm_q4_0_batch failed (see log for details)");
     }
   }
 
@@ -458,12 +452,6 @@ public:
   }
 
   // --- Other accelerator-only ops (no Hexagon accel yet - CPU fallback) ---
-  void gemm_q4_0_batch_fp32(std::vector<void *> matAdata, float *matBdata,
-                            std::vector<float *> matCdata, unsigned int M,
-                            std::vector<unsigned int> N,
-                            unsigned int K) override {
-    cpu_->gemm_q4_0_batch_fp32(matAdata, matBdata, matCdata, M, N, K);
-  }
   void gemv_int4_batch_fp32(std::vector<void *> weights,
                             std::vector<uint16_t *> scales, float *input,
                             std::vector<float *> outputs, unsigned int K,
@@ -673,6 +661,53 @@ public:
 #endif // ENABLE_FP16
 
 private:
+  // get_bridge_api()'s static-local init is already thread-safe (C++11 magic
+  // statics); the mutex here only serializes the dlopen/dlsym path itself
+  // against concurrent first-callers so a failed attempt from one thread
+  // can't race a second attempt from another.
+  static const BridgeApi *get_locked_bridge_api() {
+    static std::mutex bridge_init_mutex;
+    std::lock_guard<std::mutex> lock(bridge_init_mutex);
+    return &get_bridge_api();
+  }
+
+  // matAdata is in the *ARM* q4_0x4 layout, because the CPU kernels still read
+  // these same bytes for every decode step (M < 32, see
+  // gemm_q4_0_accel_min_rows). The DSP needs q4x4x2, so convert on first
+  // sight only: q4_0x4 -> plain block_q4_0 -> q4x4x2, then hand the result to
+  // the bridge, which copies it into a persistent rpcmem arena keyed on
+  // matAdata. All three layouts are 9K/16 bytes per row, so the scratches are
+  // exactly one weight each and get reused across weights - peak extra host
+  // memory is 2x the largest FC weight, not 2x the model.
+  //
+  // This is what lets the model .bin stay in its ordinary ARM layout: the
+  // q4x4x2 copy exists only in rpcmem, derived at load, and no
+  // Hexagon-specific weight file is needed.
+  void ensure_uploaded(const BridgeApi &api, void *matAdata, unsigned int N,
+                      unsigned int K) {
+    if (uploaded_.find(matAdata) != uploaded_.end()) {
+      return;
+    }
+
+    const size_t nbytes = (size_t)N * ((size_t)K / 32) * 18;
+
+    if (unpack_scratch_.size() < nbytes) {
+      unpack_scratch_.resize(nbytes);
+      htp_scratch_.resize(nbytes);
+    }
+
+    cpu_->unpack_q4_0(matAdata, unpack_scratch_.data(), nbytes, N, K);
+    repack_q4_0_to_htp_q4x4x2(htp_scratch_.data(), unpack_scratch_.data(),
+                              nbytes, N, K);
+
+    if (api.upload(matAdata, htp_scratch_.data(), N, K) != 0) {
+      throw std::runtime_error(
+        "HexagonComputeOps::ensure_uploaded: "
+        "nntr_htp_bridge_upload_weight_q4x4x2 failed (see log for details)");
+    }
+    uploaded_.insert(matAdata);
+  }
+
   ComputeOps *cpu_ = get_cpu_ops();
 
   // Weights already converted and uploaded to the DSP, keyed on the ARM-layout

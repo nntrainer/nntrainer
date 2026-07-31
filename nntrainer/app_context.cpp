@@ -54,6 +54,7 @@
 #include <dynamic_library_loader.h>
 #include <embedding.h>
 #include <fc_layer.h>
+#include <gate_up_layer.h>
 #include <flatten_layer.h>
 #include <gather_layer.h>
 #include <gru.h>
@@ -91,6 +92,7 @@
 #include <rnncell.h>
 #include <sine_layer.h>
 #include <slice_layer.h>
+#include <qkv_layer.h>
 #include <split_layer.h>
 #include <sqrt_layer.h>
 #include <subtract_layer.h>
@@ -330,6 +332,8 @@ void AppContext::add_default_object() {
                   LayerType::LAYER_NEG);
   registerFactory(nntrainer::createLayer<FullyConnectedLayer>,
                   FullyConnectedLayer::type, LayerType::LAYER_FC);
+  registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
+  registerFactory(nntrainer::createLayer<GateUpLayer>, GateUpLayer::type);
   registerFactory(nntrainer::createLayer<BatchNormalizationLayer>,
                   BatchNormalizationLayer::type, LayerType::LAYER_BN);
   registerFactory(nntrainer::createLayer<LayerNormalizationLayer>,
