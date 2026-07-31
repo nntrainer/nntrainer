@@ -16,11 +16,13 @@
 
 #include <reshaped_rms_norm.h>
 #include <rms_norm.h>
+#include <swiglu.h>
 
 #include <gtest/gtest.h>
 
 #include <cmath>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace {
@@ -197,6 +199,137 @@ TEST(CausalLmLoraBackward,
 
   checkGradient(inputs[0].getVariableRef().getData<float>(), analytic.data(),
                dy, height * width, height * width, forward);
+}
+
+TEST(CausalLmLoraBackward, SwiGLUCalcDerivativeMatchesFiniteDifference) {
+  const unsigned int height = 2, width = 3;
+
+  causallm::SwiGLULayer layer;
+  nntrainer::InitLayerContext init_context(
+    {nntrainer::TensorDim({1, 1, height, width}),
+     nntrainer::TensorDim({1, 1, height, width})},
+    {true}, false, "swiglu_gradcheck", "", 0.0f, {"NCHW", "FP32", "FP32"});
+  ASSERT_NO_THROW(layer.finalize(init_context));
+
+  std::vector<nntrainer::Weight> weights;
+  std::vector<nntrainer::Var_Grad> inputs, outputs, tensors;
+
+  inputs.emplace_back(init_context.getInputDimensions()[0],
+                      nntrainer::Initializer::NONE, true, true, "gate");
+  inputs.emplace_back(init_context.getInputDimensions()[1],
+                      nntrainer::Initializer::NONE, true, true, "up");
+  outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
+                       nntrainer::Initializer::NONE, true, true, "output");
+
+  float gate[height * width] = {0.2f, -0.5f, 0.8f, -0.3f, 0.1f, 1.2f};
+  float up[height * width] = {0.4f, 0.9f, -0.6f, 0.3f, -1.1f, 0.2f};
+  std::copy(gate, gate + height * width,
+           inputs[0].getVariableRef().getData<float>());
+  std::copy(up, up + height * width,
+           inputs[1].getVariableRef().getData<float>());
+
+  auto run_context =
+    makeRunContext("swiglu_gradcheck", weights, inputs, outputs, tensors);
+
+  float dy[height * width] = {0.5f, -0.3f, 0.2f, 0.1f, 0.4f, -0.2f};
+  std::copy(dy, dy + height * width,
+           run_context.getOutputGradUnsafe(0).getData<float>());
+
+  layer.forwarding(run_context, true);
+  layer.calcDerivative(run_context);
+
+  std::vector<float> analytic_gate(height * width), analytic_up(height * width);
+  std::copy(run_context.getOutgoingDerivative(0).getData<float>(),
+           run_context.getOutgoingDerivative(0).getData<float>() +
+             height * width,
+           analytic_gate.begin());
+  std::copy(run_context.getOutgoingDerivative(1).getData<float>(),
+           run_context.getOutgoingDerivative(1).getData<float>() +
+             height * width,
+           analytic_up.begin());
+
+  auto forward = [&]() -> const float * {
+    layer.forwarding(run_context, true);
+    return run_context.getOutput(0).getData<float>();
+  };
+
+  checkGradient(inputs[0].getVariableRef().getData<float>(),
+               analytic_gate.data(), dy, height * width, height * width,
+               forward);
+  checkGradient(inputs[1].getVariableRef().getData<float>(),
+               analytic_up.data(), dy, height * width, height * width,
+               forward);
+}
+
+/**
+ * @brief Regression test: nntrainer aliases each outgoing derivative onto its
+ *        input's own buffer, so a calcDerivative that writes one output
+ *        before reading every input it needs will silently consume its own
+ *        output. SwiGLU is the case that matters (d_up aliases up, which is
+ *        still needed to form d_gate).
+ *
+ * @note The other gradient checks in this file build each Var_Grad with
+ *       independent variable/gradient storage, which does NOT reproduce the
+ *       aliasing the real graph uses — hence this dedicated test.
+ */
+TEST(CausalLmLoraBackward, SwiGLUCalcDerivativeIsSafeWhenGradAliasesInput) {
+  const unsigned int height = 2, width = 3, n = height * width;
+
+  const std::vector<float> gate0 = {0.2f, -0.5f, 0.8f, -0.3f, 0.1f, 1.2f};
+  const std::vector<float> up0 = {0.4f, 0.9f, -0.6f, 0.3f, -1.1f, 0.2f};
+  const std::vector<float> dy0 = {0.5f, -0.3f, 0.2f, 0.1f, 0.4f, -0.2f};
+
+  auto build = [&](bool alias) {
+    causallm::SwiGLULayer layer;
+    nntrainer::InitLayerContext init_context(
+      {nntrainer::TensorDim({1, 1, height, width}),
+       nntrainer::TensorDim({1, 1, height, width})},
+      {true}, false, "swiglu_alias", "", 0.0f, {"NCHW", "FP32", "FP32"});
+    layer.finalize(init_context);
+
+    // Storage kept alive by the caller via the returned vectors.
+    auto gate_t = std::make_shared<nntrainer::Tensor>(
+      init_context.getInputDimensions()[0], true);
+    auto up_t = std::make_shared<nntrainer::Tensor>(
+      init_context.getInputDimensions()[1], true);
+    auto gate_g = alias ? gate_t
+                        : std::make_shared<nntrainer::Tensor>(
+                            init_context.getInputDimensions()[0], true);
+    auto up_g = alias ? up_t
+                      : std::make_shared<nntrainer::Tensor>(
+                          init_context.getInputDimensions()[1], true);
+    std::copy(gate0.begin(), gate0.end(), gate_t->getData<float>());
+    std::copy(up0.begin(), up0.end(), up_t->getData<float>());
+
+    std::vector<nntrainer::Weight> weights;
+    std::vector<nntrainer::Var_Grad> inputs, outputs, tensors;
+    inputs.emplace_back(gate_t.get(), gate_g.get(), false);
+    inputs.emplace_back(up_t.get(), up_g.get(), false);
+    outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
+                         nntrainer::Initializer::NONE, true, true, "out");
+
+    auto rc = makeRunContext("swiglu_alias", weights, inputs, outputs, tensors);
+    std::copy(dy0.begin(), dy0.end(),
+              rc.getOutputGradUnsafe(0).getData<float>());
+
+    layer.forwarding(rc, true);
+    layer.calcDerivative(rc);
+
+    std::vector<float> dg(gate_g->getData<float>(),
+                          gate_g->getData<float>() + n);
+    std::vector<float> du(up_g->getData<float>(), up_g->getData<float>() + n);
+    return std::make_pair(dg, du);
+  };
+
+  auto separate = build(false);
+  auto aliased = build(true);
+
+  for (unsigned int i = 0; i < n; ++i) {
+    EXPECT_NEAR(separate.first[i], aliased.first[i], 1e-6)
+      << "d_gate differs under aliasing at " << i;
+    EXPECT_NEAR(separate.second[i], aliased.second[i], 1e-6)
+      << "d_up differs under aliasing at " << i;
+  }
 }
 
 TEST(CausalLmLoraBackward, RmsNormCalcGradientMatchesFiniteDifference) {

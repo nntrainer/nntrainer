@@ -234,7 +234,7 @@ if get_option('enable-test')
     'unittest_lora_backward_gradcheck',
     meson.current_source_dir() / 'layers' / 'unittest_lora_backward_gradcheck.cpp',
     dependencies: [nntrainer_dep, gtest_main_dep, causallm_rms_norm_dep,
-                   causallm_reshaped_rms_norm_dep],
+                   causallm_reshaped_rms_norm_dep, causallm_swiglu_dep],
     include_directories: causallm_layer_inc,
     build_by_default: true,
     install: false,
