@@ -10,6 +10,7 @@
 
 #include <hexagon_compute_ops.h>
 #include <hexagon_context.h>
+#include <hexagon_rpc_allocator.h>
 
 #include <fc_layer.h>
 #include <gate_up_layer.h>
@@ -89,6 +90,13 @@ void HexagonContext::initialize() noexcept {
     // before falling back to the CPU NEON/AVX kernel - see compute_ops.h).
     getContextData()->setComputeOps(get_hexagon_ops());
 
+    // Route this context's activation tensor pool through rpcmem
+    // (NeuralNetwork::load's has_cdsp_engine check -> setComputeBackend("",
+    // "cdsp") is what actually activates this - see neuralnet.cpp). Lets the
+    // bridge hand the DSP a pointer it can map directly instead of
+    // memcpy-ing the activation into a separate staging buffer on every
+    // accelerated GEMM call.
+    setMemAllocator(std::make_shared<HexagonRpcAllocator>());
   } catch (std::exception &e) {
     ml_loge("hexagon_context: registering layers failed!!, reason: %s",
             e.what());

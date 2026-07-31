@@ -227,10 +227,18 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   const std::string tensor_type =
     to_string(std::get<props::ModelTensorDataType>(model_flex_props));
 
+  // node->getType() == "qnn_graph" is checkable now (intrinsic layer type),
+  // but node->getComputeEngineType() reflects the "engine=..." *property* and
+  // is not - LayerNode::finalize() (layer_node.cpp:637-639) is what copies
+  // that property into the compute_engine member read by
+  // getComputeEngineType(), and finalize() does not run until
+  // model_graph.compile() below. An ordinary engine=cdsp FC/QKVLayer/
+  // GateUpLayer (unlike QNN's single opaque qnn_graph layer, which needs no
+  // per-node finalize to identify) is therefore invisible to this check at
+  // this point - re-checked after compile() instead, see below.
   bool has_qnn_engine = false;
   for (auto &node : graph_representation) {
-    if (node->getComputeEngineType() == "qnn" ||
-        node->getType() == "qnn_graph") {
+    if (node->getType() == "qnn_graph") {
       has_qnn_engine = true;
       break;
     }
@@ -251,12 +259,6 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   if (has_qnn_engine)
     model_graph.setComputeBackend("", "qnn");
 
-  // QNN activation tensors are rpcmem-backed and registered with the DSP, so
-  // their addresses must stay stable across decode tokens. Let inference()
-  // reuse the pool (allocate once) instead of reallocating per call. CPU/GPU
-  // keep the realloc-per-call behavior they need for correct tensor state.
-  reuse_inference_tensor_pool_ = has_qnn_engine;
-
   model_graph.setMemoryOptimizations(
     std::get<props::MemoryOptimization>(model_flex_props));
   for (auto &node : graph_representation) {
@@ -272,6 +274,14 @@ int NeuralNetwork::compile(ExecutionMode mode) {
 
   int status = model_graph.compile(loss_type);
   NN_RETURN_STATUS();
+
+  // has_cdsp_engine cannot be checked yet here - LayerNode::finalize() is
+  // what copies the "engine=cdsp" property into the compute_engine member
+  // getComputeEngineType() reads (layer_node.cpp:637-639), and finalize()
+  // does not run until NetworkGraph::initialize() (called from
+  // NeuralNetwork::initialize(), a separate later function) - see the
+  // has_cdsp_engine block there instead.
+  reuse_inference_tensor_pool_ = has_qnn_engine;
 
   compiled = true;
 
@@ -326,6 +336,43 @@ int NeuralNetwork::initialize(ExecutionMode mode) {
     exec_mode, input_conn,
     std::vector<Connection>(label_layers.begin(), label_layers.end()));
   NN_RETURN_STATUS();
+
+  // Only checkable now: the initialize() call just above is what runs
+  // LayerNode::finalize() on every node (via finalizeContext,
+  // network_graph.cpp:~1212), which is what copies the "engine=cdsp"
+  // property into the compute_engine member getComputeEngineType() reads
+  // (layer_node.cpp:637-639) - checking any earlier (e.g. in compile(),
+  // before finalize() has run at all) always sees the pre-finalize default.
+  // Still well before model_graph.allocateWeights() below actually allocates
+  // memory, so setComputeBackend()'s "before allocateTensors()/
+  // allocateWeights()" contract holds.
+  bool has_cdsp_engine = false;
+  for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
+    if ((*iter)->getComputeEngineType() == "cdsp") {
+      has_cdsp_engine = true;
+      break;
+    }
+  }
+
+  // Same rationale as the QNN setComputeBackend block in compile() above,
+  // for the Hexagon cDSP bridge: HexagonRpcAllocator backs activation
+  // tensors with rpcmem so the bridge can hand the DSP a pointer it maps
+  // directly, instead of memcpy-ing into a separate staging buffer on every
+  // accelerated GEMM call. Weights are uploaded to the DSP's own pinned
+  // arena by HexagonComputeOps separately (see hexagon_compute_ops.cpp's
+  // ensure_uploaded), so only the activation pool needs to move here - same
+  // "tensor-only" split as QNN.
+  if (has_cdsp_engine)
+    model_graph.setComputeBackend("", "cdsp");
+
+  // QNN and cDSP activation tensors are rpcmem-backed and registered with
+  // the DSP, so their addresses must stay stable across decode tokens. Let
+  // inference() reuse the pool (allocate once) instead of reallocating per
+  // call. CPU/GPU keep the realloc-per-call behavior they need for correct
+  // tensor state. reuse_inference_tensor_pool_ was provisionally set from
+  // has_qnn_engine alone in compile() (has_cdsp_engine wasn't knowable
+  // there) - OR in the cdsp half now that it is.
+  reuse_inference_tensor_pool_ = reuse_inference_tensor_pool_ || has_cdsp_engine;
 
   model_graph.setBatchSize(
     std::get<props::TrainingBatchSize>(model_flex_props));
