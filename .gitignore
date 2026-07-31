@@ -37,6 +37,7 @@ Applications/CausalLM/res/gemma4/test/*
 !Applications/CausalLM/res/gemma4/test/generate_gemma4_reference.py
 !Applications/CausalLM/res/qwen3/
 Applications/CausalLM/res/qwen3/*
+!Applications/CausalLM/res/qwen3/regen_qkv_bin.py
 !Applications/CausalLM/res/qwen3/test/
 Applications/CausalLM/res/qwen3/test/*
 !Applications/CausalLM/res/qwen3/test/generate_qwen3_moe_reference.py
