@@ -164,12 +164,24 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
                             context.getActivationDataType()),
       is_nchw ? 0b1011 : 0b1101);
 
+    /**
+     * @note Standard LoRA initialization (Hu et al. 2021): A is drawn from a
+     * zero-mean distribution and B is zero, so the adapter contributes
+     * B*A == 0 at step 0 and the pretrained model is reproduced exactly.
+     *
+     * The reverse assignment (A zero, B random) also gives B*A == 0, but is
+     * badly conditioned: with A == 0 the only non-zero gradient at step 0 is
+     * dL/dA = x^T (dy B^T) * scaling, i.e. the first update to A is steered
+     * entirely by the *random* B, so the initial step is a large step in an
+     * arbitrary direction. Empirically that made training diverge above
+     * lr ~1e-6 on Qwen3-0.6B, whereas this ordering is stable at 1e-4.
+     */
     lora_idx[LORAParams::loraA] = context.requestWeight(
-      loraA_dim, Initializer::ZEROS, weight_regularizer,
+      loraA_dim, Initializer::LECUN_NORMAL, weight_regularizer,
       weight_regularizer_constant, weight_decay, "loraA", true);
 
     lora_idx[LORAParams::loraB] = context.requestWeight(
-      loraB_dim, Initializer::LECUN_NORMAL, weight_regularizer,
+      loraB_dim, Initializer::ZEROS, weight_regularizer,
       weight_regularizer_constant, weight_decay, "loraB", true);
 
     lora_idx[LORAParams::loraTmp] =
