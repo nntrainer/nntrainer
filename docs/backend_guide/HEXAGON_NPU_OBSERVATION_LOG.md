@@ -1641,3 +1641,53 @@ order:
    rather than dispatch count, and is where the remaining multiple lives.
 3. **Attention + DSP-resident KV cache** - the only route to the reference's
    round-trip count, but revisits the project's founding premise (§24).
+
+### S27 addendum: gate/up wired - dispatch count confirmed down 20%, prefill unmoved
+
+Wired `GateUpLayer` into `transformer.cpp`'s `createMlp` (the step S27 flagged
+as still-unclaimed). No `.bin` change needed, unlike QKVLayer: node order goes
+`[ffn_norm.gamma][up][gate][down]` either way, because nothing is interleaved
+between up and gate the way `q_norm`/`k_norm` are between Q/K/V.
+
+Correct - output is token-identical to the pre-wiring run.
+
+**Round-trip reduction confirmed directly** rather than inferred from wall
+time, via `GGML_HEXAGON_PROFILE=1`'s per-batch `n-ops`, counted over one
+prefill forward pass:
+
+| flush size | count | ops |
+|---|---|---|
+| 3 ops | 28 | Q/K/V batched |
+| 2 ops | 28 | up/gate batched |
+| 1 op | 56 | attention_out + ffn_down |
+
+= **112 flushes carrying 196 GEMMs**, i.e. exactly the predicted 4 dispatches
+per layer, down from 140. (196 also cross-checks against the long-known
+"196 FC GEMMs per token" figure from S6.)
+
+**And prefill did not move: median 821.3 TPS both before and after** (5 runs
+after: 922.2 / 853.2 / 821.3 / 797.9 / 795.9). A 20% cut in round trips
+bought nothing measurable.
+
+That is not a disappointment, it is the cleanest confirmation yet of what
+S10/S12 argued and S27 predicted: **past the ~215-token crossover prefill is
+compute-bound, so dispatch count is simply not its lever.** Because the op
+count was verified directly, this conclusion needs no thermal control - the
+mechanism provably changed while the outcome did not.
+
+Worth noting for anyone re-measuring: the 5 runs above drift monotonically
+downward (922 -> 796, ~14%) purely from thermals over ~40s of back-to-back
+runs. Comparing medians of separately-taken batches is unreliable at this
+granularity; either interleave configs or, better, measure the mechanism
+directly as done here.
+
+Kept anyway despite the null prefill result: it is correct, free, and a 20%
+round-trip cut is real work removed - it would matter if decode is ever
+revisited (and it lets the DSP's per-batch `src1_spad` cache skip
+re-quantizing the shared activation, per S2's finding 10). It also carries
+the same batched-M=1 caveat as QKVLayer, so it stays behind the hybrid split.
+
+**Dispatch-count reduction for prefill is now exhausted** (`ffn_down` and
+`attention_out` have no activation-sharing partner, so 4/layer is the floor
+for this approach). The remaining prefill headroom is entirely in scope of
+offload - norm/RoPE/elementwise, then attention - per S24's menu.
