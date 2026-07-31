@@ -1921,3 +1921,137 @@ via the existing `HTP_OP_ROPE`, again without touching B's semantics.
 One sizing note for A: attention is per-head - 16 heads of
 `[308,128] x [128,308]` per layer. `NNTR_HTP_MAX_BATCH` is currently 8, so
 16-head dispatch either raises that cap or issues two batches per matmul.
+
+---
+
+## 30. Attention offload: A-vs-B inverts, and B turns out to need no data conversion
+
+Work toward S29's conclusion (attention is the only remaining prefill lever).
+S29 recommended path A (offload the two matmuls as plain GEMMs) over path B
+(`FLASH_ATTN_EXT`). **That recommendation was wrong; B is both cheaper and
+bigger.** Three findings, in the order they landed.
+
+### Milestone done: the KV cache is DSP-visible
+
+Any attention offload needs the DSP to read K and V, and a DSP kernel cannot
+dereference a host pointer at all. `KVCacheManager::allocate` now takes its
+storage from rpcmem and registers it with the bridge, reusing S27's
+`register_activation_pool` + `wrap_external` machinery unchanged.
+
+Resolved by dlopen/dlsym rather than linking nntrainer's
+`HexagonRpcAllocator`, because `ENABLE_HEXAGON_CDSP` is **not** propagated to
+the CausalLM build - only to nntrainer's own. A compile-time dependency would
+break any build of the app against an nntrainer configured without the
+option. (`ENABLE_FP16` is likewise invisible to the app; see below, where that
+detail matters.)
+
+First version registered one rpcmem buffer *per tensor* - 56 mappings - which
+is exactly the anti-pattern S8's pooled arenas exist to avoid, given
+`HTP_OP_MAX_BUFS`/`HTP_MAX_MMAPS` are both 16 (S2 finding 9). It had not broken
+only because attention still runs on CPU, so the DSP never referenced those
+buffers in an op. Reworked to one 224 MiB region sub-allocated by element
+offset: registrations **57 -> 2**. `Tensor::setData`'s offset is in *elements*,
+not bytes.
+
+### Why A is worse than S29 assumed: the scores layout is packed-triangular
+
+Reading the kernels rather than assuming: for prefill, `compute_kcaches` is
+invoked **per query row** (`tm.parallel_for(0, sequence_len, ...)`), each call
+scoring row *i* against `row_to_compute = from + i + 1` cached keys. Causal
+masking is therefore **structural**, not a mask - row *i* simply does less
+work - and the scores are written **packed-triangular**, at
+`out_start_row = calc_windowed_attn_index(from+i) - calc_windowed_attn_index(from)`,
+with heads interleaved along the width
+(`output[(row-start_row)*num_cache_head*gqa_size + n*gqa_size + g]`). That is
+why `out_` is sized as a triangular count rather than `step_size * cache_to`.
+
+No standard GEMM produces that layout. Path A would therefore need either a
+CPU repack of every score matrix (expensive - it is ~1.5 M floats per layer) or
+invasive rewrites of `softmax_triangle` **and**
+`compute_fp16vcache_transposed` to consume a dense layout. Neither is the
+"just offload two GEMMs" that A sounded like.
+
+**B has no such problem**: `FLASH_ATTN_EXT` consumes Q/K/V and emits the
+attention *output*. There is no intermediate scores tensor to lay out at all,
+and softmax (only 10.4 ms of 192.2, per S29) comes along for free.
+
+### FP16: two different things, one of which is a dead end and irrelevant
+
+B requires K and V to be F16 (`ggml_hexagon_supported_flash_attn_ext`:
+`src1->type != GGML_TYPE_F16 || src2->type != GGML_TYPE_F16` -> reject; Q may
+be F16 *or* F32). This looked like a blocker, since the model runs
+`Q4_0-FP32`. It is not:
+
+- **FP16 activations are a dead end here.** Tested by temporarily reverting
+  the batching wiring (the batched layers cannot run FP16 at all - see below)
+  and interleaving configs: CPU prefill FP32 672/584 TPS vs FP16 612/583 TPS.
+  No gain, possibly marginally worse. The CausalLM README's ~2.3x FP16 claim
+  (755 vs 329) does **not** reproduce on this device - that table is S26 Ultra
+  at 8 threads. So there is no independent reason to pursue FP16 activations.
+- **The KV cache is already 2 bytes/element regardless.** `causal_lm.cpp:141`
+  picks the cache dtype *independently* of the activation dtype - FP16, or
+  UINT16 holding the same fp16 bit patterns when `ENABLE_FP16` is not visible
+  to the app build (which it is not). Confirmed arithmetically, not just from
+  the `#ifdef`: the pool is 234,881,024 B = 28 layers x 2 tensors x 2048
+  (`max_seq_len`) x 1024 (`kv_width`) x **2** B.
+
+So B's dtype requirement is **already satisfied**, and the bridge can simply
+label those bytes `HTP_TYPE_F16` when hand-building the descriptor. Zero
+conversion. The whole batched-FP16 chain (`HalfTensor::dot(vector<Tensor*>)`,
+a `gemm_q4_0_batch_fp16` ComputeOps method, an FP16 bridge path) is
+**unnecessary** - which is fortunate, because it is also the reason FP16
+activations currently *crash* with the batched layers:
+`Tensor::dot(std::vector<Tensor*>) is currently not supported in tensor data
+type FP16` (`HalfTensor` does not override the batched `dot`; it falls through
+to `TensorBase`'s throw).
+
+### The FLASH_ATTN_EXT contract, and why our layouts already fit
+
+From `htp/flash-attn-ops.c:624` (`op_flash_attn_ext`) and ggml's own
+convention:
+
+```
+q:    ne = [head_dim, n_tokens, n_head   ]   type F16 or F32
+k:    ne = [head_dim, n_kv,     n_head_kv]   type F16 (required)
+v:    ne = [head_dim, n_kv,     n_head_kv]   type F16 (required)
+mask: ne = [n_kv,     n_tokens ]             type F16, optional
+dst:  ne = [head_dim, n_head,   n_tokens ]   type F32 or F16
+op_params = { float scale, float max_bias, float logit_softcap }
+n_head = q->ne[2];  n_blocks derived from k->ne[1]
+```
+
+Note dst swaps head and token relative to q - the kernel documents it at
+`:612`, "head stride is nb[1], token stride is nb[2]".
+
+Our tensors map onto this as **pure stride permutations, with no copies**:
+
+| ours (memory order) | element address | as ggml ne / nb |
+|---|---|---|
+| Q `[token][head][dim]`, width 2048 | `t*2048 + h*128 + d` | ne=[128, 308, 16], nb=[sz, 2048sz, 128sz] |
+| K/V cache `[row][kv_head][dim]`, width 1024 | `r*1024 + n*128 + d` | ne=[128, n_kv, 8], nb=[sz, 1024sz, 128sz] |
+| out `[token][head][dim]`, width 2048 | `t*2048 + h*128 + d` | ne=[128, 16, 308], nb=[sz, 128sz, 2048sz] |
+
+and **the kernel honours `nb[]` throughout** - `nbq1/nbq2/nbq3`, `nbk1..3`,
+`nbv1..3`, `mask->nb[1..3]`, `dst->nb[1..3]` are all read explicitly
+(`:314-332`, `:388`, `:613`). Unlike `ggml_hexagon_supported_gated_delta_net`
+directly below it, the flash-attn support gate imposes **no contiguity
+requirement**, so strided views are legitimate rather than accidental.
+
+Also favourable: `head_dim = 128` satisfies the HMX fast path's
+`k->ne[0] % 64 == 0 && v->ne[0] % 64 == 0 && no sinks` (`:637`), so this lands
+on `hmx_flash_attn_ext` - the systolic-array implementation - not the HVX
+fallback.
+
+The one thing we must actually produce is the **causal mask**, since our
+causality is structural and `FLASH_ATTN_EXT` expects it as an F16 tensor.
+`[n_kv, n_tokens]` at 308x308x2 B = ~190 KB, and it is identical for all 28
+layers, so it is built once per forward pass into rpcmem and reused.
+
+### Net effect on the plan
+
+B addresses all 192.2 ms of attention (55% of prefill) rather than A's 131.7 ms,
+needs no data conversion, no FP16 activation work, no new DSP kernel, and no
+new opcode - the skel already implements `HTP_OP_FLASH_ATTN_EXT` (S29). What it
+needs is a bridge entry point that hand-builds five strided descriptors plus
+`op_params`, a shared causal mask, and the `mha_core` call site. **B is now
+strictly the better path and S29's A recommendation is withdrawn.**
