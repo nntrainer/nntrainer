@@ -7,6 +7,7 @@
  * @brief  This is LM_Head Layer Class of Neural Network
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
+ * @author Anirudh Bocha <b.saianirud@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  */
@@ -27,6 +28,27 @@
 #include <layer_impl.h>
 
 namespace causallm {
+
+/**
+ * @brief Row (within the current input buffer) that forwarding() should
+ *        project to vocab logits. UINT_MAX (default) means "use the last
+ *        row" (height - 1), matching incremental_forwarding's inference
+ *        behavior.
+ *
+ * @details Under right-padded training the last *real* token is not at row
+ *          (height - 1), so this must be set to that token's row before the
+ *          forward pass. It must be written from the training thread during
+ *          the forward pass itself — NOT from the dataset generator, which
+ *          nntrainer runs on a separate producer thread that may prefetch
+ *          ahead of the trainer.
+ *
+ * @note This standalone lm_head layer is only used by models that do NOT tie
+ *       word embeddings; the tied path uses TieWordEmbedding, whose
+ *       embedding-mode instance derives the row itself (see
+ *       g_tie_embedding_lm_head_read_row). An untied model trained with
+ *       right-padding needs an equivalent hook in its embedding layer.
+ */
+extern unsigned int g_lm_head_read_row;
 
 /**
  * @class   LMHead layer
@@ -102,8 +124,12 @@ public:
 
   /**
    * @copydoc Layer::supportBackwarding()
+   * @note Both calcDerivative and calcGradient are implemented. The LM
+   *       head weight stays frozen under LoRA-only training (see
+   *       causal_lm.cpp), in which case the framework never calls
+   *       calcGradient; it is implemented so full fine-tuning works.
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; }
+  WIN_EXPORT bool supportBackwarding() const override { return true; }
 
   WIN_EXPORT void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,

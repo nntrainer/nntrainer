@@ -7,12 +7,14 @@
  * @brief  This is lmhead layer
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
+ * @author Anirudh Bocha <b.saianirud@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  */
 
 #include <cpu_backend.h>
 #include <layer_context.h>
+#include <limits>
 #include <lm_head.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
@@ -29,6 +31,8 @@ enum LmHeadParams {
   weight,
   bias,
 };
+
+unsigned int g_lm_head_read_row = std::numeric_limits<unsigned int>::max();
 
 LmHeadLayer::LmHeadLayer() :
   LayerImpl(), lmhead_props(nntrainer::props::Unit()) {
@@ -113,10 +117,53 @@ void LmHeadLayer::setProperty(const std::vector<std::string> &values) {
   LayerImpl::setProperty(remain_props);
 }
 
+/**
+ * @brief Full-sequence (training) forward: projects only a single row (the
+ *        last real token under right-padded training, or the last row of
+ *        the buffer by default) to vocab logits, matching the height=1
+ *        output contract already established by incremental_forwarding.
+ */
 void LmHeadLayer::forwarding(nntrainer::RunLayerContext &context,
                              bool training) {
-  throw nntrainer::exception::not_supported(
-    "Forwarding for LMHead layer is not supported");
+  nntrainer::Tensor weight =
+    context.getWeight(weight_idx[LmHeadParams::weight]);
+
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+
+  ml::train::TensorDim input_dim = input_.getDim();
+  ml::train::TensorDim hidden_dim = hidden_.getDim();
+
+  unsigned int read_row = (g_lm_head_read_row != std::numeric_limits<unsigned int>::max())
+                            ? g_lm_head_read_row
+                            : (input_dim.height() - 1);
+
+  ml::train::TensorDim input_step_dim = input_dim;
+  ml::train::TensorDim hidden_step_dim = hidden_dim;
+
+  input_step_dim.batch(1);
+  input_step_dim.height(1);
+  hidden_step_dim.batch(1);
+
+  unsigned int b_size = input_dim.batch();
+
+  for (unsigned int b = 0; b < b_size; ++b) {
+    nntrainer::Tensor input_step = input_.getSharedDataTensor(
+      input_step_dim,
+      b * input_dim.getFeatureLen() + read_row * input_dim.width(), true);
+    nntrainer::Tensor hidden_step = hidden_.getSharedDataTensor(
+      hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
+
+    input_step.dot(weight, hidden_step, false, false);
+
+    if (auto &disable_bias =
+          std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+        disable_bias.empty() || disable_bias.get() == false) {
+      nntrainer::Tensor &bias =
+        context.getWeight(weight_idx[LmHeadParams::bias]);
+      hidden_step.add_i(bias);
+    }
+  }
 }
 
 void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
@@ -163,14 +210,123 @@ void LmHeadLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   }
 }
 
+/**
+ * @brief calcDerivative for LMHead.
+ * @details forwarding() only ever reads one row (read_row) of the input
+ *          per batch, so only that row receives a non-zero gradient; every
+ *          other row's outgoing derivative is exactly zero by the chain
+ *          rule (the output does not depend on them at all).
+ */
 void LmHeadLayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  throw nntrainer::exception::not_supported(
-    "calcDerivative for LMHead layer is not supported");
+  nntrainer::Tensor weight =
+    context.getWeight(weight_idx[LmHeadParams::weight]);
+
+  const nntrainer::Tensor &dy =
+    context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &dx = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
+
+  ml::train::TensorDim input_dim = dx.getDim();
+  ml::train::TensorDim dy_dim = dy.getDim();
+
+  unsigned int read_row = (g_lm_head_read_row != std::numeric_limits<unsigned int>::max())
+                            ? g_lm_head_read_row
+                            : (input_dim.height() - 1);
+
+  dx.setZero();
+
+  ml::train::TensorDim dx_step_dim = input_dim;
+  ml::train::TensorDim dy_step_dim = dy_dim;
+
+  dx_step_dim.batch(1);
+  dx_step_dim.height(1);
+  dy_step_dim.batch(1);
+
+  unsigned int b_size = input_dim.batch();
+
+  for (unsigned int b = 0; b < b_size; ++b) {
+    nntrainer::Tensor dx_step = dx.getSharedDataTensor(
+      dx_step_dim,
+      b * input_dim.getFeatureLen() + read_row * input_dim.width(), true);
+    nntrainer::Tensor dy_step = dy.getSharedDataTensor(
+      dy_step_dim, b * dy_dim.getFeatureLen(), true);
+
+    // y = x . W  =>  dx = dy . W^T
+    dy_step.dot(weight, dx_step, false, true);
+  }
 }
 
+/**
+ * @brief calcGradient for LMHead.
+ * @details forwarding() computes y = x[read_row] . W (plus bias), reading a
+ *          single input row, so
+ *            dL/dW[i][j] += x[read_row][i] * dy[j]
+ *            dL/dbias[j] += dy[j]
+ *          Only that one row contributes; every other row of the input has
+ *          no effect on the output and therefore none on dW.
+ *
+ * @note Only invoked when the layer is trainable. Under LoRA-only training
+ *       the LM head is frozen (see causal_lm.cpp) so this never runs; it
+ *       exists so full fine-tuning can train the head.
+ * @note Safe to read the input: calcGradient runs before calcDerivative,
+ *       which is what overwrites the input buffer with dx.
+ */
 void LmHeadLayer::calcGradient(nntrainer::RunLayerContext &context) {
-  throw nntrainer::exception::not_supported(
-    "calcGradient for LMHead layer is not supported");
+  nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
+  const nntrainer::Tensor &dy =
+    context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &dw =
+    context.getWeightGrad(weight_idx[LmHeadParams::weight]);
+
+  NNTR_THROW_IF(input_.getDataType() != ml::train::TensorDim::DataType::FP32 ||
+                  dw.getDataType() != ml::train::TensorDim::DataType::FP32,
+                std::invalid_argument)
+    << "[lm_head] calcGradient only supports FP32 for now";
+
+  const ml::train::TensorDim in_dim = input_.getDim();
+  const ml::train::TensorDim dy_dim = dy.getDim();
+  const unsigned int in_w = in_dim.width();
+  const unsigned int unit = dy_dim.width();
+
+  const unsigned int read_row =
+    (g_lm_head_read_row != std::numeric_limits<unsigned int>::max())
+      ? g_lm_head_read_row
+      : (in_dim.height() - 1);
+
+  const bool first =
+    context.isGradientFirstAccess(weight_idx[LmHeadParams::weight]);
+  if (first)
+    dw.setZero();
+
+  const float *x = input_.getData<float>();
+  const float *dy_ = dy.getData<float>();
+  float *dw_ = dw.getData<float>();
+
+  for (unsigned int b = 0; b < in_dim.batch(); ++b) {
+    const float *x_row =
+      x + b * in_dim.getFeatureLen() + read_row * in_w;
+    const float *dy_row = dy_ + b * dy_dim.getFeatureLen();
+    for (unsigned int i = 0; i < in_w; ++i) {
+      const float xi = x_row[i];
+      float *dw_row = dw_ + i * unit;
+      for (unsigned int j = 0; j < unit; ++j)
+        dw_row[j] += xi * dy_row[j];
+    }
+  }
+
+  if (auto &disable_bias =
+        std::get<nntrainer::props::DisableBias>(*layer_impl_props);
+      disable_bias.empty() || disable_bias.get() == false) {
+    nntrainer::Tensor &db =
+      context.getWeightGrad(weight_idx[LmHeadParams::bias]);
+    if (context.isGradientFirstAccess(weight_idx[LmHeadParams::bias]))
+      db.setZero();
+    float *db_ = db.getData<float>();
+    for (unsigned int b = 0; b < in_dim.batch(); ++b) {
+      const float *dy_row = dy_ + b * dy_dim.getFeatureLen();
+      for (unsigned int j = 0; j < unit; ++j)
+        db_[j] += dy_row[j];
+    }
+  }
 }
 
 void LmHeadLayer::exportTo(nntrainer::Exporter &exporter,

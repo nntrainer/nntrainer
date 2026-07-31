@@ -14,14 +14,17 @@
 #include <var_grad.h>
 #include <weight.h>
 
+#include <lm_head.h>
 #include <reshaped_rms_norm.h>
 #include <rms_norm.h>
 #include <swiglu.h>
+#include <tie_word_embedding.h>
 
 #include <gtest/gtest.h>
 
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -261,6 +264,144 @@ TEST(CausalLmLoraBackward, SwiGLUCalcDerivativeMatchesFiniteDifference) {
                forward);
 }
 
+TEST(CausalLmLoraBackward, LmHeadCalcDerivativeMatchesFiniteDifference) {
+  const unsigned int height = 3, width = 4, unit = 5;
+  causallm::g_lm_head_read_row = 1; // simulate a right-padded sample: the
+                                    // last *real* token is row 1, not
+                                    // row (height - 1) = 2.
+
+  causallm::LmHeadLayer layer;
+  ASSERT_NO_THROW(layer.setProperty({"unit=" + std::to_string(unit)}));
+  nntrainer::InitLayerContext init_context(
+    {nntrainer::TensorDim({1, 1, height, width})}, {true}, false,
+    "lm_head_gradcheck", "", 0.0f, {"NCHW", "FP32", "FP32"});
+  ASSERT_NO_THROW(layer.finalize(init_context));
+
+  std::vector<nntrainer::Weight> weights;
+  std::vector<nntrainer::Var_Grad> inputs, outputs, tensors;
+
+  nntrainer::Tensor weight_tensor(nntrainer::TensorDim({1, 1, width, unit}),
+                                 true);
+  float weight_vals[width * unit] = {0.1f,  0.2f,  -0.3f, 0.4f,  0.5f,
+                                     -0.2f, 0.3f,  0.1f,  -0.4f, 0.2f,
+                                     0.3f,  -0.1f, 0.2f,  0.4f,  -0.3f,
+                                     0.1f,  -0.2f, 0.3f,  0.4f,  -0.1f};
+  std::copy(weight_vals, weight_vals + width * unit,
+           weight_tensor.getData<float>());
+  weights.emplace_back(weight_tensor, nntrainer::Tensor(), nntrainer::Tensor(),
+                       "weight");
+
+  nntrainer::Tensor bias_tensor(nntrainer::TensorDim({1, 1, 1, unit}), true);
+  float bias_vals[unit] = {0.05f, -0.1f, 0.15f, -0.05f, 0.1f};
+  std::copy(bias_vals, bias_vals + unit, bias_tensor.getData<float>());
+  weights.emplace_back(bias_tensor, nntrainer::Tensor(), nntrainer::Tensor(),
+                       "bias");
+
+  inputs.emplace_back(init_context.getInputDimensions()[0],
+                      nntrainer::Initializer::NONE, true, true, "input");
+  outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
+                       nntrainer::Initializer::NONE, true, true, "output");
+
+  float x[height * width] = {0.2f,  -0.1f, 0.4f, 0.3f, -0.3f, 0.5f,
+                             -0.2f, 0.1f,  0.6f, -0.4f, 0.2f, -0.5f};
+  std::copy(x, x + height * width, inputs[0].getVariableRef().getData<float>());
+
+  auto run_context =
+    makeRunContext("lm_head_gradcheck", weights, inputs, outputs, tensors);
+
+  float dy[unit] = {0.5f, -0.3f, 0.2f, 0.1f, -0.2f};
+  std::copy(dy, dy + unit, run_context.getOutputGradUnsafe(0).getData<float>());
+
+  layer.forwarding(run_context, true);
+  layer.calcDerivative(run_context);
+
+  std::vector<float> analytic(height * width);
+  std::copy(run_context.getOutgoingDerivative(0).getData<float>(),
+           run_context.getOutgoingDerivative(0).getData<float>() +
+             height * width,
+           analytic.begin());
+
+  auto forward = [&]() -> const float * {
+    layer.forwarding(run_context, true);
+    return run_context.getOutput(0).getData<float>();
+  };
+
+  checkGradient(inputs[0].getVariableRef().getData<float>(), analytic.data(),
+               dy, height * width, unit, forward);
+
+  causallm::g_lm_head_read_row = std::numeric_limits<unsigned int>::max();
+}
+
+TEST(CausalLmLoraBackward,
+    TieWordEmbeddingLmHeadCalcDerivativeMatchesFiniteDifference) {
+  const unsigned int height = 3, width = 4, unit = 5;
+  causallm::g_tie_embedding_lm_head_read_row =
+    1; // simulate a right-padded sample.
+
+  causallm::TieWordEmbedding layer;
+  ASSERT_NO_THROW(layer.setProperty({"unit=" + std::to_string(unit)}));
+  nntrainer::InitLayerContext init_context(
+    {nntrainer::TensorDim({1, 1, height, width})}, {true}, false,
+    "tie_word_embedding_lmhead_gradcheck", "", 0.0f, {"NCHW", "FP32", "FP32"});
+  ASSERT_NO_THROW(layer.finalize(init_context));
+
+  std::vector<nntrainer::Weight> weights;
+  std::vector<nntrainer::Var_Grad> inputs, outputs, tensors;
+
+  // tied weight layout is [vocab=unit, hidden=width] (shared with embedding).
+  nntrainer::Tensor weight_tensor(nntrainer::TensorDim({1, 1, unit, width}),
+                                 true);
+  float weight_vals[unit * width] = {0.1f,  0.2f, -0.3f, 0.4f,  0.5f, -0.2f,
+                                     0.3f,  0.1f, -0.4f, 0.2f,  0.3f, -0.1f,
+                                     0.2f,  0.4f, -0.3f, 0.1f,  -0.2f, 0.3f,
+                                     0.4f, -0.1f};
+  std::copy(weight_vals, weight_vals + unit * width,
+           weight_tensor.getData<float>());
+  weights.emplace_back(weight_tensor, nntrainer::Tensor(), nntrainer::Tensor(),
+                       "weight");
+
+  nntrainer::Tensor bias_tensor(nntrainer::TensorDim({1, 1, 1, unit}), true);
+  float bias_vals[unit] = {0.05f, -0.1f, 0.15f, -0.05f, 0.1f};
+  std::copy(bias_vals, bias_vals + unit, bias_tensor.getData<float>());
+  weights.emplace_back(bias_tensor, nntrainer::Tensor(), nntrainer::Tensor(),
+                       "bias");
+
+  inputs.emplace_back(init_context.getInputDimensions()[0],
+                      nntrainer::Initializer::NONE, true, true, "input");
+  outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
+                       nntrainer::Initializer::NONE, true, true, "output");
+
+  float x[height * width] = {0.2f,  -0.1f, 0.4f, 0.3f, -0.3f, 0.5f,
+                             -0.2f, 0.1f,  0.6f, -0.4f, 0.2f, -0.5f};
+  std::copy(x, x + height * width, inputs[0].getVariableRef().getData<float>());
+
+  auto run_context = makeRunContext("tie_word_embedding_lmhead_gradcheck",
+                                    weights, inputs, outputs, tensors);
+
+  float dy[unit] = {0.5f, -0.3f, 0.2f, 0.1f, -0.2f};
+  std::copy(dy, dy + unit, run_context.getOutputGradUnsafe(0).getData<float>());
+
+  layer.forwarding(run_context, true);
+  layer.calcDerivative(run_context);
+
+  std::vector<float> analytic(height * width);
+  std::copy(run_context.getOutgoingDerivative(0).getData<float>(),
+           run_context.getOutgoingDerivative(0).getData<float>() +
+             height * width,
+           analytic.begin());
+
+  auto forward = [&]() -> const float * {
+    layer.forwarding(run_context, true);
+    return run_context.getOutput(0).getData<float>();
+  };
+
+  checkGradient(inputs[0].getVariableRef().getData<float>(), analytic.data(),
+               dy, height * width, unit, forward);
+
+  causallm::g_tie_embedding_lm_head_read_row =
+    std::numeric_limits<unsigned int>::max();
+}
+
 /**
  * @brief Regression test: nntrainer aliases each outgoing derivative onto its
  *        input's own buffer, so a calcDerivative that writes one output
@@ -439,4 +580,174 @@ TEST(CausalLmLoraBackward,
   };
   checkGradient(rc.getWeight(0).getData<float>(), analytic.data(), dy.data(),
                 feature_size, n, forward);
+}
+
+TEST(CausalLmLoraBackward, LmHeadCalcGradientMatchesFiniteDifference) {
+  const unsigned int height = 3, width = 4, unit = 5;
+  causallm::g_lm_head_read_row = 1; // right-padded: last real token is row 1
+
+  causallm::LmHeadLayer layer;
+  ASSERT_NO_THROW(layer.setProperty(
+    {"unit=" + std::to_string(unit), "disable_bias=true"}));
+  nntrainer::InitLayerContext init_context(
+    {nntrainer::TensorDim({1, 1, height, width})}, {true}, false,
+    "lm_head_gradw", "", 0.0f, {"NCHW", "FP32", "FP32"});
+  ASSERT_NO_THROW(layer.finalize(init_context));
+
+  std::vector<nntrainer::Weight> weights;
+  std::vector<nntrainer::Var_Grad> inputs, outputs, tensors;
+
+  nntrainer::Tensor w_v(nntrainer::TensorDim({1, 1, width, unit}), true);
+  nntrainer::Tensor w_g(nntrainer::TensorDim({1, 1, width, unit}), true);
+  for (unsigned int i = 0; i < width * unit; ++i)
+    w_v.getData<float>()[i] = std::sin(0.4f * i + 0.7f) * 0.3f;
+  w_g.setZero();
+  weights.emplace_back(w_v, w_g, nntrainer::Tensor(), "weight");
+
+  inputs.emplace_back(init_context.getInputDimensions()[0],
+                      nntrainer::Initializer::NONE, true, true, "input");
+  outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
+                       nntrainer::Initializer::NONE, true, true, "output");
+
+  for (unsigned int i = 0; i < height * width; ++i)
+    inputs[0].getVariableRef().getData<float>()[i] =
+      std::sin(0.9f * i + 0.2f) * 0.5f;
+
+  auto rc = makeRunContext("lm_head_gradw", weights, inputs, outputs, tensors);
+  std::vector<float> dy(unit);
+  for (unsigned int j = 0; j < unit; ++j)
+    dy[j] = std::cos(1.1f * j + 0.5f) * 0.6f;
+  std::copy(dy.begin(), dy.end(), rc.getOutputGradUnsafe(0).getData<float>());
+
+  layer.forwarding(rc, true);
+  layer.calcGradient(rc);
+
+  std::vector<float> analytic(rc.getWeightGrad(0).getData<float>(),
+                              rc.getWeightGrad(0).getData<float>() +
+                                width * unit);
+
+  auto forward = [&]() -> const float * {
+    layer.forwarding(rc, true);
+    return rc.getOutput(0).getData<float>();
+  };
+  checkGradient(rc.getWeight(0).getData<float>(), analytic.data(), dy.data(),
+                width * unit, unit, forward);
+
+  causallm::g_lm_head_read_row = std::numeric_limits<unsigned int>::max();
+}
+
+TEST(CausalLmLoraBackward,
+     TieWordEmbeddingLmHeadCalcGradientMatchesFiniteDifference) {
+  const unsigned int height = 3, hidden = 4, vocab = 5;
+  causallm::g_tie_embedding_lm_head_read_row = 1;
+
+  causallm::TieWordEmbedding layer;
+  ASSERT_NO_THROW(layer.setProperty(
+    {"unit=" + std::to_string(vocab), "disable_bias=true"}));
+  nntrainer::InitLayerContext init_context(
+    {nntrainer::TensorDim({1, 1, height, hidden})}, {true}, false,
+    "twe_gradw", "", 0.0f, {"NCHW", "FP32", "FP32"});
+  ASSERT_NO_THROW(layer.finalize(init_context));
+
+  std::vector<nntrainer::Weight> weights;
+  std::vector<nntrainer::Var_Grad> inputs, outputs, tensors;
+
+  nntrainer::Tensor w_v(nntrainer::TensorDim({1, 1, vocab, hidden}), true);
+  nntrainer::Tensor w_g(nntrainer::TensorDim({1, 1, vocab, hidden}), true);
+  for (unsigned int i = 0; i < vocab * hidden; ++i)
+    w_v.getData<float>()[i] = std::sin(0.35f * i + 0.9f) * 0.3f;
+  w_g.setZero();
+  weights.emplace_back(w_v, w_g, nntrainer::Tensor(), "weight");
+
+  inputs.emplace_back(init_context.getInputDimensions()[0],
+                      nntrainer::Initializer::NONE, true, true, "input");
+  outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
+                       nntrainer::Initializer::NONE, true, true, "output");
+
+  for (unsigned int i = 0; i < height * hidden; ++i)
+    inputs[0].getVariableRef().getData<float>()[i] =
+      std::sin(0.75f * i + 0.15f) * 0.5f;
+
+  auto rc = makeRunContext("twe_gradw", weights, inputs, outputs, tensors);
+  std::vector<float> dy(vocab);
+  for (unsigned int v = 0; v < vocab; ++v)
+    dy[v] = std::cos(0.95f * v + 0.25f) * 0.6f;
+  std::copy(dy.begin(), dy.end(), rc.getOutputGradUnsafe(0).getData<float>());
+
+  layer.forwarding(rc, true);
+  layer.calcGradient(rc);
+
+  std::vector<float> analytic(rc.getWeightGrad(0).getData<float>(),
+                              rc.getWeightGrad(0).getData<float>() +
+                                vocab * hidden);
+
+  auto forward = [&]() -> const float * {
+    layer.forwarding(rc, true);
+    return rc.getOutput(0).getData<float>();
+  };
+  checkGradient(rc.getWeight(0).getData<float>(), analytic.data(), dy.data(),
+                vocab * hidden, vocab, forward);
+
+  causallm::g_tie_embedding_lm_head_read_row =
+    std::numeric_limits<unsigned int>::max();
+}
+
+TEST(CausalLmLoraBackward, TieWordEmbeddingEmbeddingModeCalcGradientScatters) {
+  const unsigned int seq_len = 4, hidden = 3, vocab = 6;
+  const float scale = 2.0f;
+
+  causallm::TieWordEmbedding layer;
+  ASSERT_NO_THROW(layer.setProperty({"in_dim=" + std::to_string(vocab),
+                                     "out_dim=" + std::to_string(hidden),
+                                     "scale=" + std::to_string(scale)}));
+  nntrainer::InitLayerContext init_context(
+    {nntrainer::TensorDim({1, 1, 1, seq_len})}, {true}, false, "twe_emb_gradw",
+    "", 0.0f, {"NCHW", "FP32", "FP32"});
+  ASSERT_NO_THROW(layer.finalize(init_context));
+
+  std::vector<nntrainer::Weight> weights;
+  std::vector<nntrainer::Var_Grad> inputs, outputs, tensors;
+
+  nntrainer::Tensor w_v(nntrainer::TensorDim({1, 1, vocab, hidden}), true);
+  nntrainer::Tensor w_g(nntrainer::TensorDim({1, 1, vocab, hidden}), true);
+  w_v.setZero();
+  w_g.setZero();
+  weights.emplace_back(w_v, w_g, nntrainer::Tensor(), "Embedding");
+
+  inputs.emplace_back(init_context.getInputDimensions()[0],
+                      nntrainer::Initializer::NONE, true, true, "input");
+  outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
+                       nntrainer::Initializer::NONE, true, true, "output");
+
+  // ids: 3, 1, 3, 0  -> row 3 receives positions 0 and 2 summed; row 0 gets
+  // the trailing pad position; rows 2,4,5 stay zero.
+  const float ids[seq_len] = {3.0f, 1.0f, 3.0f, 0.0f};
+  std::copy(ids, ids + seq_len, inputs[0].getVariableRef().getData<float>());
+
+  auto rc = makeRunContext("twe_emb_gradw", weights, inputs, outputs, tensors);
+
+  std::vector<float> dy(seq_len * hidden);
+  for (unsigned int i = 0; i < dy.size(); ++i)
+    dy[i] = 0.1f * static_cast<float>(i + 1);
+  std::copy(dy.begin(), dy.end(), rc.getOutputGradUnsafe(0).getData<float>());
+
+  layer.calcGradient(rc);
+
+  const float *dw = rc.getWeightGrad(0).getData<float>();
+  for (unsigned int h = 0; h < hidden; ++h) {
+    // row 3 <- positions 0 and 2
+    EXPECT_NEAR(dw[3 * hidden + h],
+                (dy[0 * hidden + h] + dy[2 * hidden + h]) * scale, 1e-6)
+      << "row 3 (repeated id) must accumulate both positions, h=" << h;
+    // row 1 <- position 1
+    EXPECT_NEAR(dw[1 * hidden + h], dy[1 * hidden + h] * scale, 1e-6)
+      << "row 1, h=" << h;
+    // row 0 <- position 3 (the pad slot)
+    EXPECT_NEAR(dw[0 * hidden + h], dy[3 * hidden + h] * scale, 1e-6)
+      << "row 0, h=" << h;
+    // untouched ids
+    EXPECT_NEAR(dw[2 * hidden + h], 0.0f, 1e-6) << "row 2 must stay zero";
+    EXPECT_NEAR(dw[4 * hidden + h], 0.0f, 1e-6) << "row 4 must stay zero";
+    EXPECT_NEAR(dw[5 * hidden + h], 0.0f, 1e-6) << "row 5 must stay zero";
+  }
 }
