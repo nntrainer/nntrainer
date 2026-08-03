@@ -2055,3 +2055,126 @@ new opcode - the skel already implements `HTP_OP_FLASH_ATTN_EXT` (S29). What it
 needs is a bridge entry point that hand-builds five strided descriptors plus
 `op_params`, a shared causal mask, and the `mha_core` call site. **B is now
 strictly the better path and S29's A recommendation is withdrawn.**
+
+---
+
+## 31. Flash-attn shipped, then regressed at short prompts - it's a crossover, not a bug
+
+Follow-up to S30. `nntr_htp_bridge_flash_attn` (bridge) and the `mha_core.cpp`
+call site (S30's Phase 2) both landed and dispatch correctly - 28 DSP calls per
+prefill pass, one per layer, `verify_flash_attn` passes on-device. But the
+first end-to-end read was a **regression**: a 157-token prompt went from 687.2
+TPS (GEMM offload only) to 555.2 TPS with flash-attn on, a 19.2% loss, against
+a 640.8 TPS CPU-only baseline. Investigated hands-on on R3CX9078DNH, same
+device as S27-S30, using the bridge's existing `NNTR_HTP_BRIDGE_PROF=1`
+per-phase timer (weight/stage/desc/flush/out) plus direct A/B/C runs at
+several prompt lengths.
+
+### First finding: the profiler's own accumulators are shared across op types
+
+`nntr_htp_bridge_get_prof()` returns one process-global singleton, and every
+bridged function (`gemm_q4_0`, `gemm_q4_0_batch`, `flash_attn`) laps into the
+*same* `t_weight/t_stage/t_desc/t_flush/t_out/n` fields and reports on its own
+modulo of that shared `n`. With ~112 GEMM flushes/prefill-pass vastly
+outnumbering 28 flash-attn calls, flash-attn's report (`% 100`) essentially
+never fires on its own boundary, and when it does, the printed averages are
+contaminated by GEMM timings accumulated in between. Worked around for this
+session with a function-local dedicated accumulator; reverted after, since a
+real fix (per-op-type or per-call profiling) is a separate piece of work worth
+doing properly rather than as a diagnostic side-effect.
+
+### Second finding: a silent-fallback footgun independent of the regression
+
+Reproducing needed `NNTR_USE_HEXAGON_CDSP=1` *in addition to*
+`NNTR_HEXAGON_FLASH_ATTN=1` - the former gates whether `KVCacheManager`
+backs the KV cache with rpcmem at all (`kv_cache_manager.cpp:163-164`). Without
+it, every `nntr_htp_bridge_flash_attn` call fails at
+`"K/V not in registered rpcmem pool"` and `mha_core.cpp` silently falls back to
+the CPU path (`ml_logw`, which did not appear in the captured stdout/stderr -
+Android logcat only). Easy to misread as "flash-attn is slow" when it was
+actually never running. Confirmed via the bridge's own `GGML_LOG_ERROR`, which
+*does* reach stderr - that message is the tell if this is ever hit again.
+
+### Measured, with both flags correctly set (3 prompt lengths, same device/session)
+
+Flash-attn's own per-layer cost, from the (session-local) profiler:
+
+| tokens | stage (Q+mask) | desc | **flush (DSP round trip)** | out | total/layer | flush share |
+|---|---|---|---|---|---|---|
+| 18  | 24.8 us | 1.2 us | **187.8 us**  | 3.5 us  | 217.3 us  | 86% |
+| 137 | 39.5 us | 1.8 us | **1572.6 us** | 27.1 us | 1641.1 us | 96% |
+| 203 | 53.8 us | 1.5 us | **1821.3 us** | 42.4 us | 1919.0 us | 95% |
+| 410 | 90.5 us | 1.9 us | **4081.5 us** | 98.5 us | 4272.4 us | 96% |
+
+**This rules out hypothesis 1 (Q staging).** Staging Q + the causal mask is
+2-4% of flash-attn's own cost at every size tested - `stage` grows from 25 to
+90 us/layer across a 23x token-count range, nowhere near enough to explain a
+19% end-to-end regression. `flush` - the FastRPC round trip plus whatever the
+DSP kernel itself does - is 86-96% of it throughout, so hypothesis 2
+(dispatch/DSP compute) is confirmed and hypothesis 1 is dead.
+
+Note also `flush` grows *sub-quadratically* with tokens (10.6x tokens
+18->203, but only 9.7x flush time; 22.8x tokens 18->410, 21.7x flush time) -
+close to linear, well under the O(n^2) an attention op naively implies. Reading
+this together with S29's HMX fast-path note (`head_dim%64==0`), the systolic
+array is evidently fast enough that FLOPs are not the bottleneck here - the
+wall-clock cost is dominated by data movement (Q/K/V/mask over FastRPC) plus a
+mostly-fixed per-call latency, both closer to O(n) than O(n^2).
+
+### Direct A/B/C comparison, same device/session, same prompt scaled to 3 lengths
+
+| tokens | A: CPU-only prefill TPS | B: Hexagon GEMM-only TPS | C: Hexagon + flash-attn TPS | C vs B |
+|---|---|---|---|---|
+| 137 | 646.2 | 756.9  | 732.6   | **-3.3%** |
+| 203 | -     | 910.3  | 971.3   | **+6.7%** |
+| 410 | 571.8 | 823.3  | **1216.6** | **+47.8%** |
+
+This is the crossover the CPU-side attention math already predicted (S28/S29:
+attention is O(n^2), the DSP round trip is closer to O(n) + a fixed latency
+floor) - it just hadn't been checked end-to-end with flash-attn actually
+wired up. **The regression reported at 157 tokens is this same effect, not a
+bug**: at that length flash-attn's per-layer round trip (~1.5-1.8 ms measured
+at 137-203 tokens) is not yet amortized by the quadratic CPU cost it replaces.
+By 410 tokens it wins by a wide margin - 1216.6 TPS *exceeds* the S28
+ggml-hexagon reference ratio scaled to this prompt length, which is the first
+time this project's prefill has beaten that comparison point on an
+attention-inclusive measurement.
+
+Crossover falls between 137 (small loss) and 203 tokens (clear win) - close to,
+but a separate measurement from, the ~215-token GEMM compute-bound crossover
+established in S10. Coincidental in mechanism (that one is about DSP GEMM
+throughput vs. dispatch count; this one is about DSP flash-attn round trip vs.
+CPU O(n^2) attention cost) but landing in a similar range on the same chip.
+
+### Fix applied: gate flash-attn on `step_size`, not just prefill-ness
+
+One-line-scoped change in `should_use_flash_attn()`
+(`Applications/CausalLM/layers/mha_core.cpp`): reject if
+`step_size < NNTR_HEXAGON_FLASH_ATTN_MIN_TOKENS` (default 160, the midpoint of
+the measured 137-loss/203-win bracket), falling back to the existing CPU path
+below that. Verified on-device after rebuild: a 137-token prompt now shows 0
+flash-attn calls and 810.7 TPS (no regression, same ballpark as GEMM-only); a
+410-token prompt still shows 28 calls and 1223.9 TPS (the win is preserved).
+Threshold is env-overridable for re-measurement on other devices/models - the
+crossover point is a property of this chip's FastRPC latency and HMX
+throughput vs. this CPU's attention kernel, not a universal constant.
+
+### What's still open
+
+- The profiler-sharing issue (finding 1) is real but wasn't fixed permanently
+  this session - only worked around locally to get clean per-op numbers.
+  Worth doing properly (either a profiler instance per bridge function, or an
+  explicit op-type tag on the shared one) before the next round-trip-reduction
+  push, since it will misattribute cost across op types otherwise.
+- The silent-fallback footgun (finding 2) suggests `mha_core.cpp`'s
+  `ml_logw` on `rc != 0` should also go to stderr (or the gate should log
+  loudly) - right now a misconfigured run *looks* like a working-but-slow
+  flash-attn path instead of a not-running one.
+- The remaining lever flagged in S28/HEXAGON_PROFILING_ANALYSIS.md - batching
+  multiple layers' (or the whole graph's) ops into one flush - still applies:
+  it would lower the crossover point itself by cutting the fixed per-call
+  latency that dominates `flush` at low token counts, which is exactly what
+  separates this project's per-layer-flush architecture from ggml-hexagon's
+  single-flush whole-graph offload (see HEXAGON_PROFILING_ANALYSIS.md §3B).
+  Not attempted here - it is the structural fix, not a targeted one, and the
+  token-count gate above resolves the immediate regression without it.
