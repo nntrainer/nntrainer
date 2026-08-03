@@ -18,6 +18,7 @@
  * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
  * @author	Anirudh Bocha <b.saianirud@samsung.com>
+ * @author	Pranjal Thapliyal <p.thapliyal@samsung.com>
  * @bug		No known bugs except for NYI items
  *
  */
@@ -31,7 +32,10 @@
 #include <node_exporter.h>
 #include <util_func.h>
 
+#include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <numeric>
 
 namespace nntrainer {
 
@@ -40,13 +44,106 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 enum FCParams { weight, bias };
 enum LORAParams { loraA, loraB, loraTmp, loraOut };
 
+std::mutex FullyConnectedLayer::s_registry_mutex;
+std::unordered_map<std::string, FullyConnectedLayer::LoRAQATStats>
+  FullyConnectedLayer::s_qat_registry;
+std::unordered_map<std::string,
+                   std::pair<std::vector<float>, std::vector<float>>>
+  FullyConnectedLayer::s_block_d_registry;
+
 FullyConnectedLayer::FullyConnectedLayer() :
   LayerImpl(),
   lora_scaling(1.0f),
-  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha()),
+  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha(),
+          props::LoraQAT(), props::LoraWeightQ4()),
   quantizer(nullptr) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   lora_idx.fill(std::numeric_limits<unsigned>::max());
+}
+
+// Per-block Q4_0 fake-quantization with EMA block scales tracked in N x K
+// layout.
+//
+// Blocks are defined in N x K layout (the transposed layout the Q4_0 GEMM
+// kernel and build_q4_0_forced_blocks both use at save time), so the EMA
+// scales computed here line up exactly with the blocks force-fed at save
+// time.
+//
+// Training:   compute a fresh per-block scale, bootstrap the EMA on first
+//             use, then update block_d[b] = (1-m)*block_d[b] + m*d_fresh,
+//             and quantize with the updated EMA scale.
+// Validation: quantize with the current EMA scale without updating it.
+// STE:        the caller (calcDerivative/calcGradient) treats the round in
+//             this function as the identity for gradient purposes; this
+//             function itself only computes the forward value.
+Tensor FullyConnectedLayer::fakeQuantizeQ4_0(const Tensor &x,
+                                             std::vector<float> &block_d,
+                                             bool training) {
+  // x is stored K x N in nntrainer (height=K, width=N).
+  const size_t K = x.getDim().height();
+  const size_t N = x.getDim().width();
+  const size_t num_blocks_NK = (K * N) / 32;
+
+  if (block_d.empty())
+    block_d.resize(num_blocks_NK, 0.0f);
+
+  // Compute fresh per-block scales in N x K layout.
+  // For N x K linear index nk = b*32+j: n = nk/K, k = nk%K -> K x N index =
+  // k*N+n.
+  for (size_t b = 0; b < num_blocks_NK; ++b) {
+    float max_abs = 0.0f;
+    for (size_t j = 0; j < 32; ++j) {
+      const size_t nk = b * 32 + j;
+      const size_t n = nk / K;
+      const size_t k = nk % K;
+      max_abs = std::max(max_abs, std::abs(x.getValue<float>(k * N + n)));
+    }
+    const float d_fresh = (max_abs > 1e-8f) ? max_abs / 8.0f : 0.0f;
+    if (training) {
+      if (block_d[b] < 1e-10f)
+        block_d[b] = d_fresh;
+      else
+        block_d[b] = (1.0f - momentum) * block_d[b] + momentum * d_fresh;
+    }
+  }
+
+  // Apply fake-quant iterating K x N order; map each element to its N x K
+  // block. apply() iterates K x N linearly: index i = k*N + n -> k = i/N,
+  // n = i%N -> N x K index nk = n*K + k -> block = nk/32.
+  Tensor x_fq = x.clone();
+  size_t i = 0;
+  std::function<float(float)> fn = [&i, K, N, &block_d](float v) -> float {
+    const size_t k = i / N;
+    const size_t n = i % N;
+    const size_t b = (n * K + k) / 32;
+    ++i;
+    const float d = block_d[b];
+    if (d < 1e-10f)
+      return v;
+    float q = std::round(v / d);
+    q = std::max(-8.0f, std::min(7.0f, q));
+    return q * d;
+  };
+  x_fq.apply<float>(fn, x_fq);
+  return x_fq;
+}
+
+FullyConnectedLayer::LoRAQATStats
+FullyConnectedLayer::getRegisteredStats(const std::string &layer_name) {
+  std::lock_guard<std::mutex> lock(s_registry_mutex);
+  auto it = s_qat_registry.find(layer_name);
+  if (it != s_qat_registry.end())
+    return it->second;
+  return {};
+}
+
+std::pair<std::vector<float>, std::vector<float>>
+FullyConnectedLayer::getRegisteredBlockScales(const std::string &layer_name) {
+  std::lock_guard<std::mutex> lock(s_registry_mutex);
+  auto it = s_block_d_registry.find(layer_name);
+  if (it != s_block_d_registry.end())
+    return it->second;
+  return {};
 }
 
 void FullyConnectedLayer::finalize(InitLayerContext &context) {
@@ -134,18 +231,31 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   /** create weights for LoRA */
   if (lora_rank) {
 
+    const bool lora_qat_mode = !std::get<props::LoraQAT>(fc_props).empty() &&
+                               std::get<props::LoraQAT>(fc_props).get();
+    const bool lora_q4 = !std::get<props::LoraWeightQ4>(fc_props).empty() &&
+                        std::get<props::LoraWeightQ4>(fc_props).get();
+    // Inference-only Q4_0 adapter (no QAT): register loraA/loraB as real
+    // Q4_0 tensors so the W4A8 GEMM kernel fires at runtime. Otherwise
+    // (plain FP32 training, or QAT training, which needs FP32 gradients and
+    // fake-quantizes in forwarding/calcDerivative/calcGradient instead),
+    // keep them in the base weight's dtype.
+    const bool use_q4_tensors = lora_q4 && !lora_qat_mode;
+    const auto lora_dtype = use_q4_tensors ? TensorDim::DataType::Q4_0
+                                           : context.getWeightDataType();
+
     /** loraA Dimension : (1, 1, in_dim.width, lora_rank) */
     TensorDim loraA_dim(
       1, is_nchw ? 1 : lora_rank, is_nchw ? in_dim.width() : 1,
       is_nchw ? lora_rank : in_dim.channel(),
-      TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
+      TensorDim::TensorType(context.getFormat(), lora_dtype),
       is_nchw ? 0b0011 : 0b0101);
 
     /** loraB Dimension : (1, 1, lora_rank, unit) */
     TensorDim loraB_dim(
       1, is_nchw ? 1 : unit, is_nchw ? lora_rank : 1,
       is_nchw ? unit : lora_rank,
-      TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
+      TensorDim::TensorType(context.getFormat(), lora_dtype),
       is_nchw ? 0b0011 : 0b0101);
 
     /** loraTmp Dimension : (B, 1, in_dim.height(), lora_rank) */
@@ -175,14 +285,24 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
      * entirely by the *random* B, so the initial step is a large step in an
      * arbitrary direction. Empirically that made training diverge above
      * lr ~1e-6 on Qwen3-0.6B, whereas this ordering is stable at 1e-4.
+     *
+     * When loraA/loraB are registered as real Q4_0 tensors (inference-only,
+     * see use_q4_tensors above), there is nothing to initialize randomly:
+     * the values come from the saved adapter file, so use NONE and mark
+     * them non-trainable.
      */
+    const Initializer loraA_init =
+      use_q4_tensors ? Initializer::NONE : Initializer::LECUN_NORMAL;
+    const Initializer loraB_init =
+      use_q4_tensors ? Initializer::NONE : Initializer::ZEROS;
+
     lora_idx[LORAParams::loraA] = context.requestWeight(
-      loraA_dim, Initializer::LECUN_NORMAL, weight_regularizer,
-      weight_regularizer_constant, weight_decay, "loraA", true);
+      loraA_dim, loraA_init, weight_regularizer, weight_regularizer_constant,
+      weight_decay, "loraA", !use_q4_tensors);
 
     lora_idx[LORAParams::loraB] = context.requestWeight(
-      loraB_dim, Initializer::ZEROS, weight_regularizer,
-      weight_regularizer_constant, weight_decay, "loraB", true);
+      loraB_dim, loraB_init, weight_regularizer, weight_regularizer_constant,
+      weight_decay, "loraB", !use_q4_tensors);
 
     lora_idx[LORAParams::loraTmp] =
       context.requestTensor(loraTmp_dim, "hidden_tmp_lora", Initializer::NONE,
@@ -191,6 +311,9 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
     lora_idx[LORAParams::loraOut] =
       context.requestTensor(loraOut_dim, "hidden_lora", Initializer::NONE, true,
                             TensorLifespan::FORWARD_FUNC_LIFESPAN);
+
+    if (lora_qat_mode)
+      layer_name_ = context.getName();
   }
 
   ///@todo this quantizaer should be moved to tensor, not layer!
@@ -254,8 +377,39 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
     Tensor &hidden_tmp_lora = context.getTensor(lora_idx[LORAParams::loraTmp]);
     Tensor &hidden_out_lora = context.getTensor(lora_idx[LORAParams::loraOut]);
 
-    input_.dot(loraA, hidden_tmp_lora, false, false);
-    hidden_tmp_lora.dot(loraB, hidden_out_lora, false, false);
+    const bool lora_qat = !std::get<props::LoraQAT>(fc_props).empty() &&
+                         std::get<props::LoraQAT>(fc_props).get();
+    if (lora_qat) {
+      // Per-block EMA fake-quant: training updates the EMA, validation
+      // reads it without updating.
+      a_fq = fakeQuantizeQ4_0(loraA, lora_a_block_d, training);
+      b_fq = fakeQuantizeQ4_0(loraB, lora_b_block_d, training);
+
+      // Publish the current calibration to the registries so the
+      // Application layer can force-feed these scales at save time.
+      if (!lora_a_block_d.empty() && !lora_b_block_d.empty()) {
+        LoRAQATStats s;
+        s.a_min = loraA.minValue();
+        s.a_max = loraA.maxValue();
+        s.a_scale = std::accumulate(lora_a_block_d.begin(),
+                                    lora_a_block_d.end(), 0.0f) /
+                   static_cast<float>(lora_a_block_d.size());
+        s.b_min = loraB.minValue();
+        s.b_max = loraB.maxValue();
+        s.b_scale = std::accumulate(lora_b_block_d.begin(),
+                                    lora_b_block_d.end(), 0.0f) /
+                   static_cast<float>(lora_b_block_d.size());
+        s.valid = true;
+        std::lock_guard<std::mutex> lk(s_registry_mutex);
+        s_qat_registry[layer_name_] = s;
+        s_block_d_registry[layer_name_] = {lora_a_block_d, lora_b_block_d};
+      }
+      input_.dot(a_fq, hidden_tmp_lora, false, false);
+      hidden_tmp_lora.dot(b_fq, hidden_out_lora, false, false);
+    } else {
+      input_.dot(loraA, hidden_tmp_lora, false, false);
+      hidden_tmp_lora.dot(loraB, hidden_out_lora, false, false);
+    }
     hidden_out_lora.multiply_i(lora_scaling);
     hidden_.add_i(hidden_out_lora);
   }
@@ -367,10 +521,19 @@ void FullyConnectedLayer::calcDerivative(RunLayerContext &context) {
   Tensor &ret_ = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
 
   if (!std::get<props::LoraRank>(fc_props).empty()) {
-    Tensor &lora_A = context.getWeight(lora_idx[LORAParams::loraA]);
-    Tensor &lora_B = context.getWeight(lora_idx[LORAParams::loraB]);
-    ret_.dot_deriv_wrt_1(weight.add(lora_A.dot(lora_B).multiply(lora_scaling)),
-                         derivative_, false, false);
+    const bool lora_qat_deriv = !std::get<props::LoraQAT>(fc_props).empty() &&
+                               std::get<props::LoraQAT>(fc_props).get();
+    Tensor lora_contrib;
+    if (lora_qat_deriv) {
+      // Straight-through estimator: dL/dx uses the same fake-quantized
+      // a_fq/b_fq the forward pass used, not the raw (unquantized) weights.
+      lora_contrib = a_fq.dot(b_fq).multiply(lora_scaling);
+    } else {
+      Tensor &lora_A = context.getWeight(lora_idx[LORAParams::loraA]);
+      Tensor &lora_B = context.getWeight(lora_idx[LORAParams::loraB]);
+      lora_contrib = lora_A.dot(lora_B).multiply(lora_scaling);
+    }
+    ret_.dot_deriv_wrt_1(weight.add(lora_contrib), derivative_, false, false);
   } else {
     ret_.dot_deriv_wrt_1(weight, derivative_, false, false);
   }
@@ -411,7 +574,6 @@ void FullyConnectedLayer::calcGradient(RunLayerContext &context) {
 
     const Tensor &derivative_ = context.getIncomingDerivative(SINGLE_INOUT_IDX);
     Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-    Tensor &loraA = context.getWeight(lora_idx[LORAParams::loraA]);
     Tensor &loraB = context.getWeight(lora_idx[LORAParams::loraB]);
     Tensor &loraTmp = context.getTensor(lora_idx[LORAParams::loraTmp]);
     const auto &lora_derivative_ = derivative_.multiply(lora_scaling);
@@ -419,9 +581,20 @@ void FullyConnectedLayer::calcGradient(RunLayerContext &context) {
     loraTmp.dot_deriv_wrt_2(
       djdlb, lora_derivative_, false, false,
       !context.isGradientFirstAccess(lora_idx[LORAParams::loraB]));
-    djdtmp.dot_deriv_wrt_1(
-      loraB, lora_derivative_, false, false,
-      !context.isGradientFirstAccess(lora_idx[LORAParams::loraTmp]));
+
+    const bool lora_qat_grad = !std::get<props::LoraQAT>(fc_props).empty() &&
+                              std::get<props::LoraQAT>(fc_props).get();
+    if (lora_qat_grad) {
+      // Straight-through estimator: dL/d(loraTmp) uses b_fq (the same
+      // fake-quantized loraB the forward pass used), not the raw loraB.
+      djdtmp.dot_deriv_wrt_1(
+        b_fq, lora_derivative_, false, false,
+        !context.isGradientFirstAccess(lora_idx[LORAParams::loraTmp]));
+    } else {
+      djdtmp.dot_deriv_wrt_1(
+        loraB, lora_derivative_, false, false,
+        !context.isGradientFirstAccess(lora_idx[LORAParams::loraTmp]));
+    }
     input_.dot_deriv_wrt_2(
       djdla, djdtmp, false, false,
       !context.isGradientFirstAccess(lora_idx[LORAParams::loraA]));
