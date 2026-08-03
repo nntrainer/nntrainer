@@ -172,9 +172,9 @@ cd "$SCRIPT_DIR/jni"
 # Clean previous builds
 rm -rf libs obj
 
-log_info "Building with ndk-build (builds causallm_core, nntrainer_causallm, nntr_quantize, nntr_safetensors_info)..."
+log_info "Building with ndk-build (builds causallm_core, nntrainer_causallm, nntr_lora_train, nntr_quantize, nntr_safetensors_info)..."
 # We explicitly set paths to ensure outputs are predictable
-if ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk causallm_core nntrainer_causallm  nntr_quantize nntr_safetensors_info -j $(nproc); then
+if ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk causallm_core nntrainer_causallm nntr_lora_train nntr_quantize nntr_safetensors_info -j $(nproc); then
     log_success "Build completed successfully"
 else
     log_error "Build failed"
@@ -186,6 +186,7 @@ log_info "Build artifacts:"
 
 check_artifact "libcausallm_core.so" || exit 1
 check_artifact "nntrainer_causallm" || exit 1
+check_artifact "nntr_lora_train" || exit 1
 check_artifact "nntr_quantize" || exit 1
 check_artifact "nntr_safetensors_info" || exit 1
 
@@ -194,7 +195,7 @@ log_header "Build Summary"
 log_success "Build completed successfully!"
 log_info "Output files are in: $SCRIPT_DIR/jni/libs/arm64-v8a/"
 log_info "Executables:"
-log_info "  - nntrainer_causallm (main application), nntr_quantize, nntr_safetensors_info"
+log_info "  - nntrainer_causallm (main application), nntr_lora_train (LoRA fine-tuning), nntr_quantize, nntr_safetensors_info"
 log_info "Libraries:"
 log_info "  - libcausallm_core.so (CausalLM Core library)"
 log_info "  - libnntrainer.so (nntrainer library)"

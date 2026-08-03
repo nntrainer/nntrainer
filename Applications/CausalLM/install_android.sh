@@ -63,6 +63,7 @@ log_success "Device connected: $DEVICE_ID"
 log_step "2/3" "Check build artifacts"
 REQUIRED_FILES=(
     "$SCRIPT_DIR/jni/libs/arm64-v8a/nntrainer_causallm"
+    "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_lora_train"
     "$SCRIPT_DIR/jni/libs/arm64-v8a/libcausallm_core.so"
     "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize"
     "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_safetensors_info"
@@ -167,6 +168,11 @@ if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
 fi
 
 
+log_info "Pushing nntr_lora_train..."
+adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_lora_train" "$INSTALL_DIR/" 2>&1 | tail -1
+adb shell "chmod 755 $INSTALL_DIR/nntr_lora_train"
+log_success "nntr_lora_train pushed"
+
 log_info "Pushing nntr_quantize..."
 adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" "$INSTALL_DIR/" 2>&1 | tail -1
 adb shell "chmod 755 $INSTALL_DIR/nntr_quantize"
@@ -231,6 +237,18 @@ cd $INSTALL_DIR
 EOF"
 
 adb shell "chmod 755 $INSTALL_DIR/run_safetensors_info.sh"
+
+# Create LoRA training run script on device
+adb shell "cat > $INSTALL_DIR/run_lora_train.sh << 'EOF'
+#!/system/bin/sh
+export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+export NNTR_NUM_THREADS=4
+cd $INSTALL_DIR
+./nntr_lora_train \$@
+EOF"
+
+adb shell "chmod 755 $INSTALL_DIR/run_lora_train.sh"
+
 # Create test script on device if API lib exists
 if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     adb shell "cat > $INSTALL_DIR/run_test_api.sh << 'EOF'
@@ -253,6 +271,7 @@ log_info "Device: $DEVICE_ID"
 log_info "Install directory: $INSTALL_DIR"
 log_info "Installed files:"
 log_info "  - nntrainer_causallm (executable)"
+log_info "  - nntr_lora_train (LoRA fine-tuning executable)"
 if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     log_info "  - test_api (executable)"
 fi
@@ -272,6 +291,10 @@ log_info "   adb shell $INSTALL_DIR/run_causallm.sh $MODEL_DIR/qwen3-4b"
 log_info ""
 log_info "(optional) Run quantization:"
 log_info "  adb shell $INSTALL_DIR/run_quantize.sh $MODEL_DIR/qwen3-4b --fc_dtype Q4_0"
+log_info ""
+log_info "To run LoRA fine-tuning on device:"
+log_info "  adb push res/train_data/lamp3_user_train.txt $MODEL_DIR/"
+log_info "  adb shell $INSTALL_DIR/run_lora_train.sh $MODEL_DIR/qwen3-0.6b $MODEL_DIR/lamp3_user_train.txt --lr 1e-4 --epochs 20 --seq_len 192 --lora_rank 8 --output $MODEL_DIR/lora_adapter.bin"
 log_info ""
 log_info "For interactive shell:"
 log_info "   adb shell"
