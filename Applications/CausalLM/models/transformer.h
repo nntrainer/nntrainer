@@ -9,6 +9,7 @@
  * @author Eunju Yang <ej.yang@samsung.com>
  * @author Pranjal Thapliyal <p.thapliyal@samsung.com>
  * @author Sumon Nath <sumon.nath@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  * @note   This transformer.h constructs a class for Transformer model which can
  * be a parent of CausalLM and Encoder models with transformer structure.
@@ -505,6 +506,18 @@ protected:
    *  weights (not per layer) — so flagging every adapter yields standard
    *  global-norm clipping over the whole adapter. */
   float LORA_CLIP_GRAD = 0.0f;
+
+  /** Enable per-block Q4_0 QAT (fake-quant + EMA calibration + STE) on
+   *  loraA/loraB, from nntr_cfg's "lora_qat". Default false trains the
+   *  adapters in plain FP32. */
+  bool LORA_QAT = false;
+
+  /** Store/load LoRA adapters as real Q4_0 tensors, from nntr_cfg's
+   *  "lora_weight_q4". Combined with LORA_QAT, the adapters are
+   *  fake-quantized (with EMA-calibrated scales) during training and can be
+   *  saved/loaded as Q4_0 so the W4A8 GEMM kernel fires at inference.
+   *  Requires lora_rank to be a multiple of 32. */
+  bool LORA_WEIGHT_Q4 = false;
 
   /** When true, the RMSNorm layers stay trainable even though LoRA is
    *  active, i.e. the "LoRA + norms" recipe. This is what exercises the
