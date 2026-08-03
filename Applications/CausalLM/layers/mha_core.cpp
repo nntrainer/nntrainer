@@ -30,12 +30,124 @@ static std::mutex rope_init_mtx;
 #include <util_func.h>
 
 #include <cstdint>
+#include <dlfcn.h>
 
 inline float convert_scalar(uint16_t h) {
   return nntrainer::compute_fp16_to_fp32(h);
 }
 
 namespace causallm {
+
+namespace {
+/**
+ * @brief Flash attention bridge function type.
+ * Dispatches Q/K/V/mask to DSP via nntr_htp_bridge_flash_attn.
+ */
+using flash_attn_fn = int (*)(const void *, const void *, const void *,
+                              const void *, void *, unsigned int, unsigned int,
+                              unsigned int, unsigned int, unsigned int, float,
+                              int, int);
+
+/**
+ * @brief Lazily dlopen libggml-hexagon.so and dlsym nntr_htp_bridge_flash_attn.
+ * Cached for process lifetime - same pattern as hexagon_compute_ops.cpp.
+ */
+flash_attn_fn get_flash_attn_bridge() {
+  static flash_attn_fn fn = []() -> flash_attn_fn {
+    fprintf(stderr, "[FLASH_ATTN] attempting dlopen(libggml-hexagon.so)\n");
+    void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+      const char *err = dlerror();
+      fprintf(stderr, "[FLASH_ATTN] dlopen FAILED: %s\n", err);
+      ml_logw("MHACore: dlopen(libggml-hexagon.so) failed: %s "
+              "(flash attention disabled, using CPU path)",
+              err);
+      return nullptr;
+    }
+    fprintf(stderr, "[FLASH_ATTN] dlopen SUCCESS, handle=%p\n", handle);
+
+    fprintf(stderr, "[FLASH_ATTN] attempting dlsym(handle, nntr_htp_bridge_flash_attn)\n");
+    void *s = dlsym(handle, "nntr_htp_bridge_flash_attn");
+    if (!s) {
+      const char *err = dlerror();
+      fprintf(stderr, "[FLASH_ATTN] dlsym FAILED: %s\n", err);
+      ml_logw("MHACore: dlsym(nntr_htp_bridge_flash_attn) failed: %s "
+              "(flash attention disabled, using CPU path)",
+              err);
+      return nullptr;
+    }
+    fprintf(stderr, "[FLASH_ATTN] dlsym SUCCESS, function ptr=%p\n", s);
+
+    fprintf(stderr, "[FLASH_ATTN] bridge loaded successfully\n");
+    ml_logi("MHACore: flash attention bridge loaded successfully");
+    return reinterpret_cast<flash_attn_fn>(s);
+  }();
+  return fn;
+}
+
+/**
+ * @brief Check if flash attention should be used.
+ * Only enabled for prefill (step_size > 1) with head_dim=128 (HMX fast path).
+ */
+bool should_use_flash_attn(unsigned int step_size, unsigned int head_dim,
+                           bool is_prefill) {
+  static const char *env = std::getenv("NNTR_HEXAGON_FLASH_ATTN");
+  bool enabled = (env && std::atoi(env) == 1);
+
+  if (!enabled) {
+    fprintf(stderr, "[FLASH_ATTN] gate: env not set or not 1\n");
+    return false;
+  }
+  fprintf(stderr, "[FLASH_ATTN] gate: enabled=true, step_size=%u head_dim=%u is_prefill=%d\n",
+          step_size, head_dim, (int)is_prefill);
+
+  if (!is_prefill || step_size <= 1) {
+    fprintf(stderr, "[FLASH_ATTN] gate: REJECT (not prefill or step_size<=1)\n");
+    return false;
+  }
+
+  // Below this, the per-layer FastRPC round trip (~1.6-1.8ms/layer measured
+  // on S25/HTP79 at 137-203 tokens, see HEXAGON_NPU_OBSERVATION_LOG.md S31)
+  // is not amortized by the O(step_size^2) CPU attention cost it replaces:
+  // measured net loss below ~150 tokens, net win from ~200 tokens on.
+  // Overridable for re-measurement on other devices/models.
+  static const char *min_tok_env = std::getenv("NNTR_HEXAGON_FLASH_ATTN_MIN_TOKENS");
+  static const unsigned int min_tokens = min_tok_env ? (unsigned int)std::atoi(min_tok_env) : 160;
+  if (step_size < min_tokens) {
+    fprintf(stderr, "[FLASH_ATTN] gate: REJECT (step_size=%u < min_tokens=%u, below measured crossover)\n",
+            step_size, min_tokens);
+    return false;
+  }
+
+  if (head_dim != 128) {
+    fprintf(stderr, "[FLASH_ATTN] gate: REJECT (head_dim=%u != 128)\n", head_dim);
+    return false;
+  }
+
+  fprintf(stderr, "[FLASH_ATTN] gate: ACCEPT, loading bridge...\n");
+  const flash_attn_fn &fn = get_flash_attn_bridge();
+  bool result = (fn != nullptr);
+  fprintf(stderr, "[FLASH_ATTN] gate: bridge=%p, result=%d\n", fn, (int)result);
+  return result;
+}
+
+/**
+ * @brief Build causal mask for flash attention.
+ * mask[i][j] = 0 if j < cache_from + i + 1, else -INF (0xFC00).
+ * Layout: [n_tokens, n_kv] F16, row-major.
+ */
+void build_causal_mask(std::vector<uint16_t> &mask, unsigned int n_tokens,
+                       unsigned int n_kv, unsigned int cache_from) {
+  mask.resize(n_tokens * n_kv);
+  for (unsigned int i = 0; i < n_tokens; ++i) {
+    const unsigned int valid_to = cache_from + i + 1;
+    for (unsigned int j = 0; j < n_kv; ++j) {
+      mask[i * n_kv + j] = (j < valid_to) ? 0x0000 : 0xFC00;
+    }
+  }
+}
+
+} // namespace
 
 #define tile_size 4
 
@@ -771,14 +883,44 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
-  compute_kcaches(query_step, b_cached_key, out_, cache_from,
-                  cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
+  // Try flash attention dispatch (DSP offload) for prefill
+  bool use_flash = should_use_flash_attn(step_size, head_dim, is_prefill);
 
-  softmax_triangle(out_, step_size, num_heads_Q, cache_from);
+  if (use_flash) {
+    // Build causal mask: [step_size, cache_to] F16
+    std::vector<uint16_t> mask;
+    build_causal_mask(mask, step_size, cache_to, cache_from);
 
-  compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
-                                cache_from, num_heads_KV, gqa_size, head_dim,
-                                cache_to);
+    // Determine Q/out dtype - FP16 is the common case for CausalLM
+    bool q_is_fp16 = (query_step.getDataType() ==
+                      ml::train::TensorDim::DataType::FP16);
+    bool out_is_fp16 = (attention_output_step.getDataType() ==
+                        ml::train::TensorDim::DataType::FP16);
+
+    const flash_attn_fn &fn = get_flash_attn_bridge();
+    int rc = fn(query_step.getData(), b_cached_key.getData(),
+                b_cached_value.getData(), mask.data(),
+                attention_output_step.getData(), step_size, num_heads_Q,
+                num_heads_KV, head_dim, cache_to,
+                1.0f / sqrtf((float)head_dim), q_is_fp16, out_is_fp16);
+
+    if (rc != 0) {
+      ml_logw("MHACore: flash_attn returned %d, falling back to CPU", rc);
+      use_flash = false;
+    }
+  }
+
+  if (!use_flash) {
+    // Original CPU path
+    compute_kcaches(query_step, b_cached_key, out_, cache_from,
+                    cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
+
+    softmax_triangle(out_, step_size, num_heads_Q, cache_from);
+
+    compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
+                                  cache_from, num_heads_KV, gqa_size, head_dim,
+                                  cache_to);
+  }
 }
 
 void MHACoreLayer::one_batch_incremental_forwarding(
