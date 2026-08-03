@@ -30,6 +30,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <quantizer.h>
 #include <util_func.h>
 
 #include <algorithm>
@@ -240,9 +241,12 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
     // (plain FP32 training, or QAT training, which needs FP32 gradients and
     // fake-quantizes in forwarding/calcDerivative/calcGradient instead),
     // keep them in the base weight's dtype.
+    // LoRA adapters are always FP32 for training (gradients need full
+    // precision). Only inference-only Q4_0 adapters (lora_q4 && !QAT)
+    // use Q4_0 dtype so the W4A8 GEMM kernel fires at runtime.
     const bool use_q4_tensors = lora_q4 && !lora_qat_mode;
     const auto lora_dtype = use_q4_tensors ? TensorDim::DataType::Q4_0
-                                           : context.getWeightDataType();
+                                           : TensorDim::DataType::FP32;
 
     /** loraA Dimension : (1, 1, in_dim.width, lora_rank) */
     TensorDim loraA_dim(
@@ -521,6 +525,24 @@ void FullyConnectedLayer::calcDerivative(RunLayerContext &context) {
   Tensor &ret_ = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
 
   if (!std::get<props::LoraRank>(fc_props).empty()) {
+    // Dequantize the base weight to FP32 if it is stored in a quantized
+    // format (Q4_0 / Q6_K). The backward pass needs FP32 to compute
+    // gradients correctly; the base weight is frozen during LoRA training,
+    // so this dequantization is exact and has no gradient through it.
+    Tensor w_fp32;
+    using DT = TensorDim::DataType;
+    if (quantizer != nullptr) {
+      w_fp32 = quantizer->dequantize(weight, DT::FP32);
+    } else if (weight.getDataType() == DT::Q4_0) {
+      auto dq = Quantization::createQuantizer(nntrainer::QScheme::Q4_0);
+      w_fp32 = dq->dequantize(weight, DT::FP32);
+    } else if (weight.getDataType() == DT::Q6_K) {
+      auto dq = Quantization::createQuantizer(nntrainer::QScheme::Q6_K);
+      w_fp32 = dq->dequantize(weight, DT::FP32);
+    } else {
+      w_fp32 = weight;
+    }
+
     const bool lora_qat_deriv = !std::get<props::LoraQAT>(fc_props).empty() &&
                                std::get<props::LoraQAT>(fc_props).get();
     Tensor lora_contrib;
@@ -533,7 +555,7 @@ void FullyConnectedLayer::calcDerivative(RunLayerContext &context) {
       Tensor &lora_B = context.getWeight(lora_idx[LORAParams::loraB]);
       lora_contrib = lora_A.dot(lora_B).multiply(lora_scaling);
     }
-    ret_.dot_deriv_wrt_1(weight.add(lora_contrib), derivative_, false, false);
+    ret_.dot_deriv_wrt_1(w_fp32.add(lora_contrib), derivative_, false, false);
   } else {
     ret_.dot_deriv_wrt_1(weight, derivative_, false, false);
   }

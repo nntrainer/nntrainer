@@ -381,13 +381,6 @@ void Transformer::load_weight_lora(const std::string &base_path,
   // Step 1: build a throwaway copy of the graph that is byte-for-byte the
   // graph the checkpoint was written from, and load the base checkpoint into
   // it with the ordinary (already-correct) loader.
-  //
-  // This must match the *inference* topology exactly, not just be LoRA-free:
-  // NeuralNetwork::load() walks the graph in sorted order and hands each
-  // weight a sequential file offset, so any change to the node set shifts
-  // every subsequent offset. In particular FOR_TRAINING must be off here,
-  // otherwise createAttention() omits the per-layer KV-cache `input`
-  // placeholder nodes and the weights silently load into the wrong layers.
   const unsigned int saved_lora_rank = LORA_RANK;
   const bool saved_for_training = FOR_TRAINING;
   LORA_RANK = 0;
@@ -403,7 +396,6 @@ void Transformer::load_weight_lora(const std::string &base_path,
     {withKey("batch_size", BATCH_SIZE), withKey("epochs", "1"),
      withKey("model_tensor_type", MODEL_TENSOR_TYPE)});
   auto [bx, by] = constructModel();
-  // compile(Tensor, Tensor, mode) internally compiles + initializes.
   if (base_model->compile(bx, by, ml::train::ExecutionMode::INFERENCE)) {
     restore_graph_flags();
     throw std::invalid_argument(
@@ -414,12 +406,6 @@ void Transformer::load_weight_lora(const std::string &base_path,
   restore_graph_flags();
 
   // Step 2: index the base model's weights by their (layer-prefixed) name.
-  //
-  // Deliberately stores POINTERS into base_model rather than clones: cloning
-  // every weight would hold a third full copy of the model in memory (on top
-  // of base_model and this model) and roughly triples peak RSS on a
-  // multi-GB checkpoint. base_model outlives the copy below, so borrowing is
-  // safe.
   std::unordered_map<std::string, const nntrainer::Tensor *> base_weights;
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     collect = [&base_weights](ml::train::Layer &, nntrainer::RunLayerContext &context,
@@ -434,6 +420,10 @@ void Transformer::load_weight_lora(const std::string &base_path,
   // pretrained checkpoint); anything else unmatched means the two graphs
   // disagree and the model would silently train from random weights, so
   // fail loudly instead.
+  //
+  // For Q4_0/Q6_K tensors, copyData() is not supported, so we use a raw
+  // memcpy of the backing buffer instead. Both tensors come from the same
+  // layer in the same graph topology, so they have the same dtype and size.
   std::vector<std::string> unmatched;
   unsigned int matched = 0;
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
@@ -443,7 +433,10 @@ void Transformer::load_weight_lora(const std::string &base_path,
         const std::string &name = w->getName();
         auto it = base_weights.find(name);
         if (it != base_weights.end()) {
-          w->getVariableRef().copyData(*it->second);
+          nntrainer::Tensor &dst = w->getVariableRef();
+          const nntrainer::Tensor &src = *it->second;
+          const size_t bytes = src.getMemoryBytes();
+          std::memcpy(dst.getData<char>(), src.getData<char>(), bytes);
           ++matched;
         } else if (name.find(":loraA") == std::string::npos &&
                    name.find(":loraB") == std::string::npos) {
