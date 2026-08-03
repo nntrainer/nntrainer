@@ -706,6 +706,12 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
           nntrainer::dequantize_row_q4_0(src, tmp.getData(), out_dim);
           out_tensor.copyData(tmp);
         }
+      } else if (weight.getDataType() ==
+                 nntrainer::TensorDim::DataType::QS4CX) {
+        nntrainer::dequantize_row_qs4cx(embed_idx, out_dim, weight.getData(),
+                                        weight.getScale(),
+                                        out_tensor.getData());
+
       } else {
         out_tensor.copyData(cur_weight);
       }
@@ -785,6 +791,21 @@ void EmbeddingLayer::save(std::ofstream &file,
                                    quant_weight.getData<uint8_t>(), K, N,
                                    nullptr);
           quant_weight.save(file);
+        } else if (dtype == nntrainer::TensorDim::DataType::QS4CX) {
+          // embedding should not be trasposed
+          const size_t N = dim.height();
+          const size_t K = dim.width();
+
+          const size_t data_size = N * ((K + 1) / 2);
+          const size_t scale_size = N * sizeof(float);
+
+          // allocate packed size, not an unpacked size
+          std::vector<uint8_t> rhs_q(data_size + scale_size);
+          uint8_t *data = rhs_q.data();
+          uint8_t *scale = data + data_size;
+
+          nntrainer::quant_qs4cx_f32(N, K, weight.getData(), data, scale, true);
+          file.write((const char *)data, data_size + scale_size);
         } else {
           NNTR_THROW_IF(true, std::runtime_error)
             << "This dtype is not supported in save with quantization";
