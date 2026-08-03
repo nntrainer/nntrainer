@@ -11,7 +11,16 @@
 #include <AEEStdErr.h>
 #include <remote.h>
 
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+#include <qurt.h>
+
 #include "nntr_hvx.h"
+
+/** @brief HVX vector width in bytes (128B mode). */
+#define VLEN 128
+/** @brief float lanes per HVX vector. */
+#define LANES ((int)(VLEN / sizeof(float)))
 
 int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   (void)uri;
@@ -32,15 +41,32 @@ int nntr_hvx_close(remote_handle64 handle) {
 int nntr_hvx_add_f32(remote_handle64 handle, const float *a, int aLen,
                      const float *b, int bLen, float *c, int cLen) {
   (void)handle;
-  (void)a;
-  (void)b;
-  (void)c;
 
   if (aLen != bLen || aLen != cLen) {
     return AEE_EBADPARM;
   }
 
-  /* Not implemented yet -- Task 3 replaces this with the HVX kernel.
-     Reaching this return proves the FastRPC path is up. */
-  return AEE_EUNSUPPORTED;
+  /* Bits 15:8 hold the number of 128-byte HVX contexts. */
+  if (((qurt_hvx_get_units() >> 8) & 0xFF) == 0) {
+    return AEE_EUNSUPPORTED;
+  }
+
+  /* FastRPC buffers carry no vector alignment guarantee, so the unaligned
+     vector type is what keeps this from faulting on a misaligned input. */
+  const HVX_UVector *va = (const HVX_UVector *)a;
+  const HVX_UVector *vb = (const HVX_UVector *)b;
+  HVX_UVector *vc = (HVX_UVector *)c;
+
+  const int n_vec = aLen / LANES;
+  for (int i = 0; i < n_vec; ++i) {
+    vc[i] = Q6_Vsf_vadd_VsfVsf(va[i], vb[i]);
+  }
+
+  /* ponytail: scalar tail; a masked vector store would fold it in, add
+     that only if the tail shows up in a profile. */
+  for (int i = n_vec * LANES; i < aLen; ++i) {
+    c[i] = a[i] + b[i];
+  }
+
+  return AEE_SUCCESS;
 }
