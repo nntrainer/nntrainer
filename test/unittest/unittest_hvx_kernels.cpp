@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
+ * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
+ *
  * @file   unittest_hvx_kernels.cpp
- * @brief  Device test: an HVX kernel on the CDSP returns what the CPU does.
+ * @date   03 Aug 2026
+ * @brief  Device test: an HVX kernel on the CDSP returns what the CPU does
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  *
  * Runs on an Android device only. Requires libnntr_hvx_skel.so on
  * ADSP_LIBRARY_PATH. See test/htp/build.sh.
@@ -43,8 +49,7 @@ protected:
     remote_rpc_control_unsigned_module unsigned_pd = {CDSP_DOMAIN_ID, 1};
     int err = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
                                      &unsigned_pd, sizeof(unsigned_pd));
-    ASSERT_EQ(err, AEE_SUCCESS)
-      << "enabling unsigned PD failed: " << hex(err);
+    ASSERT_EQ(err, AEE_SUCCESS) << "enabling unsigned PD failed: " << hex(err);
 
     const std::string uri = std::string(nntr_hvx_URI) + "&_dom=cdsp";
     err = nntr_hvx_open(uri.c_str(), &handle_);
@@ -75,6 +80,18 @@ TEST_F(HvxAdd, MatchesCpuForFullVectorsPlusRemainder) {
   int err = nntr_hvx_add_f32(handle_, a.data(), n, b.data(), n, c.data(), n);
   ASSERT_EQ(err, AEE_SUCCESS) << "add_f32 failed: " << hex(err);
   EXPECT_EQ(c, expected);
+}
+
+TEST_F(HvxAdd, MatchesCpuBelowOneVector) {
+  // Fewer floats than a single vector holds: n_vec is 0 and only the
+  // scalar tail runs.
+  const std::vector<float> a = {1.5f};
+  const std::vector<float> b = {2.25f};
+  std::vector<float> c = {0.0f};
+
+  int err = nntr_hvx_add_f32(handle_, a.data(), 1, b.data(), 1, c.data(), 1);
+  ASSERT_EQ(err, AEE_SUCCESS) << "add_f32 failed: " << hex(err);
+  EXPECT_EQ(c[0], 3.75f);
 }
 
 } // namespace

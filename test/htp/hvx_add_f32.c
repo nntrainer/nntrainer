@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
- * @file   hvx_add_f32.c
- * @brief  DSP-side implementation of the nntr_hvx FastRPC interface.
+ * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
  *
- * Built into libnntr_hvx_skel.so and loaded into the CDSP unsigned PD.
+ * @file   hvx_add_f32.c
+ * @date   03 Aug 2026
+ * @brief  DSP-side implementation of the nntr_hvx FastRPC interface
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
  */
 
 #include <stdlib.h>
@@ -51,8 +55,8 @@ int nntr_hvx_add_f32(remote_handle64 handle, const float *a, int aLen,
     return AEE_EUNSUPPORTED;
   }
 
-  /* FastRPC buffers carry no vector alignment guarantee, so the unaligned
-     vector type is what keeps this from faulting on a misaligned input. */
+  // FastRPC buffers carry no vector alignment guarantee, so the unaligned
+  // vector type is what keeps this from faulting on a misaligned input.
   const HVX_UVector *va = (const HVX_UVector *)a;
   const HVX_UVector *vb = (const HVX_UVector *)b;
   HVX_UVector *vc = (HVX_UVector *)c;
@@ -62,8 +66,8 @@ int nntr_hvx_add_f32(remote_handle64 handle, const float *a, int aLen,
     vc[i] = Q6_Vsf_vadd_VsfVsf(va[i], vb[i]);
   }
 
-  /* ponytail: scalar tail; a masked vector store would fold it in, add
-     that only if the tail shows up in a profile. */
+  // ponytail: scalar tail; a masked vector store would fold it in, add
+  // that only if the tail shows up in a profile.
   for (int i = n_vec * LANES; i < aLen; ++i) {
     c[i] = a[i] + b[i];
   }
