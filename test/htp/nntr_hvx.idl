@@ -1,0 +1,13 @@
+//============================================================================
+// SPDX-License-Identifier: Apache-2.0
+//
+// FastRPC interface for HVX kernel device bring-up.
+//============================================================================
+
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface nntr_hvx : remote_handle64 {
+   AEEResult add_f32(in sequence<float> a, in sequence<float> b,
+                     rout sequence<float> c);
+};
