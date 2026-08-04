@@ -18,6 +18,48 @@
 
 namespace causallm {
 
+namespace {
+
+/**
+ * @brief Insert Qwen3's think-disable marker after the last assistant turn,
+ *        unless the sample already contains a <think> block.
+ *
+ * @details Qwen3 is a hybrid thinking/non-thinking model: its own chat
+ * template inserts "<think>\n\n</think>\n\n" right after
+ * "<|im_start|>assistant\n" whenever generation is requested with
+ * enable_thinking=false (see tokenizer_config.json's chat_template). Without
+ * that marker, the model's own strong prior is to begin a real <think>...
+ * </think> reasoning block, NOT to answer directly.
+ *
+ * Plain-text training samples that go straight from
+ * "<|im_start|>assistant\n" to a short direct answer (e.g. a LAMP-3-style
+ * sentiment label) omit this marker, so the label token is wildly
+ * out-of-distribution for what the base model actually wants to emit next —
+ * this alone can keep training loss stuck 15+ nats above what the same data
+ * gives once the marker is restored (empirically confirmed: ~29 -> ~13 on
+ * lamp3_user_train.txt with no other change). Insert it here so plain
+ * short-answer training data doesn't have to be hand-edited to match the
+ * chat template's own convention. Samples that already contain a <think>
+ * block (deliberate reasoning-mode training) are left untouched.
+ */
+std::string ensureThinkDisableMarker(const std::string &sample) {
+  if (sample.find("<think>") != std::string::npos)
+    return sample;
+
+  static const std::string assistant_marker = "<|im_start|>assistant\n";
+  static const std::string think_disable = "<think>\n\n</think>\n\n";
+
+  size_t pos = sample.rfind(assistant_marker);
+  if (pos == std::string::npos)
+    return sample;
+
+  std::string out = sample;
+  out.insert(pos + assistant_marker.size(), think_disable);
+  return out;
+}
+
+} // namespace
+
 TrainingDataGenerator::TrainingDataGenerator(const std::string &data_path,
                                              tokenizers::Tokenizer *tokenizer,
                                              unsigned int seq_len,
@@ -57,7 +99,7 @@ void TrainingDataGenerator::loadTextFile(const std::string &path,
     for (const auto &l : lines) {
       if (l.find("<|im_start|>user") != std::string::npos) {
         if (started && !current.empty())
-          raw_samples.push_back(current);
+          raw_samples.push_back(ensureThinkDisableMarker(current));
         current = l;
         started = true;
       } else if (started) {
@@ -65,7 +107,7 @@ void TrainingDataGenerator::loadTextFile(const std::string &path,
       }
     }
     if (started && !current.empty())
-      raw_samples.push_back(current);
+      raw_samples.push_back(ensureThinkDisableMarker(current));
   } else {
     raw_samples = lines;
   }
