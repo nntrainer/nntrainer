@@ -79,7 +79,7 @@ void hvx_quant_rows_u8_params(const float *x, uint32_t m_valid, uint32_t m_pad,
       continue; /* leaves scale 1, zp 0 */
     }
     const float s = (rmax - rmin) / 255.0f;
-    /* nearbyintf, not roundf: the vectorized path rounds to nearest even
+    /** nearbyintf, not roundf: the vectorized path rounds to nearest even
        and the host reference is written to match. */
     int32_t z = (int32_t)nearbyintf(-rmin / s);
     if (z < 0) {
