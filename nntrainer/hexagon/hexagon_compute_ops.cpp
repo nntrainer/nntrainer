@@ -190,9 +190,15 @@ public:
 
     int rc = api->gemm(matAdata, matBdata, matCdata, M, N, K);
     if (rc != 0) {
-      throw std::runtime_error(
-        "HexagonComputeOps::gemm_q4_0_accel_fp32: "
-        "nntr_htp_bridge_gemm_q4_0 failed (see log for details)");
+      // Bridge declines rather than crashes for out-of-range shapes (e.g. M >
+      // 1024 activation rows - see nntr-htp-bridge.cpp's check). matAdata is
+      // still the ordinary ARM q4_0x4 layout (see the class-level comment),
+      // the same bytes the CPU kernel already reads for every decode call, so
+      // falling back here is exactly the same "not accelerated" path
+      // float_tensor.cpp takes when supports_gemm_q4_0_accel_fp32() is false.
+      ml_logw("HexagonComputeOps::gemm_q4_0_accel_fp32: nntr_htp_bridge_gemm_q4_0 "
+              "failed (M=%u N=%u K=%u) - falling back to CPU", M, N, K);
+      cpu_->gemm_q4_0_fp32(M, N, K, matBdata, K, matAdata, N, matCdata, N);
     }
   }
 
@@ -218,9 +224,17 @@ public:
     int rc = api->gemm_batch(keys.data(), matBdata, matCdata.data(), N.data(),
                              (unsigned int)matAdata.size(), M, K);
     if (rc != 0) {
-      throw std::runtime_error(
-        "HexagonComputeOps::gemm_q4_0_batch_fp32: "
-        "nntr_htp_bridge_gemm_q4_0_batch failed (see log for details)");
+      // Same fallback as gemm_q4_0_accel_fp32 above, and for the same reason
+      // (e.g. M > 1024 activation rows) - matAdata[i] is still ARM q4_0x4,
+      // readable directly by the CPU kernel, matching float_tensor.cpp's own
+      // per-weight loop when supports_gemm_q4_0_batch_fp32() is false.
+      ml_logw("HexagonComputeOps::gemm_q4_0_batch_fp32: nntr_htp_bridge_gemm_q4_0_batch "
+              "failed (M=%u K=%u, %zu weights) - falling back to CPU", M, K,
+              matAdata.size());
+      for (size_t i = 0; i < matAdata.size(); ++i) {
+        cpu_->gemm_q4_0_fp32(M, N[i], K, matBdata, K, matAdata[i], N[i],
+                            matCdata[i], N[i]);
+      }
     }
   }
 

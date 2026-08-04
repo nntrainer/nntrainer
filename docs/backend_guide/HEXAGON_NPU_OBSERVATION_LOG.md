@@ -2178,3 +2178,177 @@ throughput vs. this CPU's attention kernel, not a universal constant.
   single-flush whole-graph offload (see HEXAGON_PROFILING_ANALYSIS.md §3B).
   Not attempted here - it is the structural fix, not a targeted one, and the
   token-count gate above resolves the immediate regression without it.
+
+---
+
+## 32. Flash-attn plateaus past ~300 tokens instead of climbing like ggml-hexagon, and a separate hard 1024-token wall
+
+Follow-up to S31, prompted by an external benchmark table showing nntrainer's
+flash-attn TPS peaking around 300 tokens (1127 TPS) then going *flat or down*
+by 602 tokens (1098.54 TPS, with the reported GEMM-only figure at that same
+row exactly equal to the CPU figure - 670.38 both). ggml-hexagon's own
+prefill, by contrast, keeps climbing to 2083 TPS at 512 tokens. Two separate
+things were found chasing this.
+
+### The reported 602-token row does not reproduce - likely the S31 footgun again
+
+Re-ran interleaved CPU/GEMM/flash-attn A/B/C at the same lengths (318 and 611
+tokens), multiple rounds, same device:
+
+| tokens | CPU | GEMM | flash-attn |
+|---|---|---|---|
+| 318 | 608.0, 577.1 | 943.6, 861.8-890.8 | 1111.9, 1127.7 |
+| 611 | 455.6, 403.0 | 641.8, 580.8 | 1121.1, 1039.1 |
+
+flash-attn is still ~1.8x GEMM-only at 611 tokens across both rounds - nowhere
+near the reported CPU==GEMM tie. CPU and GEMM both decline together across
+rounds (thermal drift, consistent with every prior session), but never
+converge. The reported row is almost certainly the same silent-fallback
+footgun S31 finding 2 documented: if `NNTR_USE_HEXAGON_CDSP=1` was missing for
+that specific run, GEMM (and flash-attn) fail closed and match CPU exactly -
+worth checking the benchmark script that produced it.
+
+### The real, reproducible finding: flash-attn's TPS is flat from ~300-950 tokens, not climbing
+
+| tokens | CPU | GEMM | flash-attn | flash/GEMM |
+|---|---|---|---|---|
+| 137 | 646.2 | 756.9 | 732.6 | 0.97x (below crossover, gate now rejects this) |
+| 203 | - | 910.3 | 971.3 | 1.07x |
+| 318 | 577-608 | 862-944 | 1112-1128 | ~1.2-1.3x |
+| 410 | 571.8 | 823.3 | 1216.6 | 1.48x |
+| 611 | 403-456 | 581-642 | 1039-1121 | ~1.7-1.8x |
+| 954 | 379.5 | 518.5 | 1050.7 | 2.03x |
+
+flash-attn's *absolute* TPS is roughly flat (~1040-1130) from 318 to 954
+tokens - not climbing toward ggml-hexagon's 2083 the way CPU and GEMM-only
+both keep dropping (thermal, expected) while flash-attn holds steady. Checked
+the DSP kernel itself for a hidden cliff first (VTCM overflow forcing a
+fallback from the HMX path to the slow HVX path) - ruled out:
+`hmx_flash_attn_ext` (`hmx-flash-attn-ops.c:1265`) computes its Br/Bc tile
+sizes dynamically from the VTCM budget via `hmx_fa_find_chunk_size`, so it
+should not hit a wall as tokens grow; it is designed to tile regardless of
+sequence length.
+
+The actual reason is architectural, not a bug: nntrainer pays a **fixed 140
+flushes every prefill pass** (112 GEMM + 28 flash-attn, one per layer each),
+independent of token count. ggml-hexagon pays **1 flush** for its entire
+535-op graph, also independent of token count. Since dispatch *count* is flat
+for both frameworks regardless of prompt length, what lets ggml-hexagon's TPS
+keep climbing past 512 tokens is that its one-time dispatch overhead is
+already negligible at any size, so its curve is governed purely by DSP
+compute efficiency (which improves with more rows per GEMM/attention call -
+better systolic-array utilization). nntrainer never gets to enjoy that: every
+one of its 140 round trips still carries its own dispatch tax no matter how
+large the prefill gets, so there is no per-token amortization left on the
+table - S27 already closed that door (attn_out/ffn_down have no batching
+partner). This is consistent with, not a contradiction of, S31: the crossover
+there was about *whether* flash-attn wins; this is about *how much*, and the
+answer is "a flat ~1.8-2x over GEMM-only, not a climbing one," because the
+lever that would let it climb (collapsing round-trip count) hasn't been
+pulled.
+
+### New, more fundamental finding: the bridge hard-crashes past 1024 activation rows
+
+Tried to test 1024 and ~1900 tokens to see whether the plateau holds or
+resumes climbing at larger sizes. Hit two separate walls:
+
+1. At the model's default `init_seq_len: 1024` (`nntr_config.json`), a prompt
+   tokenizing past that raises `std::invalid_argument: Creating shared tensor
+   of size bigger than tensor memory` and crashes - `INIT_SEQ_LEN` pre-sizes
+   the graph's input tensor at model construction (`transformer.cpp:244`), so
+   this is a hard ceiling set at model-build time, unrelated to Hexagon.
+2. Raised `init_seq_len` to 2048 (device-local test only, config restored
+   after) to get past that and hit the real wall: `nntr_htp_bridge_gemm_q4_0`
+   and `_batch` both throw `"M too large (>1024 activation rows) - no
+   batching support in this bridge yet"` (`nntr-htp-bridge.cpp:727,855`) - a
+   **hard crash**, not a graceful CPU fallback, for any Hexagon-offloaded
+   prefill chunk over 1024 tokens. Since `useHexagonCdsp()` gates both GEMM
+   offload and the flash-attn/KV-rpcmem path with the same flag, this ceiling
+   applies to flash-attn too - there is currently no way to test either DSP
+   path past 1024 tokens without hitting this.
+
+This is very likely *why* `init_seq_len` defaults to 1024 for this model - it
+is calibrated to sit exactly at the bridge's cap, so normal use never reaches
+it. But it means the current bridge cannot offload any prefill chunk larger
+than 1024 tokens at all, by construction - not a performance question, a hard
+limit. Lifting it would need the bridge's GEMM path to chunk/tile M like
+`hmx_flash_attn_ext` already does for its own K/V blocks, rather than
+rejecting M>1024 outright.
+
+### What this means for "what can we do further"
+
+- The flash-attn plateau (not a regression, but not climbing either) has the
+  same fix already identified in S31/HEXAGON_PROFILING_ANALYSIS.md: collapse
+  the 140-flush structure toward ggml-hexagon's 1-flush whole-graph model.
+  No new cheaper lever was found chasing this - it remains the one
+  structural rewrite left standing.
+- The 1024-row bridge cap is a separate, higher-priority gap if longer-context
+  prefill is ever a goal: today it is silently avoided by `init_seq_len`'s
+  default, but any attempt to raise context length hits a hard crash, not a
+  slowdown. Worth fixing (chunked M, or at minimum a graceful CPU fallback
+  instead of `throw`) independently of the whole-graph-fusion question.
+
+---
+
+## 33. Fixed the 1024-row crash: graceful CPU fallback, not chunking
+
+Follow-up to S32. The bridge's own `M > 1024` check (`nntr-htp-bridge.cpp:727,
+855`) already mirrors ggml-hexagon's own upstream policy
+(`ggml_hexagon_supported_mul_mat`'s `ggml_nrows(src1) > 1024` reject, commented
+"no huge batches (for now)") - i.e. a deliberate, conservative limit, not a
+proven-safe-to-lift hardware wall. Chunking M ourselves would mean trusting
+that `op_matmul_hvx` behaves correctly past a boundary neither bridge has ever
+exercised, for a case (>1024-token prefill chunks) that is not the common
+path. Not the right tradeoff for a targeted fix.
+
+The actual crash lived one layer up: the bridge already fails cleanly (catches
+its own `throw`, returns -1, logs via `GGML_LOG_ERROR`), but
+`HexagonComputeOps::gemm_q4_0_accel_fp32`/`gemm_q4_0_batch_fp32`
+(`nntrainer/hexagon/hexagon_compute_ops.cpp`) turned that clean failure into
+an unconditional `throw std::runtime_error` on any non-zero return, with no
+distinction between "shape not supported, please fall back" and "actually
+broken." Fixed by falling back to `cpu_->gemm_q4_0_fp32(...)` instead -
+`cpu_` (`get_cpu_ops()`) is already a member, and this is not a new pattern:
+the class's own header comment already establishes that `matAdata` is always
+plain ARM q4_0x4 (never the DSP's repacked q4x4x2), specifically because "decode
+... runs on the CPU kernels, which need to read these same bytes." The
+parameter mapping was taken directly from `float_tensor.cpp`'s own "not
+accelerated" branch (lines ~815/1024) rather than invented, so the fallback
+computes exactly what would run if `supports_gemm_q4_0_batch_fp32()`/
+`supports_gemm_q4_0_accel_fp32()` had returned false in the first place.
+
+One build wrinkle worth recording: `hexagon_compute_ops.cpp` lives in
+nntrainer core, gated behind meson's `enable-hexagon-cdsp` option
+(`nntrainer/meson.build:64-65`), and `Applications/CausalLM/build_android.sh`
+treats nntrainer core as a prebuilt dependency (`builddir/android_build_result`)
+that `--cache` never rebuilds. Editing this file and rebuilding only the
+CausalLM app (even without `--cache`) is a no-op for it, since
+`package_android.sh` run with no arguments doesn't pass
+`-Denable-hexagon-cdsp=true` either (option defaults to false) - the existing
+`builddir` only had it because some earlier, unrecorded invocation set it
+explicitly. Confirmed by symbol inspection
+(`readelf -sW libnntrainer.so | grep gemm_q4_0`) before and after: the fix
+requires `meson configure -Denable-hexagon-cdsp=true && ninja install` inside
+`builddir` directly, then redeploying `libnntrainer.so` itself (a real file the
+app dynamically links, separate from `libcausallm_core.so` - `readelf -d`
+confirms `NEEDED libnntrainer.so`) - not just relinking the app. The app's own
+hash does not change when only nntrainer-core internals change, since nothing
+about the *linked symbols* changes; this is expected, not a sign the build
+silently failed, but it is easy to mistake for one.
+
+Verified on-device, `init_seq_len` temporarily raised to 2048 (restored after,
+same as S32): a 1090-token prompt that previously crashed with `FATAL ERROR:
+HexagonComputeOps::gemm_q4_0_batch_fp32: ... failed` now completes cleanly.
+`logcat` (the `ml_logw` fallback warning routes there, not stdout/stderr - see
+S31 finding 2) confirms the fallback fires for every GEMM in the prefill pass,
+every layer, as expected (`M=1090` exceeds 1024 uniformly since M is the whole
+prefill's token count). Correctness check: since M=1090 forces every GEMM in
+this pass onto the CPU path, prefill throughput at 1090 tokens should closely
+track a pure-CPU-only run at the same length if the fallback computes the
+right thing - measured 315.6 TPS (CPU-only) vs 271.7 TPS (Hexagon+fallback),
+within this device's already-documented run-to-run thermal variance, not the
+signature of wrong output (which tends to show up as a crash downstream, e.g.
+softmax/NaN propagation, given how many other assertions this codebase has).
+Regression check at 954 tokens (under the cap): 541.1 TPS, no fallback
+warnings logged, GEMM offload engages normally - the fix is scoped to exactly
+the M>1024 case and does not touch the working path.

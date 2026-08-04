@@ -29,8 +29,10 @@ static std::mutex rope_init_mtx;
 #include <thread_manager.h>
 #include <util_func.h>
 
+#include <atomic>
 #include <cstdint>
 #include <dlfcn.h>
+
 
 inline float convert_scalar(uint16_t h) {
   return nntrainer::compute_fp16_to_fp32(h);
@@ -95,14 +97,16 @@ bool should_use_flash_attn(unsigned int step_size, unsigned int head_dim,
   bool enabled = (env && std::atoi(env) == 1);
 
   if (!enabled) {
-    fprintf(stderr, "[FLASH_ATTN] gate: env not set or not 1\n");
     return false;
   }
-  fprintf(stderr, "[FLASH_ATTN] gate: enabled=true, step_size=%u head_dim=%u is_prefill=%d\n",
-          step_size, head_dim, (int)is_prefill);
+
+  // Verbose mode: log every gate evaluation
+  static const char *verbose_env = std::getenv("NNTR_HEXAGON_FLASH_ATTN_VERBOSE");
+  static const bool verbose = (verbose_env && std::atoi(verbose_env) == 1);
 
   if (!is_prefill || step_size <= 1) {
-    fprintf(stderr, "[FLASH_ATTN] gate: REJECT (not prefill or step_size<=1)\n");
+    if (verbose)
+      fprintf(stderr, "[FLASH_ATTN] gate: REJECT (not prefill or step_size<=1)\n");
     return false;
   }
 
@@ -114,20 +118,30 @@ bool should_use_flash_attn(unsigned int step_size, unsigned int head_dim,
   static const char *min_tok_env = std::getenv("NNTR_HEXAGON_FLASH_ATTN_MIN_TOKENS");
   static const unsigned int min_tokens = min_tok_env ? (unsigned int)std::atoi(min_tok_env) : 160;
   if (step_size < min_tokens) {
-    fprintf(stderr, "[FLASH_ATTN] gate: REJECT (step_size=%u < min_tokens=%u, below measured crossover)\n",
-            step_size, min_tokens);
+    if (verbose)
+      fprintf(stderr, "[FLASH_ATTN] gate: REJECT (step_size=%u < min_tokens=%u)\n",
+              step_size, min_tokens);
     return false;
   }
 
   if (head_dim != 128) {
-    fprintf(stderr, "[FLASH_ATTN] gate: REJECT (head_dim=%u != 128)\n", head_dim);
+    if (verbose)
+      fprintf(stderr, "[FLASH_ATTN] gate: REJECT (head_dim=%u != 128)\n", head_dim);
     return false;
   }
 
-  fprintf(stderr, "[FLASH_ATTN] gate: ACCEPT, loading bridge...\n");
+  // Log ACCEPT only once per forward pass (first layer)
+  static std::atomic<bool> logged_accept{false};
+  if (!logged_accept.exchange(true)) {
+    fprintf(stderr, "[FLASH_ATTN] gate: ACCEPT (step_size=%u head_dim=%u), loading bridge...\n",
+            step_size, head_dim);
+  }
+
   const flash_attn_fn &fn = get_flash_attn_bridge();
   bool result = (fn != nullptr);
-  fprintf(stderr, "[FLASH_ATTN] gate: bridge=%p, result=%d\n", fn, (int)result);
+  if (verbose)
+    fprintf(stderr, "[FLASH_ATTN] gate: bridge=%p, result=%d\n", fn, (int)result);
+
   return result;
 }
 
