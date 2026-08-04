@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -188,6 +189,47 @@ void ref_dequant(const std::vector<int32_t> &acc, uint32_t m_valid, uint32_t N,
   }
 }
 
+/**
+ * @brief Unquantized fp32 matmul. The yardstick S4 measures against.
+ */
+void ref_fp32_matmul(const std::vector<float> &x, const std::vector<float> &w,
+                     uint32_t M, uint32_t K, uint32_t N,
+                     const std::vector<float> &bias, std::vector<float> &out) {
+  out.assign(static_cast<size_t>(M) * N, 0.0f);
+  for (uint32_t m = 0; m < M; ++m) {
+    for (uint32_t n = 0; n < N; ++n) {
+      float sum = 0.0f;
+      for (uint32_t k = 0; k < K; ++k) {
+        sum +=
+          x[static_cast<size_t>(m) * K + k] * w[static_cast<size_t>(k) * N + n];
+      }
+      out[static_cast<size_t>(m) * N + n] = sum + bias[n];
+    }
+  }
+}
+
+/**
+ * @brief Signal-to-noise ratio in dB between a reference and a result.
+ *
+ * Reported rather than asserted tightly: no measurement exists yet for
+ * what per-channel int4 costs on this workload, and inventing a threshold
+ * before measuring would just encode a guess.
+ */
+double snr_db(const std::vector<float> &ref, const std::vector<float> &got) {
+  double sig = 0.0;
+  double noise = 0.0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    const double r = ref[i];
+    const double e = static_cast<double>(got[i]) - r;
+    sig += r * r;
+    noise += e * e;
+  }
+  if (noise == 0.0) {
+    return std::numeric_limits<double>::infinity();
+  }
+  return 10.0 * std::log10(sig / noise);
+}
+
 /** @brief Deterministic pseudo-random fill in [-1, 1). */
 void fill_deterministic(std::vector<float> &v, uint32_t seed) {
   uint32_t s = seed;
@@ -296,198 +338,117 @@ protected:
   }
 
   remote_handle64 handle_ = 0;
+
+  /**
+   * @brief Runs S1 through S4 for one shape.
+   *
+   * S1 and S2 are bit-exact: integer arithmetic is deterministic, so any
+   * layout or wiring error shows up as an exact mismatch rather than
+   * being absorbed into a tolerance. S3 allows f32 ordering slack. S4 is
+   * reported, not gated.
+   */
+  void CheckShape(uint32_t M, uint32_t K, uint32_t N, bool want_wh_dump) {
+    SCOPED_TRACE("M=" + std::to_string(M) + " K=" + std::to_string(K) +
+                 " N=" + std::to_string(N));
+    const uint32_t m_pad = round_up(M, kTileRow);
+
+    std::vector<float> w_f32(static_cast<size_t>(K) * N);
+    fill_deterministic(w_f32, 0x5EED0001u);
+    std::vector<int8_t> q_w;
+    std::vector<float> d;
+    std::vector<int32_t> colsum;
+    quantize_weights_qs4cx(w_f32, K, N, q_w, d, colsum);
+
+    std::vector<float> x(static_cast<size_t>(M) * K);
+    fill_deterministic(x, 0x5EED0002u);
+    std::vector<float> bias(N);
+    fill_deterministic(bias, 0x5EED0003u);
+
+    std::vector<float> exp_scale;
+    std::vector<int32_t> exp_zp;
+    quantize_act_rows(x, M, m_pad, K, exp_scale, exp_zp);
+    std::vector<uint8_t> exp_u_rm;
+    quantize_act_values(x, M, m_pad, K, exp_scale, exp_zp, exp_u_rm);
+    std::vector<uint8_t> exp_ah;
+    pack_ah_from_rowmajor(exp_u_rm, m_pad, K, exp_ah);
+    std::vector<int32_t> exp_acc;
+    ref_int_matmul(exp_u_rm, q_w, m_pad, K, N, exp_acc);
+    std::vector<float> exp_out;
+    ref_dequant(exp_acc, M, N, exp_scale, exp_zp, colsum, d, bias, exp_out);
+
+    std::vector<uint8_t> got_ah(static_cast<size_t>(m_pad) * K, 0);
+    std::vector<float> got_scale(m_pad, 0.0f);
+    std::vector<int32_t> got_zp(m_pad, -1);
+    std::vector<int32_t> got_acc(static_cast<size_t>(m_pad) * N, 0);
+    std::vector<float> got_out(static_cast<size_t>(M) * N, 0.0f);
+
+    int err = nntr_hvx_mm_u8i4_from_f32(
+      handle_, M, K, N, x.data(), static_cast<int>(x.size()), q_w.data(),
+      static_cast<int>(q_w.size()), d.data(), static_cast<int>(d.size()),
+      colsum.data(), static_cast<int>(colsum.size()), bias.data(),
+      static_cast<int>(bias.size()), got_ah.data(),
+      static_cast<int>(got_ah.size()), got_scale.data(),
+      static_cast<int>(got_scale.size()), got_zp.data(),
+      static_cast<int>(got_zp.size()), got_acc.data(),
+      static_cast<int>(got_acc.size()), got_out.data(),
+      static_cast<int>(got_out.size()));
+    ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_from_f32 failed: " << hex(err);
+
+    // S1
+    for (uint32_t m = 0; m < m_pad; ++m) {
+      EXPECT_NEAR(got_scale[m], exp_scale[m], std::abs(exp_scale[m]) * 1e-6f)
+        << "scale[" << m << "]";
+      EXPECT_EQ(got_zp[m], exp_zp[m]) << "zp[" << m << "]";
+    }
+    EXPECT_EQ(got_ah, exp_ah);
+
+    // S2
+    EXPECT_EQ(got_acc, exp_acc);
+
+    // S3
+    for (size_t i = 0; i < exp_out.size(); ++i) {
+      EXPECT_NEAR(got_out[i], exp_out[i], std::abs(exp_out[i]) * 1e-5f + 1e-6f);
+    }
+
+    // S4 -- measured and printed, deliberately not gated tightly.
+    std::vector<float> fp32_ref;
+    ref_fp32_matmul(x, w_f32, M, K, N, bias, fp32_ref);
+    double max_rel = 0.0;
+    for (size_t i = 0; i < fp32_ref.size(); ++i) {
+      const double denom = std::abs(static_cast<double>(fp32_ref[i]));
+      if (denom > 1e-6) {
+        max_rel = std::max(
+          max_rel,
+          std::abs(static_cast<double>(got_out[i]) - fp32_ref[i]) / denom);
+      }
+    }
+    const double snr = snr_db(fp32_ref, got_out);
+    std::cout << "[S4] M=" << M << " K=" << K << " N=" << N << " SNR=" << snr
+              << " dB  max_rel=" << max_rel << std::endl;
+    EXPECT_GT(snr, 0.0) << "quantized output carries no signal at all";
+  }
 };
 
-TEST_F(HmxMmU8I4, HmxBringsUp) {
-  // Task 1 gate: the entry point links against libhexkl_micro.a, hw_init
-  // succeeds and the HMX lock round-trips. Buffers are unused here.
-  std::vector<uint8_t> act(64 * 128, 0);
-  std::vector<int8_t> w(128 * 128, 0);
-  std::vector<int32_t> acc(64 * 128, 0);
-  std::vector<uint8_t> dump(0);
-
-  int err = nntr_hvx_mm_u8i4_from_u8(
-    handle_, 64, 128, 128, act.data(), static_cast<int>(act.size()), w.data(),
-    static_cast<int>(w.size()), acc.data(), static_cast<int>(acc.size()),
-    dump.data(), 0);
-  ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_from_u8 failed: " << hex(err);
+TEST_F(HmxMmU8I4, Shape1_Minimal) {
+  // Same dimensions as HexKL's own example, so a failure here is ours.
+  CheckShape(64, 128, 128, /*want_wh_dump=*/true);
 }
 
-TEST_F(HmxMmU8I4, S2_IntegerAccumulatorIsBitExact) {
-  const uint32_t M = 64, K = 128, N = 128;
-  const uint32_t m_pad = round_up(M, kTileRow);
-
-  // Host-side weight quantization: fp32 -> per-channel int4.
-  std::vector<float> w_f32(static_cast<size_t>(K) * N);
-  fill_deterministic(w_f32, 0x5EED0001u);
-  std::vector<int8_t> q_w;
-  std::vector<float> d;
-  std::vector<int32_t> colsum;
-  quantize_weights_qs4cx(w_f32, K, N, q_w, d, colsum);
-
-  // Host-side activation: an arbitrary but deterministic uint8 pattern.
-  // Activation quantization from fp32 is Task 3; this task isolates the
-  // weight bake, the WH layout and the HMX matmul.
-  std::vector<uint8_t> u_rm(static_cast<size_t>(m_pad) * K);
-  for (size_t i = 0; i < u_rm.size(); ++i) {
-    u_rm[i] = static_cast<uint8_t>((i * 37u + 11u) & 0xFFu);
-  }
-  std::vector<uint8_t> act_ah;
-  pack_ah_from_rowmajor(u_rm, m_pad, K, act_ah);
-
-  std::vector<int32_t> expected;
-  ref_int_matmul(u_rm, q_w, m_pad, K, N, expected);
-
-  std::vector<int32_t> acc(static_cast<size_t>(m_pad) * N, 0);
-  std::vector<uint8_t> dump(static_cast<size_t>(K / kTileInner) *
-                            (N / kTileCol) * 512);
-
-  int err = nntr_hvx_mm_u8i4_from_u8(
-    handle_, M, K, N, act_ah.data(), static_cast<int>(act_ah.size()),
-    q_w.data(), static_cast<int>(q_w.size()), acc.data(),
-    static_cast<int>(acc.size()), dump.data(), static_cast<int>(dump.size()));
-  ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_from_u8 failed: " << hex(err);
-
-  size_t mismatches = 0;
-  for (uint32_t m = 0; m < m_pad && mismatches < 10; ++m) {
-    for (uint32_t n = 0; n < N && mismatches < 10; ++n) {
-      const size_t i = static_cast<size_t>(m) * N + n;
-      if (acc[i] != expected[i]) {
-        ++mismatches;
-        ADD_FAILURE() << "acc[" << m << "][" << n << "] = " << acc[i]
-                      << ", expected " << expected[i];
-      }
-    }
-  }
-  EXPECT_EQ(acc, expected);
-
-  // The baked buffer is the WH i4 layout, which HexKL does not document.
-  // Print the first tile so the offline converter has a reference.
-  std::cout << "WH tile 0 (512B, hex):" << std::endl;
-  for (size_t i = 0; i < 512; ++i) {
-    std::cout << std::hex << std::setw(2) << std::setfill('0')
-              << static_cast<unsigned>(dump[i])
-              << ((i % 32 == 31) ? "\n" : " ");
-  }
-  std::cout << std::dec << std::flush;
+TEST_F(HmxMmU8I4, Shape2_DecodeSingleToken) {
+  // One token padded out to a 64-row tile: the decode case, and the one
+  // that exercises the zero-pad path for 63 of 64 rows.
+  CheckShape(1, 1024, 1024, /*want_wh_dump=*/false);
 }
 
-TEST_F(HmxMmU8I4, S1_ActivationQuantMatchesHost) {
-  const uint32_t M = 64, K = 128, N = 128;
-  const uint32_t m_pad = round_up(M, kTileRow);
-
-  std::vector<float> w_f32(static_cast<size_t>(K) * N);
-  fill_deterministic(w_f32, 0x5EED0001u);
-  std::vector<int8_t> q_w;
-  std::vector<float> d;
-  std::vector<int32_t> colsum;
-  quantize_weights_qs4cx(w_f32, K, N, q_w, d, colsum);
-
-  std::vector<float> x(static_cast<size_t>(M) * K);
-  fill_deterministic(x, 0x5EED0002u);
-  std::vector<float> bias(N);
-  fill_deterministic(bias, 0x5EED0003u);
-
-  std::vector<float> exp_scale;
-  std::vector<int32_t> exp_zp;
-  quantize_act_rows(x, M, m_pad, K, exp_scale, exp_zp);
-  std::vector<uint8_t> exp_u_rm;
-  quantize_act_values(x, M, m_pad, K, exp_scale, exp_zp, exp_u_rm);
-  std::vector<uint8_t> exp_ah;
-  pack_ah_from_rowmajor(exp_u_rm, m_pad, K, exp_ah);
-  std::vector<int32_t> exp_acc;
-  ref_int_matmul(exp_u_rm, q_w, m_pad, K, N, exp_acc);
-
-  std::vector<uint8_t> got_ah(static_cast<size_t>(m_pad) * K, 0);
-  std::vector<float> got_scale(m_pad, 0.0f);
-  std::vector<int32_t> got_zp(m_pad, -1);
-  std::vector<int32_t> got_acc(static_cast<size_t>(m_pad) * N, 0);
-  std::vector<float> got_out(static_cast<size_t>(M) * N, 0.0f);
-
-  int err = nntr_hvx_mm_u8i4_from_f32(
-    handle_, M, K, N, x.data(), static_cast<int>(x.size()), q_w.data(),
-    static_cast<int>(q_w.size()), d.data(), static_cast<int>(d.size()),
-    colsum.data(), static_cast<int>(colsum.size()), bias.data(),
-    static_cast<int>(bias.size()), got_ah.data(),
-    static_cast<int>(got_ah.size()), got_scale.data(),
-    static_cast<int>(got_scale.size()), got_zp.data(),
-    static_cast<int>(got_zp.size()), got_acc.data(),
-    static_cast<int>(got_acc.size()), got_out.data(),
-    static_cast<int>(got_out.size()));
-  ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_from_f32 failed: " << hex(err);
-
-  for (uint32_t m = 0; m < m_pad; ++m) {
-    EXPECT_NEAR(got_scale[m], exp_scale[m], std::abs(exp_scale[m]) * 1e-6f)
-      << "scale[" << m << "]";
-    EXPECT_EQ(got_zp[m], exp_zp[m]) << "zp[" << m << "]";
-  }
-  EXPECT_EQ(got_ah, exp_ah);
-
-  // The activation the HMX actually consumed now comes from the HVX
-  // kernel, so this re-checks S2 end to end rather than with a fixed
-  // pattern.
-  EXPECT_EQ(got_acc, exp_acc);
+TEST_F(HmxMmU8I4, Shape3_PrefillQwen3Scale) {
+  // Weights alone need (1024/32)*(1024/32)*512 = 512 KiB of VTCM here.
+  CheckShape(64, 1024, 1024, /*want_wh_dump=*/false);
 }
 
-TEST_F(HmxMmU8I4, S3_DequantMatchesHost) {
-  const uint32_t M = 64, K = 128, N = 128;
-  const uint32_t m_pad = round_up(M, kTileRow);
-
-  std::vector<float> w_f32(static_cast<size_t>(K) * N);
-  fill_deterministic(w_f32, 0x5EED0001u);
-  std::vector<int8_t> q_w;
-  std::vector<float> d;
-  std::vector<int32_t> colsum;
-  quantize_weights_qs4cx(w_f32, K, N, q_w, d, colsum);
-
-  std::vector<float> x(static_cast<size_t>(M) * K);
-  fill_deterministic(x, 0x5EED0002u);
-  std::vector<float> bias(N);
-  fill_deterministic(bias, 0x5EED0003u);
-
-  std::vector<float> exp_scale;
-  std::vector<int32_t> exp_zp;
-  quantize_act_rows(x, M, m_pad, K, exp_scale, exp_zp);
-  std::vector<uint8_t> exp_u_rm;
-  quantize_act_values(x, M, m_pad, K, exp_scale, exp_zp, exp_u_rm);
-  std::vector<int32_t> exp_acc;
-  ref_int_matmul(exp_u_rm, q_w, m_pad, K, N, exp_acc);
-  std::vector<float> exp_out;
-  ref_dequant(exp_acc, M, N, exp_scale, exp_zp, colsum, d, bias, exp_out);
-
-  std::vector<uint8_t> got_ah(static_cast<size_t>(m_pad) * K, 0);
-  std::vector<float> got_scale(m_pad, 0.0f);
-  std::vector<int32_t> got_zp(m_pad, -1);
-  std::vector<int32_t> got_acc(static_cast<size_t>(m_pad) * N, 0);
-  std::vector<float> got_out(static_cast<size_t>(M) * N, 0.0f);
-
-  int err = nntr_hvx_mm_u8i4_from_f32(
-    handle_, M, K, N, x.data(), static_cast<int>(x.size()), q_w.data(),
-    static_cast<int>(q_w.size()), d.data(), static_cast<int>(d.size()),
-    colsum.data(), static_cast<int>(colsum.size()), bias.data(),
-    static_cast<int>(bias.size()), got_ah.data(),
-    static_cast<int>(got_ah.size()), got_scale.data(),
-    static_cast<int>(got_scale.size()), got_zp.data(),
-    static_cast<int>(got_zp.size()), got_acc.data(),
-    static_cast<int>(got_acc.size()), got_out.data(),
-    static_cast<int>(got_out.size()));
-  ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_from_f32 failed: " << hex(err);
-
-  ASSERT_EQ(got_acc, exp_acc) << "accumulator diverged; S3 is meaningless";
-
-  size_t reported = 0;
-  for (uint32_t m = 0; m < M; ++m) {
-    for (uint32_t n = 0; n < N; ++n) {
-      const size_t i = static_cast<size_t>(m) * N + n;
-      const float tol = std::abs(exp_out[i]) * 1e-5f + 1e-6f;
-      if (std::abs(got_out[i] - exp_out[i]) > tol && reported < 10) {
-        ++reported;
-        ADD_FAILURE() << "out[" << m << "][" << n << "] = " << got_out[i]
-                      << ", expected " << exp_out[i];
-      }
-      EXPECT_NEAR(got_out[i], exp_out[i], tol);
-    }
-  }
+TEST_F(HmxMmU8I4, Shape4_MultipleRowBlocks) {
+  // Shapes 1 through 3 all pad to 64 rows, so the row-block loop only
+  // ever runs with rb=0. This is the one that runs it twice.
+  CheckShape(128, 128, 128, /*want_wh_dump=*/false);
 }
 
 } // namespace
