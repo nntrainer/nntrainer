@@ -123,12 +123,12 @@ void MemoryPool::allocate() {
   ml_logi("MemoryPool::allocate size: %zu allocator: %s", pool_size,
           allocator_->getName().c_str());
 
-  if (allocator_->getName() == "qnn") {
+  if (allocator_->getName() == "qnn" || allocator_->getName() == "neuron") {
     const auto &allocation_sizes =
       memory_size.empty() ? planned_memory_size_ : memory_size;
     NNTR_THROW_IF(allocation_sizes.size() != memory_offset.size(),
                   std::runtime_error)
-      << "QNN memory layout metadata is stale; call planLayout() before "
+      << "NPU memory layout metadata is stale; call planLayout() before "
          "allocate()";
 
     std::map<size_t, size_t> offset_size;

@@ -68,8 +68,15 @@ if get_option('enable-npu')
   # The qnn subdir is processed after nntrainer_dep is available (see below).
 endif
 
+if get_option('enable-neuron')
+  nntrainer_elements += 'neuron'
+  # Same deferred-subdir reason as qnn above: libneuron_context.so links
+  # against libnntrainer, so its subdir is processed after nntrainer_dep
+  # exists (see below).
+endif
+
 foreach elem : nntrainer_elements
-  if elem != 'qnn'
+  if elem != 'qnn' and elem != 'neuron'
     subdir(elem)
   endif
   nntrainer_inc += include_directories(elem)
@@ -84,10 +91,16 @@ nntrainer_common_sources = [
 ]
 
 # QNN context is built as a separate plugin .so (libqnn_context.so)
-# and loaded dynamically by Engine. See qnn/jni/meson.build for the
+# and loaded dynamically by Engine. See jni/Android.mk.in for the
 # shared_library target. The header is still needed for type definitions.
 if get_option('enable-npu')
   nntrainer_headers += meson.current_source_dir() / 'qnn' / 'qnn_context.h'
+endif
+
+# MediaTek Neuron context: same pattern as QNN above (separate plugin .so,
+# libneuron_context.so, built by jni/Android.mk.in's neuron_context module).
+if get_option('enable-neuron')
+  nntrainer_headers += meson.current_source_dir() / 'neuron' / 'neuron_context.h'
 endif
 
 nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'ruy'
@@ -156,6 +169,11 @@ endif
 # libqnn_context.so links against libnntrainer, so it must be built after it.
 if get_option('enable-npu')
   subdir('qnn')
+endif
+
+# Build Neuron context plugin after nntrainer_dep is available, same reason.
+if get_option('enable-neuron')
+  subdir('neuron')
 endif
 
 # Install headers

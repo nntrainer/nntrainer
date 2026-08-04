@@ -142,6 +142,10 @@ if get_option('enable-npu')
      extra_defines += '-DENABLE_NPU=1'
 endif
 
+if get_option('enable-neuron')
+     extra_defines += '-DENABLE_NEURON=1'
+endif
+
 if get_option('mmap-read')
     extra_defines += '-DMMAP_READ=1'
 else

@@ -67,5 +67,16 @@ else
     endif
   endif
 
+  # Neuron backend smoke test. Deliberately gated on enable-neuron alone
+  # rather than folded into CausalLM/meson.build: the test only needs the
+  # ccapi and the neuron_graph layer, so coupling it to enable-transformer
+  # would silently skip it for anyone building just the backend. Desktop-only
+  # here — the on-device Android artifact is built via jni/Android.mk.in's
+  # nntrainer_neuron_smoke NDK module instead (see NEURON_BUILD.md), since
+  # this file's android branch above is narrowed to CausalLM only.
+  if get_option('enable-neuron') and enable_ccapi
+    subdir('CausalLM/neuron')
+  endif
+
   subdir('Optimizers/jni')
 endif

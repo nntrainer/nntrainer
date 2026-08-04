@@ -76,6 +76,17 @@ void Engine::add_default_object() {
     ml_logw("QNN context plugin not available: %s", e.what());
   }
 #endif
+
+#if defined(ENABLE_NEURON) && ENABLE_NEURON == 1
+  // MediaTek NeuroPilot (Neuron Runtime) context is loaded as a plugin .so
+  // for decoupling from the NeuroPilot SDK. libneuron_context.so exports
+  // ml_train_context_pluggable symbol.
+  try {
+    registerContext("libneuron_context.so", "");
+  } catch (std::exception &e) {
+    ml_logw("Neuron context plugin not available: %s", e.what());
+  }
+#endif
 }
 
 void Engine::initialize() noexcept {

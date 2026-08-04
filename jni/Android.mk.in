@@ -258,4 +258,46 @@ include $(BUILD_SHARED_LIBRARY)
 
 endif # MESON_ENABLE_NPU
 
+ifeq (@MESON_ENABLE_NEURON@,1)
+
+include $(CLEAR_VARS)
+
+LOCAL_MODULE        := neuron_context
+LOCAL_SRC_FILES     := @MESON_NEURON_SRCS@
+LOCAL_C_INCLUDES    := @MESON_NEURON_INCS@ @MESON_ML_API_COMMON_ROOT@/include @MESON_NNTRAINER_INCS@
+LOCAL_EXPORT_C_INCLUDES := $(LOCAL_C_INCLUDES)
+
+LOCAL_CFLAGS        += -pthread -fexceptions @MESON_CFLAGS@ @ML_API_COMMON@
+LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions @ML_API_COMMON@ @MESON_CXXFLAGS@ -DENABLE_NEURON=1 -DPLUGGABLE=1
+LOCAL_MODULE_TAGS   := optional
+
+LOCAL_LDLIBS        := -llog -landroid
+LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384"
+
+LOCAL_SHARED_LIBRARIES += nntrainer
+
+include $(BUILD_SHARED_LIBRARY)
+
+# On android the meson `Applications/` tree is skipped entirely, so the
+# on-device smoke test has to be produced here rather than by
+# Applications/CausalLM/neuron/meson.build (which serves desktop builds).
+include $(CLEAR_VARS)
+
+LOCAL_MODULE        := nntrainer_neuron_smoke
+LOCAL_SRC_FILES     := @MESON_NEURON_SMOKE_SRCS@
+LOCAL_C_INCLUDES    := @MESON_NEURON_INCS@ @MESON_ML_API_COMMON_ROOT@/include @MESON_NNTRAINER_INCS@ @MESON_CCAPI_NNTRAINER_INCS@
+
+LOCAL_CFLAGS        += -pthread -fexceptions @MESON_CFLAGS@ @ML_API_COMMON@
+LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions @ML_API_COMMON@ @MESON_CXXFLAGS@ -DENABLE_NEURON=1
+LOCAL_MODULE_TAGS   := optional
+
+LOCAL_LDLIBS        := -llog -landroid
+LOCAL_LDFLAGS       += "-Wl,-z,max-page-size=16384"
+
+LOCAL_SHARED_LIBRARIES += nntrainer ccapi-nntrainer
+
+include $(BUILD_EXECUTABLE)
+
+endif # MESON_ENABLE_NEURON
+
 

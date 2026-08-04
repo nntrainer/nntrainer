@@ -227,11 +227,19 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   const std::string tensor_type =
     to_string(std::get<props::ModelTensorDataType>(model_flex_props));
 
-  bool has_qnn_engine = false;
+  // Detect whether an NPU-offload engine (QNN, Neuron, ...) is present and,
+  // if so, which one — setComputeBackend() below needs the exact registered
+  // Context name, not just a yes/no flag, since it is looked up via
+  // Engine::getRegisteredContext(name).
+  std::string offload_engine_name;
   for (auto &node : graph_representation) {
-    if (node->getComputeEngineType() == "qnn" ||
-        node->getType() == "qnn_graph") {
-      has_qnn_engine = true;
+    const std::string engine_type = node->getComputeEngineType();
+    if (engine_type == "qnn" || node->getType() == "qnn_graph") {
+      offload_engine_name = "qnn";
+      break;
+    }
+    if (engine_type == "neuron" || node->getType() == "neuron_graph") {
+      offload_engine_name = "neuron";
       break;
     }
   }
@@ -240,22 +248,25 @@ int NeuralNetwork::compile(ExecutionMode mode) {
     NetworkGraph(fsu, mode, fsu_path, lookahead, tensor_format, tensor_type);
 
   // QNN/HTP graphs register their I/O tensors with the DSP via rpcmem_to_fd(),
-  // which requires those buffers to be rpcmem (DMA/ION). Route ONLY the
-  // activation pool to the "qnn" (rpcmem) allocator; the weight pool stays on
-  // CPU. The nntrainer weight pool is NOT DSP-registered (QNN graph weights are
-  // loaded by the QNN context loader), so routing weights to rpcmem too would
-  // needlessly exhaust the scarce CMA pool — observed as rpcmem_to_fd failures
-  // after a few generated tokens once the app UI's GPU dmabuf also draws on
-  // CMA. Mirrors the upstream setComputeBackend("", "npu") tensor-only design
-  // (here the QNN context registers under the name "qnn").
-  if (has_qnn_engine)
-    model_graph.setComputeBackend("", "qnn");
+  // which requires those buffers to be rpcmem (DMA/ION); MediaTek Neuron
+  // graphs likewise expect their buffers through a backend-specific
+  // allocator. Route ONLY the activation pool to that allocator; the weight
+  // pool stays on CPU. The nntrainer weight pool is NOT DSP-registered (NPU
+  // graph weights are loaded by the NPU context loader), so routing weights
+  // to the vendor allocator too would needlessly exhaust the scarce CMA pool
+  // — observed as rpcmem_to_fd failures after a few generated tokens once the
+  // app UI's GPU dmabuf also draws on CMA. Mirrors the upstream
+  // setComputeBackend("", "npu") tensor-only design (here the offload
+  // context registers under its own name, e.g. "qnn" or "neuron").
+  if (!offload_engine_name.empty())
+    model_graph.setComputeBackend("", offload_engine_name);
 
-  // QNN activation tensors are rpcmem-backed and registered with the DSP, so
-  // their addresses must stay stable across decode tokens. Let inference()
-  // reuse the pool (allocate once) instead of reallocating per call. CPU/GPU
-  // keep the realloc-per-call behavior they need for correct tensor state.
-  reuse_inference_tensor_pool_ = has_qnn_engine;
+  // NPU activation tensors are vendor-allocator-backed and registered with
+  // the device, so their addresses must stay stable across decode tokens.
+  // Let inference() reuse the pool (allocate once) instead of reallocating
+  // per call. CPU/GPU keep the realloc-per-call behavior they need for
+  // correct tensor state.
+  reuse_inference_tensor_pool_ = !offload_engine_name.empty();
 
   model_graph.setMemoryOptimizations(
     std::get<props::MemoryOptimization>(model_flex_props));

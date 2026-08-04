@@ -21,6 +21,17 @@ option('opencl-kernel-path', type: 'string', value: 'nntrainer_opencl_kernels')
 option('enable-mmap', type: 'boolean', value: true)
 option('enable-npu', type: 'boolean', value: false)
 option('qnn-sdk-root', type: 'string', value: '')
+
+option('enable-neuron', type: 'boolean', value: false)
+# MediaTek NeuroPilot (Neuron Runtime) backend. Unlike enable-npu/QNN, no SDK
+# root option is needed at configure time: the two headers the plugin needs
+# (neuron/api/RuntimeAPI.h, neuron/api/Types.h) are vendored directly under
+# nntrainer/neuron/vendor/ (see that directory's README.md) since they are
+# small, self-contained, and identical across every NeuroPilot SDK per-SoC
+# tree. libneuron_runtime.so itself is resolved at runtime via dlopen, same
+# as QNN's libQnnHtp.so — nothing from the SDK is linked at build time.
+# See docs/backend_guide/NEURON_BUILD.md for details.
+
 option('mmap-read', type: 'boolean', value: true)
 option('enable-kernel-caching', type: 'boolean', value: false)
 

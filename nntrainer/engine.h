@@ -37,6 +37,9 @@
 // QNN context is loaded as a plugin .so (libqnn_context.so)
 // No header dependency needed here.
 
+// MediaTek NeuroPilot (Neuron Runtime) context is loaded as a plugin .so
+// (libneuron_context.so) the same way. No header dependency needed here.
+
 #include "singleton.h"
 
 namespace nntrainer {
