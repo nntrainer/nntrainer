@@ -44,69 +44,6 @@ static int hmx_bringup(uint8_t **vtcm_base, uint32_t *vtcm_size) {
   return AEE_SUCCESS;
 }
 
-int nntr_hvx_mm_u8i4_from_u8(remote_handle64 handle, uint32 M, uint32 K,
-                             uint32 N, const uint8 *act_u8_ah, int act_u8_ahLen,
-                             const int8 *w_i4_rm, int w_i4_rmLen,
-                             int32 *acc_i32, int acc_i32Len, uint8 *w_wh_dump,
-                             int w_wh_dumpLen) {
-  (void)handle;
-
-  const uint32_t m_pad = ROUND_UP(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
-
-  if ((uint32_t)act_u8_ahLen != m_pad * K || (uint32_t)w_i4_rmLen != K * N ||
-      (uint32_t)acc_i32Len != m_pad * N) {
-    FARF(ERROR, "bad lengths: act=%d w=%d acc=%d (M=%u K=%u N=%u m_pad=%u)",
-         act_u8_ahLen, w_i4_rmLen, acc_i32Len, (unsigned)M, (unsigned)K,
-         (unsigned)N, (unsigned)m_pad);
-    return AEE_EBADPARM;
-  }
-
-  uint8_t *vtcm_base = NULL;
-  uint32_t vtcm_size = 0;
-  int res = hmx_bringup(&vtcm_base, &vtcm_size);
-  if (res != AEE_SUCCESS) {
-    return res;
-  }
-
-  hexkl_mm_u8i4_layout L;
-  res = hexkl_mm_u8i4_plan(vtcm_base, vtcm_size, m_pad, K, N, &L);
-  if (res != AEE_SUCCESS) {
-    FARF(ERROR, "plan failed: 0x%08x (need w=%u act=%u, vtcm=%u)", res,
-         (unsigned)L.w_size, (unsigned)L.act_size, (unsigned)vtcm_size);
-    return res;
-  }
-
-  res = hexkl_micro_hmx_lock();
-  if (res != AEE_SUCCESS) {
-    FARF(ERROR, "hexkl_micro_hmx_lock failed: 0x%08x", res);
-    return res;
-  }
-
-  res = hexkl_micro_hmx_setup_acc_read_int32(vtcm_base, L.config_off);
-  if (res == AEE_SUCCESS) {
-    res = hexkl_mm_u8i4_bake_weights(&L, w_i4_rm, K, N);
-  }
-  if (res == AEE_SUCCESS) {
-    // Activation arrives already in AH layout, so a flat copy places it.
-    memcpy(vtcm_base + L.act_base, act_u8_ah, (size_t)m_pad * K);
-    res = hexkl_mm_u8i4_run(&L, m_pad, K, N, acc_i32);
-  }
-  if (res == AEE_SUCCESS && w_wh_dumpLen > 0) {
-    const uint32_t n_copy =
-      (uint32_t)w_wh_dumpLen < L.w_size ? (uint32_t)w_wh_dumpLen : L.w_size;
-    memcpy(w_wh_dump, vtcm_base + L.w_base, n_copy);
-  }
-
-  int res2 = hexkl_micro_hmx_unlock();
-  if (res2 != AEE_SUCCESS) {
-    FARF(ERROR, "hexkl_micro_hmx_unlock failed: 0x%08x", res2);
-    if (res == AEE_SUCCESS) {
-      res = res2;
-    }
-  }
-  return res;
-}
-
 int nntr_hvx_mm_u8i4_from_f32(
   remote_handle64 handle, uint32 M, uint32 K, uint32 N, const float *act_f32,
   int act_f32Len, const int8 *w_i4_rm, int w_i4_rmLen, const float *w_scale,

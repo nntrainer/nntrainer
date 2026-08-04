@@ -11,14 +11,6 @@ interface nntr_hvx : remote_handle64 {
    AEEResult add_f32(in sequence<float> a, in sequence<float> b,
                      rout sequence<float> c);
 
-   // Accuracy harness: activation already quantized on the host, so this
-   // isolates the weight bake, the WH layout and the HMX matmul.
-   AEEResult mm_u8i4_from_u8(in uint32 M, in uint32 K, in uint32 N,
-                             in sequence<uint8> act_u8_ah,
-                             in sequence<int8> w_i4_rm,
-                             rout sequence<int32> acc_i32,
-                             rout sequence<uint8> w_wh_dump);
-
    // Accuracy harness: the whole flow, quantization and dequantization on
    // the DSP. Intermediate buffers come back so each stage is checkable.
    AEEResult mm_u8i4_from_f32(in uint32 M, in uint32 K, in uint32 N,
