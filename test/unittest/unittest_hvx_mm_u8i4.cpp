@@ -154,6 +154,40 @@ void ref_int_matmul(const std::vector<uint8_t> &u_rm,
   }
 }
 
+/**
+ * @brief Dequantization reference.
+ *
+ * out[m][n] = (acc[m][n] - zp[m]*colsum[n]) * scale[m] * d[n] + bias[n]
+ *
+ * The correction term comes from feeding HMX unsigned activations:
+ *   sum_k x*w = sum_k s*(u - zp) * d*q_w
+ *             = s*d * (sum_k u*q_w  -  zp * sum_k q_w)
+ * and sum_k q_w is colsum, which the weights alone determine.
+ *
+ * |acc| <= 255*8*K and |zp*colsum| <= 255*8*K, so the difference stays
+ * inside int32 and both operands are exactly representable in f32 (below
+ * 2^24), which is why the DSP may do the correction in either domain.
+ *
+ * @param[in] acc m_pad by n, row-major
+ * @param[out] out m_valid by n, row-major
+ */
+void ref_dequant(const std::vector<int32_t> &acc, uint32_t m_valid, uint32_t N,
+                 const std::vector<float> &act_scale,
+                 const std::vector<int32_t> &act_zp,
+                 const std::vector<int32_t> &colsum,
+                 const std::vector<float> &d, const std::vector<float> &bias,
+                 std::vector<float> &out) {
+  out.assign(static_cast<size_t>(m_valid) * N, 0.0f);
+  for (uint32_t m = 0; m < m_valid; ++m) {
+    for (uint32_t n = 0; n < N; ++n) {
+      const int32_t corrected =
+        acc[static_cast<size_t>(m) * N + n] - act_zp[m] * colsum[n];
+      out[static_cast<size_t>(m) * N + n] =
+        static_cast<float>(corrected) * act_scale[m] * d[n] + bias[n];
+    }
+  }
+}
+
 /** @brief Deterministic pseudo-random fill in [-1, 1). */
 void fill_deterministic(std::vector<float> &v, uint32_t seed) {
   uint32_t s = seed;
@@ -162,6 +196,74 @@ void fill_deterministic(std::vector<float> &v, uint32_t seed) {
     v[i] = static_cast<float>(static_cast<int32_t>(s >> 8)) /
              static_cast<float>(1 << 23) -
            1.0f;
+  }
+}
+
+/**
+ * @brief Per-row asymmetric uint8 activation quantization: scale and zp.
+ *
+ * x[m][k] is recovered as scale[m] * (u[m][k] - zp[m]).
+ *
+ * Padded rows (m >= m_valid) get scale 1 and zp 0. Their uint8 values are
+ * zero, which does not decode to zero -- s*(0-zp) is nonzero whenever zp
+ * is -- so their outputs are meaningless. Rows are independent in a
+ * matmul so valid rows are unaffected; fixing scale and zp for pad rows
+ * just makes the host reference easy to keep identical to the DSP.
+ */
+void quantize_act_rows(const std::vector<float> &x, uint32_t m_valid,
+                       uint32_t m_pad, uint32_t K, std::vector<float> &scale,
+                       std::vector<int32_t> &zp) {
+  scale.assign(m_pad, 1.0f);
+  zp.assign(m_pad, 0);
+
+  for (uint32_t m = 0; m < m_valid; ++m) {
+    float min0 = x[static_cast<size_t>(m) * K];
+    float max0 = min0;
+    for (uint32_t k = 0; k < K; ++k) {
+      const float v = x[static_cast<size_t>(m) * K + k];
+      min0 = std::min(min0, v);
+      max0 = std::max(max0, v);
+    }
+    const float rmin = std::min(0.0f, min0);
+    const float rmax = std::max(0.0f, max0);
+    if (rmin == rmax) {
+      scale[m] = 1.0f;
+      zp[m] = 0;
+      continue;
+    }
+    scale[m] = (rmax - rmin) / 255.0f;
+    int32_t z = static_cast<int32_t>(std::nearbyint(-rmin / scale[m]));
+    zp[m] = std::max(0, std::min(255, z));
+  }
+}
+
+/**
+ * @brief Per-row asymmetric uint8 activation quantization: the values.
+ *
+ * std::nearbyint, not std::round: this value is computed independently on
+ * the DSP and compared byte for byte, and HVX's float add rounds to
+ * nearest-even. std::round (half away from zero) would disagree at exact
+ * .5. Weight quantization uses std::round because it runs on the host
+ * only -- see quantize_weights_qs4cx.
+ *
+ * @param[out] u_rm row-major uint8, m_pad by K
+ */
+void quantize_act_values(const std::vector<float> &x, uint32_t m_valid,
+                         uint32_t m_pad, uint32_t K,
+                         const std::vector<float> &scale,
+                         const std::vector<int32_t> &zp,
+                         std::vector<uint8_t> &u_rm) {
+  u_rm.assign(static_cast<size_t>(m_pad) * K, 0);
+  for (uint32_t m = 0; m < m_valid; ++m) {
+    const float inv_s = 1.0f / scale[m];
+    for (uint32_t k = 0; k < K; ++k) {
+      // Reciprocal multiply, matching the DSP kernel: f32 a/b and a*(1/b)
+      // can differ by 1 ULP, which breaks the S1 byte-exact check.
+      const float q = std::nearbyint(x[static_cast<size_t>(m) * K + k] * inv_s);
+      int32_t v = static_cast<int32_t>(q) + zp[m];
+      v = std::max(0, std::min(255, v));
+      u_rm[static_cast<size_t>(m) * K + k] = static_cast<uint8_t>(v);
+    }
   }
 }
 
@@ -268,6 +370,124 @@ TEST_F(HmxMmU8I4, S2_IntegerAccumulatorIsBitExact) {
               << ((i % 32 == 31) ? "\n" : " ");
   }
   std::cout << std::dec << std::flush;
+}
+
+TEST_F(HmxMmU8I4, S1_ActivationQuantMatchesHost) {
+  const uint32_t M = 64, K = 128, N = 128;
+  const uint32_t m_pad = round_up(M, kTileRow);
+
+  std::vector<float> w_f32(static_cast<size_t>(K) * N);
+  fill_deterministic(w_f32, 0x5EED0001u);
+  std::vector<int8_t> q_w;
+  std::vector<float> d;
+  std::vector<int32_t> colsum;
+  quantize_weights_qs4cx(w_f32, K, N, q_w, d, colsum);
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0002u);
+  std::vector<float> bias(N);
+  fill_deterministic(bias, 0x5EED0003u);
+
+  std::vector<float> exp_scale;
+  std::vector<int32_t> exp_zp;
+  quantize_act_rows(x, M, m_pad, K, exp_scale, exp_zp);
+  std::vector<uint8_t> exp_u_rm;
+  quantize_act_values(x, M, m_pad, K, exp_scale, exp_zp, exp_u_rm);
+  std::vector<uint8_t> exp_ah;
+  pack_ah_from_rowmajor(exp_u_rm, m_pad, K, exp_ah);
+  std::vector<int32_t> exp_acc;
+  ref_int_matmul(exp_u_rm, q_w, m_pad, K, N, exp_acc);
+
+  std::vector<uint8_t> got_ah(static_cast<size_t>(m_pad) * K, 0);
+  std::vector<float> got_scale(m_pad, 0.0f);
+  std::vector<int32_t> got_zp(m_pad, -1);
+  std::vector<int32_t> got_acc(static_cast<size_t>(m_pad) * N, 0);
+  std::vector<float> got_out(static_cast<size_t>(M) * N, 0.0f);
+
+  int err = nntr_hvx_mm_u8i4_from_f32(
+    handle_, M, K, N, x.data(), static_cast<int>(x.size()), q_w.data(),
+    static_cast<int>(q_w.size()), d.data(), static_cast<int>(d.size()),
+    colsum.data(), static_cast<int>(colsum.size()), bias.data(),
+    static_cast<int>(bias.size()), got_ah.data(),
+    static_cast<int>(got_ah.size()), got_scale.data(),
+    static_cast<int>(got_scale.size()), got_zp.data(),
+    static_cast<int>(got_zp.size()), got_acc.data(),
+    static_cast<int>(got_acc.size()), got_out.data(),
+    static_cast<int>(got_out.size()));
+  ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_from_f32 failed: " << hex(err);
+
+  for (uint32_t m = 0; m < m_pad; ++m) {
+    EXPECT_NEAR(got_scale[m], exp_scale[m], std::abs(exp_scale[m]) * 1e-6f)
+      << "scale[" << m << "]";
+    EXPECT_EQ(got_zp[m], exp_zp[m]) << "zp[" << m << "]";
+  }
+  EXPECT_EQ(got_ah, exp_ah);
+
+  // The activation the HMX actually consumed now comes from the HVX
+  // kernel, so this re-checks S2 end to end rather than with a fixed
+  // pattern.
+  EXPECT_EQ(got_acc, exp_acc);
+}
+
+TEST_F(HmxMmU8I4, S3_DequantMatchesHost) {
+  const uint32_t M = 64, K = 128, N = 128;
+  const uint32_t m_pad = round_up(M, kTileRow);
+
+  std::vector<float> w_f32(static_cast<size_t>(K) * N);
+  fill_deterministic(w_f32, 0x5EED0001u);
+  std::vector<int8_t> q_w;
+  std::vector<float> d;
+  std::vector<int32_t> colsum;
+  quantize_weights_qs4cx(w_f32, K, N, q_w, d, colsum);
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0002u);
+  std::vector<float> bias(N);
+  fill_deterministic(bias, 0x5EED0003u);
+
+  std::vector<float> exp_scale;
+  std::vector<int32_t> exp_zp;
+  quantize_act_rows(x, M, m_pad, K, exp_scale, exp_zp);
+  std::vector<uint8_t> exp_u_rm;
+  quantize_act_values(x, M, m_pad, K, exp_scale, exp_zp, exp_u_rm);
+  std::vector<int32_t> exp_acc;
+  ref_int_matmul(exp_u_rm, q_w, m_pad, K, N, exp_acc);
+  std::vector<float> exp_out;
+  ref_dequant(exp_acc, M, N, exp_scale, exp_zp, colsum, d, bias, exp_out);
+
+  std::vector<uint8_t> got_ah(static_cast<size_t>(m_pad) * K, 0);
+  std::vector<float> got_scale(m_pad, 0.0f);
+  std::vector<int32_t> got_zp(m_pad, -1);
+  std::vector<int32_t> got_acc(static_cast<size_t>(m_pad) * N, 0);
+  std::vector<float> got_out(static_cast<size_t>(M) * N, 0.0f);
+
+  int err = nntr_hvx_mm_u8i4_from_f32(
+    handle_, M, K, N, x.data(), static_cast<int>(x.size()), q_w.data(),
+    static_cast<int>(q_w.size()), d.data(), static_cast<int>(d.size()),
+    colsum.data(), static_cast<int>(colsum.size()), bias.data(),
+    static_cast<int>(bias.size()), got_ah.data(),
+    static_cast<int>(got_ah.size()), got_scale.data(),
+    static_cast<int>(got_scale.size()), got_zp.data(),
+    static_cast<int>(got_zp.size()), got_acc.data(),
+    static_cast<int>(got_acc.size()), got_out.data(),
+    static_cast<int>(got_out.size()));
+  ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_from_f32 failed: " << hex(err);
+
+  ASSERT_EQ(got_acc, exp_acc) << "accumulator diverged; S3 is meaningless";
+
+  size_t reported = 0;
+  for (uint32_t m = 0; m < M; ++m) {
+    for (uint32_t n = 0; n < N; ++n) {
+      const size_t i = static_cast<size_t>(m) * N + n;
+      const float tol = std::abs(exp_out[i]) * 1e-5f + 1e-6f;
+      if (std::abs(got_out[i] - exp_out[i]) > tol && reported < 10) {
+        ++reported;
+        ADD_FAILURE() << "out[" << m << "][" << n << "] = " << got_out[i]
+                      << ", expected " << exp_out[i];
+      }
+      EXPECT_NEAR(got_out[i], exp_out[i], tol);
+    }
+  }
 }
 
 } // namespace
