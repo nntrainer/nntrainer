@@ -72,6 +72,10 @@ void QS4CX_Tensor::pack() {
   }
 
   size_t opt_kernel_idx = 8;
+  /**
+   * @note QS4CX tensor assumes that it is per-channel quantized along width()
+   * axis which denotes output channel.
+   */
   const size_t K = height();
   const size_t N = width();
 
@@ -97,6 +101,10 @@ void *QS4CX_Tensor::getPackedData() const {
 }
 
 size_t QS4CX_Tensor::size() const {
+  /**
+   * @note QS4CX tensor assumes that it is per-channel quantized along width()
+   * axis which denotes output channel.
+   */
   const size_t K = height();
   const size_t N = width();
   return N * ((K + 1) / 2) + N * sizeof(float);
@@ -110,6 +118,10 @@ void *QS4CX_Tensor::getScale() const {
 
   data->validate();
 
+  /**
+   * @note QS4CX tensor assumes that it is per-channel quantized along width()
+   * axis which denotes output channel.
+   */
   const size_t K = height();
   const size_t N = width();
 

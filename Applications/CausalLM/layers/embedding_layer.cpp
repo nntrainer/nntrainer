@@ -513,9 +513,27 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
 
   dim.setTensorType({context.getFormat(), context.getWeightDataType()});
 
-  dim.height(in_dim);
-  dim.width(out_dim);
   dim.batch(1);
+
+  /**
+   * @note nntrainer's per-channel quantized tensor is in following shape
+   * - quantized data: (H, W)
+   * - scales: (W)
+   *
+   * For embedding, there are in_dim elements in scale.
+   * So we should use (out_dim, in_dim) dimension although actual tensor
+   * shape is (in_dim, out_dim)
+   *
+   * @todo Add other types that needs to be transposed
+   * @todo Allow other axis can be a quantization axis
+   */
+  if (context.getWeightDataType() == nntrainer::TensorDim::DataType::QS4CX) {
+    dim.height(out_dim);
+    dim.width(in_dim);
+  } else {
+    dim.height(in_dim);
+    dim.width(out_dim);
+  }
 
   weight_idx = context.requestWeight(
     dim, weight_initializer, weight_regularizer, weight_regularizer_constant,
@@ -762,8 +780,8 @@ void EmbeddingLayer::save(std::ofstream &file,
         ///@note The codelines below can be replaced with quantizer's
         /// quantize()
         nntrainer::TensorDim dim = weight.getDim();
-        unsigned int K = dim.height();
-        unsigned int N = dim.width();
+        size_t K = dim.height();
+        size_t N = dim.width();
 
         if (dtype == nntrainer::TensorDim::DataType::Q4_0) {
           NNTR_THROW_IF(N % 32 != 0, std::invalid_argument)
@@ -792,9 +810,11 @@ void EmbeddingLayer::save(std::ofstream &file,
                                    nullptr);
           quant_weight.save(file);
         } else if (dtype == nntrainer::TensorDim::DataType::QS4CX) {
-          // embedding should not be trasposed
-          const size_t N = dim.height();
-          const size_t K = dim.width();
+          /**
+           * @note QS4CX tensor uses N as the number of scale.
+           * In finalize(), we passed in_dim as width() which equals to number
+           * of scale. So we don't need to swap N and K.
+           */
 
           const size_t data_size = N * ((K + 1) / 2);
           const size_t scale_size = N * sizeof(float);
