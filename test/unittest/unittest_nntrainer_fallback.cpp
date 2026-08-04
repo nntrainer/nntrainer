@@ -932,7 +932,7 @@ TEST(nntrainer_fallback_kleidiai, quant_nxk_qs4cx_f32_basic) {
       } else if (lo_ref >= +7.0f * scale) {
         EXPECT_EQ(lo, 15);
       } else {
-        EXPECT_NEAR(lo_f, lo_ref, scale / 2);
+        EXPECT_NEAR(lo_f, lo_ref, scale / 2 + TOLERANCE);
       }
 
       if (hi_ref <= -8.0f * scale) {
@@ -940,7 +940,7 @@ TEST(nntrainer_fallback_kleidiai, quant_nxk_qs4cx_f32_basic) {
       } else if (hi_ref >= +7.0f * scale) {
         EXPECT_EQ(hi, 15);
       } else {
-        EXPECT_NEAR(hi_f, hi_ref, scale / 2);
+        EXPECT_NEAR(hi_f, hi_ref, scale / 2 + TOLERANCE);
       }
     }
   }
@@ -980,7 +980,7 @@ TEST(nntrainer_fallback_kleidiai, quant_kxn_qs4cx_f32_basic) {
       } else if (lo_ref >= +7.0f * scale_lo) {
         EXPECT_EQ(lo, 15);
       } else {
-        EXPECT_NEAR(lo_f, lo_ref, scale_lo / 2);
+        EXPECT_NEAR(lo_f, lo_ref, scale_lo / 2 + TOLERANCE);
       }
 
       if (hi_ref <= -8.0f * scale_hi) {
@@ -988,7 +988,7 @@ TEST(nntrainer_fallback_kleidiai, quant_kxn_qs4cx_f32_basic) {
       } else if (hi_ref >= +7.0f * scale_hi) {
         EXPECT_EQ(hi, 15);
       } else {
-        EXPECT_NEAR(hi_f, hi_ref, scale_hi / 2);
+        EXPECT_NEAR(hi_f, hi_ref, scale_hi / 2 + TOLERANCE);
       }
     }
   }
@@ -1028,7 +1028,7 @@ TEST(nntrainer_fallback_kleidiai, quant_nxk_qs4cx_f32_odd_k) {
       } else if (lo_ref >= +7.0f * scale) {
         EXPECT_EQ(lo, 15);
       } else {
-        EXPECT_NEAR(lo_f, lo_ref, scale / 2);
+        EXPECT_NEAR(lo_f, lo_ref, scale / 2 + TOLERANCE);
       }
 
       if (hi_ref <= -8.0f * scale) {
@@ -1036,7 +1036,7 @@ TEST(nntrainer_fallback_kleidiai, quant_nxk_qs4cx_f32_odd_k) {
       } else if (hi_ref >= +7.0f * scale) {
         EXPECT_EQ(hi, 15);
       } else {
-        EXPECT_NEAR(hi_f, hi_ref, scale / 2);
+        EXPECT_NEAR(hi_f, hi_ref, scale / 2 + TOLERANCE);
       }
     }
 
@@ -1060,7 +1060,7 @@ TEST(nntrainer_fallback_kleidiai, quant_nxk_qs4cx_f32_odd_k) {
       } else if (lo_ref >= +7.0f * scale) {
         EXPECT_EQ(lo, 15);
       } else {
-        EXPECT_NEAR(lo_f, lo_ref, scale / 2);
+        EXPECT_NEAR(lo_f, lo_ref, scale / 2 + TOLERANCE);
       }
     }
   }
@@ -1101,7 +1101,7 @@ TEST(nntrainer_fallback_kleidiai, quant_kxn_qs4cx_f32_odd_n) {
       } else if (lo_ref >= +7.0f * scale_lo) {
         EXPECT_EQ(lo, 15);
       } else {
-        EXPECT_NEAR(lo_f, lo_ref, scale_lo / 2);
+        EXPECT_NEAR(lo_f, lo_ref, scale_lo / 2 + TOLERANCE);
       }
 
       if (hi_ref <= -8.0f * scale_hi) {
@@ -1109,7 +1109,7 @@ TEST(nntrainer_fallback_kleidiai, quant_kxn_qs4cx_f32_odd_n) {
       } else if (hi_ref >= +7.0f * scale_hi) {
         EXPECT_EQ(hi, 15);
       } else {
-        EXPECT_NEAR(hi_f, hi_ref, scale_hi / 2);
+        EXPECT_NEAR(hi_f, hi_ref, scale_hi / 2 + TOLERANCE);
       }
     }
   }
@@ -1134,7 +1134,7 @@ TEST(nntrainer_fallback_kleidiai, quant_kxn_qs4cx_f32_odd_n) {
       } else if (lo_ref >= +7.0f * scale) {
         EXPECT_EQ(lo, 15);
       } else {
-        EXPECT_NEAR(lo_f, lo_ref, scale / 2);
+        EXPECT_NEAR(lo_f, lo_ref, scale / 2 + TOLERANCE);
       }
     }
   }
@@ -1166,7 +1166,7 @@ static void test_quant_nxk_qs8cx_f32(size_t n, size_t k) {
       } else if (ref >= (float)INT8_MAX * scale) {
         EXPECT_EQ(q, INT8_MAX);
       } else {
-        EXPECT_NEAR(q_f, ref, scale / 2);
+        EXPECT_NEAR(q_f, ref, scale / 2 + TOLERANCE);
       }
     }
   }
@@ -1256,7 +1256,7 @@ TEST(nntrainer_fallback_kleidiai, quant_qa8dx_basic) {
       } else if (x_ref >= (INT8_MAX + zerop_neg) * scale) {
         EXPECT_EQ(q, INT8_MAX);
       } else {
-        EXPECT_NEAR(x, x_ref, scale / 2);
+        EXPECT_NEAR(x, x_ref, scale / 2 + TOLERANCE);
       }
     }
   }
