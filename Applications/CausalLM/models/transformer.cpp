@@ -653,7 +653,75 @@ void Transformer::save_weight_lora_q4(const std::string &path) {
  */
 void Transformer::load_weight_lora_q4(const std::string &base_path,
                                       const std::string &lora_q4_path) {
-  load_weight(base_path);
+  NNTR_THROW_IF(!is_initialized, std::runtime_error)
+    << "Transformer model is not initialized. Please call "
+       "initialize() before load_weight_lora_q4().";
+
+  // The current graph has LoRA weights (loraA/loraB) spliced into every
+  // targeted FC layer, but the checkpoint at base_path has no such slots.
+  // model->load() assigns file offsets by walking the graph positionally, so
+  // loading the checkpoint directly into this model (as a naive load_weight()
+  // call would) desyncs every weight after the first LoRA slot it hits --
+  // this crashed with a heap-corrupting read inside NeuralNetwork::load().
+  // Fix: build a throwaway no-LoRA graph matching the checkpoint's own
+  // topology, load into that, then copy every matching weight over by name
+  // (mirroring load_weight_lora()'s FP32 path).
+  const unsigned int saved_lora_rank = LORA_RANK;
+  LORA_RANK = 0;
+  auto restore_lora_rank = [&]() { LORA_RANK = saved_lora_rank; };
+
+  ModelHandle base_model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+  base_model->setProperty(
+    {withKey("batch_size", BATCH_SIZE), withKey("epochs", "1"),
+     withKey("model_tensor_type", MODEL_TENSOR_TYPE)});
+  auto [bx, by] = constructModel();
+  if (base_model->compile(bx, by, ml::train::ExecutionMode::INFERENCE)) {
+    restore_lora_rank();
+    throw std::invalid_argument(
+      "Base (no-LoRA) model compilation failed during load_weight_lora_q4.");
+  }
+  base_model->load(base_path, formatFromExtension(base_path));
+
+  restore_lora_rank();
+
+  std::unordered_map<std::string, const nntrainer::Tensor *> base_weights;
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    collect = [&base_weights](ml::train::Layer &, nntrainer::RunLayerContext &context,
+                              void *) {
+      for (auto &w : context.getWeights())
+        base_weights.emplace(w->getName(), &w->getVariableRef());
+    };
+  base_model->forEachLayer(collect, nullptr);
+
+  std::vector<std::string> unmatched;
+  unsigned int matched = 0;
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    apply = [&](ml::train::Layer &, nntrainer::RunLayerContext &context, void *) {
+      for (auto &w : context.getWeights()) {
+        const std::string &name = w->getName();
+        auto it = base_weights.find(name);
+        if (it != base_weights.end()) {
+          nntrainer::Tensor &dst = w->getVariableRef();
+          const nntrainer::Tensor &src = *it->second;
+          const size_t bytes = src.getMemoryBytes();
+          std::memcpy(dst.getData<char>(), src.getData<char>(), bytes);
+          ++matched;
+        } else if (name.find(":loraA") == std::string::npos &&
+                   name.find(":loraB") == std::string::npos) {
+          unmatched.push_back(name);
+        }
+      }
+    };
+  model->forEachLayer(apply, nullptr);
+
+  NNTR_THROW_IF(!unmatched.empty(), std::runtime_error)
+    << "load_weight_lora_q4: " << unmatched.size()
+    << " non-LoRA weight(s) had no counterpart in the base checkpoint graph "
+       "(first: "
+    << unmatched.front()
+    << "). The base graph must match the graph the checkpoint was saved from.";
+  NNTR_THROW_IF(matched == 0, std::runtime_error)
+    << "load_weight_lora_q4: no weights were loaded from " << base_path;
 
   std::ifstream f(lora_q4_path, std::ios::binary);
   NNTR_THROW_IF(!f.is_open(), std::runtime_error)
