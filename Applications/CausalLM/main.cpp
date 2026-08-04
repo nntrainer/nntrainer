@@ -358,6 +358,11 @@ int main(int argc, char *argv[]) {
     resolveNntrConfigPath(nntr_cfg, "binary_config_path", model_path);
     resolveNntrConfigPath(nntr_cfg, "image_newline_path", model_path);
 
+    if (nntr_cfg.contains("lora_q4_file_name") &&
+        !nntr_cfg["lora_q4_file_name"].get<std::string>().empty()) {
+      nntr_cfg["lora_weight_q4"] = true;
+    }
+
     if (nntr_cfg.contains("system_prompt")) {
       system_head_prompt =
         nntr_cfg["system_prompt"]["head_prompt"].get<std::string>();

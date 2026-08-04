@@ -676,20 +676,21 @@ void Transformer::load_weight_lora_q4(const std::string &base_path,
           << "load_weight_lora_q4: failed reading element count at '"
           << wname << "'";
 
+        nntrainer::Tensor &dst = w->getVariableRef();
         const uint32_t expected =
-          static_cast<uint32_t>(w->getVariableRef().getDim().getDataLen());
+          static_cast<uint32_t>(dst.getDim().getDataLen());
         NNTR_THROW_IF(n != expected, std::runtime_error)
           << "load_weight_lora_q4: element count mismatch for '" << wname
           << "': file=" << n << " model=" << expected;
 
-        // Write the repacked Q4_0 bytes directly into the Q4_0 tensor
-        // buffer.
-        const size_t block_bytes = (n / 32) * 18;
-        f.read(reinterpret_cast<char *>(w->getVariableRef().getData<char>()),
-              block_bytes);
+        // For Q4_0 tensors, read directly into the tensor buffer using memcpy
+        const size_t bytes = dst.getMemoryBytes();
+        void *buf = dst.getData<char>();
+        NNTR_THROW_IF(!buf, std::runtime_error)
+          << "load_weight_lora_q4: tensor buffer not allocated for '" << wname << "'";
+        f.read(reinterpret_cast<char *>(buf), bytes);
         NNTR_THROW_IF(!f, std::runtime_error)
-          << "load_weight_lora_q4: failed reading Q4_0 data for '" << wname
-          << "'";
+          << "load_weight_lora_q4: failed reading Q4_0 data for '" << wname << "'";
       }
     };
   model->forEachLayer(fn, nullptr);
