@@ -347,7 +347,7 @@ protected:
    * being absorbed into a tolerance. S3 allows f32 ordering slack. S4 is
    * reported, not gated.
    */
-  void CheckShape(uint32_t M, uint32_t K, uint32_t N, bool want_wh_dump) {
+  void CheckShape(uint32_t M, uint32_t K, uint32_t N) {
     SCOPED_TRACE("M=" + std::to_string(M) + " K=" + std::to_string(K) +
                  " N=" + std::to_string(N));
     const uint32_t m_pad = round_up(M, kTileRow);
@@ -431,24 +431,24 @@ protected:
 
 TEST_F(HmxMmU8I4, Shape1_Minimal) {
   // Same dimensions as HexKL's own example, so a failure here is ours.
-  CheckShape(64, 128, 128, /*want_wh_dump=*/true);
+  CheckShape(64, 128, 128);
 }
 
 TEST_F(HmxMmU8I4, Shape2_DecodeSingleToken) {
   // One token padded out to a 64-row tile: the decode case, and the one
   // that exercises the zero-pad path for 63 of 64 rows.
-  CheckShape(1, 1024, 1024, /*want_wh_dump=*/false);
+  CheckShape(1, 1024, 1024);
 }
 
 TEST_F(HmxMmU8I4, Shape3_PrefillQwen3Scale) {
   // Weights alone need (1024/32)*(1024/32)*512 = 512 KiB of VTCM here.
-  CheckShape(64, 1024, 1024, /*want_wh_dump=*/false);
+  CheckShape(64, 1024, 1024);
 }
 
 TEST_F(HmxMmU8I4, Shape4_MultipleRowBlocks) {
   // Shapes 1 through 3 all pad to 64 rows, so the row-block loop only
   // ever runs with rb=0. This is the one that runs it twice.
-  CheckShape(128, 128, 128, /*want_wh_dump=*/false);
+  CheckShape(128, 128, 128);
 }
 
 } // namespace

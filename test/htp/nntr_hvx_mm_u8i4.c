@@ -22,8 +22,8 @@
 #include "hvx_quant_u8.h"
 #include "nntr_hvx.h"
 
-/** @brief Rounds @a v up to a multiple of @a a (a must be a power of two). */
-#define ROUND_UP(v, a) (((v) + ((a)-1)) & ~((a)-1))
+/** @brief Rounds @a v up to a multiple of @a a. */
+#define ROUND_UP(v, a) ((((v) + ((a)-1)) / (a)) * (a))
 
 /**
  * @brief Brings up HMX and reports the VTCM budget.
