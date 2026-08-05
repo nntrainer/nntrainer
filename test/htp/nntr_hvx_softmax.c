@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 dlwlzzero <dlwlzzero@gmail.com>
+ *
+ * @file   nntr_hvx_softmax.c
+ * @date   05 Aug 2026
+ * @brief  DSP-side entries that expose the HVX softmax kernel to the host test
+ * @see    https://github.com/nntrainer/nntrainer
+ * @author dlwlzzero <dlwlzzero@gmail.com>
+ * @bug    No known bugs except for NYI items
+ */
+
+#include <string.h>
+
+#include <AEEStdErr.h>
+#include <remote.h>
+
+#include <hexagon_types.h>
+#include <hvx_hexagon_protos.h>
+#include <qurt.h>
+
+#include "nntr_hvx.h"
+
+/** @brief f32 lanes per HVX vector in 128B mode. */
+#define LANES 32u
+
+/** @brief Fails unless the DSP actually has a 128-byte HVX context. */
+static int have_hvx(void) {
+  /* Bits 15:8 hold the number of 128-byte HVX contexts. */
+  return ((qurt_hvx_get_units() >> 8) & 0xFF) != 0;
+}
+
+int nntr_hvx_exp_f32(remote_handle64 handle, const float *x, int xLen, float *y,
+                     int yLen) {
+  (void)handle;
+  (void)x;
+
+  if (xLen != yLen || xLen <= 0 || (unsigned)xLen % LANES != 0u) {
+    return AEE_EBADPARM;
+  }
+  if (!have_hvx()) {
+    return AEE_EUNSUPPORTED;
+  }
+
+  /* Stub: proves the rout buffer comes back. Task 2 fills it in. */
+  memset(y, 0, (size_t)yLen * sizeof(float));
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_softmax_f32(remote_handle64 handle, uint32 M, uint32 K,
+                         float scale, const float *x, int xLen, float *y,
+                         int yLen) {
+  (void)handle;
+  (void)scale;
+  (void)x;
+
+  if (M == 0u || K == 0u) {
+    return AEE_EBADPARM;
+  }
+  if ((uint32)xLen != M * K || xLen != yLen) {
+    return AEE_EBADPARM;
+  }
+  if (!have_hvx()) {
+    return AEE_EUNSUPPORTED;
+  }
+
+  /* Stub: proves the rout buffer comes back. Task 3 fills it in. */
+  memset(y, 0, (size_t)yLen * sizeof(float));
+  return AEE_SUCCESS;
+}

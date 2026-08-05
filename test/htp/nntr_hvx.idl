@@ -24,4 +24,13 @@ interface nntr_hvx : remote_handle64 {
                               rout sequence<int32> act_zp,
                               rout sequence<int32> acc_i32,
                               rout sequence<float> out_f32);
+
+   // HVX softmax 검증용. exp을 따로 뚫는 이유: softmax 출력만 보면 exp의
+   // 상대오차가 sum 정규화로 상쇄되어 드러나지 않는다.
+   // xLen은 32의 배수여야 한다 (hvx_exp_sf는 벡터 단위 연산이고, 이
+   // 엔트리는 tail을 다루지 않는다).
+   AEEResult exp_f32(in sequence<float> x, rout sequence<float> y);
+
+   AEEResult softmax_f32(in uint32 M, in uint32 K, in float scale,
+                         in sequence<float> x, rout sequence<float> y);
 };
