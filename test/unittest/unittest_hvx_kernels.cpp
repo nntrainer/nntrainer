@@ -37,7 +37,7 @@ std::string hex(int err) {
 }
 
 /**
- * @brief Opens one unsigned-PD CDSP session for the whole test case.
+ * @brief Opens an unsigned-PD CDSP session for the each test.
  *
  * A failure here is a hard FAIL rather than a skip: proving the DSP comes
  * up on the device is the point of this test, so a quiet skip would
