@@ -1,0 +1,9 @@
+torch>=2.1
+transformers>=4.38
+huggingface_hub>=0.23
+safetensors>=0.4
+
+# agentic orchestration layer
+langchain>=0.2
+langchain-anthropic>=0.1.20
+langgraph>=0.1.5
