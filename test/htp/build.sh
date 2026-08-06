@@ -44,6 +44,7 @@ SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4.c $BACKEND/hmx/hexkl_mm_u8i4_dma.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_dma_ring.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_quant_u8.c $BACKEND/hvx/hvx_dequant_i32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_softmax_f32.c"
+SRCS="$SRCS $BACKEND/hvx/hvx_worker_pool.c"
 
 "$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" \
     -m"$HEX_ARCH" -mhvx -mhvx-length=128B -G0 -O3 -fPIC -shared \

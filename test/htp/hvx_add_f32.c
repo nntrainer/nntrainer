@@ -22,6 +22,7 @@
 #include <qurt.h>
 
 #include "hexkl_micro.h"
+#include "hvx_worker_pool.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
@@ -85,6 +86,19 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
     return res;
   }
 
+  // Sized from the real HVX context count (bits 15:8, same decode
+  // nntr_hvx_add_f32 uses to check HVX is present at all) minus one, since
+  // this session's own FastRPC thread uses an HVX context too when it runs
+  // quant's own share of the work.
+  const uint32_t n_hvx = (qurt_hvx_get_units() >> 8) & 0xFFu;
+  s->quant_pool = hvx_worker_pool_create(n_hvx > 1 ? n_hvx - 1 : 0);
+  if (!s->quant_pool) {
+    FARF(ERROR, "nntr_hvx_open: hvx_worker_pool_create failed");
+    hexkl_micro_hmx_unlock();
+    free(s);
+    return AEE_ENOMEMORY;
+  }
+
   *handle = (remote_handle64)s;
   return AEE_SUCCESS;
 }
@@ -99,6 +113,7 @@ int nntr_hvx_close(remote_handle64 handle) {
       hexkl_weight_u8i4_release(&s->weights, i);
     }
   }
+  hvx_worker_pool_destroy(s->quant_pool);
   int res = AEE_SUCCESS;
   if (s->hmx_locked) {
     res = hexkl_micro_hmx_unlock();

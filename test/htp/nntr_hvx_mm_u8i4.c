@@ -77,9 +77,13 @@ int nntr_hvx_mm_u8i4_from_f32(remote_handle64 handle, uint32 M, uint32 K,
        (unsigned)L.unshuf_off, (unsigned)L.config_off);
 
   // K1 then K2, writing the AH tiles straight into VTCM.
-  hvx_quant_rows_u8_params(act_f32, M, m_pad, K, act_scale, act_zp);
-  hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
-                       s->vtcm_base + L.act_base);
+  hvx_quant_rows_u8_params(act_f32, M, m_pad, K, act_scale, act_zp,
+                          s->quant_pool);
+  res = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
+                            s->vtcm_base + L.act_base, s->quant_pool);
+  if (res != AEE_SUCCESS) {
+    return res;
+  }
   memcpy(act_u8_ah, s->vtcm_base + L.act_base, (size_t)m_pad * K);
 
   // setup_acc_read_int32 already ran once in nntr_hvx_open for
@@ -167,5 +171,6 @@ int nntr_hvx_mm_u8i4_layer(remote_handle64 handle, uint32 M, uint32 K,
   }
   return hexkl_mm_u8i4_layer_run(&s->weights, s->vtcm_base, s->vtcm_size,
                                  s->config_off, M, K, w_handles,
-                                 (uint32_t)w_handlesLen, act_f32, out_cat);
+                                 (uint32_t)w_handlesLen, act_f32, out_cat,
+                                 s->quant_pool);
 }

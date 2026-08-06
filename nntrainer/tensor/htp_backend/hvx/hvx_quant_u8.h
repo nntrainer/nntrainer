@@ -15,6 +15,8 @@
 
 #include <stdint.h>
 
+#include "hvx_worker_pool.h"
+
 /**
  * @brief Computes the per-row scale and zero point (K1).
  *
@@ -28,9 +30,12 @@
  * @param[in]  m_pad    rows after padding up to a multiple of 64
  * @param[out] scale    m_pad entries
  * @param[out] zp       m_pad entries, each in [0, 255]
+ * @param[in]  pool     rows are independent, so this splits by row range.
+ *                      NULL runs single-threaded.
  */
 void hvx_quant_rows_u8_params(const float *x, uint32_t m_valid, uint32_t m_pad,
-                              uint32_t k, float *scale, int32_t *zp);
+                              uint32_t k, float *scale, int32_t *zp,
+                              hvx_worker_pool *pool);
 
 /**
  * @brief Quantizes to uint8 and writes AH tiles (K2).
@@ -44,9 +49,16 @@ void hvx_quant_rows_u8_params(const float *x, uint32_t m_valid, uint32_t m_pad,
  *
  * @param[in]  out_ah  destination, m_pad * k bytes. Usually VTCM, and then
  *                     it must be 2048-byte aligned.
+ * @param[in]  pool    splits the vectorized part by k-tile, not by row: a
+ *                     k-tile's destination bytes are its own, disjoint from
+ *                     every other k-tile's, so this preserves the 4-row
+ *                     vectorized store groups a row split would break.
+ *                     NULL runs single-threaded.
+ * @return AEE_SUCCESS, or AEE_ENOMEMORY if the small per-row vector cache
+ *         this needs to parallelize safely fails to allocate.
  */
-void hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
-                          uint32_t k, const float *scale, const int32_t *zp,
-                          uint8_t *out_ah);
+int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
+                        uint32_t k, const float *scale, const int32_t *zp,
+                        uint8_t *out_ah, hvx_worker_pool *pool);
 
 #endif /* __NNTRAINER_HVX_QUANT_U8_H__ */
