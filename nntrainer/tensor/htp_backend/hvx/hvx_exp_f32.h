@@ -53,20 +53,20 @@
  */
 static inline HVX_Vector hvx_exp_sf(HVX_Vector x) {
   const HVX_Vector log2e = hvx_splat_sf(1.44269504f); /* 1/ln(2) */
-  /* ln2_hi + ln2_lo == ln2, split so that k*ln2_hi is exact (see the
+  /** ln2_hi + ln2_lo == ln2, split so that k*ln2_hi is exact (see the
      range-reduction comment below for why one f32 constant is not enough
      and how this split fixes it). */
   const HVX_Vector ln2_hi = hvx_splat_sf(0.693359375f);
   const HVX_Vector ln2_lo = hvx_splat_sf(-2.12194440e-4f);
   const HVX_Vector zero = Q6_V_vzero();
 
-  /* Clamp the bottom. Without it a -1e30 input pushes x/ln2 past the
+  /** Clamp the bottom. Without it a -1e30 input pushes x/ln2 past the
      |v| <= 2^22 domain of hvx_sf_to_w_rne, k comes out as garbage, and the
      underflow guard below can be fooled into passing it through. -120
      underflows to zero anyway, so nothing representable is lost. */
   x = Q6_Vsf_vmax_VsfVsf(x, hvx_splat_sf(-120.0f));
 
-  /* k = round(x / ln2), kf = (float)k.
+  /** k = round(x / ln2), kf = (float)k.
      The two directions are asymmetric: Q6_Vw_equals_Vsf rounds toward
      zero, so f32 -> int32 goes through the magic-number identity in
      hvx_convert.h, while int32 -> f32 is a single numeric convert (the
@@ -74,7 +74,7 @@ static inline HVX_Vector hvx_exp_sf(HVX_Vector x) {
   const HVX_Vector k = hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(x, log2e));
   const HVX_Vector kf = Q6_Vsf_equals_Vw(k);
 
-  /* r = x - kf*ln2, in [-ln2/2, ln2/2]. Computed in qf32 (dropping to Vsf
+  /** r = x - kf*ln2, in [-ln2/2, ln2/2]. Computed in qf32 (dropping to Vsf
      only once, at the end) because x and kf*ln2 are close in magnitude
      here, and a plain-Vsf multiply would round away precision before the
      subtraction's cancellation amplifies it.
@@ -91,7 +91,7 @@ static inline HVX_Vector hvx_exp_sf(HVX_Vector x) {
   const HVX_Vector r =
     Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_Vqf32Vqf32(r_hi_qf32, kf_ln2_lo_qf32));
 
-  /* p = 1 + r + r^2 * (1/2! + r*(1/3! + r*(1/4! + r*(1/5! + r*(1/6! +
+  /** p = 1 + r + r^2 * (1/2! + r*(1/3! + r*(1/4! + r*(1/5! + r*(1/6! +
    *     r/7!)))))
      Coefficients are written as 1/n! rather than hex bit patterns so the
      value's origin stays in the source; the compiler folds them.
@@ -129,11 +129,11 @@ static inline HVX_Vector hvx_exp_sf(HVX_Vector x) {
 
   const HVX_Vector p = Q6_Vsf_equals_Vqf32(p_qf32);
 
-  /* p is in [0.707, 1.414], so its exponent field is 126 or 127. Adding
+  /** p is in [0.707, 1.414], so its exponent field is 126 or 127. Adding
      k there multiplies by 2^k. */
   const HVX_Vector y = Q6_Vw_vaslacc_VwVwR(p, k, 23);
 
-  /* If k plus that exponent lands at zero or below, the true result is
+  /** If k plus that exponent lands at zero or below, the true result is
      subnormal or smaller and the bit add produced garbage, not a small
      number. Shift off the sign bit, pull the 8 exponent bits down. */
   const HVX_Vector p_exp = Q6_Vuw_vlsr_VuwR(Q6_Vw_vasl_VwR(p, 1), 24);

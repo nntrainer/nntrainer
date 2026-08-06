@@ -28,8 +28,8 @@
 /** @brief HVX vector width in bytes (128B mode). */
 #define VLEN 128u
 /** @brief f32 lanes per HVX vector. */
-/* Kept as an int-casted expression (not the unsigned LANES form used
-   elsewhere) because n_vec/i in this file's loops are int. */
+/** Kept as an int-casted expression (not the unsigned LANES form used
+    elsewhere) because n_vec/i in this file's loops are int. */
 #define LANES ((int)(VLEN / sizeof(float)))
 
 int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
@@ -40,7 +40,7 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
     return AEE_ENOMEMORY;
   }
 
-  /* Bits 15:8 hold the number of 128-byte HVX contexts. Checked once for
+  /** Bits 15:8 hold the number of 128-byte HVX contexts. Checked once for
      the session: every entry in this skel uses HVX and the unit count does
      not change while a session is open. */
   if (((qurt_hvx_get_units() >> 8) & 0xFF) == 0) {

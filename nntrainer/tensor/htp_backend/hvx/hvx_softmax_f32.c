@@ -95,7 +95,7 @@ void hvx_softmax_rows_f32(const float *x, float *y, uint32_t m_first,
     const HVX_UVector *vx = (const HVX_UVector *)xr;
     HVX_UVector *vy = (HVX_UVector *)yr;
 
-    /* Pass 1: max of x*scale. Scaling here instead of using
+    /** Pass 1: max of x*scale. Scaling here instead of using
        scale*max(x) is what keeps a negative scale correct -- a negative
        scale flips which element is the maximum. */
     HVX_Vector vmax = hvx_splat_sf(xr[0] * scale);
@@ -109,7 +109,7 @@ void hvx_softmax_rows_f32(const float *x, float *y, uint32_t m_first,
     }
     const HVX_Vector vm = reduce_max_sf(vmax);
 
-    /* Pass 2: y = exp(x*scale - max), summing as we go. The exp results
+    /** Pass 2: y = exp(x*scale - max), summing as we go. The exp results
        go straight to y, so no scratch buffer is needed; pass 3 scales
        them in place. Reading vx[v] before writing vy[v] at the same index
        is what makes y == x safe.
@@ -128,7 +128,7 @@ void hvx_softmax_rows_f32(const float *x, float *y, uint32_t m_first,
       const HVX_Vector t = load_tail_sf(xr + nvec * LANES, nloe, 0.0f);
       HVX_Vector e =
         hvx_exp_sf(Q6_Vsf_vsub_VsfVsf(Q6_Vsf_vmpy_VsfVsf(t, vscale), vm));
-      /* The pad lanes hold exp(0*scale - max), not zero, so they have to
+      /** The pad lanes hold exp(0*scale - max), not zero, so they have to
          be masked off before they reach the sum. Padding the input cannot
          fix this: no input value maps to an exact zero after exp. */
       e = Q6_V_vmux_QVV(Q6_Q_vsetq2_R((int)(nloe * 4u)), e, Q6_V_vzero());
@@ -137,7 +137,7 @@ void hvx_softmax_rows_f32(const float *x, float *y, uint32_t m_first,
     }
     const float sum = lane0_sf(reduce_sum_sf(Q6_Vsf_equals_Vqf32(acc)));
 
-    /* Pass 3: normalize in place. sum is one scalar replicated across the
+    /** Pass 3: normalize in place. sum is one scalar replicated across the
        vector, so a scalar reciprocal is both exact and cheaper than a
        vector Newton iteration. sum is at least 1 in exact arithmetic --
        the maximum element contributes exp(0) -- so the guard is only
