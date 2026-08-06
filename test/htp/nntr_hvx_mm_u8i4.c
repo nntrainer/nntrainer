@@ -110,9 +110,9 @@ int nntr_hvx_weight_register_u8i4(remote_handle64 handle, uint32 K, uint32 N,
          (unsigned)N);
     return AEE_EBADPARM;
   }
-  return hexkl_weight_u8i4_register(&s->weights, s->vtcm_base, s->vtcm_size, K,
-                                    N, w_i4_rm, w_scale, colsum_w, bias,
-                                    w_handle);
+  return hexkl_weight_u8i4_register(&s->weights_u8i4, s->vtcm_base,
+                                    s->vtcm_size, K, N, w_i4_rm, w_scale,
+                                    colsum_w, bias, w_handle);
 }
 
 int nntr_hvx_weight_release_u8i4(remote_handle64 handle, uint32 w_handle) {
@@ -120,7 +120,7 @@ int nntr_hvx_weight_release_u8i4(remote_handle64 handle, uint32 w_handle) {
   if (!s) {
     return AEE_EBADPARM;
   }
-  return hexkl_weight_u8i4_release(&s->weights, w_handle);
+  return hexkl_weight_u8i4_release(&s->weights_u8i4, w_handle);
 }
 
 /**
@@ -145,17 +145,17 @@ int nntr_hvx_mm_u8i4_layer(remote_handle64 handle, uint32 M, uint32 K,
   uint32_t n_total = 0;
   for (int i = 0; i < w_handlesLen; ++i) {
     if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
-        !s->weights.slots[w_handles[i]].in_use) {
+        !s->weights_u8i4.slots[w_handles[i]].in_use) {
       return AEE_EBADPARM;
     }
-    n_total += s->weights.slots[w_handles[i]].N;
+    n_total += s->weights_u8i4.slots[w_handles[i]].N;
   }
   if ((uint32_t)out_catLen != M * n_total) {
     FARF(ERROR, "mm_u8i4_layer: bad out_catLen (M=%u n_total=%u)", (unsigned)M,
          (unsigned)n_total);
     return AEE_EBADPARM;
   }
-  return hexkl_mm_u8i4_layer_run(&s->weights, s->vtcm_base, s->vtcm_size,
+  return hexkl_mm_u8i4_layer_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
                                  s->config_off, M, K, w_handles,
                                  (uint32_t)w_handlesLen, act_f32, out_cat);
 }

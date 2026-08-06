@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include "hexkl_mm_u8i4_dma.h"
+#include "hexkl_mm_u8i8_dma.h"
 
 /**
  * @brief State held for the lifetime of one nntr_hvx_open()/close() pair.
@@ -34,7 +35,8 @@ typedef struct {
   uint32_t vtcm_size;
   uint32_t config_off; /**< session-constant: depends only on vtcm_size */
   int hmx_locked;      /**< close() only unlocks/finalizes what open() set up */
-  hexkl_weight_u8i4_table weights;
+  hexkl_weight_u8i4_table weights_u8i4;
+  hexkl_weight_u8i8_table weights_u8i8;
 } nntr_hvx_session;
 
 #endif /* __NNTR_HVX_SESSION_H__ */
