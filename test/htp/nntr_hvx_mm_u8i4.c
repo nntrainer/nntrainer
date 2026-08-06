@@ -18,32 +18,26 @@
 
 #include "hexkl_micro.h"
 #include "hexkl_mm_u8i4.h"
+#include "hexkl_mm_u8i4_dma.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
 #include "nntr_hvx.h"
+#include "nntr_hvx_session.h"
 
 /** @brief Rounds @a v up to a multiple of @a a. */
 #define ROUND_UP(v, a) ((((v) + ((a)-1)) / (a)) * (a))
 
 /**
- * @brief Brings up HMX and reports the VTCM budget.
+ * @brief Accuracy harness: the whole flow, quantization and dequantization
+ *        on the DSP, with every intermediate buffer returned so each stage
+ *        is checkable. Used by unittest_hvx_mm_u8i4's fixed shapes.
  *
- * Split out because both entry points need the same preamble, and because
- * the VTCM size it reports is itself a measurement we do not have yet.
+ * hw_init and the HMX lock are session-scoped (nntr_hvx_open), not per
+ * call, since doc15 §8 item 3 turned this from a call that stood alone into
+ * one of several entry points sharing one session. The weight is still
+ * baked fresh every call -- that is the point of this harness, checking the
+ * bake -- unlike the resident-weight path in mm_u8i4_layer below.
  */
-static int hmx_bringup(uint8_t **vtcm_base, uint32_t *vtcm_size) {
-  uint32_t hmx_fp16_rate = 0;
-  int res = hexkl_micro_hw_init(vtcm_base, vtcm_size, &hmx_fp16_rate);
-  if (res != AEE_SUCCESS) {
-    FARF(ERROR, "hexkl_micro_hw_init failed: 0x%08x", res);
-    return res;
-  }
-  FARF(ALWAYS, "vtcm_base=%p vtcm_size=%u config_size=%u hmx_fp16_rate=%u",
-       (void *)*vtcm_base, (unsigned)*vtcm_size,
-       (unsigned)hexkl_micro_hmx_config_size(), (unsigned)hmx_fp16_rate);
-  return AEE_SUCCESS;
-}
-
 int nntr_hvx_mm_u8i4_from_f32(
   remote_handle64 handle, uint32 M, uint32 K, uint32 N, const float *act_f32,
   int act_f32Len, const int8 *w_i4_rm, int w_i4_rmLen, const float *w_scale,
@@ -51,7 +45,10 @@ int nntr_hvx_mm_u8i4_from_f32(
   int biasLen, uint8 *act_u8_ah, int act_u8_ahLen, float *act_scale,
   int act_scaleLen, int32 *act_zp, int act_zpLen, int32 *acc_i32,
   int acc_i32Len, float *out_f32, int out_f32Len) {
-  (void)handle;
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
 
   const uint32_t m_pad = ROUND_UP(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
 
@@ -65,15 +62,8 @@ int nntr_hvx_mm_u8i4_from_f32(
     return AEE_EBADPARM;
   }
 
-  uint8_t *vtcm_base = NULL;
-  uint32_t vtcm_size = 0;
-  int res = hmx_bringup(&vtcm_base, &vtcm_size);
-  if (res != AEE_SUCCESS) {
-    return res;
-  }
-
   hexkl_mm_u8i4_layout L;
-  res = hexkl_mm_u8i4_plan(vtcm_base, vtcm_size, m_pad, K, N, &L);
+  int res = hexkl_mm_u8i4_plan(s->vtcm_base, s->vtcm_size, m_pad, K, N, &L);
   if (res != AEE_SUCCESS) {
     FARF(ERROR, "plan failed: 0x%08x", res);
     return res;
@@ -82,19 +72,13 @@ int nntr_hvx_mm_u8i4_from_f32(
   // K1 then K2, writing the AH tiles straight into VTCM.
   hvx_quant_rows_u8_params(act_f32, M, m_pad, K, act_scale, act_zp);
   hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
-                       vtcm_base + L.act_base);
-  memcpy(act_u8_ah, vtcm_base + L.act_base, (size_t)m_pad * K);
+                       s->vtcm_base + L.act_base);
+  memcpy(act_u8_ah, s->vtcm_base + L.act_base, (size_t)m_pad * K);
 
-  res = hexkl_micro_hmx_lock();
-  if (res != AEE_SUCCESS) {
-    FARF(ERROR, "hexkl_micro_hmx_lock failed: 0x%08x", res);
-    return res;
-  }
-
-  res = hexkl_micro_hmx_setup_acc_read_int32(vtcm_base, L.config_off);
-  if (res == AEE_SUCCESS) {
-    res = hexkl_mm_u8i4_bake_weights(&L, w_i4_rm, K, N);
-  }
+  // setup_acc_read_int32 already ran once in nntr_hvx_open for
+  // s->config_off, which hexkl_mm_u8i4_plan recomputes identically here
+  // (it is a pure function of vtcm_size) -- no need to call it again.
+  res = hexkl_mm_u8i4_bake_weights(&L, w_i4_rm, K, N);
   if (res == AEE_SUCCESS) {
     res = hexkl_mm_u8i4_run(&L, m_pad, K, N, acc_i32);
   }
@@ -103,13 +87,75 @@ int nntr_hvx_mm_u8i4_from_f32(
     hvx_dequant_i32_to_f32(acc_i32, M, m_pad, N, act_scale, act_zp, colsum_w,
                            w_scale, bias, out_f32);
   }
-
-  int res2 = hexkl_micro_hmx_unlock();
-  if (res2 != AEE_SUCCESS) {
-    FARF(ERROR, "hexkl_micro_hmx_unlock failed: 0x%08x", res2);
-    if (res == AEE_SUCCESS) {
-      res = res2;
-    }
-  }
   return res;
+}
+
+/**
+ * @brief Bakes a K x N int4 weight once and keeps it resident until
+ *        weight_release_u8i4 -- see hexkl_mm_u8i4_dma.h.
+ */
+int nntr_hvx_weight_register_u8i4(remote_handle64 handle, uint32 K, uint32 N,
+                                  const int8 *w_i4_rm, int w_i4_rmLen,
+                                  const float *w_scale, int w_scaleLen,
+                                  const int32 *colsum_w, int colsum_wLen,
+                                  const float *bias, int biasLen,
+                                  uint32 *w_handle) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)w_i4_rmLen != K * N || (uint32_t)w_scaleLen != N ||
+      (uint32_t)colsum_wLen != N || (uint32_t)biasLen != N) {
+    FARF(ERROR, "weight_register_u8i4: bad lengths (K=%u N=%u)", (unsigned)K,
+         (unsigned)N);
+    return AEE_EBADPARM;
+  }
+  return hexkl_weight_u8i4_register(&s->weights, s->vtcm_base, s->vtcm_size,
+                                    K, N, w_i4_rm, w_scale, colsum_w, bias,
+                                    w_handle);
+}
+
+int nntr_hvx_weight_release_u8i4(remote_handle64 handle, uint32 w_handle) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  return hexkl_weight_u8i4_release(&s->weights, w_handle);
+}
+
+/**
+ * @brief Runs a layer's worth of matmuls (Q/K/V, or gate/up) against one
+ *        shared activation -- see hexkl_mm_u8i4_dma.h. This is the entry
+ *        point PR③'s ComputeOps seam will call; nntr_hvx_mm_u8i4_from_f32
+ *        above stays the accuracy harness.
+ */
+int nntr_hvx_mm_u8i4_layer(remote_handle64 handle, uint32 M, uint32 K,
+                           const uint32 *w_handles, int w_handlesLen,
+                           const float *act_f32, int act_f32Len,
+                           float *out_cat, int out_catLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || w_handlesLen <= 0) {
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)act_f32Len != M * K) {
+    FARF(ERROR, "mm_u8i4_layer: bad act_f32Len (M=%u K=%u)", (unsigned)M,
+         (unsigned)K);
+    return AEE_EBADPARM;
+  }
+  uint32_t n_total = 0;
+  for (int i = 0; i < w_handlesLen; ++i) {
+    if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights.slots[w_handles[i]].in_use) {
+      return AEE_EBADPARM;
+    }
+    n_total += s->weights.slots[w_handles[i]].N;
+  }
+  if ((uint32_t)out_catLen != M * n_total) {
+    FARF(ERROR, "mm_u8i4_layer: bad out_catLen (M=%u n_total=%u)",
+         (unsigned)M, (unsigned)n_total);
+    return AEE_EBADPARM;
+  }
+  return hexkl_mm_u8i4_layer_run(&s->weights, s->vtcm_base, s->vtcm_size,
+                                 s->config_off, M, K, w_handles,
+                                 (uint32_t)w_handlesLen, act_f32, out_cat);
 }

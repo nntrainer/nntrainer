@@ -40,7 +40,8 @@ mkdir -p generated build
     -mdll -o generated nntr_hvx.idl
 
 SRCS="hvx_add_f32.c nntr_hvx_mm_u8i4.c nntr_hvx_softmax.c generated/nntr_hvx_skel.c"
-SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4.c"
+SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4.c $BACKEND/hmx/hexkl_mm_u8i4_dma.c"
+SRCS="$SRCS $BACKEND/hmx/hexkl_dma_ring.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_quant_u8.c $BACKEND/hvx/hvx_dequant_i32.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_softmax_f32.c"
 

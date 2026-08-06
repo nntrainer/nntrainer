@@ -11,15 +11,19 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
 
 #include <AEEStdErr.h>
+#include <HAP_farf.h>
 #include <remote.h>
 
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
 #include <qurt.h>
 
+#include "hexkl_micro.h"
 #include "nntr_hvx.h"
+#include "nntr_hvx_session.h"
 
 /** @brief HVX vector width in bytes (128B mode). */
 #define VLEN 128
@@ -28,18 +32,72 @@
 
 int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
   (void)uri;
-  /* No per-session state; a unique non-NULL handle is all FastRPC needs. */
-  void *ctx = malloc(1);
-  if (!ctx) {
+
+  nntr_hvx_session *s = (nntr_hvx_session *)calloc(1, sizeof(nntr_hvx_session));
+  if (!s) {
     return AEE_ENOMEMORY;
   }
-  *handle = (remote_handle64)ctx;
+
+  // hw_init and the HMX lock happen once here, for the session's whole
+  // lifetime, instead of per call (doc15 §3/§4) -- every other entry point
+  // in this skel reaches vtcm_base/vtcm_size/config_off through the
+  // session rather than re-acquiring either.
+  uint32_t hmx_fp16_rate = 0;
+  int res = hexkl_micro_hw_init(&s->vtcm_base, &s->vtcm_size, &hmx_fp16_rate);
+  if (res != AEE_SUCCESS) {
+    FARF(ERROR, "nntr_hvx_open: hexkl_micro_hw_init failed: 0x%08x", res);
+    free(s);
+    return res;
+  }
+  // config_off depends only on vtcm_size (see hexkl_mm_u8i4_plan), so it is
+  // computed once here rather than at every mm_u8i4_layer call.
+  const uint32_t config_size = hexkl_micro_hmx_config_size();
+  if (s->vtcm_size < config_size) {
+    free(s);
+    return AEE_ENOMEMORY;
+  }
+  s->config_off =
+    (s->vtcm_size - config_size) & ~(HEXKL_HMX_CONFIG_ALIGNMENT - 1u);
+
+  res = hexkl_micro_hmx_lock();
+  if (res != AEE_SUCCESS) {
+    FARF(ERROR, "nntr_hvx_open: hexkl_micro_hmx_lock failed: 0x%08x", res);
+    free(s);
+    return res;
+  }
+  s->hmx_locked = 1;
+
+  res = hexkl_micro_hmx_setup_acc_read_int32(s->vtcm_base, s->config_off);
+  if (res != AEE_SUCCESS) {
+    FARF(ERROR, "nntr_hvx_open: setup_acc_read_int32 failed: 0x%08x", res);
+    hexkl_micro_hmx_unlock();
+    free(s);
+    return res;
+  }
+
+  *handle = (remote_handle64)s;
   return AEE_SUCCESS;
 }
 
 int nntr_hvx_close(remote_handle64 handle) {
-  free((void *)handle);
-  return AEE_SUCCESS;
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_SUCCESS;
+  }
+  for (uint32_t i = 0; i < HEXKL_MM_U8I4_MAX_WEIGHTS; ++i) {
+    if (s->weights.slots[i].in_use) {
+      hexkl_weight_u8i4_release(&s->weights, i);
+    }
+  }
+  int res = AEE_SUCCESS;
+  if (s->hmx_locked) {
+    res = hexkl_micro_hmx_unlock();
+    if (res != AEE_SUCCESS) {
+      FARF(ERROR, "nntr_hvx_close: hexkl_micro_hmx_unlock failed: 0x%08x", res);
+    }
+  }
+  free(s);
+  return res;
 }
 
 int nntr_hvx_add_f32(remote_handle64 handle, const float *a, int aLen,
