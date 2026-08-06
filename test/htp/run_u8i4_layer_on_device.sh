@@ -1,17 +1,21 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Builds the DSP skel + the ARM gtest for the u8i4 layer endpoint and runs
-# them on a connected device.
+# Builds the DSP skel + the ARM gtest for the u8i4 AND u8i8 layer endpoints
+# and runs them on a connected device. Both live in one gtest binary
+# (unittest_hvx_mm_u8i4 despite the name -- it predates the u8i8 fixture),
+# so one run covers both.
 #
 # What this checks, in order:
 #   1. DSP skel compiles clean against HexKL (-Wall -Werror)
 #   2. libnntrainer.so + the ARM gtest binary build for arm64-v8a
-#   3. unittest_hvx_mm_u8i4 passes on-device -- both the original accuracy
-#      harness (Shape1-4) and the layer-endpoint tests
-#   4. the reported layer_x4/harness speedup lands near the 1.7-2x the
-#      cross-matmul prefetch was measured at (printed, not asserted -- see
-#      ReportPerCallCost's comment)
+#   3. unittest_hvx_mm_u8i4 passes on-device -- the original u8i4 accuracy
+#      harness (Shape1-4), the u8i4 layer-endpoint tests, and the u8i8
+#      layer-endpoint tests
+#   4. the reported layer_x4/harness speedup (u8i4) lands near the 1.7-2x
+#      the cross-matmul prefetch was measured at, and the u8i8-vs-u8i4 ratio
+#      is sane (both printed, not asserted -- see the ReportPerCallCost*
+#      tests' comments)
 #
 # Required, with no default -- these are per-machine install paths, and a
 # guessed one fails later and less clearly than an unset one does here:
@@ -159,7 +163,7 @@ adb shell "cd $DEVICE_TMP && \
 
 echo
 log "Summary"
-grep -E "^\[  (PASSED|FAILED)|U8I4_FIELD" "$RUN_LOG" || true
+grep -E "^\[  (PASSED|FAILED)|U8I[48]_FIELD" "$RUN_LOG" || true
 echo
 echo "Full log: $RUN_LOG"
 echo "Gate to clear before building on top of this: all PASSED, and the"
