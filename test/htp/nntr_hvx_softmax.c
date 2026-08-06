@@ -11,6 +11,7 @@
  */
 
 #include <AEEStdErr.h>
+#include <HAP_farf.h>
 #include <remote.h>
 
 #include <hexagon_types.h>
@@ -18,6 +19,7 @@
 #include <qurt.h>
 
 #include "nntr_hvx.h"
+#include "nntr_hvx_session.h"
 
 #include "hvx_exp_f32.h"
 #include "hvx_softmax_f32.h"
@@ -33,9 +35,17 @@ static int have_hvx(void) {
 
 int nntr_hvx_exp_f32(remote_handle64 handle, const float *x, int xLen, float *y,
                      int yLen) {
-  (void)handle;
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
 
-  if (xLen != yLen || xLen <= 0 || (unsigned)xLen % LANES != 0u) {
+  if (xLen != yLen) {
+    FARF(ERROR, "exp_f32: bad lengths (xLen=%d yLen=%d)", xLen, yLen);
+    return AEE_EBADPARM;
+  }
+  if (xLen <= 0 || (unsigned)xLen % LANES != 0u) {
+    FARF(ERROR, "exp_f32: xLen not a multiple of %u (xLen=%d)", LANES, xLen);
     return AEE_EBADPARM;
   }
   if (!have_hvx()) {
@@ -57,12 +67,19 @@ int nntr_hvx_exp_f32(remote_handle64 handle, const float *x, int xLen, float *y,
 int nntr_hvx_softmax_f32(remote_handle64 handle, uint32 M, uint32 K,
                          uint32 m_first, float scale, const float *x, int xLen,
                          float *y, int yLen) {
-  (void)handle;
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
 
   if (M == 0u || K == 0u || m_first > M) {
+    FARF(ERROR, "softmax_f32: bad shape (M=%u K=%u m_first=%u)", (unsigned)M,
+         (unsigned)K, (unsigned)m_first);
     return AEE_EBADPARM;
   }
   if ((uint32)xLen != M * K || xLen != yLen) {
+    FARF(ERROR, "softmax_f32: bad lengths (M=%u K=%u xLen=%d yLen=%d)",
+         (unsigned)M, (unsigned)K, xLen, yLen);
     return AEE_EBADPARM;
   }
   if (!have_hvx()) {
