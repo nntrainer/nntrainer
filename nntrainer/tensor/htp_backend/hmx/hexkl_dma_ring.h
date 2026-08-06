@@ -33,8 +33,8 @@ void hexkl_dma_ring_reset(void);
  * @param dst_vtcm  nonzero if @a dst is in VTCM (bypasses L2)
  */
 void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t dst_stride,
-                          uint32_t src_stride, uint32_t row_size,
-                          uint32_t nrows, int src_vtcm, int dst_vtcm);
+                           uint32_t src_stride, uint32_t row_size,
+                           uint32_t nrows, int src_vtcm, int dst_vtcm);
 
 /** @brief Blocks until every queued transfer has completed. */
 void hexkl_dma_ring_drain(void);

@@ -82,8 +82,8 @@ void hexkl_dma_ring_reset(void) {
 }
 
 void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t dst_stride,
-                          uint32_t src_stride, uint32_t row_size,
-                          uint32_t nrows, int src_vtcm, int dst_vtcm) {
+                           uint32_t src_stride, uint32_t row_size,
+                           uint32_t nrows, int src_vtcm, int dst_vtcm) {
   if (((g_push + 1) & (HEXKL_DMA_RING_N - 1)) == g_pop) {
     // Ring full: the oldest transfer must have already finished by the time
     // we have wrapped this far around, so reclaiming it is a formality, not
@@ -111,7 +111,8 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t dst_stride,
   d->row_size = row_size;
   d->nrows_lo = nrows & 0xffu;
   d->nrows_hi = (nrows >> 8) & 0xffu;
-  Q6_dccleaninva_A((void *)d); // push the descriptor to memory for the DMA engine
+  Q6_dccleaninva_A(
+    (void *)d); // push the descriptor to memory for the DMA engine
   if (!g_started) {
     hexkl_dma_start(d);
     g_started = 1;
