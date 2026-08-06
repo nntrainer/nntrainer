@@ -38,6 +38,14 @@ int nntr_hvx_open(const char *uri, remote_handle64 *handle) {
     return AEE_ENOMEMORY;
   }
 
+  /* Bits 15:8 hold the number of 128-byte HVX contexts. Checked once for
+     the session: every entry in this skel uses HVX and the unit count does
+     not change while a session is open. */
+  if (((qurt_hvx_get_units() >> 8) & 0xFF) == 0) {
+    free(s);
+    return AEE_EUNSUPPORTED;
+  }
+
   // hw_init and the HMX lock happen once here, for the session's whole
   // lifetime, instead of per call (doc15 §3/§4) -- every other entry point
   // in this skel reaches vtcm_base/vtcm_size/config_off through the
@@ -106,11 +114,6 @@ int nntr_hvx_add_f32(remote_handle64 handle, const float *a, int aLen,
 
   if (aLen != bLen || aLen != cLen) {
     return AEE_EBADPARM;
-  }
-
-  /* Bits 15:8 hold the number of 128-byte HVX contexts. */
-  if (((qurt_hvx_get_units() >> 8) & 0xFF) == 0) {
-    return AEE_EUNSUPPORTED;
   }
 
   // FastRPC buffers carry no vector alignment guarantee, so the unaligned
