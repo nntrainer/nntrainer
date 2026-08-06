@@ -23,6 +23,8 @@
 
 #include <stdint.h>
 
+#include "hvx_worker_pool.h"
+
 /** @brief Upper bound on weights resident at once. A 28-layer qwen3-sized
  *         model registers 7 per layer (q,k,v,o,gate,up,down) = 196; this
  *         leaves headroom without making the table itself large. */
@@ -87,11 +89,13 @@ int hexkl_weight_u8i4_release(hexkl_weight_u8i4_table *tbl, uint32_t handle);
  *                     once already -- this function does not repeat that
  *                     because it is session-scoped, not call-scoped.
  * @param[out] out_cat  sum(handles[i].N) * M f32 entries
+ * @param[in]  pool     forwarded to hvx_quant_rows_u8_params/
+ *                      hvx_quant_pack_u8_ah; NULL runs quant single-threaded
  */
 int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                             uint32_t vtcm_size, uint32_t config_off, uint32_t M,
                             uint32_t K, const uint32_t *handles,
                             uint32_t n_handles, const float *act_f32,
-                            float *out_cat);
+                            float *out_cat, hvx_worker_pool *pool);
 
 #endif /* __NNTRAINER_HEXKL_MM_U8I4_DMA_H__ */

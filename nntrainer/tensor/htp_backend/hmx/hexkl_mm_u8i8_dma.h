@@ -23,6 +23,8 @@
 
 #include <stdint.h>
 
+#include "hvx_worker_pool.h"
+
 /** @brief Upper bound on weights resident at once -- see the u8i4 header
  *         for the sizing rationale; identical here. */
 #define HEXKL_MM_U8I8_MAX_WEIGHTS 512
@@ -64,6 +66,6 @@ int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
                             uint32_t vtcm_size, uint32_t config_off, uint32_t M,
                             uint32_t K, const uint32_t *handles,
                             uint32_t n_handles, const float *act_f32,
-                            float *out_cat);
+                            float *out_cat, hvx_worker_pool *pool);
 
 #endif /* __NNTRAINER_HEXKL_MM_U8I8_DMA_H__ */

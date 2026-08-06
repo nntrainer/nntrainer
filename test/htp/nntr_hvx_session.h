@@ -17,6 +17,7 @@
 
 #include "hexkl_mm_u8i4_dma.h"
 #include "hexkl_mm_u8i8_dma.h"
+#include "hvx_worker_pool.h"
 
 /**
  * @brief State held for the lifetime of one nntr_hvx_open()/close() pair.
@@ -37,6 +38,7 @@ typedef struct {
   int hmx_locked;      /**< close() only unlocks/finalizes what open() set up */
   hexkl_weight_u8i4_table weights_u8i4;
   hexkl_weight_u8i8_table weights_u8i8;
+  hvx_worker_pool *quant_pool; /**< sized from the HVX unit count in open() */
 } nntr_hvx_session;
 
 #endif /* __NNTR_HVX_SESSION_H__ */

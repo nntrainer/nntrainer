@@ -82,5 +82,6 @@ int nntr_hvx_mm_u8i8_layer(remote_handle64 handle, uint32 M, uint32 K,
   }
   return hexkl_mm_u8i8_layer_run(&s->weights_u8i8, s->vtcm_base, s->vtcm_size,
                                  s->config_off, M, K, w_handles,
-                                 (uint32_t)w_handlesLen, act_f32, out_cat);
+                                 (uint32_t)w_handlesLen, act_f32, out_cat,
+                                 s->quant_pool);
 }

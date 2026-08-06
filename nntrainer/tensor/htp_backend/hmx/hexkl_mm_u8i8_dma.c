@@ -142,7 +142,7 @@ int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
                             uint32_t vtcm_size, uint32_t config_off, uint32_t M,
                             uint32_t K, const uint32_t *handles,
                             uint32_t n_handles, const float *act_f32,
-                            float *out_cat) {
+                            float *out_cat, hvx_worker_pool *pool) {
   if (!tbl || !vtcm_base || !handles || n_handles == 0 || !act_f32 ||
       !out_cat || M == 0 || K == 0) {
     return AEE_EBADPARM;
@@ -205,11 +205,13 @@ int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
     free(acc_scratch);
     return AEE_ENOMEMORY;
   }
-  hvx_quant_rows_u8_params(act_f32, M, m_pad, K, act_scale, act_zp);
-  hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
-                       vtcm_base + act_off);
+  hvx_quant_rows_u8_params(act_f32, M, m_pad, K, act_scale, act_zp, pool);
+  int rc = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
+                               vtcm_base + act_off, pool);
+  if (rc != AEE_SUCCESS) {
+    goto out;
+  }
 
-  int rc = AEE_SUCCESS;
   size_t out_off = 0;
   hexkl_dma_ring_reset();
 
