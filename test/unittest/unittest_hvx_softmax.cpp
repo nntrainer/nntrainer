@@ -181,17 +181,6 @@ TEST_F(HvxExp, FlushesFarNegativeToZero) {
   }
 }
 
-TEST_F(HvxSoftmax, RoundTripsTheOutputBuffer) {
-  const uint32_t m = 1, k = 32;
-  std::vector<float> in(m * k, 1.0f), out(m * k, -1.0f);
-
-  int err = nntr_hvx_softmax_f32(handle_, m, k, 1.0f, in.data(),
-                                 static_cast<int>(in.size()), out.data(),
-                                 static_cast<int>(out.size()));
-  ASSERT_EQ(err, AEE_SUCCESS) << "softmax_f32 failed: " << hex(err);
-  EXPECT_NE(out[0], -1.0f);
-}
-
 TEST_F(HvxSoftmax, RejectsLengthMismatch) {
   const uint32_t m = 2, k = 32;
   std::vector<float> in(m * k, 1.0f), out(k, 0.0f);
@@ -201,6 +190,142 @@ TEST_F(HvxSoftmax, RejectsLengthMismatch) {
                                  static_cast<int>(out.size()));
   EXPECT_EQ(err, AEE_EBADPARM + kDspOffset)
     << "expected EBADPARM, got " << hex(err);
+}
+
+TEST_F(HvxSoftmax, MatchesDoubleForOneFullRow) {
+  const uint32_t m = 1, k = 1024;
+  std::vector<float> in(m * k), out(m * k, 0.0f);
+
+  std::mt19937 rng(20260805u);
+  std::uniform_real_distribution<float> dist(-8.0f, 8.0f);
+  for (auto &v : in) {
+    v = dist(rng);
+  }
+
+  int err = nntr_hvx_softmax_f32(handle_, m, k, 1.0f, in.data(),
+                                 static_cast<int>(in.size()), out.data(),
+                                 static_cast<int>(out.size()));
+  ASSERT_EQ(err, AEE_SUCCESS) << "softmax_f32 failed: " << hex(err);
+
+  const std::vector<float> ref = ref_softmax(in, m, k, 1.0f);
+  double worst = 0.0;
+  double sum = 0.0;
+  for (uint32_t i = 0; i < k; ++i) {
+    worst = std::max(worst, std::abs(static_cast<double>(out[i]) - ref[i]));
+    sum += out[i];
+  }
+  EXPECT_LT(worst, 1e-6) << "worst absolute error";
+  EXPECT_NEAR(sum, 1.0, 1e-6) << "row does not sum to 1";
+}
+
+TEST_F(HvxSoftmax, IsInvariantToAConstantShift) {
+  // Adding a constant to every element must not change the result. This is
+  // what the max subtraction buys. exp(100) overflows f32, so 1e2 still
+  // forces max subtraction; going larger (e.g. 1e4) rounds f32 inputs to
+  // ULP ~0.001 on the host before the DSP sees them, making 1e-6
+  // unachievable regardless of kernel precision.
+  const uint32_t m = 1, k = 256;
+  std::vector<float> base(m * k), shifted(m * k);
+  std::vector<float> out_base(m * k, 0.0f), out_shift(m * k, 0.0f);
+
+  std::mt19937 rng(7u);
+  std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
+  for (uint32_t i = 0; i < k; ++i) {
+    base[i] = dist(rng);
+    shifted[i] = base[i] + 1e2f;
+  }
+
+  const int n = static_cast<int>(m * k);
+  ASSERT_EQ(nntr_hvx_softmax_f32(handle_, m, k, 1.0f, base.data(), n,
+                                 out_base.data(), n),
+            AEE_SUCCESS);
+  ASSERT_EQ(nntr_hvx_softmax_f32(handle_, m, k, 1.0f, shifted.data(), n,
+                                 out_shift.data(), n),
+            AEE_SUCCESS);
+
+  for (uint32_t i = 0; i < k; ++i) {
+    EXPECT_NEAR(out_base[i], out_shift[i], 1e-6) << "lane " << i;
+  }
+}
+
+TEST_F(HvxSoftmax, SpreadsUniformlyForEqualInputs) {
+  const uint32_t m = 1, k = 64;
+  const std::vector<float> in(m * k, 5.0f);
+  std::vector<float> out(m * k, 0.0f);
+
+  const int n = static_cast<int>(m * k);
+  ASSERT_EQ(
+    nntr_hvx_softmax_f32(handle_, m, k, 1.0f, in.data(), n, out.data(), n),
+    AEE_SUCCESS);
+
+  for (uint32_t i = 0; i < k; ++i) {
+    EXPECT_NEAR(out[i], 1.0f / 64.0f, 1e-6) << "lane " << i;
+  }
+}
+
+TEST_F(HvxSoftmax, CollapsesOntoADominantElement) {
+  // Every other term underflows exp. Without the guard in hvx_exp_sf these
+  // come back as garbage rather than zero.
+  const uint32_t m = 1, k = 32;
+  std::vector<float> in(m * k, 0.0f);
+  in[7] = 100.0f;
+  std::vector<float> out(m * k, -1.0f);
+
+  const int n = static_cast<int>(m * k);
+  ASSERT_EQ(
+    nntr_hvx_softmax_f32(handle_, m, k, 1.0f, in.data(), n, out.data(), n),
+    AEE_SUCCESS);
+
+  for (uint32_t i = 0; i < k; ++i) {
+    EXPECT_NEAR(out[i], i == 7 ? 1.0f : 0.0f, 1e-6) << "lane " << i;
+  }
+}
+
+TEST_F(HvxSoftmax, HandlesRowLengthsThatAreNotWholeVectors) {
+  // 1 is below one vector; 31 is one short; 33 is one over; 100 is three
+  // vectors plus four.
+  for (const uint32_t k : {1u, 31u, 33u, 100u}) {
+    const uint32_t m = 1;
+    std::vector<float> in(k), out(k, -1.0f);
+
+    std::mt19937 rng(k);
+    std::uniform_real_distribution<float> dist(-4.0f, 4.0f);
+    for (auto &v : in) {
+      v = dist(rng);
+    }
+
+    const int n = static_cast<int>(k);
+    ASSERT_EQ(
+      nntr_hvx_softmax_f32(handle_, m, k, 1.0f, in.data(), n, out.data(), n),
+      AEE_SUCCESS)
+      << "k=" << k;
+
+    const std::vector<float> ref = ref_softmax(in, m, k, 1.0f);
+    double sum = 0.0;
+    for (uint32_t i = 0; i < k; ++i) {
+      EXPECT_NEAR(out[i], ref[i], 1e-6) << "k=" << k << " lane " << i;
+      sum += out[i];
+    }
+    EXPECT_NEAR(sum, 1.0, 1e-6) << "k=" << k << " does not sum to 1";
+  }
+}
+
+TEST_F(HvxSoftmax, DoesNotWritePastTheEndOfTheBuffer) {
+  // k=33 means the tail vector covers 32 lanes but only 1 is real. A
+  // full-vector store would clobber 31 floats of whatever follows.
+  const uint32_t m = 1, k = 33;
+  const uint32_t guard = 64;
+  std::vector<float> buf(k + guard, 12345.0f);
+  std::vector<float> in(k, 1.0f);
+
+  const int n = static_cast<int>(k);
+  ASSERT_EQ(
+    nntr_hvx_softmax_f32(handle_, m, k, 1.0f, in.data(), n, buf.data(), n),
+    AEE_SUCCESS);
+
+  for (uint32_t i = 0; i < guard; ++i) {
+    EXPECT_EQ(buf[k + i], 12345.0f) << "clobbered guard word " << i;
+  }
 }
 
 } // namespace

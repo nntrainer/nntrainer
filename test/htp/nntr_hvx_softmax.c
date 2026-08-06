@@ -10,8 +10,6 @@
  * @bug    No known bugs except for NYI items
  */
 
-#include <string.h>
-
 #include <AEEStdErr.h>
 #include <remote.h>
 
@@ -22,6 +20,7 @@
 #include "nntr_hvx.h"
 
 #include "hvx_exp_f32.h"
+#include "hvx_softmax_f32.h"
 
 /** @brief f32 lanes per HVX vector in 128B mode. */
 #define LANES 32u
@@ -59,8 +58,6 @@ int nntr_hvx_softmax_f32(remote_handle64 handle, uint32 M, uint32 K,
                          float scale, const float *x, int xLen, float *y,
                          int yLen) {
   (void)handle;
-  (void)scale;
-  (void)x;
 
   if (M == 0u || K == 0u) {
     return AEE_EBADPARM;
@@ -72,7 +69,6 @@ int nntr_hvx_softmax_f32(remote_handle64 handle, uint32 M, uint32 K,
     return AEE_EUNSUPPORTED;
   }
 
-  /* Stub: proves the rout buffer comes back. Task 3 fills it in. */
-  memset(y, 0, (size_t)yLen * sizeof(float));
+  hvx_softmax_rows_f32(x, y, 0u, M, K, scale);
   return AEE_SUCCESS;
 }

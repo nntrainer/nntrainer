@@ -42,6 +42,7 @@ mkdir -p generated build
 SRCS="hvx_add_f32.c nntr_hvx_mm_u8i4.c nntr_hvx_softmax.c generated/nntr_hvx_skel.c"
 SRCS="$SRCS $BACKEND/hmx/hexkl_mm_u8i4.c"
 SRCS="$SRCS $BACKEND/hvx/hvx_quant_u8.c $BACKEND/hvx/hvx_dequant_i32.c"
+SRCS="$SRCS $BACKEND/hvx/hvx_softmax_f32.c"
 
 "$DEFAULT_HEXAGON_TOOLS_ROOT/Tools/bin/hexagon-clang" \
     -m"$HEX_ARCH" -mhvx -mhvx-length=128B -G0 -O3 -fPIC -shared \
