@@ -98,7 +98,8 @@ hvx_worker_pool *hvx_worker_pool_create(uint32_t n_workers) {
   }
 
   pool->tids = (qurt_thread_t *)calloc(n_workers, sizeof(qurt_thread_t));
-  pool->worker_ctx = (hvx_worker_ctx *)calloc(n_workers, sizeof(hvx_worker_ctx));
+  pool->worker_ctx =
+    (hvx_worker_ctx *)calloc(n_workers, sizeof(hvx_worker_ctx));
   pool->stack_blob =
     (unsigned char *)malloc((size_t)n_workers * HVX_WORKER_POOL_STACK_SIZE);
   if (!pool->tids || !pool->worker_ctx || !pool->stack_blob) {
@@ -131,7 +132,7 @@ hvx_worker_pool *hvx_worker_pool_create(uint32_t n_workers) {
     qurt_thread_attr_set_name(&attr, name);
 
     if (qurt_thread_create(&pool->tids[i], &attr, hvx_worker_pool_thread_entry,
-                          &pool->worker_ctx[i]) != 0) {
+                           &pool->worker_ctx[i]) != 0) {
       // Only i threads actually started; limit teardown's join loop to
       // those.
       pool->n_workers = i;
@@ -163,7 +164,7 @@ void hvx_worker_pool_destroy(hvx_worker_pool *pool) {
 }
 
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
-                        void *ctx, uint32_t n_units) {
+                         void *ctx, uint32_t n_units) {
   if (!pool || pool->n_workers == 0 || n_units <= 1) {
     func(n_units == 0 ? 1u : n_units, 0, ctx);
     return;

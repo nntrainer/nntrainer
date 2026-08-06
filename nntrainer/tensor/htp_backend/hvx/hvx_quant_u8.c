@@ -174,21 +174,24 @@ typedef struct {
 static void quant_pack_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
   quant_pack_ctx *ctx = (quant_pack_ctx *)ctx_;
   const uint32_t lo = (uint32_t)((uint64_t)ctx->n_ktiles * i / n_threads);
-  const uint32_t hi =
-    (uint32_t)((uint64_t)ctx->n_ktiles * (i + 1) / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)ctx->n_ktiles * (i + 1) / n_threads);
 
   for (uint32_t kt = lo; kt < hi; ++kt) {
     for (uint32_t m = 0; m < ctx->m_vec_end; m += 4u) {
       const uint32_t rb = m / TILE_ROW;
       const uint32_t r0 = m % TILE_ROW; // multiple of 4; group never wraps rb
       const HVX_UVector *vin0 =
-        (const HVX_UVector *)(ctx->x + (size_t)(m + 0) * ctx->k + kt * TILE_INNER);
+        (const HVX_UVector *)(ctx->x + (size_t)(m + 0) * ctx->k +
+                              kt * TILE_INNER);
       const HVX_UVector *vin1 =
-        (const HVX_UVector *)(ctx->x + (size_t)(m + 1) * ctx->k + kt * TILE_INNER);
+        (const HVX_UVector *)(ctx->x + (size_t)(m + 1) * ctx->k +
+                              kt * TILE_INNER);
       const HVX_UVector *vin2 =
-        (const HVX_UVector *)(ctx->x + (size_t)(m + 2) * ctx->k + kt * TILE_INNER);
+        (const HVX_UVector *)(ctx->x + (size_t)(m + 2) * ctx->k +
+                              kt * TILE_INNER);
       const HVX_UVector *vin3 =
-        (const HVX_UVector *)(ctx->x + (size_t)(m + 3) * ctx->k + kt * TILE_INNER);
+        (const HVX_UVector *)(ctx->x + (size_t)(m + 3) * ctx->k +
+                              kt * TILE_INNER);
 
       const HVX_Vector vq0 = Q6_Vw_vadd_VwVw(
         hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin0[0], ctx->vinv[m + 0])),
@@ -214,16 +217,16 @@ static void quant_pack_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
       const HVX_Vector vb = Q6_Vub_vpack_VhVh_sat(vh23, vh01);
 
       uint8_t *dst = ctx->out_ah +
-                    (size_t)(rb * ctx->n_ktiles + kt) * ACT_TILE_BYTES +
-                    r0 * TILE_INNER;
+                     (size_t)(rb * ctx->n_ktiles + kt) * ACT_TILE_BYTES +
+                     r0 * TILE_INNER;
       *(HVX_UVector *)dst = vb;
     }
   }
 }
 
 int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
-                        uint32_t k, const float *scale, const int32_t *zp,
-                        uint8_t *out_ah, hvx_worker_pool *pool) {
+                         uint32_t k, const float *scale, const int32_t *zp,
+                         uint8_t *out_ah, hvx_worker_pool *pool) {
   const uint32_t n_ktiles = k / TILE_INNER;
 
   memset(out_ah, 0, (size_t)m_pad * k);
@@ -274,8 +277,8 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
   for (uint32_t m = m_vec_end; m < m_valid; ++m) {
     const uint32_t rb = m / TILE_ROW;
     const uint32_t r = m % TILE_ROW;
-    uint8_t *dst_tile0 = out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES +
-                        r * TILE_INNER;
+    uint8_t *dst_tile0 =
+      out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES + r * TILE_INNER;
     quant_pack_row_scalar(x + (size_t)m * k, n_ktiles,
                           hvx_splat_sf(1.0f / scale[m]), Q6_V_vsplat_R(zp[m]),
                           dst_tile0, ACT_TILE_BYTES);

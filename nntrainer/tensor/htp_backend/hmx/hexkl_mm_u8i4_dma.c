@@ -212,7 +212,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   }
   hvx_quant_rows_u8_params(act_f32, M, m_pad, K, act_scale, act_zp, pool);
   int rc = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
-                               vtcm_base + act_off, pool);
+                                vtcm_base + act_off, pool);
   if (rc != AEE_SUCCESS) {
     goto out;
   }

@@ -23,8 +23,7 @@
  *        by writing one more function with this signature, with nothing
  *        below it needing to change.
  */
-typedef void (*hvx_worker_pool_func)(uint32_t n_threads, uint32_t i,
-                                    void *ctx);
+typedef void (*hvx_worker_pool_func)(uint32_t n_threads, uint32_t i, void *ctx);
 
 typedef struct hvx_worker_pool_s hvx_worker_pool;
 
@@ -53,6 +52,6 @@ void hvx_worker_pool_destroy(hvx_worker_pool *pool);
  * single-owner assumption as the HMX lock this pool lives alongside.
  */
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
-                        void *ctx, uint32_t n_units);
+                         void *ctx, uint32_t n_units);
 
 #endif /* __NNTRAINER_HVX_WORKER_POOL_H__ */
