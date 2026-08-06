@@ -174,6 +174,9 @@ int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
     }
   }
 
+  // See hexkl_mm_u8i4_dma.c's VTCM layout comment: one result slot per
+  // (row-band, output-tile) pair, so async output write-back never has
+  // to be waited on before the next tile's acc_read reuses a slot.
   const uint32_t act_bytes =
     n_rblocks * k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
   const uint32_t act_off = 0;
@@ -182,12 +185,13 @@ int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
     ROUND_UP_U32(act_off + act_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT),
     ROUND_UP_U32(act_off + act_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT) + wb_max,
   };
+  const uint32_t n_slots = n_tiles_max * n_rblocks;
   const uint32_t result_off =
     ROUND_UP_U32(wbuf[1] + wb_max, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  if (result_off + ACC_TILE_BYTES > config_off) {
+  if (result_off + (uint64_t)n_slots * ACC_TILE_BYTES > config_off) {
     return AEE_ENOMEMORY; // double-buffered widest weight does not fit VTCM
   }
-  if (result_off + ACC_TILE_BYTES > vtcm_size) {
+  if (result_off + (uint64_t)n_slots * ACC_TILE_BYTES > vtcm_size) {
     return AEE_ENOMEMORY;
   }
 
@@ -247,18 +251,26 @@ int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
             goto out;
           }
         }
-        rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off, result_off);
+        // This tile's own slot -- see hexkl_mm_u8i4_dma.c's VTCM layout
+        // comment for why (rb, nt) never collide with another in-flight
+        // tile.
+        const uint32_t slot_off =
+          result_off + (rb * n_tiles_max + nt) * ACC_TILE_BYTES;
+        rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off, slot_off);
         if (rc != AEE_SUCCESS) {
           goto out;
         }
-        rc = hexkl_micro_hmx_copy_32b_to_submatrix(
-          vtcm_base, result_off, acc_scratch, rb, nt, m_pad, h->N);
-        if (rc != AEE_SUCCESS) {
-          goto out;
-        }
+
+        // See hexkl_mm_u8i4_dma.c: async VTCM -> DDR write-back replacing
+        // the scalar hexkl_micro_hmx_copy_32b_to_submatrix.
+        int32_t *dst = acc_scratch + (size_t)rb * 64 * h->N + (size_t)nt * 32;
+        hexkl_dma_ring_push2d(dst, vtcm_base + slot_off, h->N * 4, 32 * 4,
+                             32 * 4, 64, /*src_vtcm=*/1, /*dst_vtcm=*/0);
       }
     }
 
+    // See hexkl_mm_u8i4_dma.c: this drain covers both the next handle's
+    // weight prefetch and every output tile pushed above.
     hexkl_dma_ring_drain();
 
     hvx_dequant_i32_to_f32(acc_scratch, M, m_pad, h->N, act_scale, act_zp,

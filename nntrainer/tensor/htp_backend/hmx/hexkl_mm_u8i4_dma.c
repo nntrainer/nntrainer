@@ -173,7 +173,13 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   }
 
   // VTCM layout: activation (all row-bands, shared across every handle) |
-  // weight double-buffer (sized for the widest handle) | one result tile.
+  // weight double-buffer (sized for the widest handle) | one result slot
+  // per (row-band, output-tile) pair, so that async-DMA-ing one tile out
+  // to DDR never has to be waited on before the next tile's acc_read can
+  // reuse its slot -- they simply don't share a slot within one handle.
+  // Slots ARE reused across handles: the ring is drained (see below)
+  // before a handle's dequant, which is also before the next handle's
+  // acc_read could touch them again.
   const uint32_t act_bytes =
     n_rblocks * k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
   const uint32_t act_off = 0;
@@ -182,12 +188,13 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     ROUND_UP_U32(act_off + act_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT),
     ROUND_UP_U32(act_off + act_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT) + wb_max,
   };
+  const uint32_t n_slots = n_tiles_max * n_rblocks;
   const uint32_t result_off =
     ROUND_UP_U32(wbuf[1] + wb_max, HEXKL_HMX_ACTIVATION_ALIGNMENT);
   // config_off is at or below vtcm_size (checked above), so clearing it also
   // clears the arena -- one bound, not two.
-  if (result_off + ACC_TILE_BYTES > config_off) {
-    return AEE_ENOMEMORY; // double-buffered widest weight does not fit VTCM
+  if (result_off + (uint64_t)n_slots * ACC_TILE_BYTES > config_off) {
+    return AEE_ENOMEMORY; // the per-slot result tiles do not fit VTCM
   }
 
   // K1/K2: quantize the shared activation once, straight into its AH tiles
@@ -255,23 +262,35 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
             goto out;
           }
         }
-        rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off, result_off);
+        // This tile's own slot -- see the VTCM layout comment above for
+        // why (rb, nt) never collide with another in-flight tile.
+        const uint32_t slot_off =
+          result_off + (rb * n_tiles_max + nt) * ACC_TILE_BYTES;
+        rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off, slot_off);
         if (rc != AEE_SUCCESS) {
           goto out;
         }
-        rc = hexkl_micro_hmx_copy_32b_to_submatrix(
-          vtcm_base, result_off, acc_scratch, rb, nt, m_pad, h->N);
-        if (rc != AEE_SUCCESS) {
-          goto out;
-        }
+
+        // Async VTCM -> DDR write-back, queued onto the same ring as the
+        // weight prefetch below: replaces
+        // hexkl_micro_hmx_copy_32b_to_submatrix's scalar strided copy with
+        // a transfer that overlaps the NEXT tile's HMX+acc_read instead of
+        // blocking on it. Matches hexkl_micro_hmx_copy_32b_to_submatrix's
+        // own addressing exactly (tile (rb, nt) of an m_pad x h->N
+        // row-major matrix), just moved by DMA rather than a scalar loop.
+        int32_t *dst = acc_scratch + (size_t)rb * 64 * h->N + (size_t)nt * 32;
+        hexkl_dma_ring_push2d(dst, vtcm_base + slot_off, h->N * 4, 32 * 4,
+                              32 * 4, 64, /*src_vtcm=*/1, /*dst_vtcm=*/0);
       }
     }
 
-    // Block until handle i+1's weight has fully landed before moving on to
-    // it -- matches the measured bench's "next weight fully in wnxt before
-    // matmul i+1" invariant. Dequant below does not touch the DMA engine,
-    // so a later pass could move it ahead of this drain to overlap with
-    // the prefetch; left as-is for correctness first.
+    // Drains two things queued on this one ring: handle i+1's weight
+    // prefetch (must have fully landed before matmul i+1, matching the
+    // measured bench's invariant) and every output tile pushed above
+    // (must have landed before dequant below reads acc_scratch). Dequant
+    // does not touch the DMA engine, so a later pass could move it ahead
+    // of this drain to overlap with the next handle's weight prefetch;
+    // left as-is for correctness first.
     hexkl_dma_ring_drain();
 
     hvx_dequant_i32_to_f32(acc_scratch, M, m_pad, h->N, act_scale, act_zp,
