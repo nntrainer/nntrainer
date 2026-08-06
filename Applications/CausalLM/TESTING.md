@@ -83,11 +83,12 @@ The script handles meson setup, ninja build, fixture extraction, and sets
 | `Applications/CausalLM/lib/libtokenizers_android_c.a` | arm64 build — copy from an existing workspace or build with `./Applications/CausalLM/build_tokenizer_android.sh` (requires Rust + network) |
 | `Applications/CausalLM/json.hpp` | Run `./jni/prepare_encoder.sh builddir 0.2` if absent |
 
-### Step 1: Build core nntrainer for Android
+### Step 1: Build the canonical Android native artifacts
 
 ```bash
-./tools/package_android.sh
-# output: builddir/android_build_result/lib/arm64-v8a/libnntrainer.so
+./Applications/CausalLM/build_android.sh
+# core:  builddir_app/cpu/libcausallm.so
+# tools: builddir_app/cpu/nntr_quantize
 ```
 
 ### Step 2: Vendor googletest (one-time)
@@ -109,7 +110,8 @@ ndk-build \
   NDK_OUT=Applications/CausalLM/jni/obj \
   APP_BUILD_SCRIPT=Applications/CausalLM/jni/Android.mk \
   NDK_APPLICATION_MK=Applications/CausalLM/jni/Application.mk \
-  causallm_core nntr_quantize unittest_causallm_models \
+  CAUSALLM_PREBUILT_LIB=../../../builddir_app/cpu/libcausallm.so \
+  unittest_causallm_models \
   -j$(nproc)
 # output: Applications/CausalLM/jni/obj/local/arm64-v8a/
 ```
@@ -126,16 +128,18 @@ tar xzf packaging/causallm_reference_embedding.tar.gz  -C test/unittest/models/
 
 ```bash
 INSTALL=/data/local/tmp/nntr_causallm_test
-JNI=Applications/CausalLM/jni/obj/local/arm64-v8a
+TEST=Applications/CausalLM/jni/obj/local/arm64-v8a
+NATIVE=builddir_app/cpu
+ENGINE=builddir/android_build_result/lib/arm64-v8a
 
 adb shell "mkdir -p $INSTALL/causallm_reference $INSTALL/tmp"
 
-adb push $JNI/unittest_causallm_models  $INSTALL/
-adb push $JNI/nntr_quantize            $INSTALL/
-adb push $JNI/libcausallm_core.so      $INSTALL/
-adb push $JNI/libnntrainer.so          $INSTALL/
-adb push $JNI/libccapi-nntrainer.so    $INSTALL/
-adb push builddir/android_build_result/lib/arm64-v8a/libc++_shared.so $INSTALL/
+adb push $TEST/unittest_causallm_models $INSTALL/
+adb push $NATIVE/nntr_quantize          $INSTALL/
+adb push $NATIVE/libcausallm.so         $INSTALL/
+adb push $ENGINE/libnntrainer.so        $INSTALL/
+adb push $ENGINE/libccapi-nntrainer.so  $INSTALL/
+adb push $ENGINE/libc++_shared.so       $INSTALL/
 adb push test/unittest/models/causallm_reference $INSTALL/
 
 adb shell "chmod 755 $INSTALL/unittest_causallm_models $INSTALL/nntr_quantize"
@@ -155,8 +159,8 @@ adb shell "chmod 755 $INSTALL/unittest_causallm_models $INSTALL/nntr_quantize"
 ./Applications/CausalLM/run_unittest_android.sh --cache --filter '*Q40*'
 ```
 
-The script runs all six steps above end-to-end. Use `--cache` to skip
-the nntrainer build and ndk-build when only the test execution needs to be re-run.
+The script runs all six steps above end-to-end. Use `--cache` to reuse a
+compatible canonical native build and the test-only ndk-build artifact.
 
 ### Expected result
 
@@ -180,5 +184,5 @@ the nntrainer build and ndk-build when only the test execution needs to be re-ru
 |---------|-------|-----|
 | All differential tests SKIP | `NNTRAINER_CAUSALLM_FIXTURE_DIR` not set or fixtures not pushed | Verify `adb shell ls $INSTALL/causallm_reference/` |
 | All Q4_0 tests SKIP | `NNTR_QUANTIZE_BIN` not set or binary not pushed | Verify `adb shell ls $INSTALL/nntr_quantize` |
-| Linker error: `libcausallm_core.so` not found | Libraries not in `LD_LIBRARY_PATH` | Ensure all `.so` files are in `$INSTALL` |
+| Linker error: `libcausallm.so` not found | Libraries not in `LD_LIBRARY_PATH` | Ensure all `.so` files are in `$INSTALL` |
 

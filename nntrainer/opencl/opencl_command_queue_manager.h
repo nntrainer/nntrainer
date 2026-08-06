@@ -19,6 +19,17 @@
 #include "singleton.h"
 #include <memory>
 
+namespace nntrainer {
+namespace opencl {
+/** @brief Forward declaration of CommandQueueManager. */
+class CommandQueueManager;
+} // namespace opencl
+/** @brief Return the CommandQueueManager singleton. */
+template <>
+NNTRAINER_SINGLETON_API opencl::CommandQueueManager &
+Singleton<opencl::CommandQueueManager>::Global();
+} // namespace nntrainer
+
 namespace nntrainer::opencl {
 
 /**

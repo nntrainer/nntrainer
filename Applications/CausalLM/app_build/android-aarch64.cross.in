@@ -1,0 +1,21 @@
+# Meson cross file for Android aarch64 (arm64-v8a)
+# Generated from template by build.sh — do not edit the generated copy.
+# @ANDROID_NDK@ is substituted with the ANDROID_NDK environment variable.
+
+[binaries]
+c = '@ANDROID_NDK@/toolchains/llvm/prebuilt/@ANDROID_NDK_HOST@/bin/aarch64-linux-android29-clang@ANDROID_CLANG_SUFFIX@'
+cpp = '@ANDROID_NDK@/toolchains/llvm/prebuilt/@ANDROID_NDK_HOST@/bin/aarch64-linux-android29-clang++@ANDROID_CLANG_SUFFIX@'
+ar = '@ANDROID_NDK@/toolchains/llvm/prebuilt/@ANDROID_NDK_HOST@/bin/llvm-ar@ANDROID_EXE_SUFFIX@'
+strip = '@ANDROID_NDK@/toolchains/llvm/prebuilt/@ANDROID_NDK_HOST@/bin/llvm-strip@ANDROID_EXE_SUFFIX@'
+
+[built-in options]
+c_args = ['-O3', '-ffast-math']
+cpp_args = ['-O3', '-ffast-math', '-frtti', '-fexceptions']
+c_link_args = ['-fexceptions', '-fopenmp', '-static-openmp']
+cpp_link_args = ['-fexceptions', '-fopenmp', '-static-openmp']
+
+[host_machine]
+system = 'android'
+cpu_family = 'aarch64'
+cpu = 'armv8'
+endian = 'little'

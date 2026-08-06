@@ -3,8 +3,9 @@
  * Copyright (C) 2026 Samsung Electronics Co., Ltd. All Rights Reserved.
  *
  * @file    streamer.cpp
- * @brief   Null-safe BaseStreamer vtable helpers.
- * @author  Joonseok Oh <jrock.oh@samsung.com>
+ * @brief   Null-safe wrappers around the BaseStreamer vtable declared in
+ *          streamer.h. See AsyncAndStreaming.md §3.1.
+ * @author  junbong.yu <junbong.yu@samsung.com>
  * @bug     No known bugs except for NYI items
  */
 
@@ -17,7 +18,6 @@ int streamer_put(BaseStreamer *self, const char *decoded_utf8) {
       self->vtable->put == nullptr || decoded_utf8 == nullptr) {
     return 0;
   }
-
   return self->vtable->put(self, decoded_utf8);
 }
 
@@ -26,7 +26,6 @@ void streamer_end(BaseStreamer *self) {
       self->vtable->end == nullptr) {
     return;
   }
-
   self->vtable->end(self);
 }
 

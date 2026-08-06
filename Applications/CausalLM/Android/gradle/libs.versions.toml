@@ -1,0 +1,72 @@
+[versions]
+# Toolchain pinned to versions proven to be resolvable from the
+# target environment's Maven mirror, determined empirically from
+# build failure logs:
+#
+#  - kotlin-stdlib/kotlin-reflect 2.2.21 appeared in ~/.gradle/caches
+#    as transitive deps of litertlm-android, proving 2.2.21 is in the
+#    mirror. Kotlin 2.2.21 also matches what most Kotlin 2.2-compiled
+#    LiteRT-LM artifacts expect, so we pin the Kotlin compiler here.
+#
+#  - litertlm-android 0.10.0 is the concrete version the mirror serves
+#    when we ask for `latest.release`. LiteRT-LM 1.0.1 (which we
+#    originally targeted) is NOT in the mirror. 0.10.0's public API
+#    matches the one we code against (Content / Contents / Backend /
+#    EngineConfig with visionBackend / sendMessage(Contents) / etc),
+#    so pinning down a minor version does not require any code
+#    changes.
+#
+#  - AGP 8.9.1 is the last AGP that ships the old Kotlin serialization
+#    plugin default wiring and is compatible with Kotlin 2.2.21 (the
+#    combination emits a "Kotlin version tested up to 2.1" warning
+#    but the build succeeds — suppressed via
+#    kotlin.compiler.suppressExperimentalICOptimizationsWarning).
+#
+#  - Gradle 8.11.1 is the paired Gradle for AGP 8.9.x.
+#
+# LiteRT-LM 0.10.0 itself was compiled with Kotlin 2.3.0; Kotlin
+# 2.2.21's compiler cannot natively read 2.3.0-stamped metadata, so
+# every module adds `-Xskip-metadata-version-check` to
+# kotlinOptions.freeCompilerArgs. The flag is safe here because 2.3
+# only added new metadata fields on top of 2.2, and every LiteRT-LM
+# symbol we actually call predates 2.3.
+agp = "8.9.1"
+kotlin = "2.2.21"
+kotlinxSerialization = "1.7.3"
+kotlinxCoroutines = "1.9.0"
+okhttp = "4.12.0"
+nanohttpd = "2.3.1"
+litertlm = "0.10.0"
+coreKtx = "1.18.0"
+junit = "4.13.2"
+junitVersion = "1.3.0"
+espressoCore = "3.7.0"
+appcompat = "1.7.1"
+material = "1.13.0"
+constraintlayout = "2.2.1"
+activity = "1.13.0"
+lifecycleRuntimeKtx = "2.9.0"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
+androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
+material = { group = "com.google.android.material", name = "material", version.ref = "material" }
+androidx-constraintlayout = { group = "androidx.constraintlayout", name = "constraintlayout", version.ref = "constraintlayout" }
+androidx-activity = { group = "androidx.activity", name = "activity", version.ref = "activity" }
+androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntimeKtx" }
+
+# QuickAI additions
+nanohttpd = { group = "org.nanohttpd", name = "nanohttpd", version.ref = "nanohttpd" }
+kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
+kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "kotlinxCoroutines" }
+okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
+litertlm-android = { group = "com.google.ai.edge.litertlm", name = "litertlm-android", version.ref = "litertlm" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }

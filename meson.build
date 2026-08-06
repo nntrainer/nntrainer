@@ -776,7 +776,18 @@ endif
 
 if get_option('enable-app')
   if get_option('platform') == 'android'
-    warning('android app is not supported for now, building app skipped')
+    # Most legacy sample Applications (LogisticRegression, MNIST, VGG, ...)
+    # build via ndk-build/Android.mk, not this meson tree, and are untested
+    # under a meson-driven android cross build — so android keeps skipping
+    # this tree by default. CausalLM is the exception (nntrainer standalone
+    # app build, S1): when enable-transformer is also on, let it through;
+    # Applications/meson.build itself narrows the android path to CausalLM
+    # only, leaving every other sample app off.
+    if get_option('enable-transformer')
+      subdir('Applications')
+    else
+      warning('android app is not supported for now, building app skipped')
+    endif
   else
     if host_machine.system() != 'windows'
       if get_option('enable-tflite-backbone') and not tflite_dep.found()

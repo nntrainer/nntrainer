@@ -118,7 +118,18 @@ void QNNContext::initialize() noexcept {
   LOGD("initialize: START");
   try {
     LOGD("initialize: calling init()");
-    init();
+    if (init() != 0) {
+      // init() failed (e.g. no usable QNN/HTP backend on this device). Do NOT
+      // register the QNN layer factory or rpcmem allocator: the QNN backend is
+      // non-functional, but the process must survive so CPU models still run.
+      // A QNN model load will then fail cleanly (no QNNGraph factory) instead
+      // of crashing the whole process here at engine construction time.
+      LOGE("initialize: init() failed; QNN backend unavailable on this device, "
+           "skipping QNN registration (CPU path stays alive)");
+      ml_logw("qnn init failed; continuing without QNN backend");
+      LOGD("initialize: END (init failed)");
+      return;
+    }
     LOGD("initialize: init() completed");
     ml_logi("qnn init done");
     LOGD("initialize: creating QNNRpcManager");
@@ -196,6 +207,13 @@ int QNNContext::init() {
       LOGE("init: unknown error initializing QNN Function Pointers");
       ml_loge("Error initializing QNN Function Pointers");
     }
+    // The QNN function-pointer table failed to load (e.g. this device has no
+    // usable QNN/HTP backend). It stays zero-initialized, so any subsequent
+    // qnn_data->m_qnnFunctionPointers.qnnInterface.* call would dereference a
+    // null function pointer and crash (this used to SIGSEGV at the logCreate
+    // call below). Fail init() cleanly here so the caller can keep the CPU
+    // path alive instead of taking the whole process down.
+    return -1;
   }
 
   LOGD("init: calling getQnnSystemFunctionPointers");
@@ -206,9 +224,14 @@ int QNNContext::init() {
   if (qnn::tools::dynamicloadutil::StatusCode::SUCCESS != statusCode) {
     LOGE("init: Error initializing QNN System Function Pointers");
     ml_loge("Error initializing QNN System Function Pointers", EXIT_FAILURE);
+    // Same reasoning as the backend function-pointer failure above: bail out
+    // before any qnnInterface.* / qnnSystemInterface.* call is made through a
+    // null pointer.
+    return -1;
   }
 
-  if (log::isLogInitialized()) {
+  if (log::isLogInitialized() &&
+      nullptr != qnn_data->m_qnnFunctionPointers.qnnInterface.logCreate) {
     auto logCallback = log::getLogCallback();
     auto logLevel = log::getLogLevel();
 

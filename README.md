@@ -68,7 +68,8 @@ CausalLM supports multiple deployment targets with ready-to-use build scripts:
 cd Applications/CausalLM
 
 # Android
-./build_android.sh && ./install_android.sh
+./build_android.sh
+# Add --app for the QuickDotAI AAR/APK and --install for device deployment.
 
 # Linux / PC
 meson build && ninja -C build

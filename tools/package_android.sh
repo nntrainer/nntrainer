@@ -69,7 +69,7 @@ except Exception as e:
 fi
 
 
-if [ ! -d builddir ]; then
+if [ ! -f builddir/build.ninja ]; then
     #default value of openblas num threads is 1 for android
     #enable-tflite-interpreter=false is just temporally until ci system is stabel
     #enable-opencl=true will compile OpenCL related changes or remove this option to exclude OpenCL compilations.

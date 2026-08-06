@@ -1,0 +1,32 @@
+def frame_to_depth(pixel_values_videos: torch.Tensor, tubelet_size: int) -> torch.Tensor:
+    """Pre-reshape video tensors so the on-graph patch embed is a clean Conv2d.
+
+    Input:  (B, T, C, H, W) — raw video frames (PyTorch's NCHW convention
+            with a leading time axis).
+    Output: (B*D', H, W, t*C) where D' = ceil(T / tubelet_size) — **NHWC
+            layout** matching QNN HTP's native tensor format. The QC ONNX
+            converter expects the graph input in NHWC (with
+            `--input_layout NHWC`), and the explicit NHWC→NCHW transpose
+            we add inside `_PatchEmbed2D.forward` to feed PyTorch's Conv2d
+            is then folded away by the compiler.
+
+    Pads T up to a multiple of tubelet_size by repeating the last frame
+    (matches the in-graph fallback in `QCVJEPA2Embeddings.forward`).
+
+    Channel layout inside the t*C axis: `c` varies fastest within each
+    tubelet group — i.e. flat index `ct = tau*C + c` — matching the
+    (hidden, t, C, p, p) layout that `_PatchEmbed2D.proj` expects after
+    the load-time reshape of the original Conv3d weight.
+    """
+    B, T, C, H, W = pixel_values_videos.shape
+    t = tubelet_size
+    Dp = T // t
+    # (B, T, C, H, W) -> (B, Dp, t, C, H, W) — split T into (D', t) groups.
+    x = pixel_values_videos.reshape(B, Dp, t, C, H, W)
+    # Collapse (t, C) into channels (c-fastest).
+    x = x.reshape(B, Dp, t * C, H, W)
+    # Collapse (B, D') into batch.
+    x = x.reshape(B * Dp, t * C, H, W)
+    # NCHW -> NHWC for QC-native graph input.
+    x = x.permute(0, 2, 3, 1).contiguous()
+    return x

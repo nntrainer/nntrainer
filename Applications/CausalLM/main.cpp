@@ -352,6 +352,9 @@ int main(int argc, char *argv[]) {
     resolveNntrConfigPath(nntr_cfg, "tokenizer_file", model_path);
     resolveNntrConfigPath(nntr_cfg, "embedding_file_name", model_path);
     resolveNntrConfigPath(nntr_cfg, "ple_file_name", model_path);
+    resolveNntrConfigPath(nntr_cfg, "model_file_name", model_path);
+    resolveNntrConfigPath(nntr_cfg, "binary_config_path", model_path);
+    resolveNntrConfigPath(nntr_cfg, "image_newline_path", model_path);
 
     if (nntr_cfg.contains("system_prompt")) {
       system_head_prompt =
@@ -360,9 +363,9 @@ int main(int argc, char *argv[]) {
         nntr_cfg["system_prompt"]["tail_prompt"].get<std::string>();
     }
 
-    // Construct weight file path
+    // Construct weight file path (already rebased onto model_path above)
     const std::string weight_file =
-      model_path + "/" + nntr_cfg["model_file_name"].get<std::string>();
+      nntr_cfg["model_file_name"].get<std::string>();
 
     std::cout << weight_file << std::endl;
 

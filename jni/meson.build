@@ -37,16 +37,32 @@ and_conf.set('MESON_CCAPI_NNTRAINER_SRCS', ' '.join(ccapi_src))
 and_conf.set('MESON_CCAPI_NNTRAINER_INCS', ' '.join(ccapi_inc_abs))
 and_conf.set('MESON_ARM_MARCH', arm_march_flag)
 
-# ABI-affecting defines exported to prebuilt consumers via Android-prebuilt.mk:
-# they gate the _FP16 type in the public headers (tensor_dim.h), so apps that
-# link the prebuilts must compile with the same values.
+# Keep ABI-affecting flags identical for Android.mk and Meson consumers.
 nntrainer_abi_defines = []
 foreach define : extra_defines
   if define == '-DENABLE_FP16=1' or define == '-DUSE__FP16=1'
     nntrainer_abi_defines += define
   endif
 endforeach
+nntrainer_abi_flags = []
+if arm_march_flag != ''
+  nntrainer_abi_flags += arm_march_flag
+endif
+nntrainer_abi_flags += nntrainer_abi_defines
+
+nntrainer_abi_meson_args = []
+foreach flag : nntrainer_abi_flags
+  nntrainer_abi_meson_args += '\'@0@\''.format(flag)
+endforeach
+
 and_conf.set('NNTRAINER_ABI_DEFINES', ' '.join(nntrainer_abi_defines))
+and_conf.set('NNTRAINER_ABI_FLAGS', ' '.join(nntrainer_abi_flags))
+and_conf.set('NNTRAINER_ABI_MESON_ARGS', ', '.join(nntrainer_abi_meson_args))
+if get_option('enable-fp16')
+  and_conf.set('NNTRAINER_ENABLE_FP16', 'true')
+else
+  and_conf.set('NNTRAINER_ENABLE_FP16', 'false')
+endif
 
 and_conf.set('VERSION_MAJOR', nntrainer_version_split[0])
 and_conf.set('VERSION_MINOR', nntrainer_version_split[1])
@@ -139,6 +155,13 @@ android_prebuilt_mk = configure_file(input: 'Android-prebuilt.mk.in',
 )
 
 install_data(android_prebuilt_mk, rename: 'Android.mk', install_dir: nntrainer_prefix)
+
+nntrainer_abi_file = configure_file(input: 'nntrainer-abi.ini.template',
+  output: 'nntrainer-abi.ini',
+  configuration: and_conf
+)
+
+install_data(nntrainer_abi_file, install_dir: nntrainer_prefix)
 
 configure_file(input: 'Application.mk', output: 'Application.mk',
   copy: true

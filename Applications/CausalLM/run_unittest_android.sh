@@ -15,6 +15,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NNTRAINER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 JNI_DIR="$SCRIPT_DIR/jni"
 OBJ_DIR="$JNI_DIR/obj/local/arm64-v8a"
+NATIVE_BUILD="$NNTRAINER_ROOT/builddir_app/cpu"
+NNTRAINER_LIB_DIR="$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a"
+TEST_CACHE_MARKER="$JNI_DIR/obj/.canonical-libcausallm-test"
 INSTALL_DIR="/data/local/tmp/nntr_causallm_test"
 
 RED='\033[0;31m'
@@ -70,38 +73,26 @@ fi
 DEVICE_ID=$(adb devices | grep "device$" | head -1 | cut -f1)
 log_success "Device: $DEVICE_ID"
 
-if [[ ! -f "$SCRIPT_DIR/lib/libtokenizers_android_c.a" ]]; then
-    log_error "Missing: $SCRIPT_DIR/lib/libtokenizers_android_c.a (arm64 build required)"
-    log_info  "Copy from an existing workspace, or run ./build_tokenizer_android.sh"
-    exit 1
-fi
-
-if [[ ! -f "$SCRIPT_DIR/json.hpp" ]]; then
-    log_error "Missing: $SCRIPT_DIR/json.hpp"
-    log_info  "Run: $NNTRAINER_ROOT/jni/prepare_encoder.sh $NNTRAINER_ROOT/builddir 0.2"
-    exit 1
-fi
-
 log_success "Prerequisites OK"
 
 # ---------------------------------------------------------------------------
-log_step "2/6" "Build core nntrainer for Android"
+log_step "2/6" "Build canonical CausalLM native artifacts"
 # ---------------------------------------------------------------------------
 
-NNTRAINER_LIB="$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libnntrainer.so"
-if [[ "$USE_CACHE" -eq 1 && -f "$NNTRAINER_LIB" ]]; then
-    log_info "Reusing cached nntrainer build"
-else
-    log_info "Running package_android.sh..."
-    cd "$NNTRAINER_ROOT"
-    ./tools/package_android.sh
+BUILD_ARGS=()
+if [[ "$USE_CACHE" -eq 1 ]]; then
+    BUILD_ARGS+=(--cache)
 fi
+"$SCRIPT_DIR/build_android.sh" "${BUILD_ARGS[@]}"
 
-if [[ ! -f "$NNTRAINER_LIB" ]]; then
-    log_error "nntrainer build failed — $NNTRAINER_LIB not found"
-    exit 1
-fi
-log_success "nntrainer ready"
+for artifact in \
+    libcausallm.so nntr_quantize libquick_dot_ai_api.so nntr_causallm; do
+    if [[ ! -f "$NATIVE_BUILD/$artifact" ]]; then
+        log_error "Canonical native build is missing: $NATIVE_BUILD/$artifact"
+        exit 1
+    fi
+done
+log_success "Canonical native artifacts ready"
 
 # ---------------------------------------------------------------------------
 log_step "3/6" "Vendor googletest (one-time)"
@@ -120,10 +111,11 @@ fi
 log_step "4/6" "ndk-build"
 # ---------------------------------------------------------------------------
 
-if [[ "$USE_CACHE" -eq 1 && -f "$OBJ_DIR/unittest_causallm_models" ]]; then
+if [[ "$USE_CACHE" -eq 1 && -f "$OBJ_DIR/unittest_causallm_models" && \
+      -f "$TEST_CACHE_MARKER" ]]; then
     log_info "Reusing cached ndk-build artifacts"
 else
-    log_info "Building causallm_core, nntr_quantize, unittest_causallm_models..."
+    log_info "Building unittest_causallm_models against Meson libcausallm.so..."
     ndk-build \
         -C "$JNI_DIR" \
         NDK_PROJECT_PATH="$JNI_DIR" \
@@ -131,14 +123,17 @@ else
         NDK_OUT="$JNI_DIR/obj" \
         APP_BUILD_SCRIPT="$JNI_DIR/Android.mk" \
         NDK_APPLICATION_MK="$JNI_DIR/Application.mk" \
-        causallm_core nntr_quantize unittest_causallm_models \
+        CAUSALLM_PREBUILT_LIB="../../../builddir_app/cpu/libcausallm.so" \
+        unittest_causallm_models \
         -j"$(nproc)"
+    touch "$TEST_CACHE_MARKER"
     log_success "ndk-build done"
 fi
 
-for f in unittest_causallm_models nntr_quantize libcausallm_core.so; do
-    [[ -f "$OBJ_DIR/$f" ]] || { log_error "Missing artifact: $OBJ_DIR/$f"; exit 1; }
-done
+[[ -f "$OBJ_DIR/unittest_causallm_models" ]] || {
+    log_error "Missing artifact: $OBJ_DIR/unittest_causallm_models"
+    exit 1
+}
 
 # ---------------------------------------------------------------------------
 log_step "5/6" "Push to device"
@@ -154,14 +149,19 @@ if [[ ! -d "$FIXTURE_DIR" ]]; then
 fi
 
 adb shell "mkdir -p $INSTALL_DIR/causallm_reference $INSTALL_DIR/tmp"
+adb shell "rm -f \
+    $INSTALL_DIR/libcausallm_core.so \
+    $INSTALL_DIR/libcausallm.so \
+    $INSTALL_DIR/nntr_quantize \
+    $INSTALL_DIR/unittest_causallm_models"
 
 log_info "Pushing binaries and libraries..."
 adb push "$OBJ_DIR/unittest_causallm_models"  "$INSTALL_DIR/" 2>&1 | tail -1
-adb push "$OBJ_DIR/nntr_quantize"             "$INSTALL_DIR/" 2>&1 | tail -1
-adb push "$OBJ_DIR/libcausallm_core.so"       "$INSTALL_DIR/" 2>&1 | tail -1
-adb push "$OBJ_DIR/libnntrainer.so"           "$INSTALL_DIR/" 2>&1 | tail -1
-adb push "$OBJ_DIR/libccapi-nntrainer.so"     "$INSTALL_DIR/" 2>&1 | tail -1
-adb push "$NNTRAINER_ROOT/builddir/android_build_result/lib/arm64-v8a/libc++_shared.so" \
+adb push "$NATIVE_BUILD/nntr_quantize"        "$INSTALL_DIR/" 2>&1 | tail -1
+adb push "$NATIVE_BUILD/libcausallm.so"       "$INSTALL_DIR/" 2>&1 | tail -1
+adb push "$NNTRAINER_LIB_DIR/libnntrainer.so" "$INSTALL_DIR/" 2>&1 | tail -1
+adb push "$NNTRAINER_LIB_DIR/libccapi-nntrainer.so" "$INSTALL_DIR/" 2>&1 | tail -1
+adb push "$NNTRAINER_LIB_DIR/libc++_shared.so" \
          "$INSTALL_DIR/" 2>&1 | tail -1
 
 log_info "Pushing fixtures..."

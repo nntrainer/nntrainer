@@ -8,7 +8,8 @@ A benchmark tool for nntrainer CausalLM models on Android devices.
 
 - Python 3.6+
 - ADB (Android Debug Bridge) installed and device connected
-- nntrainer C++ binary built and deployed to device at `/data/local/tmp/nntrainer/causallm/`
+- Canonical native artifacts deployed with `../build_android.sh --install`
+  to `/data/local/tmp/Quick.AI/`
 - Model files and `nntr_config.json` available on device
 
 ### Python Dependencies
@@ -25,7 +26,7 @@ Run a single trial benchmark:
 
 ```bash
 python3 benchmark_android.py \
-  -m /data/local/tmp/nntrainer/causallm/qwen3-0.6b \
+  -m /data/local/tmp/Quick.AI/models/qwen3-0.6b \
   -p 512 \
   -n 128 \
   -t 4
@@ -68,12 +69,12 @@ The script runs benchmarks for all combinations of the specified parameters (Car
 ```bash
 # Test 512 tokens, no generation
 python3 benchmark_android.py \
-  -m /data/local/tmp/nntrainer/causallm/qwen3-0.6b \
+  -m /data/local/tmp/Quick.AI/models/qwen3-0.6b \
   -p 512 -n 0 -r 5 -t 4
 
 # Test 128,256,512,1024 tokens, no generation
 python3 benchmark_android.py \
-  -m /data/local/tmp/nntrainer/causallm/qwen3-0.6b \
+  -m /data/local/tmp/Quick.AI/models/qwen3-0.6b \
   -p 128,256,512,1024 -n 0 -r 5 -t 4
 ```
 
@@ -81,12 +82,12 @@ python3 benchmark_android.py \
 ```bash
 # Test 128 token generation
 python3 benchmark_android.py \
-  -m /data/local/tmp/nntrainer/causallm/qwen3-0.6b \
+  -m /data/local/tmp/Quick.AI/models/qwen3-0.6b \
   -p 512 -n 128 -r 5 -t 4
 
 # Test 128,256,512,1024 token generation
 python3 benchmark_android.py \
-  -m /data/local/tmp/nntrainer/causallm/qwen3-0.6b \
+  -m /data/local/tmp/Quick.AI/models/qwen3-0.6b \
   -p 512 -n 128,256,512,1024 -r 5 -t 4
 ```
 
@@ -94,12 +95,12 @@ python3 benchmark_android.py \
 ```bash
 # Test with 4 threads
 python3 benchmark_android.py \
-  -m /data/local/tmp/nntrainer/causallm/qwen3-0.6b \
+  -m /data/local/tmp/Quick.AI/models/qwen3-0.6b \
   -t 4
 
 # Test with 2,4,8,16 threads
 python3 benchmark_android.py \
-  -m /data/local/tmp/nntrainer/causallm/qwen3-0.6b \
+  -m /data/local/tmp/Quick.AI/models/qwen3-0.6b \
   -t 2,4,8,16
 ```
 
@@ -141,14 +142,16 @@ adb devices
 Make sure your device is connected and ADB debugging is enabled.
 
 ### Model file not found on device
-The script requires all model files to be on the device. Ensure your model is deployed to `/data/local/tmp/nntrainer/causallm/`.
+The script requires all model files to be on the device. Deploy the native
+artifacts with `../build_android.sh --install`, then copy each model directory
+under `/data/local/tmp/Quick.AI/models/`.
 
 ### nntr_config.json not found on device
 The script reads `nntr_config.json` directly from the device. Make sure it exists at the specified model path.
 
 Example device structure:
 ```
-/data/local/tmp/nntrainer/causallm/
+/data/local/tmp/Quick.AI/
 ├── models/qwen3-0.6b/
 │   ├── nntr_config.json
 │   ├── config.json
@@ -157,7 +160,8 @@ Example device structure:
 ├── libc++_shared.so  
 ├── libccapi-nntrainer.so  
 ├── libnntrainer.so
-├── nntrainer_causallm
+├── libcausallm.so
+├── nntr_causallm
 └── run_causallm.sh
 ```
 

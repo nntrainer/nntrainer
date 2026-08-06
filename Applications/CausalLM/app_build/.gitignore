@@ -1,0 +1,5 @@
+# The android cross-file template is a tracked source of this app build
+# project (the app build needs it to cross-compile for android without any
+# dependency on QuickAI's tree). Re-include it: the nntrainer root .gitignore
+# ignores all *.in files.
+!android-aarch64.cross.in

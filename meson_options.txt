@@ -20,18 +20,6 @@ option('test-timeout', type: 'integer', value: 90)
 option('opencl-kernel-path', type: 'string', value: 'nntrainer_opencl_kernels')
 option('enable-mmap', type: 'boolean', value: true)
 option('enable-npu', type: 'boolean', value: false)
-# Path to a locally-installed Qualcomm QNN SDK. When enable-npu=true, either
-# this option or the QNN_SDK_ROOT environment variable must be set; the option
-# takes priority when both are provided. The SDK root is used at configure time
-# by nntrainer/qnn/jni/tools/update_qnn_version.py to auto-generate the
-# vendor/ directory (SDK headers + compatibility patches). vendor/ is gitignored
-# and must NOT be committed — it is always produced from the locally-installed SDK.
-# The QNN SDK is "Confidential and Proprietary" Qualcomm code that cannot be
-# redistributed in this repository. Obtain it from Qualcomm Software Center
-# (https://qpm.qualcomm.com/) and pass the extracted SDK root, e.g.:
-#   meson setup build -Denable-npu=true -Dqnn-sdk-root=/opt/qcom/aistack/qnn-2.47.0
-# Alternatively: export QNN_SDK_ROOT=/opt/qcom/aistack/qnn-2.47.0
-# See docs/backend_guide/QNN_BUILD.md for details.
 option('qnn-sdk-root', type: 'string', value: '')
 # HTP (Hexagon Tensor Processor / HMX) backend via the Qualcomm HexKL
 # CPU Macro API (sdkl.h / libsdkl.so). Proprietary SDK is NOT vendored;
@@ -88,6 +76,9 @@ option('nnstreamer-subplugin-install-path', type: 'string', value: 'lib/nnstream
 
 # application related options
 option('enable-transformer', type: 'boolean', value: false)
+# Builds libquick_dot_ai_api.so (+ quick_dot_ai_test smoke exe)
+option('enable-api', type: 'boolean', value: false)
+option('enable-qnn-models', type: 'boolean', value: false)
 option('causallm-tokenizer-lib', type: 'string', value: '',
        description: 'Windows-only path to tokenizers_c.lib for CausalLM. The default is generated under <builddir>/tokenizers_c_win/target.')
 

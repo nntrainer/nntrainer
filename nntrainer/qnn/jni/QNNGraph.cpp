@@ -59,33 +59,40 @@ QNNGraph::~QNNGraph() {
     }
   }
 
-  // Free the QNN context stored in QNNVar::ct_map using the stored bin_path.
-  // Access QNNContext through Engine (same pattern as NeuralNetwork::load).
+  // Deregister QNN tensor memHandles while the QNN context is still alive,
+  // so memDeRegister succeeds. The context itself is NOT freed — it persists
+  // in ct_map for reuse on the next load, following the same pattern as CPU
+  // (AppContext) and GPU (ClContext) which never free their backend resources
+  // on model unload. Destroying and recreating a QNN context handle on top
+  // of an already-initialised HTP backend leaves dangling memHandles and
+  // corrupts the backend's internal state, causing graphExecute to fail on
+  // every subsequent load (load → unload → load cycle).
   if (!bin_path.empty()) {
-    LOGD("[QNNGraph] ~QNNGraph: freeing context for bin_path=%s",
+    LOGD("[QNNGraph] ~QNNGraph: deregistering tensors for bin_path=%s",
          bin_path.c_str());
     auto *ctx = Engine::Global().getRegisteredContext("qnn");
     if (ctx) {
       auto *qnn_ctx = static_cast<QNNContext *>(ctx);
       auto qnn_data = qnn_ctx->getQnnData();
-      if (qnn_data && qnn_data->findContext(bin_path).has_value()) {
-        LOGD("[QNNGraph] ~QNNGraph: calling freeContext for bin_path=%s",
-             bin_path.c_str());
-        qnn_data->freeContext(bin_path);
-        LOGD("[QNNGraph] ~QNNGraph: freeContext completed for bin_path=%s",
-             bin_path.c_str());
-      } else {
+      if (qnn_data) {
+        // Deregister all QNN memHandles while context is still valid.
+        // Multiple QNNGraph instances share the same QNNVar (and thus the
+        // same QNNRpcManager); the first destructor clears the map and
+        // subsequent ones are no-ops.
+        qnn_data->RpcMem->deRegisterQnnTensor();
         LOGD(
-          "[QNNGraph] ~QNNGraph: context not found in ct_map for bin_path=%s",
+          "[QNNGraph] ~QNNGraph: deRegisterQnnTensor completed (context kept "
+          "for reuse) bin_path=%s",
           bin_path.c_str());
       }
     } else {
       LOGD("[QNNGraph] ~QNNGraph: qnn context not registered in Engine");
     }
   } else {
-    LOGD("[QNNGraph] ~QNNGraph: bin_path is empty, skipping freeContext");
+    LOGD("[QNNGraph] ~QNNGraph: bin_path is empty, skipping deRegister");
   }
 }
+
 
 void QNNGraph::finalize(InitLayerContext &context) {
   bin_path = std::get<props::FilePath>(graph_props).get();

@@ -61,8 +61,6 @@
 #endif
 #endif
 
-#include "singleton.h"
-
 using namespace qnn;
 using namespace qnn::tools;
 
@@ -75,7 +73,7 @@ extern std::mutex qnn_factory_mutex;
  * @brief QNN support for app context
  */
 
-class QNNContext : public Context, public Singleton<QNNContext> {
+class QNNContext : public Context {
 
 public:
   /**
@@ -83,7 +81,22 @@ public:
    */
   QNNContext() : Context(std::make_shared<QNNBackendVar>()) {}
 
-  ~QNNContext() {
+  /** @brief Deleted copy constructor. */
+  QNNContext(const QNNContext &) = delete;
+  /** @brief Deleted copy assignment operator. */
+  QNNContext &operator=(const QNNContext &) = delete;
+  /** @brief Deleted move constructor. */
+  QNNContext(QNNContext &&) = delete;
+  /** @brief Deleted move assignment operator. */
+  QNNContext &operator=(QNNContext &&) = delete;
+
+  /** @brief Initialize the context once. */
+  void initializeOnce() {
+    std::call_once(initialized_, [this]() { initialize(); });
+  }
+
+  /** @brief Release QNN resources. */
+  ~QNNContext() override {
     auto qnn_data = getQnnData();
     // Free all remaining QNN contexts in ct_map before releasing backend
     if (qnn_data) {
@@ -231,11 +244,9 @@ public:
   std::string getName() override { return "qnn"; }
 
   /**
-   * @brief   Set the default backend extension config path before singleton
-   * initialization. Must be called before QNNContext::Global() or any
-   * operation that triggers context creation. Relative paths are resolved from
-   * QUICK_DOT_AI_BASE_DIR when set, otherwise from the current working
-   * directory.
+   * @brief Set the backend config path before initialization.
+   * @note
+   * Relative paths use QUICK_DOT_AI_BASE_DIR or the working directory.
    */
   static void setDefaultBackendExtConfigPath(const std::string &path);
 
@@ -259,8 +270,12 @@ public:
     return (int)ret;
   }
 
+protected:
+  std::once_flag initialized_;
+
 private:
-  void initialize() noexcept override;
+  /** @brief Initialize the QNN backend. */
+  virtual void initialize() noexcept;
 
   // flag to check predefined qnn context is resistered
   bool qnn_initialized = false;

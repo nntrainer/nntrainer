@@ -167,6 +167,7 @@ subdir('compiler')
 subdir('layers')
 subdir('datasets')
 subdir('models')
+subdir('singleton')
 if get_option('enable-tflite-interpreter')
   subdir('integration_tests')
 endif

@@ -28,10 +28,23 @@ public:
   using Creator =
     std::function<std::unique_ptr<Transformer>(json &, json &, json &)>;
 
-  static Factory &Instance() {
-    static Factory factory;
-    return factory;
-  }
+  /**
+   * @brief   Get the single process-wide Factory instance.
+   * @note    Declared here but DEFINED OUT-OF-LINE in factory.cpp (compiled
+   *          into libcausallm.so) so there is exactly ONE Factory across all
+   *          shared libraries. An inline definition (function-local static in
+   *          this header) gets instantiated separately in each consumer .so
+   *          under Android's per-namespace loading / -fvisibility=hidden, i.e.
+   *          libcausallm, libquick_dot_ai_api, and the optional model plugin
+   *          libqai_ext_model each got their OWN Factory. A model registered
+   *          into one (e.g. a gauss model self-registering from the plugin's
+   *          __attribute__((constructor))) was then invisible to another (the
+   *          api's load_into_handle calling create()), surfacing as
+   *          "Factory::create returned nullptr". A single out-of-line
+   *          definition makes every Factory::Instance() caller share one map.
+   *          Mirrors Engine::Global() (see nntrainer/engine.h / engine.cpp).
+   */
+  static Factory &Instance();
 
   void registerModel(const std::string &key, Creator creator) {
     creators[key] = creator;

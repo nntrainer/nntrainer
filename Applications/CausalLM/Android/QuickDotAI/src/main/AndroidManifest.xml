@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      QuickDotAI AAR manifest.
+
+      Added storage permissions so that downstream apps can access
+      /sdcard/Download/ without declaring the permissions themselves.
+      requestLegacyExternalStorage opts legacy apps out of scoped
+      storage on Android 10/11.
+    -->
+
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <application
+        android:requestLegacyExternalStorage="true">
+        <uses-native-library
+            android:name="libvndksupport.so"
+            android:required="false"/>
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false"
+            />
+        <uses-native-library android:name="libcdsprpc.so" android:required="false"/>
+    </application>
+
+</manifest>

@@ -23,6 +23,19 @@
 
 #include <nntrainer_log.h>
 
+namespace nntrainer {
+
+/** @brief Return the ContextManager singleton. */
+template <>
+NNTRAINER_SINGLETON_API opencl::ContextManager &
+Singleton<opencl::ContextManager>::Global() {
+  static opencl::ContextManager instance;
+  instance.initializeOnce();
+  return instance;
+}
+
+} // namespace nntrainer
+
 namespace nntrainer::opencl {
 
 /**

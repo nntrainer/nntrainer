@@ -41,6 +41,11 @@
 
 namespace nntrainer {
 
+/** @brief Forward declaration of ClContext. */
+class ClContext;
+/** @brief Return the ClContext singleton. */
+template <> NNTRAINER_SINGLETON_API ClContext &Singleton<ClContext>::Global();
+
 extern std::mutex cl_factory_mutex;
 
 /**

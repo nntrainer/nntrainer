@@ -25,3 +25,6 @@
 [submodule "nntrainer-windows-resource"]
 	path = nntrainer-windows-resource
 	url = https://github.com/nnstreamer/nntrainer-windows-resource.git
+[submodule "Applications/CausalLM/xgrammar"]
+	path = Applications/CausalLM/xgrammar
+	url = https://github.com/mlc-ai/xgrammar.git

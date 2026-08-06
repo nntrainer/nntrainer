@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      SampleTestAPP's MainActivity extends AppCompatActivity and builds
+      its UI entirely in code (no XML layouts). The only reason this
+      theme has to exist is that AndroidManifest.xml's <application
+      android:theme="@style/Theme.SampleTestAPP"> points at it — every
+      AppCompat activity needs an AppCompat-derived theme at
+      inflation time, otherwise AppCompatDelegate throws
+      "You need to use a Theme.AppCompat theme (or descendant)…".
+
+      Using DayNight.DarkActionBar mirrors what Android Studio's
+      "Empty Views Activity" wizard scaffolds and matches the style
+      used by sibling module :clientapp for consistency.
+    -->
+    <!--
+      The in-app UI (see QuickDotAI redesign) draws its own top bar, hero
+      status card, and tab strip in code, so we use NoActionBar to avoid
+      a duplicate action bar above the custom header.
+    -->
+    <style name="Theme.SampleTestAPP" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <!--
+          The redesigned UI manages its own light/dark palette per the M3
+          Expressive token sets in MainActivity.kt. Letting the system
+          repaint the window background to a light/dark default would
+          flash before our background colors take effect, so freeze the
+          window background to the LIGHT-token surface color.
+        -->
+        <item name="android:windowBackground">#FBF8FF</item>
+    </style>
+</resources>

@@ -124,6 +124,14 @@ constexpr const char *getConfPath() { return DEFAULT_CONF_PATH; }
 
 namespace nntrainer {
 
+/** @brief Return the AppContext singleton. */
+template <>
+NNTRAINER_SINGLETON_API AppContext &Singleton<AppContext>::Global() {
+  static AppContext instance;
+  instance.initializeOnce();
+  return instance;
+}
+
 namespace {
 
 /**
@@ -658,14 +666,7 @@ const int AppContext::registerFactory(const FactoryType<T> factory,
 
   const std::lock_guard<std::mutex> lock(factory_mutex);
   if (str_map.find(assigned_key) != str_map.end()) {
-    // Re-registering an already-registered factory key is a no-op, not an
-    // error. QuickAI QNN models register the process-global CausalLM custom
-    // layers (swiglu/rms_norm/embedding_layer/...) once per model via
-    // Transformer::registerCustomLayers(); a multi-model handle (the multimodal
-    // [vision, LLM] pair) therefore re-registers the same keys. Upstream main
-    // throws here, but pr/3963 (the working QNN reference) returns the existing
-    // int key so later models reuse the already-registered factory. Carried
-    // forward from pr/3963.
+    // Reuse an existing factory key.
     for (const auto &[ik, sk] : int_map) {
       if (sk == assigned_key)
         return ik;
@@ -674,8 +675,7 @@ const int AppContext::registerFactory(const FactoryType<T> factory,
   }
 
   if (int_key != -1 && int_map.find(int_key) != int_map.end()) {
-    // Duplicate int key is likewise a no-op (reuse the existing one), per
-    // pr/3963.
+    // Reuse an existing integer key.
     return int_key;
   }
 

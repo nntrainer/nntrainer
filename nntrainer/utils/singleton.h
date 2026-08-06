@@ -19,6 +19,16 @@
 #include "noncopyable.h"
 #include "nonmovable.h"
 
+#ifndef NNTRAINER_SINGLETON_API
+#if defined(_WIN32)
+#define NNTRAINER_SINGLETON_API
+#elif defined(__GNUC__) || defined(__clang__)
+#define NNTRAINER_SINGLETON_API __attribute__((visibility("default")))
+#else
+#define NNTRAINER_SINGLETON_API
+#endif
+#endif
+
 namespace nntrainer {
 
 /**
@@ -31,7 +41,9 @@ public:
   /**
    * @brief   Get reference to global instance object
    * once
+   *
    * @return Instance to singleton class reference
+   * @note Define shared-library specializations in the owning library.
    */
   static T &Global() {
     static T instance;

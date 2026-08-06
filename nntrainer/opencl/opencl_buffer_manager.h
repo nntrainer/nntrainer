@@ -25,6 +25,12 @@
 
 namespace nntrainer {
 
+/** @brief Forward declaration of ClBufferManager. */
+class ClBufferManager;
+/** @brief Return the ClBufferManager singleton. */
+template <>
+NNTRAINER_SINGLETON_API ClBufferManager &Singleton<ClBufferManager>::Global();
+
 /**
  * @class ClBufferManager contains Buffer object management
  * @brief Support for Buffer management

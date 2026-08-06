@@ -39,6 +39,11 @@
 
 namespace nntrainer {
 
+/** @brief Forward declaration of AppContext. */
+class AppContext;
+/** @brief Return the AppContext singleton. */
+template <> NNTRAINER_SINGLETON_API AppContext &Singleton<AppContext>::Global();
+
 extern std::mutex factory_mutex;
 namespace {} // namespace
 

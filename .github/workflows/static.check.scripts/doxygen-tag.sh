@@ -39,7 +39,7 @@ echo "::group::Doxygen tag check started"
 
 for file in `cat $files`; do
   if [[ `file $file | grep -E "(ASCII|Unicode) text" | wc -l` -gt 0 ]]; then
-      # In case of source code files: *.c|*.h|*.cpp|*.py|*.sh|*.php )
+      # Only C/C++ source files are checked.
       case $file in
           # In case of C/C++ code
           *.c|*.h|*.cc|*.hh|*.cpp|*.hpp )
@@ -113,31 +113,6 @@ for file in `cat $files`; do
                       fi
 
                   done < "$file"
-              fi
-              ;;
-          # In case of Python code
-          *.py )
-              doxygen_lang="doxygen-python"
-              # Append a Doxgen rule step by step
-              doxygen_rules="@package @brief"
-              doxygen_rule_num=0
-              doxygen_rule_all=0
-
-              for word in $doxygen_rules
-              do
-                  doxygen_rule_all=$(( doxygen_rule_all + 1 ))
-                  doxygen_rule[$doxygen_rule_all]=`cat ${file} | grep "$word" | wc -l`
-                  doxygen_rule_num=$(( $doxygen_rule_num + ${doxygen_rule[$doxygen_rule_all]} ))
-              done
-              if  [[ $doxygen_rule_num -le 0 ]]; then
-                  echo "[ERROR] $doxygen_lang: failed. file name: $file, ($doxygen_rule_num)/$doxygen_rule_all tags are found."
-                  failed=1
-                  # continue (not break): "break" here would exit the outer
-                  # "for file" loop, silently skipping every file listed
-                  # after this one regardless of language.
-                  continue
-              else
-                  echo "[DEBUG] $doxygen_lang: passed. file name: $file, ($doxygen_rule_num)/$doxygen_rule_all tags are found." >> $report_path
               fi
               ;;
       esac

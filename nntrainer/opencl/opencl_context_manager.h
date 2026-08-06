@@ -21,6 +21,17 @@
 
 #include "singleton.h"
 
+namespace nntrainer {
+namespace opencl {
+/** @brief Forward declaration of ContextManager. */
+class ContextManager;
+} // namespace opencl
+/** @brief Return the ContextManager singleton. */
+template <>
+NNTRAINER_SINGLETON_API opencl::ContextManager &
+Singleton<opencl::ContextManager>::Global();
+} // namespace nntrainer
+
 namespace nntrainer::opencl {
 
 /**

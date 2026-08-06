@@ -6,9 +6,9 @@ It supports *inference* mode (text generation) on various devices, including And
 ## Features
 
 - **Standalone Application (`nntr_causallm`)**: A command-line tool to load models and generate text.
-- **C API (Optional)**: A lightweight C interface (`libcausallm_api.so`) for integrating LLM capabilities into other applications (e.g., Android JNI, iOS, or other C/C++ apps).
-- **Core Library**: The core implementation is separated into `libcausallm_core.so` for modularity.
-- **Supported Backends**: CPU, with GPU/NPU support planned.
+- **C API (Optional)**: A lightweight C interface (`libquick_dot_ai_api.so`) for integrating LLM capabilities into other applications (e.g., Android JNI, iOS, or other C/C++ apps).
+- **Core Library**: The core implementation is separated into `libcausallm.so` for modularity.
+- **Supported Backends**: CPU by default, with optional QNN support on Android.
 
 ## Supported models
 
@@ -211,83 +211,49 @@ PS> .\build-causallm-win\Applications\CausalLM\nntr_causallm.exe C:\path\to\mode
 
 ### 4. Android Build & Test
 
-The Android build process is modularized to support building the core library, API library, and test applications independently.
+`build_android.sh` is the single entry point for the Android native libraries,
+QuickDotAI AAR, and sample app. With no options, it builds the six canonical
+CPU native artifacts with Meson, without invoking Gradle or modifying a device.
 
 #### Prerequisites
-- Android NDK (e.g., r21d or later)
-- CMake
-- Rust (for tokenizers-cpp)
-- ADB (Android Debug Bridge)
 
-#### Build Scripts
+- Android NDK (`ANDROID_NDK` or `NDK_ROOT`)
+- Meson, Ninja, CMake, and Rust (for tokenizers-cpp)
+- ADB only when using `--install`
+- QNN SDK (`QNN_SDK_ROOT`) only when using `--qnn`
 
-The following scripts are provided in `Applications/CausalLM/` to handle the build process:
+#### Build
 
-1.  **`build_android.sh`** (Core + App):
-    - Builds `nntrainer` core library for Android.
-    - Builds `tokenizers-cpp` dependency if missing.
-    - Compiles **`libcausallm_core.so`** (Core logic) and **`nntrainer_causallm`** (Main Executable).
-    - **Usage**: `./build_android.sh`
+```bash
+export ANDROID_NDK=/path/to/your/android-ndk
+cd Applications/CausalLM
+./build_android.sh
+```
 
-2.  **`build_api_lib.sh`** (API Library):
-    - Requires `libcausallm_core.so` (run `build_android.sh` first).
-    - Compiles **`libcausallm_api.so`** (C-API wrapper).
-    - **Usage**: `./build_api_lib.sh`
+CPU native artifacts are written under `builddir_app/cpu/`; QNN artifacts use
+`builddir_app/qnn/`. To additionally build the standalone app and AAR without
+installing them, run `./build_android.sh --app`. That mode stages
+`libcausallm.so`, `libquick_dot_ai_api.so`, and their runtime dependencies;
+Gradle adds `libquickai_jni.so` and writes the debug AAR under
+`Android/QuickDotAI/build/outputs/aar/`.
 
-3.  **`build_test_app.sh`** (Test App):
-    - Requires both Core and API libraries.
-    - Compiles **`test_api`** (Simple C++ test app for API).
-    - **Usage**: `./build_test_app.sh`
+The most useful options are:
 
-4.  **`install_android.sh`**:
-    - Installs all built artifacts to a connected Android device.
-    - Creates helper scripts (`run_causallm.sh`, `run_test_api.sh`) on the device.
-    - **Usage**: `./install_android.sh`
+| Option | Behavior |
+|---|---|
+| `--app` | Add the QuickDotAI AAR and sample APK to the canonical native build. |
+| `--install` | Push the native libraries and tools; with `--app`, also install the built APK. |
+| `--qnn` | Build the QNN variant and include its runtime libraries; requires `QNN_SDK_ROOT`. CPU is the default. |
+| `--cache` | Reuse a compatible existing nntrainer Android engine build, or build it when absent. |
+| `--clean` | Recreate the selected CPU or QNN CausalLM build directory. |
+| `--nntr-threads=N` | Set the positive nntrainer compute-thread count. |
 
-#### Build Instructions
+`--app`, `--install`, and QNN selection are independent. For example,
+`--install` pushes only native artifacts, while `--app --install` also installs
+the APK. Set `ANDROID_SERIAL` when more than one device is connected.
+QNN deployment supports HTP V75, V79, and V81 SDK runtimes and requires at
+least one complete matching Stub/Skel pair.
 
-1.  **Set NDK Path**:
-    ```bash
-    export ANDROID_NDK=/path/to/your/android-ndk
-    ```
-
-2.  **Build Core & Main App**:
-    ```bash
-    cd Applications/CausalLM
-    ./build_android.sh
-    ```
-    Artifacts in `jni/libs/arm64-v8a/`:
-    - `libcausallm_core.so`
-    - `nntrainer_causallm`
-
-3.  **Build API Library (Optional)**:
-    ```bash
-    ./build_api_lib.sh
-    ```
-    Artifacts:
-    - `libcausallm_api.so`
-
-4.  **Build Test App (Optional)**:
-    ```bash
-    ./build_test_app.sh
-    ```
-    Artifacts:
-    - `test_api`
-
-5.  **Install & Run**:
-    ```bash
-    ./install_android.sh
-    ```
-    
-    **Run Main App:**
-    ```bash
-    adb shell /data/local/tmp/nntrainer/causallm/run_causallm.sh [model_path]
-    ```
-
-    **Run API Test:**
-    ```bash
-    adb shell /data/local/tmp/nntrainer/causallm/run_test_api.sh [model_name] [prompt]
-    ```
 ## Quantizing Models
 
 NNTrainer provides a quantization utility (`nntr_quantize`) that converts FP32 CausalLM model weights to lower-precision data types, reducing model size for efficient on-device inference.

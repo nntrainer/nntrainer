@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      SampleTestAPP runs the QuickDotAI AAR in-process: no remote service,
+      no REST server, no sockets. We therefore do not need INTERNET or
+      FOREGROUND_SERVICE permissions.
+
+      The <uses-native-library> entries required by LiteRT-LM's GPU backend
+      (libvndksupport.so, libOpenCL.so) are declared in the :QuickDotAI AAR
+      manifest and merged in automatically.
+    -->
+
+    <!-- All-files access is required so that the native engine can open
+         models under /sdcard/Download/ on Android 11+.  This is an
+         internal/enterprise build, so Google Play’s sensitive-permission
+         policy does not apply. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.SampleTestAPP">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

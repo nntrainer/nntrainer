@@ -1,0 +1,37 @@
+{
+    "alarm": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["set_alarm", "set_timer", "dismiss_alarm", "show_alarms"], "description": "Action to perform"},
+            "hour": {"type": "integer", "description": "Hour in 24h format (0-23) for set_alarm or dismiss_alarm"},
+            "minute": {"type": "integer", "description": "Minute (0-59) for set_alarm or dismiss_alarm"},
+            "label": {"type": "string", "description": "Label/name for the alarm or timer"},
+            "seconds": {"type": "integer", "description": "Timer duration in seconds for set_timer"},
+            "days": {"type": "string", "description": "Comma-separated recurring days (1=Sun,2=Mon,...7=Sat)"}
+        },
+        "required": ["action"]
+    },
+    "send_email": {
+        "type": "object",
+        "properties": {
+            "to": {"type": "string", "description": "Recipient email address"},
+            "subject": {"type": "string", "description": "Email subject"},
+            "body": {"type": "string", "description": "Email body text"},
+            "cc": {"type": "string", "description": "CC email address"},
+            "bcc": {"type": "string", "description": "BCC email address"},
+            "attachment": {"type": "string", "description": "File path to attach (from file_search results)"}
+        },
+        "required": ["to"]
+    },
+    "memo": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["save", "list", "get", "delete", "delete_all"], "description": "Action to perform"},
+            "title": {"type": "string", "description": "Memo title (optional for save)"},
+            "content": {"type": "string", "description": "Memo content (required for save)"},
+            "query": {"type": "string", "description": "Search keyword (for list)"},
+            "memo_id": {"type": "string", "description": "Memo ID (for get/delete)"}
+        },
+        "required": ["action"]
+    }
+}

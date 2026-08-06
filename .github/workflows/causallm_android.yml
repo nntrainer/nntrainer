@@ -43,8 +43,12 @@ jobs:
         override: true
         components: rustfmt, clippy
 
+    - name: Build tokenizer library for Android
+      run: |
+        chmod +x Applications/CausalLM/build_tokenizer_android.sh
+        ./Applications/CausalLM/build_tokenizer_android.sh
+
     - name: Build CausalLM for Android
       run: |
         chmod +x Applications/CausalLM/build_android.sh
-        chmod +x Applications/CausalLM/build_tokenizer_android.sh
         ./Applications/CausalLM/build_android.sh

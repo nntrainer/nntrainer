@@ -4,15 +4,19 @@
  *
  * @file    model_config.cpp
  * @date    22 Jan 2026
- * @brief   This is a sample code for internal regitration of model_config.
+ * @brief   Built-in model configuration registration for api.
+ *          All calls use C++ namespaced functions — no extern "C" PLT calls.
  * @see     https://github.com/nntrainer/nntrainer
  * @author  Eunju Yang <ej.yang@samsung.com>
  * @bug     No known bugs except for NYI items
  */
-#include "causal_lm_api.h"
 #include "model_config_internal.h"
+#include "quick_dot_ai_api.h"
 #include <climits>
 #include <cstring>
+#include <iostream>
+
+namespace quick_dot_ai {
 
 static void register_qwen3_0_6b() {
   // 1. Architecture Config
@@ -38,7 +42,7 @@ static void register_qwen3_0_6b() {
   ac.eos_token_ids[0] = 151645;
   ac.num_eos_token_ids = 1;
 
-  registerModelArchitecture("Qwen3-0.6B-Arch", ac);
+  register_arch("Qwen3-0.6B-Arch", ac);
 
   // 2. Runtime Config
   ModelRuntimeConfig rc;
@@ -52,9 +56,9 @@ static void register_qwen3_0_6b() {
   rc.num_to_generate = 512;
   rc.fsu = false;
   rc.fsu_lookahead = 2;
-  strncpy(rc.embedding_dtype, "Q4_0", sizeof(rc.embedding_dtype) - 1);
+  strncpy(rc.embedding_dtype, "Q6_K", sizeof(rc.embedding_dtype) - 1);
   strncpy(rc.fc_layer_dtype, "Q4_0", sizeof(rc.fc_layer_dtype) - 1);
-  strncpy(rc.model_file_name, "qwen3-0.6b-q40-fp32-arm.bin",
+  strncpy(rc.model_file_name, "qwen3-0.6b-q6k-q40-q40-fp32-arm.bin",
           sizeof(rc.model_file_name) - 1);
   strncpy(rc.tokenizer_file, "tokenizer.json", sizeof(rc.tokenizer_file) - 1);
   strncpy(rc.lmhead_dtype, "Q4_0", sizeof(rc.lmhead_dtype) - 1);
@@ -64,7 +68,7 @@ static void register_qwen3_0_6b() {
   rc.top_p = 0.95f;
   rc.temperature = 0.7f;
 
-  registerModel("Qwen3-0.6B-W4A32", "Qwen3-0.6B-Arch", rc);
+  register_model("Qwen3-0.6B-W4A32", "Qwen3-0.6B-Arch", rc);
 
   // Example for W32A32 (FP32)
   ModelRuntimeConfig rc_fp32 = rc;
@@ -75,14 +79,15 @@ static void register_qwen3_0_6b() {
   strncpy(rc_fp32.lmhead_dtype, "FP32", sizeof(rc_fp32.lmhead_dtype) - 1);
   strncpy(rc_fp32.model_file_name, "qwen3-0.6b-fp32.bin",
           sizeof(rc_fp32.model_file_name) - 1);
-  registerModel("Qwen3-0.6B-W32A32", "Qwen3-0.6B-Arch", rc_fp32);
+  register_model("Qwen3-0.6B-W32A32", "Qwen3-0.6B-Arch", rc_fp32);
 
   // Register default alias
-  registerModel("Qwen3-0.6B", "Qwen3-0.6B-Arch", rc);
+  register_model("Qwen3-0.6B", "Qwen3-0.6B-Arch", rc);
 }
 
-int register_builtin_model_configs() {
+void register_builtin_configs() {
   register_qwen3_0_6b();
   // Add more models here...
-  return 0;
 }
+
+} // namespace quick_dot_ai

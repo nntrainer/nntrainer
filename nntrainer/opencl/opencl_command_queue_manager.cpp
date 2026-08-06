@@ -19,6 +19,19 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 
+namespace nntrainer {
+
+/** @brief Return the CommandQueueManager singleton. */
+template <>
+NNTRAINER_SINGLETON_API opencl::CommandQueueManager &
+Singleton<opencl::CommandQueueManager>::Global() {
+  static opencl::CommandQueueManager instance;
+  instance.initializeOnce();
+  return instance;
+}
+
+} // namespace nntrainer
+
 namespace nntrainer::opencl {
 
 /**
