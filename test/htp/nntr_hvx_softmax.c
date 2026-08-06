@@ -23,8 +23,10 @@
 #include "hvx_exp_f32.h"
 #include "hvx_softmax_f32.h"
 
-/** @brief f32 lanes per HVX vector in 128B mode. */
-#define LANES 32u
+/** @brief HVX vector width in bytes (128B mode). */
+#define VLEN 128u
+/** @brief f32 lanes per HVX vector. */
+#define LANES (VLEN / sizeof(float))
 
 int nntr_hvx_exp_f32(remote_handle64 handle, const float *x, int xLen, float *y,
                      int yLen) {

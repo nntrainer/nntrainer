@@ -26,8 +26,10 @@
 #include "nntr_hvx_session.h"
 
 /** @brief HVX vector width in bytes (128B mode). */
-#define VLEN 128
-/** @brief float lanes per HVX vector. */
+#define VLEN 128u
+/** @brief f32 lanes per HVX vector. */
+/* Kept as an int-casted expression (not the unsigned LANES form used
+   elsewhere) because n_vec/i in this file's loops are int. */
 #define LANES ((int)(VLEN / sizeof(float)))
 
 int nntr_hvx_open(const char *uri, remote_handle64 *handle) {

@@ -23,7 +23,7 @@
 /** @brief HVX vector width in bytes (128B mode). */
 #define VLEN 128u
 /** @brief f32 lanes per HVX vector. */
-#define LANES (VLEN / 4u)
+#define LANES (VLEN / sizeof(float))
 
 /**
  * @brief Loads n < LANES floats into lanes 0..n-1, filling the rest with pad.
