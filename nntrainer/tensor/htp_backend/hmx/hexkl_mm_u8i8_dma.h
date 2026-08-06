@@ -45,11 +45,11 @@ typedef struct {
  *        result resident until hexkl_weight_u8i8_release. See
  *        hexkl_weight_u8i4_register -- same contract, wider weight.
  */
-int hexkl_weight_u8i8_register(hexkl_weight_u8i8_table *tbl,
-                               uint8_t *vtcm_base, uint32_t vtcm_size,
-                               uint32_t K, uint32_t N, const int8_t *w_i8_rm,
-                               const float *w_scale, const int32_t *colsum_w,
-                               const float *bias, uint32_t *out_handle);
+int hexkl_weight_u8i8_register(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
+                               uint32_t vtcm_size, uint32_t K, uint32_t N,
+                               const int8_t *w_i8_rm, const float *w_scale,
+                               const int32_t *colsum_w, const float *bias,
+                               uint32_t *out_handle);
 
 /** @brief Frees a registered weight's resident bytes. */
 int hexkl_weight_u8i8_release(hexkl_weight_u8i8_table *tbl, uint32_t handle);
@@ -61,8 +61,8 @@ int hexkl_weight_u8i8_release(hexkl_weight_u8i8_table *tbl, uint32_t handle);
  *        u8i4) all in one call.
  */
 int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
-                            uint32_t vtcm_size, uint32_t config_off,
-                            uint32_t M, uint32_t K, const uint32_t *handles,
+                            uint32_t vtcm_size, uint32_t config_off, uint32_t M,
+                            uint32_t K, const uint32_t *handles,
                             uint32_t n_handles, const float *act_f32,
                             float *out_cat);
 

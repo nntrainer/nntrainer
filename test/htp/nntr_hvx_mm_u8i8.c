@@ -56,8 +56,8 @@ int nntr_hvx_weight_release_u8i8(remote_handle64 handle, uint32 w_handle) {
 
 int nntr_hvx_mm_u8i8_layer(remote_handle64 handle, uint32 M, uint32 K,
                            const uint32 *w_handles, int w_handlesLen,
-                           const float *act_f32, int act_f32Len,
-                           float *out_cat, int out_catLen) {
+                           const float *act_f32, int act_f32Len, float *out_cat,
+                           int out_catLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s || w_handlesLen <= 0) {
     return AEE_EBADPARM;
@@ -76,12 +76,11 @@ int nntr_hvx_mm_u8i8_layer(remote_handle64 handle, uint32 M, uint32 K,
     n_total += s->weights_u8i8.slots[w_handles[i]].N;
   }
   if ((uint32_t)out_catLen != M * n_total) {
-    FARF(ERROR, "mm_u8i8_layer: bad out_catLen (M=%u n_total=%u)",
-         (unsigned)M, (unsigned)n_total);
+    FARF(ERROR, "mm_u8i8_layer: bad out_catLen (M=%u n_total=%u)", (unsigned)M,
+         (unsigned)n_total);
     return AEE_EBADPARM;
   }
-  return hexkl_mm_u8i8_layer_run(&s->weights_u8i8, s->vtcm_base,
-                                 s->vtcm_size, s->config_off, M, K,
-                                 w_handles, (uint32_t)w_handlesLen, act_f32,
-                                 out_cat);
+  return hexkl_mm_u8i8_layer_run(&s->weights_u8i8, s->vtcm_base, s->vtcm_size,
+                                 s->config_off, M, K, w_handles,
+                                 (uint32_t)w_handlesLen, act_f32, out_cat);
 }

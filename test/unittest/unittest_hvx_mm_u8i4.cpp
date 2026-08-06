@@ -138,9 +138,8 @@ void quantize_weights_qs4cx(const std::vector<float> &w_f32, uint32_t K,
  *        parametrizing qs4cx over the range: that function's name and
  *        callers are already tied to QS4CX specifically.
  */
-void quantize_weights_symmetric_i8(const std::vector<float> &w_f32,
-                                   uint32_t K, uint32_t N,
-                                   std::vector<int8_t> &q_w,
+void quantize_weights_symmetric_i8(const std::vector<float> &w_f32, uint32_t K,
+                                   uint32_t N, std::vector<int8_t> &q_w,
                                    std::vector<float> &d,
                                    std::vector<int32_t> &colsum) {
   q_w.assign(static_cast<size_t>(K) * N, 0);
@@ -782,8 +781,8 @@ protected:
 
     w.handle = 0xFFFFFFFFu;
     int err = nntr_hvx_weight_register_u8i8(
-      handle_, K, N, w.q_w.data(), static_cast<int>(w.q_w.size()),
-      w.d.data(), static_cast<int>(w.d.size()), w.colsum.data(),
+      handle_, K, N, w.q_w.data(), static_cast<int>(w.q_w.size()), w.d.data(),
+      static_cast<int>(w.d.size()), w.colsum.data(),
       static_cast<int>(w.colsum.size()), w.bias.data(),
       static_cast<int>(w.bias.size()), &w.handle);
     ASSERT_EQ(err, AEE_SUCCESS) << "weight_register_u8i8 failed: " << hex(err);
@@ -940,10 +939,9 @@ TEST_F(HmxMmU8I8Layer, ReportPerCallCostVsU8I4) {
   }
   std::vector<float> out8(static_cast<size_t>(M) * n_total8, 0.0f);
   const double u8i8_x4_us = time_us([&] {
-    nntr_hvx_mm_u8i8_layer(handle_, M, K, hs8.data(),
-                           static_cast<int>(hs8.size()), x.data(),
-                           static_cast<int>(x.size()), out8.data(),
-                           static_cast<int>(out8.size()));
+    nntr_hvx_mm_u8i8_layer(
+      handle_, M, K, hs8.data(), static_cast<int>(hs8.size()), x.data(),
+      static_cast<int>(x.size()), out8.data(), static_cast<int>(out8.size()));
   });
 
   std::vector<int8_t> q_w4;
