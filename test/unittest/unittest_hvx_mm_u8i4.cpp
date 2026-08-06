@@ -16,8 +16,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -449,6 +451,264 @@ TEST_F(HmxMmU8I4, Shape4_MultipleRowBlocks) {
   // Shapes 1 through 3 all pad to 64 rows, so the row-block loop only
   // ever runs with rb=0. This is the one that runs it twice.
   CheckShape(128, 128, 128);
+}
+
+/**
+ * @brief The performance path: weights registered once, several matmuls
+ *        per call sharing one activation.
+ *
+ * Shares HmxMmU8I4's helpers rather than duplicating a reference: the
+ * layer endpoint must produce exactly what calling the accuracy endpoint
+ * once per weight would, so that is what these compare against.
+ */
+class HmxMmU8I4Layer : public HmxMmU8I4 {
+protected:
+  /** @brief One weight plus everything needed to check its output. */
+  struct Weight {
+    uint32_t handle;
+    uint32_t N;
+    std::vector<int8_t> q_w;
+    std::vector<float> d;
+    std::vector<int32_t> colsum;
+    std::vector<float> bias;
+    std::vector<float> w_f32;
+  };
+
+  /** @brief Quantizes a deterministic K x N weight and registers it. */
+  void MakeAndRegister(uint32_t K, uint32_t N, uint32_t seed, Weight &w) {
+    w.N = N;
+    w.w_f32.resize(static_cast<size_t>(K) * N);
+    fill_deterministic(w.w_f32, seed);
+    quantize_weights_qs4cx(w.w_f32, K, N, w.q_w, w.d, w.colsum);
+    w.bias.resize(N);
+    fill_deterministic(w.bias, seed ^ 0xA5A5A5A5u);
+
+    w.handle = 0xFFFFFFFFu;
+    int err = nntr_hvx_weight_register_u8i4(
+      handle_, K, N, w.q_w.data(), static_cast<int>(w.q_w.size()),
+      w.d.data(), static_cast<int>(w.d.size()), w.colsum.data(),
+      static_cast<int>(w.colsum.size()), w.bias.data(),
+      static_cast<int>(w.bias.size()), &w.handle);
+    ASSERT_EQ(err, AEE_SUCCESS) << "weight_register_u8i4 failed: " << hex(err);
+    ASSERT_NE(w.handle, 0xFFFFFFFFu) << "handle not written";
+  }
+
+  /** @brief Host reference for one weight's slice of the concatenated
+   *         output, via the same path the accuracy harness checks. */
+  void ExpectedFor(const Weight &w, const std::vector<float> &x, uint32_t M,
+                   uint32_t K, std::vector<float> &out) {
+    const uint32_t m_pad = round_up(M, kTileRow);
+    std::vector<float> scale;
+    std::vector<int32_t> zp;
+    quantize_act_rows(x, M, m_pad, K, scale, zp);
+    std::vector<uint8_t> u_rm;
+    quantize_act_values(x, M, m_pad, K, scale, zp, u_rm);
+    std::vector<int32_t> acc;
+    ref_int_matmul(u_rm, w.q_w, m_pad, K, w.N, acc);
+    ref_dequant(acc, M, w.N, scale, zp, w.colsum, w.d, w.bias, out);
+  }
+};
+
+TEST_F(HmxMmU8I4Layer, ThreeWeightsMatchPerWeightReference) {
+  // A Q/K/V set: three weights, one shared activation, one call. The
+  // shapes differ in N so a bug that assumes a uniform stride into
+  // out_cat shows up as a mismatch rather than passing by luck.
+  const uint32_t M = 64, K = 256;
+  const uint32_t Ns[3] = {128, 256, 64};
+
+  std::vector<Weight> ws(3);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+      MakeAndRegister(K, Ns[i], 0xB0B00001u + i * 0x1000u, ws[i]));
+  }
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0002u);
+
+  uint32_t n_total = 0;
+  std::vector<uint32_t> handles;
+  for (const auto &w : ws) {
+    handles.push_back(w.handle);
+    n_total += w.N;
+  }
+  std::vector<float> got(static_cast<size_t>(M) * n_total, 0.0f);
+
+  int err = nntr_hvx_mm_u8i4_layer(
+    handle_, M, K, handles.data(), static_cast<int>(handles.size()), x.data(),
+    static_cast<int>(x.size()), got.data(), static_cast<int>(got.size()));
+  ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_layer failed: " << hex(err);
+
+  size_t off = 0;
+  for (int i = 0; i < 3; ++i) {
+    SCOPED_TRACE("weight " + std::to_string(i) + " N=" + std::to_string(Ns[i]));
+    std::vector<float> want;
+    ExpectedFor(ws[i], x, M, K, want);
+    for (size_t j = 0; j < want.size(); ++j) {
+      EXPECT_NEAR(got[off + j], want[j], std::abs(want[j]) * 1e-5f + 1e-6f)
+        << "element " << j;
+    }
+    off += want.size();
+  }
+
+  for (const auto &w : ws) {
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
+  }
+}
+
+TEST_F(HmxMmU8I4Layer, RegisteredWeightSurvivesRepeatedCalls) {
+  // The whole point of registering is that the bake is not repaid per
+  // call, so the second call must return exactly what the first did --
+  // bitwise, since nothing between them is supposed to differ.
+  const uint32_t M = 1, K = 512, N = 128;
+  Weight w;
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, N, 0xC0FFEE01u, w));
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0002u);
+  const uint32_t handles[1] = {w.handle};
+
+  std::vector<float> first(static_cast<size_t>(M) * N, 0.0f);
+  std::vector<float> second(static_cast<size_t>(M) * N, 1.0f);
+  for (int pass = 0; pass < 2; ++pass) {
+    std::vector<float> &dst = pass == 0 ? first : second;
+    int err = nntr_hvx_mm_u8i4_layer(handle_, M, K, handles, 1, x.data(),
+                                     static_cast<int>(x.size()), dst.data(),
+                                     static_cast<int>(dst.size()));
+    ASSERT_EQ(err, AEE_SUCCESS) << "pass " << pass << ": " << hex(err);
+  }
+  EXPECT_EQ(first, second);
+
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
+}
+
+TEST_F(HmxMmU8I4Layer, ReleasedHandleIsRejectedAndSlotIsReused) {
+  const uint32_t K = 128, N = 128;
+  Weight w;
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, N, 0xD00D0001u, w));
+  const uint32_t released = w.handle;
+  ASSERT_EQ(nntr_hvx_weight_release_u8i4(handle_, released), AEE_SUCCESS);
+
+  // Using a released handle must fail rather than read freed memory.
+  std::vector<float> x(K, 0.0f);
+  std::vector<float> out(N, 0.0f);
+  const uint32_t handles[1] = {released};
+  EXPECT_NE(nntr_hvx_mm_u8i4_layer(handle_, 1, K, handles, 1, x.data(),
+                                   static_cast<int>(x.size()), out.data(),
+                                   static_cast<int>(out.size())),
+            AEE_SUCCESS);
+  EXPECT_NE(nntr_hvx_weight_release_u8i4(handle_, released), AEE_SUCCESS)
+    << "double release accepted";
+
+  // The freed slot must come back, or a long-running process leaks handles.
+  Weight w2;
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, N, 0xD00D0002u, w2));
+  EXPECT_EQ(w2.handle, released);
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w2.handle), AEE_SUCCESS);
+}
+
+TEST_F(HmxMmU8I4Layer, MismatchedKIsRejected) {
+  // Every handle in one call shares the activation, so a handle baked for
+  // a different K is a caller bug that must not read out of bounds.
+  Weight w;
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(256, 128, 0xE0E00001u, w));
+  const uint32_t handles[1] = {w.handle};
+  std::vector<float> x(128, 0.0f); // K=128, but the weight was baked at 256
+  std::vector<float> out(128, 0.0f);
+  EXPECT_NE(nntr_hvx_mm_u8i4_layer(handle_, 1, 128, handles, 1, x.data(),
+                                   static_cast<int>(x.size()), out.data(),
+                                   static_cast<int>(out.size())),
+            AEE_SUCCESS);
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
+}
+
+/**
+ * @brief Per-call cost of the harness endpoint against the layer endpoint.
+ *
+ * Printed, never asserted. doc13 §3a measured 1.7-2x for cross-matmul
+ * prefetch on a V79, but that was inside a standalone DSP program with no
+ * FastRPC in the timed region, and thermal state moves these numbers
+ * between runs -- a threshold here would encode the lab conditions rather
+ * than a property of the code. Read the ratio, do not gate on it.
+ */
+TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
+  const uint32_t M = 64, K = 1024, N = 1024;
+  const int kReps = 20;
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0002u);
+
+  Weight w;
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, N, 0xF00D0001u, w));
+  const uint32_t handles[1] = {w.handle};
+
+  std::vector<float> out(static_cast<size_t>(M) * N, 0.0f);
+  auto time_us = [&](const std::function<void()> &fn) {
+    fn(); // warm-up, discarded
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kReps; ++i) {
+      fn();
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::micro>(t1 - t0).count() / kReps;
+  };
+
+  const uint32_t m_pad = round_up(M, kTileRow);
+  std::vector<uint8_t> ah(static_cast<size_t>(m_pad) * K, 0);
+  std::vector<float> sc(m_pad, 0.0f);
+  std::vector<int32_t> zp(m_pad, 0);
+  std::vector<int32_t> acc(static_cast<size_t>(m_pad) * N, 0);
+  std::vector<float> harness_out(static_cast<size_t>(M) * N, 0.0f);
+
+  const double harness_us = time_us([&] {
+    nntr_hvx_mm_u8i4_from_f32(
+      handle_, M, K, N, x.data(), static_cast<int>(x.size()), w.q_w.data(),
+      static_cast<int>(w.q_w.size()), w.d.data(), static_cast<int>(w.d.size()),
+      w.colsum.data(), static_cast<int>(w.colsum.size()), w.bias.data(),
+      static_cast<int>(w.bias.size()), ah.data(), static_cast<int>(ah.size()),
+      sc.data(), static_cast<int>(sc.size()), zp.data(),
+      static_cast<int>(zp.size()), acc.data(), static_cast<int>(acc.size()),
+      harness_out.data(), static_cast<int>(harness_out.size()));
+  });
+
+  const double layer_us = time_us([&] {
+    nntr_hvx_mm_u8i4_layer(handle_, M, K, handles, 1, x.data(),
+                           static_cast<int>(x.size()), out.data(),
+                           static_cast<int>(out.size()));
+  });
+
+  std::cout << "U8I4_FIELD path=harness  field=us_per_matmul value="
+            << harness_us << std::endl;
+  std::cout << "U8I4_FIELD path=layer_x1 field=us_per_matmul value="
+            << layer_us << std::endl;
+
+  // Several weights per call is where the prefetch has something to hide
+  // behind; x1 above cannot show it by construction (doc13 §3a: a single
+  // matmul is parity).
+  std::vector<Weight> ws(4);
+  std::vector<uint32_t> hs;
+  uint32_t n_total = 0;
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+      MakeAndRegister(K, N, 0xF00D1000u + i * 0x100u, ws[i]));
+    hs.push_back(ws[i].handle);
+    n_total += ws[i].N;
+  }
+  std::vector<float> out4(static_cast<size_t>(M) * n_total, 0.0f);
+  const double layer4_us = time_us([&] {
+    nntr_hvx_mm_u8i4_layer(handle_, M, K, hs.data(),
+                           static_cast<int>(hs.size()), x.data(),
+                           static_cast<int>(x.size()), out4.data(),
+                           static_cast<int>(out4.size()));
+  });
+  std::cout << "U8I4_FIELD path=layer_x4 field=us_per_matmul value="
+            << (layer4_us / 4.0) << std::endl;
+  std::cout << "U8I4_FIELD path=layer_x4 field=speedup_vs_harness value="
+            << (harness_us / (layer4_us / 4.0)) << std::endl;
+
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
+  for (const auto &ww : ws) {
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, ww.handle), AEE_SUCCESS);
+  }
 }
 
 } // namespace
