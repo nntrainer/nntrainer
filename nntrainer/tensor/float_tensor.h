@@ -577,6 +577,13 @@ private:
    */
   Tensor &dotQs4cx(Tensor const &input, Tensor &output, bool trans,
                    bool trans_in, float beta, Tdatatype dtype) const;
+
+  /**
+   * @brief Float.dot(QS8CX)
+   * @return Tensor& reference to the output tensor
+   */
+  Tensor &dotQs8cx(Tensor const &input, Tensor &output, bool trans,
+                   bool trans_in, float beta, Tdatatype dtype) const;
 };
 
 } // namespace nntrainer

@@ -104,7 +104,7 @@ const std::map<std::string, DataType> dtype_str_map = {
   {"FP32", DataType::FP32}, {"FP16", DataType::FP16},
   {"Q4_0", DataType::Q4_0}, {"Q6_K", DataType::Q6_K},
   {"Q4_K", DataType::Q4_K}, {"QS4CX", DataType::QS4CX},
-  {"NONE", DataType::NONE}};
+  {"QS8CX", DataType::QS8CX}, {"NONE", DataType::NONE}};
 
 /**
  * @brief Map of string ISA names to ISA enum values
@@ -201,9 +201,9 @@ std::string generateOutputBinName(const std::string &original_bin,
 
   // Remove old dtype suffix patterns (e.g., _fp32, _q40_fp32)
   // Common patterns: _fp32, _fp16, _q40, _q6k, _q4k, etc.
-  std::vector<std::string> dtype_suffixes = {"_fp32", "_fp16",  "_q40",
-                                             "_q4_0", "_q6k",   "_q6_k",
-                                             "_q4k",  "_qs4cx", "_q4_k"};
+  std::vector<std::string> dtype_suffixes = {
+    "_fp32", "_fp16", "_q40",   "_q4_0",  "_q6k",
+    "_q6_k", "_q4k",  "_qs4cx", "_qs8cx", "_q4_k"};
   for (const auto &suffix : dtype_suffixes) {
     auto pos = base.rfind(suffix);
     if (pos != std::string::npos && pos + suffix.size() == base.size()) {

@@ -35,13 +35,15 @@ void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
     << "feature size must be a divisor of width";
 
   if (use_gamma) {
-    // gamma is unquantized FP32 on disk; request FP32 regardless of activation
-    // dtype (FP16 would reinterpret the FP32 bytes and corrupt gamma). The FP16
-    // path casts gamma down at the multiply site.
+    // gamma defaults to unquantized FP32 on disk; request FP32 regardless of
+    // activation dtype (FP16 would reinterpret the FP32 bytes and corrupt gamma
+    // -- the FP16 path casts gamma down at the multiply site). The gamma_dtype
+    // property overrides this when the checkpoint stores gamma in another
+    // dtype.
+    const auto gamma_dtype = std::get<props::GammaDtype>(rms_props).get();
     nntrainer::TensorDim gamma_dim(
       1, 1, 1, feature_size,
-      nntrainer::TensorDim::TensorType(context.getFormat(),
-                                       nntrainer::TensorDim::DataType::FP32));
+      nntrainer::TensorDim::TensorType(context.getFormat(), gamma_dtype));
     wt_idx[RMSParams::gamma] = context.requestWeight(
       gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
       nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
@@ -125,7 +127,14 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     }
     if (use_gamma) {
       nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
-      if (gamma.getDataType() != out_step.getDataType()) {
+      if (gamma.getDataType() == ml::train::TensorDim::DataType::QS8CX) {
+        nntrainer::TensorDim gamma_dim = gamma.getDim();
+        gamma_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+        nntrainer::Tensor gamma_fp32(gamma_dim);
+        nntrainer::dequantize_row_qs8cx(0, gamma_dim.width(), gamma.getData(),
+                                        gamma.getScale(), gamma_fp32.getData());
+        out_step.multiply_i(gamma_fp32);
+      } else if (gamma.getDataType() != out_step.getDataType()) {
         nntrainer::Tensor gamma_cast = gamma.clone(out_step.getDataType());
         out_step.multiply_i(gamma_cast);
       } else {

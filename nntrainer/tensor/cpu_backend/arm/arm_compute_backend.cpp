@@ -746,6 +746,21 @@ void gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
 #endif
 }
 
+void gemm_qai8dxp_qsi8cxp(size_t m, size_t n, size_t k,
+                          void *lhs_native_mtx_f32, void *rhs_packed_mtx_qs8cx,
+                          float *dst_act_mtx_f32, size_t idx_variant,
+                          float lower_bound, float upper_bound) {
+#ifndef ARMV7
+  __kai_gemm_qai8dxp_qsi8cxp(m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs8cx,
+                             dst_act_mtx_f32, idx_variant, lower_bound,
+                             upper_bound);
+#else
+  throw std::runtime_error(
+    "gemm_qai8dxp_qsi8cxp is not supported on ARMv7 (requires KleidiAI "
+    "AArch64 kernels)");
+#endif
+}
+
 // Dispatches to the NEON prefill kernel on AArch64.
 void causal_depthwise_conv1d_k3(const float *input, const float *packed_weight,
                                 const float *bias, float *output,

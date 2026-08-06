@@ -971,7 +971,8 @@ void NeuralNetwork::load(const std::string &file_path,
           tensor_data_type != TensorDim::DataType::FP16 &&
           tensor_data_type != TensorDim::DataType::Q6_K &&
           tensor_data_type != TensorDim::DataType::Q4_0 &&
-          tensor_data_type != TensorDim::DataType::QS4CX) {
+          tensor_data_type != TensorDim::DataType::QS4CX &&
+          tensor_data_type != TensorDim::DataType::QS8CX) {
         // for tensor with qparam
         size += sizeof(uint16_t);
       }

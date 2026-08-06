@@ -1651,6 +1651,25 @@ void gemm_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
                           float lower_bound = -FLT_MAX,
                           float upper_bound = FLT_MAX);
 
+/**
+ * @brief run qai8dxp_qsi8cxp GEMM with offline packed rhs
+ *
+ * @param[in] m M for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] n N for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] k K for (M, K) * (K, N) = (M, N) in noTrans GEMM
+ * @param[in] lhs_native_mtx_f32 matrix data
+ * @param[in] rhs_packed_mtx_qs8cx quantized matrix data, packed already
+ * @param[out] dst_act_mtx_f32 output data
+ * @param[in] idx_variant index of ukernel to use
+ * @param[in] lower_bound clipping param
+ * @param[in] upper_bound clipping param
+ */
+void gemm_qai8dxp_qsi8cxp(size_t m, size_t n, size_t k,
+                          void *lhs_native_mtx_f32, void *rhs_packed_mtx_qs8cx,
+                          float *dst_act_mtx_f32, size_t idx_variant,
+                          float lower_bound = -FLT_MAX,
+                          float upper_bound = FLT_MAX);
+
 } /* namespace nntrainer */
 #endif /* __cplusplus */
 #endif /* __ARM_COMPUTE_BACKEND_H__ */

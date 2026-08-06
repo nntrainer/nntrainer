@@ -106,6 +106,28 @@ public:
   using prop_tag = nntrainer::enum_class_prop_tag;
   static constexpr const char *key = "gamma_initializer";
 };
+
+/**
+ * @brief GammaDtype — data type of the RMSNorm gamma weight.
+ *
+ * Defaults to FP32 so existing checkpoints (gamma stored unquantized on disk)
+ * keep loading unchanged. Set it explicitly to override the gamma weight dtype
+ * (e.g. via reshaped_rms_norm_dtype in nntr_config.json).
+ */
+WIN_EXPORT class GammaDtype final
+  : public nntrainer::EnumProperty<nntrainer::TensorDataTypeInfo> {
+public:
+  /**
+   * @brief Construct a GammaDtype object, defaulting to FP32
+   */
+  WIN_EXPORT GammaDtype(nntrainer::TensorDataTypeInfo::Enum value =
+                          nntrainer::TensorDataTypeInfo::Enum::FP32) {
+    set(value);
+  };
+
+  using prop_tag = nntrainer::enum_class_prop_tag;
+  static constexpr const char *key = "gamma_dtype";
+};
 }; // namespace props
 
 WIN_EXPORT enum RMSParams { gamma };

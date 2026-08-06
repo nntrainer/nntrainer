@@ -48,7 +48,7 @@ public:
     Layer(),
     rms_props(props::RMS_NORM_GAMMA_INIT(), nntrainer::props::Epsilon(),
               props::FeatureSize(), nntrainer::props::SkipPrefill(),
-              props::UseGamma()),
+              props::UseGamma(), props::GammaDtype()),
     feature_size(0),
     use_gamma(true) {
     wt_idx.fill(std::numeric_limits<unsigned int>::max());
@@ -122,7 +122,8 @@ public:
 private:
   std::array<unsigned int, 1> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
-             props::FeatureSize, nntrainer::props::SkipPrefill, props::UseGamma>
+             props::FeatureSize, nntrainer::props::SkipPrefill, props::UseGamma,
+             props::GammaDtype>
     rms_props;
 
   unsigned int feature_size;
