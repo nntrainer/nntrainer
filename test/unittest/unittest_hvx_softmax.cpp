@@ -185,7 +185,7 @@ TEST_F(HvxSoftmax, RejectsLengthMismatch) {
   const uint32_t m = 2, k = 32;
   std::vector<float> in(m * k, 1.0f), out(k, 0.0f);
 
-  int err = nntr_hvx_softmax_f32(handle_, m, k, 1.0f, in.data(),
+  int err = nntr_hvx_softmax_f32(handle_, m, k, 0u, 1.0f, in.data(),
                                  static_cast<int>(in.size()), out.data(),
                                  static_cast<int>(out.size()));
   EXPECT_EQ(err, AEE_EBADPARM + kDspOffset)
@@ -202,7 +202,7 @@ TEST_F(HvxSoftmax, MatchesDoubleForOneFullRow) {
     v = dist(rng);
   }
 
-  int err = nntr_hvx_softmax_f32(handle_, m, k, 1.0f, in.data(),
+  int err = nntr_hvx_softmax_f32(handle_, m, k, 0u, 1.0f, in.data(),
                                  static_cast<int>(in.size()), out.data(),
                                  static_cast<int>(out.size()));
   ASSERT_EQ(err, AEE_SUCCESS) << "softmax_f32 failed: " << hex(err);
@@ -236,10 +236,10 @@ TEST_F(HvxSoftmax, IsInvariantToAConstantShift) {
   }
 
   const int n = static_cast<int>(m * k);
-  ASSERT_EQ(nntr_hvx_softmax_f32(handle_, m, k, 1.0f, base.data(), n,
+  ASSERT_EQ(nntr_hvx_softmax_f32(handle_, m, k, 0u, 1.0f, base.data(), n,
                                  out_base.data(), n),
             AEE_SUCCESS);
-  ASSERT_EQ(nntr_hvx_softmax_f32(handle_, m, k, 1.0f, shifted.data(), n,
+  ASSERT_EQ(nntr_hvx_softmax_f32(handle_, m, k, 0u, 1.0f, shifted.data(), n,
                                  out_shift.data(), n),
             AEE_SUCCESS);
 
@@ -255,7 +255,7 @@ TEST_F(HvxSoftmax, SpreadsUniformlyForEqualInputs) {
 
   const int n = static_cast<int>(m * k);
   ASSERT_EQ(
-    nntr_hvx_softmax_f32(handle_, m, k, 1.0f, in.data(), n, out.data(), n),
+    nntr_hvx_softmax_f32(handle_, m, k, 0u, 1.0f, in.data(), n, out.data(), n),
     AEE_SUCCESS);
 
   for (uint32_t i = 0; i < k; ++i) {
@@ -273,7 +273,7 @@ TEST_F(HvxSoftmax, CollapsesOntoADominantElement) {
 
   const int n = static_cast<int>(m * k);
   ASSERT_EQ(
-    nntr_hvx_softmax_f32(handle_, m, k, 1.0f, in.data(), n, out.data(), n),
+    nntr_hvx_softmax_f32(handle_, m, k, 0u, 1.0f, in.data(), n, out.data(), n),
     AEE_SUCCESS);
 
   for (uint32_t i = 0; i < k; ++i) {
@@ -295,9 +295,9 @@ TEST_F(HvxSoftmax, HandlesRowLengthsThatAreNotWholeVectors) {
     }
 
     const int n = static_cast<int>(k);
-    ASSERT_EQ(
-      nntr_hvx_softmax_f32(handle_, m, k, 1.0f, in.data(), n, out.data(), n),
-      AEE_SUCCESS)
+    ASSERT_EQ(nntr_hvx_softmax_f32(handle_, m, k, 0u, 1.0f, in.data(), n,
+                                   out.data(), n),
+              AEE_SUCCESS)
       << "k=" << k;
 
     const std::vector<float> ref = ref_softmax(in, m, k, 1.0f);
@@ -320,11 +320,117 @@ TEST_F(HvxSoftmax, DoesNotWritePastTheEndOfTheBuffer) {
 
   const int n = static_cast<int>(k);
   ASSERT_EQ(
-    nntr_hvx_softmax_f32(handle_, m, k, 1.0f, in.data(), n, buf.data(), n),
+    nntr_hvx_softmax_f32(handle_, m, k, 0u, 1.0f, in.data(), n, buf.data(), n),
     AEE_SUCCESS);
 
   for (uint32_t i = 0; i < guard; ++i) {
     EXPECT_EQ(buf[k + i], 12345.0f) << "clobbered guard word " << i;
+  }
+}
+
+TEST_F(HvxSoftmax, KeepsRowsIndependent) {
+  // Different distributions per row: if one row's max or sum leaked into
+  // the next, these would not all normalize to 1.
+  const uint32_t m = 8, k = 100;
+  std::vector<float> in(m * k), out(m * k, -1.0f);
+
+  std::mt19937 rng(31u);
+  for (uint32_t r = 0; r < m; ++r) {
+    std::uniform_real_distribution<float> dist(-2.0f * (r + 1), 2.0f * (r + 1));
+    for (uint32_t i = 0; i < k; ++i) {
+      in[(size_t)r * k + i] = dist(rng);
+    }
+  }
+
+  const int n = static_cast<int>(in.size());
+  ASSERT_EQ(
+    nntr_hvx_softmax_f32(handle_, m, k, 0u, 1.0f, in.data(), n, out.data(), n),
+    AEE_SUCCESS);
+
+  const std::vector<float> ref = ref_softmax(in, m, k, 1.0f);
+  for (uint32_t r = 0; r < m; ++r) {
+    double sum = 0.0;
+    for (uint32_t i = 0; i < k; ++i) {
+      const size_t j = (size_t)r * k + i;
+      EXPECT_NEAR(out[j], ref[j], 1e-6) << "row " << r << " lane " << i;
+      sum += out[j];
+    }
+    EXPECT_NEAR(sum, 1.0, 1e-6) << "row " << r << " does not sum to 1";
+  }
+}
+
+TEST_F(HvxSoftmax, MatchesOutOfPlaceWhenComputedInPlace) {
+  const uint32_t m = 4, k = 65;
+  std::vector<float> in(m * k);
+
+  std::mt19937 rng(99u);
+  std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+  for (auto &v : in) {
+    v = dist(rng);
+  }
+
+  std::vector<float> out_of_place(m * k, 0.0f);
+  std::vector<float> in_place = in;
+
+  const int n = static_cast<int>(in.size());
+  ASSERT_EQ(nntr_hvx_softmax_f32(handle_, m, k, 0u, 1.0f, in.data(), n,
+                                 out_of_place.data(), n),
+            AEE_SUCCESS);
+  ASSERT_EQ(nntr_hvx_softmax_f32(handle_, m, k, 0u, 1.0f, in_place.data(), n,
+                                 in_place.data(), n),
+            AEE_SUCCESS);
+
+  for (uint32_t i = 0; i < m * k; ++i) {
+    EXPECT_EQ(in_place[i], out_of_place[i]) << "lane " << i;
+  }
+}
+
+TEST_F(HvxSoftmax, HandlesANegativeScale) {
+  // A negative scale flips which element is the maximum. Taking
+  // scale*max(x) instead of max(x*scale) would subtract the wrong value
+  // and overflow exp.
+  const uint32_t m = 2, k = 48;
+  std::vector<float> in(m * k), out(m * k, -1.0f);
+
+  std::mt19937 rng(5u);
+  std::uniform_real_distribution<float> dist(-6.0f, 6.0f);
+  for (auto &v : in) {
+    v = dist(rng);
+  }
+
+  const int n = static_cast<int>(in.size());
+  ASSERT_EQ(
+    nntr_hvx_softmax_f32(handle_, m, k, 0u, -1.0f, in.data(), n, out.data(), n),
+    AEE_SUCCESS);
+
+  const std::vector<float> ref = ref_softmax(in, m, k, -1.0f);
+  for (uint32_t i = 0; i < m * k; ++i) {
+    EXPECT_NEAR(out[i], ref[i], 1e-6) << "lane " << i;
+  }
+}
+
+TEST_F(HvxSoftmax, LeavesRowsBeforeTheRangeAlone) {
+  // m_first=2 of 5 rows. FastRPC zeroes the rout buffer before sending it
+  // to the DSP, so the untouched rows come back 0 regardless -- an in-place
+  // (inrout) IDL entry would be needed to see them directly. Instead, call
+  // twice -- (0, M) and (m_first, M) -- and compare the rows the range call
+  // should have produced.
+  const uint32_t m = 5, k = 64, m_first = 2;
+  std::vector<float> in(m * k, 1.0f);
+  std::vector<float> out_full(m * k, 0.0f);
+  std::vector<float> out_range(m * k, 0.0f);
+
+  const int n = static_cast<int>(in.size());
+  ASSERT_EQ(nntr_hvx_softmax_f32(handle_, m, k, 0u, 1.0f, in.data(), n,
+                                 out_full.data(), n),
+            AEE_SUCCESS);
+  ASSERT_EQ(nntr_hvx_softmax_f32(handle_, m, k, m_first, 1.0f, in.data(), n,
+                                 out_range.data(), n),
+            AEE_SUCCESS);
+
+  for (uint32_t i = m_first * k; i < m * k; ++i) {
+    EXPECT_NEAR(out_range[i], out_full[i], 1e-6)
+      << "range result differs from full result at lane " << i;
   }
 }
 

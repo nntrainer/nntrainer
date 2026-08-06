@@ -31,6 +31,7 @@ interface nntr_hvx : remote_handle64 {
    // 엔트리는 tail을 다루지 않는다).
    AEEResult exp_f32(in sequence<float> x, rout sequence<float> y);
 
-   AEEResult softmax_f32(in uint32 M, in uint32 K, in float scale,
-                         in sequence<float> x, rout sequence<float> y);
+   AEEResult softmax_f32(in uint32 M, in uint32 K, in uint32 m_first,
+                         in float scale, in sequence<float> x,
+                         rout sequence<float> y);
 };

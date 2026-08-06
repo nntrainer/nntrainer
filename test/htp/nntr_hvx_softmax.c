@@ -55,11 +55,11 @@ int nntr_hvx_exp_f32(remote_handle64 handle, const float *x, int xLen, float *y,
 }
 
 int nntr_hvx_softmax_f32(remote_handle64 handle, uint32 M, uint32 K,
-                         float scale, const float *x, int xLen, float *y,
-                         int yLen) {
+                         uint32 m_first, float scale, const float *x, int xLen,
+                         float *y, int yLen) {
   (void)handle;
 
-  if (M == 0u || K == 0u) {
+  if (M == 0u || K == 0u || m_first > M) {
     return AEE_EBADPARM;
   }
   if ((uint32)xLen != M * K || xLen != yLen) {
@@ -69,6 +69,6 @@ int nntr_hvx_softmax_f32(remote_handle64 handle, uint32 M, uint32 K,
     return AEE_EUNSUPPORTED;
   }
 
-  hvx_softmax_rows_f32(x, y, 0u, M, K, scale);
+  hvx_softmax_rows_f32(x, y, m_first, M, K, scale);
   return AEE_SUCCESS;
 }
