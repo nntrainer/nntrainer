@@ -21,6 +21,8 @@
 
 #include "nntr_hvx.h"
 
+#include "hvx_exp_f32.h"
+
 /** @brief f32 lanes per HVX vector in 128B mode. */
 #define LANES 32u
 
@@ -33,7 +35,6 @@ static int have_hvx(void) {
 int nntr_hvx_exp_f32(remote_handle64 handle, const float *x, int xLen, float *y,
                      int yLen) {
   (void)handle;
-  (void)x;
 
   if (xLen != yLen || xLen <= 0 || (unsigned)xLen % LANES != 0u) {
     return AEE_EBADPARM;
@@ -42,8 +43,15 @@ int nntr_hvx_exp_f32(remote_handle64 handle, const float *x, int xLen, float *y,
     return AEE_EUNSUPPORTED;
   }
 
-  /* Stub: proves the rout buffer comes back. Task 2 fills it in. */
-  memset(y, 0, (size_t)yLen * sizeof(float));
+  // FastRPC buffers carry no vector alignment guarantee, so the unaligned
+  // vector type is what keeps this from faulting.
+  const HVX_UVector *vx = (const HVX_UVector *)x;
+  HVX_UVector *vy = (HVX_UVector *)y;
+
+  const int nvec = xLen / (int)LANES;
+  for (int i = 0; i < nvec; ++i) {
+    vy[i] = hvx_exp_sf(vx[i]);
+  }
   return AEE_SUCCESS;
 }
 

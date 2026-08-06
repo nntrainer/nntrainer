@@ -115,16 +115,6 @@ protected:
 class HvxExp : public HtpSession {};
 class HvxSoftmax : public HtpSession {};
 
-TEST_F(HvxExp, RoundTripsTheOutputBuffer) {
-  const int n = 32;
-  std::vector<float> in(n, 1.0f), out(n, -1.0f);
-
-  int err = nntr_hvx_exp_f32(handle_, in.data(), n, out.data(), n);
-  ASSERT_EQ(err, AEE_SUCCESS) << "exp_f32 failed: " << hex(err);
-  /* The stub zeroes the buffer; this only proves rout came back. */
-  EXPECT_NE(out[0], -1.0f);
-}
-
 TEST_F(HvxExp, RejectsNonVectorLength) {
   const int n = 33;
   std::vector<float> in(n, 1.0f), out(n, 0.0f);
@@ -132,6 +122,63 @@ TEST_F(HvxExp, RejectsNonVectorLength) {
   int err = nntr_hvx_exp_f32(handle_, in.data(), n, out.data(), n);
   EXPECT_EQ(err, AEE_EBADPARM + kDspOffset)
     << "expected EBADPARM, got " << hex(err);
+}
+
+TEST_F(HvxExp, MatchesDoubleOverTheNormalRange) {
+  // 8192 is a multiple of 32. Sweep stops at -87: below that the true
+  // value is subnormal and the kernel flushes it to zero by contract.
+  const int n = 8192;
+  std::vector<float> in(n), out(n, 0.0f);
+  for (int i = 0; i < n; ++i) {
+    in[i] = -87.0f + 175.0f * static_cast<float>(i) / static_cast<float>(n - 1);
+  }
+
+  int err = nntr_hvx_exp_f32(handle_, in.data(), n, out.data(), n);
+  ASSERT_EQ(err, AEE_SUCCESS) << "exp_f32 failed: " << hex(err);
+
+  double worst = 0.0;
+  int worst_i = 0;
+  for (int i = 0; i < n; ++i) {
+    const double ref = std::exp(static_cast<double>(in[i]));
+    const double rel = std::abs(static_cast<double>(out[i]) - ref) / ref;
+    if (rel > worst) {
+      worst = rel;
+      worst_i = i;
+    }
+  }
+  EXPECT_LT(worst, 1e-6) << "worst relative error at x=" << in[worst_i]
+                         << ": got " << out[worst_i] << ", want "
+                         << std::exp(static_cast<double>(in[worst_i]));
+}
+
+TEST_F(HvxExp, ExactlyOneAtZero) {
+  const int n = 32;
+  const std::vector<float> in(n, 0.0f);
+  std::vector<float> out(n, -1.0f);
+
+  int err = nntr_hvx_exp_f32(handle_, in.data(), n, out.data(), n);
+  ASSERT_EQ(err, AEE_SUCCESS) << "exp_f32 failed: " << hex(err);
+  for (int i = 0; i < n; ++i) {
+    EXPECT_EQ(out[i], 1.0f) << "lane " << i;
+  }
+}
+
+TEST_F(HvxExp, FlushesFarNegativeToZero) {
+  // softmax feeds x - max, which can be arbitrarily negative. The low
+  // clamp inside hvx_exp_sf is what keeps the range reduction from
+  // overflowing its own valid domain on these.
+  const int n = 32;
+  std::vector<float> in(n, -90.0f);
+  in[1] = -200.0f;
+  in[2] = -1e30f;
+  in[3] = -3.4e38f;
+  std::vector<float> out(n, 1.0f);
+
+  int err = nntr_hvx_exp_f32(handle_, in.data(), n, out.data(), n);
+  ASSERT_EQ(err, AEE_SUCCESS) << "exp_f32 failed: " << hex(err);
+  for (int i = 0; i < n; ++i) {
+    EXPECT_EQ(out[i], 0.0f) << "lane " << i << " x=" << in[i];
+  }
 }
 
 TEST_F(HvxSoftmax, RoundTripsTheOutputBuffer) {
