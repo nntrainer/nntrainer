@@ -246,6 +246,15 @@ public:
   virtual void calcGradient(RunLayerContext &context) {}
 
   /**
+   * @brief     Pack the layer's weights into a backend-optimized layout
+   * @details   Invoked after weights are loaded.
+   * - The default implementation is a no-op
+   * - Each derived layer overrides this if weight repack needed
+   * @param     context Context of the layer, providing access to its weights
+   */
+  virtual void pack(RunLayerContext &context) {}
+
+  /**
    * @brief     set Property of layer
    * @param     values values of property
    * @throw std::invalid_argument invalid parameter.

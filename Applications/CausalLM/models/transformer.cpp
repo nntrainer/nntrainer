@@ -361,22 +361,12 @@ void Transformer::repack_weight() {
   }
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
-      // repack FC layer only
-      if (l.getType() != "fully_connected" &&
-          l.getType() != "shared_fully_connected")
-        return;
-
-      auto weights = context.getWeights();
-      for (auto &w : weights) {
-        if (w->getVariableRef().getDataType() ==
-            ml::train::TensorDim::DataType::QS4CX) {
-          w->getVariableRef().pack();
-        }
-      }
+      // Each layer determines whether it repacks its own weights or not
+      static_cast<nntrainer::LayerNode &>(l).pack(context);
     };
   try {
     model->forEachLayer(fn, nullptr);
-    ml_logd("QS4CX weights repacked successfully");
+    ml_logd("weights repacked successfully");
   } catch (const std::exception &e) {
     throw std::runtime_error("Failed to repack weights: " +
                              std::string(e.what()));

@@ -109,6 +109,11 @@ public:
   void setBatch(nntrainer::RunLayerContext &context,
                 unsigned int batch) override;
 
+  /**
+   * @copydoc Layer::pack(RunLayerContext &context)
+   */
+  void pack(RunLayerContext &context) override;
+
   static constexpr const char *type = "fully_connected";
 
 private:

@@ -214,6 +214,14 @@ void FullyConnectedLayer::setBatch(nntrainer::RunLayerContext &context,
   }
 }
 
+void FullyConnectedLayer::pack(RunLayerContext &context) {
+  for (auto &w : context.getWeights()) {
+    Tensor &var = w->getVariableRef();
+    if (var.getDataType() == TensorDim::DataType::QS4CX)
+      var.pack();
+  }
+}
+
 void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);

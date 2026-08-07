@@ -140,6 +140,11 @@ public:
    */
   bool supportBackwarding() const override { return true; }
 
+  /**
+   * @copydoc Layer::pack(RunLayerContext &context)
+   */
+  void pack(nntrainer::RunLayerContext &context) override;
+
   static constexpr const char *type = "shared_fully_connected";
 
 private:

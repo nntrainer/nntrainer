@@ -184,6 +184,14 @@ void SharedFullyConnectedLayer::exportTo(
   exporter.saveResult(fc_props, method, this);
 }
 
+void SharedFullyConnectedLayer::pack(nntrainer::RunLayerContext &context) {
+  for (auto &w : context.getWeights()) {
+    nntrainer::Tensor &var = w->getVariableRef();
+    if (var.getDataType() == nntrainer::TensorDim::DataType::QS4CX)
+      var.pack();
+  }
+}
+
 void SharedFullyConnectedLayer::read(
   std::ifstream &file, nntrainer::RunLayerContext &context, bool opt_var,
   ml::train::ExecutionMode mode, bool trainable,

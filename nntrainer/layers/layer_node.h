@@ -422,6 +422,14 @@ public:
   bool supportBackwarding() const { return getLayer()->supportBackwarding(); }
 
   /**
+   * @brief     Pack the underlying layer's weights
+   * @details   Delegates to the wrapped layer so each layer type decides how
+   *            (and whether) to repack its own weights.
+   * @param     context Run context bound to this node
+   */
+  void pack(RunLayerContext &context) { getLayer()->pack(context); }
+
+  /**
    * Support interfaces for the properties intercepted from layer
    */
 
