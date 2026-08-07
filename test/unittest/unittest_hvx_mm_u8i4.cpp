@@ -672,8 +672,8 @@ TEST_F(HmxMmU8I4Layer, PartialLastRowBlockMatchesReference) {
     ASSERT_EQ(want.size(), static_cast<size_t>(M) * Ns[i]);
     for (size_t j = 0; j < want.size(); ++j) {
       EXPECT_NEAR(got[off + j], want[j], std::abs(want[j]) * 1e-5f + 1e-6f)
-        << "element " << j << " (row " << (j / Ns[i]) << ", col "
-        << (j % Ns[i]) << ")";
+        << "element " << j << " (row " << (j / Ns[i]) << ", col " << (j % Ns[i])
+        << ")";
     }
     off += want.size();
   }

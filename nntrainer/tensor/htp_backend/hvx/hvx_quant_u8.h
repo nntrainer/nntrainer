@@ -58,7 +58,7 @@ void hvx_quant_rows_u8_params(const float *x, uint32_t m_valid, uint32_t m_pad,
  *         this needs to parallelize safely fails to allocate.
  */
 int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
-                        uint32_t k, const float *scale, const int32_t *zp,
-                        uint8_t *out_ah, hvx_worker_pool *pool);
+                         uint32_t k, const float *scale, const int32_t *zp,
+                         uint8_t *out_ah, hvx_worker_pool *pool);
 
 #endif /* __NNTRAINER_HVX_QUANT_U8_H__ */

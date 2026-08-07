@@ -44,11 +44,11 @@ static uint32_t dma_row_size_dividing(uint32_t total_bytes) {
   return rs;
 }
 
-int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl,
-                               uint8_t *vtcm_base, uint32_t vtcm_size,
-                               uint32_t K, uint32_t N, const int8_t *w_i4_rm,
-                               const float *w_scale, const int32_t *colsum_w,
-                               const float *bias, uint32_t *out_handle) {
+int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
+                               uint32_t vtcm_size, uint32_t K, uint32_t N,
+                               const int8_t *w_i4_rm, const float *w_scale,
+                               const int32_t *colsum_w, const float *bias,
+                               uint32_t *out_handle) {
   if (!tbl || !vtcm_base || !w_i4_rm || !w_scale || !colsum_w || !bias ||
       !out_handle || K == 0 || N == 0) {
     return AEE_EBADPARM;
@@ -85,8 +85,7 @@ int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl,
   for (uint32_t kt = 0; kt < k_tiles; ++kt) {
     for (uint32_t nt = 0; nt < n_tiles; ++nt) {
       const uint32_t off = (kt * n_tiles + nt) * WEIGHT_TILE_BYTES_U8I4;
-      int res =
-        hexkl_micro_hmx_rm_to_wh_i4(vtcm_base, off, w_i4_rm, kt, nt, N);
+      int res = hexkl_micro_hmx_rm_to_wh_i4(vtcm_base, off, w_i4_rm, kt, nt, N);
       if (res != AEE_SUCCESS) {
         return res;
       }
@@ -133,8 +132,8 @@ int hexkl_weight_u8i4_release(hexkl_weight_u8i4_table *tbl, uint32_t handle) {
 }
 
 int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
-                            uint32_t vtcm_size, uint32_t config_off,
-                            uint32_t M, uint32_t K, const uint32_t *handles,
+                            uint32_t vtcm_size, uint32_t config_off, uint32_t M,
+                            uint32_t K, const uint32_t *handles,
                             uint32_t n_handles, const float *act_f32,
                             float *out_cat, hvx_worker_pool *pool) {
   if (!tbl || !vtcm_base || !handles || n_handles == 0 || !act_f32 ||
@@ -154,7 +153,8 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   // bounds are the caller's to check (nntr_hvx_mm_u8i4_layer does).
   uint32_t n_tiles_max = 0;
   for (uint32_t i = 0; i < n_handles; ++i) {
-    if (handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS || !tbl->slots[handles[i]].in_use) {
+    if (handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !tbl->slots[handles[i]].in_use) {
       return AEE_EBADPARM;
     }
     const hexkl_weight_u8i4 *h = &tbl->slots[handles[i]];
@@ -172,7 +172,8 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   // readout tile | its row-major unshuffle. The last two are one tile each
   // and stay that size regardless of M or N: the epilogue consumes a tile
   // before the next one is read, so nothing has to be kept around.
-  const uint32_t act_bytes = n_rblocks * k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
+  const uint32_t act_bytes =
+    n_rblocks * k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
   const uint32_t act_off = 0;
   const uint32_t wb_max = k_tiles * n_tiles_max * WEIGHT_TILE_BYTES_U8I4;
   const uint32_t wbuf[2] = {
@@ -226,7 +227,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     const uint32_t wb0 = k_tiles * nt0 * WEIGHT_TILE_BYTES_U8I4;
     const uint32_t rs0 = dma_row_size_dividing(wb0);
     hexkl_dma_ring_push2d(vtcm_base + wbuf[0], h0->wh_bytes, rs0, rs0, rs0,
-                         wb0 / rs0, /*src_vtcm=*/0, /*dst_vtcm=*/1);
+                          wb0 / rs0, /*src_vtcm=*/0, /*dst_vtcm=*/1);
     hexkl_dma_ring_drain();
   }
 
@@ -245,8 +246,8 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
       const uint32_t wb_next = k_tiles * nt_next * WEIGHT_TILE_BYTES_U8I4;
       const uint32_t rs = dma_row_size_dividing(wb_next);
       hexkl_dma_ring_push2d(vtcm_base + wbuf[(i + 1) & 1u], hn->wh_bytes, rs,
-                           rs, rs, wb_next / rs, /*src_vtcm=*/0,
-                           /*dst_vtcm=*/1);
+                            rs, rs, wb_next / rs, /*src_vtcm=*/0,
+                            /*dst_vtcm=*/1);
     }
 
     float *const out_h = out_cat + out_off;
