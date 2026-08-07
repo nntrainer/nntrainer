@@ -19,8 +19,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -234,31 +232,6 @@ double snr_db(const std::vector<float> &ref, const std::vector<float> &got) {
   return 10.0 * std::log10(sig / noise);
 }
 
-/**
- * @brief Writes @a v to $NNTR_DUMP_DIR/<name>.bin when that variable is set.
- *
- * Scaffolding for the one-shot byte-exact comparison across the epilogue
- * fusion: the formula and the inputs do not change, so the pre- and
- * post-fusion outputs must agree to the bit, which is a far stronger
- * statement than S3's 1e-5 relative gate. Removed once that comparison
- * has been made.
- */
-void dump_f32(const std::string &name, const std::vector<float> &v) {
-  const char *dir = std::getenv("NNTR_DUMP_DIR");
-  if (dir == nullptr) {
-    return;
-  }
-  const std::string path = std::string(dir) + "/" + name + ".bin";
-  std::FILE *f = std::fopen(path.c_str(), "wb");
-  if (f == nullptr) {
-    std::cerr << "dump_f32: cannot open " << path << std::endl;
-    return;
-  }
-  std::fwrite(v.data(), sizeof(float), v.size(), f);
-  std::fclose(f);
-  std::cout << "[dump] " << path << " (" << v.size() << " floats)" << std::endl;
-}
-
 /** @brief Deterministic pseudo-random fill in [-1, 1). */
 void fill_deterministic(std::vector<float> &v, uint32_t seed) {
   uint32_t s = seed;
@@ -408,7 +381,6 @@ protected:
     std::vector<uint8_t> got_ah(static_cast<size_t>(m_pad) * K, 0);
     std::vector<float> got_scale(m_pad, 0.0f);
     std::vector<int32_t> got_zp(m_pad, -1);
-    std::vector<int32_t> got_acc(static_cast<size_t>(m_pad) * N, 0);
     std::vector<float> got_out(static_cast<size_t>(M) * N, 0.0f);
     // S2 reads the accumulator from the dedicated debug entry point, not
     // from from_f32: the fused epilogue keeps the int32 tile inside VTCM,
@@ -422,8 +394,7 @@ protected:
       static_cast<int>(bias.size()), got_ah.data(),
       static_cast<int>(got_ah.size()), got_scale.data(),
       static_cast<int>(got_scale.size()), got_zp.data(),
-      static_cast<int>(got_zp.size()), got_acc.data(),
-      static_cast<int>(got_acc.size()), got_out.data(),
+      static_cast<int>(got_zp.size()), got_out.data(),
       static_cast<int>(got_out.size()));
     ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_from_f32 failed: " << hex(err);
 
@@ -467,10 +438,6 @@ protected:
     std::cout << "[S4] M=" << M << " K=" << K << " N=" << N << " SNR=" << snr
               << " dB  max_rel=" << max_rel << std::endl;
     EXPECT_GT(snr, 0.0) << "quantized output carries no signal at all";
-
-    dump_f32("out_M" + std::to_string(M) + "_K" + std::to_string(K) + "_N" +
-               std::to_string(N),
-             got_out);
   }
 };
 
@@ -528,8 +495,8 @@ protected:
 
     w.handle = 0xFFFFFFFFu;
     int err = nntr_hvx_weight_register_u8i4(
-      handle_, K, N, w.q_w.data(), static_cast<int>(w.q_w.size()),
-      w.d.data(), static_cast<int>(w.d.size()), w.colsum.data(),
+      handle_, K, N, w.q_w.data(), static_cast<int>(w.q_w.size()), w.d.data(),
+      static_cast<int>(w.d.size()), w.colsum.data(),
       static_cast<int>(w.colsum.size()), w.bias.data(),
       static_cast<int>(w.bias.size()), &w.handle);
     ASSERT_EQ(err, AEE_SUCCESS) << "weight_register_u8i4 failed: " << hex(err);
@@ -699,7 +666,6 @@ TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
   std::vector<uint8_t> ah(static_cast<size_t>(m_pad) * K, 0);
   std::vector<float> sc(m_pad, 0.0f);
   std::vector<int32_t> zp(m_pad, 0);
-  std::vector<int32_t> acc(static_cast<size_t>(m_pad) * N, 0);
   std::vector<float> harness_out(static_cast<size_t>(M) * N, 0.0f);
 
   const double harness_us = time_us([&] {
@@ -709,8 +675,8 @@ TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
       w.colsum.data(), static_cast<int>(w.colsum.size()), w.bias.data(),
       static_cast<int>(w.bias.size()), ah.data(), static_cast<int>(ah.size()),
       sc.data(), static_cast<int>(sc.size()), zp.data(),
-      static_cast<int>(zp.size()), acc.data(), static_cast<int>(acc.size()),
-      harness_out.data(), static_cast<int>(harness_out.size()));
+      static_cast<int>(zp.size()), harness_out.data(),
+      static_cast<int>(harness_out.size()));
   });
 
   const double layer_us = time_us([&] {
@@ -721,8 +687,8 @@ TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
 
   std::cout << "U8I4_FIELD path=harness  field=us_per_matmul value="
             << harness_us << std::endl;
-  std::cout << "U8I4_FIELD path=layer_x1 field=us_per_matmul value="
-            << layer_us << std::endl;
+  std::cout << "U8I4_FIELD path=layer_x1 field=us_per_matmul value=" << layer_us
+            << std::endl;
 
   // Several weights per call is where the prefetch has something to hide
   // behind; x1 above cannot show it by construction (doc13 §3a: a single
@@ -738,10 +704,9 @@ TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
   }
   std::vector<float> out4(static_cast<size_t>(M) * n_total, 0.0f);
   const double layer4_us = time_us([&] {
-    nntr_hvx_mm_u8i4_layer(handle_, M, K, hs.data(),
-                           static_cast<int>(hs.size()), x.data(),
-                           static_cast<int>(x.size()), out4.data(),
-                           static_cast<int>(out4.size()));
+    nntr_hvx_mm_u8i4_layer(
+      handle_, M, K, hs.data(), static_cast<int>(hs.size()), x.data(),
+      static_cast<int>(x.size()), out4.data(), static_cast<int>(out4.size()));
   });
   std::cout << "U8I4_FIELD path=layer_x4 field=us_per_matmul value="
             << (layer4_us / 4.0) << std::endl;

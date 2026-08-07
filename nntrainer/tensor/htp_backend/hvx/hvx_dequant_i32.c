@@ -62,3 +62,36 @@ void hvx_dequant_i32_to_f32(const int32_t *acc, uint32_t m_valid,
     }
   }
 }
+
+/** @brief One tile row is exactly one HVX vector, which is what kills the
+ *         tail handling. HEXKL_HMX_INT8_BLOCK_N_COL is 32. */
+_Static_assert(LANES == 32u, "tile kernel assumes 32 columns per HVX vector");
+
+void hvx_dequant_tile_i32_to_f32(const int32_t *tile, uint32_t n_rows,
+                                 const float *act_scale, const int32_t *act_zp,
+                                 const int32_t *colsum_w, const float *w_scale,
+                                 const float *bias, float *out,
+                                 uint32_t out_stride) {
+  // Every row of the tile shares these, so they load once. The DDR-side
+  // buffers come from FastRPC, whose base alignment is not part of the
+  // contract, hence the unaligned loads.
+  const HVX_Vector csf = Q6_Vsf_equals_Vw(*(const HVX_UVector *)colsum_w);
+  const HVX_Vector vws = *(const HVX_UVector *)w_scale;
+  const HVX_Vector vb = *(const HVX_UVector *)bias;
+
+  // VTCM, and unshuf_off inherits result_off's 2048-byte alignment.
+  const HVX_Vector *vtile = (const HVX_Vector *)tile;
+
+  for (uint32_t r = 0; r < n_rows; ++r) {
+    const HVX_Vector vs = hvx_splat_sf(act_scale[r]);
+    const HVX_Vector vzf = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(act_zp[r]));
+
+    const HVX_Vector af = Q6_Vsf_equals_Vw(vtile[r]);
+    const HVX_Vector corrected =
+      Q6_Vsf_vsub_VsfVsf(af, Q6_Vsf_vmpy_VsfVsf(vzf, csf));
+    const HVX_Vector scaled =
+      Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(corrected, vs), vws);
+    *(HVX_UVector *)(out + (size_t)r * out_stride) =
+      Q6_Vsf_vadd_VsfVsf(scaled, vb);
+  }
+}

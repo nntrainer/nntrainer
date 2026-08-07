@@ -22,7 +22,8 @@ interface nntr_hvx : remote_handle64 {
                              rout sequence<int32> acc_i32);
 
    // Accuracy harness: the whole flow, quantization and dequantization on
-   // the DSP. Intermediate buffers come back so each stage is checkable.
+   // the DSP. The int32 accumulator never reaches DDR, so it is not among
+   // the buffers that come back.
    AEEResult mm_u8i4_from_f32(in uint32 M, in uint32 K, in uint32 N,
                               in sequence<float> act_f32,
                               in sequence<int8> w_i4_rm,
@@ -32,7 +33,6 @@ interface nntr_hvx : remote_handle64 {
                               rout sequence<uint8> act_u8_ah,
                               rout sequence<float> act_scale,
                               rout sequence<int32> act_zp,
-                              rout sequence<int32> acc_i32,
                               rout sequence<float> out_f32);
 
    // For HVX softmax verification. exp is broken out as its own entry

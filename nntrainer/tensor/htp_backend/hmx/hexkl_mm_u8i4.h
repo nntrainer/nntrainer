@@ -70,4 +70,39 @@ int hexkl_mm_u8i4_bake_weights(const hexkl_mm_u8i4_layout *L,
 int hexkl_mm_u8i4_run(const hexkl_mm_u8i4_layout *L, uint32_t m_pad, uint32_t k,
                       uint32_t n, int32_t *acc_i32);
 
+/**
+ * @brief The DDR-side operands the fused epilogue needs.
+ *
+ * Bundled into a struct because passing them positionally would make
+ * hexkl_mm_u8i4_run_dequant an eleven-argument function.
+ */
+typedef struct {
+  const float *act_scale;  /**< per row, m_pad entries */
+  const int32_t *act_zp;   /**< per row, m_pad entries */
+  const int32_t *colsum_w; /**< per column, n entries */
+  const float *w_scale;    /**< per column, n entries */
+  const float *bias;       /**< per column, n entries */
+  float *out;              /**< m_valid by n f32, row-major, DDR */
+} hexkl_mm_u8i4_dequant;
+
+/**
+ * @brief Runs the matmul and dequantizes each tile before moving on.
+ *
+ * Same preconditions as hexkl_mm_u8i4_run. The difference is where the
+ * int32 accumulator goes: copy_32b_to_submatrix unshuffles it into the
+ * VTCM scratch tile at L->unshuf_off rather than into DDR, and the HVX
+ * epilogue turns it into f32 from there. The only DDR write is D->out.
+ *
+ * Rows at or past @a m_valid are neither read nor written, so a row block
+ * that is entirely padding is skipped outright.
+ *
+ * @param[in] m_valid rows carrying real data; D->out has this many rows
+ * @param[in] m_pad   rows after padding up to a multiple of 64
+ * @return AEE_SUCCESS, AEE_EBADPARM on a NULL pointer, or the first
+ *         failing HexKL micro status.
+ */
+int hexkl_mm_u8i4_run_dequant(const hexkl_mm_u8i4_layout *L, uint32_t m_valid,
+                              uint32_t m_pad, uint32_t k, uint32_t n,
+                              const hexkl_mm_u8i4_dequant *D);
+
 #endif /* __NNTRAINER_HEXKL_MM_U8I4_H__ */

@@ -19,7 +19,6 @@
 #include "hexkl_micro.h"
 #include "hexkl_mm_u8i4.h"
 #include "hexkl_mm_u8i4_dma.h"
-#include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
@@ -37,9 +36,9 @@
  * where S2 observes it in the meantime. Retired together with S2.
  */
 int nntr_hvx_mm_u8i4_acc_i32(remote_handle64 handle, uint32 M, uint32 K,
-                             uint32 N, const uint8 *act_u8_ah,
-                             int act_u8_ahLen, const int8 *w_i4_rm,
-                             int w_i4_rmLen, int32 *acc_i32, int acc_i32Len) {
+                             uint32 N, const uint8 *act_u8_ah, int act_u8_ahLen,
+                             const int8 *w_i4_rm, int w_i4_rmLen,
+                             int32 *acc_i32, int acc_i32Len) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s) {
     return AEE_EBADPARM;
@@ -85,13 +84,15 @@ int nntr_hvx_mm_u8i4_acc_i32(remote_handle64 handle, uint32 M, uint32 K,
  * baked fresh every call -- that is the point of this harness, checking the
  * bake -- unlike the resident-weight path in mm_u8i4_layer below.
  */
-int nntr_hvx_mm_u8i4_from_f32(
-  remote_handle64 handle, uint32 M, uint32 K, uint32 N, const float *act_f32,
-  int act_f32Len, const int8 *w_i4_rm, int w_i4_rmLen, const float *w_scale,
-  int w_scaleLen, const int32 *colsum_w, int colsum_wLen, const float *bias,
-  int biasLen, uint8 *act_u8_ah, int act_u8_ahLen, float *act_scale,
-  int act_scaleLen, int32 *act_zp, int act_zpLen, int32 *acc_i32,
-  int acc_i32Len, float *out_f32, int out_f32Len) {
+int nntr_hvx_mm_u8i4_from_f32(remote_handle64 handle, uint32 M, uint32 K,
+                              uint32 N, const float *act_f32, int act_f32Len,
+                              const int8 *w_i4_rm, int w_i4_rmLen,
+                              const float *w_scale, int w_scaleLen,
+                              const int32 *colsum_w, int colsum_wLen,
+                              const float *bias, int biasLen, uint8 *act_u8_ah,
+                              int act_u8_ahLen, float *act_scale,
+                              int act_scaleLen, int32 *act_zp, int act_zpLen,
+                              float *out_f32, int out_f32Len) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s) {
     return AEE_EBADPARM;
@@ -101,9 +102,9 @@ int nntr_hvx_mm_u8i4_from_f32(
 
   if ((uint32_t)act_f32Len != M * K || (uint32_t)w_i4_rmLen != K * N ||
       (uint32_t)act_u8_ahLen != m_pad * K || (uint32_t)act_scaleLen != m_pad ||
-      (uint32_t)act_zpLen != m_pad || (uint32_t)acc_i32Len != m_pad * N ||
-      (uint32_t)w_scaleLen != N || (uint32_t)colsum_wLen != N ||
-      (uint32_t)biasLen != N || (uint32_t)out_f32Len != M * N) {
+      (uint32_t)act_zpLen != m_pad || (uint32_t)w_scaleLen != N ||
+      (uint32_t)colsum_wLen != N || (uint32_t)biasLen != N ||
+      (uint32_t)out_f32Len != M * N) {
     FARF(ERROR, "bad lengths (M=%u K=%u N=%u m_pad=%u)", (unsigned)M,
          (unsigned)K, (unsigned)N, (unsigned)m_pad);
     return AEE_EBADPARM;
@@ -133,12 +134,15 @@ int nntr_hvx_mm_u8i4_from_f32(
   // (it is a pure function of vtcm_size) -- no need to call it again.
   res = hexkl_mm_u8i4_bake_weights(&L, w_i4_rm, K, N);
   if (res == AEE_SUCCESS) {
-    res = hexkl_mm_u8i4_run(&L, m_pad, K, N, acc_i32);
-  }
-
-  if (res == AEE_SUCCESS) {
-    hvx_dequant_i32_to_f32(acc_i32, M, m_pad, N, act_scale, act_zp, colsum_w,
-                           w_scale, bias, out_f32);
+    const hexkl_mm_u8i4_dequant D = {
+      .act_scale = act_scale,
+      .act_zp = act_zp,
+      .colsum_w = colsum_w,
+      .w_scale = w_scale,
+      .bias = bias,
+      .out = out_f32,
+    };
+    res = hexkl_mm_u8i4_run_dequant(&L, M, m_pad, K, N, &D);
   }
   return res;
 }
@@ -163,8 +167,8 @@ int nntr_hvx_weight_register_u8i4(remote_handle64 handle, uint32 K, uint32 N,
          (unsigned)N);
     return AEE_EBADPARM;
   }
-  return hexkl_weight_u8i4_register(&s->weights, s->vtcm_base, s->vtcm_size,
-                                    K, N, w_i4_rm, w_scale, colsum_w, bias,
+  return hexkl_weight_u8i4_register(&s->weights, s->vtcm_base, s->vtcm_size, K,
+                                    N, w_i4_rm, w_scale, colsum_w, bias,
                                     w_handle);
 }
 
@@ -184,8 +188,8 @@ int nntr_hvx_weight_release_u8i4(remote_handle64 handle, uint32 w_handle) {
  */
 int nntr_hvx_mm_u8i4_layer(remote_handle64 handle, uint32 M, uint32 K,
                            const uint32 *w_handles, int w_handlesLen,
-                           const float *act_f32, int act_f32Len,
-                           float *out_cat, int out_catLen) {
+                           const float *act_f32, int act_f32Len, float *out_cat,
+                           int out_catLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s || w_handlesLen <= 0) {
     return AEE_EBADPARM;
@@ -204,8 +208,8 @@ int nntr_hvx_mm_u8i4_layer(remote_handle64 handle, uint32 M, uint32 K,
     n_total += s->weights.slots[w_handles[i]].N;
   }
   if ((uint32_t)out_catLen != M * n_total) {
-    FARF(ERROR, "mm_u8i4_layer: bad out_catLen (M=%u n_total=%u)",
-         (unsigned)M, (unsigned)n_total);
+    FARF(ERROR, "mm_u8i4_layer: bad out_catLen (M=%u n_total=%u)", (unsigned)M,
+         (unsigned)n_total);
     return AEE_EBADPARM;
   }
   return hexkl_mm_u8i4_layer_run(&s->weights, s->vtcm_base, s->vtcm_size,

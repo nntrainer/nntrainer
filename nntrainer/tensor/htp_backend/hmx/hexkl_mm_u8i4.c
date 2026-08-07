@@ -10,11 +10,14 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <stddef.h>
+
 #include <AEEStdErr.h>
 
 #include "hexkl_micro.h"
 
 #include "hexkl_mm_u8i4.h"
+#include "hvx_dequant_i32.h"
 
 #define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
 
@@ -91,6 +94,33 @@ int hexkl_mm_u8i4_bake_weights(const hexkl_mm_u8i4_layout *L,
   return AEE_SUCCESS;
 }
 
+/**
+ * @brief Accumulates one output tile over the whole K reduction and reads
+ *        it back into L->result_off.
+ *
+ * Shared by both entry points so the two can never drift on the tile index
+ * arithmetic, which is the part a reader cannot check by inspection.
+ *
+ * @return AEE_SUCCESS or the first failing HexKL micro status.
+ */
+static inline int accumulate_tile(const hexkl_mm_u8i4_layout *L,
+                                  uint32_t n_ktiles, uint32_t n_ntiles,
+                                  uint32_t rb, uint32_t nt) {
+  hexkl_micro_hmx_acc_clear_int32();
+
+  for (uint32_t kt = 0; kt < n_ktiles; ++kt) {
+    const uint32_t act_off =
+      L->act_base + (rb * n_ktiles + kt) * HEXKL_HMX_ACTIVATION_ALIGNMENT;
+    const uint32_t w_off = L->w_base + (kt * n_ntiles + nt) * WEIGHT_TILE_BYTES;
+    int res = hexkl_micro_hmx_mm_u8i4(L->vtcm_base, act_off, w_off);
+    if (res != AEE_SUCCESS) {
+      return res;
+    }
+  }
+  return hexkl_micro_hmx_acc_read_int32(L->vtcm_base, L->config_off,
+                                        L->result_off);
+}
+
 int hexkl_mm_u8i4_run(const hexkl_mm_u8i4_layout *L, uint32_t m_pad, uint32_t k,
                       uint32_t n, int32_t *acc_i32) {
   if (!L || !acc_i32) {
@@ -102,21 +132,7 @@ int hexkl_mm_u8i4_run(const hexkl_mm_u8i4_layout *L, uint32_t m_pad, uint32_t k,
 
   for (uint32_t rb = 0; rb < n_rblocks; ++rb) {
     for (uint32_t nt = 0; nt < n_ntiles; ++nt) {
-      hexkl_micro_hmx_acc_clear_int32();
-
-      for (uint32_t kt = 0; kt < n_ktiles; ++kt) {
-        const uint32_t act_off =
-          L->act_base + (rb * n_ktiles + kt) * HEXKL_HMX_ACTIVATION_ALIGNMENT;
-        const uint32_t w_off =
-          L->w_base + (kt * n_ntiles + nt) * WEIGHT_TILE_BYTES;
-        int res = hexkl_micro_hmx_mm_u8i4(L->vtcm_base, act_off, w_off);
-        if (res != AEE_SUCCESS) {
-          return res;
-        }
-      }
-
-      int res = hexkl_micro_hmx_acc_read_int32(L->vtcm_base, L->config_off,
-                                               L->result_off);
+      int res = accumulate_tile(L, n_ktiles, n_ntiles, rb, nt);
       if (res != AEE_SUCCESS) {
         return res;
       }
@@ -127,6 +143,59 @@ int hexkl_mm_u8i4_run(const hexkl_mm_u8i4_layout *L, uint32_t m_pad, uint32_t k,
       if (res != AEE_SUCCESS) {
         return res;
       }
+    }
+  }
+  return AEE_SUCCESS;
+}
+
+int hexkl_mm_u8i4_run_dequant(const hexkl_mm_u8i4_layout *L, uint32_t m_valid,
+                              uint32_t m_pad, uint32_t k, uint32_t n,
+                              const hexkl_mm_u8i4_dequant *D) {
+  if (!L || !D || !D->act_scale || !D->act_zp || !D->colsum_w || !D->w_scale ||
+      !D->bias || !D->out) {
+    return AEE_EBADPARM;
+  }
+  const uint32_t n_ktiles = k / HEXKL_HMX_INT8_BLOCK_N_INNER;
+  const uint32_t n_ntiles = n / HEXKL_HMX_INT8_BLOCK_N_COL;
+  const uint32_t n_rblocks = m_pad / HEXKL_HMX_INT8_BLOCK_N_ROW;
+
+  // tile_row/col of 0 with the tile's own dimensions as the output extent
+  // makes copy_32b_to_submatrix write a dense 64x32 block, so element
+  // (r, c) lands at unshuf_off + (r*32 + c)*4 and every row starts on a
+  // 128-byte boundary.
+  int32_t *const unshuf = (int32_t *)(L->vtcm_base + L->unshuf_off);
+
+  for (uint32_t rb = 0; rb < n_rblocks; ++rb) {
+    const uint32_t row0 = rb * HEXKL_HMX_INT8_BLOCK_N_ROW;
+    if (row0 >= m_valid) {
+      // Nothing in this row block reaches the output, so skip the multiply
+      // as well as the epilogue.
+      continue;
+    }
+    const uint32_t rows_left = m_valid - row0;
+    const uint32_t n_rows = rows_left < HEXKL_HMX_INT8_BLOCK_N_ROW
+                              ? rows_left
+                              : HEXKL_HMX_INT8_BLOCK_N_ROW;
+
+    for (uint32_t nt = 0; nt < n_ntiles; ++nt) {
+      const uint32_t col0 = nt * HEXKL_HMX_INT8_BLOCK_N_COL;
+
+      int res = accumulate_tile(L, n_ktiles, n_ntiles, rb, nt);
+      if (res != AEE_SUCCESS) {
+        return res;
+      }
+
+      res = hexkl_micro_hmx_copy_32b_to_submatrix(
+        L->vtcm_base, L->result_off, unshuf, 0, 0, HEXKL_HMX_INT8_BLOCK_N_ROW,
+        HEXKL_HMX_INT8_BLOCK_N_COL);
+      if (res != AEE_SUCCESS) {
+        return res;
+      }
+
+      hvx_dequant_tile_i32_to_f32(unshuf, n_rows, D->act_scale + row0,
+                                  D->act_zp + row0, D->colsum_w + col0,
+                                  D->w_scale + col0, D->bias + col0,
+                                  D->out + (size_t)row0 * n + col0, n);
     }
   }
   return AEE_SUCCESS;
