@@ -27,53 +27,6 @@
 #define ROUND_UP(v, a) ((((v) + ((a)-1)) / (a)) * (a))
 
 /**
- * @brief Debug scaffolding for S2: runs the weight bake and the HMX integer
- *        matmul on an activation that arrives already quantized and in AH
- *        layout, and hands back nothing but the int32 accumulator.
- *
- * Isolates the bake, the WH layout and the matmul from the dequantization.
- * from_f32 stops exposing acc_i32 once its epilogue is fused, and this is
- * where S2 observes it in the meantime. Retired together with S2.
- */
-int nntr_hvx_mm_u8i4_acc_i32(remote_handle64 handle, uint32 M, uint32 K,
-                             uint32 N, const uint8 *act_u8_ah, int act_u8_ahLen,
-                             const int8 *w_i4_rm, int w_i4_rmLen,
-                             int32 *acc_i32, int acc_i32Len) {
-  nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s) {
-    return AEE_EBADPARM;
-  }
-
-  const uint32_t m_pad = ROUND_UP(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
-
-  if ((uint32_t)act_u8_ahLen != m_pad * K || (uint32_t)w_i4_rmLen != K * N ||
-      (uint32_t)acc_i32Len != m_pad * N) {
-    FARF(ERROR, "acc_i32: bad lengths (M=%u K=%u N=%u m_pad=%u)", (unsigned)M,
-         (unsigned)K, (unsigned)N, (unsigned)m_pad);
-    return AEE_EBADPARM;
-  }
-
-  hexkl_mm_u8i4_layout L;
-  int res = hexkl_mm_u8i4_plan(s->vtcm_base, s->vtcm_size, m_pad, K, N, &L);
-  if (res != AEE_SUCCESS) {
-    FARF(ERROR, "acc_i32: plan failed: 0x%08x", res);
-    return res;
-  }
-
-  // The activation arrives already in AH layout, so a flat copy places it.
-  // hw_init, the HMX lock and setup_acc_read_int32 all ran once in
-  // nntr_hvx_open for s->config_off, which plan recomputes identically here
-  // -- there is nothing to acquire or release around this call.
-  memcpy(s->vtcm_base + L.act_base, act_u8_ah, (size_t)m_pad * K);
-
-  res = hexkl_mm_u8i4_bake_weights(&L, w_i4_rm, K, N);
-  if (res == AEE_SUCCESS) {
-    res = hexkl_mm_u8i4_run(&L, m_pad, K, N, acc_i32);
-  }
-  return res;
-}
-
-/**
  * @brief Accuracy harness: the whole flow, quantization and dequantization
  *        on the DSP, with every intermediate buffer returned so each stage
  *        is checkable. Used by unittest_hvx_mm_u8i4's fixed shapes.

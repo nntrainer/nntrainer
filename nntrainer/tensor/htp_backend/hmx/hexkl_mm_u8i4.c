@@ -98,8 +98,8 @@ int hexkl_mm_u8i4_bake_weights(const hexkl_mm_u8i4_layout *L,
  * @brief Accumulates one output tile over the whole K reduction and reads
  *        it back into L->result_off.
  *
- * Shared by both entry points so the two can never drift on the tile index
- * arithmetic, which is the part a reader cannot check by inspection.
+ * Split out from the tile loop so the index arithmetic, which is the part
+ * a reader cannot check by inspection, sits on its own.
  *
  * @return AEE_SUCCESS or the first failing HexKL micro status.
  */
@@ -119,33 +119,6 @@ static inline int accumulate_tile(const hexkl_mm_u8i4_layout *L,
   }
   return hexkl_micro_hmx_acc_read_int32(L->vtcm_base, L->config_off,
                                         L->result_off);
-}
-
-int hexkl_mm_u8i4_run(const hexkl_mm_u8i4_layout *L, uint32_t m_pad, uint32_t k,
-                      uint32_t n, int32_t *acc_i32) {
-  if (!L || !acc_i32) {
-    return AEE_EBADPARM;
-  }
-  const uint32_t n_ktiles = k / HEXKL_HMX_INT8_BLOCK_N_INNER;
-  const uint32_t n_ntiles = n / HEXKL_HMX_INT8_BLOCK_N_COL;
-  const uint32_t n_rblocks = m_pad / HEXKL_HMX_INT8_BLOCK_N_ROW;
-
-  for (uint32_t rb = 0; rb < n_rblocks; ++rb) {
-    for (uint32_t nt = 0; nt < n_ntiles; ++nt) {
-      int res = accumulate_tile(L, n_ktiles, n_ntiles, rb, nt);
-      if (res != AEE_SUCCESS) {
-        return res;
-      }
-      // Going through copy_32b_to_submatrix keeps us off the accumulator's
-      // shuffled layout, which HexKL does not document.
-      res = hexkl_micro_hmx_copy_32b_to_submatrix(L->vtcm_base, L->result_off,
-                                                  acc_i32, rb, nt, m_pad, n);
-      if (res != AEE_SUCCESS) {
-        return res;
-      }
-    }
-  }
-  return AEE_SUCCESS;
 }
 
 int hexkl_mm_u8i4_run_dequant(const hexkl_mm_u8i4_layout *L, uint32_t m_valid,

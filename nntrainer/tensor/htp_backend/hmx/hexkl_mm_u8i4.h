@@ -59,18 +59,6 @@ int hexkl_mm_u8i4_bake_weights(const hexkl_mm_u8i4_layout *L,
                                const int8_t *w_i4_rm, uint32_t k, uint32_t n);
 
 /**
- * @brief Runs the HMX matmul over the baked weights and staged activation.
- *
- * Requires hexkl_micro_hmx_setup_acc_read_int32() to have been called for
- * L->config_off, the HMX lock to be held, and the activation to already be
- * in AH layout at L->act_base.
- *
- * @param[out] acc_i32 m_pad by n int32 accumulators, row-major, in DDR
- */
-int hexkl_mm_u8i4_run(const hexkl_mm_u8i4_layout *L, uint32_t m_pad, uint32_t k,
-                      uint32_t n, int32_t *acc_i32);
-
-/**
  * @brief The DDR-side operands the fused epilogue needs.
  *
  * Bundled into a struct because passing them positionally would make
@@ -88,10 +76,13 @@ typedef struct {
 /**
  * @brief Runs the matmul and dequantizes each tile before moving on.
  *
- * Same preconditions as hexkl_mm_u8i4_run. The difference is where the
- * int32 accumulator goes: copy_32b_to_submatrix unshuffles it into the
- * VTCM scratch tile at L->unshuf_off rather than into DDR, and the HVX
- * epilogue turns it into f32 from there. The only DDR write is D->out.
+ * Requires hexkl_micro_hmx_setup_acc_read_int32() to have been called for
+ * L->config_off, the HMX lock to be held, and the activation to already be
+ * in AH layout at L->act_base.
+ *
+ * copy_32b_to_submatrix unshuffles each int32 tile into the VTCM scratch
+ * tile at L->unshuf_off rather than into DDR, and the HVX epilogue turns
+ * it into f32 from there. The only DDR write is D->out.
  *
  * Rows at or past @a m_valid are neither read nor written, so a row block
  * that is entirely padding is skipped outright.

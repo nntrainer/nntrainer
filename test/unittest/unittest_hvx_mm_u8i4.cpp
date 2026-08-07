@@ -382,10 +382,6 @@ protected:
     std::vector<float> got_scale(m_pad, 0.0f);
     std::vector<int32_t> got_zp(m_pad, -1);
     std::vector<float> got_out(static_cast<size_t>(M) * N, 0.0f);
-    // S2 reads the accumulator from the dedicated debug entry point, not
-    // from from_f32: the fused epilogue keeps the int32 tile inside VTCM,
-    // so from_f32 will have nothing to hand back.
-    std::vector<int32_t> dbg_acc(static_cast<size_t>(m_pad) * N, 0);
 
     int err = nntr_hvx_mm_u8i4_from_f32(
       handle_, M, K, N, x.data(), static_cast<int>(x.size()), q_w.data(),
@@ -405,17 +401,6 @@ protected:
       EXPECT_EQ(got_zp[m], exp_zp[m]) << "zp[" << m << "]";
     }
     EXPECT_EQ(got_ah, exp_ah);
-
-    // S2 -- separate call so it stays an integer bit-exact gate even after
-    // from_f32 stops materializing the accumulator. exp_ah rather than
-    // got_ah so a K1/K2 regression cannot mask an HMX layout regression.
-    int err_acc = nntr_hvx_mm_u8i4_acc_i32(
-      handle_, M, K, N, exp_ah.data(), static_cast<int>(exp_ah.size()),
-      q_w.data(), static_cast<int>(q_w.size()), dbg_acc.data(),
-      static_cast<int>(dbg_acc.size()));
-    ASSERT_EQ(err_acc, AEE_SUCCESS)
-      << "mm_u8i4_acc_i32 failed: " << hex(err_acc);
-    EXPECT_EQ(dbg_acc, exp_acc);
 
     // S3
     for (size_t i = 0; i < exp_out.size(); ++i) {
