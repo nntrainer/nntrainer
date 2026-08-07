@@ -11,6 +11,16 @@ interface nntr_hvx : remote_handle64 {
    AEEResult add_f32(in sequence<float> a, in sequence<float> b,
                      rout sequence<float> c);
 
+   // Debug scaffolding for S2: the activation arrives already quantized and
+   // in AH layout, so this isolates the weight bake, the WH layout and the
+   // HMX integer matmul from the dequantization. from_f32 stops exposing
+   // acc_i32 once its epilogue is fused, and this is where S2 observes it
+   // in the meantime. Retired together with S2.
+   AEEResult mm_u8i4_acc_i32(in uint32 M, in uint32 K, in uint32 N,
+                             in sequence<uint8> act_u8_ah,
+                             in sequence<int8> w_i4_rm,
+                             rout sequence<int32> acc_i32);
+
    // Accuracy harness: the whole flow, quantization and dequantization on
    // the DSP. Intermediate buffers come back so each stage is checkable.
    AEEResult mm_u8i4_from_f32(in uint32 M, in uint32 K, in uint32 N,

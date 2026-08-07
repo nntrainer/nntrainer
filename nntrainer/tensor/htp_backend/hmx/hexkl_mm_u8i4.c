@@ -51,6 +51,11 @@ int hexkl_mm_u8i4_plan(uint8_t *vtcm_base, uint32_t vtcm_size, uint32_t m_pad,
 
   out->result_off = out->act_base + out->act_size;
 
+  // The unshuffled tile lands next to the shuffled one. result_off is
+  // 2048-aligned and the tile is 8192 bytes, so this inherits the
+  // alignment; HVX only needs 128 of it.
+  out->unshuf_off = out->result_off + ACC_TILE_BYTES;
+
   // Put the config region at the top of the arena, rounded down to its
   // alignment so the rounding can never eat into the result region.
   if (vtcm_size < hexkl_micro_hmx_config_size()) {
@@ -59,7 +64,7 @@ int hexkl_mm_u8i4_plan(uint8_t *vtcm_base, uint32_t vtcm_size, uint32_t m_pad,
   out->config_off = (vtcm_size - hexkl_micro_hmx_config_size()) &
                     ~(HEXKL_HMX_CONFIG_ALIGNMENT - 1u);
 
-  if (out->result_off + ACC_TILE_BYTES > out->config_off) {
+  if (out->unshuf_off + ACC_TILE_BYTES > out->config_off) {
     return AEE_ENOMEMORY;
   }
   return AEE_SUCCESS;

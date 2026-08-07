@@ -29,6 +29,7 @@ typedef struct {
   uint32_t act_base;   /**< activation AH tiles, m_pad*K bytes, 2048-aligned */
   uint32_t act_size;   /**< byte span of the activation region */
   uint32_t result_off; /**< 8192-byte accumulator readout, 2048-aligned */
+  uint32_t unshuf_off; /**< 8192-byte row-major unshuffle of result_off */
   uint32_t config_off; /**< HMX config region, 256-aligned */
 } hexkl_mm_u8i4_layout;
 
