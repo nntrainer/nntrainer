@@ -617,6 +617,73 @@ TEST_F(HmxMmU8I4Layer, MismatchedKIsRejected) {
 }
 
 /**
+ * @brief M that is neither a multiple of 64 nor small enough for one row
+ *        block, through the layer endpoint.
+ *
+ * The existing layer tests use M=64 (exactly one full row block) and M=1,
+ * so nothing here covers a partial LAST row block behind at least one full
+ * one. That is the shape a tile-fused epilogue gets wrong first: it has to
+ * clamp the last block's row count to m_valid instead of writing all 64,
+ * and a bug there lands past the end of out_cat's slice for this weight --
+ * which is another weight's data, not unmapped memory, so it corrupts
+ * silently rather than faulting.
+ *
+ * Two weights, not one, so a wrong row count in weight 0 shows up as a
+ * mismatch in weight 1 as well as in weight 0's own tail.
+ */
+TEST_F(HmxMmU8I4Layer, PartialLastRowBlockMatchesReference) {
+  // M=100 -> m_pad=128, two row blocks, the second carrying 36 valid rows.
+  // N=96 and N=160 are both multiples of 32 without being multiples of 64,
+  // so the column tiling does not accidentally line up with the row tiling.
+  const uint32_t M = 100, K = 256;
+  const uint32_t Ns[2] = {96, 160};
+
+  std::vector<Weight> ws(2);
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_NO_FATAL_FAILURE(
+      MakeAndRegister(K, Ns[i], 0xD00D0001u + i * 0x1000u, ws[i]));
+  }
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0003u);
+
+  uint32_t n_total = 0;
+  std::vector<uint32_t> handles;
+  for (const auto &w : ws) {
+    handles.push_back(w.handle);
+    n_total += w.N;
+  }
+
+  // Poison the output so a short write (the failure mode a wrong tail row
+  // count produces) is a mismatch rather than a lucky zero.
+  const float kPoison = -12345.0f;
+  std::vector<float> got(static_cast<size_t>(M) * n_total, kPoison);
+
+  int err = nntr_hvx_mm_u8i4_layer(
+    handle_, M, K, handles.data(), static_cast<int>(handles.size()), x.data(),
+    static_cast<int>(x.size()), got.data(), static_cast<int>(got.size()));
+  ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_layer failed: " << hex(err);
+
+  size_t off = 0;
+  for (int i = 0; i < 2; ++i) {
+    SCOPED_TRACE("weight " + std::to_string(i) + " N=" + std::to_string(Ns[i]));
+    std::vector<float> want;
+    ExpectedFor(ws[i], x, M, K, want);
+    ASSERT_EQ(want.size(), static_cast<size_t>(M) * Ns[i]);
+    for (size_t j = 0; j < want.size(); ++j) {
+      EXPECT_NEAR(got[off + j], want[j], std::abs(want[j]) * 1e-5f + 1e-6f)
+        << "element " << j << " (row " << (j / Ns[i]) << ", col "
+        << (j % Ns[i]) << ")";
+    }
+    off += want.size();
+  }
+
+  for (const auto &w : ws) {
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
+  }
+}
+
+/**
  * @brief Per-call cost of the harness endpoint against the layer endpoint.
  *
  * Printed, never asserted. doc13 §3a measured 1.7-2x for cross-matmul
