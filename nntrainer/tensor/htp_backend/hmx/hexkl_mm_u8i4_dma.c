@@ -150,9 +150,9 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   }
 
   // Validate every handle up front -- K must match, and this is also where
-  // the widest weight (for the double-buffer size) and the total output
-  // width (for out_cat bounds) come from.
-  uint32_t n_tiles_max = 0, n_max = 0;
+  // the widest weight comes from, for the double-buffer size. out_cat's
+  // bounds are the caller's to check (nntr_hvx_mm_u8i4_layer does).
+  uint32_t n_tiles_max = 0;
   for (uint32_t i = 0; i < n_handles; ++i) {
     if (handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS || !tbl->slots[handles[i]].in_use) {
       return AEE_EBADPARM;
@@ -165,13 +165,13 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     if (nt > n_tiles_max) {
       n_tiles_max = nt;
     }
-    if (h->N > n_max) {
-      n_max = h->N;
-    }
   }
 
   // VTCM layout: activation (all row-bands, shared across every handle) |
-  // weight double-buffer (sized for the widest handle) | one result tile.
+  // weight double-buffer (sized for the widest handle) | the accumulator
+  // readout tile | its row-major unshuffle. The last two are one tile each
+  // and stay that size regardless of M or N: the epilogue consumes a tile
+  // before the next one is read, so nothing has to be kept around.
   const uint32_t act_bytes = n_rblocks * k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
   const uint32_t act_off = 0;
   const uint32_t wb_max = k_tiles * n_tiles_max * WEIGHT_TILE_BYTES_U8I4;
@@ -181,10 +181,14 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   };
   const uint32_t result_off =
     ROUND_UP_U32(wbuf[1] + wb_max, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  if (result_off + ACC_TILE_BYTES > config_off) {
+  // hvx_dequant_tile_i32_to_f32 does aligned vector loads out of this, so
+  // the 2048-byte round-up is load-bearing, not cosmetic.
+  const uint32_t unshuf_off =
+    ROUND_UP_U32(result_off + ACC_TILE_BYTES, HEXKL_HMX_ACTIVATION_ALIGNMENT);
+  if (unshuf_off + ACC_TILE_BYTES > config_off) {
     return AEE_ENOMEMORY; // double-buffered widest weight does not fit VTCM
   }
-  if (result_off + ACC_TILE_BYTES > vtcm_size) {
+  if (unshuf_off + ACC_TILE_BYTES > vtcm_size) {
     return AEE_ENOMEMORY;
   }
 
@@ -193,13 +197,17 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   // contract.
   float *act_scale = (float *)malloc(sizeof(float) * m_pad);
   int32_t *act_zp = (int32_t *)malloc(sizeof(int32_t) * m_pad);
-  int32_t *acc_scratch = (int32_t *)malloc(sizeof(int32_t) * (size_t)m_pad * n_max);
-  if (!act_scale || !act_zp || !acc_scratch) {
+  if (!act_scale || !act_zp) {
     free(act_scale);
     free(act_zp);
-    free(acc_scratch);
     return AEE_ENOMEMORY;
   }
+
+  // The epilogue reads the unshuffled tile straight out of VTCM, so the
+  // int32 accumulator never reaches DDR and there is no scratch matrix to
+  // allocate for it -- what used to be an m_pad-by-widest-handle-N-wide
+  // int32 host allocation per call.
+  int32_t *const unshuf = (int32_t *)(vtcm_base + unshuf_off);
   hvx_quant_rows_u8_params(act_f32, M, m_pad, K, act_scale, act_zp, pool);
   int rc = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
                                 vtcm_base + act_off, pool);
@@ -241,8 +249,23 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                            /*dst_vtcm=*/1);
     }
 
+    float *const out_h = out_cat + out_off;
+
     for (uint32_t rb = 0; rb < n_rblocks; ++rb) {
+      const uint32_t row0 = rb * HEXKL_HMX_INT8_BLOCK_N_ROW;
+      if (row0 >= M) {
+        // Every row of this block is padding, so neither the multiply nor
+        // the epilogue has anything to contribute.
+        continue;
+      }
+      const uint32_t rows_left = M - row0;
+      const uint32_t n_rows = rows_left < HEXKL_HMX_INT8_BLOCK_N_ROW
+                                ? rows_left
+                                : HEXKL_HMX_INT8_BLOCK_N_ROW;
+
       for (uint32_t nt = 0; nt < nt_n; ++nt) {
+        const uint32_t col0 = nt * HEXKL_HMX_INT8_BLOCK_N_COL;
+
         hexkl_micro_hmx_acc_clear_int32();
         for (uint32_t kt = 0; kt < k_tiles; ++kt) {
           const uint32_t act_tile_off =
@@ -258,30 +281,38 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
         if (rc != AEE_SUCCESS) {
           goto out;
         }
+
+        // tile_row/col of 0 with the tile's own dimensions as the output
+        // extent makes copy_32b_to_submatrix write a dense 64x32 block, so
+        // element (r, c) lands at unshuf_off + (r*32 + c)*4 and every row
+        // starts on a 128-byte boundary. Same call hexkl_mm_u8i4.c's fused
+        // path makes -- the destination is VTCM here too, so the int32
+        // accumulator never crosses to DDR.
         rc = hexkl_micro_hmx_copy_32b_to_submatrix(
-          vtcm_base, result_off, acc_scratch, rb, nt, m_pad, h->N);
+          vtcm_base, result_off, unshuf, 0, 0, HEXKL_HMX_INT8_BLOCK_N_ROW,
+          HEXKL_HMX_INT8_BLOCK_N_COL);
         if (rc != AEE_SUCCESS) {
           goto out;
         }
+
+        hvx_dequant_tile_i32_to_f32(unshuf, n_rows, act_scale + row0,
+                                    act_zp + row0, h->colsum_w + col0,
+                                    h->w_scale + col0, h->bias + col0,
+                                    out_h + (size_t)row0 * h->N + col0, h->N);
       }
     }
 
     // Block until handle i+1's weight has fully landed before moving on to
     // it -- matches the measured bench's "next weight fully in wnxt before
-    // matmul i+1" invariant. Dequant below does not touch the DMA engine,
-    // so a later pass could move it ahead of this drain to overlap with
-    // the prefetch; left as-is for correctness first.
+    // matmul i+1" invariant. This is now the only thing on the ring: the
+    // epilogue above writes its output with HVX stores, not DMA.
     hexkl_dma_ring_drain();
 
-    hvx_dequant_i32_to_f32(acc_scratch, M, m_pad, h->N, act_scale, act_zp,
-                           h->colsum_w, h->w_scale, h->bias,
-                           out_cat + out_off);
     out_off += (size_t)M * h->N;
   }
 
 out:
   free(act_scale);
   free(act_zp);
-  free(acc_scratch);
   return rc;
 }

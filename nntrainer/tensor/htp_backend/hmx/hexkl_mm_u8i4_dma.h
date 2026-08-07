@@ -82,6 +82,11 @@ int hexkl_weight_u8i4_release(hexkl_weight_u8i4_table *tbl, uint32_t handle);
  * not assumed. Output is dequantized f32, one contiguous M x handle[i].N
  * block per handle in call order (not interleaved row-by-row).
  *
+ * The dequant epilogue runs per output tile, straight out of VTCM, the
+ * same way hexkl_mm_u8i4_run_dequant does: the int32 accumulator never
+ * reaches DDR, and the VTCM this needs for results is two tiles (16 KB)
+ * regardless of M and N.
+ *
  * @param config_off  session-constant HMX config region offset (from
  *                     hexkl_mm_u8i4_plan; the same for every M/K/N because
  *                     it depends only on vtcm_size). The caller must have
