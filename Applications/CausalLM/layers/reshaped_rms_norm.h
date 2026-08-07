@@ -8,6 +8,7 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
  * @author Niket Agarwal <niket.a@samsung.com>
+ * @author Anirudh Bocha <b.saianirud@samsung.com>
  * @bug    No known bugs except for NYI items
  * @note   This layer only supports inference mode.
  */
@@ -125,10 +126,19 @@ public:
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
+  /**
+   * @copydoc Layer::setBatch(RunLayerContext &context, unsigned int batch)
+   * @note See RMSNormLayer::setBatch's note -- batch-size changes go through
+   *       this hook, not updateTensorsByInputDimensions(), so the inv_rms
+   *       cache must be resized here too.
+   */
+  WIN_EXPORT void setBatch(nntrainer::RunLayerContext &context,
+                           unsigned int batch) override;
+
   inline static const std::string type = "reshaped_rms_norm";
 
 private:
-  std::array<unsigned int, 1> wt_idx;
+  std::array<unsigned int, 2> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
              props::FeatureSize, nntrainer::props::SkipPrefill, props::UseGamma>
     rms_props;
@@ -136,11 +146,22 @@ private:
   unsigned int feature_size;
   bool skip_prefill = false;
   bool use_gamma;
+  /**
+   * @brief true when finalize() ran under ExecutionMode::TRAIN, in which
+   *        case the inv_rms cache was requested and computeRMSNorm() must
+   *        populate it. See RMSNormLayer::cache_inv_rms (rms_norm.h) for the
+   *        full rationale -- this layer has the identical cross-layer
+   *        buffer-reuse hazard if inv_rms is instead recomputed from the
+   *        input tensor in calcDerivative/calcGradient.
+   */
+  bool cache_inv_rms = false;
 
   /**
    * @brief shared per-chunk RMS normalization compute used by both
    *        forwarding (full sequence, [0, height)) and
-   *        incremental_forwarding (decode step, [from, to)).
+   *        incremental_forwarding (decode step, [from, to)). Also populates
+   *        the inv_rms cache (one value per chunk) that
+   *        calcDerivative/calcGradient read back.
    */
   void computeRMSNorm(nntrainer::RunLayerContext &context, unsigned int from,
                       unsigned int to);

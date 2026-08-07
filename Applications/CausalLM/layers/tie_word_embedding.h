@@ -26,28 +26,32 @@
 #include <common_properties.h>
 #include <layer_devel.h>
 #include <layer_impl.h>
+#include <vector>
 
 namespace causallm {
 
 /**
- * @brief Row (within the current input buffer) that lm_head-mode
- *        forwarding() should project to vocab logits. UINT_MAX (default)
- *        means "use the last row" (height - 1), matching
- *        incremental_forwarding_lmhead's inference behavior.
+ * @brief Per-batch-index row (within the current input buffer) that
+ *        lm_head-mode forwarding() should project to vocab logits. An empty
+ *        vector (default), or a batch index beyond its size, means "use the
+ *        last row" (height - 1), matching incremental_forwarding_lmhead's
+ *        inference behavior.
  *
  * @details Under right-padded training the last *real* token is not at
- *          row (height - 1), so the lm head must be told which row to read.
- *          The value is produced by the *embedding*-mode instance of this
- *          same layer (see forwarding()), which is the first node in the
- *          graph and is the only place the raw token ids are visible: it
- *          scans for the last non-pad id and records it here, and the
- *          lm_head-mode instance reads it later in the very same forward
- *          pass on the same thread. It is deliberately NOT thread_local and
- *          deliberately NOT set by the data pipeline: nntrainer runs the
- *          dataset generator on a separate producer thread which may also
- *          prefetch ahead of the trainer, so a value written there is both
- *          invisible to the training thread and liable to describe the
- *          wrong sample.
+ *          row (height - 1), so the lm head must be told which row to read
+ *          -- and since different samples in the same batch pad to
+ *          different lengths, that row is inherently per batch index, not
+ *          one shared value. The vector is produced by the *embedding*-mode
+ *          instance of this same layer (see forwarding()), which is the
+ *          first node in the graph and is the only place the raw token ids
+ *          are visible: it scans every batch row for its own last non-pad
+ *          id and records read_row[b] here, and the lm_head-mode instance
+ *          reads it back later in the very same forward pass on the same
+ *          thread. It is deliberately NOT thread_local and deliberately NOT
+ *          set by the data pipeline: nntrainer runs the dataset generator on
+ *          a separate producer thread which may also prefetch ahead of the
+ *          trainer, so a value written there is both invisible to the
+ *          training thread and liable to describe the wrong sample.
  *
  *          This is a separate variable from lm_head.h's
  *          `g_lm_head_read_row` to avoid an inter-shared-library link
@@ -55,7 +59,7 @@ namespace causallm {
  *          (a model only ever loads one of the two lm-head layer types,
  *          depending on whether it ties embeddings).
  */
-extern unsigned int g_tie_embedding_lm_head_read_row;
+extern std::vector<unsigned int> g_tie_embedding_lm_head_read_row;
 
 /**
  * @class   TieWordEmbedding

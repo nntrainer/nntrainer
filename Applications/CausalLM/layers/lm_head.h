@@ -26,29 +26,36 @@
 #include <common_properties.h>
 #include <layer_devel.h>
 #include <layer_impl.h>
+#include <vector>
 
 namespace causallm {
 
 /**
- * @brief Row (within the current input buffer) that forwarding() should
- *        project to vocab logits. UINT_MAX (default) means "use the last
+ * @brief Per-batch-index row (within the current input buffer) that
+ *        forwarding() should project to vocab logits. An empty vector
+ *        (default), or a batch index beyond its size, means "use the last
  *        row" (height - 1), matching incremental_forwarding's inference
  *        behavior.
  *
  * @details Under right-padded training the last *real* token is not at row
  *          (height - 1), so this must be set to that token's row before the
- *          forward pass. It must be written from the training thread during
- *          the forward pass itself — NOT from the dataset generator, which
- *          nntrainer runs on a separate producer thread that may prefetch
- *          ahead of the trainer.
+ *          forward pass -- and since different samples in the same batch pad
+ *          to different lengths, that row is inherently per batch index, not
+ *          one shared value. It must be written from the training thread
+ *          during the forward pass itself — NOT from the dataset generator,
+ *          which nntrainer runs on a separate producer thread that may
+ *          prefetch ahead of the trainer.
  *
  * @note This standalone lm_head layer is only used by models that do NOT tie
  *       word embeddings; the tied path uses TieWordEmbedding, whose
  *       embedding-mode instance derives the row itself (see
  *       g_tie_embedding_lm_head_read_row). An untied model trained with
- *       right-padding needs an equivalent hook in its embedding layer.
+ *       right-padding needs an equivalent hook in its embedding layer --
+ *       today nothing in this codebase populates this vector outside of
+ *       unit tests, so untied-embedding training still needs that hook
+ *       written before it can train correctly under right-padding.
  */
-extern unsigned int g_lm_head_read_row;
+extern std::vector<unsigned int> g_lm_head_read_row;
 
 /**
  * @class   LMHead layer

@@ -116,6 +116,12 @@ TEST(CausalLmLoraBackward, RmsNormCalcDerivativeMatchesFiniteDifference) {
   weights.emplace_back(gamma_tensor, nntrainer::Tensor(), nntrainer::Tensor(),
                        "gamma");
 
+  // inv_rms cache: finalize() requests this via context.requestTensor() when
+  // running under ExecutionMode::TRAIN (the InitLayerContext default here);
+  // forwarding() populates it below, calcDerivative() reads it back.
+  tensors.emplace_back(nntrainer::TensorDim({1, 1, height, 1}),
+                       nntrainer::Initializer::NONE, true, true, "inv_rms");
+
   inputs.emplace_back(init_context.getInputDimensions()[0],
                       nntrainer::Initializer::NONE, true, true, "input");
   outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
@@ -171,6 +177,12 @@ TEST(CausalLmLoraBackward,
            gamma_tensor.getData<float>());
   weights.emplace_back(gamma_tensor, nntrainer::Tensor(), nntrainer::Tensor(),
                        "gamma");
+
+  // inv_rms cache: see the identical note in the plain-RMSNorm test above.
+  // One entry per feature_size-wide chunk, not per row.
+  const unsigned int chunks_per_batch = height * width / feature_size;
+  tensors.emplace_back(nntrainer::TensorDim({1, 1, chunks_per_batch, 1}),
+                       nntrainer::Initializer::NONE, true, true, "inv_rms");
 
   inputs.emplace_back(init_context.getInputDimensions()[0],
                       nntrainer::Initializer::NONE, true, true, "input");
@@ -267,9 +279,9 @@ TEST(CausalLmLoraBackward, SwiGLUCalcDerivativeMatchesFiniteDifference) {
 
 TEST(CausalLmLoraBackward, LmHeadCalcDerivativeMatchesFiniteDifference) {
   const unsigned int height = 3, width = 4, unit = 5;
-  causallm::g_lm_head_read_row = 1; // simulate a right-padded sample: the
-                                    // last *real* token is row 1, not
-                                    // row (height - 1) = 2.
+  causallm::g_lm_head_read_row = {1}; // simulate a right-padded sample: the
+                                      // last *real* token is row 1, not
+                                      // row (height - 1) = 2.
 
   causallm::LmHeadLayer layer;
   ASSERT_NO_THROW(layer.setProperty({"unit=" + std::to_string(unit)}));
@@ -330,14 +342,14 @@ TEST(CausalLmLoraBackward, LmHeadCalcDerivativeMatchesFiniteDifference) {
   checkGradient(inputs[0].getVariableRef().getData<float>(), analytic.data(),
                dy, height * width, unit, forward);
 
-  causallm::g_lm_head_read_row = std::numeric_limits<unsigned int>::max();
+  causallm::g_lm_head_read_row.clear();
 }
 
 TEST(CausalLmLoraBackward,
     TieWordEmbeddingLmHeadCalcDerivativeMatchesFiniteDifference) {
   const unsigned int height = 3, width = 4, unit = 5;
-  causallm::g_tie_embedding_lm_head_read_row =
-    1; // simulate a right-padded sample.
+  causallm::g_tie_embedding_lm_head_read_row = {
+    1}; // simulate a right-padded sample.
 
   causallm::TieWordEmbedding layer;
   ASSERT_NO_THROW(layer.setProperty({"unit=" + std::to_string(unit)}));
@@ -399,8 +411,7 @@ TEST(CausalLmLoraBackward,
   checkGradient(inputs[0].getVariableRef().getData<float>(), analytic.data(),
                dy, height * width, unit, forward);
 
-  causallm::g_tie_embedding_lm_head_read_row =
-    std::numeric_limits<unsigned int>::max();
+  causallm::g_tie_embedding_lm_head_read_row.clear();
 }
 
 TEST(CausalLmLoraBackward, MhaCoreCalcDerivativeMatchesFiniteDifference) {
@@ -647,6 +658,10 @@ TEST(CausalLmLoraBackward, RmsNormCalcGradientMatchesFiniteDifference) {
   gamma_g.setZero();
   weights.emplace_back(gamma_v, gamma_g, nntrainer::Tensor(), "gamma");
 
+  // inv_rms cache: see the identical note in the calcDerivative test above.
+  tensors.emplace_back(nntrainer::TensorDim({1, 1, height, 1}),
+                       nntrainer::Initializer::NONE, true, true, "inv_rms");
+
   inputs.emplace_back(init_context.getInputDimensions()[0],
                       nntrainer::Initializer::NONE, true, true, "input");
   outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
@@ -705,6 +720,11 @@ TEST(CausalLmLoraBackward,
   gamma_g.setZero();
   weights.emplace_back(gamma_v, gamma_g, nntrainer::Tensor(), "gamma");
 
+  // inv_rms cache: one entry per feature_size-wide chunk, not per row.
+  const unsigned int chunks_per_batch = height * width / feature_size;
+  tensors.emplace_back(nntrainer::TensorDim({1, 1, chunks_per_batch, 1}),
+                       nntrainer::Initializer::NONE, true, true, "inv_rms");
+
   inputs.emplace_back(init_context.getInputDimensions()[0],
                       nntrainer::Initializer::NONE, true, true, "input");
   outputs.emplace_back(init_context.getOutSpecs()[0].variable_spec.dim,
@@ -738,7 +758,7 @@ TEST(CausalLmLoraBackward,
 
 TEST(CausalLmLoraBackward, LmHeadCalcGradientMatchesFiniteDifference) {
   const unsigned int height = 3, width = 4, unit = 5;
-  causallm::g_lm_head_read_row = 1; // right-padded: last real token is row 1
+  causallm::g_lm_head_read_row = {1}; // right-padded: last real token is row 1
 
   causallm::LmHeadLayer layer;
   ASSERT_NO_THROW(layer.setProperty(
@@ -787,13 +807,13 @@ TEST(CausalLmLoraBackward, LmHeadCalcGradientMatchesFiniteDifference) {
   checkGradient(rc.getWeight(0).getData<float>(), analytic.data(), dy.data(),
                 width * unit, unit, forward);
 
-  causallm::g_lm_head_read_row = std::numeric_limits<unsigned int>::max();
+  causallm::g_lm_head_read_row.clear();
 }
 
 TEST(CausalLmLoraBackward,
      TieWordEmbeddingLmHeadCalcGradientMatchesFiniteDifference) {
   const unsigned int height = 3, hidden = 4, vocab = 5;
-  causallm::g_tie_embedding_lm_head_read_row = 1;
+  causallm::g_tie_embedding_lm_head_read_row = {1};
 
   causallm::TieWordEmbedding layer;
   ASSERT_NO_THROW(layer.setProperty(
@@ -842,8 +862,7 @@ TEST(CausalLmLoraBackward,
   checkGradient(rc.getWeight(0).getData<float>(), analytic.data(), dy.data(),
                 vocab * hidden, vocab, forward);
 
-  causallm::g_tie_embedding_lm_head_read_row =
-    std::numeric_limits<unsigned int>::max();
+  causallm::g_tie_embedding_lm_head_read_row.clear();
 }
 
 TEST(CausalLmLoraBackward, TieWordEmbeddingEmbeddingModeCalcGradientScatters) {

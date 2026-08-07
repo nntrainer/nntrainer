@@ -8,6 +8,7 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
  * @author Niket Agarwal <niket.a@samsung.com>
+ * @author Anirudh Bocha <b.saianirud@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  */
@@ -41,6 +42,40 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   wt_idx[RMSParams::gamma] = context.requestWeight(
     gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
     nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
+
+  /**
+   * @note inv_rms cache: one value per row (batch*channel*height), populated
+   * by computeRMSNorm() during forwarding() and read back verbatim by
+   * calcDerivative()/calcGradient(). This must NOT be recomputed from the
+   * input tensor in calcDerivative/calcGradient: calcDerivative's outgoing
+   * derivative (dx) aliases this layer's own input buffer (nntrainer reuses
+   * the input's storage for the gradient), and for a mid-stack layer like
+   * this one, nntrainer's memory planner is also free to hand that same
+   * physical buffer to an unrelated tensor once forwarding()'s last forward
+   * consumer is done with it -- there can be many decoder layers between
+   * this layer's forward pass and its own backward pass. Recomputing ms/
+   * inv_rms by re-reading "the input" at that point silently reads whatever
+   * now occupies that memory, not the original activation, which showed up
+   * as ms collapsing to ~0 for most rows and inv_rms exploding into a
+   * roughly per-layer 2-8x gradient-norm amplification that compounds
+   * exponentially over a 28-layer stack (confirmed empirically: single-
+   * sample overfit diverges instead of converging). Caching inv_rms here
+   * (ITERATION_LIFESPAN, alive for the whole forward+backward iteration)
+   * mirrors how mha_core.cpp already caches its own training-time
+   * intermediates (train_q_roped/train_k_roped/train_attn_wt) instead of
+   * re-deriving them from possibly-reused buffers.
+   */
+  cache_inv_rms =
+    (context.getExecutionMode() == ml::train::ExecutionMode::TRAIN);
+  if (cache_inv_rms) {
+    nntrainer::TensorDim inv_rms_dim(dim[0]);
+    inv_rms_dim.width(1);
+    inv_rms_dim.setTensorType(
+      {context.getFormat(), nntrainer::TensorDim::DataType::FP32});
+    wt_idx[RMSParams::inv_rms] = context.requestTensor(
+      inv_rms_dim, "inv_rms", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+  }
 }
 
 void RMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
@@ -104,6 +139,24 @@ void RMSNormLayer::computeRMSNorm(nntrainer::RunLayerContext &context,
         in_step.getData<float>(), out_step.getData<float>(), dim.height(),
         dim.width(), epsilon);
 #endif
+      // Cache inv_rms per row for calcDerivative()/calcGradient() to read
+      // back verbatim -- see the note in finalize() for why this must not
+      // be recomputed from the input tensor at backward time instead.
+      if (cache_inv_rms) {
+        nntrainer::Tensor &inv_rms_cache =
+          context.getTensor(wt_idx[RMSParams::inv_rms]);
+        float *inv_rms_row = inv_rms_cache.getData<float>() +
+                            b * inv_rms_cache.getDim().getFeatureLen() + from;
+        const float *x_row = in_step.getData<float>();
+        const unsigned int width = dim.width();
+        for (unsigned int r = 0; r < dim.height(); ++r) {
+          float ms = 0.0f;
+          for (unsigned int w = 0; w < width; ++w)
+            ms += x_row[r * width + w] * x_row[r * width + w];
+          ms /= width;
+          inv_rms_row[r] = 1.0f / std::sqrt(ms + epsilon);
+        }
+      }
 #ifdef ENABLE_FP16
     } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       const auto &dim = in_step.getDim();
@@ -137,6 +190,18 @@ void RMSNormLayer::updateTensorsByInputDimensions(
   std::vector<nntrainer::TensorDim> input_dimensions) {
   context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
   context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
+
+  if (cache_inv_rms) {
+    nntrainer::TensorDim inv_rms_dim(input_dimensions[0]);
+    inv_rms_dim.width(1);
+    context.updateTensor(wt_idx[RMSParams::inv_rms], inv_rms_dim);
+  }
+}
+
+void RMSNormLayer::setBatch(nntrainer::RunLayerContext &context,
+                            unsigned int batch) {
+  if (cache_inv_rms)
+    context.updateTensor(wt_idx[RMSParams::inv_rms], batch);
 }
 
 /**
@@ -150,13 +215,13 @@ void RMSNormLayer::updateTensorsByInputDimensions(
  *          frozen under LoRA-only training).
  */
 void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
-
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
   const nntrainer::Tensor &dy =
     context.getIncomingDerivative(SINGLE_INOUT_IDX);
   nntrainer::Tensor &dx = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
+  const nntrainer::Tensor &inv_rms_cache =
+    context.getTensor(wt_idx[RMSParams::inv_rms]);
 
   NNTR_THROW_IF(in.getDataType() != ml::train::TensorDim::DataType::FP32,
                 std::invalid_argument)
@@ -171,28 +236,31 @@ void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   const unsigned int width = in_dim.width();
   const unsigned int rows_per_batch = in_dim.getFeatureLen() / width;
   const unsigned int batch = in_dim.batch();
+  const unsigned int inv_rms_stride = inv_rms_cache.getDim().getFeatureLen();
 
   const float *x = in.getData<float>();
   const float *dy_ = dy.getData<float>();
   const float *g = gamma_fp32.getData<float>();
+  const float *inv_rms_ = inv_rms_cache.getData<float>();
   float *dx_ = dx.getData<float>();
 
   for (unsigned int b = 0; b < batch; ++b) {
     const float *x_b = x + b * in_dim.getFeatureLen();
     const float *dy_b = dy_ + b * in_dim.getFeatureLen();
     float *dx_b = dx_ + b * in_dim.getFeatureLen();
+    const float *inv_rms_b = inv_rms_ + b * inv_rms_stride;
 
     for (unsigned int r = 0; r < rows_per_batch; ++r) {
       const float *x_row = x_b + r * width;
       const float *dy_row = dy_b + r * width;
       float *dx_row = dx_b + r * width;
 
-      float ms = 0.0f;
-      for (unsigned int w = 0; w < width; ++w)
-        ms += x_row[w] * x_row[w];
-      ms /= width;
-      float inv_rms = 1.0f / std::sqrt(ms + epsilon);
-      float inv_rms3 = inv_rms * inv_rms * inv_rms;
+      // Read back the inv_rms this row's forward pass computed, rather than
+      // recomputing it from x_row here -- see the note in finalize() for
+      // why re-deriving it from the (possibly since-reused) input buffer at
+      // this point is unsafe.
+      const float inv_rms = inv_rms_b[r];
+      const float inv_rms3 = inv_rms * inv_rms * inv_rms;
 
       float sum_gdyx = 0.0f;
       for (unsigned int w = 0; w < width; ++w)
@@ -218,17 +286,25 @@ void RMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
  *       first visit and accumulated afterwards, so a gamma shared between
  *       several layers sums their contributions instead of discarding all
  *       but the last.
+ * @note Reads the input directly (not just the cached inv_rms) for the
+ *       dy*x product itself, which is safe here for the same reason it is
+ *       safe in calcDerivative: every row this layer didn't compute a
+ *       fresh inv_rms for during forward has dy == 0 (nothing downstream
+ *       gave it a gradient), so even if that row's input memory has since
+ *       been reused for something else, its contribution is multiplied by
+ *       zero regardless. inv_rms itself is NOT safe to recompute this way
+ *       -- see the note in finalize().
  * @note Safe to read the input here: the framework runs calcGradient before
  *       calcDerivative, and it is calcDerivative that overwrites the input
  *       buffer with dx (see the aliasing note there).
  */
 void RMSNormLayer::calcGradient(nntrainer::RunLayerContext &context) {
-  auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
-
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   const nntrainer::Tensor &dy =
     context.getIncomingDerivative(SINGLE_INOUT_IDX);
   nntrainer::Tensor &dgamma = context.getWeightGrad(wt_idx[RMSParams::gamma]);
+  const nntrainer::Tensor &inv_rms_cache =
+    context.getTensor(wt_idx[RMSParams::inv_rms]);
 
   NNTR_THROW_IF(in.getDataType() != ml::train::TensorDim::DataType::FP32 ||
                   dgamma.getDataType() !=
@@ -240,25 +316,23 @@ void RMSNormLayer::calcGradient(nntrainer::RunLayerContext &context) {
   const unsigned int width = in_dim.width();
   const unsigned int rows_per_batch = in_dim.getFeatureLen() / width;
   const unsigned int batch = in_dim.batch();
+  const unsigned int inv_rms_stride = inv_rms_cache.getDim().getFeatureLen();
 
   const float *x = in.getData<float>();
   const float *dy_ = dy.getData<float>();
+  const float *inv_rms_ = inv_rms_cache.getData<float>();
 
   std::vector<double> acc(width, 0.0);
 
   for (unsigned int b = 0; b < batch; ++b) {
     const float *x_b = x + b * in_dim.getFeatureLen();
     const float *dy_b = dy_ + b * in_dim.getFeatureLen();
+    const float *inv_rms_b = inv_rms_ + b * inv_rms_stride;
 
     for (unsigned int r = 0; r < rows_per_batch; ++r) {
       const float *x_row = x_b + r * width;
       const float *dy_row = dy_b + r * width;
-
-      float ms = 0.0f;
-      for (unsigned int w = 0; w < width; ++w)
-        ms += x_row[w] * x_row[w];
-      ms /= width;
-      const float inv_rms = 1.0f / std::sqrt(ms + epsilon);
+      const float inv_rms = inv_rms_b[r];
 
       for (unsigned int w = 0; w < width; ++w)
         acc[w] += static_cast<double>(dy_row[w]) * x_row[w] * inv_rms;

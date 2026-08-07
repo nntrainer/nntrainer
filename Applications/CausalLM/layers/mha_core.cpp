@@ -1568,6 +1568,18 @@ void MHACoreLayer::setBatch(nntrainer::RunLayerContext &context,
   if (dropout_rate > epsilon) {
     context.updateTensor(tensor_idx[AttentionParams::dropout_mask], batch);
   }
+  // Training caches (populated by trainForwarding(), consumed by
+  // calcDerivative()): only resized in updateTensorsByInputDimensions()
+  // (sequence-length changes) until this fix -- a batch-size change alone
+  // (this function) left them sized for whatever batch finalize() ran with,
+  // so every batch index beyond that read/wrote past the end of its backing
+  // tensor once the real batch size was set. Same root cause as
+  // RMSNormLayer::setBatch's note.
+  if (train_tensors_requested) {
+    context.updateTensor(tensor_idx[AttentionParams::train_q_roped], batch);
+    context.updateTensor(tensor_idx[AttentionParams::train_k_roped], batch);
+    context.updateTensor(tensor_idx[AttentionParams::train_attn_wt], batch);
+  }
 }
 
 void MHACoreLayer::updateTensorsByInputDimensions(

@@ -37,8 +37,21 @@ enum TieWordEmbeddingParams {
   candidate_hidden_step
 };
 
-unsigned int g_tie_embedding_lm_head_read_row =
-  std::numeric_limits<unsigned int>::max();
+std::vector<unsigned int> g_tie_embedding_lm_head_read_row;
+
+namespace {
+/**
+ * @brief Look up batch index b's cached read row, falling back to
+ *        `fallback` (the last row) if the cache is empty or doesn't cover
+ *        this batch index -- e.g. inference, which never goes through the
+ *        embedding-mode forwarding() that populates it.
+ */
+inline unsigned int readRowForBatch(unsigned int b, unsigned int fallback) {
+  return (b < g_tie_embedding_lm_head_read_row.size())
+           ? g_tie_embedding_lm_head_read_row[b]
+           : fallback;
+}
+} // namespace
 
 TieWordEmbedding::TieWordEmbedding() :
   LayerImpl(),
@@ -202,16 +215,19 @@ void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
                                   bool training) {
   if (mode_ == mode::embedding) {
     nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-    const unsigned int seq_len = input_.getDim().width();
+    const ml::train::TensorDim input_dim = input_.getDim();
+    const unsigned int seq_len = input_dim.width();
+    const unsigned int b_size = input_dim.batch();
 
     /**
      * @note Record which row the lm-head-mode instance should read later in
-     * this same forward pass. Training right-pads with token id 0, so the
-     * last real token is the last non-zero id; falling back to
-     * (seq_len - 1) would read a pad position and make the model predict
-     * from padding. See g_tie_embedding_lm_head_read_row in the header for
-     * why this is derived here rather than passed in from the data
-     * pipeline.
+     * this same forward pass, per batch index -- different samples in the
+     * same batch pad to different real lengths, so this is not one shared
+     * value. Training right-pads with token id 0, so the last real token is
+     * the last non-zero id; falling back to (seq_len - 1) would read a pad
+     * position and make the model predict from padding. See
+     * g_tie_embedding_lm_head_read_row in the header for why this is
+     * derived here rather than passed in from the data pipeline.
      *
      * @note A sample whose final input token is genuinely id 0 would be
      * under-counted here. The training data generator avoids this by
@@ -224,15 +240,19 @@ void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
     // Inference does not come through here at all — it uses
     // incremental_forwarding(), which derives its own row from (to - from).
     {
+      g_tie_embedding_lm_head_read_row.assign(b_size, 0);
       const float *ids = input_.getData<float>();
-      unsigned int last_real = 0;
-      for (unsigned int i = seq_len; i-- > 0;) {
-        if (static_cast<unsigned int>(ids[i]) != 0u) {
-          last_real = i;
-          break;
+      for (unsigned int b = 0; b < b_size; ++b) {
+        const float *ids_b = ids + b * input_dim.getFeatureLen();
+        unsigned int last_real = 0;
+        for (unsigned int i = seq_len; i-- > 0;) {
+          if (static_cast<unsigned int>(ids_b[i]) != 0u) {
+            last_real = i;
+            break;
+          }
         }
+        g_tie_embedding_lm_head_read_row[b] = last_real;
       }
-      g_tie_embedding_lm_head_read_row = last_real;
     }
 
     incremental_forwarding_embedding(context, 0, seq_len, training);
@@ -252,11 +272,7 @@ void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
   ml::train::TensorDim input_dim = input_.getDim();
   ml::train::TensorDim hidden_dim = hidden_.getDim();
 
-  unsigned int read_row =
-    (g_tie_embedding_lm_head_read_row !=
-     std::numeric_limits<unsigned int>::max())
-      ? g_tie_embedding_lm_head_read_row
-      : (input_dim.height() - 1);
+  const unsigned int fallback_row = input_dim.height() - 1;
 
   ml::train::TensorDim input_step_dim = input_dim;
   ml::train::TensorDim hidden_step_dim = hidden_dim;
@@ -268,6 +284,7 @@ void TieWordEmbedding::forwarding(nntrainer::RunLayerContext &context,
   unsigned int b_size = input_dim.batch();
 
   for (unsigned int b = 0; b < b_size; ++b) {
+    const unsigned int read_row = readRowForBatch(b, fallback_row);
     nntrainer::Tensor input_step = input_.getSharedDataTensor(
       input_step_dim,
       b * input_dim.getFeatureLen() + read_row * input_dim.width(), true);
@@ -536,11 +553,7 @@ void TieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
   ml::train::TensorDim input_dim = dx.getDim();
   ml::train::TensorDim dy_dim = dy.getDim();
 
-  unsigned int read_row =
-    (g_tie_embedding_lm_head_read_row !=
-     std::numeric_limits<unsigned int>::max())
-      ? g_tie_embedding_lm_head_read_row
-      : (input_dim.height() - 1);
+  const unsigned int fallback_row = input_dim.height() - 1;
 
   dx.setZero();
 
@@ -554,6 +567,7 @@ void TieWordEmbedding::calcDerivative(nntrainer::RunLayerContext &context) {
   unsigned int b_size = input_dim.batch();
 
   for (unsigned int b = 0; b < b_size; ++b) {
+    const unsigned int read_row = readRowForBatch(b, fallback_row);
     nntrainer::Tensor dx_step = dx.getSharedDataTensor(
       dx_step_dim,
       b * input_dim.getFeatureLen() + read_row * input_dim.width(), true);
@@ -634,14 +648,11 @@ void TieWordEmbedding::calcGradient(nntrainer::RunLayerContext &context) {
   // lm_head mode
   const ml::train::TensorDim in_dim = input_.getDim();
   const ml::train::TensorDim dy_dim = dy.getDim();
-  const unsigned int read_row =
-    (g_tie_embedding_lm_head_read_row !=
-     std::numeric_limits<unsigned int>::max())
-      ? g_tie_embedding_lm_head_read_row
-      : (in_dim.height() - 1);
+  const unsigned int fallback_row = in_dim.height() - 1;
 
   const float *x = input_.getData<float>();
   for (unsigned int b = 0; b < in_dim.batch(); ++b) {
+    const unsigned int read_row = readRowForBatch(b, fallback_row);
     const float *x_row =
       x + b * in_dim.getFeatureLen() + read_row * in_dim.width();
     const float *dy_row = dy_ + b * dy_dim.getFeatureLen();
