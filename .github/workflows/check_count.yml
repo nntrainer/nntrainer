@@ -1,10 +1,8 @@
 name: Check Review
 
 on:
-  pull_request:
-    types: [opened, edited, reopened, synchronize]
   pull_request_review:
-    types: [edited, dismissed, submitted]
+    types: [submitted]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
