@@ -68,3 +68,36 @@ jobs:
         run: meson test -C build --no-suite unittests --print-errorlogs
       - name: run Unittests
         run: meson test -C build --suite unittests --print-errorlogs
+
+  clang_meson_test:
+
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ ubuntu-22.04, ubuntu-24.04 ]
+        # @todo add options if necessary
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: install additional package from PPA for testing
+        run: sudo add-apt-repository -y ppa:nnstreamer/ppa && sudo apt-get update
+      - name: install minimal requirements
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev libiniparser-dev libjsoncpp-dev libcurl3-dev tensorflow2-lite-dev nnstreamer-dev libglib2.0-dev libgstreamer1.0-dev libgtest-dev ml-api-common-dev flatbuffers-compiler ml-inference-api-dev libunwind-dev
+      - name: install additional packages for features
+        run: sudo apt-get install -y python3-dev python3-numpy python3
+      - name: Install llvm
+        run: sudo apt install -y llvm
+      - name: Install submodules
+        run: git submodule sync && git submodule update --init --recursive
+      - name: Install build systems
+        run: sudo apt install meson ninja-build
+      - name: Prepare Build
+        run: meson setup --native-file configurations/linux-native-clang.ini builddir
+      - name: Run Build
+        run: meson compile -C builddir
+      - name: Run Test Suite
+        run: meson test -C builddir --print-errorlogs

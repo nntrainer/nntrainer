@@ -1,8 +1,10 @@
 name: "Build Test - Windows on ARM Meson Clang"
 
 on:
-  pull_request:
-    branches: [ main ]
+  # TODO: enable pull_request if needed
+  # pull_request:
+  #   branches: [ main ]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
