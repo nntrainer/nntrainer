@@ -909,12 +909,19 @@ void Manager::flushCacheExcept(unsigned int order) {
 void Manager::finalizeTensorPool(TensorPool &pool, unsigned int start,
                                  unsigned int end) {
   if (enable_optimizations) {
-    if (exec_mode == ExecutionMode::INFERENCE && enable_fsu) {
-      //@todo change V3 and validate
-      pool.finalize(OptimizedV1Planner(), start, end);
-    } else {
-      pool.finalize(OptimizedV1Planner(), start, end);
-    }
+    /// The memory planner is selected at compile time via
+    /// -DENABLE_MEMORY_PLANNER_V2 / -DENABLE_MEMORY_PLANNER_V3 (meson
+    /// -Dmemory-planner=v2/v3, or ndk-build ENABLE_MEMORY_PLANNER_V2/V3=1).
+    /// The default (and validated) planner is OptimizedV1Planner.
+    /// @note OptimizedV2/V3Planner produce lower peak memory layouts but are
+    /// not yet validated for correctness on all models; opt-in only.
+#if defined(ENABLE_MEMORY_PLANNER_V3)
+    pool.finalize(OptimizedV3Planner(), start, end);
+#elif defined(ENABLE_MEMORY_PLANNER_V2)
+    pool.finalize(OptimizedV2Planner(), start, end);
+#else
+    pool.finalize(OptimizedV1Planner(), start, end);
+#endif
   } else {
     pool.finalize(BasicPlanner(), start, end);
   }

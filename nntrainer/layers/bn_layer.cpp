@@ -432,7 +432,7 @@ void BatchNormalizationLayer::read(std::ifstream &file,
       if (run_context.isGradientLastAccess(i) && trainable) {
         /// @note read optimizer variables
         for (unsigned int j = 0; j < run_context.getNumWeightOptVar(i); ++j) {
-          run_context.getWeightOptVar(i, j).read(file);
+          run_context.getWeightOptVar(i, j).read(file, start_offset);
         }
       }
     }
@@ -452,10 +452,12 @@ void BatchNormalizationLayer::read(std::ifstream &file,
           TensorDim dim = run_context.getWeight(i).getDim();
           dim.setDataType(definedWeightDataType);
           Tensor T_read(dim, true);
-          T_read.read(file);
+          T_read.setFileOffset(run_context.getWeight(i).getFileOffset());
+          T_read.read(file, start_offset, read_from_offset, file_fd);
           run_context.getWeight(i).copyData(T_read);
         } else {
-          run_context.getWeight(i).read(file, start_offset);
+          run_context.getWeight(i).read(file, start_offset, read_from_offset,
+                                        file_fd);
         }
 
         if (run_context.isMixedPrecision(i) && trainable &&
@@ -478,7 +480,7 @@ void BatchNormalizationLayer::read(ReadSource src, RunLayerContext &run_context,
       if (run_context.isGradientLastAccess(i) && trainable) {
         /// @note read optimizer variables
         for (unsigned int j = 0; j < run_context.getNumWeightOptVar(i); ++j) {
-          run_context.getWeightOptVar(i, j).read(src);
+          run_context.getWeightOptVar(i, j).read(src, start_offset);
         }
       }
     }
@@ -498,10 +500,12 @@ void BatchNormalizationLayer::read(ReadSource src, RunLayerContext &run_context,
           TensorDim dim = run_context.getWeight(i).getDim();
           dim.setDataType(definedWeightDataType);
           Tensor T_read(dim, true);
-          T_read.read(src);
+          T_read.setFileOffset(run_context.getWeight(i).getFileOffset());
+          T_read.read(src, start_offset, read_from_offset, file_fd);
           run_context.getWeight(i).copyData(T_read);
         } else {
-          run_context.getWeight(i).read(src, start_offset);
+          run_context.getWeight(i).read(src, start_offset, read_from_offset,
+                                        file_fd);
         }
 
         if (run_context.isMixedPrecision(i) && trainable &&

@@ -191,6 +191,17 @@ LOCAL_EXPORT_C_INCLUDES  := $(LOCAL_C_INCLUDES)
 
 LOCAL_CFLAGS        += -pthread -fexceptions @MESON_CFLAGS@ @ML_API_COMMON@
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions @ML_API_COMMON@ @MESON_CXXFLAGS@
+# Opt-in inference memory planner (off by default; 'auto'/'v1' = OptimizedV1).
+# The YOLOv11 inference build sets ENABLE_MEMORY_PLANNER_V3=1 on the ndk-build
+# command line; ENABLE_MEMORY_PLANNER_V2=1 selects OptimizedV2Planner.
+ifeq ($(ENABLE_MEMORY_PLANNER_V2), 1)
+LOCAL_CFLAGS        += -DENABLE_MEMORY_PLANNER_V2=1
+LOCAL_CXXFLAGS      += -DENABLE_MEMORY_PLANNER_V2=1
+endif
+ifeq ($(ENABLE_MEMORY_PLANNER_V3), 1)
+LOCAL_CFLAGS        += -DENABLE_MEMORY_PLANNER_V3=1
+LOCAL_CXXFLAGS      += -DENABLE_MEMORY_PLANNER_V3=1
+endif
 LOCAL_MODULE_TAGS   := optional
 
 LOCAL_LDLIBS        := -llog -landroid

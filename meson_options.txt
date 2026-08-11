@@ -16,6 +16,12 @@ option('enable-tflite-interpreter', type: 'boolean', value: true)
 option('enable-onnx-interpreter', type: 'boolean', value: false)
 option('enable-fsu', type: 'boolean', value: false)
 option('fsu-path', type: 'string', value: '')
+# Tensor memory pool planner for inference. 'auto'/'v1' keep the validated
+# built-in OptimizedV1Planner (unchanged default); 'v2' compiles in
+# OptimizedV2Planner; 'v3' compiles in OptimizedV3Planner for lower peak memory.
+# Selected per build (e.g. the YOLOv11 inference build uses 'v3').
+option('memory-planner', type: 'combo', choices: ['auto', 'v1', 'v2', 'v3'],
+       value: 'auto')
 option('test-timeout', type: 'integer', value: 90)
 option('opencl-kernel-path', type: 'string', value: 'nntrainer_opencl_kernels')
 option('enable-mmap', type: 'boolean', value: true)
