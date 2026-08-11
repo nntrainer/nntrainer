@@ -16,6 +16,7 @@
 #include <HAP_farf.h>
 #include <remote.h>
 
+#include "hexkl_hmx_geom.h"
 #include "hexkl_micro.h"
 #include "hexkl_mm_u8i4.h"
 #include "hexkl_mm_u8i4_dma.h"
@@ -24,8 +25,7 @@
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
-/** @brief Rounds @a v up to a multiple of @a a. */
-#define ROUND_UP(v, a) ((((v) + ((a)-1)) / (a)) * (a))
+#define ROUND_UP(v, a) HEXKL_ROUND_UP_U32(v, a)
 
 /**
  * @brief Accuracy harness: the whole flow, quantization and dequantization

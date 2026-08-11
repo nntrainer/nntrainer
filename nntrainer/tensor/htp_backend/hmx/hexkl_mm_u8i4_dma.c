@@ -135,16 +135,23 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     return AEE_EBADPARM;
   }
 
-  const uint32_t m_pad = ROUND_UP_U32(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
-  const uint32_t k_tiles = K / HEXKL_HMX_INT8_BLOCK_N_INNER;
-  const uint32_t n_rblocks = m_pad / HEXKL_HMX_INT8_BLOCK_N_ROW;
   if ((K % HEXKL_HMX_INT8_BLOCK_N_INNER) != 0) {
     return AEE_EBADPARM;
   }
+  // config_off comes from the session rather than being computed here, so
+  // check it against the arena before deriving any offset from it.
+  if (config_off > vtcm_size) {
+    return AEE_EBADPARM;
+  }
+
+  const uint32_t m_pad = ROUND_UP_U32(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
+  const uint32_t k_tiles = K / HEXKL_HMX_INT8_BLOCK_N_INNER;
+  const uint32_t n_rblocks = m_pad / HEXKL_HMX_INT8_BLOCK_N_ROW;
 
   // Validate every handle up front -- K must match, and this is also where
-  // the widest weight (for the double-buffer size) and the total output
-  // width (for out_cat bounds) come from.
+  // the widest weight comes from, which sizes both the VTCM double-buffer
+  // and the accumulator scratch. The caller checks out_cat's length against
+  // the sum of the handles' N; this loop only needs the maximum.
   uint32_t n_tiles_max = 0, n_max = 0;
   for (uint32_t i = 0; i < n_handles; ++i) {
     if (handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
@@ -176,11 +183,10 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   };
   const uint32_t result_off =
     ROUND_UP_U32(wbuf[1] + wb_max, HEXKL_HMX_ACTIVATION_ALIGNMENT);
+  // config_off is at or below vtcm_size (checked above), so clearing it also
+  // clears the arena -- one bound, not two.
   if (result_off + ACC_TILE_BYTES > config_off) {
     return AEE_ENOMEMORY; // double-buffered widest weight does not fit VTCM
-  }
-  if (result_off + ACC_TILE_BYTES > vtcm_size) {
-    return AEE_ENOMEMORY;
   }
 
   // K1/K2: quantize the shared activation once, straight into its AH tiles
