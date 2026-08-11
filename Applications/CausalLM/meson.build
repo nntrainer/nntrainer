@@ -248,6 +248,22 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  unittest_qwen3_lora_training_smoke = executable(
+    'unittest_qwen3_lora_training_smoke',
+    meson.current_source_dir() / 'models' / 'unittest_qwen3_lora_training_smoke.cpp',
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, gtest_main_dep,
+                   causallm_dep, causallm_layer_dependencies],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_qwen3_lora_training_smoke', unittest_qwen3_lora_training_smoke,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_qwen3_lora_training_smoke'),
+    timeout: 120,
+    suite: 'unittests'
+  )
+
   unittest_kv_cache_manager = executable(
     'unittest_kv_cache_manager',
     meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_kv_cache_manager.cpp',
