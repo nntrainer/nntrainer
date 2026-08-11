@@ -42,6 +42,15 @@ void printUsage(const char *prog) {
     << "                        (0 = off, the default)\n"
     << "  --train_norms         also train the RMSNorm gammas alongside the\n"
     << "                        LoRA adapters (default: norms frozen)\n"
+    << "  --lora_qat            fake-quantize loraA/loraB to the Q4_0 grid\n"
+    << "                        during training (per-block EMA scales,\n"
+    << "                        straight-through backward). Implies\n"
+    << "                        --lora_weight_q4.\n"
+    << "  --lora_weight_q4      also save a Q4_0 adapter (output path with\n"
+    << "                        a _q4.bin suffix) alongside the FP32 one.\n"
+    << "                        With --lora_qat, force-feeds the calibrated\n"
+    << "                        EMA scales; without it, quantizes the\n"
+    << "                        trained FP32 adapter post hoc (PTQ).\n"
     << "  --seed <int>          RNG seed for epoch shuffling (default 42)\n";
 }
 
@@ -49,6 +58,7 @@ void printUsage(const char *prog) {
 struct EpochState {
   causallm::Qwen3CausalLM *model;
   std::string output_path;
+  std::string q4_output_path; // empty unless --lora_weight_q4 was passed
   unsigned int epoch = 0;
   float best_loss = std::numeric_limits<float>::max();
 };
@@ -72,6 +82,16 @@ void onEpochComplete(void *user_data) {
       std::cout << "  saved LoRA adapter -> " << st->output_path << std::endl;
     } catch (const std::exception &e) {
       std::cerr << "  failed to save LoRA adapter: " << e.what() << std::endl;
+    }
+    if (!st->q4_output_path.empty()) {
+      try {
+        st->model->save_weight_lora_q4(st->q4_output_path);
+        std::cout << "  saved Q4_0 LoRA adapter -> " << st->q4_output_path
+                  << std::endl;
+      } catch (const std::exception &e) {
+        std::cerr << "  failed to save Q4_0 LoRA adapter: " << e.what()
+                  << std::endl;
+      }
     }
   }
 }
@@ -97,6 +117,8 @@ int main(int argc, char *argv[]) {
   unsigned int seq_len_override = 0;
   float clip_grad = -1.0f;
   bool train_norms = false;
+  bool lora_qat = false;
+  bool lora_weight_q4 = false;
   unsigned int seed = 42;
 
   for (int i = 3; i < argc; ++i) {
@@ -132,6 +154,10 @@ int main(int argc, char *argv[]) {
         clip_grad = std::stof(next("--clip_grad"));
       else if (arg == "--train_norms")
         train_norms = true;
+      else if (arg == "--lora_qat")
+        lora_qat = true;
+      else if (arg == "--lora_weight_q4")
+        lora_weight_q4 = true;
       else if (arg == "--seed")
         seed = static_cast<unsigned int>(std::stoul(next("--seed")));
       else {
@@ -201,6 +227,15 @@ int main(int argc, char *argv[]) {
     if (clip_grad >= 0.0f)
       nntr_cfg["lora_clip_grad_by_norm"] = clip_grad;
 
+    // --lora_qat implies --lora_weight_q4: there is no point calibrating
+    // fake-quant EMA scales without also saving the adapter they describe.
+    if (lora_qat)
+      lora_weight_q4 = true;
+    if (lora_qat)
+      nntr_cfg["lora_qat"] = true;
+    if (lora_weight_q4)
+      nntr_cfg["lora_weight_q4"] = true;
+
     if (seq_len_override) {
       nntr_cfg["init_seq_len"] = seq_len_override;
       // max_seq_len must not sit below the training length; mha_core derives
@@ -212,6 +247,12 @@ int main(int argc, char *argv[]) {
     const unsigned int seq_len = nntr_cfg["init_seq_len"].get<unsigned int>();
     const unsigned int vocab_size = cfg["vocab_size"].get<unsigned int>();
 
+    std::string q4_output_path;
+    if (lora_weight_q4) {
+      std::filesystem::path p(output_path);
+      q4_output_path = (p.parent_path() / (p.stem().string() + "_q4.bin")).string();
+    }
+
     std::cout << "model:        " << model_path << "\n"
               << "data:         " << data_path << "\n"
               << "lora_rank:    " << nntr_cfg["lora_rank"].get<unsigned int>()
@@ -222,9 +263,14 @@ int main(int argc, char *argv[]) {
               << "\n"
               << "clip_grad:    "
               << nntr_cfg.value("lora_clip_grad_by_norm", 0.0f) << "\n"
+              << "lora_qat:     " << (lora_qat ? "true" : "false") << "\n"
               << "lr:           " << lr << "\n"
               << "epochs:       " << epochs << "\n"
-              << "output:       " << output_path << std::endl;
+              << "output:       " << output_path << "\n";
+    if (!q4_output_path.empty())
+      std::cout << "output_q4:    " << q4_output_path << std::endl;
+    else
+      std::cout << std::flush;
 
     causallm::Qwen3CausalLM model(cfg, generation_cfg, nntr_cfg);
     model.initializeForTraining(lr, epochs);
@@ -248,7 +294,7 @@ int main(int argc, char *argv[]) {
     model.setDataset(ml::train::DatasetModeType::MODE_TRAIN, dataset);
     model.setDataset(ml::train::DatasetModeType::MODE_VALID, dataset);
 
-    EpochState state{&model, output_path};
+    EpochState state{&model, output_path, q4_output_path};
     model.train(onEpochComplete, &state);
 
     std::cout << "training complete; best valid_loss=" << state.best_loss
