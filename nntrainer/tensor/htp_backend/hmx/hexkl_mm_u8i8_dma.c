@@ -41,8 +41,9 @@
  *         u8i4 module -- the accumulator width does not depend on the
  *         weight width. */
 #define ACC_TILE_BYTES 8192u
-/** @brief Largest single DMA row HexKL/HVX will move correctly; rows above
- *         this size have a documented hardware bug (doc13 §3a, §5). */
+/** @brief Largest single DMA row the engine will move correctly. Rows
+ *         above 256 KB hit a known hardware erratum, so a transfer is
+ *         chunked into rows at or below this size. */
 #define MAX_DMA_ROW_BYTES 262144u
 
 static uint32_t dma_row_size_dividing(uint32_t total_bytes) {
