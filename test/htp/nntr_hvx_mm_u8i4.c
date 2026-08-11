@@ -34,9 +34,9 @@
  *
  * hw_init and the HMX lock are session-scoped (nntr_hvx_open), not per
  * call, since the layer endpoint below turned this from a call that stood
- * alone into one of several entry points sharing one session. The weight is still
- * baked fresh every call -- that is the point of this harness, checking the
- * bake -- unlike the resident-weight path in mm_u8i4_layer below.
+ * alone into one of several entry points sharing one session. The weight is
+ * still baked fresh every call -- that is the point of this harness, checking
+ * the bake -- unlike the resident-weight path in mm_u8i4_layer below.
  */
 int nntr_hvx_mm_u8i4_from_f32(
   remote_handle64 handle, uint32 M, uint32 K, uint32 N, const float *act_f32,
