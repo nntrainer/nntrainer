@@ -77,11 +77,33 @@ using nntr_htp_bridge_gemm_q4_0_batch_fn =
   int (*)(const void *const *, const float *, float *const *,
           const unsigned int *, unsigned int, unsigned int, unsigned int);
 
+/**
+ * @brief FP32 SGEMM bridge function type for training.
+ *
+ * Dispatches a general FP32 matrix multiply to the DSP. Used by
+ * HexagonComputeOps::sgemm_fp32 to offload forward, backward-input, and
+ * backward-weight GEMMs during training. The bridge function is optional —
+ * if dlsym fails (older libggml-hexagon.so without training support), the
+ * pointer stays null and sgemm_fp32 falls back to CPU transparently.
+ */
+using nntr_htp_bridge_sgemm_fn = int (*)(const float *, const float *, float *,
+                                         unsigned int, unsigned int,
+                                         unsigned int, int, int);
+
+using nntr_htp_bridge_sgemm_batch_fn =
+  int (*)(const float * const *, const float * const *, float * const *,
+          const unsigned int *, const unsigned int *, const unsigned int *,
+          const int *, const int *, unsigned int);
+
 struct BridgeApi {
   nntr_htp_bridge_upload_fn upload = nullptr;
   nntr_htp_bridge_gemm_q4_0_fn gemm = nullptr;
   nntr_htp_bridge_gemm_q4_0_batch_fn gemm_batch = nullptr;
+  nntr_htp_bridge_sgemm_fn sgemm = nullptr;             /**< FP32 GEMM for training */
+  nntr_htp_bridge_sgemm_batch_fn sgemm_batch = nullptr;  /**< Batched FP32 GEMM */
 };
+
+
 
 /**
  * @brief Lazily dlopen libggml-hexagon.so and dlsym the bridge entry points.
@@ -109,6 +131,13 @@ const BridgeApi &get_bridge_api() {
       return s;
     };
 
+    // Optional symbol lookup — returns nullptr if not found (no throw).
+    // Used for the training-only sgemm bridge, which may not exist in older
+    // builds of libggml-hexagon.so.
+    auto sym_optional = [handle](const char *name) -> void * {
+      return dlsym(handle, name);
+    };
+
     BridgeApi a;
     a.upload = reinterpret_cast<nntr_htp_bridge_upload_fn>(
       sym("nntr_htp_bridge_upload_weight_q4x4x2"));
@@ -116,7 +145,21 @@ const BridgeApi &get_bridge_api() {
       sym("nntr_htp_bridge_gemm_q4_0"));
     a.gemm_batch = reinterpret_cast<nntr_htp_bridge_gemm_q4_0_batch_fn>(
       sym("nntr_htp_bridge_gemm_q4_0_batch"));
+    // Training bridge — optional, stays null if not present.
+    a.sgemm = reinterpret_cast<nntr_htp_bridge_sgemm_fn>(
+      sym_optional("nntr_htp_bridge_sgemm_fp32"));
+    a.sgemm_batch = reinterpret_cast<nntr_htp_bridge_sgemm_batch_fn>(
+      sym_optional("nntr_htp_bridge_sgemm_batch_fp32"));
+    if (a.sgemm) {
+      ml_logi("HexagonComputeOps: FP32 SGEMM training bridge loaded%s",
+              a.sgemm_batch ? " (with batch fusion)" : "");
+    } else {
+      ml_logi("HexagonComputeOps: FP32 SGEMM training bridge not found "
+              "(sgemm_fp32 will use CPU)");
+    }
     return a;
+
+
   }();
 
   return api;
@@ -245,15 +288,49 @@ public:
   // ===========================================================================
 
   // --- FP32 BLAS ---
+  //
+  // sgemm_fp32 is the training hot path: FullyConnectedLayer calls it for
+  // forwarding (Y = X·W), calcDerivative (dX = dY·W^T), and calcGradient
+  // (dW = X^T·dY). When the optional nntr_htp_bridge_sgemm_fp32 symbol is
+  // present in libggml-hexagon.so, we dispatch the simple case (alpha=1,
+  // beta=0, no leading-dimension padding) to the DSP. All other cases fall
+  // back to CPU, as do any bridge failures.
   void sgemm_fp32(const unsigned int TStorageOrder, bool TransA, bool TransB,
-                  const unsigned int M, const unsigned int N,
-                  const unsigned int K, const float alpha, const float *A,
-                  const unsigned int lda, const float *B,
-                  const unsigned int ldb, const float beta, float *C,
-                  const unsigned int ldc) override {
+                   const unsigned int M, const unsigned int N,
+                   const unsigned int K, const float alpha, const float *A,
+                   const unsigned int lda, const float *B,
+                   const unsigned int ldb, const float beta, float *C,
+                   const unsigned int ldc) override {
+    const BridgeApi *api = get_locked_bridge_api();
+    // Dispatch to NPU bridge for all transpose combinations.
+    // The bridge swaps src0/src1 to compensate for the matmul_2d kernel's
+    // transposed output write, and physically transposes A/B as needed.
+    // We only require alpha=1, beta=0 (the common training case).
+    if (api->sgemm && alpha == 1.0f && beta == 0.0f) {
+      bool dims_ok = true;
+      if (!TransA && lda != K) dims_ok = false;
+      if (TransA && lda != M) dims_ok = false;
+      if (!TransB && ldb != N) dims_ok = false;
+      if (TransB && ldb != K) dims_ok = false;
+      if (ldc != N) dims_ok = false;
+      if (dims_ok) {
+        int rc = api->sgemm(A, B, C, M, N, K, TransA ? 1 : 0,
+                            TransB ? 1 : 0);
+        if (rc == 0) {
+          return;
+        }
+        ml_logw("HexagonComputeOps::sgemm_fp32: bridge failed (rc=%d, "
+                "M=%u N=%u K=%u transA=%d transB=%d) - falling back to CPU",
+                rc, M, N, K, TransA, TransB);
+      }
+    }
+
     cpu_->sgemm_fp32(TStorageOrder, TransA, TransB, M, N, K, alpha, A, lda, B,
                      ldb, beta, C, ldc);
   }
+
+
+
   void sgemv_fp32(const unsigned int TStorageOrder, bool TransA,
                   const unsigned int M, const unsigned int N,
                   const float alpha, const float *A, const unsigned int lda,

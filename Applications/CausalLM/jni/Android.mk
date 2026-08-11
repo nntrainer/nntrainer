@@ -109,9 +109,11 @@ LOCAL_SRC_FILES := \
     ../models/xlm_roberta/xlm_roberta.cpp \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
+    ../layers/fused_ffn_layer.cpp \
     ../api/streamer.cpp \
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
+
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
 LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
@@ -224,10 +226,12 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/xlm_roberta/xlm_roberta.cpp \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
+    ../layers/fused_ffn_layer.cpp \
     ../api/streamer.cpp
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
+
 
 LOCAL_C_INCLUDES += \
     $(LOCAL_PATH)/.. \

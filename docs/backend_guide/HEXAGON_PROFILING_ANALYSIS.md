@@ -260,3 +260,106 @@ nntrainer (per-op bridge, FC matmuls only on DSP):
 - Further dispatch count reduction for prefill (dispatch is 2.7%)
 - NPU decode (hardware floor is 56 t/s vs CPU 158.9 t/s)
 - FP16 activations (no gain on this device)
+
+---
+
+## 8. Full Variant Benchmark (2026-08-05)
+
+**Model:** Qwen3-0.6B Q4_0, 318-token prompt, 128 tokens generated  
+**Device:** Galaxy S25 (SM-S936U), Snapdragon 8 Elite, HTP v79
+
+### Run 1: DSP bridge decode (weights [N,K], DSP for both prefill+decode)
+
+| Variant | Prefill TPS | Decode TPS | Total ms |
+|---------|------------|-----------|---------|
+| CPU (4 threads) | 626 | 77.4 | 2164 |
+| NPU (CDSP) | 916 | 76.9 | 2021 |
+| NPU + Flash Attn | 1161 | 78.0 | 1921 |
+| NPU + Fused FFN | 978 | 65.7 | 2279 |
+| **NPU + Flash Attn + Fused FFN** | **1237** | 64.9 | 2234 |
+
+### Run 2: CPU decode with [K,N] weights (transpose at load time, CPU for decode)
+
+| Variant | Prefill TPS | Decode TPS | Total ms |
+|---------|------------|-----------|---------|
+| CPU (4 threads) | 646 | 79.0 | 2115 |
+| NPU (CDSP) | 933 | 77.7 | 1998 |
+| NPU + Flash Attn | 1156 | 77.4 | 1936 |
+| NPU + Fused FFN | 506 | 72.9 | 2389 |
+| NPU + Flash Attn + Fused FFN | 505 | 75.7 | 2325 |
+
+### Key findings
+
+1. **Best prefill:** NPU + Flash Attn + Fused FFN (DSP bridge) at **1237 TPS**
+2. **Best decode:** NPU + Flash Attn at **78–79 TPS** (consistent across runs)
+3. **Best overall:** NPU + Flash Attn at **~1930 ms**
+4. **Fused FFN with DSP bridge decode (Run 1):** prefill 978→1237 TPS (great),
+   but decode drops to 65 TPS (3 individual DSP calls vs 2 batched for non-fused)
+5. **Fused FFN with CPU decode (Run 2):** decode recovers to 73–76 TPS (close to
+   non-fused 77 TPS), but prefill drops to 505 TPS because CPU dot() is used
+   instead of the DSP bridge (bridge can't work with [K,N] weight layout)
+
+### Decode regression root cause (Run 1)
+
+The existing FC layers use `gemm_q4_0_batch_fp32` to batch all layers' GEMMs into
+one FastRPC dispatch (2 calls per layer: gate_up batched + ffn_down). The fused FFN
+layer's DSP bridge (`nntr_htp_bridge_ffn_swiglu`) does all 3 GEMMs + SwiGLU in one
+call for prefill, but for decode (M=1) it still uses 3 individual `gemm_q4_0` calls
+(84 FastRPC calls/token vs 2 batched for non-fused).
+
+### CPU decode fix (Run 2)
+
+To enable CPU decode, weights are stored as `[K,N]` (matching GateUpLayer) instead
+of `[N,K]`. The `read()` method transposes Q4_0 weights at load time:
+dequantize → transpose FP32 → re-quantize. This allows `dot(weight, false, false)`
+with no transpose, which `dotQnK` supports. Decode runs on CPU at ~73–76 TPS.
+However, the DSP fused bridge can't work with `[K,N]` weights (it expects `[N,K]`),
+so prefill also runs on CPU at 505 TPS.
+
+### Run 3: Dequantize-on-the-fly for decode (weights [N,K], FP32 dot for decode)
+
+| Variant | Prefill TPS | Decode TPS | Total ms |
+|---------|------------|-----------|---------|
+| NPU + FlashAttn + FusedFFN | 129 | 30.2 | 6705 |
+
+This approach keeps `[N,K]` weights and dequantizes Q4_0→FP32 at decode time,
+using FP32 `dot(transpose=true)`. It's **extremely slow** (30 TPS decode) because
+FP32 GEMM with transpose is 2.5x slower than Q4_0 `dot(false, false)`. Not viable.
+
+### Final implementation: [N,K] weights with DSP bridge for prefill+decode
+
+The shipped implementation keeps the original `[N,K]` weight layout (matching
+the .bin file) and uses the DSP fused bridge for both prefill and decode.
+
+**Final benchmark numbers (latest code, 2026-08-05):**
+
+| Variant | Prefill TPS | Decode TPS | Total ms |
+|---------|------------|-----------|---------|
+| CPU (4 threads) | 640 | 77.3 | 2154 |
+| NPU (CDSP) | 906 | 77.6 | 2011 |
+| NPU + Flash Attn | 1136 | 77.4 | 1940 |
+| NPU + Fused FFN | 961 | 67.9 | 2226 |
+| **NPU + Flash Attn + Fused FFN** | **1233** | 66.3 | 2196 |
+
+**Key takeaways:**
+- **Best prefill:** NPU + Flash Attn + Fused FFN at **1233 TPS** (1.93x over CPU)
+- **Best decode:** NPU + Flash Attn at **77.4 TPS** (flash attn doesn't affect decode)
+- **Best overall:** NPU + Flash Attn at **1940 ms**
+- **Fused FFN prefill gain:** 1136→1233 TPS (+8.5%) when combined with flash attn
+- **Fused FFN decode cost:** 77.4→66.3 TPS (−14%) due to 3 individual DSP calls
+  per token instead of 2 batched calls
+
+The decode is slower than non-fused (66.3 vs 77.4 TPS) because the fused bridge
+makes 3 individual `gemm_q4_0` calls per token instead of the 2 batched calls
+that non-fused FC layers use. However, the prefill gain (1233 vs 1136 TPS) and
+the architectural simplicity (single layer, no read() override) make this the
+preferred implementation.
+
+The CPU decode alternatives were explored but rejected:
+- `[K,N]` + read() transpose: 75.7 TPS decode but only 507 TPS prefill (no DSP)
+- Dequantize-on-fly: 30 TPS decode (FP32 GEMM too slow)
+
+
+
+
+

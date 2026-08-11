@@ -18,6 +18,8 @@ causallm_per_layer_slice_src_abs = [meson.current_source_dir() / 'per_layer_slic
 causallm_scalar_multiply_src_abs = [meson.current_source_dir() / 'scalar_multiply.cpp']
 causallm_logit_softcapping_src_abs = [meson.current_source_dir() / 'logit_softcapping.cpp']
 causallm_custom_multiply_layer_src_abs = [meson.current_source_dir() / 'custom_multiply.cpp']
+causallm_fused_ffn_src_abs = [meson.current_source_dir() / 'fused_ffn_layer.cpp']
+
 
 causallm_rms_norm = shared_library(
     'rms_norm_layer', 
@@ -245,3 +247,17 @@ causallm_custom_multiply_dep = declare_dependency(
     link_with: causallm_custom_multiply_layer,
     include_directories: causallm_layer_inc
 )
+
+causallm_fused_ffn = shared_library(
+    'fused_ffn_layer',
+    causallm_fused_ffn_src_abs,
+    include_directories: causallm_layer_inc,
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+    install: true,
+    install_dir: application_install_dir
+)
+causallm_fused_ffn_dep = declare_dependency(
+    link_with: causallm_fused_ffn,
+    include_directories: causallm_layer_inc
+)
+

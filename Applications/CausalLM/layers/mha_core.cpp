@@ -89,10 +89,15 @@ flash_attn_fn get_flash_attn_bridge() {
 
 /**
  * @brief Check if flash attention should be used.
- * Only enabled for prefill (step_size > 1) with head_dim=128 (HMX fast path).
+ * Enabled for prefill (step_size > 1) with head_dim a multiple of 64
+ * (HMX fast path). The bridge (nntr_htp_bridge_flash_attn) and the DSP
+ * kernel (hmx_flash_attn_ext in flash-attn-ops.c) both require
+ * head_dim % 64 == 0 — so head_dim=64 (Qwen3-0.6B) and head_dim=128
+ * (Qwen3-4B/8B) are both supported.
  */
 bool should_use_flash_attn(unsigned int step_size, unsigned int head_dim,
                            bool is_prefill) {
+
   static const char *env = std::getenv("NNTR_HEXAGON_FLASH_ATTN");
   bool enabled = (env && std::atoi(env) == 1);
 
@@ -124,11 +129,16 @@ bool should_use_flash_attn(unsigned int step_size, unsigned int head_dim,
     return false;
   }
 
-  if (head_dim != 128) {
+  // HMX requires head_dim to be a multiple of 64. Both the bridge
+  // (nntr_htp_bridge_flash_attn: head_dim % 64 != 0 check) and the DSP kernel
+  // (hmx_flash_attn_ext: k->ne[0] % 64 == 0 check) enforce this.
+  // Qwen3-0.6B has head_dim=64, Qwen3-4B/8B has head_dim=128 — both pass.
+  if (head_dim % 64 != 0 || head_dim == 0) {
     if (verbose)
-      fprintf(stderr, "[FLASH_ATTN] gate: REJECT (head_dim=%u != 128)\n", head_dim);
+      fprintf(stderr, "[FLASH_ATTN] gate: REJECT (head_dim=%u not multiple of 64)\n", head_dim);
     return false;
   }
+
 
   // Log ACCEPT only once per forward pass (first layer)
   static std::atomic<bool> logged_accept{false};

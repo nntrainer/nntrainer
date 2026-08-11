@@ -21,6 +21,7 @@
 #include <thread_manager.h>
 
 #include <tensor.h>
+
 #include <util_func.h>
 
 #include <compute_ops.h>
@@ -817,6 +818,8 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
       }
     }
   } else { // QINT4
+
+
     if (o->supports_gemv_int4_batch_fp32() &&
         input[0]->getMemoryData()->isSVM() &&
         output[0]->getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
@@ -1025,6 +1028,8 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     }
     break;
   }
+
+
 
   default:
     throw std::invalid_argument("Error: unsupported datatype");

@@ -271,31 +271,27 @@ From `Applications/CausalLM/res/qwen3/qwen3-0.6b/config.json`:
 
 ## Future Improvements
 
-### 1. Fused FFN Kernel (Same Pattern as Flash Attention)
+### 1. Fused FFN Kernel ✅ IMPLEMENTED
 
-Extend the flash attention pattern to FFN:
+Fused FFN is now implemented and working for prefill. See
+`FUSED_FFN_IMPLEMENTATION_PLAN.md` for full details.
 
-```cpp
-// nntr-htp-bridge.cpp
-int nntr_htp_bridge_ffn_swiglu(
-    const void* input,      // F16
-    const void* W_gate,     // Q4_0
-    const void* W_up,       // Q4_0
-    const void* W_down,     // Q4_0
-    void* output,           // F16
-    int seq_len, int hidden_dim, int intermediate_dim
-);
+**Benchmark results (318 tokens, Qwen3-0.6B):**
 
-// ffn_layer.cpp (same pattern as mha_core.cpp)
-bool use_fused_ffn = is_inference && seq_len >= FFN_FUSION_MIN_TOKENS;
-if (use_fused_ffn) {
-    nntr_htp_bridge_ffn_swiglu(...);
-} else {
-    // Original CPU path
-}
-```
+| Variant | Prefill TPS | Decode TPS | Total ms |
+|---------|------------|-----------|---------|
+| CPU (4 threads) | 642 | 78.2 | 2134 |
+| NPU (CDSP, existing FC layers) | 946 | 79.0 | 1960 |
+| NPU + Flash Attn | 1140 | 79.4 | 1896 |
+| NPU + Fused FFN | 1043 | 47.6 | 2998 |
+| **NPU + Flash Attn + Fused FFN** | **1247** | 47.7 | 2943 |
 
-**Expected gain:** +15-20% on top of flash attention
+**Prefill:** Flash Attn + Fused FFN achieves 1247 TPS — the best prefill
+performance, 1.32x faster than NPU baseline and 1.94x faster than CPU.
+**Decode:** Fused FFN decode needs optimization (see
+`FUSED_FFN_IMPLEMENTATION_PLAN.md`).
+
+
 
 ### 2. rpcmem Intermediates
 

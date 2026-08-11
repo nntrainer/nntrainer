@@ -27,7 +27,9 @@
 #include <qs4cx_tensor.h>
 #include <rms_norm.h>
 #include <swiglu.h>
+#include <fused_ffn_layer.h>
 #include <tie_word_embedding.h>
+
 
 namespace causallm {
 
@@ -537,6 +539,32 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
 Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
                               Tensor input) {
 
+  // Check if fused FFN is enabled at graph-construction time. When enabled,
+  // the entire FFN (gate + up GEMMs, SwiGLU activation, down GEMM) is
+  // dispatched to the DSP in a single FastRPC call via the bridge's
+  // nntr_htp_bridge_ffn_swiglu(). Weight request order inside FusedFFNLayer
+  // (up, gate, down) matches the existing .bin file layout, so no model
+  // re-quantization is needed.
+  static const char *fused_env = std::getenv("NNTR_HEXAGON_FUSED_FFN");
+  static const bool use_fused =
+    (fused_env && std::atoi(fused_env) == 1);
+
+  if (use_fused) {
+    // Note: no withHexagonEngine — like mha_core, fused_ffn handles its own
+    // DSP dispatch internally via the bridge (nntr_htp_bridge_ffn_swiglu).
+    // Adding engine=cdsp here would make the framework look up the layer in
+    // the cdsp engine context, where custom layers are not registered.
+    LayerHandle fused_ffn(createLayer(
+      "fused_ffn",
+      {withKey("name",
+               "layer" + std::to_string(layer_id) + "_ffn_fused"),
+       withKey("hidden_dim", hidden_dim),
+       withKey("unit", dim), withKey("disable_bias", "true"),
+       withKey("weight_initializer", "ones")}));
+    return fused_ffn(input);
+  }
+
+
   // Up/gate batched into one gate_up_layer: two independent Q4_0 matmuls
   // sharing the same input activation, dispatched together so a Hexagon
   // cDSP ComputeOps can collapse them into one FastRPC round trip
@@ -573,6 +601,7 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   return ffn_down(act);
 }
 
+
 /**
  * @brief Register custom CausalLM layers in the nntrainer app context.
  */
@@ -592,7 +621,10 @@ void Transformer::registerCustomLayers() {
       nntrainer::createLayer<causallm::TieWordEmbedding>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::EmbeddingLayer>);
+    app_context->registerFactory(
+      nntrainer::createLayer<causallm::FusedFFNLayer>);
   });
 }
+
 
 } // namespace causallm

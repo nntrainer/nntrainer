@@ -525,6 +525,10 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       dtype_map[prefix + "_ffn_down"] = fc_dtype;
       // GateUpLayer: up/gate batched into one node (nntrainer/layers/gate_up_layer.h).
       dtype_map[prefix + "_ffn_gateup"] = fc_dtype;
+      // FusedFFNLayer: up/gate/down fused into one node (fused_ffn_layer.h).
+      // Same weight layout (up, gate, down) as the non-fused path.
+      dtype_map[prefix + "_ffn_fused"] = fc_dtype;
+
 
       dtype_map[prefix + "_ffn_output"] = fc_dtype;
 

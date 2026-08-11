@@ -1,7 +1,8 @@
 # Fused FFN Kernel Implementation Plan
 
 **Date:** 2026-08-04
-**Status:** Planning - Not yet implemented
+**Status:** Implemented - Prefill working, decode needs optimization
+
 
 ---
 
@@ -260,3 +261,72 @@ No flexibility loss, same as flash attention pattern.
 | Weight upload overhead | Reuse existing `ensure_uploaded` (already cached) |
 | Intermediate dimension too large for DSP scratch | Check VTCM size, fall back if needed |
 | Correctness | Add `verify_fused_ffn` test (same as verify_flash_attn) |
+
+---
+
+## Benchmark Results (2026-08-04)
+
+**Device:** Snapdragon 8 Gen 3 (SM8650)  
+**Model:** Qwen3-0.6B (28 layers, hidden=1024, intermediate=3072)  
+**Prompt:** 301 tokens (318 after tokenization)  
+**Decode:** 128 tokens  
+
+| Variant | Prefill TPS | Decode TPS | Total ms |
+|---------|------------|-----------|---------|
+| CPU (4 threads) | 642 | 78.2 | 2134 |
+| NPU (CDSP, existing FC layers) | 946 | 79.0 | 1960 |
+| NPU + Flash Attn | 1140 | 79.4 | 1896 |
+| NPU + Fused FFN | 1043 | 47.6 | 2998 |
+| **NPU + Flash Attn + Fused FFN** | **1247** | 47.7 | 2943 |
+
+
+### Analysis
+
+**Prefill:** Fused FFN achieves 1043 TPS — **1.10x faster** than NPU baseline
+(946 TPS) and **1.62x faster** than CPU (642 TPS). The speedup comes from
+reducing 2 FastRPC calls per layer to 1, and eliminating the CPU↔DSP
+round-trip for SwiGLU activation.
+
+**NPU + Flash Attn + Fused FFN** achieves the best prefill at **1247 TPS** —
+combining both optimizations: flash attention fuses attention (Q·K^T + softmax
++ ·V) into one DSP kernel, and fused FFN fuses 3 GEMMs + SwiGLU into one DSP
+call. Together they reduce FastRPC calls per layer from 4 to 2.
+
+**Decode regression:** Fused FFN decode drops from 79.0 → 47.6 TPS.
+**Why decode goes through DSP:** The weights are quantized in HEXAGON's
+q4x4x2 layout (not ARM's q4_0x4), so CPU cannot dequantize them. The
+existing NPU path's FC layers handle decode by using
+`HexagonComputeOps::gemm_q4_0_accel_fp32` which dispatches to DSP even for
+M=1 — but critically, it uses `gemm_q4_0_batch` to batch **all layers'**
+GEMMs into **~2 FastRPC calls** per token.
+
+**Root cause of slowdown:** Our fused FFN layer can't batch across layers
+(each layer is independent), so it does **3 individual `gemm_q4_0` calls
+per layer** = **84 FastRPC calls per token** (vs ~2 for the existing path).
+
+**Timing breakdown:**
+- NPU baseline: 12.7ms/token (2 batched FastRPC calls)
+- Fused FFN:    21.0ms/token (84 individual FastRPC calls)
+- Difference:   8.3ms/token = 82 extra calls × ~0.1ms/call
+
+Each FastRPC round-trip costs ~0.1ms of overhead (kernel context switch +
+rpcmem marshalling). The DSP GEMM compute itself is the same — it's purely
+IPC overhead from not batching.
+
+
+
+### Decode Optimization Path
+
+To fix the decode regression, the decode path should either:
+1. Use `gemm_q4_0_batch` to batch all 3 GEMMs across all 28 layers into one
+   FastRPC call (requires bridge support for batched FFN)
+2. Fall back to the existing FC layer path for decode (M=1) and only use
+   the fused bridge for prefill (M>1) — this requires keeping the original
+   gate_up/swiglu/ffn_down layers alongside the fused layer
+3. Use the fused bridge for decode too (M=1) — the `ffn_swiglu` bridge
+   handles M=1, but has ~100ms overhead per call, making it 10x slower
+   than the existing path
+
+**Current approach:** Option 3 is used (3 separate `gemm_q4_0` calls for
+decode). This works correctly but is slower than the batched path.
+

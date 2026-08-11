@@ -69,7 +69,6 @@ public:
                               unsigned int to, bool training) override;
 
   /**
-  /**
    * @copydoc Layer::calcDerivative(RunLayerContext &context)
    */
   void calcDerivative(RunLayerContext &context) override;
