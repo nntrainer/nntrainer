@@ -253,57 +253,25 @@ inline void Lfm2MoELayer::compute_expert_forward(
   const nntrainer::Tensor &gate_proj, const nntrainer::Tensor &up_proj,
   const nntrainer::Tensor &down_proj, unsigned int hidden_size) {
 
-  const unsigned intermediate_size = gate_proj.width();
-  const unsigned num_tokens = token_assignments.size();
-
-  if (num_tokens == 0)
+  if (token_assignments.empty())
     return;
 
-  nntrainer::TensorDim token_input_dim({1, 1, 1, hidden_size},
-                                       input.getTensorType());
-  nntrainer::TensorDim intermediate_dim({1, 1, 1, intermediate_size},
-                                        input.getTensorType());
-  nntrainer::TensorDim token_output_dim({1, 1, 1, hidden_size},
-                                        input.getTensorType());
+  nntrainer::Tensor expert_output(
+    static_cast<unsigned int>(token_assignments.size()), 1, 1, hidden_size,
+    output.getTensorType());
+  compute_expert_forward_no_critical(input, expert_output, token_assignments,
+                                     gate_proj, up_proj, down_proj,
+                                     hidden_size);
 
-  // Temporary output tensor for this expert to avoid a critical section
-  nntrainer::Tensor expert_output(output.batch(), output.channel(),
-                                  output.height(), output.width(),
-                                  output.getTensorType());
-  expert_output.setZero();
-
-  for (size_t i = 0; i < num_tokens; ++i) {
-    const unsigned token_idx = token_assignments[i].first;
-    const float weight = token_assignments[i].second;
-
-    size_t token_offset = token_idx * hidden_size;
-    nntrainer::Tensor token_input =
-      input.getSharedDataTensor(token_input_dim, token_offset, true);
-
-    nntrainer::Tensor gate_out(intermediate_dim);
-    nntrainer::Tensor acti_out(intermediate_dim);
-    nntrainer::Tensor up_out(intermediate_dim);
-
-    // Gate and up projections followed by fused SIMD SwiGLU.
-    token_input.dot(gate_proj, gate_out);
-    token_input.dot(up_proj, up_out);
-    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
-                      gate_out.getData<float>(), up_out.getData<float>());
-
-    // Down projection
-    nntrainer::Tensor token_expert_output(token_output_dim);
-    acti_out.dot(down_proj, token_expert_output);
-
-    // Apply routing weight and accumulate to this expert's temporary output
-    token_expert_output.multiply_i(weight);
-    size_t output_offset = token_idx * hidden_size;
-    nntrainer::Tensor token_output =
-      expert_output.getSharedDataTensor(token_output_dim, output_offset, true);
-
-    token_output.add_i(token_expert_output);
+  nntrainer::TensorDim token_step_dim({1, 1, 1, hidden_size},
+                                      output.getTensorType());
+  for (size_t i = 0; i < token_assignments.size(); ++i) {
+    nntrainer::Tensor token_output = output.getSharedDataTensor(
+      token_step_dim, token_assignments[i].first * hidden_size, true);
+    nntrainer::Tensor expert_token_output =
+      expert_output.getSharedDataTensor(token_step_dim, i * hidden_size, true);
+    token_output.add_i(expert_token_output);
   }
-
-  output.add_i(expert_output);
 }
 
 inline void Lfm2MoELayer::compute_expert_forward_no_critical(
@@ -318,39 +286,54 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
   if (num_tokens == 0)
     return;
 
-  nntrainer::TensorDim token_input_dim({1, 1, 1, hidden_size},
+  nntrainer::TensorDim token_input_dim({1, 1, num_tokens, hidden_size},
                                        input.getTensorType());
-  nntrainer::TensorDim intermediate_dim({1, 1, 1, intermediate_size},
+  nntrainer::TensorDim intermediate_dim({1, 1, num_tokens, intermediate_size},
                                         input.getTensorType());
-  nntrainer::TensorDim token_output_dim({1, 1, 1, hidden_size},
-                                        input.getTensorType());
+  nntrainer::TensorDim token_step_dim({1, 1, 1, hidden_size},
+                                      input.getTensorType());
 
-  for (size_t i = 0; i < num_tokens; ++i) {
-    const unsigned token_idx = token_assignments[i].first;
-    const float weight = token_assignments[i].second;
+  nntrainer::Tensor token_input;
+  if (num_tokens == 1) {
+    token_input = input.getSharedDataTensor(
+      token_input_dim, token_assignments[0].first * hidden_size, true);
+  } else {
+    token_input = nntrainer::Tensor(token_input_dim);
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
+      nntrainer::Tensor source = input.getSharedDataTensor(
+        token_step_dim, token_assignments[i].first * hidden_size, true);
+      nntrainer::Tensor target =
+        token_input.getSharedDataTensor(token_step_dim, i * hidden_size, true);
+      target.copyData(source);
+    });
+  }
 
-    size_t token_offset = token_idx * hidden_size;
-    nntrainer::Tensor token_input =
-      input.getSharedDataTensor(token_input_dim, token_offset, true);
+  nntrainer::Tensor gate_out(intermediate_dim);
+  nntrainer::Tensor acti_out(intermediate_dim);
+  nntrainer::Tensor up_out(intermediate_dim);
+  token_input.dot(gate_proj, gate_out);
+  token_input.dot(up_proj, up_out);
 
-    nntrainer::Tensor gate_out(intermediate_dim);
-    nntrainer::Tensor acti_out(intermediate_dim);
-    nntrainer::Tensor up_out(intermediate_dim);
-
-    token_input.dot(gate_proj, gate_out);
-    token_input.dot(up_proj, up_out);
+  if (num_tokens == 1) {
     nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
                       gate_out.getData<float>(), up_out.getData<float>());
+  } else {
+    auto &tm = nntrainer::ThreadManager::Global();
+    tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
+      const unsigned int offset = acti_out.getIndex(0, 0, i, 0);
+      nntrainer::swiglu(acti_out.width(), acti_out.getData<float>() + offset,
+                        gate_out.getData<float>() + offset,
+                        up_out.getData<float>() + offset);
+    });
+  }
 
-    nntrainer::Tensor token_expert_output(token_output_dim);
-    acti_out.dot(down_proj, token_expert_output);
+  acti_out.dot(down_proj, expert_output);
 
-    token_expert_output.multiply_i(weight);
-    size_t output_offset = token_idx * hidden_size;
-    nntrainer::Tensor token_output =
-      expert_output.getSharedDataTensor(token_output_dim, output_offset, true);
-
-    token_output.add_i(token_expert_output);
+  for (size_t i = 0; i < num_tokens; ++i) {
+    nntrainer::Tensor expert_token_output =
+      expert_output.getSharedDataTensor(token_step_dim, i * hidden_size, true);
+    expert_token_output.multiply_i(token_assignments[i].second);
   }
 }
 
@@ -405,33 +388,16 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     buildExpertAssignments(router_logits, expert_bias, total_tokens,
                            expert_assignments);
 
-    std::vector<nntrainer::Tensor> expert_outputs(num_experts);
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      if (!expert_assignments[expert_idx].empty()) {
-        expert_outputs[expert_idx] = nntrainer::Tensor(
-          total_tokens, 1, 1, hidden_size, output.getTensorType());
-        expert_outputs[expert_idx].setZero();
-      }
-    }
-
     for (unsigned int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
       const auto &assignments = expert_assignments[expert_idx];
       if (assignments.empty())
         continue;
 
-      compute_expert_forward_no_critical(
-        input, expert_outputs[expert_idx], assignments,
+      compute_expert_forward(
+        input, output, assignments,
         context.getWeight(expert_gate_proj_indices[expert_idx]),
         context.getWeight(expert_up_proj_indices[expert_idx]),
         context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-    }
-
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      if (!expert_assignments[expert_idx].empty()) {
-        output.add_i(expert_outputs[expert_idx]);
-      }
     }
 
     // reshape output: [B*S,1,1,H] -> [B,1,S,H]

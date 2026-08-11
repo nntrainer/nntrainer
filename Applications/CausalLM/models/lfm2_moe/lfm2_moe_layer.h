@@ -164,7 +164,7 @@ private:
     std::vector<std::vector<std::pair<unsigned, float>>> &expert_assignments);
 
   /**
-   * @brief expert forward computation without memory copies
+   * @brief Run one expert as a token batch and stream its compact output
    * @param input Input tensor (reshaped to [total_tokens, 1, 1, hidden_size])
    * @param output Output tensor to accumulate results
    * @param token_assignments Vector of (token_index, weight) pairs for this
@@ -181,9 +181,9 @@ private:
     const nntrainer::Tensor &down_proj, unsigned int hidden_size);
 
   /**
-   * @brief expert forward computation without critical section
+   * @brief Compute weighted expert output in assignment order
    * @param input Input tensor (reshaped to [total_tokens, 1, 1, hidden_size])
-   * @param expert_output Expert-specific output tensor
+   * @param expert_output Compact expert output in assignment order
    * @param token_assignments Vector of (token_index, weight) pairs for this
    * expert
    * @param gate_proj Gate projection weight tensor
