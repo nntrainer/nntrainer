@@ -9,7 +9,7 @@
  * @author SeungHui Lee <shsh1004.lee@samsung.com>
  * @bug    No known bugs except for NYI items
  *
- * Ported from the doc13 §3a measurement bench's ring_push2d/ring_drain,
+ * Ported from the measurement bench's ring_push2d/ring_drain,
  * itself lifted from llama.cpp ggml-hexagon's dma-queue.{c,h}. Behaviour is
  * unchanged; only the names are de-abbreviated and the file stands alone so
  * both the u8i4 and (later) u8i8 matmul modules can share one ring.

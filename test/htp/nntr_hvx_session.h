@@ -20,9 +20,9 @@
 /**
  * @brief State held for the lifetime of one nntr_hvx_open()/close() pair.
  *
- * hw_init and the HMX lock happen once in open() rather than per call (doc15
- * §3/§4): every FastRPC entry point in this file reaches its VTCM arena and
- * weight table through the session instead of re-acquiring either. This
+ * hw_init and the HMX lock happen once in open() rather than per call:
+ * every FastRPC entry point in this skel reaches its VTCM arena and weight
+ * table through the session instead of re-acquiring either. This
  * assumes one open session at a time -- hexkl_micro_hw_init is a singleton
  * DSP resource, so a second concurrent open would contend for the same VTCM
  * arena and HMX lock. nntrainer opens exactly one HTP session per process,

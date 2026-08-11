@@ -624,10 +624,10 @@ TEST_F(HmxMmU8I4Layer, MismatchedKIsRejected) {
 /**
  * @brief Per-call cost of the harness endpoint against the layer endpoint.
  *
- * Printed, never asserted. doc13 §3a measured 1.7-2x for cross-matmul
- * prefetch on a V79, but that was inside a standalone DSP program with no
- * FastRPC in the timed region, and thermal state moves these numbers
- * between runs -- a threshold here would encode the lab conditions rather
+ * Printed, never asserted. Cross-matmul prefetch measured 1.7-2x on a
+ * V79, but that was inside a standalone DSP program with no FastRPC in the
+ * timed region, and thermal state moves these numbers between runs -- a
+ * threshold here would encode the lab conditions rather
  * than a property of the code. Read the ratio, do not gate on it.
  */
 TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
@@ -682,8 +682,8 @@ TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
             << std::endl;
 
   // Several weights per call is where the prefetch has something to hide
-  // behind; x1 above cannot show it by construction (doc13 §3a: a single
-  // matmul is parity).
+  // behind; x1 above cannot show it by construction -- with a single
+  // matmul there is nothing to overlap the transfer with, so it is parity.
   std::vector<Weight> ws(4);
   std::vector<uint32_t> hs;
   uint32_t n_total = 0;

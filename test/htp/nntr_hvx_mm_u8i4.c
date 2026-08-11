@@ -33,8 +33,8 @@
  *        is checkable. Used by unittest_hvx_mm_u8i4's fixed shapes.
  *
  * hw_init and the HMX lock are session-scoped (nntr_hvx_open), not per
- * call, since doc15 §8 item 3 turned this from a call that stood alone into
- * one of several entry points sharing one session. The weight is still
+ * call, since the layer endpoint below turned this from a call that stood
+ * alone into one of several entry points sharing one session. The weight is still
  * baked fresh every call -- that is the point of this harness, checking the
  * bake -- unlike the resident-weight path in mm_u8i4_layer below.
  */
@@ -126,8 +126,8 @@ int nntr_hvx_weight_release_u8i4(remote_handle64 handle, uint32 w_handle) {
 /**
  * @brief Runs a layer's worth of matmuls (Q/K/V, or gate/up) against one
  *        shared activation -- see hexkl_mm_u8i4_dma.h. This is the entry
- *        point PR③'s ComputeOps seam will call; nntr_hvx_mm_u8i4_from_f32
- *        above stays the accuracy harness.
+ *        point nntrainer's ComputeOps seam will call once it is wired up;
+ *        nntr_hvx_mm_u8i4_from_f32 above stays the accuracy harness.
  */
 int nntr_hvx_mm_u8i4_layer(remote_handle64 handle, uint32 M, uint32 K,
                            const uint32 *w_handles, int w_handlesLen,

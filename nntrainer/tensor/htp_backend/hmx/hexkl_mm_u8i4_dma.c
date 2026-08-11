@@ -26,8 +26,9 @@
 #define ROUND_UP_U32(v, a) HEXKL_ROUND_UP_U32(v, a)
 #define WEIGHT_TILE_BYTES_U8I4 HEXKL_WEIGHT_TILE_BYTES_I4
 #define ACC_TILE_BYTES HEXKL_ACC_TILE_BYTES
-/** @brief Largest single DMA row HexKL/HVX will move correctly; rows above
- *         this size have a documented hardware bug (doc13 §3a, §5). */
+/** @brief Largest single DMA row the engine will move correctly. Rows
+ *         above 256 KB hit a known hardware erratum, so a transfer is
+ *         chunked into rows at or below this size. */
 #define MAX_DMA_ROW_BYTES 262144u
 
 static uint32_t dma_row_size_dividing(uint32_t total_bytes) {
@@ -228,7 +229,7 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     const uint32_t wcur = wbuf[i & 1u];
 
     if (i + 1 < n_handles) {
-      // Cross-matmul prefetch (doc13 §3a): while handle i computes below,
+      // Cross-matmul prefetch: while handle i computes below,
       // stream handle i+1's weight into the OTHER buffer in the
       // background. One transfer, chunked under the >512KB-row DMA bug's
       // threshold, not one per tile.

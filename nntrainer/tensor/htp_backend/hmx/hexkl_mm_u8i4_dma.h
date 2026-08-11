@@ -10,12 +10,12 @@
  * @bug    No known bugs except for NYI items
  *
  * Turns hexkl_mm_u8i4's accuracy-harness building blocks (plan / bake /
- * run, one matmul at a time, weight baked fresh every call) into the
- * performance path doc15 §4/§8 item 3 describes: a weight is baked once
- * and kept DSP-resident until released, and a "layer" of matmuls that share
- * one activation (Q/K/V, or gate/up) runs back to back with the next
- * weight prefetched into VTCM while the current one computes -- the
- * cross-matmul win measured in doc13 §3a (1.7-2x over SDKL on V79).
+ * run, one matmul at a time, weight baked fresh every call) into a
+ * performance path: a weight is baked once and kept DSP-resident until
+ * released, and a "layer" of matmuls that share one activation (Q/K/V, or
+ * gate/up) runs back to back with the next weight prefetched into VTCM
+ * while the current one computes. That cross-matmul overlap measured
+ * 1.7-2x over SDKL on V79.
  */
 
 #ifndef __NNTRAINER_HEXKL_MM_U8I4_DMA_H__
