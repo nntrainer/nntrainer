@@ -8,6 +8,7 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
  * @author Pranjal Thapliyal <p.thapliyal@samsung.com>
+ * @author Sumon Nath <sumon.nath@samsung.com>
  * @bug    No known bugs except for NYI items
  * @note   This transformer.h constructs a class for Transformer model which can
  * be a parent of CausalLM and Encoder models with transformer structure.
@@ -312,6 +313,32 @@ public:
    *        completed.
    */
   ml::train::RunStats getValidStats();
+
+  /**
+   * @brief Load a pretrained (non-LoRA) base checkpoint into a graph that
+   *        has LoRA weights (loraA/loraB) allocated, then optionally
+   *        overlay a previously saved LoRA adapter.
+   * @details The base checkpoint predates LoRA and was saved without
+   *          loraA/loraB, so the ordinary load_weight() (positional,
+   *          sequential read matching the *current* graph's weight list)
+   *          would desync as soon as it reached the first LoRA-bearing
+   *          layer. Instead this builds a throwaway LoRA-free copy of the
+   *          graph, loads the base checkpoint into that with the ordinary
+   *          (already-correct) loader, and copies each matching weight by
+   *          name into this model — names with no match (loraA/loraB) are
+   *          left at their freshly-initialized values.
+   * @param base_path path to the pretrained (non-LoRA) checkpoint
+   * @param lora_path optional path to a previously saved LoRA adapter
+   *        (from save_weight_lora()); pass an empty string to skip
+   */
+  virtual void load_weight_lora(const std::string &base_path,
+                               const std::string &lora_path = "");
+
+  /**
+   * @brief Save only the loraA/loraB weights (raw FP32) to a file.
+   * @param lora_path output path for the adapter file
+   */
+  virtual void save_weight_lora(const std::string &lora_path);
 
   /**
    * @brief Visit each layer in the compiled model (passthrough to

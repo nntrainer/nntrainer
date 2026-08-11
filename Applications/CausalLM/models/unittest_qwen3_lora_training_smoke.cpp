@@ -169,3 +169,99 @@ TEST(Qwen3LoraTrainingSmoke, TrainableFlagsMatchLoraFreezePolicy) {
   }
 }
 
+/** @brief Read every FP32 weight's first element, keyed by weight name. */
+std::map<std::string, float> snapshotFirstElements(causallm::Qwen3CausalLM &m) {
+  std::map<std::string, float> out;
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [&out](ml::train::Layer &, nntrainer::RunLayerContext &context,
+               void *) {
+      for (unsigned int i = 0; i < context.getNumWeights(); ++i) {
+        auto &w = context.getWeight(i);
+        if (w.getDataType() == ml::train::TensorDim::DataType::FP32)
+          out[w.getName()] = w.getData<float>()[0];
+      }
+    };
+  m.forEachLayer(fn, nullptr);
+  return out;
+}
+
+TEST(Qwen3LoraTrainingSmoke, TrainsAFewStepsAndSaveLoadLoraRoundTrips) {
+  auto cfg = makeTinyQwen3Config();
+  auto generation_cfg = makeTinyGenerationConfig();
+
+  // Step 1: build a plain (no-LoRA) model, initialize (random init, no
+  // pretrained checkpoint available in this synthetic test), and save it as
+  // the "base checkpoint" that load_weight_lora() will read back.
+  auto base_nntr_cfg = makeTinyNntrainerConfig(/*lora_rank=*/0);
+  causallm::Qwen3CausalLM base_model(cfg, generation_cfg, base_nntr_cfg);
+  ASSERT_NO_THROW(base_model.initialize());
+  const auto base_path =
+    (std::filesystem::temp_directory_path() / "nntrainer_qwen3_base_smoke.bin")
+      .string();
+  ASSERT_NO_THROW(base_model.save_weight(base_path));
+  auto base_snapshot = snapshotFirstElements(base_model);
+
+  // Step 2: build the LoRA training model, train a few steps so loraA/loraB
+  // move away from their initial (zero/LeCun-normal) values, then save just
+  // the LoRA adapter.
+  auto lora_nntr_cfg = makeTinyNntrainerConfig(/*lora_rank=*/4);
+  causallm::Qwen3CausalLM lora_model(cfg, generation_cfg, lora_nntr_cfg);
+  ASSERT_NO_THROW(lora_model.initializeForTraining(/*lr=*/1e-2f, /*epochs=*/1));
+
+  SyntheticDataGen gen{/*seq_len=*/4, /*vocab_size=*/32};
+  std::shared_ptr<ml::train::Dataset> dataset = ml::train::createDataset(
+    ml::train::DatasetType::GENERATOR, datasetCb, &gen);
+  ASSERT_NO_THROW(
+    lora_model.setDataset(ml::train::DatasetModeType::MODE_TRAIN, dataset));
+  ASSERT_NO_THROW(
+    lora_model.setDataset(ml::train::DatasetModeType::MODE_VALID, dataset));
+  ASSERT_NO_THROW(lora_model.train());
+
+  auto stats = lora_model.getTrainingStats();
+  EXPECT_GT(stats.loss, 0.0f);
+
+  const auto lora_path =
+    (std::filesystem::temp_directory_path() / "nntrainer_qwen3_lora_smoke.bin")
+      .string();
+  ASSERT_NO_THROW(lora_model.save_weight_lora(lora_path));
+  auto trained_lora_snapshot = snapshotFirstElements(lora_model);
+
+  // Step 3: fresh LoRA model, load_weight_lora(base, lora), and verify (a)
+  // its base weights now match the base checkpoint (not fresh random init),
+  // and (b) its loraA/loraB weights now match what was just saved (not
+  // fresh zero/LeCun-normal init).
+  auto reloaded_nntr_cfg = makeTinyNntrainerConfig(/*lora_rank=*/4);
+  causallm::Qwen3CausalLM reloaded_model(cfg, generation_cfg,
+                                         reloaded_nntr_cfg);
+  ASSERT_NO_THROW(
+    reloaded_model.initializeForTraining(/*lr=*/1e-2f, /*epochs=*/1));
+  ASSERT_NO_THROW(reloaded_model.load_weight_lora(base_path, lora_path));
+
+  auto reloaded_snapshot = snapshotFirstElements(reloaded_model);
+
+  unsigned int base_matches = 0, lora_matches = 0;
+  for (const auto &[name, value] : reloaded_snapshot) {
+    bool is_lora = name.find(":loraA") != std::string::npos ||
+                  name.find(":loraB") != std::string::npos;
+    if (is_lora) {
+      auto it = trained_lora_snapshot.find(name);
+      if (it != trained_lora_snapshot.end() &&
+          std::abs(it->second - value) < 1e-6f)
+        ++lora_matches;
+    } else {
+      auto it = base_snapshot.find(name);
+      if (it != base_snapshot.end() && std::abs(it->second - value) < 1e-6f)
+        ++base_matches;
+    }
+  }
+
+  EXPECT_GT(base_matches, 0u)
+    << "expected at least one base weight to match the base checkpoint after "
+       "load_weight_lora()";
+  EXPECT_GT(lora_matches, 0u)
+    << "expected at least one loraA/loraB weight to match the saved adapter "
+       "after load_weight_lora()";
+
+  std::filesystem::remove(base_path);
+  std::filesystem::remove(lora_path);
+}

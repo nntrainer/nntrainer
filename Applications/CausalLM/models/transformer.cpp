@@ -7,6 +7,7 @@
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
  * @author Pranjal Thapliyal <p.thapliyal@samsung.com>
+ * @author Sumon Nath <sumon.nath@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This file defines Transformer's basic actions
  */
@@ -342,6 +343,146 @@ void Transformer::forEachLayer(
     fn,
   void *user_data) {
   model->forEachLayer(fn, user_data);
+}
+
+/**
+ * @brief Save only the loraA/loraB weights (raw FP32) to a file.
+ */
+void Transformer::save_weight_lora(const std::string &lora_path) {
+  std::ofstream file(lora_path, std::ios::binary);
+  NNTR_THROW_IF(!file.is_open(), std::runtime_error)
+    << "Failed to open lora output file: " << lora_path;
+
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [&file](ml::train::Layer &l, nntrainer::RunLayerContext &context,
+                 void *) {
+      if (l.getType() != "fully_connected")
+        return;
+      for (auto &w : context.getWeights()) {
+        const std::string &name = w->getName();
+        if (name.find(":loraA") != std::string::npos ||
+            name.find(":loraB") != std::string::npos)
+          w->getVariableRef().save(file);
+      }
+    };
+  model->forEachLayer(fn, nullptr);
+}
+
+/**
+ * @brief Load a pretrained (non-LoRA) base checkpoint into a graph that has
+ *        LoRA weights, then optionally overlay a saved LoRA adapter.
+ */
+void Transformer::load_weight_lora(const std::string &base_path,
+                                   const std::string &lora_path) {
+  NNTR_THROW_IF(!is_initialized, std::runtime_error)
+    << "Transformer model is not initialized. Please call "
+       "initializeForTraining() before load_weight_lora().";
+
+  // Step 1: build a throwaway copy of the graph that is byte-for-byte the
+  // graph the checkpoint was written from, and load the base checkpoint into
+  // it with the ordinary (already-correct) loader.
+  //
+  // This must match the *inference* topology exactly, not just be LoRA-free:
+  // NeuralNetwork::load() walks the graph in sorted order and hands each
+  // weight a sequential file offset, so any change to the node set shifts
+  // every subsequent offset. In particular FOR_TRAINING must be off here,
+  // otherwise createAttention() omits the per-layer KV-cache `input`
+  // placeholder nodes and the weights silently load into the wrong layers.
+  const unsigned int saved_lora_rank = LORA_RANK;
+  const bool saved_for_training = FOR_TRAINING;
+  LORA_RANK = 0;
+  FOR_TRAINING = false;
+
+  auto restore_graph_flags = [&]() {
+    LORA_RANK = saved_lora_rank;
+    FOR_TRAINING = saved_for_training;
+  };
+
+  ModelHandle base_model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
+  base_model->setProperty(
+    {withKey("batch_size", BATCH_SIZE), withKey("epochs", "1"),
+     withKey("model_tensor_type", MODEL_TENSOR_TYPE)});
+  auto [bx, by] = constructModel();
+  // compile(Tensor, Tensor, mode) internally compiles + initializes.
+  if (base_model->compile(bx, by, ml::train::ExecutionMode::INFERENCE)) {
+    restore_graph_flags();
+    throw std::invalid_argument(
+      "Base (no-LoRA) model compilation failed during load_weight_lora.");
+  }
+  base_model->load(base_path, formatFromExtension(base_path));
+
+  restore_graph_flags();
+
+  // Step 2: index the base model's weights by their (layer-prefixed) name.
+  //
+  // Deliberately stores POINTERS into base_model rather than clones: cloning
+  // every weight would hold a third full copy of the model in memory (on top
+  // of base_model and this model) and roughly triples peak RSS on a
+  // multi-GB checkpoint. base_model outlives the copy below, so borrowing is
+  // safe.
+  std::unordered_map<std::string, const nntrainer::Tensor *> base_weights;
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    collect = [&base_weights](ml::train::Layer &, nntrainer::RunLayerContext &context,
+                              void *) {
+      for (auto &w : context.getWeights())
+        base_weights.emplace(w->getName(), &w->getVariableRef());
+    };
+  base_model->forEachLayer(collect, nullptr);
+
+  // Step 3: copy every matching weight (by name) into this model. Only
+  // loraA/loraB are expected to go unmatched (they do not exist in a
+  // pretrained checkpoint); anything else unmatched means the two graphs
+  // disagree and the model would silently train from random weights, so
+  // fail loudly instead.
+  std::vector<std::string> unmatched;
+  unsigned int matched = 0;
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    apply = [&](ml::train::Layer &, nntrainer::RunLayerContext &context,
+                void *) {
+      for (auto &w : context.getWeights()) {
+        const std::string &name = w->getName();
+        auto it = base_weights.find(name);
+        if (it != base_weights.end()) {
+          w->getVariableRef().copyData(*it->second);
+          ++matched;
+        } else if (name.find(":loraA") == std::string::npos &&
+                   name.find(":loraB") == std::string::npos) {
+          unmatched.push_back(name);
+        }
+      }
+    };
+  model->forEachLayer(apply, nullptr);
+
+  NNTR_THROW_IF(!unmatched.empty(), std::runtime_error)
+    << "load_weight_lora: " << unmatched.size()
+    << " non-LoRA weight(s) had no counterpart in the base checkpoint graph "
+       "(first: "
+    << unmatched.front()
+    << "). The base graph must match the graph the checkpoint was saved "
+       "from.";
+  NNTR_THROW_IF(matched == 0, std::runtime_error)
+    << "load_weight_lora: no weights were loaded from " << base_path;
+
+  // Step 4: overlay a previously saved LoRA adapter, if given.
+  if (!lora_path.empty()) {
+    std::ifstream lora_file(lora_path, std::ios::binary);
+    NNTR_THROW_IF(!lora_file.is_open(), std::runtime_error)
+      << "Failed to open lora file: " << lora_path;
+
+    std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+      load_lora = [&lora_file](ml::train::Layer &l,
+                               nntrainer::RunLayerContext &context, void *) {
+        if (l.getType() != "fully_connected")
+          return;
+        for (auto &w : context.getWeights()) {
+          const std::string &name = w->getName();
+          if (name.find(":loraA") != std::string::npos ||
+              name.find(":loraB") != std::string::npos)
+            w->getVariableRef().read(lora_file);
+        }
+      };
+    model->forEachLayer(load_lora, nullptr);
+  }
 }
 
 /**
