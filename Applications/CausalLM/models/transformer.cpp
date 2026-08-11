@@ -14,6 +14,8 @@
  */
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <mutex>
@@ -27,7 +29,9 @@
 #include <tokenizers_cpp.h>
 #include <transformer.h>
 
+#include <cpu_backend.h>
 #include <embedding_layer.h>
+#include <fc_layer.h>
 #include <mha_core.h>
 #include <neuralnet.h>
 #include <qs4cx_tensor.h>
@@ -485,6 +489,213 @@ void Transformer::load_weight_lora(const std::string &base_path,
       };
     model->forEachLayer(load_lora, nullptr);
   }
+}
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Q4_0 helpers (block = 32 elements, 18 bytes: 2B FP16 scale + 16B nibbles)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Build repacked Q4_0 bytes from an FP32 weight stored in nntrainer's
+ *        (K, N) layout. Mirrors GgmlQuantizer's own pipeline: transpose
+ *        K x N -> N x K, then quantize_q4_0, then repack_q4_0. The repacked
+ *        format is required by the W4A8 GEMM kernel.
+ */
+std::vector<uint8_t> build_q4_0_natural(const float *data_KN, size_t K,
+                                        size_t N) {
+  std::vector<float> transposed(N * K);
+  for (size_t n = 0; n < N; ++n)
+    for (size_t k = 0; k < K; ++k)
+      transposed[n * K + k] = data_KN[k * N + n];
+
+  size_t out_size = (N * K / 32) * 18;
+  std::vector<uint8_t> tmp(out_size);
+  nntrainer::quantize_q4_0(transposed.data(), tmp.data(), (int64_t)N,
+                          (int64_t)K, nullptr);
+
+  std::vector<uint8_t> out(out_size);
+  nntrainer::repack_q4_0(out.data(), tmp.data(), out_size, (unsigned int)N,
+                        (unsigned int)K);
+  return out;
+}
+
+/** Minimal FP32 -> FP16 conversion for writing Q4_0 block scale fields. */
+uint16_t q40_fp32_to_fp16(float v) {
+  union {
+    float f;
+    uint32_t u;
+  } x{v};
+  const uint32_t s = (x.u >> 16) & 0x8000u;
+  const int e = ((x.u >> 23) & 0xFFu) - 127 + 15;
+  const uint32_t m = x.u & 0x7FFFFFu;
+  if (e <= 0)
+    return (uint16_t)s;
+  if (e >= 31)
+    return (uint16_t)(s | 0x7C00u);
+  return (uint16_t)(s | ((uint32_t)e << 10) | (m >> 13));
+}
+
+/**
+ * @brief Build repacked Q4_0 bytes using pre-specified per-block EMA scales
+ *        (force-feed), instead of recomputing a natural per-block scale
+ *        from the data. block_d_NK must be indexed in N x K layout -- the
+ *        same layout FullyConnectedLayer::fakeQuantizeQ4_0 tracks -- so the
+ *        saved adapter matches exactly what training quantized against.
+ *        Output format matches build_q4_0_natural exactly.
+ */
+std::vector<uint8_t> build_q4_0_forced_blocks(const float *data_KN, size_t K,
+                                              size_t N,
+                                              const std::vector<float> &block_d_NK) {
+  std::vector<float> transposed(N * K);
+  for (size_t n = 0; n < N; ++n)
+    for (size_t k = 0; k < K; ++k)
+      transposed[n * K + k] = data_KN[k * N + n];
+
+  const size_t num_blocks = N * K / 32;
+  const size_t out_size = num_blocks * 18;
+  std::vector<uint8_t> tmp(out_size, 0);
+
+  for (size_t b = 0; b < num_blocks; ++b) {
+    const float *blk_data = transposed.data() + b * 32;
+    float d = (b < block_d_NK.size() && block_d_NK[b] > 1e-10f)
+                ? block_d_NK[b]
+                : 1.0f;
+
+    uint16_t d_fp16 = q40_fp32_to_fp16(d);
+    uint8_t *blk = tmp.data() + b * 18;
+    std::memcpy(blk, &d_fp16, 2);
+
+    // Q4_0: quant stored as q+8 in [0,15]; lower nibble = elem[j], upper =
+    // elem[j+16].
+    for (int j = 0; j < 16; ++j) {
+      int q0 = (int)std::round(blk_data[j] / d) + 8;
+      int q1 = (int)std::round(blk_data[j + 16] / d) + 8;
+      q0 = std::max(0, std::min(15, q0));
+      q1 = std::max(0, std::min(15, q1));
+      blk[2 + j] = (uint8_t)((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+    }
+  }
+
+  std::vector<uint8_t> out(out_size);
+  nntrainer::repack_q4_0(out.data(), tmp.data(), out_size, (unsigned)N,
+                        (unsigned)K);
+  return out;
+}
+
+} // namespace
+
+/**
+ * @brief Save LoRA adapters as Q4_0. When LORA_QAT calibrated per-block EMA
+ *        scales during training, force-feed them; otherwise fall back to a
+ *        natural (recomputed) per-block scale, i.e. plain PTQ.
+ */
+void Transformer::save_weight_lora_q4(const std::string &path) {
+  NNTR_THROW_IF(!is_initialized, std::runtime_error)
+    << "Model not initialized before save_weight_lora_q4().";
+
+  std::ofstream f(path, std::ios::binary);
+  NNTR_THROW_IF(!f.is_open(), std::runtime_error)
+    << "Failed to open " << path << " for writing.";
+
+  size_t total_blocks = 0;
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [&](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
+      if (l.getType() != "fully_connected")
+        return;
+      const std::string lname = l.getName();
+
+      for (auto &w : context.getWeights()) {
+        const std::string &wname = w->getName();
+        const bool is_loraA = wname.find(":loraA") != std::string::npos;
+        const bool is_loraB = wname.find(":loraB") != std::string::npos;
+        if (!is_loraA && !is_loraB)
+          continue;
+
+        const nntrainer::Tensor &t = w->getVariableRef();
+        const size_t K = t.getDim().height();
+        const size_t N = t.getDim().width();
+        const uint32_t total_elems = static_cast<uint32_t>(K * N);
+
+        // QAT: force-feed the EMA block scales (N x K layout) calibrated
+        // during training. Non-QAT: fall back to natural (PTQ) scales.
+        std::vector<uint8_t> q4_bytes;
+        if (LORA_QAT) {
+          auto [a_bd, b_bd] =
+            nntrainer::FullyConnectedLayer::getRegisteredBlockScales(lname);
+          const std::vector<float> &block_d = is_loraA ? a_bd : b_bd;
+          q4_bytes = block_d.empty()
+                       ? build_q4_0_natural(t.getData<float>(), K, N)
+                       : build_q4_0_forced_blocks(t.getData<float>(), K, N,
+                                                  block_d);
+        } else {
+          q4_bytes = build_q4_0_natural(t.getData<float>(), K, N);
+        }
+
+        f.write(reinterpret_cast<const char *>(&total_elems),
+               sizeof(total_elems));
+        f.write(reinterpret_cast<const char *>(q4_bytes.data()),
+               q4_bytes.size());
+        total_blocks += q4_bytes.size() / 18;
+      }
+    };
+  model->forEachLayer(fn, nullptr);
+
+  std::cout << "[save_weight_lora_q4] Saved Q4_0 LoRA adapters to " << path
+            << " (" << total_blocks << " blocks, " << (total_blocks * 18 / 1024)
+            << " KB)" << std::endl;
+}
+
+/**
+ * @brief Load a pretrained (non-LoRA) base checkpoint, then load Q4_0 LoRA
+ *        adapters directly into Q4_0-dtype loraA/loraB tensors.
+ */
+void Transformer::load_weight_lora_q4(const std::string &base_path,
+                                      const std::string &lora_q4_path) {
+  load_weight(base_path);
+
+  std::ifstream f(lora_q4_path, std::ios::binary);
+  NNTR_THROW_IF(!f.is_open(), std::runtime_error)
+    << "Failed to open Q4_0 LoRA file: " << lora_q4_path;
+
+  std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
+    fn = [&](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
+      if (l.getType() != "fully_connected")
+        return;
+
+      for (auto &w : context.getWeights()) {
+        const std::string &wname = w->getName();
+        if (wname.find(":loraA") == std::string::npos &&
+            wname.find(":loraB") == std::string::npos)
+          continue;
+
+        uint32_t n = 0;
+        f.read(reinterpret_cast<char *>(&n), sizeof(n));
+        NNTR_THROW_IF(!f, std::runtime_error)
+          << "load_weight_lora_q4: failed reading element count at '"
+          << wname << "'";
+
+        const uint32_t expected =
+          static_cast<uint32_t>(w->getVariableRef().getDim().getDataLen());
+        NNTR_THROW_IF(n != expected, std::runtime_error)
+          << "load_weight_lora_q4: element count mismatch for '" << wname
+          << "': file=" << n << " model=" << expected;
+
+        // Write the repacked Q4_0 bytes directly into the Q4_0 tensor
+        // buffer.
+        const size_t block_bytes = (n / 32) * 18;
+        f.read(reinterpret_cast<char *>(w->getVariableRef().getData<char>()),
+              block_bytes);
+        NNTR_THROW_IF(!f, std::runtime_error)
+          << "load_weight_lora_q4: failed reading Q4_0 data for '" << wname
+          << "'";
+      }
+    };
+  model->forEachLayer(fn, nullptr);
+
+  std::cout << "[load_weight_lora_q4] Loaded Q4_0 LoRA adapters from "
+            << lora_q4_path << std::endl;
 }
 
 /**

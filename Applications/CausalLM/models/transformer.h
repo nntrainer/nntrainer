@@ -342,6 +342,27 @@ public:
   virtual void save_weight_lora(const std::string &lora_path);
 
   /**
+   * @brief Save LoRA adapters as Q4_0 (block=32, repacked for the W4A8 GEMM
+   *        kernel). When LORA_QAT is active, force-feeds the per-block EMA
+   *        scales calibrated during training instead of recomputing a
+   *        natural per-block scale at save time, so the saved adapter
+   *        matches the exact quantization the model trained against.
+   * @param path output path for the Q4_0 adapter file
+   */
+  virtual void save_weight_lora_q4(const std::string &path);
+
+  /**
+   * @brief Load a pretrained (non-LoRA) base checkpoint, then load Q4_0
+   *        LoRA adapters directly into Q4_0-dtype loraA/loraB tensors (see
+   *        LORA_WEIGHT_Q4), so the W4A8 GEMM kernel fires at inference.
+   * @param base_path path to the pretrained (non-LoRA) checkpoint
+   * @param lora_q4_path path to a Q4_0 adapter file (from
+   *        save_weight_lora_q4())
+   */
+  virtual void load_weight_lora_q4(const std::string &base_path,
+                                   const std::string &lora_q4_path);
+
+  /**
    * @brief Visit each layer in the compiled model (passthrough to
    *        ml::train::Model::forEachLayer). Exposed publicly so callers
    *        (tests, tooling) can inspect/manipulate weights without needing
