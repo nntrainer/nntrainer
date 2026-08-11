@@ -115,11 +115,11 @@ public:
    *       which would otherwise be silently Q4_0-quantized on save and
    *       corrupt the file layout for every tensor written after it.
    */
-  void save(std::ofstream &file, nntrainer::RunLayerContext &run_context,
-           bool opt_var, ml::train::ExecutionMode mode, bool trainable,
-           ml::train::TensorDim::DataType dtype =
-             ml::train::TensorDim::DataType::NONE,
-           ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const override;
+  void save(
+    std::ofstream &file, nntrainer::RunLayerContext &run_context, bool opt_var,
+    ml::train::ExecutionMode mode, bool trainable,
+    ml::train::TensorDim::DataType dtype = ml::train::TensorDim::DataType::NONE,
+    ml::train::ISA target_isa = ml::train::ISA::DEFAULT) const override;
 
   /**
    * @copydoc Layer::getType()
@@ -137,16 +137,6 @@ private:
   unsigned int num_experts;      /**< number of experts */
   unsigned int topk;             /**< number of experts per token, i.e., topk */
   nntrainer::ActiFunc acti_func; /**< activation function for the expert */
-  /**
-   * @brief True when expert projection weights are quantized (e.g. Q4_0).
-   * @note Quantized-weight FC dot products (ggml_interface_omp) internally
-   *       call ThreadManager::parallel_for; dispatching the outer per-expert
-   *       loop through the same global thread pool would nest parallel_for
-   *       calls and deadlock (worker threads exhaust the pool waiting on
-   *       inner jobs). Forces the outer expert dispatch to run sequentially
-   *       whenever expert weights are quantized.
-   */
-  bool expert_weights_quantized = false;
   std::tuple<props::NumExperts, props::NumExpertsPerToken,
              nntrainer::props::Unit, props::MoEActivation>
     moe_props;

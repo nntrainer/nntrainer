@@ -107,8 +107,6 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
     weight_regularizer_constant, weight_decay, "expert_bias", false);
 
   // 5. Initialize expert weights
-  expert_weights_quantized =
-    context.getWeightDataType() != ml::train::TensorDim::DataType::FP32;
   expert_gate_proj_indices.reserve(num_experts);
   expert_up_proj_indices.reserve(num_experts);
   expert_down_proj_indices.reserve(num_experts);
@@ -230,50 +228,19 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
   buildExpertAssignments(router_logits, expert_bias, total_tokens,
                          expert_assignments);
 
-  // Adaptive optimization based on workload
-  const int active_experts =
-    std::count_if(expert_assignments.begin(), expert_assignments.end(),
-                  [](const auto &assignments) { return !assignments.empty(); });
+  // Serial outer loop: dot() parallelizes internally through ThreadManager.
+  // Nesting another parallel_for here can deadlock on its non-recursive
+  // execution mutex, regardless of the expert weight dtype.
+  for (unsigned int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+    const auto &assignments = expert_assignments[expert_idx];
+    if (assignments.empty())
+      continue;
 
-  int total_work = 0;
-  for (const auto &assignments : expert_assignments) {
-    total_work += assignments.size();
-  }
-
-  // Quantized expert weights are dispatched sequentially: their FC dot
-  // product internally uses ThreadManager::parallel_for, so running the
-  // outer per-expert loop through the same pool would nest parallel_for
-  // calls and deadlock.
-  const bool use_parallel =
-    (total_work > 4) && (active_experts > 1) && !expert_weights_quantized;
-
-  if (use_parallel) {
-    auto &tm = nntrainer::ThreadManager::Global();
-    tm.parallel_for(
-      0, static_cast<size_t>(num_experts), [&](size_t expert_idx) {
-        const auto &assignments = expert_assignments[expert_idx];
-        if (assignments.empty())
-          return;
-
-        compute_expert_forward(
-          input, output, assignments,
-          context.getWeight(expert_gate_proj_indices[expert_idx]),
-          context.getWeight(expert_up_proj_indices[expert_idx]),
-          context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-      });
-  } else {
-    for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-         ++expert_idx) {
-      const auto &assignments = expert_assignments[expert_idx];
-      if (assignments.empty())
-        continue;
-
-      compute_expert_forward(
-        input, output, assignments,
-        context.getWeight(expert_gate_proj_indices[expert_idx]),
-        context.getWeight(expert_up_proj_indices[expert_idx]),
-        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
-    }
+    compute_expert_forward(
+      input, output, assignments,
+      context.getWeight(expert_gate_proj_indices[expert_idx]),
+      context.getWeight(expert_up_proj_indices[expert_idx]),
+      context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
   }
 
   // reshape output: [B*S,1,1,H] -> [B,1,S,H]
@@ -317,13 +284,11 @@ inline void Lfm2MoELayer::compute_expert_forward(
     nntrainer::Tensor acti_out(intermediate_dim);
     nntrainer::Tensor up_out(intermediate_dim);
 
-    // Gate projection + activation (silu)
+    // Gate and up projections followed by fused SIMD SwiGLU.
     token_input.dot(gate_proj, gate_out);
-    acti_func.run_fn(gate_out, acti_out);
-
-    // Up projection and element-wise multiply: silu(gate) * up
     token_input.dot(up_proj, up_out);
-    acti_out.multiply_i(up_out);
+    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
+                      gate_out.getData<float>(), up_out.getData<float>());
 
     // Down projection
     nntrainer::Tensor token_expert_output(token_output_dim);
@@ -373,10 +338,9 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
     nntrainer::Tensor up_out(intermediate_dim);
 
     token_input.dot(gate_proj, gate_out);
-    acti_func.run_fn(gate_out, acti_out);
-
     token_input.dot(up_proj, up_out);
-    acti_out.multiply_i(up_out);
+    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
+                      gate_out.getData<float>(), up_out.getData<float>());
 
     nntrainer::Tensor token_expert_output(token_output_dim);
     acti_out.dot(down_proj, token_expert_output);
@@ -451,39 +415,16 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       }
     }
 
-    // Quantized expert weights are dispatched sequentially: their FC dot
-    // product internally uses ThreadManager::parallel_for, so running the
-    // outer per-expert loop through the same pool would nest parallel_for
-    // calls and deadlock.
-    if (expert_weights_quantized) {
-      for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
-           ++expert_idx) {
-        const auto &assignments = expert_assignments[expert_idx];
-        if (assignments.empty())
-          continue;
+    for (unsigned int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+      const auto &assignments = expert_assignments[expert_idx];
+      if (assignments.empty())
+        continue;
 
-        compute_expert_forward_no_critical(
-          input, expert_outputs[expert_idx], assignments,
-          context.getWeight(expert_gate_proj_indices[expert_idx]),
-          context.getWeight(expert_up_proj_indices[expert_idx]),
-          context.getWeight(expert_down_proj_indices[expert_idx]),
-          hidden_size);
-      }
-    } else {
-      auto &tm = nntrainer::ThreadManager::Global();
-      tm.parallel_for(
-        0, static_cast<size_t>(num_experts), [&](size_t expert_idx) {
-          const auto &assignments = expert_assignments[expert_idx];
-          if (assignments.empty())
-            return;
-
-          compute_expert_forward_no_critical(
-            input, expert_outputs[expert_idx], assignments,
-            context.getWeight(expert_gate_proj_indices[expert_idx]),
-            context.getWeight(expert_up_proj_indices[expert_idx]),
-            context.getWeight(expert_down_proj_indices[expert_idx]),
-            hidden_size);
-        });
+      compute_expert_forward_no_critical(
+        input, expert_outputs[expert_idx], assignments,
+        context.getWeight(expert_gate_proj_indices[expert_idx]),
+        context.getWeight(expert_up_proj_indices[expert_idx]),
+        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
     }
 
     for (int expert_idx = 0; expert_idx < static_cast<int>(num_experts);
@@ -538,7 +479,8 @@ void Lfm2MoELayer::save(std::ofstream &file,
     }
 
     if (effective_dtype == ml::train::TensorDim::DataType::Q4_0) {
-      NNTR_THROW_IF(weight.getDataType() != ml::train::TensorDim::DataType::FP32,
+      NNTR_THROW_IF(weight.getDataType() !=
+                      ml::train::TensorDim::DataType::FP32,
                     std::runtime_error)
         << "Save with quantization only supports for FP32 weight.";
       nntrainer::TensorDim dim = weight.getDim();
@@ -562,7 +504,7 @@ void Lfm2MoELayer::save(std::ofstream &file,
       std::vector<char> tmp(quant_weight.size());
 
       nntrainer::quantize_q4_0(weight_t.getData<float>(), tmp.data(), N, K,
-                              nullptr);
+                               nullptr);
       nntrainer::repack_q4_0(quant_weight.getData<uint8_t>(), tmp.data(),
                              quant_weight.size(), N, K, target_isa);
       quant_weight.save(file);
