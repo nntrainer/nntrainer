@@ -33,16 +33,14 @@ Lfm2MoELayer::Lfm2MoELayer() :
   topk(0),
   moe_props(props::NumExperts(), props::NumExpertsPerToken(),
             nntrainer::props::Unit(), props::MoEActivation()),
-  expert_gate_proj_indices({}),
-  expert_up_proj_indices({}),
+  expert_gate_up_proj_indices({}),
   expert_down_proj_indices({}),
   gate_idx(std::numeric_limits<unsigned>::max()),
   expert_bias_idx(std::numeric_limits<unsigned>::max()),
   router_logits_idx(std::numeric_limits<unsigned>::max()),
   decode_expert_output_idx(std::numeric_limits<unsigned>::max()),
-  decode_gate_output_idx(std::numeric_limits<unsigned>::max()),
-  decode_activation_output_idx(std::numeric_limits<unsigned>::max()),
-  decode_up_output_idx(std::numeric_limits<unsigned>::max()) {}
+  decode_gate_up_output_idx(std::numeric_limits<unsigned>::max()),
+  decode_activation_output_idx(std::numeric_limits<unsigned>::max()) {}
 
 void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
 
@@ -111,13 +109,12 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
     weight_regularizer_constant, weight_decay, "expert_bias", false);
 
   // 5. Initialize expert weights
-  expert_gate_proj_indices.reserve(num_experts);
-  expert_up_proj_indices.reserve(num_experts);
+  expert_gate_up_proj_indices.reserve(num_experts);
   expert_down_proj_indices.reserve(num_experts);
 
-  nntrainer::TensorDim expert_gate_dim(
-    1, is_nchw ? 1 : intermediate_size, is_nchw ? hidden_size : 1,
-    is_nchw ? intermediate_size : hidden_size,
+  nntrainer::TensorDim expert_gate_up_dim(
+    1, is_nchw ? 1 : 2 * intermediate_size, is_nchw ? hidden_size : 1,
+    is_nchw ? 2 * intermediate_size : hidden_size,
     nntrainer::TensorDim::TensorType(context.getFormat(),
                                      context.getWeightDataType()),
     is_nchw ? 0b0011 : 0b0101);
@@ -130,17 +127,11 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
     is_nchw ? 0b0011 : 0b0101);
 
   for (unsigned int i = 0; i < num_experts; ++i) {
-    // Up projection
-    expert_up_proj_indices.push_back(context.requestWeight(
-      expert_gate_dim, // Same dimensions as gate projection
-      weight_initializer, weight_regularizer, weight_regularizer_constant,
-      weight_decay, "expert_up_" + std::to_string(i), false));
-
-    // Gate projection
-    expert_gate_proj_indices.push_back(context.requestWeight(
-      expert_gate_dim, weight_initializer, weight_regularizer,
+    // Fused gate and up projection. Each output row is [gate | up].
+    expert_gate_up_proj_indices.push_back(context.requestWeight(
+      expert_gate_up_dim, weight_initializer, weight_regularizer,
       weight_regularizer_constant, weight_decay,
-      "expert_gate_" + std::to_string(i), false));
+      "expert_gate_up_" + std::to_string(i), false));
 
     // Down projection
     expert_down_proj_indices.push_back(context.requestWeight(
@@ -162,18 +153,14 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
     context.requestTensor({1, 1, 1, hidden_size}, "decode_expert_output",
                           nntrainer::Initializer::NONE, false,
                           nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
-  decode_gate_output_idx =
-    context.requestTensor({1, 1, 1, intermediate_size}, "decode_gate_output",
-                          nntrainer::Initializer::NONE, false,
-                          nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+  decode_gate_up_output_idx = context.requestTensor(
+    {1, 1, 1, 2 * intermediate_size}, "decode_gate_up_output",
+    nntrainer::Initializer::NONE, false,
+    nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
   decode_activation_output_idx = context.requestTensor(
     {1, 1, 1, intermediate_size}, "decode_activation_output",
     nntrainer::Initializer::NONE, false,
     nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
-  decode_up_output_idx =
-    context.requestTensor({1, 1, 1, intermediate_size}, "decode_up_output",
-                          nntrainer::Initializer::NONE, false,
-                          nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
 }
 
 void Lfm2MoELayer::buildExpertAssignments(
@@ -254,15 +241,13 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
 
   nntrainer::Tensor prefill_token_input;
   nntrainer::Tensor prefill_expert_output;
-  nntrainer::Tensor prefill_gate_output;
+  nntrainer::Tensor prefill_gate_up_output;
   nntrainer::Tensor prefill_activation_output;
-  nntrainer::Tensor prefill_up_output;
   ExpertWorkspace workspace{
     nullptr,
     &context.getTensor(decode_expert_output_idx),
-    &context.getTensor(decode_gate_output_idx),
+    &context.getTensor(decode_gate_up_output_idx),
     &context.getTensor(decode_activation_output_idx),
-    &context.getTensor(decode_up_output_idx),
   };
   if (max_assigned_tokens > 1) {
     const unsigned int workspace_tokens =
@@ -273,15 +258,12 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
                                             input.getTensorType());
     prefill_expert_output = nntrainer::Tensor(
       workspace_tokens, 1, 1, hidden_size, output.getTensorType());
-    prefill_gate_output = nntrainer::Tensor(
-      1, 1, workspace_tokens, intermediate_size, input.getTensorType());
+    prefill_gate_up_output = nntrainer::Tensor(
+      1, 1, workspace_tokens, 2 * intermediate_size, input.getTensorType());
     prefill_activation_output = nntrainer::Tensor(
       1, 1, workspace_tokens, intermediate_size, input.getTensorType());
-    prefill_up_output = nntrainer::Tensor(
-      1, 1, workspace_tokens, intermediate_size, input.getTensorType());
     workspace = {&prefill_token_input, &prefill_expert_output,
-                 &prefill_gate_output, &prefill_activation_output,
-                 &prefill_up_output};
+                 &prefill_gate_up_output, &prefill_activation_output};
   }
 
   // Serial outer loop: dot() parallelizes internally through ThreadManager.
@@ -294,8 +276,7 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
 
     compute_expert_forward(
       input, output, assignments,
-      context.getWeight(expert_gate_proj_indices[expert_idx]),
-      context.getWeight(expert_up_proj_indices[expert_idx]),
+      context.getWeight(expert_gate_up_proj_indices[expert_idx]),
       context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size,
       workspace);
   }
@@ -307,9 +288,8 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
 inline void Lfm2MoELayer::compute_expert_forward(
   const nntrainer::Tensor &input, nntrainer::Tensor &output,
   const std::vector<std::pair<unsigned, float>> &token_assignments,
-  const nntrainer::Tensor &gate_proj, const nntrainer::Tensor &up_proj,
-  const nntrainer::Tensor &down_proj, unsigned int hidden_size,
-  ExpertWorkspace &workspace) {
+  const nntrainer::Tensor &gate_up_proj, const nntrainer::Tensor &down_proj,
+  unsigned int hidden_size, ExpertWorkspace &workspace) {
 
   if (token_assignments.empty())
     return;
@@ -319,7 +299,7 @@ inline void Lfm2MoELayer::compute_expert_forward(
       {static_cast<unsigned int>(token_assignments.size()), 1, 1, hidden_size},
       0, true);
   compute_expert_forward_no_critical(input, expert_output, token_assignments,
-                                     gate_proj, up_proj, down_proj, hidden_size,
+                                     gate_up_proj, down_proj, hidden_size,
                                      workspace);
 
   nntrainer::TensorDim token_step_dim({1, 1, 1, hidden_size},
@@ -336,11 +316,10 @@ inline void Lfm2MoELayer::compute_expert_forward(
 inline void Lfm2MoELayer::compute_expert_forward_no_critical(
   const nntrainer::Tensor &input, nntrainer::Tensor &expert_output,
   const std::vector<std::pair<unsigned, float>> &token_assignments,
-  const nntrainer::Tensor &gate_proj, const nntrainer::Tensor &up_proj,
-  const nntrainer::Tensor &down_proj, unsigned int hidden_size,
-  ExpertWorkspace &workspace) {
+  const nntrainer::Tensor &gate_up_proj, const nntrainer::Tensor &down_proj,
+  unsigned int hidden_size, ExpertWorkspace &workspace) {
 
-  const unsigned intermediate_size = gate_proj.width();
+  const unsigned intermediate_size = gate_up_proj.width() / 2;
   const unsigned num_tokens = token_assignments.size();
 
   if (num_tokens == 0)
@@ -350,6 +329,8 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
                                        input.getTensorType());
   nntrainer::TensorDim intermediate_dim({1, 1, num_tokens, intermediate_size},
                                         input.getTensorType());
+  nntrainer::TensorDim gate_up_dim({1, 1, num_tokens, 2 * intermediate_size},
+                                   input.getTensorType());
   nntrainer::TensorDim token_step_dim({1, 1, 1, hidden_size},
                                       input.getTensorType());
 
@@ -370,25 +351,25 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
     });
   }
 
-  nntrainer::Tensor gate_out =
-    workspace.gate_output->getSharedDataTensor(intermediate_dim, 0, true);
+  nntrainer::Tensor gate_up_out =
+    workspace.gate_up_output->getSharedDataTensor(gate_up_dim, 0, true);
   nntrainer::Tensor acti_out =
     workspace.activation_output->getSharedDataTensor(intermediate_dim, 0, true);
-  nntrainer::Tensor up_out =
-    workspace.up_output->getSharedDataTensor(intermediate_dim, 0, true);
-  token_input.dot(gate_proj, gate_out);
-  token_input.dot(up_proj, up_out);
+  token_input.dot(gate_up_proj, gate_up_out);
 
   if (num_tokens == 1) {
     nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
-                      gate_out.getData<float>(), up_out.getData<float>());
+                      gate_up_out.getData<float>(),
+                      gate_up_out.getData<float>() + intermediate_size);
   } else {
     auto &tm = nntrainer::ThreadManager::Global();
     tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
       const unsigned int offset = acti_out.getIndex(0, 0, i, 0);
+      const unsigned int gate_up_offset = gate_up_out.getIndex(0, 0, i, 0);
       nntrainer::swiglu(acti_out.width(), acti_out.getData<float>() + offset,
-                        gate_out.getData<float>() + offset,
-                        up_out.getData<float>() + offset);
+                        gate_up_out.getData<float>() + gate_up_offset,
+                        gate_up_out.getData<float>() + gate_up_offset +
+                          intermediate_size);
     });
   }
 
@@ -458,15 +439,13 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     nntrainer::Tensor prefill_token_input;
     nntrainer::Tensor prefill_expert_output;
-    nntrainer::Tensor prefill_gate_output;
+    nntrainer::Tensor prefill_gate_up_output;
     nntrainer::Tensor prefill_activation_output;
-    nntrainer::Tensor prefill_up_output;
     ExpertWorkspace workspace{
       nullptr,
       &context.getTensor(decode_expert_output_idx),
-      &context.getTensor(decode_gate_output_idx),
+      &context.getTensor(decode_gate_up_output_idx),
       &context.getTensor(decode_activation_output_idx),
-      &context.getTensor(decode_up_output_idx),
     };
     if (max_assigned_tokens > 1) {
       const unsigned int workspace_tokens =
@@ -477,15 +456,12 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         1, 1, workspace_tokens, hidden_size, input.getTensorType());
       prefill_expert_output = nntrainer::Tensor(
         workspace_tokens, 1, 1, hidden_size, output.getTensorType());
-      prefill_gate_output = nntrainer::Tensor(
-        1, 1, workspace_tokens, intermediate_size, input.getTensorType());
+      prefill_gate_up_output = nntrainer::Tensor(
+        1, 1, workspace_tokens, 2 * intermediate_size, input.getTensorType());
       prefill_activation_output = nntrainer::Tensor(
         1, 1, workspace_tokens, intermediate_size, input.getTensorType());
-      prefill_up_output = nntrainer::Tensor(
-        1, 1, workspace_tokens, intermediate_size, input.getTensorType());
       workspace = {&prefill_token_input, &prefill_expert_output,
-                   &prefill_gate_output, &prefill_activation_output,
-                   &prefill_up_output};
+                   &prefill_gate_up_output, &prefill_activation_output};
     }
 
     for (unsigned int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
@@ -495,8 +471,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
       compute_expert_forward(
         input, output, assignments,
-        context.getWeight(expert_gate_proj_indices[expert_idx]),
-        context.getWeight(expert_up_proj_indices[expert_idx]),
+        context.getWeight(expert_gate_up_proj_indices[expert_idx]),
         context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size,
         workspace);
     }
