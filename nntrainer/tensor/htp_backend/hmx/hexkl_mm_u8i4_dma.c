@@ -18,20 +18,14 @@
 #include <AEEStdErr.h>
 
 #include "hexkl_dma_ring.h"
+#include "hexkl_hmx_geom.h"
 #include "hexkl_micro.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
 
-#define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
-
-/** @brief Bytes in one packed i4 weight tile (32x32 values). Matches
- *         hexkl_mm_u8i4.c's local definition -- both are file-scoped, so
- *         this is not a redefinition, just the same constant kept in sync
- *         by inspection. If HexKL ever exposes it from hexkl_micro.h, both
- *         files should switch to that instead of this comment. */
-#define WEIGHT_TILE_BYTES_U8I4 512u
-/** @brief Bytes in one int32 accumulator tile (64x32 values). */
-#define ACC_TILE_BYTES 8192u
+#define ROUND_UP_U32(v, a) HEXKL_ROUND_UP_U32(v, a)
+#define WEIGHT_TILE_BYTES_U8I4 HEXKL_WEIGHT_TILE_BYTES_I4
+#define ACC_TILE_BYTES HEXKL_ACC_TILE_BYTES
 /** @brief Largest single DMA row HexKL/HVX will move correctly; rows above
  *         this size have a documented hardware bug (doc13 §3a, §5). */
 #define MAX_DMA_ROW_BYTES 262144u

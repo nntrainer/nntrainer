@@ -16,13 +16,17 @@
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
 
+#include "hexkl_hmx_geom.h"
 #include "hvx_convert.h"
 #include "hvx_quant_u8.h"
 
-/** @brief HMX activation tile geometry, mirrored from hexkl_micro.h. */
-#define TILE_ROW 64u
-#define TILE_INNER 32u
-#define ACT_TILE_BYTES 2048u
+/** @brief HMX activation tile geometry. Taken from hexkl_hmx_geom.h rather
+ *         than restated here: this kernel writes the tiles that
+ *         hexkl_mm_u8i4_run then reads, and the two strides have to be the
+ *         same number or the matmul silently reads the wrong bytes. */
+#define TILE_ROW HEXKL_TILE_ROW
+#define TILE_INNER HEXKL_TILE_INNER
+#define ACT_TILE_BYTES HEXKL_ACT_TILE_BYTES
 /** @brief HVX vector width in bytes (128B mode). */
 #define VLEN 128u
 /** @brief f32 lanes per HVX vector. */
