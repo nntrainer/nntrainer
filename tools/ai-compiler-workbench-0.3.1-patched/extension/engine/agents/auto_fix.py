@@ -1,19 +1,36 @@
-"""
-Auto-Fix Agent (LLM).
-
-Runs only when the Compiler Agent reports real g++ errors against the
-generated file (not for unsupported-op TODOs -- those are a known,
-already-explained gap, not a bug to "fix" by guessing). Sends the
-compiler's stderr plus the offending source to an LLM via LangChain
-and asks for the corrected file back, verbatim. Bounded to
-MAX_FIX_ITERATIONS so a model that can't converge on a fix doesn't
-loop forever; each attempt is a fresh compile, so a bad patch just
-falls through to "leave the TODOs / errors for the user" rather than
-silently shipping something unverified.
-"""
+"""Auto-Fix Agent for compiler errors."""
+import subprocess
+import sys
 from .events import bus
 
 MAX_FIX_ITERATIONS = 2
+
+
+def _ensure_langchain_installed(api_key: str) -> bool:
+    try:
+        from langchain_anthropic import ChatAnthropic
+        from langchain_core.messages import HumanMessage
+        return True
+    except ImportError:
+        pass
+    
+    bus.log("langchain-anthropic not installed -- attempting auto-install...", "warn")
+    bus.agent_status("auto_fix", "running", "installing langchain-anthropic...")
+    
+    try:
+        python_path = sys.executable or "python3"
+        pip_args = ["-m", "pip", "install", "-q", "langchain-anthropic", "langchain-core"]
+        subprocess.check_call([python_path] + pip_args)
+        bus.log("langchain-anthropic installed successfully", "info")
+        return True
+    except subprocess.CalledProcessError as e:
+        bus.log(f"Failed to install langchain-anthropic: {e}", "error")
+        bus.agent_status("auto_fix", "error", "pip install failed")
+        return False
+    except Exception as e:
+        bus.log(f"Failed to install langchain-anthropic: {e}", "error")
+        bus.agent_status("auto_fix", "error", str(e))
+        return False
 
 
 def run(state: dict) -> dict:
@@ -26,12 +43,15 @@ def run(state: dict) -> dict:
 
     bus.agent_status("auto_fix", "running", f"attempt {state.get('fix_iterations', 0) + 1}")
 
+    if not _ensure_langchain_installed(api_key):
+        return state
+
     try:
         from langchain_anthropic import ChatAnthropic
         from langchain_core.messages import HumanMessage
     except ImportError:
-        bus.log("langchain-anthropic not installed -- cannot auto-fix compile errors", "warn")
-        bus.agent_status("auto_fix", "error", "langchain-anthropic not installed")
+        bus.log("langchain-anthropic still not available after install attempt", "warn")
+        bus.agent_status("auto_fix", "error", "langchain-anthropic not available")
         return state
 
     prompt = (

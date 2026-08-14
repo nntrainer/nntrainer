@@ -1,16 +1,5 @@
-"""
-Weight Download Agent (no LLM).
-
-Downloads the model's weight files (.safetensors preferred, .bin
-fallback) from the Hugging Face Hub into the workspace cache
-(<workspace>/.ai_compiler_cache/<model>/weights/), reusing a cached
-copy if one was downloaded within the last 30 days. Resolves local
-paths directly without caching (nothing to download).
-
-The orchestrator runs this agent in a background thread starting
-right after Model Discovery, in parallel with graph/.ini/.cpp
-construction and compilation -- weights aren't needed for any of
-that, only for actually running/training the model later.
+t"""
+Weight Download Agent - Downloads model weights from HuggingFace Hub.
 """
 import os
 
@@ -22,6 +11,13 @@ def run(state: dict) -> dict:
     bus.agent_status("weight_download", "running")
     model_name = state["model_name"]
     out_dir = state["out_dir"]
+    custom_weights_path = state.get("custom_weights_path")
+
+    if custom_weights_path and os.path.isdir(custom_weights_path):
+        state["weights_path"] = custom_weights_path
+        bus.log(f"Using custom optimized weights from: {custom_weights_path}")
+        bus.agent_status("weight_download", "done", "custom optimized")
+        return state
 
     if os.path.isdir(model_name):
         state["weights_path"] = model_name

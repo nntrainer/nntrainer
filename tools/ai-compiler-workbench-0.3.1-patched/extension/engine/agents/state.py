@@ -16,6 +16,7 @@ class PipelineState(TypedDict, total=False):
     model_name: str
     out_dir: str
     anthropic_api_key: Optional[str]
+    custom_weights_path: Optional[str]
 
     hf_config: dict
     architecture: str
@@ -46,7 +47,14 @@ class PipelineState(TypedDict, total=False):
 
     cpp_code: Optional[str]
     cpp_path: Optional[str]
+    cpp_emission_mode: str  # "model_api" or "causallm_component" -- set by cpp_generator_agent, read by compiler_agent
     fix_iterations: int
+    requires_causallm_build: bool
+    skip_cpp_compilation: bool
+    nntrainer_missing: bool
+    compile_skipped: bool
+    compile_command: str
+
 
     causallm_header: Optional[str]        # generated_<arch>_causallm.h contents
     causallm_source: Optional[str]        # generated_<arch>_causallm.cpp contents
@@ -64,7 +72,14 @@ class PipelineState(TypedDict, total=False):
     causallm_installed_header_path: Optional[str]
     causallm_installed_source_path: Optional[str]
 
+    # CausalLM Build & Run agent (PC x86 build + inference)
+    causallm_build_success: bool
+    causallm_build_log: str
+    causallm_run_success: bool
+    causallm_run_log: str
+
     compiled: bool
+
     compile_log: str
     binary_path: Optional[str]
 
@@ -79,6 +94,7 @@ def new_state(
     model_name: str,
     out_dir: str,
     api_key: Optional[str],
+    custom_weights_path: Optional[str] = None,
     causallm_project_root: Optional[str] = None,
     install_generated_files: bool = False,
     generated_header_directory: str = "include/generated",
@@ -88,11 +104,19 @@ def new_state(
         model_name=model_name,
         out_dir=out_dir,
         anthropic_api_key=api_key,
+        custom_weights_path=custom_weights_path,
         fix_iterations=0,
         compiled=False,
         errors=[],
+        cpp_emission_mode="",
+        requires_causallm_build=False,
+        skip_cpp_compilation=True,
+        nntrainer_missing=False,
+        compile_skipped=False,
+        compile_command="",
         causallm_project_root=causallm_project_root,
         install_generated_files=install_generated_files,
         generated_header_directory=generated_header_directory,
         generated_source_directory=generated_source_directory,
     )
+

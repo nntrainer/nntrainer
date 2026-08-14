@@ -1,19 +1,30 @@
 """
-Builds the two graph views the webview renders side by side: one
-parsed straight out of model.ini, one parsed straight out of
-generated_model.cpp. Deliberately parses the *actual generated text*
-rather than reusing the in-memory IR a second time -- that way the
-graph shown is a genuine reflection of what got written to disk (and,
-incidentally, a cheap cross-check that the .ini and .cpp agree with
-each other), including each node's weight info for the inspector panel.
-
-Both graphs use a vertical, top-to-bottom layered layout: one row per
-topological depth, nodes within a row spread out left-to-right.
+Graph Views - Builds Model Graph and nntrainer Graph for webview.
 """
 import re
+from typing import Optional, Dict, Any
 
 ROW_HEIGHT = 130
 COL_WIDTH = 200
+
+_weight_cache: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+def set_weight_cache(cache: Dict[str, Dict[str, Any]]) -> None:
+    global _weight_cache
+    _weight_cache = cache
+
+
+def clear_weight_cache() -> None:
+    global _weight_cache
+    _weight_cache = None
+
+
+def get_weight_preview(weight_name: str) -> Optional[Dict[str, Any]]:
+    if _weight_cache and weight_name in _weight_cache:
+        return _weight_cache[weight_name]
+    return None
+
 
 WEIGHT_RE = re.compile(
     r'weight:\s*name=(\S+)\s*shape=(\[[^\]]*\])\s*dtype=(\S+)\s*params=(\d+)',
@@ -41,9 +52,7 @@ def build_ini_graph(ini_content: str) -> dict:
     edges = []
     order = []
 
-    # Split into [section] blocks
     blocks = re.split(r"^\[(.+?)\]\s*$", ini_content, flags=re.MULTILINE)
-    # re.split with a capturing group returns [pre, name1, body1, name2, body2, ...]
     it = iter(blocks[1:])
     for name, body in zip(it, it):
         if name == "Model":
@@ -98,17 +107,17 @@ def build_cpp_graph(cpp_code: str) -> dict:
     edges = []
     order = []
 
-    var_type = {}      # C++ variable name -> layer type
-    var_attrs = {}      # C++ variable name -> {key: value}
-    var_name = {}       # C++ variable name -> layer name= value
-    var_weight = {}      # C++ variable name -> weight info dict
+    var_type = {}
+    var_attrs = {}
+    var_name = {}
+    var_weight = {}
 
     create_re = re.compile(r'auto\s+(\w+)\s*=\s*createLayer\("([^"]+)"\);')
     setprop_re = re.compile(r'(\w+)->setProperty\(\{"([^=]+)=([^"]*)"\}\);')
     todo_re = re.compile(r'//\s*TODO\(unsupported\):\s*(\S+)\s*\[([^\]]+)\]\s*--\s*(.*)')
 
     lines = cpp_code.splitlines()
-    current_unsupported = None  # name of the TODO block currently being read, if any
+    current_unsupported = None
 
     for line in lines:
         m = todo_re.search(line)
@@ -154,9 +163,6 @@ def build_cpp_graph(cpp_code: str) -> dict:
                 var_attrs.setdefault(var, {})[key] = value
             continue
 
-    # Weight comments for *supported* layers appear after their setProperty
-    # calls but reference the most recently declared variable -- re-scan
-    # to attach them since we need the var context, not just node id.
     current_var = None
     for line in lines:
         m = create_re.search(line)
@@ -196,26 +202,10 @@ def build_cpp_graph(cpp_code: str) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-# ---------------------------------------------------------------------------
-# Two-graph views: "Model Graph" (from the semantic IR) and "nntrainer Graph"
-# (from the lowered target IR). Both feed the same webview tabs; see
-# extension/webview/main.html. Only these two tabs exist -- a third
-# "C++ Audit" / "Mapping" tab was considered and dropped: mapping is
-# handled by click-to-highlight using `build_node_mappings` below instead
-# of a dedicated view, per the simplified two-tab design.
-# ---------------------------------------------------------------------------
-
-#: Layers beyond this count get the first/last layer fully expanded and
-#: everything in between collapsed into one node per layer -- keeps a
-#: 28-layer model's graph readable without hiding any data (collapsed
-#: nodes still carry every member id in source_node_ids for expand-on-click).
 _EXPAND_THRESHOLD = 3
 
 
 def build_model_graph_view(model_ir) -> dict:
-    """Architecture-level source graph, built directly from the semantic
-    IR (api.semantic.model.CausalLMIR) -- never by re-parsing generated
-    text. See agents/nntrainer_lowering.py."""
     nodes, edges, order = [], [], []
 
     def node(id_, label, type_, semantic_type, group_id="", source_ids=None, attrs=None):
@@ -331,11 +321,6 @@ def _build_expanded_layer(node_fn, edges, layer, index):
 
 
 def build_nntrainer_graph_view(nntrainer_graph_ir: dict) -> dict:
-    """Renders the exact lowered target graph -- the same
-    nntrainer_graph_ir the C++ generator consumes -- collapsing every
-    decoder-layer group except the first and last so a 28-layer model
-    stays readable. Nothing is discarded: a collapsed node's
-    sourceNodeIds lists every member node id."""
     raw_nodes = {n["id"]: n for n in nntrainer_graph_ir.get("nodes", [])}
     raw_edges = nntrainer_graph_ir.get("edges", [])
 
@@ -347,7 +332,6 @@ def build_nntrainer_graph_view(nntrainer_graph_ir: dict) -> dict:
     layer_indices = sorted(int(g.split("_", 1)[1]) for g in groups)
     collapse = set(f"decoder_{i}" for i in layer_indices[1:-1]) if len(layer_indices) > _EXPAND_THRESHOLD else set()
 
-    # id -> id it was folded into (itself if not collapsed)
     redirect: dict[str, str] = {}
     view_nodes = []
     order = []
@@ -357,16 +341,29 @@ def build_nntrainer_graph_view(nntrainer_graph_ir: dict) -> dict:
         if gid in collapse:
             continue
         redirect[n["id"]] = n["id"]
+        
+        weight_info = None
+        if n.get("weight_name"):
+            weight_info = {
+                "name": n["weight_name"],
+                "shape": list(n["weight_shape"] or []),
+                "dtype": n["weight_dtype"],
+                "params": n["parameter_count"],
+            }
+            preview = get_weight_preview(n["weight_name"])
+            if preview:
+                weight_info["preview"] = preview["preview"]
+                weight_info["min"] = preview["min"]
+                weight_info["max"] = preview["max"]
+                weight_info["mean"] = preview["mean"]
+                weight_info["std"] = preview["std"]
+        
         view_nodes.append({
             "id": n["id"], "label": n["name"], "type": n["node_type"] or "passthrough",
             "status": n.get("status", "supported"),
             "attributes": n.get("attributes", {}),
             "group": gid, "sourceNodeIds": n.get("source_node_ids", []),
-            "weightInfo": (
-                {"name": n["weight_name"], "shape": list(n["weight_shape"] or []),
-                 "dtype": n["weight_dtype"], "params": n["parameter_count"]}
-                if n.get("weight_name") else None
-            ),
+            "weightInfo": weight_info,
         })
         order.append(n["id"])
 
@@ -403,9 +400,6 @@ def build_nntrainer_graph_view(nntrainer_graph_ir: dict) -> dict:
 
 
 def build_node_mappings(model_ir, nntrainer_graph) -> list:
-    """One mapping record per decoder layer (plus embedding/final-norm/
-    lm-head) so the webview can highlight the matching nodes in the
-    *other* graph on click, without a dedicated third "mapping" tab."""
     mappings = []
     by_group: dict[str, list] = {}
     ungrouped = []
@@ -440,29 +434,12 @@ BARYCENTER_SWEEPS = 4
 
 
 def _layout_vertical(nodes: list, edges: list, order: list):
-    """Sugiyama-style layered layout, assigning x/y in place.
-
-    Three stages:
-      1. Longest-path layering -> each node's row (y = depth * ROW_HEIGHT).
-      2. Barycenter crossing reduction -> the order of nodes *within* each
-         row is repeatedly re-sorted by the average position of their
-         parents (down sweep) and children (up sweep), which pulls
-         connected nodes into vertical alignment and untangles crossings.
-      3. Row centering -> narrower rows are centered against the widest
-         row, so a single parent sits roughly above the midpoint of its
-         children instead of everything being left-packed.
-
-    Nodes with no resolvable depth fall back to row 0; declaration order
-    (`order`, then node order) is the tie-breaker so layout is stable and
-    deterministic across runs.
-    """
     ids = [n["id"] for n in nodes]
     if not ids:
         return
     id_set = set(ids)
     by_id = {n["id"]: n for n in nodes}
 
-    # --- stage 1: longest-path layering ---
     depth = {nid: 0 for nid in ids}
     for _ in range(len(ids) + 1):
         changed = False
@@ -482,7 +459,6 @@ def _layout_vertical(nodes: list, edges: list, order: list):
             children[src].append(tgt)
             parents[tgt].append(src)
 
-    # Stable declaration order: honour `order` first, then any stragglers.
     decl = {nid: i for i, nid in enumerate(order) if nid in id_set}
     for i, nid in enumerate(ids):
         decl.setdefault(nid, len(order) + i)
@@ -492,7 +468,6 @@ def _layout_vertical(nodes: list, edges: list, order: list):
     for nid in sorted(ids, key=lambda x: decl[x]):
         rows[depth[nid]].append(nid)
 
-    # --- stage 2: barycenter crossing reduction ---
     pos = {}
 
     def reindex():
@@ -504,18 +479,16 @@ def _layout_vertical(nodes: list, edges: list, order: list):
 
     def barycenter(nid, neighbours):
         ns = neighbours[nid]
-        # No neighbours in the adjacent row -> keep current slot (stable).
         return sum(pos[n] for n in ns) / len(ns) if ns else pos[nid]
 
     for _ in range(BARYCENTER_SWEEPS):
-        for d in range(1, max_depth + 1):                 # down: align to parents
+        for d in range(1, max_depth + 1):
             rows[d].sort(key=lambda nid: (barycenter(nid, parents), decl[nid]))
             reindex()
-        for d in range(max_depth - 1, -1, -1):            # up: align to children
+        for d in range(max_depth - 1, -1, -1):
             rows[d].sort(key=lambda nid: (barycenter(nid, children), decl[nid]))
             reindex()
 
-    # --- stage 3: assign coordinates, centering each row ---
     widest = max((len(rows[d]) for d in rows), default=1)
     for d in range(max_depth + 1):
         row = rows[d]
