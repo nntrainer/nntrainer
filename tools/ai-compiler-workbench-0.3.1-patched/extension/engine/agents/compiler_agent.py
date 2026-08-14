@@ -28,10 +28,18 @@ def _handle_causallm_component(state: dict) -> dict:
     project_root = state.get("causallm_project_root")
     install_enabled = bool(state.get("install_generated_files", False))
 
-    state["compiled"] = False
+    # Preserve compiled/binary_path if already set by causallm_build_run
+    already_compiled = state.get("compiled", False)
+    existing_binary = state.get("binary_path")
+    
     state["compile_skipped"] = True
-    state["binary_path"] = None
     state["requires_causallm_build"] = True
+    
+    # Only set compiled=False if causallm_build_run hasn't already run
+    if not already_compiled:
+        state["compiled"] = False
+        state["binary_path"] = None
+
 
     if not install_enabled:
         message = (

@@ -59,7 +59,6 @@
   .h-splitter { width: 6px; background: var(--border); cursor: col-resize; flex-shrink: 0; }
   .h-splitter:hover { background: var(--accent); }
 
-  /* Agent pipeline list */
   .agent-row { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid rgba(255,255,255,.04); }
   .agent-row .dot { width: 9px; height: 9px; border-radius: 50%; background: #555; flex-shrink: 0; }
   .agent-row.done .dot { background: var(--green); }
@@ -139,13 +138,24 @@
   .kv { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; color: var(--muted); }
   .kv b { color: var(--fg); font-weight: 500; max-width: 140px; overflow: hidden; text-overflow: ellipsis; text-align: right; }
   .no-weight { color: var(--muted); font-style: italic; padding: 6px 0; }
+  .weight-preview { 
+    background: rgba(0,0,0,.2); 
+    border-radius: 4px; 
+    padding: 6px 8px; 
+    font-family: "Monaco", "Courier New", monospace; 
+    font-size: 10px; 
+    color: var(--accent);
+    word-break: break-all;
+  }
 
   /* Minimap */
   .minimap {
-    position: absolute; bottom: 8px; right: 8px; width: 150px; height: 115px;
-    background: rgba(18,18,28,.92); border: 1px solid var(--border); border-radius: 6px;
-    z-index: 25; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,.5); cursor: pointer;
+    position: fixed; bottom: 240px; right: 20px; width: 150px; height: 115px;
+    background: rgba(18,18,28,.95); border: 1px solid var(--border); border-radius: 6px;
+    z-index: 100; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,.5); cursor: pointer;
+    display: none;
   }
+  .minimap.visible { display: block; }
   .minimap .mm-hdr { font-size: 8px; text-transform: uppercase; color: var(--muted); padding: 3px 6px; letter-spacing: .3px; }
   .minimapSvg { display: block; width: 100%; height: 100%; }
   .minimapViewport { position: absolute; border: 1.5px solid var(--accent); background: rgba(97,175,239,.12); pointer-events: none; }
@@ -245,7 +255,7 @@
         <div class="panel-body">
           <div class="graphContainer" id="graphContainer-ini"><div class="empty-msg">Run the pipeline to see the model graph.</div></div>
           <div class="inspector" id="inspector-ini"></div>
-          <div class="minimap" id="minimap-ini" style="display:none;">
+          <div class="minimap" id="minimap-ini">
             <div class="mm-hdr">Minimap</div>
             <svg class="minimapSvg"></svg>
             <div class="minimapViewport"></div>
@@ -272,7 +282,7 @@
         <div class="panel-body">
           <div class="graphContainer" id="graphContainer-cpp"><div class="empty-msg">Run the pipeline to see the lowered nntrainer graph.</div></div>
           <div class="inspector" id="inspector-cpp"></div>
-          <div class="minimap" id="minimap-cpp" style="display:none;">
+          <div class="minimap" id="minimap-cpp">
             <div class="mm-hdr">Minimap</div>
             <svg class="minimapSvg"></svg>
             <div class="minimapViewport"></div>
@@ -395,17 +405,7 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-// =========================================================================
-// Graph panes: both "ini" and "cpp" are always visible side by side, each
-// independently pannable/zoomable/exportable with its own inspector + minimap.
-// =========================================================================
 const fileContents = { ini: null, cpp: null };
-
-// Source<->target node-id groups from the backend (agents/graph_views.py
-// build_node_mappings). "ini" pane == Model Graph == source side; "cpp"
-// pane == nntrainer Graph == target side. Selecting a node in either
-// graph highlights its counterparts in the other one, in place of a
-// dedicated third "Mapping" tab.
 let nodeMappings = [];
 
 function crossHighlightFrom(paneKey, nodeId) {
@@ -526,10 +526,6 @@ function makeGraphPane(key) {
     applyFocusStyles();
   }
 
-  // Dims every node/edge not in state.focusedIds, keeping layout untouched.
-  // An edge stays fully visible only if BOTH endpoints are in the focus set,
-  // since a dimmed-to-full-color edge running through dimmed nodes reads as
-  // a mistake, not a signal.
   function applyFocusStyles() {
     const ids = state.focusedIds;
     container.querySelectorAll(".node").forEach((el) => {
@@ -561,6 +557,7 @@ function makeGraphPane(key) {
   function renderInspector(n) {
     inspector.classList.add("vis");
     const hasWeight = !!n.weightInfo;
+    const hasPreview = hasWeight && n.weightInfo.preview;
     let attrRows = "";
     for (const [k, v] of Object.entries(n.attributes || {})) {
       attrRows += `<div class="kv"><span>${escapeHtml(k)}</span><b>${escapeHtml(String(v))}</b></div>`;
@@ -572,11 +569,21 @@ function makeGraphPane(key) {
       ${n.outputShape ? `<div class="kv"><span>Output</span><b>${escapeHtml(JSON.stringify(n.outputShape))}</b></div>` : ""}
       ${attrRows}
       ${n.reason ? `<div class="kv"><span>Note</span><b>${escapeHtml(n.reason)}</b></div>` : ""}`;
+    
     const weightsBody = hasWeight ? `
-      <div class="kv"><span>Name</span><b>${escapeHtml(n.weightInfo.name)}</b></div>
+      <div class="kv"><span>Name</span><b title="${escapeHtml(n.weightInfo.name)}">${escapeHtml(n.weightInfo.name)}</b></div>
       <div class="kv"><span>Shape</span><b>${escapeHtml(JSON.stringify(n.weightInfo.shape))}</b></div>
       <div class="kv"><span>Dtype</span><b>${escapeHtml(n.weightInfo.dtype)}</b></div>
       <div class="kv"><span>Params</span><b>${n.weightInfo.params.toLocaleString()}</b></div>
+      ${hasPreview ? `
+        <h4>Statistics</h4>
+        <div class="kv"><span>Min</span><b>${n.weightInfo.min.toFixed(6)}</b></div>
+        <div class="kv"><span>Max</span><b>${n.weightInfo.max.toFixed(6)}</b></div>
+        <div class="kv"><span>Mean</span><b>${n.weightInfo.mean.toFixed(6)}</b></div>
+        <div class="kv"><span>Std Dev</span><b>${n.weightInfo.std.toFixed(6)}</b></div>
+        <h4>Preview (first 5 values)</h4>
+        <div class="weight-preview">${n.weightInfo.preview.map(v => v.toFixed(6)).join(", ")}</div>
+      ` : ""}
     ` : `<div class="no-weight">No weight data for this node.</div>`;
 
     inspector.innerHTML = `
@@ -593,7 +600,7 @@ function makeGraphPane(key) {
   }
 
   function renderMinimap(data, graphW, graphH) {
-    minimap.style.display = "block";
+    minimap.classList.add("visible");
     const mmW = minimap.clientWidth, mmH = minimap.clientHeight - 16;
     const scale = Math.min(mmW / graphW, mmH / graphH) * 0.92;
 
@@ -649,7 +656,6 @@ function makeGraphPane(key) {
     container.scrollTop = Math.max(0, localY / scale - container.clientHeight / 2);
   }
 
-  // Grab-to-pan
   let panDrag = null;
   container.addEventListener("mousedown", (e) => {
     if (!state.panEnabled) return;
@@ -711,7 +717,6 @@ function makeGraphPane(key) {
 
 const graphPanes = { ini: makeGraphPane("ini"), cpp: makeGraphPane("cpp") };
 
-// ---- Code viewer ----
 function renderCode(content) {
   const escaped = escapeHtml(content);
   const highlighted = escaped
@@ -722,7 +727,6 @@ function renderCode(content) {
   document.getElementById("codeViewer").innerHTML = highlighted;
 }
 
-// ---- Profiler ----
 function renderProfile(p) {
   document.getElementById("profNote").textContent = p.note || (p.ran ? "" : "Not run: " + (p.reason || "unknown"));
   document.getElementById("bottleneckList").innerHTML = "";
@@ -764,7 +768,6 @@ function renderProfile(p) {
   }
 }
 
-// ---- Artifacts ----
 function renderArtifacts(items) {
   const body = document.getElementById("artifactsBody");
   body.innerHTML = "";

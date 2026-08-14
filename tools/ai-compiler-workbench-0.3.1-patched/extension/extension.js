@@ -206,13 +206,19 @@ async function sendChat(context, message) {
 
   const pythonPath = vscode.workspace.getConfiguration("aiCompilerWorkbench").get("pythonPath") || "python3";
   const apiKey = vscode.workspace.getConfiguration("aiCompilerWorkbench").get("anthropicApiKey") || "";
+  const clineApiKey = vscode.workspace.getConfiguration("cline").get("apiKey") || "";
+  const umsToken = process.env.CLINE_UMS_TOKEN || clineApiKey;
   const engineDir = path.join(context.extensionPath, "engine");
 
   post({ type: "engineEvent", event: { event: "chat", role: "user", content: message } });
 
   const chatEnv = { ...process.env };
   if (apiKey) chatEnv.ANTHROPIC_API_KEY = apiKey;
-  const proc = spawn(pythonPath, ["-m", "agents.chat_agent", outDir, message], { cwd: engineDir, env: chatEnv });
+  if (umsToken) chatEnv.CLINE_UMS_TOKEN = umsToken;
+  const args = ["-m", "agents.chat_agent", outDir, message];
+  if (apiKey) args.push(apiKey);
+  if (umsToken) args.push(umsToken);
+  const proc = spawn(pythonPath, args, { cwd: engineDir, env: chatEnv });
   let stdout = "";
   proc.stdout.on("data", (d) => (stdout += d.toString()));
   proc.stderr.on("data", (d) => output.append(d.toString()));

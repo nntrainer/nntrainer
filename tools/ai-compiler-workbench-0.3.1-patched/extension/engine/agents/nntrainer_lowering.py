@@ -1,22 +1,5 @@
 """
-NNTrainer Lowering Agent (no LLM).
-
-Runs right after Compatibility. Takes `state["semantic_ir"]` (built by
-an ArchitectureAdapter -- see api/adapters) and lowers it into
-`state["nntrainer_graph_ir"]`: the actual target graph, with real
-nntrainer layer types and genuine tensor dataflow. This is the ONLY
-graph the C++ generator and the "nntrainer Graph" webview tab consume
-from here on -- see converters/cpp_generator.py and
-agents/graph_views.py.
-
-Two independent pieces of work only depend on `semantic_ir` and not on
-each other -- the source-side "Model Graph" view, and the target-side
-lowering + validation -- so they run concurrently on a small thread
-pool rather than sequentially.
-
-If no adapter matched (state["semantic_ir"] is None), this agent is a
-no-op: the pipeline falls back to the pre-existing graph_ir/.ini/.cpp
-path for that architecture, unchanged.
+NNTrainer Lowering Agent - Converts semantic IR to nntrainer graph.
 """
 from concurrent.futures import ThreadPoolExecutor
 
@@ -38,6 +21,16 @@ def run(state: dict) -> dict:
         return state
 
     model_ir = CausalLMIR.from_dict(semantic_ir_dict)
+
+    weights_path = state.get("weights_path")
+    if weights_path:
+        try:
+            from ..utils.weight_reader import build_weight_cache
+            weight_cache = build_weight_cache(weights_path)
+            graph_views.set_weight_cache(weight_cache)
+            bus.log(f"Loaded weight preview cache: {len(weight_cache)} tensors")
+        except Exception as e:
+            bus.log(f"Warning: Could not build weight preview cache: {e}", "warn")
 
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="lowering-stage") as pool:
         model_view_future = pool.submit(graph_views.build_model_graph_view, model_ir)
