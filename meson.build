@@ -408,34 +408,35 @@ nntrainer_conf.set('INCLUDE_INSTALL_DIR', nntrainer_includedir / '..')
 nntrainer_conf.set('FLASH_STORAGE_UTILIZATION', nntrainer_enable_fsu)
 nntrainer_conf.set('FLASH_STORAGE_UTILIZATION_PATH', nntrainer_fsudir)
 
-ml_api_common_flag = '-DML_API_COMMON=0'
-
-# if ml-api-support is disabled, enable dummy common api interfaces and disable related dependencies.
-ml_api_common_dep = dependency(get_option('capi-ml-common-actual'), required : get_option('ml-api-support').enabled())
+ml_api_common_dep = dummy_dep
 nnstreamer_capi_dep = dummy_dep
-if (ml_api_common_dep.found())
-  nnstreamer_capi_dep = dependency(get_option('capi-ml-inference-actual'), required : get_option('ml-api-support').enabled())
-  if (nnstreamer_capi_dep.found())
-    nntrainer_conf.set('CAPI_ML_COMMON_DEP', get_option('capi-ml-common-actual'))
-    extra_defines += '-DML_API_COMMON=1'
-    ml_api_common_flag = '-DML_API_COMMON=1'
-    extra_defines += '-DNNSTREAMER_AVAILABLE=1'
-    # accessing this variable when dep_.not_found() remains hard error on purpose
-    supported_nnstreamer_capi = nnstreamer_capi_dep.version().version_compare('>=1.7.0')
-    if not supported_nnstreamer_capi
-      extra_defines += '-DUNSUPPORTED_NNSTREAMER=1'
-      warning('capi-nnstreamer version is too old, we do not know if it works with older nnstreamer version')
-    endif
-  else
-    # if nnstreamer_capi is not there and ml-api-support is "auto", disable it.
-    message ('ml-api-support is disabled although capi-ml-api-common is found: capi-ml-api-inference is not available and ml-api-support is configured to be auto')
-    nntrainer_conf.set('CAPI_ML_COMMON_DEP', '')
-    extra_defines += '-DML_API_COMMON=0'
+
+# android should not use host packages
+if get_option('platform') != 'android'
+  ml_api_common_dep = dependency(get_option('capi-ml-common-actual'), required : get_option('ml-api-support').enabled())
+  if ml_api_common_dep.found()
+    nnstreamer_capi_dep = dependency(get_option('capi-ml-inference-actual'), required : get_option('ml-api-support').enabled())
+  endif
+endif
+
+if nnstreamer_capi_dep.found()
+  nntrainer_conf.set('CAPI_ML_COMMON_DEP', get_option('capi-ml-common-actual'))
+  extra_defines += '-DML_API_COMMON=1'
+  extra_defines += '-DNNSTREAMER_AVAILABLE=1'
+  # accessing this variable when dep_.not_found() remains hard error on purpose
+  supported_nnstreamer_capi = nnstreamer_capi_dep.version().version_compare('>=1.7.0')
+  if not supported_nnstreamer_capi
+    extra_defines += '-DUNSUPPORTED_NNSTREAMER=1'
+    warning('capi-nnstreamer version is too old, we do not know if it works with older nnstreamer version')
   endif
 else
   nntrainer_conf.set('CAPI_ML_COMMON_DEP', '')
   extra_defines += '-DML_API_COMMON=0'
+  if ml_api_common_dep.found()
+    message('ml-api-support disabled: capi-ml-inference not found though capi-ml-common is')
+  endif
 endif
+
 blas_dep = dummy_dep
 # Dependencies
 if get_option('enable-cublas')
@@ -669,18 +670,31 @@ else
 endif
 endif # enable ruy
 
+build_capi = get_option('enable-capi').enabled() or \
+  (get_option('enable-capi').auto() and get_option('enable-ccapi') and nnstreamer_capi_dep.found())
+
 if get_option('platform') == 'android'
-  message('preparing ml api')
-  run_command([meson.source_root() / 'jni' / 'prepare_ml-api.sh', meson.build_root() / 'ml-api-inference'], check: true)
-  ml_api_common_root = meson.build_root() / 'ml-api-inference'
-  ml_api_inc = ml_api_common_root / 'include'
-  meson.add_install_script(
-    'sh', '-c', 'cp @0@ ${DESTDIR}@1@'.format(ml_api_inc / 'ml-api-common.h', nntrainer_includedir)
-  )
-  meson.add_install_script(
-    'sh', '-c', 'cp @0@ ${DESTDIR}@1@'.format(ml_api_inc / 'tizen_error.h', nntrainer_includedir)
-  )
-  ml_api_common_dep = declare_dependency(include_directories: ['ml-api-inference/include'])
+  # ml-api is only consumed by capi, prepare it only when capi is built.
+  if build_capi
+    message('preparing ml api')
+    run_command([meson.source_root() / 'jni' / 'prepare_ml-api.sh', meson.build_root() / 'ml-api-inference'], check: true)
+    ml_api_common_root = meson.build_root() / 'ml-api-inference'
+    ml_api_inc = ml_api_common_root / 'include'
+    meson.add_install_script(
+      'sh', '-c', 'cp @0@ ${DESTDIR}@1@'.format(ml_api_inc / 'ml-api-common.h', nntrainer_includedir)
+    )
+    meson.add_install_script(
+      'sh', '-c', 'cp @0@ ${DESTDIR}@1@'.format(ml_api_inc / 'tizen_error.h', nntrainer_includedir)
+    )
+    ml_api_common_dep = declare_dependency(include_directories: ['ml-api-inference/include'])
+    # ml-api available now: enable ML_API_COMMON (default was disabled above).
+    extra_defines += '-DML_API_COMMON=1'
+    extra_defines += '-DNNSTREAMER_AVAILABLE=1'
+  else
+    message('capi is disabled; skipping ml-api preparation for android build')
+    ml_api_common_root = ''
+    ml_api_common_dep = dummy_dep
+  endif
 endif
 
 if get_option('enable-nnstreamer-backbone') and get_option('platform') != 'android'

@@ -104,8 +104,6 @@ else
   and_conf.set('MESON_HAS_TFLITE', 0)
 endif
 
-# -DML_API_COMMON=[01]
-and_conf.set('ML_API_COMMON', ml_api_common_flag)
 
 if blas_dep.found()
   and_conf.set('MESON_BLAS_ROOT', blas_root)
@@ -113,10 +111,14 @@ else
   error('blas is needed for the android build')
 endif
 
+# ml-api is only prepared when capi is enabled (see meson.build); when absent,
+# expose MESON_HAS_ML_API=0 instead of erroring (Android.mk guards on it).
 if ml_api_common_dep.found()
+  and_conf.set('MESON_HAS_ML_API', 1)
   and_conf.set('MESON_ML_API_COMMON_ROOT', ml_api_common_root)
 else
-  error('ml api common dep is needed for the android build')
+  and_conf.set('MESON_HAS_ML_API', 0)
+  and_conf.set('MESON_ML_API_COMMON_ROOT', '')
 endif
 
 if get_option('enable-npu')
