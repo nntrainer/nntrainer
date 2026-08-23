@@ -295,35 +295,127 @@ std::shared_ptr<QuantLut> loadUfixed8Manifest(const std::string &manifest_path,
   return lut;
 }
 
+/**
+ * @brief sfixed4 sidecar: packed signed-4bit nibbles (low nibble first, two's
+ *        complement) with fp32 scales. Two scale layouts, keyed by the
+ *        manifest's "quant-type":
+ *          - "per-row-symmetric" (default): ONE scale per row.
+ *          - "per-row-per-block-symmetric": each row splits into equal-width
+ *            blocks, one scale per (row, block) -- the folded per-layer table,
+ *            where a block is one decoder layer's slice. The block count comes
+ *            from quant-param.scale-shape [rows, nblocks] and/or the top-level
+ *            block width "size-per-layer"; when both are present they must
+ *            agree (size == nblocks * size-per-layer).
+ *        Scales come from the inline quant-param.scale list, or from
+ *        quant-param.scale-path: a raw little-endian fp32 file resolved like
+ *        lut-path. The file form exists because the per-block table's inline
+ *        list is rows*nblocks floats (~237MB of JSON for a full token
+ *        table) and parsing it would wreck init latency; when both are
+ *        present the file wins.
+ */
 std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
                                               const nlohmann::json &json) {
   const auto lut_path = requireJsonStringField(json, "lut-path", manifest_path);
   const auto &quant_param =
     requireJsonObjectField(json, "quant-param", manifest_path);
-  NNTR_THROW_IF(!quant_param.contains("scale") ||
-                  !quant_param.at("scale").is_array(),
+
+  const std::string quant_type =
+    json.contains("quant-type")
+      ? requireJsonStringField(json, "quant-type", manifest_path)
+      : std::string("per-row-symmetric");
+  const bool per_block = quant_type == "per-row-per-block-symmetric";
+  NNTR_THROW_IF(!per_block && quant_type != "per-row-symmetric",
                 std::runtime_error)
     << "Malformed LUT manifest " << manifest_path
-    << ": sfixed4 expects quant-param.scale array";
+    << ": unsupported sfixed4 quant-type '" << quant_type << "'";
+
+  const bool has_scale_path = quant_param.contains("scale-path");
+  NNTR_THROW_IF(!has_scale_path && (!quant_param.contains("scale") ||
+                                    !quant_param.at("scale").is_array()),
+                std::runtime_error)
+    << "Malformed LUT manifest " << manifest_path
+    << ": sfixed4 expects quant-param.scale array or quant-param.scale-path";
 
   auto lut = std::make_shared<QuantLut>();
   lut->out_dim = requireJsonSizeField(json, "size", manifest_path);
   lut->is_raw_u16 = false;
   lut->is_signed4 = true;
-  attachPayload(*lut, resolveLutPath(manifest_path, lut_path));
-  lut->row_scales.reserve(quant_param.at("scale").size());
 
-  for (const auto &scale : quant_param.at("scale")) {
-    NNTR_THROW_IF(!scale.is_number(), std::runtime_error)
+  // Per-block geometry. A block boundary MAY fall inside a nibble byte (each
+  // nibble resolves its own column, unlike the QS4CX group decode), so no
+  // evenness constraint on the block width -- only that it tiles the row.
+  size_t shape_rows = 0;
+  if (per_block) {
+    size_t nblocks = 0;
+    if (quant_param.contains("scale-shape")) {
+      const auto &shape = quant_param.at("scale-shape");
+      NNTR_THROW_IF(!shape.is_array() || shape.size() != 2 ||
+                      !shape[0].is_number_integer() ||
+                      !shape[1].is_number_integer() ||
+                      shape[0].get<long long>() <= 0 ||
+                      shape[1].get<long long>() <= 0,
+                    std::runtime_error)
+        << "Malformed LUT manifest " << manifest_path
+        << ": scale-shape must be a positive [rows, nblocks] pair";
+      shape_rows = shape[0].get<size_t>();
+      nblocks = shape[1].get<size_t>();
+    }
+    if (json.contains("size-per-layer")) {
+      const size_t block_width =
+        requireJsonSizeField(json, "size-per-layer", manifest_path);
+      NNTR_THROW_IF(lut->out_dim % block_width != 0, std::invalid_argument)
+        << "Malformed LUT manifest " << manifest_path << ": size-per-layer "
+        << block_width << " must divide size " << lut->out_dim;
+      const size_t derived = lut->out_dim / block_width;
+      NNTR_THROW_IF(nblocks != 0 && nblocks != derived, std::invalid_argument)
+        << "Malformed LUT manifest " << manifest_path << ": scale-shape blocks "
+        << nblocks << " disagree with size/size-per-layer = " << derived;
+      nblocks = derived;
+    }
+    NNTR_THROW_IF(nblocks == 0, std::runtime_error)
       << "Malformed LUT manifest " << manifest_path
-      << ": sfixed4 row scale must be numeric";
-    lut->row_scales.push_back(scale.get<float>());
+      << ": per-row-per-block-symmetric needs scale-shape or size-per-layer";
+    NNTR_THROW_IF(lut->out_dim % nblocks != 0, std::invalid_argument)
+      << "Malformed LUT manifest " << manifest_path << ": " << nblocks
+      << " blocks must tile size " << lut->out_dim;
+    lut->sfixed4_blocks = nblocks;
   }
 
+  attachPayload(*lut, resolveLutPath(manifest_path, lut_path));
   derivePacked4BitDimensions(*lut, manifest_path);
-  NNTR_THROW_IF(lut->row_scales.size() != lut->in_dim, std::invalid_argument)
-    << "sfixed4 row scale count " << lut->row_scales.size()
-    << " does not match in_dim " << lut->in_dim << " for " << manifest_path;
+
+  const size_t expected_scales = lut->in_dim * lut->sfixed4_blocks;
+  if (has_scale_path) {
+    const auto scale_path =
+      requireJsonStringField(quant_param, "scale-path", manifest_path);
+    const auto scale_bytes =
+      readBinaryFile(resolveLutPath(manifest_path, scale_path));
+    NNTR_THROW_IF(scale_bytes.size() != expected_scales * sizeof(float),
+                  std::runtime_error)
+      << "sfixed4 scale file size " << scale_bytes.size()
+      << " does not match rows*blocks*4 (" << expected_scales * sizeof(float)
+      << ") for " << manifest_path;
+    lut->row_scales.resize(expected_scales);
+    std::memcpy(lut->row_scales.data(), scale_bytes.data(), scale_bytes.size());
+  } else {
+    lut->row_scales.reserve(quant_param.at("scale").size());
+    for (const auto &scale : quant_param.at("scale")) {
+      NNTR_THROW_IF(!scale.is_number(), std::runtime_error)
+        << "Malformed LUT manifest " << manifest_path
+        << ": sfixed4 row scale must be numeric";
+      lut->row_scales.push_back(scale.get<float>());
+    }
+  }
+
+  NNTR_THROW_IF(lut->row_scales.size() != expected_scales,
+                std::invalid_argument)
+    << "sfixed4 scale count " << lut->row_scales.size()
+    << " does not match rows*blocks (" << lut->in_dim << "*"
+    << lut->sfixed4_blocks << ") for " << manifest_path;
+  NNTR_THROW_IF(shape_rows != 0 && shape_rows != lut->in_dim,
+                std::invalid_argument)
+    << "sfixed4 scale-shape rows " << shape_rows << " does not match payload "
+    << lut->in_dim << " for " << manifest_path;
 
   return lut;
 }
@@ -483,13 +575,17 @@ void validateDecodeArgs(const QuantLut &lut, size_t token_idx,
     << lut.out_dim;
 }
 
-float decodePacked4BitValue(const QuantLut &lut, size_t token_idx,
+float decodePacked4BitValue(const QuantLut &lut, size_t token_idx, size_t col,
                             uint8_t nibble, float layer_scale) {
   if (lut.is_signed4) {
-    NNTR_THROW_IF(lut.row_scales.size() != lut.in_dim, std::runtime_error)
-      << "sfixed4 LUT row scale count does not match in_dim";
+    NNTR_THROW_IF(lut.row_scales.size() != lut.in_dim * lut.sfixed4_blocks,
+                  std::runtime_error)
+      << "sfixed4 LUT scale count does not match rows*blocks";
+    // sfixed4_blocks == 1 collapses to the original one-scale-per-row lookup.
+    const size_t block_width = lut.out_dim / lut.sfixed4_blocks;
     return static_cast<float>(decodeSigned4(nibble)) *
-           lut.row_scales[token_idx] * layer_scale;
+           lut.row_scales[token_idx * lut.sfixed4_blocks + col / block_width] *
+           layer_scale;
   }
 
   return (static_cast<float>(nibble & 0x0fU) + static_cast<float>(lut.offset)) *
@@ -512,9 +608,10 @@ void decodePacked4BitRowToFloatType(const QuantLut &lut, size_t token_idx,
   for (size_t i = 0; i < bytes_per_row; ++i) {
     const uint8_t byte = row[i];
     output[i * 2] = static_cast<T>(
-      decodePacked4BitValue(lut, token_idx, byte & 0x0fU, layer_scale));
+      decodePacked4BitValue(lut, token_idx, i * 2, byte & 0x0fU, layer_scale));
     output[i * 2 + 1] = static_cast<T>(
-      decodePacked4BitValue(lut, token_idx, byte >> 4, layer_scale));
+      decodePacked4BitValue(lut, token_idx, i * 2 + 1, byte >> 4,
+                            layer_scale));
   }
 }
 
@@ -577,9 +674,10 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
   for (size_t i = 0; i < bytes_per_row; ++i) {
     const uint8_t byte = row[i];
     output[i * 2] = clampFloatToU16(
-      decodePacked4BitValue(lut, token_idx, byte & 0x0fU, layer_scale));
+      decodePacked4BitValue(lut, token_idx, i * 2, byte & 0x0fU, layer_scale));
     output[i * 2 + 1] = clampFloatToU16(
-      decodePacked4BitValue(lut, token_idx, byte >> 4, layer_scale));
+      decodePacked4BitValue(lut, token_idx, i * 2 + 1, byte >> 4,
+                            layer_scale));
   }
 }
 
@@ -606,9 +704,9 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
   for (size_t i = 0; i < bytes_per_row; ++i) {
     const uint8_t byte = row[i];
     const float lo =
-      decodePacked4BitValue(lut, token_idx, byte & 0x0fU, layer_scale);
-    const float hi =
-      decodePacked4BitValue(lut, token_idx, byte >> 4, layer_scale);
+      decodePacked4BitValue(lut, token_idx, i * 2, byte & 0x0fU, layer_scale);
+    const float hi = decodePacked4BitValue(lut, token_idx, i * 2 + 1,
+                                           byte >> 4, layer_scale);
 
     output[i * 2] = clampRoundedToU16(
       std::round(static_cast<double>(lo) / output_quant_scale) -
@@ -763,6 +861,49 @@ void EmbeddingLayer::forwardSidecarLut(nntrainer::RunLayerContext &context,
   const auto output_dtype = hidden.getDataType();
   const unsigned int batch_size = input.batch();
 
+  // True only on the CUDA device-only activation pool; declared for every
+  // build so the row loop below has ONE shape instead of two.
+  bool emb_dev_only = false;
+  (void)emb_dev_only; // only the CUDA blocks below read it
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Device-only activation pool: this decode writes rows through host
+  // pointers, so when the output lives in real device memory (the CUDA
+  // activation pool -- not just NNTR_CUDA_DEV_ACT; a planner may place
+  // the embedding output on-device too) decode into the layer's pinned
+  // staging buffer and push it H2D on the backend stream. Same mechanism,
+  // same pinned/persistent/per-instance buffer and the same reasons, as the
+  // ggml branch of incremental_forwarding -- see the long comment there.
+  const size_t act_esz =
+    (output_dtype == nntrainer::TensorDim::DataType::FP32) ? 4u : 2u;
+  if (nntrainer::cuda::engine_selected()) {
+    cudaPointerAttributes pa{};
+    emb_dev_only =
+      cudaPointerGetAttributes(&pa, hidden.getData<char>()) == cudaSuccess &&
+      pa.type == cudaMemoryTypeDevice;
+    cudaGetLastError();
+#ifndef ENABLE_FP16
+    NNTR_THROW_IF(emb_dev_only &&
+                    output_dtype == nntrainer::TensorDim::DataType::FP16,
+                  std::runtime_error)
+      << "embedding: FP16 activation on the device-only CUDA pool needs an "
+         "fp16-enabled build";
+#endif
+    if (emb_dev_only) {
+      const size_t need = (size_t)iter * out_dim * act_esz;
+      if (need > cuda_stage_cap) {
+        emb_stage_h2d_wait(); // buffer may be freed under an in-flight copy
+        if (cuda_stage)
+          cudaFreeHost(cuda_stage);
+        cudaHostAlloc(&cuda_stage, need, cudaHostAllocDefault);
+        cuda_stage_cap = need;
+      }
+      NNTR_THROW_IF(cuda_stage == nullptr, std::runtime_error)
+        << "embedding: pinned staging allocation failed for the device-only "
+           "activation pool";
+    }
+  }
+#endif
+
   NNTR_THROW_IF(quant_lut->is_raw_u16 &&
                   output_dtype != nntrainer::TensorDim::DataType::UINT16,
                 std::runtime_error)
@@ -774,13 +915,22 @@ void EmbeddingLayer::forwardSidecarLut(nntrainer::RunLayerContext &context,
     const float *input_data =
       input.getAddress<float>(batch * input.getDim().getFeatureLen());
     nntrainer::Tensor batch_hidden = hidden.getBatchSlice(batch, 1);
+    char *out_base = batch_hidden.getData<char>();
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    if (emb_dev_only) {
+      // The previous token's (or batch's) H2D from this pinned buffer may
+      // still be in flight -- wait before the host rewrites it.
+      emb_stage_h2d_wait();
+      out_base = static_cast<char *>(cuda_stage);
+    }
+#endif
 
     tm.parallel_for(0, static_cast<size_t>(iter), [&](size_t i) {
       const size_t token_idx = static_cast<size_t>(input_data[i]);
       const size_t output_offset = static_cast<size_t>(out_dim) * i;
 
       if (output_dtype == nntrainer::TensorDim::DataType::UINT16) {
-        auto output = batch_hidden.getData<uint16_t>() + output_offset;
+        auto output = reinterpret_cast<uint16_t *>(out_base) + output_offset;
         if (has_output_quant_scale) {
           decode_quant_lut_row_to_uint16(*quant_lut, token_idx, scale,
                                          out_scale, out_offset, output,
@@ -796,7 +946,7 @@ void EmbeddingLayer::forwardSidecarLut(nntrainer::RunLayerContext &context,
         << "Raw UINT16 LUT requires UINT16 output dtype";
 
       if (output_dtype == nntrainer::TensorDim::DataType::FP32) {
-        auto output = batch_hidden.getData<float>() + output_offset;
+        auto output = reinterpret_cast<float *>(out_base) + output_offset;
         decode_quant_lut_row_to_fp32(*quant_lut, token_idx, scale, output,
                                      out_dim);
         return;
@@ -804,7 +954,7 @@ void EmbeddingLayer::forwardSidecarLut(nntrainer::RunLayerContext &context,
 
 #ifdef ENABLE_FP16
       if (output_dtype == nntrainer::TensorDim::DataType::FP16) {
-        auto output = batch_hidden.getData<_FP16>() + output_offset;
+        auto output = reinterpret_cast<_FP16 *>(out_base) + output_offset;
         decodePacked4BitRowToFloatType(*quant_lut, token_idx, scale, output,
                                        out_dim);
         return;
@@ -814,6 +964,35 @@ void EmbeddingLayer::forwardSidecarLut(nntrainer::RunLayerContext &context,
       throw std::runtime_error(
         "Embedding sidecar LUT does not support output dtype");
     });
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // Push the host-decoded rows into the device-only output on the backend
+    // stream (ordered before the GPU consumer). Sync/async convention is the
+    // ggml branch's: Windows defaults to a fully-synchronous upload,
+    // NNTR_CUDA_EMB_SYNCCOPY=0/1 overrides.
+    if (emb_dev_only) {
+      static const bool emb_synccopy = []() {
+        const char *e = std::getenv("NNTR_CUDA_EMB_SYNCCOPY");
+        if (e)
+          return e[0] == '1';
+#ifdef _WIN32
+        return true;
+#else
+        return false;
+#endif
+      }();
+      void *dst = batch_hidden.getData<char>();
+      const size_t bytes = (size_t)iter * out_dim * act_esz;
+      if (emb_synccopy &&
+          !nntrainer::cuda::StreamManager::Global().isCapturing()) {
+        cudaMemcpy(dst, cuda_stage, bytes, cudaMemcpyHostToDevice);
+      } else {
+        cudaMemcpyAsync(dst, cuda_stage, bytes, cudaMemcpyHostToDevice,
+                        nntrainer::cuda::StreamManager::Global().GetStream());
+        emb_stage_h2d_record();
+      }
+    }
+#endif
   }
 }
 

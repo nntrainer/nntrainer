@@ -102,6 +102,14 @@ struct QuantLut {
     nntrainer::TensorDim::DataType::NONE;
   size_t row_bytes = 0; ///< payload stride per row (ggml mode)
 
+  /// sfixed4 only: how many equal-width scale blocks a row is split into.
+  /// 1 = ONE scale per row (manifest quant-type "per-row-symmetric", the
+  /// original layout). >1 is "per-row-per-block-symmetric" (the folded
+  /// per-layer table: one block per decoder layer), where
+  /// row_scales[row * blocks + col / (out_dim / blocks)] scales column `col`.
+  size_t sfixed4_blocks = 1;
+
+
   void *mmap_ptr = nullptr;
   size_t mmap_len = 0;
 
