@@ -575,21 +575,61 @@ void validateDecodeArgs(const QuantLut &lut, size_t token_idx,
     << lut.out_dim;
 }
 
-float decodePacked4BitValue(const QuantLut &lut, size_t token_idx, size_t col,
-                            uint8_t nibble, float layer_scale) {
+/// Decodes one packed-4-bit row, calling emit(col, value) for every column in
+/// order. The per-element overhead the old per-nibble helper paid on every
+/// value is hoisted: the scale-count check runs once per row (it is also
+/// enforced at manifest-load time), the block geometry (block_width and the
+/// row's scale-base pointer) is resolved once per row, and the inner nibble
+/// loop is pure multiply-adds. The arithmetic (same fp32 ops, same order) is
+/// unchanged, so outputs stay byte-identical.
+template <typename Emit>
+void forEachPacked4BitValue(const QuantLut &lut, size_t token_idx,
+                            float layer_scale, Emit &&emit) {
+  NNTR_THROW_IF(lut.out_dim % 2 != 0, std::runtime_error)
+    << "4-bit packed LUT requires even out_dim, got " << lut.out_dim;
+
+  const size_t bytes_per_row = lut.out_dim / 2;
+  const uint8_t *row = lut.data() + token_idx * bytes_per_row;
+
   if (lut.is_signed4) {
     NNTR_THROW_IF(lut.row_scales.size() != lut.in_dim * lut.sfixed4_blocks,
                   std::runtime_error)
       << "sfixed4 LUT scale count does not match rows*blocks";
     // sfixed4_blocks == 1 collapses to the original one-scale-per-row lookup.
     const size_t block_width = lut.out_dim / lut.sfixed4_blocks;
-    return static_cast<float>(decodeSigned4(nibble)) *
-           lut.row_scales[token_idx * lut.sfixed4_blocks + col / block_width] *
-           layer_scale;
+    const float *scale =
+      lut.row_scales.data() + token_idx * lut.sfixed4_blocks;
+    // A block boundary MAY fall inside a nibble byte (odd block_width), so
+    // walk the scale pointer with a per-nibble countdown instead of assuming
+    // byte-aligned blocks (or dividing col / block_width per nibble).
+    size_t left = block_width;
+    for (size_t i = 0; i < bytes_per_row; ++i) {
+      const uint8_t byte = row[i];
+      emit(i * 2, static_cast<float>(decodeSigned4(byte & 0x0fU)) * *scale *
+                    layer_scale);
+      if (--left == 0) {
+        ++scale;
+        left = block_width;
+      }
+      emit(i * 2 + 1, static_cast<float>(decodeSigned4(byte >> 4)) * *scale *
+                        layer_scale);
+      if (--left == 0) {
+        ++scale;
+        left = block_width;
+      }
+    }
+    return;
   }
 
-  return (static_cast<float>(nibble & 0x0fU) + static_cast<float>(lut.offset)) *
-         lut.scale * layer_scale;
+  const float offset = static_cast<float>(lut.offset);
+  const float scale = lut.scale;
+  for (size_t i = 0; i < bytes_per_row; ++i) {
+    const uint8_t byte = row[i];
+    emit(i * 2,
+         (static_cast<float>(byte & 0x0fU) + offset) * scale * layer_scale);
+    emit(i * 2 + 1,
+         (static_cast<float>(byte >> 4) + offset) * scale * layer_scale);
+  }
 }
 
 template <typename T>
@@ -599,20 +639,11 @@ void decodePacked4BitRowToFloatType(const QuantLut &lut, size_t token_idx,
   validateDecodeArgs(lut, token_idx, output_len);
   NNTR_THROW_IF(lut.is_raw_u16, std::runtime_error)
     << "Raw UINT16 LUT cannot be decoded to floating-point output";
-  NNTR_THROW_IF(lut.out_dim % 2 != 0, std::runtime_error)
-    << "4-bit packed LUT requires even out_dim, got " << lut.out_dim;
 
-  const size_t bytes_per_row = lut.out_dim / 2;
-  const uint8_t *row = lut.data() + token_idx * bytes_per_row;
-
-  for (size_t i = 0; i < bytes_per_row; ++i) {
-    const uint8_t byte = row[i];
-    output[i * 2] = static_cast<T>(
-      decodePacked4BitValue(lut, token_idx, i * 2, byte & 0x0fU, layer_scale));
-    output[i * 2 + 1] = static_cast<T>(
-      decodePacked4BitValue(lut, token_idx, i * 2 + 1, byte >> 4,
-                            layer_scale));
-  }
+  forEachPacked4BitValue(lut, token_idx, layer_scale,
+                         [output](size_t col, float value) {
+                           output[col] = static_cast<T>(value);
+                         });
 }
 
 } // namespace
@@ -665,20 +696,10 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
     return;
   }
 
-  NNTR_THROW_IF(lut.out_dim % 2 != 0, std::runtime_error)
-    << "4-bit packed LUT requires even out_dim, got " << lut.out_dim;
-
-  const size_t bytes_per_row = lut.out_dim / 2;
-  const uint8_t *row = lut.data() + token_idx * bytes_per_row;
-
-  for (size_t i = 0; i < bytes_per_row; ++i) {
-    const uint8_t byte = row[i];
-    output[i * 2] = clampFloatToU16(
-      decodePacked4BitValue(lut, token_idx, i * 2, byte & 0x0fU, layer_scale));
-    output[i * 2 + 1] = clampFloatToU16(
-      decodePacked4BitValue(lut, token_idx, i * 2 + 1, byte >> 4,
-                            layer_scale));
-  }
+  forEachPacked4BitValue(lut, token_idx, layer_scale,
+                         [output](size_t col, float value) {
+                           output[col] = clampFloatToU16(value);
+                         });
 }
 
 void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
@@ -695,26 +716,14 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
 
   NNTR_THROW_IF(output_quant_scale <= 0.0f, std::invalid_argument)
     << "output_quant_scale must be positive";
-  NNTR_THROW_IF(lut.out_dim % 2 != 0, std::runtime_error)
-    << "4-bit packed LUT requires even out_dim, got " << lut.out_dim;
-
-  const size_t bytes_per_row = lut.out_dim / 2;
-  const uint8_t *row = lut.data() + token_idx * bytes_per_row;
-
-  for (size_t i = 0; i < bytes_per_row; ++i) {
-    const uint8_t byte = row[i];
-    const float lo =
-      decodePacked4BitValue(lut, token_idx, i * 2, byte & 0x0fU, layer_scale);
-    const float hi = decodePacked4BitValue(lut, token_idx, i * 2 + 1,
-                                           byte >> 4, layer_scale);
-
-    output[i * 2] = clampRoundedToU16(
-      std::round(static_cast<double>(lo) / output_quant_scale) -
-      output_quant_offset);
-    output[i * 2 + 1] = clampRoundedToU16(
-      std::round(static_cast<double>(hi) / output_quant_scale) -
-      output_quant_offset);
-  }
+  forEachPacked4BitValue(
+    lut, token_idx, layer_scale,
+    [output, output_quant_scale, output_quant_offset](size_t col,
+                                                      float value) {
+      output[col] = clampRoundedToU16(
+        std::round(static_cast<double>(value) / output_quant_scale) -
+        output_quant_offset);
+    });
 }
 
 EmbeddingLayer::EmbeddingLayer() :
