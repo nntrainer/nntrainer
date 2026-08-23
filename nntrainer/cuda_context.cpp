@@ -19,6 +19,7 @@
 #include <activation_layer.h>
 #include <addition_layer.h>
 #include <compute_ops.h>
+#include <cuda_emb_gather.h>
 #include <cuda_mem_allocator.h>
 #include <cuda_rmsnorm_layer.h>
 #include <fc_layer_cl.h>
@@ -356,6 +357,9 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
     cudaGraphExecDestroy(cached_exec);
     cached_exec = nullptr;
     cached_out = {};
+    // The gather nodes captured in that graph are gone with it: the per-token
+    // feed must dispatch (or host-decode) eagerly until the next capture.
+    nntrainer::cuda::emb_gather_set_graph_live(false);
   }
 
   if (decode_graph && feed_declared && single_token) {

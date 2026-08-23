@@ -271,7 +271,19 @@ private:
    *  buffer and the second lookup overwrote the first one's still-in-flight
    *  async H2D copy => corrupted residual seed => CUDA garbage. */
   void *cuda_stage = nullptr;
-  size_t cuda_stage_cap = 0; ///< capacity in _FP16 elements
+  size_t cuda_stage_cap = 0; ///< capacity in BYTES (activation dtype varies)
+
+  /// On-GPU LUT gather (CUDA M==1 decode): cuda_emb_gather handle for this
+  /// layer's sidecar (-2 = not attempted, -1 = unavailable/refused, >= 0 =
+  /// registered). Plain ints so non-CUDA builds need no guards.
+  int cuda_gather_handle = -2;
+  /// True when the LIVE M2-B decode graph captured this layer's gather kernel
+  /// at the recorded epoch: the per-token feed then only publishes the token
+  /// id (the replay performs the gather). A graph captured WITHOUT the gather
+  /// (dispatch refused mid-capture) keeps false, so the feed still refreshes
+  /// the host staging that graph depends on.
+  bool cuda_gather_in_graph = false;
+  unsigned cuda_gather_epoch = 0;
 };
 } // namespace causallm
 

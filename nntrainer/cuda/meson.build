@@ -5,6 +5,7 @@ cuda_sources = [
   'cuda_buffer_manager.cpp',
   'cuda_module.cpp',
   'cuda_kernel.cpp',
+  'cuda_emb_gather.cpp',
   'cuda_compute_ops.cpp',
   'cuda_rmsnorm.cpp',
   'cuda_layernorm.cpp',

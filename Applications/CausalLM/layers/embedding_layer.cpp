@@ -21,13 +21,24 @@
 #include <thread_manager.h>
 #include <util_func.h>
 
+#include <cstdio>
 #include <vector>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
+#include <cuda_emb_gather.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 
+// These helpers stay under the plain ENABLE_CUDA guard. They were briefly
+// narrowed to `ENABLE_CUDA && ENABLE_FP16`, because at that point every call
+// site was FP16-only and -Werror=unused-function fails a cuda=true / fp16=false
+// build on a definition nothing reaches. The device-gather staging path added
+// below reintroduces a caller that is FP16-independent (see the
+// `emb_stage_h2d_wait()` before the staging buffer is reallocated, which is
+// guarded by ENABLE_CUDA alone and whose fp16-off behaviour is spelled out by
+// the `#ifndef ENABLE_FP16` throw next to it), so the narrow guard would now
+// break exactly the configuration it was added to fix.
 namespace {
 // NNTR_CUDA_ASYNC guard for the pinned embedding staging buffers: in async
 // mode nothing drains the stream per-op, so the NEXT token's host dequant can
@@ -67,7 +78,7 @@ void emb_stage_h2d_wait() {
   g_emb_h2d_pending = false;
 }
 } // namespace
-#endif
+#endif // ENABLE_CUDA
 
 #include "../third_party/nlohmann/json.hpp"
 
@@ -917,6 +928,82 @@ void EmbeddingLayer::forwardSidecarLut(nntrainer::RunLayerContext &context,
                   output_dtype != nntrainer::TensorDim::DataType::UINT16,
                 std::runtime_error)
     << "Raw UINT16 LUT requires UINT16 output dtype";
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // On-GPU gather+dequant for the M==1 decode step. The GPU reads the
+  // packed row + scales IN PLACE (HMM zero-copy over the existing mmap/heap
+  // -- no pinned copy, no registration, no residency change) and writes the
+  // activation row where the staged H2D used to land; the token id reaches a
+  // captured graph through the pinned-slot 4-byte H2D recorded with the
+  // gather (cuda_set_pos pattern), so the per-token M2-B feed collapses to
+  // ONE host store. Registration (NVRTC compile + id-slot alloc + advise) is
+  // attempted on ANY eligible call -- prefill included, so it always lands
+  // BEFORE the first decode capture, where allocation would be illegal.
+  // Everything else (prefill M>1, batch>1, ufixed/raw/ggml rows, uint16 or
+  // quantized outputs, no HMM, NNTR_CUDA_EMB_GATHER=0) keeps the host path.
+  static const bool eg_dbg = std::getenv("NNTR_CUDA_EMB_GATHER_DBG") != nullptr;
+  if (eg_dbg) {
+    static int eg_dbg_n = 0;
+    if (++eg_dbg_n <= 8)
+      std::fprintf(stderr,
+                   "[EMB_GATHER_DBG] call iter=%u dev_only=%d signed4=%d "
+                   "raw=%d oq=%d dtype=%d batch=%u handle=%d\n",
+                   iter, (int)emb_dev_only, (int)quant_lut->is_signed4,
+                   (int)quant_lut->is_raw_u16, (int)has_output_quant_scale,
+                   (int)output_dtype, batch_size, cuda_gather_handle);
+  }
+  if (emb_dev_only && quant_lut->is_signed4 && !quant_lut->is_raw_u16 &&
+      !has_output_quant_scale &&
+      (output_dtype == nntrainer::TensorDim::DataType::FP32 ||
+       output_dtype == nntrainer::TensorDim::DataType::FP16)) {
+    auto &sm = nntrainer::cuda::StreamManager::Global();
+    if (cuda_gather_handle == -2 && !sm.isCapturing()) {
+      cuda_gather_handle = nntrainer::cuda::emb_gather_register_lut(
+        quant_lut->data(), quant_lut->payload_size(),
+        quant_lut->row_scales.data(), quant_lut->row_scales.size(),
+        (unsigned)quant_lut->in_dim, (unsigned)quant_lut->out_dim,
+        (unsigned)quant_lut->sfixed4_blocks);
+    }
+    if (cuda_gather_handle >= 0 && iter > 1 && !sm.isCapturing()) {
+      // Prefill: batch-warm this chunk's row pages on the side stream (the
+      // decode vocabulary is dominated by the prompt vocabulary, so this
+      // removes most decode-time HMM cold faults). Host path continues below.
+      for (unsigned int b = 0; b < batch_size; ++b)
+        nntrainer::cuda::emb_gather_warm_ids(
+          cuda_gather_handle,
+          input.getAddress<float>(b * input.getDim().getFeatureLen()), iter);
+    }
+    if (cuda_gather_handle >= 0 && iter == 1 && batch_size == 1) {
+      const int tok = (int)input.getAddress<float>(0)[0];
+      // Publish the id for the (captured or eager) 4-byte H2D, and warm the
+      // row's pages if a host-sampled id skipped the argmax notify hook.
+      nntrainer::cuda::emb_gather_set_token(cuda_gather_handle, tok);
+      const bool fp16_out =
+        output_dtype == nntrainer::TensorDim::DataType::FP16;
+      char *dst = hidden.getData<char>();
+      if (sm.isCapturing()) {
+        if (nntrainer::cuda::emb_gather_dispatch_s4(cuda_gather_handle, scale,
+                                                    dst, fp16_out)) {
+          cuda_gather_in_graph = true;
+          cuda_gather_epoch = nntrainer::cuda::emb_gather_epoch();
+          return;
+        }
+        cuda_gather_in_graph = false; // graph gets the staging H2D instead
+      } else if (nntrainer::cuda::emb_gather_graph_live() &&
+                 cuda_gather_in_graph &&
+                 cuda_gather_epoch == nntrainer::cuda::emb_gather_epoch()) {
+        // M2-B feed pass: the live graph replays the gather; the id store
+        // above is the entire per-token feed for this layer.
+        return;
+      } else if (nntrainer::cuda::emb_gather_dispatch_s4(cuda_gather_handle,
+                                                         scale, dst,
+                                                         fp16_out)) {
+        return; // eager decode step (no cached graph)
+      }
+      // dispatch refused: fall through to the host dequant+staging path.
+    }
+  }
+#endif
 
   auto &tm = nntrainer::ThreadManager::Global();
 

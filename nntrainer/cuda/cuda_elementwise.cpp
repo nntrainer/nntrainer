@@ -12,6 +12,8 @@
 
 #include "cuda_elementwise.h"
 
+#include "cuda_emb_gather.h" // early page-warm of the next token's LUT rows
+
 #include <cuda_context.h>
 #include <cuda_stream_manager.h>
 
@@ -275,6 +277,9 @@ bool argmax_dispatch(const void *logits_dev, bool is_fp16, unsigned int vocab,
                  cudaMemcpyDeviceToHost) != cudaSuccess)
     return false;
   *token_out_host = *g_am_oidx_host;
+  // Next token's id is first known here: kick the LUT page-warm now so the
+  // HMM prefetch overlaps the host detok/EOS/feed window (emb gather).
+  emb_gather_notify_token(*g_am_oidx_host);
   return true;
 }
 } // namespace
