@@ -752,15 +752,22 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
   // predicates below (generate() applies each only under its own triple
   // check, so the device route must mirror both or it would penalize where
   // the host would not).
-  const bool rp_active =
-    repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0;
+  const bool rp_active = repetition_penalty != 1 && input_ids != nullptr &&
+                         NUM_INPUT_IDS != 0;
   const bool bw_active = BAD_WORD_IDS.size() != 0 && NUM_BADWORDS != 0;
+  // The penalized device argmax replicates the host math bit-for-bit
+  // (cuda_argmax_penalized_fp16) but its id scratch is capped; oversize
+  // windows keep the host path. fp16-ness of the logits is only known from
+  // the stash inside the loop, so it is checked there, not here (a wrong
+  // guess by this hint costs one deferred conversion, never a wrong token).
+  const bool dev_penalty_fits =
+    (!rp_active || NUM_INPUT_IDS <= 512) && (!bw_active || NUM_BADWORDS <= 64);
   // Tell the NEXT incrementalInference whether the full-vocab host row is
   // going to be read at all. Recomputed every call, so a run that switches
   // sampling on pays one deferred conversion and then stops deferring.
   g_greedy_hint = cuda_argmax_enabled() && do_sample == false &&
                   logits_processor == nullptr && BATCH_SIZE == 1 &&
-                  !rp_active && !bw_active;
+                  dev_penalty_fits;
 #endif
   for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
@@ -769,21 +776,36 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
     // skipping the host std::max_element over the full-vocab buffer. Gated to
     // greedy (no sampling, no logits processor -- those consume logits on the
     // host) and only when incrementalInference stashed a device-accessible
-    // logits pointer for this (single, BATCH_SIZE==1) row. A repetition or
-    // bad-words penalty mutates the logits on the host, so those rows keep the
-    // host path.
+    // logits pointer for this (single, BATCH_SIZE==1) row. Repetition penalty
+    // and bad words no longer force the host path: for fp16 logits they run
+    // on-device through cuda_argmax_penalized_fp16, which replays the host
+    // penalty loops bit-for-bit in fp32 (see its contract) -- only fp32
+    // logits or over-cap id counts still fall back.
     if (cuda_argmax_enabled() && g_cuda_logits_dev != nullptr &&
-        do_sample == false && logits_processor == nullptr && !rp_active &&
-        !bw_active) {
+        do_sample == false && logits_processor == nullptr &&
+        ((!rp_active && !bw_active) ||
+         (g_cuda_logits_fp16 && dev_penalty_fits))) {
       unsigned int tok = 0;
-      const bool ok =
-        g_cuda_logits_fp16
-          ? nntrainer::cuda::cuda_argmax_fp16(
-              reinterpret_cast<const unsigned short *>(g_cuda_logits_dev),
-              NUM_VOCAB, &tok)
-          : nntrainer::cuda::cuda_argmax_fp32(
-              reinterpret_cast<const float *>(g_cuda_logits_dev), NUM_VOCAB,
-              &tok);
+      bool ok;
+      if (rp_active || bw_active) {
+        // Window ids walk batch rows like the host path (input_ids is
+        // advanced by MAX_SEQ_LEN per row below); BATCH_SIZE==1 here.
+        ok = nntrainer::cuda::cuda_argmax_penalized_fp16(
+          reinterpret_cast<const unsigned short *>(g_cuda_logits_dev),
+          NUM_VOCAB, rp_active ? input_ids : nullptr,
+          rp_active ? NUM_INPUT_IDS : 0,
+          bw_active ? BAD_WORD_IDS.data() : nullptr,
+          bw_active ? NUM_BADWORDS : 0, repetition_penalty, &tok);
+      } else {
+        ok =
+          g_cuda_logits_fp16
+            ? nntrainer::cuda::cuda_argmax_fp16(
+                reinterpret_cast<const unsigned short *>(g_cuda_logits_dev),
+                NUM_VOCAB, &tok)
+            : nntrainer::cuda::cuda_argmax_fp32(
+                reinterpret_cast<const float *>(g_cuda_logits_dev), NUM_VOCAB,
+                &tok);
+      }
       // Consume the stash regardless (it belongs to this call's logits row).
       g_cuda_logits_dev = nullptr;
       if (ok) {
