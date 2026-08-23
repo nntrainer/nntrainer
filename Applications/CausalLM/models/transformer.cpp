@@ -208,6 +208,8 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   EMBD_SIDECAR_EXPORT = nntr_cfg.value("embd_sidecar_export", std::string());
   LMHEAD_UNTIE =
     nntr_cfg.contains("lmhead_untie") && nntr_cfg["lmhead_untie"].get<bool>();
+  LMHEAD_TIE_LUT = nntr_cfg.contains("lmhead_tie_lut") &&
+                   nntr_cfg["lmhead_tie_lut"].get<bool>();
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();

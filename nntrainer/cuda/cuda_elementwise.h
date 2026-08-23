@@ -97,11 +97,10 @@ bool cuda_argmax_fp16(const unsigned short *logits_dev, unsigned int vocab,
  *         allocation under graph capture, or kernel failure.
  */
 bool cuda_argmax_penalized_fp16(const unsigned short *logits_dev,
-                                unsigned int vocab,
-                                const unsigned int *win_ids,
-                                unsigned int n_win,
-                                const unsigned int *bad_ids, unsigned int n_bad,
-                                float penalty, unsigned int *token_out_host);
+                                unsigned int vocab, const unsigned int *win_ids,
+                                unsigned int n_win, const unsigned int *bad_ids,
+                                unsigned int n_bad, float penalty,
+                                unsigned int *token_out_host);
 
 } // namespace nntrainer::cuda
 

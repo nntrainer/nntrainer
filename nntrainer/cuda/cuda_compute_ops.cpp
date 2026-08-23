@@ -408,6 +408,29 @@ public:
         return !(e != nullptr && e[0] == '0');
       }();
       const uint8_t *W = weight.getData<uint8_t>();
+#ifdef ENABLE_FP16
+      // [lmhead-tie-lut] Re-tied head: the lm_head's weight IS the embedding
+      // sidecar LUT, resident in VRAM since load, and W is a pure routing key
+      // -- no derived cache, no scale side buffer, and (with the plain payload
+      // dropped) no dereferenceable bytes behind W at all. That is why this
+      // arm sits BEFORE the scale/cache entry ticket below: a tied head passes
+      // neither test by construction (no fp16-scale cache is built for it, and
+      // the staging that would follow a cache miss would upload dropped pages).
+      // Shape gate only (the fp-act decode shape); the callee refuses unless
+      // the app registered THIS weight's LUT at load, so with the tie inactive
+      // the arm costs one mutexed pointer compare and falls through unchanged.
+      if (M == 1 && N >= (int)cuda::CUDA_FC_FPACT_MIN_N && at == DT::FP16 &&
+          hidden_.getDataType() == DT::FP16 &&
+          (int)weight.getDim().height() == K) {
+        auto *Xh =
+          reinterpret_cast<const unsigned short *>(input_.getData<_FP16>());
+        auto *Yh = reinterpret_cast<unsigned short *>(hidden_.getData<_FP16>());
+        if (nntrainer::cuda::dev_accessible(Xh) &&
+            cuda::cuda_fc_lmhead_tie_gemv_fp16(W, Xh, Yh, (unsigned)N,
+                                               (unsigned)K))
+          return;
+      }
+#endif
       // The only per-weight side buffer: the N fp16 per-channel scales the
       // dequant kernels read every call (cached UVM; built at load by the
       // prewarm, so this is a pure cache hit -- a miss under graph capture

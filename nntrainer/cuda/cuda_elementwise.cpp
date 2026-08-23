@@ -425,9 +425,8 @@ bool ensure_rp_scratch() {
     return true;
   if (StreamManager::Global().isCapturing())
     return false;
-  if (!g_rp_ids_host &&
-      cudaHostAlloc(&g_rp_ids_host, sizeof(int) * RP_MAX_IDS,
-                    cudaHostAllocDefault) != cudaSuccess)
+  if (!g_rp_ids_host && cudaHostAlloc(&g_rp_ids_host, sizeof(int) * RP_MAX_IDS,
+                                      cudaHostAllocDefault) != cudaSuccess)
     return false;
   if (!g_rp_ids_dev &&
       cudaMalloc(&g_rp_ids_dev, sizeof(int) * RP_MAX_IDS) != cudaSuccess)
@@ -443,10 +442,10 @@ bool ensure_rp_scratch() {
 } // namespace
 
 bool cuda_argmax_penalized_fp16(const unsigned short *logits_dev,
-                                unsigned int vocab,
-                                const unsigned int *win_ids, unsigned int n_win,
-                                const unsigned int *bad_ids, unsigned int n_bad,
-                                float penalty, unsigned int *token_out_host) {
+                                unsigned int vocab, const unsigned int *win_ids,
+                                unsigned int n_win, const unsigned int *bad_ids,
+                                unsigned int n_bad, float penalty,
+                                unsigned int *token_out_host) {
   if (logits_dev == nullptr || vocab == 0 || token_out_host == nullptr)
     return false;
   if (n_win > RP_MAX_WIN || n_bad > RP_MAX_BAD)
@@ -460,8 +459,8 @@ bool cuda_argmax_penalized_fp16(const unsigned short *logits_dev,
 
   auto kpen =
     CudaContext::Global().registerCudaKernel(RP_ARGMAX_SRC, "rp_penalize_f16");
-  auto kp1 = CudaContext::Global().registerCudaKernel(RP_ARGMAX_SRC,
-                                                      "argmax_p1_f16_rp");
+  auto kp1 =
+    CudaContext::Global().registerCudaKernel(RP_ARGMAX_SRC, "argmax_p1_f16_rp");
   auto kp2 = CudaContext::Global().registerCudaKernel(ARGMAX_SRC, "argmax_p2");
   if (!kpen || !kp1 || !kp2) {
     ml_loge("[CUDA] penalized argmax: kernel registration failed");

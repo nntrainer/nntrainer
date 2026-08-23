@@ -360,12 +360,11 @@ std::shared_ptr<QuantLut> loadSfixed4Manifest(const std::string &manifest_path,
     size_t nblocks = 0;
     if (quant_param.contains("scale-shape")) {
       const auto &shape = quant_param.at("scale-shape");
-      NNTR_THROW_IF(!shape.is_array() || shape.size() != 2 ||
-                      !shape[0].is_number_integer() ||
-                      !shape[1].is_number_integer() ||
-                      shape[0].get<long long>() <= 0 ||
-                      shape[1].get<long long>() <= 0,
-                    std::runtime_error)
+      NNTR_THROW_IF(
+        !shape.is_array() || shape.size() != 2 ||
+          !shape[0].is_number_integer() || !shape[1].is_number_integer() ||
+          shape[0].get<long long>() <= 0 || shape[1].get<long long>() <= 0,
+        std::runtime_error)
         << "Malformed LUT manifest " << manifest_path
         << ": scale-shape must be a positive [rows, nblocks] pair";
       shape_rows = shape[0].get<size_t>();
@@ -608,8 +607,7 @@ void forEachPacked4BitValue(const QuantLut &lut, size_t token_idx,
       << "sfixed4 LUT scale count does not match rows*blocks";
     // sfixed4_blocks == 1 collapses to the original one-scale-per-row lookup.
     const size_t block_width = lut.out_dim / lut.sfixed4_blocks;
-    const float *scale =
-      lut.row_scales.data() + token_idx * lut.sfixed4_blocks;
+    const float *scale = lut.row_scales.data() + token_idx * lut.sfixed4_blocks;
     // A block boundary MAY fall inside a nibble byte (odd block_width), so
     // walk the scale pointer with a per-nibble countdown instead of assuming
     // byte-aligned blocks (or dividing col / block_width per nibble).
@@ -622,8 +620,8 @@ void forEachPacked4BitValue(const QuantLut &lut, size_t token_idx,
         ++scale;
         left = block_width;
       }
-      emit(i * 2 + 1, static_cast<float>(decodeSigned4(byte >> 4)) * *scale *
-                        layer_scale);
+      emit(i * 2 + 1,
+           static_cast<float>(decodeSigned4(byte >> 4)) * *scale * layer_scale);
       if (--left == 0) {
         ++scale;
         left = block_width;
@@ -651,10 +649,9 @@ void decodePacked4BitRowToFloatType(const QuantLut &lut, size_t token_idx,
   NNTR_THROW_IF(lut.is_raw_u16, std::runtime_error)
     << "Raw UINT16 LUT cannot be decoded to floating-point output";
 
-  forEachPacked4BitValue(lut, token_idx, layer_scale,
-                         [output](size_t col, float value) {
-                           output[col] = static_cast<T>(value);
-                         });
+  forEachPacked4BitValue(
+    lut, token_idx, layer_scale,
+    [output](size_t col, float value) { output[col] = static_cast<T>(value); });
 }
 
 } // namespace
@@ -729,8 +726,7 @@ void decode_quant_lut_row_to_uint16(const QuantLut &lut, size_t token_idx,
     << "output_quant_scale must be positive";
   forEachPacked4BitValue(
     lut, token_idx, layer_scale,
-    [output, output_quant_scale, output_quant_offset](size_t col,
-                                                      float value) {
+    [output, output_quant_scale, output_quant_offset](size_t col, float value) {
       output[col] = clampRoundedToU16(
         std::round(static_cast<double>(value) / output_quant_scale) -
         output_quant_offset);
@@ -995,9 +991,8 @@ void EmbeddingLayer::forwardSidecarLut(nntrainer::RunLayerContext &context,
         // M2-B feed pass: the live graph replays the gather; the id store
         // above is the entire per-token feed for this layer.
         return;
-      } else if (nntrainer::cuda::emb_gather_dispatch_s4(cuda_gather_handle,
-                                                         scale, dst,
-                                                         fp16_out)) {
+      } else if (nntrainer::cuda::emb_gather_dispatch_s4(
+                   cuda_gather_handle, scale, dst, fp16_out)) {
         return; // eager decode step (no cached graph)
       }
       // dispatch refused: fall through to the host dequant+staging path.

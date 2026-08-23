@@ -643,6 +643,16 @@ protected:
    *  output_of_causallm on save. */
   bool LMHEAD_UNTIE = false;
 
+  /** [lmhead-tie-lut] re-tie the UNTIED lm_head onto the embedding sidecar
+   *  LUT at dispatch time (CUDA): the LUT payload+scales go device-resident
+   *  once at load and the head FC reads them instead of building its own
+   *  dp4a weight cache, so the head's QS4CX record stops costing VRAM (and
+   *  its host payload is droppable outright). Graph shape is untouched --
+   *  this is a routing flag, meaningful only with lmhead_untie and an
+   *  embedding_file_name sidecar; anything missing at load falls back to the
+   *  fp-act route with a warning. */
+  bool LMHEAD_TIE_LUT = false;
+
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int SLIDING_WINDOW_PATTERN = 5;
   unsigned int ROPE_THETA = 10000; /**< RoPE theta value */

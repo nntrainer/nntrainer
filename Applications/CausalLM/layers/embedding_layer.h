@@ -109,7 +109,6 @@ struct QuantLut {
   /// row_scales[row * blocks + col / (out_dim / blocks)] scales column `col`.
   size_t sfixed4_blocks = 1;
 
-
   void *mmap_ptr = nullptr;
   size_t mmap_len = 0;
 

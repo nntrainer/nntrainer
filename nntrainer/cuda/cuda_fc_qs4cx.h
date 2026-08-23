@@ -20,6 +20,8 @@
 #ifndef __CUDA_FC_QS4CX_H__
 #define __CUDA_FC_QS4CX_H__
 
+#include <cstddef>
+
 namespace nntrainer::cuda {
 
 /**
@@ -160,6 +162,61 @@ bool cuda_fc_qs4cx_dp4a_gemm_fp16(const unsigned short *Xh,
                                   const unsigned short *scales_fp16,
                                   unsigned short *Yh, unsigned int M,
                                   unsigned int N, unsigned int K);
+
+/**
+ * @brief [lmhead-tie-lut] Re-tie the lm_head onto the embedding sidecar LUT:
+ *        upload the LUT's packed sfixed4 payload ([N rows][K/2 bytes], low
+ *        nibble first, two's complement, NO +8 zero-point) and its N per-row
+ *        fp32 scales to DEVICE memory once, and bind them to @p weight_key --
+ *        the untied lm_head's QS4CX plain pointer, which from then on acts as
+ *        a pure routing key. The head's dp4a/i8 derived caches are never
+ *        built (that is the VRAM this tie saves; the LUT upload replaces
+ *        them byte-for-byte in the budget), and the head's own QS4CX payload
+ *        may be discarded outright.
+ *
+ *        The LUT rows are the embedding table PRE-SCALED by sqrt(K) (the
+ *        folded embedding fold); the tied GEMV compensates with a constant
+ *        1/sqrt(K) in the fp32 epilogue, so the logits are the LUT's own
+ *        quantization of the very tensor the QS4CX head record re-quantizes.
+ *
+ *        Call at load time, outside graph capture (registration compiles the
+ *        kernel and cudaMallocs -- both illegal under capture). Idempotent
+ *        for the same key/geometry. Returns false (and leaves nothing
+ *        registered -- the caller must then keep the normal fp-act prewarm)
+ *        on geometry mismatch, allocation/copy/compile failure, or capture.
+ */
+bool cuda_fc_lmhead_tie_lut_register(
+  const void *weight_key, const void *lut_payload, size_t payload_bytes,
+  const float *scales_fp32, size_t scale_count, unsigned int N, unsigned int K);
+
+/** @brief [lmhead-tie-lut] True once a tied-head LUT is registered. */
+bool cuda_fc_lmhead_tie_lut_ready();
+
+/**
+ * @brief [lmhead-tie-lut] The tied-head GEMV: fp16 hidden row in, fp16 logits
+ *        out, fp32 accumulate, reading the registered VRAM LUT instead of any
+ *        weight-derived cache. Same warp mapping and launch shape as
+ *        cuda_fc_qs4cx_fpact_gemv_fp16 (whose argmax-fidelity rationale this
+ *        route inherits: the activation is never int8-quantized).
+ * @return false -- nothing dispatched, caller falls through to the fp-act /
+ *         dp4a chain -- unless @p weight_key and the shape match the
+ *         registered LUT exactly.
+ */
+bool cuda_fc_lmhead_tie_gemv_fp16(const void *weight_key,
+                                  const unsigned short *Xh, unsigned short *Yh,
+                                  unsigned int N, unsigned int K);
+
+/**
+ * @brief [lmhead-tie-lut] Look up the registered VRAM copy by the LUT's HOST
+ *        payload pointer, so the on-GPU embedding gather (cuda_emb_gather) can
+ *        read the resident copy instead of HMM zero-copy faulting over the
+ *        file mmap -- same bytes, no cold-fault. @p dev_payload / @p
+ *        dev_scales receive device pointers valid for the process lifetime.
+ * @return true on a hit.
+ */
+bool cuda_fc_lmhead_tie_lut_device_copy(const void *host_payload,
+                                        const void **dev_payload,
+                                        const float **dev_scales);
 
 /** @brief NNTR_CUDA_FUSED_NORMQ (default on, =0 opts out): whether the decode
  *  RMSNorm may fold in the int8 activation quant of the FC group it feeds. */

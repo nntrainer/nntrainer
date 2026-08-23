@@ -12,6 +12,8 @@
 
 #include "cuda_emb_gather.h"
 
+#include "cuda_fc_qs4cx.h" // [lmhead-tie-lut] VRAM LUT copy lookup
+
 #include <cuda_context.h>
 #include <cuda_stream_manager.h>
 
@@ -122,10 +124,10 @@ struct GatherLut {
   std::vector<bool> warm; ///< per-row: GPU pages prefetched already
 };
 
-std::vector<GatherLut> g_luts;         // small (2 for the folded demo)
-int *g_tok_dev = nullptr;              // device id slot the graph bakes in
-int *g_tok_pin = nullptr;              // pinned host slot; feed = one store
-cudaStream_t g_side_stream = nullptr;  // page-warm prefetches (off critical)
+std::vector<GatherLut> g_luts;        // small (2 for the folded demo)
+int *g_tok_dev = nullptr;             // device id slot the graph bakes in
+int *g_tok_pin = nullptr;             // pinned host slot; feed = one store
+cudaStream_t g_side_stream = nullptr; // page-warm prefetches (off critical)
 bool g_graph_live = false;
 unsigned g_epoch = 0;
 
@@ -256,8 +258,8 @@ int emb_gather_register_lut(const void *payload, size_t payload_bytes,
     return -1;
   }
   if (g_tok_pin == nullptr &&
-      cudaHostAlloc((void **)&g_tok_pin, sizeof(int),
-                    cudaHostAllocDefault) != cudaSuccess) {
+      cudaHostAlloc((void **)&g_tok_pin, sizeof(int), cudaHostAllocDefault) !=
+        cudaSuccess) {
     g_tok_pin = nullptr;
     cudaGetLastError();
     return -1;
@@ -274,8 +276,8 @@ int emb_gather_register_lut(const void *payload, size_t payload_bytes,
                                                       "emb_gather_s4_f16");
   auto k32 = CudaContext::Global().registerCudaKernel(EMB_GATHER_SRC,
                                                       "emb_gather_s4_f32");
-  auto kw = CudaContext::Global().registerCudaKernel(EMB_GATHER_SRC,
-                                                     "emb_warm_rows");
+  auto kw =
+    CudaContext::Global().registerCudaKernel(EMB_GATHER_SRC, "emb_warm_rows");
   if (!k16 || !k32 || !kw) {
     ml_loge("[CUDA] emb_gather: kernel registration failed");
     return -1;
@@ -289,13 +291,31 @@ int emb_gather_register_lut(const void *payload, size_t payload_bytes,
   lut.nblocks = nblocks;
   lut.row_bytes = out_dim / 2;
   lut.scale_row_bytes = (size_t)nblocks * sizeof(float);
-  lut.warm.assign(n_rows, false);
-  advise_accessed_by(payload, payload_bytes);
-  advise_accessed_by(scales, scale_count * sizeof(float));
+  // [lmhead-tie-lut] If the app uploaded a VRAM copy of this very payload for
+  // the tied lm_head GEMV, gather from it instead of HMM zero-copy: same
+  // bytes (verbatim device copy of payload + fp32 scales), but every row is
+  // resident, so the per-new-token HMM mapping fault (and the side-stream
+  // prefetch machinery that hides it) disappears for this table. Marking the
+  // whole warm bitmap keeps warm_token()/emb_gather_warm_ids() no-ops --
+  // which also keeps cudaMemPrefetchAsync away from a non-managed pointer.
+  const void *dev_payload = nullptr;
+  const float *dev_scales = nullptr;
+  const bool vram_copy =
+    cuda_fc_lmhead_tie_lut_device_copy(payload, &dev_payload, &dev_scales);
+  if (vram_copy) {
+    lut.payload = static_cast<const uint8_t *>(dev_payload);
+    lut.scales = dev_scales;
+    lut.warm.assign(n_rows, true);
+  } else {
+    lut.warm.assign(n_rows, false);
+    advise_accessed_by(payload, payload_bytes);
+    advise_accessed_by(scales, scale_count * sizeof(float));
+  }
   g_luts.push_back(std::move(lut));
   ml_logi("[CUDA] emb_gather: LUT %zu registered (rows=%u out_dim=%u "
-          "blocks=%u, zero-copy HMM)",
-          g_luts.size() - 1, n_rows, out_dim, nblocks);
+          "blocks=%u, %s)",
+          g_luts.size() - 1, n_rows, out_dim, nblocks,
+          vram_copy ? "tied VRAM copy" : "zero-copy HMM");
   return (int)(g_luts.size() - 1);
 }
 
@@ -393,8 +413,8 @@ void emb_gather_warm_ids(int handle, const float *ids_host, unsigned n) {
   const int grid[3] = {(int)((fresh + 127) / 128), 1, 1};
   auto params = kernel->getKernelParams();
   if (cuLaunchKernel(kernel->GetFunction(), grid[0], 1, 1, block[0], 1, 1, 0,
-                     reinterpret_cast<CUstream>(g_side_stream),
-                     params.data(), nullptr) != CUDA_SUCCESS) {
+                     reinterpret_cast<CUstream>(g_side_stream), params.data(),
+                     nullptr) != CUDA_SUCCESS) {
     cudaGetLastError();
     return;
   }

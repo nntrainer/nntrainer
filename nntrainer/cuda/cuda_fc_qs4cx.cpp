@@ -24,12 +24,16 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #if defined(_WIN32)
 #include <windows.h> // DiscardVirtualMemory
 #else
 #include <sys/mman.h> // madvise
 #endif
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -1145,6 +1149,63 @@ __global__ void fpact_gemv_i4_h(const unsigned short *Xh,
     Y[n] = vq_f2h(acc * wscale[n]);
 }
 
+// --- tied lm_head GEMV over the embedding sidecar LUT (VRAM copy) ---------
+//
+// fpact_gemv_i4_h's twin for the RE-TIED head: the weight is the embedding
+// LUT's device-resident sfixed4 payload instead of the head's dp4a-derived
+// cache. The byte layout is IDENTICAL by construction -- the dp4a cache is
+// plain^0x88, i.e. packed low-nibble-first two's-complement int4, which is
+// exactly how the sfixed4 sidecar is serialized -- so the unpack arms are
+// byte-for-byte the same as fpact_gemv_i4_h. Two scale differences live in
+// the epilogue only:
+//   * wscale is the LUT's PER-ROW fp32 scale (per-row-symmetric manifest),
+//     read at full precision like the fp-act route's scale (same argmax-
+//     fidelity reasoning);
+//   * comp = 1/sqrt(K): the LUT rows carry the embedding PRE-FOLD (content
+//     scaled by sqrt(hidden) so the embedding runtime scale is 1.0); the
+//     lm_head wants the unfolded table, so the fold is divided back out
+//     here, in fp32, before the fp16 store.
+__global__ void tied_gemv_s4_h(const unsigned short *Xh,
+                               const signed char *lut, const float *wscale,
+                               float comp, unsigned short *Y, int N, int K,
+                               int wide) {
+  const int warps_per_block = blockDim.x >> 5;
+  const int n = blockIdx.x * warps_per_block + (threadIdx.x >> 5);
+  if (n >= N)
+    return;
+  const int lane = threadIdx.x & 31;
+  const int Kh = (K + 1) >> 1;
+  const signed char *wrow = lut + (long)n * Kh;
+  float acc = 0.f;
+  if (wide) {
+    for (int k = lane * 8; k < K; k += 32 * 8) {
+      const unsigned int wb = *(const unsigned int *)(wrow + (k >> 1));
+      const uint4 av = *(const uint4 *)(Xh + k);
+      const unsigned int aw[4] = {av.x, av.y, av.z, av.w};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int b = (int)((wb >> (j * 8)) & 0xFFu);
+        acc += vq_h2f((unsigned short)(aw[j] & 0xFFFFu)) *
+               (float)(((int)(signed char)(b << 4)) >> 4);
+        acc += vq_h2f((unsigned short)(aw[j] >> 16)) *
+               (float)(((int)(signed char)b) >> 4);
+      }
+    }
+  } else {
+    for (int k = lane; k < K; k += 32) {
+      const int b = (unsigned char)wrow[k >> 1];
+      const int wv = (k & 1) ? (((int)(signed char)b) >> 4)
+                             : (((int)(signed char)(b << 4)) >> 4);
+      acc += vq_h2f(Xh[k]) * (float)wv;
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    acc += __shfl_down_sync(0xffffffffu, acc, o);
+  if (lane == 0)
+    Y[n] = vq_f2h(acc * wscale[n] * comp);
+}
+
 }
 )CU";
 
@@ -2003,6 +2064,162 @@ bool cuda_fc_qs4cx_fpact_gemv_fp16(const unsigned short *Xh,
             "(N=%u K=%u, %s arm); NNTR_CUDA_LMHEAD_FPACT=0 restores w4a8 dp4a",
             N, K, wide ? "wide" : "scalar");
   }
+  maybe_finish(Yh);
+  return true;
+}
+
+// --- [lmhead-tie-lut] ------------------------------------------------------
+// One tied head per process: the embedding sidecar LUT, uploaded to device
+// memory once at load, keyed to the lm_head weight's plain pointer. A single
+// slot (not a map) is deliberate -- a model has one lm_head, and the key
+// check in the dispatch keeps any other huge-N FC off this route.
+namespace {
+struct TiedHeadLut {
+  const void *weight_key = nullptr;   ///< the head's QS4CX plain pointer
+  const void *host_payload = nullptr; ///< source LUT bytes (mmap), lookup key
+  signed char *dev_payload = nullptr; ///< VRAM copy, [N][K/2] sfixed4
+  float *dev_scales = nullptr;        ///< VRAM copy, [N] per-row fp32
+  float comp = 1.f;                   ///< (float)(1.0 / sqrt((double)K))
+  unsigned int N = 0, K = 0;
+};
+TiedHeadLut g_tied_lut;
+std::mutex g_tied_mtx;
+} // namespace
+
+bool cuda_fc_lmhead_tie_lut_register(const void *weight_key,
+                                     const void *lut_payload,
+                                     size_t payload_bytes,
+                                     const float *scales_fp32,
+                                     size_t scale_count, unsigned int N,
+                                     unsigned int K) {
+  if (weight_key == nullptr || lut_payload == nullptr ||
+      scales_fp32 == nullptr || N == 0 || K == 0 || (K & 1u) != 0u)
+    return false;
+  // Geometry must be the LUT's own: N rows of K/2 packed bytes, ONE fp32
+  // scale per row (the per-row-symmetric manifest). A per-block table cannot
+  // take this route -- the caller filters, this refuses.
+  if (payload_bytes != (size_t)N * (K / 2) || scale_count != (size_t)N)
+    return false;
+  if (StreamManager::Global().isCapturing())
+    return false;
+  std::lock_guard<std::mutex> lk(g_tied_mtx);
+  if (g_tied_lut.dev_payload != nullptr)
+    return g_tied_lut.weight_key == weight_key && g_tied_lut.N == N &&
+           g_tied_lut.K == K; // idempotent for the same head
+  // Compile the kernel NOW: the first dispatch may be inside a captured
+  // decode graph, where an NVRTC module load is illegal.
+  if (!CudaContext::Global().registerCudaKernel(FC_QS4CX_DP4A_SRC,
+                                                "tied_gemv_s4_h")) {
+    ml_loge("[CUDA] lmhead-tie-lut: kernel registration failed");
+    return false;
+  }
+  signed char *dp = nullptr;
+  float *ds = nullptr;
+  if (cudaMalloc(&dp, payload_bytes) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  if (cudaMalloc(&ds, sizeof(float) * (size_t)N) != cudaSuccess) {
+    cudaGetLastError();
+    cudaFree(dp);
+    return false;
+  }
+  if (cudaMemcpy(dp, lut_payload, payload_bytes, cudaMemcpyHostToDevice) !=
+        cudaSuccess ||
+      cudaMemcpy(ds, scales_fp32, sizeof(float) * (size_t)N,
+                 cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaGetLastError();
+    cudaFree(dp);
+    cudaFree(ds);
+    return false;
+  }
+  g_tied_lut.weight_key = weight_key;
+  g_tied_lut.host_payload = lut_payload;
+  g_tied_lut.dev_payload = dp;
+  g_tied_lut.dev_scales = ds;
+  // The fold constant in double, rounded to fp32 once (the epilogue multiply
+  // is fp32 anyway; deriving it in float would round sqrt twice).
+  g_tied_lut.comp = (float)(1.0 / std::sqrt((double)K));
+  g_tied_lut.N = N;
+  g_tied_lut.K = K;
+  ml_logi("[CUDA] lmhead-tie-lut: embedding LUT resident on device (%zu MB "
+          "payload + %zu KB scales, N=%u K=%u, comp=1/sqrt(K)); the head's "
+          "dp4a cache will not be built",
+          payload_bytes >> 20, (sizeof(float) * (size_t)N) >> 10, N, K);
+  return true;
+}
+
+bool cuda_fc_lmhead_tie_lut_ready() {
+  std::lock_guard<std::mutex> lk(g_tied_mtx);
+  return g_tied_lut.dev_payload != nullptr;
+}
+
+bool cuda_fc_lmhead_tie_lut_device_copy(const void *host_payload,
+                                        const void **dev_payload,
+                                        const float **dev_scales) {
+  if (host_payload == nullptr || dev_payload == nullptr ||
+      dev_scales == nullptr)
+    return false;
+  std::lock_guard<std::mutex> lk(g_tied_mtx);
+  if (g_tied_lut.dev_payload == nullptr ||
+      g_tied_lut.host_payload != host_payload)
+    return false;
+  *dev_payload = g_tied_lut.dev_payload;
+  *dev_scales = g_tied_lut.dev_scales;
+  return true;
+}
+
+bool cuda_fc_lmhead_tie_gemv_fp16(const void *weight_key,
+                                  const unsigned short *Xh, unsigned short *Yh,
+                                  unsigned int N, unsigned int K) {
+  if (Xh == nullptr || Yh == nullptr || N == 0 || K == 0)
+    return false;
+  const signed char *lut = nullptr;
+  const float *sc = nullptr;
+  float comp = 1.f;
+  {
+    std::lock_guard<std::mutex> lk(g_tied_mtx);
+    if (g_tied_lut.dev_payload == nullptr ||
+        g_tied_lut.weight_key != weight_key || g_tied_lut.N != N ||
+        g_tied_lut.K != K)
+      return false;
+    lut = g_tied_lut.dev_payload;
+    sc = g_tied_lut.dev_scales;
+    comp = g_tied_lut.comp;
+  }
+  auto kg = CudaContext::Global().registerCudaKernel(FC_QS4CX_DP4A_SRC,
+                                                     "tied_gemv_s4_h");
+  if (!kg) {
+    ml_loge("[CUDA] lmhead-tie-lut: kernel lookup failed");
+    return false;
+  }
+  int n = (int)N, k = (int)K;
+  // Same alignment verdict as the fp-act GEMV: the wide arm needs K%8==0
+  // (4-byte aligned weight row bases) and a 16-byte aligned activation row.
+  const int wide =
+    ((K & 7u) == 0u && (reinterpret_cast<uintptr_t>(Xh) & 15u) == 0u) ? 1 : 0;
+  kg->SetKernelArguments(0, &Xh, sizeof(Xh));
+  kg->SetKernelArguments(1, &lut, sizeof(lut));
+  kg->SetKernelArguments(2, &sc, sizeof(sc));
+  kg->SetKernelArguments(3, &comp, sizeof(comp));
+  kg->SetKernelArguments(4, &Yh, sizeof(Yh));
+  kg->SetKernelArguments(5, &n, sizeof(n));
+  kg->SetKernelArguments(6, &k, sizeof(k));
+  kg->SetKernelArguments(7, &wide, sizeof(wide));
+  // One warp per output row, 4 warps per block -- the fp-act GEMV shape.
+  const int blk[3] = {128, 1, 1};
+  const int grd[3] = {((int)N + 3) / 4, 1, 1};
+  if (!StreamManager::Global().DispatchCommand(*kg, grd, blk))
+    return false;
+  static bool announced = false;
+  if (!announced) {
+    announced = true;
+    ml_logi("[CUDA] lm_head decode on the TIED embedding-LUT GEMV "
+            "(N=%u K=%u, %s arm)",
+            N, K, wide ? "wide" : "scalar");
+  }
+  // Local helper, not StreamManager::maybeFinish: it skips the drain when the
+  // output is device-only, which is the shape the decode head always has here.
   maybe_finish(Yh);
   return true;
 }

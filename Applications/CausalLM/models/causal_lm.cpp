@@ -57,21 +57,21 @@
 #include <tensor.h>
 
 #include <causal_lm.h>
+#include <embedding_layer.h> // [lmhead-tie-lut] QuantLut / get_or_load_quant_lut
 #include <llm_util.hpp>
+#if !defined(_WIN32)
+#include <sys/mman.h> // [lmhead-tie-lut] madvise the uploaded LUT mmap away
+#endif
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
+#include <cuda_fc_qs4cx.h> // [lmhead-tie-lut] tied-head LUT registration
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-namespace nntrainer::cuda {
-// Frees all cuBLAS int8 caches at the prefill -> decode boundary.
-void cuda_fc_qs4cx_free_i8_caches();
-} // namespace nntrainer::cuda
-
 namespace {
 // On-GPU greedy argmax. incrementalInference()
 // stashes the DEVICE-resident lm_head logits pointer + dtype here (the tensor
@@ -752,8 +752,8 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
   // predicates below (generate() applies each only under its own triple
   // check, so the device route must mirror both or it would penalize where
   // the host would not).
-  const bool rp_active = repetition_penalty != 1 && input_ids != nullptr &&
-                         NUM_INPUT_IDS != 0;
+  const bool rp_active =
+    repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0;
   const bool bw_active = BAD_WORD_IDS.size() != 0 && NUM_BADWORDS != 0;
   // The penalized device argmax replicates the host math bit-for-bit
   // (cuda_argmax_penalized_fp16) but its id scratch is capped; oversize
@@ -797,14 +797,13 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
           bw_active ? BAD_WORD_IDS.data() : nullptr,
           bw_active ? NUM_BADWORDS : 0, repetition_penalty, &tok);
       } else {
-        ok =
-          g_cuda_logits_fp16
-            ? nntrainer::cuda::cuda_argmax_fp16(
-                reinterpret_cast<const unsigned short *>(g_cuda_logits_dev),
-                NUM_VOCAB, &tok)
-            : nntrainer::cuda::cuda_argmax_fp32(
-                reinterpret_cast<const float *>(g_cuda_logits_dev), NUM_VOCAB,
-                &tok);
+        ok = g_cuda_logits_fp16
+               ? nntrainer::cuda::cuda_argmax_fp16(
+                   reinterpret_cast<const unsigned short *>(g_cuda_logits_dev),
+                   NUM_VOCAB, &tok)
+               : nntrainer::cuda::cuda_argmax_fp32(
+                   reinterpret_cast<const float *>(g_cuda_logits_dev),
+                   NUM_VOCAB, &tok);
       }
       // Consume the stash regardless (it belongs to this call's logits row).
       g_cuda_logits_dev = nullptr;
@@ -1171,6 +1170,82 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   const unsigned int prefill_from = SYS_PROMP_LEN + global_token_len;
   std::vector<unsigned int> id_list;
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // [lmhead-tie-lut] Re-tie the untied lm_head onto the embedding sidecar LUT.
+  // The LUT is fetched through the same path-keyed cache the embedding layer
+  // used at finalize (a pure cache hit -- same QuantLut, same mmap) and is
+  // validated against the contract the tied GEMV assumes: sfixed4 rows, ONE
+  // fp32 scale per row, [vocab x hidden] geometry, and a 1.0 runtime embedding
+  // scale (the sqrt(hidden) fold lives in the LUT content, which is exactly
+  // what the kernel's 1/sqrt(K) compensates). Anything off leaves the head on
+  // the fp-activation QS4CX route, unchanged.
+  if (LMHEAD_TIE_LUT && causallm_engine() == "cuda" &&
+      !EMBEDDING_FILE_NAME.empty()) {
+    std::shared_ptr<QuantLut> tie_lut;
+    try {
+      tie_lut = get_or_load_quant_lut(EMBEDDING_FILE_NAME, NUM_VOCAB, DIM);
+    } catch (const std::exception &e) {
+      ml_logw("[lmhead-tie-lut] embedding LUT load failed (%s)", e.what());
+    }
+    if (tie_lut &&
+        !(tie_lut->is_signed4 && !tie_lut->is_raw_u16 &&
+          tie_lut->ggml_dtype == nntrainer::TensorDim::DataType::NONE &&
+          tie_lut->sfixed4_blocks == 1 &&
+          tie_lut->in_dim == (size_t)NUM_VOCAB &&
+          tie_lut->out_dim == (size_t)DIM && EMBEDDING_SCALE == 1.0f)) {
+      ml_logw("[lmhead-tie-lut] embedding LUT does not satisfy the tied-head "
+              "contract (sfixed4 per-row-symmetric [vocab x hidden], "
+              "embedding scale 1.0)");
+      tie_lut.reset();
+    }
+    if (tie_lut) {
+      std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
+                         void *)>
+        fn = [&tie_lut](ml::train::Layer &l, nntrainer::RunLayerContext &ctx,
+                        void *) {
+          if (l.getType() != "fully_connected" ||
+              l.getName() != "output_of_causallm")
+            return;
+          for (unsigned int w = 0; w < ctx.getNumWeights(); ++w) {
+            auto &wt = ctx.getWeight(w);
+            // QINT4 never appears here: layer_context coerces it to QS4CX.
+            if (wt.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+              continue;
+            if (wt.width() != (unsigned)tie_lut->in_dim ||
+                wt.height() != (unsigned)tie_lut->out_dim)
+              continue;
+            // Registers the LUT as the head's weight and builds nothing else
+            // for it: the upload inside register() replaces the dp4a cache the
+            // fp-act route would have built.
+            if (nntrainer::cuda::cuda_fc_lmhead_tie_lut_register(
+                  wt.getData<uint8_t>(), tie_lut->data(),
+                  tie_lut->payload_size(), tie_lut->row_scales.data(),
+                  tie_lut->row_scales.size(), wt.width(), wt.height())) {
+#if !defined(_WIN32)
+              // The upload just read the ENTIRE payload mmap, faulting all of
+              // its file pages resident, where demand paging kept only the
+              // touched rows. Drop the PTEs now that the device holds a copy:
+              // file-backed MADV_DONTNEED is non-destructive (pages re-fault
+              // from the page cache), so the host prefill dequant that still
+              // reads this mmap keeps working and re-faults only its working
+              // set.
+              if (tie_lut->mmap_ptr != nullptr)
+                ::madvise(tie_lut->mmap_ptr, tie_lut->mmap_len, MADV_DONTNEED);
+#endif
+            }
+          }
+        };
+      model->forEachLayer(fn, nullptr);
+    }
+    // The flag promised a tied head but nothing registered (no untied FC head
+    // reached the walk, geometry mismatch, or the device upload failed): say so
+    // once -- a decode that silently keeps the fp-act route is otherwise
+    // indistinguishable from the tie working.
+    if (!nntrainer::cuda::cuda_fc_lmhead_tie_lut_ready())
+      ml_logw("[lmhead-tie-lut] requested but not activated -- lm_head keeps "
+              "the fp-activation QS4CX route");
+  }
+#endif
   // [resume-block] A resumed prefill (multi-turn continuation or a restored
   // KV cache, prefill_from > 0) runs as ONE block call — same shape as the
   // first prefill but with `from` at the absolute position — now that the
