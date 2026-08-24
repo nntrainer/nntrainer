@@ -217,18 +217,31 @@ std::vector<float> loadImageLetterbox(const std::string &path) {
   // NCHW layout, normalized to [0, 1], gray (114/255) padding
   std::vector<float> out(target * target * 3, 114.0f / 255.0f);
 
+  // Bilinear interpolation with half-pixel center to match cv2 INTER_LINEAR
+  // cv2 maps: src = (dst + 0.5) / r - 0.5
   for (int dy = 0; dy < nh; ++dy) {
-    int sy = std::min(static_cast<int>(std::round(dy / r)), h - 1);
+    float fy = (dy + 0.5f) / r - 0.5f;
+    fy = std::max(0.0f, std::min(fy, (float)(h - 1)));
+    int y0 = (int)fy;
+    int y1 = std::min(y0 + 1, h - 1);
+    float wy = fy - y0;
     for (int dx = 0; dx < nw; ++dx) {
-      int sx = std::min(static_cast<int>(std::round(dx / r)), w - 1);
-      int s_idx = (sy * w + sx) * 3;
-      // NCHW: [c, H, W]
-      int r_idx = (0 * target + (dy + pad_h)) * target + (dx + pad_w);
-      int g_idx = (1 * target + (dy + pad_h)) * target + (dx + pad_w);
-      int b_idx = (2 * target + (dy + pad_h)) * target + (dx + pad_w);
-      out[r_idx] = data[s_idx + 0] / 255.0f;
-      out[g_idx] = data[s_idx + 1] / 255.0f;
-      out[b_idx] = data[s_idx + 2] / 255.0f;
+      float fx = (dx + 0.5f) / r - 0.5f;
+      fx = std::max(0.0f, std::min(fx, (float)(w - 1)));
+      int x0 = (int)fx;
+      int x1 = std::min(x0 + 1, w - 1);
+      float wx = fx - x0;
+
+      for (int c = 0; c < 3; ++c) {
+        float v00 = data[(y0 * w + x0) * 3 + c];
+        float v01 = data[(y0 * w + x1) * 3 + c];
+        float v10 = data[(y1 * w + x0) * 3 + c];
+        float v11 = data[(y1 * w + x1) * 3 + c];
+        float v = v00 * (1 - wx) * (1 - wy) + v01 * wx * (1 - wy) +
+                  v10 * (1 - wx) * wy + v11 * wx * wy;
+        int dst_idx = (c * target + (dy + pad_h)) * target + (dx + pad_w);
+        out[dst_idx] = v / 255.0f;
+      }
     }
   }
 
