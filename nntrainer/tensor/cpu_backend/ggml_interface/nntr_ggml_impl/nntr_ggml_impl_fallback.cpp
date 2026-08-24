@@ -357,44 +357,30 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
     for (int x = 0; x < nc / ncols_interleaved; x++) {
       const block_q4_0x4 *vb_ptr = (const block_q4_0x4 *)vx + (x * nb);
 
-      // One named accumulator per row rather than an acc[4] array, so the
-      // register allocator can keep them live. Some spilling is unavoidable
-      // either way: eight split B vectors plus four accumulators plus the
-      // per-row temporaries exceed the sixteen Q registers A32 has, which is
-      // why the aarch64 kernel (32 registers) can hold a much wider tile.
-      float32x4_t acc0 = vdupq_n_f32(0);
-      float32x4_t acc1 = vdupq_n_f32(0);
-      float32x4_t acc2 = vdupq_n_f32(0);
-      float32x4_t acc3 = vdupq_n_f32(0);
+      // Row-outer: only one accumulator is live across the block loop, which
+      // is what keeps this inside the sixteen Q registers A32 has. Re-reading
+      // B once per row costs four L1 hits per block; carrying four
+      // accumulators plus four rows of A instead costs far more in spills.
+      for (int m = 0; m < 4; m++) {
+        float32x4_t acc = vdupq_n_f32(0);
+        // Walk the blocks with plain increments; indexing vb_ptr[l] makes gcc
+        // redo a 72/136-byte stride multiply every iteration.
+        const block_q4_0x4 *bp = vb_ptr;
+        const block_q8_0x4 *ap = va_ptr;
 
-      for (int l = 0; l < nb; l++) {
-        const int8_t *bq = (const int8_t *)vb_ptr[l].qs;
-        int8x16_t b0 = vld1q_s8(bq);      // k = 0, cols 0-1
-        int8x16_t b1 = vld1q_s8(bq + 16); // k = 0, cols 2-3
-        int8x16_t b2 = vld1q_s8(bq + 32); // k = 1, cols 0-1
-        int8x16_t b3 = vld1q_s8(bq + 48); // k = 1, cols 2-3
+        for (int l = 0; l < nb; l++, bp++, ap++) {
+          const int8_t *bq = (const int8_t *)bp->qs;
+          const int8_t *aq = (const int8_t *)ap->qs + m * 8;
 
-        int8x16_t b0l = b0 << 4;
-        int8x16_t b1l = b1 << 4;
-        int8x16_t b2l = b2 << 4;
-        int8x16_t b3l = b3 << 4;
-        int8x16_t b0h = b0 & 0xf0U;
-        int8x16_t b1h = b1 & 0xf0U;
-        int8x16_t b2h = b2 & 0xf0U;
-        int8x16_t b3h = b3 & 0xf0U;
+          int8x16_t b0 = vld1q_s8(bq);      // k = 0, cols 0-1
+          int8x16_t b1 = vld1q_s8(bq + 16); // k = 0, cols 2-3
+          int8x16_t b2 = vld1q_s8(bq + 32); // k = 1, cols 0-1
+          int8x16_t b3 = vld1q_s8(bq + 48); // k = 1, cols 2-3
 
-        float32x4_t bd = vcvt_f32_f16(vld1_f16((const __fp16 *)vb_ptr[l].d));
-
-        // qs is int8_t[128]: 8 bytes per {k, row} for the low nibbles, then
-        // the same again from byte 64 for the high nibbles. Loaded as bytes so
-        // gcc cannot attach a :64 alignment qualifier (see the GEMV above).
-        const int8_t *aq = (const int8_t *)va_ptr[l].qs;
-
-        auto row = [&](const int8_t *ap, int m, float32x4_t acc) {
-          int8x8_t t0 = vld1_s8(ap);
-          int8x8_t t1 = vld1_s8(ap + 32);
-          int8x8_t t2 = vld1_s8(ap + 64);
-          int8x8_t t3 = vld1_s8(ap + 96);
+          int8x8_t t0 = vld1_s8(aq);       // k = 0, low nibble operand
+          int8x8_t t1 = vld1_s8(aq + 32);  // k = 1, low
+          int8x8_t t2 = vld1_s8(aq + 64);  // k = 0, high
+          int8x8_t t3 = vld1_s8(aq + 96);  // k = 1, high
           int8x16_t a0 = vcombine_s8(t0, t0);
           int8x16_t a1 = vcombine_s8(t1, t1);
           int8x16_t a2 = vcombine_s8(t2, t2);
@@ -403,32 +389,27 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
           int32x4_t r0 = vdupq_n_s32(0);
           int32x4_t r1 = vdupq_n_s32(0);
 
-          r0 = vdotq_s32(r0, b0l, a0);
-          r1 = vdotq_s32(r1, b1l, a0);
-          r0 = vdotq_s32(r0, b2l, a1);
-          r1 = vdotq_s32(r1, b3l, a1);
+          r0 = vdotq_s32(r0, b0 << 4, a0);
+          r1 = vdotq_s32(r1, b1 << 4, a0);
+          r0 = vdotq_s32(r0, b2 << 4, a1);
+          r1 = vdotq_s32(r1, b3 << 4, a1);
 
-          r0 = vdotq_s32(r0, b0h, a2);
-          r1 = vdotq_s32(r1, b1h, a2);
-          r0 = vdotq_s32(r0, b2h, a3);
-          r1 = vdotq_s32(r1, b3h, a3);
+          r0 = vdotq_s32(r0, b0 & 0xf0U, a2);
+          r1 = vdotq_s32(r1, b1 & 0xf0U, a2);
+          r0 = vdotq_s32(r0, b2 & 0xf0U, a3);
+          r1 = vdotq_s32(r1, b3 & 0xf0U, a3);
 
-          float ad = nntr_compute_fp16_to_fp32(va_ptr[l].d[m]);
-          return vfmaq_f32(acc, vcvtq_n_f32_s32(vpaddq_s32(r0, r1), 4),
-                           vmulq_n_f32(bd, ad));
-        };
+          float32x4_t bd = vcvt_f32_f16(vld1_f16((const __fp16 *)bp->d));
+          // Inline __fp16 conversion, not nntr_compute_fp16_to_fp32: an
+          // out-of-line call here spills every live vector register.
+          __fp16 adh;
+          memcpy(&adh, &ap->d[m], sizeof(adh));
 
-        acc0 = row(aq, 0, acc0);
-        acc1 = row(aq + 8, 1, acc1);
-        acc2 = row(aq + 16, 2, acc2);
-        acc3 = row(aq + 24, 3, acc3);
+          acc = vfmaq_f32(acc, vcvtq_n_f32_s32(vpaddq_s32(r0, r1), 4),
+                          vmulq_n_f32(bd, (float)adh));
+        }
+        vst1q_f32(&s[(y * 4 + m) * bs + x * ncols_interleaved], acc);
       }
-
-      float *out = &s[(y * 4) * bs + x * ncols_interleaved];
-      vst1q_f32(out, acc0);
-      vst1q_f32(out + bs, acc1);
-      vst1q_f32(out + 2 * bs, acc2);
-      vst1q_f32(out + 3 * bs, acc3);
     }
   }
 #else
@@ -737,7 +718,11 @@ void nntr_gemm_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
 
         // qs is int8_t[128] laid out as {k, row/col, i}: 4 groups of 32 bytes,
         // each group holding four 8-byte lanes.
-        auto row = [&](const int8_t *ap, int m, float32x4_t acc) {
+        // See the q4_0 kernel above: hoist the scale conversion so the innermost
+        // loop stays free of out-of-line calls.
+        float32x4_t ad = vcvt_f32_f16(vld1_f16((const __fp16 *)va_ptr[l].d));
+
+        auto row = [&](const int8_t *ap, float32x4_t scale, float32x4_t acc) {
           int32x4_t r0 = vdupq_n_s32(0);
           int32x4_t r1 = vdupq_n_s32(0);
           for (int k = 0; k < 4; k++) {
@@ -746,15 +731,13 @@ void nntr_gemm_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
             r0 = vdotq_s32(r0, vld1q_s8(bq + k * 32), a);      // cols 0-1
             r1 = vdotq_s32(r1, vld1q_s8(bq + k * 32 + 16), a); // cols 2-3
           }
-          float ad = nntr_compute_fp16_to_fp32(va_ptr[l].d[m]);
-          return vfmaq_f32(acc, vcvtq_f32_s32(vpaddq_s32(r0, r1)),
-                           vmulq_n_f32(bd, ad));
+          return vfmaq_f32(acc, vcvtq_f32_s32(vpaddq_s32(r0, r1)), scale);
         };
 
-        acc0 = row(aq, 0, acc0);
-        acc1 = row(aq + 8, 1, acc1);
-        acc2 = row(aq + 16, 2, acc2);
-        acc3 = row(aq + 24, 3, acc3);
+        acc0 = row(aq, vmulq_laneq_f32(bd, ad, 0), acc0);
+        acc1 = row(aq + 8, vmulq_laneq_f32(bd, ad, 1), acc1);
+        acc2 = row(aq + 16, vmulq_laneq_f32(bd, ad, 2), acc2);
+        acc3 = row(aq + 24, vmulq_laneq_f32(bd, ad, 3), acc3);
       }
 
       float *out = &s[(y * 4) * bs + x * ncols_interleaved];
