@@ -64,6 +64,16 @@ struct Detection {
   int cls;
 };
 
+// Original image info for coordinate scaling
+struct OrigImageInfo {
+  int w = 0;
+  int h = 0;
+  float r = 1.0f;
+  int pad_w = 0;
+  int pad_h = 0;
+};
+static OrigImageInfo g_orig;
+
 inline float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 std::vector<float> loadBin(const std::string &path) {
@@ -197,6 +207,9 @@ std::vector<float> loadImageLetterbox(const std::string &path) {
 
   int pad_w = (target - nw) / 2;
   int pad_h = (target - nh) / 2;
+
+  // Store original image info for coordinate scaling
+  g_orig = {w, h, r, pad_w, pad_h};
 
   // NCHW layout, normalized to [0, 1], gray (114/255) padding
   std::vector<float> out(target * target * 3, 114.0f / 255.0f);
@@ -427,6 +440,7 @@ int main(int argc, char **argv) {
 
     auto dets = nms(candidates, iou_thres, 100);
 
+    // Print detections in 320x320 letterbox coordinates
     std::cout << "\n[";
     for (size_t i = 0; i < dets.size(); ++i) {
       const auto &d = dets[i];
@@ -437,6 +451,28 @@ int main(int argc, char **argv) {
                   d.x1, d.y1, d.x2, d.y2, d.conf, d.cls);
     }
     std::cout << (dets.empty() ? "" : "\n") << "]" << std::endl;
+
+    // Print detections in original image coordinates
+    if (g_orig.w > 0) {
+      const char *names[] = {"dog", "cat", "human", "package"};
+      std::cout << "\n[L1 Detector] Detections (original image coords, "
+                << g_orig.w << "x" << g_orig.h << "):" << std::endl;
+      for (size_t i = 0; i < dets.size(); ++i) {
+        const auto &d = dets[i];
+        float ox1 = (d.x1 - g_orig.pad_w) / g_orig.r;
+        float oy1 = (d.y1 - g_orig.pad_h) / g_orig.r;
+        float ox2 = (d.x2 - g_orig.pad_w) / g_orig.r;
+        float oy2 = (d.y2 - g_orig.pad_h) / g_orig.r;
+        // Clamp to image bounds
+        ox1 = std::max(0.0f, std::min(ox1, (float)g_orig.w));
+        oy1 = std::max(0.0f, std::min(oy1, (float)g_orig.h));
+        ox2 = std::max(0.0f, std::min(ox2, (float)g_orig.w));
+        oy2 = std::max(0.0f, std::min(oy2, (float)g_orig.h));
+        std::printf("  cls=%d (%s), conf=%.6f, x1=%.1f, y1=%.1f, x2=%.1f, "
+                    "y2=%.1f\n",
+                    d.cls, names[d.cls], d.conf, ox1, oy1, ox2, oy2);
+      }
+    }
 
     return 0;
   } catch (const std::exception &e) {
