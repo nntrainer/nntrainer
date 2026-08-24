@@ -33,16 +33,23 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/lfm2 \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
+    $(NNTRAINER_ROOT)/nntrainer/hexagon \
 
 # Common compile flags. -std=c++17/-fexceptions/-frtti come from Application.mk
 # (APP_CPPFLAGS); -march and the FP16 ABI defines are inherited from the
 # prebuilt nntrainer modules below via LOCAL_EXPORT_CFLAGS.
-CAUSALLM_COMMON_CFLAGS := -O3 -ffast-math \
+# Note: -fexceptions and -frtti are required because the nntrainer headers
+# (nntrainer_error.h, base_properties.h) use throw/try/catch, and the prebuilt
+# was compiled with -fno-exceptions. We must override at compile time.
+CAUSALLM_COMMON_CFLAGS := -O3 -ffast-math -fexceptions -frtti \
     -Wno-nan-infinity-disabled -Wno-deprecated-literal-operator
+
 
 # Prebuilt nntrainer libraries. The generated Android.mk exports the include
 # paths and the -march/FP16 cflags the prebuilts were built with.
 NNTRAINER_PREBUILT_MK := $(NNTRAINER_ROOT)/builddir/android_build_result/Android.mk
+
+
 ifeq ($(wildcard $(NNTRAINER_PREBUILT_MK)),)
 $(error $(NNTRAINER_PREBUILT_MK) not found. Build nntrainer first (tools/package_android.sh))
 endif

@@ -751,7 +751,8 @@ endif
 
 if get_option('enable-app')
   if get_option('platform') == 'android'
-    warning('android app is not supported for now, building app skipped')
+    warning('android app: only building CausalLM (other apps skipped)')
+    subdir('Applications')
   else
     if host_machine.system() != 'windows'
       if get_option('enable-tflite-backbone') and not tflite_dep.found()
