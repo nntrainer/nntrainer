@@ -103,14 +103,21 @@ static void ensure_weight_uploaded(const void *key, const void *data,
   }
 }
 
-static bool should_use_fused_ffn(unsigned int step_size, bool is_prefill) {
+static bool should_use_fused_ffn(bool is_cdsp_engine, unsigned int step_size,
+                                 bool is_prefill) {
+  // Primary gate is compute_engine (set from this layer's "engine="
+  // property, see withHexagonEngine() at its construction site) rather than
+  // an independently-probed env var - same source of truth LayerNode's
+  // flush guard uses, so a layer tagged engine=cdsp both skips the
+  // pre-layer flush AND actually dispatches here. NNTR_HEXAGON_FUSED_FFN
+  // remains a manual kill-switch on top, for benchmarking without
+  // rebuilding.
+  if (!is_cdsp_engine)
+    return false;
+
   static const char *env = std::getenv("NNTR_HEXAGON_FUSED_FFN");
   bool enabled = (env && std::atoi(env) == 1);
   if (!enabled)
-    return false;
-
-  static const char *cdsp_env = std::getenv("NNTR_USE_HEXAGON_CDSP");
-  if (!cdsp_env)
     return false;
 
   static std::atomic<bool> logged_accept{false};
@@ -190,6 +197,9 @@ void FusedFFNLayer::finalize(nntrainer::InitLayerContext &context) {
   NNTR_THROW_IF(context.getNumInputs() < 1, std::invalid_argument)
     << "FusedFFNLayer requires at least one input";
 
+  is_cdsp_engine =
+    context.getComputeEngineType() == ml::train::LayerComputeEngine::CDSP;
+
   const auto &hidden_dim = std::get<props::HiddenDim>(ffn_props).get();
   const auto &output_dim = std::get<props::OutputDim>(ffn_props).get();
 
@@ -251,7 +261,7 @@ void FusedFFNLayer::forwarding(nntrainer::RunLayerContext &context,
 
   unsigned int step_size = input.height();
 
-  if (should_use_fused_ffn(step_size, true)) {
+  if (should_use_fused_ffn(is_cdsp_engine, step_size, true)) {
     // DSP fused path: single FastRPC call for all 3 GEMMs + SwiGLU
     ffn_fn bridge = get_ffn_bridge();
     if (bridge) {
@@ -288,7 +298,7 @@ void FusedFFNLayer::incremental_forwarding(
 
   unsigned int step_size = to - from;
 
-  if (should_use_fused_ffn(step_size, false)) {
+  if (should_use_fused_ffn(is_cdsp_engine, step_size, false)) {
     // DSP fused path for decode: single FastRPC call
     ffn_fn bridge = get_ffn_bridge();
     if (bridge) {

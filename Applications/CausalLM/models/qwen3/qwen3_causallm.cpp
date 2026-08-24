@@ -26,6 +26,7 @@
 
 #include <app_context.h>
 #include <engine.h>
+#include <hexagon_context.h>
 #include <reshaped_rms_norm.h>
 
 namespace causallm {
@@ -59,17 +60,19 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
   // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape)))
   LayerHandle q_norm(createLayer(
     "reshaped_rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
-     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
+    withHexagonEngine(
+      {withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
+       withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
+       withKey("feature_size", std::to_string(head_dim))})));
   Tensor q_normed = q_norm(q);
 
   // K-reshaped-norm layer (k_norm(k_proj.view(hidden_shape)))
   LayerHandle k_norm(createLayer(
     "reshaped_rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
-     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
+    withHexagonEngine(
+      {withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
+       withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
+       withKey("feature_size", std::to_string(head_dim))})));
   Tensor k_normed = k_norm(k);
 
   // External KV cache placeholders (per-layer). Storage is owned by the host
@@ -79,14 +82,16 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
   // Attention core layer
   LayerHandle mha(createLayer(
     "mha_core",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
-     withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
-     withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
-     withKey("sliding_window", SLIDING_WINDOW),
-     withKey("rope_theta", ROPE_THETA),
-     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
-     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-     withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
+    withHexagonEngine(
+      {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
+       withKey("num_heads", n_heads),
+       withKey("num_heads_kv", n_heads / GQA_SIZE),
+       withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
+       withKey("sliding_window", SLIDING_WINDOW),
+       withKey("rope_theta", ROPE_THETA),
+       withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
+       withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+       withKey("is_causal", IS_CAUSAL ? "true" : "false")})));
   Tensor a = mha({q_normed, k_normed, v, cache_k, cache_v});
 
   // O layer
@@ -111,6 +116,20 @@ void Qwen3Transformer::registerCustomLayers() {
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
+  }
+
+  // Also register under "cdsp" so q_norm/k_norm can be tagged engine=cdsp
+  // (see withHexagonEngine() at their construction sites above) - same
+  // reasoning as Transformer::registerCustomLayers() registering
+  // RMSNormLayer/MHACoreLayer there. Probed at runtime since "cdsp" is only
+  // registered in builds compiled with -Denable-hexagon-cdsp=true.
+  try {
+    auto hexagon_context = static_cast<nntrainer::HexagonContext *>(
+      ct_engine.getRegisteredContext("cdsp"));
+    hexagon_context->registerFactory(
+      nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+  } catch (const std::invalid_argument &) {
+    // "cdsp" context not registered in this build - nothing to do.
   }
 }
 

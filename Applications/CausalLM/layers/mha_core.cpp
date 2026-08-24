@@ -32,6 +32,8 @@ static std::mutex rope_init_mtx;
 #include <atomic>
 #include <cstdint>
 #include <dlfcn.h>
+#include <unordered_map>
+
 
 
 inline float convert_scalar(uint16_t h) {
@@ -88,8 +90,487 @@ flash_attn_fn get_flash_attn_bridge() {
 }
 
 /**
+ * @brief RoPE DSP bridge function type.
+ * Dispatches in-place rotary position embedding to the cDSP via
+ * nntr_htp_bridge_rope (HTP_OP_ROPE). F32-only.
+ */
+using rope_fn = int (*)(float *, const int32_t *, unsigned int,
+                        unsigned int, unsigned int, float, int);
+
+/**
+ * @brief Lazily dlopen libggml-hexagon.so and dlsym nntr_htp_bridge_rope.
+ * Same pattern as get_flash_attn_bridge().
+ */
+rope_fn get_rope_bridge() {
+  static rope_fn fn = []() -> rope_fn {
+    void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+      ml_logw("MHACore: dlopen(libggml-hexagon.so) failed: %s "
+              "(RoPE DSP offload disabled, using CPU path)", dlerror());
+      return nullptr;
+    }
+    void *s = dlsym(handle, "nntr_htp_bridge_rope");
+    if (!s) {
+      ml_logw("MHACore: dlsym(nntr_htp_bridge_rope) failed: %s "
+              "(RoPE DSP offload disabled, using CPU path)", dlerror());
+      return nullptr;
+    }
+    ml_logi("MHACore: RoPE DSP bridge loaded successfully");
+    return reinterpret_cast<rope_fn>(s);
+  }();
+  return fn;
+}
+
+/**
+ * @brief FP16 RoPE DSP bridge function type.
+ * Dispatches in-place rotary position embedding on __fp16 tensors via
+ * nntr_htp_bridge_rope_f16. The DSP kernel casts F16->F32 internally,
+ * runs F32 rope, and casts back — all in one op (replaces the 3-op
+ * cast-rotate-cast chain).
+ */
+using rope_f16_fn = int (*)(__fp16 *, const int32_t *, unsigned int,
+                            unsigned int, unsigned int, float, int);
+
+/**
+ * @brief Lazily dlopen libggml-hexagon.so and dlsym nntr_htp_bridge_rope_f16.
+ */
+rope_f16_fn get_rope_f16_bridge() {
+  static rope_f16_fn fn = []() -> rope_f16_fn {
+    void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+      return nullptr;
+    }
+    void *s = dlsym(handle, "nntr_htp_bridge_rope_f16");
+    if (!s) {
+      ml_logw("MHACore: dlsym(nntr_htp_bridge_rope_f16) failed: %s "
+              "(FP16 RoPE will use cast-rotate-cast chain)", dlerror());
+      return nullptr;
+    }
+    ml_logi("MHACore: FP16 RoPE DSP bridge loaded successfully");
+    return reinterpret_cast<rope_f16_fn>(s);
+  }();
+  return fn;
+}
+
+
+/**
+ * @brief Force a DSP sync if a begin_batch/end_batch scope is currently
+ * open, otherwise do nothing.
+ *
+ * Every nntr_htp_bridge_* call above only enqueues without executing when
+ * a batch is open (that's the whole point of batching) - the actual DSP
+ * computation doesn't happen until something flushes. If this layer is
+ * about to read a tensor's raw CPU memory that an earlier enqueued-but-
+ * unflushed op (a Q/K/V projection GEMM, or the RoPE dispatch above) was
+ * supposed to have written, that read sees whatever was there before, not
+ * the result - silently wrong attention, not just slow attention. Call
+ * this immediately before any such read (see its call site in
+ * one_batch_incremental_forwarding, right before the K/V cache-append
+ * copies).
+ */
+void flush_if_batch_active() {
+  using IsBatchActiveFn = int (*)();
+  using FlushFn = void (*)();
+  static IsBatchActiveFn is_batch_active = nullptr;
+  static FlushFn do_flush = nullptr;
+  static bool tried = false;
+  if (!tried) {
+    tried = true;
+    void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (handle) {
+      is_batch_active =
+        (IsBatchActiveFn)dlsym(handle, "nntr_htp_bridge_is_batch_active");
+      do_flush = (FlushFn)dlsym(handle, "nntr_htp_bridge_flush");
+    }
+  }
+  if (is_batch_active && do_flush && is_batch_active()) {
+    do_flush();
+  }
+}
+
+/**
+ * @brief §6.2: DSP-side copy bridge for KV-cache append.
+ * Dispatches HTP_OP_CPY to the cDSP, allowing K/V cache append to happen
+ * on the NPU without forcing a CPU-side flush+copy. This eliminates the
+ * 5/block explicit flush_if_batch_active() calls in mha_core.
+ * dst_is_fp16=1 downcasts F32 src to the cache's actual F16 storage dtype
+ * (op_cpy's existing same-shape F32->F16 kernel, htp/cpy-ops.c).
+ */
+using cpy_fn = int (*)(const void *, void *, unsigned int, int, int);
+
+cpy_fn get_cpy_bridge() {
+
+  static cpy_fn fn = []() -> cpy_fn {
+    void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) return nullptr;
+    return reinterpret_cast<cpy_fn>(dlsym(handle, "nntr_htp_bridge_cpy"));
+  }();
+  return fn;
+}
+
+/**
+ * @brief Try a straight (no-rotation) DSP copy for KV-cache append via
+ * HTP_OP_CPY. `src` and `dst` must have the same element count and be a
+ * contiguous view (true for the n_tokens-row cache-append slices this is
+ * called with - see one_batch_incremental_forwarding). Handles FP32/FP16 on
+ * either side (the DSP kernel supports all four combinations - see
+ * htp/cpy-ops.c). Any other dtype (e.g. UINT16 cache), non-cdsp engine, or
+ * missing bridge falls back to the caller's CPU path, unchanged.
+ *
+ * No flush_if_batch_active() needed before this call, unlike the CPU
+ * fallback: the DSP enqueue just chains after whatever DSP op already
+ * produced `src`, instead of forcing the host to wait for it first.
+ *
+ * On this model's actual on-device dtypes (Q/K/V activations and the KV
+ * cache are both FP16 - see Applications/CausalLM/models/transformer.cpp,
+ * cache_dtype="FP16" on ARM/Android), this only ever fires for the V-cache
+ * append: V needs no rotation, so it's a pure copy every time. K's append
+ * is NOT a pure copy on this model - key_step.getDataType()==FP32 (the
+ * DSP RoPE bridge's dtype gate) is false for FP16 activations, so K's
+ * rotation never dispatches to the DSP RoPE kernel and always falls
+ * through to the CPU path, which computes the actual rotation (not just a
+ * copy) and therefore must flush and read real data - this helper can't
+ * remove that flush without an FP16-capable DSP RoPE kernel, which does
+ * not exist today (htp/rope-ops.c is F32-only). The K call site below is
+ * kept for the case where DSP RoPE does succeed (F32 activations, or a
+ * future FP16 RoPE kernel).
+ */
+bool try_dsp_cache_copy(bool is_cdsp_engine, nntrainer::Tensor &src,
+                        nntrainer::Tensor &dst) {
+  if (!is_cdsp_engine)
+    return false;
+  auto to_flag = [](ml::train::TensorDim::DataType t) -> int {
+    if (t == ml::train::TensorDim::DataType::FP32)
+      return 0;
+#ifdef ENABLE_FP16
+    if (t == ml::train::TensorDim::DataType::FP16)
+      return 1;
+#endif
+    return -1;
+  };
+  int src_is_fp16 = to_flag(src.getDataType());
+  int dst_is_fp16 = to_flag(dst.getDataType());
+  if (src_is_fp16 < 0 || dst_is_fp16 < 0)
+    return false;
+  cpy_fn fn = get_cpy_bridge();
+  if (!fn)
+    return false;
+  unsigned int n_elems = static_cast<unsigned int>(src.size());
+  const void *src_ptr = src_is_fp16
+#ifdef ENABLE_FP16
+                          ? static_cast<const void *>(src.getData<_FP16>())
+#else
+                          ? nullptr
+#endif
+                          : static_cast<const void *>(src.getData<float>());
+  void *dst_ptr = dst_is_fp16
+#ifdef ENABLE_FP16
+                    ? static_cast<void *>(dst.getData<_FP16>())
+#else
+                    ? nullptr
+#endif
+                    : static_cast<void *>(dst.getData<float>());
+  int rc = fn(src_ptr, dst_ptr, n_elems, src_is_fp16, dst_is_fp16);
+  if (rc != 0) {
+    ml_logw("MHACore: DSP cache-copy bridge failed (rc=%d), falling back to CPU", rc);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * @brief Reusable FP16 scratch tensor for the Q/K/V/O FP32->FP16 staging
+ * cast in forwarding()'s `#if ENABLE_FP16 && __ANDROID__` block.
+ *
+ * Measured root cause of a regression: that block used to do
+ * `nntrainer::Tensor(dim, true)` - a brand-new heap allocation - for
+ * Q_step/K_step/V_step/O_step on *every* call, i.e. every one of the 28
+ * transformer blocks, every prefill. Since that memory was never part of
+ * any rpcmem region the DSP already knows about, every
+ * `nntr_htp_bridge_cpy()` touching it was a pool "miss" - a fresh,
+ * synchronous rpcmem registration RPC that can't be deferred into the open
+ * batch. Measured: this alone produced 112 of 141 real FastRPC
+ * round-trips in a 28-layer/909-token prefill
+ * (`pool_stats cpy:dst/src: 140 hit(s), 112 miss(es)`) - see
+ * docs/backend_guide/AGENT_HANDOFF_2026-08-20.md.
+ *
+ * Every layer in this model shares the same head_dim/num_heads, so one
+ * grow-once (never-shrink) scratch tensor per role, held in the caller's
+ * function-static storage (shared across all 28 MHACoreLayer instances,
+ * since `forwarding()` has exactly one compiled body), means only the
+ * very first layer's call ever registers a new buffer - the other 27 get
+ * a plain `getSharedDataTensor()` view into memory the bridge has already
+ * seen (a pool hit, no RPC).
+ */
+nntrainer::Tensor
+get_reusable_fp16_scratch(nntrainer::Tensor &owner,
+                          const nntrainer::TensorDim &want_dim) {
+  if (owner.empty() || owner.size() < want_dim.getDataLen()) {
+    owner = nntrainer::Tensor(want_dim, true);
+    // Reusing the same C++ Tensor/pointer across layers is necessary but
+    // NOT sufficient: nntr_htp_bridge_cpy's hit/miss check
+    // (nntr_htp_bridge_find_ext_pool) only checks the bridge's OWN
+    // registered-pool table, not "have I seen this address before" - a
+    // stable pointer that was never registered still misses on every
+    // single call. Register it once here, same as RopeScratchRpcMem does
+    // for its own scratch buffer, so all subsequent reuses are real hits.
+    using RegisterFn = int (*)(const void *, size_t);
+    static RegisterFn register_pool = []() -> RegisterFn {
+      void *bridge = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+      if (!bridge) return nullptr;
+      return reinterpret_cast<RegisterFn>(
+        dlsym(bridge, "nntr_htp_bridge_register_activation_pool"));
+    }();
+    if (register_pool) {
+      int rc = register_pool(owner.getData<char>(), owner.bytes());
+      if (rc != 0) {
+        ml_logw("MHACore: register_activation_pool failed (rc=%d) for FP16 "
+                "staging scratch (%zu bytes) - this buffer will miss the "
+                "pool on every use",
+                rc, owner.bytes());
+      }
+    }
+    return owner;
+  }
+  return owner.getSharedDataTensor(want_dim, 0, true);
+}
+
+// ---------------------------------------------------------------------------
+// FP16 RoPE via cast-rotate-cast: the DSP RoPE kernel (htp/rope-ops.c) is
+// F32-only, but this model's Q/K activations are FP16 - so instead of a new
+// FP16 RoPE kernel, chain three DSP ops that already exist and enqueue them
+// into the same batch (FIFO-ordered, no host flush needed between or before
+// them - same chaining guarantee nntr_htp_bridge_ffn_swiglu already relies
+// on for its 5 sequentially-dependent ops):
+//   1. cpy (F16->F32): cast the FP16 activation into a scratch F32 buffer
+//   2. rope (F32, in-place): rotate the scratch buffer
+//   3. cpy (F32->F16): cast the rotated result into its FP16 destination
+//      (the KV cache for K, or back into the activation tensor for Q)
+// A single scratch rpcmem buffer is allocated and registered ONCE (not per
+// layer/per call - registering many small pools was found to hang the DSP
+// after ~12-13 registrations, see RMSNormLayer's disabled gamma-rpcmem
+// attempt in rms_norm.cpp) and reused for every block's Q and K calls in
+// turn, since prefill processes one block, one tensor, at a time.
+// ---------------------------------------------------------------------------
+namespace {
+
+class RopeScratchRpcMem {
+public:
+  static RopeScratchRpcMem &global() {
+    static RopeScratchRpcMem inst;
+    return inst;
+  }
+
+  // Returns a scratch F32 buffer with room for at least `n_elems` floats,
+  // or nullptr if rpcmem/the bridge is unavailable or n_elems exceeds the
+  // buffer's fixed capacity (sized generously for this model at
+  // construction; see kMaxElems below).
+  float *get(unsigned int n_elems) {
+    if (!usable() || n_elems > kMaxElems) {
+      return nullptr;
+    }
+    return buf_;
+  }
+
+  bool usable() const { return buf_ != nullptr; }
+
+private:
+  // Sized for one block's largest single Q or K call: num_heads * head_dim
+  // per token, up to 1024 tokens - matching the existing gemm_q4_0/
+  // ffn_swiglu "M>1024 activation rows" bridge limit (docs/backend_guide:
+  // "add graceful CPU fallback for M>1024 activation rows"), since prefill
+  // already falls back to CPU wholesale past that length anyway. 32 heads *
+  // 128 head_dim * 1024 tokens covers Qwen3-0.6B (16 Q heads) with margin
+  // for larger head counts.
+  static constexpr unsigned int kMaxElems = 32u * 128u * 1024u;
+
+  using AllocFn = void *(*)(int, uint32_t, int);
+  using RegisterFn = int (*)(const void *, size_t);
+
+  static constexpr int kHeapIdSystem = 25;
+  static constexpr int kDefaultFlags = 1;
+
+  RopeScratchRpcMem() {
+    void *rpc = dlopen("libcdsprpc.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!rpc) {
+      ml_logw("MHACore: dlopen(libcdsprpc.so) failed: %s", dlerror());
+      return;
+    }
+    auto alloc = reinterpret_cast<AllocFn>(dlsym(rpc, "rpcmem_alloc"));
+    if (!alloc) {
+      ml_logw("MHACore: dlsym(rpcmem_alloc) failed: %s", dlerror());
+      return;
+    }
+
+    void *bridge = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!bridge) {
+      ml_logw("MHACore: dlopen(libggml-hexagon.so) failed: %s", dlerror());
+      return;
+    }
+    auto register_pool = reinterpret_cast<RegisterFn>(
+      dlsym(bridge, "nntr_htp_bridge_register_activation_pool"));
+    if (!register_pool) {
+      ml_logw("MHACore: dlsym(nntr_htp_bridge_register_activation_pool) "
+              "failed: %s",
+              dlerror());
+      return;
+    }
+
+    size_t bytes = static_cast<size_t>(kMaxElems) * sizeof(float);
+    void *p = alloc(kHeapIdSystem, kDefaultFlags, static_cast<int>(bytes));
+    if (!p) {
+      ml_logw("MHACore: rpcmem_alloc(%zu) failed for RoPE scratch buffer; "
+              "FP16 RoPE will stay on CPU",
+              bytes);
+      return;
+    }
+    if (register_pool(p, bytes) != 0) {
+      ml_logw("MHACore: bridge rejected RoPE scratch pool %p (%zu bytes); "
+              "FP16 RoPE will stay on CPU",
+              p, bytes);
+      return;
+    }
+    buf_ = static_cast<float *>(p);
+  }
+
+  float *buf_ = nullptr;
+};
+
+} // namespace
+
+/**
+ * @brief Try FP16 RoPE via the cast-rotate-cast chain described above.
+ * `dst` may alias `src.getData()` for Q (in-place rotation, no cache
+ * involved) or be a separate KV-cache view for K. Returns false (caller
+ * falls back to CPU) if any step can't be dispatched - `src` is never
+ * mutated by this function (only the scratch buffer is), so the CPU
+ * fallback path re-reads unmodified original data, exactly as if this had
+ * never been attempted.
+ *
+ * Re-enabled: the original 14% regression was measured when the
+ * flush_if_batch_active() calls in the CPU fallback path were no-ops
+ * (nothing was pending on the DSP at that point). Now that the QKV input
+ * copies use try_dsp_cache_copy (Op 2 fix), there ARE pending DSP ops
+ * when K-RoPE runs, making the CPU fallback's flush a real round-trip.
+ * The cast-chain eliminates that real flush, so the trade-off is now:
+ * 3 extra HVX dispatches vs 1 real FastRPC flush per block. Re-measure
+ * to confirm whether this is now a net win.
+ */
+bool try_dsp_fp16_rope(bool is_cdsp_engine, nntrainer::Tensor &src,
+                       nntrainer::Tensor &dst, const int32_t *positions,
+                       unsigned int n_tokens, unsigned int n_heads,
+                       unsigned int head_dim, float theta) {
+
+  if (!is_cdsp_engine)
+    return false;
+#ifdef ENABLE_FP16
+  if (src.getDataType() != ml::train::TensorDim::DataType::FP16 ||
+      dst.getDataType() != ml::train::TensorDim::DataType::FP16)
+    return false;
+
+  // Try the single-op FP16 RoPE bridge first (nntr_htp_bridge_rope_f16).
+  // The DSP kernel (rope_job_f16 in rope-ops.c) casts F16->F32 internally,
+  // runs F32 rope, and casts back to F16 — all in one DSP op. This replaces
+  // the old 3-op cast-rotate-cast chain (cpy F16->F32 + rope F32 + cpy
+  // F32->F16) that produced 3× as many FastRPC round-trips.
+  const rope_f16_fn &rope_f16_dsp = get_rope_f16_bridge();
+  if (rope_f16_dsp) {
+    int rc = rope_f16_dsp(src.getData<_FP16>(), positions, n_tokens, n_heads,
+                          head_dim, theta, 2);
+    if (rc == 0) {
+      // Single-op F16 RoPE succeeded. If src != dst, copy result to dst.
+      // (For Q rotation, src==dst and this is a no-op; for K rotation,
+      // rope_f16_dsp writes in-place to src, so copy to dst/cache.)
+      if (&src != &dst) {
+        if (!try_dsp_cache_copy(is_cdsp_engine, src, dst)) {
+          flush_if_batch_active();
+          dst.copyData(src);
+        }
+      }
+      return true;
+    }
+    ml_logw("MHACore: FP16 RoPE DSP bridge failed (rc=%d), falling back to "
+            "cast-rotate-cast chain",
+            rc);
+  }
+
+  // Fallback: 3-op cast-rotate-cast chain (for older DSP libs without
+  // nntr_htp_bridge_rope_f16).
+  cpy_fn cpy = get_cpy_bridge();
+  const rope_fn &rope_dsp = get_rope_bridge();
+  if (!cpy || !rope_dsp)
+    return false;
+  unsigned int n_elems = static_cast<unsigned int>(src.size());
+  float *scratch = RopeScratchRpcMem::global().get(n_elems);
+  if (!scratch)
+    return false;
+
+  int rc = cpy(static_cast<const void *>(src.getData<_FP16>()),
+              static_cast<void *>(scratch), n_elems, /*src_is_fp16=*/1,
+              /*dst_is_fp16=*/0);
+  if (rc != 0) {
+    ml_logw("MHACore: DSP cast-in (F16->F32) failed (rc=%d) for FP16 RoPE, "
+            "falling back to CPU",
+            rc);
+    return false;
+  }
+
+  rc = rope_dsp(scratch, positions, n_tokens, n_heads, head_dim, theta, 2);
+  if (rc != 0) {
+    ml_logw("MHACore: DSP RoPE on scratch buffer failed (rc=%d), falling "
+            "back to CPU",
+            rc);
+    return false;
+  }
+
+  rc = cpy(static_cast<const void *>(scratch),
+          static_cast<void *>(dst.getData<_FP16>()), n_elems,
+          /*src_is_fp16=*/0, /*dst_is_fp16=*/1);
+  if (rc != 0) {
+    ml_logw("MHACore: DSP cast-out (F32->F16) failed (rc=%d) for FP16 RoPE, "
+            "falling back to CPU",
+            rc);
+    return false;
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
+
+// Forward declaration — build_causal_mask is defined below in this namespace.
+void build_causal_mask(std::vector<uint16_t> &mask, unsigned int n_tokens,
+                       unsigned int n_kv, unsigned int cache_from);
+
+/**
+ * @brief §6.3: Cached causal mask to avoid rebuilding it on every layer.
+ * The causal mask for a given (n_tokens, n_kv, cache_from) is identical
+ * across all 28 transformer blocks during prefill. Cache it so the CPU
+ * build_causal_mask loop runs once instead of 28 times.
+ */
+static std::unordered_map<uint64_t, std::vector<uint16_t>> g_causal_mask_cache;
+
+const std::vector<uint16_t> & get_cached_causal_mask(
+    unsigned int n_tokens, unsigned int n_kv, unsigned int cache_from) {
+  // Cache key: pack (cache_from, n_kv, n_tokens) into 64 bits
+  uint64_t key = ((uint64_t)cache_from << 40) | ((uint64_t)n_kv << 20) | (uint64_t)n_tokens;
+  auto it = g_causal_mask_cache.find(key);
+  if (it != g_causal_mask_cache.end()) {
+    return it->second;
+  }
+  // Build and cache
+  std::vector<uint16_t> & mask = g_causal_mask_cache[key];
+  build_causal_mask(mask, n_tokens, n_kv, cache_from);
+  return mask;
+}
+
+
+
+/**
  * @brief Check if flash attention should be used.
  * Enabled for prefill (step_size > 1) with head_dim a multiple of 64
+
  * (HMX fast path). The bridge (nntr_htp_bridge_flash_attn) and the DSP
  * kernel (hmx_flash_attn_ext in flash-attn-ops.c) both require
  * head_dim % 64 == 0 — so head_dim=64 (Qwen3-0.6B) and head_dim=128
@@ -300,6 +781,11 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** use rope */
   use_rope = std::get<props::UseRope>(mha_core_props).get();
 
+  /** cache compute_engine for one_batch_incremental_forwarding(), which has
+   * no RunLayerContext of its own to query it from directly */
+  is_cdsp_engine =
+    context.getComputeEngineType() == ml::train::LayerComputeEngine::CDSP;
+
   /** attention scaling computation */
   rope_scaling_type = std::get<props::RopeScalingType>(mha_core_props).get();
   scale = std::get<props::RopeScalingFactor>(mha_core_props).get();
@@ -489,14 +975,27 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
       V_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
       O_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
 
-      nntrainer::Tensor Q_step = nntrainer::Tensor(Q_step_dim, true);
-      nntrainer::Tensor K_step = nntrainer::Tensor(K_step_dim, true);
-      nntrainer::Tensor V_step = nntrainer::Tensor(V_step_dim, true);
-      nntrainer::Tensor O_step = nntrainer::Tensor(O_step_dim, true);
+      // Shared across all 28 MHACoreLayer instances - see
+      // get_reusable_fp16_scratch()'s doc comment for why.
+      static nntrainer::Tensor Q_scratch_owner, K_scratch_owner,
+        V_scratch_owner, O_scratch_owner;
+      nntrainer::Tensor Q_step =
+        get_reusable_fp16_scratch(Q_scratch_owner, Q_step_dim);
+      nntrainer::Tensor K_step =
+        get_reusable_fp16_scratch(K_scratch_owner, K_step_dim);
+      nntrainer::Tensor V_step =
+        get_reusable_fp16_scratch(V_scratch_owner, V_step_dim);
+      nntrainer::Tensor O_step =
+        get_reusable_fp16_scratch(O_scratch_owner, O_step_dim);
 
-      Q_step.copyData(query_step);
-      K_step.copyData(key_step);
-      V_step.copyData(value_step);
+      bool cdsp = context.getComputeEngineType() ==
+                  ml::train::LayerComputeEngine::CDSP;
+      if (!try_dsp_cache_copy(cdsp, query_step, Q_step))
+        Q_step.copyData(query_step);
+      if (!try_dsp_cache_copy(cdsp, key_step, K_step))
+        K_step.copyData(key_step);
+      if (!try_dsp_cache_copy(cdsp, value_step, V_step))
+        V_step.copyData(value_step);
 
       if (use_sink) {
         one_batch_incremental_forwarding(
@@ -504,23 +1003,26 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
           cache_value, cache_key_dim, cache_key_step_dim, cache_value_dim,
           cache_value_step_dim, sink);
       } else {
-        one_batch_incremental_forwarding(batch, from, from, to, Q_step, K_step,
-                                         V_step, O_step, cache_key, cache_value,
-                                         cache_key_dim, cache_key_step_dim,
-                                         cache_value_dim, cache_value_step_dim);
+        one_batch_incremental_forwarding(
+          batch, from, from, to, Q_step, K_step, V_step, O_step, cache_key,
+          cache_value, cache_key_dim, cache_key_step_dim, cache_value_dim,
+          cache_value_step_dim);
       }
-      output_step.copyData(O_step);
+      if (!try_dsp_cache_copy(cdsp, O_step, output_step))
+        output_step.copyData(O_step);
 #else
-      if (use_sink) {
-        one_batch_incremental_forwarding(
-          batch, from, from, to, query_step, key_step, value_step, output_step,
-          cache_key, cache_value, cache_key_dim, cache_key_step_dim,
-          cache_value_dim, cache_value_step_dim, sink);
-      } else {
-        one_batch_incremental_forwarding(
-          batch, from, from, to, query_step, key_step, value_step, output_step,
-          cache_key, cache_value, cache_key_dim, cache_key_step_dim,
-          cache_value_dim, cache_value_step_dim);
+      {
+        if (use_sink) {
+          one_batch_incremental_forwarding(
+            batch, from, from, to, query_step, key_step, value_step,
+            output_step, cache_key, cache_value, cache_key_dim,
+            cache_key_step_dim, cache_value_dim, cache_value_step_dim, sink);
+        } else {
+          one_batch_incremental_forwarding(
+            batch, from, from, to, query_step, key_step, value_step,
+            output_step, cache_key, cache_value, cache_key_dim,
+            cache_key_step_dim, cache_value_dim, cache_value_step_dim);
+        }
       }
 #endif
     } else {
@@ -654,37 +1156,53 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       V_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
       O_step_dim.setDataType(ml::train::TensorDim::DataType::FP16);
 
-      nntrainer::Tensor Q_step = nntrainer::Tensor(Q_step_dim, true);
-      nntrainer::Tensor K_step = nntrainer::Tensor(K_step_dim, true);
-      nntrainer::Tensor V_step = nntrainer::Tensor(V_step_dim, true);
-      nntrainer::Tensor O_step = nntrainer::Tensor(O_step_dim, true);
+      // Shared across all 28 MHACoreLayer instances - see
+      // get_reusable_fp16_scratch()'s doc comment for why.
+      static nntrainer::Tensor Q_scratch_owner, K_scratch_owner,
+        V_scratch_owner, O_scratch_owner;
+      nntrainer::Tensor Q_step =
+        get_reusable_fp16_scratch(Q_scratch_owner, Q_step_dim);
+      nntrainer::Tensor K_step =
+        get_reusable_fp16_scratch(K_scratch_owner, K_step_dim);
+      nntrainer::Tensor V_step =
+        get_reusable_fp16_scratch(V_scratch_owner, V_step_dim);
+      nntrainer::Tensor O_step =
+        get_reusable_fp16_scratch(O_scratch_owner, O_step_dim);
 
-      Q_step.copyData(query_step);
-      K_step.copyData(key_step);
-      V_step.copyData(value_step);
+      bool cdsp = context.getComputeEngineType() ==
+                  ml::train::LayerComputeEngine::CDSP;
+      if (!try_dsp_cache_copy(cdsp, query_step, Q_step))
+        Q_step.copyData(query_step);
+      if (!try_dsp_cache_copy(cdsp, key_step, K_step))
+        K_step.copyData(key_step);
+      if (!try_dsp_cache_copy(cdsp, value_step, V_step))
+        V_step.copyData(value_step);
       if (use_sink) {
         one_batch_incremental_forwarding(
           batch, _from, from, to, Q_step, K_step, V_step, O_step, cache_key,
           cache_value, cache_key_dim, cache_key_step_dim, cache_value_dim,
           cache_value_step_dim, sink);
       } else {
-        one_batch_incremental_forwarding(batch, _from, from, to, Q_step, K_step,
-                                         V_step, O_step, cache_key, cache_value,
-                                         cache_key_dim, cache_key_step_dim,
-                                         cache_value_dim, cache_value_step_dim);
+        one_batch_incremental_forwarding(
+          batch, _from, from, to, Q_step, K_step, V_step, O_step, cache_key,
+          cache_value, cache_key_dim, cache_key_step_dim, cache_value_dim,
+          cache_value_step_dim);
       }
-      output_step.copyData(O_step);
+      if (!try_dsp_cache_copy(cdsp, O_step, output_step))
+        output_step.copyData(O_step);
 #else
-      if (use_sink) {
-        one_batch_incremental_forwarding(
-          batch, _from, from, to, query_step, key_step, value_step, output_step,
-          cache_key, cache_value, cache_key_dim, cache_key_step_dim,
-          cache_value_dim, cache_value_step_dim, sink);
-      } else {
-        one_batch_incremental_forwarding(
-          batch, _from, from, to, query_step, key_step, value_step, output_step,
-          cache_key, cache_value, cache_key_dim, cache_key_step_dim,
-          cache_value_dim, cache_value_step_dim);
+      {
+        if (use_sink) {
+          one_batch_incremental_forwarding(
+            batch, _from, from, to, query_step, key_step, value_step,
+            output_step, cache_key, cache_value, cache_key_dim,
+            cache_key_step_dim, cache_value_dim, cache_value_step_dim, sink);
+        } else {
+          one_batch_incremental_forwarding(
+            batch, _from, from, to, query_step, key_step, value_step,
+            output_step, cache_key, cache_value, cache_key_dim,
+            cache_key_step_dim, cache_value_dim, cache_value_step_dim);
+        }
       }
 #endif
     } else {
@@ -857,32 +1375,161 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                       cache_index * cache_value_dim.width(),
                                     true);
 
-  // append kcache with or without rotary embedding
-  apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, cache_index,
-                             !use_rope);
+  // step_size/is_prefill computed here (rather than after, where it used to
+  // be computed) because the DSP RoPE dispatch below needs it: decode
+  // (step_size==1) must never hit the bridge - a single-row RoPE is a GEMV-
+  // scale op where the FastRPC round trip costs far more than the CPU
+  // compute it replaces, exactly like every other NPU dispatch gate in this
+  // codebase (should_use_flash_attn, should_use_fused_ffn).
+  unsigned int step_size = to - from;
+  bool is_prefill = !from || step_size > 1;
 
-  // append vcache without rotary embedding
+  // append kcache with or without rotary embedding
+  // For prefill with flash_attn: try DSP RoPE on K, then copy already-
+  // rotated K into cache. F32 key_step rotates in-place directly; FP16
+  // key_step (this model's actual dtype) goes through the cast-rotate-cast
+  // chain in try_dsp_fp16_rope (the F32-only DSP RoPE kernel by way of a
+  // scratch buffer) since there's no FP16 RoPE kernel on the DSP.
+  bool k_rope_done = false;
+  if (is_prefill && use_rope && is_cdsp_engine &&
+      !getenv("NNTR_HEXAGON_NO_ELEM_OPS") &&
+      (key_step.getDataType() == ml::train::TensorDim::DataType::FP32 ||
+       key_step.getDataType() == ml::train::TensorDim::DataType::FP16)) {
+
+    unsigned int n_tokens = key_step.height();
+    unsigned int n_heads = num_heads_KV;
+    std::vector<int32_t> positions(n_tokens);
+    for (unsigned int i = 0; i < n_tokens; i++) {
+      positions[i] = (int32_t)(cache_index + i);
+    }
+
+    if (key_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+      const rope_fn &rope_dsp = get_rope_bridge();
+      if (rope_dsp) {
+        int rc = rope_dsp(key_step.getData<float>(), positions.data(),
+                          n_tokens, n_heads, (unsigned int)head_dim,
+                          theta, 2);
+        if (rc == 0) {
+          // K is now actually rotated (rotation was just enqueued, not yet
+          // run) - copy it into the cache without re-rotating. Try the DSP
+          // copy bridge first: it enqueues right after the pending RoPE op
+          // with no host-side flush at all. Only fall back to
+          // flush_if_batch_active()+CPU copy (which forces the RoPE result
+          // to materialize on the host first) if the DSP copy path isn't
+          // available for this tensor (see try_dsp_cache_copy).
+          if (!try_dsp_cache_copy(is_cdsp_engine, key_step, b_cache_key_step)) {
+            flush_if_batch_active();
+            apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim,
+                                       cache_index, true);
+          }
+          k_rope_done = true;
+        } else {
+          ml_logw("MHACore: K RoPE DSP bridge failed (rc=%d), falling back to CPU", rc);
+        }
+      }
+    } else {
+      // FP16: cast-rotate-cast straight into the cache - no separate copy
+      // step needed, try_dsp_fp16_rope's last cast writes directly to dst.
+      if (try_dsp_fp16_rope(is_cdsp_engine, key_step, b_cache_key_step,
+                            positions.data(), n_tokens, n_heads,
+                            (unsigned int)head_dim, theta)) {
+        k_rope_done = true;
+      }
+    }
+  }
+  if (!k_rope_done) {
+    // key_step may be the output of an enqueued-but-not-yet-executed K
+    // projection GEMM (dispatched via HexagonComputeOps from the FC layer
+    // above, inside the same open batch) - sync before reading it here too.
+    flush_if_batch_active();
+    apply_rotary_emb_tensor_v2(key_step, b_cache_key_step, head_dim, cache_index,
+                               !use_rope);
+  }
+
+
+  // append vcache without rotary embedding.
+  // value_step is the V projection GEMM's output, which may itself be an
+  // enqueued-but-not-yet-executed op if it went through HexagonComputeOps
+  // inside the same open batch. Try the DSP copy bridge first - it chains
+  // after whatever produced value_step with no host-side flush at all
+  // (V never needs rotation, unlike K, so this doesn't depend on RoPE
+  // dispatch succeeding); only the fallback CPU paths below need to force
+  // it to materialize first.
   if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
-                               cache_index, true);
+    if (!try_dsp_cache_copy(is_cdsp_engine, value_step, b_cache_value_step)) {
+      flush_if_batch_active();
+      apply_rotary_emb_tensor_v2(value_step, b_cache_value_step, head_dim,
+                                 cache_index, true);
+    }
   } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    b_cache_value_step.copyData(value_step);
+    if (!try_dsp_cache_copy(is_cdsp_engine, value_step, b_cache_value_step)) {
+      flush_if_batch_active();
+      b_cache_value_step.copyData(value_step);
+    }
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
   }
 
-  unsigned int step_size = to - from;
-  bool is_prefill = !from || step_size > 1;
   if (skip_prefill && is_prefill)
     return;
 
   // apply rotary embedding for query
   if (use_rope) {
-    apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
-                               false);
+    // Try DSP RoPE bridge for prefill (in-place rotation on cDSP). F32
+    // rotates directly; FP16 (this model's actual dtype) goes through the
+    // cast-rotate-cast chain in try_dsp_fp16_rope - see the K-RoPE dispatch
+    // above for the full explanation. Prefill-only - see the is_prefill
+    // comment above the K-RoPE dispatch.
+    bool rope_done = false;
+    if (is_prefill && is_cdsp_engine &&
+        !getenv("NNTR_HEXAGON_NO_ELEM_OPS") &&
+        (query_step.getDataType() == ml::train::TensorDim::DataType::FP32 ||
+         query_step.getDataType() == ml::train::TensorDim::DataType::FP16)) {
+      unsigned int n_tokens = query_step.height();
+      unsigned int n_heads = num_heads_Q;
+
+      // Build position indices [cache_index, cache_index+1, ..., cache_index+n_tokens-1]
+      std::vector<int32_t> positions(n_tokens);
+      for (unsigned int i = 0; i < n_tokens; i++) {
+        positions[i] = (int32_t)(cache_index + i);
+      }
+
+      if (query_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+        const rope_fn &rope_dsp = get_rope_bridge();
+        if (rope_dsp) {
+          // mode=2 is NEOX (split-half) — matches ggml/llama.cpp Qwen3 RoPE
+          int rc = rope_dsp(query_step.getData<float>(), positions.data(),
+                            n_tokens, n_heads, (unsigned int)head_dim,
+                            theta, 2);
+          if (rc == 0) {
+            rope_done = true;
+          } else {
+            ml_logw("MHACore: RoPE DSP bridge failed (rc=%d), falling back to CPU", rc);
+          }
+        }
+      } else {
+        // FP16, in-place: src and dst are the same tensor - safe, since the
+        // cast-in (reads query_step) always executes before the cast-out
+        // (writes query_step) in DSP FIFO order, with the rotation done on
+        // the scratch buffer in between.
+        if (try_dsp_fp16_rope(is_cdsp_engine, query_step, query_step,
+                              positions.data(), n_tokens, n_heads,
+                              (unsigned int)head_dim, theta)) {
+          rope_done = true;
+        }
+      }
+    }
+    if (!rope_done) {
+      // Same hazard as the K fallback above: query_step may be an
+      // enqueued-but-not-yet-executed Q projection GEMM's output.
+      flush_if_batch_active();
+      apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
+                                 false);
+    }
   }
+
 
   /// @todo replace step_size into input height
   unsigned int cache_from = cache_index;
@@ -911,9 +1558,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   bool use_flash = should_use_flash_attn(step_size, head_dim, is_prefill);
 
   if (use_flash) {
-    // Build causal mask: [step_size, cache_to] F16
-    std::vector<uint16_t> mask;
-    build_causal_mask(mask, step_size, cache_to, cache_from);
+    // §6.3: Use cached causal mask instead of rebuilding per-layer.
+    // The mask for a given (step_size, cache_to, cache_from) is identical
+    // across all 28 transformer blocks during prefill, so build it once
+    // and reuse. Falls back to build_causal_mask on cache miss.
+    const std::vector<uint16_t> & mask =
+      get_cached_causal_mask(step_size, cache_to, cache_from);
+
 
     // Determine Q/out dtype - FP16 is the common case for CausalLM
     bool q_is_fp16 = (query_step.getDataType() ==
@@ -935,6 +1586,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   }
 
   if (!use_flash) {
+    // query_step/b_cached_key can be enqueued-but-not-yet-executed DSP
+    // output here: RoPE-DSP is gated on is_prefill alone (see above), while
+    // flash_attn additionally requires step_size >= 160 - so for
+    // 2 <= step_size < 160, RoPE may have been dispatched to the DSP
+    // (leaving query_step's rotation pending) while attention still falls
+    // through to this CPU path. Sync before it reads anything.
+    flush_if_batch_active();
     // Original CPU path
     compute_kcaches(query_step, b_cached_key, out_, cache_from,
                     cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
@@ -993,11 +1651,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                                true);
   } else if (query_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    b_cache_value_step.copyData(value_step);
+    if (!try_dsp_cache_copy(is_cdsp_engine, value_step, b_cache_value_step)) {
+      flush_if_batch_active();
+      b_cache_value_step.copyData(value_step);
+    }
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
   }
+
 
   ml::train::TensorDim cached_key_dim = cache_key_dim;
   ml::train::TensorDim cached_value_dim = cache_value_dim;

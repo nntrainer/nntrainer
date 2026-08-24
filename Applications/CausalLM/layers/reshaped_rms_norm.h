@@ -128,6 +128,10 @@ private:
   unsigned int feature_size;
   bool skip_prefill = false;
   bool use_gamma;
+  // Cached from finalize()'s InitLayerContext (set from this layer's
+  // "engine=" property) - see rms_norm.cpp/mha_core.cpp for the same
+  // pattern and why it's cached rather than read fresh each call.
+  bool is_cdsp_engine = false;
 };
 
 } // namespace causallm

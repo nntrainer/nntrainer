@@ -60,7 +60,8 @@ public:
    * @brief Encode the prompt and return the embedding output
    */
   std::vector<float *> encode(const WSTR prompt, const WSTR system_prompt = "",
-                              const WSTR tail_prompt = "");
+                              const WSTR tail_prompt = "") override;
+
 };
 
 } // namespace causallm

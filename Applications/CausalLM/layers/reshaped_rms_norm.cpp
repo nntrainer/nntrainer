@@ -13,11 +13,245 @@
 
 #include <cmath>
 #include <cpu_backend.h>
+#include <cstdint>
+#include <cstring>
+#include <dlfcn.h>
 #include <reshaped_rms_norm.h>
 
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
+
+// ---------------------------------------------------------------------------
+// DSP bridge for q_norm/k_norm (the RMSNorm applied inside attention, on the
+// reshaped-per-head view of Q/K - distinct from the residual-stream
+// attention_norm/ffn_norm in rms_norm.cpp, which already dispatches). Same
+// nntr_htp_bridge_rms_norm bridge function, same fused normalize+scale
+// (HTP_OP_RMS_NORM_MUL) kernel - but that kernel is F32-only, and this
+// layer's actual input here is FP16 (it operates directly on the Q/K
+// projection GEMM's FP16 output, before mha_core ever sees it). So unlike
+// rms_norm.cpp's direct F32 dispatch, this goes through the same
+// cast-rotate-cast-style chain used for FP16 RoPE in mha_core.cpp: cast
+// F16->F32 into a scratch buffer, normalize the scratch buffer on the DSP,
+// cast the result back to F16 at the destination - all three ops are
+// existing DSP kernels (htp/cpy-ops.c's F16<->F32 conversion, htp/
+// unary-ops.c's F32 rms_norm_mul), enqueued into the same batch with no
+// flush needed between or before them (same FIFO-chaining guarantee
+// nntr_htp_bridge_ffn_swiglu already relies on for its 5 dependent ops).
+// ---------------------------------------------------------------------------
+using rms_norm_fn = int (*)(const float *, const float *, float *,
+                            unsigned int, unsigned int, float);
+
+static rms_norm_fn get_rms_norm_bridge() {
+  static rms_norm_fn fn = []() -> rms_norm_fn {
+    void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) {
+      ml_logw("ReshapedRMSNorm: dlopen(libggml-hexagon.so) failed: %s "
+              "(DSP offload disabled, using CPU path)", dlerror());
+      return nullptr;
+    }
+    void *s = dlsym(handle, "nntr_htp_bridge_rms_norm");
+    if (!s) {
+      ml_logw("ReshapedRMSNorm: dlsym(nntr_htp_bridge_rms_norm) failed: %s "
+              "(DSP offload disabled, using CPU path)", dlerror());
+      return nullptr;
+    }
+    return reinterpret_cast<rms_norm_fn>(s);
+  }();
+  return fn;
+}
+
+using cpy_fn = int (*)(const void *, void *, unsigned int, int, int);
+
+static cpy_fn get_cpy_bridge() {
+  static cpy_fn fn = []() -> cpy_fn {
+    void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!handle) return nullptr;
+    return reinterpret_cast<cpy_fn>(dlsym(handle, "nntr_htp_bridge_cpy"));
+  }();
+  return fn;
+}
+
+namespace {
+
+// One shared F32 scratch buffer, allocated and registered with the bridge
+// ONCE (not per layer/call - registering many small pools was found to hang
+// the DSP after ~12-13 registrations, see RMSNormLayer's disabled
+// gamma-rpcmem attempt in rms_norm.cpp), reused for every q_norm/k_norm call
+// across every block. Two halves so the cast-in destination and the
+// rms_norm-mul output don't alias the same memory the DSP is still reading.
+class NormScratchRpcMem {
+public:
+  static NormScratchRpcMem &global() {
+    static NormScratchRpcMem inst;
+    return inst;
+  }
+
+  // Returns {in_buf, out_buf}, each with room for at least `n_elems` floats,
+  // or {nullptr, nullptr} if unavailable or n_elems exceeds capacity.
+  std::pair<float *, float *> get(unsigned int n_elems) {
+    if (!usable() || n_elems > kMaxElemsPerHalf) {
+      return {nullptr, nullptr};
+    }
+    return {buf_, buf_ + kMaxElemsPerHalf};
+  }
+
+  bool usable() const { return buf_ != nullptr; }
+
+private:
+  // Sized for one block's largest single q_norm/k_norm call: reshaped to
+  // (n_tokens * num_heads) rows of feature_size (head_dim) each. 32 heads *
+  // 128 head_dim * 1024 tokens covers Qwen3-0.6B (16 Q heads) with margin,
+  // matching the same cap used for mha_core.cpp's RoPE scratch buffer (the
+  // existing gemm_q4_0/ffn_swiglu "M>1024 activation rows" limit already
+  // forces CPU fallback wholesale past that length anyway).
+  static constexpr unsigned int kMaxElemsPerHalf = 32u * 128u * 1024u;
+
+  using AllocFn = void *(*)(int, uint32_t, int);
+  using RegisterFn = int (*)(const void *, size_t);
+
+  static constexpr int kHeapIdSystem = 25;
+  static constexpr int kDefaultFlags = 1;
+
+  NormScratchRpcMem() {
+    void *rpc = dlopen("libcdsprpc.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!rpc) {
+      ml_logw("ReshapedRMSNorm: dlopen(libcdsprpc.so) failed: %s", dlerror());
+      return;
+    }
+    auto alloc = reinterpret_cast<AllocFn>(dlsym(rpc, "rpcmem_alloc"));
+    if (!alloc) {
+      ml_logw("ReshapedRMSNorm: dlsym(rpcmem_alloc) failed: %s", dlerror());
+      return;
+    }
+
+    void *bridge = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!bridge) {
+      ml_logw("ReshapedRMSNorm: dlopen(libggml-hexagon.so) failed: %s",
+              dlerror());
+      return;
+    }
+    auto register_pool = reinterpret_cast<RegisterFn>(
+      dlsym(bridge, "nntr_htp_bridge_register_activation_pool"));
+    if (!register_pool) {
+      ml_logw("ReshapedRMSNorm: dlsym(nntr_htp_bridge_register_activation_"
+              "pool) failed: %s",
+              dlerror());
+      return;
+    }
+
+    size_t bytes = static_cast<size_t>(kMaxElemsPerHalf) * 2 * sizeof(float);
+    void *p = alloc(kHeapIdSystem, kDefaultFlags, static_cast<int>(bytes));
+    if (!p) {
+      ml_logw("ReshapedRMSNorm: rpcmem_alloc(%zu) failed for scratch buffer; "
+              "FP16 DSP dispatch will stay on CPU",
+              bytes);
+      return;
+    }
+    if (register_pool(p, bytes) != 0) {
+      ml_logw("ReshapedRMSNorm: bridge rejected scratch pool %p (%zu bytes); "
+              "FP16 DSP dispatch will stay on CPU",
+              p, bytes);
+      return;
+    }
+    buf_ = static_cast<float *>(p);
+  }
+
+  float *buf_ = nullptr;
+};
+
+} // namespace
+
+/**
+ * @brief Try DSP dispatch for q_norm/k_norm. On this model, in_step/out_step
+ * turn out to be FP32 here (the FP16 downcast mha_core.cpp sees happens
+ * later, at the connection into mha_core - not in q_norm/k_norm itself,
+ * confirmed by direct on-device dtype tracing), so the direct dispatch path
+ * mirrors rms_norm.cpp exactly: no cast needed, just call
+ * nntr_htp_bridge_rms_norm straight on in_step/out_step. The FP16
+ * cast-rotate-cast chain (cast in, normalize on a scratch F32 buffer, cast
+ * out - all existing DSP kernels, same pattern as mha_core.cpp's FP16 RoPE
+ * attempt) is kept as a fallback for the FP16 case in case a future model
+ * config actually exercises it.
+ *
+ * Returns false (caller falls back to CPU) if any step can't be dispatched;
+ * `in_step`/`gamma` are never mutated by the FP16 path (only the scratch
+ * buffer is), so the CPU fallback re-reads unmodified original data.
+ */
+bool try_dsp_fp16_reshaped_rms_norm(bool is_cdsp_engine,
+                                    nntrainer::Tensor &in_step,
+                                    nntrainer::Tensor &out_step,
+                                    const nntrainer::Tensor &gamma,
+                                    unsigned int M, unsigned int W,
+                                    float epsilon) {
+  if (!is_cdsp_engine)
+    return false;
+
+  if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+      out_step.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+      gamma.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    rms_norm_fn norm = get_rms_norm_bridge();
+    if (!norm)
+      return false;
+    int rc = norm(in_step.getData<float>(), gamma.getData<float>(),
+                  out_step.getData<float>(), M, W, epsilon);
+    if (rc != 0) {
+      ml_logw("ReshapedRMSNorm: DSP rms_norm_mul failed (rc=%d), falling "
+              "back to CPU",
+              rc);
+      return false;
+    }
+    return true;
+  }
+
+#ifdef ENABLE_FP16
+  if (in_step.getDataType() != ml::train::TensorDim::DataType::FP16 ||
+      out_step.getDataType() != ml::train::TensorDim::DataType::FP16 ||
+      gamma.getDataType() != ml::train::TensorDim::DataType::FP32) {
+    return false;
+  }
+  cpy_fn cpy = get_cpy_bridge();
+  rms_norm_fn norm = get_rms_norm_bridge();
+  if (!cpy || !norm) {
+    return false;
+  }
+  unsigned int n_elems = M * W;
+  auto [scratch_in, scratch_out] = NormScratchRpcMem::global().get(n_elems);
+  if (!scratch_in) {
+    return false;
+  }
+  int rc = cpy(static_cast<const void *>(in_step.getData<_FP16>()),
+              static_cast<void *>(scratch_in), n_elems, /*src_is_fp16=*/1,
+              /*dst_is_fp16=*/0);
+  if (rc != 0) {
+    ml_logw("ReshapedRMSNorm: DSP cast-in (F16->F32) failed (rc=%d), "
+            "falling back to CPU",
+            rc);
+    return false;
+  }
+
+  rc = norm(scratch_in, gamma.getData<float>(), scratch_out, M, W, epsilon);
+  if (rc != 0) {
+    ml_logw("ReshapedRMSNorm: DSP rms_norm_mul failed (rc=%d), falling back "
+            "to CPU",
+            rc);
+    return false;
+  }
+
+  rc = cpy(static_cast<const void *>(scratch_out),
+          static_cast<void *>(out_step.getData<_FP16>()), n_elems,
+          /*src_is_fp16=*/0, /*dst_is_fp16=*/1);
+  if (rc != 0) {
+    ml_logw("ReshapedRMSNorm: DSP cast-out (F32->F16) failed (rc=%d), "
+            "falling back to CPU",
+            rc);
+    return false;
+  }
+  return true;
+#else
+  return false;
+#endif
+}
 
 void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   std::vector<nntrainer::TensorDim> dim = context.getInputDimensions();
@@ -28,8 +262,8 @@ void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
     skip_prefill = std::get<nntrainer::props::SkipPrefill>(rms_props).get();
 
-  if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
-    skip_prefill = std::get<nntrainer::props::SkipPrefill>(rms_props).get();
+  is_cdsp_engine =
+    context.getComputeEngineType() == ml::train::LayerComputeEngine::CDSP;
 
   NNTR_THROW_IF(dim[0].width() % feature_size != 0, std::invalid_argument)
     << "feature size must be a divisor of width";
@@ -94,7 +328,25 @@ void ReshapedRMSNormLayer::incremental_forwarding(
     in_step.reshape(step_reshaped_dim);
     out_step.reshape(step_reshaped_dim);
 
-    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
+    // Try DSP dispatch first (prefill-only, matching every other NPU
+    // dispatch gate in this codebase: decode is a single row, all
+    // round-trip cost, no compute to amortize it against). Only attempted
+    // when use_gamma is true - the DSP bridge always applies gamma, no
+    // no-gamma variant exists.
+    bool dsp_done = false;
+    if (is_prefill && is_cdsp_engine && use_gamma &&
+        !getenv("NNTR_HEXAGON_NO_ELEM_OPS")) {
+      nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
+      unsigned int M = step_reshaped_dim.height();
+      unsigned int W = step_reshaped_dim.width();
+      dsp_done = try_dsp_fp16_reshaped_rms_norm(is_cdsp_engine, in_step,
+                                                out_step, gamma, M, W,
+                                                epsilon);
+    }
+    if (dsp_done) {
+      // gamma already applied by the DSP kernel - skip the CPU compute and
+      // the CPU gamma multiply below entirely.
+    } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
       ///@todo rms_norm_wrt_width_something() should be refactored to
       /// nntrainer::Tensor operation.
 #ifdef ENABLE_FP16
@@ -123,7 +375,7 @@ void ReshapedRMSNormLayer::incremental_forwarding(
       throw std::invalid_argument(
         "Error: not yet implemented for this data type");
     }
-    if (use_gamma) {
+    if (use_gamma && !dsp_done) {
       nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
       if (gamma.getDataType() != out_step.getDataType()) {
         nntrainer::Tensor gamma_cast = gamma.clone(out_step.getDataType());

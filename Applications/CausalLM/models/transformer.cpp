@@ -15,6 +15,7 @@
 
 #include <app_context.h>
 #include <engine.h>
+#include <hexagon_context.h>
 #include <model.h>
 
 #include <llm_util.hpp>
@@ -264,10 +265,10 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
   }
 
   // final rms_norm
-  LayerHandle out_norm(
-    createLayer("rms_norm", {withKey("name", "output_norm"),
-                             withKey("epsilon", std::to_string(NORM_EPS)),
-                             withKey("packed", "false")}));
+  LayerHandle out_norm(createLayer(
+    "rms_norm", withHexagonEngine({withKey("name", "output_norm"),
+                                   withKey("epsilon", std::to_string(NORM_EPS)),
+                                   withKey("packed", "false")})));
   h = out_norm(h);
 
   return {x, h};
@@ -403,31 +404,34 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
 
   LayerHandle attn_norm(createLayer(
     "rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+    withHexagonEngine(
+      {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
+       withKey("epsilon", std::to_string(NORM_EPS)),
+       withKey("packed", "false")})));
   Tensor normed = attn_norm(input);
 
   Tensor att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
                                    normed, normed, normed);
 
   LayerHandle decoder_add(createLayer(
-    "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add")}));
+    "addition", withHexagonEngine({withKey(
+                  "name", "layer" + std::to_string(layer_id) + "_decoder_add")})));
   Tensor residual = decoder_add({input, att_out});
 
   LayerHandle ffn_norm(createLayer(
     "rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+    withHexagonEngine(
+      {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
+       withKey("epsilon", std::to_string(NORM_EPS)),
+       withKey("packed", "false")})));
   Tensor ffn_normed = ffn_norm(residual);
 
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed);
 
   LayerHandle decoder_output(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output")}));
+    withHexagonEngine({withKey(
+      "name", "layer" + std::to_string(layer_id) + "_decoder_output")})));
   return decoder_output({residual, ffn_out});
 }
 
@@ -450,21 +454,27 @@ Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
   // USE_EMBEDDING prefill: the embedding reached input0's output but never
   // layer0_conv_norm (all-zero activations → <pad>). The x86 (#else) path
   // always used input layers and worked; this keeps both paths symmetric,
-  // differing only in the external dtype (FP16 on ARM, UINT16 elsewhere).
+  // differing only in the external dtype (FP16 on ARM, FP32 elsewhere - must
+  // match CausalLM::allocateAndBindKVCache()'s cache_dtype exactly, see the
+  // comment there for why it's FP32 and not UINT16).
 #ifdef ENABLE_FP16
   const char *cache_dtype = "FP16";
 #else
-  const char *cache_dtype = "UINT16";
+  const char *cache_dtype = "FP32";
 #endif
 
   LayerHandle cache_k_input(createLayer(
-    "input", {withKey("name", "cache_k_l" + std::to_string(layer_id)),
-              withKey("input_shape", cache_shape),
-              withKey("input_dtype", cache_dtype)}));
+    "input",
+    withHexagonEngine(
+      {withKey("name", "cache_k_l" + std::to_string(layer_id)),
+       withKey("input_shape", cache_shape),
+       withKey("input_dtype", cache_dtype)})));
   LayerHandle cache_v_input(createLayer(
-    "input", {withKey("name", "cache_v_l" + std::to_string(layer_id)),
-              withKey("input_shape", cache_shape),
-              withKey("input_dtype", cache_dtype)}));
+    "input",
+    withHexagonEngine(
+      {withKey("name", "cache_v_l" + std::to_string(layer_id)),
+       withKey("input_shape", cache_shape),
+       withKey("input_dtype", cache_dtype)})));
 
   return {cache_k_input(Tensor()), cache_v_input(Tensor())};
 }
@@ -512,15 +522,17 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
   // Attention core layer
   LayerHandle mha(createLayer(
     "mha_core",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
-     withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
-     withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
-     withKey("sliding_window", (layer_id + 1) % SLIDING_WINDOW_PATTERN
-                                 ? SLIDING_WINDOW
-                                 : UINT_MAX),
-     withKey("rope_theta", ROPE_THETA),
-     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-     withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
+    withHexagonEngine(
+      {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
+       withKey("num_heads", n_heads),
+       withKey("num_heads_kv", n_heads / GQA_SIZE),
+       withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
+       withKey("sliding_window", (layer_id + 1) % SLIDING_WINDOW_PATTERN
+                                   ? SLIDING_WINDOW
+                                   : UINT_MAX),
+       withKey("rope_theta", ROPE_THETA),
+       withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+       withKey("is_causal", IS_CAUSAL ? "true" : "false")})));
   Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer
@@ -550,17 +562,21 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
     (fused_env && std::atoi(fused_env) == 1);
 
   if (use_fused) {
-    // Note: no withHexagonEngine — like mha_core, fused_ffn handles its own
-    // DSP dispatch internally via the bridge (nntr_htp_bridge_ffn_swiglu).
-    // Adding engine=cdsp here would make the framework look up the layer in
-    // the cdsp engine context, where custom layers are not registered.
+    // Now registered under "cdsp" and tagged via withHexagonEngine() (see
+    // registerCustomLayers()) - closes the same guard-overhead gap
+    // rms_norm/addition/mha_core already had fixed: without this tag, the
+    // LayerNode flush guard fired before every fused_ffn call even though
+    // its own compute already dispatches to the DSP bridge internally
+    // (nntr_htp_bridge_ffn_swiglu), gated (secondarily, now) on its own
+    // NNTR_HEXAGON_FUSED_FFN env var.
     LayerHandle fused_ffn(createLayer(
       "fused_ffn",
-      {withKey("name",
-               "layer" + std::to_string(layer_id) + "_ffn_fused"),
-       withKey("hidden_dim", hidden_dim),
-       withKey("unit", dim), withKey("disable_bias", "true"),
-       withKey("weight_initializer", "ones")}));
+      withHexagonEngine(
+        {withKey("name",
+                 "layer" + std::to_string(layer_id) + "_ffn_fused"),
+         withKey("hidden_dim", hidden_dim),
+         withKey("unit", dim), withKey("disable_bias", "true"),
+         withKey("weight_initializer", "ones")})));
     return fused_ffn(input);
   }
 
@@ -623,6 +639,28 @@ void Transformer::registerCustomLayers() {
       nntrainer::createLayer<causallm::EmbeddingLayer>);
     app_context->registerFactory(
       nntrainer::createLayer<causallm::FusedFFNLayer>);
+
+    // Also register under the "cdsp" context so rms_norm/mha_core layers can
+    // be tagged engine=cdsp (see withHexagonEngine() call sites below) - both
+    // classes already dispatch their own compute to the DSP bridge
+    // internally (rms_norm.cpp/mha_core.cpp), so nothing but the registry
+    // lookup itself needs to succeed here; no cdsp-specific ComputeOps/
+    // MemAllocator behavior is required from this registration beyond making
+    // the layer resolvable. "cdsp" is only registered in builds compiled
+    // with -Denable-hexagon-cdsp=true, which this Application target isn't
+    // guaranteed to know about at compile time - probe at runtime instead.
+    try {
+      const auto hexagon_context = static_cast<nntrainer::HexagonContext *>(
+        ct_engine.getRegisteredContext("cdsp"));
+      hexagon_context->registerFactory(
+        nntrainer::createLayer<causallm::RMSNormLayer>);
+      hexagon_context->registerFactory(
+        nntrainer::createLayer<causallm::MHACoreLayer>);
+      hexagon_context->registerFactory(
+        nntrainer::createLayer<causallm::FusedFFNLayer>);
+    } catch (const std::invalid_argument &) {
+      // "cdsp" context not registered in this build - nothing to do.
+    }
   });
 }
 

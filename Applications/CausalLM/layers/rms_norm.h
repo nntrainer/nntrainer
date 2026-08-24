@@ -111,11 +111,34 @@ public:
   inline static const std::string type = "rms_norm";
 
 private:
+  /**
+   * @brief Lazily allocate a persistent rpcmem copy of gamma and register it
+   * with the Hexagon bridge, so nntr_htp_bridge_rms_norm's gamma operand is a
+   * zero-copy pool hit instead of the bridge's staging memcpy fallback.
+   * gamma is immutable after weight load, so this copies it once and reuses
+   * the pointer for the rest of the layer's lifetime.
+   *
+   * @param gamma the layer's gamma weight tensor (FP32)
+   * @return the rpcmem-backed copy, or nullptr if rpcmem/the bridge is
+   * unavailable (caller should fall back to gamma's own pointer)
+   */
+  float *getOrCreateGammaRpcmem(const nntrainer::Tensor &gamma);
+
+
   std::array<unsigned int, 1> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
              nntrainer::props::SkipPrefill>
     rms_props;
   bool skip_prefill = false;
+
+  // Zero-copy staging for gamma: gamma is a weight tensor, and weights are
+  // deliberately kept off the graph's rpcmem-backed activation pool (see
+  // docs/backend_guide - CMA budget concern for the large GEMM weight
+  // matrices). RMSNorm's gamma is tiny by comparison (one row, width floats)
+  // so it gets its own small persistent rpcmem copy instead, populated once
+  // on first DSP dispatch. See get_gamma_rpcmem() in rms_norm.cpp.
+  float *gamma_rpcmem = nullptr;
+  unsigned int gamma_rpcmem_width = 0;
 };
 
 } // namespace causallm

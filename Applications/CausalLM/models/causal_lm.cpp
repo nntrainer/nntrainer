@@ -20,8 +20,10 @@
  *          - Llama
  */
 
+#include <dlfcn.h>
 #include <algorithm>
 #include <app_context.h>
+
 #include <cmath>
 #include <cstdlib>
 #include <engine.h>
@@ -137,10 +139,21 @@ void CausalLM::allocateAndBindKVCache() {
   if (!kv_cache.isAllocated()) {
     // dtype matches mha_core's cache placeholders so external cache storage
     // is interpreted consistently across platforms.
+    //
+    // Non-FP16 builds use FP32 here (not UINT16): try_dsp_cache_copy()'s
+    // dtype gate (mha_core.cpp) only recognizes FP32/FP16 - a UINT16 cache
+    // is invisible to it, so every K/V-cache append silently falls back to
+    // a CPU flush+copy every layer (measured: 28-29 extra real FastRPC
+    // round-trips per prefill on the FP32 build - see
+    // docs/backend_guide/AGENT_HANDOFF_2026-08-20.md). FP32 matches what
+    // the GEMM output already is in this build, so try_dsp_cache_copy's
+    // existing FP32 case just works, no new DSP kernel needed. Costs 2x
+    // the KV-cache memory (4 bytes/elem vs 2) versus the old UINT16
+    // encoding - acceptable for this model/context length.
 #ifdef ENABLE_FP16
     const auto cache_dtype = ml::train::TensorDim::DataType::FP16;
 #else
-    const auto cache_dtype = ml::train::TensorDim::DataType::UINT16;
+    const auto cache_dtype = ml::train::TensorDim::DataType::FP32;
 #endif
 
     const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
@@ -507,7 +520,112 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   auto start_prefill = std::chrono::high_resolution_clock::now();
 
+  std::vector<unsigned int> id_list;
+
+  // Begin NPU batch: all DSP ops during prefill will be enqueued without
+  // flushing, then flushed in one FastRPC round-trip at the end.
+  // This collapses ~196+ FastRPC calls (28 layers × 7 ops) into 1.
+  {
+
+    using BeginBatchFn = void (*)();
+    using EndBatchFn = void (*)();
+    using GetFlushCountFn = unsigned long long (*)();
+    using ResetFlushCountFn = void (*)();
+    using DumpPoolStatsFn = void (*)();
+    static BeginBatchFn begin_batch = nullptr;
+    static EndBatchFn end_batch = nullptr;
+    static GetFlushCountFn get_flush_count = nullptr;
+    static GetFlushCountFn get_real_flush_count = nullptr;
+    static ResetFlushCountFn reset_flush_count = nullptr;
+    static DumpPoolStatsFn dump_pool_stats = nullptr;
+    static bool batch_tried = false;
+    // Resolved unconditionally (unlike begin_batch/end_batch below, which
+    // are only wired up when NNTR_HEXAGON_NO_BATCH isn't set) - the
+    // zero-copy pool-hit/miss question matters in every configuration,
+    // including NO_BATCH and NO_ELEM_OPS, not just the batched default.
+    if (!batch_tried) {
+      void *stats_lib = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_NOLOAD);
+      if (!stats_lib)
+        stats_lib = dlopen("libggml-hexagon.so", RTLD_LAZY);
+      if (stats_lib)
+        dump_pool_stats =
+          (DumpPoolStatsFn)dlsym(stats_lib, "nntr_htp_bridge_dump_pool_stats");
+    }
+    if (!batch_tried) {
+      batch_tried = true;
+      // Allow disabling batch mode for benchmarking (NNTR_HEXAGON_NO_BATCH=1)
+      if (!getenv("NNTR_HEXAGON_NO_BATCH")) {
+        void *lib = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!lib)
+          lib = dlopen("libggml-hexagon.so", RTLD_LAZY);
+        // Diagnostic: this must print "handle=<non-null> begin=<non-null>
+        // end=<non-null>" or batching is silently not happening at all -
+        // every op below will flush individually regardless of the
+        // begin_batch()/end_batch() calls further down, because they'll be
+        // no-ops. The most likely cause of a null handle/symbol is a stale
+        // libggml-hexagon.so on-device that predates these exported symbols.
+        if (!lib) {
+          fprintf(stderr, "[NPU_BATCH] dlopen(libggml-hexagon.so) FAILED: %s "
+                          "- batching disabled, every DSP op will flush "
+                          "individually\n", dlerror());
+        } else {
+          begin_batch = (BeginBatchFn)dlsym(lib, "nntr_htp_bridge_begin_batch");
+          end_batch = (EndBatchFn)dlsym(lib, "nntr_htp_bridge_end_batch");
+          get_flush_count =
+            (GetFlushCountFn)dlsym(lib, "nntr_htp_bridge_get_flush_count");
+          get_real_flush_count =
+            (GetFlushCountFn)dlsym(lib, "nntr_htp_bridge_get_real_flush_count");
+          reset_flush_count =
+            (ResetFlushCountFn)dlsym(lib, "nntr_htp_bridge_reset_flush_count");
+          fprintf(stderr, "[NPU_BATCH] handle=%p begin_batch=%p end_batch=%p"
+                          " (both must be non-null for batching to work)\n",
+                  lib, (void *)begin_batch, (void *)end_batch);
+          if (!begin_batch || !end_batch) {
+            fprintf(stderr, "[NPU_BATCH] dlsym FAILED for one or both symbols: "
+                            "%s - batching disabled, every DSP op will flush "
+                            "individually despite the code path below looking "
+                            "like it's batching\n", dlerror());
+          }
+        }
+      }
+    }
+    // end_batch_and_report(): call end_batch() and, if the diagnostic
+    // symbols resolved, print exactly how many FastRPC flushes happened
+    // during this batch scope. Should read 0 or 1 - anything higher means
+    // ops are still flushing individually and batching is not engaging,
+    // regardless of what begin_batch/end_batch's presence alone would
+    // suggest.
+    auto end_batch_and_report = [&]() {
+      // Zero-copy pool stats matter in every configuration, not just when
+      // begin_batch/end_batch are active - dump unconditionally first.
+      if (dump_pool_stats)
+        dump_pool_stats();
+      if (!end_batch)
+        return;
+      end_batch();
+      if (get_flush_count) {
+        fprintf(stderr,
+                "[NPU_BATCH] prefill produced %llu flush(es) total "
+                "(should be 0 or 1 if batching is actually working)\n",
+                get_flush_count());
+      }
+      if (get_real_flush_count) {
+        fprintf(stderr,
+                "[NPU_BATCH] prefill produced %llu REAL FastRPC round-trip(s) "
+                "(excludes LayerNode-guard calls that found nothing queued - "
+                "this is the number that actually predicts wall-clock time)\n",
+                get_real_flush_count());
+      }
+    };
+    if (begin_batch) {
+      if (reset_flush_count)
+        reset_flush_count();
+      begin_batch();
+    }
+
+
   std::vector<float *> output;
+
 
   if (SAVE_KVCACHE) {
     //@note This is for the save the kv cache. precomputed kv cache should be
@@ -541,8 +659,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                 << "\n==================================================\n"
                 << std::endl;
     }
+    // End NPU batch before returning.
+    end_batch_and_report();
     return;
   }
+
 
   if (USE_KVCACHE) {
     load_kvcache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
@@ -551,9 +672,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   }
   allocateAndBindKVCache();
   const unsigned int prefill_from = SYS_PROMP_LEN + global_token_len;
-  std::vector<unsigned int> id_list;
 
   if (SKIP_PREFILL && init_len > 1) {
+
+
     // Prefill only N-1 tokens; the last input token will be used as the first
     // token in the generation phase (assigned directly, not sampled).
     unsigned int skipped_token =
@@ -563,6 +685,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     setKVCachePosition(prefill_from);
     output = model->incremental_inference(
       BATCH_SIZE, input, label, init_len - 1, prefill_from, prefill_to, false);
+
+    // End NPU batch: flush all enqueued DSP ops in one FastRPC round-trip
+    // and copy results back to host buffers.
+    end_batch_and_report();
 
     for (unsigned int b = 0; b < BATCH_SIZE; ++b)
       id_list.push_back(skipped_token);
@@ -577,6 +703,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
                                           prefill_from, prefill_to, false);
 
+    // End NPU batch: flush all enqueued DSP ops in one FastRPC round-trip
+    // and copy results back to host buffers.
+    end_batch_and_report();
+
     // post process of model output
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);
 
@@ -587,8 +717,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   for (auto &out : output) {
     delete[] out;
   }
+  } // end begin_batch scope
 
   auto finish_prefill = std::chrono::high_resolution_clock::now();
+
+
   auto prefill_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
     finish_prefill - start_prefill);
 

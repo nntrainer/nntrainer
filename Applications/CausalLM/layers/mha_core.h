@@ -372,6 +372,11 @@ private:
   size_t local_window_size;
   bool use_sink = false;
   bool use_rope = true;
+  // Cached from finalize()'s InitLayerContext (set from this layer's
+  // "engine=" property, see withHexagonEngine() at its construction site) -
+  // one_batch_incremental_forwarding() has no RunLayerContext of its own to
+  // query, so this is threaded through as a plain member like use_rope.
+  bool is_cdsp_engine = false;
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
   bool skip_prefill = false;

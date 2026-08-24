@@ -74,6 +74,11 @@ private:
              props::OutputDim>
     ffn_props;
   std::array<unsigned int, 3> weight_idx;
+  // Cached from finalize()'s InitLayerContext (set from this layer's
+  // "engine=" property) - see rms_norm.cpp/mha_core.cpp for the same
+  // pattern and why it's cached: should_use_fused_ffn() is a plain function
+  // with no RunLayerContext of its own to query it from directly.
+  bool is_cdsp_engine = false;
 };
 
 } // namespace causallm
