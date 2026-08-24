@@ -901,7 +901,7 @@ inline static int32_t vaddvq_s32(int32x4_t v) {
 // is also what vmulq_lane_f32 itself requires.
 #define vmulq_laneq_f32(a, b, lane)                                            \
   vmulq_lane_f32((a), ((lane) < 2 ? vget_low_f32(b) : vget_high_f32(b)),       \
-                 (lane) & 1)
+                 (lane) % 2)
 
 #if not(defined(ARMV7)) || !(ARMV7)
 

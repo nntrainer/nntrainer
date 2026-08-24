@@ -377,10 +377,10 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
           int8x16_t b2 = vld1q_s8(bq + 32); // k = 1, cols 0-1
           int8x16_t b3 = vld1q_s8(bq + 48); // k = 1, cols 2-3
 
-          int8x8_t t0 = vld1_s8(aq);       // k = 0, low nibble operand
-          int8x8_t t1 = vld1_s8(aq + 32);  // k = 1, low
-          int8x8_t t2 = vld1_s8(aq + 64);  // k = 0, high
-          int8x8_t t3 = vld1_s8(aq + 96);  // k = 1, high
+          int8x8_t t0 = vld1_s8(aq);      // k = 0, low nibble operand
+          int8x8_t t1 = vld1_s8(aq + 32); // k = 1, low
+          int8x8_t t2 = vld1_s8(aq + 64); // k = 0, high
+          int8x8_t t3 = vld1_s8(aq + 96); // k = 1, high
           int8x16_t a0 = vcombine_s8(t0, t0);
           int8x16_t a1 = vcombine_s8(t1, t1);
           int8x16_t a2 = vcombine_s8(t2, t2);
@@ -615,7 +615,8 @@ void nntr_gemv_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
 
     for (int b = 0; b < nb; b++) {
       // Separate vld1q_s8 rather than vld1q_s8_x4: on A32 gcc declares the _xN
-      // forms as taking const uint8_t *, and four plain loads schedule the same.
+      // forms as taking const uint8_t *, and four plain loads schedule the
+      // same.
       const int8_t *bq = (const int8_t *)vb_ptr->qs;
       const int8_t *aq = (const int8_t *)va_ptr->qs;
       float16x4_t bd = vld1_f16((const __fp16 *)vb_ptr->d);
@@ -718,8 +719,8 @@ void nntr_gemm_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
 
         // qs is int8_t[128] laid out as {k, row/col, i}: 4 groups of 32 bytes,
         // each group holding four 8-byte lanes.
-        // See the q4_0 kernel above: hoist the scale conversion so the innermost
-        // loop stays free of out-of-line calls.
+        // See the q4_0 kernel above: hoist the scale conversion so the
+        // innermost loop stays free of out-of-line calls.
         float32x4_t ad = vcvt_f32_f16(vld1_f16((const __fp16 *)va_ptr[l].d));
 
         auto row = [&](const int8_t *ap, float32x4_t scale, float32x4_t acc) {
@@ -813,8 +814,8 @@ void nntr_gemv_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
     float32x4_t acc = vdupq_n_f32(0);
 
     for (int b = 0; b < nb; b++) {
-      // Separate loads rather than vld1q_s8_x4 / vld1_s8_x4: on A32 gcc declares
-      // the _xN forms as taking const uint8_t *.
+      // Separate loads rather than vld1q_s8_x4 / vld1_s8_x4: on A32 gcc
+      // declares the _xN forms as taking const uint8_t *.
       const int8_t *bq = (const int8_t *)vb_ptr->qs;
       const int8_t *aq = (const int8_t *)va_ptr->qs;
       float16x4_t bd = vld1_f16((const __fp16 *)vb_ptr->d);
