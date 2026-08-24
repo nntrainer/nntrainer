@@ -214,8 +214,9 @@ std::vector<float> loadImageLetterbox(const std::string &path) {
   float fpad_h = (target - h * r) / 2.0f;
   g_orig = {w, h, r, fpad_w, fpad_h};
 
-  // NCHW layout, normalized to [0, 1], gray (114/255) padding
-  std::vector<float> out(target * target * 3, 114.0f / 255.0f);
+  // NCHW layout, normalized to [0, 1].
+  // PyTorch letterbox uses black (0) padding, not gray (114).
+  std::vector<float> out(target * target * 3, 0.0f);
 
   // Bilinear interpolation with half-pixel center to match cv2 INTER_LINEAR
   // cv2 maps: src = (dst + 0.5) / r - 0.5
