@@ -48,18 +48,52 @@
 
 %endif # 0%{tizen_version_major}%{tizen_version_minor} >= 65
 
-%define enable_fp16 0
-### nntrainer fp16 implementation relies on NEON, which requires armv8.2-a
+## Float16 / ARMv8.2-A support
+## nntrainer fp16 implementation relies on NEON, which requires armv8.2-a.
+## Off by default because the reference aarch64 Tizen target is armv8.0-a; a
+## plain %define here would shadow the command line, so this follows the same
+## bcond idiom as the gpu flag below. To build for an armv8.2-a device:
+##   gbs build -A aarch64 --define "_with_fp16 1"
 ### armv7l Tizen: do not support fp16 neon.
-### aarch64 Tizen: uses armv8.0a. no fp16 neon.
 ### x86/x64 Tizen: it has gcc9. x86 requires gcc >= 12 for fp16
+%bcond_with fp16
 
-## Float16 support
-%if 0%{?enable_fp16}
-%define fp16_support -Denable-fp16=true
+%if %{with fp16}
+%define enable_fp16 1
+### -Darm-arch= selects the aarch64 NEON/SVE sources in nntr_ggml_impl; passing
+### it on armv7l would pull aarch64-only assembly into a 32-bit build.
+%ifarch aarch64
+%define fp16_support -Denable-fp16=true -Darm-arch=armv8.2-a
 %else
+%define fp16_support -Denable-fp16=true
+%endif
+%else
+%define enable_fp16 0
 %define fp16_support -Denable-fp16=false
-%endif # enable_fp16
+%endif # fp16
+
+## Device-specific ARM tuning
+## The Tizen reference optflags target the oldest supported core:
+##   armv7l : -march=armv7-a -mtune=cortex-a8 -mfpu=neon -mfloat-abi=softfp -mthumb
+##   aarch64: -march=armv8-a+fp+simd+crc+crypto -mtune=cortex-a57.cortex-a53
+## A build pinned to a known newer device can raise that baseline. The value is
+## appended to CFLAGS/CXXFLAGS last in %build, so it beats both the reference
+## optflags and the -march that meson.build hardcodes for aarch64 (meson places
+## environment flags after add_project_arguments()).
+##   gbs build -A armv7l --define "arm_tune -march=armv8.2-a+dotprod -mtune=cortex-a76 -mfpu=neon-fp-armv8 -mfp16-format=ieee"
+##
+## On armv7l that exact set is what turns on the A32 dot-product kernels for
+## q4_0 in nntr_ggml_impl_fallback.cpp; without it they stay scalar:
+##   armv8.2-a       gcc rejects +dotprod on plain armv8-a for A32
+##   +dotprod        defines __ARM_FEATURE_DOTPROD, which gates the kernels
+##   neon-fp-armv8   FMA and fp16<->fp32 conversion
+##   -mfp16-format=ieee  needed for float16x4_t / the scale conversions
+## Cortex-A76 implements FEAT_DotProd at EL0 in AArch32, so VSDOT is available
+## even though the userspace is 32-bit.
+##
+## Do not put -mfloat-abi here: softfp is part of the armv7l ABI. Do not add
+## +i8mm for Cortex-A76 either; FEAT_I8MM is armv8.6-a and the core lacks it.
+## The resulting rpm no longer runs on cores below the baseline you pick.
 
 
 ## GPU flag
@@ -430,8 +464,16 @@ export CXXFLAGS+=" -fprofile-arcs -ftest-coverage"
 %endif
 
 %if 0%{?enable_fp16}
+%ifarch aarch64
 export CFLAGS+=" -march=armv8.2-a+fp16+dotprod+i8mm"
 export CXXFLAGS+=" -march=armv8.2-a+fp16+dotprod+i8mm"
+%endif
+%endif
+
+# Appended last: see the arm_tune comment near the top of this spec.
+%ifarch %arm aarch64
+export CFLAGS+=" %{?arm_tune}"
+export CXXFLAGS+=" %{?arm_tune}"
 %endif
 
 # Add backward competibility for tizen < 6
