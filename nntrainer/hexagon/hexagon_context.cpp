@@ -12,8 +12,11 @@
 #include <hexagon_context.h>
 #include <hexagon_rpc_allocator.h>
 
+#include <addition_layer.h>
 #include <fc_layer.h>
 #include <gate_up_layer.h>
+#include <input_layer.h>
+#include <multiout_layer.h>
 #include <qkv_layer.h>
 
 namespace nntrainer {
@@ -78,6 +81,32 @@ void HexagonContext::add_default_object() {
   // throw "Key is not found for the object".
   registerFactory(nntrainer::createLayer<QKVLayer>, QKVLayer::type);
   registerFactory(nntrainer::createLayer<GateUpLayer>, GateUpLayer::type);
+  // AdditionLayer's forwarding()/incremental_forwarding() dispatches
+  // residual-add to the cDSP bridge itself (see addition_layer.cpp) when its
+  // RunLayerContext reports engine=cdsp - it needs to be resolvable under
+  // this context (same "Key is not found" reasoning as QKV/GateUp above) for
+  // that tag to ever reach it via withHexagonEngine().
+  registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
+                  ml::train::LayerType::LAYER_ADDITION);
+  // MultioutRealizer (compiler/multiout_realizer.cpp) auto-generates a
+  // "multiout" node for any connection consumed by more than one downstream
+  // layer (e.g. the residual stream after an "addition" tagged engine=cdsp)
+  // and now propagates engine=cdsp onto it when the source node is also
+  // cdsp - needs to be resolvable under this context for that tag, same
+  // "Key is not found" reasoning as above. MultiOutLayer::forwarding() is a
+  // true no-op when running in-place (the normal case, forced by
+  // NetworkGraph's InPlaceType::RESTRICTING for this layer type), so this is
+  // purely closing a guard-overhead gap, not adding new dispatch behavior.
+  registerFactory(nntrainer::createLayer<MultiOutLayer>, MultiOutLayer::type);
+  // KV-cache placeholder tensors (createKVCachePlaceholders() in
+  // transformer.cpp) are plain "input" layers tagged engine=cdsp so the
+  // LayerNode flush guard (layer_node.cpp) doesn't force a flush before
+  // them - InputLayer::forwarding() is a no-op (the tensor is bound
+  // externally by KVCacheManager), so this is the same guard-overhead-only
+  // registration as MultiOutLayer above, not new dispatch behavior. Needs
+  // to be resolvable under this context for the same "Key is not found"
+  // reasoning as every other type registered above.
+  registerFactory(nntrainer::createLayer<InputLayer>, InputLayer::type);
 }
 
 void HexagonContext::initialize() noexcept {

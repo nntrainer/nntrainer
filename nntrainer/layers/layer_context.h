@@ -995,6 +995,26 @@ public:
    */
   bool reStoreData() { return restoreData; }
 
+  /**
+   * @brief   set Layer Compute Engine Type
+   *
+   * Mirrors LayerNode::compute_engine (set from the "engine=" property at
+   * finalize() time) so a layer's own forwarding()/incremental_forwarding()
+   * can query which backend it was tagged for (e.g. engine=cdsp) without
+   * independently probing env vars/dlopen. Set once by
+   * LayerNode::configureRunContext() right after construction.
+   *
+   * @param e Engine Type
+   */
+  void setComputeEngineType(ml::train::LayerComputeEngine e) { engine = e; }
+
+  /**
+   * @brief   get Layer Compute Engine Type
+   *
+   * @return Engine Engine Type
+   */
+  ml::train::LayerComputeEngine getComputeEngineType() { return engine; }
+
 private:
   std::tuple<props::Name, props::Trainable> props; /**< props of the layer */
   std::shared_ptr<ContextData> ct_data;
@@ -1012,6 +1032,14 @@ private:
   std::map<std::string, const void *>
     tensor_map; /**< map of tensor name to tensor address */
 #endif
+
+  ml::train::LayerComputeEngine engine =
+    ml::train::LayerComputeEngine::CPU; /**< compute engine this layer was
+                                            tagged for (engine= property) -
+                                            appended last, not interleaved
+                                            with the constructor's
+                                            member-initializer-list-ordered
+                                            fields above */
 
   /**
    * @brief Get regularization loss for the weight

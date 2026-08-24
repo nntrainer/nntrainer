@@ -16,6 +16,8 @@
 #include <cmath>
 #include <iterator>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <utility>
 
 #include <activation_layer.h>
@@ -33,6 +35,9 @@
 #include <time_dist.h>
 #include <tracer.h>
 #include <util_func.h>
+
+#include <dlfcn.h>
+
 
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
 #include <cl_context.h>
@@ -783,11 +788,52 @@ LayerNode::refinalize(const std::vector<TensorDim> &input_dims) {
 /**
  * @brief     Forward Propagation of a layer
  */
+// Systemic NPU sync-guard: flushes pending NPU ops if batch mode is active.
+// This prevents CPU layers from reading stale (pre-NPU) tensor data.
+// Lazily dlopens libggml-hexagon.so and dlsyms the flush function once.
+// If the library or symbol is not found, this is a no-op (CPU-only mode).
+static int nntr_hexagon_flush_if_batch_active(const std::string &caller_name) {
+  static int (*flush_fn)(void) = []() -> int (*)(void) {
+    void *handle = dlopen("libggml-hexagon.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!handle) return nullptr;
+    return reinterpret_cast<int (*)(void)>(dlsym(handle, "nntr_htp_bridge_flush_if_batch_active"));
+  }();
+  if (!flush_fn) return 0;
+  int rc = flush_fn();
+  // Diagnostic: trace which layer triggers each real flush, and how many
+  // times each layer name has triggered one - a genuine hang-via-infinite-
+  // host-loop should show the SAME layer name repeating without bound.
+  if (rc) {
+    static std::unordered_map<std::string, unsigned long long> counts;
+    unsigned long long &c = counts[caller_name];
+    c++;
+    if (c <= 5 || (c % 200) == 0) {
+      fprintf(stderr, "[LAYER_FLUSH] layer=%s triggered flush #%llu\n",
+              caller_name.c_str(), c);
+    }
+  }
+  return rc;
+}
+
 void LayerNode::forwarding(bool training) {
   loss->set(run_context->getRegularizationLoss());
 
+  // Sync-guard: flush any pending NPU ops so this layer sees up-to-date
+  // tensor data on the CPU. NPU layers that enqueue more ops are unaffected
+  // (their ops just get enqueued after the flush). CPU layers that read
+  // tensor data directly are protected from reading stale memory.
+  //
+  // §6.1 optimization: skip the flush before CDSP (NPU) layers. These layers
+  // will just enqueue more ops into the batch — flushing before them breaks
+  // op chaining and forces unnecessary FastRPC round-trips. Only flush before
+  // CPU layers, which may need to read tensor data directly.
+  if (compute_engine != ml::train::LayerComputeEngine::CDSP)
+    nntr_hexagon_flush_if_batch_active(getName());
+
+
   PROFILE_TIME_START(forward_event_key);
   if (reStoreData()) {
+
     if (getInPlaceType() == InPlaceType::NONE) {
       for (unsigned int i = 0; i < run_context->getNumOutputs(); ++i) {
         run_context->getOutput(i).setValue(0);
@@ -825,9 +871,20 @@ void LayerNode::forwarding(bool training) {
 void LayerNode::incremental_forwarding(unsigned int from, unsigned int to,
                                        bool training) {
   loss->set(run_context->getRegularizationLoss());
+  // Sync-guard: same as forwarding() — flush pending NPU ops before any
+  // CPU layer reads tensor data.
+  //
+  // §6.1 optimization: skip the flush before CDSP (NPU) layers. These layers
+  // will just enqueue more ops into the batch — flushing before them breaks
+  // op chaining and forces unnecessary FastRPC round-trips. Only flush before
+  // CPU layers, which may need to read tensor data directly.
+  if (compute_engine != ml::train::LayerComputeEngine::CDSP)
+    nntr_hexagon_flush_if_batch_active(getName());
   PROFILE_TIME_START(forward_event_key);
   // std::cerr << getType() << "\n";
   layer->incremental_forwarding(*run_context, from, to, training);
+
+
   PROFILE_TIME_END(forward_event_key);
   TRACE_MEMORY() << getName() + ": F";
   TRACE_TIME() << getName() + ": F";
@@ -969,6 +1026,11 @@ void LayerNode::configureRunContext(const std::vector<Weight *> &weights,
   run_context = std::make_unique<RunLayerContext>(
     getName(), getTrainable(), 0.0f, getInPlaceType() != InPlaceType::NONE,
     loss_scale, ct_data, false, weights, inputs, outputs, tensors);
+  // Thread compute_engine (set from the "engine=" property in finalize())
+  // into the RunLayerContext so the layer's own forwarding() can query it
+  // (context.getComputeEngineType()) instead of independently probing env
+  // vars/dlopen for NPU dispatch decisions.
+  run_context->setComputeEngineType(compute_engine);
 }
 
 /**

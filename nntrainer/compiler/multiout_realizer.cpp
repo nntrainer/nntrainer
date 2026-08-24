@@ -32,12 +32,21 @@ MultioutRealizer::realize(const GraphRepresentation &reference) {
   std::unordered_map<Connection, unsigned> freq_map;
   std::unordered_set<std::string> node_names;
   std::vector<Connection> connections;
+  // Looked up when creating each multiout node below, so it can inherit the
+  // source node's compute_engine (see §2) - a node tagged engine=cdsp
+  // (e.g. an "addition" layer whose output fans out to two consumers) would
+  // otherwise always force a flush before its auto-generated multiout
+  // successor, even though the successor does zero real compute (it's a
+  // pure tensor-pool/in-place-aliasing bookkeeping node, see
+  // MultiOutLayer::forwarding()).
+  std::unordered_map<std::string, std::shared_ptr<LayerNode>> node_by_name;
 
   /// 1. build frequency map and connection names
   for (auto &node : reference) {
     NNTR_THROW_IF(node_names.count(node->getName()), std::invalid_argument)
       << "node name clashes: " << node->getName();
     node_names.emplace(node->getName());
+    node_by_name.emplace(node->getName(), node);
 
     for (unsigned int i = 0, num_nodes = node->getNumInputConnections();
          i < num_nodes; ++i) {
@@ -79,8 +88,22 @@ MultioutRealizer::realize(const GraphRepresentation &reference) {
     }
     auto multiout_name = ss.str();
 
-    multiout_nodes[id].push_back(createLayerNode(
-      "multiout", {"name=" + multiout_name, "input_layers=" + con.toString()}));
+    std::vector<std::string> multiout_props = {
+      "name=" + multiout_name, "input_layers=" + con.toString()};
+    // NOTE: LayerNode::getComputeEngineType() reads the `compute_engine`
+    // member, which is only populated by LayerNode::finalize() - realizers
+    // (this one included) run on the GraphRepresentation *before*
+    // finalize(), so that member is always still the default "cpu" here.
+    // getProperty("engine") reads layer_node_props directly instead, which
+    // is populated at construction time (withHexagonEngine() sets it via
+    // the "engine=cdsp" key), so it's actually visible at this point.
+    auto src_it = node_by_name.find(id);
+    if (src_it != node_by_name.end() &&
+        src_it->second->getProperty("engine") == "cdsp") {
+      multiout_props.push_back("engine=cdsp");
+    }
+    multiout_nodes[id].push_back(
+      createLayerNode("multiout", multiout_props));
     node_names.emplace(multiout_name);
 
     unsigned input_count = 0;

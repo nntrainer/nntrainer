@@ -388,6 +388,13 @@ public:
               float beta) const override;
 
   /**
+   *  @copydoc Tensor::dot(std::vector<Tensor *> input, std::vector<Tensor *>
+   * output, bool trans, bool trans_in, float beta)
+   */
+  void dot(std::vector<Tensor *> input, std::vector<Tensor *> output, bool trans,
+           bool trans_in, float beta) const override;
+
+  /**
    * @copydoc Tensor::dropout_mask(float dropout)
    */
   void dropout_mask(float dropout) override;

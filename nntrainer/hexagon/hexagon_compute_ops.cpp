@@ -69,8 +69,14 @@ namespace nntrainer {
 namespace {
 
 using nntr_htp_bridge_gemm_q4_0_fn = int (*)(const void *, const float *,
-                                              float *, unsigned int,
-                                              unsigned int, unsigned int);
+                                               float *, unsigned int,
+                                               unsigned int, unsigned int);
+#ifdef ENABLE_FP16
+using nntr_htp_bridge_gemm_q4_0_fp16_fn = int (*)(const void *, const _FP16 *,
+                                                   _FP16 *, unsigned int,
+                                                   unsigned int, unsigned int);
+#endif
+
 using nntr_htp_bridge_upload_fn = int (*)(const void *, const void *,
                                            unsigned int, unsigned int);
 using nntr_htp_bridge_gemm_q4_0_batch_fn =
@@ -99,9 +105,13 @@ struct BridgeApi {
   nntr_htp_bridge_upload_fn upload = nullptr;
   nntr_htp_bridge_gemm_q4_0_fn gemm = nullptr;
   nntr_htp_bridge_gemm_q4_0_batch_fn gemm_batch = nullptr;
+#ifdef ENABLE_FP16
+  nntr_htp_bridge_gemm_q4_0_fp16_fn gemm_fp16 = nullptr;  /**< FP16 activation Q4_0 GEMM */
+#endif
   nntr_htp_bridge_sgemm_fn sgemm = nullptr;             /**< FP32 GEMM for training */
   nntr_htp_bridge_sgemm_batch_fn sgemm_batch = nullptr;  /**< Batched FP32 GEMM */
 };
+
 
 
 
@@ -145,7 +155,17 @@ const BridgeApi &get_bridge_api() {
       sym("nntr_htp_bridge_gemm_q4_0"));
     a.gemm_batch = reinterpret_cast<nntr_htp_bridge_gemm_q4_0_batch_fn>(
       sym("nntr_htp_bridge_gemm_q4_0_batch"));
+#ifdef ENABLE_FP16
+    // FP16 activation bridge — optional (older libggml-hexagon.so without it
+    // stays null, and supports_gemm_q4_0_accel_fp16 returns false).
+    a.gemm_fp16 = reinterpret_cast<nntr_htp_bridge_gemm_q4_0_fp16_fn>(
+      sym_optional("nntr_htp_bridge_gemm_q4_0_fp16"));
+    if (a.gemm_fp16) {
+      ml_logi("HexagonComputeOps: FP16 Q4_0 GEMM bridge loaded");
+    }
+#endif
     // Training bridge — optional, stays null if not present.
+
     a.sgemm = reinterpret_cast<nntr_htp_bridge_sgemm_fn>(
       sym_optional("nntr_htp_bridge_sgemm_fp32"));
     a.sgemm_batch = reinterpret_cast<nntr_htp_bridge_sgemm_batch_fn>(
@@ -735,6 +755,39 @@ public:
                       const unsigned int ldc) override {
     cpu_->gemm_q4_0_fp16(M, N, K, A, lda, B, ldb, C, ldc);
   }
+
+  // --- NPU-accelerated Q4_0 GEMM with FP16 activations ---
+  // Mirrors gemm_q4_0_accel_fp32 but dispatches via the FP16 bridge function
+  // (nntr_htp_bridge_gemm_q4_0_fp16). The DSP's HMX matmul kernel natively
+  // supports FP16 activations — the dequantized block scales are already
+  // __fp16 internally (see matmul-ops.c) — so this is a pure type change at
+  // the bridge boundary, not a new kernel. Weights are the same Q4_0 already
+  // uploaded by ensure_uploaded (shared weight arena, type-agnostic).
+  bool supports_gemm_q4_0_accel_fp16() const override {
+    const BridgeApi *api = get_locked_bridge_api();
+    return api->gemm_fp16 != nullptr;
+  }
+
+  void gemm_q4_0_accel_fp16(void *matAdata, _FP16 *matBdata, _FP16 *matCdata,
+                            unsigned int M, unsigned int N,
+                            unsigned int K) override {
+    const BridgeApi *api = get_locked_bridge_api();
+    if (!api->gemm_fp16) {
+      // Bridge not available — caller (half_tensor.cpp) falls back to
+      // gemm_q4_0_fp16 on CPU.
+      return;
+    }
+    ensure_uploaded(*api, matAdata, N, K);
+
+    int rc = api->gemm_fp16(matAdata, matBdata, matCdata, M, N, K);
+    if (rc != 0) {
+      ml_logw("HexagonComputeOps::gemm_q4_0_accel_fp16: "
+              "nntr_htp_bridge_gemm_q4_0_fp16 failed (M=%u N=%u K=%u) "
+              "- falling back to CPU", M, N, K);
+      cpu_->gemm_q4_0_fp16(M, N, K, matBdata, K, matAdata, N, matCdata, N);
+    }
+  }
+
   void gemm_q6_K_fp16(const unsigned int M, const unsigned int N,
                       const unsigned int K, const _FP16 *A,
                       const unsigned int lda, const void *B,

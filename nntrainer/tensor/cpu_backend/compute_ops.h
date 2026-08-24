@@ -374,6 +374,26 @@ public:
                               const unsigned int lda, const void *B,
                               const unsigned int ldb, _FP16 *C,
                               const unsigned int ldc);
+
+  /**
+   * @brief Whether this backend supports NPU-accelerated Q4_0 GEMM with FP16
+   * activations. When true, HalfTensor::dotQnK calls gemm_q4_0_accel_fp16
+   * instead of the CPU gemm_q4_0_fp16.
+   */
+  virtual bool supports_gemm_q4_0_accel_fp16() const { return false; }
+
+  /**
+   * @brief NPU-accelerated Q4_0 GEMM with FP16 activations.
+   *
+   * Computes C[M,N] = A[M,K] @ B[N,K]^T where A is FP16, B is Q4_0, C is FP16.
+   * Dispatches to the DSP's HMX 4-bit matmul unit via the bridge.
+   */
+  virtual void gemm_q4_0_accel_fp16(void *matAdata, _FP16 *matBdata,
+                                    _FP16 *matCdata, unsigned int M,
+                                    unsigned int N, unsigned int K) {
+    // Default: no NPU support — caller falls back to gemm_q4_0_fp16.
+  }
+
   virtual void gemm_q6_K_fp16(const unsigned int M, const unsigned int N,
                               const unsigned int K, const _FP16 *A,
                               const unsigned int lda, const void *B,

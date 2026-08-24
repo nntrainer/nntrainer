@@ -741,8 +741,18 @@ Tensor &HalfTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
   N = trans_in ? input.getDim().height() : input.getDim().width();
   switch (dtype) {
   case Tdatatype::Q4_0:
-    o->gemm_q4_0_fp16(M, N, K, data, K, (void *)mdata, N, rdata, N);
+    // NPU-accelerated path: when the Hexagon cDSP bridge is available,
+    // dispatch the Q4_0 GEMM to the HMX 4-bit matmul unit with FP16
+    // activations. Falls back to the CPU gemm_q4_0_fp16 when the bridge
+    // is not present (non-cDSP context, or older libggml-hexagon.so).
+    if (o->supports_gemm_q4_0_accel_fp16() &&
+        M >= o->gemm_q4_0_accel_min_rows()) {
+      o->gemm_q4_0_accel_fp16((void *)mdata, data, rdata, M, N, K);
+    } else {
+      o->gemm_q4_0_fp16(M, N, K, data, K, (void *)mdata, N, rdata, N);
+    }
     break;
+
   case Tdatatype::Q6_K:
     o->gemm_q6_K_fp16(M, N, K, data, K, (void *)mdata, N, rdata, N);
     break;
@@ -750,6 +760,27 @@ Tensor &HalfTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     throw std::invalid_argument("Error: unsupported datatype");
   }
   return output;
+}
+
+void HalfTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
+                     bool trans, bool trans_in, float beta) const {
+  // For non-quantized inputs, fall back to per-weight single dot().
+  Tdatatype input_dtype = input[0]->getDataType();
+  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::Q6_K) {
+    for (unsigned int i = 0; i < input.size(); ++i) {
+      dot(*input[i], *output[i], trans, trans_in, beta);
+    }
+    return;
+  }
+
+  // For quantized inputs (Q4_0, Q6_K), dispatch each weight through the
+  // single-weight dotQnK path, which calls gemm_q4_0_accel_fp16 (NPU) or
+  // gemm_q6_K_fp16 on the DSP when the Hexagon bridge is available.
+  // Note: there is no gemm_q4_0_batch_fp16 bridge yet, so we do N separate
+  // dispatches. With HTP_OP_MAX_BUFS=64, these still batch on the DSP side.
+  for (unsigned int i = 0; i < input.size(); ++i) {
+    dot(*input[i], *output[i], trans, trans_in, beta);
+  }
 }
 
 void HalfTensor::dropout_mask(float dropout) {
