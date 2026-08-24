@@ -69,8 +69,8 @@ struct OrigImageInfo {
   int w = 0;
   int h = 0;
   float r = 1.0f;
-  int pad_w = 0;
-  int pad_h = 0;
+  float pad_w = 0.0f; // float pad to match PyTorch scale_coords
+  float pad_h = 0.0f;
 };
 static OrigImageInfo g_orig;
 
@@ -208,8 +208,11 @@ std::vector<float> loadImageLetterbox(const std::string &path) {
   int pad_w = (target - nw) / 2;
   int pad_h = (target - nh) / 2;
 
-  // Store original image info for coordinate scaling
-  g_orig = {w, h, r, pad_w, pad_h};
+  // Store original image info for coordinate scaling.
+  // Use float pad to match PyTorch scale_coords: pad = (target - orig * r) / 2
+  float fpad_w = (target - w * r) / 2.0f;
+  float fpad_h = (target - h * r) / 2.0f;
+  g_orig = {w, h, r, fpad_w, fpad_h};
 
   // NCHW layout, normalized to [0, 1], gray (114/255) padding
   std::vector<float> out(target * target * 3, 114.0f / 255.0f);
