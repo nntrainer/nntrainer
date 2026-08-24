@@ -867,6 +867,7 @@ static inline __m256 __avx_rearranged_f32cx8_load(nntr_fp16_t *x,
 // vpaddq_s16
 // vpaddq_s32
 // vaddvq_s32
+// vmulq_laneq_f32
 // vaddvq_f32
 // vmaxvq_f32
 // vcvtnq_s32_f32
@@ -894,6 +895,13 @@ inline static int32_t vaddvq_s32(int32x4_t v) {
   return vgetq_lane_s32(v, 0) + vgetq_lane_s32(v, 1) + vgetq_lane_s32(v, 2) +
          vgetq_lane_s32(v, 3);
 }
+
+// A32 only has the 64-bit lane form of the by-scalar multiply, so select the
+// half of `b` that holds the requested lane. `lane` must be a literal, which
+// is also what vmulq_lane_f32 itself requires.
+#define vmulq_laneq_f32(a, b, lane)                                            \
+  vmulq_lane_f32((a), ((lane) < 2 ? vget_low_f32(b) : vget_high_f32(b)),       \
+                 (lane) & 1)
 
 #if not(defined(ARMV7)) || !(ARMV7)
 

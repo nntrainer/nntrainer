@@ -218,6 +218,74 @@ void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
   assert(n % qk == 0);
   assert(nc % ncols_interleaved == 0);
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+  /**
+   * A32 dot-product path. aarch64 gets this kernel from
+   * nntr_ggml_impl_neon.cpp; armv7l lands here instead, and Advanced SIMD in
+   * ARMv8.2-A exposes the same VSDOT, so the schedule carries over unchanged.
+   * Needs -march=armv8.2-a+dotprod (armv8-a rejects +dotprod on A32) and
+   * -mfp16-format=ieee for the scale conversions.
+   *
+   * Both nibbles are lifted into the high half of a byte (<<4 and &0xf0), so
+   * every product carries a factor of 16 that vcvtq_n_f32_s32(.., 4) removes
+   * when the accumulator is converted. That matches the scalar `>> 4` exactly:
+   * the summed pair is always a multiple of 16, so nothing is rounded away.
+   */
+  (void)blocklen;
+  const block_q4_0x4 *vb_ptr = (const block_q4_0x4 *)vx;
+  for (int c = 0; c < nc; c += ncols_interleaved) {
+    const block_q8_0 *va_ptr = (const block_q8_0 *)vy;
+    float32x4_t acc = vdupq_n_f32(0);
+
+    for (int b = 0; b < nb; b++) {
+      const int8_t *bq = (const int8_t *)vb_ptr->qs;
+      int8x16_t b0 = vld1q_s8(bq);      // k = 0, cols 0-1
+      int8x16_t b1 = vld1q_s8(bq + 16); // k = 0, cols 2-3
+      int8x16_t b2 = vld1q_s8(bq + 32); // k = 1, cols 0-1
+      int8x16_t b3 = vld1q_s8(bq + 48); // k = 1, cols 2-3
+      float16x4_t bd = vld1_f16((const __fp16 *)vb_ptr->d);
+
+      // Load as bytes, not as int64: block_q8_0 puts qs at offset 2, so an
+      // int64_t* would let gcc emit `vld1.64 [rN:64]`, whose :64 qualifier
+      // faults on a 2-byte-aligned address. aarch64 has no such constraint on
+      // LD1R, which is why the kernel there can dup straight from memory.
+      const int8_t *aq = (const int8_t *)va_ptr->qs;
+      int8x8_t t0 = vld1_s8(aq);      // k = 0, low nibble operand
+      int8x8_t t1 = vld1_s8(aq + 8);  // k = 1, low
+      int8x8_t t2 = vld1_s8(aq + 16); // k = 0, high
+      int8x8_t t3 = vld1_s8(aq + 24); // k = 1, high
+      int8x16_t a0 = vcombine_s8(t0, t0);
+      int8x16_t a1 = vcombine_s8(t1, t1);
+      int8x16_t a2 = vcombine_s8(t2, t2);
+      int8x16_t a3 = vcombine_s8(t3, t3);
+      float16x4_t ad = vld1_dup_f16((const __fp16 *)&va_ptr->d);
+
+      int32x4_t ret0 = vdupq_n_s32(0);
+      int32x4_t ret1 = vdupq_n_s32(0);
+
+      ret0 = vdotq_s32(ret0, b0 << 4, a0);
+      ret1 = vdotq_s32(ret1, b1 << 4, a0);
+      ret0 = vdotq_s32(ret0, b2 << 4, a1);
+      ret1 = vdotq_s32(ret1, b3 << 4, a1);
+
+      ret0 = vdotq_s32(ret0, b0 & 0xf0U, a2);
+      ret1 = vdotq_s32(ret1, b1 & 0xf0U, a2);
+      ret0 = vdotq_s32(ret0, b2 & 0xf0U, a3);
+      ret1 = vdotq_s32(ret1, b3 & 0xf0U, a3);
+
+      // { col0, col1, col2, col3 } once each column's two lanes are folded
+      int32x4_t ret = vpaddq_s32(ret0, ret1);
+
+      acc = vfmaq_f32(acc, vcvtq_n_f32_s32(ret, 4),
+                      vmulq_f32(vcvt_f32_f16(ad), vcvt_f32_f16(bd)));
+      va_ptr++;
+      vb_ptr++;
+    }
+    vst1q_f32(s, acc);
+    s += ncols_interleaved;
+  }
+#else
+
   float sumf[4];
   int sumi;
 
@@ -252,6 +320,7 @@ void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
     for (int j = 0; j < ncols_interleaved; j++)
       s[x * ncols_interleaved + j] = sumf[j];
   }
+#endif
 }
 
 //============================================================================
@@ -269,6 +338,100 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
   assert(n % qk == 0);
   assert(nr % 4 == 0);
   assert(nc % ncols_interleaved == 0);
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+  /**
+   * A32 dot-product path; the aarch64 kernel in nntr_ggml_impl_neon.cpp uses
+   * SMMLA, which needs FEAT_I8MM (armv8.6-a) and has no A32 form here, so the
+   * four rows of the tile are driven through VSDOT instead. B is loaded once
+   * per block and reused across all four rows.
+   *
+   * Scalar reference folds `>> 4` into each i-step and scales per k; both are
+   * hoisted here. The shift is exact because every product is a multiple of 16
+   * (both nibbles sit in the high half of the byte), and the two k halves share
+   * one scale pair, so folding them before the FMA is algebraically identical.
+   */
+  (void)blocklen;
+  for (int y = 0; y < nr / 4; y++) {
+    const block_q8_0x4 *va_ptr = (const block_q8_0x4 *)vy + (y * nb);
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+      const block_q4_0x4 *vb_ptr = (const block_q4_0x4 *)vx + (x * nb);
+
+      // One named accumulator per row rather than an acc[4] array, so the
+      // register allocator can keep them live. Some spilling is unavoidable
+      // either way: eight split B vectors plus four accumulators plus the
+      // per-row temporaries exceed the sixteen Q registers A32 has, which is
+      // why the aarch64 kernel (32 registers) can hold a much wider tile.
+      float32x4_t acc0 = vdupq_n_f32(0);
+      float32x4_t acc1 = vdupq_n_f32(0);
+      float32x4_t acc2 = vdupq_n_f32(0);
+      float32x4_t acc3 = vdupq_n_f32(0);
+
+      for (int l = 0; l < nb; l++) {
+        const int8_t *bq = (const int8_t *)vb_ptr[l].qs;
+        int8x16_t b0 = vld1q_s8(bq);      // k = 0, cols 0-1
+        int8x16_t b1 = vld1q_s8(bq + 16); // k = 0, cols 2-3
+        int8x16_t b2 = vld1q_s8(bq + 32); // k = 1, cols 0-1
+        int8x16_t b3 = vld1q_s8(bq + 48); // k = 1, cols 2-3
+
+        int8x16_t b0l = b0 << 4;
+        int8x16_t b1l = b1 << 4;
+        int8x16_t b2l = b2 << 4;
+        int8x16_t b3l = b3 << 4;
+        int8x16_t b0h = b0 & 0xf0U;
+        int8x16_t b1h = b1 & 0xf0U;
+        int8x16_t b2h = b2 & 0xf0U;
+        int8x16_t b3h = b3 & 0xf0U;
+
+        float32x4_t bd = vcvt_f32_f16(vld1_f16((const __fp16 *)vb_ptr[l].d));
+
+        // qs is int8_t[128]: 8 bytes per {k, row} for the low nibbles, then
+        // the same again from byte 64 for the high nibbles. Loaded as bytes so
+        // gcc cannot attach a :64 alignment qualifier (see the GEMV above).
+        const int8_t *aq = (const int8_t *)va_ptr[l].qs;
+
+        auto row = [&](const int8_t *ap, int m, float32x4_t acc) {
+          int8x8_t t0 = vld1_s8(ap);
+          int8x8_t t1 = vld1_s8(ap + 32);
+          int8x8_t t2 = vld1_s8(ap + 64);
+          int8x8_t t3 = vld1_s8(ap + 96);
+          int8x16_t a0 = vcombine_s8(t0, t0);
+          int8x16_t a1 = vcombine_s8(t1, t1);
+          int8x16_t a2 = vcombine_s8(t2, t2);
+          int8x16_t a3 = vcombine_s8(t3, t3);
+
+          int32x4_t r0 = vdupq_n_s32(0);
+          int32x4_t r1 = vdupq_n_s32(0);
+
+          r0 = vdotq_s32(r0, b0l, a0);
+          r1 = vdotq_s32(r1, b1l, a0);
+          r0 = vdotq_s32(r0, b2l, a1);
+          r1 = vdotq_s32(r1, b3l, a1);
+
+          r0 = vdotq_s32(r0, b0h, a2);
+          r1 = vdotq_s32(r1, b1h, a2);
+          r0 = vdotq_s32(r0, b2h, a3);
+          r1 = vdotq_s32(r1, b3h, a3);
+
+          float ad = nntr_compute_fp16_to_fp32(va_ptr[l].d[m]);
+          return vfmaq_f32(acc, vcvtq_n_f32_s32(vpaddq_s32(r0, r1), 4),
+                           vmulq_n_f32(bd, ad));
+        };
+
+        acc0 = row(aq, 0, acc0);
+        acc1 = row(aq + 8, 1, acc1);
+        acc2 = row(aq + 16, 2, acc2);
+        acc3 = row(aq + 24, 3, acc3);
+      }
+
+      float *out = &s[(y * 4) * bs + x * ncols_interleaved];
+      vst1q_f32(out, acc0);
+      vst1q_f32(out + bs, acc1);
+      vst1q_f32(out + 2 * bs, acc2);
+      vst1q_f32(out + 3 * bs, acc3);
+    }
+  }
+#else
 
   float sumf[4][4];
   int sumi;
@@ -313,6 +476,7 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
       }
     }
   }
+#endif
 }
 
 //============================================================================
@@ -352,6 +516,58 @@ void nntr_gemm_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
   assert(nr % 4 == 0);
   assert(nc % ncols_interleaved == 0);
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+  /**
+   * A32 dot-product path, ported from nntr_ggml_impl_neon.cpp. vmulq_laneq_f32
+   * is aarch64-only and comes from the shim in nntr_ggml_impl_utils.h.
+   */
+  (void)blocklen;
+  for (int y = 0; y < nr / 4; y++) {
+    const block_q8_0x4 *va_ptr = (const block_q8_0x4 *)vy + (y * nb);
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+      const block_q8_0x4 *vb_ptr = (const block_q8_0x4 *)vx + (x * nb);
+
+      float32x4_t sf0 = vdupq_n_f32(0);
+      float32x4_t sf1 = vdupq_n_f32(0);
+      float32x4_t sf2 = vdupq_n_f32(0);
+      float32x4_t sf3 = vdupq_n_f32(0);
+
+      for (int l = 0; l < nb; l++) {
+        float32x4_t a_d = vcvt_f32_f16(vld1_f16((const __fp16 *)va_ptr[l].d));
+        float32x4_t b_d = vcvt_f32_f16(vld1_f16((const __fp16 *)vb_ptr[l].d));
+
+        int32x4_t si0 = vdupq_n_s32(0);
+        int32x4_t si1 = vdupq_n_s32(0);
+        int32x4_t si2 = vdupq_n_s32(0);
+        int32x4_t si3 = vdupq_n_s32(0);
+
+        const int8_t *aq = (const int8_t *)va_ptr[l].qs;
+        const int8_t *bq = (const int8_t *)vb_ptr[l].qs;
+
+        for (int kk = 0; kk < 8; kk++) {
+          int8x16_t av = vld1q_s8(aq + 16 * kk);
+          int8x16_t bv = vld1q_s8(bq + 16 * kk);
+          si0 = vdotq_laneq_s32(si0, bv, av, 0);
+          si1 = vdotq_laneq_s32(si1, bv, av, 1);
+          si2 = vdotq_laneq_s32(si2, bv, av, 2);
+          si3 = vdotq_laneq_s32(si3, bv, av, 3);
+        }
+
+        sf0 = vmlaq_f32(sf0, vmulq_laneq_f32(b_d, a_d, 0), vcvtq_f32_s32(si0));
+        sf1 = vmlaq_f32(sf1, vmulq_laneq_f32(b_d, a_d, 1), vcvtq_f32_s32(si1));
+        sf2 = vmlaq_f32(sf2, vmulq_laneq_f32(b_d, a_d, 2), vcvtq_f32_s32(si2));
+        sf3 = vmlaq_f32(sf3, vmulq_laneq_f32(b_d, a_d, 3), vcvtq_f32_s32(si3));
+      }
+
+      float *out = &s[(y * 4) * bs + x * ncols_interleaved];
+      vst1q_f32(out, sf0);
+      vst1q_f32(out + bs, sf1);
+      vst1q_f32(out + 2 * bs, sf2);
+      vst1q_f32(out + 3 * bs, sf3);
+    }
+  }
+#else
+
   float sumf[4][4];
   int sumi;
 
@@ -388,6 +604,7 @@ void nntr_gemm_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
       }
     }
   }
+#endif
 }
 
 void nntr_gemv_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
@@ -401,6 +618,52 @@ void nntr_gemv_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
   assert(nr == 1);
   assert(n % qk == 0);
   assert(nc % ncols_interleaved == 0);
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+  /**
+   * A32 dot-product path, ported from the aarch64 kernel in
+   * nntr_ggml_impl_neon.cpp. Every intrinsic it uses exists in A32 Advanced
+   * SIMD once -march=armv8.2-a+dotprod is on, vdotq_laneq_s32 included.
+   */
+  (void)blocklen;
+  const block_q8_0x4 *vb_ptr = (const block_q8_0x4 *)vx;
+
+  for (int c = 0; c < nc; c += ncols_interleaved) {
+    const block_q8_0 *va_ptr = (const block_q8_0 *)vy;
+    float32x4_t acc = vdupq_n_f32(0);
+
+    for (int b = 0; b < nb; b++) {
+      // Separate vld1q_s8 rather than vld1q_s8_x4: on A32 gcc declares the _xN
+      // forms as taking const uint8_t *, and four plain loads schedule the same.
+      const int8_t *bq = (const int8_t *)vb_ptr->qs;
+      const int8_t *aq = (const int8_t *)va_ptr->qs;
+      float16x4_t bd = vld1_f16((const __fp16 *)vb_ptr->d);
+
+      int8x16_t a_lo = vld1q_s8(aq);
+      int8x16_t a_hi = vld1q_s8(aq + 16);
+      float16x4_t ad = vld1_dup_f16((const __fp16 *)&va_ptr->d);
+
+      int32x4_t ret = vdupq_n_s32(0);
+
+      ret = vdotq_laneq_s32(ret, vld1q_s8(bq), a_lo, 0);
+      ret = vdotq_laneq_s32(ret, vld1q_s8(bq + 16), a_lo, 1);
+      ret = vdotq_laneq_s32(ret, vld1q_s8(bq + 32), a_lo, 2);
+      ret = vdotq_laneq_s32(ret, vld1q_s8(bq + 48), a_lo, 3);
+
+      ret = vdotq_laneq_s32(ret, vld1q_s8(bq + 64), a_hi, 0);
+      ret = vdotq_laneq_s32(ret, vld1q_s8(bq + 80), a_hi, 1);
+      ret = vdotq_laneq_s32(ret, vld1q_s8(bq + 96), a_hi, 2);
+      ret = vdotq_laneq_s32(ret, vld1q_s8(bq + 112), a_hi, 3);
+
+      acc = vfmaq_f32(acc, vcvtq_f32_s32(ret),
+                      vmulq_f32(vcvt_f32_f16(ad), vcvt_f32_f16(bd)));
+      va_ptr++;
+      vb_ptr++;
+    }
+    vst1q_f32(s, acc);
+    s += ncols_interleaved;
+  }
+#else
 
   float sumf[4];
   int sumi;
@@ -430,6 +693,7 @@ void nntr_gemv_q8_0_4x4_q8_0(int n, float *__restrict s, size_t bs,
       s[x * ncols_interleaved + j] = sumf[j];
     }
   }
+#endif
 }
 
 //============================================================================
@@ -448,6 +712,60 @@ void nntr_gemm_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
   assert(nr % 4 == 0);
   assert(nc % ncols_interleaved == 0);
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+  /**
+   * A32 dot-product path. The aarch64 kernel drives this shape with SMMLA
+   * (vmmlaq_s32), which needs FEAT_I8MM: absent on Cortex-A76 and with no A32
+   * form, so this is built on VSDOT instead, in the same 4x4 tile shape as the
+   * q4_0 4x8 kernel above. B is loaded once per block and reused per row.
+   */
+  (void)blocklen;
+  for (int y = 0; y < nr / 4; y++) {
+    const block_q8_0x4 *va_ptr = (const block_q8_0x4 *)vy + (y * nb);
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+      const block_q8_0x4 *vb_ptr = (const block_q8_0x4 *)vx + (x * nb);
+
+      float32x4_t acc0 = vdupq_n_f32(0);
+      float32x4_t acc1 = vdupq_n_f32(0);
+      float32x4_t acc2 = vdupq_n_f32(0);
+      float32x4_t acc3 = vdupq_n_f32(0);
+
+      for (int l = 0; l < nb; l++) {
+        const int8_t *bq = (const int8_t *)vb_ptr[l].qs;
+        const int8_t *aq = (const int8_t *)va_ptr[l].qs;
+        float32x4_t bd = vcvt_f32_f16(vld1_f16((const __fp16 *)vb_ptr[l].d));
+
+        // qs is int8_t[128] laid out as {k, row/col, i}: 4 groups of 32 bytes,
+        // each group holding four 8-byte lanes.
+        auto row = [&](const int8_t *ap, int m, float32x4_t acc) {
+          int32x4_t r0 = vdupq_n_s32(0);
+          int32x4_t r1 = vdupq_n_s32(0);
+          for (int k = 0; k < 4; k++) {
+            int8x8_t t = vld1_s8(ap + k * 32);
+            int8x16_t a = vcombine_s8(t, t);
+            r0 = vdotq_s32(r0, vld1q_s8(bq + k * 32), a);      // cols 0-1
+            r1 = vdotq_s32(r1, vld1q_s8(bq + k * 32 + 16), a); // cols 2-3
+          }
+          float ad = nntr_compute_fp16_to_fp32(va_ptr[l].d[m]);
+          return vfmaq_f32(acc, vcvtq_f32_s32(vpaddq_s32(r0, r1)),
+                           vmulq_n_f32(bd, ad));
+        };
+
+        acc0 = row(aq, 0, acc0);
+        acc1 = row(aq + 8, 1, acc1);
+        acc2 = row(aq + 16, 2, acc2);
+        acc3 = row(aq + 24, 3, acc3);
+      }
+
+      float *out = &s[(y * 4) * bs + x * ncols_interleaved];
+      vst1q_f32(out, acc0);
+      vst1q_f32(out + bs, acc1);
+      vst1q_f32(out + 2 * bs, acc2);
+      vst1q_f32(out + 3 * bs, acc3);
+    }
+  }
+#else
+
   float sumf[4][4];
   int sumi;
 
@@ -484,6 +802,7 @@ void nntr_gemm_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
       }
     }
   }
+#endif
 }
 
 void nntr_gemv_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
@@ -497,6 +816,59 @@ void nntr_gemv_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
   assert(nr == 1);
   assert(n % qk == 0);
   assert(nc % ncols_interleaved == 0);
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+  /**
+   * A32 dot-product path, ported from nntr_ggml_impl_neon.cpp. vpaddq_s32 is
+   * the only aarch64-ism and it already has a shim in nntr_ggml_impl_utils.h.
+   */
+  (void)blocklen;
+  const block_q8_0x4 *vb_ptr = (const block_q8_0x4 *)vx;
+
+  for (int c = 0; c < nc; c += ncols_interleaved) {
+    const block_q8_0 *va_ptr = (const block_q8_0 *)vy;
+    float32x4_t acc = vdupq_n_f32(0);
+
+    for (int b = 0; b < nb; b++) {
+      // Separate loads rather than vld1q_s8_x4 / vld1_s8_x4: on A32 gcc declares
+      // the _xN forms as taking const uint8_t *.
+      const int8_t *bq = (const int8_t *)vb_ptr->qs;
+      const int8_t *aq = (const int8_t *)va_ptr->qs;
+      float16x4_t bd = vld1_f16((const __fp16 *)vb_ptr->d);
+
+      int8x8_t t0 = vld1_s8(aq);
+      int8x8_t t1 = vld1_s8(aq + 8);
+      int8x8_t t2 = vld1_s8(aq + 16);
+      int8x8_t t3 = vld1_s8(aq + 24);
+      int8x16_t a0 = vcombine_s8(t0, t0);
+      int8x16_t a1 = vcombine_s8(t1, t1);
+      int8x16_t a2 = vcombine_s8(t2, t2);
+      int8x16_t a3 = vcombine_s8(t3, t3);
+      float16x4_t ad = vld1_dup_f16((const __fp16 *)&va_ptr->d);
+
+      int32x4_t ret0 = vdupq_n_s32(0);
+      int32x4_t ret1 = vdupq_n_s32(0);
+
+      ret0 = vdotq_s32(ret0, vld1q_s8(bq), a0); // k = 0
+      ret1 = vdotq_s32(ret1, vld1q_s8(bq + 16), a0);
+      ret0 = vdotq_s32(ret0, vld1q_s8(bq + 32), a1); // k = 1
+      ret1 = vdotq_s32(ret1, vld1q_s8(bq + 48), a1);
+      ret0 = vdotq_s32(ret0, vld1q_s8(bq + 64), a2); // k = 2
+      ret1 = vdotq_s32(ret1, vld1q_s8(bq + 80), a2);
+      ret0 = vdotq_s32(ret0, vld1q_s8(bq + 96), a3); // k = 3
+      ret1 = vdotq_s32(ret1, vld1q_s8(bq + 112), a3);
+
+      int32x4_t ret = vpaddq_s32(ret0, ret1);
+
+      acc = vfmaq_f32(acc, vcvtq_f32_s32(ret),
+                      vmulq_f32(vcvt_f32_f16(ad), vcvt_f32_f16(bd)));
+      va_ptr++;
+      vb_ptr++;
+    }
+    vst1q_f32(s, acc);
+    s += ncols_interleaved;
+  }
+#else
 
   float sumf[4];
   int sumi;
@@ -526,6 +898,7 @@ void nntr_gemv_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
       s[x * ncols_interleaved + j] = sumf[j];
     }
   }
+#endif
 }
 
 //============================================================================
@@ -591,8 +964,41 @@ void nntr_quantize_mat_q8_0_4x4(const float *__restrict x, void *__restrict vy,
 
 void nntr_quantize_mat_q8_0_4x8(const float *__restrict x, void *__restrict vy,
                                 int64_t k) {
-  // NYI: Fallback quantization - requires row-by-row implementation
-  throw std::runtime_error("NYI: nntr_quantize_mat_q8_0_4x8 fallback");
+  assert(QK8_0 == 32);
+  assert(k % QK8_0 == 0);
+  const int nb = k / QK8_0;
+
+  block_q8_0x4 *__restrict y = (block_q8_0x4 *)vy;
+
+  // Same shape as nntr_quantize_mat_q8_0_4x4, with an 8-wide interleave.
+  const int blck_size_interleave = 8;
+  float srcv[4][QK8_0];
+  float id[4];
+
+  for (int i = 0; i < nb; i++) {
+    for (int row_iter = 0; row_iter < 4; row_iter++) {
+      float amax = 0.0f; // absolute max
+
+      for (int j = 0; j < QK8_0; j++) {
+        srcv[row_iter][j] = x[row_iter * k + i * QK8_0 + j];
+        amax = MAX(amax, fabsf(srcv[row_iter][j]));
+      }
+
+      const float d = amax / ((1 << 7) - 1);
+      id[row_iter] = d ? 1.0f / d : 0.0f;
+
+      y[i].d[row_iter] = nntr_compute_fp32_to_fp16(d);
+    }
+
+    for (int j = 0; j < QK8_0 * 4; j++) {
+      int src_offset = (j / (4 * blck_size_interleave)) * blck_size_interleave;
+      int src_id = (j % (4 * blck_size_interleave)) / blck_size_interleave;
+      src_offset += (j % blck_size_interleave);
+
+      float x0 = srcv[src_id][src_offset] * id[src_id];
+      y[i].qs[j] = roundf(x0);
+    }
+  }
 }
 
 void nntr_quantize_mat_q8_K_4x8(const float *__restrict x, void *__restrict vy,
