@@ -63,16 +63,17 @@ inline Tensor conv(const std::string &name, int in_ch, int out_ch, int k,
   return c(input);
 }
 
-// Conv + BN + LeakyReLU(0.1) Fused equivalent
+// Conv + BN + SiLU (Swish) Fused equivalent
 inline Tensor convBnLeaky(const std::string &name, int in_ch, int out_ch, int k,
                           int stride, int padding, Tensor input,
                           bool conv_q = false) {
   auto x = conv(name, in_ch, out_ch, k, stride, padding, input, conv_q);
-  LayerHandle leaky(createLayer(
-    "activation", {nntrainer::withKey("name", name + "/leaky"),
-                   nntrainer::withKey("activation", "leaky_relu")}));
-  return leaky(x);
+  LayerHandle act(createLayer(
+    "activation", {nntrainer::withKey("name", name + "/silu"),
+                   nntrainer::withKey("activation", "swish")}));
+  return act(x);
 }
+
 
 inline Tensor concat(const std::string &name, std::vector<Tensor> xs) {
   LayerHandle c(createLayer("concat", {nntrainer::withKey("name", name),
@@ -125,11 +126,14 @@ inline Tensor sppcspc(const std::string &name, int c_in, int c_out,
   auto m5 = maxpool(name + "/m_5", 5, 1, 2, cv1);
   auto m9 = maxpool(name + "/m_9", 9, 1, 4, cv1);
   auto m13 = maxpool(name + "/m_13", 13, 1, 6, cv1);
+  // PyTorch: cat([x1] + [m(x1) for m in self.m], 1) = [cv1, m5, m9, m13]
   auto y1 = convBnLeaky(name + ".cv3", 4 * c_hidden, c_hidden, 1, 1, 0,
-                        concat(name + "/cat3", {m13, m9, m5, cv1}), conv_q);
+                        concat(name + "/cat3", {cv1, m5, m9, m13}), conv_q);
+  // PyTorch: cat((y1, y2), dim=1)
   return convBnLeaky(name + ".cv4", 2 * c_hidden, c_out, 1, 1, 0,
                      concat(name + "/cat4", {y1, cv2}), conv_q);
 }
+
 
 // UpSampleBlock
 inline Tensor upSample(const std::string &name, int c_in, int c_out,
@@ -144,8 +148,10 @@ inline Tensor upSample(const std::string &name, int c_in, int c_out,
   auto x_up = up(c1);
   auto c2 =
     convBnLeaky(name + ".base.conv2", route_ch, c_hidden, 1, 1, 0, route, conv_q);
-  return concat(name + "/cat", {x_up, c2});
+  // PyTorch: cat((x1, x), dim=1) where x1=conv2(route), x=up(conv1(input))
+  return concat(name + "/cat", {c2, x_up});
 }
+
 
 // DownSampleBlock
 inline Tensor downSample(const std::string &name, int c_in, int c_out,
