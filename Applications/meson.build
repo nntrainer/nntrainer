@@ -51,9 +51,7 @@ if host_machine.system() != 'windows'
 endif
 
 if get_option('enable-transformer')
-  if get_option('platform') != 'tizen'
-    subdir('CausalLM')
-  endif
+  subdir('CausalLM')
 endif
 
 subdir('Optimizers/jni')

@@ -679,8 +679,6 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         throw std::invalid_argument("input word index is greater than in_dim");
       }
 
-      nntrainer::Tensor cur_weight =
-        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
       nntrainer::Tensor out_tensor =
         batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
 
@@ -731,6 +729,8 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                         out_tensor.getData());
 
       } else {
+        nntrainer::Tensor cur_weight =
+          weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
         out_tensor.copyData(cur_weight);
       }
 

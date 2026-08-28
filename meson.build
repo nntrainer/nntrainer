@@ -192,6 +192,10 @@ if get_option('enable-fp16')
      elif arm_arch_opt == 'armv8.2-a'
        add_project_arguments('-march=armv8.2-a+fp16+dotprod+i8mm', language: ['c', 'cpp'])
        extra_defines += '-DARM_ARCH_ARMV8_2A=1'
+     elif arm_arch_opt == 'armv8-a'
+       add_project_arguments('-march=armv8-a+fp16', language: ['c', 'cpp'])
+       extra_defines += '-DARM_ARCH_ARMV8_A=1'
+       message('meson.build arm_arch_opt: armv8-a+fp16')
      else
        # auto: default to armv8.2-a+fp16+dotprod+i8mm for native aarch64 builds
        add_project_arguments('-march=armv8.2-a+fp16+dotprod+i8mm', language: ['c', 'cpp'])
@@ -393,7 +397,7 @@ endif
 if get_option('install-app')
 # add a script to install resources from installs to application_install_dir
 meson.add_install_script(
-  'sh', '-c', 'cp -r @0@ ${DESTDIR}@1@'.format(nntrainer_resdir, application_install_dir)
+  'sh', '-c', 'mkdir -p ${DESTDIR}@1@ && cp -r @0@ ${DESTDIR}@1@'.format(nntrainer_resdir, application_install_dir)
 )
 endif
 

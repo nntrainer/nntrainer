@@ -17,7 +17,7 @@ jobs:
         run: |
           echo "Checking whitespace errors on changed lines"
           git diff --check ${{ github.event.pull_request.base.sha }}...HEAD \
-            -- . ':(exclude).github' ':(exclude)Applications/CausalLM/third_party'
+            -- . ':(exclude).github' ':(exclude)Applications/CausalLM/third_party' ':(exclude)Applications/CausalLM/json.hpp'
       - name: install dev packages
         run: |
           echo "Install mandatory dev packages to avoid false-positive reports from cpp-linter"
@@ -37,7 +37,7 @@ jobs:
           tidy-checks: '-*' # disable clang-tidy checks.
           # third_party/ holds vendored upstream code (minja, ...) that is not
           # formatted to nntrainer style; skip it like static.check.yml does.
-          ignore: '.github|Applications/CausalLM/third_party'
+          ignore: '.github|Applications/CausalLM/third_party|Applications/CausalLM/json.hpp'
 
       - name: failing fast
         if: steps.linter.outputs.clang-format-checks-failed > 0

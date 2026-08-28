@@ -28,6 +28,7 @@
 #define WIN_EXPORT
 #endif
 #endif
+#include <mutex>
 
 #include <acti_func.h>
 #include <causallm_common_properties.h>

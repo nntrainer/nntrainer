@@ -12,6 +12,8 @@
  * @brief  This is the layer context for each layer
  */
 
+#include <map>
+
 #include "nntrainer_error.h"
 #include <functional>
 #include <memory>
@@ -562,7 +564,8 @@ bool RunLayerContext::validate(bool skip_input, bool skip_label) {
 #ifdef DEBUG
   std::function<bool(const Var_Grad *, bool)> matcher;
 
-  if (tensor_map.empty() || !tensor_map[inputs[0]->getName()]) {
+  if (tensor_map.empty() ||
+      (!inputs.empty() && !tensor_map[inputs[0]->getName()])) {
     auto filler = [this](const auto &vec) {
       for (auto const &val : vec) {
         if (val->getVariableRef().getTensorType().data_type ==

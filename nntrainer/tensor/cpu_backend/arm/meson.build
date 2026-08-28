@@ -11,9 +11,11 @@ arm_compute_backend_sources = [
 
 arch = host_machine.cpu_family()
 if arch != 'arm'
-  subdir('kai_interface')
-  nntrainer_inc += include_directories('kai_interface')
-  nntrainer_inc_abs += meson.current_source_dir() / 'kai_interface'
+  if arm_arch_opt != 'armv7l' and arm_arch_opt != 'armv8-a'
+    subdir('kai_interface')
+    nntrainer_inc += include_directories('kai_interface')
+    nntrainer_inc_abs += meson.current_source_dir() / 'kai_interface'
+  endif
 endif
 
 subdir('matrix_transpose_neon')
@@ -24,7 +26,6 @@ nntrainer_inc_abs += meson.current_source_dir() / 'matrix_transpose_neon'
 if get_option('enable-fp16')
   arm_compute_backend_sources += 'arm_compute_backend_fp16.cpp'
   arm_compute_backend_sources += 'neon_impl_fp16.cpp'
-  
   subdir('hgemm')
   nntrainer_inc += include_directories('hgemm')
   nntrainer_inc_abs += meson.current_source_dir() / 'hgemm'

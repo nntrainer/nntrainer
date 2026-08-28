@@ -429,9 +429,21 @@ template <>
 void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,
                                        float epsilon) {
+#if defined(__ARM_FEATURE_FP16) && defined(__ARM_FEATURE_FMA)
   neon::rms_norm_wrt_width_fp16_intrinsic(X, Y, H, W, epsilon);
+#else
+  neon::rms_norm_wrt_width_fp32_intrinsic(X, Y, H, W, epsilon);
+#endif
 }
 
+void nntr_quant_qs4cx_f32(size_t n, size_t k, void *rhs_native_mtx_f32,
+                          void *rhs_native_mtx_qs4cx, void *rhs_scales_f32,
+                          bool transB) {
+  quant_qs4cx_f32(n, k, rhs_native_mtx_f32, rhs_native_mtx_qs4cx,
+                  rhs_scales_f32, transB);
+}
+
+#if defined(__ARM_FEATURE_DOTPROD) && defined(__ARM_FEATURE_MATMUL_INT8)
 void nntr_quant_qs4c32_f32(size_t n, size_t k, size_t bl,
                            void *rhs_native_mtx_f32,
                            void *rhs_native_mtx_qs4c32) {
@@ -477,5 +489,6 @@ void nntr_gemm_qsi8d32p_qsi4c32p_packed(size_t m, size_t n, size_t k,
     m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx, dst_act_mtx_f32,
     idx_variant, transB, lower_bound, upper_bound);
 }
+#endif
 
 } /* namespace nntrainer */

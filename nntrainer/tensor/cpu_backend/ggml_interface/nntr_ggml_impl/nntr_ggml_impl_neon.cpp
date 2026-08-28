@@ -38,7 +38,7 @@ void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
 
   assert(n % qk == 0);
   assert(nc % ncols_interleaved == 0);
-#if defined(__ARM_FEATURE_DOTPROD)
+
   const block_q4_0x4 *b_ptr = (const block_q4_0x4 *)vx;
   for (int c = 0; c < nc; c += ncols_interleaved) {
     const block_q8_0 *a_ptr = (const block_q8_0 *)vy;
@@ -59,6 +59,7 @@ void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
       int32x4_t ret0 = vdupq_n_s32(0);
       int32x4_t ret1 = vdupq_n_s32(0);
 
+#if defined(__ARM_FEATURE_DOTPROD)
       ret0 = vdotq_s32(ret0, b0 << 4, a0);
       ret1 = vdotq_s32(ret1, b1 << 4, a0);
       ret0 = vdotq_s32(ret0, b2 << 4, a1);
@@ -68,6 +69,17 @@ void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
       ret1 = vdotq_s32(ret1, b1 & 0xf0U, a2);
       ret0 = vdotq_s32(ret0, b2 & 0xf0U, a3);
       ret1 = vdotq_s32(ret1, b3 & 0xf0U, a3);
+#else
+      ret0 = ggml_vdotq_s32(ret0, b0 << 4, a0);
+      ret1 = ggml_vdotq_s32(ret1, b1 << 4, a0);
+      ret0 = ggml_vdotq_s32(ret0, b2 << 4, a1);
+      ret1 = ggml_vdotq_s32(ret1, b3 << 4, a1);
+
+      ret0 = ggml_vdotq_s32(ret0, b0 & 0xf0U, a2);
+      ret1 = ggml_vdotq_s32(ret1, b1 & 0xf0U, a2);
+      ret0 = ggml_vdotq_s32(ret0, b2 & 0xf0U, a3);
+      ret1 = ggml_vdotq_s32(ret1, b3 & 0xf0U, a3);
+#endif
 
       int32x4_t ret = vpaddq_s32(ret0, ret1);
 
@@ -80,72 +92,6 @@ void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
     s += ncols_interleaved;
   }
   return;
-
-#else
-  const void *b_ptr = vx;
-  const void *a_ptr = vy;
-  float *res_ptr = s;
-
-  __asm__ __volatile__(
-    "movi v2.16b, #0x4\n"
-    "movi v1.16b, #0xf0\n"
-    "add %x[b_ptr], %x[b_ptr], #0x8\n"
-    "1:" // Column loop
-    "add x23, %x[a_ptr], #0x2\n"
-    "movi v0.16b, #0x0\n"
-    "mov x22, %x[nb]\n"
-    "2:" // Block loop
-    "ldr q31, [%x[b_ptr], #0x0]\n"
-    "ldr q30, [%x[b_ptr], #0x10]\n"
-    "mov x21, x23\n"
-    "movi v29.4s, #0x0\n"
-    "ldr q28, [%x[b_ptr], #0x20]\n"
-    "ldr q27, [%x[b_ptr], #0x30]\n"
-    "movi v26.4s, #0x0\n"
-    "sub x20, x23, #0x2\n"
-    "ld1r { v25.8h }, [x20]\n"
-    "ldr q24, [%x[b_ptr], #-0x8]\n"
-    "sub x22, x22, #0x1\n"
-    "add x23, x23, #0x22\n"
-    "ld1r { v23.2d }, [x21], #0x8\n"
-    "sshl v22.16b, v31.16b, v2.16b\n"
-    "sshl v16.16b, v30.16b, v2.16b\n"
-    "add %x[b_ptr], %x[b_ptr], #0x48\n"
-    "ld1r { v21.2d }, [x21], #0x8\n"
-    "sshl v20.16b, v28.16b, v2.16b\n"
-    "sshl v19.16b, v27.16b, v2.16b\n"
-    "ld1r { v18.2d }, [x21], #0x8\n"
-    "ld1r { v17.2d }, [x21], #0x8\n"
-    "and v31.16b, v31.16b, v1.16b\n"
-    "and v30.16b, v30.16b, v1.16b\n"
-    ".inst 0x4e9796dd  // sdot v29.4s, v22.16b, v23.16b\n"
-    ".inst 0x4e97961a  // sdot v26.4s, v16.16b, v23.16b\n"
-    "and v28.16b, v28.16b, v1.16b\n"
-    "and v27.16b, v27.16b, v1.16b\n"
-    "fcvtl v25.4s, v25.4h\n"
-    "fcvtl v16.4s, v24.4h\n"
-    ".inst 0x4e95969d  // sdot v29.4s, v20.16b, v21.16b\n"
-    ".inst 0x4e95967a  // sdot v26.4s, v19.16b, v21.16b\n"
-    "fmul v16.4s, v16.4s, v25.4s\n"
-    ".inst 0x4e9297fd  // sdot v29.4s, v31.16b, v18.16b\n"
-    ".inst 0x4e9297da  // sdot v26.4s, v30.16b, v18.16b\n"
-    ".inst 0x4e91979d  // sdot v29.4s, v28.16b, v17.16b\n"
-    ".inst 0x4e91977a  // sdot v26.4s, v27.16b, v17.16b\n"
-    "addp v29.4s, v29.4s, v26.4s\n"
-    "scvtf v29.4s, v29.4s, #0x4\n"
-    "fmla v0.4s, v29.4s, v16.4s\n"
-    "cbnz x22, 2b\n"
-    "sub %x[nc], %x[nc], #0x4\n"
-    "str q0, [%x[res_ptr], #0x0]\n"
-    "add %x[res_ptr], %x[res_ptr], #0x10\n"
-    "cbnz %x[nc], 1b\n"
-    : [b_ptr] "+&r"(b_ptr), [res_ptr] "+&r"(res_ptr), [nc] "+&r"(nc)
-    : [a_ptr] "r"(a_ptr), [nb] "r"(nb)
-    : "memory", "v0", "v1", "v2", "v16", "v17", "v18", "v19", "v20", "v21",
-      "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
-      "x20", "x21", "x22", "x23");
-  return;
-#endif
 }
 
 #ifdef ENABLE_FP16
@@ -291,6 +237,7 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
   float *res_ptr = s;
   size_t res_stride = bs * sizeof(float);
 
+#if defined(__ARM_FEATURE_MATMUL_INT8) || defined(__ARM_V8_2A_I8MM)
   __asm__ __volatile__("mov x10, %x[nr]\n"
                        "mov x9, #0x88\n"
                        "cmp x10, #0x10\n"
@@ -686,6 +633,59 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                          "v30", "v31", "x9", "x10", "x20", "x21", "x22", "x23",
                          "x24", "x25", "x26", "x27", "x28");
   return;
+#else
+  for (int y = 0; y < nr / 4; y++) {
+    const block_q8_0x4 *a_ptr = (const block_q8_0x4 *)vy + (y * nb);
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+      const block_q4_0x4 *b_ptr = (const block_q4_0x4 *)vx + (x * nb);
+
+      float sumf_local[4][4];
+      for (int m = 0; m < 4; m++) {
+        for (int j = 0; j < 4; j++) {
+          sumf_local[m][j] = 0.0f;
+        }
+      }
+
+      for (int l = 0; l < nb; l++) {
+        float a_scales[4], b_scales[4];
+        for (int i = 0; i < 4; i++) {
+          a_scales[i] = nntr_compute_fp16_to_fp32(a_ptr[l].d[i]);
+          b_scales[i] = nntr_compute_fp16_to_fp32(b_ptr[l].d[i]);
+        }
+
+        for (int k = 0; k < (qk / (2 * blocklen)); k++) {
+          int8x8_t am[4], am_h[4];
+          for (int m = 0; m < 4; m++) {
+            am[m] = vld1_s8(&a_ptr[l].qs[k * 4 * blocklen + m * blocklen]);
+            am_h[m] = vld1_s8(
+              &a_ptr[l].qs[k * 4 * blocklen + m * blocklen + qk / 2 * 4]);
+          }
+
+          for (int j = 0; j < ncols_interleaved; j++) {
+            uint8x8_t b_qs =
+              vld1_u8((const uint8_t *)&b_ptr[l]
+                        .qs[k * ncols_interleaved * blocklen + j * blocklen]);
+
+            int8x8_t v0 = vreinterpret_s8_u8(vshl_n_u8(b_qs, 4));
+            int8x8_t v1 = vreinterpret_s8_u8(vand_u8(b_qs, vdup_n_u8(0xF0)));
+
+            for (int m = 0; m < 4; m++) {
+              int16x8_t p =
+                vaddq_s16(vmull_s8(v0, am[m]), vmull_s8(v1, am_h[m]));
+              int32_t sumi = vaddlvq_s16(p) >> 4;
+              sumf_local[m][j] += (float)sumi * b_scales[j] * a_scales[m];
+            }
+          }
+        }
+      }
+      for (int m = 0; m < 4; m++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf_local[m][j];
+        }
+      }
+    }
+  }
+#endif
 }
 
 #ifdef ENABLE_FP16
