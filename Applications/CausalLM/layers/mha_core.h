@@ -77,6 +77,23 @@ public:
 };
 
 /**
+ * @brief InitSeqLen -- the model's activation-plane height in query rows.
+ * @details The prefill feeds at most this many query rows per forward pass,
+ * so it is the ceiling the prefill chunk is clamped to. The layer needs the
+ * clamped chunk (not the raw NNTR_PREFILL_CHUNK request) to size its KV window
+ * ring exactly as the model side does -- the two must agree to the row or the
+ * modulo indexing writes out of bounds. 0 means "not told", and the layer then
+ * falls back to its query input height, which is the same plane.
+ */
+class InitSeqLen : public nntrainer::Property<unsigned int> {
+public:
+  InitSeqLen(unsigned int value = 0) { set(value); };
+  static constexpr const char *key =
+    "init_seq_len";                          /**< unique key to access */
+  using prop_tag = nntrainer::uint_prop_tag; /**< property type */
+};
+
+/**
  * @brief MaxNewTokens
  */
 class MaxNewTokens : public nntrainer::Property<unsigned int> {
@@ -408,12 +425,12 @@ private:
     nntrainer::props::OutputShape, nntrainer::props::DropOutRate,
     nntrainer::props::ReturnAttentionWeight,
     nntrainer::props::AverageAttentionWeight, nntrainer::props::MaxTimestep,
-    props::SlidingWindow, props::MaxNewTokens, props::RopeTheta, props::UseRope,
-    props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
-    props::RopeScalingFactor, props::RopePartialRotaryFactor,
-    props::RopeScalingMaxPositionEmbeddings, props::AttnLogitSoftcapping,
-    props::IsCausal, props::UseGemmAttention, props::GpuDecodeAttn,
-    props::GpuDecodeRope, props::GpuOhwiRope>
+    props::SlidingWindow, props::InitSeqLen, props::MaxNewTokens,
+    props::RopeTheta, props::UseRope, props::MaxPositionEmbeddings,
+    props::UseSink, props::RopeScalingType, props::RopeScalingFactor,
+    props::RopePartialRotaryFactor, props::RopeScalingMaxPositionEmbeddings,
+    props::AttnLogitSoftcapping, props::IsCausal, props::UseGemmAttention,
+    props::GpuDecodeAttn, props::GpuDecodeRope, props::GpuOhwiRope>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */

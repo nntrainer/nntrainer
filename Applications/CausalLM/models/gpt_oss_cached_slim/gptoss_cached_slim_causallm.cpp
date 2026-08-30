@@ -73,6 +73,7 @@ Tensor GptOssCachedSlimCausalLM::createAttention(const int layer_id,
      // other model: num_to_generate is optional and may be 0 (no explicit
      // cap), which would otherwise leave positions past INIT_SEQ_LEN uncovered.
      withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
+     withKey("init_seq_len", std::to_string(INIT_SEQ_LEN)),
      withKey("sliding_window", sliding_window),
      withKey("rope_theta", ROPE_THETA),
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
