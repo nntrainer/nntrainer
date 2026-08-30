@@ -44,8 +44,10 @@
 #include <embedding_layer.h>
 #include <mha_core.h>
 #include <neuralnet.h>
+#include <per_layer_slice_gpu.h>
 #include <qs4cx_tensor.h>
 #include <rms_norm.h>
+#include <rms_norm_gpu.h>
 
 namespace causallm {
 
@@ -791,6 +793,11 @@ void Transformer::registerCustomLayers() {
   // getData() pointers + GPU dispatches; they avoid any CPU-only Tensor ops
   // (Tensor::multiply / add_i / dot) that crash on gpu-context tensors. Inert
   // when there is no "gpu" context (CPU-only / NNTR_ENGINE=cpu builds).
+  tryRegister("gpu", nntrainer::createLayer<causallm::RMSNormLayerGPU>);
+  // GPU-resident per_layer_slice: the same type string as the CPU class,
+  // registered here so engine=gpu routes to the GPU kernel instead of taking a
+  // host round-trip that would break the activation's residency.
+  tryRegister("gpu", nntrainer::createLayer<causallm::PerLayerSliceLayerGPU>);
   // MHACoreLayer on the gpu context enables engine=gpu attention. The same
   // class runs on both backends: forwarding() dispatches the GPU kernels when
   // NNTR_MHA_GPU is set and Q/K/V/cache are SVM-resident, else the CPU NEON

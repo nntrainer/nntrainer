@@ -14,11 +14,11 @@ endif
 
 # Common Includes Definition
 #
-# The last entry is TEMPORARY and app-local: the layer TUs here (mha_core,
-# reshaped_rms_norm) still include the raw OpenCL kernel wrappers
-# <blas_kernels.h> / <attention_kernels.h> instead of going through the
-# ComputeOps table. Those two headers are private to
-# libnntrainer and are deliberately not installed, so the ndk build reaches
+# The last entry is TEMPORARY and app-local: four layer TUs here
+# (mha_core, reshaped_rms_norm, rms_norm_gpu, per_layer_slice_gpu) still include
+# the raw OpenCL kernel wrappers <blas_kernels.h> / <attention_kernels.h>
+# instead of going through the ComputeOps table. Those two headers are private
+# to libnntrainer and are deliberately not installed, so the ndk build reaches
 # them through the nntrainer source dir rather than through the prebuilt
 # include export. Delete that entry together with the last raw
 # nntrainer::*_cl(...) call site under ../layers; it exists to keep the bypass
@@ -52,7 +52,7 @@ CAUSALLM_COMMON_INCLUDES := \
 # prebuilt nntrainer modules below via LOCAL_EXPORT_CFLAGS.
 #
 # -DENABLE_OPENCL=1 stays app-side: it selects the app's GPU-routed layer
-# implementations (the cl paths inside
+# implementations (rms_norm_gpu / per_layer_slice_gpu / the cl paths inside
 # mha_core). Dropping it silently compiles the whole GPU stack out and the
 # app falls back to CPU (Adreno gemma4 191 vs 2400 TPS).
 CAUSALLM_COMMON_CFLAGS := -O3 -ffast-math -DENABLE_OPENCL=1 \
@@ -111,6 +111,7 @@ LOCAL_SRC_FILES := \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
+    ../layers/per_layer_slice_gpu.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
@@ -118,6 +119,7 @@ LOCAL_SRC_FILES := \
     ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_reverse_norm.cpp \
     ../layers/rms_norm.cpp \
+    ../layers/rms_norm_gpu.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
@@ -225,6 +227,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
+    ../layers/per_layer_slice_gpu.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
@@ -232,6 +235,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../layers/causal_conv1d_layer.cpp \
     ../layers/rms_reverse_norm.cpp \
     ../layers/rms_norm.cpp \
+    ../layers/rms_norm_gpu.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
