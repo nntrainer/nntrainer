@@ -60,20 +60,15 @@
 #include <llm_util.hpp>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-#include <cuda_attention.h>
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
-#include <cuda_fc_qint4.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 namespace nntrainer::cuda {
-// [i8-skip] Defined in cuda_fc_qint4.cpp (declared locally: single-TU contract,
-// no header edit) -- exempts a QS4CX weight from the eager cuBLAS-i8 build.
-void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w);
-// [i8-ephemeral] Frees all cuBLAS-i8 caches at the prefill->decode boundary.
+// Frees all cuBLAS int8 caches at the prefill -> decode boundary.
 void cuda_fc_qs4cx_free_i8_caches();
 } // namespace nntrainer::cuda
 
@@ -566,24 +561,10 @@ std::vector<float *> CausalLM::incrementalInference(
         if (!defer_host_logits)
           nntrainer::cuda::StreamManager::Global().finish();
       }
-      // Device-only activation pool (NNTR_CUDA_DEV_ACT): fp32 logits are real
-      // device memory the raw memcpy below cannot read -- drain and stage D2H,
-      // symmetric to the fp16 branch above. (Campaign scout gap: only the fp16
-      // branch staged; the fp32 branch would fault under DEV_ACT.)
-      if (defer_host_logits) {
-        // nothing to stage: nobody is going to read the host row
-      } else if (out_t.getMemoryData() &&
-                 !out_t.getMemoryData()->isHostAddressable()) {
-        nntrainer::cuda::StreamManager::Global().finish();
-        if (!nntrainer::cuda::copy_any((void *)last_out_buf_data,
-                                       (const void *)out_t.getData(),
-                                       sizeof(float) * buf_size))
-          throw std::runtime_error(
-            "CausalLM: D2H staging of the fp32 logits failed");
-      } else {
+      // Nothing to materialize when the row is deferred: no reader for it.
+      if (!defer_host_logits)
         std::memcpy(last_out_buf_data, out_t.getData(),
                     sizeof(float) * buf_size);
-      }
 #else
       std::memcpy(last_out_buf_data, out_t.getData(), sizeof(float) * buf_size);
 #endif
@@ -1205,7 +1186,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
   }
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-  // [i8-ephemeral] NNTR_CUDA_I8_EPHEMERAL=1: the prefill just finished and
+  // NNTR_CUDA_I8_EPHEMERAL=1: the prefill just finished and
   // decode (M=1, dp4a) never reads the cuBLAS-i8 caches -- free them here so
   // the decode phase runs without their VRAM residency (~1.2GB measured).
   // Multi-turn: the next prefill lazily rebuilds (slower TTFT on that turn).

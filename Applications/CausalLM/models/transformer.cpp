@@ -34,7 +34,6 @@
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context.h>
-#include <cuda_rmsnorm_layer.h>
 #include <per_layer_slice.h>
 #endif
 
@@ -808,12 +807,11 @@ void Transformer::registerCustomLayers() {
   const char *eager_env = std::getenv("NNTR_CUDA_EAGER_CTX");
   if (causallm_engine() == "cuda" ||
       (eager_env != nullptr && eager_env[0] != '0')) {
-    // swiglu promoted to core cuda_context.cpp.
-    // CUDA RMSNorm (FP32-safe sum-of-squares) instead of the host
-    // causallm::RMSNormLayer, whose FP16 path squares in FP16 and overflows on
-    // gemma4's large residual (pre_ffn_norm |x|~1688 -> +Inf -> garbage). Same
-    // "rms_norm" type, so it takes this slot.
-    tryRegister("cuda", nntrainer::createLayer<nntrainer::CudaRMSNormLayer>);
+    // The application's own "rms_norm" class. The cuda context registers the
+    // core RMS norm under the backend-neutral "rmsnorm" type string, which is
+    // a different key from the one this application's graph asks for, so the
+    // app class has to be registered here or the graph cannot resolve it.
+    tryRegister("cuda", nntrainer::createLayer<causallm::RMSNormLayer>);
     tryRegister("cuda", nntrainer::createLayer<causallm::MHACoreLayer>);
     // tie_word_embedding promoted to core cuda_context.cpp.
     tryRegister("cuda", nntrainer::createLayer<causallm::EmbeddingLayer>);
