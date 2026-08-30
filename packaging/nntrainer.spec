@@ -790,6 +790,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/optimizer.h
 %{_includedir}/nntrainer/dataset.h
 %{_includedir}/nntrainer/tensor_dim.h
+%{_includedir}/nntrainer/half_fp16.h
 %{_libdir}/pkgconfig/ccapi-ml-training.pc
 
 %files -n ccapi-machine-learning-training-devel-static

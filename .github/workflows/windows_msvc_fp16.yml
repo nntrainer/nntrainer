@@ -1,0 +1,66 @@
+name: "Build Test - Windows Meson fp16 (Half wrapper)"
+
+# MSVC cl.exe has no native _Float16, so -Denable-fp16=true selects the
+# uint16-backed nntrainer::Half wrapper through the fp16-impl=auto probe.
+# See docs/design/msvc_fp16_half_wrapper.md.
+#
+# This job verifies COMPILE + LINK of that configuration; it does not run the
+# test suite (see configurations/windows-native-fp16.ini for why). The existing
+# fp32 Windows job in windows.yml keeps running meson test.
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    name: Windows Meson fp16 build (Half wrapper)
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # The composite check-rebuild action is sh-only, so reuse the same
+      # classifier script inline via bash (git-bash) to skip doc-only PRs.
+      # A manual dispatch always builds.
+      - name: Check if rebuild required
+        id: rebuild
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "rebuild=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tmpfile=$(mktemp)
+          git show --pretty="format:" --name-only --diff-filter=AMRC ${{ github.event.pull_request.head.sha }} -${{ github.event.pull_request.commits }} | sort | uniq | awk NF > "$tmpfile"
+          if bash .github/actions/check-rebuild/check_if_rebuild_requires.sh "$tmpfile" build | grep -q "REBUILD=YES"; then
+            echo "rebuild=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "rebuild=0" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install submodules
+        if: steps.rebuild.outputs.rebuild == '1'
+        run: git submodule sync && git submodule update --init --recursive
+      - name: Install Python Dependencies
+        if: steps.rebuild.outputs.rebuild == '1'
+        run: pip install meson==1.7.2 ninja
+      - name: Prepare MSVC
+        if: steps.rebuild.outputs.rebuild == '1'
+        uses: bus1/cabuild/action/msdevshell@v1
+        with:
+          architecture: x64
+      - name: Prepare Build
+        if: steps.rebuild.outputs.rebuild == '1'
+        run: meson setup --native-file configurations/windows-native-fp16.ini builddir
+      # -k 0 keeps going after the first error so a single run surfaces every
+      # remaining MSVC gap instead of one per round trip.
+      - name: Run Build
+        if: steps.rebuild.outputs.rebuild == '1'
+        run: ninja -C builddir -k 0

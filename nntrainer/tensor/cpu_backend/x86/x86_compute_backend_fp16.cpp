@@ -170,7 +170,6 @@ void scopy_int8_to_float16(const unsigned int N, const int8_t *X,
 _FP16 sdot(const unsigned int N, const _FP16 *X, const unsigned int incX,
            const _FP16 *Y, const unsigned int incY) {
   assert(incX > 0 && incY > 0);
-  _FP16 ret = 0;
   return __fallback_sdot(N, X, incX, Y, incY);
 }
 

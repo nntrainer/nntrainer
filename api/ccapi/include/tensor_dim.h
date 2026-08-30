@@ -25,6 +25,9 @@
 #ifdef ENABLE_FP16
 #ifdef USE__FP16
 #define _FP16 __fp16
+#elif defined(USE_HALF_WRAPPER)
+#include "half_fp16.h" // self-contained leaf: uint16-backed nntrainer::Half
+#define _FP16 ::nntrainer::Half
 #else
 #define _FP16 _Float16
 #endif
