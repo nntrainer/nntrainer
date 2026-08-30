@@ -14,15 +14,22 @@ endif
 
 # Common Includes Definition
 #
-# The last entry is TEMPORARY and app-local: the layer TUs here (mha_core,
-# reshaped_rms_norm) still include the raw OpenCL kernel wrappers
-# <blas_kernels.h> / <attention_kernels.h> instead of going through the
-# ComputeOps table. Those two headers are private to
-# libnntrainer and are deliberately not installed, so the ndk build reaches
-# them through the nntrainer source dir rather than through the prebuilt
-# include export. Delete that entry together with the last raw
-# nntrainer::*_cl(...) call site under ../layers; it exists to keep the bypass
-# visible and app-local, never to make it ABI.
+# The three $(NNTRAINER_ROOT) entries reach headers that libnntrainer keeps
+# private and deliberately does not install, so the ndk build has to find them
+# in the nntrainer source dir rather than through the prebuilt include export
+# (the meson leg does not notice because it compiles against nntrainer_inc):
+#   nntrainer/tensor              residency_policy.h, the application-declared
+#                                 residency boundaries causal_lm.cpp populates
+#                                 before the graph allocates
+#   nntrainer/tensor/cl_operations  TEMPORARY: the layer TUs here (mha_core,
+#                                 reshaped_rms_norm) still include the raw
+#                                 OpenCL kernel wrappers <blas_kernels.h> /
+#                                 <attention_kernels.h> instead of going
+#                                 through the ComputeOps table. Delete that
+#                                 entry together with the last raw
+#                                 nntrainer::*_cl(...) call site under
+#                                 ../layers; it exists to keep the bypass
+#                                 visible and app-local, never to make it ABI.
 CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/.. \
     $(LOCAL_PATH)/../layers \
@@ -45,17 +52,23 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
     $(NNTRAINER_ROOT)/nntrainer/utils \
+    $(NNTRAINER_ROOT)/nntrainer/tensor \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
 
 # Common compile flags. -std=c++17/-fexceptions/-frtti come from Application.mk
-# (APP_CPPFLAGS); -march and the FP16 ABI defines are inherited from the
-# prebuilt nntrainer modules below via LOCAL_EXPORT_CFLAGS.
+# (APP_CPPFLAGS); -march and the ABI defines are inherited from the prebuilt
+# nntrainer modules below via LOCAL_EXPORT_CFLAGS.
 #
-# -DENABLE_OPENCL=1 stays app-side: it selects the app's GPU-routed layer
-# implementations (the cl paths inside
-# mha_core). Dropping it silently compiles the whole GPU stack out and the
-# app falls back to CPU (Adreno gemma4 191 vs 2400 TPS).
-CAUSALLM_COMMON_CFLAGS := -O3 -ffast-math -DENABLE_OPENCL=1 \
+# ENABLE_OPENCL is one of those inherited defines and must not be repeated
+# here: it selects the app's GPU-routed layer implementations (the cl paths
+# inside mha_core) and it also gates the cl_context.h member of engine.h, and
+# cl_context.h is installed only when nntrainer itself was configured with
+# -Denable-opencl=true. Hardcoding the define makes the app disagree with the
+# library it links, which is an ABI break on a CPU-only prebuilt rather than a
+# missing feature. Build nntrainer with -Denable-opencl=true instead
+# (build_android.sh forwards -D* verbatim) and the define arrives with the
+# prebuilt export.
+CAUSALLM_COMMON_CFLAGS := -O3 -ffast-math \
     -Wno-nan-infinity-disabled -Wno-deprecated-literal-operator
 
 # Prebuilt nntrainer libraries. The generated Android.mk exports the include
@@ -67,14 +80,11 @@ endif
 include $(NNTRAINER_PREBUILT_MK)
 LOCAL_PATH := $(CAUSALLM_JNI_PATH)
 
-# OpenCL driver: linked by the GPU-native binary that calls clSVMAlloc /
-# clEnqueueSVM* directly. libnntrainer.so resolves these dynamically via
-# its own loader; standalone binaries need the link explicitly.
-include $(CLEAR_VARS)
-LOCAL_MODULE := OpenCL
-LOCAL_SRC_FILES := $(NNTRAINER_ROOT)/builddir/opencl/lib/$(TARGET_ARCH_ABI)/libOpenCL.so
-LOCAL_EXPORT_C_INCLUDES := $(NNTRAINER_ROOT)/builddir/opencl/include
-include $(PREBUILT_SHARED_LIBRARY)
+# No OpenCL prebuilt module here: every module below reaches the driver
+# through libnntrainer.so, which loads it via its own loader. A
+# PREBUILT_SHARED_LIBRARY is validated at parse time, so declaring one for
+# builddir/opencl aborts ndk-build outright whenever nntrainer was configured
+# without -Denable-opencl=true and that tree was never downloaded.
 
 # Tokenizer library
 include $(CLEAR_VARS)
@@ -220,6 +230,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/qwen3_cached_slim_moe/qwen3_cached_slim_moe_causallm.cpp \
     ../models/gpt_oss/gptoss_causallm.cpp \
     ../models/gpt_oss_cached_slim/gptoss_cached_slim_causallm.cpp \
+    ../huggingface_tokenizer.cpp \
     ../llm_util.cpp \
     ../layers/embedding_layer.cpp \
     ../layers/embedding_pooling_layer.cpp \
@@ -271,6 +282,7 @@ LOCAL_C_INCLUDES += \
     $(LOCAL_PATH)/../models/xlm_roberta \
     $(LOCAL_PATH)/../models/lfm2 \
     $(NNTRAINER_ROOT)/nntrainer/utils \
+    $(NNTRAINER_ROOT)/nntrainer/tensor \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
 
 include $(BUILD_EXECUTABLE)
