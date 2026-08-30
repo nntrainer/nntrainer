@@ -466,6 +466,17 @@ private:
   bool cache_shift;
   float theta;
   size_t local_window_size;
+  /** [kv-window-ring] Physical ring rows for this layer (0 = full max_seq, no
+   * ring). Set in finalize() from mha_kv_ring_cap(local_window_size,
+   * max_timestep). When non-zero every cache-row index -- write offset and
+   * kernel read alike -- is taken modulo this. */
+  unsigned int kv_ring_cap = 0;
+  /** Map an absolute cache position to its physical ring row (identity when the
+   * ring is off). Used ONLY for cache-storage row offsets: RoPE and the
+   * causal/window masks keep the absolute position. */
+  inline size_t cacheRow(size_t abs_pos) const {
+    return kv_ring_cap ? (abs_pos % (size_t)kv_ring_cap) : abs_pos;
+  }
   bool use_sink = false;
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
