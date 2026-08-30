@@ -12,6 +12,7 @@
 
 #include "kv_cache_manager.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -73,6 +74,11 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   cache_pos_ = 0;
 
   layer_caches_.resize(num_layers);
+
+  // [kv-share] Reject an unusable alias map BEFORE a single byte is requested:
+  // a source that is not strictly earlier, or whose geometry differs, would
+  // produce a cache that reads the wrong plane without ever crashing.
+  validateKVSources(num_layers);
 
   // GPU-resident KV cache: when the graph runs on the SVM pool
   // (NNTR_GPU_SVM_POOL) and the gpu-svm allocator is available, allocate the
@@ -146,16 +152,21 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
 
   if (svm_alloc) {
     svm_pool_ = std::make_shared<nntrainer::MemoryPool>(svm_alloc);
-    std::vector<unsigned int> tokens;
-    tokens.reserve((size_t)num_layers * 2);
+    // [kv-share] A layer that aliases an earlier layer's K/V requests NO
+    // token -- it gets no bytes of its own, which is the whole point. Index
+    // the tokens per layer (0 = "none"; MemoryPool tokens start at 1) instead
+    // of the old 2*i / 2*i+1 arithmetic, which cannot survive the gaps.
+    std::vector<unsigned int> ktok(num_layers, 0u), vtok(num_layers, 0u);
     // All caches are live for the whole run; BasicPlanner gives each its own
     // (non-overlapping) region so the total pool is the sum. Size each region
     // per-layer so models with non-uniform KV widths stay correct.
     for (unsigned int i = 0; i < num_layers; ++i) {
+      if (isLayerKVAliased(i))
+        continue;
       const size_t bytes =
         (size_t)batch_size * max_seq_len * kv_widths_[i] * elem_size;
-      tokens.push_back(svm_pool_->requestMemory(bytes, 1, 2)); // key
-      tokens.push_back(svm_pool_->requestMemory(bytes, 1, 2)); // value
+      ktok[i] = svm_pool_->requestMemory(bytes, 1, 2); // key
+      vtok[i] = svm_pool_->requestMemory(bytes, 1, 2); // value
     }
     svm_pool_->planLayout(nntrainer::BasicPlanner());
     svm_pool_->allocate();
@@ -163,12 +174,23 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     for (unsigned int i = 0; i < num_layers; ++i) {
       ml::train::TensorDim cache_dim(
         {batch_size, 1, max_seq_len, kv_widths_[i]}, {format, dtype});
+      // [kv-share] The source is strictly earlier, so its storage is already
+      // in place -- one pass suffices, no second fixup loop. The source's
+      // plane was zeroed when the source itself was set up, so the sharer must
+      // NOT be zeroed again: it is the same memory, and a second pass over it
+      // is a wasted device kernel (and, on the managed path, a wasted
+      // migration).
+      const int src = getLayerKVSource(i);
+      if (src >= 0) {
+        aliasLayerCache(i, static_cast<unsigned int>(src), cache_dim);
+        continue;
+      }
       layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, false);
-      layer_caches_[i].key_cache.setData(svm_pool_->getMemory(tokens[2 * i]), 0,
+      layer_caches_[i].key_cache.setData(svm_pool_->getMemory(ktok[i]), 0,
                                          false);
       layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, false);
-      layer_caches_[i].value_cache.setData(
-        svm_pool_->getMemory(tokens[2 * i + 1]), 0, false);
+      layer_caches_[i].value_cache.setData(svm_pool_->getMemory(vtok[i]), 0,
+                                           false);
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
       // Device-only KV (NNTR_CUDA_KV_DEV): host setZero would dereference a
       // cudaMalloc pointer -- zero on the device instead. Detected from the
@@ -195,12 +217,168 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     for (unsigned int i = 0; i < num_layers; ++i) {
       ml::train::TensorDim cache_dim(
         {batch_size, 1, max_seq_len, kv_widths_[i]}, {format, dtype});
+      // [kv-share] Same rule as the pool branch above: an aliased layer gets a
+      // view, never an allocation. Tensor(dim, /*alloc=*/false) + setData()
+      // shares the source's MemoryData shared_ptr, so the host buffer outlives
+      // every view of it regardless of destruction order.
+      const int src = getLayerKVSource(i);
+      if (src >= 0) {
+        aliasLayerCache(i, static_cast<unsigned int>(src), cache_dim);
+        continue;
+      }
       layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, true);
       layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
       layer_caches_[i].key_cache.setZero();
       layer_caches_[i].value_cache.setZero();
     }
   }
+
+  reportKVShare(num_layers, batch_size, dtype, svm_alloc ? "svm-pool" : "host");
+}
+
+void KVCacheManager::validateKVSources(unsigned int num_layers) const {
+  if (layer_kv_sources_.empty())
+    return; // no sharing declared -- every layer owns its cache (the default)
+
+  if (layer_kv_sources_.size() != num_layers)
+    throw std::invalid_argument(
+      "KVCacheManager::allocate: setLayerKVSources() size (" +
+      std::to_string(layer_kv_sources_.size()) + ") != num_layers (" +
+      std::to_string(num_layers) + ")");
+
+  for (unsigned int i = 0; i < num_layers; ++i) {
+    const int src = layer_kv_sources_[i];
+    if (src < 0)
+      continue;
+
+    // Strictly earlier: the allocation pass walks layers in order and aliases
+    // onto storage that already exists. A forward or self reference would
+    // alias an empty Tensor -- and an empty KV cache does not crash here, it
+    // silently feeds zeros into attention.
+    if (static_cast<unsigned int>(src) >= i)
+      throw std::invalid_argument(
+        "KVCacheManager::allocate: KV source layer " + std::to_string(src) +
+        " for layer " + std::to_string(i) + " must be strictly earlier");
+
+    // Same physical plane means same physical geometry. KV width is
+    // per-layer, so a source/sharer drift (e.g. a narrow layer pointed at a
+    // wide one) is exactly the mistake this check exists to catch, and it is
+    // cheap. Every layer holds max_seq_len rows here, so width is the only
+    // axis that can differ.
+    if (kv_widths_[i] != kv_widths_[static_cast<unsigned int>(src)])
+      throw std::invalid_argument(
+        "KVCacheManager::allocate: KV alias geometry mismatch, layer " +
+        std::to_string(i) + " (width " + std::to_string(kv_widths_[i]) +
+        ") -> layer " + std::to_string(src) + " (width " +
+        std::to_string(kv_widths_[static_cast<unsigned int>(src)]) + ")");
+  }
+}
+
+void KVCacheManager::aliasLayerCache(unsigned int dst, unsigned int src,
+                                     const ml::train::TensorDim &cache_dim) {
+  auto &s = layer_caches_[src];
+
+  // The source must already hold storage; validateKVSources() guarantees the
+  // ordering, this catches the case where the source's own allocation failed
+  // to attach memory. Never fall through to "leave the sharer empty".
+  if (s.key_cache.getMemoryData() == nullptr ||
+      s.value_cache.getMemoryData() == nullptr)
+    throw std::runtime_error(
+      "KVCacheManager::allocate: KV alias source layer " + std::to_string(src) +
+      " has no storage (layer " + std::to_string(dst) + " would read nulls)");
+
+  if (s.key_cache.getDim() != cache_dim || s.value_cache.getDim() != cache_dim)
+    throw std::runtime_error(
+      "KVCacheManager::allocate: KV alias dim mismatch, layer " +
+      std::to_string(dst) + " -> layer " + std::to_string(src));
+
+  // Share the source's MemoryData shared_ptr (NOT a fresh MemoryPool::
+  // getMemory(), which mints a new MemoryData object every call): ownership is
+  // refcounted, so the sharer keeps the plane alive and teardown order is
+  // irrelevant on both the pool and the host branch. This is byte-for-byte the
+  // same setData() the model's allocateAndBindKVCache() performs when it hands
+  // a cache to a graph placeholder.
+  layer_caches_[dst].key_cache = nntrainer::Tensor(cache_dim, false);
+  layer_caches_[dst].key_cache.setData(s.key_cache.getMemoryData(),
+                                       s.key_cache.getOffset(), false);
+  layer_caches_[dst].value_cache = nntrainer::Tensor(cache_dim, false);
+  layer_caches_[dst].value_cache.setData(s.value_cache.getMemoryData(),
+                                         s.value_cache.getOffset(), false);
+
+  // Post-condition, asserted rather than assumed: the sharer resolves to a
+  // non-null address and it is the source's address.
+  const void *dk = layer_caches_[dst].key_cache.getData<char>();
+  const void *dv = layer_caches_[dst].value_cache.getData<char>();
+  if (dk == nullptr || dv == nullptr || dk != s.key_cache.getData<char>() ||
+      dv != s.value_cache.getData<char>())
+    throw std::runtime_error(
+      "KVCacheManager::allocate: KV alias did not land, layer " +
+      std::to_string(dst) + " -> layer " + std::to_string(src));
+}
+
+void KVCacheManager::reportKVShare(unsigned int num_layers,
+                                   unsigned int batch_size,
+                                   ml::train::TensorDim::DataType dtype,
+                                   const char *where) const {
+  // [kv-share] Independent witness of the RESOLVED layer -> source map.
+  // Emitted whenever sharing is declared (i.e. not gated on the window ring,
+  // which can collapse to off), because "which layer reads whose K/V" is the
+  // one fact an aliased cache makes impossible to infer after the fact -- and
+  // a silent source/sharer disagreement produces fluent, wrong output with no
+  // crash. It also states the bytes NOT allocated, so a memory measurement
+  // never has to assume the aliasing engaged.
+  //
+  // STDERR, deliberately, and not ml_logi like the window-ring line above.
+  // ml_logi is not a witness in a shipping build: under -D__LOGGING__ (which
+  // is how this app is built) it goes to a CWD-relative ./logs/*.out file that
+  // no run harness reads, and in the non-__LOGGING__ DEBUG variant INFO goes
+  // to STDOUT -- which is the generated-text stream, i.e. inside the slice a
+  // golden md5 hashes. stderr is the channel the app already uses for run
+  // diagnostics and the only one that is both visible and safe here.
+  if (layer_kv_sources_.empty())
+    return;
+
+  const size_t es = (dtype == ml::train::TensorDim::DataType::FP16) ? 2u : 4u;
+  size_t saved = 0;
+  unsigned int n_ok = 0;
+  std::vector<std::string> entries;
+  for (unsigned int i = 0; i < num_layers; ++i) {
+    const int src = getLayerKVSource(i);
+    if (src < 0)
+      continue;
+    saved += (size_t)batch_size * max_seq_len_ * kv_widths_[i] * es * 2u;
+
+    // Prove the alias landed instead of asserting it in prose: both planes
+    // must resolve to a non-null address, and to the SAME address as the
+    // source. getData() only computes MemoryData::addr + offset, so this is
+    // safe for a device-only plane too -- nothing is dereferenced.
+    const auto &d = layer_caches_[i];
+    const auto &s = layer_caches_[static_cast<unsigned int>(src)];
+    const void *dk = d.key_cache.getData<char>();
+    const void *dv = d.value_cache.getData<char>();
+    const bool ok = dk != nullptr && dv != nullptr &&
+                    dk == s.key_cache.getData<char>() &&
+                    dv == s.value_cache.getData<char>();
+    if (ok)
+      ++n_ok;
+
+    entries.push_back(std::to_string(i) + "->" + std::to_string(src) +
+                      (ok ? "" : "(BROKEN)"));
+  }
+
+  std::fprintf(stderr,
+               "[kvcache] kv-share (%s): %u of %u layers alias an earlier "
+               "layer's K/V, %.1f MB not allocated, "
+               "alias pointer check %zu/%zu ok\n",
+               where, static_cast<unsigned int>(entries.size()), num_layers,
+               saved / (1024.0 * 1024.0), (size_t)n_ok, entries.size());
+  for (size_t b = 0; b < entries.size(); b += 10) {
+    std::string line;
+    for (size_t j = b; j < entries.size() && j < b + 10; ++j)
+      line += " " + entries[j];
+    std::fprintf(stderr, "[kvcache] kv-share map:%s\n", line.c_str());
+  }
+  std::fflush(stderr);
 }
 
 void KVCacheManager::setPosition(unsigned int pos) {
@@ -336,6 +514,15 @@ void KVCacheManager::save(const std::string &path, unsigned int seq_len) const {
     throw std::runtime_error("KVCacheManager::save: cannot open file: " + path);
   }
 
+  // [kv-share] The file format stays one K plane + one V plane per layer, in
+  // layer order, exactly as before -- so a file written by an aliasing build
+  // and one written by a non-aliasing build of the same model are byte
+  // identical, and either loads into either. An aliased layer simply emits its
+  // source's plane a second time, which is not an approximation: the values
+  // written into a sharer's private slab always WERE its source's values (same
+  // wk/wv, same k_norm/v_norm, same RoPE, same absolute position -- see
+  // Gemma4Transformer::createSharedAttention). load() below skips the
+  // duplicates rather than replaying them.
   for (const auto &lc : layer_caches_) {
     ml::train::TensorDim save_dim = lc.key_cache.getDim();
     save_dim.height(seq_len);
@@ -384,7 +571,18 @@ void KVCacheManager::load(const std::string &path, unsigned int seq_len) {
     throw std::runtime_error("KVCacheManager::load: cannot open file: " + path);
   }
 
-  for (auto &lc : layer_caches_) {
+  // [kv-share] File extent, taken once: seeking PAST the end of an ifstream is
+  // not itself an error (the failure only surfaces on the next read), and the
+  // aliased planes below are skipped by seeking. Without this, a file truncated
+  // inside the trailing aliased region -- every layer after the last owner, so
+  // most of the file for a KV-sharing model -- would be skipped over and
+  // "loaded" silently.
+  f.seekg(0, std::ios::end);
+  const std::streamoff file_end = f.tellg();
+  f.seekg(0, std::ios::beg);
+
+  for (unsigned int i = 0; i < layer_caches_.size(); ++i) {
+    auto &lc = layer_caches_[i];
     ml::train::TensorDim load_dim = lc.key_cache.getDim();
     load_dim.height(seq_len);
 
@@ -392,6 +590,24 @@ void KVCacheManager::load(const std::string &path, unsigned int seq_len) {
       lc.key_cache.getSharedDataTensor(load_dim, 0, true);
     nntrainer::Tensor v_slice =
       lc.value_cache.getSharedDataTensor(load_dim, 0, true);
+
+    // [kv-share] An aliased layer's plane IS its source's plane. Reading it
+    // again would write the same bytes over memory that was already filled by
+    // the source's own read -- harmless when the file came from save() above,
+    // but it makes the final contents depend on which sharer happened to be
+    // read last instead of on the source. Skip the duplicate bytes (the file
+    // still carries them, so the format stays interchangeable in both
+    // directions) and let the source's read be the single writer.
+    if (isLayerKVAliased(i)) {
+      f.seekg(static_cast<std::streamoff>(k_slice.bytes() + v_slice.bytes()),
+              std::ios::cur);
+      if (!f || f.tellg() > file_end)
+        throw std::runtime_error(
+          "KVCacheManager::load: truncated file while skipping the aliased "
+          "plane of layer " +
+          std::to_string(i));
+      continue;
+    }
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
     // Device-only KV: Tensor::read writes on the host -- read into a host
