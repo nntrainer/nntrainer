@@ -73,6 +73,7 @@ public:
     validate_cb([](unsigned int) {}),
     invalidate_cb([](unsigned int) {}),
     svm_allocation(false),
+    host_addressable(true),
     device_mem(nullptr),
     residency_(ResidencyClass::HOST) {}
 
@@ -91,6 +92,7 @@ public:
     validate_cb(v_cb),
     invalidate_cb(i_cb),
     svm_allocation(false),
+    host_addressable(true),
     device_mem(nullptr),
     residency_(ResidencyClass::HOST) {}
 
@@ -171,6 +173,17 @@ public:
   bool isClMem() const { return residency_ == ResidencyClass::GPU_CLMEM; }
 
   /**
+   * @brief   True unless this memory is DEVICE-ONLY (e.g. a cudaMalloc plane):
+   *          the host must not dereference the pointer, and every host read or
+   *          write has to stage through a bounce buffer.
+   * @note    Stamped from MemAllocator::isHostAddressable() at pool bind, the
+   *          same way the SVM flag is, so a consumer asks the tensor it already
+   *          holds rather than probing the driver. Defaults true, because a
+   *          plain host buffer is host memory.
+   */
+  bool isHostAddressable() const { return host_addressable; }
+
+  /**
    * @brief   The device buffer backing this memory, or null when the planner
    *          left it on the shared plane.
    * @note    Held as void* so this header stays free of the OpenCL types and
@@ -190,6 +203,13 @@ private:
   void setSVM(bool is_svm) { svm_allocation = is_svm; }
 
   /**
+   * @brief  Record whether the host may dereference this memory (private -
+   *         only accessible by MemoryPool, for the same reason setSVM is).
+   * @param[in] addressable false for a device-only allocation
+   */
+  void setHostAddressable(bool addressable) { host_addressable = addressable; }
+
+  /**
    * @brief  Record the planner's placement and, for a device-resident tensor,
    *         the buffer that backs it (private - only the pool decides).
    */
@@ -204,6 +224,7 @@ private:
   MemoryDataValidateCallback validate_cb;
   MemoryDataValidateCallback invalidate_cb;
   bool svm_allocation;
+  bool host_addressable;     /**< false for a device-only allocation */
   void *device_mem;          /**< device buffer, when device-resident */
   ResidencyClass residency_; /**< the planner's placement */
 };

@@ -143,5 +143,38 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output);
  */
 bool dotCl_v8c_prebuild_weight(const Tensor &weight);
 
+/**
+ * @brief Upload a boundary tensor's host bytes into the device buffer that
+ *        backs it (host -> cl_mem RAISE).
+ *
+ * A tensor the planner placed on the GPU_CLMEM residency class keeps its bytes
+ * in a device buffer; its host mirror is only meaningful once one of these two
+ * calls has moved them. Use this after a genuine host WRITE, so the kernels
+ * that read the buffer next see what the host produced.
+ *
+ * Only offset-0 views are bridgeable: the sub-buffer covers the whole tensor,
+ * so a nonzero-offset view would read from the wrong place. That case throws
+ * rather than silently misreading.
+ *
+ * @param[in] t tensor to raise; a non-cl_mem tensor is a no-op
+ * @param[in] valid_bytes bytes to move, or 0 for the whole tensor
+ * @return true when bytes were moved
+ */
+bool clmem_raise_cl(const Tensor &t, unsigned int valid_bytes);
+
+/**
+ * @brief Read a boundary tensor's device buffer back into its host mirror
+ *        (cl_mem -> host LOWER). The counterpart of clmem_raise_cl.
+ *
+ * Use before a genuine host READ. The read is blocking on the in-order queue,
+ * so it also waits for every command already enqueued -- which is exactly the
+ * ordering a host consumer needs.
+ *
+ * @param[in] t tensor to lower; a non-cl_mem tensor is a no-op
+ * @param[in] valid_bytes bytes to move, or 0 for the whole tensor
+ * @return true when bytes were moved
+ */
+bool clmem_lower_cl(const Tensor &t, unsigned int valid_bytes);
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNEL_INTERFACE_H__ */
