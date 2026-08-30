@@ -81,12 +81,20 @@ __global__ void scalar_mul_fp16(const unsigned short *in, unsigned short *out,
 // Device-slot V-copy: write into the KV cache at the live slot d_pos[0] computed
 // on-device (out_base is the cache BASE, width = per-row element count), so a
 // captured graph writes V to the correct (new-token) slot on every replay.
+// [kv-window-ring] ring_cap > 0 maps each ABSOLUTE row (d_pos[0] + i/width) to
+// its physical ring row (% ring_cap): a sliding layer's cache only has ring_cap
+// physical rows, so writing at the absolute row lands outside it (or, with a
+// full-size buffer, at a row nothing reads). Mapped PER ROW, not just at the
+// base, so a multi-row prefill-chunk write stays correct without relying on the
+// Wcap seam-alignment invariant.
 __global__ void scalar_mul_fp16_slot(const unsigned short *in,
                                      unsigned short *out_base, int n, float scalar,
-                                     const int *d_pos, int width) {
+                                     const int *d_pos, int width, int ring_cap) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  out_base[(long)d_pos[0] * width + i] = ew_f2h(ew_h2f(in[i]) * scalar);
+  long row_abs = (long)d_pos[0] + i / width;
+  long row = (ring_cap > 0) ? (row_abs % ring_cap) : row_abs;
+  out_base[row * width + (i % width)] = ew_f2h(ew_h2f(in[i]) * scalar);
 }
 __global__ void slice_copy_fp16(const unsigned short *in, unsigned short *out,
                                 int rows, int in_width, int layer_off, int fs) {
@@ -361,7 +369,7 @@ bool cuda_scalar_mul_fp16(const unsigned short *in, unsigned short *out,
 
 bool cuda_scalar_mul_fp16_slot(const unsigned short *in,
                                unsigned short *out_base, unsigned int n,
-                               float scalar, int width) {
+                               float scalar, int width, int ring_cap) {
   if (n == 0)
     return true;
   auto k = CudaContext::Global().registerCudaKernel(ELTWISE_SRC,
@@ -378,6 +386,7 @@ bool cuda_scalar_mul_fp16_slot(const unsigned short *in,
   k->SetKernelArguments(3, &scalar, sizeof(scalar));
   k->SetKernelArguments(4, &d_pos, sizeof(d_pos));
   k->SetKernelArguments(5, &width, sizeof(width));
+  k->SetKernelArguments(6, &ring_cap, sizeof(ring_cap)); // [kv-window-ring]
   return dispatch1d(k, n);
 }
 

@@ -54,7 +54,8 @@ bool cuda_rope_fp16(const unsigned short *in, unsigned short *out,
 bool cuda_rope_fp16_dpos(const unsigned short *in, unsigned short *out,
                          const unsigned short *cos_lut,
                          const unsigned short *sin_lut, int num_heads,
-                         int head_dim, int num_rows, int out_slot_dpos);
+                         int head_dim, int num_rows, int out_slot_dpos,
+                         int ring_cap = 0);
 
 } // namespace nntrainer::cuda
 
