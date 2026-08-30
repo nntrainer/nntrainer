@@ -367,6 +367,104 @@ void transpose_cl_axis(const _FP16 *in, _FP16 *res,
                        unsigned int input_batch_size,
                        unsigned int input_channels, unsigned int input_height,
                        unsigned int input_width, unsigned int axis);
+
+/**
+ * @brief FP16 rmsnorm over each row (width), scaled by gamma.
+ *
+ * Mirrors rmsnorm_cl for the FP16 activation stream. The cooperative kernel
+ * (one workgroup per row, FP32 accumulation) runs whenever width % 8 == 0;
+ * the scalar per-row kernel is the fallback for other widths.
+ *
+ * @param[in] input FP16 activation rows
+ * @param[in] gamma per-feature scale, or nullptr for the gamma-free variant
+ * @param[out] result FP16 output rows
+ * @param[in] epsilon added to the mean square before the reciprocal square root
+ * @param[in] height number of rows
+ * @param[in] width row width
+ * @param[in] use_svm bind input/gamma/result as SVM pointers
+ * @param[in] out_clmem when set, write the result into this device buffer (the
+ *            tensor's residency-plane sub-buffer) instead of the SVM pointer,
+ *            with no host map, so a device-resident consumer reads it directly
+ * @param[in] in_clmem when set, read the input from this device buffer
+ */
+void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
+                     const float epsilon, unsigned int height,
+                     unsigned int width, const bool use_svm = true,
+                     void *out_clmem = nullptr, void *in_clmem = nullptr);
+
+/**
+ * @brief Reverse RMSNorm on the GPU: out = out_scale * normalize(in * weight).
+ *
+ * The per-feature @a weight is folded INSIDE the RMS denominator (it couples
+ * all features, so this is not expressible as rmsnorm * gamma) and @a out_scale
+ * is a post-norm scalar. FP32 accumulation; width need not be a multiple of 8.
+ *
+ * @param[in] input FP16 activation rows
+ * @param[in] weight per-feature weight applied before the RMS denominator
+ * @param[in] out_scale post-norm scalar
+ * @param[out] result FP16 output rows
+ * @param[in] epsilon added to the mean square before the reciprocal square root
+ * @param[in] height number of rows
+ * @param[in] width row width
+ * @param[in] use_svm bind input/weight/result as SVM pointers
+ * @param[in] out_clmem when set, write the result into this device buffer
+ * @param[in] in_clmem when set, read the input from this device buffer
+ */
+void rms_reverse_norm_cl_fp16(const _FP16 *input, const _FP16 *weight,
+                              _FP16 out_scale, _FP16 *result,
+                              const float epsilon, unsigned int height,
+                              unsigned int width, bool use_svm = true,
+                              void *out_clmem = nullptr,
+                              void *in_clmem = nullptr);
+
+/**
+ * @brief Gather one per-layer slice of a packed per-layer input tensor:
+ *        out[r * fs + j] = in[r * in_width + off + j].
+ *
+ * @param[in] input packed per-layer input rows
+ * @param[out] result gathered slice
+ * @param[in] rows number of rows
+ * @param[in] fs slice width (the per-layer feature size)
+ * @param[in] in_width width of a packed input row
+ * @param[in] off column offset of this layer's slice
+ * @param[in] use_svm bind input/result as SVM pointers
+ * @param[in] out_clmem when set, write the result into this device buffer
+ * @param[in] in_clmem when set, read the input from this device buffer
+ */
+void per_layer_slice_cl_fp16(const _FP16 *input, _FP16 *result,
+                             unsigned int rows, unsigned int fs,
+                             unsigned int in_width, unsigned int off,
+                             bool use_svm, void *out_clmem = nullptr,
+                             void *in_clmem = nullptr);
+
+/**
+ * @brief Fused RMSNorm and residual add in one kernel:
+ *        out = rmsnorm(input) * gamma + residual.
+ *
+ * Removes the separate residual-add dispatch (and the idle between the two)
+ * at a sandwich-norm boundary. The arithmetic matches [rmsnorm_cl_fp16 then
+ * add]: the normed value rounds to FP16 before the residual add rounds again,
+ * exactly the two roundings the separate pair performs.
+ *
+ * @param[in] input FP16 activation rows
+ * @param[in] gamma per-feature scale
+ * @param[in] residual residual stream added after the norm
+ * @param[out] result FP16 output rows
+ * @param[in] epsilon added to the mean square before the reciprocal square root
+ * @param[in] height number of rows
+ * @param[in] width row width; must be a multiple of 8
+ * @param[in] use_svm bind the SVM pointers; required for this path
+ * @param[in] out_clmem when set, write the result into this device buffer
+ * @param[in] in_clmem when set, read the input from this device buffer
+ * @param[in] resid_clmem when set, read the residual from this device buffer
+ * @return false when the shape is unsupported, so the caller can fall back to
+ *         the separate norm and add
+ */
+bool rmsnorm_add_cl_fp16(const _FP16 *input, const _FP16 *gamma,
+                         const _FP16 *residual, _FP16 *result, float epsilon,
+                         unsigned int height, unsigned int width,
+                         bool use_svm = true, void *out_clmem = nullptr,
+                         void *in_clmem = nullptr, void *resid_clmem = nullptr);
 #endif
 
 /**
