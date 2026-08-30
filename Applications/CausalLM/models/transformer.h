@@ -77,16 +77,58 @@ enum class ModelType { MODEL, CAUSALLM, EMBEDDING, UNKNOWN };
 using multimodal_pointer = std::pair<void *, size_t>;
 
 /**
+ * @brief Whether the sliding-window KV ring may turn itself ON without an
+ *        explicit request.
+ * @details The ring is only correct where the attention kernels modulo-map the
+ * cache row, which today means the GPU attention paths. The host CPU attention
+ * fallback walks absolute rows, so a CPU run must keep the linear cache.
+ * NNTR_KV_WINDOW_RING=1 forces the ring on regardless (kernel bring-up).
+ */
+inline bool kvRingAutoEligible() {
+  const char *e = std::getenv("NNTR_ENGINE");
+  if (e != nullptr && std::string(e) == "cpu")
+    return false;
+  if (e != nullptr && std::string(e) == "cuda")
+    return true;
+#if defined(ENABLE_OPENCL)
+  return true; // no explicit engine + an OpenCL build == the gpu engine
+#else
+  return false;
+#endif
+}
+
+/**
+ * @brief Whether the KV ring is enabled for this process.
+ * @details NNTR_KV_WINDOW_RING: '0' disables, '1' forces on, unset means on
+ * wherever it is eligible (kvRingAutoEligible).
+ */
+inline bool kvRingEnabled() {
+  const char *g = std::getenv("NNTR_KV_WINDOW_RING");
+  if (g && g[0] == '0')
+    return false;
+  if (g && g[0] == '1')
+    return true;
+  return kvRingAutoEligible();
+}
+
+/**
  * @brief Effective prefill chunk size (0 = no chunking / single-block prefill).
  * @details An explicit NNTR_PREFILL_CHUNK always wins (user override, per-GPU
- * tuning). Otherwise chunking is off. Callers clamp the result to the
- * activation-plane height (INIT_SEQ_LEN).
+ * tuning). Otherwise, when the KV ring is enabled, chunking is what bounds a
+ * launch's live key span, so the ring picks the chunk: 4096 for every backend.
+ * The equal-thermal ring-on sweep is monotone in the chunk but with a poor
+ * marginal ratio past 4096 (the next step up buys under a percent of prefill
+ * for another GB of working set), and the CUDA tensor-core GEMMs want a large
+ * chunk anyway -- so one constant, no backend branch. Callers clamp the result
+ * to the activation-plane height (INIT_SEQ_LEN).
  */
 inline unsigned int effectivePrefillChunk() {
   const char *pc = std::getenv("NNTR_PREFILL_CHUNK");
   if (pc && pc[0])
-    return static_cast<unsigned int>(std::atoi(pc));
-  return 0u;
+    return static_cast<unsigned int>(std::atoi(pc)); // explicit override wins
+  if (!kvRingEnabled())
+    return 0u; // chunking is auto-enabled only by the ring
+  return 4096u;
 }
 
 /**
@@ -95,6 +137,11 @@ inline unsigned int effectivePrefillChunk() {
  * attends to the last W keys, so with chunked prefill -- which bounds one
  * launch's live key span to W+C -- its KV storage can be a ring of Wcap rows
  * instead of the full max_seq.
+ *
+ * The ring is the memory half of the sliding-window design contract: a
+ * W-bounded attention deserves W-bounded storage, and the rows past W are dead
+ * weight the mask can never read again. It is therefore ON wherever it is
+ * correct (see kvRingEnabled); NNTR_KV_WINDOW_RING=0 opts out.
  *
  * Returns Wcap (the physical row capacity to allocate and modulo-index) for a
  * sliding layer, or 0 meaning "no ring, keep full max_seq" (full-attention
@@ -109,9 +156,8 @@ inline unsigned int effectivePrefillChunk() {
  * Returning 0 keeps the exact pre-ring behaviour, so ring-off is bit-identical.
  */
 inline unsigned int kvRingCap(unsigned int local_window, unsigned int max_seq) {
-  const char *g = std::getenv("NNTR_KV_WINDOW_RING");
-  if (!(g && g[0] == '1'))
-    return 0; // ring disabled -> full max_seq (bit-identical default)
+  if (!kvRingEnabled())
+    return 0; // ring off -> full max_seq (bit-identical legacy)
   if (local_window == 0 || local_window >= max_seq)
     return 0; // full-attention layer -> no ring
   const unsigned int C = effectivePrefillChunk();
@@ -306,10 +352,21 @@ public:
    * every other layer keeps the full context window.
    */
   unsigned int getKVCacheRows(int layer_id) const {
-    const unsigned int cap = kvRingCap(getLayerSlidingWindow(layer_id),
-                                       static_cast<unsigned int>(MAX_SEQ_LEN));
+    const unsigned int cap =
+      kvRingSupported() ? kvRingCap(getLayerSlidingWindow(layer_id),
+                                    static_cast<unsigned int>(MAX_SEQ_LEN))
+                        : 0u;
     return cap ? cap : static_cast<unsigned int>(MAX_SEQ_LEN);
   }
+
+  /**
+   * @brief Whether this model's attention can read a ringed KV cache.
+   * @details The ring needs an attention path that modulo-maps the cache row.
+   * A model whose attention variant does not (the attention-sink variant reads
+   * the cache through the host compute path) must keep the linear cache;
+   * mha_core makes the same call for the same layers, so the two agree.
+   */
+  virtual bool kvRingSupported() const { return true; }
 
   /**
    * @brief Per-layer attention window: the value this model feeds mha_core's

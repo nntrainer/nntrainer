@@ -594,16 +594,34 @@ MHACoreLayer::~MHACoreLayer() {
 // Applications/CausalLM/models/transformer.h (the canonical single source of
 // truth); replicated here rather than pulling the heavy transformer.h into this
 // layer TU. Off (0) => bit-identical to the pre-ring path.
+static bool mha_kv_ring_enabled() {
+  const char *g = std::getenv("NNTR_KV_WINDOW_RING");
+  if (g && g[0] == '0')
+    return false;
+  if (g && g[0] == '1')
+    return true;
+  const char *e = std::getenv("NNTR_ENGINE");
+  if (e != nullptr && std::string(e) == "cpu")
+    return false;
+  if (e != nullptr && std::string(e) == "cuda")
+    return true;
+#if defined(ENABLE_OPENCL)
+  return true;
+#else
+  return false;
+#endif
+}
 static unsigned int mha_effective_chunk() {
   const char *pc = std::getenv("NNTR_PREFILL_CHUNK");
   if (pc && pc[0])
     return static_cast<unsigned int>(std::atoi(pc));
-  return 0u;
+  if (!mha_kv_ring_enabled())
+    return 0u;
+  return 4096u; // both backends -- see causallm::effectivePrefillChunk
 }
 static unsigned int mha_kv_ring_cap(unsigned int local_window,
                                     unsigned int max_seq) {
-  const char *g = std::getenv("NNTR_KV_WINDOW_RING");
-  if (!(g && g[0] == '1'))
+  if (!mha_kv_ring_enabled())
     return 0;
   if (local_window == 0 || local_window >= max_seq)
     return 0;
@@ -647,7 +665,8 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
    * is fp16 external-cache only for now; the int8 internal cache (allocated at
    * full max_seq below) is NOT ring-sized, so keep it linear. */
   kv_ring_cap =
-    (std::getenv("NNTR_KV_INT8") != nullptr)
+    (std::getenv("NNTR_KV_INT8") != nullptr || !use_external_cache ||
+     std::get<props::UseSink>(mha_core_props).get())
       ? 0u
       : mha_kv_ring_cap((unsigned int)local_window_size, max_timestep);
 
