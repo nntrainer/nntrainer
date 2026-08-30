@@ -1135,6 +1135,20 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   static const char *_rb_env = std::getenv("NNTR_RESUME_BLOCK");
   static const bool resume_block_on = !(_rb_env && _rb_env[0] == '0');
 
+  // [prefill-chunk] NNTR_PREFILL_CHUNK=C (>0) drives the prefill FORWARD in
+  // C-token chunks instead of one M-token block. Each chunk feeds its tokens at
+  // input row 0 and writes its KV at the absolute range [from, from+clen); the
+  // next chunk attends over the accumulated cache. For causal (and
+  // sliding-window) attention every query sees the identical causal prefix
+  // either way, so the result is bit-identical to the single block. This is the
+  // exact token-feed pattern the legacy resumed-prefill loop below already uses
+  // (tokens at input row 0, absolute KV position via `from`), generalized from
+  // one token per call to C. Default off (C=0) is the single-block path
+  // verbatim.
+  static const char *_pc_env = std::getenv("NNTR_PREFILL_CHUNK");
+  const unsigned int prefill_chunk =
+    (_pc_env && _pc_env[0]) ? static_cast<unsigned int>(std::atoi(_pc_env))
+                            : 0u;
   auto do_prefill = [&](unsigned int n_tok,
                         unsigned int from_pos) -> std::vector<float *> {
     // Legacy token-by-token resumed prefill (debug escape hatch) -- unchanged.
@@ -1154,9 +1168,27 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       }
       return out;
     }
-    // Single block: one forward over the whole prompt window.
-    return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
-                                from_pos + n_tok);
+    // Single block (default) when chunking is off or the prompt fits one chunk.
+    if (prefill_chunk == 0 || n_tok <= prefill_chunk)
+      return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
+                                  from_pos + n_tok);
+    // Chunked forward prefill.
+    std::vector<float *> out;
+    for (unsigned int o = 0; o < n_tok; o += prefill_chunk) {
+      const unsigned int clen = std::min(prefill_chunk, n_tok - o);
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+        for (unsigned int j = 0; j < clen; ++j)
+          input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =
+            static_cast<float>(init_input[o + j]);
+      const unsigned int cf = from_pos + o;
+      auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
+      if (o + clen < n_tok)
+        for (auto &oo : so)
+          releaseLogitsBuf(oo);
+      else
+        out = std::move(so);
+    }
+    return out;
   };
 
   if (SKIP_PREFILL && init_len > 1) {
