@@ -983,8 +983,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // constructModel, {1,1,1,INIT_SEQ_LEN}); resetInputDimension is disabled, so
   // ONE forward pass cannot process more than INIT_SEQ_LEN query rows without
   // overflowing the shared activation tensor (getSharedDataTensor bounds-check
-  // throw), so the prompt is capped by INIT_SEQ_LEN as well as by the KV
-  // budget below -- whichever is smaller.
+  // throw). Normally that caps the prompt to INIT_SEQ_LEN. With
+  // NNTR_PREFILL_CHUNK the prefill is fed FORWARD in chunks of <= INIT_SEQ_LEN
+  // rows -- each chunk fits the buffer -- so the prompt is bounded by the KV
+  // budget alone and the activation plane stays INIT_SEQ_LEN-sized however long
+  // the prompt is. That decoupling is the point of chunking: INIT_SEQ_LEN is
+  // the activation/chunk height (small), MAX_SEQ_LEN the KV capacity (large).
   //
   // NUM_TO_GENERATE <= 0 means "no explicit cap": generation runs until EOS or
   // until the window is full, so nothing has to be held back for it beyond the
@@ -996,7 +1000,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   const unsigned int kv_budget = MAX_SEQ_LEN > reserved_for_generation
                                    ? MAX_SEQ_LEN - reserved_for_generation
                                    : 0u;
-  unsigned int num_allow_str = std::min<unsigned int>(INIT_SEQ_LEN, kv_budget);
+  static const char *_pc_env0 = std::getenv("NNTR_PREFILL_CHUNK");
+  const bool _prefill_chunking =
+    _pc_env0 && _pc_env0[0] && std::atoi(_pc_env0) > 0;
+  unsigned int num_allow_str =
+    _prefill_chunking ? kv_budget
+                      : std::min<unsigned int>(INIT_SEQ_LEN, kv_budget);
   unsigned int text_len = _len;
 
   if (_len > num_allow_str) {
@@ -1009,12 +1018,14 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     std::fprintf(
       stderr,
       "[causallm] WARNING: prompt (%u tokens) exceeds the prefill window "
-      "(init_seq_len=%u, %s=%u); truncating %u "
-      "tail tokens. Raise init_seq_len to fit the prompt.\n",
+      "(init_seq_len=%u%s, %s=%u); truncating %u "
+      "tail tokens. Raise %s to fit the prompt.\n",
       _len, static_cast<unsigned int>(INIT_SEQ_LEN),
+      _prefill_chunking ? " (chunked: not the prompt limit)" : "",
       unlimited_generation ? "max_seq_len-1 (generating until EOS)"
                            : "max_seq_len-num_to_generate",
-      kv_budget, _len - num_allow_str);
+      kv_budget, _len - num_allow_str,
+      _prefill_chunking ? "max_seq_len" : "init_seq_len");
   }
 
   // feed only available length
@@ -1145,10 +1156,15 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // (tokens at input row 0, absolute KV position via `from`), generalized from
   // one token per call to C. Default off (C=0) is the single-block path
   // verbatim.
+  // Each chunk must fit the INIT_SEQ_LEN-height activation buffer, so the
+  // requested chunk is clamped to INIT_SEQ_LEN (a larger one would overflow
+  // it).
   static const char *_pc_env = std::getenv("NNTR_PREFILL_CHUNK");
   const unsigned int prefill_chunk =
-    (_pc_env && _pc_env[0]) ? static_cast<unsigned int>(std::atoi(_pc_env))
-                            : 0u;
+    (_pc_env && _pc_env[0])
+      ? std::min<unsigned int>(static_cast<unsigned int>(std::atoi(_pc_env)),
+                               INIT_SEQ_LEN)
+      : 0u;
   auto do_prefill = [&](unsigned int n_tok,
                         unsigned int from_pos) -> std::vector<float *> {
     // Legacy token-by-token resumed prefill (debug escape hatch) -- unchanged.
