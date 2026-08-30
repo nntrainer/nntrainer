@@ -269,7 +269,7 @@ void Gemma4Transformer::setupParameters(json &cfg, json &generation_cfg,
 std::pair<Tensor, Tensor>
 Gemma4Transformer::createGemma4KVCachePlaceholders(const int layer_id,
                                                    unsigned int kv_width) {
-  const unsigned int cache_rows = static_cast<unsigned int>(MAX_SEQ_LEN);
+  const unsigned int cache_rows = getKVCacheRows(layer_id);
 #ifdef ENABLE_FP16
   ml::train::TensorDim cache_dim(
     {BATCH_SIZE, 1, cache_rows, kv_width},

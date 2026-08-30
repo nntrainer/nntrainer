@@ -250,6 +250,19 @@ public:
   }
 
   /**
+   * @brief Per-layer physical KV-cache row count.
+   * @details The row counterpart of getKVCacheWidth(). Every KV sizing site --
+   * each model's placeholder factory and the KVCacheManager allocation -- must
+   * agree on how many rows a layer's cache has, and hard-coding MAX_SEQ_LEN in
+   * each of them made "how many rows" un-answerable from one place. Default is
+   * the full context window.
+   */
+  unsigned int getKVCacheRows(int layer_id) const {
+    (void)layer_id;
+    return static_cast<unsigned int>(MAX_SEQ_LEN);
+  }
+
+  /**
    * @brief Per-layer attention window: the value this model feeds mha_core's
    *        `sliding_window` property for the layer, or UINT_MAX for a
    *        full-attention layer.
