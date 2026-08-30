@@ -31,6 +31,20 @@
 #include <node_exporter.h>
 #include <thread_manager.h>
 
+// DebertaV2's all-FP16 attention kernels (nntrainer::compute_kcaches /
+// compute_fp16vcache_transposed / softmax_row[_inplace] with _FP16 I/O) are
+// implemented only for ARM-NEON. On x86 the cpu_backend ships only the
+// fp16-cache / fp32-out variants, and DebertaV2 (an encoder model) is not run
+// on x86. The _FP16 typedef from <fp16.h> above is already established, so
+// dropping ENABLE_FP16 here only compiles out the (ARM-only) FP16 code paths
+// and keeps the x86 build linking. Each FP16 runtime branch falls through to
+// its NYI throw.
+#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||            \
+     defined(_M_IX86)) &&                                                      \
+  defined(ENABLE_FP16)
+#undef ENABLE_FP16
+#endif
+
 namespace causallm {
 
 #define tile_size 4
@@ -469,6 +483,11 @@ void DebertaAttentionLayer::compute_kcaches(
     }
 
   } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    // The all-FP16 attention kernels (nntrainer::compute_kcaches /
+    // compute_fp16vcache_transposed) are ARM-NEON only; x86 only ships the
+    // fp16-cache / fp32-out variants. DebertaV2 (an encoder model) is not run
+    // on x86, so keep this path ARM-only rather than dragging in x86 fp16
+    // attention kernels.
 #ifdef ENABLE_FP16
     if (sequence_len == 1) {
       const int num_rows = from + sequence_len;
@@ -502,7 +521,9 @@ void DebertaAttentionLayer::compute_kcaches(
       }
     }
 #else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+    NNTR_THROW_IF(true, std::invalid_argument)
+      << "DebertaAttentionLayer: FP16 attention requires ENABLE_FP16 on a "
+         "non-x86 (ARM) target";
 #endif
   }
 }
@@ -628,6 +649,7 @@ void DebertaAttentionLayer::compute_fp16vcache_transposed(
     }
 
   } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    // ARM-only all-FP16 V-cache kernel (see compute_kcaches note above).
 #ifdef ENABLE_FP16
     if ((to - from) != 1) {
       const int seq = to - from;
@@ -661,7 +683,9 @@ void DebertaAttentionLayer::compute_fp16vcache_transposed(
         });
     }
 #else
-    NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
+    NNTR_THROW_IF(true, std::invalid_argument)
+      << "DebertaAttentionLayer: FP16 attention requires ENABLE_FP16 on a "
+         "non-x86 (ARM) target";
 #endif
   }
 }
