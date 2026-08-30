@@ -35,6 +35,7 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <algorithm> // std::min (prefillChunk clamp)
 #include <context.h> // nntrainer::ModelFeatures (T11)
 #include <future>    // async tokenizer load (round-13 init overlap)
 #include <layer.h>
@@ -112,17 +113,22 @@ inline bool kvRingEnabled() {
 }
 
 /**
- * @brief Effective prefill chunk size (0 = no chunking / single-block prefill).
+ * @brief Requested prefill chunk size (0 = no chunking / single-block prefill).
  * @details An explicit NNTR_PREFILL_CHUNK always wins (user override, per-GPU
  * tuning). Otherwise, when the KV ring is enabled, chunking is what bounds a
  * launch's live key span, so the ring picks the chunk: 4096 for every backend.
  * The equal-thermal ring-on sweep is monotone in the chunk but with a poor
  * marginal ratio past 4096 (the next step up buys under a percent of prefill
  * for another GB of working set), and the CUDA tensor-core GEMMs want a large
- * chunk anyway -- so one constant, no backend branch. Callers clamp the result
- * to the activation-plane height (INIT_SEQ_LEN).
+ * chunk anyway -- so one constant, no backend branch.
+ *
+ * This is the REQUEST, not what the prefill actually runs: a chunk cannot
+ * exceed the activation-plane height it has to fit in, so the number every
+ * consumer must use is Transformer::prefillChunk(), which clamps this to
+ * INIT_SEQ_LEN. Use that accessor, not this function, anywhere the answer
+ * feeds sizing or control flow.
  */
-inline unsigned int effectivePrefillChunk() {
+inline unsigned int requestedPrefillChunk() {
   const char *pc = std::getenv("NNTR_PREFILL_CHUNK");
   if (pc && pc[0])
     return static_cast<unsigned int>(std::atoi(pc)); // explicit override wins
@@ -160,7 +166,7 @@ inline unsigned int kvRingCap(unsigned int local_window, unsigned int max_seq) {
     return 0; // ring off -> full max_seq (bit-identical legacy)
   if (local_window == 0 || local_window >= max_seq)
     return 0; // full-attention layer -> no ring
-  const unsigned int C = effectivePrefillChunk();
+  const unsigned int C = requestedPrefillChunk();
   if (C == 0)
     return 0; // the ring requires chunked prefill to bound the live span
   // multiple of C, >= W + C (headroom so the window never wraps onto itself).
@@ -339,6 +345,33 @@ public:
     (void)layer_id;
     return static_cast<unsigned int>(NUM_KEY_VALUE_HEADS) *
            static_cast<unsigned int>(HEAD_DIM);
+  }
+
+  /**
+   * @brief The prefill chunk this model actually runs, in query rows
+   *        (0 = no chunking / single-block prefill).
+   * @details requestedPrefillChunk() is only the request; one chunk is fed at
+   * input row 0 of the activation plane, which is built INIT_SEQ_LEN rows tall
+   * (transformer.cpp constructModel), so a larger chunk would overflow it. The
+   * clamp therefore belongs to the model, which is the only thing that knows
+   * its plane -- and every consumer must read the SAME clamped number:
+   *
+   *   - the prompt budget (a chunked prefill is bounded by the KV budget, an
+   *     unchunked one by the plane),
+   *   - the prefill drive loop (chunk length per forward),
+   *   - the KV ring capacity (Wcap is a multiple of the chunk).
+   *
+   * They used to disagree: the drive loop and the budget gate keyed off the
+   * NNTR_PREFILL_CHUNK env var being SET, so the ring's auto-chunk turned on
+   * the ring but not the chunking, and a long prompt was silently truncated to
+   * INIT_SEQ_LEN; the ring cap meanwhile used the unclamped request and
+   * over-allocated. One accessor, one answer.
+   */
+  unsigned int prefillChunk() const {
+    const unsigned int c = requestedPrefillChunk();
+    return c ? std::min<unsigned int>(c,
+                                      static_cast<unsigned int>(INIT_SEQ_LEN))
+             : 0u;
   }
 
   /**

@@ -992,12 +992,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // constructModel, {1,1,1,INIT_SEQ_LEN}); resetInputDimension is disabled, so
   // ONE forward pass cannot process more than INIT_SEQ_LEN query rows without
   // overflowing the shared activation tensor (getSharedDataTensor bounds-check
-  // throw). Normally that caps the prompt to INIT_SEQ_LEN. With
-  // NNTR_PREFILL_CHUNK the prefill is fed FORWARD in chunks of <= INIT_SEQ_LEN
-  // rows -- each chunk fits the buffer -- so the prompt is bounded by the KV
-  // budget alone and the activation plane stays INIT_SEQ_LEN-sized however long
-  // the prompt is. That decoupling is the point of chunking: INIT_SEQ_LEN is
-  // the activation/chunk height (small), MAX_SEQ_LEN the KV capacity (large).
+  // throw). Normally that caps the prompt to INIT_SEQ_LEN. With chunking
+  // (prefillChunk() > 0) the prefill is fed FORWARD in chunks of <=
+  // INIT_SEQ_LEN rows -- each chunk fits the buffer -- so the prompt is bounded
+  // by the KV budget alone and the activation plane stays INIT_SEQ_LEN-sized
+  // however long the prompt is. That decoupling is the point of chunking:
+  // INIT_SEQ_LEN is the activation/chunk height (small), MAX_SEQ_LEN the KV
+  // capacity (large).
   //
   // NUM_TO_GENERATE <= 0 means "no explicit cap": generation runs until EOS or
   // until the window is full, so nothing has to be held back for it beyond the
@@ -1009,9 +1010,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   const unsigned int kv_budget = MAX_SEQ_LEN > reserved_for_generation
                                    ? MAX_SEQ_LEN - reserved_for_generation
                                    : 0u;
-  static const char *_pc_env0 = std::getenv("NNTR_PREFILL_CHUNK");
-  const bool _prefill_chunking =
-    _pc_env0 && _pc_env0[0] && std::atoi(_pc_env0) > 0;
+  // Whether the prefill is chunked is a property of the model, not of the
+  // environment: the ring turns chunking on by default (prefillChunk() > 0)
+  // with no env var set. Keying this off getenv("NNTR_PREFILL_CHUNK") meant
+  // the default-on chunking never opened the budget, so a 29K-token prompt was
+  // cut to INIT_SEQ_LEN even though the prefill could have fed it in chunks.
+  const bool _prefill_chunking = prefillChunk() > 0;
   unsigned int num_allow_str =
     _prefill_chunking ? kv_budget
                       : std::min<unsigned int>(INIT_SEQ_LEN, kv_budget);
@@ -1155,7 +1159,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   static const char *_rb_env = std::getenv("NNTR_RESUME_BLOCK");
   static const bool resume_block_on = !(_rb_env && _rb_env[0] == '0');
 
-  // [prefill-chunk] NNTR_PREFILL_CHUNK=C (>0) drives the prefill FORWARD in
+  // [prefill-chunk] A chunk C (>0) drives the prefill FORWARD in
   // C-token chunks instead of one M-token block. Each chunk feeds its tokens at
   // input row 0 and writes its KV at the absolute range [from, from+clen); the
   // next chunk attends over the accumulated cache. For causal (and
@@ -1163,17 +1167,13 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // either way, so the result is bit-identical to the single block. This is the
   // exact token-feed pattern the legacy resumed-prefill loop below already uses
   // (tokens at input row 0, absolute KV position via `from`), generalized from
-  // one token per call to C. Default off (C=0) is the single-block path
-  // verbatim.
-  // Each chunk must fit the INIT_SEQ_LEN-height activation buffer, so the
-  // requested chunk is clamped to INIT_SEQ_LEN (a larger one would overflow
-  // it).
-  static const char *_pc_env = std::getenv("NNTR_PREFILL_CHUNK");
-  const unsigned int prefill_chunk =
-    (_pc_env && _pc_env[0])
-      ? std::min<unsigned int>(static_cast<unsigned int>(std::atoi(_pc_env)),
-                               INIT_SEQ_LEN)
-      : 0u;
+  // one token per call to C. C=0 (no ring, no override) is the single-block
+  // path verbatim.
+  // prefillChunk() is the one clamped answer -- the same number the prompt
+  // budget above and the KV ring capacity are computed from, so a chunk always
+  // fits the INIT_SEQ_LEN-height activation buffer and never straddles the
+  // ring's wrap seam.
+  const unsigned int prefill_chunk = prefillChunk();
   auto do_prefill = [&](unsigned int n_tok,
                         unsigned int from_pos) -> std::vector<float *> {
     // Legacy token-by-token resumed prefill (debug escape hatch) -- unchanged.
