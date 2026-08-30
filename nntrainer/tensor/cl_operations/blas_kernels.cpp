@@ -3274,4 +3274,18 @@ void v8c_collect_lazy_program_tasks(ClContext &cc,
   });
 }
 
+void cl_queue_finish() {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc)
+    clFinish(blas_cc->command_queue_inst_.GetCommandQueue());
+}
+
+void cl_svm_unmap_force(void *ptr) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc && ptr)
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(ptr);
+}
+
 } // namespace nntrainer
