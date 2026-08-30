@@ -584,7 +584,9 @@ flash_attention_prefill_f16_blockq(
   __global half *O,       // [M, HD_Q]
   const int M, const int N_kv, const int d, const int HD_Q, const int HD_KV,
   const int gqa, const int is_causal, const float scale, const int k_stride,
-  const float softcap, const int local_window) {
+  const float softcap, const int local_window,
+  // [kv-window-ring] >0: K/V physical row = n % ring_cap
+  const int ring_cap) {
   const int lid = get_local_id(0);
   const int grp = get_group_id(0); // -> (head_q, row-tile)
   const int n_row_tiles = (M + FBQ_TM - 1) / FBQ_TM;
@@ -655,13 +657,15 @@ flash_attention_prefill_f16_blockq(
   // called uniformly across lanes (m0/n/M are WG-uniform, r is the loop var),
   // so the per-row causal `continue` does not break subgroup uniformity.
   for (int n = n_lo; n <= n_last; ++n) {
-    const long k_base = k_head_base + (long)n * k_row_stride;
+    // [kv-window-ring] physical cache row = n % ring_cap (ring_cap<=0: linear).
+    const long pn = (ring_cap > 0) ? (long)(n % ring_cap) : (long)n;
+    const long k_base = k_head_base + pn * k_row_stride;
     const FVFLOAT k_reg = FV_CVT_F(FV_VLOAD(K, (k_base + lane0) / VPL));
     float sdot[FBQ_TM];
 #pragma unroll
     for (int r = 0; r < FBQ_TM; ++r)
       sdot[r] = sub_group_reduce_add(fv_hsum(q_reg[r] * k_reg));
-    const long v_base = (long)n * HD_KV + (long)head_kv * d;
+    const long v_base = pn * HD_KV + (long)head_kv * d;
     const FVFLOAT v_reg = FV_CVT_F(FV_VLOAD(V, (v_base + lane0) / VPL));
 #pragma unroll
     for (int r = 0; r < FBQ_TM; ++r) {
@@ -694,7 +698,10 @@ flash_attention_prefill_f16_blockq(
 
     // (1) Load K[n] ONCE per key; partial d-dot for ALL TM rows -> red_sh.
     for (int j = 0; j < nb; ++j) {
-      const long k_base = k_head_base + (long)(n0 + j) * k_row_stride;
+      // [kv-window-ring] physical cache row = n % ring_cap.
+      const long pnj =
+          (ring_cap > 0) ? (long)((n0 + j) % ring_cap) : (long)(n0 + j);
+      const long k_base = k_head_base + pnj * k_row_stride;
       const FVFLOAT k_reg = FV_CVT_F(FV_VLOAD(K, (k_base + lane0) / VPL));
 #pragma unroll
       for (int r = 0; r < FBQ_TM; ++r)
@@ -715,7 +722,8 @@ flash_attention_prefill_f16_blockq(
     // (3) Online-softmax. V[n] loaded ONCE per key, applied to all TM rows.
     for (int j = 0; j < nb; ++j) {
       const int n = n0 + j;
-      const long v_base = (long)n * HD_KV + (long)head_kv * d;
+      const long pn = (ring_cap > 0) ? (long)(n % ring_cap) : (long)n;
+      const long v_base = pn * HD_KV + (long)head_kv * d;
       const FVFLOAT v_reg = FV_CVT_F(FV_VLOAD(V, (v_base + lane0) / VPL));
 #pragma unroll
       for (int r = 0; r < FBQ_TM; ++r) {
@@ -777,7 +785,9 @@ __kernel void flash_decode_partial(
   __global float *part_ml,  // [H_q][n_chunks][2] fp32 (m, l)
   const int N_kv, const int d, const int HD_Q, const int HD_KV, const int gqa,
   const float scale, const int k_stride, const int local_window,
-  const int chunk_kv, const int n_chunks) {
+  const int chunk_kv, const int n_chunks,
+  // [kv-window-ring] >0: physical row = n % ring_cap
+  const int ring_cap) {
   const int lid = get_local_id(0);
   const int grp = get_group_id(0); // -> (head_q, chunk)
   const int head_q = grp / n_chunks;
@@ -809,7 +819,9 @@ __kernel void flash_decode_partial(
   for (int nb0 = n0; nb0 < n1; nb0 += FLASH_VEC_BLOCK_KV) {
     const int nb = min(FLASH_VEC_BLOCK_KV, n1 - nb0);
     for (int j = 0; j < nb; ++j) {
-      const long k_base = k_head_base + (long)(nb0 + j) * k_row_stride;
+      const long pnj =
+          (ring_cap > 0) ? (long)((nb0 + j) % ring_cap) : (long)(nb0 + j);
+      const long k_base = k_head_base + pnj * k_row_stride;
       const FVFLOAT k_reg = FV_CVT_F(FV_VLOAD(K, (k_base + lane0) / VPL));
       red_sh[j * FLASH_VEC_LWS + lid] = fv_hsum(q_reg * k_reg);
     }
@@ -826,7 +838,9 @@ __kernel void flash_decode_partial(
       const float m_new = fmax(m_i, s);
       const float alpha = exp(m_i - m_new);
       const float p = exp(s - m_new);
-      const long v_base = (long)(nb0 + j) * HD_KV + (long)head_kv * d;
+      const long pnj2 =
+          (ring_cap > 0) ? (long)((nb0 + j) % ring_cap) : (long)(nb0 + j);
+      const long v_base = pnj2 * HD_KV + (long)head_kv * d;
       const FVFLOAT v_reg = FV_CVT_F(FV_VLOAD(V, (v_base + lane0) / VPL));
       acc_reg = alpha * acc_reg + p * v_reg;
       l_i = alpha * l_i + p;

@@ -589,6 +589,31 @@ MHACoreLayer::~MHACoreLayer() {
 
 /************************************************************** */
 
+// [kv-window-ring] Wcap (physical ring rows) for a sliding-window layer, or 0
+// meaning "no ring, keep full max_seq". MUST match causallm::kvRingCap in
+// Applications/CausalLM/models/transformer.h (the canonical single source of
+// truth); replicated here rather than pulling the heavy transformer.h into this
+// layer TU. Off (0) => bit-identical to the pre-ring path.
+static unsigned int mha_effective_chunk() {
+  const char *pc = std::getenv("NNTR_PREFILL_CHUNK");
+  if (pc && pc[0])
+    return static_cast<unsigned int>(std::atoi(pc));
+  return 0u;
+}
+static unsigned int mha_kv_ring_cap(unsigned int local_window,
+                                    unsigned int max_seq) {
+  const char *g = std::getenv("NNTR_KV_WINDOW_RING");
+  if (!(g && g[0] == '1'))
+    return 0;
+  if (local_window == 0 || local_window >= max_seq)
+    return 0;
+  const unsigned int C = mha_effective_chunk();
+  if (C == 0)
+    return 0;
+  const unsigned int cap = (local_window / C + 2u) * C;
+  return (cap < max_seq) ? cap : 0u;
+}
+
 void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   NNTR_THROW_IF(context.getNumInputs() < 3 || context.getNumInputs() > 5,
@@ -617,6 +642,14 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
 
   /** local window size */
   local_window_size = std::get<props::SlidingWindow>(mha_core_props).get();
+
+  /** [kv-window-ring] physical ring capacity for this (sliding) layer. The ring
+   * is fp16 external-cache only for now; the int8 internal cache (allocated at
+   * full max_seq below) is NOT ring-sized, so keep it linear. */
+  kv_ring_cap =
+    (std::getenv("NNTR_KV_INT8") != nullptr)
+      ? 0u
+      : mha_kv_ring_cap((unsigned int)local_window_size, max_timestep);
 
   /** attention scaling computation */
   rope_scaling_type = std::get<props::RopeScalingType>(mha_core_props).get();
@@ -1475,16 +1508,32 @@ void MHACoreLayer::one_batch_incremental_forwarding(
    *  |<-------------b_cached_key--------------->|
    */
 
+  // [kv-window-ring] Fail loud if a step write would straddle the ring seam.
+  // Wcap is a multiple of the prefill chunk C and cache_index is C-aligned
+  // (chunked prefill) or step==1 (decode), so cacheRow(cache_index)+step <=
+  // Wcap by construction. A violation means a misconfigured chunk -- throw
+  // rather than silently corrupt the neighbouring pool region (SVM writes do
+  // not bounds-check). Covers every cache-row write below (same cache_index).
+  if (kv_ring_cap &&
+      cacheRow(cache_index) + (size_t)cache_key_step_dim.height() >
+        (size_t)kv_ring_cap) {
+    throw std::runtime_error(
+      "mha_core kv-window-ring: step write straddles the ring seam "
+      "(NNTR_PREFILL_CHUNK must divide the window ring capacity; keep the "
+      "chunk a power-of-two <= the sliding window)");
+  }
+
   // Load Input Tensors of this batch : b_ denotes a Tensor for this batch
   nntrainer::Tensor b_cache_key_step = cache_key.getSharedDataTensor(
     cache_key_step_dim,
-    batch * cache_key_dim.getFeatureLen() + cache_index * cache_key_dim.width(),
+    batch * cache_key_dim.getFeatureLen() +
+      cacheRow(cache_index) * cache_key_dim.width(),
     true);
-  nntrainer::Tensor b_cache_value_step =
-    cache_value.getSharedDataTensor(cache_value_step_dim,
-                                    batch * cache_value_dim.getFeatureLen() +
-                                      cache_index * cache_value_dim.width(),
-                                    true);
+  nntrainer::Tensor b_cache_value_step = cache_value.getSharedDataTensor(
+    cache_value_step_dim,
+    batch * cache_value_dim.getFeatureLen() +
+      cacheRow(cache_index) * cache_value_dim.width(),
+    true);
 
   // Static GPU_CLMEM residency: the wq/wk/wv FC outputs and the attention
   // output may live in planner cl_mem sub-buffers (class GPU_CLMEM). The GPU
@@ -1648,8 +1697,9 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     const size_t scale_step_width =
       static_cast<size_t>(num_heads_KV); // per-token scale row width
     const size_t scale_batch_offset = batch * scale_feature_len;
+    // [kv-window-ring] scale row ring-indexed in lockstep with the int8 cache.
     const size_t scale_step_offset =
-      scale_batch_offset + (size_t)cache_index * scale_step_width;
+      scale_batch_offset + cacheRow(cache_index) * scale_step_width;
 
     const uint16_t *key_src =
       reinterpret_cast<const uint16_t *>(key_step.getData<_FP16>());
@@ -2464,8 +2514,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   ml::train::TensorDim cached_key_dim = cache_key_dim;
   ml::train::TensorDim cached_value_dim = cache_value_dim;
-  cached_key_dim.height(cache_to);
-  cached_value_dim.height(cache_to);
+  // [kv-window-ring] The cache buffer is only kv_ring_cap rows, so the read
+  // VIEW must fit it. The GPU flash kernel walks the LOGICAL range (N_kv =
+  // cache_to, passed separately) and modulo-maps to the physical ring, so a
+  // Wcap-high view is sufficient. (Ring off: full cache_to, unchanged.)
+  const unsigned int read_rows =
+    kv_ring_cap ? std::min<unsigned int>(cache_to, kv_ring_cap) : cache_to;
+  cached_key_dim.height(read_rows);
+  cached_value_dim.height(read_rows);
 
   // §3.8 Phase 2: OHWI-direct GPU prefill. When both NNTR_KV_OHWI=1 and
   // NNTR_MHA_GPU=1 are set, the K cache is already laid out as
@@ -2941,13 +2997,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             ok = nntrainer::flash_decode_f16_cl(
               Q_p, K_p, V_p, O_p, cache_to, num_heads_Q, num_heads_KV, head_dim,
               /*max_seq_len=*/0u, /*svm_inputs=*/true, attn_logit_softcapping,
-              /*local_window=*/win);
+              /*local_window=*/win, /*ring_cap=*/kv_ring_cap);
           if (!ok)
             ok = nntrainer::flash_attention_prefill_f16_cl(
               Q_p, K_p, V_p, O_p, step_size, cache_to, num_heads_Q,
               num_heads_KV, head_dim, /*max_seq_len=*/0u, is_causal,
-              /*svm_inputs=*/true, attn_logit_softcapping,
-              /*local_window=*/win);
+              /*svm_inputs=*/true, attn_logit_softcapping, /*local_window=*/win,
+              /*ring_cap=*/kv_ring_cap);
         }
         // image2d_from_buffer variant gated by NNTR_MHA_GPU_IMG=1. Uses 8-half
         // texel loads (RGBA UINT32) for the d-axis reduction, ~8x fewer
@@ -3933,8 +3989,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   ml::train::TensorDim cached_key_dim = cache_key_dim;
   ml::train::TensorDim cached_value_dim = cache_value_dim;
-  cached_key_dim.height(to);
-  cached_value_dim.height(to);
+  // [kv-window-ring] cap the host-path read view to the physical ring buffer.
+  // This CPU compute_kcaches fallback is not itself ring-indexed, so it is only
+  // correct for the GPU flash path; the cap keeps it from over-reading the Wcap
+  // buffer.
+  const unsigned int read_rows_host =
+    kv_ring_cap ? std::min<unsigned int>(to, kv_ring_cap) : to;
+  cached_key_dim.height(read_rows_host);
+  cached_value_dim.height(read_rows_host);
 
   nntrainer::Tensor b_cached_key = cache_key.getSharedDataTensor(
     cached_key_dim, batch * cache_key_dim.getFeatureLen(), true);
