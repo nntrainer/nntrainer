@@ -254,6 +254,9 @@ std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
   // OpenCL SVM allocation is both host-addressable and device-visible. See
   // MemAllocator::isSVM() for why this is not a generic unified-memory test.
   mem_data->setSVM(allocator_->isSVM());
+  // Same rule for host addressability: a device-only plane (cudaMalloc) must be
+  // staged, never dereferenced, and the allocator is the only thing that knows.
+  mem_data->setHostAddressable(allocator_->isHostAddressable());
   return mem_data;
 }
 
