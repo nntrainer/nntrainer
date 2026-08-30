@@ -73,15 +73,25 @@ __global__ void rope_fp16(const unsigned short *in, unsigned short *out,
 // at the live cache slot computed on-device (out is then the cache BASE pointer,
 // not a host pre-offset slice). out_slot_dpos==0 keeps the row-relative output
 // (Q, in-place). Math identical to rope_fp16.
+// [kv-window-ring] ring_cap > 0 maps the slot-mode OUTPUT row to its physical
+// ring row ((from+row) % ring_cap): a sliding layer's cache only has ring_cap
+// physical rows, so the absolute row is outside it. The RoPE LUT index stays
+// ABSOLUTE (from+row) -- only physical storage wraps, positions do not.
 __global__ void rope_fp16_dpos(const unsigned short *in, unsigned short *out,
                                const unsigned short *cos_lut,
                                const unsigned short *sin_lut, int num_heads,
                                int head_dim, int half, const int *d_pos,
-                               int out_slot_dpos) {
+                               int out_slot_dpos, int ring_cap) {
   int from = d_pos[0];
   int row = blockIdx.x, head = blockIdx.y;
   long HD = (long)num_heads * head_dim;
-  long out_row = (long)(out_slot_dpos ? from : 0) + row;
+  long out_row;
+  if (out_slot_dpos) {
+    long abs_row = (long)from + row;
+    out_row = (ring_cap > 0) ? (abs_row % ring_cap) : abs_row;
+  } else {
+    out_row = (long)row;
+  }
   const unsigned short *xr = in + (long)row * HD + (long)head * head_dim;
   unsigned short *yr = out + out_row * HD + (long)head * head_dim;
   const unsigned short *cosr = cos_lut + (long)(from + row) * half;
@@ -130,7 +140,8 @@ bool cuda_rope_fp16(const unsigned short *in, unsigned short *out,
 bool cuda_rope_fp16_dpos(const unsigned short *in, unsigned short *out,
                          const unsigned short *cos_lut,
                          const unsigned short *sin_lut, int num_heads,
-                         int head_dim, int num_rows, int out_slot_dpos) {
+                         int head_dim, int num_rows, int out_slot_dpos,
+                         int ring_cap) {
   if (num_heads == 0 || head_dim == 0 || num_rows == 0)
     return true;
   const int half = head_dim / 2;
@@ -150,6 +161,8 @@ bool cuda_rope_fp16_dpos(const unsigned short *in, unsigned short *out,
   kernel->SetKernelArguments(6, &half, sizeof(half));
   kernel->SetKernelArguments(7, &d_pos, sizeof(d_pos));
   kernel->SetKernelArguments(8, &out_slot_dpos, sizeof(out_slot_dpos));
+  kernel->SetKernelArguments(9, &ring_cap,
+                             sizeof(ring_cap)); // [kv-window-ring]
   const int block[3] = {half < 256 ? half : 256, 1, 1};
   const int grid[3] = {num_rows, num_heads, 1};
   if (!StreamManager::Global().DispatchCommand(*kernel, grid, block))

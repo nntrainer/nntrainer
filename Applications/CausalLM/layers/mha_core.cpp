@@ -2331,7 +2331,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                   (size_t)batch * cache_key_dim.getFeatureLen();
                 k_rope_gpu = nntrainer::cuda::cuda_rope_fp16_dpos(
                   kin, kbase, cosd, sind, key_step.width() / head_dim, head_dim,
-                  (int)knrows, /*out_slot_dpos=*/1);
+                  (int)knrows, /*out_slot_dpos=*/1,
+                  /*ring_cap=*/(int)kv_ring_cap);
               } else if (cosd && sind) {
                 k_rope_gpu = nntrainer::cuda::cuda_rope_fp16(
                   kin, kout, cosd, sind, key_step.width() / head_dim, head_dim,
@@ -2405,7 +2406,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 (size_t)batch * cache_value_dim.getFeatureLen();
               if (nntrainer::cuda::cuda_scalar_mul_fp16_slot(
                     vin, vbase, (unsigned int)value_step.size(), 1.0f,
-                    (int)cache_value_dim.width()))
+                    (int)cache_value_dim.width(),
+                    /*ring_cap=*/(int)kv_ring_cap))
                 v_copy_gpu = true;
             } else if (nntrainer::cuda::cuda_scalar_mul_fp16(
                          vin, vout, (unsigned int)value_step.size(), 1.0f)) {

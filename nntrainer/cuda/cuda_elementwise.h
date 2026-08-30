@@ -43,7 +43,7 @@ bool cuda_scalar_mul_fp16(const unsigned short *in, unsigned short *out,
  */
 bool cuda_scalar_mul_fp16_slot(const unsigned short *in,
                                unsigned short *out_base, unsigned int n,
-                               float scalar, int width);
+                               float scalar, int width, int ring_cap = 0);
 
 /** @brief out[i] = cap * tanh(in[i] / cap) -- final logit softcapping */
 bool cuda_softcap_fp16(const unsigned short *in, unsigned short *out,
