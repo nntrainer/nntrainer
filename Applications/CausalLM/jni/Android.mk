@@ -14,7 +14,7 @@ endif
 
 # Common Includes Definition
 #
-# The last entry is TEMPORARY and app-local: four layer TUs here
+# The cl_operations entry is TEMPORARY and app-local: four layer TUs here
 # (mha_core, reshaped_rms_norm, rms_norm_gpu, per_layer_slice_gpu) still include
 # the raw OpenCL kernel wrappers <blas_kernels.h> / <attention_kernels.h>
 # instead of going through the ComputeOps table. Those two headers are private
@@ -23,6 +23,12 @@ endif
 # include export. Delete that entry together with the last raw
 # nntrainer::*_cl(...) call site under ../layers; it exists to keep the bypass
 # visible and app-local, never to make it ABI.
+#
+# The layers/llm entry serves the same purpose for <layer_prof.h>, the
+# header-only NNTR_LAYER_PROFILE instrumentation. It is intentionally kept out
+# of nntrainer_headers (it is a development aid, not -devel surface, and
+# installing it would require matching packaging/nntrainer.spec and
+# debian/*.install entries), so the ndk build resolves it from the source tree.
 CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/.. \
     $(LOCAL_PATH)/../layers \
@@ -46,6 +52,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../third_party \
     $(NNTRAINER_ROOT)/nntrainer/utils \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
+    $(NNTRAINER_ROOT)/nntrainer/layers/llm \
 
 # Common compile flags. -std=c++17/-fexceptions/-frtti come from Application.mk
 # (APP_CPPFLAGS); -march and the FP16 ABI defines are inherited from the
@@ -276,6 +283,7 @@ LOCAL_C_INCLUDES += \
     $(LOCAL_PATH)/../models/lfm2 \
     $(NNTRAINER_ROOT)/nntrainer/utils \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
+    $(NNTRAINER_ROOT)/nntrainer/layers/llm \
 
 include $(BUILD_EXECUTABLE)
 
