@@ -1396,13 +1396,13 @@ bool clmem_raise_cl(const Tensor &t, unsigned int valid_bytes) {
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   if (!cc)
     throw std::runtime_error("clmem_raise_cl: no GPU context");
-  // Non-blocking upload: the in-order queue orders it before every later
-  // consumer, and the host source is not written again until the next forward.
-  if (clEnqueueWriteBuffer(cc->command_queue_inst_.GetCommandQueue(),
-                           static_cast<cl_mem>(sub), CL_FALSE, 0, bytes,
-                           t.getData<uint8_t>(), 0, nullptr,
-                           nullptr) != CL_SUCCESS)
-    throw std::runtime_error("clmem_raise_cl: clEnqueueWriteBuffer failed");
+  // Asynchronous upload: the queue is in-order, so it is already sequenced
+  // ahead of every later kernel, and the host source is not written again
+  // until the next forward pass.
+  if (!cc->command_queue_inst_.EnqueueWriteBuffer(
+        static_cast<cl_mem>(sub), bytes, t.getData<uint8_t>(), /*async=*/true))
+    throw std::runtime_error("clmem_raise_cl: buffer upload failed for " +
+                             t.getName());
   return true;
 }
 
@@ -1422,17 +1422,13 @@ bool clmem_lower_cl(const Tensor &t, unsigned int valid_bytes) {
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   if (!cc)
     throw std::runtime_error("clmem_lower_cl: no GPU context");
-  // BLOCKING read on the in-order queue: it waits for every prior command and
-  // then lands the bytes in host memory, which is what the host consumer that
-  // runs next expects to find there.
-  const cl_int rb_err = clEnqueueReadBuffer(
-    cc->command_queue_inst_.GetCommandQueue(), static_cast<cl_mem>(sub),
-    CL_TRUE, 0, bytes, t.getData<uint8_t>(), 0, nullptr, nullptr);
-  if (rb_err != CL_SUCCESS)
-    throw std::runtime_error("clmem_lower_cl: clEnqueueReadBuffer failed err=" +
-                             std::to_string(rb_err) + " bytes=" +
-                             std::to_string(bytes) + " name=" + t.getName());
+  // Blocking read on the in-order queue: it waits for every command already
+  // enqueued and then lands the bytes in host memory, which is what the host
+  // consumer that runs next expects to find there.
+  if (!cc->command_queue_inst_.EnqueueReadBuffer(
+        static_cast<cl_mem>(sub), bytes, t.getData<uint8_t>(), /*async=*/false))
+    throw std::runtime_error("clmem_lower_cl: buffer read-back failed for " +
+                             t.getName());
   return true;
 }
-
 } // namespace nntrainer
