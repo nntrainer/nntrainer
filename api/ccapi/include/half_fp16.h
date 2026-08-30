@@ -464,12 +464,26 @@ public:
   static constexpr bool traps = false;
   static constexpr bool tinyness_before = false;
 
-  /** @brief smallest positive normal value, 2^-14 */
-  static constexpr nntrainer::Half min() noexcept {
+  /**
+   * @brief smallest positive normal value, 2^-14
+   * @note  The parentheses around the name are load-bearing, here and on max()
+   *        below. <windows.h> defines min and max as function-like macros
+   *        unless NOMINMAX is set, and translation units in this tree include
+   *        it before this header. A bare `min()` is then a macro invocation
+   *        with the wrong argument count, which MSVC expands into the macro's
+   *        ternary instead of rejecting: the build fails on this line with
+   *        "syntax error: ')'" and "unexpected token(s) preceding ':'", and
+   *        every namespace parsed afterwards in that translation unit is
+   *        wrong. Wrapping the name leaves the next token as ')' rather than
+   *        '(', so no expansion is attempted. The MSVC standard library writes
+   *        its own numeric_limits members exactly this way, for exactly this
+   *        reason.
+   */
+  static constexpr nntrainer::Half(min)() noexcept {
     return nntrainer::Half::from_bits(0x0400);
   }
-  /** @brief largest finite value, 65504 */
-  static constexpr nntrainer::Half max() noexcept {
+  /** @brief largest finite value, 65504; see the note on min() above */
+  static constexpr nntrainer::Half(max)() noexcept {
     return nntrainer::Half::from_bits(0x7BFF);
   }
   /** @brief most negative finite value, -65504 */
