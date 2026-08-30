@@ -28,17 +28,26 @@ void RMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
     skip_prefill = std::get<nntrainer::props::SkipPrefill>(rms_props).get();
 
-  // gamma is unquantized and stored as FP32 in the bin. Request it as FP32
-  // regardless of the activation dtype; declaring it FP16 reinterprets the
-  // on-disk FP32 bytes as FP16 and corrupts gamma (≈FP16-max garbage). The
-  // FP16 forward path casts gamma down to FP16 at the multiply site.
+  // gamma is an unquantized weight read straight out of the model .bin, and
+  // the .bin carries no per-tensor dtype: NeuralNetwork::load() derives every
+  // weight's file offset by accumulating getMemoryBytes() over the graph. The
+  // request must therefore reproduce the dtype the exporting graph used, which
+  // for a packed=false norm is the activation dtype -- exactly what
+  // getWeightDataType() yields here, and what the quantizer records in
+  // model_tensor_type. Hard-coding FP32 misreads an FP16-stored gamma *and*
+  // shifts every following weight's offset, and would disagree with the sibling
+  // implementations of this same on-disk weight (RMSNormLayerGPU,
+  // nntrainer::CudaRMSNormLayer, RMSNormLayerCl) which all use
+  // getWeightDataType(). A package that really stores FP32 gamma declares an
+  // FP32 activation dtype and lands here as FP32; the forward path still casts
+  // gamma at the multiply site for any mismatched case.
   nntrainer::TensorDim gamma_dim(
     1, 1, 1, dim[0].width(),
     nntrainer::TensorDim::TensorType(context.getFormat(),
-                                     nntrainer::TensorDim::DataType::FP32));
+                                     context.getWeightDataType()));
   wt_idx[RMSParams::gamma] = context.requestWeight(
     gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
-    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
+    nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", false);
 }
 
 void RMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
@@ -59,6 +68,8 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   ml::train::TensorDim in_step_dim = in_dim;
   ml::train::TensorDim out_step_dim = out_dim;
 
+  // A multi-token step is a prefill even when it does not start at 0 (a
+  // resumed or chunked prefill), so (to - from) > 1 counts as prefill too.
   bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
@@ -96,19 +107,41 @@ void RMSNormLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 #endif
 #ifdef ENABLE_FP16
     } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-      const auto &dim = in_step.getDim();
-      // FP16 activation: this kernel accumulates the sum-of-squares in FP32
-      // (so a wide residual row cannot overflow FP16) and reads/writes FP16.
-      nntrainer::rms_norm_wrt_width_fp16_intrinsic(
-        in_step.getData<_FP16>(), out_step.getData<_FP16>(), dim.height(),
-        dim.width(), epsilon);
+      // FP16 path: the sum of squares MUST be accumulated in FP32. Accumulating
+      // it in FP16 loses precision and overflows on a large residual (|x| up to
+      // ~1700 squares past the FP16 maximum of 65504 -> +Inf -> wrong scale ->
+      // an exploded norm). On x86 the FP16 reduction happens to accumulate in
+      // FP32, but the aarch64 NEON FP16 path accumulates in FP16 and produces
+      // garbage there, while reshaped_rms_norm and CudaRMSNormLayer -- which
+      // already reduce in FP32 -- stay correct. Reducing explicitly in FP32
+      // here makes the host norm correct on every architecture. gamma is
+      // applied below.
+      const unsigned int rows = in_step_dim.channel() * in_step_dim.height();
+      const unsigned int W = in_step_dim.width();
+      const _FP16 *xi = in_step.getData<_FP16>();
+      _FP16 *yi = out_step.getData<_FP16>();
+      for (unsigned int r = 0; r < rows; ++r) {
+        const _FP16 *xr = xi + (size_t)r * W;
+        _FP16 *yr = yi + (size_t)r * W;
+        float ss = 0.f;
+        for (unsigned int k = 0; k < W; ++k) {
+          const float v = static_cast<float>(xr[k]);
+          ss += v * v;
+        }
+        const float inv =
+          1.0f / std::sqrt(ss / static_cast<float>(W) + epsilon);
+        for (unsigned int k = 0; k < W; ++k)
+          yr[k] = static_cast<_FP16>(static_cast<float>(xr[k]) * inv);
+      }
 #endif
     } else {
       throw std::invalid_argument(
-        "Error: not yet implemented for this data type");
+        "rms_norm NYI dtype=" +
+        std::to_string(static_cast<int>(in_step.getDataType())) +
+        " layer=" + context.getName());
     }
-    // gamma (unquantized) may be stored at a different dtype than the FP16
-    // activation; cast it to match before the elementwise multiply.
+    // gamma normally matches the activation dtype (see finalize); cast it when
+    // a package pins it to a different one before the elementwise multiply.
     if (gamma.getDataType() != out_step.getDataType()) {
       nntrainer::Tensor gamma_cast = gamma.clone(out_step.getDataType());
       out_step.multiply_i(gamma_cast);
