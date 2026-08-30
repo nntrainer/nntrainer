@@ -613,5 +613,25 @@ bool v8c_use_buffer_path();
 void v8c_collect_lazy_program_tasks(ClContext &cc,
                                     std::vector<std::function<void()>> &out);
 
+/**
+ * @brief Block until the GPU command queue drains (clFinish).
+ *
+ * A host-coherence barrier for the point where a host operation is about to
+ * read a buffer that a previous GPU operation wrote asynchronously. The queue
+ * is in-order, so draining it is the whole ordering guarantee the caller needs.
+ */
+void cl_queue_finish();
+
+/**
+ * @brief Hand a shared-virtual-memory buffer back to the device.
+ *
+ * Use after a genuine HOST write to an SVM activation, so the GPU kernels that
+ * read it next see coherent data. A no-op when there is no GPU context, which
+ * is what a CPU-only run has.
+ *
+ * @param ptr shared-virtual-memory pointer to unmap; null is ignored
+ */
+void cl_svm_unmap_force(void *ptr);
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNELS_H__ */
