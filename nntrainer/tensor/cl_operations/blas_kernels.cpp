@@ -3278,7 +3278,7 @@ void cl_queue_finish() {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   if (blas_cc)
-    clFinish(blas_cc->command_queue_inst_.GetCommandQueue());
+    opencl::clFinish(blas_cc->command_queue_inst_.GetCommandQueue());
 }
 
 void cl_svm_unmap_force(void *ptr) {
