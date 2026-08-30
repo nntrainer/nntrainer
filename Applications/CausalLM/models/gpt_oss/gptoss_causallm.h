@@ -71,6 +71,10 @@ private:
                                                           : UINT_MAX;
   }
 
+  /** @copydoc Transformer::kvRingSupported() — this model uses the
+   *  attention-sink variant, whose cache read path is not ring-indexed. */
+  bool kvRingSupported() const override { return false; }
+
   float ATTENTION_ROPE_SCALING_FACTOR;
 };
 
