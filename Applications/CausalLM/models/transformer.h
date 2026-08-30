@@ -77,6 +77,52 @@ enum class ModelType { MODEL, CAUSALLM, EMBEDDING, UNKNOWN };
 using multimodal_pointer = std::pair<void *, size_t>;
 
 /**
+ * @brief Effective prefill chunk size (0 = no chunking / single-block prefill).
+ * @details An explicit NNTR_PREFILL_CHUNK always wins (user override, per-GPU
+ * tuning). Otherwise chunking is off. Callers clamp the result to the
+ * activation-plane height (INIT_SEQ_LEN).
+ */
+inline unsigned int effectivePrefillChunk() {
+  const char *pc = std::getenv("NNTR_PREFILL_CHUNK");
+  if (pc && pc[0])
+    return static_cast<unsigned int>(std::atoi(pc));
+  return 0u;
+}
+
+/**
+ * @brief Sliding-window KV ring capacity (NNTR_KV_WINDOW_RING, default off).
+ * @details A sliding-window attention layer with local window W only ever
+ * attends to the last W keys, so with chunked prefill -- which bounds one
+ * launch's live key span to W+C -- its KV storage can be a ring of Wcap rows
+ * instead of the full max_seq.
+ *
+ * Returns Wcap (the physical row capacity to allocate and modulo-index) for a
+ * sliding layer, or 0 meaning "no ring, keep full max_seq" (full-attention
+ * layer, ring disabled, no chunking, or no benefit). Every site -- placeholder
+ * shape, KV allocation, cache write, attention kernel dispatch -- computes Wcap
+ * from THIS one function so they stay consistent; a disagreement is an
+ * out-of-bounds write, not a wrong answer.
+ *
+ * Wcap is a multiple of C and >= W + C: a multiple of C means a C-aligned chunk
+ * write never straddles the wrap seam (it stays one contiguous slice), and
+ * >= W + C means the live window [pos-W+1, pos+C) never self-collides mod Wcap.
+ * Returning 0 keeps the exact pre-ring behaviour, so ring-off is bit-identical.
+ */
+inline unsigned int kvRingCap(unsigned int local_window, unsigned int max_seq) {
+  const char *g = std::getenv("NNTR_KV_WINDOW_RING");
+  if (!(g && g[0] == '1'))
+    return 0; // ring disabled -> full max_seq (bit-identical default)
+  if (local_window == 0 || local_window >= max_seq)
+    return 0; // full-attention layer -> no ring
+  const unsigned int C = effectivePrefillChunk();
+  if (C == 0)
+    return 0; // the ring requires chunked prefill to bound the live span
+  // multiple of C, >= W + C (headroom so the window never wraps onto itself).
+  const unsigned int cap = (local_window / C + 2u) * C;
+  return (cap < max_seq) ? cap : 0u; // no benefit if it would not shrink
+}
+
+/**
  * @brief Non-owning logits processor hook for token generation
  */
 class LogitsProcessor {
@@ -254,12 +300,15 @@ public:
    * @details The row counterpart of getKVCacheWidth(). Every KV sizing site --
    * each model's placeholder factory and the KVCacheManager allocation -- must
    * agree on how many rows a layer's cache has, and hard-coding MAX_SEQ_LEN in
-   * each of them made "how many rows" un-answerable from one place. Default is
-   * the full context window.
+   * each of them made "how many rows" un-answerable from one place.
+   *
+   * A sliding-window layer under the KV ring stores only kvRingCap() rows;
+   * every other layer keeps the full context window.
    */
   unsigned int getKVCacheRows(int layer_id) const {
-    (void)layer_id;
-    return static_cast<unsigned int>(MAX_SEQ_LEN);
+    const unsigned int cap = kvRingCap(getLayerSlidingWindow(layer_id),
+                                       static_cast<unsigned int>(MAX_SEQ_LEN));
+    return cap ? cap : static_cast<unsigned int>(MAX_SEQ_LEN);
   }
 
   /**

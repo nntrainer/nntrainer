@@ -279,6 +279,27 @@ public:
     return getLayerKVSource(layer_idx) >= 0;
   }
 
+  /**
+   * @brief [kv-window-ring] Set the per-layer physical row capacity. A
+   * sliding-window layer under the ring stores only Wcap rows instead of
+   * max_seq_len; pass caps[i]=Wcap for those layers and caps[i]=0 (or
+   * max_seq_len) for the full ones. Must be called BEFORE allocate(). An empty
+   * vector means every layer is full max_seq.
+   */
+  void setLayerCaps(std::vector<unsigned int> caps) {
+    layer_caps_ = std::move(caps);
+  }
+
+  /**
+   * @brief Physical row capacity of a layer's cache (Wcap for a ring layer,
+   * else max_seq_len). The write/read code modulo-indexes against this.
+   */
+  unsigned int getLayerCap(unsigned int layer_idx) const {
+    if (layer_idx < layer_caps_.size() && layer_caps_[layer_idx] > 0)
+      return layer_caps_[layer_idx];
+    return max_seq_len_;
+  }
+
 private:
   /**
    * @brief [kv-share] Validate layer_kv_sources_ against num_layers and the
@@ -336,6 +357,8 @@ private:
   std::vector<unsigned int> kv_widths_;
   /** [kv-share] per-layer KV alias source (-1 = owns its cache) */
   std::vector<int> layer_kv_sources_;
+  /** [kv-window-ring] per-layer physical row capacity (0 = full max_seq_len) */
+  std::vector<unsigned int> layer_caps_;
 
   ml::train::TensorDim::DataType dtype_ = ml::train::TensorDim::DataType::FP16;
   ml::train::TensorDim::Format format_ = ml::train::TensorDim::Format::NCHW;
