@@ -295,6 +295,15 @@ void CausalLM::allocateAndBindKVCache() {
 
     const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
 
+    // [kv-window-ring] Per-layer physical row capacity: a sliding-window layer
+    // stores a Wcap-row ring, every other layer keeps max_seq. Same
+    // getKVCacheRows() hook the placeholder factories use, so the two shapes
+    // line up at bind time (the bind asserts they do).
+    std::vector<unsigned int> layer_caps(static_cast<size_t>(NUM_LAYERS), 0u);
+    for (int i = 0; i < NUM_LAYERS; ++i)
+      layer_caps[static_cast<size_t>(i)] = getKVCacheRows(i);
+    kv_cache.setLayerCaps(layer_caps);
+
     // Per-layer width via the getKVCacheWidth() hook: uniform
     // (NUM_KEY_VALUE_HEADS * HEAD_DIM) by default, overridden by
     // variable-geometry models. One vector path now serves every model, so the

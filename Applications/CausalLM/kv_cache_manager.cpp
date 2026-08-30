@@ -19,6 +19,7 @@
 #include <basic_planner.h>
 #include <engine.h>
 #include <mem_allocator.h>
+#include <nntrainer_log.h>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
@@ -79,6 +80,29 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   // a source that is not strictly earlier, or whose geometry differs, would
   // produce a cache that reads the wrong plane without ever crashing.
   validateKVSources(num_layers);
+  {
+    // [kv-window-ring] one-time diagnostic, printed only when the ring is
+    // actually engaged: KV rows allocated vs the full-max_seq baseline.
+    bool ring_on = false;
+    for (auto c : layer_caps_)
+      if (c > 0) {
+        ring_on = true;
+        break;
+      }
+    if (ring_on) {
+      const size_t es =
+        (dtype == ml::train::TensorDim::DataType::FP16) ? 2u : 4u;
+      size_t rows = 0, bytes = 0;
+      for (unsigned int i = 0; i < num_layers; ++i) {
+        rows += getLayerCap(i);
+        bytes += (size_t)batch_size * getLayerCap(i) * kv_widths_[i] * es * 2u;
+      }
+      ml_logi("[kvcache] window-ring: %u layers, KV rows %zu (vs %zu full), "
+              "%.1f MB",
+              num_layers, rows, (size_t)num_layers * max_seq_len,
+              bytes / (1024.0 * 1024.0));
+    }
+  }
 
   // GPU-resident KV cache: when the graph runs on the SVM pool
   // (NNTR_GPU_SVM_POOL) and the gpu-svm allocator is available, allocate the
@@ -163,8 +187,9 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
     for (unsigned int i = 0; i < num_layers; ++i) {
       if (isLayerKVAliased(i))
         continue;
+      // [kv-window-ring] a ring layer only needs its Wcap rows.
       const size_t bytes =
-        (size_t)batch_size * max_seq_len * kv_widths_[i] * elem_size;
+        (size_t)batch_size * getLayerCap(i) * kv_widths_[i] * elem_size;
       ktok[i] = svm_pool_->requestMemory(bytes, 1, 2); // key
       vtok[i] = svm_pool_->requestMemory(bytes, 1, 2); // value
     }
@@ -173,7 +198,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
 
     for (unsigned int i = 0; i < num_layers; ++i) {
       ml::train::TensorDim cache_dim(
-        {batch_size, 1, max_seq_len, kv_widths_[i]}, {format, dtype});
+        {batch_size, 1, getLayerCap(i), kv_widths_[i]}, {format, dtype});
       // [kv-share] The source is strictly earlier, so its storage is already
       // in place -- one pass suffices, no second fixup loop. The source's
       // plane was zeroed when the source itself was set up, so the sharer must
@@ -216,7 +241,7 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   } else {
     for (unsigned int i = 0; i < num_layers; ++i) {
       ml::train::TensorDim cache_dim(
-        {batch_size, 1, max_seq_len, kv_widths_[i]}, {format, dtype});
+        {batch_size, 1, getLayerCap(i), kv_widths_[i]}, {format, dtype});
       // [kv-share] Same rule as the pool branch above: an aliased layer gets a
       // view, never an allocation. Tensor(dim, /*alloc=*/false) + setData()
       // shares the source's MemoryData shared_ptr, so the host buffer outlives
