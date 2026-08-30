@@ -1629,7 +1629,8 @@ void FloatTensor::apply_broadcast_util(
   }
   for (unsigned int i = 0; i < dim.getTensorDim(continuity[cur_axis]); ++i) {
     size_t next_offset = offset + i * strides[cur_axis];
-    size_t next_m_offset = m_offset + i * e.strides[cur_axis];
+    size_t next_m_offset =
+      m_offset + static_cast<size_t>(i) * e.strides[cur_axis];
     apply_broadcast_util(m, v_func, output, e, cur_axis, next_offset,
                          next_m_offset);
   }

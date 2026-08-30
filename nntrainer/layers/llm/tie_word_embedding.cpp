@@ -241,8 +241,8 @@ void TieWordEmbedding::incremental_forwarding_embedding(
         throw std::invalid_argument("input word index is greater than in_dim");
       }
 
-      nntrainer::Tensor cur_weight =
-        weight.getSharedDataTensor(out_tensor_dim, out_dim * embed_idx);
+      nntrainer::Tensor cur_weight = weight.getSharedDataTensor(
+        out_tensor_dim, static_cast<size_t>(out_dim) * embed_idx);
       nntrainer::Tensor out_tensor =
         batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
 
