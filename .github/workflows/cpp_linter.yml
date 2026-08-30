@@ -18,29 +18,42 @@ jobs:
           echo "Checking whitespace errors on changed lines"
           git diff --check ${{ github.event.pull_request.base.sha }}...HEAD \
             -- . ':(exclude).github' ':(exclude)Applications/CausalLM/third_party'
-      - name: install dev packages
+      - name: install clang-format
         run: |
-          echo "Install mandatory dev packages to avoid false-positive reports from cpp-linter"
           sudo apt-get update
-          sudo apt-get install libstdc++-*-dev
-      - uses: cpp-linter/cpp-linter-action@v2.9.0
+          sudo apt-get install -y clang-format-14
+      - name: check the format of changed lines
         id: linter
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          style: file
-          version: 14
-          lines-changed-only: true
-          file-annotations: false
-          step-summary: true
-          format-review: true
-          tidy-checks: '-*' # disable clang-tidy checks.
+        run: |
+          set -o pipefail
+          # Collect the changed lines with git rather than with the pull request
+          # patch endpoint, which refuses to serve a diff longer than 20000
+          # lines. Same base.sha...HEAD range as the whitespace check above.
+          #
           # third_party/ holds vendored upstream code (minja, ...) that is not
           # formatted to nntrainer style; skip it like static.check.yml does.
-          ignore: '.github|Applications/CausalLM/third_party'
-
-      - name: failing fast
-        if: steps.linter.outputs.clang-format-checks-failed > 0
-        run: |
-          echo "This PR failed to pass the C++ source file format checks."
-          exit 1
+          RANGE='${{ github.event.pull_request.base.sha }}...HEAD'
+          PATHS=('*.c' '*.h' '*.C' '*.H' '*.cpp' '*.hpp' '*.cc' '*.hh'
+                 '*.cxx' '*.hxx' '*.c++' '*.h++'
+                 ':(exclude).github' ':(exclude)Applications/CausalLM/third_party')
+          echo "Changed C/C++ files:"
+          git diff --name-only "$RANGE" -- "${PATHS[@]}"
+          # clang-format-diff reformats only the lines the diff touches, so
+          # untouched code in an edited file is never reported.
+          git diff -U0 "$RANGE" -- "${PATHS[@]}" |
+            clang-format-diff-14 -p1 -style=file > suggestions.diff
+          if [ -s suggestions.diff ]; then
+            {
+              echo '### C++ format check failed'
+              echo
+              echo 'Apply this patch, or run clang-format-14 on the changed lines.'
+              echo
+              echo '```diff'
+              cat suggestions.diff
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            cat suggestions.diff
+            echo "This PR failed to pass the C++ source file format checks."
+            exit 1
+          fi
+          echo "The changed C/C++ lines are correctly formatted."
