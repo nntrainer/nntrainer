@@ -63,7 +63,8 @@ void Int4Utils::computeScales(const float *weights, const size_t rows_count,
   const auto last_group_size = columns_count % group_size;
   const auto padded_groups_per_row = ceilDiv(columns_count, group_size);
   const auto rows_count_pad = align(rows_count, ROW_BLOCK_SIZE);
-  scales.resize(rows_count_pad * padded_groups_per_row, 1.0f);
+  scales.resize(static_cast<size_t>(rows_count_pad) * padded_groups_per_row,
+                1.0f);
 
   for (size_t row_id = 0; row_id < rows_count; ++row_id) {
     const auto *weights_row = weights + (row_id * columns_count);
