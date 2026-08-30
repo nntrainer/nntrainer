@@ -10,8 +10,17 @@
  * @brief  Selects per-layer input chunk from packed per-layer embedding tensor.
  */
 
+#include <cstdlib>
 #include <cstring>
+#include <env_compat.h>
 #include <per_layer_slice.h>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+#endif
 
 namespace causallm {
 
@@ -40,6 +49,8 @@ void PerLayerSliceLayer::forwarding(nntrainer::RunLayerContext &context,
 void PerLayerSliceLayer::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
+  // A multi-token step is a prefill even when it does not start at 0 (resumed
+  // / chunked prefill), so recognize (to - from) > 1 as prefill too.
   bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
@@ -70,29 +81,55 @@ void PerLayerSliceLayer::incremental_forwarding(
       out_step_dim, b * out.getDim().getFeatureLen(), true);
 
     unsigned int tokens = in_step_dim.height();
-    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP32) {
-      float *in_data = in_step.getData<float>();
-      float *out_data = out_step.getData<float>();
-      for (unsigned int t = 0; t < tokens; ++t) {
-        const float *src =
-          in_data + t * in_dim.width() + layer_index * feature_size;
-        float *dst = out_data + t * feature_size;
-        std::memcpy(dst, src, sizeof(float) * feature_size);
-      }
+    const unsigned int W = in_dim.width();
+    // dtype-aware slice: getData<float> on an FP16 tensor strides by 4 bytes
+    // over 2-byte cells (wrong offset) and memcpy(sizeof(float)*fs) copies
+    // twice the bytes -> a corrupt PLE slice. gemma4 QINT4-FP16 activations are
+    // FP16.
 #ifdef ENABLE_FP16
-    } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       _FP16 *in_data = in_step.getData<_FP16>();
       _FP16 *out_data = out_step.getData<_FP16>();
-      for (unsigned int t = 0; t < tokens; ++t) {
-        const _FP16 *src =
-          in_data + t * in_dim.width() + layer_index * feature_size;
-        _FP16 *dst = out_data + t * feature_size;
-        std::memcpy(dst, src, sizeof(_FP16) * feature_size);
+      bool done = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
+      if (gpu) {
+        const bool dev = nntrainer::cuda::dev_accessible(in_data);
+        if (dev && nntrainer::cuda::cuda_slice_copy_fp16(
+                     reinterpret_cast<const unsigned short *>(in_data),
+                     reinterpret_cast<unsigned short *>(out_data), tokens, W,
+                     layer_index * feature_size, feature_size))
+          done = true;
       }
 #endif
-    } else {
+      if (!done) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+        // Host memcpy slicing reads the GPU-produced UVM input on the CPU; sync
+        // first in async mode (no-op in default sync mode).
+        nntrainer::cuda::drain_if_async();
+#endif
+        for (unsigned int t = 0; t < tokens; ++t)
+          std::memcpy(out_data + t * feature_size,
+                      in_data + t * W + layer_index * feature_size,
+                      sizeof(_FP16) * feature_size);
+      }
+    } else
+#endif
+      if (in_step.getDataType() != ml::train::TensorDim::DataType::FP32) {
       throw std::invalid_argument(
         "[PerLayerSlice] unsupported activation data type");
+    } else {
+      float *in_data = in_step.getData<float>();
+      float *out_data = out_step.getData<float>();
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Host memcpy slicing reads the GPU-produced UVM input on the CPU; sync
+      // first in async mode (no-op in default sync mode).
+      nntrainer::cuda::drain_if_async();
+#endif
+      for (unsigned int t = 0; t < tokens; ++t)
+        std::memcpy(out_data + t * feature_size,
+                    in_data + t * W + layer_index * feature_size,
+                    sizeof(float) * feature_size);
     }
   }
 }
