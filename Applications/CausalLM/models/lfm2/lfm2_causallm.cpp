@@ -29,8 +29,6 @@
 #include <mha_core.h>
 #include <reshaped_rms_norm.h>
 #include <rms_norm.h>
-#include <swiglu_layer.h>
-#include <tie_word_embedding.h>
 
 using ml::train::Tensor;
 
