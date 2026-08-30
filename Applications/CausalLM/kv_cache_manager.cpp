@@ -217,13 +217,26 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
       layer_caches_[i].value_cache.setData(svm_pool_->getMemory(vtok[i]), 0,
                                            false);
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-      // Device-only KV (NNTR_CUDA_KV_DEV): host setZero would dereference a
-      // cudaMalloc pointer -- zero on the device instead. Detected from the
-      // pointer itself so the UVM/pinned/SVM paths keep the host memset.
+      // Zero a CUDA-resident KV cache ON THE DEVICE, never with a host memset.
+      //
+      // Device-only KV (NNTR_CUDA_KV_DEV) has no host mapping at all, so a host
+      // setZero would dereference a cudaMalloc pointer. But the managed (UVM)
+      // cache needs the same treatment for a performance reason: it IS host
+      // addressable, and a host memset faults every page of the cache into HOST
+      // residency. The first GPU writer -- the RoPE that lands K in the cache
+      // and the V copy -- then has to migrate the whole cache back across PCIe
+      // page by page, which showed up as 15 ms of a 1K gemma4 prefill (K-write
+      // 10.4 ms and V-write 4.8 ms per prefill, versus 0.5 ms each once the
+      // pages start out on the device). Zeroing through the stream leaves the
+      // pages where every consumer of this cache wants them.
+      //
+      // dev_accessible() is false unless the CUDA engine is actually selected,
+      // so the OpenCL SVM pool keeps the host memset.
       auto zero_kv = [](nntrainer::Tensor &t) {
         void *ptr = (void *)t.getData<char>();
         const auto md = t.getMemoryData();
-        if (md && !md->isHostAddressable()) {
+        const bool host_only = md && !md->isHostAddressable();
+        if (host_only || nntrainer::cuda::dev_accessible(ptr)) {
           if (!nntrainer::cuda::device_memset0(ptr, t.bytes()))
             throw std::runtime_error(
               "KVCacheManager: device memset of the KV cache failed");
