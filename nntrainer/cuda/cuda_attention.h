@@ -61,6 +61,8 @@ bool cuda_attention_core_fp32(const float *Q, const float *K, const float *V,
  * @param N_q / N_kv  query rows / cached keys
  * @param cache_from  absolute position of query row 0
  * @param head_dim, window, softcap
+ * @param ring_cap  [kv-window-ring] >0: the K/V cache physically holds only
+ *                  ring_cap rows and row n lives at n % ring_cap; 0 = linear
  */
 bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
                                      const unsigned short *k_fp16,
@@ -68,7 +70,7 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
                                      unsigned short *o_fp16, int num_heads_Q,
                                      int num_heads_KV, int N_q, int N_kv,
                                      int cache_from, int head_dim, int window,
-                                     float softcap);
+                                     float softcap, int ring_cap = 0);
 
 /**
  * @brief Pre-grow the split-KV decode scratch buffers to the model's max decode

@@ -3466,7 +3466,7 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
         if (nntrainer::cuda::cuda_attention_interleaved_fp16(
               Q_fp16_src, Kbase, Vbase, O_fp16, (int)num_heads_Q,
               (int)num_heads_KV, (int)N_q, (int)N_kv, (int)cache_from, (int)d,
-              win, /*softcap=*/0.0f))
+              win, /*softcap=*/0.0f, /*ring_cap=*/(int)kv_ring_cap))
           return;
       }
     }

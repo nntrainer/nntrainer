@@ -135,7 +135,7 @@ __global__ void attn_core_il_fp16(const unsigned short *q, const unsigned short 
                                   const unsigned short *v, unsigned short *o,
                                   int HQ, int HKV, int N_q, int N_kv,
                                   int cache_from, int d, int window, float softcap,
-                                  const int *d_pos) {
+                                  const int *d_pos, int ring_cap) {
   int i = blockIdx.x, h = blockIdx.y;
   // Graph replay: when d_pos is bound, read the live position/key-count from the device
   // buffer so a captured graph reads the new token's state on replay (else use
@@ -161,7 +161,9 @@ __global__ void attn_core_il_fp16(const unsigned short *q, const unsigned short 
   int j_hi = i_abs; if (j_hi>=nkv) j_hi=nkv-1;
   float mmax=-1e30f, l=0.f;
   for (int j=j_lo;j<=j_hi;++j) {
-    const unsigned short *kr = k + (long)j*HD_KV + (long)hkv*d;
+    // [kv-window-ring] physical cache row = j % ring_cap (ring_cap<=0: linear).
+    long pj = (ring_cap > 0) ? (long)(j % ring_cap) : (long)j;
+    const unsigned short *kr = k + pj*HD_KV + (long)hkv*d;
     float pd=0.f;
     for (int dd=tid;dd<d;dd+=B) pd += Qsh[dd]*a_h2f(kr[dd]);
     red[tid]=pd; __syncthreads();
@@ -170,7 +172,7 @@ __global__ void attn_core_il_fp16(const unsigned short *q, const unsigned short 
     if (softcap>0.f) score=softcap*tanhf(score/softcap);
     float mn=fmaxf(mmax,score), corr=__expf(mmax-mn), p=__expf(score-mn);
     l=l*corr+p; mmax=mn;
-    const unsigned short *vr = v + (long)j*HD_KV + (long)hkv*d;
+    const unsigned short *vr = v + pj*HD_KV + (long)hkv*d;
     int r=0; for (int dd=tid;dd<d;dd+=B,++r) acc[r]=acc[r]*corr + p*a_h2f(vr[dd]);
   }
   float inv = l>0.f?1.f/l:0.f;
@@ -278,7 +280,7 @@ __global__ void attn_partial(const unsigned short *q, const unsigned short *k,
                              int cache_from, int d, int window, float softcap,
                              int chunk_kv, int n_chunks,
                              const int *d_pos, int max_n_chunks,
-                             int clip) {
+                             int clip, int ring_cap) {
   int h = blockIdx.x, c = blockIdx.y;
   // Graph replay: read the live query position / key-count from the device d_pos buffer
   // (mirrors attn_core_il_fp16) so ONE captured graph is valid for every token.
@@ -311,7 +313,9 @@ __global__ void attn_partial(const unsigned short *q, const unsigned short *k,
   for (int r = 0; r < 4; r++) acc[r] = 0.f;
   float mmax = -1e30f, l = 0.f;
   for (int j = j_lo; j <= j_hi; ++j) {
-    const unsigned short *kr = k + (long)j * HD_KV + (long)hkv * d;
+    // [kv-window-ring] physical cache row = j % ring_cap (ring_cap<=0: linear).
+    long pj = (ring_cap > 0) ? (long)(j % ring_cap) : (long)j;
+    const unsigned short *kr = k + pj * HD_KV + (long)hkv * d;
     float pd = 0.f;
     for (int dd = tid; dd < d; dd += B) pd += Qsh[dd] * s_h2f(kr[dd]);
     red[tid] = pd; __syncthreads();
@@ -320,7 +324,7 @@ __global__ void attn_partial(const unsigned short *q, const unsigned short *k,
     if (softcap > 0.f) score = softcap * tanhf(score / softcap);
     float mn = fmaxf(mmax, score), corr = __expf(mmax - mn), p = __expf(score - mn);
     l = l * corr + p; mmax = mn;
-    const unsigned short *vr = v + (long)j * HD_KV + (long)hkv * d;
+    const unsigned short *vr = v + pj * HD_KV + (long)hkv * d;
     int r = 0; for (int dd = tid; dd < d; dd += B, ++r) acc[r] = acc[r]*corr + p*s_h2f(vr[dd]);
   }
   if (j_lo > j_hi) { mmax = -1e30f; l = 0.f; }
@@ -531,7 +535,7 @@ splitkv_warp_body(const unsigned short *q, const unsigned short *k,
                   const unsigned short *v, float *pm, float *pl, float *pacc,
                   int HQ, int HKV, int N_kv, int cache_from, int d, int window,
                   float softcap, int chunk_kv, int n_chunks, const int *d_pos,
-                  int max_n_chunks, int clip) {
+                  int max_n_chunks, int clip, int ring_cap) {
   const int h = blockIdx.x * HPW, c = blockIdx.y;
   // Replayed graph: live query position / key count from the device pos buffer; blocks
   // past the live chunk count early-return without writing (identical gate to
@@ -578,7 +582,9 @@ splitkv_warp_body(const unsigned short *q, const unsigned short *k,
     for (int t = 0; t < KPI; ++t) {
       const int jj = j + t * NW;
       if (jj <= j_hi) {
-        long base = (long)jj * HD_KV + (long)hkv * d + lane0;
+        // [kv-window-ring] physical cache row = jj % ring_cap (<=0: linear).
+        const long pjj = (ring_cap > 0) ? (long)(jj % ring_cap) : (long)jj;
+        long base = pjj * HD_KV + (long)hkv * d + lane0;
         wk_ldrow<VPL>(k + base, kh[t]);
         wk_ldrow<VPL>(v + base, vh[t]);
         ++nstaged;
@@ -652,11 +658,12 @@ splitkv_warp_body(const unsigned short *q, const unsigned short *k,
     const unsigned short *q, const unsigned short *k, const unsigned short *v, \
     float *pm, float *pl, float *pacc, int HQ, int HKV, int N_kv,              \
     int cache_from, int d, int window, float softcap, int chunk_kv,            \
-    int n_chunks, const int *d_pos, int max_n_chunks, int clip) {              \
+    int n_chunks, const int *d_pos, int max_n_chunks, int clip,                \
+    int ring_cap) {                                                            \
     splitkv_warp_body<VPL, 4, HPW, KPI>(q, k, v, pm, pl, pacc, HQ, HKV, N_kv,  \
                                         cache_from, d, window, softcap,        \
                                         chunk_kv, n_chunks, d_pos,             \
-                                        max_n_chunks, clip);                   \
+                                        max_n_chunks, clip, ring_cap);         \
   }
 // HPW=1: the unfused launch, kept as the kill-switch / narrow-grid path.
 SPLITKV_WARP_ENTRY(attn_partial_w128, 4, 1, 1)
@@ -711,7 +718,8 @@ template <int TM, int VPL>
 __device__ __forceinline__ void
 blockq_body(const unsigned short *q, const unsigned short *k,
             const unsigned short *v, unsigned short *o, int HQ, int HKV, int N_q,
-            int N_kv, int cache_from, int d, int window, float softcap) {
+            int N_kv, int cache_from, int d, int window, float softcap,
+            int ring_cap) { // [kv-window-ring] >0: K/V physical row = n%ring_cap
   const int lane = threadIdx.x;             // 0..31
   const int grp = blockIdx.x;
   const int n_row_tiles = (N_q + TM - 1) / TM;
@@ -747,7 +755,9 @@ blockq_body(const unsigned short *q, const unsigned short *k,
   int n_lo = (window > 0) ? (m0 + q_pos_off - window + 1) : 0;
   if (n_lo < 0) n_lo = 0;
   for (int n = n_lo; n <= n_last; ++n) {
-    long k_base = (long)n * HD_KV + (long)hkv * d;
+    // [kv-window-ring] physical cache row = n % ring_cap (ring_cap<=0: linear).
+    long pn = (ring_cap > 0) ? (long)(n % ring_cap) : (long)n;
+    long k_base = pn * HD_KV + (long)hkv * d;
     float k_reg[VPL];
 #pragma unroll
     for (int vv = 0; vv < VPL; vv++) k_reg[vv] = bq_h2f(k[k_base + lane0 + vv]);
@@ -759,7 +769,7 @@ blockq_body(const unsigned short *q, const unsigned short *k,
       for (int vv = 0; vv < VPL; vv++) p += q_reg[r][vv] * k_reg[vv];
       sdot[r] = bq_wreduce(p);
     }
-    long v_base = (long)n * HD_KV + (long)hkv * d;
+    long v_base = pn * HD_KV + (long)hkv * d;
     float v_reg[VPL];
 #pragma unroll
     for (int vv = 0; vv < VPL; vv++) v_reg[vv] = bq_h2f(v[v_base + lane0 + vv]);
@@ -791,22 +801,25 @@ extern "C" __global__ void
 attn_blockq_d256(const unsigned short *q, const unsigned short *k,
                  const unsigned short *v, unsigned short *o, int HQ, int HKV,
                  int N_q, int N_kv, int cache_from, int d, int window,
-                 float softcap) {
-  blockq_body<4, 8>(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from, d, window, softcap);
+                 float softcap, int ring_cap) {
+  blockq_body<4, 8>(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from, d, window,
+                    softcap, ring_cap);
 }
 extern "C" __global__ void
 attn_blockq_d512(const unsigned short *q, const unsigned short *k,
                  const unsigned short *v, unsigned short *o, int HQ, int HKV,
                  int N_q, int N_kv, int cache_from, int d, int window,
-                 float softcap) {
-  blockq_body<4, 16>(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from, d, window, softcap);
+                 float softcap, int ring_cap) {
+  blockq_body<4, 16>(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from, d, window,
+                    softcap, ring_cap);
 }
 extern "C" __global__ void
 attn_blockq_d128(const unsigned short *q, const unsigned short *k,
                  const unsigned short *v, unsigned short *o, int HQ, int HKV,
                  int N_q, int N_kv, int cache_from, int d, int window,
-                 float softcap) {
-  blockq_body<4, 4>(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from, d, window, softcap);
+                 float softcap, int ring_cap) {
+  blockq_body<4, 4>(q, k, v, o, HQ, HKV, N_q, N_kv, cache_from, d, window,
+                    softcap, ring_cap);
 }
 )CU";
 
@@ -922,7 +935,8 @@ bool ensure_sk(size_t mn, size_t acc) {
 bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
                               const unsigned short *v, unsigned short *o,
                               int HQ, int HKV, int N_kv, int cache_from, int d,
-                              int window, float softcap, int chunk_kv) {
+                              int window, float softcap, int chunk_kv,
+                              int ring_cap) {
   const int n_chunks = (N_kv + chunk_kv - 1) / chunk_kv;
   // Graph replay: when the device pos buffer is bound, the captured graph uses
   // the FIXED max-chunk stride/grid (g_sk_max_nchunks, published at prewarm) so
@@ -1057,6 +1071,11 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   kp->SetKernelArguments(15, &dpos, sizeof(dpos));
   kp->SetKernelArguments(16, &max_nc, sizeof(max_nc));
   kp->SetKernelArguments(17, &clip, sizeof(clip));
+  // [kv-window-ring] arg 18. BOTH partial kernels (the warp variants and the
+  // legacy attn_partial) declare it, so this one bind serves whichever is
+  // selected above -- an unset kernel argument passes a null pointer into
+  // cuLaunchKernel and faults on the host.
+  kp->SetKernelArguments(18, &ring_cap, sizeof(ring_cap));
   const int pg[3] = {HQ / hpw, max_nc, 1};
   const int pb[3] = {B, 1, 1};
   // legacy: Q row [d] + reduction scratch [B]; warp: HPW*NW acc rows [d] +
@@ -1204,13 +1223,17 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
                                      unsigned short *o_fp16, int num_heads_Q,
                                      int num_heads_KV, int N_q, int N_kv,
                                      int cache_from, int head_dim, int window,
-                                     float softcap) {
+                                     float softcap, int ring_cap) {
   if (num_heads_Q == 0 || N_q == 0 || N_kv == 0 || head_dim == 0)
     return true;
 
   // mirror the KV cache to the device if it is host-resident (engine=cuda KV
   // cache is not UVM). K/V are [N_kv, num_heads_KV*head_dim] interleaved.
-  const size_t kv_elems = (size_t)N_kv * num_heads_KV * head_dim;
+  // [kv-window-ring] under the ring the buffer physically holds only ring_cap
+  // rows; mirroring N_kv of them would read past its end (and hand the kernel
+  // garbage for every row it then modulo-maps into).
+  const int kv_rows = (ring_cap > 0 && ring_cap < N_kv) ? ring_cap : N_kv;
+  const size_t kv_elems = (size_t)kv_rows * num_heads_KV * head_dim;
   k_fp16 = mirror_kv(k_fp16, kv_elems);
   v_fp16 = mirror_kv(v_fp16, kv_elems);
   if (!k_fp16 || !v_fp16)
@@ -1227,7 +1250,7 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   if (sk_chunk > 0 && N_q == 1 && N_kv > sk_chunk) {
     if (attention_splitkv_decode(q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q,
                                  num_heads_KV, N_kv, cache_from, head_dim,
-                                 window, softcap, sk_chunk)) {
+                                 window, softcap, sk_chunk, ring_cap)) {
       StreamManager::Global().maybeFinish();
       return true;
     }
@@ -1272,10 +1295,15 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   constexpr int GEMM_ATTN_MIN_KV = 4096;
   const int gemm_min_kv =
     (gemm_attn_mode > 1) ? gemm_attn_mode : GEMM_ATTN_MIN_KV;
+  // [kv-window-ring] the cuBLAS GEMM prefill reads K/V as one contiguous
+  // [N_kv, HD] slab, which a ring buffer is not -- exclude ringed layers from
+  // it outright (they are sliding layers, whose block-Q walk is window-bounded
+  // anyway).
   const bool gemm_attn_on =
-    (gemm_attn_mode == 1) ||
-    (gemm_attn_mode != 0 &&
-     (integrated_gpu || (win_bq == 0 && N_kv >= gemm_min_kv)));
+    ring_cap <= 0 &&
+    ((gemm_attn_mode == 1) ||
+     (gemm_attn_mode != 0 &&
+      (integrated_gpu || (win_bq == 0 && N_kv >= gemm_min_kv))));
   // head_dim 256/512 (gemma4 sliding/global) were historically excluded because
   // block-Q beat the cuBLAS path on RTX/Adreno. On Orin (sm_87) block-Q runs at
   // only ~0.2 TFLOP/s, so the cuBLAS int8/fp16 Tensor-Core QK/PV is worth
@@ -1319,6 +1347,8 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
       kb->SetKernelArguments(9, &head_dim, sizeof(head_dim));
       kb->SetKernelArguments(10, &win_bq, sizeof(win_bq));
       kb->SetKernelArguments(11, &softcap, sizeof(softcap));
+      // [kv-window-ring]
+      kb->SetKernelArguments(12, &ring_cap, sizeof(ring_cap));
       const int grid[3] = {num_heads_Q * n_row_tiles, 1, 1};
       const int block[3] = {32, 1, 1};
       if (StreamManager::Global().DispatchCommand(*kb, grid, block, 0)) {
@@ -1353,6 +1383,8 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   static const bool decode_graph_attn = nntr_env_on("NNTR_CUDA_GRAPH");
   const int *attn_dpos = decode_graph_attn ? cuda_pos_buffer() : nullptr;
   kernel->SetKernelArguments(12, &attn_dpos, sizeof(attn_dpos));
+  // [kv-window-ring]
+  kernel->SetKernelArguments(13, &ring_cap, sizeof(ring_cap));
   const int grid[3] = {N_q, num_heads_Q, 1};
   const int block[3] = {B, 1, 1};
   const unsigned int shmem =
