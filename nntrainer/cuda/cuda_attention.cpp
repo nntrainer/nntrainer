@@ -823,6 +823,230 @@ attn_blockq_d128(const unsigned short *q, const unsigned short *k,
 }
 )CU";
 
+// Split-KV chunked-prefill attention (global/full-attention layers, long K).
+// The serial blockq_body launches ONE fixed 32-lane warp per (head, TM-row
+// tile) that walks the ENTIRE causal K range; once the growing KV exceeds L2
+// (ctx ~9K on gemma4) every warp streams K/V from DRAM independently and the
+// per-key cost plateaus ~2x higher. Split the key axis into a FIXED,
+// deterministic partition (ceil(N_kv/split_len), capped at 32): each block
+// owns (tile, split) and runs the identical register online-softmax over its
+// sub-range, writing partial (m, l, acc[d]) to scratch; a second kernel
+// combines the partials per row in FIXED split order (serial loop, no
+// atomics -> byte-stable run to run). Same-split blocks are adjacent on the
+// fast grid axis so they walk the same K window together (L2-aligned
+// frontier). Numerics: exact-arithmetic-equal to the serial kernel; fp32
+// renormalization ORDER differs (per-split then combine vs one running
+// pass), so fp16 outputs may differ by rounding -- gated by the golden runs.
+static const char *ATTN_BLOCKQ_SPLIT_SRC = R"CU(
+__device__ __forceinline__ float bs_h2f(unsigned short h) {
+  float f;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+  return f;
+}
+__device__ __forceinline__ unsigned short bs_f2h(float f) {
+  unsigned short h;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+  return h;
+}
+__device__ __forceinline__ float bs_wreduce(float v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    v += __shfl_xor_sync(0xffffffffu, v, off);
+  return v;
+}
+// Vectorized K/V row-slice load (uint2 for VPL=4, uint4 pairs above). The
+// serial kernel's 16 scalar u16 loads per slice make the per-key dependent
+// chain latency-dominated (probe: the whole kernel is latency-bound at ~8
+// warps/SM, NOT bandwidth-bound -- a 4x shared-memory traffic cut measured
+// flat). Wide loads + the launch-bounds occupancy floor bought 1.9x on d512
+// in the standalone probe, with bit-identical partials (loads only; the FP
+// arithmetic order is untouched). Requires an 8B (VPL=4) / 16B (VPL>=8)
+// aligned K/V base -- verified by the host dispatch, which otherwise falls
+// back to the serial kernel.
+template <int VPL>
+__device__ __forceinline__ void bs_ldrow(const unsigned short *p,
+                                         unsigned short *h) {
+  if (VPL == 4) {
+    uint2 w = *(const uint2 *)p;
+    h[0] = (unsigned short)(w.x); h[1] = (unsigned short)(w.x >> 16);
+    h[2] = (unsigned short)(w.y); h[3] = (unsigned short)(w.y >> 16);
+  } else {
+#pragma unroll
+    for (int p4 = 0; p4 < VPL / 8; p4++) {
+      uint4 w = *(const uint4 *)(p + p4 * 8);
+      h[p4*8+0]=(unsigned short)(w.x); h[p4*8+1]=(unsigned short)(w.x>>16);
+      h[p4*8+2]=(unsigned short)(w.y); h[p4*8+3]=(unsigned short)(w.y>>16);
+      h[p4*8+4]=(unsigned short)(w.z); h[p4*8+5]=(unsigned short)(w.z>>16);
+      h[p4*8+6]=(unsigned short)(w.w); h[p4*8+7]=(unsigned short)(w.w>>16);
+    }
+  }
+}
+// Partial pass: block (blockIdx.x = slab-local tile, blockIdx.y = split sp).
+// Body identical to blockq_body except the key walk is clipped to split sp's
+// sub-range [sp*split_len, (sp+1)*split_len), K/V loads are vectorized (see
+// bs_ldrow), and the result is written as partial (m, l, acc) instead of the
+// normalized output row. Empty sub-ranges (fully masked / beyond the tile's
+// causal end) write (-1e30, 0, 0) which the reduce weights to zero. grp0 =
+// first tile of this slab (scratch is sized for a slab of tiles, not the
+// whole grid -- a pure memory knob, slab boundaries never touch numerics).
+template <int TM, int VPL>
+__device__ __forceinline__ void
+blockq_split_body(const unsigned short *q, const unsigned short *k,
+                  const unsigned short *v, float *pm, float *pl, float *pacc,
+                  int HQ, int HKV, int N_q, int N_kv, int cache_from, int d,
+                  int window, float softcap, int ring_cap, int split_len,
+                  int n_splits, int grp0) {
+  const int lane = threadIdx.x;             // 0..31
+  const int grp = grp0 + blockIdx.x;
+  const int sp = blockIdx.y;
+  const int n_row_tiles = (N_q + TM - 1) / TM;
+  const int head_q = grp / n_row_tiles;
+  const int tile = grp % n_row_tiles;
+  const int m0 = tile * TM;
+  if (head_q >= HQ || m0 >= N_q) return;
+  const int gqa = HQ / HKV, hkv = head_q / gqa;
+  const int HD_Q = HQ * d, HD_KV = HKV * d;
+  const float scale = rsqrtf((float)d);
+  const int lane0 = lane * VPL;
+  float q_reg[TM][VPL], acc_reg[TM][VPL], m_i[TM], l_i[TM];
+  int valid[TM];
+#pragma unroll
+  for (int r = 0; r < TM; r++) {
+    int m = m0 + r; valid[r] = (m < N_q) ? 1 : 0; m_i[r] = -1e30f; l_i[r] = 0.f;
+    long q_base = (long)(valid[r] ? m : 0) * HD_Q + (long)head_q * d;
+#pragma unroll
+    for (int vv = 0; vv < VPL; vv++) {
+      q_reg[r][vv] = bs_h2f(q[q_base + lane0 + vv]); acc_reg[r][vv] = 0.f;
+    }
+  }
+  const int q_pos_off = cache_from;          // absolute query pos = m0+r+cache_from
+  int last_row = ((m0 + TM - 1 < N_q) ? (m0 + TM - 1) : (N_q - 1)) + q_pos_off;
+  int n_last = (N_kv - 1 < last_row) ? (N_kv - 1) : last_row;   // causal
+  int n_lo = (window > 0) ? (m0 + q_pos_off - window + 1) : 0;
+  if (n_lo < 0) n_lo = 0;
+  // clip to split sp's sub-range of the uniform key partition
+  int s_lo = sp * split_len; if (s_lo < n_lo) s_lo = n_lo;
+  long s_hi_l = (long)(sp + 1) * split_len - 1;
+  int s_hi = (s_hi_l > (long)n_last) ? n_last : (int)s_hi_l;
+  for (int n = s_lo; n <= s_hi; ++n) {
+    // [kv-window-ring] physical cache row = n % ring_cap (ring_cap<=0: linear).
+    long pn = (ring_cap > 0) ? (long)(n % ring_cap) : (long)n;
+    long kv_base = pn * HD_KV + (long)hkv * d + lane0;
+    unsigned short kh[VPL], vh[VPL];
+    bs_ldrow<VPL>(k + kv_base, kh);
+    bs_ldrow<VPL>(v + kv_base, vh);
+    float k_reg[VPL];
+#pragma unroll
+    for (int vv = 0; vv < VPL; vv++) k_reg[vv] = bs_h2f(kh[vv]);
+    float sdot[TM];
+#pragma unroll
+    for (int r = 0; r < TM; r++) {
+      float p = 0.f;
+#pragma unroll
+      for (int vv = 0; vv < VPL; vv++) p += q_reg[r][vv] * k_reg[vv];
+      sdot[r] = bs_wreduce(p);
+    }
+    float v_reg[VPL];
+#pragma unroll
+    for (int vv = 0; vv < VPL; vv++) v_reg[vv] = bs_h2f(vh[vv]);
+#pragma unroll
+    for (int r = 0; r < TM; r++) {
+      int m = m0 + r + q_pos_off;
+      if (!valid[r] || n > m || (window > 0 && n + window <= m)) continue;
+      float s = scale * sdot[r];
+      if (softcap > 0.f) s = softcap * tanhf(s / softcap);
+      float m_new = fmaxf(m_i[r], s), alpha = __expf(m_i[r] - m_new),
+            pp = __expf(s - m_new);
+#pragma unroll
+      for (int vv = 0; vv < VPL; vv++)
+        acc_reg[r][vv] = alpha * acc_reg[r][vv] + pp * v_reg[vv];
+      l_i[r] = alpha * l_i[r] + pp; m_i[r] = m_new;
+    }
+  }
+  // partial write; scratch rows are slab-local: (tile-in-slab, sp, r)
+  long sbase = ((long)blockIdx.x * n_splits + sp) * TM;
+#pragma unroll
+  for (int r = 0; r < TM; r++) {
+    if (lane == 0) { pm[sbase + r] = m_i[r]; pl[sbase + r] = l_i[r]; }
+#pragma unroll
+    for (int vv = 0; vv < VPL; vv++)
+      pacc[(sbase + r) * (long)d + lane0 + vv] = acc_reg[r][vv];
+  }
+}
+extern "C" __global__ void __launch_bounds__(32, 24)
+attn_blockq_split_d128(const unsigned short *q, const unsigned short *k,
+                       const unsigned short *v, float *pm, float *pl,
+                       float *pacc, int HQ, int HKV, int N_q, int N_kv,
+                       int cache_from, int d, int window, float softcap,
+                       int ring_cap, int split_len, int n_splits, int grp0) {
+  blockq_split_body<4, 4>(q, k, v, pm, pl, pacc, HQ, HKV, N_q, N_kv,
+                          cache_from, d, window, softcap, ring_cap, split_len,
+                          n_splits, grp0);
+}
+extern "C" __global__ void __launch_bounds__(32, 16)
+attn_blockq_split_d256(const unsigned short *q, const unsigned short *k,
+                       const unsigned short *v, float *pm, float *pl,
+                       float *pacc, int HQ, int HKV, int N_q, int N_kv,
+                       int cache_from, int d, int window, float softcap,
+                       int ring_cap, int split_len, int n_splits, int grp0) {
+  blockq_split_body<4, 8>(q, k, v, pm, pl, pacc, HQ, HKV, N_q, N_kv,
+                          cache_from, d, window, softcap, ring_cap, split_len,
+                          n_splits, grp0);
+}
+extern "C" __global__ void __launch_bounds__(32, 12)
+attn_blockq_split_d512(const unsigned short *q, const unsigned short *k,
+                       const unsigned short *v, float *pm, float *pl,
+                       float *pacc, int HQ, int HKV, int N_q, int N_kv,
+                       int cache_from, int d, int window, float softcap,
+                       int ring_cap, int split_len, int n_splits, int grp0) {
+  blockq_split_body<4, 16>(q, k, v, pm, pl, pacc, HQ, HKV, N_q, N_kv,
+                           cache_from, d, window, softcap, ring_cap, split_len,
+                           n_splits, grp0);
+}
+// Reduce pass: one 32-lane block per slab-local tile. Combines the n_splits
+// partials of each of the tile's TM rows with the standard flash merge
+// (M = max_s m_s; out = sum_s exp(m_s - M) acc_s / sum_s exp(m_s - M) l_s),
+// looping the splits in FIXED order in every lane -> deterministic, no
+// atomics. n_splits <= 32 is enforced by the host dispatch (w[] bound).
+extern "C" __global__ void
+attn_blockq_split_reduce(const float *pm, const float *pl, const float *pacc,
+                         unsigned short *o, int HQ, int N_q, int d,
+                         int n_splits, int grp0) {
+  const int TM = 4;
+  const int lane = threadIdx.x;             // 0..31
+  const int grp = grp0 + blockIdx.x;
+  const int n_row_tiles = (N_q + TM - 1) / TM;
+  const int head_q = grp / n_row_tiles;
+  const int tile = grp % n_row_tiles;
+  const int m0 = tile * TM;
+  if (head_q >= HQ || m0 >= N_q) return;
+  const int HD_Q = HQ * d;
+  const long tbase = (long)blockIdx.x * n_splits * TM;
+  for (int r = 0; r < TM; r++) {
+    const int m = m0 + r;
+    if (m >= N_q) continue;
+    float M = -1e30f;
+    for (int s = 0; s < n_splits; ++s)
+      M = fmaxf(M, pm[tbase + (long)s * TM + r]);
+    float w[32];
+    float L = 0.f;
+    for (int s = 0; s < n_splits; ++s) {
+      float ws = __expf(pm[tbase + (long)s * TM + r] - M);
+      w[s] = ws;
+      L += pl[tbase + (long)s * TM + r] * ws;
+    }
+    float inv = L > 0.f ? 1.f / L : 0.f;
+    unsigned short *orow = o + (long)m * HD_Q + (long)head_q * d;
+    for (int dd = lane; dd < d; dd += 32) {
+      float a = 0.f;
+      for (int s = 0; s < n_splits; ++s)
+        a += pacc[(tbase + (long)s * TM + r) * d + dd] * w[s];
+      orow[dd] = bs_f2h(a * inv);
+    }
+  }
+}
+)CU";
+
 // Row-wise causal+window softmax over a per-head scores matrix [N_q, N_kv]
 // (row-major: scores[i*N_kv + j] = dot(Q_i, K_j) already scaled). Masks
 // j>i_abs (causal) and j<i_abs-window+1 (sliding) to 0, softmax in FP32 over
@@ -1187,6 +1411,153 @@ bool attention_gemm_prefill_fp16(const unsigned short *q,
   }
   return true;
 }
+
+// --- split-KV chunked-prefill scratch (partial m/l/acc, slab-sized) ---
+// Separate from the decode scratch (g_pm/...): that one is pre-sized by
+// cuda_attention_splitkv_prewarm under the M2-B fixed-stride contract; the
+// prefill path is never graph-captured, so plain lazy growth is fine here.
+float *g_bs_pm = nullptr, *g_bs_pl = nullptr, *g_bs_pacc = nullptr;
+size_t g_bs_pm_cap = 0, g_bs_pacc_cap = 0;
+std::mutex g_bs_mtx;
+bool ensure_bs(size_t mn, size_t acc) {
+  if (mn > g_bs_pm_cap) {
+    if (StreamManager::Global().isCapturing())
+      return false; // prefill is never captured; guard anyway (see ensure_sk)
+    if (g_bs_pm)
+      cudaFree(g_bs_pm);
+    if (g_bs_pl)
+      cudaFree(g_bs_pl);
+    if (cudaMalloc(&g_bs_pm, mn * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&g_bs_pl, mn * sizeof(float)) != cudaSuccess) {
+      g_bs_pm = g_bs_pl = nullptr;
+      g_bs_pm_cap = 0;
+      return false;
+    }
+    g_bs_pm_cap = mn;
+  }
+  if (acc > g_bs_pacc_cap) {
+    if (StreamManager::Global().isCapturing())
+      return false;
+    if (g_bs_pacc)
+      cudaFree(g_bs_pacc);
+    if (cudaMalloc(&g_bs_pacc, acc * sizeof(float)) != cudaSuccess) {
+      g_bs_pacc = nullptr;
+      g_bs_pacc_cap = 0;
+      return false;
+    }
+    g_bs_pacc_cap = acc;
+  }
+  return true;
+}
+
+// Split-KV chunked prefill (see ATTN_BLOCKQ_SPLIT_SRC). The K axis is cut
+// into n_splits = ceil(N_kv/split_len) fixed uniform partitions (capped at
+// 32; the cap re-derives split_len so the partition stays a pure function of
+// N_kv -> deterministic). Tiles are dispatched in slabs bounded by a fixed
+// scratch budget; slab boundaries never affect numerics (each row reduces
+// over its own splits only). On ANY failure the caller falls through to the
+// serial blockq_body which recomputes every row -- output is never mixed.
+bool attention_blockq_splitkv_prefill(
+  const unsigned short *q, const unsigned short *k, const unsigned short *v,
+  unsigned short *o, int HQ, int HKV, int N_q, int N_kv, int cache_from, int d,
+  int window, float softcap, int ring_cap, int split_len) {
+  const int TM = 4; // must match blockq_body / the _split kernels
+  int n_splits = (N_kv + split_len - 1) / split_len;
+  if (n_splits >
+      32) { // grid.y + reduce w[32] bound; re-derive deterministically
+    split_len = (N_kv + 31) / 32;
+    n_splits = (N_kv + split_len - 1) / split_len;
+  }
+  if (n_splits < 2)
+    return false;
+  // The split kernels read K/V through uint2/uint4 slices (bs_ldrow). All
+  // in-row offsets are provably aligned (d and lane0*2B are multiples of the
+  // width) but the pool packs tensors by cumulative byte size with NO
+  // alignment padding, so the cache BASE can land misaligned -- verify here
+  // and let the caller fall back to the serial kernel otherwise.
+  const size_t amask = (d == 128) ? (size_t)7 : (size_t)15;
+  if ((((size_t)k | (size_t)v) & amask) != 0) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      fprintf(stderr,
+              "[cuda-splitkv] WARNING: K/V cache base not %zu-byte "
+              "aligned; keeping the serial prefill kernel\n",
+              amask + 1);
+    }
+    return false;
+  }
+  const char *fn = (d == 256)   ? "attn_blockq_split_d256"
+                   : (d == 512) ? "attn_blockq_split_d512"
+                                : "attn_blockq_split_d128";
+  auto kp = CudaContext::Global().registerCudaKernel(ATTN_BLOCKQ_SPLIT_SRC, fn);
+  auto kr = CudaContext::Global().registerCudaKernel(
+    ATTN_BLOCKQ_SPLIT_SRC, "attn_blockq_split_reduce");
+  if (!kp || !kr)
+    return false;
+  const int n_row_tiles = (N_q + TM - 1) / TM;
+  const int n_grp = HQ * n_row_tiles;
+  // scratch budget (pacc dominates): default 64 MiB, env-tunable. A pure
+  // memory/duty-cycle knob -- numerics are slab-invariant.
+  static const long budget_floats = []() {
+    const char *e = std::getenv("NNTR_CUDA_SPLITKV_PREFILL_MB");
+    long mb = e ? atol(e) : 0;
+    if (mb <= 0)
+      mb = 64;
+    return mb * (long)(1 << 20) / (long)sizeof(float);
+  }();
+  const long per_tile_acc = (long)n_splits * TM * d;
+  int tiles_per_slab = (int)(budget_floats / per_tile_acc);
+  if (tiles_per_slab < 1)
+    tiles_per_slab = 1;
+  if (tiles_per_slab > n_grp)
+    tiles_per_slab = n_grp;
+  std::lock_guard<std::mutex> lk(g_bs_mtx);
+  if (!ensure_bs((size_t)tiles_per_slab * n_splits * TM,
+                 (size_t)tiles_per_slab * per_tile_acc))
+    return false;
+  const int pb[3] = {32, 1, 1};
+  for (int grp0 = 0; grp0 < n_grp; grp0 += tiles_per_slab) {
+    const int slab =
+      (n_grp - grp0 < tiles_per_slab) ? (n_grp - grp0) : tiles_per_slab;
+    kp->SetKernelArguments(0, &q, sizeof(q));
+    kp->SetKernelArguments(1, &k, sizeof(k));
+    kp->SetKernelArguments(2, &v, sizeof(v));
+    kp->SetKernelArguments(3, &g_bs_pm, sizeof(g_bs_pm));
+    kp->SetKernelArguments(4, &g_bs_pl, sizeof(g_bs_pl));
+    kp->SetKernelArguments(5, &g_bs_pacc, sizeof(g_bs_pacc));
+    kp->SetKernelArguments(6, &HQ, sizeof(HQ));
+    kp->SetKernelArguments(7, &HKV, sizeof(HKV));
+    kp->SetKernelArguments(8, &N_q, sizeof(N_q));
+    kp->SetKernelArguments(9, &N_kv, sizeof(N_kv));
+    kp->SetKernelArguments(10, &cache_from, sizeof(cache_from));
+    kp->SetKernelArguments(11, &d, sizeof(d));
+    kp->SetKernelArguments(12, &window, sizeof(window));
+    kp->SetKernelArguments(13, &softcap, sizeof(softcap));
+    kp->SetKernelArguments(14, &ring_cap, sizeof(ring_cap));
+    kp->SetKernelArguments(15, &split_len, sizeof(split_len));
+    kp->SetKernelArguments(16, &n_splits, sizeof(n_splits));
+    kp->SetKernelArguments(17, &grp0, sizeof(grp0));
+    // grid: x = tiles (fast axis -> same-split blocks run together, keeping
+    // their K frontier L2-aligned), y = splits.
+    const int pg[3] = {slab, n_splits, 1};
+    if (!StreamManager::Global().DispatchCommand(*kp, pg, pb, 0))
+      return false;
+    kr->SetKernelArguments(0, &g_bs_pm, sizeof(g_bs_pm));
+    kr->SetKernelArguments(1, &g_bs_pl, sizeof(g_bs_pl));
+    kr->SetKernelArguments(2, &g_bs_pacc, sizeof(g_bs_pacc));
+    kr->SetKernelArguments(3, &o, sizeof(o));
+    kr->SetKernelArguments(4, &HQ, sizeof(HQ));
+    kr->SetKernelArguments(5, &N_q, sizeof(N_q));
+    kr->SetKernelArguments(6, &d, sizeof(d));
+    kr->SetKernelArguments(7, &n_splits, sizeof(n_splits));
+    kr->SetKernelArguments(8, &grp0, sizeof(grp0));
+    const int rg[3] = {slab, 1, 1};
+    if (!StreamManager::Global().DispatchCommand(*kr, rg, pb))
+      return false;
+  }
+  return true;
+}
 } // namespace
 
 // Pre-grow the split-KV decode scratch (g_pm/g_pl/g_pacc) to the model's max
@@ -1295,21 +1666,25 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   constexpr int GEMM_ATTN_MIN_KV = 4096;
   const int gemm_min_kv =
     (gemm_attn_mode > 1) ? gemm_attn_mode : GEMM_ATTN_MIN_KV;
-  // [kv-window-ring] the cuBLAS GEMM prefill reads K/V as one contiguous
-  // [N_kv, HD] slab, which a ring buffer is not -- exclude ringed layers from
-  // it outright (they are sliding layers, whose block-Q walk is window-bounded
-  // anyway).
   const bool gemm_attn_on =
-    ring_cap <= 0 &&
-    ((gemm_attn_mode == 1) ||
-     (gemm_attn_mode != 0 &&
-      (integrated_gpu || (win_bq == 0 && N_kv >= gemm_min_kv))));
+    (gemm_attn_mode == 1) ||
+    (gemm_attn_mode != 0 &&
+     (integrated_gpu || (win_bq == 0 && N_kv >= gemm_min_kv)));
   // head_dim 256/512 (gemma4 sliding/global) were historically excluded because
   // block-Q beat the cuBLAS path on RTX/Adreno. On Orin (sm_87) block-Q runs at
   // only ~0.2 TFLOP/s, so the cuBLAS int8/fp16 Tensor-Core QK/PV is worth
   // trying here -- opt-in via NNTR_CUDA_GEMM_ATTN, so other arches keep
-  // block-Q.
-  if (gemm_attn_on && N_q > 1) {
+  // block-Q. [kv-window-ring] attention_gemm_prefill_fp16 hands K/V straight to
+  // cuBLAS as dense [N_kv, d] matrices, so it can only be used while the ring
+  // has NOT wrapped (logical rows <= ring_cap). Past that the physical cache
+  // holds only ring_cap rows and a linear walk both reads past the mirror and
+  // pairs the wrong key with each query; fall through to the ring-mapping
+  // kernels below. Gating the arm on `ring_cap <= 0` instead disables it for
+  // the WHOLE of a ring profile, including the un-wrapped span where it is both
+  // correct and the fastest arm available -- keep the wrap test, not the ring
+  // test.
+  const bool ring_linear = (ring_cap <= 0) || (N_kv <= ring_cap);
+  if (gemm_attn_on && N_q > 1 && ring_linear) {
     if (attention_gemm_prefill_fp16(q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q,
                                     num_heads_KV, N_q, N_kv, cache_from,
                                     head_dim, window, softcap)) {
@@ -1326,6 +1701,43 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   static const bool blockq_on = nntr_env_on("NNTR_CUDA_BLOCKQ");
   if (blockq_on && N_q > 1 &&
       (head_dim == 128 || head_dim == 256 || head_dim == 512)) {
+    // [splitkv-prefill] NNTR_CUDA_SPLITKV_PREFILL: unset/=1 -> ON with the
+    // default 4096-key split (engage threshold == split_len, so any context
+    // at or below it takes the serial kernel VERBATIM -- 1K runs are
+    // bit-unchanged); =N>1 -> custom split length; =0 -> OFF (kill-switch:
+    // reproduces the pre-lever serial streams byte-for-byte). Global/full
+    // layers only (win_bq==0): the sliding layers' key walk is already
+    // bounded by the n_lo window skip.
+    // DEFAULT ON (owner decision + golden re-baseline, qwen3 precedent):
+    // deterministic (byte-stable run to run), numerics fp64-probe-equal to
+    // the serial kernel (<=1 fp16 ulp on 0.67% of outputs, equal rms vs an
+    // fp64 reference); the d512 32K stream is byte-identical to serial; the
+    // d128 32K cell flips ONE near-tie argmax in the generated continuation
+    // -- that stream is re-baselined as the new canonical golden. Measured
+    // (RTX 5060, 32K/chunk1024/ring profile cells): d512-global model
+    // 1760.3 -> 2850.3 prefill TPS (+62%), d128-global model 2489.6 ->
+    // 2678.7 (+7.6%), decode untouched, 1K cells byte-identical (below
+    // threshold), +64 MiB scratch.
+    static const int sp_len = []() {
+      const char *e = std::getenv("NNTR_CUDA_SPLITKV_PREFILL");
+      if (!e || e[0] == '\0')
+        return 4096; // default ON (owner decision, see above)
+      int v_ = atoi(e);
+      if (v_ <= 0)
+        return 0;
+      return (v_ == 1) ? 4096 : v_;
+    }();
+    // win_bq (sliding mask disabled when window<=0 or window>=N_kv) is hoisted
+    // above the GEMM gate; the split path shares the exact same semantic.
+    if (sp_len > 0 && win_bq == 0 && N_kv > sp_len) {
+      if (attention_blockq_splitkv_prefill(
+            q_fp16, k_fp16, v_fp16, o_fp16, num_heads_Q, num_heads_KV, N_q,
+            N_kv, cache_from, head_dim, win_bq, softcap, ring_cap, sp_len)) {
+        StreamManager::Global().maybeFinish();
+        return true;
+      }
+      // any failure: fall through to the serial blockq (full recompute)
+    }
     const char *fn = (head_dim == 256)   ? "attn_blockq_d256"
                      : (head_dim == 512) ? "attn_blockq_d512"
                                          : "attn_blockq_d128";
