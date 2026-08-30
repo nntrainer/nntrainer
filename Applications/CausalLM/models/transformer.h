@@ -160,13 +160,21 @@ inline unsigned int requestedPrefillChunk() {
  * write never straddles the wrap seam (it stays one contiguous slice), and
  * >= W + C means the live window [pos-W+1, pos+C) never self-collides mod Wcap.
  * Returning 0 keeps the exact pre-ring behaviour, so ring-off is bit-identical.
+ *
+ * @param chunk C, the chunk the prefill ACTUALLY runs -- Transformer::
+ * prefillChunk(), not requestedPrefillChunk(). Sizing the ring off the raw
+ * request while the prefill runs the clamped one buys nothing (the live span
+ * is bounded by the chunk that runs) and costs a Wcap up to 4x too large.
+ * It is a parameter rather than a call so that the caller's chunk and this
+ * cap cannot drift apart.
  */
-inline unsigned int kvRingCap(unsigned int local_window, unsigned int max_seq) {
+inline unsigned int kvRingCap(unsigned int local_window, unsigned int max_seq,
+                              unsigned int chunk) {
   if (!kvRingEnabled())
     return 0; // ring off -> full max_seq (bit-identical legacy)
   if (local_window == 0 || local_window >= max_seq)
     return 0; // full-attention layer -> no ring
-  const unsigned int C = requestedPrefillChunk();
+  const unsigned int C = chunk;
   if (C == 0)
     return 0; // the ring requires chunked prefill to bound the live span
   // multiple of C, >= W + C (headroom so the window never wraps onto itself).
@@ -386,9 +394,10 @@ public:
    */
   unsigned int getKVCacheRows(int layer_id) const {
     const unsigned int cap =
-      kvRingSupported() ? kvRingCap(getLayerSlidingWindow(layer_id),
-                                    static_cast<unsigned int>(MAX_SEQ_LEN))
-                        : 0u;
+      kvRingSupported()
+        ? kvRingCap(getLayerSlidingWindow(layer_id),
+                    static_cast<unsigned int>(MAX_SEQ_LEN), prefillChunk())
+        : 0u;
     return cap ? cap : static_cast<unsigned int>(MAX_SEQ_LEN);
   }
 

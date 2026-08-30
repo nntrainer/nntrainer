@@ -557,9 +557,9 @@ MHACoreLayer::MHACoreLayer() :
     nntrainer::props::OutputShape(), nntrainer::props::DropOutRate(),
     nntrainer::props::ReturnAttentionWeight(),
     nntrainer::props::AverageAttentionWeight(), nntrainer::props::MaxTimestep(),
-    props::SlidingWindow(), props::MaxNewTokens(), props::RopeTheta(),
-    props::UseRope(), props::MaxPositionEmbeddings(), props::UseSink(),
-    props::RopeScalingType(), props::RopeScalingFactor(),
+    props::SlidingWindow(), props::InitSeqLen(), props::MaxNewTokens(),
+    props::RopeTheta(), props::UseRope(), props::MaxPositionEmbeddings(),
+    props::UseSink(), props::RopeScalingType(), props::RopeScalingFactor(),
     props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
     props::AttnLogitSoftcapping(), props::IsCausal(), props::UseGemmAttention(),
     props::GpuDecodeAttn(), props::GpuDecodeRope(), props::GpuOhwiRope()),
@@ -611,21 +611,33 @@ static bool mha_kv_ring_enabled() {
   return false;
 #endif
 }
-static unsigned int mha_effective_chunk() {
+// `init_seq_len` = the activation-plane height, which the model tells us as a
+// layer property. A chunk is fed at row 0 of that plane, so the chunk that
+// actually runs is the request clamped to it -- mirroring
+// causallm::Transformer::prefillChunk(). Sizing the ring off the unclamped
+// request (a 4096 request against a 1024-row plane) leaves Wcap up to 4x too
+// large; the model side clamps, so this side must clamp identically.
+static unsigned int mha_effective_chunk(unsigned int init_seq_len) {
+  unsigned int c;
   const char *pc = std::getenv("NNTR_PREFILL_CHUNK");
   if (pc && pc[0])
-    return static_cast<unsigned int>(std::atoi(pc));
-  if (!mha_kv_ring_enabled())
+    c = static_cast<unsigned int>(std::atoi(pc));
+  else if (!mha_kv_ring_enabled())
     return 0u;
-  return 4096u; // both backends -- see causallm::effectivePrefillChunk
+  else
+    c = 4096u; // both backends -- see causallm::requestedPrefillChunk
+  if (c == 0 || init_seq_len == 0)
+    return c;
+  return std::min(c, init_seq_len);
 }
 static unsigned int mha_kv_ring_cap(unsigned int local_window,
-                                    unsigned int max_seq) {
+                                    unsigned int max_seq,
+                                    unsigned int init_seq_len) {
   if (!mha_kv_ring_enabled())
     return 0;
   if (local_window == 0 || local_window >= max_seq)
     return 0;
-  const unsigned int C = mha_effective_chunk();
+  const unsigned int C = mha_effective_chunk(init_seq_len);
   if (C == 0)
     return 0;
   const unsigned int cap = (local_window / C + 2u) * C;
@@ -664,11 +676,16 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** [kv-window-ring] physical ring capacity for this (sliding) layer. The ring
    * is fp16 external-cache only for now; the int8 internal cache (allocated at
    * full max_seq below) is NOT ring-sized, so keep it linear. */
+  const unsigned int init_seq_len =
+    std::get<props::InitSeqLen>(mha_core_props).get()
+      ? std::get<props::InitSeqLen>(mha_core_props).get()
+      : query_dim.height(); // unset -> the plane we were handed
   kv_ring_cap =
     (std::getenv("NNTR_KV_INT8") != nullptr || !use_external_cache ||
      std::get<props::UseSink>(mha_core_props).get())
       ? 0u
-      : mha_kv_ring_cap((unsigned int)local_window_size, max_timestep);
+      : mha_kv_ring_cap((unsigned int)local_window_size, max_timestep,
+                        init_seq_len);
 
   /** attention scaling computation */
   rope_scaling_type = std::get<props::RopeScalingType>(mha_core_props).get();
