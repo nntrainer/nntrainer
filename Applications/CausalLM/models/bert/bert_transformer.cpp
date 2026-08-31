@@ -211,12 +211,15 @@ Tensor BertTransformer::createAttention(const int layer_id, int seq_len,
 
   // Attention core layer (bidirectional, no RoPE)
   std::vector<std::string> a_params = {
-    withKey("name", A),
-    withKey("num_heads", n_heads),
+    withKey("name", A), withKey("num_heads", n_heads),
     withKey("num_heads_kv", n_heads / GQA_SIZE),
     withKey("max_timestep", std::to_string(INIT_SEQ_LEN)),
-    withKey("rope_theta", ROPE_THETA),
-    withKey("use_rope", "false"),
+    // init_seq_len is the activation-plane height mha_core clamps the prefill
+    // chunk to. Every other model passes it; without it mha_core falls back to
+    // query_dim.height(). Benign for BERT (no sliding window, so no KV ring)
+    // but it should not be the one model that answers the question differently.
+    withKey("init_seq_len", std::to_string(INIT_SEQ_LEN)),
+    withKey("rope_theta", ROPE_THETA), withKey("use_rope", "false"),
     withKey("is_causal", "false"),
     // use_gemm_attention routes the (non-causal, encoder) prefill onto the GPU
     // flash path, which handles is_causal=false + no-RoPE.
