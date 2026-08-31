@@ -25,6 +25,7 @@ using DT = ml::train::TensorDim::DataType;
 bool isQuantized(DT dtype) {
   switch (dtype) {
   case DT::Q4_0:
+  case DT::Q8_0:
   case DT::Q4_K:
   case DT::Q6_K:
   case DT::Q8_0:
@@ -58,6 +59,7 @@ const char *dtypeToString(DT dtype) {
   // safetensors parsers can still read them; the native type is recorded
   // separately via the nntr_dtype extension field.
   case DT::Q4_0:
+  case DT::Q8_0:
   case DT::Q4_K:
   case DT::Q6_K:
   case DT::Q8_0:
@@ -89,6 +91,8 @@ const char *nntrDtypeName(DT dtype) {
     return "UINT32";
   case DT::Q4_0:
     return "Q4_0";
+  case DT::Q8_0:
+    return "Q8_0";
   case DT::Q4_K:
     return "Q4_K";
   case DT::Q6_K:
@@ -124,6 +128,8 @@ DT nntrDtypeFromName(const std::string &name) {
     return DT::UINT32;
   if (up == "Q4_0")
     return DT::Q4_0;
+  if (up == "Q8_0")
+    return DT::Q8_0;
   if (up == "Q4_K")
     return DT::Q4_K;
   if (up == "Q6_K")

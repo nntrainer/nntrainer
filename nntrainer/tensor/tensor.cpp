@@ -19,6 +19,7 @@
 #include <lazy_tensor.h>
 #include <q4_0_tensor.h>
 #include <q4_k_tensor.h>
+#include <q8_0_tensor.h>
 #include <q6_k_tensor.h>
 #include <q8_0_tensor.h>
 #include <qs4cx_tensor.h>

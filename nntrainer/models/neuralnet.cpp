@@ -121,6 +121,7 @@ Tensor mapExternalTensor(float *buf, const TensorDim &dim,
   case TensorDim::DataType::Q4_K:
   case TensorDim::DataType::Q6_K:
   case TensorDim::DataType::Q4_0:
+  case TensorDim::DataType::Q8_0:
     return Tensor::Map<uint8_t>(reinterpret_cast<uint8_t *>(buf), bytes, dim,
                                 0);
   case TensorDim::DataType::UINT32:
