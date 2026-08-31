@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -362,22 +363,47 @@ void ScreenAICaption::generateFromEncoderHidden(
   size_t peak_memory = getPeakMemoryKb();
 
   if (log_output) {
-    std::cout << "[ScreenAICaption] token_ids:";
-    for (int t : token_ids_)
-      std::cout << " " << t;
-    std::cout << "\n[ScreenAICaption] caption: " << caption_ << "\n";
+    if (std::getenv("JSON_OUTPUT") != nullptr) {
+      std::string escaped_caption = "";
+      for (char c : caption_) {
+        if (c == '"') escaped_caption += "\\\"";
+        else if (c == '\\') escaped_caption += "\\\\";
+        else escaped_caption += c;
+      }
+      std::cout << "{\n"
+                << "  \"caption\": \"" << escaped_caption << "\",\n"
+                << "  \"token_ids\": [";
+      for (size_t i = 0; i < token_ids_.size(); ++i) {
+        std::cout << (i ? ", " : "") << token_ids_[i];
+      }
+      std::cout << "],\n"
+                << "  \"prefill_tokens\": " << BertDecoder::BD_ENC_LEN << ",\n"
+                << "  \"prefill_ms\": " << prefill_ms << ",\n"
+                << "  \"prefill_tps\": " << prefill_tps << ",\n"
+                << "  \"generation_tokens\": " << generation_cnt << ",\n"
+                << "  \"generation_ms\": " << generation_ms << ",\n"
+                << "  \"generation_tps\": " << generation_tps << ",\n"
+                << "  \"total_ms\": " << total_ms << ",\n"
+                << "  \"peak_memory_kb\": " << peak_memory << "\n"
+                << "}\n";
+    } else {
+      std::cout << "[ScreenAICaption] token_ids:";
+      for (int t : token_ids_)
+        std::cout << " " << t;
+      std::cout << "\n[ScreenAICaption] caption: " << caption_ << "\n";
 
-    std::cout << "\n";
-    std::cout << "=================[ ScreenAICaption with NNTrainer "
-                 "]===================\n";
-    std::cout << "encoder+prefill: " << BertDecoder::BD_ENC_LEN << " tokens, "
-              << prefill_ms << " ms, " << prefill_tps << " TPS\n";
-    std::cout << "generation: " << generation_cnt << " tokens, "
-              << generation_ms << " ms, " << generation_tps << " TPS\n";
-    std::cout << "total: " << total_ms << " ms\n";
-    std::cout << "peak memory: " << peak_memory << " KB\n";
-    std::cout << "============================================================="
-                 "=========\n";
+      std::cout << "\n";
+      std::cout << "=================[ ScreenAICaption with NNTrainer "
+                   "]===================\n";
+      std::cout << "encoder+prefill: " << BertDecoder::BD_ENC_LEN << " tokens, "
+                << prefill_ms << " ms, " << prefill_tps << " TPS\n";
+      std::cout << "generation: " << generation_cnt << " tokens, "
+                << generation_ms << " ms, " << generation_tps << " TPS\n";
+      std::cout << "total: " << total_ms << " ms\n";
+      std::cout << "peak memory: " << peak_memory << " KB\n";
+      std::cout << "============================================================="
+                   "=========\n";
+    }
   }
 
   // Populate performance_metrics (inherited from Transformer).
