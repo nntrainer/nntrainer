@@ -719,6 +719,7 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
     break;
   case Tdatatype::Q4_0:
   case Tdatatype::Q6_K:
+  case Tdatatype::Q8_0:
     dotQnK(input, output, trans, trans_in, beta, input.getDataType());
     break;
   default:
@@ -744,6 +745,26 @@ Tensor &HalfTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     break;
   case Tdatatype::Q6_K:
     o->gemm_q6_K_fp16(M, N, K, data, K, (void *)mdata, N, rdata, N);
+    break;
+  case Tdatatype::Q8_0:
+    /// Q8_0 has no direct GEMM kernel for FP16; dequantize to FP32 then
+    /// cast to FP16 for GEMM
+    M = getDim().height();
+    K = getDim().width();
+    N = input.getDim().width();
+    {
+      size_t total_elems = (size_t)K * N;
+      std::vector<float> dq_buf(total_elems);
+      dequantize_row_q8_0((const void *)mdata, dq_buf.data(),
+                          (int64_t)total_elems);
+      // Cast to FP16
+      std::vector<_FP16> dq_fp16(total_elems);
+      for (size_t i = 0; i < total_elems; ++i)
+        dq_fp16[i] = static_cast<_FP16>(dq_buf[i]);
+      const float alpha = 1.0f;
+      o->sgemm_fp16((unsigned int)dim.getStorageOrder(), false, true, M, N, K,
+                    alpha, data, K, dq_fp16.data(), K, beta, rdata, N);
+    }
     break;
   default:
     throw std::invalid_argument("Error: unsupported datatype");

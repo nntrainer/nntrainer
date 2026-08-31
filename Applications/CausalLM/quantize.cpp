@@ -154,7 +154,7 @@ DataType strToDataType(const std::string &s) {
   auto it = dtype_str_map.find(upper);
   if (it == dtype_str_map.end()) {
     throw std::invalid_argument("Unsupported data type: " + s +
-                                ". Supported: FP32, FP16, Q4_0, Q6_K, Q4_K");
+                                ". Supported: FP32, FP16, Q4_0, Q8_0, Q6_K, Q4_K");
   }
   return it->second;
 }

@@ -779,7 +779,8 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   Tdatatype input_dtype = input[0]->getDataType();
 
   // Handle standard inputs
-  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::QINT4) {
+  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::Q8_0 &&
+      input_dtype != Tdatatype::QINT4) {
     for (unsigned int i = 0; i < input.size(); ++i) {
       dot(*input[i], *output[i], trans, trans_in, beta);
     }
@@ -1170,7 +1171,7 @@ void FloatTensor::copyData(const Tensor &from) {
     << getName() << " is not contiguous, cannot copy.";
 
   NNTR_THROW_IF(size() != from.size(), std::invalid_argument)
-    << "Size of tensor to copy must match";
+    << "Size of tensor to copy must match: " << size() << " vs " << from.size();
 
   switch (from.getDataType()) {
   case ml::train::TensorDim::DataType::FP32:

@@ -204,7 +204,7 @@ def collect_decoder(sd, dtype):
         arr = tensor_to_numpy(tensor, dtype, transpose=transpose)
         weights.append((name, arr))
 
-    bp = "decoder.bert."
+    bp = "bert."
 
     # 1–4. Embeddings
     add("word_emb:weight",
@@ -286,7 +286,7 @@ def collect_decoder(sd, dtype):
             sd[f"{lp}output.LayerNorm.bias"])
 
     # 6. LM head (word-embedding projection is TIED — not re-saved)
-    cp = "decoder.cls."
+    cp = "cls."
     add("lmhead_dense:weight",
         sd[f"{cp}predictions.transform.dense.weight"], transpose=True)
     add("lmhead_dense:bias",

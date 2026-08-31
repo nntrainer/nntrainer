@@ -339,7 +339,7 @@ template <typename T> void UIntTensor<T>::copyData(const Tensor &from) {
     << getName() << " is not contiguous, cannot copy.";
 
   NNTR_THROW_IF(size() != from.size(), std::invalid_argument)
-    << "Size of tensor to copy must match";
+    << "Size of tensor to copy must match: " << size() << " vs " << from.size();
 
   // copy data with the same data type T
   if (from.getDataType() == getDataType()) {
