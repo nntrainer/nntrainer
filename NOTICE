@@ -1,6 +1,14 @@
 This project includes code derived from llama.cpp
 which is licensed under the MIT License:
 
+Files under nntrainer/tensor/hexagon/htp/hex/ (hex-utils.h, hex-fastdiv.h,
+hex-dump.h, hex-common.h), nntrainer/tensor/hexagon/htp/dma/ (dma-queue.c,
+dma-queue.h), and nntrainer/tensor/hexagon/htp/hvx/ (hvx-exp.h, hvx-base.h,
+hvx-floor.h, hvx-inverse.h, hvx-types.h) are imported from llama.cpp's
+ggml-hexagon backend (https://github.com/ggml-org/llama.cpp,
+ggml/src/ggml-hexagon/htp/) and are likewise MIT-licensed; see the MIT
+License text below.
+
 MIT License
 
 Copyright (c) 2023-2024 The ggml authors

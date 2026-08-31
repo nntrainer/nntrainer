@@ -271,33 +271,35 @@ if get_option('opencl-kernel-path') != ''
   extra_defines += '-DOPENCL_KERNEL_PATH=@0@'.format(get_option('opencl-kernel-path'))
 endif
 
-# HTP (Hexagon/HMX) backend via Qualcomm HexKL CPU Macro API (libsdkl.so).
-# Qualcomm Snapdragon only — libsdkl.so talks to the Hexagon DSP over FastRPC,
-# so it needs a Qualcomm SoC with an HTP/HMX block, not ARM in general, and
-# there is no x86 build of it. Default off, so x86/CI builds are unaffected.
-# hexkl_dep is referenced only under this guard (mirrors how clblast_dep is
-# referenced only when enable-opencl).
-if get_option('enable-htp')
-  hexkl_root = get_option('hexkl-sdk-root')
-  if hexkl_root == ''
-    error('enable-htp=true requires -Dhexkl-sdk-root=<path to hexkl_addon>')
+# Hexagon HVX backend: host-side sources talk to the cDSP over FastRPC.
+# Android only (libcdsprpc.so). The DSP skel is built separately by
+# tools/hexagon/build_skel.sh (hexagon-clang, not this toolchain).
+if get_option('enable-hexagon')
+  if get_option('platform') != 'android'
+    error('enable-hexagon is Android-only (FastRPC/libcdsprpc)')
   endif
-  hexkl_lib_dir = hexkl_root / 'lib' / get_option('hexkl-lib-subdir')
-  # Derive the Hexagon SDK root from the addon path (two levels up).
-  # remote.h and AEEStdErr.h live under <sdk_root>/incs/ and
-  # <sdk_root>/incs/stddef/ respectively; sdkl.h is in the addon include/.
-  hexagon_sdk_root = fs.parent(fs.parent(hexkl_root))
-  hexkl_inc = include_directories(
-    hexkl_root / 'include',
-    hexagon_sdk_root / 'incs',
-    hexagon_sdk_root / 'incs' / 'stddef',
-    is_system: true)
-  libsdkl = cc.find_library('sdkl', dirs: hexkl_lib_dir, required: true)
-  hexkl_dep = declare_dependency(
-    dependencies: libsdkl,
-    include_directories: hexkl_inc)
-  extra_defines += '-DENABLE_HEXKL=1'
-  message('HTP/HexKL backend enabled, linking ' + hexkl_lib_dir / 'libsdkl.so')
+  hvx_sdk_root = get_option('hexagon-sdk-root')
+  if hvx_sdk_root == ''
+    error('enable-hexagon=true requires -Dhexagon-sdk-root=<Hexagon_SDK/x.y.z>')
+  endif
+  hvx_lib_dir = hvx_sdk_root / 'ipc' / 'fastrpc' / 'remote' / 'ship' / 'android_aarch64'
+  # QAIC stub generation at configure time so the output paths are plain
+  # strings for the Android.mk source list.
+  hvx_gen_dir = meson.build_root() / 'nntr_htp_generated'
+  run_command('mkdir', '-p', hvx_gen_dir, check: true)
+  run_command(hvx_sdk_root / 'ipc' / 'fastrpc' / 'qaic' / 'Ubuntu' / 'qaic',
+    '-I', hvx_sdk_root / 'incs',
+    '-I', hvx_sdk_root / 'incs' / 'stddef',
+    '-mdll', '-o', hvx_gen_dir,
+    meson.source_root() / 'nntrainer' / 'tensor' / 'hexagon' / 'htp' / 'nntr_htp.idl',
+    check: true)
+  # Register the .idl as a reconfigure trigger: run_command alone tracks no
+  # dependency, so an idl edit would otherwise keep building the stale stub.
+  configure_file(
+    input: 'nntrainer' / 'tensor' / 'hexagon' / 'htp' / 'nntr_htp.idl',
+    output: 'nntr_htp.idl.tracked', copy: true)
+  extra_defines += '-DENABLE_HEXAGON=1'
+  message('Hexagon HVX backend enabled, SDK: ' + hvx_sdk_root)
 endif
 
 if get_option('enable-biqgemm')

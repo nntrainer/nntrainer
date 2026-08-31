@@ -45,6 +45,7 @@
 #include <utf8_stream_util.h>
 
 #include "api/streamer.h"
+#include "hexagon/hexagon_backend.h"
 
 namespace causallm {
 
@@ -134,6 +135,8 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
 }
 
 void CausalLM::allocateAndBindKVCache() {
+  if (hexagon_)
+    return; /* KV lives on the DSP */
   if (!kv_cache.isAllocated()) {
     // dtype matches mha_core's cache placeholders so external cache storage
     // is interpreted consistently across platforms.
@@ -205,6 +208,8 @@ void CausalLM::allocateAndBindKVCache() {
 }
 
 void CausalLM::setKVCachePosition(unsigned int pos) {
+  if (hexagon_)
+    return; /* the DSP takes pos per forward() */
   kv_cache.setPosition(pos);
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [pos](ml::train::Layer &l, nntrainer::RunLayerContext &, void *) {
@@ -345,6 +350,51 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
 
   return outputs;
 };
+
+bool CausalLM::initHexagon(const std::string &weight_file) {
+#ifdef ENABLE_HEXAGON
+  if (BATCH_SIZE != 1 || USE_KVCACHE || SKIP_PREFILL || !TIE_WORD_EMBEDDINGS) {
+    std::cerr << "hexagon: batch>1, kv-cache save/load, skip_prefill and an "
+                 "untied lm_head are not supported, CPU fallback\n";
+    return false;
+  }
+  using nntrainer::hexagon::HexModelConfig;
+  const HexModelConfig cfg = {static_cast<uint32_t>(NUM_LAYERS),
+                              static_cast<uint32_t>(NUM_HEADS),
+                              static_cast<uint32_t>(NUM_KEY_VALUE_HEADS),
+                              static_cast<uint32_t>(HEAD_DIM),
+                              static_cast<uint32_t>(DIM),
+                              static_cast<uint32_t>(INTERMEDIATE_SIZE),
+                              NUM_VOCAB,
+                              MAX_SEQ_LEN,
+                              /*max_chunk=*/128u,
+                              NORM_EPS,
+                              static_cast<float>(ROPE_THETA)};
+  hexagon_ = nntrainer::hexagon::HexagonBackend::create(weight_file, cfg);
+  is_initialized = hexagon_ != nullptr;
+  return is_initialized;
+#else
+  return false;
+#endif
+}
+
+std::vector<float *> CausalLM::hexagonInfer(const float *ids, unsigned int n,
+                                            unsigned int pos) {
+#ifdef ENABLE_HEXAGON
+  std::vector<int32_t> tokens(ids, ids + n);
+  float *logits = new float[NUM_VOCAB];
+  const int err = hexagon_->forward(tokens.data(), n, pos, logits);
+  if (err) {
+    delete[] logits;
+    // No CPU graph to fall back to mid-generation: stop the run.
+    throw std::runtime_error("hexagon: forward failed (0x" +
+                             std::to_string(err) + ")");
+  }
+  return {logits};
+#else
+  throw std::runtime_error("hexagon backend not built");
+#endif
+}
 
 void CausalLM::registerCustomLayers() {
   Transformer::registerCustomLayers();
@@ -509,7 +559,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       inference_inputs.push_back(cache_input.second);
     return inference_inputs;
   };
-  input = build_inference_inputs();
+  if (!hexagon_)
+    input = build_inference_inputs();
 
   ///@note contains possible bug
   // std::vector<ml::train::TensorDim> input_dims;
@@ -520,6 +571,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   auto start_prefill = std::chrono::high_resolution_clock::now();
 
   std::vector<float *> output;
+  // engine="htp": the whole forward runs on the DSP; the CPU graph is absent.
+  auto infer = [&](unsigned int n, unsigned int from, unsigned int to) {
+    return hexagon_ ? hexagonInfer(input_sample, to - from, from)
+                    : model->incremental_inference(BATCH_SIZE, input, label, n,
+                                                   from, to, false);
+  };
 
   if (SAVE_KVCACHE) {
     //@note This is for the save the kv cache. precomputed kv cache should be
@@ -537,8 +594,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       std::cout << "\n==============[KV CACHE SAVE MODE]================\n";
     allocateAndBindKVCache();
     setKVCachePosition(0);
-    output = model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                          0, input_len, false);
+    output = infer(input_len, 0, input_len);
 
     SYS_PROMP_LEN = input_len;
     save_kvcache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
@@ -573,8 +629,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     const unsigned int prefill_to = prefill_from + input_len - 1;
     setKVCachePosition(prefill_from);
-    output = model->incremental_inference(
-      BATCH_SIZE, input, label, init_len - 1, prefill_from, prefill_to, false);
+    output = infer(init_len - 1, prefill_from, prefill_to);
 
     for (unsigned int b = 0; b < BATCH_SIZE; ++b)
       id_list.push_back(skipped_token);
@@ -586,8 +641,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   } else {
     const unsigned int prefill_to = prefill_from + input_len;
     setKVCachePosition(prefill_from);
-    output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
-                                          prefill_from, prefill_to, false);
+    output = infer(init_len, prefill_from, prefill_to);
 
     // post process of model output
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);
@@ -624,9 +678,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
     allocateAndBindKVCache();
     auto output_interval =
-      model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                   token_generation_idx - 1 + global_token_len,
-                                   token_generation_idx + global_token_len);
+      infer(input_len, token_generation_idx - 1 + global_token_len,
+            token_generation_idx + global_token_len);
     std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
 
     // Feed the newly generated token back as the next input token.

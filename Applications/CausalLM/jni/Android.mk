@@ -44,6 +44,8 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
+    $(NNTRAINER_ROOT)/nntrainer/tensor/hexagon/host \
+    $(NNTRAINER_ROOT)/nntrainer/tensor/hexagon/htp \
 
 # Common compile flags. -std=c++17/-fexceptions/-frtti come from Application.mk
 # (APP_CPPFLAGS); -march and the FP16 ABI defines are inherited from the
@@ -122,6 +124,9 @@ LOCAL_SRC_FILES := \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
     ../api/streamer.cpp \
+    ../hexagon/qwen3_lowering.cpp \
+    ../hexagon/qwen3_w8cx_bin.cpp \
+    ../hexagon/hexagon_backend.cpp \
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
@@ -237,29 +242,15 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/xlm_roberta/xlm_roberta.cpp \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
-    ../api/streamer.cpp
+    ../api/streamer.cpp \
+    ../hexagon/qwen3_lowering.cpp \
+    ../hexagon/qwen3_w8cx_bin.cpp \
+    ../hexagon/hexagon_backend.cpp
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
 LOCAL_STATIC_LIBRARIES := tokenizers_c
 
-LOCAL_C_INCLUDES += \
-    $(LOCAL_PATH)/.. \
-    $(LOCAL_PATH)/../layers \
-    $(LOCAL_PATH)/../models \
-    $(LOCAL_PATH)/../models/gpt_oss \
-    $(LOCAL_PATH)/../models/gpt_oss_cached_slim \
-    $(LOCAL_PATH)/../models/qwen2 \
-    $(LOCAL_PATH)/../models/qwen3 \
-    $(LOCAL_PATH)/../models/qwen3_moe \
-    $(LOCAL_PATH)/../models/qwen3_slim_moe \
-    $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
-    $(LOCAL_PATH)/../models/gemma3 \
-    $(LOCAL_PATH)/../models/bert \
-    $(LOCAL_PATH)/../models/deberta_v2 \
-    $(LOCAL_PATH)/../models/gemma4 \
-    $(LOCAL_PATH)/../models/xlm_roberta \
-    $(LOCAL_PATH)/../models/lfm2 \
-    $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
+LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
 
 include $(BUILD_EXECUTABLE)
 

@@ -1,0 +1,36 @@
+//============================================================================
+// SPDX-License-Identifier: Apache-2.0
+//
+// FastRPC interface for the nntrainer Hexagon HVX backend.
+//
+// Design rules:
+//  - Large buffers cross once at init() as dma-buf fds, persistently mapped
+//    on the DSP (HAP_mmap). weights is ALSO passed as an in-sequence so the
+//    FastRPC driver performs the one-time cache flush; the DSP keeps only
+//    the fd mapping.
+//  - forward() carries only token_ids/logits (driver-managed coherency)
+//    plus scalars. One RPC per chunk/token. dsp_pcycles is the DSP-side
+//    cycle count of the op-list execution.
+//  - forward_debug() runs ops [0, n_ops_limit) only and returns `dump`
+//    bytes read from bufs[dump_buf] + dump_offset, for locating the first
+//    op that diverges from the x86 reference executor. KV is updated by a
+//    partial run too, so debug sessions restart from pos 0.
+//============================================================================
+
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface nntr_htp : remote_handle64 {
+   AEEResult init(in sequence<uint8> oplist,
+                  in sequence<uint8> weights,
+                  in int32 weights_fd,
+                  in int32 kv_fd,  in uint32 kv_size,
+                  in int32 act_fd, in uint32 act_size,
+                  rout uint32 dsp_abi_version);
+   AEEResult forward(in sequence<int32> token_ids, in uint32 pos,
+                     rout sequence<float> logits, rout uint64 dsp_pcycles);
+   AEEResult forward_debug(in sequence<int32> token_ids, in uint32 pos,
+                           in uint32 n_ops_limit,
+                           in uint32 dump_buf, in uint32 dump_offset,
+                           rout sequence<uint8> dump, rout uint64 dsp_pcycles);
+};

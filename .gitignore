@@ -96,3 +96,4 @@ ctre-unicode.hpp
 encoder.hpp
 json.hpp
 
+build_hexagon/

@@ -49,6 +49,10 @@ extern "C" {
 struct BaseStreamer;
 }
 
+namespace nntrainer::hexagon {
+class HexagonBackend;
+}
+
 namespace causallm {
 
 /**
@@ -90,6 +94,13 @@ public:
   void run(const WSTR prompt, bool do_sample = false,
            const WSTR system_prompt = "", const WSTR tail_prompt = "",
            bool log_output = true) override;
+
+  /**
+   * @brief engine="htp": pack the W8_CX checkpoint into rpcmem and run the
+   *        whole forward on the DSP. On success the CPU graph is never built
+   *        (no initialize()/load_weight() needed); false = use the CPU path.
+   */
+  bool initHexagon(const std::string &weight_file);
 
   /**
    * @brief Get the generated output text
@@ -215,6 +226,12 @@ protected:
    */
   KVCacheManager kv_cache;
   bool kv_cache_bound = false; /**< True once KV cache tensors are bound */
+  std::shared_ptr<nntrainer::hexagon::HexagonBackend>
+    hexagon_; /**< non-null: the whole forward (and KV) lives on the DSP */
+
+  /** @brief DSP forward of n token ids (float-encoded) at position pos. */
+  std::vector<float *> hexagonInfer(const float *ids, unsigned int n,
+                                    unsigned int pos);
 
   /**
    * @brief Allocate kv_cache and bind it to all mha_core layers via
