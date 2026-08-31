@@ -44,6 +44,9 @@
 #include <transformer.h>
 
 #include <atomic>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 extern "C" {
 struct BaseStreamer;
@@ -82,6 +85,8 @@ public:
   virtual ~CausalLM() {
     if (ids_history)
       free(ids_history);
+    for (auto &kv : logits_pool_sizes_)
+      delete[] kv.first;
   }
 
   /**
@@ -125,6 +130,43 @@ public:
    */
   void resetLogitsProcessor() override;
 
+  /**
+   * @brief Current KV-cache write position (absolute token position)
+   */
+  int getKvLen() const override {
+    return static_cast<int>(kv_cache.getPosition());
+  }
+
+  /**
+   * @brief save kv cache (all layers, first @p to positions) to @p path
+   */
+  WIN_EXPORT virtual void save_kvcache(std::string path, int to);
+
+  /**
+   * @brief load kv cache from @p path and sync every layer's cache index
+   *        to position @p to
+   */
+  WIN_EXPORT virtual void load_kvcache(std::string path, int to);
+
+  /**
+   * @brief Arm (or disarm) resume-from-saved-KV for the next run() call.
+   * @param path Saved KV-cache file produced by save_kvcache(); an empty
+   *             string disarms and restores plain-prefill behavior.
+   * @param sys_prompt_token_len Absolute token position the cache was saved
+   *             at; the next run() reloads the cache and prefills the new
+   *             prompt starting from this offset.
+   * @note  Drives the same USE_KVCACHE flow that nntr_config.json's
+   *        system_prompt.kvcache block configures, without needing the
+   *        config entry.
+   */
+  void setPrecomputedKVCache(const std::string &path,
+                             unsigned int sys_prompt_token_len) {
+    USE_KVCACHE = !path.empty();
+    PRE_COMPUTED_CACHE_PATH = path;
+    SYS_PROMP_LEN = USE_KVCACHE ? sys_prompt_token_len : 0;
+    global_token_len = 0;
+  }
+
 protected:
   /**
    * @brief Setup the parameters for the CausalLM model
@@ -139,22 +181,24 @@ protected:
   virtual std::pair<Tensor, Tensor> constructModel() override;
 
   /**
+   * @brief Build the output_of_causallm lm_head layer from the transformer
+   *        hidden state and return its output tensor.
+   * @param h hidden state produced by the transformer body
+   * @param add_skip_prefill append the skip_prefill layer property. The gate
+   *        differs per constructModel path (the generic path derives it from
+   *        the model-level SKIP_PREFILL runtime flag; the diamond-inheritance
+   *        models from their own skip-prefill option), so it is passed in
+   *        rather than recomputed here.
+   */
+  Tensor buildLmHeadOutput(Tensor h, bool add_skip_prefill);
+
+  /**
    * @brief register Outputs
    */
   virtual void
   registerOutputs(std::unique_ptr<tokenizers::Tokenizer> &tokenizer,
                   std::vector<unsigned int> ids, unsigned int pos,
                   const std::vector<bool> &eos_list, bool log_output = true);
-
-  /**
-   * @brief save kv cache
-   */
-  WIN_EXPORT virtual void save_kvcache(std::string path, int to);
-
-  /**
-   * @brief load kv cache
-   */
-  WIN_EXPORT virtual void load_kvcache(std::string path, int to);
 
   /**
    * @brief generate
@@ -180,6 +224,27 @@ protected:
   unsigned int *ids_history =
     nullptr; /**< History of input IDs for the model */
 
+  /**
+   * @brief Recycled host staging buffers for incrementalInference outputs.
+   * @details Decode allocated (and mostly never even touched, under the
+   *          deferred-logits path) a fresh 1MB float row EVERY token and
+   *          run() freed it right after -- a per-token mmap/munmap pair.
+   *          acquireLogitsBuf() hands back a previously released buffer of
+   *          the same element count instead; releaseLogitsBuf() returns a
+   *          buffer to the free list (or plain delete[]s a pointer the pool
+   *          does not own). Every in-tree release site is converted together:
+   *          a plain delete[] on a pooled pointer would corrupt the ownership
+   *          map. All pool storage is freed in the destructor.
+   */
+  std::unordered_map<float *, size_t> logits_pool_sizes_;
+  std::vector<std::pair<size_t, float *>> logits_pool_free_;
+
+  /** @brief Pop a same-size recycled buffer or allocate a new pooled one. */
+  float *acquireLogitsBuf(size_t count);
+  /** @brief Return a pooled buffer to the free list (delete[]s foreign ptrs).
+   */
+  void releaseLogitsBuf(float *buf);
+
   std::vector<int> pending_ids_;
 
   ::BaseStreamer *streamer_ = nullptr;
@@ -187,6 +252,10 @@ protected:
   std::atomic<bool> stop_prepared_for_run_{false};
 
   std::string LMHEAD_DTYPE; /** embedding dtype */
+  // LMHEAD_UNTIE moved to Transformer: embedding0's layer-type choice (tied
+  // TieWordEmbedding vs untied embedding_layer) needs it in
+  // <model>Transformer::constructModel scope, which does not see CausalLM
+  // members (the diamond joins only at <Model>CausalLM).
   std::vector<unsigned int> EOS_TOKEN_ID;
   unsigned int BOS_TOKEN_ID;
   float TEMPERATURE;
@@ -201,6 +270,20 @@ protected:
   bool SAVE_KVCACHE;
   bool USE_KVCACHE;
   bool SKIP_PREFILL;
+  /**
+   * @brief nntr_config.json "repetition_penalty". Divides positive logits of
+   *        already-generated tokens (multiplies negative ones), so > 1
+   *        discourages repeats. 1.0 -- the default, and what a config without
+   *        the key gets -- is the identity transform and leaves the greedy
+   *        fast path in generate() untouched.
+   */
+  float REPETITION_PENALTY;
+  /**
+   * @brief nntr_config.json "repetition_window": how many of the most recently
+   *        generated tokens REPETITION_PENALTY is applied to. Ignored while
+   *        REPETITION_PENALTY == 1.
+   */
+  unsigned int REPETITION_WINDOW;
   unsigned int global_token_len;
 
   std::mt19937 rng; /**< Random Number Gen */
@@ -222,6 +305,25 @@ protected:
    *        initialize().
    */
   virtual void allocateAndBindKVCache();
+
+  /**
+   * @brief incremental_inference wrapper that feeds the REAL KV-cache tensors
+   *        (with their original MemoryData, isSVM() intact) into the graph's
+   *        input placeholders instead of letting the framework re-wrap the
+   *        raw pointers in fresh (flag-less) Tensor::Map MemoryData.
+   * @details With in-place input layers (NNTR_INPUT_INPLACE relaxation) the
+   *          mha_core cache input views alias the input placeholder directly
+   *          (view-of-view flattening), so whatever MemoryData fills the
+   *          placeholder reaches mha_core's svm_ok gate. A Map wrap of the
+   *          same pointer would report isSVM()=false and silently kill the
+   *          GPU attention path. Non-cache inputs (the prompt sample) keep
+   *          the framework's Map wrapping, byte-identical to
+   *          Model::incremental_inference(float* ...).
+   */
+  std::vector<float *> incrementalInference(unsigned int batch_size,
+                                            const std::vector<float *> &input,
+                                            unsigned int init_seq_len,
+                                            unsigned int from, unsigned int to);
 
   /**
    * @brief Reset all mha_core layers' cache_index to @p pos and the

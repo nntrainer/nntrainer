@@ -122,6 +122,7 @@ if get_option('enable-opencl')
   test_target += 'unittest_layers_fully_connected_cl.cpp'
   test_target += 'unittest_layers_concat_cl.cpp'
   test_target += 'unittest_layers_swiglu_cl.cpp'
+  test_target += 'unittest_layers_norm_activation_neutral.cpp'
 endif
 
 if get_option('enable-tflite-backbone')

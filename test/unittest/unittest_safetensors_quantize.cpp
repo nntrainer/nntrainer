@@ -10,6 +10,7 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -24,7 +25,9 @@
 #include <model.h>
 #include <neuralnet.h>
 #include <optimizer.h>
+#include <quantizer.h>
 #include <safetensors_util.h>
+#include <tensor.h>
 #include <tensor_dim.h>
 
 namespace st = nntrainer::safetensors;
@@ -39,6 +42,7 @@ TEST(SafetensorsUtil, quantized_dtype_maps_to_u8_p) {
   EXPECT_STREQ(st::dtypeToString(DataType::Q4_0), "U8");
   EXPECT_STREQ(st::dtypeToString(DataType::Q4_K), "U8");
   EXPECT_STREQ(st::dtypeToString(DataType::Q6_K), "U8");
+  EXPECT_STREQ(st::dtypeToString(DataType::QS4CX), "U8");
   EXPECT_STREQ(st::dtypeToString(DataType::FP32), "F32");
   EXPECT_STREQ(st::dtypeToString(DataType::FP16), "F16");
 }
@@ -47,13 +51,14 @@ TEST(SafetensorsUtil, is_quantized_p) {
   EXPECT_TRUE(st::isQuantized(DataType::Q4_0));
   EXPECT_TRUE(st::isQuantized(DataType::Q4_K));
   EXPECT_TRUE(st::isQuantized(DataType::Q6_K));
+  EXPECT_TRUE(st::isQuantized(DataType::QS4CX));
   EXPECT_FALSE(st::isQuantized(DataType::FP32));
   EXPECT_FALSE(st::isQuantized(DataType::FP16));
 }
 
 TEST(SafetensorsUtil, nntr_dtype_name_round_trip_p) {
   for (auto dt : {DataType::FP32, DataType::FP16, DataType::Q4_0,
-                  DataType::Q4_K, DataType::Q6_K}) {
+                  DataType::Q4_K, DataType::Q6_K, DataType::QS4CX}) {
     const std::string name = st::nntrDtypeName(dt);
     EXPECT_EQ(st::nntrDtypeFromName(name), dt);
   }
@@ -229,6 +234,131 @@ TEST(SafetensorsQuant, q4_0_payload_matches_bin_p) {
   EXPECT_EQ(st_weight, bin_weight)
     << "safetensors quantized payload differs from BIN payload";
 
+  remove(bin_path.c_str());
+  remove(st_path.c_str());
+}
+
+/**
+ * @brief A QS4CX weight stored in safetensors must be byte-identical to the
+ *        same weight stored in the BIN format, must carry U8 + nntr_dtype
+ *        tags, and must be exactly what the QS4CX quantizer makes of the FP32
+ *        weight it came from.
+ */
+TEST(SafetensorsQuant, qs4cx_payload_matches_bin_p) {
+  const unsigned int W = 32; // weight dim (1,1,W,U)
+  const unsigned int U = 16;
+
+  std::map<std::string, DataType> dtype_map = {{"dense", DataType::QS4CX}};
+
+  auto nn = createFcNN(W, U);
+
+  // An FP32 copy of the very weights that are about to be quantized.
+  const std::string ref_path = "st_qs4cx_ref.bin";
+  ASSERT_NO_THROW(nn->save(ref_path, ModelFormat::MODEL_FORMAT_BIN));
+
+  const std::string bin_path = "st_qs4cx_test.bin";
+  ASSERT_NO_THROW(nn->save(bin_path, ModelFormat::MODEL_FORMAT_BIN,
+                           DataType::NONE, dtype_map));
+
+  const std::string st_path = "st_qs4cx_test.safetensors";
+  ASSERT_NO_THROW(nn->save(st_path, ModelFormat::MODEL_FORMAT_SAFETENSORS,
+                           DataType::NONE, dtype_map));
+
+  // Parse the safetensors header.
+  std::ifstream stf(st_path, std::ios::binary);
+  ASSERT_TRUE(stf.is_open());
+  uint64_t header_size = 0;
+  stf.read(reinterpret_cast<char *>(&header_size), sizeof(header_size));
+  std::string header_json(header_size, '\0');
+  stf.read(header_json.data(), static_cast<std::streamsize>(header_size));
+
+  auto entries = st::parseHeaderEntries(header_json);
+  const st::TensorEntry *q = nullptr;
+  for (const auto &e : entries)
+    if (e.nntr_dtype == "QS4CX")
+      q = &e;
+  ASSERT_NE(q, nullptr) << "quantized weight entry not found in header";
+  EXPECT_EQ(q->dtype, "U8");
+  ASSERT_EQ(q->nntr_shape.size(), 4u);
+  EXPECT_EQ(q->nntr_shape[2], W);
+  EXPECT_EQ(q->nntr_shape[3], U);
+
+  // A QS4CX record is U rows of ceil(W/2) nibble bytes plus U float scales.
+  const size_t expected_bytes =
+    static_cast<size_t>(U) * ((W + 1) / 2) + static_cast<size_t>(U) * 4;
+  EXPECT_EQ(q->offset_end - q->offset_start, expected_bytes);
+
+  // The bias (height == 1) is not quantized, so it stays FP32 next to it.
+  const st::TensorEntry *bias = nullptr;
+  for (const auto &e : entries)
+    if (e.nntr_dtype.empty())
+      bias = &e;
+  ASSERT_NE(bias, nullptr);
+  EXPECT_EQ(bias->dtype, "F32");
+  EXPECT_EQ(bias->offset_end - bias->offset_start,
+            static_cast<size_t>(U) * sizeof(float));
+
+  // Extract the quantized payload from the safetensors data section.
+  const size_t data_base = sizeof(uint64_t) + header_size;
+  std::vector<char> st_bytes = readFile(st_path);
+  ASSERT_GE(st_bytes.size(), data_base + q->offset_end);
+  std::vector<char> st_weight(st_bytes.begin() + data_base + q->offset_start,
+                              st_bytes.begin() + data_base + q->offset_end);
+
+  // The BIN file begins with the (graph-order first) quantized weight.
+  std::vector<char> bin_bytes = readFile(bin_path);
+  ASSERT_GE(bin_bytes.size(), expected_bytes);
+  std::vector<char> bin_weight(bin_bytes.begin(),
+                               bin_bytes.begin() + expected_bytes);
+
+  EXPECT_EQ(st_weight, bin_weight)
+    << "safetensors quantized payload differs from BIN payload";
+
+  // The quantizer is the writer: quantizing the FP32 reference must land on
+  // the same bytes both files hold.
+  std::vector<char> ref_bytes = readFile(ref_path);
+  const size_t ref_weight_bytes = static_cast<size_t>(W) * U * sizeof(float);
+  ASSERT_GE(ref_bytes.size(), ref_weight_bytes);
+
+  nntrainer::Tensor ref(1, 1, W, U);
+  memcpy(ref.getData<float>(), ref_bytes.data(), ref_weight_bytes);
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  nntrainer::Tensor quantized = quantizer->quantize(ref, DataType::QS4CX);
+  ASSERT_EQ(quantized.getMemoryBytes(), expected_bytes);
+  EXPECT_EQ(
+    0, memcmp(quantized.getData<uint8_t>(), st_weight.data(), expected_bytes));
+
+  // ... and reading that record back gives the weight to within a 4-bit step.
+  nntrainer::Tensor loaded(
+    {1, 1, W, U, {nntrainer::Tformat::NCHW, DataType::QS4CX}},
+    st_weight.data());
+  nntrainer::Tensor deq = quantizer->dequantize(loaded, DataType::FP32);
+
+  const float *scales = loaded.getScale<float>();
+  for (unsigned int w = 0; w < U; ++w) {
+    // The scale of an output channel is its range, zero included, over the 15
+    // steps of the code.
+    float lo = 0.0f, hi = 0.0f;
+    for (unsigned int h = 0; h < W; ++h) {
+      lo = std::min(lo, ref.getValue(0, 0, h, w));
+      hi = std::max(hi, ref.getValue(0, 0, h, w));
+    }
+    const float step = scales[w];
+    ASSERT_NEAR(step, (hi - lo) / 15.0f, 1e-6f) << " at w=" << w;
+
+    // Reconstruction costs half a step to rounding, plus whatever the top of
+    // the range loses to the +7 clamp: the code carries no zero point, so it
+    // reaches 8 steps below zero but only 7 above.
+    const float tol = 0.5f * step + std::max(0.0f, lo + 8.0f * step) + 1e-5f;
+    for (unsigned int h = 0; h < W; ++h) {
+      EXPECT_NEAR(deq.getValue(0, 0, h, w), ref.getValue(0, 0, h, w), tol)
+        << " at h=" << h << ", w=" << w;
+    }
+  }
+
+  remove(ref_path.c_str());
   remove(bin_path.c_str());
   remove(st_path.c_str());
 }

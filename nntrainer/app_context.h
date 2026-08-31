@@ -181,6 +181,12 @@ public:
                             const std::string &key = "",
                             const int int_key = -1);
 
+  /**
+   * @copydoc Context::registerLayerFactory
+   */
+  int registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                           const std::string &key, const int int_key) override;
+
   std::unique_ptr<nntrainer::Layer>
   createLayerObject(const std::string &type,
                     const std::vector<std::string> &properties = {}) override {

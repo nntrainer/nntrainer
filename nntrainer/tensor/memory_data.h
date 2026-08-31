@@ -21,6 +21,27 @@ namespace nntrainer {
 using MemoryDataValidateCallback = std::function<void(unsigned int)>;
 
 /**
+ * @brief  Where a tensor's backing memory lives.
+ *
+ * @details Decided once, at allocation, by the memory planner, and therefore a
+ * property of the tensor rather than of an edge between two layers. The
+ * planner already knows every tensor's producer, its consumers and its
+ * lifetime, so it can place a tensor and have all of them agree; a decision
+ * made per edge at execution time cannot, and leaves a producer writing one
+ * plane while a consumer reads another.
+ *
+ *   - HOST: host memory. The only class a CPU backend produces.
+ *   - SVM: shared virtual memory, addressable by both the host and the device.
+ *   - GPU_CLMEM: device memory, addressable only by the device. A layer binds
+ *     it as a buffer kernel argument; see Tensor::isClMem / Tensor::getClMem.
+ */
+enum class ResidencyClass : unsigned char {
+  HOST = 0,      /**< host memory */
+  SVM = 1,       /**< shared virtual memory (host and device addressable) */
+  GPU_CLMEM = 2, /**< device memory (device addressable only) */
+};
+
+/**
  * @brief  MemoryData Class
  */
 class MemoryData {
@@ -31,6 +52,14 @@ class MemoryData {
    *          accidental modification from other parts of the codebase.
    */
   friend class MemoryPool;
+
+  /**
+   * @brief TensorPool is granted friend access to call setResidency()
+   * @details Where a tensor lives is the memory planner's decision, taken
+   *          once at allocation; TensorPool is the only place that runs the
+   *          planner, so it is the only place allowed to record the result.
+   */
+  friend class TensorPool;
 
 public:
   /**
@@ -43,7 +72,10 @@ public:
     address(addr),
     validate_cb([](unsigned int) {}),
     invalidate_cb([](unsigned int) {}),
-    svm_allocation(false) {}
+    svm_allocation(false),
+    host_addressable(true),
+    device_mem(nullptr),
+    residency_(ResidencyClass::HOST) {}
 
   /**
    * @brief  Constructor of Memory Data
@@ -59,7 +91,10 @@ public:
     address(memory_ptr),
     validate_cb(v_cb),
     invalidate_cb(i_cb),
-    svm_allocation(false) {}
+    svm_allocation(false),
+    host_addressable(true),
+    device_mem(nullptr),
+    residency_(ResidencyClass::HOST) {}
 
   /**
    * @brief  Deleted constructor of Memory Data
@@ -124,6 +159,39 @@ public:
    */
   bool isSVM() const { return svm_allocation; }
 
+  /**
+   * @brief   The residency class the planner assigned this memory.
+   */
+  ResidencyClass residency() const { return residency_; }
+
+  /**
+   * @brief   True if this memory lives in device memory the host cannot
+   *          address, so a layer has to bind it as a buffer argument rather
+   *          than pass a pointer. Host pointer arithmetic on it is a bug by
+   *          construction.
+   */
+  bool isClMem() const { return residency_ == ResidencyClass::GPU_CLMEM; }
+
+  /**
+   * @brief   True unless this memory is DEVICE-ONLY (e.g. a cudaMalloc plane):
+   *          the host must not dereference the pointer, and every host read or
+   *          write has to stage through a bounce buffer.
+   * @note    Stamped from MemAllocator::isHostAddressable() at pool bind, the
+   *          same way the SVM flag is, so a consumer asks the tensor it already
+   *          holds rather than probing the driver. Defaults true, because a
+   *          plain host buffer is host memory.
+   */
+  bool isHostAddressable() const { return host_addressable; }
+
+  /**
+   * @brief   The device buffer backing this memory, or null when the planner
+   *          left it on the shared plane.
+   * @note    Held as void* so this header stays free of the OpenCL types and
+   *          keeps compiling in a CPU-only build. Non-owning: the pool that
+   *          handed it out owns it.
+   */
+  void *deviceMem() const { return device_mem; }
+
 private:
   /**
    * @brief  Set SVM allocation flag (private - only accessible by MemoryPool)
@@ -134,12 +202,31 @@ private:
    */
   void setSVM(bool is_svm) { svm_allocation = is_svm; }
 
+  /**
+   * @brief  Record whether the host may dereference this memory (private -
+   *         only accessible by MemoryPool, for the same reason setSVM is).
+   * @param[in] addressable false for a device-only allocation
+   */
+  void setHostAddressable(bool addressable) { host_addressable = addressable; }
+
+  /**
+   * @brief  Record the planner's placement and, for a device-resident tensor,
+   *         the buffer that backs it (private - only the pool decides).
+   */
+  void setResidency(ResidencyClass r, void *dev = nullptr) {
+    residency_ = r;
+    device_mem = dev;
+  }
+
   bool valid;
   unsigned int id;
   void *address;
   MemoryDataValidateCallback validate_cb;
   MemoryDataValidateCallback invalidate_cb;
   bool svm_allocation;
+  bool host_addressable;     /**< false for a device-only allocation */
+  void *device_mem;          /**< device buffer, when device-resident */
+  ResidencyClass residency_; /**< the planner's placement */
 };
 
 } // namespace nntrainer
