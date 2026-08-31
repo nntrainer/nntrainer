@@ -1011,10 +1011,11 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                                    ? MAX_SEQ_LEN - reserved_for_generation
                                    : 0u;
   // Whether the prefill is chunked is a property of the model, not of the
-  // environment: the ring turns chunking on by default (prefillChunk() > 0)
-  // with no env var set. Keying this off getenv("NNTR_PREFILL_CHUNK") meant
-  // the default-on chunking never opened the budget, so a 29K-token prompt was
-  // cut to INIT_SEQ_LEN even though the prefill could have fed it in chunks.
+  // environment: the KV ring requests chunking on its own (prefillChunk() > 0)
+  // even when NNTR_PREFILL_CHUNK is unset. Keying this off
+  // getenv("NNTR_PREFILL_CHUNK") meant that chunking never opened the budget,
+  // so a 29K-token prompt was cut to INIT_SEQ_LEN even though the prefill
+  // could have fed it in chunks.
   const bool _prefill_chunking = prefillChunk() > 0;
   unsigned int num_allow_str =
     _prefill_chunking ? kv_budget

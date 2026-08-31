@@ -484,8 +484,9 @@ private:
   float theta;
   size_t local_window_size;
   /** [kv-window-ring] Physical ring rows for this layer (0 = full max_seq, no
-   * ring). Set in finalize() from mha_kv_ring_cap(local_window_size,
-   * max_timestep). When non-zero every cache-row index -- write offset and
+   * ring). Set in finalize() from causallm::kvRingCap(local_window_size,
+   * max_timestep, chunk) -- the same function models/transformer.h sizes the
+   * allocation with. When non-zero every cache-row index -- write offset and
    * kernel read alike -- is taken modulo this. */
   unsigned int kv_ring_cap = 0;
   /** Map an absolute cache position to its physical ring row (identity when the

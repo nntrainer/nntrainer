@@ -1,5 +1,8 @@
-causallm_layer_inc_abs = [meson.current_source_dir()]
-causallm_layer_inc = [include_directories('.')]
+# '..' brings in the app-root headers the layers share with the models --
+# today kv_ring.h, the one definition of the KV-ring capacity rule that
+# mha_core.cpp and models/transformer.h must not disagree about.
+causallm_layer_inc_abs = [meson.current_source_dir(), meson.current_source_dir() / '..']
+causallm_layer_inc = [include_directories('.'), include_directories('..')]
 
 causallm_rms_norm_src_abs = [meson.current_source_dir() / 'rms_norm.cpp']
 causallm_rms_norm_gpu_src_abs = [meson.current_source_dir() / 'rms_norm_gpu.cpp']
