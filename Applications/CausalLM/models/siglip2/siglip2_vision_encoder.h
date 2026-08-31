@@ -35,7 +35,7 @@ class Siglip2VisionEncoder : virtual public Transformer {
 
 public:
   static constexpr const char *architectures = "Siglip2VisionEncoder";
-  static constexpr unsigned int ENC_TO_DEC_DIM = 256;
+  static constexpr unsigned int ENC_TO_DEC_DIM = 512;
 
   /**
    * @brief Construct a Siglip2VisionEncoder object.
@@ -125,9 +125,9 @@ protected:
            bool log_output = true) override;
 
 private:
-  unsigned int IMG_SIZE = 224;    /**< Image height/width */
+  unsigned int IMG_SIZE = 384;    /**< Image height/width */
   unsigned int PATCH_SIZE = 16;   /**< Patch height/width */
-  unsigned int NUM_PATCHES = 196; /**< Number of patches */
+  unsigned int NUM_PATCHES = 576; /**< Number of patches */
   unsigned int IMG_CHANNELS = 3;  /**< Image channels (RGB) */
 
   /** patch_embed_conv weight dtype (nntr_config "patch_embed_dtype").

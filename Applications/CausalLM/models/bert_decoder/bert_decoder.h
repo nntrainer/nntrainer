@@ -14,7 +14,7 @@
  *   input0          [1,1,1,1]     token id
  *   position_ids    [1,1,1,1]
  *   token_type_ids  [1,1,1,1]
- *   encoder_hidden  [1,1,196,256] encoder hidden states for cross-attention
+ *   encoder_hidden  [1,1,576,512] encoder hidden states for cross-attention
  *   cache_k_l0..N-1 [1,1,MAX_SEQ,DIM]  per-layer KV cache
  *   cache_v_l0..N-1 [1,1,MAX_SEQ,DIM]
  *
@@ -60,10 +60,10 @@ class BertDecoder : virtual public Transformer {
 public:
   static constexpr const char *architectures = "BertDecoder";
 
-  // Hardcoded decoder constants matching the source BERT decoder.
-  static constexpr int BD_DIM = 256;
+  // Hardcoded decoder constants matching the ScreenAI caption BERT decoder.
+  static constexpr int BD_DIM = 512;
   static constexpr int BD_NUM_LAYERS = 4;
-  static constexpr int BD_NUM_HEADS = 4;
+  static constexpr int BD_NUM_HEADS = 8;
   static constexpr int BD_HEAD_DIM = 64;
   static constexpr unsigned int BD_NUM_VOCAB = 30522;
   static constexpr unsigned int BD_MAX_POSITION_EMBEDDINGS = 512;
@@ -74,12 +74,12 @@ public:
   static constexpr unsigned int BD_INIT_SEQ_LEN = 1;
   static constexpr unsigned int BD_MAX_SEQ_LEN = 512;
   // Encoder (SigLIP2) output sequence length fed to cross-attention.
-  static constexpr unsigned int BD_ENC_LEN = 196;
+  static constexpr unsigned int BD_ENC_LEN = 576;
   // NUM_TO_GENERATE must be set for Transformer; use a reasonable default.
   static constexpr unsigned int BD_NUM_TO_GENERATE = 1;
 
-  // FFN intermediate size (4 * DIM = 1024 for BERT-small)
-  static constexpr int BD_INTERMEDIATE_SIZE = 1024;
+  // FFN intermediate size (4 * DIM = 2048 for BERT v4.0.0)
+  static constexpr int BD_INTERMEDIATE_SIZE = 2048;
 
   /**
    * @brief Construct a BertDecoder with hardcoded parameters.
