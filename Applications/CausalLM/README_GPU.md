@@ -127,6 +127,15 @@ gives them a shared device buffer; drop either and output collapses.
 | `NNTR_XE3_SYNC` | — | `1` **mandatory on Xe3** | — |
 | GEMM family | dp4a (image) | **XMX auto** (caps) → dp4a | cuBLAS IMMA + block-Q |
 
+**Long context.** The sliding-window KV ring and chunked prefill are opt-in and
+off by default; add `NNTR_KV_WINDOW_RING=1` (which also turns chunked prefill on
+at 4096 rows) on top of a canonical set, and `NNTR_CUDA_SPLITKV_PREFILL=1` on
+CUDA. Turning the ring on changes what `init_seq_len` means: with chunking off
+it is the prompt ceiling and a longer prompt is truncated to it, while with
+chunking on it is only the height of one chunk's activation plane — the prompt
+is then bounded by the KV budget (`max_timestep`), not by `init_seq_len`, and
+the truncation warning reports the KV budget instead.
+
 `NNTR_FC_GPU` appears in some wrapper scripts but is a **legacy no-op alias** —
 the real FC gate is `NNTR_FC_INT8_GPU`. `NNTR_FC_XMX` and `NNTR_CUDA_GEMM_ATTN`
 are now **caps-derived defaults** (auto-on where the hardware supports them) and
@@ -562,6 +571,10 @@ The full list is in the source (`grep -rn std::getenv`).
 | `NNTR_CUDA_GRAPH` / `NNTR_CUDA_M2B` | CUDA-graph decode capture / single-capture replay. | CUDA |
 | `NNTR_CUDA_PREWARM` / `NNTR_CUDA_KV_UVM` / `NNTR_CUDA_VCOPY_PREFILL` | Load-time repack+scratch prewarm / KV residency / V-copy into the live KV slot. | CUDA |
 | `NNTR_OPENCL_PROFILING` / `NNTR_LAYER_PROFILE` / `NNTR_V8C_KCLOCK` | clprof / per-layer latency / in-kernel clock profiling. | diag |
+| `NNTR_KV_WINDOW_RING` | **Long context, opt-in (default off).** `=1` stores a sliding-window layer's KV cache as a ring of `Wcap` physical rows instead of the full context window, and turns chunked prefill on. The request is granted only where a ring-aware attention arm resolves (`NNTR_KV_OHWI=1` + `NNTR_MHA_GPU=1` on OpenCL, `NNTR_CUDA_ATTN=1` on `NNTR_ENGINE=cuda`, and neither `NNTR_KV_IMG_ATTN` nor `NNTR_MHA_GPU_IMG`); otherwise the linear full-height cache is kept and the reason is printed once. | OpenCL, CUDA |
+| `NNTR_PREFILL_CHUNK` | Query rows per prefill forward (`0`/unset ⇒ one block, unless the ring is on, which requests 4096). Clamped to `init_seq_len`, the activation-plane height. A non-positive or unparseable value is rejected with a message. | all |
+| `NNTR_CUDA_SPLITKV_PREFILL` | **Opt-in (default off).** Inside `NNTR_CUDA_BLOCKQ`, splits the key axis of a full-attention prefill (`=1` ⇒ 4096-key split, `=N>1` ⇒ custom, `=0` ⇒ off). Engages only above the split length, so shorter contexts are bit-unchanged. | CUDA |
+| `NNTR_CUDA_SPLITKV_PREFILL_MB` | Scratch budget in MiB for the split-KV partial buffers. | CUDA |
 
 ## 9. Build artifacts & deploy (Adreno)
 
