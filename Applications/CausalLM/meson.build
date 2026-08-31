@@ -236,6 +236,24 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  # KV window-ring rule (kv_ring.h): host-only, no GPU needed. Pins the
+  # capacity formula and the row wrap that the model-side allocation and the
+  # layer-side modulo map must both obey.
+  unittest_kv_ring = executable(
+    'unittest_kv_ring',
+    meson.current_source_dir() / 'layers' / 'unittest_kv_ring.cpp',
+    dependencies: [nntrainer_dep, gtest_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_kv_ring', unittest_kv_ring,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_kv_ring'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   unittest_kv_cache_manager = executable(
     'unittest_kv_cache_manager',
     meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_kv_cache_manager.cpp',
