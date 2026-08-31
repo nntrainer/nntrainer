@@ -1701,27 +1701,25 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   static const bool blockq_on = nntr_env_on("NNTR_CUDA_BLOCKQ");
   if (blockq_on && N_q > 1 &&
       (head_dim == 128 || head_dim == 256 || head_dim == 512)) {
-    // [splitkv-prefill] NNTR_CUDA_SPLITKV_PREFILL: unset/=1 -> ON with the
-    // default 4096-key split (engage threshold == split_len, so any context
-    // at or below it takes the serial kernel VERBATIM -- 1K runs are
-    // bit-unchanged); =N>1 -> custom split length; =0 -> OFF (kill-switch:
-    // reproduces the pre-lever serial streams byte-for-byte). Global/full
-    // layers only (win_bq==0): the sliding layers' key walk is already
-    // bounded by the n_lo window skip.
-    // DEFAULT ON (owner decision + golden re-baseline, qwen3 precedent):
-    // deterministic (byte-stable run to run), numerics fp64-probe-equal to
-    // the serial kernel (<=1 fp16 ulp on 0.67% of outputs, equal rms vs an
-    // fp64 reference); the d512 32K stream is byte-identical to serial; the
-    // d128 32K cell flips ONE near-tie argmax in the generated continuation
-    // -- that stream is re-baselined as the new canonical golden. Measured
-    // (RTX 5060, 32K/chunk1024/ring profile cells): d512-global model
-    // 1760.3 -> 2850.3 prefill TPS (+62%), d128-global model 2489.6 ->
-    // 2678.7 (+7.6%), decode untouched, 1K cells byte-identical (below
-    // threshold), +64 MiB scratch.
+    // [splitkv-prefill] NNTR_CUDA_SPLITKV_PREFILL: unset/=0 -> OFF (the serial
+    // blockq streams, byte-for-byte); =1 -> ON with the default 4096-key split
+    // (engage threshold == split_len, so any context at or below it takes the
+    // serial kernel VERBATIM -- 1K runs are bit-unchanged); =N>1 -> custom
+    // split length. Global/full layers only (win_bq==0): the sliding layers'
+    // key walk is already bounded by the n_lo window skip.
+    // DEFAULT OFF for this cycle. The numerics are deterministic (byte-stable
+    // run to run) and fp64-probe-equal to the serial kernel (<=1 fp16 ulp on
+    // 0.67% of outputs, equal rms vs an fp64 reference), and the d512 32K
+    // stream is byte-identical to serial -- but the d128 32K cell flips ONE
+    // near-tie argmax in the generated continuation, and no CI job runs CUDA,
+    // so the flip cannot be caught before merge. Opt in to measure: on an
+    // RTX 5060 (32K / chunk 1024 / ring profile cells) the d512-global model
+    // goes 1760.3 -> 2850.3 prefill TPS (+62%) and the d128-global model
+    // 2489.6 -> 2678.7 (+7.6%), decode untouched, +64 MiB scratch.
     static const int sp_len = []() {
       const char *e = std::getenv("NNTR_CUDA_SPLITKV_PREFILL");
       if (!e || e[0] == '\0')
-        return 4096; // default ON (owner decision, see above)
+        return 0; // default OFF (opt-in, see above)
       int v_ = atoi(e);
       if (v_ <= 0)
         return 0;
