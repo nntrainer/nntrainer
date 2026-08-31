@@ -12,6 +12,10 @@
 #include <iomanip>
 #include <iostream>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include <compute_ops.h>
 #include <half_tensor.h>
 #include <tensor.h>
@@ -754,13 +758,34 @@ Tensor &HalfTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     N = input.getDim().width();
     {
       size_t total_elems = (size_t)K * N;
-      std::vector<float> dq_buf(total_elems);
+      static thread_local std::vector<float> dq_buf;
+      static thread_local std::vector<_FP16> dq_fp16;
+      if (dq_buf.size() < total_elems) {
+        dq_buf.resize(total_elems);
+      }
+      if (dq_fp16.size() < total_elems) {
+        dq_fp16.resize(total_elems);
+      }
       dequantize_row_q8_0((const void *)mdata, dq_buf.data(),
                           (int64_t)total_elems);
-      // Cast to FP16
-      std::vector<_FP16> dq_fp16(total_elems);
+      // Cast to FP16 using NEON vectorization if available
+#if defined(__ARM_NEON)
+      size_t i = 0;
+      for (; i + 7 < total_elems; i += 8) {
+        float32x4_t f0 = vld1q_f32(dq_buf.data() + i);
+        float32x4_t f1 = vld1q_f32(dq_buf.data() + i + 4);
+        float16x4_t h0 = vcvt_f16_f32(f0);
+        float16x4_t h1 = vcvt_f16_f32(f1);
+        vst1_f16((float16_t *)(dq_fp16.data() + i), h0);
+        vst1_f16((float16_t *)(dq_fp16.data() + i + 4), h1);
+      }
+      for (; i < total_elems; ++i) {
+        dq_fp16[i] = static_cast<_FP16>(dq_buf[i]);
+      }
+#else
       for (size_t i = 0; i < total_elems; ++i)
         dq_fp16[i] = static_cast<_FP16>(dq_buf[i]);
+#endif
       const float alpha = 1.0f;
       o->sgemm_fp16((unsigned int)dim.getStorageOrder(), false, true, M, N, K,
                     alpha, data, K, dq_fp16.data(), K, beta, rdata, N);

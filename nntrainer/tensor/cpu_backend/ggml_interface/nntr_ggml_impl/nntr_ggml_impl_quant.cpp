@@ -882,6 +882,60 @@ void dequantize_row_q8_0_impl(const block_q8_0 *__restrict x,
 
   const int64_t nb = k / qk;
 
+#if defined(__ARM_NEON)
+  for (int64_t i = 0; i < nb; i++) {
+    const float d = nntr_fp16_to_fp32(x[i].d);
+
+    int8x16_t qs0 = vld1q_s8(x[i].qs);
+    int8x16_t qs1 = vld1q_s8(x[i].qs + 16);
+
+    int16x8_t qs0_l = vmovl_s8(vget_low_s8(qs0));
+    int16x8_t qs0_h = vmovl_s8(vget_high_s8(qs0));
+    int16x8_t qs1_l = vmovl_s8(vget_low_s8(qs1));
+    int16x8_t qs1_h = vmovl_s8(vget_high_s8(qs1));
+
+    int32x4_t qs0_ll = vmovl_s16(vget_low_s16(qs0_l));
+    int32x4_t qs0_lh = vmovl_s16(vget_high_s16(qs0_l));
+    int32x4_t qs0_hl = vmovl_s16(vget_low_s16(qs0_h));
+    int32x4_t qs0_hh = vmovl_s16(vget_high_s16(qs0_h));
+
+    int32x4_t qs1_ll = vmovl_s16(vget_low_s16(qs1_l));
+    int32x4_t qs1_lh = vmovl_s16(vget_high_s16(qs1_l));
+    int32x4_t qs1_hl = vmovl_s16(vget_low_s16(qs1_h));
+    int32x4_t qs1_hh = vmovl_s16(vget_high_s16(qs1_h));
+
+    vst1q_f32(y + i * 32 + 0, vmulq_n_f32(vcvtq_f32_s32(qs0_ll), d));
+    vst1q_f32(y + i * 32 + 4, vmulq_n_f32(vcvtq_f32_s32(qs0_lh), d));
+    vst1q_f32(y + i * 32 + 8, vmulq_n_f32(vcvtq_f32_s32(qs0_hl), d));
+    vst1q_f32(y + i * 32 + 12, vmulq_n_f32(vcvtq_f32_s32(qs0_hh), d));
+
+    vst1q_f32(y + i * 32 + 16, vmulq_n_f32(vcvtq_f32_s32(qs1_ll), d));
+    vst1q_f32(y + i * 32 + 20, vmulq_n_f32(vcvtq_f32_s32(qs1_lh), d));
+    vst1q_f32(y + i * 32 + 24, vmulq_n_f32(vcvtq_f32_s32(qs1_hl), d));
+    vst1q_f32(y + i * 32 + 28, vmulq_n_f32(vcvtq_f32_s32(qs1_hh), d));
+  }
+#elif defined(__AVX2__)
+  for (int64_t i = 0; i < nb; i++) {
+    const float d = nntr_fp16_to_fp32(x[i].d);
+    __m256 factor = _mm256_set1_ps(d);
+
+    __m256i raw = _mm256_loadu_si256((const __m256i *)x[i].qs);
+
+    __m128i raw_low = _mm256_castsi256_si128(raw);
+    __m128i raw_high = _mm256_extracti128_si256(raw, 1);
+
+    __m256i ep0 = _mm256_cvtepi8_epi32(raw_low);
+    __m256i ep1 = _mm256_cvtepi8_epi32(_mm_srli_si128(raw_low, 8));
+
+    __m256i ep2 = _mm256_cvtepi8_epi32(raw_high);
+    __m256i ep3 = _mm256_cvtepi8_epi32(_mm_srli_si128(raw_high, 8));
+
+    _mm256_storeu_ps(y + i * 32 + 0, _mm256_mul_ps(_mm256_cvtepi32_ps(ep0), factor));
+    _mm256_storeu_ps(y + i * 32 + 8, _mm256_mul_ps(_mm256_cvtepi32_ps(ep1), factor));
+    _mm256_storeu_ps(y + i * 32 + 16, _mm256_mul_ps(_mm256_cvtepi32_ps(ep2), factor));
+    _mm256_storeu_ps(y + i * 32 + 24, _mm256_mul_ps(_mm256_cvtepi32_ps(ep3), factor));
+  }
+#else
   for (int64_t i = 0; i < nb; i++) {
     const float d = nntr_fp16_to_fp32(x[i].d);
 
@@ -889,6 +943,7 @@ void dequantize_row_q8_0_impl(const block_q8_0 *__restrict x,
       y[i * qk + j] = x[i].qs[j] * d;
     }
   }
+#endif
 }
 
 void nntr_dequantize_row_q8_0(const void *__restrict x, float *__restrict y,
