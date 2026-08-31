@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <nntrainer_log.h>
 #include <opencl_loader.h>
 #include <tuple>
 #include <vector>
@@ -2907,8 +2908,20 @@ bool flash_attention_prefill_f16_cl(
     }
     return true;
   };
-  if (!bind_all(kp))
+  if (!bind_all(kp)) {
+    // An argument-bind failure means the selected kernel's signature and this
+    // binder disagree (e.g. a Block-Q variant that never declared argument 15).
+    // The caller then drops to host attention with no other symptom than a
+    // ~3x slower prefill, so say it once instead of failing silently.
+    static bool _bind_fail_logged = false;
+    if (!_bind_fail_logged) {
+      _bind_fail_logged = true;
+      ml_loge("flash prefill: kernel argument bind failed (xmx=%d blockq=%d "
+              "d=%d) -- falling back to host attention",
+              (int)use_xmx, (int)flash_blockq, (int)head_dim);
+    }
     return false;
+  }
 
   std::array<size_t, 1> gws;
   std::array<size_t, 1> lws;
