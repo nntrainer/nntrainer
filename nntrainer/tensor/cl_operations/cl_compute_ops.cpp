@@ -39,6 +39,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include <attention_kernels.h>     // gpu_copy_f16_cl
 #include <blas_kernel_interface.h> // add_i_cl, dotCl, dotCl_v8c
 #include <blas_kernels.h>
 #include <common_properties.h> // ActivationType, the act_type int encoding
@@ -241,7 +242,40 @@ public:
       return;
     }
 
+    // Device plane first: when either operand lives there, the shared-plane
+    // paths below cannot address it.
+#ifdef ENABLE_FP16
+    if (nntrainer::clmem_residual_op_cl(hidden, input, accumulate))
+      return;
+#endif
+
     if (!accumulate) {
+      // First operand: hidden = input. This has to happen ON THE DEVICE when
+      // both live on the shared plane, because the accumulate branch below is
+      // a GPU kernel. A host copy followed by a device add reads whatever the
+      // device last saw in `hidden` -- the host write was never handed back --
+      // so the second operand lands on stale bytes and the residual ends up
+      // carrying only one of its two inputs. Measured on the 1K cell: the
+      // decoder-add output was the embedding alone, with the whole attention
+      // contribution missing, and every later layer inherited it.
+#ifdef ENABLE_FP16
+      const bool svm16 =
+        hidden.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        input.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        hidden.getMemoryData() && hidden.getMemoryData()->isSVM() &&
+        input.getMemoryData() && input.getMemoryData()->isSVM() &&
+        hidden.size() == input.size();
+      // NNTR_ADD_DRAIN=1 drains after the copy; the in-order queue already
+      // sequences the add behind it, so the default is not to.
+      static const bool add_drain = std::getenv("NNTR_ADD_DRAIN") != nullptr;
+      if (svm16 &&
+          nntrainer::gpu_copy_f16_cl(
+            reinterpret_cast<const uint16_t *>(input.getData<_FP16>()),
+            reinterpret_cast<uint16_t *>(hidden.getData<_FP16>()),
+            (unsigned int)hidden.size(), /*svm_inputs=*/true,
+            /*in_clmem=*/nullptr, /*out_clmem=*/nullptr, /*drain=*/add_drain))
+        return;
+#endif
       hidden.copy(input);
     } else {
       nntrainer::add_i_cl(hidden, input);

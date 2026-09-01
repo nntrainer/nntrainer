@@ -938,7 +938,107 @@ __kernel void v8c_copy_f2f(__global const float *in, __global float *out,
   int i = get_global_id(0);
   if (i < n) out[i] = in[i];
 }
+__kernel void v8c_add_h2h(__global const half *in, __global half *out,
+                          const int n) {
+  int i = get_global_id(0);
+  if (i < n) out[i] += in[i];
+}
 )CL";
+
+/**
+ * @brief Residual copy / accumulate for operands on the DEVICE plane.
+ *
+ * @details The shared-plane path in add_i_cl binds host-visible pointers. A
+ * tensor the planner placed on the device plane has none: its getData() is a
+ * shadow the device never wrote, so the shared-plane path would read stale
+ * bytes and write the result somewhere no consumer looks. This binds each
+ * operand on its own plane instead, which also makes the mixed case -- a
+ * device-resident source into a shared-plane destination, the shape of a
+ * boundary whose consumer reads on the host -- expressible.
+ *
+ * @param[in,out] dst destination (the residual accumulator)
+ * @param[in] src source
+ * @param[in] accumulate false: dst = src; true: dst += src
+ * @return false when neither operand is on the device plane, so the caller
+ *         keeps its shared-plane path; true when the op was issued.
+ */
+bool clmem_residual_op_cl(Tensor &dst, const Tensor &src, bool accumulate) {
+  if (dst.getDataType() != ml::train::TensorDim::DataType::FP16 ||
+      src.getDataType() != ml::train::TensorDim::DataType::FP16)
+    return false;
+  if (dst.size() != src.size() || dst.size() == 0)
+    return false;
+  void *dst_cl = dst.isClMem() ? dst.getClMem() : nullptr;
+  void *src_cl = src.isClMem() ? src.getClMem() : nullptr;
+  if (dst_cl == nullptr && src_cl == nullptr)
+    return false;
+
+  // The device handle covers the WHOLE tensor and kernels address from its
+  // base, so a step/batch view at a nonzero offset cannot bind it. Fail loudly
+  // rather than silently corrupting through a base bind.
+  if ((dst_cl != nullptr && dst.getOffset() != 0) ||
+      (src_cl != nullptr && src.getOffset() != 0))
+    throw std::runtime_error(
+      "clmem_residual_op_cl: device-plane tensor accessed at a nonzero offset "
+      "(batch>1 step views are unsupported on the device plane)");
+
+  auto *cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!cc)
+    throw std::runtime_error("clmem_residual_op_cl: no GPU context");
+  const unsigned int n = (unsigned int)dst.size();
+  const size_t bytes = (size_t)n * sizeof(uint16_t);
+
+  // A device-to-device copy could go through clEnqueueCopyBuffer rather than a
+  // kernel, but that entry point is not in this build's OpenCL loader, and the
+  // copy kernel below is the path this falls back to anyway whenever a
+  // recordable queue is in use (a non-NDRange op is not captured by one).
+  // One path is also one thing to reason about.
+
+  auto kp = cc->registerClKernel(v8c_util_kernels,
+                                 accumulate ? "v8c_add_h2h" : "v8c_copy_h2h");
+  if (!kp)
+    throw std::runtime_error("clmem_residual_op_cl: kernel registration");
+
+  // A shared-plane operand keeps the established per-op map protocol (unmap
+  // before the kernel, map after); a device-plane one needs neither.
+  void *src_svm =
+    const_cast<void *>(static_cast<const void *>(src.getData<uint8_t>()));
+  void *dst_svm = static_cast<void *>(dst.getData<uint8_t>());
+  if (src_cl == nullptr)
+    cc->command_queue_inst_.enqueueSVMUnmap(src_svm);
+  if (dst_cl == nullptr)
+    cc->command_queue_inst_.enqueueSVMUnmap(dst_svm);
+
+  bool ok = true;
+  if (src_cl != nullptr) {
+    cl_mem h = static_cast<cl_mem>(src_cl);
+    ok = ok && kp->SetKernelArguments(0, &h, sizeof(cl_mem));
+  } else {
+    ok = ok && kp->SetKernelSVMArguments(0, src_svm);
+  }
+  if (dst_cl != nullptr) {
+    cl_mem h = static_cast<cl_mem>(dst_cl);
+    ok = ok && kp->SetKernelArguments(1, &h, sizeof(cl_mem));
+  } else {
+    ok = ok && kp->SetKernelSVMArguments(1, dst_svm);
+  }
+  int ni = (int)n;
+  ok = ok && kp->SetKernelArguments(2, &ni, sizeof(int));
+  if (!ok)
+    throw std::runtime_error("clmem_residual_op_cl: arg binding");
+
+  const int gws[3] = {(int)(((size_t)n + 63) / 64 * 64), 1, 1};
+  const int lws[3] = {64, 1, 1};
+  if (!cc->command_queue_inst_.DispatchCommand(kp, gws, lws))
+    throw std::runtime_error("clmem_residual_op_cl: dispatch");
+
+  if (src_cl == nullptr)
+    cc->command_queue_inst_.enqueueSVMMap(src_svm, bytes, true);
+  if (dst_cl == nullptr)
+    cc->command_queue_inst_.enqueueSVMMap(dst_svm, bytes, true);
+  return true;
+}
 
 // Write the fp16 GEMM result (y_fp16, device cl_mem, n = M*N valid elements)
 // directly into the GPU-resident SVM output, converting to fp32 when needed.

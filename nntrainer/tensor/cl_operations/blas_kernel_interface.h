@@ -176,5 +176,21 @@ bool clmem_raise_cl(const Tensor &t, unsigned int valid_bytes);
  */
 bool clmem_lower_cl(const Tensor &t, unsigned int valid_bytes);
 
+/**
+ * @brief Residual copy / accumulate for operands on the device plane.
+ *
+ * Both operands must be device-visible -- on the device plane, or SVM. Once
+ * one of them is device-plane resident the other is bound as an SVM argument,
+ * so a plain host operand is refused at argument binding rather than
+ * dispatched: a host pointer is not a kernel operand.
+ *
+ * @param[in,out] dst destination tensor (the residual accumulator)
+ * @param[in] src source tensor
+ * @param[in] accumulate false: dst = src; true: dst += src
+ * @return false when neither operand is device-plane resident, so the caller
+ *         keeps its shared-plane path
+ */
+bool clmem_residual_op_cl(Tensor &dst, const Tensor &src, bool accumulate);
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNEL_INTERFACE_H__ */
