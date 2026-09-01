@@ -864,11 +864,15 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
   /// train initialization this might not worth optimize because in general
   /// output of a neuralnet is very small
   if (lnode->getOutputConnections().size() == 0u) {
-    std::for_each(out_specs.begin(), out_specs.end(),
-                  [this](VarGradSpecV2 &spec) {
-                    spec.variable_spec.additional_exec_order.push_back(
-                      std::get<0>(forward_iter_end->getExecutionOrder()));
-                  });
+    std::for_each(
+      out_specs.begin(), out_specs.end(), [this](VarGradSpecV2 &spec) {
+        spec.variable_spec.additional_exec_order.push_back(
+          std::get<0>(forward_iter_end->getExecutionOrder()));
+        /** No layer reads this one: the caller does, on the host.
+         *  Plan it where the host can read it whatever engine
+         *  produced it. */
+        spec.variable_spec.engine = ml::train::LayerComputeEngine::CPU;
+      });
   }
 
   if (lnode->getType() == RNNCellLayer::type or
@@ -1032,11 +1036,15 @@ NetworkGraph::refinalizeContext(const std::shared_ptr<LayerNode> &lnode,
   /// train initialization this might not worth optimize because in general
   /// output of a neuralnet is very small
   if (lnode->getOutputConnections().size() == 0u) {
-    std::for_each(out_specs.begin(), out_specs.end(),
-                  [this](VarGradSpecV2 &spec) {
-                    spec.variable_spec.additional_exec_order.push_back(
-                      std::get<0>(forward_iter_end->getExecutionOrder()));
-                  });
+    std::for_each(
+      out_specs.begin(), out_specs.end(), [this](VarGradSpecV2 &spec) {
+        spec.variable_spec.additional_exec_order.push_back(
+          std::get<0>(forward_iter_end->getExecutionOrder()));
+        /** No layer reads this one: the caller does, on the host.
+         *  Plan it where the host can read it whatever engine
+         *  produced it. */
+        spec.variable_spec.engine = ml::train::LayerComputeEngine::CPU;
+      });
   }
 
   if (lnode->getType() == RNNCellLayer::type or

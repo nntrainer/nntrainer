@@ -446,6 +446,64 @@ TEST(nntrainer_cpu_backend_standalone, q4_0_repack_unpack_dequantize) {
   }
 }
 
+/**
+ * @brief The standalone legacy-QINT4 record reader
+ *   (Int4Utils::readLegacyQint4RecordToQs4cx) must reproduce, byte for byte,
+ *   what the in-place QINT4 -> QS4CX transcode produces (sectionAToPlain plus
+ *   an fp16 -> fp32 scale widening). This is what lets the reader replace the
+ *   removed Int4QTensor load path.
+ */
+TEST(nntrainer_cpu_backend_standalone, qint4_legacy_reader_to_qs4cx) {
+  nntrainer::init_backend();
+
+  // Section A packing needs N % 4 == 0 and K % 32 == 0.
+  const std::vector<std::pair<size_t, size_t>> shapes = {
+    {512, 768}, {2048, 2048}, {256, 2048}, {4, 32}, {1024, 2560}};
+
+  for (auto &shape : shapes) {
+    const size_t N = shape.first;
+    const size_t K = shape.second;
+    std::vector<float> weight = generate_random_vector<float>(N * K);
+
+    // What a legacy QINT4 (0x06) .bin stores: Section A nibbles + fp16 scales.
+    std::vector<uint8_t> sec_a;
+    std::vector<uint16_t> fp16_scales;
+    nntrainer::Int4Utils::quantizeAndPackKai(weight.data(), N, K, sec_a,
+                                             fp16_scales);
+
+    // Reference: exactly what the QINT4 -> QS4CX transcode does for a record
+    // whose payload is sec_a and whose scales are fp16_scales.
+    const size_t plain_bytes = N * ((K + 1) / 2);
+    std::vector<uint8_t> ref_plain(plain_bytes);
+    nntrainer::Int4Utils::sectionAToPlain(sec_a.data(), N, K, ref_plain.data());
+    std::vector<float> ref_scales(N);
+    for (size_t n = 0; n < N; ++n)
+      ref_scales[n] = nntrainer::compute_fp16_to_fp32(fp16_scales[n]);
+
+    // Assemble the on-disk record: [u16 = 0x06][sec_a nibbles][fp16 scales].
+    const uint16_t scheme = 0x0006; // QScheme::QS4CX
+    std::vector<uint8_t> record;
+    record.insert(record.end(), (const uint8_t *)&scheme,
+                  (const uint8_t *)&scheme + sizeof(uint16_t));
+    record.insert(record.end(), sec_a.begin(), sec_a.end());
+    record.insert(record.end(), (const uint8_t *)fp16_scales.data(),
+                  (const uint8_t *)fp16_scales.data() +
+                    fp16_scales.size() * sizeof(uint16_t));
+
+    // Standalone reader output (no Int4QTensor).
+    std::vector<uint8_t> got_plain(plain_bytes);
+    std::vector<float> got_scales(N);
+    nntrainer::Int4Utils::readLegacyQint4RecordToQs4cx(
+      record.data(), record.size(), N, K, got_plain.data(), got_scales.data());
+
+    ASSERT_EQ(got_plain, ref_plain)
+      << "plain nibble mismatch for N=" << N << " K=" << K;
+    for (size_t n = 0; n < N; ++n)
+      ASSERT_EQ(got_scales[n], ref_scales[n])
+        << "fp32 scale mismatch n=" << n << " (N=" << N << " K=" << K << ")";
+  }
+}
+
 float test_gemm_q4_0(const uint32_t M, const uint32_t K, const uint32_t N,
                      const float *weights, const float *activations,
                      std::vector<float> &ref_dst, bool print = false) {

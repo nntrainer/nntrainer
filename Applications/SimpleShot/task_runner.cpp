@@ -185,8 +185,6 @@ std::unique_ptr<ml::train::Model> createModel(const std::string &backbone,
  */
 int main(int argc, char **argv) {
   auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
 
   if (argc != 6 && argc != 5) {
     std::cout
@@ -224,8 +222,8 @@ int main(int argc, char **argv) {
   std::string val_path = app_path + "/tasks/" + argv[4];
 
   try {
-    app_context->registerFactory(
-      nntrainer::createLayer<simpleshot::layers::CenteringLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<simpleshot::layers::CenteringLayer>);
   } catch (std::system_error &e) {
     std::cerr << "registering factory failed: " << e.what();
     return 1;

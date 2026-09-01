@@ -21,6 +21,8 @@
 #include <fp16.h>
 #include <fstream>
 #include <nntrainer_error.h>
+#include <qs4cx_tensor.h>
+#include <quantizer.h>
 #include <sstream>
 #include <tensor.h>
 #include <tensor_dim.h>
@@ -376,87 +378,274 @@ TEST(nntrainer_Tensor, QTensor_01_p) {
 }
 
 /**
- * @brief Int4QTensor creation with initializer
+ * @brief QS4CX_Tensor holds N rows of ceil(K/2) nibble bytes followed by N
+ * float scales, one per output channel
  */
-TEST(nntrainer_Tensor, QTensor_02_p) {
-  int status = ML_ERROR_NONE;
-  nntrainer::Tensor tensor = nntrainer::Tensor(
-    1, 4, 2, 2, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4});
-  ASSERT_NE(nullptr, tensor.getData<int8_t>());
-
-  // Initialize tensor with one
-  tensor.initialize(nntrainer::Initializer::ONES);
-
-  for (size_t b = 0; b < tensor.batch(); ++b) {
-    for (size_t c = 0; c < tensor.channel(); ++c) {
-      for (size_t h = 0; h < tensor.height(); ++h) {
-        for (size_t w = 0; w < tensor.width(); ++w) {
-          size_t idx = tensor.getIndex(b, c, h, w);
-          // get encoded int8 data and decode to a single int 4 value
-          int8_t value = tensor.getValue<int8_t>(idx / 2);
-          if (idx % 2 == 1) {
-            value <<= 4;
-          }
-          value >>= 4;
-
-          // check if the value of data is one
-          ASSERT_EQ(1, value);
-        }
-      }
-    }
-  }
-}
-
-/**
- * @brief Int4QTensor creation with the vector data
- */
-TEST(nntrainer_Tensor, QTensor_03_p) {
-  std::vector<std::vector<std::vector<int8_t>>> in = {{{-8, 0}, {-4, 4}},
-                                                      {{-7, 1}, {-3, 5}},
-                                                      {{-6, 2}, {-2, 6}},
-                                                      {{-5, 3}, {-1, 7}}};
-
+TEST(nntrainer_Tensor, QS4CXTensor_01_p) {
+  const unsigned int K = 5;
+  const unsigned int N = 4;
   nntrainer::Tensor tensor(
-    in, {3.561f}, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4},
-    nntrainer::QScheme::PER_TENSOR_AFFINE);
+    {1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QS4CX}},
+    true);
 
-  // compare tensor data with vector data
-  for (size_t b = 0; b < tensor.batch(); ++b) {
-    for (size_t c = 0; c < tensor.channel(); ++c) {
-      for (size_t h = 0; h < tensor.height(); ++h) {
-        for (size_t w = 0; w < tensor.width(); ++w) {
-          size_t idx = tensor.getIndex(b, c, h, w);
-          // get encoded int8 data and decode to a single int 4 value
-          int8_t value = tensor.getValue<int8_t>(idx / 2);
-          if (idx % 2 == 1) {
-            value <<= 4;
-          }
-          value >>= 4;
-          ASSERT_EQ(in[c][h][w], value);
-        }
-      }
-    }
-  }
-
-  ASSERT_FLOAT_EQ(*tensor.getScale<float>(), 3.561f);
+  const size_t expected = N * ((K + 1) / 2) + N * sizeof(float);
+  EXPECT_EQ(tensor.size(), expected);
+  EXPECT_EQ(tensor.getMemoryBytes(), expected);
+  ASSERT_NE(tensor.getData<uint8_t>(), nullptr);
+  ASSERT_NE(tensor.getScale<float>(), nullptr);
+  EXPECT_EQ(reinterpret_cast<uint8_t *>(tensor.getScale<float>()) -
+              tensor.getData<uint8_t>(),
+            static_cast<ptrdiff_t>(N * ((K + 1) / 2)));
+  EXPECT_EQ(tensor.q_scheme(), nntrainer::QScheme::QS4CX);
 }
 
 /**
- * @brief Int4QTensor creation with incorrect size of scale factors
+ * @brief QS4CX_Tensor is a 2 dimensional weight type
  */
-TEST(nntrainer_Tensor, QTensor_04_n) {
-  std::vector<std::vector<std::vector<int8_t>>> in = {{{-8, 0}, {-4, 4}},
-                                                      {{-7, 1}, {-3, 5}},
-                                                      {{-6, 2}, {-2, 6}},
-                                                      {{-5, 3}, {-1, 7}}};
-
+TEST(nntrainer_Tensor, QS4CXTensor_02_n) {
   EXPECT_THROW(
-    nntrainer::Tensor(in, {3.561f},
-                      {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4},
-                      nntrainer::QScheme::PER_CHANNEL_AFFINE),
+    nntrainer::Tensor(
+      {2, 1, 4, 4, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QS4CX}},
+      true),
     std::invalid_argument);
 }
 
+/**
+ * @brief a QS4CX tensor keeps its type and its record through copy,
+ * assignment, construction from a TensorBase handle, and comparison
+ */
+TEST(nntrainer_Tensor, QS4CXTensor_03_p) {
+  const unsigned int K = 8;
+  const unsigned int N = 4;
+  nntrainer::TensorDim dim(
+    {1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QS4CX}});
+
+  nntrainer::Tensor q(dim, true);
+  uint8_t *raw = q.getData<uint8_t>();
+  for (size_t i = 0; i < N * ((K + 1) / 2); ++i)
+    raw[i] = static_cast<uint8_t>(0x3B + i);
+  float *scale = q.getScale<float>();
+  for (unsigned int n = 0; n < N; ++n)
+    scale[n] = 0.125f * static_cast<float>(n + 1);
+
+  nntrainer::Tensor copied(q);
+  EXPECT_EQ(copied.getDataType(), nntrainer::Tdatatype::QS4CX);
+  EXPECT_EQ(copied, q);
+
+  // assignment used to leave itensor_ null, so the next call dereferenced it
+  nntrainer::Tensor assigned;
+  assigned = q;
+  EXPECT_EQ(assigned.getDataType(), nntrainer::Tdatatype::QS4CX);
+  EXPECT_EQ(assigned, q);
+  EXPECT_EQ(assigned.getData<uint8_t>(), q.getData<uint8_t>());
+
+  // construction from a TensorBase handle, as a clone of one would do
+  std::unique_ptr<nntrainer::TensorBase> base =
+    std::make_unique<nntrainer::QS4CX_Tensor>(dim, true);
+  nntrainer::Tensor from_base(base);
+  ASSERT_NE(from_base.getData<uint8_t>(), nullptr);
+  EXPECT_EQ(from_base.getDataType(), nntrainer::Tdatatype::QS4CX);
+  EXPECT_EQ(from_base.size(), q.size());
+  EXPECT_EQ(from_base, q);
+}
+
+/**
+ * @brief Build an FP32 weight whose output channels have deliberately
+ * different magnitudes, so a single tensor-wide scale could not stand in for
+ * the per-channel ones QS4CX keeps.
+ */
+static nntrainer::Tensor qs4cxSource(unsigned int K, unsigned int N) {
+  nntrainer::Tensor t(1, 1, K, N);
+  for (unsigned int n = 0; n < N; ++n) {
+    const float amp = 0.25f * static_cast<float>(n + 1);
+    for (unsigned int k = 0; k < K; ++k) {
+      // symmetric around zero and touching both ends of the channel's range
+      float v;
+      if (k == 0)
+        v = amp;
+      else if (k == 1)
+        v = -amp;
+      else
+        v =
+          amp * std::sin(1.7f * static_cast<float>(k) + static_cast<float>(n));
+      t.setValue(0, 0, k, n, v);
+    }
+  }
+  return t;
+}
+
+/**
+ * @brief How far a QS4CX reconstruction of channel @a n may sit from the
+ * source: half a step to rounding, plus whatever the top of the channel's
+ * range loses to the +7 clamp. The code carries no zero point, so it reaches
+ * 8 steps below zero but only 7 above.
+ */
+static float qs4cxTolerance(const nntrainer::Tensor &src, unsigned int n,
+                            float step) {
+  float lo = 0.0f;
+  for (unsigned int k = 0; k < src.height(); ++k)
+    lo = std::min(lo, src.getValue(0, 0, k, n));
+  return 0.5f * step + std::max(0.0f, lo + 8.0f * step) + 1e-5f;
+}
+
+/**
+ * @brief QScheme::QS4CX resolves to a quantizer instead of throwing
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_01_p) {
+  std::unique_ptr<nntrainer::Quantizer> quantizer;
+  ASSERT_NO_THROW(quantizer = nntrainer::Quantization::createQuantizer(
+                    nntrainer::QScheme::QS4CX));
+  ASSERT_NE(quantizer, nullptr);
+  EXPECT_EQ(quantizer->qscheme(), nntrainer::QScheme::QS4CX);
+  EXPECT_EQ(quantizer->create()->qscheme(), nntrainer::QScheme::QS4CX);
+}
+
+/**
+ * @brief QS4CX quantize / dequantize round trip stays within the per-channel
+ * step size
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_02_p) {
+  const unsigned int K = 8;
+  const unsigned int N = 4;
+  nntrainer::Tensor input = qs4cxSource(K, N);
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  nntrainer::Tensor q = quantizer->quantize(input, nntrainer::Tdatatype::QS4CX);
+
+  EXPECT_EQ(q.getDataType(), nntrainer::Tdatatype::QS4CX);
+  EXPECT_EQ(q.q_scheme(), nntrainer::QScheme::QS4CX);
+  EXPECT_EQ(q.height(), K);
+  EXPECT_EQ(q.width(), N);
+  EXPECT_EQ(q.size(), N * ((K + 1) / 2) + N * sizeof(float));
+
+  const float *scales = q.getScale<float>();
+  // the scales are per output channel, and this input made them differ
+  EXPECT_NE(scales[0], scales[N - 1]);
+
+  nntrainer::Tensor deq = quantizer->dequantize(q, nntrainer::Tdatatype::FP32);
+  ASSERT_EQ(deq.getDim(), input.getDim());
+
+  for (unsigned int n = 0; n < N; ++n) {
+    // the scale of a channel is its range, zero included, over the 15 steps
+    float lo = 0.0f, hi = 0.0f;
+    for (unsigned int k = 0; k < K; ++k) {
+      lo = std::min(lo, input.getValue(0, 0, k, n));
+      hi = std::max(hi, input.getValue(0, 0, k, n));
+    }
+    ASSERT_NEAR(scales[n], (hi - lo) / 15.0f, 1e-6f) << " at n=" << n;
+
+    const float tol = qs4cxTolerance(input, n, scales[n]);
+    for (unsigned int k = 0; k < K; ++k) {
+      EXPECT_NEAR(deq.getValue(0, 0, k, n), input.getValue(0, 0, k, n), tol)
+        << " at k=" << k << ", n=" << n;
+    }
+  }
+}
+
+/**
+ * @brief a quantized QS4CX weight survives the .bin save / read round trip
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_03_p) {
+  // an odd K leaves the last nibble of every channel unused
+  const unsigned int K = 9;
+  const unsigned int N = 4;
+  nntrainer::Tensor input = qs4cxSource(K, N);
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  nntrainer::Tensor saved =
+    quantizer->quantize(input, nntrainer::Tdatatype::QS4CX);
+  nntrainer::Tensor before =
+    quantizer->dequantize(saved, nntrainer::Tdatatype::FP32);
+
+  const std::string path = "qs4cx_round_trip.bin";
+  {
+    std::ofstream f(path, std::ios::out | std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(f.good());
+    saved.save(f);
+  }
+
+  // the record is the nibbles and the scales, with no qparam header of its own
+  {
+    std::ifstream f(path, std::ios::in | std::ios::binary | std::ios::ate);
+    ASSERT_TRUE(f.good());
+    EXPECT_EQ(static_cast<size_t>(f.tellg()), saved.getMemoryBytes());
+  }
+
+  nntrainer::Tensor loaded(
+    {1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QS4CX}},
+    true);
+  {
+    std::ifstream f(path, std::ios::in | std::ios::binary);
+    ASSERT_TRUE(f.good());
+    loaded.read(f);
+  }
+  remove(path.c_str());
+
+  EXPECT_EQ(0, memcmp(loaded.getData<uint8_t>(), saved.getData<uint8_t>(),
+                      saved.getMemoryBytes()));
+
+  nntrainer::Tensor after =
+    quantizer->dequantize(loaded, nntrainer::Tdatatype::FP32);
+  EXPECT_EQ(before, after);
+
+  const float *scales = loaded.getScale<float>();
+  for (unsigned int n = 0; n < N; ++n) {
+    const float tol = qs4cxTolerance(input, n, scales[n]);
+    for (unsigned int k = 0; k < K; ++k) {
+      EXPECT_NEAR(after.getValue(0, 0, k, n), input.getValue(0, 0, k, n), tol)
+        << " at k=" << k << ", n=" << n;
+    }
+  }
+}
+
+/**
+ * @brief only an FP32 tensor can be quantized to QS4CX
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_01_n) {
+  nntrainer::Tensor input(
+    {1, 1, 8, 4, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT8}},
+    true);
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  EXPECT_THROW(quantizer->quantize(input, nntrainer::Tdatatype::QS4CX),
+               std::invalid_argument);
+}
+
+/**
+ * @brief the QS4CX quantizer produces QS4CX and nothing else
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_02_n) {
+  nntrainer::Tensor input = qs4cxSource(8, 4);
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  EXPECT_THROW(quantizer->quantize(input, nntrainer::Tdatatype::QINT8),
+               std::invalid_argument);
+}
+
+/**
+ * @brief a QS4CX record dequantizes to FP32 and nothing else
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_03_n) {
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  nntrainer::Tensor q =
+    quantizer->quantize(qs4cxSource(8, 4), nntrainer::Tdatatype::QS4CX);
+  EXPECT_THROW(quantizer->dequantize(q, nntrainer::Tdatatype::QINT8),
+               std::invalid_argument);
+}
+
+/**
+ * @brief the QS4CX quantizer only dequantizes QS4CX
+ */
+TEST(nntrainer_Tensor, QS4CXQuantizer_04_n) {
+  nntrainer::Tensor input = qs4cxSource(8, 4);
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  EXPECT_THROW(quantizer->dequantize(input, nntrainer::Tdatatype::FP32),
+               std::invalid_argument);
+}
 /**
  * @brief Per Tensor Quantized Tensor (unsigned 32-bit integer)
  */
@@ -4916,19 +5105,6 @@ TEST(nntrainer_Tensor, argmax_02_p) {
   EXPECT_EQ(target.argmax(), std::vector<unsigned int>({24, 0, 0}));
 }
 
-TEST(nntrainer_Tensor, argmax_03_p) {
-  std::vector<std::vector<std::vector<std::vector<int8_t>>>> in = {
-    {{{0, 1, 2}, {-1, 0, 1}, {-2, -1, 0}}},
-    {{{-7, -6, -5}, {-8, -7, -6}, {7, -8, -7}}},
-    {{{2, 3, 4}, {1, 2, 3}, {0, 1, 2}}}};
-
-  nntrainer::Tensor target(
-    in, {0.0719785f}, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4},
-    nntrainer::QScheme::PER_TENSOR_AFFINE);
-
-  EXPECT_EQ(target.argmax(), std::vector<unsigned int>({2, 6, 2}));
-}
-
 TEST(nntrainer_Tensor, topK_supported_fp32_p) {
   nntrainer::Tensor input(3, 1, 5, 6, nntrainer::Tformat::NCHW,
                           nntrainer::Tdatatype::FP32);
@@ -5120,30 +5296,6 @@ TEST(nntrainer_Tensor, max_element_02_p) {
   EXPECT_EQ(target.max_abs(), 31);
 }
 
-TEST(nntrainer_Tensor, max_element_03_p) {
-  std::vector<std::vector<std::vector<int8_t>>> in = {{{1, 1, 1, 1, 1, 1},
-                                                       {2, 1, 0, -1, -2, -3},
-                                                       {3, 1, -1, -3, -5, -7},
-                                                       {4, 1, -2, -5, -8, 5},
-                                                       {5, 1, -3, -7, 5, 1}},
-                                                      {{0, 0, 0, 0, 0, 0},
-                                                       {1, 0, -1, -2, -3, -4},
-                                                       {2, 0, -2, -4, -6, -8},
-                                                       {3, 0, -3, -6, 7, 4},
-                                                       {4, 0, -4, -8, 4, 0}},
-                                                      {{-1, -1, -1, -1, -1, -1},
-                                                       {0, -1, -2, -3, -4, -5},
-                                                       {1, -1, -3, -5, -7, 7},
-                                                       {2, -1, -4, -7, 6, 3},
-                                                       {3, -1, -5, 7, 3, -1}}};
-
-  nntrainer::Tensor target(
-    in, {3.561f}, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4},
-    nntrainer::QScheme::PER_TENSOR_AFFINE);
-
-  EXPECT_EQ(target.max_abs(), 8);
-}
-
 TEST(nntrainer_Tensor, min_element_01_p) {
   int batch = 3;
   int channel = 1;
@@ -5180,43 +5332,6 @@ TEST(nntrainer_Tensor, min_element_02_p) {
   }
 
   EXPECT_EQ(target.minValue(), 16);
-}
-
-/**
- * @brief Int4QTensor minimum value test
- */
-TEST(nntrainer_Tensor, min_element_03_p) {
-  std::vector<std::vector<int8_t>> in = {{0, 5, -6, -1, 4},
-                                         {5, -7, -3, 1, 5},
-                                         {-6, -3, 0, 3, 6},
-                                         {-1, 1, 3, 5, 7},
-                                         {4, 5, 6, 7, -8}};
-
-  nntrainer::Tensor target(
-    in, {0.05126f}, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4},
-    nntrainer::QScheme::PER_TENSOR_AFFINE);
-
-  EXPECT_EQ(target.minValue(), -8);
-
-  // Add 2 to mininum element. next minimum value is -7
-  // [ 0   5  -6  -1   4]    [ 0   5  -6  -1   4]
-  // [ 5  -7  -3   1   5]    [ 5  -7  -3   1   5]
-  // [-6  -3   0   3   6] -> [-6  -3   0   3   6]
-  // [-1   1   3   5   7]    [-1   1   3   5   7]
-  // [ 4   5   6   7  -8]    [ 4   5   6   7  -6]
-  target.addValue(0, 0, 4, 4, 2, 1);
-
-  EXPECT_EQ(target.minValue(), -7);
-
-  // Add 2 to mininum element. next minimum value is -6
-  // [ 0   5  -6  -1   4]    [ 0   5  -6  -1   4]
-  // [ 5  -7  -3   1   5]    [ 5  -5  -3   1   5]
-  // [-6  -3   0   3   6] -> [-6  -3   0   3   6]
-  // [-1   1   3   5   7]    [-1   1   3   5   7]
-  // [ 4   5   6   7  -6]    [ 4   5   6   7  -6]
-  target.addValue(0, 0, 1, 1, 2, 1);
-
-  EXPECT_EQ(target.minValue(), -6);
 }
 
 TEST(nntrainer_Tensor, copy_and_shares_variable_01_p) {
@@ -5810,45 +5925,6 @@ TEST(nntrainer_Tensor, initialize_15_n) {
   /// @note UInt32Tensor does not support HE_NORMAL initialization
   EXPECT_THROW(t.initialize(nntrainer::Initializer::HE_NORMAL),
                std::invalid_argument);
-}
-
-/**
- * @brief initializer one / zero test
- */
-TEST(nntrainer_Tensor, initialize_16_p) {
-  nntrainer::Tensor result(
-    {1, 2, 3, 4, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4}}, true,
-    nntrainer::Initializer::ONES);
-  nntrainer::Tensor tensor(
-    {1, 2, 3, 4, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4}}, true,
-    nntrainer::Initializer::ZEROS);
-  EXPECT_NE(tensor, result);
-  tensor.initialize(nntrainer::Initializer::ONES);
-  EXPECT_EQ(tensor, result);
-}
-
-/**
- * @brief invalid initializer
- */
-TEST(nntrainer_Tensor, initialize_17_n) {
-  nntrainer::Tensor tensor(
-    {1, 2, 3, 4, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4}},
-    true);
-
-  /// @note Int4QTensor does not support HE_NORMAL initialization
-  EXPECT_THROW(tensor.initialize(nntrainer::Initializer::HE_NORMAL),
-               std::invalid_argument);
-}
-
-/**
- * @brief set out of range value. must be in range [-8, 7]
- */
-TEST(nntrainer_Tensor, initialize_18_n) {
-  nntrainer::Tensor tensor(
-    {1, 2, 3, 4, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::QINT4}},
-    true);
-
-  EXPECT_THROW(tensor.setValue(127), std::out_of_range);
 }
 
 TEST(nntrainer_Tensor, split_01_p) {

@@ -402,6 +402,76 @@ private:
 };
 
 /**
+ * @class QS4CXQuantizer class
+ * @brief QS4CXQuantizer produces the QS4CX type: symmetric 4-bit weights with
+ * one float scale per output channel.
+ *
+ * Quantization: x_q = clip(round(x / scale[n]), -8, 7) + 8
+ * Dequantization: x = (x_q - 8) * scale[n]
+ *
+ * @note A QS4CX record is laid out channel-major: the nibbles of the N output
+ * channels come first, K values each, followed by the N float scales. The
+ * logical tensor is (K, N), so this quantizer transposes on the way in and on
+ * the way out; a caller therefore hands over, and gets back, the same shape it
+ * would use for an unquantized weight.
+ * @note Only 2-D tensors (batch == 1, channel == 1) can be quantized, as that
+ * is what QS4CX_Tensor holds.
+ */
+class QS4CXQuantizer : public UniformQuantizer {
+public:
+  /**
+   * @brief Basic Constructor of a QS4CXQuantizer
+   */
+  QS4CXQuantizer() : UniformQuantizer() {}
+
+  /**
+   * @copydoc Quantizer::create()
+   */
+  std::unique_ptr<Quantizer> create() override;
+
+  /**
+   * @copydoc Quantizer::quantize(const Tensor &input,
+   * ml::train::TensorDim::DataType qtype)
+   */
+  Tensor quantize(const Tensor &input,
+                  ml::train::TensorDim::DataType qtype) override;
+
+  /**
+   * @copydoc Quantizer::quantize(const Tensor &input, Tensor &output, float
+   * *scales, unsigned int *zero_points)
+   *
+   * @note The scales are derived from the input, not supplied: they land in
+   * the scale section of @a output. @a scales, when not null, additionally
+   * receives a copy of the width() scales that were computed. @a zero_points
+   * is unused - QS4CX is symmetric, its +8 bias is part of the encoding.
+   */
+  Tensor &quantize(const Tensor &input, Tensor &output, float *scales,
+                   unsigned int *zero_points = nullptr) override;
+
+  /**
+   * @copydoc Quantizer::dequantize(const Tensor &input)
+   */
+  Tensor dequantize(const Tensor &input,
+                    ml::train::TensorDim::DataType dtype) override;
+
+  /**
+   * @copydoc Quantizer::qscheme()
+   */
+  QScheme qscheme() const override;
+
+private:
+  /**
+   * @copydoc Quantizer::calculateQParams(const Tensor &input,
+   * ml::train::TensorDim::DataType qtype)
+   *
+   * @note The per-channel scales are computed by the quantization kernel
+   * itself, in the same pass that writes the nibbles.
+   */
+  void calculateQParams(const Tensor &input,
+                        ml::train::TensorDim::DataType qtype) override {}
+};
+
+/**
  * @brief Quantization class to create a quantizer
  *
  * @details The quantization class is a creator class to create a predefined
@@ -435,6 +505,9 @@ public:
     case QScheme::Q6_K:
     case QScheme::Q4_0:
       return std::make_unique<GgmlQuantizer>(qscheme);
+      break;
+    case QScheme::QS4CX:
+      return std::make_unique<QS4CXQuantizer>();
       break;
     default:
       return Quantizer::getRegisteredQuantizer(qscheme)->create();
