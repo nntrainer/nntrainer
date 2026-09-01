@@ -16,6 +16,7 @@
 #include <blas_kernels.h>
 #endif
 #include <cstring>
+#include <nntrainer_error.h>
 
 namespace causallm {
 
@@ -90,17 +91,21 @@ void PerLayerSliceLayerGPU::incremental_forwarding(
     if (use_svm &&
         in_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
         out_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
-      // Bind the device buffer only for an offset-0 view. getClMem() returns
-      // the PARENT buffer, which carries no offset of its own, so a b > 0 step
-      // view would bind batch 0's bytes and silently slice the wrong batch.
-      // Falling back to the SVM pointer keeps those batches correct, because
-      // getData<_FP16>() does honour the view offset.
-      void *in_cl = (in_step.isClMem() && in_step.getOffset() == 0)
-                      ? in_step.getClMem()
-                      : nullptr;
-      void *out_cl = (out_step.isClMem() && out_step.getOffset() == 0)
-                       ? out_step.getClMem()
-                       : nullptr;
+      // Bind the device buffer whenever the tensor is on the device plane.
+      // getClMem() returns the PARENT buffer with no offset of its own, so a
+      // b > 0 step view would bind batch 0's bytes -- but falling back to
+      // getData<_FP16>() is NOT a safe alternative for such a tensor: on the
+      // device plane the shared-plane pointer is a shadow nobody wrote, so the
+      // fallback slices zeros rather than the wrong batch. The live path is
+      // batch == 1, where the offset is 0; refuse loudly if that ever changes
+      // rather than silently reading either wrong bytes or no bytes.
+      NNTR_THROW_IF((in_step.isClMem() && in_step.getOffset() != 0) ||
+                      (out_step.isClMem() && out_step.getOffset() != 0),
+                    std::runtime_error)
+        << "PerLayerSliceLayerGPU: device-plane tensor at a nonzero offset "
+           "(batch>1 step views are unsupported on the device plane)";
+      void *in_cl = in_step.isClMem() ? in_step.getClMem() : nullptr;
+      void *out_cl = out_step.isClMem() ? out_step.getClMem() : nullptr;
       nntrainer::per_layer_slice_cl_fp16(
         in_step.getData<_FP16>(), out_step.getData<_FP16>(), rows, feature_size,
         in_width, off, /*use_svm=*/true, out_cl, in_cl);
