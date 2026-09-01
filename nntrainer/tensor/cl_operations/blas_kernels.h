@@ -623,6 +623,22 @@ void v8c_collect_lazy_program_tasks(ClContext &cc,
 void cl_queue_finish();
 
 /**
+ * @brief Take a shared-virtual-memory buffer back for the host.
+ *
+ * The counterpart of cl_svm_unmap_force below, and the reason both have to
+ * exist: at a genuine GPU->host boundary the host must map the buffer before
+ * it reads it, or it reads a stale shadow of the bytes the device wrote --
+ * fluent, wrong output with no crash to notice it by. Blocking, so the
+ * mapping is in place when the call returns. A no-op when there is no GPU
+ * context, which is what a CPU-only run has.
+ *
+ * @param ptr shared-virtual-memory pointer to map; null is ignored
+ * @param bytes length of the region to map; zero is ignored
+ * @param read_only true when the host only reads through the mapping
+ */
+void cl_svm_map_force(void *ptr, size_t bytes, bool read_only);
+
+/**
  * @brief Hand a shared-virtual-memory buffer back to the device.
  *
  * Use after a genuine HOST write to an SVM activation, so the GPU kernels that

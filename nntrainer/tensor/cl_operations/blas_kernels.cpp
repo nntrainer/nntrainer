@@ -3281,6 +3281,18 @@ void cl_queue_finish() {
     opencl::clFinish(blas_cc->command_queue_inst_.GetCommandQueue());
 }
 
+void cl_svm_map_force(void *ptr, size_t bytes, bool read_only) {
+  // Blocking host-coherent SVM map at a genuine GPU->host boundary (the
+  // lm_head reading the final RMSNorm output on the host). The counterpart of
+  // cl_svm_unmap_force below: without it the host reads a stale SVM shadow of
+  // a buffer the device has written, which is fluent, wrong output with no
+  // crash to notice it by.
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (blas_cc && ptr && bytes)
+    blas_cc->command_queue_inst_.enqueueSVMMap(ptr, bytes, read_only);
+}
+
 void cl_svm_unmap_force(void *ptr) {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
