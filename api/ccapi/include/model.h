@@ -334,6 +334,27 @@ public:
                void *user_data = nullptr) = 0;
 
   /**
+   * @brief Register a per-node callback the weight loader invokes as soon as
+   *        that node's weights are fully materialized, instead of after the
+   *        whole load joins. Lets an application overlap its per-weight
+   *        derive/upload/release work with the other load workers' file reads,
+   *        which is what keeps an all-payloads-resident host peak from forming.
+   *        Set to nullptr to clear. Default: a no-op, so a Model implementation
+   *        that does not support the hook simply ignores it.
+   * @param fn per-node callback (same signature as forEachLayer's)
+   * @param user_data opaque pointer handed back to @p fn
+   */
+  virtual void
+  setWeightLoadHook(std::function<void(Layer & /**< layer */,
+                                       nntrainer::RunLayerContext & /**< rc */,
+                                       void * /**< user_data */)>
+                      fn,
+                    void *user_data = nullptr) {
+    (void)fn;
+    (void)user_data;
+  }
+
+  /**
    * @brief Look up a graph-managed tensor by name.
    *
    * Used by the symbolic ml::train::Tensor API to wire a user-facing

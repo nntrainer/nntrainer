@@ -38,6 +38,19 @@ FsuLookahead::FsuLookahead(const unsigned int &value) { set(value); }
 ModelTensorDataType::ModelTensorDataType(ModelTensorDataTypeInfo::Enum value) {
   set(value);
 }
+
+bool ModelTensorDataType::isValid(
+  const ModelTensorDataTypeInfo::Enum &v) const {
+  if (v == ModelTensorDataTypeInfo::Enum::W4A16 ||
+      v == ModelTensorDataTypeInfo::Enum::W4A32) {
+    ml_loge("model_tensor_type QINT4-FP16 and QINT4-FP32 are deprecated: "
+            "channel-wise int4 is QS4CX. QINT4 is an on-disk format only and "
+            "an int4 weight materialises as a QS4CX tensor, so neither value "
+            "can be allocated. Use QS4CX-FP16 or QS4CX-FP32 instead.");
+    return false;
+  }
+  return true;
+}
 LossScale::LossScale(float value) { set(value); }
 
 bool LossScale::isValid(const float &value) const {

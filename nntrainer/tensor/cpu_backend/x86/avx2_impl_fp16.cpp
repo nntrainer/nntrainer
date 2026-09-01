@@ -21,13 +21,13 @@
 
 namespace nntrainer::avx2 {
 
-void vcvt_f16_f32(unsigned int N, const _Float16 *input, float *output) {
+void vcvt_f16_f32(unsigned int N, const _FP16 *input, float *output) {
   assert(N != 0);
   assert(input != NULL);
   assert(output != NULL);
 
   unsigned int idx = 0;
-  const _Float16 *data = (const _Float16 *)input;
+  const _FP16 *data = (const _FP16 *)input;
 
   // 16 half-precision floating point values to single-precision values
   for (; N - idx >= 16; idx += 16) {
@@ -57,13 +57,13 @@ void vcvt_f16_f32(unsigned int N, const _Float16 *input, float *output) {
   }
 }
 
-void vcvt_f32_f16(unsigned int N, const float *input, _Float16 *output) {
+void vcvt_f32_f16(unsigned int N, const float *input, _FP16 *output) {
   assert(N != 0);
   assert(input != NULL);
   assert(output != NULL);
 
   unsigned int idx = 0;
-  _Float16 *out_data = (_Float16 *)output;
+  _FP16 *out_data = (_FP16 *)output;
 
   // 16 single-precision floating point values to half-precision values
   for (; N - idx >= 16; idx += 16) {
@@ -97,14 +97,14 @@ void vcvt_f32_f16(unsigned int N, const float *input, _Float16 *output) {
   }
   // remaining single-precision floating point values to half-precision values
   while (idx < N) {
-    *out_data = static_cast<_Float16>(*input);
+    *out_data = static_cast<_FP16>(*input);
     ++out_data;
     ++input;
     ++idx;
   }
 }
 
-bool is_valid(const unsigned int N, const _Float16 *input) {
+bool is_valid(const unsigned int N, const _FP16 *input) {
   assert(N != 0);
   assert(input != NULL);
 

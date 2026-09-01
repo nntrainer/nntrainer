@@ -15,7 +15,14 @@ jobs:
     strategy:
       matrix:
         os: [ ubuntu-22.04, ubuntu-24.04 ]
-        meson_options: [ "-Denable-fp16=false", "-Denable-fp16=true" ]
+        # The third entry builds and RUNS the whole suite with _FP16 bound to
+        # the uint16 nntrainer::Half wrapper instead of native _Float16. It is
+        # the only leg that can catch a change using an _FP16 operation Half
+        # does not provide, or one leaning on native promotion where Half
+        # differs: the MSVC job that selects the wrapper for real is
+        # compile-and-link only, and unittest_half_fp16 exercises Half in
+        # isolation rather than the tree's thousands of _FP16 uses.
+        meson_options: [ "-Denable-fp16=false", "-Denable-fp16=true", "-Denable-fp16=true -Dfp16-impl=wrapper" ]
 
     steps:
     - uses: actions/checkout@v4

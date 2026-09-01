@@ -14,7 +14,7 @@
  * XLMRobertaForMaskedLM sanitizes its config in the constructor, so a thin
  * subclass owns the (virtual) Transformer mem-initializer.
  *
- * Guarded for Linux/non-Android only, matching the factory registration in
+ * Guarded for non-Windows only, matching the factory registration in
  * Applications/CausalLM/main.cpp. The test skips when the fixture is absent.
  *
  * @see    https://github.com/nntrainer/nntrainer
@@ -24,7 +24,7 @@
 
 #include <gtest/gtest.h>
 
-#if !defined(_WIN32) && !defined(__ANDROID__)
+#if !defined(_WIN32)
 
 #include <causallm_test_utils.h>
 
@@ -82,4 +82,4 @@ TEST(TinyXLMRobertaDifferentialTest, Q40CloseToFP32Reference) {
 
 } // namespace
 
-#endif // !_WIN32 && !__ANDROID__
+#endif // !_WIN32

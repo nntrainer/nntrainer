@@ -816,6 +816,157 @@ TEST(SaveWithDtypeInference, save_partial_q4_load_inference_compare_p) {
   remove(save_path.c_str());
 }
 
+/**
+ * @brief Save a model as QS4CX, then load it back and compare inference with
+ *        the original FP32 model.
+ *
+ *        The QS4CX record carries no version and the .bin no per-tensor dtype,
+ *        so the reader tells the trimmed record stride (N * ceil(K/2) nibbles
+ *        + N fp32 scales, what the writer emits) from the padded one
+ *        (N * (K + 1) / 2 nibbles, floor(N/2) of them pad) by which of the two
+ *        totals the file size fits. This locks both halves: the file must have
+ *        the trimmed size, and reading it back must land the per-channel
+ *        scales where the GEMM looks for them -- a stride mix-up reads the
+ *        scales out of the nibbles and the output is nowhere near.
+ *
+ *        Model: input(1:1:32) -> dense(unit=32, no bias), so the file holds
+ *        exactly one QS4CX record, with an even K where the two strides differ
+ *        (they coincide for odd K).
+ */
+TEST(SaveWithDtypeInference, save_qs4cx_trimmed_record_load_p) {
+  const unsigned int K = 32; // input width, even: the two strides differ here
+  const unsigned int N = 32; // units
+
+  auto nn_orig = std::make_unique<nntrainer::NeuralNetwork>();
+  nn_orig->addLayer(ml::train::layer::Input(
+    {"name=input", "input_shape=1:1:" + std::to_string(K)}));
+  nn_orig->addLayer(ml::train::layer::FullyConnected(
+    {"name=dense", "unit=" + std::to_string(N), "disable_bias=true"}));
+  nn_orig->setOptimizer(ml::train::optimizer::SGD({"learning_rate=0.1"}));
+  nn_orig->setProperty({"loss=mse", "batch_size=1"});
+  ASSERT_EQ(nn_orig->compile(), ML_ERROR_NONE);
+  ASSERT_EQ(nn_orig->initialize(), ML_ERROR_NONE);
+
+  nntrainer::Tensor input = buildInput(K);
+  nntrainer::Tensor out_orig = runInference(*nn_orig, input);
+
+  std::string qs4cx_path = "test_infer_qs4cx.bin";
+  ASSERT_NO_THROW(
+    nn_orig->save(qs4cx_path, ModelFormat::MODEL_FORMAT_BIN, DataType::QS4CX));
+
+  const std::streamsize trimmed =
+    N * ((K + 1) / 2) + N * 4 + TRAIN_METADATA_SIZE;
+  const std::streamsize padded = N * (K + 1) / 2 + N * 4 + TRAIN_METADATA_SIZE;
+  ASSERT_NE(trimmed, padded);
+
+  std::ifstream qs4cx_file(qs4cx_path, std::ios::binary | std::ios::ate);
+  ASSERT_TRUE(qs4cx_file.is_open());
+  EXPECT_EQ(qs4cx_file.tellg(), trimmed);
+  qs4cx_file.close();
+
+  auto nn_qs4cx =
+    ml::train::createModel(ml::train::ModelType::NEURAL_NET, {"loss=mse"});
+  nn_qs4cx->addLayer(ml::train::createLayer(
+    "input", {"name=input", "input_shape=1:1:" + std::to_string(K)}));
+  nn_qs4cx->addLayer(ml::train::createLayer(
+    "fully_connected",
+    {"name=dense", "unit=" + std::to_string(N), "disable_bias=true"}));
+  nn_qs4cx->setProperty({"batch_size=1", "model_tensor_type=QS4CX-FP32"});
+  ASSERT_EQ(nn_qs4cx->compile(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+  ASSERT_EQ(nn_qs4cx->initialize(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+  ASSERT_NO_THROW(nn_qs4cx->load(qs4cx_path, ModelFormat::MODEL_FORMAT_BIN));
+
+  float *input_data = input.getData<float>();
+  std::vector<float *> in_raw = {input_data};
+  std::vector<float *> answer = nn_qs4cx->inference(1, in_raw);
+
+  for (unsigned int l = 0; l < N; ++l) {
+    float orig_val = out_orig.getValue<float>(0, 0, 0, l);
+    float load_val = answer[0][l];
+    EXPECT_NEAR(orig_val, load_val, 0.5f) << "Mismatch at output index " << l;
+  }
+
+  remove(qs4cx_path.c_str());
+}
+
+/**
+ * @brief A QS4CX save leaves the bias FP32, because that is the type the
+ *        reader asks for.
+ *
+ *        The bias of a dense layer is (1, 1, 1, N), so its height is 1. A
+ *        layer whose weight is quantized requests its bias as FP32 rather
+ *        than as the weight type (FullyConnectedLayer::finalize spells this
+ *        out), so N floats are exactly what load() goes on to read. Writing a
+ *        QS4CX record there instead would put N * ceil(1/2) nibble bytes plus
+ *        N scales where the reader expects N floats, and every byte after it
+ *        would be read from the wrong offset.
+ *
+ *        Model: input(1:1:32) -> dense(unit=32) with the bias left enabled,
+ *        so the file holds a quantized weight followed by an FP32 bias rather
+ *        than one record alone.
+ *
+ * @note  Inference is compared as well as the file size: a size alone cannot
+ *        tell a correctly placed bias from one whose bytes are read at the
+ *        right offset with the wrong type.
+ */
+TEST(SaveWithDtypeInference, save_qs4cx_bias_record_load_p) {
+  const unsigned int K = 32; // input width
+  const unsigned int N = 32; // units
+
+  auto nn_orig = std::make_unique<nntrainer::NeuralNetwork>();
+  nn_orig->addLayer(ml::train::layer::Input(
+    {"name=input", "input_shape=1:1:" + std::to_string(K)}));
+  nn_orig->addLayer(ml::train::layer::FullyConnected(
+    {"name=dense", "unit=" + std::to_string(N)}));
+  nn_orig->setOptimizer(ml::train::optimizer::SGD({"learning_rate=0.1"}));
+  nn_orig->setProperty({"loss=mse", "batch_size=1"});
+  ASSERT_EQ(nn_orig->compile(), ML_ERROR_NONE);
+  ASSERT_EQ(nn_orig->initialize(), ML_ERROR_NONE);
+
+  nntrainer::Tensor input = buildInput(K);
+  nntrainer::Tensor out_orig = runInference(*nn_orig, input);
+
+  std::string qs4cx_path = "test_infer_qs4cx_bias.bin";
+  ASSERT_NO_THROW(
+    nn_orig->save(qs4cx_path, ModelFormat::MODEL_FORMAT_BIN, DataType::QS4CX));
+
+  // The weight (K, N) is a QS4CX record; the bias (1, N) stays N floats.
+  const std::streamsize weight_record = N * ((K + 1) / 2) + N * 4;
+  const std::streamsize bias_record = N * 4;
+
+  std::ifstream qs4cx_file(qs4cx_path, std::ios::binary | std::ios::ate);
+  ASSERT_TRUE(qs4cx_file.is_open());
+  EXPECT_EQ(qs4cx_file.tellg(),
+            weight_record + bias_record + TRAIN_METADATA_SIZE);
+  qs4cx_file.close();
+
+  auto nn_qs4cx =
+    ml::train::createModel(ml::train::ModelType::NEURAL_NET, {"loss=mse"});
+  nn_qs4cx->addLayer(ml::train::createLayer(
+    "input", {"name=input", "input_shape=1:1:" + std::to_string(K)}));
+  nn_qs4cx->addLayer(ml::train::createLayer(
+    "fully_connected", {"name=dense", "unit=" + std::to_string(N)}));
+  nn_qs4cx->setProperty({"batch_size=1", "model_tensor_type=QS4CX-FP32"});
+  ASSERT_EQ(nn_qs4cx->compile(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+  ASSERT_EQ(nn_qs4cx->initialize(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+
+  // Each record is the size the reader assumes, so the bias is read from the
+  // offset the weight before it ends at and the file is fully consumed.
+  ASSERT_NO_THROW(nn_qs4cx->load(qs4cx_path, ModelFormat::MODEL_FORMAT_BIN));
+
+  float *input_data = input.getData<float>();
+  std::vector<float *> in_raw = {input_data};
+  std::vector<float *> answer = nn_qs4cx->inference(1, in_raw);
+
+  for (unsigned int l = 0; l < N; ++l) {
+    float orig_val = out_orig.getValue<float>(0, 0, 0, l);
+    float load_val = answer[0][l];
+    EXPECT_NEAR(orig_val, load_val, 0.5f) << "Mismatch at output index " << l;
+  }
+
+  remove(qs4cx_path.c_str());
+}
+
 // =============================================================================
 // Main function
 // =============================================================================

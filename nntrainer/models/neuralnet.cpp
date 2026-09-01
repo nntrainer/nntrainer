@@ -34,14 +34,24 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <thread>
+
+#if defined(__GLIBC__) && !defined(_WIN32)
+#include <malloc.h> // malloc_trim: return the loader's freed transients to the OS
+#endif
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_fc_qs4cx.h> // [wprefetch] cuda_fc_qs4cx_prefetch_weight
+#endif
 
 #include <activation_realizer.h>
 #include <adamw.h>
 #include <common_properties.h>
 #include <databuffer.h>
 #include <flatten_realizer.h>
+#include <fusion_realizer.h>
 #include <ini_interpreter.h>
 #include <ini_wrapper.h>
 #include <input_realizer.h>
@@ -74,6 +84,17 @@
 
 namespace nntrainer {
 
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+// Derive-once GPU weight-pack cache
+// (tensor/cl_operations/v8c_pack_cache.h). Declared here rather than included
+// so this file stays free of the OpenCL headers; only these two calls, both
+// of which take plain arguments, are needed from the loader.
+namespace v8c_pack {
+void set_source(const char *model_bin_path);
+void load_complete();
+} // namespace v8c_pack
+#endif
+
 namespace {
 
 Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
@@ -90,6 +111,7 @@ Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
   case TensorDim::DataType::UINT4:
   case TensorDim::DataType::QINT8:
   case TensorDim::DataType::QINT4:
+  case TensorDim::DataType::QS4CX:
   case TensorDim::DataType::Q4_K:
   case TensorDim::DataType::Q6_K:
   case TensorDim::DataType::Q4_0:
@@ -211,6 +233,15 @@ int NeuralNetwork::compile(ExecutionMode mode) {
     std::vector<Connection>(input_conn.begin(), input_conn.end())));
   realizers.emplace_back(new MultioutRealizer());
   realizers.emplace_back(new FlattenRealizer());
+  // Fuse a compute layer's activation epilogue (conv+relu / fc+act) BEFORE
+  // ActivationRealizer would split it into a node, so it stays inline. Gated
+  // by NNTR_FUSE_ACT (default on) and restricted to inference: the fused
+  // forward is value-identical to the standalone node, but there is no fused
+  // backward, so a training graph keeps the separate ActivationLayer that
+  // contributes the activation derivative. A no-op for graphs whose compute
+  // layers carry no activation property.
+  if (mode == ExecutionMode::INFERENCE)
+    realizers.emplace_back(new FusionRealizer());
   realizers.emplace_back(new ActivationRealizer());
 
   for (auto &realizer : realizers) {
@@ -236,6 +267,26 @@ int NeuralNetwork::compile(ExecutionMode mode) {
     }
   }
 
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+  bool has_gpu_engine = false;
+  for (auto &node : graph_representation) {
+    if (node->isComputeEngineGPU()) {
+      has_gpu_engine = true;
+      break;
+    }
+  }
+#endif
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  bool has_cuda_engine = false;
+  for (auto &node : graph_representation) {
+    if (node->isComputeEngineCUDA()) {
+      has_cuda_engine = true;
+      break;
+    }
+  }
+#endif
+
   model_graph =
     NetworkGraph(fsu, mode, fsu_path, lookahead, tensor_format, tensor_type);
 
@@ -250,6 +301,32 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   // (here the QNN context registers under the name "qnn").
   if (has_qnn_engine)
     model_graph.setComputeBackend("", "qnn");
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+  // A graph with an OpenCL layer in it reads its tensors from the GPU, so
+  // allocate them where the GPU can read them: the OpenCL allocator hands out
+  // memory both sides address, and it is the allocator that can additionally
+  // place a tensor in device memory when the memory planner asks for it.
+  // Without this the pools stay on host memory and every GPU layer pays a copy
+  // in and a copy out, whatever the planner decided.
+  else if (has_gpu_engine)
+    model_graph.setComputeBackend("gpu", "gpu");
+#endif
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Same argument for a graph with a CUDA layer in it: the CUDA allocator hands
+  // out Unified Memory (cudaMallocManaged), addressable by host and device
+  // alike, which is what lets CudaComputeOps::fc take its device arms at all.
+  // Without this the pools stay on plain host memory, dev_accessible() is false
+  // for input, weight and output, every device arm declines, and the FC falls
+  // to the host Tensor::dot -- which has no QS4CX/int4 implementation, so a
+  // quantized model does not merely run slowly on engine=cuda, it throws
+  // "unsupported datatype" on its first FC.
+  // NNTR_CUDA_UVM_POOL=0 forces the host allocator back (correct, host-only).
+  else if (has_cuda_engine) {
+    const char *uvm = std::getenv("NNTR_CUDA_UVM_POOL");
+    if (!(uvm != nullptr && uvm[0] == '0'))
+      model_graph.setComputeBackend("cuda", "cuda");
+  }
+#endif
 
   // QNN activation tensors are rpcmem-backed and registered with the DSP, so
   // their addresses must stay stable across decode tokens. Let inference()
@@ -499,6 +576,50 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
   model_graph.setInputsLabels(input, label);
 
   return forwarding(training);
+}
+
+// The base execution seam: one decode or prefill forward step is a plain graph
+// walk. CPU and OpenCL use this unchanged, so they are byte-identical to the
+// pre-seam code; a backend whose decode is a capture/replay state machine
+// overrides it on its own Context.
+sharedConstTensors Context::runDecode(NeuralNetwork &nn, unsigned int from,
+                                      unsigned int to,
+                                      const sharedConstTensors &input,
+                                      const sharedConstTensors &label) {
+  return nn.incremental_forwarding(from, to, input, label, false);
+}
+
+// Resolve, once and then cache, the Context whose runDecode() drives a decode
+// step. Every backend's base runDecode is the same plain walk, which dispatches
+// each layer to the context named by its own engine= property, so the seam must
+// drive through a backend only when the graph's layers actually run there.
+//
+// A build with two GPU backends compiled in registers both of their contexts. A
+// blind "prefer the accelerator" would then hijack a run whose graph is on the
+// other one — prefill walked on one backend, decode captured on the other, with
+// the KV and hidden-state handoff crossing backends incoherently. Decide from
+// the authoritative per-layer engine property instead, the same one the graph
+// uses to route each node's context, and never from a hardcoded backend order.
+Context *NeuralNetwork::getDecodeContext() {
+  if (decode_ctx_ != nullptr)
+    return decode_ctx_;
+  if (ct_engine == nullptr)
+    return nullptr;
+
+  std::string engine_name = "cpu";
+  if (model_graph.cbegin() != model_graph.cend())
+    engine_name = (*model_graph.cbegin())->getComputeEngineType();
+
+  for (const std::string &name : {engine_name, std::string("cpu")}) {
+    try {
+      decode_ctx_ = ct_engine->getRegisteredContext(name);
+      if (decode_ctx_ != nullptr)
+        return decode_ctx_;
+    } catch (...) {
+      // not registered in this build; try the next candidate
+    }
+  }
+  return decode_ctx_;
 }
 
 sharedConstTensors NeuralNetwork::incremental_forwarding(
@@ -1009,6 +1130,14 @@ void NeuralNetwork::load(const std::string &file_path,
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open file : " << f_path;
 
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+      // Bind the derive-once GPU weight-pack cache to this weight file, by
+      // file identity (size and modification time). Either maps a pack the
+      // load workers below can consume, or arms a one-time rewrite. A no-op
+      // when the cache is opted out of, and on every non-OpenCL build.
+      v8c_pack::set_source(f_path.c_str());
+#endif
+
       // Load weights with bounded thread number not to exceed mmap limits
       constexpr size_t MAX_LOAD_THREADS = 8;
       std::vector<std::shared_ptr<LayerNode>> load_nodes(model_graph.cbegin(),
@@ -1017,7 +1146,38 @@ void NeuralNetwork::load(const std::string &file_path,
       const size_t num_load_threads =
         std::min<size_t>(num_load_nodes, MAX_LOAD_THREADS);
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // [wprefetch level 2] NNTR_CUDA_WPREFETCH>=2 on a cuda graph: migrate
+      // each QS4CX weight's plain payload to the device AS IT IS READ, so the
+      // FC bytes never accumulate in host RSS during the load. Opt-in and
+      // default-off: the migration only has anything to move when the payload
+      // is in managed memory, and cuda_fc_qs4cx_prefetch_weight declines
+      // otherwise. The engine gate keeps this off OpenCL/CPU runs of a
+      // dual-enabled binary, where a stray CUDA call would create a CUDA
+      // context. Scale conversion at the first forward briefly faults the
+      // small fp32-scale tail back -- expected, and tiny.
+      bool cuda_wprefetch_load = false;
+      {
+        static const int _wpf = []() {
+          const char *e = std::getenv("NNTR_CUDA_WPREFETCH");
+          return e ? atoi(e) : 0;
+        }();
+        if (_wpf >= 2)
+          for (auto &n : load_nodes)
+            if (n->isComputeEngineCUDA()) {
+              cuda_wprefetch_load = true;
+              break;
+            }
+      }
+#endif
+
       std::atomic<size_t> next_load_index{0};
+
+      // Serializes weight_load_hook invocations across the load workers: the
+      // hook body may run parallel_for derives and device uploads of its own,
+      // and the interleave's win is overlapping THAT work with the other
+      // workers' file reads -- not running several hook bodies at once.
+      std::mutex load_hook_mtx;
 
       auto load_worker = [&]() {
         for (size_t idx =
@@ -1090,6 +1250,39 @@ void NeuralNetwork::load(const std::string &file_path,
             ::munmap(mmap_ptr, f_size);
 #endif
           }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+          if (cuda_wprefetch_load) {
+            for (unsigned int wi = 0; wi < node->getNumWeights(); ++wi) {
+              nntrainer::Tensor &wt = node->getWeight(wi);
+              if (wt.getDataType() == ml::train::TensorDim::DataType::QS4CX)
+                (void)nntrainer::cuda::cuda_fc_qs4cx_prefetch_weight(
+                  wt.getData<uint8_t>(), wt.width(), wt.height());
+            }
+          }
+#endif
+
+          // [load-drop interleave] this node's weight bytes (payload + any
+          // trailing scales) are fully materialized in their final tensor
+          // storage -- on BOTH the stream and the mmap arm above: hand the
+          // node to the registered per-weight hook NOW, so derived-cache
+          // builds and plain-payload drops overlap the other workers' reads
+          // instead of waiting for the join. Failures are contained -- the
+          // application's post-load sweep is the fallback for anything the
+          // hook missed.
+          if (weight_load_hook) {
+            std::lock_guard<std::mutex> hook_lk(load_hook_mtx);
+            try {
+              weight_load_hook(*node, node->getRunContext(),
+                               weight_load_hook_data);
+            } catch (const std::exception &e) {
+              ml_logw("weight-load hook failed on node %s: %s",
+                      node->getName().c_str(), e.what());
+            } catch (...) {
+              ml_logw("weight-load hook failed on node %s (non-std exception)",
+                      node->getName().c_str());
+            }
+          }
         }
       };
 
@@ -1102,6 +1295,31 @@ void NeuralNetwork::load(const std::string &file_path,
         if (t.joinable())
           t.join();
       }
+
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+      // Every load-time weight pack has committed its record by now: finalize
+      // a pending rewrite off-thread, so writing the pack costs the load
+      // nothing. The writer is joined at exit.
+      v8c_pack::load_complete();
+#endif
+
+#if defined(__GLIBC__) && !defined(_WIN32)
+      // Give the loader's freed transients (staging vectors, per-chunk derive
+      // buffers) back to the OS: glibc keeps brk/arena tops cached after
+      // free(), so they stay in this process's RSS until a trim. One call, at
+      // the end of the positional load -- past the worker join above, and past
+      // any per-weight cache build that ran inside the load, so the trim sees
+      // everything the load transiently allocated. Opt out with
+      // NNTR_MALLOC_TRIM=0.
+      {
+        static const bool malloc_trim_on = []() {
+          const char *e = std::getenv("NNTR_MALLOC_TRIM");
+          return !(e != nullptr && e[0] == '0');
+        }();
+        if (malloc_trim_on)
+          ::malloc_trim(0);
+      }
+#endif
 
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
@@ -1543,7 +1761,14 @@ sharedConstTensors NeuralNetwork::incremental_inference(
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");
   PROFILE_TIME_START(nn_foward);
 
-  out = incremental_forwarding(from, to, X, label, false);
+  // The execution seam: one decode or prefill step is dispatched through the
+  // resolved Context. The base runDecode is the plain walk below, so CPU and
+  // OpenCL are byte-identical; a backend with its own decode strategy overrides
+  // it instead of adding a compile-guarded block here.
+  if (Context *dctx = getDecodeContext())
+    out = dctx->runDecode(*this, from, to, X, label);
+  else
+    out = incremental_forwarding(from, to, X, label, false);
 
   PROFILE_TIME_END(nn_foward);
 

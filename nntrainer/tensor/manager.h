@@ -33,6 +33,11 @@
 #include <common.h>
 #include <graph_node.h>
 #include <tensor_pool.h>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cstdlib>
+#include <cuda_mem_allocator.h>
+#endif
 #include <var_grad.h>
 #include <weight.h>
 
@@ -139,6 +144,30 @@ public:
    *        tensor pools so all dynamically requested memory comes
    *        from the same source. Default = host CPU memory.
    */
+  /**
+   * @brief Pick the activation-pool allocator. Default = the same allocator as
+   *        the weight pool. On engine=cuda with NNTR_CUDA_DEV_ACT enabled,
+   *        return a device-only (cudaMalloc) allocator so the activation
+   *        (tensor) pool is real device memory -- no host<->device page
+   *        migration / async thrash; weights keep UVM (cuda-uvm) because the
+   *        host writes them at load.
+   *
+   *        VALUE-checked, not presence-checked: an explicit =0 is the only way
+   *        to force the UVM activation pool back on, and a presence check would
+   *        make that impossible. Inert on non-CUDA builds and on any allocator
+   *        that is not cuda-uvm.
+   */
+  static std::shared_ptr<MemAllocator>
+  activationAllocator(const std::shared_ptr<MemAllocator> &allocator) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    const char *dev_act = std::getenv("NNTR_CUDA_DEV_ACT");
+    if (allocator && allocator->getName() == "cuda-uvm" && dev_act != nullptr &&
+        dev_act[0] != '0')
+      return std::make_shared<CudaMemAllocator>(/*device_only=*/true);
+#endif
+    return allocator;
+  }
+
   Manager(bool enable_fsu_, const std::string &fsu_path = "",
           unsigned int lookahead = 0, const std::string tensor_format_ = "NCHW",
           const std::string tensor_dtype_ = "FP32-FP32",
@@ -147,7 +176,7 @@ public:
             std::make_shared<MemAllocator>()) :
     weight_pool(enable_fsu_, fsu_path, "weight_pool", exec_mode_, allocator),
     tensor_pool(enable_fsu_ && (exec_mode_ == ExecutionMode::TRAIN), fsu_path,
-                "tensor_pool", exec_mode_, allocator),
+                "tensor_pool", exec_mode_, activationAllocator(allocator)),
     enable_fsu(enable_fsu_),
     enable_optimizations(true),
     fsu_lookahead(lookahead),
@@ -167,7 +196,7 @@ public:
     if (weight_allocator != nullptr)
       weight_pool.setAllocator(std::move(weight_allocator));
     if (tensor_allocator != nullptr)
-      tensor_pool.setAllocator(std::move(tensor_allocator));
+      tensor_pool.setAllocator(activationAllocator(tensor_allocator));
   }
 
   /**

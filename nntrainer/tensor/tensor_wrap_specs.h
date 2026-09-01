@@ -146,6 +146,12 @@ struct TensorSpecV2 {
   /** ONLY FOR THE GRANULAR CONTROL OF LIFE OUTSIDE OF LAYER NODE */
   /// @todo make this as an opaque information with PIMPL
   std::vector<unsigned> additional_exec_order = {};
+
+  /** compute engine of the producing layer, stamped by InitLayerContext so a
+   * later residency step can derive where the tensor should live. CPU by
+   * default, so nothing changes for non-GPU layers.
+   */
+  ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU;
 };
 
 /**

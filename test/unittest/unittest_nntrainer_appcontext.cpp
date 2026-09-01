@@ -23,6 +23,7 @@
 #include <weight.h>
 
 #include <app_context.h>
+#include <engine.h>
 #include <nntrainer_error.h>
 #include <nntrainer_test_util.h>
 
@@ -260,6 +261,256 @@ TEST(AppContextTest, callingUnknownFactoryOptimizerWithIntKey_n) {
   EXPECT_EQ(num, 999);
   EXPECT_THROW(ac.createObject<nntrainer::Optimizer>(num),
                std::invalid_argument);
+}
+
+/**
+ * @brief   ExecPlan resolver tests (caps-only overload)
+ *
+ */
+TEST(ExecPlanResolverTest, capsOnly_cpuBackend_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "cpu";
+
+  auto plan = nntrainer::resolveExecPlan(caps);
+  EXPECT_EQ(plan.gemm_path, nntrainer::GemmPath::CPU);
+}
+
+TEST(ExecPlanResolverTest, capsOnly_gpuWithDpas_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "gpu";
+  caps.dpas = true;
+
+  auto plan = nntrainer::resolveExecPlan(caps);
+  EXPECT_EQ(plan.gemm_path, nntrainer::GemmPath::XMX);
+}
+
+TEST(ExecPlanResolverTest, capsOnly_gpuWithoutDpas_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "gpu";
+  caps.dpas = false;
+
+  auto plan = nntrainer::resolveExecPlan(caps);
+  EXPECT_EQ(plan.gemm_path, nntrainer::GemmPath::DP4A);
+}
+
+TEST(ExecPlanResolverTest, capsOnly_cudaBackend_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "cuda";
+
+  auto plan = nntrainer::resolveExecPlan(caps);
+  EXPECT_EQ(plan.gemm_path, nntrainer::GemmPath::CUBLAS);
+}
+
+TEST(ExecPlanResolverTest, capsOnly_hostCoherentMirrorsIntegrated_p) {
+  nntrainer::DeviceCaps integrated_caps;
+  integrated_caps.backend = "gpu";
+  integrated_caps.integrated = true;
+  EXPECT_EQ(nntrainer::resolveExecPlan(integrated_caps).host_coherent, true);
+
+  nntrainer::DeviceCaps discrete_caps;
+  discrete_caps.backend = "gpu";
+  discrete_caps.integrated = false;
+  EXPECT_EQ(nntrainer::resolveExecPlan(discrete_caps).host_coherent, false);
+}
+
+TEST(ExecPlanResolverTest, capsOnly_decodeGpuDefaultsFalse_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "gpu";
+  caps.dpas = true;
+
+  auto plan = nntrainer::resolveExecPlan(caps);
+  EXPECT_EQ(plan.decode_gpu, false);
+}
+
+/**
+ * @brief   ExecPlan resolver tests (caps + ModelFeatures matcher overload)
+ *
+ */
+TEST(ExecPlanResolverTest, matcher_decodeGpuOnGpuBackend_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "gpu";
+  caps.dpas = true;
+
+  nntrainer::ModelFeatures features;
+  features.decode_gpu = true;
+
+  auto plan = nntrainer::resolveExecPlan(caps, features);
+  EXPECT_EQ(plan.decode_gpu, true);
+}
+
+TEST(ExecPlanResolverTest, matcher_decodeGpuOnCudaBackend_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "cuda";
+
+  nntrainer::ModelFeatures features;
+  features.decode_gpu = true;
+
+  auto plan = nntrainer::resolveExecPlan(caps, features);
+  EXPECT_EQ(plan.decode_gpu, true);
+}
+
+TEST(ExecPlanResolverTest, matcher_decodeGpuGatedOffOnCpuBackend_n) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "cpu";
+
+  nntrainer::ModelFeatures features;
+  features.decode_gpu = true;
+
+  auto plan = nntrainer::resolveExecPlan(caps, features);
+  EXPECT_EQ(plan.decode_gpu, false);
+}
+
+TEST(ExecPlanResolverTest, matcher_decodeGpuFalseStaysFalseOnGpuBackend_n) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "gpu";
+  caps.dpas = true;
+
+  nntrainer::ModelFeatures features;
+  features.decode_gpu = false;
+
+  auto plan = nntrainer::resolveExecPlan(caps, features);
+  EXPECT_EQ(plan.decode_gpu, false);
+}
+
+TEST(ExecPlanResolverTest, matcher_capsDerivedCellsMatchCapsOnlyOverload_p) {
+  nntrainer::DeviceCaps caps;
+  caps.backend = "gpu";
+  caps.dpas = true;
+  caps.integrated = false;
+
+  nntrainer::ModelFeatures features;
+  features.decode_gpu = true;
+
+  auto caps_only_plan = nntrainer::resolveExecPlan(caps);
+  auto matcher_plan = nntrainer::resolveExecPlan(caps, features);
+
+  EXPECT_EQ(matcher_plan.gemm_path, caps_only_plan.gemm_path);
+  EXPECT_EQ(matcher_plan.host_coherent, caps_only_plan.host_coherent);
+}
+
+/**
+ * @brief   toString() smoke tests for the ExecPlan/ModelFeatures resolver
+ *          types and their enums
+ *
+ */
+TEST(ExecPlanResolverTest, toString_execPlanContainsGemmPathKey_p) {
+  nntrainer::ExecPlan plan;
+  std::string dump = plan.toString();
+
+  EXPECT_FALSE(dump.empty());
+  EXPECT_NE(dump.find("gemm_path="), std::string::npos);
+}
+
+TEST(ExecPlanResolverTest, toString_modelFeaturesContainsQkNormKey_p) {
+  nntrainer::ModelFeatures features;
+  std::string dump = features.toString();
+
+  EXPECT_FALSE(dump.empty());
+  EXPECT_NE(dump.find("qk_norm="), std::string::npos);
+}
+
+TEST(ExecPlanResolverTest, toString_gemmPathEnumLiterals_p) {
+  EXPECT_STREQ(nntrainer::toString(nntrainer::GemmPath::CPU), "CPU");
+  EXPECT_STREQ(nntrainer::toString(nntrainer::GemmPath::DP4A), "DP4A");
+  EXPECT_STREQ(nntrainer::toString(nntrainer::GemmPath::XMX), "XMX");
+  EXPECT_STREQ(nntrainer::toString(nntrainer::GemmPath::CUBLAS), "CUBLAS");
+}
+
+/**
+ * @brief   Minimal concrete layer, so the registration facade can be exercised
+ *          end to end (register through Engine, then create through Context).
+ */
+class FacadeLayer : public nntrainer::Layer {
+public:
+  static constexpr const char *type = "facade_test_layer";
+
+  void finalize(nntrainer::InitLayerContext &context) override {}
+  void forwarding(nntrainer::RunLayerContext &context, bool training) override {
+  }
+  void calcDerivative(nntrainer::RunLayerContext &context) override {}
+  void setProperty(const std::vector<std::string> &values) override {}
+  bool supportBackwarding() const override { return false; }
+  const std::string getType() const override { return FacadeLayer::type; }
+};
+
+/**
+ * @brief   The open backend registry: an engine name resolves against the LIVE
+ *          registered-context set, not a closed enum, and an unregistered name
+ *          falls back to "cpu" rather than resolving to something
+ *          getRegisteredContext() would later reject.
+ */
+TEST(EngineRegistryTest, parseComputeEngineResolvesRegisteredName_p) {
+  auto &engine = nntrainer::Engine::Global();
+
+  EXPECT_EQ(engine.parseComputeEngine({"engine=cpu"}), "cpu");
+  /** case-insensitive: the property is normalised before the lookup */
+  EXPECT_EQ(engine.parseComputeEngine({"engine=CPU"}), "cpu");
+  /** no engine property at all keeps the default */
+  EXPECT_EQ(engine.parseComputeEngine({}), "cpu");
+}
+
+TEST(EngineRegistryTest, parseComputeEngineFallsBackForUnknownName_n) {
+  auto &engine = nntrainer::Engine::Global();
+
+  /** a name no Context registered under must not resolve to itself: the graph
+   *  would then ask getRegisteredContext() for a name that throws */
+  EXPECT_EQ(engine.parseComputeEngine({"engine=no_such_backend"}), "cpu");
+  EXPECT_NO_THROW(
+    engine.getRegisteredContext(engine.parseComputeEngine({"engine=vulkan"})));
+}
+
+/**
+ * @brief   The registration facade dispatches through Context, so a caller
+ *          never needs the concrete context type.
+ */
+TEST(EngineRegistryTest, registerLayerFactoryThroughFacade_p) {
+  auto &engine = nntrainer::Engine::Global();
+
+  int key = engine.registerLayerFactory(
+    "cpu", nntrainer::createLayer<FacadeLayer>, "facade_test_layer");
+  EXPECT_NE(key, -1);
+
+  auto layer = engine.getRegisteredContext("cpu")->createLayerObject(
+    "facade_test_layer", {});
+  EXPECT_NE(layer, nullptr);
+}
+
+TEST(EngineRegistryTest, registerLayerFactoryOnUnknownEngine_n) {
+  auto &engine = nntrainer::Engine::Global();
+
+  /** an unregistered engine name is an error at resolution, not a silent -1 */
+  EXPECT_THROW(engine.registerLayerFactory("no_such_backend",
+                                           nntrainer::createLayer<FacadeLayer>,
+                                           "unreachable_layer"),
+               std::invalid_argument);
+}
+
+/**
+ * @brief   Each Context declares its own residency plane, so the layer graph
+ *          needs no central name-to-enum table.
+ */
+TEST(EngineRegistryTest, contextDeclaresItsResidencyPlane_p) {
+  auto &engine = nntrainer::Engine::Global();
+
+  EXPECT_EQ(engine.getRegisteredContext("cpu")->residencyEngine(),
+            ml::train::LayerComputeEngine::CPU);
+}
+
+/**
+ * @brief   The CPU context reports a host-coherent capability snapshot, and the
+ *          resolver turns it into a CPU execution plan.
+ */
+TEST(EngineRegistryTest, cpuContextReportsHostCoherentCaps_p) {
+  auto &engine = nntrainer::Engine::Global();
+  const nntrainer::DeviceCaps &caps =
+    engine.getRegisteredContext("cpu")->caps();
+
+  EXPECT_EQ(caps.backend, "cpu");
+  EXPECT_TRUE(caps.integrated);
+
+  auto plan = nntrainer::resolveExecPlan(caps);
+  EXPECT_EQ(plan.gemm_path, nntrainer::GemmPath::CPU);
+  EXPECT_TRUE(plan.host_coherent);
 }
 
 /**
