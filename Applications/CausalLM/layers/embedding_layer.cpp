@@ -11,6 +11,12 @@
  * @note   This embedding layer supports FP32/FP16/Q6_K data type only.
  */
 
+#if defined(ENABLE_OPENCL)
+// OpenCL residency handoff (clmem_raise_cl / cl_svm_unmap_force). Guarded so a
+// build without OpenCL compiles this as a host-only embedding.
+#include <blas_kernel_interface.h>
+#include <blas_kernels.h>
+#endif
 #include <embedding_layer.h>
 #include <layer_context.h>
 #include <layer_prof.h>
@@ -1094,6 +1100,28 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
               << "\n input:" << input_ << "\n hidden: " << hidden_ << std::endl;
 #endif
   }
+
+  // The embedding row is written on the HOST (the dequant loop above) into the
+  // output activation. When that output is SVM-resident, hand the buffer back
+  // to the device so the GPU consumer reads fresh data instead of a stale
+  // host-mapped shadow. This runs for EVERY token -- prefill and each decode
+  // step -- so a missing handoff corrupts every step, not just the first.
+  // No-op when the output is not SVM-resident. Mirrors TieWordEmbedding.
+#if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
+  {
+    const auto h_md = hidden_.getMemoryData();
+    if (h_md && h_md->isSVM())
+      nntrainer::cl_svm_unmap_force(hidden_.getData<uint8_t>());
+  }
+#endif
+  // Device-plane residency: upload the host-written rows into the planner's
+  // device sub-buffer so GPU consumers read device memory. No-op when the
+  // tensor is on the shared plane (handled above).
+#if defined(ENABLE_OPENCL)
+  nntrainer::clmem_raise_cl(hidden_,
+                            (unsigned int)((size_t)(to - from) * out_dim *
+                                           hidden_.getDim().getDataTypeSize()));
+#endif
 }
 
 void EmbeddingLayer::calcDerivative(nntrainer::RunLayerContext &context) {
