@@ -60,17 +60,18 @@
 #include <llm_util.hpp>
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_attention.h>
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
+#include <cuda_fc_qs4cx.h>
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 #endif
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
-namespace nntrainer::cuda {
-// Frees all cuBLAS int8 caches at the prefill -> decode boundary.
-void cuda_fc_qs4cx_free_i8_caches();
-} // namespace nntrainer::cuda
+// cuda_fc_qs4cx_free_i8_caches() -- frees all cuBLAS int8 caches at the
+// prefill -> decode boundary -- now comes from <cuda_fc_qs4cx.h> above; a local
+// re-declaration here would trip -Werror=redundant-decls.
 
 namespace {
 // On-GPU greedy argmax. incrementalInference()
@@ -1133,6 +1134,102 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   allocateAndBindKVCache();
   const unsigned int prefill_from = SYS_PROMP_LEN + global_token_len;
   std::vector<unsigned int> id_list;
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Per-weight CUDA prewarm walk, gated by NNTR_CUDA_PREWARM (default on, set
+  // by the cuda context). Two things depend on it:
+  //   - correctness: without it every QS4CX weight's derived device caches (the
+  //     dp4a int4 repack, the fp16/fp32 per-channel scale copies) are built
+  //     LAZILY inside the first forward that uses the weight. Those builds
+  //     cudaMalloc and free while the stream is running under async submission,
+  //     so the first big-K FC of the prefill can consume a buffer another
+  //     allocation has already moved. Building them all here, before any
+  //     forward, removes the mid-stream allocation entirely.
+  //   - cost: the one-time plain -> packed int4 repack is a large share of the
+  //     cold-run GPU time; doing it once here keeps it off the first prefill.
+  // Idempotent (each cache is keyed by the weight pointer), so a second call
+  // and the lazy in-path build are both no-ops afterwards.
+  {
+    static bool cuda_prewarmed = false;
+    static const char *_pw = std::getenv("NNTR_CUDA_PREWARM");
+    static const bool cuda_prewarm_on = !(_pw && _pw[0] == '0');
+    // cuda engine ONLY: a dual-enabled (CUDA + OpenCL) binary would otherwise
+    // run the whole prewarm on OpenCL runs too, allocating every FC's derived
+    // cache on the NVIDIA device.
+    if (!cuda_prewarmed && cuda_prewarm_on && causallm_engine() == "cuda") {
+      cuda_prewarmed = true;
+      std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
+                         void *)>
+        fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &ctx, void *) {
+          if (l.getType() != "fully_connected")
+            return;
+          for (unsigned int w = 0; w < ctx.getNumWeights(); ++w) {
+            nntrainer::Tensor &wt = ctx.getWeight(w);
+            // QINT4 never appears here: layer_context coerces it to QS4CX.
+            if (wt.getDataType() != ml::train::TensorDim::DataType::QS4CX)
+              continue;
+            const unsigned short *uS = nullptr;
+            nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp16(
+              wt.getScale<float>(), wt.width(), &uS);
+            // Same reason, fp32 copy, for the one weight whose decode takes the
+            // fp-activation lm_head GEMV: that route keeps the scale in full
+            // precision.
+            if (wt.width() >= nntrainer::cuda::CUDA_FC_FPACT_MIN_N) {
+              const float *uS32 = nullptr;
+              nntrainer::cuda::cuda_fc_qs4cx_scales_to_uvm_fp32(
+                wt.getScale<float>(), wt.width(), &uS32);
+            }
+            // A skip_prefill FC never sees prefill M>1 and the untied lm_head
+            // decodes at M=1, so neither can reach the M>=32 cuBLAS-i8 gate:
+            // their [K,N] int8 cache is dead VRAM. Exempt them from the EAGER
+            // build; the lazy runtime build remains as the self-healing
+            // fallback.
+            bool i8_dead = l.getName() == "output_of_causallm";
+            if (!i8_dead) {
+              try {
+                i8_dead = l.getProperty("skip_prefill") == "true";
+              } catch (...) {
+              }
+            }
+            if (i8_dead)
+              nntrainer::cuda::cuda_fc_qs4cx_prewarm_exempt_i8(
+                wt.getData<uint8_t>());
+            nntrainer::cuda::cuda_fc_qs4cx_prewarm(wt.getData<uint8_t>(),
+                                                   wt.width(), wt.height());
+          }
+        };
+      model->forEachLayer(fn, nullptr);
+      // The walk is load-time work, not prefill work: restart the prefill clock
+      // so it is not billed to the first forward.
+      start_prefill = std::chrono::high_resolution_clock::now();
+    }
+  }
+
+  // Pre-grow the decode scratch buffers, once, before any timed phase. Both
+  // grow-on-demand allocators FREE the previous buffer and cudaMalloc a larger
+  // one; under async submission (NNTR_CUDA_ASYNC, the default here) kernels
+  // launched earlier on the stream still reference the OLD pointer, so the
+  // first decode step that outgrows a prefill-sized scratch silently reads
+  // freed memory. Sizing them here for the largest shape the model can ask for
+  // removes the regrow entirely -- and it is also what keeps the M=1 path from
+  // cudaMalloc'ing inside a CUDA-graph capture.
+  if (causallm_engine() == "cuda") {
+    // 2*HEAD_DIM covers a model whose global-attention head_dim is wider than
+    // its sliding one; the over-allocation is a few hundred KB.
+    nntrainer::cuda::cuda_attention_splitkv_prewarm(
+      static_cast<int>(MAX_SEQ_LEN), NUM_HEADS, 2 * HEAD_DIM);
+    // Decode is M=1. K (the FC contraction dim) is bounded by
+    // max(hidden, FFN intermediate) -- the down projection reads the FFN
+    // intermediate activation, so DIM alone under-sizes the activation-quant
+    // staging. N is bounded by the largest decode FC output = max(vocab, FFN
+    // intermediate).
+    nntrainer::cuda::cuda_fc_qs4cx_dp4a_prewarm(
+      1u,
+      std::max(static_cast<unsigned int>(DIM),
+               static_cast<unsigned int>(INTERMEDIATE_SIZE)),
+      std::max(NUM_VOCAB, static_cast<unsigned int>(INTERMEDIATE_SIZE)));
+  }
+#endif
 
   // [resume-block] A resumed prefill (multi-turn continuation or a restored
   // KV cache, prefill_from > 0) runs as ONE block call — same shape as the
