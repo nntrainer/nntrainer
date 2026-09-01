@@ -25,6 +25,7 @@
 
 #ifdef __cplusplus
 
+#include <cstdlib>
 #include <cstring>
 #include <regex>
 #include <sstream>
@@ -422,6 +423,29 @@ char *getRealpath(const char *name, char *resolved);
  * @return tm struct
  */
 tm *getLocaltime(tm *tp);
+
+/**
+ * @brief Portable setenv().
+ *
+ * Mirrors POSIX setenv() semantics on every platform. When @a overwrite is 0
+ * and @a name already exists in the environment its value is left untouched
+ * (returns 0). MSVC has no setenv(); _putenv_s() always overwrites, so the
+ * overwrite==0 case is emulated with a std::getenv() presence check.
+ *
+ * @param name      environment variable name
+ * @param value     value to assign
+ * @param overwrite non-zero to overwrite an existing value
+ * @return 0 on success, non-zero on error
+ */
+inline int nntr_setenv(const char *name, const char *value, int overwrite) {
+#if defined(_WIN32)
+  if (overwrite == 0 && std::getenv(name) != nullptr)
+    return 0;
+  return _putenv_s(name, value);
+#else
+  return ::setenv(name, value, overwrite);
+#endif
+}
 
 /**
  * @brief Create and return std::regex with the received string

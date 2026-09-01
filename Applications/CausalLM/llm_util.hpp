@@ -14,6 +14,7 @@
 #ifndef __LLM_UTIL_HPP__
 #define __LLM_UTIL_HPP__ __LLM_UTIL_HPP__
 
+#include <cstdlib> // getenv (causallm_engine); upstream dropped algorithm/math.h
 #include <optional>
 
 #include <base_properties.h>
@@ -78,6 +79,43 @@ T unwrap(std::optional<T> &&value, const std::string &error_msg) {
   } else {
     throw std::runtime_error(error_msg);
   }
+}
+
+/**
+ * @brief Compute engine for CausalLM model layers.
+ * @return "gpu" by default (the v8c OpenCL inference path), or "cpu" when the
+ *         NNTR_ENGINE=cpu env var is set. engine=cpu runs the model on the
+ *         standard CPU layers + CpuComputeOps (e.g. Q4_0-FP32 host inference /
+ *         CPU-only deployment), instead of the engine=gpu Cl layers whose
+ *         ClComputeOps throws NI for plain CPU BLAS ops. An absent engine prop
+ *         already defaults to CPU in LayerNode; this keeps the explicit GPU
+ *         default for backward compatibility while making CPU one env away.
+ */
+// inline (not static): several sibling TUs include this header without ever
+// calling causallm_engine(), which trips -Werror=unused-function on the
+// static-with-internal-linkage form; inline exempts it from that warning and
+// (correctly, since it's a pure function of the environment) gives the whole
+// binary a single cached instance instead of one per TU.
+inline std::string causallm_engine() {
+  static const std::string eng = []() -> std::string {
+    const char *e = std::getenv("NNTR_ENGINE");
+    if (e != nullptr) {
+      const std::string s(e);
+      if (s == "cpu")
+        return "cpu";
+      if (s == "cuda") // additive NVIDIA CUDA backend (engine=cuda)
+        return "cuda";
+    }
+#if defined(ENABLE_OPENCL)
+    return "gpu";
+#else
+    // No OpenCL "gpu" Context is registered in this build (e.g. the FP32 CPU
+    // reference / unittest build), so default to cpu instead of throwing
+    // "[Engine] gpu Context is not registered" at model build.
+    return "cpu";
+#endif
+  }();
+  return eng;
 }
 
 /**

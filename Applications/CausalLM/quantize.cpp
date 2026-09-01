@@ -55,6 +55,7 @@
  */
 
 #include <algorithm>
+#include <env_compat.h>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -71,6 +72,7 @@
 #include "causal_lm.h"
 #include "deberta_v2.h"
 #include "embedding_gemma.h"
+#include "gemma2_causallm.h"
 #include "gemma3_causallm.h"
 #include "gemma4_causallm.h"
 #if !defined(_WIN32)
@@ -101,10 +103,11 @@ namespace {
  * @brief Map of string data type names to DataType enum values
  */
 const std::map<std::string, DataType> dtype_str_map = {
-  {"FP32", DataType::FP32}, {"FP16", DataType::FP16},
-  {"Q4_0", DataType::Q4_0}, {"Q6_K", DataType::Q6_K},
-  {"Q4_K", DataType::Q4_K}, {"QS4CX", DataType::QS4CX},
-  {"NONE", DataType::NONE}};
+  {"FP32", DataType::FP32},   {"FP16", DataType::FP16},
+  {"Q4_0", DataType::Q4_0},   {"Q6_K", DataType::Q6_K},
+  {"Q4_K", DataType::Q4_K},   {"QINT4", DataType::QINT4},
+  {"QS4CX", DataType::QS4CX}, {"NONE", DataType::NONE},
+};
 
 /**
  * @brief Map of string ISA names to ISA enum values
@@ -168,11 +171,21 @@ std::string dataTypeToStr(DataType dt) {
 }
 
 /**
- * @brief Build model_tensor_type string from fc_dtype and activation dtype
- *        Format: "<weight_type>-<activation_type>"
+ * @brief Build model_tensor_type string from fc_dtype and the source's
+ *        activation dtype. Format: "<weight_type>-<activation_type>".
+ *        Quantization only changes weight bytes; the activation/compute dtype
+ *        (and the packed=false norm weights that follow it) is preserved from
+ *        the source model_tensor_type. So an FP16-FP16 source yields
+ *        "<fc>-FP16" (fp16 norms), an FP32-FP32 source yields "<fc>-FP32".
  */
-std::string buildModelTensorType(const std::string &fc_dtype) {
-  return fc_dtype + "-FP32";
+std::string buildModelTensorType(const std::string &fc_dtype,
+                                 const std::string &src_tensor_type) {
+  auto dash = src_tensor_type.find('-');
+  std::string act =
+    (dash != std::string::npos && dash + 1 < src_tensor_type.size())
+      ? src_tensor_type.substr(dash + 1)
+      : std::string("FP32");
+  return fc_dtype + "-" + act;
 }
 
 /**
@@ -349,6 +362,11 @@ void registerAllModels() {
         cfg, generation_cfg, nntr_cfg);
     });
 #endif
+  factory.registerModel("Gemma2ForCausalLM",
+                        [](json cfg, json generation_cfg, json nntr_cfg) {
+                          return std::make_unique<causallm::Gemma2CausalLM>(
+                            cfg, generation_cfg, nntr_cfg);
+                        });
   factory.registerModel("Gemma3ForCausalLM",
                         [](json cfg, json generation_cfg, json nntr_cfg) {
                           return std::make_unique<causallm::Gemma3CausalLM>(
@@ -405,6 +423,9 @@ void printUsage(const char *prog) {
     << "\n"
     << "Options:\n"
     << "  --output, -o <path>   Output directory (default: <model_path>)\n"
+    << "  --container <form>    QINT4 on-disk container: section_a (legacy,\n"
+    << "                        default) or plain (engine-neutral, shared\n"
+    << "                        with the upstream KAI CPU path)\n"
     << "  --fc_dtype <type>     Target dtype for FC layers (default: Q4_0)\n"
     << "  --embd_dtype <type>   Target dtype for embedding (default: FP32)\n"
     << "  --lmhead_dtype <type> Target dtype for LM head (default: same as "
@@ -421,14 +442,48 @@ void printUsage(const char *prog) {
     << "                        individual dtype options. The fc_layer_dtype,\n"
     << "                        embedding_dtype, and lmhead_dtype fields\n"
     << "                        from this config will be used.\n"
+    << "  --ple_sidecar         Write the per-layer-embedding (PLE) table to "
+       "a\n"
+    << "                        sidecar file (<bin>_ple.bin + _ple.json GGML\n"
+    << "                        manifest) instead of embedding it in the "
+       "model\n"
+    << "                        .bin; the output config gains ple_file_name "
+       "so\n"
+    << "                        the runtime mmaps it and dequantizes rows on\n"
+    << "                        demand. gemma4 only; requires Q4_0 or\n"
+    << "                        Q6_K --embd_dtype and 'bin' output format.\n"
+    << "                        Also works on an already-quantized source "
+       "with\n"
+    << "                        matching dtypes (pure repack, bit-identical).\n"
+    << "  --embd_sidecar        Same for the embedding0 token-embedding table\n"
+    << "                        (<bin>_embd.bin + _embd.json; output config\n"
+    << "                        gains embedding_file_name). Requires an "
+       "UNTIED\n"
+    << "                        lm_head (lmhead_untie=true) — a tied head "
+       "scans\n"
+    << "                        every table row per decode step, so a sidecar\n"
+    << "                        saves nothing. Composes with --ple_sidecar.\n"
     << "  --help, -h            Show this help message\n"
     << "\n"
-    << "Supported data types: FP32, FP16, Q4_0, Q6_K, Q4_K\n"
+    << "Supported data types: FP32, FP16, Q4_0, Q6_K, Q4_K, QS4CX\n"
+    << "  int4 = QS4CX (per-channel int4: plain nibbles + fp32 scales) is the\n"
+    << "  canonical int4 weight format for GPU/NPU FC/lm_head. The legacy "
+       "QINT4\n"
+    << "  target is still accepted, and existing QINT4-FP16 .bin files still "
+       "load\n"
+    << "  (transcoded losslessly to QS4CX at read time), but prefer QS4CX for "
+       "new\n"
+    << "  models.\n"
     << "Supported ISA options: DEFAULT (current platform), X86, ARM\n"
     << "\n"
     << "Examples:\n"
     << "  # Quantize FC layers to Q4_0 (default):\n"
     << "  " << prog << " /path/to/qwen3-4b\n"
+    << "\n"
+    << "  # Canonical int4 GPU/NPU recipe (FC+lm_head QS4CX, embedding Q6_K):\n"
+    << "  " << prog
+    << " /path/to/gemma4 --fc_dtype QS4CX --embd_dtype Q6_K --lmhead_dtype "
+       "QS4CX\n"
     << "\n"
     << "  # Quantize FC layers to Q4_0 and embedding to Q6_K:\n"
     << "  " << prog << " /path/to/qwen3-4b --fc_dtype Q4_0 --embd_dtype Q6_K\n"
@@ -478,9 +533,17 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
     dtype_map["token_type_embedding"] = embd_dtype;
   }
 
-  // Gemma4 PLE layers - set to Q4_0 first
-  dtype_map["per_layer_input_embedding"] = fc_dtype;
-  // Gemma4 PLE projection
+  // ViT (TimmViT) patch-embedding projection is a plain FC layer.
+  if (fc_dtype != DataType::FP32 && fc_dtype != DataType::NONE) {
+    dtype_map["patch_embed/proj"] = fc_dtype;
+  }
+  // Gemma4 PLE input embedding is a lookup table (EmbeddingLayer), whose save
+  // supports only Q4_0/Q6_K/FP32 — NOT QINT4 (a matmul-weight packing). Use
+  // embd_dtype, not fc_dtype, so QINT4 FC runs don't choke on this embedding.
+  if (embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE) {
+    dtype_map["per_layer_input_embedding"] = embd_dtype;
+  }
+  // Gemma4 PLE projection is a plain FC layer -> fc_dtype.
   dtype_map["per_layer_input_projection"] = fc_dtype;
 
   // Transformer decoder layers
@@ -529,8 +592,10 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       // for PLE
       dtype_map[prefix + "_per_layer_input_gate"] = fc_dtype;
       dtype_map[prefix + "_per_layer_input_proj"] = fc_dtype;
+      // per-layer PLE embedding is a lookup table -> embd_dtype (EmbeddingLayer
+      // save supports Q4_0/Q6_K/FP32, not QINT4).
       if (embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE) {
-        dtype_map[prefix + "_ple"] = fc_dtype;
+        dtype_map[prefix + "_ple"] = embd_dtype;
       }
 
       dtype_map[prefix + "_ple_projection"] = fc_dtype;
@@ -616,6 +681,8 @@ int main(int argc, char *argv[]) {
   std::string output_bin_name = "";
   std::string target_config_path = "";
   std::string output_format = "bin";
+  bool ple_sidecar = false;
+  bool embd_sidecar = false;
 
   for (int i = 2; i < argc; ++i) {
     std::string arg = argv[i];
@@ -640,6 +707,39 @@ int main(int argc, char *argv[]) {
       }
     } else if (arg == "--config" && i + 1 < argc) {
       target_config_path = argv[++i];
+    } else if (arg == "--ple_sidecar") {
+      ple_sidecar = true;
+    } else if (arg == "--embd_sidecar") {
+      embd_sidecar = true;
+    } else if (arg == "--container" && i + 1 < argc) {
+      std::string container = argv[++i];
+      if (container == "plain") {
+        // Engine-neutral QINT4 record (PR#3978-compatible): plain nibbles +
+        // fp32 scales; loaders repack per engine (CPU KAI / GPU Section A).
+#if defined(_WIN32)
+        _putenv_s("NNTR_QINT4_PLAIN", "1");
+#else
+        setenv("NNTR_QINT4_PLAIN", "1", 1);
+#endif
+      } else if (container != "section_a") {
+        std::cerr << "Unknown --container (use plain or section_a): "
+                  << container << "\n";
+        return EXIT_FAILURE;
+      }
+    } else if (arg == "--int4_scale" && i + 1 < argc) {
+      std::string formula = argv[++i];
+      if (formula == "range15") {
+        // PR#3978/KAI quantizer formula (plain container only).
+#if defined(_WIN32)
+        _putenv_s("NNTR_QINT4_RANGE15", "1");
+#else
+        setenv("NNTR_QINT4_RANGE15", "1", 1);
+#endif
+      } else if (formula != "absmax7") {
+        std::cerr << "Unknown --int4_scale (use absmax7 or range15): "
+                  << formula << "\n";
+        return EXIT_FAILURE;
+      }
     } else if (arg == "--help" || arg == "-h") {
       printUsage(argv[0]);
       return EXIT_SUCCESS;
@@ -727,6 +827,61 @@ int main(int argc, char *argv[]) {
     std::string src_weight_path = model_path + "/" + original_bin;
     std::string dst_weight_path = output_dir + "/" + output_bin_name;
 
+    // PLE sidecar extraction: names derived from the output bin; the payload
+    // path is injected into nntr_cfg so the model wires sidecar_export_path
+    // onto the per_layer_input_embedding layer during save.
+    std::string ple_payload_name, ple_manifest_name;
+    if (ple_sidecar) {
+      if (output_format != "bin")
+        throw std::invalid_argument(
+          "--ple_sidecar supports only the 'bin' output format");
+      if (embd_dtype != DataType::Q4_0 && embd_dtype != DataType::Q6_K)
+        throw std::invalid_argument(
+          "--ple_sidecar requires --embd_dtype Q4_0 or Q6_K (got " +
+          dataTypeToStr(embd_dtype) + ")");
+      if (!nntr_cfg.value("ple_file_name", std::string()).empty())
+        throw std::invalid_argument(
+          "source model already uses a PLE sidecar (ple_file_name set); "
+          "nothing to extract");
+      std::string base = output_bin_name;
+      auto pos = base.rfind(".bin");
+      if (pos != std::string::npos && pos + 4 == base.size())
+        base = base.substr(0, pos);
+      ple_payload_name = base + "_ple.bin";
+      ple_manifest_name = base + "_ple.json";
+      nntr_cfg["ple_sidecar_export"] = output_dir + "/" + ple_payload_name;
+    }
+
+    // embedding0 sidecar: same scheme, gated on an UNTIED lm_head (a tied
+    // head shares the table and scans every row per decode step — a sidecar
+    // would fault the whole file back in and save nothing).
+    std::string embd_payload_name, embd_manifest_name;
+    if (embd_sidecar) {
+      if (output_format != "bin")
+        throw std::invalid_argument(
+          "--embd_sidecar supports only the 'bin' output format");
+      if (embd_dtype != DataType::Q4_0 && embd_dtype != DataType::Q6_K)
+        throw std::invalid_argument(
+          "--embd_sidecar requires --embd_dtype Q4_0 or Q6_K (got " +
+          dataTypeToStr(embd_dtype) + ")");
+      if (!(nntr_cfg.contains("lmhead_untie") &&
+            nntr_cfg["lmhead_untie"].get<bool>()))
+        throw std::invalid_argument(
+          "--embd_sidecar requires an untied lm_head (lmhead_untie=true); a "
+          "tied lm_head shares the embedding table and would gain nothing");
+      if (!nntr_cfg.value("embedding_file_name", std::string()).empty())
+        throw std::invalid_argument(
+          "source model already uses an embedding sidecar "
+          "(embedding_file_name set); nothing to extract");
+      std::string base = output_bin_name;
+      auto pos = base.rfind(".bin");
+      if (pos != std::string::npos && pos + 4 == base.size())
+        base = base.substr(0, pos);
+      embd_payload_name = base + "_embd.bin";
+      embd_manifest_name = base + "_embd.json";
+      nntr_cfg["embd_sidecar_export"] = output_dir + "/" + embd_payload_name;
+    }
+
     int num_layers = cfg["num_hidden_layers"].get<int>();
     std::string architecture =
       cfg["architectures"].get<std::vector<std::string>>()[0];
@@ -759,6 +914,13 @@ int main(int argc, char *argv[]) {
     // baked in on the build host but running on an Android device) fall back to
     // the bare filename resolved against model_path, so the file is found as
     // long as it lives next to nntr_config.json.
+    // Keep the ORIGINAL (unresolved) values for the output config — baking the
+    // build host's absolute paths into it breaks the model dir on-device.
+    json orig_path_cfg;
+    for (const char *key : {"module_config_path", "tokenizer_file"}) {
+      if (nntr_cfg.contains(key))
+        orig_path_cfg[key] = nntr_cfg[key];
+    }
     for (const char *key : {"module_config_path", "tokenizer_file"}) {
       if (!nntr_cfg.contains(key))
         continue;
@@ -814,6 +976,80 @@ int main(int argc, char *argv[]) {
     model->save_weight(dst_weight_path, DataType::NONE, layer_dtype_map,
                        target_isa);
 
+    if (ple_sidecar) {
+      const std::string ple_payload_path = output_dir + "/" + ple_payload_name;
+      if (!std::filesystem::exists(ple_payload_path) ||
+          std::filesystem::file_size(ple_payload_path) == 0)
+        throw std::runtime_error(
+          "PLE sidecar was not written — does this architecture (" +
+          architecture + ") build a per_layer_input_embedding layer?");
+
+      // Manifest: GGML row payload; rows/size cross-checked by the loader
+      // against the payload byte count.
+      if (!cfg.contains("hidden_size_per_layer_input"))
+        throw std::runtime_error(
+          "--ple_sidecar: config.json lacks hidden_size_per_layer_input");
+      const bool q6k = (embd_dtype == DataType::Q6_K);
+      const size_t out_dim = static_cast<size_t>(num_layers) *
+                             cfg["hidden_size_per_layer_input"].get<size_t>();
+      const size_t row_bytes =
+        q6k ? 210 * ((out_dim + 255) / 256) : 18 * ((out_dim + 31) / 32);
+      const size_t payload = std::filesystem::file_size(ple_payload_path);
+      if (payload % row_bytes != 0)
+        throw std::runtime_error("PLE sidecar size " + std::to_string(payload) +
+                                 " is not a multiple of the row stride " +
+                                 std::to_string(row_bytes));
+
+      json manifest;
+      manifest["datatype"] = q6k ? "q6_k" : "q4_0";
+      manifest["size"] = out_dim;
+      manifest["rows"] = payload / row_bytes;
+      manifest["lut-path"] = ple_payload_name;
+      std::ofstream mf(output_dir + "/" + ple_manifest_name);
+      if (!mf.is_open())
+        throw std::runtime_error("Failed to open PLE manifest for write");
+      mf << manifest.dump(4) << std::endl;
+
+      std::cout << "  PLE sidecar:  " << ple_payload_name << " ("
+                << (payload / (1024 * 1024)) << " MB, " << payload / row_bytes
+                << " rows x " << out_dim << ") + " << ple_manifest_name << "\n";
+    }
+
+    if (embd_sidecar) {
+      const std::string embd_payload_path =
+        output_dir + "/" + embd_payload_name;
+      if (!std::filesystem::exists(embd_payload_path) ||
+          std::filesystem::file_size(embd_payload_path) == 0)
+        throw std::runtime_error(
+          "embedding sidecar was not written — embedding0 must be an untied "
+          "embedding_layer for architecture " +
+          architecture);
+
+      const bool q6k = (embd_dtype == DataType::Q6_K);
+      const size_t hidden = cfg["hidden_size"].get<size_t>();
+      const size_t row_bytes =
+        q6k ? 210 * ((hidden + 255) / 256) : 18 * ((hidden + 31) / 32);
+      const size_t payload = std::filesystem::file_size(embd_payload_path);
+      if (payload % row_bytes != 0)
+        throw std::runtime_error(
+          "embedding sidecar size " + std::to_string(payload) +
+          " is not a multiple of the row stride " + std::to_string(row_bytes));
+
+      json manifest;
+      manifest["datatype"] = q6k ? "q6_k" : "q4_0";
+      manifest["size"] = hidden;
+      manifest["rows"] = payload / row_bytes;
+      manifest["lut-path"] = embd_payload_name;
+      std::ofstream mf(output_dir + "/" + embd_manifest_name);
+      if (!mf.is_open())
+        throw std::runtime_error("Failed to open embd manifest for write");
+      mf << manifest.dump(4) << std::endl;
+
+      std::cout << "  EMBD sidecar: " << embd_payload_name << " ("
+                << (payload / (1024 * 1024)) << " MB, " << payload / row_bytes
+                << " rows x " << hidden << ") + " << embd_manifest_name << "\n";
+    }
+
     // Report file size
     auto src_size = std::filesystem::file_size(src_weight_path);
     auto dst_size = std::filesystem::file_size(dst_weight_path);
@@ -835,7 +1071,18 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["embedding_dtype"] = dataTypeToStr(embd_dtype);
     new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
     new_nntr_cfg["model_tensor_type"] =
-      buildModelTensorType(dataTypeToStr(fc_dtype));
+      buildModelTensorType(dataTypeToStr(fc_dtype), src_tensor_type);
+    // *_sidecar_export are extraction-time keys only — the runtime keys are
+    // ple_file_name / embedding_file_name, pointing at the manifests next to
+    // the model file.
+    new_nntr_cfg.erase("ple_sidecar_export");
+    new_nntr_cfg.erase("embd_sidecar_export");
+    if (ple_sidecar)
+      new_nntr_cfg["ple_file_name"] = ple_manifest_name;
+    if (embd_sidecar)
+      new_nntr_cfg["embedding_file_name"] = embd_manifest_name;
+    for (auto &[key, value] : orig_path_cfg.items())
+      new_nntr_cfg[key] = value;
 
     std::string output_config_path = output_dir + "/nntr_config.json";
 

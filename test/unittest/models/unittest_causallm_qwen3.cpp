@@ -53,8 +53,7 @@ void setupQwen3DeterministicWeights(TinyQwen3CausalLM &model) {
           continue;
 
         weight.setValue(0.0f);
-        if (layer.getType() == "rms_norm" ||
-            layer.getType() == "reshaped_rms_norm") {
+        if (causallm_test::isRmsNormLayerType(layer.getType())) {
           weight.setValue(1.0f);
         } else if (layer.getName() == "embedding0") {
           weight.setValue(0.0f);
@@ -121,8 +120,7 @@ public:
           continue;
 
         weight.setValue(0.0f);
-        if (layer.getType() == "rms_norm" ||
-            layer.getType() == "reshaped_rms_norm") {
+        if (causallm_test::isRmsNormLayerType(layer.getType())) {
           weight.setValue(1.0f);
         } else if (layer.getName() == "embedding0") {
           weight.setValue(0, 0, 1, 0, 1.0f);

@@ -11,6 +11,7 @@
 
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 
 #include <compute_ops.h>
 #include <half_tensor.h>

@@ -184,6 +184,17 @@ public:
 struct ModelTensorDataTypeInfo {
   enum Enum {
     W3A32,
+    /**
+     * @brief Deprecated: the two QINT4 weight types.
+     * @details Channel-wise int4 is QS4CX; QINT4 is deprecated and is an
+     * on-disk format only, so an int4 weight materialises as a QS4CX tensor
+     * and a model asking for one of these could not allocate a single weight.
+     * Use WQS4CXA16 / WQS4CXA32 ("QS4CX-FP16" / "QS4CX-FP32") instead. The
+     * enumerators are retained, and rejected by
+     * ModelTensorDataType::isValid(), only so that the values of the
+     * enumerators after them stay stable for the installed header; neither
+     * appears in EnumList or EnumStr, so neither parses from a string.
+     */
     W4A16,
     W4A32,
     W8A16,
@@ -205,22 +216,24 @@ struct ModelTensorDataTypeInfo {
     WQS4CXA32,
     WQS4CXA16,
   };
+  /// @note W4A16 and W4A32 are deliberately absent: QINT4 is deprecated in
+  /// favour of channel-wise QS4CX, so the two "QINT4-*" spellings are no
+  /// longer accepted values. EnumList and EnumStr are matched by position, so
+  /// the two lists drop the same slots together.
   static constexpr std::initializer_list<Enum> EnumList = {
-    Enum::W3A32,     Enum::W4A16,    Enum::W4A32,    Enum::W8A16,
-    Enum::W8A32,     Enum::W16A16,   Enum::W16A32,   Enum::W32A16,
-    Enum::W32A32,    Enum::WQ16AQ16, Enum::WU16AU16, Enum::W8AU16,
-    Enum::WU4AU8,    Enum::WU4AU16,  Enum::WU8AU8,   Enum::WU8AU16,
-    Enum::WQ4KA32,   Enum::WQ40A32,  Enum::WQ40A16,  Enum::WQS4CXA32,
-    Enum::WQS4CXA16,
+    Enum::W3A32,    Enum::W8A16,     Enum::W8A32,     Enum::W16A16,
+    Enum::W16A32,   Enum::W32A16,    Enum::W32A32,    Enum::WQ16AQ16,
+    Enum::WU16AU16, Enum::W8AU16,    Enum::WU4AU8,    Enum::WU4AU16,
+    Enum::WU8AU8,   Enum::WU8AU16,   Enum::WQ4KA32,   Enum::WQ40A32,
+    Enum::WQ40A16,  Enum::WQS4CXA32, Enum::WQS4CXA16,
   };
 
   static constexpr const char *EnumStr[] = {
-    "BCQ-FP32",    "QINT4-FP16",    "QINT4-FP32",    "QINT8-FP16",
-    "QINT8-FP32",  "FP16-FP16",     "FP16-FP32",     "FP32-FP16",
-    "FP32-FP32",   "QINT16-QINT16", "UINT16-UINT16", "QINT8-UINT16",
-    "UINT4-UINT8", "UINT4-UINT16",  "UINT8-UINT8",   "UINT8-UINT16",
-    "Q4_K-FP32",   "Q4_0-FP32",     "Q4_0-FP16",     "QS4CX-FP32",
-    "QS4CX-FP16"};
+    "BCQ-FP32",      "QINT8-FP16",   "QINT8-FP32",  "FP16-FP16",
+    "FP16-FP32",     "FP32-FP16",    "FP32-FP32",   "QINT16-QINT16",
+    "UINT16-UINT16", "QINT8-UINT16", "UINT4-UINT8", "UINT4-UINT16",
+    "UINT8-UINT8",   "UINT8-UINT16", "Q4_K-FP32",   "Q4_0-FP32",
+    "Q4_0-FP16",     "QS4CX-FP32",   "QS4CX-FP16"};
 };
 
 /**
@@ -239,6 +252,20 @@ public:
    */
   ModelTensorDataType(ModelTensorDataTypeInfo::Enum value =
                         ModelTensorDataTypeInfo::Enum::W32A32);
+
+  /**
+   * @brief Reject the two deprecated QINT4 weight types
+   * @details Channel-wise int4 is QS4CX; QINT4 is deprecated. It is an on-disk
+   * format only, so an int4 weight becomes a QS4CX tensor in memory and a
+   * model built with QINT4-FP16 or QINT4-FP32 would throw from the Tensor
+   * constructor at the first weight allocation. Neither spelling parses from a
+   * string any more, having been dropped from EnumList and EnumStr; this
+   * covers the remaining path, a caller passing the retained enumerator
+   * directly, and names the replacement rather than failing at allocation.
+   * @param v value to check
+   * @retval true if the value is a type the library can allocate
+   */
+  bool isValid(const ModelTensorDataTypeInfo::Enum &v) const override;
 };
 
 /**

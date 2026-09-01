@@ -14,6 +14,7 @@
 #include <embedding_normalize_layer.h>
 #include <embedding_pooling_layer.h>
 #include <engine.h>
+#include <llm_util.hpp> // withKey, causallm_engine
 #include <sentence_transformer.h>
 
 #include <algorithm>
@@ -209,6 +210,14 @@ Tensor SentenceTransformer::addModule(const std::string &type, int idx,
     props.insert(props.begin(), "name=" + layer_name);
   }
 
+  // Route the appended sentence-transformer modules (Pooling / Normalize /
+  // any Dense) to the active engine, exactly as every backbone layer in
+  // transformer.cpp does. Without this key the modules always construct on the
+  // default (cpu) context, so the embedding tail stayed on the host even when
+  // the whole backbone ran on the GPU — and the pooled output had to be
+  // drained back to host memory between the two.
+  props.push_back(withKey("engine", causallm_engine()));
+
   LayerHandle layer(ml::train::createLayer(layer_name, props));
   return layer(input);
 }
@@ -309,6 +318,7 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
   }
 
   std::string prompt_ = system_prompt + prompt + tail_prompt;
+  ensureTokenizer(); // join the async load
   auto _input = tokenizer->Encode(prompt_, true);
 
   std::vector<int64_t> init_input;
@@ -383,18 +393,53 @@ void SentenceTransformer::registerCustomLayers() {
   Transformer::registerCustomLayers();
 
   const auto &ct_engine = nntrainer::Engine::Global();
-  const auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+  // cpu-context registration goes through Engine::registerLayerFactory below
+  // (no static_cast to AppContext).
 
   try {
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::EmbeddingPoolingLayer>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::EmbeddingNormalizeLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::EmbeddingPoolingLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::EmbeddingNormalizeLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
   }
+
+  // The SAME layer classes on the gpu context — not GPU forks. Both layers are
+  // backend-neutral: they dispatch their math via in.getOps(), which resolves
+  // to ClComputeOps on a gpu-context tensor (mean_rows / l2_normalize_rows) and
+  // to scopy_fp32 for the last-token row copy. This is the MHACoreLayer /
+  // GeGLULayer pattern, deliberately NOT the RMSNormLayer vs
+  // RMSNormLayerGPU fork. Inert when there is no "gpu" context.
+  //
+  // Registration is required, not optional: addModule() below attaches
+  // engine=causallm_engine() to these nodes, and createLayer on a live context
+  // with an unregistered type THROWS rather than falling back to cpu.
+  try {
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::EmbeddingPoolingLayer>);
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::EmbeddingNormalizeLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "gpu" context (CPU-only build) or already registered — both benign.
+  }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Same classes again on the cuda context. NOTE: this is NOT an accelerated
+  // CUDA path — CudaComputeOps derives CpuComputeOps and does not override
+  // mean_rows/l2_normalize_rows, so both run the host loop on host-coherent
+  // UVM pointers. That is functionally correct; a CUDA reduction kernel would
+  // be a pure performance follow-up.
+  try {
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::EmbeddingPoolingLayer>);
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::EmbeddingNormalizeLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "cuda" context or already registered — both benign.
+  }
+#endif
 }
 
 } // namespace causallm

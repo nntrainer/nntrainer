@@ -104,13 +104,21 @@ void setupMyModelDeterministicWeights(TinyMyModelCausalLM &model) {
       if (w.getDataType() != ml::train::TensorDim::DataType::FP32)
         continue;
       w.setValue(0.0f);
-      if (layer.getType() == "rms_norm")
+      if (causallm_test::isRmsNormLayerType(layer.getType()))
         w.setValue(1.0f);
       // Initialize embedding or other layers as needed
     }
   });
 }
 ```
+
+Match RMS norm nodes with `causallm_test::isRmsNormLayerType()` rather than a
+literal `getType() == "rms_norm"`. The same operator has one type string per
+backend -- the application class reports `"rms_norm"`, its per-head variant
+reports `"reshaped_rms_norm"`, and the OpenCL and CUDA device classes report
+the backend-neutral `"rmsnorm"` -- so a literal comparison silently skips those
+nodes on an `engine=gpu` or `engine=cuda` graph, saves a zero gamma, and the
+model reloads as all-zero logits.
 
 Weight visit order follows the **DFS topological sort** of the nntrainer graph
 (not insertion order). For parallel branches where `wq`, `wk`, `wv` all consume

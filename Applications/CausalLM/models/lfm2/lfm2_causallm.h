@@ -40,6 +40,14 @@ public:
                          int head_dim, Tensor query, Tensor key,
                          Tensor value) override;
 
+  /** @copydoc Transformer::getLayerSlidingWindow(int) — one uniform window for
+   *  every layer (no full-attention interleave), so the base pattern rule does
+   *  not apply. */
+  unsigned int getLayerSlidingWindow(int layer_id) const override {
+    (void)layer_id;
+    return SLIDING_WINDOW;
+  }
+
   /**
    * @brief Create a conv block for LFM2 hybrid layers.
    * @param layer_id index of the layer
