@@ -170,6 +170,15 @@ CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
 #endif
   if (rp.lower_patterns.empty())
     rp.lower_patterns = "output_norm:out0";
+  // The KV cache is the one activation the application itself binds and reads
+  // through two different paths -- the KVCacheManager's own allocator plus the
+  // attention layer's host path -- so it must stay on the shared plane. Core
+  // used to hard-code this exclusion in the planner; declaring it here is the
+  // same rule, moved to the side that owns the tensor, and without it the
+  // cache is placed on the device plane while a host reader still holds the
+  // shared pointer.
+  if (rp.exclude_patterns.empty())
+    rp.exclude_patterns = "cache_";
   if (rp.engine_neutral_types.empty())
     rp.engine_neutral_types = {"mha_core"};
   setupParameters(cfg, generation_cfg, nntr_cfg);
