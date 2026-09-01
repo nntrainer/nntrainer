@@ -28,6 +28,13 @@
 #include <cuda_runtime.h>
 #include <cuda_stream_manager.h>
 
+// Both helpers below are reached only from the FP16 embedding paths, whose own
+// guards read `ENABLE_CUDA && ENABLE_FP16`. This guard has to match those call
+// sites exactly: with CUDA on and FP16 off the definitions would have no
+// caller, and -Werror=unused-function fails that build. Upstream CI runs no
+// CUDA job, so only a local cuda=true / opencl=false / fp16=false build sees
+// it.
+#if defined(ENABLE_FP16)
 namespace {
 // NNTR_CUDA_ASYNC guard for the pinned embedding staging buffers: in async
 // mode nothing drains the stream per-op, so the NEXT token's host dequant can
@@ -67,7 +74,8 @@ void emb_stage_h2d_wait() {
   g_emb_h2d_pending = false;
 }
 } // namespace
-#endif
+#endif // ENABLE_FP16
+#endif // ENABLE_CUDA
 
 #include "../third_party/nlohmann/json.hpp"
 
