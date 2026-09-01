@@ -220,6 +220,7 @@ Tensor BertTransformer::createAttention(const int layer_id, int seq_len,
     withKey("is_causal", "false"),
     // use_gemm_attention routes the (non-causal, encoder) prefill onto the GPU
     // flash path, which handles is_causal=false + no-RoPE.
+    withKey("use_gemm_attention", "true"),
   };
   LayerHandle mha(createLayer("mha_core", a_params));
   Tensor a = mha({q, k, v});

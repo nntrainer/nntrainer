@@ -114,6 +114,12 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
       // derive from getModelFeatures() (single source). Values
       // unchanged (qwen3: host decode, head_dim=128 diverges), so
       // token-identical.
+      withKey("gpu_decode_attn",
+              getModelFeatures().decode_gpu ? "true" : "false"),
+      withKey("gpu_decode_rope",
+              getModelFeatures().decode_rope_gpu ? "true" : "false"),
+      withKey("gpu_ohwi_rope",
+              getModelFeatures().decode_gpu ? "true" : "false"),
     }));
   Tensor a = wireAttentionKVCache(layer_id, n_heads, mha, q_normed, k_normed, v,
                                   _kv_int8_setup);

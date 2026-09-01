@@ -718,6 +718,7 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
             std::to_string(rope_partial_rotary_factor)),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
     withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
+    withKey("use_gemm_attention", "true"),
     // Decode-GPU path is token-identical for gemma4: both the flash decode
     // attention and the GPU-RoPE-decode are validated, so enable both by
     // default (no NNTR_MHA_GPU_DECODE env needed). The env flag still forces
@@ -725,6 +726,11 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
     // decode-GPU gates now derive from getModelFeatures() (the
     // single source) instead of per-call literals. Values unchanged (gemma4:
     // all GPU), so token-identical.
+    withKey("gpu_decode_attn",
+            getModelFeatures().decode_gpu ? "true" : "false"),
+    withKey("gpu_decode_rope",
+            getModelFeatures().decode_rope_gpu ? "true" : "false"),
+    withKey("gpu_ohwi_rope", getModelFeatures().decode_gpu ? "true" : "false"),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
   LayerHandle mha(createLayer("mha_core", a_params));
@@ -880,6 +886,7 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
             std::to_string(rope_partial_rotary_factor)),
     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
     withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
+    withKey("use_gemm_attention", "true"),
     // Decode-GPU path is token-identical for gemma4: both the flash decode
     // attention and the GPU-RoPE-decode are validated, so enable both by
     // default (no NNTR_MHA_GPU_DECODE env needed). The env flag still forces
@@ -887,6 +894,11 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     // decode-GPU gates now derive from getModelFeatures() (the
     // single source) instead of per-call literals. Values unchanged (gemma4:
     // all GPU), so token-identical.
+    withKey("gpu_decode_attn",
+            getModelFeatures().decode_gpu ? "true" : "false"),
+    withKey("gpu_decode_rope",
+            getModelFeatures().decode_rope_gpu ? "true" : "false"),
+    withKey("gpu_ohwi_rope", getModelFeatures().decode_gpu ? "true" : "false"),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
   LayerHandle mha(createLayer("mha_core", a_params));
