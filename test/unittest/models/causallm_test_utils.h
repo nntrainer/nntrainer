@@ -31,6 +31,35 @@
 namespace causallm_test {
 
 /**
+ * @brief Is this layer type string one of the RMS norm families?
+ *
+ * The tiny-model fixtures populate deterministic weights by walking the built
+ * graph and matching each node's getType(); RMS norm nodes are the ones whose
+ * gamma has to be seeded to 1.0 instead of 0.0, or the norm -- and every layer
+ * below it -- saves and reloads as all zeros.
+ *
+ * Matching a type string means the set of spellings has to be kept complete.
+ * There are three, because the same operator is implemented once per backend
+ * and the backends deliberately do not share one string:
+ *
+ *   - "rms_norm"          the application class (causallm::RMSNormLayer)
+ *   - "reshaped_rms_norm" its per-head variant, used for Q/K norms
+ *   - "rmsnorm"           the backend-neutral spelling the OpenCL and CUDA
+ *                         device classes register under, so that a graph can
+ *                         move between backends by changing engine= alone
+ *
+ * A graph built with engine=cuda or engine=gpu resolves an "rms_norm" node to
+ * a device class whose getType() is "rmsnorm", so a fixture that knows only
+ * the first two spellings silently skips those nodes on those engines.
+ *
+ * @param type layer type string, as returned by ml::train::Layer::getType()
+ * @return true if the node is an RMS norm of any backend
+ */
+inline bool isRmsNormLayerType(const std::string &type) {
+  return type == "rms_norm" || type == "reshaped_rms_norm" || type == "rmsnorm";
+}
+
+/**
  * @brief Files generated for one tiny CausalLM test invocation
  */
 struct TinyCausalLMFiles {
