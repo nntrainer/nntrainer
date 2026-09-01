@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <compute_ops.h>
 #include <embedding_normalize_layer.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
@@ -23,6 +24,13 @@
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
+
+/**
+ * Norm floor for the L2 normalize. Matches Tensor::normalization_i's default
+ * epsilon, which this layer relied on before the op-table dispatch, so the
+ * host result is unchanged.
+ */
+static constexpr float DEFAULT_L2_EPSILON = 1e-12f;
 
 EmbeddingNormalizeLayer::EmbeddingNormalizeLayer() : LayerImpl() {}
 
@@ -41,10 +49,17 @@ void EmbeddingNormalizeLayer::forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &input = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output = context.getOutput(SINGLE_INOUT_IDX);
 
-  // Copy input to output as we will modify output in-place
-  output.copyData(input);
-  // Normalize along the last dimension (dim=3)
-  output.normalization_i(3);
+  // Row-wise L2 normalize along the last dimension (dim=3), dispatched through
+  // the op table so the same neutral layer runs on every backend. The CPU impl
+  // is literally the previous copyData + normalization_i(3) pair (bit-identical
+  // host result); the OpenCL impl runs one cooperative-reduction kernel; CUDA
+  // inherits the CPU impl and runs it on host-coherent UVM.
+  //
+  // getOps() is taken from the context-owned input tensor: a locally
+  // constructed Tensor carries no ContextData and would silently fall back to
+  // the global CPU table.
+  input.getOps()->l2_normalize_rows(input, output,
+                                    /*epsilon=*/DEFAULT_L2_EPSILON);
 }
 
 void EmbeddingNormalizeLayer::incremental_forwarding(

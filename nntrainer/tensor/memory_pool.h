@@ -130,6 +130,27 @@ public:
   virtual std::shared_ptr<MemoryData> getMemory(unsigned int idx);
 
   /**
+   * @brief Get device memory backing the token, if this pool has a device
+   *        plane at all.
+   *
+   * @param idx The token received from requestMemory
+   *
+   * @return the device buffer for the token, or nullptr when this pool has no
+   *         device plane or cannot back this token in it. A null answer is not
+   *         an error: it means the tensor stays on the plane getMemory()
+   *         returned, which is a placement, not a failure.
+   *
+   * @details Called by the memory planner for the tensors it wants
+   *          device-resident, after allocate(). A pool with a device plane
+   *          creates the buffer on the first ask, so a graph that wants none
+   *          pays for none.
+   */
+  virtual void *deviceMemory(unsigned int idx) {
+    (void)idx;
+    return nullptr;
+  }
+
+  /**
    * @brief Free all the allocated memory
    *
    */

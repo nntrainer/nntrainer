@@ -37,6 +37,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 SAFETENSORS_DTYPE_MAP = {
     "float32": "F32",
+    "float16": "F16",
 }
 
 # nntrainer internal weight names per layer type (the part after ':').
@@ -303,17 +304,25 @@ def _transposed_shape(tensor, transpose):
     return shape
 
 
-def save_gemma4_bin(params, config, dtype, file, tie_word_embeddings):
+def save_gemma4_bin(params, config, dtype, file, tie_word_embeddings,
+                    norm_dtype=None):
     """Write Gemma4 weights as the nntrainer binary (.bin) layout.
 
     Streams one tensor at a time: each weight is converted to numpy, written,
     then released, so peak memory stays at the model plus a single tensor.
+
+    norm_dtype (optional): when set, the RMSNorm gamma and scalar_multiply
+    weights are written in this dtype while the FC/embedding weights use
+    `dtype`. This yields a "FP32-FP16" source (FP32 weights, FP16 norms) that
+    nntr_quantize can quantize to QS4CX int4 while preserving FP16 norms/activations.
     """
     total_bytes = 0
     count = 0
     for _name, _suffix, tensor, transpose in iter_gemma4_weight_specs(
             params, config):
-        arr = tensor_to_numpy(tensor, dtype, transpose)
+        dt = norm_dtype if (norm_dtype is not None and
+                            _suffix in (SUFFIX_GAMMA, SUFFIX_SCALAR)) else dtype
+        arr = tensor_to_numpy(tensor, dt, transpose)
         arr.tofile(file)
         total_bytes += arr.nbytes
         count += 1
@@ -411,10 +420,18 @@ def parse_args():
         help="Output weight file path",
     )
     parser.add_argument(
+        "--norm_dtype",
+        type=str,
+        default=None,
+        choices=["float32", "float16"],
+        help="Override dtype for RMSNorm gamma + scalar weights (e.g. float16 "
+             "with --data_type float32 yields a FP32-FP16 source).",
+    )
+    parser.add_argument(
         "--data_type",
         type=str,
         default="float32",
-        choices=["float32"],
+        choices=["float32", "float16"],
         help="Output data type",
     )
     parser.add_argument(
@@ -461,7 +478,8 @@ def main():
 
     with open(args.output_name, "wb") as output_file:
         save_gemma4_bin(
-            params, config, args.data_type, output_file, tie_word_embeddings
+            params, config, args.data_type, output_file, tie_word_embeddings,
+            norm_dtype=args.norm_dtype
         )
     print(f"Saved binary: {args.output_name}")
 

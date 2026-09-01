@@ -7,14 +7,25 @@ gpt_oss_inc = include_directories('.')
 # Define Layers
 causallm_gptoss_moe_layer_src_abs = [meson.current_source_dir() / 'gpt_oss_moe_layer.cpp']
 
-causallm_gptoss_moe_layer = shared_library(
-    'gptoss_moe_layer',
-    causallm_gptoss_moe_layer_src_abs,
-    include_directories: [causallm_layer_inc, gpt_oss_inc],
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
-    install: true,
-    install_dir: application_install_dir
-)
+if get_option('default_library') == 'static'
+    causallm_gptoss_moe_layer = static_library(
+        'gptoss_moe_layer',
+        causallm_gptoss_moe_layer_src_abs,
+        include_directories: [causallm_layer_inc, gpt_oss_inc],
+        dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+        install: true,
+        install_dir: application_install_dir
+    )
+else
+    causallm_gptoss_moe_layer = shared_library(
+        'gptoss_moe_layer',
+        causallm_gptoss_moe_layer_src_abs,
+        include_directories: [causallm_layer_inc, gpt_oss_inc],
+        dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+        install: true,
+        install_dir: application_install_dir
+    )
+endif
 
 casuallm_gptoss_moe_layer_dep = declare_dependency(
     link_with: causallm_gptoss_moe_layer,

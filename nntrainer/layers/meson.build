@@ -2,6 +2,10 @@ subdir('loss')
 nntrainer_inc += include_directories('loss')
 nntrainer_inc_abs += meson.current_source_dir() / 'loss'
 
+subdir('llm')
+nntrainer_inc += include_directories('llm')
+nntrainer_inc_abs += meson.current_source_dir() / 'llm'
+
 layer_sources = [
   'activation_layer.cpp',
   'weight_layer.cpp',
@@ -30,6 +34,7 @@ layer_sources = [
   'conv2d_layer.cpp',
   'conv1d_layer.cpp',
   'fc_layer.cpp',
+  'fc_layer_cl.cpp',
   'flatten_layer.cpp',
   'input_layer.cpp',
   'multiout_layer.cpp',

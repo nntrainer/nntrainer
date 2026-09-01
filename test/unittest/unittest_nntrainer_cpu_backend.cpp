@@ -446,6 +446,64 @@ TEST(nntrainer_cpu_backend_standalone, q4_0_repack_unpack_dequantize) {
   }
 }
 
+/**
+ * @brief The standalone legacy-QINT4 record reader
+ *   (Int4Utils::readLegacyQint4RecordToQs4cx) must reproduce, byte for byte,
+ *   what the in-place QINT4 -> QS4CX transcode produces (sectionAToPlain plus
+ *   an fp16 -> fp32 scale widening). This is what lets the reader replace the
+ *   removed Int4QTensor load path.
+ */
+TEST(nntrainer_cpu_backend_standalone, qint4_legacy_reader_to_qs4cx) {
+  nntrainer::init_backend();
+
+  // Section A packing needs N % 4 == 0 and K % 32 == 0.
+  const std::vector<std::pair<size_t, size_t>> shapes = {
+    {512, 768}, {2048, 2048}, {256, 2048}, {4, 32}, {1024, 2560}};
+
+  for (auto &shape : shapes) {
+    const size_t N = shape.first;
+    const size_t K = shape.second;
+    std::vector<float> weight = generate_random_vector<float>(N * K);
+
+    // What a legacy QINT4 (0x06) .bin stores: Section A nibbles + fp16 scales.
+    std::vector<uint8_t> sec_a;
+    std::vector<uint16_t> fp16_scales;
+    nntrainer::Int4Utils::quantizeAndPackKai(weight.data(), N, K, sec_a,
+                                             fp16_scales);
+
+    // Reference: exactly what the QINT4 -> QS4CX transcode does for a record
+    // whose payload is sec_a and whose scales are fp16_scales.
+    const size_t plain_bytes = N * ((K + 1) / 2);
+    std::vector<uint8_t> ref_plain(plain_bytes);
+    nntrainer::Int4Utils::sectionAToPlain(sec_a.data(), N, K, ref_plain.data());
+    std::vector<float> ref_scales(N);
+    for (size_t n = 0; n < N; ++n)
+      ref_scales[n] = nntrainer::compute_fp16_to_fp32(fp16_scales[n]);
+
+    // Assemble the on-disk record: [u16 = 0x06][sec_a nibbles][fp16 scales].
+    const uint16_t scheme = 0x0006; // QScheme::QS4CX
+    std::vector<uint8_t> record;
+    record.insert(record.end(), (const uint8_t *)&scheme,
+                  (const uint8_t *)&scheme + sizeof(uint16_t));
+    record.insert(record.end(), sec_a.begin(), sec_a.end());
+    record.insert(record.end(), (const uint8_t *)fp16_scales.data(),
+                  (const uint8_t *)fp16_scales.data() +
+                    fp16_scales.size() * sizeof(uint16_t));
+
+    // Standalone reader output (no Int4QTensor).
+    std::vector<uint8_t> got_plain(plain_bytes);
+    std::vector<float> got_scales(N);
+    nntrainer::Int4Utils::readLegacyQint4RecordToQs4cx(
+      record.data(), record.size(), N, K, got_plain.data(), got_scales.data());
+
+    ASSERT_EQ(got_plain, ref_plain)
+      << "plain nibble mismatch for N=" << N << " K=" << K;
+    for (size_t n = 0; n < N; ++n)
+      ASSERT_EQ(got_scales[n], ref_scales[n])
+        << "fp32 scale mismatch n=" << n << " (N=" << N << " K=" << K << ")";
+  }
+}
+
 float test_gemm_q4_0(const uint32_t M, const uint32_t K, const uint32_t N,
                      const float *weights, const float *activations,
                      std::vector<float> &ref_dst, bool print = false) {
@@ -473,7 +531,7 @@ float test_gemm_q4_0(const uint32_t M, const uint32_t K, const uint32_t N,
 
   // Step3. Run GEMM! (Online activation quantization + kernel routine + return
   // float)
-  std::vector<float> dst(M * N);
+  std::vector<float> dst(static_cast<size_t>(M) * N);
   auto t1 = high_resolution_clock::now();
   // #### MAIN TESTED METHOD ####
   nntrainer::gemm_q4_0(M, N, K, activations, K,
@@ -516,7 +574,7 @@ float test_gemm_q4_K(const uint32_t M, const uint32_t K, const uint32_t N,
 
   // Step3. Run GEMM! (Online activation quantization + kernel routine + return
   // float)
-  std::vector<float> dst(M * N);
+  std::vector<float> dst(static_cast<size_t>(M) * N);
   auto t1 = high_resolution_clock::now();
   // #### MAIN TESTED METHOD ####
   nntrainer::gemm_q4_K(M, N, K, activations, K, (void *)repacked_qWeight.data(),
@@ -553,7 +611,7 @@ float test_gemm_q6_K(const uint32_t M, const uint32_t K, const uint32_t N,
 
   // Step2. Run GEMM! (Online activation quantization + kernel routine + return
   // float)
-  std::vector<float> dst(M * N);
+  std::vector<float> dst(static_cast<size_t>(M) * N);
   auto t1 = high_resolution_clock::now();
   // #### MAIN TESTED METHOD ####
   nntrainer::gemm_q6_K(M, N, K, activations, K, (void *)offline_qWeight_ptr, N,
@@ -585,9 +643,11 @@ static void run_quant_test(const uint32_t M, const uint32_t K, const uint32_t N,
   ///@note A(sizez, sizex) * W.T(sizey, sizex) = (sizez, sizey)
 
   ///@note q4_K GEMM is a Row-Major, transB GEMM
-  std::vector<float> activation = generate_random_vector<float>(M * K);
-  std::vector<float> weight = generate_random_vector<float>(N * K);
-  std::vector<float> ref_dst(M * N);
+  std::vector<float> activation =
+    generate_random_vector<float>(static_cast<size_t>(M) * K);
+  std::vector<float> weight =
+    generate_random_vector<float>(static_cast<size_t>(N) * K);
+  std::vector<float> ref_dst(static_cast<size_t>(M) * N);
 
   // GROUND TRUTH TRANSB SGEMM for reference
   auto t1 = high_resolution_clock::now();
@@ -1418,9 +1478,10 @@ static void run_transform_int4_test_(const uint32_t K, const uint32_t N,
   std::vector<float> weight_fp32;
   if (use_ones) {
     float ones_ratio = 0.1f;
-    weight_fp32 = generate_01_vector(N * K, ones_ratio);
+    weight_fp32 = generate_01_vector(static_cast<size_t>(N) * K, ones_ratio);
   } else {
-    weight_fp32 = generate_random_vector<float, false>(N * K, -1.0, 1.0);
+    weight_fp32 = generate_random_vector<float, false>(
+      static_cast<size_t>(N) * K, -1.0, 1.0);
   }
 
   bool print = false;
@@ -1452,9 +1513,10 @@ static void run_transform_int4_test_(const uint32_t K, const uint32_t N,
   std::vector<uint8_t> unpacked_weights_q4(q4_data_size);
   nntrainer::unpack_q4_0(dst_q4_0x.data(), unpacked_weights_q4.data(),
                          q4_data_size, N, K);
-  std::vector<float> dequantized_weights_q4(N * K);
+  std::vector<float> dequantized_weights_q4(static_cast<size_t>(N) * K);
   nntrainer::dequantize_row_q4_0(unpacked_weights_q4.data(),
-                                 dequantized_weights_q4.data(), N * K);
+                                 dequantized_weights_q4.data(),
+                                 static_cast<int64_t>(N) * K);
   if (print && use_ones) {
     printMatrixI("dequantized_weights_q4 I", dequantized_weights_q4.data(), N,
                  K);
@@ -1467,7 +1529,7 @@ static void run_transform_int4_test_(const uint32_t K, const uint32_t N,
 
   // Reference solution - Int4 data (osv32_isv2) --> FP32 --> quantization to
   // Q4_0x8 For checking difference of accuracy
-  std::vector<float> dequant_weight_fp32(N * K);
+  std::vector<float> dequant_weight_fp32(static_cast<size_t>(N) * K);
   nntrainer::Int4Utils::dequantizePacked(osv32_weights, osv32_scales, N, K,
                                          scale_group_size, dequant_weight_fp32);
   std::vector<uint8_t> tmp_q4_weight(q4_data_size);
@@ -1480,9 +1542,10 @@ static void run_transform_int4_test_(const uint32_t K, const uint32_t N,
   std::vector<uint8_t> unpacked_ref_weights_q4(q4_data_size);
   nntrainer::unpack_q4_0(ref_q4_0x8.data(), unpacked_ref_weights_q4.data(),
                          q4_data_size, N, K);
-  std::vector<float> dequantized_ref_weights_q4(N * K);
+  std::vector<float> dequantized_ref_weights_q4(static_cast<size_t>(N) * K);
   nntrainer::dequantize_row_q4_0(unpacked_ref_weights_q4.data(),
-                                 dequantized_ref_weights_q4.data(), N * K);
+                                 dequantized_ref_weights_q4.data(),
+                                 static_cast<int64_t>(N) * K);
   float mse_fp32_transform_q4 =
     mse<float>(weight_fp32.data(), dequantized_ref_weights_q4.data(), N * K);
   std::cout << "MSE FP32 transform Q4_0:   " << std::setprecision(10)

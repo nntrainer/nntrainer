@@ -423,6 +423,50 @@ public:
                         bool output_hidden_state = false) override;
 
   /**
+   * @brief Disable capturing the prefill step into a CUDA graph for the next
+   *        forward(s).
+   * @note  A load-time warmup must run EAGER: its FC layers still grow their
+   *        device scratch, and an allocation inside a capture invalidates the
+   *        graph. Re-enable once the warmup has grown everything.
+   */
+  void setPrefillCaptureDisabled(bool v) { prefill_capture_disabled_ = v; }
+
+  /**
+   * @copydoc setPrefillCaptureDisabled
+   */
+  bool isPrefillCaptureDisabled() const { return prefill_capture_disabled_; }
+
+  /**
+   * @brief Declare which nodes must still run on the host when a captured step
+   *        graph is replayed.
+   * @details A captured graph reproduces the device work of a step, but a node
+   *          whose HOST side writes into a buffer the graph reads through a
+   *          fixed device pointer -- an embedding lookup staging its row, for
+   *          example -- has to run again for each step or the replay reuses the
+   *          previous step's value. Which nodes those are is a property of the
+   *          model, so the model declares them rather than the backend guessing
+   *          from layer names. An empty list means the backend must not use a
+   *          replayed step graph at all.
+   * @param names graph node names
+   */
+  void setGraphReplayFeedNodes(std::vector<std::string> names) {
+    graph_replay_feed_nodes_ = std::move(names);
+  }
+
+  /**
+   * @copydoc setGraphReplayFeedNodes
+   */
+  const std::vector<std::string> &getGraphReplayFeedNodes() const {
+    return graph_replay_feed_nodes_;
+  }
+
+  /**
+   * @brief Run only the declared feed nodes on the next forward(s).
+   * @param v true to enter feed-only mode, false to leave it
+   */
+  void setStepFeedOnly(bool v) { step_feed_only_ = v; }
+
+  /**
    * @brief     reset input dimensions of a model
    * @param[in] dims input dimensions
    * @note Similar to reinitialize, the resetInputDimension API is used for
@@ -713,6 +757,31 @@ private:
 
   const Engine *ct_engine =
     nullptr; /** Configurations bound to current engine */
+
+  bool prefill_capture_disabled_ =
+    false; /**< gate for the device graph capture of a prefill step (a warmup
+                run has to stay eager) */
+
+  bool step_feed_only_ =
+    false; /**< when set, one forward runs only graph_replay_feed_nodes_ */
+
+  std::vector<std::string>
+    graph_replay_feed_nodes_; /**< nodes that must still run on the host when a
+                                   captured step graph is replayed */
+
+  /**< resolved-once Context for the decode seam; see getDecodeContext() */
+  Context *decode_ctx_ = nullptr;
+
+  /**
+   * @brief Resolve, once and then cache, the Context whose runDecode() drives
+   *        a decode or prefill forward step. A backend may override runDecode
+   *        with its own strategy; every other backend uses the base plain walk,
+   *        so any registered context gives a byte-identical forward. Resolves
+   *        from the graph's own engine, falling back to "cpu".
+   * @return the decode Context, or nullptr if none is registered (the caller
+   *         then walks the graph directly).
+   */
+  Context *getDecodeContext();
 
   NetworkGraph model_graph; /** Network Model Graph */
 
