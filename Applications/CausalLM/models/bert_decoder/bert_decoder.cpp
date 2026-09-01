@@ -247,6 +247,9 @@ std::pair<std::vector<Tensor>, Tensor> BertDecoder::constructDecoderGraph() {
 
   // lm_head_bias: learnable bias [1,1,1,30522] loaded from weight file
   // The weight_name "lmhead_bias" matches the key written by collect_decoder.
+  // This dtype must match what the weight file actually stores: the raw .bin is
+  // an ordered dump with no per-tensor headers, so declaring FP16 here while
+  // the quantizer wrote FP32 shifts every following tensor on load.
   LayerHandle lmbias(createLayer(
     "weight",
     {withKey("name", "lm_head_bias/weights"),

@@ -727,7 +727,11 @@ Tensor &HalfTensor::dot(Tensor const &input, Tensor &output, bool trans,
     dotQnK(input, output, trans, trans_in, beta, input.getDataType());
     break;
   default:
-    throw std::invalid_argument("Error: unsupported datatype");
+    throw std::invalid_argument(
+      "HalfTensor::dot: unsupported operand datatype (Tdatatype=" +
+      std::to_string(static_cast<int>(input.getDataType())) +
+      ", expected FP16, Q4_0, Q6_K or Q8_0). An FP32 weight under an "
+      "FP16-activation model usually means that layer was left unquantized.");
   }
   return output;
 }

@@ -523,33 +523,51 @@ int main(int argc, char *argv[]) {
     bool fp16_act = false;
     bool preset_q40 = false;  // implied by w4a16/w4a8 presets
     bool preset_nhwc = false; // implied by w4a16/w4a8 presets
+
+    // Offline quantization mode (YOLO_QUANTIZE_OUT set) must build the graph in
+    // plain FP32 so the FP32 source weights load and Conv2DLayer::save can
+    // quantize them ("quantized save only supports FP32 source weight").  The
+    // preset is still parsed here, but in quantize mode it only selects the
+    // TARGET weight dtype written to the file — it must not switch the live
+    // graph to FP16/NHWC/quantized weights.
+    const bool quantize_mode = (std::getenv("YOLO_QUANTIZE_OUT") != nullptr);
+    auto quant_target_dtype = ml::train::TensorDim::DataType::Q4_0;
     if (const char *tt = std::getenv("YOLO_TENSOR_TYPE")) {
       std::string tts = tt;
       if (tts == "w4a16" || tts == "W4A16") {
-        model->setProperty(
-          {nntrainer::withKey("model_tensor_type", "FP32-FP16")});
-        fp16_act = true;
-        preset_q40 = true;
-        preset_nhwc = true;
+        if (!quantize_mode) {
+          model->setProperty(
+            {nntrainer::withKey("model_tensor_type", "FP32-FP16")});
+          fp16_act = true;
+          preset_q40 = true;
+          preset_nhwc = true;
+        }
         std::cout << "[YOLO] preset = w4a16 (Q4_0 weights + FP16 act + NHWC)"
                   << std::endl;
       } else if (tts == "w4a8" || tts == "W4A8") {
-        model->setProperty(
-          {nntrainer::withKey("model_tensor_type", "FP32-FP16")});
-        fp16_act = true;
-        preset_q40 = true;
-        preset_nhwc = true;
-        setenv("NNTR_CONV_Q8ACT", "1", 1);
+        if (!quantize_mode) {
+          model->setProperty(
+            {nntrainer::withKey("model_tensor_type", "FP32-FP16")});
+          fp16_act = true;
+          preset_q40 = true;
+          preset_nhwc = true;
+          setenv("NNTR_CONV_Q8ACT", "1", 1);
+        }
         std::cout << "[YOLO] preset = w4a8 (Q4_0 weights + Q8_0 act + NHWC)"
                   << std::endl;
       } else if (tts == "w8a16" || tts == "W8A16") {
-        model->setProperty(
-          {nntrainer::withKey("model_tensor_type", "FP32-FP16")});
-        fp16_act = true;
-        preset_q40 = true;
-        preset_nhwc = true;
-        yolov11::quantWeightDtype() = "Q8_0";
+        quant_target_dtype = ml::train::TensorDim::DataType::Q8_0;
+        if (!quantize_mode) {
+          model->setProperty(
+            {nntrainer::withKey("model_tensor_type", "FP32-FP16")});
+          fp16_act = true;
+          preset_q40 = true;
+          preset_nhwc = true;
+          yolov11::quantWeightDtype() = "Q8_0";
+        }
         std::cout << "[YOLO] preset = w8a16 (Q8_0 weights + FP16 act + NHWC)"
+                  << (quantize_mode ? " [quantize mode: FP32 graph, Q8_0 target]"
+                                    : "")
                   << std::endl;
       } else {
         model->setProperty({nntrainer::withKey("model_tensor_type", tt)});
@@ -568,12 +586,6 @@ int main(int argc, char *argv[]) {
       model->setProperty({nntrainer::withKey("tensor_format", "NHWC")});
       std::cout << "[YOLO] tensor_format = NHWC" << std::endl;
     }
-
-    // Offline quantization mode (YOLO_QUANTIZE_OUT set): build the graph in
-    // FP32, load FP32 weights, then re-save through the framework's general
-    // per-layer quantizer. Must build FP32 here (not Q4_0) so finalize
-    // allocates FP32 conv weights that can receive the FP32 file.
-    const bool quantize_mode = (std::getenv("YOLO_QUANTIZE_OUT") != nullptr);
 
     // Q4_0 weight path: activated by preset or explicit YOLO_CONV_Q40.
     const bool conv_q40 =
@@ -648,7 +660,7 @@ int main(int argc, char *argv[]) {
       // does the conv -> [CRS, out_ch] Q4_0 repack; ineligible/bias stay FP32.
       std::map<std::string, ml::train::TensorDim::DataType> dmap;
       for (const auto &n : q_conv_names)
-        dmap[n] = ml::train::TensorDim::DataType::Q4_0;
+        dmap[n] = quant_target_dtype;
       model->save(out_q, ml::train::ModelFormat::MODEL_FORMAT_SAFETENSORS,
                   ml::train::TensorDim::DataType::NONE, dmap, isa);
       std::cout << "[YOLO] quantized " << dmap.size() << " conv filters -> "

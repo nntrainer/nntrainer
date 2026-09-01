@@ -405,7 +405,10 @@ Tensor Siglip2VisionEncoder::createPatchEmbed(Tensor input) {
                             withKey("direction", {1, 3, 2})}));
   h = transpose(h);
 
-  // Learned position embedding [1, 1, 196, 768]
+  // Learned position embedding [1, 1, num_patches, 768]. This dtype must match
+  // what the weight file actually stores: the raw .bin is an ordered dump with
+  // no per-tensor headers, so declaring FP16 here while the quantizer wrote
+  // FP32 shifts every following tensor and corrupts the whole load.
   LayerHandle pos_embed(
     createLayer("weight", {withKey("name", "pos_embedding"),
                            withKey("dim", "1:1:" + std::to_string(NUM_PATCHES) +
@@ -543,6 +546,11 @@ Tensor Siglip2VisionEncoder::createTransformerDecoderBlock(const int layer_id,
  *   post_ln w,b -> enc_to_dec_proj w,b
  */
 std::pair<Tensor, Tensor> Siglip2VisionEncoder::constructModel() {
+  // The graph input stays FP32 even for an FP16-activation model: the image is
+  // FP32 by contract, and patch_embed_conv is the mixed-precision boundary that
+  // reads FP32 and emits the FP16 activation dtype (Conv2DLayer::finalize gives
+  // its output the activation dtype, and FloatTensor::dotQnK implements the
+  // FP32-activation x quantized-weight -> FP16-output GEMM).
   Tensor input({BATCH_SIZE, IMG_CHANNELS, IMG_SIZE, IMG_SIZE}, "input0");
   Tensor h = createPatchEmbed(input);
 
@@ -598,18 +606,10 @@ std::vector<float> Siglip2VisionEncoder::encode(const std::string &image_path) {
   std::vector<float> image_data = siglip2LoadAndPreprocessImage(
     image_path, static_cast<int>(IMG_SIZE), static_cast<int>(IMG_SIZE), true);
 
-  std::vector<float *> inputs{image_data.data()};
-  std::vector<float *> labels;
-
-  std::vector<float *> output = model->incremental_inference(
-    BATCH_SIZE, inputs, labels, NUM_PATCHES, 0, NUM_PATCHES, false);
-
-  const int out_size =
-    static_cast<int>(NUM_PATCHES) * static_cast<int>(ENC_TO_DEC_DIM);
-  enc_output_buf_.assign(output[0], output[0] + out_size);
-  for (auto *p : output)
-    delete[] p;
-  return enc_output_buf_;
+  // Delegate to encodePixels() so both entry points share one implementation
+  // of the graph-input binding (which has to pack fp16 for an FP16-activation
+  // model — see the note there).
+  return encodePixels(image_data.data(), image_data.size());
 }
 
 /**
@@ -636,6 +636,13 @@ std::vector<float> Siglip2VisionEncoder::encodePixels(const float *pixel_data,
 
   // Copy pixel_data into a local buffer (incremental_inference takes float*;
   // mirrors how encode() owns its image buffer).
+  //
+  // NOTE the graph input must stay FP32 here. incremental_inference() maps an
+  // FP16 graph input by REINTERPRETING the caller's buffer as fp16 bits
+  // (mapExternalTensor's convert_fp32_to_fp16 is false there, since its usual
+  // callers pass KV-cache buffers that already hold halves), so declaring the
+  // image input FP16 and passing FP32 pixels feeds the graph garbage and the
+  // encoder output comes out all NaN.
   std::vector<float> pixel_buf(pixel_data, pixel_data + pixel_count);
   std::vector<float *> inputs{pixel_buf.data()};
   std::vector<float *> labels;

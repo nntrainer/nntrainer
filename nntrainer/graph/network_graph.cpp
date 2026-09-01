@@ -425,11 +425,61 @@ sharedConstTensors NetworkGraph::incremental_forwarding(
   unsigned int from, unsigned int to, bool training,
   std::function<void(std::shared_ptr<LayerNode>, bool)> forwarding_op,
   std::function<bool(void *userdata)> stop_cb, void *userdata) {
+  // NNTR_DEBUG_LAYER_STATS=1 prints per-layer output ranges and stops at the
+  // first non-finite tensor. Mixed-precision graphs fail silently otherwise:
+  // an FP16 overflow or a mis-dispatched kernel only surfaces as NaN at the
+  // very end, with no indication of which layer produced it.
+  static const bool debug_layer_stats =
+    (std::getenv("NNTR_DEBUG_LAYER_STATS") != nullptr);
+
   for (auto iter = cbegin(); iter != cend() && !stop_cb(userdata); iter++) {
     auto &ln = *iter;
     PROFILE_TIME_START(profile_keys.at(ln->getType()));
     forwarding_op(*iter, training);
     PROFILE_TIME_END(profile_keys.at(ln->getType()));
+
+    if (debug_layer_stats) {
+      for (unsigned int i = 0; i < ln->getNumOutputs(); ++i) {
+        const Tensor &o = ln->getOutput(i);
+        const auto dt = o.getDataType();
+        // getValue<T>() reinterprets the buffer rather than converting, so
+        // only the float types can be scanned generically here.
+        if (dt != TensorDim::DataType::FP32 &&
+            dt != TensorDim::DataType::FP16) {
+          continue;
+        }
+        const size_t n = o.size();
+        float mn = std::numeric_limits<float>::infinity();
+        float mx = -std::numeric_limits<float>::infinity();
+        size_t bad = 0;
+        for (size_t k = 0; k < n; ++k) {
+          float v;
+          if (dt == TensorDim::DataType::FP32) {
+            v = o.getValue<float>(k);
+          } else {
+#ifdef ENABLE_FP16
+            v = static_cast<float>(o.getValue<_FP16>(k));
+#else
+            break;
+#endif
+          }
+          if (!std::isfinite(v)) {
+            ++bad;
+            continue;
+          }
+          mn = std::min(mn, v);
+          mx = std::max(mx, v);
+        }
+        std::cout << "[layer-stats] " << ln->getName() << " (" << ln->getType()
+                  << ") out[" << i << "] n=" << n << " min=" << mn
+                  << " max=" << mx << " nonfinite=" << bad << std::endl;
+        if (bad) {
+          std::cout << "[layer-stats] FIRST NON-FINITE OUTPUT at layer '"
+                    << ln->getName() << "'" << std::endl;
+          return {};
+        }
+      }
+    }
   }
 
   sharedConstTensors out;

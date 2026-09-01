@@ -20,6 +20,7 @@
 #include <common_properties.h>
 #include <cpu_backend.h>
 #include <thread_manager.h>
+#include <type_traits>
 
 #if defined(_WIN32)
 #define _USE_MATH_DEFINES
@@ -438,6 +439,18 @@ public:
    */
   template <typename T = float>
   static Tensor &gelu(Tensor const &t_in, Tensor &t_out) {
+    // FP32-only vectorized kernel below; see tanhGelu() for why a non-float
+    // tensor must not be reinterpreted as float here.
+    if constexpr (!std::is_same_v<T, float>) {
+      t_in.apply<T>(
+        [](T x) {
+          const float v = static_cast<float>(x);
+          return static_cast<T>(0.5f * v *
+                                (1.0f + std::erf(v * 0.7071067811f)));
+        },
+        t_out);
+      return t_out;
+    }
     const unsigned int N = t_in.size();
     const float *x = t_in.getData<float>();
     float *y = t_out.getData<float>();
@@ -497,8 +510,23 @@ public:
    */
   template <typename T = float>
   static Tensor &tanhGelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::tanh_gelu(t_in.size(), t_in.getData<float>(),
-                         t_out.getData<float>());
+    // The vectorized kernel is FP32-only. Dispatching a non-float tensor to it
+    // would reinterpret T data as float and read/write size()*4 bytes out of a
+    // size()*sizeof(T) buffer — an out-of-bounds write for FP16. Compute in
+    // float and store back as T for those types.
+    if constexpr (std::is_same_v<T, float>) {
+      nntrainer::tanh_gelu(t_in.size(), t_in.getData<float>(),
+                           t_out.getData<float>());
+    } else {
+      t_in.apply<T>(
+        [](T x) {
+          const float v = static_cast<float>(x);
+          return static_cast<T>(
+            0.5f * v *
+            (1.0f + std::tanh(0.7978845608f * (v + 0.044715f * v * v * v))));
+        },
+        t_out);
+    }
     return t_out;
   }
 

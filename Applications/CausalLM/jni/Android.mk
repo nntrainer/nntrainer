@@ -249,7 +249,6 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../api/streamer.cpp \
     ../models/timm_vit/timm_vit_transformer.cpp \
     ../models/siglip2/siglip2_vision_encoder.cpp \
-    ../models/siglip2/stb_image_impl.cpp \
     ../models/bert_decoder/bert_decoder.cpp \
     ../models/screenai_caption/screenai_caption.cpp
 

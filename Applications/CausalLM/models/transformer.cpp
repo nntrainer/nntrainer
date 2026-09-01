@@ -355,6 +355,11 @@ void Transformer::repack_weight() {
       "Transformer model is not initialized. Please call "
       "initialize() before repack_weight().");
   }
+  // Orchestrator subclasses (e.g. ScreenAICaption) own sub-models instead of
+  // populating this base `model` member; nothing to repack here in that case.
+  if (!model) {
+    return;
+  }
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
     fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
       auto weights = context.getWeights();

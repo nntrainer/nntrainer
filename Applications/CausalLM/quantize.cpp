@@ -174,8 +174,9 @@ std::string dataTypeToStr(DataType dt) {
  * @brief Build model_tensor_type string from fc_dtype and activation dtype
  *        Format: "<weight_type>-<activation_type>"
  */
-std::string buildModelTensorType(const std::string &fc_dtype) {
-  return fc_dtype + "-FP32";
+std::string buildModelTensorType(const std::string &fc_dtype,
+                                 const std::string &act_dtype) {
+  return fc_dtype + "-" + act_dtype;
 }
 
 /**
@@ -426,6 +427,15 @@ void printUsage(const char *prog) {
     << "  --embd_dtype <type>   Target dtype for embedding (default: FP32)\n"
     << "  --lmhead_dtype <type> Target dtype for LM head (default: same as "
        "embd_dtype)\n"
+    << "  --act_dtype <type>    Activation dtype recorded in "
+       "model_tensor_type\n"
+    << "                        (default: FP32). Options: FP32, FP16. With "
+       "Q8_0\n"
+    << "                        weights, FP32 selects the W8A8 path (ggml "
+       "re-quantizes\n"
+    << "                        activations to Q8_0); FP16 selects W8A16, "
+       "which is\n"
+    << "                        markedly more accurate.\n"
     << "  --isa <arch>          Target instruction set architecture for "
        "quantized weights\n"
     << "                        (default: DEFAULT). Options: DEFAULT, X86, "
@@ -700,8 +710,8 @@ std::map<std::string, DataType> buildCaptionLayerDtypeMap(int enc_layers,
     embd_dtype != DataType::FP32 && embd_dtype != DataType::NONE;
 
   if (quant_fc) {
-    // ---- Encoder (SigLIP2) FCs (2D — patch_embed_conv/pos_embedding excluded,
-    //      they stay FP32 via the encoder graph's per-layer pins) ----
+    // ---- Encoder (SigLIP2) FCs (2D — pos_embedding excluded, it stays FP32
+    //      via the encoder graph's per-layer pin) ----
     for (int i = 0; i < enc_layers; ++i) {
       const std::string pfx = "enc_layer" + std::to_string(i);
       dtype_map[pfx + "_wq"] = fc_dtype;
@@ -712,6 +722,13 @@ std::map<std::string, DataType> buildCaptionLayerDtypeMap(int enc_layers,
       dtype_map[pfx + "_fc2"] = fc_dtype;
     }
     dtype_map["enc_to_dec_proj"] = fc_dtype;
+    // Q8_0 also covers the 16x16 stride-16 patch conv (same rationale as
+    // buildEncoderLayerDtypeMap). This is required, not just an optimization,
+    // for an FP16-activation model: HalfTensor::dot only accepts an FP16 or
+    // Q4_0/Q6_K/Q8_0 operand, so leaving the conv weight FP32 throws
+    // "unsupported datatype" at the first patch-embed matmul.
+    if (fc_dtype == DataType::Q8_0)
+      dtype_map["patch_embed_conv"] = fc_dtype;
 
     // ---- Decoder (BERT) FCs ----
     for (int i = 0; i < dec_layers; ++i) {
@@ -805,6 +822,11 @@ int main(int argc, char *argv[]) {
   std::string fc_dtype_str = "Q4_0";
   std::string embd_dtype_str = "FP32";
   std::string lmhead_dtype_str = "";
+  // Activation dtype of the emitted model_tensor_type ("<weight>-<activation>").
+  // FP32 activations against Q8_0 weights run ggml's W8A8 path (activations are
+  // dynamically re-quantized to Q8_0 per block); FP16 keeps the activations in
+  // half precision, which roughly halves the end-to-end quantization error.
+  std::string act_dtype_str = "FP32";
   std::string isa_str = "DEFAULT";
   std::string output_bin_name = "";
   std::string target_config_path = "";
@@ -820,6 +842,13 @@ int main(int argc, char *argv[]) {
       embd_dtype_str = argv[++i];
     } else if (arg == "--lmhead_dtype" && i + 1 < argc) {
       lmhead_dtype_str = argv[++i];
+    } else if (arg == "--act_dtype" && i + 1 < argc) {
+      act_dtype_str = argv[++i];
+      if (act_dtype_str != "FP32" && act_dtype_str != "FP16") {
+        std::cerr << "Unknown activation dtype: " << act_dtype_str
+                  << " (expected 'FP32' or 'FP16')\n";
+        return EXIT_FAILURE;
+      }
     } else if (arg == "--isa" && i + 1 < argc) {
       isa_str = argv[++i];
     } else if (arg == "--output_bin" && i + 1 < argc) {
@@ -1079,10 +1108,10 @@ int main(int argc, char *argv[]) {
     // The encoder's patch conv is quantized alongside the FCs for Q8_0 (the
     // NCHW conv runs the same interleaved int8 GEMM); record its dtype so the
     // runtime graph declares the matching weight tensor.
-    if (is_encoder && fc_dtype == DataType::Q8_0)
+    if ((is_encoder || is_caption) && fc_dtype == DataType::Q8_0)
       new_nntr_cfg["patch_embed_dtype"] = dataTypeToStr(fc_dtype);
     new_nntr_cfg["model_tensor_type"] =
-      buildModelTensorType(dataTypeToStr(fc_dtype));
+      buildModelTensorType(dataTypeToStr(fc_dtype), act_dtype_str);
 
     // model_dir was injected only to let the orchestrator resolve weight files
     // during this run; drop it so the saved config is portable (the runtime

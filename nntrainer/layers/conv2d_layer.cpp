@@ -828,6 +828,12 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
   out_dim.height((eff_in_height - eff_k_height) / stride[0] + 1);
   out_dim.width((eff_in_width - eff_k_width) / stride[1] + 1);
 
+  // NOTE the output dtype follows the INPUT, not the model's activation dtype.
+  // Making it follow the activation dtype (so a quantized FP16-activation model
+  // could use this conv as its FP32-image -> FP16-graph boundary) is not enough
+  // on its own: the quantized NCHW branch materializes its im2col/GEMM scratch
+  // in the input dtype and writes the result out through transpose(), which
+  // cannot convert FP32 -> FP16. Both would have to change together.
   out_dim.setTensorType(in_dim.getTensorType());
 
   context.setOutputDimensions({out_dim});
@@ -1125,13 +1131,10 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
                 "indirect conv on ARM).");
             }
           } else {
-            // NCHW Q8_0 matmul convs need an FP32 activation: they run through
-            // dotQnK (gemm_q8_0_fp32), which HalfTensor does not implement.
-            if (weight_is_q8 &&
-                in_sub.getDataType() != ml::train::TensorDim::DataType::FP32) {
-              throw std::runtime_error(
-                "NCHW Q8_0 conv weights require FP32 activations.");
-            }
+            // NCHW Q8_0 matmul convs dispatch through Tensor::dot -> dotQnK,
+            // which both FloatTensor (gemm_q8_0_fp32) and HalfTensor
+            // (dequantize + FP16 cast + sgemm_fp16) implement, so an FP16
+            // activation is fine here.
             // Quantized conv as matmul: act [OH*OW, CRS] . weight [CRS, out_ch]
             // -> [OH*OW, out_ch] -> out [out_ch, OH*OW]. CRS = in_ch*kh*kw.
             // NOTE: col must outlive `act` (act aliases col's storage); here
