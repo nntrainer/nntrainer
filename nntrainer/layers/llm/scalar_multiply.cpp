@@ -12,9 +12,18 @@
  */
 
 #include <cmath>
+#include <cstdlib>
+#include <env_compat.h>
 #include <iostream>
 
 #include "scalar_multiply.h"
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+#endif
 
 namespace nntrainer {
 
@@ -31,15 +40,20 @@ void ScalarMultiplyLayer::finalize(nntrainer::InitLayerContext &context) {
 
   if (use_weight) {
     // Request weight for scalar value (single element).
-    // @note The multiplier is a single un-quantized scalar coefficient and is
-    // read back as float at the multiply site. Store it FP32 regardless of the
-    // activation dtype: an FP16 scalar weight is both lossy and unreliable to
-    // read here (getValue<float> on the FP16 slot returns garbage for some
-    // layers), which silently zeroed the hidden state under FP16 activation.
+    // @note The scalar is an unquantized weight read straight out of the model
+    // .bin, whose layout has no per-tensor dtype: NeuralNetwork::load() derives
+    // every weight's file offset by accumulating getMemoryBytes() over the
+    // graph. The request must therefore reproduce the dtype the exporting graph
+    // used -- getWeightDataType() -- or this scalar is misread *and* every
+    // weight after it is read at the wrong offset. Upstream pinned this to FP32
+    // because its multiply site did an unconditional getValue<float> on the
+    // 2-byte cell; incremental_forwarding() below instead reads the scalar
+    // dtype-aware (FP16 or FP32), which fixes that hazard without changing the
+    // on-disk contract.
     nntrainer::TensorDim scalar_dim(
       1, 1, 1, 1,
       nntrainer::TensorDim::TensorType(context.getFormat(),
-                                       nntrainer::TensorDim::DataType::FP32));
+                                       context.getWeightDataType()));
     wt_idx[0] = context.requestWeight(
       scalar_dim, nntrainer::props::InitializerInfo::Enum::NONE,
       nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "scalar_multiplier",
@@ -50,20 +64,24 @@ void ScalarMultiplyLayer::finalize(nntrainer::InitLayerContext &context) {
 /**
  * @brief Resolve the multiplier for one step, memoizing a weight-borne one.
  *
- * `use_weight` puts the multiplier in a one-element static weight, and reading
- * it is a HOST read. On the GPU lanes the weight pool is unified memory
- * (cudaMallocManaged / SVM), so that 4-byte host read migrates the whole page
- * out of device memory -- and the neighbouring norm weights packed into the
- * same page are faulted straight back device-side by the next block's kernel.
- * That is one device->host->device page round trip per scalar_multiply per
- * step, for a value that never changes: measured at 55 4 KiB migrations and
- * about 0.13 ms per token on a 35-block model.
+ * `use_weight` puts the multiplier in a one-element STATIC weight, and reading
+ * it is a HOST read. On the GPU lanes the weight pool is Unified Memory
+ * (cudaMallocManaged / SVM), so that 2-byte host read migrates the whole 4 KiB
+ * page out of device memory -- and the neighbouring RMSNorm gammas packed into
+ * the same page are then faulted straight back device-side by the next block's
+ * norm kernel. One device->host->device page round trip per scalar_multiply per
+ * step: measured at 55 4 KiB UVM migrations and about 0.13 ms per token on a
+ * 35-block model, plus the fault stalls hidden behind them, for a value that
+ * never changes.
  *
  * So read it once per weight BUFFER and keep it. The key is the weight's data
- * address rather than a done flag, because deallocateTensors() +
- * allocateTensors() hands the layer a different buffer and the address
- * comparison re-arms the read there instead of serving a stale scalar. Taking
+ * address rather than a done-flag: deallocateTensors()+allocateTensors() (the
+ * reset / KV-resume path) hands the layer a different buffer, and comparing
+ * addresses re-arms the read there instead of serving a stale scalar. Taking
  * the address does not touch the page.
+ *
+ * NNTR_CUDA_UVM_PIN=0 restores the per-step read (A/B, or a caller that
+ * rewrites the weight in place between steps).
  *
  * @param context run context holding the (optional) scalar weight
  * @return the scalar to multiply the input by
@@ -73,11 +91,27 @@ float ScalarMultiplyLayer::readMultiplier(nntrainer::RunLayerContext &context) {
     return std::get<props::ScalarMultiplier>(scalar_multiply_props).get();
 
   nntrainer::Tensor &weight = context.getWeight(wt_idx[0]);
+  // Value-checked, not presence-checked: the memoisation is the default and
+  // only an explicit 0 turns it off.
+  static const bool memo_on = []() {
+    const char *e = std::getenv("NNTR_CUDA_UVM_PIN");
+    return !(e != nullptr && e[0] == '0');
+  }();
   const void *addr = weight.getData<char>();
-  if (addr != nullptr && addr == memo_weight_addr)
+  if (memo_on && addr != nullptr && addr == memo_weight_addr)
     return memo_multiplier;
 
+#ifdef ENABLE_FP16
+  // dtype-aware scalar read: getValue<float> on an FP16 weight reads 4 bytes
+  // from the 2-byte cell (garbage). The per-layer scalar / q_scale /
+  // model_proj_scale weights are FP16 in QINT4-FP16 models -> reading them as
+  // float gave a huge multiplier and overflowed the residual to +Inf.
+  const float m = (weight.getDataType() == ml::train::TensorDim::DataType::FP16)
+                    ? static_cast<float>(weight.getValue<_FP16>(0, 0, 0, 0))
+                    : weight.getValue<float>(0, 0, 0, 0);
+#else
   const float m = weight.getValue<float>(0, 0, 0, 0);
+#endif
   memo_weight_addr = addr;
   memo_multiplier = m;
   return m;
@@ -125,7 +159,30 @@ void ScalarMultiplyLayer::incremental_forwarding(
     nntrainer::Tensor out_step =
       out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen(), true);
 
-    in_step.multiply(multiplier, out_step);
+    bool done = false;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
+      if (gpu) {
+        auto *ip =
+          reinterpret_cast<const unsigned short *>(in_step.getData<_FP16>());
+        auto *op =
+          reinterpret_cast<unsigned short *>(out_step.getData<_FP16>());
+        const bool dev = nntrainer::cuda::dev_accessible(ip);
+        if (dev && nntrainer::cuda::cuda_scalar_mul_fp16(
+                     ip, op, (unsigned int)in_step.size(), multiplier))
+          done = true;
+      }
+    }
+#endif
+    if (!done) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Host multiply() reads the GPU-produced UVM input on the CPU; sync first
+      // in async mode (no-op in default sync mode).
+      nntrainer::cuda::drain_if_async();
+#endif
+      in_step.multiply(multiplier, out_step);
+    }
 
 #ifdef DEBUG
     std::cout << context.getName() << " \n input:" << in_step
