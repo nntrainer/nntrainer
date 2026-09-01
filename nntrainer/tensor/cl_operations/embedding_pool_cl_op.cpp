@@ -105,10 +105,14 @@ void l2_normalize_rows_cl_op(const Tensor &in, Tensor &out, float epsilon) {
 
   const auto &kernel = getOpKernelPtrs()[Kernels::L2_NORMALIZE_ROWS_CL];
 
-  // Residency: SVM > host. getData() is only host-addressable in the second
-  // case, which is why the host branch below has to stage through the shared
-  // buffers instead of binding the caller's pointer.
+  // Residency: device plane > SVM > host. getData() is only host-addressable
+  // in the last case, which is why the host branch below has to stage through
+  // the shared buffers instead of binding the caller's pointer -- and why a
+  // tensor the planner put on the device plane has to bind its own sub-buffer
+  // rather than a shared-plane pointer that shadows it.
   const bool svm = isSvmTensor(in);
+  void *in_clmem = (svm && in.isClMem()) ? in.getClMem() : nullptr;
+  void *out_clmem = (svm && out.isClMem()) ? out.getClMem() : nullptr;
 
   do {
     if (!svm) {
@@ -121,15 +125,30 @@ void l2_normalize_rows_cl_op(const Tensor &in, Tensor &out, float epsilon) {
           !kernel->SetKernelArguments(1, &bufOut, sizeof(cl_mem)))
         break;
     } else {
-      // Unmap the INPUT only, then bind SVM args and re-map the output after
-      // the dispatch -- the exact sequence swiglu_cl and geglu_cl use.
-      if (!cl_ctx->command_queue_inst_.enqueueSVMUnmap((void *)idata)) {
+      // Unmap the INPUT only, then bind the args and re-map the output after
+      // the dispatch -- the exact sequence the gated ops use. A device-bound
+      // operand must NOT be SVM-unmapped: its shared-plane shadow was never
+      // written, so unmapping it would publish stale bytes.
+      if (in_clmem == nullptr &&
+          !cl_ctx->command_queue_inst_.enqueueSVMUnmap((void *)idata)) {
         ml_loge("l2_normalize_rows: failed to unmap svm input");
         break;
       }
-      if (!kernel->SetKernelSVMArguments(0, idata) ||
-          !kernel->SetKernelSVMArguments(1, odata)) {
-        ml_loge("l2_normalize_rows: failed to set svm args");
+      bool bound = true;
+      if (in_clmem != nullptr) {
+        cl_mem b = static_cast<cl_mem>(in_clmem);
+        bound &= kernel->SetKernelArguments(0, &b, sizeof(cl_mem));
+      } else {
+        bound &= kernel->SetKernelSVMArguments(0, idata);
+      }
+      if (out_clmem != nullptr) {
+        cl_mem b = static_cast<cl_mem>(out_clmem);
+        bound &= kernel->SetKernelArguments(1, &b, sizeof(cl_mem));
+      } else {
+        bound &= kernel->SetKernelSVMArguments(1, odata);
+      }
+      if (!bound) {
+        ml_loge("l2_normalize_rows: failed to set svm/clmem args");
         break;
       }
     }
@@ -153,8 +172,11 @@ void l2_normalize_rows_cl_op(const Tensor &in, Tensor &out, float epsilon) {
       if (!clbuf.getOutBufferA()->ReadDataRegion(cl_ctx->command_queue_inst_,
                                                  bytes, odata))
         break;
-    } else if (!cl_ctx->command_queue_inst_.enqueueSVMMap(odata, bytes,
+    } else if (out_clmem == nullptr &&
+               !cl_ctx->command_queue_inst_.enqueueSVMMap(odata, bytes,
                                                           /*read_only=*/true)) {
+      // A device-bound output stays device-owned; only a shared-plane one is
+      // mapped back for its host reader.
       ml_loge("l2_normalize_rows: failed to map svm output");
       break;
     }
@@ -186,6 +208,12 @@ void mean_rows_cl_op(const Tensor &in, Tensor &out, unsigned int active_rows,
   const auto &kernel = getOpKernelPtrs()[Kernels::MEAN_ROWS_CL];
 
   const bool svm = isSvmTensor(in);
+  // Bind a device sub-buffer only for an offset-0 view: getClMem() hands back
+  // the whole buffer with no offset applied, so a windowed read has to stay on
+  // the shared plane, where the offset rides on the pointer.
+  void *in_clmem =
+    (svm && elem_off == 0 && in.isClMem()) ? in.getClMem() : nullptr;
+  void *out_clmem = (svm && out.isClMem()) ? out.getClMem() : nullptr;
 
   do {
     if (!svm) {
@@ -199,13 +227,26 @@ void mean_rows_cl_op(const Tensor &in, Tensor &out, unsigned int active_rows,
         break;
     } else {
       // Input-only unmap, as in l2_normalize_rows_cl_op above (swiglu pattern).
-      if (!cl_ctx->command_queue_inst_.enqueueSVMUnmap((void *)idata)) {
+      if (in_clmem == nullptr &&
+          !cl_ctx->command_queue_inst_.enqueueSVMUnmap((void *)idata)) {
         ml_loge("mean_rows: failed to unmap svm input");
         break;
       }
-      if (!kernel->SetKernelSVMArguments(0, idata) ||
-          !kernel->SetKernelSVMArguments(1, odata)) {
-        ml_loge("mean_rows: failed to set svm args");
+      bool bound = true;
+      if (in_clmem != nullptr) {
+        cl_mem b = static_cast<cl_mem>(in_clmem);
+        bound &= kernel->SetKernelArguments(0, &b, sizeof(cl_mem));
+      } else {
+        bound &= kernel->SetKernelSVMArguments(0, idata);
+      }
+      if (out_clmem != nullptr) {
+        cl_mem b = static_cast<cl_mem>(out_clmem);
+        bound &= kernel->SetKernelArguments(1, &b, sizeof(cl_mem));
+      } else {
+        bound &= kernel->SetKernelSVMArguments(1, odata);
+      }
+      if (!bound) {
+        ml_loge("mean_rows: failed to set svm/clmem args");
         break;
       }
     }
@@ -230,7 +271,8 @@ void mean_rows_cl_op(const Tensor &in, Tensor &out, unsigned int active_rows,
       if (!clbuf.getOutBufferA()->ReadDataRegion(cl_ctx->command_queue_inst_,
                                                  out_bytes, odata))
         break;
-    } else if (!cl_ctx->command_queue_inst_.enqueueSVMMap(odata, out_bytes,
+    } else if (out_clmem == nullptr &&
+               !cl_ctx->command_queue_inst_.enqueueSVMMap(odata, out_bytes,
                                                           /*read_only=*/true)) {
       ml_loge("mean_rows: failed to map svm output");
       break;
