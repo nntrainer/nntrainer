@@ -101,6 +101,12 @@ protected:
    */
   int getSharedKVSourceLayer(int layer_id) const;
 
+  /** @copydoc Transformer::getKVSourceLayer(int) — gemma4 is the one model
+   *  that shares KV planes; the rule lives in getSharedKVSourceLayer(). */
+  int getKVSourceLayer(int layer_id) const override {
+    return getSharedKVSourceLayer(layer_id);
+  }
+
   unsigned int getAttentionHeadDim(int layer_id) const;
   unsigned int getKVHeadCount(int layer_id) const;
   unsigned int getKVCacheWidth(int layer_id) const override;

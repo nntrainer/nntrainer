@@ -306,6 +306,31 @@ void CausalLM::allocateAndBindKVCache() {
     for (int i = 0; i < NUM_LAYERS; ++i)
       kv_widths[static_cast<size_t>(i)] = getKVCacheWidth(i);
 
+    // Second hook, same shape as the one above: which layers need storage at
+    // all. A KV-shared layer (gemma4 `num_kv_shared_layers`) has no wk/wv and
+    // no k_norm/v_norm of its own -- it attends over an earlier layer's K/V
+    // plane -- so the private slab it gets otherwise is filled with
+    // byte-identical values every step. Declaring the source makes those
+    // layers aliases of it (same MemoryData, same offset) instead of copies.
+    //
+    // The map comes from getKVSourceLayer(), which resolves through the SAME
+    // function the model's graph builder used to wire the shared attention, so
+    // the plane a layer reads is by construction the plane it was given.
+    //
+    // Declared only when some layer actually shares: a model that inherits the
+    // -1 default for every layer never calls setLayerKVSources at all, so it
+    // keeps the literal pre-aliasing path through KVCacheManager (empty map =>
+    // validate early-returns, both allocation loops are untouched, no witness
+    // line) rather than an all-(-1) map that merely behaves the same.
+    std::vector<int> kv_sources(static_cast<size_t>(NUM_LAYERS), -1);
+    bool any_kv_shared = false;
+    for (int i = 0; i < NUM_LAYERS; ++i) {
+      kv_sources[static_cast<size_t>(i)] = getKVSourceLayer(i);
+      any_kv_shared |= (kv_sources[static_cast<size_t>(i)] >= 0);
+    }
+    if (any_kv_shared)
+      kv_cache.setLayerKVSources(std::move(kv_sources));
+
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
                       max_timestep, kv_widths, cache_dtype);
     kv_cache_bound = false;

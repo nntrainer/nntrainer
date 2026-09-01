@@ -250,6 +250,30 @@ public:
   }
 
   /**
+   * @brief The EARLIER layer whose K/V storage this layer reads, or -1 when
+   *        the layer owns its K/V (the default, and every model but gemma4).
+   * @details The second per-model degree of freedom of the generic
+   * allocateAndBindKVCache, alongside getKVCacheWidth(): which layers need
+   * storage at all. A model whose graph makes some layers attend over an
+   * earlier layer's K/V plane (gemma4 `num_kv_shared_layers`) reports that
+   * here, and KVCacheManager aliases those layers onto the source instead of
+   * allocating each of them a byte-identical copy of it.
+   *
+   * It MUST be the same rule the model's graph builder used to wire the shared
+   * attention -- see Gemma4Transformer::getSharedKVSourceLayer(), which is the
+   * single implementation both callers go through. If the allocator and the
+   * graph resolved different sources, a layer would attend over the wrong
+   * layer's K/V: fluent, wrong, and with no crash to notice it by.
+   *
+   * @param[in] layer_id decoder layer index
+   * @return source layer id (< layer_id), or -1 when the layer owns its cache
+   */
+  virtual int getKVSourceLayer(int layer_id) const {
+    (void)layer_id;
+    return -1;
+  }
+
+  /**
    * @brief Per-layer attention window: the value this model feeds mha_core's
    *        `sliding_window` property for the layer, or UINT_MAX for a
    *        full-attention layer.
