@@ -25,6 +25,9 @@
 #ifdef ENABLE_FP16
 #ifdef USE__FP16
 #define _FP16 __fp16
+#elif defined(USE_HALF_WRAPPER)
+#include "half_fp16.h" // self-contained leaf: uint16-backed nntrainer::Half
+#define _FP16 ::nntrainer::Half
 #else
 #define _FP16 _Float16
 #endif
@@ -53,14 +56,18 @@ public:
    * FP16 & FP32
    */
   enum class DataType {
-    QINT4,  /** quantized int 4*/
+    QINT4,  /** [DEPRECATED - use QS4CX] per-channel int4 held in the
+               KleidiAI qsi4cxp packed layout. QS4CX is the canonical int4
+               weight format; QINT4 is kept read-only so existing files still
+               load, and is transcoded to QS4CX on read. */
     QINT8,  /** quantized int 8*/
     QINT16, /** quantized int 16*/
     BCQ,    /** binary-code-based quantized*/
     Q4_K,   /** Q4_K quantized*/
     Q6_K,   /** q6 k quantized */
     Q4_0,   /** Q4_0 k quantized */
-    QS4CX,  /** QS4CX quantized */
+    QS4CX,  /** per-channel int4, the canonical int4 weight format: plain
+               row-major nibbles plus one fp32 scale per output channel. */
     UINT4,  /** quantized unsigned int 4*/
     UINT8,  /** unsigned int 8 bit */
     UINT16, /** unsigned int 16 bit */

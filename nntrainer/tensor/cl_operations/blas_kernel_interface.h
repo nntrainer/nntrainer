@@ -120,5 +120,77 @@ int amaxCl(const Tensor &input);
  */
 int aminCl(const Tensor &input);
 
+/**
+ * @brief v8c GPU path entry point — paper 8/4/4 (arXiv:2505.00232): int8
+ *        activation × channel-wise QINT4 weight GEMM. Default-on for the GPU
+ *        FC dispatch; NNTR_FC_INT8_GPU=0 disables. Caller falls back to the
+ *        generic host path on false.
+ * @param[in] input fp32 or fp16 activation tensor [M, K]
+ * @param[in] weight channel-wise QINT4 (QS4CX) weight tensor [K, N]
+ * @param[out] output fp32 or fp16 tensor [M, N] (preallocated)
+ * @return true if the v8c path executed; false if not applicable
+ *         (env disabled, weight not int4, shape misaligned).
+ */
+bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output);
+
+/**
+ * @brief Eagerly build the v8c GPU weight entry (nibble permute + upload +
+ *        image view) for a freshly READ int4 FC weight, so the first prefill
+ *        does not pay the lazy per-weight build. Called by the CL FC layer
+ *        after the base read. Returns false (no-op) off the v8c path (env
+ *        unset / non-int4 / unsupported shape); the lazy build in dotCl_v8c
+ *        still covers those.
+ */
+bool dotCl_v8c_prebuild_weight(const Tensor &weight);
+
+/**
+ * @brief Upload a boundary tensor's host bytes into the device buffer that
+ *        backs it (host -> cl_mem RAISE).
+ *
+ * A tensor the planner placed on the GPU_CLMEM residency class keeps its bytes
+ * in a device buffer; its host mirror is only meaningful once one of these two
+ * calls has moved them. Use this after a genuine host WRITE, so the kernels
+ * that read the buffer next see what the host produced.
+ *
+ * Only offset-0 views are bridgeable: the sub-buffer covers the whole tensor,
+ * so a nonzero-offset view would read from the wrong place. That case throws
+ * rather than silently misreading.
+ *
+ * @param[in] t tensor to raise; a non-cl_mem tensor is a no-op
+ * @param[in] valid_bytes bytes to move, or 0 for the whole tensor
+ * @return true when bytes were moved
+ */
+bool clmem_raise_cl(const Tensor &t, unsigned int valid_bytes);
+
+/**
+ * @brief Read a boundary tensor's device buffer back into its host mirror
+ *        (cl_mem -> host LOWER). The counterpart of clmem_raise_cl.
+ *
+ * Use before a genuine host READ. The read is blocking on the in-order queue,
+ * so it also waits for every command already enqueued -- which is exactly the
+ * ordering a host consumer needs.
+ *
+ * @param[in] t tensor to lower; a non-cl_mem tensor is a no-op
+ * @param[in] valid_bytes bytes to move, or 0 for the whole tensor
+ * @return true when bytes were moved
+ */
+bool clmem_lower_cl(const Tensor &t, unsigned int valid_bytes);
+
+/**
+ * @brief Residual copy / accumulate for operands on the device plane.
+ *
+ * Both operands must be device-visible -- on the device plane, or SVM. Once
+ * one of them is device-plane resident the other is bound as an SVM argument,
+ * so a plain host operand is refused at argument binding rather than
+ * dispatched: a host pointer is not a kernel operand.
+ *
+ * @param[in,out] dst destination tensor (the residual accumulator)
+ * @param[in] src source tensor
+ * @param[in] accumulate false: dst = src; true: dst += src
+ * @return false when neither operand is device-plane resident, so the caller
+ *         keeps its shared-plane path
+ */
+bool clmem_residual_op_cl(Tensor &dst, const Tensor &src, bool accumulate);
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNEL_INTERFACE_H__ */

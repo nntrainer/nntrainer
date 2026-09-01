@@ -439,6 +439,87 @@ void nntr_quant_qs4c32_f32(size_t n, size_t k, size_t bl,
                             (uint8_t *)rhs_native_mtx_qs4c32);
 }
 
+template <>
+uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, float *dst_mtx_f32,
+  bool transB, float lower_bound, float upper_bound) {
+  // idx_variant only selects the micro-kernel; the arithmetic is
+  // variant-independent, and this path is not hot (canonical weights are
+  // pre-packed at load time), so pick a fixed valid variant rather than
+  // benchmarking one per call.
+  __kai_gemm_qai8dxp_qsi4cxp_rhs_unpacked(
+    m, n, k, lhs_native_mtx_f32, rhs_native_mtx_qs4cx, rhs_scales_f32,
+    dst_mtx_f32, /*idx_variant=*/0, transB, lower_bound, upper_bound);
+  return 1;
+}
+
+size_t nntr_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                                  uint32_t idx_variant,
+                                                  bool transB) {
+  return __kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(n, k, idx_variant, transB);
+}
+
+void nntr_qsi4cxp_qs4cxs1s0_rhs_pack(size_t n, size_t k,
+                                     void *rhs_packed_mtx_qs4cx,
+                                     void *rhs_native_mtx_qs4cx,
+                                     void *rhs_scales_f32, uint32_t idx_variant,
+                                     bool transB) {
+  __kai_rhs_pack_qsi4cxp_qs4cxs1s0(n, k, rhs_packed_mtx_qs4cx,
+                                   rhs_native_mtx_qs4cx, rhs_scales_f32,
+                                   idx_variant, transB);
+}
+
+template <>
+void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
+                                      void *lhs_native_mtx_f32,
+                                      void *rhs_packed_mtx_qs4cx,
+                                      float *dst_act_mtx_f32,
+                                      uint32_t idx_variant, bool transB,
+                                      float lower_bound, float upper_bound) {
+  // transB is not used by the packed path: the RHS layout is fixed at pack
+  // time. __kai_gemm_qai8dxp_qsi4cxp parallelises internally.
+  (void)transB;
+  __kai_gemm_qai8dxp_qsi4cxp(m, n, k, lhs_native_mtx_f32, rhs_packed_mtx_qs4cx,
+                             dst_act_mtx_f32, idx_variant, lower_bound,
+                             upper_bound);
+}
+
+template <>
+void nntr_gemm_qai8dxp_qsi4cxp_packed(size_t m, size_t n, size_t k,
+                                      void *lhs_native_mtx_f16,
+                                      void *rhs_packed_mtx_qs4cx,
+                                      _FP16 *dst_act_mtx_f16,
+                                      uint32_t idx_variant, bool transB,
+                                      _FP16 lower_bound, _FP16 upper_bound) {
+  // Dispatch straight into the KleidiAI f16 qai8dxp x qsi4cxp interface, so
+  // neither the activation nor the destination is promoted to fp32. The RHS
+  // must already be packed for a qsi4cxp4x8 micro-kernel (nr=4, kr=16, sr=2)
+  // -- that is what QS4CX_Tensor::packF16Activation() emits. It is NOT the
+  // fp32 facade's pack: that one is qsi4cxp8x8 (nr=8) and reading it here
+  // would silently mis-stride every super-row past the first.
+  //
+  // Only the two qsi4cxp4x8 variants are layout-compatible with that pack:
+  //   1 = qai8dxp1x8_qsi4cxp4x8_1x4_neon_dotprod   (single-row / decode)
+  //   3 = qai8dxp4x8_qsi4cxp4x8_16x4_neon_i8mm     (multi-row / prefill)
+  // Variants 0 and 2 are qsi4cxp4x4 (kr=8) and must never be selected here.
+  // Variant 3 is only compiled in when i8mm is available, so fall back to 1.
+  (void)idx_variant;
+  (void)transB;
+
+  constexpr size_t kVariantF16Dotprod = 1;
+  constexpr size_t kVariantF16I8mm = 3;
+  const size_t variant =
+    (m > 1 &&
+     __kai_get_num_ukernel_variants_f16_qai8dxp_qsi4cxp() > kVariantF16I8mm)
+      ? kVariantF16I8mm
+      : kVariantF16Dotprod;
+
+  __kai_gemm_f16_qai8dxp_qsi4cxp(
+    m, n, k, lhs_native_mtx_f16, rhs_packed_mtx_qs4cx, dst_act_mtx_f16, variant,
+    static_cast<float>(lower_bound), static_cast<float>(upper_bound));
+}
+
 size_t nntr_get_rhs_packed_size_qsi8d32p_qsi4c32p(size_t n, size_t k,
                                                   uint32_t idx_variant,
                                                   bool transB) {

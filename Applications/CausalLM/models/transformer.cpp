@@ -10,12 +10,32 @@
  * @brief  This file defines Transformer's basic actions
  */
 
+#include <chrono>
 #include <fstream>
 #include <mutex>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h> // SetThreadPriority (async tokenizer, below-normal)
+#endif
+
 #include <app_context.h>
+#if defined(ENABLE_OPENCL)
+#include <cl_context.h> // GPU registration goes via the Engine facade now; the
+// header is OpenCL-only -> guard for the no-OpenCL build.
+#endif
 #include <engine.h>
 #include <model.h>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context.h>
+#include <per_layer_slice.h>
+#endif
 
 #include <llm_util.hpp>
 #include <tokenizers_cpp.h>
@@ -26,8 +46,6 @@
 #include <neuralnet.h>
 #include <qs4cx_tensor.h>
 #include <rms_norm.h>
-#include <swiglu.h>
-#include <tie_word_embedding.h>
 
 namespace causallm {
 
@@ -118,8 +136,31 @@ Transformer::Transformer(json &cfg, json &generation_cfg, json &nntr_cfg,
       nntr_cfg["tokenizer_file"].is_null()) {
     tokenizer = nullptr; // No tokenizer for this model
   } else {
-    tokenizer = tokenizers::Tokenizer::FromBlobJSON(
-      LoadBytesFromFile(nntr_cfg["tokenizer_file"]));
+    // The ~30MB tokenizer.json parse measured ~680ms
+    // and is independent of graph compile + weight load -- run it on a side
+    // thread and join at first use (ensureTokenizer / getTokenizer).
+    const std::string tok_path = nntr_cfg["tokenizer_file"];
+    tokenizer_future_ = std::async(std::launch::async, [tok_path]() {
+    // Below-normal priority: the parse tail (~100-300ms) overlaps the
+    // parallel v8c prebuild workers (round-13 ordering trace), so let
+    // the load workers win contention -- the parse still finishes long
+    // before its first use joins it.
+#if defined(_WIN32)
+      SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+      auto tok =
+        tokenizers::Tokenizer::FromBlobJSON(LoadBytesFromFile(tok_path));
+      // [NNTR_INIT_TRACE] ordering marker: where in the load pipeline the
+      // async parse actually completes (contention forensics -- if this
+      // lands after "load_weight begins" the side thread competes with the
+      // parallel v8c prebuild workers; observed: it completes during the
+      // single-threaded compile/planner phase instead).
+      if (std::getenv("NNTR_INIT_TRACE")) {
+        std::fprintf(stderr, "[init-trace] tokenizer async parse done\n");
+        std::fflush(stderr);
+      }
+      return tok;
+    });
   }
 };
 
@@ -134,7 +175,17 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   MODEL_TENSOR_TYPE = nntr_cfg["model_tensor_type"].get<std::string>();
   INIT_SEQ_LEN = nntr_cfg["init_seq_len"];
   MAX_SEQ_LEN = nntr_cfg["max_seq_len"];
-  NUM_TO_GENERATE = nntr_cfg["num_to_generate"];
+  // num_to_generate is optional: absent (or <= 0) means "no explicit cap",
+  // i.e. generate until EOS or until the context window runs out. 0 is the
+  // sentinel every consumer below tests for.
+  NUM_TO_GENERATE = nntr_cfg.value("num_to_generate", 0);
+  // Any non-positive value is the supported "no explicit cap" request, not a
+  // misconfiguration: normalize it to the same 0 sentinel silently. This lives
+  // in the function that (re-)reads the key so it holds after every call --
+  // a derived Transformer whose constructor calls setupParameters() again
+  // reloads the raw value, which would silently drop a guard placed elsewhere.
+  if (NUM_TO_GENERATE < 0)
+    NUM_TO_GENERATE = 0;
   MODEL_TENSOR_TYPE = nntr_cfg["model_tensor_type"];
   MEMORY_SWAP = nntr_cfg.contains("fsu") ? nntr_cfg["fsu"].get<bool>() : false;
   FSU_LOOKAHEAD = nntr_cfg.contains("fsu_lookahead")
@@ -142,8 +193,19 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                     : 1;
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
+  // Legacy QINT4 weights now load as the canonical QS4CX class;
+  // remap the config dtype so the whole pipeline (tensor factory + runtime
+  // consumers) is QS4CX. The on-disk bytes stay legacy QINT4 and are transcoded
+  // losslessly at read time, keyed on model_tensor_type ("QINT4-*"), which is
+  // intentionally NOT remapped so the loader still knows the on-disk format.
+  if (FC_LAYER_DTYPE == "QINT4")
+    FC_LAYER_DTYPE = "QS4CX";
   EMBEDDING_FILE_NAME = nntr_cfg.value("embedding_file_name", std::string());
   PLE_FILE_NAME = nntr_cfg.value("ple_file_name", std::string());
+  PLE_SIDECAR_EXPORT = nntr_cfg.value("ple_sidecar_export", std::string());
+  EMBD_SIDECAR_EXPORT = nntr_cfg.value("embd_sidecar_export", std::string());
+  LMHEAD_UNTIE =
+    nntr_cfg.contains("lmhead_untie") && nntr_cfg["lmhead_untie"].get<bool>();
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();
@@ -161,6 +223,9 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
 
   NUM_VOCAB = cfg["vocab_size"];
   DIM = cfg["hidden_size"];
+  // Not every architecture that reaches this base parser declares an FFN
+  // intermediate size (e.g. the encoder-only / conv-block models); default it
+  // instead of throwing on a missing key.
   INTERMEDIATE_SIZE =
     cfg.contains("intermediate_size") ? cfg["intermediate_size"].get<int>() : 0;
   NUM_LAYERS = cfg["num_hidden_layers"];
@@ -198,16 +263,53 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
     cfg.contains("rms_norm_eps") ? cfg["rms_norm_eps"].get<float>() : 1e-5;
   GQA_SIZE = NUM_HEADS / NUM_KEY_VALUE_HEADS;
 
+  // Attention-logit soft-capping (Gemma family). Parsed here so every model
+  // shares one path; gated on cfg presence, so models without the key keep the
+  // 0.0f default (no soft-cap). Consolidated from the per-model
+  // setupParameters overrides, which carried byte-identical copies of it.
+  if (cfg.contains("attn_logit_softcapping") &&
+      !cfg["attn_logit_softcapping"].is_null()) {
+    ATTN_LOGIT_SOFTCAPPING = cfg["attn_logit_softcapping"].get<float>();
+  }
+
+  // [Adreno image-attn model vetting] now lives in the model classes that
+  // have geometry the OHWI kernels cannot serve (gemma4: global_head_dim=512
+  // exceeds the proven d<=256 tiling — see Gemma4Transformer::setupParameters).
+  // The sliding-window case is handled IN the kernels since qk_matmul_f16_ohwi
+  // (+_img) grew a local_window argument (n + W <= q_pos lower-bound mask),
+  // so window < max_seq_len no longer forces the flash path.
+
   return;
 };
 
 /**
  * @brief Build and compile the symbolic transformer graph.
  */
+void Transformer::ensureTokenizer() {
+  std::lock_guard<std::mutex> lk(tokenizer_join_mtx_);
+  if (tokenizer_future_.valid())
+    tokenizer = tokenizer_future_.get();
+}
+
 void Transformer::initialize() {
+
+  // [NNTR_INIT_TRACE] init-latency dissection (round-13 follow-up).
+  static const bool init_trace = std::getenv("NNTR_INIT_TRACE") != nullptr;
+  const auto _tt0 = std::chrono::steady_clock::now();
+  auto _tlap = [&](const char *what) {
+    if (!init_trace)
+      return;
+    std::fprintf(stderr, "[init-trace] %8.1f ms  %s\n",
+                 std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - _tt0)
+                   .count(),
+                 what);
+    std::fflush(stderr);
+  };
 
   // RegisterCustomLayers
   registerCustomLayers();
+  _tlap("registerCustomLayers");
 
   // create model and apply properties before compile()
   model = ml::train::createModel(ml::train::ModelType::NEURAL_NET);
@@ -223,10 +325,12 @@ void Transformer::initialize() {
 
   // build symbolic tensor graph and compile from (input, output)
   auto [x, y] = constructModel();
+  _tlap("constructModel (symbolic graph)");
 
   if (model->compile(x, y, ml::train::ExecutionMode::INFERENCE)) {
     throw std::invalid_argument("Model compilation failed.");
   }
+  _tlap("model->compile+initialize (ccapi)");
 
   is_initialized = true;
 #ifdef DEBUG
@@ -261,11 +365,16 @@ std::pair<Tensor, Tensor> Transformer::constructModel() {
     h = createTransformerDecoderBlock(i, h);
   }
 
-  // final rms_norm
+  // final rms_norm. NOTE: stays on CausalLM's custom RMSNormLayer
+  // ("rms_norm" type, app_context only) so the fused-rmsq + v8c FC
+  // consumer chain works. The nntrainer GPU RMSNormLayerCl uses type
+  // "rmsnorm" (different) and has a separate reduction-order drift
+  // issue documented in.
   LayerHandle out_norm(
     createLayer("rms_norm", {withKey("name", "output_norm"),
                              withKey("epsilon", std::to_string(NORM_EPS)),
-                             withKey("packed", "false")}));
+                             withKey("packed", "false"),
+                             withKey("engine", causallm_engine())}));
   h = out_norm(h);
 
   return {x, h};
@@ -359,10 +468,69 @@ void Transformer::repack_weight() {
       "Transformer model is not initialized. Please call "
       "initialize() before repack_weight().");
   }
+
+  // [perf/thermal] The KAI rhs-pack below is consumed ONLY by the ARM CPU
+  // KleidiAI GEMM. The GPU (v8c) and x86 paths read the plain on-disk QS4CX
+  // blob directly (see the comment at the pack() call). On a GPU run the whole
+  // loop is therefore redundant CPU work — and it is single-threaded, so for a
+  // large model it pins one core to a thermal shutdown (Adreno: GPU idle at 0%,
+  // one CPU core -> ~104C -> device reboot; 96%+ of CPU was in
+  // kai_run_rhs_pack). Skip it on every non-CPU engine — "gpu" (OpenCL) AND
+  // "cuda" both consume the plain blob; only the ARM CPU (KAI) run packs.
+  // (On ARM64 CUDA the old =="gpu" check let packF16Activation allocate a
+  // full unconsumed host copy of every FC weight.)
+  if (causallm_engine() != "cpu") {
+    ml_logd("repack_weight: skipped on %s engine (consumes plain QS4CX blob)",
+            causallm_engine().c_str());
+    return;
+  }
+  // fp16-act graphs dispatch QS4CX FCs through HalfTensor::dot, whose KAI rhs
+  // is the fp16-scale layout (packF16Activation) — pack()'s fp32-facade rhs
+  // would be dead weight there (an unconsumed full extra copy of every FC in
+  // RAM, and ~11% of a 1K-run's CPU in kai_run_rhs_pack). fp32-act graphs
+  // dispatch through FloatTensor::dotQs4cx and need pack() as before.
+  const bool f16_act =
+    MODEL_TENSOR_TYPE.size() >= 5 &&
+    MODEL_TENSOR_TYPE.compare(MODEL_TENSOR_TYPE.size() - 5, 5, "-FP16") == 0;
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
-    fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &context, void *) {
-      // Each layer determines whether it repacks its own weights or not
-      static_cast<nntrainer::LayerNode &>(l).pack(context);
+    fn = [f16_act](ml::train::Layer &l, nntrainer::RunLayerContext &context,
+                   void *) {
+      auto &node = static_cast<nntrainer::LayerNode &>(l);
+      try {
+        if (!f16_act) {
+          // Upstream repack delegation/restriction: each layer decides whether
+          // it repacks its own weights. Only the FC layers override Layer::pack
+          // today — importantly the QS4CX *embedding* table must NOT be packed
+          // (finalize() stores it transposed as (out_dim, in_dim) and the row
+          // decoder reads the plain nibbles + per-channel scales).
+          node.pack(context);
+          return;
+        }
+        // fp16-act graphs dispatch QS4CX FCs through HalfTensor::dot, whose KAI
+        // rhs is the fp16-scale layout (packF16Activation) — pack()'s
+        // fp32-facade rhs would be dead weight there (an unconsumed full extra
+        // copy of every FC in RAM, and ~11% of a 1K-run's CPU in
+        // kai_run_rhs_pack). There is no Layer::pack hook for the fp16 layout
+        // yet, so mirror the restriction by hand: only the layer types that
+        // override pack() get repacked.
+        const std::string ty = node.getType();
+        if (ty != "fully_connected" && ty != "shared_fully_connected")
+          return;
+        for (auto &w : context.getWeights()) {
+          if (w->getVariableRef().getDataType() ==
+              ml::train::TensorDim::DataType::QS4CX) {
+            // KAI rhs-pack is the ARM (i8mm) CPU GEMM's in-memory
+            // derivation; on x86 it is NYI and the x86 CPU GEMM + the GPU v8c
+            // path consume the plain on-disk QS4CX (nibbles + fp32 scales)
+            // directly. Skip-on-NYI so a single QS4CX weight set loads on every
+            // backend (ARM packs, x86/GPU use the plain blob).
+            w->getVariableRef().packF16Activation();
+          }
+        }
+      } catch (const std::exception &e) {
+        ml_logd("QS4CX pack skipped (engine consumes plain blob): %s",
+                e.what());
+      }
     };
   try {
     model->forEachLayer(fn, nullptr);
@@ -397,8 +565,8 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
   LayerHandle attn_norm(createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false"),
+     withKey("engine", causallm_engine())}));
   Tensor normed = attn_norm(input);
 
   Tensor att_out = createAttention(layer_id, INIT_SEQ_LEN, NUM_HEADS, HEAD_DIM,
@@ -406,21 +574,23 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
 
   LayerHandle decoder_add(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_add"),
+     withKey("engine", causallm_engine())}));
   Tensor residual = decoder_add({input, att_out});
 
   LayerHandle ffn_norm(createLayer(
     "rms_norm",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
-     withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("packed", "false")}));
+     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false"),
+     withKey("engine", causallm_engine())}));
   Tensor ffn_normed = ffn_norm(residual);
 
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, ffn_normed);
 
   LayerHandle decoder_output(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_decoder_output"),
+     withKey("engine", causallm_engine())}));
   return decoder_output({residual, ffn_out});
 }
 
@@ -429,11 +599,11 @@ Tensor Transformer::createTransformerDecoderBlock(const int layer_id,
  */
 std::pair<Tensor, Tensor>
 Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
-  const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
+  const unsigned int cache_rows = static_cast<unsigned int>(MAX_SEQ_LEN);
   const unsigned int kv_width =
     static_cast<unsigned int>(HEAD_DIM * n_heads / GQA_SIZE);
   const std::string cache_shape = std::to_string(BATCH_SIZE) +
-                                  ":1:" + std::to_string(max_timestep) + ":" +
+                                  ":1:" + std::to_string(cache_rows) + ":" +
                                   std::to_string(kv_width);
 
   // KV caches MUST be created as "input" layers (not plain Tensors). Plain
@@ -463,6 +633,24 @@ Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
 }
 
 /**
+ * @brief Wire the attention core's KV cache: 3-input internal-int8 mode when
+ * use_int8, else 5-input external-fp16 mode with per-layer placeholders. The
+ * placeholder factory is virtual (createKVCachePlaceholders) so a model with a
+ * non-uniform cache width overrides it. Consolidates the wiring previously
+ * duplicated across the per-model createAttention overrides.
+ */
+Tensor Transformer::wireAttentionKVCache(const int layer_id, int n_heads,
+                                         LayerHandle mha, Tensor q, Tensor k,
+                                         Tensor v, bool use_int8) {
+  if (use_int8)
+    return mha({q, k, v});
+  // External KV cache placeholders (per-layer). Their actual storage is owned
+  // by the host (KVCacheManager) and bound at runtime via setExternalTensors.
+  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
+  return mha({q, k, v, cache_k, cache_v});
+}
+
+/**
  * @brief Create the default attention subgraph.
  */
 Tensor Transformer::createAttention(const int layer_id, int seq_len,
@@ -474,7 +662,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
      withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor q = wq(query);
 
   // K layer
@@ -482,7 +671,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor k = wk(key);
 
   // V layer
@@ -490,34 +680,34 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
      withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor v = wv(value);
-
-  // External KV cache placeholders (per-layer). Their actual storage is owned
-  // by the host (KVCacheManager) and bound at runtime via setExternalTensors.
-  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
 
   // Attention core layer
   LayerHandle mha(createLayer(
     "mha_core",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
-     withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
-     withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
-     withKey("sliding_window", (layer_id + 1) % SLIDING_WINDOW_PATTERN
-                                 ? SLIDING_WINDOW
-                                 : UINT_MAX),
-     withKey("rope_theta", ROPE_THETA),
-     withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
-     withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-     withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
-  Tensor a = mha({q, k, v, cache_k, cache_v});
+    {
+      withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
+      withKey("num_heads", n_heads),
+      withKey("num_heads_kv", n_heads / GQA_SIZE),
+      withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
+      withKey("sliding_window", getLayerSlidingWindow(layer_id)),
+      withKey("rope_theta", ROPE_THETA),
+      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
+      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
+      withKey("is_causal", IS_CAUSAL ? "true" : "false"),
+    }));
+  Tensor a = wireAttentionKVCache(layer_id, n_heads, mha, q, k, v,
+                                  /*use_int8=*/false);
 
   // O layer
   LayerHandle wo(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
      withKey("unit", DIM), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   return wo(a);
 }
 
@@ -527,35 +717,41 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
 Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
                               Tensor input) {
 
-  LayerHandle ffn_up(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
-     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
-  Tensor up = ffn_up(input);
-
+  // Create gate BEFORE up: the model loader assigns file offsets in graph
+  // creation order (positional, not by name), and the converters write the
+  // FFN weights gate_proj -> up_proj -> down_proj (the HF convention). If up
+  // is created first, ffn_up loads the gate_proj bytes and ffn_gate loads the
+  // up_proj bytes, so swiglu computes silu(up)*gate instead of silu(gate)*up
+  // -- coherent-looking but wrong (the global gate/up swap; Gemma2/3 avoided
+  // it by overriding createMlp gate-first).
   LayerHandle ffn_gate(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
      withKey("unit", hidden_dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor gate = ffn_gate(input);
 
-  /// @note nntrainer binary stores mlp weights in up, gate order.
-  /// For backward compatibility,
-  /// * layers are in up, gate order
-  /// * swiglu input[0] = gate
-  /// * swiglu input[1] = up
+  LayerHandle ffn_up(createLayer(
+    "fully_connected",
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
+     withKey("unit", hidden_dim), withKey("disable_bias", "true"),
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
+  Tensor up = ffn_up(input);
+
   LayerHandle swiglu(createLayer(
     "swiglu",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
-  Tensor act = swiglu({up, gate}, {1, 0});
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu"),
+     withKey("engine", causallm_engine())}));
+  Tensor act = swiglu({gate, up});
 
   LayerHandle ffn_down(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   return ffn_down(act);
 }
 
@@ -563,22 +759,68 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
  * @brief Register custom CausalLM layers in the nntrainer app context.
  */
 void Transformer::registerCustomLayers() {
-  static std::once_flag registered;
-  std::call_once(registered, []() {
-    const auto &ct_engine = nntrainer::Engine::Global();
-    const auto app_context = static_cast<nntrainer::AppContext *>(
-      ct_engine.getRegisteredContext("cpu"));
+  ///
+  const auto &ct_engine = nntrainer::Engine::Global();
 
-    app_context->registerFactory(nntrainer::createLayer<causallm::SwiGLULayer>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::RMSNormLayer>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::MHACoreLayer>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::TieWordEmbedding>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::EmbeddingLayer>);
-  });
+  // Registration is best-effort and repeatable: every model construction runs
+  // this, and two conditions are normal rather than errors — the build has no
+  // such Context ("[Engine] gpu Context is not registered"), or an earlier
+  // model already took the key (the cpu AppContext returns the existing key,
+  // the cl/cuda contexts throw). Register each factory on its own so one taken
+  // key cannot skip the registrations that follow it in the same block; a
+  // factory that really fails to register surfaces loudly later as "Key is not
+  // found for the object" at graph build.
+  auto tryRegister = [&ct_engine](const char *engine, auto factory) {
+    try {
+      ct_engine.registerLayerFactory(engine, factory);
+    } catch (const std::exception &) {
+    }
+  };
+
+  // CPU layer classes on the cpu (app) context — through Engine's registration
+  // facade, no static_cast to AppContext.
+  // swiglu promoted to core app_context.cpp (merged app fork into the
+  // backend-neutral nntrainer::SwiGLULayer).
+  tryRegister("cpu", nntrainer::createLayer<causallm::RMSNormLayer>);
+  tryRegister("cpu", nntrainer::createLayer<causallm::MHACoreLayer>);
+  // tie_word_embedding promoted to core — self-registered on cpu/gpu/cuda.
+  tryRegister("cpu", nntrainer::createLayer<causallm::EmbeddingLayer>);
+
+  // GPU variants: same type strings as the CPU classes but registered on the
+  // gpu context so engine=gpu createLayer routes there. The GPU classes use raw
+  // getData() pointers + GPU dispatches; they avoid any CPU-only Tensor ops
+  // (Tensor::multiply / add_i / dot) that crash on gpu-context tensors. Inert
+  // when there is no "gpu" context (CPU-only / NNTR_ENGINE=cpu builds).
+  // MHACoreLayer on the gpu context enables engine=gpu attention. The same
+  // class runs on both backends: forwarding() dispatches the GPU kernels when
+  // NNTR_MHA_GPU is set and Q/K/V/cache are SVM-resident, else the CPU NEON
+  // path. Additive — a node with no engine= property keeps routing to CPU.
+  tryRegister("gpu", nntrainer::createLayer<causallm::MHACoreLayer>);
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Additive CUDA backend: register the host CausalLM layer classes on the cuda
+  // context too. engine=cuda tensors are Unified Memory (host-coherent), so the
+  // CPU implementations run correctly on them (no cl_mem); GPU kernels are
+  // layered on per-layer later. Runtime-gated to match the engine.cpp context
+  // bring-up gate: on a non-cuda run there is no "cuda" context and the
+  // registration would just throw per layer.
+  const char *eager_env = std::getenv("NNTR_CUDA_EAGER_CTX");
+  if (causallm_engine() == "cuda" ||
+      (eager_env != nullptr && eager_env[0] != '0')) {
+    // The application's own "rms_norm" class. The cuda context registers the
+    // core RMS norm under the backend-neutral "rmsnorm" type string, which is
+    // a different key from the one this application's graph asks for, so the
+    // app class has to be registered here or the graph cannot resolve it.
+    tryRegister("cuda", nntrainer::createLayer<causallm::RMSNormLayer>);
+    tryRegister("cuda", nntrainer::createLayer<causallm::MHACoreLayer>);
+    // tie_word_embedding promoted to core cuda_context.cpp.
+    tryRegister("cuda", nntrainer::createLayer<causallm::EmbeddingLayer>);
+    // gemma4 PLE host impl (the GPU variant is OpenCL-only and would mis-run on
+    // UVM). Without it on the cuda context the type falls back to the wrong
+    // factory. scalar_multiply is now self-registered in core cuda_context.cpp.
+    tryRegister("cuda", nntrainer::createLayer<causallm::PerLayerSliceLayer>);
+  }
+#endif
 }
 
 } // namespace causallm

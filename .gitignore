@@ -41,11 +41,29 @@ Applications/CausalLM/res/qwen3/*
 Applications/CausalLM/res/qwen3/test/*
 !Applications/CausalLM/res/qwen3/test/generate_qwen3_moe_reference.py
 !Applications/CausalLM/res/qwen3/test/generate_qwen3_reference.py
+# qwen3-0.6b QS4CX conversion pipeline
+!Applications/CausalLM/res/qwen3/qwen3-0.6b/
+Applications/CausalLM/res/qwen3/qwen3-0.6b/*
+!Applications/CausalLM/res/qwen3/qwen3-0.6b/weight_converter.py
+!Applications/CausalLM/res/qwen3/qwen3-0.6b/weight_converter_layergraph.py
+!Applications/CausalLM/res/qwen3/qwen3-0.6b/gguf_to_nntrainer.py
+!Applications/CausalLM/res/qwen3/qwen3-0.6b/README.md
+!Applications/CausalLM/res/qwen3/qwen3-0.6b/build_qs4cx.sh
+# gemma2 QS4CX conversion pipeline
+!Applications/CausalLM/res/gemma2/
+Applications/CausalLM/res/gemma2/*
+!Applications/CausalLM/res/gemma2/weight_converter.py
+!Applications/CausalLM/res/gemma2/build_qs4cx.sh
+!Applications/CausalLM/res/gemma2/README.md
+# gemma4 QS4CX build script + notes
+!Applications/CausalLM/res/gemma4/build_qs4cx.sh
+!Applications/CausalLM/res/gemma4/README.md
 !Applications/CausalLM/res/lfm2_vl/
 Applications/CausalLM/res/lfm2_vl/*
 !Applications/CausalLM/res/lfm2_vl/README.md
 !Applications/CausalLM/res/lfm2_vl/*.py
 Applications/**/tokenizers-cpp-build/*
+Applications/**/tokenizers-android-build/*
 
 # CTag
 /tags

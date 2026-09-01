@@ -71,6 +71,30 @@ public:
 
   std::string getName() override { return "gpu-svm"; }
 
+  // OpenCL SVM is a single pointer the device reads directly (no copy);
+  // host-addressable inherits the base default (true). host + device ->
+  // isSVM() derives true, matching the old getName()=="gpu-svm".
+  bool isDeviceVisible() const override { return true; }
+
+  /**
+   * @copydoc MemAllocator::supportsDevicePool
+   *
+   * OpenCL has a second, device-only plane (cl_mem) a tensor can be placed
+   * in, so this allocator can back one.
+   */
+  bool supportsDevicePool() const override { return true; }
+
+  /**
+   * @copydoc MemAllocator::makePool
+   *
+   * Returns the pool that can hand out a device buffer for a tensor the
+   * planner placed in device memory. It is not conditional: a pool whose
+   * tensors all stay on the shared plane never asks for one, and none is
+   * created.
+   */
+  std::shared_ptr<MemoryPool>
+  makePool(const std::shared_ptr<MemAllocator> &self) override;
+
 private:
   opencl::ContextManager &ctx_;
   // Host-owned set: pointers that came from MemAllocator::alloc
