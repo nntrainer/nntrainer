@@ -59,7 +59,7 @@ bool RMSNormLayerCl::registerClKernels(ClContext &cl_context) {
       ml_loge("OpenCL Error: Fail to register rmsnorm_cl_fp16 kernel");
       break;
     }
-    layer_kernel_ptrs.emplace_back(kernel_rmsnorm_ptr);
+    layer_kernel_ptrs.emplace_back(kernel_rmsnorm_fp16_ptr);
 #endif
 
     return true;
@@ -103,9 +103,17 @@ void RMSNormLayerCl::forwarding(RunLayerContext &context, bool training) {
 
 void RMSNormLayerCl::rmsnormProcess(Tensor const &input, Tensor &result,
                                     Tensor const &gamma, const float epsilon) {
+  // Bind device memory directly (SVM-direct) only when the tensors are
+  // GPU-resident, i.e. allocated from the SVM pool. On the default host (cpu)
+  // pool getData() returns HOST pointers, and passing those as SVM kernel
+  // arguments produces garbage -- so take the host-bounce path there.
+  // rmsnorm_cl's use_svm defaults to true, so omitting it is not neutral.
+  const auto md = input.getMemoryData();
+  const bool use_svm = md && md->isSVM();
   rmsnorm_cl(input.getData<float>(), gamma.getData<float>(),
              result.getData<float>(), epsilon,
-             input.batch() * input.channel() * input.height(), input.width());
+             input.batch() * input.channel() * input.height(), input.width(),
+             use_svm);
 }
 
 #ifdef ENABLE_FP16
@@ -146,20 +154,25 @@ void RMSNormLayerCl::rmsnormProcess_fp16(Tensor const &input, Tensor &result,
       break;
     }
 
+    // SetKernelArguments takes a POINTER to the value (clSetKernelArg
+    // semantics), so a cl_mem arg must be passed by address. Passing
+    // GetBuffer() (a cl_mem) directly bound a garbage handle =>
+    // CL_INVALID_MEM_OBJECT, which silently broke this dispatch and left the
+    // output stale.
     ret = kernel_rmsnorm_ptr->SetKernelArguments(
-      0, clbuffInstance.getInBufferA()->GetBuffer(), sizeof(cl_mem));
+      0, &clbuffInstance.getInBufferA()->GetBuffer(), sizeof(cl_mem));
     if (!ret) {
       break;
     }
 
     ret = kernel_rmsnorm_ptr->SetKernelArguments(
-      1, clbuffInstance.getOutBufferA()->GetBuffer(), sizeof(cl_mem));
+      1, &clbuffInstance.getOutBufferA()->GetBuffer(), sizeof(cl_mem));
     if (!ret) {
       break;
     }
 
     ret = kernel_rmsnorm_ptr->SetKernelArguments(
-      2, clbuffInstance.getInBufferB()->GetBuffer(), sizeof(cl_mem));
+      2, &clbuffInstance.getInBufferB()->GetBuffer(), sizeof(cl_mem));
     if (!ret) {
       break;
     }
@@ -169,7 +182,11 @@ void RMSNormLayerCl::rmsnormProcess_fp16(Tensor const &input, Tensor &result,
       break;
     }
 
-    ret = kernel_rmsnorm_ptr->SetKernelArguments(3, &epsilon, sizeof(cl_half));
+    // epsilon is a float; the kernel arg is half, so convert it. Passing the
+    // low 2 bytes of the float as a half gave a wrong epsilon.
+    const _FP16 epsilon_h = static_cast<_FP16>(epsilon);
+    ret =
+      kernel_rmsnorm_ptr->SetKernelArguments(3, &epsilon_h, sizeof(cl_half));
     if (!ret) {
       break;
     }
