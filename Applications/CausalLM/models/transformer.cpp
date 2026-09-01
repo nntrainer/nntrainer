@@ -34,6 +34,7 @@
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context.h>
+#include <cuda_rmsnorm_layer.h>
 #include <per_layer_slice.h>
 #endif
 
@@ -773,9 +774,10 @@ void Transformer::registerCustomLayers() {
   // key cannot skip the registrations that follow it in the same block; a
   // factory that really fails to register surfaces loudly later as "Key is not
   // found for the object" at graph build.
-  auto tryRegister = [&ct_engine](const char *engine, auto factory) {
+  auto tryRegister = [&ct_engine](const char *engine, auto factory,
+                                  const char *key = "") {
     try {
-      ct_engine.registerLayerFactory(engine, factory);
+      ct_engine.registerLayerFactory(engine, factory, key);
     } catch (const std::exception &) {
     }
   };
@@ -810,11 +812,16 @@ void Transformer::registerCustomLayers() {
   const char *eager_env = std::getenv("NNTR_CUDA_EAGER_CTX");
   if (causallm_engine() == "cuda" ||
       (eager_env != nullptr && eager_env[0] != '0')) {
-    // The application's own "rms_norm" class. The cuda context registers the
-    // core RMS norm under the backend-neutral "rmsnorm" type string, which is
-    // a different key from the one this application's graph asks for, so the
-    // app class has to be registered here or the graph cannot resolve it.
-    tryRegister("cuda", nntrainer::createLayer<causallm::RMSNormLayer>);
+    // CUDA RMSNorm (device kernel, FP32 sum-of-squares) under the "rms_norm"
+    // key this application's graph asks for. The cuda context self-registers
+    // the same class under the backend-neutral "rmsnorm" type string, which is
+    // a DIFFERENT key, so without this line every rms_norm node on an
+    // engine=cuda graph resolved to the host causallm::RMSNormLayer instead —
+    // a host loop reading and writing UVM activations inside the device chain,
+    // which is both wrong (host reads racing the un-synced device stream) and
+    // catastrophically slow (page migration per norm, per token).
+    tryRegister("cuda", nntrainer::createLayer<nntrainer::CudaRMSNormLayer>,
+                "rms_norm");
     tryRegister("cuda", nntrainer::createLayer<causallm::MHACoreLayer>);
     // tie_word_embedding promoted to core cuda_context.cpp.
     tryRegister("cuda", nntrainer::createLayer<causallm::EmbeddingLayer>);
