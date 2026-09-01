@@ -30,6 +30,10 @@
 #include <mutex>
 #include <unordered_map>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace nntrainer::cuda {
 
 // One block per (query head h, query row i). Online (flash) softmax in FP32.
@@ -1156,11 +1160,47 @@ bool ensure_sk(size_t mn, size_t acc) {
   return true;
 }
 
+/**
+ * @brief Make sure THIS MODULE's split-KV scratch is prewarmed, replaying the
+ *        app's prewarm call if it landed in a different module.
+ *
+ * cuda_attention_splitkv_prewarm() is called once at load by the application
+ * (causal_lm.cpp), and on Windows that call runs against the copy of this file
+ * linked into the EXE -- while the decode dispatch below runs against the copy
+ * linked into mha_core's DLL (see StreamManager::initialize() for why every
+ * layer DLL has its own). So g_sk_max_nchunks is published in one module and
+ * read as 0 in the other, which silently turns OFF the M2-B fixed-stride
+ * contract here: the decode falls back to the LIVE n_chunks and the HOST N_kv,
+ * both of which a captured graph freezes at the capture token. The KV those
+ * frozen values exclude is then never attended on any replayed token -- the
+ * answer degrades the further generation runs past the capture point, which is
+ * only visible once the context is long enough to need more than one chunk.
+ *
+ * The prewarm's three ARGUMENTS are published process-wide instead, and any
+ * module that needs the stride re-derives it locally. Runs on the M2-B warm
+ * token, i.e. outside the capture, where the cudaMallocs it needs are legal.
+ */
+void ensure_splitkv_prewarmed() {
+#ifdef _WIN32
+  if (g_sk_max_nchunks > 0 || StreamManager::Global().isCapturing())
+    return;
+  char buf[64] = {0};
+  if (GetEnvironmentVariableA("__NNTR_CUDA_SPLITKV_PREWARM", buf,
+                              (DWORD)sizeof(buf)) == 0)
+    return;
+  int msl = 0, mhq = 0, mhd = 0;
+  if (std::sscanf(buf, "%d %d %d", &msl, &mhq, &mhd) != 3)
+    return;
+  cuda_attention_splitkv_prewarm(msl, mhq, mhd);
+#endif
+}
+
 bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
                               const unsigned short *v, unsigned short *o,
                               int HQ, int HKV, int N_kv, int cache_from, int d,
                               int window, float softcap, int chunk_kv,
                               int ring_cap) {
+  ensure_splitkv_prewarmed();
   const int n_chunks = (N_kv + chunk_kv - 1) / chunk_kv;
   // Graph replay: when the device pos buffer is bound, the captured graph uses
   // the FIXED max-chunk stride/grid (g_sk_max_nchunks, published at prewarm) so
@@ -1585,6 +1625,16 @@ bool cuda_attention_splitkv_prewarm(int max_seq_len, int max_hq,
   // the SAME value the scratch was just sized with (replay-capture
   // correctness).
   g_sk_max_nchunks = max_nchunks;
+#ifdef _WIN32
+  // ...and publish the ARGUMENTS process-wide, because the module that reads
+  // the stride is not this one. See ensure_splitkv_prewarmed().
+  {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%d %d %d", max_seq_len, max_hq,
+                  max_head_dim);
+    SetEnvironmentVariableA("__NNTR_CUDA_SPLITKV_PREWARM", buf);
+  }
+#endif
   return true;
 }
 
