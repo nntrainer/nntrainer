@@ -11,6 +11,12 @@
  *
  */
 
+#if defined(ENABLE_OPENCL)
+// The OpenCL GPU lm_head GEMVs (lmhead_gemv_*_cl). Guarded so the FP32 CPU
+// build (enable-opencl=false, which is what the causallm model unittests use)
+// compiles tie as a host-only lm_head.
+#include <blas_kernels.h>
+#endif
 #include <cpu_backend.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
@@ -22,7 +28,60 @@
 #include <tie_word_embedding.h>
 #include <util_func.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <vector>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_fc_qs4cx.h>
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+
+#if defined(ENABLE_FP16)
+namespace {
+// NNTR_CUDA_ASYNC guard for the pinned tie-embedding staging buffer: in async
+// mode nothing drains the stream per-op, so the NEXT token's host dequant can
+// rewrite (or cudaFreeHost) emb_stage while the PREVIOUS token's H2D from the
+// same buffer is still in flight -> the consumer kernel reads torn rows
+// (measured: word-salad decode under ASYNC=1, coherent under sync). One event
+// on the single backend stream marks the most recent staging H2D; stream FIFO
+// means "last H2D done" implies every earlier one is done. Skipped during
+// graph capture: an in-capture cudaEventSynchronize is illegal and the
+// captured H2D is replay-ordered by the graph itself.
+cudaEvent_t g_tie_emb_h2d_evt = nullptr;
+bool g_tie_emb_h2d_pending = false;
+
+void tie_emb_stage_h2d_record() {
+  auto &sm = nntrainer::cuda::StreamManager::Global();
+  if (sm.isCapturing())
+    return;
+  if (g_tie_emb_h2d_evt == nullptr &&
+      cudaEventCreateWithFlags(&g_tie_emb_h2d_evt, cudaEventDisableTiming) !=
+        cudaSuccess) {
+    g_tie_emb_h2d_evt = nullptr;
+    cudaGetLastError();
+    return;
+  }
+  if (cudaEventRecord(g_tie_emb_h2d_evt, sm.GetStream()) == cudaSuccess)
+    g_tie_emb_h2d_pending = true;
+  else
+    cudaGetLastError();
+}
+
+void tie_emb_stage_h2d_wait() {
+  if (!g_tie_emb_h2d_pending ||
+      nntrainer::cuda::StreamManager::Global().isCapturing())
+    return;
+  cudaEventSynchronize(g_tie_emb_h2d_evt);
+  g_tie_emb_h2d_pending = false;
+}
+} // namespace
+// The staging buffer, and therefore these two helpers, exist only on the FP16
+// path below; defining them in a cuda=on / fp16=off build is an unused-function
+// error under -Werror.
+#endif
+#endif
 
 namespace nntrainer {
 
@@ -139,13 +198,17 @@ void TieWordEmbedding::finalize_lmhead(nntrainer::InitLayerContext &context) {
   is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
   output_dims[0].height(1);
 
-  // The lm_head output is the logits; generate() reads them as float* for
-  // argmax/sampling. Force FP32 regardless of the activation dtype — under FP16
-  // activation an FP16 logits tensor is reinterpreted as FP32 and produces
-  // garbage tokens. (The Q6_K/Q4_0 lmhead matmul writes FP32 directly; the FP16
-  // activation is cast up to FP32 before the dot in incremental_forwarding.)
+  // @note The logits keep the ACTIVATION dtype on purpose. This was once
+  // forced to FP32 because the caller read the logits unconditionally as
+  // float*, so an FP16 logits tensor was reinterpreted as FP32 (garbage
+  // tokens). That is no longer the case: the whole lm_head chain below is
+  // dtype-aware (the Q4_0 / Q6_K / FP32-weight paths all branch on
+  // hidden_step's dtype and cast), the device lm_head GEMVs require FP16
+  // logits to stay on the device, and incremental_inference() already
+  // narrows an FP16 output tensor to the float* the caller expects. Forcing
+  // FP32 here silently disables every device path.
   output_dims[0].setTensorType(
-    {context.getFormat(), nntrainer::TensorDim::DataType::FP32});
+    {context.getFormat(), context.getActivationDataType()});
 
   context.setOutputDimensions(output_dims);
 
@@ -234,6 +297,48 @@ void TieWordEmbedding::incremental_forwarding_embedding(
     nntrainer::Tensor batchsliced_hidden = hidden_.getBatchSlice(b, 1);
     int iter = to - from;
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // Device-only activation pool (NNTR_CUDA_DEV_ACT): the output is real
+    // device memory (cudaMalloc), NOT host-addressable. The host dequant below
+    // cannot store into it directly (segfault). Dequant into a host staging
+    // buffer, then push it H2D on the backend stream (ordered before the first
+    // GPU layer reads the residual seed). Keeps the CPU off device memory =
+    // no page-fault thrash.
+    // Persistent + PINNED host staging (was a local std::vector). Under
+    // CUDA-graph stream capture a local vector fails twice: (a) a pageable
+    // cudaMemcpyAsync is NOT capturable, and (b) the vector is freed when this
+    // function returns, but the captured graph REPLAYS afterwards -- it would
+    // copy from freed memory => garbage. A process-lifetime pinned
+    // (cudaHostAlloc) buffer is capturable and survives the replay. Grows
+    // monotonically (decode iter==1; prefill iter<=max_seq_len); single
+    // sequence (b_size==1) so one shared buffer is sufficient.
+    static _FP16 *emb_stage = nullptr;
+    static size_t emb_stage_cap = 0; // capacity in _FP16 elements
+    bool emb_dev_only = false;
+    if (nntrainer::cuda::engine_selected() &&
+        hidden_.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+      cudaPointerAttributes pa{};
+      emb_dev_only =
+        cudaPointerGetAttributes(&pa, batchsliced_hidden.getData<_FP16>()) ==
+          cudaSuccess &&
+        pa.type == cudaMemoryTypeDevice;
+      cudaGetLastError();
+      if (emb_dev_only) {
+        // Async-mode: the previous token's H2D from this pinned buffer may
+        // still be in flight -- wait before the host rewrites or frees it.
+        tie_emb_stage_h2d_wait();
+        size_t need = (size_t)iter * out_dim;
+        if (need > emb_stage_cap) {
+          if (emb_stage)
+            cudaFreeHost(emb_stage);
+          cudaHostAlloc((void **)&emb_stage, need * sizeof(_FP16),
+                        cudaHostAllocDefault);
+          emb_stage_cap = need;
+        }
+      }
+    }
+#endif
+
     auto &tm = nntrainer::ThreadManager::Global();
     tm.parallel_for(0, static_cast<size_t>(iter), [&](size_t i) {
       unsigned int embed_idx = static_cast<unsigned int>(in_data[i]);
@@ -246,48 +351,105 @@ void TieWordEmbedding::incremental_forwarding_embedding(
       nntrainer::Tensor out_tensor =
         batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
 
-      if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K ||
-          weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0) {
-        ///@note this should be replaced with quantizer operation
-        const bool is_q6k =
-          weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K;
-        const int blk = is_q6k ? 256 : 32;
-        const int bytes_per_blk = is_q6k ? 210 : 18;
-        const int num_blocks_per_row = (weight.width() + blk - 1) / blk;
-        const void *src =
-          (void *)((char *)weight.getData<uint8_t>() +
-                   (bytes_per_blk * num_blocks_per_row) * embed_idx);
-
-        if (out_tensor.getDataType() == nntrainer::TensorDim::DataType::FP32) {
-          if (is_q6k)
-            nntrainer::dequantize_row_q6_K(src, out_tensor.getData(), out_dim);
-          else
-            nntrainer::dequantize_row_q4_0(src, out_tensor.getData(), out_dim);
+      const auto wt = weight.getDataType();
+      if (wt == nntrainer::TensorDim::DataType::Q6_K ||
+          wt == nntrainer::TensorDim::DataType::Q4_0) {
+        // dequantize_row_q{6_K,4_0} ALWAYS writes out_dim FP32 values. The
+        // destination out_tensor is FP16 in an FP16-activation run, so writing
+        // FP32 directly would overrun the buffer 2x and corrupt every value
+        // (=> garbage row => <pad>). Dequantize into an FP32 scratch, then
+        // write into out_tensor with the correct dtype (folding embed scale).
+        std::vector<float> tmp(out_dim);
+        if (wt == nntrainer::TensorDim::DataType::Q6_K) {
+          int num_blocks_per_row = (weight.width() + 256 - 1) / 256;
+          nntrainer::dequantize_row_q6_K(
+            (void *)((char *)weight.getData<uint8_t>() +
+                     (210 * num_blocks_per_row) * embed_idx),
+            tmp.data(), out_dim);
         } else {
-          // dequantize_row_* writes FP32. Under a non-FP32 (e.g. FP16)
-          // activation, writing straight into out_tensor would scribble each
-          // 4-byte float across the narrower slots and corrupt the embedding
-          // (multilingual-garbage symptom). Dequantize into an FP32 temp then
-          // cast into the activation dtype.
-          nntrainer::TensorDim fp32_dim(
-            {1, 1, 1, out_dim}, nntrainer::TensorDim::TensorType(
-                                  out_tensor_dim.getFormat(),
-                                  nntrainer::TensorDim::DataType::FP32));
-          nntrainer::Tensor tmp(fp32_dim, true);
-          if (is_q6k)
-            nntrainer::dequantize_row_q6_K(src, tmp.getData(), out_dim);
-          else
-            nntrainer::dequantize_row_q4_0(src, tmp.getData(), out_dim);
-          out_tensor.copyData(tmp);
+          int num_blocks_per_row = (weight.width() + 32 - 1) / 32;
+          nntrainer::dequantize_row_q4_0(
+            (void *)((char *)weight.getData<uint8_t>() +
+                     (18 * num_blocks_per_row) * embed_idx),
+            tmp.data(), out_dim);
         }
+        if (out_tensor.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+          _FP16 *o =
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+            emb_dev_only ? (emb_stage + (size_t)i * out_dim) :
+#endif
+                         out_tensor.getData<_FP16>();
+          for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
+            o[k] = static_cast<_FP16>(tmp[k] * scale);
+#else
+          throw std::invalid_argument("FP16 out_tensor requires ENABLE_FP16");
+#endif
+        } else {
+          float *o = out_tensor.getData<float>();
+          for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
+            o[k] = tmp[k] * scale;
+        }
+      } else if (wt == nntrainer::TensorDim::DataType::FP32 &&
+                 out_tensor.getDataType() ==
+                   nntrainer::TensorDim::DataType::FP16) {
+        // FP32 embed row -> FP16 activation needs an explicit narrowing cast.
+        // copyData byte-copies same-dtype tensors, so an FP32->FP16 copyData
+        // writes out_dim*4 bytes into an out_dim*2 buffer => every other value
+        // reads as 0 ([0, x, 0, x] corruption => garbage hidden). Mirror the
+        // Q6_K/Q4_0 cast path above.
+#ifdef ENABLE_FP16
+        const float *src = cur_weight.getData<float>();
+        _FP16 *o =
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+          emb_dev_only ? (emb_stage + (size_t)i * out_dim) :
+#endif
+                       out_tensor.getData<_FP16>();
+        for (unsigned int k = 0; k < (unsigned int)out_dim; ++k)
+          o[k] = static_cast<_FP16>(src[k] * scale);
+#else
+        throw std::invalid_argument("FP16 out_tensor requires ENABLE_FP16");
+#endif
       } else {
         out_tensor.copyData(cur_weight);
-      }
-
-      if (scale != 1.0f) {
-        out_tensor.multiply_i(scale);
+        if (scale != 1.0f) {
+          out_tensor.multiply_i(scale);
+        }
       }
     });
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
+    // push the host-dequantized embedding rows into the device-only output on
+    // the backend stream (ordered before the first GPU layer consumes them).
+    if (emb_dev_only) {
+      // Windows defaults to a synchronous upload: an asynchronous staging
+      // copy here was the measured source of a Windows-only divergence.
+      // NNTR_CUDA_EMB_SYNCCOPY=0 restores the async copy; every other
+      // platform keeps async.
+      static const bool emb_synccopy = []() {
+        const char *e = std::getenv("NNTR_CUDA_EMB_SYNCCOPY");
+        if (e)
+          return e[0] == '1';
+#ifdef _WIN32
+        return true;
+#else
+        return false;
+#endif
+      }();
+      if (emb_synccopy &&
+          !nntrainer::cuda::StreamManager::Global().isCapturing()) {
+        cudaMemcpy(batchsliced_hidden.getData<_FP16>(), emb_stage,
+                   (size_t)iter * out_dim * sizeof(_FP16),
+                   cudaMemcpyHostToDevice);
+      } else {
+        cudaMemcpyAsync(batchsliced_hidden.getData<_FP16>(), emb_stage,
+                        (size_t)iter * out_dim * sizeof(_FP16),
+                        cudaMemcpyHostToDevice,
+                        nntrainer::cuda::StreamManager::Global().GetStream());
+        tie_emb_stage_h2d_record();
+      }
+    }
+#endif
 
 #ifdef DEBUG
     std::cout << context.getName() << " : "
@@ -336,22 +498,9 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
                   std::invalid_argument)
       << "weight type is not supported for custom tie word embedding layer";
 
-    if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K) {
-      ///@note The tied (embedding-shaped) weight is [vocab, hidden]. The fused
-      /// Q6_K GEMV computes logits[v] = input . weight[v] row-wise, which needs
-      /// no data transpose, and is ~2x faster per decode token than a per-row
-      /// dequantize+sdot loop. The lmhead output is forced FP32 (finalize);
-      /// cast a FP16 activation up to FP32 first so FloatTensor::dotQnK writes
-      /// FP32 logits directly (generate() reads them as float*).
-      nntrainer::Tensor input_fp32 =
-        (input_step.getDataType() == nntrainer::TensorDim::DataType::FP32)
-          ? input_step
-          : input_step.clone(nntrainer::TensorDim::DataType::FP32);
-      input_fp32.dot(weight, hidden_step, false, true);
-    } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0) {
-      ///@note Unlike Q6_K, the Q4_0 Qn_K dot does NOT transpose the block data
-      /// for the [vocab, hidden] tied layout, so compute each vocab row
-      /// explicitly: logits[v] = dot(input, dequant(weight_row_v)).
+    if (weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0) {
+      ///@note Q4_0 tensor dot does not support trans_in=true for the
+      /// embedding-shaped tied weight, so compute each vocab row explicitly.
       const unsigned int hidden_size = input_step.width();
       const unsigned int vocab_size = weight.height();
       NNTR_THROW_IF(weight.width() != hidden_size ||
@@ -360,17 +509,34 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
         << "Q4_0 tie word embedding lmhead has mismatched dimensions";
 
       const unsigned int num_blocks_per_row = (hidden_size + 32 - 1) / 32;
-      const size_t row_stride = (sizeof(uint16_t) + 16) * num_blocks_per_row;
+      const size_t row_size = sizeof(uint16_t) + 16;
+      const size_t row_stride = row_size * num_blocks_per_row;
       const uint8_t *weight_data = weight.getData<uint8_t>();
-
-      // The activation may be FP16; sdot/dequant work in FP32, so cast the
-      // single input row up to FP32 once (no-op when already FP32).
-      nntrainer::Tensor input_fp32 =
-        (input_step.getDataType() == nntrainer::TensorDim::DataType::FP32)
-          ? input_step
-          : input_step.clone(nntrainer::TensorDim::DataType::FP32);
-      const float *input_data = input_fp32.getData<float>();
-      float *logits = hidden_step.getData<float>();
+      // dtype-aware I/O: the hidden (input_step) and logits (hidden_step) are
+      // FP16 in an FP16-activation run. sdot/dequant operate in fp32, so read
+      // the hidden into an fp32 row and write each logit back as the output's
+      // dtype (writing fp32 into an fp16 buffer would corrupt it).
+      std::vector<float> input_f32;
+      const float *input_data;
+      if (input_step.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+        const _FP16 *in16 = input_step.getData<_FP16>();
+        input_f32.resize(hidden_size);
+        for (unsigned int k = 0; k < hidden_size; ++k)
+          input_f32[k] = static_cast<float>(in16[k]);
+        input_data = input_f32.data();
+#else
+        throw std::invalid_argument("FP16 hidden requires ENABLE_FP16");
+#endif
+      } else {
+        input_data = input_step.getData<float>();
+      }
+      const bool out_fp16 =
+        hidden_step.getDataType() == nntrainer::TensorDim::DataType::FP16;
+      float *logits = out_fp16 ? nullptr : hidden_step.getData<float>();
+#ifdef ENABLE_FP16
+      _FP16 *logits16 = out_fp16 ? hidden_step.getData<_FP16>() : nullptr;
+#endif
 
       auto &tm = nntrainer::ThreadManager::Global();
       const unsigned int compute_thread_num = tm.getComputeThreadCount();
@@ -382,13 +548,216 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
         std::vector<float> dequant_row(hidden_size);
 
         for (unsigned int row = start; row < end; ++row) {
-          const void *wrow =
-            static_cast<const void *>(weight_data + row_stride * row);
-          nntrainer::dequantize_row_q4_0(wrow, dequant_row.data(), hidden_size);
-          logits[row] =
+          nntrainer::dequantize_row_q4_0(
+            static_cast<const void *>(weight_data + row_stride * row),
+            dequant_row.data(), hidden_size);
+          const float val =
             nntrainer::sdot(hidden_size, input_data, 1, dequant_row.data(), 1);
+#ifdef ENABLE_FP16
+          if (out_fp16)
+            logits16[row] = static_cast<_FP16>(val);
+          else
+#endif
+            logits[row] = val;
         }
       });
+    } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K) {
+      // Q6_K manual lm_head. Mirror the Q4_0 path: dequant each vocab row to
+      // fp32, then sdot against the (single) input row. Avoids Tensor::dot,
+      // which can crash on gpu-context-allocated tensors when this layer is
+      // registered on the OpenCL context.
+      const unsigned int hidden_size = input_step.width();
+      const unsigned int vocab_size = weight.height();
+      NNTR_THROW_IF(weight.width() != hidden_size ||
+                      hidden_step.width() != vocab_size,
+                    std::invalid_argument)
+        << "Q6_K tie word embedding lmhead has mismatched dimensions";
+
+      const unsigned int num_blocks_per_row = (hidden_size + 256 - 1) / 256;
+      const size_t row_stride = 210 * num_blocks_per_row;
+      const uint8_t *weight_data = weight.getData<uint8_t>();
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // engine=cuda GPU Q6_K lm_head: reads the device FP16 hidden + (managed)
+      // Q6_K weight directly and writes FP16 logits to the device output -- no
+      // host bounce, so it works with a device-only activation pool
+      // (NNTR_CUDA_DEV_ACT) where the host GEMV below faults on the device-only
+      // hidden/logits. Gated on FP16 in/out that are device-resident; falls
+      // through to the host loop otherwise (OpenCL/CPU unaffected).
+      if (input_step.getDataType() == nntrainer::TensorDim::DataType::FP16 &&
+          hidden_step.getDataType() == nntrainer::TensorDim::DataType::FP16 &&
+          (hidden_size % 256) == 0) {
+#ifdef ENABLE_FP16
+        const _FP16 *hin = input_step.getData<_FP16>();
+        _FP16 *hout = hidden_step.getData<_FP16>();
+        const bool dev = hin && nntrainer::cuda::dev_accessible(hin);
+        if (dev && nntrainer::cuda::lmhead_gemv_q6_k_cuda(
+                     weight_data, reinterpret_cast<const unsigned short *>(hin),
+                     reinterpret_cast<unsigned short *>(hout), (int)vocab_size,
+                     (int)hidden_size))
+          return;
+#endif
+      }
+#endif
+
+      // dtype-aware I/O (see Q4_0 path above): FP16 hidden -> fp32 row; logits
+      // written back as the output tensor's dtype.
+      std::vector<float> input_f32;
+      const float *input_data;
+      if (input_step.getDataType() == nntrainer::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+        const _FP16 *in16 = input_step.getData<_FP16>();
+        input_f32.resize(hidden_size);
+        for (unsigned int k = 0; k < hidden_size; ++k)
+          input_f32[k] = static_cast<float>(in16[k]);
+        input_data = input_f32.data();
+#else
+        throw std::invalid_argument("FP16 hidden requires ENABLE_FP16");
+#endif
+      } else {
+        input_data = input_step.getData<float>();
+      }
+      const bool out_fp16 =
+        hidden_step.getDataType() == nntrainer::TensorDim::DataType::FP16;
+      float *logits = out_fp16 ? nullptr : hidden_step.getData<float>();
+#ifdef ENABLE_FP16
+      _FP16 *logits16 = out_fp16 ? hidden_step.getData<_FP16>() : nullptr;
+#endif
+
+      // Decode lm_head on the GPU: the host loop below streams the whole Q6_K
+      // table through the CPU every token, which is the dominant decode cost.
+      // Gated to GPU runs (NNTR_FC_INT8_GPU, the canonical GPU-FC lever) with
+      // NNTR_LMHEAD_GPU=0/1 as an explicit kill switch / opt-in; falls back to
+      // the host loop on any failure. The logits differ from the host loop
+      // only in fp32 summation order, so greedy token-ID equality is the
+      // validation gate.
+      static const int lmhead_gpu = []() {
+        if (const char *e = std::getenv("NNTR_LMHEAD_GPU"))
+          return std::atoi(e);
+        // Track the GPU-FC default: the lm_head GEMV is the dominant decode
+        // op, so leaving it off when NNTR_FC_INT8_GPU is unset costs about
+        // 40% of decode. Default on; =0 disables.
+        const char *fc = std::getenv("NNTR_FC_INT8_GPU");
+        return (!fc || std::atoi(fc) != 0) ? 1 : 0;
+      }();
+      bool gpu_done = false;
+#if defined(ENABLE_OPENCL)
+      // GPU Q6_K lm_head GEMV; falls through to the host loop (gpu_done stays
+      // false) on the no-OpenCL build.
+      if (lmhead_gpu != 0 && (hidden_size % 256) == 0) {
+        std::vector<float> logits_f32(vocab_size);
+        gpu_done = nntrainer::lmhead_gemv_q6_k_cl(
+          weight_data, input_data, logits_f32.data(), vocab_size, hidden_size);
+        if (gpu_done) {
+#ifdef ENABLE_FP16
+          if (out_fp16) {
+            for (unsigned int v = 0; v < vocab_size; ++v)
+              logits16[v] = static_cast<_FP16>(logits_f32[v]);
+          } else
+#endif
+          {
+            std::memcpy(logits, logits_f32.data(), sizeof(float) * vocab_size);
+          }
+        }
+      }
+#endif
+      (void)lmhead_gpu;
+
+      if (!gpu_done) {
+        auto &tm = nntrainer::ThreadManager::Global();
+        const unsigned int compute_thread_num = tm.getComputeThreadCount();
+        const unsigned int thread_num =
+          compute_thread_num == 0 ? 1 : compute_thread_num;
+        tm.parallel_for(0, static_cast<size_t>(thread_num), [=](size_t t) {
+          const unsigned int start = (t * vocab_size) / thread_num;
+          const unsigned int end = ((t + 1) * vocab_size) / thread_num;
+          std::vector<float> dequant_row(hidden_size);
+
+          for (unsigned int row = start; row < end; ++row) {
+            nntrainer::dequantize_row_q6_K(
+              static_cast<const void *>(weight_data + row_stride * row),
+              dequant_row.data(), hidden_size);
+            const float val = nntrainer::sdot(hidden_size, input_data, 1,
+                                              dequant_row.data(), 1);
+#ifdef ENABLE_FP16
+            if (out_fp16)
+              logits16[row] = static_cast<_FP16>(val);
+            else
+#endif
+              logits[row] = val;
+          }
+        });
+      }
+    } else if (weight.getDataType() == nntrainer::TensorDim::DataType::FP32) {
+      // Unquantized FP32 (passthrough) lm_head weight. Q6_K loses ~1.66 logit
+      // on the first-token argmax (the <think> vs garbage decision => a garbage
+      // "noise prefix" on Qwen3 thinking models); use a high-precision FP32-
+      // weight GPU GEMV (fp32 W x fp16 act, fp32 accumulate) that matches the
+      // HF reference. Falls back to the generic Tensor::dot on any failure.
+      const unsigned int hidden_size = input_step.width();
+      const unsigned int vocab_size = weight.height();
+      const bool out_fp16 =
+        hidden_step.getDataType() == nntrainer::TensorDim::DataType::FP16;
+      static const int lmhead_gpu_fp32 = []() {
+        if (const char *e = std::getenv("NNTR_LMHEAD_GPU"))
+          return std::atoi(e);
+        const char *fc = std::getenv("NNTR_FC_INT8_GPU");
+        return (fc && std::atoi(fc) != 0) ? 1 : 0;
+      }();
+      bool gpu_done = false;
+      // lmhead_gemv_fp32w_cl is only declared/defined under ENABLE_OPENCL
+      // (blas_kernels.h is included behind that guard above). Requiring
+      // ENABLE_OPENCL here too keeps the FP16-but-no-OpenCL build (e.g. the
+      // CPU/HTP libnntrainer) compiling: gpu_done stays false and the host
+      // lm_head path below runs.
+#if defined(ENABLE_FP16) && defined(ENABLE_OPENCL)
+      if (lmhead_gpu_fp32 != 0 &&
+          input_step.getDataType() == nntrainer::TensorDim::DataType::FP16 &&
+          weight.width() == hidden_size && hidden_step.width() == vocab_size) {
+        std::vector<float> logits_f32(vocab_size);
+        gpu_done = nntrainer::lmhead_gemv_fp32w_cl(
+          static_cast<const void *>(weight.getData<float>()),
+          static_cast<const void *>(input_step.getData<_FP16>()),
+          logits_f32.data(), vocab_size, hidden_size);
+        if (gpu_done) {
+          if (out_fp16) {
+            _FP16 *o = hidden_step.getData<_FP16>();
+            for (unsigned int v = 0; v < vocab_size; ++v)
+              o[v] = static_cast<_FP16>(logits_f32[v]);
+          } else {
+            std::memcpy(hidden_step.getData<float>(), logits_f32.data(),
+                        sizeof(float) * vocab_size);
+          }
+        }
+      }
+#endif
+      if (!gpu_done) {
+        // All-FP32 case (FP32 weight AND FP32 act/logits): raw CPU BLAS on
+        // the already host-lowered buffers instead of Tensor::dot. dot()
+        // dispatches the tensors' ATTACHED op table, which on an engine=gpu
+        // graph is ClComputeOps -- it derives the abstract ComputeOps
+        // directly, so every raw-pointer BLAS virtual it does not override
+        // (sgemv_fp32 / sgemm_fp32 among them) is a loud not-implemented
+        // throw, and the FP32 lm_head died on any GPU-engine run. Same math
+        // as dotFloat's sgemm(RowMajor, N, T) call; this function is a
+        // designed host-compute boundary, so calling the CPU BLAS entry
+        // point directly is the honest expression of what already happens
+        // here -- not a silent fallback smuggled into the GPU op table.
+        if (input_step.getDataType() == nntrainer::TensorDim::DataType::FP32 &&
+            !out_fp16 && weight.width() == hidden_size &&
+            hidden_step.width() == vocab_size) {
+          const unsigned int rows =
+            input_step.batch() * input_step.channel() * input_step.height();
+          const unsigned int order = static_cast<unsigned int>(
+            ml::train::TensorDim::StorageOrder::ROW_MAJOR);
+          nntrainer::sgemm(order, false, true, rows, vocab_size, hidden_size,
+                           1.0f, input_step.getData<float>(), hidden_size,
+                           weight.getData<float>(), hidden_size, 0.0f,
+                           hidden_step.getData<float>(), vocab_size);
+        } else {
+          input_step.dot(weight, hidden_step, false, true);
+        }
+      }
     } else {
       input_step.dot(weight, hidden_step, false, true);
     }
