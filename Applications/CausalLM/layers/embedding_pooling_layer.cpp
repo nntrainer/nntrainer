@@ -10,6 +10,7 @@
  * @bug     No known bugs except for NYI items
  */
 
+#include <compute_ops.h>
 #include <embedding_pooling_layer.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
@@ -93,6 +94,9 @@ void EmbeddingPoolingLayer::forwarding(nntrainer::RunLayerContext &context,
 
       nntrainer::Tensor dest =
         output.getSharedDataTensor({1, 1, 1, dim}, b * dim);
+      // Pure row copy: copyData already dispatches through the op table
+      // (ComputeOps::scopy_fp32), which every backend including OpenCL
+      // implements, so this mode needs no new op.
       dest.copyData(source);
     }
   } else if (mode_mean) {
@@ -102,8 +106,11 @@ void EmbeddingPoolingLayer::forwarding(nntrainer::RunLayerContext &context,
       nntrainer::Tensor dest =
         output.getSharedDataTensor({1, 1, 1, dim}, b * dim);
 
-      // Calculate mean along average dim (height/seq_len)
-      dest.copyData(source.average(2));
+      // Calculate mean along average dim (height/seq_len). Dispatched through
+      // the op table: Tensor::average(2) resolves to sgemv_fp32, which the
+      // OpenCL backend does not implement, so it threw on a gpu-context tensor.
+      // getOps() comes from the context-owned `input`, not a local Tensor.
+      input.getOps()->mean_rows(source, dest, seq_len, 0);
     }
   } else {
     output.setZero();
@@ -145,7 +152,8 @@ void EmbeddingPoolingLayer::incremental_forwarding(
       nntrainer::Tensor dest =
         output.getSharedDataTensor({1, 1, 1, dim}, b * dim);
 
-      dest.copyData(source.average(2));
+      // Op-table dispatch, as in forwarding() above.
+      input.getOps()->mean_rows(source, dest, len, 0);
     }
   } else {
     output.setZero();

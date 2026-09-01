@@ -35,6 +35,24 @@
 
 namespace nntrainer {
 
+// Per-channel int4 (qai8dxp x qsi4cxp) GEMM entry points. cpu_backend.h
+// declares the same templates for callers that go through the neutral header;
+// they are repeated here for translation units that include only this backend
+// header. The specializations live in arm_compute_backend_fp16.cpp.
+template <typename T = float>
+uint32_t nntr_gemm_qai8dxp_qsi4cxp_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales, T *dst_mtx, bool transB = true,
+  T lower_bound = std::numeric_limits<T>::lowest(),
+  T upper_bound = std::numeric_limits<T>::max());
+
+template <typename T = float>
+void nntr_gemm_qai8dxp_qsi4cxp_packed(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f32,
+  void *rhs_packed_mtx_qs4cx, T *dst_act_mtx_f32, uint32_t idx_variant,
+  bool transB = true, T lower_bound = std::numeric_limits<T>::lowest(),
+  T upper_bound = std::numeric_limits<T>::max());
+
 #ifdef ENABLE_FP16
 /**
  * @brief F32 * F16 = F32 GEMM

@@ -139,13 +139,15 @@ public:
    * @param size Size of the SVM memory region to be mapped
    * @param read_only Flag indicating whether the SVM memory should be mapped
    * for read-only access (true) or read-write access (false).
+   * @param async Enqueue the map without blocking the host. Only sound on an
+   * in-order queue when the region is next touched by another device
+   * operation, never by the host. Defaults to the blocking behaviour.
    * @param event Optional event object that can be used to query or wait for
-   * the mapping operation to complete. If not provided, the mapping will be
-   * blocking.
+   * the mapping operation to complete.
    * @return true if mapping is successful, false otherwise.
    */
   bool enqueueSVMMap(void *svm_ptr, size_t size, bool read_only,
-                     cl_event *event = nullptr);
+                     bool async = false, cl_event *event = nullptr);
 
   /**
    * @brief Enqueue SVM memory unmap operation.

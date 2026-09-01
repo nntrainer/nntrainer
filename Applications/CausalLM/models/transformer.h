@@ -35,9 +35,13 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <algorithm> // std::min (prefillChunk clamp)
+#include <context.h> // nntrainer::ModelFeatures (T11)
+#include <future>    // async tokenizer load (round-13 init overlap)
 #include <layer.h>
 #include <map>
 #include <model.h>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <tensor_api.h>
@@ -47,6 +51,7 @@
 #include <limits.h>
 
 #include "json.hpp"
+#include "kv_ring.h" // kvRingCap / effectivePrefillChunk (shared with mha_core)
 #include "performance_metrics.h"
 #include <fstream>
 #include <tokenizers_c.h>
@@ -233,6 +238,96 @@ public:
   virtual int getKvLen() const { return 0; }
 
   /**
+   * @brief Per-layer KV-cache width (num_kv_heads * head_dim) for the layer.
+   * @details The single per-model degree of freedom the generic
+   * allocateAndBindKVCache needs: uniform-geometry models use this default,
+   * variable-geometry models (whose sliding and global layers carry different
+   * head dims / KV head counts) override it. Lets one base allocate/bind serve
+   * every model instead of a per-model copy of the whole routine.
+   */
+  virtual unsigned int getKVCacheWidth(int layer_id) const {
+    (void)layer_id;
+    return static_cast<unsigned int>(NUM_KEY_VALUE_HEADS) *
+           static_cast<unsigned int>(HEAD_DIM);
+  }
+
+  /**
+   * @brief The prefill chunk this model actually runs, in query rows
+   *        (0 = no chunking / single-block prefill).
+   * @details requestedPrefillChunk() is only the request; one chunk is fed at
+   * input row 0 of the activation plane, which is built INIT_SEQ_LEN rows tall
+   * (transformer.cpp constructModel), so a larger chunk would overflow it. The
+   * clamp therefore belongs to the model, which is the only thing that knows
+   * its plane -- and every consumer must read the SAME clamped number:
+   *
+   *   - the prompt budget (a chunked prefill is bounded by the KV budget, an
+   *     unchunked one by the plane),
+   *   - the prefill drive loop (chunk length per forward),
+   *   - the KV ring capacity (Wcap is a multiple of the chunk).
+   *
+   * They used to disagree: the drive loop and the budget gate keyed off the
+   * NNTR_PREFILL_CHUNK env var being SET, so the ring's auto-chunk turned on
+   * the ring but not the chunking, and a long prompt was silently truncated to
+   * INIT_SEQ_LEN; the ring cap meanwhile used the unclamped request and
+   * over-allocated. One accessor, one answer.
+   */
+  unsigned int prefillChunk() const {
+    return effectivePrefillChunk(static_cast<unsigned int>(INIT_SEQ_LEN));
+  }
+
+  /**
+   * @brief Per-layer physical KV-cache row count.
+   * @details The row counterpart of getKVCacheWidth(). Every KV sizing site --
+   * each model's placeholder factory and the KVCacheManager allocation -- must
+   * agree on how many rows a layer's cache has, and hard-coding MAX_SEQ_LEN in
+   * each of them made "how many rows" un-answerable from one place.
+   *
+   * A sliding-window layer under the KV ring stores only kvRingCap() rows;
+   * every other layer keeps the full context window.
+   */
+  unsigned int getKVCacheRows(int layer_id) const {
+    // The layer side (mha_core::finalize) reaches the same verdict by feeding
+    // the same two facts to the same predicate: usesAttentionSink() is the
+    // model's answer to mha_core's `use_sink` property, and this cache IS the
+    // external one mha_core is handed. Neither side re-derives the rule.
+    const unsigned int cap =
+      kvRingLayerEligible(usesAttentionSink(), /*external_cache=*/true)
+        ? kvRingCap(getLayerSlidingWindow(layer_id),
+                    static_cast<unsigned int>(MAX_SEQ_LEN), prefillChunk())
+        : 0u;
+    return cap ? cap : static_cast<unsigned int>(MAX_SEQ_LEN);
+  }
+
+  /**
+   * @brief Whether this model's attention is the attention-sink variant.
+   * @details The sink variant reads the cache through the host compute path,
+   * which walks absolute rows and cannot read a ringed cache. This is the
+   * single fact the ring rule needs from the model; mha_core asks the same
+   * question of its `use_sink` property and feeds the answer to the same
+   * kvRingLayerEligible(), so the two cannot drift. It replaces the former
+   * kvRingSupported(), which asked about the ring rather than about the model
+   * and so restated a conclusion each side had to derive for itself.
+   */
+  virtual bool usesAttentionSink() const { return false; }
+
+  /**
+   * @brief Per-layer attention window: the value this model feeds mha_core's
+   *        `sliding_window` property for the layer, or UINT_MAX for a
+   *        full-attention layer.
+   * @details Every model already decided this inside its createAttention
+   * override, where nothing outside could see it. Host-side sizing decisions
+   * that must agree with the layer's window (KV-cache capacity being the one
+   * that matters) need the same answer, so the choice lives here and the
+   * createAttention overrides read it. The default is the base pattern rule
+   * (every SLIDING_WINDOW_PATTERN-th layer is full attention); models with a
+   * layer_types table or a fixed window override it.
+   */
+  virtual unsigned int getLayerSlidingWindow(int layer_id) const {
+    return ((layer_id + 1) % SLIDING_WINDOW_PATTERN) ? SLIDING_WINDOW
+                                                     : UINT_MAX;
+  }
+
+  /**
    * @brief Get TransformerPerformanceMetrics
    */
   TransformerPerformanceMetrics getPerformanceMetrics() const {
@@ -251,9 +346,36 @@ public:
   unsigned int getVocabSize() const { return NUM_VOCAB; }
 
   /**
+   * @brief Override the max number of new tokens for subsequent run() calls
+   * @param num_to_generate Max new tokens per run; must leave room within
+   *        MAX_SEQ_LEN (run() caps the prompt to MAX_SEQ_LEN - NUM_TO_GENERATE)
+   */
+  void setNumToGenerate(unsigned int num_to_generate) {
+    NUM_TO_GENERATE = static_cast<int>(num_to_generate);
+  }
+
+  /**
+   * @brief Get the configured max number of new tokens per run
+   */
+  unsigned int getNumToGenerate() const {
+    return static_cast<unsigned int>(NUM_TO_GENERATE);
+  }
+
+  /**
    * @brief Get tokenizer owned by this model, or nullptr if no tokenizer exists
    */
-  tokenizers::Tokenizer *getTokenizer() { return tokenizer.get(); }
+  tokenizers::Tokenizer *getTokenizer() {
+    ensureTokenizer();
+    return tokenizer.get();
+  }
+
+  /**
+   * @brief Join the async tokenizer load (round-13 init overlap: the ~30MB
+   *        tokenizer.json parse runs on a side thread concurrent with graph
+   *        compile + weight load; call this before any direct `tokenizer`
+   *        member access). Idempotent and cheap after the first call.
+   */
+  void ensureTokenizer();
 
   /**
    * @brief Attach a non-owning logits processor
@@ -323,6 +445,17 @@ protected:
                            Tensor input);
 
   /**
+   * @brief Declare WHAT THIS MODEL IS as a flat ModelFeatures struct (mlp kind,
+   *        q/k/v-norm, sliding window, KV-share, PLE, soft-caps, lm_head,
+   * decode path, ...). The resolver pairs it with the backend's DeviceCaps to
+   *        produce an ExecPlan, replacing per-model-identity branching. Base
+   *        returns the defaults; each {Model}Transformer overrides it.
+   */
+  virtual nntrainer::ModelFeatures getModelFeatures() const {
+    return nntrainer::ModelFeatures{};
+  }
+
+  /**
    * @brief Create the per-layer external KV-cache placeholder Tensors that
    *        feed mha_core's input slots 3 and 4. The actual storage is owned
    *        by the host (e.g. KVCacheManager) and is bound at runtime via
@@ -333,8 +466,27 @@ protected:
    *                  the KV head count)
    * @return {cache_k, cache_v} symbolic placeholder tensors
    */
-  std::pair<Tensor, Tensor> createKVCachePlaceholders(const int layer_id,
-                                                      int n_heads);
+  virtual std::pair<Tensor, Tensor>
+  createKVCachePlaceholders(const int layer_id, int n_heads);
+
+  /**
+   * @brief Wire the attention core's KV cache: 3-input internal-int8 mode
+   *        when use_int8, else 5-input external-fp16 mode with per-layer
+   *        placeholders. The placeholder factory is virtual
+   *        (createKVCachePlaceholders) so a model with a non-uniform cache
+   *        width overrides it instead of re-implementing the wiring.
+   *        Consolidates the if/else previously duplicated across every
+   *        per-model createAttention override.
+   * @param layer_id  attention layer index
+   * @param n_heads   total query heads (passed through to
+   *                  createKVCachePlaceholders)
+   * @param mha       the mha_core layer handle to invoke
+   * @param q,k,v     query/key/value tensors to feed mha_core
+   * @param use_int8  true selects the 3-input internal-int8 cache mode
+   * @return attention output tensor
+   */
+  Tensor wireAttentionKVCache(const int layer_id, int n_heads, LayerHandle mha,
+                              Tensor q, Tensor k, Tensor v, bool use_int8);
 
   /**
    * @brief register CustomLayers
@@ -357,6 +509,9 @@ protected:
 
   /** tokenizer */
   std::unique_ptr<tokenizers::Tokenizer> tokenizer;
+  std::future<std::unique_ptr<tokenizers::Tokenizer>>
+    tokenizer_future_;            /**< async load; joined by ensureTokenizer */
+  std::mutex tokenizer_join_mtx_; /**< ensureTokenizer idempotence guard */
 
   unsigned int NUM_VOCAB;
   int DIM;
@@ -374,6 +529,19 @@ protected:
   std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
   std::string EMBEDDING_FILE_NAME;
   std::string PLE_FILE_NAME;
+  /** nntr_quantize --ple_sidecar / --embd_sidecar: save() writes the table to
+   *  these paths instead of the model file (extraction-time keys, not runtime
+   *  ones) */
+  std::string PLE_SIDECAR_EXPORT;
+  std::string EMBD_SIDECAR_EXPORT;
+  /** untie lm_head from the input embedding (separate FC weight, not shared
+   *  with the embedding table). Lives here (not CausalLM) because embedding0's
+   *  layer-type choice — tied TieWordEmbedding vs untied embedding_layer —
+   *  happens in <model>Transformer::constructModel scope. A dedicated flag
+   *  (not derived from LMHEAD_DTYPE) so the quantizer builds the same untied
+   *  graph from FP32 source weights while the dtype map quantizes
+   *  output_of_causallm on save. */
+  bool LMHEAD_UNTIE = false;
 
   unsigned int SLIDING_WINDOW = UINT_MAX;
   unsigned int SLIDING_WINDOW_PATTERN = 5;

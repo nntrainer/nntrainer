@@ -8,7 +8,7 @@ It supports *inference* mode (text generation) on various devices, including And
 - **Standalone Application (`nntr_causallm`)**: A command-line tool to load models and generate text.
 - **C API (Optional)**: A lightweight C interface (`libcausallm_api.so`) for integrating LLM capabilities into other applications (e.g., Android JNI, iOS, or other C/C++ apps).
 - **Core Library**: The core implementation is separated into `libcausallm_core.so` for modularity.
-- **Supported Backends**: CPU, with GPU/NPU support planned.
+- **Supported Backends**: CPU and **GPU (OpenCL)** — Adreno (Android) and Intel Arc (x86). See [README_GPU.md](README_GPU.md) for GPU build/run/env, per-platform performance, and tuning. NPU support is planned.
 
 ## Supported models
 

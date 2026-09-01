@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <gtest/gtest.h>
 #include <string>
+#include <vector>
 
 #include <kv_cache_manager.h>
 #include <tensor.h>
@@ -313,6 +314,118 @@ TEST_F(KVCacheManagerTest, typical_inference_flow) {
   float *kd = k_full.getData<float>();
   EXPECT_FLOAT_EQ(kd[0], 0.0f); // l=0, b=0, i=0
   EXPECT_FLOAT_EQ(kd[1], 1.0f); // l=0, b=0, i=1
+}
+
+/**
+ * @brief [kv-share] A layer declared as sharing an earlier layer's KV must end
+ *        up ALIASING that layer's storage -- same address, full dimensions,
+ *        never empty. Getting this wrong the other way (an empty or null slab)
+ *        does not crash: getKeyCache(i).getData() returns nullptr, the graph
+ *        binds it, and attention silently reads zeros. So the post-conditions
+ *        pinned here are "non-null" and "identical to the source", not merely
+ *        "allocate() returned".
+ */
+TEST(KVCacheManagerShare, shared_layers_alias_the_source_plane) {
+  constexpr unsigned int LAYERS = 6;
+  constexpr unsigned int BATCH = 2;
+  constexpr unsigned int SEQ = 32;
+  constexpr unsigned int HEADS_KV = 2;
+  constexpr unsigned int HEAD_D = 4;
+
+  causallm::KVCacheManager m;
+  // layers 0..2 own their cache; 3->1, 4->0, 5->1 (sources strictly earlier,
+  // and one source feeding two sharers).
+  m.setLayerKVSources({-1, -1, -1, 1, 0, 1});
+  m.allocate(LAYERS, BATCH, SEQ, HEADS_KV, HEAD_D,
+             ml::train::TensorDim::DataType::FP32);
+
+  const std::vector<int> expect = {-1, -1, -1, 1, 0, 1};
+  for (unsigned int l = 0; l < LAYERS; ++l) {
+    EXPECT_EQ(m.getLayerKVSource(l), expect[l]) << "layer=" << l;
+
+    // No layer -- shared or not -- may present an empty/null cache.
+    ASSERT_NE(m.getKeyCache(l).getData<float>(), nullptr) << "layer=" << l;
+    ASSERT_NE(m.getValueCache(l).getData<float>(), nullptr) << "layer=" << l;
+    EXPECT_EQ(m.getKeyCache(l).getDim(), m.getKeyCache(0).getDim());
+    EXPECT_EQ(m.getValueCache(l).getDim(), m.getValueCache(0).getDim());
+    EXPECT_EQ(m.getKeyCache(l).bytes(), static_cast<size_t>(BATCH) * SEQ *
+                                          HEADS_KV * HEAD_D * sizeof(float));
+  }
+
+  for (unsigned int l = 0; l < LAYERS; ++l) {
+    const int src = m.getLayerKVSource(l);
+    if (src < 0)
+      continue;
+    EXPECT_EQ(m.getKeyCache(l).getData<float>(),
+              m.getKeyCache(static_cast<unsigned int>(src)).getData<float>())
+      << "layer=" << l;
+    EXPECT_EQ(m.getValueCache(l).getData<float>(),
+              m.getValueCache(static_cast<unsigned int>(src)).getData<float>())
+      << "layer=" << l;
+  }
+
+  // Distinct owners stay distinct -- aliasing must not collapse everything.
+  EXPECT_NE(m.getKeyCache(0).getData<float>(),
+            m.getKeyCache(1).getData<float>());
+  EXPECT_NE(m.getKeyCache(0).getData<float>(),
+            m.getValueCache(0).getData<float>());
+
+  // The alias is the same memory in both directions: this is what makes the
+  // shared layer's (redundant, byte-identical) write harmless.
+  m.getKeyCache(1).getData<float>()[7] = 42.0f;
+  EXPECT_FLOAT_EQ(m.getKeyCache(3).getData<float>()[7], 42.0f);
+  m.getKeyCache(5).getData<float>()[7] = -1.5f;
+  EXPECT_FLOAT_EQ(m.getKeyCache(1).getData<float>()[7], -1.5f);
+  EXPECT_FLOAT_EQ(m.getKeyCache(3).getData<float>()[7], -1.5f);
+}
+
+/**
+ * @brief [kv-share] An unusable source map must be rejected at allocate(),
+ *        before any memory is requested -- a forward/self reference would
+ *        alias a not-yet-allocated (empty) plane, and a geometry mismatch
+ *        would reinterpret the source's rows. Both fail silently at runtime.
+ */
+TEST(KVCacheManagerShare, rejects_unusable_source_maps) {
+  {
+    causallm::KVCacheManager m;
+    m.setLayerKVSources({-1, 2, -1, -1}); // forward reference
+    EXPECT_THROW(m.allocate(4, 1, 16, 2, 4), std::invalid_argument);
+  }
+  {
+    causallm::KVCacheManager m;
+    m.setLayerKVSources({-1, 1, -1, -1}); // self reference
+    EXPECT_THROW(m.allocate(4, 1, 16, 2, 4), std::invalid_argument);
+  }
+  {
+    causallm::KVCacheManager m;
+    m.setLayerKVSources({-1, -1}); // size != num_layers
+    EXPECT_THROW(m.allocate(4, 1, 16, 2, 4), std::invalid_argument);
+  }
+  {
+    causallm::KVCacheManager m;
+    m.setLayerKVSources({-1, 0}); // width(1) != width(0)
+    EXPECT_THROW(m.allocate(2, 1, 16, std::vector<unsigned int>{8u, 16u},
+                            ml::train::TensorDim::DataType::FP32),
+                 std::invalid_argument);
+  }
+}
+
+/**
+ * @brief [kv-share] The default (no setLayerKVSources call) must stay exactly
+ *        what it always was: every layer owns a private plane.
+ */
+TEST(KVCacheManagerShare, no_declaration_means_no_aliasing) {
+  causallm::KVCacheManager m;
+  m.allocate(3, 1, 16, 2, 4, ml::train::TensorDim::DataType::FP32);
+  for (unsigned int l = 0; l < 3; ++l) {
+    EXPECT_EQ(m.getLayerKVSource(l), -1);
+    EXPECT_FALSE(m.isLayerKVAliased(l));
+    ASSERT_NE(m.getKeyCache(l).getData<float>(), nullptr);
+  }
+  EXPECT_NE(m.getKeyCache(0).getData<float>(),
+            m.getKeyCache(1).getData<float>());
+  EXPECT_NE(m.getKeyCache(1).getData<float>(),
+            m.getKeyCache(2).getData<float>());
 }
 
 int main(int argc, char **argv) {

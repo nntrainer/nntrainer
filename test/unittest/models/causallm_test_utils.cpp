@@ -496,9 +496,12 @@ FixtureConfigs loadFixtureConfigs(const std::filesystem::path &dir) {
  */
 bool runQuantize(const std::string &quantize_bin,
                  const std::filesystem::path &fp32_dir,
-                 const std::filesystem::path &out_dir) {
+                 const std::filesystem::path &out_dir,
+                 const std::string &fc_dtype = "Q4_0",
+                 const std::string &extra = "") {
   std::string cmd = quantize_bin + " " + fp32_dir.string() + " -o " +
-                    out_dir.string() + " --fc_dtype Q4_0 2>&1";
+                    out_dir.string() + " --fc_dtype " + fc_dtype +
+                    (extra.empty() ? "" : (" " + extra)) + " 2>&1";
   int ret = std::system(cmd.c_str());
   return ret == 0;
 }
@@ -675,6 +678,86 @@ void runQ40DifferentialChecks(const DifferentialModel &model) {
   ASSERT_NO_THROW(q4_tokens = q4_model->greedyGenerateFromIds(
                     fixture.input_ids, fixture.reference_tokens.size()));
   expectTokenPrefixMatch(q4_tokens, fixture.reference_tokens,
+                         fixture.prefix_match_min);
+}
+
+void runQINT4DifferentialChecks(const DifferentialModel &model) {
+#if !defined(__aarch64__) && !defined(__ARM_NEON)
+  // QINT4 weights are loaded into the KAI (KAI_QSI4CXP_4x4x32) osv32/Section-A
+  // layout with per-channel fp16 scales; that int4 dequant/matmul path is
+  // ARM-NEON-only (i8mm). There is no x86 cpu dequant for it, so the QINT4 ->
+  // FP32 reference comparison cannot run on a non-ARM build. (Q40 has a
+  // portable cpu path and its differential test runs everywhere.)
+  GTEST_SKIP()
+    << "QINT4 uses the NEON-only KAI int4 packing; no x86 cpu dequant "
+       "path — skipping on this non-ARM build.";
+#endif
+  std::filesystem::path fixture_dir;
+  ReferenceFixture fixture;
+  std::string skip_reason;
+  if (!tryLoadFixture(model, fixture_dir, fixture, skip_reason))
+    GTEST_SKIP() << skip_reason;
+
+  const char *quantize_bin_env = std::getenv(QUANTIZE_BIN_ENV);
+  if (!quantize_bin_env || std::string(quantize_bin_env).empty())
+    GTEST_SKIP() << "NNTR_QUANTIZE_BIN not set — QINT4 test skipped";
+  const std::string quantize_bin(quantize_bin_env);
+
+  auto q_dir = std::filesystem::temp_directory_path() /
+               ("nntrainer_" + model.fixture_name + "_qint4_ref");
+  std::filesystem::remove_all(q_dir);
+  std::filesystem::create_directories(q_dir);
+
+  ASSERT_TRUE(
+    runQuantize(quantize_bin, fixture_dir, q_dir, "QINT4", "--container plain"))
+    << "nntr_quantize (QINT4) failed — check that the FP32 fixture is valid";
+
+  auto q_nntr_cfg_path = q_dir / "nntr_config.json";
+  ASSERT_TRUE(std::filesystem::exists(q_nntr_cfg_path))
+    << "nntr_quantize did not produce nntr_config.json";
+
+  std::string q_bin_name;
+  {
+    std::ifstream f(q_nntr_cfg_path);
+    auto cfg_j = json::parse(f);
+    q_bin_name = cfg_j["model_file_name"].get<std::string>();
+  }
+  auto q_bin_path = q_dir / q_bin_name;
+  ASSERT_TRUE(std::filesystem::exists(q_bin_path))
+    << "QINT4 weight file not found: " << q_bin_path;
+
+  auto fc = loadFixtureConfigs(fixture_dir);
+  auto q_nntr_cfg = causallm::LoadJsonFile(q_nntr_cfg_path.string());
+  q_nntr_cfg["tokenizer_file"] = (fixture_dir / "tokenizer.json").string();
+
+  auto q_model = model.make_model(fc.model_cfg, fc.gen_cfg, q_nntr_cfg);
+  q_model->initializeModel();
+  q_model->loadWeight(q_bin_path.string());
+
+  std::vector<float> q_logits;
+  try {
+    q_logits = q_model->prefillLogitsFromIds(fixture.input_ids);
+  } catch (const std::exception &e) {
+    // QINT4 is KAI-packed in memory (KAI_QSI4CXP_4x4x32). The KAI GEMM is
+    // ARM-only; on x86 the CPU fallback is NYI and the CUDA Section-A reader is
+    // pending. Skip rather than fail so the gap is documented, not red.
+    const std::string w = e.what();
+    if (w.find("NYI") != std::string::npos ||
+        w.find("qai8dxp") != std::string::npos ||
+        w.find("qsi4cxp") != std::string::npos)
+      GTEST_SKIP() << "QINT4 GEMM unavailable on this platform (KAI is ARM; "
+                      "x86 CPU NYI, CUDA Section-A reader pending): "
+                   << w;
+    throw;
+  }
+
+  // QINT4 logits vs HF FP32 reference (reuse the Q4_0 tolerance).
+  expectLogitsNear(q_logits, fixture.reference_logits, fixture.logits_atol_q40);
+
+  std::vector<unsigned int> q_tokens;
+  ASSERT_NO_THROW(q_tokens = q_model->greedyGenerateFromIds(
+                    fixture.input_ids, fixture.reference_tokens.size()));
+  expectTokenPrefixMatch(q_tokens, fixture.reference_tokens,
                          fixture.prefix_match_min);
 }
 

@@ -24,24 +24,120 @@
 #include <app_context.h>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <engine.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <compute_ops.h>
+#include <env_compat.h> // nntr_env_on: value-checked read of auto-injected flags
+#include <neuralnet.h>
+
+#if defined(ENABLE_OPENCL)
+#include <cl_context.h> // OpenCL-only; registration uses the Engine facade.
+#endif
 #include <common.h>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context.h>
+#endif
 #include <layer_context.h>
-#include <lm_head.h>
 #include <mha_core.h>
 #include <nntrainer_error.h>
+#include <nntrainer_log.h>
+#include <reshaped_rms_norm.h>
+#include <residency_policy.h>
+#include <rms_reverse_norm.h>
 #include <tensor.h>
 
 #include <causal_lm.h>
 #include <llm_util.hpp>
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context_manager.h>
+#include <cuda_elementwise.h>
+#include <cuda_runtime.h>
+#include <cuda_stream_manager.h>
+#endif
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+namespace nntrainer::cuda {
+// Frees all cuBLAS int8 caches at the prefill -> decode boundary.
+void cuda_fc_qs4cx_free_i8_caches();
+} // namespace nntrainer::cuda
+
+namespace {
+// On-GPU greedy argmax. incrementalInference()
+// stashes the DEVICE-resident lm_head logits pointer + dtype here (the tensor
+// data, before the host copy), so generate() can reduce it to the 4-byte token
+// id on the GPU instead of running host std::max_element over the full-vocab
+// D->H copy. One batch row (BATCH_SIZE==1 only, like the CL argmax gating).
+// Reset every call; valid only when the FP32/FP16 output was confirmed
+// device-accessible.
+const void *g_cuda_logits_dev = nullptr;
+bool g_cuda_logits_fp16 = false;
+bool cuda_argmax_enabled() {
+  // NNTR_CUDA_DEV_ARGMAX, default ON with =0 opting out. The reduction is
+  // numerically identical to the host one it replaces (same fp32 values, ties
+  // to the lowest index), so there is nothing to trade off per lane; it just
+  // has to be on to be worth anything.
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_CUDA_DEV_ARGMAX");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+// Deferred host logits.
+//
+// Greedy decoding reads exactly ONE number out of the lm_head output, but the
+// output conversion below materializes the whole [vocab] row on the host every
+// token: a 1MB allocation, a 524KB D2H, and an fp16->fp32 pass over 262144
+// elements -- all of it discarded after a max_element. When the previous
+// generate() was greedy, incrementalInference skips that work and records here
+// what it skipped. generate() then either takes the on-GPU token (the normal
+// case) or, if anything about this call disqualifies the device path,
+// materializes the row itself from the stashed pointer. The greedy flag is a
+// HINT, never a correctness input: a wrong guess costs a deferred conversion,
+// it cannot produce a wrong token or an unfilled read.
+struct PendingLogits {
+  const void *dev = nullptr; /**< device/managed logits row */
+  float *host = nullptr;     /**< caller-owned destination, not yet filled */
+  size_t count = 0;
+  bool fp16 = false;
+};
+PendingLogits g_pending_logits;
+bool g_greedy_hint = false;
+
+/** @brief Fill the deferred host row (no-op unless one is outstanding). */
+void materialize_pending_logits() {
+  PendingLogits p = g_pending_logits;
+  g_pending_logits = PendingLogits{};
+  if (p.dev == nullptr || p.host == nullptr)
+    return;
+  nntrainer::cuda::StreamManager::Global().finish();
+  if (p.fp16) {
+#ifdef ENABLE_FP16
+    std::vector<_FP16> stage(p.count);
+    cudaMemcpy(stage.data(), p.dev, p.count * sizeof(_FP16),
+               cudaMemcpyDeviceToHost);
+    nntrainer::getComputeOps()->scopy_fp16_to_fp32(p.count, stage.data(), 1,
+                                                   p.host, 1);
+#endif
+  } else {
+    cudaMemcpy(p.host, p.dev, p.count * sizeof(float), cudaMemcpyDeviceToHost);
+  }
+  cudaGetLastError();
+}
+} // namespace
+#endif
+
 #include <utf8_stream_util.h>
 
 #include "api/streamer.h"
@@ -50,6 +146,32 @@ namespace causallm {
 
 CausalLM::CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg) :
   Transformer(cfg, generation_cfg, nntr_cfg, ModelType::CAUSALLM) {
+  // Declare CausalLM's static-residency boundaries so the core planner
+  // (tensor_pool / manager) needs no app-specific tensor/layer names. These are
+  // byte-identical to the former hardcoded core defaults: the embedding output
+  // is host-produced but uploaded to cl_mem (RAISE), the final norm output is
+  // GPU-produced but read back once by the host lm_head (LOWER), and mha_core
+  // is a CPU-registered layer that binds/consumes Q/K/V on the GPU plane
+  // (engine- neutral). NNTR_CLMEM_RAISE/LOWER still override the raise/lower
+  // patterns.
+  auto &rp = nntrainer::ResidencyPolicy::global();
+#ifndef _WIN32
+  if (rp.raise_patterns.empty())
+    rp.raise_patterns = "embedding0:out0";
+#else
+  // The embedding-output RAISE (host-written per token, then
+  // uploaded to the cl_mem plane) is the single tensor whose cl_mem binding
+  // makes Windows/Intel runs nondeterministic: keep-one bisection over every
+  // GPU_CLMEM class reproduced run-to-run divergence ONLY here, and excluding
+  // just this tensor is bit-reproducible 6/6 with NO drain at baseline cost
+  // (2079/18.5 vs base 2075/18.2 — zero). The raise's own rationale (layer0
+  // coarse-SVM ingress) did not reproduce in any of those runs. Keep the
+  // embedding on SVM on Windows; NNTR_CLMEM_RAISE overrides for A/B.
+#endif
+  if (rp.lower_patterns.empty())
+    rp.lower_patterns = "output_norm:out0";
+  if (rp.engine_neutral_types.empty())
+    rp.engine_neutral_types = {"mha_core"};
   setupParameters(cfg, generation_cfg, nntr_cfg);
 }
 
@@ -89,10 +211,30 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   LMHEAD_DTYPE = nntr_cfg.contains("lmhead_dtype")
                    ? nntr_cfg["lmhead_dtype"]
                    : nntr_cfg["embedding_dtype"];
+  // a legacy int4 lm_head loads as the canonical QS4CX class
+  // (on-disk stays legacy QINT4, transcoded at read time). See transformer.cpp.
+  if (LMHEAD_DTYPE == "QINT4")
+    LMHEAD_DTYPE = "QS4CX";
+
+  // LMHEAD_UNTIE is parsed in Transformer::setupParameters (member moved
+  // there so <model>Transformer::constructModel can gate embedding0's type).
 
   SKIP_PREFILL = nntr_cfg.contains("skip_prefill")
                    ? nntr_cfg["skip_prefill"].get<bool>()
                    : false;
+
+  // Repetition penalty. applyRepetitionPenalty() has always been here but
+  // nothing plumbed a value into it, so generate() only ever saw the
+  // default 1 and the penalty was unreachable. Both keys are optional; the
+  // defaults below are exactly the arguments the old call sites passed, so a
+  // config without them decodes byte-identically (penalty == 1 in particular
+  // is what keeps generate()'s on-GPU argmax engaged).
+  REPETITION_PENALTY = nntr_cfg.contains("repetition_penalty")
+                         ? nntr_cfg["repetition_penalty"].get<float>()
+                         : 1.0f;
+  REPETITION_WINDOW = nntr_cfg.contains("repetition_window")
+                        ? nntr_cfg["repetition_window"].get<unsigned int>()
+                        : 128;
 
   USE_KVCACHE = false;
   PRE_COMPUTED_CACHE_PATH = "";
@@ -117,6 +259,14 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   } else {
     EOS_TOKEN_ID.clear();
     EOS_TOKEN_ID.push_back(generation_cfg["eos_token_id"].get<unsigned int>());
+  }
+  if (EOS_TOKEN_ID.empty()) {
+    // Without an EOS id nothing can break the decode loop early, so a config
+    // with no explicit num_to_generate will always run to the context window.
+    std::cerr << "[CausalLM] WARNING: no eos_token_id in the config; "
+                 "generation can only stop at num_to_generate or at the end of "
+                 "the context window."
+              << std::endl;
   }
   BOS_TOKEN_ID = generation_cfg["bos_token_id"].empty()
                    ? cfg["bos_token_id"].get<unsigned int>()
@@ -145,10 +295,28 @@ void CausalLM::allocateAndBindKVCache() {
 
     const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
 
+    // [kv-window-ring] Per-layer physical row capacity: a sliding-window layer
+    // stores a Wcap-row ring, every other layer keeps max_seq. Same
+    // getKVCacheRows() hook the placeholder factories use, so the two shapes
+    // line up at bind time (the bind asserts they do).
+    std::vector<unsigned int> layer_caps(static_cast<size_t>(NUM_LAYERS), 0u);
+    for (int i = 0; i < NUM_LAYERS; ++i)
+      layer_caps[static_cast<size_t>(i)] = getKVCacheRows(i);
+    kv_cache.setLayerCaps(layer_caps);
+
+    // Per-layer width via the getKVCacheWidth() hook: uniform
+    // (NUM_KEY_VALUE_HEADS * HEAD_DIM) by default, overridden by
+    // variable-geometry models. One vector path now serves every model, so the
+    // per-model allocateAndBindKVCache overrides are gone. (The scalar
+    // allocate this used before only additionally set the KVCacheManager
+    // num_heads_kv_/head_dim_ members, which have no reader -- getKVWidth() is
+    // uncalled -- so this is behavior-identical.)
+    std::vector<unsigned int> kv_widths(static_cast<size_t>(NUM_LAYERS), 0u);
+    for (int i = 0; i < NUM_LAYERS; ++i)
+      kv_widths[static_cast<size_t>(i)] = getKVCacheWidth(i);
+
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
-                      max_timestep,
-                      static_cast<unsigned int>(NUM_KEY_VALUE_HEADS),
-                      static_cast<unsigned int>(HEAD_DIM), cache_dtype);
+                      max_timestep, kv_widths, cache_dtype);
     kv_cache_bound = false;
   }
 
@@ -196,12 +364,235 @@ void CausalLM::allocateAndBindKVCache() {
                   std::runtime_error)
       << "allocateAndBindKVCache: cache placeholder dtype mismatch for layer "
       << i;
+    NNTR_THROW_IF(kp->getDim() != kc.getDim() || vp->getDim() != vc.getDim(),
+                  std::runtime_error)
+      << "allocateAndBindKVCache: cache placeholder shape mismatch for layer "
+      << i
+      << " (the placeholder shape from createKVCachePlaceholders and the "
+         "KVCacheManager allocation must agree)";
 
     kp->setData(kc.getMemoryData(), kc.getOffset(), false);
     vp->setData(vc.getMemoryData(), vc.getOffset(), false);
   }
 
   kv_cache_bound = true;
+}
+
+float *CausalLM::acquireLogitsBuf(size_t count) {
+  for (auto it = logits_pool_free_.begin(); it != logits_pool_free_.end();
+       ++it) {
+    if (it->first == count) {
+      float *buf = it->second;
+      logits_pool_free_.erase(it);
+      return buf;
+    }
+  }
+  float *buf = new float[count];
+  logits_pool_sizes_.emplace(buf, count);
+  return buf;
+}
+
+void CausalLM::releaseLogitsBuf(float *buf) {
+  if (buf == nullptr)
+    return;
+  auto it = logits_pool_sizes_.find(buf);
+  if (it == logits_pool_sizes_.end()) {
+    delete[] buf; // not pool-owned (defensive; all in-tree callers are)
+    return;
+  }
+  logits_pool_free_.emplace_back(it->second, buf);
+}
+
+std::vector<float *> CausalLM::incrementalInference(
+  unsigned int batch_size, const std::vector<float *> &input,
+  unsigned int init_seq_len, unsigned int from, unsigned int to) {
+  // Same contract as NeuralNetwork::incremental_inference(float* ...), except
+  // inputs whose raw pointer belongs to a KVCacheManager cache tensor are fed
+  // as the REAL tensor (sharing its MemoryData, so isSVM() set by the SVM
+  // MemoryPool survives the per-call fillPlaceholder/syncDependents). With
+  // in-place input layers the mha_core cache views are dependents of the
+  // input placeholder; a fresh Tensor::Map MemoryData of the same pointer
+  // would clobber the SVM flag and drop attention to the host path.
+  auto *nn = static_cast<nntrainer::NeuralNetwork *>(model.get());
+
+  std::unordered_map<const void *, nntrainer::Tensor *> cache_by_ptr;
+  if (kv_cache.isAllocated()) {
+    for (unsigned int i = 0; i < kv_cache.getNumLayers(); ++i) {
+      auto &kc = kv_cache.getKeyCache(i);
+      auto &vc = kv_cache.getValueCache(i);
+      cache_by_ptr.emplace(reinterpret_cast<const void *>(kc.getData()), &kc);
+      cache_by_ptr.emplace(reinterpret_cast<const void *>(vc.getData()), &vc);
+    }
+  }
+
+  auto in_dim = nn->getInputDimension();
+  NNTR_THROW_IF(input.size() < in_dim.size(), std::invalid_argument)
+    << "incrementalInference: model expects " << in_dim.size()
+    << " inputs, got " << input.size();
+
+  nntrainer::sharedConstTensors input_tensors;
+  input_tensors.reserve(in_dim.size());
+  for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
+    auto it = cache_by_ptr.find(reinterpret_cast<const void *>(input[idx]));
+    if (it != cache_by_ptr.end()) {
+      // shallow copy: shares the cache's MemoryData (isSVM intact)
+      input_tensors.emplace_back(MAKE_SHARED_TENSOR(*it->second));
+    } else {
+      in_dim[idx].batch(batch_size);
+      input_tensors.emplace_back(MAKE_SHARED_TENSOR(nntrainer::Tensor::Map(
+        input[idx], in_dim[idx].getDataLen() * sizeof(float), in_dim[idx], 0)));
+    }
+  }
+
+  nntrainer::sharedConstTensors output_tensors =
+    nn->incremental_inference(input_tensors, init_seq_len, from, to);
+
+  // Output conversion identical to the float* overload in neuralnet.cpp.
+  std::vector<float *> output;
+  output.reserve(output_tensors.size());
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Invalidate any stale device-logits stash; re-armed below
+  // only when this call's first output is device-accessible (UVM / managed /
+  // device) so generate() can run the on-GPU argmax instead of host
+  // max_element.
+  g_cuda_logits_dev = nullptr;
+  // A row deferred by the previous call and never claimed belongs to a buffer
+  // the caller has since freed; drop it rather than write through it later.
+  g_pending_logits = PendingLogits{};
+  // first_output is read only by the device-logits stash checks below
+  // (both the fp16 and fp32 branches); without CUDA there is no reader.
+  bool first_output = true;
+#endif
+  for (auto &out : output_tensors) {
+    auto out_t = *out.get();
+    const size_t buf_size = (size_t)batch_size * out_t.getDim().getFeatureLen();
+    // Pooled host staging: decode paid a fresh 1MB new[]/delete[] round trip
+    // per token here (mostly never even written under the deferred-logits
+    // path); the pool recycles the row instead. Contents are as uninitialized
+    // as a fresh new[] -- everything below either fills it or defers it.
+    float *last_out_buf_data = acquireLogitsBuf(buf_size);
+
+    if (out->getDataType() == ml::train::TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+      const _FP16 *out_src = out_t.getData<_FP16>();
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // Per-token cudart touches (pointer probes + stream drains) are cuda-run
+      // only: on a non-cuda run of the unified binary the first cudart call
+      // boots the statically-linked runtime inside this (timed) path.
+      std::vector<_FP16> out_host;
+      bool defer_host_logits = false;
+      if (causallm_engine() == "cuda") {
+        // Stash the device logits pointer (before the D2H copy) when
+        // device-accessible, for generate()'s on-GPU argmax. batch_size==1
+        // only (the argmax reduces a single [vocab] row).
+        if (cuda_argmax_enabled() && first_output && batch_size == 1) {
+          cudaPointerAttributes pa0{};
+          if (cudaPointerGetAttributes(&pa0, out_src) == cudaSuccess &&
+              (pa0.type == cudaMemoryTypeDevice ||
+               pa0.type == cudaMemoryTypeManaged)) {
+            g_cuda_logits_dev = out_src;
+            g_cuda_logits_fp16 = true;
+            // Greedy last time -> generate() will read one index off the GPU
+            // and never touch the host row. Hand it the ingredients instead of
+            // the row (see PendingLogits).
+            if (g_greedy_hint) {
+              g_pending_logits = {out_src, last_out_buf_data, buf_size, true};
+              defer_host_logits = true;
+            }
+          }
+          cudaGetLastError();
+        }
+        // Device-only activation pool (NNTR_CUDA_DEV_ACT): the model output is
+        // real device memory, not host-addressable. Drain the backend stream
+        // and copy it D2H into a host buffer before the host fp16->fp32
+        // convert (=the one sync-per-token boundary). For UVM the pointer is
+        // host-coherent so this is skipped.
+        cudaPointerAttributes pa{};
+        if (defer_host_logits) {
+          // nothing to stage: nobody is going to read the host row
+        } else if (cudaPointerGetAttributes(&pa, out_src) == cudaSuccess &&
+                   pa.type == cudaMemoryTypeDevice) {
+          nntrainer::cuda::StreamManager::Global().finish();
+          out_host.resize(buf_size);
+          cudaMemcpy(out_host.data(), out_src, buf_size * sizeof(_FP16),
+                     cudaMemcpyDeviceToHost);
+          out_src = out_host.data();
+        } else {
+          // UVM/managed pointer: host-coherent for ADDRESSING, but the
+          // producing work may still be in flight -- under NNTR_CUDA_ASYNC
+          // (eager, no per-op drain) and, since the sync consolidation in
+          // CudaContext::runDecode, after an M2B graph replay in sync mode
+          // too (the replay no longer stream-syncs; each host consumer
+          // drains once itself). Full finish(), not finishIfAsync().
+          nntrainer::cuda::StreamManager::Global().finish();
+        }
+        cudaGetLastError();
+      }
+#endif
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      if (!defer_host_logits)
+#endif
+        nntrainer::getComputeOps()->scopy_fp16_to_fp32(buf_size, out_src, 1,
+                                                       last_out_buf_data, 1);
+#else
+      throw std::invalid_argument("Error: enable-fp16 is not set");
+#endif
+    } else if (out->getDataType() == ml::train::TensorDim::DataType::FP32) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      bool defer_host_logits = false;
+      // Per-token cudart touches are cuda-run only (see the fp16 branch note).
+      if (causallm_engine() == "cuda") {
+        // Stash the device logits pointer (the tensor data,
+        // before the host memcpy below) when device-accessible. UVM/managed
+        // pointers are host-coherent, so this same pointer feeds both the
+        // on-GPU argmax kernel and -- as the fallback -- the host memcpy.
+        if (cuda_argmax_enabled() && first_output && batch_size == 1) {
+          const float *out_src = out_t.getData();
+          cudaPointerAttributes pa0{};
+          if (cudaPointerGetAttributes(&pa0, out_src) == cudaSuccess &&
+              (pa0.type == cudaMemoryTypeDevice ||
+               pa0.type == cudaMemoryTypeManaged)) {
+            g_cuda_logits_dev = out_src;
+            g_cuda_logits_fp16 = false;
+            if (g_greedy_hint) {
+              g_pending_logits = {out_src, last_out_buf_data, buf_size, false};
+              defer_host_logits = true;
+            }
+          }
+          cudaGetLastError();
+        }
+        // Host read of the GPU-produced logits: sync first so the read is
+        // coherent -- under NNTR_CUDA_ASYNC and, since the runDecode sync
+        // consolidation, after a sync-mode M2B replay as well (the replay no
+        // longer drains; each host consumer waits once itself). Skipped when
+        // the row is deferred: nobody reads it, and the on-GPU argmax path
+        // does its own single finish() before the 4-byte D2H.
+        if (!defer_host_logits)
+          nntrainer::cuda::StreamManager::Global().finish();
+      }
+      // Nothing to materialize when the row is deferred: no reader for it.
+      if (!defer_host_logits)
+        std::memcpy(last_out_buf_data, out_t.getData(),
+                    sizeof(float) * buf_size);
+#else
+      std::memcpy(last_out_buf_data, out_t.getData(), sizeof(float) * buf_size);
+#endif
+    }
+
+    output.push_back(last_out_buf_data);
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    first_output = false;
+#endif
+  }
+
+  // Keep the host-side KV tracker at the absolute position just written:
+  // mha_core advances only its own internal cache_index during forwarding,
+  // so without this getKvLen()/save_kvcache() would report the stale
+  // prefill-start position (advanceKVCachePosition had no caller).
+  if (kv_cache.isAllocated() && to <= kv_cache.getMaxSeqLen())
+    kv_cache.setPosition(to);
+
+  return output;
 }
 
 void CausalLM::setKVCachePosition(unsigned int pos) {
@@ -220,26 +611,67 @@ void CausalLM::advanceKVCachePosition(unsigned int step_size) {
   kv_cache.advance(step_size);
 }
 
-std::pair<Tensor, Tensor> CausalLM::constructModel() {
-
-  // base transformer (input, output_norm)
-  auto [x, h] = Transformer::constructModel();
-
+/**
+ * @brief Build the output_of_causallm lm_head from the transformer hidden
+ * state h. Shared by the generic and the diamond-inheritance model
+ * constructModel paths, which previously copy-pasted this block: pick
+ * fully_connected / tie_word_embeddings / lm_head, assemble the
+ * name/unit/disable_bias/weight_dtype/engine props, conditionally append
+ * skip_prefill and shared_from, create the layer and apply it. The
+ * skip_prefill decision differs per path, so it is passed in rather than
+ * recomputed here.
+ *
+ * When the config unties the head (lmhead_untie) the layer is an independent
+ * fully_connected with its own weight even for a tied-embedding model, so the
+ * head can carry a different dtype than the input embedding (e.g. an int4 GEMV
+ * head over a Q6_K gather embedding -- the tied full-vocab GEMV is the single
+ * largest decode kernel on every backend). Untie is the config flag, NOT
+ * derived from the head dtype: the quantizer constructs this same untied graph
+ * from the FP32 source and quantizes output_of_causallm via the dtype map on
+ * save.
+ */
+Tensor CausalLM::buildLmHeadOutput(Tensor h, bool add_skip_prefill) {
+  const bool lmhead_untied = LMHEAD_UNTIE;
   const std::string lmhead_type =
-    TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head";
-
+    lmhead_untied ? "fully_connected"
+                  : (TIE_WORD_EMBEDDINGS ? "tie_word_embeddings" : "lm_head");
   std::vector<std::string> lmhead_prop = {
     withKey("name", "output_of_causallm"),
     withKey("unit", NUM_VOCAB),
     withKey("disable_bias", "true"),
     withKey("weight_dtype", LMHEAD_DTYPE),
+    withKey("engine", causallm_engine()),
   };
-
-  if (TIE_WORD_EMBEDDINGS)
+  // skip_prefill must agree with the caller's runtime skip-prefill flag: the
+  // layer property alone makes fc_layer early-return during prefill, but run()
+  // only routes around that when the model-level flag is set too -- tagging the
+  // layer without the flag silently yields garbage prefill logits.
+  if (add_skip_prefill)
+    lmhead_prop.emplace_back(withKey("skip_prefill", "true"));
+  if (TIE_WORD_EMBEDDINGS && !lmhead_untied)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
-
   LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));
-  Tensor y = lmhead(h);
+  return lmhead(h);
+}
+
+std::pair<Tensor, Tensor> CausalLM::constructModel() {
+
+  // base transformer (input, output_norm)
+  auto [x, h] = Transformer::constructModel();
+
+  Tensor y = buildLmHeadOutput(h, LMHEAD_UNTIE && SKIP_PREFILL);
+
+  // ModelFeatures x DeviceCaps matcher SHADOW: the model declares its
+  // features, the resolver combines them with the chosen backend's device caps
+  // into an ExecPlan. Log-only (no decision site reads the plan yet) — the
+  // model graph is unchanged, so this is byte-identical. docs §10 T11.
+  if (const auto *ct =
+        nntrainer::Engine::Global().getRegisteredContext(causallm_engine())) {
+    const auto feats = getModelFeatures();
+    const auto plan = nntrainer::resolveExecPlan(ct->caps(), feats);
+    ml_logi("[CausalLM] %s | %s (shadow)", feats.toString().c_str(),
+            plan.toString().c_str());
+  }
 
   return {x, y};
 }
@@ -303,8 +735,72 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
                                              unsigned int *input_ids,
                                              unsigned int NUM_INPUT_IDS) {
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Terminal drain for the selective-sync (NNTR_CUDA_ASYNC) decode path: ensure
+  // the GPU has finished producing the logits before the host reads them here.
+  // No-op in default mode (every GPU op already drained per-op). cuda engine
+  // ONLY: in a dual-enabled (CUDA+OpenCL) binary this ran on OpenCL runs too,
+  // and StreamManager::Global() lazily CREATES the CUDA context -- the first
+  // stray CUDA touch on a non-cuda run (NVIDIA VRAM burned on an Intel run).
+  if (causallm_engine() == "cuda")
+    nntrainer::cuda::StreamManager::Global().finish();
+#endif
+
   std::vector<unsigned int> outputs;
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Repetition penalty / bad-words activity, with EXACTLY the host-path
+  // predicates below (generate() applies each only under its own triple
+  // check, so the device route must mirror both or it would penalize where
+  // the host would not).
+  const bool rp_active =
+    repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0;
+  const bool bw_active = BAD_WORD_IDS.size() != 0 && NUM_BADWORDS != 0;
+  // Tell the NEXT incrementalInference whether the full-vocab host row is
+  // going to be read at all. Recomputed every call, so a run that switches
+  // sampling on pays one deferred conversion and then stops deferring.
+  g_greedy_hint = cuda_argmax_enabled() && do_sample == false &&
+                  logits_processor == nullptr && BATCH_SIZE == 1 &&
+                  !rp_active && !bw_active;
+#endif
   for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    // CUDA on-GPU greedy argmax: reduce the device-resident
+    // lm_head logits to the token id on the GPU and read back only 4 bytes,
+    // skipping the host std::max_element over the full-vocab buffer. Gated to
+    // greedy (no sampling, no logits processor -- those consume logits on the
+    // host) and only when incrementalInference stashed a device-accessible
+    // logits pointer for this (single, BATCH_SIZE==1) row. A repetition or
+    // bad-words penalty mutates the logits on the host, so those rows keep the
+    // host path.
+    if (cuda_argmax_enabled() && g_cuda_logits_dev != nullptr &&
+        do_sample == false && logits_processor == nullptr && !rp_active &&
+        !bw_active) {
+      unsigned int tok = 0;
+      const bool ok =
+        g_cuda_logits_fp16
+          ? nntrainer::cuda::cuda_argmax_fp16(
+              reinterpret_cast<const unsigned short *>(g_cuda_logits_dev),
+              NUM_VOCAB, &tok)
+          : nntrainer::cuda::cuda_argmax_fp32(
+              reinterpret_cast<const float *>(g_cuda_logits_dev), NUM_VOCAB,
+              &tok);
+      // Consume the stash regardless (it belongs to this call's logits row).
+      g_cuda_logits_dev = nullptr;
+      if (ok) {
+        // The deferred host row was never needed -- drop it unfilled.
+        g_pending_logits = PendingLogits{};
+        outputs.push_back(tok);
+        logits = logits + NUM_VOCAB;
+        input_ids = input_ids + MAX_SEQ_LEN;
+        continue;
+      }
+      // else: fall through to the host path below.
+    }
+    // Reached only when the device path did not take this row: either the gate
+    // above refused it or the reduction failed. Either way the host row may
+    // still be outstanding, so fill it before anyone reads `logits`.
+    materialize_pending_logits();
+#endif
 
     // apply repetition penalty
     if (repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0) {
@@ -349,14 +845,55 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
 void CausalLM::registerCustomLayers() {
   Transformer::registerCustomLayers();
   const auto &ct_engine = nntrainer::Engine::Global();
-  const auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+  // lm_head promoted to core app_context.cpp (cpu).
+
+  // Register ReshapedRMSNormLayer on the GPU (cl) context once, centrally, so
+  // ANY model can build its per-head q/k/v norms with engine=GPU and keep them
+  // GPU_CLMEM-resident (Gemma4 S1.1 / Qwen3 q/k norm) instead of draining to
+  // the host every layer. Future q/k-norm models get GPU residency for free:
+  // they only need their existing cpu-context registration plus
+  // engine=causallm_engine() on the reshaped_rms_norm layer. Inert (skipped)
+  // when there is no GPU context (CPU-only / NNTR_ENGINE=cpu builds). The
+  // per-model registerCustomLayers still registers it on the cpu context.
+  // Goes through Engine's registration facade — no static_cast to ClContext.
   try {
-    app_context->registerFactory(nntrainer::createLayer<causallm::LmHeadLayer>);
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
+    // no "gpu" context (CPU-only build) or already registered — both benign.
   }
+
+  // PLE post_norm (RMSReverseNormLayer) on the GPU context: its
+  // incremental_forwarding runs the reverse-norm as a GPU op (no host op inside
+  // the async GPU graph). Same central-registration pattern as the reshaped
+  // norm above; inert on CPU-only builds.
+  try {
+    ct_engine.registerLayerFactory(
+      "gpu", nntrainer::createLayer<causallm::RMSReverseNormLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "gpu" context or already registered — both benign.
+  }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Centralized cuda-context registration of ReshapedRMSNormLayer (mirror of
+  // the cl block above). engine=cuda tensors are UVM (host-coherent) and not
+  // isSVM()-flagged, so its forwarding takes the correct host path.
+  try {
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "cuda" context or already registered — both benign.
+  }
+  // PLE post_norm (RMSReverseNormLayer) on the cuda context: UVM
+  // tensors are host-coherent and not isSVM()-flagged, so its forwarding
+  // takes the correct host FP32-temp path (mirror of the "gpu" block above).
+  try {
+    ct_engine.registerLayerFactory(
+      "cuda", nntrainer::createLayer<causallm::RMSReverseNormLayer>);
+  } catch (std::invalid_argument &e) {
+    // no "cuda" context or already registered — both benign.
+  }
+#endif
 }
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
@@ -425,12 +962,25 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     prompt_ = system_prompt + prompt + tail_prompt;
   }
 
+  // join the async tokenizer load before first use
+  // (covers both Encode calls below and every later Decode this run).
+  ensureTokenizer();
+
   if (USE_KVCACHE && !SAVE_KVCACHE && SYS_PROMP_LEN == 0)
     SYS_PROMP_LEN = tokenizer->Encode(system_prompt).size();
 
-  auto _input = tokenizer->Encode(prompt_);
-  ///@note insert bos token at the beginning of the input
-  // _input.insert(_input.begin(), BOS_TOKEN_ID);
+  ///@note add_special_tokens=true lets each model's OWN tokenizer decide
+  /// whether
+  /// to prepend a BOS, rather than hard-coding it. The 1-arg Encode skips
+  /// special tokens, so the leading BOS that Gemma2 (TemplateProcessing,
+  /// add_bos_token= true) needs was dropped -> short prompts degenerated into
+  /// pure repetition
+  /// ("The capital of France is" -> "is is is..."); long prompts masked it.
+  /// Verified to match HF add_special_tokens=True per model: Gemma2 gains its
+  /// BOS(2); models whose tokenizer adds no BOS (e.g. Qwen3 — ByteLevel post-
+  /// processor, add_bos_token=false) are byte-identical to the old behavior, so
+  /// they are unaffected. (sentence_transformer.cpp already encodes this way.)
+  auto _input = tokenizer->Encode(prompt_, /*add_special_tokens=*/true);
 
   // | <------------------- MAX_SEQ_LEN -------------------> |
   //                       ||             ||
@@ -438,22 +988,58 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   std::vector<int64_t> init_input;
   unsigned int _len = _input.size();
-  unsigned int num_allow_str = MAX_SEQ_LEN - NUM_TO_GENERATE;
+  // The prefill activation buffers are built at INIT_SEQ_LEN (transformer.cpp
+  // constructModel, {1,1,1,INIT_SEQ_LEN}); resetInputDimension is disabled, so
+  // ONE forward pass cannot process more than INIT_SEQ_LEN query rows without
+  // overflowing the shared activation tensor (getSharedDataTensor bounds-check
+  // throw). Normally that caps the prompt to INIT_SEQ_LEN. With chunking
+  // (prefillChunk() > 0) the prefill is fed FORWARD in chunks of <=
+  // INIT_SEQ_LEN rows -- each chunk fits the buffer -- so the prompt is bounded
+  // by the KV budget alone and the activation plane stays INIT_SEQ_LEN-sized
+  // however long the prompt is. That decoupling is the point of chunking:
+  // INIT_SEQ_LEN is the activation/chunk height (small), MAX_SEQ_LEN the KV
+  // capacity (large).
+  //
+  // NUM_TO_GENERATE <= 0 means "no explicit cap": generation runs until EOS or
+  // until the window is full, so nothing has to be held back for it beyond the
+  // single position the decode loop starts at (input_len + 1). Reserving 1
+  // keeps the prompt budget at MAX_SEQ_LEN - 1 and that loop in bounds.
+  const bool unlimited_generation = (NUM_TO_GENERATE <= 0);
+  const unsigned int reserved_for_generation =
+    unlimited_generation ? 1u : static_cast<unsigned int>(NUM_TO_GENERATE);
+  const unsigned int kv_budget = MAX_SEQ_LEN > reserved_for_generation
+                                   ? MAX_SEQ_LEN - reserved_for_generation
+                                   : 0u;
+  // Whether the prefill is chunked is a property of the model, not of the
+  // environment: the KV ring requests chunking on its own (prefillChunk() > 0)
+  // even when NNTR_PREFILL_CHUNK is unset. Keying this off
+  // getenv("NNTR_PREFILL_CHUNK") meant that chunking never opened the budget,
+  // so a 29K-token prompt was cut to INIT_SEQ_LEN even though the prefill
+  // could have fed it in chunks.
+  const bool _prefill_chunking = prefillChunk() > 0;
+  unsigned int num_allow_str =
+    _prefill_chunking ? kv_budget
+                      : std::min<unsigned int>(INIT_SEQ_LEN, kv_budget);
   unsigned int text_len = _len;
 
   if (_len > num_allow_str) {
     text_len = num_allow_str;
-    // Truncation drops tokens from the tail of the prompt, which is where
-    // instructions in "summarize this document"-style prompts live: a
-    // silently truncated prompt can make the model continue the body
-    // instead of following a dropped trailing instruction. Always warn
-    // with the exact counts.
-    std::cerr << "[CausalLM] WARNING: prompt (" << _len
-              << " tokens) exceeds the max allowed prefill length ("
-              << num_allow_str
-              << " = max_seq_len - num_to_generate); "
-                 "truncating "
-              << (_len - num_allow_str) << " tail tokens." << std::endl;
+    // Silent tail truncation loses whatever the prompt ENDS with (round-13
+    // field case: a summarization instruction at the tail was dropped and
+    // the model continued the body instead). Unexpected state -> always warn.
+    // The named limit follows the budget actually applied: without an explicit
+    // cap it is max_seq_len - 1, not max_seq_len - num_to_generate.
+    std::fprintf(
+      stderr,
+      "[causallm] WARNING: prompt (%u tokens) exceeds the prefill window "
+      "(init_seq_len=%u%s, %s=%u); truncating %u "
+      "tail tokens. Raise %s to fit the prompt.\n",
+      _len, static_cast<unsigned int>(INIT_SEQ_LEN),
+      _prefill_chunking ? " (chunked: not the prompt limit)" : "",
+      unlimited_generation ? "max_seq_len-1 (generating until EOS)"
+                           : "max_seq_len-num_to_generate",
+      kv_budget, _len - num_allow_str,
+      _prefill_chunking ? "max_seq_len" : "init_seq_len");
   }
 
   // feed only available length
@@ -537,8 +1123,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       std::cout << "\n==============[KV CACHE SAVE MODE]================\n";
     allocateAndBindKVCache();
     setKVCachePosition(0);
-    output = model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                          0, input_len, false);
+    output = incrementalInference(BATCH_SIZE, input, input_len, 0, input_len);
 
     SYS_PROMP_LEN = input_len;
     save_kvcache(PRE_COMPUTED_CACHE_PATH, SYS_PROMP_LEN);
@@ -565,16 +1150,81 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   const unsigned int prefill_from = SYS_PROMP_LEN + global_token_len;
   std::vector<unsigned int> id_list;
 
+  // [resume-block] A resumed prefill (multi-turn continuation or a restored
+  // KV cache, prefill_from > 0) runs as ONE block call — same shape as the
+  // first prefill but with `from` at the absolute position — now that the
+  // shared llm activation layers accept from>0 with to-from>1 (their row
+  // math is base+live-window on every backend; attention/mha_core always
+  // supported it). NNTR_RESUME_BLOCK=0 restores the legacy token-by-token
+  // decode-shape feed (prefill at decode TPS) as an escape hatch.
+  static const char *_rb_env = std::getenv("NNTR_RESUME_BLOCK");
+  static const bool resume_block_on = !(_rb_env && _rb_env[0] == '0');
+
+  // [prefill-chunk] A chunk C (>0) drives the prefill FORWARD in
+  // C-token chunks instead of one M-token block. Each chunk feeds its tokens at
+  // input row 0 and writes its KV at the absolute range [from, from+clen); the
+  // next chunk attends over the accumulated cache. For causal (and
+  // sliding-window) attention every query sees the identical causal prefix
+  // either way, so the result is bit-identical to the single block. This is the
+  // exact token-feed pattern the legacy resumed-prefill loop below already uses
+  // (tokens at input row 0, absolute KV position via `from`), generalized from
+  // one token per call to C. C=0 (no ring, no override) is the single-block
+  // path verbatim.
+  // prefillChunk() is the one clamped answer -- the same number the prompt
+  // budget above and the KV ring capacity are computed from, so a chunk always
+  // fits the INIT_SEQ_LEN-height activation buffer and never straddles the
+  // ring's wrap seam.
+  const unsigned int prefill_chunk = prefillChunk();
+  auto do_prefill = [&](unsigned int n_tok,
+                        unsigned int from_pos) -> std::vector<float *> {
+    // Legacy token-by-token resumed prefill (debug escape hatch) -- unchanged.
+    if (!resume_block_on && from_pos > 0 && n_tok > 1) {
+      std::vector<float *> out;
+      for (unsigned int i = 0; i < n_tok; ++i) {
+        for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+          input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
+            static_cast<float>(init_input[i]);
+        const unsigned int p = from_pos + i;
+        auto so = incrementalInference(BATCH_SIZE, input, p, p, p + 1);
+        if (i + 1 < n_tok)
+          for (auto &o : so)
+            releaseLogitsBuf(o);
+        else
+          out = std::move(so);
+      }
+      return out;
+    }
+    // Single block (default) when chunking is off or the prompt fits one chunk.
+    if (prefill_chunk == 0 || n_tok <= prefill_chunk)
+      return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
+                                  from_pos + n_tok);
+    // Chunked forward prefill.
+    std::vector<float *> out;
+    for (unsigned int o = 0; o < n_tok; o += prefill_chunk) {
+      const unsigned int clen = std::min(prefill_chunk, n_tok - o);
+      for (unsigned int b = 0; b < BATCH_SIZE; ++b)
+        for (unsigned int j = 0; j < clen; ++j)
+          input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =
+            static_cast<float>(init_input[o + j]);
+      const unsigned int cf = from_pos + o;
+      auto so = incrementalInference(BATCH_SIZE, input, clen, cf, cf + clen);
+      if (o + clen < n_tok)
+        for (auto &oo : so)
+          releaseLogitsBuf(oo);
+      else
+        out = std::move(so);
+    }
+    return out;
+  };
+
   if (SKIP_PREFILL && init_len > 1) {
     // Prefill only N-1 tokens; the last input token will be used as the first
     // token in the generation phase (assigned directly, not sampled).
     unsigned int skipped_token =
       static_cast<unsigned int>(init_input[init_len - 1]);
 
-    const unsigned int prefill_to = prefill_from + input_len - 1;
     setKVCachePosition(prefill_from);
-    output = model->incremental_inference(
-      BATCH_SIZE, input, label, init_len - 1, prefill_from, prefill_to, false);
+    output = do_prefill(init_len - 1, prefill_from);
 
     for (unsigned int b = 0; b < BATCH_SIZE; ++b)
       id_list.push_back(skipped_token);
@@ -584,10 +1234,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     input_len -= 1;
     init_len -= 1;
   } else {
-    const unsigned int prefill_to = prefill_from + input_len;
     setKVCachePosition(prefill_from);
-    output = model->incremental_inference(BATCH_SIZE, input, label, init_len,
-                                          prefill_from, prefill_to, false);
+    output = do_prefill(init_len, prefill_from);
 
     // post process of model output
     id_list = generate(output[0], do_sample, 1, ids_history, init_len);
@@ -595,9 +1243,23 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     if (init_len < INIT_SEQ_LEN)
       registerOutputs(tokenizer, id_list, init_len, eos_list, log_output);
   }
-  // output should be deallocated after use
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // NNTR_CUDA_I8_EPHEMERAL=1: the prefill just finished and
+  // decode (M=1, dp4a) never reads the cuBLAS-i8 caches -- free them here so
+  // the decode phase runs without their VRAM residency (~1.2GB measured).
+  // Multi-turn: the next prefill lazily rebuilds (slower TTFT on that turn).
+  {
+    static const bool i8_ephemeral = []() {
+      const char *e = std::getenv("NNTR_CUDA_I8_EPHEMERAL");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (i8_ephemeral && causallm_engine() == "cuda")
+      nntrainer::cuda::cuda_fc_qs4cx_free_i8_caches();
+  }
+#endif
+  // output should be released after use (returns the row to the pool)
   for (auto &out : output) {
-    delete[] out;
+    releaseLogitsBuf(out);
   }
 
   auto finish_prefill = std::chrono::high_resolution_clock::now();
@@ -617,17 +1279,60 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
 
   auto start_generation = std::chrono::high_resolution_clock::now();
 
-  for (unsigned int token_generation_idx = input_len + 1;
-       token_generation_idx < input_len + 1 + NUM_TO_GENERATE &&
+  // registerOutputs() writes ids_history[b * MAX_SEQ_LEN + idx] with no bounds
+  // check, so the loop index has to stay inside the row stride the buffer was
+  // allocated with. A budget that fits the window is not enough on its own: the
+  // loop starts one past input_len, and input_len carries SYS_PROMP_LEN (added
+  // just above) on top of the already-truncated prompt, so
+  // input_len + NUM_TO_GENERATE can still reach MAX_SEQ_LEN. Derive the end
+  // from the window too and stop at whichever comes first.
+  //
+  // Without an explicit cap (NUM_TO_GENERATE <= 0) the budget is the whole
+  // window; the std::min below is then what actually bounds the loop, so
+  // generation runs until EOS breaks out of it or the window is exhausted.
+  const unsigned int generation_budget =
+    NUM_TO_GENERATE > 0 ? static_cast<unsigned int>(NUM_TO_GENERATE)
+                        : MAX_SEQ_LEN;
+  const unsigned int generation_begin = input_len + 1;
+  const unsigned int generation_end =
+    generation_begin < MAX_SEQ_LEN
+      ? generation_begin +
+          std::min(MAX_SEQ_LEN - generation_begin, generation_budget)
+      : generation_begin;
+
+  for (unsigned int token_generation_idx = generation_begin;
+       token_generation_idx < generation_end &&
        !stop_requested_.load(std::memory_order_acquire);
        ++token_generation_idx) {
 
     allocateAndBindKVCache();
-    auto output_interval =
-      model->incremental_inference(BATCH_SIZE, input, label, input_len,
-                                   token_generation_idx - 1 + global_token_len,
-                                   token_generation_idx + global_token_len);
-    std::vector<unsigned int> ids_list(generate(output_interval[0], do_sample));
+    auto output_interval = incrementalInference(
+      BATCH_SIZE, input, input_len, token_generation_idx - 1 + global_token_len,
+      token_generation_idx + global_token_len);
+    // Repetition-penalty window. ids_history is one MAX_SEQ_LEN-strided row of
+    // token ids per batch entry -- the same layout generate() walks with
+    // `input_ids += MAX_SEQ_LEN` -- and registerOutputs() below has already
+    // filled [generation_begin, token_generation_idx) with the tokens THIS
+    // loop produced, so the window is just a suffix of that span and the
+    // pointer can be offset directly. Two deliberate boundaries:
+    //   - the prompt is excluded. Penalizing it would suppress exactly the
+    //     vocabulary a summarization task has to reuse, and with a 29K prompt
+    //     it would also swamp the generated tail it is meant to police.
+    //   - the span is empty on the first decode step (nothing generated yet to
+    //     repeat), which is also the one step that keeps the on-GPU argmax.
+    // With the penalty off both arguments collapse to generate()'s defaults,
+    // so the greedy device path is bit-for-bit what it was.
+    const unsigned int rep_window_len =
+      REPETITION_PENALTY != 1.0f
+        ? std::min(token_generation_idx - generation_begin, REPETITION_WINDOW)
+        : 0u;
+    std::vector<unsigned int> ids_list(
+      generate(output_interval[0], do_sample,
+               rep_window_len != 0 ? REPETITION_PENALTY : 1.0f,
+               rep_window_len != 0
+                 ? ids_history + (token_generation_idx - rep_window_len)
+                 : nullptr,
+               rep_window_len));
 
     // Feed the newly generated token back as the next input token.
     // token_generation_idx always starts at input_len + 1, so we are
@@ -640,9 +1345,10 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                     log_output);
     ++generation_cnt;
 
-    // output should be deallocated after use
+    // output should be released after use (returns the row to the pool; the
+    // deferred-logits stash referencing it was already consumed by generate())
     for (auto out : output_interval) {
-      delete[] out;
+      releaseLogitsBuf(out);
     }
 
     // check FINISH

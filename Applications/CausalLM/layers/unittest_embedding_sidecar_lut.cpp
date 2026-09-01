@@ -113,7 +113,7 @@ TEST(CausalLmEmbeddingSidecarLut, rawUint16RequiresExactHintedSize) {
   EXPECT_TRUE(lut->is_raw_u16);
   EXPECT_EQ(lut->in_dim, 2u);
   EXPECT_EQ(lut->out_dim, 3u);
-  EXPECT_EQ(lut->bytes.size(), 6u * sizeof(uint16_t));
+  EXPECT_EQ(lut->payload_size(), 6u * sizeof(uint16_t));
 
   const auto bad_path = dir.path() / "bad_embedding.u16";
   writeU16(bad_path, {1, 2, 3, 4, 5, 6});
@@ -142,7 +142,7 @@ TEST(CausalLmEmbeddingSidecarLut, ufixed8ManifestUsesRelativePathAndDims) {
   EXPECT_EQ(lut->out_dim, 4u);
   EXPECT_FLOAT_EQ(lut->scale, 0.5f);
   EXPECT_EQ(lut->offset, -1);
-  EXPECT_EQ(lut->bytes.size(), 6u);
+  EXPECT_EQ(lut->payload_size(), 6u);
 }
 
 TEST(CausalLmEmbeddingSidecarLut, sfixed4ManifestParsesAndValidatesRowScale) {
