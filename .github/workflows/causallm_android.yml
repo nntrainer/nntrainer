@@ -59,3 +59,12 @@ jobs:
         chmod +x Applications/CausalLM/build_android.sh
         chmod +x Applications/CausalLM/build_tokenizer_android.sh
         ./Applications/CausalLM/build_android.sh
+    - name: Dump ml-api build logs on failure
+      if: failure()
+      run: |
+        echo "::group::ml-api local build log"
+        tail -n 300 builddir/ml-api-inference/local-build/build_ml-api.log 2>/dev/null || echo "(no build_ml-api.log)"
+        echo "::endgroup::"
+        echo "::group::meson-log.txt (tail)"
+        tail -n 200 builddir/meson-logs/meson-log.txt 2>/dev/null || echo "(no meson-log.txt)"
+        echo "::endgroup::"
