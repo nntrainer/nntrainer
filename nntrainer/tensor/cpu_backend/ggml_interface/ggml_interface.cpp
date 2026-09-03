@@ -11,12 +11,14 @@
  */
 
 #include <algorithm>
+#include <assert.h>
 #include <cmath>
 #include <ggml_interface.h>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
 #include <string>
 #include <thread>
+#include <thread_manager.h>
 #include <vector>
 
 namespace nntrainer {
@@ -104,6 +106,38 @@ float __ggml_vec_dot_q6_K(const unsigned int K, const void *__restrict v_q6_K,
   nntr_vec_dot_q6_K_q8_K(K, &result, bs, v_q6_K, bx, v_q8_activation.data(), by,
                          nrc);
   return result;
+}
+
+void __ggml_gemv_q4_0_rowwise(const unsigned int N, const unsigned int K,
+                              const float *A, const void *B, float *C) {
+  assert(K % QK4_0 == 0);
+  assert(K % QK8_0 == 0);
+  if (N == 0)
+    return;
+
+  const size_t weight_row_size = sizeof(block_q4_0) * (K / QK4_0);
+  const size_t activation_row_size = sizeof(block_q8_0) * (K / QK8_0);
+  std::vector<char> quantized_activation(activation_row_size);
+  nntr_quantize_row_q8_0(A, quantized_activation.data(), K);
+
+  auto &tm = ThreadManager::Global();
+  constexpr size_t rows_per_gemv_group = 4;
+  constexpr size_t max_gemv_chunks = 16;
+  const size_t num_row_groups =
+    (N + rows_per_gemv_group - 1) / rows_per_gemv_group;
+  const size_t num_chunks = std::min(num_row_groups, max_gemv_chunks);
+
+  const char *weight_data = static_cast<const char *>(B);
+  tm.parallel_for(0, num_chunks, [&](size_t chunk) {
+    const size_t row_group_begin = chunk * num_row_groups / num_chunks;
+    const size_t row_group_end = (chunk + 1) * num_row_groups / num_chunks;
+    const size_t row_begin = row_group_begin * rows_per_gemv_group;
+    const size_t row_end =
+      std::min<size_t>(N, row_group_end * rows_per_gemv_group);
+    nntr_gemv_q4_0_q8_0_canonical_rows(
+      K, C + row_begin, weight_data + row_begin * weight_row_size,
+      quantized_activation.data(), row_end - row_begin);
+  });
 }
 
 void __ggml_repack_q4_0_to_q4_0_4(void *dst, void *src, size_t data_size,

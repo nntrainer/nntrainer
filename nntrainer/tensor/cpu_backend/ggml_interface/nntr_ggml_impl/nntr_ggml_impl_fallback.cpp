@@ -34,6 +34,60 @@
 #include <nntr_ggml_impl_common.h>
 #include <nntr_ggml_impl_utils.h>
 
+void nntr_gemv_q4_0_q8_0_canonical_rows(int k, float *__restrict output,
+                                        const void *__restrict q4_weight,
+                                        const void *__restrict q8_activation,
+                                        size_t num_rows) {
+  assert(k % QK4_0 == 0);
+  static_assert(QK4_0 == QK8_0, "Q4_0 and Q8_0 block sizes must match");
+
+  const int nb = k / QK4_0;
+  const block_q4_0 *x = static_cast<const block_q4_0 *>(q4_weight);
+  const block_q8_0 *y = static_cast<const block_q8_0 *>(q8_activation);
+  constexpr size_t rows_per_group = 4;
+
+  size_t row = 0;
+  for (; row + rows_per_group <= num_rows; row += rows_per_group) {
+    float sumf[rows_per_group] = {};
+    for (int i = 0; i < nb; ++i) {
+      int sumi[rows_per_group] = {};
+      for (int j = 0; j < QK4_0 / 2; ++j) {
+        for (size_t r = 0; r < rows_per_group; ++r) {
+          const block_q4_0 &xr = x[(row + r) * nb + i];
+          const int q4_low = (xr.qs[j] & 0x0f) - 8;
+          const int q4_high = (xr.qs[j] >> 4) - 8;
+          sumi[r] += q4_low * y[i].qs[j] + q4_high * y[i].qs[j + QK4_0 / 2];
+        }
+      }
+      const float q8_scale = nntr_compute_fp16_to_fp32(y[i].d);
+      for (size_t r = 0; r < rows_per_group; ++r) {
+        sumf[r] += static_cast<float>(sumi[r]) *
+                   nntr_compute_fp16_to_fp32(x[(row + r) * nb + i].d) *
+                   q8_scale;
+      }
+    }
+    for (size_t r = 0; r < rows_per_group; ++r) {
+      output[row + r] = sumf[r];
+    }
+  }
+
+  for (; row < num_rows; ++row) {
+    float sumf = 0.0f;
+    const block_q4_0 *xr = x + row * nb;
+    for (int i = 0; i < nb; ++i) {
+      int sumi = 0;
+      for (int j = 0; j < QK4_0 / 2; ++j) {
+        const int q4_low = (xr[i].qs[j] & 0x0f) - 8;
+        const int q4_high = (xr[i].qs[j] >> 4) - 8;
+        sumi += q4_low * y[i].qs[j] + q4_high * y[i].qs[j + QK4_0 / 2];
+      }
+      sumf += static_cast<float>(sumi) * nntr_compute_fp16_to_fp32(xr[i].d) *
+              nntr_compute_fp16_to_fp32(y[i].d);
+    }
+    output[row] = sumf;
+  }
+}
+
 //============================================================================
 // Helper functions for block packing
 //============================================================================

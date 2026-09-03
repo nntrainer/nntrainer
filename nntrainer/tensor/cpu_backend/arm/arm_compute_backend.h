@@ -1108,6 +1108,17 @@ template <typename T = float>
 void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const T *A, const unsigned int lda, const void *B,
                const unsigned int ldb, T *C, const unsigned int ldc);
+
+/**
+ * @brief Compute canonical Q4_0 weight rows against one FP32 activation row
+ * @param N Number of canonical Q4_0 weight rows
+ * @param K Number of elements per activation and weight row
+ * @param A FP32 activation row to quantize online
+ * @param B Canonical row-major Q4_0 weights
+ * @param C FP32 output vector
+ */
+void gemv_q4_0_rowwise(const unsigned int N, const unsigned int K,
+                       const float *A, const void *B, float *C);
 void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                const unsigned int K, const float *A, const unsigned int lda,
                std::vector<void *> Bs, std::vector<unsigned int> ldbs,
@@ -1304,11 +1315,10 @@ void unpack_q4_0(const void *in_q4_0x, void *out_q4_0, size_t data_size,
                  const unsigned int M, const unsigned int N);
 
 /**
- * @brief Quantize float to q6_K Quantization format
- *
- * @param src float* src to be quantized
- * @param dst void* dst to store quantized data
- * @param k number of elements in src
+ * @brief Quantize one row to Q8_0
+ * @param src Source row
+ * @param dst Preallocated Q8_0 destination
+ * @param k Number of elements in the row
  */
 template <typename T = float>
 void quantize_row_q8_0(const T *__restrict src, void *__restrict dst,

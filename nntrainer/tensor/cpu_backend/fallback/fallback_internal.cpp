@@ -21,6 +21,7 @@
 #include <fallback_internal.h>
 #include <fp16.h>
 #include <limits>
+#include <nntr_ggml_impl.h>
 #include <q4_0_utils.h>
 #include <stdexcept>
 #include <tensor_dim.h>
@@ -49,6 +50,18 @@ struct block_q4_0x8 {
   uint16_t d[8];   // 16B
   uint8_t qs[128]; // 16 x u64
 };
+
+/**
+ * @brief Canonical Q8_0 block used by the fallback row-wise GEMV
+ */
+struct block_q8_0_fallback {
+  uint16_t d;
+  int8_t qs[QK4_0];
+};
+
+static_assert(sizeof(block_q8_0_fallback) ==
+                sizeof(uint16_t) + QK4_0 * sizeof(int8_t),
+              "Q8_0 block must not contain padding");
 
 void __fallback_sscal(const unsigned int N, const float alpha, float *X,
                       const unsigned int incX) {
@@ -495,6 +508,18 @@ void __fallback_gemm_q4_0(const unsigned int M, const unsigned int N,
                           const unsigned int ldb, float *C,
                           const unsigned int ldc) {
   throw std::runtime_error("NYI : __fallback_gemm_q4_0");
+}
+
+void __fallback_gemv_q4_0_rowwise(const unsigned int N, const unsigned int K,
+                                  const float *A, const void *B, float *C) {
+  assert(K % QK4_0 == 0);
+  if (N == 0)
+    return;
+
+  const size_t num_blocks = static_cast<size_t>(K) / QK4_0;
+  std::vector<block_q8_0_fallback> quantized_activation(num_blocks);
+  nntr_quantize_row_q8_0(A, quantized_activation.data(), K);
+  nntr_gemv_q4_0_q8_0_canonical_rows(K, C, B, quantized_activation.data(), N);
 }
 
 void __fallback_gemm_q4_K(const unsigned int M, const unsigned int N,

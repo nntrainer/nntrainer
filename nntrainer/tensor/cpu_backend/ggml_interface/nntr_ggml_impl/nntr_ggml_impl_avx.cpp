@@ -28,6 +28,96 @@
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
 
+static inline float q4_0_scale_to_float(nntr_fp16_t value) {
+  return _cvtsh_ss(value);
+}
+
+static inline __m256
+accumulate_q4_0_q8_0_avx2(const block_q4_0 &x, const __m256i q8_low,
+                          const __m256i q8_high, const float q8_scale,
+                          const __m128i low_mask, const __m128i offset,
+                          __m256 acc) {
+  const __m128i packed =
+    _mm_loadu_si128(reinterpret_cast<const __m128i *>(x.qs));
+  const __m128i q4_low = _mm_sub_epi8(_mm_and_si128(packed, low_mask), offset);
+  const __m128i q4_high =
+    _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(packed, 4), low_mask), offset);
+  __m256i sumi = _mm256_madd_epi16(_mm256_cvtepi8_epi16(q4_low), q8_low);
+  sumi = _mm256_add_epi32(
+    sumi, _mm256_madd_epi16(_mm256_cvtepi8_epi16(q4_high), q8_high));
+
+  const float scale = q4_0_scale_to_float(x.d) * q8_scale;
+  return _mm256_add_ps(
+    acc, _mm256_mul_ps(_mm256_cvtepi32_ps(sumi), _mm256_set1_ps(scale)));
+}
+
+void nntr_gemv_q4_0_q8_0_canonical_rows(int k, float *__restrict output,
+                                        const void *__restrict q4_weight,
+                                        const void *__restrict q8_activation,
+                                        size_t num_rows) {
+  assert(k % QK4_0 == 0);
+  static_assert(QK4_0 == QK8_0, "Q4_0 and Q8_0 block sizes must match");
+
+  const int nb = k / QK4_0;
+  const block_q4_0 *x = static_cast<const block_q4_0 *>(q4_weight);
+  const block_q8_0 *y = static_cast<const block_q8_0 *>(q8_activation);
+  constexpr size_t rows_per_group = 4;
+  const __m128i low_mask = _mm_set1_epi8(0x0f);
+  const __m128i offset = _mm_set1_epi8(8);
+
+  size_t row = 0;
+  for (; row + rows_per_group <= num_rows; row += rows_per_group) {
+    const block_q4_0 *x0 = x + row * nb;
+    const block_q4_0 *x1 = x0 + nb;
+    const block_q4_0 *x2 = x1 + nb;
+    const block_q4_0 *x3 = x2 + nb;
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+      const __m128i q8_low =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(y[i].qs));
+      const __m128i q8_high =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(y[i].qs + 16));
+      const __m256i q8_low_16 = _mm256_cvtepi8_epi16(q8_low);
+      const __m256i q8_high_16 = _mm256_cvtepi8_epi16(q8_high);
+      const float q8_scale = q4_0_scale_to_float(y[i].d);
+      acc0 = accumulate_q4_0_q8_0_avx2(x0[i], q8_low_16, q8_high_16, q8_scale,
+                                       low_mask, offset, acc0);
+      acc1 = accumulate_q4_0_q8_0_avx2(x1[i], q8_low_16, q8_high_16, q8_scale,
+                                       low_mask, offset, acc1);
+      acc2 = accumulate_q4_0_q8_0_avx2(x2[i], q8_low_16, q8_high_16, q8_scale,
+                                       low_mask, offset, acc2);
+      acc3 = accumulate_q4_0_q8_0_avx2(x3[i], q8_low_16, q8_high_16, q8_scale,
+                                       low_mask, offset, acc3);
+    }
+
+    output[row] = hsum_float_8(acc0);
+    output[row + 1] = hsum_float_8(acc1);
+    output[row + 2] = hsum_float_8(acc2);
+    output[row + 3] = hsum_float_8(acc3);
+  }
+
+  for (; row < num_rows; ++row) {
+    const block_q4_0 *xr = x + row * nb;
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+      const __m128i q8_low =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(y[i].qs));
+      const __m128i q8_high =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(y[i].qs + 16));
+      const __m256i q8_low_16 = _mm256_cvtepi8_epi16(q8_low);
+      const __m256i q8_high_16 = _mm256_cvtepi8_epi16(q8_high);
+      const float q8_scale = q4_0_scale_to_float(y[i].d);
+      acc = accumulate_q4_0_q8_0_avx2(xr[i], q8_low_16, q8_high_16, q8_scale,
+                                      low_mask, offset, acc);
+    }
+    output[row] = hsum_float_8(acc);
+  }
+}
+
 void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc) {

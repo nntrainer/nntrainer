@@ -29,6 +29,103 @@
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_utils.h>
 
+// SVE builds select this translation unit instead of the NEON implementation.
+// Use Advanced SIMD for canonical Q4_0 rows until a dedicated SVE kernel
+// exists.
+static inline float q4_0_scale_to_float(nntr_fp16_t value) {
+  __fp16 result;
+  std::memcpy(&result, &value, sizeof(value));
+  return static_cast<float>(result);
+}
+
+static inline float32x4_t
+accumulate_q4_0_q8_0_neon(const block_q4_0 &x, const int8x16_t q8_low,
+                          const int8x16_t q8_high, const float q8_scale,
+                          const uint8x16_t low_mask, const uint8x16_t offset,
+                          float32x4_t acc) {
+  const uint8x16_t packed = vld1q_u8(x.qs);
+  const int8x16_t q4_low =
+    vreinterpretq_s8_u8(vsubq_u8(vandq_u8(packed, low_mask), offset));
+  const int8x16_t q4_high =
+    vreinterpretq_s8_u8(vsubq_u8(vshrq_n_u8(packed, 4), offset));
+
+#if defined(__ARM_FEATURE_DOTPROD)
+  int32x4_t sumi = vdotq_s32(vdupq_n_s32(0), q4_low, q8_low);
+  sumi = vdotq_s32(sumi, q4_high, q8_high);
+#else
+  int32x4_t sumi =
+    vpaddlq_s16(vmull_s8(vget_low_s8(q4_low), vget_low_s8(q8_low)));
+  sumi = vaddq_s32(
+    sumi, vpaddlq_s16(vmull_s8(vget_high_s8(q4_low), vget_high_s8(q8_low))));
+  sumi = vaddq_s32(
+    sumi, vpaddlq_s16(vmull_s8(vget_low_s8(q4_high), vget_low_s8(q8_high))));
+  sumi = vaddq_s32(
+    sumi, vpaddlq_s16(vmull_s8(vget_high_s8(q4_high), vget_high_s8(q8_high))));
+#endif
+
+  const float scale = q4_0_scale_to_float(x.d) * q8_scale;
+  return vmlaq_n_f32(acc, vcvtq_f32_s32(sumi), scale);
+}
+
+void nntr_gemv_q4_0_q8_0_canonical_rows(int k, float *__restrict output,
+                                        const void *__restrict q4_weight,
+                                        const void *__restrict q8_activation,
+                                        size_t num_rows) {
+  assert(k % QK4_0 == 0);
+  static_assert(QK4_0 == QK8_0, "Q4_0 and Q8_0 block sizes must match");
+
+  const int nb = k / QK4_0;
+  const block_q4_0 *x = static_cast<const block_q4_0 *>(q4_weight);
+  const block_q8_0 *y = static_cast<const block_q8_0 *>(q8_activation);
+  constexpr size_t rows_per_group = 4;
+  const uint8x16_t low_mask = vdupq_n_u8(0x0f);
+  const uint8x16_t offset = vdupq_n_u8(8);
+
+  size_t row = 0;
+  for (; row + rows_per_group <= num_rows; row += rows_per_group) {
+    const block_q4_0 *x0 = x + row * nb;
+    const block_q4_0 *x1 = x0 + nb;
+    const block_q4_0 *x2 = x1 + nb;
+    const block_q4_0 *x3 = x2 + nb;
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+    for (int i = 0; i < nb; ++i) {
+      const int8x16_t q8_low = vld1q_s8(y[i].qs);
+      const int8x16_t q8_high = vld1q_s8(y[i].qs + 16);
+      const float q8_scale = q4_0_scale_to_float(y[i].d);
+      acc0 = accumulate_q4_0_q8_0_neon(x0[i], q8_low, q8_high, q8_scale,
+                                       low_mask, offset, acc0);
+      acc1 = accumulate_q4_0_q8_0_neon(x1[i], q8_low, q8_high, q8_scale,
+                                       low_mask, offset, acc1);
+      acc2 = accumulate_q4_0_q8_0_neon(x2[i], q8_low, q8_high, q8_scale,
+                                       low_mask, offset, acc2);
+      acc3 = accumulate_q4_0_q8_0_neon(x3[i], q8_low, q8_high, q8_scale,
+                                       low_mask, offset, acc3);
+    }
+
+    output[row] = vaddvq_f32(acc0);
+    output[row + 1] = vaddvq_f32(acc1);
+    output[row + 2] = vaddvq_f32(acc2);
+    output[row + 3] = vaddvq_f32(acc3);
+  }
+
+  for (; row < num_rows; ++row) {
+    const block_q4_0 *xr = x + row * nb;
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (int i = 0; i < nb; ++i) {
+      const int8x16_t q8_low = vld1q_s8(y[i].qs);
+      const int8x16_t q8_high = vld1q_s8(y[i].qs + 16);
+      const float q8_scale = q4_0_scale_to_float(y[i].d);
+      acc = accumulate_q4_0_q8_0_neon(xr[i], q8_low, q8_high, q8_scale,
+                                      low_mask, offset, acc);
+    }
+    output[row] = vaddvq_f32(acc);
+  }
+}
+
 void nntr_gemv_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc) {
