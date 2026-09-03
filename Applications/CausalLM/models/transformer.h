@@ -336,6 +336,27 @@ protected:
   std::pair<Tensor, Tensor> createKVCachePlaceholders(const int layer_id,
                                                       int n_heads);
 
+  /** @brief Host buffer offered for one named model input. */
+  struct NamedModelInput {
+    std::string name; /**< compiled input layer name */
+    float *data;      /**< host buffer, reinterpreted to the slot dtype */
+    size_t bytes;     /**< usable size of @a data in bytes */
+  };
+
+  /**
+   * @brief Arrange named external inputs in compiled positional order.
+   *
+   * Every compiled input must be matched by name; unmatched entries are
+   * collected in @a dropped (expected for hybrid architectures like LFM2
+   * whose conv blocks have no cache inputs).
+   */
+  std::vector<float *> buildOrderedInferenceInputs(
+    const std::vector<NamedModelInput> &named_inputs,
+    std::vector<std::string> *dropped = nullptr) const;
+
+  /** @brief Name of the primary (token/embedding) input layer. */
+  static constexpr const char *PRIMARY_INPUT_NAME = "input0";
+
   /**
    * @brief register CustomLayers
    */

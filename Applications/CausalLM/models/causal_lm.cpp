@@ -204,6 +204,32 @@ void CausalLM::allocateAndBindKVCache() {
   kv_cache_bound = true;
 }
 
+std::vector<float *> CausalLM::buildInferenceInputs(float *model_input,
+                                                    size_t model_input_bytes) {
+  std::vector<NamedModelInput> inputs;
+  inputs.reserve(1 + static_cast<size_t>(NUM_LAYERS) * 2);
+  inputs.push_back({PRIMARY_INPUT_NAME, model_input, model_input_bytes});
+
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    auto &kc = kv_cache.getKeyCache(i);
+    auto &vc = kv_cache.getValueCache(i);
+    inputs.push_back({"cache_k_l" + std::to_string(i),
+                      reinterpret_cast<float *>(kc.getData()), kc.bytes()});
+    inputs.push_back({"cache_v_l" + std::to_string(i),
+                      reinterpret_cast<float *>(vc.getData()), vc.bytes()});
+  }
+
+  // Dropped entries are expected for hybrid architectures (e.g. LFM2 conv
+  // blocks) but indicate a name mismatch otherwise.
+  std::vector<std::string> dropped;
+  auto ordered = buildOrderedInferenceInputs(inputs, &dropped);
+  for (const auto &name : dropped)
+    ml_logd("[CausalLM] KV cache '%s' is not a compiled model input; skipped",
+            name.c_str());
+
+  return ordered;
+}
+
 void CausalLM::setKVCachePosition(unsigned int pos) {
   kv_cache.setPosition(pos);
   std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &, void *)>
@@ -485,31 +511,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
    * PREFILL
    */
   std::vector<int64_t> token_ids;
-  input.push_back(input_sample);
-  auto build_inference_inputs = [&]() {
-    std::vector<std::pair<std::string, float *>> cache_inputs;
-    cache_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
-    for (int i = 0; i < NUM_LAYERS; ++i) {
-      cache_inputs.emplace_back(
-        "cache_k_l" + std::to_string(i),
-        reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
-      cache_inputs.emplace_back(
-        "cache_v_l" + std::to_string(i),
-        reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
-    }
-
-    std::sort(
-      cache_inputs.begin(), cache_inputs.end(),
-      [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
-
-    std::vector<float *> inference_inputs;
-    inference_inputs.reserve(1 + cache_inputs.size());
-    inference_inputs.push_back(input_sample);
-    for (const auto &cache_input : cache_inputs)
-      inference_inputs.push_back(cache_input.second);
-    return inference_inputs;
-  };
-  input = build_inference_inputs();
+  input = buildInferenceInputs(input_sample,
+                               sizeof(float) * BATCH_SIZE * MAX_SEQ_LEN);
 
   ///@note contains possible bug
   // std::vector<ml::train::TensorDim> input_dims;

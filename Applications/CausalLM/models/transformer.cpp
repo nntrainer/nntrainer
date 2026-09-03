@@ -462,6 +462,61 @@ Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
   return {cache_k_input(Tensor()), cache_v_input(Tensor())};
 }
 
+std::vector<float *> Transformer::buildOrderedInferenceInputs(
+  const std::vector<NamedModelInput> &named_inputs,
+  std::vector<std::string> *dropped) const {
+  NNTR_THROW_IF(model == nullptr, std::logic_error)
+    << "Cannot build inference inputs before model initialization";
+
+  std::map<std::string, const NamedModelInput *> input_by_name;
+  for (const auto &input : named_inputs) {
+    NNTR_THROW_IF(input.name.empty(), std::invalid_argument)
+      << "Named model input must not have an empty name";
+    NNTR_THROW_IF(input.data == nullptr, std::invalid_argument)
+      << "Named model input pointer must not be null: " << input.name;
+    NNTR_THROW_IF(!input_by_name.emplace(input.name, &input).second,
+                  std::invalid_argument)
+      << "Duplicate named model input: " << input.name;
+  }
+
+  const auto input_names = model->getInputNames();
+  const auto input_dims = model->getInputDimension();
+  NNTR_THROW_IF(input_names.size() != input_dims.size(), std::logic_error)
+    << "Compiled model input names and dimensions are not synchronized";
+
+  std::vector<float *> ordered_inputs;
+  ordered_inputs.reserve(input_names.size());
+
+  for (size_t idx = 0; idx < input_names.size(); ++idx) {
+    const auto &name = input_names[idx];
+    const auto named_input = input_by_name.find(name);
+    NNTR_THROW_IF(named_input == input_by_name.end(), std::invalid_argument)
+      << "No host buffer offered for compiled model input: " << name;
+
+    // Reject undersized buffers: the graph reinterprets the raw pointer with
+    // the slot dim, so a smaller buffer would read/write past its end.
+    const size_t slot_bytes =
+      static_cast<size_t>(input_dims[idx].getDataLen()) *
+      input_dims[idx].getDataTypeSize();
+    NNTR_THROW_IF(named_input->second->bytes < slot_bytes,
+                  std::invalid_argument)
+      << "Host buffer for model input '" << name
+      << "' is too small: " << named_input->second->bytes << " bytes offered, "
+      << slot_bytes << " bytes required by the compiled slot";
+
+    ordered_inputs.push_back(named_input->second->data);
+    input_by_name.erase(named_input);
+  }
+
+  if (dropped != nullptr) {
+    dropped->reserve(input_by_name.size());
+    for (const auto &leftover : input_by_name)
+      dropped->push_back(leftover.first);
+  }
+
+  return ordered_inputs;
+}
+
 /**
  * @brief Create the default attention subgraph.
  */

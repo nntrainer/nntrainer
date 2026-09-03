@@ -1485,7 +1485,11 @@ NeuralNetwork::inference(unsigned int batch_size,
   sharedConstTensors input_tensors, output_tensors;
   auto in_dim = getInputDimension();
 
-  input_tensors.reserve(input.size());
+  NNTR_THROW_IF(input.size() != in_dim.size(), std::invalid_argument)
+    << "input pointer count does not match the model input count: received "
+    << input.size() << ", expected " << in_dim.size();
+
+  input_tensors.reserve(in_dim.size());
   for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
     in_dim[idx].batch(batch_size);
     input_tensors.emplace_back(
@@ -1495,7 +1499,11 @@ NeuralNetwork::inference(unsigned int batch_size,
   if (!label.empty()) {
     sharedConstTensors label_tensors;
     auto label_dim = getOutputDimension();
-    label_tensors.reserve(label.size());
+    NNTR_THROW_IF(label.size() != label_dim.size(), std::invalid_argument)
+      << "label pointer count does not match the model output count: received "
+      << label.size() << ", expected " << label_dim.size();
+
+    label_tensors.reserve(label_dim.size());
     for (unsigned int idx = 0; idx < label_dim.size(); idx++) {
       label_dim[idx].batch(batch_size);
       label_tensors.emplace_back(
@@ -1564,7 +1572,11 @@ std::vector<float *> NeuralNetwork::incremental_inference(
   sharedConstTensors input_tensors, output_tensors;
   auto in_dim = getInputDimension();
 
-  input_tensors.reserve(input.size());
+  NNTR_THROW_IF(input.size() != in_dim.size(), std::invalid_argument)
+    << "input pointer count does not match the model input count: received "
+    << input.size() << ", expected " << in_dim.size();
+
+  input_tensors.reserve(in_dim.size());
   for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
     in_dim[idx].batch(batch_size);
     input_tensors.emplace_back(
@@ -1575,7 +1587,11 @@ std::vector<float *> NeuralNetwork::incremental_inference(
   if (!label.empty()) {
     sharedConstTensors label_tensors;
     auto label_dim = getOutputDimension();
-    label_tensors.reserve(label.size());
+    NNTR_THROW_IF(label.size() != label_dim.size(), std::invalid_argument)
+      << "label pointer count does not match the model output count: received "
+      << label.size() << ", expected " << label_dim.size();
+
+    label_tensors.reserve(label_dim.size());
     for (unsigned int idx = 0; idx < label_dim.size(); idx++) {
       label_dim[idx].batch(batch_size);
       label_tensors.emplace_back(

@@ -287,7 +287,7 @@ public:
       }
     }
 
-    auto [input, cache_inputs] = buildCacheInput(input_sample);
+    auto input = buildCacheInput(input_sample);
     std::vector<float *> label;
     this->setKVCachePosition(0);
     auto output = this->model->incremental_inference(
@@ -316,7 +316,7 @@ public:
         input_sample[static_cast<size_t>(b) * this->MAX_SEQ_LEN + i] =
           static_cast<float>(ids[i]);
 
-    auto [input, cache_inputs] = buildCacheInput(input_sample);
+    auto input = buildCacheInput(input_sample);
     std::vector<float *> label;
 
     this->setKVCachePosition(0);
@@ -390,35 +390,55 @@ public:
     this->model->forEachLayer(fn, nullptr);
   }
 
+  /** @brief Compiled model input names (for input-order regression tests). */
+  std::vector<std::string> getInputNamesForTest() {
+    return this->model->getInputNames();
+  }
+
+  /** @brief Compiled input dimensions (for input-order regression tests). */
+  std::vector<ml::train::TensorDim> getInputDimensionsForTest() {
+    return this->model->getInputDimension();
+  }
+
+  /** @brief Build production inference inputs (for input-order regression
+   * tests). */
+  std::vector<float *> buildInferenceInputsForTest(std::vector<float> &input) {
+    this->allocateAndBindKVCache();
+    return this->buildInferenceInputs(input.data(),
+                                      input.size() * sizeof(float));
+  }
+
+  /** @brief One host-owned KV cache buffer, as bound at inference time. */
+  struct CacheBufferForTest {
+    float *data;              /**< buffer start */
+    size_t bytes;             /**< allocated size in bytes */
+    ml::train::TensorDim dim; /**< logical cache dimension */
+  };
+
+  /** @brief Get one key cache buffer. */
+  CacheBufferForTest getKeyCacheForTest(unsigned int layer_id) {
+    auto &cache = this->kv_cache.getKeyCache(layer_id);
+    return {reinterpret_cast<float *>(cache.getData()), cache.bytes(),
+            cache.getDim()};
+  }
+
+  /** @brief Get one value cache buffer. */
+  CacheBufferForTest getValueCacheForTest(unsigned int layer_id) {
+    auto &cache = this->kv_cache.getValueCache(layer_id);
+    return {reinterpret_cast<float *>(cache.getData()), cache.bytes(),
+            cache.getDim()};
+  }
+
 private:
   /**
-   * @brief Build the (input, cache_inputs) pair for incremental_inference
-   *
-   * The returned cache_inputs keeps the string keys alive; input holds raw
-   * pointers into input_sample and cache buffers.
+   * @brief Build positional pointers for incremental_inference
    */
-  std::pair<std::vector<float *>, std::vector<std::pair<std::string, float *>>>
-  buildCacheInput(std::vector<float> &input_sample) {
-    std::vector<std::pair<std::string, float *>> cache_inputs;
-    cache_inputs.reserve(static_cast<size_t>(this->NUM_LAYERS) * 2);
-    for (int i = 0; i < this->NUM_LAYERS; ++i) {
-      cache_inputs.emplace_back(
-        "cache_k_l" + std::to_string(i),
-        reinterpret_cast<float *>(this->kv_cache.getKeyCache(i).getData()));
-      cache_inputs.emplace_back(
-        "cache_v_l" + std::to_string(i),
-        reinterpret_cast<float *>(this->kv_cache.getValueCache(i).getData()));
-    }
-    std::sort(cache_inputs.begin(), cache_inputs.end(),
-              [](const auto &l, const auto &r) { return l.first < r.first; });
-
-    std::vector<float *> input;
-    input.reserve(1 + cache_inputs.size());
-    input.push_back(input_sample.data());
-    for (const auto &ci : cache_inputs)
-      input.push_back(ci.second);
-
-    return {std::move(input), std::move(cache_inputs)};
+  std::vector<float *> buildCacheInput(std::vector<float> &input_sample) {
+    // Delegate to the production path so test inference uses the same
+    // compiled-input ordering as CausalLM::run().
+    this->allocateAndBindKVCache();
+    return this->buildInferenceInputs(input_sample.data(),
+                                      input_sample.size() * sizeof(float));
   }
 };
 

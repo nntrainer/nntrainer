@@ -672,6 +672,12 @@ TEST(nntrainer_ccapi_graph, simple_fc_compile_p) {
   auto model = createModel(ModelType::NEURAL_NET, {"batch_size=1"});
   EXPECT_EQ(model->compile(x, y, ml::train::ExecutionMode::INFERENCE),
             ML_ERROR_NONE);
+  EXPECT_EQ(model->getInputNames(), std::vector<std::string>({"input"}));
+
+  // Reject missing positional input instead of indexing past the vector.
+  EXPECT_THROW(model->inference(1, {}), std::invalid_argument);
+  EXPECT_THROW(model->incremental_inference(1, {}, {}, 1, 0, 1),
+               std::invalid_argument);
 }
 
 /**

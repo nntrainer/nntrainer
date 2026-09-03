@@ -217,6 +217,15 @@ protected:
   bool kv_cache_bound = false; /**< True once KV cache tensors are bound */
 
   /**
+   * @brief Build model inputs in compiled positional order.
+   *
+   * @param model_input       primary (token or embedding) host buffer
+   * @param model_input_bytes usable size of @a model_input in bytes
+   */
+  std::vector<float *> buildInferenceInputs(float *model_input,
+                                            size_t model_input_bytes);
+
+  /**
    * @brief Allocate kv_cache and bind it to all mha_core layers via
    *        Model::setExternalTensors. Idempotent — safe to call once after
    *        initialize().

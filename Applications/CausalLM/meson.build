@@ -362,4 +362,38 @@ if get_option('enable-test')
       env: {'NNTR_QUANTIZE_BIN': e_quantize.full_path()}
     )
   endif
+
+  enable_gemma4_fp16_input_order_test = (
+    platform in model_unittest_platforms and get_option('enable-fp16')
+  )
+  if enable_gemma4_fp16_input_order_test
+    unittest_gemma4_input_order_fp16 = executable(
+      'unittest_gemma4_input_order_fp16',
+      [
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'causallm_test_utils.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4.cpp',
+      ],
+      dependencies: [
+        nntrainer_dep,
+        nntrainer_ccapi_dep,
+        gtest_main_dep,
+        causallm_layer_dependencies,
+        causallm_dep
+      ],
+      include_directories: causallm_inc + [causallm_unittest_inc],
+      build_by_default: true,
+      install: false,
+    )
+
+    test('unittest_gemma4_input_order_fp16',
+      unittest_gemma4_input_order_fp16,
+      args: [
+        '--gtest_filter=Gemma4KVCacheInputOrderTest.*',
+        '--gtest_output=xml:@0@/@1@.xml'.format(
+          meson.build_root(), 'unittest_gemma4_input_order_fp16')
+      ],
+      timeout: 60,
+      suite: 'unittests'
+    )
+  endif
 endif
