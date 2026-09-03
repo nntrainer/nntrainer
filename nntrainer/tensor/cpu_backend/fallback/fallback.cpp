@@ -16,14 +16,13 @@
 #include <compute_ops.h>
 #include <fallback.h>
 #include <fallback_internal.h>
+#include <ggml_interface.h>
 #include <nntrainer_error.h>
 
 namespace nntrainer {
 
 void init_backend() {
-  // Fallback build has no GGML / OpenBLAS to set up — bind the CPU
-  // ops table directly. Same shape as the ARM / x86 init_backend
-  // entry points so callers can use ensureComputeOps() uniformly.
+  __ggml_init();
   g_compute_ops = get_cpu_ops();
 }
 
@@ -233,6 +232,21 @@ void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const float *A, const unsigned int lda, const void *B,
                const unsigned int ldb, float *C, const unsigned int ldc) {
   return __fallback_gemm_q4_0<float>(M, N, K, A, lda, B, ldb, C, ldc);
+}
+
+size_t q4_0_gemv_activation_size(const unsigned int K) {
+  return __ggml_q4_0_gemv_activation_size(K);
+}
+
+void quantize_q4_0_gemv_activation(const unsigned int K, const float *A,
+                                   void *quantized_A) {
+  __ggml_quantize_q4_0_gemv_activation(K, A, quantized_A);
+}
+
+void gemv_q4_0_rowwise_range(const unsigned int row_begin,
+                             const unsigned int row_end, const unsigned int K,
+                             const void *quantized_A, const void *B, float *C) {
+  __ggml_gemv_q4_0_rowwise_range(row_begin, row_end, K, quantized_A, B, C);
 }
 
 void gemm_q4_K(const unsigned int M, const unsigned int N, const unsigned int K,

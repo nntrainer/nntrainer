@@ -1004,6 +1004,13 @@ template <typename T = float>
 void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const T *A, const unsigned int lda, const void *B,
                const unsigned int ldb, T *C, const unsigned int ldc);
+
+size_t q4_0_gemv_activation_size(const unsigned int K);
+void quantize_q4_0_gemv_activation(const unsigned int K, const float *A,
+                                   void *quantized_A);
+void gemv_q4_0_rowwise_range(const unsigned int row_begin,
+                             const unsigned int row_end, const unsigned int K,
+                             const void *quantized_A, const void *B, float *C);
 /**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *

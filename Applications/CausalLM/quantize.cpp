@@ -78,6 +78,11 @@
 #endif
 #include "gptoss_causallm.h"
 #include "lfm2_causallm.h"
+#include "lfm2_moe_causallm.h"
+#include "lfm2_slim_moe_causallm.h"
+#if !defined(_WIN32)
+#include "lfm2_cached_slim_moe_causallm.h"
+#endif
 #if !defined(_WIN32) && !defined(__ANDROID__)
 #include "multilingual_tinybert_16mb.h"
 #endif
@@ -369,6 +374,24 @@ void registerAllModels() {
                           return std::make_unique<causallm::Lfm2CausalLM>(
                             cfg, generation_cfg, nntr_cfg);
                         });
+  factory.registerModel("Lfm2MoeForCausalLM",
+                        [](json cfg, json generation_cfg, json nntr_cfg) {
+                          return std::make_unique<causallm::Lfm2MoeCausalLM>(
+                            cfg, generation_cfg, nntr_cfg);
+                        });
+  factory.registerModel("Lfm2SlimMoeForCausalLM",
+                        [](json cfg, json generation_cfg, json nntr_cfg) {
+                          return std::make_unique<causallm::Lfm2SlimMoeCausalLM>(
+                            cfg, generation_cfg, nntr_cfg);
+                        });
+#if !defined(_WIN32)
+  factory.registerModel(
+    "Lfm2CachedSlimMoeForCausalLM",
+    [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Lfm2CachedSlimMoeCausalLM>(
+        cfg, generation_cfg, nntr_cfg);
+    });
+#endif
   factory.registerModel("DebertaV2", [](json cfg, json generation_cfg,
                                         json nntr_cfg) {
     return std::make_unique<causallm::DebertaV2>(cfg, generation_cfg, nntr_cfg);

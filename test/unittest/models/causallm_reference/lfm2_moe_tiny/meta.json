@@ -1,0 +1,15 @@
+{
+  "seed": 42,
+  "n_gen": 4,
+  "input_ids": [
+    1,
+    4,
+    2,
+    3
+  ],
+  "logits_atol_fp32": 0.01,
+  "logits_atol_q40": 5.0,
+  "prefix_match_min": 2,
+  "torch_version": "2.12.0+cu130",
+  "note": "Pure-PyTorch reference; no HuggingFace transformers dependency. Forward pass mirrors nntrainer's LFM2-MoE computation (sigmoid router + expert bias for top-k selection)."
+}

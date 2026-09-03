@@ -280,9 +280,13 @@ void Lfm2Transformer::setupLfm2Parameters(json &cfg, json &generation_cfg,
       }
     }
 
+    // Hugging Face LFM2 configs omit tie_word_embeddings while the model
+    // configuration defaults it to true and the checkpoint has no standalone
+    // lm_head weight. Match that default so the graph and converted binary
+    // request the same set of weights.
     TIE_WORD_EMBEDDINGS = cfg.contains("tie_word_embeddings")
                             ? cfg["tie_word_embeddings"].get<bool>()
-                            : false;
+                            : true;
 
     USE_EMBEDDING = nntr_cfg.contains("use_embedding")
                       ? nntr_cfg["use_embedding"].get<bool>()

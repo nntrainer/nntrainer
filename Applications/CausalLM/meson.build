@@ -209,6 +209,18 @@ test_api = executable('test_api',
     install: false,
 )
 
+# Temporary diagnostic tool for debugging LFM2-MoE real-weight inference.
+if get_option('enable-test')
+  debug_dump_logits_inc = include_directories('../../test/unittest/models')
+  debug_dump_logits = executable('debug_dump_logits',
+      meson.current_source_dir() / 'debug_dump_logits.cpp',
+      include_directories: [causallm_inc, debug_dump_logits_inc],
+      dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+      build_by_default: true,
+      install: false,
+  )
+endif
+
 # KVCacheManager unit tests
 if get_option('enable-test')
   causallm_unittest_inc = include_directories(
@@ -342,6 +354,10 @@ if get_option('enable-test')
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_xlm_roberta_reference.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2.cpp',
         meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2_moe.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2_moe_reference.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2_slim_moe.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_lfm2_cached_slim_moe.cpp',
       ],
       dependencies: [
         nntrainer_dep,

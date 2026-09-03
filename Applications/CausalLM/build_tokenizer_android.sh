@@ -161,54 +161,51 @@ find "$CURRENT_BUILD_DIR" -name "*.a" -type f | while read -r lib; do
     echo "Found library: $lib"
 done
 
-# Collect all libraries to combine
-LIBS_TO_COMBINE=""
-
-# Search for specific libraries with more flexible paths
-for lib_name in "libtokenizers_cpp.a" "libtokenizers_c.a" "libsentencepiece.a"; do
-    echo "Searching for $lib_name..."
-    lib_path=$(find "$CURRENT_BUILD_DIR" -name "$lib_name" -type f | head -n 1)
-    if [ -n "$lib_path" ]; then
-        echo "Found $lib_name at: $lib_path"
-        LIBS_TO_COMBINE="$LIBS_TO_COMBINE $lib_path"
-    fi
-done
-
-# If specific libraries not found, collect all .a files
-if [ -z "$LIBS_TO_COMBINE" ]; then
-    echo "Specific libraries not found. Collecting all .a files..."
-    LIBS_TO_COMBINE=$(find "$CURRENT_BUILD_DIR" -name "*.a" -type f | grep -v "CMakeFiles" | tr '\n' ' ')
-fi
+# Collect every static library produced by the build (tokenizers-cpp,
+# sentencepiece, protobuf-lite, and all the Abseil archives sentencepiece
+# depends on for logging/random/strings/synchronization). Combining only a
+# hand-picked subset silently drops transitive deps and produces an archive
+# with undefined symbols at final link time (e.g. absl::StrCat, absl::
+# SetMinLogLevel, google::protobuf::operator<<).
+LIBS_TO_COMBINE=$(find "$CURRENT_BUILD_DIR" -name "*.a" -type f | grep -v "CMakeFiles" | tr '\n' ' ')
 
 # Combine all libraries into one
 if [ -n "$LIBS_TO_COMBINE" ]; then
     echo "Libraries to combine: $LIBS_TO_COMBINE"
-    
+
     # Create a temporary directory for extracting object files
     TEMP_DIR="$BUILD_DIR/temp_objs"
     rm -rf "$TEMP_DIR"
     mkdir -p "$TEMP_DIR"
-    cd "$TEMP_DIR"
-    
-    # Extract all object files from each library
+
+    # Extract each library's object files into its own subdirectory. Many
+    # Abseil archives contain identically-named translation units (e.g.
+    # globals.cc.o, internal.cc.o) across different subdirs — extracting them
+    # all into one flat directory silently overwrites earlier objects and
+    # drops their symbols from the final combined archive.
+    LIB_INDEX=0
     for lib in $LIBS_TO_COMBINE; do
         if [ -f "$lib" ]; then
             echo "Extracting from $lib..."
-            "$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/llvm-ar" x "$lib"
+            LIB_INDEX=$((LIB_INDEX + 1))
+            LIB_OBJ_DIR="$TEMP_DIR/lib_$LIB_INDEX"
+            mkdir -p "$LIB_OBJ_DIR"
+            (cd "$LIB_OBJ_DIR" && "$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/llvm-ar" x "$lib")
         else
             echo "Warning: Could not find $lib"
         fi
     done
-    
+
     # Create the combined library
     echo "Creating combined library..."
-    if ls *.o 1> /dev/null 2>&1; then
-        "$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/llvm-ar" rcs "$SCRIPT_DIR/lib/$TARGET_ABI/libtokenizers_android_c.a" *.o
+    ALL_OBJS=$(find "$TEMP_DIR" -name "*.o" -type f)
+    if [ -n "$ALL_OBJS" ]; then
+        "$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/llvm-ar" rcs "$SCRIPT_DIR/lib/$TARGET_ABI/libtokenizers_android_c.a" $ALL_OBJS
         echo "Combined library created successfully"
     else
         echo "Error: No object files found to combine"
         echo "Checking if any libraries were built..."
-        
+
         # If no object files, maybe the libraries are header-only or built differently
         # Try to copy the first found library as-is
         first_lib=$(echo $LIBS_TO_COMBINE | awk '{print $1}')
@@ -216,14 +213,12 @@ if [ -n "$LIBS_TO_COMBINE" ]; then
             echo "Copying $first_lib as libtokenizers_android_c.a"
             cp "$first_lib" "$SCRIPT_DIR/lib/$TARGET_ABI/libtokenizers_android_c.a"
         else
-            cd ..
             rm -rf "$TEMP_DIR"
             exit 1
         fi
     fi
-    
+
     # Clean up
-    cd ..
     rm -rf "$TEMP_DIR"
 else
     echo "Error: No libraries found to combine"

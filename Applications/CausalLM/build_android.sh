@@ -4,6 +4,9 @@
 # This script builds libcausallm_core.so and nntrainer_causallm executable
 set -e
 
+export ANDROID_NDK=~/Desktop/workspace/android-ndk-r26d
+export PATH=${PATH}:${ANDROID_NDK}
+
 # Parse options
 USE_BUILD_CACHE=0
 while [[ $# -gt 0 ]]; do
