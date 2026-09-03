@@ -432,6 +432,42 @@ void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
   neon::rms_norm_wrt_width_fp16_intrinsic(X, Y, H, W, epsilon);
 }
 
+size_t get_rhs_packed_size_f16_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                                 size_t idx_variant,
+                                                 bool is_nxk) {
+  return __kai_get_rhs_packed_size_f16_qsi4cxp_qs4cxs1s0(n, k, idx_variant,
+                                                         is_nxk);
+}
+
+void rhs_pack_f16_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
+                                    void *rhs_packed_mtx_qs4cx,
+                                    void *rhs_native_mtx_qs4cx,
+                                    void *rhs_scales_f32, size_t idx_variant,
+                                    bool is_nxk) {
+  __kai_rhs_pack_f16_qsi4cxp_qs4cxs1s0(n, k, rhs_packed_mtx_qs4cx,
+                                       rhs_native_mtx_qs4cx, rhs_scales_f32,
+                                       idx_variant, is_nxk);
+}
+
+void gemm_f16_qai8dxp_qsi4cxp_rhs_unpacked(
+  size_t m, size_t n, size_t k, void *lhs_native_mtx_f16,
+  void *rhs_native_mtx_qs4cx, void *rhs_scales_f32, void *dst_act_mtx_f16,
+  size_t idx_variant, bool is_nxk, float lower_bound, float upper_bound) {
+  __kai_gemm_f16_qai8dxp_qsi4cxp_rhs_unpacked(
+    m, n, k, lhs_native_mtx_f16, rhs_native_mtx_qs4cx, rhs_scales_f32,
+    dst_act_mtx_f16, idx_variant, is_nxk, lower_bound, upper_bound);
+}
+
+void gemm_f16_qai8dxp_qsi4cxp(size_t m, size_t n, size_t k,
+                              void *lhs_native_mtx_f16,
+                              void *rhs_packed_mtx_qs4cx, void *dst_act_mtx_f16,
+                              size_t idx_variant, float lower_bound,
+                              float upper_bound) {
+  __kai_gemm_f16_qai8dxp_qsi4cxp(m, n, k, lhs_native_mtx_f16,
+                                 rhs_packed_mtx_qs4cx, dst_act_mtx_f16,
+                                 idx_variant, lower_bound, upper_bound);
+}
+
 void nntr_quant_qs4c32_f32(size_t n, size_t k, size_t bl,
                            void *rhs_native_mtx_f32,
                            void *rhs_native_mtx_qs4c32) {
