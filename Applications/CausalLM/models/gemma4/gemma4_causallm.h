@@ -72,6 +72,9 @@ protected:
   unsigned int getKVCacheWidth(int layer_id) const;
   void appendSkipPrefillIfNeeded(std::vector<std::string> &props,
                                  bool enable_skip) const;
+  virtual Tensor createFeedForwardBlock(const int layer_id,
+                                        Tensor post_attention,
+                                        bool is_kv_shared_layer);
   std::pair<Tensor, Tensor>
   createGemma4KVCachePlaceholders(const int layer_id, unsigned int kv_width);
 

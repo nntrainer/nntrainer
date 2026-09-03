@@ -24,6 +24,7 @@
 #include <gtest/gtest.h>
 
 #include <gemma4_causallm.h>
+#include <gemma4_moe_causallm.h>
 
 #include <memory>
 
@@ -46,6 +47,22 @@ public:
 };
 
 /**
+ * @brief Gemma4 MoE adapter that sanitizes configs before Transformer init
+ */
+class ReferenceGemma4MoE final
+  : public causallm_test::CausalLMTestAdapter<causallm::Gemma4MoECausalLM> {
+public:
+  ReferenceGemma4MoE(causallm::json &cfg, causallm::json &generation_cfg,
+                     causallm::json &nntr_cfg) :
+    causallm::Transformer(causallm::Gemma4Transformer::sanitizeConfig(cfg),
+                          causallm::Gemma4Transformer::sanitizeGenerationConfig(
+                            generation_cfg, cfg),
+                          nntr_cfg, causallm::ModelType::CAUSALLM),
+    causallm_test::CausalLMTestAdapter<causallm::Gemma4MoECausalLM>(
+      cfg, generation_cfg, nntr_cfg) {}
+};
+
+/**
  * @brief Differential model descriptor for the tiny Gemma4 fixture
  */
 causallm_test::DifferentialModel gemma4Model() {
@@ -56,6 +73,33 @@ causallm_test::DifferentialModel gemma4Model() {
     },
   };
 }
+
+/**
+ * @brief Differential model descriptor for the tiny Gemma4 MoE fixture
+ */
+causallm_test::DifferentialModel gemma4MoEModel() {
+  return {
+    "gemma4_moe_tiny",
+    [](causallm::json &cfg, causallm::json &gen_cfg, causallm::json &nntr_cfg) {
+      return std::make_unique<ReferenceGemma4MoE>(cfg, gen_cfg, nntr_cfg);
+    },
+  };
+}
+
+#if !defined(_WIN32)
+/**
+ * @brief Differential descriptor with bounded virtual expert weights enabled
+ */
+causallm_test::DifferentialModel gemma4MoECachedModel() {
+  return {
+    "gemma4_moe_tiny",
+    [](causallm::json &cfg, causallm::json &gen_cfg, causallm::json &nntr_cfg) {
+      nntr_cfg["moe_cache_size"] = 1;
+      return std::make_unique<ReferenceGemma4MoE>(cfg, gen_cfg, nntr_cfg);
+    },
+  };
+}
+#endif
 
 /**
  * @brief FP32 prefill logits and greedy tokens match the HF reference
@@ -75,5 +119,35 @@ TEST(Gemma4DifferentialTest, FP32MatchesHFReference) {
 TEST(Gemma4DifferentialTest, Q40CloseToFP32Reference) {
   causallm_test::runQ40DifferentialChecks(gemma4Model());
 }
+
+/**
+ * @brief Gemma4 MoE FP32 prefill logits and greedy tokens match HF
+ */
+TEST(Gemma4MoEDifferentialTest, FP32MatchesHFReference) {
+  causallm_test::runFp32DifferentialChecks(gemma4MoEModel());
+}
+
+/**
+ * @brief Gemma4 MoE Q4_0 logits and generation stay close to HF FP32
+ */
+TEST(Gemma4MoEDifferentialTest, Q40CloseToFP32Reference) {
+  causallm_test::runQ40DifferentialChecks(gemma4MoEModel());
+}
+
+#if !defined(_WIN32)
+/**
+ * @brief FP32 virtual experts and bounded prefetch preserve HF output
+ */
+TEST(Gemma4MoEVirtualCacheDifferentialTest, FP32MatchesHFReference) {
+  causallm_test::runFp32DifferentialChecks(gemma4MoECachedModel());
+}
+
+/**
+ * @brief Q4_0 virtual experts and bounded prefetch preserve HF output
+ */
+TEST(Gemma4MoEVirtualCacheDifferentialTest, Q40CloseToFP32Reference) {
+  causallm_test::runQ40DifferentialChecks(gemma4MoECachedModel());
+}
+#endif
 
 } // namespace

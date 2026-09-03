@@ -1,0 +1,18 @@
+{
+  "seed": 17,
+  "n_gen": 4,
+  "input_ids": [
+    1,
+    4,
+    2,
+    3
+  ],
+  "logits_atol_fp32": 0.01,
+  "logits_atol_q40": 5.0,
+  "prefix_match_min": 2,
+  "top2_logit_margin": 0.1370646059513092,
+  "minimum_greedy_margin": 0.10221818089485168,
+  "transformers_version": "5.15.0.dev0",
+  "transformers_commit": "d24d79da55f7ee6e538a460d3025e41dcc41ab21",
+  "torch_version": "2.11.0"
+}
