@@ -307,8 +307,11 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
   unsigned int step_size = (incremental_step_size > 0)
                              ? incremental_step_size
                              : (unsigned int)query.height();
-  unsigned int from = cache_index;
-  unsigned int to = cache_index + step_size;
+  unsigned int from =
+    kv_cache_manager_ ? kv_cache_manager_->getPosition() : cache_index;
+  unsigned int to = from + step_size;
+  // Keep cache_index in sync for one_batch_incremental_forwarding().
+  cache_index = from;
 
   auto get_step_dim = [step_size](const ml::train::TensorDim &dim) {
     auto step_dim = dim;
@@ -395,7 +398,11 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
     }
   }
 
-  cache_index += step_size;
+  // With a bound KVCacheManager, the host advances the shared position
+  // once per step (see CausalLM::advanceKVCachePosition).
+  if (!kv_cache_manager_) {
+    cache_index += step_size;
+  }
 }
 
 /**
@@ -406,12 +413,14 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int _from, unsigned int _to,
                                           bool training) {
-  // External KV cache path: from/to are interpreted as the absolute write
-  // position; route through forwarding() which reads cache_key/cache_value
-  // from input slots 3/4. forwarding() advances cache_index internally.
+  // External KV cache path: route through forwarding(). Step size comes from
+  // _to - _from. When a KVCacheManager is bound, it owns the write position;
+  // otherwise fall back to _from for back-compat.
   if (use_external_cache) {
-    cache_index = _from;
     incremental_step_size = _to - _from;
+    if (!kv_cache_manager_) {
+      cache_index = _from;
+    }
     forwarding(context, training);
     incremental_step_size = 0;
     return;
@@ -1555,9 +1564,12 @@ void MHACoreLayer::setProperty(const std::vector<std::string> &values) {
   for (const auto &value : values) {
     std::string key;
     std::string parsed_value;
-    if (nntrainer::getKeyValue(value, key, parsed_value) == ML_ERROR_NONE &&
-        key == "cache_index") {
-      setCacheIndex(static_cast<unsigned int>(std::stoul(parsed_value)));
+    if (nntrainer::getKeyValue(value, key, parsed_value) == ML_ERROR_NONE) {
+      if (key == "cache_index") {
+        setCacheIndex(static_cast<unsigned int>(std::stoul(parsed_value)));
+      } else {
+        props.push_back(value);
+      }
     } else {
       props.push_back(value);
     }
