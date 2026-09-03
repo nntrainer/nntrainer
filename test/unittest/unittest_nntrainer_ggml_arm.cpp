@@ -28,6 +28,10 @@
 #include <nntrainer_test_util.h>
 #include <thread_manager.h>
 
+// keep this include last: it defines quantization block macros (e.g. Q4_0)
+// that collide with enum values in base_properties.h if included earlier
+#include <nntr_ggml_impl_utils.h>
+
 // Convert a float to its fp16 bit pattern the same way the production kernels
 // do. This test only runs on aarch64, where the library's fp32->fp16 helpers
 // reduce to a hardware __fp16 cast, so doing the cast directly keeps the
@@ -538,6 +542,41 @@ TEST(nntrainer_ggml_arm, gemm_q8_0_4x8_128x128x128) {
   float cos = test_q8_0_4x8(M, N, K);
 
   EXPECT_GT(cos, 0.999f);
+}
+
+/**
+ * @brief Regression test for the SDOT semantics of ggml_vdotq_s32.
+ *
+ * Lane j of the result must be acc[j] + a[4j..4j+3] . b[4j..4j+3]. On
+ * builds without __ARM_FEATURE_DOTPROD this exercises the NEON emulation,
+ * which used to mix bytes 0..1 with bytes 8..9 per lane (vaddq_s32 instead
+ * of vpaddq_s32) and made every quantized GEMM silently wrong on such
+ * targets; with dotprod it sanity-checks the hardware instruction.
+ */
+TEST(nntrainer_ggml_arm, ggml_vdotq_s32_matches_scalar_sdot) {
+  std::mt19937 rng(42);
+  std::uniform_int_distribution<int> dist(-128, 127);
+
+  for (int iter = 0; iter < 1000; ++iter) {
+    int8_t a[16], b[16];
+    int32_t acc[4], got[4];
+    for (int i = 0; i < 16; ++i) {
+      a[i] = (int8_t)dist(rng);
+      b[i] = (int8_t)dist(rng);
+    }
+    for (int j = 0; j < 4; ++j)
+      acc[j] = dist(rng);
+
+    int32x4_t out = ggml_vdotq_s32(vld1q_s32(acc), vld1q_s8(a), vld1q_s8(b));
+    vst1q_s32(got, out);
+
+    for (int j = 0; j < 4; ++j) {
+      int32_t expect = acc[j];
+      for (int k = 0; k < 4; ++k)
+        expect += (int32_t)a[4 * j + k] * (int32_t)b[4 * j + k];
+      ASSERT_EQ(expect, got[j]) << "iteration " << iter << " lane " << j;
+    }
+  }
 }
 
 TEST(nntrainer_ggml_arm, DISABLED_quantize_row_q8_0_benchmark) {
