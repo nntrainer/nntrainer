@@ -104,6 +104,13 @@ public:
   static constexpr const char *type = "embedding";
 
 private:
+  /**
+   * @brief Copy embedding rows for the local input token chunk
+   * @param context run context
+   * @param token_count number of local tokens per batch
+   */
+  void forwardRows(RunLayerContext &context, unsigned int token_count);
+
   std::tuple<props::InDim, props::OutDim> embedding_props;
   unsigned int weight_idx;
 };
