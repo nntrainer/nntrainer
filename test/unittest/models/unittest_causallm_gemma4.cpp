@@ -95,7 +95,9 @@ causallm::json makeTinyGemma4Config() {
        {"hidden_size_per_layer_input", 32},
        {"intermediate_size", 64},
        {"layer_types", {"sliding_attention", "full_attention"}},
-       {"max_position_embeddings", 8},
+       // Keep the model context deliberately larger than the runtime
+       // max_seq_len (8) so this fixture covers runtime-bounded RoPE LUTs.
+       {"max_position_embeddings", 131072},
        {"num_attention_heads", 8},
        {"num_hidden_layers", tiny_gemma4_num_layers},
        {"num_key_value_heads", 4},
