@@ -175,6 +175,18 @@ e = executable('nntr_causallm',
 )
 
 
+lora_train_src = [
+    meson.current_source_dir() / 'lora_train.cpp',
+    meson.current_source_dir() / 'train_qwen3_lora.cpp',
+]
+
+e_lora_train = executable('nntr_lora_train',
+    lora_train_src,
+    include_directories: [causallm_inc, causallm_inc_minja_inc, causallm_inc_nlohmann_inc],
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+)
+
+
 quantize_src = [
     meson.current_source_dir() / 'quantize.cpp',
 ]
@@ -227,6 +239,40 @@ if get_option('enable-test')
   test('unittest_embedding_sidecar_lut', unittest_embedding_sidecar_lut,
     args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_embedding_sidecar_lut'),
     timeout: 60,
+    suite: 'unittests'
+  )
+
+  unittest_lora_backward_gradcheck = executable(
+    'unittest_lora_backward_gradcheck',
+    meson.current_source_dir() / 'layers' / 'unittest_lora_backward_gradcheck.cpp',
+    dependencies: [nntrainer_dep, gtest_main_dep, causallm_rms_norm_dep,
+                   causallm_reshaped_rms_norm_dep, causallm_swiglu_dep,
+                   causallm_lm_head_dep, causallm_tie_word_embedding_dep,
+                   causallm_mha_core_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_lora_backward_gradcheck', unittest_lora_backward_gradcheck,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_lora_backward_gradcheck'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
+  unittest_qwen3_lora_training_smoke = executable(
+    'unittest_qwen3_lora_training_smoke',
+    meson.current_source_dir() / 'models' / 'unittest_qwen3_lora_training_smoke.cpp',
+    dependencies: [nntrainer_dep, nntrainer_ccapi_dep, gtest_main_dep,
+                   causallm_dep, causallm_layer_dependencies],
+    include_directories: causallm_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_qwen3_lora_training_smoke', unittest_qwen3_lora_training_smoke,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_qwen3_lora_training_smoke'),
+    timeout: 120,
     suite: 'unittests'
   )
 

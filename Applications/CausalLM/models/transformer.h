@@ -7,6 +7,9 @@
  * @date   31 Dec 2025
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
+ * @author Pranjal Thapliyal <p.thapliyal@samsung.com>
+ * @author Sumon Nath <sumon.nath@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  * @note   This transformer.h constructs a class for Transformer model which can
  * be a parent of CausalLM and Encoder models with transformer structure.
@@ -35,6 +38,7 @@
 #define WCHAR_P std::string &
 #endif
 
+#include <dataset.h>
 #include <layer.h>
 #include <map>
 #include <model.h>
@@ -266,7 +270,125 @@ public:
    */
   virtual void resetLogitsProcessor() {}
 
+  /**
+   * @brief Build and compile the symbolic transformer graph for LoRA
+   *        training (ExecutionMode::TRAIN), as opposed to initialize()
+   *        which always compiles for INFERENCE. Adds a `cross_softmax`
+   *        loss layer on top of constructModel()'s output. Only
+   *        loraA/loraB weights (inside FC layers targeted by lora_target)
+   *        end up trainable; every other layer is frozen — see
+   *        hasLoRA()/appendLoRAProps() and their call sites in
+   *        createAttention()/createMlp()/CausalLM::constructModel().
+   * @param lr learning rate for the Adam optimizer
+   * @param epochs number of epochs to configure on the model
+   */
+  virtual void initializeForTraining(float lr, unsigned int epochs);
+
+  /**
+   * @brief Set the dataset used for training/validation.
+   */
+  virtual void setDataset(const ml::train::DatasetModeType &mode,
+                          std::shared_ptr<ml::train::Dataset> dataset);
+
+  /**
+   * @brief Run training for the epochs configured in initializeForTraining().
+   * @param epoch_complete_cb optional callback invoked at the end of each
+   *        epoch (e.g. for early stopping / logging)
+   * @param epoch_data user data passed to epoch_complete_cb
+   * @param stop_cb optional callback polled to request early stop
+   * @param stop_data user data passed to stop_cb
+   */
+  virtual void train(std::function<void(void *)> epoch_complete_cb = nullptr,
+                     void *epoch_data = nullptr,
+                     std::function<bool(void *)> stop_cb = nullptr,
+                     void *stop_data = nullptr);
+
+  /**
+   * @brief Get training-split running statistics (loss, accuracy) for the
+   *        epoch just completed.
+   */
+  ml::train::RunStats getTrainingStats();
+
+  /**
+   * @brief Get validation-split running statistics for the epoch just
+   *        completed.
+   */
+  ml::train::RunStats getValidStats();
+
+  /**
+   * @brief Load a pretrained (non-LoRA) base checkpoint into a graph that
+   *        has LoRA weights (loraA/loraB) allocated, then optionally
+   *        overlay a previously saved LoRA adapter.
+   * @details The base checkpoint predates LoRA and was saved without
+   *          loraA/loraB, so the ordinary load_weight() (positional,
+   *          sequential read matching the *current* graph's weight list)
+   *          would desync as soon as it reached the first LoRA-bearing
+   *          layer. Instead this builds a throwaway LoRA-free copy of the
+   *          graph, loads the base checkpoint into that with the ordinary
+   *          (already-correct) loader, and copies each matching weight by
+   *          name into this model — names with no match (loraA/loraB) are
+   *          left at their freshly-initialized values.
+   * @param base_path path to the pretrained (non-LoRA) checkpoint
+   * @param lora_path optional path to a previously saved LoRA adapter
+   *        (from save_weight_lora()); pass an empty string to skip
+   */
+  virtual void load_weight_lora(const std::string &base_path,
+                               const std::string &lora_path = "");
+
+  /**
+   * @brief Save only the loraA/loraB weights (raw FP32) to a file.
+   * @param lora_path output path for the adapter file
+   */
+  virtual void save_weight_lora(const std::string &lora_path);
+
+  /**
+   * @brief Save LoRA adapters as Q4_0 (block=32, repacked for the W4A8 GEMM
+   *        kernel). When LORA_QAT is active, force-feeds the per-block EMA
+   *        scales calibrated during training instead of recomputing a
+   *        natural per-block scale at save time, so the saved adapter
+   *        matches the exact quantization the model trained against.
+   * @param path output path for the Q4_0 adapter file
+   */
+  virtual void save_weight_lora_q4(const std::string &path);
+
+  /**
+   * @brief Load a pretrained (non-LoRA) base checkpoint, then load Q4_0
+   *        LoRA adapters directly into Q4_0-dtype loraA/loraB tensors (see
+   *        LORA_WEIGHT_Q4), so the W4A8 GEMM kernel fires at inference.
+   * @param base_path path to the pretrained (non-LoRA) checkpoint
+   * @param lora_q4_path path to a Q4_0 adapter file (from
+   *        save_weight_lora_q4())
+   */
+  virtual void load_weight_lora_q4(const std::string &base_path,
+                                   const std::string &lora_q4_path);
+
+  /**
+   * @brief Visit each layer in the compiled model (passthrough to
+   *        ml::train::Model::forEachLayer). Exposed publicly so callers
+   *        (tests, tooling) can inspect/manipulate weights without needing
+   *        access to the protected `model` handle.
+   */
+  virtual void forEachLayer(
+    std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
+                       void *)>
+      fn,
+    void *user_data = nullptr);
+
 protected:
+  /**
+   * @brief Whether the given FC-layer module type (e.g. "wq", "ffn_up") is
+   *        targeted by lora_target for LoRA adaptation.
+   */
+  bool hasLoRA(const std::string &module_type) const;
+
+  /**
+   * @brief Append lora_rank/lora_alpha layer properties to `props` when
+   *        LoRA is enabled (LORA_RANK > 0). Caller is responsible for
+   *        checking hasLoRA() first to decide whether to call this or
+   *        freeze the layer instead.
+   */
+  void appendLoRAProps(std::vector<std::string> &props) const;
+
   /**
    * @brief Setup the parameters for the Transformer model
    */
@@ -389,6 +511,50 @@ protected:
   unsigned int FSU_LOOKAHEAD;
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
+
+  /** LoRA config (parsed in setupParameters() from nntr_cfg's "lora_rank" /
+   *  "lora_alpha" / "lora_target" keys, already present but previously
+   *  unread in res/**\/nntr_config.json). LORA_RANK == 0 means LoRA is off
+   *  (default, ordinary full-graph inference). */
+  unsigned int LORA_RANK = 0;
+  unsigned int LORA_ALPHA = 0;
+  std::vector<std::string> LORA_TARGET;
+
+  /** Optional gradient clipping for the LoRA weights, from nntr_cfg's
+   *  "lora_clip_grad_by_norm". 0 (default) disables it. When set, every
+   *  LoRA-adapted layer gets nntrainer's `clip_grad_by_norm` property, and
+   *  NetworkGraph clips by the norm taken GLOBALLY across all flagged
+   *  weights (not per layer) — so flagging every adapter yields standard
+   *  global-norm clipping over the whole adapter. */
+  float LORA_CLIP_GRAD = 0.0f;
+
+  /** Enable per-block Q4_0 QAT (fake-quant + EMA calibration + STE) on
+   *  loraA/loraB, from nntr_cfg's "lora_qat". Default false trains the
+   *  adapters in plain FP32. */
+  bool LORA_QAT = false;
+
+  /** Store/load LoRA adapters as real Q4_0 tensors, from nntr_cfg's
+   *  "lora_weight_q4". Combined with LORA_QAT, the adapters are
+   *  fake-quantized (with EMA-calibrated scales) during training and can be
+   *  saved/loaded as Q4_0 so the W4A8 GEMM kernel fires at inference.
+   *  Requires lora_rank to be a multiple of 32. */
+  bool LORA_WEIGHT_Q4 = false;
+
+  /** When true, the RMSNorm layers stay trainable even though LoRA is
+   *  active, i.e. the "LoRA + norms" recipe. This is what exercises the
+   *  norm layers' calcGradient(); with the default (false) every norm is
+   *  frozen and only loraA/loraB train. From nntr_cfg's
+   *  "lora_train_norms". */
+  bool TRAIN_NORMS = false;
+
+  /** Set by initializeForTraining() before constructModel() runs, so
+   *  createAttention() can skip attaching the external-KV-cache
+   *  placeholders (createKVCachePlaceholders()) that inference wires
+   *  mha_core with — training has no use for incremental decode caching,
+   *  and mha_core's training-mode forward/backward (trainForwarding()/
+   *  calcDerivative() in mha_core.cpp) requires the internal-cache
+   *  (3-input) construction. */
+  bool FOR_TRAINING = false;
 
   // Performance metrics
   TransformerPerformanceMetrics performance_metrics;

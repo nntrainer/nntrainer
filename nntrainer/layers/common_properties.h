@@ -8,6 +8,7 @@
  * layers
  * @see	   https://github.com/nntrainer/nntrainer
  * @author Jihoon Lee <jhoon.it.lee@samsung.com>
+ * @author Pranjal Thapliyal <p.thapliyal@samsung.com>
  * @bug    No known bugs except for NYI items
  */
 #ifndef __COMMON_PROPERTIES_H__
@@ -1524,6 +1525,31 @@ class LoraAlpha : public PositiveIntegerProperty {
 public:
   static constexpr const char *key = "lora_alpha"; /**< unique key to access */
   using prop_tag = uint_prop_tag;                  /**< property type */
+};
+
+/**
+ * @brief Enable quantization-aware training (per-block Q4_0 fake-quant) on
+ * LoRA adapters. When set, loraA/loraB are fake-quantized to the Q4_0 grid
+ * during forward, with EMA-tracked per-block scales, and backward uses a
+ * straight-through gradient estimator.
+ */
+class LoraQAT : public Property<bool> {
+public:
+  static constexpr const char *key = "lora_qat"; /**< unique key to access */
+  using prop_tag = bool_prop_tag;                /**< property type */
+};
+
+/**
+ * @brief Store LoRA adapters as Q4_0 (4-bit, block size 32) for inference.
+ * Combined with lora_qat=true, the adapters are fake-quantized (with
+ * EMA-calibrated scales) during training and can be saved and loaded as real
+ * Q4_0 tensors that run through the W4A8 GEMM kernel at inference. Requires
+ * lora_rank to be a multiple of 32.
+ */
+class LoraWeightQ4 : public Property<bool> {
+public:
+  static constexpr const char *key = "lora_weight_q4"; /**< unique key */
+  using prop_tag = bool_prop_tag;                       /**< property type */
 };
 
 /**
