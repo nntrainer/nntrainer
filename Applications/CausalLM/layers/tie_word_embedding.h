@@ -87,6 +87,11 @@ public:
   WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
 
   /**
+   * @copydoc Layer::pack(RunLayerContext &context)
+   */
+  WIN_EXPORT void pack(nntrainer::RunLayerContext &context) override;
+
+  /**
    * @copydoc Layer::exportTo(Exporter &exporter, ml::train::ExportMethods
    * method)
    */

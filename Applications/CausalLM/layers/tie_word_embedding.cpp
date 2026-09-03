@@ -97,9 +97,30 @@ void TieWordEmbedding::finalize_embedding(
 
   dim.setTensorType({context.getFormat(), context.getWeightDataType()});
 
-  dim.height(in_dim);
-  dim.width(out_dim);
   dim.batch(1);
+
+  /**
+   * @note nntrainer's per-channel quantized tensor is in following shape
+   * - quantized data: (H, W)
+   * - scales: (W)
+   *
+   * For embedding, there are in_dim elements in scale.
+   * So we should use (out_dim, in_dim) dimension although actual tensor
+   * shape is (in_dim, out_dim)
+   *
+   * @todo Add other types that needs to be transposed
+   * @todo Allow other axis can be a quantization axis
+   */
+  if (dim.getDataType() == nntrainer::TensorDim::DataType::QS4CX) {
+    if (dim.getFormat() == nntrainer::TensorDim::Format::NHWC) {
+      throw std::invalid_argument{"NYI for QS4CX NHWC embedding"};
+    }
+    dim.height(out_dim);
+    dim.width(in_dim);
+  } else {
+    dim.height(in_dim);
+    dim.width(out_dim);
+  }
 
   weight_idx[TieWordEmbeddingParams::weight] = context.requestWeight(
     dim, weight_initializer, weight_regularizer, weight_regularizer_constant,
@@ -157,14 +178,19 @@ void TieWordEmbedding::finalize_lmhead(nntrainer::InitLayerContext &context) {
     is_nchw ? 0b0001 : 0b0100);
 
   ///@note TieWordEmbedding layer's tensor dim is transposed dim of user-defined
-  /// dim
-  /// so it can reuse embedding layer.
+  /// dim so it can reuse embedding layer.
   ml::train::TensorDim weight_dim(
     1, is_nchw ? 1 : in_dim.channel(), is_nchw ? unit : 1,
     is_nchw ? in_dim.width() : unit,
     ml::train::TensorDim::TensorType(context.getFormat(),
                                      context.getWeightDataType()),
     is_nchw ? 0b0011 : 0b0101);
+
+  // See finalize_embedding for dimension
+  if (weight_dim.getDataType() == nntrainer::TensorDim::DataType::QS4CX) {
+    weight_dim.height(in_dim.width());
+    weight_dim.width(unit);
+  }
 
   weight_idx[TieWordEmbeddingParams::weight] = context.requestWeight(
     weight_dim, weight_initializer, weight_regularizer,
@@ -221,6 +247,7 @@ void TieWordEmbedding::incremental_forwarding_embedding(
 
   if (!(weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0 ||
         weight.getDataType() == nntrainer::TensorDim::DataType::Q6_K ||
+        weight.getDataType() == nntrainer::TensorDim::DataType::QS4CX ||
         weight.getDataType() == nntrainer::TensorDim::DataType::FP32))
     throw std::invalid_argument(
       "Tieword embedding is not supported yet for the data type");
@@ -278,6 +305,25 @@ void TieWordEmbedding::incremental_forwarding_embedding(
             nntrainer::dequantize_row_q6_K(src, tmp.getData(), out_dim);
           else
             nntrainer::dequantize_row_q4_0(src, tmp.getData(), out_dim);
+          out_tensor.copyData(tmp);
+        }
+      } else if (weight.getDataType() ==
+                 nntrainer::TensorDim::DataType::QS4CX) {
+        if (hidden_.getDataType() == nntrainer::TensorDim::DataType::FP32) {
+          nntrainer::dequantize_row_qs4cx(embed_idx, weight.height(),
+                                          weight.getData(), weight.getScale(),
+                                          out_tensor.getData());
+        } else if (hidden_.getDataType() ==
+                   nntrainer::TensorDim::DataType::FP16) {
+          // dequant to fp32 tmp tensor first, then convert it to fp16
+          nntrainer::TensorDim fp32_dim(
+            {1, 1, 1, out_dim}, nntrainer::TensorDim::TensorType(
+                                  out_tensor_dim.getFormat(),
+                                  nntrainer::TensorDim::DataType::FP32));
+          nntrainer::Tensor tmp(fp32_dim, true);
+          nntrainer::dequantize_row_qs4cx(embed_idx, weight.height(),
+                                          weight.getData(), weight.getScale(),
+                                          tmp.getData());
           out_tensor.copyData(tmp);
         }
       } else {
@@ -500,8 +546,8 @@ void TieWordEmbedding::save(std::ofstream &file,
           ///@note The codelines below can be replaced with quantizer's
           /// quantize()
           nntrainer::TensorDim dim = weight.getDim();
-          unsigned int K = dim.height();
-          unsigned int N = dim.width();
+          size_t K = dim.height();
+          size_t N = dim.width();
 
           if (dtype == nntrainer::TensorDim::DataType::Q4_0) {
             if (K == 1) {
@@ -529,12 +575,41 @@ void TieWordEmbedding::save(std::ofstream &file,
                                      quant_weight.getData<uint8_t>(), K, N,
                                      nullptr);
             quant_weight.save(file);
+          } else if (dtype == nntrainer::TensorDim::DataType::QS4CX) {
+            /**
+             * @note QS4CX tensor uses N as the number of scale.
+             * In finalize(), we passed in_dim as height() for FP32 tie word
+             * embedding. So we need to swap N and K.
+             */
+            size_t N = dim.height();
+            size_t K = dim.width();
+
+            const size_t data_size = N * ((K + 1) / 2);
+            const size_t scale_size = N * sizeof(float);
+
+            std::vector<uint8_t> rhs_q(data_size + scale_size);
+            uint8_t *data = rhs_q.data();
+            uint8_t *scale = data + data_size;
+
+            nntrainer::quant_qs4cx_f32(N, K, weight.getData(), data, scale,
+                                       true);
+            file.write((const char *)data, data_size + scale_size);
           } else {
             NNTR_THROW_IF(true, std::runtime_error)
               << "This dtype is not supported in save with quantization";
           }
         }
       }
+    }
+  }
+}
+
+void TieWordEmbedding::pack(nntrainer::RunLayerContext &context) {
+  if (mode_ == mode::lm_head) {
+    auto &embedding =
+      context.getWeight(weight_idx[TieWordEmbeddingParams::weight]);
+    if (embedding.getDataType() == nntrainer::TensorDim::DataType::QS4CX) {
+      embedding.pack();
     }
   }
 }
