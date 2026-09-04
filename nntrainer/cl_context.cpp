@@ -105,11 +105,10 @@ void ClContext::initialize() noexcept {
 };
 
 void ClContext::add_default_object() {
-  if (FullyConnectedLayerCl::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
-                    FullyConnectedLayerCl::type,
-                    ml::train::LayerType::LAYER_FC);
-  }
+  // The FC layer is now backend-neutral (it dispatches its GEMM through
+  // ComputeOps::fc), so it registers no kernels of its own here.
+  registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
+                  FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
 
   if (AdditionLayerCL::registerClKernels(*this)) {
     registerFactory(nntrainer::createLayer<AdditionLayerCL>,
@@ -326,5 +325,83 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
 template const int ClContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
+
+// Non-template seam (Context::registerLayerFactory override): forwards to the
+// per-class registerFactory<Layer> here in the same translation unit, so the
+// explicit instantiation above is the one used and no template crosses the .so
+// boundary.
+int ClContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                                    const std::string &key, const int int_key) {
+  return registerFactory<nntrainer::Layer>(factory, key, int_key);
+}
+
+const DeviceCaps &ClContext::caps() const {
+  std::call_once(caps_probed_, [this]() {
+    // Vendor ID of Intel, the one vendor whose compiler rejects the
+    // integer-coordinate read_imageui kernel (see DeviceCaps::image_v8c).
+    constexpr cl_uint intel_vendor_id = 0x8086;
+
+    // Set the backend tag first: it is the one field that stays true even when
+    // no device can be opened, and resolveExecPlan() keys on it.
+    device_caps_.backend = "gpu";
+
+    try {
+      // GetDeviceId() opens the default GPU device if it is not open yet and
+      // fills the DeviceInfo the queries below read, so from here on every
+      // field is a real clGetDeviceInfo answer rather than a build-time
+      // default.
+      if (context_inst_.GetDeviceId() == nullptr)
+        return;
+      const opencl::DeviceInfo *info = context_inst_.getDeviceInfo();
+      if (info == nullptr)
+        return;
+
+      device_caps_.device_name = info->getDeviceName();
+      device_caps_.vendor_id = static_cast<uint32_t>(info->getDeviceVendorId());
+      device_caps_.compute_units =
+        static_cast<uint32_t>(info->getDeviceMaxComputeUnits());
+      device_caps_.max_alloc_bytes =
+        static_cast<uint64_t>(info->getDeviceMaxMemAllocSize());
+
+      // CL_DEVICE_HOST_UNIFIED_MEMORY is deprecated and several drivers answer
+      // it wrongly, so the shared-pool question is asked of the SVM
+      // capabilities instead: a device that can hand the host a buffer of its
+      // own memory is the integrated, host-coherent case.
+      const cl_device_svm_capabilities svm = info->getDeviceSVMCapabilities();
+      device_caps_.unified_memory =
+        (svm & CL_DEVICE_SVM_COARSE_GRAIN_BUFFER) != 0;
+      device_caps_.integrated = device_caps_.unified_memory;
+
+      const std::string &ext = info->getDeviceExtensions();
+      device_caps_.subgroups =
+        ext.find("cl_intel_subgroups") != std::string::npos;
+      // The real matrix-engine gate. cl_intel_subgroups is advertised by every
+      // Intel GPU since Gen9 and says nothing about a systolic array, so the
+      // DPAS extension is matched under its own name (see DeviceCaps::dpas).
+      device_caps_.dpas =
+        ext.find("cl_intel_subgroup_matrix_multiply_accumulate") !=
+        std::string::npos;
+
+      // Not a clean query: both kinds of device advertise
+      // CL_DEVICE_IMAGE_SUPPORT and the split is a driver compiler quirk, so it
+      // is derived from the vendor id exactly as DeviceCaps::image_v8c
+      // documents.
+      device_caps_.image_v8c = device_caps_.vendor_id != intel_vendor_id;
+    } catch (const std::exception &e) {
+      ml_logw("[ClContext] device capability probe failed (%s); every field "
+              "stays at its default",
+              e.what());
+    } catch (...) {
+      ml_logw("[ClContext] device capability probe failed; every field stays "
+              "at its default");
+    }
+
+    ml_logi("[ClContext] %s", device_caps_.toString().c_str());
+    ml_logi("[ClContext] resolved %s",
+            resolveExecPlan(device_caps_).toString().c_str());
+  });
+
+  return device_caps_;
+}
 
 } // namespace nntrainer

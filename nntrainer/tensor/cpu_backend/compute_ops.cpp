@@ -406,6 +406,40 @@ void ComputeOps::compute_rotary_embedding_value(unsigned int, unsigned int,
 }
 #endif // ENABLE_FP16
 
+// ----------------------------------------------------------------------------
+// Whole-op (Tensor-level) defaults — throw as above. CpuComputeOps overrides
+// every one of them; an accelerator table overrides only what it accelerates
+// and inherits the rest.
+// ----------------------------------------------------------------------------
+void ComputeOps::geglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
+                       unsigned int) {
+  NI(geglu);
+}
+void ComputeOps::swiglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
+                        unsigned int) {
+  NI(swiglu);
+}
+void ComputeOps::layer_norm(const Tensor &, Tensor &, const Tensor &,
+                            const Tensor &, float, unsigned int, unsigned int) {
+  NI(layer_norm);
+}
+void ComputeOps::activation(const Tensor &, Tensor &, int, unsigned int,
+                            unsigned int) {
+  NI(activation);
+}
+void ComputeOps::residual_op(Tensor &, const Tensor &, bool) {
+  NI(residual_op);
+}
+void ComputeOps::fc(Tensor &, Tensor &, Tensor &) { NI(fc); }
+void ComputeOps::apply_activation(Tensor &, int) { NI(apply_activation); }
+void ComputeOps::mean_rows(const Tensor &, Tensor &, unsigned int,
+                           unsigned int) {
+  NI(mean_rows);
+}
+void ComputeOps::l2_normalize_rows(const Tensor &, Tensor &, float) {
+  NI(l2_normalize_rows);
+}
+
 #undef NI
 
 } // namespace nntrainer

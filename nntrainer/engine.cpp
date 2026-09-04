@@ -11,6 +11,9 @@
  * @bug    No known bugs except for NYI items
  *
  */
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
@@ -49,6 +52,80 @@ Engine &Engine::Global() {
   return instance;
 }
 
+// Guarded on exactly the backends that call bringUpWanted() below, which today
+// is OpenCL alone. Widening this to ENABLE_CUDA before a CUDA call site exists
+// leaves two unused statics and a -Wunused-function in a CUDA-on/OpenCL-off
+// build; the guard widens in the change that adds the second caller.
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+namespace {
+
+/**
+ * @brief The compute engine this process asked for, lowercased, or "" if unset.
+ *
+ * Read from NNTR_ENGINE. This is the process-wide backend selector: a consumer
+ * that runs one engine exports it before the first Engine::Global(), and that
+ * ordering is the contract -- the value is latched on first use, so a later
+ * setenv() has no effect. Unset means "no preference", which keeps the
+ * historical default (see bringUpWanted's on_by_default).
+ *
+ * @note This is the only reader of NNTR_ENGINE in the tree. A backend that adds
+ *       its own read must route through this function rather than comparing
+ *       getenv() exactly, or NNTR_ENGINE=GPU registers a context that the
+ *       backend's own gate then declines.
+ */
+const std::string &requestedEngine() {
+  static const std::string eng = []() -> std::string {
+    const char *e = std::getenv("NNTR_ENGINE");
+    if (e == nullptr)
+      return std::string();
+    std::string s(e);
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return s;
+  }();
+  return eng;
+}
+
+/**
+ * @brief Should the named backend's Context be brought up in this process?
+ *
+ * SYMMETRY IS THE POINT. A process runs ONE compute engine (the consumer
+ * resolves exactly one from NNTR_ENGINE), but this translation unit used to be
+ * the place where every compiled-in backend was constructed unconditionally, so
+ * each lane paid the other's device bring-up:
+ *
+ *   - a CUDA run enumerated OpenCL and eagerly built ~50 CL programs that no
+ *     CL kernel would ever execute (measured 200-218 ms warm on an RTX 5060
+ *     box, and ~8.5 s on a launch where the OpenCL driver's compiler cache is
+ *     cold)
+ *   - a cpu-engine run paid that same OpenCL bring-up, plus the ~2.4 s wake of
+ *     a runtime-PM-suspended discrete GPU that the ICD loader triggers
+ *
+ * @param name       registry name of the backend ("gpu", "cuda")
+ * @param eager_env  env var that force-restores the unconditional bring-up
+ *                   (kept so the gate is A/B-able and so a genuinely mixed
+ *                   process can opt back in)
+ * @param on_by_default true for the backend that an unset NNTR_ENGINE selects
+ *                   (OpenCL "gpu": the consumer's own default; CUDA is opt-in)
+ * @return true when this run should construct that Context
+ */
+bool bringUpWanted(const char *name, const char *eager_env,
+                   bool on_by_default) {
+  // Not latched, unlike requestedEngine(): this is the per-backend A/B escape
+  // hatch, read once per backend at bring-up, so a static per call site would
+  // buy nothing and would need one static per name.
+  const char *eager = std::getenv(eager_env);
+  if (eager != nullptr && eager[0] != '0')
+    return true;
+  const std::string &eng = requestedEngine();
+  if (eng.empty())
+    return on_by_default;
+  return eng == name;
+}
+
+} // namespace
+#endif
+
 void Engine::add_default_object() {
   /// @note all layers should be added to the app_context to guarantee that
   /// createLayer/createOptimizer class is created
@@ -62,9 +139,25 @@ void Engine::add_default_object() {
   registerContext("cpu", &app_context);
 
 #if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
-  auto &cl_context = nntrainer::ClContext::Global();
+  // Engine-conditional, the mirror of the CUDA gate below (see bringUpWanted).
+  // ClContext::Global() is leaked-by-design (never destroyed, cl_context.h), so
+  // on a non-OpenCL run it would leave a cl_context + command queue and ~50
+  // compiled programs alive for the whole process for nothing. Skipping the
+  // registration is safe because an engine name that is not registered resolves
+  // to "cpu" in parseComputeEngine, and every "gpu" consumer on the production
+  // path already try/catches a missing context.
+  // NNTR_CL_EAGER_CTX=1 restores the unconditional bring-up.
+  if (bringUpWanted("gpu", "NNTR_CL_EAGER_CTX", /*on_by_default=*/true)) {
+    auto &cl_context = nntrainer::ClContext::Global();
 
-  registerContext("gpu", &cl_context);
+    registerContext("gpu", &cl_context);
+  } else {
+    // Warn, not info: a model that ran on the GPU yesterday now runs on the
+    // CPU, and this line is the only trace of it.
+    ml_logw("OpenCL/gpu backend compiled in but not brought up "
+            "(NNTR_ENGINE=%s); engine=gpu layers fall back to cpu.",
+            requestedEngine().c_str());
+  }
 #endif
 
 #if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
@@ -101,15 +194,31 @@ Engine::parseComputeEngine(const std::vector<std::string> &props) const {
     std::string key, value;
     int status = nntrainer::getKeyValue(prop, key, value);
     if (nntrainer::istrequal(key, "engine")) {
-      constexpr const auto data =
-        std::data(props::ComputeEngineTypeInfo::EnumList);
-      for (unsigned int i = 0;
-           i < props::ComputeEngineTypeInfo::EnumList.size(); ++i) {
-        if (nntrainer::istrequal(value.c_str(),
-                                 props::ComputeEngineTypeInfo::EnumStr[i])) {
-          return props::ComputeEngineTypeInfo::EnumStr[i];
-        }
-      }
+      // Validate against the LIVE registered-context name set, not the closed
+      // LayerComputeEngine enum + string list. A vendor backend that
+      // self-registers a Context (e.g. "npu", "exynos") then resolves with no
+      // enum edit; an unknown/unavailable engine falls back to "cpu" instead of
+      // resolving to a name that getRegisteredContext would later reject.
+      // An engine tag is therefore a registered Context NAME, not a device
+      // taxonomy: names are flat keys bound one-per-Context, so "gpu" and
+      // "cuda" are disjoint by construction and no tag is a superset of
+      // another. Nothing downstream should read a hierarchy into them.
+      std::string name = value;
+      std::transform(name.begin(), name.end(), name.begin(),
+                     [](unsigned char c) { return std::tolower(c); });
+      if (engines.find(name) != engines.end())
+        return name;
+
+      // An open registry cannot treat an unknown name as an error, but it must
+      // not swallow it either. A typo ("gpuu"), a backend compiled out, and a
+      // backend the bring-up gate declined all arrive here and all resolve to
+      // the CPU; without this line the only trace is a once-per-process
+      // bring-up warning that names no layer. Report the requested and the
+      // resolved engine together so the fallback is readable from the log.
+      ml_logw("engine=%s is not a backend registered in this process; "
+              "resolving this layer to engine=cpu instead",
+              value.c_str());
+      return "cpu";
     }
   }
 

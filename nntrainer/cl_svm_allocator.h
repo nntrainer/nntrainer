@@ -71,6 +71,11 @@ public:
 
   std::string getName() override { return "gpu-svm"; }
 
+  // OpenCL SVM is a single pointer the device reads directly (no copy);
+  // host-addressable inherits the base default (true). host + device ->
+  // isSVM() derives true, matching the old getName()=="gpu-svm".
+  bool isDeviceVisible() const override { return true; }
+
 private:
   opencl::ContextManager &ctx_;
   // Host-owned set: pointers that came from MemAllocator::alloc

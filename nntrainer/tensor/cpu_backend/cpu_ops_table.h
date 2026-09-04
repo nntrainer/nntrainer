@@ -14,7 +14,11 @@
  * implementation. Method bodies forward to the arch-specialized
  * nntrainer::sgemm etc. free functions (build-time arch dispatch picks
  * the symbol at link time), so a single definition serves ARM / x86 /
- * fallback.
+ * fallback and the class stays header-inline.
+ *
+ * The whole-op (Tensor-level) overrides at the tail are the exception:
+ * they are defined out-of-line in cpu_ops_table.cpp so this header stays
+ * free of <tensor.h>.
  */
 
 #ifndef __CPU_OPS_TABLE_H__
@@ -364,6 +368,39 @@ public:
                                               sin_);
   }
 #endif // ENABLE_FP16
+
+  // Whole-op (Tensor-level). Defined out-of-line in cpu_ops_table.cpp so this
+  // header stays free of <tensor.h>. Every one of them is a plain host loop
+  // over the row window, which is also correct for the host-coherent unified
+  // memory an accelerator table may inherit this class for.
+
+  // out = gelu_tanh(gate) * up over the live rows.
+  void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+             unsigned int active_rows, unsigned int row_offset) override;
+  // out = silu(gate) * up over the live rows (numerically stable SiLU).
+  void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+              unsigned int active_rows, unsigned int row_offset) override;
+  // out = (x - mean) * rsqrt(var + eps) * gamma + beta per row over width,
+  // FP32 accumulation, all four activation x weight dtype combinations.
+  void layer_norm(const Tensor &in, Tensor &out, const Tensor &gamma,
+                  const Tensor &beta, float epsilon, unsigned int active_rows,
+                  unsigned int row_offset) override;
+  // out = f_act(in) over the live rows: gelu / tanh_gelu with an explicit
+  // dtype switch, every other mode through the host ActiFunc.
+  void activation(const Tensor &in, Tensor &out, int act_type,
+                  unsigned int active_rows, unsigned int row_offset) override;
+  // hidden = input (copy) / hidden += input (add) via host Tensor ops.
+  void residual_op(Tensor &hidden, const Tensor &input,
+                   bool accumulate) override;
+  // output = input * weight via host Tensor::dot.
+  void fc(Tensor &input, Tensor &weight, Tensor &output) override;
+  // In-place whole-tensor activation, expressed via activation() above.
+  void apply_activation(Tensor &out, int act_type) override;
+  // Host row reductions, expressed in terms of the very Tensor calls their
+  // callers used before an op-table entry existed, so results are unchanged.
+  void mean_rows(const Tensor &in, Tensor &out, unsigned int active_rows,
+                 unsigned int row_offset) override;
+  void l2_normalize_rows(const Tensor &in, Tensor &out, float epsilon) override;
 };
 
 } // namespace nntrainer

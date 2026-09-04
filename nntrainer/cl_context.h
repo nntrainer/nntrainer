@@ -119,6 +119,38 @@ public:
                             const int int_key = -1);
 
   /**
+   * @copydoc Context::registerLayerFactory
+   */
+  int registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                           const std::string &key, const int int_key) override;
+
+  /**
+   * @brief The OpenCL backend's tensors live on the GPU residency plane, so
+   *        this context declares GPU. This is the override the base
+   *        Context::residencyEngine() documentation names: without it
+   *        toLayerComputeEngine("gpu") resolves this very context and reads
+   *        the host-residency base, so every engine=gpu layer would report a
+   *        CPU plane and LayerNode::isComputeEngineGPU() could never be true.
+   *        Declaring the plane here is what keeps the central name-to-enum
+   *        table retired.
+   * @return ml::train::LayerComputeEngine::GPU
+   */
+  ml::train::LayerComputeEngine residencyEngine() const override {
+    return ml::train::LayerComputeEngine::GPU;
+  }
+
+  /**
+   * @copydoc Context::caps
+   *
+   * @note Probed lazily on the first call rather than in the constructor: the
+   *       probe needs a live cl_device_id, and ClContext is constructed at
+   *       registration time, before the command queue exists. The probe is
+   *       one-shot (std::call_once) and never throws — a device that cannot be
+   *       opened leaves every field at its default and only `backend` is set.
+   */
+  const DeviceCaps &caps() const override;
+
+  /**
    * @brief Create an Object from the integer key
    *
    * @tparam T Type of Object, currently, Only Layer is supported
@@ -248,6 +280,12 @@ private:
 
   // flag to check opencl commandqueue and context inititalization
   bool cl_initialized = false;
+
+  // Device capability snapshot behind caps(). Mutable because caps() is a
+  // const query whose probe is deferred to first use; the once_flag makes the
+  // deferral safe if two threads ask at the same time.
+  mutable DeviceCaps device_caps_;
+  mutable std::once_flag caps_probed_;
 
   // flag to check default blas kernels registered or not
   bool blas_kernels_initialized = false;
