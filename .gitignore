@@ -45,6 +45,8 @@ Applications/CausalLM/res/qwen3/test/*
 Applications/CausalLM/res/lfm2_vl/*
 !Applications/CausalLM/res/lfm2_vl/README.md
 !Applications/CausalLM/res/lfm2_vl/*.py
+!Applications/CausalLM/res/train_data/
+!Applications/CausalLM/res/train_data/*.txt
 Applications/**/tokenizers-cpp-build/*
 
 # CTag
