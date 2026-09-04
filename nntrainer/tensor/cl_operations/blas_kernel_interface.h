@@ -83,6 +83,7 @@ void transposeCl(const std::string &direction, Tensor const &in,
  *
  * @param input Tensor
  * @param result Tensor
+ * @throws exception::not_supported no OpenCL kernel backs this entry point
  */
 void copyCl(const Tensor &input, Tensor &result);
 
@@ -91,6 +92,7 @@ void copyCl(const Tensor &input, Tensor &result);
  * @param input Tensor
  * @return Euclidean norm
  * @note This function is used to compute the Euclidean norm of a vector.
+ * @throws exception::not_supported no OpenCL kernel backs this entry point
  */
 float nrm2Cl(const Tensor &input);
 
@@ -99,6 +101,7 @@ float nrm2Cl(const Tensor &input);
  *
  * @param input Tensor
  * @return float absolute sum of the elements
+ * @throws exception::not_supported no OpenCL kernel backs this entry point
  */
 float asumCl(const Tensor &input);
 
@@ -108,6 +111,7 @@ float asumCl(const Tensor &input);
  * @param input Tensor
  * @return int index of the maximum absolute value
  * @note Not necessarily the first if there are multiple maximums.
+ * @throws exception::not_supported no OpenCL kernel backs this entry point
  */
 int amaxCl(const Tensor &input);
 
@@ -117,6 +121,7 @@ int amaxCl(const Tensor &input);
  * @param input Tensor
  * @return int index of the minimum absolute value
  * @note Not necessarily the first if there are multiple minimums.
+ * @throws exception::not_supported no OpenCL kernel backs this entry point
  */
 int aminCl(const Tensor &input);
 

@@ -120,6 +120,15 @@ public:
   void *getSVMQuant(unsigned int idx = 0);
 
   /**
+   * @brief Release every buffer and SVM region held by this manager.
+   *
+   * @note Safe to call more than once; the handles are cleared as they go.
+   * ClContext drives this from its exit handler so the driver calls happen
+   * while the OpenCL library is still live.
+   */
+  void releaseBuffers();
+
+  /**
    * @brief Destroy Buffer pointers.
    *
    */

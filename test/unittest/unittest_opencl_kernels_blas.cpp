@@ -485,66 +485,6 @@ TEST(blas_kernels, addition_i) {
   EXPECT_IN_RANGE((float)cosSim, 0.99, 1);
 }
 
-TEST(blas_kernels, l2norm) {
-  const int batch = 1;
-  const int channel = 1;
-  const int height = 768;
-  const int width = 768;
-
-  const float alpha = 1e-1;
-  const int MOD = 10;
-
-  nntrainer::TensorDim::TensorType t_type_nchw_fp32 = {
-    nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32};
-
-  nntrainer::Tensor A_fp32(batch, channel, height, width, t_type_nchw_fp32);
-  nntrainer::Tensor B_fp32(batch, channel, height, width, t_type_nchw_fp32);
-
-  GEN_TEST_INPUT(A_fp32, ((i * (batch * height * channel) +
-                           j * (batch * height) + k * (width) + l + 1) %
-                          MOD) *
-                           alpha);
-
-  GEN_TEST_INPUT(B_fp32, ((i * (batch * height * channel) +
-                           j * (batch * height) + k * (width) + l + 1) %
-                          MOD) *
-                           alpha);
-
-  float gpu_result = nrm2Cl(A_fp32);
-  float cpu_result = B_fp32.l2norm();
-
-  EXPECT_FLOAT_EQ(gpu_result, cpu_result);
-}
-
-TEST(blas_kernels, absolute_sum) {
-  const int batch = 1;
-  const int channel = 1;
-  const int height = 32;
-  const int width = 32;
-
-  const float alpha = 1e-1;
-  const int MOD = 10;
-
-  nntrainer::TensorDim::TensorType t_type_nchw_fp32 = {
-    nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32};
-
-  nntrainer::Tensor A_fp32(batch, channel, height, width, t_type_nchw_fp32);
-
-  GEN_TEST_INPUT(A_fp32, ((i * (batch * height * channel) +
-                           j * (batch * height) + k * (width) + l + 1) %
-                          MOD) *
-                           alpha);
-
-  float cpu_result = 0.0f;
-  for (size_t i = 0; i < A_fp32.size(); ++i) {
-    cpu_result += fabs(A_fp32.getData<float>()[i]);
-  }
-
-  float gpu_result = asumCl(A_fp32);
-
-  EXPECT_FLOAT_EQ(cpu_result, gpu_result);
-}
-
 TEST(blas_kernels, rmsnorm_fp32) {
   const int batch = 1;
   const int channel = 1;

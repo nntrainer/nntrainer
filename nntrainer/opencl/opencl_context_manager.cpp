@@ -97,6 +97,13 @@ void *ContextManager::createSVMRegion(size_t size) {
 }
 
 void ContextManager::releaseSVMRegion(void *svm_ptr) {
+  if (!context_) {
+    // The region went away with the context it was allocated from; handing it
+    // to the driver now would dereference released state.
+    ml_logw("Attempted to deallocate an SVM region without a context");
+    return;
+  }
+
   if (svm_ptr) {
     // deallocates the SVM memory
     clSVMFree(context_, svm_ptr);

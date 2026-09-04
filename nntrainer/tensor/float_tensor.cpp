@@ -794,13 +794,19 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   }
 
   auto *o = getOps();
+  // The scalar Q4_0 GEMM is a CPU-table op: an accelerator ComputeOps only
+  // implements the accel-only ops it advertises through supports_*(), and
+  // everything else falls through to the base default, which throws. Every
+  // non-accel branch below therefore has to take it from the CPU table
+  // explicitly rather than from this (possibly accelerator) tensor's ops.
+  auto *cpu_o = nntrainer::getComputeOps();
   if (input_dtype == Tdatatype::Q4_0) {
     if (o->supports_gemm_q4_0_batch_fp32() && M > 1) {
       o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
     } else {
       for (unsigned int i = 0; i < input.size(); ++i) {
-        o->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
-                          Ns[i]);
+        cpu_o->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
+                              Ns[i]);
       }
     }
   } else { // QINT4
@@ -821,8 +827,8 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
     } else {
       /// @todo Replace with standard CPU INT4 computation
       for (unsigned int i = 0; i < input.size(); ++i) {
-        o->gemm_q4_0_fp32(M, Ns[i], K, data, K, (void *)input[i]->getData(),
-                          Ns[i], rdatas[i], Ns[i]);
+        cpu_o->gemm_q4_0_fp32(M, Ns[i], K, data, K, (void *)input[i]->getData(),
+                              Ns[i], rdatas[i], Ns[i]);
       }
     }
   }
@@ -1000,7 +1006,11 @@ Tensor &FloatTensor::dotQnK(Tensor const &input, Tensor &output, bool trans,
     if (o->supports_gemm_q4_0_accel_fp32() && M > 1) {
       o->gemm_q4_0_accel_fp32((void *)mdata, data, rdata, M, N, K);
     } else {
-      o->gemm_q4_0_fp32(M, N, K, data, K, (void *)mdata, N, rdata, N);
+      // Scalar Q4_0 GEMM/GEMV is a CPU-table op (an accelerator ComputeOps
+      // only implements the accel ops it advertises), so the M == 1 decode
+      // step of a gpu-context tensor has to take it from the CPU table.
+      nntrainer::getComputeOps()->gemm_q4_0_fp32(M, N, K, data, K,
+                                                 (void *)mdata, N, rdata, N);
     }
     break;
   }
@@ -1045,7 +1055,8 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
     }
   } else {
     /// @todo Replace with standard CPU INT4 computation
-    o->gemm_q4_0_fp32(M, N, K, data, K, (void *)input.getData(), N, rdata, N);
+    nntrainer::getComputeOps()->gemm_q4_0_fp32(
+      M, N, K, data, K, (void *)input.getData(), N, rdata, N);
   }
 
   return output;

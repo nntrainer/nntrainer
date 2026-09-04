@@ -1,4 +1,0 @@
-[wrap-git]
-url = https://github.com/CNugteren/CLBlast.git
-directory=CLBlast
-revision = HEAD

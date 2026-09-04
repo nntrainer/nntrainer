@@ -335,12 +335,6 @@ Summary: Ruy support in NNTrainer
 %description -n ruy
 %endif
 
-%if %{with gpu}
-%package -n clblast
-Summary: CLBlast as an OpenCL backend for BLAS operations in NNTrainer
-%description -n clblast
-%endif # clblast
-
 %endif #tizen
 
 ## Define build options
@@ -444,11 +438,6 @@ ln -sf %{_libdir}/pkgconfig/capi-nnstreamer.pc %{_libdir}/pkgconfig/capi-ml-comm
 %if 0%{?use_ruy}
 tar -xf packaging/ruy.tar.gz -C subprojects
 %endif
-
-# Setup CLBlast
-%if %{with gpu}
-tar -xf packaging/clblast.tar.gz -C subprojects
-%endif # clblast
 
 mkdir -p build
 meson --buildtype=plain --prefix=%{_prefix} --sysconfdir=%{_sysconfdir} \
@@ -839,29 +828,6 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %ifarch x86_64
 %{_bindir}/cpuid_dump
 %endif #x86_64
-%endif
-
-# CLBlast
-%if %{with gpu}
-%files -n clblast
-%manifest nntrainer.manifest
-%defattr(-,root,root,-)
-%license LICENSE
-%{_libdir}/libclblast.so
-%{_bindir}/clblast_tuner_copy_fast
-%{_bindir}/clblast_tuner_copy_pad
-%{_bindir}/clblast_tuner_invert
-%{_bindir}/clblast_tuner_routine_xgemm
-%{_bindir}/clblast_tuner_routine_xtrsv
-%{_bindir}/clblast_tuner_transpose_fast
-%{_bindir}/clblast_tuner_transpose_pad
-%{_bindir}/clblast_tuner_xaxpy
-%{_bindir}/clblast_tuner_xconvgemm
-%{_bindir}/clblast_tuner_xdot
-%{_bindir}/clblast_tuner_xgemm
-%{_bindir}/clblast_tuner_xgemm_direct
-%{_bindir}/clblast_tuner_xgemv
-%{_bindir}/clblast_tuner_xger
 %endif
 
 %endif #tizen

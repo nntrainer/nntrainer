@@ -10,7 +10,11 @@ include $(CLEAR_VARS)
 
 LOCAL_MODULE := ccapi-nntrainer
 
-LOCAL_SRC_FILES := $(LOCAL_PATH)/lib/$(TARGET_ARCH_ABI)/libccapi-nntrainer.so
+# LOCAL_SRC_FILES of a prebuilt module is resolved by ndk-build's
+# local-prebuilt-path, which prepends LOCAL_PATH to any relative entry. Spelling
+# the prefix out here doubles it whenever LOCAL_PATH itself is relative.
+# LOCAL_EXPORT_C_INCLUDES below is not resolved that way and keeps its prefix.
+LOCAL_SRC_FILES := lib/$(TARGET_ARCH_ABI)/libccapi-nntrainer.so
 LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH)/include
 LOCAL_EXPORT_CFLAGS := $(NNTRAINER_EXPORT_CFLAGS)
 
@@ -20,7 +24,7 @@ include $(CLEAR_VARS)
 
 LOCAL_MODULE := nntrainer
 
-LOCAL_SRC_FILES := $(LOCAL_PATH)/lib/$(TARGET_ARCH_ABI)/libnntrainer.so
+LOCAL_SRC_FILES := lib/$(TARGET_ARCH_ABI)/libnntrainer.so
 LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH)/include $(LOCAL_PATH)/include/nntrainer
 LOCAL_EXPORT_CFLAGS := $(NNTRAINER_EXPORT_CFLAGS)
 

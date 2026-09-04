@@ -16,6 +16,7 @@
 #define __CL_CONTEXT_H__
 
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -71,13 +72,26 @@ public:
   /**
    * @brief destructor to release opencl commandQueue
    */
-  ~ClContext() override {
-    if (cl_initialized) {
-      command_queue_inst_.ReleaseCommandQueue();
-      // getContext() is called by clCreateKernel
-      context_inst_.ReleaseContext();
-    }
-  };
+  ~ClContext() override { releaseClResources(); };
+
+  /**
+   * @brief release the buffers, command queue and context owned here
+   *
+   * @note Idempotent: clInit() arms this as an exit handler, and the
+   * destructor calls it again for the paths that never got there.
+   */
+  void releaseClResources() {
+    if (!cl_initialized)
+      return;
+    cl_initialized = false;
+
+    // SVM regions and device buffers belong to the context below, so they
+    // have to go back first.
+    clbuffInstance.releaseBuffers();
+    command_queue_inst_.ReleaseCommandQueue();
+    // getContext() is called by clCreateKernel
+    context_inst_.ReleaseContext();
+  }
 
   /**
    * @brief Factory register function, use this function to register custom
@@ -298,6 +312,16 @@ private:
     // initialize device buffers
     clbuffInstance.initBuffers();
     cl_initialized = result;
+
+    // CreateCommandQueue() above dlopen()s the OpenCL driver, so the driver
+    // registered its own exit handlers *after* the singletons here were
+    // constructed. Exit handlers run in reverse registration order, so the
+    // driver tears itself down first and the singleton destructors then call
+    // clSVMFree()/clRelease*() on finalized driver state. Registering the
+    // teardown from here, after the driver is loaded, puts it ahead of the
+    // driver's own handlers.
+    std::atexit([]() { ClContext::Global().releaseClResources(); });
+
     return cl_initialized;
   };
 
