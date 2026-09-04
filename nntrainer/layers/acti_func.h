@@ -18,6 +18,7 @@
 
 #include <common_properties.h>
 #include <cpu_backend.h>
+#include <thread_manager.h>
 
 #if defined(_WIN32)
 #define _USE_MATH_DEFINES
@@ -398,6 +399,28 @@ public:
    */
   template <typename T = float>
   static Tensor &swish(Tensor const &t_in, Tensor &t_out) {
+    constexpr size_t parallel_threshold = 4096;
+    if (t_in.getContiguous() && t_out.getContiguous()) {
+      const size_t size = t_in.size();
+      const T *input = t_in.getData<T>();
+      T *output = t_out.getData<T>();
+
+      auto swish_at = [=](size_t i) {
+        const float value = static_cast<float>(input[i]);
+        output[i] = static_cast<T>(value / (1.0f + std::exp(-value)));
+      };
+
+      auto &thread_manager = ThreadManager::Global();
+      const unsigned int thread_count = thread_manager.getComputeThreadCount();
+      if (thread_count <= 1 || size < parallel_threshold) {
+        for (size_t i = 0; i < size; ++i)
+          swish_at(i);
+      } else {
+        thread_manager.parallel_for(0, size, swish_at);
+      }
+      return t_out;
+    }
+
     t_in.apply<T>([&](T x) { return sigmoid<T>(x); }, t_out);
     t_out.multiply_i(t_in);
 

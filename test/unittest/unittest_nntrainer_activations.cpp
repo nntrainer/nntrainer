@@ -384,6 +384,48 @@ TEST(nntrainer_activation, swish_01_p) {
   }
 }
 
+TEST(nntrainer_activation, swish_large_tensor_p) {
+  constexpr size_t size = 4097;
+  nntrainer::Tensor input(1, 1, 1, size);
+  nntrainer::Tensor results(1, 1, 1, size);
+
+  float *input_data = input.getData<float>();
+  for (size_t i = 0; i < size; ++i)
+    input_data[i] = static_cast<float>(i % 101) / 10.0f - 5.0f;
+
+  nntrainer::ActiFunc::swish<float>(input, results);
+
+  const float *result_data = results.getData<float>();
+  for (size_t i = 0; i < size; ++i) {
+    const float value = input_data[i];
+    EXPECT_NEAR(result_data[i], value / (1.0f + std::exp(-value)), tolerance);
+  }
+}
+
+#ifdef ENABLE_FP16
+TEST(nntrainer_activation, swish_fp16_p) {
+  constexpr size_t size = 4097;
+  const nntrainer::TensorDim::TensorType fp16_type = {
+    nntrainer::TensorDim::Format::NCHW, nntrainer::TensorDim::DataType::FP16};
+  nntrainer::Tensor input(nntrainer::TensorDim(1, 1, 1, size, fp16_type));
+  nntrainer::Tensor results(nntrainer::TensorDim(1, 1, 1, size, fp16_type));
+
+  _FP16 *input_data = input.getData<_FP16>();
+  for (size_t i = 0; i < size; ++i)
+    input_data[i] =
+      static_cast<_FP16>(static_cast<float>(i % 101) / 10.0f - 5.0f);
+
+  nntrainer::ActiFunc::swish<_FP16>(input, results);
+
+  const _FP16 *result_data = results.getData<_FP16>();
+  for (size_t i = 0; i < size; ++i) {
+    const float value = static_cast<float>(input_data[i]);
+    EXPECT_NEAR(static_cast<float>(result_data[i]),
+                value / (1.0f + std::exp(-value)), 0.004f);
+  }
+}
+#endif
+
 TEST(nntrainer_activation, swishPrime_01_p) {
 
   int batch = 3;

@@ -11,6 +11,7 @@
  *
  */
 
+#include <thread_manager.h>
 #include <util_simd.h>
 
 #include "swiglu.h"
@@ -51,31 +52,32 @@ void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   if (skip_prefill && is_prefill)
     return;
 
-  int iter = to - from;
+  const unsigned int iter = to - from;
+  const size_t rows = static_cast<size_t>(in1.batch()) * in1.channel() * iter;
+
+  auto &thread_manager = nntrainer::ThreadManager::Global();
 
   if (in1.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    for (unsigned int b = 0; b < in1.batch(); b++) {
-      for (unsigned int c = 0; c < in1.channel(); c++) {
-        for (unsigned int h = 0; h < iter; h++) {
-          nntrainer::swiglu(in1.width(),
-                            out.getData<float>() + out.getIndex(b, c, h, 0),
-                            in1.getData<float>() + in1.getIndex(b, c, h, 0),
-                            in2.getData<float>() + in2.getIndex(b, c, h, 0));
-        }
-      }
-    }
+    thread_manager.parallel_for(0, rows, [&](size_t row) {
+      const unsigned int b = row / (in1.channel() * iter);
+      const unsigned int c = row / iter % in1.channel();
+      const unsigned int h = row % iter;
+      nntrainer::swiglu(in1.width(),
+                        out.getData<float>() + out.getIndex(b, c, h, 0),
+                        in1.getData<float>() + in1.getIndex(b, c, h, 0),
+                        in2.getData<float>() + in2.getIndex(b, c, h, 0));
+    });
   } else if (in1.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    for (unsigned int b = 0; b < in1.batch(); b++) {
-      for (unsigned int c = 0; c < in1.channel(); c++) {
-        for (unsigned int h = 0; h < iter; h++) {
-          nntrainer::swiglu(in1.width(),
-                            out.getData<_FP16>() + out.getIndex(b, c, h, 0),
-                            in1.getData<_FP16>() + in1.getIndex(b, c, h, 0),
-                            in2.getData<_FP16>() + in2.getIndex(b, c, h, 0));
-        }
-      }
-    }
+    thread_manager.parallel_for(0, rows, [&](size_t row) {
+      const unsigned int b = row / (in1.channel() * iter);
+      const unsigned int c = row / iter % in1.channel();
+      const unsigned int h = row % iter;
+      nntrainer::swiglu(in1.width(),
+                        out.getData<_FP16>() + out.getIndex(b, c, h, 0),
+                        in1.getData<_FP16>() + in1.getIndex(b, c, h, 0),
+                        in2.getData<_FP16>() + in2.getIndex(b, c, h, 0));
+    });
 #else
     NNTR_THROW_IF(true, std::invalid_argument) << "enable-fp16 is not set!";
 #endif
