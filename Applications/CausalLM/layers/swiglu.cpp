@@ -7,10 +7,12 @@
  * @brief  Implementation of SwiGLU activation function
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  */
 
+#include <cmath>
 #include <util_simd.h>
 
 #include "swiglu.h"
@@ -38,18 +40,26 @@ void SwiGLULayer::finalize(nntrainer::InitLayerContext &context) {
 }
 
 void SwiGLULayer::forwarding(nntrainer::RunLayerContext &context,
-                             bool training) {}
+                             bool training) {
+  nntrainer::Tensor &in1 = context.getInput(INPUT_IDX_1);
+  computeSwiGLU(context, 0, in1.getDim().height());
+}
 
 void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                          unsigned int from, unsigned int to,
                                          bool training) {
-  nntrainer::Tensor &in1 = context.getInput(INPUT_IDX_1);
-  nntrainer::Tensor &in2 = context.getInput(INPUT_IDX_2);
-  nntrainer::Tensor &out = context.getOutput(OUT_IDX);
-
   bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
+
+  computeSwiGLU(context, from, to);
+}
+
+void SwiGLULayer::computeSwiGLU(nntrainer::RunLayerContext &context,
+                                unsigned int from, unsigned int to) {
+  nntrainer::Tensor &in1 = context.getInput(INPUT_IDX_1);
+  nntrainer::Tensor &in2 = context.getInput(INPUT_IDX_2);
+  nntrainer::Tensor &out = context.getOutput(OUT_IDX);
 
   int iter = to - from;
 
@@ -98,9 +108,54 @@ void SwiGLULayer::updateTensorsByInputDimensions(
   context.updateOutput(OUT_IDX, output_dim);
 }
 
+/**
+ * @brief calcDerivative for SwiGLU.
+ * @details out = silu(gate) * up, where gate = input[0], up = input[1] and
+ *          silu(g) = g * sigmoid(g).
+ *          d(out)/d(gate) = up * silu'(gate),
+ *            silu'(g) = sigmoid(g) * (1 + g * (1 - sigmoid(g)))
+ *          d(out)/d(up) = silu(gate)
+ *          SwiGLU has no weights of its own, so there is no
+ *          calcGradient to implement.
+ *
+ * @note nntrainer aliases each outgoing derivative onto its input's own
+ *       buffer (the activation's storage is recycled to hold its gradient),
+ *       so `d_gate` IS `gate` and `d_up` IS `up`. Every input element must
+ *       therefore be read into a local before *either* output element at
+ *       that index is written — otherwise writing d_up[i] destroys up[i]
+ *       before it is used to form d_gate[i].
+ */
 void SwiGLULayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  // std::throw_with_nested(std::runtime_error("Training is not supported
-  // yet."));
+  nntrainer::Tensor &gate = context.getInput(INPUT_IDX_1);
+  nntrainer::Tensor &up = context.getInput(INPUT_IDX_2);
+  const nntrainer::Tensor &dy = context.getIncomingDerivative(OUT_IDX);
+  nntrainer::Tensor &d_gate = context.getOutgoingDerivative(INPUT_IDX_1);
+  nntrainer::Tensor &d_up = context.getOutgoingDerivative(INPUT_IDX_2);
+
+  NNTR_THROW_IF(gate.getDataType() != ml::train::TensorDim::DataType::FP32,
+                std::invalid_argument)
+    << "[swiglu] calcDerivative only supports FP32 for now";
+
+  const size_t len = gate.size();
+  const float *g = gate.getData<float>();
+  const float *u = up.getData<float>();
+  const float *dy_ = dy.getData<float>();
+  float *dg = d_gate.getData<float>();
+  float *du = d_up.getData<float>();
+
+  for (size_t i = 0; i < len; ++i) {
+    // Snapshot all inputs at this index first; see the aliasing note above.
+    const float gi = g[i];
+    const float ui = u[i];
+    const float dyi = dy_[i];
+
+    const float sig = 1.0f / (1.0f + std::exp(-gi));
+    const float silu = gi * sig;
+    const float dsilu = sig * (1.0f + gi * (1.0f - sig));
+
+    du[i] = dyi * silu;
+    dg[i] = dyi * ui * dsilu;
+  }
 }
 
 #ifdef PLUGGABLE
