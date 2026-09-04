@@ -1,0 +1,966 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-__NONCE__';">
+<title>Agentic Graph Visualiser</title>
+<style>
+  :root {
+    --bg: #0e0e18;
+    --panel-bg: #12121c;
+    --border: #2a2a3d;
+    --fg: #ddd;
+    --muted: #888;
+    --accent: #61afef;
+    --green: #98c379;
+    --red: #e06c75;
+    --amber: #d19a66;
+    --purple: #c678dd;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--fg); font-size: 13px;
+    display: flex; flex-direction: column;
+  }
+  .topbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; background: var(--panel-bg); border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .topbar h1 { font-size: 14px; margin: 0; font-weight: 600; flex-shrink: 0; }
+  .topbar input[type=text] {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 5px 8px; width: 220px; font-size: 12px;
+  }
+  .topbar button {
+    background: #2d5a8c; color: #fff;
+    border: none; border-radius: 4px; padding: 5px 12px; cursor: pointer; font-size: 12px;
+  }
+  .topbar button:hover { background: #3a6ea0; }
+  .topbar button.danger { background: #7a3030; }
+  .topbar .spacer { flex: 1; }
+  .topbar .status { font-size: 11px; color: var(--muted); }
+
+  .layout { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .main { flex: 1; display: flex; min-height: 0; gap: 0; overflow: hidden; }
+  .v-splitter { height: 6px; background: var(--border); cursor: row-resize; flex-shrink: 0; }
+  .v-splitter:hover { background: var(--accent); }
+
+  .panel { display: flex; flex-direction: column; min-height: 0; border: 1px solid var(--border); background: var(--panel-bg); min-width: 0; }
+  .panel-hdr { padding: 6px 10px; font-size: 11px; font-weight: 700; letter-spacing: .4px;
+              background: rgba(255,255,255,.04); border-bottom: 1px solid var(--border); flex-shrink: 0;
+              display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .panel-hdr .label { text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .panel-body { flex: 1; overflow: auto; min-height: 0; position: relative; }
+
+  .h-splitter { width: 6px; background: var(--border); cursor: col-resize; flex-shrink: 0; }
+  .h-splitter:hover { background: var(--accent); }
+
+  .agent-row { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid rgba(255,255,255,.04); }
+  .agent-row .dot { width: 9px; height: 9px; border-radius: 50%; background: #555; flex-shrink: 0; }
+  .agent-row.done .dot { background: var(--green); }
+  .agent-row.running .dot { background: var(--accent); animation: pulse 1s infinite; }
+  .agent-row.error .dot { background: var(--red); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+  .agent-row .info { display: flex; flex-direction: column; min-width: 0; }
+  .agent-row .name { font-size: 12px; }
+  .agent-row .detail { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* Graph header controls */
+  .graph-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .graph-actions button {
+    background: rgba(255,255,255,.06); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 3px 8px; font-size: 10px; cursor: pointer; text-transform: none;
+  }
+  .graph-actions button:hover { background: rgba(255,255,255,.12); }
+  .graph-actions button.active { background: var(--accent); color: #111; border-color: var(--accent); }
+  .graph-actions button.export-btn { background: rgba(152,195,121,.15); border-color: rgba(152,195,121,.4); color: var(--green); }
+  .graph-actions button.export-btn:hover { background: rgba(152,195,121,.3); }
+
+  /* Graph focus row */
+  .focus-row {
+    display: flex; gap: 6px; align-items: center; padding: 5px 10px;
+    background: var(--panel-bg); border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .focus-row input.focus-input {
+    flex: 1; min-width: 0; background: rgba(255,255,255,.05); border: 1px solid var(--border);
+    border-radius: 4px; padding: 4px 8px; font-size: 11px; color: var(--fg);
+  }
+  .focus-row input.focus-input:focus { outline: none; border-color: var(--accent); }
+  .focus-row button {
+    background: rgba(97,175,239,.15); color: var(--accent); border: 1px solid rgba(97,175,239,.4);
+    border-radius: 4px; padding: 4px 10px; font-size: 10px; cursor: pointer; white-space: nowrap;
+  }
+  .focus-row button:hover:not(:disabled) { background: rgba(97,175,239,.3); }
+  .focus-row button:disabled { opacity: .35; cursor: default; }
+  .focus-row button.focus-reset { background: rgba(255,255,255,.06); color: var(--fg); border-color: var(--border); }
+
+  /* Graph canvas */
+  .graphContainer { position: relative; width: 100%; height: 100%; overflow: auto; background: #0a0a12; cursor: grab; }
+  .graphContainer.panning { cursor: grabbing; }
+  .graphContainer.nopan { cursor: default; }
+  svg { display: block; background: #0a0a12; }
+  .node {
+    position: absolute; min-width: 145px; max-width: 180px; border-radius: 7px; border: 1.5px solid #444;
+    background: #22222f; font-size: 11px; cursor: pointer; overflow: hidden;
+    box-shadow: 0 2px 6px rgba(0,0,0,.4); user-select: none;
+    transition: opacity .15s ease;
+  }
+  .node .nhdr { padding: 4px 8px; font-size: 9px; font-weight: 700; text-transform: uppercase; border-radius: 6px 6px 0 0; }
+  .node .nname { padding: 5px 8px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .node.mapped { border-left: 3px solid var(--green); }
+  .node.unmapped { border-left: 3px solid var(--red); }
+  .node.skipped { border-left: 3px solid var(--amber); opacity: .6; }
+  .node.sel { box-shadow: 0 0 0 2px var(--accent), 0 2px 8px rgba(97,175,239,.3); z-index: 10; }
+  .node.dimmed { opacity: .18; }
+  .node.dimmed.sel { opacity: .5; }
+  path.edge-dimmed { opacity: .12; }
+  .node .nhdr.mapped { color: var(--green); background: rgba(152,195,121,.15); }
+  .node .nhdr.unmapped { color: var(--red); background: rgba(224,108,117,.15); }
+  .node .nhdr.skipped { color: var(--amber); background: rgba(209,154,102,.15); }
+
+  /* Inspector (reference-tool pattern: docked overlay, Properties/Weights tabs) */
+  .inspector {
+    position: absolute; top: 8px; right: 8px; width: 230px; max-height: calc(100% - 16px);
+    background: var(--panel-bg); border: 1px solid var(--border); border-radius: 6px;
+    font-size: 11px; display: none; z-index: 30; box-shadow: 0 4px 12px rgba(0,0,0,.5); overflow: hidden;
+    display: none; flex-direction: column;
+  }
+  .inspector.vis { display: flex; }
+  .inspector h4 { margin: 0; padding: 8px 10px 4px; font-size: 12px; color: var(--accent); }
+  .itabs { display: flex; gap: 3px; padding: 0 8px 6px; border-bottom: 1px solid var(--border); }
+  .itab { padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; color: var(--muted); }
+  .itab.active { background: var(--accent); color: #111; font-weight: 600; }
+  .ibody { padding: 8px 10px; overflow-y: auto; }
+  .kv { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; color: var(--muted); }
+  .kv b { color: var(--fg); font-weight: 500; max-width: 140px; overflow: hidden; text-overflow: ellipsis; text-align: right; }
+  .no-weight { color: var(--muted); font-style: italic; padding: 6px 0; }
+  .weight-preview { 
+    background: rgba(0,0,0,.2); 
+    border-radius: 4px; 
+    padding: 6px 8px; 
+    font-family: "Monaco", "Courier New", monospace; 
+    font-size: 10px; 
+    color: var(--accent);
+    word-break: break-all;
+  }
+
+  /* Minimap */
+  .minimap {
+    position: fixed; bottom: 240px; right: 20px; width: 150px; height: 115px;
+    background: rgba(18,18,28,.95); border: 1px solid var(--border); border-radius: 6px;
+    z-index: 100; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,.5); cursor: pointer;
+    display: none;
+  }
+  .minimap.visible { display: block; }
+  .minimap .mm-hdr { font-size: 8px; text-transform: uppercase; color: var(--muted); padding: 3px 6px; letter-spacing: .3px; }
+  .minimapSvg { display: block; width: 100%; height: 100%; }
+  .minimapViewport { position: absolute; border: 1.5px solid var(--accent); background: rgba(97,175,239,.12); pointer-events: none; }
+
+  /* Code viewer */
+  #codeViewer { margin: 0; padding: 10px; font-family: "Monaco", "Courier New", monospace;
+                font-size: 12px; white-space: pre; line-height: 1.5; }
+  .tok-kw { color: #c678dd; } .tok-com { color: #6a7c93; font-style: italic; }
+  .tok-str { color: #98c379; } .tok-pre { color: #e5c07b; }
+
+  /* Tabs (chat/agent-msgs) */
+  .tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; background: rgba(255,255,255,.02); }
+  .tab { padding: 6px 12px; font-size: 11px; cursor: pointer; color: var(--muted); text-transform: uppercase; letter-spacing: .3px; }
+  .tab.active { color: var(--fg); border-bottom: 2px solid var(--accent); }
+  .tabpage { display: none; flex: 1; min-height: 0; overflow: auto; }
+  .tabpage.active { display: block; }
+
+  /* Chat */
+  .chat-msgs { padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { padding: 8px 10px; border-radius: 6px; font-size: 12px; max-width: 96%; word-wrap: break-word; }
+  .msg.user { background: #2d3f52; align-self: flex-end; }
+  .msg.assistant { background: #23232f; align-self: flex-start; }
+  .msg .role { font-size: 9px; color: var(--muted); text-transform: uppercase; margin-bottom: 2px; font-weight: 700; }
+  .chat-input { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--border); flex-shrink: 0; }
+  .chat-input input { flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; }
+  .chat-input button { background: var(--accent); border: none; border-radius: 4px; padding: 6px 12px; cursor: pointer; color: #111; font-weight: 600; }
+
+  /* Logs */
+  .log-line { padding: 3px 10px; font-family: "Monaco", "Courier New", monospace; font-size: 11px; white-space: pre-wrap; word-wrap: break-word; }
+  .log-line.warn { color: var(--amber); }
+  .log-line.error { color: var(--red); }
+
+  /* Profiler */
+  #profilerBody { padding: 10px; }
+  .prof-stats { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .prof-stat { background: rgba(255,255,255,.04); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; }
+  .prof-stat .v { font-size: 16px; font-weight: 700; }
+  .prof-stat .l { font-size: 10px; color: var(--muted); }
+  .prof-note { font-size: 10px; color: var(--muted); margin-top: 8px; }
+  .bottleneck-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+  .bottleneck-row .bn-name { flex: 1; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bottleneck-row .bn-bar-wrap { flex: 0 0 90px; height: 8px; background: rgba(255,255,255,.06); border-radius: 3px; overflow: hidden; }
+  .bottleneck-row .bn-bar { height: 100%; background: linear-gradient(90deg, var(--accent), var(--red)); }
+  .bottleneck-row .bn-pct { flex: 0 0 42px; text-align: right; font-size: 10px; color: var(--muted); }
+
+  /* Artifacts */
+  .artifact-row { display: flex; justify-content: space-between; gap: 8px; padding: 6px 10px; font-size: 11px;
+                  border-bottom: 1px solid rgba(255,255,255,.04); cursor: pointer; }
+  .artifact-row:hover { background: rgba(255,255,255,.04); }
+  .artifact-row .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .artifact-row .size { color: var(--muted); flex-shrink: 0; }
+
+  .bottom-panels { display: flex; gap: 0; height: 220px; flex-shrink: 0; }
+
+  .empty-msg { padding: 20px; color: #888; font-size: 12px; }
+</style>
+</head>
+<body>
+
+  <div class="topbar">
+    <h1>⚙️ Agentic Graph Visualiser</h1>
+    <input id="modelInput" type="text" placeholder="e.g. bert-base-uncased" value="bert-base-uncased" />
+    <button id="btnRun">▶ Run Pipeline</button>
+    <button id="btnStop" class="danger">⏹ Stop</button>
+    <button id="btnEnv">Check Env</button>
+    <button id="btnExport">⬇ Export All</button>
+    <input id="nntrainerPathInput" type="text" placeholder="nntrainer install prefix or git-clone repo path" style="width: 320px;" />
+    <button id="btnProfileDevice">🔧 Run On-Device Profiling</button>
+    <div class="spacer"></div>
+    <div class="status" id="statusLine">Idle</div>
+  </div>
+
+  <div class="layout">
+    <div class="main" id="mainRow">
+      <!-- Agent Pipeline -->
+      <div class="panel" id="panel-pipeline" style="flex: 0 0 210px;">
+        <div class="panel-hdr"><span class="label">Agent Pipeline</span></div>
+        <div class="panel-body" id="agentList"></div>
+      </div>
+      <div class="h-splitter" data-before="panel-pipeline" data-after="panel-graph-ini"></div>
+
+      <!-- Model Graph -->
+      <div class="panel" id="panel-graph-ini" style="flex: 1 1 0;">
+        <div class="panel-hdr">
+          <span class="label">Model Graph</span>
+          <div class="graph-actions">
+            <button class="pan-toggle active" data-graph="ini">✋ Pan</button>
+            <button class="zoom-fit" data-graph="ini">⤢ Fit</button>
+            <button class="export-btn" data-graph="ini">⬇ Export .ini</button>
+          </div>
+        </div>
+        <div class="focus-row">
+          <input class="focus-input" data-graph="ini" type="text" placeholder="Focus: e.g. 'self attention' or 'bottleneck'" />
+          <button class="focus-go" data-graph="ini">Focus</button>
+          <button class="focus-reset" data-graph="ini" disabled>Show Full Graph</button>
+        </div>
+        <div class="panel-body">
+          <div class="graphContainer" id="graphContainer-ini"><div class="empty-msg">Run the pipeline to see the model graph.</div></div>
+          <div class="inspector" id="inspector-ini"></div>
+          <div class="minimap" id="minimap-ini">
+            <div class="mm-hdr">Minimap</div>
+            <svg class="minimapSvg"></svg>
+            <div class="minimapViewport"></div>
+          </div>
+        </div>
+      </div>
+      <div class="h-splitter" data-before="panel-graph-ini" data-after="panel-graph-cpp"></div>
+
+      <!-- nntrainer Graph -->
+      <div class="panel" id="panel-graph-cpp" style="flex: 1 1 0;">
+        <div class="panel-hdr">
+          <span class="label">nntrainer Graph</span>
+          <div class="graph-actions">
+            <button class="pan-toggle active" data-graph="cpp">✋ Pan</button>
+            <button class="zoom-fit" data-graph="cpp">⤢ Fit</button>
+            <button class="export-btn" data-graph="cpp">⬇ Export .cpp</button>
+          </div>
+        </div>
+        <div class="focus-row">
+          <input class="focus-input" data-graph="cpp" type="text" placeholder="Focus: e.g. 'self attention' or 'bottleneck'" />
+          <button class="focus-go" data-graph="cpp">Focus</button>
+          <button class="focus-reset" data-graph="cpp" disabled>Show Full Graph</button>
+        </div>
+        <div class="panel-body">
+          <div class="graphContainer" id="graphContainer-cpp"><div class="empty-msg">Run the pipeline to see the lowered nntrainer graph.</div></div>
+          <div class="inspector" id="inspector-cpp"></div>
+          <div class="minimap" id="minimap-cpp">
+            <div class="mm-hdr">Minimap</div>
+            <svg class="minimapSvg"></svg>
+            <div class="minimapViewport"></div>
+          </div>
+        </div>
+      </div>
+      <div class="h-splitter" data-before="panel-graph-cpp" data-after="panel-code"></div>
+
+      <!-- C++ Code Viewer -->
+      <div class="panel" id="panel-code" style="flex: 0 0 280px;">
+        <div class="panel-hdr"><span class="label">C++ Code Viewer</span></div>
+        <div class="panel-body"><pre id="codeViewer">// Run the pipeline to generate nntrainer C++ code.</pre></div>
+      </div>
+    </div>
+
+    <div class="v-splitter" id="vSplitter"></div>
+
+    <!-- Bottom row: Chat | Logs | Profiler | Artifacts -->
+    <div class="bottom-panels" id="bottomRow">
+      <div class="panel" id="panel-chat" style="flex: 1 1 0;">
+        <div class="tabs">
+          <div class="tab active" data-tab="chat">Chat</div>
+          <div class="tab" data-tab="agentmsgs">Agent Msgs</div>
+        </div>
+        <div class="tabpage active" data-tab="chat" id="chatMsgsWrap">
+          <div class="chat-msgs" id="chatMsgs"></div>
+        </div>
+        <div class="tabpage" data-tab="agentmsgs" id="agentMsgsWrap"><div class="chat-msgs" id="agentMsgs"></div></div>
+        <div class="chat-input">
+          <input id="chatInput" type="text" placeholder="Ask the orchestrator..." />
+          <button id="btnSend">⮕</button>
+        </div>
+      </div>
+      <div class="h-splitter" data-before="panel-chat" data-after="panel-logs"></div>
+
+      <div class="panel" id="panel-logs" style="flex: 1 1 0;">
+        <div class="panel-hdr"><span class="label">Logs</span></div>
+        <div class="panel-body" id="logsBody"></div>
+      </div>
+      <div class="h-splitter" data-before="panel-logs" data-after="panel-profiler"></div>
+
+      <div class="panel" id="panel-profiler" style="flex: 1 1 0;">
+        <div class="panel-hdr"><span class="label">Profiler Dashboard</span></div>
+        <div class="panel-body" id="profilerBody">
+          <div class="prof-stats">
+            <div class="prof-stat"><div class="v" id="profTotal">—</div><div class="l">Avg Latency</div></div>
+            <div class="prof-stat"><div class="v" id="profLayers">—</div><div class="l">Layers</div></div>
+            <div class="prof-stat"><div class="v" id="profArch">—</div><div class="l">Target</div></div>
+            <div class="prof-stat"><div class="v" id="profWeights">—</div><div class="l">Weights</div></div>
+          </div>
+          <div id="bottleneckList"></div>
+          <div class="prof-note" id="profNote">Run the pipeline, then click "Profile On-Device" for real hardware measurements.</div>
+        </div>
+      </div>
+      <div class="h-splitter" data-before="panel-profiler" data-after="panel-artifacts"></div>
+
+      <div class="panel" id="panel-artifacts" style="flex: 1 1 0;">
+        <div class="panel-hdr"><span class="label">Artifacts</span></div>
+        <div class="panel-body" id="artifactsBody"></div>
+      </div>
+    </div>
+  </div>
+
+<script nonce="__NONCE__">
+const vscode = acquireVsCodeApi();
+
+const AGENTS = [
+  ["model_discovery", "Model Discovery"],
+  ["weight_download", "Weight Download (background)"],
+  ["weight_converter", "Weight Converter (background)"],
+  ["compatibility", "Compatibility (from config, no download)"],
+  ["ini_generator", "INI Generator"],
+  ["graph_builder", "Graph Builder"],
+  ["cpp_generator", "C++ Generator"],
+  ["dual_graph", "Dual Graph"],
+  ["compiler", "Compiler"],
+  ["auto_fix", "Auto-Fix"],
+  ["nntrainer_builder", "NNTrainer Build (if needed)"],
+  ["profiler", "Profiler"],
+  ["artifact_manager", "Artifact Manager"],
+];
+
+const agentList = document.getElementById("agentList");
+const agentRows = {};
+for (const [id, label] of AGENTS) {
+  const row = document.createElement("div");
+  row.className = "agent-row";
+  row.innerHTML = `<div class="dot"></div><div class="info"><div class="name">${escapeHtml(label)}</div><div class="detail">pending</div></div>`;
+  agentList.appendChild(row);
+  agentRows[id] = row;
+}
+
+function setAgentStatus(agent, status, detail) {
+  const row = agentRows[agent];
+  if (!row) return;
+  row.className = "agent-row " + status;
+  row.querySelector(".detail").textContent = detail || status;
+}
+
+function addLog(message, level) {
+  const el = document.createElement("div");
+  el.className = "log-line " + (level || "info");
+  el.textContent = message;
+  const body = document.getElementById("logsBody");
+  body.appendChild(el);
+  body.scrollTop = body.scrollHeight;
+}
+
+function addChat(role, content, agent) {
+  const wrap = agent && agent !== "orchestrator" ? "agentMsgs" : "chatMsgs";
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  el.innerHTML = `<div class="role">${escapeHtml(agent || role)}</div><div>${escapeHtml(content)}</div>`;
+  const container = document.getElementById(wrap);
+  container.appendChild(el);
+  container.parentElement.scrollTop = container.parentElement.scrollHeight;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+const fileContents = { ini: null, cpp: null };
+let nodeMappings = [];
+
+function crossHighlightFrom(paneKey, nodeId) {
+  const otherKey = paneKey === "ini" ? "cpp" : "ini";
+  const otherPane = graphPanes[otherKey];
+  if (!otherPane) return;
+  const isSourceSide = paneKey === "ini";
+  const match = nodeMappings.find((m) =>
+    isSourceSide ? (m.sourceIds || []).includes(nodeId) : (m.targetIds || []).includes(nodeId)
+  );
+  if (!match) return;
+  const otherIds = isSourceSide ? match.targetIds : match.sourceIds;
+  if (otherIds && otherIds.length) {
+    otherPane.applyFocus(otherIds);
+    if (otherPane.focusResetBtn) otherPane.focusResetBtn.disabled = false;
+  }
+}
+
+function makeGraphPane(key) {
+  const container = document.getElementById(`graphContainer-${key}`);
+  const inspector = document.getElementById(`inspector-${key}`);
+  const minimap = document.getElementById(`minimap-${key}`);
+  const minimapSvg = minimap.querySelector(".minimapSvg");
+  const minimapViewport = minimap.querySelector(".minimapViewport");
+  const panToggleBtn = document.querySelector(`.pan-toggle[data-graph="${key}"]`);
+  const fitBtn = document.querySelector(`.zoom-fit[data-graph="${key}"]`);
+  const exportBtn = document.querySelector(`.export-btn[data-graph="${key}"]`);
+
+  const state = { data: null, panEnabled: true, mmScale: null, inspTab: "props", focusedIds: null };
+
+  function render(data) {
+    state.data = data;
+    draw();
+  }
+
+  function draw() {
+    const data = state.data;
+    container.innerHTML = "";
+    inspector.classList.remove("vis");
+
+    if (!data || !data.nodes || data.nodes.length === 0) {
+      container.innerHTML = `<div class="empty-msg">No graph yet. Run the pipeline.</div>`;
+      minimap.style.display = "none";
+      return;
+    }
+
+    const nodes = data.nodes || [];
+    const edges = data.edges || [];
+
+    let maxX = 100, maxY = 100;
+    nodes.forEach(n => {
+      maxX = Math.max(maxX, n.x + 220);
+      maxY = Math.max(maxY, n.y + 100);
+    });
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("width", maxX);
+    svg.setAttribute("height", maxY);
+    svg.style.position = "absolute";
+    svg.style.top = "0";
+    svg.style.left = "0";
+    svg.style.pointerEvents = "none";
+    svg.style.zIndex = "0";
+
+    const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+    const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+    marker.setAttribute("id", `arrowhead-${key}`);
+    marker.setAttribute("markerWidth", "10");
+    marker.setAttribute("markerHeight", "10");
+    marker.setAttribute("refX", "5");
+    marker.setAttribute("refY", "8");
+    marker.setAttribute("orient", "auto");
+    const poly = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+    poly.setAttribute("points", "0 0, 10 0, 5 9");
+    poly.setAttribute("fill", "#4a4a5e");
+    marker.appendChild(poly);
+    defs.appendChild(marker);
+    svg.appendChild(defs);
+
+    const byId = {};
+    nodes.forEach(n => (byId[n.id] = n));
+    edges.forEach(e => {
+      const s = byId[e.source], t = byId[e.target];
+      if (!s || !t) return;
+      const x1 = s.x + 80, y1 = s.y + 52;
+      const x2 = t.x + 80, y2 = t.y - 2;
+      const my = (y1 + y2) / 2;
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`);
+      path.setAttribute("stroke", "#4a4a5e");
+      path.setAttribute("stroke-width", "1.5");
+      path.setAttribute("fill", "none");
+      path.setAttribute("marker-end", `url(#arrowhead-${key})`);
+      path.dataset.source = e.source;
+      path.dataset.target = e.target;
+      svg.appendChild(path);
+    });
+
+    container.appendChild(svg);
+    container.style.width = maxX + "px";
+    container.style.height = maxY + "px";
+
+    nodes.forEach(n => {
+      const div = document.createElement("div");
+      div.className = "node " + n.status;
+      div.dataset.id = n.id;
+      div.style.left = n.x + "px";
+      div.style.top = n.y + "px";
+      div.style.position = "absolute";
+      div.style.zIndex = "1";
+      div.innerHTML = `<div class="nhdr ${n.status}">${escapeHtml(n.type)}</div><div class="nname">${escapeHtml(n.label)}</div>`;
+      div.addEventListener("mousedown", (e) => e.stopPropagation());
+      div.onclick = (e) => { e.stopPropagation(); selectNode(n, div); };
+      container.appendChild(div);
+    });
+
+    renderMinimap(data, maxX, maxY);
+    applyFocusStyles();
+  }
+
+  function applyFocusStyles() {
+    const ids = state.focusedIds;
+    container.querySelectorAll(".node").forEach((el) => {
+      el.classList.toggle("dimmed", !!ids && !ids.has(el.dataset.id));
+    });
+    container.querySelectorAll("path[data-source]").forEach((el) => {
+      const bothIn = !ids || (ids.has(el.dataset.source) && ids.has(el.dataset.target));
+      el.classList.toggle("edge-dimmed", !bothIn);
+    });
+  }
+
+  function applyFocus(matchedIds) {
+    state.focusedIds = new Set(matchedIds);
+    applyFocusStyles();
+  }
+
+  function resetFocus() {
+    state.focusedIds = null;
+    applyFocusStyles();
+  }
+
+  function selectNode(n, div) {
+    container.querySelectorAll(".node.sel").forEach((el) => el.classList.remove("sel"));
+    div.classList.add("sel");
+    renderInspector(n);
+    crossHighlightFrom(key, n.id);
+  }
+
+  function renderInspector(n) {
+    inspector.classList.add("vis");
+    const hasWeight = !!n.weightInfo;
+    const hasPreview = hasWeight && n.weightInfo.preview;
+    let attrRows = "";
+    for (const [k, v] of Object.entries(n.attributes || {})) {
+      attrRows += `<div class="kv"><span>${escapeHtml(k)}</span><b>${escapeHtml(String(v))}</b></div>`;
+    }
+    const propsBody = `
+      <div class="kv"><span>Type</span><b>${escapeHtml(n.type)}</b></div>
+      <div class="kv"><span>Status</span><b>${escapeHtml(n.status)}</b></div>
+      ${n.inputShape ? `<div class="kv"><span>Input</span><b>${escapeHtml(JSON.stringify(n.inputShape))}</b></div>` : ""}
+      ${n.outputShape ? `<div class="kv"><span>Output</span><b>${escapeHtml(JSON.stringify(n.outputShape))}</b></div>` : ""}
+      ${attrRows}
+      ${n.reason ? `<div class="kv"><span>Note</span><b>${escapeHtml(n.reason)}</b></div>` : ""}`;
+    
+    const weightsBody = hasWeight ? `
+      <div class="kv"><span>Name</span><b title="${escapeHtml(n.weightInfo.name)}">${escapeHtml(n.weightInfo.name)}</b></div>
+      <div class="kv"><span>Shape</span><b>${escapeHtml(JSON.stringify(n.weightInfo.shape))}</b></div>
+      <div class="kv"><span>Dtype</span><b>${escapeHtml(n.weightInfo.dtype)}</b></div>
+      <div class="kv"><span>Params</span><b>${n.weightInfo.params.toLocaleString()}</b></div>
+      ${hasPreview ? `
+        <h4>Statistics</h4>
+        <div class="kv"><span>Min</span><b>${n.weightInfo.min.toFixed(6)}</b></div>
+        <div class="kv"><span>Max</span><b>${n.weightInfo.max.toFixed(6)}</b></div>
+        <div class="kv"><span>Mean</span><b>${n.weightInfo.mean.toFixed(6)}</b></div>
+        <div class="kv"><span>Std Dev</span><b>${n.weightInfo.std.toFixed(6)}</b></div>
+        <h4>Preview (first 5 values)</h4>
+        <div class="weight-preview">${n.weightInfo.preview.map(v => v.toFixed(6)).join(", ")}</div>
+      ` : ""}
+    ` : `<div class="no-weight">No weight data for this node.</div>`;
+
+    inspector.innerHTML = `
+      <h4>${escapeHtml(n.label)}</h4>
+      <div class="itabs">
+        <div class="itab ${state.inspTab === 'props' ? 'active' : ''}" data-itab="props">Properties</div>
+        <div class="itab ${state.inspTab === 'weights' ? 'active' : ''}" data-itab="weights">Weights</div>
+      </div>
+      <div class="ibody">${state.inspTab === 'props' ? propsBody : weightsBody}</div>
+    `;
+    inspector.querySelectorAll(".itab").forEach(tab => {
+      tab.onclick = () => { state.inspTab = tab.dataset.itab; renderInspector(n); };
+    });
+  }
+
+  function renderMinimap(data, graphW, graphH) {
+    minimap.classList.add("visible");
+    const mmW = minimap.clientWidth, mmH = minimap.clientHeight - 16;
+    const scale = Math.min(mmW / graphW, mmH / graphH) * 0.92;
+
+    minimapSvg.innerHTML = "";
+    minimapSvg.setAttribute("viewBox", `0 0 ${mmW} ${mmH}`);
+
+    const colors = { mapped: "#98c379", unmapped: "#e06c75", skipped: "#d19a66" };
+    data.nodes.forEach(n => {
+      const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      rect.setAttribute("x", n.x * scale + 4);
+      rect.setAttribute("y", n.y * scale + 4);
+      rect.setAttribute("width", Math.max(3, 160 * scale));
+      rect.setAttribute("height", Math.max(2, 40 * scale));
+      rect.setAttribute("fill", colors[n.status] || "#666");
+      rect.setAttribute("rx", "1");
+      minimapSvg.appendChild(rect);
+    });
+
+    state.mmScale = scale;
+    updateMinimapViewport();
+  }
+
+  function updateMinimapViewport() {
+    const scale = state.mmScale;
+    if (!scale || !container.style.width) { minimapViewport.style.display = "none"; return; }
+    minimapViewport.style.display = "block";
+    minimapViewport.style.left = (container.scrollLeft * scale + 4) + "px";
+    minimapViewport.style.top = (container.scrollTop * scale + 4 + 16) + "px";
+    minimapViewport.style.width = (container.clientWidth * scale) + "px";
+    minimapViewport.style.height = (container.clientHeight * scale) + "px";
+  }
+
+  container.addEventListener("scroll", updateMinimapViewport);
+
+  minimap.addEventListener("mousedown", (e) => {
+    jumpToMinimapPoint(e);
+    const onMove = (ev) => jumpToMinimapPoint(ev);
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+
+  function jumpToMinimapPoint(e) {
+    const rect = minimap.getBoundingClientRect();
+    const scale = state.mmScale;
+    if (!scale) return;
+    const localX = e.clientX - rect.left - 4;
+    const localY = e.clientY - rect.top - 4 - 16;
+    container.scrollLeft = Math.max(0, localX / scale - container.clientWidth / 2);
+    container.scrollTop = Math.max(0, localY / scale - container.clientHeight / 2);
+  }
+
+  let panDrag = null;
+  container.addEventListener("mousedown", (e) => {
+    if (!state.panEnabled) return;
+    if (e.target.closest(".node") || e.target.closest(".inspector")) return;
+    panDrag = { startX: e.clientX, startY: e.clientY, scrollLeft: container.scrollLeft, scrollTop: container.scrollTop };
+    container.classList.add("panning");
+  });
+  document.addEventListener("mousemove", (e) => {
+    if (!panDrag) return;
+    container.scrollLeft = panDrag.scrollLeft - (e.clientX - panDrag.startX);
+    container.scrollTop = panDrag.scrollTop - (e.clientY - panDrag.startY);
+  });
+  document.addEventListener("mouseup", () => {
+    if (panDrag) { panDrag = null; container.classList.remove("panning"); }
+  });
+
+  panToggleBtn.onclick = () => {
+    state.panEnabled = !state.panEnabled;
+    panToggleBtn.classList.toggle("active", state.panEnabled);
+    container.classList.toggle("nopan", !state.panEnabled);
+  };
+  fitBtn.onclick = () => { container.scrollLeft = 0; container.scrollTop = 0; };
+  exportBtn.onclick = () => {
+    const fc = fileContents[key];
+    if (!fc) { addLog(`Nothing to export yet for ${key} -- run the pipeline first.`, "warn"); return; }
+    vscode.postMessage({ type: "exportFile", filename: fc.filename, content: fc.content });
+  };
+
+  const focusInput = document.querySelector(`.focus-input[data-graph="${key}"]`);
+  const focusGoBtn = document.querySelector(`.focus-go[data-graph="${key}"]`);
+  const focusResetBtn = document.querySelector(`.focus-reset[data-graph="${key}"]`);
+
+  const RESET_WORDS = new Set(["reset", "clear", "show all", "full graph", "show everything"]);
+
+  function submitFocusQuery() {
+    const query = focusInput.value.trim();
+    if (!query) return;
+    if (RESET_WORDS.has(query.toLowerCase())) {
+      resetFocus();
+      focusResetBtn.disabled = true;
+      focusInput.value = "";
+      return;
+    }
+    vscode.postMessage({ type: "graphFocusQuery", graph: key, query });
+  }
+
+  focusGoBtn.onclick = submitFocusQuery;
+  focusInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submitFocusQuery();
+  });
+  focusResetBtn.onclick = () => {
+    resetFocus();
+    focusResetBtn.disabled = true;
+    focusInput.value = "";
+  };
+
+  return { render, reset: () => render(null), applyFocus, resetFocus, focusResetBtn };
+}
+
+const graphPanes = { ini: makeGraphPane("ini"), cpp: makeGraphPane("cpp") };
+
+function renderCode(content) {
+  const escaped = escapeHtml(content);
+  const highlighted = escaped
+    .replace(/(\/\/.*)/g, '<span class="tok-com">$1</span>')
+    .replace(/(&quot;.*?&quot;)/g, '<span class="tok-str">$1</span>')
+    .replace(/\b(auto|using|namespace|return|std|void|int|const|include|shared_ptr|make_shared|model|addLayer)\b/g, '<span class="tok-kw">$1</span>')
+    .replace(/^(#.*)/gm, '<span class="tok-pre">$1</span>');
+  document.getElementById("codeViewer").innerHTML = highlighted;
+}
+
+function renderProfile(p) {
+  document.getElementById("profNote").textContent = p.note || (p.ran ? "" : "Not run: " + (p.reason || "unknown"));
+  document.getElementById("bottleneckList").innerHTML = "";
+
+  if (!p.ran) {
+    document.getElementById("profTotal").textContent = "—";
+    document.getElementById("profLayers").textContent = "—";
+    document.getElementById("profArch").textContent = "—";
+    document.getElementById("profWeights").textContent = "—";
+    return;
+  }
+
+  const avgMs = p.avg_ms !== undefined ? p.avg_ms : p.total_latency_ms;
+  document.getElementById("profTotal").textContent = avgMs.toFixed(2) + " ms";
+  document.getElementById("profLayers").textContent = p.layers.length;
+  document.getElementById("profArch").textContent = p.arch || "smoke-test";
+  document.getElementById("profWeights").textContent =
+    p.weights_loaded === undefined ? "—" : (p.weights_loaded ? "Real" : "Random init");
+
+  // Bottleneck ranking -- only present on real device-profiler runs
+  // (params/share_pct fields), not the basic post-compile smoke test.
+  const withShare = p.layers.filter(l => l.share_pct !== undefined);
+  if (withShare.length) {
+    const top = [...withShare].sort((a, b) => b.estimated_ms - a.estimated_ms).slice(0, 8);
+    const list = document.getElementById("bottleneckList");
+    const hdr = document.createElement("div");
+    hdr.style.cssText = "font-size:10px; text-transform:uppercase; color:var(--muted); margin: 8px 0 4px;";
+    hdr.textContent = "Likely Bottleneck Layers";
+    list.appendChild(hdr);
+    top.forEach(l => {
+      const row = document.createElement("div");
+      row.className = "bottleneck-row";
+      row.innerHTML = `
+        <span class="bn-name" title="${escapeHtml(l.name)}">${escapeHtml(l.name)}</span>
+        <span class="bn-bar-wrap"><span class="bn-bar" style="width:${l.share_pct}%"></span></span>
+        <span class="bn-pct">${l.share_pct.toFixed(1)}%</span>`;
+      list.appendChild(row);
+    });
+  }
+}
+
+function renderArtifacts(items) {
+  const body = document.getElementById("artifactsBody");
+  body.innerHTML = "";
+  for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "artifact-row";
+    const kb = (item.size_bytes / 1024).toFixed(1);
+    row.innerHTML = `<span class="path">${escapeHtml(item.path)}</span><span class="size">${kb} KB</span>`;
+    row.onclick = () => vscode.postMessage({ type: "openGeneratedFile", filename: item.path.split("/").pop() });
+    body.appendChild(row);
+  }
+}
+
+// ---- Event dispatch from extension ----
+window.addEventListener("message", (e) => {
+  const msg = e.data;
+  if (msg.type === "pipelineStarted") {
+    for (const [id] of AGENTS) setAgentStatus(id, "pending", "pending");
+    document.getElementById("statusLine").textContent = "Running: " + msg.model;
+    fileContents.ini = null; fileContents.cpp = null;
+    graphPanes.ini.reset();
+    graphPanes.cpp.reset();
+    return;
+  }
+  if (msg.type === "pipelineStopped") {
+    document.getElementById("statusLine").textContent = "Stopped";
+    return;
+  }
+  if (msg.type === "deviceProfilerStarted") {
+    document.getElementById("statusLine").textContent = "Profiling on-device...";
+    return;
+  }
+  if (msg.type === "settingsInfo") {
+    const input = document.getElementById("nntrainerPathInput");
+    if (input && !input.value && msg.nntrainerPath) input.value = msg.nntrainerPath;
+    return;
+  }
+  if (msg.type !== "engineEvent") return;
+
+  const ev = msg.event;
+  switch (ev.event) {
+    case "agent_status":
+      setAgentStatus(ev.agent, ev.status, ev.detail);
+      break;
+    case "log":
+      addLog(ev.message, ev.level);
+      break;
+    case "chat":
+      addChat(ev.role, ev.content, ev.agent);
+      break;
+    case "graph": {
+      // Backend now emits target "model" (Model Graph) / "nntrainer"
+      // (nntrainer Graph); older/fallback runs may still emit "ini"/"cpp"
+      // directly (non-transformer architectures, see agents/dual_graph.py).
+      // Both map onto the same two panes -- there are only ever two tabs.
+      const targetMap = { model: "ini", nntrainer: "cpp", ini: "ini", cpp: "cpp" };
+      const target = targetMap[ev.target] || "ini";
+      if (graphPanes[target]) graphPanes[target].render(ev.data);
+      break;
+    }
+    case "node_mappings":
+      nodeMappings = ev.mappings || [];
+      break;
+    case "code":
+      renderCode(ev.content);
+      break;
+    case "file_content":
+      fileContents[ev.target] = { filename: ev.filename, content: ev.content };
+      break;
+    case "profile":
+      renderProfile(ev.data);
+      break;
+    case "graph_focus": {
+      const pane = graphPanes[ev.graph];
+      if (!pane) break;
+      if (ev.ok && ev.matched_ids.length) {
+        pane.applyFocus(ev.matched_ids);
+        pane.focusResetBtn.disabled = false;
+        addLog(`Graph focus (${ev.graph}): ${ev.explanation}`, "info");
+      } else if (ev.ok) {
+        // "reset" command came back through the agent path
+        pane.resetFocus();
+        pane.focusResetBtn.disabled = true;
+      } else {
+        addLog(`Graph focus (${ev.graph}): ${ev.explanation}`, "warn");
+      }
+      break;
+    }
+    case "artifacts":
+      renderArtifacts(ev.items);
+      break;
+    case "pipeline_complete":
+      document.getElementById("statusLine").textContent =
+        "Done — " + (ev.summary.compatibility.compatibility ?? "?") + "% compatible, compiled=" + ev.summary.compiled;
+      break;
+    case "error":
+      addLog("[" + ev.stage + "] " + ev.message, "error");
+      break;
+  }
+});
+
+// ---- UI wiring ----
+document.getElementById("btnRun").onclick = () =>
+  vscode.postMessage({ type: "runPipeline", model: document.getElementById("modelInput").value });
+document.getElementById("btnStop").onclick = () => vscode.postMessage({ type: "stopPipeline" });
+document.getElementById("btnEnv").onclick = () => vscode.postMessage({ type: "checkEnvironment" });
+document.getElementById("btnExport").onclick = () => vscode.postMessage({ type: "exportArtifacts" });
+document.getElementById("btnProfileDevice").onclick = () =>
+  vscode.postMessage({ type: "runNntrainerPipeline", nntrainerPath: document.getElementById("nntrainerPathInput").value });
+document.getElementById("btnSend").onclick = sendChat;
+document.getElementById("chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+
+function sendChat() {
+  const input = document.getElementById("chatInput");
+  const val = input.value.trim();
+  if (!val) return;
+  vscode.postMessage({ type: "sendChat", message: val });
+  input.value = "";
+}
+
+// ---- Chat/Agent-msgs tabs ----
+document.querySelectorAll(".tab").forEach((tab) => {
+  tab.onclick = () => {
+    const group = tab.parentElement;
+    group.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+    tab.classList.add("active");
+    const wrap = tab.closest(".panel");
+    wrap.querySelectorAll(".tabpage").forEach((p) => p.classList.remove("active"));
+    wrap.querySelector(`.tabpage[data-tab="${tab.dataset.tab}"]`).classList.add("active");
+  };
+});
+
+// =========================================================================
+// Generic resizable splitters -- every panel in both the main row and the
+// bottom row can be resized by dragging the splitter next to it. Adjacent
+// pair only changes flex-basis on the two panels touching that splitter,
+// so the rest of the layout doesn't jump around.
+// =========================================================================
+function makeHSplitter(splitterEl) {
+  const beforeEl = document.getElementById(splitterEl.dataset.before);
+  const afterEl = document.getElementById(splitterEl.dataset.after);
+  const MIN = 120;
+
+  splitterEl.addEventListener("mousedown", (e) => {
+    const startX = e.clientX;
+    const beforeWidth = beforeEl.getBoundingClientRect().width;
+    const afterWidth = afterEl.getBoundingClientRect().width;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    function onMove(ev) {
+      const dx = ev.clientX - startX;
+      const newBefore = Math.max(MIN, beforeWidth + dx);
+      const newAfter = Math.max(MIN, afterWidth - dx);
+      beforeEl.style.flex = `0 0 ${newBefore}px`;
+      afterEl.style.flex = `0 0 ${newAfter}px`;
+    }
+    function onUp() {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  });
+}
+
+document.querySelectorAll(".h-splitter").forEach(makeHSplitter);
+
+// Vertical splitter: resize bottom-panels height, main row auto-fills via flex:1
+const vSplitter = document.getElementById("vSplitter");
+const bottomRow = document.getElementById("bottomRow");
+vSplitter.addEventListener("mousedown", (e) => {
+  const startY = e.clientY;
+  const startHeight = bottomRow.getBoundingClientRect().height;
+  document.body.style.cursor = "row-resize";
+  document.body.style.userSelect = "none";
+
+  function onMove(ev) {
+    const dy = ev.clientY - startY;
+    const newHeight = Math.max(100, Math.min(window.innerHeight - 200, startHeight - dy));
+    bottomRow.style.height = newHeight + "px";
+  }
+  function onUp() {
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  }
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+});
+</script>
+</body>
+</html>
