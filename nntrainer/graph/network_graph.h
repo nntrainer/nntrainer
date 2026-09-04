@@ -597,6 +597,12 @@ public:
     }
   }
 
+  std::shared_ptr<Manager> getTensorManager() { return tensor_manager; }
+
+  void setRefGraph(std::shared_ptr<NetworkGraph> ref_graph) {
+    tensor_manager->setRefManager(ref_graph->getTensorManager());
+  }
+
 private:
   std::map<std::string, std::string> sub_in_out; /** This is map to identify
                  input and output layer name of subgraph */

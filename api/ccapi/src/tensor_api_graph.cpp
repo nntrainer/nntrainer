@@ -320,25 +320,28 @@ static const char *dtypeToStr(nntrainer::TensorDim::DataType dt) {
   }
 }
 
-int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode) {
+int Model::compile(Tensor &input, Tensor &output, ExecutionMode mode,
+                   std::shared_ptr<ml::train::Model> ref_model) {
   std::vector<Tensor> inputs = {input};
   std::vector<Tensor> outputs = {output};
-  int status = compile(inputs, outputs, mode);
+  int status = compile(inputs, outputs, mode, ref_model);
   input = inputs[0];
   output = outputs[0];
   return status;
 }
 
 int Model::compile(Tensor &input, std::vector<Tensor> &outputs,
-                   ExecutionMode mode) {
+                   ExecutionMode mode,
+                   std::shared_ptr<ml::train::Model> ref_model) {
   std::vector<Tensor> inputs = {input};
-  int status = compile(inputs, outputs, mode);
+  int status = compile(inputs, outputs, mode, ref_model);
   input = inputs[0];
   return status;
 }
 
 int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
-                   ExecutionMode mode) {
+                   ExecutionMode mode,
+                   std::shared_ptr<ml::train::Model> ref_model) {
   struct LayerInfo {
     std::shared_ptr<Layer> layer;
     std::vector<std::string> input_layer_names;
@@ -555,7 +558,7 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
   }
 
   // 4. Initialize the model
-  status = initialize(mode);
+  status = initialize(mode, ref_model);
   if (status != ML_ERROR_NONE) {
     return status;
   }

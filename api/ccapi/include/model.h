@@ -146,7 +146,9 @@ public:
    * @retval #ML_ERROR_NONE Successful.
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
    */
-  virtual int compile(ExecutionMode exec_mode_ = ExecutionMode::TRAIN) = 0;
+  virtual int
+  compile(ExecutionMode exec_mode_ = ExecutionMode::TRAIN,
+          std::shared_ptr<ml::train::Model> ref_model = nullptr) = 0;
 
   /**
    * @brief     Compile from symbolic tensor graph.
@@ -161,7 +163,8 @@ public:
    * @retval #ML_ERROR_NONE Successful.
    */
   int compile(Tensor &input, Tensor &output,
-              ExecutionMode mode = ExecutionMode::TRAIN);
+              ExecutionMode mode = ExecutionMode::TRAIN,
+              std::shared_ptr<ml::train::Model> ref_model = nullptr);
 
   /**
    * @brief     Compile from symbolic tensor graph with multiple outputs.
@@ -176,7 +179,8 @@ public:
    * @retval #ML_ERROR_NONE Successful.
    */
   int compile(Tensor &input, std::vector<Tensor> &outputs,
-              ExecutionMode mode = ExecutionMode::TRAIN);
+              ExecutionMode mode = ExecutionMode::TRAIN,
+              std::shared_ptr<ml::train::Model> ref_model = nullptr);
 
   /**
    * @brief     Compile from symbolic tensor graph with multiple inputs and
@@ -192,7 +196,8 @@ public:
    * @retval #ML_ERROR_NONE Successful.
    */
   int compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
-              ExecutionMode mode = ExecutionMode::TRAIN);
+              ExecutionMode mode = ExecutionMode::TRAIN,
+              std::shared_ptr<ml::train::Model> ref_model = nullptr);
 
   /**
    * @brief     Initialize Network. This should be called after setting the
@@ -200,7 +205,9 @@ public:
    * @retval #ML_ERROR_NONE Successful.
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
    */
-  virtual int initialize(ExecutionMode exec_mode_ = ExecutionMode::TRAIN) = 0;
+  virtual int
+  initialize(ExecutionMode exec_mode_ = ExecutionMode::TRAIN,
+             std::shared_ptr<ml::train::Model> ref_model = nullptr) = 0;
 
   /**
    * @brief     Reinitialize Network. This should be called after initialize
@@ -460,6 +467,12 @@ public:
    * @retval loadedFromConfig value
    */
   virtual bool getLoadedFromConfig() const = 0;
+
+  /**
+   * @brief returns loadedWeight state of a network
+   * @retval loadedWeight value
+   */
+  virtual bool getLoadedWeight() const = 0;
 
   /**
    * @brief     Get Loss from the previous epoch of training data

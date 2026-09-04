@@ -124,6 +124,12 @@ public:
   bool getLoadedFromConfig() const override { return loadedFromConfig; }
 
   /**
+   * @brief returns loadedWeight state of a network
+   * @retval loadedWeight value
+   */
+  bool getLoadedWeight() const override { return loadedWeight; }
+
+  /**
    * @brief     Get Loss from the previous epoch of training data
    * @retval    loss value
    */
@@ -162,7 +168,8 @@ public:
    * @retval #ML_ERROR_NONE Successful.
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
    */
-  int compile(ExecutionMode mode = ExecutionMode::TRAIN) override;
+  int compile(ExecutionMode mode = ExecutionMode::TRAIN,
+              std::shared_ptr<ml::train::Model> ref_model = nullptr) override;
 
   /**
    * @brief     set Property of Network
@@ -178,7 +185,9 @@ public:
    * @retval #ML_ERROR_NONE Successful.
    * @retval #ML_ERROR_INVALID_PARAMETER invalid parameter.
    */
-  int initialize(ExecutionMode mode = ExecutionMode::TRAIN) override;
+  int initialize(
+    ExecutionMode mode = ExecutionMode::TRAIN,
+    std::shared_ptr<ml::train::Model> ref_model = nullptr) override;
 
   /**
    * @brief     Reinitialize Network. This should be called after initialize
@@ -705,6 +714,8 @@ private:
 
   bool loadedFromConfig; /**< Check if config is loaded to prevent load twice */
 
+  bool loadedWeight; /**< Check if weights are loaded to prevent load twice */
+
   RunStats validation; /** validation statistics of the model */
   RunStats training;   /** training statistics of the model */
   RunStats testing;    /** testing statistics of the model */
@@ -715,6 +726,7 @@ private:
     nullptr; /** Configurations bound to current engine */
 
   NetworkGraph model_graph; /** Network Model Graph */
+  std::shared_ptr<ml::train::Model> ref_model;
 
   /**< Set in compile() for graphs that contain a QNN/HTP engine. When true,
    * inference() reuses the already-allocated tensor pool across calls instead
@@ -796,6 +808,19 @@ private:
    * @retval true if matches, false is error
    */
   bool validateInput(sharedConstTensors X);
+
+  /**
+   * @brief Set reference model
+   * @param[in] ref_model_ reference model
+   */
+  void setRefModel(std::shared_ptr<ml::train::Model> ref_model_);
+
+  /**
+   * @brief Verifying if reference model graph matches the current model graph.
+   * @param[in] ref_model_graph reference model graph
+   * @retval true if matches, false if not match
+   */
+  bool verifyRefModel(std::shared_ptr<NetworkGraph> ref_model_graph);
 };
 
 } /* namespace nntrainer */

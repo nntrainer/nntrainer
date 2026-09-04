@@ -124,8 +124,10 @@ NeuralNetwork::NeuralNetwork() :
   initialized(false),
   compiled(false),
   loadedFromConfig(false),
+  loadedWeight(false),
   exec_mode(ExecutionMode::TRAIN),
-  ct_engine(&Engine::Global()) {}
+  ct_engine(&Engine::Global()),
+  ref_model(nullptr) {}
 
 NeuralNetwork::NeuralNetwork(const Engine *ct_engine_) :
   model_props(props::LossType(), {}, {}, props::ClipGradByGlobalNorm(),
@@ -143,8 +145,10 @@ NeuralNetwork::NeuralNetwork(const Engine *ct_engine_) :
   initialized(false),
   compiled(false),
   loadedFromConfig(false),
+  loadedWeight(false),
   exec_mode(ExecutionMode::TRAIN),
-  ct_engine(ct_engine_) {}
+  ct_engine(ct_engine_),
+  ref_model(nullptr) {}
 
 int NeuralNetwork::loadFromConfig(const std::string &config) {
   if (loadedFromConfig == true) {
@@ -190,7 +194,8 @@ void NeuralNetwork::setTrainConfig(const std::vector<std::string> &values) {
     << " of first element: " << left_props.front();
 }
 
-int NeuralNetwork::compile(ExecutionMode mode) {
+int NeuralNetwork::compile(ExecutionMode mode,
+                           std::shared_ptr<ml::train::Model> ref_model) {
 
   exec_mode = mode;
 
@@ -278,7 +283,8 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   return status;
 }
 
-int NeuralNetwork::initialize(ExecutionMode mode) {
+int NeuralNetwork::initialize(ExecutionMode mode,
+                              std::shared_ptr<ml::train::Model> ref_model) {
   int status = ML_ERROR_NONE;
 
   if (mode != exec_mode) {
@@ -347,6 +353,10 @@ int NeuralNetwork::initialize(ExecutionMode mode) {
         return opt->getOptimizerVariableDim(dim);
       };
     model_graph.requestOptimizerVariable(cb, true);
+  }
+
+  if (ref_model.get()) {
+    setRefModel(ref_model);
   }
 
   // Allocate weights
@@ -987,6 +997,13 @@ void NeuralNetwork::load(const std::string &file_path,
 
   switch (format) {
   case ml::train::ModelFormat::MODEL_FORMAT_BIN: {
+    if (ref_model) {
+      NNTR_THROW_IF(!ref_model->getLoadedWeight(), std::invalid_argument)
+        << "Model load failed: reference model weights not loaded.";
+
+      ml_logd("Skipping model load: reference model is already loaded.");
+      return;
+    }
     NNTR_THROW_IF(!initialized, std::runtime_error)
       << "Cannot load if not initialized yet, path: " << file_path
       << " format: " << static_cast<unsigned>(format);
@@ -1334,6 +1351,8 @@ void NeuralNetwork::load(const std::string &file_path,
     throw nntrainer::exception::not_supported(
       "loading with given format is not supported yet");
   }
+
+  loadedWeight = true;
 }
 
 float NeuralNetwork::getLoss() {
@@ -1934,6 +1953,8 @@ void swap(NeuralNetwork &lhs, NeuralNetwork &rhs) {
     swap(lhs.graph_representation, rhs.graph_representation);
     swap(lhs.compiled, rhs.compiled);
     swap(lhs.loadedFromConfig, rhs.loadedFromConfig);
+    swap(lhs.loadedWeight, rhs.loadedWeight);
+    swap(lhs.ref_model, rhs.ref_model);
   }
 }
 
@@ -2311,4 +2332,50 @@ void NeuralNetwork::exports(const ml::train::ExportMethods &method,
     throw std::runtime_error{"Unsupported export method"};
   }
 }
+
+void NeuralNetwork::setRefModel(std::shared_ptr<ml::train::Model> ref_model_) {
+  NNTR_THROW_IF(!ref_model_->getInitialized(), std::invalid_argument)
+    << "The reference model has not been initialized, so the reference will be "
+       "omitted.";
+
+  auto ref_model_graph = std::make_shared<NetworkGraph>(
+    std::dynamic_pointer_cast<NeuralNetwork>(ref_model_)->getNetworkGraph());
+
+  NNTR_THROW_IF(!verifyRefModel(ref_model_graph), std::invalid_argument)
+    << "The reference model is not match with current model";
+
+  ref_model = ref_model_;
+  model_graph.setRefGraph(ref_model_graph);
+}
+
+bool NeuralNetwork::verifyRefModel(
+  std::shared_ptr<NetworkGraph> ref_model_graph) {
+  for (auto iter = model_graph.cbegin(), ref_iter = ref_model_graph->cbegin();
+       iter != model_graph.cend() || ref_iter != ref_model_graph->cend();
+       iter++, ref_iter++) {
+    if (iter == model_graph.cend() || ref_iter == ref_model_graph->cend()) {
+      return false;
+    }
+
+    auto weights = (*iter)->getRunContext().getWeights();
+    auto ref_weights = (*ref_iter)->getRunContext().getWeights();
+
+    if (weights.size() != ref_weights.size()) {
+      return false;
+    }
+
+    for (size_t i = 0; i < weights.size(); ++i) {
+      auto weight = weights[i];
+      auto ref_weight = ref_weights[i];
+
+      if (weight->getVariable().getDim() !=
+          ref_weight->getVariable().getDim()) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 } /* namespace nntrainer */
