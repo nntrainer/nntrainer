@@ -1,10 +1,15 @@
 cl_op_sources = [
   'blas_kernels.cpp',
+  'cl_buffer_pool.cpp',
   'blas_kernel_interface.cpp',
   'attention_kernel_interface.cpp',
   'attention_kernels.cpp',
   'clblast_interface.cpp',
-  'cl_compute_ops.cpp'
+  'cl_compute_ops.cpp',
+  'layernorm_cl_op.cpp',
+  'gelu_cl_op.cpp',
+  'geglu_cl_op.cpp',
+  'swiglu_cl_op.cpp',
 ]
 
 cl_op_headers = [

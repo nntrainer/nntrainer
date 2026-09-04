@@ -10,7 +10,10 @@
  * @brief   Implementation of OpenCL SVM-backed MemAllocator subclass.
  */
 
+#include <cl_buffer_pool.h>
 #include <cl_svm_allocator.h>
+#include <cstdlib>
+#include <memory_pool.h>
 #include <mutex>
 #include <opencl_context_manager.h>
 #include <unordered_set>
@@ -26,6 +29,22 @@ std::unordered_set<void *> host_owned;
 } // namespace
 
 ClSVMAllocator::ClSVMAllocator(opencl::ContextManager &ctx) : ctx_(ctx) {}
+
+std::shared_ptr<MemoryPool>
+ClSVMAllocator::makePool(const std::shared_ptr<MemAllocator> &self) {
+  // NNTR_GPU_CLMEM_POOL=0: fall back to the plain SVM-backed MemoryPool, whose
+  // deviceMemory() returns null, so the planner demotes every device placement
+  // to the shared plane and no tensor is placed on cl_mem at all.
+  //
+  // The device plane stays ON by default -- this is an opt-OUT and changes no
+  // default. What it buys is the A/B: the plane is the largest single variable
+  // in a device run, and separating "the kernels are wrong" from "the
+  // placement is wrong" otherwise costs a rebuild.
+  const char *e = std::getenv("NNTR_GPU_CLMEM_POOL");
+  if (e != nullptr && e[0] == '0')
+    return std::make_shared<MemoryPool>(self);
+  return std::make_shared<ClBufferPool>(self);
+}
 
 void ClSVMAllocator::track_host_owned(void *ptr) {
   std::lock_guard<std::mutex> lk(host_owned_mtx);

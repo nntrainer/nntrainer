@@ -21,10 +21,10 @@
 
 namespace nntrainer {
 template <typename T = float>
-inline static void sgemv_cl_internal(ClContext::SharedPtrClKernel kernel,
-                                     const T *matAdata, const T *vecXdata,
-                                     T *vecYdata, unsigned int dim1,
-                                     unsigned int dim2, unsigned int lda) {
+inline static void
+sgemv_cl_internal(ClContext::SharedPtrClKernel kernel, const T *matAdata,
+                  const T *vecXdata, T *vecYdata, unsigned int dim1,
+                  unsigned int dim2, unsigned int lda, bool out_svm = false) {
   bool result = false;
 
   auto *blas_cc =
@@ -87,6 +87,26 @@ inline static void sgemv_cl_internal(ClContext::SharedPtrClKernel kernel,
   result = opencl::CommandQueueManager::Global().DispatchCommand(
     kernel, work_groups_count, work_group_size);
   if (!result) {
+    return;
+  }
+
+  // A rect read straight into shared virtual memory returns success on some
+  // drivers without the bytes ever reaching the host view -- a heap
+  // destination lands, a shared one stays whatever it was, even when mapped.
+  // Read into host scratch and copy through an explicit mapping instead. The
+  // output is deliberately left mapped: the convention here is that a GPU
+  // op's shared output stays host-mapped for the next reader, and the next
+  // GPU consumer unmaps it itself.
+  if (out_svm) {
+    blas_cc->command_queue_inst_.enqueueSVMMap(vecYdata, dim1_size,
+                                               /*read_only=*/false);
+    std::vector<T> scratch(dim1);
+    result = clbuffInstance.getOutBufferA()->ReadDataRegion(
+      blas_cc->command_queue_inst_, dim1_size, scratch.data());
+    if (!result) {
+      return;
+    }
+    std::memcpy(vecYdata, scratch.data(), dim1_size);
     return;
   }
 
@@ -171,7 +191,7 @@ inline static void
 sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
                   const T *A, const T *B, T *C, unsigned int M, unsigned int N,
                   unsigned int K, unsigned int lda, unsigned int ldb,
-                  unsigned int ldc) {
+                  unsigned int ldc, bool out_svm = false) {
   bool result = false;
 
   auto *blas_cc =
@@ -244,6 +264,22 @@ sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
   result = blas_cc->command_queue_inst_.DispatchCommand(
     kernel, work_groups_count, work_group_size);
   if (!result) {
+    return;
+  }
+
+  // Same hazard as sgemv_cl_internal above: the rect read into a shared
+  // destination silently never lands. Scratch plus an explicit mapping;
+  // leave the output mapped for the next reader.
+  if (out_svm) {
+    blas_cc->command_queue_inst_.enqueueSVMMap(C, m_n_size,
+                                               /*read_only=*/false);
+    std::vector<T> scratch((size_t)M * N);
+    result = clbuffInstance.getOutBufferA()->ReadDataRegion(
+      blas_cc->command_queue_inst_, m_n_size, scratch.data());
+    if (!result) {
+      return;
+    }
+    std::memcpy(C, scratch.data(), m_n_size);
     return;
   }
 

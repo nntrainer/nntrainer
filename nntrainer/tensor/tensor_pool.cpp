@@ -14,14 +14,27 @@
  * @todo   check before allocate that finalize is done
  */
 
+#include <cstdlib>
 #include <memory_pool.h>
 #include <nntrainer_log.h>
+#include <residency_planner.h>
+#include <residency_policy.h>
 #include <tensor.h>
 #include <tensor_pool.h>
 #include <tensor_wrap_specs.h>
 #include <util_func.h>
 
 namespace nntrainer {
+
+/**
+ * @brief The single process-wide residency policy instance. Out of line here
+ * so the library and the application that declares the model's residency
+ * boundaries share one copy across the shared-object boundary.
+ */
+ResidencyPolicy &ResidencyPolicy::global() {
+  static ResidencyPolicy instance;
+  return instance;
+}
 
 /**
  * @brief     Request tensor with the given spec
@@ -33,7 +46,8 @@ namespace nntrainer {
 Tensor *TensorPool::request(const std::string &name, const TensorDim &dim,
                             const std::vector<unsigned int> &exec_order,
                             TensorLifespan lifespan, const Initializer &init,
-                            bool is_weight_grad) {
+                            bool is_weight_grad,
+                            ml::train::LayerComputeEngine engine) {
 
   bool is_virtual = lifespan == TensorLifespan::VIRTUAL;
   lifespan = is_virtual ? TensorLifespan::UNMANAGED : lifespan;
@@ -41,7 +55,7 @@ Tensor *TensorPool::request(const std::string &name, const TensorDim &dim,
     {is_weight_grad,
      std::make_unique<Tensor>(dim, false, init, name,
                               QScheme::PER_CHANNEL_AFFINE, is_virtual),
-     TensorPool::SourceDetails{0, lifespan, exec_order, {}}});
+     TensorPool::SourceDetails{0, lifespan, exec_order, {}, engine}});
 }
 
 /**
@@ -64,7 +78,8 @@ Tensor *TensorPool::placeholder(const std::string &name, const TensorDim &dim) {
 Tensor *TensorPool::view(const std::string &name, const std::string &reference,
                          const TensorDim &dim,
                          const std::vector<unsigned int> &exec_order,
-                         TensorLifespan lifespan, const size_t offset) {
+                         TensorLifespan lifespan, const size_t offset,
+                         ml::train::LayerComputeEngine consumer_engine) {
   auto &spec = getSourceSpec(reference);
 
   NNTR_THROW_IF(spec.tensor->getDataType() != dim.getDataType() ||
@@ -95,7 +110,15 @@ Tensor *TensorPool::view(const std::string &name, const std::string &reference,
     << " name: " << spec.tensor->getName();
 
   expandLifespan(spec, exec_order, lifespan);
-  std::get<SourceDetails>(spec.details).dependents.push_back(pool.size());
+  {
+    auto &src_details = std::get<SourceDetails>(spec.details);
+    src_details.dependents.push_back(pool.size());
+    /** A consumer that does not run on the device pulls the source back onto
+     *  the shared plane: the placement has to be one every reader can reach. */
+    src_details.all_consumers_device &=
+      (consumer_engine == ml::train::LayerComputeEngine::GPU);
+    src_details.view_count++;
+  }
 
   /** @note below invalidates spec reference */
   /** @note in case of view of view, internal datastructure saves the src to
@@ -224,6 +247,29 @@ void TensorPool::allocate(bool init) {
     return;
   mem_pool->allocate();
 
+  /** Configure the residency planner for this pool. What the allocator can
+   *  produce decides what placements are available at all; the application's
+   *  declared boundaries decide the two places the engine heuristic cannot
+   *  see (see residency_policy.h). */
+  const auto &policy = ResidencyPolicy::global();
+  ResidencyPlanner planner;
+  planner.device_backed = allocator_ && allocator_->isDeviceVisible();
+  planner.device_pool =
+    allocator_ && allocator_->supportsResidency(ResidencyClass::GPU_CLMEM);
+  planner.raise =
+    policy.raise_patterns.empty() ? nullptr : policy.raise_patterns.c_str();
+  planner.lower =
+    policy.lower_patterns.empty() ? nullptr : policy.lower_patterns.c_str();
+  planner.exclude =
+    policy.exclude_patterns.empty() ? nullptr : policy.exclude_patterns.c_str();
+  /** NNTR_CLMEM_FANOUT=0 demotes a fan-out tensor off the device plane. The
+   *  default keeps it eligible, so an unset environment classifies exactly as
+   *  before (see SourceDetails::view_count). */
+  planner.allow_fanout = [] {
+    const char *e = std::getenv("NNTR_CLMEM_FANOUT");
+    return !(e != nullptr && e[0] == '0');
+  }();
+
   /** set the pointers using the token for all the tensors */
   for (auto &spec : pool) {
     auto details = std::get_if<SourceDetails>(&spec.details);
@@ -234,6 +280,35 @@ void TensorPool::allocate(bool init) {
     ml_logi("Memory Alloc Details (Tensor): %s : %zu : address %p",
             spec.tensor->getName().c_str(), spec.tensor->getMemoryBytes(),
             spec.tensor->getData());
+
+    /** Record the placement on the freshly bound MemoryData. Views share that
+     *  MemoryData through syncDependents below, so they inherit it and cannot
+     *  disagree with the source about where the tensor is. A device placement
+     *  the pool cannot honour falls back to the shared plane for the WHOLE
+     *  tensor, which is a placement, not a half-conversion. */
+    if (auto md = spec.tensor->getMemoryData()) {
+      ResidencyClass cls = planner.classify(
+        details->engine, details->all_consumers_device,
+        spec.tensor->getDataType() == ml::train::TensorDim::DataType::FP16,
+        spec.tensor->getInitializer() != Initializer::NONE,
+        spec.tensor->getName(), details->view_count);
+      /** The allocator has the last word on the class, because a placement
+       *  is only available if the memory behind it is. Demote rather than
+       *  refuse: the shared plane, and then the host plane, are always
+       *  reachable by whoever was going to read the tensor. */
+      if (allocator_ && !allocator_->supportsResidency(cls))
+        cls = allocator_->supportsResidency(ResidencyClass::SVM)
+                ? ResidencyClass::SVM
+                : ResidencyClass::HOST;
+
+      void *dev = nullptr;
+      if (cls == ResidencyClass::GPU_CLMEM) {
+        dev = mem_pool->deviceMemory(details->token);
+        if (dev == nullptr)
+          cls = ResidencyClass::SVM;
+      }
+      md->setResidency(cls, dev);
+    }
 
     syncDependents(spec);
   }
@@ -369,7 +444,8 @@ Tensor *TensorPool::requestOrExtend(const std::string &name,
                                     const TensorDim &dim,
                                     const std::vector<unsigned int> &exec_order,
                                     TensorLifespan lifespan,
-                                    const Initializer &init) {
+                                    const Initializer &init,
+                                    ml::train::LayerComputeEngine engine) {
   NNTR_THROW_IF(lifespan == TensorLifespan::UNMANAGED, std::invalid_argument)
     << "unmanaged life span is not supported";
 
@@ -381,7 +457,8 @@ Tensor *TensorPool::requestOrExtend(const std::string &name,
       << "tensor initializer mismatch for requestOrExtend name: " << name;
     return extend(name, dim, exec_order, lifespan);
   } else {
-    return request(name, dim, exec_order, lifespan, init);
+    return request(name, dim, exec_order, lifespan, init,
+                   /*is_weight_grad=*/false, engine);
   }
 }
 

@@ -26,10 +26,12 @@
 #include <context.h>
 #include <engine.h>
 #include <layer_node.h>
+#include <multiout_layer.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <profiler.h>
+#include <residency_policy.h>
 #include <time_dist.h>
 #include <tracer.h>
 #include <util_func.h>
@@ -132,29 +134,58 @@ public:
 LayerNode::~LayerNode() = default;
 
 /**
- * @brief get the compute engine property from property string vector
- *  : default is CPU
- * @return LayerComputeEngine Enum : CPU, GPU, QNN
+ * @brief Whether a node of this type must NOT vote its own engine onto the
+ *        tensor it shares with its producer. MultiOut is always neutral (an
+ *        in-place identity fan-out); the application declares any further
+ *        types through ResidencyPolicy, so no app-specific layer name is
+ *        hardcoded here.
  *
+ * @note  This is the producer-side half of the predicate Manager::
+ *        requestInputs() applies on the consumer side; the two must agree
+ *        about a type or one plane's vote survives and the other's does not.
+ *
+ * @param type the node's registered layer type
+ * @return true if a node of this type must not stamp its engine on the
+ *         tensor it shares with its producer
  */
-ml::train::LayerComputeEngine
-getComputeEngine(const std::vector<std::string> &props) {
-  for (auto &prop : props) {
-    std::string key, value;
-    int status = nntrainer::getKeyValue(prop, key, value);
-    if (nntrainer::istrequal(key, "engine")) {
-      constexpr const auto data =
-        std::data(props::ComputeEngineTypeInfo::EnumList);
-      for (unsigned int i = 0;
-           i < props::ComputeEngineTypeInfo::EnumList.size(); ++i) {
-        if (nntrainer::istrequal(value.c_str(),
-                                 props::ComputeEngineTypeInfo::EnumStr[i])) {
-          return data[i];
-        }
-      }
-    }
-  }
+static bool isEngineNeutralNode(const std::string &type) {
+  return type == MultiOutLayer::type ||
+         nntrainer::ResidencyPolicy::global().isEngineNeutral(type);
+}
 
+/**
+ * @brief map a registered engine NAME onto the residency-plane enum: the
+ *        tensor/residency plane (tensor_wrap_specs, InitLayerContext,
+ *        RunLayerContext) still speaks LayerComputeEngine. cpu/gpu/qnn/cuda
+ *        map 1:1; any other registered name gets CPU (host) residency — its
+ *        DISPATCH is name-based via getRegisteredContext, only the memory
+ *        plane defaults to host.
+ */
+static ml::train::LayerComputeEngine
+toLayerComputeEngine(const std::string &name) {
+  // A registered context DECLARES its own residency plane via
+  // Context::residencyEngine() -- the single authority, retiring the central
+  // name->enum string table below. A registry ALIAS collapses onto its backend
+  // for free: an alias resolves to the same Context, whose residencyEngine()
+  // reports that backend's plane -- no per-alias special case here, and a new
+  // aliased or added backend just declares its plane in its Context override
+  // (add-only, no edit here). See
+  // docs/backend_guide/ARCHITECTURE_REFACTOR.md §5 step 1.
+  try {
+    auto ctx = nntrainer::Engine::Global().getRegisteredContext(name);
+    if (ctx != nullptr)
+      return ctx->residencyEngine();
+  } catch (...) {
+    // fall through to the enum table below
+  }
+  // Name not registered in this build (e.g. a cpu-only build that still parsed
+  // "cuda"): map the raw spelling through the string table, defaulting to CPU.
+  constexpr const auto data = std::data(props::ComputeEngineTypeInfo::EnumList);
+  for (unsigned int i = 0; i < props::ComputeEngineTypeInfo::EnumList.size();
+       ++i) {
+    if (nntrainer::istrequal(name, props::ComputeEngineTypeInfo::EnumStr[i]))
+      return data[i];
+  }
   return ml::train::LayerComputeEngine::CPU;
 }
 
@@ -219,6 +250,17 @@ void LayerNode::setProperty(const std::vector<std::string> &properties) {
   auto left_properties = loadProperties(properties, *layer_node_props);
   left_properties =
     loadProperties(left_properties, *layer_node_props_realization);
+
+  /// registry-open engine name: normalize the parsed name against
+  /// the live Engine registry (lowercase; unregistered -> "cpu" fallback), so
+  /// the node's engine always names a context that getRegisteredContext() can
+  /// resolve and always matches the backend createLayerObject() chose via the
+  /// same parseComputeEngine call.
+  auto &ce_prop = std::get<props::ComputeEngine>(*layer_node_props);
+  if (!ce_prop.empty())
+    ce_prop.set(
+      Engine::Global().parseComputeEngine({"engine=" + ce_prop.get()}));
+
   layer->setProperty(left_properties);
 
   if (getType() == ActivationLayer::type) {
@@ -306,9 +348,41 @@ void LayerNode::setOutputConnection(unsigned nth, const std::string &name,
 
 void LayerNode::setComputeEngine(
   const ml::train::LayerComputeEngine &compute_engine) {
-  // setting compute_engine of LayerNode
-  // can be reused later to propagate this info
-  this->compute_engine = compute_engine;
+  // compat shim (no callers in-tree): the node-level engine is stored as the
+  // registered context NAME now; map the legacy enum to its canonical name.
+  constexpr const auto data = std::data(props::ComputeEngineTypeInfo::EnumList);
+  for (unsigned int i = 0; i < props::ComputeEngineTypeInfo::EnumList.size();
+       ++i) {
+    if (data[i] == compute_engine) {
+      this->compute_engine = props::ComputeEngineTypeInfo::EnumStr[i];
+      return;
+    }
+  }
+  this->compute_engine = "cpu";
+}
+
+ml::train::LayerComputeEngine LayerNode::residencyEngine() const {
+  if (!layer_node_props)
+    return ml::train::LayerComputeEngine::CPU;
+  auto &ce = std::get<props::ComputeEngine>(*layer_node_props);
+  if (ce.empty())
+    return ml::train::LayerComputeEngine::CPU;
+  // The engine tag is a registered Context NAME, so the plane is whatever that
+  // Context declares (Context::residencyEngine()) -- not something decided
+  // here by comparing the name against a hardcoded spelling.
+  return toLayerComputeEngine(ce.get());
+}
+
+bool LayerNode::isComputeEngineGPU() const {
+  return residencyEngine() == ml::train::LayerComputeEngine::GPU;
+}
+
+bool LayerNode::isComputeEngineCUDA() const {
+  return residencyEngine() == ml::train::LayerComputeEngine::CUDA;
+}
+
+bool LayerNode::isComputeEngineCPU() const {
+  return residencyEngine() == ml::train::LayerComputeEngine::CPU;
 }
 
 const std::string LayerNode::getName() const {
@@ -664,7 +738,20 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
 
   auto context = InitLayerContext(
     actual_input_dims, out_info, getInPlaceType() != InPlaceType::NONE,
-    getName(), scope, max_norm, tensor_type, loss_scale, mode, compute_engine);
+    getName(), scope, max_norm, tensor_type, loss_scale, mode,
+    toLayerComputeEngine(compute_engine));
+  /** An engine-neutral node must not stamp its own engine on the tensor it
+   *  shares with its producer. MultiOut is the auto-inserted fan-out: an
+   *  in-place identity that touches no data, whose real consumers register
+   *  their own engines on views resolving to the same source. An application
+   *  may declare further neutral types (ResidencyPolicy) for a layer that is
+   *  registered on one engine but binds its tensors on another. Without this,
+   *  such a node stamps the host plane onto the shared source, which both
+   *  demotes that source and clears all_consumers_device for every reader
+   *  behind it -- so one neutral node in the middle of a fan-out takes the
+   *  whole subtree off the device plane. */
+  if (isEngineNeutralNode(getType()))
+    context.setComputeEngine(ml::train::LayerComputeEngine::GPU);
 
   layer->finalize(context);
 
@@ -969,6 +1056,10 @@ void LayerNode::configureRunContext(const std::vector<Weight *> &weights,
   run_context = std::make_unique<RunLayerContext>(
     getName(), getTrainable(), 0.0f, getInPlaceType() != InPlaceType::NONE,
     loss_scale, ct_data, false, weights, inputs, outputs, tensors);
+  // Thread the layer's compute engine onto the run context so a residency
+  // step can tell CPU from GPU consumers at getInput/getOutput. Nothing reads
+  // it yet; the default is CPU.
+  run_context->setRunComputeEngine(toLayerComputeEngine(compute_engine));
 }
 
 /**

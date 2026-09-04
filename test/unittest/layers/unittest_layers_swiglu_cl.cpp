@@ -14,18 +14,17 @@
 #include <gtest/gtest.h>
 
 #include <layers_common_tests.h>
-#include <swiglu_cl.h>
+#include <swiglu_layer.h>
 
 auto semantic_swiglu_gpu = LayerSemanticsParamType(
-  nntrainer::createLayer<nntrainer::SwiGLULayerCl>,
-  nntrainer::SwiGLULayerCl::type, {},
-  LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false, 1);
+  nntrainer::createLayer<nntrainer::SwiGLULayer>, nntrainer::SwiGLULayer::type,
+  {}, LayerCreateSetPropertyOptions::AVAILABLE_FROM_APP_CONTEXT, false, 1);
 
 GTEST_PARAMETER_TEST(SwigluGPU, LayerSemanticsGpu,
                      ::testing::Values(semantic_swiglu_gpu));
 
 auto swiglu_basic_plain =
-  LayerGoldenTestParamType(nntrainer::createLayer<nntrainer::SwiGLULayerCl>, {},
+  LayerGoldenTestParamType(nntrainer::createLayer<nntrainer::SwiGLULayer>, {},
                            "2:3:3:3,2:3:3:3", "swiglu.nnlayergolden",
                            LayerGoldenTestParamOptions::SKIP_CALC_DERIV |
                              LayerGoldenTestParamOptions::SKIP_CALC_GRAD |
@@ -37,7 +36,7 @@ GTEST_PARAMETER_TEST(SwigluGPU, LayerGoldenTest,
 
 #ifdef ENABLE_FP16
 auto swiglu_basic_plain_w16a16 =
-  LayerGoldenTestParamType(nntrainer::createLayer<nntrainer::SwiGLULayerCl>, {},
+  LayerGoldenTestParamType(nntrainer::createLayer<nntrainer::SwiGLULayer>, {},
                            "2:3:3:3,2:3:3:3", "swiglufp16.nnlayergolden",
                            LayerGoldenTestParamOptions::SKIP_CALC_DERIV |
                              LayerGoldenTestParamOptions::SKIP_CALC_GRAD |
