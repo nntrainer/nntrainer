@@ -56,6 +56,7 @@
 #include <fc_layer.h>
 #include <flatten_layer.h>
 #include <gather_layer.h>
+#include <geglu_layer.h>
 #include <gru.h>
 #include <grucell.h>
 #include <identity_layer.h>
@@ -437,6 +438,11 @@ void AppContext::add_default_object() {
 
   registerFactory(nntrainer::createLayer<TimeDistLayer>, TimeDistLayer::type,
                   LayerType::LAYER_TIME_DIST);
+
+  // Backend-neutral LLM layers, registered by type string only (no
+  // LayerType enum): the same C++ class serves every engine, dispatching
+  // its math through the op table.
+  registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
 
   registerFactory(AppContext::unknownFactory<nntrainer::Layer>, "unknown",
                   LayerType::LAYER_UNKNOWN);

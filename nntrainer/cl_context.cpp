@@ -105,11 +105,10 @@ void ClContext::initialize() noexcept {
 };
 
 void ClContext::add_default_object() {
-  if (FullyConnectedLayerCl::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
-                    FullyConnectedLayerCl::type,
-                    ml::train::LayerType::LAYER_FC);
-  }
+  // The FC layer is now backend-neutral (it dispatches its GEMM through
+  // ComputeOps::fc), so it registers no kernels of its own here.
+  registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
+                  FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
 
   if (AdditionLayerCL::registerClKernels(*this)) {
     registerFactory(nntrainer::createLayer<AdditionLayerCL>,

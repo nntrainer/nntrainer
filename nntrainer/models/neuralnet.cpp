@@ -42,6 +42,7 @@
 #include <common_properties.h>
 #include <databuffer.h>
 #include <flatten_realizer.h>
+#include <fusion_realizer.h>
 #include <ini_interpreter.h>
 #include <ini_wrapper.h>
 #include <input_realizer.h>
@@ -211,6 +212,15 @@ int NeuralNetwork::compile(ExecutionMode mode) {
     std::vector<Connection>(input_conn.begin(), input_conn.end())));
   realizers.emplace_back(new MultioutRealizer());
   realizers.emplace_back(new FlattenRealizer());
+  // Fuse a compute layer's activation epilogue (conv+relu / fc+act) BEFORE
+  // ActivationRealizer would split it into a node, so it stays inline. Gated
+  // by NNTR_FUSE_ACT (default on) and restricted to inference: the fused
+  // forward is value-identical to the standalone node, but there is no fused
+  // backward, so a training graph keeps the separate ActivationLayer that
+  // contributes the activation derivative. A no-op for graphs whose compute
+  // layers carry no activation property.
+  if (mode == ExecutionMode::INFERENCE)
+    realizers.emplace_back(new FusionRealizer());
   realizers.emplace_back(new ActivationRealizer());
 
   for (auto &realizer : realizers) {

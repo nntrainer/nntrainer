@@ -141,6 +141,32 @@ public:
 };
 
 /**
+ * @brief Whether only the last row of the layer's output is ever produced
+ *
+ * @details A layer that computes one row per step -- a projection head marked
+ * skip_prefill, which runs a single decode position at a time -- still has its
+ * output planned at the graph-build height, so every row above the first is
+ * allocated and never written. A model that knows its head behaves that way
+ * sets this, and the layer plans the output at height 1 instead. Unset, the
+ * output keeps the full height, which is the behaviour of every layer that
+ * does not carry the property.
+ *
+ * @note It is read together with skip_prefill: shortening the plan of a layer
+ * that does fill every row would drop the rows it writes, so the two are only
+ * honoured as a pair.
+ */
+class PlanLastRowOnly : public nntrainer::Property<bool> {
+public:
+  /**
+   * @brief Construct a new PlanLastRowOnly object
+   *
+   */
+  PlanLastRowOnly() : nntrainer::Property<bool>() {}
+  static constexpr const char *key = "plan_last_row_only";
+  using prop_tag = bool_prop_tag;
+};
+
+/**
  * @brief Inplace operation property
  *
  */
@@ -1013,6 +1039,21 @@ class Activation final
 public:
   using prop_tag = enum_class_prop_tag;
   static constexpr const char *key = "activation";
+};
+
+/**
+ * @brief FusedActivation — a layer-internal activation applied inline in the
+ *        compute layer's forward (after GEMM+bias), instead of as a separate
+ *        ActivationLayer node. It has a distinct key from `activation`, which
+ *        is the LayerNode realization property ActivationRealizer consumes, so
+ *        the FusionRealizer can move an activation onto the compute layer
+ *        without it being split back out into a node.
+ */
+class FusedActivation final
+  : public EnumProperty<nntrainer::props::ActivationTypeInfo> {
+public:
+  using prop_tag = enum_class_prop_tag;
+  static constexpr const char *key = "fused_activation";
 };
 
 /**
