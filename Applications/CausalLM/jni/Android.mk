@@ -91,6 +91,7 @@ LOCAL_SRC_FILES := \
     ../huggingface_tokenizer.cpp \
     ../llm_util.cpp \
     ../layers/embedding_layer.cpp \
+    ../layers/vision_embedding_layer.cpp \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
@@ -208,6 +209,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gpt_oss_cached_slim/gptoss_cached_slim_causallm.cpp \
     ../llm_util.cpp \
     ../layers/embedding_layer.cpp \
+    ../layers/vision_embedding_layer.cpp \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
