@@ -65,6 +65,28 @@ bool LoadOpenCL() {
     return true;
   }
 
+#if !defined(_WIN32)
+  // Android Qualcomm/Adreno: the vendor's libOpenCL.so is not always reachable
+  // through the default linker namespace from a shell-launched executable, so
+  // try the well-known vendor paths explicitly. The alternative is asking the
+  // caller to set LD_LIBRARY_PATH=/system/vendor/lib64, which on some devices
+  // drags in libandroid_runtime.so with unresolved symbols.
+  static const char *kAndroidVendorPaths[] = {
+    "/vendor/lib64/libOpenCL.so",
+    "/system/vendor/lib64/libOpenCL.so",
+    "/vendor/lib/libOpenCL.so",
+    "/system/vendor/lib/libOpenCL.so",
+  };
+  for (const char *p : kAndroidVendorPaths) {
+    libopencl = DynamicLibraryLoader::loadLibrary(p, RTLD_NOW | RTLD_LOCAL);
+    if (libopencl) {
+      LoadOpenCLFunctions(libopencl);
+      open_cl_initialized = true;
+      return true;
+    }
+  }
+#endif
+
   // record error
   std::string error(DynamicLibraryLoader::getLastError());
   ml_loge("Cannot open OpenCL library on this device - %s", error.c_str());
@@ -173,12 +195,14 @@ void LoadOpenCLFunctions(void *libopencl) {
   LoadFunction(clGetPlatformIDs);
   LoadFunction(clGetDeviceIDs);
   LoadFunction(clGetDeviceInfo);
+  LoadFunction(clGetImageInfo);
   LoadFunction(clCreateContext);
   LoadFunction(clCreateCommandQueue);
   LoadFunction(clCreateBuffer);
   LoadFunction(clCreateSubBuffer);
   LoadFunction(clCreateImage);
   LoadFunction(clEnqueueWriteBuffer);
+  LoadFunction(clEnqueueFillBuffer);
   LoadFunction(clEnqueueReadBuffer);
   LoadFunction(clEnqueueMapBuffer);
   LoadFunction(clEnqueueUnmapMemObject);
@@ -207,17 +231,20 @@ void LoadOpenCLFunctions(void *libopencl) {
   LoadFunction(clEnqueueSVMUnmap);
   LoadFunction(clSetKernelArgSVMPointer);
   LoadFunction(clWaitForEvents);
+  LoadFunction(clReleaseEvent);
 }
 
 PFN_clGetPlatformIDs clGetPlatformIDs;
 PFN_clGetDeviceIDs clGetDeviceIDs;
 PFN_clGetDeviceInfo clGetDeviceInfo;
+PFN_clGetImageInfo clGetImageInfo;
 PFN_clCreateContext clCreateContext;
 PFN_clCreateCommandQueue clCreateCommandQueue;
 PFN_clCreateBuffer clCreateBuffer;
 PFN_clCreateSubBuffer clCreateSubBuffer;
 PFN_clCreateImage clCreateImage;
 PFN_clEnqueueWriteBuffer clEnqueueWriteBuffer;
+PFN_clEnqueueFillBuffer clEnqueueFillBuffer;
 PFN_clEnqueueReadBuffer clEnqueueReadBuffer;
 PFN_clEnqueueMapBuffer clEnqueueMapBuffer;
 PFN_clEnqueueUnmapMemObject clEnqueueUnmapMemObject;
@@ -246,4 +273,5 @@ PFN_clEnqueueSVMMap clEnqueueSVMMap;
 PFN_clEnqueueSVMUnmap clEnqueueSVMUnmap;
 PFN_clSetKernelArgSVMPointer clSetKernelArgSVMPointer;
 PFN_clWaitForEvents clWaitForEvents;
+PFN_clReleaseEvent clReleaseEvent;
 } // namespace nntrainer::opencl
