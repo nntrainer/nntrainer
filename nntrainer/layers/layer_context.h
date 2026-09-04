@@ -104,6 +104,13 @@ public:
   ml::train::LayerComputeEngine getComputeEngineType() { return engine; };
 
   /**
+   * @brief  set the layer compute engine (used by refinalize, which builds the
+   *         context without the engine arg). Must be set before the layer
+   *         requests its outputs so outSpec() stamps the right residency.
+   */
+  void setComputeEngine(ml::train::LayerComputeEngine e) { engine = e; }
+
+  /**
    * @brief   get name by the layer
    *
    * @return name of the layer
@@ -995,6 +1002,23 @@ public:
    */
   bool reStoreData() { return restoreData; }
 
+  /**
+   * @brief  Set the layer's compute engine on the run context. Threaded in
+   *         from LayerNode::compute_engine at
+   *         configureRunContext time. Lets a residency step tell, at the
+   *         universal getInput/getOutput accessor, whether THIS consuming layer
+   *         runs on GPU or CPU (needed to decide a device->host sync). Nothing
+   *         reads it yet; the default CPU keeps the host path.
+   */
+  void setRunComputeEngine(ml::train::LayerComputeEngine e) { run_engine = e; }
+
+  /**
+   * @brief  Get the layer's compute engine (CPU/GPU) for this run context.
+   */
+  ml::train::LayerComputeEngine getRunComputeEngine() const {
+    return run_engine;
+  }
+
 private:
   std::tuple<props::Name, props::Trainable> props; /**< props of the layer */
   std::shared_ptr<ContextData> ct_data;
@@ -1002,6 +1026,8 @@ private:
   bool is_inplace;  /**< if the layer is expected to run in-place */
   float loss_scale; /**< loss_scale of the layer */
   bool restoreData; /**< reset output for mixed precsion */
+  ml::train::LayerComputeEngine run_engine =
+    ml::train::LayerComputeEngine::CPU; /**< this layer's compute engine */
 
   std::vector<Weight *> weights;   /**< weights of the layer */
   std::vector<Var_Grad *> inputs;  /**< inputs of the layer */
