@@ -2045,6 +2045,16 @@ public:
   }
 
   /**
+   * @brief Get the ComputeOps this tensor dispatches through.
+   *
+   * Priority: the attached ContextData's per-vendor table, else the global
+   * one. This is how a backend-neutral Layer reaches the right backend's
+   * whole-op without a preprocessor branch at the call site, e.g.
+   * `in.getOps()->layer_norm(...)`.
+   */
+  ComputeOps *getOps() const { return itensor_->getOps(); }
+
+  /**
    * @brief Propagate this tensor's ContextData to a result tensor.
    *
    * Used by binary/unary ops so that subsequent calls on the result

@@ -16,10 +16,83 @@
 #include "opencl_context_manager.h"
 #include "opencl_loader.h"
 
+#include <cstdlib>
+
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 
 namespace nntrainer::opencl {
+
+namespace {
+
+/**
+ * @brief Whether this device needs an explicit flush between a kernel that
+ *        writes shared virtual memory and the kernel that reads it.
+ *
+ * An in-order queue does not by itself make a coarse-grain shared-memory
+ * handoff visible to the next kernel; fine-grain buffer memory is coherent by
+ * definition and needs nothing. CL_DEVICE_SVM_FINE_GRAIN_BUFFER is the
+ * queryable difference, so the decision is derived from that capability and
+ * from nothing else.
+ *
+ * There is deliberately no vendor clause. What is being worked around is a
+ * property of coarse-grain shared memory, which the queue does not order;
+ * scoping the repair to the one device it was first measured on would leave
+ * every other coarse-grain device racing. Adreno is coarse-grain and is not
+ * Intel, and this backend now probes the vendor ICD path specifically to reach
+ * it, so a vendor clause would exclude a primary target of that work from the
+ * fix. "Not observed elsewhere" is an absence of measurement rather than a
+ * distinction a reader can act on, and what it would leave in place is a wrong
+ * result, not a slow one. The cost where the drain was not needed is one
+ * clFinish per dispatch that touched shared memory: throughput, measurable,
+ * and recoverable.
+ *
+ * Both fine-grain capabilities count. A device advertising FINE_GRAIN_SYSTEM
+ * without FINE_GRAIN_BUFFER is coherent just the same, and testing only the
+ * buffer bit would classify it coarse-grain and drain it for nothing.
+ *
+ * Resolved once per process, on the first dispatch rather than at init: the
+ * device info is not populated before then, and a null device_info latches
+ * false for the life of the process. NNTR_XE3_SYNC overrides the whole
+ * derivation, and is read before it, so that case is recoverable without a
+ * rebuild.
+ */
+bool needsCoarseSVMDrain() {
+  static const bool drain = []() {
+    // NNTR_XE3_SYNC: explicit override, consulted FIRST. The capability
+    // derivation below is the right default, but it can only speak once the
+    // device has been probed -- and this predicate resolves ONCE. A dispatch
+    // that beats the device info into existence latches "no drain" for the
+    // life of the process, silently, and a coarse-grain device then reads a
+    // buffer the GPU has not finished writing. The override exists precisely
+    // for that case, so it must not depend on the thing it works around.
+    if (const char *e = std::getenv("NNTR_XE3_SYNC")) {
+      const bool on = std::atoi(e) != 0;
+      ml_logi("NNTR_XE3_SYNC=%s overrides the shared-memory drain: %s", e,
+              on ? "on" : "off");
+      return on;
+    }
+    const auto *device_info = ContextManager::Global().getDeviceInfo();
+    if (!device_info) {
+      // Fail safe to off, but say so: this disables a coherence drain, which
+      // is not something to discover from wrong output.
+      ml_logw("No device info when resolving the shared-memory drain; it is "
+              "off for this process. Set NNTR_XE3_SYNC=1 if the GPU output "
+              "races.");
+      return false;
+    }
+    const cl_device_svm_capabilities svm =
+      device_info->getDeviceSVMCapabilities();
+    const bool fine_grain = (svm & (CL_DEVICE_SVM_FINE_GRAIN_BUFFER |
+                                    CL_DEVICE_SVM_FINE_GRAIN_SYSTEM)) != 0;
+    ml_logd("SVM capabilities 0x%x (fine grain %d): shared-memory drain %s",
+            (unsigned)svm, (int)fine_grain, fine_grain ? "off" : "on");
+    return !fine_grain;
+  }();
+  return drain;
+}
+
+} // namespace
 
 /**
  * @brief Create a Command Queue object
@@ -48,9 +121,13 @@ bool CommandQueueManager::CreateCommandQueue() {
   // getting GPU device ID
   cl_device_id device_id = context_instance.GetDeviceId();
 
-  // returns NULL with error code if fails
-  command_queue_ = clCreateCommandQueue(
-    context, device_id, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, &error_code);
+  // In-order queue. Nothing in this tree enqueues a wait list or waits on an
+  // event, so out-of-order execution bought no overlap; what it did do is let
+  // the device reorder two kernels that hand off through a shared buffer,
+  // which is exactly how consecutive layers on the OpenCL memory allocator
+  // communicate. Submission order is the only ordering guarantee those
+  // handoffs have.
+  command_queue_ = clCreateCommandQueue(context, device_id, 0, &error_code);
   if (!command_queue_) {
     ml_loge("Failed to create a command queue. OpenCL error code: %d : ",
             error_code, OpenCLErrorCodeToString(error_code));
@@ -357,11 +434,16 @@ bool CommandQueueManager::DispatchCommand(
   const int error_code =
     clEnqueueNDRangeKernel(command_queue_, kernel_, 3, nullptr, global, local,
                            events_to_wait.size(), events_to_wait.data(), event);
+  // Always consume the flag, so it never leaks onto the next dispatch.
+  const bool touched_svm = Kernel::takeDispatchTouchedSVM();
   if (error_code != CL_SUCCESS) {
     ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));
     return false;
   }
+
+  if (touched_svm && needsCoarseSVMDrain())
+    clFinish(command_queue_);
 
   return true;
 }
@@ -391,11 +473,16 @@ bool CommandQueueManager::DispatchCommand(
   const int error_code =
     clEnqueueNDRangeKernel(command_queue_, kernel_, 3, nullptr, global, local,
                            events_to_wait.size(), events_to_wait.data(), event);
+  // Always consume the flag, so it never leaks onto the next dispatch.
+  const bool touched_svm = Kernel::takeDispatchTouchedSVM();
   if (error_code != CL_SUCCESS) {
     ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));
     return false;
   }
+
+  if (touched_svm && needsCoarseSVMDrain())
+    clFinish(command_queue_);
 
   return true;
 }
@@ -412,9 +499,18 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
     command_queue_, kernel, work_dim, nullptr, global_work_size,
     local_work_size, num_events_in_wait_list, event_wait_list, event);
 
+  // Always consume the flag, so it never leaks onto the next dispatch.
+  const bool touched_svm = Kernel::takeDispatchTouchedSVM();
+
   NNTR_THROW_IF(error_code != CL_SUCCESS, std::runtime_error)
     << "clEnqueueNDRangeKernel failed. OpenCL error code: " << error_code
     << ", error: " << OpenCLErrorCodeToString(error_code);
+
+  // The attention and rotary-embedding kernels come through here rather than
+  // DispatchCommand, and they are the shared-memory producers and consumers,
+  // so the flush that keeps their handoff coherent has to live here too.
+  if (touched_svm && needsCoarseSVMDrain())
+    clFinish(command_queue_);
 }
 
 } // namespace nntrainer::opencl

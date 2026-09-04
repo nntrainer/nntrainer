@@ -992,7 +992,7 @@ void sgemv_q6_k_cl(void *matAdata, float *vecXdata, float *vecYdata,
 
 void sgemv_cl(const float *matAdata, const float *vecXdata, float *vecYdata,
               bool TransA, unsigned int dim1, unsigned int dim2,
-              unsigned int lda) {
+              unsigned int lda, bool out_svm) {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
 
@@ -1005,12 +1005,11 @@ void sgemv_cl(const float *matAdata, const float *vecXdata, float *vecYdata,
       blas_cc->registerClKernel(sgemv_no_trans_kernel, "sgemv_cl_noTrans");
   }
 
-  if (!kernel_sgemv_ptr) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(kernel_sgemv_ptr, "sgemv_cl<fp32>", "kernel register",
+                       dim1, dim2, lda);
 
   sgemv_cl_internal<float>(kernel_sgemv_ptr, matAdata, vecXdata, vecYdata, dim1,
-                           dim2, lda);
+                           dim2, lda, out_svm);
 }
 
 float dot_cl(const float *vecAdata, const float *vecXdata, unsigned int dim1) {
@@ -1028,7 +1027,8 @@ float dot_cl(const float *vecAdata, const float *vecXdata, unsigned int dim1) {
 
 void sgemm_cl(bool TransA, bool TransB, const float *A, const float *B,
               float *C, unsigned int M, unsigned int N, unsigned int K,
-              unsigned int lda, unsigned int ldb, unsigned int ldc) {
+              unsigned int lda, unsigned int ldb, unsigned int ldc,
+              bool out_svm) {
   std::string kernel_func_;
   std::string sgemm_cl_kernel_;
 
@@ -1051,16 +1051,15 @@ void sgemm_cl(bool TransA, bool TransB, const float *A, const float *B,
 
   ClContext::SharedPtrClKernel kernel_sgemm_ptr =
     blas_cc->registerClKernel(sgemm_cl_kernel_, kernel_func_);
-  if (!kernel_sgemm_ptr) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(kernel_sgemm_ptr, "sgemm_cl<fp32>", "kernel register", M,
+                       N, K);
 
   sgemm_cl_internal<float>(kernel_sgemm_ptr, TransA, TransB, A, B, C, M, N, K,
-                           lda, ldb, ldc);
+                           lda, ldb, ldc, out_svm);
 }
 
 void addition_cl(const float *input, float *res, unsigned int size_input,
-                 unsigned int size_res) {
+                 unsigned int size_res, bool use_svm) {
   bool result = false;
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
@@ -1072,7 +1071,7 @@ void addition_cl(const float *input, float *res, unsigned int size_input,
   }
 
   addition_cl_internal<float>(kernel_addition_ptr, input, res, size_input,
-                              size_res);
+                              size_res, use_svm);
 }
 
 void rmsnorm_cl(const float *input, const float *gamma, float *result,

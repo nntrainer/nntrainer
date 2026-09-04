@@ -157,6 +157,13 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result, bool trans,
     const _FP16 *mdata = m.getData<_FP16>();
     _FP16 *rdata = result.getData<_FP16>();
 
+    // out_svm: a result tensor in coarse-grain shared virtual memory has to be
+    // host-mapped before the staging read-back, or the copy-out silently never
+    // lands (see sgemv_cl_internal). This is the one place the Tensor -- and
+    // therefore the answer -- is still in hand.
+    const bool out_svm =
+      result.getMemoryData() && result.getMemoryData()->isSVM();
+
     /// shortcut handling in case of vector
     /// for vector, (1 * K) == (K * 1) in current memory layout...
     /// and plaese note that N, K, M is a fixed place holder after considering
@@ -169,19 +176,21 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result, bool trans,
     }
     /// case2: (M * K) X (K * 1)
     else if (N == 1) {
-      trans ? sgemv_cl(data, mdata, rdata, trans, dim2, dim1, lda)
-            : sgemv_cl(data, mdata, rdata, trans, dim1, dim2, lda);
+      trans ? sgemv_cl(data, mdata, rdata, trans, dim2, dim1, lda, out_svm)
+            : sgemv_cl(data, mdata, rdata, trans, dim1, dim2, lda, out_svm);
     }
     /// case3: (1 * K) X (K * N) = 1 * N = R
     /// = R^T = (K * N) ^T * (1 * K) ^T = (N * K) * (K * 1) = (N * K) * (1 * K)
     /// Effectively a translation of sgemv
     else if (M == 1) {
-      trans_m ? sgemv_cl(mdata, data, rdata, !trans_m, mdim1, mdim2, ldb)
-              : sgemv_cl(mdata, data, rdata, !trans_m, mdim2, mdim1, ldb);
+      trans_m
+        ? sgemv_cl(mdata, data, rdata, !trans_m, mdim1, mdim2, ldb, out_svm)
+        : sgemv_cl(mdata, data, rdata, !trans_m, mdim2, mdim1, ldb, out_svm);
     }
     /// case others: use sgemm
     else {
-      sgemm_cl(trans, trans_m, data, mdata, rdata, M, N, K, lda, ldb, ldc);
+      sgemm_cl(trans, trans_m, data, mdata, rdata, M, N, K, lda, ldb, ldc,
+               out_svm);
     }
 #else
     throw std::invalid_argument("Error: enable-fp16 is not enabled");
@@ -235,7 +244,17 @@ void add_i_cl(Tensor &result, Tensor const &input) {
       _FP16 *data_res = result.getData<_FP16>();
       const _FP16 *data_input = input.getData<_FP16>();
 
-      addition_cl(data_input, data_res, size_input, size_res);
+      // Bind the device pointers directly (SVM-direct, in-place accumulate)
+      // when BOTH tensors are device-visible; otherwise fall back to the host
+      // round trip. This is what keeps the residual stream on the device --
+      // and on a coarse-grain device it is not an optimisation but a
+      // correctness requirement, because the host round trip reads a
+      // shared-plane view the device has been writing.
+      const bool use_svm =
+        result.getMemoryData() && result.getMemoryData()->isSVM() &&
+        input.getMemoryData() && input.getMemoryData()->isSVM();
+
+      addition_cl(data_input, data_res, size_input, size_res, use_svm);
 
 #else
       throw std::invalid_argument("Error: enable-fp16 is not enabled");

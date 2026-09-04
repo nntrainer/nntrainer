@@ -13,7 +13,9 @@
 
 #include "opencl_program.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -26,8 +28,61 @@
 
 namespace nntrainer::opencl {
 
+namespace {
+
+/**
+ * @brief Resolve the directory the compiled-kernel binary cache lives in.
+ *
+ * The configured opencl-kernel-path is a bare relative name by default, which
+ * would place the cache in the process's working directory. That is the wrong
+ * home for it now that caching is on by default, for two reasons. It is a
+ * surprising side effect: merely initialising the library would create a
+ * directory and write files wherever the caller happened to be standing. And
+ * it is a hazard, because these files are handed to clCreateProgramWithBinary
+ * -- a process started in a directory another local user can write to would
+ * load that user's chosen binary into the GPU driver, under a file name anyone
+ * can compute from the kernel sources in this repository and the readable
+ * device strings.
+ *
+ * A relative configured path is therefore resolved under the invoking user's
+ * own cache directory: XDG_CACHE_HOME when set, else $HOME/.cache. An absolute
+ * configured path is honoured exactly as given -- that is a deployment saying
+ * where it wants the cache. Android keeps the relative behaviour, where the
+ * working directory is the app's own and the existing flow prepares it.
+ *
+ * With no per-user directory determinable, the relative name stands and the
+ * caller's own directory permissions are what protect it.
+ *
+ * @return the cache directory to use
+ */
+std::string resolveKernelCachePath() {
+  const std::string configured = stringify(OPENCL_KERNEL_PATH);
+
+#if defined(__ANDROID__)
+  return configured;
+#else
+  if (configured.empty() || std::filesystem::path(configured).is_absolute())
+    return configured;
+
+  std::string base;
+  const char *xdg = std::getenv("XDG_CACHE_HOME");
+  const char *home = std::getenv("HOME");
+  if (xdg != nullptr && xdg[0] != '\0') {
+    base = xdg;
+  } else if (home != nullptr && home[0] != '\0') {
+    base = std::string(home) + "/.cache";
+  } else {
+    return configured;
+  }
+
+  return (std::filesystem::path(base) / "nntrainer" / configured).string();
+#endif
+}
+
+} // namespace
+
 // defining DEFAULT_KERNEL_PATH
-const std::string Program::DEFAULT_KERNEL_PATH = stringify(OPENCL_KERNEL_PATH);
+const std::string Program::DEFAULT_KERNEL_PATH = resolveKernelCachePath();
 
 /**
  * @brief Build OpenCL program

@@ -14,23 +14,38 @@
  * creates the OpenCL command queue and context.
  */
 
-#include <addition_layer_cl.h>
+#include <activation_layer.h>
+#include <addition_layer.h>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
 #include <cl_svm_allocator.h>
 #include <compute_ops.h>
 #include <concat_cl.h>
 #include <fc_layer_cl.h>
+#include <geglu_cl_op.h>
+#include <geglu_layer.h>
+#include <gelu_cl_op.h>
+#include <layer_normalization_layer.h>
+#include <layernorm_cl_op.h>
 #include <opencl_context_manager.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
-#include <swiglu_cl.h>
+#include <swiglu_cl_op.h>
+#include <swiglu_layer.h>
 #include <transpose_cl.h>
 
+#include <cstdlib>
 #include <filesystem>
+#include <mutex>
+#include <system_error>
+#include <unordered_map>
 
 #if defined(_WIN32)
 #include <windows.h>
+#else
+// For the kernel cache directory ownership/permission check below.
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace nntrainer {
@@ -40,6 +55,62 @@ static constexpr bool KERNEL_CACHE_ENABLED = true;
 static constexpr bool KERNEL_CACHE_ENABLED = false;
 #endif
 std::mutex cl_factory_mutex;
+
+// Guards ClContext::ocl_kernel_map, the process-wide compiled-kernel cache.
+// Separate from cl_factory_mutex, which guards the layer factory registry: the
+// two are unrelated maps taken on unrelated paths, and sharing one lock would
+// put a cold kernel compile in front of every layer registration.
+static std::mutex ocl_kernel_map_mutex;
+
+// Whether the resolved cache directory is safe to load GPU program binaries
+// from. Set once at init and read on every cached lookup; false leaves the
+// cache disabled for the process without disabling anything else.
+static bool kernel_cache_usable = false;
+
+/**
+ * @brief Is the kernel cache directory writable only by its owner, and owned
+ *        by the user this process runs as?
+ *
+ * A cached binary goes straight to clCreateProgramWithBinary, so anyone who
+ * can write the file chooses what the GPU driver compiles. The file name is no
+ * protection: the key is a hash over kernel sources that ship in this
+ * repository plus device strings any local user can read. Decline the cache
+ * rather than trust a directory that somebody else can write into -- the cost
+ * is one cold kernel compile, and the alternative is a local code-execution
+ * surface that appears the moment a process is started from a shared
+ * directory.
+ *
+ * @param path cache directory
+ * @return true when the directory may be read from and written to
+ */
+static bool kernelCacheDirIsPrivate(const std::string &path) {
+#if defined(_WIN32) || defined(__ANDROID__)
+  // Windows permissions do not map onto the POSIX bits this checks, and on
+  // Android the directory is inside the app's own private storage.
+  (void)path;
+  return true;
+#else
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0) {
+    ml_logw("Cannot stat the kernel cache directory %s; not caching kernels",
+            path.c_str());
+    return false;
+  }
+  if (st.st_uid != ::geteuid()) {
+    ml_logw("The kernel cache directory %s is owned by another user; not "
+            "caching kernels",
+            path.c_str());
+    return false;
+  }
+  if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    ml_logw("The kernel cache directory %s is writable by other users; not "
+            "caching kernels",
+            path.c_str());
+    return false;
+  }
+  return true;
+#endif
+}
 
 std::vector<std::byte> readBinaryFile(const std::string &path) {
   // reading binary
@@ -56,6 +127,33 @@ std::vector<std::byte> readBinaryFile(const std::string &path) {
   } else {
     return {};
   }
+}
+
+/**
+ * @brief Directory the kernel binary cache lives in.
+ *
+ * NNTR_KERNEL_CACHE_DIR names it outright; with the variable unset or empty,
+ * Program::DEFAULT_KERNEL_PATH stands, which is the configured path already
+ * resolved under the user's own cache directory on every platform that has
+ * one.
+ *
+ * The override is the integration point for an embedder that knows its own
+ * private storage and cannot rely on either -- an Android application passing
+ * Context.getCacheDir() is the case that motivates it, since the per-user
+ * resolution deliberately does not apply there and the configured path stays
+ * relative to a working directory the library does not choose.
+ *
+ * Program::DEFAULT_KERNEL_PATH is still READ when the override points
+ * somewhere else, so setting it does not orphan a cache that is already there;
+ * new entries go only to the resolved directory.
+ */
+static const std::string &kernelCacheDir() {
+  static const std::string dir = []() -> std::string {
+    if (const char *e = std::getenv("NNTR_KERNEL_CACHE_DIR"); e && *e)
+      return std::string(e);
+    return opencl::Program::DEFAULT_KERNEL_PATH;
+  }();
+  return dir;
 }
 
 bool writeBinaryFile(const std::string &path,
@@ -77,12 +175,37 @@ void ClContext::initialize() noexcept {
       return;
     }
     if (KERNEL_CACHE_ENABLED) {
-      std::filesystem::create_directories(opencl::Program::DEFAULT_KERNEL_PATH);
+      // Best effort: the binary cache is an optimisation. A read-only or
+      // otherwise unwritable directory must not take the whole context down
+      // with it -- create_directories throws std::filesystem::filesystem_error,
+      // and everything below (the kernel registration, the memory allocator,
+      // the ops table) would then be skipped by the catch at the end of this
+      // function, leaving a context that registers no layer and hands out no
+      // allocator.
+      std::error_code ec;
+      std::filesystem::create_directories(kernelCacheDir(), ec);
+      if (ec) {
+        ml_logw("Could not create the kernel cache directory %s (%s); "
+                "compiling kernels from source without caching them",
+                kernelCacheDir().c_str(), ec.message().c_str());
+      } else {
+        kernel_cache_usable = kernelCacheDirIsPrivate(kernelCacheDir());
+      }
     }
 
     initBlasClKernels();
     initAttentionClKernels();
-    add_default_object();
+
+    // The allocator and the ops table are installed BEFORE the layer
+    // registrations, not after. add_default_object() throws on a duplicate
+    // registration key, and the catch at the end of this function swallows
+    // that -- so with the old order a single bad key left the context alive
+    // with a null MemAllocator, and the failure surfaced much later as a
+    // segfault in TensorPool's constructor (allocator_->makePool on a null
+    // shared_ptr) for every model on this engine, with nothing in the log to
+    // connect the two. Installing them first bounds the damage of a failed
+    // registration to the layers that did not register.
+    //
     // SVM-backed allocator so MemoryPool buffers are device-visible
     // without an explicit copy. Falls back to host memory inside
     // ClSVMAllocator when the driver lacks SVM support.
@@ -90,12 +213,14 @@ void ClContext::initialize() noexcept {
       std::make_shared<ClSVMAllocator>(opencl::ContextManager::Global()));
 
     // Install the OpenCL ComputeOps subclass so tensors created from
-    // this Context dispatch their accelerator-only ops (Q4_0/INT4
-    // batch & accel GEMM/GEMV) to the existing OpenCL kernels in
-    // cl_operations/blas_kernels.cpp instead of throwing or silently
-    // taking the CPU path. CPU-only ops on a CL-attached tensor still
-    // throw via base default — by design, those stay on a CPU context.
+    // this Context dispatch the whole-op table and the accelerator-only ops
+    // (Q4_0/INT4 batch & accel GEMM/GEMV) to the OpenCL kernels instead of
+    // throwing or silently taking the CPU path. CPU-only ops on a CL-attached
+    // tensor still throw via base default — by design, those stay on a CPU
+    // context.
     getContextData()->setComputeOps(get_cl_ops());
+
+    add_default_object();
 
   } catch (std::exception &e) {
     ml_loge("cl_context: registering layers failed!!, reason: %s", e.what());
@@ -105,20 +230,22 @@ void ClContext::initialize() noexcept {
 };
 
 void ClContext::add_default_object() {
-  if (FullyConnectedLayerCl::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
-                    FullyConnectedLayerCl::type,
-                    ml::train::LayerType::LAYER_FC);
-  }
+  // The FC layer is now backend-neutral (it dispatches its GEMM through
+  // ComputeOps::fc), so it registers no kernels of its own here.
+  registerFactory(nntrainer::createLayer<FullyConnectedLayerCl>,
+                  FullyConnectedLayerCl::type, ml::train::LayerType::LAYER_FC);
 
-  if (AdditionLayerCL::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<AdditionLayerCL>,
-                    AdditionLayerCL::type,
-                    ml::train::LayerType::LAYER_ADDITION);
-  }
+  // The core AdditionLayer is backend-neutral: its per-input copy and add
+  // dispatch through ComputeOps::residual_op, so the residual stream can stay
+  // device-resident without forking the layer. The former AdditionLayerCL is
+  // gone.
+  registerFactory(nntrainer::createLayer<AdditionLayer>, AdditionLayer::type,
+                  ml::train::LayerType::LAYER_ADDITION);
 
-  if (SwiGLULayerCl::registerClKernels(*this)) {
-    registerFactory(nntrainer::createLayer<SwiGLULayerCl>, SwiGLULayerCl::type,
+  // Likewise SwiGLU: one neutral layer dispatching ComputeOps::swiglu, in
+  // place of the former SwiGLULayerCl.
+  if (registerSwiGLUClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<SwiGLULayer>, SwiGLULayer::type,
                     ml::train::LayerType::LAYER_SWIGLU);
   }
 
@@ -141,6 +268,45 @@ void ClContext::add_default_object() {
     registerFactory(nntrainer::createLayer<TransposeLayerCl>,
                     TransposeLayerCl::type,
                     ml::train::LayerType::LAYER_TRANSPOSE);
+  }
+
+  // LayerNormalization and Activation are the SAME core classes the cpu
+  // context registers, under the same type strings -- there is no
+  // LayerNormLayerCl or ActivationLayerCl. Both dispatch their maths through
+  // the tensor's ComputeOps, so createLayer("layer_normalization",
+  // {engine=gpu}) and createLayer("activation", {activation=gelu,
+  // engine=gpu}) land on ClComputeOps::layer_norm / ::activation. Registration
+  // is gated on the kernels building, so a device that cannot compile them
+  // leaves the type unregistered rather than accepting the layer and throwing
+  // at the first forward. Both keys are explicit: the auto-assigned key is
+  // str_map.size() + 1, which silently collides with an enum key once the
+  // registration list grows.
+  if (registerLayerNormClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<LayerNormalizationLayer>,
+                    LayerNormalizationLayer::type,
+                    ml::train::LayerType::LAYER_LAYER_NORMALIZATION);
+  }
+  if (registerGeluClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<ActivationLayer>,
+                    ActivationLayer::type,
+                    ml::train::LayerType::LAYER_ACTIVATION);
+  }
+
+  // GeGLU: gelu_tanh(gate) * up, dispatching to ClComputeOps::geglu -- a
+  // device kernel where the gate and up rows are device-resident, and the
+  // inherited host implementation over the SVM-coherent buffer otherwise, so
+  // the op table side of this layer is complete on this backend once its
+  // kernel compiles. What was missing was the factory: ml::train::LayerType
+  // has no GeGLU enumerator, so, matching how the application context
+  // registers the same class, this is a string-keyed factory with an
+  // auto-assigned integer key. Without it, createLayer("geglu", {engine=gpu})
+  // throws "Key is not found for the object", and a gemma-family graph -- the
+  // only in-tree consumer of this type -- cannot be built under engine=gpu at
+  // all.
+  if (registerGeGLUClKernels(*this)) {
+    registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+  } else {
+    ml_logw("failed to register the OpenCL GeGLU kernels");
   }
 }
 
@@ -174,7 +340,19 @@ const int ClContext::registerFactory(const FactoryType<T> factory,
     throw std::invalid_argument(ss.str().c_str());
   }
 
-  int assigned_int_key = int_key == -1 ? str_map.size() + 1 : int_key;
+  // An auto-assigned key is str_map.size() + 1, which is not free: an explicit
+  // key taken from ml::train::LayerType sits in the same map, so inserting a
+  // string-keyed factory ahead of the explicit ones shifts every later
+  // auto-key onto one of them. The int_map write then silently replaced a
+  // registration instead of failing, and the type it displaced simply stopped
+  // resolving. Skip past what is taken rather than overwrite it, and keep the
+  // explicit-key branch throwing, which is the caller's own mistake.
+  int assigned_int_key = int_key;
+  if (assigned_int_key == -1) {
+    assigned_int_key = static_cast<int>(str_map.size()) + 1;
+    while (int_map.find(assigned_int_key) != int_map.end())
+      ++assigned_int_key;
+  }
 
   str_map[assigned_key] = factory;
   int_map[assigned_int_key] = assigned_key;
@@ -246,23 +424,48 @@ void ClContext::initAttentionClKernels() {
 }
 
 const ClContext::SharedPtrClKernel
-ClContext::registerClKernel(std::string kernel_string, std::string kernel_name,
-                            std::string compile_options) {
-  // check if created before
-  if (ocl_kernel_map.find(kernel_name + compile_options) !=
-      ocl_kernel_map.end()) {
-    return ocl_kernel_map[kernel_name + compile_options];
+ClContext::registerClKernel(const std::string &kernel_string,
+                            const std::string &kernel_name,
+                            const std::string &compile_options) {
+  // check if created before. One key construction, one lookup: the previous
+  // by-value parameters copied the whole kernel source -- tens of KB -- on
+  // every cached lookup, and the attention path takes this route once per
+  // kernel per layer.
+  const std::string key = kernel_name + compile_options;
+
+  // ocl_kernel_map is a process-wide static reached from the per-op dispatch
+  // path, not only from init, so it takes the same treatment clCreateKernel
+  // gives program_cache one frame below. Leaving the outer map unguarded while
+  // the inner one is locked is not a lost cache hit but a data race on an
+  // unordered_map, and therefore undefined behaviour. It gets its own lock
+  // because clCreateKernel takes program_cache_mtx while this one is not held,
+  // and clCreateKernel never calls back in here, so there is no reentrancy.
+  {
+    const std::lock_guard<std::mutex> lock(ocl_kernel_map_mutex);
+    auto it = ocl_kernel_map.find(key);
+    if (it != ocl_kernel_map.end())
+      return it->second;
   }
 
-  // creating shared_ptr for kernel object
+  // Built outside the lock: a cold compile can take hundreds of milliseconds
+  // and holding the map across it would serialise every other lookup behind
+  // it. Two threads racing on the same cold key both compile, and try_emplace
+  // below keeps the first one home -- wasted work on a rare race, never a torn
+  // map.
+  //
+  // clCreateKernel takes mutable references, so the cold path makes the copies
+  // it needs.
+  std::string source = kernel_string;
+  std::string name = kernel_name;
+  std::string options = compile_options;
   SharedPtrClKernel kernelPtr = std::make_shared<opencl::Kernel>();
-  if (!clCreateKernel(kernel_string, kernel_name, compile_options, kernelPtr)) {
+  if (!clCreateKernel(source, name, options, kernelPtr)) {
     ml_loge("Failed to register kernel %s", kernel_name.c_str());
     return nullptr;
   }
-  // add to map
-  ocl_kernel_map.emplace(kernel_name + compile_options, kernelPtr);
-  return ocl_kernel_map[kernel_name + compile_options];
+
+  const std::lock_guard<std::mutex> lock(ocl_kernel_map_mutex);
+  return ocl_kernel_map.try_emplace(key, kernelPtr).first->second;
 }
 
 bool ClContext::clCreateKernel(std::string &kernel_string,
@@ -276,20 +479,63 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
 
   opencl::Program program;
 
-  // reading binary
-  std::string binary_file_path =
-    opencl::Program::DEFAULT_KERNEL_PATH + "/" +
-    std::to_string(program.GetKernelHash(kernel_string, "")) + ".cl.bin";
-  auto binary_data = KERNEL_CACHE_ENABLED ? readBinaryFile(binary_file_path)
-                                          : std::vector<std::byte>();
+  // In-memory program cache: kernels that share one source and one option
+  // string share the built cl_program. Without it every kernel of a
+  // multi-kernel source repeats the binary read and the
+  // clCreateProgramWithBinary that goes with it, all of it inside the first
+  // forward pass.
+  static std::unordered_map<std::string, opencl::Program> program_cache;
+  static std::mutex program_cache_mtx;
+  const std::string pc_key =
+    std::to_string(program.GetKernelHash(kernel_string, "")) + "|" +
+    compile_options;
+  {
+    std::lock_guard<std::mutex> lk(program_cache_mtx);
+    auto it = program_cache.find(pc_key);
+    if (it != program_cache.end())
+      return kernel_ptr_->CreateKernelFromProgram(it->second, kernel_name);
+  }
 
-  if (KERNEL_CACHE_ENABLED && !binary_data.empty()) {
+  // On-disk kernel binary cache. The key folds in the per-kernel
+  // compile_options and the device signature (name + driver version): a stored
+  // binary is only valid for the exact source and options it was built from,
+  // and only on the same GPU and driver. Keying on the source alone hands a
+  // binary built for another device to clCreateProgramWithBinary.
+  static const std::string device_sig =
+    opencl::ContextManager::Global().GetDeviceSignature();
+  const std::string binary_file_name =
+    std::to_string(program.GetKernelHash(kernel_string,
+                                         compile_options + "|" + device_sig)) +
+    ".cl.bin";
+  const std::string binary_file_path =
+    kernelCacheDir() + "/" + binary_file_name;
+  auto binary_data = (KERNEL_CACHE_ENABLED && kernel_cache_usable)
+                       ? readBinaryFile(binary_file_path)
+                       : std::vector<std::byte>();
+  if (KERNEL_CACHE_ENABLED && kernel_cache_usable && binary_data.empty() &&
+      kernelCacheDir() != opencl::Program::DEFAULT_KERNEL_PATH) {
+    // Fall back to the legacy working-directory location so a cache written
+    // before the directory was resolvable is still used (read-only: new
+    // entries go to the resolved directory).
+    binary_data = readBinaryFile(opencl::Program::DEFAULT_KERNEL_PATH + "/" +
+                                 binary_file_name);
+  }
+
+  bool loaded_from_binary = false;
+  if (KERNEL_CACHE_ENABLED && kernel_cache_usable && !binary_data.empty()) {
     ml_logi("Using cached version of kernel: %s at path %s",
             kernel_name.c_str(), binary_file_path.c_str());
-    result = program.CreateCLProgramWithBinary(
+    loaded_from_binary = program.CreateCLProgramWithBinary(
       opencl::ContextManager::Global().GetContext(),
       opencl::ContextManager::Global().GetDeviceId(), binary_data,
       binary_file_path, "");
+    if (!loaded_from_binary)
+      ml_logw("Cached kernel binary %s was rejected; recompiling from source",
+              binary_file_path.c_str());
+  }
+
+  if (loaded_from_binary) {
+    result = true;
   } else {
     ml_logi("Binary for kernel %s not found, compiling from source...",
             kernel_name.c_str());
@@ -298,21 +544,29 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
                               opencl::ContextManager::Global().GetDeviceId(),
                               kernel_string, compile_options);
 
-    if (KERNEL_CACHE_ENABLED && result) {
+    if (KERNEL_CACHE_ENABLED && kernel_cache_usable && result) {
+      // Best-effort cache write: the freshly compiled program is already
+      // usable, so failing to persist it is a warning, not a build failure.
       auto binary = program.GetProgramBinary(
         opencl::ContextManager::Global().GetDeviceId());
 
       if (binary.empty()) {
-        ml_loge("Failed retrieving binary for kernel %s", kernel_name.c_str());
-        result = false;
-      } else {
-        result &= writeBinaryFile(binary_file_path, binary);
+        ml_logw("Failed retrieving binary for kernel %s; skipping cache write",
+                kernel_name.c_str());
+      } else if (!writeBinaryFile(binary_file_path, binary)) {
+        ml_logw("Failed writing kernel cache %s; continuing",
+                binary_file_path.c_str());
       }
     }
   }
 
   if (!result) {
     return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(program_cache_mtx);
+    program_cache.emplace(pc_key, program);
   }
 
   result = kernel_ptr_->CreateKernelFromProgram(program, kernel_name);
@@ -326,5 +580,14 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
 template const int ClContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
+
+// Non-template seam (Context::registerLayerFactory override): forwards to the
+// per-class registerFactory<Layer> here in the same translation unit, so the
+// explicit instantiation above is the one used and no template crosses the .so
+// boundary.
+int ClContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                                    const std::string &key, const int int_key) {
+  return registerFactory<nntrainer::Layer>(factory, key, int_key);
+}
 
 } // namespace nntrainer
