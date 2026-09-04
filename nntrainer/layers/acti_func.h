@@ -18,6 +18,9 @@
 
 #include <common_properties.h>
 #include <cpu_backend.h>
+#include <thread_manager.h>
+
+#include <type_traits>
 
 #if defined(_WIN32)
 #define _USE_MATH_DEFINES
@@ -436,8 +439,40 @@ public:
    */
   template <typename T = float>
   static Tensor &gelu(Tensor const &t_in, Tensor &t_out) {
-    nntrainer::gelu_v2(t_in.size(), t_in.getData<float>(),
-                       t_out.getData<float>());
+    const size_t size = t_in.size();
+    const T *input = t_in.getData<T>();
+    T *output = t_out.getData<T>();
+
+    auto gelu_chunk = [=](size_t begin, size_t end) {
+      if constexpr (std::is_same_v<T, float>) {
+        nntrainer::gelu_v2(static_cast<unsigned int>(end - begin),
+                           input + begin, output + begin);
+#ifdef ENABLE_FP16
+      } else if constexpr (std::is_same_v<T, _FP16>) {
+        constexpr float inv_sqrt_two = 0.70710678118654752440f;
+        for (size_t i = begin; i < end; ++i) {
+          const float value = static_cast<float>(input[i]);
+          output[i] = static_cast<_FP16>(
+            0.5f * value * (1.0f + std::erf(value * inv_sqrt_two)));
+        }
+#endif
+      } else {
+        throw std::invalid_argument("unsupported data type for gelu");
+      }
+    };
+
+    auto &thread_manager = ThreadManager::Global();
+    const unsigned int thread_count = thread_manager.getComputeThreadCount();
+    if (thread_count <= 1 || size < 4096) {
+      gelu_chunk(0, size);
+      return t_out;
+    }
+
+    thread_manager.parallel_for(
+      0, static_cast<size_t>(thread_count), [=](size_t thread_index) {
+        gelu_chunk(size * thread_index / thread_count,
+                   size * (thread_index + 1) / thread_count);
+      });
     return t_out;
   }
 
