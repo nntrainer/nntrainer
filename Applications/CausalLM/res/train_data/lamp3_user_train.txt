@@ -1,0 +1,394 @@
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Teeny, tiny bars! It looked like ONE bar, it is so small! Cant believe these are 2000 calories!!
+All 12 measure 3 x 3.5 x 2 approximately: FOR ALL 12!!!<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I LOVE cast iron, and I wanted a good wafflemaker that didn't have toxic coating on it (teflon, etc.). this will work on my stove, or for camping, too. Haven't used it yet, but I did get it seasoned, and plan to soon.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This would get a 5 star if they had included some instructions on HOW to do the belt!!! I am not even sure if the belt I purchased will fit!! There is NOTHING in the instructions on how to fit, install or fasten the belt. This is a NECESSARY step in being able to actually USE this product. They tell you how to SCREW into place the thread holder...duh. But NOTHING on how to make it work via the bel<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This stuff is really good. I bought it for a recipe, but it's so good I am blending it half and half with real good expensive coffee to help cut the caffeine but still keep the taste.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Funny how these RED gloves look awfully BLACK to me. I ordered the red, and got black. I guess Im ok with that, they will still work the same, but I DO expect to get WHAT I ORDER, and I DIDNT order THE BLACK.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This works GREAT as an ant killer!!!! Seriously. That is what it was originally created for, and it does work!<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I love these types of jars: they are great for keeping food items dry and safe from bugs.
+I use many of these jars. I can pick some up at my local thrift store, but usually they are the smaller ones, and I wanted the bigger ones like these. You can also buy the gaskets for them most places, but I don't unless I get them second-hand, when I don't like to reuse others stuff...
+Ill buy more when I ru<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This stuff really works! I have been using a watered down peppermint essential oil for two types of ant that have been plaguing me for nearly a year, off and on. Tiny meat ants and larger ones. They go after MEAT, not grease or sugar. The peppermint kills the tiny ones on contact, the larger ones takes a few sprays. This Orange guard does it too, only they are staying away MUCH longer. So far I ha<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Seems to work. there are only 4 loops, two long wooden dowels inserted at each end. It would have been nicer had there been at least one more bent to make 6. Works, but not great.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: While I give this book a 4 star rating due to informative content, and real life stories, I must give it only a 2 star rating overall. It will NOT be a good book in case of a real emergency need, as there is NO way to look up a particular situation and remedy. It is all over the place in the book, and the chapter titles are no help at all. Read it for entertainment, and some hopeful retention if a<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I LOVE these leggings! I have several pair, and they fit great. I'm 5'2", but heavy and these fit GREAT! (I get the Plus Size). They are soft, heavier than most leggings, and I really love the designs.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: These are great for helping keep earrings on so they don't get lost. I lost one good earring recently, a FAVORITE one, of course. It was later found, but these will prevent this from happening again. Suggestion:
+take these and for every one, slip them on and off the earring several times to "open" them up (both sides) or else you'll have beet red ears from trying to get them on!<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Guess I shouldn't have bought these as I don't like the style, but I wanted a top in this exact color! Color is great, style, not so much..(duh!)<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This double Burner looks traditional and blends well into the kitchen. It heats up very quickly, and seems to be evenly heating. It is a  tiny bit shorter than the one I had previously, which had a solid metal cooktop which had the tendency to rust. This one doesnt, which I really like.
+Since it is shorter, meaning there is less room between the two burners, it  won't accommodate two large pans at<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I will use these for homemade ice cream, but also use them for making large chunks of ice for my beverage dispenser. Ice cubes melt too fast, store bought ice is yucky tasting and is way too big. These are perfect, and I can use my own filtered water!!! YAY!
+You can tear away the container so getting it out is no issue.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I was a bit hesitant to buy these, after all, they are WOOD. But I LOVE them! They are much thicker than I thought they would be, so they are not  flimsy or thin, yet they are not bulky and heavy feeling, either. They feel perfect. They are also very beautiful with the natural carvings inside. I did not buy them for looks only, or even the beautiful art-y ness of them, but because I don't do plast<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I bought this juicer some time ago, when I was new to juicing. I really liked it then, but after much time, and really getting into some serious juicing, I have many problems with it.
+
+This is an OK juicer if you are dabbling in it for kicks, but for serious juicing for large amounts and getting the best bang for your buck, this is NOT the one.
+For one, there is SO MUCH loss of pulp and  getting i<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This DVD appears to be defective from whatever it was recorded from. It simply won't work. I have replaced it once and the replacement is also defective. Very disappointed as I got it for my Dad, in his 80s, who really wanted it.<|im_end|>
+<|im_start|>assistant
+1
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Not exactly what I was looking for, but there are a very few tips...too much trouble to return.<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I have a glass French Press which I really like and it was pretty inexpensive. I happened to look at "Today's Deals" and saw this on sale, so I bought it. I do like the look and feel. It seems nice and 'heavy' and for once, the plunger doesn't look like it ts going to fall apart as my other two glass ones did frequently. I had to keep screwing them back together...I've only used it once, but was v<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This is a nice grinder. It has a larger bowl so I only have to make 1 grind to fill my large coffee press, which I like. It takes a bit more grinding to get the beans done, though. guess its a trade off! I do like it. I wish it came in different colors, as I use one for coffee and one for herbs. I would buy again, if it came with different colors.
+I have used this for over a year now, and I really<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This is the second time Ive tried to get a tea cozy that will fit my large teapot. If this had ACTUALLY been 12 it would have fit! BUT it is only 11!!!! I am returning it.
+Im VERY disappointed!<|im_end|>
+<|im_start|>assistant
+1
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: So far, I like it. I like it better than the one everyone said leaked.....(I bought THAT one, and boy, DID it!!! Just dumped the entire water load right at the start!) So far, this one hasnt. I do like the swivel pad: lets you do more without changing pads, BUT: it makes it a bit difficult to operate. If there is sticky on floor, cant really maneuver well as it sticks and then wobbles due to desig<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I mix this with DandyBlend for a GREAT mocha. Usually I make it like a milkshake using my own homemade ice cream. You can get a much better price from the Natural News store, over $5. less.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I LOVE these leggings! I have a total of 13 pair, and recently discovered they sell them in this, Capri length, as well.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This was a great series. Too bad it cancelled after the first season.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: They work for what I want, but would like to be able to purchase extra metal and/or plastic lids. they are awfully thin, too.<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This is what it is, but in the pics is shows more as red. It is definitely ORANGE, which clashes with my kitchen color scheme. Im a bit of a perfectionist when it comes to matching/co-ordinating on things like this, which hopefully most of you aren't  ;-), and it really isn't a problem as it does what it is intended to do, and well, but for those of you like me..... it is NOT red, but ORANGE.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This is HUGE!!! That is the only real drawback as I had to ship and it cost alot. I have a similar one, and I should have looked at the dimensions, because mine is about the same size when open but also about half the size of this one when closed...Not sure how, but it is!<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I had read about these, and bought this, but they are not as great as I thought they would be. the bark peels off with difficulty, they don't feather out like I feel they should, making them uncomfortable to brush with. I suppose in an emergency, they will do, but hoped for more.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Nice book covering many areas of self sufficiency. It has some great recipes. A bit basic, but it is a good read with lots of heart, character and information. Id buy it to give as a gift.<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I like this, but as other comments have said, the part that juices could be a bit more sharp in order to juice rather than maul the fruit. It does the job, however, and so im satisfied with it. the bowl does seem to hold a good amount of juice, but if you're doing more than two or three large fruits (oranges or grapefruit) it could be tiresome emptying it so frequently.<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: These are a bit shorter than I would have liked. the size was readily available, but I just thought they would work. They are ok, just a bit short.
+They do look beautiful.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: LOVE this brand of bakewear as it isn't toxic like Teflon. Unfortunately, this won't fit my small countertop oven (which I'm forced to use instead of a large oven at this time) like the mini muffin pan I just bought. I still love it!!!<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This won't fit in ANYTHING in order to use. It is tapered, so the bottom (fat part) won't fit in any jar or container, and the cardboard won't come out in order to make it fit! There isn't any reason this couldn't have been wound on a tube rather than a cone shape so it would fit into something in order to use and cut!!! I wanted to use an antique wall mount holder for this, but it just won't work<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: These are pretty standard, but the stamping for the measurement size is almost unreadable. I don't know why they didn't use more pressure and put the stamp in so you could actually READ it, but it is so faint that youll just have to guess most of the time. I don't think I would buy these again.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: No inside measure, so I guess fill to the brim....awkward!
+Otherwise these look nice. I like some other designs better.
+Ill give these as a gift!!!<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I liked the idea of a spigot rather than just plastic or rubber tubing ...but didn't really think it through: this means that you need a place to put the container for the finished juice that is LOWER than the spigot!!! Not easy on a stove. I guess you could remove the entire thing and find a table and put it on a chair or something, but this is a tricky solution at best. I would most likely not g<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I love these! They are used for taking old bottles and re purposing them for bath concoctions like my homemade hair rinse, and hair conditioner. One did come apart, though, but for the price, they are nice and they work<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Never made espresso like this. Have heard it is THE way to do, though. It is small for my stove burner.....that is a small issue, and it makes a VERY tiny cup....but that is normal. It tasted really good!
+LOVE that it is SS, not aluminum<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I wrote a review earlier, but wanted to give better feedback regarding these.
+I love that they are organic material. I think they have good coverage, comparable to other, regular, leggings.
+My main complaint has to do with what they are regarding as their best feature: the waist.
+I hate it!!! Maybe if I had a perfectly flat stomach, they MIGHT be a better fit, but I doubt it.
+They simply WONT stay<|im_end|>
+<|im_start|>assistant
+1
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This is EXACTLY what I wanted! It is all stainless steel, no plastic touches your beverage or lips. It is lightweight, but has kept my coffee at the perfect temp! I even had to open it up for awhile for it to cool to my preferred temperature, but once there, has held it a long time. I tend to drink slowly at work and usually by the second hour, my coffee has been cold. Not so with this! I have lef<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Not at all what I wanted. I KNOW what the sayings mean, I wanted a REASON where it originated: Did someone REALLY "kick the bucket" when they died??? Etc. Will give it to Goodwill. OLUS, the ONE saying aI actually bought it for (Cup of Joe) wasn't included.<|im_end|>
+<|im_start|>assistant
+1
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I only bought two, but should have bought more. I don't like returning things, so clothing only gets a one or two purchase until I know it will fit. These went to double the price right after I bought them, and now they are SO expensive!!! Should have bought more! Oh, and colors are much more spendy, too.....AND they don't have all sizes in all colors.....I do love them, but won't pay extortion pr<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Awfully small ....thought it would be larger, and have more on it. Love that it is organic, as cotton has so much toxic chemicals sprayed on it from seed to final product. I want to be chemical free using this for food.<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This works SO much better than a recommended similar spiral cutter which is flat. THAT one, you need three hands to use. This one, only two, which is great, cause I only have two!!! I love spiraling my potatoes for breakfast hashbrowns. Thats mostly what I do with it, but Im certain that it will do much more. Eventually Ill get around to doing more with it, but for now I like the spiral hashbrowns<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: These pans are very nice, and they have some weight to them so they don't seem too flimsy. The only improvement I could see is if they didn't have the feet so they could stack and take up less space. Space is a premium in my kitchen, and because they have the pop out silicon, they won't stack at all.<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: It's OK, but nothing special. You can cut it to fit a more rounded soap holder. The soap sticks to it is my main complaint.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I like this book, despite it being a bit different than what I expected. This book actually describes actual commercial products that she has used for her own family. There is one remedy that is homemade, but most are available to purchase through several different sellers. I do feel that the basic principle for which I purchased this book will definitely be usable. It gives me a good list of what<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Bowls are pretty shallow. Theyre ok, and they do look nice, but Im not impressed. I noted another issue with these: they put stickers on the backs!!! That leave a sticky reside that I cant get off! That makes ANYTHING I use these for to scoop with particles of the product on it!!! WHY!!!!!<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Wish they would put actual measure on these, they turned out way too small. Ill use them, but wanted a larger size.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This is perfect for what I needed. I needed a large mouth but small funnel for filling bottles. The canning ones are the right mouth, but the huge funnel was too big to fill them with. This is perfect! I wish they had one in a ceramic, too. Some of my concoctions require I don't use metal.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This set is just perfect for my kitchen. All the utensils are single piece, meaning that hygiene and cleaning will be a snap as there are NO seams for food to get stuck in and they won't come apart! I actually just needed the pastry brush, and bought that separate, but then saw this set and just had to have it! I am constantly using the whisk, and always need the scrapers. I bought stainless steel<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This is a very nice, heavy item. It looks great, comes with 8 hooks like the ones in the photo. They are wider that you would imagine, you can see that in the ones that are straight in front.
+
+I am very pleased with it.
+
+I would advise: make SURE you have the backing in your wall to hang this. It is VERY heavy, and if you want to hang cast iron pots like me, you will require very good backing in y<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This is ok. The crimping on the back of the pan is not well done, so there will always be moisture there....Normally, what I call "fake booger" glue is easy to remove, bu this was super sticky and it required lots of work to remove, not a real issue, but I want to be clear on the problems. I'm sure the pan will function fine, but the crimping on the back of the pan is a bit of a problem for me.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: These are great! The ONLY thing I would complain about is the fact that all of this style have the same issue: ALL DIFFERENT COLORS! For someone like me, I really, REALLY like to co-ordinate or match! These are the entire color wheel. Not a problematic issue, just an appearance one.
+They are easy to handle and use. Oh...one other tiny issue: they are definitely made for righties, NOT lefties as th<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Nor exactly what I thought it would be, but there is some useful information, just not as much as I would have liked. It is more of a diary of STUDIES of Vermont medical history<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Misleading title. This is for a CERAMIC CROCK. It ISNT A CERAMIC  lever faucet! VERY misleading!!! It is PLASTIC, the same thing I was trying to get away from!<|im_end|>
+<|im_start|>assistant
+1
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Saw the live show in Vegas and wanted the music, but this was nowhere close to the feeling I got while watching the show. Guess you cant really reproduce that, but I had hoped! This isn't just the music, which I had hoped it was, but the ENTIRE show, script talk and all. Not really what I wanted.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This is just plain common sense. I am a bit disappointed that it didn't have actual medical secrets that are other than these. I would not buy this again, and wouldn't recommend it to someone else if they have the least amount of common sense.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Another great Geena Davis movie. Had it on video, upgrading to blu ray DVD.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Almost the exact same as I already have (Herbal Antibiotics) from same author. Even LOOKS identical with slight variation of title. Oh well, I can give it away.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: At first, I didn't like the appearance of this book. It looked like a homemade, self absorbed author book. Well, I should heed the don't judge a book by its cover!!! I opened it looking for specific information and got something I have been looking for in one shot! That is: what supplements, vitamins, minerals and enzymes should/should not be taken together!!! This is an amazing book, full of real<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Just what I wanted! I use a pastry brush to coat my cast iron. I had a wooden/hair one, but noticed it often left brush hair on the skillets. This is just right! The brush hairs are very soft and pliable, and do the job perfectly. AND they are the red I have in my kitchen!<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: These are great soap dispensers. They are attractive, easy to handle, fill and use. They have the fill-lines to make filling simple and easy, yet they don't show. Several colors to make it nice for different colored bath/kitchen use, which I do love!
+I bought three, two for gifts and one for myself. One came with a small piece missing from the spout so I kept it for my bathroom, and it works great<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: NOT a cereal lover,(actually, NEVER eat cold cereal!) but bought this for a specific recipe: the recipe is GREAT!!!! I have added it to my list again, as I plan to make the recipe a LOT!
+Recipe :
+CHOCOLATE PEANUT POWER BALLS
+from Strength and Sunshine<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: My mom is an Owl collector, and we both love tea! Perfect gift!!! Slightly mismatched color scheme, but they are very nice and my mom loves them!<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This company is pretty great. I had serious issues about buying food from Japan (Fukushima) they sent docs  (although the company was blocked out) to show it is clean. So far, I have used it sporadically in a coffee smoothie, the taste is not noticeable, but the smoothie is good! I haven't gotten around to drinking it straight. Just no time! Perhaps this winter I will. I would buy from them again,<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Informative and nicely laid out. Easy to find what you're looking for. Id buy again for a gift.<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Gave my first pair of these to my daughter who was cutting herself every time she used a knife!!!
+So I had to replace them for myself!<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: These work great! I took the advice of another comment, and made sure I oiled the inside of the ring. It did seep a bit, but that was only because I put the egg in before the skillet was quite hot enough. They seem heavy enough to withstand the use, and they do look nice. I hang them with my potholders next to the stove for quick use. I LOVE that they can be folded up for storage anywhere PERFECT <|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This teapot looks amazing. It is beautiful. HOWEVER. It dribbles horribly, and makes a mess wherever you are pouring it, and as for 'whistling', technically it does, but it is SO FAINT that I can barely hear it. I got this because I boiled a pan dry several times, and my older teapot just wore out. Now THAT teapot WHISTLED!! I can still use this one, but except for it's beauty, I really don't like<|im_end|>
+<|im_start|>assistant
+1
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This is rather large, and won't fit the small mailbox, it has to be the middle size or larger. Purchased, but VERY tight in metal mid-size box.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This is such a fun game! Probably more for the younger kids. Im 60 and I, my daughter and 15 YO grandson played this and it was so much fun! It doesnt take as long as regular monopoly which is nice, too. Monopoly can sometimes take forever! I wish Minions had more board games. And I wish they offered more of the minions on the sides of the box for purchase for this game, too.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: While the title of this item says DELUXE pandemic Flu Kit, the actual package, (and the photo) both say STANDARD Pandemic Flu kit. The title leads you to believe that you are getting a deluxe edition (ie: something MORE than just standard) when in actuality, you are just getting plain old standard.
+The items listed were accurate. Guess Im just objecting to the lead of deluxe and then getting stand<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Well, this would be GREAT IF it hadn't scratched just sitting on my visor! Apparently, DUST makes it scratch. And once it is scratched, it won't work. Try SEEING through it then! Waste of money, and I won't be buying again. Pity, since I drive due EAST early in the AM and due WEST late in the PM. I need something like this<|im_end|>
+<|im_start|>assistant
+1
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I liked this movie. I didn't watch the theatrical version but rather the extended version and thought it was very good. I have read reviews that said Kristin Stewart was horrible, and that Chris Hemsworth wasn't much better. Although not a Stewart fan for many reasons, I thought her portrayal of her character was very well done. Except for riding to battle in armor in which she looked cold and unc<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I received this boric acid, purchased to make an eye wash solution after several weeks. It was NOT medicinal grade, and even said right on the bottle:Do not use in the eyes or allow to remain on skin. (The photo was very different, also, indicating a different product) I am upset , and plan to return it as it was not as described. Make SURE if you are using boric acid powder for any eye care solut<|im_end|>
+<|im_start|>assistant
+1
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I wish I had NOT bought this set of spatulas. They are NOT one piece, but rather spliced together. Where they fit together, food gets trapped and yucky. It is not sanitary, and it is gross. The small and medium ones are the only usable ones, the large one is so large, it won't fit any containers.
+I have two spatulas that are silicon, they are one single piece, and they work so much better than thi<|im_end|>
+<|im_start|>assistant
+1
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I dislike "one size fits all" because the NEVER do, especially larger women, and I fear these will shrink. I do like the bold print, and plan to get a few more of the different prints. Just wish they offered a small-medium and a Large size option.<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I like these, and I hate these!
+The look and feel is awesome! They are SO soft and look nice on....that is, if you like feeling naked as EVERY bit of skin is visible...they are  SO see-through!!!
+They don't hang in the crotch like so many other brands, and fit well there, so they are nice that way, but they do tend to ride up from the bottom, so if you're wearing short sox, and leave with them hid<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: LOVE these! I plan to use them as shaker tops for my herbs! I plan to get more of the patterned tops for other projects.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Corks are too large, they don't fit ANY bottles I have...no vinegar bottles, no wine bottles, no similar bottles at all. They ALMOST fit the 25 oz California Olive Ranch oil bottles, but don't go very far. I'm returning these. Not sure exactly WHAT they'll fit, but unless you have a VERY WIDE opening, don't expect them to fit.<|im_end|>
+<|im_start|>assistant
+1
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: The bottle still smells after several washings. I am not sure if I can get used to this smell....not really chemical, but unpleasant, and since you have to put your nose up to the plastic, there is no way to get around it. Also, be CAREFUL. It leaked on me today as the sippy place is only plugged by a push down top. It can get pulled up pretty easily. I would have liked a larger one, but this colo<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This is ok, and it should work as expected, but it is a VERY thin product. Maybe that is because it is taller than most of the other silicon baking products that I have which seem to be much sturdier, but this one feels like the batter, if thick, will force it into a different shape when baking, and make them not round, but more oval...
+Just be aware it is very thin silicon.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: These are ok, but I wish I hadn't had to buy 12 to get what I wanted!!! As someone else mentioned, they aren't totally stable, and do wobble when placed on a porcelain sink. I actually bought them for ONE square pillar candle I got as a gift, with a crystal inside for a neat effect. NOW I can burn it! And figure out what to do with the other 11...May use them for a decoupage gift idea....or add co<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: While I realize that natural food coloring is much less brilliant and colorful, these were really not very good at all! The blue was almost the exact same color as the red which was faint pink...but I knew that it would be a pink color going in. I DID want a blue color, which I did NOT get. It appeared blue in the bottle, but when mixed, was, as I mentioned, the same pink as the red. So...no chanc<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I read on the box that these should burn for 4 hours. I really didn't believe it, so I tried one just to see....well, it burned for OVER 4 hours! Not sure how much more, but it did burn for 4 hours. It burned all away, too, so there is no reside at all...no wax just a clean tin container . I will definitely be buying more of these!<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: While the diameter of these bras are a bit small, I really like how they fit. The are SO comfy! I'm buying more as styles always get discontinued and then you can't find what you really like. I bought the beige and the black. Will be buying several more.<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Perfect for what I need! These will fit perfectly in mason jars for fermentins, and also in jars for when I make infused oils with my herbs to keep them submerged.<|im_end|>
+<|im_start|>assistant
+5
