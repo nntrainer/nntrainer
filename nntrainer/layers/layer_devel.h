@@ -31,6 +31,7 @@
 #include <common.h>
 #include <cpu_backend.h>
 #include <layer_context.h>
+#include <quantizer.h>
 #include <tensor_dim.h>
 
 namespace ml::train {
@@ -353,6 +354,21 @@ public:
   virtual bool supportBackwarding() const = 0;
 
   /**
+   * @brief  check whether this layer indexes one of its weights by ROW
+   * @note   A per-channel-quantized record such as QS4CX carries one scale per
+   * COLUMN of the weight, because every consumer of it -- the GEMMs and the
+   * packers alike -- reads a column as an output channel. A layer that instead
+   * slices a whole ROW out of its weight (a lookup table indexed by token id,
+   * say) pools unrelated rows into one scale when it is quantized on the column
+   * axis, and nothing in the record says which axis it was quantized on, so it
+   * reads back as noise rather than as an error. Layers whose weight is used
+   * that way answer true here and save() refuses to quantize them; it is a
+   * property of how a layer uses its weight, not of its name.
+   * @return true if a weight of this layer is indexed by row, else false
+   */
+  virtual bool hasRowIndexedWeight() const { return false; }
+
+  /**
    * @brief     save layer Weight & Bias data from file
    * @param file output file stream
    * @param run_context run context for the layer
@@ -424,25 +440,42 @@ public:
               NNTR_THROW_IF(weight.getDataType() != TensorDim::DataType::FP32,
                             std::runtime_error)
                 << "Save with quantization only supports for FP32 weight.";
-              ///@note The codelines below can be replaced with quantizer's
-              /// quantize()
               TensorDim dim = weight.getDim();
-              size_t K = dim.height();
-              size_t N = dim.width();
-              Tensor weight_t = weight.transpose("0:2:1");
 
-              size_t q_size = N * ((K + 1) / 2);
-              size_t scale_size = N * sizeof(float);
-
-              // allocate packed size, not an unpacked size
-              std::vector<uint8_t> rhs_q(q_size + scale_size);
-              uint8_t *data = rhs_q.data();
-
-              uint8_t *scale = data + q_size;
-
-              nntrainer::quant_qs4cx_f32(N, K, weight_t.getData(), data, scale,
-                                         true);
-              file.write((const char *)data, q_size + scale_size);
+              // Skip quantization for bias-like tensors (1D with height == 1),
+              // as the Q4_0 branch above does. The reason here is not the
+              // block size but the reader: a layer that quantizes its weight
+              // requests its bias as FP32 (see FullyConnectedLayer::finalize),
+              // so an FP32 bias is exactly what load() goes on to read.
+              // Quantizing it would write a nibbles + scales record where the
+              // reader expects N floats. NeuralNetwork::save() mirrors this
+              // policy in resolveStoredDtype() when it sizes the same records
+              // for a safetensors header, so the two must agree.
+              if (dim.height() == 1) {
+                weight.save(file);
+              } else {
+                // QS4CX keeps one scale per width(): the record's N is the
+                // weight's width and every consumer of it -- the GEMMs and
+                // the packers alike -- reads a column as an output channel.
+                // A weight its own layer indexes by ROW instead needs a scale
+                // per height(), and an embedding LUT is exactly that: the
+                // forward pass slices row `token id` out of it. Quantizing it
+                // on the width axis pools unrelated vocabulary entries into
+                // one scale, and nothing in the record says which axis it was
+                // quantized on, so it reads back as noise rather than as an
+                // error. Refuse it here; a LUT would have to reach the
+                // quantizer transposed, which needs a reader that knows to
+                // transpose it back. The layer answers for itself -- see
+                // hasRowIndexedWeight() -- rather than being named here, so an
+                // out-of-tree LUT layer can opt in too.
+                NNTR_THROW_IF(hasRowIndexedWeight(), std::runtime_error)
+                  << "[Layer::save] cannot quantize '" << getType()
+                  << "' to QS4CX: its weight is a lookup table indexed by row, "
+                     "and QS4CX carries one scale per column";
+                Quantization::createQuantizer(QScheme::QS4CX)
+                  ->quantize(weight, dtype)
+                  .save(file);
+              }
             } else {
               NNTR_THROW_IF(true, std::runtime_error)
                 << "This dtype is not supported in save with quantization";

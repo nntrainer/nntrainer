@@ -13,9 +13,11 @@
 
 #include "nntrainer_test_util.h"
 #include "util_func.h"
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <nntrainer_error.h>
+#include <quantizer.h>
 #include <tensor.h>
 #include <tensor_dim.h>
 
@@ -6345,6 +6347,157 @@ TEST(nntrainer_Tensor, is_valid_03) {
   input.setValue(0, 0, 0, 0, -std::numeric_limits<float>::infinity());
 
   EXPECT_EQ(input.isValid(), false);
+}
+
+/**
+ * @brief An FP32 weight whose output channels differ in magnitude, so a
+ *        per-channel scale read at the wrong channel shows up as an error.
+ */
+static nntrainer::Tensor qs4cxDotWeight(unsigned int K, unsigned int N) {
+  nntrainer::Tensor w(1, 1, K, N);
+  for (unsigned int n = 0; n < N; ++n) {
+    const float amp = 0.25f * static_cast<float>(n + 1);
+    for (unsigned int k = 0; k < K; ++k)
+      w.setValue(
+        0, 0, k, n,
+        amp * std::sin(1.7f * static_cast<float>(k) + static_cast<float>(n)));
+  }
+  return w;
+}
+
+/**
+ * @brief An FP16 activation times a QS4CX weight agrees with the same product
+ *        taken in FP32 from the same record.
+ *
+ * The QS4CX record has exactly one plain nibble layout in this tree -- the one
+ * quant_qs4cx_f32() writes: N rows of ceil(K/2) bytes, row-major [N, K], even
+ * k in the low nibble, each stored uint4 being int4 + 8. Nothing in the record
+ * names it, so the only thing keeping a consumer honest is a round trip
+ * through a second, independent reader. Here the reference is the dequantizer
+ * reading the very bytes the fp16 GEMM reads; a consumer that walked the
+ * record on any other axis, nibble order, or sign encoding would come back
+ * with an unrelated product rather than a slightly rounded one.
+ */
+TEST(nntrainer_Tensor, dot_qs4cx_fp16_activation_p) {
+  const unsigned int M = 3;
+  const unsigned int K = 16;
+  const unsigned int N = 8;
+
+  nntrainer::Tensor w = qs4cxDotWeight(K, N);
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  nntrainer::Tensor q = quantizer->quantize(w, nntrainer::Tdatatype::QS4CX);
+  ASSERT_EQ(q.getDataType(), nntrainer::Tdatatype::QS4CX);
+  nntrainer::Tensor w_deq =
+    quantizer->dequantize(q, nntrainer::Tdatatype::FP32);
+
+  // activations in [0, 1]: an fp16 lhs and the int8 lhs the Arm micro-kernel
+  // quantizes it to are then both a fraction of a step away from the value
+  // this reference uses
+  nntrainer::Tensor a_fp32(1, 1, M, K);
+  nntrainer::Tensor a_fp16(
+    {1, 1, M, K, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16}}, true);
+  for (unsigned int m = 0; m < M; ++m) {
+    for (unsigned int k = 0; k < K; ++k) {
+      const float v = 0.5f + 0.5f * std::sin(0.9f * static_cast<float>(k) +
+                                             2.3f * static_cast<float>(m));
+      a_fp32.setValue(0, 0, m, k, v);
+      a_fp16.setValue(0, 0, m, k, v);
+    }
+  }
+
+  nntrainer::Tensor ref = a_fp32.dot(w_deq);
+  ASSERT_EQ(ref.height(), M);
+  ASSERT_EQ(ref.width(), N);
+
+  nntrainer::Tensor out(
+    {1, 1, M, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16}}, true);
+  out.setZero();
+  a_fp16.dot(q, out, false, false, 0.0f);
+
+  float peak = 0.0f;
+  for (unsigned int m = 0; m < M; ++m)
+    for (unsigned int n = 0; n < N; ++n)
+      peak = std::max(peak, std::fabs(ref.getValue(0, 0, m, n)));
+  // a product that came out all zeros would pass every bound below
+  ASSERT_GT(peak, 0.5f);
+
+  for (unsigned int m = 0; m < M; ++m) {
+    for (unsigned int n = 0; n < N; ++n) {
+      const float want = ref.getValue(0, 0, m, n);
+      const float got = static_cast<float>(out.getValue<_FP16>(0, 0, m, n));
+      EXPECT_NEAR(got, want, 0.02f + 0.05f * std::fabs(want))
+        << " at m=" << m << ", n=" << n;
+    }
+  }
+}
+
+/**
+ * @brief beta scales what the output already holds instead of being dropped
+ */
+TEST(nntrainer_Tensor, dot_qs4cx_fp16_activation_beta_p) {
+  const unsigned int M = 2;
+  const unsigned int K = 16;
+  const unsigned int N = 8;
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  nntrainer::Tensor q =
+    quantizer->quantize(qs4cxDotWeight(K, N), nntrainer::Tdatatype::QS4CX);
+
+  nntrainer::Tensor a(
+    {1, 1, M, K, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16}}, true);
+  for (unsigned int m = 0; m < M; ++m)
+    for (unsigned int k = 0; k < K; ++k)
+      a.setValue(0, 0, m, k,
+                 0.5f + 0.5f * std::sin(0.9f * static_cast<float>(k) +
+                                        2.3f * static_cast<float>(m)));
+
+  nntrainer::Tensor plain(
+    {1, 1, M, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16}}, true);
+  plain.setZero();
+  a.dot(q, plain, false, false, 0.0f);
+
+  nntrainer::Tensor accumulated(
+    {1, 1, M, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16}}, true);
+  for (unsigned int m = 0; m < M; ++m)
+    for (unsigned int n = 0; n < N; ++n)
+      accumulated.setValue(0, 0, m, n, 1.0f);
+  a.dot(q, accumulated, false, false, 1.0f);
+
+  for (unsigned int m = 0; m < M; ++m) {
+    for (unsigned int n = 0; n < N; ++n) {
+      const float base = static_cast<float>(plain.getValue<_FP16>(0, 0, m, n));
+      const float got =
+        static_cast<float>(accumulated.getValue<_FP16>(0, 0, m, n));
+      EXPECT_NEAR(got, base + 1.0f, 0.02f + 0.01f * std::fabs(base))
+        << " at m=" << m << ", n=" << n;
+    }
+  }
+}
+
+/**
+ * @brief a QS4CX weight has no transposed form to ask for
+ */
+TEST(nntrainer_Tensor, dot_qs4cx_fp16_activation_trans_n) {
+  const unsigned int M = 2;
+  const unsigned int K = 16;
+  const unsigned int N = 8;
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::QS4CX);
+  nntrainer::Tensor q =
+    quantizer->quantize(qs4cxDotWeight(K, N), nntrainer::Tdatatype::QS4CX);
+
+  nntrainer::Tensor a(
+    {1, 1, M, K, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16}}, true);
+  a.setZero();
+  nntrainer::Tensor out(
+    {1, 1, M, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16}}, true);
+  out.setZero();
+
+  EXPECT_THROW(a.dot(q, out, false, true, 0.0f), std::invalid_argument);
 }
 
 GTEST_API_ int main(int argc, char **argv) {

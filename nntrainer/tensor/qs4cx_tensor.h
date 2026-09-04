@@ -12,6 +12,8 @@
 #define __QS4CX_TENSOR_H__
 #ifdef __cplusplus
 
+#include <atomic>
+
 #include <quantizer.h>
 #include <tensor_base.h>
 
@@ -188,6 +190,36 @@ public:
   }
 
   /**
+   * @brief Bytes of the nibble payload of one QS4CX record, i.e. the offset of
+   *        the per-channel fp32 scales inside it.
+   * @param K input channels (height)
+   * @param N output channels (width), one fp32 scale each
+   * @param padded true for the padded layout `N * (K + 1) / 2`, false for the
+   *        trimmed one `N * ((K + 1) / 2)`. The nibbles themselves are the
+   *        same N rows of ceil(K/2) bytes either way; the padded layout adds
+   *        floor(N/2) unused bytes before the scales when K is even (the two
+   *        expressions coincide for odd K).
+   * @return offset of the scales in bytes
+   */
+  static size_t nibbleBytes(size_t K, size_t N, bool padded) {
+    return padded ? N * (K + 1) / 2 : N * ((K + 1) / 2);
+  }
+
+  /**
+   * @brief Bytes of one whole QS4CX record: nibble payload + N fp32 scales.
+   *        This is both the on-disk record stride and the buffer this tensor
+   *        needs, so NeuralNetwork::load() can size a record it has not built
+   *        a tensor for yet.
+   * @param K input channels (height)
+   * @param N output channels (width)
+   * @param padded see nibbleBytes()
+   * @return record size in bytes
+   */
+  static size_t recordBytes(size_t K, size_t N, bool padded) {
+    return nibbleBytes(K, N, padded) + N * sizeof(float);
+  }
+
+  /**
    * @copydoc TensorBase::size()
    */
   size_t size() const override;
@@ -214,6 +246,52 @@ public:
    */
   void pack() override;
 
+  /**
+   * @brief Eagerly build the fp16-activation KAI rhs after loading
+   * @note Byte-identical to the buffer HalfTensor::dot's QS4CX case assembles
+   * lazily on its first call (plain -> Section A -> fp16 scales ->
+   * assembleKaiRhsPacked), so this only moves WHEN it is built. The layout is
+   * NOT interchangeable with pack()'s fp32-facade rhs; repack_weight() picks
+   * one of the two by the model's activation dtype. ARM-only (no-op
+   * elsewhere, mirroring pack()'s NYI behavior on x86).
+   */
+  void packF16Activation() override;
+
+  /**
+   * @copydoc TensorBase::isPackedF16Activation()
+   */
+  bool isPackedF16Activation() const override {
+    return packed_f16.load(std::memory_order_acquire) && packed_data != nullptr;
+  }
+
+  /**
+   * @copydoc TensorBase::isPacked()
+   * @note packed_data holds either pack()'s fp32-activation rhs or
+   * packF16Activation()'s fp16-scale rhs, and the two layouts are not
+   * interchangeable, so the fp16 one must not be reported here.
+   */
+  bool isPacked() const override {
+    return !packed_f16.load(std::memory_order_acquire) &&
+           packed_data != nullptr;
+  }
+
+  /**
+   * @copydoc Tensor::read(std::ifstream &file, size_t, bool)
+   * @note When this tensor is flagged on-disk-legacy-QINT4
+   *   (setOnDiskLegacyQint4), the record is a legacy QINT4 (u16 header + KAI
+   *   Section A / plain container) and is transcoded losslessly to the QS4CX
+   *   in-memory layout via Int4Utils::readLegacyQint4RecordToQs4cx; otherwise a
+   *   plain TensorBase::read.
+   */
+  void read(std::ifstream &file, size_t start_offset = 0,
+            bool read_from_offset = false) override;
+
+  /**
+   * @copydoc Tensor::read(ReadSource, size_t, bool)
+   */
+  void read(ReadSource src, size_t start_offset = 0,
+            bool read_from_offset = false) override;
+
 private:
   /**
    * @brief copy a buffer to @a this, the caller has to ensure that @a this is
@@ -235,6 +313,16 @@ private:
   bool isValid() const override { return true; }
 
   std::unique_ptr<uint8_t[]> packed_data = nullptr;
+  /**
+   * @brief packed_data holds the fp16-activation KAI rhs (packF16Activation),
+   * not pack()'s fp32 layout
+   * @note Atomic because HalfTensor::dot's QS4CX case reads it outside the lock
+   * that serialises the lazy fill (a double-checked lock). packF16Activation()
+   * publishes it with release AFTER filling packed_data, and
+   * isPackedF16Activation() acquires it before looking at packed_data, so a
+   * thread that sees the flag set also sees the buffer it names.
+   */
+  std::atomic<bool> packed_f16 = {false};
 };
 
 } // namespace nntrainer

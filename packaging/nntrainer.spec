@@ -583,7 +583,6 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/q4_0_tensor.h
 %{_includedir}/nntrainer/q4_0_utils.h
 %{_includedir}/nntrainer/qs4cx_tensor.h
-%{_includedir}/nntrainer/int4_tensor.h
 %{_includedir}/nntrainer/int4_utils.h
 %{_includedir}/nntrainer/uint4_tensor.h
 %{_includedir}/nntrainer/char_tensor.h

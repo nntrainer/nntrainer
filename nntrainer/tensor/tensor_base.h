@@ -143,6 +143,11 @@ public:
     file_offset = rhs.file_offset;
     src_tensor = rhs.src_tensor;
     ct_data_ = rhs.ct_data_;
+    // Carried because it describes the LAYOUT of the buffer being shared here,
+    // not a read-time intention: a QS4CX copy that fell back to the default
+    // stride would read the per-channel scales out of the middle of the
+    // nibbles. @see setQs4cxRecordPadded
+    qs4cx_record_padded_ = rhs.qs4cx_record_padded_;
   }
 
   /**
@@ -258,6 +263,29 @@ public:
    * require packing
    */
   virtual void pack() {}
+
+  /**
+   * @brief Pack the weight data eagerly for the fp16-activation KAI path
+   * @note Default implementation does nothing. QS4CX overrides this to build
+   * the fp16-scale KAI rhs consumed by HalfTensor::dot — a different byte
+   * layout than pack(), which builds the fp32-activation facade's rhs.
+   */
+  virtual void packF16Activation() {}
+
+  /**
+   * @brief Whether packF16Activation() has produced a packed buffer
+   */
+  virtual bool isPackedF16Activation() const { return false; }
+
+  /**
+   * @brief Whether pack() has produced a buffer the fp32-activation GEMM can
+   * consume
+   * @note Lets a kernel choose the pre-packed entry point when the weight was
+   * packed after load and the pack-on-the-fly one when it was not, rather than
+   * requiring every caller to have run pack() first. The default is false
+   * because the default getPackedData() hands back the plain data.
+   */
+  virtual bool isPacked() const { return false; }
 
   /**
    * @brief     i data index
@@ -685,6 +713,50 @@ public:
   void setFileOffset(size_t off);
 
   /**
+   * @brief Mark that this tensor's on-disk bytes are a legacy QINT4 record
+   *        (u16 qscheme header + KAI Section A / plain container) that must be
+   *        transcoded losslessly to the canonical QS4CX in-memory layout on
+   *        read.
+   * @note  A record carries no version, so nothing in the bytes tells a
+   *        legacy record from a canonical one. NeuralNetwork::load() sets
+   *        this from the model's own declared type: a "QINT4-*"
+   *        model_tensor_type package whose weights are built as QS4CX holds
+   *        legacy records by construction. A package that declares QS4CX
+   *        keeps the canonical branch. The flag stays public so an
+   *        exporter-aware tool can set it directly, which is also how the
+   *        cpu_backend unit test reaches the legacy branch.
+   */
+  void setOnDiskLegacyQint4(bool v) { on_disk_legacy_qint4_ = v; }
+
+  /**
+   * @brief Whether this tensor's on-disk bytes are a legacy QINT4 record.
+   */
+  bool isOnDiskLegacyQint4() const { return on_disk_legacy_qint4_; }
+
+  /**
+   * @brief Select which of the two QS4CX record layouts this tensor uses:
+   *        padded (nibbles + floor(N/2) pad + fp32 scales) when true, trimmed
+   *        (nibbles + fp32 scales) when false. The two differ only for even K,
+   *        because the padded offset expression N * (K + 1) / 2 is evaluated
+   *        left to right. It picks the stride at which QS4CX_Tensor::size()
+   *        and getScale() place the scales, so it must be set before the
+   *        record is read. No effect on any other tensor type.
+   * @note  NeuralNetwork::load() sets this per weight FILE. Nothing in the
+   *        file names its stride, so load() lays every record out at the
+   *        padded stride first and re-walks at the trimmed one only when the
+   *        file size fits the trimmed total and not the padded one. The
+   *        default is padded because padded is never the SMALLER of the two,
+   *        so an unresolved default can only over-size a record, never shift
+   *        the ones after it.
+   */
+  void setQs4cxRecordPadded(bool v) { qs4cx_record_padded_ = v; }
+
+  /**
+   * @brief Whether this tensor uses the padded QS4CX record layout.
+   */
+  bool isQs4cxRecordPadded() const { return qs4cx_record_padded_; }
+
+  /**
    * @brief     set Tensor Dim
    * @param[in] d TensorDim
    * @note      Throws std::invalid_argument if size mismatch
@@ -912,6 +984,16 @@ protected:
   std::shared_ptr<ContextData> ct_data_; /**< per-Context dispatch table */
   size_t offset;
   size_t file_offset; /**< offset of the tensor in the file */
+  bool on_disk_legacy_qint4_ =
+    false; /**< on-disk bytes are a legacy QINT4 record to transcode to QS4CX */
+  bool qs4cx_record_padded_ =
+    true; /**< QS4CX record keeps the padded stride (see
+             setQs4cxRecordPadded). Padded is the default because it is never
+             the SMALLER of the two strides: NeuralNetwork::load() starts its
+             record walk here and re-walks with the trimmed stride only once
+             the file size proves the file is trimmed, so an unresolved
+             default can never under-size a record and shift every later
+             weight's offset. */
 
   /**<
    * When using shared_data with tensor, this stores the ptr of the source
