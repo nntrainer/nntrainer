@@ -18,13 +18,7 @@ message('arm_arch_opt : ' + arm_arch_opt)
 
 # arm_arch_opt != 'none' case for cross-compilation scenario
 if arch == 'aarch64' or arm_arch_opt != 'none'
-  if arm_arch_opt == 'armv9.2-a'
-    # SVE/SVE2 implementation for armv9.2-a
-    ggml_impl_interface_sources += 'nntr_ggml_impl_sve.cpp'
-  else
-    # NEON implementation (armv8.2-a, armv7l, or auto)
-    ggml_impl_interface_sources += 'nntr_ggml_impl_neon.cpp'
-  endif
+  ggml_impl_interface_sources += 'nntr_ggml_impl_neon.cpp'
 elif arch == 'x86_64' or arch == 'x86'
   # AVX/AVX2/AVX512 implementation for x86_64
   ggml_impl_interface_sources += 'nntr_ggml_impl_avx.cpp'

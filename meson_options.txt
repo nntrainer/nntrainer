@@ -94,6 +94,9 @@ option('causallm-tokenizer-lib', type: 'string', value: '',
 # ARM architecture options
 # Note: Tizen (GBS) builds do not use this option
 # armv7l is a Tizen-only target, so it is not listed here.
+# Note that armv9.2-a used to denote enabling sve kernels, but as of now
+# it only means enabling auto vectorization from compiler.
+# @todo extract each extension from `arm-arch` presets.
 option('arm-arch', type: 'combo',
        choices: ['none', 'armv8.2-a', 'armv9.2-a'],
        value: 'none',
