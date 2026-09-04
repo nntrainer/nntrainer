@@ -171,13 +171,13 @@ void ele_add(const unsigned int N, const float *X, const float *Y, float *Z,
 void ele_sub(const unsigned N, const float *X, const float *Y, float *Z,
              float alpha, float beta, unsigned int i_stride,
              unsigned int o_stride) {
-  __fallback_ele_sub(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  nntrainer::avx2::ele_sub(N, X, Y, Z, alpha, beta, i_stride, o_stride);
 }
 
 void ele_div(const unsigned N, const float *X, const float *Y, float *Z,
              float alpha, float beta, unsigned int i_stride,
              unsigned int o_stride) {
-  __fallback_ele_div(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  nntrainer::avx2::ele_div(N, X, Y, Z, alpha, beta, i_stride, o_stride);
 }
 
 void saxpy(const unsigned int N, const float alpha, const float *X,

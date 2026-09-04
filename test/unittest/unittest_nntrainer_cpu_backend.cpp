@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <chrono>
+#include <cmath>
 #include <iostream>
 using std::chrono::duration_cast;
 using std::chrono::high_resolution_clock;
@@ -446,6 +447,9 @@ TEST(nntrainer_cpu_backend_standalone, q4_0_repack_unpack_dequantize) {
   }
 }
 
+/**
+ * @brief test for gemm_q4_0
+ */
 float test_gemm_q4_0(const uint32_t M, const uint32_t K, const uint32_t N,
                      const float *weights, const float *activations,
                      std::vector<float> &ref_dst, bool print = false) {
@@ -492,6 +496,9 @@ float test_gemm_q4_0(const uint32_t M, const uint32_t K, const uint32_t N,
   return mean_squared_error;
 }
 
+/**
+ * @brief test for gemm_q4_K
+ */
 float test_gemm_q4_K(const uint32_t M, const uint32_t K, const uint32_t N,
                      const float *weights, const float *activations,
                      std::vector<float> &ref_dst, bool print = false) {
@@ -535,6 +542,9 @@ float test_gemm_q4_K(const uint32_t M, const uint32_t K, const uint32_t N,
   return mean_squared_error;
 }
 
+/**
+ * @brief test for gemm_q6_K
+ */
 float test_gemm_q6_K(const uint32_t M, const uint32_t K, const uint32_t N,
                      const float *weights, const float *activations,
                      std::vector<float> &ref_dst, bool print = false) {
@@ -572,6 +582,9 @@ float test_gemm_q6_K(const uint32_t M, const uint32_t K, const uint32_t N,
   return mean_squared_error;
 }
 
+/**
+ * @brief run quantization tests
+ */
 static void run_quant_test(const uint32_t M, const uint32_t K, const uint32_t N,
                            float &q4_0_mse, float &q4_k_mse, float &q6_k_mse,
                            bool print = false) {
@@ -668,6 +681,9 @@ TEST(nntrainer_cpu_backend_standalone, quant_GEMV_1x512x512) {
   ASSERT_LE(q6_k_mse, q4_k_mse);
 }
 
+/**
+ * @brief run vec dot tests
+ */
 static void run_vec_dot_test(const uint32_t K, bool print = false) {
   const int TEST_CNT = 20;
   nanoseconds ref_time = (nanoseconds)0;
@@ -738,6 +754,9 @@ TEST(nntrainer_cpu_backend_standalone, quant_q_6_K_DOT_10240) {
   run_vec_dot_test(K);
 }
 
+/**
+ * @brief run elementwise multiplication test (Z = X ⊙ alpha * Y + beta * Z)
+ */
 static void run_ele_mul_test(const unsigned int N, float alpha, float beta,
                              unsigned int i_stride, unsigned int o_stride,
                              bool print = false) {
@@ -778,7 +797,7 @@ static void run_ele_mul_test(const unsigned int N, float alpha, float beta,
       }
     }
 
-    auto mean_squared_error = compute_mse(1, N, Z_ref, Z, false);
+    auto mean_squared_error = compute_mse(1, N * o_stride, Z_ref, Z, false);
     ASSERT_LE(mean_squared_error, 0.00001f);
   }
 
@@ -818,6 +837,21 @@ TEST(nntrainer_cpu_backend_standalone, ele_mul_3072_istr_16_ostr_16) {
   run_ele_mul_test(N, alpha, beta, i_stride, o_stride);
 }
 
+TEST(nntrainer_cpu_backend_standalone, ele_mul_3072_alpha3_beta2_istr_0) {
+  run_ele_mul_test(3072, 3.f, 2.f, 0, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_mul_3072_alpha3_beta2_istr_1) {
+  run_ele_mul_test(3072, 3.f, 2.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_mul_3079_alpha3_beta2_tail) {
+  run_ele_mul_test(3079, 3.f, 2.f, 1, 1);
+}
+
+/**
+ * @brief run elementwise addition test (Z = X + alpha * Y + beta * Z)
+ */
 static void run_ele_add_test(const unsigned int N, float alpha, float beta,
                              unsigned int i_stride, unsigned int o_stride,
                              bool print = false) {
@@ -857,7 +891,7 @@ static void run_ele_add_test(const unsigned int N, float alpha, float beta,
         add_time += dt;
       }
     }
-    auto mean_squared_error = compute_mse(1, N, Z_ref, Z, false);
+    auto mean_squared_error = compute_mse(1, N * o_stride, Z_ref, Z, false);
     ASSERT_LE(mean_squared_error, 0.00001f);
   }
   if (print) {
@@ -894,6 +928,18 @@ TEST(nntrainer_cpu_backend_standalone, ele_add_3072_istr_16_ostrid_16) {
   const unsigned int i_stride = 16;
   const unsigned int o_stride = 16;
   run_ele_add_test(N, alpha, beta, i_stride, o_stride);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_add_3072_alpha3_beta2_istr_0) {
+  run_ele_add_test(3072, 3.f, 2.f, 0, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_add_3072_alpha3_beta2_istr_1) {
+  run_ele_add_test(3072, 3.f, 2.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_add_3079_alpha3_beta2_tail) {
+  run_ele_add_test(3079, 3.f, 2.f, 1, 1);
 }
 
 TEST(nntrainer_cpu_backend_standalone, softmax_row_inplace) {
@@ -1129,6 +1175,219 @@ TEST(nntrainer_cpu_backend_standalone, compute_fp16vcache_fp32_transposed) {
   for (size_t i = 0; i < output.size(); i++) {
     EXPECT_NEAR(ref_out[i], output[i], 0.0001f);
   }
+}
+
+/**
+ * @brief scalar reference of compute_kcaches, mirroring the kernel semantics
+ * including local_window_size and the [head_start, head_end) head range
+ */
+static void ref_compute_kcaches(const float *in, const uint16_t *kcache,
+                                float *output, int num_rows, int num_cache_head,
+                                int head_dim, int gqa_size,
+                                size_t local_window_size, int head_start,
+                                int head_end) {
+  int actual_head_end = head_end < 0 ? num_cache_head : head_end;
+  int start_row = (size_t)num_rows < local_window_size
+                    ? 0
+                    : num_rows - (int)local_window_size;
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int row = start_row; row < num_rows; ++row) {
+      for (int g = 0; g < gqa_size; ++g) {
+        const float *in_ptr = in + n * gqa_size * head_dim + g * head_dim;
+        const uint16_t *kptr = kcache + (row * num_cache_head + n) * head_dim;
+        float sum = 0.0f;
+        for (int i = 0; i < head_dim; ++i)
+          sum += in_ptr[i] * nntrainer::compute_fp16_to_fp32(kptr[i]);
+        output[(row - start_row) * num_cache_head * gqa_size + n * gqa_size +
+               g] = sum / std::sqrt((float)head_dim);
+      }
+    }
+  }
+}
+
+/**
+ * @brief run one compute_kcaches shape against the scalar reference
+ */
+static void run_compute_kcaches_case(int num_rows, int num_cache_head,
+                                     int head_dim, int gqa_size, int tile_size,
+                                     size_t local_window_size, int head_start,
+                                     int head_end) {
+  size_t in_size = (size_t)num_cache_head * gqa_size * head_dim;
+  size_t kcache_size = (size_t)num_rows * num_cache_head * head_dim;
+  int row_cnt =
+    (size_t)num_rows < local_window_size ? num_rows : (int)local_window_size;
+  size_t out_size = (size_t)row_cnt * num_cache_head * gqa_size;
+
+  std::vector<float> rnd = generate_random_vector<float>(in_size + kcache_size);
+  std::vector<float> in(rnd.begin(), rnd.begin() + in_size);
+  std::vector<float> kc_f32(rnd.begin() + in_size, rnd.end());
+  std::vector<uint16_t> kcache = convert_vector_f32_to_f16_as_uint16(kc_f32);
+  std::vector<float> out(out_size, 0.0f);
+  std::vector<float> ref(out_size, 0.0f);
+
+  ref_compute_kcaches(in.data(), kcache.data(), ref.data(), num_rows,
+                      num_cache_head, head_dim, gqa_size, local_window_size,
+                      head_start, head_end);
+  nntrainer::compute_kcaches<uint16_t>(
+    in.data(), kcache.data(), out.data(), num_rows, num_cache_head, head_dim,
+    gqa_size, tile_size, local_window_size, head_start, head_end);
+
+  int actual_head_end = head_end < 0 ? num_cache_head : head_end;
+  for (int r = 0; r < row_cnt; ++r) {
+    for (int n = head_start; n < actual_head_end; ++n) {
+      for (int g = 0; g < gqa_size; ++g) {
+        size_t idx = (size_t)r * num_cache_head * gqa_size + n * gqa_size + g;
+        EXPECT_NEAR(ref[idx], out[idx], 0.0001f)
+          << "kcaches mismatch at row=" << r << " head=" << n << " g=" << g;
+      }
+    }
+  }
+}
+
+/**
+ * @brief scalar reference of compute_fp16vcache_fp32_transposed, mirroring the
+ * kernel semantics including local_window_size and the head range
+ */
+static void ref_compute_fp16vcache(int row_num, const float *in,
+                                   const uint16_t *vcache, float *output,
+                                   int num_cache_head, int gqa_size,
+                                   int head_dim, size_t local_window_size,
+                                   int head_start, int head_end) {
+  int actual_head_end = head_end < 0 ? num_cache_head : head_end;
+  int j0 = (size_t)row_num < local_window_size
+             ? 0
+             : row_num + 1 - (int)local_window_size;
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int h = 0; h < gqa_size; ++h) {
+      for (int d = 0; d < head_dim; ++d)
+        output[(n * gqa_size + h) * head_dim + d] = 0.0f;
+    }
+    for (int j = j0; j <= row_num; ++j) {
+      for (int h = 0; h < gqa_size; ++h) {
+        float a =
+          in[(size_t)(j - j0) * (gqa_size * num_cache_head) + n * gqa_size + h];
+        for (int d = 0; d < head_dim; ++d) {
+          output[(n * gqa_size + h) * head_dim + d] +=
+            a * nntrainer::compute_fp16_to_fp32(
+                  vcache[((size_t)j * num_cache_head + n) * head_dim + d]);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * @brief run one compute_fp16vcache_fp32_transposed shape against the scalar
+ * reference
+ */
+static void run_compute_fp16vcache_case(int row_num, int num_cache_head,
+                                        int gqa_size, int head_dim,
+                                        size_t local_window_size,
+                                        int head_start, int head_end) {
+  int j0 = (size_t)row_num < local_window_size
+             ? 0
+             : row_num + 1 - (int)local_window_size;
+  size_t in_size = (size_t)(row_num - j0 + 1) * gqa_size * num_cache_head;
+  size_t vcache_size = (size_t)(row_num + 1) * num_cache_head * head_dim;
+  size_t out_size = (size_t)num_cache_head * gqa_size * head_dim;
+
+  std::vector<float> rnd = generate_random_vector<float>(in_size + vcache_size);
+  std::vector<float> in(rnd.begin(), rnd.begin() + in_size);
+  std::vector<float> vc_f32(rnd.begin() + in_size, rnd.end());
+  std::vector<uint16_t> vcache = convert_vector_f32_to_f16_as_uint16(vc_f32);
+  std::vector<float> out(out_size, 0.0f);
+  std::vector<float> ref(out_size, 0.0f);
+
+  ref_compute_fp16vcache(row_num, in.data(), vcache.data(), ref.data(),
+                         num_cache_head, gqa_size, head_dim, local_window_size,
+                         head_start, head_end);
+  nntrainer::compute_fp16vcache_fp32_transposed(
+    row_num, in.data(), vcache.data(), out.data(), num_cache_head, gqa_size,
+    head_dim, local_window_size, head_start, head_end);
+
+  int actual_head_end = head_end < 0 ? num_cache_head : head_end;
+  for (int n = head_start; n < actual_head_end; ++n) {
+    for (int h = 0; h < gqa_size; ++h) {
+      for (int d = 0; d < head_dim; ++d) {
+        size_t idx = (size_t)(n * gqa_size + h) * head_dim + d;
+        EXPECT_NEAR(ref[idx], out[idx], 0.0001f)
+          << "vcache mismatch at head=" << n << " h=" << h << " d=" << d;
+      }
+    }
+  }
+}
+
+/**
+ * @brief scalar reference of softmax_row_inplace: per-head softmax across rows
+ * [start_row, end_row), optionally seeded with a sink logit
+ */
+static void ref_softmax_rows(float *qk, size_t start_row, size_t end_row,
+                             size_t num_heads, const float *sink = nullptr) {
+  for (size_t c = 0; c < num_heads; ++c) {
+    float mx = sink ? sink[c] : qk[start_row * num_heads + c];
+    for (size_t r = start_row; r < end_row; ++r)
+      mx = std::max(mx, qk[r * num_heads + c]);
+    float sum = sink ? std::exp(sink[c] - mx) : 0.0f;
+    for (size_t r = start_row; r < end_row; ++r)
+      sum += std::exp(qk[r * num_heads + c] - mx);
+    for (size_t r = start_row; r < end_row; ++r)
+      qk[r * num_heads + c] = std::exp(qk[r * num_heads + c] - mx) / sum;
+  }
+}
+
+/**
+ * @brief run softmax_row_inplace on one shape against the scalar reference
+ */
+static void run_softmax_row_inplace_case(size_t rows, size_t num_heads,
+                                         bool with_sink) {
+  std::vector<float> qk =
+    generate_random_vector<float>(rows * num_heads, -5.0f, 5.0f);
+  std::vector<float> sink =
+    generate_random_vector<float>(num_heads, -5.0f, 5.0f);
+  std::vector<float> ref = qk;
+
+  ref_softmax_rows(ref.data(), 0, rows, num_heads,
+                   with_sink ? sink.data() : nullptr);
+  nntrainer::softmax_row_inplace(qk.data(), 0, rows, num_heads,
+                                 with_sink ? sink.data() : nullptr);
+
+  for (size_t i = 0; i < rows * num_heads; ++i) {
+    EXPECT_NEAR(ref[i], qk[i], 0.0001f) << "softmax mismatch at i=" << i;
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone, compute_kcaches_head_dim16_rem0) {
+  run_compute_kcaches_case(3, 2, 16, 2, 16, UINT_MAX, 0, -1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, compute_kcaches_window_headrange) {
+  run_compute_kcaches_case(9, 4, 12, 2, 4, 4, 1, 3);
+}
+
+TEST(nntrainer_cpu_backend_standalone, compute_fp16vcache_head_dim16_rem0) {
+  run_compute_fp16vcache_case(2, 2, 2, 16, UINT_MAX, 0, -1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, compute_fp16vcache_window_headrange) {
+  run_compute_fp16vcache_case(5, 3, 2, 9, 3, 1, 2);
+}
+
+/**
+ * @brief The vcache/softmax kernels keep thread_local scratch that only grows;
+ * call each kernel twice on the same thread with a large shape first and a
+ * smaller one second, so the second call must produce correct results from
+ * reused (larger-capacity) buffers.
+ */
+TEST(nntrainer_cpu_backend_standalone, compute_fp16vcache_scratch_reuse) {
+  run_compute_fp16vcache_case(3, 3, 4, 24, UINT_MAX, 0, -1);
+  run_compute_fp16vcache_case(1, 2, 2, 9, UINT_MAX, 0, -1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, softmax_row_inplace_scratch_reuse) {
+  run_softmax_row_inplace_case(4, 32, false);
+  run_softmax_row_inplace_case(3, 10, false);
+  run_softmax_row_inplace_case(4, 32, true);
+  run_softmax_row_inplace_case(3, 10, true);
 }
 #endif
 
@@ -1562,6 +1821,214 @@ DECLARE_transform_int4_test_K_N(1024, 648, 32);
 DECLARE_transform_int4_test_K_N(1024, 648, 64);
 DECLARE_transform_int4_test_K_N(1024, 648, 128);
 DECLARE_transform_int4_test_K_N(3072, 8192, 32);
+
+/**
+ * @brief run swiglu accuracy test: cpu backend (AVX2 approximation on x86)
+ * against the scalar fallback reference
+ */
+static void run_swiglu_test(const unsigned int N, float alpha, bool use_alpha,
+                            float abs_tol) {
+  // y spans the sigmoid saturation range on both sides; z is kept moderate so
+  // the absolute tolerance stays meaningful for the product
+  std::vector<float> Y = generate_random_vector<float>(N, -8.0f, 8.0f);
+  std::vector<float> Z = generate_random_vector<float>(N, -2.0f, 2.0f);
+  std::vector<float> X(N, 0.0f);
+  std::vector<float> X_ref(N, 0.0f);
+
+  if (use_alpha) {
+    nntrainer::__fallback_swiglu(N, X_ref.data(), Y.data(), Z.data(), alpha);
+    nntrainer::swiglu(N, X.data(), Y.data(), Z.data(), alpha);
+  } else {
+    nntrainer::__fallback_swiglu(N, X_ref.data(), Y.data(), Z.data());
+    nntrainer::swiglu(N, X.data(), Y.data(), Z.data());
+  }
+
+  for (unsigned int i = 0; i < N; ++i) {
+    EXPECT_NEAR(X[i], X_ref[i], abs_tol)
+      << "swiglu mismatch at i=" << i << " y=" << Y[i] << " z=" << Z[i];
+  }
+}
+
+/**
+ * @brief run tanh-approximated gelu accuracy test: cpu backend (AVX2
+ * polynomial on x86) against the scalar fallback reference
+ */
+static void run_tanh_gelu_v2_test(const unsigned int N, float abs_tol) {
+  // range covers the polynomial region and both clamp branches (~ +-4.38)
+  std::vector<float> X = generate_random_vector<float>(N, -8.0f, 8.0f);
+  std::vector<float> Y(N, 0.0f);
+  std::vector<float> Y_ref(N, 0.0f);
+
+  nntrainer::__fallback_tanh_gelu(N, X.data(), Y_ref.data());
+  nntrainer::tanh_gelu_v2(N, X.data(), Y.data());
+
+  for (unsigned int i = 0; i < N; ++i) {
+    EXPECT_NEAR(Y[i], Y_ref[i], abs_tol)
+      << "tanh_gelu_v2 mismatch at i=" << i << " x=" << X[i];
+  }
+}
+
+/**
+ * @brief run erf-based gelu accuracy test: cpu backend (AVX2 polynomial on
+ * x86) against the scalar fallback reference
+ */
+static void run_gelu_v2_test(const unsigned int N, float abs_tol) {
+  // range covers the polynomial region and both clamp branches (~ +-4.59)
+  std::vector<float> X = generate_random_vector<float>(N, -8.0f, 8.0f);
+  std::vector<float> Y(N, 0.0f);
+  std::vector<float> Y_ref(N, 0.0f);
+
+  nntrainer::__fallback_gelu_v2(N, X.data(), Y_ref.data());
+  nntrainer::gelu_v2(N, X.data(), Y.data());
+
+  for (unsigned int i = 0; i < N; ++i) {
+    EXPECT_NEAR(Y[i], Y_ref[i], abs_tol)
+      << "gelu_v2 mismatch at i=" << i << " x=" << X[i];
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone, swiglu_3072) {
+  run_swiglu_test(3072, 1.0f, false, 1.0e-5f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, swiglu_3075_remainder) {
+  run_swiglu_test(3075, 1.0f, false, 1.0e-5f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, swiglu_3072_alpha) {
+  run_swiglu_test(3072, 1.7f, true, 1.0e-5f);
+}
+
+// Tolerances below are ~2x the measured max abs error of the AVX2 polynomial
+// approximations against the scalar references over a dense [-10, 10] sweep
+// (tanh_gelu_v2: 3.7e-5, gelu_v2: 5.7e-5, both at the clamp boundary).
+TEST(nntrainer_cpu_backend_standalone, tanh_gelu_v2_3072) {
+  run_tanh_gelu_v2_test(3072, 8.0e-5f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, tanh_gelu_v2_3075_remainder) {
+  run_tanh_gelu_v2_test(3075, 8.0e-5f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, gelu_v2_3072) {
+  run_gelu_v2_test(3072, 1.2e-4f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, gelu_v2_3075_remainder) {
+  run_gelu_v2_test(3075, 1.2e-4f);
+}
+
+// ============================================================================
+// P1: AVX2 replacement tests for formerly-fallback FP32 functions
+// ============================================================================
+
+static void run_ele_sub_test(const unsigned int N, float alpha, float beta,
+                             unsigned int i_stride, unsigned int o_stride) {
+  const int TEST_CNT = 20;
+  for (int i = 0; i < TEST_CNT; i++) {
+    std::vector<float> X =
+      generate_random_vector<float, false>((size_t)N * o_stride);
+    std::vector<float> Y = generate_random_vector<float, false>(
+      std::max<size_t>(1, (size_t)N * i_stride));
+    std::vector<float> Z =
+      generate_random_vector<float, false>((size_t)N * o_stride);
+    std::vector<float> Z_ref = Z;
+
+    nntrainer::__fallback_ele_sub(N, X.data(), Y.data(), Z_ref.data(), alpha,
+                                  beta, i_stride, o_stride);
+    nntrainer::ele_sub(N, X.data(), Y.data(), Z.data(), alpha, beta, i_stride,
+                       o_stride);
+
+    auto mean_squared_error = compute_mse(1, N * o_stride, Z_ref, Z, false);
+    ASSERT_LE(mean_squared_error, 0.00001f);
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3072_istr_0) {
+  run_ele_sub_test(3072, 1.f, 0.f, 0, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3072_istr_1) {
+  run_ele_sub_test(3072, 1.f, 0.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3072_istr_16_ostrid_16) {
+  run_ele_sub_test(3072, 3.f, 2.f, 16, 16);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3072_alpha1_beta0_istr_2) {
+  run_ele_sub_test(3072, 1.f, 0.f, 2, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3072_alpha3_beta2_istr_0) {
+  run_ele_sub_test(3072, 3.f, 2.f, 0, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3072_alpha3_beta2_istr_1) {
+  run_ele_sub_test(3072, 3.f, 2.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3079_tail) {
+  run_ele_sub_test(3079, 1.f, 0.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_sub_3079_alpha3_beta2_tail) {
+  run_ele_sub_test(3079, 3.f, 2.f, 1, 1);
+}
+
+static void run_ele_div_test(const unsigned int N, float alpha, float beta,
+                             unsigned int i_stride, unsigned int o_stride) {
+  const int TEST_CNT = 20;
+  for (int i = 0; i < TEST_CNT; i++) {
+    std::vector<float> X =
+      generate_random_vector<float, false>((size_t)N * o_stride);
+    std::vector<float> Y = generate_random_vector<float, false>(
+      std::max<size_t>(1, (size_t)N * i_stride), 0.1f, 1.0f);
+    std::vector<float> Z =
+      generate_random_vector<float, false>((size_t)N * o_stride);
+    std::vector<float> Z_ref = Z;
+
+    nntrainer::__fallback_ele_div(N, X.data(), Y.data(), Z_ref.data(), alpha,
+                                  beta, i_stride, o_stride);
+    nntrainer::ele_div(N, X.data(), Y.data(), Z.data(), alpha, beta, i_stride,
+                       o_stride);
+
+    auto mean_squared_error = compute_mse(1, N * o_stride, Z_ref, Z, false);
+    ASSERT_LE(mean_squared_error, 0.00001f);
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3072_istr_0) {
+  run_ele_div_test(3072, 1.f, 0.f, 0, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3072_istr_1) {
+  run_ele_div_test(3072, 1.f, 0.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3072_istr_16_ostrid_16) {
+  run_ele_div_test(3072, 3.f, 2.f, 16, 16);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3072_alpha1_beta0_istr_2) {
+  run_ele_div_test(3072, 1.f, 0.f, 2, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3072_alpha3_beta2_istr_0) {
+  run_ele_div_test(3072, 3.f, 2.f, 0, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3072_alpha3_beta2_istr_1) {
+  run_ele_div_test(3072, 3.f, 2.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3079_tail) {
+  run_ele_div_test(3079, 1.f, 0.f, 1, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, ele_div_3079_alpha3_beta2_tail) {
+  run_ele_div_test(3079, 3.f, 2.f, 1, 1);
+}
 
 int main(int argc, char **argv) {
   int result = -1;
