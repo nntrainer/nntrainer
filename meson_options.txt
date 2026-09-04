@@ -48,7 +48,7 @@ option('hexkl-sdk-root', type: 'string', value: '')
 # the Android app process on current SM8750/V79 devices.
 option('hexkl-lib-subdir', type: 'string', value: 'armv8_android26')
 option('mmap-read', type: 'boolean', value: true)
-option('enable-kernel-caching', type: 'boolean', value: false)
+option('enable-kernel-caching', type: 'boolean', value: true)
 
 # dependency conflict resolution
 option('capi-ml-inference-actual', type: 'string', value: 'capi-ml-inference',
