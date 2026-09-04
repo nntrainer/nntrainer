@@ -31,12 +31,15 @@ Applications/CausalLM/res/xlm_roberta/*
 !Applications/CausalLM/res/gemma4/
 Applications/CausalLM/res/gemma4/*
 !Applications/CausalLM/res/gemma4/weight_converter.py
+!Applications/CausalLM/res/gemma4/weight_converter_stream.py
 !Applications/CausalLM/res/gemma4/nntr_config.json
 !Applications/CausalLM/res/gemma4/test/
 Applications/CausalLM/res/gemma4/test/*
 !Applications/CausalLM/res/gemma4/test/generate_gemma4_reference.py
 !Applications/CausalLM/res/qwen3/
 Applications/CausalLM/res/qwen3/*
+!Applications/CausalLM/res/qwen3/qwen3-30b-a3b/
+!Applications/CausalLM/res/qwen3/qwen3-30b-a3b/weight_converter_stream.py
 !Applications/CausalLM/res/qwen3/test/
 Applications/CausalLM/res/qwen3/test/*
 !Applications/CausalLM/res/qwen3/test/generate_qwen3_moe_reference.py
