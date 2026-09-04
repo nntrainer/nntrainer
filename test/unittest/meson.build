@@ -66,6 +66,11 @@ test_target = [
   ['unittest_nntrainer_lazy_tensor', []],
   ['unittest_nntrainer_tensor', []],
   ['unittest_nntrainer_quantizer', []],
+  ['unittest_hexkl_kv_quant', ['../../nntrainer/tensor/htp_backend/hmx/hexkl_kv_quant.c']],
+  ['unittest_mha_htp_host_model', [
+    '../../nntrainer/tensor/htp_backend/hmx/hexkl_kv_quant.c',
+    'mha_htp_host_model.cpp'
+  ]],
   ['unittest_util_func', []],
   ['unittest_nntrainer_models', [
     'models' / 'models_test_utils.cpp', 'models' / 'models_golden_test.cpp'
@@ -117,6 +122,14 @@ foreach target: test_target
     # below is temporary measure, we will eventually remove unittest_nntrainer_models
     include_directories: include_directories('models'),
     dependencies: unittest_nntrainer_deps,
+    # Some targets here pull in a C source (the HTP backend's hexkl_*.c),
+    # which uses C99 declarations in for-loops. The project-wide c_std in
+    # the top-level default_options is only a DEFAULT: it loses to an
+    # already-configured build directory, to a native/cross file, and to
+    # distro packaging, all of which routinely pin c_std. Declaring the
+    # requirement on the target is what makes it hold regardless. No-op
+    # for the C++-only targets in this list.
+    override_options: ['c_std=gnu99'],
     install: get_option('enable-test'),
     install_dir: application_install_dir
   )

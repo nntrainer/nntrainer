@@ -8,6 +8,202 @@
 #include "remote.idl"
 
 interface nntr_hvx : remote_handle64 {
-   AEEResult add_f32(in sequence<float> a, in sequence<float> b,
-                     rout sequence<float> c);
+ AEEResult add_f32(in sequence<float> a, in sequence<float> b,
+ rout sequence<float> c);
+
+ // Accuracy harness: the whole flow, quantization and dequantization on
+ // the DSP. Intermediate buffers come back so each stage is checkable.
+ AEEResult mm_u8i4_from_f32(in uint32 M, in uint32 K, in uint32 N,
+ in sequence<float> act_f32,
+ in sequence<int8> w_i4_rm,
+ in sequence<float> w_scale,
+ in sequence<int32> colsum_w,
+ in sequence<float> bias,
+ rout sequence<uint8> act_u8_ah,
+ rout sequence<float> act_scale,
+ rout sequence<int32> act_zp,
+ rout sequence<int32> acc_i32,
+ rout sequence<float> out_f32);
+
+ // --- Performance path ---
+ //
+ // Bakes a K x N int4 weight (int4 values in int8 containers, row-major)
+ // to WH layout once and keeps it DSP-resident, along with its dequant
+ // constants, until weight_release_u8i4. hw_init and the HMX lock happen
+ // once in nntr_hvx_open, not per call see nntr_hvx_session.h.
+ AEEResult weight_register_u8i4(in uint32 K, in uint32 N,
+ in sequence<int8> w_i4_rm,
+ in sequence<float> w_scale,
+ in sequence<int32> colsum_w,
+ in sequence<float> bias,
+ rout uint32 w_handle);
+
+ AEEResult weight_release_u8i4(in uint32 w_handle);
+
+ // Runs matmuls against several registered weights that share ONE
+ // quantized activation e.g. a Q/K/V or gate/up projection set. Every
+ // handle must have been registered with the same K. Quantizes act_f32
+ // once, double-buffers each handle's weight into VTCM with the next
+ // handle prefetched while the current one computes (cross-matmul
+ // prefetch: 1.7-2x over SDKL on V79), and returns
+ // dequantized f32 one contiguous M x handle[i].N block per handle in
+ // call order.
+ AEEResult mm_u8i4_layer(in uint32 M, in uint32 K,
+ in sequence<uint32> w_handles,
+ in sequence<float> act_f32,
+ rout sequence<float> out_cat);
+
+ // Same three ops, at the wider weight width. u8i8 keeps the activation
+ // at uint8 (HMX's activation port is always 8-bit) and widens only the
+ // weight, so the accuracy risk relative to u8i4 is narrower this is
+ // why it is worth having alongside u8i4 rather than instead of it.
+ // Same as mm_u8i4_layer, plus the DSP-side stage breakdown. Separate
+ // entry point rather than an optional out-param: the production path must
+ // not pay for the probes, and a caller that wants the breakdown is asking
+ // for a different contract, not a flag.
+ AEEResult mm_u8i4_layer_timed(in uint32 M, in uint32 K,
+ in sequence<uint32> w_handles,
+ in sequence<float> act_f32,
+ rout sequence<float> out_cat,
+ rout sequence<uint32> stage_us);
+
+ AEEResult weight_register_u8i8(in uint32 K, in uint32 N,
+ in sequence<int8> w_i8_rm,
+ in sequence<float> w_scale,
+ in sequence<int32> colsum_w,
+ in sequence<float> bias,
+ rout uint32 w_handle);
+
+ AEEResult weight_release_u8i8(in uint32 w_handle);
+
+ AEEResult mm_u8i8_layer(in uint32 M, in uint32 K,
+ in sequence<uint32> w_handles,
+ in sequence<float> act_f32,
+ rout sequence<float> out_cat);
+
+ // Same layer call, plus the DSP-internal microseconds:
+ // [dsp_total, quant, dequant, acc_read, acc_copy, drain, acc_stride].
+ // DEBUG ONLY and stripped before the PR, same as attn_forward_timed.
+ //
+ // A fully connected layer carries M*K floats in and M*N floats out 12 MB
+ // per call at Qwen3-0.6B's q_proj with M=1024 so the host-side wall clock
+ // is part FastRPC and part compute in a ratio nobody should have to guess
+ // at. This makes the split measured rather than assumed, which is what lets
+ // the result be compared against a per-op QNN number that has no host
+ // transfer in it at all.
+ AEEResult mm_u8i8_layer_timed(in uint32 M, in uint32 K,
+ in sequence<uint32> w_handles,
+ in sequence<float> act_f32,
+ rout sequence<float> out_cat,
+ rout sequence<uint32> stage_us);
+
+ // For HVX softmax verification. exp is broken out as its own entry
+ // because looking at softmax output alone hides exp's relative error // sum normalization cancels it out. xLen must be a multiple of 32 // hvx_exp_sf operates in whole vectors and this entry does not handle a
+ // tail.
+ AEEResult exp_f32(in sequence<float> x, rout sequence<float> y);
+
+ AEEResult softmax_f32(in uint32 M, in uint32 K, in uint32 m_first,
+ in float scale, in sequence<float> x,
+ rout sequence<float> y);
+
+ // QNN-style uint8-in/uint8-out RoPE. cos/sin are uint8 half-tables
+ // quantized with their own per-tensor (scale, zero-point). s_in/zp_in
+ // may be per-row or length-one broadcast.
+ AEEResult rope_u8(in uint32 n_rows, in uint32 width, in uint32 dim,
+ in sequence<uint8> x, in sequence<float> s_in,
+ in sequence<int32> zp_in, in sequence<uint8> cos_u8,
+ in sequence<uint8> sin_u8, in float cos_scale,
+ in int32 cos_zp, in float sin_scale, in int32 sin_zp,
+ in float s_out, in int32 zp_out,
+ rout sequence<uint8> y, rout uint32 n_saturated);
+
+ // Builds and caches a uint8 sin/cos table for [0, n_positions). thetas
+ // and attention_scaling carry every rope scaling type (default/yarn/
+ // proportional) and the partial rotary factor, already reduced by ARM.
+ // cos/sin are quantized with separate per-tensor (scale, zp). The cache
+ // is session-owned; generation changes only on a new (n_positions,
+ // thetas, attention_scaling, cos_scale, cos_zp, sin_scale, sin_zp).
+ AEEResult rope_cache_init(in uint32 n_positions, in sequence<float> thetas,
+ in float attention_scaling, in float cos_scale,
+ in int32 cos_zp, in float sin_scale,
+ in int32 sin_zp, rout uint32 generation);
+ AEEResult rope_cache_clear;
+
+ // Uses the session cache for positions [position_start, position_start +
+ // n_rows). dim must be 2 * the thetas length rope_cache_init was called
+ // with.
+ AEEResult rope_u8_cached(in uint32 n_rows, in uint32 width, in uint32 dim,
+ in uint32 position_start, in sequence<uint8> x,
+ in sequence<float> s_in,
+ in sequence<int32> zp_in, in float s_out,
+ in int32 zp_out, rout sequence<uint8> y,
+ rout uint32 n_saturated);
+
+ // PHASE B of the fused attention loop, exposed on its own so it can be
+ // gated against the host model (test/unittest/mha_htp_host_model.cpp)
+ // before the attention endpoint that will call it in-process exists.
+ //
+ // The band arrives flattened as n_seg contiguous M x T blocks the same
+ // bytes hexkl_mm_u8iX_layer_run's out_cat holds, in the same order and
+ // comes back holding UNNORMALIZED exp values, plus l per row. Flattening
+ // it into one buffer is a marshalling convenience for this harness only;
+ // on device the blocks are already adjacent in VTCM and the kernel takes
+ // the pointer array directly. Pass an empty sink to mean "no sink".
+ AEEResult softmax_blocked_f32(in uint32 n_seg, in uint32 T, in uint32 M,
+ in float scale, in sequence<float> band_in,
+ in sequence<uint32> begin,
+ in sequence<uint32> end,
+ in sequence<float> sink,
+ rout sequence<float> band_out,
+ rout sequence<float> l_out);
+
+ // --- Attention (the task) --------------------------
+ //
+ // ONE register entry taking both widths, not one entry per width: the
+ // combinations are four (K and V are independent) and four copies of
+ // every attention entry point is not a surface worth carrying.
+ AEEResult attn_register(in uint32 nch, in uint32 gqa, in uint32 head_dim,
+ in uint32 max_kv, in uint32 T, in uint32 M_band,
+ in uint32 w_k, in uint32 w_v, rout uint32 h);
+
+ AEEResult attn_release(in uint32 h);
+
+ // Appends KV positions and re-registers only the blocks they land in.
+ AEEResult attn_kv_append(in uint32 h, in uint32 kv_from, in uint32 n_rows,
+ in sequence<uint16> k_rows,
+ in sequence<uint16> v_rows);
+
+ // DEBUG ONLY, and stripped before the PR: returns the raw S band so it can
+ // be compared against mha_htp_host_forward's PHASE A. Without a per-stage
+ // output a wrong O gives no signal about which stage produced it
+ // Mirrors how mm_u8i4_from_f32 returns
+ // intermediates as an accuracy harness.
+ AEEResult attn_scores_debug(in uint32 h, in uint32 head, in uint32 M,
+ in sequence<float> q_band,
+ rout sequence<float> out_s);
+
+ // The whole layer in ONE round trip: Q.Kt, masked softmax and P.V, with S
+ // and P never crossing the host boundary. An unfused seam would pay the
+ // ~404 us fixed FastRPC cost three times per layer instead of once, which
+ // is the entire reason softmax runs on the DSP.
+ //
+ // This replaces exactly compute_kcaches + softmax_triangle +
+ // compute_fp16vcache_transposed in mha_core's incremental path. RoPE and
+ // the Q/K/V and output projections stay where they are.
+ AEEResult attn_forward(in uint32 h, in uint32 kv_from, in uint32 n_query,
+ in float scale, in uint32 is_causal,
+ in uint32 window, in sequence<float> sink,
+ in sequence<float> q, rout sequence<float> attn_out);
+
+ // Same forward, plus the DSP-internal per-stage microseconds:
+ // [qk, softmax, pv, accum, gather, total, layer_run_calls]. DEBUG ONLY and
+ // stripped before the PR. The host times the whole call, this times the
+ // inside, and the difference is the FastRPC transport, which is how
+ // the transport share gets checked rather than assumed.
+ AEEResult attn_forward_timed(in uint32 h, in uint32 kv_from,
+ in uint32 n_query, in float scale,
+ in uint32 is_causal, in uint32 window,
+ in sequence<float> sink, in sequence<float> q,
+ rout sequence<float> attn_out,
+ rout sequence<uint32> stage_us);
 };
