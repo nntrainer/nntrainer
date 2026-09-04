@@ -7,6 +7,8 @@
  * @brief  Implementation of RMS normalization function
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
+ * @author Anirudh Bocha <b.saianirud@samsung.com>
  * @bug    No known bugs except for NYI items
  * @note   This layer only supports inference mode.
  */
@@ -43,7 +45,7 @@ public:
    * @brief Construct a new custom RMS normalization layer object
    *
    */
-  WIN_EXPORT RMSNormLayer() : Layer(), wt_idx({0}) {}
+  WIN_EXPORT RMSNormLayer() : Layer(), wt_idx({0, 0}) {}
 
   /**
    * @brief Destroy the custom RMS normalization layer object
@@ -76,9 +78,17 @@ public:
   WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
 
   /**
+   * @copydoc Layer::calcGradient(RunLayerContext &context)
+   * @note Only invoked when the layer is trainable. Under LoRA-only
+   *       training gamma is frozen so this never runs; it exists so that
+   *       full fine-tuning (or a "LoRA + norms" recipe) can train gamma.
+   */
+  WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
+
+  /**
    * @copydoc bool supportBackwarding() const
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; };
+  WIN_EXPORT bool supportBackwarding() const override { return true; };
 
   /**
    * @copydoc Layer::exportTo(Exporter &exporter, ExportMethods method)
@@ -108,14 +118,47 @@ public:
     nntrainer::RunLayerContext &context,
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
+  /**
+   * @copydoc Layer::setBatch(RunLayerContext &context, unsigned int batch)
+   * @note nntrainer resizes a layer's own requested tensors on a batch-size
+   *       change via this hook, NOT via updateTensorsByInputDimensions()
+   *       (that one is for sequence-length changes only -- see
+   *       NetworkGraph::setBatchSize()). Without this override the inv_rms
+   *       cache stays sized for whatever batch finalize() ran with, so
+   *       every batch index beyond that reads/writes past the end of its
+   *       backing tensor once the real batch size is set.
+   */
+  WIN_EXPORT void setBatch(nntrainer::RunLayerContext &context,
+                           unsigned int batch) override;
+
   inline static const std::string type = "rms_norm";
 
 private:
-  std::array<unsigned int, 1> wt_idx;
+  std::array<unsigned int, 2> wt_idx;
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
              nntrainer::props::SkipPrefill>
     rms_props;
   bool skip_prefill = false;
+  /**
+   * @brief true when finalize() ran under ExecutionMode::TRAIN, in which
+   *        case the inv_rms cache was requested and computeRMSNorm() must
+   *        populate it (skipped for inference-only compiled graphs, which
+   *        never call calcDerivative/calcGradient and would otherwise pay
+   *        for a cache they never read).
+   */
+  bool cache_inv_rms = false;
+
+  /**
+   * @brief shared per-row RMS normalization compute used by both forwarding
+   *        (full sequence, [0, height)) and incremental_forwarding (decode
+   *        step, [from, to)). Also populates the inv_rms cache (one value
+   *        per row) that calcDerivative/calcGradient read back, instead of
+   *        recomputing it from the input tensor -- see the note on
+   *        wt_idx[RMSParams::inv_rms] in rms_norm.cpp for why recomputing
+   *        from the input is unsafe.
+   */
+  void computeRMSNorm(nntrainer::RunLayerContext &context, unsigned int from,
+                      unsigned int to);
 };
 
 } // namespace causallm

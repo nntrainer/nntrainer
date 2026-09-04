@@ -7,6 +7,7 @@
  * @brief  Implementation of custom SwiGLU activation function
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  */
@@ -109,6 +110,14 @@ public:
 private:
   std::tuple<nntrainer::props::SkipPrefill> swiglu_props;
   bool skip_prefill = false;
+
+  /**
+   * @brief shared elementwise SwiGLU compute used by both forwarding (full
+   *        sequence, [0, height)) and incremental_forwarding (decode step,
+   *        [from, to)).
+   */
+  void computeSwiGLU(nntrainer::RunLayerContext &context, unsigned int from,
+                     unsigned int to);
 };
 
 } // namespace causallm
