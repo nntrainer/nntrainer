@@ -71,6 +71,19 @@ public:
   void finalize(nntrainer::InitLayerContext &context) override;
 
   /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<nntrainer::TensorDim>, 3>
+  getLayerDimensions(nntrainer::InitLayerContext &context) override;
+
+  /**
+   * @copydoc Layer::updateTensorsByInputDimensions(...)
+   */
+  std::vector<nntrainer::TensorDim> updateTensorsByInputDimensions(
+    nntrainer::InitLayerContext &init_context,
+    nntrainer::RunLayerContext &run_context) override;
+
+  /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
    */
   void forwarding(nntrainer::RunLayerContext &context, bool training) override;
@@ -115,10 +128,6 @@ public:
    * @brief Layer::supportBackwarding()
    */
   bool supportBackwarding() const override { return false; }
-
-  void updateTensorsByInputDimensions(
-    nntrainer::RunLayerContext &context,
-    std::vector<nntrainer::TensorDim> input_dimensions) override;
 
   static constexpr const char *type =
     "moe_cached_slim"; /**< type of the layer */

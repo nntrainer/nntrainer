@@ -357,7 +357,8 @@ public:
    * @details Update the dimensions of inputs, outputs, weights, tensors based
    * on the input dimensions
    */
-  void updateTensorsByInputDimensions(std::vector<TensorDim> input_dimensions);
+  std::vector<TensorDim>
+  updateTensorsByInputDimensions(std::vector<TensorDim> input_dimensions);
 
   /**
    * @brief   If the current layer can support in-place
@@ -1044,14 +1045,12 @@ private:
   ml::train::LayerComputeEngine compute_engine =
     ml::train::LayerComputeEngine::CPU;
 
-#ifdef ENABLE_TEST
   /**
    * @brief   Init context which is stored for debugging issue
    *
    * @note init context is stored only for testing purpose
    */
   std::unique_ptr<InitLayerContext> init_context;
-#endif // ENABLE_TEST
 
   std::unique_ptr<RunLayerContext>
     run_context; /**< context required for running/execution of the layer. This

@@ -20,8 +20,6 @@ namespace causallm {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
-  std::vector<nntrainer::TensorDim> dim = context.getInputDimensions();
-  context.setOutputDimensions(dim);
   feature_size = std::get<props::FeatureSize>(rms_props);
   use_gamma = std::get<props::UseGamma>(rms_props).get();
 
@@ -31,21 +29,36 @@ void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
   if (!std::get<nntrainer::props::SkipPrefill>(rms_props).empty())
     skip_prefill = std::get<nntrainer::props::SkipPrefill>(rms_props).get();
 
-  NNTR_THROW_IF(dim[0].width() % feature_size != 0, std::invalid_argument)
-    << "feature size must be a divisor of width";
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
+
+  context.setOutputDimensions(output_dims);
 
   if (use_gamma) {
     // gamma is unquantized FP32 on disk; request FP32 regardless of activation
     // dtype (FP16 would reinterpret the FP32 bytes and corrupt gamma). The FP16
     // path casts gamma down at the multiply site.
-    nntrainer::TensorDim gamma_dim(
-      1, 1, 1, feature_size,
-      nntrainer::TensorDim::TensorType(context.getFormat(),
-                                       nntrainer::TensorDim::DataType::FP32));
+    weight_dims[RMSParams::gamma].setDataType(
+      nntrainer::TensorDim::DataType::FP32);
     wt_idx[RMSParams::gamma] = context.requestWeight(
-      gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
+      weight_dims[RMSParams::gamma],
+      nntrainer::props::InitializerInfo::Enum::NONE,
       nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
   }
+}
+
+std::vector<nntrainer::TensorDim>
+ReshapedRMSNormLayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
+
+  return output_dims;
 }
 
 void ReshapedRMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
@@ -143,15 +156,35 @@ void ReshapedRMSNormLayer::incremental_forwarding(
   }
 }
 
-void ReshapedRMSNormLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
-  context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
-}
-
 void ReshapedRMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
   std::throw_with_nested(std::runtime_error("Training is not supported yet."));
+}
+
+std::array<std::vector<nntrainer::TensorDim>, 3>
+ReshapedRMSNormLayer::getLayerDimensions(nntrainer::InitLayerContext &context) {
+  std::vector<nntrainer::TensorDim> output_dims = context.getInputDimensions();
+
+  NNTR_THROW_IF(output_dims[SINGLE_INOUT_IDX].width() % feature_size != 0,
+                std::invalid_argument)
+    << "feature size must be a divisor of width, width of output: "
+    << output_dims[SINGLE_INOUT_IDX] << ", feature_size: " << feature_size;
+
+  if (output_dims[SINGLE_INOUT_IDX].getDataType() ==
+      ml::train::TensorDim::DataType::FP16) {
+    ml::train::TensorDim in_out_fp32_dim = output_dims[SINGLE_INOUT_IDX];
+    in_out_fp32_dim.setDataType(ml::train::TensorDim::DataType::FP32);
+    input_fp32 = std::make_shared<nntrainer::Tensor>(in_out_fp32_dim);
+    output_fp32 = std::make_shared<nntrainer::Tensor>(in_out_fp32_dim);
+  }
+
+  std::vector<nntrainer::TensorDim> weight_dims;
+  nntrainer::TensorDim gamma_dim(
+    1, 1, 1, feature_size,
+    nntrainer::TensorDim::TensorType(context.getFormat(),
+                                     context.getWeightDataType()));
+  weight_dims.push_back(gamma_dim);
+
+  return {output_dims, weight_dims, {}};
 }
 
 #ifdef PLUGGABLE

@@ -60,7 +60,6 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   auto &bias_initializer = std::get<props::BiasInitializer>(*layer_impl_props);
   auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
 
-  const auto &unit = std::get<props::Unit>(fc_props).get();
   const auto &lora_rank = (std::get<props::LoraRank>(fc_props).empty())
                             ? 0
                             : std::get<props::LoraRank>(fc_props).get();
@@ -70,61 +69,26 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   if (!std::get<props::SkipPrefill>(*layer_impl_props).empty())
     skip_prefill = std::get<props::SkipPrefill>(*layer_impl_props).get();
 
-  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
-    << "Fully connected layer takes only one input";
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
 
-  std::vector<TensorDim> output_dims(1);
-
-  /// @todo fc actaully supports multidimensions. EffDimFlag shouldn't be fixed
-  /// like this.
-  context.setEffDimFlagInputDimension(0, 0b1001);
-  context.setDynDimFlagInputDimension(0, 0b1000);
-
-  bool is_nchw = (context.getFormat() == Tformat::NCHW);
   /** set output dimensions */
-  auto const &in_dim = context.getInputDimensions()[0];
-  output_dims[0] = in_dim;
-  is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
-
-  output_dims[0].setTensorType(
-    {context.getFormat(), context.getActivationDataType()});
-
   context.setOutputDimensions(output_dims);
 
-  /** set weight specifications */
-  // @todo : This NCHW format setting is just temporal, it needs to be set by
-  // global configuration
-
-  /** Bias Dimension : (1, 1, 1, unit) */
-  /// @note Bias is un-quantized and added directly to the activation. Its
-  /// storage dtype must match how it is laid out on disk:
-  ///  - float weight (FP16/FP32): bias is stored in the activation dtype, so
-  ///    request it as such (no cast needed at the add site).
-  ///  - quantized weight (Q4_0/Q6_K/QINT*/...): bias is stored FP32 on disk;
-  ///    requesting it as the (possibly FP16) activation dtype would reinterpret
-  ///    the FP32 bytes and corrupt it. Request FP32 and cast to the activation
-  ///    dtype at the add site below.
-  const auto weight_dtype = context.getWeightDataType();
-  const bool weight_is_float = (weight_dtype == TensorDim::DataType::FP32 ||
-                                weight_dtype == TensorDim::DataType::FP16);
-  const auto bias_dtype = weight_is_float ? context.getActivationDataType()
-                                          : TensorDim::DataType::FP32;
-  TensorDim bias_dim(1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
-                     TensorDim::TensorType(context.getFormat(), bias_dtype),
-                     is_nchw ? 0b0001 : 0b0100);
-
-  /** Weight Dimension : (1, 1, in_dim.width(), unit)*/
-  TensorDim weight_dim(
-    1, is_nchw ? 1 : unit, is_nchw ? in_dim.width() : 1,
-    is_nchw ? unit : in_dim.channel(),
-    TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
-    is_nchw ? 0b0011 : 0b0101);
-
+  TensorDim weight_dim = weight_dims[FCParams::weight];
   weight_idx[FCParams::weight] = context.requestWeight(
     weight_dim, weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "weight", true);
 
   if (disable_bias.empty() || disable_bias.get() == false) {
+    TensorDim bias_dim = weight_dims[FCParams::bias];
+    const auto weight_dtype = context.getWeightDataType();
+    const bool weight_is_float = (weight_dtype == TensorDim::DataType::FP32 ||
+                                  weight_dtype == TensorDim::DataType::FP16);
+    const auto bias_dtype = weight_is_float ? context.getActivationDataType()
+                                            : TensorDim::DataType::FP32;
+    bias_dim.setDataType(bias_dtype);
+
     weight_idx[FCParams::bias] =
       context.requestWeight(bias_dim, bias_initializer, WeightRegularizer::NONE,
                             1.0f, bias_decay, "bias", true);
@@ -132,49 +96,22 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
 
   /** create weights for LoRA */
   if (lora_rank) {
-
-    /** loraA Dimension : (1, 1, in_dim.width, lora_rank) */
-    TensorDim loraA_dim(
-      1, is_nchw ? 1 : lora_rank, is_nchw ? in_dim.width() : 1,
-      is_nchw ? lora_rank : in_dim.channel(),
-      TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
-      is_nchw ? 0b0011 : 0b0101);
-
-    /** loraB Dimension : (1, 1, lora_rank, unit) */
-    TensorDim loraB_dim(
-      1, is_nchw ? 1 : unit, is_nchw ? lora_rank : 1,
-      is_nchw ? unit : lora_rank,
-      TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
-      is_nchw ? 0b0011 : 0b0101);
-
-    /** loraTmp Dimension : (B, 1, in_dim.height(), lora_rank) */
-    TensorDim loraTmp_dim(
-      in_dim.batch(), is_nchw ? 1 : lora_rank, is_nchw ? in_dim.height() : 1,
-      is_nchw ? lora_rank : in_dim.width(),
-      TensorDim::TensorType(context.getFormat(),
-                            context.getActivationDataType()),
-      is_nchw ? 0b1011 : 0b1101);
-
-    /** loraTmp Dimension : (B, 1, in_dim.height(), unit) */
-    TensorDim loraOut_dim(
-      in_dim.batch(), is_nchw ? 1 : unit, is_nchw ? in_dim.height() : 1,
-      is_nchw ? unit : in_dim.width(),
-      TensorDim::TensorType(context.getFormat(),
-                            context.getActivationDataType()),
-      is_nchw ? 0b1011 : 0b1101);
-
+    TensorDim loraA_dim = weight_dims[weight_dims.size() - 2];
     lora_idx[LORAParams::loraA] = context.requestWeight(
       loraA_dim, Initializer::ZEROS, weight_regularizer,
       weight_regularizer_constant, weight_decay, "loraA", true);
 
+    TensorDim loraB_dim = weight_dims[weight_dims.size() - 1];
     lora_idx[LORAParams::loraB] = context.requestWeight(
       loraB_dim, Initializer::LECUN_NORMAL, weight_regularizer,
       weight_regularizer_constant, weight_decay, "loraB", true);
 
+    TensorDim loraTmp_dim = tensor_dims[0];
     lora_idx[LORAParams::loraTmp] =
       context.requestTensor(loraTmp_dim, "hidden_tmp_lora", Initializer::NONE,
                             true, TensorLifespan::FORWARD_GRAD_LIFESPAN);
 
+    TensorDim loraOut_dim = tensor_dims[1];
     lora_idx[LORAParams::loraOut] =
       context.requestTensor(loraOut_dim, "hidden_lora", Initializer::NONE, true,
                             TensorLifespan::FORWARD_FUNC_LIFESPAN);
@@ -192,6 +129,26 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
     quantizer = nullptr;
     break;
   }
+}
+
+std::vector<TensorDim> FullyConnectedLayer::updateTensorsByInputDimensions(
+  InitLayerContext &init_context, RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
+
+  const auto &lora_rank = (std::get<props::LoraRank>(fc_props).empty())
+                            ? 0
+                            : std::get<props::LoraRank>(fc_props).get();
+  if (lora_rank) {
+    run_context.updateTensor(lora_idx[LORAParams::loraTmp], tensor_dims[0]);
+    run_context.updateTensor(lora_idx[LORAParams::loraOut], tensor_dims[1]);
+  }
+
+  return output_dims;
 }
 
 void FullyConnectedLayer::exportTo(
@@ -406,6 +363,100 @@ void FullyConnectedLayer::calcGradient(RunLayerContext &context) {
       djdla, djdtmp, false, false,
       !context.isGradientFirstAccess(lora_idx[LORAParams::loraA]));
   }
+}
+
+std::array<std::vector<TensorDim>, 3>
+FullyConnectedLayer::getLayerDimensions(InitLayerContext &context) {
+  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
+    << "Fully connected layer takes only one input";
+
+  auto &disable_bias = std::get<props::DisableBias>(*layer_impl_props);
+  const auto &unit = std::get<props::Unit>(fc_props).get();
+  const auto &lora_rank = (std::get<props::LoraRank>(fc_props).empty())
+                            ? 0
+                            : std::get<props::LoraRank>(fc_props).get();
+
+  /// @todo fc actaully supports multidimensions. EffDimFlag shouldn't be fixed
+  /// like this.
+  context.setEffDimFlagInputDimension(0, 0b1001);
+  context.setDynDimFlagInputDimension(0, 0b1000);
+
+  bool is_nchw = (context.getFormat() == Tformat::NCHW);
+  auto const &in_dim = context.getInputDimensions()[SINGLE_INOUT_IDX];
+
+  std::vector<TensorDim> output_dims;
+  std::vector<TensorDim> weight_dims;
+  std::vector<TensorDim> tensor_dims;
+
+  TensorDim output_dim = in_dim;
+  is_nchw ? output_dim.width(unit) : output_dim.channel(unit);
+  output_dim.setTensorType(
+    {context.getFormat(), context.getActivationDataType()});
+  output_dims.push_back(output_dim);
+
+  /** set weight specifications */
+  // @todo : This NCHW format setting is just temporal, it needs to be set by
+  // global configuration
+
+  /** Weight Dimension : (1, 1, in_dim.width(), unit)*/
+  TensorDim weight_dim(
+    1, is_nchw ? 1 : unit, is_nchw ? in_dim.width() : 1,
+    is_nchw ? unit : in_dim.channel(),
+    TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
+    is_nchw ? 0b0011 : 0b0101);
+  weight_dims.push_back(weight_dim);
+
+  if (disable_bias.empty() || disable_bias.get() == false) {
+    /** Bias Dimension : (1, 1, 1, unit) */
+    /// @note bias is directly added to activation
+    /// since we have no dequantizer for add operation,
+    /// we have to set its data type as same as activation.
+    /// This should be updated when the dequantizer is supported.
+    TensorDim bias_dim(1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
+                       TensorDim::TensorType(context.getFormat(),
+                                             context.getActivationDataType()),
+                       is_nchw ? 0b0001 : 0b0100);
+    weight_dims.push_back(bias_dim);
+  }
+
+  if (lora_rank) {
+    /** loraA Dimension : (1, 1, in_dim.width, lora_rank) */
+    TensorDim loraA_dim(
+      1, is_nchw ? 1 : lora_rank, is_nchw ? in_dim.width() : 1,
+      is_nchw ? lora_rank : in_dim.channel(),
+      TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
+      is_nchw ? 0b0011 : 0b0101);
+    weight_dims.push_back(loraA_dim);
+
+    /** loraB Dimension : (1, 1, lora_rank, unit) */
+    TensorDim loraB_dim(
+      1, is_nchw ? 1 : unit, is_nchw ? lora_rank : 1,
+      is_nchw ? unit : lora_rank,
+      TensorDim::TensorType(context.getFormat(), context.getWeightDataType()),
+      is_nchw ? 0b0011 : 0b0101);
+    weight_dims.push_back(loraB_dim);
+
+    /** loraTmp Dimension : (B, 1, in_dim.height(), lora_rank) */
+    TensorDim loraTmp_dim(
+      in_dim.batch(), is_nchw ? 1 : lora_rank, is_nchw ? in_dim.height() : 1,
+      is_nchw ? lora_rank : in_dim.width(),
+      TensorDim::TensorType(context.getFormat(),
+                            context.getActivationDataType()),
+      is_nchw ? 0b1011 : 0b1101);
+    tensor_dims.push_back(loraTmp_dim);
+
+    /** loraTmp Dimension : (B, 1, in_dim.height(), unit) */
+    TensorDim loraOut_dim(
+      in_dim.batch(), is_nchw ? 1 : unit, is_nchw ? in_dim.height() : 1,
+      is_nchw ? unit : in_dim.width(),
+      TensorDim::TensorType(context.getFormat(),
+                            context.getActivationDataType()),
+      is_nchw ? 0b1011 : 0b1101);
+    tensor_dims.push_back(loraOut_dim);
+  }
+
+  return std::array<std::vector<TensorDim>, 3>{output_dims, weight_dims,
+                                               tensor_dims};
 }
 
 } /* namespace nntrainer */

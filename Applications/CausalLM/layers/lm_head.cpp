@@ -49,63 +49,37 @@ void LmHeadLayer::finalize(nntrainer::InitLayerContext &context) {
   auto &disable_bias =
     std::get<nntrainer::props::DisableBias>(*layer_impl_props);
 
-  auto unit = std::get<nntrainer::props::Unit>(lmhead_props).get();
   if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
     skip_prefill =
       std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).get();
 
-  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
-    << "lm head layer takes only one input";
-
-  std::vector<ml::train::TensorDim> output_dims(1);
-
-  /// @todo fc actaully supports multidimensions.
-  /// EffDimFlag shouldn't be fixed like this.
-  context.setEffDimFlagInputDimension(0, 0b1001);
-  context.setDynDimFlagInputDimension(0, 0b1000);
-  bool is_nchw = (context.getFormat() == nntrainer::Tformat::NCHW);
-
-  /** set output dimensions */
-  ///@note lm_head's output dimension (height is always 1 !)
-  auto const &in_dim = context.getInputDimensions()[0];
-  output_dims[0] = in_dim;
-  if (is_nchw)
-    output_dims[0].width(unit);
-  else
-    output_dims[0].channel(unit);
-  output_dims[0].height(1);
-
-  output_dims[0].setTensorType(
-    {context.getFormat(), context.getActivationDataType()});
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
 
   context.setOutputDimensions(output_dims);
 
-  /** set weight specifications */
-  ml::train::TensorDim bias_dim(
-    1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
-    ml::train::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()),
-    is_nchw ? 0b0001 : 0b0100);
-
-  ///@note LMHead layer's tensor dim is transposed dim of user-defined
-  /// dim
-  /// so it can reuse embedding layer.
-  ml::train::TensorDim weight_dim(
-    1, is_nchw ? 1 : unit, is_nchw ? in_dim.width() : 1,
-    is_nchw ? unit : in_dim.channel(),
-    ml::train::TensorDim::TensorType(context.getFormat(),
-                                     context.getWeightDataType()),
-    is_nchw ? 0b0011 : 0b0101);
-
   weight_idx[LmHeadParams::weight] = context.requestWeight(
-    weight_dim, weight_initializer, weight_regularizer,
+    weight_dims[LmHeadParams::weight], weight_initializer, weight_regularizer,
     weight_regularizer_constant, weight_decay, "weight", true);
 
   if (disable_bias.empty() || disable_bias.get() == false) {
     weight_idx[LmHeadParams::bias] = context.requestWeight(
-      bias_dim, bias_initializer, nntrainer::WeightRegularizer::NONE, 1.0f,
-      bias_decay, "bias", true);
+      weight_dims[LmHeadParams::bias], bias_initializer,
+      nntrainer::WeightRegularizer::NONE, 1.0f, bias_decay, "bias", true);
   }
+}
+
+std::vector<nntrainer::TensorDim> LmHeadLayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
+
+  return output_dims;
 }
 
 void LmHeadLayer::setProperty(const std::vector<std::string> &values) {
@@ -179,16 +153,60 @@ void LmHeadLayer::exportTo(nntrainer::Exporter &exporter,
   exporter.saveResult(lmhead_props, method, this);
 }
 
-void LmHeadLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  nntrainer::TensorDim in_dim = context.getInput(SINGLE_INOUT_IDX).getDim();
+std::array<std::vector<nntrainer::TensorDim>, 3>
+LmHeadLayer::getLayerDimensions(nntrainer::InitLayerContext &context) {
+  auto &disable_bias =
+    std::get<nntrainer::props::DisableBias>(*layer_impl_props);
 
-  unsigned int height = input_dimensions[0].height();
+  auto unit = std::get<nntrainer::props::Unit>(lmhead_props).get();
 
-  // output dim's height is always 1 !
-  in_dim.height(height);
-  context.updateInput(SINGLE_INOUT_IDX, in_dim);
+  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
+    << "lm head layer takes only one input";
+
+  std::vector<ml::train::TensorDim> output_dims(1);
+  std::vector<ml::train::TensorDim> weight_dims;
+
+  /// @todo fc actaully supports multidimensions.
+  /// EffDimFlag shouldn't be fixed like this.
+  context.setEffDimFlagInputDimension(0, 0b1001);
+  context.setDynDimFlagInputDimension(0, 0b1000);
+  bool is_nchw = (context.getFormat() == nntrainer::Tformat::NCHW);
+
+  /** set output dimensions */
+  ///@note lm_head's output dimension (height is always 1 !)
+  auto const &in_dim = context.getInputDimensions()[SINGLE_INOUT_IDX];
+  output_dims[SINGLE_INOUT_IDX] = in_dim;
+  if (is_nchw)
+    output_dims[SINGLE_INOUT_IDX].width(unit);
+  else
+    output_dims[SINGLE_INOUT_IDX].channel(unit);
+  output_dims[SINGLE_INOUT_IDX].height(1);
+
+  output_dims[SINGLE_INOUT_IDX].setTensorType(
+    {context.getFormat(), context.getActivationDataType()});
+
+  ///@note LMHead layer's tensor dim is transposed dim of user-defined
+  /// dim
+  /// so it can reuse embedding layer.
+  ml::train::TensorDim weight_dim(
+    1, is_nchw ? 1 : unit, is_nchw ? in_dim.width() : 1,
+    is_nchw ? unit : in_dim.channel(),
+    ml::train::TensorDim::TensorType(context.getFormat(),
+                                     context.getWeightDataType()),
+    is_nchw ? 0b0011 : 0b0101);
+  weight_dims.push_back(weight_dim);
+
+  if (disable_bias.empty() || disable_bias.get() == false) {
+    /** set weight specifications */
+    ml::train::TensorDim bias_dim(
+      1, is_nchw ? 1 : unit, 1, is_nchw ? unit : 1,
+      ml::train::TensorDim::TensorType(context.getFormat(),
+                                       context.getWeightDataType()),
+      is_nchw ? 0b0001 : 0b0100);
+    weight_dims.push_back(bias_dim);
+  }
+
+  return {output_dims, weight_dims, {}};
 }
 
 #ifdef PLUGGABLE

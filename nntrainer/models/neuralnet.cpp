@@ -77,6 +77,14 @@ namespace nntrainer {
 namespace {
 
 Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
+  if (dim.getDataLen() == 0) {
+    throw std::invalid_argument(
+      "[mapExternalTensor] empty tensor dim is not allowed: dim = [" +
+      std::to_string(dim.batch()) + ", " + std::to_string(dim.channel()) +
+      ", " + std::to_string(dim.height()) + ", " + std::to_string(dim.width()) +
+      "]");
+  }
+
   const unsigned int bytes = static_cast<unsigned int>(
     static_cast<size_t>(dim.getDataLen()) * dim.getDataTypeSize());
 
@@ -1634,8 +1642,11 @@ std::vector<float *> NeuralNetwork::incremental_inference(
   return output;
 }
 
-void NeuralNetwork::resetInputDimension(std::vector<TensorDim> dims) {
-  model_graph.resetInputDimension(dims);
+void NeuralNetwork::resetInputDimension(
+  std::vector<TensorDim> model_input_dims) {
+  if (initialized) {
+    model_graph.resetInputDimension(model_input_dims);
+  }
 }
 
 int NeuralNetwork::setDataset(const DatasetModeType &mode,

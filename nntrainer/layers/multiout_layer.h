@@ -52,6 +52,14 @@ public:
   void finalize(InitLayerContext &context) override;
 
   /**
+   * @copydoc Layer::updateTensorsByInputDimensions(InitLayerContext
+   * &init_context, RunLayerContext &context)
+   */
+  std::vector<TensorDim>
+  updateTensorsByInputDimensions(InitLayerContext &init_context,
+                                 RunLayerContext &context) override;
+
+  /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
    */
   void forwarding(RunLayerContext &context, bool training) override;
@@ -99,11 +107,14 @@ public:
    */
   const std::string getType() const override { return MultiOutLayer::type; };
 
-  void updateTensorsByInputDimensions(
-    nntrainer::RunLayerContext &context,
-    std::vector<nntrainer::TensorDim> input_dimensions) override;
-
   static constexpr const char *type = "multiout";
+
+private:
+  /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<TensorDim>, 3>
+  getLayerDimensions(InitLayerContext &context) override;
 };
 
 } // namespace nntrainer

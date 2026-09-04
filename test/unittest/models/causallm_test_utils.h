@@ -224,6 +224,11 @@ public:
   void initializeModel() override { this->initialize(); }
 
   /**
+   * @brief Get the underlying NNTrainer Model pointer
+   */
+  ml::train::Model *getModel() { return this->model.get(); }
+
+  /**
    * @brief Save model weights
    */
   void saveWeight(const std::string &path) override { this->save_weight(path); }

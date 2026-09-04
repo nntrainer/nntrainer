@@ -31,10 +31,27 @@ float swiglu(float x) { return x / (1 + nntrainer::exp_util(-x)); }
 } // namespace ActivationOp
 
 void SwiGLULayer::finalize(nntrainer::InitLayerContext &context) {
-  context.setOutputDimensions({context.getInputDimensions()[0]});
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
+  context.setOutputDimensions(output_dims);
 
   if (!std::get<nntrainer::props::SkipPrefill>(swiglu_props).empty())
     skip_prefill = std::get<nntrainer::props::SkipPrefill>(swiglu_props).get();
+}
+
+std::vector<nntrainer::TensorDim> SwiGLULayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(INPUT_IDX_1,
+                          init_context.getInputDimensions()[INPUT_IDX_1]);
+  run_context.updateInput(INPUT_IDX_2,
+                          init_context.getInputDimensions()[INPUT_IDX_2]);
+  run_context.updateOutput(OUT_IDX, output_dims[OUT_IDX]);
+
+  return output_dims;
 }
 
 void SwiGLULayer::forwarding(nntrainer::RunLayerContext &context,
@@ -82,25 +99,22 @@ void SwiGLULayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   }
 }
 
-void SwiGLULayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  ml::train::TensorDim input_dim1 = context.getInput(INPUT_IDX_1).getDim();
-  ml::train::TensorDim input_dim2 = context.getInput(INPUT_IDX_2).getDim();
-  ml::train::TensorDim output_dim = context.getOutput(OUT_IDX).getDim();
-
-  input_dim1.height(input_dimensions[0].height());
-  input_dim2.height(input_dimensions[0].height());
-  output_dim.height(input_dimensions[0].height());
-
-  context.updateInput(INPUT_IDX_1, input_dim1);
-  context.updateInput(INPUT_IDX_2, input_dim2);
-  context.updateOutput(OUT_IDX, output_dim);
-}
-
 void SwiGLULayer::calcDerivative(nntrainer::RunLayerContext &context) {
   // std::throw_with_nested(std::runtime_error("Training is not supported
   // yet."));
+}
+
+std::array<std::vector<nntrainer::TensorDim>, 3>
+SwiGLULayer::getLayerDimensions(nntrainer::InitLayerContext &context) {
+  NNTR_THROW_IF(context.getInputDimensions()[INPUT_IDX_1] !=
+                  context.getInputDimensions()[INPUT_IDX_2],
+                std::invalid_argument)
+    << "2 input dimensions of SwiGLU layer SHOULD BE identical";
+
+  return {std::move(std::vector<nntrainer::TensorDim>{
+            (context.getInputDimensions()[INPUT_IDX_1])}),
+          {},
+          {}};
 }
 
 #ifdef PLUGGABLE

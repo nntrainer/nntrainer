@@ -425,6 +425,8 @@ public:
    */
   bool isMixedTraining() { return istrequal(tensor_type[1], "FP32"); }
 
+  void setInputDimension(std::vector<TensorDim> dim) { input_dim = dim; }
+
 private:
   std::vector<TensorDim> input_dim; /**< Input dimensions for the layer */
   bool is_inplace;           /**< if the layer is expected to run in-place */

@@ -16,6 +16,7 @@
 
 #include <layer.h>
 #include <layer_context.h>
+#include <layer_node.h>
 #include <qwen3_causallm.h>
 #include <qwen3_embedding.h>
 
@@ -433,6 +434,91 @@ TEST_P(CausalLMTinyModelTest, WeightRoundTripProducesSameLogits) {
 TEST_P(CausalLMTinyModelTest, PromptProducesExpectedLogits) {
   const auto files = makeFiles();
   causallm_test::expectPromptProducesExpectedLogits(GetParam(), files);
+}
+
+/**
+ * @brief Test that resetInputDimension dynamically resizes the Qwen3 model
+ * successfully
+ */
+TEST_P(CausalLMTinyModelTest,
+       ResetInputDimensionResizesQwen3ModelSuccessfully) {
+  const auto files = makeFiles();
+  auto config =
+    causallm_test::makeTinyCausalLMConfig(GetParam(), files.tokenizer_path);
+  auto model_runner =
+    GetParam().create_model(config.model, config.generation, config.nntrainer);
+
+  model_runner->initializeModel();
+
+  auto qwen_model = dynamic_cast<TinyQwen3CausalLM *>(model_runner.get());
+  ASSERT_NE(qwen_model, nullptr);
+
+  auto nn_model = qwen_model->getModel();
+  ASSERT_NE(nn_model, nullptr);
+
+  std::vector<ml::train::TensorDim> input_dims = nn_model->getInputDimension();
+  ASSERT_FALSE(input_dims.empty());
+
+  // 1. Capture and verify the original input sequence length before resizing
+  unsigned int original_width = input_dims[0].width();
+
+  // Dynamically compute a new sequence length that is guaranteed to be
+  // different from original_width
+  unsigned int new_width = (original_width == 4u) ? 8u : 4u;
+
+  // Dynamic resizing: Change sequence length (width) to new_width
+  input_dims[0].width(new_width);
+
+  EXPECT_NO_THROW(nn_model->resetInputDimension(input_dims));
+
+  // 2. Deterministic Verification: Retrieve and verify the model's updated
+  // input dimension
+  std::vector<ml::train::TensorDim> updated_input_dims =
+    nn_model->getInputDimension();
+  ASSERT_FALSE(updated_input_dims.empty());
+
+  // Verify that the input sequence length has successfully resized and is
+  // different from original
+  EXPECT_EQ(updated_input_dims[0].width(), new_width);
+  EXPECT_NE(updated_input_dims[0].width(), original_width);
+
+  // 3. Deep Structural Verification: Extract intermediate layers to verify
+  // propagation In transformer models, the sequence length shifts from 'width'
+  // in the input to 'height' in subsequent layers.
+
+  std::vector<std::string> layers_to_check = {
+    "embedding0",            // Embedding layer
+    "layer0_attention_norm", // RMS Norm layer
+    "layer0_wq",             // Fully Connected layer
+    "layer0_q_norm",         // Reshaped RMS Norm layer
+    "layer0_attention",      // Multi-Head Attention Core layer
+    "layer0_attention_out",  // Fully Connected layer (Output projection)
+    "layer0_decoder_add",    // Addition layer
+    "layer0_ffn_norm",       // RMS Norm layer
+    "output_norm"            // Terminal RMS Norm layer before Logits
+  };
+
+  for (const auto &layer_name : layers_to_check) {
+    std::shared_ptr<ml::train::Layer> layer;
+    int status = nn_model->getLayer(layer_name.c_str(), &layer);
+    EXPECT_EQ(status, ML_ERROR_NONE)
+      << "Failed to extract layer: " << layer_name;
+    ASSERT_NE(layer, nullptr) << "Layer pointer is null for: " << layer_name;
+
+    // Forcefully downcast the API wrapper to the core LayerNode to access
+    // internal tensor dimensions
+    auto layer_node = std::static_pointer_cast<nntrainer::LayerNode>(layer);
+    ASSERT_NE(layer_node, nullptr)
+      << "Failed to downcast to LayerNode for: " << layer_name;
+
+    auto out_dims = layer_node->getOutputDimensions();
+    ASSERT_FALSE(out_dims.empty())
+      << "Output dimensions are empty for layer: " << layer_name;
+
+    EXPECT_EQ(out_dims[0].height(), new_width)
+      << "Height mismatch detected at layer: " << layer_name << ". Expected "
+      << new_width << " but got " << out_dims[0].height();
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(

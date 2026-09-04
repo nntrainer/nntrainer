@@ -511,11 +511,9 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   };
   input = build_inference_inputs();
 
-  ///@note contains possible bug
-  // std::vector<ml::train::TensorDim> input_dims;
-  // ml::train::TensorDim input_dim(1, 1, input_len, DIM);
-  // input_dims.push_back(input_dim);
-  // model->resetInputDimension(input_dims);
+  std::vector<ml::train::TensorDim> input_dims = model->getInputDimension();
+  input_dims[0] = ml::train::TensorDim(1, 1, 1, input_len);
+  model->resetInputDimension(input_dims);
 
   auto start_prefill = std::chrono::high_resolution_clock::now();
 

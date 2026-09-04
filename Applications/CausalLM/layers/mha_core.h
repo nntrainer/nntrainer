@@ -242,6 +242,14 @@ public:
   WIN_EXPORT void finalize(nntrainer::InitLayerContext &context) override;
 
   /**
+   * @copydoc Layer::updateTensorsByInputDimensions(InitLayerContext
+   * &init_context, RunLayerContext &context)
+   */
+  WIN_EXPORT std::vector<nntrainer::TensorDim> updateTensorsByInputDimensions(
+    nntrainer::InitLayerContext &init_context,
+    nntrainer::RunLayerContext &run_context) override;
+
+  /**
    * @brief forwarding function of MhaCore Layer
    *        Please note that forwarding function is used only for training.
    */
@@ -316,10 +324,6 @@ public:
   WIN_EXPORT void setBatch(nntrainer::RunLayerContext &context,
                            unsigned int batch) override;
 
-  WIN_EXPORT void updateTensorsByInputDimensions(
-    nntrainer::RunLayerContext &context,
-    std::vector<nntrainer::TensorDim> input_dimensions) override;
-
   /**
    * @brief Set the cache index for external cache mode.
    *        Must be called before forwarding() when use_external_cache is true.
@@ -331,7 +335,6 @@ public:
    * @brief Get the current cache index
    */
   WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
-
   inline static const std::string type = "mha_core";
 
 private:
@@ -506,6 +509,12 @@ private:
                                      int head_dim, int to);
 
   /************** END OF  ROTARY EMBEDDING *************/
+
+  /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<nntrainer::TensorDim>, 3>
+  getLayerDimensions(nntrainer::InitLayerContext &context) override;
 
   /**
    * @brief calculate common derivative

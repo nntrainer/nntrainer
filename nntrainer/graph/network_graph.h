@@ -35,6 +35,8 @@ class Connection;
  * @brief   NeuralNetwork Graph Class which manage layers
  */
 class NetworkGraph {
+  friend class NeuralNetwork;
+
 public:
   /**
    * @brief     Constructor of NeuralNetwork Graph Class
@@ -201,19 +203,14 @@ public:
   void setBatchSize(unsigned int batch_size);
 
   /**
-   * @brief     reset input dimensions of a model
-   * @param[in] dims input dimensions
-   * @note Similar to reinitialize, the resetInputDimension API is used for
-   * modifying input dimensions after model initialization. The reinitialize
-   * function should be the officially called API when changing input
-   * dimensions, as it properly recalculates weights, tensors, and outputs for
-   * each layer. On the other hand, resetInputDimension is a specialized API
-   * created to modify only specific dimensions (specifically height values)
-   * within input/output dimensions. Since this API uniformly adjusts the height
-   * across all model layers, developers must verify that every layer in their
-   * model architecture can safely accommodate such height modifications.
+   * @brief     Reset input dimensions of a model
+   * @param[in] model_input_dims input dimensions
+   * @note resetInputDimension recalculates ans sets the dimensions of the
+   * outputs and the tensors according to the given input for each layer.
+   * However it must be guaranteed that the weight dimensions remain unchanged.
+   * If not, it will raise an error.
    */
-  void resetInputDimension(std::vector<TensorDim> dims);
+  void resetInputDimension(std::vector<TensorDim> model_input_dims);
 
   /**
    * @brief try apply gradient if possible

@@ -54,6 +54,14 @@ public:
   void finalize(InitLayerContext &context) override;
 
   /**
+   * @copydoc Layer::updateTensorsByInputDimensions(InitLayerContext
+   * &init_context, RunLayerContext &context)
+   */
+  std::vector<TensorDim>
+  updateTensorsByInputDimensions(InitLayerContext &init_context,
+                                 RunLayerContext &context) override;
+
+  /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
    */
   void forwarding(RunLayerContext &context, bool training) override;
@@ -92,15 +100,18 @@ public:
    */
   const std::string getType() const override { return AdditionLayer::type; };
 
-  void updateTensorsByInputDimensions(
-    nntrainer::RunLayerContext &context,
-    std::vector<nntrainer::TensorDim> input_dimensions) override;
-
   std::tuple<props::Print, props::SkipPrefill>
     add_props; /**< fc layer properties : unit - number of output neurons */
   bool skip_prefill = false;
 
   static constexpr const char *type = "addition";
+
+private:
+  /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<TensorDim>, 3>
+  getLayerDimensions(InitLayerContext &context) override;
 };
 
 } // namespace nntrainer

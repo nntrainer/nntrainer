@@ -668,9 +668,7 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
 
   layer->finalize(context);
 
-#ifdef ENABLE_TEST
   init_context = std::make_unique<InitLayerContext>(context);
-#endif // ENABLE_TEST
 
 #ifdef PROFILE
   auto profile_name = [this](const char *suffix) {
@@ -891,12 +889,30 @@ void LayerNode::setBatch(unsigned int batch) {
   getLayer()->setBatch(*run_context, batch);
 }
 
-void LayerNode::updateTensorsByInputDimensions(
+std::vector<TensorDim> LayerNode::updateTensorsByInputDimensions(
   std::vector<TensorDim> input_dimensions) {
   NNTR_THROW_IF(!run_context, std::invalid_argument)
     << " update tensors not supported before initialization";
 
-  getLayer()->updateTensorsByInputDimensions(*run_context, input_dimensions);
+  init_context->setInputDimension(input_dimensions);
+
+  auto output_dims =
+    getLayer()->updateTensorsByInputDimensions(*init_context, *run_context);
+
+  // Defensive weight dimension check to prevent dynamic weight resizing at
+  // runtime
+  auto weight_dims = std::get<1>(getLayer()->getLayerDimensions(*init_context));
+  for (unsigned int i = 0; i < weight_dims.size(); ++i) {
+    NNTR_THROW_IF(run_context->getWeight(i).getDim() != weight_dims[i],
+                  std::invalid_argument)
+      << "The input to be changed triggers a change in the previously "
+         "allocated weight dimensions for layer "
+      << getName() << " at index " << i
+      << ". Original: " << run_context->getWeight(i).getDim()
+      << ", New: " << weight_dims[i];
+  }
+
+  return output_dims;
 }
 
 /**
