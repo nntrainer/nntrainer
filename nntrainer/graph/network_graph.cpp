@@ -808,6 +808,22 @@ NetworkGraph::finalizeContext(const std::shared_ptr<LayerNode> &lnode,
   if (lnode->getInPlaceType() != InPlaceType::NONE && lnode->supportInPlace()) {
     setInplaceSharedMemoryConfigByLayer(lnode, shared_var, shared_grad);
 
+    /** in-place output specs below alias input tensors by name; an output
+     * that cannot be mapped back to an input means the graph is broken,
+     * so fail loudly instead of silently aliasing a wrong tensor */
+    if (lnode->getType() == IdentityLayer::type) {
+      NNTR_THROW_IF(out_specs.size() > inputs.size(), std::runtime_error)
+        << "Identity layer " << lnode->getName() << " has " << out_specs.size()
+        << " outputs but only " << inputs.size() << " inputs";
+    } else if (lnode->getInPlaceDirection() == InPlaceDirection::RIGHT) {
+      NNTR_THROW_IF(inputs.size() < 2, std::runtime_error)
+        << "In-place direction RIGHT requires two inputs: " << lnode->getName();
+    } else if (lnode->getType() != WeightLayer::type) {
+      NNTR_THROW_IF(inputs.empty(), std::runtime_error)
+        << "In-place layer without input cannot be finalized: "
+        << lnode->getName();
+    }
+
     for (unsigned int i = 0; i < out_specs.size(); ++i) {
       auto &s = out_specs.at(i);
       if (shared_var) {
@@ -987,6 +1003,23 @@ NetworkGraph::refinalizeContext(const std::shared_ptr<LayerNode> &lnode,
   bool shared_var = false, shared_grad = false;
   if (lnode->getInPlaceType() != InPlaceType::NONE) {
     setInplaceSharedMemoryConfigByLayer(lnode, shared_var, shared_grad);
+
+    /** in-place output specs below alias input tensors by name; an output
+     * that cannot be mapped back to an input means the graph is broken,
+     * so fail loudly instead of silently aliasing a wrong tensor */
+    if (lnode->getType() == IdentityLayer::type) {
+      NNTR_THROW_IF(out_specs.size() > inputs.size(), std::runtime_error)
+        << "Identity layer " << lnode->getName() << " has " << out_specs.size()
+        << " outputs but only " << inputs.size() << " inputs";
+    } else if (lnode->getInPlaceDirection() == InPlaceDirection::RIGHT) {
+      NNTR_THROW_IF(inputs.size() < 2, std::runtime_error)
+        << "In-place direction RIGHT requires two inputs: " << lnode->getName();
+    } else {
+      NNTR_THROW_IF(inputs.empty(), std::runtime_error)
+        << "In-place layer without input cannot be refinalized: "
+        << lnode->getName();
+    }
+
     for (unsigned int i = 0; i < out_specs.size(); ++i) {
       auto &s = out_specs.at(i);
       if (shared_var) {

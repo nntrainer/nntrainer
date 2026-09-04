@@ -12,6 +12,8 @@
  * @brief  This is the layer context for each layer
  */
 
+#include <map>
+
 #include "nntrainer_error.h"
 #include <functional>
 #include <memory>
@@ -562,7 +564,14 @@ bool RunLayerContext::validate(bool skip_input, bool skip_label) {
 #ifdef DEBUG
   std::function<bool(const Var_Grad *, bool)> matcher;
 
-  if (tensor_map.empty() || !tensor_map[inputs[0]->getName()]) {
+  /** layers without an input connection (e.g. WeightLayer) have an empty
+   * inputs vector; for them only tensor_map.empty() triggers the rebuild */
+  auto has_valid_entry = [this](const std::string &name) {
+    auto iter = tensor_map.find(name);
+    return iter != tensor_map.end() && iter->second != nullptr;
+  };
+  if (tensor_map.empty() ||
+      (!inputs.empty() && !has_valid_entry(inputs[0]->getName()))) {
     auto filler = [this](const auto &vec) {
       for (auto const &val : vec) {
         if (val->getVariableRef().getTensorType().data_type ==
@@ -579,7 +588,44 @@ bool RunLayerContext::validate(bool skip_input, bool skip_label) {
 #else
           throw std::invalid_argument("Error: enable-fp16 is not enabled");
 #endif
-        } else {
+        } else if (val->getVariableRef().getTensorType().data_type ==
+                   TensorDim::DataType::UINT32) {
+          tensor_map[val->getName()] =
+            val->getVariableRef().template getData<uint32_t>();
+          tensor_map[val->getGradientName()] =
+            val->getGradientRef().template getData<uint32_t>();
+        } else if (val->getVariableRef().getTensorType().data_type ==
+                   TensorDim::DataType::UINT16) {
+          tensor_map[val->getName()] =
+            val->getVariableRef().template getData<uint16_t>();
+          tensor_map[val->getGradientName()] =
+            val->getGradientRef().template getData<uint16_t>();
+        } else if (val->getVariableRef().getTensorType().data_type ==
+                   TensorDim::DataType::UINT8) {
+          tensor_map[val->getName()] =
+            val->getVariableRef().template getData<uint8_t>();
+          tensor_map[val->getGradientName()] =
+            val->getGradientRef().template getData<uint8_t>();
+        } else if (val->getVariableRef().getTensorType().data_type ==
+                   TensorDim::DataType::UINT4) {
+          tensor_map[val->getName()] =
+            val->getVariableRef().template getData<uint8_t>();
+          tensor_map[val->getGradientName()] =
+            val->getGradientRef().template getData<uint8_t>();
+        } else if (val->getVariableRef().getTensorType().data_type ==
+                   TensorDim::DataType::Q4_0) {
+          tensor_map[val->getName()] =
+            val->getVariableRef().template getData<uint8_t>();
+          tensor_map[val->getGradientName()] =
+            val->getGradientRef().template getData<uint8_t>();
+        } else if (val->getVariableRef().getTensorType().data_type ==
+                   TensorDim::DataType::Q4_K) {
+          tensor_map[val->getName()] =
+            val->getVariableRef().template getData<uint8_t>();
+          tensor_map[val->getGradientName()] =
+            val->getGradientRef().template getData<uint8_t>();
+        } else if (val->getVariableRef().getTensorType().data_type ==
+                   TensorDim::DataType::Q6_K) {
           tensor_map[val->getName()] =
             val->getVariableRef().template getData<uint8_t>();
           tensor_map[val->getGradientName()] =
