@@ -501,6 +501,33 @@ void __fallback_rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
     "NYI : __fallback_rms_norm_wrt_width_fp16_intrinsic with FP16 type input");
 }
 
+void __fallback_layer_norm_wrt_width_fp16_intrinsic(
+  const _FP16 *__restrict X, _FP16 *__restrict Y, const float *__restrict gamma,
+  const float *__restrict beta, size_t H, size_t W, float epsilon) {
+  for (size_t h = 0; h < H; ++h) {
+    const _FP16 *row_x = X + h * W;
+    _FP16 *row_y = Y + h * W;
+    float mean = 0.0f;
+    for (size_t w = 0; w < W; ++w)
+      mean += static_cast<float>(row_x[w]);
+    mean /= static_cast<float>(W);
+
+    float variance = 0.0f;
+    for (size_t w = 0; w < W; ++w) {
+      const float deviation = static_cast<float>(row_x[w]) - mean;
+      variance += deviation * deviation;
+    }
+    variance /= static_cast<float>(W);
+    const float inv_std_dev = 1.0f / std::sqrt(variance + epsilon);
+
+    for (size_t w = 0; w < W; ++w) {
+      const float normalized =
+        (static_cast<float>(row_x[w]) - mean) * inv_std_dev;
+      row_y[w] = static_cast<_FP16>(normalized * gamma[w] + beta[w]);
+    }
+  }
+}
+
 template <>
 void __fallback_clamp(const _FP16 *input, _FP16 *output, size_t length,
                       _FP16 lower_bound, _FP16 upper_bound) {

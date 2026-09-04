@@ -408,6 +408,16 @@ void rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
 }
 
 template <>
+void layer_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
+                                         _FP16 *__restrict Y,
+                                         const float *__restrict gamma,
+                                         const float *__restrict beta, size_t H,
+                                         size_t W, float epsilon) {
+  neon::layer_norm_wrt_width_fp16_intrinsic<_FP16>(X, Y, gamma, beta, H, W,
+                                                   epsilon);
+}
+
+template <>
 void sine(const unsigned int N, _FP16 *X, _FP16 *Y, float alpha, float beta) {
   nntrainer::neon::sine<_FP16>(N, X, Y, alpha, beta);
 }

@@ -1350,6 +1350,11 @@ void dequantize_row_q8_0(const void *x_raw, T *y, int64_t k);
 void rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,
                                        float epsilon);
+void layer_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
+                                         float *__restrict Y,
+                                         const float *__restrict gamma,
+                                         const float *__restrict beta, size_t H,
+                                         size_t W, float epsilon);
 
 /**
  * @brief Causal depthwise Conv1D prefill for kernel size 3.
@@ -1401,6 +1406,11 @@ void causal_depthwise_conv1d_k3_decode(const float *x_cur,
 template <typename T = float>
 void rms_norm_wrt_width_fp16_intrinsic(const T *__restrict X, T *__restrict Y,
                                        size_t H, size_t W, float epsilon);
+template <typename T = float>
+void layer_norm_wrt_width_fp16_intrinsic(const T *__restrict X, T *__restrict Y,
+                                         const float *__restrict gamma,
+                                         const float *__restrict beta, size_t H,
+                                         size_t W, float epsilon);
 #endif
 
 /**

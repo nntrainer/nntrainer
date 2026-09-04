@@ -870,6 +870,11 @@ void softmax_row(__fp16 *qk_out, size_t start_row, size_t end_row,
 void rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,
                                        float epsilon);
+void layer_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
+                                         float *__restrict Y,
+                                         const float *__restrict gamma,
+                                         const float *__restrict beta, size_t H,
+                                         size_t W, float epsilon);
 
 /**
  * @brief rms normalization computation w.r.t. width in H*W matrix input
@@ -883,6 +888,11 @@ void rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
 template <typename T = float>
 void rms_norm_wrt_width_fp16_intrinsic(const T *__restrict X, T *__restrict Y,
                                        size_t H, size_t W, float epsilon);
+template <typename T = float>
+void layer_norm_wrt_width_fp16_intrinsic(const T *__restrict X, T *__restrict Y,
+                                         const float *__restrict gamma,
+                                         const float *__restrict beta, size_t H,
+                                         size_t W, float epsilon);
 
 /**
  * @brief fallback for clamping function.

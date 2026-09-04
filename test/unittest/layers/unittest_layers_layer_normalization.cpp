@@ -38,6 +38,14 @@ auto ln_axis_3 = LayerGoldenTestParamType(
   nntrainer::createLayer<nntrainer::LayerNormalizationLayer>, {"axis=3"},
   "2:4:2:3", "ln_axis_3.nnlayergolden", ln_option, "nchw", "fp32", "fp32");
 
+auto ln_axis_3_inference = LayerGoldenTestParamType(
+  nntrainer::createLayer<nntrainer::LayerNormalizationLayer>, {"axis=3"},
+  "2:4:2:3", "ln_axis_3.nnlayergolden",
+  LayerGoldenTestParamOptions::SKIP_CALC_DERIV |
+    LayerGoldenTestParamOptions::SKIP_CALC_GRAD |
+    LayerGoldenTestParamOptions::FORWARD_MODE_INFERENCE,
+  "nchw", "fp32", "fp32");
+
 auto ln_axis_1_2 = LayerGoldenTestParamType(
   nntrainer::createLayer<nntrainer::LayerNormalizationLayer>, {"axis=1, 2"},
   "2:4:2:3", "ln_axis_1_2.nnlayergolden", ln_option, "nchw", "fp32", "fp32");
@@ -56,7 +64,8 @@ auto ln_axis_1_2_3 = LayerGoldenTestParamType(
 
 GTEST_PARAMETER_TEST(LayerNormalization, LayerGoldenTest,
                      ::testing::Values(ln_axis_1, ln_axis_2, ln_axis_3,
-                                       ln_axis_1_2, ln_axis_2_3, ln_axis_1_3,
+                                       ln_axis_3_inference, ln_axis_1_2,
+                                       ln_axis_2_3, ln_axis_1_3,
                                        ln_axis_1_2_3));
 
 #ifdef ENABLE_FP16
@@ -98,7 +107,6 @@ auto ln_axis_1_2_3_w16a16 = LayerGoldenTestParamType(
 GTEST_PARAMETER_TEST(LayerNormalization16, LayerGoldenTest,
                      ::testing::Values(ln_axis_1_w16a16, ln_axis_2_w16a16,
                                        ln_axis_3_w16a16, ln_axis_1_2_w16a16,
-                                       ln_axis_2_3_w16a16,
-                                       ln_axis_1_3_w16a16,
+                                       ln_axis_2_3_w16a16, ln_axis_1_3_w16a16,
                                        ln_axis_1_2_3_w16a16));
 #endif

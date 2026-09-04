@@ -1944,6 +1944,52 @@ void rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
   }
 }
 
+void layer_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
+                                         float *__restrict Y,
+                                         const float *__restrict gamma,
+                                         const float *__restrict beta, size_t H,
+                                         size_t W, float epsilon) {
+  for (size_t h = 0; h < H; ++h) {
+    const float *row_x = X + h * W;
+    float *row_y = Y + h * W;
+    size_t w = 0;
+    float32x4_t sum_v = vdupq_n_f32(0.0f);
+    for (; w + 4 <= W; w += 4)
+      sum_v = vaddq_f32(sum_v, vld1q_f32(row_x + w));
+    float sum = hsum_f32x4(sum_v);
+    for (; w < W; ++w)
+      sum += row_x[w];
+    const float mean = sum / static_cast<float>(W);
+    const float32x4_t mean_v = vdupq_n_f32(mean);
+
+    w = 0;
+    float32x4_t variance_v = vdupq_n_f32(0.0f);
+    for (; w + 4 <= W; w += 4) {
+      const float32x4_t deviation = vsubq_f32(vld1q_f32(row_x + w), mean_v);
+      variance_v = VFMAQ_F32(variance_v, deviation, deviation);
+    }
+    float variance = hsum_f32x4(variance_v);
+    for (; w < W; ++w) {
+      const float deviation = row_x[w] - mean;
+      variance += deviation * deviation;
+    }
+    const float inv_std_dev =
+      1.0f / std::sqrt(variance / static_cast<float>(W) + epsilon);
+    const float32x4_t inv_std_dev_v = vdupq_n_f32(inv_std_dev);
+
+    w = 0;
+    for (; w + 4 <= W; w += 4) {
+      float32x4_t normalized =
+        vmulq_f32(vsubq_f32(vld1q_f32(row_x + w), mean_v), inv_std_dev_v);
+      normalized =
+        VFMAQ_F32(vld1q_f32(beta + w), normalized, vld1q_f32(gamma + w));
+      vst1q_f32(row_y + w, normalized);
+    }
+    for (; w < W; ++w)
+      row_y[w] = (row_x[w] - mean) * inv_std_dev * gamma[w] + beta[w];
+  }
+}
+
 template <>
 void clamp(const float *input, float *output, size_t length, float lower_bound,
            float upper_bound) {
