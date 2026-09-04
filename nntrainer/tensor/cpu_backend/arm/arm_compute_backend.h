@@ -35,6 +35,30 @@
 
 namespace nntrainer {
 
+#if !defined(ENABLE_FP16) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+/**
+ * @brief F32 * F16 -> F32 GEMM (FP32 accumulation).
+ * @note Exposed only for ENABLE_FP16=0 consumers (e.g. the CausalLM
+ *       flash-attention path in mha_core.cpp), where the _FP16-typed
+ *       declaration below is compiled out. Uses the __fp16 builtin; the
+ *       definition lives in libnntrainer (built with ENABLE_FP16=1) and
+ *       resolves at link time. Under ENABLE_FP16 the _FP16
+ *       declaration below serves all callers (_FP16 == __fp16 there, since
+ *       nntrainer always sets USE__FP16 on ARM ENABLE_FP16 builds), so this
+ *       __fp16 overload is intentionally absent to avoid a second, undefined
+ *       overload should _FP16 ever resolve to _Float16. Additionally gated on
+ *       __ARM_FEATURE_FP16_VECTOR_ARITHMETIC (set only when the compiler
+ *       targets -march=...+fp16), since __fp16 is not a usable type on ARM
+ *       targets built without that extension (e.g. Tizen armv7l/aarch64,
+ *       which do not support fp16 NEON).
+ */
+void shgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
+            const unsigned int M, const unsigned int N, const unsigned int K,
+            const float alpha, const float *A, const unsigned int lda,
+            const __fp16 *B, const unsigned int ldb, const float beta, float *C,
+            const unsigned int ldc);
+#endif
+
 #ifdef ENABLE_FP16
 /**
  * @brief F32 * F16 = F32 GEMM

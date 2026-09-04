@@ -12,6 +12,9 @@
  *
  */
 
+#ifndef __HGEMM_H__
+#define __HGEMM_H__
+
 /**
  * @brief     hgemm computation with neon : Y = alpha*op(A)*op(B) + beta*C,
  * where op(X) is one of X or X**T
@@ -102,3 +105,39 @@ void hgemm_classify(const __fp16 *A, const __fp16 *B, float *C32,
 void hgemm_K1(const __fp16 *A, const __fp16 *B, __fp16 *C, unsigned int M,
               unsigned int N, unsigned int K, float alpha, float beta,
               bool TransA, bool TransB);
+
+/**
+ * @brief     FP16 x FP16 -> FP32 QK GEMM via ARMv8.2-A FMLAL widening.
+ * Computes C[m,n] = alpha * sum_k A[m,k] * B[n,k] (TransB-style dot). Each pair
+ * of vfmlalq_low/high_f16 widens 8 FP16 products into FP32 accumulators, so
+ * products accumulate in FP32 from the start (no FP16-product overflow on wide
+ * logits). Row-major; lda/ldb/ldc are row strides; K is the dot length.
+ * @param[in] A __fp16 * lhs, row-major, lda columns
+ * @param[in] B __fp16 * rhs, row-major, ldb columns
+ * @param[in] C float * output, row-major, ldc columns
+ * @param[in] M number of rows of A and C
+ * @param[in] N number of rows of B (columns of C)
+ * @param[in] K dot length
+ * @param[in] alpha scaling factor applied to the result
+ * @param[in] lda row stride of A
+ * @param[in] ldb row stride of B
+ * @param[in] ldc row stride of C
+ */
+void hgemm_f16xf16_f32_fmlal(const __fp16 *A, const __fp16 *B, float *C,
+                             unsigned int M, unsigned int N, unsigned int K,
+                             float alpha, unsigned int lda, unsigned int ldb,
+                             unsigned int ldc);
+
+/**
+ * @brief     Runtime check for FEAT_FHM (ARMv8.2-A FMLAL widening, asimdfhm)
+ * support on the current CPU. hgemm_f16xf16_f32_fmlal() is compiled with
+ * "+fp16fml", which is an optional extension on top of nntrainer's baseline
+ * march (armv8.2-a+fp16+dotprod+i8mm) -- some ARMv8.2 FP16 devices lack it,
+ * so callers must check this before dispatching to that kernel and fall back
+ * otherwise (e.g. to shgemm) to avoid SIGILL. Result is cached after the
+ * first call.
+ * @return    true if the CPU supports FEAT_FHM
+ */
+bool hgemm_fp16fml_supported();
+
+#endif /* __HGEMM_H__ */

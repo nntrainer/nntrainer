@@ -248,7 +248,8 @@ Tensor TimmViTTransformer::createAttention(const int layer_id, Tensor input) {
      withKey("num_heads_kv", std::to_string(NUM_HEADS)),
      withKey("max_timestep", std::to_string(NUM_PATCHES + 1)),
      withKey("is_causal", "false"),
-     withKey("rope_theta", std::to_string(ROPE_THETA))}));
+     withKey("rope_theta", std::to_string(ROPE_THETA)),
+     withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false")}));
   Tensor context = attention({query, key, value});
 
   LayerHandle out_proj(

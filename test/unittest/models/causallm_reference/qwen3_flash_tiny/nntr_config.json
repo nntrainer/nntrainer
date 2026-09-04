@@ -1,0 +1,15 @@
+{
+  "bad_word_ids": [],
+  "batch_size": 1,
+  "embedding_dtype": "FP32",
+  "fc_layer_dtype": "FP32",
+  "init_seq_len": 32,
+  "lmhead_dtype": "FP32",
+  "max_seq_len": 64,
+  "model_file_name": "nntr_qwen3_flash_tiny_fp32.bin",
+  "model_tensor_type": "FP32-FP32",
+  "model_type": "CausalLM",
+  "num_to_generate": 1,
+  "tokenizer_file": "/home/jwon/Desktop/workspace/testcode/nntrainer/test/unittest/models/causallm_reference/qwen3_flash_tiny/tokenizer.json",
+  "use_flash_attention": true
+}

@@ -150,6 +150,19 @@ public:
 };
 
 /**
+ * @brief UseGemmAttention property
+ * @note  Optional GEMM-based attention path for the non-causal (encoder) case.
+ *        QK and AV are computed with (s)gemm per head instead of the per-row
+ *        dot kernels, improving cache reuse for large sequence lengths.
+ */
+class UseGemmAttention : public nntrainer::Property<bool> {
+public:
+  UseGemmAttention(bool value = false) { set(value); };
+  static constexpr const char *key = "use_gemm_attention";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+/**
  * @brief RopeScalingType
  * - default
  * - yarn
@@ -345,7 +358,7 @@ private:
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopePartialRotaryFactor,
     props::RopeScalingMaxPositionEmbeddings, props::AttnLogitSoftcapping,
-    props::IsCausal>
+    props::IsCausal, props::UseGemmAttention>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -374,7 +387,30 @@ private:
   bool use_rope = true;
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
+  bool use_gemm_attention = false;
   bool skip_prefill = false;
+
+  /**
+   * @brief GEMM-based flash attention for one batch (covers both encoder
+   *        non-causal and causal-LLM prefill paths).
+   *        2-phase: (1) de-interleave Q (num_heads_Q heads) and K/V
+   *        (num_heads_KV heads) into shared contiguous [H,N,d] buffers; (2)
+   *        balanced parallel_for over (h_q, query_block) units with online
+   *        softmax over key-blocks (shgemm QK -> NEON exp -> shgemm AV).
+   *        GQA: h_kv = h_q / gqa_size. Causal: key-block upper-bound break
+   *        + in-block boundary mask. Sliding window: key-block lower-bound
+   *        skip + in-block lower mask.
+   * @param[in] N_kv      total cache length (= cache_to, keys [0, N_kv))
+   * @param[in] N_q       step length (= step_size, rows of the output)
+   * @param[in] cache_from absolute starting position of queries in the cache
+   *                      (so q_abs(i) = cache_from + i, k_abs(k) = k)
+   */
+  void gemm_attention(nntrainer::Tensor &query_step,
+                      nntrainer::Tensor &b_cached_key,
+                      nntrainer::Tensor &b_cached_value,
+                      nntrainer::Tensor &attention_output_step,
+                      unsigned int N_kv, unsigned int N_q,
+                      unsigned int cache_from);
 
   enum INOUT_INDEX {
     /** input index */

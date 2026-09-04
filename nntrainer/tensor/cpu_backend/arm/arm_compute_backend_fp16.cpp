@@ -217,8 +217,8 @@ void sgemm(const unsigned int TStorageOrder, bool TransA, bool TransB,
     __fallback_sgemm(TStorageOrder, TransA, TransB, M, N, K, alpha, A, lda, B,
                      ldb, beta, C, ldc);
   } else {
-    nntrainer::neon::custom_hgemm(A, B, C, M, N, K, alpha, beta, TransA,
-                                  TransB);
+    nntrainer::neon::hgemm_f16xf16_f16(A, B, C, M, N, K, alpha, beta, TransA,
+                                       TransB);
   }
 }
 

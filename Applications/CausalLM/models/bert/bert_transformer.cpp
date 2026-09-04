@@ -212,7 +212,8 @@ Tensor BertTransformer::createAttention(const int layer_id, int seq_len,
     withKey("max_timestep", std::to_string(INIT_SEQ_LEN)),
     withKey("rope_theta", ROPE_THETA),
     withKey("use_rope", "false"),
-    withKey("is_causal", "false")};
+    withKey("is_causal", "false"),
+    withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false")};
   LayerHandle mha(createLayer("mha_core", a_params));
   Tensor a = mha({q, k, v});
 

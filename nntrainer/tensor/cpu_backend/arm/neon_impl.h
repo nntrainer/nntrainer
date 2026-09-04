@@ -23,6 +23,32 @@
 #include <tensor_dim.h>
 
 namespace nntrainer::neon {
+
+#if defined(ENABLE_FP16) || defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+/**
+ * @brief NEON half-precision GEMM: C = alpha*op(A)*op(B) + beta*C, all FP16.
+ * @note Declared outside ENABLE_FP16 so consumers built with ENABLE_FP16=0
+ *       (e.g. the CausalLM flash-attention path in mha_core.cpp) can call it;
+ *       the definition lives in libnntrainer (built with ENABLE_FP16=1) and
+ *       resolves at link time. Gated on __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+ *       (set only when the compiler is targeting -march=...+fp16) in addition
+ *       to ENABLE_FP16, since __fp16 is not a usable type on ARM targets built
+ *       without that extension (e.g. Tizen armv7l/aarch64, which do not
+ *       support fp16 NEON).
+ * @param[in] A __fp16 * for Matrix A
+ * @param[in] B __fp16 * for Matrix B
+ * @param[in] C __fp16 * for Matrix C
+ * @param[in] M number of op(A)'s and C's row
+ * @param[in] N number of op(B)'s and C's columns
+ * @param[in] K number of op(A)'s and columns and op(B)'s rows
+ * @param[in] alpha float number
+ * @param[in] beta float number
+ */
+void hgemm_f16xf16_f16(const __fp16 *A, const __fp16 *B, __fp16 *C, uint32_t M,
+                       uint32_t N, uint32_t K, float alpha, float beta,
+                       bool TransA, bool TransB);
+#endif
+
 #ifdef ENABLE_FP16
 /**
  * @brief Accelerating function for rotary embedding layer forwarding
@@ -242,21 +268,6 @@ void copy_fp16_to_fp32(const unsigned int N, const __fp16 *X, float *Y);
  */
 unsigned int isamax(const unsigned int N, const __fp16 *X);
 
-/**
- * @brief     hgemm computation with neon : Y = alpha*op(A)*op(B) + beta*C,
- * where op(X) is one of X or X**T
- * @param[in] A __fp16 * for Matrix A
- * @param[in] B __fp16 * for Matrix B
- * @param[in] C __fp16 * for Matrix C
- * @param[in] M number of op(A)'s and C's row
- * @param[in] N number of op(B)'s and C's columns
- * @param[in] K number of op(A)'s and columns and op(B)'s rows
- * @param[in] alpha float number
- * @param[in] beta float number
- */
-void custom_hgemm(const __fp16 *A, const __fp16 *B, __fp16 *C, uint32_t M,
-                  uint32_t N, uint32_t K, float alpha, float beta, bool TransA,
-                  bool TransB);
 /**
  * @brief squared root transformation with neon : X = sqrt(X)
  *

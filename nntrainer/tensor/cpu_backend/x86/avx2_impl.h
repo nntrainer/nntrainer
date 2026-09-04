@@ -23,6 +23,34 @@
 
 namespace nntrainer::avx2 {
 
+/**
+ * @brief Fused FP32 x FP16-bits(uint16_t) -> FP32 GEMM (AVX2 + F16C). Reads the
+ * FP16-bits operand B directly without materializing an FP32 copy. beta is
+ * hard-coded to 0; row-major only.
+ *   TransB=true  (QK): C[m,n] = alpha * sum_k A[m,k] * fp16(B[n,k])
+ *   TransB=false (AV): C[m,n] = alpha * sum_k A[m,k] * fp16(B[k,n])
+ * @note Declared outside ENABLE_FP16 so consumers built with ENABLE_FP16=0
+ *       (e.g. the CausalLM flash-attention path in mha_core.cpp) can call it;
+ *       the definition lives in libnntrainer (built with ENABLE_FP16=1) and
+ *       resolves at link time. Operand B is passed as uint16_t bits, so no
+ *       FP16 type is required at the call site.
+ * @param M number of rows of A and C
+ * @param N number of columns of C
+ * @param K dot length
+ * @param alpha scaling factor applied to the result
+ * @param A FP32 lhs, row-major, lda columns
+ * @param lda row stride of A
+ * @param B FP16-bits (uint16_t) rhs, row-major, ldb columns
+ * @param ldb row stride of B
+ * @param TransB selects the QK (true) or AV (false) operand layout
+ * @param C FP32 output, row-major, ldc columns
+ * @param ldc row stride of C
+ */
+void hsgemm_fp16bits_avx2(unsigned int M, unsigned int N, unsigned int K,
+                          float alpha, const float *A, unsigned int lda,
+                          const uint16_t *B, unsigned int ldb, bool TransB,
+                          float *C, unsigned int ldc);
+
 #ifdef ENABLE_FP16
 /**
  * @brief Converts half-precision floating point values to single-precision
