@@ -262,6 +262,18 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
       1, 1, workspace_tokens, 2 * intermediate_size, input.getTensorType());
     prefill_activation_output = nntrainer::Tensor(
       1, 1, workspace_tokens, intermediate_size, input.getTensorType());
+    // These are locally-constructed Tensors, not context-requested ones, so
+    // they carry no ContextData of their own and dispatch would otherwise
+    // silently fall back to the CPU table (checkContextCompatibility is
+    // permissive when either side lacks ContextData) regardless of the
+    // weights' engine. Inherit input's now, before any dot() call below --
+    // unlike the kernel-output usage inheritContextTo's docstring warns
+    // about, these tensors are already fully shaped, so there is no
+    // CREATE_IF_EMPTY_DIMS reallocation to race.
+    input.inheritContextTo(prefill_token_input);
+    input.inheritContextTo(prefill_expert_output);
+    input.inheritContextTo(prefill_gate_up_output);
+    input.inheritContextTo(prefill_activation_output);
     workspace = {&prefill_token_input, &prefill_expert_output,
                  &prefill_gate_up_output, &prefill_activation_output};
   }
@@ -460,6 +472,14 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         1, 1, workspace_tokens, 2 * intermediate_size, input.getTensorType());
       prefill_activation_output = nntrainer::Tensor(
         1, 1, workspace_tokens, intermediate_size, input.getTensorType());
+      // See the identical comment in forwarding(): these locally-constructed
+      // Tensors carry no ContextData of their own, so dispatch would
+      // otherwise silently fall back to CPU regardless of the weights'
+      // engine.
+      input.inheritContextTo(prefill_token_input);
+      input.inheritContextTo(prefill_expert_output);
+      input.inheritContextTo(prefill_gate_up_output);
+      input.inheritContextTo(prefill_activation_output);
       workspace = {&prefill_token_input, &prefill_expert_output,
                    &prefill_gate_up_output, &prefill_activation_output};
     }
