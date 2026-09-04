@@ -13,7 +13,7 @@ It supports *inference* mode (text generation) on various devices, including And
 ## Supported models
 
 - Llama
-- Qwen3 (0.6B, 1.7B, 4B, 7B, 14B, 32B) [[link](https://huggingface.co/Qwen/Qwen3-4B)]
+- Qwen3 (0.6B, 1.7B, 4B, 8B, 14B, 32B) [[link](https://huggingface.co/Qwen/Qwen3-4B)]
 - Qwen3-MoE (30B-A3B) [[link](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507)]
 - GPT-OSS (MoE: 20B, 120B) [[link](https://huggingface.co/openai/gpt-oss-20b)]
 - You can try your own model with custom layers!
