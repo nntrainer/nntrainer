@@ -172,9 +172,9 @@ cd "$SCRIPT_DIR/jni"
 # Clean previous builds
 rm -rf libs obj
 
-log_info "Building with ndk-build (builds causallm_core, nntrainer_causallm, nntr_quantize, nntr_safetensors_info)..."
+log_info "Building with ndk-build (builds causallm_core, nntrainer_causallm, nntr_lora_train, nntr_quantize, nntr_safetensors_info)..."
 # We explicitly set paths to ensure outputs are predictable
-if ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk causallm_core nntrainer_causallm  nntr_quantize nntr_safetensors_info -j $(nproc); then
+if ndk-build NDK_PROJECT_PATH=. NDK_LIBS_OUT=./libs NDK_OUT=./obj APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk causallm_core nntrainer_causallm nntr_lora_train nntr_quantize nntr_safetensors_info -j $(nproc); then
     log_success "Build completed successfully"
 else
     log_error "Build failed"
@@ -186,6 +186,7 @@ log_info "Build artifacts:"
 
 check_artifact "libcausallm_core.so" || exit 1
 check_artifact "nntrainer_causallm" || exit 1
+check_artifact "nntr_lora_train" || exit 1
 check_artifact "nntr_quantize" || exit 1
 check_artifact "nntr_safetensors_info" || exit 1
 
@@ -194,12 +195,23 @@ log_header "Build Summary"
 log_success "Build completed successfully!"
 log_info "Output files are in: $SCRIPT_DIR/jni/libs/arm64-v8a/"
 log_info "Executables:"
-log_info "  - nntrainer_causallm (main application), nntr_quantize, nntr_safetensors_info"
+log_info "  - nntrainer_causallm (inference)"
+log_info "  - nntr_lora_train (on-device LoRA fine-tuning)"
+log_info "  - nntr_quantize (model quantization)"
+log_info "  - nntr_safetensors_info (safetensors inspector)"
 log_info "Libraries:"
 log_info "  - libcausallm_core.so (CausalLM Core library)"
 log_info "  - libnntrainer.so (nntrainer library)"
 log_info "  - libccapi-nntrainer.so (nntrainer C/C API)"
 log_info "  - libc++_shared.so (C++ runtime)"
+log_info ""
+log_info "On-device scripts (created by install_android.sh):"
+log_info "  - run_causallm.sh       Inference"
+log_info "  - run_lora_train.sh     LoRA training (pass-through to nntr_lora_train)"
+log_info "  - train_lora_qat.sh     Q4_0 base + QAT LoRA training (with defaults)"
+log_info "  - run_quantize.sh       Model quantization"
+log_info "  - run_safetensors_info.sh  Safetensors inspector"
+log_info ""
 log_info "To build API library, run:"
 log_info "  ./build_api_lib.sh"
 log_info "To install and run:"

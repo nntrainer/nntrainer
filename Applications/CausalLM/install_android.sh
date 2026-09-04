@@ -63,6 +63,7 @@ log_success "Device connected: $DEVICE_ID"
 log_step "2/3" "Check build artifacts"
 REQUIRED_FILES=(
     "$SCRIPT_DIR/jni/libs/arm64-v8a/nntrainer_causallm"
+    "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_lora_train"
     "$SCRIPT_DIR/jni/libs/arm64-v8a/libcausallm_core.so"
     "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize"
     "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_safetensors_info"
@@ -167,6 +168,11 @@ if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
 fi
 
 
+log_info "Pushing nntr_lora_train..."
+adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_lora_train" "$INSTALL_DIR/" 2>&1 | tail -1
+adb shell "chmod 755 $INSTALL_DIR/nntr_lora_train"
+log_success "nntr_lora_train pushed"
+
 log_info "Pushing nntr_quantize..."
 adb push "$SCRIPT_DIR/jni/libs/arm64-v8a/nntr_quantize" "$INSTALL_DIR/" 2>&1 | tail -1
 adb shell "chmod 755 $INSTALL_DIR/nntr_quantize"
@@ -231,6 +237,56 @@ cd $INSTALL_DIR
 EOF"
 
 adb shell "chmod 755 $INSTALL_DIR/run_safetensors_info.sh"
+
+# Create LoRA training run script on device
+adb shell "cat > $INSTALL_DIR/run_lora_train.sh << 'EOF'
+#!/system/bin/sh
+export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+export NNTR_NUM_THREADS=4
+cd $INSTALL_DIR
+./nntr_lora_train \$@
+EOF"
+
+adb shell "chmod 755 $INSTALL_DIR/run_lora_train.sh"
+
+# Create Q4_0 LoRA QAT training wrapper on device.
+# Pre-fills the QAT defaults so the user only needs to supply model + data paths.
+# Usage: train_lora_qat.sh <model_dir> <train_data> [extra nntr_lora_train flags...]
+adb shell "cat > $INSTALL_DIR/train_lora_qat.sh << 'EOF'
+#!/system/bin/sh
+# On-device Q4_0 base + QAT LoRA fine-tuning with sensible defaults.
+export LD_LIBRARY_PATH=$INSTALL_DIR:\$LD_LIBRARY_PATH
+export NNTR_NUM_THREADS=4
+cd $INSTALL_DIR
+
+MODEL_DIR=\${1:?Usage: train_lora_qat.sh <model_dir> <train_data> [extra flags]}
+TRAIN_DATA=\${2:?Usage: train_lora_qat.sh <model_dir> <train_data> [extra flags]}
+shift 2
+
+OUTPUT=\${MODEL_DIR}/lora_adapter.bin
+
+./nntr_lora_train \"\$MODEL_DIR\" \"\$TRAIN_DATA\" \\
+  --lora_rank 32 \\
+  --lora_alpha 64 \\
+  --lora_qat \\
+  --lora_weight_q4 \\
+  --seq_len 192 \\
+  --lr 1e-4 \\
+  --epochs 20 \\
+  --max_samples 90 \\
+  --clip_grad 1.0 \\
+  --seed 42 \\
+  --output \"\$OUTPUT\" \\
+  \"\$@\"
+
+echo \"\"
+echo \"Training complete!\"
+echo \"FP32 adapter: \$OUTPUT\"
+echo \"Q4_0 adapter: \${OUTPUT%.bin}_q4.bin\"
+EOF"
+
+adb shell "chmod 755 $INSTALL_DIR/train_lora_qat.sh"
+
 # Create test script on device if API lib exists
 if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     adb shell "cat > $INSTALL_DIR/run_test_api.sh << 'EOF'
@@ -252,7 +308,14 @@ log_header "Installation Complete!"
 log_info "Device: $DEVICE_ID"
 log_info "Install directory: $INSTALL_DIR"
 log_info "Installed files:"
-log_info "  - nntrainer_causallm (executable)"
+log_info "  - nntrainer_causallm (inference executable)"
+log_info "  - nntr_lora_train (LoRA fine-tuning executable)"
+log_info "On-device scripts:"
+log_info "  - run_causallm.sh (inference)"
+log_info "  - run_lora_train.sh (LoRA training, pass-through)"
+log_info "  - train_lora_qat.sh (Q4_0 base + QAT LoRA training with defaults)"
+log_info "  - run_quantize.sh (model quantization)"
+log_info "  - run_safetensors_info.sh (safetensors inspector)"
 if [ -f "$SCRIPT_DIR/jni/libs/arm64-v8a/test_api" ]; then
     log_info "  - test_api (executable)"
 fi
@@ -272,6 +335,24 @@ log_info "   adb shell $INSTALL_DIR/run_causallm.sh $MODEL_DIR/qwen3-4b"
 log_info ""
 log_info "(optional) Run quantization:"
 log_info "  adb shell $INSTALL_DIR/run_quantize.sh $MODEL_DIR/qwen3-4b --fc_dtype Q4_0"
+log_info ""
+log_info "To run LoRA fine-tuning on device:"
+log_info "  1. Push model + training data:"
+log_info "      adb push res/qwen3/qwen3-0.6b $MODEL_DIR/qwen3-0.6b"
+log_info "      adb push res/train_data/lamp3_user_train.txt $MODEL_DIR/"
+log_info "  2a. Q4_0 base + QAT training (with defaults):"
+log_info "      adb shell $INSTALL_DIR/train_lora_qat.sh $MODEL_DIR/qwen3-0.6b $MODEL_DIR/lamp3_user_train.txt"
+log_info "  2b. Custom training (any flags):"
+log_info "      adb shell $INSTALL_DIR/run_lora_train.sh $MODEL_DIR/qwen3-0.6b $MODEL_DIR/lamp3_user_train.txt \\"
+log_info "        --lora_rank 32 --lora_alpha 64 --lora_qat --lora_weight_q4 \\"
+log_info "        --seq_len 192 --lr 1e-4 --epochs 20 --max_samples 90 \\"
+log_info "        --clip_grad 1.0 --seed 42 --output $MODEL_DIR/lora_adapter.bin"
+log_info "  3. Pull the trained adapter back to host:"
+log_info "      adb pull $MODEL_DIR/lora_adapter.bin /tmp/lora_adapter.bin"
+log_info "      adb pull $MODEL_DIR/lora_adapter_q4.bin /tmp/lora_adapter_q4.bin"
+log_info ""
+log_info "To run inference with a trained LoRA adapter:"
+log_info "  adb shell $INSTALL_DIR/run_causallm.sh $MODEL_DIR/qwen3-0.6b"
 log_info ""
 log_info "For interactive shell:"
 log_info "   adb shell"
