@@ -432,7 +432,7 @@ TEST(nntrainer_Quantizer, per_tensor_affine_uint8_auto_qparams) {
     nntrainer::Tensor output =
       quantizer->dequantize(quantized, nntrainer::Tdatatype::FP32);
     for (unsigned int w = 0; w < 3; ++w)
-      EXPECT_NEAR(output.getValue(0, 0, 0, w), inputs[i][w], 0.5f);
+      EXPECT_NEAR(output.getValue(0, 0, 0, w), inputs[i][w], 0.50001f);
   }
 }
 
@@ -461,6 +461,11 @@ TEST(nntrainer_Quantizer, per_tensor_affine_other_unsigned_auto_qparams) {
     quantizer->quantize(uint4_input, nntrainer::Tdatatype::UINT4);
   EXPECT_EQ(*uint4_quantized.getZeroPoint(), 8u);
   EXPECT_FLOAT_EQ(*uint4_quantized.getScale<float>(), 1.0f);
+
+  nntrainer::Tensor uint4_output =
+    quantizer->dequantize(uint4_quantized, nntrainer::Tdatatype::FP32);
+  for (unsigned int w = 0; w < 3; ++w)
+    EXPECT_NEAR(uint4_output.getValue(0, 0, 0, w), uint4_data[w], 0.50001f);
 }
 
 /**

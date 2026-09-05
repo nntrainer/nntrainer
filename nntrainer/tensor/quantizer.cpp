@@ -167,7 +167,7 @@ Tensor &PerTensorAffineQuantizer::quantize(const Tensor &input, Tensor &output,
 Tensor PerTensorAffineQuantizer::dequantize(const Tensor &input,
                                             Tdatatype dtype) {
   Tensor output = input.clone(dtype);
-  if (output.getDataType() == Tdatatype::UINT4 ||
+  if (input.getDataType() == Tdatatype::UINT4 ||
       input.getDataType() == Tdatatype::UINT8 ||
       input.getDataType() == Tdatatype::UINT16) {
     output.subtract_i(static_cast<float>(*input.getZeroPoint()));
