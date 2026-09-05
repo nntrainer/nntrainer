@@ -1139,6 +1139,16 @@ void FloatTensor::copyData(const Tensor &from) {
     o->scopy_int8_to_fp32_u(from.size(), from.getData<uint8_t>(), 1,
                             (float *)getData(), 1);
     break;
+  case ml::train::TensorDim::DataType::UINT4: {
+    const uint8_t *packed = from.getData<uint8_t>();
+    float *unpacked = static_cast<float *>(getData());
+    for (size_t i = 0; i < from.size(); ++i) {
+      const uint8_t value = packed[i / 2];
+      unpacked[i] = static_cast<float>(
+        i % 2 == 0 ? (value >> 4) & 0x0F : value & 0x0F);
+    }
+    break;
+  }
   default:
     throw std::invalid_argument(
       "[FloatTensor::copyData] Error: Unsupported data type");
