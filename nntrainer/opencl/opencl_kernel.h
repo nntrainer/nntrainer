@@ -82,6 +82,53 @@ public:
    * @return true when the dispatch being enqueued bound shared memory
    */
   static bool takeDispatchTouchedSVM();
+
+  /**
+   * @brief Declare what the NEXT dispatch writes on the device activation
+   *        plane, for the producer-to-consumer handoff log below.
+   *
+   * A caller that knows its kernel writes exactly one device buffer (and
+   * nothing else another op could be reading) calls this immediately before
+   * the dispatch. A dispatch for which nothing is declared is logged as
+   * UNKNOWN, and an UNKNOWN dispatch invalidates every outstanding handoff --
+   * so a site that is not annotated costs a re-computation, never a wrong
+   * answer.
+   *
+   * @param written device buffer handle (cl_mem) the next dispatch writes
+   */
+  static void noteDispatchWrites(void *written);
+
+  /**
+   * @brief Declare that the NEXT dispatch writes nothing that a handoff can
+   *        be tracking (its outputs are private scratch).
+   */
+  static void noteDispatchWritesNothing();
+
+  /**
+   * @brief Append the pending declaration to the log. Called once per
+   *        enqueued NDRange by CommandQueueManager, whatever the outcome of
+   *        the declaration, so the log has exactly one entry per dispatch.
+   */
+  static void commitDispatch();
+
+  /**
+   * @brief Sequence number of the last logged dispatch.
+   */
+  static unsigned long long dispatchSeq();
+
+  /**
+   * @brief Whether the device buffer @a handle still holds what it held at
+   *        @a since_seq.
+   *
+   * True only when EVERY dispatch logged after @a since_seq declared what it
+   * wrote and none of them wrote @a handle. An unannotated dispatch, or a
+   * window longer than the log, answers false.
+   *
+   * @param handle device buffer handle (cl_mem)
+   * @param since_seq dispatchSeq() sampled when the content was established
+   * @return true when nothing can have overwritten the buffer since
+   */
+  static bool bufferUnchangedSince(void *handle, unsigned long long since_seq);
 };
 } // namespace nntrainer::opencl
 #endif // __OPENCL_KERNEL_H__

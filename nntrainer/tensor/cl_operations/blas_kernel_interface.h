@@ -176,5 +176,49 @@ bool clmem_raise_cl(const Tensor &t, unsigned int valid_bytes);
  */
 bool clmem_lower_cl(const Tensor &t, unsigned int valid_bytes);
 
+/**
+ * @brief Reserve the v8c activation scratch a fused norm can quantise into.
+ *
+ * A norm that writes a device-plane row is, on every LLM graph this backend
+ * runs, immediately read by a v8c FC that would quantise exactly that row.
+ * Letting the norm emit the quantisation itself removes a dispatch, and on
+ * this device a dispatch is worth three to four times its own GPU time. This
+ * hands the norm the same per-fanout scratch the FC's own quantiser would
+ * have filled, so the FC can then simply use it.
+ *
+ * Nothing is promised: when the fusion is off, the shapes do not fit, or the
+ * scratch cannot be grown, this returns false and the caller keeps the plain
+ * norm. A reservation that is never committed costs one slot of the ring.
+ *
+ * @param[in] site stable identity of the calling norm (its gamma pointer):
+ *            a norm whose quantisation nothing ever claims stops being fused,
+ *            so speculation is paid for only where it is collected
+ * @param[in] rows rows the norm will write (= the FC's real M)
+ * @param[in] K row width (= the FC's K)
+ * @param[out] act_i8 int8 activation scratch (cl_mem)
+ * @param[out] act_scale per-row scale scratch (cl_mem)
+ * @param[out] act_zp per-row zero-point scratch (cl_mem)
+ * @param[out] act_rs per-row sum scratch (cl_mem)
+ * @return true when the four scratch handles are usable
+ */
+bool v8cNormQuantBegin(const void *site, unsigned int rows, unsigned int K,
+                       void **act_i8, void **act_scale, void **act_zp,
+                       void **act_rs);
+
+/**
+ * @brief Publish the reservation after the fused norm has been enqueued.
+ *
+ * @param[in] src_clmem device buffer the norm wrote the fp16 row into -- the
+ *            handle the consuming FC will present as its input
+ * @param[in] rows rows written
+ * @param[in] K row width
+ */
+void v8cNormQuantCommit(void *src_clmem, unsigned int rows, unsigned int K);
+
+/**
+ * @brief Drop a reservation whose dispatch did not happen.
+ */
+void v8cNormQuantAbort();
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNEL_INTERFACE_H__ */

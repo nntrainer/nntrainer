@@ -208,3 +208,154 @@ __kernel void rms_reverse_norm_cl_fp16_coop(__global const half *input,
     output[base + j] = (half)(t * scale);
   }
 }
+
+// Cooperative RMSNorm that also emits the int8 activation quantisation of the
+// row it just normalised (v8c_act_quant_f16_parx), so a norm feeding a v8c FC
+// costs ONE dispatch instead of two.
+//
+// Why this is worth a kernel of its own: on the Adreno decode step both halves
+// are ~2-7 us of GPU under a ~7.4 us per-dispatch submission floor, so removing
+// the second dispatch returns three to four times its GPU cost. The two halves
+// already read the same row.
+//
+// Bit-exactness is the whole design constraint, and it forces the odd shape:
+//
+//  * The norm's reduction is a float sum tree, and float addition is not
+//    associative -- folding the same row over 256 lanes instead of 64 changes
+//    `mean` and with it every output element. So the NORM half runs on exactly
+//    RMSN_LWS lanes, striding and folding exactly as rmsnorm_cl_fp16_coop
+//    does, whatever the workgroup size is. The remaining lanes idle through it
+//    (they still execute every barrier -- a barrier must be reached by the
+//    whole group).
+//  * The QUANT half then runs on ALL lanes, which is the width that made the
+//    standalone quantiser fast, and it is bit-identical at any width by its
+//    own argument (fmin/fmax and an integer sum fold the same per-lane
+//    partials in any order).
+//  * The quant half re-READS the normed row from global memory rather than
+//    keeping it in registers, behind a global-memory barrier. That is not a
+//    missed optimisation: it is what makes the result identical to running the
+//    two kernels separately, because the separate quantiser reads FP16 from
+//    memory and this way the rounding to half happens in exactly one place.
+//    The re-read is W halves per row, negligible against the row's own traffic.
+//
+// scale_per_row / zp_per_row / row_sum_act / act_int8 are the v8c FC's
+// per-fanout activation scratch; n_rows rows are written, matching the rows
+// the FC's quant-direct path would have written.
+#define RMSNQ_LWS_MAX 256
+__kernel void rmsnorm_cl_fp16_coop_q(__global const half *input,
+                                     __global half *output,
+                                     __global const half *alpha, half epsilon,
+                                     int n_rows, int W,
+                                     __global char *act_int8,
+                                     __global float *scale_per_row,
+                                     __global int *zp_per_row,
+                                     __global int *row_sum_act) {
+  const int row = get_group_id(0);
+  const int tid = get_local_id(0);
+  const int lsz = (int)get_local_size(0);
+  if (row >= n_rows)
+    return;
+  const long base = (long)row * (long)W;
+  const int W8 = W >> 3;
+  __global const half8 *in8 = (__global const half8 *)(input + base);
+  __global half8 *out8 = (__global half8 *)(output + base);
+
+  __local float lmin[RMSNQ_LWS_MAX];
+  __local float lmax[RMSNQ_LWS_MAX];
+  __local int lsum[RMSNQ_LWS_MAX];
+  __local float l_scale_q;
+  __local int l_zp;
+
+  /* ---- norm half: RMSN_LWS lanes, folded exactly as the coop kernel ---- */
+  float partial = 0.0f;
+  if (tid < RMSN_LWS) {
+    for (int i = tid; i < W8; i += RMSN_LWS) {
+      const float8 v = convert_float8(in8[i]);
+      partial += dot(v.lo, v.lo) + dot(v.hi, v.hi);
+    }
+  }
+  lmin[tid] = partial; /* lmin doubles as the sum-of-squares scratch here */
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = RMSN_LWS >> 1; s > 0; s >>= 1) {
+    if (tid < s)
+      lmin[tid] += lmin[tid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float mean = lmin[0] / (float)W;
+  const float nscale = rsqrt(mean + (float)epsilon);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (tid < RMSN_LWS) {
+    for (int i = tid; i < W8; i += RMSN_LWS) {
+      const float8 nv = convert_float8(in8[i]) * nscale;
+      const int gi = i << 3;
+      const float8 a = (float8)(
+        (float)alpha[gi + 0], (float)alpha[gi + 1], (float)alpha[gi + 2],
+        (float)alpha[gi + 3], (float)alpha[gi + 4], (float)alpha[gi + 5],
+        (float)alpha[gi + 6], (float)alpha[gi + 7]);
+      const float8 o = clamp(nv * a, -60000.0f, 60000.0f);
+      out8[i] = convert_half8(o);
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+  /* ---- quant half: every lane, v8c_act_quant_f16_parx verbatim ---- */
+  __global const half *q_in = output + base;
+  float pmin = 0.0f, pmax = 0.0f;
+  for (int k = tid; k < W; k += lsz) {
+    const float v = (float)q_in[k];
+    pmin = fmin(pmin, v);
+    pmax = fmax(pmax, v);
+  }
+  lmin[tid] = pmin;
+  lmax[tid] = pmax;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = lsz / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      lmin[tid] = fmin(lmin[tid], lmin[tid + s]);
+      lmax[tid] = fmax(lmax[tid], lmax[tid + s]);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (tid == 0) {
+    const float fmn = lmin[0], fmx = lmax[0];
+    const float rmin = fmn < 0.0f ? fmn : 0.0f;
+    const float rmax = fmx > 0.0f ? fmx : 0.0f;
+    const float qmin = -128.0f, qmax = 127.0f;
+    const float range = rmax - rmin;
+    const float scale_q = range > 0.0f ? 255.0f / range : 1.0f;
+    const float recip = range > 0.0f ? range / 255.0f : 1.0f;
+    const float dmin = rmin * scale_q, dmax = rmax * scale_q;
+    const float zp_lo = qmin - dmin, zp_hi = qmax - dmax;
+    float zp_f = (qmin + dmin) + (qmax + dmax) > 0.0f ? zp_lo : zp_hi;
+    if (zp_f < qmin)
+      zp_f = qmin;
+    if (zp_f > qmax)
+      zp_f = qmax;
+    l_scale_q = scale_q;
+    l_zp = (int)rint(zp_f);
+    scale_per_row[row] = recip;
+    zp_per_row[row] = l_zp;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const float scale_q = l_scale_q;
+  const int zp = l_zp;
+  int psum = 0;
+  for (int k = tid; k < W; k += lsz) {
+    int q = (int)rint((float)q_in[k] * scale_q) + zp;
+    if (q < -128)
+      q = -128;
+    if (q > 127)
+      q = 127;
+    act_int8[(long)row * W + k] = (char)q;
+    psum += q;
+  }
+  lsum[tid] = psum;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int s = lsz / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      lsum[tid] += lsum[tid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (tid == 0)
+    row_sum_act[row] = lsum[0];
+}

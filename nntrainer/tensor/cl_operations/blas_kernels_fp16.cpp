@@ -12,6 +12,7 @@
  */
 
 #include "blas_kernels_templates.h"
+#include <blas_kernel_interface.h>
 #include <cl_kernels/cl_kernels.h>
 
 #include <cstring>
@@ -293,6 +294,62 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
 
   if (use_coop) {
     constexpr int RMSN_LWS = 64;
+    // [norm->FC quant fusion] Every device-plane norm in an LLM decoder feeds
+    // a v8c FC that would immediately quantise the row this kernel is about to
+    // write. rmsnorm_cl_fp16_coop_q writes both, so the pair costs one
+    // dispatch instead of two -- worth three to four times its GPU cost on a
+    // backend whose submission floor is ~7.4 us against ~2-7 us kernels.
+    // Speculative: when no FC claims the quantisation it is simply unread.
+    // NNTR_FUSE_NORM_QUANT=0 keeps the plain kernel.
+    if (to_clmem && gamma != nullptr && width >= 8u) {
+      void *q_i8 = nullptr, *q_scale = nullptr, *q_zp = nullptr,
+           *q_rs = nullptr;
+      // The gamma pointer names this norm layer: a stable, unique key for
+      // "which norm is this", which the pooled output buffer is not.
+      if (v8cNormQuantBegin(gamma, height, width, &q_i8, &q_scale, &q_zp,
+                            &q_rs)) {
+        ClContext::SharedPtrClKernel kq = blas_cc->registerClKernel(
+          rmsnorm_fp16_kernel, "rmsnorm_cl_fp16_coop_q");
+        bool ok = (kq != nullptr);
+        if (ok) {
+          cl_mem i8 = static_cast<cl_mem>(q_i8);
+          cl_mem sca = static_cast<cl_mem>(q_scale);
+          cl_mem zpb = static_cast<cl_mem>(q_zp);
+          cl_mem rsb = static_cast<cl_mem>(q_rs);
+          if (from_clmem)
+            ok = ok && kq->SetKernelArguments(0, &in_cl, sizeof(cl_mem));
+          else
+            ok = ok && kq->SetKernelSVMArguments(0, const_cast<_FP16 *>(input));
+          ok = ok && kq->SetKernelArguments(1, &out_cl, sizeof(cl_mem)) &&
+               kq->SetKernelSVMArguments(2, const_cast<_FP16 *>(gamma)) &&
+               kq->SetKernelArguments(3, &eps_h, sizeof(cl_half)) &&
+               kq->SetKernelArguments(4, &n_rows, sizeof(int)) &&
+               kq->SetKernelArguments(5, &w, sizeof(int)) &&
+               kq->SetKernelArguments(6, &i8, sizeof(cl_mem)) &&
+               kq->SetKernelArguments(7, &sca, sizeof(cl_mem)) &&
+               kq->SetKernelArguments(8, &zpb, sizeof(cl_mem)) &&
+               kq->SetKernelArguments(9, &rsb, sizeof(cl_mem));
+        }
+        // The quant half is the width-sensitive one (one workgroup per row, so
+        // at M=1 the group IS the dispatch); the norm half pins itself to
+        // RMSN_LWS lanes internally whatever this is, to keep its float
+        // reduction tree -- and therefore its output -- bit-identical.
+        constexpr int RMSNQ_LWS = 256;
+        const int gws_q[3] = {RMSNQ_LWS * n_rows, 1, 1};
+        const int lws_q[3] = {RMSNQ_LWS, 1, 1};
+        if (ok) {
+          // The norm's fp16 row is the one graph tensor this writes; the int8
+          // scratch is v8c's own and no handoff tracks it.
+          opencl::Kernel::noteDispatchWrites(out_cl);
+          ok = blas_cc->command_queue_inst_.DispatchCommand(kq, gws_q, lws_q);
+        }
+        if (ok) {
+          v8cNormQuantCommit(out_cl, height, width);
+          return;
+        }
+        v8cNormQuantAbort();
+      }
+    }
     // Gamma-free variant (a norm whose layer has no learned scale, so gamma is
     // nullptr): the _ng kernel keeps the same six-argument signature but never
     // reads alpha, so bind argument 2 to a valid-but-unread pointer rather
@@ -355,6 +412,8 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
       return;
     const int work_groups_count[3] = {RMSN_LWS * n_rows, 1, 1};
     const int work_group_size[3] = {RMSN_LWS, 1, 1};
+    if (to_clmem)
+      opencl::Kernel::noteDispatchWrites(out_cl);
     if (!blas_cc->command_queue_inst_.DispatchCommand(kp, work_groups_count,
                                                       work_group_size))
       return;

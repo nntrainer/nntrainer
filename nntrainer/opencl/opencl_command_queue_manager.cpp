@@ -405,6 +405,10 @@ bool CommandQueueManager::DispatchCommand(
                            events_to_wait.size(), events_to_wait.data(), event);
   // Always consume the flag, so it never leaks onto the next dispatch.
   const bool touched_svm = Kernel::takeDispatchTouchedSVM();
+  // One write-log entry per NDRange, before the error check: a dispatch that
+  // failed to enqueue still has to consume its pending declaration, and an
+  // entry that says nothing is the safe answer for it.
+  Kernel::commitDispatch();
   if (error_code != CL_SUCCESS) {
     ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));
@@ -444,6 +448,10 @@ bool CommandQueueManager::DispatchCommand(
                            events_to_wait.size(), events_to_wait.data(), event);
   // Always consume the flag, so it never leaks onto the next dispatch.
   const bool touched_svm = Kernel::takeDispatchTouchedSVM();
+  // One write-log entry per NDRange, before the error check: a dispatch that
+  // failed to enqueue still has to consume its pending declaration, and an
+  // entry that says nothing is the safe answer for it.
+  Kernel::commitDispatch();
   if (error_code != CL_SUCCESS) {
     ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));
@@ -470,6 +478,7 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
 
   // Always consume the flag, so it never leaks onto the next dispatch.
   const bool touched_svm = Kernel::takeDispatchTouchedSVM();
+  Kernel::commitDispatch();
 
   NNTR_THROW_IF(error_code != CL_SUCCESS, std::runtime_error)
     << "clEnqueueNDRangeKernel failed. OpenCL error code: " << error_code
