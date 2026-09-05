@@ -2936,6 +2936,293 @@ bool lmhead_gemv_q6_k_cl(const void *w_q6k_host, const float *act_f32_host,
   return true;
 }
 
+// ===========================================================================
+// Greedy on-GPU argmax over the decode lm_head row.
+//
+// Greedy decode reads exactly ONE number out of the [vocab] lm_head output,
+// and everything between the GEMV and that number is a full-vocabulary host
+// pass. Measured per token on Adreno 840 at vocab 262 144 (gemma4 E2B):
+//
+//     blocking 512 KiB readback   ~12 ms   (dominated by the queue drain --
+//                                           the host reaches it before the GPU
+//                                           is done, so this is not recovered)
+//     final logit softcapping     2.1-2.6 ms   copy + scale + tanh + scale,
+//                                              four passes over 262 144 half
+//     fp16 -> fp32 widening       0.04 ms
+//     std::max_element            0.26 ms
+//
+// The last three -- ~2.4 ms, all of it AFTER the GPU has gone idle -- exist
+// only to find one index, and the reduction below replaces them with two small
+// kernels and a 4-byte read.
+//
+// Bit-exactness is the whole point, since the gate is generated text. Two
+// things are reproduced rather than argued away: the softcap (see softcap_h --
+// monotone, so it cannot move an argmax, but its fp16 rounding DOES create
+// ties that decide the answer), and the tie rule (lowest index, which is what
+// std::max_element returns).
+//
+// The deferral is driven by a HINT the caller sets before the step
+// (cl_lmhead_set_greedy_hint): sampling, a logits processor and the penalty
+// passes all consume the whole row on the host and set it false. A wrong guess
+// is never a wrong token -- the row stays claimable through
+// cl_lmhead_materialize_logits(), which pays exactly the work the hint tried
+// to skip, post-op included.
+// ===========================================================================
+
+/**
+ * @brief NNTR_CL_DEV_ARGMAX: default ON, "=0" opts out.
+ * @note The reduction is defined to return the same index as the host scan it
+ *       replaces, so there is nothing to trade off per lane; the env exists as
+ *       a bisection lever, not as a policy knob.
+ */
+static bool cl_dev_argmax_enabled() {
+  static const bool on = []() {
+    const char *e = std::getenv("NNTR_CL_DEV_ARGMAX");
+    return e == nullptr || e[0] != '0';
+  }();
+  return on;
+}
+
+/** @brief An lm_head logits row left on the device, its host row unwritten. */
+struct ClLmHeadPending {
+  cl_mem buf = nullptr; /**< device fp16 logits [n] -- the GEMV's out_buf */
+  void *host = nullptr; /**< the GEMV's own row (fp16 or fp32), NOT filled */
+  /**
+   * @brief The row the model finally hands the caller. Equal to @c host until
+   * a monotone post-op joins the deferral, after which it is that op's output
+   * -- which is what the caller sees and therefore what it must key on.
+   */
+  void *claim = nullptr;
+  unsigned int n = 0;    /**< vocab */
+  bool out_fp16 = false; /**< dtype of the host row */
+  float softcap = 0.0f;  /**< >0: the post-op the reduction must reproduce */
+  std::function<void()> replay; /**< re-runs the skipped post-op on the host */
+  bool live = false;
+};
+static ClLmHeadPending cl_lmhead_pending;
+static bool cl_lmhead_greedy_hint = false;
+
+/**
+ * @brief Round @a v to fp16 and widen it back, without needing a _Float16 type.
+ *
+ * The reduction has to narrow at exactly the points the host layer does, and
+ * this file is compiled on configurations where fp16 arithmetic is not
+ * available, so the rounding is done on the bits (round-to-nearest-even, with
+ * subnormal and overflow handling) rather than by a cast.
+ */
+static float narrow_to_half(float v) {
+  uint32_t x;
+  std::memcpy(&x, &v, 4);
+  const uint32_t sign = x & 0x80000000u;
+  const uint32_t mag = x & 0x7fffffffu;
+  if (mag >= 0x7f800000u) { // inf / nan pass through
+    std::memcpy(&v, &x, 4);
+    return v;
+  }
+  const int exp32 = (int)((mag >> 23) & 0xff) - 127;
+  uint32_t out;
+  if (exp32 >= 16) { // overflows fp16 -> inf
+    out = sign | 0x7f800000u;
+  } else if (exp32 >= -14) { // normal fp16: keep 10 mantissa bits
+    const uint32_t drop = mag & 0x1fffu;
+    uint32_t kept = mag & ~0x1fffu;
+    if (drop > 0x1000u || (drop == 0x1000u && (kept & 0x2000u)))
+      kept += 0x2000u;
+    // the carry can push 65504 past the fp16 maximum, which is an overflow
+    out = ((int)((kept >> 23) & 0xffu) - 127 >= 16) ? (sign | 0x7f800000u)
+                                                    : (sign | kept);
+  } else if (exp32 >= -25) {       // subnormal fp16
+    const int shift = -14 - exp32; // 1..11
+    const uint32_t hidden = (mag & 0x007fffffu) | 0x00800000u;
+    const uint32_t denom = (uint32_t)1 << (13 + shift);
+    const uint32_t q = hidden >> (13 + shift);
+    const uint32_t r = hidden & (denom - 1);
+    uint32_t m = q;
+    if (r > (denom >> 1) || (r == (denom >> 1) && (q & 1u)))
+      m += 1;
+    if (m == 0) {
+      out = sign;
+    } else {
+      float f = (float)m * 5.9604644775390625e-08f; // 2^-24
+      uint32_t fb;
+      std::memcpy(&fb, &f, 4);
+      out = sign | fb;
+    }
+  } else {
+    out = sign;
+  }
+  std::memcpy(&v, &out, 4);
+  return v;
+}
+
+/**
+ * @brief The blocking readback (plus fp16 -> fp32 widening) that the deferral
+ *        skips. Factored out of the GEMV so cl_lmhead_materialize_logits() can
+ *        pay it later, byte for byte, when the greedy hint guessed wrong.
+ */
+static bool lmhead_read_logits_to_host(cl_mem out_buf, void *logits_host,
+                                       unsigned int N, bool out_fp16) {
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc || !out_buf || !logits_host)
+    return false;
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  if (!q)
+    return false;
+  const size_t out_bytes = sizeof(uint16_t) * (size_t)N;
+
+  if (out_fp16) {
+    return opencl::clEnqueueReadBuffer(q, out_buf, CL_TRUE, 0, out_bytes,
+                                       logits_host, 0, nullptr,
+                                       nullptr) == CL_SUCCESS;
+  }
+  std::vector<uint16_t> y_host(N);
+  if (opencl::clEnqueueReadBuffer(q, out_buf, CL_TRUE, 0, out_bytes,
+                                  y_host.data(), 0, nullptr,
+                                  nullptr) != CL_SUCCESS)
+    return false;
+  float *o = static_cast<float *>(logits_host);
+  for (unsigned int i = 0; i < N; ++i) {
+    // fp16 -> fp32 (matches v8c_h2f / the q6k host conversion).
+    const uint16_t h = y_host[i];
+    const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t ex = (h >> 10) & 0x1fu, m = h & 0x3ffu, bits;
+    if (ex == 0) {
+      if (m == 0)
+        bits = s;
+      else {
+        ex = 1;
+        while ((m & 0x400u) == 0) {
+          m <<= 1;
+          ex--;
+        }
+        m &= 0x3ffu;
+        bits = s | ((ex + 112) << 23) | (m << 13);
+      }
+    } else if (ex == 0x1f) {
+      bits = s | 0x7f800000u | (m << 13);
+    } else {
+      bits = s | ((ex + 112) << 23) | (m << 13);
+    }
+    std::memcpy(&o[i], &bits, 4);
+  }
+  return true;
+}
+
+// Two-stage (value, index) reduction over the fp16 logits row. Stage one gives
+// one partial per work-group; stage two folds the partials in a single group
+// and stores the winning index, so the host reads 4 bytes and never sees the
+// row. ARGMAX_TAKE is the whole numerical contract: strictly-greater wins, and
+// an equal value only wins with a smaller index -- so the result is the lowest
+// index among the maxima regardless of how the reduction is ordered, which is
+// std::max_element's answer. A NaN never wins (every comparison against it is
+// false), which is also what the host scan does for any NaN past element 0.
+static const std::string lmhead_argmax_kernel = R"CL(
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#define ARGMAX_LS 64
+#define ARGMAX_TAKE(bv, bi, ov, oi)                                            \
+  if ((ov) > (bv) || ((ov) == (bv) && (oi) < (bi))) {                          \
+    bv = (ov);                                                                 \
+    bi = (oi);                                                                 \
+  }
+
+// Final logit softcapping, reproduced STEP FOR STEP as the host layer computes
+// it. Softcapping is strictly monotone, so it cannot move an argmax on its own
+// -- but it collapses near-equal logits into equal fp16 values, and the host
+// tie rule then decides the token, so the rounding is what has to match, not
+// the mathematical value. The host chain is not a tanh() call: it is
+// ActiFunc's logistic form over fp16 tensors, which narrows to half at four
+// separate points (util_func.h exp_util<_Float16>, acti_func.h sigmoid /
+// tanhFloat, half_tensor.cpp multiply(float) -- which multiplies IN half):
+//
+//   h1 = half(x * half(1/cap))     HalfTensor::multiply(1/cap)
+//   y  = 2 * h1                    tanhFloat: half(2)*x, exact
+//   e  = half(exp(-y))             exp_util<_Float16>: exp, then narrow
+//   s  = half(1 / (1 + e))         sigmoid
+//   t  = half(2*s - 1)             tanhFloat
+//   out= half(t * half(cap))       HalfTensor::multiply(cap)
+//
+// Approximating this with a single tanh() instead differs by ~1 half-ULP on
+// most elements -- enough to flip a token within the first 40 of a 223-token
+// generation, which is how this chain came to be written out.
+inline float softcap_h(float x, float inv_cap_h, float cap_h) {
+  const float h1 = (float)(half)(x * inv_cap_h);
+  const float y = 2.0f * h1;
+  const float e = (float)(half)exp(-y);
+  const float s = (float)(half)(1.0f / (1.0f + e));
+  const float t = (float)(half)(2.0f * s - 1.0f);
+  return (float)(half)(t * cap_h);
+}
+
+__kernel void lmhead_argmax_f16_part(__global const half *logits,
+                                     __global float *part_val,
+                                     __global int *part_idx, const int N,
+                                     const float inv_cap_h, const float cap_h) {
+  const int lid = get_local_id(0);
+  float bv = -MAXFLOAT;
+  int bi = 0x7fffffff;
+  for (int i = get_global_id(0); i < N; i += get_global_size(0)) {
+    float v = (float)logits[i];
+    if (cap_h > 0.0f)
+      v = softcap_h(v, inv_cap_h, cap_h);
+    ARGMAX_TAKE(bv, bi, v, i)
+  }
+  __local float lv[ARGMAX_LS];
+  __local int li[ARGMAX_LS];
+  lv[lid] = bv;
+  li[lid] = bi;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int off = ARGMAX_LS / 2; off > 0; off >>= 1) {
+    if (lid < off) {
+      const float ov = lv[lid + off];
+      const int oi = li[lid + off];
+      ARGMAX_TAKE(lv[lid], li[lid], ov, oi)
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0) {
+    part_val[get_group_id(0)] = lv[0];
+    part_idx[get_group_id(0)] = li[0];
+  }
+}
+
+__kernel void lmhead_argmax_f16_final(__global const float *part_val,
+                                      __global const int *part_idx,
+                                      __global int *token, const int G) {
+  const int lid = get_local_id(0);
+  float bv = -MAXFLOAT;
+  int bi = 0x7fffffff;
+  for (int i = lid; i < G; i += ARGMAX_LS) {
+    const float v = part_val[i];
+    const int ix = part_idx[i];
+    ARGMAX_TAKE(bv, bi, v, ix)
+  }
+  __local float lv[ARGMAX_LS];
+  __local int li[ARGMAX_LS];
+  lv[lid] = bv;
+  li[lid] = bi;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (int off = ARGMAX_LS / 2; off > 0; off >>= 1) {
+    if (lid < off) {
+      const float ov = lv[lid + off];
+      const int oi = li[lid + off];
+      ARGMAX_TAKE(lv[lid], li[lid], ov, oi)
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  if (lid == 0)
+    token[0] = li[0];
+}
+)CL";
+
+// Must match ARGMAX_LS in the kernel source above (the __local arrays and the
+// reduction tree are sized from it).
+static constexpr int ARGMAX_LS = 64;
+// Work-groups in stage one. 128 groups x 64 lanes = 8 192 lanes over a 262 144
+// vocabulary, i.e. 32 half loads each -- enough parallelism to saturate the 12
+// compute units without making stage two's fold non-trivial.
+static constexpr int ARGMAX_GROUPS = 128;
+
 // Decode lm_head GEMV on a QINT4 (v8c row-major) weight buffer. For the untied
 // int4 lm_head N=vocab=262144 exceeds the image2d height cap (~16384) so
 // dotCl_v8c's image GEMM cannot run; this reads the already-built v8c row-major
@@ -3018,8 +3305,10 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
     if (out_buf)
       opencl::clReleaseMemObject(out_buf);
     cl_int e = CL_SUCCESS;
+    // READ_WRITE, not WRITE_ONLY: the on-GPU argmax below reads this same
+    // buffer from a kernel, which a WRITE_ONLY object does not permit.
     out_buf =
-      opencl::clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, out_bytes, nullptr, &e);
+      opencl::clCreateBuffer(ctx, CL_MEM_READ_WRITE, out_bytes, nullptr, &e);
     if (e != CL_SUCCESS || !out_buf) {
       out_buf = nullptr;
       out_cap = 0;
@@ -3058,43 +3347,24 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
     t1 = std::chrono::steady_clock::now();
   }
 
-  // Blocking readback to the host output (consumed by the host argmax/sampler).
-  if (out_fp16) {
-    if (opencl::clEnqueueReadBuffer(q, out_buf, CL_TRUE, 0, out_bytes,
-                                    logits_host, 0, nullptr,
-                                    nullptr) != CL_SUCCESS)
-      return false;
+  // Greedy step: the caller is going to reduce this row to one token id on the
+  // GPU and never look at the rest, so do not drag 512 KiB across the bus to
+  // find one index -- hand the row over instead. Any earlier deferral is
+  // dropped first: it named a row this pass has just overwritten.
+  cl_lmhead_pending = ClLmHeadPending{};
+  if (cl_lmhead_greedy_hint && cl_dev_argmax_enabled()) {
+    cl_lmhead_pending = ClLmHeadPending{};
+    cl_lmhead_pending.buf = out_buf;
+    cl_lmhead_pending.host = logits_host;
+    cl_lmhead_pending.claim = logits_host;
+    cl_lmhead_pending.n = N;
+    cl_lmhead_pending.out_fp16 = out_fp16;
+    cl_lmhead_pending.live = true;
   } else {
-    std::vector<uint16_t> y_host(N);
-    if (opencl::clEnqueueReadBuffer(q, out_buf, CL_TRUE, 0, out_bytes,
-                                    y_host.data(), 0, nullptr,
-                                    nullptr) != CL_SUCCESS)
+    // Not greedy: the blocking readback to the host output, as before -- the
+    // host argmax / sampler reads the whole row.
+    if (!lmhead_read_logits_to_host(out_buf, logits_host, N, out_fp16))
       return false;
-    float *o = static_cast<float *>(logits_host);
-    for (unsigned int i = 0; i < N; ++i) {
-      // fp16 -> fp32 (matches v8c_h2f / the q6k host conversion).
-      const uint16_t h = y_host[i];
-      const uint32_t s = (uint32_t)(h & 0x8000u) << 16;
-      uint32_t ex = (h >> 10) & 0x1fu, m = h & 0x3ffu, bits;
-      if (ex == 0) {
-        if (m == 0)
-          bits = s;
-        else {
-          ex = 1;
-          while ((m & 0x400u) == 0) {
-            m <<= 1;
-            ex--;
-          }
-          m &= 0x3ffu;
-          bits = s | ((ex + 112) << 23) | (m << 13);
-        }
-      } else if (ex == 0x1f) {
-        bits = s | 0x7f800000u | (m << 13);
-      } else {
-        bits = s | ((ex + 112) << 23) | (m << 13);
-      }
-      std::memcpy(&o[i], &bits, 4);
-    }
   }
   if (tprof) {
     const auto t2 = std::chrono::steady_clock::now();
@@ -3109,6 +3379,207 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
         std::chrono::duration<double, std::milli>(t2 - t1).count());
     }
   }
+  return true;
+}
+
+void cl_lmhead_set_greedy_hint(bool on) { cl_lmhead_greedy_hint = on; }
+
+bool cl_lmhead_logits_deferred(const void *host_row) {
+  // Keyed on the row ADDRESS, not merely on "something is pending": that is
+  // what proves the caller is looking at the very buffer this deferral owns,
+  // rather than at some other output tensor of the same pass. Gemma-family
+  // graphs put a softcapping node between the GEMV and the model output, so
+  // the address that matters is the END of that chain, not the GEMV's.
+  return cl_lmhead_pending.live && host_row != nullptr &&
+         cl_lmhead_pending.claim == host_row;
+}
+
+bool cl_lmhead_defer_softcap(const void *in_row, void *out_row, float softcap,
+                             std::function<void()> replay) {
+  // Only the row this deferral owns, only a real cap, and only a post-op that
+  // can be replayed -- anything else keeps its own host pass.
+  if (!cl_lmhead_pending.live || in_row == nullptr || out_row == nullptr ||
+      softcap <= 0.0f || !replay || cl_lmhead_pending.softcap != 0.0f ||
+      cl_lmhead_pending.claim != in_row || !cl_lmhead_pending.out_fp16)
+    return false;
+  cl_lmhead_pending.claim = out_row;
+  cl_lmhead_pending.softcap = softcap;
+  cl_lmhead_pending.replay = std::move(replay);
+  return true;
+}
+
+bool cl_lmhead_materialize_logits() {
+  if (!cl_lmhead_pending.live)
+    return true;
+  ClLmHeadPending p = std::move(cl_lmhead_pending);
+  cl_lmhead_pending = ClLmHeadPending{};
+  if (!lmhead_read_logits_to_host(p.buf, p.host, p.n, p.out_fp16))
+    return false;
+  // The GEMV's row is now on the host exactly as the un-deferred path left it,
+  // so the post-op that stood down can run on it and produce its own row.
+  if (p.replay)
+    p.replay();
+  return true;
+}
+
+bool cl_lmhead_dev_argmax(unsigned int vocab, unsigned int *token_out) {
+  if (token_out == nullptr || vocab == 0 || !cl_lmhead_pending.live ||
+      cl_lmhead_pending.n != vocab)
+    return false;
+  auto *blas_cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (!blas_cc)
+    return false;
+  cl_context ctx = blas_cc->context_inst_.GetContext();
+  cl_command_queue q = blas_cc->command_queue_inst_.GetCommandQueue();
+  if (!ctx || !q)
+    return false;
+
+  ClContext::SharedPtrClKernel k_part =
+    blas_cc->registerClKernel(lmhead_argmax_kernel, "lmhead_argmax_f16_part");
+  ClContext::SharedPtrClKernel k_final =
+    blas_cc->registerClKernel(lmhead_argmax_kernel, "lmhead_argmax_f16_final");
+  if (!k_part || !k_final) {
+    static int logged = 0;
+    if (!logged++)
+      std::fprintf(stderr, "[lmhead-argmax] registerClKernel failed\n");
+    return false;
+  }
+
+  // Partial (value, index) pairs and the 4-byte result. Built once: the
+  // lm_head N never changes and neither does the group count, so steady decode
+  // allocates nothing here.
+  static cl_mem part_val = nullptr, part_idx = nullptr, tok_buf = nullptr;
+  if (part_val == nullptr || part_idx == nullptr || tok_buf == nullptr) {
+    cl_int e = CL_SUCCESS;
+    if (part_val == nullptr)
+      part_val = opencl::clCreateBuffer(
+        ctx, CL_MEM_READ_WRITE, sizeof(float) * ARGMAX_GROUPS, nullptr, &e);
+    if (part_idx == nullptr && e == CL_SUCCESS)
+      part_idx = opencl::clCreateBuffer(
+        ctx, CL_MEM_READ_WRITE, sizeof(int) * ARGMAX_GROUPS, nullptr, &e);
+    if (tok_buf == nullptr && e == CL_SUCCESS)
+      tok_buf = opencl::clCreateBuffer(ctx, CL_MEM_READ_WRITE, sizeof(int),
+                                       nullptr, &e);
+    if (e != CL_SUCCESS || !part_val || !part_idx || !tok_buf)
+      return false; // the row is still pending; the caller reads it instead
+  }
+
+  cl_mem src = cl_lmhead_pending.buf;
+  const int N_i = (int)vocab;
+  const int G_i = ARGMAX_GROUPS;
+  // Both constants are pre-narrowed to half here, because the host multiplies
+  // by them IN half (HalfTensor::multiply(float) casts the scalar first).
+  const float cap = cl_lmhead_pending.softcap;
+  const float cap_h = narrow_to_half(cap);
+  const float inv_cap_h = cap > 0.0f ? narrow_to_half(1.0f / cap) : 0.0f;
+  const int gws_part[3] = {ARGMAX_GROUPS * ARGMAX_LS, 1, 1};
+  const int gws_final[3] = {ARGMAX_LS, 1, 1};
+  const int lws[3] = {ARGMAX_LS, 1, 1};
+
+  if (!k_part->SetKernelArguments(0, &src, sizeof(cl_mem)) ||
+      !k_part->SetKernelArguments(1, &part_val, sizeof(cl_mem)) ||
+      !k_part->SetKernelArguments(2, &part_idx, sizeof(cl_mem)) ||
+      !k_part->SetKernelArguments(3, &N_i, sizeof(int)) ||
+      !k_part->SetKernelArguments(4, &inv_cap_h, sizeof(float)) ||
+      !k_part->SetKernelArguments(5, &cap_h, sizeof(float)))
+    return false;
+  if (!blas_cc->command_queue_inst_.DispatchCommand(k_part, gws_part, lws))
+    return false;
+
+  if (!k_final->SetKernelArguments(0, &part_val, sizeof(cl_mem)) ||
+      !k_final->SetKernelArguments(1, &part_idx, sizeof(cl_mem)) ||
+      !k_final->SetKernelArguments(2, &tok_buf, sizeof(cl_mem)) ||
+      !k_final->SetKernelArguments(3, &G_i, sizeof(int)))
+    return false;
+  if (!blas_cc->command_queue_inst_.DispatchCommand(k_final, gws_final, lws))
+    return false;
+
+  // The one blocking sync of the step, now 4 bytes wide. The queue is
+  // in-order, so this also waits for the GEMV that produced the row.
+  int tok = -1;
+  if (opencl::clEnqueueReadBuffer(q, tok_buf, CL_TRUE, 0, sizeof(int), &tok, 0,
+                                  nullptr, nullptr) != CL_SUCCESS)
+    return false;
+  // Out of range means the reduction saw nothing usable (an all-NaN row, or a
+  // driver that dropped the dispatch). Leave the row pending and say so; the
+  // caller falls back to reading and scanning it.
+  if (tok < 0 || (unsigned int)tok >= vocab)
+    return false;
+
+  // NNTR_CL_ARGMAX_VERIFY: cross-check the reduction against a host scan of
+  // the same row (softcap included), on the first few tokens. Diagnostic only
+  // -- it re-reads the 512 KiB the reduction exists to avoid, so it is off
+  // unless the env is set.
+  {
+    static const bool verify = std::getenv("NNTR_CL_ARGMAX_VERIFY") != nullptr;
+    static int checked = 0;
+    if (verify && checked < 6) {
+      ++checked;
+      std::vector<uint16_t> row(vocab);
+      if (opencl::clEnqueueReadBuffer(
+            q, src, CL_TRUE, 0, sizeof(uint16_t) * (size_t)vocab, row.data(), 0,
+            nullptr, nullptr) == CL_SUCCESS) {
+        auto h2f = [](uint16_t h) {
+          const uint32_t sgn = (uint32_t)(h & 0x8000u) << 16;
+          uint32_t ex = (h >> 10) & 0x1fu, m = h & 0x3ffu, bits;
+          if (ex == 0) {
+            if (m == 0)
+              bits = sgn;
+            else {
+              ex = 1;
+              while ((m & 0x400u) == 0) {
+                m <<= 1;
+                ex--;
+              }
+              m &= 0x3ffu;
+              bits = sgn | ((ex + 112) << 23) | (m << 13);
+            }
+          } else if (ex == 0x1f) {
+            bits = sgn | 0x7f800000u | (m << 13);
+          } else {
+            bits = sgn | ((ex + 112) << 23) | (m << 13);
+          }
+          float f;
+          std::memcpy(&f, &bits, 4);
+          return f;
+        };
+        // Host reference: the same softcap chain the skipped layer would have
+        // applied, then the same first-maximum scan generate() would run.
+        auto capped = [&](uint16_t h) {
+          float v = h2f(h);
+          if (cap_h > 0.0f) {
+            const float h1 = narrow_to_half(v * inv_cap_h);
+            const float e = narrow_to_half(std::exp(-(2.0f * h1)));
+            const float sg = narrow_to_half(1.0f / (1.0f + e));
+            const float t = narrow_to_half(2.0f * sg - 1.0f);
+            v = narrow_to_half(t * cap_h);
+          }
+          return v;
+        };
+        unsigned int best = 0;
+        float bestv = capped(row[0]);
+        for (unsigned int i = 1; i < vocab; ++i) {
+          const float v = capped(row[i]);
+          if (v > bestv) {
+            bestv = v;
+            best = i;
+          }
+        }
+        std::fprintf(stderr,
+                     "[cl-argmax] verify#%d dev=%d host=%u hostval=%.4f "
+                     "devval=%.4f %s\n",
+                     checked, tok, best, bestv, capped(row[tok]),
+                     ((unsigned int)tok == best) ? "OK" : "MISMATCH");
+      } else {
+        std::fprintf(stderr, "[cl-argmax] verify#%d readback failed\n",
+                     checked);
+      }
+    }
+  }
+
+  cl_lmhead_pending = ClLmHeadPending{};
+  *token_out = (unsigned int)tok;
   return true;
 }
 

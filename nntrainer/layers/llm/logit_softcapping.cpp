@@ -15,6 +15,10 @@
 #include <algorithm>
 #include <stdexcept>
 
+#if defined(ENABLE_OPENCL)
+#include <blas_kernels.h>
+#endif
+
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
@@ -142,6 +146,28 @@ void LogitSoftCappingLayer::applyOnRange(nntrainer::RunLayerContext &context,
         }
         cudaGetLastError();
       }
+#endif
+#if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
+      // The lm_head GEMV may have left this row on the GPU because the caller
+      // is going to reduce it to one token id there (greedy decode). This pass
+      // is the row's only other reader, and softcapping is strictly monotone,
+      // so the reduction can absorb it: hand the row on, and skip the four
+      // full-vocabulary host passes below. Measured 2.1-2.6 ms/token on
+      // Adreno 840 at vocab 262144 -- all of it on the token's critical path.
+      // The replay closure is what makes this safe: if anything downstream
+      // ends up needing the host row after all, it re-runs exactly these four
+      // lines on the materialized input.
+      if (softcap > 0.0f &&
+          in_chunk.getDataType() == nntrainer::TensorDim::DataType::FP16 &&
+          nntrainer::cl_lmhead_defer_softcap(
+            in_chunk.getData<_FP16>(), out_chunk.getData<_FP16>(), softcap,
+            [this, in_chunk, out_chunk, softcap]() mutable {
+              out_chunk.copyData(in_chunk);
+              in_chunk.multiply(1.0f / softcap, out_chunk);
+              acti_func.run_fn(out_chunk, out_chunk);
+              out_chunk.multiply(softcap, out_chunk);
+            }))
+        continue;
 #endif
       out_chunk.copyData(in_chunk);
 

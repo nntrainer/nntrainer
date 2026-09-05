@@ -609,6 +609,68 @@ bool lmhead_int4_v8c_gemv_cl(void *w_buf_clmem, void *scale_buf_clmem,
                              bool out_fp16, unsigned int N, unsigned int K);
 
 /**
+ * @brief Tell the NEXT decode lm_head GEMV whether the full-vocabulary host
+ *        row is going to be read at all.
+ *
+ * Greedy decoding reads one index out of [vocab]; sampling, a logits processor
+ * and the repetition / bad-word passes read the whole row. Only the first case
+ * can leave the row on the device. This is a HINT, never a correctness input:
+ * a wrong guess costs one deferred readback (cl_lmhead_materialize_logits),
+ * it cannot produce a wrong token or an unfilled read.
+ */
+void cl_lmhead_set_greedy_hint(bool on);
+
+/**
+ * @brief Whether the last lm_head GEMV left @a host_row unwritten on purpose.
+ * @param host_row the caller's logits row -- the answer is keyed on this
+ *        address, so it is true only for the very buffer the GEMV declined to
+ *        fill.
+ */
+bool cl_lmhead_logits_deferred(const void *host_row);
+
+/**
+ * @brief Reduce the deferred, device-resident lm_head row to a token id on the
+ *        GPU and read back 4 bytes.
+ *
+ * The reduction compares the same fp32 values a host scan would (half -> float
+ * is exact and order-preserving) and returns the LOWEST index among the
+ * maxima, which is what std::max_element returns -- the token is bit-identical
+ * to the host path.
+ *
+ * @param vocab must equal the deferred row's length; a mismatch is refused
+ *        rather than reduced over the wrong extent.
+ * @return false when there is no deferred row for this vocab, or the reduction
+ *         could not run. The row is then still pending and the caller must
+ *         fall back through cl_lmhead_materialize_logits().
+ */
+bool cl_lmhead_dev_argmax(unsigned int vocab, unsigned int *token_out);
+
+/**
+ * @brief Let a monotone post-op on the deferred row stand down.
+ *
+ * Gemma-family graphs put a final logit-softcapping node between the lm_head
+ * GEMV and the model output, and that node is the deferred row's only other
+ * host reader. Softcapping cannot move an argmax, so the on-GPU reduction
+ * absorbs it (bit-for-bit, including the fp16 ties it creates) and the node's
+ * four full-vocabulary host passes are skipped.
+ *
+ * @param in_row  the node's input -- must be the row currently deferred
+ * @param out_row the node's output; becomes the address callers key on
+ * @param softcap the cap value the reduction will reproduce
+ * @param replay  re-runs the node's host math on a materialized input; called
+ *                by cl_lmhead_materialize_logits() if the row is ever needed
+ * @return false when this is not the deferred row (the node then runs as usual)
+ */
+bool cl_lmhead_defer_softcap(const void *in_row, void *out_row, float softcap,
+                             std::function<void()> replay);
+
+/**
+ * @brief Pay the readback a deferral skipped, filling the host row.
+ * @return true when there was nothing outstanding, or the row was filled.
+ */
+bool cl_lmhead_materialize_logits();
+
+/**
  * @brief Whether the v8c FC GEMM / KV attention use the cl_mem BUFFER path
  *        (Intel NEO) instead of the image2d path (Adreno). The env var
  * NNTR_V8C_BUF overrides; unset ⇒ derived from DeviceCaps::image_v8c
