@@ -469,6 +469,28 @@ public:
                            bool accumulate);
 
   /**
+   * @brief The whole two-operand residual add in one go: hidden = a + b.
+   *
+   * The per-operand residual_op above costs one device dispatch per operand --
+   * a copy and then an accumulate -- and on a backend whose per-dispatch
+   * submission floor is several times the kernel's own runtime that pair is
+   * dominated by the floor, not by the add. A backend that can do both
+   * operands in one kernel overrides this; the default declines and the
+   * caller keeps the per-operand loop.
+   *
+   * @param[out] hidden destination
+   * @param[in] a first operand
+   * @param[in] b second operand
+   * @return true when the fused add was issued
+   */
+  virtual bool residual_op2(Tensor &hidden, const Tensor &a, const Tensor &b) {
+    (void)hidden;
+    (void)a;
+    (void)b;
+    return false;
+  }
+
+  /**
    * @brief Fully-connected matmul: output = input * weight. The neutral
    *        FullyConnectedLayer owns the weight/bias binding and calls this for
    *        the matmul, so a quantized accelerator GEMM lives in the op table

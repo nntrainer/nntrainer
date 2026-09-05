@@ -177,6 +177,16 @@ bool clmem_raise_cl(const Tensor &t, unsigned int valid_bytes);
 bool clmem_lower_cl(const Tensor &t, unsigned int valid_bytes);
 
 /**
+ * @brief Both residual operands in one device dispatch: dst = a + b.
+ * @param[out] dst destination (device plane)
+ * @param[in] a first operand (device plane)
+ * @param[in] b second operand (device plane)
+ * @return false when any operand is not device-plane resident or the shapes
+ *         disagree, so the caller keeps the per-operand path
+ */
+bool clmem_residual_add2_cl(Tensor &dst, const Tensor &a, const Tensor &b);
+
+/**
  * @brief Reserve the v8c activation scratch a fused norm can quantise into.
  *
  * A norm that writes a device-plane row is, on every LLM graph this backend

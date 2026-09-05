@@ -1110,7 +1110,74 @@ __kernel void v8c_copy_f2f(__global const float *in, __global float *out,
   int i = get_global_id(0);
   if (i < n) out[i] = in[i];
 }
+__kernel void v8c_add2_h2h(__global const half *a, __global const half *b,
+                           __global half *out, const int n) {
+  int i = get_global_id(0);
+  if (i < n) out[i] = a[i] + b[i];
+}
 )CL";
+
+/**
+ * @brief Both residual operands in one dispatch: dst = a + b.
+ *
+ * The two-input AdditionLayer is the residual stream's join, and it is the
+ * single most frequent elementwise op in a decoder step. Run per operand it
+ * costs a copy dispatch and an accumulate dispatch; run together it costs one.
+ * On this backend that halves a pair whose GPU time (~1.7 us each) is a
+ * quarter of the ~7.4 us it costs to put either of them on the device.
+ *
+ * The result is bit-identical to the pair: the copy writes a[i] exactly and
+ * the accumulate then rounds a[i] + b[i] once, which is what this single
+ * add does.
+ *
+ * Device plane only, and only when all three tensors are there: a shared-plane
+ * operand keeps the map/unmap protocol the per-operand path implements, and
+ * splitting the difference here would be a second protocol to reason about for
+ * no dispatch saved (the shared-plane first operand does not dispatch at all).
+ */
+bool clmem_residual_add2_cl(Tensor &dst, const Tensor &a, const Tensor &b) {
+  static const bool fuse_on = []() {
+    const char *e = std::getenv("NNTR_FUSE_RESIDUAL_ADD2");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  if (!fuse_on)
+    return false;
+  const auto fp16 = ml::train::TensorDim::DataType::FP16;
+  if (dst.getDataType() != fp16 || a.getDataType() != fp16 ||
+      b.getDataType() != fp16)
+    return false;
+  if (dst.size() == 0 || dst.size() != a.size() || dst.size() != b.size())
+    return false;
+  if (!dst.isClMem() || !a.isClMem() || !b.isClMem())
+    return false;
+  void *dst_cl = dst.getClMem(), *a_cl = a.getClMem(), *b_cl = b.getClMem();
+  if (dst_cl == nullptr || a_cl == nullptr || b_cl == nullptr)
+    return false;
+  // Same rule as clmem_residual_op_cl: the device handle covers the whole
+  // tensor, so a view at a nonzero offset cannot be bound from its base.
+  if (dst.getOffset() != 0 || a.getOffset() != 0 || b.getOffset() != 0)
+    return false;
+
+  auto *cc =
+    static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
+  if (cc == nullptr)
+    return false;
+  auto kp = cc->registerClKernel(v8c_util_kernels, "v8c_add2_h2h");
+  if (!kp)
+    return false;
+  cl_mem ah = static_cast<cl_mem>(a_cl), bh = static_cast<cl_mem>(b_cl),
+         oh = static_cast<cl_mem>(dst_cl);
+  int ni = (int)dst.size();
+  if (!kp->SetKernelArguments(0, &ah, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(1, &bh, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(2, &oh, sizeof(cl_mem)) ||
+      !kp->SetKernelArguments(3, &ni, sizeof(int)))
+    return false;
+  const int gws[3] = {(int)(((size_t)ni + 63) / 64 * 64), 1, 1};
+  const int lws[3] = {64, 1, 1};
+  opencl::Kernel::noteDispatchWrites(dst_cl);
+  return cc->command_queue_inst_.DispatchCommand(kp, gws, lws);
+}
 
 // Write the fp16 GEMM result (y_fp16, device cl_mem, n = M*N valid elements)
 // directly into the GPU-resident SVM output, converting to fp32 when needed.

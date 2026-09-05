@@ -224,6 +224,20 @@ public:
   // back into the caller's pointer, which is the very read into shared memory
   // that does not land (see the FP32 GEMM read-back), and both operands are
   // host-addressable here anyway.
+  // Both operands of the residual join in one kernel. Declines (and the
+  // neutral AdditionLayer falls back to the per-operand loop) whenever the
+  // three tensors are not all device-plane FP16.
+  bool residual_op2(Tensor &hidden, const Tensor &a, const Tensor &b) override {
+#ifdef ENABLE_FP16
+    return nntrainer::clmem_residual_add2_cl(hidden, a, b);
+#else
+    (void)hidden;
+    (void)a;
+    (void)b;
+    return false;
+#endif
+  }
+
   void residual_op(Tensor &hidden, const Tensor &input,
                    bool accumulate) override {
     const auto fp32 = ml::train::TensorDim::DataType::FP32;
