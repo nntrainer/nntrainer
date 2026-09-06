@@ -45,6 +45,9 @@ number (~240 tok/s) because it is below the flash-attention threshold and is
 dominated by fixed setup cost — not representative of sustained throughput.
 Peak RSS ≈ 0.94 GB.
 
+For the V-JEPA-2 ViT-B/16 video-encoder numbers, see
+[examples/vjepa2](examples/vjepa2/README.md).
+
 ## CausalLM API
 
 The CausalLM application exposes a C API for easy integration with other applications (e.g., Android JNI).

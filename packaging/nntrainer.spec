@@ -711,6 +711,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/singleton.h
 %{_includedir}/nntrainer/fp16.h
 %{_includedir}/nntrainer/util_simd.h
+%{_includedir}/nntrainer/perf_profile.h
 %{_includedir}/nntrainer/dynamic_library_loader.h
 %{_includedir}/nntrainer/mman_windows.h
 %{_includedir}/nntrainer/loss_layer.h

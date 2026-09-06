@@ -89,7 +89,8 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
      withKey("rope_theta", ROPE_THETA),
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-     withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
+     withKey("is_causal", IS_CAUSAL ? "true" : "false"),
+     withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false")}));
   Tensor a = mha({q_normed, k_normed, v, cache_k, cache_v});
 
   // O layer

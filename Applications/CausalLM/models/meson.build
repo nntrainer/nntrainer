@@ -16,6 +16,7 @@ subdir('gemma3')
 subdir('gemma4')
 subdir('timm_vit')
 subdir('lfm2')
+subdir('vjepa2_vit')
 if get_option('platform') != 'windows'
     subdir('bert')
     subdir('xlm_roberta')

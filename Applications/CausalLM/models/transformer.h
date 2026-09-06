@@ -389,6 +389,11 @@ protected:
   unsigned int FSU_LOOKAHEAD;
   float ATTN_LOGIT_SOFTCAPPING = 0.0f; /**< attention logit softcapping */
   bool IS_CAUSAL = true;
+  bool USE_FLASH_ATTENTION = true; /**< Enable flash GEMM attention path for
+                                        prefill (decode always uses the
+                                        per-row dot path). Defaults to true;
+                                        read from nntr_config.json key
+                                        "use_flash_attention". */
 
   // Performance metrics
   TransformerPerformanceMetrics performance_metrics;

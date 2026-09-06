@@ -1,0 +1,3 @@
+{ "model_tensor_type":"Q4_0-FP16","model_file_name":"nntr_vjepa2_vitb_q40_arm.bin","model_type":"Model",
+  "embedding_dtype":"FP32","fc_layer_dtype":"Q4_0","batch_size":1,"max_seq_len":3072,"init_seq_len":3072,
+  "num_to_generate":0,"fsu":false,"skip_tokenizer":true }

@@ -1,0 +1,12 @@
+{
+  "num_frames": 32,
+  "img_size": 384,
+  "patch_size": 16,
+  "tubelet_size": 2,
+  "grid_t": 16,
+  "grid_h": 24,
+  "grid_w": 24,
+  "num_patches": 9216,
+  "embed_dim": 768,
+  "seed": 0
+}

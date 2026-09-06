@@ -14,6 +14,7 @@
 #include <ggml_interface.h>
 #include <nntr_ggml_impl.h>
 #include <nntr_ggml_impl_common.h>
+#include <perf_profile.h>
 
 #include <algorithm>
 #include <assert.h>

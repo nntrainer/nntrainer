@@ -144,6 +144,9 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
   EMBEDDING_FILE_NAME = nntr_cfg.value("embedding_file_name", std::string());
   PLE_FILE_NAME = nntr_cfg.value("ple_file_name", std::string());
+  USE_FLASH_ATTENTION = nntr_cfg.contains("use_flash_attention")
+                          ? nntr_cfg["use_flash_attention"].get<bool>()
+                          : true;
 
   if (cfg.contains("is_causal")) {
     IS_CAUSAL = cfg["is_causal"].get<bool>();
@@ -509,7 +512,8 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
      withKey("rope_theta", ROPE_THETA),
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
-     withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
+     withKey("is_causal", IS_CAUSAL ? "true" : "false"),
+     withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false")}));
   Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer
@@ -541,15 +545,15 @@ Tensor Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
      withKey("weight_initializer", "ones")}));
   Tensor gate = ffn_gate(input);
 
-  /// @note nntrainer binary stores mlp weights in up, gate order.
-  /// For backward compatibility,
-  /// * layers are in up, gate order
-  /// * swiglu input[0] = gate
-  /// * swiglu input[1] = up
+  /// @note SwiGLU computes silu(input[0]) * input[1], i.e. silu(gate) * up,
+  /// so the gate projection must be wired to input[0] and up to input[1].
+  /// Wire them explicitly via the input order; the input-index remap form
+  /// (swiglu({up, gate}, {1, 0})) does not deliver this slot mapping at
+  /// inference time and silently computes silu(up) * gate instead.
   LayerHandle swiglu(createLayer(
     "swiglu",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_swiglu")}));
-  Tensor act = swiglu({up, gate}, {1, 0});
+  Tensor act = swiglu({gate, up});
 
   LayerHandle ffn_down(createLayer(
     "fully_connected",

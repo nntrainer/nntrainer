@@ -69,6 +69,7 @@
 /usr/include/nntrainer/safetensors_util.h
 /usr/include/nntrainer/fp16.h
 /usr/include/nntrainer/util_simd.h
+/usr/include/nntrainer/perf_profile.h
 /usr/include/nntrainer/dynamic_library_loader.h
 /usr/include/nntrainer/mman_windows.h
 # model

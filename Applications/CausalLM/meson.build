@@ -42,6 +42,9 @@ causallm_layer_dependencies += [
     causallm_per_layer_slice_dep,
     causallm_scalar_multiply_dep,
     causallm_logit_softcapping_dep,
+    causallm_vjepa_rope_layer_dep,
+    causallm_vjepa_gelu_layer_dep,
+    causallm_vjepa_layernorm_layer_dep,
 ]
 
 subdir('models')

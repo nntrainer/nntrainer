@@ -56,6 +56,7 @@
 #include "qwen3_moe_causallm.h"
 #include "qwen3_slim_moe_causallm.h"
 #include "timm_vit/timm_vit_transformer.h"
+#include "vjepa2_vit/vjepa2_vit.h"
 #include <models/gemma3/function.h>
 #if !defined(_WIN32)
 #include <sys/resource.h>
@@ -211,6 +212,10 @@ std::string resolve_architecture(std::string model_type,
     return "Gemma4ForCausalLM";
   }
 
+  if (architecture == "VJEPA2ViT" || architecture == "vjepa2_1_vit_base_384") {
+    return "VJEPA2ViT";
+  }
+
   return architecture;
 }
 
@@ -322,6 +327,11 @@ int main(int argc, char *argv[]) {
     "Lfm2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::Lfm2CausalLM>(cfg, generation_cfg,
                                                       nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "VJEPA2ViT", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::VJEPA2ViT>(cfg, generation_cfg,
+                                                   nntr_cfg);
     });
 
   // Validate arguments

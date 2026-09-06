@@ -28,6 +28,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <perf_profile.h>
 #include <util_func.h>
 
 #include <iostream>
@@ -266,6 +267,9 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
+  PERF_SCOPE(input_.getDataType() == TensorDim::DataType::FP32
+               ? "FC.inc_fwd[fp32]"
+               : "FC.inc_fwd[fp16]");
   Tensor loraA, loraB, hidden_tmp_lora, hidden_out_lora;
 
   bool is_prefill = !from || (to - from) > 1;

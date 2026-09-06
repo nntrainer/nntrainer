@@ -1,0 +1,15 @@
+{
+    "batch_size": 1,
+    "embedding_dtype": "FP32",
+    "fc_layer_dtype": "Q4_0",
+    "fsu": false,
+    "init_seq_len": 9216,
+    "lmhead_dtype": "FP32",
+    "max_seq_len": 9216,
+    "model_file_name": "nntr_vjepa2_vitb_q40_arm.bin",
+    "model_tensor_type": "Q4_0-FP32",
+    "model_type": "Model",
+    "num_to_generate": 0,
+    "sample_input": "sample_video.bin",
+    "skip_tokenizer": true
+}
