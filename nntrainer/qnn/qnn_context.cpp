@@ -19,6 +19,7 @@
 #include "Utils/QnnSampleAppUtils.hpp"
 #include "WrapperUtils/QnnWrapperUtils.hpp"
 #include "iotensor_wrapper.hpp"
+#include <stdexcept>
 
 #include "BackendExtensions.hpp"
 
@@ -118,7 +119,18 @@ void QNNContext::initialize() noexcept {
   LOGD("initialize: START");
   try {
     LOGD("initialize: calling init()");
-    init();
+    // init()'s return value used to be discarded. It reports exactly the case
+    // this context cannot recover from -- the QNN backend/system libraries
+    // could not be loaded or the backend refused to come up -- and the code
+    // below (QNNRpcManager, registerFactory) assumes they did. Continuing past
+    // a failed init() is how a process without the QNN SDK on its library path
+    // reached QNNRpcManager's null QnnInterface_getProviders and crashed at
+    // pc=0. Throw instead: the catch below turns it into a log line and
+    // Engine::add_default_object() carries on with the cpu/gpu contexts.
+    if (init() != 0) {
+      LOGE("initialize: init() failed; QNN backend unavailable");
+      throw std::runtime_error("QNN backend initialization failed");
+    }
     LOGD("initialize: init() completed");
     ml_logi("qnn init done");
     LOGD("initialize: creating QNNRpcManager");
