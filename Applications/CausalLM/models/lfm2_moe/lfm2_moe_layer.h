@@ -206,6 +206,33 @@ private:
     const std::vector<std::pair<unsigned, float>> &token_assignments,
     const nntrainer::Tensor &gate_up_proj, const nntrainer::Tensor &down_proj,
     unsigned int hidden_size, ExpertWorkspace &workspace);
+
+  /**
+   * @brief Decode (single-token) fast path: every expert in
+   * @a selected_experts has exactly one (token 0, weight) assignment here,
+   * so they all read the SAME activation for gate_up. Groups that into one
+   * Tensor::dot(vector, vector) call instead of one dot() per expert --
+   * a no-op reshuffle on CPU (its fallback for that call is the same
+   * per-weight loop this replaces) and, on HTP, the one thing that lets the
+   * DSP kernel prefetch the next expert's weight while the current one
+   * computes instead of a separate FastRPC round trip per expert.
+   * @param context Layer context (for expert weight lookup)
+   * @param input Input tensor (reshaped to [1, 1, 1, hidden_size])
+   * @param output Output tensor to accumulate results into
+   * @param selected_experts Expert ids with a non-empty assignment (>= 2)
+   * @param expert_assignments Full per-expert assignment table (for the
+   * per-expert routing weight)
+   * @param hidden_size Hidden dimension size
+   * @param workspace Reusable expert output/activation storage (reused per
+   * expert, sequentially, matching compute_expert_forward)
+   */
+  void computeGroupedDecodeExperts(
+    nntrainer::RunLayerContext &context, const nntrainer::Tensor &input,
+    nntrainer::Tensor &output,
+    const std::vector<unsigned int> &selected_experts,
+    const std::vector<std::vector<std::pair<unsigned, float>>>
+      &expert_assignments,
+    unsigned int hidden_size, ExpertWorkspace &workspace);
 };
 } // namespace causallm
 

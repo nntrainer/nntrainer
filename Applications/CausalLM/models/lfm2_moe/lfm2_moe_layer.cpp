@@ -484,20 +484,109 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                    &prefill_gate_up_output, &prefill_activation_output};
     }
 
-    for (unsigned int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
-      const auto &assignments = expert_assignments[expert_idx];
-      if (assignments.empty())
-        continue;
+    // Decode's single token routes to num_experts_per_tok distinct experts,
+    // all sharing that one token as gate_up's activation -- group them (see
+    // computeGroupedDecodeExperts). Prefill (total_tokens != 1) and the
+    // degenerate 0/1-expert case are unaffected: same loop as before.
+    std::vector<unsigned int> single_token_experts;
+    if (total_tokens == 1) {
+      for (unsigned int expert_idx = 0; expert_idx < num_experts;
+           ++expert_idx) {
+        if (!expert_assignments[expert_idx].empty())
+          single_token_experts.push_back(expert_idx);
+      }
+    }
 
-      compute_expert_forward(
-        input, output, assignments,
-        context.getWeight(expert_gate_up_proj_indices[expert_idx]),
-        context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size,
-        workspace);
+    if (single_token_experts.size() > 1) {
+      computeGroupedDecodeExperts(context, input, output, single_token_experts,
+                                  expert_assignments, hidden_size, workspace);
+    } else {
+      for (unsigned int expert_idx = 0; expert_idx < num_experts;
+           ++expert_idx) {
+        const auto &assignments = expert_assignments[expert_idx];
+        if (assignments.empty())
+          continue;
+
+        compute_expert_forward(
+          input, output, assignments,
+          context.getWeight(expert_gate_up_proj_indices[expert_idx]),
+          context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size,
+          workspace);
+      }
     }
 
     // reshape output: [B*S,1,1,H] -> [B,1,S,H]
     output.reshape({batch_size, 1, seq_len, hidden_size});
+  }
+}
+
+void Lfm2MoELayer::computeGroupedDecodeExperts(
+  nntrainer::RunLayerContext &context, const nntrainer::Tensor &input,
+  nntrainer::Tensor &output, const std::vector<unsigned int> &selected_experts,
+  const std::vector<std::vector<std::pair<unsigned, float>>>
+    &expert_assignments,
+  unsigned int hidden_size, ExpertWorkspace &workspace) {
+
+  const unsigned int n = static_cast<unsigned int>(selected_experts.size());
+  const unsigned int intermediate_size =
+    std::get<nntrainer::props::Unit>(moe_props).get();
+
+  // Decode's one token (token index 0 in this reshaped call), shared by
+  // every selected expert's gate_up projection.
+  nntrainer::Tensor token_input =
+    input.getSharedDataTensor({1, 1, 1, hidden_size}, 0, true);
+
+  // One buffer holding every selected expert's [gate|up] side by side, so
+  // the grouped dot() below can write each expert's slice through its own
+  // view -- same shape decode_gate_up_output holds for a single expert,
+  // just concatenated across the n experts in this call.
+  nntrainer::Tensor batched_gate_up(1, 1, n, 2 * intermediate_size,
+                                    input.getTensorType());
+  input.inheritContextTo(batched_gate_up);
+
+  std::vector<nntrainer::Tensor *> gate_up_weights(n);
+  std::vector<nntrainer::Tensor> gate_up_views;
+  gate_up_views.reserve(n);
+  for (unsigned int i = 0; i < n; ++i) {
+    gate_up_weights[i] =
+      &context.getWeight(expert_gate_up_proj_indices[selected_experts[i]]);
+    gate_up_views.push_back(batched_gate_up.getSharedDataTensor(
+      {1, 1, 1, 2 * intermediate_size}, i * 2 * intermediate_size, true));
+  }
+  std::vector<nntrainer::Tensor *> gate_up_outs(n);
+  for (unsigned int i = 0; i < n; ++i)
+    gate_up_outs[i] = &gate_up_views[i];
+
+  token_input.dot(gate_up_weights, gate_up_outs);
+
+  nntrainer::TensorDim intermediate_dim({1, 1, 1, intermediate_size},
+                                        input.getTensorType());
+  nntrainer::TensorDim token_step_dim({1, 1, 1, hidden_size},
+                                      input.getTensorType());
+
+  // swiglu and down stay per-expert and sequential -- each expert's
+  // activation differs after swiglu, so they cannot share a down call the
+  // way gate_up shared its activation. Reuses the same single-expert
+  // workspace slots compute_expert_forward_no_critical uses, one expert at
+  // a time, exactly as the un-grouped loop already did.
+  for (unsigned int i = 0; i < n; ++i) {
+    const unsigned int expert_idx = selected_experts[i];
+    nntrainer::Tensor acti_out =
+      workspace.activation_output->getSharedDataTensor(intermediate_dim, 0,
+                                                       true);
+    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
+                      gate_up_views[i].getData<float>(),
+                      gate_up_views[i].getData<float>() + intermediate_size);
+
+    nntrainer::Tensor expert_output =
+      workspace.expert_output->getSharedDataTensor(token_step_dim, 0, true);
+    acti_out.dot(context.getWeight(expert_down_proj_indices[expert_idx]),
+                 expert_output);
+    expert_output.multiply_i(expert_assignments[expert_idx][0].second);
+
+    nntrainer::Tensor token_output =
+      output.getSharedDataTensor(token_step_dim, 0, true);
+    token_output.add_i(expert_output);
   }
 }
 
