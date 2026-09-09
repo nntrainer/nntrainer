@@ -399,21 +399,37 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
   // token (same reason accelerates_q4_0_at_m1() is false).
   // gate_up_out / acti_out are simply unused when this takes.
   //
-  // Enabled as of the exp_top 88.0f -> 85.0f fix in hvx_swiglu_f32.c.
-  // Both earlier attempts -- hexkl_mm_u8i4_fused_run and the split-call
-  // hexkl_mm_u8i4_gate_up_swiglu_run -- broke the real model identically
-  // ("Could you please provide the text you would like summarized?", 206
-  // tokens, vs the CPU path's correct 512-token summary) while passing
-  // every synthetic-weight SNR gate. They share exactly one thing:
-  // hvx_swiglu_inplace_f32, whose hvx_recip_qf32 returned NaN for every
-  // gate at or below the old clamp. One NaN lane poisons
-  // hvx_quant_rows_u8_params' whole-row min/max scan, so a single
-  // saturated gate destroyed that row's requantization -- which is why
-  // it compounded across experts and layers instead of showing up as
-  // per-call noise. See docs/htp_attention/43_moe_ffn_measured_next_
-  // levers.md section 7 for the derivation and the accept criterion:
-  // generated text identical to moe_engine=cpu, not a dB number.
-  constexpr bool kFusedSwigluEnabled = true;
+  // ponytail: DISABLED again, and this time with the NaN hypothesis ruled
+  // out on device rather than merely suspected.
+  //
+  // Three attempts now break the real model identically ("Could you please
+  // provide the text you would like summarized?", 206 tokens, vs the CPU
+  // path's correct 512-token summary) while passing every synthetic-weight
+  // SNR gate. The shared hvx_recip_qf32 NaN was the leading candidate --
+  // its magic seed really does diverge for any gate at or below the old
+  // exp clamp, host-verified, and hvx_swiglu_f32.c's clamp is fixed on that
+  // basis and stays fixed. But NNTR_L2_CHECK, which scans the DSP's own
+  // per-row requantization scales (where a NaN lane lands, since
+  // hvx_quant_rows_u8_params scans the whole row for min/max) and the down
+  // matmul's f32 output, reports ZERO non-finite values on a full run whose
+  // text is still wrong. So the fused path's output is finite and wrong,
+  // not NaN and wrong: a different class of bug, and the NaN fix -- correct
+  // on its own terms -- was never what this needed.
+  //
+  // What has still never been controlled for is the DATA. Every gate this
+  // path has ever passed used fill_deterministic weights and activations;
+  // the model's own registered weight bytes and a real captured activation
+  // have never been put through both paths side by side. NNTR_L2_DIFF
+  // (HtpComputeOps::l2Diff) does exactly that and bisects the remaining
+  // search in one run -- see its doc comment. Run it before writing a
+  // fourth implementation.
+  //
+  // Performance is NOT the reason this is off: at 41.5-42.6 ms/layer the
+  // split-call path beats the two-dot HTP path's 55.6 ms (doc 43 section 1).
+  // HTP losing to CPU at these shapes is a separate, structural finding --
+  // the matmul is 21% of the call (the profile's own mm<= column now
+  // measures it) and MoE prefill is DDR-bandwidth bound on expert weights.
+  constexpr bool kFusedSwigluEnabled = false;
   bool expert_ffn_done = false;
   if (kFusedSwigluEnabled && num_tokens > 1 &&
       gate_up_proj.getDataType() == nntrainer::Tdatatype::QS4CX &&
