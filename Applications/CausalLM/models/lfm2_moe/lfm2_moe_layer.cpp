@@ -399,35 +399,21 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
   // token (same reason accelerates_q4_0_at_m1() is false).
   // gate_up_out / acti_out are simply unused when this takes.
   //
-  // ponytail: DISABLED, not deleted -- STILL disabled after a full
-  // reimplementation. Two structurally different DSP kernels now
-  // reproduce the identical model-breaking failure ("Could you please
-  // provide the text you would like summarized?", 206 tokens, vs the
-  // CPU path's correct 512-token summary):
-  //   1. hexkl_mm_u8i4_fused_run -- one call, two weights, six VTCM
-  //      regions carved by hand. Its own unit test has a real M>=128 SNR
-  //      anomaly (139 -> 77 dB) that this session never explained.
-  //   2. hexkl_mm_u8i4_gate_up_swiglu_run + the already-verified u8in
-  //      path for down -- one weight per call, reuses proven code for
-  //      the down side, does NOT reproduce #1's M-anomaly (stable
-  //      138-141 dB from M=11 to M=200, the real model's own observed
-  //      per-expert M range, confirmed via NNTR_L2_DEBUG prints of the
-  //      actual dispatch args -- shapes and pointers all correct).
-  // Since #2's unit tests pass at the real model's exact shapes AND its
-  // ARM-side call arguments are confirmed correct, but the real model
-  // still breaks, the bug is not in either kernel's basic correctness or
-  // in how Lfm2MoELayer constructs the call -- it is something neither
-  // implementation controls for: most likely a systematic (not just
-  // random) bias in hvx_swiglu_f32.c's exp/reciprocal approximation that
-  // a per-call SNR-vs-synthetic-data metric does not catch, compounding
-  // across 32 experts and however many downstream layers see the result.
-  // Root cause NOT found. Ceiling: a differential test against this
-  // model's OWN registered weight bytes and a real captured activation
-  // (not fill_deterministic's synthetic pattern) is the one variable
-  // neither attempt has controlled for -- see docs/htp_attention/
-  // 43_moe_ffn_measured_next_levers.md §7's L2 rows before trying a third
-  // implementation.
-  constexpr bool kFusedSwigluEnabled = false;
+  // Enabled as of the exp_top 88.0f -> 85.0f fix in hvx_swiglu_f32.c.
+  // Both earlier attempts -- hexkl_mm_u8i4_fused_run and the split-call
+  // hexkl_mm_u8i4_gate_up_swiglu_run -- broke the real model identically
+  // ("Could you please provide the text you would like summarized?", 206
+  // tokens, vs the CPU path's correct 512-token summary) while passing
+  // every synthetic-weight SNR gate. They share exactly one thing:
+  // hvx_swiglu_inplace_f32, whose hvx_recip_qf32 returned NaN for every
+  // gate at or below the old clamp. One NaN lane poisons
+  // hvx_quant_rows_u8_params' whole-row min/max scan, so a single
+  // saturated gate destroyed that row's requantization -- which is why
+  // it compounded across experts and layers instead of showing up as
+  // per-call noise. See docs/htp_attention/43_moe_ffn_measured_next_
+  // levers.md section 7 for the derivation and the accept criterion:
+  // generated text identical to moe_engine=cpu, not a dB number.
+  constexpr bool kFusedSwigluEnabled = true;
   bool expert_ffn_done = false;
   if (kFusedSwigluEnabled && num_tokens > 1 &&
       gate_up_proj.getDataType() == nntrainer::Tdatatype::QS4CX &&
