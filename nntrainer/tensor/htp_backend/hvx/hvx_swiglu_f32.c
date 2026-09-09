@@ -48,7 +48,20 @@
  * three steps end past f32's 24-bit mantissa. The whole chain stays in
  * qf32 -- the same reason hvx_exp_sf runs its Horner recurrence there.
  *
- * @param[in] aq  qf32 lanes of a; must be nonzero and finite
+ * DOMAIN, and it is narrower than "finite": the seed is a word subtract on
+ * the raw f32 bit pattern, so it is only valid while
+ * bits(a) <= 0x7EF311C2, i.e. a <= 1.6154730e38. Past that the subtraction
+ * goes negative, the seed reinterprets as a negative float, and NR on a
+ * negative seed against positive a diverges -- three steps overflow and the
+ * result is NaN, not a wrong-but-finite reciprocal. Accuracy also degrades
+ * before that hard edge as the seed approaches zero: measured on host
+ * against the shipped constants, relative error holds <= 1e-6 only up to
+ * a = 1+exp(87.5437), is ~10% at 1+exp(87.9), and ~5x off at 1+exp(87.97).
+ * Callers must keep a inside the accurate range, not merely the finite one;
+ * hvx_swiglu_row_f32's exp_top is what does that here.
+ *
+ * @param[in] aq  qf32 lanes of a; must be nonzero, positive, and satisfy
+ *                bits(a) <= 0x7EF311C2 (a <= 1.6154730e38)
  * @return qf32 lanes of 1/a
  */
 static inline HVX_Vector hvx_recip_qf32(HVX_Vector aq) {
@@ -68,12 +81,28 @@ static inline HVX_Vector hvx_recip_qf32(HVX_Vector aq) {
 /** @brief Swiglus one row in place: gate[j] = silu(gate[j]) * up[j]. */
 static void hvx_swiglu_row_f32(float *gate, const float *up, uint32_t n_out) {
   const HVX_Vector zero = Q6_V_vzero();
-  /** hvx_exp_sf is undefined above 88.7 and has no overflow clamp; -gate
-   *  past 88 only happens for very negative gates, where sigmoid is 1e-38
-   *  or smaller either way. Clamping keeps exp in its documented domain
-   *  and the product at "effectively zero", where the reference lands too
-   *  (its exp overflows to inf and 1/(1+inf) == 0). */
-  const HVX_Vector exp_top = hvx_splat_sf(88.0f);
+  /** Clamp on -gate. Two separate ceilings apply and the tighter one wins:
+   *
+   *   1. hvx_exp_sf is undefined above 88.7.
+   *   2. hvx_recip_qf32, which consumes a = 1 + exp(t), NaNs once
+   *      bits(a) > 0x7EF311C2 -- t > 87.977861 (host-derived: the analytic
+   *      log(bitcast(0x7EF311C2) - 1) and a bisection over the shipped
+   *      seed + 3 NR steps agree to 2e-6) -- and loses its documented 1e-6
+   *      accuracy above t = 87.5437, well before that.
+   *
+   * This was 88.0f, chosen against ceiling 1 alone, which put EVERY gate at
+   * or below the clamp past ceiling 2: gate <= -87.98 produced NaN, one NaN
+   * lane poisoned hvx_quant_rows_u8_params' whole-row min/max scan, and the
+   * row's requantized scale/zp went with it (doc 43 section 5, L2).
+   *
+   * 85.0f clears both: relative error of the reciprocal at a = 1+exp(85) is
+   * 1.55e-8 (65x inside its 1e-6 spec) with 36.5M ULPs of headroom to the
+   * NaN edge -- enough that even a 100x-worse-than-documented hvx_exp_sf
+   * could not cross it. What the clamp discards costs nothing: the largest
+   * silu term it can suppress is 85*exp(-85) = 1.03e-35 per unit of up,
+   * 3.8e32x below one u8 step of an O(1) row, and the reference lands at
+   * exactly 0 there anyway (its expf overflows to inf, 1/(1+inf) == 0). */
+  const HVX_Vector exp_top = hvx_splat_sf(85.0f);
 
   uint32_t j = 0;
   for (; j + LANES <= n_out; j += LANES) {

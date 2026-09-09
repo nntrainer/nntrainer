@@ -25,6 +25,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <AEEStdErr.h>
@@ -514,14 +515,28 @@ protected:
     std::vector<float> w_f32;
   };
 
-  /** @brief Quantizes a deterministic K x N weight and registers it. */
-  void MakeAndRegister(uint32_t K, uint32_t N, uint32_t seed, Weight &w) {
+  /** @brief Quantizes a deterministic K x N weight and registers it.
+   *
+   *  @param bias_overrides (column, value) pairs written over the generated
+   *  bias before registration. The bias is the only term of the dequantized
+   *  output a test can set directly -- everything else is the matmul of two
+   *  deterministic fills -- so it is how a test drives one output column to
+   *  a chosen magnitude. Used by SwigluSurvivesExtremeNegativeGate to place
+   *  a gate below the SwiGLU clamp; empty (the default) leaves every
+   *  existing caller's weight byte-for-byte what it was. */
+  void MakeAndRegister(
+    uint32_t K, uint32_t N, uint32_t seed, Weight &w,
+    const std::vector<std::pair<uint32_t, float>> &bias_overrides = {}) {
     w.N = N;
     w.w_f32.resize(static_cast<size_t>(K) * N);
     fill_deterministic(w.w_f32, seed);
     quantize_weights_qs4cx(w.w_f32, K, N, w.q_w, w.d, w.colsum);
     w.bias.resize(N);
     fill_deterministic(w.bias, seed ^ 0xA5A5A5A5u);
+    for (const auto &ov : bias_overrides) {
+      ASSERT_LT(ov.first, N) << "bias override column out of range";
+      w.bias[ov.first] = ov.second;
+    }
 
     w.handle = 0xFFFFFFFFu;
     int err = nntr_hvx_weight_register_u8i4(
@@ -1040,6 +1055,161 @@ TEST_F(HmxMmU8I4Layer, GateUpSwigluPlusU8InMatchesTwoCallReference) {
     EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, gu.handle), AEE_SUCCESS);
     EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, dn.handle), AEE_SUCCESS);
   } // M sweep
+}
+
+/**
+ * @brief [L2] Both SwiGLU kernels, with a gate driven below the exp clamp.
+ *
+ * The coverage hole that let doc 43 section 7's two L2 attempts ship: every
+ * other SwiGLU test builds its gate from fill_deterministic x
+ * fill_deterministic, whose |gate| never approaches the clamp, so both
+ * kernels passed every gate while failing the real model. hvx_swiglu_row_f32
+ * clamps -gate to exp_top and feeds a = 1 + exp(t) to hvx_recip_qf32, whose
+ * magic seed is a word subtract on bits(a) and goes negative -- NR then
+ * diverges to NaN -- once bits(a) > 0x7EF311C2, i.e. t > 87.977861. At the
+ * old exp_top = 88.0f EVERY gate at or below the clamp landed there, and one
+ * NaN lane poisons hvx_quant_rows_u8_params' whole-row min/max scan, taking
+ * that row's scale/zp and everything downstream of it with it.
+ *
+ * Bias is what makes the gate reachable: it is the one term of the
+ * dequantized output a test sets directly. Three gate columns are pinned far
+ * below the clamp, spread across separate 32-lane HVX chunks (I = 1792 = 56
+ * chunks exactly, so there is no scalar tail to hide in -- every column runs
+ * the vector path). The test asserts the gates it built are actually past
+ * the clamp before it judges anything, so it cannot quietly stop testing
+ * what it claims to if the magnitudes ever drift.
+ *
+ * Both kernels are exercised because both call hvx_swiglu_inplace_f32 --
+ * that shared call, not either kernel's own arithmetic, is what doc 43
+ * section 7 identified as the common factor in two independent failures.
+ */
+TEST_F(HmxMmU8I4Layer, SwigluSurvivesExtremeNegativeGate) {
+  const uint32_t K = 2048, I = 1792, N = 2048;
+
+  // Well past the clamp, not at it: gate = matmul + bias, and the matmul
+  // term is O(10) for these fills, so -200 and beyond is past -88 with room
+  // to spare. The ASSERT_LE below is what actually holds that claim.
+  const std::vector<std::pair<uint32_t, float>> gate_overrides = {
+    {37u, -200.0f}, {1000u, -300.0f}, {1791u, -400.0f}};
+
+  Weight gu, dn;
+  ASSERT_NO_FATAL_FAILURE(
+    MakeAndRegister(K, 2 * I, 0xBA5E0007u, gu, gate_overrides));
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xBA5E0008u, dn));
+
+  for (const uint32_t M : {55u, 64u}) {
+    std::vector<float> x(static_cast<size_t>(M) * K);
+    fill_deterministic(x, 0x5EED0002u);
+
+    std::vector<float> gu_out(static_cast<size_t>(M) * 2 * I, 0.0f);
+    {
+      const uint32_t handles[1] = {gu.handle};
+      int err = nntr_hvx_mm_u8i4_layer(
+        handle_, M, K, handles, 1, x.data(), static_cast<int>(x.size()),
+        gu_out.data(), static_cast<int>(gu_out.size()));
+      ASSERT_EQ(err, AEE_SUCCESS) << "gate_up layer call failed: " << hex(err);
+    }
+
+    // The test's own premise, checked: these columns really are past the
+    // clamp. Without this the test could pass by never testing anything.
+    for (const auto &ov : gate_overrides) {
+      for (uint32_t m = 0; m < M; ++m) {
+        const float g = gu_out[static_cast<size_t>(m) * 2 * I + ov.first];
+        ASSERT_LE(g, -88.0f)
+          << "premise broken: gate column " << ov.first << " row " << m
+          << " is " << g
+          << ", not below the SwiGLU clamp -- this test is no "
+             "longer exercising hvx_recip_qf32's failing range";
+      }
+    }
+
+    std::vector<float> inter_ref(static_cast<size_t>(M) * I);
+    for (uint32_t m = 0; m < M; ++m) {
+      for (uint32_t j = 0; j < I; ++j) {
+        const float g = gu_out[static_cast<size_t>(m) * 2 * I + j];
+        const float u = gu_out[static_cast<size_t>(m) * 2 * I + I + j];
+        inter_ref[static_cast<size_t>(m) * I + j] =
+          g / (1.0f + std::exp(-g)) * u;
+      }
+    }
+
+    // Kernel 1: the split gate_up + SwiGLU + requant call.
+    const uint32_t m_pad = round_up(M, kTileRow);
+    const uint32_t n_ktiles = I / 32;
+    std::vector<uint8_t> out_ah(static_cast<size_t>(m_pad) * I, 0);
+    std::vector<float> out_scale(m_pad, 1.0f);
+    std::vector<int32_t> out_zp(m_pad, 0);
+    int err = nntr_hvx_mm_u8i4_gate_up_swiglu(
+      handle_, M, K, gu.handle, x.data(), static_cast<int>(x.size()),
+      out_ah.data(), static_cast<int>(out_ah.size()), out_scale.data(),
+      static_cast<int>(out_scale.size()), out_zp.data(),
+      static_cast<int>(out_zp.size()));
+    ASSERT_EQ(err, AEE_SUCCESS)
+      << "mm_u8i4_gate_up_swiglu failed: " << hex(err) << " M=" << M;
+
+    // The requantization parameters are where a NaN gate lane actually
+    // lands: hvx_quant_rows_u8_params scans the whole row for min/max, so
+    // one poisoned lane takes the row's scale and zp with it. Checking them
+    // directly names the failure instead of leaving it as "SNR was nan".
+    for (uint32_t m = 0; m < M; ++m) {
+      ASSERT_TRUE(std::isfinite(out_scale[m]))
+        << "row " << m << " requant scale is " << out_scale[m]
+        << " -- a NaN SwiGLU lane poisoned the row min/max scan (M=" << M
+        << ")";
+    }
+
+    std::vector<float> inter_got(static_cast<size_t>(M) * I);
+    for (uint32_t m = 0; m < M; ++m) {
+      const uint32_t rb = m / 64, r = m % 64;
+      for (uint32_t k = 0; k < I; ++k) {
+        const uint32_t kt = k / 32, c = k % 32;
+        const size_t idx =
+          (static_cast<size_t>(rb) * n_ktiles + kt) * 2048 + r * 32 + c;
+        inter_got[static_cast<size_t>(m) * I + k] =
+          out_scale[m] * (static_cast<float>(out_ah[idx]) - out_zp[m]);
+      }
+    }
+    const double snr_stage1 = snr_db(inter_ref, inter_got);
+    std::cout << "U8I4_FIELD path=gate_up_swiglu_extreme field=snr_db_stage1 "
+                 "value="
+              << snr_stage1 << " (M=" << M << ")" << std::endl;
+    EXPECT_GT(snr_stage1, 30.0)
+      << "gate_up+SwiGLU+requant intermediate degraded by an out-of-clamp "
+         "gate, M="
+      << M;
+
+    // Kernel 2: the one-call fused path, same gates, end to end.
+    std::vector<float> dn_ref(static_cast<size_t>(M) * N, 0.0f);
+    {
+      const uint32_t handles[1] = {dn.handle};
+      int e2 =
+        nntr_hvx_mm_u8i4_layer(handle_, M, I, handles, 1, inter_ref.data(),
+                               static_cast<int>(inter_ref.size()),
+                               dn_ref.data(), static_cast<int>(dn_ref.size()));
+      ASSERT_EQ(e2, AEE_SUCCESS) << "down layer call failed: " << hex(e2);
+    }
+    const uint32_t fused_handles[2] = {gu.handle, dn.handle};
+    std::vector<float> got(static_cast<size_t>(M) * N, 0.0f);
+    err = nntr_hvx_mm_u8i4_layer_fused(
+      handle_, M, K, fused_handles, 2, x.data(), static_cast<int>(x.size()),
+      got.data(), static_cast<int>(got.size()));
+    ASSERT_EQ(err, AEE_SUCCESS)
+      << "mm_u8i4_layer_fused failed: " << hex(err) << " M=" << M;
+
+    for (size_t i = 0; i < got.size(); ++i) {
+      ASSERT_TRUE(std::isfinite(got[i]))
+        << "fused output element " << i << " is " << got[i]
+        << " -- NaN reached the down matmul's output (M=" << M << ")";
+    }
+    const double snr_fused = snr_db(dn_ref, got);
+    std::cout << "U8I4_FIELD path=fused_swiglu_extreme field=snr_db value="
+              << snr_fused << " (M=" << M << ")" << std::endl;
+    EXPECT_GT(snr_fused, 40.0)
+      << "fused SwiGLU output degraded by an out-of-clamp gate, M=" << M;
+  } // M sweep
+
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, gu.handle), AEE_SUCCESS);
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, dn.handle), AEE_SUCCESS);
 }
 
 /**
