@@ -661,6 +661,42 @@ TEST_F(HmxMmU8I4Layer, MismatchedKIsRejected) {
   EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
 }
 
+TEST_F(HmxMmU8I4Layer, BakeBitsDump) {
+  // Print-only: one registered weight at the MoE gate_up prefill shape, its
+  // layer output reduced to an FNV-1a hash of the raw f32 bytes. Comparing
+  // the printed value across two skel builds is the bit-identity gate doc
+  // 43 §5 L1 asks for ("compare a registered weight's matmul output against
+  // the current build") -- any WH byte a parallelised bake drops or
+  // transposes moves some accumulator, hence some output bit. The expected
+  // hash lives in the measurement log, not in an assertion: there is no
+  // independent oracle for it, only the previous build.
+  const uint32_t M = 64, K = 2048, N = 3584;
+
+  Weight w;
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, N, 0xBA5E0001u, w));
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0002u);
+  const uint32_t handles[1] = {w.handle};
+  std::vector<float> got(static_cast<size_t>(M) * N, 0.0f);
+  int err = nntr_hvx_mm_u8i4_layer(handle_, M, K, handles, 1, x.data(),
+                                   static_cast<int>(x.size()), got.data(),
+                                   static_cast<int>(got.size()));
+  ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_layer failed: " << hex(err);
+
+  uint64_t h = 1469598103934665603ull; // FNV-1a 64-bit offset basis
+  const auto *bytes = reinterpret_cast<const uint8_t *>(got.data());
+  for (size_t i = 0; i < got.size() * sizeof(float); ++i) {
+    h ^= bytes[i];
+    h *= 1099511628211ull;
+  }
+  std::cout << "U8I4_FIELD path=bake_bits field=out_f32_fnv1a value=0x"
+            << std::hex << h << std::dec << " (M=" << M << " K=" << K
+            << " N=" << N << ")" << std::endl;
+
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
+}
+
 /**
  * @brief Per-call cost of the harness endpoint against the layer endpoint.
  *
@@ -748,6 +784,262 @@ TEST_F(HmxMmU8I4Layer, ReportPerCallCost) {
   for (const auto &ww : ws) {
     EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, ww.handle), AEE_SUCCESS);
   }
+}
+
+/**
+ * @brief [L2] fused gate_up -> SwiGLU -> down against the unfused two-call
+ *        path.
+ *
+ * Reference: one mm_u8i4_layer call for gate_up, host SwiGLU (plain expf),
+ * one mm_u8i4_layer call for down. The fused call requantizes ITS OWN HVX
+ * SwiGLU output, so the intermediate's per-row scale comes from slightly
+ * different values and bit equality is not expected even in principle --
+ * the gate is SNR (doc 43 §[L2] accuracy rule), thresholded at 40 dB, the
+ * u8 requantization floor this seam sits on. This is also the only check
+ * that pins the gate/up split semantics: swapping gate and up changes
+ * every output element, not a few.
+ */
+TEST_F(HmxMmU8I4Layer, FusedSwigluMatchesTwoCallReference) {
+  // The real seam's shape: LFM2-A1B expert FFN at prefill (gate_up
+  // 2048x3584, down 1792x2048, 64 tokens) -- exercises the gate/up split
+  // at the real tile boundary (I = 1792 = 56 tiles) and the ~6.65 MB
+  // fused VTCM layout.
+  const uint32_t K = 2048, I = 1792, N = 2048;
+
+  Weight gu, dn;
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0xBA5E0002u, gu));
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xBA5E0003u, dn));
+
+  // M sweep, not just 64: the fused kernel walks the rows in 64-row blocks,
+  // and M == 64 is the ONE value that exercises neither a partial block nor
+  // a second block. The real model never sees it -- 444 tokens x topk 4 over
+  // 32 experts averages M = 55.5, spread either side -- so 64-only coverage
+  // left the whole block loop untested (doc 43 §7's fused row).
+  for (const uint32_t M : {55u, 64u, 100u, 128u, 138u, 200u, 11u}) {
+    std::vector<float> x(static_cast<size_t>(M) * K);
+    fill_deterministic(x, 0x5EED0002u);
+
+    std::vector<float> gu_out(static_cast<size_t>(M) * 2 * I, 0.0f);
+    {
+      const uint32_t handles[1] = {gu.handle};
+      int err = nntr_hvx_mm_u8i4_layer(
+        handle_, M, K, handles, 1, x.data(), static_cast<int>(x.size()),
+        gu_out.data(), static_cast<int>(gu_out.size()));
+      ASSERT_EQ(err, AEE_SUCCESS) << "gate_up layer call failed: " << hex(err);
+    }
+
+    std::vector<float> inter(static_cast<size_t>(M) * I);
+    for (uint32_t m = 0; m < M; ++m) {
+      for (uint32_t j = 0; j < I; ++j) {
+        const float g = gu_out[static_cast<size_t>(m) * 2 * I + j];
+        const float u = gu_out[static_cast<size_t>(m) * 2 * I + I + j];
+        inter[static_cast<size_t>(m) * I + j] = g / (1.0f + std::exp(-g)) * u;
+      }
+    }
+
+    std::vector<float> dn_ref(static_cast<size_t>(M) * N, 0.0f);
+    {
+      const uint32_t handles[1] = {dn.handle};
+      int err = nntr_hvx_mm_u8i4_layer(
+        handle_, M, I, handles, 1, inter.data(), static_cast<int>(inter.size()),
+        dn_ref.data(), static_cast<int>(dn_ref.size()));
+      ASSERT_EQ(err, AEE_SUCCESS) << "down layer call failed: " << hex(err);
+    }
+
+    const uint32_t handles[2] = {gu.handle, dn.handle};
+    std::vector<float> got(static_cast<size_t>(M) * N, 0.0f);
+    int err = nntr_hvx_mm_u8i4_layer_fused(
+      handle_, M, K, handles, 2, x.data(), static_cast<int>(x.size()),
+      got.data(), static_cast<int>(got.size()));
+    ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_layer_fused failed: " << hex(err);
+
+    const double snr = snr_db(dn_ref, got);
+    std::cout << "U8I4_FIELD path=fused_swiglu field=snr_db value=" << snr
+              << " (M=" << M << " K=" << K << " I=" << I << " N=" << N << ")"
+              << std::endl;
+    EXPECT_GT(snr, 40.0)
+      << "fused SwiGLU output below the u8 requantization floor, M=" << M;
+  } // M sweep
+
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, gu.handle), AEE_SUCCESS);
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, dn.handle), AEE_SUCCESS);
+}
+
+/**
+ * @brief [L2, split-call variant] gate_up+SwiGLU+requant, checked in
+ *        ISOLATION against the two-call reference's OWN intermediate --
+ *        not just the final output.
+ *
+ * This is the gap the fused kernel's unit test had: SNR against a
+ * two-call reference only ever checks the END of the pipeline, so a bug
+ * anywhere upstream of the last matmul is invisible as long as it is
+ * consistent between the path under test and the reference (which it is
+ * not here -- the reference's intermediate is plain host f32, computed
+ * independently of any DSP call). Comparing the SPLIT call's own
+ * requantized intermediate against that host intermediate, before ever
+ * touching the down matmul, localizes a divergence to stage 1 instead of
+ * leaving it to be inferred from the end-to-end number.
+ */
+TEST_F(HmxMmU8I4Layer, GateUpSwigluMatchesHostIntermediate) {
+  for (const uint32_t M : {55u, 64u, 100u, 128u, 138u, 200u, 11u}) {
+    const uint32_t K = 2048, I = 1792;
+
+    Weight gu;
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0xBA5E0004u, gu));
+
+    std::vector<float> x(static_cast<size_t>(M) * K);
+    fill_deterministic(x, 0x5EED0002u);
+
+    // Host reference: gate_up via the already-proven mm_u8i4_layer, SwiGLU
+    // on the host with expf (same reference formula as
+    // FusedSwigluMatchesTwoCallReference above).
+    std::vector<float> gu_out(static_cast<size_t>(M) * 2 * I, 0.0f);
+    {
+      const uint32_t handles[1] = {gu.handle};
+      int err = nntr_hvx_mm_u8i4_layer(
+        handle_, M, K, handles, 1, x.data(), static_cast<int>(x.size()),
+        gu_out.data(), static_cast<int>(gu_out.size()));
+      ASSERT_EQ(err, AEE_SUCCESS) << "gate_up layer call failed: " << hex(err);
+    }
+    std::vector<float> inter_ref(static_cast<size_t>(M) * I);
+    for (uint32_t m = 0; m < M; ++m) {
+      for (uint32_t j = 0; j < I; ++j) {
+        const float g = gu_out[static_cast<size_t>(m) * 2 * I + j];
+        const float u = gu_out[static_cast<size_t>(m) * 2 * I + I + j];
+        inter_ref[static_cast<size_t>(m) * I + j] =
+          g / (1.0f + std::exp(-g)) * u;
+      }
+    }
+
+    // Split call under test: gate_up + SwiGLU + requant, ONE weight.
+    const uint32_t m_pad = (M + 63) / 64 * 64;
+    const uint32_t n_ktiles = I / 32;
+    std::vector<uint8_t> out_ah(static_cast<size_t>(m_pad) * I, 0);
+    std::vector<float> out_scale(m_pad, 1.0f);
+    std::vector<int32_t> out_zp(m_pad, 0);
+    int err = nntr_hvx_mm_u8i4_gate_up_swiglu(
+      handle_, M, K, gu.handle, x.data(), static_cast<int>(x.size()),
+      out_ah.data(), static_cast<int>(out_ah.size()), out_scale.data(),
+      static_cast<int>(out_scale.size()), out_zp.data(),
+      static_cast<int>(out_zp.size()));
+    ASSERT_EQ(err, AEE_SUCCESS)
+      << "mm_u8i4_gate_up_swiglu failed: " << hex(err) << " M=" << M;
+
+    // Dequantize out_ah with the SAME AH-tile addressing
+    // htp_act_quant.h/hvx_quant_pack_u8_ah use, and compare against
+    // inter_ref -- this is the stage-1-only check.
+    std::vector<float> inter_got(static_cast<size_t>(M) * I);
+    for (uint32_t m = 0; m < M; ++m) {
+      const uint32_t rb = m / 64, r = m % 64;
+      for (uint32_t k = 0; k < I; ++k) {
+        const uint32_t kt = k / 32, c = k % 32;
+        const size_t idx =
+          (static_cast<size_t>(rb) * n_ktiles + kt) * 2048 + r * 32 + c;
+        const uint8_t q = out_ah[idx];
+        inter_got[static_cast<size_t>(m) * I + k] =
+          out_scale[m] * (static_cast<float>(q) - out_zp[m]);
+      }
+    }
+    const double snr_stage1 = snr_db(inter_ref, inter_got);
+    std::cout << "U8I4_FIELD path=gate_up_swiglu field=snr_db_stage1 value="
+              << snr_stage1 << " (M=" << M << " K=" << K << " I=" << I << ")"
+              << std::endl;
+    // 30, not 40: this compares against a NEVER-quantized host f32
+    // intermediate, unlike the end-to-end test below (which compares two
+    // paths that both quantize down's activation, so a lot of noise cancels
+    // between them -- see this test's own doc comment). Measured stable at
+    // 37.5-37.7 dB across M in {55,64,100,128}: two u8 quantization hops
+    // (gate_up's activation, then this requant) with SwiGLU in between,
+    // still comfortably above the project's own single-hop floor (S4's
+    // 23.5 dB for one bare u8i4 matmul) -- 30 leaves headroom below the
+    // measured band without diluting the gate into meaninglessness.
+    EXPECT_GT(snr_stage1, 30.0)
+      << "gate_up+SwiGLU+requant intermediate below the u8 requantization "
+         "floor, M="
+      << M;
+
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, gu.handle), AEE_SUCCESS);
+  } // M sweep
+}
+
+/**
+ * @brief [L2, split-call variant] end to end: gate_up_swiglu's output fed
+ *        straight into mm_u8i4_layer_u8in for the down matmul, compared
+ *        against the same two-call reference FusedSwigluMatchesTwoCall
+ *        Reference uses. Complements that test's stage-1-only sibling
+ *        above: this one exercises the ACTUAL production call sequence
+ *        (what ARM dispatch will do), not just stage 1 in isolation.
+ */
+TEST_F(HmxMmU8I4Layer, GateUpSwigluPlusU8InMatchesTwoCallReference) {
+  for (const uint32_t M : {55u, 64u, 100u, 128u, 138u, 200u, 11u}) {
+    const uint32_t K = 2048, I = 1792, N = 2048;
+
+    Weight gu, dn;
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0xBA5E0005u, gu));
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xBA5E0006u, dn));
+
+    std::vector<float> x(static_cast<size_t>(M) * K);
+    fill_deterministic(x, 0x5EED0002u);
+
+    std::vector<float> gu_out(static_cast<size_t>(M) * 2 * I, 0.0f);
+    {
+      const uint32_t handles[1] = {gu.handle};
+      int err = nntr_hvx_mm_u8i4_layer(
+        handle_, M, K, handles, 1, x.data(), static_cast<int>(x.size()),
+        gu_out.data(), static_cast<int>(gu_out.size()));
+      ASSERT_EQ(err, AEE_SUCCESS) << "gate_up layer call failed: " << hex(err);
+    }
+    std::vector<float> inter(static_cast<size_t>(M) * I);
+    for (uint32_t m = 0; m < M; ++m) {
+      for (uint32_t j = 0; j < I; ++j) {
+        const float g = gu_out[static_cast<size_t>(m) * 2 * I + j];
+        const float u = gu_out[static_cast<size_t>(m) * 2 * I + I + j];
+        inter[static_cast<size_t>(m) * I + j] = g / (1.0f + std::exp(-g)) * u;
+      }
+    }
+    std::vector<float> dn_ref(static_cast<size_t>(M) * N, 0.0f);
+    {
+      const uint32_t handles[1] = {dn.handle};
+      int err = nntr_hvx_mm_u8i4_layer(
+        handle_, M, I, handles, 1, inter.data(), static_cast<int>(inter.size()),
+        dn_ref.data(), static_cast<int>(dn_ref.size()));
+      ASSERT_EQ(err, AEE_SUCCESS) << "down layer call failed: " << hex(err);
+    }
+
+    // Split-call path: gate_up_swiglu, then feed its output straight into
+    // mm_u8i4_layer_u8in for down -- the actual sequence ARM dispatch uses.
+    const uint32_t m_pad = (M + 63) / 64 * 64;
+    std::vector<uint8_t> out_ah(static_cast<size_t>(m_pad) * I, 0);
+    std::vector<float> out_scale(m_pad, 1.0f);
+    std::vector<int32_t> out_zp(m_pad, 0);
+    int err = nntr_hvx_mm_u8i4_gate_up_swiglu(
+      handle_, M, K, gu.handle, x.data(), static_cast<int>(x.size()),
+      out_ah.data(), static_cast<int>(out_ah.size()), out_scale.data(),
+      static_cast<int>(out_scale.size()), out_zp.data(),
+      static_cast<int>(out_zp.size()));
+    ASSERT_EQ(err, AEE_SUCCESS)
+      << "mm_u8i4_gate_up_swiglu failed: " << hex(err);
+
+    std::vector<float> got(static_cast<size_t>(M) * N, 0.0f);
+    const uint32_t dn_handles[1] = {dn.handle};
+    err = nntr_hvx_mm_u8i4_layer_u8in(
+      handle_, M, I, dn_handles, 1, out_ah.data(),
+      static_cast<int>(out_ah.size()), out_scale.data(),
+      static_cast<int>(out_scale.size()), out_zp.data(),
+      static_cast<int>(out_zp.size()), got.data(),
+      static_cast<int>(got.size()));
+    ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_layer_u8in failed: " << hex(err);
+
+    const double snr = snr_db(dn_ref, got);
+    std::cout << "U8I4_FIELD path=gate_up_swiglu_plus_u8in field=snr_db value="
+              << snr << " (M=" << M << " K=" << K << " I=" << I << " N=" << N
+              << ")" << std::endl;
+    EXPECT_GT(snr, 40.0)
+      << "split-call fused path below the u8 requantization floor, M=" << M;
+
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, gu.handle), AEE_SUCCESS);
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, dn.handle), AEE_SUCCESS);
+  } // M sweep
 }
 
 /**
