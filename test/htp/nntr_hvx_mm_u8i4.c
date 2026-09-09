@@ -117,7 +117,7 @@ int nntr_hvx_weight_register_u8i4(remote_handle64 handle, uint32 K, uint32 N,
   }
   return hexkl_weight_u8i4_register(&s->weights_u8i4, s->vtcm_base,
                                     s->vtcm_size, K, N, w_i4_rm, w_scale,
-                                    colsum_w, bias, w_handle);
+                                    colsum_w, bias, s->quant_pool, w_handle);
 }
 
 int nntr_hvx_weight_release_u8i4(remote_handle64 handle, uint32 w_handle) {
@@ -239,5 +239,316 @@ int nntr_hvx_mm_u8i4_layer_timed(remote_handle64 handle, uint32 M, uint32 K,
   stage_us[FC_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
   stage_us[FC_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
   stage_us[FC_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  return rc;
+}
+
+/** @brief Shared by both u8in entry points below, mirroring
+ *         check_layer_args's role for the f32-activation pair. */
+static int check_layer_args_u8in(const nntr_hvx_session *s, uint32 M, uint32 K,
+                                 const uint32 *w_handles, int w_handlesLen,
+                                 int act_ahLen, int act_scaleLen, int act_zpLen,
+                                 int out_catLen) {
+  uint32_t n_total = 0;
+  int i;
+  const uint32_t m_pad = ROUND_UP(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
+  if (!s || w_handlesLen <= 0) {
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)act_ahLen != m_pad * K || (uint32_t)act_scaleLen != m_pad ||
+      (uint32_t)act_zpLen != m_pad) {
+    FARF(ERROR, "mm_u8i4_layer_u8in: bad lengths (M=%u K=%u m_pad=%u)",
+         (unsigned)M, (unsigned)K, (unsigned)m_pad);
+    return AEE_EBADPARM;
+  }
+  for (i = 0; i < w_handlesLen; ++i) {
+    if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[w_handles[i]].in_use) {
+      return AEE_EBADPARM;
+    }
+    n_total += s->weights_u8i4.slots[w_handles[i]].N;
+  }
+  if ((uint32_t)out_catLen != M * n_total) {
+    FARF(ERROR, "mm_u8i4_layer_u8in: bad out_catLen (M=%u n_total=%u)",
+         (unsigned)M, (unsigned)n_total);
+    return AEE_EBADPARM;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_layer_u8in(remote_handle64 handle, uint32 M, uint32 K,
+                                const uint32 *w_handles, int w_handlesLen,
+                                const uint8 *act_ah, int act_ahLen,
+                                const float *act_scale, int act_scaleLen,
+                                const int32 *act_zp, int act_zpLen,
+                                float *out_cat, int out_catLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  int rc = check_layer_args_u8in(s, M, K, w_handles, w_handlesLen, act_ahLen,
+                                 act_scaleLen, act_zpLen, out_catLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  return hexkl_mm_u8i4_layer_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handles, (uint32_t)w_handlesLen, /*act_f32=*/NULL, out_cat,
+    &(const hexkl_mm_opts){.pool = s->quant_pool,
+                           .act_scale = act_scale,
+                           .act_zp = act_zp,
+                           .act_ah_prepacked = act_ah});
+}
+
+int nntr_hvx_mm_u8i4_layer_u8in_timed(
+  remote_handle64 handle, uint32 M, uint32 K, const uint32 *w_handles,
+  int w_handlesLen, const uint8 *act_ah, int act_ahLen, const float *act_scale,
+  int act_scaleLen, const int32 *act_zp, int act_zpLen, float *out_cat,
+  int out_catLen, uint32 *stage_us, int stage_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t t0, t1;
+  int rc = check_layer_args_u8in(s, M, K, w_handles, w_handlesLen, act_ahLen,
+                                 act_scaleLen, act_zpLen, out_catLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (!stage_us || stage_usLen != FC_N_STAGES) {
+    FARF(ERROR, "mm_u8i4_layer_u8in_timed: stage_usLen %d, expected %d",
+         stage_usLen, (int)FC_N_STAGES);
+    return AEE_EBADPARM;
+  }
+
+  hexkl_probe_reset(1);
+  t0 = hexkl_probe_now();
+  rc = hexkl_mm_u8i4_layer_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handles, (uint32_t)w_handlesLen, /*act_f32=*/NULL, out_cat,
+    &(const hexkl_mm_opts){.pool = s->quant_pool,
+                           .act_scale = act_scale,
+                           .act_zp = act_zp,
+                           .act_ah_prepacked = act_ah});
+  t1 = hexkl_probe_now();
+  hexkl_probe_on = 0;
+
+  stage_us[FC_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[FC_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[FC_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[FC_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[FC_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[FC_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[FC_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  return rc;
+}
+
+/**
+ * @brief Slots mm_u8i4_layer_fused_timed fills, in order.
+ *
+ * NOT the FC_T_* layout: the fused call runs a second QUANT pass (the
+ * SwiGLU output's requant) and a SwiGLU stage the unfused call does not
+ * have, so the slots are restated here rather than reusing FC_N_STAGES --
+ * the entry rejects a stale count with AEE_EBADPARM, same drift guard as
+ * the FC pair.
+ */
+enum {
+  FU_T_DSP_TOTAL = 0, /**< the whole fused_run call, DSP clock */
+  FU_T_QUANT,         /**< act quant + the SwiGLU output's requant */
+  FU_T_SWIGLU,        /**< silu(gate)*up, in VTCM */
+  FU_T_DEQUANT,       /**< both matmuls' i32 -> f32 */
+  FU_T_ACC_READ,      /**< HMX accumulator -> VTCM, vendor (both matmuls) */
+  FU_T_ACC_COPY,      /**< always 0: fused_run requires the in-place layout */
+  FU_T_DRAIN,         /**< DMA waits */
+  FU_T_ACC_STRIDE,    /**< not a time: the derived row stride */
+  FU_N_STAGES
+};
+
+/** @brief Shared by both fused entry points below. The SwiGLU contract
+ *         (down.K == gate_up.N / 2) is checked here so a mismatching pair
+ *         fails loudly instead of computing garbage. */
+static int check_layer_args_fused(const nntr_hvx_session *s, uint32 M, uint32 K,
+                                  const uint32 *w_handles, int w_handlesLen,
+                                  int act_f32Len, int out_f32Len) {
+  int i;
+  if (!s || w_handlesLen != 2) {
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)act_f32Len != M * K) {
+    FARF(ERROR, "mm_u8i4_layer_fused: bad act_f32Len (M=%u K=%u)", (unsigned)M,
+         (unsigned)K);
+    return AEE_EBADPARM;
+  }
+  for (i = 0; i < 2; ++i) {
+    if (w_handles[i] >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+        !s->weights_u8i4.slots[w_handles[i]].in_use) {
+      return AEE_EBADPARM;
+    }
+  }
+  const hexkl_weight_u8i4 *gu = &s->weights_u8i4.slots[w_handles[0]];
+  const hexkl_weight_u8i4 *dn = &s->weights_u8i4.slots[w_handles[1]];
+  if (gu->K != K || gu->N != 2 * dn->K) {
+    FARF(ERROR, "mm_u8i4_layer_fused: SwiGLU contract (gu K=%u N=%u, dn K=%u)",
+         (unsigned)gu->K, (unsigned)gu->N, (unsigned)dn->K);
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)out_f32Len != M * dn->N) {
+    FARF(ERROR, "mm_u8i4_layer_fused: bad out_f32Len (M=%u N=%u)", (unsigned)M,
+         (unsigned)dn->N);
+    return AEE_EBADPARM;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_layer_fused(remote_handle64 handle, uint32 M, uint32 K,
+                                 const uint32 *w_handles, int w_handlesLen,
+                                 const float *act_f32, int act_f32Len,
+                                 float *out_f32, int out_f32Len) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  int rc = check_layer_args_fused(s, M, K, w_handles, w_handlesLen, act_f32Len,
+                                  out_f32Len);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  /** No probe reset here: this is the production path, same policy as
+   * mm_u8i4_layer above. */
+  return hexkl_mm_u8i4_fused_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handles, act_f32, out_f32, &(const hexkl_mm_opts){.pool = s->quant_pool});
+}
+
+int nntr_hvx_mm_u8i4_layer_fused_timed(remote_handle64 handle, uint32 M,
+                                       uint32 K, const uint32 *w_handles,
+                                       int w_handlesLen, const float *act_f32,
+                                       int act_f32Len, float *out_f32,
+                                       int out_f32Len, uint32 *stage_us,
+                                       int stage_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t t0, t1;
+  int rc = check_layer_args_fused(s, M, K, w_handles, w_handlesLen, act_f32Len,
+                                  out_f32Len);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (!stage_us || stage_usLen != FU_N_STAGES) {
+    FARF(ERROR, "mm_u8i4_layer_fused_timed: stage_usLen %d, expected %d",
+         stage_usLen, (int)FU_N_STAGES);
+    return AEE_EBADPARM;
+  }
+
+  hexkl_probe_reset(1);
+  t0 = hexkl_probe_now();
+  rc = hexkl_mm_u8i4_fused_run(&s->weights_u8i4, s->vtcm_base, s->vtcm_size,
+                               s->config_off, M, K, w_handles, act_f32, out_f32,
+                               &(const hexkl_mm_opts){.pool = s->quant_pool});
+  t1 = hexkl_probe_now();
+  hexkl_probe_on = 0;
+
+  stage_us[FU_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[FU_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[FU_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
+  stage_us[FU_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[FU_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[FU_T_ACC_COPY] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[FU_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[FU_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  return rc;
+}
+
+/**
+ * @brief Slots mm_u8i4_gate_up_swiglu_timed fills. Restated rather than
+ *        reusing FU_T_*: this call has no down-side dequant/acc_read at
+ *        all, so FU_T_DEQUANT/FU_T_ACC_READ would silently mean something
+ *        narrower here than there.
+ */
+enum {
+  GU_T_DSP_TOTAL = 0,
+  GU_T_QUANT, /**< act quant + the SwiGLU output's requant */
+  GU_T_SWIGLU,
+  GU_T_DEQUANT, /**< gate_up matmul's i32 -> f32 split */
+  GU_T_ACC_READ,
+  GU_T_DRAIN,
+  GU_T_ACC_STRIDE,
+  GU_N_STAGES
+};
+
+static int check_gate_up_swiglu_args(const nntr_hvx_session *s, uint32 M,
+                                     uint32 K, uint32 w_handle_gate_up,
+                                     int act_f32Len, int out_ahLen,
+                                     int out_scaleLen, int out_zpLen) {
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)act_f32Len != M * K) {
+    FARF(ERROR, "mm_u8i4_gate_up_swiglu: bad act_f32Len (M=%u K=%u)",
+         (unsigned)M, (unsigned)K);
+    return AEE_EBADPARM;
+  }
+  if (w_handle_gate_up >= HEXKL_MM_U8I4_MAX_WEIGHTS ||
+      !s->weights_u8i4.slots[w_handle_gate_up].in_use) {
+    return AEE_EBADPARM;
+  }
+  const hexkl_weight_u8i4 *gu = &s->weights_u8i4.slots[w_handle_gate_up];
+  if (gu->K != K || (gu->N % 2) != 0) {
+    FARF(ERROR, "mm_u8i4_gate_up_swiglu: bad shape (gu K=%u N=%u, want K=%u)",
+         (unsigned)gu->K, (unsigned)gu->N, (unsigned)K);
+    return AEE_EBADPARM;
+  }
+  const uint32_t inter = gu->N / 2;
+  const uint32_t m_pad = ROUND_UP(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
+  if ((uint32_t)out_ahLen != m_pad * inter || (uint32_t)out_scaleLen != m_pad ||
+      (uint32_t)out_zpLen != m_pad) {
+    FARF(ERROR, "mm_u8i4_gate_up_swiglu: bad out lengths (M=%u inter=%u)",
+         (unsigned)M, (unsigned)inter);
+    return AEE_EBADPARM;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_gate_up_swiglu(remote_handle64 handle, uint32 M, uint32 K,
+                                    uint32 w_handle_gate_up,
+                                    const float *act_f32, int act_f32Len,
+                                    uint8 *out_ah, int out_ahLen,
+                                    float *out_scale, int out_scaleLen,
+                                    int32 *out_zp, int out_zpLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  int rc = check_gate_up_swiglu_args(s, M, K, w_handle_gate_up, act_f32Len,
+                                     out_ahLen, out_scaleLen, out_zpLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  return hexkl_mm_u8i4_gate_up_swiglu_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handle_gate_up, act_f32, out_ah, out_scale, out_zp, s->quant_pool);
+}
+
+int nntr_hvx_mm_u8i4_gate_up_swiglu_timed(remote_handle64 handle, uint32 M,
+                                          uint32 K, uint32 w_handle_gate_up,
+                                          const float *act_f32, int act_f32Len,
+                                          uint8 *out_ah, int out_ahLen,
+                                          float *out_scale, int out_scaleLen,
+                                          int32 *out_zp, int out_zpLen,
+                                          uint32 *stage_us, int stage_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t t0, t1;
+  int rc = check_gate_up_swiglu_args(s, M, K, w_handle_gate_up, act_f32Len,
+                                     out_ahLen, out_scaleLen, out_zpLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (!stage_us || stage_usLen != GU_N_STAGES) {
+    FARF(ERROR, "mm_u8i4_gate_up_swiglu_timed: stage_usLen %d, expected %d",
+         stage_usLen, (int)GU_N_STAGES);
+    return AEE_EBADPARM;
+  }
+
+  hexkl_probe_reset(1);
+  t0 = hexkl_probe_now();
+  rc = hexkl_mm_u8i4_gate_up_swiglu_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K,
+    w_handle_gate_up, act_f32, out_ah, out_scale, out_zp, s->quant_pool);
+  t1 = hexkl_probe_now();
+  hexkl_probe_on = 0;
+
+  stage_us[GU_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[GU_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[GU_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
+  stage_us[GU_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[GU_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[GU_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[GU_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
   return rc;
 }
