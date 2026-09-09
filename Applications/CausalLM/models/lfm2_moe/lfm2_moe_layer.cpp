@@ -12,8 +12,13 @@
 
 #include <acti_func.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <compute_ops.h>
 #include <cpu_backend.h>
+#include <cstdlib>
+#include <iostream>
 #include <lfm2_moe_layer.h>
 #include <node_exporter.h>
 #include <stdexcept>
@@ -26,6 +31,11 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 /** LFM2-MoE router hyper-parameters (fixed for LFM2-8B-A1B). */
 static constexpr bool NORM_TOPK_PROB = true;
 static constexpr float ROUTED_SCALING_FACTOR = 1.0f;
+
+/** M0 (doc 43 §5): ordinal of prefill forwarding() calls, so each MoE layer
+ * prints under a stable index in layer order. Decode never touches this --
+ * it runs incremental_forwarding. */
+static std::atomic<unsigned> g_m0_call_index{0};
 
 Lfm2MoELayer::Lfm2MoELayer() :
   LayerImpl(),
@@ -208,6 +218,13 @@ void Lfm2MoELayer::buildExpertAssignments(
 
 void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
+  /** M0 (doc 43 §5): ARM-side wall timer around the whole layer -- this
+   * profile is invisible to NNTR_HTP_PROFILE's host column by design, and
+   * in the htp run the one dispatched layer's figure includes its
+   * registration (once, first forward) on top of dispatch. */
+  const bool m0_profile = std::getenv("NNTR_M0_PROFILE") != nullptr;
+  const auto m0_t0 = std::chrono::steady_clock::now();
+
   nntrainer::Tensor &input = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output = context.getOutput(SINGLE_INOUT_IDX);
 
@@ -295,6 +312,14 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
 
   // reshape output: [B*S,1,1,H] -> [B,1,S,H]
   output.reshape({batch_size, 1, seq_len, hidden_size});
+
+  if (m0_profile && total_tokens > 1) {
+    const auto m0_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - m0_t0)
+                         .count();
+    std::cout << "[M0-PROF] moe_layer[" << g_m0_call_index.fetch_add(1)
+              << "] tokens=" << total_tokens << " us=" << m0_us << std::endl;
+  }
 }
 
 inline void Lfm2MoELayer::compute_expert_forward(
@@ -367,25 +392,83 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
     workspace.gate_up_output->getSharedDataTensor(gate_up_dim, 0, true);
   nntrainer::Tensor acti_out =
     workspace.activation_output->getSharedDataTensor(intermediate_dim, 0, true);
-  token_input.dot(gate_up_proj, gate_up_out);
 
-  if (num_tokens == 1) {
-    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
-                      gate_up_out.getData<float>(),
-                      gate_up_out.getData<float>() + intermediate_size);
-  } else {
-    auto &tm = nntrainer::ThreadManager::Global();
-    tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
-      const unsigned int offset = acti_out.getIndex(0, 0, i, 0);
-      const unsigned int gate_up_offset = gate_up_out.getIndex(0, 0, i, 0);
-      nntrainer::swiglu(acti_out.width(), acti_out.getData<float>() + offset,
-                        gate_up_out.getData<float>() + gate_up_offset,
-                        gate_up_out.getData<float>() + gate_up_offset +
-                          intermediate_size);
-    });
+  // [L2] fused HTP path: gate_up -> SwiGLU -> down, the SwiGLU never
+  // leaving the DSP. Decode (num_tokens == 1) stays on the two-dot path
+  // below: the fused call's 64-row pad tax is not amortizable by a single
+  // token (same reason accelerates_q4_0_at_m1() is false).
+  // gate_up_out / acti_out are simply unused when this takes.
+  //
+  // ponytail: DISABLED, not deleted -- STILL disabled after a full
+  // reimplementation. Two structurally different DSP kernels now
+  // reproduce the identical model-breaking failure ("Could you please
+  // provide the text you would like summarized?", 206 tokens, vs the
+  // CPU path's correct 512-token summary):
+  //   1. hexkl_mm_u8i4_fused_run -- one call, two weights, six VTCM
+  //      regions carved by hand. Its own unit test has a real M>=128 SNR
+  //      anomaly (139 -> 77 dB) that this session never explained.
+  //   2. hexkl_mm_u8i4_gate_up_swiglu_run + the already-verified u8in
+  //      path for down -- one weight per call, reuses proven code for
+  //      the down side, does NOT reproduce #1's M-anomaly (stable
+  //      138-141 dB from M=11 to M=200, the real model's own observed
+  //      per-expert M range, confirmed via NNTR_L2_DEBUG prints of the
+  //      actual dispatch args -- shapes and pointers all correct).
+  // Since #2's unit tests pass at the real model's exact shapes AND its
+  // ARM-side call arguments are confirmed correct, but the real model
+  // still breaks, the bug is not in either kernel's basic correctness or
+  // in how Lfm2MoELayer constructs the call -- it is something neither
+  // implementation controls for: most likely a systematic (not just
+  // random) bias in hvx_swiglu_f32.c's exp/reciprocal approximation that
+  // a per-call SNR-vs-synthetic-data metric does not catch, compounding
+  // across 32 experts and however many downstream layers see the result.
+  // Root cause NOT found. Ceiling: a differential test against this
+  // model's OWN registered weight bytes and a real captured activation
+  // (not fill_deterministic's synthetic pattern) is the one variable
+  // neither attempt has controlled for -- see docs/htp_attention/
+  // 43_moe_ffn_measured_next_levers.md §7's L2 rows before trying a third
+  // implementation.
+  constexpr bool kFusedSwigluEnabled = false;
+  bool expert_ffn_done = false;
+  if (kFusedSwigluEnabled && num_tokens > 1 &&
+      gate_up_proj.getDataType() == nntrainer::Tdatatype::QS4CX &&
+      down_proj.getDataType() == nntrainer::Tdatatype::QS4CX) {
+    auto *ops = token_input.getOps();
+    if (ops->supports_gemm_qs4cx_fused_swiglu_fp32()) {
+      std::vector<void *> wdata = {gate_up_proj.getData<char>(),
+                                   down_proj.getData<char>()};
+      std::vector<float *> wscale = {gate_up_proj.getScale<float>(),
+                                     down_proj.getScale<float>()};
+      std::vector<unsigned int> widths = {
+        static_cast<unsigned int>(gate_up_proj.width()),
+        static_cast<unsigned int>(down_proj.width())};
+      ops->gemm_qs4cx_fused_swiglu_fp32(
+        wdata, wscale, token_input.getData<float>(),
+        expert_output.getData<float>(), num_tokens, widths, hidden_size);
+      expert_ffn_done = true;
+    }
   }
 
-  acti_out.dot(down_proj, expert_output);
+  if (!expert_ffn_done) {
+    token_input.dot(gate_up_proj, gate_up_out);
+
+    if (num_tokens == 1) {
+      nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
+                        gate_up_out.getData<float>(),
+                        gate_up_out.getData<float>() + intermediate_size);
+    } else {
+      auto &tm = nntrainer::ThreadManager::Global();
+      tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
+        const unsigned int offset = acti_out.getIndex(0, 0, i, 0);
+        const unsigned int gate_up_offset = gate_up_out.getIndex(0, 0, i, 0);
+        nntrainer::swiglu(acti_out.width(), acti_out.getData<float>() + offset,
+                          gate_up_out.getData<float>() + gate_up_offset,
+                          gate_up_out.getData<float>() + gate_up_offset +
+                            intermediate_size);
+      });
+    }
+
+    acti_out.dot(down_proj, expert_output);
+  }
 
   for (size_t i = 0; i < num_tokens; ++i) {
     nntrainer::Tensor expert_token_output =
@@ -397,6 +480,12 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
 void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int from, unsigned int to,
                                           bool training) {
+
+  /** M0: same timer as forwarding() -- the runner drives prefill through
+   * this path too (from=0,to=prompt_len), decode is the total_tokens==1
+   * case and stays silent under the same guard. */
+  const bool m0_profile = std::getenv("NNTR_M0_PROFILE") != nullptr;
+  const auto m0_t0 = std::chrono::steady_clock::now();
 
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -517,6 +606,14 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     // reshape output: [B*S,1,1,H] -> [B,1,S,H]
     output.reshape({batch_size, 1, seq_len, hidden_size});
+
+    if (m0_profile && total_tokens > 1) {
+      const auto m0_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - m0_t0)
+                           .count();
+      std::cout << "[M0-PROF] moe_layer[" << g_m0_call_index.fetch_add(1)
+                << "] tokens=" << total_tokens << " us=" << m0_us << std::endl;
+    }
   }
 }
 
