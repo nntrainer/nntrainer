@@ -37,6 +37,7 @@ enum {
   HEXKL_PROBE_DEQUANT,      /**< hvx_dequant_i32_to_f32 */
   HEXKL_PROBE_QUANT,        /**< hvx_quant_rows_u8_params + pack */
   HEXKL_PROBE_DRAIN,        /**< hexkl_dma_ring_drain */
+  HEXKL_PROBE_SWIGLU,       /**< hvx_swiglu_inplace_f32 (fused layer only) */
   /** NOT a time: hexkl_acc_layout::row_stride when the in-place tile dequant
    *  is running, 0 when layer_run fell back to the vendor copy. One number
    *  that says which path the numbers beside it came from. */

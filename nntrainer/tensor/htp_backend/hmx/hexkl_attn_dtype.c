@@ -23,9 +23,12 @@ static int reg_u8i4(void *tbl, uint8_t *vtcm_base, uint32_t vtcm_size,
                     uint32_t K, uint32_t N, const int8_t *w_rm,
                     const float *w_scale, const int32_t *colsum_w,
                     const float *bias, uint32_t *out_handle) {
+  // NULL: the KV-block registration calling this runs per token append --
+  // a fork/join there would buy nothing at head_dim x T sizes and stall the
+  // hot path. Revisit only if attention weights ever reach MoE sizes.
   return hexkl_weight_u8i4_register((hexkl_weight_u8i4_table *)tbl, vtcm_base,
                                     vtcm_size, K, N, w_rm, w_scale, colsum_w,
-                                    bias, out_handle);
+                                    bias, NULL, out_handle);
 }
 
 static int rel_u8i4(void *tbl, uint32_t handle) {

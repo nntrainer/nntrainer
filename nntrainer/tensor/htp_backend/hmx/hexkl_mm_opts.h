@@ -43,6 +43,21 @@ typedef struct {
       identical to staging into a scratch and adding afterwards -- which is
       the caller loop this flag deletes. */
   int accumulate;
+
+  /** Non-NULL: the caller already quantized AND AH-tile-packed the
+      activation on the ARM side (nntrainer/tensor/htp_act_quant.h's
+      htp_quant_pack_u8_ah, bit-for-bit matching hvx_quant_rows_u8_params +
+      hvx_quant_pack_u8_ah below), m_pad(M)*K bytes where m_pad is the same
+      64-row rounding every caller of layer_run already computes. act_f32
+      may be NULL in this case -- there is nothing left to quantize -- and
+      act_scale/act_zp must be the caller's own (not a DSP-side scan's),
+      required alongside this field. Lets the DSP skip the whole quant
+      pass (not just its scan, which act_scale/act_zp alone already skip)
+      and DMA the bytes into VTCM the way a weight tile lands there,
+      instead of re-quantizing f32 that was never sent -- see
+      docs/htp_attention's u8-boundary task for the transport arithmetic
+      this buys. */
+  const uint8_t *act_ah_prepacked;
 } hexkl_mm_opts;
 
 #endif /* __NNTRAINER_HEXKL_MM_OPTS_H__ */
