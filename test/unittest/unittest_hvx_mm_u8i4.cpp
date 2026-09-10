@@ -1406,9 +1406,14 @@ TEST_F(HmxMmU8I4Layer, MemoryCeilings) {
   // ceiling here is the DSP's address space rather than the host's memory,
   // this is where it shows.
   {
+    // 24 x 256 MB = 6 GB, not 10: the first run of this test produced no
+    // ion_total_gb line at all, which is what an OOM kill looks like from
+    // the log's side. 6 GB is comfortably past the 4.10 the plan needs and
+    // leaves the phone room to keep the process alive.
     const size_t chunk = 256u * 1024u * 1024u;
+    const size_t max_chunks = 24;
     std::vector<void *> bufs;
-    while (bufs.size() < 40) { // stop past 10 GB
+    while (bufs.size() < max_chunks) {
       void *p = try_alloc(chunk);
       if (!p) {
         break;
@@ -1418,13 +1423,17 @@ TEST_F(HmxMmU8I4Layer, MemoryCeilings) {
         break;
       }
       bufs.push_back(p);
+      // Printed as it goes, so a run that dies partway still leaves its
+      // last good value in the log rather than nothing.
+      std::cout << "U8I4_FIELD path=mem field=ion_total_gb value="
+                << bufs.size() * chunk / 1073741824.0 << std::endl;
     }
     const double total_gb = bufs.size() * chunk / 1073741824.0;
     for (void *p : bufs) {
       rfree(p);
     }
-    std::cout << "U8I4_FIELD path=mem field=ion_total_gb value=" << total_gb
-              << "\n"
+    std::cout << "U8I4_FIELD path=mem field=ion_total_final_gb value="
+              << total_gb << "\n"
               << "U8I4_FIELD path=mem field=need_gb value=" << need_gb
               << std::endl;
   }
