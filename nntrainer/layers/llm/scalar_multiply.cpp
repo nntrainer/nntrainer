@@ -18,6 +18,11 @@
 
 #include "scalar_multiply.h"
 
+#if defined(ENABLE_OPENCL)
+#include <blas_kernels.h>
+#include <memory_data.h>
+#endif
+
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
 #include <cuda_context_manager.h>
 #include <cuda_elementwise.h>
@@ -160,8 +165,37 @@ void ScalarMultiplyLayer::incremental_forwarding(
       out.getSharedDataTensor(out_step_dim, b * out_dim.getFeatureLen(), true);
 
     bool done = false;
+#if defined(ENABLE_OPENCL) && defined(ENABLE_FP16)
+    // OpenCL: multiply in place on the device when both operands are already
+    // device-visible. Falling through to the host Tensor::multiply() below
+    // would read and write the shared plane from the CPU, which (a) drains the
+    // queue twice per call -- this layer runs ~2x per block, so ~70x per
+    // decoded token -- and (b) is not even correct once the residency planner
+    // has moved the activation into a cl_mem sub-buffer: the host-visible
+    // shadow of such a tensor is never written back, so the CPU reads zeros
+    // and the whole generation degenerates to token 0. The device path is
+    // therefore taken whenever it is available, not behind an env flag.
+    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16 &&
+        out_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+      const auto in_md = in_step.getMemoryData();
+      const auto out_md = out_step.getMemoryData();
+      if (in_md && in_md->isSVM() && out_md && out_md->isSVM()) {
+        // Both data pointers are already pre-offset for this step, so the
+        // kernel's row offset is 0. A cl_mem sub-buffer is bound only when the
+        // planner actually placed that operand on the device plane.
+        void *in_cl = in_step.isClMem() ? in_step.getClMem() : nullptr;
+        void *out_cl = out_step.isClMem() ? out_step.getClMem() : nullptr;
+        nntrainer::scalar_mul_cl_fp16(
+          in_step.getData<_FP16>(), out_step.getData<_FP16>(), multiplier,
+          (unsigned int)in_step.size(), /*use_svm=*/true, out_cl, in_cl,
+          /*row_off=*/0);
+        done = true;
+      }
+    }
+#endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
-    if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
+    if (!done &&
+        in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       static const bool gpu = nntr_env_on("NNTR_CUDA_ELTWISE");
       if (gpu) {
         auto *ip =
