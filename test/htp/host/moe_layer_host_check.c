@@ -9,6 +9,7 @@
 #include "hexkl_dma_ring.h"
 #include "hexkl_mm_u8i4_moe.h"
 #include "hexkl_probe.h"
+#include "hvx_gather_ah_u8.h"
 #include "hvx_scale_add_f32.h"
 #include <AEEStdErr.h>
 #include <math.h>
@@ -98,9 +99,12 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m, uint32_t mp, uint32_t k,
                          const float *scale, const int32_t *zp, uint8_t *out,
                          hvx_worker_pool *p) {
   (void)p;
-  (void)mp;
+  /* Tiles run (row_block, inner_tile) at a 2048-byte stride, so a caller
+     passing more than 64 rows writes several row blocks. The kernel now
+     packs the whole activation in one call, so this can no longer assume
+     one block the way it did. */
   const uint32_t kt_n = k / 32u;
-  memset(out, 0, (size_t)64 * k);
+  memset(out, 0, (size_t)mp * k);
   for (uint32_t r = 0; r < m; ++r)
     for (uint32_t kt = 0; kt < kt_n; ++kt)
       for (uint32_t j = 0; j < 32; ++j) {
@@ -109,7 +113,8 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m, uint32_t mp, uint32_t k,
           q = 0;
         if (q > 255)
           q = 255;
-        out[(size_t)kt * 2048 + r * 32 + j] = (uint8_t)q;
+        out[(size_t)(r / 64u) * kt_n * 2048u + (size_t)kt * 2048u +
+            (size_t)(r % 64u) * 32u + j] = (uint8_t)q;
       }
   return 0;
 }
@@ -141,6 +146,23 @@ void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
      this check caught first time out: that form means "worker 0 of n_units"
      and does 1/n_units of the work. */
   func(1u, 0, ctx);
+}
+
+void hvx_gather_ah_u8(uint8_t *dst_ah, const uint8_t *src_ah,
+                      const uint32_t *rows, uint32_t n_rows, uint32_t k,
+                      hvx_worker_pool *pool) {
+  (void)pool;
+  const uint32_t kt_n = k / 32u;
+  memset(dst_ah, 0, (size_t)kt_n * 2048u);
+  for (uint32_t r = 0; r < n_rows; ++r) {
+    const uint32_t t = rows[r];
+    for (uint32_t kt = 0; kt < kt_n; ++kt) {
+      memcpy(dst_ah + (size_t)kt * 2048u + (size_t)r * 32u,
+             src_ah + (size_t)(t / 64u) * kt_n * 2048u + (size_t)kt * 2048u +
+               (size_t)(t % 64u) * 32u,
+             32u);
+    }
+  }
 }
 
 void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,

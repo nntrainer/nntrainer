@@ -43,6 +43,7 @@
 #include "hexkl_micro.h"
 #include "hexkl_probe.h"
 #include "hvx_dequant_i32.h"
+#include "hvx_gather_ah_u8.h"
 #include "hvx_quant_u8.h"
 #include "hvx_scale_add_f32.h"
 #include "hvx_swiglu_f32.h"
@@ -75,33 +76,6 @@ static void moe_push_weight(uint8_t *vtcm_base, uint32_t dst_off,
   const uint32_t rs = moe_dma_row_size(bytes);
   hexkl_dma_ring_push2d(vtcm_base + dst_off, h->wh_bytes, rs, rs, rs,
                         bytes / rs, /*src_vtcm=*/0, /*dst_vtcm=*/1);
-}
-
-/**
- * @brief hvx_worker_pool_func body for the per-block token gather.
- *
- * Rows are independent and their destinations are disjoint, so this splits
- * by row. It was a plain loop on the calling thread and measured about
- * 15 ms/layer -- 29 MB of copying at under 2 GB/s, which is what a scalar
- * memcpy costs on this core. Every other bulk pass in this file already
- * runs on the pool; this one did not, for no reason.
- */
-typedef struct {
-  float *stage;
-  const float *act;
-  const uint32_t *rows;
-  uint32_t n_rows;
-  uint32_t K;
-} moe_gather_ctx;
-
-static void moe_gather_worker(uint32_t n_threads, uint32_t i, void *vctx) {
-  moe_gather_ctx *c = (moe_gather_ctx *)vctx;
-  const uint32_t lo = (uint32_t)((uint64_t)c->n_rows * i / n_threads);
-  const uint32_t hi = (uint32_t)((uint64_t)c->n_rows * (i + 1) / n_threads);
-  for (uint32_t r = lo; r < hi; ++r) {
-    memcpy(c->stage + (size_t)r * c->K, c->act + (size_t)c->rows[r] * c->K,
-           sizeof(float) * c->K);
-  }
 }
 
 /**
@@ -251,7 +225,15 @@ int hexkl_mm_u8i4_moe_layer_run(
      the scarce resource. */
   float *scale = (float *)malloc(sizeof(float) * BR);
   int32_t *zp = (int32_t *)malloc(sizeof(int32_t) * BR);
-  float *stage = (float *)malloc(sizeof(float) * (size_t)BR * K);
+  /* The whole activation, quantized once. hvx_quant_pack_u8_ah writes it,
+     so a row's bytes are exactly what quantizing that row inside any expert
+     block would have produced -- row quantization is independent of how
+     rows are grouped -- and the per-block work becomes a uint8 move rather
+     than a scan and a pack of the same rows four times over at top-4. */
+  const uint32_t m_pad = ROUND_UP_U32(M, BR);
+  uint8_t *act_ah = (uint8_t *)malloc((size_t)m_pad * K);
+  float *scale_all = (float *)malloc(sizeof(float) * m_pad);
+  int32_t *zp_all = (int32_t *)malloc(sizeof(int32_t) * m_pad);
   /* act_f32 and out_f32 are the host's FastRPC buffers, which are rpcmem
      and therefore UNCACHED. The gather reads M*K*4 bytes of act four times
      over at top-4 routing, and the scatter is a read-modify-write of
@@ -272,7 +254,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint32_t *base_of = (uint32_t *)malloc(sizeof(uint32_t) * n_experts);
   uint32_t n_active = 0u;
   uint64_t p0 = 0;
-  if (!scale || !zp || !stage || !order || !base_of || !act_c || !out_c) {
+  if (!scale || !zp || !act_ah || !scale_all || !zp_all || !order || !base_of ||
+      !act_c || !out_c) {
     rc = AEE_ENOMEMORY;
     goto out;
   }
@@ -295,6 +278,17 @@ int hexkl_mm_u8i4_moe_layer_run(
   memcpy(act_c, act_f32, sizeof(float) * (size_t)M * K);
   memset(out_c, 0, sizeof(float) * (size_t)M * N_out);
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
+
+  /* Once for the layer, from the cached copy. 444 rows here against 1776
+     scanned and packed a block at a time before. */
+  HEXKL_PROBE_T0(p0);
+  hvx_quant_rows_u8_params(act_c, M, m_pad, K, scale_all, zp_all, pool);
+  rc =
+    hvx_quant_pack_u8_ah(act_c, M, m_pad, K, scale_all, zp_all, act_ah, pool);
+  HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
+  if (rc != AEE_SUCCESS) {
+    goto out;
+  }
   if (n_active == 0u) {
     memcpy(out_f32, out_c, sizeof(float) * (size_t)M * N_out);
     rc = AEE_SUCCESS;
@@ -334,17 +328,13 @@ int hexkl_mm_u8i4_moe_layer_run(
          but it changes what is compared, so it does not belong in the
          commit that has to prove equivalence. */
       HEXKL_PROBE_T0(p0);
-      {
-        moe_gather_ctx gc = {stage, act_c, rows + mb, m_blk, K};
-        hvx_worker_pool_run(pool, moe_gather_worker, &gc, m_blk);
+      hvx_gather_ah_u8(vtcm_base + L.act_off, act_ah, rows + mb, m_blk, K,
+                       pool);
+      for (uint32_t r = 0; r < m_blk; ++r) {
+        scale[r] = scale_all[rows[mb + r]];
+        zp[r] = zp_all[rows[mb + r]];
       }
-      hvx_quant_rows_u8_params(stage, m_blk, BR, K, scale, zp, pool);
-      rc = hvx_quant_pack_u8_ah(stage, m_blk, BR, K, scale, zp,
-                                vtcm_base + L.act_off, pool);
       HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
-      if (rc != AEE_SUCCESS) {
-        goto out;
-      }
 
       /* --- gate_up ------------------------------------------------- */
       for (uint32_t nt = 0; nt < gu_ntiles; ++nt) {
@@ -468,7 +458,9 @@ int hexkl_mm_u8i4_moe_layer_run(
 out:
   free(scale);
   free(zp);
-  free(stage);
+  free(act_ah);
+  free(scale_all);
+  free(zp_all);
   free(order);
   free(base_of);
   free(act_c);
