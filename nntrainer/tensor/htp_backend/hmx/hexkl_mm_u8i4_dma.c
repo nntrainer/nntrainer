@@ -292,6 +292,22 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   const float *act_scale = o->act_scale;
   const int32_t *act_zp = o->act_zp;
   int rc0 = AEE_SUCCESS;
+
+  /** Issue handle 0's weight transfer HERE, before the activation is
+     quantized, and wait for it after. The quantization needs no weight and
+     the DMA engine needs no HVX, so the two overlap for free; the drain
+     that used to sit right after this push had nothing in front of it to
+     hide behind. Nothing else in the loop can cover it either when
+     n_handles is 1, which is every MoE expert call. */
+  {
+    const hexkl_weight_u8i4 *h0 = &tbl->slots[handles[0]];
+    const uint32_t nt0 = h0->N / HEXKL_HMX_INT8_BLOCK_N_COL;
+    const uint32_t wb0 = k_tiles * nt0 * WEIGHT_TILE_BYTES_U8I4;
+    const uint32_t rs0 = dma_row_size_dividing(wb0);
+    hexkl_dma_ring_push2d(vtcm_base + wbuf[0], h0->wh_bytes, rs0, rs0, rs0,
+                          wb0 / rs0, /*src_vtcm=*/0, /*dst_vtcm=*/1);
+  }
+
   if (o->act_ah_prepacked != NULL) {
     // The caller already quantized and AH-tile-packed the activation (see
     // hexkl_mm_opts.h's doc on this field) -- DMA the bytes into VTCM the
@@ -331,19 +347,13 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   int rc = AEE_SUCCESS;
   size_t out_off = 0;
 
-  // Load handle 0's weight before the loop starts -- there is nothing to
-  // prefetch it behind yet, so this one transfer is blocking.
-  {
-    const hexkl_weight_u8i4 *h0 = &tbl->slots[handles[0]];
-    const uint32_t nt0 = h0->N / HEXKL_HMX_INT8_BLOCK_N_COL;
-    const uint32_t wb0 = k_tiles * nt0 * WEIGHT_TILE_BYTES_U8I4;
-    const uint32_t rs0 = dma_row_size_dividing(wb0);
-    hexkl_dma_ring_push2d(vtcm_base + wbuf[0], h0->wh_bytes, rs0, rs0, rs0,
-                          wb0 / rs0, /*src_vtcm=*/0, /*dst_vtcm=*/1);
-    HEXKL_PROBE_T0(p0);
-    hexkl_dma_ring_drain();
-    HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
-  }
+  // Handle 0's weight was issued before the activation quantization above;
+  // this is where the wait for it lands. With one handle -- every MoE
+  // expert call -- there is no next weight to prefetch it behind, so
+  // overlapping it with the quant is the only cover available.
+  HEXKL_PROBE_T0(p0);
+  hexkl_dma_ring_drain();
+  HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
 
   for (uint32_t i = 0; i < n_handles; ++i) {
     const hexkl_weight_u8i4 *h = &tbl->slots[handles[i]];
@@ -821,16 +831,15 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
   int rc = AEE_SUCCESS;
   uint64_t p0 = 0;
 
-  // Load gate_up's weight once, blocking -- one weight, no cross-matmul
-  // handle to prefetch it behind (unlike hexkl_mm_u8i4_layer_run's
-  // multi-handle case).
+  // Issue gate_up's weight once. One weight, so there is no cross-matmul
+  // handle to prefetch it behind the way hexkl_mm_u8i4_layer_run's
+  // multi-handle case does -- the wait for it sits after the first block's
+  // quantization below instead, which is the only work available to cover
+  // it.
   {
     const uint32_t rs = dma_row_size_dividing(wb1);
     hexkl_dma_ring_push2d(vtcm_base + w_off, h_gu->wh_bytes, rs, rs, rs,
                           wb1 / rs, /*src_vtcm=*/0, /*dst_vtcm=*/1);
-    HEXKL_PROBE_T0(p0);
-    hexkl_dma_ring_drain();
-    HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
   }
 
   for (uint32_t mb = 0; mb < M; mb += HEXKL_HMX_INT8_BLOCK_N_ROW) {
@@ -845,6 +854,17 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
     if (rc != AEE_SUCCESS) {
       goto out;
+    }
+
+    /** The weight transfer was issued before this loop and waited for
+       here, after the first block's quantization -- which needs no weight,
+       so it covers part of the transfer instead of running after it. Only
+       the first block waits: the weight is loaded once and every later
+       block reuses it. */
+    if (mb == 0) {
+      HEXKL_PROBE_T0(p0);
+      hexkl_dma_ring_drain();
+      HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
     }
 
     hvx_dequant_prepare_rows(m_blk, scale1, zp1, dq_rows,
