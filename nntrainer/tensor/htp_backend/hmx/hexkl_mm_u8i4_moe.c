@@ -44,6 +44,7 @@
 #include "hexkl_probe.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
+#include "hvx_scale_add_f32.h"
 #include "hvx_swiglu_f32.h"
 
 #define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
@@ -397,12 +398,9 @@ int hexkl_mm_u8i4_moe_layer_run(
       {
         const float *res = (const float *)(vtcm_base + L.res_f32_off);
         for (uint32_t r = 0; r < m_blk; ++r) {
-          const float w = weights[mb + r];
-          float *dst = out_c + (size_t)rows[mb + r] * N_out;
-          const float *src = res + (size_t)r * N_out;
-          for (uint32_t c = 0; c < N_out; ++c) {
-            dst[c] += src[c] * w;
-          }
+          hvx_scale_add_rows_f32(out_c + (size_t)rows[mb + r] * N_out,
+                                 res + (size_t)r * N_out, weights[mb + r],
+                                 N_out);
         }
       }
       HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);

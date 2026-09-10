@@ -9,6 +9,7 @@
 #include "hexkl_dma_ring.h"
 #include "hexkl_mm_u8i4_moe.h"
 #include "hexkl_probe.h"
+#include "hvx_scale_add_f32.h"
 #include <AEEStdErr.h>
 #include <math.h>
 #include <stdint.h>
@@ -127,6 +128,18 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
       else
         out[(size_t)r * ostride + c] = v;
     }
+}
+void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
+                            uint32_t n) {
+  /* Two operations, never one: HVX has no f32 fused multiply-add and the
+     ARM path this has to agree with applies the routing weight with
+     multiply_i and then accumulates with add_i. The volatile is what stops
+     the host compiler contracting them and making this stub disagree with
+     the kernel for a reason that is the stub's. */
+  for (uint32_t i = 0; i < n; ++i) {
+    volatile float p = src[i] * scale;
+    dst[i] = dst[i] + p;
+  }
 }
 void hvx_swiglu_inplace_f32(float *gate, const float *up, uint32_t m,
                             uint32_t n, hvx_worker_pool *p) {
@@ -299,8 +312,12 @@ int main(void) {
       int32_t mz;
       quant_row(mid, inter, mq, &ms, &mz);
       ref_mm(&wd[e], mq, ms, mz, dn);
-      for (uint32_t c = 0; c < N_out; ++c)
-        want[(size_t)row * N_out + c] += dn[c] * rw[base + i];
+      for (uint32_t c = 0; c < N_out; ++c) {
+        /* Two operations through a volatile, matching what the kernel and
+           the ARM path both do -- see hvx_scale_add_rows_f32's stub. */
+        volatile float p = dn[c] * rw[base + i];
+        want[(size_t)row * N_out + c] = want[(size_t)row * N_out + c] + p;
+      }
     }
     base += rc_[e];
   }
