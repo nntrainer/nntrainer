@@ -26,9 +26,13 @@
 #include "hexkl_mm_opts.h"
 
 /** @brief Upper bound on weights resident at once. A 28-layer qwen3-sized
- *         model registers 7 per layer (q,k,v,o,gate,up,down) = 196; this
- *         leaves headroom without making the table itself large. */
-#define HEXKL_MM_U8I4_MAX_WEIGHTS 512
+ *         model registers 7 per layer (q,k,v,o,gate,up,down) = 196.
+ *         LFM2.5-8B-A1B resident in full (doc 45) is 22 MoE layers x 64 +
+ *         2 dense x 2 + 18 conv x 2 + 6 attention x 4 = 1472, so 512 --
+ *         which bounded the MoE work to 8 layers at a time -- is not
+ *         enough for the whole model. The table is ~48 bytes per slot;
+ *         2048 costs ~100 KB of static DSP memory. */
+#define HEXKL_MM_U8I4_MAX_WEIGHTS 2048
 
 /**
  * @brief One registered weight: WH-baked bytes plus its dequant constants,

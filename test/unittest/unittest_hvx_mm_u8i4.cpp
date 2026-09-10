@@ -1221,6 +1221,80 @@ TEST_F(HmxMmU8I4Layer, SwigluSurvivesExtremeNegativeGate) {
  *        need re-verifying that it still exercises u8i4 correctly to
  *        trust either.
  */
+/**
+ * @brief [doc 45 Gate 0] How much weight the DSP can hold resident.
+ *
+ * The whole-model plan needs every weight of LFM2.5-8B-A1B -- about 4.3 GB
+ * at 4 bits -- resident on the DSP at once, because streaming a layer's
+ * weights over FastRPC per forward (~180 MB, ~90 ms) would cost more than
+ * the layer saves. Registered weights live in the DSP PD's own heap
+ * (hexkl_mm_u8i4_dma.c bakes into VTCM and mallocs the resident copy), so
+ * the question is whether that heap, and the PD's address space, reach
+ * 4.3 GB. Nothing else in the plan matters if this does not, which is why
+ * it is a gate and runs before any of it is built.
+ *
+ * Registers one gate_up-sized weight's bytes over and over -- the DSP
+ * copies each into fresh heap, so the host needs only one buffer -- until
+ * registration fails, and reports how far it got and why. The cap is
+ * comfortably above the target so a device that can hold more still
+ * terminates.
+ */
+TEST_F(HmxMmU8I4Layer, RegistryCapacity) {
+  const uint32_t K = 2048, N = 3584; // gate_up: the model's largest weight
+  Weight w;
+  MakeAndRegister(K, N, 0xC0FFEEu, w);
+  std::vector<uint32_t> handles = {w.handle};
+
+  const uint32_t k_tiles = K / 32u, n_tiles = N / 32u;
+  const double gb_per = k_tiles * n_tiles * 512.0 / 1e9; // WH bytes
+  const double target_gb = 4.3;
+  const size_t cap = static_cast<size_t>(6.0 / gb_per); // stop past 6 GB
+  int stop_err = AEE_SUCCESS;
+
+  const auto t0 = std::chrono::steady_clock::now();
+  while (handles.size() < cap) {
+    uint32_t h = 0xFFFFFFFFu;
+    const int err = nntr_hvx_weight_register_u8i4(
+      handle_, K, N, w.q_w.data(), static_cast<int>(w.q_w.size()), w.d.data(),
+      static_cast<int>(w.d.size()), w.colsum.data(),
+      static_cast<int>(w.colsum.size()), w.bias.data(),
+      static_cast<int>(w.bias.size()), &h);
+    if (err != AEE_SUCCESS) {
+      stop_err = err;
+      break;
+    }
+    handles.push_back(h);
+  }
+  const double secs =
+    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+      .count();
+
+  const double gb = handles.size() * gb_per;
+  std::cout << "U8I4_FIELD path=registry field=weights_resident value="
+            << handles.size() << "\n"
+            << "U8I4_FIELD path=registry field=gb_resident value=" << gb << "\n"
+            << "U8I4_FIELD path=registry field=stop_reason value="
+            << (stop_err == AEE_SUCCESS ? std::string("cap") : hex(stop_err))
+            << "\n"
+            << "U8I4_FIELD path=registry field=register_ms_per_weight value="
+            << (handles.size() > 1 ? secs * 1e3 / (handles.size() - 1) : 0.0)
+            << std::endl;
+
+  for (uint32_t h : handles) {
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h), AEE_SUCCESS);
+  }
+
+  // The gate. A FAILED here is the finding, not a broken test: it means the
+  // whole-model plan cannot keep its weights resident on this device.
+  EXPECT_GE(gb, target_gb) << "the DSP holds " << gb
+                           << " GB of registered weight; the whole-model "
+                              "plan (doc 45) needs "
+                           << target_gb
+                           << " GB resident. Registration stopped with "
+                           << (stop_err == AEE_SUCCESS ? std::string("the cap")
+                                                       : hex(stop_err));
+}
+
 class HmxMmU8I8Layer : public HmxMmU8I4 {
 protected:
   struct Weight {
