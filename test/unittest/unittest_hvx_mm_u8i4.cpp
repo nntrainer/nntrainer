@@ -1326,7 +1326,10 @@ TEST_F(HmxMmU8I4Layer, MemoryCeilings) {
   {
     const uint32_t chunk_mb = 64, max_chunks = 128; // stop past 8 GB
     std::vector<uint32_t> chunks_ok(1, 0);
-    std::vector<uint64_t> touched(1, 0);
+    // unsigned long long, matching what the IDL's uint64 generates. The
+    // fixed-width alias is `unsigned long` on aarch64 -- same width, and
+    // C++ still refuses the pointer conversion.
+    std::vector<unsigned long long> touched(1, 0);
     const int err = nntr_hvx_mem_probe_dsp_heap(
       handle_, chunk_mb, max_chunks, chunks_ok.data(), 1, touched.data(), 1);
     const double gb =
@@ -1374,7 +1377,7 @@ TEST_F(HmxMmU8I4Layer, MemoryCeilings) {
     if (bytes > 0x7FFFFFFFull) {
       return false;
     }
-    std::vector<uint64_t> touched(1, 0);
+    std::vector<unsigned long long> touched(1, 0);
     return nntr_hvx_mem_probe_touch(handle_, static_cast<const uint8_t *>(p),
                                     static_cast<int>(bytes), touched.data(),
                                     1) == AEE_SUCCESS;
