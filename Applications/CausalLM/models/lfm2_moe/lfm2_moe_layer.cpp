@@ -440,6 +440,74 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
   g_m0_on = false;
 }
 
+/**
+ * @brief [doc 46] The whole MoE FFN layer in one accelerator call.
+ *
+ * Flattens the per-expert assignment lists into the three arrays the call
+ * wants and hands the routing over, so the token gather, the routing
+ * multiply and the scatter-add happen on the accelerator instead of here.
+ * Doc 44 section 15.1 measured those at 6.3 ms/layer on the ARM side.
+ *
+ * @return true when the layer was computed; false when this build or these
+ *         weights cannot take the path, and the caller's per-expert loop
+ *         still has to run.
+ */
+static bool tryMoeLayerOnAccelerator(
+  const nntrainer::Tensor &input, nntrainer::Tensor &output,
+  const std::vector<std::vector<std::pair<unsigned, float>>>
+    &expert_assignments,
+  nntrainer::RunLayerContext &context,
+  const std::vector<unsigned int> &gate_up_indices,
+  const std::vector<unsigned int> &down_indices, unsigned int total_tokens,
+  unsigned int hidden_size, unsigned int intermediate_size) {
+
+  auto *ops = input.getOps();
+  if (ops == nullptr || !ops->supports_gemm_qs4cx_moe_layer_fp32()) {
+    return false;
+  }
+
+  const size_t n_experts = expert_assignments.size();
+  std::vector<void *> gu_data(n_experts), dn_data(n_experts);
+  std::vector<float *> gu_scale(n_experts), dn_scale(n_experts);
+  for (size_t e = 0; e < n_experts; ++e) {
+    nntrainer::Tensor &gu = context.getWeight(gate_up_indices[e]);
+    nntrainer::Tensor &dn = context.getWeight(down_indices[e]);
+    if (gu.getDataType() != nntrainer::Tdatatype::QS4CX ||
+        dn.getDataType() != nntrainer::Tdatatype::QS4CX) {
+      return false;
+    }
+    gu_data[e] = gu.getData<char>();
+    dn_data[e] = dn.getData<char>();
+    gu_scale[e] = gu.getScale<float>();
+    dn_scale[e] = dn.getScale<float>();
+  }
+
+  // Grouped by expert in expert order -- the layout the kernel slices by
+  // running offsets, so the order here is part of the contract, not a
+  // convenience.
+  std::vector<unsigned int> row_index, row_count(n_experts);
+  std::vector<float> row_weight;
+  size_t total_rows = 0;
+  for (const auto &a : expert_assignments) {
+    total_rows += a.size();
+  }
+  row_index.reserve(total_rows);
+  row_weight.reserve(total_rows);
+  for (size_t e = 0; e < n_experts; ++e) {
+    row_count[e] = static_cast<unsigned int>(expert_assignments[e].size());
+    for (const auto &pair : expert_assignments[e]) {
+      row_index.push_back(pair.first);
+      row_weight.push_back(pair.second);
+    }
+  }
+
+  ops->gemm_qs4cx_moe_layer_fp32(
+    gu_data, gu_scale, dn_data, dn_scale, row_index, row_count, row_weight,
+    input.getData<float>(), output.getData<float>(), total_tokens, hidden_size,
+    intermediate_size, hidden_size);
+  return true;
+}
+
 inline void Lfm2MoELayer::compute_expert_forward(
   const nntrainer::Tensor &input, nntrainer::Tensor &output,
   const std::vector<std::pair<unsigned, float>> &token_assignments,
@@ -732,7 +800,21 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       }
     }
 
-    if (single_token_experts.size() > 1) {
+    // [doc 46] One call for every expert, when the accelerator offers it and
+    // there is more than one token to amortize the 64-row pad tax over --
+    // the same M > 1 gate the split-call fused path uses. Falls through to
+    // the per-expert loop below otherwise.
+    const bool moe_layer_done =
+      total_tokens > 1 &&
+      tryMoeLayerOnAccelerator(
+        input, output, expert_assignments, context, expert_gate_up_proj_indices,
+        expert_down_proj_indices, total_tokens, hidden_size,
+        std::get<nntrainer::props::Unit>(moe_props).get());
+
+    if (moe_layer_done) {
+      // nothing further: the accelerator zeroed the output, ran every
+      // expert, applied the routing weights and scattered the results.
+    } else if (single_token_experts.size() > 1) {
       computeGroupedDecodeExperts(context, input, output, single_token_experts,
                                   expert_assignments, hidden_size, workspace);
     } else {
