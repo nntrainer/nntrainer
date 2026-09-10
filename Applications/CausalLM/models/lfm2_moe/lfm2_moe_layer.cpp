@@ -24,6 +24,13 @@
 #include <stdexcept>
 #include <thread_manager.h>
 
+/** [A1] The deterministic SwiGLU. nntrainer::swiglu is left alone on
+    purpose -- every model on ARM uses it and nothing is wrong with it.
+    What this path needs is not a better SwiGLU but the SAME one the DSP
+    runs, down to the bit, so that enabling the fused kernel cannot move a
+    single uint8 quantization level (doc 44 section 3.3). */
+#include <swiglu_det.h>
+
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
@@ -454,18 +461,18 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
     token_input.dot(gate_up_proj, gate_up_out);
 
     if (num_tokens == 1) {
-      nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
-                        gate_up_out.getData<float>(),
-                        gate_up_out.getData<float>() + intermediate_size);
+      swiglu_det(acti_out.width(), acti_out.getData<float>(),
+                 gate_up_out.getData<float>(),
+                 gate_up_out.getData<float>() + intermediate_size);
     } else {
       auto &tm = nntrainer::ThreadManager::Global();
       tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
         const unsigned int offset = acti_out.getIndex(0, 0, i, 0);
         const unsigned int gate_up_offset = gate_up_out.getIndex(0, 0, i, 0);
-        nntrainer::swiglu(acti_out.width(), acti_out.getData<float>() + offset,
-                          gate_up_out.getData<float>() + gate_up_offset,
-                          gate_up_out.getData<float>() + gate_up_offset +
-                            intermediate_size);
+        swiglu_det(acti_out.width(), acti_out.getData<float>() + offset,
+                   gate_up_out.getData<float>() + gate_up_offset,
+                   gate_up_out.getData<float>() + gate_up_offset +
+                     intermediate_size);
       });
     }
 
@@ -673,9 +680,9 @@ void Lfm2MoELayer::computeGroupedDecodeExperts(
     nntrainer::Tensor acti_out =
       workspace.activation_output->getSharedDataTensor(intermediate_dim, 0,
                                                        true);
-    nntrainer::swiglu(acti_out.width(), acti_out.getData<float>(),
-                      gate_up_views[i].getData<float>(),
-                      gate_up_views[i].getData<float>() + intermediate_size);
+    swiglu_det(acti_out.width(), acti_out.getData<float>(),
+               gate_up_views[i].getData<float>(),
+               gate_up_views[i].getData<float>() + intermediate_size);
 
     nntrainer::Tensor expert_output =
       workspace.expert_output->getSharedDataTensor(token_step_dim, 0, true);
