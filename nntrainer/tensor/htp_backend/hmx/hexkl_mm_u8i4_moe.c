@@ -347,6 +347,8 @@ int hexkl_mm_u8i4_moe_layer_run(
     for (uint32_t mb = 0; mb < n_e; mb += BR) {
       const uint32_t m_blk = (n_e - mb < BR) ? (n_e - mb) : BR;
       const int last_block = (mb + BR >= n_e);
+      /* Counted, not timed -- see HEXKL_PROBE_BLOCKS. */
+      hexkl_probe_us[HEXKL_PROBE_BLOCKS] += 1;
 
       /* Gather this block's token rows into a contiguous staging buffer and
          quantize them. Gathering f32 and quantizing per block -- rather

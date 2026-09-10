@@ -598,6 +598,7 @@ enum {
   MOE_T_SCATTER, /**< routing multiply + accumulate into out_f32 */
   MOE_T_GATHER,  /**< hvx_gather_ah_u8 + the per-block scale/zp slice */
   MOE_T_REQUANT, /**< the SwiGLU output's per-block quantize */
+  MOE_T_BLOCKS,  /**< NOT us: 64-row blocks issued, summed over experts */
   MOE_T_STAGE,   /**< copying the FastRPC buffers to and from cached heap */
   MOE_T_ACC_STRIDE,
   MOE_N_STAGES
@@ -725,6 +726,7 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
   stage_us[MOE_T_STAGE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
   stage_us[MOE_T_GATHER] = (uint32)hexkl_probe_us[HEXKL_PROBE_GATHER];
   stage_us[MOE_T_REQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_REQUANT];
+  stage_us[MOE_T_BLOCKS] = (uint32)hexkl_probe_us[HEXKL_PROBE_BLOCKS];
   stage_us[MOE_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
   return rc;
 }

@@ -54,6 +54,15 @@ enum {
       shared, and which of the two it was could not be read off the
       profile. */
   HEXKL_PROBE_SCATTER,
+  /** NOT a time: how many 64-row blocks the MoE layer issued, summed over
+      experts. The matmul cost scales with THIS, not with the routed row
+      count -- HMX computes all 64 rows of a tile whatever m_blk says. At
+      1776 rows over 32 experts the average expert holds 55.5, just under
+      the tile, so whether an expert lands at 60 or 70 decides between one
+      block and two-with-one-nearly-empty. The spread between the two
+      readings is 22.5 vs 33.8 GMAC, and nothing in the profile could tell
+      them apart. */
+  HEXKL_PROBE_BLOCKS,
   /** NOT a time: hexkl_acc_layout::row_stride when the in-place tile dequant
    *  is running, 0 when layer_run fell back to the vendor copy. One number
    *  that says which path the numbers beside it came from. */
