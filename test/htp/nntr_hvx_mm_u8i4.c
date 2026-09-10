@@ -10,6 +10,7 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <AEEStdErr.h>
@@ -153,6 +154,91 @@ enum {
   FC_T_ACC_STRIDE,    /**< not a time: the derived row stride, 0 if fallback */
   FC_N_STAGES
 };
+
+/**
+ * @brief [doc 45 Gate 0b] The DSP PD's own allocatable memory.
+ *
+ * Gate 0 stopped at 1.89 GB with 0x8000040d, an error raised before
+ * hexkl_weight_u8i4_register ran -- registration's own out-of-memory path
+ * returns AEE_ENOMEMORY. So the PD could not service the call at all, and
+ * what ran out was PD memory generally rather than the malloc heap the
+ * baked weights live in. This probe carries no payload, so whatever it
+ * reaches is the heap ceiling on its own, with none of the 3.67 MB input
+ * buffer registration also needs in flight.
+ *
+ * Every chunk is touched one byte per 4 KB page: an allocator that reserves
+ * lazily would otherwise report a ceiling that does not exist once the
+ * pages are actually written.
+ */
+int nntr_hvx_mem_probe_dsp_heap(remote_handle64 handle, uint32 chunk_mb,
+                                uint32 max_chunks, uint32 *chunks_ok,
+                                int chunks_okLen, uint64 *touched_sum,
+                                int touched_sumLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  void **blocks;
+  uint32_t n = 0, i;
+  uint64_t sum = 0;
+  const size_t chunk = (size_t)chunk_mb * 1024u * 1024u;
+
+  if (!s || chunks_okLen < 1 || touched_sumLen < 1) {
+    return AEE_EBADPARM;
+  }
+  if (chunk_mb == 0 || max_chunks == 0) {
+    return AEE_EBADPARM;
+  }
+  blocks = (void **)malloc(sizeof(void *) * max_chunks);
+  if (!blocks) {
+    return AEE_ENOMEMORY;
+  }
+
+  for (n = 0; n < max_chunks; ++n) {
+    unsigned char *p = (unsigned char *)malloc(chunk);
+    size_t off;
+    if (!p) {
+      break;
+    }
+    for (off = 0; off < chunk; off += 4096u) {
+      p[off] = (unsigned char)(off + n);
+      sum += p[off];
+    }
+    blocks[n] = p;
+  }
+  for (i = 0; i < n; ++i) {
+    free(blocks[i]);
+  }
+  free(blocks);
+
+  chunks_ok[0] = n;
+  touched_sum[0] = sum;
+  return AEE_SUCCESS;
+}
+
+/**
+ * @brief [doc 45 Gate 0b] Whether the DSP can reach a host buffer of a
+ *        given size.
+ *
+ * Called with rpcmem/ION memory, this is the measurement doc 45 section 8.4
+ * rests on: the redesign puts one baked-weight arena in ION and has the DSP
+ * read it directly, so what matters is the largest ION mapping the DSP can
+ * touch, not how much it can malloc. Touching every page rather than the
+ * first byte is what makes it a mapping test rather than an address test.
+ */
+int nntr_hvx_mem_probe_touch(remote_handle64 handle, const uint8 *buf,
+                             int bufLen, uint64 *touched_sum,
+                             int touched_sumLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t sum = 0;
+  int off;
+
+  if (!s || !buf || bufLen <= 0 || touched_sumLen < 1) {
+    return AEE_EBADPARM;
+  }
+  for (off = 0; off < bufLen; off += 4096) {
+    sum += buf[off];
+  }
+  touched_sum[0] = sum;
+  return AEE_SUCCESS;
+}
 
 /** @brief Shared by both entry points below, so they cannot drift apart on
  *         what they accept. */

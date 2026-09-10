@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <dlfcn.h>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -1293,6 +1294,137 @@ TEST_F(HmxMmU8I4Layer, RegistryCapacity) {
                            << " GB resident. Registration stopped with "
                            << (stop_err == AEE_SUCCESS ? std::string("the cap")
                                                        : hex(stop_err));
+}
+
+/**
+ * @brief [doc 45 Gate 0b] Which of the two memory limits stopped Gate 0.
+ *
+ * Gate 0 registered 1.89 GB of the 4.10 the whole-model plan needs and
+ * failed with 0x8000040d -- raised before the registration function ran, so
+ * the PD could not service the call rather than running out of the malloc
+ * heap the baked weights sit in. Section 8.4's redesign moves those weights
+ * into one ION arena the DSP maps and reads directly, which gets past a PD
+ * heap limit but not past the DSP's virtual address space. This measures
+ * three numbers that separate them:
+ *
+ *   dsp_heap_gb   what the DSP can malloc and touch with no payload in
+ *                 flight -- the heap ceiling on its own
+ *   ion_single_gb the largest single rpcmem buffer the DSP can touch every
+ *                 page of; what the one-arena design needs to be >= 4.10
+ *   ion_total_gb  how much rpcmem the host can allocate and have the DSP
+ *                 touch across several buffers -- the fallback if one
+ *                 arena is capped
+ *
+ * Not an assertion. Three branches follow from the numbers (doc 45 section
+ * 8.5) and only one of them is a failure, so this reports and passes; the
+ * decision is a design one, not a regression.
+ */
+TEST_F(HmxMmU8I4Layer, MemoryCeilings) {
+  const double need_gb = 4.10;
+
+  // --- 1. the DSP's own heap, no payload -------------------------------
+  {
+    const uint32_t chunk_mb = 64, max_chunks = 128; // stop past 8 GB
+    std::vector<uint32_t> chunks_ok(1, 0);
+    std::vector<uint64_t> touched(1, 0);
+    const int err = nntr_hvx_mem_probe_dsp_heap(
+      handle_, chunk_mb, max_chunks, chunks_ok.data(), 1, touched.data(), 1);
+    const double gb =
+      err == AEE_SUCCESS ? chunks_ok[0] * chunk_mb / 1024.0 : 0.0;
+    std::cout << "U8I4_FIELD path=mem field=dsp_heap_gb value=" << gb << "\n"
+              << "U8I4_FIELD path=mem field=dsp_heap_err value=" << hex(err)
+              << std::endl;
+  }
+
+  // --- 2. rpcmem/ION: one buffer, as large as it will go ---------------
+  // rpcmem_alloc's size argument is int, so 2 GB - 1 is the API's own
+  // ceiling regardless of the device; rpcmem_alloc2 takes size_t where it
+  // exists. Which one is available is itself part of the answer.
+  using AllocFn = void *(*)(int, uint32_t, int);
+  using Alloc2Fn = void *(*)(int, uint32_t, size_t);
+  using FreeFn = void (*)(void *);
+  auto init = (void (*)(void))dlsym(RTLD_DEFAULT, "rpcmem_init");
+  auto alloc = (AllocFn)dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+  auto alloc2 = (Alloc2Fn)dlsym(RTLD_DEFAULT, "rpcmem_alloc2");
+  auto rfree = (FreeFn)dlsym(RTLD_DEFAULT, "rpcmem_free");
+  if (!alloc || !rfree) {
+    std::cout << "U8I4_FIELD path=mem field=rpcmem value=absent" << std::endl;
+    GTEST_SKIP() << "no rpcmem in this process -- ION cannot be measured";
+  }
+  if (init) {
+    init();
+  }
+  const int kHeapIdContig = 25; // RPCMEM_HEAP_ID_SYSTEM
+  const uint32_t kFlags = 1;    // RPCMEM_DEFAULT_FLAGS
+  std::cout << "U8I4_FIELD path=mem field=rpcmem_alloc2 value="
+            << (alloc2 ? "yes" : "no") << std::endl;
+
+  auto try_alloc = [&](size_t bytes) -> void * {
+    if (alloc2) {
+      return alloc2(kHeapIdContig, kFlags, bytes);
+    }
+    if (bytes > 0x7FFFFFFFull) {
+      return nullptr; // int would overflow; not a device limit, an API one
+    }
+    return alloc(kHeapIdContig, kFlags, static_cast<int>(bytes));
+  };
+  // The DSP side takes bufLen as int, so a single call cannot describe more
+  // than 2 GB - 1 no matter how the allocation went.
+  auto dsp_can_touch = [&](void *p, size_t bytes) -> bool {
+    if (bytes > 0x7FFFFFFFull) {
+      return false;
+    }
+    std::vector<uint64_t> touched(1, 0);
+    return nntr_hvx_mem_probe_touch(handle_, static_cast<const uint8_t *>(p),
+                                    static_cast<int>(bytes), touched.data(),
+                                    1) == AEE_SUCCESS;
+  };
+
+  double single_gb = 0.0;
+  for (size_t mb : {256u, 512u, 1024u, 1536u, 2047u}) {
+    const size_t bytes = mb * 1024u * 1024u;
+    void *p = try_alloc(bytes);
+    if (!p) {
+      break;
+    }
+    const bool ok = dsp_can_touch(p, bytes);
+    rfree(p);
+    if (!ok) {
+      break;
+    }
+    single_gb = mb / 1024.0;
+  }
+  std::cout << "U8I4_FIELD path=mem field=ion_single_gb value=" << single_gb
+            << std::endl;
+
+  // --- 3. how much ION in total, across buffers, the DSP can reach -----
+  // FastRPC keeps an ION buffer's SMMU mapping across calls (htp_rpcmem.h),
+  // so buffers touched in earlier calls should still be mapped; if the
+  // ceiling here is the DSP's address space rather than the host's memory,
+  // this is where it shows.
+  {
+    const size_t chunk = 256u * 1024u * 1024u;
+    std::vector<void *> bufs;
+    while (bufs.size() < 40) { // stop past 10 GB
+      void *p = try_alloc(chunk);
+      if (!p) {
+        break;
+      }
+      if (!dsp_can_touch(p, chunk)) {
+        rfree(p);
+        break;
+      }
+      bufs.push_back(p);
+    }
+    const double total_gb = bufs.size() * chunk / 1073741824.0;
+    for (void *p : bufs) {
+      rfree(p);
+    }
+    std::cout << "U8I4_FIELD path=mem field=ion_total_gb value=" << total_gb
+              << "\n"
+              << "U8I4_FIELD path=mem field=need_gb value=" << need_gb
+              << std::endl;
+  }
 }
 
 class HmxMmU8I8Layer : public HmxMmU8I4 {
