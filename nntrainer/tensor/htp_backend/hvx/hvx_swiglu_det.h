@@ -78,7 +78,7 @@
  *
  * That is not something to assume. nntr_hvx_swiglu_det_f32 exposes this
  * function's output AND its two intermediates, and
- * unittest_hvx_softmax.cpp's SwigluDetMatchesScalarBitExact compares all
+ * unittest_hvx_softmax.cpp's HvxSwigluDet.MatchesScalarBitExact compares all
  * three against a scalar reference built from the same spec, bit for bit.
  * If it fails, its per-stage counts say whether exp_det, recip_det or the
  * final multiply is where the two arithmetics part company.
