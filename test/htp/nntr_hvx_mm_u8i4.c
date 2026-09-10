@@ -20,6 +20,7 @@
 #include "hexkl_micro.h"
 #include "hexkl_mm_u8i4.h"
 #include "hexkl_mm_u8i4_dma.h"
+#include "hexkl_mm_u8i4_moe.h"
 #include "hexkl_probe.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
@@ -582,6 +583,144 @@ static int check_gate_up_swiglu_args(const nntr_hvx_session *s, uint32 M,
     return AEE_EBADPARM;
   }
   return AEE_SUCCESS;
+}
+
+/** @brief Slots mm_u8i4_moe_layer_timed fills, in order. Mirrors GU_T_*
+ *         with one extra: the routing multiply and scatter-add, which no
+ *         existing call has because the ARM side does them today. */
+enum {
+  MOE_T_DSP_TOTAL = 0,
+  MOE_T_QUANT, /**< act quant + the SwiGLU output's requant */
+  MOE_T_SWIGLU,
+  MOE_T_DEQUANT, /**< both matmuls' i32 -> f32 */
+  MOE_T_ACC_READ,
+  MOE_T_DRAIN,   /**< the cross-expert weight DMA waits */
+  MOE_T_SCATTER, /**< routing multiply + accumulate into out_f32 */
+  MOE_T_ACC_STRIDE,
+  MOE_N_STAGES
+};
+
+/** @brief Shared by both entry points so they cannot drift on what they
+ *         accept. Lengths are the only thing the skel can check that the
+ *         kernel cannot: the kernel sees pointers, not sequence lengths. */
+static int check_moe_layer_args(const nntr_hvx_session *s, uint32 M, uint32 K,
+                                uint32 inter, uint32 N_out, int h_guLen,
+                                int h_dnLen, int row_indexLen, int row_countLen,
+                                int row_weightLen, int act_f32Len,
+                                int out_f32Len) {
+  if (!s || M == 0 || K == 0 || inter == 0 || N_out == 0) {
+    return AEE_EBADPARM;
+  }
+  if (h_guLen <= 0 || h_dnLen != h_guLen || row_countLen != h_guLen) {
+    FARF(ERROR, "moe_layer: expert count mismatch (gu=%d dn=%d count=%d)",
+         h_guLen, h_dnLen, row_countLen);
+    return AEE_EBADPARM;
+  }
+  if (row_indexLen < 0 || row_weightLen != row_indexLen) {
+    FARF(ERROR, "moe_layer: row_index %d vs row_weight %d", row_indexLen,
+         row_weightLen);
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)act_f32Len != M * K) {
+    FARF(ERROR, "moe_layer: bad act_f32Len %d (M=%u K=%u)", act_f32Len,
+         (unsigned)M, (unsigned)K);
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)out_f32Len != M * N_out) {
+    FARF(ERROR, "moe_layer: bad out_f32Len %d (M=%u N_out=%u)", out_f32Len,
+         (unsigned)M, (unsigned)N_out);
+    return AEE_EBADPARM;
+  }
+  return AEE_SUCCESS;
+}
+
+/** @brief The row_count entries must add up to exactly the number of
+ *         row_index entries, or the kernel would read past the array while
+ *         slicing per-expert groups out of it. */
+static int check_moe_row_totals(const uint32 *row_count, int n_experts,
+                                int row_indexLen) {
+  uint32_t sum = 0;
+  int i;
+  for (i = 0; i < n_experts; ++i) {
+    sum += row_count[i];
+  }
+  if (sum != (uint32_t)row_indexLen) {
+    FARF(ERROR, "moe_layer: row_count sums to %u, row_index has %d", sum,
+         row_indexLen);
+    return AEE_EBADPARM;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
+                               uint32 inter, uint32 N_out,
+                               const uint32 *h_gate_up, int h_gate_upLen,
+                               const uint32 *h_down, int h_downLen,
+                               const uint32 *row_index, int row_indexLen,
+                               const uint32 *row_count, int row_countLen,
+                               const float *row_weight, int row_weightLen,
+                               const float *act_f32, int act_f32Len,
+                               float *out_f32, int out_f32Len) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  int rc = check_moe_layer_args(s, M, K, inter, N_out, h_gate_upLen, h_downLen,
+                                row_indexLen, row_countLen, row_weightLen,
+                                act_f32Len, out_f32Len);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  rc = check_moe_row_totals(row_count, h_gate_upLen, row_indexLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  return hexkl_mm_u8i4_moe_layer_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
+    N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
+    row_weight, act_f32, out_f32, s->quant_pool);
+}
+
+int nntr_hvx_mm_u8i4_moe_layer_timed(
+  remote_handle64 handle, uint32 M, uint32 K, uint32 inter, uint32 N_out,
+  const uint32 *h_gate_up, int h_gate_upLen, const uint32 *h_down,
+  int h_downLen, const uint32 *row_index, int row_indexLen,
+  const uint32 *row_count, int row_countLen, const float *row_weight,
+  int row_weightLen, const float *act_f32, int act_f32Len, float *out_f32,
+  int out_f32Len, uint32 *stage_us, int stage_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  uint64_t t0, t1;
+  int rc = check_moe_layer_args(s, M, K, inter, N_out, h_gate_upLen, h_downLen,
+                                row_indexLen, row_countLen, row_weightLen,
+                                act_f32Len, out_f32Len);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  rc = check_moe_row_totals(row_count, h_gate_upLen, row_indexLen);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  if (!stage_us || stage_usLen != MOE_N_STAGES) {
+    FARF(ERROR, "moe_layer_timed: stage_usLen %d, expected %d", stage_usLen,
+         (int)MOE_N_STAGES);
+    return AEE_EBADPARM;
+  }
+
+  hexkl_probe_reset(1);
+  t0 = hexkl_probe_now();
+  rc = hexkl_mm_u8i4_moe_layer_run(
+    &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
+    N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
+    row_weight, act_f32, out_f32, s->quant_pool);
+  t1 = hexkl_probe_now();
+  hexkl_probe_on = 0;
+
+  stage_us[MOE_T_DSP_TOTAL] = (uint32)(t1 - t0);
+  stage_us[MOE_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
+  stage_us[MOE_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
+  stage_us[MOE_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
+  stage_us[MOE_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
+  stage_us[MOE_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
+  stage_us[MOE_T_SCATTER] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[MOE_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  return rc;
 }
 
 int nntr_hvx_mm_u8i4_gate_up_swiglu(remote_handle64 handle, uint32 M, uint32 K,
