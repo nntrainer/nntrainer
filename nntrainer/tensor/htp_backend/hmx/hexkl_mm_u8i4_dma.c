@@ -304,13 +304,14 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   } else {
     HEXKL_PROBE_T0(p0);
     if (act_scale == NULL) {
-      hvx_quant_rows_u8_params(act_f32, M, m_pad, K, loc_scale, loc_zp,
-                               o->pool);
+      rc0 = hvx_quant_rows_pack_u8_ah(act_f32, M, m_pad, K, loc_scale, loc_zp,
+                                      vtcm_base + act_off, o->pool);
       act_scale = loc_scale;
       act_zp = loc_zp;
+    } else {
+      rc0 = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
+                                 vtcm_base + act_off, o->pool);
     }
-    rc0 = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
-                               vtcm_base + act_off, o->pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
   }
   if (rc0 != AEE_SUCCESS) {
@@ -569,10 +570,9 @@ int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
 
     // Stage 1: K1 on this block's activation, straight into AH tiles.
     HEXKL_PROBE_T0(p0);
-    hvx_quant_rows_u8_params(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, K,
-                             scale1, zp1, o->pool);
-    rc = hvx_quant_pack_u8_ah(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, K,
-                              scale1, zp1, vtcm_base + act1_off, o->pool);
+    rc =
+      hvx_quant_rows_pack_u8_ah(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, K,
+                                scale1, zp1, vtcm_base + act1_off, o->pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
     if (rc != AEE_SUCCESS) {
       goto out;
@@ -629,12 +629,9 @@ int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     HEXKL_PROBE_ADD(HEXKL_PROBE_SWIGLU, p0);
 
     HEXKL_PROBE_T0(p0);
-    hvx_quant_rows_u8_params((const float *)(vtcm_base + inter_gate_off), m_blk,
-                             HEXKL_HMX_INT8_BLOCK_N_ROW, inter, scale2, zp2,
-                             o->pool);
-    rc = hvx_quant_pack_u8_ah((const float *)(vtcm_base + inter_gate_off),
-                              m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, inter, scale2,
-                              zp2, vtcm_base + act2_off, o->pool);
+    rc = hvx_quant_rows_pack_u8_ah((const float *)(vtcm_base + inter_gate_off),
+                                   m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, inter,
+                                   scale2, zp2, vtcm_base + act2_off, o->pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
     if (rc != AEE_SUCCESS) {
       goto out;
@@ -810,10 +807,8 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
     const float *act_blk = act_f32 + (size_t)mb * K;
 
     HEXKL_PROBE_T0(p0);
-    hvx_quant_rows_u8_params(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, K,
-                             scale1, zp1, pool);
-    rc = hvx_quant_pack_u8_ah(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, K,
-                              scale1, zp1, vtcm_base + act_off, pool);
+    rc = hvx_quant_rows_pack_u8_ah(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW,
+                                   K, scale1, zp1, vtcm_base + act_off, pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
     if (rc != AEE_SUCCESS) {
       goto out;
@@ -869,18 +864,17 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
     // AH tiling's row-block byte stride is fixed (inter_ktiles*2048)
     // regardless of how many blocks the caller happens to split M into.
     HEXKL_PROBE_T0(p0);
-    hvx_quant_rows_u8_params((const float *)(vtcm_base + gate_off), m_blk,
-                             HEXKL_HMX_INT8_BLOCK_N_ROW, inter, scale1, zp1,
-                             pool);
+    uint8_t *out_ah_blk =
+      out_ah + (size_t)(mb / HEXKL_HMX_INT8_BLOCK_N_ROW) * inter_ktiles * 2048u;
+    rc = hvx_quant_rows_pack_u8_ah((const float *)(vtcm_base + gate_off), m_blk,
+                                   HEXKL_HMX_INT8_BLOCK_N_ROW, inter, scale1,
+                                   zp1, out_ah_blk, pool);
+    // Copied out after the fused call, not between a params and a pack:
+    // the worker that packs a row is the one that derived its scale/zp.
     for (uint32_t r = 0; r < m_blk; ++r) {
       out_scale[mb + r] = scale1[r];
       out_zp[mb + r] = zp1[r];
     }
-    uint8_t *out_ah_blk =
-      out_ah + (size_t)(mb / HEXKL_HMX_INT8_BLOCK_N_ROW) * inter_ktiles * 2048u;
-    rc = hvx_quant_pack_u8_ah((const float *)(vtcm_base + gate_off), m_blk,
-                              HEXKL_HMX_INT8_BLOCK_N_ROW, inter, scale1, zp1,
-                              out_ah_blk, pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
     if (rc != AEE_SUCCESS) {
       goto out;

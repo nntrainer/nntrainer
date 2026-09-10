@@ -151,56 +151,84 @@ static void quant_pack_row_scalar(const float *row, uint32_t n_ktiles,
 typedef struct {
   const float *x;
   uint32_t m_vec_end, k, n_ktiles;
-  const HVX_UVector *vinv; /**< m_vec_end entries, precomputed once --
-                               malloc'd, so unaligned: see the two heap
-                               HVX_UVector arrays below. */
-  const HVX_UVector *vz;   /**< m_vec_end entries, precomputed once */
+  float *scale; /**< derive_params: written here; otherwise read */
+  int32_t *zp;  /**< same */
   uint8_t *out_ah;
+  /** Whether this run derives scale/zp from the rows themselves, or the
+      caller already supplied them (hexkl_mm_opts' act_scale/act_zp path). */
+  int derive_params;
 } quant_pack_ctx;
 
 /**
- * @brief One k-tile's worth of K2, every row-group in it.
+ * @brief One row-group's worth of K2: four rows, every k-tile of them.
  *
- * A k-tile's destination bytes ((rb*n_ktiles+kt)*ACT_TILE_BYTES + r0*32,
- * for every rb/r0) never overlap another k-tile's, so splitting by k-tile
- * (not by row) is what lets workers write without touching each other's
- * memory -- and it keeps every row-group's four rows on one worker, which
- * is what the vectorized store below needs.
+ * Split by row-GROUP, not by k-tile. Both are safe against overlapping
+ * writes -- a group's four rows own bytes [r0*32, r0*32+128) of every tile
+ * and no other group touches them -- but this axis is what lets the min/max
+ * pass and the pack pass share one dispatch: a row's scale/zp depend only on
+ * that row, so the worker that will pack a row can derive its params first,
+ * with no barrier between the phases and no worker recomputing another's
+ * rows.
+ *
+ * It also fixes the read pattern. Splitting by k-tile means the params pass
+ * streams all m rows, then the pack pass streams all m rows again -- 2x512
+ * KB of cold reads at the MoE's gate_up shape. Here the two passes over a
+ * row are back to back, so the second finds it warm, and inside a group the
+ * k-tile loop walks four rows contiguously instead of revisiting each row
+ * once per tile.
  */
 static void quant_pack_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
   quant_pack_ctx *ctx = (quant_pack_ctx *)ctx_;
-  const uint32_t lo = (uint32_t)((uint64_t)ctx->n_ktiles * i / n_threads);
-  const uint32_t hi = (uint32_t)((uint64_t)ctx->n_ktiles * (i + 1) / n_threads);
+  const uint32_t n_groups = ctx->m_vec_end / 4u;
+  const uint32_t lo = (uint32_t)((uint64_t)n_groups * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)n_groups * (i + 1) / n_threads);
 
-  for (uint32_t kt = lo; kt < hi; ++kt) {
-    for (uint32_t m = 0; m < ctx->m_vec_end; m += 4u) {
-      const uint32_t rb = m / TILE_ROW;
-      const uint32_t r0 = m % TILE_ROW; // multiple of 4; group never wraps rb
-      const HVX_UVector *vin0 =
-        (const HVX_UVector *)(ctx->x + (size_t)(m + 0) * ctx->k +
-                              kt * TILE_INNER);
-      const HVX_UVector *vin1 =
-        (const HVX_UVector *)(ctx->x + (size_t)(m + 1) * ctx->k +
-                              kt * TILE_INNER);
-      const HVX_UVector *vin2 =
-        (const HVX_UVector *)(ctx->x + (size_t)(m + 2) * ctx->k +
-                              kt * TILE_INNER);
-      const HVX_UVector *vin3 =
-        (const HVX_UVector *)(ctx->x + (size_t)(m + 3) * ctx->k +
-                              kt * TILE_INNER);
+  for (uint32_t g = lo; g < hi; ++g) {
+    const uint32_t m = g * 4u;
+
+    if (ctx->derive_params) {
+      // The same function hvx_quant_rows_u8_params calls, so a fused run
+      // and a params-then-pack run write byte-identical scale/zp.
+      quant_row_params_one(ctx->x, m + 0, ctx->k, ctx->scale, ctx->zp);
+      quant_row_params_one(ctx->x, m + 1, ctx->k, ctx->scale, ctx->zp);
+      quant_row_params_one(ctx->x, m + 2, ctx->k, ctx->scale, ctx->zp);
+      quant_row_params_one(ctx->x, m + 3, ctx->k, ctx->scale, ctx->zp);
+    }
+
+    // Four rows' reciprocal scale and zero point, live in registers for
+    // this group's whole k-tile loop. The k-tile split needed every row's
+    // pair at once and so heap-allocated two m_vec_end-long arrays per
+    // call; on this axis they are locals.
+    const HVX_Vector vinv0 = hvx_splat_sf(1.0f / ctx->scale[m + 0]);
+    const HVX_Vector vinv1 = hvx_splat_sf(1.0f / ctx->scale[m + 1]);
+    const HVX_Vector vinv2 = hvx_splat_sf(1.0f / ctx->scale[m + 2]);
+    const HVX_Vector vinv3 = hvx_splat_sf(1.0f / ctx->scale[m + 3]);
+    const HVX_Vector vz0 = Q6_V_vsplat_R(ctx->zp[m + 0]);
+    const HVX_Vector vz1 = Q6_V_vsplat_R(ctx->zp[m + 1]);
+    const HVX_Vector vz2 = Q6_V_vsplat_R(ctx->zp[m + 2]);
+    const HVX_Vector vz3 = Q6_V_vsplat_R(ctx->zp[m + 3]);
+
+    const uint32_t rb = m / TILE_ROW;
+    const uint32_t r0 = m % TILE_ROW; // multiple of 4; group never wraps rb
+    const float *row0 = ctx->x + (size_t)(m + 0) * ctx->k;
+    const float *row1 = ctx->x + (size_t)(m + 1) * ctx->k;
+    const float *row2 = ctx->x + (size_t)(m + 2) * ctx->k;
+    const float *row3 = ctx->x + (size_t)(m + 3) * ctx->k;
+
+    for (uint32_t kt = 0; kt < ctx->n_ktiles; ++kt) {
+      const HVX_UVector *vin0 = (const HVX_UVector *)(row0 + kt * TILE_INNER);
+      const HVX_UVector *vin1 = (const HVX_UVector *)(row1 + kt * TILE_INNER);
+      const HVX_UVector *vin2 = (const HVX_UVector *)(row2 + kt * TILE_INNER);
+      const HVX_UVector *vin3 = (const HVX_UVector *)(row3 + kt * TILE_INNER);
 
       const HVX_Vector vq0 = Q6_Vw_vadd_VwVw(
-        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin0[0], ctx->vinv[m + 0])),
-        ctx->vz[m + 0]);
+        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin0[0], vinv0)), vz0);
       const HVX_Vector vq1 = Q6_Vw_vadd_VwVw(
-        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin1[0], ctx->vinv[m + 1])),
-        ctx->vz[m + 1]);
+        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin1[0], vinv1)), vz1);
       const HVX_Vector vq2 = Q6_Vw_vadd_VwVw(
-        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin2[0], ctx->vinv[m + 2])),
-        ctx->vz[m + 2]);
+        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin2[0], vinv2)), vz2);
       const HVX_Vector vq3 = Q6_Vw_vadd_VwVw(
-        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin3[0], ctx->vinv[m + 3])),
-        ctx->vz[m + 3]);
+        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin3[0], vinv3)), vz3);
 
       // vpack(Vu, Vv):sat places Vv's (narrowed, saturated) elements in the
       // low half of the result and Vu's in the high half, in order --
@@ -220,12 +248,47 @@ static void quant_pack_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
   }
 }
 
-int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
-                         uint32_t k, const float *scale, const int32_t *zp,
-                         uint8_t *out_ah, hvx_worker_pool *pool) {
+/** @brief Body shared by the two public entries below; @a derive_params is
+ *         what separates them. */
+static int quant_pack_common(const float *x, uint32_t m_valid, uint32_t m_pad,
+                             uint32_t k, float *scale, int32_t *zp,
+                             uint8_t *out_ah, hvx_worker_pool *pool,
+                             int derive_params) {
+  /** AH's row-block stride is n_ktiles*ACT_TILE_BYTES, which only describes
+     the buffer when k tiles exactly. A k that does not would leave its last
+     columns unwritten AND unaccounted for in out_ah's size, so this is a
+     contract violation rather than a case to handle. Every caller in tree
+     passes an already-checked K or inter; the guard is here so that a
+     future one that does not fails loudly instead of writing partial
+     tiles. */
+  if ((k % TILE_INNER) != 0) {
+    return AEE_EBADPARM;
+  }
   const uint32_t n_ktiles = k / TILE_INNER;
 
-  memset(out_ah, 0, (size_t)m_pad * k);
+  /** Only the padding rows need zeroing: every valid row is fully
+     overwritten below, for every k-tile, and rows at or past m_pad are
+     never read by HMX. That is at most 63 rows against m_pad*k bytes --
+     18 KB instead of 128 KB at the MoE's gate_up shape, where m_valid is
+     ~55 of a 64-row block. */
+  for (uint32_t m = m_valid; m < m_pad; ++m) {
+    const uint32_t rb = m / TILE_ROW;
+    const uint32_t r = m % TILE_ROW;
+    uint8_t *dst =
+      out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES + r * TILE_INNER;
+    for (uint32_t kt = 0; kt < n_ktiles; ++kt) {
+      memset(dst + (size_t)kt * ACT_TILE_BYTES, 0, TILE_INNER);
+    }
+    /** Same neutral params hvx_quant_rows_u8_params leaves on the padding
+       rows. It writes all m_pad entries up front and then overwrites the
+       valid ones; here only the padding range needs it, but a consumer that
+       walks all m_pad entries must not see stale values from a previous
+       call either way. */
+    if (derive_params) {
+      scale[m] = 1.0f;
+      zp[m] = 0;
+    }
+  }
 
   // Four rows at a time: TILE_ROW (64) is a multiple of 4, so a group of 4
   // consecutive rows never straddles a row-block boundary, and the group's
@@ -242,35 +305,17 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
   // the int16->uint8 stage (V79 HVX Programmer Reference Manual, "Pack").
   const uint32_t m_vec_end = (m_valid / 4u) * 4u;
   if (m_vec_end > 0) {
-    // Splitting the work below by k-tile means every k-tile's worker needs
-    // every row's vinv/vz -- computed here, once, instead of once per
-    // (k-tile, row) the way splitting by k-tile would otherwise force.
-    // HVX_UVector, not HVX_Vector: malloc gives no 128-byte alignment
-    // guarantee, and HVX_Vector's aligned load/store faults the moment it
-    // isn't (found on-device -- this crashed the DSP process the first
-    // time M was big enough to take this path).
-    HVX_UVector *vinv = (HVX_UVector *)malloc(sizeof(HVX_UVector) * m_vec_end);
-    HVX_UVector *vz = (HVX_UVector *)malloc(sizeof(HVX_UVector) * m_vec_end);
-    if (!vinv || !vz) {
-      free(vinv);
-      free(vz);
-      return AEE_ENOMEMORY;
-    }
-    for (uint32_t m = 0; m < m_vec_end; ++m) {
-      vinv[m] = hvx_splat_sf(1.0f / scale[m]);
-      vz[m] = Q6_V_vsplat_R(zp[m]);
-    }
-
-    quant_pack_ctx ctx = {x, m_vec_end, k, n_ktiles, vinv, vz, out_ah};
-    hvx_worker_pool_run(pool, quant_pack_worker, &ctx, n_ktiles);
-
-    free(vinv);
-    free(vz);
+    quant_pack_ctx ctx = {x,     m_vec_end, k,      n_ktiles,
+                          scale, zp,        out_ah, derive_params};
+    hvx_worker_pool_run(pool, quant_pack_worker, &ctx, m_vec_end / 4u);
   }
 
   // Tail: 0-3 rows that didn't fit a group of 4 (e.g. every row when
-  // m_valid == 1, the decode case). Unvectorized, same as before.
+  // m_valid == 1, the decode case). Unvectorized, on the calling thread.
   for (uint32_t m = m_vec_end; m < m_valid; ++m) {
+    if (derive_params) {
+      quant_row_params_one(x, m, k, scale, zp);
+    }
     const uint32_t rb = m / TILE_ROW;
     const uint32_t r = m % TILE_ROW;
     uint8_t *dst_tile0 =
@@ -280,4 +325,20 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
                           dst_tile0, ACT_TILE_BYTES);
   }
   return AEE_SUCCESS;
+}
+
+int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
+                         uint32_t k, const float *scale, const int32_t *zp,
+                         uint8_t *out_ah, hvx_worker_pool *pool) {
+  /** The cast drops const only to match the shared body's signature; with
+     derive_params 0 nothing below writes through either pointer. */
+  return quant_pack_common(x, m_valid, m_pad, k, (float *)scale, (int32_t *)zp,
+                           out_ah, pool, /*derive_params=*/0);
+}
+
+int hvx_quant_rows_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
+                              uint32_t k, float *scale, int32_t *zp,
+                              uint8_t *out_ah, hvx_worker_pool *pool) {
+  return quant_pack_common(x, m_valid, m_pad, k, scale, zp, out_ah, pool,
+                           /*derive_params=*/1);
 }
