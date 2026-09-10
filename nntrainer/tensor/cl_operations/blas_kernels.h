@@ -343,6 +343,30 @@ void addition_cl(const _FP16 *input, _FP16 *res, unsigned int size_input,
                  unsigned int size_res);
 
 /**
+ * @brief Multiply an FP16 activation by a scalar on the GPU.
+ *
+ * @details Each operand binds its own residency plane: a device sub-buffer
+ * when the planner placed the tensor there, the shared-plane pointer
+ * otherwise. Mixing them in one dispatch is valid. A device sub-buffer is
+ * bound whole, so the row window travels as @a row_off; a shared-plane pointer
+ * is pre-offset by the caller and @a row_off stays 0 there.
+ *
+ * @param[in] input source rows
+ * @param[out] result destination rows
+ * @param[in] scalar multiplier
+ * @param[in] n element count
+ * @param[in] use_svm both operands are device visible (shared-plane or
+ * device sub-buffer). A false has no bindable operand and the call is
+ * refused, since a host pointer is not a kernel argument.
+ * @param[in] out_clmem device sub-buffer backing @a result, or null
+ * @param[in] in_clmem device sub-buffer backing @a input, or null
+ * @param[in] row_off element offset applied by the kernel
+ */
+void scalar_mul_cl_fp16(const _FP16 *input, _FP16 *result, float scalar,
+                        unsigned int n, bool use_svm, void *out_clmem = nullptr,
+                        void *in_clmem = nullptr, unsigned int row_off = 0);
+
+/**
  * @brief     fp16 sscal value element by element immediately
  * @param[in] X _FP16 * input
  * @param[in] N unsigned int number of elements
