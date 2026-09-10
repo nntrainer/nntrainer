@@ -15,6 +15,8 @@
 
 #include <stdint.h>
 
+#include <hexagon_types.h>
+
 /**
  * @brief Turns HMX int32 accumulators back into f32 (K3).
  *
@@ -43,6 +45,26 @@ void hvx_dequant_i32_to_f32(const int32_t *acc, uint32_t m_valid,
                             int accumulate);
 
 /**
+ * @brief Splats one row block's act_scale/act_zp into vector form, once.
+ *
+ * hvx_dequant_acc_tile_to_f32 needs each row's scale and zero point as full
+ * vectors, and the same row block feeds every column tile of that block --
+ * 112 of them at the MoE's gate_up shape. Splatting inside the tile loop
+ * therefore redid identical work 112 times per row, which measured as
+ * roughly 40% of the tile dequant's operation count. Hoisting it here makes
+ * it once per row block.
+ *
+ * @param[in]  m_count   rows in this block, at most HEXKL_ACC_TILE_ROWS
+ * @param[in]  act_scale m_count entries, already offset to this row block
+ * @param[in]  act_zp    m_count entries, already offset to this row block
+ * @param[out] act_vs    m_count vectors; caller-owned, need not be aligned
+ * @param[out] act_vz    m_count vectors, act_zp converted to f32
+ */
+void hvx_dequant_prepare_rows(uint32_t m_count, const float *act_scale,
+                              const int32_t *act_zp, HVX_UVector *act_vs,
+                              HVX_UVector *act_vz);
+
+/**
  * @brief Same dequantization, applied to ONE 64x32 accumulator tile still
  *        sitting in VTCM.
  *
@@ -61,8 +83,9 @@ void hvx_dequant_i32_to_f32(const int32_t *acc, uint32_t m_valid,
  * @param[in]  row_stride int32 elements between tile rows (from the probe)
  * @param[in]  m_count    tile rows carrying real data; padded rows are
  *                        skipped, same rule as m_valid above
- * @param[in]  act_scale  m_count entries, already offset to this row block
- * @param[in]  act_zp     m_count entries, already offset to this row block
+ * @param[in]  act_vs     m_count splatted act_scale vectors, from
+ *                        hvx_dequant_prepare_rows -- NOT the raw floats
+ * @param[in]  act_vz     m_count splatted act_zp vectors, same source
  * @param[in]  colsum_w   32 entries, already offset to this column tile
  * @param[in]  w_scale    32 entries, already offset to this column tile
  * @param[in]  bias       32 entries, already offset to this column tile
@@ -73,10 +96,10 @@ void hvx_dequant_i32_to_f32(const int32_t *acc, uint32_t m_valid,
  *                        bitwise the staged add it replaces
  */
 void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
-                                 uint32_t m_count, const float *act_scale,
-                                 const int32_t *act_zp, const int32_t *colsum_w,
-                                 const float *w_scale, const float *bias,
-                                 float *out, uint32_t out_stride,
-                                 int accumulate);
+                                 uint32_t m_count, const HVX_UVector *act_vs,
+                                 const HVX_UVector *act_vz,
+                                 const int32_t *colsum_w, const float *w_scale,
+                                 const float *bias, float *out,
+                                 uint32_t out_stride, int accumulate);
 
 #endif /* __NNTRAINER_HVX_DEQUANT_I32_H__ */

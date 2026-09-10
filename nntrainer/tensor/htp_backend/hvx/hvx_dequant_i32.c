@@ -81,11 +81,20 @@ void hvx_dequant_i32_to_f32(const int32_t *acc, uint32_t m_valid,
  * intrinsics, same order, same operands. Only the scheduling changes, which
  * is why the bit-exact gates stay a valid check on this.
  */
+void hvx_dequant_prepare_rows(uint32_t m_count, const float *act_scale,
+                              const int32_t *act_zp, HVX_UVector *act_vs,
+                              HVX_UVector *act_vz) {
+  for (uint32_t m = 0; m < m_count; ++m) {
+    act_vs[m] = hvx_splat_sf(act_scale[m]);
+    act_vz[m] = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(act_zp[m]));
+  }
+}
+
 #define DQ_TILE_ROW(i)                                                         \
   const HVX_Vector af##i = Q6_Vsf_equals_Vw(                                   \
     ((const HVX_UVector *)(tile + (size_t)(m + (i)) * row_stride))[0]);        \
-  const HVX_Vector vs##i = hvx_splat_sf(act_scale[m + (i)]);                   \
-  const HVX_Vector vz##i = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(act_zp[m + (i)]));   \
+  const HVX_Vector vs##i = act_vs[m + (i)];                                    \
+  const HVX_Vector vz##i = act_vz[m + (i)];                                    \
   const HVX_Vector r##i = Q6_Vsf_vadd_VsfVsf(                                  \
     Q6_Vsf_vmpy_VsfVsf(                                                        \
       Q6_Vsf_vmpy_VsfVsf(                                                      \
@@ -101,11 +110,11 @@ void hvx_dequant_i32_to_f32(const int32_t *acc, uint32_t m_valid,
   } while (0)
 
 void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
-                                 uint32_t m_count, const float *act_scale,
-                                 const int32_t *act_zp, const int32_t *colsum_w,
-                                 const float *w_scale, const float *bias,
-                                 float *out, uint32_t out_stride,
-                                 int accumulate) {
+                                 uint32_t m_count, const HVX_UVector *act_vs,
+                                 const HVX_UVector *act_vz,
+                                 const int32_t *colsum_w, const float *w_scale,
+                                 const float *bias, float *out,
+                                 uint32_t out_stride, int accumulate) {
   /** One vector per tile row, so the loop above's n_vec/tail split collapses.
      If a future part changes the tile width this stops being true, and the
      build should stop with it rather than silently emit 32 of n columns. */
