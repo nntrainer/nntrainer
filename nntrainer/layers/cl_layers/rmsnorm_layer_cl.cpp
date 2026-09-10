@@ -75,6 +75,8 @@ bool RMSNormLayerCl::registerClKernels(ClContext &cl_context) {
 void RMSNormLayerCl::finalize(InitLayerContext &context) {
   std::vector<TensorDim> dim = context.getInputDimensions();
   context.setOutputDimensions(dim);
+  if (!std::get<props::SkipPrefill>(rmsnorm_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(rmsnorm_props).get();
   auto &rmsparams_gamma = std::get<props::GammaInitializer>(rmsnorm_props);
 
   TensorDim gamma_dim(
@@ -226,6 +228,14 @@ void RMSNormLayerCl::rmsnormProcess_fp16(Tensor const &input, Tensor &result,
 void RMSNormLayerCl::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             unsigned int from, unsigned int to,
                                             bool training) {
+  // A decoder block that shares its key/value cache with an earlier block has
+  // nothing to contribute during prefill (from == 0); the live token is
+  // recomputed at decode. This is the same contract skip_prefill already has
+  // on the CPU layers and on the CUDA RMSNorm layer, which registers under the
+  // same type string as this one -- without it here, a graph that carries the
+  // property cannot move to the OpenCL backend.
+  if (skip_prefill && from == 0)
+    return;
   Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
