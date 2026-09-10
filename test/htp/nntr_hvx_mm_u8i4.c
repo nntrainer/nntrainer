@@ -596,6 +596,7 @@ enum {
   MOE_T_ACC_READ,
   MOE_T_DRAIN,   /**< the cross-expert weight DMA waits */
   MOE_T_SCATTER, /**< routing multiply + accumulate into out_f32 */
+  MOE_T_STAGE,   /**< copying the FastRPC buffers to and from cached heap */
   MOE_T_ACC_STRIDE,
   MOE_N_STAGES
 };
@@ -718,7 +719,8 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
   stage_us[MOE_T_DEQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_DEQUANT];
   stage_us[MOE_T_ACC_READ] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_READ];
   stage_us[MOE_T_DRAIN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN];
-  stage_us[MOE_T_SCATTER] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
+  stage_us[MOE_T_SCATTER] = (uint32)hexkl_probe_us[HEXKL_PROBE_SCATTER];
+  stage_us[MOE_T_STAGE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_COPY];
   stage_us[MOE_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
   return rc;
 }

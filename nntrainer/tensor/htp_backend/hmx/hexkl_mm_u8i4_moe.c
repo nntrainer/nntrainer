@@ -196,6 +196,18 @@ int hexkl_mm_u8i4_moe_layer_run(
   float *scale = (float *)malloc(sizeof(float) * BR);
   int32_t *zp = (int32_t *)malloc(sizeof(int32_t) * BR);
   float *stage = (float *)malloc(sizeof(float) * (size_t)BR * K);
+  /* act_f32 and out_f32 are the host's FastRPC buffers, which are rpcmem
+     and therefore UNCACHED. The gather reads M*K*4 bytes of act four times
+     over at top-4 routing, and the scatter is a read-modify-write of
+     M*N_out*4 one float at a time -- both catastrophic against uncached
+     DDR, and measured so: 17.3 ms of gather+quant and 104.8 ms of scatter
+     against 3.6 and 2.8 for the path this replaces (doc 46 section 10).
+     Same axis Q1 broke on, doc 44 section 10.1.
+     So each is touched exactly once, sequentially: act is copied in at the
+     start and out is copied out at the end, and everything in between
+     works on cached heap. */
+  float *act_c = (float *)malloc(sizeof(float) * (size_t)M * K);
+  float *out_c = (float *)malloc(sizeof(float) * (size_t)M * N_out);
   uint32_t *order = (uint32_t *)malloc(sizeof(uint32_t) * n_experts);
   /* row_index is grouped by expert, so each active expert needs the offset
      its group starts at. Heap, not a stack array sized by
@@ -203,7 +215,8 @@ int hexkl_mm_u8i4_moe_layer_run(
      with how many experts this layer has. */
   uint32_t *base_of = (uint32_t *)malloc(sizeof(uint32_t) * n_experts);
   uint32_t n_active = 0u;
-  if (!scale || !zp || !stage || !order || !base_of) {
+  uint64_t p0 = 0;
+  if (!scale || !zp || !stage || !order || !base_of || !act_c || !out_c) {
     rc = AEE_ENOMEMORY;
     goto out;
   }
@@ -222,14 +235,17 @@ int hexkl_mm_u8i4_moe_layer_run(
       base += row_count[e];
     }
   }
-  memset(out_f32, 0, sizeof(float) * (size_t)M * N_out);
+  HEXKL_PROBE_T0(p0);
+  memcpy(act_c, act_f32, sizeof(float) * (size_t)M * K);
+  memset(out_c, 0, sizeof(float) * (size_t)M * N_out);
+  HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
   if (n_active == 0u) {
+    memcpy(out_f32, out_c, sizeof(float) * (size_t)M * N_out);
     rc = AEE_SUCCESS;
     goto out;
   }
 
   hexkl_dma_ring_reset();
-  uint64_t p0 = 0;
   moe_push_weight(vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[0]]], K);
 
   for (uint32_t i = 0; i < n_active; ++i) {
@@ -263,7 +279,7 @@ int hexkl_mm_u8i4_moe_layer_run(
          commit that has to prove equivalence. */
       HEXKL_PROBE_T0(p0);
       for (uint32_t r = 0; r < m_blk; ++r) {
-        memcpy(stage + (size_t)r * K, act_f32 + (size_t)rows[mb + r] * K,
+        memcpy(stage + (size_t)r * K, act_c + (size_t)rows[mb + r] * K,
                sizeof(float) * K);
       }
       hvx_quant_rows_u8_params(stage, m_blk, BR, K, scale, zp, pool);
@@ -382,16 +398,20 @@ int hexkl_mm_u8i4_moe_layer_run(
         const float *res = (const float *)(vtcm_base + L.res_f32_off);
         for (uint32_t r = 0; r < m_blk; ++r) {
           const float w = weights[mb + r];
-          float *dst = out_f32 + (size_t)rows[mb + r] * N_out;
+          float *dst = out_c + (size_t)rows[mb + r] * N_out;
           const float *src = res + (size_t)r * N_out;
           for (uint32_t c = 0; c < N_out; ++c) {
             dst[c] += src[c] * w;
           }
         }
       }
-      HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
+      HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);
     }
   }
+
+  HEXKL_PROBE_T0(p0);
+  memcpy(out_f32, out_c, sizeof(float) * (size_t)M * N_out);
+  HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
 
 out:
   free(scale);
@@ -399,5 +419,7 @@ out:
   free(stage);
   free(order);
   free(base_of);
+  free(act_c);
+  free(out_c);
   return rc;
 }
