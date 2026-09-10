@@ -436,7 +436,7 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
   // HTP losing to CPU at these shapes is a separate, structural finding --
   // the matmul is 21% of the call (the profile's own mm<= column now
   // measures it) and MoE prefill is DDR-bandwidth bound on expert weights.
-  constexpr bool kFusedSwigluEnabled = false;
+  constexpr bool kFusedSwigluEnabled = true;
   bool expert_ffn_done = false;
   if (kFusedSwigluEnabled && num_tokens > 1 &&
       gate_up_proj.getDataType() == nntrainer::Tdatatype::QS4CX &&
