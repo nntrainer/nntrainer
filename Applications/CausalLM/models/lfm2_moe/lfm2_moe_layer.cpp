@@ -33,6 +33,94 @@
 
 namespace causallm {
 
+namespace {
+
+/**
+ * @brief [P3] Where the MoE layer's ARM-side wall clock actually goes.
+ *
+ * NNTR_HTP_PROFILE accounts for everything inside a FastRPC call. M0
+ * measures the layer's wall clock. Doc 43 section 4.3 subtracted one from
+ * the other and got ~21 ms/layer that neither instrument sees, and the
+ * whole HTP-vs-CPU verdict turns on it (doc 44 section 5): if that time is
+ * HTP-specific, P1's batching removes it and HTP wins; if it is work the
+ * CPU path does too, P1 changes nothing and the MoE FFN alone cannot beat
+ * CPU.
+ *
+ * A residual cannot answer that, because most of what happens here --
+ * routing, top-k, the token gather, the scatter-add -- runs on BOTH paths.
+ * So this times the stages by name and prints them, and the same build
+ * prints the same stages under moe_engine=cpu. Subtracting the two runs
+ * cancels the shared work and leaves ffn_cpu against ffn_htp, which is the
+ * comparison that decides P1.
+ *
+ * `other` is the layer wall clock minus every named stage. It is printed
+ * rather than distributed, so a stage nobody thought to time shows up as a
+ * number instead of hiding inside one that was.
+ *
+ * ponytail: one file-scope accumulator, no locking. Layers run one at a
+ * time within a forward and each of these stages is entered from the
+ * serial outer thread (the parallel_for inside the gather is timed from
+ * its caller, not from the workers), so there is no race today. If layers
+ * are ever run concurrently this needs to become per-call state threaded
+ * through the two compute_expert_forward helpers -- which is why the
+ * timers below take a pointer to their slot rather than an index.
+ */
+struct M0Stages {
+  uint64_t setup = 0;   /**< reshape + output.setZero() */
+  uint64_t router = 0;  /**< input.dot(gate_weights) */
+  uint64_t topk = 0;    /**< buildExpertAssignments + max scan */
+  uint64_t wksp = 0;    /**< per-layer workspace Tensor construction */
+  uint64_t gather = 0;  /**< tokens -> contiguous per-expert input */
+  uint64_t ffn = 0;     /**< the expert FFN itself: HTP dispatch or two dots */
+  uint64_t route = 0;   /**< multiply by the routing weight */
+  uint64_t scatter = 0; /**< add_i back into the layer output */
+
+  void reset() { *this = M0Stages{}; }
+  uint64_t sum() const {
+    return setup + router + topk + wksp + gather + ffn + route + scatter;
+  }
+};
+
+M0Stages g_m0;
+bool g_m0_on = false;
+
+/** @brief Adds its lifetime to one M0Stages slot, and costs two predicted
+ *         branches when profiling is off. */
+class M0Timer {
+public:
+  explicit M0Timer(uint64_t *slot) : slot_(g_m0_on ? slot : nullptr) {
+    if (slot_) {
+      t0_ = std::chrono::steady_clock::now();
+    }
+  }
+  ~M0Timer() { stop(); }
+
+  /** @brief Ends the interval early and idempotently, for a stage that
+   *         finishes before its enclosing scope does. Without it the FFN
+   *         timer below would have to be given its own block, and the
+   *         re-indentation would bury a one-line instrument in a diff that
+   *         looks like a rewrite of the dispatch. */
+  void stop() {
+    if (!slot_) {
+      return;
+    }
+    *slot_ += static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0_)
+        .count());
+    slot_ = nullptr;
+  }
+
+  M0Timer(const M0Timer &) = delete;
+  M0Timer &operator=(const M0Timer &) = delete;
+
+private:
+  uint64_t *slot_;
+  std::chrono::steady_clock::time_point t0_;
+};
+
+} // namespace
+
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 /** LFM2-MoE router hyper-parameters (fixed for LFM2-8B-A1B). */
@@ -231,6 +319,8 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
    * registration (once, first forward) on top of dispatch. */
   const bool m0_profile = std::getenv("NNTR_M0_PROFILE") != nullptr;
   const auto m0_t0 = std::chrono::steady_clock::now();
+  g_m0_on = m0_profile;
+  g_m0.reset();
 
   nntrainer::Tensor &input = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output = context.getOutput(SINGLE_INOUT_IDX);
@@ -242,26 +332,35 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
   const unsigned hidden_size = input.width();
   const unsigned total_tokens = batch_size * seq_len;
 
-  // reshape input: [B,1,S,H] -> [B*S,1,1,H]
-  input.reshape({total_tokens, 1, 1, hidden_size});
+  {
+    M0Timer t(&g_m0.setup);
+    // reshape input: [B,1,S,H] -> [B*S,1,1,H]
+    input.reshape({total_tokens, 1, 1, hidden_size});
 
-  // reshape output: [B,1,S,H] -> [B*S,1,1,H]
-  output.reshape({total_tokens, 1, 1, hidden_size});
-  output.setZero();
+    // reshape output: [B,1,S,H] -> [B*S,1,1,H]
+    output.reshape({total_tokens, 1, 1, hidden_size});
+    output.setZero();
+  }
 
   // routing: raw logits -> sigmoid + expert-bias top-k selection
   nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
   nntrainer::Tensor &expert_bias = context.getWeight(expert_bias_idx);
-  input.dot(gate_weights, router_logits);
+  {
+    M0Timer t(&g_m0.router);
+    input.dot(gate_weights, router_logits);
+  }
 
   std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
     num_experts);
-  buildExpertAssignments(router_logits, expert_bias, total_tokens,
-                         expert_assignments);
-
   size_t max_assigned_tokens = 0;
-  for (const auto &assignments : expert_assignments)
-    max_assigned_tokens = std::max(max_assigned_tokens, assignments.size());
+  {
+    M0Timer t(&g_m0.topk);
+    buildExpertAssignments(router_logits, expert_bias, total_tokens,
+                           expert_assignments);
+
+    for (const auto &assignments : expert_assignments)
+      max_assigned_tokens = std::max(max_assigned_tokens, assignments.size());
+  }
 
   nntrainer::Tensor prefill_token_input;
   nntrainer::Tensor prefill_expert_output;
@@ -274,6 +373,7 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
     &context.getTensor(decode_activation_output_idx),
   };
   if (max_assigned_tokens > 1) {
+    M0Timer t(&g_m0.wksp);
     const unsigned int workspace_tokens =
       static_cast<unsigned int>(max_assigned_tokens);
     const unsigned int intermediate_size =
@@ -321,12 +421,23 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
   output.reshape({batch_size, 1, seq_len, hidden_size});
 
   if (m0_profile && total_tokens > 1) {
-    const auto m0_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                         std::chrono::steady_clock::now() - m0_t0)
-                         .count();
+    const auto m0_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - m0_t0)
+        .count());
+    // [P3] `other` is deliberately not folded into a neighbour: it is the
+    // part no named stage claims, and the point of this instrument is that
+    // such a part is visible rather than inferred.
+    const uint64_t named = g_m0.sum();
     std::cout << "[M0-PROF] moe_layer[" << g_m0_call_index.fetch_add(1)
-              << "] tokens=" << total_tokens << " us=" << m0_us << std::endl;
+              << "] tokens=" << total_tokens << " us=" << m0_us
+              << "  setup=" << g_m0.setup << " router=" << g_m0.router
+              << " topk=" << g_m0.topk << " wksp=" << g_m0.wksp
+              << " gather=" << g_m0.gather << " ffn=" << g_m0.ffn
+              << " route=" << g_m0.route << " scatter=" << g_m0.scatter
+              << " other=" << (m0_us > named ? m0_us - named : 0) << std::endl;
   }
+  g_m0_on = false;
 }
 
 inline void Lfm2MoELayer::compute_expert_forward(
@@ -346,6 +457,7 @@ inline void Lfm2MoELayer::compute_expert_forward(
                                      gate_up_proj, down_proj, hidden_size,
                                      workspace);
 
+  M0Timer t(&g_m0.scatter);
   nntrainer::TensorDim token_step_dim({1, 1, 1, hidden_size},
                                       output.getTensorType());
   for (size_t i = 0; i < token_assignments.size(); ++i) {
@@ -379,20 +491,25 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
                                       input.getTensorType());
 
   nntrainer::Tensor token_input;
-  if (num_tokens == 1) {
-    token_input = input.getSharedDataTensor(
-      token_input_dim, token_assignments[0].first * hidden_size, true);
-  } else {
-    token_input =
-      workspace.token_input->getSharedDataTensor(token_input_dim, 0, true);
-    auto &tm = nntrainer::ThreadManager::Global();
-    tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
-      nntrainer::Tensor source = input.getSharedDataTensor(
-        token_step_dim, token_assignments[i].first * hidden_size, true);
-      nntrainer::Tensor target =
-        token_input.getSharedDataTensor(token_step_dim, i * hidden_size, true);
-      target.copyData(source);
-    });
+  {
+    // Timed from the serial caller, so this is the gather's wall clock
+    // including the fork/join, not the sum of the workers' time.
+    M0Timer t(&g_m0.gather);
+    if (num_tokens == 1) {
+      token_input = input.getSharedDataTensor(
+        token_input_dim, token_assignments[0].first * hidden_size, true);
+    } else {
+      token_input =
+        workspace.token_input->getSharedDataTensor(token_input_dim, 0, true);
+      auto &tm = nntrainer::ThreadManager::Global();
+      tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
+        nntrainer::Tensor source = input.getSharedDataTensor(
+          token_step_dim, token_assignments[i].first * hidden_size, true);
+        nntrainer::Tensor target = token_input.getSharedDataTensor(
+          token_step_dim, i * hidden_size, true);
+        target.copyData(source);
+      });
+    }
   }
 
   nntrainer::Tensor gate_up_out =
@@ -438,6 +555,10 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
   // measures it) and MoE prefill is DDR-bandwidth bound on expert weights.
   constexpr bool kFusedSwigluEnabled = true;
   bool expert_ffn_done = false;
+  // [P3] One timer over the whole FFN, fused or two-dot, so the two engines
+  // are measured at the same boundary and the CPU-vs-HTP subtraction is
+  // between like and like.
+  M0Timer m0_ffn(&g_m0.ffn);
   if (kFusedSwigluEnabled && num_tokens > 1 &&
       gate_up_proj.getDataType() == nntrainer::Tdatatype::QS4CX &&
       down_proj.getDataType() == nntrainer::Tdatatype::QS4CX) {
@@ -478,11 +599,15 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
 
     acti_out.dot(down_proj, expert_output);
   }
+  m0_ffn.stop();
 
-  for (size_t i = 0; i < num_tokens; ++i) {
-    nntrainer::Tensor expert_token_output =
-      expert_output.getSharedDataTensor(token_step_dim, i * hidden_size, true);
-    expert_token_output.multiply_i(token_assignments[i].second);
+  {
+    M0Timer t(&g_m0.route);
+    for (size_t i = 0; i < num_tokens; ++i) {
+      nntrainer::Tensor expert_token_output = expert_output.getSharedDataTensor(
+        token_step_dim, i * hidden_size, true);
+      expert_token_output.multiply_i(token_assignments[i].second);
+    }
   }
 }
 
@@ -495,6 +620,8 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
    * case and stays silent under the same guard. */
   const bool m0_profile = std::getenv("NNTR_M0_PROFILE") != nullptr;
   const auto m0_t0 = std::chrono::steady_clock::now();
+  g_m0_on = m0_profile;
+  g_m0.reset();
 
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output_ = context.getOutput(SINGLE_INOUT_IDX);
@@ -528,24 +655,33 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     const unsigned hidden_size = input.width();
     const unsigned total_tokens = batch_size * seq_len;
 
-    // reshape input: [B,1,S,H] -> [B*S,1,1,H]
-    input.reshape({total_tokens, 1, 1, hidden_size});
+    {
+      M0Timer t(&g_m0.setup);
+      // reshape input: [B,1,S,H] -> [B*S,1,1,H]
+      input.reshape({total_tokens, 1, 1, hidden_size});
 
-    // reshape output: [B,1,S,H] -> [B*S,1,1,H]
-    output.reshape({total_tokens, 1, 1, hidden_size});
-    output.setZero();
+      // reshape output: [B,1,S,H] -> [B*S,1,1,H]
+      output.reshape({total_tokens, 1, 1, hidden_size});
+      output.setZero();
+    }
 
     // routing
-    input.dot(gate_weights, router_logits);
+    {
+      M0Timer t(&g_m0.router);
+      input.dot(gate_weights, router_logits);
+    }
 
     std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
       num_experts);
-    buildExpertAssignments(router_logits, expert_bias, total_tokens,
-                           expert_assignments);
-
     size_t max_assigned_tokens = 0;
-    for (const auto &assignments : expert_assignments)
-      max_assigned_tokens = std::max(max_assigned_tokens, assignments.size());
+    {
+      M0Timer t(&g_m0.topk);
+      buildExpertAssignments(router_logits, expert_bias, total_tokens,
+                             expert_assignments);
+
+      for (const auto &assignments : expert_assignments)
+        max_assigned_tokens = std::max(max_assigned_tokens, assignments.size());
+    }
 
     nntrainer::Tensor prefill_token_input;
     nntrainer::Tensor prefill_expert_output;
@@ -558,6 +694,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       &context.getTensor(decode_activation_output_idx),
     };
     if (max_assigned_tokens > 1) {
+      M0Timer t(&g_m0.wksp);
       const unsigned int workspace_tokens =
         static_cast<unsigned int>(max_assigned_tokens);
       const unsigned int intermediate_size =
@@ -617,13 +754,22 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     output.reshape({batch_size, 1, seq_len, hidden_size});
 
     if (m0_profile && total_tokens > 1) {
-      const auto m0_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           std::chrono::steady_clock::now() - m0_t0)
-                           .count();
+      const auto m0_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - m0_t0)
+          .count());
+      const uint64_t named = g_m0.sum();
       std::cout << "[M0-PROF] moe_layer[" << g_m0_call_index.fetch_add(1)
-                << "] tokens=" << total_tokens << " us=" << m0_us << std::endl;
+                << "] tokens=" << total_tokens << " us=" << m0_us
+                << "  setup=" << g_m0.setup << " router=" << g_m0.router
+                << " topk=" << g_m0.topk << " wksp=" << g_m0.wksp
+                << " gather=" << g_m0.gather << " ffn=" << g_m0.ffn
+                << " route=" << g_m0.route << " scatter=" << g_m0.scatter
+                << " other=" << (m0_us > named ? m0_us - named : 0)
+                << std::endl;
     }
   }
+  g_m0_on = false;
 }
 
 void Lfm2MoELayer::computeGroupedDecodeExperts(
