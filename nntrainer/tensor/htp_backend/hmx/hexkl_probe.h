@@ -36,6 +36,16 @@ enum {
   HEXKL_PROBE_ACC_COPY,     /**< hexkl_micro_hmx_copy_32b_to_submatrix */
   HEXKL_PROBE_DEQUANT,      /**< hvx_dequant_i32_to_f32 */
   HEXKL_PROBE_QUANT,        /**< hvx_quant_rows_u8_params + pack */
+  /** The MoE layer's three quantization-adjacent costs, split apart. One
+      bucket held all of them and read 5537us both before and after the
+      restructure that was supposed to cut it to ~1500 -- which is only
+      readable as "the saving landed somewhere else in the same bucket" if
+      the bucket is split. QUANT keeps the layer-wide activation quantize
+      (now once, not once per expert block), GATHER is the uint8 row pick
+      that replaced re-quantizing per block, REQUANT is the SwiGLU output's
+      per-block quantize, which the restructure never touched. */
+  HEXKL_PROBE_GATHER,
+  HEXKL_PROBE_REQUANT,
   HEXKL_PROBE_DRAIN,        /**< hexkl_dma_ring_drain */
   HEXKL_PROBE_SWIGLU,       /**< hvx_swiglu_inplace_f32 (fused layer only) */
   /** Routing multiply + accumulate into the layer output (MoE layer call

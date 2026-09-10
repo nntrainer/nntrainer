@@ -106,6 +106,35 @@ static void moe_scatter_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   }
 }
 
+/**
+ * @brief Copies through the DMA engine instead of the core.
+ *
+ * The two staging copies move 3.6 MB each between the host's uncached
+ * rpcmem buffers and cached heap, and doing that with memcpy costs about
+ * 3.6 ms of the scatter column -- a scalar core reading uncached DDR. The
+ * DMA engine is what this hardware has for bulk moves, and it is free at
+ * both points: the activation copy runs before the expert loop, when only
+ * expert 0's gate_up is in flight, and the output copy runs after the loop,
+ * when nothing is.
+ *
+ * Split into ring-sized pieces because a 2D descriptor's row count is
+ * bounded; row_size stays the largest power of two that divides the
+ * transfer, the same rule the weight pushes use.
+ */
+static void moe_dma_copy(void *dst, const void *src, size_t bytes, int src_vtcm,
+                         int dst_vtcm) {
+  const uint32_t CHUNK = 1u << 20;
+  size_t off = 0;
+  while (off < bytes) {
+    const uint32_t n = (bytes - off) > CHUNK ? CHUNK : (uint32_t)(bytes - off);
+    const uint32_t rs = moe_dma_row_size(n);
+    hexkl_dma_ring_push2d((uint8_t *)dst + off, (const uint8_t *)src + off, rs,
+                          rs, rs, n / rs, src_vtcm, dst_vtcm);
+    off += n;
+  }
+  hexkl_dma_ring_drain();
+}
+
 int hexkl_mm_u8i4_moe_layout(uint32_t K, uint32_t inter, uint32_t N_out,
                              uint32_t arena_bytes, hexkl_moe_layout *out) {
   if (!out || K == 0u || inter == 0u || N_out == 0u) {
@@ -275,7 +304,8 @@ int hexkl_mm_u8i4_moe_layer_run(
     }
   }
   HEXKL_PROBE_T0(p0);
-  memcpy(act_c, act_f32, sizeof(float) * (size_t)M * K);
+  hexkl_dma_ring_reset();
+  moe_dma_copy(act_c, act_f32, sizeof(float) * (size_t)M * K, 0, 0);
   memset(out_c, 0, sizeof(float) * (size_t)M * N_out);
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
 
@@ -290,12 +320,11 @@ int hexkl_mm_u8i4_moe_layer_run(
     goto out;
   }
   if (n_active == 0u) {
-    memcpy(out_f32, out_c, sizeof(float) * (size_t)M * N_out);
+    moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0);
     rc = AEE_SUCCESS;
     goto out;
   }
 
-  hexkl_dma_ring_reset();
   moe_push_weight(vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[0]]], K);
 
   for (uint32_t i = 0; i < n_active; ++i) {
@@ -334,7 +363,7 @@ int hexkl_mm_u8i4_moe_layer_run(
         scale[r] = scale_all[rows[mb + r]];
         zp[r] = zp_all[rows[mb + r]];
       }
-      HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
+      HEXKL_PROBE_ADD(HEXKL_PROBE_GATHER, p0);
 
       /* --- gate_up ------------------------------------------------- */
       for (uint32_t nt = 0; nt < gu_ntiles; ++nt) {
@@ -401,7 +430,7 @@ int hexkl_mm_u8i4_moe_layer_run(
       rc =
         hvx_quant_pack_u8_ah((const float *)(vtcm_base + L.gate_off), m_blk, BR,
                              inter, scale, zp, vtcm_base + L.mid_off, pool);
-      HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
+      HEXKL_PROBE_ADD(HEXKL_PROBE_REQUANT, p0);
       if (rc != AEE_SUCCESS) {
         goto out;
       }
@@ -452,7 +481,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   }
 
   HEXKL_PROBE_T0(p0);
-  memcpy(out_f32, out_c, sizeof(float) * (size_t)M * N_out);
+  moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0);
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
 
 out:
