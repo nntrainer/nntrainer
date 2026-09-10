@@ -1084,6 +1084,140 @@ TEST_F(HmxMmU8I4Layer, GateUpSwigluPlusU8InMatchesTwoCallReference) {
  * that shared call, not either kernel's own arithmetic, is what doc 43
  * section 7 identified as the common factor in two independent failures.
  */
+/**
+ * @brief [doc 46 V1] The batched MoE layer against the 64-call path it
+ *        replaces, bit for bit.
+ *
+ * Not SNR. The two paths run the same quantizer, the same swiglu_det and
+ * the same HMX kernel on the same bytes; only the call structure differs,
+ * so anything but identical output is a bug in the batching, and an SNR
+ * gate would hide exactly the class of one-level differences doc 44
+ * section 3 spent a week tracking down.
+ *
+ * The routing here is shaped like real routing rather than uniform: one
+ * expert spanning several 64-row blocks, one with no rows at all, one with
+ * exactly a block, and token rows repeating across experts the way top-k
+ * produces them. Those are the cases the kernel's expert compaction and
+ * its cross-expert weight prefetch actually turn on.
+ */
+TEST_F(HmxMmU8I4Layer, MoeLayerMatchesTwoCallReference) {
+  const uint32_t K = 2048, I = 1792, N = 2048, M = 200, NE = 4;
+
+  std::vector<Weight> gu(NE), dn(NE);
+  std::vector<uint32_t> h_gu(NE), h_dn(NE);
+  for (uint32_t e = 0; e < NE; ++e) {
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0xB0E00000u + e, gu[e]));
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xD0000000u + e, dn[e]));
+    h_gu[e] = gu[e].handle;
+    h_dn[e] = dn[e].handle;
+  }
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0007u);
+
+  // 70 spans two blocks, 0 exercises the compaction, 64 is the boundary.
+  const std::vector<uint32_t> row_count = {70u, 0u, 64u, 33u};
+  std::vector<uint32_t> row_index;
+  std::vector<float> row_weight;
+  {
+    uint32_t st = 0xC0FFEEu;
+    for (uint32_t e = 0; e < NE; ++e) {
+      for (uint32_t i = 0; i < row_count[e]; ++i) {
+        st = st * 1664525u + 1013904223u;
+        row_index.push_back((st >> 8) % M);
+        st = st * 1664525u + 1013904223u;
+        row_weight.push_back(0.1f + 0.9f * ((st >> 8) % 1000u) / 1000.0f);
+      }
+    }
+  }
+
+  // --- reference: the two calls per expert, and the routing multiply and
+  // scatter-add on the host, which is exactly what Lfm2MoELayer does today.
+  std::vector<float> want(static_cast<size_t>(M) * N, 0.0f);
+  {
+    uint32_t base = 0;
+    for (uint32_t e = 0; e < NE; ++e) {
+      const uint32_t n_e = row_count[e];
+      if (n_e == 0) {
+        continue;
+      }
+      std::vector<float> xe(static_cast<size_t>(n_e) * K);
+      for (uint32_t i = 0; i < n_e; ++i) {
+        std::memcpy(&xe[static_cast<size_t>(i) * K],
+                    &x[static_cast<size_t>(row_index[base + i]) * K],
+                    sizeof(float) * K);
+      }
+      const uint32_t m_pad = (n_e + 63) / 64 * 64;
+      std::vector<uint8_t> mid_ah(static_cast<size_t>(m_pad) * I, 0);
+      std::vector<float> mid_scale(m_pad, 1.0f);
+      std::vector<int32_t> mid_zp(m_pad, 0);
+      int err = nntr_hvx_mm_u8i4_gate_up_swiglu(
+        handle_, n_e, K, h_gu[e], xe.data(), static_cast<int>(xe.size()),
+        mid_ah.data(), static_cast<int>(mid_ah.size()), mid_scale.data(),
+        static_cast<int>(mid_scale.size()), mid_zp.data(),
+        static_cast<int>(mid_zp.size()));
+      ASSERT_EQ(err, AEE_SUCCESS) << "reference gate_up_swiglu: " << hex(err);
+
+      std::vector<float> ye(static_cast<size_t>(n_e) * N, 0.0f);
+      const uint32_t dh[1] = {h_dn[e]};
+      err = nntr_hvx_mm_u8i4_layer_u8in(
+        handle_, n_e, I, dh, 1, mid_ah.data(), static_cast<int>(mid_ah.size()),
+        mid_scale.data(), static_cast<int>(mid_scale.size()), mid_zp.data(),
+        static_cast<int>(mid_zp.size()), ye.data(),
+        static_cast<int>(ye.size()));
+      ASSERT_EQ(err, AEE_SUCCESS) << "reference layer_u8in: " << hex(err);
+
+      for (uint32_t i = 0; i < n_e; ++i) {
+        float *dst = &want[static_cast<size_t>(row_index[base + i]) * N];
+        const float *src = &ye[static_cast<size_t>(i) * N];
+        const float w = row_weight[base + i];
+        for (uint32_t c = 0; c < N; ++c) {
+          dst[c] += src[c] * w;
+        }
+      }
+      base += n_e;
+    }
+  }
+
+  // --- the batched call
+  std::vector<float> got(static_cast<size_t>(M) * N, 1.0f); // not pre-zeroed
+  int err = nntr_hvx_mm_u8i4_moe_layer(
+    handle_, M, K, I, N, h_gu.data(), static_cast<int>(h_gu.size()),
+    h_dn.data(), static_cast<int>(h_dn.size()), row_index.data(),
+    static_cast<int>(row_index.size()), row_count.data(),
+    static_cast<int>(row_count.size()), row_weight.data(),
+    static_cast<int>(row_weight.size()), x.data(), static_cast<int>(x.size()),
+    got.data(), static_cast<int>(got.size()));
+  ASSERT_EQ(err, AEE_SUCCESS) << "mm_u8i4_moe_layer failed: " << hex(err);
+
+  size_t bad = 0;
+  size_t first = got.size();
+  for (size_t i = 0; i < got.size(); ++i) {
+    if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) {
+      if (bad == 0) {
+        first = i;
+      }
+      ++bad;
+    }
+  }
+  std::cout << "U8I4_FIELD path=moe_layer field=bad_elems value=" << bad
+            << " of " << got.size() << std::endl;
+  if (bad != 0) {
+    std::cout << "  first at " << first << " (row " << first / N << " col "
+              << first % N << "): got " << std::hexfloat << got[first]
+              << " want " << want[first] << std::defaultfloat << std::endl;
+  }
+  EXPECT_EQ(bad, 0u)
+    << "the batched MoE layer differs from the 64-call path it replaces; "
+       "same quantizer, same SwiGLU, same HMX kernel, so this is the "
+       "batching";
+
+  for (uint32_t e = 0; e < NE; ++e) {
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h_gu[e]), AEE_SUCCESS);
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h_dn[e]), AEE_SUCCESS);
+  }
+}
+
 TEST_F(HmxMmU8I4Layer, SwigluSurvivesExtremeNegativeGate) {
   const uint32_t K = 2048, I = 1792, N = 2048;
 
