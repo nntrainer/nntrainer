@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -116,6 +117,173 @@ protected:
 
 class HvxExp : public HtpSession {};
 class HvxSoftmax : public HtpSession {};
+
+class HvxSwigluDet : public HtpSession {};
+
+namespace {
+
+/**
+ * @brief One f32 operation, forced to round on its own.
+ *
+ * The whole question this test asks is whether two machines round the same
+ * way, so the reference must not let the compiler contract a multiply and
+ * an add into one fused operation -- that rounds once where the DSP rounds
+ * twice, and the mismatch would be the compiler's, not the hardware's.
+ * Storing each intermediate through a volatile makes contraction
+ * impossible regardless of -ffp-contract.
+ */
+inline float dmul(float a, float b) {
+  volatile float r = a * b;
+  return r;
+}
+inline float dadd(float a, float b) {
+  volatile float r = a + b;
+  return r;
+}
+inline float dsub(float a, float b) {
+  volatile float r = a - b;
+  return r;
+}
+
+inline int32_t bits_of(float f) {
+  int32_t i;
+  std::memcpy(&i, &f, sizeof(i));
+  return i;
+}
+inline float float_of(int32_t i) {
+  float f;
+  std::memcpy(&f, &i, sizeof(f));
+  return f;
+}
+
+/** @brief hvx_swiglu_det.h's exp_det, operation for operation. */
+float exp_det_ref(float x) {
+  if (x > 85.0f) {
+    x = 85.0f;
+  }
+  if (x < -88.0f) {
+    x = -88.0f;
+  }
+  // std::nearbyint under the default rounding mode is round-to-nearest-even,
+  // which is what hvx_sf_to_w_rne does.
+  const int32_t k = static_cast<int32_t>(std::nearbyint(dmul(x, 1.44269504f)));
+  const float kl = static_cast<float>(k);
+
+  float r = dsub(x, dmul(kl, 0.693359375f));
+  r = dsub(r, dmul(kl, -2.12194440e-4f));
+
+  float p = 1.0f / 5040.0f;
+  p = dadd(dmul(p, r), 1.0f / 720.0f);
+  p = dadd(dmul(p, r), 1.0f / 120.0f);
+  p = dadd(dmul(p, r), 1.0f / 24.0f);
+  p = dadd(dmul(p, r), 1.0f / 6.0f);
+  p = dadd(dmul(p, r), 0.5f);
+  p = dadd(dmul(p, r), 1.0f);
+  p = dadd(dmul(p, r), 1.0f);
+
+  const int32_t pb = bits_of(p);
+  const int32_t p_exp = static_cast<int32_t>((static_cast<uint32_t>(pb) << 1) >>
+                                             24); // sign off, exponent down
+  if (k + p_exp <= 0) {
+    return 0.0f;
+  }
+  return float_of(pb + (k << 23));
+}
+
+/** @brief hvx_swiglu_det.h's recip_det, operation for operation. */
+float recip_det_ref(float d) {
+  float y = float_of(static_cast<int32_t>(0x7EF311C2u) - bits_of(d));
+  for (int it = 0; it < 3; ++it) {
+    y = dmul(y, dsub(2.0f, dmul(d, y)));
+  }
+  return y;
+}
+
+float swiglu_det_ref(float g, float u) {
+  const float e = exp_det_ref(dsub(0.0f, g));
+  const float s = recip_det_ref(dadd(1.0f, e));
+  return dmul(dmul(g, s), u);
+}
+
+} // namespace
+
+TEST_F(HvxSwigluDet, RejectsNonVectorLength) {
+  const int n = 33;
+  std::vector<float> g(n, 1.0f), u(n, 1.0f), o(n), e(n), r(n);
+  int err = nntr_hvx_swiglu_det_f32(handle_, g.data(), n, u.data(), n, o.data(),
+                                    n, e.data(), n, r.data(), n);
+  EXPECT_EQ(err, AEE_EBADPARM + kDspOffset)
+    << "expected EBADPARM, got " << hex(err);
+}
+
+/**
+ * @brief [A1] The gate the whole deterministic-SwiGLU approach rests on.
+ *
+ * Not an SNR test and not a tolerance test -- the output must be BIT
+ * IDENTICAL to a scalar reference running the same specification. That is
+ * the only property that drives the quantization flip count to zero (doc 44
+ * section 3.3), and a value that is merely close does not have it.
+ *
+ * A failure here is informative rather than fatal: the per-stage counts say
+ * whether HVX's Vsf multiply and add round differently from ARM's f32 ones
+ * (exp and recip both off), or whether only the tail does. If exp_det
+ * mismatches, hvx_exp_f32.h's remark that chained Vsf loses precision meant
+ * Vsf is not IEEE-correctly-rounded, and bit identity is not reachable on
+ * this hardware -- which is worth knowing before anything is built on it.
+ */
+TEST_F(HvxSwigluDet, MatchesScalarBitExact) {
+  // A spread that covers what a real SwiGLU sees plus both clamps: the
+  // saturating tails, the sign change, and the dense band around zero
+  // where sigmoid actually varies.
+  const int n = 8192;
+  std::vector<float> g(n), u(n), o(n, 0.0f), e(n, 0.0f), r(n, 0.0f);
+  std::mt19937 rng(0xA1A1A1A1u);
+  std::uniform_real_distribution<float> small(-8.0f, 8.0f);
+  for (int i = 0; i < n; ++i) {
+    if (i < 64) {
+      g[i] = -200.0f + 3.0f * static_cast<float>(i); // through both clamps
+    } else if (i < 128) {
+      g[i] = 100.0f - 3.0f * static_cast<float>(i - 64);
+    } else {
+      g[i] = small(rng);
+    }
+    u[i] = small(rng);
+  }
+
+  int err = nntr_hvx_swiglu_det_f32(handle_, g.data(), n, u.data(), n, o.data(),
+                                    n, e.data(), n, r.data(), n);
+  ASSERT_EQ(err, AEE_SUCCESS) << "swiglu_det_f32 failed: " << hex(err);
+
+  int bad_exp = 0, bad_recip = 0, bad_out = 0;
+  int first_bad = -1;
+  for (int i = 0; i < n; ++i) {
+    const float ref_e = exp_det_ref(dsub(0.0f, g[i]));
+    const float ref_r = recip_det_ref(dadd(1.0f, ref_e));
+    const float ref_o = swiglu_det_ref(g[i], u[i]);
+    const bool de = bits_of(e[i]) != bits_of(ref_e);
+    const bool dr = bits_of(r[i]) != bits_of(ref_r);
+    const bool dobad = bits_of(o[i]) != bits_of(ref_o);
+    bad_exp += de ? 1 : 0;
+    bad_recip += dr ? 1 : 0;
+    bad_out += dobad ? 1 : 0;
+    if (first_bad < 0 && (de || dr || dobad)) {
+      first_bad = i;
+      std::cout << "SWIGLU_DET first mismatch i=" << i << " g=" << g[i]
+                << " u=" << u[i] << "\n  exp   dsp=" << std::hexfloat << e[i]
+                << " ref=" << ref_e << "\n  recip dsp=" << r[i]
+                << " ref=" << ref_r << "\n  out   dsp=" << o[i]
+                << " ref=" << ref_o << std::defaultfloat << std::endl;
+    }
+  }
+  std::cout << "SWIGLU_DET_FIELD bad_exp=" << bad_exp
+            << " bad_recip=" << bad_recip << " bad_out=" << bad_out << " of "
+            << n << std::endl;
+
+  EXPECT_EQ(bad_exp, 0) << "hvx_exp_det_sf differs from the scalar spec -- "
+                           "HVX Vsf does not round like ARM f32";
+  EXPECT_EQ(bad_recip, 0) << "hvx_recip_det_sf differs from the scalar spec";
+  EXPECT_EQ(bad_out, 0) << "hvx_swiglu_det_sf differs from the scalar spec";
+}
 
 TEST_F(HvxExp, RejectsNonVectorLength) {
   const int n = 33;

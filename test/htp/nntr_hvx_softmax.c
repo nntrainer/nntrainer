@@ -24,6 +24,7 @@
 #include "hvx_exp_f32.h"
 #include "hvx_softmax_blocked_f32.h"
 #include "hvx_softmax_f32.h"
+#include "hvx_swiglu_det.h"
 
 /** @brief HVX vector width in bytes (128B mode). */
 #define VLEN 128u
@@ -59,6 +60,49 @@ int nntr_hvx_exp_f32(remote_handle64 handle, const float *x, int xLen, float *y,
   const int nvec = xLen / (int)LANES;
   for (int i = 0; i < nvec; ++i) {
     vy[i] = hvx_exp_sf(vx[i]);
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_swiglu_det_f32(remote_handle64 handle, const float *gate,
+                            int gateLen, const float *up, int upLen, float *out,
+                            int outLen, float *exp_out, int expLen,
+                            float *recip_out, int recipLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  if (gateLen != upLen || gateLen != outLen || gateLen != expLen ||
+      gateLen != recipLen) {
+    FARF(ERROR, "swiglu_det_f32: length mismatch (%d %d %d %d %d)", gateLen,
+         upLen, outLen, expLen, recipLen);
+    return AEE_EBADPARM;
+  }
+  if (gateLen <= 0 || (unsigned)gateLen % LANES != 0u) {
+    FARF(ERROR, "swiglu_det_f32: len not a multiple of %u (len=%d)",
+         (unsigned)LANES, gateLen);
+    return AEE_EBADPARM;
+  }
+
+  // FastRPC buffers carry no vector alignment guarantee, so the unaligned
+  // vector type is what keeps this from faulting.
+  const HVX_UVector *vg = (const HVX_UVector *)gate;
+  const HVX_UVector *vu = (const HVX_UVector *)up;
+  HVX_UVector *vo = (HVX_UVector *)out;
+  HVX_UVector *ve = (HVX_UVector *)exp_out;
+  HVX_UVector *vr = (HVX_UVector *)recip_out;
+
+  const int nvec = gateLen / (int)LANES;
+  for (int i = 0; i < nvec; ++i) {
+    // Recomputed rather than threaded out of hvx_swiglu_det_sf: the point
+    // of this entry is to report exactly what that function computes, and
+    // a variant of it that returns its own intermediates would be a second
+    // implementation to keep in step with the first.
+    const HVX_Vector g = vg[i];
+    const HVX_Vector e = hvx_exp_det_sf(Q6_Vsf_vsub_VsfVsf(Q6_V_vzero(), g));
+    ve[i] = e;
+    vr[i] = hvx_recip_det_sf(Q6_Vsf_vadd_VsfVsf(hvx_splat_sf(1.0f), e));
+    vo[i] = hvx_swiglu_det_sf(g, vu[i]);
   }
   return AEE_SUCCESS;
 }
