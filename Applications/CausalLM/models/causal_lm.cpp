@@ -647,8 +647,21 @@ Tensor CausalLM::buildLmHeadOutput(Tensor h, bool add_skip_prefill) {
   // layer property alone makes fc_layer early-return during prefill, but run()
   // only routes around that when the model-level flag is set too -- tagging the
   // layer without the flag silently yields garbage prefill logits.
-  if (add_skip_prefill)
+  if (add_skip_prefill) {
     lmhead_prop.emplace_back(withKey("skip_prefill", "true"));
+    // A skip-prefill head computes one position per step, so every row of its
+    // output above the first is allocated and never written. At a
+    // vocabulary-sized unit that dead plane is hundreds of megabytes
+    // (gemma4: 1024 x 262144 fp16 = 512 MB), and it is not merely wasted
+    // space: the caller reads the whole output through getDim(), so the
+    // per-step fp16->fp32 logits copy in NeuralNetwork::incremental_inference
+    // walks 268M elements instead of 262144 -- measured 53 ms per decoded
+    // token and 355 ms of prefill on the Intel Xe3 gemma4 1K cell. The FC
+    // layers honour this by planning the output at height 1
+    // (props::PlanLastRowOnly, fc_layer.cpp / fc_layer_cl.cpp); without the
+    // declaration the property is inert and the plane comes back.
+    lmhead_prop.emplace_back(withKey("plan_last_row_only", "true"));
+  }
   if (TIE_WORD_EMBEDDINGS && !lmhead_untied)
     lmhead_prop.emplace_back(withKey("shared_from", "embedding0"));
   LayerHandle lmhead(createLayer(lmhead_type, lmhead_prop));
