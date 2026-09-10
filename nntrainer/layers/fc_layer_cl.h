@@ -135,9 +135,11 @@ public:
 private:
   bool skip_prefill =
     false; /**< skip compute during prefill (Gemma4 KV-share) */
-  std::tuple<props::Unit, props::FusedActivation>
+  std::tuple<props::Unit, props::FusedActivation, props::PlanLastRowOnly>
     fc_props; /**< fc layer properties : unit - number of output neurons;
-                   fused_activation - inline activation epilogue */
+                   fused_activation - inline activation epilogue;
+                   plan_last_row_only - plan the output at height 1 because
+                   only the last row is ever produced */
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
 };
 } // namespace nntrainer

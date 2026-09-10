@@ -120,7 +120,7 @@ void Exporter::saveTflResult(
 template <>
 void Exporter::saveTflResult(
   const std::tuple<props::Unit, props::LoraRank, props::LoraAlpha,
-                   props::FusedActivation> &props,
+                   props::FusedActivation, props::PlanLastRowOnly> &props,
   const FullyConnectedLayer *self) {
   // A fused activation epilogue has no tflite FullyConnectedOptions
   // representation here, so refuse rather than export a node that silently
@@ -130,6 +130,13 @@ void Exporter::saveTflResult(
                   fused_act.get() != ActivationType::ACT_NONE,
                 nntrainer::exception::not_supported)
     << "fully_connected with a fused activation cannot be converted to tfnode";
+  // Likewise for a head planned at a single row: the exported node would carry
+  // the full-height output shape and describe a layer that does not exist.
+  auto &plan_last_row_only = std::get<props::PlanLastRowOnly>(props);
+  NNTR_THROW_IF(!plan_last_row_only.empty() && plan_last_row_only.get(),
+                nntrainer::exception::not_supported)
+    << "fully_connected planned for the last row only cannot be converted to "
+       "tfnode";
   createIfNull(tf_node);
   tf_node->setOpType(tflite::BuiltinOperator_FULLY_CONNECTED);
   auto options = tflite::CreateFullyConnectedOptions(*fbb).Union();

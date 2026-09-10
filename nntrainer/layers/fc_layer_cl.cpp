@@ -29,7 +29,8 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 enum FCParams { weight, bias };
 
 FullyConnectedLayerCl::FullyConnectedLayerCl() :
-  LayerImpl(), fc_props(props::Unit(), props::FusedActivation()) {
+  LayerImpl(),
+  fc_props(props::Unit(), props::FusedActivation(), props::PlanLastRowOnly()) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -62,6 +63,18 @@ void FullyConnectedLayerCl::finalize(InitLayerContext &context) {
   auto const &in_dim = context.getInputDimensions()[0];
   output_dims[0] = in_dim;
   is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
+
+  // The model can declare that only the last row of this output is ever
+  // produced. A head that skips prefill computes one decode position per step,
+  // so planning its output at the graph-build height allocates a plane whose
+  // rows above the first are never written -- at a vocabulary-sized unit that
+  // is hundreds of megabytes of dead activation, which costs bandwidth in
+  // every decode kernel and leaves the next layer reading rows nothing wrote.
+  // Plan it at height 1 instead; the incremental path already clamps its step
+  // view to a tensor that has a single row.
+  auto &plan_last_row_only = std::get<props::PlanLastRowOnly>(fc_props);
+  if (skip_prefill && !plan_last_row_only.empty() && plan_last_row_only.get())
+    output_dims[0].height(1);
 
   output_dims[0].setTensorType(
     {context.getFormat(), context.getActivationDataType()});

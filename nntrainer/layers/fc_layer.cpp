@@ -43,7 +43,7 @@ FullyConnectedLayer::FullyConnectedLayer() :
   LayerImpl(),
   lora_scaling(1.0f),
   fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha(),
-           props::FusedActivation()),
+           props::FusedActivation(), props::PlanLastRowOnly()),
   quantizer(nullptr) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   lora_idx.fill(std::numeric_limits<unsigned>::max());
@@ -86,6 +86,16 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
   auto const &in_dim = context.getInputDimensions()[0];
   output_dims[0] = in_dim;
   is_nchw ? output_dims[0].width(unit) : output_dims[0].channel(unit);
+
+  // Same planning contract the neutral FC states, so the property reads the
+  // same whichever engine resolves "fully_connected": a head the model has
+  // declared to produce only its last row is planned at height 1 instead of
+  // the graph-build height, whose rows above the first are allocated and never
+  // written. Read with skip_prefill, which is what makes the rest of the plane
+  // dead in the first place.
+  auto &plan_last_row_only = std::get<props::PlanLastRowOnly>(fc_props);
+  if (skip_prefill && !plan_last_row_only.empty() && plan_last_row_only.get())
+    output_dims[0].height(1);
 
   output_dims[0].setTensorType(
     {context.getFormat(), context.getActivationDataType()});
