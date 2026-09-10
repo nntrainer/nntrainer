@@ -271,11 +271,6 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     acc_layout->usable
       ? NULL
       : (int32_t *)malloc(sizeof(int32_t) * (size_t)m_pad * n_max);
-  /** One row block's act_scale/act_zp in vector form. Every column tile of
-     a row block reuses them, so they are splatted once per block here
-     instead of once per tile inside hvx_dequant_acc_tile_to_f32. */
-  HVX_UVector *dq_rows =
-    (HVX_UVector *)malloc(sizeof(HVX_UVector) * 2u * HEXKL_ACC_TILE_ROWS);
   if (o->act_scale == NULL) {
     loc_scale = (float *)malloc(sizeof(float) * m_pad);
     loc_zp = (int32_t *)malloc(sizeof(int32_t) * m_pad);
@@ -285,7 +280,6 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     free(loc_scale);
     free(loc_zp);
     free(acc_scratch);
-    free(dq_rows);
     return AEE_ENOMEMORY;
   }
   uint64_t p0 = 0;
@@ -298,7 +292,8 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
      the DMA engine needs no HVX, so the two overlap for free; the drain
      that used to sit right after this push had nothing in front of it to
      hide behind. Nothing else in the loop can cover it either when
-     n_handles is 1, which is every MoE expert call. */
+     n_handles is 1, which is every MoE expert call.
+     Measured on device 2026-09-10: gate_up's drain 111.9 -> 22.8 us/call. */
   {
     const hexkl_weight_u8i4 *h0 = &tbl->slots[handles[0]];
     const uint32_t nt0 = h0->N / HEXKL_HMX_INT8_BLOCK_N_COL;
@@ -326,21 +321,19 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   } else {
     HEXKL_PROBE_T0(p0);
     if (act_scale == NULL) {
-      rc0 = hvx_quant_rows_pack_u8_ah(act_f32, M, m_pad, K, loc_scale, loc_zp,
-                                      vtcm_base + act_off, o->pool);
+      hvx_quant_rows_u8_params(act_f32, M, m_pad, K, loc_scale, loc_zp,
+                               o->pool);
       act_scale = loc_scale;
       act_zp = loc_zp;
-    } else {
-      rc0 = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
-                                 vtcm_base + act_off, o->pool);
     }
+    rc0 = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
+                               vtcm_base + act_off, o->pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
   }
   if (rc0 != AEE_SUCCESS) {
     free(loc_scale);
     free(loc_zp);
     free(acc_scratch);
-    free(dq_rows);
     return rc0;
   }
 
@@ -375,21 +368,6 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     }
 
     for (uint32_t rb = 0; rb < n_rblocks; ++rb) {
-      /** Rows beyond M are the accumulator's padding: their quantization
-         parameters are synthetic, so emitting them would be wrong, not
-         merely wasted -- the same rule hvx_dequant_i32_to_f32 applies via
-         m_valid. At decode that is 62 of 64 rows never touched at all.
-         Hoisted out of the nt loop with the splats, since neither depends
-         on the column tile. */
-      const uint32_t m0 = rb * HEXKL_ACC_TILE_ROWS;
-      const uint32_t cnt =
-        (m0 >= M)
-          ? 0u
-          : ((M - m0 < HEXKL_ACC_TILE_ROWS) ? (M - m0) : HEXKL_ACC_TILE_ROWS);
-      if (acc_layout->usable && cnt != 0u) {
-        hvx_dequant_prepare_rows(cnt, act_scale + m0, act_zp + m0, dq_rows,
-                                 dq_rows + HEXKL_ACC_TILE_ROWS);
-      }
       for (uint32_t nt = 0; nt < nt_n; ++nt) {
         hexkl_micro_hmx_acc_clear_int32();
         for (uint32_t kt = 0; kt < k_tiles; ++kt) {
@@ -409,17 +387,25 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
           goto out;
         }
         if (acc_layout->usable) {
-          /** Dequantize the tile where it already is. */
+          /** Dequantize the tile where it already is. The rows beyond M are
+           * the accumulator's padding: their quantization parameters are
+           * synthetic, so emitting them would be wrong, not merely wasted --
+           * the same rule hvx_dequant_i32_to_f32 applies via m_valid. At
+           * decode that is 62 of 64 rows never touched at all. */
+          const uint32_t m0 = rb * HEXKL_ACC_TILE_ROWS;
+          const uint32_t cnt =
+            (m0 >= M) ? 0u
+                      : ((M - m0 < HEXKL_ACC_TILE_ROWS) ? (M - m0)
+                                                        : HEXKL_ACC_TILE_ROWS);
           if (cnt != 0u) {
             const int32_t *tile =
               (const int32_t *)(vtcm_base + result_off) + acc_layout->base;
             const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
             HEXKL_PROBE_T0(p0);
             hvx_dequant_acc_tile_to_f32(
-              tile, acc_layout->row_stride, cnt, dq_rows,
-              dq_rows + HEXKL_ACC_TILE_ROWS, h->colsum_w + c0, h->w_scale + c0,
-              h->bias + c0, out_cat + out_off + (size_t)m0 * h->N + c0, h->N,
-              o->accumulate);
+              tile, acc_layout->row_stride, cnt, act_scale + m0, act_zp + m0,
+              h->colsum_w + c0, h->w_scale + c0, h->bias + c0,
+              out_cat + out_off + (size_t)m0 * h->N + c0, h->N, o->accumulate);
             HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
           }
         } else {
@@ -459,7 +445,6 @@ out:
   free(loc_scale);
   free(loc_zp);
   free(acc_scratch);
-  free(dq_rows);
   return rc;
 }
 
@@ -554,18 +539,11 @@ int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   int32_t *zp1 = (int32_t *)malloc(sizeof(int32_t) * m_pad);
   float *scale2 = (float *)malloc(sizeof(float) * m_pad);
   int32_t *zp2 = (int32_t *)malloc(sizeof(int32_t) * m_pad);
-  /** See layer_run's copy: one row block's splatted act params, reused by
-     every column tile of that block. Both stages share the buffer -- it is
-     refilled from scale2/zp2 once stage 1's dequants are done with
-     scale1/zp1. */
-  HVX_UVector *dq_rows =
-    (HVX_UVector *)malloc(sizeof(HVX_UVector) * 2u * HEXKL_ACC_TILE_ROWS);
   if (!scale1 || !zp1 || !scale2 || !zp2) {
     free(scale1);
     free(zp1);
     free(scale2);
     free(zp2);
-    free(dq_rows);
     return AEE_ENOMEMORY;
   }
 
@@ -602,16 +580,14 @@ int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
 
     // Stage 1: K1 on this block's activation, straight into AH tiles.
     HEXKL_PROBE_T0(p0);
-    rc =
-      hvx_quant_rows_pack_u8_ah(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, K,
-                                scale1, zp1, vtcm_base + act1_off, o->pool);
+    hvx_quant_rows_u8_params(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, K,
+                             scale1, zp1, o->pool);
+    rc = hvx_quant_pack_u8_ah(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, K,
+                              scale1, zp1, vtcm_base + act1_off, o->pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
     if (rc != AEE_SUCCESS) {
       goto out;
     }
-
-    hvx_dequant_prepare_rows(m_blk, scale1, zp1, dq_rows,
-                             dq_rows + HEXKL_ACC_TILE_ROWS);
 
     // Stage 2a: gate_up matmul. Each 64x32 result tile dequantizes straight
     // into the gate or the up region -- gate occupies gate_up's output
@@ -641,9 +617,8 @@ int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
         (float *)(vtcm_base + (c0 < inter ? inter_gate_off : inter_up_off)) +
         (c0 < inter ? c0 : c0 - inter);
       HEXKL_PROBE_T0(p0);
-      hvx_dequant_acc_tile_to_f32(tile, acc_layout->row_stride, m_blk, dq_rows,
-                                  dq_rows + HEXKL_ACC_TILE_ROWS,
-                                  h_gu->colsum_w + c0, h_gu->w_scale + c0,
+      hvx_dequant_acc_tile_to_f32(tile, acc_layout->row_stride, m_blk, scale1,
+                                  zp1, h_gu->colsum_w + c0, h_gu->w_scale + c0,
                                   h_gu->bias + c0, dst, inter,
                                   /*accumulate=*/0);
       HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
@@ -665,16 +640,16 @@ int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     HEXKL_PROBE_ADD(HEXKL_PROBE_SWIGLU, p0);
 
     HEXKL_PROBE_T0(p0);
-    rc = hvx_quant_rows_pack_u8_ah((const float *)(vtcm_base + inter_gate_off),
-                                   m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, inter,
-                                   scale2, zp2, vtcm_base + act2_off, o->pool);
+    hvx_quant_rows_u8_params((const float *)(vtcm_base + inter_gate_off), m_blk,
+                             HEXKL_HMX_INT8_BLOCK_N_ROW, inter, scale2, zp2,
+                             o->pool);
+    rc = hvx_quant_pack_u8_ah((const float *)(vtcm_base + inter_gate_off),
+                              m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, inter, scale2,
+                              zp2, vtcm_base + act2_off, o->pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
     if (rc != AEE_SUCCESS) {
       goto out;
     }
-
-    hvx_dequant_prepare_rows(m_blk, scale2, zp2, dq_rows,
-                             dq_rows + HEXKL_ACC_TILE_ROWS);
 
     // Stage 3: down matmul, dequant straight to the caller's out rows.
     for (uint32_t nt = 0; nt < n2_tiles; ++nt) {
@@ -700,9 +675,9 @@ int hexkl_mm_u8i4_fused_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
       const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
       HEXKL_PROBE_T0(p0);
       hvx_dequant_acc_tile_to_f32(
-        tile, acc_layout->row_stride, m_blk, dq_rows,
-        dq_rows + HEXKL_ACC_TILE_ROWS, h_dn->colsum_w + c0, h_dn->w_scale + c0,
-        h_dn->bias + c0, out + (size_t)mb * n_out + c0, n_out, o->accumulate);
+        tile, acc_layout->row_stride, m_blk, scale2, zp2, h_dn->colsum_w + c0,
+        h_dn->w_scale + c0, h_dn->bias + c0, out + (size_t)mb * n_out + c0,
+        n_out, o->accumulate);
       HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
     }
   }
@@ -712,7 +687,6 @@ out:
   free(zp1);
   free(scale2);
   free(zp2);
-  free(dq_rows);
   return rc;
 }
 
@@ -818,12 +792,9 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
   float *scale1 = (float *)malloc(sizeof(float) * HEXKL_HMX_INT8_BLOCK_N_ROW);
   int32_t *zp1 =
     (int32_t *)malloc(sizeof(int32_t) * HEXKL_HMX_INT8_BLOCK_N_ROW);
-  HVX_UVector *dq_rows =
-    (HVX_UVector *)malloc(sizeof(HVX_UVector) * 2u * HEXKL_ACC_TILE_ROWS);
-  if (!scale1 || !zp1 || !dq_rows) {
+  if (!scale1 || !zp1) {
     free(scale1);
     free(zp1);
-    free(dq_rows);
     return AEE_ENOMEMORY;
   }
 
@@ -849,8 +820,10 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
     const float *act_blk = act_f32 + (size_t)mb * K;
 
     HEXKL_PROBE_T0(p0);
-    rc = hvx_quant_rows_pack_u8_ah(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW,
-                                   K, scale1, zp1, vtcm_base + act_off, pool);
+    hvx_quant_rows_u8_params(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, K,
+                             scale1, zp1, pool);
+    rc = hvx_quant_pack_u8_ah(act_blk, m_blk, HEXKL_HMX_INT8_BLOCK_N_ROW, K,
+                              scale1, zp1, vtcm_base + act_off, pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
     if (rc != AEE_SUCCESS) {
       goto out;
@@ -866,9 +839,6 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
       hexkl_dma_ring_drain();
       HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
     }
-
-    hvx_dequant_prepare_rows(m_blk, scale1, zp1, dq_rows,
-                             dq_rows + HEXKL_ACC_TILE_ROWS);
 
     for (uint32_t nt = 0; nt < n1_tiles; ++nt) {
       hexkl_micro_hmx_acc_clear_int32();
@@ -897,9 +867,8 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
       float *dst = (float *)(vtcm_base + (c0 < inter ? gate_off : up_off)) +
                    (c0 < inter ? c0 : c0 - inter);
       HEXKL_PROBE_T0(p0);
-      hvx_dequant_acc_tile_to_f32(tile, acc_layout->row_stride, m_blk, dq_rows,
-                                  dq_rows + HEXKL_ACC_TILE_ROWS,
-                                  h_gu->colsum_w + c0, h_gu->w_scale + c0,
+      hvx_dequant_acc_tile_to_f32(tile, acc_layout->row_stride, m_blk, scale1,
+                                  zp1, h_gu->colsum_w + c0, h_gu->w_scale + c0,
                                   h_gu->bias + c0, dst, inter,
                                   /*accumulate=*/0);
       HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
@@ -921,17 +890,18 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
     // AH tiling's row-block byte stride is fixed (inter_ktiles*2048)
     // regardless of how many blocks the caller happens to split M into.
     HEXKL_PROBE_T0(p0);
-    uint8_t *out_ah_blk =
-      out_ah + (size_t)(mb / HEXKL_HMX_INT8_BLOCK_N_ROW) * inter_ktiles * 2048u;
-    rc = hvx_quant_rows_pack_u8_ah((const float *)(vtcm_base + gate_off), m_blk,
-                                   HEXKL_HMX_INT8_BLOCK_N_ROW, inter, scale1,
-                                   zp1, out_ah_blk, pool);
-    // Copied out after the fused call, not between a params and a pack:
-    // the worker that packs a row is the one that derived its scale/zp.
+    hvx_quant_rows_u8_params((const float *)(vtcm_base + gate_off), m_blk,
+                             HEXKL_HMX_INT8_BLOCK_N_ROW, inter, scale1, zp1,
+                             pool);
     for (uint32_t r = 0; r < m_blk; ++r) {
       out_scale[mb + r] = scale1[r];
       out_zp[mb + r] = zp1[r];
     }
+    uint8_t *out_ah_blk =
+      out_ah + (size_t)(mb / HEXKL_HMX_INT8_BLOCK_N_ROW) * inter_ktiles * 2048u;
+    rc = hvx_quant_pack_u8_ah((const float *)(vtcm_base + gate_off), m_blk,
+                              HEXKL_HMX_INT8_BLOCK_N_ROW, inter, scale1, zp1,
+                              out_ah_blk, pool);
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
     if (rc != AEE_SUCCESS) {
       goto out;
@@ -941,6 +911,5 @@ int hexkl_mm_u8i4_gate_up_swiglu_run(hexkl_weight_u8i4_table *tbl,
 out:
   free(scale1);
   free(zp1);
-  free(dq_rows);
   return rc;
 }
