@@ -144,10 +144,17 @@ static inline HVX_Vector hvx_exp_det_sf(HVX_Vector x) {
 
   /** If k plus that exponent lands at or below zero the true result is
      subnormal or smaller, and the bit add produced garbage rather than a
-     small number. Shift off the sign bit, pull the 8 exponent bits down. */
+     small number. Shift off the sign bit, pull the 8 exponent bits down.
+
+     AT OR BELOW: the compare is against 1, so it fires on 0 too. This
+     shipped as `gt(zero, sum)` -- strictly below -- which is wrong exactly
+     where it matters, since equality is the case that occurs: x = -88 gives
+     k = -127 and p_exp = 127, and the bit add then yields 3.5e-40 where the
+     answer is 6.1e-39. The device found it at 5 values out of 8192
+     (SWIGLU_DET_FIELD bad_exp=5), all of them the clamp. */
   const HVX_Vector p_exp = Q6_Vuw_vlsr_VuwR(Q6_Vw_vasl_VwR(p, 1), 24);
   const HVX_VectorPred underflow =
-    Q6_Q_vcmp_gt_VwVw(zero, Q6_Vw_vadd_VwVw(k, p_exp));
+    Q6_Q_vcmp_gt_VwVw(Q6_V_vsplat_R(1), Q6_Vw_vadd_VwVw(k, p_exp));
   return Q6_V_vmux_QVV(underflow, zero, y);
 }
 

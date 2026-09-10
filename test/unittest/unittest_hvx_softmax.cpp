@@ -31,6 +31,7 @@
 #include <remote.h>
 
 #include "nntr_hvx.h"
+#include "swiglu_det.h"
 
 #include "mha_htp_host_model.h"
 
@@ -123,86 +124,27 @@ class HvxSwigluDet : public HtpSession {};
 namespace {
 
 /**
- * @brief One f32 operation, forced to round on its own.
+ * @brief The scalar specification, taken from the header both machines
+ *        implement rather than copied.
  *
- * The whole question this test asks is whether two machines round the same
- * way, so the reference must not let the compiler contract a multiply and
- * an add into one fused operation -- that rounds once where the DSP rounds
- * twice, and the mismatch would be the compiler's, not the hardware's.
- * Storing each intermediate through a volatile makes contraction
- * impossible regardless of -ffp-contract.
+ * An earlier version of this file carried its own transcription of
+ * swiglu_det.h's arithmetic. That is one copy too many: the whole point of
+ * the test is to catch a divergence between implementations of one
+ * specification, and a private copy of the specification cannot do that --
+ * it can only catch divergence from itself. swiglu_det.h's scalar path
+ * stores every intermediate through a volatile for exactly the reason this
+ * test needed to, so nothing is lost by deferring to it.
  */
-inline float dmul(float a, float b) {
-  volatile float r = a * b;
-  return r;
-}
-inline float dadd(float a, float b) {
-  volatile float r = a + b;
-  return r;
-}
-inline float dsub(float a, float b) {
-  volatile float r = a - b;
-  return r;
-}
+inline float exp_det_ref(float x) { return swiglu_det_exp(x); }
+inline float recip_det_ref(float d) { return swiglu_det_recip(d); }
+inline float swiglu_det_ref(float g, float u) { return swiglu_det_one(g, u); }
+inline float dadd(float a, float b) { return swiglu_det_add(a, b); }
+inline float dsub(float a, float b) { return swiglu_det_sub(a, b); }
 
 inline int32_t bits_of(float f) {
   int32_t i;
   std::memcpy(&i, &f, sizeof(i));
   return i;
-}
-inline float float_of(int32_t i) {
-  float f;
-  std::memcpy(&f, &i, sizeof(f));
-  return f;
-}
-
-/** @brief hvx_swiglu_det.h's exp_det, operation for operation. */
-float exp_det_ref(float x) {
-  if (x > 85.0f) {
-    x = 85.0f;
-  }
-  if (x < -88.0f) {
-    x = -88.0f;
-  }
-  // std::nearbyint under the default rounding mode is round-to-nearest-even,
-  // which is what hvx_sf_to_w_rne does.
-  const int32_t k = static_cast<int32_t>(std::nearbyint(dmul(x, 1.44269504f)));
-  const float kl = static_cast<float>(k);
-
-  float r = dsub(x, dmul(kl, 0.693359375f));
-  r = dsub(r, dmul(kl, -2.12194440e-4f));
-
-  float p = 1.0f / 5040.0f;
-  p = dadd(dmul(p, r), 1.0f / 720.0f);
-  p = dadd(dmul(p, r), 1.0f / 120.0f);
-  p = dadd(dmul(p, r), 1.0f / 24.0f);
-  p = dadd(dmul(p, r), 1.0f / 6.0f);
-  p = dadd(dmul(p, r), 0.5f);
-  p = dadd(dmul(p, r), 1.0f);
-  p = dadd(dmul(p, r), 1.0f);
-
-  const int32_t pb = bits_of(p);
-  const int32_t p_exp = static_cast<int32_t>((static_cast<uint32_t>(pb) << 1) >>
-                                             24); // sign off, exponent down
-  if (k + p_exp <= 0) {
-    return 0.0f;
-  }
-  return float_of(pb + (k << 23));
-}
-
-/** @brief hvx_swiglu_det.h's recip_det, operation for operation. */
-float recip_det_ref(float d) {
-  float y = float_of(static_cast<int32_t>(0x7EF311C2u) - bits_of(d));
-  for (int it = 0; it < 3; ++it) {
-    y = dmul(y, dsub(2.0f, dmul(d, y)));
-  }
-  return y;
-}
-
-float swiglu_det_ref(float g, float u) {
-  const float e = exp_det_ref(dsub(0.0f, g));
-  const float s = recip_det_ref(dadd(1.0f, e));
-  return dmul(dmul(g, s), u);
 }
 
 } // namespace
@@ -283,6 +225,67 @@ TEST_F(HvxSwigluDet, MatchesScalarBitExact) {
                            "HVX Vsf does not round like ARM f32";
   EXPECT_EQ(bad_recip, 0) << "hvx_recip_det_sf differs from the scalar spec";
   EXPECT_EQ(bad_out, 0) << "hvx_swiglu_det_sf differs from the scalar spec";
+}
+
+/**
+ * @brief [A1] The ARM half of the same specification, on the same data.
+ *
+ * This test needs no DSP: it compares swiglu_det.h's NEON path against
+ * swiglu_det.h's scalar path, both on this phone's own CPU. What it is
+ * really looking for is a fused multiply-add. The scalar path stores every
+ * intermediate through a volatile and cannot be contracted; the NEON path
+ * has only `#pragma clang fp contract(off)` between it and an fmla that
+ * would round once where the DSP rounds twice. That failure is silent --
+ * the kernel still computes an accurate SwiGLU, just not the same bits --
+ * so nothing but a comparison like this one would find it.
+ *
+ * Together with MatchesScalarBitExact this closes the triangle: DSP ==
+ * scalar and NEON == scalar give DSP == NEON, which is the property the
+ * fused MoE path actually needs.
+ */
+TEST(SwigluDetNeon, MatchesScalar) {
+#ifndef SWIGLU_DET_HAS_NEON
+  GTEST_SKIP() << "built without the NEON path -- nothing to compare";
+#else
+  const int n = 8192;
+  std::vector<float> g(n), u(n), out(n, 0.0f);
+  std::mt19937 rng(0xA1A1A1A1u);
+  std::uniform_real_distribution<float> small(-8.0f, 8.0f);
+  for (int i = 0; i < n; ++i) {
+    // The same spread MatchesScalarBitExact uses, including the five
+    // inputs that land on the exp clamp -- the exact place the DSP side
+    // was wrong.
+    if (i < 64) {
+      g[i] = -200.0f + 3.0f * static_cast<float>(i);
+    } else if (i < 128) {
+      g[i] = 100.0f - 3.0f * static_cast<float>(i - 64);
+    } else {
+      g[i] = small(rng);
+    }
+    u[i] = small(rng);
+  }
+
+  swiglu_det(static_cast<unsigned int>(n), out.data(), g.data(), u.data());
+
+  int bad = 0;
+  int first_bad = -1;
+  for (int i = 0; i < n; ++i) {
+    const float ref = swiglu_det_one(g[i], u[i]);
+    if (bits_of(out.data()[i]) != bits_of(ref)) {
+      ++bad;
+      if (first_bad < 0) {
+        first_bad = i;
+        std::cout << "SWIGLU_DET_NEON first mismatch i=" << i << " g=" << g[i]
+                  << " u=" << u[i] << std::hexfloat << " neon=" << out[i]
+                  << " scalar=" << ref << std::defaultfloat << std::endl;
+      }
+    }
+  }
+  std::cout << "SWIGLU_DET_NEON_FIELD bad=" << bad << " of " << n << std::endl;
+  EXPECT_EQ(bad, 0)
+    << "the NEON path does not match the scalar specification -- the usual "
+       "cause is the compiler contracting a multiply and an add into an fmla";
+#endif
 }
 
 TEST_F(HvxExp, RejectsNonVectorLength) {
