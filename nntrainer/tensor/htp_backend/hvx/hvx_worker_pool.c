@@ -166,7 +166,15 @@ void hvx_worker_pool_destroy(hvx_worker_pool *pool) {
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units) {
   if (!pool || pool->n_workers == 0 || n_units <= 1) {
-    func(n_units == 0 ? 1u : n_units, 0, ctx);
+    /* ONE slice, not n_units of them. func(n_units, 0, ctx) means "act as
+       worker 0 of n_units", so with no pool it ran 1/n_units of the work
+       and silently dropped the rest -- doc 43 section 7's L1 correction is
+       an entry about exactly that, where a test used NULL as a "serial
+       reference", compared against a weight image that was 1/n baked, and
+       got a revert out of it. The trap was left in place and documented;
+       this removes it. Callers that pass NULL now get the whole range on
+       the calling thread, which is what every one of them meant. */
+    func(1u, 0, ctx);
     return;
   }
 

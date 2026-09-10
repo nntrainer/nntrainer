@@ -129,6 +129,20 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
         out[(size_t)r * ostride + c] = v;
     }
 }
+/* The pool runs everything on the caller, which is what its own NULL path
+   does for n_units <= 1. Doing it here rather than passing NULL keeps the
+   kernel's call sites exercised: the range arithmetic they hand the worker
+   is part of what this check is for. */
+void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
+                         void *ctx, uint32_t n_units) {
+  (void)pool;
+  /* One slice covering everything. Writing this the way the real function's
+     degenerate branch used to be written -- func(n_units, 0, ctx) -- is what
+     this check caught first time out: that form means "worker 0 of n_units"
+     and does 1/n_units of the work. */
+  func(1u, 0, ctx);
+}
+
 void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
                             uint32_t n) {
   /* Two operations, never one: HVX has no f32 fused multiply-add and the

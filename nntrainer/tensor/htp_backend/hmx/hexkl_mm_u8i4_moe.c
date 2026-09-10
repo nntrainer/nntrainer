@@ -77,6 +77,61 @@ static void moe_push_weight(uint8_t *vtcm_base, uint32_t dst_off,
                         bytes / rs, /*src_vtcm=*/0, /*dst_vtcm=*/1);
 }
 
+/**
+ * @brief hvx_worker_pool_func body for the per-block token gather.
+ *
+ * Rows are independent and their destinations are disjoint, so this splits
+ * by row. It was a plain loop on the calling thread and measured about
+ * 15 ms/layer -- 29 MB of copying at under 2 GB/s, which is what a scalar
+ * memcpy costs on this core. Every other bulk pass in this file already
+ * runs on the pool; this one did not, for no reason.
+ */
+typedef struct {
+  float *stage;
+  const float *act;
+  const uint32_t *rows;
+  uint32_t n_rows;
+  uint32_t K;
+} moe_gather_ctx;
+
+static void moe_gather_worker(uint32_t n_threads, uint32_t i, void *vctx) {
+  moe_gather_ctx *c = (moe_gather_ctx *)vctx;
+  const uint32_t lo = (uint32_t)((uint64_t)c->n_rows * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)c->n_rows * (i + 1) / n_threads);
+  for (uint32_t r = lo; r < hi; ++r) {
+    memcpy(c->stage + (size_t)r * c->K, c->act + (size_t)c->rows[r] * c->K,
+           sizeof(float) * c->K);
+  }
+}
+
+/**
+ * @brief hvx_worker_pool_func body for the routing multiply and scatter-add.
+ *
+ * Safe to split by row because a token picks k DISTINCT experts, so within
+ * one expert's block every row_index is different and no two workers touch
+ * the same output row. Across blocks and experts they do collide, which is
+ * why the split is inside a block and the blocks stay sequential.
+ */
+typedef struct {
+  float *out;
+  const float *res;
+  const uint32_t *rows;
+  const float *weights;
+  uint32_t n_rows;
+  uint32_t N_out;
+} moe_scatter_ctx;
+
+static void moe_scatter_worker(uint32_t n_threads, uint32_t i, void *vctx) {
+  moe_scatter_ctx *c = (moe_scatter_ctx *)vctx;
+  const uint32_t lo = (uint32_t)((uint64_t)c->n_rows * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)c->n_rows * (i + 1) / n_threads);
+  for (uint32_t r = lo; r < hi; ++r) {
+    hvx_scale_add_rows_f32(c->out + (size_t)c->rows[r] * c->N_out,
+                           c->res + (size_t)r * c->N_out, c->weights[r],
+                           c->N_out);
+  }
+}
+
 int hexkl_mm_u8i4_moe_layout(uint32_t K, uint32_t inter, uint32_t N_out,
                              uint32_t arena_bytes, hexkl_moe_layout *out) {
   if (!out || K == 0u || inter == 0u || N_out == 0u) {
@@ -279,9 +334,9 @@ int hexkl_mm_u8i4_moe_layer_run(
          but it changes what is compared, so it does not belong in the
          commit that has to prove equivalence. */
       HEXKL_PROBE_T0(p0);
-      for (uint32_t r = 0; r < m_blk; ++r) {
-        memcpy(stage + (size_t)r * K, act_c + (size_t)rows[mb + r] * K,
-               sizeof(float) * K);
+      {
+        moe_gather_ctx gc = {stage, act_c, rows + mb, m_blk, K};
+        hvx_worker_pool_run(pool, moe_gather_worker, &gc, m_blk);
       }
       hvx_quant_rows_u8_params(stage, m_blk, BR, K, scale, zp, pool);
       rc = hvx_quant_pack_u8_ah(stage, m_blk, BR, K, scale, zp,
@@ -396,12 +451,11 @@ int hexkl_mm_u8i4_moe_layer_run(
          destination row is one index away. */
       HEXKL_PROBE_T0(p0);
       {
-        const float *res = (const float *)(vtcm_base + L.res_f32_off);
-        for (uint32_t r = 0; r < m_blk; ++r) {
-          hvx_scale_add_rows_f32(out_c + (size_t)rows[mb + r] * N_out,
-                                 res + (size_t)r * N_out, weights[mb + r],
-                                 N_out);
-        }
+        moe_scatter_ctx sc = {
+          out_c,     (const float *)(vtcm_base + L.res_f32_off),
+          rows + mb, weights + mb,
+          m_blk,     N_out};
+        hvx_worker_pool_run(pool, moe_scatter_worker, &sc, m_blk);
       }
       HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);
     }
