@@ -11,6 +11,8 @@
  */
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <mutex>
 
@@ -175,6 +177,43 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
   BATCH_SIZE = nntr_cfg["batch_size"].get<unsigned int>();
   MODEL_TENSOR_TYPE = nntr_cfg["model_tensor_type"].get<std::string>();
   INIT_SEQ_LEN = nntr_cfg["init_seq_len"];
+  /** NNTR_INIT_SEQ_LEN overrides the pack's init_seq_len.
+   *
+   *  init_seq_len is not a capability: max_seq_len is. It is the HEIGHT of the
+   *  activation plane the graph is built at, and therefore also the largest
+   *  prefill chunk that can be fed in one forward (Transformer::prefillChunk
+   *  clamps to it). Every activation the planner sizes is [init_seq_len x
+   *  something], so on the GPU lane the plane -- shared and device both -- is
+   *  linear in this number, and it is the one dial that moves the activation
+   *  half of the GPU footprint at all.
+   *
+   *  Lowering it does NOT shorten the prompt a model can take: with chunked
+   *  prefill on (which the KV ring turns on by default on OpenCL and CUDA) the
+   *  prompt is bounded by the KV budget and fed in chunks of this height. It
+   *  trades prefill throughput -- more, smaller launches -- for plane bytes,
+   *  which is a measurement, not an assumption, so it is a dial rather than a
+   *  new default here.
+   *
+   *  Refused below max 8 or above the pack's own value: raising it would build
+   *  a plane the pack never validated, and a chunk of 0 would disable the
+   *  prefill loop entirely. */
+  if (const char *isl = std::getenv("NNTR_INIT_SEQ_LEN")) {
+    const int want = std::atoi(isl);
+    if (want >= 8 && want <= static_cast<int>(INIT_SEQ_LEN)) {
+      std::fprintf(stderr,
+                   "[init_seq_len] pack %u -> %d (NNTR_INIT_SEQ_LEN); the "
+                   "activation plane and the prefill chunk follow\n",
+                   static_cast<unsigned int>(INIT_SEQ_LEN), want);
+      std::fflush(stderr);
+      INIT_SEQ_LEN = want;
+    } else {
+      std::fprintf(stderr,
+                   "[init_seq_len] ignoring NNTR_INIT_SEQ_LEN=%s: outside "
+                   "[8, %u]\n",
+                   isl, static_cast<unsigned int>(INIT_SEQ_LEN));
+      std::fflush(stderr);
+    }
+  }
   MAX_SEQ_LEN = nntr_cfg["max_seq_len"];
   // num_to_generate is optional: absent (or <= 0) means "no explicit cap",
   // i.e. generate until EOS or until the context window runs out. 0 is the
