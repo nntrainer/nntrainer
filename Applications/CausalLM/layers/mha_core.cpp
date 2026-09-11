@@ -86,6 +86,7 @@ static unsigned int min_prefill_thr(unsigned int head_dim) {
 #include <attention_kernels.h>
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h>
+#include <opencl_kernel.h>
 #endif
 #include <fp16.h>
 #include <layer_context.h>
@@ -2033,8 +2034,21 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // a cl_mem; unstaged writes the SVM cache slice and, on the image
             // chain, has the same all-GPU consumer set.
             /*drain_svm_out=*/!kv_chain_gpu_only);
-        if (ok && k_out_stage == nullptr && kv_chain_gpu_only)
+        if (ok && k_out_stage == nullptr && kv_chain_gpu_only) {
           kv_write_undrained = true;
+          // The rotation above bound an OFFSET-BAKED destination (kc_p = the
+          // step's slice), while the scatter that consumes it binds the cache
+          // tensor's STABLE BASE with the row offset as a kernel scalar
+          // (NNTR_KV_SCALAR_OFF). The generic declaration inside
+          // rope_inplace_f16_cl therefore names a plane that starts BELOW the
+          // consumer's pointer and would not contain it. Widen it to the whole
+          // cache tensor, which both addresses lie in. This is the site the
+          // non-determinism was bisected to, so it is declared here even at
+          // `site` scope.
+          nntrainer::opencl::Kernel::noteUndrainedSvmPlane(
+            cache_key.getData<_FP16>(), cache_key.bytes(),
+            /*declared_by_consumer_site=*/true);
+        }
         if (ok && q_out_stage != nullptr) {
           q_attn_clmem = q_out_stage;
           q_rope_staged = q_out_stage;
@@ -2100,8 +2114,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
               v_stage_svm = v_in;
               v_stage_clmem = v_cl;
             }
-            if (!v_stage && kv_chain_gpu_only)
+            if (!v_stage && kv_chain_gpu_only) {
               kv_write_undrained = true;
+              // Same widening as the K site: an offset-baked destination, a
+              // base-plus-scalar consumer.
+              nntrainer::opencl::Kernel::noteUndrainedSvmPlane(
+                cache_value.getData<_FP16>(), cache_value.bytes(),
+                /*declared_by_consumer_site=*/true);
+            }
             if (_kvst_on())
               _kvst_t0 = _kvst_now();
           } else {

@@ -25,6 +25,7 @@
 #include <map>
 #include <mutex>
 #include <nntrainer_log.h>
+#include <opencl_kernel.h>
 #include <opencl_loader.h>
 #include <tuple>
 #include <vector>
@@ -697,10 +698,21 @@ bool rope_inplace_f16_cl(const uint16_t *in, uint16_t *out,
       const char *e = std::getenv("NNTR_ROPE_NOFLUSH");
       return e && e[0] == '1';
     }();
-    if (out_clmem == nullptr && drain_svm_out)
+    if (out_clmem == nullptr && drain_svm_out) {
       opencl::clFinish(q);
-    else if (out_clmem == nullptr || !rope_noflush)
+      opencl::Kernel::clearUndrainedSvmPlanes();
+    } else if (out_clmem == nullptr) {
       opencl::clFlush(q);
+      // The rotated bytes are in a shared plane that only a flush stands
+      // behind. Declare the plane so the first consumer that binds into it
+      // drains, instead of a per-pack flag deciding for the whole model.
+      // write_off is a kernel scalar, so the plane starts at the bound base and
+      // runs past the rotated rows.
+      opencl::Kernel::noteUndrainedSvmPlane(
+        out, (size_t)write_off * sizeof(uint16_t) + io_bytes);
+    } else if (!rope_noflush) {
+      opencl::clFlush(q);
+    }
     // NNTR_ROPE_FINISH=1 (Xe3 regression probe): force a full drain after the
     // rope kernel so the cl_mem rotated-Q write completes before the attention
     // reads it in a separate submission (the suspected cross-submission
@@ -813,10 +825,17 @@ bool gpu_copy_f16_cl(const uint16_t *in, uint16_t *out, unsigned int N,
     // When skipping, still clFlush: the drain doubled as the submission
     // point, and deferring submission just moves the idle to the next
     // blocking call instead of removing it.
-    if (out_clmem == nullptr && drain)
+    if (out_clmem == nullptr && drain) {
       opencl::clFinish(q);
-    else
+      opencl::Kernel::clearUndrainedSvmPlanes();
+    } else if (out_clmem == nullptr) {
       opencl::clFlush(q);
+      // Undrained shared-memory write: name the plane so its first consumer
+      // drains.
+      opencl::Kernel::noteUndrainedSvmPlane(out, bytes);
+    } else {
+      opencl::clFlush(q);
+    }
   } else {
     if (opencl::clEnqueueReadBuffer(q, out_arg, CL_TRUE, 0, bytes, out, 0,
                                     nullptr, nullptr) != CL_SUCCESS)
@@ -868,10 +887,18 @@ bool gpu_copy_f16_row_cl(const uint16_t *in, uint16_t *out_base, unsigned int N,
   std::array<size_t, 3> lws = {LWS, 1, 1};
   blas_cc->command_queue_inst_.enqueueKernel(kp->GetKernel(), 3, gws.data(),
                                              lws.data(), 0, nullptr, nullptr);
-  if (out_base_clmem == nullptr && drain)
+  if (out_base_clmem == nullptr && drain) {
     opencl::clFinish(q);
-  else
+    opencl::Kernel::clearUndrainedSvmPlanes();
+  } else {
     opencl::clFlush(q);
+    // Stable-base form of the same undrained shared write: the plane starts at
+    // the bound base and runs past the written rows.
+    if (out_base_clmem == nullptr) {
+      opencl::Kernel::noteUndrainedSvmPlane(out_base, ((size_t)write_off + N) *
+                                                        sizeof(uint16_t));
+    }
+  }
   return true;
 }
 
