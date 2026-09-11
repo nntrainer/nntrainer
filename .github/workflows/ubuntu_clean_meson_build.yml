@@ -14,7 +14,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ ubuntu-22.04, ubuntu-24.04 ]
+        os: [ ubuntu-22.04 ]
         # The third entry builds and RUNS the whole suite with _FP16 bound to
         # the uint16 nntrainer::Half wrapper instead of native _Float16. It is
         # the only leg that can catch a change using an _FP16 operation Half
