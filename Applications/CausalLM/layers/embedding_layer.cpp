@@ -1222,6 +1222,38 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     }
 #endif
 
+#if defined(ENABLE_OPENCL)
+    // The loop below writes this layer's OUTPUT with plain host stores from
+    // worker threads. That output is a POOLED activation plane: the memory
+    // planner hands the same address to other tensors whose lifetimes do not
+    // overlap IN GRAPH ORDER -- among them the rotated-Q plane the attention's
+    // qk kernel binds as a shared-memory argument. Graph order is not execution
+    // order here: the GPU queue is asynchronous and the host runs tens of
+    // milliseconds ahead of it, so under a CHUNKED prefill these stores land
+    // while the previous chunk's qk dispatch is still reading the same pages.
+    // Proven on device with an mprotect canary that fires inside this function
+    // while the qk event is not yet CL_COMPLETE, three times per four-chunk
+    // prefill and never on a single-chunk one.
+    //
+    // Settle the queue before the host writes into a plane the device may still
+    // be reading. This is the cheap place to do it: once per forward pass, at
+    // the head of the pass, where the host was going to spend the dequant time
+    // anyway -- unlike a consumer-side drain, which fires once per KV-owning
+    // layer and costs 8-11 % of the prefill. NNTR_EMB_HOST_SYNC=0 is the A/B
+    // arm.
+    {
+      static const bool emb_host_sync = []() {
+        const char *e = std::getenv("NNTR_EMB_HOST_SYNC");
+        return !(e != nullptr && e[0] == '0');
+      }();
+      // Only where the plane is device-visible at all: a host-only or CUDA run
+      // has no OpenCL queue to settle and must not be made to create one.
+      const auto h_md = hidden_.getMemoryData();
+      if (emb_host_sync && h_md && (h_md->isSVM() || hidden_.isClMem()))
+        nntrainer::cl_queue_finish();
+    }
+#endif
+
     auto &tm = nntrainer::ThreadManager::Global();
     const size_t total = static_cast<size_t>(iter);
     const size_t max_workers = std::max<size_t>(1, tm.getComputeThreadCount());

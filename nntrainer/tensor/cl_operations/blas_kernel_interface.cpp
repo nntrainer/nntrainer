@@ -1223,11 +1223,17 @@ bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output) {
       // Zero-fill the padded rows so the act-quant kernel sees deterministic
       // values (per-row amax -> 0 -> scale defaults to 1, q=0, row_sum=0;
       // padded rows produce zero output).
+      // The old form here staged the zeros in a local std::vector and handed
+      // it to a NON-BLOCKING clEnqueueWriteBuffer: the vector was destroyed on
+      // the next line while the command still named its bytes, which the
+      // OpenCL contract forbids (the pad rows then quantise whatever the
+      // allocator handed out). clEnqueueFillBuffer needs no host source at
+      // all, so the pattern cannot come back.
       const size_t pad_bytes = (size_t)(M_pad - M) * K * act_elem;
-      std::vector<uint8_t> zeros(pad_bytes, 0);
-      if (opencl::clEnqueueWriteBuffer(
-            q, sc.act_in, CL_FALSE, (size_t)M * K * act_elem, pad_bytes,
-            zeros.data(), 0, nullptr, nullptr) != CL_SUCCESS)
+      const cl_uchar zero_pat = 0;
+      if (opencl::clEnqueueFillBuffer(q, sc.act_in, &zero_pat, sizeof(zero_pat),
+                                      (size_t)M * K * act_elem, pad_bytes, 0,
+                                      nullptr, nullptr) != CL_SUCCESS)
         return false;
     }
   }
