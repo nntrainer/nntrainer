@@ -1186,6 +1186,14 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   const unsigned int prefill_chunk = prefillChunk();
   auto do_prefill = [&](unsigned int n_tok,
                         unsigned int from_pos) -> std::vector<float *> {
+    // [prefill-long] Tell the attention layers the whole key span this prefill
+    // will reach, so the tight-stride V image is laid out once instead of once
+    // per chunk (each re-layout re-scatters every V row already written). The
+    // guard clears it on every exit, so decode sees 0 = unknown.
+    struct SpanHint {
+      SpanHint(unsigned int s) { setPrefillSpanHint(s); }
+      ~SpanHint() { setPrefillSpanHint(0); }
+    } _span_hint(from_pos + n_tok);
     // Legacy token-by-token resumed prefill (debug escape hatch) -- unchanged.
     if (!resume_block_on && from_pos > 0 && n_tok > 1) {
       std::vector<float *> out;

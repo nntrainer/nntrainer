@@ -116,7 +116,13 @@ static void rms_norm_host_fp32(const float *in, const float *gamma, float *out,
 void RMSNormLayerGPU::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
-  if (skip_prefill && from == 0)
+  // [prefill-chunk] Match RMSNormLayer and the PerLayerSliceLayerGPU sibling:
+  // a chunked prefill is still a prefill even though chunk k>0 does not start
+  // at token 0. Testing only `from == 0` ran ~101 skip_prefill norm nodes on
+  // every chunk after the first -- work whose output no later op reads,
+  // measured at ~50 ms of a 4-chunk 3 595-token prefill.
+  const bool is_prefill = !from || (to - from) > 1;
+  if (skip_prefill && is_prefill)
     return;
   auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
 

@@ -307,6 +307,18 @@ void setPrefillKvDrain(bool on);
 bool prefillKvDrain();
 
 /**
+ * @brief [prefill-long] Announce the total key span the next prefill reaches.
+ * @details Set by the prefill driver before the chunk loop and cleared after,
+ * so the tight-stride V image is laid out once for the whole prompt instead of
+ * being re-laid (and every scattered row re-written) at each chunk boundary.
+ * 0 means "unknown", which restores the per-chunk growth exactly.
+ */
+void setPrefillSpanHint(unsigned int span);
+
+/** @copydoc setPrefillSpanHint(unsigned int) */
+unsigned int prefillSpanHint();
+
+/**
  * @class MHA Core Layer
  * @brief Part of Multi-Head-Attention Layer.
  *        It should be attached after Q / K / V fc layers and before O fc layer.

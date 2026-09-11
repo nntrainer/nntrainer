@@ -469,6 +469,33 @@ bool prefillKvDrain() {
   return g_prefill_kv_drain.load(std::memory_order_relaxed);
 }
 
+/**
+ * @brief [prefill-long] Total key span the prefill about to run will reach.
+ * @details The tight-stride V image (NNTR_KV_VTIGHT) is sized from `cache_to`,
+ * which under chunked prefill grows one chunk at a time. Each growth crosses
+ * the 256-half image pitch quantum, and a stride change invalidates EVERY row
+ * already scattered -- so a 4-chunk prefill re-scatters [0,1024), [0,2048) and
+ * [0,3072) of V on top of the rows it actually writes, and blocks the host on
+ * the gather+drain that precedes each one. Measured: NNTR_KV_VTIGHT=0 (no
+ * tight image at all, no re-scatter) is worth 659 -> 603 ms at 1 606 tokens
+ * and 1 817 -> 1 619 ms at 3 595 tokens with a 2 048 chunk.
+ *
+ * The prefill driver knows the whole span before the first chunk. Handing it
+ * over lets the tight image be laid out ONCE, at the stride the last chunk
+ * would have chosen: the texture-cache win of a tight pitch is kept and the
+ * re-scatters disappear. 0 = unknown (decode, or a caller that does not set
+ * it), which restores the grow-as-you-go behaviour exactly.
+ */
+static std::atomic<unsigned int> g_prefill_span_hint{0};
+
+void setPrefillSpanHint(unsigned int span) {
+  g_prefill_span_hint.store(span, std::memory_order_relaxed);
+}
+
+unsigned int prefillSpanHint() {
+  return g_prefill_span_hint.load(std::memory_order_relaxed);
+}
+
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
 // Upload a vector<vector<_FP16>> RoPE LUT to a flat device buffer ONCE (cached
 // by table identity), [num_positions * half] row-major. The per-call host LUT
@@ -2999,6 +3026,14 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             unsigned int v_stride = kv_mirror_S_max;
             if (v_tight_on) {
               unsigned int need = (cache_to + 7u) & ~7u;
+              // [prefill-long] Lay the tight image out for the WHOLE prefill
+              // span, not just this chunk, so the stride never changes mid
+              // prefill (a change re-scatters every row already written).
+              {
+                const unsigned int hint = prefillSpanHint();
+                if (hint > need)
+                  need = (hint + 7u) & ~7u;
+              }
               if (need > kv_v_img_S) {
                 void *nimg = nullptr;
                 // The helper rounds `need` up to the device image pitch
