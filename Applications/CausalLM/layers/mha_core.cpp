@@ -1560,6 +1560,33 @@ void MHACoreLayer::one_batch_incremental_forwarding(
       cacheRow(cache_index) * cache_value_dim.width(),
     true);
 
+  // [rq-scalar-off] The SAME address, expressed as (stable base, scalar row
+  // offset) instead of an offset-baked pointer.
+  //
+  // b_cache_key_step / b_cache_value_step above are views whose OFFSET moves
+  // with cache_index, so `.getData()` hands the GPU a DIFFERENT SVM pointer
+  // every decode token even though the allocation never moved. A recorded
+  // command queue (cl_qcom_recordable_queues) captures SVM pointer arguments
+  // at record time and cannot re-bind them per replay, while it CAN override
+  // scalar arguments -- so a per-token SVM pointer is a dispatch that can
+  // never be replayed. The kernels that take the offset as a scalar already
+  // exist (rope_inplace_f16 write_off, scatter_copy_f16_row,
+  // k_scatter_ohwi / v_scatter_ohwi_t src_off); these are the stable bases and
+  // scalar offsets their call sites need. Byte-identical by construction:
+  // base + off is the very expression the view was built from.
+  //
+  // NNTR_KV_SCALAR_OFF=0 restores the offset-baked pointers (A/B arm).
+  static const bool _kv_scalar_off = [] {
+    const char *e = std::getenv("NNTR_KV_SCALAR_OFF");
+    return !(e && e[0] == '0');
+  }();
+  const size_t _kc_step_off =
+    (size_t)batch * cache_key_dim.getFeatureLen() +
+    (size_t)cacheRow(cache_index) * cache_key_dim.width();
+  const size_t _vc_step_off =
+    (size_t)batch * cache_value_dim.getFeatureLen() +
+    (size_t)cacheRow(cache_index) * cache_value_dim.width();
+
   // Static GPU_CLMEM residency: the wq/wk/wv FC outputs and the attention
   // output may live in planner cl_mem sub-buffers (class GPU_CLMEM). The GPU
   // stages bind these handles directly (RoPE / V-copy / image attention); any
@@ -2123,6 +2150,19 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           reinterpret_cast<const uint16_t *>(value_step.getData<_FP16>());
         uint16_t *v_out =
           reinterpret_cast<uint16_t *>(b_cache_value_step.getData<_FP16>());
+        // [rq-scalar-off] The recordable form of the same two destinations:
+        // the cache tensor's OWN base (fixed for the life of the graph) plus
+        // the step's row offset as a kernel SCALAR. kc_base + _kc_step_off is
+        // kc_p; vc_base + _vc_step_off is v_out (assert-equal below).
+        uint16_t *kc_base =
+          reinterpret_cast<uint16_t *>(cache_key.getData<_FP16>());
+        uint16_t *vc_base =
+          reinterpret_cast<uint16_t *>(cache_value.getData<_FP16>());
+        const bool _kv_soff_k = _kv_scalar_off && kc_base != nullptr &&
+                                kc_svm && (kc_base + _kc_step_off) == kc_p;
+        const bool _kv_soff_v = _kv_scalar_off && vc_base != nullptr &&
+                                vc_svm && v_svm && v_in != nullptr &&
+                                (vc_base + _vc_step_off) == v_out;
         const unsigned int kv_n =
           (to - from) * (unsigned int)num_heads_KV * (unsigned int)head_dim;
         // ORDER MATTERS for safe partial-failure fallback: rotate K and V into
@@ -2136,9 +2176,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // OHWI scatter source). cl_mem-in (k_cl) -> SVM-out. key_step left
         // unmodified.
         bool ok = nntrainer::rope_inplace_f16_cl(
-          k_p, kc_p, cos_lut, sin_lut, to - from, num_heads_KV, head_dim,
-          cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
-          /*out_clmem=*/nullptr, /*drain_svm_out=*/false);
+          k_p, _kv_soff_k ? kc_base : kc_p, cos_lut, sin_lut, to - from,
+          num_heads_KV, head_dim, cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
+          /*out_clmem=*/nullptr, /*drain_svm_out=*/false,
+          /*write_off=*/_kv_soff_k ? (unsigned int)_kc_step_off : 0u);
         // Enqueued without a drain: the SVM/host fallbacks below must drain
         // once if the image attention ends up missing this step.
         if (ok)
@@ -2146,10 +2187,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // V: flat copy value_step -> b_cache_value_step SVM slice (no RoPE, the
         // OHWI v-scatter source). value_step left unmodified.
         if (ok)
-          ok = nntrainer::gpu_copy_f16_cl(v_in, v_out, kv_n, v_svm,
-                                          /*in_clmem=*/v_cl,
-                                          /*out_clmem=*/nullptr,
-                                          /*drain=*/false);
+          ok = _kv_soff_v ? nntrainer::gpu_copy_f16_row_cl(
+                              v_in, vc_base, kv_n, (int)_vc_step_off,
+                              /*svm_inputs=*/true,
+                              /*in_clmem=*/v_cl, /*out_base_clmem=*/nullptr,
+                              /*drain=*/false)
+                          : nntrainer::gpu_copy_f16_cl(v_in, v_out, kv_n, v_svm,
+                                                       /*in_clmem=*/v_cl,
+                                                       /*out_clmem=*/nullptr,
+                                                       /*drain=*/false);
         // Q LAST: in-place into the SVM shadow (the OHWI decode qk reads Q_p
         // with q_clmem=null). cl_mem-in -> SVM-out when the FC parked Q in
         // cl_mem. Only run once K+V are committed so a Q failure cannot leave a
@@ -2956,22 +3002,48 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // RoPE/copy wrote. In-order queue (NNTR_GPU_SVM_POOL) keeps
             // RoPE -> scatter -> attention ordered with no explicit sync.
             const double _kvst_t1 = _kvst_on() ? _kvst_now() : 0;
+            // [rq-scalar-off] Unstaged (k_stage == null) the source is the
+            // step slice of the SVM K cache -- an offset-baked pointer that
+            // moves every token. Read the cache's stable base at the scalar
+            // row offset instead (same address, recordable).
+            const uint16_t *k_sc_src = reinterpret_cast<const uint16_t *>(
+              b_cache_key_step.getData<_FP16>());
+            unsigned int k_sc_off = 0u;
+            if (k_stage == nullptr && _kv_scalar_off) {
+              const uint16_t *b =
+                reinterpret_cast<const uint16_t *>(cache_key.getData<_FP16>());
+              if (b != nullptr && b + _kc_step_off == k_sc_src) {
+                k_sc_src = b;
+                k_sc_off = (unsigned int)_kc_step_off;
+              }
+            }
             nntrainer::k_scatter_ohwi_cl(
-              reinterpret_cast<const uint16_t *>(
-                b_cache_key_step.getData<_FP16>()),
-              reinterpret_cast<cl_mem>(k_buf_ohwi), step_size, num_heads_KV,
-              head_dim, kv_mirror_S_max, cache_from, /*src_clmem=*/k_stage,
-              /*src_off=*/0u);
+              k_sc_src, reinterpret_cast<cl_mem>(k_buf_ohwi), step_size,
+              num_heads_KV, head_dim, kv_mirror_S_max, cache_from,
+              /*src_clmem=*/k_stage, /*src_off=*/k_sc_off);
             kv_k_valid_to = cache_to;
             const double _kvst_tk = _kvst_on() ? _kvst_now() : 0;
-            nntrainer::v_scatter_ohwi_t_cl(
+            // [rq-scalar-off] Same as the K scatter above: when the source is
+            // the V cache's step slice (no stage), address the stable base with
+            // a scalar row offset.
+            const uint16_t *v_sc_src =
               v_stage_svm != nullptr ? v_stage_svm
                                      : reinterpret_cast<const uint16_t *>(
-                                         b_cache_value_step.getData<_FP16>()),
-              reinterpret_cast<cl_mem>(v_buf_ohwi), step_size, num_heads_KV,
-              head_dim, v_stride, cache_from,
-              /*src_clmem=*/v_stage_clmem,
-              /*src_off=*/0u);
+                                         b_cache_value_step.getData<_FP16>());
+            unsigned int v_sc_off = 0u;
+            if (v_stage_svm == nullptr && v_stage_clmem == nullptr &&
+                _kv_scalar_off) {
+              const uint16_t *b = reinterpret_cast<const uint16_t *>(
+                cache_value.getData<_FP16>());
+              if (b != nullptr && b + _vc_step_off == v_sc_src) {
+                v_sc_src = b;
+                v_sc_off = (unsigned int)_vc_step_off;
+              }
+            }
+            nntrainer::v_scatter_ohwi_t_cl(
+              v_sc_src, reinterpret_cast<cl_mem>(v_buf_ohwi), step_size,
+              num_heads_KV, head_dim, v_stride, cache_from,
+              /*src_clmem=*/v_stage_clmem, /*src_off=*/v_sc_off);
             kv_v_valid_to = cache_to;
             const double _kvst_tv = _kvst_on() ? _kvst_now() : 0;
             // S3 decode: OHWI rotates Q on the HOST (query_step SVM, in-place);
