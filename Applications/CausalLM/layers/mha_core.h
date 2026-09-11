@@ -282,6 +282,31 @@ public:
 }; // namespace props
 
 /**
+ * @brief Declare that this pack wants the prefill K rotation drained, i.e.
+ *        whether nntr_config.json sets `"prefill_kv_drain": true`.
+ *
+ * The attention core uses it for exactly one decision: whether the prefill K
+ * rotation drains before `k_scatter_ohwi_cl` reads the SVM cache slice it
+ * wrote (see mha_core.cpp, `_kv_nodrain_env`). Default false, i.e. the
+ * per-write no-drain, which is what every pack that has not been observed to
+ * need the drain keeps.
+ *
+ * Read the gate honestly. This is a DECLARATION, recording where the defect
+ * has been OBSERVED to decide a token -- it is not a decision the tree makes
+ * about a pack, and it is emphatically not a model name. The RISK condition is
+ * a consumer reading an SVM write issued in an earlier submission, which every
+ * model on this chain does; deciding THAT in code, where the chain is built
+ * rather than from a config flag, is the per-dispatch hazard check this series
+ * lands next (Kernel::noteUndrainedSvmPlane), which would replace this
+ * declaration with the thing it stands for. Until then a pack that does not set
+ * it is unobserved, not proven safe.
+ */
+void setPrefillKvDrain(bool on);
+
+/** @copydoc setPrefillKvDrain(bool) */
+bool prefillKvDrain();
+
+/**
  * @class MHA Core Layer
  * @brief Part of Multi-Head-Attention Layer.
  *        It should be attached after Q / K / V fc layers and before O fc layer.

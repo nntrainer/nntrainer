@@ -12,6 +12,7 @@
  *         This code is a part of the break down version of the mha layer.
  */
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -450,6 +451,22 @@ static inline void compute_fp16vcache_transposed_int8(
 #endif
 
 namespace causallm {
+
+/**
+ * @brief Whether this pack asked for the prefill K rotation to be drained
+ * (nntr_config.json "prefill_kv_drain", default false). Set once at model
+ * setup, read on the forward path; a relaxed atomic because the two are
+ * ordered by the model being built before it is run, not by this variable.
+ */
+static std::atomic<bool> g_prefill_kv_drain{false};
+
+void setPrefillKvDrain(bool on) {
+  g_prefill_kv_drain.store(on, std::memory_order_relaxed);
+}
+
+bool prefillKvDrain() {
+  return g_prefill_kv_drain.load(std::memory_order_relaxed);
+}
 
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1 && defined(ENABLE_FP16)
 // Upload a vector<vector<_FP16>> RoPE LUT to a flat device buffer ONCE (cached
@@ -1951,13 +1968,47 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // 0 steady-decode clFinish), and it is a weaker claim than rope-Q's:
         // both writes go to a handle they do not read. Non-image lanes
         // (Intel/CUDA flash, host attention) keep the drain.
-        // NNTR_KV_PREFILL_NODRAIN=0 puts the per-write drain back, as a
-        // single-binary control arm for this optimisation (and an escape hatch
-        // for a model whose K/V readers are not all on this queue).
-        static const bool _kv_nodrain_env = [] {
+        // This site -- the prefill K rotation, which writes
+        // b_cache_key_step's SVM cache slice and lets k_scatter_ohwi_cl read
+        // that slice out of a LATER submission -- is where one model on this
+        // chain stops being reproducible under greedy decode. Without the
+        // drain the run produces a different logits row for the first sampled
+        // token about one time in three, and the token sequence is a
+        // deterministic function of that row, so the generated text differs
+        // run to run at temperature 0. With it, 10 runs of 10 give one row and
+        // one answer.
+        //
+        // The drain is therefore DEFAULT-ON only where that has been observed,
+        // and the pack SAYS SO: nntr_config.json "prefill_kv_drain": true.
+        // Elsewhere the no-drain above stands, because the drain is expensive
+        // on the prefill it was removed from -- measured -41 % on gemma4
+        // (4274 -> 2521 TPS, interleaved, one binary) while gemma4's golden
+        // held 21 of 21 runs without it.
+        //
+        // Why a declaration and not an inference. The first gate this took was
+        // skip_prefill, on the argument that it is a configuration property
+        // rather than a model name -- but it is a property about something
+        // else (whether the first sampled token runs as a decode-shaped step),
+        // and packs that do not need the drain set it too, so the proxy
+        // silently spent their prefill gain. A flag whose only meaning is
+        // "this pack was observed to need the drain" cannot mis-fire that way:
+        // it says exactly what it knows and nothing more.
+        //
+        // It is still a MANIFESTATION record, not the risk condition. The risk
+        // is a consumer reading an SVM write from an earlier submission, which
+        // every model on this chain does; a pack that does not set the flag is
+        // unobserved, not proven safe. Deciding the risk condition
+        // structurally, where the chain is built, is the follow-up this series
+        // lands next (Kernel::noteUndrainedSvmPlane) and is what should retire
+        // this flag. NNTR_KV_PREFILL_NODRAIN overrides either way and outranks
+        // the pack: =1 no drain, =0 drain.
+        static const int _kv_nodrain_override = [] {
           const char *e = std::getenv("NNTR_KV_PREFILL_NODRAIN");
-          return e == nullptr || std::atoi(e) != 0;
+          return e == nullptr ? -1 : (std::atoi(e) != 0 ? 1 : 0);
         }();
+        const bool _kv_nodrain_env = _kv_nodrain_override >= 0
+                                       ? (_kv_nodrain_override == 1)
+                                       : !prefillKvDrain();
         const bool kv_chain_gpu_only =
           _kv_nodrain_env && _kv_img_attn_env && use_image_attn == 1;
         void *q_rope_out = q_out_stage != nullptr

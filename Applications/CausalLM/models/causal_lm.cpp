@@ -222,6 +222,15 @@ void CausalLM::setupParameters(json &cfg, json &generation_cfg,
   SKIP_PREFILL = nntr_cfg.contains("skip_prefill")
                    ? nntr_cfg["skip_prefill"].get<bool>()
                    : false;
+  // A pack declares whether the prefill K rotation has to drain before
+  // k_scatter_ohwi_cl reads the SVM cache slice it wrote. Default false --
+  // the per-write no-drain -- and true only where the missing drain has been
+  // observed to decide a token (mha_core.h, setPrefillKvDrain). Not inferred
+  // from any other property and never from a model name; see the comment at
+  // the call site for why the earlier skip_prefill proxy was wrong.
+  setPrefillKvDrain(nntr_cfg.contains("prefill_kv_drain")
+                      ? nntr_cfg["prefill_kv_drain"].get<bool>()
+                      : false);
 
   // Repetition penalty. applyRepetitionPenalty() has always been here but
   // nothing plumbed a value into it, so generate() only ever saw the
