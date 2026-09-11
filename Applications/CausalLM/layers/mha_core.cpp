@@ -1695,6 +1695,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   void *k_stage = nullptr;               // rope-K wrote the staging temp
   const uint16_t *v_stage_svm = nullptr; // v_scatter source (value_step)
   void *v_stage_clmem = nullptr;         // v_scatter cl_mem source (v_cl)
+#if defined(ENABLE_OPENCL)
+  // Set when a K/V cache write below was enqueued with a submission flush and
+  // NO trailing clFinish. On the image-attention path that is coherent -- every
+  // consumer is a same-queue GPU kernel -- but the SVM/host fallbacks further
+  // down are not on that queue, so they drain once when this is set.
+  bool kv_write_undrained = false;
+#endif
 
   const double _mha_t_prelude = _kvst_on() ? _kvst_now() : 0;
 
@@ -1904,6 +1911,28 @@ void MHACoreLayer::one_batch_incremental_forwarding(
         // read the FC output from q_cl, write the rotation to the SVM Q_p the
         // qk actually consumes. GPU-resident, no cl_mem->SVM copy.
         // (Non-image/flash keeps q_cl.)
+        // The K rotation and the V copy below land in the SVM KV-cache
+        // slices, and while the image attention is the live path their ONLY
+        // consumers are same-queue GPU kernels (k_scatter_ohwi /
+        // v_scatter_ohwi_t, then the image attention itself); the host reads
+        // those slices no earlier than the lm_head lower, which drains the
+        // whole queue anyway. The trailing clFinish each of them takes is
+        // therefore pure GPU idle: 2 per layer, 70 per 1K prefill, 19.0 ms =
+        // 5.4% of the prefill window (measured on an Adreno 840 cell). Keep
+        // the submission flush, drop the drain. This is the shape the OHWI
+        // DECODE branch below already ships (drain_svm_out=false / drain=false,
+        // 0 steady-decode clFinish), and it is a weaker claim than rope-Q's:
+        // both writes go to a handle they do not read. Non-image lanes
+        // (Intel/CUDA flash, host attention) keep the drain.
+        // NNTR_KV_PREFILL_NODRAIN=0 puts the per-write drain back, as a
+        // single-binary control arm for this optimisation (and an escape hatch
+        // for a model whose K/V readers are not all on this queue).
+        static const bool _kv_nodrain_env = [] {
+          const char *e = std::getenv("NNTR_KV_PREFILL_NODRAIN");
+          return e == nullptr || std::atoi(e) != 0;
+        }();
+        const bool kv_chain_gpu_only =
+          _kv_nodrain_env && _kv_img_attn_env && use_image_attn == 1;
         void *q_rope_out = q_out_stage != nullptr
                              ? q_out_stage
                              : (_kv_img_attn_env ? nullptr : q_cl);
@@ -1918,10 +1947,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             // This is the pre-regression cost (a drain here cost ~5 TPS
             // of decode). Non-image keeps the default drain.
             /*drain_svm_out=*/!_kv_img_attn_env) &&
-          nntrainer::rope_inplace_f16_cl(k_p, kc_p, cos_lut, sin_lut, to - from,
-                                         num_heads_KV, head_dim, cache_index,
-                                         mp, kc_svm, /*in_clmem=*/k_cl,
-                                         /*out_clmem=*/k_out_stage);
+          nntrainer::rope_inplace_f16_cl(
+            k_p, kc_p, cos_lut, sin_lut, to - from, num_heads_KV, head_dim,
+            cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
+            /*out_clmem=*/k_out_stage,
+            // Staged (k_out_stage != null) already skips the drain by writing
+            // a cl_mem; unstaged writes the SVM cache slice and, on the image
+            // chain, has the same all-GPU consumer set.
+            /*drain_svm_out=*/!kv_chain_gpu_only);
+        if (ok && k_out_stage == nullptr && kv_chain_gpu_only)
+          kv_write_undrained = true;
         if (ok && q_out_stage != nullptr) {
           q_attn_clmem = q_out_stage;
           q_rope_staged = q_out_stage;
@@ -1979,14 +2014,16 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             v_stage_clmem = v_cl;
             if (_kvst_on())
               _kvst_t0 = _kvst_now();
-          } else if (nntrainer::gpu_copy_f16_cl(v_in, v_out, v_n, v_svm,
-                                                /*in_clmem=*/v_cl,
-                                                /*out_clmem=*/nullptr,
-                                                /*drain=*/!v_stage)) {
+          } else if (nntrainer::gpu_copy_f16_cl(
+                       v_in, v_out, v_n, v_svm, /*in_clmem=*/v_cl,
+                       /*out_clmem=*/nullptr,
+                       /*drain=*/!(v_stage || kv_chain_gpu_only))) {
             if (v_stage) {
               v_stage_svm = v_in;
               v_stage_clmem = v_cl;
             }
+            if (!v_stage && kv_chain_gpu_only)
+              kv_write_undrained = true;
             if (_kvst_on())
               _kvst_t0 = _kvst_now();
           } else {
@@ -2102,6 +2139,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           k_p, kc_p, cos_lut, sin_lut, to - from, num_heads_KV, head_dim,
           cache_index, mp, kc_svm, /*in_clmem=*/k_cl,
           /*out_clmem=*/nullptr, /*drain_svm_out=*/false);
+        // Enqueued without a drain: the SVM/host fallbacks below must drain
+        // once if the image attention ends up missing this step.
+        if (ok)
+          kv_write_undrained = true;
         // V: flat copy value_step -> b_cache_value_step SVM slice (no RoPE, the
         // OHWI v-scatter source). value_step left unmodified.
         if (ok)
@@ -2997,8 +3038,8 @@ void MHACoreLayer::one_batch_incremental_forwarding(
             /*out_clmem=*/nullptr, /*drain=*/true);
           q_cl = nullptr;
         }
-        if (!ok &&
-            (kv_stage_on || k_stage != nullptr || v_stage_svm != nullptr)) {
+        if (!ok && (kv_stage_on || k_stage != nullptr ||
+                    v_stage_svm != nullptr || kv_write_undrained)) {
           // The staged K/V cache side-fills (and, in staged mode, the
           // undrained rope-Q SVM output) were never drained; the
           // flash/two_conv SVM readers below depend on them. One drain.
@@ -3109,6 +3150,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     }
     // Host/NEON attention reads Q and writes O on the host.
     mha_ring_assert_host_path_ok(kv_ring_cap, "host prefill attention");
+#if defined(ENABLE_OPENCL)
+    // A K/V cache write above may have been enqueued with a submission flush
+    // and no drain (the image-attention GPU chain). This reader is on the
+    // host, not on that queue: settle the queue once first.
+    if (kv_write_undrained)
+      nntrainer::cl_queue_finish();
+#endif
     lower_q();
     sync_kv_slab(cache_from);
     if (mha_clmem_mode && cache_to > kv_slab_synced_to)
