@@ -194,12 +194,20 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
    *  which is a measurement, not an assumption, so it is a dial rather than a
    *  new default here.
    *
-   *  Refused below max 8 or above the pack's own value: raising it would build
-   *  a plane the pack never validated, and a chunk of 0 would disable the
-   *  prefill loop entirely. */
+   *  Refused below 8 (a chunk of 0 would disable the prefill loop entirely)
+   *  or above max_seq_len. */
+  /** The upper bound is max_seq_len, not the pack's own init_seq_len. The
+   *  pack value is a DEFAULT (a plane height the pack ships with), while the
+   *  capability is max_seq_len -- Transformer::prefillChunk() clamps the
+   *  chunk to INIT_SEQ_LEN and the KV budget bounds the prompt, so any height
+   *  in [8, max_seq_len] builds a graph the pack can run. Bounding the
+   *  override by the pack value instead made a lowered default a one-way
+   *  door: once a pack ships init_seq_len 512, no A/B could raise it back to
+   *  1024 without editing the pack. */
+  const unsigned int isl_cap = nntr_cfg["max_seq_len"].get<unsigned int>();
   if (const char *isl = std::getenv("NNTR_INIT_SEQ_LEN")) {
     const int want = std::atoi(isl);
-    if (want >= 8 && want <= static_cast<int>(INIT_SEQ_LEN)) {
+    if (want >= 8 && want <= static_cast<int>(isl_cap)) {
       std::fprintf(stderr,
                    "[init_seq_len] pack %u -> %d (NNTR_INIT_SEQ_LEN); the "
                    "activation plane and the prefill chunk follow\n",
@@ -210,7 +218,7 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
       std::fprintf(stderr,
                    "[init_seq_len] ignoring NNTR_INIT_SEQ_LEN=%s: outside "
                    "[8, %u]\n",
-                   isl, static_cast<unsigned int>(INIT_SEQ_LEN));
+                   isl, isl_cap);
       std::fflush(stderr);
     }
   }
