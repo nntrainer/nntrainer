@@ -90,6 +90,8 @@
 #include <reduce_sum_layer.h>
 #include <rnn.h>
 #include <rnncell.h>
+#include <sigmoid_add_layer.h>
+#include <sigmoid_glu_layer.h>
 #include <sine_layer.h>
 #include <slice_layer.h>
 #include <split_layer.h>
@@ -450,6 +452,14 @@ void AppContext::add_default_object() {
   // LayerType enum): the same C++ class serves every engine, dispatching
   // its math through the op table.
   registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+  // The two sigmoid-gated members of the gated-activation family:
+  // sigmoid_glu (sigmoid(gate) * up) and sigmoid_add (sigmoid(gate) + addend).
+  // Both dispatch their maths through the tensor's ComputeOps table, so the
+  // same class serves every backend.
+  registerFactory(nntrainer::createLayer<SigmoidGluLayer>,
+                  SigmoidGluLayer::type);
+  registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
+                  SigmoidAddLayer::type);
 
   registerFactory(AppContext::unknownFactory<nntrainer::Layer>, "unknown",
                   LayerType::LAYER_UNKNOWN);

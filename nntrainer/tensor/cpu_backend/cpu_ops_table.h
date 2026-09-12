@@ -380,6 +380,12 @@ public:
   // out = silu(gate) * up over the live rows (numerically stable SiLU).
   void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
               unsigned int active_rows, unsigned int row_offset) override;
+  // out = sigmoid(gate) * up over the live rows (fp32-accumulated).
+  void sigmoid_glu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                   unsigned int active_rows, unsigned int row_offset) override;
+  // out = sigmoid(gate) + addend over the live rows (fp32-accumulated).
+  void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
+                   unsigned int active_rows, unsigned int row_offset) override;
   // out = (x - mean) * rsqrt(var + eps) * gamma + beta per row over width,
   // FP32 accumulation, all four activation x weight dtype combinations.
   void layer_norm(const Tensor &in, Tensor &out, const Tensor &gamma,

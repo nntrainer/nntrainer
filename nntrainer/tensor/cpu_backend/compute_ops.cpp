@@ -419,6 +419,14 @@ void ComputeOps::swiglu(const Tensor &, const Tensor &, Tensor &, unsigned int,
                         unsigned int) {
   NI(swiglu);
 }
+void ComputeOps::sigmoid_glu(const Tensor &, const Tensor &, Tensor &,
+                             unsigned int, unsigned int) {
+  NI(sigmoid_glu);
+}
+void ComputeOps::sigmoid_add(const Tensor &, const Tensor &, Tensor &,
+                             unsigned int, unsigned int) {
+  NI(sigmoid_add);
+}
 void ComputeOps::layer_norm(const Tensor &, Tensor &, const Tensor &,
                             const Tensor &, float, unsigned int, unsigned int) {
   NI(layer_norm);

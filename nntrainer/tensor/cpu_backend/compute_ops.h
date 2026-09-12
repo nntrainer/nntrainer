@@ -417,6 +417,24 @@ public:
                       unsigned int active_rows, unsigned int row_offset);
 
   /**
+   * @brief Sigmoid-gated linear unit over the `active_rows` rows starting at
+   *        `row_offset`: out = sigmoid(in1) * in2 ({gate, up} -> result).
+   *        in1/in2/out share shape; width() is the per-row element count.
+   */
+  virtual void sigmoid_glu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                           unsigned int active_rows, unsigned int row_offset);
+
+  /**
+   * @brief Sigmoid-gated add over the `active_rows` rows starting at
+   *        `row_offset`: out = sigmoid(in1) + in2 ({gate, addend} -> result).
+   *        The additive counterpart of sigmoid_glu, for architectures that mix
+   *        a side signal into the hidden state rather than scaling it.
+   *        in1/in2/out share shape; width() is the per-row element count.
+   */
+  virtual void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
+                           unsigned int active_rows, unsigned int row_offset);
+
+  /**
    * @brief Row-wise layer normalization over the `active_rows` rows starting at
    *        `row_offset`: out = (x - mean(x)) * rsqrt(var(x) + epsilon) * gamma
    *        + beta, with mean/variance taken over the LAST (width) axis and

@@ -642,6 +642,7 @@ LOCAL_SRC_FILES := \
 	 ../unittest/layers/unittest_layers_reshape.cpp \
 	 ../unittest/layers/unittest_layers_multi_head_attention.cpp \
 	 ../unittest/layers/unittest_layers_positional_encoding.cpp \
+	 ../unittest/layers/unittest_layers_sigmoid_gate.cpp \
 
 ifeq ($(MESON_ENABLE_OPENCL), 1)
 

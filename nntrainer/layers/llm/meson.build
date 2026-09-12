@@ -4,6 +4,8 @@
 llm_layer_sources = [
   'geglu_layer.cpp',
   'swiglu_layer.cpp',
+  'sigmoid_glu_layer.cpp',
+  'sigmoid_add_layer.cpp',
 ]
 
 # NOTE: concrete layer headers are not part of the -devel surface. They stay out

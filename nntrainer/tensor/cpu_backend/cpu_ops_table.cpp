@@ -48,6 +48,12 @@ inline float gelu_tanh_f(float x) {
 }
 /** silu, in the numerically stable x / (1 + exp(-x)) form */
 inline float silu_f(float x) { return x / (1.0f + std::exp(-x)); }
+/**
+ * logistic sigmoid. The OpenCL sigmoid_glu / sigmoid_add kernels and the CUDA
+ * ELTWISE_SRC ones spell it the same way (1/(1+exp(-x))) so that the three
+ * backends agree token for token rather than only to within a rounding.
+ */
+inline float sigmoid_f(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 /**
  * @brief Run a binary element-wise op over the row window, dispatching on the
@@ -173,6 +179,20 @@ void CpuComputeOps::swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
                            unsigned int active_rows, unsigned int row_offset) {
   elementwise2_rows(in1, in2, out, active_rows, row_offset, "swiglu",
                     [](float a, float b) { return silu_f(a) * b; });
+}
+
+void CpuComputeOps::sigmoid_glu(const Tensor &in1, const Tensor &in2,
+                                Tensor &out, unsigned int active_rows,
+                                unsigned int row_offset) {
+  elementwise2_rows(in1, in2, out, active_rows, row_offset, "sigmoid_glu",
+                    [](float a, float b) { return sigmoid_f(a) * b; });
+}
+
+void CpuComputeOps::sigmoid_add(const Tensor &in1, const Tensor &in2,
+                                Tensor &out, unsigned int active_rows,
+                                unsigned int row_offset) {
+  elementwise2_rows(in1, in2, out, active_rows, row_offset, "sigmoid_add",
+                    [](float a, float b) { return sigmoid_f(a) + b; });
 }
 
 void CpuComputeOps::layer_norm(const Tensor &in, Tensor &out,
