@@ -75,8 +75,10 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
       s0d.height(to - from);
       s1d.batch(1);
       s1d.height(to - from);
-      Tensor s0 = i0.getSharedDataTensor(s0d, static_cast<size_t>(b) * f0, true);
-      Tensor s1 = i1.getSharedDataTensor(s1d, static_cast<size_t>(b) * f1, true);
+      Tensor s0 =
+        i0.getSharedDataTensor(s0d, static_cast<size_t>(b) * f0, true);
+      Tensor s1 =
+        i1.getSharedDataTensor(s1d, static_cast<size_t>(b) * f1, true);
       if (hidden_step.getOps()->residual_op2(hidden_step, s0, s1))
         continue;
     }
