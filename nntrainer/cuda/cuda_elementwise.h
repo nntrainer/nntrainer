@@ -27,6 +27,15 @@ bool cuda_geglu_fp16(const unsigned short *gate, const unsigned short *up,
 bool cuda_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
                       unsigned short *out, unsigned int n);
 
+/** @brief out[i] = sigmoid(gate[i]) * up[i] (sigmoid-gated linear unit) */
+bool cuda_sigmoid_glu_fp16(const unsigned short *gate, const unsigned short *up,
+                           unsigned short *out, unsigned int n);
+
+/** @brief out[i] = sigmoid(gate[i]) + addend[i] (sigmoid-gated add) */
+bool cuda_sigmoid_add_fp16(const unsigned short *gate,
+                           const unsigned short *addend, unsigned short *out,
+                           unsigned int n);
+
 /** @brief out[i] = a[i] + b[i] (residual add) */
 bool cuda_add_fp16(const unsigned short *a, const unsigned short *b,
                    unsigned short *out, unsigned int n);

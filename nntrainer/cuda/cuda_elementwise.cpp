@@ -66,6 +66,26 @@ __global__ void swiglu_fp16(const unsigned short *gate, const unsigned short *up
   float s = x / (1.0f + expf(-x));
   out[i] = ew_f2h(s * ew_h2f(up[i]));
 }
+// The two sigmoid-gated members of the same family: the gate is squashed by
+// the plain logistic sigmoid rather than by gelu_tanh or SiLU, and the second
+// operand is either scaled by it (sigmoid_glu) or added to it (sigmoid_add).
+// FP32 math, exactly like the host CpuComputeOps loops and the OpenCL kernels.
+__global__ void sigmoid_glu_fp16(const unsigned short *gate,
+                                 const unsigned short *up, unsigned short *out,
+                                 int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float g = 1.0f / (1.0f + expf(-ew_h2f(gate[i])));
+  out[i] = ew_f2h(g * ew_h2f(up[i]));
+}
+__global__ void sigmoid_add_fp16(const unsigned short *gate,
+                                 const unsigned short *addend,
+                                 unsigned short *out, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float g = 1.0f / (1.0f + expf(-ew_h2f(gate[i])));
+  out[i] = ew_f2h(g + ew_h2f(addend[i]));
+}
 __global__ void add_fp16(const unsigned short *a, const unsigned short *b,
                          unsigned short *out, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -319,6 +339,43 @@ bool cuda_swiglu_fp16(const unsigned short *gate, const unsigned short *up,
   int ni = (int)n;
   k->SetKernelArguments(0, &gate, sizeof(gate));
   k->SetKernelArguments(1, &up, sizeof(up));
+  k->SetKernelArguments(2, &out, sizeof(out));
+  k->SetKernelArguments(3, &ni, sizeof(ni));
+  return dispatch1d(k, n);
+}
+
+bool cuda_sigmoid_glu_fp16(const unsigned short *gate, const unsigned short *up,
+                           unsigned short *out, unsigned int n) {
+  if (n == 0)
+    return true;
+  auto k =
+    CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "sigmoid_glu_fp16");
+  if (!k) {
+    ml_loge("[CUDA] sigmoid_glu_fp16: registration failed");
+    return false;
+  }
+  int ni = (int)n;
+  k->SetKernelArguments(0, &gate, sizeof(gate));
+  k->SetKernelArguments(1, &up, sizeof(up));
+  k->SetKernelArguments(2, &out, sizeof(out));
+  k->SetKernelArguments(3, &ni, sizeof(ni));
+  return dispatch1d(k, n);
+}
+
+bool cuda_sigmoid_add_fp16(const unsigned short *gate,
+                           const unsigned short *addend, unsigned short *out,
+                           unsigned int n) {
+  if (n == 0)
+    return true;
+  auto k =
+    CudaContext::Global().registerCudaKernel(ELTWISE_SRC, "sigmoid_add_fp16");
+  if (!k) {
+    ml_loge("[CUDA] sigmoid_add_fp16: registration failed");
+    return false;
+  }
+  int ni = (int)n;
+  k->SetKernelArguments(0, &gate, sizeof(gate));
+  k->SetKernelArguments(1, &addend, sizeof(addend));
   k->SetKernelArguments(2, &out, sizeof(out));
   k->SetKernelArguments(3, &ni, sizeof(ni));
   return dispatch1d(k, n);

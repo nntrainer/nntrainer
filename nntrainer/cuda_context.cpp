@@ -26,6 +26,8 @@
 #include <fc_layer_cl.h>
 #include <geglu_layer.h>
 #include <layer_normalization_layer.h>
+#include <sigmoid_add_layer.h>
+#include <sigmoid_glu_layer.h>
 
 // The decode/prefill graph state machine needs the model walk and the CUDA
 // graph API (cuda_context.h already pulls in the stream/context managers).
@@ -396,6 +398,13 @@ void CudaContext::add_default_object() {
   // only in-tree consumer of this type -- cannot be built under engine=cuda at
   // all.
   registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
+
+  // The sigmoid-gated pair likewise: CudaComputeOps has a device kernel for
+  // each of them, so the neutral layers reach the device through the table.
+  registerFactory(nntrainer::createLayer<SigmoidGluLayer>,
+                  SigmoidGluLayer::type);
+  registerFactory(nntrainer::createLayer<SigmoidAddLayer>,
+                  SigmoidAddLayer::type);
 }
 
 template <typename T>
