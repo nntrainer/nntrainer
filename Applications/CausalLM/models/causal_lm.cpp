@@ -40,7 +40,8 @@
 #include <neuralnet.h>
 
 #if defined(ENABLE_OPENCL)
-#include <cl_context.h> // OpenCL-only; registration uses the Engine facade.
+#include <blas_kernels.h> // the lm_head GEMV's deferred-logits / argmax hooks
+#include <cl_context.h>   // OpenCL-only; registration uses the Engine facade.
 #endif
 #include <common.h>
 
@@ -135,6 +136,43 @@ void materialize_pending_logits() {
     cudaMemcpy(p.host, p.dev, p.count * sizeof(float), cudaMemcpyDeviceToHost);
   }
   cudaGetLastError();
+}
+} // namespace
+#endif
+
+#if defined(ENABLE_OPENCL)
+namespace {
+// Deferred host logits, OpenCL lane -- the counterpart of the CUDA
+// PendingLogits above, one level further out.
+//
+// On this backend the logits reach the host in stages: the lm_head GEMV reads
+// the device row into the FC output tensor, a monotone post-op (gemma4's final
+// logit softcapping) rewrites it into the model's output tensor, and this
+// function widens THAT into the fp32 buffer generate() scans. Under the greedy
+// hint the first two stand down (the deferral in blas_kernels, which the
+// reduction absorbs), so the widening has nothing to widen: record what it
+// skipped instead. generate() then either takes the on-GPU token -- and the
+// row is never materialized at all -- or fills it here, replaying exactly the
+// stages that were skipped and nothing else.
+struct ClPendingLogits {
+  const void *src_fp16 = nullptr; /**< the model's fp16 row, left unwritten */
+  float *host = nullptr;          /**< caller-owned fp32 row, not yet filled */
+  size_t count = 0;
+};
+ClPendingLogits g_cl_pending_logits;
+
+/** @brief Fill the deferred host row (no-op unless one is outstanding). */
+void materialize_cl_pending_logits() {
+  const ClPendingLogits p = g_cl_pending_logits;
+  g_cl_pending_logits = ClPendingLogits{};
+  if (p.src_fp16 == nullptr || p.host == nullptr)
+    return;
+#ifdef ENABLE_FP16
+  // Device -> the FC row, replay the post-op into the model's row, then widen.
+  nntrainer::cl_lmhead_materialize_logits();
+  nntrainer::getComputeOps()->scopy_fp16_to_fp32(
+    p.count, static_cast<const _FP16 *>(p.src_fp16), 1, p.host, 1);
+#endif
 }
 } // namespace
 #endif
@@ -451,6 +489,11 @@ std::vector<float *> CausalLM::incrementalInference(
   // Output conversion identical to the float* overload in neuralnet.cpp.
   std::vector<float *> output;
   output.reserve(output_tensors.size());
+#if defined(ENABLE_OPENCL)
+  // Same rule as the CUDA stash below: a row deferred by the previous call and
+  // never claimed names a buffer the caller has since returned to the pool.
+  g_cl_pending_logits = ClPendingLogits{};
+#endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
   // Invalidate any stale device-logits stash; re-armed below
   // only when this call's first output is device-accessible (UVM / managed /
@@ -530,15 +573,41 @@ std::vector<float *> CausalLM::incrementalInference(
         cudaGetLastError();
       }
 #endif
+#if defined(ENABLE_OPENCL)
+      // The logits chain stood down for this row under the greedy hint, so
+      // there is nothing here to widen yet. Record the ingredients instead --
+      // generate() either takes the on-GPU token and drops the row, or fills it
+      // through materialize_cl_pending_logits(). Keyed on the row address, so
+      // it can only ever match the buffer that chain declined to fill.
+      bool defer_cl_logits = false;
+      if (batch_size == 1 && nntrainer::cl_lmhead_logits_deferred(out_src)) {
+        g_cl_pending_logits = {out_src, last_out_buf_data, buf_size};
+        defer_cl_logits = true;
+      } else {
+        // Safety net, and the reason a deferral can never corrupt a token: if
+        // the GEMV left a row on the device that this output is NOT, the
+        // widening below would read the previous step's numbers. Pay the
+        // readback now instead. Costs exactly what the old code always paid.
+        nntrainer::cl_lmhead_materialize_logits();
+      }
+#endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
       if (!defer_host_logits)
 #endif
-        nntrainer::getComputeOps()->scopy_fp16_to_fp32(buf_size, out_src, 1,
-                                                       last_out_buf_data, 1);
+#if defined(ENABLE_OPENCL)
+        if (!defer_cl_logits)
+#endif
+          nntrainer::getComputeOps()->scopy_fp16_to_fp32(buf_size, out_src, 1,
+                                                         last_out_buf_data, 1);
 #else
       throw std::invalid_argument("Error: enable-fp16 is not set");
 #endif
     } else if (out->getDataType() == ml::train::TensorDim::DataType::FP32) {
+#if defined(ENABLE_OPENCL)
+      // Same safety net as the fp16 branch: this path copies the row wholesale,
+      // so anything the GEMV deferred has to land first.
+      nntrainer::cl_lmhead_materialize_logits();
+#endif
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
       bool defer_host_logits = false;
       // Per-token cudart touches are cuda-run only (see the fp16 branch note).
@@ -776,6 +845,22 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
                   logits_processor == nullptr && BATCH_SIZE == 1 &&
                   !rp_active && !bw_active;
 #endif
+#if defined(ENABLE_OPENCL)
+  // Same predicates the host path below applies, so the device route can never
+  // skip a penalty the host would have applied.
+  const bool cl_rp_active =
+    repetition_penalty != 1 && input_ids != nullptr && NUM_INPUT_IDS != 0;
+  const bool cl_bw_active = BAD_WORD_IDS.size() != 0 && NUM_BADWORDS != 0;
+  // Tell the NEXT lm_head GEMV whether the full-vocabulary host row is going to
+  // be read at all. Recomputed every call, so a run that switches sampling on
+  // pays one deferred readback and then stops deferring. Unlike the CUDA lane
+  // there is no on-device penalty kernel here, so any penalty keeps the host
+  // row. Guarded on the engine: on a cuda or cpu run this arms nothing.
+  const bool cl_greedy = causallm_engine() == "gpu" && do_sample == false &&
+                         logits_processor == nullptr && BATCH_SIZE == 1 &&
+                         !cl_rp_active && !cl_bw_active;
+  nntrainer::cl_lmhead_set_greedy_hint(cl_greedy);
+#endif
   for (unsigned int iteration = 0; iteration < BATCH_SIZE; ++iteration) {
 #if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
     // CUDA on-GPU greedy argmax: reduce the device-resident
@@ -814,6 +899,36 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
     // above refused it or the reduction failed. Either way the host row may
     // still be outstanding, so fill it before anyone reads `logits`.
     materialize_pending_logits();
+#endif
+
+#if defined(ENABLE_OPENCL)
+    // OpenCL on-GPU greedy argmax: reduce the device-resident lm_head row to a
+    // token id on the GPU and read back 4 bytes, skipping the softcapping pass
+    // over the vocabulary, the fp16 -> fp32 widening and the max_element. The
+    // gate is the deferral itself -- the GEMV only defers under the greedy
+    // hint -- plus this call's own predicates, re-checked because the hint was
+    // armed one step earlier. Ties resolve to the lowest index exactly as
+    // std::max_element does, so the token is bit-identical to the host path.
+    if (g_cl_pending_logits.host != nullptr &&
+        g_cl_pending_logits.host == logits && do_sample == false &&
+        logits_processor == nullptr && !cl_rp_active && !cl_bw_active) {
+      unsigned int tok = 0;
+      if (nntrainer::cl_lmhead_dev_argmax(NUM_VOCAB, &tok)) {
+        // The deferred host row was never needed -- drop it unfilled.
+        g_cl_pending_logits = ClPendingLogits{};
+        outputs.push_back(tok);
+        logits = logits + NUM_VOCAB;
+        if (input_ids != nullptr)
+          input_ids = input_ids + MAX_SEQ_LEN;
+        continue;
+      }
+      // else: the reduction refused this row; fall through to the host path,
+      // which materializes it just below.
+    }
+    // Reached only when the device path did not take this row. Either way the
+    // host row may still be outstanding, so fill it before anyone reads
+    // `logits`.
+    materialize_cl_pending_logits();
 #endif
 
     // apply repetition penalty
