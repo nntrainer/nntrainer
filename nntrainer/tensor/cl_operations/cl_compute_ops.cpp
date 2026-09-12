@@ -46,6 +46,8 @@
 #include <geglu_cl_op.h>
 #include <gelu_cl_op.h>
 #include <layernorm_cl_op.h>
+#include <sigmoid_add_cl_op.h>
+#include <sigmoid_glu_cl_op.h>
 #include <swiglu_cl_op.h>
 #include <tensor.h>
 
@@ -185,6 +187,16 @@ public:
   void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
               unsigned int active_rows, unsigned int row_offset) override {
     nntrainer::swiglu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+  // The two sigmoid-gated members of the family: sigmoid_glu multiplies the
+  // second operand by the gate, sigmoid_add adds it.
+  void sigmoid_glu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                   unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::sigmoid_glu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+  void sigmoid_add(const Tensor &in1, const Tensor &in2, Tensor &out,
+                   unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::sigmoid_add_cl_op(in1, in2, out, active_rows, row_offset);
   }
 
   // LayerNorm over the last axis. The neutral LayerNormalizationLayer owns

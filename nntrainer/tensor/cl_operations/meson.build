@@ -12,6 +12,8 @@ cl_op_sources = [
   'gelu_cl_op.cpp',
   'geglu_cl_op.cpp',
   'swiglu_cl_op.cpp',
+  'sigmoid_glu_cl_op.cpp',
+  'sigmoid_add_cl_op.cpp',
   'v8c_pack_cache.cpp',
 ]
 

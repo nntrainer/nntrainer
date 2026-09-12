@@ -103,6 +103,8 @@ if get_option('enable-opencl')
   if get_option('enable-fp16')
     test_target += [['unittest_cl_residency', []]]
   endif
+  # CPU-vs-OpenCL differential for the fused sigmoid-gated whole-ops.
+  test_target += [['unittest_sigmoid_gate_ops_cl', []]]
 endif
 
 if get_option('enable-fp16')
