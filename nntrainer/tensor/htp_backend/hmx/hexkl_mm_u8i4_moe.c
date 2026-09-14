@@ -313,6 +313,16 @@ int hexkl_mm_u8i4_moe_layer_run(
     }
     n_rows += row_count[e];
   }
+  /* Bounds are checked because out_f32 is indexed by these; distinctness
+     within one expert's slice is NOT, and moe_scatter_worker needs it (see
+     its comment) or two workers read-modify-write one output row. Top-k
+     routing gives it for free -- a token picks k distinct experts -- and
+     checking it here would cost a per-expert bitmap over M on every call to
+     restate what the caller's routing already guarantees.
+     ponytail: a caller that repeats a row inside one expert gets a racy
+     sum, not a wrong shape. If a future router can do that, the fix is to
+     sort each slice and merge duplicates on the ARM side before the call,
+     not a scan here. */
   for (uint32_t i = 0; i < n_rows; ++i) {
     if (row_index[i] >= M) {
       return AEE_EBADPARM;

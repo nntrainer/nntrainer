@@ -1122,12 +1122,43 @@ TEST_F(HmxMmU8I4Layer, MoeLayerMatchesTwoCallReference) {
   {
     uint32_t st = 0xC0FFEEu;
     for (uint32_t e = 0; e < NE; ++e) {
+      // Top-k routing gives a token k DISTINCT experts, so one expert sees a
+      // given row at most once. moe_scatter_worker splits a block by row and
+      // relies on that: two entries in one block with the same row_index are
+      // two workers doing read-modify-write on one output row. Drawing with
+      // replacement here put 13 such pairs in expert 0 alone, which made this
+      // comparison a race against an input real routing never produces.
+      std::vector<bool> taken(M, false);
       for (uint32_t i = 0; i < row_count[e]; ++i) {
-        st = st * 1664525u + 1013904223u;
-        row_index.push_back((st >> 8) % M);
+        uint32_t r;
+        do {
+          st = st * 1664525u + 1013904223u;
+          r = (st >> 8) % M;
+        } while (taken[r]);
+        taken[r] = true;
+        row_index.push_back(r);
         st = st * 1664525u + 1013904223u;
         row_weight.push_back(0.1f + 0.9f * ((st >> 8) % 1000u) / 1000.0f);
       }
+    }
+  }
+
+  // Rows several experts land on are the ones where a reordered scatter shows
+  // up, since float addition is associative only for two terms. Counting them
+  // turns a bad_elems number into a place to look: confined to these rows means
+  // accumulation order, spread beyond them means the matmul or the quantizer.
+  std::vector<uint32_t> hits(M, 0);
+  for (uint32_t r : row_index) {
+    ++hits[r];
+  }
+  {
+    std::vector<uint32_t> hist(NE + 1, 0);
+    for (uint32_t h : hits) {
+      ++hist[h];
+    }
+    for (uint32_t k = 2; k <= NE; ++k) {
+      std::cout << "U8I4_FIELD path=moe_layer field=rows_with_" << k
+                << "_experts value=" << hist[k] << std::endl;
     }
   }
 
@@ -1192,16 +1223,36 @@ TEST_F(HmxMmU8I4Layer, MoeLayerMatchesTwoCallReference) {
 
   size_t bad = 0;
   size_t first = got.size();
+  size_t bad_single = 0; // on a row exactly one expert wrote
+  uint32_t max_ulp = 0;
   for (size_t i = 0; i < got.size(); ++i) {
     if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) {
       if (bad == 0) {
         first = i;
       }
       ++bad;
+      if (hits[i / N] <= 1u) {
+        ++bad_single;
+      }
+      // Distance in representable steps. Same sign and both finite here, so
+      // the bit patterns as integers are monotone and subtracting them counts
+      // the floats in between: 1 is adjacent, which only reassociation does.
+      uint32_t a, b;
+      std::memcpy(&a, &got[i], sizeof a);
+      std::memcpy(&b, &want[i], sizeof b);
+      const uint32_t d = (a > b) ? (a - b) : (b - a);
+      if (d > max_ulp) {
+        max_ulp = d;
+      }
     }
   }
   std::cout << "U8I4_FIELD path=moe_layer field=bad_elems value=" << bad
             << " of " << got.size() << std::endl;
+  std::cout << "U8I4_FIELD path=moe_layer field=bad_on_single_expert_rows"
+               " value="
+            << bad_single << std::endl;
+  std::cout << "U8I4_FIELD path=moe_layer field=max_ulp value=" << max_ulp
+            << std::endl;
   if (bad != 0) {
     std::cout << "  first at " << first << " (row " << first / N << " col "
               << first % N << "): got " << std::hexfloat << got[first]
