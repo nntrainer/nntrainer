@@ -218,10 +218,27 @@ enum {
 #endif
 #endif
 
+#ifdef NNTR_HAVE_HAP_MMAP
+/* The DSP half of fastrpc_mmap. The host attaches a dma_buf fd to the
+   session and the DSP asks where it landed; it does not map the fd itself.
+   HAP_mmap's POSIX shape invites the other reading, and taking it cost two
+   device cycles: all five prot/flags pairs came back MAP_FAILED, which the
+   probe reads as "known and refused" -- what an fd that is already mapped
+   would say.
+
+   Declared weak rather than relied on, because this is a probe: an SDK
+   without the symbol should make it report "no" at runtime, not fail to
+   link. Redeclaring what HAP_mem.h already declares is harmless as long as
+   the signatures agree, and a build error here is the cheap way to find out
+   they do not. */
+extern int HAP_mmap_get(int fd, void **vaddr, int *size) __attribute__((weak));
+extern int HAP_mmap_put(int fd) __attribute__((weak));
+#endif
+
 int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
                          uint32 dma_bytes, uint32 *res, int resLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s || !res || resLen < 8) {
+  if (!s || !res || resLen < 10) {
     return AEE_EBADPARM;
   }
   for (int i = 0; i < resLen; ++i) {
@@ -259,9 +276,28 @@ int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
     const uint32_t n_try = (uint32_t)(sizeof(kTry) / sizeof(kTry[0]));
     void *va = NULL;
     uint64_t t1 = t0;
-    for (uint32_t ti = 0; ti < n_try; ++ti) {
-      void *p = HAP_mmap(NULL, (int)bytes, kTry[ti].prot, kTry[ti].flags, fd,
-                         0);
+    int used_get = 0;
+
+    /* Ask for the mapping the host already made, before trying to make one.
+       res[8] carries the return code either way, so "the symbol is missing"
+       and "the symbol said no" stay apart. */
+    res[9] = (HAP_mmap_get != NULL) ? 1u : 0u;
+    if (HAP_mmap_get != NULL) {
+      void *gp = NULL;
+      int gsz = 0;
+      const int grc = HAP_mmap_get(fd, &gp, &gsz);
+      res[8] = (uint32)grc;
+      if (grc == 0 && gp != NULL && (uint32)gsz >= bytes) {
+        va = gp;
+        used_get = 1;
+        t1 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+        res[6] = 6u; /* past the five prot/flags pairs */
+      }
+    }
+
+    for (uint32_t ti = 0; va == NULL && ti < n_try; ++ti) {
+      void *p =
+        HAP_mmap(NULL, (int)bytes, kTry[ti].prot, kTry[ti].flags, fd, 0);
       if (p != NULL && p != (void *)-1) {
         va = p;
         t1 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
@@ -311,7 +347,14 @@ int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
       }
       res[4] = sum;
     }
-    res[5] = (HAP_munmap(va, (int)bytes) == 0) ? 1u : 0u;
+    /* Release through whichever call handed it over: a mapping obtained
+       with HAP_mmap_get belongs to the host's attachment and is given back
+       with HAP_mmap_put, not unmapped. */
+    if (used_get) {
+      res[5] = (HAP_mmap_put != NULL && HAP_mmap_put(fd) == 0) ? 1u : 0u;
+    } else {
+      res[5] = (HAP_munmap(va, (int)bytes) == 0) ? 1u : 0u;
+    }
   }
   return AEE_SUCCESS;
 #endif
