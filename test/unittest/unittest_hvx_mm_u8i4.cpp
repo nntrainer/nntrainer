@@ -1505,8 +1505,10 @@ TEST_F(HmxMmU8I4Layer, RegistryCapacity) {
   // raised before the registration function runs), and a PD in that state
   // fails every call including this one -- which printed 516 identical
   // failures and turned the suite red for the ceiling working as measured.
-  // So count them, and assert only in the case where the PD is healthy:
-  // stopping at our own cap means releases have no excuse.
+  // The code they fail with says as much: 0x27, which is neither success nor
+  // the AEE_EBADPARM hexkl_weight_u8i4_release can return, so the call never
+  // reached it. So count them, and assert only in the case where the PD is
+  // healthy: stopping at our own cap means releases have no excuse.
   size_t released = 0;
   int first_release_err = AEE_SUCCESS;
   for (uint32_t h : handles) {
@@ -1640,8 +1642,17 @@ TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
   auto fmunmap = (FastrpcMunmap)dlsym(RTLD_DEFAULT, "fastrpc_munmap");
   field("fastrpc_mmap", fmmap ? "yes" : "no");
 
-  const int kCdspDomain = 3; // CDSP_DOMAIN_ID
-  const int kMapFd = 0;      // FASTRPC_MAP_FD
+  // Taken from remote.h rather than written as numbers: attempt 3 passed 0
+  // with a comment calling it FASTRPC_MAP_FD, and 0 is FASTRPC_MAP_STATIC --
+  // the mapping the driver makes for a buffer passed as a call argument,
+  // pinned to one remote address and not tagged with the fd. FASTRPC_MAP_FD
+  // is the one whose documentation says the DSP fetches the address with
+  // HAP_mmap_get / HAP_mmap_put, which is what the probe calls. The values
+  // are printed so the log carries what this build actually sent.
+  const int kCdspDomain = CDSP_DOMAIN_ID;
+  const int kMapFd = static_cast<int>(FASTRPC_MAP_FD);
+  field("map_domain", std::to_string(kCdspDomain));
+  field("map_flag", std::to_string(kMapFd));
   bool attached = false;
   if (fmmap != nullptr) {
     const int rc = fmmap(kCdspDomain, fd, buf, 0, kBytes, kMapFd);
