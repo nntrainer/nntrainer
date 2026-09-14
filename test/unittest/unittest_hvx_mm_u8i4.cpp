@@ -1203,7 +1203,15 @@ TEST_F(HmxMmU8I4Layer, MoeLayerMatchesTwoCallReference) {
         const float *src = &ye[static_cast<size_t>(i) * N];
         const float w = row_weight[base + i];
         for (uint32_t c = 0; c < N; ++c) {
-          dst[c] += src[c] * w;
+          // Two statements, so the product is rounded before it is added.
+          // Written as one, clang contracts this to FMLA at the default
+          // -ffp-contract=on and rounds once, while hvx_scale_add_rows_f32
+          // on the DSP multiplies and adds separately. A row one expert
+          // wrote still matched -- dst is 0 there and fma(s, w, 0) rounds
+          // the same -- so the gap only opened on the second contribution,
+          // which is what made it look like the batching.
+          const float p = src[c] * w;
+          dst[c] = dst[c] + p;
         }
       }
       base += n_e;
@@ -1225,12 +1233,14 @@ TEST_F(HmxMmU8I4Layer, MoeLayerMatchesTwoCallReference) {
   size_t first = got.size();
   size_t bad_single = 0; // on a row exactly one expert wrote
   uint32_t max_ulp = 0;
+  std::vector<uint32_t> bad_per_row(M, 0);
   for (size_t i = 0; i < got.size(); ++i) {
     if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) {
       if (bad == 0) {
         first = i;
       }
       ++bad;
+      ++bad_per_row[i / N];
       if (hits[i / N] <= 1u) {
         ++bad_single;
       }
@@ -1253,6 +1263,30 @@ TEST_F(HmxMmU8I4Layer, MoeLayerMatchesTwoCallReference) {
             << bad_single << std::endl;
   std::cout << "U8I4_FIELD path=moe_layer field=max_ulp value=" << max_ulp
             << std::endl;
+  // Spread decides where to look next. A mismatch sitting on a few rows is
+  // about those rows -- how their contributions were combined. One that
+  // touches most routed rows a little is the matmul or the quantizer, which
+  // every row goes through.
+  {
+    uint32_t bad_rows = 0, routed_rows = 0, worst = 0;
+    for (uint32_t r = 0; r < M; ++r) {
+      if (hits[r] != 0u) {
+        ++routed_rows;
+      }
+      if (bad_per_row[r] != 0u) {
+        ++bad_rows;
+        if (bad_per_row[r] > worst) {
+          worst = bad_per_row[r];
+        }
+      }
+    }
+    std::cout << "U8I4_FIELD path=moe_layer field=bad_rows value=" << bad_rows
+              << " of " << routed_rows << " routed" << std::endl;
+    std::cout << "U8I4_FIELD path=moe_layer field=worst_row_bad_cols value="
+              << worst << " of " << N << std::endl;
+    std::cout << "U8I4_FIELD path=moe_layer field=first_bad_row_experts value="
+              << (first < got.size() ? hits[first / N] : 0u) << std::endl;
+  }
   if (bad != 0) {
     std::cout << "  first at " << first << " (row " << first / N << " col "
               << first % N << "): got " << std::hexfloat << got[first]
