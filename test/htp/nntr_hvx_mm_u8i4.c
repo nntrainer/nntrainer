@@ -218,22 +218,6 @@ enum {
 #endif
 #endif
 
-#ifdef NNTR_HAVE_HAP_MMAP
-/* The DSP half of fastrpc_mmap. The host attaches a dma_buf fd to the
-   session and the DSP asks where it landed; it does not map the fd itself.
-   HAP_mmap's POSIX shape invites the other reading, and taking it cost two
-   device cycles: all five prot/flags pairs came back MAP_FAILED, which the
-   probe reads as "known and refused" -- what an fd that is already mapped
-   would say.
-
-   Declared weak rather than relied on, because this is a probe: an SDK
-   without the symbol should make it report "no" at runtime, not fail to
-   link. Redeclaring what HAP_mem.h already declares is harmless as long as
-   the signatures agree, and a build error here is the cheap way to find out
-   they do not. */
-extern int HAP_mmap_get(int fd, void **vaddr, int *size) __attribute__((weak));
-extern int HAP_mmap_put(int fd) __attribute__((weak));
-#endif
 
 int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
                          uint32 dma_bytes, uint32 *res, int resLen) {
@@ -279,15 +263,19 @@ int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
     int used_get = 0;
 
     /* Ask for the mapping the host already made, before trying to make one.
-       res[8] carries the return code either way, so "the symbol is missing"
-       and "the symbol said no" stay apart. */
-    res[9] = (HAP_mmap_get != NULL) ? 1u : 0u;
-    if (HAP_mmap_get != NULL) {
+       HAP_mem.h declares this as (fd, void **vaddr, uint64 *paddr) -- the
+       third argument is the physical address, not a size, so there is
+       nothing to check the length against here; the host sized the buffer.
+       res[8] keeps the return code and res[9] the low half of the physical
+       address, which separates "mapped somewhere real" from a zero that
+       happens to come back with rc 0. */
+    {
       void *gp = NULL;
-      int gsz = 0;
-      const int grc = HAP_mmap_get(fd, &gp, &gsz);
+      uint64 gpa = 0;
+      const int grc = HAP_mmap_get(fd, &gp, &gpa);
       res[8] = (uint32)grc;
-      if (grc == 0 && gp != NULL && (uint32)gsz >= bytes) {
+      res[9] = (uint32)(gpa & 0xFFFFFFFFu);
+      if (grc == 0 && gp != NULL) {
         va = gp;
         used_get = 1;
         t1 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
@@ -351,7 +339,7 @@ int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
        with HAP_mmap_get belongs to the host's attachment and is given back
        with HAP_mmap_put, not unmapped. */
     if (used_get) {
-      res[5] = (HAP_mmap_put != NULL && HAP_mmap_put(fd) == 0) ? 1u : 0u;
+      res[5] = (HAP_mmap_put(fd) == 0) ? 1u : 0u;
     } else {
       res[5] = (HAP_munmap(va, (int)bytes) == 0) ? 1u : 0u;
     }

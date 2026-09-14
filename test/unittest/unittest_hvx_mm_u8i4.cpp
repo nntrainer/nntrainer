@@ -1662,16 +1662,18 @@ TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
   static const char *kTryName[] = {"none",      "rw|shared", "r|shared",
                                    "rw|private", "r|private", "rw|0",
                                    "mmap_get"};
-  field("hap_mmap_accepted",
-        res[6] < (sizeof(kTryName) / sizeof(kTryName[0])) ? kTryName[res[6]]
-                                                          : "?");
+  field("hap_mmap_accepted", res[6] < (sizeof(kTryName) / sizeof(kTryName[0]))
+                               ? kTryName[res[6]]
+                               : "?");
   field("hap_mmap_fail_mask", hex((int)res[7]));
   // Whether the DSP had HAP_mmap_get at all, and what it said. An fd the
   // host attached with fastrpc_mmap is already mapped on the DSP, so this
   // asks for that address instead of making a second mapping -- which is
   // what every prot/flags pair refused to do.
-  field("hap_mmap_get_symbol", res[9] ? "yes" : "no");
   field("hap_mmap_get_rc", hex((int)res[8]));
+  // Low half of the physical address it reported. Zero with rc 0 would mean
+  // the call answered without actually pointing anywhere.
+  field("hap_mmap_get_paddr_lo", hex((int)res[9]));
   if (err == AEE_SUCCESS) {
     const double gbs = res[2] > 0 ? (double)res[3] / res[2] / 1000.0 : 0.0;
     field("mapped", res[0] ? "yes" : "no");
