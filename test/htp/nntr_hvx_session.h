@@ -31,6 +31,18 @@
  * so that is not a real constraint today; it would need addressing before
  * this skel served more than one client process at once.
  */
+/** @brief How many host arenas one session can have mapped at once. The
+ *  whole-model plan needs 3.9 GB in chunks of at most 1 GiB (rpcmem/ION
+ *  allocation size, doc 45 Gate 0b), so four; eight leaves room. */
+#define NNTR_HVX_MAX_ARENAS 8
+
+/** @brief One host rpcmem buffer as the DSP sees it. va NULL means free. */
+typedef struct {
+  int fd;
+  uint8_t *va;
+  uint32_t bytes;
+} nntr_hvx_arena;
+
 typedef struct {
   uint8_t *vtcm_base;
   uint32_t vtcm_size;
@@ -39,6 +51,12 @@ typedef struct {
   hexkl_weight_u8i4_table weights_u8i4;
   hexkl_weight_u8i8_table weights_u8i8;
   hvx_worker_pool *quant_pool; /**< sized from the HVX unit count in open() */
+  nntr_hvx_arena arenas[NNTR_HVX_MAX_ARENAS];
 } nntr_hvx_session;
+
+/** @brief HAP_mmap_put on every attached arena. close() calls it after the
+ *  weight tables are released, since a borrowed slot points into one. Lives
+ *  in nntr_hvx_mm_u8i4.c, the one file that includes HAP_mem.h. */
+void nntr_hvx_arenas_put_all(nntr_hvx_session *s);
 
 #endif /* __NNTR_HVX_SESSION_H__ */

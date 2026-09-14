@@ -56,6 +56,14 @@ log "1/4  Building the DSP skel (test/htp/build.sh, HexKL $HEXKL_SDK_VER)"
 )
 SKEL="$REPO_ROOT/test/htp/build/libnntr_hvx_skel.so"
 [ -f "$SKEL" ] || fail "skel did not build: $SKEL"
+# The ARM client stub comes from the same IDL and is generated separately.
+# Regenerated here every time rather than when the IDL "looks" changed: a
+# fresh skel meeting a stale client returns EBADPARM on the new entry points
+# and the two once drifted for exactly that reason (doc 46 section 14.2).
+log "1b/4 Regenerating the ARM client stub (generate_stub.sh)"
+HEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
+  bash "$REPO_ROOT/nntrainer/tensor/htp_backend/generate_stub.sh" ||
+  fail "generate_stub.sh failed"
 
 # --- 2. libnntrainer.so for arm64-v8a --------------------------------------
 # unittest_hvx_mm_u8i4 does not itself call into nntrainer, but Android.mk's

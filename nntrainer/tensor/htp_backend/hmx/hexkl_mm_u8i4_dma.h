@@ -46,6 +46,7 @@ typedef struct {
   int32_t *colsum_w; /**< N entries */
   float *bias;       /**< N entries */
   uint32_t K, N;
+  int borrowed; /**< wh_bytes points into a host arena, not our heap */
 } hexkl_weight_u8i4;
 
 typedef struct {
@@ -79,31 +80,27 @@ int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                                hvx_worker_pool *pool, uint32_t *out_handle);
 
 /**
- * @brief Same registration, but the WH bytes are already baked.
+ * @brief Registers a weight whose WH bytes already sit in host memory the
+ *        DSP has mapped (an arena), borrowing them in place.
  *
- * The bake is the expensive half of registration -- about 25 ms for a
- * gate_up weight, 1597 ms across a 64-weight model -- and it is
- * deterministic, so a run that has paid for it once can hand the bytes to
- * the next run instead. hexkl_weight_u8i4_export reads them back out.
+ * Nothing is copied and nothing is allocated for the bytes: the slot points
+ * at @a wh and release() leaves it alone. The three N-sized arrays are
+ * copied, they are small. The caller guarantees @a wh stays mapped and
+ * unchanged for the handle's lifetime -- the arena code refuses to detach
+ * while a slot borrows from it, which is the check that keeps that promise.
  *
- * Takes no VTCM and no worker pool: there is nothing to stage and nothing
- * to parallelise, only the copy into the slot's resident arrays.
- *
- * @a wh_len must equal (K/32)*(N/32)*512. It is checked rather than
- * trusted: these bytes reach the DSP from a file, and a wrong length is a
- * silently wrong matmul, not a crash.
- *
- * @param vtcm_size  only to apply the same "does this weight fit" rule the
- *                   bake path applies, so both paths accept the same set
- * @return AEE_SUCCESS, AEE_EBADPARM on a shape or length violation,
- *         AEE_ENOMEMORY if the table is full or an allocation fails
+ * @a wh must be WEIGHT_TILE_BYTES_U8I4-aligned: every DMA out of it starts
+ * on a tile boundary and the ring's 2D descriptors assume it.
  */
-int hexkl_weight_u8i4_register_baked(hexkl_weight_u8i4_table *tbl,
+int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
                                      uint32_t vtcm_size, uint32_t K, uint32_t N,
-                                     const uint8_t *wh_src, uint32_t wh_len,
-                                     const float *w_scale,
+                                     const uint8_t *wh, const float *w_scale,
                                      const int32_t *colsum_w, const float *bias,
                                      uint32_t *out_handle);
+
+/** @brief Whether any live slot borrows bytes inside [base, base+bytes). */
+int hexkl_weight_u8i4_borrows(const hexkl_weight_u8i4_table *tbl,
+                              const uint8_t *base, uint32_t bytes);
 
 /**
  * @brief Copies a registered weight's baked WH bytes out, for caching.

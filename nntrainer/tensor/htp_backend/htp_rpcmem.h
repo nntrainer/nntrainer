@@ -47,6 +47,13 @@ struct HtpRpcMemApi {
       whose libcdsprpc.so predates it still allocates and frees normally,
       and only the arena path needs it. */
   int (*to_fd)(void *p) = nullptr;
+  /** Attach / detach a buffer to the DSP session by fd, so the DSP can map
+      it once with HAP_mmap_get instead of receiving it per call. Optional
+      for the same reason as to_fd. Signatures as remote.h declares them;
+      the flags argument takes a fastrpc_map_flags value. */
+  int (*mmap)(int domain, int fd, void *addr, int offset, size_t length,
+              int flags) = nullptr;
+  int (*munmap)(int domain, int fd, void *addr, size_t length) = nullptr;
 
   static const HtpRpcMemApi &get() {
     static HtpRpcMemApi api = [] {
@@ -56,6 +63,10 @@ struct HtpRpcMemApi {
         (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
       a.free_ = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
       a.to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+      a.mmap = (int (*)(int, int, void *, int, size_t, int))dlsym(
+        RTLD_DEFAULT, "fastrpc_mmap");
+      a.munmap = (int (*)(int, int, void *, size_t))dlsym(RTLD_DEFAULT,
+                                                          "fastrpc_munmap");
       if (a.alloc == nullptr || a.free_ == nullptr) {
         // Partial API is not usable -- treat as absent rather than mixing
         // an rpcmem_alloc with a libc free or vice versa.
@@ -72,6 +83,11 @@ struct HtpRpcMemApi {
 
 constexpr int HTP_RPC_HEAP_ID_SYSTEM = 25;    // rpcmem.h RPCMEM_HEAP_ID_SYSTEM
 constexpr uint32_t HTP_RPC_FLAGS_DEFAULT = 1; // rpcmem.h RPCMEM_DEFAULT_FLAGS
+/** rpcmem.h RPCMEM_FLAG_UNCACHED. The arena is allocated with this: the DSP
+    maps it once and the host keeps writing into it afterwards, and with an
+    uncached CPU mapping those writes reach DDR with no flush to remember.
+    The cost is on the CPU write side only -- the host never reads it back. */
+constexpr uint32_t HTP_RPC_FLAGS_UNCACHED = 0;
 
 /**
  * @brief A byte buffer the FastRPC driver can map once instead of per call.
@@ -80,12 +96,12 @@ constexpr uint32_t HTP_RPC_FLAGS_DEFAULT = 1; // rpcmem.h RPCMEM_DEFAULT_FLAGS
  */
 class HtpRpcBuffer {
 public:
-  explicit HtpRpcBuffer(size_t bytes) : bytes_(bytes) {
+  explicit HtpRpcBuffer(size_t bytes, uint32_t flags = HTP_RPC_FLAGS_DEFAULT) :
+    bytes_(bytes) {
     const HtpRpcMemApi &api = HtpRpcMemApi::get();
     if (api.alloc != nullptr) {
-      data_ = static_cast<uint8_t *>(api.alloc(HTP_RPC_HEAP_ID_SYSTEM,
-                                               HTP_RPC_FLAGS_DEFAULT,
-                                               static_cast<int>(bytes)));
+      data_ = static_cast<uint8_t *>(
+        api.alloc(HTP_RPC_HEAP_ID_SYSTEM, flags, static_cast<int>(bytes)));
       ion_ = (data_ != nullptr);
     }
     if (data_ == nullptr) {

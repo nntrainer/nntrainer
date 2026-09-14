@@ -124,30 +124,6 @@ int nntr_hvx_weight_register_u8i4(remote_handle64 handle, uint32 K, uint32 N,
                                     colsum_w, bias, s->quant_pool, w_handle);
 }
 
-int nntr_hvx_weight_register_u8i4_baked(remote_handle64 handle, uint32 K,
-                                        uint32 N, const uint8 *wh_src,
-                                        int wh_srcLen, const float *w_scale,
-                                        int w_scaleLen, const int32 *colsum_w,
-                                        int colsum_wLen, const float *bias,
-                                        int biasLen, uint32 *w_handle) {
-  nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s) {
-    return AEE_EBADPARM;
-  }
-  /* Only the three N-sized arrays can be checked here; wh_srcLen is checked
-     against the shape inside hexkl_weight_u8i4_register_baked, which is the
-     side that owns the tile layout. */
-  if ((uint32_t)w_scaleLen != N || (uint32_t)colsum_wLen != N ||
-      (uint32_t)biasLen != N) {
-    FARF(ERROR, "weight_register_u8i4_baked: bad lengths (K=%u N=%u)",
-         (unsigned)K, (unsigned)N);
-    return AEE_EBADPARM;
-  }
-  return hexkl_weight_u8i4_register_baked(&s->weights_u8i4, s->vtcm_size, K, N,
-                                          wh_src, (uint32_t)wh_srcLen, w_scale,
-                                          colsum_w, bias, w_handle);
-}
-
 int nntr_hvx_weight_bake_export(remote_handle64 handle, uint32 w_handle,
                                 uint8 *wh_out, int wh_outLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
@@ -346,6 +322,129 @@ int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
   }
   return AEE_SUCCESS;
 #endif
+}
+
+/* ---- the arena (doc 46 section 32) ------------------------------------- */
+
+static nntr_hvx_arena *nntr_hvx_arena_slot(nntr_hvx_session *s, uint32 arena) {
+  if (arena >= NNTR_HVX_MAX_ARENAS || s->arenas[arena].va == NULL) {
+    return NULL;
+  }
+  return &s->arenas[arena];
+}
+
+int nntr_hvx_arena_attach(remote_handle64 handle, int32 fd, uint32 bytes,
+                          uint32 *arena) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || !arena || bytes == 0u) {
+    return AEE_EBADPARM;
+  }
+#ifndef NNTR_HAVE_HAP_MMAP
+  (void)fd;
+  FARF(ERROR, "arena_attach: HAP_mem.h not available in this SDK");
+  return AEE_EUNSUPPORTED;
+#else
+  {
+    uint32 i;
+    for (i = 0; i < NNTR_HVX_MAX_ARENAS; ++i) {
+      if (s->arenas[i].va == NULL) {
+        break;
+      }
+    }
+    if (i == NNTR_HVX_MAX_ARENAS) {
+      return AEE_ENOMEMORY;
+    }
+    {
+      void *va = NULL;
+      uint64 pa = 0;
+      const int rc = HAP_mmap_get((int)fd, &va, &pa);
+      if (rc != 0 || va == NULL) {
+        FARF(ERROR, "arena_attach: HAP_mmap_get(fd=%d) rc=0x%08x", (int)fd,
+             (unsigned)rc);
+        return rc != 0 ? rc : AEE_ENOMEMORY;
+      }
+      s->arenas[i].fd = (int)fd;
+      s->arenas[i].va = (uint8_t *)va;
+      s->arenas[i].bytes = bytes;
+    }
+    *arena = i;
+    return AEE_SUCCESS;
+  }
+#endif
+}
+
+int nntr_hvx_arena_detach(remote_handle64 handle, uint32 arena) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  nntr_hvx_arena *a;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  a = nntr_hvx_arena_slot(s, arena);
+  if (!a) {
+    return AEE_EBADPARM;
+  }
+  if (hexkl_weight_u8i4_borrows(&s->weights_u8i4, a->va, a->bytes)) {
+    return AEE_EBADSTATE;
+  }
+#ifndef NNTR_HAVE_HAP_MMAP
+  return AEE_EUNSUPPORTED;
+#else
+  {
+    const int rc = HAP_mmap_put(a->fd);
+    memset(a, 0, sizeof(*a));
+    return rc == 0 ? AEE_SUCCESS : rc;
+  }
+#endif
+}
+
+void nntr_hvx_arenas_put_all(nntr_hvx_session *s) {
+#ifdef NNTR_HAVE_HAP_MMAP
+  uint32 i;
+  for (i = 0; i < NNTR_HVX_MAX_ARENAS; ++i) {
+    if (s->arenas[i].va != NULL) {
+      HAP_mmap_put(s->arenas[i].fd);
+      memset(&s->arenas[i], 0, sizeof(s->arenas[i]));
+    }
+  }
+#else
+  (void)s;
+#endif
+}
+
+int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
+                                        uint32 N, uint32 arena, uint32 wh_off,
+                                        const float *w_scale, int w_scaleLen,
+                                        const int32 *colsum_w, int colsum_wLen,
+                                        const float *bias, int biasLen,
+                                        uint32 *w_handle) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  const nntr_hvx_arena *a;
+  uint32 wh_bytes;
+  if (!s || !w_handle) {
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)w_scaleLen != N || (uint32_t)colsum_wLen != N ||
+      (uint32_t)biasLen != N) {
+    FARF(ERROR, "weight_register_u8i4_arena: bad lengths (K=%u N=%u)",
+         (unsigned)K, (unsigned)N);
+    return AEE_EBADPARM;
+  }
+  a = nntr_hvx_arena_slot(s, arena);
+  if (!a) {
+    return AEE_EBADPARM;
+  }
+  /* The extent check is here and not only in the registry: the registry
+     sees a pointer, this is the one place that knows how big the mapping
+     behind it is. Overflow-safe in 64-bit. */
+  wh_bytes = (K / 32u) * (N / 32u) * 512u;
+  if ((uint64_t)wh_off + wh_bytes > a->bytes) {
+    FARF(ERROR, "weight_register_u8i4_arena: off=%u + %u past arena %u",
+         (unsigned)wh_off, (unsigned)wh_bytes, (unsigned)a->bytes);
+    return AEE_EBADPARM;
+  }
+  return hexkl_weight_u8i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N,
+                                          a->va + wh_off, w_scale, colsum_w,
+                                          bias, w_handle);
 }
 
 int nntr_hvx_mem_probe_dsp_heap(remote_handle64 handle, uint32 chunk_mb,

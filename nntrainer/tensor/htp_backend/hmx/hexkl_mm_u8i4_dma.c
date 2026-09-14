@@ -12,6 +12,7 @@
 
 #include "hexkl_mm_u8i4_dma.h"
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -120,26 +121,34 @@ static uint32_t hexkl_weight_u8i4_free_slot(hexkl_weight_u8i4_table *tbl) {
  * @a wh_src is the finished WH bytes -- the VTCM scratch the bake just
  * wrote, or the host's cached copy. Neither path owns them afterwards.
  */
+/* borrow != 0 points the slot at wh_src instead of copying it: the bytes
+   live in a host arena the DSP has mapped, and release() must not free
+   them. Everything else about the slot is the same either way. */
 static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
                                        uint32_t slot, uint32_t K, uint32_t N,
                                        uint32_t wh_bytes, const uint8_t *wh_src,
                                        const float *w_scale,
                                        const int32_t *colsum_w,
-                                       const float *bias) {
+                                       const float *bias, int borrow) {
   hexkl_weight_u8i4 *h = &tbl->slots[slot];
-  h->wh_bytes = (uint8_t *)malloc(wh_bytes);
+  h->wh_bytes = borrow ? (uint8_t *)wh_src : (uint8_t *)malloc(wh_bytes);
   h->w_scale = (float *)malloc(sizeof(float) * N);
   h->colsum_w = (int32_t *)malloc(sizeof(int32_t) * N);
   h->bias = (float *)malloc(sizeof(float) * N);
   if (!h->wh_bytes || !h->w_scale || !h->colsum_w || !h->bias) {
-    free(h->wh_bytes);
+    if (!borrow) {
+      free(h->wh_bytes);
+    }
     free(h->w_scale);
     free(h->colsum_w);
     free(h->bias);
     memset(h, 0, sizeof(*h));
     return AEE_ENOMEMORY;
   }
-  memcpy(h->wh_bytes, wh_src, wh_bytes);
+  h->borrowed = borrow;
+  if (!borrow) {
+    memcpy(h->wh_bytes, wh_src, wh_bytes);
+  }
   memcpy(h->w_scale, w_scale, sizeof(float) * N);
   memcpy(h->colsum_w, colsum_w, sizeof(int32_t) * N);
   memcpy(h->bias, bias, sizeof(float) * N);
@@ -180,9 +189,10 @@ int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   // This bake is the expensive half of registration -- 7168 independent
   // 512-byte tiles for a gate_up weight, about 25 ms even split ~6 ways
   // across the caller's HVX pool, and 64 weights of it is the 1597 ms the
-  // profile reports as "register FastRPC". hexkl_weight_u8i4_register_baked
-  // below is the same registration with that bake already done by an
-  // earlier run, which is the whole point of exporting the bytes.
+  // profile reports as "register FastRPC". A run pays it once per weight and
+  // exports the bytes; every later run hands them back through
+  // hexkl_weight_u8i4_register_arena below, already in a host buffer the
+  // DSP has mapped, so neither the bake nor a DSP-heap copy happens again.
   //
   // Verified NOT a race (doc 43 section 7, corrected): an earlier session
   // read a hash mismatch as HMX-lock corruption from running this across
@@ -205,7 +215,7 @@ int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   }
 
   rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N, wh_bytes, vtcm_base,
-                                   w_scale, colsum_w, bias);
+                                   w_scale, colsum_w, bias, /*borrow=*/0);
   if (rc != AEE_SUCCESS) {
     return rc;
   }
@@ -213,43 +223,52 @@ int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   return AEE_SUCCESS;
 }
 
-int hexkl_weight_u8i4_register_baked(hexkl_weight_u8i4_table *tbl,
+int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
                                      uint32_t vtcm_size, uint32_t K, uint32_t N,
-                                     const uint8_t *wh_src, uint32_t wh_len,
-                                     const float *w_scale,
+                                     const uint8_t *wh, const float *w_scale,
                                      const int32_t *colsum_w, const float *bias,
                                      uint32_t *out_handle) {
   uint32_t wh_bytes = 0;
   uint32_t slot;
   int rc;
 
-  if (!tbl || !wh_src || !w_scale || !colsum_w || !bias || !out_handle) {
+  if (!tbl || !wh || !w_scale || !colsum_w || !bias || !out_handle) {
+    return AEE_EBADPARM;
+  }
+  if (((uintptr_t)wh % WEIGHT_TILE_BYTES_U8I4) != 0u) {
     return AEE_EBADPARM;
   }
   rc = hexkl_weight_u8i4_check(K, N, vtcm_size, &wh_bytes);
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  /* The caller's bytes came off disk. A length that does not match the one
-     K and N imply means the file is for a different weight or a different
-     tile layout, and copying it in would produce a silently wrong matmul
-     rather than a failure -- so it is rejected here even though the host
-     also checks, because this is the side that owns the layout. */
-  if (wh_len != wh_bytes) {
-    return AEE_EBADPARM;
-  }
   slot = hexkl_weight_u8i4_free_slot(tbl);
   if (slot == HEXKL_MM_U8I4_MAX_WEIGHTS) {
     return AEE_ENOMEMORY;
   }
-
-  rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N, wh_bytes, wh_src, w_scale,
-                                   colsum_w, bias);
+  rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N, wh_bytes, wh, w_scale,
+                                   colsum_w, bias, /*borrow=*/1);
   if (rc != AEE_SUCCESS) {
     return rc;
   }
   *out_handle = slot;
   return AEE_SUCCESS;
+}
+
+int hexkl_weight_u8i4_borrows(const hexkl_weight_u8i4_table *tbl,
+                              const uint8_t *base, uint32_t bytes) {
+  uint32_t i;
+  if (!tbl || !base) {
+    return 0;
+  }
+  for (i = 0; i < HEXKL_MM_U8I4_MAX_WEIGHTS; ++i) {
+    const hexkl_weight_u8i4 *h = &tbl->slots[i];
+    if (h->in_use && h->borrowed && h->wh_bytes >= base &&
+        h->wh_bytes < base + bytes) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 int hexkl_weight_u8i4_export(const hexkl_weight_u8i4_table *tbl,
@@ -280,7 +299,9 @@ int hexkl_weight_u8i4_release(hexkl_weight_u8i4_table *tbl, uint32_t handle) {
     return AEE_EBADPARM;
   }
   hexkl_weight_u8i4 *h = &tbl->slots[handle];
-  free(h->wh_bytes);
+  if (!h->borrowed) {
+    free(h->wh_bytes);
+  }
   free(h->w_scale);
   free(h->colsum_w);
   free(h->bias);
