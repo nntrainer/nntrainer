@@ -78,6 +78,44 @@ int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
                                const int32_t *colsum_w, const float *bias,
                                hvx_worker_pool *pool, uint32_t *out_handle);
 
+/**
+ * @brief Same registration, but the WH bytes are already baked.
+ *
+ * The bake is the expensive half of registration -- about 25 ms for a
+ * gate_up weight, 1597 ms across a 64-weight model -- and it is
+ * deterministic, so a run that has paid for it once can hand the bytes to
+ * the next run instead. hexkl_weight_u8i4_export reads them back out.
+ *
+ * Takes no VTCM and no worker pool: there is nothing to stage and nothing
+ * to parallelise, only the copy into the slot's resident arrays.
+ *
+ * @a wh_len must equal (K/32)*(N/32)*512. It is checked rather than
+ * trusted: these bytes reach the DSP from a file, and a wrong length is a
+ * silently wrong matmul, not a crash.
+ *
+ * @param vtcm_size  only to apply the same "does this weight fit" rule the
+ *                   bake path applies, so both paths accept the same set
+ * @return AEE_SUCCESS, AEE_EBADPARM on a shape or length violation,
+ *         AEE_ENOMEMORY if the table is full or an allocation fails
+ */
+int hexkl_weight_u8i4_register_baked(hexkl_weight_u8i4_table *tbl,
+                                     uint32_t vtcm_size, uint32_t K, uint32_t N,
+                                     const uint8_t *wh_src, uint32_t wh_len,
+                                     const float *w_scale,
+                                     const int32_t *colsum_w, const float *bias,
+                                     uint32_t *out_handle);
+
+/**
+ * @brief Copies a registered weight's baked WH bytes out, for caching.
+ *
+ * @a wh_out_len must equal the weight's (K/32)*(N/32)*512.
+ * @return AEE_SUCCESS, or AEE_EBADPARM for an unknown handle, a free slot,
+ *         or a length that does not match the weight's shape.
+ */
+int hexkl_weight_u8i4_export(const hexkl_weight_u8i4_table *tbl,
+                             uint32_t handle, uint8_t *wh_out,
+                             uint32_t wh_out_len);
+
 /** @brief Frees a registered weight's resident bytes. */
 int hexkl_weight_u8i4_release(hexkl_weight_u8i4_table *tbl, uint32_t handle);
 

@@ -122,6 +122,40 @@ int nntr_hvx_weight_register_u8i4(remote_handle64 handle, uint32 K, uint32 N,
                                     colsum_w, bias, s->quant_pool, w_handle);
 }
 
+int nntr_hvx_weight_register_u8i4_baked(remote_handle64 handle, uint32 K,
+                                        uint32 N, const uint8 *wh_src,
+                                        int wh_srcLen, const float *w_scale,
+                                        int w_scaleLen, const int32 *colsum_w,
+                                        int colsum_wLen, const float *bias,
+                                        int biasLen, uint32 *w_handle) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  /* Only the three N-sized arrays can be checked here; wh_srcLen is checked
+     against the shape inside hexkl_weight_u8i4_register_baked, which is the
+     side that owns the tile layout. */
+  if ((uint32_t)w_scaleLen != N || (uint32_t)colsum_wLen != N ||
+      (uint32_t)biasLen != N) {
+    FARF(ERROR, "weight_register_u8i4_baked: bad lengths (K=%u N=%u)",
+         (unsigned)K, (unsigned)N);
+    return AEE_EBADPARM;
+  }
+  return hexkl_weight_u8i4_register_baked(&s->weights_u8i4, s->vtcm_size, K, N,
+                                          wh_src, (uint32_t)wh_srcLen, w_scale,
+                                          colsum_w, bias, w_handle);
+}
+
+int nntr_hvx_weight_bake_export(remote_handle64 handle, uint32 w_handle,
+                                uint8 *wh_out, int wh_outLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || wh_outLen < 0) {
+    return AEE_EBADPARM;
+  }
+  return hexkl_weight_u8i4_export(&s->weights_u8i4, w_handle, wh_out,
+                                  (uint32_t)wh_outLen);
+}
+
 int nntr_hvx_weight_release_u8i4(remote_handle64 handle, uint32 w_handle) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s) {
@@ -594,15 +628,15 @@ enum {
   MOE_T_SWIGLU,
   MOE_T_DEQUANT, /**< both matmuls' i32 -> f32 */
   MOE_T_ACC_READ,
-  MOE_T_DRAIN,   /**< the cross-expert weight DMA waits */
-  MOE_T_SCATTER, /**< routing multiply + accumulate into out_f32 */
-  MOE_T_GATHER,  /**< hvx_gather_ah_u8 + the per-block scale/zp slice */
-  MOE_T_REQUANT, /**< the SwiGLU output's per-block quantize */
-  MOE_T_BLOCKS,  /**< NOT us: 64-row blocks issued, summed over experts */
-  MOE_T_MM,      /**< the HMX issue loop, timed rather than left a residual */
-  MOE_T_DMA_KB,  /**< NOT us: kilobytes pushed through the DMA ring */
+  MOE_T_DRAIN,     /**< the cross-expert weight DMA waits */
+  MOE_T_SCATTER,   /**< routing multiply + accumulate into out_f32 */
+  MOE_T_GATHER,    /**< hvx_gather_ah_u8 + the per-block scale/zp slice */
+  MOE_T_REQUANT,   /**< the SwiGLU output's per-block quantize */
+  MOE_T_BLOCKS,    /**< NOT us: 64-row blocks issued, summed over experts */
+  MOE_T_MM,        /**< the HMX issue loop, timed rather than left a residual */
+  MOE_T_DMA_KB,    /**< NOT us: kilobytes pushed through the DMA ring */
   MOE_T_DMA_FIRST, /**< us of the first weight drain = one 3.5 MiB transfer */
-  MOE_T_STAGE,   /**< copying the FastRPC buffers to and from cached heap */
+  MOE_T_STAGE,     /**< copying the FastRPC buffers to and from cached heap */
   MOE_T_ACC_STRIDE,
   MOE_N_STAGES
 };

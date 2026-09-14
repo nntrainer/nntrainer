@@ -80,66 +80,52 @@ static void hexkl_bake_u8i4_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   }
 }
 
-int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
-                               uint32_t vtcm_size, uint32_t K, uint32_t N,
-                               const int8_t *w_i4_rm, const float *w_scale,
-                               const int32_t *colsum_w, const float *bias,
-                               hvx_worker_pool *pool, uint32_t *out_handle) {
-  if (!tbl || !vtcm_base || !w_i4_rm || !w_scale || !colsum_w || !bias ||
-      !out_handle || K == 0 || N == 0) {
-    return AEE_EBADPARM;
-  }
-  if ((K % HEXKL_HMX_INT8_BLOCK_N_INNER) != 0 ||
+/**
+ * @brief Shape check and WH byte count, shared by the two register paths.
+ *
+ * @return AEE_SUCCESS with *out_bytes set, or the same rejection either
+ *         entry point would have made on its own.
+ */
+static int hexkl_weight_u8i4_check(uint32_t K, uint32_t N, uint32_t vtcm_size,
+                                   uint32_t *out_bytes) {
+  if (K == 0 || N == 0 || (K % HEXKL_HMX_INT8_BLOCK_N_INNER) != 0 ||
       (N % HEXKL_HMX_INT8_BLOCK_N_COL) != 0) {
     return AEE_EBADPARM;
   }
-
-  uint32_t slot = HEXKL_MM_U8I4_MAX_WEIGHTS;
-  for (uint32_t i = 0; i < HEXKL_MM_U8I4_MAX_WEIGHTS; ++i) {
-    if (!tbl->slots[i].in_use) {
-      slot = i;
-      break;
-    }
-  }
-  if (slot == HEXKL_MM_U8I4_MAX_WEIGHTS) {
+  *out_bytes = (K / HEXKL_HMX_INT8_BLOCK_N_INNER) *
+               (N / HEXKL_HMX_INT8_BLOCK_N_COL) * WEIGHT_TILE_BYTES_U8I4;
+  /* The bake path stages through the VTCM arena, so a weight that does not
+     fit it cannot be registered that way. Checked for both paths so the two
+     accept exactly the same set of weights -- a cache written by one and
+     read by the other must not hit a shape the other rejects. */
+  if (*out_bytes > vtcm_size) {
     return AEE_ENOMEMORY;
   }
+  return AEE_SUCCESS;
+}
 
-  const uint32_t k_tiles = K / HEXKL_HMX_INT8_BLOCK_N_INNER;
-  const uint32_t n_tiles = N / HEXKL_HMX_INT8_BLOCK_N_COL;
-  const uint32_t wh_bytes = k_tiles * n_tiles * WEIGHT_TILE_BYTES_U8I4;
-  if (wh_bytes > vtcm_size) {
-    return AEE_ENOMEMORY; // weight alone does not fit the VTCM scratch arena
+/** @brief First free slot, or HEXKL_MM_U8I4_MAX_WEIGHTS when full. */
+static uint32_t hexkl_weight_u8i4_free_slot(hexkl_weight_u8i4_table *tbl) {
+  for (uint32_t i = 0; i < HEXKL_MM_U8I4_MAX_WEIGHTS; ++i) {
+    if (!tbl->slots[i].in_use) {
+      return i;
+    }
   }
+  return HEXKL_MM_U8I4_MAX_WEIGHTS;
+}
 
-  // Bake every tile into VTCM (borrowed as scratch -- caller holds the HMX
-  // lock and has no other VTCM use in flight), then copy the baked bytes
-  // out to DSP heap memory where they stay resident across calls. A plain
-  // copy, not the DMA ring: registration happens once per weight at model
-  // load, off the per-token hot path, so its cost is not what this file
-  // exists to optimise. The bake itself is the 34-48 ms/weight line item
-  // (doc 43 §2): 7168 independent 512-byte tiles for a gate_up weight, so
-  // the caller's HVX pool splits it ~6-way here -- NULL keeps the serial
-  // order (one worker takes every tile, ascending).
-  //
-  // Verified NOT a race (doc 43 §7, corrected): an earlier session read a
-  // hash mismatch as HMX-lock corruption from running this across worker
-  // threads, but the "serial reference" in that comparison was itself
-  // produced by hvx_worker_pool_run(NULL, ...) with n_units > 1 -- which
-  // does not run the full range on one thread, it runs ONLY worker 0's
-  // 1/n_units SLICE under a hypothetical n_units-way split (see that
-  // function's NULL branch: func(n_units, 0, ctx), not func(1, 0, ctx)).
-  // That "reference" had baked one tile and left the rest as stale VTCM
-  // scratch. The REAL pool path (an actual N-worker pool, N < n_units) was
-  // re-verified bit-identical to a true manual serial loop -- FNV-1a of
-  // the same M/K/N matmul output matches (0x198748e597cf4105) either way.
-  hexkl_bake_u8i4_ctx bc = {w_i4_rm, vtcm_base, k_tiles * n_tiles,
-                            n_tiles, N,         AEE_SUCCESS};
-  hvx_worker_pool_run(pool, hexkl_bake_u8i4_worker, &bc, k_tiles * n_tiles);
-  if (bc.err != AEE_SUCCESS) {
-    return bc.err;
-  }
-
+/**
+ * @brief Allocates a slot's four arrays and copies the caller's bytes in.
+ *
+ * @a wh_src is the finished WH bytes -- the VTCM scratch the bake just
+ * wrote, or the host's cached copy. Neither path owns them afterwards.
+ */
+static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
+                                       uint32_t slot, uint32_t K, uint32_t N,
+                                       uint32_t wh_bytes, const uint8_t *wh_src,
+                                       const float *w_scale,
+                                       const int32_t *colsum_w,
+                                       const float *bias) {
   hexkl_weight_u8i4 *h = &tbl->slots[slot];
   h->wh_bytes = (uint8_t *)malloc(wh_bytes);
   h->w_scale = (float *)malloc(sizeof(float) * N);
@@ -153,15 +139,138 @@ int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     memset(h, 0, sizeof(*h));
     return AEE_ENOMEMORY;
   }
-  memcpy(h->wh_bytes, vtcm_base, wh_bytes);
+  memcpy(h->wh_bytes, wh_src, wh_bytes);
   memcpy(h->w_scale, w_scale, sizeof(float) * N);
   memcpy(h->colsum_w, colsum_w, sizeof(int32_t) * N);
   memcpy(h->bias, bias, sizeof(float) * N);
   h->K = K;
   h->N = N;
   h->in_use = 1;
+  return AEE_SUCCESS;
+}
 
+int hexkl_weight_u8i4_register(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
+                               uint32_t vtcm_size, uint32_t K, uint32_t N,
+                               const int8_t *w_i4_rm, const float *w_scale,
+                               const int32_t *colsum_w, const float *bias,
+                               hvx_worker_pool *pool, uint32_t *out_handle) {
+  uint32_t wh_bytes = 0;
+  uint32_t slot;
+  int rc;
+
+  if (!tbl || !vtcm_base || !w_i4_rm || !w_scale || !colsum_w || !bias ||
+      !out_handle) {
+    return AEE_EBADPARM;
+  }
+  rc = hexkl_weight_u8i4_check(K, N, vtcm_size, &wh_bytes);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  slot = hexkl_weight_u8i4_free_slot(tbl);
+  if (slot == HEXKL_MM_U8I4_MAX_WEIGHTS) {
+    return AEE_ENOMEMORY;
+  }
+
+  // Bake every tile into VTCM (borrowed as scratch -- caller holds the HMX
+  // lock and has no other VTCM use in flight), then copy the baked bytes
+  // out to DSP heap memory where they stay resident across calls. A plain
+  // copy, not the DMA ring: registration happens once per weight at model
+  // load, off the per-token hot path.
+  //
+  // This bake is the expensive half of registration -- 7168 independent
+  // 512-byte tiles for a gate_up weight, about 25 ms even split ~6 ways
+  // across the caller's HVX pool, and 64 weights of it is the 1597 ms the
+  // profile reports as "register FastRPC". hexkl_weight_u8i4_register_baked
+  // below is the same registration with that bake already done by an
+  // earlier run, which is the whole point of exporting the bytes.
+  //
+  // Verified NOT a race (doc 43 section 7, corrected): an earlier session
+  // read a hash mismatch as HMX-lock corruption from running this across
+  // worker threads, but the "serial reference" in that comparison was
+  // itself produced by hvx_worker_pool_run(NULL, ...) with n_units > 1 --
+  // which at the time ran ONLY worker 0's 1/n_units slice. That reference
+  // had baked one tile and left the rest as stale VTCM scratch. The REAL
+  // pool path was re-verified bit-identical to a true serial loop --
+  // FNV-1a of the same M/K/N matmul output matches either way
+  // (0x198748e597cf4105).
+  {
+    const uint32_t n_tiles_row = N / HEXKL_HMX_INT8_BLOCK_N_COL;
+    const uint32_t n_tiles = wh_bytes / WEIGHT_TILE_BYTES_U8I4;
+    hexkl_bake_u8i4_ctx bc = {w_i4_rm,     vtcm_base, n_tiles,
+                              n_tiles_row, N,         AEE_SUCCESS};
+    hvx_worker_pool_run(pool, hexkl_bake_u8i4_worker, &bc, n_tiles);
+    if (bc.err != AEE_SUCCESS) {
+      return bc.err;
+    }
+  }
+
+  rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N, wh_bytes, vtcm_base,
+                                   w_scale, colsum_w, bias);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
   *out_handle = slot;
+  return AEE_SUCCESS;
+}
+
+int hexkl_weight_u8i4_register_baked(hexkl_weight_u8i4_table *tbl,
+                                     uint32_t vtcm_size, uint32_t K, uint32_t N,
+                                     const uint8_t *wh_src, uint32_t wh_len,
+                                     const float *w_scale,
+                                     const int32_t *colsum_w, const float *bias,
+                                     uint32_t *out_handle) {
+  uint32_t wh_bytes = 0;
+  uint32_t slot;
+  int rc;
+
+  if (!tbl || !wh_src || !w_scale || !colsum_w || !bias || !out_handle) {
+    return AEE_EBADPARM;
+  }
+  rc = hexkl_weight_u8i4_check(K, N, vtcm_size, &wh_bytes);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  /* The caller's bytes came off disk. A length that does not match the one
+     K and N imply means the file is for a different weight or a different
+     tile layout, and copying it in would produce a silently wrong matmul
+     rather than a failure -- so it is rejected here even though the host
+     also checks, because this is the side that owns the layout. */
+  if (wh_len != wh_bytes) {
+    return AEE_EBADPARM;
+  }
+  slot = hexkl_weight_u8i4_free_slot(tbl);
+  if (slot == HEXKL_MM_U8I4_MAX_WEIGHTS) {
+    return AEE_ENOMEMORY;
+  }
+
+  rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N, wh_bytes, wh_src, w_scale,
+                                   colsum_w, bias);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  *out_handle = slot;
+  return AEE_SUCCESS;
+}
+
+int hexkl_weight_u8i4_export(const hexkl_weight_u8i4_table *tbl,
+                             uint32_t handle, uint8_t *wh_out,
+                             uint32_t wh_out_len) {
+  const hexkl_weight_u8i4 *h;
+  uint32_t wh_bytes;
+
+  if (!tbl || !wh_out || handle >= HEXKL_MM_U8I4_MAX_WEIGHTS) {
+    return AEE_EBADPARM;
+  }
+  h = &tbl->slots[handle];
+  if (!h->in_use) {
+    return AEE_EBADPARM;
+  }
+  wh_bytes = (h->K / HEXKL_HMX_INT8_BLOCK_N_INNER) *
+             (h->N / HEXKL_HMX_INT8_BLOCK_N_COL) * WEIGHT_TILE_BYTES_U8I4;
+  if (wh_out_len != wh_bytes) {
+    return AEE_EBADPARM;
+  }
+  memcpy(wh_out, h->wh_bytes, wh_bytes);
   return AEE_SUCCESS;
 }
 

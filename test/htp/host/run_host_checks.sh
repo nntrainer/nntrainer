@@ -30,3 +30,12 @@ cc=${CC:-gcc}
   "$HERE/moe_layer_host_check.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" -lm
 
 "$OUT/moe_layer_host_check"
+
+cxx=${CXX:-g++}
+"$cxx" -std=c++17 -O1 -Wall -Wextra \
+  -I "$BACKEND" \
+  -o "$OUT/weight_cache_host_check" \
+  "$HERE/weight_cache_host_check.cpp"
+
+echo
+"$OUT/weight_cache_host_check"
