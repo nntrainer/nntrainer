@@ -221,7 +221,7 @@ enum {
 int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
                          uint32 dma_bytes, uint32 *res, int resLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s || !res || resLen < 6) {
+  if (!s || !res || resLen < 8) {
     return AEE_EBADPARM;
   }
   for (int i = 0; i < resLen; ++i) {
@@ -249,7 +249,19 @@ int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
        answer rather than fail to compile. */
     void *va = HAP_mmap(NULL, (int)bytes, 1 /*READ*/ | 2 /*WRITE*/, 0, fd, 0);
     uint64_t t1 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
-    if (va == NULL || va == (void *)-1) {
+    /* Null and MAP_FAILED are reported apart: the first reads as "the DSP
+       does not know this fd", which is what an unattached buffer looks
+       like, and the second as "it knew it and refused". The first attempt
+       at this probe could not tell them apart. */
+    if (va == NULL) {
+      res[6] = 1u;
+      FARF(ERROR, "arena_probe: HAP_mmap returned null (fd=%d) -- is the "
+                  "buffer attached to the session?",
+           (int)fd);
+      return AEE_ENOMEMORY;
+    }
+    if (va == (void *)-1) {
+      res[6] = 2u;
       FARF(ERROR, "arena_probe: HAP_mmap failed (fd=%d bytes=%u)", (int)fd,
            (unsigned)bytes);
       return AEE_ENOMEMORY;

@@ -1517,10 +1517,35 @@ TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
   const int fd = to_fd(buf);
   field("fd", std::to_string(fd));
 
-  std::vector<uint32_t> res(6, 0);
+  // An fd number means nothing to the DSP until FastRPC has attached the
+  // buffer to the session -- which is what the first attempt at this probe
+  // missed: HAP_mem.h was present and HAP_mmap linked, and it still
+  // returned null. fastrpc_mmap is the documented call that does the
+  // attaching. Resolved rather than linked because a libcdsprpc.so without
+  // it is a fact worth reporting, not a link error.
+  using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
+  using FastrpcMunmap = int (*)(int, int, void *, size_t);
+  auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
+  auto fmunmap = (FastrpcMunmap)dlsym(RTLD_DEFAULT, "fastrpc_munmap");
+  field("fastrpc_mmap", fmmap ? "yes" : "no");
+
+  const int kCdspDomain = 3;   // CDSP_DOMAIN_ID
+  const int kMapFd = 0;        // FASTRPC_MAP_FD
+  bool attached = false;
+  if (fmmap != nullptr) {
+    const int rc = fmmap(kCdspDomain, fd, buf, 0, kBytes, kMapFd);
+    field("fastrpc_mmap_rc", hex(rc));
+    attached = (rc == 0);
+  }
+
+  std::vector<uint32_t> res(8, 0);
   const int err = nntr_hvx_arena_probe(handle_, fd, kBytes, kDma, res.data(),
                                        (int)res.size());
   field("err", hex(err));
+  field("attached", attached ? "yes" : "no");
+  // Which of the two mapping calls got there, if either -- the DSP reports
+  // them apart so a failure names the API rather than just the outcome.
+  field("hap_mmap", res[6] == 1u ? "null" : (res[6] == 2u ? "failed" : "ok"));
   if (err == AEE_SUCCESS) {
     const double gbs = res[2] > 0 ? (double)res[3] / res[2] / 1000.0 : 0.0;
     field("mapped", res[0] ? "yes" : "no");
@@ -1531,6 +1556,9 @@ TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
     field("unmapped", res[5] ? "yes" : "no");
     EXPECT_EQ(res[4], want)
       << "the mapping was readable but did not carry the host's bytes";
+  }
+  if (attached && fmunmap != nullptr) {
+    field("fastrpc_munmap_rc", hex(fmunmap(kCdspDomain, fd, buf, kBytes)));
   }
   rfree(buf);
 }
