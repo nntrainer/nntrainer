@@ -1459,6 +1459,82 @@ TEST_F(HmxMmU8I4Layer, RegistryCapacity) {
  * 8.5) and only one of them is a failure, so this reports and passes; the
  * decision is a design one, not a regression.
  */
+/**
+ * @brief [doc 46 section 32.4] Gate 0c: can the DSP map a host ION buffer
+ *        and DMA out of it?
+ *
+ * The converted-model plan rests on one mechanism this tree has never
+ * exercised. Every weight path so far copies bytes to the DSP, which then
+ * owns them in its own heap; the arena instead hands the DSP a file
+ * descriptor, maps it once, and leaves the bytes where they are. Gate 0b
+ * measured how much ION the host could allocate -- it said nothing about
+ * whether the DSP can reach it.
+ *
+ * Reports rather than asserts, like the other two probes: a device that
+ * cannot do this is a fact about the plan, not a broken build. The one
+ * thing it does check is the checksum, because a mapping that succeeds and
+ * reads as zeros would otherwise look like a pass with a very good
+ * bandwidth number.
+ */
+TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
+  auto field = [](const char *k, const std::string &v) {
+    std::cout << "U8I4_FIELD path=arena field=" << k << " value=" << v << "\n";
+  };
+
+  auto init = (void (*)(void))dlsym(RTLD_DEFAULT, "rpcmem_init");
+  auto alloc =
+    (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+  auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+  auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+  field("rpcmem_to_fd", to_fd ? "yes" : "no");
+  if (!alloc || !rfree || !to_fd) {
+    GTEST_SKIP() << "no rpcmem_to_fd -- the arena cannot be handed to the DSP";
+  }
+  if (init) {
+    init();
+  }
+
+  // One gate_up weight's worth, so the rate is directly comparable to the
+  // 27-33 GB/s the profile reports for the same transfer out of DSP heap.
+  const uint32_t kBytes = 3670016u;
+  const uint32_t kDma = 1048576u; // fits VTCM with room to spare
+  void *buf = alloc(25 /*RPCMEM_HEAP_ID_SYSTEM*/, 1, (int)kBytes);
+  if (buf == nullptr) {
+    field("alloc", "failed");
+    GTEST_SKIP() << "rpcmem_alloc failed";
+  }
+  // A pattern, not zeros: the checksum below has to be able to tell a live
+  // mapping from one that reads back empty.
+  auto *p = static_cast<uint8_t *>(buf);
+  uint32_t want = 0;
+  for (uint32_t i = 0; i < kBytes; ++i) {
+    p[i] = static_cast<uint8_t>(i * 31u + 7u);
+  }
+  for (uint32_t i = 0; i < kDma; i += 64u) {
+    want += p[i];
+  }
+
+  const int fd = to_fd(buf);
+  field("fd", std::to_string(fd));
+
+  std::vector<uint32_t> res(6, 0);
+  const int err = nntr_hvx_arena_probe(handle_, fd, kBytes, kDma, res.data(),
+                                       (int)res.size());
+  field("err", hex(err));
+  if (err == AEE_SUCCESS) {
+    const double gbs = res[2] > 0 ? (double)res[3] / res[2] / 1000.0 : 0.0;
+    field("mapped", res[0] ? "yes" : "no");
+    field("map_us", std::to_string(res[1]));
+    field("dma_us", std::to_string(res[2]));
+    field("dma_gbs", std::to_string(gbs));
+    field("checksum_ok", res[4] == want ? "yes" : "no");
+    field("unmapped", res[5] ? "yes" : "no");
+    EXPECT_EQ(res[4], want)
+      << "the mapping was readable but did not carry the host's bytes";
+  }
+  rfree(buf);
+}
+
 TEST_F(HmxMmU8I4Layer, MemoryCeilings) {
   const double need_gb = 4.10;
 

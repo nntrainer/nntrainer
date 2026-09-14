@@ -42,6 +42,11 @@ namespace nntrainer {
 struct HtpRpcMemApi {
   void *(*alloc)(int heap, uint32_t flags, int size) = nullptr;
   void (*free_)(void *p) = nullptr;
+  /** The ION file descriptor behind a buffer, which is how the DSP is given
+      something to map rather than something to copy. Optional: a process
+      whose libcdsprpc.so predates it still allocates and frees normally,
+      and only the arena path needs it. */
+  int (*to_fd)(void *p) = nullptr;
 
   static const HtpRpcMemApi &get() {
     static HtpRpcMemApi api = [] {
@@ -50,6 +55,7 @@ struct HtpRpcMemApi {
       a.alloc =
         (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
       a.free_ = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+      a.to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
       if (a.alloc == nullptr || a.free_ == nullptr) {
         // Partial API is not usable -- treat as absent rather than mixing
         // an rpcmem_alloc with a libc free or vice versa.
@@ -104,6 +110,15 @@ public:
   /** @brief Whether this buffer actually landed on rpcmem/ION, for the
    *  profile dump to report which transport a run actually got. */
   bool isIon() const { return ion_; }
+
+  /** @brief The buffer's ION fd, or -1 when it is plain heap or this
+   *  libcdsprpc.so has no rpcmem_to_fd. Only the arena path needs it. */
+  int fd() const {
+    const HtpRpcMemApi &api = HtpRpcMemApi::get();
+    if (!ion_ || api.to_fd == nullptr)
+      return -1;
+    return api.to_fd(data_);
+  }
 
 private:
   uint8_t *data_ = nullptr;

@@ -15,8 +15,10 @@
 
 #include <AEEStdErr.h>
 #include <HAP_farf.h>
+#include <HAP_perf.h>
 #include <remote.h>
 
+#include "hexkl_dma_ring.h"
 #include "hexkl_micro.h"
 #include "hexkl_mm_u8i4.h"
 #include "hexkl_mm_u8i4_dma.h"
@@ -205,6 +207,90 @@ enum {
  * lazily would otherwise report a ceiling that does not exist once the
  * pages are actually written.
  */
+/* Gate 0c. HAP_mem.h is the first use of that header in this tree, so the
+   probe reports "unavailable" rather than failing the build if the SDK in
+   use does not ship it -- a probe that cannot compile is worse than one
+   that answers no. */
+#if defined(__has_include)
+#if __has_include(<HAP_mem.h>)
+#include <HAP_mem.h>
+#define NNTR_HAVE_HAP_MMAP 1
+#endif
+#endif
+
+int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
+                         uint32 dma_bytes, uint32 *res, int resLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || !res || resLen < 6) {
+    return AEE_EBADPARM;
+  }
+  for (int i = 0; i < resLen; ++i) {
+    res[i] = 0;
+  }
+#ifndef NNTR_HAVE_HAP_MMAP
+  (void)fd;
+  (void)bytes;
+  (void)dma_bytes;
+  FARF(ERROR, "arena_probe: HAP_mem.h not available in this SDK");
+  return AEE_EUNSUPPORTED;
+#else
+  if (dma_bytes == 0u || dma_bytes > bytes || dma_bytes > s->vtcm_size) {
+    return AEE_EBADPARM;
+  }
+  {
+    uint64_t t0 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+    /* HAP_mmap is the older and more widely present of the two mapping
+       APIs; SDKs that ship HAP_mmap_get/HAP_mmap_put instead take the fd
+       directly and hand back the address through an out-parameter. If the
+       link fails on this symbol, that pair is what to swap in -- the rest
+       of the probe is unchanged either way.
+       prot is written numerically: PROT_READ|PROT_WRITE are host macros and
+       a missing one would be a build break in a probe whose whole job is to
+       answer rather than fail to compile. */
+    void *va = HAP_mmap(NULL, (int)bytes, 1 /*READ*/ | 2 /*WRITE*/, 0, fd, 0);
+    uint64_t t1 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+    if (va == NULL || va == (void *)-1) {
+      FARF(ERROR, "arena_probe: HAP_mmap failed (fd=%d bytes=%u)", (int)fd,
+           (unsigned)bytes);
+      return AEE_ENOMEMORY;
+    }
+    res[0] = 1u;
+    res[1] = (uint32)(t1 - t0);
+
+    /* One 2D transfer out of the mapping into VTCM, same shape the weight
+       pusher uses, so the rate is comparable to the 27-33 GB/s the profile
+       already reports for DSP-heap weights. */
+    {
+      uint32_t rs = 4096u;
+      while (rs > 1u && (dma_bytes % rs) != 0u) {
+        rs >>= 1;
+      }
+      hexkl_dma_ring_reset();
+      uint64_t d0 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+      hexkl_dma_ring_push2d(s->vtcm_base, va, rs, rs, rs, dma_bytes / rs,
+                            /*src_vtcm=*/0, /*dst_vtcm=*/1);
+      hexkl_dma_ring_drain();
+      uint64_t d1 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+      res[2] = (uint32)(d1 - d0);
+      res[3] = dma_bytes;
+    }
+
+    /* Summed so the transfer cannot be elided and an all-zero mapping --
+       which would look like a success with a garbage rate -- is visible. */
+    {
+      uint32_t sum = 0;
+      const uint8_t *p = (const uint8_t *)s->vtcm_base;
+      for (uint32_t i = 0; i < dma_bytes; i += 64u) {
+        sum += p[i];
+      }
+      res[4] = sum;
+    }
+    res[5] = (HAP_munmap(va, (int)bytes) == 0) ? 1u : 0u;
+  }
+  return AEE_SUCCESS;
+#endif
+}
+
 int nntr_hvx_mem_probe_dsp_heap(remote_handle64 handle, uint32 chunk_mb,
                                 uint32 max_chunks, uint32 *chunks_ok,
                                 int chunks_okLen, uint64 *touched_sum,
