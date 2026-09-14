@@ -77,6 +77,11 @@ enum {
       different amounts of work in front of them to hide behind: gate_up
       was pushed a whole expert earlier, down only one gate_up matmul
       earlier. */
+  /** NOT a time: kilobytes the transfer DMA_FIRST waits on. Was implied
+      by the shapes until the weight started arriving in chunks, and the
+      profile then divided a chunk's time by the whole weight's size and
+      reported 114.7 GB/s for a link that does about 33. */
+  HEXKL_PROBE_DMA_FIRST_KB,
   HEXKL_PROBE_DRAIN_DN,
   /** hexkl_dma_ring_push2d itself. It chains onto an in-flight descriptor
       via dmlink, and whether that ever blocks is the difference between

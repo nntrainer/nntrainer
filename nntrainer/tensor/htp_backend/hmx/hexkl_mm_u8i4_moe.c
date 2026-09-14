@@ -479,9 +479,17 @@ int hexkl_mm_u8i4_moe_layer_run(
 
     /* gate_up[e] was pushed either before this loop or by iteration i-1,
        where it had this expert's predecessor's down matmul to hide behind. */
-    /* down[e] goes out first so the whole gate_up matmul covers it. */
-    const uint32_t dn_idx = moe_push_weight_chunk(
-      vtcm_base, L.w_dn_off, d, inter_ktiles, dn_ntiles, 0u, dn_ntiles);
+    /* down[e] goes out first so the whole gate_up matmul covers it, and in
+       chunks for the same reason gate_up is: waiting for all 1.75 MB before
+       the first n-tile column cost 55 us an expert. */
+    uint32_t dn_idx[MOE_MAX_CHUNKS];
+    uint32_t dn_nchunk = 0u;
+    for (uint32_t nt0 = 0; nt0 < dn_ntiles; nt0 += L.acc_tiles) {
+      const uint32_t cn =
+        (dn_ntiles - nt0 < L.acc_tiles) ? (dn_ntiles - nt0) : L.acc_tiles;
+      dn_idx[dn_nchunk++] = moe_push_weight_chunk(
+        vtcm_base, L.w_dn_off, d, inter_ktiles, dn_ntiles, nt0, cn);
+    }
 
     for (uint32_t mb = 0; mb < n_e; mb += BR) {
       const uint32_t m_blk = (n_e - mb < BR) ? (n_e - mb) : BR;
@@ -489,12 +497,23 @@ int hexkl_mm_u8i4_moe_layer_run(
       /* Counted, not timed -- see HEXKL_PROBE_BLOCKS. */
       HEXKL_PROBE_COUNT(HEXKL_PROBE_BLOCKS, 1);
 
-      /* The pack already wrote this block in slot order, so its 64 rows
-         are one contiguous run and this is a flat copy into VTCM. Rows
-         beyond m_blk are padding whose accumulator output is never read. */
+      /* The pack already wrote this block in slot order, so its 64 rows are
+         one contiguous run -- a single DMA, not a copy. Doing it on the
+         core moved 5.5 MB a layer at 3.1 GB/s, against the 33 the engine
+         measures, because the destination is VTCM and the core is the wrong
+         thing to write it with. Rows past m_blk are padding whose
+         accumulator output is never read. */
       HEXKL_PROBE_T0(p0);
-      hvx_copy_ah_block(vtcm_base + L.act_off,
-                        act_ah + (size_t)(slot_of[i] + mb) * K, K, pool);
+      {
+        const uint32_t blk_bytes = k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
+        const uint32_t rs = moe_dma_row_size(blk_bytes);
+        const uint32_t aidx = hexkl_dma_ring_next_idx();
+        hexkl_dma_ring_push2d(vtcm_base + L.act_off,
+                              act_ah + (size_t)(slot_of[i] + mb) * K, rs, rs,
+                              rs, blk_bytes / rs, /*src_vtcm=*/0,
+                              /*dst_vtcm=*/1);
+        hexkl_dma_ring_wait(aidx);
+      }
       for (uint32_t r = 0; r < m_blk; ++r) {
         scale[r] = slot_scale[slot_of[i] + mb + r];
         zp[r] = slot_zp[slot_of[i] + mb + r];
@@ -522,6 +541,8 @@ int hexkl_mm_u8i4_moe_layer_run(
           if (first_drain && ci == 0u) {
             hexkl_probe_us[HEXKL_PROBE_DMA_FIRST] =
               hexkl_probe_us[HEXKL_PROBE_DRAIN];
+            HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_FIRST_KB,
+                              (nb * k_tiles * WEIGHT_TILE_BYTES_U8I4) >> 10);
           }
         }
         MOE_MM_BEGIN();
@@ -560,11 +581,6 @@ int hexkl_mm_u8i4_moe_layer_run(
          is what keeps this wait off the gate_up prefetch below -- the ring
          drains everything pending, so a push issued first would be waited
          for too and the pipeline would collapse into a serial chain. */
-      if (mb == 0u) {
-        HEXKL_PROBE_T0(p0);
-        hexkl_dma_ring_wait(dn_idx);
-        HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN_DN, p0);
-      }
 
       /* A is dead once the last block's gate_up matmul is done, so the next
          expert's gate_up goes out now and rides under this block's SwiGLU,
@@ -600,9 +616,15 @@ int hexkl_mm_u8i4_moe_layer_run(
       /* --- down ---------------------------------------------------- */
       /* Same batching as gate_up. One destination here, so the split is set
          past the last column and dst_b is never reached. */
-      for (uint32_t nt0 = 0; nt0 < dn_ntiles; nt0 += L.acc_tiles) {
+      for (uint32_t nt0 = 0, ci = 0; nt0 < dn_ntiles;
+           nt0 += L.acc_tiles, ++ci) {
         const uint32_t nb =
           (dn_ntiles - nt0 < L.acc_tiles) ? (dn_ntiles - nt0) : L.acc_tiles;
+        if (mb == 0u) {
+          HEXKL_PROBE_T0(p0);
+          hexkl_dma_ring_wait(dn_idx[ci]);
+          HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN_DN, p0);
+        }
         MOE_MM_BEGIN();
         for (uint32_t j = 0; j < nb; ++j) {
           hexkl_micro_hmx_acc_clear_int32();
