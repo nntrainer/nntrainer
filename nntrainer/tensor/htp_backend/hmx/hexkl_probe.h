@@ -46,6 +46,30 @@ enum {
       per-block quantize, which the restructure never touched. */
   HEXKL_PROBE_GATHER,
   HEXKL_PROBE_REQUANT,
+  /** The HMX issue loop itself: acc_clear plus the k-tile mm calls, with
+      the acc_read and dequant that share the n-tile loop subtracted back
+      out (both are already timed, so their totals are snapshotted around
+      the loop rather than probed again inside it -- two timer reads per
+      block instead of 176, which is what makes naming this stage affordable
+      at all). Until now mm was a residual, and a residual absorbs whatever
+      the probes do not name: it read 10638 us at 42.7 ms and 13722 at
+      37.2 ms with the same 43 blocks, which no change in between explains.
+      Naming it turns the leftover into a real leftover. */
+  HEXKL_PROBE_MM,
+  /** NOT a time: kilobytes pushed through the DMA ring this call. Pairs
+      with DMA_FIRST below. */
+  HEXKL_PROBE_DMA_KB,
+  /** Microseconds of the FIRST weight drain, which waits on exactly one
+      gate_up transfer (3.5 MiB) with nothing else in flight -- the one
+      point in the call where a drain measures a transfer instead of a
+      pipeline. 3.5 MiB over this gives the DDR-to-VTCM rate, and that
+      number decides whether the rest of the kernel work is worth doing:
+      the 176 MB of int4 expert weights per layer need 12.8 GB/s to hide
+      behind the matmul, and the staging copies (DDR to DDR) already show
+      18.7 GB/s. If the weight path is near 6 GB/s instead, the layer is
+      bandwidth-bound at ~30 ms and no amount of gather or dequant work
+      moves it. */
+  HEXKL_PROBE_DMA_FIRST,
   HEXKL_PROBE_DRAIN,        /**< hexkl_dma_ring_drain */
   HEXKL_PROBE_SWIGLU,       /**< hvx_swiglu_inplace_f32 (fused layer only) */
   /** Routing multiply + accumulate into the layer output (MoE layer call
@@ -106,6 +130,15 @@ static inline uint64_t hexkl_probe_now(void) {
   do {                                                                         \
     if (hexkl_probe_on) {                                                      \
       hexkl_probe_us[slot] += hexkl_probe_now() - (t0);                        \
+    }                                                                          \
+  } while (0)
+
+/** @brief Folds @a n into a slot that holds a count rather than a time.
+ *         Same gate as the timers, so "probing off" means off. */
+#define HEXKL_PROBE_COUNT(slot, n)                                             \
+  do {                                                                         \
+    if (hexkl_probe_on) {                                                      \
+      hexkl_probe_us[slot] += (n);                                             \
     }                                                                          \
   } while (0)
 

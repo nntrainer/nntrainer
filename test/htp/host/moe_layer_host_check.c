@@ -187,6 +187,10 @@ void hvx_swiglu_inplace_f32(float *gate, const float *up, uint32_t m,
     }
 }
 uint64_t hexkl_probe_us[HEXKL_PROBE_N];
+/* On, so the counting probes (blocks, DMA bytes) run here too -- this
+   harness is where a miscounted block or a push that never happens shows up
+   without a device. The timers read the stub clock and are not checked. */
+int hexkl_probe_on = 1;
 
 /* ---------------- reference: one expert, one row, at a time -------------- */
 typedef struct {
@@ -372,6 +376,30 @@ int main(void) {
   printf("mismatches=%u of %u   worst_rel=%g\n", bad, M * N_out, worst);
   printf(bad == 0 ? "MOE KERNEL MATCHES REFERENCE\n" : "MOE KERNEL DIFFERS\n");
   int fail = (bad != 0);
+
+  /* Every active expert's gate_up and down must have been pushed. The DMA
+     stub here completes immediately, so a missing push cannot show up as a
+     wrong result the way a premature one does -- this counter is the only
+     thing that catches it, and it is also what the device profile divides
+     by to get GB/s, so a wrong count would quietly misreport the bandwidth
+     the whole plan is gated on. */
+  {
+    uint32_t active = 0;
+    for (uint32_t e = 0; e < NE; ++e) {
+      if (rc_[e] != 0u)
+        ++active;
+    }
+    const uint32_t gu_kb = ((K / 32u) * ((2u * inter) / 32u) * 512u) >> 10;
+    const uint32_t dn_kb = ((inter / 32u) * (N_out / 32u) * 512u) >> 10;
+    const uint64_t want = (uint64_t)active * (gu_kb + dn_kb);
+    const uint64_t got_kb = hexkl_probe_us[HEXKL_PROBE_DMA_KB];
+    printf("weight DMA        : %llu KB over %u experts (want %llu)\n",
+           (unsigned long long)got_kb, active, (unsigned long long)want);
+    if (got_kb != want)
+      fail = 1;
+    if (hexkl_probe_us[HEXKL_PROBE_BLOCKS] == 0u)
+      fail = 1;
+  }
 
   /* --- edge cases the routing can actually produce --------------------- */
   {

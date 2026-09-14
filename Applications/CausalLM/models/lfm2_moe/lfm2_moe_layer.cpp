@@ -804,12 +804,21 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // there is more than one token to amortize the 64-row pad tax over --
     // the same M > 1 gate the split-call fused path uses. Falls through to
     // the per-expert loop below otherwise.
-    const bool moe_layer_done =
-      total_tokens > 1 &&
-      tryMoeLayerOnAccelerator(
+    /* M0: the one stage that had no timer. With the whole-layer call the
+       ARM-side gather, route and scatter all read ~0 because the DSP does
+       them, and this read 0 as well -- so nothing accounted for the layer's
+       wall clock, and doc 46 section 18.1 had to quote the ARM remainder as
+       a 2.1-5.0 ms range rather than a number. Scoped, not folded into the
+       && above: a temporary M0Timer in an expression is destroyed before
+       the call it was meant to wrap. */
+    bool moe_layer_done = false;
+    if (total_tokens > 1) {
+      M0Timer t(&g_m0.ffn);
+      moe_layer_done = tryMoeLayerOnAccelerator(
         input, output, expert_assignments, context, expert_gate_up_proj_indices,
         expert_down_proj_indices, total_tokens, hidden_size,
         std::get<nntrainer::props::Unit>(moe_props).get());
+    }
 
     if (moe_layer_done) {
       // nothing further: the accelerator zeroed the output, ran every

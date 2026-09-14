@@ -74,6 +74,7 @@ static void moe_push_weight(uint8_t *vtcm_base, uint32_t dst_off,
                          (h->N / HEXKL_HMX_INT8_BLOCK_N_COL) *
                          WEIGHT_TILE_BYTES_U8I4;
   const uint32_t rs = moe_dma_row_size(bytes);
+  HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_KB, bytes >> 10);
   hexkl_dma_ring_push2d(vtcm_base + dst_off, h->wh_bytes, rs, rs, rs,
                         bytes / rs, /*src_vtcm=*/0, /*dst_vtcm=*/1);
 }
@@ -134,6 +135,40 @@ static void moe_dma_copy(void *dst, const void *src, size_t bytes, int src_vtcm,
   }
   hexkl_dma_ring_drain();
 }
+
+/**
+ * @brief Times an n-tile loop's HMX issue by difference.
+ *
+ * hexkl_micro_hmx_acc_read_int32 and the tile dequant sit inside the same
+ * loop and are already probed, so their running totals are snapshotted
+ * across it and subtracted rather than probed again per tile: two clock
+ * reads for a 112-tile loop instead of 224. What is left is acc_clear, the
+ * k-tile mm calls and the loop itself -- exactly what the old mm residual
+ * was meant to be, except a residual also absorbs everything unnamed, which
+ * is how it moved 3.1 ms between two runs at the same block count with
+ * nothing in between that touches it.
+ *
+ * Needs mm_t0 / mm_acc0 / mm_dq0 in scope; they are declared once per call
+ * beside p0 so the two loops in a block do not redeclare them.
+ */
+#define MOE_MM_BEGIN()                                                         \
+  do {                                                                         \
+    if (hexkl_probe_on) {                                                      \
+      mm_acc0 = hexkl_probe_us[HEXKL_PROBE_ACC_READ];                          \
+      mm_dq0 = hexkl_probe_us[HEXKL_PROBE_DEQUANT];                            \
+      mm_t0 = hexkl_probe_now();                                               \
+    }                                                                          \
+  } while (0)
+
+#define MOE_MM_END()                                                           \
+  do {                                                                         \
+    if (hexkl_probe_on) {                                                      \
+      hexkl_probe_us[HEXKL_PROBE_MM] +=                                        \
+        (hexkl_probe_now() - mm_t0) -                                          \
+        (hexkl_probe_us[HEXKL_PROBE_ACC_READ] - mm_acc0) -                     \
+        (hexkl_probe_us[HEXKL_PROBE_DEQUANT] - mm_dq0);                        \
+    }                                                                          \
+  } while (0)
 
 int hexkl_mm_u8i4_moe_layout(uint32_t K, uint32_t inter, uint32_t N_out,
                              uint32_t arena_bytes, hexkl_moe_layout *out) {
@@ -283,6 +318,9 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint32_t *base_of = (uint32_t *)malloc(sizeof(uint32_t) * n_experts);
   uint32_t n_active = 0u;
   uint64_t p0 = 0;
+  /* MOE_MM_BEGIN/END's state. See the macros above hexkl_mm_u8i4_moe_layout
+     for why the HMX issue loop is timed by difference. */
+  uint64_t mm_t0 = 0, mm_acc0 = 0, mm_dq0 = 0;
   if (!scale || !zp || !act_ah || !scale_all || !zp_all || !order || !base_of ||
       !act_c || !out_c) {
     rc = AEE_ENOMEMORY;
@@ -329,6 +367,11 @@ int hexkl_mm_u8i4_moe_layer_run(
 
   for (uint32_t i = 0; i < n_active; ++i) {
     const uint32_t e = order[i];
+    /* i == 0 waits on gate_up[order[0]] alone -- pushed just above with an
+       empty ring -- so it times a 3.5 MiB DDR->VTCM transfer rather than a
+       pipeline bubble. Recorded separately for that reason; it still counts
+       toward DRAIN so the stage columns keep summing to the DSP total. */
+    const int first_drain = (i == 0u);
     const hexkl_weight_u8i4 *g = &tbl->slots[h_gate_up[e]];
     const hexkl_weight_u8i4 *d = &tbl->slots[h_down[e]];
     const uint32_t *rows = row_index + base_of[i];
@@ -340,6 +383,9 @@ int hexkl_mm_u8i4_moe_layer_run(
     HEXKL_PROBE_T0(p0);
     hexkl_dma_ring_drain();
     HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
+    if (first_drain) {
+      hexkl_probe_us[HEXKL_PROBE_DMA_FIRST] = hexkl_probe_us[HEXKL_PROBE_DRAIN];
+    }
 
     /* down[e] goes out now so the first block's gate_up matmul covers it. */
     moe_push_weight(vtcm_base, L.w_dn_off, d, inter);
@@ -348,7 +394,7 @@ int hexkl_mm_u8i4_moe_layer_run(
       const uint32_t m_blk = (n_e - mb < BR) ? (n_e - mb) : BR;
       const int last_block = (mb + BR >= n_e);
       /* Counted, not timed -- see HEXKL_PROBE_BLOCKS. */
-      hexkl_probe_us[HEXKL_PROBE_BLOCKS] += 1;
+      HEXKL_PROBE_COUNT(HEXKL_PROBE_BLOCKS, 1);
 
       /* Gather this block's token rows into a contiguous staging buffer and
          quantize them. Gathering f32 and quantizing per block -- rather
@@ -368,6 +414,7 @@ int hexkl_mm_u8i4_moe_layer_run(
       HEXKL_PROBE_ADD(HEXKL_PROBE_GATHER, p0);
 
       /* --- gate_up ------------------------------------------------- */
+      MOE_MM_BEGIN();
       for (uint32_t nt = 0; nt < gu_ntiles; ++nt) {
         hexkl_micro_hmx_acc_clear_int32();
         for (uint32_t kt = 0; kt < k_tiles; ++kt) {
@@ -400,6 +447,7 @@ int hexkl_mm_u8i4_moe_layer_run(
                                     /*accumulate=*/0);
         HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
       }
+      MOE_MM_END();
 
       /* down[e]'s transfer is waited for here, after a whole gate_up
          matmul has run over it. Draining before the next push, not after,
@@ -438,6 +486,7 @@ int hexkl_mm_u8i4_moe_layer_run(
       }
 
       /* --- down ---------------------------------------------------- */
+      MOE_MM_BEGIN();
       for (uint32_t nt = 0; nt < dn_ntiles; ++nt) {
         hexkl_micro_hmx_acc_clear_int32();
         for (uint32_t kt = 0; kt < inter_ktiles; ++kt) {
@@ -465,6 +514,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           (float *)(vtcm_base + L.res_f32_off) + c0, N_out, /*accumulate=*/0);
         HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
       }
+      MOE_MM_END();
 
       /* Routing multiply and scatter-add in one pass. The ARM side does
          these as two loops building a Tensor per token per expert (doc 44

@@ -599,6 +599,9 @@ enum {
   MOE_T_GATHER,  /**< hvx_gather_ah_u8 + the per-block scale/zp slice */
   MOE_T_REQUANT, /**< the SwiGLU output's per-block quantize */
   MOE_T_BLOCKS,  /**< NOT us: 64-row blocks issued, summed over experts */
+  MOE_T_MM,      /**< the HMX issue loop, timed rather than left a residual */
+  MOE_T_DMA_KB,  /**< NOT us: kilobytes pushed through the DMA ring */
+  MOE_T_DMA_FIRST, /**< us of the first weight drain = one 3.5 MiB transfer */
   MOE_T_STAGE,   /**< copying the FastRPC buffers to and from cached heap */
   MOE_T_ACC_STRIDE,
   MOE_N_STAGES
@@ -727,6 +730,9 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
   stage_us[MOE_T_GATHER] = (uint32)hexkl_probe_us[HEXKL_PROBE_GATHER];
   stage_us[MOE_T_REQUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_REQUANT];
   stage_us[MOE_T_BLOCKS] = (uint32)hexkl_probe_us[HEXKL_PROBE_BLOCKS];
+  stage_us[MOE_T_MM] = (uint32)hexkl_probe_us[HEXKL_PROBE_MM];
+  stage_us[MOE_T_DMA_KB] = (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_KB];
+  stage_us[MOE_T_DMA_FIRST] = (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_FIRST];
   stage_us[MOE_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
   return rc;
 }
