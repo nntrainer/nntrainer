@@ -61,4 +61,26 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
                          uint32_t k, const float *scale, const int32_t *zp,
                          uint8_t *out_ah, hvx_worker_pool *pool);
 
+/**
+ * @brief Same pack, but destination row d takes its input from source row
+ *        @a row_map[d].
+ *
+ * hvx_quant_pack_u8_ah is this with @a row_map NULL. @a scale and @a zp are
+ * indexed by DESTINATION row, so a caller that repeats a source row (a MoE
+ * token routed to several experts does) must repeat its quantization
+ * parameters to match -- they belong to the source row and do not change
+ * with where it lands.
+ *
+ * Exists so a MoE layer can pack straight into expert order, 64-row block
+ * by 64-row block, and skip gathering rows out of a row-ordered buffer
+ * afterwards. That gather read 32 bytes at a time from addresses scattered
+ * across the whole activation and cost 3.2 ms a layer; tidying its
+ * destination did nothing, because the scattered reads were the cost
+ * (doc 46 section 26.3).
+ */
+int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *row_map,
+                                uint32_t m_valid, uint32_t m_pad, uint32_t k,
+                                const float *scale, const int32_t *zp,
+                                uint8_t *out_ah, hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_QUANT_U8_H__ */

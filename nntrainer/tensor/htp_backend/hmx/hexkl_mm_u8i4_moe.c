@@ -67,19 +67,36 @@ static uint32_t moe_dma_row_size(uint32_t total_bytes) {
   return rs;
 }
 
-/** @brief Pushes a registered weight's WH bytes into a VTCM buffer. */
-static void moe_push_weight(uint8_t *vtcm_base, uint32_t dst_off,
-                            const hexkl_weight_u8i4 *h, uint32_t K) {
-  const uint32_t bytes = (K / HEXKL_HMX_INT8_BLOCK_N_INNER) *
-                         (h->N / HEXKL_HMX_INT8_BLOCK_N_COL) *
-                         WEIGHT_TILE_BYTES_U8I4;
-  const uint32_t rs = moe_dma_row_size(bytes);
+/**
+ * @brief Pushes n-tile columns [nt0, nt0+cn) of a weight, one descriptor.
+ *
+ * WH tiles are indexed kt*n_col + nt, so a run of n-tile columns is cn*512
+ * contiguous bytes repeated k_tiles times at a n_col*512 stride -- exactly
+ * a 2D transfer, and the destination keeps the same layout so the matmul's
+ * indexing is unchanged. The bake order does not have to move.
+ *
+ * Splitting the weight this way is what lets the matmul start on column
+ * nt0 while the rest is still arriving. Waiting for all 3.5 MB of a
+ * gate_up first cost 110 us an expert against a 136 us transfer -- the
+ * prefetch was hiding almost nothing (doc 46 section 26.4).
+ *
+ * @return the ring index to hand hexkl_dma_ring_wait
+ */
+static uint32_t moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
+                                      const hexkl_weight_u8i4 *h,
+                                      uint32_t k_tiles, uint32_t n_col,
+                                      uint32_t nt0, uint32_t cn) {
+  const uint32_t row = cn * WEIGHT_TILE_BYTES_U8I4;
+  const uint32_t stride = n_col * WEIGHT_TILE_BYTES_U8I4;
+  const uint32_t off = nt0 * WEIGHT_TILE_BYTES_U8I4;
+  const uint32_t idx = hexkl_dma_ring_next_idx();
   uint64_t pt = 0;
-  HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_KB, bytes >> 10);
+  HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_KB, (row * k_tiles) >> 10);
   HEXKL_PROBE_T0(pt);
-  hexkl_dma_ring_push2d(vtcm_base + dst_off, h->wh_bytes, rs, rs, rs,
-                        bytes / rs, /*src_vtcm=*/0, /*dst_vtcm=*/1);
+  hexkl_dma_ring_push2d(vtcm_base + dst_off + off, h->wh_bytes + off, stride,
+                        stride, row, k_tiles, /*src_vtcm=*/0, /*dst_vtcm=*/1);
   HEXKL_PROBE_ADD(HEXKL_PROBE_PUSH, pt);
+  return idx;
 }
 
 /**
@@ -221,13 +238,22 @@ int hexkl_mm_u8i4_moe_layout(uint32_t K, uint32_t inter, uint32_t N_out,
      one still works, and is exactly the old behaviour. gate_up has the most
      n-tiles, so it sets the useful ceiling. */
   {
-    const uint32_t want = (2u * inter) / HEXKL_HMX_INT8_BLOCK_N_COL;
+    uint32_t want = (2u * inter) / HEXKL_HMX_INT8_BLOCK_N_COL;
     uint32_t fits = 0u;
     if (arena_bytes > L.result_off) {
       fits = (arena_bytes - L.result_off) / ACC_TILE_BYTES;
     }
     if (fits == 0u) {
       return AEE_ENOMEMORY;
+    }
+    /* Capped, not maximised. This count is also the weight chunk size (see
+       moe_push_weight_chunk): a bigger batch parallelises the dequant no
+       better once it is well past the worker count, and a smaller chunk is
+       what makes the matmul start sooner. 32 leaves gate_up in 4 chunks and
+       down in 2, which is 194 ring descriptors a layer against the ring's
+       256. */
+    if (want > 32u) {
+      want = 32u;
     }
     L.acc_tiles = (fits < want) ? fits : want;
   }
@@ -316,7 +342,18 @@ int hexkl_mm_u8i4_moe_layer_run(
      rows are grouped -- and the per-block work becomes a uint8 move rather
      than a scan and a pack of the same rows four times over at top-4. */
   const uint32_t m_pad = ROUND_UP_U32(M, BR);
-  uint8_t *act_ah = (uint8_t *)malloc((size_t)m_pad * K);
+  /* One 64-row slot per row every expert asked for, padded up per block:
+     the pack writes straight into this order so no gather is needed. A
+     token picked by four experts occupies four slots. */
+  uint32_t n_slots = 0u;
+  for (uint32_t e = 0; e < n_experts; ++e) {
+    n_slots += ROUND_UP_U32(row_count[e], HEXKL_HMX_INT8_BLOCK_N_ROW);
+  }
+  uint8_t *act_ah = (uint8_t *)malloc((size_t)n_slots * K);
+  uint32_t *slot_row = (uint32_t *)malloc(sizeof(uint32_t) * n_slots);
+  uint32_t *slot_of = (uint32_t *)malloc(sizeof(uint32_t) * n_experts);
+  float *slot_scale = (float *)malloc(sizeof(float) * n_slots);
+  int32_t *slot_zp = (int32_t *)malloc(sizeof(int32_t) * n_slots);
   float *scale_all = (float *)malloc(sizeof(float) * m_pad);
   int32_t *zp_all = (int32_t *)malloc(sizeof(int32_t) * m_pad);
   /* act_f32 and out_f32 are the host's FastRPC buffers, which are rpcmem
@@ -342,8 +379,9 @@ int hexkl_mm_u8i4_moe_layer_run(
   /* MOE_MM_BEGIN/END's state. See the macros above hexkl_mm_u8i4_moe_layout
      for why the HMX issue loop is timed by difference. */
   uint64_t mm_t0 = 0, mm_acc0 = 0, mm_dq0 = 0;
-  if (!scale || !zp || !act_ah || !scale_all || !zp_all || !order || !base_of ||
-      !act_c || !out_c) {
+  if (!scale || !zp || !act_ah || !slot_row || !slot_of || !slot_scale ||
+      !slot_zp || !scale_all || !zp_all || !order || !base_of || !act_c ||
+      !out_c) {
     rc = AEE_ENOMEMORY;
     goto out;
   }
@@ -353,11 +391,13 @@ int hexkl_mm_u8i4_moe_layer_run(
      expert in the middle would break the chain; compacting first means the
      pipeline never has to think about empties. */
   {
-    uint32_t base = 0u;
+    uint32_t base = 0u, slot = 0u;
     for (uint32_t e = 0; e < n_experts; ++e) {
       if (row_count[e] != 0u) {
         base_of[n_active] = base;
+        slot_of[n_active] = slot;
         order[n_active++] = e;
+        slot += ROUND_UP_U32(row_count[e], HEXKL_HMX_INT8_BLOCK_N_ROW);
       }
       base += row_count[e];
     }
@@ -368,12 +408,38 @@ int hexkl_mm_u8i4_moe_layer_run(
   memset(out_c, 0, sizeof(float) * (size_t)M * N_out);
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
 
-  /* Once for the layer, from the cached copy. 444 rows here against 1776
-     scanned and packed a block at a time before. */
+  /* The scan is per source row and independent of where a row ends up, so
+     it still runs once over M rows. */
   HEXKL_PROBE_T0(p0);
   hvx_quant_rows_u8_params(act_c, M, m_pad, K, scale_all, zp_all, pool);
-  rc =
-    hvx_quant_pack_u8_ah(act_c, M, m_pad, K, scale_all, zp_all, act_ah, pool);
+
+  /* Slot order: every active expert's rows, each expert padded up to a
+     whole 64-row block. Padding slots repeat row 0 -- their accumulator
+     output is never dequantized (m_blk bounds that) so the content does not
+     matter, only that the read is in range. */
+  {
+    uint32_t d = 0u;
+    for (uint32_t i = 0; i < n_active; ++i) {
+      const uint32_t e = order[i];
+      const uint32_t *rows_e = row_index + base_of[i];
+      const uint32_t padded =
+        ROUND_UP_U32(row_count[e], HEXKL_HMX_INT8_BLOCK_N_ROW);
+      for (uint32_t r = 0; r < padded; ++r, ++d) {
+        const uint32_t src = (r < row_count[e]) ? rows_e[r] : 0u;
+        slot_row[d] = src;
+        slot_scale[d] = scale_all[src];
+        slot_zp[d] = zp_all[src];
+      }
+    }
+    n_slots = d; /* inactive experts contribute nothing */
+  }
+
+  /* Packed straight into slot order, so a block's 64 rows are already
+     contiguous and the gather pass that used to follow is gone. */
+  HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
+  HEXKL_PROBE_T0(p0);
+  rc = hvx_quant_pack_u8_ah_mapped(act_c, slot_row, n_slots, n_slots, K,
+                                   slot_scale, slot_zp, act_ah, pool);
   HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
   if (rc != AEE_SUCCESS) {
     goto out;
@@ -384,7 +450,19 @@ int hexkl_mm_u8i4_moe_layer_run(
     goto out;
   }
 
-  moe_push_weight(vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[0]]], K);
+  /* gate_up in chunks, so the first n-tile column is usable long before
+     the last. MOE_MAX_CHUNKS bounds the array; acc_tiles caps at 32 and
+     gate_up has 112 columns, so 4 is the real count. */
+#define MOE_MAX_CHUNKS 16u
+  uint32_t gu_idx[MOE_MAX_CHUNKS];
+  uint32_t gu_nchunk = 0u;
+  for (uint32_t nt0 = 0; nt0 < gu_ntiles; nt0 += L.acc_tiles) {
+    const uint32_t cn =
+      (gu_ntiles - nt0 < L.acc_tiles) ? (gu_ntiles - nt0) : L.acc_tiles;
+    gu_idx[gu_nchunk++] = moe_push_weight_chunk(
+      vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[0]]], k_tiles,
+      gu_ntiles, nt0, cn);
+  }
 
   for (uint32_t i = 0; i < n_active; ++i) {
     const uint32_t e = order[i];
@@ -401,15 +479,9 @@ int hexkl_mm_u8i4_moe_layer_run(
 
     /* gate_up[e] was pushed either before this loop or by iteration i-1,
        where it had this expert's predecessor's down matmul to hide behind. */
-    HEXKL_PROBE_T0(p0);
-    hexkl_dma_ring_drain();
-    HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
-    if (first_drain) {
-      hexkl_probe_us[HEXKL_PROBE_DMA_FIRST] = hexkl_probe_us[HEXKL_PROBE_DRAIN];
-    }
-
-    /* down[e] goes out now so the first block's gate_up matmul covers it. */
-    moe_push_weight(vtcm_base, L.w_dn_off, d, inter);
+    /* down[e] goes out first so the whole gate_up matmul covers it. */
+    const uint32_t dn_idx = moe_push_weight_chunk(
+      vtcm_base, L.w_dn_off, d, inter_ktiles, dn_ntiles, 0u, dn_ntiles);
 
     for (uint32_t mb = 0; mb < n_e; mb += BR) {
       const uint32_t m_blk = (n_e - mb < BR) ? (n_e - mb) : BR;
@@ -417,20 +489,15 @@ int hexkl_mm_u8i4_moe_layer_run(
       /* Counted, not timed -- see HEXKL_PROBE_BLOCKS. */
       HEXKL_PROBE_COUNT(HEXKL_PROBE_BLOCKS, 1);
 
-      /* Gather this block's token rows into a contiguous staging buffer and
-         quantize them. Gathering f32 and quantizing per block -- rather
-         than quantizing all M rows once and gathering uint8 -- is what
-         makes this bit-identical to the path it replaces: the same rows go
-         through the same scan and the same pack, in the same grouping. The
-         uint8 version reads 4x fewer bytes and is the obvious follow-up,
-         but it changes what is compared, so it does not belong in the
-         commit that has to prove equivalence. */
+      /* The pack already wrote this block in slot order, so its 64 rows
+         are one contiguous run and this is a flat copy into VTCM. Rows
+         beyond m_blk are padding whose accumulator output is never read. */
       HEXKL_PROBE_T0(p0);
-      hvx_gather_ah_u8(vtcm_base + L.act_off, act_ah, rows + mb, m_blk, K,
-                       pool);
+      hvx_copy_ah_block(vtcm_base + L.act_off,
+                        act_ah + (size_t)(slot_of[i] + mb) * K, K, pool);
       for (uint32_t r = 0; r < m_blk; ++r) {
-        scale[r] = scale_all[rows[mb + r]];
-        zp[r] = zp_all[rows[mb + r]];
+        scale[r] = slot_scale[slot_of[i] + mb + r];
+        zp[r] = slot_zp[slot_of[i] + mb + r];
       }
       HEXKL_PROBE_ADD(HEXKL_PROBE_GATHER, p0);
 
@@ -441,9 +508,22 @@ int hexkl_mm_u8i4_moe_layer_run(
          convention hvx_swiglu_inplace_f32's contract assumes -- and a
          batch can straddle that boundary, which is why the split is a
          parameter rather than two calls. */
-      for (uint32_t nt0 = 0; nt0 < gu_ntiles; nt0 += L.acc_tiles) {
+      for (uint32_t nt0 = 0, ci = 0; nt0 < gu_ntiles;
+           nt0 += L.acc_tiles, ++ci) {
         const uint32_t nb =
           (gu_ntiles - nt0 < L.acc_tiles) ? (gu_ntiles - nt0) : L.acc_tiles;
+        /* Only the first block of an expert waits: by the second the whole
+           weight is resident. i == 0 && ci == 0 is the one wait that cannot
+           hide behind anything, which is what DMA_FIRST records. */
+        if (mb == 0u) {
+          HEXKL_PROBE_T0(p0);
+          hexkl_dma_ring_wait(gu_idx[ci]);
+          HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
+          if (first_drain && ci == 0u) {
+            hexkl_probe_us[HEXKL_PROBE_DMA_FIRST] =
+              hexkl_probe_us[HEXKL_PROBE_DRAIN];
+          }
+        }
         MOE_MM_BEGIN();
         for (uint32_t j = 0; j < nb; ++j) {
           hexkl_micro_hmx_acc_clear_int32();
@@ -482,7 +562,7 @@ int hexkl_mm_u8i4_moe_layer_run(
          for too and the pipeline would collapse into a serial chain. */
       if (mb == 0u) {
         HEXKL_PROBE_T0(p0);
-        hexkl_dma_ring_drain();
+        hexkl_dma_ring_wait(dn_idx);
         HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN_DN, p0);
       }
 
@@ -490,8 +570,14 @@ int hexkl_mm_u8i4_moe_layer_run(
          expert's gate_up goes out now and rides under this block's SwiGLU,
          requantization and down matmul. */
       if (last_block && i + 1u < n_active) {
-        moe_push_weight(vtcm_base, L.w_gu_off,
-                        &tbl->slots[h_gate_up[order[i + 1u]]], K);
+        gu_nchunk = 0u;
+        for (uint32_t nt0 = 0; nt0 < gu_ntiles; nt0 += L.acc_tiles) {
+          const uint32_t cn =
+            (gu_ntiles - nt0 < L.acc_tiles) ? (gu_ntiles - nt0) : L.acc_tiles;
+          gu_idx[gu_nchunk++] = moe_push_weight_chunk(
+            vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[i + 1u]]],
+            k_tiles, gu_ntiles, nt0, cn);
+        }
       }
 
       HEXKL_PROBE_T0(p0);
@@ -572,6 +658,10 @@ out:
   free(scale);
   free(zp);
   free(act_ah);
+  free(slot_row);
+  free(slot_of);
+  free(slot_scale);
+  free(slot_zp);
   free(scale_all);
   free(zp_all);
   free(order);

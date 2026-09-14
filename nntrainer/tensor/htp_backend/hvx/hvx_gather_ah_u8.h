@@ -47,8 +47,14 @@
  * @param[in]  k        must be a multiple of 32
  * @param[in]  pool     splits by row; NULL runs on the caller
  */
-void hvx_gather_ah_u8(uint8_t *dst_ah, const uint8_t *src_ah,
-                      const uint32_t *rows, uint32_t n_rows, uint32_t k,
-                      hvx_worker_pool *pool);
+/**
+ * @brief Copies one 64-row AH block, @a k/32 tiles of 2048 bytes, pooled.
+ *
+ * @param dst_ah  destination block, kt_n*2048 bytes (VTCM)
+ * @param src_ah  the block's first byte in a slot-ordered activation
+ * @param pool    NULL copies on the calling thread
+ */
+void hvx_copy_ah_block(uint8_t *dst_ah, const uint8_t *src_ah, uint32_t k,
+                       hvx_worker_pool *pool);
 
 #endif /* __NNTRAINER_HVX_GATHER_AH_U8_H__ */

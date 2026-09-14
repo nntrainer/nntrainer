@@ -59,6 +59,14 @@ int hexkl_micro_hmx_acc_read_int32(uint8_t *base, uint32_t cfg, uint32_t off) {
    destination is still live shows up as a wrong result. ---- */
 void hexkl_dma_ring_reset(void) {}
 void hexkl_dma_ring_drain(void) {}
+/* Indices are handed out and waited on for real shape, but every transfer
+   has already completed by the time push2d returns, so a wait is a no-op.
+   That is the point: a chunk consumed before its push would read stale
+   bytes on device and read correct ones here, so what this harness checks
+   is that every chunk IS pushed and that the offsets line up. */
+static uint32_t g_stub_idx;
+uint32_t hexkl_dma_ring_next_idx(void) { return g_stub_idx++; }
+void hexkl_dma_ring_wait(uint32_t idx) { (void)idx; }
 void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
                            uint32_t rs, uint32_t nrows, int sv, int dv) {
   (void)sv;
@@ -95,9 +103,10 @@ void hvx_quant_rows_u8_params(const float *x, uint32_t m, uint32_t mp,
     zp[r] = (int32_t)z;
   }
 }
-int hvx_quant_pack_u8_ah(const float *x, uint32_t m, uint32_t mp, uint32_t k,
-                         const float *scale, const int32_t *zp, uint8_t *out,
-                         hvx_worker_pool *p) {
+int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *map,
+                                uint32_t m, uint32_t mp, uint32_t k,
+                                const float *scale, const int32_t *zp,
+                                uint8_t *out, hvx_worker_pool *p) {
   (void)p;
   /* Tiles run (row_block, inner_tile) at a 2048-byte stride, so a caller
      passing more than 64 rows writes several row blocks. The kernel now
@@ -108,7 +117,8 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m, uint32_t mp, uint32_t k,
   for (uint32_t r = 0; r < m; ++r)
     for (uint32_t kt = 0; kt < kt_n; ++kt)
       for (uint32_t j = 0; j < 32; ++j) {
-        long q = lrintf(x[(size_t)r * k + kt * 32 + j] / scale[r]) + zp[r];
+        const size_t sr = map ? map[r] : r;
+        long q = lrintf(x[sr * k + kt * 32 + j] / scale[r]) + zp[r];
         if (q < 0)
           q = 0;
         if (q > 255)
@@ -117,6 +127,12 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m, uint32_t mp, uint32_t k,
             (size_t)(r % 64u) * 32u + j] = (uint8_t)q;
       }
   return 0;
+}
+
+int hvx_quant_pack_u8_ah(const float *x, uint32_t m, uint32_t mp, uint32_t k,
+                         const float *scale, const int32_t *zp, uint8_t *out,
+                         hvx_worker_pool *p) {
+  return hvx_quant_pack_u8_ah_mapped(x, NULL, m, mp, k, scale, zp, out, p);
 }
 void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
                                  uint32_t m, const float *as, const int32_t *az,
@@ -148,21 +164,10 @@ void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
   func(1u, 0, ctx);
 }
 
-void hvx_gather_ah_u8(uint8_t *dst_ah, const uint8_t *src_ah,
-                      const uint32_t *rows, uint32_t n_rows, uint32_t k,
-                      hvx_worker_pool *pool) {
+void hvx_copy_ah_block(uint8_t *dst, const uint8_t *src, uint32_t k,
+                       hvx_worker_pool *pool) {
   (void)pool;
-  const uint32_t kt_n = k / 32u;
-  memset(dst_ah, 0, (size_t)kt_n * 2048u);
-  for (uint32_t r = 0; r < n_rows; ++r) {
-    const uint32_t t = rows[r];
-    for (uint32_t kt = 0; kt < kt_n; ++kt) {
-      memcpy(dst_ah + (size_t)kt * 2048u + (size_t)r * 32u,
-             src_ah + (size_t)(t / 64u) * kt_n * 2048u + (size_t)kt * 2048u +
-               (size_t)(t % 64u) * 32u,
-             32u);
-    }
-  }
+  memcpy(dst, src, (size_t)(k / 32u) * 2048u);
 }
 
 void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
@@ -465,7 +470,7 @@ int main(void) {
   {
     hexkl_moe_layout R;
     int r = hexkl_mm_u8i4_moe_layout(2048, 1792, 2048, 8300u * 1024u, &R);
-    printf("LFM2 shapes       : rc=%d total=%.2f MB (doc 46 section 25 says 7.23)\n", r,
+    printf("LFM2 shapes       : rc=%d total=%.2f MB (doc 46 section 28 says 6.61)\n", r,
            R.total / 1048576.0);
     fail |= (r != 0);
     r = hexkl_mm_u8i4_moe_layout(2048, 1792, 2048, 4u << 20, &R);

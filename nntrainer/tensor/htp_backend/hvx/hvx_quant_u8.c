@@ -150,6 +150,13 @@ static void quant_pack_row_scalar(const float *row, uint32_t n_ktiles,
 
 typedef struct {
   const float *x;
+  /** Source row for each destination row, or NULL for "row m from row m".
+      A MoE layer builds one that lists every expert's rows in expert order,
+      padded to 64, so the pack writes each block ready to use and the
+      separate gather pass disappears. A token routed to four experts
+      appears four times, which is why this is a map and not a permutation:
+      it is read-only on the source side. */
+  const uint32_t *row_map;
   uint32_t m_vec_end, k, n_ktiles;
   const HVX_UVector *vinv; /**< m_vec_end entries, precomputed once --
                                malloc'd, so unaligned: see the two heap
@@ -176,18 +183,23 @@ static void quant_pack_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
     for (uint32_t m = 0; m < ctx->m_vec_end; m += 4u) {
       const uint32_t rb = m / TILE_ROW;
       const uint32_t r0 = m % TILE_ROW; // multiple of 4; group never wraps rb
+      /* The four rows of a group are four independent source pointers, so
+         a row map costs one indirection each and nothing else -- the
+         packing below still sees four rows and still lands them as one
+         128-byte store. */
+      const uint32_t *mp = ctx->row_map;
+      const size_t s0 = (size_t)(mp ? mp[m + 0] : (m + 0)) * ctx->k;
+      const size_t s1 = (size_t)(mp ? mp[m + 1] : (m + 1)) * ctx->k;
+      const size_t s2 = (size_t)(mp ? mp[m + 2] : (m + 2)) * ctx->k;
+      const size_t s3 = (size_t)(mp ? mp[m + 3] : (m + 3)) * ctx->k;
       const HVX_UVector *vin0 =
-        (const HVX_UVector *)(ctx->x + (size_t)(m + 0) * ctx->k +
-                              kt * TILE_INNER);
+        (const HVX_UVector *)(ctx->x + s0 + kt * TILE_INNER);
       const HVX_UVector *vin1 =
-        (const HVX_UVector *)(ctx->x + (size_t)(m + 1) * ctx->k +
-                              kt * TILE_INNER);
+        (const HVX_UVector *)(ctx->x + s1 + kt * TILE_INNER);
       const HVX_UVector *vin2 =
-        (const HVX_UVector *)(ctx->x + (size_t)(m + 2) * ctx->k +
-                              kt * TILE_INNER);
+        (const HVX_UVector *)(ctx->x + s2 + kt * TILE_INNER);
       const HVX_UVector *vin3 =
-        (const HVX_UVector *)(ctx->x + (size_t)(m + 3) * ctx->k +
-                              kt * TILE_INNER);
+        (const HVX_UVector *)(ctx->x + s3 + kt * TILE_INNER);
 
       const HVX_Vector vq0 = Q6_Vw_vadd_VwVw(
         hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin0[0], ctx->vinv[m + 0])),
@@ -223,6 +235,14 @@ static void quant_pack_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
 int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
                          uint32_t k, const float *scale, const int32_t *zp,
                          uint8_t *out_ah, hvx_worker_pool *pool) {
+  return hvx_quant_pack_u8_ah_mapped(x, NULL, m_valid, m_pad, k, scale, zp,
+                                     out_ah, pool);
+}
+
+int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *row_map,
+                                uint32_t m_valid, uint32_t m_pad, uint32_t k,
+                                const float *scale, const int32_t *zp,
+                                uint8_t *out_ah, hvx_worker_pool *pool) {
   const uint32_t n_ktiles = k / TILE_INNER;
 
   memset(out_ah, 0, (size_t)m_pad * k);
@@ -261,7 +281,7 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
       vz[m] = Q6_V_vsplat_R(zp[m]);
     }
 
-    quant_pack_ctx ctx = {x, m_vec_end, k, n_ktiles, vinv, vz, out_ah};
+    quant_pack_ctx ctx = {x, row_map, m_vec_end, k, n_ktiles, vinv, vz, out_ah};
     hvx_worker_pool_run(pool, quant_pack_worker, &ctx, n_ktiles);
 
     free(vinv);
@@ -275,7 +295,7 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m_valid, uint32_t m_pad,
     const uint32_t r = m % TILE_ROW;
     uint8_t *dst_tile0 =
       out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES + r * TILE_INNER;
-    quant_pack_row_scalar(x + (size_t)m * k, n_ktiles,
+    quant_pack_row_scalar(x + (size_t)(row_map ? row_map[m] : m) * k, n_ktiles,
                           hvx_splat_sf(1.0f / scale[m]), Q6_V_vsplat_R(zp[m]),
                           dst_tile0, ACT_TILE_BYTES);
   }

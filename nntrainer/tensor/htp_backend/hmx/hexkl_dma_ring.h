@@ -36,6 +36,25 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t dst_stride,
                            uint32_t src_stride, uint32_t row_size,
                            uint32_t nrows, int src_vtcm, int dst_vtcm);
 
+/**
+ * @brief The ring slot the next hexkl_dma_ring_push2d will occupy.
+ *
+ * Take it before the push, pass it to hexkl_dma_ring_wait after. Lets a
+ * caller split one logical transfer into chunks and start computing on the
+ * first while the rest is still moving -- which drain cannot express,
+ * because it waits for everything and so also for the prefetches a
+ * pipelined caller deliberately has in flight.
+ *
+ * The ring holds 256 descriptors and wraps, so an index is only meaningful
+ * until that many further pushes have happened. Callers that queue a
+ * bounded number per group (the MoE layer queues about 194) are safe by
+ * construction; one that queued more would have to wait sooner.
+ */
+uint32_t hexkl_dma_ring_next_idx(void);
+
+/** @brief Blocks until the transfer queued at @a idx has completed. */
+void hexkl_dma_ring_wait(uint32_t idx);
+
 /** @brief Blocks until every queued transfer has completed. */
 void hexkl_dma_ring_drain(void);
 

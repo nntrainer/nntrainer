@@ -64,7 +64,7 @@ static uint32_t g_push, g_pop;
 static hexkl_dma_desc2d *g_tail;
 static int g_started;
 
-static void hexkl_dma_ring_wait_idx(uint32_t i) {
+static void hexkl_dma_ring_wait_idx_(uint32_t i) {
   long guard = 0;
   while (!g_ring[i].done && guard++ < 50000000L) {
     unsigned r = 0;
@@ -88,7 +88,7 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t dst_stride,
     // Ring full: the oldest transfer must have already finished by the time
     // we have wrapped this far around, so reclaiming it is a formality, not
     // a stall -- but wait for `done` explicitly rather than assume it.
-    hexkl_dma_ring_wait_idx(g_pop);
+    hexkl_dma_ring_wait_idx_(g_pop);
     g_pop = (g_pop + 1) & (HEXKL_DMA_RING_N - 1);
   }
   hexkl_dma_desc2d *d = &g_ring[g_push];
@@ -123,9 +123,19 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t dst_stride,
   g_push = (g_push + 1) & (HEXKL_DMA_RING_N - 1);
 }
 
+uint32_t hexkl_dma_ring_next_idx(void) { return g_push; }
+
+void hexkl_dma_ring_wait(uint32_t idx) {
+  /* Descriptors are dmlinked, so they retire in push order and waiting on
+     one implies every earlier one. g_pop is deliberately NOT advanced: the
+     ring-full path in push2d reclaims, and leaving it alone keeps drain's
+     "everything pending" meaning intact for the callers that still use it. */
+  hexkl_dma_ring_wait_idx_(idx);
+}
+
 void hexkl_dma_ring_drain(void) {
   while (g_pop != g_push) {
-    hexkl_dma_ring_wait_idx(g_pop);
+    hexkl_dma_ring_wait_idx_(g_pop);
     g_pop = (g_pop + 1) & (HEXKL_DMA_RING_N - 1);
   }
   g_started = 0; // engine idle after drain -- the next push must dmstart
