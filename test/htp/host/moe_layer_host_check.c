@@ -186,6 +186,33 @@ void hvx_swiglu_inplace_f32(float *gate, const float *up, uint32_t m,
       gate[(size_t)r * n + j] = g / (1.f + expf(-g)) * up[(size_t)r * n + j];
     }
 }
+/* Scalar stand-in for the pooled batch dequant. Deliberately a loop over
+   the per-tile stand-in above, exactly as the real one is a pooled loop over
+   the real per-tile kernel: what this harness can check is the kernel's
+   batching arithmetic -- which tile lands at which staged slot, which column
+   it carries, and which side of the gate/up split it belongs to -- and a
+   stand-in that recomputed the dequant itself would check the stand-in. */
+void hvx_dequant_acc_tiles_to_f32(const uint8_t *tiles_base,
+                                  uint32_t tile_stride, uint32_t n_tiles,
+                                  uint32_t nt0, uint32_t row_stride,
+                                  uint32_t m_count, const float *act_scale,
+                                  const int32_t *act_zp,
+                                  const int32_t *colsum_w,
+                                  const float *w_scale, const float *bias,
+                                  float *dst_a, float *dst_b, uint32_t split,
+                                  uint32_t dst_stride, hvx_worker_pool *pool) {
+  (void)pool;
+  for (uint32_t j = 0; j < n_tiles; ++j) {
+    const uint32_t c0 = (nt0 + j) * 32u;
+    const int32_t *tile =
+      (const int32_t *)(tiles_base + (size_t)j * tile_stride);
+    float *out = (c0 < split) ? (dst_a + c0) : (dst_b + (c0 - split));
+    hvx_dequant_acc_tile_to_f32(tile, row_stride, m_count, act_scale, act_zp,
+                                colsum_w + c0, w_scale + c0, bias + c0, out,
+                                dst_stride, 0);
+  }
+}
+
 uint64_t hexkl_probe_us[HEXKL_PROBE_N];
 /* On, so the counting probes (blocks, DMA bytes) run here too -- this
    harness is where a miscounted block or a push that never happens shows up
@@ -438,7 +465,7 @@ int main(void) {
   {
     hexkl_moe_layout R;
     int r = hexkl_mm_u8i4_moe_layout(2048, 1792, 2048, 8300u * 1024u, &R);
-    printf("LFM2 shapes       : rc=%d total=%.2f MB (doc 46 says 6.37)\n", r,
+    printf("LFM2 shapes       : rc=%d total=%.2f MB (doc 46 section 25 says 7.23)\n", r,
            R.total / 1048576.0);
     fail |= (r != 0);
     r = hexkl_mm_u8i4_moe_layout(2048, 1792, 2048, 4u << 20, &R);

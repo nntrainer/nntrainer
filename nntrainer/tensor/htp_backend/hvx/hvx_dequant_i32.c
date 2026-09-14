@@ -137,3 +137,62 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
 
 #undef DQ_TILE_ROW
 #undef DQ_TILE_STORE
+
+/* ---- pooled dequant over a run of staged tiles --------------------------- */
+
+typedef struct {
+  const uint8_t *tiles_base;
+  uint32_t tile_stride;
+  uint32_t nt0;
+  uint32_t row_stride;
+  uint32_t m_count;
+  const float *act_scale;
+  const int32_t *act_zp;
+  const int32_t *colsum_w;
+  const float *w_scale;
+  const float *bias;
+  float *dst_a;
+  float *dst_b;
+  uint32_t split;
+  uint32_t dst_stride;
+  uint32_t n_tiles;
+} dq_tiles_ctx;
+
+static void dq_tiles_worker(uint32_t n_threads, uint32_t i, void *vctx) {
+  const dq_tiles_ctx *c = (const dq_tiles_ctx *)vctx;
+  const uint32_t lo = (uint32_t)((uint64_t)c->n_tiles * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)c->n_tiles * (i + 1) / n_threads);
+
+  for (uint32_t j = lo; j < hi; ++j) {
+    const uint32_t c0 = (c->nt0 + j) * HEXKL_ACC_TILE_COLS;
+    const int32_t *tile =
+      (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
+    /* Which half of a gate_up result this tile belongs to. A caller with one
+       destination passes a split past the last column, so this always takes
+       dst_a and never reads dst_b. */
+    float *out = (c0 < c->split) ? (c->dst_a + c0)
+                                 : (c->dst_b + (c0 - c->split));
+    hvx_dequant_acc_tile_to_f32(tile, c->row_stride, c->m_count,
+                                c->act_scale, c->act_zp, c->colsum_w + c0,
+                                c->w_scale + c0, c->bias + c0, out,
+                                c->dst_stride, /*accumulate=*/0);
+  }
+}
+
+void hvx_dequant_acc_tiles_to_f32(const uint8_t *tiles_base,
+                                  uint32_t tile_stride, uint32_t n_tiles,
+                                  uint32_t nt0, uint32_t row_stride,
+                                  uint32_t m_count, const float *act_scale,
+                                  const int32_t *act_zp,
+                                  const int32_t *colsum_w,
+                                  const float *w_scale, const float *bias,
+                                  float *dst_a, float *dst_b, uint32_t split,
+                                  uint32_t dst_stride, hvx_worker_pool *pool) {
+  if (!tiles_base || n_tiles == 0u || m_count == 0u) {
+    return;
+  }
+  dq_tiles_ctx c = {tiles_base, tile_stride, nt0,   row_stride, m_count,
+                    act_scale,  act_zp,      colsum_w, w_scale, bias,
+                    dst_a,      dst_b,       split, dst_stride, n_tiles};
+  hvx_worker_pool_run(pool, dq_tiles_worker, &c, n_tiles);
+}

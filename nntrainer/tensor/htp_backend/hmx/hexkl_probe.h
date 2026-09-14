@@ -70,6 +70,20 @@ enum {
       bandwidth-bound at ~30 ms and no amount of gather or dequant work
       moves it. */
   HEXKL_PROBE_DMA_FIRST,
+  /** The two drains an expert makes, apart. DRAIN waits on that expert's
+      gate_up, DRAIN_DN on its down -- one bucket held both, and a bucket
+      holding two things is how section 13.1's quant reading stayed
+      unreadable for two runs. The split matters here because the two have
+      different amounts of work in front of them to hide behind: gate_up
+      was pushed a whole expert earlier, down only one gate_up matmul
+      earlier. */
+  HEXKL_PROBE_DRAIN_DN,
+  /** hexkl_dma_ring_push2d itself. It chains onto an in-flight descriptor
+      via dmlink, and whether that ever blocks is the difference between
+      "the prefetch is not hiding" and "issuing the prefetch is the cost".
+      At 31.6 GB/s measured and 5.6 GB/s averaged, something is serialising
+      and the push is one of two candidates. */
+  HEXKL_PROBE_PUSH,
   HEXKL_PROBE_DRAIN,        /**< hexkl_dma_ring_drain */
   HEXKL_PROBE_SWIGLU,       /**< hvx_swiglu_inplace_f32 (fused layer only) */
   /** Routing multiply + accumulate into the layer output (MoE layer call

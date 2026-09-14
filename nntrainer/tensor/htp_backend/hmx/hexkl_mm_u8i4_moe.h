@@ -47,7 +47,12 @@ typedef struct {
   uint32_t gate_off;    /**< [64 x inter] f32, then SwiGLU's output in place */
   uint32_t up_off;      /**< [64 x inter] f32 */
   uint32_t mid_off;     /**< requantized SwiGLU output, AH tiles */
-  uint32_t result_off;  /**< one HMX accumulator tile */
+  uint32_t result_off;  /**< acc_tiles staged HMX accumulator tiles */
+  /** How many 8 KB accumulator tiles fit at result_off, given the arena.
+      At least 1, which is the old one-at-a-time behaviour; more lets the
+      dequant run pooled over a batch. gate_up's n-tile count is the
+      useful ceiling. */
+  uint32_t acc_tiles;
   uint32_t res_f32_off; /**< [64 x N_out] f32, down's dequantized block.
                              ALIASES gate_off -- see the .c on why that is
                              safe and what would break it. */

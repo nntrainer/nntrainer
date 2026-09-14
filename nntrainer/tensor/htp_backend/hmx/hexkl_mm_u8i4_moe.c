@@ -74,9 +74,12 @@ static void moe_push_weight(uint8_t *vtcm_base, uint32_t dst_off,
                          (h->N / HEXKL_HMX_INT8_BLOCK_N_COL) *
                          WEIGHT_TILE_BYTES_U8I4;
   const uint32_t rs = moe_dma_row_size(bytes);
+  uint64_t pt = 0;
   HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_KB, bytes >> 10);
+  HEXKL_PROBE_T0(pt);
   hexkl_dma_ring_push2d(vtcm_base + dst_off, h->wh_bytes, rs, rs, rs,
                         bytes / rs, /*src_vtcm=*/0, /*dst_vtcm=*/1);
+  HEXKL_PROBE_ADD(HEXKL_PROBE_PUSH, pt);
 }
 
 /**
@@ -210,7 +213,25 @@ int hexkl_mm_u8i4_moe_layout(uint32_t K, uint32_t inter, uint32_t N_out,
     ROUND_UP_U32(L.up_off + inter_rows, HEXKL_HMX_ACTIVATION_ALIGNMENT);
   L.result_off =
     ROUND_UP_U32(L.mid_off + mid_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  L.total = L.result_off + ACC_TILE_BYTES;
+
+  /* Accumulator tiles are staged so the dequant can run over a run of them
+     on the whole worker pool instead of one tile at a time on the calling
+     thread (hvx_dequant_acc_tiles_to_f32 explains why that is worth doing).
+     Whatever the arena has left after everything else decides how many fit;
+     one still works, and is exactly the old behaviour. gate_up has the most
+     n-tiles, so it sets the useful ceiling. */
+  {
+    const uint32_t want = (2u * inter) / HEXKL_HMX_INT8_BLOCK_N_COL;
+    uint32_t fits = 0u;
+    if (arena_bytes > L.result_off) {
+      fits = (arena_bytes - L.result_off) / ACC_TILE_BYTES;
+    }
+    if (fits == 0u) {
+      return AEE_ENOMEMORY;
+    }
+    L.acc_tiles = (fits < want) ? fits : want;
+  }
+  L.total = L.result_off + L.acc_tiles * ACC_TILE_BYTES;
 
   /* down's dequantized block lands on top of gate, whose bytes are dead by
      then. The two regions the alias covers -- gate and up -- are adjacent,
@@ -414,40 +435,45 @@ int hexkl_mm_u8i4_moe_layer_run(
       HEXKL_PROBE_ADD(HEXKL_PROBE_GATHER, p0);
 
       /* --- gate_up ------------------------------------------------- */
-      MOE_MM_BEGIN();
-      for (uint32_t nt = 0; nt < gu_ntiles; ++nt) {
-        hexkl_micro_hmx_acc_clear_int32();
-        for (uint32_t kt = 0; kt < k_tiles; ++kt) {
-          rc = hexkl_micro_hmx_mm_u8i4(
-            vtcm_base, L.act_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
-            L.w_gu_off + (kt * gu_ntiles + nt) * WEIGHT_TILE_BYTES_U8I4);
+      /* Matmul a batch of n-tiles, staging each accumulator read into its
+         own slot, then dequantize the whole batch on the pool. gate is
+         gate_up's columns [0, inter) and up is [inter, 2*inter) -- the
+         convention hvx_swiglu_inplace_f32's contract assumes -- and a
+         batch can straddle that boundary, which is why the split is a
+         parameter rather than two calls. */
+      for (uint32_t nt0 = 0; nt0 < gu_ntiles; nt0 += L.acc_tiles) {
+        const uint32_t nb =
+          (gu_ntiles - nt0 < L.acc_tiles) ? (gu_ntiles - nt0) : L.acc_tiles;
+        MOE_MM_BEGIN();
+        for (uint32_t j = 0; j < nb; ++j) {
+          hexkl_micro_hmx_acc_clear_int32();
+          for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+            rc = hexkl_micro_hmx_mm_u8i4(
+              vtcm_base, L.act_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
+              L.w_gu_off + (kt * gu_ntiles + nt0 + j) * WEIGHT_TILE_BYTES_U8I4);
+            if (rc != AEE_SUCCESS) {
+              goto out;
+            }
+          }
+          HEXKL_PROBE_T0(p0);
+          rc = hexkl_micro_hmx_acc_read_int32(
+            vtcm_base, config_off, L.result_off + j * ACC_TILE_BYTES);
+          HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
           if (rc != AEE_SUCCESS) {
             goto out;
           }
         }
+        MOE_MM_END();
+
         HEXKL_PROBE_T0(p0);
-        rc =
-          hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off, L.result_off);
-        HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
-        if (rc != AEE_SUCCESS) {
-          goto out;
-        }
-        const int32_t *tile =
-          (const int32_t *)(vtcm_base + L.result_off) + acc->base;
-        const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
-        /* gate is gate_up's columns [0, inter), up is [inter, 2*inter) --
-           the convention hvx_swiglu_inplace_f32's contract assumes. */
-        float *dst =
-          (float *)(vtcm_base + (c0 < inter ? L.gate_off : L.up_off)) +
-          (c0 < inter ? c0 : c0 - inter);
-        HEXKL_PROBE_T0(p0);
-        hvx_dequant_acc_tile_to_f32(tile, acc->row_stride, m_blk, scale, zp,
-                                    g->colsum_w + c0, g->w_scale + c0,
-                                    g->bias + c0, dst, inter,
-                                    /*accumulate=*/0);
+        hvx_dequant_acc_tiles_to_f32(
+          (const uint8_t *)((const int32_t *)(vtcm_base + L.result_off) +
+                            acc->base),
+          ACC_TILE_BYTES, nb, nt0, acc->row_stride, m_blk, scale, zp,
+          g->colsum_w, g->w_scale, g->bias, (float *)(vtcm_base + L.gate_off),
+          (float *)(vtcm_base + L.up_off), inter, inter, pool);
         HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
       }
-      MOE_MM_END();
 
       /* down[e]'s transfer is waited for here, after a whole gate_up
          matmul has run over it. Draining before the next push, not after,
@@ -457,7 +483,7 @@ int hexkl_mm_u8i4_moe_layer_run(
       if (mb == 0u) {
         HEXKL_PROBE_T0(p0);
         hexkl_dma_ring_drain();
-        HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
+        HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN_DN, p0);
       }
 
       /* A is dead once the last block's gate_up matmul is done, so the next
@@ -486,35 +512,41 @@ int hexkl_mm_u8i4_moe_layer_run(
       }
 
       /* --- down ---------------------------------------------------- */
-      MOE_MM_BEGIN();
-      for (uint32_t nt = 0; nt < dn_ntiles; ++nt) {
-        hexkl_micro_hmx_acc_clear_int32();
-        for (uint32_t kt = 0; kt < inter_ktiles; ++kt) {
-          rc = hexkl_micro_hmx_mm_u8i4(
-            vtcm_base, L.mid_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
-            L.w_dn_off + (kt * dn_ntiles + nt) * WEIGHT_TILE_BYTES_U8I4);
+      /* Same batching as gate_up. One destination here, so the split is set
+         past the last column and dst_b is never reached. */
+      for (uint32_t nt0 = 0; nt0 < dn_ntiles; nt0 += L.acc_tiles) {
+        const uint32_t nb =
+          (dn_ntiles - nt0 < L.acc_tiles) ? (dn_ntiles - nt0) : L.acc_tiles;
+        MOE_MM_BEGIN();
+        for (uint32_t j = 0; j < nb; ++j) {
+          hexkl_micro_hmx_acc_clear_int32();
+          for (uint32_t kt = 0; kt < inter_ktiles; ++kt) {
+            rc = hexkl_micro_hmx_mm_u8i4(
+              vtcm_base, L.mid_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
+              L.w_dn_off + (kt * dn_ntiles + nt0 + j) * WEIGHT_TILE_BYTES_U8I4);
+            if (rc != AEE_SUCCESS) {
+              goto out;
+            }
+          }
+          HEXKL_PROBE_T0(p0);
+          rc = hexkl_micro_hmx_acc_read_int32(
+            vtcm_base, config_off, L.result_off + j * ACC_TILE_BYTES);
+          HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
           if (rc != AEE_SUCCESS) {
             goto out;
           }
         }
+        MOE_MM_END();
+
         HEXKL_PROBE_T0(p0);
-        rc =
-          hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off, L.result_off);
-        HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
-        if (rc != AEE_SUCCESS) {
-          goto out;
-        }
-        const int32_t *tile =
-          (const int32_t *)(vtcm_base + L.result_off) + acc->base;
-        const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
-        HEXKL_PROBE_T0(p0);
-        hvx_dequant_acc_tile_to_f32(
-          tile, acc->row_stride, m_blk, scale, zp, d->colsum_w + c0,
-          d->w_scale + c0, d->bias + c0,
-          (float *)(vtcm_base + L.res_f32_off) + c0, N_out, /*accumulate=*/0);
+        hvx_dequant_acc_tiles_to_f32(
+          (const uint8_t *)((const int32_t *)(vtcm_base + L.result_off) +
+                            acc->base),
+          ACC_TILE_BYTES, nb, nt0, acc->row_stride, m_blk, scale, zp,
+          d->colsum_w, d->w_scale, d->bias,
+          (float *)(vtcm_base + L.res_f32_off), NULL, N_out, N_out, pool);
         HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
       }
-      MOE_MM_END();
 
       /* Routing multiply and scatter-add in one pass. The ARM side does
          these as two loops building a Tensor per token per expert (doc 44
