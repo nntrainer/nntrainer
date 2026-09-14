@@ -81,6 +81,14 @@ enum {
       by the shapes until the weight started arriving in chunks, and the
       profile then divided a chunk's time by the whole weight's size and
       reported 114.7 GB/s for a link that does about 33. */
+  /** The layer call's own allocations: about 12.8 MB of malloc up front
+      (the slot-ordered activation, the cached activation copy, the output)
+      and the matching frees. Untimed until now, so they sat in the
+      residual -- which read 1019 us on the bake path and 23888 on the
+      weight-cache path, with the kernel unchanged and every named stage
+      the same. Something about how the two paths leave the DSP heap is
+      worth 24 ms, and this is where it would be. */
+  HEXKL_PROBE_ALLOC,
   HEXKL_PROBE_DMA_FIRST_KB,
   HEXKL_PROBE_DRAIN_DN,
   /** hexkl_dma_ring_push2d itself. It chains onto an in-flight descriptor

@@ -349,6 +349,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   for (uint32_t e = 0; e < n_experts; ++e) {
     n_slots += ROUND_UP_U32(row_count[e], HEXKL_HMX_INT8_BLOCK_N_ROW);
   }
+  uint64_t p_alloc = 0;
+  HEXKL_PROBE_T0(p_alloc);
   uint8_t *act_ah = (uint8_t *)malloc((size_t)n_slots * K);
   uint32_t *slot_row = (uint32_t *)malloc(sizeof(uint32_t) * n_slots);
   uint32_t *slot_of = (uint32_t *)malloc(sizeof(uint32_t) * n_experts);
@@ -379,6 +381,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   /* MOE_MM_BEGIN/END's state. See the macros above hexkl_mm_u8i4_moe_layout
      for why the HMX issue loop is timed by difference. */
   uint64_t mm_t0 = 0, mm_acc0 = 0, mm_dq0 = 0;
+  HEXKL_PROBE_ADD(HEXKL_PROBE_ALLOC, p_alloc);
   if (!scale || !zp || !act_ah || !slot_row || !slot_of || !slot_scale ||
       !slot_zp || !scale_all || !zp_all || !order || !base_of || !act_c ||
       !out_c) {
@@ -677,6 +680,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
 
 out:
+  HEXKL_PROBE_T0(p_alloc);
   free(scale);
   free(zp);
   free(act_ah);
@@ -690,5 +694,6 @@ out:
   free(base_of);
   free(act_c);
   free(out_c);
+  HEXKL_PROBE_ADD(HEXKL_PROBE_ALLOC, p_alloc);
   return rc;
 }
