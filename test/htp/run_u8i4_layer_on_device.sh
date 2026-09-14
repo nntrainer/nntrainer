@@ -112,7 +112,12 @@ fi
     HEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
     unittest_hvx_mm_u8i4 unittest_hvx_softmax unittest_hvx_attn \
     unittest_hvx_fc
-)
+) || fail "ndk-build failed -- see the error above.
+
+A failed build used to fall through to whatever binary was left from last
+time, which then ran, printed plausible numbers, and cost a device cycle to
+notice. Three of those in this session. The binaries existing is not the
+same as them being current."
 TEST_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_mm_u8i4"
 [ -f "$TEST_BIN" ] || fail "test binary did not build: $TEST_BIN"
 # The softmax fixture carries the blocked-softmax gate: PHASE B of the fused
