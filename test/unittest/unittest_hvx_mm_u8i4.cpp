@@ -1545,7 +1545,15 @@ TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
   field("attached", attached ? "yes" : "no");
   // Which of the two mapping calls got there, if either -- the DSP reports
   // them apart so a failure names the API rather than just the outcome.
-  field("hap_mmap", res[6] == 1u ? "null" : (res[6] == 2u ? "failed" : "ok"));
+  // Which prot/flags pair the device accepted, and what the rejected ones
+  // said -- two bits each, 1 null and 2 MAP_FAILED, in the order the DSP
+  // tries them.
+  static const char *kTryName[] = {"none",      "rw|shared", "r|shared",
+                                   "rw|private", "r|private", "rw|0"};
+  field("hap_mmap_accepted",
+        res[6] < (sizeof(kTryName) / sizeof(kTryName[0])) ? kTryName[res[6]]
+                                                          : "?");
+  field("hap_mmap_fail_mask", hex((int)res[7]));
   if (err == AEE_SUCCESS) {
     const double gbs = res[2] > 0 ? (double)res[3] / res[2] / 1000.0 : 0.0;
     field("mapped", res[0] ? "yes" : "no");

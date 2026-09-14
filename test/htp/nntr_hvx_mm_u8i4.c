@@ -239,35 +239,49 @@ int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
   }
   {
     uint64_t t0 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
-    /* HAP_mmap is the older and more widely present of the two mapping
-       APIs; SDKs that ship HAP_mmap_get/HAP_mmap_put instead take the fd
-       directly and hand back the address through an out-parameter. If the
-       link fails on this symbol, that pair is what to swap in -- the rest
-       of the probe is unchanged either way.
-       prot is written numerically: PROT_READ|PROT_WRITE are host macros and
-       a missing one would be a build break in a probe whose whole job is to
-       answer rather than fail to compile. */
-    void *va = HAP_mmap(NULL, (int)bytes, 1 /*READ*/ | 2 /*WRITE*/, 0, fd, 0);
-    uint64_t t1 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
-    /* Null and MAP_FAILED are reported apart: the first reads as "the DSP
-       does not know this fd", which is what an unattached buffer looks
-       like, and the second as "it knew it and refused". The first attempt
-       at this probe could not tell them apart. */
-    if (va == NULL) {
-      res[6] = 1u;
-      FARF(ERROR, "arena_probe: HAP_mmap returned null (fd=%d) -- is the "
-                  "buffer attached to the session?",
-           (int)fd);
-      return AEE_ENOMEMORY;
+    /* prot and flags are written numerically because PROT_* and MAP_* are
+       host macros and a missing one would be a build break in a probe whose
+       job is to answer. That cost a device cycle: attempt 2 passed flags=0,
+       and POSIX mmap requires exactly one of MAP_SHARED or MAP_PRIVATE, so
+       it came back MAP_FAILED. Rather than guess the next single value, try
+       the small set that could be right and report which one the device
+       accepts -- one run instead of three. */
+    static const struct {
+      int prot;
+      int flags;
+    } kTry[] = {
+      {1 | 2, 1}, /* 1 rw | shared  */
+      {1, 1},     /* 2 r  | shared  */
+      {1 | 2, 2}, /* 3 rw | private */
+      {1, 2},     /* 4 r  | private */
+      {1 | 2, 0}, /* 5 rw | 0 -- attempt 2's, kept so a pass here is visible */
+    };
+    const uint32_t n_try = (uint32_t)(sizeof(kTry) / sizeof(kTry[0]));
+    void *va = NULL;
+    uint64_t t1 = t0;
+    for (uint32_t ti = 0; ti < n_try; ++ti) {
+      void *p = HAP_mmap(NULL, (int)bytes, kTry[ti].prot, kTry[ti].flags, fd,
+                         0);
+      if (p != NULL && p != (void *)-1) {
+        va = p;
+        t1 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+        res[6] = ti + 1u; /* 1-based: 0 stays "none worked" */
+        break;
+      }
+      /* Null and MAP_FAILED apart: null reads as "this fd is unknown here",
+         MAP_FAILED as "known and refused". Attempt 1 could not tell them
+         apart and spent a cycle on it. Two bits per attempt. */
+      res[7] |= (uint32)((p == NULL ? 1u : 2u) << (ti * 2u));
     }
-    if (va == (void *)-1) {
-      res[6] = 2u;
-      FARF(ERROR, "arena_probe: HAP_mmap failed (fd=%d bytes=%u)", (int)fd,
-           (unsigned)bytes);
+    if (va == NULL) {
+      FARF(ERROR, "arena_probe: every HAP_mmap prot/flags pair failed "
+                  "(fd=%d bytes=%u mask=0x%x)",
+           (int)fd, (unsigned)bytes, (unsigned)res[7]);
       return AEE_ENOMEMORY;
     }
     res[0] = 1u;
     res[1] = (uint32)(t1 - t0);
+    (void)n_try;
 
     /* One 2D transfer out of the mapping into VTCM, same shape the weight
        pusher uses, so the rate is comparable to the 27-33 GB/s the profile
