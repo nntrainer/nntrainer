@@ -33,6 +33,8 @@
 #include <AEEStdErr.h>
 #include <remote.h>
 
+#include <htp_wh_layout.h>
+
 #include "nntr_hvx.h"
 
 namespace {
@@ -80,58 +82,11 @@ constexpr int kDspOffset = 0x80000400;
  */
 using SdklRmToWh = int (*)(uint8_t *, int8_t *, size_t, size_t);
 
-/**
- * @brief Which nibble of a tile's 512 bytes source element (r, c) lands in,
- *        for the bake this tree's matmul reads.
- *
- * Read off WhLayoutTableFromDsp's table:
- *
- *     slot(r,c) = (r/8)*256 + c*8 + (r%4)*2 + ((r/4)%2)
- *
- * The first three terms are even, so the last one IS the nibble half and the
- * rest is the byte:
- *
- *     byte(r,c) = (r/8)*128 + c*4 + (r%4)      nibble = (r/4)%2
- *
- * One byte holds the two ROWS four apart in the same column -- low nibble for
- * the one whose bit 2 is clear. Two k values per byte is what the reduction
- * wants. 32 columns x 4 rows x 4 row groups = 512 bytes, the whole tile with
- * nothing left over.
- *
- * sdkl_cpu_i4_rm_to_i4_wh builds the TRANSPOSE of this -- its table is
- * whSlot(c, r), verified entry for entry in WhLayoutTable -- which is why a
- * packer written from it disagreed with the DSP everywhere except the
- * diagonal. The two APIs read their source with opposite conventions, of a
- * piece with hexkl_macro_i4_rm_to_i4_wh taking (n_col, n_inner) where
- * sdkl_cpu_i4_rm_to_i4_wh is documented (wt_rows, wt_cols).
- */
-inline uint32_t whSlot(uint32_t r, uint32_t c) {
-  return (r / 8u) * 256u + c * 8u + (r % 4u) * 2u + ((r / 4u) % 2u);
-}
+/** Shared with the offline quantizer, so this checks the code the model file
+ *  is built with rather than a copy of it. */
+using nntrainer::whPack;
+using nntrainer::whSlot;
 
-/**
- * @brief Builds a whole WH buffer from row-major i4-in-int8, the way the
- *        offline quantizer will have to.
- *
- * Tiles are k-major (kt*n_col_tiles + nt), matching where
- * hexkl_bake_u8i4_worker places each tile at t*512.
- */
-void whPackReference(const int8_t *rm, uint32_t K, uint32_t N, uint8_t *out) {
-  const uint32_t k_tiles = K / 32u, n_tiles = N / 32u;
-  std::fill(out, out + (size_t)k_tiles * n_tiles * 512u, uint8_t(0));
-  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
-    for (uint32_t nt = 0; nt < n_tiles; ++nt) {
-      uint8_t *tile = out + ((size_t)kt * n_tiles + nt) * 512u;
-      for (uint32_t r = 0; r < 32u; ++r) {
-        for (uint32_t c = 0; c < 32u; ++c) {
-          const int8_t v = rm[(size_t)(kt * 32u + r) * N + (nt * 32u + c)];
-          const uint32_t sl = whSlot(r, c);
-          tile[sl / 2] |= static_cast<uint8_t>((v & 0x0F) << (4 * (sl % 2)));
-        }
-      }
-    }
-  }
-}
 SdklRmToWh loadSdklRmToWh() {
   static void *lib = dlopen("libsdkl.so", RTLD_NOW | RTLD_LOCAL);
   if (lib == nullptr) {
@@ -1797,7 +1752,7 @@ TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
  *        bytes, at the shape that matters.
  *
  * This is the question the offline quantizer turns on: can a host build the
- * bytes the matmul reads, without the DSP. whPackReference is the candidate
+ * bytes the matmul reads, without the DSP. whPack is the candidate
  * and hexkl_micro_hmx_rm_to_wh_i4's output, fetched with weight_bake_export,
  * is the truth.
  *
@@ -1839,7 +1794,7 @@ TEST_F(HmxMmU8I4Layer, WhPackReferenceMatchesDspBake) {
 
   std::vector<uint8_t> host(wh_len, 0);
   const auto t0 = std::chrono::steady_clock::now();
-  whPackReference(w.q_w.data(), K, N, host.data());
+  whPack(w.q_w.data(), K, N, host.data());
   const auto host_us = std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - t0)
                          .count();
@@ -1872,7 +1827,7 @@ TEST_F(HmxMmU8I4Layer, WhPackReferenceMatchesDspBake) {
  * it exactly, square and non-square alike, and still disagreed with the DSP's
  * own bake on 3639322 of 3670016 bytes. Tile order was not the difference:
  * hexkl_weight_u8i4_register sets n_tiles_row = N/32 and takes
- * kt = t/n_tiles_row, which is what whPackReference does. The two APIs simply
+ * kt = t/n_tiles_row, which is what whPack does. The two APIs simply
  * build transposed tiles -- this table is the library's with r and c swapped
  * -- and the matmul here is hexkl_micro_hmx_mm_u8i4, so this is the one that
  * counts. Deriving from the library rather than from the thing under test
@@ -1949,7 +1904,7 @@ TEST_F(HmxMmU8I4Layer, WhLayoutTableFromDsp) {
     << "hexkl_micro_hmx_rm_to_wh_i4 uses a different tile layout than "
        "sdkl_cpu_i4_rm_to_i4_wh, which whSlot was derived from";
 
-  // Is the tile ORDER also what whPackReference assumes? Checked separately
+  // Is the tile ORDER also what whPack assumes? Checked separately
   // and on a non-square shape, because a wrong order and a wrong intra-tile
   // layout look the same in a single byte count.
   const uint32_t K2 = 64, N2 = 128;
@@ -1969,7 +1924,7 @@ TEST_F(HmxMmU8I4Layer, WhLayoutTableFromDsp) {
   ASSERT_EQ(nntr_hvx_weight_bake_export(handle_, h2, dsp2.data(), (int)len2),
             AEE_SUCCESS);
   EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h2), AEE_SUCCESS);
-  whPackReference(big.data(), K2, N2, host2.data());
+  whPack(big.data(), K2, N2, host2.data());
   size_t d2 = 0, tiles_bad = 0;
   for (uint32_t t = 0; t < len2 / 512u; ++t) {
     if (std::memcmp(dsp2.data() + t * 512u, host2.data() + t * 512u, 512) != 0)
