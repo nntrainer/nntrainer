@@ -45,8 +45,12 @@ typedef struct {
   uint32_t act_off;     /**< one 64-row activation block, AH tiles */
   uint32_t w_gu_off;    /**< buffer A: gate_up's WH bytes */
   uint32_t w_dn_off;    /**< buffer B: down's WH bytes */
-  uint32_t gate_off;    /**< [64 x inter] f32, then SwiGLU's output in place */
-  uint32_t up_off;      /**< [64 x inter] f32 */
+  uint32_t gate_off;    /**< [64 x inter] f32: SwiGLU's output, written by
+                             the fused gate_up epilogue */
+  uint32_t up_off;      /**< [64 x inter] f32. No longer written -- the
+                             fused epilogue never materialises up -- but
+                             kept adjacent to gate so res_f32_off's alias
+                             still has gate+up to fit in. Reclaimable. */
   uint32_t mid_off;     /**< requantized SwiGLU output, AH tiles */
   uint32_t result_off;  /**< acc_tiles staged HMX accumulator tiles */
   /** How many 8 KB accumulator tiles fit at result_off, given the arena.

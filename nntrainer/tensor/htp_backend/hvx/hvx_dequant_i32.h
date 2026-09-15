@@ -118,4 +118,34 @@ void hvx_dequant_acc_tiles_to_f32(const uint8_t *tiles_base,
                                   float *dst_a, float *dst_b, uint32_t split,
                                   uint32_t dst_stride, hvx_worker_pool *pool);
 
+/**
+ * @brief Dequantizes gate/up tile PAIRS and applies SwiGLU before anything
+ *        is stored: dst = silu(gate) * up, one vector at a time.
+ *
+ * The staged run holds @a n_pairs gate tiles (columns g0.. of the gate
+ * half) followed by the @a n_pairs up tiles opposite them (the same
+ * columns, @a inter further along), which is how the matmul loop issues
+ * them. Each row's gate and up vectors are dequantized with exactly
+ * hvx_dequant_acc_tile_to_f32's operations and then handed to
+ * hvx_swiglu_det_sf -- the same function hvx_swiglu_inplace_f32 applies to
+ * the same two vectors after they have been through VTCM -- so the bytes
+ * are identical to the dequant-store-swiglu sequence this replaces, and
+ * the ARM parity gate on swiglu_det.h still holds. What changes is that
+ * [64 x inter] f32 of gate and of up are never written or read back:
+ * measured, that separate SwiGLU pass was 2.05 ms of a 22.6 ms prefill
+ * call (doc 47).
+ *
+ * @param g0          first gate n-tile in the run (its column is g0 * 32)
+ * @param colsum_w, w_scale, bias  the FULL gate_up tables (2 * inter);
+ *                    the up half is found at inter + column
+ * @param dst         the [rows x inter] SwiGLU output; column g0 * 32 of it
+ *                    is where this run's first pair lands
+ */
+void hvx_dequant_swiglu_acc_tiles_to_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_pairs,
+  uint32_t g0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, uint32_t inter, float *dst, uint32_t dst_stride,
+  hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_DEQUANT_I32_H__ */

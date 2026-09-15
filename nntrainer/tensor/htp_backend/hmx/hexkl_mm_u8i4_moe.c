@@ -139,6 +139,35 @@ static uint32_t moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
 }
 
 /**
+ * @brief Pushes a gate_up weight as PAIRED chunks: chunk c carries gate
+ *        n-tile columns [c*half, +cn) and the up columns opposite them
+ *        (inter_ntiles further along), two descriptors, one index -- the
+ *        second's, since the ring retires in order.
+ *
+ * The epilogue consumes gate tile j and up tile j together
+ * (hvx_dequant_swiglu_acc_tiles_to_f32), so this is the order the columns
+ * have to arrive in: chunked by consecutive column the way down still is,
+ * the first batch would wait for three quarters of the weight.
+ *
+ * @return how many chunks were pushed; idx_out gets one index each
+ */
+static uint32_t moe_push_gate_up_chunks(uint8_t *vtcm_base, uint32_t dst_off,
+                                        const hexkl_weight_u8i4 *h,
+                                        uint32_t k_tiles, uint32_t gu_ntiles,
+                                        uint32_t inter_ntiles, uint32_t half,
+                                        uint32_t *idx_out) {
+  uint32_t n = 0u;
+  for (uint32_t g0 = 0; g0 < inter_ntiles; g0 += half) {
+    const uint32_t cn = (inter_ntiles - g0 < half) ? (inter_ntiles - g0) : half;
+    (void)moe_push_weight_chunk(vtcm_base, dst_off, h, k_tiles, gu_ntiles, g0,
+                                cn);
+    idx_out[n++] = moe_push_weight_chunk(vtcm_base, dst_off, h, k_tiles,
+                                         gu_ntiles, inter_ntiles + g0, cn);
+  }
+  return n;
+}
+
+/**
  * @brief Queues one 64-row activation block, slot-ordered heap -> VTCM.
  *
  * Issued AHEAD of the weight chunks it will be computed against, never
@@ -320,6 +349,14 @@ int hexkl_mm_u8i4_moe_layout(uint32_t K, uint32_t inter, uint32_t N_out,
       want = 32u;
     }
     L.acc_tiles = (fits < want) ? fits : want;
+    /* Pairs: the gate_up epilogue dequantizes gate tile j and up tile j
+       together and stores only silu(gate)*up
+       (hvx_dequant_swiglu_acc_tiles_to_f32), so a staged batch is an even
+       count with room for at least one pair. */
+    L.acc_tiles &= ~1u;
+    if (L.acc_tiles < 2u) {
+      return AEE_ENOMEMORY;
+    }
   }
   L.total = L.result_off + L.acc_tiles * ACC_TILE_BYTES;
 
@@ -403,9 +440,21 @@ int hexkl_mm_u8i4_moe_layer_run(
 
   const uint32_t k_tiles = K / HEXKL_HMX_INT8_BLOCK_N_INNER;
   const uint32_t gu_ntiles = (2u * inter) / HEXKL_HMX_INT8_BLOCK_N_COL;
+  /* gate_up's n-tiles are the gate's [0, inter_ntiles) then the up's; a
+     gate tile and the up tile opposite it are inter_ntiles apart. */
+  const uint32_t inter_ntiles = gu_ntiles / 2u;
   const uint32_t inter_ktiles = inter / HEXKL_HMX_INT8_BLOCK_N_INNER;
   const uint32_t dn_ntiles = N_out / HEXKL_HMX_INT8_BLOCK_N_COL;
   const uint32_t BR = HEXKL_HMX_INT8_BLOCK_N_ROW;
+  /* Pairs per staged batch; the chunk size the gate_up pushes use too. */
+  const uint32_t half = L.acc_tiles / 2u;
+  /* Bounded arrays below; a shape that needs more chunks than they hold is
+     refused up front rather than overrun. 4 and 2 for this model. */
+#define MOE_MAX_CHUNKS 16u
+  if ((inter_ntiles + half - 1u) / half > MOE_MAX_CHUNKS ||
+      (dn_ntiles + L.acc_tiles - 1u) / L.acc_tiles > MOE_MAX_CHUNKS) {
+    return AEE_EUNSUPPORTED;
+  }
 
   /* Scratch on the DSP heap, not VTCM: these are per-block staging areas
      read and written once each, so VTCM buys them nothing and the arena is
@@ -563,19 +612,13 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint32_t act_idx =
     moe_push_act_block(vtcm_base, L.act_off, act_ah, slot_of[0], K, k_tiles);
 
-  /* gate_up in chunks, so the first n-tile column is usable long before
-     the last. MOE_MAX_CHUNKS bounds the array; acc_tiles caps at 32 and
-     gate_up has 112 columns, so 4 is the real count. */
-#define MOE_MAX_CHUNKS 16u
+  /* gate_up in paired chunks, so the first gate/up pair is usable long
+     before the last -- see moe_push_gate_up_chunks. */
   uint32_t gu_idx[MOE_MAX_CHUNKS];
-  uint32_t gu_nchunk = 0u;
-  for (uint32_t nt0 = 0; nt0 < gu_ntiles; nt0 += L.acc_tiles) {
-    const uint32_t cn =
-      (gu_ntiles - nt0 < L.acc_tiles) ? (gu_ntiles - nt0) : L.acc_tiles;
-    gu_idx[gu_nchunk++] = moe_push_weight_chunk(
-      vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[0]]], k_tiles,
-      gu_ntiles, nt0, cn);
-  }
+  uint32_t gu_nchunk = moe_push_gate_up_chunks(
+    vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[0]]], k_tiles, gu_ntiles,
+    inter_ntiles, half, gu_idx);
+  (void)gu_nchunk;
 
   for (uint32_t i = 0; i < n_active; ++i) {
     const uint32_t e = order[i];
@@ -636,16 +679,17 @@ int hexkl_mm_u8i4_moe_layer_run(
       }
 
       /* --- gate_up ------------------------------------------------- */
-      /* Matmul a batch of n-tiles, staging each accumulator read into its
-         own slot, then dequantize the whole batch on the pool. gate is
-         gate_up's columns [0, inter) and up is [inter, 2*inter) -- the
-         convention hvx_swiglu_inplace_f32's contract assumes -- and a
-         batch can straddle that boundary, which is why the split is a
-         parameter rather than two calls. */
-      for (uint32_t nt0 = 0, ci = 0; nt0 < gu_ntiles;
-           nt0 += L.acc_tiles, ++ci) {
-        const uint32_t nb =
-          (gu_ntiles - nt0 < L.acc_tiles) ? (gu_ntiles - nt0) : L.acc_tiles;
+      /* Matmul a batch of gate/up PAIRS -- gate tiles g0.. into staged
+         slots [0, np), the up tiles opposite them into [np, 2np) -- then
+         dequantize and SwiGLU the whole batch on the pool in one pass,
+         straight from the staged tiles into the [64 x inter] result at
+         gate_off. gate and up never exist as f32 in VTCM: the separate
+         SwiGLU pass that read them back was 2.05 ms of a 22.6 ms prefill
+         call (doc 47), and dropping it changes no bytes -- the fused pass
+         applies the same hvx_swiglu_det_sf to the same two vectors. */
+      for (uint32_t g0 = 0, ci = 0; g0 < inter_ntiles; g0 += half, ++ci) {
+        const uint32_t np =
+          (inter_ntiles - g0 < half) ? (inter_ntiles - g0) : half;
         /* Only the first block of an expert waits: by the second the whole
            weight is resident. i == 0 && ci == 0 is the one wait that cannot
            hide behind anything, which is what DMA_FIRST records. */
@@ -657,16 +701,19 @@ int hexkl_mm_u8i4_moe_layer_run(
             hexkl_probe_us[HEXKL_PROBE_DMA_FIRST] =
               hexkl_probe_us[HEXKL_PROBE_DRAIN];
             HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_FIRST_KB,
-                              (nb * k_tiles * WEIGHT_TILE_BYTES_U8I4) >> 10);
+                              (2u * np * k_tiles * WEIGHT_TILE_BYTES_U8I4) >>
+                                10);
           }
         }
         MOE_MM_BEGIN();
-        for (uint32_t j = 0; j < nb; ++j) {
+        for (uint32_t j = 0; j < 2u * np; ++j) {
+          const uint32_t col =
+            (j < np) ? (g0 + j) : (inter_ntiles + g0 + (j - np));
           hexkl_micro_hmx_acc_clear_int32();
           for (uint32_t kt = 0; kt < k_tiles; ++kt) {
             rc = hexkl_micro_hmx_mm_u8i4(
               vtcm_base, L.act_off + kt * HEXKL_HMX_ACTIVATION_ALIGNMENT,
-              L.w_gu_off + (kt * gu_ntiles + nt0 + j) * WEIGHT_TILE_BYTES_U8I4);
+              L.w_gu_off + (kt * gu_ntiles + col) * WEIGHT_TILE_BYTES_U8I4);
             if (rc != AEE_SUCCESS) {
               goto out;
             }
@@ -682,12 +729,12 @@ int hexkl_mm_u8i4_moe_layer_run(
         MOE_MM_END();
 
         HEXKL_PROBE_T0(p0);
-        hvx_dequant_acc_tiles_to_f32(
+        hvx_dequant_swiglu_acc_tiles_to_f32(
           (const uint8_t *)((const int32_t *)(vtcm_base + L.result_off) +
                             acc->base),
-          ACC_TILE_BYTES, nb, nt0, acc->row_stride, m_blk, scale, zp,
-          g->colsum_w, g->w_scale, g->bias, (float *)(vtcm_base + L.gate_off),
-          (float *)(vtcm_base + L.up_off), inter, inter, pool);
+          ACC_TILE_BYTES, np, g0, acc->row_stride, m_blk, scale, zp,
+          g->colsum_w, g->w_scale, g->bias, inter,
+          (float *)(vtcm_base + L.gate_off), inter, pool);
         HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
       }
 
@@ -706,22 +753,13 @@ int hexkl_mm_u8i4_moe_layer_run(
       if (last_block && i + 1u < n_active) {
         act_idx = moe_push_act_block(vtcm_base, L.act_off, act_ah,
                                      slot_of[i + 1u], K, k_tiles);
-        gu_nchunk = 0u;
-        for (uint32_t nt0 = 0; nt0 < gu_ntiles; nt0 += L.acc_tiles) {
-          const uint32_t cn =
-            (gu_ntiles - nt0 < L.acc_tiles) ? (gu_ntiles - nt0) : L.acc_tiles;
-          gu_idx[gu_nchunk++] = moe_push_weight_chunk(
-            vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[i + 1u]]],
-            k_tiles, gu_ntiles, nt0, cn);
-        }
+        gu_nchunk = moe_push_gate_up_chunks(
+          vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[i + 1u]]], k_tiles,
+          gu_ntiles, inter_ntiles, half, gu_idx);
       }
 
-      HEXKL_PROBE_T0(p0);
-      hvx_swiglu_inplace_f32((float *)(vtcm_base + L.gate_off),
-                             (const float *)(vtcm_base + L.up_off), m_blk,
-                             inter, pool);
-      HEXKL_PROBE_ADD(HEXKL_PROBE_SWIGLU, p0);
-
+      /* SwiGLU already happened inside the gate_up epilogue; gate_off holds
+         silu(gate)*up for this block. Requantize it for down. */
       HEXKL_PROBE_T0(p0);
       hvx_quant_rows_u8_params((const float *)(vtcm_base + L.gate_off), m_blk,
                                BR, inter, scale, zp, pool);

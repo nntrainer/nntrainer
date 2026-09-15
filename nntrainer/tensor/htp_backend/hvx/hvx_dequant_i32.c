@@ -18,6 +18,7 @@
 #include "hexkl_acc_tile.h" /* HEXKL_ACC_TILE_COLS, for the width assert */
 #include "hvx_convert.h"
 #include "hvx_dequant_i32.h"
+#include "hvx_swiglu_det.h"
 
 /** @brief HVX vector width in bytes (128B mode). */
 #define VLEN 128u
@@ -195,4 +196,93 @@ void hvx_dequant_acc_tiles_to_f32(const uint8_t *tiles_base,
                     act_scale,  act_zp,      colsum_w, w_scale, bias,
                     dst_a,      dst_b,       split, dst_stride, n_tiles};
   hvx_worker_pool_run(pool, dq_tiles_worker, &c, n_tiles);
+}
+
+/* ---- fused dequant + SwiGLU over gate/up tile pairs ---------------------- */
+
+/**
+ * @brief One row of one tile, dequantized -- DQ_TILE_ROW's operations in
+ *        the same order, as a function so two of them can feed SwiGLU.
+ */
+static inline HVX_Vector dq_row_sf(const int32_t *row, float act_scale,
+                                   int32_t act_zp, HVX_Vector csf,
+                                   HVX_Vector vw, HVX_Vector vbias) {
+  const HVX_Vector af = Q6_Vsf_equals_Vw(((const HVX_UVector *)row)[0]);
+  const HVX_Vector vs = hvx_splat_sf(act_scale);
+  const HVX_Vector vz = Q6_Vsf_equals_Vw(Q6_V_vsplat_R(act_zp));
+  return Q6_Vsf_vadd_VsfVsf(
+    Q6_Vsf_vmpy_VsfVsf(
+      Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vsub_VsfVsf(af, Q6_Vsf_vmpy_VsfVsf(vz, csf)),
+                         vs),
+      vw),
+    vbias);
+}
+
+typedef struct {
+  const uint8_t *tiles_base;
+  uint32_t tile_stride;
+  uint32_t n_pairs;
+  uint32_t g0;
+  uint32_t row_stride;
+  uint32_t m_count;
+  const float *act_scale;
+  const int32_t *act_zp;
+  const int32_t *colsum_w;
+  const float *w_scale;
+  const float *bias;
+  uint32_t inter;
+  float *dst;
+  uint32_t dst_stride;
+} dq_swiglu_ctx;
+
+static void dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
+  const dq_swiglu_ctx *c = (const dq_swiglu_ctx *)vctx;
+  const uint32_t lo = (uint32_t)((uint64_t)c->n_pairs * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)c->n_pairs * (i + 1) / n_threads);
+
+  for (uint32_t j = lo; j < hi; ++j) {
+    const uint32_t cg = (c->g0 + j) * HEXKL_ACC_TILE_COLS; /* gate column */
+    const uint32_t cu = c->inter + cg;                     /* its up column */
+    const int32_t *gt =
+      (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
+    const int32_t *ut =
+      (const int32_t *)(c->tiles_base +
+                        (size_t)(c->n_pairs + j) * c->tile_stride);
+    /* Loop-invariant per tile, exactly as hvx_dequant_acc_tile_to_f32
+       hoists them. */
+    const HVX_Vector csg =
+      Q6_Vsf_equals_Vw(((const HVX_UVector *)(c->colsum_w + cg))[0]);
+    const HVX_Vector vwg = ((const HVX_UVector *)(c->w_scale + cg))[0];
+    const HVX_Vector vbg = ((const HVX_UVector *)(c->bias + cg))[0];
+    const HVX_Vector csu =
+      Q6_Vsf_equals_Vw(((const HVX_UVector *)(c->colsum_w + cu))[0]);
+    const HVX_Vector vwu = ((const HVX_UVector *)(c->w_scale + cu))[0];
+    const HVX_Vector vbu = ((const HVX_UVector *)(c->bias + cu))[0];
+
+    for (uint32_t m = 0; m < c->m_count; ++m) {
+      const HVX_Vector g =
+        dq_row_sf(gt + (size_t)m * c->row_stride, c->act_scale[m],
+                  c->act_zp[m], csg, vwg, vbg);
+      const HVX_Vector u =
+        dq_row_sf(ut + (size_t)m * c->row_stride, c->act_scale[m],
+                  c->act_zp[m], csu, vwu, vbu);
+      ((HVX_UVector *)(c->dst + (size_t)m * c->dst_stride + cg))[0] =
+        hvx_swiglu_det_sf(g, u);
+    }
+  }
+}
+
+void hvx_dequant_swiglu_acc_tiles_to_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_pairs,
+  uint32_t g0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, uint32_t inter, float *dst, uint32_t dst_stride,
+  hvx_worker_pool *pool) {
+  if (!tiles_base || n_pairs == 0u || m_count == 0u) {
+    return;
+  }
+  dq_swiglu_ctx c = {tiles_base, tile_stride, n_pairs, g0,    row_stride,
+                     m_count,    act_scale,   act_zp,  colsum_w, w_scale,
+                     bias,       inter,       dst,     dst_stride};
+  hvx_worker_pool_run(pool, dq_swiglu_worker, &c, n_pairs);
 }

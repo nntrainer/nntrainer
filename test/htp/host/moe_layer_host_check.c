@@ -182,14 +182,36 @@ void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
     dst[i] = dst[i] + p;
   }
 }
-void hvx_swiglu_inplace_f32(float *gate, const float *up, uint32_t m,
-                            uint32_t n, hvx_worker_pool *p) {
-  (void)p;
-  for (uint32_t r = 0; r < m; ++r)
-    for (uint32_t j = 0; j < n; ++j) {
-      float g = gate[(size_t)r * n + j];
-      gate[(size_t)r * n + j] = g / (1.f + expf(-g)) * up[(size_t)r * n + j];
-    }
+/* Scalar stand-in for the fused gate/up dequant + SwiGLU. Same policy as
+   the batch dequant stand-in below: a loop over the per-tile stand-in, so
+   what is checked is the kernel's pairing arithmetic -- that staged slot j
+   is gate column g0+j and slot n_pairs+j the up column opposite it -- not
+   the arithmetic of SwiGLU, which the device gates cover bit for bit. */
+void hvx_dequant_swiglu_acc_tiles_to_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_pairs,
+  uint32_t g0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, uint32_t inter, float *dst, uint32_t dst_stride,
+  hvx_worker_pool *pool) {
+  (void)pool;
+  float gt[64 * 32], ut[64 * 32];
+  for (uint32_t j = 0; j < n_pairs; ++j) {
+    const uint32_t cg = (g0 + j) * 32u, cu = inter + cg;
+    hvx_dequant_acc_tile_to_f32(
+      (const int32_t *)(tiles_base + (size_t)j * tile_stride), row_stride,
+      m_count, act_scale, act_zp, colsum_w + cg, w_scale + cg, bias + cg, gt,
+      32u, 0);
+    hvx_dequant_acc_tile_to_f32(
+      (const int32_t *)(tiles_base + (size_t)(n_pairs + j) * tile_stride),
+      row_stride, m_count, act_scale, act_zp, colsum_w + cu, w_scale + cu,
+      bias + cu, ut, 32u, 0);
+    for (uint32_t r = 0; r < m_count; ++r)
+      for (uint32_t c = 0; c < 32u; ++c) {
+        const float g = gt[r * 32u + c];
+        dst[(size_t)r * dst_stride + cg + c] =
+          g / (1.f + expf(-g)) * ut[r * 32u + c];
+      }
+  }
 }
 /* Scalar stand-in for the pooled batch dequant. Deliberately a loop over
    the per-tile stand-in above, exactly as the real one is a pooled loop over
