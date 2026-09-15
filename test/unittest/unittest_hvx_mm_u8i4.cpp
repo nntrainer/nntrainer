@@ -79,6 +79,50 @@ constexpr int kDspOffset = 0x80000400;
  * which is what htp_qs4cx_from_packed already produces.
  */
 using SdklRmToWh = int (*)(uint8_t *, int8_t *, size_t, size_t);
+
+/**
+ * @brief Which nibble of a tile's 512 bytes source element (r, c) lands in.
+ *
+ * Read off the table WhLayoutTable derives:
+ *
+ *     slot(r,c) = (c/8)*256 + r*8 + (c%4)*2 + ((c/4)%2)
+ *
+ * The first three terms are even, so the last one IS the nibble half and the
+ * rest is the byte:
+ *
+ *     byte(r,c) = (c/8)*128 + r*4 + (c%4)      nibble = (c/4)%2
+ *
+ * One byte holds the two columns four apart in the same row -- low nibble for
+ * the one whose bit 2 is clear. 32 rows x 4 columns x 4 column groups = 512
+ * bytes, which is the whole tile with nothing left over.
+ */
+inline uint32_t whSlot(uint32_t r, uint32_t c) {
+  return (c / 8u) * 256u + r * 8u + (c % 4u) * 2u + ((c / 4u) % 2u);
+}
+
+/**
+ * @brief Builds a whole WH buffer from row-major i4-in-int8, the way the
+ *        offline quantizer will have to.
+ *
+ * Tiles are k-major (kt*n_col_tiles + nt), matching where
+ * hexkl_bake_u8i4_worker places each tile at t*512.
+ */
+void whPackReference(const int8_t *rm, uint32_t K, uint32_t N, uint8_t *out) {
+  const uint32_t k_tiles = K / 32u, n_tiles = N / 32u;
+  std::fill(out, out + (size_t)k_tiles * n_tiles * 512u, uint8_t(0));
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    for (uint32_t nt = 0; nt < n_tiles; ++nt) {
+      uint8_t *tile = out + ((size_t)kt * n_tiles + nt) * 512u;
+      for (uint32_t r = 0; r < 32u; ++r) {
+        for (uint32_t c = 0; c < 32u; ++c) {
+          const int8_t v = rm[(size_t)(kt * 32u + r) * N + (nt * 32u + c)];
+          const uint32_t sl = whSlot(r, c);
+          tile[sl / 2] |= static_cast<uint8_t>((v & 0x0F) << (4 * (sl % 2)));
+        }
+      }
+    }
+  }
+}
 SdklRmToWh loadSdklRmToWh() {
   static void *lib = dlopen("libsdkl.so", RTLD_NOW | RTLD_LOCAL);
   if (lib == nullptr) {
@@ -1740,69 +1784,91 @@ TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
 }
 
 /**
- * @brief [doc 46 section 35] The ARM library builds the same WH bytes the
- *        DSP does.
+ * @brief [doc 46 section 35] The closed form reproduces the DSP's own WH
+ *        bytes, at the shape that matters.
  *
- * If this holds, the layout is not DSP-only and the conversion can move off
- * the load path entirely -- into the offline quantizer, which is what makes
- * a converted model possible without the DSP bake, the export, and the
- * cache files. Registration is 48.2% of prefill today and all of it is this
- * conversion.
+ * This is the question the offline quantizer turns on: can a host build the
+ * bytes the matmul reads, without the DSP. whPackReference is the candidate
+ * and hexkl_micro_hmx_rm_to_wh_i4's output, fetched with weight_bake_export,
+ * is the truth.
  *
  * memcmp, not a tolerance: a permutation of nibbles either matches or the
  * two are different layouts.
+ *
+ * sdkl_cpu_i4_rm_to_i4_wh is measured alongside but is no longer the
+ * reference. Its first run disagreed with the DSP on 99.5% of a 2048x3584
+ * weight while agreeing on a 32x32 one, which is what a swapped
+ * rows/cols argument looks like -- square inputs cannot tell the two apart,
+ * and hexkl_macro_i4_rm_to_i4_wh takes (n_col, n_inner) where this one is
+ * documented (wt_rows, wt_cols). So both orders are tried and reported.
  */
-TEST_F(HmxMmU8I4Layer, WhBakeMatchesSdklCpu) {
-  auto rm_to_wh = loadSdklRmToWh();
-  if (rm_to_wh == nullptr) {
-    GTEST_SKIP() << "libsdkl.so / sdkl_cpu_i4_rm_to_i4_wh not on this device";
-  }
-
-  // The model's largest weight, so the answer covers the shape that matters
-  // rather than a corner case.
+TEST_F(HmxMmU8I4Layer, WhPackReferenceMatchesDspBake) {
+  // The model's largest weight, and deliberately not square.
   const uint32_t K = 2048, N = 3584;
   Weight w;
   ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, N, 0x5DC10000u, w));
 
   const uint32_t wh_len = (K / 32u) * (N / 32u) * 512u;
-  std::vector<uint8_t> from_dsp(wh_len, 0), from_arm(wh_len, 0xAA);
+  std::vector<uint8_t> from_dsp(wh_len, 0);
   ASSERT_EQ(nntr_hvx_weight_bake_export(handle_, w.handle, from_dsp.data(),
                                         (int)wh_len),
             AEE_SUCCESS);
 
-  const auto t0 = std::chrono::steady_clock::now();
-  const int rc = rm_to_wh(from_arm.data(), w.q_w.data(), K, N);
-  const auto arm_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - t0)
-                        .count();
-  std::cout << "U8I4_FIELD path=wh_layout field=sdkl_rc value=" << hex(rc)
-            << "\n"
-            << "U8I4_FIELD path=wh_layout field=arm_convert_us value=" << arm_us
-            << "\n"
-            << "U8I4_FIELD path=wh_layout field=arm_convert_mbps value="
-            << (arm_us > 0 ? (double)wh_len / (double)arm_us : 0.0)
-            << std::endl;
-  ASSERT_EQ(rc, AEE_SUCCESS);
-
-  size_t bad = 0, first = wh_len;
-  for (size_t i = 0; i < wh_len; ++i) {
-    if (from_arm[i] != from_dsp[i]) {
-      if (bad == 0) {
-        first = i;
+  auto count_diff = [&](const std::vector<uint8_t> &v, size_t *first) {
+    size_t bad = 0;
+    *first = wh_len;
+    for (size_t i = 0; i < wh_len; ++i) {
+      if (v[i] != from_dsp[i]) {
+        if (bad == 0) {
+          *first = i;
+        }
+        ++bad;
       }
-      ++bad;
     }
-  }
-  std::cout << "U8I4_FIELD path=wh_layout field=bad_bytes value=" << bad
-            << " of " << wh_len << std::endl;
+    return bad;
+  };
+
+  std::vector<uint8_t> host(wh_len, 0);
+  const auto t0 = std::chrono::steady_clock::now();
+  whPackReference(w.q_w.data(), K, N, host.data());
+  const auto host_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count();
+  size_t first = 0;
+  const size_t bad = count_diff(host, &first);
+  std::cout << "U8I4_FIELD path=wh_layout field=closed_form_bad_bytes value="
+            << bad << " of " << wh_len << "\n"
+            << "U8I4_FIELD path=wh_layout field=host_pack_us value=" << host_us
+            << "\n"
+            << "U8I4_FIELD path=wh_layout field=host_pack_mbps value="
+            << (host_us > 0 ? (double)wh_len / (double)host_us : 0.0)
+            << std::endl;
   if (bad != 0) {
-    std::cout << "  first at " << first << " (tile " << first / 512 << " byte "
-              << first % 512 << "): arm " << hex(from_arm[first]) << " dsp "
-              << hex(from_dsp[first]) << std::endl;
+    std::cout << "  first at " << first << " (tile " << first / 512 << " of "
+              << wh_len / 512 << ", byte " << first % 512 << "): host "
+              << hex(host[first]) << " dsp " << hex(from_dsp[first])
+              << std::endl;
   }
   EXPECT_EQ(bad, 0u)
-    << "sdkl_cpu_i4_rm_to_i4_wh and hexkl_micro_hmx_rm_to_wh_i4 disagree; the "
-       "offline conversion cannot use the ARM library as-is";
+    << "whSlot does not describe what hexkl_micro_hmx_rm_to_wh_i4 produces "
+       "at this shape; the offline packer cannot be written from it yet";
+
+  // Which argument order the vendor's ARM entry point wants, if either.
+  // Reported rather than asserted: the offline path does not need it once
+  // the closed form holds, but it is the fallback if it does not.
+  if (auto rm_to_wh = loadSdklRmToWh()) {
+    const char *order[2] = {"rows_cols", "cols_rows"};
+    for (int o = 0; o < 2; ++o) {
+      std::vector<uint8_t> v(wh_len, 0);
+      const size_t a = (o == 0) ? K : N, b = (o == 0) ? N : K;
+      if (rm_to_wh(v.data(), w.q_w.data(), a, b) != AEE_SUCCESS)
+        continue;
+      size_t f = 0;
+      std::cout << "U8I4_FIELD path=wh_layout field=sdkl_" << order[o]
+                << "_bad_bytes value=" << count_diff(v, &f) << " of " << wh_len
+                << std::endl;
+    }
+  }
 
   EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
 }
@@ -1864,54 +1930,64 @@ TEST_F(HmxMmU8I4Layer, WhLayoutTable) {
   std::cout << "U8I4_FIELD path=wh_layout field=bijection value=yes"
             << std::endl;
 
-  // 32 lines, one per source row, each 32 slot numbers. This is the whole
-  // answer -- the offline packer needs nothing else -- and it is printed so
-  // a closed form can be read off it. Once that form is written down this
-  // test checks it instead of printing.
-  std::cout << "WH_SLOT_TABLE begin (row r, col c) -> nibble slot\n";
+  // The closed form read off this table the first time it was printed. If it
+  // still describes every entry there is nothing to look at, so the table is
+  // printed only when it does not -- which is also the signal that this
+  // device's layout differs from the one whSlot was derived on.
+  size_t form_bad = 0;
   for (uint32_t r = 0; r < 32u; ++r) {
-    std::cout << "WH_SLOT_ROW " << std::setw(2) << r << ":";
     for (uint32_t c = 0; c < 32u; ++c) {
-      std::cout << " " << slot_of[r * 32u + c];
+      if (slot_of[r * 32u + c] != (int)whSlot(r, c)) {
+        ++form_bad;
+      }
     }
-    std::cout << "\n";
   }
-  std::cout << "WH_SLOT_TABLE end" << std::endl;
+  std::cout << "U8I4_FIELD path=wh_layout field=closed_form_bad_slots value="
+            << form_bad << " of 1024" << std::endl;
+  EXPECT_EQ(form_bad, 0u) << "whSlot no longer describes this library's layout";
+  // 32 lines, one per source row, each 32 slot numbers. This is the whole
+  // answer -- the offline packer needs nothing else -- and it is what the
+  // closed form was read off the first time.
+  if (form_bad != 0) {
+    std::cout << "WH_SLOT_TABLE begin (row r, col c) -> nibble slot\n";
+    for (uint32_t r = 0; r < 32u; ++r) {
+      std::cout << "WH_SLOT_ROW " << std::setw(2) << r << ":";
+      for (uint32_t c = 0; c < 32u; ++c) {
+        std::cout << " " << slot_of[r * 32u + c];
+      }
+      std::cout << "\n";
+    }
+    std::cout << "WH_SLOT_TABLE end" << std::endl;
+  }
 
-  // Does one tile's permutation describe every tile, and are tiles laid out
-  // k-major the way hexkl_bake_u8i4_worker places them at t*512 with
-  // t = kt*n_tiles_row + nt? Both have to hold for the offline packer to be
-  // a loop over tiles around the table above.
-  const uint32_t K = 64, N = 64, NT = 2;
+  // Does the table describe every tile, and are tiles laid out k-major the
+  // way hexkl_bake_u8i4_worker places them at t*512 with
+  // t = kt*n_tiles_row + nt? whPackReference assumes both; a non-square
+  // shape is what makes the two orders distinguishable, which a 32x32 probe
+  // cannot do.
+  const uint32_t K = 64, N = 128;
   std::vector<int8_t> big(static_cast<size_t>(K) * N);
   for (size_t i = 0; i < big.size(); ++i) {
     big[i] = static_cast<int8_t>((int)(i % 15u) - 7); // whole i4 range
   }
-  std::vector<uint8_t> big_wh(NT * NT * 512u, 0);
-  ASSERT_EQ(rm_to_wh(big_wh.data(), big.data(), K, N), AEE_SUCCESS);
+  const uint32_t big_len = (K / 32u) * (N / 32u) * 512u;
+  std::vector<uint8_t> big_sdkl(big_len, 0), big_host(big_len, 0);
+  whPackReference(big.data(), K, N, big_host.data());
 
-  size_t tile_bad = 0;
-  for (uint32_t kt = 0; kt < NT; ++kt) {
-    for (uint32_t nt = 0; nt < NT; ++nt) {
-      std::vector<uint8_t> want(512, 0);
-      for (uint32_t r = 0; r < 32u; ++r) {
-        for (uint32_t c = 0; c < 32u; ++c) {
-          const int8_t v = big[(size_t)(kt * 32u + r) * N + (nt * 32u + c)];
-          const int sl = slot_of[r * 32u + c];
-          want[sl / 2] |= static_cast<uint8_t>((v & 0x0F) << (4 * (sl % 2)));
-        }
-      }
-      const uint8_t *got = big_wh.data() + (kt * NT + nt) * 512u;
-      if (std::memcmp(got, want.data(), 512) != 0) {
-        ++tile_bad;
-      }
+  const char *order[2] = {"rows_cols", "cols_rows"};
+  for (int o = 0; o < 2; ++o) {
+    std::fill(big_sdkl.begin(), big_sdkl.end(), uint8_t(0));
+    const size_t a = (o == 0) ? K : N, b = (o == 0) ? N : K;
+    if (rm_to_wh(big_sdkl.data(), big.data(), a, b) != AEE_SUCCESS)
+      continue;
+    size_t d = 0;
+    for (uint32_t t = 0; t < big_len; ++t) {
+      if (big_sdkl[t] != big_host[t])
+        ++d;
     }
+    std::cout << "U8I4_FIELD path=wh_layout field=nonsquare_sdkl_" << order[o]
+              << "_bad value=" << d << " of " << big_len << std::endl;
   }
-  std::cout << "U8I4_FIELD path=wh_layout field=tiles_mismatched value="
-            << tile_bad << " of " << (NT * NT) << std::endl;
-  EXPECT_EQ(tile_bad, 0u)
-    << "either the per-tile permutation is not the same for every tile, or "
-       "tiles are not ordered kt*n_col_tiles+nt";
 }
 
 /**
