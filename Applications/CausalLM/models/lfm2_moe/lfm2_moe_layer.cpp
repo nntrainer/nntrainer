@@ -495,7 +495,13 @@ static bool tryMoeLayerOnAccelerator(
   // the only option for these weights; a decode-shaped kernel, or moving the
   // grouped-decode gather onto the DSP, is the upgrade if decode TPS asks
   // for it.
-  if (total_tokens <= 1 && !weights_wh) {
+  // NNTR_MOE_HTP_DECODE=1 lifts that gate for plain QS4CX: the layers in
+  // moe_htp_layers take the kernel at M == 1 while the rest keep the ARM
+  // path, which is the only way to put decode's CPU and HTP FFN side by
+  // side in one run (doc 46 section 49). Measurement switch, not a default.
+  static const bool htp_decode_forced =
+    std::getenv("NNTR_MOE_HTP_DECODE") != nullptr;
+  if (total_tokens <= 1 && !weights_wh && !htp_decode_forced) {
     return false;
   }
 
