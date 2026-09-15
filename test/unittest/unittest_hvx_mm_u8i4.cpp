@@ -1874,6 +1874,127 @@ TEST_F(HmxMmU8I4Layer, WhPackReferenceMatchesDspBake) {
 }
 
 /**
+ * @brief [doc 46 section 35] Reads the permutation out of the DSP itself.
+ *
+ * whSlot was derived from sdkl_cpu_i4_rm_to_i4_wh and matches it exactly, on
+ * square and non-square shapes alike -- and both disagree with the DSP's own
+ * bake at 2048x3584 by the same 3639322 bytes. The tile order is not the
+ * difference: hexkl_weight_u8i4_register sets n_tiles_row = N/32 and indexes
+ * kt = t/n_tiles_row, which is what whPackReference does.
+ *
+ * What is left is that these are two different APIs. The matmul this tree
+ * runs is hexkl_micro_hmx_mm_u8i4, so the layout that matters is
+ * hexkl_micro_hmx_rm_to_wh_i4's, and the library's CPU converter feeds
+ * sdkl_npu_mm_u8i4_i32 instead. So ask the one we actually use.
+ *
+ * Four probes rather than the 1024 single-element calls the library version
+ * uses, because each of these is a FastRPC round trip: source index p is 10
+ * bits and an i4 safely holds 0..7, so p's bits arrive three at a time and
+ * are reassembled per output slot.
+ */
+TEST_F(HmxMmU8I4Layer, WhLayoutTableFromDsp) {
+  const uint32_t K = 32, N = 32;
+  const std::vector<float> scale(N, 1.0f), bias(N, 0.0f);
+  const std::vector<int32_t> colsum(N, 0);
+
+  std::vector<uint32_t> src_of(1024, 0); // output slot -> source index
+  for (int j = 0; j < 4; ++j) {
+    std::vector<int8_t> rm(1024);
+    for (uint32_t p = 0; p < 1024u; ++p) {
+      rm[p] = static_cast<int8_t>((p >> (3 * j)) & 7u);
+    }
+    uint32_t h = 0xFFFFFFFFu;
+    ASSERT_EQ(nntr_hvx_weight_register_u8i4(
+                handle_, K, N, rm.data(), (int)rm.size(), scale.data(), (int)N,
+                colsum.data(), (int)N, bias.data(), (int)N, &h),
+              AEE_SUCCESS);
+    std::vector<uint8_t> wh(512, 0);
+    ASSERT_EQ(nntr_hvx_weight_bake_export(handle_, h, wh.data(), 512),
+              AEE_SUCCESS);
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h), AEE_SUCCESS);
+    for (uint32_t sl = 0; sl < 1024u; ++sl) {
+      const uint32_t v = (wh[sl / 2] >> (4 * (sl % 2))) & 0x0Fu;
+      src_of[sl] |= (v & 7u) << (3 * j);
+    }
+  }
+
+  std::vector<int> slot_of(1024, -1);
+  std::vector<int> hits(1024, 0);
+  for (uint32_t sl = 0; sl < 1024u; ++sl) {
+    ASSERT_LT(src_of[sl], 1024u)
+      << "slot " << sl << " reassembled to source " << src_of[sl]
+      << "; the bake does not pass i4 values through unchanged";
+    slot_of[src_of[sl]] = (int)sl;
+    ++hits[src_of[sl]];
+  }
+  for (uint32_t p = 0; p < 1024u; ++p) {
+    ASSERT_EQ(hits[p], 1) << "source " << p << " landed in " << hits[p]
+                          << " slots; not a bijection";
+  }
+
+  size_t form_bad = 0;
+  for (uint32_t r = 0; r < 32u; ++r) {
+    for (uint32_t c = 0; c < 32u; ++c) {
+      if (slot_of[r * 32u + c] != (int)whSlot(r, c)) {
+        ++form_bad;
+      }
+    }
+  }
+  std::cout << "U8I4_FIELD path=wh_layout field=dsp_closed_form_bad_slots "
+               "value="
+            << form_bad << " of 1024" << std::endl;
+  if (form_bad != 0) {
+    std::cout << "WH_DSP_SLOT_TABLE begin (row r, col c) -> nibble slot\n";
+    for (uint32_t r = 0; r < 32u; ++r) {
+      std::cout << "WH_DSP_SLOT_ROW " << std::setw(2) << r << ":";
+      for (uint32_t c = 0; c < 32u; ++c) {
+        std::cout << " " << slot_of[r * 32u + c];
+      }
+      std::cout << "\n";
+    }
+    std::cout << "WH_DSP_SLOT_TABLE end" << std::endl;
+  }
+  EXPECT_EQ(form_bad, 0u)
+    << "hexkl_micro_hmx_rm_to_wh_i4 uses a different tile layout than "
+       "sdkl_cpu_i4_rm_to_i4_wh, which whSlot was derived from";
+
+  // Is the tile ORDER also what whPackReference assumes? Checked separately
+  // and on a non-square shape, because a wrong order and a wrong intra-tile
+  // layout look the same in a single byte count.
+  const uint32_t K2 = 64, N2 = 128;
+  std::vector<int8_t> big(static_cast<size_t>(K2) * N2);
+  for (size_t i = 0; i < big.size(); ++i) {
+    big[i] = static_cast<int8_t>((int)(i % 15u) - 7);
+  }
+  const std::vector<float> s2(N2, 1.0f), b2(N2, 0.0f);
+  const std::vector<int32_t> c2(N2, 0);
+  uint32_t h2 = 0xFFFFFFFFu;
+  ASSERT_EQ(nntr_hvx_weight_register_u8i4(
+              handle_, K2, N2, big.data(), (int)big.size(), s2.data(), (int)N2,
+              c2.data(), (int)N2, b2.data(), (int)N2, &h2),
+            AEE_SUCCESS);
+  const uint32_t len2 = (K2 / 32u) * (N2 / 32u) * 512u;
+  std::vector<uint8_t> dsp2(len2, 0), host2(len2, 0);
+  ASSERT_EQ(nntr_hvx_weight_bake_export(handle_, h2, dsp2.data(), (int)len2),
+            AEE_SUCCESS);
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h2), AEE_SUCCESS);
+  whPackReference(big.data(), K2, N2, host2.data());
+  size_t d2 = 0, tiles_bad = 0;
+  for (uint32_t t = 0; t < len2 / 512u; ++t) {
+    if (std::memcmp(dsp2.data() + t * 512u, host2.data() + t * 512u, 512) != 0)
+      ++tiles_bad;
+  }
+  for (uint32_t i = 0; i < len2; ++i) {
+    if (dsp2[i] != host2[i])
+      ++d2;
+  }
+  std::cout << "U8I4_FIELD path=wh_layout field=dsp_nonsquare_bad value=" << d2
+            << " of " << len2 << "\n"
+            << "U8I4_FIELD path=wh_layout field=dsp_nonsquare_tiles_bad value="
+            << tiles_bad << " of " << (len2 / 512u) << std::endl;
+}
+
+/**
  * @brief [doc 46 section 35] Reads the WH nibble permutation out of the
  *        library, so the offline quantizer can reproduce it.
  *
