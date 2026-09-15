@@ -467,13 +467,27 @@ static bool tryMoeLayerOnAccelerator(
   }
 
   const size_t n_experts = expert_assignments.size();
+  if (n_experts == 0 || gate_up_indices.size() < n_experts ||
+      down_indices.size() < n_experts) {
+    return false;
+  }
   std::vector<void *> gu_data(n_experts), dn_data(n_experts);
   std::vector<float *> gu_scale(n_experts), dn_scale(n_experts);
+  // QS4CX_WH is the same weight with its nibbles already in HMX tiles and a
+  // column sum after the scales, built by the offline quantizer so the DSP
+  // does not have to convert and bake at load (doc 46 section 35). Both
+  // experts' halves have to agree, and every expert with every other: the
+  // call takes one flag for the layer, and a model that mixed the two would
+  // otherwise read half its weights with the wrong layout.
+  const auto wh = nntrainer::Tdatatype::QS4CX_WH;
+  const auto plain = nntrainer::Tdatatype::QS4CX;
+  const bool weights_wh =
+    context.getWeight(gate_up_indices[0]).getDataType() == wh;
   for (size_t e = 0; e < n_experts; ++e) {
     nntrainer::Tensor &gu = context.getWeight(gate_up_indices[e]);
     nntrainer::Tensor &dn = context.getWeight(down_indices[e]);
-    if (gu.getDataType() != nntrainer::Tdatatype::QS4CX ||
-        dn.getDataType() != nntrainer::Tdatatype::QS4CX) {
+    const auto want = weights_wh ? wh : plain;
+    if (gu.getDataType() != want || dn.getDataType() != want) {
       return false;
     }
     gu_data[e] = gu.getData<char>();
@@ -504,7 +518,7 @@ static bool tryMoeLayerOnAccelerator(
   ops->gemm_qs4cx_moe_layer_fp32(
     gu_data, gu_scale, dn_data, dn_scale, row_index, row_count, row_weight,
     input.getData<float>(), output.getData<float>(), total_tokens, hidden_size,
-    intermediate_size, hidden_size);
+    intermediate_size, hidden_size, weights_wh);
   return true;
 }
 
