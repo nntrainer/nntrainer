@@ -483,6 +483,22 @@ static bool tryMoeLayerOnAccelerator(
   const auto plain = nntrainer::Tdatatype::QS4CX;
   const bool weights_wh =
     context.getWeight(gate_up_indices[0]).getDataType() == wh;
+
+  // Decode's single token normally stays on the ARM side: it cannot amortize
+  // the kernel's 64-row pad, which is why the fused path has the same gate.
+  // QS4CX_WH has no ARM side to stay on -- FloatTensor implements no dot()
+  // for it, deliberately, because those bytes are in HMX tile order and only
+  // the DSP can read them -- so there the gate would pick a throw over a
+  // slow-but-correct call.
+  // ponytail: decode through the layer kernel pads M = 1 out to 64 rows for
+  // each of the num_experts_per_tok active experts. It is correct and it is
+  // the only option for these weights; a decode-shaped kernel, or moving the
+  // grouped-decode gather onto the DSP, is the upgrade if decode TPS asks
+  // for it.
+  if (total_tokens <= 1 && !weights_wh) {
+    return false;
+  }
+
   for (size_t e = 0; e < n_experts; ++e) {
     nntrainer::Tensor &gu = context.getWeight(gate_up_indices[e]);
     nntrainer::Tensor &dn = context.getWeight(down_indices[e]);
@@ -814,10 +830,10 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       }
     }
 
-    // [doc 46] One call for every expert, when the accelerator offers it and
-    // there is more than one token to amortize the 64-row pad tax over --
-    // the same M > 1 gate the split-call fused path uses. Falls through to
-    // the per-expert loop below otherwise.
+    // [doc 46] One call for every expert, when the accelerator offers it.
+    // The M > 1 gate that used to sit here moved inside: it does not apply to
+    // QS4CX_WH weights, which have no ARM path to fall back to at M == 1.
+    // Falls through to the per-expert loop below otherwise.
     /* M0: the one stage that had no timer. With the whole-layer call the
        ARM-side gather, route and scatter all read ~0 because the DSP does
        them, and this read 0 as well -- so nothing accounted for the layer's
@@ -826,7 +842,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
        && above: a temporary M0Timer in an expression is destroyed before
        the call it was meant to wrap. */
     bool moe_layer_done = false;
-    if (total_tokens > 1) {
+    {
       M0Timer t(&g_m0.ffn);
       moe_layer_done = tryMoeLayerOnAccelerator(
         input, output, expert_assignments, context, expert_gate_up_proj_indices,

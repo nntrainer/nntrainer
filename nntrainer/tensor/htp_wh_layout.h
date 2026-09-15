@@ -99,6 +99,40 @@ inline void whPack(const int8_t *rm, uint32_t K, uint32_t N, uint8_t *out) {
   }
 }
 
+/**
+ * @brief The whole pages of [src, src + len) -- what the arena copy can hand
+ *        back to the OS once a weight's bytes are in the arena.
+ *
+ * This model's expert weights are 3.9 GB living in ONE contiguous allocation
+ * (TensorPool gives every weight a slice of a single aligned_alloc, so
+ * Tensor::deallocate() drops a pointer and frees nothing), and the arena
+ * needs its own 3.9 GB copy of them. Both at once is more memory than the
+ * device has. Dropping each weight's pages right after its copy keeps the
+ * peak at one model instead of two. The pointer stays valid and mapped --
+ * only the physical pages go, and a read would see zeros -- so nothing that
+ * still holds it dangles, which is also why the handle cache may keep using
+ * it as a key.
+ *
+ * Rounds INWARD. A weight's first and last partial page are shared with its
+ * neighbours in the pool, and dropping a neighbour's live bytes would be a
+ * silently wrong matmul rather than a failure. That keeps at most one page at
+ * each end, against a 1.8 MB smallest weight here.
+ *
+ * @param page_size    OS page size, a power of two; a parameter rather than a
+ *                     call so a host test can check the arithmetic
+ * @param[out] out_len 0 when the range covers no whole page, in which case
+ *                     *out_begin is unspecified and the caller does nothing
+ */
+inline void whSourcePageRange(const void *src, size_t len, size_t page_size,
+                              uintptr_t *out_begin, size_t *out_len) {
+  const uintptr_t mask = static_cast<uintptr_t>(page_size) - 1u;
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(src);
+  const uintptr_t begin = (addr + mask) & ~mask;
+  const uintptr_t end = (addr + len) & ~mask;
+  *out_begin = begin;
+  *out_len = end > begin ? static_cast<size_t>(end - begin) : 0u;
+}
+
 } // namespace nntrainer
 
 #endif // __NNTRAINER_HTP_WH_LAYOUT_H__

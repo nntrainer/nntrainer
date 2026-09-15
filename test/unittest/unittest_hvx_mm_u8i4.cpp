@@ -76,7 +76,7 @@ constexpr int kDspOffset = 0x80000400;
  * build should skip these tests, not fail to link the binary.
  *
  * Signature from sdkl.h: the output is
- * ((rows+31)/32)*((cols+31)/32)*512 bytes, which is HtpWeightCache::whBytes,
+ * ((rows+31)/32)*((cols+31)/32)*512 bytes, which is whBytes(),
  * and the input is one sign-extended int8 per i4 value in row-major order,
  * which is what htp_qs4cx_from_packed already produces.
  */
