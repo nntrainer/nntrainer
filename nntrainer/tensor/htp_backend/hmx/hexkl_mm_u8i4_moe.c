@@ -439,10 +439,19 @@ int hexkl_mm_u8i4_moe_layer_run(
      order / base_of / slot_of are per-expert tables on the heap rather
      than stack arrays sized by HEXKL_MM_U8I4_MAX_WEIGHTS: that constant is
      2048 and has nothing to do with how many experts this layer has. */
+  /* Reserved for the most slots THIS many rows can ever need -- every
+     expert padded to a whole block -- not for this call's routing. The 22
+     prefill calls of a token batch have the same n_rows but a different
+     n_slots each, and reserving for the actual count grew the block on
+     every layer that routed a little wider than the last: 323 us a call
+     left of the 3064 us this scratch was meant to remove (doc 46 section
+     50.7). With the bound, the first prefill call grows it once and no
+     later call of the same batch can exceed it. */
+  const size_t n_slots_cap = (size_t)n_rows + (size_t)n_experts * (BR - 1u);
   const size_t sz_scale = sizeof(float) * BR;
   const size_t sz_zp = sizeof(int32_t) * BR;
-  const size_t sz_act_ah = (size_t)n_slots * K;
-  const size_t sz_slot_u32 = sizeof(uint32_t) * n_slots;
+  const size_t sz_act_ah = n_slots_cap * K;
+  const size_t sz_slot_u32 = sizeof(uint32_t) * n_slots_cap;
   const size_t sz_expert_u32 = sizeof(uint32_t) * n_experts;
   const size_t sz_mpad_u32 = sizeof(uint32_t) * m_pad;
   const size_t sz_act_c = sizeof(float) * (size_t)M * K;
