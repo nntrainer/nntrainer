@@ -50,6 +50,19 @@ constexpr uint32_t round_up(uint32_t v, uint32_t a) {
 }
 
 /** @brief HMX int8 tile geometry, mirrored from hexkl_micro.h. */
+/**
+ * @brief Offset AEEStdErr.h adds to every AEE_* code on the DSP side.
+ *
+ * Skel code is compiled with __hexagon__ defined, where AEEStdErr.h offsets
+ * every AEE_* code; this host binary is not, so AEE_EBADSTATE here is plain
+ * 13 and the same error arrives from the DSP as 0x8000040d. Only
+ * AEE_SUCCESS is 0 on both sides, which is why every other check in this
+ * file compares against that one and nothing caught this until a test
+ * expected a specific failure. Same constant as unittest_hvx_softmax.cpp
+ * and unittest_hvx_attn.cpp.
+ */
+constexpr int kDspOffset = 0x80000400;
+
 constexpr uint32_t kTileRow = 64;   // HEXKL_HMX_INT8_BLOCK_N_ROW
 constexpr uint32_t kTileInner = 32; // HEXKL_HMX_INT8_BLOCK_N_INNER
 constexpr uint32_t kTileCol = 32;   // HEXKL_HMX_INT8_BLOCK_N_COL
@@ -1906,17 +1919,39 @@ TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
 
   // Detaching under a live borrow would leave the next matmul reading
   // unmapped memory, so the DSP refuses it. This is the check that lets
-  // register_arena skip copying at all.
-  EXPECT_EQ(nntr_hvx_arena_detach(handle_, arena), AEE_EBADSTATE)
+  // register_arena skip copying at all. Reported as well as asserted: which
+  // code came back is the difference between "the borrow scan missed the
+  // slots" and "the call never got that far".
+  const int busy_rc = nntr_hvx_arena_detach(handle_, arena);
+  std::cout << "U8I4_FIELD path=arena_moe field=detach_while_borrowed value="
+            << hex(busy_rc) << " (want " << hex(AEE_EBADSTATE + kDspOffset)
+            << ")" << std::endl;
+  EXPECT_EQ(busy_rc, AEE_EBADSTATE + kDspOffset)
     << "arena detached while weights still borrow from it";
 
+  uint32_t released = 0, first_rel_err = AEE_SUCCESS;
   for (uint32_t e = 0; e < NE; ++e) {
-    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, a_gu[e]), AEE_SUCCESS);
-    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, a_dn[e]), AEE_SUCCESS);
-    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h_gu[e]), AEE_SUCCESS);
-    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h_dn[e]), AEE_SUCCESS);
+    for (uint32_t h : {a_gu[e], a_dn[e], h_gu[e], h_dn[e]}) {
+      const int rerr = nntr_hvx_weight_release_u8i4(handle_, h);
+      if (rerr == AEE_SUCCESS) {
+        ++released;
+      } else if (first_rel_err == AEE_SUCCESS) {
+        first_rel_err = rerr;
+      }
+    }
   }
-  EXPECT_EQ(nntr_hvx_arena_detach(handle_, arena), AEE_SUCCESS);
+  const int free_rc = nntr_hvx_arena_detach(handle_, arena);
+  std::cout << "U8I4_FIELD path=arena_moe field=released value=" << released
+            << " of " << (4u * NE) << "\n"
+            << "U8I4_FIELD path=arena_moe field=first_release_err value="
+            << (first_rel_err == AEE_SUCCESS ? std::string("none")
+                                             : hex(first_rel_err))
+            << "\n"
+            << "U8I4_FIELD path=arena_moe field=detach_after_release value="
+            << hex(free_rc) << std::endl;
+  EXPECT_EQ(released, 4u * NE) << "first error " << hex(first_rel_err);
+  EXPECT_EQ(free_rc, AEE_SUCCESS)
+    << "every borrower released, so the arena should have come back";
   rfree(buf);
 }
 
