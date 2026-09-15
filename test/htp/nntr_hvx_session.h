@@ -33,8 +33,12 @@
  */
 /** @brief How many host arenas one session can have mapped at once. The
  *  whole-model plan needs 3.9 GB in chunks of at most 1 GiB (rpcmem/ION
- *  allocation size, doc 45 Gate 0b), so four; eight leaves room. */
-#define NNTR_HVX_MAX_ARENAS 8
+ *  allocation size, doc 45 Gate 0b), so four -- but the DSP refused the
+ *  fourth 1 GiB mapping (doc 46 section 39), and the host now halves its
+ *  request down to 64 MiB to find where that ceiling actually falls. The
+ *  tail of a halving sequence is what needs the room: this is a table of
+ *  three-word structs, so the slots cost nothing next to being wrong. */
+#define NNTR_HVX_MAX_ARENAS 32
 
 /** @brief One host rpcmem buffer as the DSP sees it. va NULL means free. */
 typedef struct {
