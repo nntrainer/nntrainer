@@ -45,22 +45,19 @@ typedef struct {
   uint32_t act_off;     /**< one 64-row activation block, AH tiles */
   uint32_t w_gu_off;    /**< buffer A: gate_up's WH bytes */
   uint32_t w_dn_off;    /**< buffer B: down's WH bytes */
-  uint32_t gate_off;    /**< [64 x inter] f32: SwiGLU's output, written by
+  uint32_t gate_off;    /**< [64 x inter] f32: silu(gate)*up, written by
                              the fused gate_up epilogue */
-  uint32_t up_off;      /**< [64 x inter] f32. No longer written -- the
-                             fused epilogue never materialises up -- but
-                             kept adjacent to gate so res_f32_off's alias
-                             still has gate+up to fit in. Reclaimable. */
   uint32_t mid_off;     /**< requantized SwiGLU output, AH tiles */
-  uint32_t result_off;  /**< acc_tiles staged HMX accumulator tiles */
-  /** How many 8 KB accumulator tiles fit at result_off, given the arena.
-      At least 1, which is the old one-at-a-time behaviour; more lets the
-      dequant run pooled over a batch. gate_up's n-tile count is the
-      useful ceiling. */
+  uint32_t result_off;  /**< TWO staging buffers of acc_tiles accumulator
+                             tiles each, back to back: the HMX issues a
+                             batch into one while the pool dequantizes the
+                             other */
+  /** Accumulator tiles per staging buffer, given the arena. Even, at least
+      2 (one gate/up pair); gate_up's n-tile count is the useful ceiling. */
   uint32_t acc_tiles;
   uint32_t res_f32_off; /**< [64 x N_out] f32, down's dequantized block.
-                             ALIASES gate_off -- see the .c on why that is
-                             safe and what would break it. */
+                             Its own region: the scatter reads it while the
+                             next block's epilogue already writes gate_off */
   uint32_t total;       /**< bytes needed; compared against the arena */
 } hexkl_moe_layout;
 

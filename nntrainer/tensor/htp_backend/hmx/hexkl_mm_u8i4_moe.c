@@ -23,12 +23,16 @@
  * has no activation quant for the DMA to hide behind and all 5.18 ms/layer
  * of it is exposed.
  *
- * res_f32 ALIASES gate. By the time down's result is dequantized, gate has
- * been SwiGLU'd in place and requantized into mid, so its bytes are dead.
- * Reusing them is what keeps a [64 x N_out] f32 block out of the budget.
- * If a future change reads gate after the requant, this aliasing silently
- * corrupts it -- hexkl_mm_u8i4_moe_layout asserts the sizes but cannot
- * assert the lifetime.
+ * THE POOL RUNS ONE JOB BEHIND THE HMX. Each staged batch's epilogue
+ * (dequant, or dequant+SwiGLU) and each block's scatter are submitted to
+ * the worker pool and retired only when the buffer they read or write is
+ * about to be reused: two accumulator staging buffers alternate under the
+ * HMX issue, res_f32 has its own region rather than aliasing gate, and a
+ * block's scatter runs under the next block's activation DMA. Every wait is
+ * placed where the dependency actually is, and each is timed, so the
+ * profile's DEQUANT and SCATTER columns now read the exposed part, not the
+ * work. Moving a submit or a wait without re-deriving who reads what is how
+ * this breaks -- silently, as a plausible wrong output.
  */
 
 #include "hexkl_mm_u8i4_moe.h"
@@ -46,7 +50,6 @@
 #include "hvx_gather_ah_u8.h"
 #include "hvx_quant_u8.h"
 #include "hvx_scale_add_f32.h"
-#include "hvx_swiglu_f32.h"
 
 #define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
 #define ROUND_UP_SZ(v, a) ((((v) + ((a)-1)) / (a)) * (a))
@@ -317,56 +320,47 @@ int hexkl_mm_u8i4_moe_layout(uint32_t K, uint32_t inter, uint32_t N_out,
     ROUND_UP_U32(L.w_gu_off + gu_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT);
   L.gate_off =
     ROUND_UP_U32(L.w_dn_off + dn_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  L.up_off =
-    ROUND_UP_U32(L.gate_off + inter_rows, HEXKL_HMX_ACTIVATION_ALIGNMENT);
+  /* No up region: the fused epilogue writes silu(gate)*up straight into
+     gate_off and up is never materialised. */
   L.mid_off =
-    ROUND_UP_U32(L.up_off + inter_rows, HEXKL_HMX_ACTIVATION_ALIGNMENT);
+    ROUND_UP_U32(L.gate_off + inter_rows, HEXKL_HMX_ACTIVATION_ALIGNMENT);
   L.result_off =
     ROUND_UP_U32(L.mid_off + mid_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT);
 
-  /* Accumulator tiles are staged so the dequant can run over a run of them
-     on the whole worker pool instead of one tile at a time on the calling
-     thread (hvx_dequant_acc_tiles_to_f32 explains why that is worth doing).
-     Whatever the arena has left after everything else decides how many fit;
-     one still works, and is exactly the old behaviour. gate_up has the most
-     n-tiles, so it sets the useful ceiling. */
+  /* Two staging buffers of acc_tiles accumulator tiles: the HMX fills one
+     while the pool dequantizes the other, which is what lets the epilogue
+     hide behind the next batch's issue instead of following it. res_f32
+     comes after them and no longer aliases gate -- the scatter reads it
+     while the next block's epilogue is already writing gate -- so how many
+     tiles fit is decided with res_f32 already taken out. */
   {
+    const uint32_t fixed =
+      L.result_off + ROUND_UP_U32(res_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT);
     uint32_t want = (2u * inter) / HEXKL_HMX_INT8_BLOCK_N_COL;
     uint32_t fits = 0u;
-    if (arena_bytes > L.result_off) {
-      fits = (arena_bytes - L.result_off) / ACC_TILE_BYTES;
-    }
-    if (fits == 0u) {
-      return AEE_ENOMEMORY;
+    if (arena_bytes > fixed) {
+      fits = (arena_bytes - fixed) / (2u * ACC_TILE_BYTES);
     }
     /* Capped, not maximised. This count is also the weight chunk size (see
        moe_push_weight_chunk): a bigger batch parallelises the dequant no
        better once it is well past the worker count, and a smaller chunk is
-       what makes the matmul start sooner. 32 leaves gate_up in 4 chunks and
-       down in 2, which is 194 ring descriptors a layer against the ring's
-       256. */
+       what makes the matmul start sooner. 32 leaves gate_up in 4 paired
+       chunks and down in 2. */
     if (want > 32u) {
       want = 32u;
     }
     L.acc_tiles = (fits < want) ? fits : want;
     /* Pairs: the gate_up epilogue dequantizes gate tile j and up tile j
-       together and stores only silu(gate)*up
-       (hvx_dequant_swiglu_acc_tiles_to_f32), so a staged batch is an even
-       count with room for at least one pair. */
+       together (hvx_dq_swiglu_worker), so a staged batch is an even count
+       with room for at least one pair. */
     L.acc_tiles &= ~1u;
     if (L.acc_tiles < 2u) {
       return AEE_ENOMEMORY;
     }
   }
-  L.total = L.result_off + L.acc_tiles * ACC_TILE_BYTES;
-
-  /* down's dequantized block lands on top of gate, whose bytes are dead by
-     then. The two regions the alias covers -- gate and up -- are adjacent,
-     so the check is against both together. */
-  L.res_f32_off = L.gate_off;
-  if (res_bytes > (L.mid_off - L.gate_off)) {
-    return AEE_ENOMEMORY;
-  }
+  L.res_f32_off = ROUND_UP_U32(L.result_off + 2u * L.acc_tiles * ACC_TILE_BYTES,
+                               HEXKL_HMX_ACTIVATION_ALIGNMENT);
+  L.total = L.res_f32_off + res_bytes;
   if (L.total > arena_bytes) {
     return AEE_ENOMEMORY;
   }
@@ -536,6 +530,12 @@ int hexkl_mm_u8i4_moe_layer_run(
   float *out_c = (float *)moe_carve(&cur, sz_out_c);
   uint32_t n_active = 0u;
   uint64_t p0 = 0;
+  /* The pool's in-flight jobs. Each outlives its submit until the wait that
+     retires it, so they live here, not in the loop body: one per staging
+     buffer for the two epilogues, one for the scatter. */
+  hvx_dq_swiglu_job gu_job[2];
+  hvx_dq_tiles_job dn_job[2];
+  moe_scatter_ctx sc;
   /* MOE_MM_BEGIN/END's state. See the macros above hexkl_mm_u8i4_moe_layout
      for why the HMX issue loop is timed by difference. */
   uint64_t mm_t0 = 0, mm_acc0 = 0, mm_dq0 = 0;
@@ -665,6 +665,14 @@ int hexkl_mm_u8i4_moe_layer_run(
       }
       HEXKL_PROBE_ADD(HEXKL_PROBE_GATHER, p0);
 
+      /* The previous block's scatter has been running under this block's
+         activation DMA; it must be done before this block's first epilogue
+         is submitted (one job at a time) and before res_f32 is rewritten.
+         SCATTER now times what of it is still exposed here. */
+      HEXKL_PROBE_T0(p0);
+      hvx_worker_pool_wait(pool);
+      HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);
+
       /* down[e] goes out now, behind the activation it must not delay and
          ahead of the whole gate_up matmul that covers it; in chunks for the
          same reason gate_up is: waiting for all 1.75 MB before the first
@@ -680,16 +688,20 @@ int hexkl_mm_u8i4_moe_layer_run(
 
       /* --- gate_up ------------------------------------------------- */
       /* Matmul a batch of gate/up PAIRS -- gate tiles g0.. into staged
-         slots [0, np), the up tiles opposite them into [np, 2np) -- then
-         dequantize and SwiGLU the whole batch on the pool in one pass,
-         straight from the staged tiles into the [64 x inter] result at
-         gate_off. gate and up never exist as f32 in VTCM: the separate
-         SwiGLU pass that read them back was 2.05 ms of a 22.6 ms prefill
-         call (doc 47), and dropping it changes no bytes -- the fused pass
-         applies the same hvx_swiglu_det_sf to the same two vectors. */
+         slots [0, np) of one staging buffer, the up tiles opposite them
+         into [np, 2np) -- then hand the batch to the pool, which
+         dequantizes and SwiGLUs it straight into gate_off (the same
+         hvx_swiglu_det_sf on the same two vectors the store-and-reread
+         sequence had, so no byte changes) while THIS thread issues the
+         next batch into the other staging buffer. A batch's HMX issue
+         (47 us at prefill) covers the previous batch's epilogue (18 us),
+         so only a block's last epilogue is exposed. DEQUANT times the
+         waits -- what stays exposed -- not the work. */
       for (uint32_t g0 = 0, ci = 0; g0 < inter_ntiles; g0 += half, ++ci) {
         const uint32_t np =
           (inter_ntiles - g0 < half) ? (inter_ntiles - g0) : half;
+        const uint32_t stage_off =
+          L.result_off + (ci & 1u) * L.acc_tiles * ACC_TILE_BYTES;
         /* Only the first block of an expert waits: by the second the whole
            weight is resident. i == 0 && ci == 0 is the one wait that cannot
            hide behind anything, which is what DMA_FIRST records. */
@@ -705,6 +717,8 @@ int hexkl_mm_u8i4_moe_layer_run(
                                 10);
           }
         }
+        /* This staging buffer was last read by epilogue ci-2, retired when
+           epilogue ci-1 was submitted; nothing to wait for before issuing. */
         MOE_MM_BEGIN();
         for (uint32_t j = 0; j < 2u * np; ++j) {
           const uint32_t col =
@@ -719,8 +733,8 @@ int hexkl_mm_u8i4_moe_layer_run(
             }
           }
           HEXKL_PROBE_T0(p0);
-          rc = hexkl_micro_hmx_acc_read_int32(
-            vtcm_base, config_off, L.result_off + j * ACC_TILE_BYTES);
+          rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off,
+                                              stage_off + j * ACC_TILE_BYTES);
           HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
           if (rc != AEE_SUCCESS) {
             goto out;
@@ -728,25 +742,41 @@ int hexkl_mm_u8i4_moe_layer_run(
         }
         MOE_MM_END();
 
+        /* Retire epilogue ci-1 (its buffer is the one batch ci+1 will
+           fill), then launch this batch's. */
         HEXKL_PROBE_T0(p0);
-        hvx_dequant_swiglu_acc_tiles_to_f32(
-          (const uint8_t *)((const int32_t *)(vtcm_base + L.result_off) +
-                            acc->base),
-          ACC_TILE_BYTES, np, g0, acc->row_stride, m_blk, scale, zp,
-          g->colsum_w, g->w_scale, g->bias, inter,
-          (float *)(vtcm_base + L.gate_off), inter, pool);
+        hvx_worker_pool_wait(pool);
         HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
+        {
+          hvx_dq_swiglu_job *jb = &gu_job[ci & 1u];
+          jb->tiles_base =
+            (const uint8_t *)((const int32_t *)(vtcm_base + stage_off) +
+                              acc->base);
+          jb->tile_stride = ACC_TILE_BYTES;
+          jb->n_pairs = np;
+          jb->g0 = g0;
+          jb->row_stride = acc->row_stride;
+          jb->m_count = m_blk;
+          jb->act_scale = scale;
+          jb->act_zp = zp;
+          jb->colsum_w = g->colsum_w;
+          jb->w_scale = g->w_scale;
+          jb->bias = g->bias;
+          jb->inter = inter;
+          jb->dst = (float *)(vtcm_base + L.gate_off);
+          jb->dst_stride = inter;
+          hvx_worker_pool_submit(pool, hvx_dq_swiglu_worker, jb, np);
+        }
       }
-
-      /* down[e]'s transfer is waited for here, after a whole gate_up
-         matmul has run over it. Draining before the next push, not after,
-         is what keeps this wait off the gate_up prefetch below -- the ring
-         drains everything pending, so a push issued first would be waited
-         for too and the pipeline would collapse into a serial chain. */
+      /* The last epilogue has nothing to hide behind: requant needs all of
+         gate_off. */
+      HEXKL_PROBE_T0(p0);
+      hvx_worker_pool_wait(pool);
+      HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
 
       /* A is dead once the last block's gate_up matmul is done, so the next
          expert's first activation block and then its gate_up go out now
-         and ride under this block's SwiGLU, requantization and down matmul.
+         and ride under this block's requantization and down matmul.
          Activation first: it is what the next expert waits on before
          anything else, and queued behind 3.5 MB of gate_up that wait would
          cover the gate_up too. */
@@ -758,8 +788,8 @@ int hexkl_mm_u8i4_moe_layer_run(
           gu_ntiles, inter_ntiles, half, gu_idx);
       }
 
-      /* SwiGLU already happened inside the gate_up epilogue; gate_off holds
-         silu(gate)*up for this block. Requantize it for down. */
+      /* gate_off holds silu(gate)*up for this block. Requantize it for
+         down -- on the pool, synchronously: down's HMX needs all of mid. */
       HEXKL_PROBE_T0(p0);
       hvx_quant_rows_u8_params((const float *)(vtcm_base + L.gate_off), m_blk,
                                BR, inter, scale, zp, pool);
@@ -772,12 +802,14 @@ int hexkl_mm_u8i4_moe_layer_run(
       }
 
       /* --- down ---------------------------------------------------- */
-      /* Same batching as gate_up. One destination here, so the split is set
+      /* Same two-buffer pipeline. One destination, so the split is set
          past the last column and dst_b is never reached. */
       for (uint32_t nt0 = 0, ci = 0; nt0 < dn_ntiles;
            nt0 += L.acc_tiles, ++ci) {
         const uint32_t nb =
           (dn_ntiles - nt0 < L.acc_tiles) ? (dn_ntiles - nt0) : L.acc_tiles;
+        const uint32_t stage_off =
+          L.result_off + (ci & 1u) * L.acc_tiles * ACC_TILE_BYTES;
         if (mb == 0u) {
           HEXKL_PROBE_T0(p0);
           hexkl_dma_ring_wait(dn_idx[ci]);
@@ -795,8 +827,8 @@ int hexkl_mm_u8i4_moe_layer_run(
             }
           }
           HEXKL_PROBE_T0(p0);
-          rc = hexkl_micro_hmx_acc_read_int32(
-            vtcm_base, config_off, L.result_off + j * ACC_TILE_BYTES);
+          rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off,
+                                              stage_off + j * ACC_TILE_BYTES);
           HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
           if (rc != AEE_SUCCESS) {
             goto out;
@@ -805,36 +837,62 @@ int hexkl_mm_u8i4_moe_layer_run(
         MOE_MM_END();
 
         HEXKL_PROBE_T0(p0);
-        hvx_dequant_acc_tiles_to_f32(
-          (const uint8_t *)((const int32_t *)(vtcm_base + L.result_off) +
-                            acc->base),
-          ACC_TILE_BYTES, nb, nt0, acc->row_stride, m_blk, scale, zp,
-          d->colsum_w, d->w_scale, d->bias,
-          (float *)(vtcm_base + L.res_f32_off), NULL, N_out, N_out, pool);
+        hvx_worker_pool_wait(pool);
         HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
+        {
+          hvx_dq_tiles_job *jb = &dn_job[ci & 1u];
+          jb->tiles_base =
+            (const uint8_t *)((const int32_t *)(vtcm_base + stage_off) +
+                              acc->base);
+          jb->tile_stride = ACC_TILE_BYTES;
+          jb->nt0 = nt0;
+          jb->row_stride = acc->row_stride;
+          jb->m_count = m_blk;
+          jb->act_scale = scale;
+          jb->act_zp = zp;
+          jb->colsum_w = d->colsum_w;
+          jb->w_scale = d->w_scale;
+          jb->bias = d->bias;
+          jb->dst_a = (float *)(vtcm_base + L.res_f32_off);
+          jb->dst_b = NULL;
+          jb->split = N_out;
+          jb->dst_stride = N_out;
+          jb->n_tiles = nb;
+          hvx_worker_pool_submit(pool, hvx_dq_tiles_worker, jb, nb);
+        }
       }
+      HEXKL_PROBE_T0(p0);
+      hvx_worker_pool_wait(pool);
+      HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
 
       /* Routing multiply and scatter-add in one pass. The ARM side does
          these as two loops building a Tensor per token per expert (doc 44
          section 16.3); here the block is already in VTCM and the
-         destination row is one index away. */
-      HEXKL_PROBE_T0(p0);
-      {
-        moe_scatter_ctx sc = {
-          out_c,     (const float *)(vtcm_base + L.res_f32_off),
-          rows + mb, weights + mb,
-          m_blk,     N_out};
-        hvx_worker_pool_run(pool, moe_scatter_worker, &sc, m_blk);
-      }
-      HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);
+         destination row is one index away. Submitted, not run: it rides
+         under the next block's activation DMA and gate_up issue, and the
+         next block retires it before it touches res_f32. */
+      sc.out = out_c;
+      sc.res = (const float *)(vtcm_base + L.res_f32_off);
+      sc.rows = rows + mb;
+      sc.weights = weights + mb;
+      sc.n_rows = m_blk;
+      sc.N_out = N_out;
+      hvx_worker_pool_submit(pool, moe_scatter_worker, &sc, m_blk);
     }
   }
+
+  /* The last block's scatter. */
+  HEXKL_PROBE_T0(p0);
+  hvx_worker_pool_wait(pool);
+  HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);
 
   HEXKL_PROBE_T0(p0);
   moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0);
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
 
 out:
+  /* An error path may leave a job in flight over VTCM this call owns. */
+  hvx_worker_pool_wait(pool);
   /* Nothing to free: the scratch stays with the session. */
   return rc;
 }

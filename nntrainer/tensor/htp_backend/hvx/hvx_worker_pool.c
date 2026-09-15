@@ -50,7 +50,14 @@ struct hvx_worker_pool_s {
   _Atomic int killed;
   hvx_worker_pool_func func;
   void *ctx;
-  uint32_t n_threads; /**< participants (main + workers) for the current run */
+  uint32_t n_threads; /**< participants for the current job: main + workers
+                           for run, workers only for submit */
+  /** Nonzero while a submit's job is in flight. Workers read it under the
+      seqn acquire, so a job's mode is fixed before it is published: in a
+      submitted job the caller is not worker 0, and worker id k acts as
+      index k-1 of n_threads instead of index k. */
+  int async;
+  int outstanding; /**< caller-side: a submit not yet waited for */
   uint32_t n_workers;
   qurt_thread_t *tids;
   hvx_worker_ctx *worker_ctx;
@@ -74,9 +81,12 @@ static void hvx_worker_pool_thread_entry(void *arg) {
     }
     prev_seqn = seqn;
 
-    if (me->id < pool->n_threads) {
-      pool->func(pool->n_threads, me->id, pool->ctx);
-      atomic_fetch_sub_explicit(&pool->barrier, 1, memory_order_release);
+    {
+      const uint32_t idx = pool->async ? (me->id - 1u) : me->id;
+      if (idx < pool->n_threads) {
+        pool->func(pool->n_threads, idx, pool->ctx);
+        atomic_fetch_sub_explicit(&pool->barrier, 1, memory_order_release);
+      }
     }
     // me->id >= pool->n_threads: this run didn't need this worker; loop
     // back and wait for the next one.
@@ -163,8 +173,46 @@ void hvx_worker_pool_destroy(hvx_worker_pool *pool) {
   free(pool);
 }
 
+void hvx_worker_pool_wait(hvx_worker_pool *pool) {
+  if (!pool || !pool->outstanding) {
+    return;
+  }
+  while (atomic_load_explicit(&pool->barrier, memory_order_relaxed) > 0) {
+    hvx_worker_pool_pause();
+  }
+  atomic_thread_fence(memory_order_acquire);
+  pool->outstanding = 0;
+}
+
+void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
+                            void *ctx, uint32_t n_units) {
+  if (n_units == 0u) {
+    return;
+  }
+  if (!pool || pool->n_workers == 0) {
+    func(1u, 0, ctx); /* see run: one slice, the whole range */
+    return;
+  }
+  hvx_worker_pool_wait(pool);
+
+  uint32_t n = n_units;
+  if (n > pool->n_workers) {
+    n = pool->n_workers;
+  }
+  pool->func = func;
+  pool->ctx = ctx;
+  pool->n_threads = n;
+  pool->async = 1;
+  pool->outstanding = 1;
+  atomic_store_explicit(&pool->barrier, n, memory_order_relaxed);
+  /* Publish, then wake everyone -- run() explains why everyone. */
+  atomic_fetch_add_explicit(&pool->seqn, 1, memory_order_release);
+  qurt_futex_wake(&pool->seqn, (int)pool->n_workers);
+}
+
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units) {
+  hvx_worker_pool_wait(pool);
   if (!pool || pool->n_workers == 0 || n_units <= 1) {
     /* ONE slice, not n_units of them. func(n_units, 0, ctx) means "act as
        worker 0 of n_units", so with no pool it ran 1/n_units of the work
@@ -186,6 +234,7 @@ void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
   pool->func = func;
   pool->ctx = ctx;
   pool->n_threads = n;
+  pool->async = 0;
   atomic_store_explicit(&pool->barrier, n - 1u, memory_order_relaxed);
 
   // Publish the job, then wake every worker -- not just the n-1 that will

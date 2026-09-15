@@ -9,6 +9,7 @@
 #include "hexkl_dma_ring.h"
 #include "hexkl_mm_u8i4_moe.h"
 #include "hexkl_probe.h"
+#include "hvx_dequant_i32.h"
 #include "hvx_gather_ah_u8.h"
 #include "hvx_scale_add_f32.h"
 #include <AEEStdErr.h>
@@ -163,6 +164,18 @@ void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
      and does 1/n_units of the work. */
   func(1u, 0, ctx);
 }
+/* submit runs the job to completion on the spot and wait is a no-op: the
+   harness cannot exercise the overlap, only that every job is submitted
+   with the right buffer and retired before that buffer is reused -- which
+   a job that ran late would show as a wrong result on device and cannot
+   show here. The device tests are where the ordering is checked. */
+void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
+                            void *ctx, uint32_t n_units) {
+  (void)pool;
+  if (n_units != 0u)
+    func(1u, 0, ctx);
+}
+void hvx_worker_pool_wait(hvx_worker_pool *pool) { (void)pool; }
 
 void hvx_copy_ah_block(uint8_t *dst, const uint8_t *src, uint32_t k,
                        hvx_worker_pool *pool) {
@@ -182,61 +195,55 @@ void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
     dst[i] = dst[i] + p;
   }
 }
-/* Scalar stand-in for the fused gate/up dequant + SwiGLU. Same policy as
-   the batch dequant stand-in below: a loop over the per-tile stand-in, so
-   what is checked is the kernel's pairing arithmetic -- that staged slot j
-   is gate column g0+j and slot n_pairs+j the up column opposite it -- not
-   the arithmetic of SwiGLU, which the device gates cover bit for bit. */
-void hvx_dequant_swiglu_acc_tiles_to_f32(
-  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_pairs,
-  uint32_t g0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
-  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
-  const float *bias, uint32_t inter, float *dst, uint32_t dst_stride,
-  hvx_worker_pool *pool) {
-  (void)pool;
+/* Scalar stand-in for the fused gate/up dequant + SwiGLU job. Same policy
+   as the batch dequant stand-in below: a loop over the per-tile stand-in,
+   so what is checked is the kernel's pairing arithmetic -- that staged
+   slot j is gate column g0+j and slot n_pairs+j the up column opposite it
+   -- not the arithmetic of SwiGLU, which the device gates cover bit for
+   bit. */
+void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
+  const hvx_dq_swiglu_job *c = (const hvx_dq_swiglu_job *)vjob;
+  (void)n_threads;
+  (void)i;
   float gt[64 * 32], ut[64 * 32];
-  for (uint32_t j = 0; j < n_pairs; ++j) {
-    const uint32_t cg = (g0 + j) * 32u, cu = inter + cg;
+  for (uint32_t j = 0; j < c->n_pairs; ++j) {
+    const uint32_t cg = (c->g0 + j) * 32u, cu = c->inter + cg;
     hvx_dequant_acc_tile_to_f32(
-      (const int32_t *)(tiles_base + (size_t)j * tile_stride), row_stride,
-      m_count, act_scale, act_zp, colsum_w + cg, w_scale + cg, bias + cg, gt,
-      32u, 0);
+      (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride),
+      c->row_stride, c->m_count, c->act_scale, c->act_zp, c->colsum_w + cg,
+      c->w_scale + cg, c->bias + cg, gt, 32u, 0);
     hvx_dequant_acc_tile_to_f32(
-      (const int32_t *)(tiles_base + (size_t)(n_pairs + j) * tile_stride),
-      row_stride, m_count, act_scale, act_zp, colsum_w + cu, w_scale + cu,
-      bias + cu, ut, 32u, 0);
-    for (uint32_t r = 0; r < m_count; ++r)
-      for (uint32_t c = 0; c < 32u; ++c) {
-        const float g = gt[r * 32u + c];
-        dst[(size_t)r * dst_stride + cg + c] =
-          g / (1.f + expf(-g)) * ut[r * 32u + c];
+      (const int32_t *)(c->tiles_base +
+                        (size_t)(c->n_pairs + j) * c->tile_stride),
+      c->row_stride, c->m_count, c->act_scale, c->act_zp, c->colsum_w + cu,
+      c->w_scale + cu, c->bias + cu, ut, 32u, 0);
+    for (uint32_t r = 0; r < c->m_count; ++r)
+      for (uint32_t k = 0; k < 32u; ++k) {
+        const float g = gt[r * 32u + k];
+        c->dst[(size_t)r * c->dst_stride + cg + k] =
+          g / (1.f + expf(-g)) * ut[r * 32u + k];
       }
   }
 }
-/* Scalar stand-in for the pooled batch dequant. Deliberately a loop over
-   the per-tile stand-in above, exactly as the real one is a pooled loop over
-   the real per-tile kernel: what this harness can check is the kernel's
-   batching arithmetic -- which tile lands at which staged slot, which column
-   it carries, and which side of the gate/up split it belongs to -- and a
-   stand-in that recomputed the dequant itself would check the stand-in. */
-void hvx_dequant_acc_tiles_to_f32(const uint8_t *tiles_base,
-                                  uint32_t tile_stride, uint32_t n_tiles,
-                                  uint32_t nt0, uint32_t row_stride,
-                                  uint32_t m_count, const float *act_scale,
-                                  const int32_t *act_zp,
-                                  const int32_t *colsum_w,
-                                  const float *w_scale, const float *bias,
-                                  float *dst_a, float *dst_b, uint32_t split,
-                                  uint32_t dst_stride, hvx_worker_pool *pool) {
-  (void)pool;
-  for (uint32_t j = 0; j < n_tiles; ++j) {
-    const uint32_t c0 = (nt0 + j) * 32u;
+/* Scalar stand-in for the pooled batch dequant job. Deliberately a loop
+   over the per-tile stand-in above, exactly as the real one is a pooled
+   loop over the real per-tile kernel: what this harness can check is the
+   kernel's batching arithmetic -- which tile lands at which staged slot,
+   which column it carries -- and a stand-in that recomputed the dequant
+   itself would check the stand-in. */
+void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *vjob) {
+  const hvx_dq_tiles_job *c = (const hvx_dq_tiles_job *)vjob;
+  (void)n_threads;
+  (void)i;
+  for (uint32_t j = 0; j < c->n_tiles; ++j) {
+    const uint32_t c0 = (c->nt0 + j) * 32u;
     const int32_t *tile =
-      (const int32_t *)(tiles_base + (size_t)j * tile_stride);
-    float *out = (c0 < split) ? (dst_a + c0) : (dst_b + (c0 - split));
-    hvx_dequant_acc_tile_to_f32(tile, row_stride, m_count, act_scale, act_zp,
-                                colsum_w + c0, w_scale + c0, bias + c0, out,
-                                dst_stride, 0);
+      (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
+    float *out =
+      (c0 < c->split) ? (c->dst_a + c0) : (c->dst_b + (c0 - c->split));
+    hvx_dequant_acc_tile_to_f32(tile, c->row_stride, c->m_count, c->act_scale,
+                                c->act_zp, c->colsum_w + c0, c->w_scale + c0,
+                                c->bias + c0, out, c->dst_stride, 0);
   }
 }
 
@@ -343,9 +350,10 @@ int main(void) {
   hexkl_moe_layout L;
   int rc = hexkl_mm_u8i4_moe_layout(K, inter, N_out, sizeof vtcm, &L);
   printf(
-    "layout rc=%d total=%u (act %u gu %u dn %u gate %u up %u mid %u res %u)\n",
-    rc, L.total, L.act_off, L.w_gu_off, L.w_dn_off, L.gate_off, L.up_off,
-    L.mid_off, L.result_off);
+    "layout rc=%d total=%u (act %u gu %u dn %u gate %u mid %u stage %u res "
+    "%u)\n",
+    rc, L.total, L.act_off, L.w_gu_off, L.w_dn_off, L.gate_off, L.mid_off,
+    L.result_off, L.res_f32_off);
   if (rc)
     return 1;
 
@@ -495,8 +503,9 @@ int main(void) {
   {
     hexkl_moe_layout R;
     int r = hexkl_mm_u8i4_moe_layout(2048, 1792, 2048, 8300u * 1024u, &R);
-    printf("LFM2 shapes       : rc=%d total=%.2f MB (doc 46 section 28 says 6.61)\n", r,
-           R.total / 1048576.0);
+    printf("LFM2 shapes       : rc=%d total=%.2f MB (doc 47 section 11 says "
+           "6.92)\n",
+           r, R.total / 1048576.0);
     fail |= (r != 0);
     r = hexkl_mm_u8i4_moe_layout(2048, 1792, 2048, 4u << 20, &R);
     printf("4 MB arena        : rc=%d (want %d)\n", r, AEE_ENOMEMORY);

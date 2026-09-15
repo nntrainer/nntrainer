@@ -119,6 +119,56 @@ void hvx_dequant_acc_tiles_to_f32(const uint8_t *tiles_base,
                                   uint32_t dst_stride, hvx_worker_pool *pool);
 
 /**
+ * @brief The batch dequant as a job the caller owns, so it can run on the
+ *        pool's workers (hvx_worker_pool_submit) while the caller issues
+ *        the next batch's HMX tiles. Fields are
+ *        hvx_dequant_acc_tiles_to_f32's arguments; that function is this
+ *        job run synchronously. Units for the submit: n_tiles.
+ */
+typedef struct {
+  const uint8_t *tiles_base;
+  uint32_t tile_stride;
+  uint32_t nt0;
+  uint32_t row_stride;
+  uint32_t m_count;
+  const float *act_scale;
+  const int32_t *act_zp;
+  const int32_t *colsum_w;
+  const float *w_scale;
+  const float *bias;
+  float *dst_a;
+  float *dst_b;
+  uint32_t split;
+  uint32_t dst_stride;
+  uint32_t n_tiles;
+} hvx_dq_tiles_job;
+
+/** @brief hvx_worker_pool_func over an hvx_dq_tiles_job. */
+void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *job);
+
+/** @brief Same, for the fused gate/up dequant + SwiGLU below. Units for
+ *         the submit: n_pairs. */
+typedef struct {
+  const uint8_t *tiles_base;
+  uint32_t tile_stride;
+  uint32_t n_pairs;
+  uint32_t g0;
+  uint32_t row_stride;
+  uint32_t m_count;
+  const float *act_scale;
+  const int32_t *act_zp;
+  const int32_t *colsum_w;
+  const float *w_scale;
+  const float *bias;
+  uint32_t inter;
+  float *dst;
+  uint32_t dst_stride;
+} hvx_dq_swiglu_job;
+
+/** @brief hvx_worker_pool_func over an hvx_dq_swiglu_job. */
+void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *job);
+
+/**
  * @brief Dequantizes gate/up tile PAIRS and applies SwiGLU before anything
  *        is stored: dst = silu(gate) * up, one vector at a time.
  *

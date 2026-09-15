@@ -141,26 +141,8 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
 
 /* ---- pooled dequant over a run of staged tiles --------------------------- */
 
-typedef struct {
-  const uint8_t *tiles_base;
-  uint32_t tile_stride;
-  uint32_t nt0;
-  uint32_t row_stride;
-  uint32_t m_count;
-  const float *act_scale;
-  const int32_t *act_zp;
-  const int32_t *colsum_w;
-  const float *w_scale;
-  const float *bias;
-  float *dst_a;
-  float *dst_b;
-  uint32_t split;
-  uint32_t dst_stride;
-  uint32_t n_tiles;
-} dq_tiles_ctx;
-
-static void dq_tiles_worker(uint32_t n_threads, uint32_t i, void *vctx) {
-  const dq_tiles_ctx *c = (const dq_tiles_ctx *)vctx;
+void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *vctx) {
+  const hvx_dq_tiles_job *c = (const hvx_dq_tiles_job *)vctx;
   const uint32_t lo = (uint32_t)((uint64_t)c->n_tiles * i / n_threads);
   const uint32_t hi = (uint32_t)((uint64_t)c->n_tiles * (i + 1) / n_threads);
 
@@ -192,10 +174,10 @@ void hvx_dequant_acc_tiles_to_f32(const uint8_t *tiles_base,
   if (!tiles_base || n_tiles == 0u || m_count == 0u) {
     return;
   }
-  dq_tiles_ctx c = {tiles_base, tile_stride, nt0,   row_stride, m_count,
-                    act_scale,  act_zp,      colsum_w, w_scale, bias,
-                    dst_a,      dst_b,       split, dst_stride, n_tiles};
-  hvx_worker_pool_run(pool, dq_tiles_worker, &c, n_tiles);
+  hvx_dq_tiles_job c = {tiles_base, tile_stride, nt0,      row_stride, m_count,
+                        act_scale,  act_zp,      colsum_w, w_scale,    bias,
+                        dst_a,      dst_b,       split,    dst_stride, n_tiles};
+  hvx_worker_pool_run(pool, hvx_dq_tiles_worker, &c, n_tiles);
 }
 
 /* ---- fused dequant + SwiGLU over gate/up tile pairs ---------------------- */
@@ -218,25 +200,8 @@ static inline HVX_Vector dq_row_sf(const int32_t *row, float act_scale,
     vbias);
 }
 
-typedef struct {
-  const uint8_t *tiles_base;
-  uint32_t tile_stride;
-  uint32_t n_pairs;
-  uint32_t g0;
-  uint32_t row_stride;
-  uint32_t m_count;
-  const float *act_scale;
-  const int32_t *act_zp;
-  const int32_t *colsum_w;
-  const float *w_scale;
-  const float *bias;
-  uint32_t inter;
-  float *dst;
-  uint32_t dst_stride;
-} dq_swiglu_ctx;
-
-static void dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
-  const dq_swiglu_ctx *c = (const dq_swiglu_ctx *)vctx;
+void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
+  const hvx_dq_swiglu_job *c = (const hvx_dq_swiglu_job *)vctx;
   const uint32_t lo = (uint32_t)((uint64_t)c->n_pairs * i / n_threads);
   const uint32_t hi = (uint32_t)((uint64_t)c->n_pairs * (i + 1) / n_threads);
 
@@ -281,8 +246,8 @@ void hvx_dequant_swiglu_acc_tiles_to_f32(
   if (!tiles_base || n_pairs == 0u || m_count == 0u) {
     return;
   }
-  dq_swiglu_ctx c = {tiles_base, tile_stride, n_pairs, g0,    row_stride,
-                     m_count,    act_scale,   act_zp,  colsum_w, w_scale,
-                     bias,       inter,       dst,     dst_stride};
-  hvx_worker_pool_run(pool, dq_swiglu_worker, &c, n_pairs);
+  hvx_dq_swiglu_job c = {tiles_base, tile_stride, n_pairs,  g0,      row_stride,
+                         m_count,    act_scale,   act_zp,   colsum_w, w_scale,
+                         bias,       inter,       dst,      dst_stride};
+  hvx_worker_pool_run(pool, hvx_dq_swiglu_worker, &c, n_pairs);
 }

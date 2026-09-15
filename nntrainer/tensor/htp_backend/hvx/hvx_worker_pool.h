@@ -54,4 +54,25 @@ void hvx_worker_pool_destroy(hvx_worker_pool *pool);
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units);
 
+/**
+ * @brief Starts func(n, i, ctx) for i in [0, n) on the WORKERS ONLY and
+ *        returns at once; the calling thread is free to do other work --
+ *        issue HMX tiles -- until hvx_worker_pool_wait.
+ *
+ * n = min(n_units, pool's worker count): the caller is not worker 0 here,
+ * so a pool with no workers (or NULL, or n_units == 0) runs func once
+ * inline before returning, and the wait is then a no-op. @a ctx must stay
+ * valid until the wait. One job in flight at a time: a submit while one is
+ * outstanding waits for it first, as does hvx_worker_pool_run.
+ *
+ * Same single-owner rule as run.
+ */
+void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
+                            void *ctx, uint32_t n_units);
+
+/** @brief Blocks until the job from hvx_worker_pool_submit has finished and
+ *         its writes are visible to the caller. No-op with nothing in
+ *         flight. */
+void hvx_worker_pool_wait(hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_WORKER_POOL_H__ */
