@@ -26,6 +26,7 @@
 #ifndef __NNTRAINER_HEXKL_MM_U8I4_MOE_H__
 #define __NNTRAINER_HEXKL_MM_U8I4_MOE_H__
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "hexkl_mm_u8i4_dma.h"
@@ -72,6 +73,27 @@ int hexkl_mm_u8i4_moe_layout(uint32_t K, uint32_t inter, uint32_t N_out,
                              uint32_t arena_bytes, hexkl_moe_layout *out);
 
 /**
+ * @brief The layer call's heap scratch, kept across calls.
+ *
+ * A call needs about 12.8 MB at prefill (the slot-ordered activation, a
+ * cached copy of the activation, the output) and a few KB of tables.
+ * Allocated and freed per call, that cost 3.0 ms of a 28 ms prefill call
+ * on the DSP heap (HEXKL_PROBE_ALLOC, doc 46 section 50.2 P1) -- not
+ * computation, page-in and heap bookkeeping. So the block lives with the
+ * session and only grows: whatever prefill needed stays for decode, which
+ * needs a twentieth of it. Zero-initialised is empty; free with
+ * hexkl_moe_scratch_free.
+ */
+typedef struct {
+  void *raw;     /**< what malloc returned, for free() */
+  uint8_t *base; /**< raw rounded up to 128 bytes */
+  size_t cap;    /**< usable bytes from base */
+} hexkl_moe_scratch;
+
+/** @brief Releases the block. Safe on an empty scratch. */
+void hexkl_moe_scratch_free(hexkl_moe_scratch *s);
+
+/**
  * @brief One MoE FFN layer: routing, every expert, and the scatter-add.
  *
  * out_f32 is zeroed here and accumulated into, because experts share token
@@ -85,6 +107,7 @@ int hexkl_mm_u8i4_moe_layout(uint32_t K, uint32_t inter, uint32_t N_out,
  * @param[in] row_weight  [n_rows] routing weight for each entry
  * @param[in] act_f32     [M x K]
  * @param[out] out_f32    [M x N_out]
+ * @param[in,out] scratch session-lifetime heap scratch; grown here as needed
  * @return AEE_SUCCESS, or the first failing stage's code
  */
 int hexkl_mm_u8i4_moe_layer_run(
@@ -92,6 +115,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint32_t config_off, uint32_t M, uint32_t K, uint32_t inter, uint32_t N_out,
   uint32_t n_experts, const uint32_t *h_gate_up, const uint32_t *h_down,
   const uint32_t *row_index, const uint32_t *row_count, const float *row_weight,
-  const float *act_f32, float *out_f32, hvx_worker_pool *pool);
+  const float *act_f32, float *out_f32, hvx_worker_pool *pool,
+  hexkl_moe_scratch *scratch);
 
 #endif /* __NNTRAINER_HEXKL_MM_U8I4_MOE_H__ */

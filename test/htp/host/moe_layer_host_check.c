@@ -356,9 +356,12 @@ int main(void) {
   }
 
   float *got = (float *)malloc(sizeof(float) * M * N_out);
+  /* One scratch across every call below, the way the session holds it: the
+     later, smaller calls must work out of the block the first one grew. */
+  hexkl_moe_scratch scratch = {NULL, NULL, 0};
   rc = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K,
                                    inter, N_out, NE, hg, hd, ridx, rc_, rw, act,
-                                   got, NULL);
+                                   got, NULL, &scratch);
   printf("run rc=%d  n_rows=%u\n", rc, n_rows);
   if (rc)
     return 1;
@@ -439,7 +442,7 @@ int main(void) {
     memset(got, 0xA5, sizeof(float) * M * N_out);
     int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
                                         M, K, inter, N_out, NE, hg, hd, ridx, z,
-                                        rw, act, got, NULL);
+                                        rw, act, got, NULL, &scratch);
     int ok = (r == 0);
     for (uint32_t i = 0; i < M * N_out; ++i) {
       if (got[i] != 0.f) {
@@ -454,7 +457,7 @@ int main(void) {
     uint32_t c64[8] = {64, 0, 0, 0, 0};
     int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
                                         M, K, inter, N_out, NE, hg, hd, ridx,
-                                        c64, rw, act, got, NULL);
+                                        c64, rw, act, got, NULL, &scratch);
     printf("exactly 64 rows   : rc=%d\n", r);
     fail |= (r != 0);
   }
@@ -463,7 +466,7 @@ int main(void) {
     uint32_t bad_row[1] = {M};
     int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
                                         M, K, inter, N_out, NE, hg, hd, bad_row,
-                                        c1, rw, act, got, NULL);
+                                        c1, rw, act, got, NULL, &scratch);
     printf("row_index >= M    : rc=%d (want %d)\n", r, AEE_EBADPARM);
     fail |= (r != AEE_EBADPARM);
   }
@@ -478,5 +481,6 @@ int main(void) {
     fail |= (r != AEE_ENOMEMORY);
   }
   printf(fail ? "\nFAIL\n" : "\nALL CHECKS PASS\n");
+  hexkl_moe_scratch_free(&scratch);
   return fail;
 }

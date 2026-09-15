@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include "hexkl_mm_u8i4_dma.h"
+#include "hexkl_mm_u8i4_moe.h"
 #include "hexkl_mm_u8i8_dma.h"
 #include "hvx_worker_pool.h"
 
@@ -56,6 +57,8 @@ typedef struct {
   hexkl_weight_u8i8_table weights_u8i8;
   hvx_worker_pool *quant_pool; /**< sized from the HVX unit count in open() */
   nntr_hvx_arena arenas[NNTR_HVX_MAX_ARENAS];
+  hexkl_moe_scratch moe_scratch; /**< the MoE layer call's heap scratch,
+                                      grown on demand, freed in close() */
 } nntr_hvx_session;
 
 /** @brief HAP_mmap_put on every attached arena. close() calls it after the

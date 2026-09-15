@@ -49,6 +49,45 @@
 #include "hvx_swiglu_f32.h"
 
 #define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
+#define ROUND_UP_SZ(v, a) ((((v) + ((a)-1)) / (a)) * (a))
+
+/** @brief Every carve starts on a 128-byte boundary: the slot-ordered
+ *         activation is a DMA source and the HVX passes read the rest. */
+#define MOE_SCRATCH_ALIGN 128u
+
+void hexkl_moe_scratch_free(hexkl_moe_scratch *s) {
+  if (s) {
+    free(s->raw);
+    s->raw = NULL;
+    s->base = NULL;
+    s->cap = 0;
+  }
+}
+
+/** @brief Grows the scratch to @a bytes; a no-op once it is big enough,
+ *         which after the first prefill call is every call. */
+static int moe_scratch_reserve(hexkl_moe_scratch *s, size_t bytes) {
+  if (s->cap >= bytes) {
+    return AEE_SUCCESS;
+  }
+  hexkl_moe_scratch_free(s);
+  s->raw = malloc(bytes + MOE_SCRATCH_ALIGN);
+  if (!s->raw) {
+    return AEE_ENOMEMORY;
+  }
+  s->base = (uint8_t *)(((uintptr_t)s->raw + (MOE_SCRATCH_ALIGN - 1u)) &
+                        ~(uintptr_t)(MOE_SCRATCH_ALIGN - 1u));
+  s->cap = bytes;
+  return AEE_SUCCESS;
+}
+
+/** @brief Hands out the next @a bytes of the scratch, aligned. The caller
+ *         summed the same sizes through moe_scratch_reserve first. */
+static void *moe_carve(uint8_t **cur, size_t bytes) {
+  void *p = *cur;
+  *cur += ROUND_UP_SZ(bytes, MOE_SCRATCH_ALIGN);
+  return p;
+}
 
 /** @brief Kept in sync with hexkl_mm_u8i4_dma.c's copies by inspection, the
  *         same file-scoped constant practice that file documents. */
@@ -304,10 +343,12 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint32_t config_off, uint32_t M, uint32_t K, uint32_t inter, uint32_t N_out,
   uint32_t n_experts, const uint32_t *h_gate_up, const uint32_t *h_down,
   const uint32_t *row_index, const uint32_t *row_count, const float *row_weight,
-  const float *act_f32, float *out_f32, hvx_worker_pool *pool) {
+  const float *act_f32, float *out_f32, hvx_worker_pool *pool,
+  hexkl_moe_scratch *scratch) {
 
   if (!tbl || !vtcm_base || !h_gate_up || !h_down || !row_index || !row_count ||
-      !row_weight || !act_f32 || !out_f32 || M == 0u || n_experts == 0u) {
+      !row_weight || !act_f32 || !out_f32 || !scratch || M == 0u ||
+      n_experts == 0u) {
     return AEE_EBADPARM;
   }
 
@@ -368,9 +409,9 @@ int hexkl_mm_u8i4_moe_layer_run(
 
   /* Scratch on the DSP heap, not VTCM: these are per-block staging areas
      read and written once each, so VTCM buys them nothing and the arena is
-     the scarce resource. */
-  float *scale = (float *)malloc(sizeof(float) * BR);
-  int32_t *zp = (int32_t *)malloc(sizeof(int32_t) * BR);
+     the scarce resource. All of it is carved from one session-lifetime
+     block (hexkl_moe_scratch): allocating and freeing the ~12.8 MB a
+     prefill call needs cost 3.0 ms of the call, and the block only grows. */
   /* The whole activation, quantized once. hvx_quant_pack_u8_ah writes it,
      so a row's bytes are exactly what quantizing that row inside any expert
      block would have produced -- row quantization is independent of how
@@ -384,15 +425,6 @@ int hexkl_mm_u8i4_moe_layer_run(
   for (uint32_t e = 0; e < n_experts; ++e) {
     n_slots += ROUND_UP_U32(row_count[e], HEXKL_HMX_INT8_BLOCK_N_ROW);
   }
-  uint64_t p_alloc = 0;
-  HEXKL_PROBE_T0(p_alloc);
-  uint8_t *act_ah = (uint8_t *)malloc((size_t)n_slots * K);
-  uint32_t *slot_row = (uint32_t *)malloc(sizeof(uint32_t) * n_slots);
-  uint32_t *slot_of = (uint32_t *)malloc(sizeof(uint32_t) * n_experts);
-  float *slot_scale = (float *)malloc(sizeof(float) * n_slots);
-  int32_t *slot_zp = (int32_t *)malloc(sizeof(int32_t) * n_slots);
-  float *scale_all = (float *)malloc(sizeof(float) * m_pad);
-  int32_t *zp_all = (int32_t *)malloc(sizeof(int32_t) * m_pad);
   /* act_f32 and out_f32 are the host's FastRPC buffers, which are rpcmem
      and therefore UNCACHED. The gather reads M*K*4 bytes of act four times
      over at top-4 routing, and the scatter is a read-modify-write of
@@ -401,28 +433,54 @@ int hexkl_mm_u8i4_moe_layer_run(
      against 3.6 and 2.8 for the path this replaces (doc 46 section 10).
      Same axis Q1 broke on, doc 44 section 10.1.
      So each is touched exactly once, sequentially: act is copied in at the
-     start and out is copied out at the end, and everything in between
-     works on cached heap. */
-  float *act_c = (float *)malloc(sizeof(float) * (size_t)M * K);
-  float *out_c = (float *)malloc(sizeof(float) * (size_t)M * N_out);
-  uint32_t *order = (uint32_t *)malloc(sizeof(uint32_t) * n_experts);
-  /* row_index is grouped by expert, so each active expert needs the offset
-     its group starts at. Heap, not a stack array sized by
-     HEXKL_MM_U8I4_MAX_WEIGHTS: that constant is 2048 and has nothing to do
-     with how many experts this layer has. */
-  uint32_t *base_of = (uint32_t *)malloc(sizeof(uint32_t) * n_experts);
+     start (act_c) and out is copied out at the end (out_c), and everything
+     in between works on cached heap. */
+  /* Sizes once, in carve order; the sum is what the scratch must hold.
+     order / base_of / slot_of are per-expert tables on the heap rather
+     than stack arrays sized by HEXKL_MM_U8I4_MAX_WEIGHTS: that constant is
+     2048 and has nothing to do with how many experts this layer has. */
+  const size_t sz_scale = sizeof(float) * BR;
+  const size_t sz_zp = sizeof(int32_t) * BR;
+  const size_t sz_act_ah = (size_t)n_slots * K;
+  const size_t sz_slot_u32 = sizeof(uint32_t) * n_slots;
+  const size_t sz_expert_u32 = sizeof(uint32_t) * n_experts;
+  const size_t sz_mpad_u32 = sizeof(uint32_t) * m_pad;
+  const size_t sz_act_c = sizeof(float) * (size_t)M * K;
+  const size_t sz_out_c = sizeof(float) * (size_t)M * N_out;
+  const size_t need = ROUND_UP_SZ(sz_scale, MOE_SCRATCH_ALIGN) +
+                      ROUND_UP_SZ(sz_zp, MOE_SCRATCH_ALIGN) +
+                      ROUND_UP_SZ(sz_act_ah, MOE_SCRATCH_ALIGN) +
+                      3u * ROUND_UP_SZ(sz_slot_u32, MOE_SCRATCH_ALIGN) +
+                      3u * ROUND_UP_SZ(sz_expert_u32, MOE_SCRATCH_ALIGN) +
+                      2u * ROUND_UP_SZ(sz_mpad_u32, MOE_SCRATCH_ALIGN) +
+                      ROUND_UP_SZ(sz_act_c, MOE_SCRATCH_ALIGN) +
+                      ROUND_UP_SZ(sz_out_c, MOE_SCRATCH_ALIGN);
+  uint64_t p_alloc = 0;
+  HEXKL_PROBE_T0(p_alloc);
+  rc = moe_scratch_reserve(scratch, need);
+  HEXKL_PROBE_ADD(HEXKL_PROBE_ALLOC, p_alloc);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  uint8_t *cur = scratch->base;
+  float *scale = (float *)moe_carve(&cur, sz_scale);
+  int32_t *zp = (int32_t *)moe_carve(&cur, sz_zp);
+  uint8_t *act_ah = (uint8_t *)moe_carve(&cur, sz_act_ah);
+  uint32_t *slot_row = (uint32_t *)moe_carve(&cur, sz_slot_u32);
+  float *slot_scale = (float *)moe_carve(&cur, sz_slot_u32);
+  int32_t *slot_zp = (int32_t *)moe_carve(&cur, sz_slot_u32);
+  uint32_t *slot_of = (uint32_t *)moe_carve(&cur, sz_expert_u32);
+  uint32_t *order = (uint32_t *)moe_carve(&cur, sz_expert_u32);
+  uint32_t *base_of = (uint32_t *)moe_carve(&cur, sz_expert_u32);
+  float *scale_all = (float *)moe_carve(&cur, sz_mpad_u32);
+  int32_t *zp_all = (int32_t *)moe_carve(&cur, sz_mpad_u32);
+  float *act_c = (float *)moe_carve(&cur, sz_act_c);
+  float *out_c = (float *)moe_carve(&cur, sz_out_c);
   uint32_t n_active = 0u;
   uint64_t p0 = 0;
   /* MOE_MM_BEGIN/END's state. See the macros above hexkl_mm_u8i4_moe_layout
      for why the HMX issue loop is timed by difference. */
   uint64_t mm_t0 = 0, mm_acc0 = 0, mm_dq0 = 0;
-  HEXKL_PROBE_ADD(HEXKL_PROBE_ALLOC, p_alloc);
-  if (!scale || !zp || !act_ah || !slot_row || !slot_of || !slot_scale ||
-      !slot_zp || !scale_all || !zp_all || !order || !base_of || !act_c ||
-      !out_c) {
-    rc = AEE_ENOMEMORY;
-    goto out;
-  }
 
   /* The experts that actually have rows, in order. The DMA pipeline below
      hands each expert's gate_up transfer to its predecessor, so a skipped
@@ -730,20 +788,6 @@ int hexkl_mm_u8i4_moe_layer_run(
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
 
 out:
-  HEXKL_PROBE_T0(p_alloc);
-  free(scale);
-  free(zp);
-  free(act_ah);
-  free(slot_row);
-  free(slot_of);
-  free(slot_scale);
-  free(slot_zp);
-  free(scale_all);
-  free(zp_all);
-  free(order);
-  free(base_of);
-  free(act_c);
-  free(out_c);
-  HEXKL_PROBE_ADD(HEXKL_PROBE_ALLOC, p_alloc);
+  /* Nothing to free: the scratch stays with the session. */
   return rc;
 }
