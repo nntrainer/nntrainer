@@ -245,7 +245,17 @@ int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *row_map,
                                 uint8_t *out_ah, hvx_worker_pool *pool) {
   const uint32_t n_ktiles = k / TILE_INNER;
 
-  memset(out_ah, 0, (size_t)m_pad * k);
+  /* Every row below m_valid is written below, so only the padding rows
+     need zeroing, and in the AH layout those share their 64-row block with
+     the last valid rows: clearing that one block (at most 64 * k bytes)
+     before the pack keeps every caller's bytes identical to clearing all
+     of it. The MoE layer passes m_valid == m_pad (a whole number of
+     blocks), so it clears nothing -- the 6 MB memset it paid per prefill
+     call (doc 47) is gone. */
+  if (m_valid < m_pad) {
+    const size_t last_blk = (size_t)(m_valid / TILE_ROW) * TILE_ROW;
+    memset(out_ah + last_blk * k, 0, (size_t)(m_pad - last_blk) * k);
+  }
 
   // Four rows at a time: TILE_ROW (64) is a multiple of 4, so a group of 4
   // consecutive rows never straddles a row-block boundary, and the group's
