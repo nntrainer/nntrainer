@@ -2614,6 +2614,118 @@ TEST_F(HmxMmU8I8Layer, ReportPerCallCostVsU8I4) {
 /**
  * @brief Main gtest
  */
+/**
+ * @brief Where the DSP's address space ends, and whether its heap is a
+ *        separate budget from its mappings.
+ *
+ * The model needs 3.61 GiB of weights DSP-resident. A device run mapped
+ * exactly 3.00 GiB with fastrpc_mmap and was then refused at every size down
+ * to 64 MiB (doc 46 section 40), so the mapping budget is spent. The DSP heap
+ * was untouched in that run -- every weight went to the arena -- and Gate 0
+ * measured that heap reaching 1.89 GB, which is three times the 0.61 GiB
+ * still needed.
+ *
+ * So: are the two the same exhausted address space, or two regions of it?
+ * The answer decides between a small change (overflow the last weights onto
+ * the heap) and a large one (a second PD, or a smaller model), and nothing
+ * on the device reports it. This fills the mapping budget and then asks the
+ * heap for weights until it refuses too.
+ *
+ * Not gated -- there is no right answer to assert, only a number to read.
+ * Allocates and frees every buffer it takes; at 256 MiB a step it holds the
+ * whole mapping budget at once, which is the point.
+ */
+TEST_F(HmxMmU8I4Layer, ArenaCeilingThenHeapHeadroom) {
+  auto field = [](const char *k, const std::string &v) {
+    std::cout << "U8I4_FIELD path=ceiling field=" << k << " value=" << v
+              << "\n";
+  };
+
+  auto alloc =
+    (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+  auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+  auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+  using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
+  using FastrpcMunmap = int (*)(int, int, void *, size_t);
+  auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
+  auto fmunmap = (FastrpcMunmap)dlsym(RTLD_DEFAULT, "fastrpc_munmap");
+  if (!alloc || !rfree || !to_fd || !fmmap) {
+    GTEST_SKIP() << "rpcmem/fastrpc_mmap not available";
+  }
+
+  // 256 MiB a step: fine enough to land within a quarter GiB of the real
+  // ceiling, coarse enough that filling ~3 GiB is a dozen calls.
+  const size_t kStep = size_t(256) << 20;
+  struct Mapped {
+    void *buf;
+    int fd;
+    size_t bytes;
+  };
+  std::vector<Mapped> mapped;
+  size_t total = 0;
+  int last_rc = 0;
+  for (int i = 0; i < 32; ++i) {
+    void *buf = alloc(25 /*RPCMEM_HEAP_ID_SYSTEM*/, 0 /*UNCACHED*/,
+                      static_cast<int>(kStep));
+    if (buf == nullptr) {
+      field("stopped_by", "rpcmem_alloc"); // host ION, not the DSP
+      break;
+    }
+    const int fd = to_fd(buf);
+    last_rc = fmmap(CDSP_DOMAIN_ID, fd, buf, 0, kStep,
+                    static_cast<int>(FASTRPC_MAP_FD));
+    if (last_rc != 0) {
+      rfree(buf);
+      field("stopped_by", "fastrpc_mmap");
+      field("last_mmap_rc", hex(last_rc));
+      break;
+    }
+    mapped.push_back(Mapped{buf, fd, kStep});
+    total += kStep;
+  }
+  field("mmap_ceiling_mib", std::to_string(total >> 20));
+
+  // Now the heap, with the mapping budget held. weight_register_u8i4 bakes,
+  // so each call leaves (K/32)*(N/32)*512 bytes on the DSP heap -- the
+  // model's largest weight, so the count converts straight to what the
+  // overflow would need (238 weights short, doc 46 section 40).
+  const uint32_t K = 2048, N = 3584;
+  const size_t wh_bytes = nntrainer::whBytes(K, N);
+  std::vector<int8_t> q_w(static_cast<size_t>(K) * N);
+  for (size_t i = 0; i < q_w.size(); ++i)
+    q_w[i] = static_cast<int8_t>((i % 15u) - 7);
+  std::vector<float> d(N, 0.01f), bias(N, 0.0f);
+  std::vector<int32_t> colsum(N, 0);
+
+  std::vector<uint32_t> heap_handles;
+  int heap_rc = AEE_SUCCESS;
+  for (int i = 0; i < 300; ++i) {
+    uint32_t h = 0xFFFFFFFFu;
+    heap_rc = nntr_hvx_weight_register_u8i4(
+      handle_, K, N, q_w.data(), static_cast<int>(q_w.size()), d.data(),
+      static_cast<int>(d.size()), colsum.data(),
+      static_cast<int>(colsum.size()), bias.data(),
+      static_cast<int>(bias.size()), &h);
+    if (heap_rc != AEE_SUCCESS)
+      break;
+    heap_handles.push_back(h);
+  }
+  field("heap_weights", std::to_string(heap_handles.size()));
+  field("heap_mib", std::to_string((heap_handles.size() * wh_bytes) >> 20));
+  field("heap_stop_rc", hex(heap_rc));
+  // 238 is what the model is short by; anything at or above it means the
+  // overflow fits and the fix is small.
+  field("covers_overflow", heap_handles.size() >= 238 ? "yes" : "no");
+
+  for (uint32_t h : heap_handles)
+    nntr_hvx_weight_release_u8i4(handle_, h);
+  for (const Mapped &m : mapped) {
+    if (fmunmap != nullptr)
+      fmunmap(CDSP_DOMAIN_ID, m.fd, m.buf, m.bytes);
+    rfree(m.buf);
+  }
+}
+
 int main(int argc, char **argv) {
   int result = -1;
 
