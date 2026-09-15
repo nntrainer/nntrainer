@@ -100,6 +100,31 @@ static uint32_t moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
 }
 
 /**
+ * @brief Queues one 64-row activation block, slot-ordered heap -> VTCM.
+ *
+ * Issued AHEAD of the weight chunks it will be computed against, never
+ * behind them. The ring retires in push order and hexkl_dma_ring_wait(idx)
+ * therefore waits for everything queued before idx: with this transfer
+ * queued after an expert's gate_up and down, its wait covered all 5.25 MB
+ * of them, the chunked gate_up wait below then found nothing left to wait
+ * for, and the profile filed the whole weight transfer under GATHER --
+ * 795 us at decode for a 128 KB copy (doc 46 section 49). Pushed first,
+ * the wait covers 128 KB and the weight waits time the weights.
+ *
+ * @return the ring index to hand hexkl_dma_ring_wait
+ */
+static uint32_t moe_push_act_block(uint8_t *vtcm_base, uint32_t act_off,
+                                   const uint8_t *act_ah, uint32_t slot,
+                                   uint32_t K, uint32_t k_tiles) {
+  const uint32_t blk_bytes = k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
+  const uint32_t rs = moe_dma_row_size(blk_bytes);
+  const uint32_t idx = hexkl_dma_ring_next_idx();
+  hexkl_dma_ring_push2d(vtcm_base + act_off, act_ah + (size_t)slot * K, rs, rs,
+                        rs, blk_bytes / rs, /*src_vtcm=*/0, /*dst_vtcm=*/1);
+  return idx;
+}
+
+/**
  * @brief hvx_worker_pool_func body for the routing multiply and scatter-add.
  *
  * Safe to split by row because a token picks k DISTINCT experts, so within
@@ -463,6 +488,14 @@ int hexkl_mm_u8i4_moe_layer_run(
     goto out;
   }
 
+  /* The first expert's first activation block goes out before its weights
+     -- see moe_push_act_block for why the order matters. Every later
+     block-0 is queued the same way at the point its predecessor's gate_up
+     matmul finishes with the activation slot (below, next to the gate_up
+     prefetch); blocks after the first of an expert are queued in place. */
+  uint32_t act_idx =
+    moe_push_act_block(vtcm_base, L.act_off, act_ah, slot_of[0], K, k_tiles);
+
   /* gate_up in chunks, so the first n-tile column is usable long before
      the last. MOE_MAX_CHUNKS bounds the array; acc_tiles caps at 32 and
      gate_up has 112 columns, so 4 is the real count. */
@@ -492,17 +525,8 @@ int hexkl_mm_u8i4_moe_layer_run(
 
     /* gate_up[e] was pushed either before this loop or by iteration i-1,
        where it had this expert's predecessor's down matmul to hide behind. */
-    /* down[e] goes out first so the whole gate_up matmul covers it, and in
-       chunks for the same reason gate_up is: waiting for all 1.75 MB before
-       the first n-tile column cost 55 us an expert. */
     uint32_t dn_idx[MOE_MAX_CHUNKS];
     uint32_t dn_nchunk = 0u;
-    for (uint32_t nt0 = 0; nt0 < dn_ntiles; nt0 += L.acc_tiles) {
-      const uint32_t cn =
-        (dn_ntiles - nt0 < L.acc_tiles) ? (dn_ntiles - nt0) : L.acc_tiles;
-      dn_idx[dn_nchunk++] = moe_push_weight_chunk(
-        vtcm_base, L.w_dn_off, d, inter_ktiles, dn_ntiles, nt0, cn);
-    }
 
     for (uint32_t mb = 0; mb < n_e; mb += BR) {
       const uint32_t m_blk = (n_e - mb < BR) ? (n_e - mb) : BR;
@@ -515,23 +539,34 @@ int hexkl_mm_u8i4_moe_layer_run(
          core moved 5.5 MB a layer at 3.1 GB/s, against the 33 the engine
          measures, because the destination is VTCM and the core is the wrong
          thing to write it with. Rows past m_blk are padding whose
-         accumulator output is never read. */
+         accumulator output is never read.
+         Block 0 is already in flight (queued ahead of this expert's
+         gate_up); only the blocks after it are queued here, and by then
+         nothing but this expert's own down is ahead of them in the ring. */
       HEXKL_PROBE_T0(p0);
-      {
-        const uint32_t blk_bytes = k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
-        const uint32_t rs = moe_dma_row_size(blk_bytes);
-        const uint32_t aidx = hexkl_dma_ring_next_idx();
-        hexkl_dma_ring_push2d(vtcm_base + L.act_off,
-                              act_ah + (size_t)(slot_of[i] + mb) * K, rs, rs,
-                              rs, blk_bytes / rs, /*src_vtcm=*/0,
-                              /*dst_vtcm=*/1);
-        hexkl_dma_ring_wait(aidx);
+      if (mb != 0u) {
+        act_idx = moe_push_act_block(vtcm_base, L.act_off, act_ah,
+                                     slot_of[i] + mb, K, k_tiles);
       }
+      hexkl_dma_ring_wait(act_idx);
       for (uint32_t r = 0; r < m_blk; ++r) {
         scale[r] = slot_scale[slot_of[i] + mb + r];
         zp[r] = slot_zp[slot_of[i] + mb + r];
       }
       HEXKL_PROBE_ADD(HEXKL_PROBE_GATHER, p0);
+
+      /* down[e] goes out now, behind the activation it must not delay and
+         ahead of the whole gate_up matmul that covers it; in chunks for the
+         same reason gate_up is: waiting for all 1.75 MB before the first
+         n-tile column cost 55 us an expert. */
+      if (mb == 0u) {
+        for (uint32_t nt0 = 0; nt0 < dn_ntiles; nt0 += L.acc_tiles) {
+          const uint32_t cn =
+            (dn_ntiles - nt0 < L.acc_tiles) ? (dn_ntiles - nt0) : L.acc_tiles;
+          dn_idx[dn_nchunk++] = moe_push_weight_chunk(
+            vtcm_base, L.w_dn_off, d, inter_ktiles, dn_ntiles, nt0, cn);
+        }
+      }
 
       /* --- gate_up ------------------------------------------------- */
       /* Matmul a batch of n-tiles, staging each accumulator read into its
@@ -596,9 +631,14 @@ int hexkl_mm_u8i4_moe_layer_run(
          for too and the pipeline would collapse into a serial chain. */
 
       /* A is dead once the last block's gate_up matmul is done, so the next
-         expert's gate_up goes out now and rides under this block's SwiGLU,
-         requantization and down matmul. */
+         expert's first activation block and then its gate_up go out now
+         and ride under this block's SwiGLU, requantization and down matmul.
+         Activation first: it is what the next expert waits on before
+         anything else, and queued behind 3.5 MB of gate_up that wait would
+         cover the gate_up too. */
       if (last_block && i + 1u < n_active) {
+        act_idx = moe_push_act_block(vtcm_base, L.act_off, act_ah,
+                                     slot_of[i + 1u], K, k_tiles);
         gu_nchunk = 0u;
         for (uint32_t nt0 = 0; nt0 < gu_ntiles; nt0 += L.acc_tiles) {
           const uint32_t cn =
