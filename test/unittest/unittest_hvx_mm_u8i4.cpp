@@ -1702,6 +1702,224 @@ TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
   rfree(buf);
 }
 
+/**
+ * @brief [doc 46 section 34.6 item 1] The ordering the arena actually uses.
+ *
+ * ArenaMapAndDma proved a cached buffer written BEFORE fastrpc_mmap. The
+ * arena does the opposite: it allocates uncached, attaches once, and then
+ * keeps writing weights into it for the rest of the run, with no flush --
+ * which is the whole reason it is uncached. That ordering is the one thing
+ * section 34 rests on that nothing has shown yet, so this shows it or says
+ * it does not hold.
+ */
+TEST_F(HmxMmU8I4Layer, ArenaUncachedWriteAfterMap) {
+  auto field = [](const char *k, const std::string &v) {
+    std::cout << "U8I4_FIELD path=arena_uncached field=" << k << " value=" << v
+              << "\n";
+  };
+
+  auto alloc =
+    (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+  auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+  auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+  using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
+  using FastrpcMunmap = int (*)(int, int, void *, size_t);
+  auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
+  auto fmunmap = (FastrpcMunmap)dlsym(RTLD_DEFAULT, "fastrpc_munmap");
+  if (!alloc || !rfree || !to_fd || !fmmap) {
+    GTEST_SKIP() << "rpcmem/fastrpc_mmap not available";
+  }
+
+  const uint32_t kBytes = 3670016u;
+  const uint32_t kDma = 1048576u;
+  // RPCMEM_FLAG_UNCACHED. The flag, not the heap, is what decides whether
+  // the CPU's writes need a flush before the DSP can see them.
+  void *buf = alloc(25 /*RPCMEM_HEAP_ID_SYSTEM*/, 0 /*UNCACHED*/, (int)kBytes);
+  field("alloc", buf ? "ok" : "failed");
+  if (buf == nullptr) {
+    GTEST_SKIP() << "uncached rpcmem_alloc failed";
+  }
+  const int fd = to_fd(buf);
+  field("fd", std::to_string(fd));
+
+  // Attach FIRST. Everything after this point is the steady state the
+  // arena runs in.
+  const int rc =
+    fmmap(CDSP_DOMAIN_ID, fd, buf, 0, kBytes, static_cast<int>(FASTRPC_MAP_FD));
+  field("fastrpc_mmap_rc", hex(rc));
+
+  auto *p = static_cast<uint8_t *>(buf);
+  uint32_t want = 0;
+  for (uint32_t i = 0; i < kBytes; ++i) {
+    p[i] = static_cast<uint8_t>(i * 31u + 7u);
+  }
+  for (uint32_t i = 0; i < kDma; i += 64u) {
+    want += p[i];
+  }
+
+  std::vector<uint32_t> res(10, 0);
+  const int err = nntr_hvx_arena_probe(handle_, fd, kBytes, kDma, res.data(),
+                                       (int)res.size());
+  field("err", hex(err));
+  field("hap_mmap_get_rc", hex((int)res[8]));
+  if (err == AEE_SUCCESS) {
+    const double gbs = res[2] > 0 ? (double)res[3] / res[2] / 1000.0 : 0.0;
+    field("dma_gbs", std::to_string(gbs));
+    field("checksum_ok", res[4] == want ? "yes" : "no");
+    EXPECT_EQ(res[4], want)
+      << "uncached writes made AFTER fastrpc_mmap did not reach the DSP. "
+         "doc 46 section 34 assumes they do; the fallback is a cached arena "
+         "filled before attach, with misses left on the DSP heap.";
+  }
+  if (rc == 0 && fmunmap != nullptr) {
+    field("fastrpc_munmap_rc", hex(fmunmap(CDSP_DOMAIN_ID, fd, buf, kBytes)));
+  }
+  rfree(buf);
+}
+
+/**
+ * @brief [doc 46 section 34.5] A weight borrowed from the arena multiplies
+ *        exactly like the same weight copied onto the DSP heap.
+ *
+ * Same bytes through the same kernel, so this is bit-for-bit or it is a
+ * bug: the only difference is where wh_bytes points. Also checks the one
+ * rule that keeps a borrowed slot safe -- an arena cannot be detached while
+ * a weight still points into it.
+ */
+TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
+  const uint32_t K = 2048, I = 1792, N = 2048, M = 64, NE = 2;
+
+  auto alloc =
+    (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+  auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+  auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+  using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
+  auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
+  if (!alloc || !rfree || !to_fd || !fmmap) {
+    GTEST_SKIP() << "rpcmem/fastrpc_mmap not available";
+  }
+
+  std::vector<Weight> gu(NE), dn(NE);
+  std::vector<uint32_t> h_gu(NE), h_dn(NE);
+  for (uint32_t e = 0; e < NE; ++e) {
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0xA2E00000u + e, gu[e]));
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xC1000000u + e, dn[e]));
+    h_gu[e] = gu[e].handle;
+    h_dn[e] = dn[e].handle;
+  }
+
+  auto wh_bytes = [](uint32_t k, uint32_t n) {
+    return (k / 32u) * (n / 32u) * 512u;
+  };
+  const uint32_t gu_len = wh_bytes(K, 2 * I), dn_len = wh_bytes(I, N);
+  // 4 KB apart, the same spacing HtpComputeOps::place uses.
+  const uint32_t stride_gu = (gu_len + 4095u) & ~4095u;
+  const uint32_t stride_dn = (dn_len + 4095u) & ~4095u;
+  const uint32_t arena_bytes = NE * (stride_gu + stride_dn);
+
+  void *buf = alloc(25, 0 /*UNCACHED*/, (int)arena_bytes);
+  ASSERT_NE(buf, nullptr) << "uncached rpcmem_alloc failed";
+  const int fd = to_fd(buf);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(fmmap(CDSP_DOMAIN_ID, fd, buf, 0, arena_bytes,
+                  static_cast<int>(FASTRPC_MAP_FD)),
+            0);
+
+  uint32_t arena = 0xFFFFFFFFu;
+  ASSERT_EQ(nntr_hvx_arena_attach(handle_, fd, arena_bytes, &arena),
+            AEE_SUCCESS);
+
+  // Export each baked weight straight into the arena, then register it
+  // there -- the miss path of get_or_register_qs4cx, in miniature.
+  auto *base = static_cast<uint8_t *>(buf);
+  std::vector<uint32_t> a_gu(NE), a_dn(NE);
+  uint32_t off = 0;
+  for (uint32_t e = 0; e < NE; ++e) {
+    ASSERT_EQ(
+      nntr_hvx_weight_bake_export(handle_, h_gu[e], base + off, (int)gu_len),
+      AEE_SUCCESS);
+    ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
+                handle_, K, 2 * I, arena, off, gu[e].d.data(), (int)(2 * I),
+                gu[e].colsum.data(), (int)(2 * I), gu[e].bias.data(),
+                (int)(2 * I), &a_gu[e]),
+              AEE_SUCCESS);
+    off += stride_gu;
+
+    ASSERT_EQ(
+      nntr_hvx_weight_bake_export(handle_, h_dn[e], base + off, (int)dn_len),
+      AEE_SUCCESS);
+    ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
+                handle_, I, N, arena, off, dn[e].d.data(), (int)N,
+                dn[e].colsum.data(), (int)N, dn[e].bias.data(), (int)N,
+                &a_dn[e]),
+              AEE_SUCCESS);
+    off += stride_dn;
+  }
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0011u);
+  const std::vector<uint32_t> row_count = {40u, 24u};
+  std::vector<uint32_t> row_index;
+  std::vector<float> row_weight;
+  {
+    uint32_t st = 0xBEEF01u;
+    for (uint32_t e = 0; e < NE; ++e) {
+      std::vector<bool> taken(M, false);
+      for (uint32_t i = 0; i < row_count[e]; ++i) {
+        uint32_t r;
+        do {
+          st = st * 1664525u + 1013904223u;
+          r = (st >> 8) % M;
+        } while (taken[r]);
+        taken[r] = true;
+        row_index.push_back(r);
+        st = st * 1664525u + 1013904223u;
+        row_weight.push_back(0.1f + 0.9f * ((st >> 8) % 1000u) / 1000.0f);
+      }
+    }
+  }
+
+  auto run = [&](const std::vector<uint32_t> &hg,
+                 const std::vector<uint32_t> &hd, std::vector<float> &out) {
+    out.assign(static_cast<size_t>(M) * N, 1.0f);
+    return nntr_hvx_mm_u8i4_moe_layer(
+      handle_, M, K, I, N, hg.data(), (int)hg.size(), hd.data(), (int)hd.size(),
+      row_index.data(), (int)row_index.size(), row_count.data(),
+      (int)row_count.size(), row_weight.data(), (int)row_weight.size(),
+      x.data(), (int)x.size(), out.data(), (int)out.size());
+  };
+
+  std::vector<float> from_heap, from_arena;
+  ASSERT_EQ(run(h_gu, h_dn, from_heap), AEE_SUCCESS);
+  ASSERT_EQ(run(a_gu, a_dn, from_arena), AEE_SUCCESS);
+
+  size_t bad = 0;
+  for (size_t i = 0; i < from_heap.size(); ++i) {
+    if (std::memcmp(&from_arena[i], &from_heap[i], sizeof(float)) != 0)
+      ++bad;
+  }
+  std::cout << "U8I4_FIELD path=arena_moe field=bad_elems value=" << bad
+            << " of " << from_heap.size() << std::endl;
+  EXPECT_EQ(bad, 0u) << "a weight borrowed from the arena and the same weight "
+                        "copied to DSP heap are the same bytes through the "
+                        "same kernel; any difference is the borrowing";
+
+  // Detaching under a live borrow would leave the next matmul reading
+  // unmapped memory, so the DSP refuses it. This is the check that lets
+  // register_arena skip copying at all.
+  EXPECT_EQ(nntr_hvx_arena_detach(handle_, arena), AEE_EBADSTATE)
+    << "arena detached while weights still borrow from it";
+
+  for (uint32_t e = 0; e < NE; ++e) {
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, a_gu[e]), AEE_SUCCESS);
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, a_dn[e]), AEE_SUCCESS);
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h_gu[e]), AEE_SUCCESS);
+    EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h_dn[e]), AEE_SUCCESS);
+  }
+  EXPECT_EQ(nntr_hvx_arena_detach(handle_, arena), AEE_SUCCESS);
+  rfree(buf);
+}
+
 TEST_F(HmxMmU8I4Layer, MemoryCeilings) {
   const double need_gb = 4.10;
 
