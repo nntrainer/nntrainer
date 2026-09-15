@@ -81,23 +81,32 @@ constexpr int kDspOffset = 0x80000400;
 using SdklRmToWh = int (*)(uint8_t *, int8_t *, size_t, size_t);
 
 /**
- * @brief Which nibble of a tile's 512 bytes source element (r, c) lands in.
+ * @brief Which nibble of a tile's 512 bytes source element (r, c) lands in,
+ *        for the bake this tree's matmul reads.
  *
- * Read off the table WhLayoutTable derives:
+ * Read off WhLayoutTableFromDsp's table:
  *
- *     slot(r,c) = (c/8)*256 + r*8 + (c%4)*2 + ((c/4)%2)
+ *     slot(r,c) = (r/8)*256 + c*8 + (r%4)*2 + ((r/4)%2)
  *
  * The first three terms are even, so the last one IS the nibble half and the
  * rest is the byte:
  *
- *     byte(r,c) = (c/8)*128 + r*4 + (c%4)      nibble = (c/4)%2
+ *     byte(r,c) = (r/8)*128 + c*4 + (r%4)      nibble = (r/4)%2
  *
- * One byte holds the two columns four apart in the same row -- low nibble for
- * the one whose bit 2 is clear. 32 rows x 4 columns x 4 column groups = 512
- * bytes, which is the whole tile with nothing left over.
+ * One byte holds the two ROWS four apart in the same column -- low nibble for
+ * the one whose bit 2 is clear. Two k values per byte is what the reduction
+ * wants. 32 columns x 4 rows x 4 row groups = 512 bytes, the whole tile with
+ * nothing left over.
+ *
+ * sdkl_cpu_i4_rm_to_i4_wh builds the TRANSPOSE of this -- its table is
+ * whSlot(c, r), verified entry for entry in WhLayoutTable -- which is why a
+ * packer written from it disagreed with the DSP everywhere except the
+ * diagonal. The two APIs read their source with opposite conventions, of a
+ * piece with hexkl_macro_i4_rm_to_i4_wh taking (n_col, n_inner) where
+ * sdkl_cpu_i4_rm_to_i4_wh is documented (wt_rows, wt_cols).
  */
 inline uint32_t whSlot(uint32_t r, uint32_t c) {
-  return (c / 8u) * 256u + r * 8u + (c % 4u) * 2u + ((c / 4u) % 2u);
+  return (r / 8u) * 256u + c * 8u + (r % 4u) * 2u + ((r / 4u) % 2u);
 }
 
 /**
@@ -1853,39 +1862,21 @@ TEST_F(HmxMmU8I4Layer, WhPackReferenceMatchesDspBake) {
     << "whSlot does not describe what hexkl_micro_hmx_rm_to_wh_i4 produces "
        "at this shape; the offline packer cannot be written from it yet";
 
-  // Which argument order the vendor's ARM entry point wants, if either.
-  // Reported rather than asserted: the offline path does not need it once
-  // the closed form holds, but it is the fallback if it does not.
-  if (auto rm_to_wh = loadSdklRmToWh()) {
-    const char *order[2] = {"rows_cols", "cols_rows"};
-    for (int o = 0; o < 2; ++o) {
-      std::vector<uint8_t> v(wh_len, 0);
-      const size_t a = (o == 0) ? K : N, b = (o == 0) ? N : K;
-      if (rm_to_wh(v.data(), w.q_w.data(), a, b) != AEE_SUCCESS)
-        continue;
-      size_t f = 0;
-      std::cout << "U8I4_FIELD path=wh_layout field=sdkl_" << order[o]
-                << "_bad_bytes value=" << count_diff(v, &f) << " of " << wh_len
-                << std::endl;
-    }
-  }
-
   EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
 }
 
 /**
  * @brief [doc 46 section 35] Reads the permutation out of the DSP itself.
  *
- * whSlot was derived from sdkl_cpu_i4_rm_to_i4_wh and matches it exactly, on
- * square and non-square shapes alike -- and both disagree with the DSP's own
- * bake at 2048x3584 by the same 3639322 bytes. The tile order is not the
- * difference: hexkl_weight_u8i4_register sets n_tiles_row = N/32 and indexes
- * kt = t/n_tiles_row, which is what whPackReference does.
- *
- * What is left is that these are two different APIs. The matmul this tree
- * runs is hexkl_micro_hmx_mm_u8i4, so the layout that matters is
- * hexkl_micro_hmx_rm_to_wh_i4's, and the library's CPU converter feeds
- * sdkl_npu_mm_u8i4_i32 instead. So ask the one we actually use.
+ * The first version of whSlot came from sdkl_cpu_i4_rm_to_i4_wh and matched
+ * it exactly, square and non-square alike, and still disagreed with the DSP's
+ * own bake on 3639322 of 3670016 bytes. Tile order was not the difference:
+ * hexkl_weight_u8i4_register sets n_tiles_row = N/32 and takes
+ * kt = t/n_tiles_row, which is what whPackReference does. The two APIs simply
+ * build transposed tiles -- this table is the library's with r and c swapped
+ * -- and the matmul here is hexkl_micro_hmx_mm_u8i4, so this is the one that
+ * counts. Deriving from the library rather than from the thing under test
+ * cost two device rounds.
  *
  * Four probes rather than the 1024 single-element calls the library version
  * uses, because each of these is a FastRPC round trip: source index p is 10
@@ -2051,21 +2042,23 @@ TEST_F(HmxMmU8I4Layer, WhLayoutTable) {
   std::cout << "U8I4_FIELD path=wh_layout field=bijection value=yes"
             << std::endl;
 
-  // The closed form read off this table the first time it was printed. If it
-  // still describes every entry there is nothing to look at, so the table is
-  // printed only when it does not -- which is also the signal that this
-  // device's layout differs from the one whSlot was derived on.
+  // This library's tile is the transpose of the one the DSP bakes, so the
+  // check is whSlot(c, r). Recorded rather than dropped: it is what makes
+  // "the CPU converter and the micro API differ" a fact instead of a story,
+  // and it is the relationship anyone reaching for sdkl_cpu_i4_rm_to_i4_wh
+  // again will need.
   size_t form_bad = 0;
   for (uint32_t r = 0; r < 32u; ++r) {
     for (uint32_t c = 0; c < 32u; ++c) {
-      if (slot_of[r * 32u + c] != (int)whSlot(r, c)) {
+      if (slot_of[r * 32u + c] != (int)whSlot(c, r)) {
         ++form_bad;
       }
     }
   }
   std::cout << "U8I4_FIELD path=wh_layout field=closed_form_bad_slots value="
             << form_bad << " of 1024" << std::endl;
-  EXPECT_EQ(form_bad, 0u) << "whSlot no longer describes this library's layout";
+  EXPECT_EQ(form_bad, 0u)
+    << "whSlot(c, r) no longer describes this library's layout";
   // 32 lines, one per source row, each 32 slot numbers. This is the whole
   // answer -- the offline packer needs nothing else -- and it is what the
   // closed form was read off the first time.
@@ -2079,35 +2072,6 @@ TEST_F(HmxMmU8I4Layer, WhLayoutTable) {
       std::cout << "\n";
     }
     std::cout << "WH_SLOT_TABLE end" << std::endl;
-  }
-
-  // Does the table describe every tile, and are tiles laid out k-major the
-  // way hexkl_bake_u8i4_worker places them at t*512 with
-  // t = kt*n_tiles_row + nt? whPackReference assumes both; a non-square
-  // shape is what makes the two orders distinguishable, which a 32x32 probe
-  // cannot do.
-  const uint32_t K = 64, N = 128;
-  std::vector<int8_t> big(static_cast<size_t>(K) * N);
-  for (size_t i = 0; i < big.size(); ++i) {
-    big[i] = static_cast<int8_t>((int)(i % 15u) - 7); // whole i4 range
-  }
-  const uint32_t big_len = (K / 32u) * (N / 32u) * 512u;
-  std::vector<uint8_t> big_sdkl(big_len, 0), big_host(big_len, 0);
-  whPackReference(big.data(), K, N, big_host.data());
-
-  const char *order[2] = {"rows_cols", "cols_rows"};
-  for (int o = 0; o < 2; ++o) {
-    std::fill(big_sdkl.begin(), big_sdkl.end(), uint8_t(0));
-    const size_t a = (o == 0) ? K : N, b = (o == 0) ? N : K;
-    if (rm_to_wh(big_sdkl.data(), big.data(), a, b) != AEE_SUCCESS)
-      continue;
-    size_t d = 0;
-    for (uint32_t t = 0; t < big_len; ++t) {
-      if (big_sdkl[t] != big_host[t])
-        ++d;
-    }
-    std::cout << "U8I4_FIELD path=wh_layout field=nonsquare_sdkl_" << order[o]
-              << "_bad value=" << d << " of " << big_len << std::endl;
   }
 }
 
