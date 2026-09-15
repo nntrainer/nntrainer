@@ -153,6 +153,12 @@ adb push "$FC_BIN" "$DEVICE_TMP/" >/dev/null
 # c++_shared runtime the test binary links against (APP_STL in Application.mk)
 CXX_SHARED="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
 [ -f "$CXX_SHARED" ] && adb push "$CXX_SHARED" "$DEVICE_TMP/" >/dev/null
+# HexKL's ARM-side library. sdkl_cpu_i4_rm_to_i4_wh is the layout conversion
+# the DSP does at registration, runnable on the application processor -- the
+# WH layout tests dlopen this and skip when it is absent, so a HexKL drop
+# without an armv8 build still runs everything else.
+SDKL_SO="$HEXKL_ROOT/lib/$HEXKL_SDK_VER/armv8_android26/libsdkl.so"
+[ -f "$SDKL_SO" ] && adb push "$SDKL_SO" "$DEVICE_TMP/" >/dev/null
 
 echo "  (unsigned-PD enable happens inside the test itself via remote_session_control)"
 adb shell "cd $DEVICE_TMP && \

@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <dlfcn.h>
 #include <functional>
 #include <iomanip>
@@ -62,6 +63,29 @@ constexpr uint32_t round_up(uint32_t v, uint32_t a) {
  * and unittest_hvx_attn.cpp.
  */
 constexpr int kDspOffset = 0x80000400;
+
+/**
+ * @brief HexKL's ARM-side RM->WH conversion, if this device has libsdkl.so.
+ *
+ * sdkl_cpu_* takes no domain argument where sdkl_npu_* does, so this runs on
+ * the application processor: the same layout the DSP builds at registration,
+ * without a FastRPC round trip. dlopen rather than linked, matching how this
+ * file already reaches rpcmem and fastrpc_mmap -- a HexKL drop with no armv8
+ * build should skip these tests, not fail to link the binary.
+ *
+ * Signature from sdkl.h: the output is
+ * ((rows+31)/32)*((cols+31)/32)*512 bytes, which is HtpWeightCache::whBytes,
+ * and the input is one sign-extended int8 per i4 value in row-major order,
+ * which is what htp_qs4cx_from_packed already produces.
+ */
+using SdklRmToWh = int (*)(uint8_t *, int8_t *, size_t, size_t);
+SdklRmToWh loadSdklRmToWh() {
+  static void *lib = dlopen("libsdkl.so", RTLD_NOW | RTLD_LOCAL);
+  if (lib == nullptr) {
+    return nullptr;
+  }
+  return reinterpret_cast<SdklRmToWh>(dlsym(lib, "sdkl_cpu_i4_rm_to_i4_wh"));
+}
 
 constexpr uint32_t kTileRow = 64;   // HEXKL_HMX_INT8_BLOCK_N_ROW
 constexpr uint32_t kTileInner = 32; // HEXKL_HMX_INT8_BLOCK_N_INNER
@@ -1713,6 +1737,181 @@ TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
     field("fastrpc_munmap_rc", hex(fmunmap(kCdspDomain, fd, buf, kBytes)));
   }
   rfree(buf);
+}
+
+/**
+ * @brief [doc 46 section 35] The ARM library builds the same WH bytes the
+ *        DSP does.
+ *
+ * If this holds, the layout is not DSP-only and the conversion can move off
+ * the load path entirely -- into the offline quantizer, which is what makes
+ * a converted model possible without the DSP bake, the export, and the
+ * cache files. Registration is 48.2% of prefill today and all of it is this
+ * conversion.
+ *
+ * memcmp, not a tolerance: a permutation of nibbles either matches or the
+ * two are different layouts.
+ */
+TEST_F(HmxMmU8I4Layer, WhBakeMatchesSdklCpu) {
+  auto rm_to_wh = loadSdklRmToWh();
+  if (rm_to_wh == nullptr) {
+    GTEST_SKIP() << "libsdkl.so / sdkl_cpu_i4_rm_to_i4_wh not on this device";
+  }
+
+  // The model's largest weight, so the answer covers the shape that matters
+  // rather than a corner case.
+  const uint32_t K = 2048, N = 3584;
+  Weight w;
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, N, 0x5DC10000u, w));
+
+  const uint32_t wh_len = (K / 32u) * (N / 32u) * 512u;
+  std::vector<uint8_t> from_dsp(wh_len, 0), from_arm(wh_len, 0xAA);
+  ASSERT_EQ(nntr_hvx_weight_bake_export(handle_, w.handle, from_dsp.data(),
+                                        (int)wh_len),
+            AEE_SUCCESS);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const int rc = rm_to_wh(from_arm.data(), w.q_w.data(), K, N);
+  const auto arm_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+  std::cout << "U8I4_FIELD path=wh_layout field=sdkl_rc value=" << hex(rc)
+            << "\n"
+            << "U8I4_FIELD path=wh_layout field=arm_convert_us value=" << arm_us
+            << "\n"
+            << "U8I4_FIELD path=wh_layout field=arm_convert_mbps value="
+            << (arm_us > 0 ? (double)wh_len / (double)arm_us : 0.0)
+            << std::endl;
+  ASSERT_EQ(rc, AEE_SUCCESS);
+
+  size_t bad = 0, first = wh_len;
+  for (size_t i = 0; i < wh_len; ++i) {
+    if (from_arm[i] != from_dsp[i]) {
+      if (bad == 0) {
+        first = i;
+      }
+      ++bad;
+    }
+  }
+  std::cout << "U8I4_FIELD path=wh_layout field=bad_bytes value=" << bad
+            << " of " << wh_len << std::endl;
+  if (bad != 0) {
+    std::cout << "  first at " << first << " (tile " << first / 512 << " byte "
+              << first % 512 << "): arm " << hex(from_arm[first]) << " dsp "
+              << hex(from_dsp[first]) << std::endl;
+  }
+  EXPECT_EQ(bad, 0u)
+    << "sdkl_cpu_i4_rm_to_i4_wh and hexkl_micro_hmx_rm_to_wh_i4 disagree; the "
+       "offline conversion cannot use the ARM library as-is";
+
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, w.handle), AEE_SUCCESS);
+}
+
+/**
+ * @brief [doc 46 section 35] Reads the WH nibble permutation out of the
+ *        library, so the offline quantizer can reproduce it.
+ *
+ * One tile is 32x32 i4 = 1024 nibbles = 512 bytes = WEIGHT_TILE_BYTES_U8I4
+ * exactly, so there is no room in the output for anything but the values:
+ * the transform has to be a pure bijection of nibbles. That is what makes it
+ * derivable at all, and this checks it rather than assuming it.
+ *
+ * Derived the boring way -- one source element set to 7, everything else 0,
+ * 1024 times -- because the alternative (packing position bits into 4-bit
+ * values) is cleverness this does not need at 512 bytes a call. Every slot
+ * landing exactly once is the proof that it is a bijection.
+ */
+TEST_F(HmxMmU8I4Layer, WhLayoutTable) {
+  auto rm_to_wh = loadSdklRmToWh();
+  if (rm_to_wh == nullptr) {
+    GTEST_SKIP() << "libsdkl.so / sdkl_cpu_i4_rm_to_i4_wh not on this device";
+  }
+
+  // Which output nibble slot each source element lands in. Slot s is the low
+  // half of byte s/2 when s is even, the high half when odd -- recorded as
+  // one number so the packer can be written as out_nibble[slot_of[p]] = v.
+  std::vector<int> slot_of(1024, -1);
+  std::vector<int> hits(1024, 0);
+  std::vector<int8_t> rm(1024, 0);
+  std::vector<uint8_t> wh(512, 0);
+
+  for (uint32_t p = 0; p < 1024u; ++p) {
+    std::fill(rm.begin(), rm.end(), int8_t(0));
+    rm[p] = 7;
+    std::fill(wh.begin(), wh.end(), uint8_t(0));
+    ASSERT_EQ(rm_to_wh(wh.data(), rm.data(), 32, 32), AEE_SUCCESS);
+    int found = -1, n_found = 0;
+    for (uint32_t b = 0; b < 512u; ++b) {
+      if ((wh[b] & 0x0Fu) == 7u) {
+        found = (int)(2 * b);
+        ++n_found;
+      }
+      if ((wh[b] >> 4) == 7u) {
+        found = (int)(2 * b + 1);
+        ++n_found;
+      }
+    }
+    ASSERT_EQ(n_found, 1) << "source " << p << " produced " << n_found
+                          << " nibbles of value 7; the transform is not a "
+                             "plain permutation of values";
+    slot_of[p] = found;
+    ++hits[found];
+  }
+  for (uint32_t sl = 0; sl < 1024u; ++sl) {
+    ASSERT_EQ(hits[sl], 1) << "slot " << sl << " was written by " << hits[sl]
+                           << " sources; not a bijection";
+  }
+  std::cout << "U8I4_FIELD path=wh_layout field=bijection value=yes"
+            << std::endl;
+
+  // 32 lines, one per source row, each 32 slot numbers. This is the whole
+  // answer -- the offline packer needs nothing else -- and it is printed so
+  // a closed form can be read off it. Once that form is written down this
+  // test checks it instead of printing.
+  std::cout << "WH_SLOT_TABLE begin (row r, col c) -> nibble slot\n";
+  for (uint32_t r = 0; r < 32u; ++r) {
+    std::cout << "WH_SLOT_ROW " << std::setw(2) << r << ":";
+    for (uint32_t c = 0; c < 32u; ++c) {
+      std::cout << " " << slot_of[r * 32u + c];
+    }
+    std::cout << "\n";
+  }
+  std::cout << "WH_SLOT_TABLE end" << std::endl;
+
+  // Does one tile's permutation describe every tile, and are tiles laid out
+  // k-major the way hexkl_bake_u8i4_worker places them at t*512 with
+  // t = kt*n_tiles_row + nt? Both have to hold for the offline packer to be
+  // a loop over tiles around the table above.
+  const uint32_t K = 64, N = 64, NT = 2;
+  std::vector<int8_t> big(static_cast<size_t>(K) * N);
+  for (size_t i = 0; i < big.size(); ++i) {
+    big[i] = static_cast<int8_t>((int)(i % 15u) - 7); // whole i4 range
+  }
+  std::vector<uint8_t> big_wh(NT * NT * 512u, 0);
+  ASSERT_EQ(rm_to_wh(big_wh.data(), big.data(), K, N), AEE_SUCCESS);
+
+  size_t tile_bad = 0;
+  for (uint32_t kt = 0; kt < NT; ++kt) {
+    for (uint32_t nt = 0; nt < NT; ++nt) {
+      std::vector<uint8_t> want(512, 0);
+      for (uint32_t r = 0; r < 32u; ++r) {
+        for (uint32_t c = 0; c < 32u; ++c) {
+          const int8_t v = big[(size_t)(kt * 32u + r) * N + (nt * 32u + c)];
+          const int sl = slot_of[r * 32u + c];
+          want[sl / 2] |= static_cast<uint8_t>((v & 0x0F) << (4 * (sl % 2)));
+        }
+      }
+      const uint8_t *got = big_wh.data() + (kt * NT + nt) * 512u;
+      if (std::memcmp(got, want.data(), 512) != 0) {
+        ++tile_bad;
+      }
+    }
+  }
+  std::cout << "U8I4_FIELD path=wh_layout field=tiles_mismatched value="
+            << tile_bad << " of " << (NT * NT) << std::endl;
+  EXPECT_EQ(tile_bad, 0u)
+    << "either the per-tile permutation is not the same for every tile, or "
+       "tiles are not ordered kt*n_col_tiles+nt";
 }
 
 /**
