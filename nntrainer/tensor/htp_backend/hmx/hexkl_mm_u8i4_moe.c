@@ -28,7 +28,7 @@
  * the worker pool and retired only when the buffer they read or write is
  * about to be reused: two accumulator staging buffers alternate under the
  * HMX issue, res_f32 has its own region rather than aliasing gate, and a
- * block's scatter runs under the next block's activation DMA. Every wait is
+ * block's scatter runs under the next block's first gate_up batch. Every wait is
  * placed where the dependency actually is, and each is timed, so the
  * profile's DEQUANT and SCATTER columns now read the exposed part, not the
  * work. Moving a submit or a wait without re-deriving who reads what is how
@@ -664,14 +664,12 @@ int hexkl_mm_u8i4_moe_layer_run(
         zp[r] = slot_zp[slot_of[i] + mb + r];
       }
       HEXKL_PROBE_ADD(HEXKL_PROBE_GATHER, p0);
-
-      /* The previous block's scatter has been running under this block's
-         activation DMA; it must be done before this block's first epilogue
-         is submitted (one job at a time) and before res_f32 is rewritten.
-         SCATTER now times what of it is still exposed here. */
-      HEXKL_PROBE_T0(p0);
-      hvx_worker_pool_wait(pool);
-      HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);
+      /* The previous block's scatter is still running. It is retired below,
+         after this block's first gate_up batch has been issued -- not here:
+         waited for at the head of the block it had only the 3 us activation
+         wait to hide behind and read 1056 us a call, the same as before it
+         was made asynchronous (doc 47 section 11.1). Nothing between here
+         and that first submit touches res_f32 or out_c. */
 
       /* down[e] goes out now, behind the activation it must not delay and
          ahead of the whole gate_up matmul that covers it; in chunks for the
@@ -742,11 +740,15 @@ int hexkl_mm_u8i4_moe_layer_run(
         }
         MOE_MM_END();
 
-        /* Retire epilogue ci-1 (its buffer is the one batch ci+1 will
-           fill), then launch this batch's. */
+        /* Retire what the pool is running -- the previous block's scatter
+           at ci == 0, epilogue ci-1 otherwise (its buffer is the one batch
+           ci+1 will fill) -- then launch this batch's. Each is timed in its
+           own column, so both read what is exposed after a batch's issue
+           has covered them. */
         HEXKL_PROBE_T0(p0);
         hvx_worker_pool_wait(pool);
-        HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
+        HEXKL_PROBE_ADD(ci == 0u ? HEXKL_PROBE_SCATTER : HEXKL_PROBE_DEQUANT,
+                        p0);
         {
           hvx_dq_swiglu_job *jb = &gu_job[ci & 1u];
           jb->tiles_base =
