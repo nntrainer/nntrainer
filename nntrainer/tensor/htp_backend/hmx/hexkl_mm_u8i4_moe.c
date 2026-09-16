@@ -265,7 +265,16 @@ static void moe_scatter_worker(uint32_t n_threads, uint32_t i, void *vctx) {
  * until measured: HVX_GEMM_U8I4_MAX_ROWS (16) is where a row-group unit is
  * ~20 us; the average tail here is 10-20 rows.
  */
-#define MOE_TAIL_MAX_ROWS HVX_GEMM_U8I4_MAX_ROWS
+/* OFF by default (0 rows): measured on device (doc 47 section 21.1) the path
+   took 3.5 tails a call off the HMX (-0.59 ms) and cost 1.07 ms in return --
+   the tails were not done when their expert's scatter needed them (SCATTER
+   +0.45) and the units held workers the requant and epilogue runs were
+   waiting for (REQUANT +0.48, DEQUANT +0.15). Net -0.5 ms a call. The host
+   check builds with -DMOE_TAIL_MAX_ROWS=16u so the path stays exercised;
+   HVX_GEMM_U8I4_MAX_ROWS is the ceiling. */
+#ifndef MOE_TAIL_MAX_ROWS
+#define MOE_TAIL_MAX_ROWS 0u
+#endif
 #define MOE_TAIL_TILE_I32 (MOE_TAIL_MAX_ROWS * HEXKL_HMX_INT8_BLOCK_N_COL)
 #define MOE_TAIL_TILE_BYTES (MOE_TAIL_TILE_I32 * 4u)
 

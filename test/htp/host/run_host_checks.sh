@@ -25,6 +25,7 @@ trap 'rm -rf "$OUT"' EXIT
 
 cc=${CC:-gcc}
 "$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
+  -DMOE_TAIL_MAX_ROWS=16u \
   -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/moe_layer_host_check" \
   "$HERE/moe_layer_host_check.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" -lm
