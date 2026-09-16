@@ -148,6 +148,7 @@ public:
     weight_pool(enable_fsu_, fsu_path, "weight_pool", exec_mode_, allocator),
     tensor_pool(enable_fsu_ && (exec_mode_ == ExecutionMode::TRAIN), fsu_path,
                 "tensor_pool", exec_mode_, allocator),
+    ref_weight_pool(nullptr),
     enable_fsu(enable_fsu_),
     enable_optimizations(true),
     fsu_lookahead(lookahead),
@@ -574,6 +575,12 @@ public:
     weight_pool.setWeightOffset(offsets);
   }
 
+  TensorPool *getWeightPool() { return &weight_pool; }
+
+  void setRefManager(std::shared_ptr<Manager> ref_manager) {
+    ref_weight_pool = ref_manager->getWeightPool();
+  }
+
 private:
   /** @todo: merge this list to one */
   std::vector<std::unique_ptr<Weight>> weights_v2; /**< weights for the layers
@@ -590,6 +597,8 @@ private:
 
   TensorPool weight_pool; /**< tensor pool to request tensors */
   TensorPool tensor_pool; /**< tensor pool to request tensors */
+
+  TensorPool *ref_weight_pool;
 
   /** async load task <execution order, weight completed id> */
   std::map<unsigned int, int> async_task_weight_load;

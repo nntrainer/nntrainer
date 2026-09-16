@@ -222,7 +222,9 @@ void TensorPool::setBatchSize(const std::string &name, unsigned int batch) {
 void TensorPool::allocate(bool init) {
   if (minMemoryRequirement() == 0)
     return;
-  mem_pool->allocate();
+  if (!ref_pool) {
+    mem_pool->allocate();
+  }
 
   /** set the pointers using the token for all the tensors */
   for (auto &spec : pool) {
@@ -230,7 +232,12 @@ void TensorPool::allocate(bool init) {
     if (!details || details->token == 0) {
       continue;
     }
-    spec.tensor->setData(mem_pool->getMemory(details->token), 0, init);
+    if (!ref_pool) {
+      spec.tensor->setData(mem_pool->getMemory(details->token), 0, init);
+    } else {
+      spec.tensor->setData(ref_pool->getMemoryPool()->getMemory(details->token),
+                           0, init);
+    }
     ml_logi("Memory Alloc Details (Tensor): %s : %zu : address %p",
             spec.tensor->getName().c_str(), spec.tensor->getMemoryBytes(),
             spec.tensor->getData());

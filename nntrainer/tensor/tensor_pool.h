@@ -46,7 +46,8 @@ public:
   TensorPool() :
     allocator_(std::make_shared<MemAllocator>()),
     mem_pool(std::make_unique<MemoryPool>(allocator_)),
-    cache_loader(nullptr) {}
+    cache_loader(nullptr),
+    ref_pool(nullptr) {}
 
   /**
    * @brief     Constructor of TensorPool
@@ -61,7 +62,7 @@ public:
     ml::train::ExecutionMode execution_mode = ml::train::ExecutionMode::TRAIN,
     std::shared_ptr<MemAllocator> allocator =
       std::make_shared<MemAllocator>()) :
-    allocator_(std::move(allocator)) {
+    allocator_(std::move(allocator)), ref_pool(nullptr) {
     if (enable_fsu) {
       auto cache_pool = std::make_shared<CachePool>(fsu_path, fsu_name,
                                                     execution_mode, allocator_);
@@ -369,6 +370,12 @@ public:
     }
   }
 
+  std::shared_ptr<MemoryPool> getMemoryPool() { return mem_pool; }
+
+  TensorPool *getRefPool() { return ref_pool; }
+
+  void setRefPool(TensorPool *ref) { ref_pool = ref; }
+
 private:
   /**
    * @brief Source tensor detailed specification
@@ -472,6 +479,8 @@ private:
                      without re-resolving from the engine. */
   std::shared_ptr<MemoryPool> mem_pool;      /**< memory pool for the tensors */
   std::unique_ptr<CacheLoader> cache_loader; /**< memory pool for the tensors */
+
+  TensorPool *ref_pool;
 
   /**
    * @brief     Check if the lifespan leads to long term valitidy

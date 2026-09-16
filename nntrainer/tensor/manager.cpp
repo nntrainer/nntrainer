@@ -152,8 +152,11 @@ void Manager::reinitialize() {
 
 void Manager::allocateWeights(unsigned int max_exec_order_, bool init) {
   max_exec_order = max_exec_order_;
-  if (!weight_pool.isAllocated()) {
+  if (!weight_pool.isAllocated() && !weight_pool.getRefPool()) {
     finalizeTensorPool(weight_pool, 0, max_exec_order_);
+    if (ref_weight_pool) {
+      weight_pool.setRefPool(ref_weight_pool);
+    }
     weight_pool.allocate(init);
   }
 }
