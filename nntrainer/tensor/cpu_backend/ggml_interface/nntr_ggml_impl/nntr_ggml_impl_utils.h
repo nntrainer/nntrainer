@@ -1092,14 +1092,26 @@ inline static uint8x16_t ggml_vqtbl1q_u8(uint8x16_t a, uint8x16_t b) {
 
 #endif // !defined(__aarch64__)
 
+/**
+ * @brief SDOT emulation used by ggml_vdotq_s32 on targets without the
+ * dotprod extension: lane j of the result accumulates a[4j..4j+3] .
+ * b[4j..4j+3] on top of acc[j]. Compiled on every NEON build, not only
+ * when the emulation is selected, so unit tests can validate it against
+ * a reference even on dotprod-enabled builds.
+ */
+inline static int32x4_t nntr_vdotq_s32_emul(int32x4_t acc, int8x16_t a,
+                                            int8x16_t b) {
+  const int16x8_t p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+  const int16x8_t p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
+
+  return vaddq_s32(acc, vpaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
+}
+
 #if !defined(__ARM_FEATURE_DOTPROD)
 
 inline static int32x4_t ggml_vdotq_s32(int32x4_t acc, int8x16_t a,
                                        int8x16_t b) {
-  const int16x8_t p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
-  const int16x8_t p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
-
-  return vaddq_s32(acc, vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
+  return nntr_vdotq_s32_emul(acc, a, b);
 }
 
 #else
