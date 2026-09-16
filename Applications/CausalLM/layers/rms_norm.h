@@ -57,6 +57,14 @@ public:
   WIN_EXPORT void finalize(nntrainer::InitLayerContext &context) override;
 
   /**
+   * @copydoc Layer::updateTensorsByInputDimensions(InitLayerContext
+   * &init_context, RunLayerContext &context)
+   */
+  WIN_EXPORT std::vector<nntrainer::TensorDim> updateTensorsByInputDimensions(
+    nntrainer::InitLayerContext &init_context,
+    nntrainer::RunLayerContext &run_context) override;
+
+  /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
    */
   WIN_EXPORT void forwarding(nntrainer::RunLayerContext &context,
@@ -104,10 +112,6 @@ public:
            std::to_string(values.size());
   };
 
-  WIN_EXPORT void updateTensorsByInputDimensions(
-    nntrainer::RunLayerContext &context,
-    std::vector<nntrainer::TensorDim> input_dimensions) override;
-
   inline static const std::string type = "rms_norm";
 
 private:
@@ -115,7 +119,15 @@ private:
   std::tuple<props::RMS_NORM_GAMMA_INIT, nntrainer::props::Epsilon,
              nntrainer::props::SkipPrefill>
     rms_props;
+  std::shared_ptr<nntrainer::Tensor> input_fp32;
+  std::shared_ptr<nntrainer::Tensor> output_fp32;
   bool skip_prefill = false;
+
+  /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<nntrainer::TensorDim>, 3>
+  getLayerDimensions(nntrainer::InitLayerContext &context) override;
 };
 
 } // namespace causallm

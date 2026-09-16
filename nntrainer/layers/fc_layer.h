@@ -54,6 +54,14 @@ public:
   void finalize(InitLayerContext &context) override;
 
   /**
+   * @copydoc Layer::updateTensorsByInputDimensions(InitLayerContext
+   * &init_context, RunLayerContext &context)
+   */
+  std::vector<TensorDim>
+  updateTensorsByInputDimensions(InitLayerContext &init_context,
+                                 RunLayerContext &context) override;
+
+  /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
    */
   void forwarding(RunLayerContext &context, bool training) override;
@@ -128,6 +136,12 @@ private:
   std::array<unsigned int, 4> lora_idx;   /**< indices of the lora weights */
   std::unique_ptr<nntrainer::Quantizer> quantizer;
   bool skip_prefill = false;
+
+  /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<TensorDim>, 3>
+  getLayerDimensions(InitLayerContext &context) override;
 };
 } // namespace nntrainer
 

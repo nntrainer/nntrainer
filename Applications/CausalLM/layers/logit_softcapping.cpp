@@ -110,11 +110,15 @@ void LogitSoftCappingLayer::applyOnRange(nntrainer::RunLayerContext &context,
   }
 }
 
-void LogitSoftCappingLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
-  context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
+std::vector<nntrainer::TensorDim>
+LogitSoftCappingLayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  auto input_dimensions = init_context.getInputDimensions();
+  run_context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
+
+  return {input_dimensions[0]};
 }
 
 void LogitSoftCappingLayer::calcDerivative(

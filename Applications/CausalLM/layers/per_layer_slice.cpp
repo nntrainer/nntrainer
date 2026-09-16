@@ -97,13 +97,18 @@ void PerLayerSliceLayer::incremental_forwarding(
   }
 }
 
-void PerLayerSliceLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
+std::vector<nntrainer::TensorDim>
+PerLayerSliceLayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  auto input_dimensions = init_context.getInputDimensions();
   auto out_dim = input_dimensions[0];
   out_dim.width(std::get<props::FeatureSize>(slice_props).get());
-  context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
-  context.updateOutput(SINGLE_INOUT_IDX, out_dim);
+
+  run_context.updateInput(SINGLE_INOUT_IDX, input_dimensions[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, out_dim);
+
+  return {out_dim};
 }
 
 void PerLayerSliceLayer::calcDerivative(nntrainer::RunLayerContext &context) {

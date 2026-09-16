@@ -222,6 +222,9 @@ void DebertaAttentionLayer::finalize(nntrainer::InitLayerContext &context) {
     << "DebertaAttentionLayer expects " << expected_inputs
     << " inputs, but got " << context.getNumInputs();
 
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
+
   const auto &input_dims = context.getInputDimensions();
   const auto &query_dim = input_dims[INPUT_IDX_Q];
   const auto &key_dim = input_dims[INPUT_IDX_K];
@@ -261,32 +264,14 @@ void DebertaAttentionLayer::finalize(nntrainer::InitLayerContext &context) {
 
   attn_logit_softcapping = 0.0f;
 
-#ifdef ENABLE_FP16
-  ml::train::TensorDim cache_key_dim(
-    {query_dim.batch(), 1, query_dim.height(), key_dim.width()},
-    {context.getFormat(), ml::train::TensorDim::DataType::FP16});
-  ml::train::TensorDim cache_value_dim(
-    {query_dim.batch(), 1, query_dim.height(), value_dim.width()},
-    {context.getFormat(), ml::train::TensorDim::DataType::FP16});
-#else
-  ml::train::TensorDim cache_key_dim(
-    {query_dim.batch(), 1, query_dim.height(), key_dim.width()},
-    {context.getFormat(), key_dim.getDataType()});
-  ml::train::TensorDim cache_value_dim(
-    {query_dim.batch(), 1, query_dim.height(), value_dim.width()},
-    {context.getFormat(), value_dim.getDataType()});
-#endif
-
   tensor_idx[AttentionParams::cache_key] = context.requestTensor(
-    cache_key_dim, "cache_key", nntrainer::Initializer::NONE, false,
+    tensor_dims[0], "cache_key", nntrainer::Initializer::NONE, false,
     nntrainer::TensorLifespan::MAX_LIFESPAN);
 
   tensor_idx[AttentionParams::cache_value] = context.requestTensor(
-    cache_value_dim, "cache_value", nntrainer::Initializer::NONE, false,
+    tensor_dims[1], "cache_value", nntrainer::Initializer::NONE, false,
     nntrainer::TensorLifespan::MAX_LIFESPAN);
 
-  std::vector<nntrainer::TensorDim> output_dims(1);
-  output_dims[0] = query_dim;
   context.setOutputDimensions(output_dims);
 
   prepare_bucket_table(
@@ -1011,32 +996,64 @@ void DebertaAttentionLayer::setBatch(nntrainer::RunLayerContext &context,
   context.updateTensor(tensor_idx[AttentionParams::cache_value], batch);
 }
 
-void DebertaAttentionLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-
-  ml::train::TensorDim q_dim = input_dimensions[INPUT_IDX_Q];
-  ml::train::TensorDim k_dim = input_dimensions[INPUT_IDX_K];
-  ml::train::TensorDim v_dim = input_dimensions[INPUT_IDX_V];
+std::array<std::vector<nntrainer::TensorDim>, 3>
+DebertaAttentionLayer::getLayerDimensions(
+  nntrainer::InitLayerContext &context) {
+  const auto &input_dims = context.getInputDimensions();
+  const auto &query_dim = input_dims[INPUT_IDX_Q];
+  const auto &key_dim = input_dims[INPUT_IDX_K];
+  const auto &value_dim = input_dims[INPUT_IDX_V];
 
 #ifdef ENABLE_FP16
-  k_dim.setDataType(ml::train::TensorDim::DataType::FP16);
-  v_dim.setDataType(ml::train::TensorDim::DataType::FP16);
+  ml::train::TensorDim cache_key_dim(
+    {query_dim.batch(), 1, query_dim.height(), key_dim.width()},
+    {context.getFormat(), ml::train::TensorDim::DataType::FP16});
+  ml::train::TensorDim cache_value_dim(
+    {query_dim.batch(), 1, query_dim.height(), value_dim.width()},
+    {context.getFormat(), ml::train::TensorDim::DataType::FP16});
 #else
-  k_dim.setDataType(input_dimensions[INPUT_IDX_K].getDataType());
-  v_dim.setDataType(input_dimensions[INPUT_IDX_V].getDataType());
+  ml::train::TensorDim cache_key_dim(
+    {query_dim.batch(), 1, query_dim.height(), key_dim.width()},
+    {context.getFormat(), key_dim.getDataType()});
+  ml::train::TensorDim cache_value_dim(
+    {query_dim.batch(), 1, query_dim.height(), value_dim.width()},
+    {context.getFormat(), value_dim.getDataType()});
 #endif
 
-  context.updateInput(INPUT_IDX_Q, input_dimensions[INPUT_IDX_Q]);
-  context.updateInput(INPUT_IDX_K, input_dimensions[INPUT_IDX_K]);
-  context.updateInput(INPUT_IDX_V, input_dimensions[INPUT_IDX_V]);
-  context.updateOutput(OUTPUT_IDX, input_dimensions[INPUT_IDX_Q]);
+  std::vector<nntrainer::TensorDim> output_dims(1);
+  output_dims[0] = query_dim;
 
-  context.updateTensor(tensor_idx[AttentionParams::cache_key], k_dim);
-  context.updateTensor(tensor_idx[AttentionParams::cache_value], v_dim);
+  std::vector<nntrainer::TensorDim> tensor_dims(2);
+  tensor_dims[0] = cache_key_dim;   // cache_key is index 0
+  tensor_dims[1] = cache_value_dim; // cache_value is index 1
+
+  return std::array<std::vector<nntrainer::TensorDim>, 3>{
+    output_dims, {}, tensor_dims};
+}
+
+std::vector<nntrainer::TensorDim>
+DebertaAttentionLayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  auto input_dimensions = init_context.getInputDimensions();
+
+  run_context.updateInput(INPUT_IDX_Q, input_dimensions[INPUT_IDX_Q]);
+  run_context.updateInput(INPUT_IDX_K, input_dimensions[INPUT_IDX_K]);
+  run_context.updateInput(INPUT_IDX_V, input_dimensions[INPUT_IDX_V]);
+  run_context.updateOutput(OUTPUT_IDX, output_dims[OUTPUT_IDX]);
+
+  run_context.updateTensor(tensor_idx[AttentionParams::cache_key],
+                           tensor_dims[0]);
+  run_context.updateTensor(tensor_idx[AttentionParams::cache_value],
+                           tensor_dims[1]);
 
   prepare_bucket_table(std::max<unsigned int>(
     input_dimensions[INPUT_IDX_Q].height(), max_position_embeddings));
+
+  return output_dims;
 }
 
 void DebertaAttentionLayer::calcDerivative(

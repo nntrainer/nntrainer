@@ -46,37 +46,19 @@ void CausalConv1DLayer::finalize(nntrainer::InitLayerContext &context) {
     << "[CausalConv1DLayer] requires exactly 1 input, got "
     << context.getNumInputs();
 
-  const nntrainer::TensorDim &in_dim = context.getInputDimensions()[0];
-  validateInputShape(in_dim);
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
 
-  const unsigned int B = in_dim.batch();
-  const unsigned int W = in_dim.width(); // number of features/channels
-
-  // Weight: [1, 1, KERNEL_SIZE, W] FP32
-  //   Row k  (offset k*W) = kernel weights for position k:
-  //     k=0 → w0: applied to current token x_t
-  //     k=1 → w1: applied to x_{t-1}
-  //     k=2 → w2: applied to x_{t-2}
-  nntrainer::TensorDim weight_dim(
-    {1, 1, KERNEL_SIZE, W},
-    {context.getFormat(), ml::train::TensorDim::DataType::FP32});
   weight_idx[weight] =
-    context.requestWeight(weight_dim, nntrainer::Initializer::NONE,
+    context.requestWeight(weight_dims[weight], nntrainer::Initializer::NONE,
                           nntrainer::WeightRegularizer::NONE, 0.0f, 0.0f,
                           "causal_conv1d_weight", false);
 
-  // Conv-state cache: [B, 1, KERNEL_SIZE-1, W] FP32
-  //   state[b, 0, 0, f] = x_{t-2}
-  //   state[b, 0, 1, f] = x_{t-1}
-  nntrainer::TensorDim state_dim(
-    {B, 1, KERNEL_SIZE - 1, W},
-    {context.getFormat(), ml::train::TensorDim::DataType::FP32});
   tensor_idx[conv_state] = context.requestTensor(
-    state_dim, "conv_state", nntrainer::Initializer::ZEROS, false,
+    tensor_dims[0], "conv_state", nntrainer::Initializer::ZEROS, false,
     nntrainer::TensorLifespan::MAX_LIFESPAN);
 
-  // Output has same shape as input
-  context.setOutputDimensions({in_dim});
+  context.setOutputDimensions(output_dims);
 }
 
 void CausalConv1DLayer::forwarding(nntrainer::RunLayerContext &context,
@@ -155,10 +137,52 @@ void CausalConv1DLayer::calcGradient(nntrainer::RunLayerContext &context) {
     "[CausalConv1DLayer] calcGradient() not implemented (inference only).");
 }
 
-void CausalConv1DLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  // No dynamic updates needed
+std::array<std::vector<nntrainer::TensorDim>, 3>
+CausalConv1DLayer::getLayerDimensions(nntrainer::InitLayerContext &context) {
+  validateInputShape(context.getInputDimensions()[0]);
+
+  const nntrainer::TensorDim &in_dim = context.getInputDimensions()[0];
+  const unsigned int B = in_dim.batch();
+  const unsigned int W = in_dim.width();
+
+  // Weight: [1, 1, KERNEL_SIZE, W] FP32
+  //   Row k  (offset k*W) = kernel weights for position k:
+  //     k=0 → w0: applied to current token x_t
+  //     k=1 → w1: applied to x_{t-1}
+  //     k=2 → w2: applied to x_{t-2}
+  nntrainer::TensorDim weight_dim(
+    {1, 1, KERNEL_SIZE, W},
+    {context.getFormat(), ml::train::TensorDim::DataType::FP32});
+
+  // Conv-state cache: [B, 1, KERNEL_SIZE-1, W] FP32
+  //   state[b, 0, 0, f] = x_{t-2}
+  //   state[b, 0, 1, f] = x_{t-1}
+  nntrainer::TensorDim state_dim(
+    {B, 1, KERNEL_SIZE - 1, W},
+    {context.getFormat(), ml::train::TensorDim::DataType::FP32});
+
+  std::vector<nntrainer::TensorDim> output_dims = {in_dim};
+  std::vector<nntrainer::TensorDim> weight_dims = {weight_dim};
+  std::vector<nntrainer::TensorDim> tensor_dims = {state_dim};
+
+  return std::array<std::vector<nntrainer::TensorDim>, 3>{
+    output_dims, weight_dims, tensor_dims};
+}
+
+std::vector<nntrainer::TensorDim>
+CausalConv1DLayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
+
+  run_context.updateTensor(tensor_idx[conv_state], tensor_dims[0]);
+
+  return output_dims;
 }
 
 void CausalConv1DLayer::exportTo(nntrainer::Exporter &exporter,

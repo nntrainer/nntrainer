@@ -455,17 +455,10 @@ EmbeddingLayer::EmbeddingLayer() :
   weight_idx(std::numeric_limits<unsigned>::max()) {}
 
 void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
-  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
-    << "Embedding layer takes only one input";
-
-  auto &quantized_lut_path = std::get<props::QuantizedLutPath>(embedding_props);
-  const bool has_quantized_lut = !quantized_lut_path.empty();
   context.setInputDataType(nntrainer::TensorDim::DataType::FP32);
 
-  const nntrainer::TensorDim &input_dim =
-    context.getInputDimensions()[SINGLE_INOUT_IDX];
-  NNTR_THROW_IF(input_dim.channel() != 1, std::invalid_argument)
-    << "Embedding layer takes only one for channel size";
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
 
   auto &weight_regularizer =
     std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
@@ -474,6 +467,11 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
   auto weight_initializer = nntrainer::props::InitializerInfo::Enum::NONE;
   auto &weight_decay =
     std::get<nntrainer::props::WeightDecay>(*layer_impl_props);
+
+  context.setOutputDimensions(output_dims);
+
+  auto &quantized_lut_path = std::get<props::QuantizedLutPath>(embedding_props);
+  const bool has_quantized_lut = !quantized_lut_path.empty();
 
   size_t in_dim =
     static_cast<size_t>(std::get<nntrainer::props::InDim>(embedding_props));
@@ -497,47 +495,27 @@ void EmbeddingLayer::finalize(nntrainer::InitLayerContext &context) {
       << "Raw UINT16 LUT requires UINT16 activation/output dtype";
   }
 
-  nntrainer::TensorDim output_dim = input_dim;
-
-  // output_dim expected as hidden x num input (batch size)
-  output_dim.height(input_dim.width());
-  output_dim.width(out_dim);
-  output_dim.setTensorType(
-    {context.getFormat(), context.getActivationDataType()});
-  context.setOutputDimensions({output_dim});
-
   if (quant_lut)
     return;
 
-  nntrainer::TensorDim dim = output_dim;
+  weight_idx = context.requestWeight(weight_dims[EmbeddingParams::weight],
+                                     weight_initializer, weight_regularizer,
+                                     weight_regularizer_constant, weight_decay,
+                                     "Embedding", true);
+}
 
-  dim.setTensorType({context.getFormat(), context.getWeightDataType()});
+std::vector<nntrainer::TensorDim>
+EmbeddingLayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
 
-  dim.batch(1);
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
 
-  /**
-   * @note nntrainer's per-channel quantized tensor is in following shape
-   * - quantized data: (H, W)
-   * - scales: (W)
-   *
-   * For embedding, there are in_dim elements in scale.
-   * So we should use (out_dim, in_dim) dimension although actual tensor
-   * shape is (in_dim, out_dim)
-   *
-   * @todo Add other types that needs to be transposed
-   * @todo Allow other axis can be a quantization axis
-   */
-  if (context.getWeightDataType() == nntrainer::TensorDim::DataType::QS4CX) {
-    dim.height(out_dim);
-    dim.width(in_dim);
-  } else {
-    dim.height(in_dim);
-    dim.width(out_dim);
-  }
-
-  weight_idx = context.requestWeight(
-    dim, weight_initializer, weight_regularizer, weight_regularizer_constant,
-    weight_decay, "Embedding", true);
+  return output_dims;
 }
 
 void EmbeddingLayer::setProperty(const std::vector<std::string> &values) {
@@ -833,6 +811,50 @@ void EmbeddingLayer::save(std::ofstream &file,
       }
     }
   }
+}
+
+std::array<std::vector<nntrainer::TensorDim>, 3>
+EmbeddingLayer::getLayerDimensions(nntrainer::InitLayerContext &context) {
+  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
+    << "Embedding layer takes only one input";
+
+  const nntrainer::TensorDim &input_dim =
+    context.getInputDimensions()[SINGLE_INOUT_IDX];
+  NNTR_THROW_IF(input_dim.channel() != 1, std::invalid_argument)
+    << "Embedding layer takes only one for channel size";
+
+  size_t in_dim =
+    static_cast<size_t>(std::get<nntrainer::props::InDim>(embedding_props));
+  size_t out_dim =
+    static_cast<size_t>(std::get<nntrainer::props::OutDim>(embedding_props));
+
+  std::vector<nntrainer::TensorDim> output_dims;
+  nntrainer::TensorDim output_dim = input_dim;
+
+  // output_dim expected as hidden x num input (batch size)
+  output_dim.height(input_dim.width());
+  output_dim.width(out_dim);
+  output_dim.setTensorType(
+    {context.getFormat(), context.getActivationDataType()});
+  output_dims.push_back(output_dim);
+
+  std::vector<nntrainer::TensorDim> weight_dims;
+  nntrainer::TensorDim weight_dim = output_dim;
+
+  weight_dim.setTensorType({context.getFormat(), context.getWeightDataType()});
+  weight_dim.batch(1);
+
+  if (context.getWeightDataType() == nntrainer::TensorDim::DataType::QS4CX) {
+    weight_dim.height(out_dim);
+    weight_dim.width(in_dim);
+  } else {
+    weight_dim.height(in_dim);
+    weight_dim.width(out_dim);
+  }
+
+  weight_dims.push_back(weight_dim);
+
+  return {output_dims, weight_dims, {}};
 }
 
 #ifdef PLUGGABLE

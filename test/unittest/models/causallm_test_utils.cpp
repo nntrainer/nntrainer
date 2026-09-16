@@ -497,8 +497,14 @@ FixtureConfigs loadFixtureConfigs(const std::filesystem::path &dir) {
 bool runQuantize(const std::string &quantize_bin,
                  const std::filesystem::path &fp32_dir,
                  const std::filesystem::path &out_dir) {
-  std::string cmd = quantize_bin + " " + fp32_dir.string() + " -o " +
-                    out_dir.string() + " --fc_dtype Q4_0 2>&1";
+  std::string cmd = "";
+#ifndef _WIN32
+  if (const char *ld_path = std::getenv("LD_LIBRARY_PATH")) {
+    cmd += "LD_LIBRARY_PATH=" + std::string(ld_path) + " ";
+  }
+#endif
+  cmd += quantize_bin + " " + fp32_dir.string() + " -o " + out_dir.string() +
+         " --fc_dtype Q4_0 2>&1";
   int ret = std::system(cmd.c_str());
   return ret == 0;
 }

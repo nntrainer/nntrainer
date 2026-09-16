@@ -176,6 +176,20 @@ public:
   virtual const std::string getType() const = 0;
 
   /**
+   * @brief     get output, weight and tensor dimensions of layer
+   * @param     context Context of the layer
+   *
+   * @details   Input dimensions will be provided set in the context. This
+   * function must set output dimensions in the given context. Further, context
+   * can be finalze weights for the layer, and any extra tensor required
+   * for the operation of the layer.
+   */
+  virtual std::array<std::vector<TensorDim>, 3>
+  getLayerDimensions(InitLayerContext &context) {
+    return {std::move(context.getInputDimensions()), {}, {}};
+  };
+
+  /**
    * @brief     Finalize creating the layer
    * @param     context Context of the layer
    *
@@ -288,14 +302,14 @@ public:
 
   /**
    * @brief Update the tensor dimensions of layer by input dimensions
-   * @param     context Context of the layer
-   * @param     input_dimensions input dimensions of layer
+   * @param     init_context InitLayerContext of the layer
+   * @param     run_context RunLayerContext of the layer
    * @details Update the dimensions of inputs, outputs, weights and tensors
    * based on the input dimensions
    */
-  virtual void
-  updateTensorsByInputDimensions(RunLayerContext &context,
-                                 std::vector<TensorDim> input_dimensions) {
+  virtual std::vector<TensorDim>
+  updateTensorsByInputDimensions(InitLayerContext &init_context,
+                                 RunLayerContext &run_context) {
     throw std::invalid_argument("updateTensorsByInputDimensions() is currently "
                                 "not supported for layer type " +
                                 getType());

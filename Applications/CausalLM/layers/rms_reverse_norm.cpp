@@ -170,18 +170,23 @@ void RMSReverseNormLayer::incremental_forwarding(
   }
 }
 
-void RMSReverseNormLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  ml::train::TensorDim input_dim = context.getInput(SINGLE_INOUT_IDX).getDim();
+std::vector<nntrainer::TensorDim>
+RMSReverseNormLayer::updateTensorsByInputDimensions(
+  nntrainer::InitLayerContext &init_context,
+  nntrainer::RunLayerContext &run_context) {
+  auto input_dimensions = init_context.getInputDimensions();
+  ml::train::TensorDim input_dim =
+    run_context.getInput(SINGLE_INOUT_IDX).getDim();
   ml::train::TensorDim output_dim =
-    context.getOutput(SINGLE_INOUT_IDX).getDim();
+    run_context.getOutput(SINGLE_INOUT_IDX).getDim();
 
   input_dim.height(input_dimensions[0].height());
   output_dim.height(input_dimensions[0].height());
 
-  context.updateInput(SINGLE_INOUT_IDX, input_dim);
-  context.updateOutput(SINGLE_INOUT_IDX, output_dim);
+  run_context.updateInput(SINGLE_INOUT_IDX, input_dim);
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dim);
+
+  return {output_dim};
 }
 
 void RMSReverseNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {

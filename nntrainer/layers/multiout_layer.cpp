@@ -23,11 +23,24 @@ namespace nntrainer {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 void MultiOutLayer::finalize(InitLayerContext &context) {
-  std::vector<TensorDim> out_dims(context.getNumRequestedOutputs());
-  const TensorDim &in_dim = context.getInputDimensions()[0];
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
+  context.setOutputDimensions(output_dims);
+}
 
-  std::fill(out_dims.begin(), out_dims.end(), in_dim);
-  context.setOutputDimensions(out_dims);
+std::vector<TensorDim>
+MultiOutLayer::updateTensorsByInputDimensions(InitLayerContext &init_context,
+                                              RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  for (size_t i = 0; i < run_context.getNumOutputs(); ++i) {
+    run_context.updateOutput(i, output_dims[i]);
+  }
+
+  return output_dims;
 }
 
 void MultiOutLayer::forwarding(RunLayerContext &context, bool training) {
@@ -88,14 +101,14 @@ void MultiOutLayer::setProperty(const std::vector<std::string> &values) {
   }
 }
 
-void MultiOutLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
+std::array<std::vector<TensorDim>, 3>
+MultiOutLayer::getLayerDimensions(InitLayerContext &context) {
+  std::vector<TensorDim> out_dims(context.getNumRequestedOutputs());
+  const TensorDim &in_dim = context.getInputDimensions()[SINGLE_INOUT_IDX];
 
-  for (size_t i = 0; i < context.getNumOutputs(); ++i) {
-    context.updateOutput(i, input_dimensions[0]);
-  }
+  std::fill(out_dims.begin(), out_dims.end(), in_dim);
+
+  return {out_dims, {}, {}};
 }
 
 } /* namespace nntrainer */

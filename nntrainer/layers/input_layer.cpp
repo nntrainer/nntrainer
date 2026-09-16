@@ -84,22 +84,30 @@ void InputLayer::exportTo(Exporter &exporter,
 }
 
 void InputLayer::finalize(InitLayerContext &context) {
-
-  std::vector<TensorDim> output_dims = context.getInputDimensions();
-  // Preserve the declared input dtype — the previous behaviour of silently
-  // promoting FP32 inputs to the model's activation dtype clobbers integer-
-  // valued inputs (e.g. embedding token IDs) when the model runs at FP16.
-  // Models that want a dtype change should declare it on the input layer
-  // (input_dtype=FP16) instead of relying on an implicit promotion here.
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
   context.setOutputDimensions(output_dims);
+
   is_inplace = output_dims == context.getInputDimensions();
 }
 
-void InputLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
-  context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
+std::vector<TensorDim>
+InputLayer::updateTensorsByInputDimensions(InitLayerContext &init_context,
+                                           RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  run_context.updateInput(SINGLE_INOUT_IDX,
+                          init_context.getInputDimensions()[SINGLE_INOUT_IDX]);
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
+
+  return output_dims;
+}
+
+std::array<std::vector<TensorDim>, 3>
+InputLayer::getLayerDimensions(InitLayerContext &context) {
+  std::vector<TensorDim> output_dims = context.getInputDimensions();
+  return {output_dims, {}, {}};
 }
 
 } /* namespace nntrainer */

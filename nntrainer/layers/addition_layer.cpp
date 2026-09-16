@@ -24,9 +24,26 @@ namespace nntrainer {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 
 void AdditionLayer::finalize(InitLayerContext &context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(context);
+  context.setOutputDimensions(output_dims);
+
   if (!std::get<props::SkipPrefill>(add_props).empty())
     skip_prefill = std::get<props::SkipPrefill>(add_props).get();
-  context.setOutputDimensions({context.getInputDimensions()[0]});
+}
+
+std::vector<TensorDim>
+AdditionLayer::updateTensorsByInputDimensions(InitLayerContext &init_context,
+                                              RunLayerContext &run_context) {
+  [[maybe_unused]] auto [output_dims, weight_dims, tensor_dims] =
+    getLayerDimensions(init_context);
+
+  for (size_t i = 0; i < run_context.getNumInputs(); ++i) {
+    run_context.updateInput(i, init_context.getInputDimensions()[i]);
+  }
+  run_context.updateOutput(SINGLE_INOUT_IDX, output_dims[SINGLE_INOUT_IDX]);
+
+  return output_dims;
 }
 
 void AdditionLayer::forwarding(RunLayerContext &context, bool training) {
@@ -103,13 +120,21 @@ void AdditionLayer::setProperty(const std::vector<std::string> &values) {
   }
 }
 
-void AdditionLayer::updateTensorsByInputDimensions(
-  nntrainer::RunLayerContext &context,
-  std::vector<nntrainer::TensorDim> input_dimensions) {
-  for (size_t i = 0; i < context.getNumInputs(); ++i) {
-    context.updateInput(i, input_dimensions[0]);
-  }
-  context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
+std::array<std::vector<TensorDim>, 3>
+AdditionLayer::getLayerDimensions(InitLayerContext &context) {
+  std::vector<TensorDim> output_dims(1);
+  output_dims[SINGLE_INOUT_IDX] =
+    context.getInputDimensions()[SINGLE_INOUT_IDX];
+
+  NNTR_THROW_IF(std::any_of(context.getInputDimensions().cbegin(),
+                            context.getInputDimensions().cend(),
+                            [&output_dims](const TensorDim &dim) {
+                              return output_dims[SINGLE_INOUT_IDX] != dim;
+                            }),
+                std::invalid_argument)
+    << "All of input dimensions of addition layer SHOULD BE identical";
+
+  return {output_dims, {}, {}};
 }
 
 } /* namespace nntrainer */

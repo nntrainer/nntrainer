@@ -149,6 +149,14 @@ public:
   WIN_EXPORT void finalize(nntrainer::InitLayerContext &context) override;
 
   /**
+   * @copydoc Layer::updateTensorsByInputDimensions(InitLayerContext
+   * &init_context, RunLayerContext &context)
+   */
+  WIN_EXPORT std::vector<nntrainer::TensorDim> updateTensorsByInputDimensions(
+    nntrainer::InitLayerContext &init_context,
+    nntrainer::RunLayerContext &run_context) override;
+
+  /**
    * @copydoc Layer::forwarding(RunLayerContext &context, bool training)
    */
   WIN_EXPORT void forwarding(nntrainer::RunLayerContext &context,
@@ -221,6 +229,12 @@ private:
     embedding_props;
   unsigned int weight_idx;
   std::shared_ptr<QuantLut> quant_lut;
+
+  /**
+   * @copydoc Layer::getLayerDimensions(InitLayerContext &context)
+   */
+  std::array<std::vector<nntrainer::TensorDim>, 3>
+  getLayerDimensions(nntrainer::InitLayerContext &context) override;
 };
 } // namespace causallm
 
