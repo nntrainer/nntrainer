@@ -20,6 +20,8 @@
 
 #include "hvx_gemm_u8i4_wh.h"
 
+#include <stddef.h>
+
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
 
