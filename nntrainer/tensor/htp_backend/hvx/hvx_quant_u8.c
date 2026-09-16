@@ -73,17 +73,10 @@ static void quant_row_params_one(const float *x, uint32_t m, uint32_t k,
       max0 = row[i];
     }
   }
-  hvx_quant_row_params_from_minmax(min0, max0, scale + m, zp + m);
-}
-
-void hvx_quant_row_params_from_minmax(float min0, float max0, float *scale,
-                                      int32_t *zp) {
   const float rmin = min0 < 0.0f ? min0 : 0.0f;
   const float rmax = max0 > 0.0f ? max0 : 0.0f;
   if (rmin == rmax) {
-    *scale = 1.0f; /* the padding-row defaults: a flat row quantizes to zp */
-    *zp = 0;
-    return;
+    return; /* leaves scale 1, zp 0 */
   }
   const float s = (rmax - rmin) / 255.0f;
   /** nearbyintf, not roundf: the vectorized path rounds to nearest even
@@ -95,8 +88,8 @@ void hvx_quant_row_params_from_minmax(float min0, float max0, float *scale,
   if (z > 255) {
     z = 255;
   }
-  *scale = s;
-  *zp = z;
+  scale[m] = s;
+  zp[m] = z;
 }
 
 typedef struct {

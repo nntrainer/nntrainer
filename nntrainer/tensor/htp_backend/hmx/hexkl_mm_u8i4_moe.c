@@ -375,30 +375,6 @@ static void moe_tail_down_unit(uint32_t n_units, uint32_t nt, void *v) {
   moe_tail_probe_add(t0);
 }
 
-/** @brief Folds a retired SwiGLU job's per-worker extrema into the block's
- *         running row extrema. n_parts is how many workers the submit gave
- *         it (min(units, workers)); a job that ran inline (no workers) has
- *         its one part at index 0, which is what the pool's inline path
- *         reports as n_threads == 1. */
-static void moe_fold_extrema(const hvx_dq_swiglu_job *jb, uint32_t n_parts,
-                             float *row_min, float *row_max) {
-  if (n_parts > HVX_DQ_SWIGLU_MAX_PARTS) {
-    n_parts = HVX_DQ_SWIGLU_MAX_PARTS;
-  }
-  for (uint32_t w = 0; w < n_parts; ++w) {
-    const float *mn = jb->rmin + (size_t)w * HEXKL_HMX_INT8_BLOCK_N_ROW;
-    const float *mx = jb->rmax + (size_t)w * HEXKL_HMX_INT8_BLOCK_N_ROW;
-    for (uint32_t m = 0; m < jb->m_count; ++m) {
-      if (mn[m] < row_min[m]) {
-        row_min[m] = mn[m];
-      }
-      if (mx[m] > row_max[m]) {
-        row_max[m] = mx[m];
-      }
-    }
-  }
-}
-
 /** @brief Rows of expert e's tail, 0 when it has none: a block of at most
  *         MOE_TAIL_MAX_ROWS after at least one full one. */
 static uint32_t moe_tail_rows(uint32_t n_e) {
@@ -741,9 +717,6 @@ int hexkl_mm_u8i4_moe_layer_run(
   const size_t sz_tail_rq = sizeof(float) * HEXKL_HMX_INT8_BLOCK_N_ROW;
   const size_t sz_tail_res =
     sizeof(float) * MOE_TAIL_MAX_ROWS * (size_t)N_out * n_experts;
-  /* Per-worker row extrema from the two in-flight SwiGLU epilogues (O4):
-     the requantization's scan folds these instead of re-reading the block. */
-  const size_t sz_ext = sizeof(float) * HVX_DQ_SWIGLU_MAX_PARTS * BR;
   const size_t need = ROUND_UP_SZ(sz_scale, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_zp, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_act_ah, MOE_SCRATCH_ALIGN) +
@@ -762,8 +735,7 @@ int hexkl_mm_u8i4_moe_layer_run(
                       ROUND_UP_SZ(sz_tail_mid, MOE_SCRATCH_ALIGN) +
                       2u * ROUND_UP_SZ(sz_tail_rq, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_tail_res, MOE_SCRATCH_ALIGN) +
-                      ROUND_UP_SZ(sz_expert_u32, MOE_SCRATCH_ALIGN) +
-                      4u * ROUND_UP_SZ(sz_ext, MOE_SCRATCH_ALIGN);
+                      ROUND_UP_SZ(sz_expert_u32, MOE_SCRATCH_ALIGN);
   uint64_t p_alloc = 0;
   HEXKL_PROBE_T0(p_alloc);
   rc = moe_scratch_reserve(scratch, need);
@@ -799,14 +771,6 @@ int hexkl_mm_u8i4_moe_layer_run(
   float *tail_res = (float *)moe_carve(&cur, sz_tail_res);
   /* Per active expert: its tail's index, or UINT32_MAX. */
   uint32_t *tail_of = (uint32_t *)moe_carve(&cur, sz_expert_u32);
-  float *ext_min[2], *ext_max[2];
-  ext_min[0] = (float *)moe_carve(&cur, sz_ext);
-  ext_max[0] = (float *)moe_carve(&cur, sz_ext);
-  ext_min[1] = (float *)moe_carve(&cur, sz_ext);
-  ext_max[1] = (float *)moe_carve(&cur, sz_ext);
-  /* The block's running row extrema, folded from the epilogues. */
-  float row_min[HEXKL_HMX_INT8_BLOCK_N_ROW],
-    row_max[HEXKL_HMX_INT8_BLOCK_N_ROW];
   hvx_bg_job *pack_job = &jobs[0];
   hvx_bg_job *last_job = NULL;
   uint32_t n_tails = 0u;
@@ -817,8 +781,6 @@ int hexkl_mm_u8i4_moe_layer_run(
      retires it, so they live here, not in the loop body: one per staging
      buffer for the two epilogues, one for the scatter. */
   hvx_dq_swiglu_job gu_job[2];
-  uint32_t gu_parts[2] = {0u, 0u};
-  uint32_t gu_last = 0u;
   hvx_dq_tiles_job dn_job[2];
   moe_scatter_ctx sc;
   /* MOE_MM_BEGIN/END's state. See the macros above hexkl_mm_u8i4_moe_layout
@@ -1038,14 +1000,6 @@ int hexkl_mm_u8i4_moe_layer_run(
         }
       }
 
-      /* The block's row extrema start at 0 -- the parameters fold 0 in
-         anyway -- and each retired epilogue folds its workers' partials in
-         (O4: the requantization's scan is this fold, not a second pass). */
-      for (uint32_t r = 0; r < m_blk; ++r) {
-        row_min[r] = 0.0f;
-        row_max[r] = 0.0f;
-      }
-
       /* --- gate_up ------------------------------------------------- */
       /* Matmul a batch of gate/up PAIRS -- gate tiles g0.. into staged
          slots [0, np) of one staging buffer, the up tiles opposite them
@@ -1111,10 +1065,6 @@ int hexkl_mm_u8i4_moe_layer_run(
         hvx_worker_pool_wait(pool);
         HEXKL_PROBE_ADD(ci == 0u ? HEXKL_PROBE_SCATTER : HEXKL_PROBE_DEQUANT,
                         p0);
-        if (ci != 0u) {
-          moe_fold_extrema(&gu_job[(ci - 1u) & 1u], gu_parts[(ci - 1u) & 1u],
-                           row_min, row_max);
-        }
         {
           hvx_dq_swiglu_job *jb = &gu_job[ci & 1u];
           jb->tiles_base =
@@ -1133,11 +1083,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           jb->inter = inter;
           jb->dst = (float *)(vtcm_base + L.gate_off);
           jb->dst_stride = inter;
-          jb->rmin = ext_min[ci & 1u];
-          jb->rmax = ext_max[ci & 1u];
-          gu_parts[ci & 1u] = hvx_worker_pool_submit_parts(pool, np);
           hvx_worker_pool_submit(pool, hvx_dq_swiglu_worker, jb, np);
-          gu_last = ci;
         }
       }
       /* The last epilogue has nothing to hide behind: requant needs all of
@@ -1145,8 +1091,6 @@ int hexkl_mm_u8i4_moe_layer_run(
       HEXKL_PROBE_T0(p0);
       hvx_worker_pool_wait(pool);
       HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
-      moe_fold_extrema(&gu_job[gu_last & 1u], gu_parts[gu_last & 1u], row_min,
-                       row_max);
 
       /* A is dead once the last block's gate_up matmul is done, so the next
          expert's first activation block and then its gate_up go out now
@@ -1177,18 +1121,8 @@ int hexkl_mm_u8i4_moe_layer_run(
       /* gate_off holds silu(gate)*up for this block. Requantize it for
          down -- on the pool, synchronously: down's HMX needs all of mid. */
       HEXKL_PROBE_T0(p0);
-      /* The scan is already done: the epilogues tracked each row's extrema
-         as they wrote it. Same parameters as hvx_quant_rows_u8_params
-         computes from a second pass (it calls this same function). */
-      for (uint32_t r = 0; r < BR; ++r) {
-        if (r < m_blk) {
-          hvx_quant_row_params_from_minmax(row_min[r], row_max[r], scale + r,
-                                           zp + r);
-        } else {
-          scale[r] = 1.0f;
-          zp[r] = 0;
-        }
-      }
+      hvx_quant_rows_u8_params((const float *)(vtcm_base + L.gate_off), m_blk,
+                               BR, inter, scale, zp, pool);
       rc =
         hvx_quant_pack_u8_ah((const float *)(vtcm_base + L.gate_off), m_blk, BR,
                              inter, scale, zp, vtcm_base + L.mid_off, pool);

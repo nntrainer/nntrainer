@@ -75,12 +75,6 @@ void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
  *         flight. */
 void hvx_worker_pool_wait(hvx_worker_pool *pool);
 
-/** @brief How many slices a submit of @a n_units would be split into --
- *         min(n_units, workers), or 1 when it would run inline -- so a job
- *         that leaves per-slice results knows how many to fold. */
-uint32_t hvx_worker_pool_submit_parts(const hvx_worker_pool *pool,
-                                      uint32_t n_units);
-
 /**
  * @brief A background job: func(n_units, u, ctx) for u in [0, n_units),
  *        claimed one unit at a time by whichever worker has no run/submit

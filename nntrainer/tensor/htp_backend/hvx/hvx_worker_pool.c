@@ -42,6 +42,10 @@ static inline void hvx_worker_pool_pause(void) {
  *         rather than the 16 the quant kernels needed. */
 #define HVX_WORKER_POOL_STACK_SIZE (32u * 1024u)
 
+/** @brief Pause iterations a worker spins before it sleeps; pause(#255) is
+ *         ~255 cycles, so 400 is ~100 us at 1 GHz. See the worker loop. */
+#define HVX_WORKER_POOL_SPIN 400u
+
 typedef struct hvx_worker_pool_s hvx_worker_pool;
 
 typedef struct {
@@ -152,7 +156,22 @@ static void hvx_worker_pool_thread_entry(void *arg) {
     if (hvx_worker_pool_bg_take_one(pool)) {
       continue;
     }
-    qurt_futex_wait(&pool->seqn, (int)seqn);
+    /* Spin before sleeping. The MoE kernel submits an epilogue every ~47
+       us and runs a requant every block, and a futex wake is several
+       microseconds a worker each time -- paid ~140 times a call, and
+       what the profile reads in the DEQUANT and REQUANT columns after
+       the work itself is subtracted (doc 47 section 22.1). ~100 us of
+       pause(#255) covers the gap between two submits; a worker that
+       sees nothing in that time is between calls and sleeps as before. */
+    for (uint32_t spin = 0; spin < HVX_WORKER_POOL_SPIN; ++spin) {
+      if (atomic_load_explicit(&pool->seqn, memory_order_acquire) != seqn) {
+        break;
+      }
+      hvx_worker_pool_pause();
+    }
+    if (atomic_load_explicit(&pool->seqn, memory_order_acquire) == seqn) {
+      qurt_futex_wait(&pool->seqn, (int)seqn);
+    }
   }
 }
 
@@ -248,14 +267,6 @@ void hvx_worker_pool_wait(hvx_worker_pool *pool) {
   }
   atomic_thread_fence(memory_order_acquire);
   pool->outstanding = 0;
-}
-
-uint32_t hvx_worker_pool_submit_parts(const hvx_worker_pool *pool,
-                                      uint32_t n_units) {
-  if (n_units == 0u || !pool || pool->n_workers == 0) {
-    return 1u;
-  }
-  return n_units > pool->n_workers ? pool->n_workers : n_units;
 }
 
 void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
