@@ -37,9 +37,10 @@ static inline void hvx_worker_pool_pause(void) {
 #endif
 }
 
-/** @brief Per-worker stack, generous for the quant kernels this pool
- *         currently runs (a handful of HVX vector locals, no recursion). */
-#define HVX_WORKER_POOL_STACK_SIZE (16u * 1024u)
+/** @brief Per-worker stack. The tail-block units (hvx_gemm_u8i4_wh.c and
+ *         the epilogues they call) keep a dozen HVX vectors live, so 32 KB
+ *         rather than the 16 the quant kernels needed. */
+#define HVX_WORKER_POOL_STACK_SIZE (32u * 1024u)
 
 typedef struct hvx_worker_pool_s hvx_worker_pool;
 
@@ -65,20 +66,14 @@ struct hvx_worker_pool_s {
   int async;
   int outstanding; /**< caller-side: a submit not yet waited for */
 
-  /** The background lane (hvx_worker_pool_submit_bg). bg_next is the claim
-      counter: a worker owns unit u once its CAS u -> u+1 succeeds, and
-      reads bg_func/bg_ctx/bg_n only AFTER that -- the submit stores them
-      before it publishes bg_next = 0 with release, so a claim through the
-      counter's release sequence sees the job it belongs to, even from a
-      worker that read a stale bg_n and got in through an overshoot (the
-      re-check after the claim drops that unit). */
-  hvx_worker_pool_func bg_func;
-  void *bg_ctx;
-  _Atomic uint32_t bg_n;
-  _Atomic uint32_t bg_next;
-  _Atomic uint8_t *bg_done; /**< caller-owned, one byte per unit */
-  uint32_t bg_low;          /**< caller-side: units [0, bg_low) seen done */
-  int bg_outstanding;
+  /** The background lane: a ring of caller-owned jobs in submit order.
+      Workers scan from head; a job's units are claimable only once every
+      job before it is complete, and a claim is a CAS on the job's own
+      counter, so a job's fields are fixed from before its publication
+      (the release store of bg_tail) and never reused. */
+  hvx_bg_job *bg_ring[HVX_WORKER_POOL_BG_DEPTH];
+  _Atomic uint32_t bg_head; /**< oldest job not yet popped by the caller */
+  _Atomic uint32_t bg_tail; /**< next slot; head == tail means empty */
 
   uint32_t n_workers;
   qurt_thread_t *tids;
@@ -86,27 +81,43 @@ struct hvx_worker_pool_s {
   unsigned char *stack_blob;
 };
 
-/** @brief Claims and runs one background unit; 0 when there is none. */
-static int hvx_worker_pool_bg_take_one(hvx_worker_pool *pool) {
+/** @brief Claims and runs one unit of @a job; 0 when it has none left. */
+static int hvx_worker_pool_bg_take_from(hvx_bg_job *job) {
+  uint32_t u = atomic_load_explicit(&job->next, memory_order_relaxed);
   for (;;) {
-    uint32_t u = atomic_load_explicit(&pool->bg_next, memory_order_acquire);
-    if (u >= atomic_load_explicit(&pool->bg_n, memory_order_relaxed)) {
+    if (u >= job->n_units) {
       return 0;
     }
-    if (atomic_compare_exchange_weak_explicit(&pool->bg_next, &u, u + 1u,
-                                              memory_order_acq_rel,
-                                              memory_order_acquire)) {
-      /* Fields after the claim, see the struct comment. bg_n re-read: the
-         one above may have been the previous job's larger count. */
-      const uint32_t n =
-        atomic_load_explicit(&pool->bg_n, memory_order_relaxed);
-      if (u < n) {
-        pool->bg_func(n, u, pool->bg_ctx);
-        atomic_store_explicit(&pool->bg_done[u], 1, memory_order_release);
-      }
-      return 1;
+    if (atomic_compare_exchange_weak_explicit(
+          &job->next, &u, u + 1u, memory_order_acq_rel, memory_order_relaxed)) {
+      break;
     }
   }
+  job->func(job->n_units, u, job->ctx);
+  atomic_store_explicit((_Atomic uint8_t *)&job->done[u], 1,
+                        memory_order_release);
+  if (atomic_fetch_add_explicit(&job->n_done, 1u, memory_order_acq_rel) + 1u ==
+      job->n_units) {
+    atomic_store_explicit(&job->complete, 1, memory_order_release);
+  }
+  return 1;
+}
+
+/** @brief Claims and runs one background unit from the oldest job that has
+ *         one, stopping at the first incomplete job that has none left --
+ *         the jobs behind it are gated on it. 0 when there is nothing. */
+static int hvx_worker_pool_bg_take_one(hvx_worker_pool *pool) {
+  const uint32_t tail =
+    atomic_load_explicit(&pool->bg_tail, memory_order_acquire);
+  for (uint32_t i = atomic_load_explicit(&pool->bg_head, memory_order_relaxed);
+       i != tail; ++i) {
+    hvx_bg_job *job = pool->bg_ring[i % HVX_WORKER_POOL_BG_DEPTH];
+    if (atomic_load_explicit(&job->complete, memory_order_acquire)) {
+      continue;
+    }
+    return hvx_worker_pool_bg_take_from(job);
+  }
+  return 0;
 }
 
 static void hvx_worker_pool_thread_entry(void *arg) {
@@ -154,8 +165,8 @@ hvx_worker_pool *hvx_worker_pool_create(uint32_t n_workers) {
   atomic_init(&pool->fg_id, 0);
   atomic_init(&pool->barrier, 0);
   atomic_init(&pool->killed, 0);
-  atomic_init(&pool->bg_n, 0);
-  atomic_init(&pool->bg_next, 0);
+  atomic_init(&pool->bg_head, 0);
+  atomic_init(&pool->bg_tail, 0);
   pool->n_workers = n_workers;
 
   if (n_workers == 0) {
@@ -266,56 +277,84 @@ void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
   qurt_futex_wake(&pool->seqn, (int)pool->n_workers);
 }
 
-void hvx_worker_pool_submit_bg(hvx_worker_pool *pool, hvx_worker_pool_func func,
-                               void *ctx, uint32_t n_units, uint8_t *done) {
-  if (n_units == 0u || !done) {
+/** @brief Pops complete jobs off the head of the ring. Caller-side. */
+static void hvx_worker_pool_bg_pop(hvx_worker_pool *pool) {
+  uint32_t head = atomic_load_explicit(&pool->bg_head, memory_order_relaxed);
+  const uint32_t tail =
+    atomic_load_explicit(&pool->bg_tail, memory_order_relaxed);
+  while (head != tail &&
+         atomic_load_explicit(
+           &pool->bg_ring[head % HVX_WORKER_POOL_BG_DEPTH]->complete,
+           memory_order_acquire)) {
+    ++head;
+  }
+  atomic_store_explicit(&pool->bg_head, head, memory_order_release);
+}
+
+void hvx_worker_pool_submit_bg(hvx_worker_pool *pool, hvx_bg_job *job) {
+  if (!job || job->n_units == 0u || !job->done) {
     return;
   }
+  for (uint32_t u = 0; u < job->n_units; ++u) {
+    job->done[u] = 0;
+  }
+  atomic_init(&job->next, 0);
+  atomic_init(&job->n_done, 0);
+  atomic_init(&job->complete, 0);
+  job->low = 0;
   if (!pool || pool->n_workers == 0) {
-    for (uint32_t u = 0; u < n_units; ++u) {
-      func(n_units, u, ctx);
-      done[u] = 1;
+    for (uint32_t u = 0; u < job->n_units; ++u) {
+      job->func(job->n_units, u, job->ctx);
+      job->done[u] = 1;
     }
+    atomic_store_explicit(&job->n_done, job->n_units, memory_order_relaxed);
+    atomic_store_explicit(&job->complete, 1, memory_order_relaxed);
     return;
   }
-  hvx_worker_pool_wait_bg(pool, UINT32_MAX);
-  /* All of the previous job is done, so bg_next == bg_n and no worker can
-     claim through it: the fields below are safe to replace, and the
-     release store of bg_next = 0 is what publishes them. */
-  for (uint32_t u = 0; u < n_units; ++u) {
-    done[u] = 0;
+  hvx_worker_pool_bg_pop(pool);
+  /* Ring full: the oldest job has to finish first. Helping while waiting
+     is what makes that finish. */
+  while (atomic_load_explicit(&pool->bg_tail, memory_order_relaxed) -
+           atomic_load_explicit(&pool->bg_head, memory_order_relaxed) >=
+         HVX_WORKER_POOL_BG_DEPTH) {
+    hvx_worker_pool_wait_bg(
+      pool,
+      pool->bg_ring[atomic_load_explicit(&pool->bg_head, memory_order_relaxed) %
+                    HVX_WORKER_POOL_BG_DEPTH],
+      UINT32_MAX);
+    hvx_worker_pool_bg_pop(pool);
   }
-  pool->bg_func = func;
-  pool->bg_ctx = ctx;
-  pool->bg_done = (_Atomic uint8_t *)done;
-  pool->bg_low = 0;
-  pool->bg_outstanding = 1;
-  atomic_store_explicit(&pool->bg_n, n_units, memory_order_relaxed);
-  atomic_store_explicit(&pool->bg_next, 0, memory_order_release);
+  const uint32_t tail =
+    atomic_load_explicit(&pool->bg_tail, memory_order_relaxed);
+  pool->bg_ring[tail % HVX_WORKER_POOL_BG_DEPTH] = job;
+  /* The job and its slot are visible before the tail that announces it. */
+  atomic_store_explicit(&pool->bg_tail, tail + 1u, memory_order_release);
   atomic_fetch_add_explicit(&pool->seqn, 1, memory_order_release);
   qurt_futex_wake(&pool->seqn, (int)pool->n_workers);
 }
 
-void hvx_worker_pool_wait_bg(hvx_worker_pool *pool, uint32_t n) {
-  if (!pool || !pool->bg_outstanding) {
-    return;
+void hvx_worker_pool_wait_bg(hvx_worker_pool *pool, hvx_bg_job *job,
+                             uint32_t n) {
+  if (!pool || !job || pool->n_workers == 0) {
+    return; /* inline jobs are complete at submit */
   }
-  const uint32_t total =
-    atomic_load_explicit(&pool->bg_n, memory_order_relaxed);
-  if (n > total) {
-    n = total;
-  }
-  while (pool->bg_low < n) {
-    if (atomic_load_explicit(&pool->bg_done[pool->bg_low],
-                             memory_order_acquire)) {
-      pool->bg_low++;
-    } else if (!hvx_worker_pool_bg_take_one(pool)) {
-      hvx_worker_pool_pause();
+  if (n >= job->n_units) {
+    while (!atomic_load_explicit(&job->complete, memory_order_acquire)) {
+      if (!hvx_worker_pool_bg_take_one(pool)) {
+        hvx_worker_pool_pause();
+      }
+    }
+  } else {
+    while (job->low < n) {
+      if (atomic_load_explicit((_Atomic uint8_t *)&job->done[job->low],
+                               memory_order_acquire)) {
+        job->low++;
+      } else if (!hvx_worker_pool_bg_take_one(pool)) {
+        hvx_worker_pool_pause();
+      }
     }
   }
-  if (pool->bg_low == total) {
-    pool->bg_outstanding = 0;
-  }
+  hvx_worker_pool_bg_pop(pool);
 }
 
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,

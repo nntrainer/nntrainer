@@ -61,7 +61,12 @@ static void bg_round(hvx_worker_pool *pool, uint32_t n_units, uint8_t *done,
                      int with_fg) {
   bg_ctx *bg = (bg_ctx *)calloc(1, sizeof(*bg));
   bg->n = n_units;
-  hvx_worker_pool_submit_bg(pool, bg_unit, bg, n_units, done);
+  hvx_bg_job job;
+  job.func = bg_unit;
+  job.ctx = bg;
+  job.n_units = n_units;
+  job.done = done;
+  hvx_worker_pool_submit_bg(pool, &job);
 
   if (with_fg) {
     for (int j = 0; j < 40; ++j) {
@@ -71,7 +76,7 @@ static void bg_round(hvx_worker_pool *pool, uint32_t n_units, uint8_t *done,
       hvx_worker_pool_submit(pool, fg_slice, &fg, 3u);
       /* wait_bg between submit and wait: the caller helps with units while
          a foreground job is outstanding, as the kernel does. */
-      hvx_worker_pool_wait_bg(pool, (uint32_t)(j * 3));
+      hvx_worker_pool_wait_bg(pool, &job, (uint32_t)(j * 3));
       for (uint32_t u = 0; u < (uint32_t)(j * 3) && u < n_units; ++u)
         CHECK(atomic_load(&bg->count[u]) == 1u,
               "wait_bg(%d) returned with unit %u not done", j * 3, u);
@@ -94,7 +99,7 @@ static void bg_round(hvx_worker_pool *pool, uint32_t n_units, uint8_t *done,
               "run slice %u ran %u times", s, atomic_load(&fg.slices[s]));
     }
   }
-  hvx_worker_pool_wait_bg(pool, UINT32_MAX);
+  hvx_worker_pool_wait_bg(pool, &job, UINT32_MAX);
   for (uint32_t u = 0; u < n_units; ++u) {
     CHECK(atomic_load(&bg->count[u]) == 1u, "unit %u ran %u times", u,
           atomic_load(&bg->count[u]));
@@ -104,6 +109,63 @@ static void bg_round(hvx_worker_pool *pool, uint32_t n_units, uint8_t *done,
   for (uint32_t u = n_units; u < MAX_UNITS; ++u)
     CHECK(atomic_load(&bg->count[u]) == 0u, "unit %u past the end ran", u);
   free(bg);
+}
+
+/* Gating: a job's units must only ever run once the job before it is
+   complete. Three jobs in a row; every unit of job k records whether job
+   k-1 was complete when it started. */
+typedef struct {
+  _Atomic uint32_t done_units;
+  _Atomic int complete;
+  hvx_bg_job *prev;
+  _Atomic uint32_t violations;
+} gate_ctx;
+
+static void gate_unit(uint32_t n_units, uint32_t u, void *v) {
+  gate_ctx *c = (gate_ctx *)v;
+  (void)u;
+  if (c->prev && !atomic_load(&c->prev->complete))
+    atomic_fetch_add(&c->violations, 1u);
+  volatile uint32_t spin = 0;
+  for (uint32_t i = 0; i < 500u; ++i)
+    spin += i;
+  if (atomic_fetch_add(&c->done_units, 1u) + 1u == n_units)
+    atomic_store(&c->complete, 1);
+}
+
+static void gate_round(hvx_worker_pool *pool, uint8_t *done) {
+  hvx_bg_job jobs[3];
+  gate_ctx ctx[3];
+  const uint32_t n[3] = {40u, 1u, 64u};
+  for (int k = 0; k < 3; ++k) {
+    atomic_init(&ctx[k].done_units, 0);
+    atomic_init(&ctx[k].complete, 0);
+    atomic_init(&ctx[k].violations, 0);
+    ctx[k].prev = k ? &jobs[k - 1] : NULL;
+    jobs[k].func = gate_unit;
+    jobs[k].ctx = &ctx[k];
+    jobs[k].n_units = n[k];
+    jobs[k].done = done + k * 128;
+  }
+  for (int k = 0; k < 3; ++k)
+    hvx_worker_pool_submit_bg(pool, &jobs[k]);
+  /* foreground traffic meanwhile, as in the kernel */
+  for (int j = 0; j < 10; ++j) {
+    fg_ctx fg;
+    for (int s = 0; s < 8; ++s)
+      atomic_init(&fg.slices[s], 0);
+    hvx_worker_pool_submit(pool, fg_slice, &fg, 3u);
+    hvx_worker_pool_wait(pool);
+  }
+  hvx_worker_pool_wait_bg(pool, &jobs[2], UINT32_MAX);
+  for (int k = 0; k < 3; ++k) {
+    CHECK(atomic_load(&ctx[k].done_units) == n[k], "gate job %d ran %u of %u",
+          k, atomic_load(&ctx[k].done_units), n[k]);
+    CHECK(atomic_load(&ctx[k].violations) == 0u,
+          "gate job %d: %u units started before job %d completed", k,
+          atomic_load(&ctx[k].violations), k - 1);
+    CHECK(atomic_load(&jobs[k].complete) == 1, "gate job %d not complete", k);
+  }
 }
 
 int main(void) {
@@ -123,10 +185,9 @@ int main(void) {
     bg_round(pool, 5u, done, 0);    /* smaller after bigger: stale bg_n */
     bg_round(pool, 300u, done, 0);  /* bigger after smaller */
     bg_round(pool, 1u, done, 1);
+    gate_round(pool, done);
   }
-  /* A wait_bg with nothing submitted, and one past the end. */
-  hvx_worker_pool_wait_bg(pool, 10u);
-  hvx_worker_pool_wait_bg(NULL, 10u);
+  hvx_worker_pool_wait_bg(NULL, NULL, 10u);
   hvx_worker_pool_destroy(pool);
   free(done);
 

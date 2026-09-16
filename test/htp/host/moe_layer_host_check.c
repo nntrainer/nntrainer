@@ -11,6 +11,7 @@
 #include "hexkl_probe.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_gather_ah_u8.h"
+#include "hvx_gemm_u8i4_wh.h"
 #include "hvx_scale_add_f32.h"
 #include <AEEStdErr.h>
 #include <math.h>
@@ -33,22 +34,46 @@ int hexkl_micro_hmx_acc_clear_int32(void) {
   return 0;
 }
 
-/* Weight tile: 512 bytes = 1024 int4 nibbles = 32k x 32n, k-major.
-   Activation tile: 64 rows x 32 bytes u8. Both sides use this same model. */
+/* Weight tile: 512 bytes = 32k x 32n int4 in the device's WH layout
+   (htp_wh_layout.h: byte (k/8)*128 + c*4 + k%4, low nibble for k%8 < 4),
+   two's complement nibbles. The HMX stub, the HVX GEMM stand-in and the
+   reference all read a tile through this one function, so the layout is
+   the real one and the three cannot disagree on it -- the HVX GEMM's
+   whole claim is that it reads the same bytes as the HMX.
+   Activation tile: 64 rows x 32 bytes u8. */
+static int wh_value(const uint8_t *tile, uint32_t k, uint32_t c) {
+  const uint32_t byte = (k / 8u) * 128u + c * 4u + (k % 4u);
+  const int nib = (tile[byte] >> (((k / 4u) % 2u) ? 4 : 0)) & 0xF;
+  return nib >= 8 ? nib - 16 : nib;
+}
 int hexkl_micro_hmx_mm_u8i4(uint8_t *base, uint32_t act_off, uint32_t w_off) {
   const uint8_t *a = base + act_off;
   const uint8_t *w = base + w_off;
   for (int r = 0; r < 64; ++r)
-    for (int c = 0; c < 32; ++c) {
+    for (uint32_t c = 0; c < 32; ++c) {
       int32_t s = 0;
-      for (int k = 0; k < 32; ++k) {
-        int idx = k * 32 + c;
-        int nib = (w[idx >> 1] >> ((idx & 1) ? 4 : 0)) & 0xF;
-        s += (int32_t)a[r * 32 + k] * (int32_t)(nib - 8);
-      }
+      for (uint32_t k = 0; k < 32; ++k)
+        s += (int32_t)a[r * 32 + k] * wh_value(w, k, c);
       g_acc[r][c] += s;
     }
   return 0;
+}
+/* The HVX GEMM's stand-in: the same sum, over the tiles the kernel points
+   it at, into the row-stride-32 tile the header promises. */
+void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                          const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                          int32_t *out) {
+  for (uint32_t r = 0; r < m; ++r)
+    for (uint32_t c = 0; c < 32; ++c) {
+      int32_t s = 0;
+      for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+        const uint8_t *tile = wh + ((size_t)kt * n_col + nt) * 512u;
+        const uint8_t *arow = act_ah + (size_t)kt * 2048u + r * 32u;
+        for (uint32_t k = 0; k < 32; ++k)
+          s += (int32_t)arow[k] * wh_value(tile, k, c);
+      }
+      out[r * 32u + c] = s;
+    }
 }
 int hexkl_micro_hmx_acc_read_int32(uint8_t *base, uint32_t cfg, uint32_t off) {
   (void)cfg;
@@ -199,16 +224,17 @@ void hvx_worker_pool_wait(hvx_worker_pool *pool) { (void)pool; }
    the waits find them done. What this checks is that the kernel waits for
    the right block before it queues it -- a wait for too few units cannot
    show here, and a wait for too many only as a hang on device. */
-void hvx_worker_pool_submit_bg(hvx_worker_pool *pool, hvx_worker_pool_func func,
-                               void *ctx, uint32_t n_units, uint8_t *done) {
+void hvx_worker_pool_submit_bg(hvx_worker_pool *pool, hvx_bg_job *job) {
   (void)pool;
-  for (uint32_t u = 0; u < n_units; ++u) {
-    func(n_units, u, ctx);
-    done[u] = 1;
+  for (uint32_t u = 0; u < job->n_units; ++u) {
+    job->func(job->n_units, u, job->ctx);
+    job->done[u] = 1;
   }
 }
-void hvx_worker_pool_wait_bg(hvx_worker_pool *pool, uint32_t n) {
+void hvx_worker_pool_wait_bg(hvx_worker_pool *pool, hvx_bg_job *job,
+                             uint32_t n) {
   (void)pool;
+  (void)job;
   (void)n;
 }
 
@@ -260,6 +286,32 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
       }
   }
 }
+/* The tail path calls the pooled pair function directly (pool NULL, one
+   pair); it is the job above run synchronously, as on device. */
+void hvx_dequant_swiglu_acc_tiles_to_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_pairs,
+  uint32_t g0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, uint32_t inter, float *dst, uint32_t dst_stride,
+  hvx_worker_pool *pool) {
+  (void)pool;
+  hvx_dq_swiglu_job jb;
+  jb.tiles_base = tiles_base;
+  jb.tile_stride = tile_stride;
+  jb.n_pairs = n_pairs;
+  jb.g0 = g0;
+  jb.row_stride = row_stride;
+  jb.m_count = m_count;
+  jb.act_scale = act_scale;
+  jb.act_zp = act_zp;
+  jb.colsum_w = colsum_w;
+  jb.w_scale = w_scale;
+  jb.bias = bias;
+  jb.inter = inter;
+  jb.dst = dst;
+  jb.dst_stride = dst_stride;
+  hvx_dq_swiglu_worker(1u, 0u, &jb);
+}
 /* Scalar stand-in for the pooled batch dequant job. Deliberately a loop
    over the per-tile stand-in above, exactly as the real one is a pooled
    loop over the real per-tile kernel: what this harness can check is the
@@ -304,11 +356,11 @@ static void ref_mm(const W *w, const uint8_t *a_u8, float a_scale, int32_t a_zp,
     for (uint32_t c = 0; c < 32; ++c) {
       int32_t s = 0;
       for (uint32_t kt = 0; kt < kt_n; ++kt)
-        for (uint32_t k = 0; k < 32; ++k) {
-          int idx = (int)((kt * nt_n + nt) * 1024 + k * 32 + c);
-          int nib = (w->nib[idx >> 1] >> ((idx & 1) ? 4 : 0)) & 0xF;
-          s += (int32_t)a_u8[kt * 32 + k] * (int32_t)(nib - 8);
-        }
+        for (uint32_t k = 0; k < 32; ++k)
+          s +=
+            (int32_t)a_u8[kt * 32 + k] *
+            wh_value((const uint8_t *)w->nib + (size_t)(kt * nt_n + nt) * 512u,
+                     k, c);
       uint32_t col = nt * 32 + c;
       out[col] =
         ((float)(s - a_zp * w->cs[col])) * a_scale * w->ws[col] + w->bias[col];
@@ -407,9 +459,12 @@ int main(void) {
   for (uint32_t i = 0; i < M * K; ++i)
     act[i] = rndf();
 
-  /* Routing: expert 0 gets many rows (multi-block), expert 2 gets none,
+  /* Routing: expert 0 gets many rows (multi-block, a 6-row tail for the
+     HVX path), expert 2 gets none, expert 3 a tail of exactly the
+     threshold, expert 4 a second block too big for it (stays on the HMX);
      rows repeat across experts the way top-k does. */
-  uint32_t rc_[8] = {70, 12, 0, 25, 9};
+  uint32_t rc_[8] = {70, 12, 0, 64 + HVX_GEMM_U8I4_MAX_ROWS,
+                     64 + HVX_GEMM_U8I4_MAX_ROWS + 10};
   uint32_t n_rows = 0;
   for (uint32_t e = 0; e < NE; ++e)
     n_rows += rc_[e];
@@ -497,7 +552,13 @@ int main(void) {
            (unsigned long long)got_kb, active, (unsigned long long)want);
     if (got_kb != want)
       fail = 1;
-    if (hexkl_probe_us[HEXKL_PROBE_BLOCKS] == 0u)
+    /* HMX blocks only: 70 -> 1 + a 6-row tail on the HVX, 12 -> 1,
+       80 -> 1 + a 16-row tail, 90 -> 2 (its 26-row second block is over
+       the tail threshold). 6 would mean a tail went to the HMX after all,
+       4 that a full block was skipped. */
+    printf("HMX blocks        : %llu (want 5: two tails on the HVX)\n",
+           (unsigned long long)hexkl_probe_us[HEXKL_PROBE_BLOCKS]);
+    if (hexkl_probe_us[HEXKL_PROBE_BLOCKS] != 5u)
       fail = 1;
   }
 
