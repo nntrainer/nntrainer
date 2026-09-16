@@ -37,6 +37,7 @@
 
 #include "hexkl_mm_u8i4_moe.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -289,10 +290,28 @@ typedef struct {
     N_out;
 } moe_tail_ctx;
 
+/** @brief Worker time spent inside tail units, summed across workers,
+ *         filed under the SWIGLU column -- always 0 for this kernel
+ *         otherwise, so it needs no new column and no app rebuild. It is
+ *         worker-time, not wall time: it says how much of the HMX shadow
+ *         the tails consume (3 workers x host is the capacity), and
+ *         whether a unit is the ~20 us designed for or something an
+ *         uncached weight mapping would make of it. Atomic because the
+ *         units run concurrently; HEXKL_PROBE_ADD is not. */
+static inline void moe_tail_probe_add(uint64_t t0) {
+  if (hexkl_probe_on) {
+    atomic_fetch_add_explicit(
+      (_Atomic uint64_t *)&hexkl_probe_us[HEXKL_PROBE_SWIGLU],
+      hexkl_probe_now() - t0, memory_order_relaxed);
+  }
+}
+
 /** @brief Unit j: gate column j and up column inter_ntiles+j, then the
  *         fused dequant + SwiGLU of that pair into gate_f32. */
 static void moe_tail_pair_unit(uint32_t n_units, uint32_t j, void *v) {
   (void)n_units;
+  uint64_t t0 = 0;
+  HEXKL_PROBE_T0(t0);
   const moe_tail_ctx *t = (const moe_tail_ctx *)v;
   int32_t *tiles = t->sh->acc_gu + (size_t)j * 2u * MOE_TAIL_TILE_I32;
   hvx_gemm_u8i4_wh_col(t->act_ah, t->m, t->k_tiles, t->g->wh_bytes,
@@ -304,6 +323,7 @@ static void moe_tail_pair_unit(uint32_t n_units, uint32_t j, void *v) {
     (const uint8_t *)tiles, MOE_TAIL_TILE_BYTES, 1u, j,
     HEXKL_HMX_INT8_BLOCK_N_COL, t->m, t->act_scale, t->act_zp, t->g->colsum_w,
     t->g->w_scale, t->g->bias, t->inter, t->sh->gate_f32, t->inter, NULL);
+  moe_tail_probe_add(t0);
 }
 
 /** @brief The one requantization unit: gate_f32 -> mid_ah, the same two
@@ -311,6 +331,8 @@ static void moe_tail_pair_unit(uint32_t n_units, uint32_t j, void *v) {
 static void moe_tail_requant_unit(uint32_t n_units, uint32_t u, void *v) {
   (void)n_units;
   (void)u;
+  uint64_t t0 = 0;
+  HEXKL_PROBE_T0(t0);
   const moe_tail_ctx *t = (const moe_tail_ctx *)v;
   const moe_tail_shared *sh = t->sh;
   const uint32_t m4 = ROUND_UP_U32(t->m, 4u);
@@ -324,11 +346,14 @@ static void moe_tail_requant_unit(uint32_t n_units, uint32_t u, void *v) {
                            t->inter, sh->rq_scale, sh->rq_zp, NULL);
   hvx_quant_pack_u8_ah_rows(sh->gate_f32, NULL, 0u, m4, t->inter, sh->rq_scale,
                             sh->rq_zp, sh->mid_ah);
+  moe_tail_probe_add(t0);
 }
 
 /** @brief Unit nt: down column nt, dequantized into res. */
 static void moe_tail_down_unit(uint32_t n_units, uint32_t nt, void *v) {
   (void)n_units;
+  uint64_t t0 = 0;
+  HEXKL_PROBE_T0(t0);
   const moe_tail_ctx *t = (const moe_tail_ctx *)v;
   int32_t *tile = t->sh->acc_dn + (size_t)nt * MOE_TAIL_TILE_I32;
   const uint32_t c0 = nt * HEXKL_HMX_INT8_BLOCK_N_COL;
@@ -338,6 +363,7 @@ static void moe_tail_down_unit(uint32_t n_units, uint32_t nt, void *v) {
                               t->sh->rq_scale, t->sh->rq_zp,
                               t->d->colsum_w + c0, t->d->w_scale + c0,
                               t->d->bias + c0, t->res + c0, t->N_out, 0);
+  moe_tail_probe_add(t0);
 }
 
 /** @brief Rows of expert e's tail, 0 when it has none: a block of at most
