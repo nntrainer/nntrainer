@@ -96,3 +96,6 @@ ctre-unicode.hpp
 encoder.hpp
 json.hpp
 
+# committed redirect shim to the vendored nlohmann/json
+!Applications/CausalLM/json.hpp
+
