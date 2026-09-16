@@ -766,7 +766,6 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
       // reshape output: [B,1,S,H] -> [B*S,1,1,H]
       output.reshape({total_tokens, 1, 1, hidden_size});
-      output.setZero();
     }
 
     // routing
@@ -785,42 +784,6 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
       for (const auto &assignments : expert_assignments)
         max_assigned_tokens = std::max(max_assigned_tokens, assignments.size());
-    }
-
-    nntrainer::Tensor prefill_token_input;
-    nntrainer::Tensor prefill_expert_output;
-    nntrainer::Tensor prefill_gate_up_output;
-    nntrainer::Tensor prefill_activation_output;
-    ExpertWorkspace workspace{
-      nullptr,
-      &context.getTensor(decode_expert_output_idx),
-      &context.getTensor(decode_gate_up_output_idx),
-      &context.getTensor(decode_activation_output_idx),
-    };
-    if (max_assigned_tokens > 1) {
-      M0Timer t(&g_m0.wksp);
-      const unsigned int workspace_tokens =
-        static_cast<unsigned int>(max_assigned_tokens);
-      const unsigned int intermediate_size =
-        std::get<nntrainer::props::Unit>(moe_props).get();
-      prefill_token_input = nntrainer::Tensor(
-        1, 1, workspace_tokens, hidden_size, input.getTensorType());
-      prefill_expert_output = nntrainer::Tensor(
-        workspace_tokens, 1, 1, hidden_size, output.getTensorType());
-      prefill_gate_up_output = nntrainer::Tensor(
-        1, 1, workspace_tokens, 2 * intermediate_size, input.getTensorType());
-      prefill_activation_output = nntrainer::Tensor(
-        1, 1, workspace_tokens, intermediate_size, input.getTensorType());
-      // See the identical comment in forwarding(): these locally-constructed
-      // Tensors carry no ContextData of their own, so dispatch would
-      // otherwise silently fall back to CPU regardless of the weights'
-      // engine.
-      input.inheritContextTo(prefill_token_input);
-      input.inheritContextTo(prefill_expert_output);
-      input.inheritContextTo(prefill_gate_up_output);
-      input.inheritContextTo(prefill_activation_output);
-      workspace = {&prefill_token_input, &prefill_expert_output,
-                   &prefill_gate_up_output, &prefill_activation_output};
     }
 
     // Decode's single token routes to num_experts_per_tok distinct experts,
@@ -854,6 +817,54 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         input, output, expert_assignments, context, expert_gate_up_proj_indices,
         expert_down_proj_indices, total_tokens, hidden_size,
         std::get<nntrainer::props::Unit>(moe_props).get());
+    }
+
+    // The ARM path's own preparation, after the accelerator has had its
+    // turn: it zero-fills the output itself (hexkl_mm_u8i4_moe.c, memset of
+    // out_c) and never touches the workspace, while FloatTensor's allocation
+    // is a zero-fill too (float_tensor.cpp, `new float[n]{}`), so both used
+    // to cost every accelerated prefill layer a memset and a page-fault
+    // storm for buffers it then freed unused (doc 47 section 16, E1).
+    nntrainer::Tensor prefill_token_input;
+    nntrainer::Tensor prefill_expert_output;
+    nntrainer::Tensor prefill_gate_up_output;
+    nntrainer::Tensor prefill_activation_output;
+    ExpertWorkspace workspace{
+      nullptr,
+      &context.getTensor(decode_expert_output_idx),
+      &context.getTensor(decode_gate_up_output_idx),
+      &context.getTensor(decode_activation_output_idx),
+    };
+    if (!moe_layer_done) {
+      {
+        M0Timer t(&g_m0.setup);
+        output.setZero();
+      }
+      if (max_assigned_tokens > 1) {
+        M0Timer t(&g_m0.wksp);
+        const unsigned int workspace_tokens =
+          static_cast<unsigned int>(max_assigned_tokens);
+        const unsigned int intermediate_size =
+          std::get<nntrainer::props::Unit>(moe_props).get();
+        prefill_token_input = nntrainer::Tensor(
+          1, 1, workspace_tokens, hidden_size, input.getTensorType());
+        prefill_expert_output = nntrainer::Tensor(
+          workspace_tokens, 1, 1, hidden_size, output.getTensorType());
+        prefill_gate_up_output = nntrainer::Tensor(
+          1, 1, workspace_tokens, 2 * intermediate_size, input.getTensorType());
+        prefill_activation_output = nntrainer::Tensor(
+          1, 1, workspace_tokens, intermediate_size, input.getTensorType());
+        // See the identical comment in forwarding(): these locally-constructed
+        // Tensors carry no ContextData of their own, so dispatch would
+        // otherwise silently fall back to CPU regardless of the weights'
+        // engine.
+        input.inheritContextTo(prefill_token_input);
+        input.inheritContextTo(prefill_expert_output);
+        input.inheritContextTo(prefill_gate_up_output);
+        input.inheritContextTo(prefill_activation_output);
+        workspace = {&prefill_token_input, &prefill_expert_output,
+                     &prefill_gate_up_output, &prefill_activation_output};
+      }
     }
 
     if (moe_layer_done) {
