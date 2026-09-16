@@ -75,4 +75,36 @@ void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
  *         flight. */
 void hvx_worker_pool_wait(hvx_worker_pool *pool);
 
+/**
+ * @brief Queues a BACKGROUND job: func(n_units, u, ctx) for u in [0,
+ *        n_units), one unit at a time, claimed in order by whichever
+ *        worker has no run/submit job to serve. Returns at once.
+ *
+ * The run/submit lane is one job in flight, retired at the next wait; a
+ * worker that finishes its slice of it goes idle until the next job. The
+ * MoE kernel's HMX issue between two epilogue submits is ~47 us and the
+ * epilogue ~18 us, so the workers idle for most of every batch (doc 47
+ * section 14). This lane fills that idle with work that has no place in
+ * the batch order: the activation pack, an expert's tail block. A worker
+ * takes one unit, then looks for a foreground job again, so a foreground
+ * submit waits at most one unit -- size units accordingly (~10 us).
+ *
+ * @param done  n_units bytes the caller owns, one per unit; the pool clears
+ *              them and sets each to 1 as its unit finishes. Must outlive
+ *              the job, as must ctx. One background job in flight at a
+ *              time: a submit_bg with one outstanding waits for all of it
+ *              first. With no workers (or NULL) every unit runs inline here.
+ */
+void hvx_worker_pool_submit_bg(hvx_worker_pool *pool, hvx_worker_pool_func func,
+                               void *ctx, uint32_t n_units, uint8_t *done);
+
+/**
+ * @brief Blocks until units [0, n) of the background job have finished and
+ *        their writes are visible. n past the job's unit count waits for
+ *        all of it; UINT32_MAX therefore retires the job. While it waits
+ *        the calling thread takes units itself, so a wait for the last
+ *        unit never idles the caller beside idle work.
+ */
+void hvx_worker_pool_wait_bg(hvx_worker_pool *pool, uint32_t n);
+
 #endif /* __NNTRAINER_HVX_WORKER_POOL_H__ */

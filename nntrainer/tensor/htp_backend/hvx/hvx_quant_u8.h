@@ -83,4 +83,20 @@ int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *row_map,
                                 const float *scale, const int32_t *zp,
                                 uint8_t *out_ah, hvx_worker_pool *pool);
 
+/**
+ * @brief The mapped pack for ONE whole 64-row block, rows [rb*64, rb*64+64)
+ *        of the destination, on the calling thread. Same bytes as
+ *        hvx_quant_pack_u8_ah_mapped would write for those rows.
+ *
+ * A block's tiles are its own ((rb*n_ktiles+kt)*2048 for every kt), so
+ * blocks can be packed by different threads in any order -- this is the
+ * unit the MoE kernel hands to the worker pool's background lane so the
+ * pack runs under the first experts' HMX issue instead of before it. Every
+ * row of the block is packed; a caller with fewer valid rows in the last
+ * block pads @a row_map, as the MoE kernel's slot order already does.
+ */
+void hvx_quant_pack_u8_ah_block(const float *x, const uint32_t *row_map,
+                                uint32_t rb, uint32_t k, const float *scale,
+                                const int32_t *zp, uint8_t *out_ah);
+
 #endif /* __NNTRAINER_HVX_QUANT_U8_H__ */

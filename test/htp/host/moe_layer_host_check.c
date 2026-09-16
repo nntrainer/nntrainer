@@ -135,6 +135,19 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m, uint32_t mp, uint32_t k,
                          hvx_worker_pool *p) {
   return hvx_quant_pack_u8_ah_mapped(x, NULL, m, mp, k, scale, zp, out, p);
 }
+/* One block through the mapped stand-in: the pack of rows [rb*64, +64) is
+   the same arithmetic whichever entry lands it, so the block entry is
+   defined by the whole-buffer one rather than repeated -- a second copy of
+   the formula would let the two drift and hide it. Offsets shift so the
+   mapped stand-in sees a one-block problem. */
+void hvx_quant_pack_u8_ah_block(const float *x, const uint32_t *map,
+                                uint32_t rb, uint32_t k, const float *scale,
+                                const int32_t *zp, uint8_t *out) {
+  const uint32_t kt_n = k / 32u;
+  hvx_quant_pack_u8_ah_mapped(x, map + (size_t)rb * 64u, 64u, 64u, k,
+                              scale + (size_t)rb * 64u, zp + (size_t)rb * 64u,
+                              out + (size_t)rb * kt_n * 2048u, NULL);
+}
 void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
                                  uint32_t m, const float *as, const int32_t *az,
                                  const int32_t *cs, const float *ws,
@@ -176,6 +189,22 @@ void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
     func(1u, 0, ctx);
 }
 void hvx_worker_pool_wait(hvx_worker_pool *pool) { (void)pool; }
+/* The background lane, likewise: every unit runs at submit, in order, and
+   the waits find them done. What this checks is that the kernel waits for
+   the right block before it queues it -- a wait for too few units cannot
+   show here, and a wait for too many only as a hang on device. */
+void hvx_worker_pool_submit_bg(hvx_worker_pool *pool, hvx_worker_pool_func func,
+                               void *ctx, uint32_t n_units, uint8_t *done) {
+  (void)pool;
+  for (uint32_t u = 0; u < n_units; ++u) {
+    func(n_units, u, ctx);
+    done[u] = 1;
+  }
+}
+void hvx_worker_pool_wait_bg(hvx_worker_pool *pool, uint32_t n) {
+  (void)pool;
+  (void)n;
+}
 
 void hvx_copy_ah_block(uint8_t *dst, const uint8_t *src, uint32_t k,
                        hvx_worker_pool *pool) {

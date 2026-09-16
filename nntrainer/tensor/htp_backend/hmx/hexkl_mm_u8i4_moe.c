@@ -224,6 +224,33 @@ static void moe_scatter_worker(uint32_t n_threads, uint32_t i, void *vctx) {
 }
 
 /**
+ * @brief Background-lane unit: pack one 64-row slot block of the activation.
+ *
+ * The pack of a prefill call's ~2900 slots ran on the pool synchronously
+ * before the expert loop, with the HMX idle for all of it (1.0 of the 1.44
+ * ms QUANT column, doc 47 section 14). Every block is a unit here, in slot
+ * order, and the expert loop waits for a block only just before it queues
+ * that block's DMA -- so expert 0's block is packed at once and the rest
+ * land under the first experts' HMX issue, in the workers' idle time
+ * between epilogues.
+ */
+typedef struct {
+  const float *act_c;
+  const uint32_t *slot_row;
+  const float *slot_scale;
+  const int32_t *slot_zp;
+  uint8_t *act_ah;
+  uint32_t K;
+} moe_pack_ctx;
+
+static void moe_pack_bg_worker(uint32_t n_units, uint32_t u, void *vctx) {
+  (void)n_units;
+  const moe_pack_ctx *c = (const moe_pack_ctx *)vctx;
+  hvx_quant_pack_u8_ah_block(c->act_c, c->slot_row, u, c->K, c->slot_scale,
+                             c->slot_zp, c->act_ah);
+}
+
+/**
  * @brief Copies through the DMA engine instead of the core.
  *
  * The two staging copies move 3.6 MB each between the host's uncached
@@ -499,6 +526,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   const size_t sz_mpad_u32 = sizeof(uint32_t) * m_pad;
   const size_t sz_act_c = sizeof(float) * (size_t)M * K;
   const size_t sz_out_c = sizeof(float) * (size_t)M * N_out;
+  /* One done byte per slot block for the background pack. */
+  const size_t sz_pack_done = n_slots_cap / BR + 1u;
   const size_t need = ROUND_UP_SZ(sz_scale, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_zp, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_act_ah, MOE_SCRATCH_ALIGN) +
@@ -506,7 +535,8 @@ int hexkl_mm_u8i4_moe_layer_run(
                       3u * ROUND_UP_SZ(sz_expert_u32, MOE_SCRATCH_ALIGN) +
                       2u * ROUND_UP_SZ(sz_mpad_u32, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_act_c, MOE_SCRATCH_ALIGN) +
-                      ROUND_UP_SZ(sz_out_c, MOE_SCRATCH_ALIGN);
+                      ROUND_UP_SZ(sz_out_c, MOE_SCRATCH_ALIGN) +
+                      ROUND_UP_SZ(sz_pack_done, MOE_SCRATCH_ALIGN);
   uint64_t p_alloc = 0;
   HEXKL_PROBE_T0(p_alloc);
   rc = moe_scratch_reserve(scratch, need);
@@ -528,6 +558,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   int32_t *zp_all = (int32_t *)moe_carve(&cur, sz_mpad_u32);
   float *act_c = (float *)moe_carve(&cur, sz_act_c);
   float *out_c = (float *)moe_carve(&cur, sz_out_c);
+  uint8_t *pack_done = (uint8_t *)moe_carve(&cur, sz_pack_done);
+  moe_pack_ctx pack;
   uint32_t n_active = 0u;
   uint64_t p0 = 0;
   /* The pool's in-flight jobs. Each outlives its submit until the wait that
@@ -561,6 +593,23 @@ int hexkl_mm_u8i4_moe_layer_run(
   moe_dma_copy(act_c, act_f32, sizeof(float) * (size_t)M * K, 0, 0);
   memset(out_c, 0, sizeof(float) * (size_t)M * N_out);
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
+  if (n_active == 0u) {
+    moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0);
+    rc = AEE_SUCCESS;
+    goto out;
+  }
+
+  /* The first expert's gate_up goes out before the quantization, not after
+     it: nothing in the scan or the pack needs VTCM's weight region, and a
+     3.5 MB transfer that used to be the one wait with nothing to hide
+     behind (DMA_FIRST) now has the whole scan in front of it. In paired
+     chunks, so the first gate/up pair is usable long before the last --
+     see moe_push_gate_up_chunks. */
+  uint32_t gu_idx[MOE_MAX_CHUNKS];
+  uint32_t gu_nchunk = moe_push_gate_up_chunks(
+    vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[0]]], k_tiles, gu_ntiles,
+    inter_ntiles, half, gu_idx);
+  (void)gu_nchunk;
 
   /* The scan is per source row and independent of where a row ends up, so
      it still runs once over M rows. */
@@ -589,36 +638,31 @@ int hexkl_mm_u8i4_moe_layer_run(
   }
 
   /* Packed straight into slot order, so a block's 64 rows are already
-     contiguous and the gather pass that used to follow is gone. */
+     contiguous and the gather pass that used to follow is gone. On the
+     pool's background lane, one unit per block (moe_pack_bg_worker): only
+     the block about to be queued is waited for, so from here on the pack
+     runs under the HMX. QUANT times the scan and those waits -- what stays
+     exposed -- not the pack. */
+  pack.act_c = act_c;
+  pack.slot_row = slot_row;
+  pack.slot_scale = slot_scale;
+  pack.slot_zp = slot_zp;
+  pack.act_ah = act_ah;
+  pack.K = K;
+  hvx_worker_pool_submit_bg(pool, moe_pack_bg_worker, &pack, n_slots / BR,
+                            pack_done);
+  hvx_worker_pool_wait_bg(pool, slot_of[0] / BR + 1u);
   HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
-  HEXKL_PROBE_T0(p0);
-  rc = hvx_quant_pack_u8_ah_mapped(act_c, slot_row, n_slots, n_slots, K,
-                                   slot_scale, slot_zp, act_ah, pool);
-  HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
-  if (rc != AEE_SUCCESS) {
-    goto out;
-  }
-  if (n_active == 0u) {
-    moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0);
-    rc = AEE_SUCCESS;
-    goto out;
-  }
 
-  /* The first expert's first activation block goes out before its weights
-     -- see moe_push_act_block for why the order matters. Every later
-     block-0 is queued the same way at the point its predecessor's gate_up
-     matmul finishes with the activation slot (below, next to the gate_up
-     prefetch); blocks after the first of an expert are queued in place. */
+  /* The first expert's first activation block. Queued behind its gate_up
+     here (the one place the order is reversed: that gate_up has the scan
+     to hide behind and is long done). Every later block-0 is queued ahead
+     of its expert's gate_up at the point its predecessor's gate_up matmul
+     finishes with the activation slot (below, next to the gate_up
+     prefetch) -- see moe_push_act_block for why that order matters; blocks
+     after the first of an expert are queued in place. */
   uint32_t act_idx =
     moe_push_act_block(vtcm_base, L.act_off, act_ah, slot_of[0], K, k_tiles);
-
-  /* gate_up in paired chunks, so the first gate/up pair is usable long
-     before the last -- see moe_push_gate_up_chunks. */
-  uint32_t gu_idx[MOE_MAX_CHUNKS];
-  uint32_t gu_nchunk = moe_push_gate_up_chunks(
-    vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[0]]], k_tiles, gu_ntiles,
-    inter_ntiles, half, gu_idx);
-  (void)gu_nchunk;
 
   for (uint32_t i = 0; i < n_active; ++i) {
     const uint32_t e = order[i];
@@ -653,6 +697,11 @@ int hexkl_mm_u8i4_moe_layer_run(
          Block 0 is already in flight (queued ahead of this expert's
          gate_up); only the blocks after it are queued here, and by then
          nothing but this expert's own down is ahead of them in the ring. */
+      if (mb != 0u) {
+        HEXKL_PROBE_T0(p0);
+        hvx_worker_pool_wait_bg(pool, (slot_of[i] + mb) / BR + 1u);
+        HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
+      }
       HEXKL_PROBE_T0(p0);
       if (mb != 0u) {
         act_idx = moe_push_act_block(vtcm_base, L.act_off, act_ah,
@@ -783,6 +832,9 @@ int hexkl_mm_u8i4_moe_layer_run(
          anything else, and queued behind 3.5 MB of gate_up that wait would
          cover the gate_up too. */
       if (last_block && i + 1u < n_active) {
+        HEXKL_PROBE_T0(p0);
+        hvx_worker_pool_wait_bg(pool, slot_of[i + 1u] / BR + 1u);
+        HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
         act_idx = moe_push_act_block(vtcm_base, L.act_off, act_ah,
                                      slot_of[i + 1u], K, k_tiles);
         gu_nchunk = moe_push_gate_up_chunks(
@@ -893,8 +945,10 @@ int hexkl_mm_u8i4_moe_layer_run(
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
 
 out:
-  /* An error path may leave a job in flight over VTCM this call owns. */
+  /* An error path may leave a job in flight over VTCM this call owns, and
+     the background pack over this call's scratch. */
   hvx_worker_pool_wait(pool);
+  hvx_worker_pool_wait_bg(pool, UINT32_MAX);
   /* Nothing to free: the scratch stays with the session. */
   return rc;
 }

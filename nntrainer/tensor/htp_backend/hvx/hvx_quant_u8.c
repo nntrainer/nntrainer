@@ -166,6 +166,44 @@ typedef struct {
 } quant_pack_ctx;
 
 /**
+ * @brief Four consecutive rows of one k-tile: quantize, narrow, and land
+ *        them as ONE 128-byte store. The body both entries below share, so
+ *        the per-block pack and the k-tile-split pack produce the same
+ *        bytes by construction.
+ *
+ * @param src   the four rows' k-tile slices (row + kt*32 each)
+ * @param dst   out_ah + (rb*n_ktiles+kt)*ACT_TILE_BYTES + r0*32
+ */
+static inline void quant_pack_group4(const float *const src[4],
+                                     const HVX_Vector vinv[4],
+                                     const HVX_Vector vz[4], uint8_t *dst) {
+  const HVX_UVector *vin0 = (const HVX_UVector *)src[0];
+  const HVX_UVector *vin1 = (const HVX_UVector *)src[1];
+  const HVX_UVector *vin2 = (const HVX_UVector *)src[2];
+  const HVX_UVector *vin3 = (const HVX_UVector *)src[3];
+
+  const HVX_Vector vq0 = Q6_Vw_vadd_VwVw(
+    hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin0[0], vinv[0])), vz[0]);
+  const HVX_Vector vq1 = Q6_Vw_vadd_VwVw(
+    hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin1[0], vinv[1])), vz[1]);
+  const HVX_Vector vq2 = Q6_Vw_vadd_VwVw(
+    hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin2[0], vinv[2])), vz[2]);
+  const HVX_Vector vq3 = Q6_Vw_vadd_VwVw(
+    hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin3[0], vinv[3])), vz[3]);
+
+  // vpack(Vu, Vv):sat places Vv's (narrowed, saturated) elements in the
+  // low half of the result and Vu's in the high half, in order --
+  // same convention as vpacke/vpacko (V79 HVX Programmer Reference
+  // Manual, "Pack"). Vv first each time keeps row order intact:
+  // vh01 = [row0(32), row1(32)], vh23 = [row2(32), row3(32)],
+  // vb = [row0, row1, row2, row3] (128 bytes).
+  const HVX_Vector vh01 = Q6_Vh_vpack_VwVw_sat(vq1, vq0);
+  const HVX_Vector vh23 = Q6_Vh_vpack_VwVw_sat(vq3, vq2);
+  const HVX_Vector vb = Q6_Vub_vpack_VhVh_sat(vh23, vh01);
+  *(HVX_UVector *)dst = vb;
+}
+
+/**
  * @brief One k-tile's worth of K2, every row-group in it.
  *
  * A k-tile's destination bytes ((rb*n_ktiles+kt)*ACT_TILE_BYTES + r0*32,
@@ -188,46 +226,54 @@ static void quant_pack_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
          packing below still sees four rows and still lands them as one
          128-byte store. */
       const uint32_t *mp = ctx->row_map;
-      const size_t s0 = (size_t)(mp ? mp[m + 0] : (m + 0)) * ctx->k;
-      const size_t s1 = (size_t)(mp ? mp[m + 1] : (m + 1)) * ctx->k;
-      const size_t s2 = (size_t)(mp ? mp[m + 2] : (m + 2)) * ctx->k;
-      const size_t s3 = (size_t)(mp ? mp[m + 3] : (m + 3)) * ctx->k;
-      const HVX_UVector *vin0 =
-        (const HVX_UVector *)(ctx->x + s0 + kt * TILE_INNER);
-      const HVX_UVector *vin1 =
-        (const HVX_UVector *)(ctx->x + s1 + kt * TILE_INNER);
-      const HVX_UVector *vin2 =
-        (const HVX_UVector *)(ctx->x + s2 + kt * TILE_INNER);
-      const HVX_UVector *vin3 =
-        (const HVX_UVector *)(ctx->x + s3 + kt * TILE_INNER);
-
-      const HVX_Vector vq0 = Q6_Vw_vadd_VwVw(
-        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin0[0], ctx->vinv[m + 0])),
-        ctx->vz[m + 0]);
-      const HVX_Vector vq1 = Q6_Vw_vadd_VwVw(
-        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin1[0], ctx->vinv[m + 1])),
-        ctx->vz[m + 1]);
-      const HVX_Vector vq2 = Q6_Vw_vadd_VwVw(
-        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin2[0], ctx->vinv[m + 2])),
-        ctx->vz[m + 2]);
-      const HVX_Vector vq3 = Q6_Vw_vadd_VwVw(
-        hvx_sf_to_w_rne(Q6_Vsf_vmpy_VsfVsf(vin3[0], ctx->vinv[m + 3])),
-        ctx->vz[m + 3]);
-
-      // vpack(Vu, Vv):sat places Vv's (narrowed, saturated) elements in the
-      // low half of the result and Vu's in the high half, in order --
-      // same convention as vpacke/vpacko (V79 HVX Programmer Reference
-      // Manual, "Pack"). Vv first each time keeps row order intact:
-      // vh01 = [row0(32), row1(32)], vh23 = [row2(32), row3(32)],
-      // vb = [row0, row1, row2, row3] (128 bytes).
-      const HVX_Vector vh01 = Q6_Vh_vpack_VwVw_sat(vq1, vq0);
-      const HVX_Vector vh23 = Q6_Vh_vpack_VwVw_sat(vq3, vq2);
-      const HVX_Vector vb = Q6_Vub_vpack_VhVh_sat(vh23, vh01);
-
+      const float *const src[4] = {
+        ctx->x + (size_t)(mp ? mp[m + 0] : (m + 0)) * ctx->k + kt * TILE_INNER,
+        ctx->x + (size_t)(mp ? mp[m + 1] : (m + 1)) * ctx->k + kt * TILE_INNER,
+        ctx->x + (size_t)(mp ? mp[m + 2] : (m + 2)) * ctx->k + kt * TILE_INNER,
+        ctx->x + (size_t)(mp ? mp[m + 3] : (m + 3)) * ctx->k + kt * TILE_INNER,
+      };
+      const HVX_Vector vinv[4] = {ctx->vinv[m + 0], ctx->vinv[m + 1],
+                                  ctx->vinv[m + 2], ctx->vinv[m + 3]};
+      const HVX_Vector vz[4] = {ctx->vz[m + 0], ctx->vz[m + 1], ctx->vz[m + 2],
+                                ctx->vz[m + 3]};
       uint8_t *dst = ctx->out_ah +
                      (size_t)(rb * ctx->n_ktiles + kt) * ACT_TILE_BYTES +
                      r0 * TILE_INNER;
-      *(HVX_UVector *)dst = vb;
+      quant_pack_group4(src, vinv, vz, dst);
+    }
+  }
+}
+
+void hvx_quant_pack_u8_ah_block(const float *x, const uint32_t *row_map,
+                                uint32_t rb, uint32_t k, const float *scale,
+                                const int32_t *zp, uint8_t *out_ah) {
+  const uint32_t n_ktiles = k / TILE_INNER;
+  const uint32_t m0 = rb * TILE_ROW;
+  uint8_t *blk = out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES;
+  /* Row-group outer, k-tile inner: the whole block is this call's, so the
+     k-tile split the pooled pack needs for disjoint stores is not needed,
+     and the four rows' parameters are splatted once per group instead of
+     once per (group, k-tile). Same group body, same bytes. */
+  for (uint32_t r0 = 0; r0 < TILE_ROW; r0 += 4u) {
+    const uint32_t m = m0 + r0;
+    const float *const row[4] = {
+      x + (size_t)(row_map ? row_map[m + 0] : (m + 0)) * k,
+      x + (size_t)(row_map ? row_map[m + 1] : (m + 1)) * k,
+      x + (size_t)(row_map ? row_map[m + 2] : (m + 2)) * k,
+      x + (size_t)(row_map ? row_map[m + 3] : (m + 3)) * k,
+    };
+    const HVX_Vector vinv[4] = {
+      hvx_splat_sf(1.0f / scale[m + 0]), hvx_splat_sf(1.0f / scale[m + 1]),
+      hvx_splat_sf(1.0f / scale[m + 2]), hvx_splat_sf(1.0f / scale[m + 3])};
+    const HVX_Vector vz[4] = {
+      Q6_V_vsplat_R(zp[m + 0]), Q6_V_vsplat_R(zp[m + 1]),
+      Q6_V_vsplat_R(zp[m + 2]), Q6_V_vsplat_R(zp[m + 3])};
+    for (uint32_t kt = 0; kt < n_ktiles; ++kt) {
+      const float *const src[4] = {
+        row[0] + kt * TILE_INNER, row[1] + kt * TILE_INNER,
+        row[2] + kt * TILE_INNER, row[3] + kt * TILE_INNER};
+      quant_pack_group4(src, vinv, vz,
+                        blk + (size_t)kt * ACT_TILE_BYTES + r0 * TILE_INNER);
     }
   }
 }

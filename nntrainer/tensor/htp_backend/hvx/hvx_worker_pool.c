@@ -12,10 +12,10 @@
  * The seqn/barrier/futex protocol below is not novel -- it is
  * llama.cpp ggml-hexagon's htp/work-queue.c pattern (same QuRT primitives,
  * same target), trimmed to a single-job-in-flight fork/join: this pool has
- * no run_async and no multi-slot queue, since every caller here blocks
- * until its job is done anyway. That is a smaller, already-proven surface
- * for what is otherwise this codebase's first genuinely concurrent code
- * path.
+ * no multi-slot queue. Two additions since: submit/wait, the same job run
+ * without the caller as worker 0, and the background lane (submit_bg), a
+ * unit counter workers claim from when the foreground lane has nothing
+ * for them. Both keep the one-owner, one-job-per-lane shape.
  */
 
 #include "hvx_worker_pool.h"
@@ -30,7 +30,10 @@
  *         same instruction ggml-hexagon's work-queue.c uses while a job is
  *         in flight. */
 static inline void hvx_worker_pool_pause(void) {
+#if defined(__hexagon__)
   asm volatile(" pause(#255)\n");
+#endif /* the host check (test/htp/host) builds this file with a pthread       \
+          stand-in for QuRT; a plain spin is fine there */
 }
 
 /** @brief Per-worker stack, generous for the quant kernels this pool
@@ -45,7 +48,9 @@ typedef struct {
 } hvx_worker_ctx;
 
 struct hvx_worker_pool_s {
-  _Atomic uint32_t seqn;    /**< bumped once per hvx_worker_pool_run call */
+  _Atomic uint32_t seqn;    /**< wake counter: bumped by every publish */
+  _Atomic uint32_t fg_id;   /**< bumped once per run/submit: the job a
+                                 worker has not served yet */
   _Atomic uint32_t barrier; /**< participating workers still running */
   _Atomic int killed;
   hvx_worker_pool_func func;
@@ -53,43 +58,89 @@ struct hvx_worker_pool_s {
   uint32_t n_threads; /**< participants for the current job: main + workers
                            for run, workers only for submit */
   /** Nonzero while a submit's job is in flight. Workers read it under the
-      seqn acquire, so a job's mode is fixed before it is published: in a
+      fg_id acquire, so a job's mode is fixed before it is published: in a
       submitted job the caller is not worker 0, and worker id k acts as
       index k-1 of n_threads instead of index k. */
   int async;
   int outstanding; /**< caller-side: a submit not yet waited for */
+
+  /** The background lane (hvx_worker_pool_submit_bg). bg_next is the claim
+      counter: a worker owns unit u once its CAS u -> u+1 succeeds, and
+      reads bg_func/bg_ctx/bg_n only AFTER that -- the submit stores them
+      before it publishes bg_next = 0 with release, so a claim through the
+      counter's release sequence sees the job it belongs to, even from a
+      worker that read a stale bg_n and got in through an overshoot (the
+      re-check after the claim drops that unit). */
+  hvx_worker_pool_func bg_func;
+  void *bg_ctx;
+  _Atomic uint32_t bg_n;
+  _Atomic uint32_t bg_next;
+  _Atomic uint8_t *bg_done; /**< caller-owned, one byte per unit */
+  uint32_t bg_low;          /**< caller-side: units [0, bg_low) seen done */
+  int bg_outstanding;
+
   uint32_t n_workers;
   qurt_thread_t *tids;
   hvx_worker_ctx *worker_ctx;
   unsigned char *stack_blob;
 };
 
+/** @brief Claims and runs one background unit; 0 when there is none. */
+static int hvx_worker_pool_bg_take_one(hvx_worker_pool *pool) {
+  for (;;) {
+    uint32_t u = atomic_load_explicit(&pool->bg_next, memory_order_acquire);
+    if (u >= atomic_load_explicit(&pool->bg_n, memory_order_relaxed)) {
+      return 0;
+    }
+    if (atomic_compare_exchange_weak_explicit(&pool->bg_next, &u, u + 1u,
+                                              memory_order_acq_rel,
+                                              memory_order_acquire)) {
+      /* Fields after the claim, see the struct comment. bg_n re-read: the
+         one above may have been the previous job's larger count. */
+      const uint32_t n =
+        atomic_load_explicit(&pool->bg_n, memory_order_relaxed);
+      if (u < n) {
+        pool->bg_func(n, u, pool->bg_ctx);
+        atomic_store_explicit(&pool->bg_done[u], 1, memory_order_release);
+      }
+      return 1;
+    }
+  }
+}
+
 static void hvx_worker_pool_thread_entry(void *arg) {
   hvx_worker_ctx *me = (hvx_worker_ctx *)arg;
   hvx_worker_pool *pool = me->pool;
-  uint32_t prev_seqn = 0;
+  uint32_t prev_fg = 0;
 
   for (;;) {
     if (atomic_load_explicit(&pool->killed, memory_order_relaxed)) {
       qurt_thread_exit(0);
     }
 
-    uint32_t seqn = atomic_load_explicit(&pool->seqn, memory_order_acquire);
-    if (seqn == prev_seqn) {
-      qurt_futex_wait(&pool->seqn, (int)prev_seqn);
-      continue;
-    }
-    prev_seqn = seqn;
-
-    {
+    /* seqn first: a publish between this read and the futex wait below
+       changes it, and qurt_futex_wait returns at once on a mismatch, so
+       no wake is lost. */
+    const uint32_t seqn =
+      atomic_load_explicit(&pool->seqn, memory_order_acquire);
+    const uint32_t fg =
+      atomic_load_explicit(&pool->fg_id, memory_order_acquire);
+    if (fg != prev_fg) {
+      prev_fg = fg;
       const uint32_t idx = pool->async ? (me->id - 1u) : me->id;
       if (idx < pool->n_threads) {
         pool->func(pool->n_threads, idx, pool->ctx);
         atomic_fetch_sub_explicit(&pool->barrier, 1, memory_order_release);
       }
+      // me->id >= pool->n_threads: this run didn't need this worker.
+      continue;
     }
-    // me->id >= pool->n_threads: this run didn't need this worker; loop
-    // back and wait for the next one.
+    /* One background unit, then back to the top: a foreground job that
+       arrived meanwhile is served before the next unit. */
+    if (hvx_worker_pool_bg_take_one(pool)) {
+      continue;
+    }
+    qurt_futex_wait(&pool->seqn, (int)seqn);
   }
 }
 
@@ -99,8 +150,11 @@ hvx_worker_pool *hvx_worker_pool_create(uint32_t n_workers) {
     return NULL;
   }
   atomic_init(&pool->seqn, 0);
+  atomic_init(&pool->fg_id, 0);
   atomic_init(&pool->barrier, 0);
   atomic_init(&pool->killed, 0);
+  atomic_init(&pool->bg_n, 0);
+  atomic_init(&pool->bg_next, 0);
   pool->n_workers = n_workers;
 
   if (n_workers == 0) {
@@ -206,8 +260,61 @@ void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
   pool->outstanding = 1;
   atomic_store_explicit(&pool->barrier, n, memory_order_relaxed);
   /* Publish, then wake everyone -- run() explains why everyone. */
+  atomic_fetch_add_explicit(&pool->fg_id, 1, memory_order_release);
   atomic_fetch_add_explicit(&pool->seqn, 1, memory_order_release);
   qurt_futex_wake(&pool->seqn, (int)pool->n_workers);
+}
+
+void hvx_worker_pool_submit_bg(hvx_worker_pool *pool, hvx_worker_pool_func func,
+                               void *ctx, uint32_t n_units, uint8_t *done) {
+  if (n_units == 0u || !done) {
+    return;
+  }
+  if (!pool || pool->n_workers == 0) {
+    for (uint32_t u = 0; u < n_units; ++u) {
+      func(n_units, u, ctx);
+      done[u] = 1;
+    }
+    return;
+  }
+  hvx_worker_pool_wait_bg(pool, UINT32_MAX);
+  /* All of the previous job is done, so bg_next == bg_n and no worker can
+     claim through it: the fields below are safe to replace, and the
+     release store of bg_next = 0 is what publishes them. */
+  for (uint32_t u = 0; u < n_units; ++u) {
+    done[u] = 0;
+  }
+  pool->bg_func = func;
+  pool->bg_ctx = ctx;
+  pool->bg_done = (_Atomic uint8_t *)done;
+  pool->bg_low = 0;
+  pool->bg_outstanding = 1;
+  atomic_store_explicit(&pool->bg_n, n_units, memory_order_relaxed);
+  atomic_store_explicit(&pool->bg_next, 0, memory_order_release);
+  atomic_fetch_add_explicit(&pool->seqn, 1, memory_order_release);
+  qurt_futex_wake(&pool->seqn, (int)pool->n_workers);
+}
+
+void hvx_worker_pool_wait_bg(hvx_worker_pool *pool, uint32_t n) {
+  if (!pool || !pool->bg_outstanding) {
+    return;
+  }
+  const uint32_t total =
+    atomic_load_explicit(&pool->bg_n, memory_order_relaxed);
+  if (n > total) {
+    n = total;
+  }
+  while (pool->bg_low < n) {
+    if (atomic_load_explicit(&pool->bg_done[pool->bg_low],
+                             memory_order_acquire)) {
+      pool->bg_low++;
+    } else if (!hvx_worker_pool_bg_take_one(pool)) {
+      hvx_worker_pool_pause();
+    }
+  }
+  if (pool->bg_low == total) {
+    pool->bg_outstanding = 0;
+  }
 }
 
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
@@ -244,6 +351,7 @@ void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
   // (found on-device: the very first call deadlocked here). A
   // non-participant that wakes just rechecks its id against n_threads,
   // finds it doesn't apply, and goes back to sleep -- harmless.
+  atomic_fetch_add_explicit(&pool->fg_id, 1, memory_order_release);
   atomic_fetch_add_explicit(&pool->seqn, 1, memory_order_release);
   qurt_futex_wake(&pool->seqn, (int)pool->n_workers);
 

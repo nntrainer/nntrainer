@@ -30,3 +30,14 @@ cc=${CC:-gcc}
   "$HERE/moe_layer_host_check.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" -lm
 
 "$OUT/moe_layer_host_check"
+
+# The worker pool's two lanes on pthreads (stub/qurt.h). Concurrency is
+# exercised for real here -- 3 workers, a caller that helps -- but a
+# desktop scheduler is not QuRT's; the device is still where the timing
+# and the HVX-context sharing are checked.
+"$cc" -std=c11 -O1 -Wall -Wextra -Wno-unused-parameter -pthread \
+  -I "$HERE/stub" -I "$BACKEND/hvx" \
+  -o "$OUT/worker_pool_host_check" \
+  "$HERE/worker_pool_host_check.c" "$BACKEND/hvx/hvx_worker_pool.c"
+
+"$OUT/worker_pool_host_check"
