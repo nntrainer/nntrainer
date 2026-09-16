@@ -220,6 +220,12 @@ void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
     func(1u, 0, ctx);
 }
 void hvx_worker_pool_wait(hvx_worker_pool *pool) { (void)pool; }
+uint32_t hvx_worker_pool_submit_parts(const hvx_worker_pool *pool,
+                                      uint32_t n_units) {
+  (void)pool;
+  (void)n_units;
+  return 1u; /* the submit stand-in runs one slice */
+}
 /* The background lane, likewise: every unit runs at submit, in order, and
    the waits find them done. What this checks is that the kernel waits for
    the right block before it queues it -- a wait for too few units cannot
@@ -281,10 +287,36 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
     for (uint32_t r = 0; r < c->m_count; ++r)
       for (uint32_t k = 0; k < 32u; ++k) {
         const float g = gt[r * 32u + k];
-        c->dst[(size_t)r * c->dst_stride + cg + k] =
-          g / (1.f + expf(-g)) * ut[r * 32u + k];
+        const float y = g / (1.f + expf(-g)) * ut[r * 32u + k];
+        c->dst[(size_t)r * c->dst_stride + cg + k] = y;
+        if (c->rmin && j == 0 && k == 0) {
+          c->rmin[i * 64u + r] = 0.f;
+          c->rmax[i * 64u + r] = 0.f;
+        }
+        if (c->rmin) {
+          if (y < c->rmin[i * 64u + r])
+            c->rmin[i * 64u + r] = y;
+          if (y > c->rmax[i * 64u + r])
+            c->rmax[i * 64u + r] = y;
+        }
       }
   }
+}
+/* Same formula as the scan stand-in above, so the fused path and the scan
+   path agree here as they do on device. */
+void hvx_quant_row_params_from_minmax(float min0, float max0, float *scale,
+                                      int32_t *zp) {
+  float lo = min0 < 0.f ? min0 : 0.f, hi = max0 > 0.f ? max0 : 0.f;
+  float s = (hi - lo) / 255.f;
+  if (s <= 0.f)
+    s = 1e-8f;
+  *scale = s;
+  long z = lrintf(-lo / s);
+  if (z < 0)
+    z = 0;
+  if (z > 255)
+    z = 255;
+  *zp = (int32_t)z;
 }
 /* The tail path calls the pooled pair function directly (pool NULL, one
    pair); it is the job above run synchronously, as on device. */
@@ -310,6 +342,8 @@ void hvx_dequant_swiglu_acc_tiles_to_f32(
   jb.inter = inter;
   jb.dst = dst;
   jb.dst_stride = dst_stride;
+  jb.rmin = NULL; /* no extrema wanted, as the device entry sets */
+  jb.rmax = NULL;
   hvx_dq_swiglu_worker(1u, 0u, &jb);
 }
 /* Scalar stand-in for the pooled batch dequant job. Deliberately a loop
@@ -523,6 +557,9 @@ int main(void) {
     double d = fabs((double)got[i] - (double)want[i]);
     double s = fabs((double)want[i]) + 1e-6;
     if (d / s > 1e-5) {
+      if (bad < 8)
+        printf("  mismatch row %u col %u got %g want %g\n", i / N_out,
+               i % N_out, got[i], want[i]);
       ++bad;
     }
     if (d / s > worst)

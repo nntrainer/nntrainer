@@ -200,10 +200,30 @@ static inline HVX_Vector dq_row_sf(const int32_t *row, float act_scale,
     vbias);
 }
 
+/** @brief One lane out of a vector that holds the same reduction in
+ *         every lane after the rotate-and-fold below. */
+static inline float dq_lane0(HVX_Vector v) {
+  float lanes[32];
+  *(HVX_UVector *)lanes = v;
+  return lanes[0];
+}
+
 void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   const hvx_dq_swiglu_job *c = (const hvx_dq_swiglu_job *)vctx;
   const uint32_t lo = (uint32_t)((uint64_t)c->n_pairs * i / n_threads);
   const uint32_t hi = (uint32_t)((uint64_t)c->n_pairs * (i + 1) / n_threads);
+  /* Row extrema across this worker's pairs, one vector pair per row, on
+     the stack: 16 KB, kept in memory across the pair loop so the per-pair
+     tile constants stay hoisted. Zero is a valid start because the
+     parameters fold 0 in anyway (hvx_quant_row_params_from_minmax). */
+  const int track = (c->rmin != NULL) && (i < HVX_DQ_SWIGLU_MAX_PARTS);
+  HVX_Vector vmn[HEXKL_ACC_TILE_ROWS], vmx[HEXKL_ACC_TILE_ROWS];
+  if (track) {
+    for (uint32_t m = 0; m < c->m_count; ++m) {
+      vmn[m] = Q6_V_vzero();
+      vmx[m] = Q6_V_vzero();
+    }
+  }
 
   for (uint32_t j = lo; j < hi; ++j) {
     const uint32_t cg = (c->g0 + j) * HEXKL_ACC_TILE_COLS; /* gate column */
@@ -231,8 +251,25 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
       const HVX_Vector u =
         dq_row_sf(ut + (size_t)m * c->row_stride, c->act_scale[m],
                   c->act_zp[m], csu, vwu, vbu);
-      ((HVX_UVector *)(c->dst + (size_t)m * c->dst_stride + cg))[0] =
-        hvx_swiglu_det_sf(g, u);
+      const HVX_Vector y = hvx_swiglu_det_sf(g, u);
+      ((HVX_UVector *)(c->dst + (size_t)m * c->dst_stride + cg))[0] = y;
+      if (track) {
+        vmn[m] = Q6_Vsf_vmin_VsfVsf(vmn[m], y);
+        vmx[m] = Q6_Vsf_vmax_VsfVsf(vmx[m], y);
+      }
+    }
+  }
+  if (track) {
+    /* Fold 32 lanes to 1 the way hvx_quant_u8.c's scan does: 64, 32, 16,
+       8, 4 bytes. min/max are exact, so the order is immaterial. */
+    for (uint32_t m = 0; m < c->m_count; ++m) {
+      HVX_Vector mn = vmn[m], mx = vmx[m];
+      for (uint32_t rot = 64u; rot >= 4u; rot >>= 1) {
+        mn = Q6_Vsf_vmin_VsfVsf(mn, Q6_V_vror_VR(mn, (int)rot));
+        mx = Q6_Vsf_vmax_VsfVsf(mx, Q6_V_vror_VR(mx, (int)rot));
+      }
+      c->rmin[i * HEXKL_ACC_TILE_ROWS + m] = dq_lane0(mn);
+      c->rmax[i * HEXKL_ACC_TILE_ROWS + m] = dq_lane0(mx);
     }
   }
 }
@@ -246,8 +283,9 @@ void hvx_dequant_swiglu_acc_tiles_to_f32(
   if (!tiles_base || n_pairs == 0u || m_count == 0u) {
     return;
   }
-  hvx_dq_swiglu_job c = {tiles_base, tile_stride, n_pairs,  g0,      row_stride,
-                         m_count,    act_scale,   act_zp,   colsum_w, w_scale,
-                         bias,       inter,       dst,      dst_stride};
+  hvx_dq_swiglu_job c = {tiles_base, tile_stride, n_pairs,   g0,
+                         row_stride, m_count,     act_scale, act_zp,
+                         colsum_w,   w_scale,     bias,      inter,
+                         dst,        dst_stride,  NULL,      NULL};
   hvx_worker_pool_run(pool, hvx_dq_swiglu_worker, &c, n_pairs);
 }

@@ -163,7 +163,19 @@ typedef struct {
   uint32_t inter;
   float *dst;
   uint32_t dst_stride;
+  /** Optional: per-worker row extrema of what this job wrote, for the
+      requantization that follows. Worker i writes rmin[i*64 + m] and
+      rmax[i*64 + m] for m < m_count, min/max over ITS columns and 0;
+      the caller folds the workers (and the batches) and hands the result
+      to hvx_quant_row_params_from_minmax. With the scan done here, the
+      requantization's own pass over the [64 x inter] block is gone.
+      NULL for none. Sized HVX_DQ_SWIGLU_MAX_PARTS workers. */
+  float *rmin;
+  float *rmax;
 } hvx_dq_swiglu_job;
+
+/** @brief Most workers a job's extrema arrays are sized for. */
+#define HVX_DQ_SWIGLU_MAX_PARTS 8u
 
 /** @brief hvx_worker_pool_func over an hvx_dq_swiglu_job. */
 void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *job);

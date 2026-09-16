@@ -250,6 +250,14 @@ void hvx_worker_pool_wait(hvx_worker_pool *pool) {
   pool->outstanding = 0;
 }
 
+uint32_t hvx_worker_pool_submit_parts(const hvx_worker_pool *pool,
+                                      uint32_t n_units) {
+  if (n_units == 0u || !pool || pool->n_workers == 0) {
+    return 1u;
+  }
+  return n_units > pool->n_workers ? pool->n_workers : n_units;
+}
+
 void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
                             void *ctx, uint32_t n_units) {
   if (n_units == 0u) {

@@ -38,6 +38,17 @@ void hvx_quant_rows_u8_params(const float *x, uint32_t m_valid, uint32_t m_pad,
                               hvx_worker_pool *pool);
 
 /**
+ * @brief The row's (scale, zp) from its min and max -- the second half of
+ *        hvx_quant_rows_u8_params, split out so a caller that already has
+ *        the extrema (the MoE kernel's fused SwiGLU epilogue tracks them
+ *        as it writes the row) gets the same parameters without a second
+ *        pass over the row. 0 is folded in here, so the extrema may or may
+ *        not include it; a flat row gets scale 1, zp 0, as the scan does.
+ */
+void hvx_quant_row_params_from_minmax(float min0, float max0, float *scale,
+                                      int32_t *zp);
+
+/**
  * @brief Quantizes to uint8 and writes AH tiles (K2).
  *
  * Writes directly in the layout the HMX activation port expects: 64x32
