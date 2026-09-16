@@ -30,10 +30,11 @@
  *         same instruction ggml-hexagon's work-queue.c uses while a job is
  *         in flight. */
 static inline void hvx_worker_pool_pause(void) {
+  /* The host check (test/htp/host) builds this file with a pthread stand-in
+     for QuRT; a plain spin is fine there. */
 #if defined(__hexagon__)
   asm volatile(" pause(#255)\n");
-#endif /* the host check (test/htp/host) builds this file with a pthread       \
-          stand-in for QuRT; a plain spin is fine there */
+#endif
 }
 
 /** @brief Per-worker stack, generous for the quant kernels this pool
