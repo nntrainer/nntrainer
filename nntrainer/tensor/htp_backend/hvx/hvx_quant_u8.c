@@ -244,18 +244,19 @@ static void quant_pack_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
   }
 }
 
-void hvx_quant_pack_u8_ah_block(const float *x, const uint32_t *row_map,
-                                uint32_t rb, uint32_t k, const float *scale,
-                                const int32_t *zp, uint8_t *out_ah) {
+void hvx_quant_pack_u8_ah_rows(const float *x, const uint32_t *row_map,
+                               uint32_t m0, uint32_t m1, uint32_t k,
+                               const float *scale, const int32_t *zp,
+                               uint8_t *out_ah) {
   const uint32_t n_ktiles = k / TILE_INNER;
-  const uint32_t m0 = rb * TILE_ROW;
-  uint8_t *blk = out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES;
-  /* Row-group outer, k-tile inner: the whole block is this call's, so the
+  /* Row-group outer, k-tile inner: the rows are this call's alone, so the
      k-tile split the pooled pack needs for disjoint stores is not needed,
      and the four rows' parameters are splatted once per group instead of
      once per (group, k-tile). Same group body, same bytes. */
-  for (uint32_t r0 = 0; r0 < TILE_ROW; r0 += 4u) {
-    const uint32_t m = m0 + r0;
+  for (uint32_t m = m0; m < m1; m += 4u) {
+    const uint32_t rb = m / TILE_ROW;
+    const uint32_t r0 = m % TILE_ROW;
+    uint8_t *blk = out_ah + (size_t)rb * n_ktiles * ACT_TILE_BYTES;
     const float *const row[4] = {
       x + (size_t)(row_map ? row_map[m + 0] : (m + 0)) * k,
       x + (size_t)(row_map ? row_map[m + 1] : (m + 1)) * k,

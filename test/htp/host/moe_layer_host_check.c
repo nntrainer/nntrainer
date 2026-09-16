@@ -135,18 +135,24 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m, uint32_t mp, uint32_t k,
                          hvx_worker_pool *p) {
   return hvx_quant_pack_u8_ah_mapped(x, NULL, m, mp, k, scale, zp, out, p);
 }
-/* One block through the mapped stand-in: the pack of rows [rb*64, +64) is
-   the same arithmetic whichever entry lands it, so the block entry is
-   defined by the whole-buffer one rather than repeated -- a second copy of
-   the formula would let the two drift and hide it. Offsets shift so the
-   mapped stand-in sees a one-block problem. */
-void hvx_quant_pack_u8_ah_block(const float *x, const uint32_t *map,
-                                uint32_t rb, uint32_t k, const float *scale,
-                                const int32_t *zp, uint8_t *out) {
+/* A row range, same scalar formula as the mapped stand-in above so the
+   two cannot drift: the kernel's units are 16-row quarters of a block. */
+void hvx_quant_pack_u8_ah_rows(const float *x, const uint32_t *map, uint32_t m0,
+                               uint32_t m1, uint32_t k, const float *scale,
+                               const int32_t *zp, uint8_t *out) {
   const uint32_t kt_n = k / 32u;
-  hvx_quant_pack_u8_ah_mapped(x, map + (size_t)rb * 64u, 64u, 64u, k,
-                              scale + (size_t)rb * 64u, zp + (size_t)rb * 64u,
-                              out + (size_t)rb * kt_n * 2048u, NULL);
+  for (uint32_t r = m0; r < m1; ++r)
+    for (uint32_t kt = 0; kt < kt_n; ++kt)
+      for (uint32_t j = 0; j < 32; ++j) {
+        const size_t sr = map ? map[r] : r;
+        long q = lrintf(x[sr * k + kt * 32 + j] / scale[r]) + zp[r];
+        if (q < 0)
+          q = 0;
+        if (q > 255)
+          q = 255;
+        out[(size_t)(r / 64u) * kt_n * 2048u + (size_t)kt * 2048u +
+            (size_t)(r % 64u) * 32u + j] = (uint8_t)q;
+      }
 }
 void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
                                  uint32_t m, const float *as, const int32_t *az,

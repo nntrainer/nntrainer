@@ -243,12 +243,25 @@ typedef struct {
   uint32_t K;
 } moe_pack_ctx;
 
+/** @brief Rows per background unit: a quarter block. A worker mid-unit
+ *         picks the next epilogue up late by one unit, and at 64 rows that
+ *         read as +0.32 ms/call in the DEQUANT column (doc 47 section 19.2);
+ *         16 rows is ~2.5 us of work. Divides 64, so a block is whole
+ *         units and the waits below stay block arithmetic. */
+#define MOE_PACK_UNIT_ROWS 16u
+
 static void moe_pack_bg_worker(uint32_t n_units, uint32_t u, void *vctx) {
   (void)n_units;
   const moe_pack_ctx *c = (const moe_pack_ctx *)vctx;
-  hvx_quant_pack_u8_ah_block(c->act_c, c->slot_row, u, c->K, c->slot_scale,
-                             c->slot_zp, c->act_ah);
+  hvx_quant_pack_u8_ah_rows(c->act_c, c->slot_row, u * MOE_PACK_UNIT_ROWS,
+                            (u + 1u) * MOE_PACK_UNIT_ROWS, c->K, c->slot_scale,
+                            c->slot_zp, c->act_ah);
 }
+
+/** @brief The unit count that covers slots [0, slot + 64): what to wait for
+ *         before the block at @a slot is queued. */
+#define MOE_PACK_UNITS_THROUGH(slot)                                           \
+  (((slot) + HEXKL_HMX_INT8_BLOCK_N_ROW) / MOE_PACK_UNIT_ROWS)
 
 /**
  * @brief Copies through the DMA engine instead of the core.
@@ -527,7 +540,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   const size_t sz_act_c = sizeof(float) * (size_t)M * K;
   const size_t sz_out_c = sizeof(float) * (size_t)M * N_out;
   /* One done byte per slot block for the background pack. */
-  const size_t sz_pack_done = n_slots_cap / BR + 1u;
+  const size_t sz_pack_done = n_slots_cap / MOE_PACK_UNIT_ROWS + 1u;
   const size_t need = ROUND_UP_SZ(sz_scale, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_zp, MOE_SCRATCH_ALIGN) +
                       ROUND_UP_SZ(sz_act_ah, MOE_SCRATCH_ALIGN) +
@@ -649,9 +662,9 @@ int hexkl_mm_u8i4_moe_layer_run(
   pack.slot_zp = slot_zp;
   pack.act_ah = act_ah;
   pack.K = K;
-  hvx_worker_pool_submit_bg(pool, moe_pack_bg_worker, &pack, n_slots / BR,
-                            pack_done);
-  hvx_worker_pool_wait_bg(pool, slot_of[0] / BR + 1u);
+  hvx_worker_pool_submit_bg(pool, moe_pack_bg_worker, &pack,
+                            n_slots / MOE_PACK_UNIT_ROWS, pack_done);
+  hvx_worker_pool_wait_bg(pool, MOE_PACK_UNITS_THROUGH(slot_of[0]));
   HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
 
   /* The first expert's first activation block. Queued behind its gate_up
@@ -699,7 +712,7 @@ int hexkl_mm_u8i4_moe_layer_run(
          nothing but this expert's own down is ahead of them in the ring. */
       if (mb != 0u) {
         HEXKL_PROBE_T0(p0);
-        hvx_worker_pool_wait_bg(pool, (slot_of[i] + mb) / BR + 1u);
+        hvx_worker_pool_wait_bg(pool, MOE_PACK_UNITS_THROUGH(slot_of[i] + mb));
         HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
       }
       HEXKL_PROBE_T0(p0);
@@ -833,7 +846,7 @@ int hexkl_mm_u8i4_moe_layer_run(
          cover the gate_up too. */
       if (last_block && i + 1u < n_active) {
         HEXKL_PROBE_T0(p0);
-        hvx_worker_pool_wait_bg(pool, slot_of[i + 1u] / BR + 1u);
+        hvx_worker_pool_wait_bg(pool, MOE_PACK_UNITS_THROUGH(slot_of[i + 1u]));
         HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
         act_idx = moe_push_act_block(vtcm_base, L.act_off, act_ah,
                                      slot_of[i + 1u], K, k_tiles);
