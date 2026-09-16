@@ -61,20 +61,24 @@ std::unique_ptr<Quantizer> PerTensorAffineQuantizer::create() {
 
 void PerTensorAffineQuantizer::calculateQParams(const Tensor &input,
                                                 Tdatatype qtype) {
-  float max_val = input.max_abs();
-  scale = max_val / ((quant_max - quant_min) / 2.0f);
-  scale = std::max(scale, std::numeric_limits<float>::epsilon());
+  const bool is_unsigned = qtype == Tdatatype::UINT4 ||
+                           qtype == Tdatatype::UINT8 ||
+                           qtype == Tdatatype::UINT16;
 
-  if (qtype == Tdatatype::UINT4) {
+  if (is_unsigned) {
+    const float min_val = std::min(input.minValue(), 0.0f);
+    const float max_val = std::max(input.maxValue(), 0.0f);
+    scale = (max_val - min_val) / (quant_max - quant_min);
+    scale = std::max(scale, std::numeric_limits<float>::epsilon());
+
+    const long int rounded_zero_point =
+      std::lround(quant_min - min_val / scale);
     zero_point =
-      (unsigned int)(std::round(scale * input.minValue()) + std::pow(2, 3));
-  } else if (qtype == Tdatatype::UINT8) {
-    zero_point =
-      (unsigned int)(std::round(scale * input.minValue()) + std::pow(2, 7));
-  } else if (qtype == Tdatatype::UINT16) {
-    zero_point =
-      (unsigned int)(std::round(scale * input.minValue()) + std::pow(2, 15));
+      static_cast<unsigned int>(clip(rounded_zero_point, quant_min, quant_max));
   } else {
+    const float max_val = input.max_abs();
+    scale = max_val / ((quant_max - quant_min) / 2.0f);
+    scale = std::max(scale, std::numeric_limits<float>::epsilon());
     zero_point = 0;
   }
 }
@@ -163,7 +167,7 @@ Tensor &PerTensorAffineQuantizer::quantize(const Tensor &input, Tensor &output,
 Tensor PerTensorAffineQuantizer::dequantize(const Tensor &input,
                                             Tdatatype dtype) {
   Tensor output = input.clone(dtype);
-  if (output.getDataType() == Tdatatype::UINT4 ||
+  if (input.getDataType() == Tdatatype::UINT4 ||
       input.getDataType() == Tdatatype::UINT8 ||
       input.getDataType() == Tdatatype::UINT16) {
     output.subtract_i(static_cast<float>(*input.getZeroPoint()));
