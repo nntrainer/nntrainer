@@ -51,6 +51,11 @@
 #include "qwen3_cached_slim_moe_causallm.h"
 #endif
 #include "lfm2_causallm.h"
+#include "lfm2_moe_causallm.h"
+#include "lfm2_slim_moe_causallm.h"
+#if !defined(_WIN32)
+#include "lfm2_cached_slim_moe_causallm.h"
+#endif
 #include "qwen3_causallm.h"
 #include "qwen3_embedding.h"
 #include "qwen3_moe_causallm.h"
@@ -323,6 +328,24 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::Lfm2CausalLM>(cfg, generation_cfg,
                                                       nntr_cfg);
     });
+  causallm::Factory::Instance().registerModel(
+    "Lfm2MoeForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Lfm2MoeCausalLM>(cfg, generation_cfg,
+                                                         nntr_cfg);
+    });
+  causallm::Factory::Instance().registerModel(
+    "Lfm2SlimMoeForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Lfm2SlimMoeCausalLM>(cfg, generation_cfg,
+                                                             nntr_cfg);
+    });
+#if !defined(_WIN32)
+  causallm::Factory::Instance().registerModel(
+    "Lfm2CachedSlimMoeForCausalLM",
+    [](json cfg, json generation_cfg, json nntr_cfg) {
+      return std::make_unique<causallm::Lfm2CachedSlimMoeCausalLM>(
+        cfg, generation_cfg, nntr_cfg);
+    });
+#endif
 
   // Validate arguments
   if (argc < 2) {

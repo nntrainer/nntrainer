@@ -393,6 +393,21 @@ void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
   return __ggml_q4_0_4x8_q8_0_GEMM<float>(M, Ns, K, A, lda, Bs, ldbs, Cs, ldcs);
 }
 
+size_t q4_0_gemv_activation_size(const unsigned int K) {
+  return __ggml_q4_0_gemv_activation_size(K);
+}
+
+void quantize_q4_0_gemv_activation(const unsigned int K, const float *A,
+                                   void *quantized_A) {
+  __ggml_quantize_q4_0_gemv_activation(K, A, quantized_A);
+}
+
+void gemv_q4_0_rowwise_range(const unsigned int row_begin,
+                             const unsigned int row_end, const unsigned int K,
+                             const void *quantized_A, const void *B, float *C) {
+  __ggml_gemv_q4_0_rowwise_range(row_begin, row_end, K, quantized_A, B, C);
+}
+
 void gemm_q4_K(const unsigned int M, const unsigned int N, const unsigned int K,
                const float *A, const unsigned int lda, const void *B,
                const unsigned int ldb, float *C, const unsigned int ldc) {

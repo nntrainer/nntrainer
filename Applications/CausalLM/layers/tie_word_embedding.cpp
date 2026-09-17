@@ -22,6 +22,7 @@
 #include <tie_word_embedding.h>
 #include <util_func.h>
 
+#include <algorithm>
 #include <vector>
 
 namespace causallm {
@@ -349,9 +350,9 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
           : input_step.clone(nntrainer::TensorDim::DataType::FP32);
       input_fp32.dot(weight, hidden_step, false, true);
     } else if (weight.getDataType() == nntrainer::TensorDim::DataType::Q4_0) {
-      ///@note Unlike Q6_K, the Q4_0 Qn_K dot does NOT transpose the block data
-      /// for the [vocab, hidden] tied layout, so compute each vocab row
-      /// explicitly: logits[v] = dot(input, dequant(weight_row_v)).
+      ///@note The tied weight is stored as canonical Q4_0 rows so embedding
+      /// lookup can address a token directly. Quantize the activation once and
+      /// compute all vocabulary logits with the row-wise Q4_0/Q8_0 SIMD GEMV.
       const unsigned int hidden_size = input_step.width();
       const unsigned int vocab_size = weight.height();
       NNTR_THROW_IF(weight.width() != hidden_size ||
@@ -359,35 +360,33 @@ void TieWordEmbedding::incremental_forwarding_lmhead(
                     std::invalid_argument)
         << "Q4_0 tie word embedding lmhead has mismatched dimensions";
 
-      const unsigned int num_blocks_per_row = (hidden_size + 32 - 1) / 32;
-      const size_t row_stride = (sizeof(uint16_t) + 16) * num_blocks_per_row;
       const uint8_t *weight_data = weight.getData<uint8_t>();
 
-      // The activation may be FP16; sdot/dequant work in FP32, so cast the
-      // single input row up to FP32 once (no-op when already FP32).
+      // The row-wise GEMV accepts FP32 activations and writes FP32 logits.
       nntrainer::Tensor input_fp32 =
         (input_step.getDataType() == nntrainer::TensorDim::DataType::FP32)
           ? input_step
           : input_step.clone(nntrainer::TensorDim::DataType::FP32);
       const float *input_data = input_fp32.getData<float>();
       float *logits = hidden_step.getData<float>();
+      std::vector<char> quantized_activation(
+        nntrainer::q4_0_gemv_activation_size(hidden_size));
+      nntrainer::quantize_q4_0_gemv_activation(hidden_size, input_data,
+                                               quantized_activation.data());
 
       auto &tm = nntrainer::ThreadManager::Global();
-      const unsigned int compute_thread_num = tm.getComputeThreadCount();
-      const unsigned int thread_num =
-        compute_thread_num == 0 ? 1 : compute_thread_num;
-      tm.parallel_for(0, static_cast<size_t>(thread_num), [=](size_t t) {
-        const unsigned int start = (t * vocab_size) / thread_num;
-        const unsigned int end = ((t + 1) * vocab_size) / thread_num;
-        std::vector<float> dequant_row(hidden_size);
+      constexpr size_t chunks_per_thread = 4;
+      const size_t num_chunks = std::max<size_t>(
+        1, std::min(static_cast<size_t>(vocab_size),
+                    static_cast<size_t>(tm.getComputeThreadCount()) *
+                      chunks_per_thread));
 
-        for (unsigned int row = start; row < end; ++row) {
-          const void *wrow =
-            static_cast<const void *>(weight_data + row_stride * row);
-          nntrainer::dequantize_row_q4_0(wrow, dequant_row.data(), hidden_size);
-          logits[row] =
-            nntrainer::sdot(hidden_size, input_data, 1, dequant_row.data(), 1);
-        }
+      tm.parallel_for(0, num_chunks, [&](size_t chunk) {
+        const size_t row_begin = chunk * vocab_size / num_chunks;
+        const size_t row_end = (chunk + 1) * vocab_size / num_chunks;
+        nntrainer::gemv_q4_0_rowwise_range(row_begin, row_end, hidden_size,
+                                           quantized_activation.data(),
+                                           weight_data, logits);
       });
     } else {
       input_step.dot(weight, hidden_step, false, true);
