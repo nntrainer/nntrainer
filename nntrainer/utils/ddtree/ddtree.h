@@ -31,6 +31,21 @@ DDTreeStructure buildTree(const float *draftLogits, int depthLimit, int vocab,
                           const DDTreeConfig &cfg);
 
 /**
+ * @brief Build the best-first candidate token tree from raw uint16 logits
+ *        with on-the-fly dequantization (optimized for QNN; 2026-06-24).
+ *        Dequants with (q+offset)*scale on-the-fly in the NEON logsumexp.
+ * @param draftLogits  row-major [depthLimit, vocab] draft logits (uint16)
+ * @param scale        per-row dequant scale (float)
+ * @param offset       per-row dequant offset (int32)
+ * @param depthLimit   draft horizon (block_size - 1)
+ * @param vocab        vocabulary size (row width of draftLogits)
+ * @param budget       tree budget (max verify batch - 1)
+ */
+DDTreeStructure buildTree(const uint16_t *draftLogits, float scale,
+                          int32_t offset, int depthLimit, int vocab,
+                          int budget);
+
+/**
  * @brief Flatten a tree into verify ids / position ids / additive mask
  *        (== compile_ddtree_tree). Writes into caller buffers.
  * @param rootTokenId      token at tree root (block_output_ids[:, 0])
