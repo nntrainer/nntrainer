@@ -15,11 +15,9 @@
 ## nntrainer safetensors loader matches tensors back to layers.
 ##
 ## Gemma4 specifics handled here:
-## - 35 text layers with interleaved sliding / full attention
-## - KV sharing for the last 20 layers (layer >= 15): wk / wv / k_norm are not
-##   emitted, matching nntrainer's createSharedAttention()
-## - Double-wide MLP for KV-shared layers (shape is taken from the source tensor)
-## - Per-layer input embedding / projection / norm (global, emitted with layer 0)
+## - Interleaved sliding / full attention and optional K-equals-V projection
+## - Optional KV sharing and double-wide dense MLPs
+## - Optional per-layer input embedding / projection / norm
 ## - Tied word embeddings: the lm head shares embedding0, so the safetensors
 ##   path emits no separate output_of_causallm entry, while the .bin path keeps
 ##   the trailing duplicate that nntrainer's binary lm-head save expects.
@@ -133,7 +131,6 @@ class LazyTensor:
     def materialize(self):
         return self._handle.get_tensor(self._key)
 
-
 class SafetensorsState:
     """A lazy, dict-like view over one or more safetensors files.
 
@@ -191,7 +188,7 @@ def load_model_state(model_path):
     return model.state_dict(), "HuggingFace model state_dict"
 
 
-def iter_gemma4_weight_specs(params, config):
+def iter_gemma4_weight_specs(params, config, additional_ffn_specs=None):
     """Yield (nntr_name, suffix, torch_tensor, transpose) in nntrainer order.
 
     The ordering matches nntrainer's binary save/load order. The names and
@@ -205,9 +202,11 @@ def iter_gemma4_weight_specs(params, config):
     """
     text_config = config.text_config
     n_layers = text_config.num_hidden_layers
-    num_kv_shared_layers = text_config.num_kv_shared_layers
+    num_kv_shared_layers = getattr(text_config, "num_kv_shared_layers", 0)
     first_kv_shared_layer_idx = n_layers - num_kv_shared_layers
-
+    layer_types = text_config.layer_types
+    attention_k_eq_v = bool(getattr(text_config, "attention_k_eq_v", False))
+    ple_size = int(getattr(text_config, "hidden_size_per_layer_input", 0) or 0)
     resolve = make_param_resolver(params)
 
     def is_kv_shared_layer(layer_idx):
@@ -236,8 +235,12 @@ def iter_gemma4_weight_specs(params, config):
                    resolve(f"{lp}self_attn.k_proj.weight"), True)
             yield (f"layer{layer_idx}_k_norm", SUFFIX_GAMMA,
                    resolve(f"{lp}self_attn.k_norm.weight"), False)
-            yield (f"layer{layer_idx}_wv", SUFFIX_WEIGHT,
-                   resolve(f"{lp}self_attn.v_proj.weight"), True)
+            use_alternative_attention = (
+                attention_k_eq_v and layer_types[layer_idx] == "full_attention"
+            )
+            if not use_alternative_attention:
+                yield (f"layer{layer_idx}_wv", SUFFIX_WEIGHT,
+                       resolve(f"{lp}self_attn.v_proj.weight"), True)
 
         yield (f"layer{layer_idx}_attention_out", SUFFIX_WEIGHT,
                resolve(f"{lp}self_attn.o_proj.weight"), True)
@@ -254,25 +257,29 @@ def iter_gemma4_weight_specs(params, config):
         yield (f"layer{layer_idx}_ffn_down", SUFFIX_WEIGHT,
                resolve(f"{lp}mlp.down_proj.weight"), True)
 
+        if additional_ffn_specs:
+            yield from additional_ffn_specs(layer_idx, lp, resolve)
+
         yield (f"layer{layer_idx}_post_ffn_norm", SUFFIX_GAMMA,
                resolve(f"{lp}post_feedforward_layernorm.weight"), False)
 
-        yield (f"layer{layer_idx}_per_layer_input_gate", SUFFIX_WEIGHT,
-               resolve(f"{lp}per_layer_input_gate.weight"), True)
+        if ple_size > 0:
+            yield (f"layer{layer_idx}_per_layer_input_gate", SUFFIX_WEIGHT,
+                   resolve(f"{lp}per_layer_input_gate.weight"), True)
 
-        # Global per-layer input weights live in the graph next to layer 0.
-        if layer_idx == 0:
-            yield ("per_layer_input_embedding", SUFFIX_EMBEDDING,
-                   resolve("embed_tokens_per_layer.weight"), False)
-            yield ("per_layer_input_projection", SUFFIX_WEIGHT,
-                   resolve("per_layer_model_projection.weight"), True)
-            yield ("per_layer_projection_norm", SUFFIX_GAMMA,
-                   resolve("per_layer_projection_norm.weight"), False)
+            # Global per-layer input weights live in the graph next to layer 0.
+            if layer_idx == 0:
+                yield ("per_layer_input_embedding", SUFFIX_EMBEDDING,
+                       resolve("embed_tokens_per_layer.weight"), False)
+                yield ("per_layer_input_projection", SUFFIX_WEIGHT,
+                       resolve("per_layer_model_projection.weight"), True)
+                yield ("per_layer_projection_norm", SUFFIX_GAMMA,
+                       resolve("per_layer_projection_norm.weight"), False)
 
-        yield (f"layer{layer_idx}_per_layer_input_proj", SUFFIX_WEIGHT,
-               resolve(f"{lp}per_layer_projection.weight"), True)
-        yield (f"layer{layer_idx}_post_per_layer_input_norm", SUFFIX_GAMMA,
-               resolve(f"{lp}post_per_layer_input_norm.weight"), False)
+            yield (f"layer{layer_idx}_per_layer_input_proj", SUFFIX_WEIGHT,
+                   resolve(f"{lp}per_layer_projection.weight"), True)
+            yield (f"layer{layer_idx}_post_per_layer_input_norm", SUFFIX_GAMMA,
+                   resolve(f"{lp}post_per_layer_input_norm.weight"), False)
         yield (f"layer{layer_idx}_layer_scalar", SUFFIX_SCALAR,
                resolve(f"{lp}layer_scalar"), False)
 
@@ -303,7 +310,8 @@ def _transposed_shape(tensor, transpose):
     return shape
 
 
-def save_gemma4_bin(params, config, dtype, file, tie_word_embeddings):
+def save_gemma4_bin(params, config, dtype, file, tie_word_embeddings,
+                    weight_specs=iter_gemma4_weight_specs):
     """Write Gemma4 weights as the nntrainer binary (.bin) layout.
 
     Streams one tensor at a time: each weight is converted to numpy, written,
@@ -311,8 +319,7 @@ def save_gemma4_bin(params, config, dtype, file, tie_word_embeddings):
     """
     total_bytes = 0
     count = 0
-    for _name, _suffix, tensor, transpose in iter_gemma4_weight_specs(
-            params, config):
+    for _name, _suffix, tensor, transpose in weight_specs(params, config):
         arr = tensor_to_numpy(tensor, dtype, transpose)
         arr.tofile(file)
         total_bytes += arr.nbytes
@@ -335,7 +342,8 @@ def save_gemma4_bin(params, config, dtype, file, tie_word_embeddings):
 
 
 def save_gemma4_safetensors(params, config, dtype, output_path,
-                            tie_word_embeddings):
+                            tie_word_embeddings,
+                            weight_specs=iter_gemma4_weight_specs):
     """Write Gemma4 weights as a safetensors file keyed by nntrainer names.
 
     The safetensors layout is [8-byte header length][header JSON][raw data].
@@ -350,7 +358,7 @@ def save_gemma4_safetensors(params, config, dtype, output_path,
     safetensors_dtype = SAFETENSORS_DTYPE_MAP[dtype]
     itemsize = np.dtype(dtype).itemsize
 
-    specs = list(iter_gemma4_weight_specs(params, config))
+    specs = list(weight_specs(params, config))
 
     # With tied embeddings the lm head shares embedding0's tensor, so nntrainer
     # stores a single deduped entry and no separate output_of_causallm is added.
