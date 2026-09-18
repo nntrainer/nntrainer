@@ -119,8 +119,24 @@ void Exporter::saveTflResult(
 
 template <>
 void Exporter::saveTflResult(
-  const std::tuple<props::Unit, props::LoraRank, props::LoraAlpha> &props,
+  const std::tuple<props::Unit, props::LoraRank, props::LoraAlpha,
+                   props::FusedActivation, props::PlanLastRowOnly> &props,
   const FullyConnectedLayer *self) {
+  // A fused activation epilogue has no tflite FullyConnectedOptions
+  // representation here, so refuse rather than export a node that silently
+  // drops it.
+  auto &fused_act = std::get<props::FusedActivation>(props);
+  NNTR_THROW_IF(!fused_act.empty() &&
+                  fused_act.get() != ActivationType::ACT_NONE,
+                nntrainer::exception::not_supported)
+    << "fully_connected with a fused activation cannot be converted to tfnode";
+  // Likewise for a head planned at a single row: the exported node would carry
+  // the full-height output shape and describe a layer that does not exist.
+  auto &plan_last_row_only = std::get<props::PlanLastRowOnly>(props);
+  NNTR_THROW_IF(!plan_last_row_only.empty() && plan_last_row_only.get(),
+                nntrainer::exception::not_supported)
+    << "fully_connected planned for the last row only cannot be converted to "
+       "tfnode";
   createIfNull(tf_node);
   tf_node->setOpType(tflite::BuiltinOperator_FULLY_CONNECTED);
   auto options = tflite::CreateFullyConnectedOptions(*fbb).Union();
@@ -199,8 +215,15 @@ template <>
 void Exporter::saveTflResult(
   const std::tuple<props::FilterSize, std::array<props::KernelSize, CONV2D_DIM>,
                    std::array<props::Stride, CONV2D_DIM>, props::Padding2D,
-                   std::array<props::Dilation, CONV2D_DIM>> &props,
+                   std::array<props::Dilation, CONV2D_DIM>,
+                   props::FusedActivation> &props,
   const Conv2DLayer *self) {
+  // See the fully_connected case: refuse rather than drop the epilogue.
+  auto &fused_act = std::get<props::FusedActivation>(props);
+  NNTR_THROW_IF(!fused_act.empty() &&
+                  fused_act.get() != ActivationType::ACT_NONE,
+                nntrainer::exception::not_supported)
+    << "conv2d with a fused activation cannot be converted to tfnode";
   createIfNull(tf_node);
 
   auto weight_transform = [](std::vector<const Tensor *> &old_weights) {

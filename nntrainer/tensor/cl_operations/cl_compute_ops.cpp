@@ -11,26 +11,56 @@
  *         GEMM/GEMV variants on top of the existing nntrainer
  *         OpenCL kernels in cl_operations/blas_kernels.cpp.
  *
- * Only the accelerator-specific ops (Q4_0 batch / accel,
- * INT4 batch / accel) are overridden, with their supports_*()
- * predicates returning true. All other ops fall through to the
- * base ComputeOps default (which throws), so callers rely on
- * supports_*() to decide whether to use this path or fall back
- * to a CPU ops table — exactly the contract float_tensor.cpp's
- * dispatch sites already follow.
+ * Two families live here. The accelerator-specific ops (Q4_0 batch / accel,
+ * INT4 batch / accel) are overridden with their supports_*() predicates
+ * returning true; callers rely on supports_*() to decide whether to use this
+ * path or fall back to a CPU ops table — exactly the contract
+ * float_tensor.cpp's dispatch sites already follow. The whole-ops a
+ * backend-neutral layer calls unconditionally (fc, apply_activation) have no
+ * supports_*() escape hatch, so every op a layer registered on the gpu engine
+ * reaches must resolve here: the base ComputeOps default throws, and a layer
+ * has nowhere to catch that. Those are implemented below.
  *
  * This file is what unblocks GPU dispatch end-to-end:
  *   ClContext (Engine-registered) -> ContextData -> ClComputeOps
  *   -> nntrainer::gemm_q4_0_async_cl(...) -> OpenCL kernel queue.
  */
 
+#include <blas_kernel_interface.h>
 #include <blas_kernels.h>
 #include <compute_ops.h>
+#include <tensor.h>
 
 namespace nntrainer {
 
 class ClComputeOps : public ComputeOps {
 public:
+  /**
+   * @brief Fully connected matmul on the OpenCL GEMM.
+   *
+   * This is the call FullyConnectedLayerCl made directly before the layer
+   * became backend-neutral, so a gpu-engine graph keeps the same kernel and
+   * the same numerics. dotCl() writes the result (it does not accumulate),
+   * which is why no zero-fill precedes it.
+   */
+  void fc(Tensor &input, Tensor &weight, Tensor &output) override {
+    dotCl(input, weight, output);
+  }
+
+  /**
+   * @brief Activation epilogue, run on the host.
+   *
+   * A gpu-engine Tensor is host-allocated (the kernels stage it into device
+   * buffers per call), so the CPU table operates on exactly the same memory
+   * and yields the same values a standalone ActivationLayer would. There is no
+   * whole-op activation kernel yet; this exists so a fused epilogue on the gpu
+   * engine computes rather than throwing, and it can be replaced by a kernel
+   * without touching a caller.
+   */
+  void apply_activation(Tensor &out, int act_type) override {
+    get_cpu_ops()->apply_activation(out, act_type);
+  }
+
   // ── Accelerator-only Q4_0 / INT4 GEMM/GEMV ────────────────
   bool supports_gemm_q4_0_batch_fp32() const override { return true; }
   void gemm_q4_0_batch_fp32(std::vector<void *> matAdata, float *matBdata,

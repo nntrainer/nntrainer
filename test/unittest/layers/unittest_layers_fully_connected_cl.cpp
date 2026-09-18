@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <fc_layer_cl.h>
+#include <layer_context.h>
 #include <layers_common_tests.h>
 
 auto semantic_fc_gpu = LayerSemanticsParamType(
@@ -92,3 +93,39 @@ GTEST_PARAMETER_TEST(FullyConnectedGPU16, LayerGoldenTest,
                                        fc_gpu_basic_single_batch_w16a16,
                                        fc_gpu_basic_no_decay_w16a16));
 #endif
+
+/**
+ * @brief Finalize the neutral fully connected layer over an eight-row input
+ * and report the height it planned its output at. finalize() is pure
+ * dimension planning, so it needs no device.
+ *
+ * @param props properties to set on the layer before finalizing
+ * @return unsigned int planned output height
+ */
+static unsigned int
+plannedGpuOutputHeight(const std::vector<std::string> &props) {
+  auto layer = nntrainer::createLayer<nntrainer::FullyConnectedLayerCl>();
+  layer->setProperty(props);
+
+  std::vector<ml::train::TensorDim> input_dims(
+    1, ml::train::TensorDim({1, 1, 8, 4}));
+  nntrainer::InitLayerContext context(input_dims, {true}, false, "fc", "", 0.0f,
+                                      {"NCHW", "FP32", "FP32"}, 1.0f,
+                                      ml::train::ExecutionMode::INFERENCE);
+  layer->finalize(context);
+
+  return context.getOutSpecs().at(0).variable_spec.dim.height();
+}
+
+/**
+ * @brief The same planning contract the host layer states, so the property
+ * reads the same whichever engine resolves "fully_connected".
+ */
+TEST(FullyConnectedGPU, planLastRowOnly_p) {
+  EXPECT_EQ(plannedGpuOutputHeight({"unit=5"}), 8u);
+  EXPECT_EQ(plannedGpuOutputHeight({"unit=5", "skip_prefill=true"}), 8u);
+  EXPECT_EQ(plannedGpuOutputHeight({"unit=5", "plan_last_row_only=true"}), 8u);
+  EXPECT_EQ(plannedGpuOutputHeight(
+              {"unit=5", "skip_prefill=true", "plan_last_row_only=true"}),
+            1u);
+}
