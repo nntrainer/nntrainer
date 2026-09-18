@@ -87,7 +87,7 @@ export ANDROID_NDK=/path/to/android-ndk        # e.g. ~/Android/Sdk/ndk/27.2.124
 meson configure builddir -Denable-opencl=true -Dwerror=false
 ninja -C builddir install
 #     ⚠️ ndk-build does NOT run meson's .cl->.cpp codegen. If you edited a kernel,
-#     regenerate first (tools/regen_cl_kernels.sh / build_lib.sh) or you get silent
+#     re-run the meson build (or `build_lib.sh`) first, or you get silent
 #     stale-kernel garbage. See §11.
 
 # (b) Build the app (ndk-build):
@@ -608,7 +608,7 @@ that one `.so` needs pushing.
 | Garbage on **Xe3** specifically | Missing `NNTR_XE3_SYNC=1` (Panther Lake SVM coherence regression). |
 | `model_type mismatch` crash at load | `nntr_config.json` lacks `"model_type":"CausalLM"`. |
 | `Failed to open file` (tokenizer) | `tokenizer_file` points at a device path; set the local absolute path. |
-| Silent garbage after editing a `.cl` kernel (Android) | ndk-build does not re-run meson's `.cl`→`.cpp` codegen. Regenerate (`tools/regen_cl_kernels.sh` / `build_lib.sh`) before rebuilding. |
+| Silent garbage after editing a `.cl` kernel (Android) | ndk-build does not re-run meson's `.cl`→`.cpp` codegen. Re-run the meson build (or `build_lib.sh`) before rebuilding. |
 | `dlopen`/undefined-symbol for `clSVM*` on Android | `libnntrainer.so` was built without OpenCL. Reconfigure `builddir` with `-Denable-opencl=true` and `ninja install`. |
 | Orin: `SIGILL` / host-pointer fault in an FC | A host-resident input/weight reached a device kernel; ensure the safe-set (`run_gemma4_fast.sh`) so inputs are staged to device buffers. |
 
