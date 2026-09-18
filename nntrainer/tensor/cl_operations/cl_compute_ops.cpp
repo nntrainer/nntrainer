@@ -11,21 +11,42 @@
  *         GEMM/GEMV variants on top of the existing nntrainer
  *         OpenCL kernels in cl_operations/blas_kernels.cpp.
  *
- * Only the accelerator-specific ops (Q4_0 batch / accel,
- * INT4 batch / accel) are overridden, with their supports_*()
- * predicates returning true. All other ops fall through to the
- * base ComputeOps default (which throws), so callers rely on
- * supports_*() to decide whether to use this path or fall back
- * to a CPU ops table — exactly the contract float_tensor.cpp's
- * dispatch sites already follow.
+ * Two families live here. The accelerator-specific ops (Q4_0 batch / accel,
+ * INT4 batch / accel) are overridden with their supports_*() predicates
+ * returning true; callers rely on supports_*() to decide whether to use this
+ * path or fall back to a CPU ops table — exactly the contract
+ * float_tensor.cpp's dispatch sites already follow.
+ *
+ * The second family is the whole-op table a backend-neutral layer calls
+ * without asking a predicate first: fc, apply_activation, layer_norm,
+ * activation, residual_op, geglu, swiglu and the scopy family. These have no
+ * supports_*() escape hatch, so every op a layer registered on the gpu engine
+ * can reach has to resolve here — the base ComputeOps default throws, and a
+ * layer has nowhere to catch that. The list is closed against the layers this
+ * context registers: FullyConnectedLayerCl (fc, apply_activation,
+ * fc_prebuild_weight), AdditionLayer (residual_op), SwiGLULayer (swiglu),
+ * LayerNormalizationLayer (layer_norm), ActivationLayer (activation), plus
+ * Tensor::copy (scopy). ActivationLayer is the one entry that can still
+ * throw, and only for a mode with no OpenCL kernel: supports_activation() is
+ * the query, and the message names the fix.
  *
  * This file is what unblocks GPU dispatch end-to-end:
  *   ClContext (Engine-registered) -> ContextData -> ClComputeOps
  *   -> nntrainer::gemm_q4_0_async_cl(...) -> OpenCL kernel queue.
  */
 
+#include <cstring>
+#include <stdexcept>
+
+#include <blas_kernel_interface.h> // add_i_cl, dotCl
 #include <blas_kernels.h>
+#include <common_properties.h> // ActivationType, the act_type int encoding
 #include <compute_ops.h>
+#include <geglu_cl_op.h>
+#include <gelu_cl_op.h>
+#include <layernorm_cl_op.h>
+#include <swiglu_cl_op.h>
+#include <tensor.h>
 
 namespace nntrainer {
 
@@ -80,6 +101,214 @@ public:
                              unsigned int K, unsigned int group_size) override {
     nntrainer::sgemm_int4_cl(input, weight, scale, output, M, N, K, group_size);
   }
+
+  // ── Whole-ops (Tensor level) ──────────────────────────────────
+  // Fully-connected matmul, for the neutral fully-connected layer: the layer
+  // keeps the weight and bias binding and the shape logic, and only the GEMM
+  // comes here. dotCl picks the dot, GEMV or GEMM kernel from the operand
+  // shapes, exactly as the layer used to do inline.
+  //
+  // dotCl is contracted to PRODUCE its output, not accumulate into it, which
+  // is why no zero-fill precedes this call. One shape does not honour that
+  // yet: the FP32 general-GEMM branch still dispatches through the CLBlast
+  // wrapper with beta = 1.0, so it reads the destination it is about to
+  // overwrite. That branch is deleted by the CLBlast removal this PR depends
+  // on, which routes the same shape to sgemm_cl -- which stores, like the
+  // other three shapes and like the whole FP16 branch. Do not add a zero-fill
+  // here to paper over it: that would cost a full-output memset on every
+  // forward for one transitional branch.
+  void fc(Tensor &input, Tensor &weight, Tensor &output) override {
+    nntrainer::dotCl(input, weight, output);
+  }
+
+  // The fused activation epilogue, which the fully-connected layer applies to
+  // its own output in place. It runs on the host table: the operand is the
+  // tensor the GEMM just read back, so the CPU table works on exactly the
+  // memory the kernels staged and yields the values a standalone
+  // ActivationLayer would. Unlike ::activation below, this one accepts every
+  // mode, because a fused epilogue has no way to decline one. Replacing it
+  // with a kernel is a residency refinement and touches no caller.
+  void apply_activation(Tensor &out, int act_type) override {
+    get_cpu_ops()->apply_activation(out, act_type);
+  }
+
+  // The gated pairs: (gate, up) -> out, element-wise, one kernel each.
+  void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+             unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::geglu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+  void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+              unsigned int active_rows, unsigned int row_offset) override {
+    nntrainer::swiglu_cl_op(in1, in2, out, active_rows, row_offset);
+  }
+
+  // LayerNorm over the last axis. The neutral LayerNormalizationLayer owns
+  // the axis contract and only dispatches here when its property matches, so
+  // this op never sees a property.
+  void layer_norm(const Tensor &in, Tensor &out, const Tensor &gamma,
+                  const Tensor &beta, float epsilon, unsigned int active_rows,
+                  unsigned int row_offset) override {
+    nntrainer::layernorm_cl_op(in, out, gamma, beta, epsilon, active_rows,
+                               row_offset);
+  }
+
+  // Element-wise activation. Only gelu and tanh_gelu have OpenCL kernels; the
+  // remaining modes run on the host table.
+  //
+  // That is the same answer apply_activation() above gives, and it has to be:
+  // both are handed the same tensors on the same context, so they cannot hold
+  // different beliefs about whether a host loop is valid on them. This
+  // function used to throw instead, arguing that a tensor here may live in
+  // device memory the host has unmapped -- but no tensor is device-resident on
+  // this tree yet, and while that stays true the throw only produces a worse
+  // outcome than the loop. ClContext registers the core ActivationLayer gated
+  // on the gelu kernels building, not on the mode, so engine=gpu with
+  // activation=relu constructed successfully and then failed at the first
+  // forward, mid-inference, while the fused epilogue computed the identical
+  // value for the identical tensor.
+  //
+  // supports_activation() below still reports only the accelerated pair: it
+  // answers "is this mode accelerated here", which is what a caller choosing
+  // between paths wants to know. This function answers "can this mode be
+  // served", and now it always can. When residency becomes real, this host
+  // branch and apply_activation() change together.
+  void activation(const Tensor &in, Tensor &out, int act_type,
+                  unsigned int active_rows, unsigned int row_offset) override {
+    switch (static_cast<ActivationType>(act_type)) {
+    case ActivationType::ACT_GELU:
+      nntrainer::gelu_cl_op(in, out, /*mode=*/0, active_rows, row_offset);
+      return;
+    case ActivationType::ACT_TANH_GELU:
+      nntrainer::gelu_cl_op(in, out, /*mode=*/1, active_rows, row_offset);
+      return;
+    default:
+      get_cpu_ops()->activation(in, out, act_type, active_rows, row_offset);
+      return;
+    }
+  }
+
+  bool supports_activation(int act_type) const override {
+    const auto type = static_cast<ActivationType>(act_type);
+    return type == ActivationType::ACT_GELU ||
+           type == ActivationType::ACT_TANH_GELU;
+  }
+
+  // One residual-add operand, for the neutral AdditionLayer. FP32 same-size
+  // operands take a host copy/add: the FP32 addition kernel reads its result
+  // back into the caller's pointer, which is the very read into shared memory
+  // that does not land (see the FP32 GEMM read-back), and both operands are
+  // host-addressable here anyway.
+  void residual_op(Tensor &hidden, const Tensor &input,
+                   bool accumulate) override {
+    const auto fp32 = ml::train::TensorDim::DataType::FP32;
+    if (hidden.getDataType() == fp32 && input.getDataType() == fp32 &&
+        hidden.size() == input.size()) {
+      const size_t n = hidden.size();
+      float *out = hidden.getData<float>();
+      const float *in = input.getData<float>();
+      if (!accumulate) {
+        std::memcpy(out, in, n * sizeof(float));
+      } else {
+        for (size_t i = 0; i < n; ++i)
+          out[i] += in[i];
+      }
+      return;
+    }
+
+    if (!accumulate) {
+      hidden.copy(input);
+    } else {
+      nntrainer::add_i_cl(hidden, input);
+    }
+  }
+
+  // Tensor::add() and Tensor::multiply() reach the table the same way
+  // Tensor::copy() does -- straight through, with no supports_*() guard for a
+  // caller to consult -- so leaving these off the table is not a missing
+  // acceleration but a throw: an addition between two tensors on this context
+  // raised "ComputeOps::ele_add_fp32 not implemented by this backend" from the
+  // base default. Serve them on the host table, for the same reason
+  // residual_op's FP32 path does: the addition kernel reads its result back
+  // into the caller's pointer, which is exactly the read into shared memory
+  // that does not land, and both operands are host-addressable here anyway.
+  // Putting these on a kernel is blocked behind that read-back fix, not behind
+  // a missing kernel.
+  void ele_add_fp32(const unsigned int N, const float *X, const float *Y,
+                    float *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_add_fp32(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+  void ele_mul_fp32(const unsigned int N, const float *X, const float *Y,
+                    float *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_mul_fp32(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+  void ele_sub_fp32(const unsigned int N, const float *X, const float *Y,
+                    float *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_sub_fp32(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+  void ele_div_fp32(const unsigned int N, const float *X, const float *Y,
+                    float *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_div_fp32(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+
+#ifdef ENABLE_FP16
+  void ele_add_fp16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
+                    _FP16 *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_add_fp16(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+  void ele_mul_fp16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
+                    _FP16 *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_mul_fp16(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+  void ele_sub_fp16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
+                    _FP16 *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_sub_fp16(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+  void ele_div_fp16(const unsigned int N, const _FP16 *X, const _FP16 *Y,
+                    _FP16 *Z, float alpha, float beta, unsigned int i_stride,
+                    unsigned int o_stride) override {
+    get_cpu_ops()->ele_div_fp16(N, X, Y, Z, alpha, beta, i_stride, o_stride);
+  }
+#endif
+
+  // Tensor::copy() reaches the table with no supports_*() guard, so without
+  // these a copy of a tensor on this context would throw "not implemented" --
+  // which the residual copy above does on the FP16 path. A host loop is
+  // correct for host pointers and for host-coherent shared memory; moving the
+  // copy onto a kernel is a residency refinement, not a correctness one.
+  void scopy_fp32(const unsigned int N, const float *X, const unsigned int incX,
+                  float *Y, const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = X[i * incX];
+  }
+
+#ifdef ENABLE_FP16
+  void scopy_fp16(const unsigned int N, const _FP16 *X, const unsigned int incX,
+                  _FP16 *Y, const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = X[i * incX];
+  }
+  // Mixed precision: an FP32 source feeding an FP16 graph, or an FP16 result
+  // read back as FP32, both route here on this backend.
+  void scopy_fp32_to_fp16(const unsigned int N, const float *X,
+                          const unsigned int incX, _FP16 *Y,
+                          const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = static_cast<_FP16>(X[i * incX]);
+  }
+  void scopy_fp16_to_fp32(const unsigned int N, const _FP16 *X,
+                          const unsigned int incX, float *Y,
+                          const unsigned int incY) override {
+    for (unsigned int i = 0; i < N; ++i)
+      Y[i * incY] = static_cast<float>(X[i * incX]);
+  }
+#endif
 };
 
 ComputeOps *get_cl_ops() {

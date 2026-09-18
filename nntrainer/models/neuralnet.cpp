@@ -42,6 +42,7 @@
 #include <common_properties.h>
 #include <databuffer.h>
 #include <flatten_realizer.h>
+#include <fusion_realizer.h>
 #include <ini_interpreter.h>
 #include <ini_wrapper.h>
 #include <input_realizer.h>
@@ -211,6 +212,15 @@ int NeuralNetwork::compile(ExecutionMode mode) {
     std::vector<Connection>(input_conn.begin(), input_conn.end())));
   realizers.emplace_back(new MultioutRealizer());
   realizers.emplace_back(new FlattenRealizer());
+  // Fuse a compute layer's activation epilogue (conv+relu / fc+act) BEFORE
+  // ActivationRealizer would split it into a node, so it stays inline. Gated
+  // by NNTR_FUSE_ACT (default on) and restricted to inference: the fused
+  // forward is value-identical to the standalone node, but there is no fused
+  // backward, so a training graph keeps the separate ActivationLayer that
+  // contributes the activation derivative. A no-op for graphs whose compute
+  // layers carry no activation property.
+  if (mode == ExecutionMode::INFERENCE)
+    realizers.emplace_back(new FusionRealizer());
   realizers.emplace_back(new ActivationRealizer());
 
   for (auto &realizer : realizers) {
@@ -499,6 +509,50 @@ sharedConstTensors NeuralNetwork::forwarding(sharedConstTensors input,
   model_graph.setInputsLabels(input, label);
 
   return forwarding(training);
+}
+
+// The base execution seam: one decode or prefill forward step is a plain graph
+// walk. CPU and OpenCL use this unchanged, so they are byte-identical to the
+// pre-seam code; a backend whose decode is a capture/replay state machine
+// overrides it on its own Context.
+sharedConstTensors Context::runDecode(NeuralNetwork &nn, unsigned int from,
+                                      unsigned int to,
+                                      const sharedConstTensors &input,
+                                      const sharedConstTensors &label) {
+  return nn.incremental_forwarding(from, to, input, label, false);
+}
+
+// Resolve, once and then cache, the Context whose runDecode() drives a decode
+// step. Every backend's base runDecode is the same plain walk, which dispatches
+// each layer to the context named by its own engine= property, so the seam must
+// drive through a backend only when the graph's layers actually run there.
+//
+// A build with two GPU backends compiled in registers both of their contexts. A
+// blind "prefer the accelerator" would then hijack a run whose graph is on the
+// other one — prefill walked on one backend, decode captured on the other, with
+// the KV and hidden-state handoff crossing backends incoherently. Decide from
+// the authoritative per-layer engine property instead, the same one the graph
+// uses to route each node's context, and never from a hardcoded backend order.
+Context *NeuralNetwork::getDecodeContext() {
+  if (decode_ctx_ != nullptr)
+    return decode_ctx_;
+  if (ct_engine == nullptr)
+    return nullptr;
+
+  std::string engine_name = "cpu";
+  if (model_graph.cbegin() != model_graph.cend())
+    engine_name = (*model_graph.cbegin())->getComputeEngineType();
+
+  for (const std::string &name : {engine_name, std::string("cpu")}) {
+    try {
+      decode_ctx_ = ct_engine->getRegisteredContext(name);
+      if (decode_ctx_ != nullptr)
+        return decode_ctx_;
+    } catch (...) {
+      // not registered in this build; try the next candidate
+    }
+  }
+  return decode_ctx_;
 }
 
 sharedConstTensors NeuralNetwork::incremental_forwarding(
@@ -1543,7 +1597,14 @@ sharedConstTensors NeuralNetwork::incremental_inference(
   PROFILE_TIME_REGISTER_EVENT(nn_foward, "nn_forward");
   PROFILE_TIME_START(nn_foward);
 
-  out = incremental_forwarding(from, to, X, label, false);
+  // The execution seam: one decode or prefill step is dispatched through the
+  // resolved Context. The base runDecode is the plain walk below, so CPU and
+  // OpenCL are byte-identical; a backend with its own decode strategy overrides
+  // it instead of adding a compile-guarded block here.
+  if (Context *dctx = getDecodeContext())
+    out = dctx->runDecode(*this, from, to, X, label);
+  else
+    out = incremental_forwarding(from, to, X, label, false);
 
   PROFILE_TIME_END(nn_foward);
 

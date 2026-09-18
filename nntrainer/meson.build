@@ -21,6 +21,7 @@ nntrainer_headers = [
    meson.current_source_dir() / 'context_data.h',
    meson.current_source_dir() / 'engine.h',
    meson.current_source_dir() / 'mem_allocator.h',
+   meson.current_source_dir() / 'model_features.h',
 ]
 
 nntrainer_base_deps=[

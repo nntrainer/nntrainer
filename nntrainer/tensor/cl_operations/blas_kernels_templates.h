@@ -17,14 +17,57 @@
 #ifndef __BLAS_KERNELS_TEMPLATES_H__
 #define __BLAS_KERNELS_TEMPLATES_H__
 
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+#include <vector>
+
 #include <blas_kernels.h>
 
 namespace nntrainer {
+
+/**
+ * @brief Name a hard OpenCL failure inside a dense BLAS primitive, then throw.
+ *
+ * Every step of these routines (staging write, argument bind, dispatch,
+ * read-back) used to `return;` on failure. The caller's contract is "the
+ * output is written", and there is no fallback behind these calls -- so a
+ * bare return leaves the output plane holding whatever was there before and
+ * the process keeps running on it. That is the "rc=0 but the text is garbage"
+ * failure mode: nothing in the log, exit status 0, wrong numbers. Name the op,
+ * the step and the shape on stderr and fail loudly instead.
+ *
+ * @param op     primitive + dtype, e.g. "sgemm_cl<fp16>"
+ * @param step   which OpenCL step refused
+ * @param d0d1d2 shape triple (M,N,K for gemm; dim1,dim2,lda for gemv)
+ */
+[[noreturn]] inline void clBlasFail(const char *op, const char *step,
+                                    unsigned int d0, unsigned int d1,
+                                    unsigned int d2) {
+  char msg[256];
+  std::snprintf(msg, sizeof(msg),
+                "[cl-blas] %s refused at '%s' (%u x %u x %u): the OpenCL call "
+                "failed and the output was left unwritten",
+                op, step, d0, d1, d2);
+  std::fprintf(stderr, "%s\n", msg);
+  std::fflush(stderr);
+  throw std::runtime_error(msg);
+}
+
+/**
+ * @brief Fail with clBlasFail() unless @a cond holds.
+ */
+#define NNTR_CL_BLAS_REQUIRE(cond, op, step, d0, d1, d2)                       \
+  do {                                                                         \
+    if (!(cond))                                                               \
+      clBlasFail((op), (step), (d0), (d1), (d2));                              \
+  } while (0)
+
 template <typename T = float>
-inline static void sgemv_cl_internal(ClContext::SharedPtrClKernel kernel,
-                                     const T *matAdata, const T *vecXdata,
-                                     T *vecYdata, unsigned int dim1,
-                                     unsigned int dim2, unsigned int lda) {
+inline static void
+sgemv_cl_internal(ClContext::SharedPtrClKernel kernel, const T *matAdata,
+                  const T *vecXdata, T *vecYdata, unsigned int dim1,
+                  unsigned int dim2, unsigned int lda, bool out_svm = false) {
   bool result = false;
 
   auto *blas_cc =
@@ -37,64 +80,62 @@ inline static void sgemv_cl_internal(ClContext::SharedPtrClKernel kernel,
 
   result = clbuffInstance.getInBufferA()->WriteDataRegion(
     blas_cc->command_queue_inst_, dim1_dim2_size, matAdata);
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemv_cl", "stage A", dim1, dim2, lda);
 
   result = clbuffInstance.getInBufferB()->WriteDataRegion(
     blas_cc->command_queue_inst_, dim2_size, vecXdata);
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemv_cl", "stage B", dim1, dim2, lda);
 
   result = clbuffInstance.getOutBufferA()->WriteDataRegion(
     blas_cc->command_queue_inst_, dim1_size, vecYdata);
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemv_cl", "stage C", dim1, dim2, lda);
 
   result = kernel->SetKernelArguments(0, clbuffInstance.getInBufferA(),
                                       sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemv_cl", "arg 0", dim1, dim2, lda);
 
   result = kernel->SetKernelArguments(1, clbuffInstance.getInBufferB(),
                                       sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemv_cl", "arg 1", dim1, dim2, lda);
 
   result = kernel->SetKernelArguments(2, clbuffInstance.getOutBufferA(),
                                       sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemv_cl", "arg 2", dim1, dim2, lda);
 
   result = kernel->SetKernelArguments(3, &dim2, sizeof(int));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemv_cl", "arg 3", dim1, dim2, lda);
 
   result = kernel->SetKernelArguments(4, &lda, sizeof(int));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemv_cl", "arg 4", dim1, dim2, lda);
 
   const int work_groups_count[3] = {(int)dim1, 1, 1};
   const int work_group_size[3] = {1, 1, 1};
 
   result = opencl::CommandQueueManager::Global().DispatchCommand(
     kernel, work_groups_count, work_group_size);
-  if (!result) {
+  NNTR_CL_BLAS_REQUIRE(result, "sgemv_cl", "dispatch", dim1, dim2, lda);
+
+  // A rect read straight into shared virtual memory returns success on some
+  // drivers without the bytes ever reaching the host view -- a heap
+  // destination lands, a shared one stays whatever it was, even when mapped.
+  // Read into host scratch and copy through an explicit mapping instead. The
+  // output is deliberately left mapped: the convention here is that a GPU
+  // op's shared output stays host-mapped for the next reader, and the next
+  // GPU consumer unmaps it itself.
+  if (out_svm) {
+    blas_cc->command_queue_inst_.enqueueSVMMap(vecYdata, dim1_size,
+                                               /*read_only=*/false);
+    std::vector<T> scratch(dim1);
+    result = clbuffInstance.getOutBufferA()->ReadDataRegion(
+      blas_cc->command_queue_inst_, dim1_size, scratch.data());
+    NNTR_CL_BLAS_REQUIRE(result, "sgemv_cl", "read back", dim1, dim2, lda);
+    std::memcpy(vecYdata, scratch.data(), dim1_size);
     return;
   }
 
   result = clbuffInstance.getOutBufferA()->ReadDataRegion(
     blas_cc->command_queue_inst_, dim1_size, vecYdata);
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemv_cl", "read back", dim1, dim2, lda);
 }
 
 template <typename T = float>
@@ -171,7 +212,7 @@ inline static void
 sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
                   const T *A, const T *B, T *C, unsigned int M, unsigned int N,
                   unsigned int K, unsigned int lda, unsigned int ldb,
-                  unsigned int ldc) {
+                  unsigned int ldc, bool out_svm = false) {
   bool result = false;
 
   auto *blas_cc =
@@ -185,54 +226,36 @@ sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
 
   result = clbuffInstance.getInBufferA()->WriteDataRegion(
     blas_cc->command_queue_inst_, m_k_size, A);
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemm_cl", "stage A", M, N, K);
 
   result = clbuffInstance.getInBufferB()->WriteDataRegion(
     blas_cc->command_queue_inst_, k_n_size, B);
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemm_cl", "stage B", M, N, K);
 
   result = clbuffInstance.getOutBufferA()->WriteDataRegion(
     blas_cc->command_queue_inst_, m_n_size, C);
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemm_cl", "stage C", M, N, K);
 
   result = kernel->SetKernelArguments(0, clbuffInstance.getInBufferA(),
                                       sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemm_cl", "arg 0", M, N, K);
 
   result = kernel->SetKernelArguments(1, clbuffInstance.getInBufferB(),
                                       sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemm_cl", "arg 1", M, N, K);
 
   result = kernel->SetKernelArguments(2, clbuffInstance.getOutBufferA(),
                                       sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemm_cl", "arg 2", M, N, K);
 
   result = kernel->SetKernelArguments(3, &M, sizeof(int));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemm_cl", "arg 3", M, N, K);
 
   result = kernel->SetKernelArguments(4, &N, sizeof(int));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemm_cl", "arg 4", M, N, K);
 
   result = kernel->SetKernelArguments(5, &K, sizeof(int));
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemm_cl", "arg 5", M, N, K);
 
   const int tiled_size = 16;
   const int work_groups_count[3] = {
@@ -243,21 +266,32 @@ sgemm_cl_internal(ClContext::SharedPtrClKernel kernel, bool TransA, bool TransB,
 
   result = blas_cc->command_queue_inst_.DispatchCommand(
     kernel, work_groups_count, work_group_size);
-  if (!result) {
+  NNTR_CL_BLAS_REQUIRE(result, "sgemm_cl", "dispatch", M, N, K);
+
+  // Same hazard as sgemv_cl_internal above: the rect read into a shared
+  // destination silently never lands. Scratch plus an explicit mapping;
+  // leave the output mapped for the next reader.
+  if (out_svm) {
+    blas_cc->command_queue_inst_.enqueueSVMMap(C, m_n_size,
+                                               /*read_only=*/false);
+    std::vector<T> scratch((size_t)M * N);
+    result = clbuffInstance.getOutBufferA()->ReadDataRegion(
+      blas_cc->command_queue_inst_, m_n_size, scratch.data());
+    NNTR_CL_BLAS_REQUIRE(result, "sgemm_cl", "read back", M, N, K);
+    std::memcpy(C, scratch.data(), m_n_size);
     return;
   }
 
   result = clbuffInstance.getOutBufferA()->ReadDataRegion(
     blas_cc->command_queue_inst_, m_n_size, C);
-  if (!result) {
-    return;
-  }
+  NNTR_CL_BLAS_REQUIRE(result, "sgemm_cl", "read back", M, N, K);
 }
 
 template <typename T = float>
 inline static void
 addition_cl_internal(ClContext::SharedPtrClKernel kernel, const T *input,
-                     T *res, unsigned int size_input, unsigned int size_res) {
+                     T *res, unsigned int size_input, unsigned int size_res,
+                     bool use_svm = false) {
   bool result = false;
 
   auto *blas_cc =
@@ -267,28 +301,50 @@ addition_cl_internal(ClContext::SharedPtrClKernel kernel, const T *input,
   size_t dim1_size = sizeof(T) * size_input;
   size_t dim2_size = sizeof(T) * size_res;
 
-  result = clbuffInstance.getInBufferA()->WriteDataRegion(
-    blas_cc->command_queue_inst_, dim1_size, input);
-  if (!result) {
-    return;
-  }
+  if (use_svm) {
+    // SVM-direct: input and res are device-visible pointers, so accumulate in
+    // place (res += input) with no host round trip. Coarse-grain SVM needs the
+    // coherence stated explicitly: release the host mappings so the device
+    // sees the current contents -- res was just written by the copy of the
+    // first addend -- and re-map res after the dispatch for the host reader.
+    //
+    // Without this the pair below stages both operands through the shared
+    // buffers by reading them as plain host pointers, which on a coarse-grain
+    // device is a stale view of a buffer the GPU has been writing: the
+    // accumulate is computed on the wrong bytes and then written back over the
+    // right ones. Measured on the 1K cell: the residual add kept only its
+    // first operand, so the whole attention contribution vanished from every
+    // decoder block.
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(const_cast<T *>(input));
+    blas_cc->command_queue_inst_.enqueueSVMUnmap(res);
+    if (!kernel->SetKernelSVMArguments(0, input))
+      return;
+    if (!kernel->SetKernelSVMArguments(1, res))
+      return;
+  } else {
+    result = clbuffInstance.getInBufferA()->WriteDataRegion(
+      blas_cc->command_queue_inst_, dim1_size, input);
+    if (!result) {
+      return;
+    }
 
-  result = clbuffInstance.getOutBufferA()->WriteDataRegion(
-    blas_cc->command_queue_inst_, dim2_size, res);
-  if (!result) {
-    return;
-  }
+    result = clbuffInstance.getOutBufferA()->WriteDataRegion(
+      blas_cc->command_queue_inst_, dim2_size, res);
+    if (!result) {
+      return;
+    }
 
-  result = kernel->SetKernelArguments(0, clbuffInstance.getInBufferA(),
-                                      sizeof(cl_mem));
-  if (!result) {
-    return;
-  }
+    result = kernel->SetKernelArguments(0, clbuffInstance.getInBufferA(),
+                                        sizeof(cl_mem));
+    if (!result) {
+      return;
+    }
 
-  result = kernel->SetKernelArguments(1, clbuffInstance.getOutBufferA(),
-                                      sizeof(cl_mem));
-  if (!result) {
-    return;
+    result = kernel->SetKernelArguments(1, clbuffInstance.getOutBufferA(),
+                                        sizeof(cl_mem));
+    if (!result) {
+      return;
+    }
   }
 
   result = kernel->SetKernelArguments(2, &size_input, sizeof(int));
@@ -310,11 +366,18 @@ addition_cl_internal(ClContext::SharedPtrClKernel kernel, const T *input,
     return;
   }
 
-  result = clbuffInstance.getOutBufferA()->ReadDataRegion(
-    blas_cc->command_queue_inst_, dim2_size, res);
+  if (!use_svm) {
+    result = clbuffInstance.getOutBufferA()->ReadDataRegion(
+      blas_cc->command_queue_inst_, dim2_size, res);
 
-  if (!result) {
-    return;
+    if (!result) {
+      return;
+    }
+  } else {
+    // Re-map the in-place result so the host sees the values the device wrote.
+    // Deliberately BLOCKING: an async map here measured a few percent faster
+    // and corrupted the output.
+    blas_cc->command_queue_inst_.enqueueSVMMap(res, dim2_size, true);
   }
 }
 

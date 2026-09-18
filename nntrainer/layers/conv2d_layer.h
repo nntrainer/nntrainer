@@ -17,6 +17,7 @@
 
 #include <memory.h>
 
+#include <acti_func.h>
 #include <common_properties.h>
 #include <layer_impl.h>
 
@@ -112,10 +113,12 @@ private:
   std::array<unsigned int, CONV2D_DIM * 2> padding;
   std::tuple<props::FilterSize, std::array<props::KernelSize, CONV2D_DIM>,
              std::array<props::Stride, CONV2D_DIM>, props::Padding2D,
-             std::array<props::Dilation, CONV2D_DIM>>
+             std::array<props::Dilation, CONV2D_DIM>, props::FusedActivation>
     conv_props;
 
   std::array<unsigned int, 5> wt_idx; /**< indices of the weights and tensors */
+  ActiFunc acti_func;                 /**< inline fused activation; inert unless
+                                           fused_activation is set by the FusionRealizer */
 };
 
 } // namespace nntrainer

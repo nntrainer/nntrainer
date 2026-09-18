@@ -119,6 +119,12 @@ public:
                             const int int_key = -1);
 
   /**
+   * @copydoc Context::registerLayerFactory
+   */
+  int registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                           const std::string &key, const int int_key) override;
+
+  /**
    * @brief Create an Object from the integer key
    *
    * @tparam T Type of Object, currently, Only Layer is supported
@@ -209,10 +215,13 @@ public:
    * @param kernel_string kernel implementation string
    * @param kernel_name kernel name
    * @return std::shared_ptr<opencl::Kernel>
+   * @note by const reference on purpose: kernel sources are tens of KB and a
+   *       by-value signature copies the whole source on every cached lookup.
    */
-  const SharedPtrClKernel registerClKernel(std::string kernel_string,
-                                           std::string kernel_name,
-                                           std::string compile_options = {});
+  const SharedPtrClKernel
+  registerClKernel(const std::string &kernel_string,
+                   const std::string &kernel_name,
+                   const std::string &compile_options = {});
 
   /**
    * @brief Initialize and register all blas OpenCl kernels
@@ -295,8 +304,10 @@ private:
     if (!result)
       return result;
 
-    // initialize device buffers
-    clbuffInstance.initBuffers();
+    // No device-buffer initialization here any more: every staging region is
+    // allocated on its first use, so there is nothing to do at bring-up.
+    // ClBufferManager::initBuffers() is an empty body kept only for the
+    // installed header's ABI, and calling it would say otherwise.
     cl_initialized = result;
     return cl_initialized;
   };
