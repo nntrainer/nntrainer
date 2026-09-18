@@ -1377,7 +1377,10 @@ void nntr_gemm_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
   assert(nr % 4 == 0);
   assert(nc % ncols_interleaved == 0);
 
-#if defined(__ARM_FEATURE_DOTPROD)
+/// @note this kernel accumulates with vmmlaq_s32 (smmla), which is i8mm and
+/// not dotprod; guarding it with __ARM_FEATURE_DOTPROD made it run on
+/// dotprod-only CPUs and trap with SIGILL.
+#if defined(__ARM_FEATURE_MATMUL_INT8)
   for (int y = 0; y < nr; y += 4) {
     const block_q8_0x4 *a_ptr_base = (const block_q8_0x4 *)vy + (y / 4) * nb;
 
