@@ -353,7 +353,12 @@ void unpack_q4_0x8_transpose16(const void *src, unsigned short *__restrict dT,
                                unsigned short *__restrict qsT, int N, int K,
                                int CT) // column tile (in units of 32-cols)
 {
-  assert((K % 256) == 0);
+  // One Q4_0 sub-block spans 32 elements of K and one 8-row group spans 8 rows
+  // of N; the column loop below is tiled with a std::min() bound and the odd
+  // 8-row group has its own tail, so no further alignment is required. These
+  // are the same preconditions the scalar fallback (used by the arm backend)
+  // works under.
+  assert((K % 32) == 0);
   assert((N % 8) == 0);
 
   const auto *__restrict x = static_cast<const block_q4_0x8 *>(src);
@@ -1236,43 +1241,42 @@ static inline __m256 exp256_ps(__m256 x) {
   // return _mm256_castsi256_ps(_mm256_cvtps_epi32(fx));
 
   /* Low-Precision Version II*/
-  /*    const __m256 ln2 = _mm256_set1_ps(0.69314718056f);
-    const __m256 inv_ln2 = _mm256_set1_ps(1.44269504089f); // 1 / ln(2)
+  //    const __m256 ln2 = _mm256_set1_ps(0.69314718056f);
+  // const __m256 inv_ln2 = _mm256_set1_ps(1.44269504089f); // 1 / ln(2)
 
-    // Range reduction: x = n * ln2 + r,  where n is integer and |r| <= ln2/2
-    __m256 fx = _mm256_mul_ps(x, inv_ln2);
-    fx = _mm256_round_ps(fx, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-    __m256i emm0 = _mm256_cvtps_epi32(fx);
+  // // Range reduction: x = n * ln2 + r,  where n is integer and |r| <= ln2/2
+  // __m256 fx = _mm256_mul_ps(x, inv_ln2);
+  // fx = _mm256_round_ps(fx, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+  // __m256i emm0 = _mm256_cvtps_epi32(fx);
 
-    __m256 tmp = _mm256_mul_ps(fx, ln2);
-    __m256 r = _mm256_sub_ps(x, tmp);
+  // __m256 tmp = _mm256_mul_ps(fx, ln2);
+  // __m256 r = _mm256_sub_ps(x, tmp);
 
-    // Compute polynomial approximation of exp(r)
-    const __m256 c1 = _mm256_set1_ps(1.9875691500E-4f);
-    const __m256 c2 = _mm256_set1_ps(1.3981999507E-3f);
-    const __m256 c3 = _mm256_set1_ps(8.3334519073E-3f);
-    const __m256 c4 = _mm256_set1_ps(4.1665795894E-2f);
-    const __m256 c5 = _mm256_set1_ps(1.6666665459E-1f);
-    const __m256 c6 = _mm256_set1_ps(5.0000001201E-1f);
+  // // Compute polynomial approximation of exp(r)
+  // const __m256 c1 = _mm256_set1_ps(1.9875691500E-4f);
+  // const __m256 c2 = _mm256_set1_ps(1.3981999507E-3f);
+  // const __m256 c3 = _mm256_set1_ps(8.3334519073E-3f);
+  // const __m256 c4 = _mm256_set1_ps(4.1665795894E-2f);
+  // const __m256 c5 = _mm256_set1_ps(1.6666665459E-1f);
+  // const __m256 c6 = _mm256_set1_ps(5.0000001201E-1f);
 
-  //  __m256 r2 = _mm256_mul_ps(r, r);
-  //  __m256 r3 = _mm256_mul_ps(r2, r);
-  //  __m256 r4 = _mm256_mul_ps(r2, r2);
+  // //  __m256 r2 = _mm256_mul_ps(r, r);
+  // //  __m256 r3 = _mm256_mul_ps(r2, r);
+  // //  __m256 r4 = _mm256_mul_ps(r2, r2);
 
-    __m256 y = _mm256_fmadd_ps(c1, r, c2);
-    y = _mm256_fmadd_ps(y, r, c3);
-    y = _mm256_fmadd_ps(y, r, c4);
-    y = _mm256_fmadd_ps(y, r, c5);
-    y = _mm256_fmadd_ps(y, r, c6);
-    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(1.0f));
+  // __m256 y = _mm256_fmadd_ps(c1, r, c2);
+  // y = _mm256_fmadd_ps(y, r, c3);
+  // y = _mm256_fmadd_ps(y, r, c4);
+  // y = _mm256_fmadd_ps(y, r, c5);
+  // y = _mm256_fmadd_ps(y, r, c6);
+  // y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(1.0f));
 
-    // Reconstruct exp(x) = 2^n * exp(r)
-    emm0 = _mm256_add_epi32(emm0, _mm256_set1_epi32(127));
-    emm0 = _mm256_slli_epi32(emm0, 23);
-    __m256 pow2n = _mm256_castsi256_ps(emm0);
+  // // Reconstruct exp(x) = 2^n * exp(r)
+  // emm0 = _mm256_add_epi32(emm0, _mm256_set1_epi32(127));
+  // emm0 = _mm256_slli_epi32(emm0, 23);
+  // __m256 pow2n = _mm256_castsi256_ps(emm0);
 
-    return _mm256_mul_ps(y, pow2n);
-  */
+  // return _mm256_mul_ps(y, pow2n);
   /* Low-Precision Versino III */
   const __m256 LOG2EF = _mm256_set1_ps(1.44269504088896341f); // 1 / ln(2)
   const __m256 LN2 = _mm256_set1_ps(0.6931471805599453f);     // ln(2)
@@ -1629,11 +1633,10 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
   for (int n = head_start; n < actual_head_end; ++n) {
     int rem = head_dim % 8;
 
-    /* Declaration: std::vector<__m256> sumVec(num_blocks * gqa_size,
-     * _mm256_setzero_ps()); caused warning: ignoring attributes on template
-     * argument ‘__m256’ [-Wignored-attributes].
-     * So it is implemented that way.
-     */
+    // Declaration: std::vector<__m256> sumVec(num_blocks * gqa_size,
+    // _mm256_setzero_ps()); caused warning: ignoring attributes on template
+    // argument '__m256' [-Wignored-attributes].
+    // So it is implemented that way.
     for (int i = 0; i < num_blocks * gqa_size; i++) {
       sumVec[i] = _mm256_setzero_ps();
     }

@@ -73,15 +73,11 @@ endif
 if get_option('enable-opencl')
   # Set OpenCL block markers to include the OpenCL sections
   and_conf.set('MESON_ENABLE_OPENCL', 1) 
-  if clblast_dep.found()
-    and_conf.set('MESON_CLBLAST_ROOT', clblast_root)
-    and_conf.set('MESON_CL_ROOT', opencl_root)
-  endif
+  and_conf.set('MESON_CL_ROOT', opencl_root)
 else
   # Disable OpenCL
   and_conf.set('MESON_ENABLE_OPENCL', 0)
   # No OpenCL libraries needed
-  and_conf.set('MESON_CLBLAST_ROOT', '')
   and_conf.set('MESON_CL_ROOT', '')
 endif
 

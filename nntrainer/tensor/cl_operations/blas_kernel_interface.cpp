@@ -13,7 +13,7 @@
 
 #include <blas_kernel_interface.h>
 #include <blas_kernels.h>
-#include <clblast_interface.h>
+#include <nntrainer_error.h>
 
 namespace nntrainer {
 void dotBatchedCl(Tensor const &input, Tensor const &m, Tensor &result,
@@ -126,30 +126,30 @@ void dotCl(Tensor const &input, Tensor const &m, Tensor &result, bool trans,
     /// transpose.
     /// For example, there is no case like (1 * K) X (1 * K) while
     /// (1 * K) X (1 * M) can be a case
+    // Native nntrainer CL kernels, mirroring the FP16 branch below 1:1. This
+    // path used to route through a third-party BLAS-on-OpenCL library, whose
+    // Gemm returned success while computing nothing on Intel Xe3 (NEO): every
+    // FP32 GPU FC came back all-zero, while the same shapes on these kernels
+    // match the CPU reference.
     /// case1: (1 * K) X (K * 1)
     if (M == 1 && N == 1) {
-      // *rdata = dot_cl(data, mdata, K) + (*rdata);
-      *rdata = dot_cl(K, data, mdata) + (*rdata);
+      *rdata = dot_cl(data, mdata, K) + (*rdata);
     }
     /// case2: (M * K) X (K * 1)
     else if (N == 1) {
-      gemv_cl(0, trans, dim1, dim2, 1.0f, data, lda, mdata, 0.0f, rdata, 1);
+      trans ? sgemv_cl(data, mdata, rdata, trans, dim2, dim1, lda)
+            : sgemv_cl(data, mdata, rdata, trans, dim1, dim2, lda);
     }
     /// case3: (1 * K) X (K * N) = 1 * N = R
     /// = R^T = (K * N) ^T * (1 * K) ^T = (N * K) * (K * 1) = (N * K) * (1 * K)
     /// Effectively a translation of sgemv
     else if (M == 1) {
-      gemv_cl(0, !trans_m, mdim1, mdim2, 1.0f, mdata, ldb, data, 0.0f, rdata,
-              1);
+      trans_m ? sgemv_cl(mdata, data, rdata, !trans_m, mdim1, mdim2, ldb)
+              : sgemv_cl(mdata, data, rdata, !trans_m, mdim2, mdim1, ldb);
     }
-    /// case others: use gemm
+    /// case others: use sgemm
     else {
-      if (input.getFormat() == Tformat::NHWC) {
-        sgemm_cl(trans, trans_m, data, mdata, rdata, M, N, K, lda, ldb, ldc);
-      } else {
-        gemm_cl(0, trans, trans_m, M, N, K, 1.0f, data, (trans) ? M : K, mdata,
-                (trans_m) ? K : N, 1.0f, rdata, N);
-      }
+      sgemm_cl(trans, trans_m, data, mdata, rdata, M, N, K, lda, ldb, ldc);
     }
   } else if (input.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
@@ -194,7 +194,7 @@ void multiplyCl(Tensor &input, float const &value) {
     float *data = input.getData<float>();
     unsigned int len = input.size();
 
-    scal_cl(len, value, data);
+    sscal_cl(data, len, value);
   } else if (input.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     _FP16 *data = input.getData<_FP16>();
@@ -224,9 +224,13 @@ void add_i_cl(Tensor &result, Tensor const &input) {
       float *Y = result.getData();
       const float *X = input.getData();
 
+      // axpy with alpha=1 is just elementwise add, so use our own addition_cl
+      // kernel here. FP16 already uses addition_cl below - make FP32
+      // symmetric.
+      unsigned int size_input = input.size();
       for (unsigned int i = 0; i < result.batch() / input.batch(); ++i) {
-        axpy_cl(input.size(), 1.0f, X, Y);
-        Y += input.size();
+        addition_cl(X, Y, size_input, size_input);
+        Y += size_input;
       }
     } else if (result.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
@@ -303,83 +307,28 @@ void transposeCl(const std::string &direction, Tensor const &in,
   }
 }
 
+// The five helpers below (copy, l2norm, absolute sum, index of the largest and
+// of the smallest element) never had an OpenCL kernel of their own in this
+// tree: they were thin wrappers over a third-party BLAS-on-OpenCL library that
+// is no longer a dependency. They have no in-tree caller, so rather than
+// guessing at a kernel they report the missing implementation. Add a kernel
+// next to the other entries in blas_kernels.h when a caller needs one.
+[[noreturn]] static void throwNoOpenCLKernel(const char *op) {
+  throw exception::not_supported(
+    std::string("[blas_kernel_interface] ") + op +
+    " has no OpenCL kernel implementation in nntrainer");
+}
+
 void copyCl(const Tensor &input, Tensor &result) {
-  if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    const float *data = input.getData();
-    float *rdata = result.getData();
-
-    unsigned int len = input.size();
-
-    copy_cl(len, data, rdata);
-  } else if (input.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    throw std::runtime_error("Error: Currently, copyCl not supported for FP16");
-#endif
-  }
+  throwNoOpenCLKernel("copyCl");
 }
 
-float nrm2Cl(const Tensor &input) {
-  float result = 0.0f;
-  if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    float *data = input.getData();
-    unsigned int len = input.size();
+float nrm2Cl(const Tensor &input) { throwNoOpenCLKernel("nrm2Cl"); }
 
-    result = nrm2_cl(len, data);
-  } else if (input.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    throw std::runtime_error("Error: Currently, nrm2Cl not supported for FP16");
-#endif
-  }
+float asumCl(const Tensor &input) { throwNoOpenCLKernel("asumCl"); }
 
-  return result;
-}
+int amaxCl(const Tensor &input) { throwNoOpenCLKernel("amaxCl"); }
 
-float asumCl(const Tensor &input) {
-  float result = 0.0f;
-  if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    float *data = input.getData();
-    unsigned int len = input.size();
-
-    result = asum_cl(len, data);
-  } else if (input.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    throw std::runtime_error("Error: Currently, asumCl not supported for FP16");
-#endif
-  }
-
-  return result;
-}
-
-int amaxCl(const Tensor &input) {
-  int result = 0;
-  if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    float *data = input.getData();
-    unsigned int len = input.size();
-
-    result = amax_cl(len, data);
-  } else if (input.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    throw std::runtime_error("Error: Currently, amaxCl not supported for FP16");
-#endif
-  }
-
-  return result;
-}
-
-int aminCl(const Tensor &input) {
-  int result = 0;
-  if (input.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    float *data = input.getData();
-    unsigned int len = input.size();
-
-    result = amin_cl(len, data);
-  } else if (input.getDataType() == ml::train::TensorDim::DataType::FP16) {
-#ifdef ENABLE_FP16
-    throw std::runtime_error("Error: Currently, amaxCl not supported for FP16");
-#endif
-  }
-
-  return result;
-}
+int aminCl(const Tensor &input) { throwNoOpenCLKernel("aminCl"); }
 
 } // namespace nntrainer

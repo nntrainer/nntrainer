@@ -33,10 +33,6 @@ nntrainer_base_deps=[
   thread_dep,
 ]
 
-if get_option('enable-opencl')
-  nntrainer_base_deps += clblast_dep
-endif
-
 if get_option('enable-htp')
   nntrainer_base_deps += hexkl_dep
 endif
@@ -66,8 +62,6 @@ nntrainer_elements = [
 if get_option('enable-opencl')
   nntrainer_elements += 'opencl'
   nntrainer_elements += 'layers/cl_layers'
-
-  nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
 endif
 
 if get_option('enable-npu')

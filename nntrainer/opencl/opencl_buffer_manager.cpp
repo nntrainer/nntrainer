@@ -85,35 +85,36 @@ void *ClBufferManager::getSVMOutput(unsigned int idx) {
   return output_vec[idx];
 }
 
-ClBufferManager::~ClBufferManager() {
-  if (inBufferA) {
-    delete inBufferA;
-  }
-  if (inBufferB) {
-    delete inBufferB;
-  }
-  if (inBufferC) {
-    delete inBufferC;
-  }
-  if (outBufferA) {
-    delete outBufferA;
-  }
-  if (outBufferB) {
-    delete outBufferB;
-  }
+void ClBufferManager::releaseBuffers() {
+  delete inBufferA;
+  inBufferA = nullptr;
+  delete inBufferB;
+  inBufferB = nullptr;
+  delete inBufferC;
+  inBufferC = nullptr;
+  delete outBufferA;
+  outBufferA = nullptr;
+  delete outBufferB;
+  outBufferB = nullptr;
 
   if (data_input) {
     context_inst_.releaseSVMRegion(data_input);
+    data_input = nullptr;
   }
   for (auto &ptr : scale_vec) {
     context_inst_.releaseSVMRegion(ptr);
   }
+  scale_vec.clear();
   for (auto &ptr : quant_vec) {
     context_inst_.releaseSVMRegion(ptr);
   }
+  quant_vec.clear();
   for (auto &ptr : output_vec) {
     context_inst_.releaseSVMRegion(ptr);
   }
+  output_vec.clear();
 }
+
+ClBufferManager::~ClBufferManager() { releaseBuffers(); }
 
 } // namespace nntrainer

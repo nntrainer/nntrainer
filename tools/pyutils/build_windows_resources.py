@@ -18,10 +18,6 @@ REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
 SUBPROJECTS_DIR = os.path.join(REPO_DIR, 'subprojects')
 RESOURCES_DIR = os.path.join(REPO_DIR, 'nntrainer-windows-resource')
 
-CLBLAST_DIR = os.path.join(SUBPROJECTS_DIR, 'CLBlast')
-CLBLAST_BUILD_DIR = os.path.join(CLBLAST_DIR, 'build')
-CLBLAST_RESOURCES_DIR = os.path.join(RESOURCES_DIR, 'CLBlast')
-
 OPENBLAS_DIR = os.path.join(SUBPROJECTS_DIR, 'OpenBLAS')
 OPENBLAS_BUILD_DIR = os.path.join(OPENBLAS_DIR, 'build')
 OPENBLAS_RESOURCES_DIR = os.path.join(RESOURCES_DIR, 'OpenBLAS')
@@ -95,10 +91,6 @@ def main():
     args = get_args()
 
     os.makedirs(RESOURCES_DIR, exist_ok=True)
-
-    if os.path.exists(CLBLAST_DIR):
-        build_project(args.force_rebuild, CLBLAST_DIR, CLBLAST_BUILD_DIR, ['-DCMAKE_CXX_STANDARD=17', '-DCMAKE_POLICY_VERSION_MINIMUM=3.10'])
-        package_project(args.force_rebuild, os.path.join(CLBLAST_BUILD_DIR, 'Release'), CLBLAST_RESOURCES_DIR, ['clblast.lib', 'clblast.dll'])
 
     if os.path.exists(OPENBLAS_DIR):
         build_project(args.force_rebuild, OPENBLAS_DIR, OPENBLAS_BUILD_DIR, ['-DNUM_THREADS=' + str(OPENBLAS_NUM_THREADS), '-DBUILD_TESTING=False', '-DBUILD_BENCHMARKS=False', '-DBUILD_WITHOUT_LAPACK=True', '-DNOFORTRAN=True'])

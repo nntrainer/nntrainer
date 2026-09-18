@@ -17,6 +17,7 @@
 #include <compute_ops.h>
 #include <context_data.h>
 #include <gtest/gtest.h>
+#include <quantizer.h>
 #include <tensor.h>
 
 #include <atomic>
@@ -332,6 +333,56 @@ TEST_F(ComputeOpsDispatchTest, ToMigratesContextDataAndUnblocksOp) {
 
   // Now a.multiply(b_migrated) is on the same context — no throw.
   EXPECT_NO_THROW(a.multiply(b_migrated, out));
+}
+
+/**
+ * @brief A Q4_0 dot on a context-attached tensor must still compute.
+ *
+ * The scalar Q4_0 GEMM is a CPU-table op. An accelerator ComputeOps only
+ * implements the accel-only ops it advertises through supports_*() -- the mock
+ * here, like every real accelerator table, implements none of the Q4_0 ops and
+ * inherits the base defaults, which throw. M == 1 is the decode step, which
+ * never takes the accel batch path, so before the fix this threw
+ * "ComputeOps::gemm_q4_0_fp32 not implemented by this backend" on every decode
+ * step of a Q4_0 model running on a gpu context.
+ */
+TEST_F(ComputeOpsDispatchTest, ScalarQ4_0GemmTakesTheCpuTable) {
+  nntrainer::init_backend();
+
+  constexpr unsigned int K = 512;
+  constexpr unsigned int N = 512;
+
+  nntrainer::Tensor w_fp32(
+    1, 1, K, N, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+  for (unsigned int k = 0; k < K; ++k)
+    for (unsigned int n = 0; n < N; ++n)
+      w_fp32.setValue(0, 0, k, n,
+                      0.01f * static_cast<float>((k + 3 * n) % 7) - 0.03f);
+
+  auto quantizer =
+    nntrainer::Quantization::createQuantizer(nntrainer::QScheme::Q4_0);
+  nntrainer::Tensor w_q40 =
+    quantizer->quantize(w_fp32, nntrainer::Tdatatype::Q4_0);
+  ASSERT_EQ(w_q40.getDataType(), nntrainer::Tdatatype::Q4_0);
+
+  // M == 1 is the decode step.
+  nntrainer::Tensor act(1, 1, 1, K);
+  for (unsigned int k = 0; k < K; ++k)
+    act.setValue(0, 0, 0, k, 0.5f - 0.001f * static_cast<float>(k % 11));
+
+  // Reference: no ContextData, so getOps() already resolves to the CPU table.
+  nntrainer::Tensor expected(1, 1, 1, N);
+  act.dot(w_q40, expected);
+
+  nntrainer::Tensor act_ctx(act);
+  act_ctx.setContextData(ct_data);
+
+  nntrainer::Tensor got(1, 1, 1, N);
+  ASSERT_NO_THROW(act_ctx.dot(w_q40, got));
+
+  for (unsigned int n = 0; n < N; ++n)
+    EXPECT_FLOAT_EQ(got.getValue<float>(0, 0, 0, n),
+                    expected.getValue<float>(0, 0, 0, n));
 }
 
 #ifdef ENABLE_HEXKL

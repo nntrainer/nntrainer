@@ -240,29 +240,14 @@ if get_option('enable-opencl')
   if get_option('platform') == 'android'
   endif
 
-  message ('OpenCL build is now enabled and will function only if an OpenCL-supported GPU is available. Using CLBlast as the OpenCL backend.')
+  message ('OpenCL build is now enabled and will function only if an OpenCL-supported GPU is available. The GPU routes are served by the in-tree OpenCL kernels.')
   extra_defines += '-DENABLE_OPENCL=1'
   extra_defines += '-DCL_TARGET_OPENCL_VERSION=200'
-  clblast_options = cmake.subproject_options()
 
   if get_option('platform') == 'android'
     message('preparing opencl')
     run_command([meson.source_root() / 'jni' / 'prepare_opencl.sh', meson.build_root()], check: true)
-    clblast_root = subprojects_dir_absolute / 'CLBlast'
     opencl_root = meson.build_root() / 'opencl'
-    clblast_dep = declare_dependency()
-  else 
-    clblast_options = cmake.subproject_options()
-    clblast_options.add_cmake_defines({'CMAKE_POLICY_VERSION_MINIMUM': '3.10'})
-    clblast_options.add_cmake_defines({'CMAKE_CXX_STANDARD': '17'})
-    clblast_options.add_cmake_defines({'TUNERS': false})
-    clblast_options.add_cmake_defines({'CMAKE_BUILD_TYPE': cmake_build_type})
-    if get_option('default_library') == 'static'
-      clblast_options.add_cmake_defines({'OVERRIDE_MSVC_FLAGS_TO_MT': false})
-      clblast_options.add_cmake_defines({'BUILD_SHARED_LIBS': false})
-    endif
-    clblast_proj = cmake.subproject('clblast', options: clblast_options, required: true)
-    clblast_dep = clblast_proj.dependency('clblast')
   endif
 endif
 
@@ -275,8 +260,8 @@ endif
 # Qualcomm Snapdragon only — libsdkl.so talks to the Hexagon DSP over FastRPC,
 # so it needs a Qualcomm SoC with an HTP/HMX block, not ARM in general, and
 # there is no x86 build of it. Default off, so x86/CI builds are unaffected.
-# hexkl_dep is referenced only under this guard (mirrors how clblast_dep is
-# referenced only when enable-opencl).
+# hexkl_dep is referenced only under this guard (mirrors how the OpenCL wiring
+# is referenced only when enable-opencl).
 if get_option('enable-htp')
   hexkl_root = get_option('hexkl-sdk-root')
   if hexkl_root == ''

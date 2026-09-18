@@ -1,0 +1,77 @@
+name: "Build Test - Ubuntu Meson (OpenCL)"
+
+# The OpenCL sources are compiled by NO other workflow on this repository:
+#   - meson_options.txt defaults enable-opencl to false, so every meson job
+#     (ubuntu_clean_meson_build*, daily_build*, windows*) builds them out.
+#   - The only two jobs that pass an OpenCL option (android.yml,
+#     daily_build_android.yml) hand off to tools/package_android.sh, which
+#     runs ndk-build; jni/Android.mk.in carries neither -Wall nor -Werror, so
+#     warnings there are never diagnosed at all.
+#   - packaging/nntrainer.spec gates OpenCL behind `%bcond_with gpu` and no
+#     workflow defines _with_gpu.
+# The result is that an OpenCL-only compile error can sit in the tree with
+# every check green. This job closes that hole: it builds the OpenCL sources
+# on x86-64 with the project's default werror=true.
+#
+# It deliberately does NOT run the test suite -- GitHub runners have no
+# OpenCL device. Compiling and linking is the whole point; the failure mode
+# this guards against is a build break, not a runtime regression.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  opencl_build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        fp16: [ "false", "true" ]
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Check if rebuild required
+      uses: ./.github/actions/check-rebuild
+    - name: install minimal requirements
+      if: env.rebuild == '1'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc g++ pkg-config libopenblas-dev \
+          libiniparser-dev libjsoncpp-dev libgtest-dev libunwind-dev \
+          meson ninja-build cmake
+    - name: install OpenCL headers and ICD loader
+      # Headers + the loader stub only. No runtime device is needed to build.
+      if: env.rebuild == '1'
+      run: sudo apt-get install -y opencl-headers ocl-icd-opencl-dev
+    - name: Install submodules
+      if: env.rebuild == '1'
+      run: git submodule sync && git submodule update --init --recursive
+    - name: configure
+      # werror comes from the project default_options (werror=true) and is
+      # intentionally NOT overridden here -- diagnosing warnings in the
+      # OpenCL sources is the reason this job exists.
+      if: env.rebuild == '1'
+      run: |
+        meson setup build \
+          --buildtype=release \
+          -Dplatform=none \
+          -Denable-opencl=true \
+          -Denable-fp16=${{ matrix.fp16 }} \
+          -Denable-tflite-interpreter=false \
+          -Denable-tflite-backbone=false
+    - name: confirm werror is actually on
+      # A silent werror=false would turn this job back into a false oracle.
+      if: env.rebuild == '1'
+      run: |
+        meson configure build | grep -E '^\s+werror\s+true' \
+          || { echo "werror is not enabled in this build directory"; exit 1; }
+    - name: build
+      if: env.rebuild == '1'
+      run: ninja -C build
