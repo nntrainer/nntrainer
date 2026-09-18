@@ -329,36 +329,22 @@ std::vector<float *> SentenceTransformer::encode(const WSTR prompt,
     }
   }
 
-  std::vector<float *> input;
-  input.push_back(input_sample.data());
-
   std::vector<float *> label; // Empty label for inference
 
   allocateAndBindKVCache();
-  auto build_inference_inputs = [&]() {
-    std::vector<std::pair<std::string, float *>> cache_inputs;
-    cache_inputs.reserve(static_cast<size_t>(NUM_LAYERS) * 2);
-    for (int i = 0; i < NUM_LAYERS; ++i) {
-      cache_inputs.emplace_back(
-        "cache_k_l" + std::to_string(i),
-        reinterpret_cast<float *>(kv_cache.getKeyCache(i).getData()));
-      cache_inputs.emplace_back(
-        "cache_v_l" + std::to_string(i),
-        reinterpret_cast<float *>(kv_cache.getValueCache(i).getData()));
-    }
-
-    std::sort(
-      cache_inputs.begin(), cache_inputs.end(),
-      [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
-
-    std::vector<float *> inference_inputs;
-    inference_inputs.reserve(1 + cache_inputs.size());
-    inference_inputs.push_back(input_sample.data());
-    for (const auto &cache_input : cache_inputs)
-      inference_inputs.push_back(cache_input.second);
-    return inference_inputs;
-  };
-  input = build_inference_inputs();
+  std::vector<NamedModelInput> inputs;
+  inputs.reserve(1 + static_cast<size_t>(NUM_LAYERS) * 2);
+  inputs.push_back({PRIMARY_INPUT_NAME, input_sample.data(),
+                    input_sample.size() * sizeof(float)});
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    auto &kc = kv_cache.getKeyCache(i);
+    auto &vc = kv_cache.getValueCache(i);
+    inputs.push_back({"cache_k_l" + std::to_string(i),
+                      reinterpret_cast<float *>(kc.getData()), kc.bytes()});
+    inputs.push_back({"cache_v_l" + std::to_string(i),
+                      reinterpret_cast<float *>(vc.getData()), vc.bytes()});
+  }
+  auto input = buildOrderedInferenceInputs(inputs);
 
   // Run incremental inference for the prefill stage
   // start: 0, end: input_len (process all tokens at once)

@@ -91,6 +91,7 @@ causallm::json makeTinyGemma4Config() {
     {"text_config",
      {
        {"head_dim", 8},
+       {"global_head_dim", 16},
        {"hidden_size", 64},
        {"hidden_size_per_layer_input", 32},
        {"intermediate_size", 64},
@@ -193,6 +194,104 @@ makeGemma4Case(const causallm_test::TinyCausalLMDataType &data_type) {
         static_cast<TinyGemma4CausalLM &>(runner));
     },
   };
+}
+
+/**
+ * @brief Verify runtime cache pointers follow the compiled Gemma4 input order.
+ *
+ * Layer 0 (sliding) and layer 1 (global) have different KV widths, so a
+ * wrong binding order causes an out-of-bounds access, not just a permutation.
+ */
+TEST(Gemma4KVCacheInputOrderTest, RuntimeBindingsMatchCompiledInputs) {
+  auto test_case = makeGemma4Case(causallm_test::makeTinyFp32DataType());
+  const auto files = causallm_test::makeTinyCausalLMFiles(
+    "Gemma4KVCacheInputOrderTest", "RuntimeBindingsMatchCompiledInputs",
+    test_case.name);
+  auto config =
+    causallm_test::makeTinyCausalLMConfig(test_case, files.tokenizer_path);
+  auto runner =
+    test_case.create_model(config.model, config.generation, config.nntrainer);
+  runner->initializeModel();
+
+  auto &model = static_cast<TinyGemma4CausalLM &>(*runner);
+  std::vector<float> model_input(8, 0.0f);
+  const auto input_names = model.getInputNamesForTest();
+  const auto input_dimensions = model.getInputDimensionsForTest();
+  const auto input_pointers = model.buildInferenceInputsForTest(model_input);
+
+  ASSERT_EQ(input_names.size(), input_pointers.size());
+  ASSERT_EQ(input_names.size(), input_dimensions.size());
+  ASSERT_EQ(input_names.size(),
+            1u + static_cast<size_t>(tiny_gemma4_num_layers) * 2);
+
+  // The regression only bites with heterogeneous cache widths.
+  ASSERT_NE(model.getKeyCacheForTest(0).bytes,
+            model.getKeyCacheForTest(tiny_gemma4_num_layers - 1).bytes)
+    << "tiny Gemma4 config must keep sliding/global KV widths different for "
+       "this test to be meaningful";
+
+  for (size_t input_idx = 0; input_idx < input_names.size(); ++input_idx) {
+    const auto &name = input_names[input_idx];
+    float *expected = nullptr;
+    size_t expected_bytes = model_input.size() * sizeof(float);
+    ml::train::TensorDim expected_cache_dimension;
+    bool is_cache_input = false;
+
+    if (name == "input0") {
+      expected = model_input.data();
+    } else {
+      for (int layer_id = 0; layer_id < tiny_gemma4_num_layers; ++layer_id) {
+        const bool is_key = name == "cache_k_l" + std::to_string(layer_id);
+        if (!is_key && name != "cache_v_l" + std::to_string(layer_id))
+          continue;
+
+        const auto cache =
+          is_key
+            ? model.getKeyCacheForTest(static_cast<unsigned int>(layer_id))
+            : model.getValueCacheForTest(static_cast<unsigned int>(layer_id));
+        expected = cache.data;
+        expected_bytes = cache.bytes;
+        expected_cache_dimension = cache.dim;
+        is_cache_input = true;
+        break;
+      }
+    }
+
+    ASSERT_NE(expected, nullptr) << "Unexpected compiled input: " << name;
+    EXPECT_EQ(input_pointers[input_idx], expected)
+      << "Incorrect pointer bound for compiled input: " << name;
+
+    // Bound buffer must be at least as large as the compiled slot.
+    const size_t slot_bytes =
+      static_cast<size_t>(input_dimensions[input_idx].getDataLen()) *
+      input_dimensions[input_idx].getDataTypeSize();
+    EXPECT_GE(expected_bytes, slot_bytes)
+      << "Buffer bound to compiled input '" << name << "' holds "
+      << expected_bytes << " bytes but the slot spans " << slot_bytes
+      << " bytes";
+
+    if (is_cache_input) {
+      EXPECT_EQ(input_dimensions[input_idx], expected_cache_dimension)
+        << "Incorrect dimension associated with compiled input: " << name;
+    }
+  }
+}
+
+TEST(Gemma4KVCacheInputOrderTest, RejectsBufferSmallerThanCompiledSlot) {
+  auto test_case = makeGemma4Case(causallm_test::makeTinyFp32DataType());
+  const auto files = causallm_test::makeTinyCausalLMFiles(
+    "Gemma4KVCacheInputOrderTest", "RejectsBufferSmallerThanCompiledSlot",
+    test_case.name);
+  auto config =
+    causallm_test::makeTinyCausalLMConfig(test_case, files.tokenizer_path);
+  auto runner =
+    test_case.create_model(config.model, config.generation, config.nntrainer);
+  runner->initializeModel();
+
+  auto &model = static_cast<TinyGemma4CausalLM &>(*runner);
+  std::vector<float> undersized(1, 0.0f);
+  EXPECT_THROW(model.buildInferenceInputsForTest(undersized),
+               std::invalid_argument);
 }
 
 /**

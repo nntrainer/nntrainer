@@ -333,6 +333,9 @@ public:
    */
   std::vector<TensorDim> getInputDimension() const;
 
+  /** @brief Get input layer names in positional inference order. */
+  std::vector<std::string> getInputNames() const;
+
   /**
    * @brief Get the Batch Size object of current model
    *
@@ -614,13 +617,14 @@ private:
   LayerNode *forward_iter_end;  /**< inclusive end node of the forward execution
                                  when initialize */
 
-  /// @note *_list and *_dims must be synced at all times. Consider put it as a
-  /// structure
-  std::vector<std::string> label_list;  /**< identifier for the model labels */
-  std::vector<std::string> input_list;  /**< identifier for the model inputs */
-  std::vector<std::string> output_list; /**< identifier for the model outputs */
-  std::vector<TensorDim> label_dims_;   /**< graph label dimensions */
-  std::vector<TensorDim> input_dims_;   /**< graph input dimensions */
+  /// @note *_list, input_names_, and *_dims must be synced at all times.
+  /// Consider putting them in a structure.
+  std::vector<std::string> label_list;   /**< identifier for the model labels */
+  std::vector<std::string> input_list;   /**< identifier for input tensors */
+  std::vector<std::string> input_names_; /**< ordered model input layer names */
+  std::vector<std::string> output_list;  /**< identifier for model outputs */
+  std::vector<TensorDim> label_dims_;    /**< graph label dimensions */
+  std::vector<TensorDim> input_dims_;    /**< graph input dimensions */
 
   bool optimize_memory;    /**< optimize memory */
   ExecutionMode exec_mode; /**< execution mode with which the graph has been

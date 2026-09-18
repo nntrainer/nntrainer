@@ -531,6 +531,17 @@ public:
   }
 
   /**
+   * @copydoc ml::train::Model::getInputNames()
+   */
+  std::vector<std::string> getInputNames() override {
+    if (!compiled) {
+      throw std::logic_error(
+        "model should be compiled before getting input names");
+    }
+    return model_graph.getInputNames();
+  }
+
+  /**
    * @brief     get output dimension of neural network
    * @retval std::vector<TensorDim> output dimension
    */

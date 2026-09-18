@@ -503,6 +503,11 @@ public:
    */
   virtual void exports(const ExportMethods &method,
                        const std::string file_path) = 0;
+
+  /**
+   * @brief Get input layer names in positional inference order.
+   */
+  virtual std::vector<std::string> getInputNames() = 0;
 };
 
 /**

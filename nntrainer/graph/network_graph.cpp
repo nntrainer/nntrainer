@@ -621,6 +621,17 @@ std::vector<TensorDim> NetworkGraph::getInputDimension() const {
   return input_dims_;
 }
 
+std::vector<std::string> NetworkGraph::getInputNames() const {
+  NNTR_THROW_IF(input_names_.empty(), std::invalid_argument)
+    << "[NetworkGraph] the graph has no node identified as input!";
+  NNTR_THROW_IF(input_names_.size() != input_list.size() ||
+                  input_names_.size() != input_dims_.size(),
+                std::runtime_error)
+    << "[NetworkGraph] model input names, tensors, and dimensions are not "
+       "synchronized";
+  return input_names_;
+}
+
 unsigned int NetworkGraph::getBatchSize() const { return batch_size; }
 
 std::vector<TensorDim> NetworkGraph::getOutputDimension() const {
@@ -1293,6 +1304,7 @@ int NetworkGraph::initialize(ExecutionMode mode,
       << num_input;
 
     input_list.push_back(node->getInput(0).getName());
+    input_names_.push_back(node->getName());
     input_dims_.push_back(node->getInputDimensions()[0]);
   };
 
@@ -1497,15 +1509,22 @@ int NetworkGraph::reinitialize(
     }
   }
   /**** identify model input / output to be set externally later ****/
-  auto identify_as_model_input = [this](LayerNode *node) {
+  size_t model_input_idx = 0;
+  auto identify_as_model_input = [this, &model_input_idx](LayerNode *node) {
     auto num_input = node->getNumInputs();
     NNTR_THROW_IF(num_input != 1, std::invalid_argument)
       << "Input layer is supposed to have exactly one input, but more then "
          "one input detected, num inputs: "
       << num_input;
 
-    // input_list.push_back(node->getInput(0).getName());
+    NNTR_THROW_IF(model_input_idx >= input_names_.size() ||
+                    model_input_idx >= input_list.size() ||
+                    input_names_[model_input_idx] != node->getName() ||
+                    input_list[model_input_idx] != node->getInput(0).getName(),
+                  std::runtime_error)
+      << "[NetworkGraph] model input order changed during reinitialization";
     input_dims_.push_back(node->getInputDimensions()[0]);
+    ++model_input_idx;
   };
 
   auto is_label_node = [](LayerNode *node) { return node->requireLabel(); };
@@ -1562,6 +1581,8 @@ int NetworkGraph::reinitialize(
 
   identify_external_tensors(model_input_names, is_input_node,
                             identify_as_model_input);
+  NNTR_THROW_IF(model_input_idx != input_names_.size(), std::runtime_error)
+    << "[NetworkGraph] model input count changed during reinitialization";
   identify_external_tensors(model_label_names, is_label_node,
                             identify_as_model_label);
 
