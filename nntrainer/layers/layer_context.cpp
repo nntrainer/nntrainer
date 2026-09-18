@@ -114,6 +114,11 @@ void InitLayerContext::requestOutputs(std::vector<VarGradSpecV2> &&out_specs) {
   for (unsigned i = 0u, sz = out_specs.size(); i < sz; ++i) {
     auto &spec = out_specs.at(i);
     suffixSpec(spec, i);
+    /** stamp this layer's compute engine on its output activation so a later
+     * residency step can derive where the tensor should live; input views
+     * inherit it through the shared MemoryData. outSpec() is static, so this is
+     * done here — the single chokepoint every output spec passes through. */
+    spec.variable_spec.engine = engine;
     if (is_dangled(i)) {
       ml_logw("given output is being dangled: %s in context: %s",
               spec.variable_spec.name.c_str(), name.c_str());

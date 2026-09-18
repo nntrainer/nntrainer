@@ -15,6 +15,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <tensor.h>
 #include <util_func.h>
 
 #include <layer_context.h>
@@ -35,11 +36,11 @@ void AdditionLayer::forwarding(RunLayerContext &context, bool training) {
   /** @todo check possibility for in-place of addition layer */
   for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {
     const Tensor &input_ = context.getInput(idx);
-    if (!idx) {
-      hidden_.copy(input_);
-    } else {
-      hidden_.add_i(input_);
-    }
+    // The first operand copies into hidden, the rest accumulate. The active
+    // backend's op table picks the residency path: the CPU table runs the same
+    // host copy/add this used to call inline, an accelerator can keep the
+    // residual stream in device memory.
+    hidden_.getOps()->residual_op(hidden_, input_, /*accumulate=*/idx != 0);
   }
 }
 
@@ -72,11 +73,8 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
 
       Tensor input_step = input_.getSharedDataTensor(
         input_step_dim, b * input_dim.getFeatureLen(), true);
-      if (!idx) {
-        hidden_step.copy(input_step);
-      } else {
-        hidden_step.add_i(input_step);
-      }
+      hidden_step.getOps()->residual_op(hidden_step, input_step,
+                                        /*accumulate=*/idx != 0);
     }
   }
 }

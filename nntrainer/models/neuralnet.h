@@ -714,6 +714,20 @@ private:
   const Engine *ct_engine =
     nullptr; /** Configurations bound to current engine */
 
+  /**< resolved-once Context for the decode seam; see getDecodeContext() */
+  Context *decode_ctx_ = nullptr;
+
+  /**
+   * @brief Resolve, once and then cache, the Context whose runDecode() drives
+   *        a decode or prefill forward step. A backend may override runDecode
+   *        with its own strategy; every other backend uses the base plain walk,
+   *        so any registered context gives a byte-identical forward. Resolves
+   *        from the graph's own engine, falling back to "cpu".
+   * @return the decode Context, or nullptr if none is registered (the caller
+   *         then walks the graph directly).
+   */
+  Context *getDecodeContext();
+
   NetworkGraph model_graph; /** Network Model Graph */
 
   /**< Set in compile() for graphs that contain a QNN/HTP engine. When true,

@@ -10,6 +10,7 @@
  * @brief   Implementation of OpenCL SVM-backed MemAllocator subclass.
  */
 
+#include <cl_buffer_pool.h>
 #include <cl_svm_allocator.h>
 #include <mutex>
 #include <opencl_context_manager.h>
@@ -26,6 +27,11 @@ std::unordered_set<void *> host_owned;
 } // namespace
 
 ClSVMAllocator::ClSVMAllocator(opencl::ContextManager &ctx) : ctx_(ctx) {}
+
+std::shared_ptr<MemoryPool>
+ClSVMAllocator::makePool(const std::shared_ptr<MemAllocator> &self) {
+  return std::make_shared<ClBufferPool>(self);
+}
 
 void ClSVMAllocator::track_host_owned(void *ptr) {
   std::lock_guard<std::mutex> lk(host_owned_mtx);
