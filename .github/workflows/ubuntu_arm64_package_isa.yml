@@ -1,0 +1,62 @@
+name: "Build Test - Ubuntu arm64 (packaging ISA)"
+
+## The arm64 PPA package is built for a baseline ISA (see debian/rules), which
+## no other PR job covers: pdebuild runs amd64 only, the Tizen aarch64 matrix
+## builds without unit tests, and the cross build never runs them. Kernels
+## selected at compile time therefore used to reach the PPA builders untested
+## and abort there (SIGILL / SIGSEGV). This job builds with the same ISA as the
+## package and runs the unit tests on a native arm64 runner.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  arm64_packaging_isa:
+    name: Ubuntu arm64 build & test with the packaging ISA
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Check if rebuild required
+      uses: ./.github/actions/check-rebuild
+    - name: install minimal requirements
+      if: env.rebuild == '1'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc g++ pkg-config meson ninja-build \
+          libopenblas-dev libiniparser-dev libjsoncpp-dev libgtest-dev \
+          libgmock-dev libglib2.0-dev python3-dev python3-numpy
+    - name: report the ISA of the runner
+      if: env.rebuild == '1'
+      run: grep -m1 Features /proc/cpuinfo
+    - name: meson configure
+      if: env.rebuild == '1'
+      ## -Darm-march has to stay in sync with debian/rules
+      run: |
+        meson \
+          --buildtype=plain \
+          --prefix=/usr \
+          --sysconfdir=/etc \
+          --libdir=lib/aarch64-linux-gnu \
+          --bindir=lib/nntrainer/bin \
+          --includedir=include \
+          -Darm-march=armv8.2-a+dotprod \
+          -Dreduce-tolerance=true \
+          -Denable-debug=false \
+          -Denable-app=false \
+          -Dinstall-app=false \
+          -Denable-tflite-interpreter=false \
+          -Denable-tflite-backbone=false \
+          build
+    - if: env.rebuild == '1'
+      run: ninja -C build
+    - name: run Unittests
+      if: env.rebuild == '1'
+      run: meson test -C build --suite unittests --print-errorlogs
