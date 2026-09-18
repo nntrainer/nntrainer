@@ -1016,6 +1016,21 @@ public:
 };
 
 /**
+ * @brief FusedActivation — a layer-internal activation applied inline in the
+ *        compute layer's forward (after GEMM+bias), instead of as a separate
+ *        ActivationLayer node. It has a distinct key from `activation`, which
+ *        is the LayerNode realization property ActivationRealizer consumes, so
+ *        the FusionRealizer can move an activation onto the compute layer
+ *        without it being split back out into a node.
+ */
+class FusedActivation final
+  : public EnumProperty<nntrainer::props::ActivationTypeInfo> {
+public:
+  using prop_tag = enum_class_prop_tag;
+  static constexpr const char *key = "fused_activation";
+};
+
+/**
  * @brief HiddenStateActivation Enumeration Information
  *
  */

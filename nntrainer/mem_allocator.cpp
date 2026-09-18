@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mem_allocator.h>
+#include <memory_pool.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 
@@ -67,6 +68,26 @@ void MemAllocator::free(void *ptr) {
 #else
   std::free(ptr);
 #endif
+}
+
+bool MemAllocator::supportsResidency(ResidencyClass cls) const {
+  switch (cls) {
+  case ResidencyClass::HOST:
+    /** Every allocator the pool can dereference has a host plane; one that
+     *  hands out device-only memory does not, and says so here. */
+    return isHostAddressable();
+  case ResidencyClass::SVM:
+    return isSVM();
+  case ResidencyClass::GPU_CLMEM:
+    return supportsDevicePool();
+  default:
+    return false;
+  }
+}
+
+std::shared_ptr<MemoryPool>
+MemAllocator::makePool(const std::shared_ptr<MemAllocator> &self) {
+  return std::make_shared<MemoryPool>(self);
 }
 
 } // namespace nntrainer

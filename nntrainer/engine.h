@@ -175,6 +175,32 @@ public:
   std::string parseComputeEngine(const std::vector<std::string> &props) const;
 
   /**
+   * @brief Register a layer factory on a backend by engine name, without a
+   *        static_cast to a concrete Context. Resolves the engine to its
+   *        Context and dispatches through the Context::registerLayerFactory
+   *        virtual (each backend forwards to its own registerFactory<Layer>).
+   *        This is the registration facade for vendor add-only backends and
+   *        the Application layer.
+   *        See docs/backend_guide/ARCHITECTURE_REFACTOR.md §5.
+   *
+   * @param engine registered context name ("cpu"/"gpu"/"cuda"/...)
+   * @param creator layer creator (createLayer<T> result)
+   * @param key string key (empty ⇒ derived from getType())
+   * @param int_key integer key (-1 ⇒ auto-assigned)
+   * @return registered integer key, or -1 if the backend is registered but
+   *         declines to register a factory. An engine name that is not
+   *         registered at all throws std::invalid_argument from
+   *         getRegisteredContext().
+   */
+  int registerLayerFactory(
+    const std::string &engine,
+    nntrainer::Context::PtrFactoryType<nntrainer::Layer> creator,
+    const std::string &key = "", const int int_key = -1) const {
+    return getRegisteredContext(engine)->registerLayerFactory(creator, key,
+                                                              int_key);
+  }
+
+  /**
    * @brief Create an Layer Object with Layer name
    *
    * @param type layer name

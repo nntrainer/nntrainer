@@ -140,12 +140,20 @@ public:
    * @param read_only Flag indicating whether the SVM memory should be mapped
    * for read-only access (true) or read-write access (false).
    * @param event Optional event object that can be used to query or wait for
-   * the mapping operation to complete. If not provided, the mapping will be
-   * blocking.
+   * the mapping operation to complete.
+   * @param async Enqueue the map without blocking the host. Only sound on an
+   * in-order queue when the region is next touched by another device
+   * operation, never by the host. Defaults to the blocking behaviour.
+   * @note async is appended AFTER event, not inserted before it. This header
+   * is installed, so an out-of-tree caller written against the previous
+   * signature passes a cl_event * in the fourth position; inserting a bool
+   * there would still compile -- cl_event * converts to bool -- and silently
+   * turn a blocking, event-returning map into a non-blocking one whose event
+   * is discarded. Appending keeps every existing call meaning what it meant.
    * @return true if mapping is successful, false otherwise.
    */
   bool enqueueSVMMap(void *svm_ptr, size_t size, bool read_only,
-                     cl_event *event = nullptr);
+                     cl_event *event = nullptr, bool async = false);
 
   /**
    * @brief Enqueue SVM memory unmap operation.

@@ -440,8 +440,8 @@ public:
 
               uint8_t *scale = data + q_size;
 
-              nntrainer::quant_qs4cx_f32(N, K, weight_t.getData(), data, scale,
-                                         true);
+              nntrainer::quant_qs4cx_f32(N, K, weight_t.getData<float>(), data,
+                                         scale, true);
               file.write((const char *)data, q_size + scale_size);
             } else {
               NNTR_THROW_IF(true, std::runtime_error)

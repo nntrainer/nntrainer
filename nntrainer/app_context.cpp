@@ -56,6 +56,7 @@
 #include <fc_layer.h>
 #include <flatten_layer.h>
 #include <gather_layer.h>
+#include <geglu_layer.h>
 #include <gru.h>
 #include <grucell.h>
 #include <identity_layer.h>
@@ -259,6 +260,13 @@ void AppContext::initialize() noexcept {
 
     add_default_object();
     add_extension_object();
+
+    // Log device capabilities once (log-only). AppContext inherits the base
+    // CPU snapshot (host-coherent).
+    ml_logi("[AppContext] %s", caps().toString().c_str());
+    // ExecPlan resolver shadow: the CPU context resolves to gemm_path=CPU.
+    ml_logi("[AppContext] %s (shadow)",
+            resolveExecPlan(caps()).toString().c_str());
   } catch (std::exception &e) {
     ml_loge("registering layers failed!!, reason: %s", e.what());
   } catch (...) {
@@ -437,6 +445,11 @@ void AppContext::add_default_object() {
 
   registerFactory(nntrainer::createLayer<TimeDistLayer>, TimeDistLayer::type,
                   LayerType::LAYER_TIME_DIST);
+
+  // Backend-neutral LLM layers, registered by type string only (no
+  // LayerType enum): the same C++ class serves every engine, dispatching
+  // its math through the op table.
+  registerFactory(nntrainer::createLayer<GeGLULayer>, GeGLULayer::type);
 
   registerFactory(AppContext::unknownFactory<nntrainer::Layer>, "unknown",
                   LayerType::LAYER_UNKNOWN);
@@ -703,6 +716,15 @@ template const int AppContext::registerFactory<nntrainer::Optimizer>(
 template const int AppContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
+
+// Non-template seam (Context::registerLayerFactory override): forwards to the
+// per-class registerFactory<Layer> here in the same TU so the explicit
+// instantiation is used and no template crosses the .so boundary.
+int AppContext::registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                                     const std::string &key,
+                                     const int int_key) {
+  return registerFactory<nntrainer::Layer>(factory, key, int_key);
+}
 
 /**
  * @copydoc const int AppContext::registerFactory
