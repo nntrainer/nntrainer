@@ -20,6 +20,7 @@
 #ifdef DEBUG
 #include <cassert>
 #endif
+#include <cstdlib>
 #include <fcntl.h>
 #include <functional>
 #include <limits>
@@ -159,6 +160,16 @@ void Manager::allocateWeights(unsigned int max_exec_order_, bool init) {
 }
 
 void Manager::deallocateWeights() { weight_pool.deallocate(); }
+
+/**
+ * @brief VALUE-checked env truthiness: set AND not starting with '0'.
+ * @note  Local to this translation unit rather than a shared env-compat
+ *        helper, since this branch does not carry one yet.
+ */
+[[maybe_unused]] static bool manager_env_on(const char *name) {
+  const char *e = std::getenv(name);
+  return e != nullptr && e[0] != '0';
+}
 
 static Tensor *requestTensor_(const TensorSpecV2 &spec,
                               const GraphNode::ExecutionOrder &exec_order,
@@ -471,7 +482,44 @@ std::vector<Weight *> Manager::requestWeights(
           var_exec_order.push_back(std::max(lah_order, 0));
         }
       }
-      if (is_virtual) {
+      // [pool-bypass] Give QS4CX weights their own heap allocation instead of
+      // a slice of the pool's shared arena. The GPU paths consume DERIVED
+      // device forms (dp4a caches) built once from this payload,
+      // so after that build the plain bytes are dead weight -- but a pool slice
+      // can never be released (one arena, freed whole; SVM refuses page drops,
+      // UVM cannot decommit). A self-owned heap buffer's pages CAN be dropped
+      // in place (madvise/DiscardVirtualMemory on anon pages), keeping the
+      // pointer valid for the pointer-keyed derived caches. Reuses the proven
+      // UNMANAGED exclusion (finalize / allocate-bind skip) +
+      // QS4CX_Tensor::allocate() self-alloc. Not under FSU (its swap
+      // bookkeeping assumes pool residency).
+      //
+      // ARM64 is included because that is where the difference is largest, not
+      // as a formality: there the GPU pool is a kgsl SVM arena, and a page
+      // dropped from a kgsl mapping is NOT returned to the system (measured on
+      // an Adreno 840: madvise succeeds, RssFile falls by the whole region,
+      // /sys/class/kgsl/kgsl/page_alloc and MemAvailable do not move, and the
+      // bytes fault back in unchanged). A self-owned heap payload is the only
+      // shape whose release is real there. The allocation itself has always
+      // been arch-neutral -- QS4CX_Tensor::allocate() is a plain new uint8_t[]
+      // off Windows -- so this gate was only ever naming where the family had
+      // been measured.
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
+  defined(_M_IX86) || defined(__aarch64__) || defined(_M_ARM64)
+      const bool qs4cx_heap_bypass =
+        dim_v.getDataType() == ml::train::TensorDim::DataType::QS4CX &&
+        !enable_fsu && manager_env_on("NNTR_QS4CX_HEAP_BYPASS");
+#else
+      const bool qs4cx_heap_bypass = false;
+#endif
+      if (qs4cx_heap_bypass) {
+        // Real exec_order (graph bookkeeping like getMinMaxTensorExecutionOrder
+        // iterates it -- an empty set segfaults there); the pool exclusion is
+        // carried by UNMANAGED alone (finalize/allocate skip on lifespan).
+        var = weight_pool.request(name, dim_v, var_exec_order,
+                                  TensorLifespan::UNMANAGED, t_initializer);
+        var->allocate(); // QS4CX_Tensor::allocate(): new uint8_t[], self-owned
+      } else if (is_virtual) {
         var = weight_pool.request(name, dim_v, var_exec_order,
                                   TensorLifespan::VIRTUAL, t_initializer);
       } else {

@@ -93,6 +93,14 @@ public:
    */
   bool supportBackwarding() const override { return false; }
 
+  /**
+   * @copydoc Layer::hasRowIndexedWeight()
+   * @note The embedding weight is a lookup table: forwarding slices row
+   * `token id` out of it, so a per-column scale would pool unrelated
+   * vocabulary entries together.
+   */
+  bool hasRowIndexedWeight() const override { return true; }
+
   using Layer::setProperty;
 
   /**
