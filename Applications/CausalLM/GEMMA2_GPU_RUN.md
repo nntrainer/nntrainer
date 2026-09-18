@@ -133,6 +133,8 @@ NNTR_GPU_CLMEM_POOL=1 \   # cl_mem residency -- REQUIRED for coherence (else gre
   either gives garbage (`<pad>`) or greedy-collapse respectively.
 - Local model dir: a device model pulled to host. Fix `nntr_config.json`'s
   `tokenizer_file` to the **local** absolute path (device pull leaves a `/data/...` path).
+- The command above is the whole invocation; wrap it in a shell script of
+  your own if you run it often.
 
 ### Measured (Intel Arc, `gemma2_lg_q6k`)
 
