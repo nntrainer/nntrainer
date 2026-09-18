@@ -25,7 +25,7 @@ endif
 
 # The interface table references these under #ifdef __ARM_FEATURE_SVE, so they
 # have to follow whether the resolved ISA actually has SVE.
-if get_option('arm-arch') == 'armv9.2-a' or nntr_arm_sve
+if nntr_arm_sve
   matmul_clamp_f32_qsi8d32p_qsi4c32p_headers += [
     'kai_matmul_clamp_f32_qsi8d32p1x4_qsi4c32p8x4_1x8_sve_dotprod.h',
     'kai_matmul_clamp_f32_qsi8d32p1x8_qsi4c32p8x8_1x8_sve_dotprod.h',
