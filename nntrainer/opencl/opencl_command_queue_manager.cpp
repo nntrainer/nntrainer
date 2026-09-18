@@ -21,6 +21,36 @@
 
 namespace nntrainer::opencl {
 
+namespace {
+
+/**
+ * @brief Whether this device needs an explicit flush between a kernel that
+ *        writes shared virtual memory and the kernel that reads it.
+ *
+ * An in-order queue does not by itself make a coarse-grain shared-memory
+ * handoff visible to the next kernel; fine-grain buffer memory is coherent by
+ * definition and needs nothing. CL_DEVICE_SVM_FINE_GRAIN_BUFFER is the
+ * queryable difference, so the decision is derived rather than configured.
+ * It is scoped to Intel, the vendor whose coarse-grain handoff is observably
+ * not ordered by the queue alone; elsewhere the flush would only cost
+ * throughput. Resolved once per process.
+ */
+bool needsCoarseSVMDrain() {
+  static const bool drain = []() {
+    const auto *device_info = ContextManager::Global().getDeviceInfo();
+    if (!device_info)
+      return false;
+    constexpr cl_uint INTEL_VENDOR_ID = 0x8086;
+    const cl_device_svm_capabilities svm =
+      device_info->getDeviceSVMCapabilities();
+    const bool fine_grain = (svm & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) != 0;
+    return device_info->getDeviceVendorId() == INTEL_VENDOR_ID && !fine_grain;
+  }();
+  return drain;
+}
+
+} // namespace
+
 /**
  * @brief Create a Command Queue object
  *
@@ -48,9 +78,13 @@ bool CommandQueueManager::CreateCommandQueue() {
   // getting GPU device ID
   cl_device_id device_id = context_instance.GetDeviceId();
 
-  // returns NULL with error code if fails
-  command_queue_ = clCreateCommandQueue(
-    context, device_id, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, &error_code);
+  // In-order queue. Nothing in this tree enqueues a wait list or waits on an
+  // event, so out-of-order execution bought no overlap; what it did do is let
+  // the device reorder two kernels that hand off through a shared buffer,
+  // which is exactly how consecutive layers on the OpenCL memory allocator
+  // communicate. Submission order is the only ordering guarantee those
+  // handoffs have.
+  command_queue_ = clCreateCommandQueue(context, device_id, 0, &error_code);
   if (!command_queue_) {
     ml_loge("Failed to create a command queue. OpenCL error code: %d : ",
             error_code, OpenCLErrorCodeToString(error_code));
@@ -357,11 +391,16 @@ bool CommandQueueManager::DispatchCommand(
   const int error_code =
     clEnqueueNDRangeKernel(command_queue_, kernel_, 3, nullptr, global, local,
                            events_to_wait.size(), events_to_wait.data(), event);
+  // Always consume the flag, so it never leaks onto the next dispatch.
+  const bool touched_svm = Kernel::takeDispatchTouchedSVM();
   if (error_code != CL_SUCCESS) {
     ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));
     return false;
   }
+
+  if (touched_svm && needsCoarseSVMDrain())
+    clFinish(command_queue_);
 
   return true;
 }
@@ -391,11 +430,16 @@ bool CommandQueueManager::DispatchCommand(
   const int error_code =
     clEnqueueNDRangeKernel(command_queue_, kernel_, 3, nullptr, global, local,
                            events_to_wait.size(), events_to_wait.data(), event);
+  // Always consume the flag, so it never leaks onto the next dispatch.
+  const bool touched_svm = Kernel::takeDispatchTouchedSVM();
   if (error_code != CL_SUCCESS) {
     ml_loge("Failed to clEnqueueNDRangeKernel. OpenCL error code: %d : %s",
             error_code, OpenCLErrorCodeToString(error_code));
     return false;
   }
+
+  if (touched_svm && needsCoarseSVMDrain())
+    clFinish(command_queue_);
 
   return true;
 }
@@ -412,9 +456,18 @@ void CommandQueueManager::enqueueKernel(const cl_kernel kernel,
     command_queue_, kernel, work_dim, nullptr, global_work_size,
     local_work_size, num_events_in_wait_list, event_wait_list, event);
 
+  // Always consume the flag, so it never leaks onto the next dispatch.
+  const bool touched_svm = Kernel::takeDispatchTouchedSVM();
+
   NNTR_THROW_IF(error_code != CL_SUCCESS, std::runtime_error)
     << "clEnqueueNDRangeKernel failed. OpenCL error code: " << error_code
     << ", error: " << OpenCLErrorCodeToString(error_code);
+
+  // The attention and rotary-embedding kernels come through here rather than
+  // DispatchCommand, and they are the shared-memory producers and consumers,
+  // so the flush that keeps their handoff coherent has to live here too.
+  if (touched_svm && needsCoarseSVMDrain())
+    clFinish(command_queue_);
 }
 
 } // namespace nntrainer::opencl

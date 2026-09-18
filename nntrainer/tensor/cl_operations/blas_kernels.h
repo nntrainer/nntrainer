@@ -151,7 +151,7 @@ void sgemv_q6_k_cl(void *matAdata, float *vecXdata, float *vecYdata,
  */
 void sgemv_cl(const float *matAdata, const float *vecXdata, float *vecYdata,
               bool TransA, unsigned int dim1, unsigned int dim2,
-              unsigned int lda);
+              unsigned int lda, bool out_svm = false);
 
 /**
  * @brief     dot computation : sum of all X * Y
@@ -181,7 +181,8 @@ float dot_cl(const float *vecAdata, const float *vecXdata, unsigned int dim1);
  */
 void sgemm_cl(bool TransA, bool TransB, const float *A, const float *B,
               float *C, unsigned int M, unsigned int N, unsigned int K,
-              unsigned int lda, unsigned int ldb, unsigned int ldc);
+              unsigned int lda, unsigned int ldb, unsigned int ldc,
+              bool out_svm = false);
 
 /**
  * @brief     addition : sum of all input vectors
@@ -296,7 +297,7 @@ void transpose_32_16(float *data, int M, int K);
  */
 void sgemv_cl(const _FP16 *matAdata, const _FP16 *vecXdata, _FP16 *vecYdata,
               bool TransA, unsigned int dim1, unsigned int dim2,
-              unsigned int lda);
+              unsigned int lda, bool out_svm = false);
 
 /**
  * @brief     fp16 dot computation : sum of all X * Y
@@ -326,7 +327,8 @@ _FP16 dot_cl(const _FP16 *vecAdata, const _FP16 *vecXdata, unsigned int dim1);
  */
 void sgemm_cl(bool TransA, bool TransB, const _FP16 *A, const _FP16 *B,
               _FP16 *C, unsigned int M, unsigned int N, unsigned int K,
-              unsigned int lda, unsigned int ldb, unsigned int ldc);
+              unsigned int lda, unsigned int ldb, unsigned int ldc,
+              bool out_svm = false);
 
 /**
  * @brief     fp16 addition : sum of all input vectors

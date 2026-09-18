@@ -45,6 +45,7 @@ void ActivationLayer::finalize(InitLayerContext &context) {
     skip_prefill = std::get<props::SkipPrefill>(*activation_props).get();
   NNTR_THROW_IF(act.empty(), std::invalid_argument)
     << "activation has not been set!";
+  act_type_int = (int)act.get();
   if (context.getActivationDataType() == TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     acti_func.setActiFunc<_FP16>(act.get());
@@ -73,7 +74,14 @@ void ActivationLayer::finalize(InitLayerContext &context) {
 void ActivationLayer::forwarding(RunLayerContext &context, bool training) {
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
-  acti_func.run_fn(input_, hidden_);
+  // Backend-neutral whole-op dispatch: one call, no preprocessor branch, no
+  // backend name. The CPU table delegates every non-gelu mode back to this very
+  // same ActiFunc, so each existing mode stays value-identical; acti_func is
+  // kept for the backward path, which has no whole-op yet.
+  const TensorDim in_dim = input_.getDim();
+  input_.getOps()->activation(
+    input_, hidden_, act_type_int,
+    in_dim.batch() * in_dim.channel() * in_dim.height(), /*row_offset=*/0);
 }
 
 void ActivationLayer::incremental_forwarding(RunLayerContext &context,
@@ -88,26 +96,21 @@ void ActivationLayer::incremental_forwarding(RunLayerContext &context,
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
 
   TensorDim input_dim = input_.getDim();
-  TensorDim hidden_dim = hidden_.getDim();
 
-  TensorDim input_step_dim = input_dim;
-  TensorDim hidden_step_dim = hidden_dim;
-
-  input_step_dim.batch(1);
-  hidden_step_dim.batch(1);
-
-  if (input_dim.height() > 1)
-    input_step_dim.height(to - from);
-  if (hidden_dim.height() > 1)
-    hidden_step_dim.height(to - from);
+  // The former per-batch getSharedDataTensor(step_dim, b * featureLen) loop,
+  // expressed as (active_rows, row_offset) numbers instead of views, because a
+  // view does not carry the residency state a backend op reads. Rows are
+  // (channel, height) flattened within a batch, the window starts at the batch
+  // base, and a height == 1 broadcast shape keeps its single row -- exactly
+  // what the step-dim guard did. in/out share shape: finalize() sets the output
+  // dims to the input dims.
+  const unsigned int rows_per_batch =
+    input_dim.channel() * (input_dim.height() > 1 ? (to - from) : 1u);
+  const unsigned int rows_in_batch = input_dim.channel() * input_dim.height();
 
   for (unsigned int b = 0; b < hidden_.batch(); ++b) {
-    Tensor input_step = input_.getSharedDataTensor(
-      input_step_dim, b * input_dim.getFeatureLen(), true);
-    Tensor hidden_step = hidden_.getSharedDataTensor(
-      hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
-
-    acti_func.run_fn(input_step, hidden_step);
+    input_.getOps()->activation(input_, hidden_, act_type_int, rows_per_batch,
+                                b * rows_in_batch);
   }
 }
 
@@ -131,8 +134,10 @@ void ActivationLayer::setProperty(const std::vector<std::string> &values) {
     << "Failed to set property";
 
   auto &act = std::get<props::Activation>(*activation_props);
-  if (!act.empty())
+  if (!act.empty()) {
     acti_func.setActiFunc(act.get());
+    act_type_int = (int)act.get();
+  }
 }
 
 }; // namespace nntrainer

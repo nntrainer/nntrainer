@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <fc_layer.h>
+#include <layer_context.h>
 #include <layers_common_tests.h>
 
 auto semantic_fc = LayerSemanticsParamType(
@@ -89,3 +90,36 @@ GTEST_PARAMETER_TEST(FullyConnected16, LayerGoldenTest,
                                        fc_basic_single_batch_w16a16,
                                        fc_basic_no_decay_w16a16));
 #endif
+
+/**
+ * @brief A fused activation epilogue has no backward, so finalizing a layer
+ * that carries one for anything other than an inference graph must throw
+ * rather than silently drop the activation derivative during training.
+ */
+TEST(FullyConnected, fusedActivationOnTrainingGraph_n) {
+  auto layer = nntrainer::createLayer<nntrainer::FullyConnectedLayer>();
+  EXPECT_NO_THROW(layer->setProperty({"unit=5", "fused_activation=relu"}));
+
+  std::vector<ml::train::TensorDim> input_dims(
+    1, ml::train::TensorDim({1, 1, 1, 4}));
+  nntrainer::InitLayerContext train_context(
+    input_dims, {true}, false, "fc", "", 0.0f, {"NCHW", "FP32", "FP32"}, 1.0f,
+    ml::train::ExecutionMode::TRAIN);
+  EXPECT_THROW(layer->finalize(train_context), std::invalid_argument);
+}
+
+/**
+ * @brief The same property is accepted on an inference graph, which is the
+ * only mode the FusionRealizer sets it in.
+ */
+TEST(FullyConnected, fusedActivationOnInferenceGraph_p) {
+  auto layer = nntrainer::createLayer<nntrainer::FullyConnectedLayer>();
+  EXPECT_NO_THROW(layer->setProperty({"unit=5", "fused_activation=relu"}));
+
+  std::vector<ml::train::TensorDim> input_dims(
+    1, ml::train::TensorDim({1, 1, 1, 4}));
+  nntrainer::InitLayerContext infer_context(
+    input_dims, {true}, false, "fc", "", 0.0f, {"NCHW", "FP32", "FP32"}, 1.0f,
+    ml::train::ExecutionMode::INFERENCE);
+  EXPECT_NO_THROW(layer->finalize(infer_context));
+}
