@@ -199,6 +199,31 @@ size_t __kai_get_num_ukernel_variants_qai8dxp_qsi4cxp() {
   return num_ukernel_variants;
 }
 
+size_t __kai_get_opt_ukernel_idx_qai8dxp_qsi4cxp(bool is_gemv) {
+  /**
+   * @note ukernel_variants[] holds the i8mm entries only when the target ISA
+   * provides i8mm, so the index has to follow the same condition - otherwise
+   * the GEMM index runs off the end of the table. A GEMV / GEMM pair has to
+   * share one rhs packing layout (nr, kr, sr) as well, because the weight is
+   * packed once (QS4CX_Tensor::pack) and then used by both paths.
+   */
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+  /** qsi4cxp8x8: nr = 8, kr = 16, sr = 2
+   *  GEMV matmul_clamp_f32_qai8dxp1x8_qsi4cxp8x8_1x8x32_neon_dotprod
+   *  GEMM matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm
+   */
+  const size_t idx = is_gemv ? 2 : 8;
+#else
+  /** qsi4cxp4x4: nr = 4, kr = 8, sr = 2
+   *  GEMV matmul_clamp_f32_qai8dxp1x4_qsi4cxp4x4_1x4_neon_dotprod
+   *  GEMM matmul_clamp_f32_qai8dxp4x8_qsi4cxp4x4_16x4x32_neon_dotprod
+   *  (the only dotprod GEMM sharing its packing with a GEMV kernel)
+   */
+  const size_t idx = is_gemv ? 0 : 4;
+#endif
+  return (idx < num_ukernel_variants) ? idx : 0;
+}
+
 size_t __kai_get_rhs_packed_size_qsi4cxp_qs4cxs1s0(size_t n, size_t k,
                                                    size_t idx_variant,
                                                    bool is_nxk) {

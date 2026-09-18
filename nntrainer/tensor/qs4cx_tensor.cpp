@@ -71,7 +71,11 @@ void QS4CX_Tensor::pack() {
     return;
   }
 
-  size_t opt_kernel_idx = 8;
+  /**
+   * @note the packing layout of the GEMM ukernel is shared with its GEMV
+   * counterpart, so one packed weight serves both paths.
+   */
+  size_t opt_kernel_idx = nntrainer::get_opt_ukernel_idx_qai8dxp_qsi4cxp(false);
   /**
    * @note QS4CX tensor assumes that it is per-channel quantized along width()
    * axis which denotes output channel.
