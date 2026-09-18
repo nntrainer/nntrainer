@@ -8,6 +8,12 @@ shaped the API.
 It is the contract every new backend must follow, and the rationale
 for the parts of the design that are non-obvious.
 
+> **See also:** [`ARCHITECTURE_REFACTOR.md`](ARCHITECTURE_REFACTOR.md) extends this dispatch
+> chain with the layer-side rules — when a new operation may add a `Layer` subclass and when it
+> must become a `ComputeOps` virtual, how per-backend layer forks collapse, and the capability /
+> execution-plan layering above `Context`. Read this document first for what the chain does
+> today, and that one before adding a backend or an accelerated operation.
+
 ---
 
 ## 1. The dispatch chain
