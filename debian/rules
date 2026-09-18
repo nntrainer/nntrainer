@@ -24,6 +24,17 @@ else
 	export ENABLE_DEBUG?= false
 endif
 
+# A distribution package has to run on every CPU it can be installed on, so
+# drop i8mm from the tuned default (armv8.2-a+dotprod+i8mm): the build daemons
+# and many arm64 machines do not implement it, and nntrainer selects its i8mm
+# kernels at compile time, so a tuned build dies with SIGILL there.
+# dotprod is kept because the KleidiAI int4 (QS4CX) micro-kernels are hand
+# encoded and issue SDOT whatever -march says, so it is the real floor of this
+# package anyway. Native builds are unaffected.
+ifeq ($(DEB_HOST_ARCH),arm64)
+	MESON_ARM_ARGS = -Darm-march=armv8.2-a+dotprod
+endif
+
 %:
 	dh $@ --parallel
 
@@ -44,6 +55,7 @@ override_dh_auto_configure:
                 -Dcapi-ml-common-actual=capi-ml-common \
                 -Dcapi-ml-inference-actual=capi-ml-inference \
                 -Denable-capi=enabled \
+		$(MESON_ARM_ARGS) \
 		build --wrap-mode=nodownload
 
 override_dh_auto_build:

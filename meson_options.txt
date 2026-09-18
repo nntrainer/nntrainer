@@ -100,4 +100,4 @@ option('arm-arch', type: 'combo',
        description: 'Target ARM architecture. "none" disables arm related features.')
 option('arm-march', type: 'string',
        value: '',
-       description: 'ARM march flag (e.g., "-march=armv8.2-a+fp16+dotprod+i8mm"). If empty, derived from arm-arch.')
+       description: 'ARM march flag (e.g., "armv8-a" or "-march=armv8.2-a+fp16+dotprod+i8mm"). If empty, derived from arm-arch. The dotprod / i8mm kernels are compiled in only when the resulting ISA provides them, so this is how a portable (distro) build is made.')
