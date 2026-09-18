@@ -162,15 +162,16 @@ static void verify_transpose_matrix(unsigned int M, unsigned int N,
   const unsigned int ld_src = N + ld_src_pad;
   const unsigned int ld_dst = M + ld_dst_pad;
   const size_t src_len = static_cast<size_t>(M) * ld_src;
-  const size_t dst_len = static_cast<size_t>(N) * ld_dst + TRANSPOSE_GUARD;
+  const size_t dst_len = static_cast<size_t>(N) * ld_dst + 2 * TRANSPOSE_GUARD;
 
   std::vector<float> src = generate_random_vector<float>(src_len);
   std::vector<float> dst(dst_len, TRANSPOSE_CANARY);
   std::vector<float> ref_dst(dst_len, TRANSPOSE_CANARY);
 
-  nntrainer::transpose_matrix(M, N, src.data(), ld_src, dst.data(), ld_dst);
-  nntrainer::__fallback_transpose_matrix(M, N, src.data(), ld_src,
-                                         ref_dst.data(), ld_dst);
+  nntrainer::transpose_matrix(M, N, src.data(), ld_src,
+                              dst.data() + TRANSPOSE_GUARD, ld_dst);
+  nntrainer::__fallback_transpose_matrix(
+    M, N, src.data(), ld_src, ref_dst.data() + TRANSPOSE_GUARD, ld_dst);
 
   for (size_t i = 0; i < dst_len; ++i) {
     ASSERT_EQ(dst[i], ref_dst[i])
