@@ -3132,7 +3132,24 @@ bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
     // decode query): Gemma4 long-ctx decode 7.15 (chunk 256) -> 7.74 (64).
     return (e && std::atoi(e) > 0) ? std::atoi(e) : 64;
   }();
-  const int n_chunks = (int)((N_kv + chunk_kv - 1) / chunk_kv);
+  // [window-clip] A sliding layer reads only keys [N_kv-W, N_kv). Launch the
+  // chunks that window touches, not the whole context's: the kernel already
+  // clipped each chunk's key walk to win_start, but the GRID (work-groups,
+  // partial buffers, the reduce loop) still grew with N_kv -- at 17K context a
+  // W=512 layer launched 267 chunks per head to read 9. The grid stays
+  // anchored at key 0 (chunk_base is an index on it), so the surviving chunks
+  // hold the same keys and reduce in the same order: bit-identical.
+  // NNTR_FLASH_DEC_CLIP=0 restores the whole-context grid (A/B).
+  static const bool dec_clip = []() {
+    const char *e = std::getenv("NNTR_FLASH_DEC_CLIP");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  const int n_chunks_all = (int)((N_kv + chunk_kv - 1) / chunk_kv);
+  const int chunk_base =
+    (dec_clip && local_window > 0 && local_window < N_kv)
+      ? (int)((N_kv - local_window) / (unsigned int)chunk_kv)
+      : 0;
+  const int n_chunks = n_chunks_all - chunk_base;
 
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
@@ -3193,7 +3210,9 @@ bool flash_decode_f16_cl(const uint16_t *Q_host, const uint16_t *K_host,
     return false;
   {
     int ring_cap_i = (int)ring_cap; // [kv-window-ring] physical row = n % cap
-    if (!kp->SetKernelArguments(15, &ring_cap_i, sizeof(int)))
+    int chunk_base_i = chunk_base;  // [window-clip] first live chunk
+    if (!kp->SetKernelArguments(15, &ring_cap_i, sizeof(int)) ||
+        !kp->SetKernelArguments(16, &chunk_base_i, sizeof(int)))
       return false;
   }
   {

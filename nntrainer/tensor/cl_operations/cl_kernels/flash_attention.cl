@@ -787,11 +787,20 @@ __kernel void flash_decode_partial(
   const float scale, const int k_stride, const int local_window,
   const int chunk_kv, const int n_chunks,
   // [kv-window-ring] >0: physical row = n % ring_cap
-  const int ring_cap) {
+  const int ring_cap,
+  // [window-clip] index of the first LIVE chunk on the absolute chunk grid.
+  // A sliding layer only reads keys [N_kv-W, N_kv), so the host launches just
+  // the chunks that window touches (n_chunks of them, starting here) instead
+  // of one work-group per 64 keys of the whole context. The grid stays
+  // anchored at key 0, so every surviving chunk holds the same keys as before
+  // and the reduce adds them in the same order: bit-identical, the dropped
+  // chunks were the l==0 identity.
+  const int chunk_base) {
   const int lid = get_local_id(0);
   const int grp = get_group_id(0); // -> (head_q, chunk)
   const int head_q = grp / n_chunks;
-  const int chunk = grp % n_chunks;
+  const int chunk_l = grp % n_chunks;     // slot in the partial buffers
+  const int chunk = chunk_base + chunk_l; // position on the absolute grid
   if (head_q >= (HD_Q / d))
     return;
   const int head_kv = head_q / gqa;
@@ -849,10 +858,10 @@ __kernel void flash_decode_partial(
     barrier(CLK_LOCAL_MEM_FENCE);
   }
   // Unnormalized partial. l_i==0 => empty chunk (fully window-masked).
-  const long pa = ((long)head_q * n_chunks + chunk) * d;
+  const long pa = ((long)head_q * n_chunks + chunk_l) * d;
   FV_VSTORE_F(acc_reg, (pa + lane0) / VPL, part_acc);
   if (lid == 0) {
-    const long pm = ((long)head_q * n_chunks + chunk) * 2;
+    const long pm = ((long)head_q * n_chunks + chunk_l) * 2;
     part_ml[pm + 0] = (l_i > 0.0f) ? m_i : -INFINITY;
     part_ml[pm + 1] = l_i;
   }
