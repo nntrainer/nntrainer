@@ -44,6 +44,7 @@
 #include <transformer.h>
 
 #include <atomic>
+#include <cstdint>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -166,6 +167,54 @@ public:
     SYS_PROMP_LEN = USE_KVCACHE ? sys_prompt_token_len : 0;
     global_token_len = 0;
   }
+
+  /**
+   * @brief The sampling knobs applyTKP() consumes, as a settable group.
+   * @details Same three values generation_config.json seeds at construction
+   *          (temperature 0.7 / top_k 20 / top_p 0.95 by default). Held here
+   *          rather than passed down through run() so that a host API can
+   *          express "this request is creative, the next one is not" without
+   *          every model's run() signature growing a parameter.
+   */
+  struct SamplingParams {
+    float temperature;
+    unsigned int top_k;
+    float top_p;
+  };
+
+  /**
+   * @brief Replace the sampling knobs for subsequent run() calls.
+   * @note  Only consulted when run(..., do_sample=true ...): greedy decoding
+   *        ignores all three. A temperature <= 1e-5 degenerates to argmax
+   *        inside applyTKP(), which is the documented way to ask for
+   *        "sampling requested but deterministic".
+   * @note  Not synchronized: call between runs, not during one (the same
+   *        contract as setStreamer / setLogitsProcessor).
+   */
+  void setSamplingParams(const SamplingParams &params) {
+    TEMPERATURE = params.temperature;
+    TOP_K = params.top_k;
+    TOP_P = params.top_p;
+  }
+
+  /**
+   * @brief The sampling knobs currently in effect (the config's values until
+   *        someone calls setSamplingParams()).
+   */
+  SamplingParams getSamplingParams() const {
+    return SamplingParams{TEMPERATURE, TOP_K, TOP_P};
+  }
+
+  /**
+   * @brief Re-seed the sampling RNG.
+   * @details The RNG is a per-model member that is default-constructed once and
+   *          then advances across run() calls, so sampled output is
+   *          reproducible only for the first run of a fresh process. Seeding
+   *          immediately before a run makes that run reproducible on its own:
+   *          same prompt + same params + same seed => same tokens, on any run
+   *          number. Inert for greedy decoding.
+   */
+  void setSamplingSeed(uint32_t seed) { rng.seed(seed); }
 
 protected:
   /**
