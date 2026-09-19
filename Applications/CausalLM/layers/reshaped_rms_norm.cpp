@@ -196,7 +196,7 @@ void ReshapedRMSNormLayer::incremental_forwarding(
         nntrainer::rmsnorm_cl_fp16(
           in_step.getData<_FP16>(), gamma->getData<_FP16>(),
           out_step.getData<_FP16>(), epsilon, n_rows, feature_size,
-          /*use_svm=*/true, out_cl, in_cl);
+          /*use_svm=*/true, out_cl, in_cl, /*feeds_fc=*/false);
         gpu_done = true;
 #endif
       }

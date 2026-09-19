@@ -689,12 +689,37 @@ static int v8c_ring_advance(V8cScratch &sc) {
   return sc.ring_pos;
 }
 
-static bool v8c_norm_quant_enabled() {
-  static const bool on = []() {
+// NNTR_FUSE_NORM_QUANT: 0 = never fuse, 2 = fuse speculatively at every
+// device-plane norm whatever its shape (the behaviour before the row gate,
+// kept for A/B on a new device), anything else / unset = the gated default.
+static int v8c_norm_quant_mode() {
+  static const int mode = []() {
     const char *e = std::getenv("NNTR_FUSE_NORM_QUANT");
-    return !(e != nullptr && e[0] == '0');
+    if (e != nullptr && e[0] == '0')
+      return 0;
+    if (e != nullptr && e[0] == '2')
+      return 2;
+    return 1;
   }();
-  return on;
+  return mode;
+}
+
+static bool v8c_norm_quant_enabled() { return v8c_norm_quant_mode() != 0; }
+
+// Row ceiling of the gated default. A decode step is one row and a
+// speculative-decode verify a handful; both sit on the dispatch floor, where
+// folding the quantiser into the norm saves a whole submission. A prefill is
+// hundreds of rows, where the fused kernel is slower than the norm plus the
+// FC's own quantiser. NNTR_FUSE_NORM_QUANT_MAX_ROWS moves the ceiling
+// (0 = no ceiling).
+static unsigned int v8c_norm_quant_max_rows() {
+  static const unsigned int rows = []() {
+    const char *e = std::getenv("NNTR_FUSE_NORM_QUANT_MAX_ROWS");
+    if (e != nullptr && e[0] != '\0')
+      return static_cast<unsigned int>(std::strtoul(e, nullptr, 10));
+    return 8u;
+  }();
+  return rows;
 }
 
 // Get or build the cached v8c weight backing for a given int4 (QS4CX) weight.
@@ -1016,6 +1041,9 @@ bool v8cNormQuantBegin(const void *site, unsigned int rows, unsigned int K,
                        void **act_rs) {
   if (!v8c_norm_quant_enabled() || rows == 0 || K == 0)
     return false;
+  if (v8c_norm_quant_mode() != 2 && v8c_norm_quant_max_rows() != 0 &&
+      rows > v8c_norm_quant_max_rows())
+    return false;
   auto *cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   if (cc == nullptr)
@@ -1046,6 +1074,8 @@ bool v8cNormQuantBegin(const void *site, unsigned int rows, unsigned int K,
   *act_rs = sc.act_rs[slot];
   return true;
 }
+
+bool v8cNormQuantUngated() { return v8c_norm_quant_mode() == 2; }
 
 void v8cNormQuantCommit(void *src_clmem, unsigned int rows, unsigned int K) {
   ++v8c_fuse_stats().norm_published;

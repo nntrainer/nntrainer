@@ -216,6 +216,12 @@ bool v8cNormQuantBegin(const void *site, unsigned int rows, unsigned int K,
                        void **act_rs);
 
 /**
+ * @brief True when NNTR_FUSE_NORM_QUANT=2 asks for the ungated speculation:
+ *        every device-plane norm fuses, whatever its shape or consumer.
+ */
+bool v8cNormQuantUngated();
+
+/**
  * @brief Publish the reservation after the fused norm has been enqueued.
  *
  * @param[in] src_clmem device buffer the norm wrote the fp16 row into -- the

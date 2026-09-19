@@ -386,11 +386,15 @@ void transpose_cl_axis(const _FP16 *in, _FP16 *res,
  *            tensor's residency-plane sub-buffer) instead of the SVM pointer,
  *            with no host map, so a device-resident consumer reads it directly
  * @param[in] in_clmem when set, read the input from this device buffer
+ * @param[in] feeds_fc false when the rows cannot be a quantised FC's input (a
+ *            per-head q/k-norm feeds rope and attention), so the fused
+ *            norm+quant kernel is never worth selecting for them
  */
 void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
                      const float epsilon, unsigned int height,
                      unsigned int width, const bool use_svm = true,
-                     void *out_clmem = nullptr, void *in_clmem = nullptr);
+                     void *out_clmem = nullptr, void *in_clmem = nullptr,
+                     const bool feeds_fc = true);
 
 /**
  * @brief Reverse RMSNorm on the GPU: out = out_scale * normalize(in * weight).

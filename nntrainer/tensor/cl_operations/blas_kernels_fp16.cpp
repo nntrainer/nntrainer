@@ -261,7 +261,7 @@ bool rmsnorm_add_cl_fp16(const _FP16 *input, const _FP16 *gamma,
 void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
                      const float epsilon, unsigned int height,
                      unsigned int width, const bool use_svm, void *out_clmem,
-                     void *in_clmem) {
+                     void *in_clmem, const bool feeds_fc) {
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
 
@@ -300,8 +300,18 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
     // dispatch instead of two -- worth three to four times its GPU cost on a
     // backend whose submission floor is ~7.4 us against ~2-7 us kernels.
     // Speculative: when no FC claims the quantisation it is simply unread.
-    // NNTR_FUSE_NORM_QUANT=0 keeps the plain kernel.
-    if (to_clmem && gamma != nullptr && width >= 8u) {
+    //
+    // That arithmetic only holds while the dispatch floor dominates, i.e. for
+    // decode-shaped calls. Over a prefill the quant half runs 256 lanes per
+    // row against the norm's 64 and costs more than the FC's own batched
+    // quantiser would (919 rows on Xe: 206 us fused against 46 + 55 us), and a
+    // per-head q/k-norm feeds rope and attention, never an FC, so there its
+    // quantisation is pure waste (1.9 ms against 0.27 ms per layer). Hence
+    // v8cNormQuantBegin admits few-row calls only, and a caller that knows its
+    // rows feed no FC says so. NNTR_FUSE_NORM_QUANT=0 keeps the plain kernel
+    // everywhere, =2 restores the ungated speculation.
+    if (to_clmem && gamma != nullptr && width >= 8u &&
+        (feeds_fc || v8cNormQuantUngated())) {
       void *q_i8 = nullptr, *q_scale = nullptr, *q_zp = nullptr,
            *q_rs = nullptr;
       // The gamma pointer names this norm layer: a stable, unique key for
