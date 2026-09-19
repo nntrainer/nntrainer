@@ -334,6 +334,13 @@ public:
   std::vector<TensorDim> getInputDimension() const;
 
   /**
+   * @brief     getter of the model input identifiers, in the SAME order as
+   *            getInputDimension(): entry i names the tensor input i feeds
+   * @retval    input tensor name list
+   */
+  const std::vector<std::string> &getInputList() const { return input_list; }
+
+  /**
    * @brief Get the Batch Size object of current model
    *
    * @return unsigned int

@@ -469,9 +469,44 @@ std::vector<float *> CausalLM::incrementalInference(
     << "incrementalInference: model expects " << in_dim.size()
     << " inputs, got " << input.size();
 
+  // The caller hands the cache pointers in NAME order (cache_k_l0, cache_k_l1,
+  // cache_k_l10, ...), but the graph orders its inputs by node order. While
+  // every cache plane has the same shape the two orders are interchangeable (a
+  // consistent permutation of equally-sized slabs); as soon as planes differ --
+  // a sliding-window layer that keeps fewer rows than a full-attention one --
+  // a positional mismatch is a shape error. Resolve each cache input by the
+  // NAME the graph gives that position ("cache_k_l<i>..." /
+  // "cache_v_l<i>..."); the pointer match below remains for inputs the graph
+  // does not name that way.
+  const std::vector<std::string> &in_names = nn->getInputNames();
+  auto cache_by_name = [&](const std::string &name) -> nntrainer::Tensor * {
+    if (!kv_cache.isAllocated())
+      return nullptr;
+    const bool is_k = name.rfind("cache_k_l", 0) == 0;
+    const bool is_v = name.rfind("cache_v_l", 0) == 0;
+    if (!is_k && !is_v)
+      return nullptr;
+    size_t p = 9, e = p;
+    while (e < name.size() && name[e] >= '0' && name[e] <= '9')
+      ++e;
+    if (e == p || (e < name.size() && name[e] != ':'))
+      return nullptr;
+    const unsigned long layer = std::stoul(name.substr(p, e - p));
+    if (layer >= kv_cache.getNumLayers())
+      return nullptr;
+    return is_k ? &kv_cache.getKeyCache(static_cast<unsigned int>(layer))
+                : &kv_cache.getValueCache(static_cast<unsigned int>(layer));
+  };
+
   nntrainer::sharedConstTensors input_tensors;
   input_tensors.reserve(in_dim.size());
   for (unsigned int idx = 0; idx < in_dim.size(); idx++) {
+    if (idx < in_names.size()) {
+      if (auto *named = cache_by_name(in_names[idx])) {
+        input_tensors.emplace_back(MAKE_SHARED_TENSOR(*named));
+        continue;
+      }
+    }
     auto it = cache_by_ptr.find(reinterpret_cast<const void *>(input[idx]));
     if (it != cache_by_ptr.end()) {
       // shallow copy: shares the cache's MemoryData (isSVM intact)

@@ -575,6 +575,22 @@ public:
   }
 
   /**
+   * @brief     get the model input identifiers, index-aligned with
+   *            getInputDimension()
+   * @details   A caller that feeds several inputs positionally needs to know
+   *            which input each position is; the graph orders them by its own
+   *            node order, which no naming convention on the caller side can
+   *            reproduce once the inputs stop being interchangeable.
+   * @retval    input tensor name list
+   */
+  const std::vector<std::string> &getInputNames() const {
+    if (!compiled) {
+      throw std::logic_error("model should be compiled before get input names");
+    }
+    return model_graph.getInputList();
+  }
+
+  /**
    * @brief     get output dimension of neural network
    * @retval std::vector<TensorDim> output dimension
    */
