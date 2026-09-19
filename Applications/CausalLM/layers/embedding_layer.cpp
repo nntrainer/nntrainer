@@ -80,6 +80,10 @@ void emb_stage_h2d_wait() {
 } // namespace
 #endif // ENABLE_CUDA
 
+#if defined(ENABLE_OPENCL)
+#include <blas_kernels.h>
+#endif
+
 #include "../third_party/nlohmann/json.hpp"
 
 #include <algorithm>
