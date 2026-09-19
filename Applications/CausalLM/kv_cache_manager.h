@@ -186,15 +186,42 @@ public:
    * @brief Save KV cache to file up to specified length
    * @param[in] path file path
    * @param[in] seq_len number of positions to save
+   * @param[in] model_tag opaque identity of the model that produced the cache
+   *            (see describeFile()); recorded in the header so a later load can
+   *            refuse a file written by a different model instead of
+   *            reinterpreting its bytes. Empty writes an unnamed file, which
+   *            loads into any geometry-compatible model.
    */
-  void save(const std::string &path, unsigned int seq_len) const;
+  void save(const std::string &path, unsigned int seq_len,
+            const std::string &model_tag = std::string()) const;
 
   /**
    * @brief Load KV cache from file
    * @param[in] path file path
-   * @param[in] seq_len number of positions to load
+   * @param[in] seq_len number of positions to load. 0 means "whatever the file
+   *            says", which only a file carrying a header can answer.
+   * @param[in] model_tag identity to check the header's against; empty skips
+   *            the model check (the geometry checks always run).
+   * @return the absolute token position the loaded cache holds
+   * @throw std::runtime_error naming the field that disagreed
    */
-  void load(const std::string &path, unsigned int seq_len);
+  unsigned int load(const std::string &path, unsigned int seq_len,
+                    const std::string &model_tag = std::string());
+
+  /**
+   * @brief Describe a saved KV-cache file without loading it: the header's
+   *        model tag, token length and geometry, or why it cannot be read.
+   * @param[in] path file path
+   * @return one human-readable line
+   */
+  static std::string describeFile(const std::string &path);
+
+  /**
+   * @brief Bytes this manager's geometry needs on disk for @p seq_len
+   *        positions, header included. What save() will write.
+   * @param[in] seq_len number of positions
+   */
+  size_t fileBytesFor(unsigned int seq_len) const;
 
   /**
    * @brief Get number of layers
@@ -300,7 +327,33 @@ public:
     return max_seq_len_;
   }
 
+  /**
+   * @brief Physical rows of layer @p layer_idx that a save of @p seq_len
+   *        absolute positions has to write.
+   * @details For a full layer this is @p seq_len. For a ring layer (a sliding
+   *          window storing Wcap rows and modulo-indexing into them) the live
+   *          rows ARE the whole plane once the window has been passed, and
+   *          which row holds which position is a function of the absolute
+   *          position -- so the plane is written whole and the position in the
+   *          header is what re-derives the mapping. Writing seq_len rows there
+   *          would read past the plane; that is the bug this replaces.
+   * @param[in] layer_idx attention layer index
+   * @param[in] seq_len absolute token position being saved
+   */
+  unsigned int rowsToPersist(unsigned int layer_idx,
+                             unsigned int seq_len) const {
+    const unsigned int cap = getLayerCap(layer_idx);
+    return seq_len < cap ? seq_len : cap;
+  }
+
 private:
+  /**
+   * @brief FNV-1a over the per-layer geometry vectors, so the header can refuse
+   *        a file whose widths / ring capacities / alias map differ without
+   *        carrying a variable-length table.
+   */
+  unsigned int geometryDigest() const;
+
   /**
    * @brief [kv-share] Validate layer_kv_sources_ against num_layers and the
    *        per-layer geometry, and throw if the declaration is unusable.

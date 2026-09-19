@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 #include <basic_planner.h>
@@ -534,11 +535,131 @@ nntrainer::Tensor KVCacheManager::getValueCacheReadView(unsigned int layer_idx,
   return cache.getSharedDataTensor(read_dim, offset, true);
 }
 
+/**
+ * @brief On-disk header of a saved KV cache.
+ *
+ * A KV cache file used to be a bare concatenation of planes: no magic, no
+ * geometry, no identity. Handed the wrong file -- another model, another
+ * max_seq_len, another dtype -- load() would reinterpret whatever bytes were
+ * there and the model would answer fluently from someone else's attention
+ * state, because the only check was "did the read succeed". This header is what
+ * turns those into named refusals, and it also records the ONE number the
+ * planes cannot carry: the absolute token position they belong to (a ring
+ * layer's rows mean nothing without it).
+ *
+ * Layout is fixed-size and little-endian-as-written (both targets are LE; a
+ * future big-endian port has the version field to branch on). Everything after
+ * `header_bytes` is the plane payload, in the same layer order the headerless
+ * format used -- so the payload of a v1 file and of a legacy file are
+ * byte-identical for a non-ring model, and a legacy file still loads (see
+ * load()).
+ */
+namespace {
+
+constexpr char kKvMagic[8] = {'N', 'N', 'T', 'R', 'K', 'V', 'C', '\0'};
+constexpr unsigned int kKvVersion = 1u;
+constexpr unsigned int kKvTagMax = 64u;
+
+struct KvCacheFileHeader {
+  char magic[8];
+  unsigned int version;
+  unsigned int header_bytes;
+  unsigned int num_layers;
+  unsigned int batch_size;
+  unsigned int max_seq_len;  /**< cache capacity at save time */
+  unsigned int seq_len;      /**< absolute token position saved */
+  unsigned int dtype;        /**< ml::train::TensorDim::DataType */
+  unsigned int format;       /**< ml::train::TensorDim::Format */
+  unsigned int geom_digest;  /**< per-layer widths / caps / alias map */
+  unsigned int payload_lo;   /**< plane bytes, low 32 */
+  unsigned int payload_hi;   /**< plane bytes, high 32 */
+  char model_tag[kKvTagMax]; /**< NUL-padded; empty = unnamed */
+  unsigned int reserved[3];
+};
+
+/** 128 bytes exactly: 8 magic + 11 words + a 64-byte tag + 3 reserved words. A
+ *  round number is not cosmetic here -- it is the one thing a person reading
+ *  a hex dump of the file has to know, and `header_bytes` in the header is
+ *  checked against it on load, so a build with a different layout refuses
+ *  rather than reinterprets. */
+static_assert(sizeof(KvCacheFileHeader) == 128,
+              "KV cache header must stay packed at 128 bytes as written");
+
+std::string tag_of(const KvCacheFileHeader &h) {
+  size_t n = 0;
+  while (n < kKvTagMax && h.model_tag[n] != '\0')
+    ++n;
+  return std::string(h.model_tag, n);
+}
+
+/** Read the header if the file carries one. `false` = legacy headerless (or
+ *  unreadable, which the caller reports on its own). */
+bool read_header(std::ifstream &f, KvCacheFileHeader &h) {
+  f.read(reinterpret_cast<char *>(&h), sizeof(h));
+  if (!f || std::memcmp(h.magic, kKvMagic, sizeof(kKvMagic)) != 0) {
+    f.clear();
+    f.seekg(0, std::ios::beg);
+    return false;
+  }
+  return true;
+}
+
+} // namespace
+
+unsigned int KVCacheManager::geometryDigest() const {
+  unsigned int hash = 2166136261u;
+  auto mix = [&hash](unsigned int v) {
+    for (int b = 0; b < 4; ++b) {
+      hash ^= (v >> (8 * b)) & 0xffu;
+      hash *= 16777619u;
+    }
+  };
+  const unsigned int n = static_cast<unsigned int>(layer_caches_.size());
+  mix(n);
+  for (unsigned int i = 0; i < n; ++i) {
+    mix(i < kv_widths_.size() ? kv_widths_[i] : 0u);
+    mix(getLayerCap(i));
+    mix(static_cast<unsigned int>(getLayerKVSource(i) + 1));
+  }
+  return hash;
+}
+
+size_t KVCacheManager::fileBytesFor(unsigned int seq_len) const {
+  size_t bytes = sizeof(KvCacheFileHeader);
+  for (unsigned int i = 0; i < layer_caches_.size(); ++i) {
+    ml::train::TensorDim d = layer_caches_[i].key_cache.getDim();
+    d.height(rowsToPersist(i, seq_len));
+    bytes += 2u * d.getDataLen() * d.getDataTypeSize();
+  }
+  return bytes;
+}
+
+std::string KVCacheManager::describeFile(const std::string &path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f.is_open())
+    return "cannot open '" + path + "'";
+  KvCacheFileHeader h{};
+  if (!read_header(f, h))
+    return "'" + path +
+           "' has no KV-cache header (legacy headerless file: no model, "
+           "geometry or token length recorded)";
+  std::string tag = tag_of(h);
+  return "'" + path + "' v" + std::to_string(h.version) + " model='" +
+         (tag.empty() ? std::string("(unnamed)") : tag) +
+         "' tokens=" + std::to_string(h.seq_len) +
+         " layers=" + std::to_string(h.num_layers) +
+         " batch=" + std::to_string(h.batch_size) +
+         " capacity=" + std::to_string(h.max_seq_len) +
+         " dtype=" + std::to_string(h.dtype) +
+         " geometry=" + std::to_string(h.geom_digest);
+}
+
 void KVCacheManager::save(const std::string &path) const {
   save(path, cache_pos_);
 }
 
-void KVCacheManager::save(const std::string &path, unsigned int seq_len) const {
+void KVCacheManager::save(const std::string &path, unsigned int seq_len,
+                          const std::string &model_tag) const {
   if (layer_caches_.empty()) {
     throw std::runtime_error("KVCacheManager::save: not allocated");
   }
@@ -552,6 +673,32 @@ void KVCacheManager::save(const std::string &path, unsigned int seq_len) const {
     throw std::runtime_error("KVCacheManager::save: cannot open file: " + path);
   }
 
+  {
+    KvCacheFileHeader h{};
+    std::memcpy(h.magic, kKvMagic, sizeof(kKvMagic));
+    h.version = kKvVersion;
+    h.header_bytes = static_cast<unsigned int>(sizeof(h));
+    h.num_layers = static_cast<unsigned int>(layer_caches_.size());
+    h.batch_size = batch_size_;
+    h.max_seq_len = max_seq_len_;
+    h.seq_len = seq_len;
+    h.dtype = static_cast<unsigned int>(dtype_);
+    h.format = static_cast<unsigned int>(format_);
+    h.geom_digest = geometryDigest();
+    const size_t payload = fileBytesFor(seq_len) - sizeof(h);
+    h.payload_lo = static_cast<unsigned int>(payload & 0xffffffffull);
+    h.payload_hi = static_cast<unsigned int>(payload >> 32);
+    if (model_tag.size() >= kKvTagMax)
+      throw std::invalid_argument("KVCacheManager::save: model tag '" +
+                                  model_tag + "' exceeds " +
+                                  std::to_string(kKvTagMax - 1) + " bytes");
+    std::memcpy(h.model_tag, model_tag.data(), model_tag.size());
+    f.write(reinterpret_cast<const char *>(&h), sizeof(h));
+    if (!f)
+      throw std::runtime_error(
+        "KVCacheManager::save: cannot write the header of " + path);
+  }
+
   // [kv-share] The file format stays one K plane + one V plane per layer, in
   // layer order, exactly as before -- so a file written by an aliasing build
   // and one written by a non-aliasing build of the same model are byte
@@ -561,9 +708,15 @@ void KVCacheManager::save(const std::string &path, unsigned int seq_len) const {
   // wk/wv, same k_norm/v_norm, same RoPE, same absolute position -- see
   // Gemma4Transformer::createSharedAttention). load() below skips the
   // duplicates rather than replaying them.
-  for (const auto &lc : layer_caches_) {
+  for (unsigned int li = 0; li < layer_caches_.size(); ++li) {
+    const auto &lc = layer_caches_[li];
     ml::train::TensorDim save_dim = lc.key_cache.getDim();
-    save_dim.height(seq_len);
+    // [kv-window-ring] A ring layer's plane is Wcap rows and the live rows
+    // wrap, so seq_len rows would reach past the plane (getSharedDataTensor
+    // throws) -- write the whole ring and let the header's absolute position
+    // re-derive which row is which. A full layer is unchanged: rowsToPersist ==
+    // seq_len.
+    save_dim.height(rowsToPersist(li, seq_len));
 
     nntrainer::Tensor k_slice = const_cast<nntrainer::Tensor &>(lc.key_cache)
                                   .getSharedDataTensor(save_dim, 0, true);
@@ -595,13 +748,10 @@ void KVCacheManager::save(const std::string &path, unsigned int seq_len) const {
   }
 }
 
-void KVCacheManager::load(const std::string &path, unsigned int seq_len) {
+unsigned int KVCacheManager::load(const std::string &path, unsigned int seq_len,
+                                  const std::string &model_tag) {
   if (layer_caches_.empty()) {
     throw std::runtime_error("KVCacheManager::load: not allocated");
-  }
-  if (seq_len > max_seq_len_) {
-    throw std::out_of_range(
-      "KVCacheManager::load: seq_len exceeds max_seq_len");
   }
 
   std::ifstream f(path, std::ios::binary);
@@ -619,10 +769,93 @@ void KVCacheManager::load(const std::string &path, unsigned int seq_len) {
   const std::streamoff file_end = f.tellg();
   f.seekg(0, std::ios::beg);
 
+  // The header, when the file has one. A named refusal here is the whole point:
+  // without it, a file from another model / capacity / dtype is simply a byte
+  // count, and a byte count that happens to match loads someone else's
+  // attention state into this model (two models in this tree have the SAME
+  // per-layer KV width and layer count, so a length check alone passes).
+  KvCacheFileHeader h{};
+  const bool versioned = read_header(f, h);
+  auto refuse = [&path](const std::string &what) {
+    throw std::runtime_error("KVCacheManager::load: " + path +
+                             " does not belong to this model: " + what);
+  };
+  if (versioned) {
+    if (h.version != kKvVersion)
+      refuse("file format version " + std::to_string(h.version) +
+             ", this build reads version " + std::to_string(kKvVersion));
+    if (h.header_bytes != sizeof(KvCacheFileHeader))
+      refuse("header is " + std::to_string(h.header_bytes) +
+             " bytes, this build's is " +
+             std::to_string(sizeof(KvCacheFileHeader)));
+    const std::string file_tag = tag_of(h);
+    if (!model_tag.empty() && !file_tag.empty() && file_tag != model_tag)
+      refuse("written for model '" + file_tag + "', this model is '" +
+             model_tag + "'");
+    if (h.num_layers != layer_caches_.size())
+      refuse("written with " + std::to_string(h.num_layers) +
+             " attention layers, this model has " +
+             std::to_string(layer_caches_.size()));
+    if (h.batch_size != batch_size_)
+      refuse("written at batch " + std::to_string(h.batch_size) +
+             ", this model runs at batch " + std::to_string(batch_size_));
+    if (h.dtype != static_cast<unsigned int>(dtype_))
+      refuse("written with cache dtype " + std::to_string(h.dtype) +
+             ", this model's is " +
+             std::to_string(static_cast<unsigned int>(dtype_)));
+    if (h.format != static_cast<unsigned int>(format_))
+      refuse("written with tensor format " + std::to_string(h.format) +
+             ", this model's is " +
+             std::to_string(static_cast<unsigned int>(format_)));
+    if (h.geom_digest != geometryDigest())
+      refuse("per-layer geometry digest " + std::to_string(h.geom_digest) +
+             " != this model's " + std::to_string(geometryDigest()) +
+             " (KV widths, sliding-window ring capacities or the KV-sharing "
+             "alias map differ)");
+    // The capacity may legitimately differ (a bigger window still holds a
+    // shorter cache), as long as this model can hold what the file carries.
+    if (h.seq_len > max_seq_len_)
+      refuse("holds " + std::to_string(h.seq_len) +
+             " tokens, this model's cache capacity is " +
+             std::to_string(max_seq_len_));
+    if (seq_len != 0 && seq_len != h.seq_len)
+      refuse("holds " + std::to_string(h.seq_len) +
+             " tokens, the caller asked to resume at " +
+             std::to_string(seq_len));
+    seq_len = h.seq_len;
+    const size_t payload =
+      (static_cast<size_t>(h.payload_hi) << 32) | h.payload_lo;
+    const size_t expect = fileBytesFor(seq_len) - sizeof(KvCacheFileHeader);
+    if (payload != expect)
+      refuse("declares " + std::to_string(payload) +
+             " plane bytes, this geometry needs " + std::to_string(expect));
+    if (static_cast<size_t>(file_end) < sizeof(KvCacheFileHeader) + payload)
+      refuse("is truncated: " + std::to_string(file_end) + " bytes on disk, " +
+             std::to_string(sizeof(KvCacheFileHeader) + payload) + " expected");
+  } else {
+    // A file written before the header existed: no identity, no length. Honour
+    // the caller's seq_len (the only source there is) and say so once, because
+    // every check above is unavailable for it.
+    if (seq_len == 0)
+      throw std::runtime_error(
+        "KVCacheManager::load: " + path +
+        " carries no KV-cache header, so the token length cannot be read from "
+        "it; pass the position the cache was saved at");
+    ml_logw(
+      "[kv-cache] %s has no header (legacy headerless format): loading %u "
+      "tokens on the caller's word, with no model or geometry check",
+      path.c_str(), seq_len);
+  }
+
+  if (seq_len > max_seq_len_) {
+    throw std::out_of_range(
+      "KVCacheManager::load: seq_len exceeds max_seq_len");
+  }
+
   for (unsigned int i = 0; i < layer_caches_.size(); ++i) {
     auto &lc = layer_caches_[i];
     ml::train::TensorDim load_dim = lc.key_cache.getDim();
-    load_dim.height(seq_len);
+    load_dim.height(versioned ? rowsToPersist(i, seq_len) : seq_len);
 
     nntrainer::Tensor k_slice =
       lc.key_cache.getSharedDataTensor(load_dim, 0, true);
@@ -673,6 +906,7 @@ void KVCacheManager::load(const std::string &path, unsigned int seq_len) {
   }
 
   cache_pos_ = seq_len;
+  return seq_len;
 }
 
 } // namespace causallm
