@@ -118,6 +118,7 @@ LOCAL_SRC_FILES := \
     ../models/timm_vit/timm_vit_transformer.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
     ../models/bert/bert_transformer.cpp \
+    ../models/bert/multilingual_tinybert_16mb.cpp \
     ../models/xlm_roberta/xlm_roberta.cpp \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
@@ -234,9 +235,11 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/gemma3/function.cpp \
     ../models/deberta_v2/deberta_v2.cpp \
     ../models/bert/bert_transformer.cpp \
+    ../models/bert/multilingual_tinybert_16mb.cpp \
     ../models/xlm_roberta/xlm_roberta.cpp \
     ../layers/deberta_attention_layer.cpp \
     ../layers/shared_fully_connected_layer.cpp \
+    ../huggingface_tokenizer.cpp \
     ../api/streamer.cpp
 
 LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
@@ -326,6 +329,7 @@ LOCAL_SRC_FILES := \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_embedding_gemma_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_tinybert_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_deberta_v2_reference.cpp \
+    $(UNITTEST_MODELS_DIR)/unittest_causallm_xlm_roberta_reference.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2.cpp \
     $(UNITTEST_MODELS_DIR)/unittest_causallm_lfm2_reference.cpp
 

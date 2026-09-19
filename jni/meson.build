@@ -37,12 +37,26 @@ and_conf.set('MESON_CCAPI_NNTRAINER_SRCS', ' '.join(ccapi_src))
 and_conf.set('MESON_CCAPI_NNTRAINER_INCS', ' '.join(ccapi_inc_abs))
 and_conf.set('MESON_ARM_MARCH', arm_march_flag)
 
-# ABI-affecting defines exported to prebuilt consumers via Android-prebuilt.mk:
-# they gate the _FP16 type in the public headers (tensor_dim.h), so apps that
-# link the prebuilts must compile with the same values.
+# ABI-affecting defines exported to prebuilt consumers via Android-prebuilt.mk.
+# A define belongs here when it changes what an *installed* header declares, so
+# an app that compiles without it sees a different class than the one it links:
+#   ENABLE_FP16 / USE__FP16      gate the _FP16 type in tensor_dim.h
+#   USE_HALF_WRAPPER             picks nntrainer::Half over _Float16 for that
+#                                same _FP16, so it is as ABI-affecting as the
+#                                other two even though no android toolchain
+#                                selects it today
+#   ENABLE_OPENCL                gates the cl_context.h member of engine.h
+#   CL_TARGET_OPENCL_VERSION     is required by the CL/cl.h that engine.h then
+#                                reaches, so it has to travel with ENABLE_OPENCL;
+#                                matched by prefix, since its value is a build
+#                                option and pinning 200 here would silently drop
+#                                the define the day it changes
+# Exporting them beats hardcoding the same values in each consumer's makefile:
+# a hardcoded value that disagrees with the library is an ABI break rather than
+# a missing feature.
 nntrainer_abi_defines = []
 foreach define : extra_defines
-  if define == '-DENABLE_FP16=1' or define == '-DUSE__FP16=1'
+  if define == '-DENABLE_FP16=1' or define == '-DUSE__FP16=1' or define == '-DUSE_HALF_WRAPPER=1' or define == '-DENABLE_OPENCL=1' or define.startswith('-DCL_TARGET_OPENCL_VERSION=')
     nntrainer_abi_defines += define
   endif
 endforeach
@@ -175,6 +189,20 @@ ndk_input = []
 foreach src: nntrainer_sources
   ndk_input += files(src)
 endforeach
+
+# The QNN backend's TUs are compiled by this same ndk-build (Android.mk.in
+# splices them in as MESON_QNN_SRCS) but are NOT in nntrainer_sources, so
+# without this loop ninja saw no dependency on them: editing qnn_context.cpp or
+# qnn_rpc_manager.cpp and re-running `ninja` reported "no work to do" and the
+# install step then copied the STALE libqnn_context.so. That is silent -- you
+# get an unchanged binary and a green build. qnn_sources_abs is absolute (the
+# Android.mk needs it that way), and files() only takes paths relative to this
+# subdir, hence the fs.relative_to().
+if get_option('enable-npu')
+  foreach src : qnn_sources_abs
+    ndk_input += files(fs.relative_to(src, meson.current_source_dir()))
+  endforeach
+endif
 
 if get_option('enable-tflite-interpreter')
   ndk_depends += flat_header

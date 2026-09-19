@@ -97,6 +97,18 @@ endif
 if get_option('enable-fp16')
   test_target += [['unittest_nntrainer_tensor_fp16', []]]
   test_target += [['unittest_nntrainer_tensor_pool_fp16', []]]
+  # Compares nntrainer::Half against the compiler's own half type. That needs a
+  # native half to compare against, which is exactly what the wrapper exists to
+  # replace, so build it only where both are available -- which is every
+  # GCC/clang build including -Dfp16-impl=wrapper, and not MSVC.
+  if cxx.compiles('''#ifdef __ARM_FP16_FORMAT_IEEE
+__fp16 f(__fp16 a, __fp16 b) { return a * b; }
+#else
+_Float16 f(_Float16 a, _Float16 b) { return a * b; }
+#endif
+int main() { return 0; }''', name: 'a native half type to compare Half against')
+    test_target += [['unittest_half_fp16', []]]
+  endif
 endif
 
 if get_option('enable-profile')
