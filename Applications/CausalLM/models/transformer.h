@@ -174,6 +174,24 @@ public:
   /**
    * @brief run the Transformer model
    */
+  /**
+   * @brief Nodes whose HOST side must still run when a captured decode-step
+   *        graph is replayed.
+   * @details A replayed graph reproduces a step's DEVICE work, but a node whose
+   *          host side writes into a buffer the graph reads through a fixed
+   *          device pointer -- an embedding lookup staging this token's row --
+   *          has to run every step or the replay reuses the previous token's
+   *          value. Which nodes those are is a property of the model, not
+   *          something a backend can infer from layer names, so the model says.
+   * @return  node names; EMPTY (the default) means "do not replay a step graph
+   *          for this model at all", so a model that has not been checked gets
+   *          no behaviour change and the failure mode is a missing speedup
+   *          rather than wrong tokens.
+   */
+  virtual std::vector<std::string> getGraphReplayFeedNodes() const {
+    return {};
+  }
+
   virtual void run(const WSTR prompt, bool do_sample = false,
                    const WSTR system_prompt = WSTR(),
                    const WSTR tail_prompt = WSTR(), bool log_output = true);

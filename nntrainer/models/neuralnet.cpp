@@ -605,6 +605,25 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
      lookahead](std::shared_ptr<LayerNode> node, bool training) -> void {
     PROFILE_MEM_ANNOTATE("Forwarding for layer: " + node->getName());
 
+    // Feed-only step: a captured step graph is about to be replayed, so the
+    // device work of every node is already in that graph. Only the nodes the
+    // model declared as feeds still have to run, because their HOST side writes
+    // into a buffer the graph reads through a fixed device pointer -- skip the
+    // rest. This is the consumer half of setStepFeedOnly() /
+    // setGraphReplayFeedNodes(); without it the backend can capture a graph but
+    // the walk still runs every node on every token, which is slower than not
+    // capturing at all.
+    //
+    // Ahead of getExecutionOrder()/flushCacheExcept deliberately: a skipped
+    // node must not touch the cache plan either. Inert unless a backend has
+    // entered feed-only mode for this one forward, so the CPU and OpenCL walks
+    // are bit-identical.
+    if (step_feed_only_ &&
+        std::find(graph_replay_feed_nodes_.begin(),
+                  graph_replay_feed_nodes_.end(),
+                  node->getName()) == graph_replay_feed_nodes_.end())
+      return;
+
     auto f = std::get<0>(node->getExecutionOrder());
     if (exec_mode == ExecutionMode::TRAIN or
         (exec_mode == ExecutionMode::INFERENCE and !fsu_mode)) {

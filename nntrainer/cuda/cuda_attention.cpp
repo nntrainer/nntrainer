@@ -929,7 +929,7 @@ bool attention_splitkv_decode(const unsigned short *q, const unsigned short *k,
   // one capture serves every token. M1/non-graph (dpos=nullptr) uses the live
   // n_chunks -> bit-identical to the original. Mirrors the dense path's
   // decode-graph gate below.
-  static const bool decode_graph = nntr_env_on("NNTR_CUDA_GRAPH");
+  static const bool decode_graph = decodeGraphEnabled();
   const int *dpos =
     (decode_graph && g_sk_max_nchunks > 0) ? cuda_pos_buffer() : nullptr;
   int max_nc = dpos ? g_sk_max_nchunks : n_chunks;
@@ -1350,7 +1350,7 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
   // Graph replay: bind the device position buffer so the captured graph reads
   // the live cache_from/N_kv on replay; nullptr keeps the baked-arg (non-graph)
   // path.
-  static const bool decode_graph_attn = nntr_env_on("NNTR_CUDA_GRAPH");
+  static const bool decode_graph_attn = decodeGraphEnabled();
   const int *attn_dpos = decode_graph_attn ? cuda_pos_buffer() : nullptr;
   kernel->SetKernelArguments(12, &attn_dpos, sizeof(attn_dpos));
   const int grid[3] = {N_q, num_heads_Q, 1};

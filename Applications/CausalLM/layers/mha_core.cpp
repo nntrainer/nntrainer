@@ -2192,7 +2192,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 // here only when NOT capturing (non-graph decode); under
                 // capture the neuralnet scaffold sets it once per token before
                 // the replay.
-                static const bool m2b = nntr_env_on("NNTR_CUDA_M2B");
+                static const bool m2b = nntrainer::cuda::decodeGraphEnabled();
                 if (m2b) {
                   if (!nntrainer::cuda::StreamManager::Global().isCapturing())
                     nntrainer::cuda::cuda_set_pos((int)cache_index,
@@ -2269,7 +2269,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
                 rope_lut_device(cached_freqs_cos_fp16, half);
               const unsigned short *sind =
                 rope_lut_device(cached_freqs_sin_fp16, half);
-              static const bool m2b_k = nntr_env_on("NNTR_CUDA_M2B");
+              static const bool m2b_k = nntrainer::cuda::decodeGraphEnabled();
               if (cosd && sind && m2b_k) {
                 // M2-B: write RoPE'd K into the cache at the live slot computed
                 // on-device from d_pos[0] (kbase = cache BASE for this batch,
@@ -2342,7 +2342,7 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // (pool-bind time), not a per-call driver query -- layering rule.
           const auto v_md = b_cache_value_step.getMemoryData();
           const bool v_dev_only = v_md && !v_md->isHostAddressable();
-          static const bool m2b_v = nntr_env_on("NNTR_CUDA_M2B");
+          static const bool m2b_v = nntrainer::cuda::decodeGraphEnabled();
           if (cuda_elt && dev &&
               (value_step.height() == 1 || vcopy_prefill || v_dev_only)) {
             if (m2b_v) {

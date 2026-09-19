@@ -169,6 +169,19 @@ public:
     return f;
   }
 
+  /** @copydoc Transformer::getGraphReplayFeedNodes()
+   *  gemma4 has two host-fed inputs per decode step: the token embedding
+   *  (embedding0) and the per-layer PLE embedding row
+   *  (per_layer_input_embedding). Both stage this token's row into a buffer the
+   *  captured graph reads at a fixed device address, so both must re-run while
+   *  every other node comes from the replay. Naming only one of them replays
+   *  the other's previous-token row -- fluent output that is quietly wrong,
+   *  which is why this list is explicit per model rather than pattern-matched.
+   */
+  std::vector<std::string> getGraphReplayFeedNodes() const override {
+    return {"embedding0", "per_layer_input_embedding"};
+  }
+
 protected:
   Tensor per_layer_input;
   std::vector<Tensor> layer_k_norms;

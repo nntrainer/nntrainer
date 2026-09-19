@@ -330,7 +330,24 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
                                           const sharedConstTensors &label) {
   sharedConstTensors out;
 
-  static const bool decode_graph = nntr_env_on("NNTR_CUDA_GRAPH");
+  // The decode graph has a THIRD half, app-side: the attention layer writes
+  // this token's K/V into the cache at a slot computed on-device from the d_pos
+  // buffer, and RoPE reads its position from there, so a replayed graph stays
+  // valid across tokens. Those writes are gated on NNTR_CUDA_M2B while the
+  // capture here is gated on NNTR_CUDA_GRAPH -- two names for one decision.
+  // Half of that pair is not a configuration, it is a bug:
+  // replaying with the slot writes off rewrites the captured slot every token
+  // (deterministic nonsense after the first), and the slot writes without a
+  // replay set d_pos for a graph that never runs. Refuse the mismatch loudly
+  // instead of producing either.
+  static const bool decode_graph = []() {
+    if (nntrainer::cuda::decodeGraphSwitchesDisagree())
+      ml_loge("[CudaContext] decode graph DISABLED: NNTR_CUDA_GRAPH and "
+              "NNTR_CUDA_M2B disagree. Both halves are required -- the capture "
+              "here, the graph-compatible attention kernels, and the on-device "
+              "K/V slot writes. Set both to 1, or neither.");
+    return nntrainer::cuda::decodeGraphEnabled();
+  }();
   static const bool prefill_graph = []() {
     const char *e = std::getenv("NNTR_CUDA_PREFILL_GRAPH");
     if (e != nullptr)

@@ -332,6 +332,19 @@ void Transformer::initialize() {
   }
   _tlap("model->compile+initialize (ccapi)");
 
+  // Hand the backend this model's graph-replay feed nodes, now that the graph
+  // exists and the names are final. A model that declares none (the default)
+  // leaves the list empty, and the CUDA decode-graph arm refuses to replay
+  // without it -- so an unchecked model gets no behaviour change at all, and
+  // the worst case of a wrong list is a missing speedup rather than wrong
+  // tokens. Same static_cast the incremental-inference override already uses:
+  // the ccapi Model has no passthrough for this and inventing one would widen
+  // the public surface for a backend hint.
+  if (auto feed = getGraphReplayFeedNodes(); !feed.empty()) {
+    static_cast<nntrainer::NeuralNetwork *>(model.get())
+      ->setGraphReplayFeedNodes(std::move(feed));
+  }
+
   is_initialized = true;
 #ifdef DEBUG
   model->summarize(std::cout, ML_TRAIN_SUMMARY_MODEL);

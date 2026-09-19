@@ -16,6 +16,7 @@
 #ifndef __CUDA_CONTEXT_MANAGER_H__
 #define __CUDA_CONTEXT_MANAGER_H__
 
+#include <cstdlib>
 #include <string>
 
 #include <cuda.h>
@@ -184,6 +185,49 @@ bool dev_only(const void *p);
  */
 bool device_memset0(void *p, size_t bytes);
 bool copy_any(void *dst, const void *src, size_t bytes); // cudaMemcpyDefault
+
+/**
+ * @brief Is the captured decode-step graph enabled?
+ *
+ * The feature has three halves in three translation units: the capture/replay
+ * in CudaContext::runDecode, the graph-compatible attention kernels, and the
+ * app-side on-device K/V slot writes that let a replay address this token's
+ * slot. One decision, but it grew two names: the capture and the attention side
+ * read NNTR_CUDA_GRAPH while the slot writes read NNTR_CUDA_M2B.
+ *
+ * Half of that pair is not a configuration, it is a defect: with the slot
+ * writes off a replay rewrites the captured slot every token, and with the
+ * capture off the slot writes set a device position for a graph that never
+ * runs. Either way the output is deterministic nonsense after the first token.
+ *
+ * So all three sites ask THIS function and nothing else, and it is true only
+ * when both names agree. A mismatch answers false -- the safe side -- rather
+ * than letting one TU disagree with another.
+ */
+inline bool decodeGraphEnabled() {
+  static const bool on = []() {
+    auto env_on = [](const char *name) {
+      const char *e = std::getenv(name);
+      return e != nullptr && e[0] != '0';
+    };
+    const bool capture = env_on("NNTR_CUDA_GRAPH");
+    const bool slots = env_on("NNTR_CUDA_M2B");
+    return capture && slots;
+  }();
+  return on;
+}
+
+/**
+ * @brief Do the two decode-graph switches disagree?
+ * @details Only for diagnostics: the caller that can log says so once.
+ */
+inline bool decodeGraphSwitchesDisagree() {
+  auto env_on = [](const char *name) {
+    const char *e = std::getenv(name);
+    return e != nullptr && e[0] != '0';
+  };
+  return env_on("NNTR_CUDA_GRAPH") != env_on("NNTR_CUDA_M2B");
+}
 
 } // namespace nntrainer::cuda
 
