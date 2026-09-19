@@ -204,6 +204,44 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
    *  override by the pack value instead made a lowered default a one-way
    *  door: once a pack ships init_seq_len 512, no A/B could raise it back to
    *  1024 without editing the pack. */
+  /** NNTR_MAX_SEQ_LEN overrides the pack's max_seq_len -- the capability
+   *  itself (KV budget, prompt bound). This is the other half of the pair a
+   *  host embedding this engine configures: the init_seq_len override below
+   *  was read, this name was not, so a host asking for a 32K window through
+   *  the environment ran in the pack's 2048 window and had its prompt
+   *  silently clipped (1919 of 32439 tokens prefilled on the cell that found
+   *  it). Written back into nntr_cfg so the readers below see one value.
+   *  Bounded by the RoPE table (max_position_embeddings) when the model
+   *  config carries one; init_seq_len follows down when it would exceed the
+   *  new cap. */
+  if (const char *msl = std::getenv("NNTR_MAX_SEQ_LEN")) {
+    const long want = std::atol(msl);
+    const unsigned int pack = nntr_cfg["max_seq_len"].get<unsigned int>();
+    unsigned int cap = 0;
+    if (cfg.contains("max_position_embeddings"))
+      cap = cfg["max_position_embeddings"].get<unsigned int>();
+    if (want >= 8) {
+      unsigned int use = static_cast<unsigned int>(want);
+      if (cap != 0 && use > cap) {
+        std::fprintf(stderr,
+                     "[max_seq_len] NNTR_MAX_SEQ_LEN=%ld exceeds "
+                     "max_position_embeddings=%u; clamping\n",
+                     want, cap);
+        use = cap;
+      }
+      nntr_cfg["max_seq_len"] = use;
+      if (nntr_cfg["init_seq_len"].get<unsigned int>() > use) {
+        nntr_cfg["init_seq_len"] = use;
+        INIT_SEQ_LEN = use;
+      }
+      std::fprintf(stderr, "[max_seq_len] pack %u -> %u (NNTR_MAX_SEQ_LEN)\n",
+                   pack, use);
+      std::fflush(stderr);
+    } else {
+      std::fprintf(stderr, "[max_seq_len] ignoring NNTR_MAX_SEQ_LEN=%s\n", msl);
+      std::fflush(stderr);
+    }
+  }
   const unsigned int isl_cap = nntr_cfg["max_seq_len"].get<unsigned int>();
   if (const char *isl = std::getenv("NNTR_INIT_SEQ_LEN")) {
     const int want = std::atoi(isl);
