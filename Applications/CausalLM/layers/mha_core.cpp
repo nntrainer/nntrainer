@@ -3326,8 +3326,19 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 #endif // ENABLE_OPENCL (GPU two-conv/image/flash attention)
 #endif
     }
-    // Host/NEON attention reads Q and writes O on the host.
-    mha_ring_assert_host_path_ok(kv_ring_cap, "host prefill attention");
+    // [kv-window-ring] The guard for the host attention path is NOT here, even
+    // though the next arm below is the host one. gemm_attention() is not itself
+    // the host path: it carries the CUDA arm
+    // (cuda_attention_interleaved_fp16), which is one of the three that
+    // modulo-map the ring row, and it is the only way to reach it -- the
+    // dispatch above routes every step_size here when NNTR_CUDA_ATTN is on.
+    // Asserting before the call refused the ring for the whole CUDA lane:
+    // engine=cuda + ring=1 threw "no ring-aware attention arm resolved" on the
+    // FIRST prefill chunk, having never given the arm that resolves it a turn.
+    // The guard now sits inside gemm_attention, immediately before its host
+    // phase, where the arm has either answered or declined -- which is also the
+    // only place the arm's runtime precondition (Q/O device-accessible) is
+    // known.
 #if defined(ENABLE_OPENCL)
     // A K/V cache write above may have been enqueued with a submission flush
     // and no drain (the image-attention GPU chain). This reader is on the
@@ -3731,6 +3742,15 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
     }
   }
 #endif
+
+  // [kv-window-ring] Everything below walks the KV cache by ABSOLUTE row, so
+  // this is the real edge of the ring's safety, and the guard belongs here
+  // rather than at the call site (see the note there): the device arms above
+  // have now had their turn and either returned or declined on a runtime
+  // precondition. The message names the step kind so a failure still reads the
+  // way it did before.
+  mha_ring_assert_host_path_ok(kv_ring_cap, N_q > 1 ? "host prefill attention"
+                                                    : "host decode attention");
 
   // Phase 1: de-interleave heads once into shared contiguous buffers.
   // K/V always kept as raw FP16 bits (uint16). Q either FP32 (V-JEPA
