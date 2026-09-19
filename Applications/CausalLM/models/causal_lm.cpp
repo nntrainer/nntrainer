@@ -1184,6 +1184,28 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // fits the INIT_SEQ_LEN-height activation buffer and never straddles the
   // ring's wrap seam.
   const unsigned int prefill_chunk = prefillChunk();
+  // [kv-window-ring] A ringed layer stores absolute position p at row
+  // (p % Wcap) and takes ONE contiguous slice per call, so every prefill call
+  // [p, p+L) must satisfy (p % Wcap) + L <= Wcap. Wcap is a multiple of the
+  // chunk C, so it is enough that no call crosses an ABSOLUTE multiple of C.
+  // A first turn starts at 0 and the plain C-tiling already has that property;
+  // a resumed session (a second prompt, a loaded KV file, a precomputed system
+  // prompt) starts at an arbitrary residue, and tiling from there put a slice
+  // across the seam (mha_core's guard threw: 8.5K prompt resumed at 3269 on a
+  // 2048-row ring). Only the producer's phase can uphold the invariant -- no
+  // finite Wcap does -- so with a ringed layer the first chunk is shortened to
+  // the next absolute multiple of C and every later chunk starts C-aligned.
+  // Identical to the plain tiling whenever from_pos % C == 0. Gated on the
+  // model actually having a ringed layer: a linear cache has no seam, and
+  // re-tiling it would only move fp16 rounding for no reason.
+  const unsigned int ring_grid = [&]() -> unsigned int {
+    if (prefill_chunk == 0)
+      return 0u;
+    for (int i = 0; i < NUM_LAYERS; ++i)
+      if (getKVCacheRows(i) < static_cast<unsigned int>(MAX_SEQ_LEN))
+        return prefill_chunk;
+    return 0u;
+  }();
   auto do_prefill = [&](unsigned int n_tok,
                         unsigned int from_pos) -> std::vector<float *> {
     // [prefill-long] Tell the attention layers the whole key span this prefill
@@ -1212,13 +1234,19 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
       return out;
     }
     // Single block (default) when chunking is off or the prompt fits one chunk.
-    if (prefill_chunk == 0 || n_tok <= prefill_chunk)
+    const bool one_block_on_grid =
+      ring_grid == 0 || (from_pos % ring_grid) + n_tok <= ring_grid;
+    if (prefill_chunk == 0 || (n_tok <= prefill_chunk && one_block_on_grid))
       return incrementalInference(BATCH_SIZE, input, n_tok, from_pos,
                                   from_pos + n_tok);
     // Chunked forward prefill.
     std::vector<float *> out;
-    for (unsigned int o = 0; o < n_tok; o += prefill_chunk) {
-      const unsigned int clen = std::min(prefill_chunk, n_tok - o);
+    unsigned int clen = 0;
+    for (unsigned int o = 0; o < n_tok; o += clen) {
+      // ring_grid: stop at the next absolute multiple of C (see above).
+      const unsigned int room =
+        ring_grid ? ring_grid - ((from_pos + o) % ring_grid) : prefill_chunk;
+      clen = std::min(std::min(prefill_chunk, room), n_tok - o);
       for (unsigned int b = 0; b < BATCH_SIZE; ++b)
         for (unsigned int j = 0; j < clen; ++j)
           input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN + j] =

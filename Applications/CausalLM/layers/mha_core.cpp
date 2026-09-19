@@ -1579,18 +1579,27 @@ void MHACoreLayer::one_batch_incremental_forwarding(
    */
 
   // [kv-window-ring] Fail loud if a step write would straddle the ring seam.
-  // Wcap is a multiple of the prefill chunk C and cache_index is C-aligned
-  // (chunked prefill) or step==1 (decode), so cacheRow(cache_index)+step <=
-  // Wcap by construction. A violation means a misconfigured chunk -- throw
-  // rather than silently corrupt the neighbouring pool region (SVM writes do
-  // not bounds-check). Covers every cache-row write below (same cache_index).
+  // A ringed layer takes one contiguous slice per call, so the PRODUCER must
+  // never issue a call that crosses an absolute multiple of the prefill chunk
+  // C (Wcap is a multiple of C): CausalLM::run phases its chunks on the
+  // absolute grid for exactly this reason, and decode is step == 1. cache_index
+  // is the ABSOLUTE position, so it is C-aligned only on a first turn; a
+  // resumed session starts anywhere. Reaching this throw means a producer fed
+  // a multi-row step that was not phased -- throw rather than silently corrupt
+  // the neighbouring pool region (SVM writes do not bounds-check). Covers
+  // every cache-row write below (same cache_index).
   if (kv_ring_cap &&
       cacheRow(cache_index) + (size_t)cache_key_step_dim.height() >
         (size_t)kv_ring_cap) {
     throw std::runtime_error(
-      "mha_core kv-window-ring: step write straddles the ring seam "
-      "(NNTR_PREFILL_CHUNK must divide the window ring capacity; keep the "
-      "chunk a power-of-two <= the sliding window)");
+      "mha_core kv-window-ring: step write straddles the ring seam (absolute "
+      "position " +
+      std::to_string(cache_index) + " + " +
+      std::to_string(cache_key_step_dim.height()) + " rows on a " +
+      std::to_string(kv_ring_cap) +
+      "-row ring). The caller must split multi-row steps at absolute multiples "
+      "of the prefill chunk; set NNTR_KV_WINDOW_RING=0 to keep the linear "
+      "cache.");
   }
 
   // Load Input Tensors of this batch : b_ denotes a Tensor for this batch
