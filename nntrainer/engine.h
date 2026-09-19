@@ -161,6 +161,27 @@ public:
     return engines.at(name);
   }
 
+  /**
+   * @brief is a Context with this name registered?
+   *
+   * @note getRegisteredContext() throws for a name that is not registered,
+   *       which is the right contract for a caller that cannot do its work
+   *       without that backend. It is the wrong one for the paths that only
+   *       finish work IF a backend was brought up -- load-time and teardown
+   *       hooks compiled in with a backend but reached on every engine. Since
+   *       add_default_object() registers the OpenCL and CUDA contexts only
+   *       when the run asks for them, such a hook has to ask first instead of
+   *       letting the throw escape into its caller.
+   *
+   * @param name Context name (case-insensitive)
+   * @return true when a Context is registered under this name
+   */
+  bool isContextRegistered(std::string name) const {
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return engines.find(name) != engines.end();
+  }
+
   std::unordered_map<std::string, std::shared_ptr<nntrainer::MemAllocator>>
   getAllocators() {
     return allocator;

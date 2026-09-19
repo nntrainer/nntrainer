@@ -239,6 +239,14 @@ public:
   std::string getName() override { return "gpu"; }
 
   /**
+   * @brief Capability snapshot of the OpenCL device, probed once in
+   *        initialize(). Callers that need to branch on what the device can do
+   *        read this, never a device-name string.
+   * @return const DeviceCaps& the probed capabilities
+   */
+  const DeviceCaps &caps() const override { return caps_; }
+
+  /**
    * @brief Set the Mem Allocator object
    *
    * @param mem Memory allocator object
@@ -252,6 +260,9 @@ private:
    * @brief   Overriden initialization function
    */
   void initialize() noexcept override;
+
+  /** device capabilities, probed once at initialize() */
+  DeviceCaps caps_;
 
   void add_default_object();
 

@@ -30,6 +30,10 @@
 #include <htp_context.h>
 #endif
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_context.h>
+#endif
+
 static std::string solib_suffix = ".so";
 static std::string contextlib_suffix = "context.so";
 static const std::string func_tag = "[Engine] ";
@@ -153,6 +157,27 @@ void Engine::add_default_object() {
     // CPU, and this line is the only trace of it.
     ml_logw("OpenCL/gpu backend compiled in but not brought up "
             "(NNTR_ENGINE=%s); engine=gpu layers fall back to cpu.",
+            requestedEngine().c_str());
+  }
+#endif
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Additive NVIDIA CUDA backend, registered ALONGSIDE (not replacing) the
+  // OpenCL "gpu" context; the two are selected apart at runtime by engine=.
+  // Symmetric to the gate above, but opt-in rather than on by default: the
+  // CUDA context is only registered when NNTR_ENGINE names it, so an OpenCL or
+  // CPU run on a unified binary never pays cuInit() -- which on a discrete card
+  // also means never waking a runtime-power-managed GPU over PCIe (measured at
+  // ~2.3 s on an idle laptop dGPU, i.e. the whole of an otherwise unexplained
+  // cold-start tax).
+  // NNTR_CUDA_EAGER_CTX=1 restores the unconditional bring-up.
+  if (bringUpWanted("cuda", "NNTR_CUDA_EAGER_CTX", /*on_by_default=*/false)) {
+    auto &cuda_context = nntrainer::CudaContext::Global();
+
+    registerContext("cuda", &cuda_context);
+  } else {
+    ml_logi("CUDA backend compiled in but not brought up (NNTR_ENGINE=%s); "
+            "engine=cuda layers fall back to cpu.",
             requestedEngine().c_str());
   }
 #endif

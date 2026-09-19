@@ -16,20 +16,27 @@
 
 #include <activation_layer.h>
 #include <addition_layer.h>
+#include <attention_kernels.h>
+#include <blas_kernels.h>
+#include <cerrno>
 #include <cl_context.h>
 #include <cl_kernels/cl_kernels.h>
 #include <cl_svm_allocator.h>
 #include <compute_ops.h>
 #include <concat_cl.h>
+#include <cstdlib>
 #include <fc_layer_cl.h>
 #include <geglu_cl_op.h>
 #include <geglu_layer.h>
 #include <gelu_cl_op.h>
 #include <layer_normalization_layer.h>
 #include <layernorm_cl_op.h>
+#include <load_trace.h>
 #include <opencl_context_manager.h>
+#include <opencl_loader.h>
 #include <reshape_cl.h>
 #include <rmsnorm_layer_cl.h>
+#include <string>
 #include <swiglu_cl_op.h>
 #include <swiglu_layer.h>
 #include <transpose_cl.h>
@@ -171,10 +178,68 @@ bool writeBinaryFile(const std::string &path,
 
 void ClContext::initialize() noexcept {
   try {
-    if (!clInit()) {
-      ml_loge("Error: ClContext::initialize() failed");
-      return;
+    {
+      // Platform + device enumeration, cl_context and the command queue. It
+      // is the first thing a GPU run pays and, unlike everything after it,
+      // there is no cache that can make it cheaper.
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::CTX_CREATE);
+      if (!clInit()) {
+        ml_loge("Error: ClContext::initialize() failed");
+        return;
+      }
     }
+
+    // Probe the device's capabilities once, here, where the device has just
+    // been enumerated. The struct is a plain POD of attributes (what the
+    // device can do), never identity, and every consumer reads it through
+    // Context::caps() rather than re-querying CL or matching a device name.
+    if (const auto *di = context_inst_.getDeviceInfo()) {
+      // CL_DEVICE_VENDOR_ID for Intel. Used only to derive the two attributes
+      // below whose real signal is a compiler/driver trait no CL query
+      // reports; it is never compared against a device name.
+      constexpr uint32_t INTEL_VENDOR_ID = 0x8086;
+
+      caps_.backend = "gpu";
+      caps_.device_name = di->getDeviceName();
+      // CL_DEVICE_NAME is stored sized to include the query's trailing NUL; an
+      // embedded NUL would truncate the %s log line, so strip trailing NUL/ws.
+      while (!caps_.device_name.empty()) {
+        const char c = caps_.device_name.back();
+        if (c == '\0' || c == ' ' || c == '\n' || c == '\r' || c == '\t')
+          caps_.device_name.pop_back();
+        else
+          break;
+      }
+      caps_.vendor_id = di->getDeviceVendorId();
+      caps_.compute_units = di->getDeviceMaxComputeUnits();
+      caps_.max_alloc_bytes = di->getDeviceMaxMemAllocSize();
+      caps_.unified_memory = di->getDeviceSVMCapabilities() != 0;
+      caps_.subgroups = di->getDeviceExtensions().find("cl_intel_subgroups") !=
+                        std::string::npos;
+      // cl_intel_subgroups is advertised by every Intel GPU since Gen9
+      // (including non-DPAS Xe-LPG parts), so it cannot gate a DPAS/XMX
+      // matrix-engine kernel. The matrix-multiply-accumulate extension is
+      // DPAS-specific, so it is the real capability signal.
+      caps_.dpas =
+        di->getDeviceExtensions().find(
+          "cl_intel_subgroup_matrix_multiply_accumulate") != std::string::npos;
+      // image_v8c: whether the device should prefer an image2d-based path over
+      // a cl_mem buffer path. No clean device query distinguishes the two
+      // (both report CL_DEVICE_IMAGE_SUPPORT); the practical split is that
+      // Intel NEO's compiler rejects integer-coordinate read_imageui kernels.
+      // Keyed off vendor_id -- a stable, queryable, vendor-wide attribute (the
+      // quirk is a compiler trait, not a per-model one), not the brittle
+      // device_name. Intel => buffer; others keep the image default.
+      caps_.image_v8c = (caps_.vendor_id != INTEL_VENDOR_ID);
+      cl_bool host_unified = CL_FALSE;
+      caps_.integrated =
+        (opencl::clGetDeviceInfo(
+           context_inst_.GetDeviceId(), CL_DEVICE_HOST_UNIFIED_MEMORY,
+           sizeof(host_unified), &host_unified, nullptr) == CL_SUCCESS) &&
+        (host_unified == CL_TRUE);
+      ml_logi("[ClContext] %s", caps_.toString().c_str());
+    }
+
     if (KERNEL_CACHE_ENABLED) {
       // Best effort: the binary cache is an optimisation. A read-only or
       // otherwise unwritable directory must not take the whole context down
@@ -194,8 +259,14 @@ void ClContext::initialize() noexcept {
       }
     }
 
-    initBlasClKernels();
-    initAttentionClKernels();
+    {
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_BLAS);
+      initBlasClKernels();
+    }
+    {
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_ATTN);
+      initAttentionClKernels();
+    }
 
     // The allocator and the ops table are installed BEFORE the layer
     // registrations, not after. add_default_object() throws on a duplicate
@@ -421,6 +492,25 @@ void ClContext::initAttentionClKernels() {
 #ifdef ENABLE_FP16
   registerClKernel(rotary_emb_fp16_kernel, "rotary_emb_cl_fp16");
 #endif
+
+  // Programs that would otherwise be built on their first dispatch, i.e.
+  // inside the first prefill and the first decode step. Collected by the
+  // translation unit that owns their sources AND the compile options its
+  // dispatch passes, because a prewarm with the wrong options builds a
+  // program the hot path never looks up: it pays the compile twice and
+  // removes nothing from the critical path.
+  {
+    std::vector<std::function<void()>> lazy_tasks;
+    v8c_collect_lazy_program_tasks(*this, lazy_tasks);
+    for (auto &t : lazy_tasks)
+      t();
+  }
+
+  // The attention dispatchers own a second family of lazily built programs:
+  // the in-place RoPE source also hosts the KV scatter/copy kernels, so one
+  // registration builds the program all of them share.
+  attention_prewarm_programs(*this);
+
   attention_kernels_initialized = true;
 }
 
@@ -433,6 +523,62 @@ ClContext::registerClKernel(const std::string &kernel_string,
   // every cached lookup, and the attention path takes this route once per
   // kernel per layer.
   const std::string key = kernel_name + compile_options;
+
+  // Kernel ring-rotation: hand out one of K rotating CLONES of each kernel
+  // rather than a single process-global object. Every dispatcher re-binds
+  // arguments on the object this returns, and with a singleton that re-bind
+  // can land on an object whose previous enqueue the driver has not locked
+  // in yet -- a token-altering hazard we have measured on this stack, which
+  // a per-dispatch flush only makes rarer. Rotating guarantees the object
+  // being re-bound is the one enqueued K calls ago. The cost is K-1 extra
+  // clCreateKernel per kernel, which the driver's program cache makes cheap,
+  // and nothing per call. A call site that caches the returned pointer in a
+  // static keeps singleton behaviour; that gap is deliberate and documented
+  // here rather than papered over.
+  //
+  // This is a correctness fix, so it is unconditional and does not sit under
+  // the NNTR_DETERMINISTIC opt-out, which relaxes only the ordering and
+  // reduction-shape half of the determinism contract.
+  // NNTR_CL_KERNEL_RING=K is the explicit diagnostic override; K=1
+  // reproduces the old singleton deliberately, as a bisection aid.
+  {
+    static const int ring_k = []() {
+      const char *r = std::getenv("NNTR_CL_KERNEL_RING");
+      if (r == nullptr)
+        return 8;
+      // strtol, not atoi: atoi maps every non-numeric string to 0 and has no
+      // way to report one, so a typo would silently select the singleton.
+      char *end = nullptr;
+      errno = 0;
+      const long v = std::strtol(r, &end, 10);
+      if (errno != 0 || end == r || *end != '\0' || v < 1 || v > 64) {
+        ml_logw("Ignoring NNTR_CL_KERNEL_RING=%s: expected an integer in "
+                "[1, 64]",
+                r);
+        return 8;
+      }
+      return (int)v;
+    }();
+    if (ring_k > 1) {
+      static std::unordered_map<
+        std::string, std::pair<std::vector<SharedPtrClKernel>, size_t>>
+        ring_map;
+      auto &slot = ring_map[key];
+      auto &clones = slot.first;
+      if ((int)clones.size() < ring_k) {
+        std::string ks = kernel_string, kn = kernel_name, co = compile_options;
+        SharedPtrClKernel kp = std::make_shared<opencl::Kernel>();
+        if (clCreateKernel(ks, kn, co, kp)) {
+          clones.push_back(kp);
+          return clones.back();
+        }
+        // Clone creation failed: fall through to the single-object path.
+      } else {
+        slot.second = (slot.second + 1) % clones.size();
+        return clones[slot.second];
+      }
+    }
+  }
 
   // ocl_kernel_map is a process-wide static reached from the per-op dispatch
   // path, not only from init, so it takes the same treatment clCreateKernel
@@ -493,8 +639,10 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   {
     std::lock_guard<std::mutex> lk(program_cache_mtx);
     auto it = program_cache.find(pc_key);
-    if (it != program_cache.end())
+    if (it != program_cache.end()) {
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_OBJ);
       return kernel_ptr_->CreateKernelFromProgram(it->second, kernel_name);
+    }
   }
 
   // On-disk kernel binary cache. The key folds in the per-kernel
@@ -580,9 +728,12 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
       return false;
     }
   }
-  auto binary_data = (KERNEL_CACHE_ENABLED && kernel_cache_usable)
-                       ? readBinaryFile(binary_file_path)
-                       : std::vector<std::byte>();
+  std::vector<std::byte> binary_data;
+  if (KERNEL_CACHE_ENABLED && kernel_cache_usable) {
+    nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_BIN_READ);
+    binary_data = readBinaryFile(binary_file_path);
+    _lt.bytes(binary_data.size());
+  }
   // Where the bytes actually came from. The log line used to name the resolved
   // directory whatever the answer was, which reads as a cache that is whole
   // when it is in fact split across two directories.
@@ -605,10 +756,14 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   if (KERNEL_CACHE_ENABLED && kernel_cache_usable && !binary_data.empty()) {
     ml_logi("Using cached version of kernel: %s at path %s",
             kernel_name.c_str(), binary_read_path.c_str());
-    loaded_from_binary = program.CreateCLProgramWithBinary(
-      opencl::ContextManager::Global().GetContext(),
-      opencl::ContextManager::Global().GetDeviceId(), binary_data,
-      binary_read_path, "");
+    {
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_PROG_BIN);
+      _lt.bytes(binary_data.size());
+      loaded_from_binary = program.CreateCLProgramWithBinary(
+        opencl::ContextManager::Global().GetContext(),
+        opencl::ContextManager::Global().GetDeviceId(), binary_data,
+        binary_read_path, "");
+    }
     if (!loaded_from_binary) {
       ml_logw("Cached kernel binary %s was rejected; recompiling from source",
               binary_read_path.c_str());
@@ -632,10 +787,13 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
   } else {
     ml_logi("Binary for kernel %s not found, compiling from source...",
             kernel_name.c_str());
-    result =
-      program.CreateCLProgram(opencl::ContextManager::Global().GetContext(),
-                              opencl::ContextManager::Global().GetDeviceId(),
-                              kernel_string, compile_options);
+    {
+      nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_PROG_SRC);
+      result =
+        program.CreateCLProgram(opencl::ContextManager::Global().GetContext(),
+                                opencl::ContextManager::Global().GetDeviceId(),
+                                kernel_string, compile_options);
+    }
 
     if (KERNEL_CACHE_ENABLED && kernel_cache_usable && result) {
       // Best-effort cache write: the freshly compiled program is already
@@ -663,7 +821,10 @@ bool ClContext::clCreateKernel(std::string &kernel_string,
     program_cache.emplace(pc_key, program);
   }
 
-  result = kernel_ptr_->CreateKernelFromProgram(program, kernel_name);
+  {
+    nntrainer::load_trace::Scope _lt(nntrainer::load_trace::KRN_OBJ);
+    result = kernel_ptr_->CreateKernelFromProgram(program, kernel_name);
+  }
 
   // The program built; this NAME is not in it, or the device refused the
   // kernel object. Either way the next attempt gets the same answer.

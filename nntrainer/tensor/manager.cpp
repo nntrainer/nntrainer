@@ -32,6 +32,8 @@
 #include <unistd.h>
 #endif
 
+#include <env_compat.h>
+
 #include <activation_layer.h>
 #include <basic_planner.h>
 #include <bn_layer.h>
@@ -475,7 +477,33 @@ std::vector<Weight *> Manager::requestWeights(
           var_exec_order.push_back(std::max(lah_order, 0));
         }
       }
-      if (is_virtual) {
+      // [pool-bypass] Give QS4CX weights their own heap allocation instead of
+      // a slice of the pool's shared arena. The GPU paths consume DERIVED
+      // device forms (v8c backing / dp4a caches) built once from this payload,
+      // so after that build the plain bytes are dead weight -- but a pool slice
+      // can never be released (one arena, freed whole; SVM refuses page drops,
+      // UVM cannot decommit). A self-owned heap buffer's pages CAN be dropped
+      // in place (madvise/DiscardVirtualMemory on anon pages), keeping the
+      // pointer valid for the pointer-keyed derived caches. Reuses the proven
+      // UNMANAGED exclusion (finalize / allocate-bind skip) +
+      // QS4CX_Tensor::allocate() self-alloc. Not under FSU (its swap
+      // bookkeeping assumes pool residency).
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
+  defined(_M_IX86)
+      const bool qs4cx_heap_bypass =
+        dim_v.getDataType() == ml::train::TensorDim::DataType::QS4CX &&
+        !enable_fsu && nntr_env_on("NNTR_QS4CX_HEAP_BYPASS");
+#else
+      const bool qs4cx_heap_bypass = false;
+#endif
+      if (qs4cx_heap_bypass) {
+        // Real exec_order (graph bookkeeping like getMinMaxTensorExecutionOrder
+        // iterates it -- an empty set segfaults there); the pool exclusion is
+        // carried by UNMANAGED alone (finalize/allocate skip on lifespan).
+        var = weight_pool.request(name, dim_v, var_exec_order,
+                                  TensorLifespan::UNMANAGED, t_initializer);
+        var->allocate(); // QS4CX_Tensor::allocate(): new uint8_t[], self-owned
+      } else if (is_virtual) {
         var = weight_pool.request(name, dim_v, var_exec_order,
                                   TensorLifespan::VIRTUAL, t_initializer);
       } else {

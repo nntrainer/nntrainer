@@ -368,12 +368,24 @@ bool CommandQueueManager::EnqueueUnmapMemObject(cl_mem buffer, void *mapped_ptr,
 }
 
 bool CommandQueueManager::enqueueSVMMap(void *svm_ptr, size_t size,
-                                        bool read_only, cl_event *event) {
+                                        bool read_only, bool async,
+                                        cl_event *event) {
   // managing read/write flags
   const cl_map_flags map_flag = read_only ? CL_MAP_READ : CL_MAP_WRITE;
 
-  cl_int error_code = clEnqueueSVMMap(command_queue_, CL_TRUE, map_flag,
-                                      svm_ptr, size, 0, nullptr, nullptr);
+  // async = true makes the map non-blocking. That is sound only on an in-order
+  // queue, where the map is ordered ahead of the next operation's unmap, and
+  // only when nothing on the host touches the region before that next GPU op
+  // runs -- which is exactly the GPU-to-GPU handoff the quantized GEMM below
+  // performs. It removes a host stall that otherwise drains the queue to idle
+  // between two device operations. The default keeps the blocking behaviour
+  // every existing caller has.
+  const cl_bool blocking = async ? CL_FALSE : CL_TRUE;
+
+  // The event out-parameter was accepted and then dropped on the floor here,
+  // so a caller could never wait on the map it just enqueued. Pass it through.
+  cl_int error_code = clEnqueueSVMMap(command_queue_, blocking, map_flag,
+                                      svm_ptr, size, 0, nullptr, event);
 
   if (error_code != CL_SUCCESS) {
     ml_loge(

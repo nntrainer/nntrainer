@@ -201,6 +201,7 @@ void LoadOpenCLFunctions(void *libopencl) {
   LoadFunction(clGetPlatformIDs);
   LoadFunction(clGetDeviceIDs);
   LoadFunction(clGetDeviceInfo);
+  LoadFunction(clGetImageInfo);
   LoadFunction(clCreateContext);
   LoadFunction(clCreateCommandQueue);
   LoadFunction(clCreateBuffer);
@@ -236,11 +237,14 @@ void LoadOpenCLFunctions(void *libopencl) {
   LoadFunction(clEnqueueSVMUnmap);
   LoadFunction(clSetKernelArgSVMPointer);
   LoadFunction(clWaitForEvents);
+  LoadFunction(clReleaseEvent);
+  LoadFunction(clEnqueueBarrierWithWaitList);
 }
 
 PFN_clGetPlatformIDs clGetPlatformIDs;
 PFN_clGetDeviceIDs clGetDeviceIDs;
 PFN_clGetDeviceInfo clGetDeviceInfo;
+PFN_clGetImageInfo clGetImageInfo;
 PFN_clCreateContext clCreateContext;
 PFN_clCreateCommandQueue clCreateCommandQueue;
 PFN_clCreateBuffer clCreateBuffer;
@@ -276,4 +280,6 @@ PFN_clEnqueueSVMMap clEnqueueSVMMap;
 PFN_clEnqueueSVMUnmap clEnqueueSVMUnmap;
 PFN_clSetKernelArgSVMPointer clSetKernelArgSVMPointer;
 PFN_clWaitForEvents clWaitForEvents;
+PFN_clReleaseEvent clReleaseEvent;
+PFN_clEnqueueBarrierWithWaitList clEnqueueBarrierWithWaitList;
 } // namespace nntrainer::opencl

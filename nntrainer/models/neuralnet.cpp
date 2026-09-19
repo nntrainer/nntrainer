@@ -26,16 +26,31 @@
 #include "model_common_properties.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <compute_ops.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <load_trace.h>
+#include <mutex>
 #include <sstream>
 #include <thread>
+
+#if defined(__GLIBC__) && !defined(_WIN32)
+#include <malloc.h> // malloc_trim: return the loader's freed transients to the OS
+#endif
+
+#if !defined(_WIN32)
+#include <fcntl.h> // posix_fadvise: drop the weight file's page cache after the load
+#endif
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+#include <cuda_fc_qs4cx.h> // [wprefetch] cuda_fc_qs4cx_prefetch_weight
+#endif
 
 #include <activation_realizer.h>
 #include <adamw.h>
@@ -75,6 +90,22 @@
 
 namespace nntrainer {
 
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+// Derive-once GPU weight-pack cache
+// (tensor/cl_operations/v8c_pack_cache.h). Declared here rather than included
+// so this file stays free of the OpenCL headers; only these two calls, both
+// of which take plain arguments, are needed from the loader.
+namespace v8c_pack {
+void set_source(const char *model_bin_path);
+void load_complete();
+} // namespace v8c_pack
+// Submit-and-go upload staging queued by the v8c weight build
+// (tensor/cl_operations/blas_kernels.h). Declared here for the same reason.
+void v8c_flush_pending_uploads();
+void v8c_flush_aux_arena();
+void v8c_open_aux_arena();
+#endif
+
 namespace {
 
 Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
@@ -91,6 +122,7 @@ Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
   case TensorDim::DataType::UINT4:
   case TensorDim::DataType::QINT8:
   case TensorDim::DataType::QINT4:
+  case TensorDim::DataType::QS4CX:
   case TensorDim::DataType::Q4_K:
   case TensorDim::DataType::Q6_K:
   case TensorDim::DataType::Q4_0:
@@ -256,6 +288,16 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   }
 #endif
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  bool has_cuda_engine = false;
+  for (auto &node : graph_representation) {
+    if (node->isComputeEngineCUDA()) {
+      has_cuda_engine = true;
+      break;
+    }
+  }
+#endif
+
   model_graph =
     NetworkGraph(fsu, mode, fsu_path, lookahead, tensor_format, tensor_type);
 
@@ -279,6 +321,22 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   // in and a copy out, whatever the planner decided.
   else if (has_gpu_engine)
     model_graph.setComputeBackend("gpu", "gpu");
+#endif
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // Same argument for a graph with a CUDA layer in it: the CUDA allocator hands
+  // out Unified Memory (cudaMallocManaged), addressable by host and device
+  // alike, which is what lets CudaComputeOps::fc take its device arms at all.
+  // Without this the pools stay on plain host memory, dev_accessible() is false
+  // for input, weight and output, every device arm declines, and the FC falls
+  // to the host Tensor::dot -- which has no QS4CX/int4 implementation, so a
+  // quantized model does not merely run slowly on engine=cuda, it throws
+  // "unsupported datatype" on its first FC.
+  // NNTR_CUDA_UVM_POOL=0 forces the host allocator back (correct, host-only).
+  else if (has_cuda_engine) {
+    const char *uvm = std::getenv("NNTR_CUDA_UVM_POOL");
+    if (!(uvm != nullptr && uvm[0] == '0'))
+      model_graph.setComputeBackend("cuda", "cuda");
+  }
 #endif
 
   // QNN activation tensors are rpcmem-backed and registered with the DSP, so
@@ -1013,6 +1071,11 @@ void NeuralNetwork::load(const std::string &file_path,
   /// @todo this switch case should be delegating the function call only. It's
   /// not delegating for now as required logics are manageable for now.
 
+  // [load-trace] The record walk below is the one single-threaded stretch
+  // ahead of the worker fan-out; time it separately so a slow header parse
+  // cannot hide inside the load's wall clock.
+  const auto _lt_load_t0 = std::chrono::steady_clock::now();
+
   bool fsu_mode = std::get<props::Fsu>(model_flex_props);
 
   const std::regex reg_("\\s*\\;\\s*");
@@ -1054,6 +1117,12 @@ void NeuralNetwork::load(const std::string &file_path,
     }
   }
 
+  nntrainer::load_trace::add(
+    nntrainer::load_trace::PRESCAN,
+    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - _lt_load_t0)
+      .count());
+
   if (exec_mode == ExecutionMode::INFERENCE && fsu_mode) {
     model_graph.setFsuWeightPath((v.size() == 2) ? v[1] : v[0]);
     model_graph.setWeightOffset(file_offset);
@@ -1083,6 +1152,22 @@ void NeuralNetwork::load(const std::string &file_path,
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open file : " << f_path;
 
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+      // Bind the derive-once GPU weight-pack cache to this weight file, by
+      // file identity (size and modification time). Either maps a pack the
+      // load workers below can consume, or arms a one-time rewrite. A no-op
+      // when the cache is opted out of, and on every non-OpenCL build.
+      {
+        nntrainer::load_trace::Scope _lt(nntrainer::load_trace::PACK_OPEN);
+        v8c_pack::set_source(f_path.c_str());
+      }
+      // Open the shared device arena the per-weight scale/row-sum pairs are
+      // carved from. It stays open until the flush at the end of this load,
+      // which is the only thing that guarantees a staged chunk reaches the
+      // device; outside that window every carve writes itself.
+      v8c_open_aux_arena();
+#endif
+
       // Load weights with bounded thread number not to exceed mmap limits
       constexpr size_t MAX_LOAD_THREADS = 8;
       std::vector<std::shared_ptr<LayerNode>> load_nodes(model_graph.cbegin(),
@@ -1091,7 +1176,65 @@ void NeuralNetwork::load(const std::string &file_path,
       const size_t num_load_threads =
         std::min<size_t>(num_load_nodes, MAX_LOAD_THREADS);
 
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+      // [wprefetch level 2] NNTR_CUDA_WPREFETCH>=2 on a cuda graph: migrate
+      // each QS4CX weight's plain payload to the device AS IT IS READ, so the
+      // FC bytes never accumulate in host RSS during the load. Opt-in and
+      // default-off: the migration only has anything to move when the payload
+      // is in managed memory, and cuda_fc_qs4cx_prefetch_weight declines
+      // otherwise. The engine gate keeps this off OpenCL/CPU runs of a
+      // dual-enabled binary, where a stray CUDA call would create a CUDA
+      // context. Scale conversion at the first forward briefly faults the
+      // small fp32-scale tail back -- expected, and tiny.
+      bool cuda_wprefetch_load = false;
+      {
+        static const int _wpf = []() {
+          const char *e = std::getenv("NNTR_CUDA_WPREFETCH");
+          return e ? atoi(e) : 0;
+        }();
+        if (_wpf >= 2)
+          for (auto &n : load_nodes)
+            if (n->isComputeEngineCUDA()) {
+              cuda_wprefetch_load = true;
+              break;
+            }
+      }
+#endif
+
       std::atomic<size_t> next_load_index{0};
+
+#if !defined(_WIN32)
+      // [page cache] Load-mapping reaper. Each worker maps the WHOLE weight
+      // file and drops it only when its node is done, so at any instant the
+      // resident file pages are (workers) x (one node's weights) -- measured
+      // on gemma4 E2B / Adreno 840 as ~190 MiB of the 1 520 MiB RssFile peak,
+      // and the peak is the load, not the steady state.
+      //
+      // The drop is nearly free here and that is the point: the mapping is
+      // read-only MAP_PRIVATE, so MADV_DONTNEED only tears down THIS process's
+      // PTEs. The bytes stay in the page cache, so a page the reader still
+      // wants comes back as a MINOR fault, not a trip to flash. Reaping every
+      // few milliseconds therefore bounds the resident window without turning
+      // the streaming read back into the fault-per-page disaster
+      // POSIX_MADV_RANDOM used to make of it.
+      //
+      // NNTR_LOAD_REAP_MS sets the period; 0 turns the reaper off and restores
+      // the previous drop-at-node-end behaviour exactly.
+      static const int reap_ms = []() {
+        const char *e = std::getenv("NNTR_LOAD_REAP_MS");
+        const int v = (e != nullptr) ? std::atoi(e) : 20;
+        return (v > 0) ? v : 0;
+      }();
+      std::mutex reap_mtx;
+      std::vector<std::pair<void *, size_t>> reap_live;
+      std::atomic<bool> reap_stop{false};
+#endif
+
+      // Serializes weight_load_hook invocations across the load workers: the
+      // hook body may run parallel_for derives and device uploads of its own,
+      // and the interleave's win is overlapping THAT work with the other
+      // workers' file reads -- not running several hook bodies at once.
+      std::mutex load_hook_mtx;
 
       auto load_worker = [&]() {
         for (size_t idx =
@@ -1134,41 +1277,133 @@ void NeuralNetwork::load(const std::string &file_path,
             CloseHandle(hFile);
 #else
             // POSIX: map per-task, advise kernel, drop pages, unmap
-            int fd = ::open(f_path.c_str(), O_RDONLY);
-            NNTR_THROW_IF((fd == -1), std::invalid_argument)
-              << "Cannot open file : " << f_path;
+            size_t f_size = 0;
+            void *mmap_ptr = nullptr;
+            {
+              nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MAP);
+              int fd = ::open(f_path.c_str(), O_RDONLY);
+              NNTR_THROW_IF((fd == -1), std::invalid_argument)
+                << "Cannot open file : " << f_path;
 
-            struct stat st {};
-            NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
-              << "Cannot get file info (fstat): " << f_path;
+              struct stat st {};
+              NNTR_THROW_IF((::fstat(fd, &st) == -1), std::invalid_argument)
+                << "Cannot get file info (fstat): " << f_path;
 
-            size_t f_size = static_cast<size_t>(st.st_size);
-            void *mmap_ptr =
-              ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
-            ::close(fd); // fd not needed after mmap
-            NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
-              << "mmap failed";
+              f_size = static_cast<size_t>(st.st_size);
+              mmap_ptr = ::mmap(nullptr, f_size, PROT_READ, MAP_PRIVATE, fd, 0);
+              ::close(fd); // fd not needed after mmap
+              NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
+                << "mmap failed";
+            }
 
-            // Hint: many model loads touch scattered regions -> RANDOM helps
-            // reduce readahead
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+            // A node's weights are one contiguous run and the nodes are
+            // handed out by an atomic counter, so this walks the file front to
+            // back -- it is a streaming read, not a scattered one. RANDOM was
+            // the advice here, and it turns off BOTH kernel readahead AND
+            // fault-around, which makes every 4 KiB page its own synchronous
+            // flash trip at queue depth 1. Measured on Adreno 840 with a
+            // 3.17 GiB weight file: 830 803 major faults for 830 767 file
+            // pages (every page faulted exactly once, nothing re-read) moving
+            // 176 MB/s, on a device that reads the same file at 2.2-2.5 GB/s.
+            // SEQUENTIAL restores the readahead window and adds drop-behind,
+            // which also bounds the page-cache footprint of the load.
+            {
+              nntrainer::load_trace::Scope _lt(nntrainer::load_trace::MADV);
+              (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_SEQUENTIAL);
+            }
+
+            // Publish the mapping to the reaper for the duration of the read.
+            if (reap_ms > 0) {
+              std::lock_guard<std::mutex> reap_lk(reap_mtx);
+              reap_live.emplace_back(mmap_ptr, f_size);
+            }
 
             char *view = static_cast<char *>(mmap_ptr);
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+            {
+              nntrainer::load_trace::Scope _lt(
+                nntrainer::load_trace::NODE_READ);
+              node->read(view, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            }
 
-            // Early drop: pages no longer needed; helps lower peak RSS during
-            // overlap
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
+            // Retract it BEFORE the unmap below, so the reaper can never
+            // advise a region this worker has already given back.
+            if (reap_ms > 0) {
+              std::lock_guard<std::mutex> reap_lk(reap_mtx);
+              for (auto it = reap_live.begin(); it != reap_live.end(); ++it)
+                if (it->first == mmap_ptr) {
+                  reap_live.erase(it);
+                  break;
+                }
+            }
 
-            ::munmap(mmap_ptr, f_size);
+            // Early drop: pages no longer needed; bounds peak RSS during the
+            // overlap. NOTE posix_madvise(POSIX_MADV_DONTNEED) is a documented
+            // NO-OP in glibc -- it validates its arguments and returns 0
+            // without freeing a page -- so the raw madvise is required for the
+            // drop to actually happen. The mapping is read-only MAP_PRIVATE,
+            // so dropped pages simply re-fault from the page cache if touched
+            // again: bytes read are identical either way.
+            {
+              nntrainer::load_trace::Scope _lt(nntrainer::load_trace::DROP);
+              (void)::madvise(mmap_ptr, f_size, MADV_DONTNEED);
+
+              ::munmap(mmap_ptr, f_size);
+            }
 #endif
+          }
+
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+          if (cuda_wprefetch_load) {
+            for (unsigned int wi = 0; wi < node->getNumWeights(); ++wi) {
+              nntrainer::Tensor &wt = node->getWeight(wi);
+              if (wt.getDataType() == ml::train::TensorDim::DataType::QS4CX)
+                (void)nntrainer::cuda::cuda_fc_qs4cx_prefetch_weight(
+                  wt.getData<uint8_t>(), wt.width(), wt.height());
+            }
+          }
+#endif
+
+          // [load-drop interleave] this node's weight bytes (payload + any
+          // trailing scales) are fully materialized in their final tensor
+          // storage -- on BOTH the stream and the mmap arm above: hand the
+          // node to the registered per-weight hook NOW, so derived-cache
+          // builds and plain-payload drops overlap the other workers' reads
+          // instead of waiting for the join. Failures are contained -- the
+          // application's post-load sweep is the fallback for anything the
+          // hook missed.
+          if (weight_load_hook) {
+            std::lock_guard<std::mutex> hook_lk(load_hook_mtx);
+            try {
+              weight_load_hook(*node, node->getRunContext(),
+                               weight_load_hook_data);
+            } catch (const std::exception &e) {
+              ml_logw("weight-load hook failed on node %s: %s",
+                      node->getName().c_str(), e.what());
+            } catch (...) {
+              ml_logw("weight-load hook failed on node %s (non-std exception)",
+                      node->getName().c_str());
+            }
           }
         }
       };
 
       std::vector<std::thread> threads;
       threads.reserve(num_load_threads);
+#if !defined(_WIN32)
+      std::thread reaper;
+      if (reap_ms > 0)
+        reaper = std::thread([&]() {
+          while (!reap_stop.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(reap_ms));
+            std::lock_guard<std::mutex> reap_lk(reap_mtx);
+            for (auto &e : reap_live)
+              (void)::madvise(e.first, e.second, MADV_DONTNEED);
+          }
+        });
+#endif
+      const auto _lt_fanout_t0 = std::chrono::steady_clock::now();
       for (size_t t = 0; t < num_load_threads; ++t) {
         threads.emplace_back(load_worker);
       }
@@ -1176,6 +1411,98 @@ void NeuralNetwork::load(const std::string &file_path,
         if (t.joinable())
           t.join();
       }
+      nntrainer::load_trace::add(
+        nntrainer::load_trace::WALL,
+        (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - _lt_fanout_t0)
+          .count());
+#if !defined(_WIN32)
+      reap_stop.store(true, std::memory_order_relaxed);
+      if (reaper.joinable())
+        reaper.join();
+#endif
+
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+      // Every load-time weight pack has committed its record by now: finalize
+      // a pending rewrite off-thread, so writing the pack costs the load
+      // nothing. The writer is joined at exit.
+      v8c_pack::load_complete();
+
+      // The v8c build hands each non-blocking chunk upload's host staging to
+      // a registry that the NEXT prebuild drains -- so the last builds of the
+      // load are never drained by anything, and their staging stays resident
+      // for the life of the process. Measured on an Adreno 840 handset with
+      // gemma4 E2B: five 9.0 MiB staging vectors, 45.0 MiB, still fully
+      // resident in the middle of decode and visible in smaps as
+      // `[anon:scudo:secondary]` blocks of exactly N x v8c_row_bytes. Drain
+      // them here, where the load -- and therefore every prebuild -- is over.
+      // Waiting is free at this point: the uploads were enqueued on an
+      // in-order queue long ago and completed while the rest of the load ran.
+      v8c_flush_pending_uploads();
+
+      // The per-weight scale/row-sum pairs are carved out of a shared device
+      // arena and staged host-side while the load runs, so the model's aux
+      // plane costs a handful of transfers instead of one per weight. Write
+      // the chunk still open and seal the arena: after this a weight built
+      // lazily at its first dispatch writes its own pair, so nothing can read
+      // an aux buffer whose bytes have not landed.
+      v8c_flush_aux_arena();
+#endif
+
+#if !defined(_WIN32)
+      // [page cache] The per-node madvise(MADV_DONTNEED) above drops this
+      // process's PTEs; it does not touch the SYSTEM page cache the read
+      // filled. A 1.09 GiB weight pack therefore leaves 1.09 GiB of `Cached`
+      // behind for the rest of the process, and the load also evicted whatever
+      // was there before it. posix_fadvise(DONTNEED) hands those clean pages
+      // back to the free list now that every weight is materialized in its
+      // tensor storage.
+      //
+      // It is non-destructive by construction -- the pages are clean and
+      // file-backed, so any later reader (an FSU/slim tensor's on-demand mmap
+      // through this same fd) re-reads identical bytes, it just pays the trip.
+      // FSU is excluded anyway, since there the file IS the weight store.
+      //
+      // MEASURED AND NOT ADOPTED AS A DEFAULT (Adreno 840, gemma4 E2B):
+      // it returns 1.09 GiB of `Cached` and moves nothing a
+      // caller can spend. VmHWM, RssFile peak and the MemAvailable drawdown
+      // are all unchanged -- 1 772.8 / 1 525.3 / 1 749.9 MiB against the
+      // control's 1 771.3 / 1 523.9 / 1 763.6 -- because clean page cache
+      // already counts as available memory. What it does change is the next
+      // load of the same pack, which is now cold: init 1 237 ms median
+      // against the control's 788 ms. So it is OFF unless
+      // NNTR_LOAD_FADV_DROP=1 asks for it, which is the right arm for a
+      // one-shot process on a memory-tight system that will not load the same
+      // model again.
+      {
+        static const bool fadv_drop = []() {
+          const char *e = std::getenv("NNTR_LOAD_FADV_DROP");
+          return (e != nullptr && e[0] == '1');
+        }();
+        if (fadv_drop && !fsu_mode && model_file_fd >= 0)
+          (void)::posix_fadvise(model_file_fd, 0, 0, POSIX_FADV_DONTNEED);
+      }
+#endif
+
+#if defined(__GLIBC__) && !defined(_WIN32)
+      // Give the loader's freed transients (staging vectors, per-chunk derive
+      // buffers) back to the OS: glibc keeps brk/arena tops cached after
+      // free(), so they stay in this process's RSS until a trim. One call, at
+      // the end of the positional load -- past the worker join above, and past
+      // any per-weight cache build that ran inside the load, so the trim sees
+      // everything the load transiently allocated. Opt out with
+      // NNTR_MALLOC_TRIM=0.
+      {
+        static const bool malloc_trim_on = []() {
+          const char *e = std::getenv("NNTR_MALLOC_TRIM");
+          return !(e != nullptr && e[0] == '0');
+        }();
+        if (malloc_trim_on)
+          ::malloc_trim(0);
+      }
+#endif
+
+      nntrainer::load_trace::dump("model->load_weight");
 
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
@@ -1374,7 +1701,10 @@ void NeuralNetwork::load(const std::string &file_path,
             NNTR_THROW_IF((mmap_ptr == MAP_FAILED), std::runtime_error)
               << "mmap failed for safetensors file: " << f_path;
 
-            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
+            // Streaming read, not a scattered one -- see the sibling site
+            // in the positional .bin arm above for the fault census that
+            // retired POSIX_MADV_RANDOM here.
+            (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_SEQUENTIAL);
 
             char *view = static_cast<char *>(mmap_ptr);
             node->read(view, false, exec_mode, fsu_mode,

@@ -46,6 +46,11 @@ typedef cl_int(CL_API_CALL *PFN_clGetDeviceInfo)(
   size_t /**< param_value_size */, void * /**< param_value */,
   size_t * /**< param_value_size_ret */);
 
+typedef cl_int(CL_API_CALL *PFN_clGetImageInfo)(
+  cl_mem /**< image */, cl_image_info /**< param_name */,
+  size_t /**< param_value_size */, void * /**< param_value */,
+  size_t * /**< param_value_size_ret */);
+
 typedef cl_context(CL_API_CALL *PFN_clCreateContext)(
   const cl_context_properties * /**< properties */, cl_uint /**< num_devices */,
   const cl_device_id * /**< devices */,
@@ -222,9 +227,17 @@ typedef cl_int(CL_API_CALL *PFN_clEnqueueSVMUnmap)(
 typedef cl_int(CL_API_CALL *PFN_clWaitForEvents)(cl_uint num_events,
                                                  const cl_event *event_list);
 
+typedef cl_int(CL_API_CALL *PFN_clReleaseEvent)(cl_event /**< event */);
+
+typedef cl_int(CL_API_CALL *PFN_clEnqueueBarrierWithWaitList)(
+  cl_command_queue /**< command_queue */,
+  cl_uint /**< num_events_in_wait_list */,
+  const cl_event * /**< event_wait_list */, cl_event * /**< event */);
+
 extern PFN_clGetPlatformIDs clGetPlatformIDs;
 extern PFN_clGetDeviceIDs clGetDeviceIDs;
 extern PFN_clGetDeviceInfo clGetDeviceInfo;
+extern PFN_clGetImageInfo clGetImageInfo;
 extern PFN_clCreateContext clCreateContext;
 extern PFN_clCreateCommandQueue clCreateCommandQueue;
 extern PFN_clCreateBuffer clCreateBuffer;
@@ -260,6 +273,8 @@ extern PFN_clEnqueueSVMMap clEnqueueSVMMap;
 extern PFN_clEnqueueSVMUnmap clEnqueueSVMUnmap;
 extern PFN_clSetKernelArgSVMPointer clSetKernelArgSVMPointer;
 extern PFN_clWaitForEvents clWaitForEvents;
+extern PFN_clReleaseEvent clReleaseEvent;
+extern PFN_clEnqueueBarrierWithWaitList clEnqueueBarrierWithWaitList;
 } // namespace nntrainer::opencl
 
 #endif // __OPENCL_LOADER_H__

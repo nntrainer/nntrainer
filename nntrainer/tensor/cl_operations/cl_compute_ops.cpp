@@ -35,10 +35,11 @@
  *   -> nntrainer::gemm_q4_0_async_cl(...) -> OpenCL kernel queue.
  */
 
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
-#include <blas_kernel_interface.h> // add_i_cl, dotCl
+#include <blas_kernel_interface.h> // add_i_cl, dotCl, dotCl_v8c
 #include <blas_kernels.h>
 #include <common_properties.h> // ActivationType, the act_type int encoding
 #include <compute_ops.h>
@@ -50,6 +51,10 @@
 
 namespace nntrainer {
 
+/**
+ * @brief OpenCL ComputeOps table: the accelerator-backed subset of the
+ *        ComputeOps interface, dispatched through ClContext's ContextData.
+ */
 class ClComputeOps : public ComputeOps {
 public:
   // ── Accelerator-only Q4_0 / INT4 GEMM/GEMV ────────────────
@@ -117,8 +122,48 @@ public:
   // other three shapes and like the whole FP16 branch. Do not add a zero-fill
   // here to paper over it: that would cost a full-output memset on every
   // forward for one transitional branch.
+  //
+  // A quantized weight goes to the v8c int8xint4 GEMM first. dotCl_v8c
+  // returns false rather than throwing when it declines the call (the weight
+  // is not int4, the shape is outside what the kernel covers, or the path is
+  // switched off), so the fallbacks below stay reachable: a quantized weight
+  // the kernel declined is dotted on the host, and everything else keeps the
+  // dotCl route this layer has always used.
   void fc(Tensor &input, Tensor &weight, Tensor &output) override {
-    nntrainer::dotCl(input, weight, output);
+    if (nntrainer::dotCl_v8c(input, weight, output))
+      return;
+
+    // The v8c GEMM produces its output; the fallbacks below accumulate into
+    // theirs, so zero it here and only here.
+    output.setZero();
+
+    switch (weight.getDataType()) {
+    case ml::train::TensorDim::DataType::QINT4:
+    case ml::train::TensorDim::DataType::QS4CX:
+    case ml::train::TensorDim::DataType::Q4_0:
+    case ml::train::TensorDim::DataType::Q4_K:
+    case ml::train::TensorDim::DataType::Q6_K:
+      // A quantized weight has no GPU kernel once v8c declines it: dispatch
+      // the host dot, which knows every quantization the CPU backend does.
+      input.dot(weight, output, false, false);
+      break;
+    default:
+      nntrainer::dotCl(input, weight, output);
+      break;
+    }
+  }
+
+  // Build the device-side v8c backing for this weight at load time, so the
+  // first prefill does not pay the one-time repack. A no-op when the weight
+  // is not one the v8c GEMM can take.
+  void fc_prebuild_weight(Tensor &weight) override {
+    nntrainer::dotCl_v8c_prebuild_weight(weight);
+  }
+
+  // Same build, sourcing the nibbles from the loader's file mapping so the
+  // plain payload is never copied into the tensor (see the header).
+  bool fc_prebuild_weight_from(Tensor &weight, const void *src) override {
+    return nntrainer::dotCl_v8c_prebuild_weight_from(weight, src);
   }
 
   // The fused activation epilogue, which the fully-connected layer applies to

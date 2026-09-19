@@ -10,7 +10,9 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <cstdlib>
 #include <fc_layer_cl.h>
+#include <variant>
 
 #include <limits>
 
@@ -253,8 +255,61 @@ void FullyConnectedLayerCl::read(ReadSource src, RunLayerContext &run_context,
                                  TensorDim::DataType defineWeightDataType,
                                  bool fsu, size_t start_offset,
                                  bool read_from_offset, int file_fd) {
+  // [zero-copy weight load] When the loader reads through a MAPPING of the
+  // weight file and the backend can build this QS4CX weight's device backing
+  // straight from those bytes, the copy into the tensor is a second full
+  // plane of the model that nothing ever reads: on an Adreno 840 handset
+  // running gemma4 E2B it is 1.09 GiB memcpy'd into freshly faulted anonymous
+  // pages, and it is 62% of the weight load's wall clock. Skip it, take only
+  // the scale tail, and build from the mapping. NNTR_LOAD_ZEROCOPY=0 opts out.
+  //
+  // The mapping is alive for exactly this call (the loader unmaps it when the
+  // node is done), which is why the build has to happen here and not later.
+  // The default is tied to NNTR_V8C_DROP_PLAIN rather than being ON
+  // everywhere, because it rests on exactly the same fact: that on this lane
+  // every QS4CX FC is dispatched by the v8c path, so the host FC fallback --
+  // the one reader of the payload -- is unreachable in a healthy run. Where
+  // that has been measured, DROP_PLAIN is already on (ClContext turns the
+  // pair on for Adreno) and skipping the copy is strictly better than making
+  // it and then madvising it away. Where it has not, the copy stays.
+  // NNTR_LOAD_ZEROCOPY=1/0 overrides either way.
+  static const bool zerocopy_on = []() {
+    const char *e = std::getenv("NNTR_LOAD_ZEROCOPY");
+    if (e != nullptr)
+      return e[0] != '0';
+    const char *d = std::getenv("NNTR_V8C_DROP_PLAIN");
+    return d != nullptr && d[0] == '1';
+  }();
+  const char *const *mapping = std::get_if<const char *>(&src);
+  Tensor *zc_w = nullptr;
+  if (zerocopy_on && !opt_var && !fsu && read_from_offset && mapping &&
+      *mapping) {
+    Tensor &w = run_context.getWeight(weight_idx[FCParams::weight]);
+    // The shape gate mirrors the backend's own: a weight it would decline
+    // must not have its payload skipped in the first place.
+    if (w.getDataType() == TensorDim::DataType::QS4CX && w.width() % 8 == 0 &&
+        w.height() % 32 == 0) {
+      zc_w = &w;
+      w.setQs4cxScaleOnlyRead(true);
+    }
+  }
+
   Layer::read(src, run_context, opt_var, mode, trainable, defineWeightDataType,
               fsu, start_offset, read_from_offset, file_fd);
+
+  if (zc_w) {
+    zc_w->setQs4cxScaleOnlyRead(false);
+    const uint8_t *nibbles =
+      reinterpret_cast<const uint8_t *>(*mapping) + zc_w->getFileOffset();
+    if (zc_w->getOps()->fc_prebuild_weight_from(*zc_w, nibbles))
+      return;
+    // The backend declined after all: pay the copy now, from the same
+    // mapping, and fall through to the ordinary prebuild. Nothing has read
+    // the payload in between.
+    zc_w->read(src, std::numeric_limits<size_t>::max(), read_from_offset,
+               file_fd);
+  }
+
   if (!opt_var && !fsu) {
     Tensor &w = run_context.getWeight(weight_idx[FCParams::weight]);
     w.getOps()->fc_prebuild_weight(w);
