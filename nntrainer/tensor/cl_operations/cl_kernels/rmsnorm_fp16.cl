@@ -19,7 +19,7 @@ __kernel void
 rmsnorm_cl_fp16(__global const half *input, // Input tensor
                 __global half *output,      // Output tensor
                 __global const half *alpha, // Alpha values (one for each width)
-                half epsilon,
+                float epsilon,
                 int B, // Number of batches
                 int C, // Number of channels
                 int H, // Height of feature map
@@ -66,7 +66,7 @@ RMSN_SG_ATTR
 __attribute__((reqd_work_group_size(RMSN_LWS, 1, 1)))
 __kernel void rmsnorm_cl_fp16_coop(__global const half *input,
                                    __global half *output,
-                                   __global const half *alpha, half epsilon,
+                                   __global const half *alpha, float epsilon,
                                    int n_rows, int W) {
   const int row = get_group_id(0);
   const int tid = get_local_id(0);
@@ -132,7 +132,7 @@ __kernel void rmsnorm_cl_fp16_coop(__global const half *input,
 __attribute__((reqd_work_group_size(RMSN_LWS, 1, 1)))
 __kernel void rmsnorm_cl_fp16_coop_ng(__global const half *input,
                                       __global half *output,
-                                      __global const half *alpha, half epsilon,
+                                      __global const half *alpha, float epsilon,
                                       int n_rows, int W) {
   const int row = get_group_id(0);
   const int tid = get_local_id(0);
@@ -180,7 +180,7 @@ __attribute__((reqd_work_group_size(RMSN_LWS, 1, 1)))
 __kernel void rms_reverse_norm_cl_fp16_coop(__global const half *input,
                                             __global half *output,
                                             __global const half *weight,
-                                            half out_scale, half epsilon,
+                                            half out_scale, float epsilon,
                                             int n_rows, int W) {
   const int row = get_group_id(0);
   const int tid = get_local_id(0);
@@ -244,7 +244,7 @@ __kernel void rms_reverse_norm_cl_fp16_coop(__global const half *input,
 #define RMSNQ_LWS_MAX 256
 __kernel void rmsnorm_cl_fp16_coop_q(__global const half *input,
                                      __global half *output,
-                                     __global const half *alpha, half epsilon,
+                                     __global const half *alpha, float epsilon,
                                      int n_rows, int W,
                                      __global char *act_int8,
                                      __global float *scale_per_row,

@@ -180,12 +180,13 @@ void RMSNormLayerGPU::incremental_forwarding(
       (fused_add && clmem_ok && resid->isClMem() && resid->getClMem())
         ? resid->getClMem()
         : nullptr;
-    // FP16 epsilon underflow guard: a typical rms_norm_eps of 1e-6 rounds to
-    // zero in FP16 (the smallest normal is ~6e-5), so a near-zero activation
-    // row gets 1/rms = inf and overflows to NaN. Floor epsilon to an
-    // FP16-representable value; that is mathematically negligible for a normal
-    // row, whose mean square is far larger than epsilon.
-    const float eps16 = epsilon < 1.0e-4f ? 1.0e-4f : epsilon;
+    // epsilon goes to the kernel as the float the model configured. It used to
+    // be floored to 1e-4 here so that it survived a `half` kernel argument, but
+    // that is not "negligible for a normal row": a model whose embedding rows
+    // have a mean square near 2e-4 (rms ~0.014) got its first norms scaled by
+    // up to 17%, which no other backend did. The kernels reduce in float and
+    // now take a float epsilon, so a zero row still yields 0 * rsqrt(eps) = 0.
+    const float eps_k = epsilon;
     for (unsigned int b = 0; b < b_size; ++b) {
       _FP16 *in_p = in.getData<_FP16>() + (size_t)b * in_dim.getFeatureLen();
       _FP16 *out_p = out.getData<_FP16>() + (size_t)b * out_dim.getFeatureLen();
@@ -193,14 +194,14 @@ void RMSNormLayerGPU::incremental_forwarding(
         _FP16 *resid_p =
           resid->getData<_FP16>() + (size_t)b * resid->getDim().getFeatureLen();
         if (!nntrainer::rmsnorm_add_cl_fp16(in_p, gamma_p, resid_p, out_p,
-                                            eps16, H, W, use_svm, out_cl, in_cl,
+                                            eps_k, H, W, use_svm, out_cl, in_cl,
                                             resid_cl))
           throw std::runtime_error(
             "RMSNormLayerGPU: the fused norm+add dispatch was refused; it "
             "needs "
             "an SVM activation plane and a width that is a multiple of 8");
       } else {
-        nntrainer::rmsnorm_cl_fp16(in_p, gamma_p, out_p, eps16, H, W, use_svm,
+        nntrainer::rmsnorm_cl_fp16(in_p, gamma_p, out_p, eps_k, H, W, use_svm,
                                    out_cl, in_cl);
       }
     }

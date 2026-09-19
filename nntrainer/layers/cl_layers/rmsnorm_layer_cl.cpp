@@ -184,11 +184,10 @@ void RMSNormLayerCl::rmsnormProcess_fp16(Tensor const &input, Tensor &result,
       break;
     }
 
-    // epsilon is a float; the kernel arg is half, so convert it. Passing the
-    // low 2 bytes of the float as a half gave a wrong epsilon.
-    const _FP16 epsilon_h = static_cast<_FP16>(epsilon);
-    ret =
-      kernel_rmsnorm_ptr->SetKernelArguments(3, &epsilon_h, sizeof(cl_half));
+    // The fp16 kernel takes epsilon as a float: a half cannot hold a typical
+    // rms_norm_eps (1e-5 / 1e-6 are subnormal there).
+    const float epsilon_f = epsilon;
+    ret = kernel_rmsnorm_ptr->SetKernelArguments(3, &epsilon_f, sizeof(float));
     if (!ret) {
       break;
     }

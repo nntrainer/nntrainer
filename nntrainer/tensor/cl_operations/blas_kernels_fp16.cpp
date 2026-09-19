@@ -172,7 +172,7 @@ __attribute__((reqd_work_group_size(64, 1, 1)))
 __kernel void rmsnorm_cl_fp16_coop_add(__global const half *input,
                                        __global half *output,
                                        __global const half *alpha,
-                                       half epsilon, int n_rows, int W,
+                                       float epsilon, int n_rows, int W,
                                        __global const half *residual) {
   const int row = get_group_id(0);
   const int tid = get_local_id(0);   // 0..63
@@ -225,9 +225,9 @@ bool rmsnorm_add_cl_fp16(const _FP16 *input, const _FP16 *gamma,
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
   if (!blas_cc)
     return false;
-  cl_half eps_h = 0;
-  const _FP16 eps_f = static_cast<_FP16>(epsilon);
-  std::memcpy(&eps_h, &eps_f, sizeof(cl_half));
+  // epsilon is bound as a float: the kernels already reduce in float, and a
+  // half cannot hold a typical rms_norm_eps (1e-5 / 1e-6 are subnormal there).
+  const float eps_arg = epsilon;
   cl_mem out_cl = static_cast<cl_mem>(out_clmem);
   cl_mem in_cl = static_cast<cl_mem>(in_clmem);
   cl_mem resid_cl = static_cast<cl_mem>(resid_clmem);
@@ -244,7 +244,7 @@ bool rmsnorm_add_cl_fp16(const _FP16 *input, const _FP16 *gamma,
   bool a1 = out_cl ? kp->SetKernelArguments(1, &out_cl, sizeof(cl_mem))
                    : kp->SetKernelSVMArguments(1, result);
   bool a2 = kp->SetKernelSVMArguments(2, const_cast<_FP16 *>(gamma));
-  bool a3 = kp->SetKernelArguments(3, &eps_h, sizeof(cl_half));
+  bool a3 = kp->SetKernelArguments(3, &eps_arg, sizeof(float));
   bool a4 = kp->SetKernelArguments(4, &n_rows, sizeof(int));
   bool a5 = kp->SetKernelArguments(5, &w, sizeof(int));
   bool a6 = resid_cl
@@ -265,9 +265,9 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
 
-  cl_half eps_h = 0;
-  const _FP16 eps_f = static_cast<_FP16>(epsilon);
-  std::memcpy(&eps_h, &eps_f, sizeof(cl_half));
+  // epsilon is bound as a float: the kernels already reduce in float, and a
+  // half cannot hold a typical rms_norm_eps (1e-5 / 1e-6 are subnormal there).
+  const float eps_arg = epsilon;
   const size_t in_bytes = (size_t)height * width * sizeof(_FP16);
 
   // Device-resident binding: when out_clmem is set the normed output goes to
@@ -322,7 +322,7 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
             ok = ok && kq->SetKernelSVMArguments(0, const_cast<_FP16 *>(input));
           ok = ok && kq->SetKernelArguments(1, &out_cl, sizeof(cl_mem)) &&
                kq->SetKernelSVMArguments(2, const_cast<_FP16 *>(gamma)) &&
-               kq->SetKernelArguments(3, &eps_h, sizeof(cl_half)) &&
+               kq->SetKernelArguments(3, &eps_arg, sizeof(float)) &&
                kq->SetKernelArguments(4, &n_rows, sizeof(int)) &&
                kq->SetKernelArguments(5, &w, sizeof(int)) &&
                kq->SetKernelArguments(6, &i8, sizeof(cl_mem)) &&
@@ -406,7 +406,7 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
             sizeof(cl_mem)))
         return;
     }
-    if (!kp->SetKernelArguments(3, &eps_h, sizeof(cl_half)) ||
+    if (!kp->SetKernelArguments(3, &eps_arg, sizeof(float)) ||
         !kp->SetKernelArguments(4, &n_rows, sizeof(int)) ||
         !kp->SetKernelArguments(5, &w, sizeof(int)))
       return;
@@ -445,7 +445,7 @@ void rmsnorm_cl_fp16(const _FP16 *input, const _FP16 *gamma, _FP16 *result,
                                   sizeof(cl_mem)))
         return;
     }
-    if (!kp->SetKernelArguments(3, &eps_h, sizeof(cl_half)) ||
+    if (!kp->SetKernelArguments(3, &eps_arg, sizeof(float)) ||
         !kp->SetKernelArguments(4, &b, sizeof(int)) ||
         !kp->SetKernelArguments(5, &c, sizeof(int)) ||
         !kp->SetKernelArguments(6, &h, sizeof(int)) ||
@@ -485,9 +485,9 @@ void rms_reverse_norm_cl_fp16(const _FP16 *input, const _FP16 *weight,
   auto *blas_cc =
     static_cast<ClContext *>(Engine::Global().getRegisteredContext("gpu"));
 
-  cl_half eps_h = 0;
-  const _FP16 eps_f = static_cast<_FP16>(epsilon);
-  std::memcpy(&eps_h, &eps_f, sizeof(cl_half));
+  // epsilon is bound as a float: the kernels already reduce in float, and a
+  // half cannot hold a typical rms_norm_eps (1e-5 / 1e-6 are subnormal there).
+  const float eps_arg = epsilon;
   const size_t in_bytes = (size_t)height * width * sizeof(_FP16);
   cl_mem out_cl = static_cast<cl_mem>(out_clmem);
   cl_mem in_cl = static_cast<cl_mem>(in_clmem);
@@ -536,11 +536,11 @@ void rms_reverse_norm_cl_fp16(const _FP16 *input, const _FP16 *weight,
       return;
   }
   // out_scale is already an FP16 value: pass its two bytes straight through as
-  // a `half` kernel argument, the same way epsilon is passed. Casting it to
+  // a `half` kernel argument (epsilon, by contrast, is a float). Casting it to
   // cl_half would convert the VALUE to an unsigned integer (0.0292 -> 0) and
   // zero the scale, producing an all-zero output.
   if (!kp->SetKernelArguments(3, &out_scale, sizeof(cl_half)) ||
-      !kp->SetKernelArguments(4, &eps_h, sizeof(cl_half)) ||
+      !kp->SetKernelArguments(4, &eps_arg, sizeof(float)) ||
       !kp->SetKernelArguments(5, &n_rows, sizeof(int)) ||
       !kp->SetKernelArguments(6, &w, sizeof(int)))
     return;
