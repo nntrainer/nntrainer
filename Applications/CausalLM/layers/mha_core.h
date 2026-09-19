@@ -198,6 +198,21 @@ public:
 };
 
 /**
+ * @brief KvWindowRing property (the model's default for the KV ring).
+ * @note  The value causallm::kvRingEnabled() falls back to when
+ *        NNTR_KV_WINDOW_RING is unset. It must equal the owning model's
+ *        Transformer::kvRingByDefault(): the model sizes the cache plane with
+ *        that value and this layer indexes the plane with this one. Default
+ *        false keeps the ring an explicit opt-in.
+ */
+class KvWindowRing : public nntrainer::Property<bool> {
+public:
+  KvWindowRing(bool value = false) { set(value); };
+  static constexpr const char *key = "kv_window_ring";
+  using prop_tag = nntrainer::bool_prop_tag;
+};
+
+/**
  * @brief GpuDecodeRope property (per-model decode-GPU gate).
  * @note  When true, the M=1 (decode) RoPE runs on the GPU (rope_inplace_f16_cl)
  *        so Q/K stay SVM-resident and lower_q/lower_kv drains are skipped.
@@ -467,7 +482,8 @@ private:
     props::UseSink, props::RopeScalingType, props::RopeScalingFactor,
     props::RopePartialRotaryFactor, props::RopeScalingMaxPositionEmbeddings,
     props::AttnLogitSoftcapping, props::IsCausal, props::UseGemmAttention,
-    props::GpuDecodeAttn, props::GpuDecodeRope, props::GpuOhwiRope>
+    props::GpuDecodeAttn, props::GpuDecodeRope, props::GpuOhwiRope,
+    props::KvWindowRing>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */

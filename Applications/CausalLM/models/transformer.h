@@ -272,8 +272,22 @@ public:
    * over-allocated. One accessor, one answer.
    */
   unsigned int prefillChunk() const {
-    return effectivePrefillChunk(static_cast<unsigned int>(INIT_SEQ_LEN));
+    return effectivePrefillChunk(static_cast<unsigned int>(INIT_SEQ_LEN),
+                                 kvRingByDefault());
   }
+
+  /**
+   * @brief Whether this model wants the sliding-window KV ring (and the
+   *        chunked prefill that comes with it) when NNTR_KV_WINDOW_RING is
+   *        unset.
+   * @details false keeps the ring an explicit opt-in, which is every model's
+   * behaviour before this hook existed. A model that returns true MUST feed
+   * the same value to each mha_core it builds through the `kv_window_ring`
+   * property: the model sizes the cache and the layer indexes it, and both
+   * evaluate causallm::kvRingEnabled(model_default). NNTR_KV_WINDOW_RING=0
+   * stays the opt-out either way.
+   */
+  virtual bool kvRingByDefault() const { return false; }
 
   /**
    * @brief Per-layer physical KV-cache row count.
@@ -293,7 +307,8 @@ public:
     const unsigned int cap =
       kvRingLayerEligible(usesAttentionSink(), /*external_cache=*/true)
         ? kvRingCap(getLayerSlidingWindow(layer_id),
-                    static_cast<unsigned int>(MAX_SEQ_LEN), prefillChunk())
+                    static_cast<unsigned int>(MAX_SEQ_LEN), prefillChunk(),
+                    kvRingByDefault())
         : 0u;
     return cap ? cap : static_cast<unsigned int>(MAX_SEQ_LEN);
   }

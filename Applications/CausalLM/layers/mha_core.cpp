@@ -608,7 +608,8 @@ MHACoreLayer::MHACoreLayer() :
     props::UseSink(), props::RopeScalingType(), props::RopeScalingFactor(),
     props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
     props::AttnLogitSoftcapping(), props::IsCausal(), props::UseGemmAttention(),
-    props::GpuDecodeAttn(), props::GpuDecodeRope(), props::GpuOhwiRope()),
+    props::GpuDecodeAttn(), props::GpuDecodeRope(), props::GpuOhwiRope(),
+    props::KvWindowRing()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -779,11 +780,16 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
     std::get<props::InitSeqLen>(mha_core_props).get()
       ? std::get<props::InitSeqLen>(mha_core_props).get()
       : query_dim.height(); // unset -> the plane we were handed
+  // The model's default for the ring, the same boolean it sized the plane with.
+  const bool ring_model_default =
+    std::get<props::KvWindowRing>(mha_core_props).get();
   kv_ring_cap =
     causallm::kvRingLayerEligible(
       std::get<props::UseSink>(mha_core_props).get(), use_external_cache)
-      ? causallm::kvRingCap((unsigned int)local_window_size, max_timestep,
-                            causallm::effectivePrefillChunk(init_seq_len))
+      ? causallm::kvRingCap(
+          (unsigned int)local_window_size, max_timestep,
+          causallm::effectivePrefillChunk(init_seq_len, ring_model_default),
+          ring_model_default)
       : 0u;
 
   /** attention scaling computation */

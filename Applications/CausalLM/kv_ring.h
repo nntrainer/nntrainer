@@ -101,19 +101,33 @@ inline bool kvRingArmAvailable() {
 }
 
 /**
- * @brief Whether the KV ring is enabled for this process.
- * @details NNTR_KV_WINDOW_RING is the opt-in: unset or '0' keeps the linear
- * cache (the pre-ring behaviour, bit-identical), anything else REQUESTS the
- * ring. A request is granted only where it is also correct -- the engine can
- * host it (kvRingEngineEligible) and a ring-aware attention arm is reachable
- * (kvRingArmAvailable). A refused request is reported once so the reason is
- * visible instead of showing up as a silent performance or memory difference.
+ * @brief Whether the KV ring is enabled.
+ * @param model_default what the MODEL asks for when the environment is silent.
+ * @details NNTR_KV_WINDOW_RING, when set, is the whole answer to "is the ring
+ * requested": '0' keeps the linear cache (the opt-out, bit-identical to the
+ * pre-ring path) and anything else requests the ring. When it is unset the
+ * request is the model's own default -- false for every model that has not
+ * said otherwise, so those keep the linear cache exactly as before; a model
+ * whose sliding layers are the point of its architecture (a dense stack that
+ * is 5/6 sliding at W=512) declares true and gets the ring with no variable
+ * set. The model feeds the same boolean to both consumers (its own sizing
+ * through Transformer::kvRingByDefault(), mha_core through the
+ * `kv_window_ring` property), so the two sides still cannot disagree.
+ *
+ * A request is granted only where it is also correct -- the engine can host it
+ * (kvRingEngineEligible) and a ring-aware attention arm is reachable
+ * (kvRingArmAvailable). A refused EXPLICIT request is reported once so the
+ * reason is visible instead of showing up as a silent performance or memory
+ * difference; a refused model default is not an error (the cpu engine and the
+ * Adreno image-attention bundle simply keep the linear cache).
  */
-inline bool kvRingEnabled() {
-  if (!nntr_env_on("NNTR_KV_WINDOW_RING"))
-    return false; // default OFF: opt-in for this cycle
+inline bool kvRingEnabled(bool model_default = false) {
+  const char *req = std::getenv("NNTR_KV_WINDOW_RING");
+  const bool explicit_req = (req != nullptr && req[0] != '\0');
+  if (explicit_req ? !nntr_env_on("NNTR_KV_WINDOW_RING") : !model_default)
+    return false;
   const bool ok = kvRingEngineEligible() && kvRingArmAvailable();
-  if (!ok) {
+  if (!ok && explicit_req) {
     static bool reported = false;
     if (!reported) {
       reported = true;
@@ -168,7 +182,7 @@ inline bool kvRingLayerEligible(bool attention_sink, bool external_cache) {
  * effectivePrefillChunk() (or Transformer::prefillChunk(), which calls it)
  * anywhere the answer feeds sizing or control flow.
  */
-inline unsigned int requestedPrefillChunk() {
+inline unsigned int requestedPrefillChunk(bool ring_model_default = false) {
   const char *pc = std::getenv("NNTR_PREFILL_CHUNK");
   if (pc != nullptr && pc[0] != '\0') {
     char *end = nullptr;
@@ -184,7 +198,7 @@ inline unsigned int requestedPrefillChunk() {
                    pc);
     }
   }
-  if (!kvRingEnabled())
+  if (!kvRingEnabled(ring_model_default))
     return 0u; // chunking is auto-enabled only by the ring
   return 4096u;
 }
@@ -199,8 +213,9 @@ inline unsigned int requestedPrefillChunk() {
  * chunk). They used to disagree, and sizing the ring off the unclamped request
  * (a 4096 request against a 1024-row plane) leaves Wcap up to 4x too large.
  */
-inline unsigned int effectivePrefillChunk(unsigned int plane_height) {
-  const unsigned int c = requestedPrefillChunk();
+inline unsigned int effectivePrefillChunk(unsigned int plane_height,
+                                          bool ring_model_default = false) {
+  const unsigned int c = requestedPrefillChunk(ring_model_default);
   if (c == 0u || plane_height == 0u)
     return c;
   return std::min(c, plane_height);
@@ -230,10 +245,13 @@ inline unsigned int effectivePrefillChunk(unsigned int plane_height) {
  *        effectivePrefillChunk(), not requestedPrefillChunk(). It is a
  *        parameter rather than a call so that the caller's chunk and this cap
  *        cannot drift apart.
+ * @param ring_model_default the model's own default for the ring (see
+ *        kvRingEnabled); the SAME value the chunk was computed with.
  */
 inline unsigned int kvRingCap(unsigned int local_window, unsigned int max_seq,
-                              unsigned int chunk) {
-  if (!kvRingEnabled())
+                              unsigned int chunk,
+                              bool ring_model_default = false) {
+  if (!kvRingEnabled(ring_model_default))
     return 0; // ring off -> full max_seq (bit-identical legacy)
   if (local_window == 0 || local_window >= max_seq)
     return 0; // full-attention layer -> no ring

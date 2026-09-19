@@ -155,9 +155,54 @@ TEST(KVRing, opencl_arm_rule) {
     ScopedEnv on("NNTR_KV_IMG_ATTN", "1");
     EXPECT_FALSE(causallm::kvRingArmAvailable());
     EXPECT_FALSE(causallm::kvRingEnabled());
+    EXPECT_FALSE(causallm::kvRingEnabled(true)); // a model default too
   }
 }
 #endif
+
+/**
+ * @brief A model may make the ring its default; the environment still wins.
+ * @details Unset => the model's default decides; '0' opts out of a model
+ * default; '1' opts in without one. A model default that no arm can serve is
+ * refused exactly like an explicit request (and keeps the linear cache).
+ */
+TEST(KVRing, model_default_and_env_precedence) {
+  ScopedEnv engine("NNTR_ENGINE", "cuda");
+  ScopedEnv arm("NNTR_CUDA_ATTN", "1");
+  ScopedEnv int8("NNTR_KV_INT8", nullptr);
+  ScopedEnv chunk("NNTR_PREFILL_CHUNK", nullptr);
+  {
+    ScopedEnv ring("NNTR_KV_WINDOW_RING", nullptr);
+    EXPECT_FALSE(causallm::kvRingEnabled());
+    EXPECT_FALSE(causallm::kvRingEnabled(false));
+    EXPECT_TRUE(causallm::kvRingEnabled(true));
+    // chunking and the capacity follow the same default
+    EXPECT_EQ(causallm::requestedPrefillChunk(false), 0u);
+    EXPECT_EQ(causallm::requestedPrefillChunk(true), 4096u);
+    EXPECT_EQ(causallm::effectivePrefillChunk(1024, true), 1024u);
+    EXPECT_EQ(causallm::kvRingCap(512, 32768, 1024, false), 0u);
+    EXPECT_EQ(causallm::kvRingCap(512, 32768, 1024, true), 2048u);
+    // a 2K context with a 1024-row chunk: the ring would not shrink the plane
+    EXPECT_EQ(causallm::kvRingCap(512, 2048, 1024, true), 0u);
+  }
+  {
+    ScopedEnv ring("NNTR_KV_WINDOW_RING", "0");
+    EXPECT_FALSE(causallm::kvRingEnabled(true));
+    EXPECT_EQ(causallm::requestedPrefillChunk(true), 0u);
+    EXPECT_EQ(causallm::kvRingCap(512, 32768, 1024, true), 0u);
+  }
+  {
+    ScopedEnv ring("NNTR_KV_WINDOW_RING", "1");
+    EXPECT_TRUE(causallm::kvRingEnabled(false));
+  }
+  {
+    ScopedEnv ring("NNTR_KV_WINDOW_RING", nullptr);
+    ScopedEnv no_arm("NNTR_CUDA_ATTN", nullptr);
+    EXPECT_FALSE(causallm::kvRingEnabled(true));
+    ScopedEnv cpu("NNTR_ENGINE", "cpu");
+    EXPECT_FALSE(causallm::kvRingEnabled(true));
+  }
+}
 
 /**
  * @brief The capacity formula, pinned value by value.
