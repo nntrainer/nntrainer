@@ -70,6 +70,27 @@ public:
    */
   CausalLM(json &cfg, json &generation_cfg, json &nntr_cfg);
 
+  /**
+   * @brief Model-teardown hook for the process-global device caches the
+   *        CUDA lane keys by HOST pointer (derived FC weights, scale side
+   *        buffers, the KV mirror and split-KV scratch, the decode graph).
+   *        Call after the model objects of a handle are destroyed and before
+   *        the next load: a second load in the same process otherwise lands
+   *        its weights on recycled addresses and takes stale cache hits. Pure
+   *        reset -- every cache is rebuilt lazily or by the next load's
+   *        prewarm. No-op on a build or a process that never used CUDA.
+   */
+  static void releaseDeviceCaches();
+
+protected:
+  /**
+   * @brief One-shot CUDA prewarm guard, PER MODEL OBJECT. A function-local
+   *        static was process-lifetime, so the second load of a load/destroy
+   *        loop skipped the eager derived-weight prewarm.
+   */
+  bool cuda_prewarmed_ = false;
+
+public:
 #ifdef ENABLE_TEST
 protected:
   /**

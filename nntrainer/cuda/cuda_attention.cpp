@@ -1415,4 +1415,63 @@ bool cuda_attention_core_fp32(const float *Q, const float *K, const float *V,
   return true;
 }
 
+void cuda_attention_release_caches() {
+  // [reload] Model-teardown counterpart to the lazy state this file latches.
+  // Every item here was written as "build once, keep for the process" -- true
+  // for a one-shot CLI, false for an SDK consumer that destroys the handle and
+  // loads again in the same process. No run is in flight at the call site and
+  // every item below is rebuilt lazily, so an empty/zero state is always valid.
+  //
+  // `touched` keeps this a literal no-op -- not one CUDA API call -- for a
+  // process that ran another backend: the API's unload path calls this
+  // unconditionally, and an OpenCL/CPU run must not be the thing that first
+  // pokes cudart.
+  bool touched = false;
+  {
+    // Device mirror of a host-resident KV cache, keyed by the KV tensor's HOST
+    // pointer. The next load's cache tensors are fresh allocations that
+    // routinely land on these very addresses, so a surviving entry is both a
+    // per-cycle VRAM leak (one full mirror per load) and a capacity memo
+    // describing a cache that no longer exists.
+    std::lock_guard<std::mutex> lk(g_kv_mtx);
+    for (auto &kv : g_kv_mirror) {
+      cudaFree(kv.second.buf);
+      touched = true;
+    }
+    g_kv_mirror.clear();
+  }
+  {
+    // Split-KV decode scratch + the M2-B fixed chunk stride it was sized with.
+    // g_sk_max_nchunks is a LATCH: the prewarm returns early forever once it is
+    // non-zero, so without this reset a second model loaded into the same
+    // process keeps the first model's stride and scratch size.
+    std::lock_guard<std::mutex> lk(g_sk_mtx);
+    if (g_pm || g_pl || g_pacc || g_sk_max_nchunks != 0) {
+      if (g_pm)
+        cudaFree(g_pm);
+      if (g_pl)
+        cudaFree(g_pl);
+      if (g_pacc)
+        cudaFree(g_pacc);
+      g_pm = g_pl = g_pacc = nullptr;
+      g_pm_cap = g_pacc_cap = 0;
+      g_sk_max_nchunks = 0;
+      touched = true;
+    }
+  }
+  {
+    // cuBLAS GEMM-attention score scratch [N_q, N_kv]: sized by the previous
+    // model's prefill shape, never captured, pure regrow on next use.
+    std::lock_guard<std::mutex> lk(g_ga_mtx);
+    if (g_scores) {
+      cudaFree(g_scores);
+      touched = true;
+    }
+    g_scores = nullptr;
+    g_scores_cap = 0;
+  }
+  if (touched)
+    cudaGetLastError(); // a failed free must not stick to the next lane
+}
+
 } // namespace nntrainer::cuda

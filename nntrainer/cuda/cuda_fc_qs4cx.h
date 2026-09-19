@@ -352,6 +352,19 @@ void cuda_fc_qs4cx_prewarm_exempt_i8(const void *plain_w);
  */
 void cuda_fc_qs4cx_free_i8_caches();
 
+/**
+ * @brief Model-teardown hook: free every host-pointer-keyed derived weight
+ *        cache this translation unit holds -- the device mirror of the plain
+ *        payload, the dp4a packed-int4 repack, the cuBLAS-int8 unpack and the
+ *        fp16/fp32 per-channel scale side buffers. Each is keyed by an address
+ *        the NEXT load's allocator is free to hand out again, so a surviving
+ *        entry is both a per-cycle VRAM leak and, on a recycled address, a
+ *        stale HIT that computes with the previous model's weights. Pure reset:
+ *        every entry is rebuilt lazily (or by the next load's prewarm). Call
+ *        only when no run is in flight.
+ */
+void cuda_fc_qs4cx_release_weight_caches();
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_FC_QS4CX_H__

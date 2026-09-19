@@ -82,6 +82,16 @@ bool cuda_attention_interleaved_fp16(const unsigned short *q_fp16,
 bool cuda_attention_splitkv_prewarm(int max_seq_len, int max_hq,
                                     int max_head_dim);
 
+/**
+ * @brief Model-teardown hook: drop every lazily-latched attention cache in this
+ *        translation unit -- the host-pointer-keyed device KV mirror, the
+ *        split-KV decode scratch, the GEMM-attention score scratch, and the
+ *        fixed chunk-stride latch they were sized with. All of it is rebuilt
+ *        lazily, so this is a pure reset; call it only when no run is in
+ *        flight (the API's unload/destroy path).
+ */
+void cuda_attention_release_caches();
+
 } // namespace nntrainer::cuda
 
 #endif // __CUDA_ATTENTION_H__

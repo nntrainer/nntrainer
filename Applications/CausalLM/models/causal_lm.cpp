@@ -1278,14 +1278,18 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   // Idempotent (each cache is keyed by the weight pointer), so a second call
   // and the lazy in-path build are both no-ops afterwards.
   {
-    static bool cuda_prewarmed = false;
+    // The guard is a MEMBER (cuda_prewarmed_), one per model object -- not a
+    // function-local static. A static was process-lifetime: the second load of
+    // a load/destroy loop skipped the prewarm entirely, and under a device-only
+    // activation pool the lazy in-path rebuild that was left to do the work is
+    // exactly the mid-stream cudaMalloc this walk exists to remove.
     static const char *_pw = std::getenv("NNTR_CUDA_PREWARM");
     static const bool cuda_prewarm_on = !(_pw && _pw[0] == '0');
     // cuda engine ONLY: a dual-enabled (CUDA + OpenCL) binary would otherwise
     // run the whole prewarm on OpenCL runs too, allocating every FC's derived
     // cache on the NVIDIA device.
-    if (!cuda_prewarmed && cuda_prewarm_on && causallm_engine() == "cuda") {
-      cuda_prewarmed = true;
+    if (!cuda_prewarmed_ && cuda_prewarm_on && causallm_engine() == "cuda") {
+      cuda_prewarmed_ = true;
       std::function<void(ml::train::Layer &, nntrainer::RunLayerContext &,
                          void *)>
         fn = [](ml::train::Layer &l, nntrainer::RunLayerContext &ctx, void *) {
@@ -1600,6 +1604,21 @@ std::string CausalLM::getOutput(int batch_idx) const {
     return "";
   }
   return output_list[batch_idx];
+}
+
+void CausalLM::releaseDeviceCaches() {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+  // [reload] The model objects are gone (weights freed). Drop the
+  // process-global device caches their weights seeded -- all keyed by HOST
+  // pointers the next load's allocator recycles -- so that load neither leaks a
+  // model's worth of device packs per cycle nor takes a stale hit and computes
+  // with the previous model's weights. Each hook is a pure reset that makes no
+  // driver call when its lane was never used, so a CPU/OpenCL-only process
+  // never pokes cudart.
+  nntrainer::cuda::cuda_fc_qs4cx_release_weight_caches();
+  nntrainer::cuda::cuda_attention_release_caches();
+  nntrainer::cuda_reset_decode_graph_cache();
+#endif
 }
 
 } // namespace causallm

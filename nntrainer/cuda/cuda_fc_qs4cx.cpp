@@ -54,11 +54,22 @@ namespace nntrainer::cuda {
 // readable, host-readable matters for the _resident staging path), built once
 // at load, cached by the fp32-scale pointer with no erase (weights live for
 // the process lifetime), never under a graph capture.
+// [reload] The two scale side-buffer caches are file-scope (not function-local
+// statics) so cuda_fc_qs4cx_release_weight_caches() can drop them at model
+// teardown: they are keyed by the fp32-scale HOST pointer, which the next
+// load's allocator recycles -- a stale hit then feeds the previous model's
+// scales (and RMSNorm gammas, which route through the fp16 one) to the kernels.
+// g_scale_host_mapped remembers how the buffers were allocated so the release
+// frees them with the matching call.
+static std::map<const void *, unsigned short *> g_scale16_cache;
+static std::map<const void *, float *> g_scale32_cache;
+static std::mutex g_scale_mtx;
+static bool g_scale_host_mapped = false;
+
 bool cuda_fc_qs4cx_scales_to_uvm_fp16(const float *fp32_scales, unsigned int N,
                                       const unsigned short **out_sc) {
-  static std::map<const void *, unsigned short *> cache;
-  static std::mutex mtx;
-  std::lock_guard<std::mutex> lk(mtx);
+  auto &cache = g_scale16_cache;
+  std::lock_guard<std::mutex> lk(g_scale_mtx);
   auto it = cache.find(fp32_scales);
   if (it == cache.end()) {
     // cudaMallocManaged inside a CUDA-graph capture invalidates the capture;
@@ -85,6 +96,7 @@ bool cuda_fc_qs4cx_scales_to_uvm_fp16(const float *fp32_scales, unsigned int N,
     } else if (cudaMallocManaged(&usc, sizeof(unsigned short) * (size_t)N) !=
                cudaSuccess)
       return false;
+    g_scale_host_mapped = host_mapped;
     for (unsigned int n = 0; n < N; ++n)
       usc[n] = compute_fp32_to_fp16(fp32_scales[n]);
     it = cache.emplace(fp32_scales, usc).first;
@@ -111,9 +123,8 @@ bool cuda_fc_qs4cx_scales_to_uvm_fp16(const float *fp32_scales, unsigned int N,
 bool cuda_fc_qs4cx_scales_to_uvm_fp32(const float *fp32_scales, unsigned int N,
                                       const float **out_sc,
                                       bool source_readable) {
-  static std::map<const void *, float *> cache;
-  static std::mutex mtx;
-  std::lock_guard<std::mutex> lk(mtx);
+  auto &cache = g_scale32_cache;
+  std::lock_guard<std::mutex> lk(g_scale_mtx);
   auto it = cache.find(fp32_scales);
   if (it == cache.end()) {
     if (!source_readable || fp32_scales == nullptr || N == 0)
@@ -136,6 +147,10 @@ bool cuda_fc_qs4cx_scales_to_uvm_fp32(const float *fp32_scales, unsigned int N,
     } else if (cudaMallocManaged(&usc, sizeof(float) * (size_t)N) !=
                cudaSuccess)
       return false;
+    // [reload] Same record as the fp16 buffer above: the release hook has to
+    // free with the matching call, and the fp32 cache can be the only populated
+    // one (the fp-act lm_head GEMV is its sole consumer).
+    g_scale_host_mapped = host_mapped;
     std::memcpy(usc, fp32_scales, sizeof(float) * (size_t)N);
     it = cache.emplace(fp32_scales, usc).first;
   }
@@ -1671,6 +1686,68 @@ void cuda_fc_qs4cx_free_i8_caches() {
   if (freed)
     std::fprintf(stderr, "[i8-ephemeral] freed %zu cuBLAS-i8 weight caches\n",
                  freed);
+}
+
+void cuda_fc_qs4cx_release_weight_caches() {
+  // [reload] Teardown for a load/destroy/load lifecycle in one process: every
+  // cache below is keyed by a HOST pointer on the premise "weights live for the
+  // process lifetime", which a second load breaks -- its weights are fresh
+  // allocations on the addresses the first load just freed, so a surviving
+  // entry is a stale HIT that runs the kernels against the previous model's
+  // packs, silently. Field signature (WDDM, a load/destroy/load probe): the
+  // second context's prefill runs at full speed and its decode stops after 3
+  // tokens with an empty answer. No run is in flight at the call site and each
+  // entry is rebuilt lazily or by the next load's prewarm, so an empty state
+  // is always valid. Makes no driver call when nothing was ever cached.
+  bool touched = false;
+  {
+    std::lock_guard<std::mutex> lk(g_scale_mtx);
+    for (auto &kv : g_scale16_cache) {
+      if (g_scale_host_mapped)
+        cudaFreeHost(kv.second);
+      else
+        cudaFree(kv.second);
+      touched = true;
+    }
+    g_scale16_cache.clear();
+    for (auto &kv : g_scale32_cache) {
+      if (g_scale_host_mapped)
+        cudaFreeHost(kv.second);
+      else
+        cudaFree(kv.second);
+      touched = true;
+    }
+    g_scale32_cache.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_qs4cx_mtx);
+    for (auto &kv : g_qs4cx_weight_cache) {
+      cudaFree(kv.second.d_w);
+      cudaFree(kv.second.d_sc);
+      touched = true;
+    }
+    g_qs4cx_weight_cache.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_dp4a_mtx);
+    for (auto &kv : g_dp4a_plain_cache) {
+      cudaFree(kv.second.plain);
+      cudaFree(kv.second.rowsum);
+      touched = true;
+    }
+    g_dp4a_plain_cache.clear();
+    for (auto &kv : g_i8_weight_cache) {
+      if (kv.second.w8)
+        cudaFree(kv.second.w8);
+      if (kv.second.rowsum)
+        cudaFree(kv.second.rowsum);
+      touched = true;
+    }
+    g_i8_weight_cache.clear();
+    g_i8_exempt.clear();
+  }
+  if (touched)
+    cudaGetLastError(); // a failed free must not stick to the next lane
 }
 
 // per-channel rowsum to the device cache (keyed by the plain payload pointer,

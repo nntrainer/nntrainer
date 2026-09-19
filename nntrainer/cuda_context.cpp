@@ -299,6 +299,28 @@ template const int CudaContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
 
+// [reload] The decode graph's cached state lives at file scope rather than as
+// function-local statics in runDecode so that a model teardown can reset it.
+// runDecode itself already destroys the exec at the next prefill boundary, so
+// this is not where a replay against a destroyed model's pointers is prevented;
+// what it fixes is that between a destroy and that next prefill cached_out
+// holds shared_ptrs pinning the DESTROYED model's output tensors, and a process
+// that loads again inherits a warm latch instead of the cold state a first load
+// sees.
+static cudaGraphExec_t cached_exec = nullptr;
+static sharedConstTensors cached_out;
+
+void cuda_reset_decode_graph_cache() {
+  // Makes NO cudart call unless a graph exists: a process that never ran the
+  // CUDA decode graph must not be the one that first pokes the driver.
+  if (cached_exec != nullptr) {
+    cudaGraphExecDestroy(cached_exec);
+    cudaGetLastError();
+    cached_exec = nullptr;
+  }
+  cached_out = {};
+}
+
 // CUDA override of the decode/prefill step.
 //
 // A single-token decode step issues on the order of a thousand tiny kernels,
@@ -339,8 +361,8 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
   }();
   static const bool graph_dbg = std::getenv("NNTR_CUDA_GRAPH_DBG") != nullptr;
 
-  static cudaGraphExec_t cached_exec = nullptr;
-  static sharedConstTensors cached_out;
+  // cached_exec / cached_out are file-scope (above) so a model teardown can
+  // drop them through cuda_reset_decode_graph_cache().
   bool captured = false;
 
   const bool feed_declared = !nn.getGraphReplayFeedNodes().empty();

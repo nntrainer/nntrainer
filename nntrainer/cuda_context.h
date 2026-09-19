@@ -261,6 +261,15 @@ extern template const int CudaContext::registerFactory<nntrainer::Layer>(
   const FactoryType<nntrainer::Layer> factory, const std::string &key,
   const int int_key);
 
+/**
+ * @brief Model-teardown hook for the decode CUDA-graph cache: drop the cached
+ *        graphExec and the cached output tensors (whose shared_ptrs otherwise
+ *        pin a destroyed model's buffers until the next prefill boundary).
+ *        Pure reset -- call only when no run is in flight (the API's
+ *        unload/destroy path). No driver call unless a graph exists.
+ */
+void cuda_reset_decode_graph_cache();
+
 } // namespace nntrainer
 
 #endif // __CUDA_CONTEXT_H__
