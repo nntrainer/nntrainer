@@ -175,6 +175,31 @@ public:
    * @brief run the Transformer model
    */
   /**
+   * @brief Token position at or beyond which a captured decode-step graph
+   *        stops being valid, or 0 for "never expires".
+   * @details A captured graph freezes every launch parameter the host computed
+   *          at capture time, including ones derived from the CURRENT KV
+   *          length. The sliding-window attention arms take exactly such a
+   *          decision -- `windowed = local_window_size < N_kv` and the window
+   *          offsets that follow from it -- so a graph captured while the
+   *          window still covers the whole cache keeps launching the
+   *          not-yet-sliding variant after the cache outgrows the window. The
+   *          output stays fluent and becomes quietly wrong from that token on.
+   *
+   *          A windowed model is therefore only safe to replay inside ONE
+   *          regime, and the regime changes exactly once, at the window size.
+   *          Reported from the base because SLIDING_WINDOW is a base member: a
+   *          model with no window returns 0 and never expires.
+   * @note  This is why one long-prompt cell cannot certify a model for
+   *        replay: with a prompt already past the window the flip happens
+   *        during prefill and decode never sees it, which is a property of
+   *        the cell, not of the model.
+   */
+  virtual unsigned int getGraphReplayExpiryPosition() const {
+    return SLIDING_WINDOW == UINT_MAX ? 0u : SLIDING_WINDOW;
+  }
+
+  /**
    * @brief Nodes whose HOST side must still run when a captured decode-step
    *        graph is replayed.
    * @details A replayed graph reproduces a step's DEVICE work, but a node whose

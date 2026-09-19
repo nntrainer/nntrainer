@@ -358,10 +358,40 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
 
   static cudaGraphExec_t cached_exec = nullptr;
   static sharedConstTensors cached_out;
+  static unsigned int captured_at = 0;
   bool captured = false;
 
   const bool feed_declared = !nn.getGraphReplayFeedNodes().empty();
   const bool single_token = (to - from) == 1 && from != 0;
+
+  // A capture freezes every launch parameter the host computed for it, and some
+  // of those depend on the CURRENT KV length rather than on the token: the
+  // sliding-window attention arms decide `windowed = window < kv_len` and
+  // derive their offsets from it. A graph captured while the window still
+  // covered the whole cache keeps launching the not-yet-sliding variant once
+  // the cache outgrows the window, and the answer stays fluent while quietly
+  // becoming wrong from that token on. The model reports the position where
+  // that flips; drop the capture when this step is on the far side of it.
+  //
+  // This is not a per-model quirk. Measured on a discrete part: a decoder with
+  // a 1024-token window and an 846-token prompt diverges from its golden at
+  // exactly position 1026, and a decoder with a 512-token window -- which looks
+  // correct on a 1K cell only because its prompt already exceeds its window, so
+  // the flip happens during prefill -- diverges too on a 37-token prompt
+  // generating past position 512. A single long-prompt cell cannot certify a
+  // model for replay.
+  const unsigned int expiry = nn.getGraphReplayExpiryPosition();
+  if (cached_exec != nullptr && expiry != 0 && from >= expiry &&
+      captured_at < expiry) {
+    if (graph_dbg)
+      std::fprintf(stderr,
+                   "[CUDA_GRAPH] capture from position %u expired at %u "
+                   "(window regime changed); recapturing\n",
+                   captured_at, expiry);
+    cudaGraphExecDestroy(cached_exec);
+    cached_exec = nullptr;
+    cached_out = {};
+  }
 
   if (decode_graph && feed_declared && !single_token &&
       cached_exec != nullptr) {
@@ -398,6 +428,7 @@ sharedConstTensors CudaContext::runDecode(NeuralNetwork &nn, unsigned int from,
                        n_nodes);
         }
         if (cudaGraphInstantiate(&cached_exec, graph, 0) == cudaSuccess) {
+          captured_at = from;
           cudaGraphLaunch(cached_exec, sm.GetStream());
           cudaStreamSynchronize(sm.GetStream());
           cached_out = out;

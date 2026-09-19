@@ -467,6 +467,24 @@ public:
   void setStepFeedOnly(bool v) { step_feed_only_ = v; }
 
   /**
+   * @brief Token position at or beyond which a captured step graph is invalid.
+   * @param pos the position, or 0 for "never expires"
+   * @details See Transformer::getGraphReplayExpiryPosition(): a graph freezes
+   *          host-computed launch parameters, and a sliding-window attention
+   *          arm changes those once the cache outgrows the window.
+   */
+  void setGraphReplayExpiryPosition(unsigned int pos) {
+    graph_replay_expiry_position_ = pos;
+  }
+
+  /**
+   * @copydoc setGraphReplayExpiryPosition
+   */
+  unsigned int getGraphReplayExpiryPosition() const {
+    return graph_replay_expiry_position_;
+  }
+
+  /**
    * @brief     reset input dimensions of a model
    * @param[in] dims input dimensions
    * @note Similar to reinitialize, the resetInputDimension API is used for
@@ -764,6 +782,10 @@ private:
 
   bool step_feed_only_ =
     false; /**< when set, one forward runs only graph_replay_feed_nodes_ */
+
+  unsigned int graph_replay_expiry_position_ =
+    0; /**< token position a captured step graph stops being valid at; 0 = the
+            capture never expires */
 
   std::vector<std::string>
     graph_replay_feed_nodes_; /**< nodes that must still run on the host when a
