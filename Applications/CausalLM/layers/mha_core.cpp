@@ -635,6 +635,71 @@ MHACoreLayer::~MHACoreLayer() {
 
 /************************************************************** */
 
+// [attn-timer] NNTR_MHA_ATTN_TIMER=1: true device time of the attention arm,
+// bucketed decode/prefill x sliding/full, so "a sliding layer costs O(window),
+// a full layer O(context)" is a measurement instead of a reading of the
+// kernels. The queue is drained before and after every timed launch, so this
+// serializes the device -- diagnostics only, and it must run with the CUDA
+// decode graph off (a replayed graph does not execute this host code).
+// Totals are printed at process exit.
+namespace {
+struct MhaAttnTimer {
+  // [0]=decode-sliding [1]=decode-full [2]=prefill-sliding [3]=prefill-full
+  long long ns[4] = {0, 0, 0, 0}, calls[4] = {0, 0, 0, 0};
+  unsigned int last_kv = 0;
+  static bool on() {
+    static const bool v = nntr_env_on("NNTR_MHA_ATTN_TIMER");
+    return v;
+  }
+  static void drain() {
+#if defined(ENABLE_CUDA) && ENABLE_CUDA == 1
+    if (const char *e = std::getenv("NNTR_ENGINE"))
+      if (std::string(e) == "cuda") {
+        nntrainer::cuda::StreamManager::Global().finish();
+        return;
+      }
+#endif
+#if defined(ENABLE_OPENCL)
+    nntrainer::cl_queue_finish();
+#endif
+  }
+  ~MhaAttnTimer() {
+    static const char *name[4] = {"decode-sliding", "decode-full",
+                                  "prefill-sliding", "prefill-full"};
+    for (int i = 0; i < 4; ++i)
+      if (calls[i])
+        std::fprintf(stderr,
+                     "[MHA-ATTN-TIMER] %s %.3f ms / %lld calls = %.4f ms/call "
+                     "(last N_kv=%u)\n",
+                     name[i], ns[i] / 1.0e6, calls[i],
+                     ns[i] / 1.0e6 / (double)calls[i], last_kv);
+  }
+};
+MhaAttnTimer g_mha_attn_timer;
+struct MhaAttnTimerScope {
+  int bucket = -1;
+  std::chrono::steady_clock::time_point t0;
+  MhaAttnTimerScope(unsigned int n_q, unsigned int n_kv, bool sliding) {
+    if (!MhaAttnTimer::on())
+      return;
+    bucket = (n_q == 1 ? 0 : 2) + (sliding ? 0 : 1);
+    g_mha_attn_timer.last_kv = n_kv;
+    MhaAttnTimer::drain();
+    t0 = std::chrono::steady_clock::now();
+  }
+  ~MhaAttnTimerScope() {
+    if (bucket < 0)
+      return;
+    MhaAttnTimer::drain();
+    g_mha_attn_timer.ns[bucket] +=
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0)
+        .count();
+    ++g_mha_attn_timer.calls[bucket];
+  }
+};
+} // namespace
+
 // [kv-window-ring] Guard for an attention arm that indexes the KV cache
 // LINEARLY from the logical key count. When the ring is on the cache holds only
 // kv_ring_cap physical rows, so such an arm would read past the buffer (the
@@ -3251,6 +3316,10 @@ void MHACoreLayer::one_batch_incremental_forwarding(
           // (num_heads_Q groups). flash_decode splits the KV axis into chunks
           // (num_heads_Q * n_chunks groups) for parallelism. Falls back to the
           // prefill flash kernel on shape mismatch / softcap.
+          // sliding == the layer HAS a window (not "the window already
+          // clips"), so a sliding layer's cost is one series across contexts.
+          MhaAttnTimerScope _attn_timer(step_size, cache_to,
+                                        local_window_size != UINT_MAX);
           if (step_size == 1)
             ok = nntrainer::flash_decode_f16_cl(
               Q_p, K_p, V_p, O_p, cache_to, num_heads_Q, num_heads_KV, head_dim,
@@ -3742,6 +3811,8 @@ void MHACoreLayer::gemm_attention(nntrainer::Tensor &query_step,
       bool dev = dev_ok(Q_fp16_src) && dev_ok(O_fp16);
       if (dev) {
         const int win = windowed ? (int)local_window_size : INT_MAX;
+        MhaAttnTimerScope _attn_timer((unsigned int)N_q, (unsigned int)N_kv,
+                                      local_window_size != UINT_MAX);
         if (nntrainer::cuda::cuda_attention_interleaved_fp16(
               Q_fp16_src, Kbase, Vbase, O_fp16, (int)num_heads_Q,
               (int)num_heads_KV, (int)N_q, (int)N_kv, (int)cache_from, (int)d,
