@@ -115,6 +115,26 @@ namespace {
 std::mutex quant_lut_cache_mutex;
 std::unordered_map<std::string, std::weak_ptr<QuantLut>> quant_lut_cache;
 
+/**
+ * @brief Decode one QS4CX sidecar group: n nibbles (uint4 = int4 + 8, low
+ *        nibble first) times ONE fp32 scale.
+ * @note  Deliberately NOT named dequantize_row_qs4cx: nntrainer exports a
+ *        function by that name for the KleidiAI packed layout, and an
+ *        unqualified call here would pick this one while the neighbouring ggml
+ *        calls are qualified -- a silent near-homonym. Unlike Q4_0/Q6_K there
+ *        are no sub-blocks and no scale inside the row; the whole group shares
+ *        the caller's scale, which is what makes the round-trip exact.
+ */
+void decodeQs4cxGroup(const uint8_t *row, float scale, float *out, size_t n) {
+  for (size_t k = 0; k + 1 < n; k += 2) {
+    const uint8_t b = row[k >> 1];
+    out[k] = (static_cast<int>(b & 0x0F) - 8) * scale;
+    out[k + 1] = (static_cast<int>(b >> 4) - 8) * scale;
+  }
+  if (n & 1u)
+    out[n - 1] = (static_cast<int>(row[(n - 1) >> 1] & 0x0F) - 8) * scale;
+}
+
 bool hasJsonExtension(const std::string &path) {
   return std::filesystem::path(path).extension() == ".json";
 }
@@ -473,6 +493,60 @@ std::shared_ptr<QuantLut> loadGgmlManifest(const std::string &manifest_path,
   return lut;
 }
 
+/**
+ * @brief QS4CX row sidecar: rows*(size+1)/2 nibbles followed by one contiguous
+ *        fp32 scale per row (per group, when the row is grouped). Manifest:
+ *          {"datatype": "qs4cx", "size": <out_dim>,
+ *           "rows": <in_dim, optional>, "groups": <n, optional>,
+ *           "lut-path": "<payload>"}
+ *
+ * This is the same quantization the packager already applied to the embedding
+ * table, so the sidecar is a byte copy and the decode is exact. A q4_0 sidecar
+ * of the same table has to re-quantize an already-int4 table into 32-wide
+ * blocks, which is a second lossy step that buys nothing.
+ *
+ * The row count is derived from the payload rather than trusted from the
+ * manifest, because the scale block is part of the file; a declared "rows" is
+ * cross-checked against it.
+ */
+std::shared_ptr<QuantLut> loadQs4cxManifest(const std::string &manifest_path,
+                                            const nlohmann::json &json) {
+  const auto lut_path = requireJsonStringField(json, "lut-path", manifest_path);
+
+  auto lut = std::make_shared<QuantLut>();
+  lut->out_dim = requireJsonSizeField(json, "size", manifest_path);
+  lut->ggml_dtype = nntrainer::TensorDim::DataType::QS4CX;
+  lut->row_bytes = (lut->out_dim + 1) / 2;
+  lut->qs4cx_groups = json.contains("groups")
+                        ? requireJsonSizeField(json, "groups", manifest_path)
+                        : 1u;
+  NNTR_THROW_IF(lut->qs4cx_groups == 0 ||
+                  lut->out_dim % lut->qs4cx_groups != 0 ||
+                  (lut->out_dim / lut->qs4cx_groups) % 2 != 0,
+                std::invalid_argument)
+    << "Malformed LUT manifest " << manifest_path << ": groups "
+    << lut->qs4cx_groups << " must divide size " << lut->out_dim
+    << " into EVEN-width groups (a group boundary inside a nibble byte is not "
+       "addressable)";
+
+  attachPayload(*lut, resolveLutPath(manifest_path, lut_path));
+  const size_t per_row = lut->row_bytes + lut->qs4cx_groups * sizeof(float);
+  NNTR_THROW_IF(lut->payload_size() == 0 || lut->payload_size() % per_row != 0,
+                std::runtime_error)
+    << "QS4CX LUT binary size " << lut->payload_size() << " is not rows*("
+    << lut->row_bytes << "+" << lut->qs4cx_groups << "*4) for "
+    << manifest_path;
+  lut->in_dim = lut->payload_size() / per_row;
+
+  if (json.contains("rows")) {
+    const size_t rows = requireJsonSizeField(json, "rows", manifest_path);
+    NNTR_THROW_IF(rows != lut->in_dim, std::invalid_argument)
+      << "LUT manifest " << manifest_path << " declares rows=" << rows
+      << " but payload holds " << lut->in_dim;
+  }
+  return lut;
+}
+
 std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
   std::ifstream file(manifest_path);
   NNTR_THROW_IF(!file.is_open(), std::runtime_error)
@@ -506,10 +580,12 @@ std::shared_ptr<QuantLut> loadJsonManifest(const std::string &manifest_path) {
   if (datatype == "q6_k")
     return loadGgmlManifest(manifest_path, json,
                             nntrainer::TensorDim::DataType::Q6_K);
+  if (datatype == "qs4cx")
+    return loadQs4cxManifest(manifest_path, json);
 
   NNTR_THROW_IF(true, std::runtime_error)
     << "Unsupported LUT datatype '" << datatype << "' in " << manifest_path
-    << " (expected ufixed8, sfixed4, q4_0, or q6_k)";
+    << " (expected ufixed8, sfixed4, q4_0, q6_k, or qs4cx)";
   return nullptr;
 }
 
@@ -1191,15 +1267,31 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // the channel index and out_dim as the row length.
     const bool qs4cx_w =
       !ggml_lut && wt == nntrainer::TensorDim::DataType::QS4CX;
-    NNTR_THROW_IF(ggml_lut && !row_quant, std::runtime_error)
-      << "GGML sidecar LUT supports only Q4_0/Q6_K payloads";
+    // QS4CX as a SIDECAR is a different layout from QS4CX as the in-bin weight
+    // above: nibbles for every row, then one fp32 scale per row (per group),
+    // rather than a transposed table plus the weight's own scale vector. Keep
+    // the two discriminators apart -- folding QS4CX into row_quant would make
+    // both true for the in-bin case and send it down the ggml stride maths.
+    const bool qs4cx_lut =
+      ggml_lut && wt == nntrainer::TensorDim::DataType::QS4CX;
+    NNTR_THROW_IF(ggml_lut && !row_quant && !qs4cx_lut, std::runtime_error)
+      << "GGML sidecar LUT supports only Q4_0/Q6_K/QS4CX payloads";
     const uint8_t *quant_table =
-      row_quant ? (ggml_lut ? quant_lut->data() : weight_p->getData<uint8_t>())
-                : nullptr;
+      (row_quant || qs4cx_lut)
+        ? (ggml_lut ? quant_lut->data() : weight_p->getData<uint8_t>())
+        : nullptr;
     const size_t row_stride =
-      (wt == nntrainer::TensorDim::DataType::Q6_K)
-        ? 210 * ((static_cast<size_t>(out_dim) + 255) / 256)
-        : 18 * ((static_cast<size_t>(out_dim) + 31) / 32);
+      qs4cx_lut ? quant_lut->row_bytes
+                : ((wt == nntrainer::TensorDim::DataType::Q6_K)
+                     ? 210 * ((static_cast<size_t>(out_dim) + 255) / 256)
+                     : 18 * ((static_cast<size_t>(out_dim) + 31) / 32));
+    // The scale block follows all the nibble rows, so it starts where the
+    // payload's row region ends.
+    const float *qs4cx_lut_scales =
+      qs4cx_lut ? reinterpret_cast<const float *>(
+                    quant_table + quant_lut->in_dim * row_stride)
+                : nullptr;
+    const size_t qs4cx_lut_groups = qs4cx_lut ? quant_lut->qs4cx_groups : 1;
 
 #if !defined(_WIN32)
     // Cold-start I/O for the mmap'd sidecar: MADV_RANDOM disabled readahead,
@@ -1265,7 +1357,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       const size_t chunk_begin = t * total / njobs;
       const size_t chunk_end = (t + 1) * total / njobs;
       std::vector<float> tmp;
-      if (row_quant || qs4cx_w)
+      if (row_quant || qs4cx_w || qs4cx_lut)
         tmp.resize(out_dim);
       for (size_t i = chunk_begin; i < chunk_end; ++i) {
         size_t embed_idx = static_cast<size_t>(in_data[i]);
@@ -1277,7 +1369,7 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         nntrainer::Tensor out_tensor =
           batchsliced_hidden.getSharedDataTensor(out_tensor_dim, out_dim * (i));
 
-        if (row_quant || qs4cx_w) {
+        if (row_quant || qs4cx_w || qs4cx_lut) {
           // dequantize_row_q{6_K,4_0,s4cx} ALWAYS writes out_dim FP32 values.
           // In an FP16-activation run out_tensor is FP16, so writing FP32
           // straight in (the old `out_tensor.getData()` == float*) overruns the
@@ -1285,7 +1377,17 @@ void EmbeddingLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
           // every layer => prompt-independent garbage output. Mirror
           // TieWordEmbedding: dequant into an FP32 scratch, then cast into the
           // output's real dtype, folding the embed scale.
-          if (qs4cx_w) {
+          if (qs4cx_lut) {
+            // One decode per scale group. glen is even by the manifest guard,
+            // so a group never begins inside a nibble byte.
+            const size_t glen = out_dim / qs4cx_lut_groups;
+            const uint8_t *src = quant_table + row_stride * embed_idx;
+            for (size_t g = 0; g < qs4cx_lut_groups; ++g)
+              decodeQs4cxGroup(
+                src + g * (glen / 2),
+                qs4cx_lut_scales[embed_idx * qs4cx_lut_groups + g],
+                tmp.data() + g * glen, glen);
+          } else if (qs4cx_w) {
             nntrainer::dequantize_row_qs4cx(embed_idx, out_dim,
                                             weight_p->getData(),
                                             weight_p->getScale(), tmp.data());

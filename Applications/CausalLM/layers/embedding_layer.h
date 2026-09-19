@@ -109,6 +109,14 @@ struct QuantLut {
   /// row_scales[row * blocks + col / (out_dim / blocks)] scales column `col`.
   size_t sfixed4_blocks = 1;
 
+  /// QS4CX only: how many equal-width scale groups a row is split into. 1 = one
+  /// scale for the whole row (a plain per-channel table). >1 is the packed
+  /// per-layer table -- several independently quantized sub-tables concatenated
+  /// along the row, each keeping its own scale, so the sidecar stays an exact
+  /// copy of what the packager quantized instead of being re-quantized into a
+  /// single-scale row.
+  size_t qs4cx_groups = 1;
+
   void *mmap_ptr = nullptr;
   size_t mmap_len = 0;
 
