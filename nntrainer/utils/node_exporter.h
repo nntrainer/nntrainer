@@ -303,7 +303,8 @@ class FullyConnectedLayer;
  */
 template <>
 void Exporter::saveTflResult(
-  const std::tuple<props::Unit, props::LoraRank, props::LoraAlpha> &props,
+  const std::tuple<props::Unit, props::LoraRank, props::LoraAlpha,
+                   props::FusedActivation, props::PlanLastRowOnly> &props,
   const FullyConnectedLayer *self);
 
 class ActivationLayer;
@@ -333,7 +334,8 @@ template <>
 void Exporter::saveTflResult(
   const std::tuple<props::FilterSize, std::array<props::KernelSize, 2>,
                    std::array<props::Stride, 2>, props::Padding2D,
-                   std::array<props::Dilation, 2>> &props,
+                   std::array<props::Dilation, 2>, props::FusedActivation>
+    &props,
   const Conv2DLayer *self);
 
 class InputLayer;
