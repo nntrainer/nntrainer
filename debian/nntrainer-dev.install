@@ -47,6 +47,7 @@
 # custom layer kits
 /usr/include/nntrainer/app_context.h
 /usr/include/nntrainer/context.h
+/usr/include/nntrainer/model_features.h
 /usr/include/nntrainer/engine.h
 # logger
 /usr/include/nntrainer/nntrainer_log.h

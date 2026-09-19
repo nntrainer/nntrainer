@@ -634,12 +634,10 @@ int main(int argc, char *argv[]) {
   text = converter.to_bytes(test);
 #endif
   auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
 
   try {
-    app_context->registerFactory(
-      nntrainer::createLayer<custom::MultiHeadAttentionLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<custom::MultiHeadAttentionLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
@@ -647,7 +645,8 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    app_context->registerFactory(nntrainer::createLayer<custom::SwiGLULayer>);
+    ct_engine.registerLayerFactory("cpu",
+                                   nntrainer::createLayer<custom::SwiGLULayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
@@ -655,7 +654,8 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    app_context->registerFactory(nntrainer::createLayer<custom::RMSNormLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<custom::RMSNormLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
