@@ -86,7 +86,13 @@ else
 fi
 
 pushd builddir
-ninja install
+# `ninja install` runs meson's install target for the subprojects too, which
+# tries to write /usr/local/lib/libgmock.a and fails with PermissionError on a
+# tree that configured googletest (i.e. any tree without -Denable-test=false).
+# Only nntrainer's own artefacts belong in android_build_result, so build and
+# then install with --skip-subprojects.
+ninja
+meson install --no-rebuild --skip-subprojects
 
 tar -czvf $TARGET/nntrainer_for_android.tar.gz --directory=android_build_result .
 

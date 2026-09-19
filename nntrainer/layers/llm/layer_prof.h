@@ -9,10 +9,11 @@
  * @bug    No known bugs except for NYI items
  *
  * @note   Header-only and dependency-free, so a layer in any subdirectory can
- *         include it without a link edge. It is deliberately NOT added to
- *         nntrainer_headers: it is an internal development aid, not part of
- *         the -devel surface, and installing it would need matching entries in
- *         packaging/nntrainer.spec and debian/*.install.
+ *         include it without a link edge. It IS installed (llm/meson.build ->
+ *         nntrainer_headers, packaging/nntrainer.spec, debian/*.install)
+ *         because the CausalLM application's layers include it, and an
+ *         application built out of tree compiles against the installed
+ *         include/nntrainer directory only.
  *
  * @note   Every entry point is inert unless NNTR_LAYER_PROFILE is set in the
  *         environment: the constructor and destructor both return immediately,

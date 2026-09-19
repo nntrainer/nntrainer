@@ -33,6 +33,7 @@ tensor_sources = [
 
 tensor_headers = [
   'memory_data.h',
+  'residency_policy.h',
   'tensor.h',
   'tensor_base.h',
   'float_tensor.h',

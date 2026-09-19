@@ -21,6 +21,15 @@ llm_layer_sources = [
 # and debian/nntrainer-dev.install, or the RPM/deb builds fail on an
 # installed-but-unpackaged file. The include path for this directory comes from
 # nntrainer_inc in ../meson.build, so in-tree users still resolve <geglu_layer.h>.
+#
+# layer_prof.h is the one exception. It is not a layer: it is a header-only,
+# dependency-free, env-gated (NNTR_LAYER_PROFILE) scope timer that the CausalLM
+# application's layers include. An application built out of tree sees only the
+# INSTALLED header directory (include/nntrainer), so leaving this one
+# uninstalled breaks that build with "'layer_prof.h' file not found". Installed,
+# therefore, and listed in packaging/nntrainer.spec and
+# debian/nntrainer-dev.install accordingly.
+nntrainer_headers += meson.current_source_dir() / 'layer_prof.h'
 
 foreach s : llm_layer_sources
   nntrainer_sources += meson.current_source_dir() / s

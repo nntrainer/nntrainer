@@ -694,6 +694,9 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/app_context.h
 %{_includedir}/nntrainer/context.h
 %{_includedir}/nntrainer/model_features.h
+%{_includedir}/nntrainer/layer_prof.h
+%{_includedir}/nntrainer/residency_policy.h
+%{_includedir}/nntrainer/env_compat.h
 %{_includedir}/nntrainer/engine.h
 # optimizer headers
 %{_includedir}/nntrainer/optimizer_context.h

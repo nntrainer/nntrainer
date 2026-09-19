@@ -47,6 +47,9 @@
 /usr/include/nntrainer/app_context.h
 /usr/include/nntrainer/context.h
 /usr/include/nntrainer/model_features.h
+/usr/include/nntrainer/layer_prof.h
+/usr/include/nntrainer/residency_policy.h
+/usr/include/nntrainer/env_compat.h
 /usr/include/nntrainer/engine.h
 # logger
 /usr/include/nntrainer/nntrainer_log.h
