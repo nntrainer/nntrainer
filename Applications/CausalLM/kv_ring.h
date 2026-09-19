@@ -60,9 +60,9 @@ inline bool kvRingEngineEligible() {
  * arms take the ring capacity and read row (n % cap):
  * flash_attention_prefill_f16_cl, flash_decode_f16_cl and
  * cuda_attention_interleaved_fp16. The remaining arms (the two_conv family, the
- * OHWI image path, and the host compute_kcaches / gemm_attention fallback)
- * index the cache linearly from the LOGICAL key count, so pointing them at a
- * Wcap-high buffer reads past its end.
+ * OHWI-direct and OHWI image paths, and the host compute_kcaches /
+ * gemm_attention fallback) index the cache linearly from the LOGICAL key count,
+ * so pointing them at a Wcap-high buffer reads past its end.
  *
  * The arms that do map the row are behind env gates that are readable here, so
  * the ring refuses to turn on unless one of them is actually selectable. This
@@ -80,10 +80,17 @@ inline bool kvRingArmAvailable() {
   if (e != nullptr && std::string(e) == "cuda")
     return nntr_env_on("NNTR_CUDA_ATTN"); // cuda_attention_interleaved_fp16
 #if defined(ENABLE_OPENCL)
-  // The flash arm sits inside the OHWI-direct GPU attention block, which needs
-  // both NNTR_KV_OHWI and NNTR_MHA_GPU. The image arm, which preempts flash on
-  // Adreno, is not ring-aware -- so its opt-ins disqualify the ring.
-  if (!nntr_env_on("NNTR_KV_OHWI") || !nntr_env_on("NNTR_MHA_GPU"))
+  // The two OpenCL flash arms sit in the CONCAT-layout GPU attention block,
+  // which NNTR_MHA_GPU alone opens. NNTR_KV_OHWI is the opposite of a
+  // precondition: it switches the K write to the per-head OHWI scatter, which
+  // places rows by ABSOLUTE position against the plane height (a heap overwrite
+  // on a Wcap-high plane, reproduced on Xe), and its readers -- the OHWI-direct
+  // two_conv arm and the OHWI->concat gather -- are linear too. mha_core
+  // presence-checks that variable, so presence is what disqualifies here. The
+  // image arms, which preempt flash on Adreno, are not ring-aware either.
+  if (!nntr_env_on("NNTR_MHA_GPU"))
+    return false;
+  if (std::getenv("NNTR_KV_OHWI") != nullptr)
     return false;
   if (nntr_env_on("NNTR_KV_IMG_ATTN") || nntr_env_on("NNTR_MHA_GPU_IMG"))
     return false;
@@ -114,9 +121,9 @@ inline bool kvRingEnabled() {
                    "[kv-window-ring] NNTR_KV_WINDOW_RING is set but no "
                    "ring-aware attention arm resolves in this configuration "
                    "(engine_eligible=%d arm_available=%d); keeping the linear "
-                   "full-height KV cache. The ring needs NNTR_KV_OHWI=1 and "
-                   "NNTR_MHA_GPU=1 on OpenCL, or NNTR_CUDA_ATTN=1 on "
-                   "NNTR_ENGINE=cuda.\n",
+                   "full-height KV cache. The ring needs NNTR_MHA_GPU=1 "
+                   "without NNTR_KV_OHWI / the image-attention arms on OpenCL, "
+                   "or NNTR_CUDA_ATTN=1 on NNTR_ENGINE=cuda.\n",
                    (int)kvRingEngineEligible(), (int)kvRingArmAvailable());
     }
   }

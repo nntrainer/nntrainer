@@ -126,6 +126,39 @@ TEST(KVRing, refused_without_a_ring_aware_arm) {
   EXPECT_FALSE(causallm::kvRingEnabled());
 }
 
+#if defined(ENABLE_OPENCL)
+/**
+ * @brief On OpenCL the ring-aware flash arms live in the concat-layout block:
+ *        NNTR_MHA_GPU opens it, NNTR_KV_OHWI and the image arms close it.
+ * @details NNTR_KV_OHWI used to be listed as a precondition. It is the
+ * opposite: the OHWI K scatter places rows by absolute position (a heap
+ * overwrite on a Wcap-high plane) and its readers are linear.
+ */
+TEST(KVRing, opencl_arm_rule) {
+  ScopedEnv ring("NNTR_KV_WINDOW_RING", "1");
+  ScopedEnv engine("NNTR_ENGINE", "gpu");
+  ScopedEnv ohwi("NNTR_KV_OHWI", nullptr);
+  ScopedEnv img("NNTR_KV_IMG_ATTN", nullptr);
+  ScopedEnv img2("NNTR_MHA_GPU_IMG", nullptr);
+  {
+    ScopedEnv mha("NNTR_MHA_GPU", nullptr);
+    EXPECT_FALSE(causallm::kvRingArmAvailable());
+  }
+  ScopedEnv mha("NNTR_MHA_GPU", "1");
+  EXPECT_TRUE(causallm::kvRingArmAvailable());
+  EXPECT_TRUE(causallm::kvRingEnabled());
+  {
+    ScopedEnv on("NNTR_KV_OHWI", "1");
+    EXPECT_FALSE(causallm::kvRingArmAvailable());
+  }
+  {
+    ScopedEnv on("NNTR_KV_IMG_ATTN", "1");
+    EXPECT_FALSE(causallm::kvRingArmAvailable());
+    EXPECT_FALSE(causallm::kvRingEnabled());
+  }
+}
+#endif
+
 /**
  * @brief The capacity formula, pinned value by value.
  * @details cap = (W / C + 2) * C, or 0 when that would not shrink max_seq.

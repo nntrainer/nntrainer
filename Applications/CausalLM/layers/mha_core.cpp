@@ -673,7 +673,7 @@ static void mha_ring_assert_host_path_ok(unsigned int ring_cap,
     << ": no ring-aware attention arm resolved, but the KV cache holds only "
     << ring_cap
     << " physical rows. The host attention path reads absolute rows and would "
-       "produce wrong attention. Enable a ring-aware arm (NNTR_KV_OHWI=1 + "
+       "produce wrong attention. Enable a ring-aware arm ("
        "NNTR_MHA_GPU=1 on OpenCL, adding NNTR_MHA_GPU_DECODE=1 for decode; "
        "NNTR_CUDA_ATTN=1 on NNTR_ENGINE=cuda) or set NNTR_KV_WINDOW_RING=0.";
 }
