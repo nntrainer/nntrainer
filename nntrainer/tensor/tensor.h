@@ -1574,6 +1574,22 @@ public:
   size_t getOffset() const;
 
   /**
+   * @brief  True if this tensor's memory lives in device memory the host
+   *         cannot address, which the memory planner decided at allocation.
+   *         A layer asks this to know HOW to bind the tensor to a kernel: a
+   *         buffer argument rather than a pointer. False for every tensor on
+   *         the host or shared plane, so existing callers are unaffected.
+   */
+  bool isClMem() const;
+
+  /**
+   * @brief  The device buffer backing this tensor, or nullptr when it is not
+   *         device-resident. Non-owning: the pool that planned the tensor
+   *         owns the buffer.
+   */
+  void *getClMem() const;
+
+  /**
    * @brief     Copy the Tensor
    * @param[in] from Tensor to be copied
    *

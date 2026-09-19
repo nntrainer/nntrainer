@@ -246,6 +246,16 @@ int NeuralNetwork::compile(ExecutionMode mode) {
     }
   }
 
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+  bool has_gpu_engine = false;
+  for (auto &node : graph_representation) {
+    if (node->isComputeEngineGPU()) {
+      has_gpu_engine = true;
+      break;
+    }
+  }
+#endif
+
   model_graph =
     NetworkGraph(fsu, mode, fsu_path, lookahead, tensor_format, tensor_type);
 
@@ -260,6 +270,16 @@ int NeuralNetwork::compile(ExecutionMode mode) {
   // (here the QNN context registers under the name "qnn").
   if (has_qnn_engine)
     model_graph.setComputeBackend("", "qnn");
+#if defined(ENABLE_OPENCL) && ENABLE_OPENCL == 1
+  // A graph with an OpenCL layer in it reads its tensors from the GPU, so
+  // allocate them where the GPU can read them: the OpenCL allocator hands out
+  // memory both sides address, and it is the allocator that can additionally
+  // place a tensor in device memory when the memory planner asks for it.
+  // Without this the pools stay on host memory and every GPU layer pays a copy
+  // in and a copy out, whatever the planner decided.
+  else if (has_gpu_engine)
+    model_graph.setComputeBackend("gpu", "gpu");
+#endif
 
   // QNN activation tensors are rpcmem-backed and registered with the DSP, so
   // their addresses must stay stable across decode tokens. Let inference()

@@ -26,10 +26,12 @@
 #include <context.h>
 #include <engine.h>
 #include <layer_node.h>
+#include <multiout_layer.h>
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <profiler.h>
+#include <residency_policy.h>
 #include <time_dist.h>
 #include <tracer.h>
 #include <util_func.h>
@@ -130,6 +132,26 @@ public:
  *
  */
 LayerNode::~LayerNode() = default;
+
+/**
+ * @brief Whether a node of this type must NOT vote its own engine onto the
+ *        tensor it shares with its producer. MultiOut is always neutral (an
+ *        in-place identity fan-out); the application declares any further
+ *        types through ResidencyPolicy, so no app-specific layer name is
+ *        hardcoded here.
+ *
+ * @note  This is the producer-side half of the predicate Manager::
+ *        requestInputs() applies on the consumer side; the two must agree
+ *        about a type or one plane's vote survives and the other's does not.
+ *
+ * @param type the node's registered layer type
+ * @return true if a node of this type must not stamp its engine on the
+ *         tensor it shares with its producer
+ */
+static bool isEngineNeutralNode(const std::string &type) {
+  return type == MultiOutLayer::type ||
+         nntrainer::ResidencyPolicy::global().isEngineNeutral(type);
+}
 
 /**
  * @brief map a registered engine NAME onto the residency-plane enum: the
@@ -718,6 +740,18 @@ InitLayerContext LayerNode::finalize(const std::vector<TensorDim> &input_dims,
     actual_input_dims, out_info, getInPlaceType() != InPlaceType::NONE,
     getName(), scope, max_norm, tensor_type, loss_scale, mode,
     toLayerComputeEngine(compute_engine));
+  /** An engine-neutral node must not stamp its own engine on the tensor it
+   *  shares with its producer. MultiOut is the auto-inserted fan-out: an
+   *  in-place identity that touches no data, whose real consumers register
+   *  their own engines on views resolving to the same source. An application
+   *  may declare further neutral types (ResidencyPolicy) for a layer that is
+   *  registered on one engine but binds its tensors on another. Without this,
+   *  such a node stamps the host plane onto the shared source, which both
+   *  demotes that source and clears all_consumers_device for every reader
+   *  behind it -- so one neutral node in the middle of a fan-out takes the
+   *  whole subtree off the device plane. */
+  if (isEngineNeutralNode(getType()))
+    context.setComputeEngine(ml::train::LayerComputeEngine::GPU);
 
   layer->finalize(context);
 

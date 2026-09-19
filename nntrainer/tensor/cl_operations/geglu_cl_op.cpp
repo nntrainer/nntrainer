@@ -96,18 +96,32 @@ void geglu_cl_op(const Tensor &in1, const Tensor &in2, Tensor &out,
   const auto md = in1.getMemoryData();
   const bool use_svm = md && md->isSVM();
 
+  // Bind whatever the residency planner placed in device memory on that
+  // plane. Without this an operand the producing FC wrote into its device
+  // buffer is read from a shared-plane shadow nothing ever wrote -- silently,
+  // since the kernel still runs and still produces a number.
+  const GatedClOperands dev{gatedClOperand(in1), gatedClOperand(in2),
+                            gatedClOperand(out)};
+  // A device buffer covers the WHOLE tensor and is bound from its base, so a
+  // row window carried as a pointer offset cannot be expressed on it. Every
+  // caller passes row_offset 0 (see geglu_layer.cpp); fail loudly rather than
+  // process the wrong rows if that ever changes.
+  if (dev.any() && elem_off != 0)
+    throw std::runtime_error("geglu_cl_op: a device-plane operand cannot be "
+                             "windowed by a row offset");
+
   const auto dt = in1.getDataType();
   if (dt == ml::train::TensorDim::DataType::FP32) {
     dispatchGatedClKernel<float>(
       getOpKernelPtrs()[Kernels::GEGLU_CL], in1.getData<float>() + elem_off,
       in2.getData<float>() + elem_off, out.getData<float>() + elem_off,
-      num_elems, use_svm);
+      num_elems, use_svm, dev);
   } else if (dt == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
     dispatchGatedClKernel<_FP16>(
       getOpKernelPtrs()[Kernels::GEGLU_CL_FP16],
       in1.getData<_FP16>() + elem_off, in2.getData<_FP16>() + elem_off,
-      out.getData<_FP16>() + elem_off, num_elems, use_svm);
+      out.getData<_FP16>() + elem_off, num_elems, use_svm, dev);
 #else
     throw std::invalid_argument("Error: enable-fp16 is not enabled");
 #endif

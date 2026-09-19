@@ -1,5 +1,6 @@
 cl_op_sources = [
   'blas_kernels.cpp',
+  'cl_buffer_pool.cpp',
   'blas_kernel_interface.cpp',
   'attention_kernel_interface.cpp',
   'attention_kernels.cpp',

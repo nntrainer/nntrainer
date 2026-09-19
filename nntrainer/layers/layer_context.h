@@ -530,7 +530,12 @@ public:
     if (t_w.getDataType() == Tdatatype::FP32 ||
         t_w.getDataType() == Tdatatype::FP16 ||
         t_w.getDataType() == Tdatatype::BCQ ||
-        t_w.getDataType() == Tdatatype::Q4_K) {
+        t_w.getDataType() == Tdatatype::Q4_K ||
+        t_w.getDataType() == Tdatatype::QS4CX) {
+      // A QS4CX int4 weight is consumed directly by the device int4 GEMM (and
+      // by the host int4 dot on CPU). Falling through to the placeholder
+      // branch below would hand back an uninitialised dequant buffer and make
+      // the int4 path refuse the call as "weight not int4".
       w = t_w;
       return;
     }

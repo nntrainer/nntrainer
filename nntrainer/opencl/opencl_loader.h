@@ -80,6 +80,13 @@ typedef cl_int(CL_API_CALL *PFN_clEnqueueWriteBuffer)(
   const void * /**< ptr */, cl_uint /**< num_events_in_wait_list */,
   const cl_event * /**< event_wait_list */, cl_event * /**< event */);
 
+typedef cl_int(CL_API_CALL *PFN_clEnqueueFillBuffer)(
+  cl_command_queue /**< command_queue */, cl_mem /**< buffer */,
+  const void * /**< pattern */, size_t /**< pattern_size */,
+  size_t /**< offset */, size_t /**< size */,
+  cl_uint /**< num_events_in_wait_list */,
+  const cl_event * /**< event_wait_list */, cl_event * /**< event */);
+
 typedef cl_int(CL_API_CALL *PFN_clEnqueueReadBuffer)(
   cl_command_queue /**< command_queue */, cl_mem /**< buffer */,
   cl_bool /**< blocking_read */, size_t /**< offset */, size_t /**< size */,
@@ -212,8 +219,8 @@ typedef cl_int(CL_API_CALL *PFN_clEnqueueSVMUnmap)(
   cl_uint /**< num_events_in_wait_list */,
   const cl_event * /**< event_wait_list */, cl_event * /**< event */);
 
-typedef cl_int (CL_API_CALL *PFN_clWaitForEvents)(cl_uint num_events,
-    const cl_event* event_list);
+typedef cl_int(CL_API_CALL *PFN_clWaitForEvents)(cl_uint num_events,
+                                                 const cl_event *event_list);
 
 extern PFN_clGetPlatformIDs clGetPlatformIDs;
 extern PFN_clGetDeviceIDs clGetDeviceIDs;
@@ -224,6 +231,7 @@ extern PFN_clCreateBuffer clCreateBuffer;
 extern PFN_clCreateSubBuffer clCreateSubBuffer;
 extern PFN_clCreateImage clCreateImage;
 extern PFN_clEnqueueWriteBuffer clEnqueueWriteBuffer;
+extern PFN_clEnqueueFillBuffer clEnqueueFillBuffer;
 extern PFN_clEnqueueReadBuffer clEnqueueReadBuffer;
 extern PFN_clEnqueueMapBuffer clEnqueueMapBuffer;
 extern PFN_clEnqueueUnmapMemObject clEnqueueUnmapMemObject;
