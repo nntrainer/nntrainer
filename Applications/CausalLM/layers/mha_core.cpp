@@ -154,15 +154,13 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   const unsigned int max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
 
-  /** max position embeddings */
-  max_position_embeddings =
-    std::get<props::MaxPositionEmbeddings>(mha_core_props).get();
-
   /** local window size */
   local_window_size = std::get<props::SlidingWindow>(mha_core_props).get();
 
   /** use rope */
   use_rope = std::get<props::UseRope>(mha_core_props).get();
+  if (use_rope)
+    checkMaxTimestepBound(max_timestep);
 
   /** attention scaling computation */
   rope_scaling_type = std::get<props::RopeScalingType>(mha_core_props).get();
@@ -864,9 +862,19 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
 /************************************************************** */
 
+void MHACoreLayer::checkMaxTimestepBound(unsigned int max_timestep) {
+  const unsigned int max_position_embeddings =
+    std::get<props::MaxPositionEmbeddings>(mha_core_props).get();
+  NNTR_THROW_IF(max_timestep > max_position_embeddings, std::invalid_argument)
+    << "max_timestep (" << max_timestep << ") exceeds max_position_embeddings ("
+    << max_position_embeddings
+    << "); RoPE positions would extrapolate beyond the model's trained "
+       "context length";
+}
+
 /**
  * @brief rotary embedding-related member function
- * @note seq_len -> max_position_embeddings
+ * @note seq_len is the runtime KV-cache capacity (max_timestep)
  */
 void MHACoreLayer::precompute_freqs(int head_dim, unsigned int seq_len,
                                     float theta, bool is_fp16) {
@@ -1086,11 +1094,15 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
   unsigned int max_timestep =
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
 
+  // RoPE positions are indexed by the runtime KV-cache position. The model's
+  // max_position_embeddings can be much larger than the configured execution
+  // length, so using it here would allocate unused LUT entries.
+
   if (in.getDataType() == ml::train::TensorDim::DataType::FP32) {
-    if (freqs_fp32 == nullptr) {
+    if (freqs_fp32 == nullptr || freqs_fp32->cos.size() < max_timestep) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      if (freqs_fp32 == nullptr) {
-        precompute_freqs(head_dim, max_position_embeddings, theta, false);
+      if (freqs_fp32 == nullptr || freqs_fp32->cos.size() < max_timestep) {
+        precompute_freqs(head_dim, max_timestep, theta, false);
       }
     }
     std::vector<float> *cos_ = nullptr;
@@ -1138,10 +1150,10 @@ void MHACoreLayer::apply_rotary_emb_tensor_v2(nntrainer::Tensor &in,
     }
   } else if (in.getDataType() == ml::train::TensorDim::DataType::FP16) {
 #ifdef ENABLE_FP16
-    if (freqs_fp16 == nullptr) {
+    if (freqs_fp16 == nullptr || freqs_fp16->cos.size() < max_timestep) {
       const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      if (freqs_fp16 == nullptr) {
-        precompute_freqs(head_dim, max_position_embeddings, theta, true);
+      if (freqs_fp16 == nullptr || freqs_fp16->cos.size() < max_timestep) {
+        precompute_freqs(head_dim, max_timestep, theta, true);
       }
     }
     std::vector<_FP16> *cos_ = nullptr;
@@ -1515,9 +1527,9 @@ void MHACoreLayer::updateTensorsByInputDimensions(
     std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
   unsigned int &max_new_tokens =
     std::get<props::MaxNewTokens>(mha_core_props).get();
-  max_position_embeddings =
-    std::get<props::MaxPositionEmbeddings>(mha_core_props).get();
   max_timestep = height + max_new_tokens;
+  if (use_rope)
+    checkMaxTimestepBound(max_timestep);
 
   ml::train::TensorDim kv_dim = input_dimensions[0];
   kv_dim.width(kv_dim.width() / (num_heads_Q / num_heads_KV));

@@ -403,9 +403,6 @@ private:
   std::array<unsigned int, 7> tensor_idx;
   unsigned int sink_idx;
 
-  /** attention parameters */
-  unsigned int max_position_embeddings;
-
   /** rope_scaling parameters */
   std::string rope_scaling_type;
   float attention_scaling = 1.0f;
@@ -451,6 +448,14 @@ private:
    */
   void precompute_freqs(int head_dim, unsigned int seq_len,
                         float theta = 10000.0, bool is_fp16 = false);
+
+  /**
+   * @brief verify that the runtime KV-cache capacity does not exceed the
+   * model's trained max_position_embeddings, since RoPE positions beyond
+   * that range were never seen during training
+   * @param[in] max_timestep runtime KV-cache capacity to validate
+   */
+  void checkMaxTimestepBound(unsigned int max_timestep);
 
   /**
    * @brief _compute frequency parameters for default ROPE
