@@ -219,7 +219,18 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor conv_out = context.getTensor(tensor_idx[CONV_OUT])
                                  .getSharedDataTensor(mid_dim, 0, true);
 
-  in_step.dot(in_w, proj, false, false);
+  // Under compare the projections go through the CPU Q4_0 GEMM directly:
+  // with engine=htp on this layer, dot() would route them to the HTP FC
+  // path and the "reference" would carry the same quantization points as
+  // the fused call (the first DIFF run measured that as 150 dB and proved
+  // the kernel, not the numerics -- doc 51 section 2.9).
+  if (compare) {
+    nntrainer::gemm_q4_0<float>(rows, 3 * C, K, in_step.getData<float>(), K,
+                                in_w.getData<char>(), 3 * C,
+                                proj.getData<float>(), 3 * C);
+  } else {
+    in_step.dot(in_w, proj, false, false);
+  }
 
   const float *p = proj.getData<float>();
   float *g = gated.getData<float>();
@@ -253,7 +264,12 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       0, static_cast<size_t>(rows), gate_post);
   }
 
-  conv_out.dot(out_w, out_step, false, false);
+  if (compare) {
+    nntrainer::gemm_q4_0<float>(rows, N, C, y, C, out_w.getData<char>(), N,
+                                out_step.getData<float>(), N);
+  } else {
+    conv_out.dot(out_w, out_step, false, false);
+  }
 
   if (compare) {
     // The CPU path above is the reference; the accelerator recomputes
