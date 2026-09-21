@@ -17,6 +17,7 @@
 #include <layer_context.h>
 #include <nntrainer_error.h>
 #include <node_exporter.h>
+#include <q4_0_utils.h>
 #include <thread_manager.h>
 
 #include <algorithm>
@@ -88,6 +89,97 @@ static double outlierRatio(const float *x, unsigned int rows, unsigned int k) {
     acc += mx / std::sqrt(ss / k + 1e-30);
   }
   return acc / rows;
+}
+
+/* ---- weight-recipe emulation, f32 on the CPU (doc 51 section 2.11) ----
+   What each way of quantizing the two projections' weights would cost,
+   measured before any of them is built on the DSP. The weights come out
+   of the file as Q4_0 (a scale per 32 along K); the DSP path requantizes
+   them at load to one int4 scale per output channel. Each recipe below
+   takes the dequantized f32 weight, quantizes it its own way, and runs
+   the block in f32 with the activations through the DSP's per-row u8
+   rule, so the SNRs are comparable to the accelerator's own. */
+
+/** out[t][n] = sum_k x[t][k] * w[n][k]; w is N rows of K, as
+ *  Q4_0Utils::dequantizeQ4_0x4 lays it out. */
+static void emuGemm(const float *x, unsigned int rows, unsigned int K,
+                    const float *w, unsigned int N, float *out) {
+  nntrainer::ThreadManager::Global().parallel_for(
+    0, static_cast<size_t>(rows), [&](size_t t) {
+      const float *xr = x + t * K;
+      float *o = out + t * N;
+      for (unsigned int n = 0; n < N; ++n) {
+        const float *wr = w + static_cast<size_t>(n) * K;
+        float acc = 0.f;
+        for (unsigned int k = 0; k < K; ++k)
+          acc += xr[k] * wr[k];
+        o[n] = acc;
+      }
+    });
+}
+
+/** The load-time rule (htp_qs4cx_from_q4_0x4): per output channel,
+ *  scale = 15 / (rmax - rmin) with 0 folded in, round, clamp to [-8, 7]. */
+static void quantChannelsCur(float *w, unsigned int N, unsigned int K) {
+  for (unsigned int n = 0; n < N; ++n) {
+    float *row = w + static_cast<size_t>(n) * K;
+    float lo = 0.f, hi = 0.f;
+    for (unsigned int k = 0; k < K; ++k) {
+      lo = std::min(lo, row[k]);
+      hi = std::max(hi, row[k]);
+    }
+    const float scale = (lo == hi) ? 1.f : 15.f / (hi - lo);
+    for (unsigned int k = 0; k < K; ++k) {
+      long q = std::lrint(row[k] * scale);
+      q = std::max(-8L, std::min(7L, q));
+      row[k] = static_cast<float>(q) / scale;
+    }
+  }
+}
+
+/** Symmetric per channel: step = max|w| / qmax, clamp to [-qmax, qmax]. */
+static void quantChannelsSym(float *w, unsigned int N, unsigned int K,
+                             long qmax) {
+  for (unsigned int n = 0; n < N; ++n) {
+    float *row = w + static_cast<size_t>(n) * K;
+    float mx = 0.f;
+    for (unsigned int k = 0; k < K; ++k)
+      mx = std::max(mx, std::fabs(row[k]));
+    const float step = mx > 0.f ? mx / static_cast<float>(qmax) : 1.f;
+    for (unsigned int k = 0; k < K; ++k) {
+      long q = std::lrint(row[k] / step);
+      q = std::max(-qmax, std::min(qmax, q));
+      row[k] = static_cast<float>(q) * step;
+    }
+  }
+}
+
+/** SmoothQuant, alpha = 1/2: input channel k of x divided by s_k, row k of
+ *  the weight (its column k of every output channel) multiplied by it,
+ *  s_k = sqrt(max_t |x[t][k]|) / sqrt(max_n |w[n][k]|). The product is
+ *  unchanged; the two quantizers see flatter inputs. Stats from this
+ *  call's own rows -- calibration on the test prompt, optimistic by a
+ *  little. */
+static void smoothInPlace(float *x, unsigned int rows, unsigned int K, float *w,
+                          unsigned int N) {
+  std::vector<float> xmax(K, 0.f), wmax(K, 0.f);
+  for (unsigned int t = 0; t < rows; ++t)
+    for (unsigned int k = 0; k < K; ++k)
+      xmax[k] = std::max(xmax[k], std::fabs(x[static_cast<size_t>(t) * K + k]));
+  for (unsigned int n = 0; n < N; ++n)
+    for (unsigned int k = 0; k < K; ++k)
+      wmax[k] = std::max(wmax[k], std::fabs(w[static_cast<size_t>(n) * K + k]));
+  std::vector<float> sk(K, 1.f);
+  for (unsigned int k = 0; k < K; ++k) {
+    if (xmax[k] > 0.f && wmax[k] > 0.f)
+      sk[k] = std::sqrt(xmax[k]) / std::sqrt(wmax[k]);
+  }
+  for (unsigned int t = 0; t < rows; ++t)
+    for (unsigned int k = 0; k < K; ++k)
+      x[static_cast<size_t>(t) * K + k] /= sk[k];
+  for (unsigned int n = 0; n < N; ++n)
+    for (unsigned int k = 0; k < K; ++k)
+      w[static_cast<size_t>(n) * K + k] *= sk[k];
 }
 
 static double snrDb(const float *ref, const float *got, size_t n) {
@@ -366,6 +458,68 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                  snrDb(out_step.getData<float>(), o_fq.data(), o_fq.size()),
                  g_snr, x_ratio, y_ratio,
                  convBlockShadowEnabled() ? "  (shadow: CPU values used)" : "");
+
+    // The weight recipes, emulated in f32 (see the helpers above). The
+    // accelerator's own row is recipe 0 done for real; if the emulation
+    // of it lands near the measured number the others are trustworthy.
+    {
+      std::vector<float> w_in_f(static_cast<size_t>(3) * C * K);
+      std::vector<float> w_out_f(static_cast<size_t>(N) * C);
+      nntrainer::Q4_0Utils::dequantizeQ4_0x4(
+        in_w.getData<char>(), static_cast<int>(3 * C), static_cast<int>(K),
+        w_in_f.data());
+      nntrainer::Q4_0Utils::dequantizeQ4_0x4(
+        out_w.getData<char>(), static_cast<int>(N), static_cast<int>(C),
+        w_out_f.data());
+      static const char *const names[] = {"cur int4/ch", "sym int4/ch",
+                                          "smooth+int4/ch", "int8/ch"};
+      std::string line = "[conv_block]   recipes (f32 emulation, act u8):";
+      for (int rcp = 0; rcp < 4; ++rcp) {
+        std::vector<float> xr(in_step.getData<float>(),
+                              in_step.getData<float>() +
+                                static_cast<size_t>(rows) * K);
+        std::vector<float> win(w_in_f), wout(w_out_f);
+        if (rcp == 2)
+          smoothInPlace(xr.data(), rows, K, win.data(), 3 * C);
+        if (rcp == 0)
+          quantChannelsCur(win.data(), 3 * C, K);
+        else
+          quantChannelsSym(win.data(), 3 * C, K, rcp == 3 ? 127L : 7L);
+        fakeQuantRowsU8(xr.data(), rows, K);
+        std::vector<float> pr(static_cast<size_t>(rows) * 3 * C);
+        emuGemm(xr.data(), rows, K, win.data(), 3 * C, pr.data());
+        std::vector<float> gr(static_cast<size_t>(rows) * C),
+          yr(static_cast<size_t>(rows) * C);
+        for (size_t r = 0; r < rows; ++r) {
+          const float *a = pr.data() + r * 3 * C;
+          for (unsigned int j = 0; j < C; ++j)
+            gr[r * C + j] = a[j] * a[2 * C + j];
+        }
+        nntrainer::causal_depthwise_conv1d_k3(gr.data(), w_ptr, nullptr,
+                                              yr.data(), 1, rows, C);
+        for (size_t r = 0; r < rows; ++r) {
+          const float *b = pr.data() + r * 3 * C + C;
+          for (unsigned int j = 0; j < C; ++j)
+            yr[r * C + j] = b[j] * yr[r * C + j];
+        }
+        if (rcp == 2)
+          smoothInPlace(yr.data(), rows, C, wout.data(), N);
+        if (rcp == 0)
+          quantChannelsCur(wout.data(), N, C);
+        else
+          quantChannelsSym(wout.data(), N, C, rcp == 3 ? 127L : 7L);
+        fakeQuantRowsU8(yr.data(), rows, C);
+        std::vector<float> orow(static_cast<size_t>(rows) * N);
+        emuGemm(yr.data(), rows, C, wout.data(), N, orow.data());
+        char buf[96];
+        std::snprintf(
+          buf, sizeof(buf), "  %s out %.1f g %.1f |", names[rcp],
+          snrDb(out_step.getData<float>(), orow.data(), orow.size()),
+          snrDb(g, gr.data(), gr.size()));
+        line += buf;
+      }
+      std::fprintf(stderr, "%s\n", line.c_str());
+    }
     if (!convBlockShadowEnabled()) {
       std::memcpy(out_step.getData<float>(), h_out.data(),
                   h_out.size() * sizeof(float));
