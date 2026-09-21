@@ -19,6 +19,9 @@
 #include <node_exporter.h>
 #include <thread_manager.h>
 
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -27,6 +30,31 @@ namespace causallm {
 static constexpr size_t SINGLE_INOUT_IDX = 0;
 enum ConvBlockParams { IN_PROJ, CONV_W, OUT_PROJ };
 enum ConvBlockTensors { PROJ, GATED, CONV_OUT, STATE };
+
+/** NNTR_CONV_BLOCK_DIFF: run both paths at prefill and print the SNR of
+ *  the accelerator's output and conv state against the CPU's, per layer.
+ *  NNTR_CONV_BLOCK_SHADOW: same, and hand the model the CPU's values --
+ *  the text then says whether the accelerator's numbers are what changed
+ *  it. The same two discriminators the MoE path has (NNTR_L2_DIFF /
+ *  NNTR_L2_SHADOW), for the same reason: wrong text cannot tell a bug
+ *  from a quantization point. */
+static bool convBlockDiffEnabled() {
+  static const bool on = std::getenv("NNTR_CONV_BLOCK_DIFF") != nullptr;
+  return on;
+}
+static bool convBlockShadowEnabled() {
+  static const bool on = std::getenv("NNTR_CONV_BLOCK_SHADOW") != nullptr;
+  return on;
+}
+static double snrDb(const float *ref, const float *got, size_t n) {
+  double sig = 0.0, err = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    const double d = (double)ref[i] - (double)got[i];
+    sig += (double)ref[i] * (double)ref[i];
+    err += d * d;
+  }
+  return err == 0.0 ? 999.0 : 10.0 * std::log10(sig / err);
+}
 
 ConvBlockLayer::ConvBlockLayer() :
   LayerImpl(), conv_props(nntrainer::props::Unit()) {
@@ -160,8 +188,12 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // row cannot amortize the call.
   const auto q4 = ml::train::TensorDim::DataType::Q4_0;
   auto *ops = in_step.getOps();
-  if (rows > 1 && ops != nullptr && ops->supports_gemm_q4_0_conv_block_fp32() &&
-      in_w.getDataType() == q4 && out_w.getDataType() == q4) {
+  const bool use_htp = rows > 1 && ops != nullptr &&
+                       ops->supports_gemm_q4_0_conv_block_fp32() &&
+                       in_w.getDataType() == q4 && out_w.getDataType() == q4;
+  const bool compare =
+    use_htp && (convBlockDiffEnabled() || convBlockShadowEnabled());
+  if (use_htp && !compare) {
     ops->gemm_q4_0_conv_block_fp32(
       in_w.getData<char>(), w_ptr, out_w.getData<char>(),
       in_step.getData<float>(), out_step.getData<float>(), state, rows, K, C,
@@ -222,6 +254,27 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   }
 
   conv_out.dot(out_w, out_step, false, false);
+
+  if (compare) {
+    // The CPU path above is the reference; the accelerator recomputes
+    // the same step from the same input into its own buffers.
+    std::vector<float> h_out(static_cast<size_t>(rows) * N);
+    std::vector<float> h_state(static_cast<size_t>(2) * C);
+    ops->gemm_q4_0_conv_block_fp32(
+      in_w.getData<char>(), w_ptr, out_w.getData<char>(),
+      in_step.getData<float>(), h_out.data(), h_state.data(), rows, K, C, N);
+    std::fprintf(stderr,
+                 "[conv_block] %s rows=%u  SNR out %.1f dB  state %.1f dB%s\n",
+                 context.getName().c_str(), rows,
+                 snrDb(out_step.getData<float>(), h_out.data(), h_out.size()),
+                 snrDb(state, h_state.data(), h_state.size()),
+                 convBlockShadowEnabled() ? "  (shadow: CPU values used)" : "");
+    if (!convBlockShadowEnabled()) {
+      std::memcpy(out_step.getData<float>(), h_out.data(),
+                  h_out.size() * sizeof(float));
+      std::memcpy(state, h_state.data(), h_state.size() * sizeof(float));
+    }
+  }
 }
 
 void ConvBlockLayer::updateTensorsByInputDimensions(
