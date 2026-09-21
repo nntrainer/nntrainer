@@ -19,6 +19,7 @@
 #include <node_exporter.h>
 #include <thread_manager.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -46,6 +47,49 @@ static bool convBlockShadowEnabled() {
   static const bool on = std::getenv("NNTR_CONV_BLOCK_SHADOW") != nullptr;
   return on;
 }
+/** The DSP's per-row u8 rule (hvx_quant_rows_u8_params + the pack), in
+ *  f32: min and max over the row with 0 folded in, 255 steps, round to
+ *  nearest, then back to f32. Applied to the CPU path's activations it
+ *  isolates what the two activation points cost, apart from the weight
+ *  recipe (doc 51 section 2.10). */
+static void fakeQuantRowsU8(float *x, unsigned int rows, unsigned int k) {
+  for (unsigned int r = 0; r < rows; ++r) {
+    float *row = x + static_cast<size_t>(r) * k;
+    float lo = 0.f, hi = 0.f;
+    for (unsigned int j = 0; j < k; ++j) {
+      lo = std::min(lo, row[j]);
+      hi = std::max(hi, row[j]);
+    }
+    float s = (hi - lo) / 255.f;
+    if (s <= 0.f)
+      s = 1e-8f;
+    long zp = std::lrint(-lo / s);
+    zp = std::max(0L, std::min(255L, zp));
+    for (unsigned int j = 0; j < k; ++j) {
+      long q = std::lrint(row[j] / s) + zp;
+      q = std::max(0L, std::min(255L, q));
+      row[j] = static_cast<float>(q - zp) * s;
+    }
+  }
+}
+
+/** Mean over rows of max|x| / rms(x): how far the row's largest value sits
+ *  above its typical one. Per-row u8 spends its 255 steps on the range, so
+ *  this ratio is what decides how many steps the typical value gets. */
+static double outlierRatio(const float *x, unsigned int rows, unsigned int k) {
+  double acc = 0.0;
+  for (unsigned int r = 0; r < rows; ++r) {
+    const float *row = x + static_cast<size_t>(r) * k;
+    double ss = 0.0, mx = 0.0;
+    for (unsigned int j = 0; j < k; ++j) {
+      ss += (double)row[j] * row[j];
+      mx = std::max(mx, std::fabs((double)row[j]));
+    }
+    acc += mx / std::sqrt(ss / k + 1e-30);
+  }
+  return acc / rows;
+}
+
 static double snrDb(const float *ref, const float *got, size_t n) {
   double sig = 0.0, err = 0.0;
   for (size_t i = 0; i < n; ++i) {
@@ -279,11 +323,48 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     ops->gemm_q4_0_conv_block_fp32(
       in_w.getData<char>(), w_ptr, out_w.getData<char>(),
       in_step.getData<float>(), h_out.data(), h_state.data(), rows, K, C, N);
+    // The activation points alone: the CPU path again with x and y put
+    // through the DSP's per-row u8 rule (weights still Q4_0). Its SNR
+    // against the reference, next to the accelerator's, says whether the
+    // loss is the activations or the weight recipe.
+    std::vector<float> x_fq(in_step.getData<float>(),
+                            in_step.getData<float>() +
+                              static_cast<size_t>(rows) * K);
+    const double x_ratio = outlierRatio(x_fq.data(), rows, K);
+    fakeQuantRowsU8(x_fq.data(), rows, K);
+    std::vector<float> p_fq(static_cast<size_t>(rows) * 3 * C);
+    nntrainer::gemm_q4_0<float>(rows, 3 * C, K, x_fq.data(), K,
+                                in_w.getData<char>(), 3 * C, p_fq.data(),
+                                3 * C);
+    std::vector<float> g_fq(static_cast<size_t>(rows) * C),
+      y_fq(static_cast<size_t>(rows) * C);
+    for (size_t r = 0; r < rows; ++r) {
+      const float *a = p_fq.data() + r * 3 * C;
+      for (unsigned int j = 0; j < C; ++j)
+        g_fq[r * C + j] = a[j] * a[2 * C + j];
+    }
+    nntrainer::causal_depthwise_conv1d_k3(g_fq.data(), w_ptr, nullptr,
+                                          y_fq.data(), 1, rows, C);
+    for (size_t r = 0; r < rows; ++r) {
+      const float *b = p_fq.data() + r * 3 * C + C;
+      for (unsigned int j = 0; j < C; ++j)
+        y_fq[r * C + j] = b[j] * y_fq[r * C + j];
+    }
+    const double y_ratio = outlierRatio(y_fq.data(), rows, C);
+    const double g_snr = snrDb(g, g_fq.data(), g_fq.size());
+    fakeQuantRowsU8(y_fq.data(), rows, C);
+    std::vector<float> o_fq(static_cast<size_t>(rows) * N);
+    nntrainer::gemm_q4_0<float>(rows, N, C, y_fq.data(), C,
+                                out_w.getData<char>(), N, o_fq.data(), N);
     std::fprintf(stderr,
-                 "[conv_block] %s rows=%u  SNR out %.1f dB  state %.1f dB%s\n",
+                 "[conv_block] %s rows=%u  SNR out %.1f dB  state %.1f dB | "
+                 "act-u8 only: out %.1f g %.1f | outlier max/rms x %.1f "
+                 "y %.1f%s\n",
                  context.getName().c_str(), rows,
                  snrDb(out_step.getData<float>(), h_out.data(), h_out.size()),
                  snrDb(state, h_state.data(), h_state.size()),
+                 snrDb(out_step.getData<float>(), o_fq.data(), o_fq.size()),
+                 g_snr, x_ratio, y_ratio,
                  convBlockShadowEnabled() ? "  (shadow: CPU values used)" : "");
     if (!convBlockShadowEnabled()) {
       std::memcpy(out_step.getData<float>(), h_out.data(),
