@@ -60,8 +60,9 @@ typedef struct {
   uint32_t act_off;    /**< one 64-row activation block, AH tiles */
   uint32_t w_a_off;    /**< slot A: W_a (phase 1), then W_b (phase 2) */
   uint32_t w_b_off;    /**< slot B: W_c (phase 1), then W_out (phase 2) */
-  uint32_t z_off;      /**< [64 x C] f32: dq(b), gated in place */
-  uint32_t mid_off;    /**< z requantized, AH tiles: out_proj's input */
+  uint32_t z_off;      /**< TWO [64 x C] f32: dq(b), gated in place; phase
+                            2 keeps two blocks in flight */
+  uint32_t mid_off;    /**< TWO blocks of z requantized, AH tiles */
   uint32_t conv_w_off; /**< [3 x C] f32, copied in from the call's buffer */
   uint32_t result_off; /**< two staging buffers of acc_tiles tiles each */
   uint32_t acc_tiles;  /**< tiles per staging buffer; even, >= 2 */
