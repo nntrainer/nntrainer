@@ -23,9 +23,6 @@
 #include <context.h>
 #include <dynamic_library_loader.h>
 #include <engine.h>
-#if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
-#include <htp_context.h>
-#endif
 
 static std::string solib_suffix = ".so";
 static std::string contextlib_suffix = "context.so";
@@ -65,11 +62,6 @@ void Engine::add_default_object() {
   auto &cl_context = nntrainer::ClContext::Global();
 
   registerContext("gpu", &cl_context);
-#endif
-
-#if defined(ENABLE_HEXKL) && ENABLE_HEXKL == 1
-  auto &htp_context = nntrainer::HtpContext::Global();
-  registerContext("htp", &htp_context);
 #endif
 
 #if defined(ENABLE_NPU) && ENABLE_NPU == 1

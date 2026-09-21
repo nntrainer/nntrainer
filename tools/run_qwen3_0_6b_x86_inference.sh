@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-IMAGE="${IMAGE:-nntrainer-qwen3-x86:ubuntu24.04}"
+IMAGE="${IMAGE:-nntrainer-hexagon-dev:ubuntu24.04}"
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/Applications/CausalLM/res/qwen3/qwen3-0.6b}"
 BUILD_DIR="${BUILD_DIR:-build-x86}"
 THREADS="${THREADS:-4}"
@@ -20,7 +20,7 @@ Usage:
 
 Options:
   --model-dir PATH   nntrainer model directory mounted as /model.
-  --image NAME       Docker image to use. Default: nntrainer-qwen3-x86:ubuntu24.04
+  --image NAME       Docker image to use. Default: nntrainer-hexagon-dev:ubuntu24.04 (tools/docker/Dockerfile)
   --build-dir PATH   Meson build directory. Default: build-x86
   --threads N        NNTR_NUM_THREADS value. Default: 4
   --build            Build Applications/CausalLM/nntr_causallm before running.

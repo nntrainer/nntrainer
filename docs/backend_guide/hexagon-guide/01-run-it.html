@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hexagon backend guide — 01 Run it</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb;
+    --panel: #f3f3f1;
+    --text-1: #0b0b0b;
+    --text-2: #52514e;
+    --grid: #d9d8d3;
+    --w: #2a78d6;      /* weights  (slot 1 blue)   */
+    --w-light: #cde2fb;
+    --x: #eb6834;      /* activations (slot 2 orange) */
+    --x-light: #fbd9cc;
+    --acc: #1baf7a;    /* accumulator / output (slot 3 aqua) */
+    --acc-light: #cdeee0;
+    --dim: #b7b6b0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface: #1a1a19;
+      --panel: #242423;
+      --text-1: #ffffff;
+      --text-2: #c3c2b7;
+      --grid: #3a3a38;
+      --w: #3987e5;
+      --w-light: #1c3a5e;
+      --x: #d95926;
+      --x-light: #5a2a17;
+      --acc: #199e70;
+      --acc-light: #16442f;
+      --dim: #5a5a57;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 48px;
+    background: var(--surface); color: var(--text-1);
+    font: 15px/1.55 -apple-system, "Segoe UI", "Noto Sans KR", Roboto, sans-serif;
+    max-width: 1240px; margin-inline: auto;
+  }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 8px; }
+  .sub { color: var(--text-2); margin: 0 0 28px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 28px; }
+  @media (max-width: 900px) { .row { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border-radius: 10px; padding: 18px 18px 14px;
+  }
+  .panel p { color: var(--text-2); margin: 6px 0 0; font-size: 14px; }
+  .panel .verdict { margin-top: 10px; font-size: 14px; color: var(--text-1); }
+  svg { width: 100%; height: auto; display: block; }
+  text { font-family: inherit; fill: var(--text-1); }
+  .t2 { fill: var(--text-2); }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--text-2); margin: 0 0 22px; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+    margin-right: 6px; vertical-align: -2px; background: var(--c);
+  }
+  .ctrl { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text-2); margin: 6px 0 4px; }
+  .ctrl input[type=range] { width: 160px; accent-color: var(--w); }
+  .ctrl button {
+    border: 1px solid var(--grid); background: var(--surface); color: var(--text-1);
+    border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin-top: 4px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { color: var(--text-2); font-weight: 600; }
+  td:first-child { color: var(--text-2); white-space: nowrap; }
+  .note { color: var(--text-2); font-size: 13px; margin-top: 18px; }
+  .tip {
+    position: fixed; pointer-events: none; background: var(--text-1); color: var(--surface);
+    padding: 6px 9px; border-radius: 6px; font-size: 12px; line-height: 1.4;
+    opacity: 0; transition: opacity .08s; white-space: nowrap; z-index: 10;
+  }
+</style>
+<style>
+  /* guide additions: identical on every page of hexagon-guide/ */
+  nav.guide { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; margin: 0 0 24px; padding: 10px 0; border-block: 1px solid var(--grid); }
+  nav.guide a { color: var(--text-2); text-decoration: none; }
+  nav.guide a.here { color: var(--text-1); font-weight: 600; }
+  nav.guide a:hover { color: var(--w); }
+  a { color: var(--w); }
+  .panel { margin-bottom: 24px; }
+  .panel ul, .panel ol { color: var(--text-2); font-size: 14px; margin: 6px 0 0; padding-left: 22px; }
+  .panel li { margin: 3px 0; }
+  .panel li b, .panel p b { color: var(--text-1); }
+  pre { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 10px 12px; font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; overflow-x: auto; margin: 8px 0; color: var(--text-1); white-space: pre; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.93em; }
+  .src { color: var(--text-2); font-size: 12px; }
+  .status { border-left: 4px solid var(--acc); }
+  .warn { border-left: 4px solid var(--x); }
+  .step { counter-increment: step; }
+  .kv td:first-child { white-space: normal; }
+  dl.gl { margin: 0; font-size: 14px; }
+  dl.gl dt { font-weight: 600; margin-top: 10px; }
+  dl.gl dd { margin: 2px 0 0; color: var(--text-2); }
+  td, th { word-break: break-word; }
+  td:first-child { white-space: normal; }
+</style>
+</head>
+<body>
+<nav class="guide">
+  <a href="index.html">Overview</a>
+  <a class="here" href="01-run-it.html">01 Run it</a>
+  <a href="02-architecture.html">02 Architecture</a>
+  <a href="03-kernels.html">03 Kernels</a>
+  <a href="04-measure-and-debug.html">04 Measure and debug</a>
+  <a href="05-glossary.html">05 Glossary</a>
+  <a href="06-performance.html">06 Performance</a>
+</nav>
+<h1>01 · Run it: from a clean clone to a token on the phone</h1>
+<p class="sub">Six stages, in the order the project's own verification ladder uses them (skill <code>hexagon-gates</code>, HEXAGON.md §5). Stages 1–4 run on your Mac inside a container and need no phone. Stage 5 is a file you hand to the person with the phone. Stage 6 is the app switch. Nothing here is a build log: these are the commands as the scripts and docs define them.</p>
+
+<div class="panel">
+  <h2>Who runs what</h2>
+  <svg viewBox="0 0 760 170" role="img" aria-label="Mac with container on the left, workstation with phone on the right, a measurement file passing between them">
+    <rect x="10" y="20" width="330" height="130" rx="10" fill="none" stroke="var(--grid)"/>
+    <text x="24" y="44" font-size="13" font-weight="600">Mac + Docker container (you, or an agent)</text>
+    <text x="24" y="68" font-size="12" class="t2">edit · x86 reference · simulator · skel + harness cross-build</text>
+    <rect x="24" y="84" width="300" height="50" rx="6" fill="var(--w-light)"/>
+    <text x="34" y="104" font-size="12">tools/docker/run.sh &lt;command&gt;</text>
+    <text x="34" y="122" font-size="11" class="t2">repo at /work · SDK at /opt/qcom/Hexagon_SDK · model at /model</text>
+    <rect x="420" y="20" width="330" height="130" rx="10" fill="none" stroke="var(--grid)"/>
+    <text x="434" y="44" font-size="13" font-weight="600">Workstation + Galaxy S25 Ultra (a person only)</text>
+    <text x="434" y="68" font-size="12" class="t2">adb · run_device_test.sh · run_e2e_test.sh</text>
+    <rect x="434" y="84" width="300" height="50" rx="6" fill="var(--acc-light)"/>
+    <text x="444" y="104" font-size="12">fills docs/measurements/&lt;issue#&gt;-&lt;slug&gt;.md</text>
+    <text x="444" y="122" font-size="11" class="t2">label state:needs-measurement → state:measured</text>
+    <line x1="340" y1="80" x2="420" y2="80" stroke="var(--x)" stroke-width="2"/>
+    <text x="380" y="72" font-size="11" text-anchor="middle" class="t2">handoff</text>
+    <line x1="420" y1="120" x2="340" y2="120" stroke="var(--acc)" stroke-width="2"/>
+    <text x="380" y="140" font-size="11" text-anchor="middle" class="t2">numbers</text>
+  </svg>
+  <p class="src">docs/plans/0000-agent-system-and-env.md §2 "Machines and the measurement loop"; tools/docker/README.md (host-path table).</p>
+</div>
+
+<div class="panel">
+  <h2>Stage 0 · One-time container setup: <code>tools/docker/setup_wizard.sh</code></h2>
+  <p>The wizard walks through the five things only a person can do and checks each; re-running it skips finished steps. You can run one step by name: <code>setup_wizard.sh sdk</code>. What each step does (from the script):</p>
+  <table>
+    <tr><th>Step</th><th>What happens</th><th>What you may be asked for</th></tr>
+    <tr><td>1/5 runtime</td><td>Checks <code>docker info</code> and that a <code>linux/amd64</code> container runs (the image is x86-64; on Apple silicon it runs under emulation).</td><td>Install OrbStack (<code>brew install --cask orbstack</code>) or Docker Desktop with Rosetta enabled.</td></tr>
+    <tr><td>2/5 image</td><td>Builds <code>nntrainer-hexagon-dev:ubuntu24.04</code>; downloads Android NDK r26d (~1 GB, 10–20 min).</td><td>Patience.</td></tr>
+    <tr><td>3/5 sdk</td><td>Installs the Hexagon SDK (6.4 or newer) with Qualcomm's package manager (<code>qpm-cli</code>) inside a throwaway container into <code>~/Qualcomm/Hexagon_SDK/&lt;ver&gt;/</code>. The SDK is licensed and is mounted, never baked into the image.</td><td>The Linux x86 <code>.deb</code> of Qualcomm Package Manager 3 saved into <code>~/Qualcomm/downloads</code>, and your Qualcomm login. Product name <code>hexagonsdk6.x</code>; newest version unless <code>QPM_SDK_VERSION</code> is set.</td></tr>
+    <tr><td>4/5 model</td><td>Downloads the public Qwen/Qwen3-0.6B files (~1.5 GB) into <code>Applications/CausalLM/res/qwen3/qwen3-0.6b/hf</code>, then builds the int8 checkpoint <code>nntr_qwen3_0.6b_w8cx_DEFAULT.bin</code> with <code>tools/hexagon/make_w8cx_bin.py</code>, the W8_CX <code>.bin</code> producer on this branch (numpy only; same primitive and tensor order as <code>nntr_quantize --fc_dtype W8_CX</code> on the hvx_m3 branch, which is not here) (~2 min). The size, 598,230,528 bytes, is the hard gate; the script then prints <code>md5 …</code> and warns <code>WARN: md5 differs from the #23 baseline (7562313bb4cc70410450d0ab3a4fa563)</code> if it is not the baseline's — another HuggingFace snapshot legitimately gives a different md5 at the same size, a stale or partial file does too, so read the warning as "check which", not "broken" (HEXAGON.md §2.4, §5.1; setup_wizard.sh).</td><td>Nothing.</td></tr>
+    <tr><td>5/5 check</td><td>Prints the SDK and NDK paths seen inside the container, builds the x86 tools and runs the lowering and checkpoint-reader tests.</td><td>Nothing.</td></tr>
+  </table>
+  <p>After that, <code>tools/docker/run.sh &lt;command&gt;</code> runs any command inside the container with the repo mounted at <code>/work</code>, the SDK at <code>/opt/qcom/Hexagon_SDK</code> and the model directory read-only at <code>/model</code>. It passes through the environment variables <code>HEX_ARCH</code>, <code>HEX_EXTRA_CFLAGS</code>, <code>SIM_TIMING</code>, <code>NNTR_NUM_THREADS</code>, <code>NNTR_REQUIRE_SDK</code> and <code>HEXAGON_SDK_VERSION</code>. The container entrypoint sources the SDK's <code>setup_sdk_env.source</code>, so <code>HEXAGON_SDK_ROOT</code>, <code>DEFAULT_HEXAGON_TOOLS_ROOT</code> and <code>DEFAULT_TOOLS_VARIANT</code> are set; the compiler is not on <code>PATH</code>, the scripts call it by full path.</p>
+  <p class="src">tools/docker/setup_wizard.sh, tools/docker/run.sh, tools/docker/README.md, tools/docker/Dockerfile (NDK r26d, API 31, ncurses 5 for the SDK 6.4 simulator). Toolchain inside the SDK: hexagon-clang 19.0.04, <code>toolv19</code> (HEXAGON.md §5.2).</p>
+</div>
+
+<div class="panel">
+  <h2>Stage 1 · x86 reference run (no SDK, seconds to minutes)</h2>
+  <p>Before any DSP code, the project has a plain-C scalar version of every kernel (<code>test/hexagon/sim/ref_ops.c</code>) and a program, <code>hexagon_ref_run</code>, that interprets a packed weight image with them. It is the accuracy oracle: the same fp16 + per-token int8 math the DSP does, run slowly and exactly on x86 (HEXAGON.md §5.1).</p>
+<pre>tools/docker/run.sh ./tools/hexagon/build_host_x86.sh
+tools/docker/run.sh ./build_x86_hexagon/test_lowering                  # LOWER_TEST PASS
+tools/docker/run.sh ./build_x86_hexagon/test_w8cx_bin /model/nntr_qwen3_0.6b_w8cx_DEFAULT.bin   # W8CX_BIN_TEST PASS
+tools/docker/run.sh bash -c 'gcc -Wall -Werror -o /tmp/t test/hexagon/test_oplist_header.c &amp;&amp; /tmp/t'
+
+# pack the image (~2 s) and make a token file, then evaluate
+tools/docker/run.sh ./build_x86_hexagon/nntr_hexpack /model/nntr_qwen3_0.6b_w8cx_DEFAULT.bin /work/build_x86_hexagon/qwen3_full
+tools/docker/run.sh python3 tools/hexagon/make_tokens.py /model/hf text.txt /work/build_x86_hexagon/t.i32 --limit 512
+tools/docker/run.sh ./build_x86_hexagon/hexagon_ref_run /work/build_x86_hexagon/qwen3_full --tokens /work/build_x86_hexagon/t.i32 --eval</pre>
+  <ul>
+    <li><code>nntr_hexpack &lt;bin&gt; &lt;prefix&gt; [--layers N] [--max-seq N] [--max-chunk N]</code> writes <code>&lt;prefix&gt;.hexw</code> (the weight image, 598,623,744 bytes for the full model, 172,498,944 for <code>--layers 1</code>) and <code>&lt;prefix&gt;.hexcfg</code> (12 <code>key=value</code> lines) — HEXAGON.md §2.4; the <code>--max-seq</code> / <code>--max-chunk</code> options are in <code>hex_pack.cpp</code>.</li>
+    <li><code>--eval</code> prints a teacher-forced perplexity (PPL) and a top-1 hit count. Reference values to compare against: the 512-token local prompt gives <b>PPL 33.0195 / top-1 184</b> on the workstation's gcc build (HEXAGON.md §5.1, re-run 2026-09-17). Note that the number can depend on the host compiler: on a different 512-token prompt the container's clang build gave 41.2365 / 161 and the workstation's gcc 13 build 41.5466 / 164, 0.75 % apart with no DSP involved (HEXAGON.md §5.1; 23-sdk64-baseline.md "Accuracy"). Always quote which build produced a reference.</li>
+    <li>Other modes: default (prefill in chunks, then greedy <code>--steps N</code>), <code>--dump-op i --dump-out f</code>, <code>--list-ops</code> (HEXAGON.md §5.1).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>Stage 2 · Simulator golden tests (needs the SDK; tens of minutes under emulation)</h2>
+  <p>The Hexagon simulator (<code>hexagon-sim</code>) boots a small real-time OS image (QuRT) and runs one named test that compares each DSP kernel against <code>ref_ops.c</code>. A pass prints <code>SIM_TEST &lt;name&gt; PASS</code> (HEXAGON.md §5.2).</p>
+<pre>HEX_ARCH=v75 tools/docker/run.sh ./tools/hexagon/build_sim_test.sh     # -> build_hexagon/sim/libnntr_sim_test.so
+HEX_ARCH=v75 tools/docker/run.sh ./tools/hexagon/run_sim_test.sh profile acc   # the per-task gate
+for t in smoke pool exp quant matmul matmul_dma rmsnorm rope eltwise embed attn logits graph; do
+  HEX_ARCH=v75 tools/docker/run.sh ./tools/hexagon/run_sim_test.sh $t || break
+done
+tools/docker/run.sh ./tools/hexagon/run_sim_test.sh hmx     # the 14th test since #68 (v79 default): needs HexKL on the mount, else "SIM_TEST hmx SKIP: built without HTP_HMX", rc 2</pre>
+  <ul>
+    <li><b>Budget.</b> Under Rosetta on the Mac, <code>profile acc</code> takes about 10 min and the 13 tests about 5 min (HEXAGON.md §8.3 SDK 6.4 re-run: 10m23s and 4m13s; skill <code>hexagon-gates</code>). Run <code>profile acc</code> per task and the 13 tests once before a PR; if no DSP file changed, skip both and say so. Since #68 the sweep also runs <code>hmx</code> when HexKL is mounted (it is counted as the 14th, and a SKIP is never a pass); a change that touches only <code>hmx/</code> or <code>test_hmx.c</code> runs <code>hmx</code> per step and the 13 + <code>hmx</code> once before the PR (skill <code>hexagon-gates</code> rung 3).</li>
+    <li><b>Expected on this branch.</b> Both arches pass 13/13 and <code>profile acc</code>: on v79 (the gate, the default of <code>build_sim_test.sh</code> / <code>run_sim_test.sh</code> since #35) <code>profile_prefill_acc STAT max_abs=0.0659682 max_rel=92.7791</code>, <code>quant_generic 0/65536</code>, every <code>matmul_w8a8_*</code> / <code>matmul_dma ref_*</code> / <code>logits</code> STAT <code>0/0</code>; on v75 (fallback, <code>HEX_ARCH=v75</code> on both commands) <code>0.0757427/66.5909</code>. Before #35 the same sources on v79 gave 9 PASS / 4 FAIL (<code>quant</code>, <code>matmul</code>, <code>matmul_dma</code>, <code>logits</code>, all ±1 LSB), traced to one sign bug in the quantiser decode and fixed by an integer decode (HEXAGON.md §5.2, §7 rule 6, §8.3 "#35 re-run"). Since #25 (PR #61, merged) the sweep also prints <code>SIM_TEST matmul_dma prefetch hits=6 workers=6</code> and leaves every STAT bit-identical — the prefetch cannot show in the simulator because it does not model DDR (HEXAGON.md §8.3 "#25 re-run"). Since #68 (PR #72, merged 2026-09-21) <code>build_sim_test.sh</code> prints <code>HexKL: /opt/qcom/hexkl_addon/lib/hexagon_toolv19_v79/libhexkl_micro.a (HTP_HMX=1)</code> when the addon is mounted, and the 14th test <code>hmx</code> passes on v79 with <code>SIM_TEST hmx lock rc=0 acc_layout usable=1 base=0 row_stride=32</code>, <code>hmx_mm_copy</code> / <code>hmx_mm_inplace</code> / <code>hmx_mm_reloc</code> STAT <code>max_abs=0</code> and <code>wh_reloc bytes_same=1</code>: the plain <code>-mv79</code> simulator core (<code>v79na_1</code>, HMX v3) executes HMX bit-exactly, so HMX numeric tests are simulator gates like the other 13 (HEXAGON.md §5.2, §7 rule 11). The 13 HVX STATs and <code>profile acc</code> are bit-identical in the HexKL build (the arena sits above the HVX slabs; HEXAGON.md §2.2). Without HexKL the test prints <code>SIM_TEST hmx SKIP: built without HTP_HMX</code> and returns 2.</li>
+    <li><b>Never</b> use <code>SIM_TIMING=1</code> at model shape: a timing run was aborted after 30 minutes without producing its first result line (HEXAGON.md §5.2). Simulator cycles are a correctness gate and a relative signal only; they do not model DDR bandwidth (HEXAGON.md §8.3; plan 0000 §2 gap rule 1).</li>
+  </ul>
+</div>
+
+<div class="panel warn">
+  <h2>Stage 3 · Build the DSP library (skel) and the phone-side harness</h2>
+<pre>tools/docker/run.sh ./tools/hexagon/build_skel.sh                   # -> build_hexagon/skel/libnntr_htp_skel.so (v79, the default)
+                                                                    #    prints "HexKL: … (HTP_HMX=1)" when the addon is mounted (#68)
+HEX_EXTRA_CFLAGS=-DHTP_HMX=0 tools/docker/run.sh ./tools/hexagon/build_skel.sh   # the HVX-only skel with HexKL present: object-identical to a tree without hmx/
+tools/docker/run.sh ./tools/hexagon/dsp_obj_md5.sh &lt;tree&gt;           # per-object md5 of the DSP sources: the "no DSP bytes changed" proof (#68)
+HEX_ARCH=v75 tools/docker/run.sh ./tools/hexagon/build_skel.sh     # the v75 fallback, runs unchanged on v79 silicon
+tools/docker/run.sh ./tools/hexagon/build_host_test.sh              # -> build_hexagon/host/{hexagon_rpc_test,hexagon_e2e_test}</pre>
+  <ul>
+    <li><b>Name the arch on purpose.</b> <code>build_skel.sh</code> defaults to <code>v79</code> (<code>HEX_ARCH="${HEX_ARCH:-v79}"</code>), and since #35 (device 2026-09-18) <b>v79 is the shipping skel</b>: it is 10–27 % faster than v75 on the S25 Ultra's v79 cDSP with matching accuracy, and a v79 build with the IEEE float helpers and one with the qf-format helpers gave identical PPL and top-1 on silicon (HEXAGON.md §7 rule 1, §9). v75 stays the fallback, built only when a change touches an <code>__HVX_ARCH__</code> branch or on request. The #35 kernel fix and the #25 cross-op weight prefetch (PR #61, merged) are both on this branch, so a v79 skel built here is the shipping skel the latest numbers were measured with (54.6 Mcyc per decode step at 512 on unit <code>R3CY10WM83Y</code>, #25 B). Whatever you build, write the arch and the md5 in the handoff; the device records the skel that actually ran (23-sdk64-baseline.md "Skel identity").</li>
+    <li>The script first runs the interface compiler (QAIC) on <code>nntr_htp.idl</code> to generate the stub and skel glue, then compiles <code>executor.c</code>, <code>htp_graph.c</code>, <code>worker_pool.c</code> and every file under <code>ops/</code>, <code>hvx/</code>, <code>dma/</code> with <code>-mhvx -mhvx-length=128B -O3</code>. It probes <code>-mhvx-ieee-fp</code> on an empty file and prints <code>hexagon-clang v75: -mhvx-ieee-fp probe -&gt; -mhvx-ieee-fp</code>; with HEXAGON_Tools 19.0.04 the flag is accepted (HEXAGON.md §7 rule 4; build_skel.sh). Since #68, when <code>/opt/qcom/hexkl_addon</code> (<code>HEXKL_ADDON_ROOT</code>) carries <code>lib/hexagon_toolv19_v79/libhexkl_micro.a</code> and <code>include/hexkl_micro.h</code>, the script also compiles <code>hmx/*.c</code> with <code>-DHTP_HMX=1</code> and links HexKL, printing <code>HexKL: … (HTP_HMX=1)</code> and <code>built: … (v79, HTP_HMX=1)</code>; otherwise <code>HexKL: not linked (HTP_HMX=0; … absent)</code>. Such a skel acquires the HMX unit and a VTCM arena at <code>init()</code> and logs the HexKL version, but runs no HMX kernel yet and its HVX results are bit-identical (<a href="02-architecture.html">02</a> §6; HEXAGON.md §5.3).</li>
+    <li>Variants for a measurement: <code>HEX_EXTRA_CFLAGS=-D…</code> appends compiler flags to the skel build; copy each result to <code>libnntr_htp_skel.&lt;variant&gt;.so</code> before the next build and record its <code>md5sum</code> (skill <code>hexagon-gates</code> rung 4). The measurement-only flags, all off in the shipping build: <code>HTP_MM_NO_VTCM</code> (weights read straight from DDR, M6), <code>HTP_FORCE_QF_HELPERS</code> (qf-format float helpers on v79, #35), and since #25 (PR #61, merged) <code>HTP_MM_NO_PREFETCH</code> (the cross-op weight prefetch compiled out: the A/B control), <code>HTP_MM_CHUNK_ROWS=&lt;n&gt;</code> (a fixed DMA chunk instead of max-fit), <code>HTP_MM_STREAM_ONLY</code> (every weight byte is DMA'd, nothing is multiplied — a ceiling skel whose outputs are garbage by construction, so no <code>--eval</code>) <code>HTP_PROF_FARF</code> (one <code>nntr_htp: prof …</code> line per call with the DSP cycles split by op kind, summed by <code>tools/hexagon/summ_farf_prof.py</code>), and since #68 <code>HTP_HMX=0</code> (the HVX-only build even with HexKL on the mount: no <code>hmx/</code> object, no HexKL symbol, the plain 4 MB VTCM acquire; with the addon mounted the scripts set <code>HTP_HMX=1</code> themselves). When a PR claims "no DSP bytes changed", the proof is <code>tools/hexagon/dsp_obj_md5.sh</code> run on both trees, not the skel's md5 — the linked <code>.so</code> embeds its random temp object names — and #68 used it to show its <code>-DHTP_HMX=0</code> build identical to <code>hvx_impl</code> in all 12 objects (HEXAGON.md §3, §5.3; skill <code>hexagon-gates</code>). #25 built four skels this way, A/B/C/D, and ran them as a reversed double pass, and #58's handoff does the same with <code>HTP_ATTN_L2FETCH</code> / <code>HTP_ATTN_NB</code> (HEXAGON.md §5.3 "Measurement-only skel flags"; 25-decode-prefetch.md "Artifacts"; 58-decode-attn-gqa.md "Artifacts" on branch hvx/58-decode-attn-gqa).</li>
+    <li>The skel is <em>not</em> part of the meson build; the host library is (<code>-Denable-hexagon=true</code>, HEXAGON.md §4).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>Stage 4 · The handoff: the phone is run by a person</h2>
+  <p>Write <code>docs/measurements/&lt;issue#&gt;-&lt;slug&gt;.md</code> from the template in the <code>hexagon-handoff</code> skill: why, an artifact table (path, md5, commit), the exact commands, the expected log lines, an empty result table with the reference number next to each cell, and the estimated minutes. Commit it on the issue's <code>hvx/&lt;issue#&gt;-&lt;slug&gt;</code> branch and set the label <code>state:needs-measurement</code>. The person then runs, on the workstation with the phone on USB (HEXAGON.md §5.3):</p>
+<pre>./tools/hexagon/run_device_test.sh [serial]                       # RPC_TEST PASS
+python3 tools/hexagon/check_rpc_log.py logs/hexagon/device_test_&lt;stamp&gt;.log
+./tools/hexagon/run_e2e_test.sh /tmp/qwen3_full [serial] -- --tokens /tmp/t512.i32 --chunk 128 --steps 64
+./tools/hexagon/run_e2e_test.sh /tmp/qwen3_full [serial] -- --tokens /tmp/t512.i32 --eval</pre>
+  <ul>
+    <li><code>run_device_test.sh</code> pushes the skel and <code>hexagon_rpc_test</code> and checks the round-trip contract with an empty op-list (session open, shared memory, ABI-mismatch rejection, mapping, a dummy pattern proving host-written bytes are visible on the DSP, 32 timed round-trips). <code>check_rpc_log.py</code> exits 0 only if all six <code>RPC_TEST</code> markers are present (HEXAGON.md §5.3; check_rpc_log.py).</li>
+    <li><code>run_e2e_test.sh</code> pushes the skel, the harness, the image and the token file only when the device copy's <code>md5</code> differs (the image is ~600 MB; a size-only check once left a stale image on the phone, HEXAGON.md §5.3 "Pitfall"), writes <code>0x1f</code> into <code>hexagon_e2e_test.farf</code> so DSP log lines reach logcat, runs with <code>ADSP_LIBRARY_PATH</code> / <code>DSP_LIBRARY_PATH</code> pointing at the pushed directory, and saves <code>logs/hexagon/e2e_&lt;stamp&gt;.log</code> plus <code>device_farf_&lt;stamp&gt;.log</code>.</li>
+    <li>Expected lines: <code>E2E init ok weights=598623744 ...</code>, one <code>E2E step &lt;i&gt; pos=&lt;p&gt; n=&lt;n&gt; pcycles=&lt;c&gt; us=&lt;t&gt; top1=&lt;id&gt;</code> per chunk or decode step, <code>E2E gen ...</code>, <code>E2E wall_ms</code>; for <code>--eval</code>: <code>E2E ppl &lt;x&gt; steps 511 top1 &lt;n&gt; wall_ms &lt;w&gt;</code> (23-sdk64-baseline.md step 3; hexagon_e2e_test.cpp).</li>
+    <li>The person pastes the numbers into the file, commits, and sets <code>state:measured</code>. How to turn the lines into tok/s is on the <a href="04-measure-and-debug.html">measure page</a>; the filled numbers end up on <a href="06-performance.html">06 · Performance</a>.</li>
+    <li><b>Name the phone.</b> Two S25 Ultra units have been used and their DSP decode clocks differ (1.91 vs 2.05 GHz), so every handoff and every benchmark row records the unit serial (<code>adb devices</code>), and a speed comparison against another unit is made in DSP Mcycles per step, not tok/s (HEXAGON.md §7 rule 9 (a)–(b)). The first e2e run after a push is cold — rule 9 (d) had it at 3–5 %, and #25 measured +8.5 % DSP cycles on the first run of the day — so <b>any A/B whose verdict is tighter than ±10 % is run twice, A B C D then D C B A, and only pass 2 is read</b>; a warm-up run is not a substitute (rule 9 (d); 25-decode-prefetch.md "Steps", "Notes"). The DSP clock can also wander within one session (1743–2046 MHz across the #25 runs), which is why verdicts are read in DSP Mcycles, not host ms. <b>At 4096 the rule is stricter (rule 9 (e), standing since #53):</b> even the Mcyc figure moves with the session on one unit (+2.2 % between two orders 25 min apart, +4.4 % between two sittings on the same day, +8.6 % against the other unit with the <em>same</em> binary), so a 4096 verdict is an A/B of both skels back to back inside one order after the same idle, never a 4096 cell against another day's row; before each order the handoff records <code>adb shell dumpsys battery</code> temperature and charging status and the idle minutes, and it names the sitting it is read against (HEXAGON.md §7 rule 9 (e); 53-4096-unit-split.md "Steps", "Notes from the run").</li>
+  </ul>
+  <p class="src">Complete, filled examples: docs/measurements/23-sdk64-baseline.md (SDK 6.4 baseline, 2026-09-17, about 20 min of phone time for two skel variants), 24-host-logits.md (a host-only A/B/C with reversed double runs), 35-v79-skel.md (three skels, 15 runs, about 14 min on the device), 25-decode-prefetch.md (four skels A/B/C/D as a reversed double pass at 512 plus B and C at 1024 / 4096, 14 runs, about 15 min) and 53-4096-unit-split.md (two skels at 4096 only, two mirrored orders with a ≥ 10 min idle and a battery-temperature read before each, plus one 4096 <code>--eval</code> per skel, about 20 min device-active / 40 min wall). The next one to be run is 58-decode-attn-gqa.md on branch hvx/58-decode-attn-gqa (four attention skels, ≈ 17 min core + 9 min tail).</p>
+</div>
+
+<div class="panel">
+  <h2>Stage 5 · The app switch: <code>"engine": "htp"</code></h2>
+  <p>The CausalLM app does not go through nntrainer's per-layer engine registry; per-layer remote calls would bring back exactly the overhead the design removes, so the offload is all-or-nothing at the app level (HEXAGON.md §5.4). In <code>nntr_config.json</code>:</p>
+<pre>{ "engine": "htp", "model_file_name": "nntr_qwen3_0.6b_w8cx_DEFAULT.bin", ... }</pre>
+  <ul>
+    <li><code>main.cpp</code> sees <code>engine == "htp"</code> and, only for <code>Qwen3ForCausalLM</code>, calls <code>initHexagon(weight_file)</code> instead of <code>initialize()/load_weight()/repack_weight()</code>. <code>HexagonBackend::create()</code> memory-maps the int8 checkpoint, runs <code>lower_qwen3()</code>, packs the weight image straight into shared memory (no <code>.hexw</code> file), zeroes KV and ACT, and calls <code>HexagonRunner::init()</code> (hexagon_backend.cpp; HEXAGON.md §5.4).</li>
+    <li>If any of that fails the app prints one <code>hexagon: ..., CPU fallback</code> line on stderr and builds the CPU graph exactly as before. Verified messages: <code>hexagon: open failed (0x80000406), CPU fallback</code> with the skel removed; <code>hexagon: w8cx bin: size 2384199680 != expected 598230528, CPU fallback</code> with an fp32 checkpoint (HEXAGON.md §5.4). A failure <em>during</em> generation ends the run with an exception; there is no CPU graph to switch to.</li>
+    <li>Build: <code>tools/package_android.sh . -Denable-hexagon=true -Dhexagon-sdk-root=$HEXAGON_SDK_ROOT</code>, then <code>Applications/CausalLM/build_android.sh --cache</code> (without <code>--cache</code> the app script rebuilds nntrainer without the backend). On the phone the process needs <code>ADSP_LIBRARY_PATH</code> / <code>DSP_LIBRARY_PATH</code> pointing at the directory holding <code>libnntr_htp_skel.so</code>, and a copy of <code>/vendor/lib64/libcdsprpc.so</code> next to the binary; <code>/vendor/lib64</code> must not be on <code>LD_LIBRARY_PATH</code> (HEXAGON.md §4, §5.4).</li>
+    <li>App-level numbers on record (S25, 18-token prompt, 64 generated): prefill 23.8 tok/s, decode 13.0 tok/s, RSS 758 MB on the DSP path against 52.0 / 18.7 tok/s and 3.1 GB on the CPU fp32 fallback. <b>Those predate the M6 P3/P4 kernels</b>; the harness figures on the index page are the current ones, and HEXAGON.md §9 lists an app re-measurement as planned work (HEXAGON.md §5.4, intro, §9).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>The ladder, in one table</h2>
+  <table>
+    <tr><th>Rung</th><th>Needs</th><th>Pass line</th><th>Time</th></tr>
+    <tr><td>0 format</td><td>container</td><td><code>clang-format-14</code> diff shows only intended files</td><td>seconds</td></tr>
+    <tr><td>1 x86 reference</td><td>container</td><td><code>LOWER_TEST PASS</code>, <code>W8CX_BIN_TEST PASS</code>, header test PASS (since PR #50 it also asserts the shared operand-size table <code>nntr_htp_op_extent()</code> by literal numbers); PPL unchanged unless the plan says so</td><td>seconds; <code>--eval</code> on 512 tokens 160 s in the container (23-sdk64-baseline.md)</td></tr>
+    <tr><td>2 simulator gate</td><td>SDK</td><td><code>SIM_TEST profile PASS</code>, 8-token accuracy inside 0.1 atol/rtol</td><td>≈ 10 min</td></tr>
+    <tr><td>3 simulator full</td><td>SDK</td><td>13 × <code>SIM_TEST &lt;name&gt; PASS</code>, plus <code>SIM_TEST hmx PASS</code> when HexKL is mounted (the 14th since #68; a SKIP is not counted)</td><td>≈ 5 min</td></tr>
+    <tr><td>4 skel + harness</td><td>SDK + NDK</td><td>both artifacts exist, md5 recorded; a "no DSP bytes changed" claim carries <code>dsp_obj_md5.sh</code> output from both trees</td><td>minutes</td></tr>
+    <tr><td>5 device</td><td>a person</td><td>filled handoff table; <code>RPC_TEST PASS</code>, <code>E2E</code> lines</td><td>estimate written in the handoff (e.g. 45 min)</td></tr>
+  </table>
+  <p class="src">Skill <code>hexagon-gates</code> (rungs 0–5), HEXAGON.md §5.1–§5.3.</p>
+</div>
+
+<p class="note">Hexagon backend beginner guide · sources: docs/backend_guide/HEXAGON.md, HEXAGON_BENCHMARK.md, docs/measurements/ (#23, #24, #35, #25, #53 on hvx_impl), nntrainer/tensor/hexagon/, Applications/CausalLM/hexagon/, tools/docker/, docs/superpowers/specs/hexagon-hvx-optimization/. Written 2026-09-17, refreshed 2026-09-21 against hvx_impl commit e57f66e5 (#68 S0 merged, PR #72; S1 read from branch hvx/69-w4cx-producer-abi5, in review).</p>
+</body>
+</html>

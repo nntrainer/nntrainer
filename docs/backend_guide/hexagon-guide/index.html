@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hexagon backend guide — overview</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb;
+    --panel: #f3f3f1;
+    --text-1: #0b0b0b;
+    --text-2: #52514e;
+    --grid: #d9d8d3;
+    --w: #2a78d6;      /* weights  (slot 1 blue)   */
+    --w-light: #cde2fb;
+    --x: #eb6834;      /* activations (slot 2 orange) */
+    --x-light: #fbd9cc;
+    --acc: #1baf7a;    /* accumulator / output (slot 3 aqua) */
+    --acc-light: #cdeee0;
+    --dim: #b7b6b0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface: #1a1a19;
+      --panel: #242423;
+      --text-1: #ffffff;
+      --text-2: #c3c2b7;
+      --grid: #3a3a38;
+      --w: #3987e5;
+      --w-light: #1c3a5e;
+      --x: #d95926;
+      --x-light: #5a2a17;
+      --acc: #199e70;
+      --acc-light: #16442f;
+      --dim: #5a5a57;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 48px;
+    background: var(--surface); color: var(--text-1);
+    font: 15px/1.55 -apple-system, "Segoe UI", "Noto Sans KR", Roboto, sans-serif;
+    max-width: 1240px; margin-inline: auto;
+  }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 8px; }
+  .sub { color: var(--text-2); margin: 0 0 28px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 28px; }
+  @media (max-width: 900px) { .row { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border-radius: 10px; padding: 18px 18px 14px;
+  }
+  .panel p { color: var(--text-2); margin: 6px 0 0; font-size: 14px; }
+  .panel .verdict { margin-top: 10px; font-size: 14px; color: var(--text-1); }
+  svg { width: 100%; height: auto; display: block; }
+  text { font-family: inherit; fill: var(--text-1); }
+  .t2 { fill: var(--text-2); }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--text-2); margin: 0 0 22px; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+    margin-right: 6px; vertical-align: -2px; background: var(--c);
+  }
+  .ctrl { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text-2); margin: 6px 0 4px; }
+  .ctrl input[type=range] { width: 160px; accent-color: var(--w); }
+  .ctrl button {
+    border: 1px solid var(--grid); background: var(--surface); color: var(--text-1);
+    border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin-top: 4px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { color: var(--text-2); font-weight: 600; }
+  td:first-child { color: var(--text-2); white-space: nowrap; }
+  .note { color: var(--text-2); font-size: 13px; margin-top: 18px; }
+  .tip {
+    position: fixed; pointer-events: none; background: var(--text-1); color: var(--surface);
+    padding: 6px 9px; border-radius: 6px; font-size: 12px; line-height: 1.4;
+    opacity: 0; transition: opacity .08s; white-space: nowrap; z-index: 10;
+  }
+</style>
+<style>
+  /* guide additions: identical on every page of hexagon-guide/ */
+  nav.guide { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; margin: 0 0 24px; padding: 10px 0; border-block: 1px solid var(--grid); }
+  nav.guide a { color: var(--text-2); text-decoration: none; }
+  nav.guide a.here { color: var(--text-1); font-weight: 600; }
+  nav.guide a:hover { color: var(--w); }
+  a { color: var(--w); }
+  .panel { margin-bottom: 24px; }
+  .panel ul, .panel ol { color: var(--text-2); font-size: 14px; margin: 6px 0 0; padding-left: 22px; }
+  .panel li { margin: 3px 0; }
+  .panel li b, .panel p b { color: var(--text-1); }
+  pre { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 10px 12px; font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; overflow-x: auto; margin: 8px 0; color: var(--text-1); white-space: pre; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.93em; }
+  .src { color: var(--text-2); font-size: 12px; }
+  .status { border-left: 4px solid var(--acc); }
+  .warn { border-left: 4px solid var(--x); }
+  .step { counter-increment: step; }
+  .kv td:first-child { white-space: normal; }
+  dl.gl { margin: 0; font-size: 14px; }
+  dl.gl dt { font-weight: 600; margin-top: 10px; }
+  dl.gl dd { margin: 2px 0 0; color: var(--text-2); }
+  td, th { word-break: break-word; }
+  td:first-child { white-space: normal; }
+</style>
+</head>
+<body>
+<nav class="guide">
+  <a class="here" href="index.html">Overview</a>
+  <a href="01-run-it.html">01 Run it</a>
+  <a href="02-architecture.html">02 Architecture</a>
+  <a href="03-kernels.html">03 Kernels</a>
+  <a href="04-measure-and-debug.html">04 Measure and debug</a>
+  <a href="05-glossary.html">05 Glossary</a>
+  <a href="06-performance.html">06 Performance</a>
+</nav>
+<h1>The Hexagon backend, for people who have never touched a DSP</h1>
+<p class="sub">nntrainer can run a small language model (Qwen3-0.6B) on the signal processor (Hexagon cDSP) inside a Snapdragon 8 Elite phone instead of on the phone's CPU. This guide explains how that works, how to run it, and how to read the numbers. Everything here is taken from <code>docs/backend_guide/HEXAGON.md</code>, <code>HEXAGON_BENCHMARK.md</code>, the code under <code>nntrainer/tensor/hexagon/</code> and <code>Applications/CausalLM/hexagon/</code>, and the filled measurement handoffs under <code>docs/measurements/</code> (#23, #24 and #35 on this branch; #25 on branch <code>hvx/25-decode-prefetch</code>, PR #61); each number says where it came from.</p>
+
+<div class="legend">
+  <span style="--c: var(--w)">weights (packed once, read by the DSP)</span>
+  <span style="--c: var(--x)">activations and tokens (change every call)</span>
+  <span style="--c: var(--acc)">outputs (logits) and results</span>
+</div>
+
+<div class="panel">
+  <h2>The one-paragraph mental model</h2>
+  <p>The phone's main processor (the <b>host</b>, an arm64 Android CPU) does three things. First, once at start-up, it converts the model's weights into one big byte image in a memory area both processors can see, and hands that image, an empty key/value cache and a scratch buffer to the DSP together with a short recipe called the <b>op-list</b> (HEXAGON.md §1, §1.1). From then on <b>the DSP owns the whole graph</b>: it keeps the buffers mapped for the life of the session and knows every step of the model. Second, for each chunk of prompt tokens or each generated token, the host sends only the token ids and the position, and the DSP runs the entire recipe in one remote call (one FastRPC round-trip, about 0.26 ms; HEXAGON.md intro, §8 M1 test 231 / 255 / 284 µs min / median / max). Third, the host reads back the <b>logits</b> (one score per vocabulary word, 151,936 floats for this model; HEXAGON.md intro) and picks the next token. There is no per-layer chatter between the two processors, which is the whole point of the design.</p>
+</div>
+
+<div class="panel">
+  <h2>Picture</h2>
+  <svg viewBox="0 0 760 250" role="img" aria-label="Host packs weights once and hands them to the DSP; then per token it sends token ids and reads logits back">
+    <rect x="10" y="20" width="300" height="210" rx="10" fill="none" stroke="var(--grid)"/>
+    <text x="24" y="44" font-size="13" font-weight="600">Host (arm64 Android CPU)</text>
+    <rect x="24" y="60" width="272" height="34" rx="6" fill="var(--w-light)"/>
+    <text x="34" y="82" font-size="12">1. pack weights → WEIGHTS image (598 MB)</text>
+    <rect x="24" y="104" width="272" height="34" rx="6" fill="var(--x-light)"/>
+    <text x="34" y="126" font-size="12">2. per call: token ids + position</text>
+    <rect x="24" y="148" width="272" height="34" rx="6" fill="var(--acc-light)"/>
+    <text x="34" y="170" font-size="12">3. per call: read 151,936 logits, pick token</text>
+    <text x="24" y="212" font-size="11" class="t2">HexagonRunner · RpcmemBuffer · QAIC stub</text>
+
+    <rect x="450" y="20" width="300" height="210" rx="10" fill="none" stroke="var(--grid)"/>
+    <text x="464" y="44" font-size="13" font-weight="600">DSP (Hexagon cDSP, v79 silicon)</text>
+    <rect x="464" y="60" width="272" height="34" rx="6" fill="var(--w-light)"/>
+    <text x="474" y="82" font-size="12">WEIGHTS + KV + ACT mapped for the session</text>
+    <rect x="464" y="104" width="272" height="34" rx="6" fill="var(--x-light)"/>
+    <text x="474" y="126" font-size="12">run all 451 ops of the op-list</text>
+    <rect x="464" y="148" width="272" height="34" rx="6" fill="var(--acc-light)"/>
+    <text x="474" y="170" font-size="12">write logits of the last token</text>
+    <text x="464" y="212" font-size="11" class="t2">skel · executor.c · htp_graph · 9 HVX kernels · HMX arena (S0, no kernel yet)</text>
+
+    <line x1="310" y1="77" x2="450" y2="77" stroke="var(--w)" stroke-width="2"/>
+    <text x="380" y="70" font-size="11" text-anchor="middle" class="t2">once, at init()</text>
+    <line x1="310" y1="121" x2="450" y2="121" stroke="var(--x)" stroke-width="2"/>
+    <text x="380" y="114" font-size="11" text-anchor="middle" class="t2">forward(), 1 RPC</text>
+    <line x1="450" y1="165" x2="310" y2="165" stroke="var(--acc)" stroke-width="2"/>
+    <text x="380" y="186" font-size="11" text-anchor="middle" class="t2">~0.26 ms round trip</text>
+  </svg>
+  <p class="src">Sizes and op count: HEXAGON.md §1.1 (598 MB WEIGHTS + 224 MB KV + 4 MB ACT), §2.3 (451 ops for qwen3-0.6b), intro (~0.26 ms).</p>
+</div>
+
+<div class="panel status">
+  <h2>Where we are — latest device measurement (HEXAGON_BENCHMARK.md "Goals → Now")</h2>
+  <p>Measurement <b>#25, 2026-09-18</b>, Galaxy S25 Ultra unit <code>R3CY10WM83Y</code> (Snapdragon 8 Elite, cDSP v79), <b>v79 skel with the cross-op weight prefetch</b> (variant B, md5 <code>98b07caf…</code>; the prefetch is the shipping default from #25 on and its code is on <code>hvx_impl</code> since PR #61 merged), Hexagon SDK 6.4.0.2 / hexagon-clang 19.0.04. Method: <code>hexagon_e2e_test --chunk 128 --steps 64</code>, decode median over the 63 single-token steps, host wall time around each RPC; the 512 row is pass 2 of a reversed double pass (HEXAGON_BENCHMARK.md "Method"; HEXAGON.md §7 rule 9 (d)).</p>
+  <table>
+    <tr><th>Context</th><th>Prefill tok/s</th><th>Decode tok/s</th><th>DSP Mcycles / decode step</th><th>Decode goal</th><th>Gap</th></tr>
+    <tr><td>512</td><td><b>191.1</b></td><td><b>33.7</b></td><td>54.6 (#35: 61.2, −11.6 %)</td><td>Relative to nntrainer's own CPU baseline (issue #60, user decisions 2026-09-18: CPU from <code>main</code>, precision <code>Q4_0-FP16</code>, measurement pending; written as the multiple plus the resolved tok/s once filled); bounded by the measured W8 weight-stream ceiling of <b>54 tok/s</b> (#25 C). ≥ 70.3 stays the w4a8 goal (#51, folded into #65)</td><td>pending #60; 1.6× to the ceiling</td></tr>
+    <tr><td>1024</td><td><b>123.7</b></td><td><b>26.3</b></td><td>73.7 (#35: 77.8)</td><td>—</td><td>—</td></tr>
+    <tr><td>4096</td><td><b>30.8</b></td><td><b>11.1</b></td><td>184.6 (#35: 186.8; #53's four re-runs of the same tree later that day 192.9–197.3 — the 4096 cell moves with the session, HEXAGON.md §7 rule 9 (e))</td><td>≥ 27.5 (stage-1 HVX-only row; the same figure is the w4a8 row's 4096 goal). Attention is 79 % of this step: issue #58, whose 4096 gate is read as an A/B inside one order</td><td>2.5×</td></tr>
+  </table>
+  <p>Prefill goal at 512: 1000 tok/s interim (gap 5.2×; the 4 % under #35's 198.7 is this session's lower DSP clock, not a regression — in cycles the prefetch build's prefill is 1.3 % under the no-prefetch control). Accuracy on the same runs: <code>--eval</code> on <code>t512_23.i32</code> 41.4947 / 162, 1024 5.8595 / 692, 4096 1.5623 / 3759, all equal to #35, generated ids byte-identical with and without the prefetch; the v79 accuracy record on the P4 prompt stays #35's 32.4497 / 184 (x86 33.0195 / 184). Decode and prefill do not move together: decode is weight-bandwidth plus attention bound, prefill is compute bound (HEXAGON_BENCHMARK.md "Goals"; HEXAGON.md §8.2). Two S25 Ultra units with different DSP clocks have been used (1.91 vs 2.05 GHz), and one unit's clock wandered 1.74–2.05 GHz across the #25 runs: tok/s compares only within a unit and session, DSP Mcycles per step across them (HEXAGON.md §7 rule 9).</p>
+  <table>
+    <tr><th>Context</th><th>nntrainer W8A8 HVX-only (above)</th><th>Floor: nntrainer CPU <code>Q4_0-FP16</code> from <code>main</code> (issue #60)</th><th>Stage-3 W4 reference: GENIEX_QAIRT w4a16, Galaxy S25</th></tr>
+    <tr><td>512</td><td>191.1 / 33.7</td><td>pending / pending</td><td><b>8,207 / 121</b></td></tr>
+    <tr><td>1024</td><td>123.7 / 26.3</td><td>pending / pending</td><td><b>7,503 / 112</b></td></tr>
+    <tr><td>4096</td><td>30.8 / 11.1</td><td>pending / pending</td><td><b>3,546 / 57.6</b></td></tr>
+  </table>
+  <p>Prefill / decode tok/s. The CPU row is the floor every NPU row will be read against once the user measures it; the GENIEX_QAIRT row (Qualcomm AI Hub, a w4a16 graph on the same silicon) is the target of the new top goal, <b>issue #65</b>: port upstream PR nntrainer/nntrainer#4327's W4 path (HMX u8×i4 matmul, DMA ring, u8 attention) into this backend and measure Qwen3-0.6B end to end (user decisions 2026-09-18; the A8W8 HVX-only line ends with the issues already filed, #26 #41 #57 #58 #59 #60).</p>
+  <p><b>2026-09-21:</b> no handoff has been filled since these rows (#58's is with the user, still empty), so they remain the latest. Stage 3 moved without a device number: <b>#68 (S0 of #65) merged into <code>hvx_impl</code></b> (PR #72, <code>026af1e8</code>) — HexKL linked, the HMX unit and a VTCM arena acquired at graph init above the HVX kernels' unchanged 4 MB, the v79 simulator executes HMX bit-exactly, and the HVX outputs are bit-identical (<code>profile acc</code> = #25's; the <code>-DHTP_HMX=0</code> build is object-identical). S1's x86 accuracy result, in review on <code>hvx/69-w4cx-producer-abi5</code> (PR not yet opened), misses the band: per-channel int4 on Qwen3-0.6B gives PPL 46.23 against W8's 22.53 (2.05 ×) on a 512-token prompt, where the gate was ≤ 1.10 ×, so the W4 direction is pending a user decision (HEXAGON_BENCHMARK.md log 2026-09-21; HEXAGON.md §7 rules 10–11, §9; §8.1 on that branch). Details on <a href="06-performance.html">06</a>, "What is open".</p>
+  <p class="src">HEXAGON_BENCHMARK.md "Goals" (stage-1 W8A8, decode @4096 and stage-3 cells, the #60 CPU row), its three "v79 skel + cross-op weight prefetch" rows, the "weight-stream-only skel" ceiling row and the GENIEX_QAIRT "8 Elite (Galaxy S25)" rows; docs/measurements/25-decode-prefetch.md pass-2 and goal rows and 53-4096-unit-split.md "Results" (both on hvx_impl). The full record — every measurement since M6 P4, one block each, the baselines table, the decode chart with the reference lines, what each one decided and the goal policy — is on <a href="06-performance.html">06 · Performance</a>.</p>
+</div>
+
+<div class="row">
+  <div class="panel">
+    <h2>Three facts to hold on to</h2>
+    <ul>
+      <li><b>Toolchain.</b> Every build happens in the dev container with Hexagon SDK 6.4 (6.4.0.2 in the container; the workstation that built the 2026-09-17 and 2026-09-18 device binaries has 6.4.0.1) and hexagon-clang 19.0.04 (HEXAGON.md §5.2; tools/docker/README.md; 23-sdk64-baseline.md "Artifacts").</li>
+      <li><b>Wire contract.</b> Host and DSP agree on op-list ABI version 4 (<code>NNTR_HTP_ABI_VERSION</code> in <code>nntr_htp_common.h</code>); <code>init()</code> rejects any other version before touching memory (v5, with the W4 kind and layout ids, exists only on #65 S1's branch, in review). Since PR #50 (issue #36) the same header also holds the one table of operand byte sizes, <code>nntr_htp_op_extent()</code>, that the DSP validator, the x86 reference runner, the simulator reference and the simulator model all read (HEXAGON.md §1, §1.4).</li>
+      <li><b>v79 is the shipping skel; v75 is the fallback.</b> The S25 Ultra's cDSP is v79 silicon and a v79-native skel is 10–27 % faster there with matching accuracy (#23). Its last simulator discrepancy — four ±1 LSB failures traced to one sign bug in the quantiser decode — was fixed by #35, and on silicon a v79 skel with the IEEE float helpers and one with the qf-format helpers gave identical PPL and top-1, so HEXAGON.md §7 rule 1 is closed and <code>HEX_ARCH=v79</code> is the default of <code>build_skel.sh</code>. A v79 change still needs both the v79 simulator sweep and a device <code>--eval</code> (HEXAGON.md §7 rule 1, §9). The #35 kernel fix, the v79 default of <code>build_sim_test.sh</code> / <code>run_sim_test.sh</code> and the cross-op weight prefetch that #25 measured (−11.6 % decode cycles at 512; PR #61, merged) are all on this branch, so a skel built from this tree is the one the latest numbers were measured with. The next kernel direction is not HVX at all: issue #65 brings the HMX matrix unit in through HexKL for 4-bit weights. Its build stage S0 (#68, PR #72) is merged: a skel built here with the HexKL addon mounted links HexKL and acquires the HMX unit plus a VTCM arena at <code>init()</code>, but no op uses HMX yet and the HVX kernels' outputs are unchanged bit for bit; its accuracy stage S1 is in review with a failed PPL band (see <a href="06-performance.html">06</a>, "What is open").</li>
+    </ul>
+  </div>
+  <div class="panel">
+    <h2>Read next</h2>
+    <ul>
+      <li><a href="01-run-it.html">01 · Run it</a> — container setup, x86 reference, simulator, skel, the phone handoff, the <code>engine="htp"</code> app switch.</li>
+      <li><a href="02-architecture.html">02 · Architecture</a> — packer, image files, FastRPC session, worker pool, VTCM/DMA, op list, ABI.</li>
+      <li><a href="03-kernels.html">03 · Kernels</a> — tiled int8 matmul, int16 down_proj, attention, the quantizer, and why only qf-format float ops.</li>
+      <li><a href="04-measure-and-debug.html">04 · Measure and debug</a> — reading a handoff, the 3-way accuracy comparison, <code>find_divergence.py</code>, the FARF log.</li>
+      <li><a href="05-glossary.html">05 · Glossary</a> — every acronym above, one line each.</li>
+      <li><a href="06-performance.html">06 · Performance</a> — the device record: latest numbers, every measurement since M6 P4, the decode chart, what each one decided.</li>
+    </ul>
+    <p class="note">Who does what: the Mac runs the editor and the container; a person runs the phone from a workstation and fills in a measurement file. Agents never touch the phone (docs/plans/0000-agent-system-and-env.md §2).</p>
+  </div>
+</div>
+
+<p class="note">Hexagon backend beginner guide · sources: docs/backend_guide/HEXAGON.md, HEXAGON_BENCHMARK.md, docs/measurements/ (#23, #24, #35, #25, #53 on hvx_impl), nntrainer/tensor/hexagon/, Applications/CausalLM/hexagon/, tools/docker/, docs/superpowers/specs/hexagon-hvx-optimization/. Written 2026-09-17, refreshed 2026-09-21 against hvx_impl commit e57f66e5 (#68 S0 merged; no new measurement).</p>
+</body>
+</html>

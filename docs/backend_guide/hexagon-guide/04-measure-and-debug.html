@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hexagon backend guide — 04 Measure and debug</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb;
+    --panel: #f3f3f1;
+    --text-1: #0b0b0b;
+    --text-2: #52514e;
+    --grid: #d9d8d3;
+    --w: #2a78d6;      /* weights  (slot 1 blue)   */
+    --w-light: #cde2fb;
+    --x: #eb6834;      /* activations (slot 2 orange) */
+    --x-light: #fbd9cc;
+    --acc: #1baf7a;    /* accumulator / output (slot 3 aqua) */
+    --acc-light: #cdeee0;
+    --dim: #b7b6b0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface: #1a1a19;
+      --panel: #242423;
+      --text-1: #ffffff;
+      --text-2: #c3c2b7;
+      --grid: #3a3a38;
+      --w: #3987e5;
+      --w-light: #1c3a5e;
+      --x: #d95926;
+      --x-light: #5a2a17;
+      --acc: #199e70;
+      --acc-light: #16442f;
+      --dim: #5a5a57;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 48px;
+    background: var(--surface); color: var(--text-1);
+    font: 15px/1.55 -apple-system, "Segoe UI", "Noto Sans KR", Roboto, sans-serif;
+    max-width: 1240px; margin-inline: auto;
+  }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 8px; }
+  .sub { color: var(--text-2); margin: 0 0 28px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 28px; }
+  @media (max-width: 900px) { .row { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border-radius: 10px; padding: 18px 18px 14px;
+  }
+  .panel p { color: var(--text-2); margin: 6px 0 0; font-size: 14px; }
+  .panel .verdict { margin-top: 10px; font-size: 14px; color: var(--text-1); }
+  svg { width: 100%; height: auto; display: block; }
+  text { font-family: inherit; fill: var(--text-1); }
+  .t2 { fill: var(--text-2); }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--text-2); margin: 0 0 22px; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+    margin-right: 6px; vertical-align: -2px; background: var(--c);
+  }
+  .ctrl { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text-2); margin: 6px 0 4px; }
+  .ctrl input[type=range] { width: 160px; accent-color: var(--w); }
+  .ctrl button {
+    border: 1px solid var(--grid); background: var(--surface); color: var(--text-1);
+    border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin-top: 4px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { color: var(--text-2); font-weight: 600; }
+  td:first-child { color: var(--text-2); white-space: nowrap; }
+  .note { color: var(--text-2); font-size: 13px; margin-top: 18px; }
+  .tip {
+    position: fixed; pointer-events: none; background: var(--text-1); color: var(--surface);
+    padding: 6px 9px; border-radius: 6px; font-size: 12px; line-height: 1.4;
+    opacity: 0; transition: opacity .08s; white-space: nowrap; z-index: 10;
+  }
+</style>
+<style>
+  /* guide additions: identical on every page of hexagon-guide/ */
+  nav.guide { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; margin: 0 0 24px; padding: 10px 0; border-block: 1px solid var(--grid); }
+  nav.guide a { color: var(--text-2); text-decoration: none; }
+  nav.guide a.here { color: var(--text-1); font-weight: 600; }
+  nav.guide a:hover { color: var(--w); }
+  a { color: var(--w); }
+  .panel { margin-bottom: 24px; }
+  .panel ul, .panel ol { color: var(--text-2); font-size: 14px; margin: 6px 0 0; padding-left: 22px; }
+  .panel li { margin: 3px 0; }
+  .panel li b, .panel p b { color: var(--text-1); }
+  pre { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 10px 12px; font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; overflow-x: auto; margin: 8px 0; color: var(--text-1); white-space: pre; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.93em; }
+  .src { color: var(--text-2); font-size: 12px; }
+  .status { border-left: 4px solid var(--acc); }
+  .warn { border-left: 4px solid var(--x); }
+  .step { counter-increment: step; }
+  .kv td:first-child { white-space: normal; }
+  dl.gl { margin: 0; font-size: 14px; }
+  dl.gl dt { font-weight: 600; margin-top: 10px; }
+  dl.gl dd { margin: 2px 0 0; color: var(--text-2); }
+  td, th { word-break: break-word; }
+  td:first-child { white-space: normal; }
+</style>
+</head>
+<body>
+<nav class="guide">
+  <a href="index.html">Overview</a>
+  <a href="01-run-it.html">01 Run it</a>
+  <a href="02-architecture.html">02 Architecture</a>
+  <a href="03-kernels.html">03 Kernels</a>
+  <a class="here" href="04-measure-and-debug.html">04 Measure and debug</a>
+  <a href="05-glossary.html">05 Glossary</a>
+  <a href="06-performance.html">06 Performance</a>
+</nav>
+<h1>04 · Measure and debug: reading the numbers, and finding the op that lies</h1>
+<p class="sub">Four skills: turn a filled measurement file into tok/s you can trust (and know which phone it came from); compare accuracy three ways so a kernel bug cannot hide behind quantization noise; bisect a divergence to one op with <code>find_divergence.py</code>; and read the DSP's own log (FARF) when something fails before any number appears. The numbers themselves are collected on <a href="06-performance.html">06 · Performance</a>.</p>
+
+<div class="panel">
+  <h2>1 · The loop a measurement travels</h2>
+  <svg viewBox="0 0 760 190" role="img" aria-label="Handoff document goes from the container to the workstation; the person runs the phone and fills the table; the supervisor copies numbers into the benchmark and HEXAGON.md section 8">
+    <rect x="10" y="30" width="150" height="70" rx="8" fill="var(--x-light)"/>
+    <text x="85" y="55" font-size="11" text-anchor="middle">handoff .md</text>
+    <text x="85" y="72" font-size="10" text-anchor="middle" class="t2">artifacts + md5 + commit</text>
+    <text x="85" y="86" font-size="10" text-anchor="middle" class="t2">commands, empty table</text>
+    <rect x="210" y="30" width="150" height="70" rx="8" fill="none" stroke="var(--grid)"/>
+    <text x="285" y="55" font-size="11" text-anchor="middle">workstation + phone</text>
+    <text x="285" y="72" font-size="10" text-anchor="middle" class="t2">run_e2e_test.sh × N</text>
+    <text x="285" y="86" font-size="10" text-anchor="middle" class="t2">logs/hexagon/e2e_*.log</text>
+    <rect x="410" y="30" width="150" height="70" rx="8" fill="var(--acc-light)"/>
+    <text x="485" y="55" font-size="11" text-anchor="middle">filled table</text>
+    <text x="485" y="72" font-size="10" text-anchor="middle" class="t2">skel md5 that ran</text>
+    <text x="485" y="86" font-size="10" text-anchor="middle" class="t2">label state:measured</text>
+    <rect x="610" y="30" width="140" height="70" rx="8" fill="var(--w-light)"/>
+    <text x="680" y="55" font-size="11" text-anchor="middle">HEXAGON_BENCHMARK.md</text>
+    <text x="680" y="72" font-size="10" text-anchor="middle" class="t2">rows + "Now"</text>
+    <text x="680" y="86" font-size="10" text-anchor="middle" class="t2">HEXAGON.md §8, §7 rules</text>
+    <line x1="160" y1="65" x2="210" y2="65" stroke="var(--dim)" stroke-width="2"/>
+    <line x1="360" y1="65" x2="410" y2="65" stroke="var(--dim)" stroke-width="2"/>
+    <line x1="560" y1="65" x2="610" y2="65" stroke="var(--dim)" stroke-width="2"/>
+    <text x="380" y="140" font-size="11" text-anchor="middle" class="t2">A performance verdict comes only from a device table. Simulator cycles are a correctness gate and a relative signal.</text>
+    <text x="380" y="160" font-size="11" text-anchor="middle" class="t2">If the device disagrees with the simulator, a rule is added to HEXAGON.md §7 before anything else.</text>
+  </svg>
+  <p class="src">docs/plans/0000-agent-system-and-env.md §2 (gap rules 1–3); skill <code>hexagon-handoff</code> "Reading a filled one".</p>
+</div>
+
+<div class="panel">
+  <h2>2 · How to read a measurement handoff</h2>
+  <p>Take <code>docs/measurements/23-sdk64-baseline.md</code> as the worked example. A handoff has five parts; here is what to check in each.</p>
+  <table class="kv">
+    <tr><th>Part</th><th>What to check</th><th>In the example</th></tr>
+    <tr><td>Why</td><td>The question and the decision hanging on it; which variants decide pass/fail and which are "recorded only".</td><td>A = v75 skel decides #23; B = v79 is data for ledger ④.</td></tr>
+    <tr><td>Artifacts</td><td>Every row has a path, an md5 and the commit it was built from. The result table must repeat the md5 of the skel that <em>actually ran</em> (<code>adb shell md5sum</code>), not the one expected. Same-size images with different bytes are the classic trap.</td><td>v75 skel <code>81dcaab4…</code>, v79 <code>aba0126e…</code>; the image <code>5abf61be…</code>; the device md5 read back after B was the v79 one.</td></tr>
+    <tr><td>Steps</td><td>One screen of commands, in the order that never loses the baseline (run the reference variant first). Expected log lines are written out.</td><td><code>run_device_test.sh</code> → <code>RPC_TEST PASS</code>; six <code>run_e2e_test.sh</code> per variant at 512 / 1024 / 4096, each once in generation mode and once <code>--eval</code>.</td></tr>
+    <tr><td>Results</td><td>Each cell next to its reference and a pass band. Speed <em>and</em> accuracy columns, always.</td><td>Pass band for A: DSP Mcyc/tok within ±3 %, tok/s within ±5 % of the P4 row; accuracy inside the +0.16 … +1.29 % band on the P4 prompt. (Since #35 the v79 accuracy band is ±0.3 % of 32.4497 with top-1 184 ± 4; the v75 band is unchanged for the fallback — HEXAGON.md §8.2 "#35" verdict.)</td></tr>
+    <tr><td>Notes</td><td>Anything odd: thermal, warm-up, DSP restarts, stale pushes, benign log lines.</td><td>No restart in 13 runs; the three benign <code>adsprpc</code> permission lines and the pre-handshake <code>dsp abi v0</code> probe appear in every log.</td></tr>
+  </table>
+  <p><b>Turning <code>E2E</code> lines into numbers</b> (23-sdk64-baseline.md step 3; HEXAGON.md §8.2 "Throughput by context"):</p>
+  <ul>
+    <li>Each chunk or step prints <code>E2E step &lt;i&gt; pos=&lt;p&gt; n=&lt;n&gt; pcycles=&lt;c&gt; us=&lt;t&gt; top1=&lt;id&gt;</code>; <code>us</code> is host wall time around the one RPC, <code>pcycles</code> is the DSP's own cycle count of the op loop.</li>
+    <li><b>prefill tok/s</b> = prompt tokens ÷ (sum of <code>us</code> over the <code>n=128</code> steps ÷ 1e6).</li>
+    <li><b>decode ms/tok</b> = median host <code>us</code> over the 63 <code>n=1</code> steps ÷ 1000; <b>decode tok/s</b> = 1000 ÷ that.</li>
+    <li><b>DSP Mcyc/tok</b> = median <code>pcycles</code> of the same steps ÷ 1e6. Effective clock = <code>pcycles ÷ us</code> (the harness prints it as <code>pcycles_per_us</code>); the nominal top corner is 2.09 GHz, but which S25 Ultra unit you hold decides what you actually see — 1884–2064 MHz across the six #23 runs on one unit, 1905–1915 MHz in the generation loop on the other (section 2a below).</li>
+    <li>For <code>--eval</code>: <code>E2E ppl &lt;x&gt; steps 511 top1 &lt;n&gt; wall_ms &lt;w&gt;</code> — teacher-forced perplexity over the prompt and how many next tokens the top-1 prediction got right.</li>
+  </ul>
+  <p><b>Two caveats you will meet.</b> The 512-token decode median is taken over 63 steps that are still settling after prefill (first-ten vs last-ten median Mcyc 67.1 → 64.3 at 512, flat at 1024 and 4096), so treat that pair as ±5 % by construction; a firmer figure needs repeated medians or a settled-tail estimator. And host wall time can move for host-side reasons the DSP did not cause (P3 → P4 host fell 76.4 → 31.2 ms while the DSP fell 35 → 28.5 ms), so <b>the DSP pcycles are the comparable number</b> between kernel versions (HEXAGON.md §8.2).</p>
+</div>
+
+<div class="panel warn">
+  <h2>2a · Two phones, two clocks: HEXAGON.md §7 rule 9</h2>
+  <svg viewBox="0 0 760 200" role="img" aria-label="Two S25 Ultra units run the same skel: same DSP cycles per step, different clock, therefore different tok/s; compare cycles across units">
+    <rect x="20" y="30" width="330" height="110" rx="10" fill="none" stroke="var(--grid)"/>
+    <text x="34" y="52" font-size="12" font-weight="600">unit R3CY10WM83Y (P3, P4, #24, #35)</text>
+    <text x="34" y="74" font-size="11" class="t2">decode loop 1905–1915 MHz · --eval loop 1167–1178 MHz</text>
+    <rect x="34" y="88" width="300" height="40" rx="6" fill="var(--x-light)"/>
+    <text x="44" y="105" font-size="11">v75, 512: 65.1 Mcyc in 34.0 ms = 29.4 tok/s (#24)</text>
+    <text x="44" y="121" font-size="11">v79, 512: 61.2 Mcyc in 32.4 ms = 30.9 tok/s (#35)</text>
+    <rect x="410" y="30" width="330" height="110" rx="10" fill="none" stroke="var(--grid)"/>
+    <text x="424" y="52" font-size="12" font-weight="600">unit R3CY205ZMND (#23)</text>
+    <text x="424" y="74" font-size="11" class="t2">decode loop 2054 MHz</text>
+    <rect x="424" y="88" width="300" height="40" rx="6" fill="var(--x-light)"/>
+    <text x="434" y="105" font-size="11">v75, 512: 64.3 Mcyc in 31.3 ms = 31.9 tok/s (#23 A)</text>
+    <text x="434" y="121" font-size="11">v79, 512: 60.1 Mcyc in 31.9 ms = 31.4 tok/s (#23 B)</text>
+    <line x1="350" y1="108" x2="410" y2="108" stroke="var(--w)" stroke-width="2"/>
+    <text x="380" y="100" font-size="10" text-anchor="middle" class="t2">cycles: +1.2 %</text>
+    <text x="380" y="124" font-size="10" text-anchor="middle" class="t2">tok/s: −8 %</text>
+    <text x="380" y="170" font-size="11" text-anchor="middle">Same kernels, same cycles, a slower clock: the tok/s gap is the phone, not the change.</text>
+    <text x="380" y="188" font-size="10" text-anchor="middle" class="t2">HEXAGON.md §7 rule 9; 24-host-logits.md "Notes"; 35-v79-skel.md B1 rows; 23-sdk64-baseline.md "Results"</text>
+  </svg>
+  <p>Two Galaxy S25 Ultra units have been used, and their cDSP holds different clocks in the decode loop. #24 (2026-09-18) found it: with the same v75 kernels as #23 (its skel's DSP diff against #23's is comments, clang-format and one per-call token-id check) the DSP cycles per step agreed within ~1 % at 512 and 1024 (65.1 vs 64.3; 85.0 vs 84.2 Mcyc) while tok/s came out −8 / −1 %. The P4 → #23 512-token "gain" (27.7 → 31.9 tok/s) was therefore the unit, not the SDK: on <code>R3CY10WM83Y</code> P4 ran 68.9 Mcyc in 36.1 ms and #24 65.1 Mcyc in 34.0 ms, both at 1.91 GHz. The rules that came out of it (HEXAGON.md §7 rule 9):</p>
+  <ul>
+    <li><b>(a) Name the unit.</b> Every handoff and every benchmark row carries the serial (<code>adb devices</code>; #23's own file did not, which is why its unit is inferred from the clock — see the footnote on <a href="06-performance.html">06</a>).</li>
+    <li><b>(b) Across units compare DSP Mcycles per step</b>; tok/s bands only within one unit. That makes Mcyc/step the column to read first on the performance page.</li>
+    <li><b>(c) Read a host-vs-DSP gap against the run's own clock</b>, never the nominal 2090 MHz. At 1.91 GHz a 34.0 ms / 65.1 Mcyc step is a ≈ 0 ms gap, though the nominal formula prints 2.85 ms — this is what kept #24 from opening a DSP top-k method. The same goes for the <code>pcycles_per_us ≥ 2.05</code> bar.</li>
+    <li><b>(d) The first e2e run after a push is cold, and the reversed double pass is mandatory for a tight verdict.</b> #24 put the cold run at about 3 % host wall and 5 % DSP cycles high (the first 16 <code>forward_full_us</code> of an <code>hexagon_rpc_test</code> group about 20 % high); #25 (2026-09-18, same unit) measured the first run of the day at <b>+8.5 %</b> DSP cycles over the same skel in pass 2 (66.97 vs 61.74 Mcyc). Read on pass 1 alone, #25's prefetch ratio would have been 0.84 instead of the 0.88 it is, and the chunk-64 variant would have looked 6 % better than it is. So <b>any verdict tighter than ±10 % is read from pass 2 of a reversed double pass</b> — A B C D, then D C B A — and a warm-up run is not a substitute (#24 ran malloc → rpcmem → static, then the reverse: pass 1 spread 1.8 ms, pass 2 spread 70 µs). Within one session the clock can also wander — 1743–2046 MHz across the 14 #25 runs — which is why the host-ms and Mcyc columns can even order two variants differently; verdicts read Mcyc. The teacher-forced <code>--eval</code> loop on the same unit runs at 1167–1178 MHz because the host spends ~10 ms between RPCs (issue #41) (HEXAGON.md §7 rule 9 (d); 25-decode-prefetch.md "Steps" 1–2, "Notes").</li>
+    <li><b>(e) The 4096 row moves with the unit and the session, not with the code — so a 4096 verdict is an A/B inside one order (the standing rule since #53).</b> The symptom: #35's v79 skel read 188.0 / 186.8 Mcyc (first run / cooled re-run) and 32.1 / 32.7 prefill tok/s on <code>R3CY10WM83Y</code> against #23 B's 177.6 / 34.4 on the other unit (+5.9 / +5.2 %, −6.6 / −4.9 %) while its 512 and 1024 rows sat within 2 %, and #24's v75 row had missed by the same +6.0 % the day before. The test (#53, 2026-09-18): #23 B's <em>exact</em> binary (<code>aba0126e…</code>, fingerprinted by its <code>--eval</code> 1.5687 / 3758) and <code>hvx_impl</code>'s skel (<code>1ab00865…</code>, <code>--eval</code> 1.5623 / 3759 = #35) ran 4096 back to back in two mirrored orders on this unit, ≥ 20 min idle and a battery reading before each order. Inside an order the two are indistinguishable (197.285 vs 197.092, 192.905 vs 192.897 Mcyc; same 64 tokens); between the two orders, 25 min apart, every run moved 2.2 %; the four-run mean sits 4.4 % above the same unit's #35 re-run of the same morning and 9.8 % above #23 B — with #23's own binary at +8.6 %. So there is no code regression, the offset is the unit and the session (the phone was charging throughout, and earlier sittings' charge state is not on record — the one variable left unsplit), and the rules are: a 4096 verdict compares both skels <b>inside one order</b> after the same idle (one order resolves 0.1 %); a 4096 cell is never read against another sitting's row, even on the same unit (±5 % between sittings, ≈ +9 % between units with identical bytes); a 4096 handoff records <code>adb shell dumpsys battery</code> temperature (tenths of °C) and <code>status</code> before each order plus the idle minutes, and names its reference sitting; #23 B's 4096 cells stay the other unit's numbers; and a skel's <em>size</em> is not a tree fingerprint (the second skel landed 32 B under a prediction made on another tree) — the <code>--eval</code> digits are. The measurement file itself calls its slot-matched result "inconclusive" (−2.22 % / +2.17 %, just outside its ±2 % band, opposite signs); the supervisor read the opposite signs as the per-order drift, excluded the code outcome and closed #53 without the second-day pair it asked for — see <a href="06-performance.html">06</a>, "What each measurement decided" (HEXAGON.md §7 rule 9 (e), §8.2 "#53" block; 53-4096-unit-split.md "Reading", "Notes from the run").</li>
+  </ul>
+  <p><b>And the 512 caveat again, because it bites here too.</b> The 512 decode median is ±5 % by construction (the 63 steps are still settling), so #35's 512 gate was passed on cycles (+1.8 %) and 1024 / 4096 were read first; a 512 tok/s difference of a few percent between two runs on the same unit says nothing (23-sdk64-baseline.md "Results"; 35-v79-skel.md "Results"). A handoff therefore opens with an <b>environment check</b>: its control variant must land within ±5 % of the unit's last reference at 512 in Mcyc, or the session is void (stale artifact or wrong unit), not a result — #25's control read +0.9 % of #35's 61.2 (25-decode-prefetch.md "Results", "Pass rules").</p>
+  <p><b>A ceiling is measured, not derived.</b> To know how fast decode could ever go with the current weight bytes, #25 built a skel with <code>-DHTP_MM_STREAM_ONLY</code> that DMAs every weight byte of the step and multiplies nothing (outputs garbage by construction, so no <code>--eval</code>; it prints <code>nntr_htp: stream bytes/step=595984384</code>). Its per-kind split gives the stream phase — <code>mm8</code>+<code>mm16</code>+<code>lg</code> = 32.2 Mcyc = 18.5 ms at that run's 1743 MHz = 32.3 GB/s = 54 tok/s at 512 — and the rest of its step is the attention and eltwise it still runs. The trap the handoff fell into first: reading <code>mm8</code>+<code>mm16</code> alone ("≈ 74 tok/s") forgets that the lm_head is 26 % of the bytes; the read-back corrected it (25-decode-prefetch.md "Goal rows"; HEXAGON.md §8.2 "The ceiling (G1'), read correctly").</p>
+</div>
+
+<div class="panel">
+  <h2>3 · The 3-way accuracy comparison</h2>
+  <svg viewBox="0 0 760 200" role="img" aria-label="Three implementations compared pairwise: x86 scalar reference, simulator kernels, device kernels; the model-level perplexity is the number that matters">
+    <rect x="30" y="30" width="200" height="60" rx="8" fill="var(--x-light)"/>
+    <text x="130" y="55" font-size="11" text-anchor="middle" font-weight="600">x86 reference</text>
+    <text x="130" y="72" font-size="10" text-anchor="middle" class="t2">hexagon_ref_run + ref_ops.c</text>
+    <rect x="280" y="30" width="200" height="60" rx="8" fill="var(--acc-light)"/>
+    <text x="380" y="55" font-size="11" text-anchor="middle" font-weight="600">simulator</text>
+    <text x="380" y="72" font-size="10" text-anchor="middle" class="t2">HVX kernels vs ref_ops.c, per op</text>
+    <rect x="530" y="30" width="200" height="60" rx="8" fill="var(--w-light)"/>
+    <text x="630" y="55" font-size="11" text-anchor="middle" font-weight="600">device</text>
+    <text x="630" y="72" font-size="10" text-anchor="middle" class="t2">hexagon_e2e_test --eval</text>
+    <line x1="230" y1="60" x2="280" y2="60" stroke="var(--dim)" stroke-width="2"/>
+    <text x="255" y="52" font-size="9" text-anchor="middle" class="t2">bound</text>
+    <line x1="480" y1="60" x2="530" y2="60" stroke="var(--dim)" stroke-width="2"/>
+    <text x="505" y="52" font-size="9" text-anchor="middle" class="t2">same .so</text>
+    <path d="M130,90 C130,150 630,150 630,90" fill="none" stroke="var(--dim)" stroke-width="2" stroke-dasharray="5 4"/>
+    <text x="380" y="140" font-size="11" text-anchor="middle">--eval PPL / top-1, same image, same tokens</text>
+    <text x="380" y="158" font-size="10" text-anchor="middle" class="t2">the model-level number; band +0.16 … +1.29 % on record</text>
+    <text x="380" y="190" font-size="11" text-anchor="middle" class="t2">HEXAGON.md §5.2, §8.1, §8.2; plan 0000 §2 gap rule 2</text>
+  </svg>
+  <ul>
+    <li><b>x86 reference vs simulator</b> — per kernel, on the simulator, with a mixed bound <code>|d| ≤ atol + rtol·|ref|</code>; the integer paths (W8A8, LOGITS, EMBED, the int16 accumulate) must be bit-exact, the float epilogues are allowed one fp16 ulp (2e-3 / 1e-3), the quantizers a bounded ±1 LSB rate. The 8-token <code>profile acc</code> uses the looser 0.1 / 0.1 bound because per-token int8 re-binning amplifies a 1-ulp fp16 difference roughly 2× per layer (HEXAGON.md §5.2).</li>
+    <li><b>Simulator vs device</b> — the same compiled skel, so a difference is silicon behaviour, a context-ownership bug the simulator cannot see (§7 rule 7), or a stale artifact. This is where the 2026-08 IEEE failures and the 2026-09-17 v79 surprise both showed up; #35 then showed the four v79 simulator failures were a quantiser sign bug and the 2026-08 failures a toolchain artefact (HEXAGON.md §7 rule 1). The standing rule survives both: a v79 change needs the v79 simulator sweep <em>and</em> a device <code>--eval</code>.</li>
+    <li><b>x86 reference vs device, model level</b> — <code>--eval</code> perplexity on the same image and tokens. On <code>eval.txt</code> (387 tokens) the DSP scored 20.2802 against 20.2718 reference (+0.04 %); with the P4 kernels the gap on the local prompts is +0.16 … +1.29 %, one band, not a regression. Fake-quant W8_CX itself costs about +3.4 % over fp32; that is the design's activation-quantization price, not a kernel error (HEXAGON.md §8.1, §8.2).</li>
+    <li><b>Three traps.</b> Short-text logit gates between two <em>correct</em> implementations swing by several percent (HEXAGON.md §8.1 first bullet) — judge at the model level. The reference figure depends on the host compiler that built <code>hexagon_ref_run</code> (0.75 % spread between the container's clang and the workstation's gcc on one prompt) — quote the build (HEXAGON.md §5.1). And the perplexity on these prompts responds by ~1 % to sub-1e-3 perturbations, so a 1 % PPL move alone does not identify a bad kernel (HEXAGON.md §8.2).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>4 · <code>find_divergence.py</code>: bisect to the first op that disagrees</h2>
+  <svg viewBox="0 0 760 150" role="img" aria-label="Both runners execute ops 0 to i and dump the output of op i minus 1; agreement is monotone in i so a binary search over 451 ops takes 9 comparisons">
+    <rect x="20" y="40" width="720" height="24" fill="var(--x-light)"/>
+    <text x="30" y="30" font-size="10" class="t2">op 0</text><text x="730" y="30" font-size="10" text-anchor="end" class="t2">op 450</text>
+    <rect x="20" y="40" width="380" height="24" fill="var(--acc)" opacity="0.8"/>
+    <text x="210" y="57" font-size="11" text-anchor="middle" fill="#fff">agree</text>
+    <text x="570" y="57" font-size="11" text-anchor="middle">differ</text>
+    <line x1="400" y1="30" x2="400" y2="74" stroke="var(--x)" stroke-width="3"/>
+    <text x="400" y="90" font-size="11" text-anchor="middle">FIRST_DIVERGENCE op=&lt;i&gt; kind=&lt;k&gt; layer=&lt;l&gt;</text>
+    <text x="380" y="120" font-size="11" text-anchor="middle" class="t2">run ops [0, i) on both sides, dump op i−1's output, compare; halve the range; 9 rounds for 451 ops</text>
+    <text x="380" y="140" font-size="11" text-anchor="middle" class="t2">HEXAGON.md §6; tools/hexagon/find_divergence.py</text>
+  </svg>
+<pre>python3 tools/hexagon/find_divergence.py /tmp/qwen3_full /tmp/t.i32 --serial &lt;serial&gt; --chunk 8
+# -> FIRST_DIVERGENCE op=&lt;i&gt; kind=&lt;k&gt; layer=&lt;l&gt; max_abs=.. max_rel=..   or NO_DIVERGENCE</pre>
+  <ul>
+    <li><b>The primitive.</b> <code>forward_debug()</code> (ABI v3+) runs ops <code>[0, n)</code> only and returns a byte slice of WEIGHTS / KV / ACT. <code>hexagon_ref_run --dump-op i --dump-out f</code> does the same on x86. "Outputs agree" is monotone in <code>i</code>, so a binary search finds the first bad op (HEXAGON.md §1.4, §6; nntr_htp.idl).</li>
+    <li><b>Runs on the phone.</b> The script calls <code>run_e2e_test.sh</code> for the device side, so it belongs in a handoff, not in the container. A partial run still updates the KV cache, so debug sessions restart from position 0 (HEXAGON.md §1.4).</li>
+    <li><b>Tolerance 0.1 by default</b>, deliberately loose: per-token int8 amplifies ~1e-4 fp16 noise 5–8× per matmul (ATTN rel-RMS 1e-4 → next W8A8 3e-3 on the 1-layer image), so a tight tolerance flags two correct implementations as diverged (HEXAGON.md §6).</li>
+    <li><b>Use a 1-layer image</b> (<code>nntr_hexpack --layers 1</code>, 172,498,944 bytes) for fast iteration. The last op writes LOGITS, which <code>forward_debug</code> cannot dump; judge it by the <code>--eval</code> perplexity of both runners (HEXAGON.md §6).</li>
+    <li><b>Beyond the first op.</b> The P4 isolation went one step further: it recomputed the reference for one op from the DSP's <em>own</em> input and compared that to the DSP's output — rel-RMS 1.6e-4, max one fp16 ulp — which separates "this kernel is wrong" from "this kernel is fed slightly different numbers" (HEXAGON.md §8.2).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>5 · The FARF log: what the DSP says about itself</h2>
+  <p><b>FARF</b> is the DSP's logging macro; its lines reach Android's logcat only if a file named <code>&lt;binary&gt;.farf</code> containing <code>0x1f</code> sits next to the binary on the device. Both run scripts write it, then capture <code>logcat -d | grep -i "nntr_htp\|adsprpc\|fastrpc"</code> into <code>logs/hexagon/device_farf_&lt;stamp&gt;.log</code> (HEXAGON.md §5.3; run_e2e_test.sh; run_device_test.sh).</p>
+  <table>
+    <tr><th>Line (executor.c)</th><th>Meaning</th></tr>
+    <tr><td><code>nntr_htp: open, abi v4</code></td><td>the skel loaded and a session opened</td></tr>
+    <tr><td><code>nntr_htp: op-list rejected (rc=N)</code></td><td>header check failed: 1 bad size, 2 bad magic, 3 version mismatch (→ <code>AEE_EUNSUPPORTED</code>)</td></tr>
+    <tr><td><code>nntr_htp: HAP_mmap failed (w=… kv=… act=…)</code></td><td>a buffer fd could not be mapped — usually the host did not <code>fastrpc_mmap</code> it first (HEXAGON.md §1.1)</td></tr>
+    <tr><td><code>nntr_htp: graph init failed (rc=N)</code></td><td>the full validator failed: 4 bad header field / layout, 5 bad op — since #33 that includes <code>k == 0</code>, <code>n % 64</code> on RMSNORM/ADD/SILU_MUL, PER_HEAD <code>n % head_dim</code>, <code>ATTN.layer &gt;= n_layers</code>, an ATTN <code>in1</code>/<code>in2</code> or LOGITS <code>in0</code> too short for <code>max_chunk</code> rows, and a descriptor-fixed <code>m</code> on any kind but LOGITS (HEXAGON.md §1.4; nntr_htp_common.h)</td></tr>
+    <tr><td><em>(no line)</em></td><td>a <code>forward()</code> rejection — token count 0 or &gt; <code>max_chunk</code>, position + count &gt; <code>max_seq</code>, wrong logits length, or a token id ≥ vocab / negative — returns <code>AEE_EBADPARM</code> without logging, before any KV/ACT write (htp_graph.c; executor.c)</td></tr>
+    <tr><td><code>nntr_htp: init ok, weights=… kv=… act=… n_ops=…</code></td><td>mapped and validated; the graph is ready</td></tr>
+    <tr><td><code>nntr_htp: hexkl &lt;version&gt; hmx=&lt;0|1&gt; vtcm_hvx=&lt;bytes&gt; hmx_arena=&lt;bytes&gt;</code></td><td>(since #68, <code>-DHTP_HMX=1</code> builds only; printed from htp_graph.c rather than executor.c so the <code>HTP_HMX=0</code> executor object stays byte-identical) the HexKL version, whether the HMX unit and its arena were granted, and how the VTCM grant was split — 4 MB + 4 MB on the v79 simulator, HexKL 1.0.0-beta1 hexagon v79 in the container. <code>hmx=0</code> in a HexKL build means the compute-resource manager refused the HMX attribute and the session fell back to the plain 4 MB acquire; no device value has been recorded yet, the first is read in #65 S2's handoff H1 (HEXAGON.md §2.2 "HMX arena"; htp_graph.c)</td></tr>
+    <tr><td><code>nntr_htp: prof n=… pos=… ops=451 kcyc=… mm8=… mm16=… lg=… attn=… rest=…</code></td><td>(since #25, only in a skel built with <code>-DHTP_PROF_FARF</code>) one line per forward call: this call's DSP cycles in thousands, split into the W8A8 matmuls, the int16 <code>down_proj</code>, the lm_head, attention and everything else. <code>python3 tools/hexagon/summ_farf_prof.py logs/hexagon/device_farf_*.log</code> prints the decode medians per log, which is how the #25 verdicts (−34 % <code>mm8</code>, attention 32 / 46 / 79 % of the step) were read, and what #58's <code>attn</code> gate will be read from (HEXAGON.md §5.3 "Measurement-only skel flags"; 58-decode-attn-gqa.md "Pass rules")</td></tr>
+    <tr><td><code>nntr_htp: stream bytes/step=595984384 (STREAM_ONLY, outputs are garbage)</code></td><td>(since #25, <code>-DHTP_MM_STREAM_ONLY</code> builds only) the ceiling skel announcing itself after <code>init ok</code>; repeated <code>top1</code> ids in its <code>E2E</code> log are expected, not a failure</td></tr>
+    <tr><td><code>nntr_htp: close</code></td><td>session closed, graph destroyed, buffers unmapped</td></tr>
+  </table>
+  <ul>
+    <li><b>Benign lines in every device log</b> (23-sdk64-baseline.md "Notes"): three <code>adsprpc</code> permission warnings (<code>open_shell failed for domain 3</code>, <code>fastrpc_enable_kernel_optimizations failed</code>, <code>Unable to add watcher for /vendor/lib64/rfs/dsp</code>) and the host line <code>hexagon: init failed (0x80000414), host abi v4, dsp abi v0</code> from the stub's first probe before the version handshake — the "v0" is the rule that output parameters are not copied back on failure (HEXAGON.md §1.3).</li>
+    <li><b>What a real failure looks like:</b> a hang, a DSP restart (SSR) or a fatal FARF line; the handoff asks the runner to note the last <code>E2E step</code> line and the FARF tail, <code>adb reboot</code>, and continue (23-sdk64-baseline.md step 4). None occurred in the 13 runs of #23, the 11 e2e runs of #24, the 15 runs of #35 or the 14 runs of #25 (whose one new runtime pattern, a DMA descriptor pending across the worker barrier, would have shown as a &gt; 2× step right after the prefill chunks of a prefetch run — none did). One line that looks alarming but is not: <code>remote_handle64_invoke failed … (user err 0x80000414)</code> in the <code>rpc_test</code> log is that test's own ABI-mismatch case and is followed by <code>RPC_TEST PASS</code> (35-v79-skel.md "Notes").</li>
+    <li><b>Host-side messages</b> from the app go to stderr as <code>hexagon: …</code> (e.g. <code>open failed (0x80000406), CPU fallback</code>); routing them into the nntrainer logger is planned work (HEXAGON.md §5.4, §9).</li>
+    <li><b>What a rejection looks like on the host.</b> A DSP <code>AEE_EBADPARM</code> reaches the host as <code>0x8000040E</code>: the bare code 14 plus the <code>0x80000400</code> DSP error base FastRPC adds (the same offset makes <code>AEE_EUNABLETOLOAD</code> / <code>AEE_EUNSUPPORTED</code> appear as <code>0x80000406</code> / <code>0x80000414</code>). <code>HexagonBackend::forward</code> pre-checks all token ids of a request on the host and returns that same value, <code>kHexagonBadParm</code>, without any RPC (hexagon_runner.h, static-asserted in hexagon_runner.cpp; hexagon_backend.cpp). Mid-generation the app throws <code>hexagon: forward failed (0x…)</code> — note that causal_lm.cpp formats the number with <code>std::to_string</code>, so this code prints as the decimal <code>-2147482610</code> after the <code>0x</code>, not as <code>8000040E</code> (causal_lm.cpp; HEXAGON.md §1.4, §5.2).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>6 · Simulator profiles: relative signal only</h2>
+  <p><code>run_sim_test.sh profile &lt;acc|prefill0|prefill512|decode512&gt; [n_workers]</code> lowers the qwen3 shape with 2 layers and a 4096 vocabulary and prints <code>SIM_PROF</code> lines: per-op-kind pcycles, one line per op, and the cost of 1000 empty barriers. <code>python3 tools/hexagon/summ_prof.py logs/hexagon/sim_prof_*.log</code> rescales to 28 layers and the full vocabulary and prints a sim-derived ms/token at 2.09 GHz. Those are simulator cycles: the simulator does not model DDR bandwidth, so they rank bottlenecks but never decide a performance question (HEXAGON.md §5.2, §8.3). Example of the ranking they gave: after P3, <code>MATMUL_W8A16</code> was 55.4 % of simulated prefill at position 512, which made it P4's target; after P4, attention is the largest cost that grows with context (HEXAGON.md §8.3, §9).</p>
+  <p><b>A second caveat, from #58 (2026-09-18): the v79 simulator's sixth worker runs at half speed.</b> The decode-attention branch (<code>hvx/58-decode-attn-gqa</code>) had a simulator gate of "op total ≤ 0.6× the old kernel" for <code>attn_decode_p1024</code>; it reads 0.72×. The per-worker timers show why: with six workers, workers 0–4 finish four attention jobs each in 152–167 Kcyc while worker 5 takes 308 Kcyc for the same four, in every configuration tried (the old kernel, the split, the split with <code>l2fetch</code>, the fusion alone) — so the balance the gate was written to check is there on the five other workers, and the simulator floor is not a verdict. Whether the sixth worker is also slow on silicon is not known; the device handoff decides, and if its B <code>attn</code> column lands near 2/3 of A instead of 1/2 at 4096, a per-worker FARF split is the first thing to look at. Rule of thumb for any change that spreads work over the pool: read the simulator's per-worker timers, not only the op total, and let the phone decide the ratio (58-decode-attn-gqa.md "Notes from the run", simulator record; HEXAGON.md §5.2 on simulator cycles).</p>
+  <p><b>A third note, from #68 (2026-09-21): the simulator does execute HMX, and bit-exactly.</b> The plain <code>-mv79</code> core is <code>v79na_1</code> with an HMX v3 coprocessor; HexKL's own micro-matmul example passes on it and the new <code>hmx</code> test reads <code>max_abs=0</code> in place, through HexKL's vendor copy and after a VTCM → DDR → DMA → VTCM relocate. So an HMX numeric STAT is a simulator gate like the 13 HVX tests — the plan's fallback of "links and skips, every HMX gate device-only" was not needed. What the simulator cannot vouch for is the layout HexKL's <code>acc_read_int32</code> lands an int32 result tile in (sim: <code>acc_layout usable=1 base=0 row_stride=32</code>): the first device handoff of any HMX consumer re-reads that line on the silicon before an in-place result is trusted, and a device <code>usable=0</code> routes that path through the slower vendor copy — a measured cost, never a hang (HEXAGON.md §5.2, §7 rule 11; plan 65 §4 "S0 outcome", §5 risk 1).</p>
+</div>
+
+<p class="note">Hexagon backend beginner guide · sources: docs/backend_guide/HEXAGON.md, HEXAGON_BENCHMARK.md, docs/measurements/ (#23, #24, #35, #25, #53 on hvx_impl; #58 handoff on branch hvx/58-decode-attn-gqa), nntrainer/tensor/hexagon/, Applications/CausalLM/hexagon/, tools/docker/, docs/superpowers/specs/hexagon-hvx-optimization/. Written 2026-09-17, refreshed 2026-09-21 against hvx_impl commit e57f66e5 (#68 S0 merged, PR #72; S1 read from branch hvx/69-w4cx-producer-abi5, in review).</p>
+</body>
+</html>

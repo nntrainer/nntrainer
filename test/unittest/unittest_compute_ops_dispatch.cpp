@@ -22,10 +22,6 @@
 #include <atomic>
 #include <memory>
 
-#ifdef ENABLE_HEXKL
-#include <htp_backend.h>
-#endif
-
 namespace {
 
 /**
@@ -333,32 +329,6 @@ TEST_F(ComputeOpsDispatchTest, ToMigratesContextDataAndUnblocksOp) {
   // Now a.multiply(b_migrated) is on the same context — no throw.
   EXPECT_NO_THROW(a.multiply(b_migrated, out));
 }
-
-#ifdef ENABLE_HEXKL
-/**
- * @brief The HTP ops table resolves and every op on it still computes.
- *
- * No kernel is wired to the NPU yet, so an engine="htp" model has to keep
- * working by falling through to the CPU implementation. Asserting a real
- * result -- rather than merely that the pointer is non-null -- is what
- * catches a table whose entries throw, which is what the base ComputeOps
- * defaults do. The accelerator predicates arrive with the first kernel.
- */
-TEST(HtpBackendSmoke, TableFallsThroughToCpu) {
-  auto *htp = nntrainer::get_htp_ops();
-  ASSERT_NE(htp, nullptr);
-  nntrainer::ensureComputeOps();
-
-  constexpr unsigned int N = 4;
-  const float x[N] = {1.0f, 2.0f, 3.0f, 4.0f};
-  const float y[N] = {10.0f, 20.0f, 30.0f, 40.0f};
-  float z[N] = {0.0f, 0.0f, 0.0f, 0.0f};
-
-  ASSERT_NO_THROW(htp->ele_add_fp32(N, x, y, z, 1.0f, 0.0f, 1, 1));
-  for (unsigned int i = 0; i < N; ++i)
-    EXPECT_FLOAT_EQ(z[i], x[i] + y[i]);
-}
-#endif // ENABLE_HEXKL
 
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);

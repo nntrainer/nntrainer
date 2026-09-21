@@ -1,9 +1,12 @@
 name: "Build Test - Ubuntu Meson (clang)"
 
 on:
-  # TODO: enable pull_request if needed
+  # TODO: enable pull_request for main if needed
   # pull_request:
   #   types: [opened, reopened, synchronize]
+  pull_request:
+    branches: [ hvx_impl ]
+    types: [opened, reopened, synchronize]
   workflow_dispatch:
 
 concurrency:

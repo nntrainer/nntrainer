@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hexagon backend guide — 02 Architecture</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb;
+    --panel: #f3f3f1;
+    --text-1: #0b0b0b;
+    --text-2: #52514e;
+    --grid: #d9d8d3;
+    --w: #2a78d6;      /* weights  (slot 1 blue)   */
+    --w-light: #cde2fb;
+    --x: #eb6834;      /* activations (slot 2 orange) */
+    --x-light: #fbd9cc;
+    --acc: #1baf7a;    /* accumulator / output (slot 3 aqua) */
+    --acc-light: #cdeee0;
+    --dim: #b7b6b0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface: #1a1a19;
+      --panel: #242423;
+      --text-1: #ffffff;
+      --text-2: #c3c2b7;
+      --grid: #3a3a38;
+      --w: #3987e5;
+      --w-light: #1c3a5e;
+      --x: #d95926;
+      --x-light: #5a2a17;
+      --acc: #199e70;
+      --acc-light: #16442f;
+      --dim: #5a5a57;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 48px;
+    background: var(--surface); color: var(--text-1);
+    font: 15px/1.55 -apple-system, "Segoe UI", "Noto Sans KR", Roboto, sans-serif;
+    max-width: 1240px; margin-inline: auto;
+  }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 8px; }
+  .sub { color: var(--text-2); margin: 0 0 28px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 28px; }
+  @media (max-width: 900px) { .row { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border-radius: 10px; padding: 18px 18px 14px;
+  }
+  .panel p { color: var(--text-2); margin: 6px 0 0; font-size: 14px; }
+  .panel .verdict { margin-top: 10px; font-size: 14px; color: var(--text-1); }
+  svg { width: 100%; height: auto; display: block; }
+  text { font-family: inherit; fill: var(--text-1); }
+  .t2 { fill: var(--text-2); }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--text-2); margin: 0 0 22px; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+    margin-right: 6px; vertical-align: -2px; background: var(--c);
+  }
+  .ctrl { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text-2); margin: 6px 0 4px; }
+  .ctrl input[type=range] { width: 160px; accent-color: var(--w); }
+  .ctrl button {
+    border: 1px solid var(--grid); background: var(--surface); color: var(--text-1);
+    border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin-top: 4px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { color: var(--text-2); font-weight: 600; }
+  td:first-child { color: var(--text-2); white-space: nowrap; }
+  .note { color: var(--text-2); font-size: 13px; margin-top: 18px; }
+  .tip {
+    position: fixed; pointer-events: none; background: var(--text-1); color: var(--surface);
+    padding: 6px 9px; border-radius: 6px; font-size: 12px; line-height: 1.4;
+    opacity: 0; transition: opacity .08s; white-space: nowrap; z-index: 10;
+  }
+</style>
+<style>
+  /* guide additions: identical on every page of hexagon-guide/ */
+  nav.guide { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; margin: 0 0 24px; padding: 10px 0; border-block: 1px solid var(--grid); }
+  nav.guide a { color: var(--text-2); text-decoration: none; }
+  nav.guide a.here { color: var(--text-1); font-weight: 600; }
+  nav.guide a:hover { color: var(--w); }
+  a { color: var(--w); }
+  .panel { margin-bottom: 24px; }
+  .panel ul, .panel ol { color: var(--text-2); font-size: 14px; margin: 6px 0 0; padding-left: 22px; }
+  .panel li { margin: 3px 0; }
+  .panel li b, .panel p b { color: var(--text-1); }
+  pre { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 10px 12px; font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; overflow-x: auto; margin: 8px 0; color: var(--text-1); white-space: pre; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.93em; }
+  .src { color: var(--text-2); font-size: 12px; }
+  .status { border-left: 4px solid var(--acc); }
+  .warn { border-left: 4px solid var(--x); }
+  .step { counter-increment: step; }
+  .kv td:first-child { white-space: normal; }
+  dl.gl { margin: 0; font-size: 14px; }
+  dl.gl dt { font-weight: 600; margin-top: 10px; }
+  dl.gl dd { margin: 2px 0 0; color: var(--text-2); }
+  td, th { word-break: break-word; }
+  td:first-child { white-space: normal; }
+</style>
+</head>
+<body>
+<nav class="guide">
+  <a href="index.html">Overview</a>
+  <a href="01-run-it.html">01 Run it</a>
+  <a class="here" href="02-architecture.html">02 Architecture</a>
+  <a href="03-kernels.html">03 Kernels</a>
+  <a href="04-measure-and-debug.html">04 Measure and debug</a>
+  <a href="05-glossary.html">05 Glossary</a>
+  <a href="06-performance.html">06 Performance</a>
+</nav>
+<h1>02 · Architecture: the pieces and the arrows between them</h1>
+<p class="sub">Seven parts, each with a picture. Read them in order: the packer makes the bytes, the image files carry them, the FastRPC session hands them over, the op-list tells the DSP what to do with them, the worker pool and VTCM are how the DSP does it fast, and the ABI version is the promise that keeps both sides honest.</p>
+
+<div class="legend">
+  <span style="--c: var(--w)">weights / image (fixed for the session)</span>
+  <span style="--c: var(--x)">activations, tokens, scratch (change per call)</span>
+  <span style="--c: var(--acc)">outputs, KV cache, results</span>
+</div>
+
+<div class="panel">
+  <h2>1 · The packer: model shape in, byte layout out</h2>
+  <svg viewBox="0 0 760 220" role="img" aria-label="lower_qwen3 turns a config into an op-list and offsets; pack_weights copies tensors to those offsets">
+    <rect x="10" y="30" width="170" height="60" rx="8" fill="var(--x-light)"/>
+    <text x="95" y="55" font-size="12" text-anchor="middle">HexModelConfig</text>
+    <text x="95" y="74" font-size="11" text-anchor="middle" class="t2">layers, heads, dims, max_seq…</text>
+    <rect x="10" y="130" width="170" height="60" rx="8" fill="var(--w-light)"/>
+    <text x="95" y="155" font-size="12" text-anchor="middle">W8_CX .bin (598,230,528 B)</text>
+    <text x="95" y="174" font-size="11" text-anchor="middle" class="t2">Qwen3W8cxBin mmap → HexModelWeights</text>
+    <rect x="260" y="30" width="200" height="60" rx="8" fill="none" stroke="var(--grid)"/>
+    <text x="360" y="55" font-size="12" text-anchor="middle" font-weight="600">lower_qwen3(cfg)</text>
+    <text x="360" y="74" font-size="11" text-anchor="middle" class="t2">pure shape math, reads no weights</text>
+    <rect x="260" y="130" width="200" height="60" rx="8" fill="none" stroke="var(--grid)"/>
+    <text x="360" y="155" font-size="12" text-anchor="middle" font-weight="600">pack_weights(g, cfg, w, dst)</text>
+    <text x="360" y="174" font-size="11" text-anchor="middle" class="t2">copy / convert / re-tile to g.woff</text>
+    <rect x="540" y="20" width="210" height="44" rx="8" fill="var(--x-light)"/>
+    <text x="645" y="47" font-size="12" text-anchor="middle">op-list: 64 B header + 451 × 64 B</text>
+    <rect x="540" y="76" width="210" height="44" rx="8" fill="var(--acc-light)"/>
+    <text x="645" y="103" font-size="12" text-anchor="middle">woff + weights/kv/act sizes</text>
+    <rect x="540" y="140" width="210" height="44" rx="8" fill="var(--w-light)"/>
+    <text x="645" y="167" font-size="12" text-anchor="middle">WEIGHTS image (598,623,744 B)</text>
+    <line x1="180" y1="60" x2="260" y2="60" stroke="var(--dim)" stroke-width="2"/>
+    <line x1="460" y1="50" x2="540" y2="42" stroke="var(--dim)" stroke-width="2"/>
+    <line x1="460" y1="70" x2="540" y2="98" stroke="var(--dim)" stroke-width="2"/>
+    <line x1="180" y1="160" x2="260" y2="160" stroke="var(--dim)" stroke-width="2"/>
+    <line x1="360" y1="90" x2="360" y2="130" stroke="var(--dim)" stroke-width="2"/>
+    <line x1="460" y1="160" x2="540" y2="162" stroke="var(--dim)" stroke-width="2"/>
+  </svg>
+  <p><b>Lowering</b> is the step that turns "a 28-layer Qwen3 with hidden size 1024" into a concrete plan: which op runs when, and at which byte offset every tensor lives. It is host-side C++ with no SDK dependency. <code>graph_lowering.h</code> (in the backend) holds the model-agnostic vocabulary — <code>HexModelConfig</code>, <code>HexModelWeights</code>, <code>HexLoweredGraph</code>, <code>align128()</code>, <code>pack_weights()</code>; the Qwen3 recipe <code>lower_qwen3()</code> lives with the app in <code>Applications/CausalLM/hexagon/qwen3_lowering.cpp</code>. A second model would add its own <code>*_lowering.cpp</code> and reuse <code>pack_weights()</code> unchanged (HEXAGON.md §2).</p>
+  <p>Two consumers pack: <code>nntr_hexpack</code> writes files for the harnesses, and <code>HexagonBackend::create()</code> packs straight into shared memory for the app (HEXAGON.md §2.4, §5.4; hexagon_backend.cpp).</p>
+</div>
+
+<div class="panel">
+  <h2>2 · Image files: <code>.hexw</code> and <code>.hexcfg</code></h2>
+  <svg viewBox="0 0 760 150" role="img" aria-label="Layout of the WEIGHTS image: embed, embed_scale, rope_table, final_norm, then per-layer blocks">
+    <rect x="10" y="30" width="160" height="40" fill="var(--w)" opacity="0.9"/>
+    <text x="90" y="55" font-size="11" text-anchor="middle" fill="#fff">embed int8 [vocab][hidden]</text>
+    <rect x="170" y="30" width="40" height="40" fill="var(--w)" opacity="0.6"/>
+    <rect x="210" y="30" width="60" height="40" fill="var(--w)" opacity="0.45"/>
+    <text x="240" y="55" font-size="10" text-anchor="middle">rope</text>
+    <rect x="270" y="30" width="16" height="40" fill="var(--w)" opacity="0.3"/>
+    <rect x="286" y="30" width="464" height="40" fill="none" stroke="var(--w)" stroke-dasharray="4 3"/>
+    <text x="518" y="55" font-size="11" text-anchor="middle">layer 0 … layer 27: wq wk wv wo gate up down (+ scales) + 4 norms</text>
+    <text x="90" y="90" font-size="10" text-anchor="middle" class="t2">1</text>
+    <text x="190" y="90" font-size="10" text-anchor="middle" class="t2">2 embed_scale fp32</text>
+    <text x="240" y="104" font-size="10" text-anchor="middle" class="t2">3 fp16 cos‖sin</text>
+    <text x="278" y="118" font-size="10" text-anchor="middle" class="t2">4 final_norm</text>
+    <text x="518" y="90" font-size="10" text-anchor="middle" class="t2">5 · every tensor starts on a 128-byte boundary (bump cursor, align128)</text>
+    <text x="380" y="140" font-size="11" text-anchor="middle" class="t2">total for qwen3-0.6b: 598,623,744 bytes, no padding needed (HEXAGON.md §2.1)</text>
+  </svg>
+  <ul>
+    <li><b><code>.hexw</code></b> is the WEIGHTS image exactly as the DSP will map it. Order: <code>embed</code> (int8, tied — also the logits weight), <code>embed_scale</code>, <code>rope_table</code> (fp16 cos/sin precomputed on the host), <code>final_norm</code>, then per layer the seven projections with one fp32 scale per output row and the four norm vectors as fp16. Since ABI v4 every projection except <code>down</code> is stored in a <b>tiled32</b> order (the same bytes, rearranged into 4 KB tiles of 32 rows × 128 k so the matmul kernel can consume them without reshuffling; see the <a href="03-kernels.html">kernels page</a>) (HEXAGON.md §2.1).</li>
+    <li><b><code>.hexcfg</code></b> is 12 <code>key=value</code> lines: the 11 <code>HexModelConfig</code> fields (<code>n_layers, n_heads, n_kv_heads, head_dim, hidden, ffn, vocab, max_seq, max_chunk, rms_eps, rope_theta</code>) plus <code>weight_layout=tiled32</code>. Every consumer re-runs <code>lower_qwen3()</code> from it, so the image and the op-list cannot drift apart. A file without the layout key is a pre-v4 image and <code>read_hexcfg</code> refuses it (HEXAGON.md §2.4; hex_image.h; graph_lowering.h).</li>
+    <li>The int8 checkpoint the packer reads, <code>nntr_qwen3_0.6b_w8cx_DEFAULT.bin</code>, is header-less, 598,230,528 bytes, tensors in the order <code>embedding</code>, then per layer <code>attn_norm, wq, q_norm, wk, k_norm, wv, wo, ffn_norm, up, gate, down</code>, then <code>output_norm</code> (HEXAGON.md §2.4).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>3 · The FastRPC session: hand off once, map forever</h2>
+  <svg viewBox="0 0 760 250" role="img" aria-label="Session timeline: create, init with three fds, then forward calls carrying tokens in and logits out">
+    <line x1="120" y1="20" x2="120" y2="240" stroke="var(--grid)"/>
+    <line x1="640" y1="20" x2="640" y2="240" stroke="var(--grid)"/>
+    <text x="120" y="14" font-size="12" text-anchor="middle" font-weight="600">host: HexagonRunner</text>
+    <text x="640" y="14" font-size="12" text-anchor="middle" font-weight="600">DSP: executor.c</text>
+    <line x1="120" y1="40" x2="640" y2="40" stroke="var(--dim)" stroke-width="2"/>
+    <text x="380" y="34" font-size="11" text-anchor="middle" class="t2">create(): unsigned PD request, remote_handle64_open</text>
+    <line x1="120" y1="80" x2="640" y2="80" stroke="var(--w)" stroke-width="2"/>
+    <text x="380" y="74" font-size="11" text-anchor="middle" class="t2">init(oplist, weights_fd, kv_fd, act_fd) — once, ~1 s</text>
+    <text x="380" y="96" font-size="10" text-anchor="middle" class="t2">DSP: version handshake → validate op-list → HAP_mmap the three fds → build htp_graph</text>
+    <line x1="120" y1="130" x2="640" y2="130" stroke="var(--x)" stroke-width="2"/>
+    <text x="380" y="124" font-size="11" text-anchor="middle" class="t2">forward(token_ids[n], pos)</text>
+    <line x1="640" y1="150" x2="120" y2="150" stroke="var(--acc)" stroke-width="2"/>
+    <text x="380" y="166" font-size="11" text-anchor="middle" class="t2">logits[vocab] + dsp_pcycles   (one RPC per chunk or token, ~0.26 ms)</text>
+    <line x1="120" y1="190" x2="640" y2="190" stroke="var(--x)" stroke-width="2"/>
+    <text x="380" y="184" font-size="11" text-anchor="middle" class="t2">forward_debug(token_ids, pos, n_ops_limit, dump_buf, dump_offset) → dump bytes</text>
+    <line x1="120" y1="225" x2="640" y2="225" stroke="var(--dim)" stroke-width="2"/>
+    <text x="380" y="219" font-size="11" text-anchor="middle" class="t2">destructor → close(): destroy graph, unmap</text>
+  </svg>
+  <ul>
+    <li><b>FastRPC</b> is Qualcomm's remote-procedure-call mechanism between the CPU and the DSP. The interface is written once in <code>nntr_htp.idl</code> (three methods: <code>init</code>, <code>forward</code>, <code>forward_debug</code>); the QAIC tool generates a host-side <b>stub</b> and a DSP-side <b>skel</b> from it at build time, neither is committed (HEXAGON.md §1).</li>
+    <li><b>Zero-copy buffers.</b> WEIGHTS, KV and ACT are allocated with <code>rpcmem</code> (a dma-buf, memory both processors can address). They cross the boundary <em>once</em>, at <code>init()</code>, as file descriptors; the DSP maps them with <code>HAP_mmap</code> for the whole session. <code>forward()</code> carries only the small token and logits arrays, whose coherency the driver manages (HEXAGON.md §1.1; nntr_htp.idl).</li>
+    <li>Two bring-up lessons baked into the code: a raw fd number means nothing to the DSP until the host registers it with <code>fastrpc_mmap(..., FASTRPC_MAP_FD_DELAYED)</code> (re-registering returns <code>AEE_EALREADY</code>, treated as success so re-init works); and the weights buffer is additionally passed as an in-sequence so the driver flushes the CPU cache once — the DSP ignores the sequence and keeps the mapping. Weight content must be final before <code>init()</code> (HEXAGON.md §1.1).</li>
+    <li>The session opens an <b>unsigned protection domain</b> so no per-device signing is needed; HVX needs no privileges (HEXAGON.md §1.2). Errors come back as AEE codes, offset by FastRPC's <code>0x80000400</code> DSP error base (hexagon_runner.cpp); output parameters are <em>not</em> copied back on failure, so a failed <code>init()</code> reports <code>dsp abi v0</code> — expected, not a bug (HEXAGON.md §1.3; also seen as the benign <code>hexagon: init failed (0x80000414), host abi v4, dsp abi v0</code> probe line in every device log, 23-sdk64-baseline.md "Notes").</li>
+    <li><code>HexagonRunner::create()</code> returning <code>nullptr</code> means "no usable DSP"; callers take the CPU path (hexagon_runner.h).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>4 · The op-list (ABI v4): 64-byte records the DSP validates once</h2>
+  <svg viewBox="0 0 760 160" role="img" aria-label="Op-list layout: one 64-byte header followed by n_ops 64-byte descriptors; a descriptor holds kind, shape and four tensor refs">
+    <rect x="10" y="30" width="110" height="40" fill="var(--x)" opacity="0.85"/>
+    <text x="65" y="55" font-size="11" text-anchor="middle" fill="#fff">header 64 B</text>
+    <rect x="120" y="30" width="60" height="40" fill="var(--x-light)"/><text x="150" y="55" font-size="10" text-anchor="middle">op 0</text>
+    <rect x="180" y="30" width="60" height="40" fill="var(--x-light)"/><text x="210" y="55" font-size="10" text-anchor="middle">op 1</text>
+    <rect x="240" y="30" width="60" height="40" fill="var(--x-light)"/><text x="270" y="55" font-size="10" text-anchor="middle">…</text>
+    <rect x="300" y="30" width="60" height="40" fill="var(--x-light)"/><text x="330" y="55" font-size="10" text-anchor="middle">op 450</text>
+    <text x="185" y="90" font-size="10" class="t2">magic "NHTP", version 4, n_ops, n_layers, n_heads, n_kv_heads, head_dim, hidden, ffn, vocab, max_seq, max_chunk, weight_layout</text>
+    <rect x="400" y="30" width="350" height="100" rx="8" fill="none" stroke="var(--grid)"/>
+    <text x="575" y="50" font-size="11" text-anchor="middle" font-weight="600">one nntr_htp_op_desc (64 B)</text>
+    <text x="412" y="72" font-size="10" class="t2">kind, flags, layer</text>
+    <text x="412" y="88" font-size="10" class="t2">m, k, n   (m == 0 → "this call's token count")</text>
+    <text x="412" y="104" font-size="10" class="t2">in0, in1, in2, out: {buffer id, 128 B-aligned offset}</text>
+    <text x="412" y="120" font-size="10" class="t2">param0, param1 (e.g. an fp32 bit pattern)</text>
+    <text x="380" y="150" font-size="11" text-anchor="middle" class="t2">buffer ids: WEIGHTS 0 · KV 1 · ACT 2 · TOKENS 3 · LOGITS 4   (nntr_htp_common.h)</text>
+  </svg>
+  <p>The op-list is the "recipe": a fixed-size header describing the model shape, then one 64-byte descriptor per op naming the op kind, its m/k/n shape and up to four tensor references (a buffer id plus an offset). The nine kinds (HEXAGON.md §1.4):</p>
+  <table>
+    <tr><th>kind</th><th>what it computes</th></tr>
+    <tr><td>EMBED</td><td>gather int8 embedding rows from the tiled table, dequantize to fp16</td></tr>
+    <tr><td>RMSNORM</td><td>RMS normalisation; with <code>FLAG_PER_HEAD</code>, per-head QK-Norm</td></tr>
+    <tr><td>MATMUL_W8A8</td><td>per-token int8 activation × tiled int8 weight (<code>vrmpy</code>), fp16 out</td></tr>
+    <tr><td>MATMUL_W8A16</td><td>per-token int16 activation × row-major int8 weight, fp16 out (<code>down_proj</code>)</td></tr>
+    <tr><td>ROPE</td><td>rotary position embedding on q and k in place, from the precomputed table</td></tr>
+    <tr><td>ATTN</td><td>causal grouped-query attention against the persistent KV cache</td></tr>
+    <tr><td>SILU_MUL</td><td>SiLU(gate) ⊙ up</td></tr>
+    <tr><td>ADD</td><td>residual add</td></tr>
+    <tr><td>MATMUL_LOGITS</td><td>last token × tied embedding (same tiled kernel), fp32 logits</td></tr>
+  </table>
+  <p>For qwen3-0.6b <code>lower_qwen3()</code> emits 1 + 16 × 28 + 2 = 451 ops: EMBED, then per layer RMSNORM → three W8A8 (q, k, v) → two per-head RMSNORM → ROPE → ATTN → W8A8 (o) → ADD → RMSNORM → two W8A8 (gate, up) → SILU_MUL → W8A16 (down) → ADD, then a final RMSNORM and MATMUL_LOGITS (HEXAGON.md §2.3).</p>
+  <p><b>Validation at <code>init()</code></b> (<code>nntr_htp_oplist_validate</code> in <code>nntr_htp_common.h</code>) returns 1 for a bad pointer or size, 2 for a bad magic, 3 for a version mismatch (surfaced as <code>AEE_EUNSUPPORTED</code>), 4 for a bad header field including an unknown <code>weight_layout</code>, and 5 for a bad op: unknown kind, unaligned offset, <code>m != 0</code> on any kind but MATMUL_LOGITS (the row count is always the per-call token count; a descriptor-fixed <code>m</code> would bypass the <code>forward()</code> gates below), <code>k == 0</code> or <code>k % 128 != 0</code> on the four weight-reading kinds, <code>k &gt; 16384</code> for W8A16, <code>n % 32 != 0</code> on the tiled matmuls, <code>vocab % 32 != 0</code> for EMBED, <code>n % 64 != 0</code> for RMSNORM / ADD / SILU_MUL (the kernels load whole 64-half vectors) and <code>n % head_dim != 0</code> for a PER_HEAD RMSNORM, <code>ATTN.layer &gt;= n_layers</code>, <code>max_seq % 64 != 0</code>, an ATTN <code>in1</code>/<code>in2</code> (the chunk's fresh K/V rows) or a MATMUL_LOGITS <code>in0</code> too small for <code>max_chunk</code> rows (that kernel reads row <code>n_tokens − 1</code> whatever <code>m</code> says), or any other tensor reference that runs past its buffer when sized for <code>max_chunk</code> rows (ROPE's <code>out</code> is in-place, <code>== in0</code>, and not checked separately). Every code but 3 reaches the host as <code>AEE_EBADPARM</code> (HEXAGON.md §1.4; nntr_htp_common.h; executor.c).</p>
+  <p><b>One table of operand sizes (PR #50, issue #36, merged 2026-09-17).</b> The byte extent behind every "sized for <code>max_chunk</code> rows" clause above comes from a single per-kind table, <code>nntr_htp_op_extent(header, desc, rows, &amp;e)</code> in <code>nntr_htp_common.h</code>: given the row count, it fills how many bytes each of <code>in0</code>, <code>in1</code>, <code>in2</code>, <code>out</code> must cover (with a <code>used</code> bitmask and an <code>out_alias_in0</code> flag for ROPE's in-place output). The validator calls it with <code>rows = max_chunk</code>; <code>hexagon_ref_run --list-ops</code> / <code>--dump-op</code>, the simulator reference <code>ref_graph_forward</code> and the simulator's hand lowering <code>sim_model</code> call it with the call's <code>n_tokens</code> — so the four cannot disagree about an operand size, and <code>find_divergence.py</code>, which parses the dump's <code>bytes=</code> line, follows automatically. Next to it live the row rule <code>nntr_htp_op_rows(d, n_tokens)</code> (<code>d-&gt;m ? d-&gt;m : n_tokens</code>, which the DSP kernels' <code>htp_m()</code> also uses), <code>nntr_htp_kv_bytes()</code> and <code>nntr_htp_oplist_bytes()</code> (used by <code>lower_qwen3()</code> and <code>sim_model</code>), and a second small header, <code>nntr_htp_rope.h</code>, holds the one RoPE cos/sin row generator <code>nntr_htp_rope_row_f32()</code> shared by the host packer and <code>ref_ops.c</code>. It was a pure refactor: no op-list byte, image byte, validator verdict or STAT moved and the ABI stayed at 4 (HEXAGON.md §1.4, §3; docs/plans/36-op-shape.md; nntr_htp_common.h; test/hexagon/test_oplist_header.c).</p>
+  <p><b>Checks at <code>forward()</code></b> (<code>htp_graph_forward_upto</code> in htp_graph.c): the runtime arguments (token count 1…<code>max_chunk</code>, position + count ≤ <code>max_seq</code>, logits length == vocab) and then every token id (<code>&lt; vocab</code> as one unsigned compare, so a negative id fails too), all before any buffer pointer or KV row is touched; a violation returns <code>AEE_EBADPARM</code> with no FARF line. The same predicate, <code>nntr_htp_token_ids_ok()</code> from nntr_htp_common.h, runs on the host in <code>HexagonBackend::forward</code> over the <em>whole</em> request before the first RPC, because the DSP rejects per chunk and the chunks before a bad id would already sit in KV; the host returns <code>kHexagonBadParm = 0x8000040E</code>, which is <code>AEE_EBADPARM</code> (14) plus the <code>0x80000400</code> DSP error base FastRPC adds to every DSP-originated AEE code (<code>hexagon_runner.h</code>, static-asserted against <code>AEEStdErr.h</code> in hexagon_runner.cpp; the familiar <code>0x80000406</code> / <code>0x80000414</code> are <code>AEE_EUNABLETOLOAD</code> / <code>AEE_EUNSUPPORTED</code> offset the same way). The <code>m == 0</code>, <code>k &gt; 0</code>, <code>n % 64</code>, PER_HEAD, <code>ATTN.layer</code>, ATTN <code>in1</code>/<code>in2</code>, LOGITS-row and token-id rules were added after the 2026-09-17 review (issue #33, PR #44) without an ABI bump: they only refuse lists and calls no kernel could have run safely (HEXAGON.md §1.4, §5.2; hexagon_backend.cpp).</p>
+</div>
+
+<div class="panel">
+  <h2>5 · The worker pool: one thread per vector unit, a barrier per op</h2>
+  <svg viewBox="0 0 760 170" role="img" aria-label="The RPC thread dispatches each op to N workers which fan out, run, and meet at a barrier before the next op">
+    <rect x="10" y="60" width="130" height="50" rx="8" fill="var(--x-light)"/>
+    <text x="75" y="82" font-size="11" text-anchor="middle">RPC thread</text>
+    <text x="75" y="98" font-size="10" text-anchor="middle" class="t2">no HVX context</text>
+    <rect x="220" y="20" width="200" height="30" rx="6" fill="var(--acc-light)"/><text x="320" y="40" font-size="11" text-anchor="middle">worker 0 (HVX unit 0)</text>
+    <rect x="220" y="56" width="200" height="30" rx="6" fill="var(--acc-light)"/><text x="320" y="76" font-size="11" text-anchor="middle">worker 1 (HVX unit 1)</text>
+    <rect x="220" y="92" width="200" height="30" rx="6" fill="var(--acc-light)"/><text x="320" y="112" font-size="11" text-anchor="middle">worker 2</text>
+    <rect x="220" y="128" width="200" height="30" rx="6" fill="var(--acc-light)"/><text x="320" y="148" font-size="11" text-anchor="middle">worker 3 …</text>
+    <line x1="140" y1="85" x2="220" y2="35" stroke="var(--dim)" stroke-width="2"/>
+    <line x1="140" y1="85" x2="220" y2="71" stroke="var(--dim)" stroke-width="2"/>
+    <line x1="140" y1="85" x2="220" y2="107" stroke="var(--dim)" stroke-width="2"/>
+    <line x1="140" y1="85" x2="220" y2="143" stroke="var(--dim)" stroke-width="2"/>
+    <line x1="470" y1="15" x2="470" y2="165" stroke="var(--x)" stroke-width="3"/>
+    <text x="470" y="10" font-size="10" text-anchor="middle" class="t2">barrier</text>
+    <line x1="420" y1="35" x2="470" y2="35" stroke="var(--dim)"/><line x1="420" y1="71" x2="470" y2="71" stroke="var(--dim)"/>
+    <line x1="420" y1="107" x2="470" y2="107" stroke="var(--dim)"/><line x1="420" y1="143" x2="470" y2="143" stroke="var(--dim)"/>
+    <text x="610" y="80" font-size="11" text-anchor="middle" class="t2">wp_run(fn, arg) returns only</text>
+    <text x="610" y="96" font-size="11" text-anchor="middle" class="t2">after every worker finished;</text>
+    <text x="610" y="112" font-size="11" text-anchor="middle" class="t2">then the next op is dispatched</text>
+  </svg>
+  <ul>
+    <li><code>htp_graph</code> runs the ops <em>sequentially</em>; inside each op the work fans out over a pool of QuRT threads, one per HVX vector unit (<code>wp_create(n &lt;= 0)</code> asks <code>qurt_hvx_get_units()</code>), and returns at a barrier. Kernels split rows (matmul: whole 32-row tiles per worker) or heads (attention: by KV head) (HEXAGON.md §1; worker_pool.h; hvx-matmul.c; hvx-attn.c).</li>
+    <li><b>HVX code may only run on pool workers.</b> Each worker locks a 128-byte HVX unit at thread entry and keeps it for the session, so the RPC thread owns none; locking one there deadlocks. Even the single-row quantization for MATMUL_LOGITS goes through the pool. The simulator does not enforce this, so only a device run or a review catches it (HEXAGON.md §7 rule 7).</li>
+    <li><b>HMX instructions are issued by worker 0 only (HEXAGON.md §7 rule 10, since #68 / PR #72, 2026-09-21).</b> The HMX lock (<code>HAP_compute_res_hmx_lock</code>) is per thread, so it is not taken on the RPC thread at init: worker 0 takes it lazily on its first HMX section (<code>htp_hmx_worker_acquire</code>, which also sets HexKL's int32 accumulator read up once) and <code>htp_graph_destroy</code> releases it from worker 0 in a <code>wp_run</code> job before the compute-resource context goes back. A future HMX kernel runs its HMX section on worker 0 and fans the HVX epilogue out to the other workers, never the reverse (hmx/htp_hmx.h; htp_graph.c).</li>
+    <li>Cost: an empty barrier is about 4.1–4.3 k simulator cycles per op, ≈ 0.93 ms per decoded token over 451 ops (sim-derived, not device time; HEXAGON.md §8.3). The simulator exposes 4 units on v75 and 6 on v79; the device count is not recorded (HEXAGON.md §5.2, §8.3).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>6 · VTCM and DMA: streaming weights past the vector units</h2>
+  <svg viewBox="0 0 760 200" role="img" aria-label="Weights stream from DDR through a DMA engine into two VTCM half-slabs per worker; the kernel computes on one while the other fills, since #25 the next matmul's first chunk is prefetched into the free half, and since #68 a HexKL/HMX arena sits above the HVX slabs in HTP_HMX builds">
+    <rect x="10" y="40" width="150" height="90" rx="8" fill="var(--w-light)"/>
+    <text x="85" y="70" font-size="12" text-anchor="middle">DDR</text>
+    <text x="85" y="90" font-size="11" text-anchor="middle" class="t2">WEIGHTS 598 MB</text>
+    <text x="85" y="106" font-size="11" text-anchor="middle" class="t2">tile strips, 32·K B each</text>
+    <rect x="250" y="55" width="110" height="60" rx="8" fill="none" stroke="var(--grid)"/>
+    <text x="305" y="80" font-size="12" text-anchor="middle">user DMA</text>
+    <text x="305" y="98" font-size="10" text-anchor="middle" class="t2">one descriptor / strip</text>
+    <rect x="450" y="30" width="300" height="165" rx="8" fill="none" stroke="var(--grid)"/>
+    <text x="600" y="50" font-size="12" text-anchor="middle" font-weight="600">VTCM: first 4 MB = HVX slabs, one per worker</text>
+    <rect x="465" y="65" width="130" height="30" rx="4" fill="var(--acc-light)"/><text x="530" y="85" font-size="11" text-anchor="middle">buf[0]: compute</text>
+    <rect x="605" y="65" width="130" height="30" rx="4" fill="var(--w-light)"/><text x="670" y="85" font-size="11" text-anchor="middle">buf[1]: filling</text>
+    <text x="600" y="120" font-size="10" text-anchor="middle" class="t2">whole 32-row tiles per chunk; swap when the DMA for the next chunk lands</text>
+    <text x="600" y="134" font-size="10" text-anchor="middle" class="t2">#25 (PR #61, merged): the last chunk of an op also kicks chunk 0 of the next matmul into the free half</text>
+    <rect x="465" y="146" width="270" height="24" rx="4" fill="var(--x-light)"/>
+    <text x="600" y="162" font-size="10" text-anchor="middle">#68 (HTP_HMX=1 builds): HexKL arena above 4 MB — config · 2 int32 result tiles · free</text>
+    <text x="600" y="186" font-size="10" text-anchor="middle" class="t2">8 MB requested with the HMX unit, 4 MB floor; the HVX slabs never move (§7 rule 10 (c))</text>
+    <line x1="160" y1="85" x2="250" y2="85" stroke="var(--w)" stroke-width="2"/>
+    <line x1="360" y1="85" x2="450" y2="85" stroke="var(--w)" stroke-width="2"/>
+  </svg>
+  <ul>
+    <li><b>VTCM</b> is a small, very fast memory local to the DSP. At <code>init()</code> the graph asks for 4 MB best-effort; if it cannot get it (or the build sets <code>HTP_MM_NO_VTCM</code>) the matmul reads weights straight from DDR with bit-identical output. In a build with HexKL linked (<code>-DHTP_HMX=1</code>, since #68) the request is 8 MB plus the HMX unit in one compute-resource context, with 4 MB as the floor — see the HMX arena bullet below. The W8A8 / LOGITS kernel splits the VTCM evenly per worker and uses each slab as a two-chunk double buffer of whole 32-row tiles, kicking the DMA for chunk c+1 while computing chunk c; a chunk is as many tiles as fit in half the slab ("max-fit"). Activations are not copied into VTCM: the quantized rows are read with 4-byte scalar loads, which VTCM would not speed up (HEXAGON.md §2.2; hvx-matmul.c).</li>
+    <li><b>Cross-op prefetch (issue #25, merged in PR #61).</b> In decode a tiled matmul is only 1–2 chunks per worker, so its first DMA was fully exposed and the memory bus sat idle through the small ops in between (ROPE, ATTN, ADD, RMSNORM, SILU_MUL). #25 gives each worker one DMA queue for the whole session (4 descriptors deep, <code>HTP_MM_DMA_QUEUE_CAP</code>, created at graph init and drained before VTCM is released) and makes the two halves of a slab op-independent, so that when a worker's last chunk of one matmul has landed it kicks chunk 0 of the <em>next</em> tiled matmul (the graph precomputes a <code>next_mm[]</code> table) into the half it is not using; the next matmul finds that chunk already in flight. The same bytes land in the same VTCM bytes, so the output is bit-identical by construction, and the simulator checks the hand-over on an X → Y chain (<code>SIM_TEST matmul_dma prefetch hits=6 workers=6</code>). The int16 <code>down_proj</code> is skipped by the chain because it does not use VTCM. Compile-time knobs for measurements: <code>HTP_MM_NO_PREFETCH</code>, <code>HTP_MM_CHUNK_ROWS=&lt;n&gt;</code> (fixed chunk; 0 = max-fit, the default), <code>HTP_MM_STREAM_ONLY</code> (HEXAGON.md §2.2, §5.2, §5.3; hvx-matmul.c, htp_graph.c).</li>
+    <li>What it buys on the device: the M6 double buffer alone ~5 % on decode and nothing on prefill (1024-token run: decode 90.7 ms with VTCM vs 95.1 ms direct DDR; prefill 44.8 s vs 45.1 s) (HEXAGON.md §8.2 "VTCM/DMA double buffering"). The cross-op prefetch, measured in #25 (2026-09-18, unit <code>R3CY10WM83Y</code>, pass 2 of a reversed double pass): the W8A8 matmul share of a 512-context decode step fell from 24.3 to 16.1 Mcyc (−34 %) and the step from 61.7 to 54.6 Mcyc (−11.6 %), which is 0.5 Mcyc <em>below</em> the pure DMA wait of a skel that streams the same bytes and multiplies nothing — so at 512 the int8 multiplies are now hidden behind the weight stream, whose ceiling is 54 tok/s (596 MB per step at 32.3 GB/s). At 1024 and 4096 the prefetch changes nothing because attention is 46 % / 79 % of those steps (issue #58). A fixed 64-row chunk was tried and rejected (+9.9 % cycles): the small decode ops become several chunks and pay the DMA latency each time (HEXAGON.md §8.2 "#25"; 25-decode-prefetch.md "Pass rules").</li>
+    <li>The int16 <code>down_proj</code> kernel (W8A16) does not use VTCM yet; the simulator cannot say whether streaming would help because it does not model DDR bandwidth, but #25's stream-only skel now has the device number: the row-major <code>down</code> rows move at 21 GB/s where the tiled DMA ring reaches 37, about 3 Mcyc of the decode step — issue #59 (HEXAGON.md §2.2, §8.2 "#25", §9).</li>
+    <li><b>The HMX arena (issue #65 S0 = #68, merged 2026-09-21 in PR #72; <code>-DHTP_HMX=1</code> builds only).</b> When <code>libhexkl_micro.a</code> is on the addon mount, the build scripts set <code>-DHTP_HMX=1</code>, compile <code>hmx/*.c</code> and link HexKL, and <code>htp_graph_init</code> asks the compute-resource manager for <b>8 MB</b> of VTCM (<code>HAP_compute_res_attr_set_vtcm_param_v2</code>, 4 MB floor) <b>plus the HMX unit</b> (<code>HAP_compute_res_attr_set_hmx_param</code>) in one context. The HVX tiled kernels keep exactly the first 4 MB and their slab geometry, so their outputs are unchanged by construction (#68's <code>profile acc</code> STAT is bit-identical to #25's; §7 rule 10 (c): a moved HVX slab is a bug, not a tuning). <code>hmx/htp_hmx.c</code> lays HexKL's arena over the rest: the config region (256-aligned) at the top, two 8 KB int32 result tiles below it, and everything under <code>free_off</code> free for a future kernel's activation tiles and weight strips, every offset 2048-aligned. A 4 MB grant carves only the arena's fixed part (≈ 20 KB) off the HVX region; a refused HMX attribute falls back to the plain 4 MB acquire with <code>ctx.hmx.base == NULL</code>, and an op that needs HMX then fails at <code>init</code>, never running silently on HVX. The worker DMA queues learn the whole VTCM range so a descriptor into the arena carries the bypass bit. <code>init</code> logs <code>nntr_htp: hexkl &lt;version&gt; hmx=&lt;0|1&gt; vtcm_hvx=&lt;B&gt; hmx_arena=&lt;B&gt;</code> (HexKL 1.0.0-beta1 hexagon v79 in the container; the v79 simulator grants 8 MB: 4 MB + 4 MB). A <code>-DHTP_HMX=0</code> build, or a tree without the addon, compiles none of this and every DSP object is md5-identical to the tree before #68 (<code>tools/hexagon/dsp_obj_md5.sh</code>). No op uses the arena yet (HEXAGON.md §2.2 "HMX arena", §5.3, §7 rule 10; htp_graph.c; hmx/htp_hmx.h; build_skel.sh).</li>
+    <li><b>Where this picture goes next (issue #65: S1 in review, S2 / S3 planned).</b> The top goal ports upstream PR nntrainer/nntrainer#4327's W4 path: the six per-layer projections move from the HVX <code>vrmpy</code> kernel to the <b>HMX</b> matrix unit with 4-bit weights, fed by the same per-worker DMA queue; the image gains a <code>w4cx</code> layout and the op list a <code>MATMUL_W4A8</code> kind under ABI v5 (S1, branch <code>hvx/69-w4cx-producer-abi5</code>, in review — its x86 accuracy band failed, PPL 2.05 × W8 against a ≤ 1.10 × gate, so the format is pending a user decision; see <a href="06-performance.html">06</a>, "What is open"). Everything on this page stays valid for the W8 image, which must remain byte-identical through the port (plan docs/plans/65-w4-htp-port.md §2–§4, on hvx_impl).</li>
+    <li>The <b>ACT</b> buffer holds nine 128-byte-aligned slots (<code>x, t, q, kb, vb, ao, h2, g, u</code>), each sized for <code>max_chunk</code> tokens and reused by every layer, so it is ~4 MB regardless of depth. The <b>KV</b> cache is separate and DSP-private: <code>2 × n_layers × n_kv_heads × max_seq × head_dim × 2</code> bytes, K stored transposed per layer/head so the attention kernel streams 64 positions per vector (HEXAGON.md §2.2).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>7 · The ABI version: the promise between two compilers</h2>
+  <svg viewBox="0 0 760 120" role="img" aria-label="Host and DSP each carry NNTR_HTP_ABI_VERSION 4; init compares them before anything else">
+    <rect x="10" y="30" width="230" height="60" rx="8" fill="var(--x-light)"/>
+    <text x="125" y="55" font-size="12" text-anchor="middle">host stub, NDK clang</text>
+    <text x="125" y="75" font-size="11" text-anchor="middle" class="mono">NNTR_HTP_ABI_VERSION = 4</text>
+    <rect x="520" y="30" width="230" height="60" rx="8" fill="var(--x-light)"/>
+    <text x="635" y="55" font-size="12" text-anchor="middle">DSP skel, hexagon-clang</text>
+    <text x="635" y="75" font-size="11" text-anchor="middle" class="mono">NNTR_HTP_ABI_VERSION = 4</text>
+    <line x1="240" y1="60" x2="520" y2="60" stroke="var(--dim)" stroke-width="2"/>
+    <text x="380" y="52" font-size="11" text-anchor="middle" class="t2">init(): header.version == 4 ?</text>
+    <text x="380" y="80" font-size="11" text-anchor="middle" class="t2">else AEE_EUNSUPPORTED, nothing mapped</text>
+  </svg>
+  <ul>
+    <li><code>nntr_htp_common.h</code> is plain C compiled by both toolchains (and by the x86 tests); it pins <code>NNTR_HTP_ABI_VERSION 4</code>, the 64-byte record sizes (checked at compile time), the buffer and kind enums, the tiled32 index function <code>nntr_htp_tile_off()</code>, the validator and, since PR #50, the operand-size table <code>nntr_htp_op_extent()</code>, the row rule and the KV / op-list size helpers (section 4 above). The host packer, the DSP kernels and the scalar references all use that one index function, so no two of them can disagree about where a weight byte lives (HEXAGON.md §2.1; nntr_htp_common.h).</li>
+    <li><b>What v4 changed:</b> a reserved header word became <code>weight_layout</code> and must read <code>TILED32</code> (1); the tiled matmuls require <code>n % 32 == 0</code> and EMBED requires <code>vocab % 32 == 0</code>; W8A16 is exempt from tiling but since M6 P4 must have <code>k ≤ 16384</code>. <b>v3</b> had added the DSP cycle count on <code>forward()</code> and the <code>forward_debug()</code> partial-run primitive (HEXAGON.md §1.4).</li>
+    <li><b>v5 is proposed, not merged:</b> #65 S1 (branch <code>hvx/69-w4cx-producer-abi5</code>, in review) bumps to v5 with the <code>MATMUL_W4A8</code> kind and the <code>W4CX_DOWN8</code> / <code>W4CX</code> layout ids; <code>hvx_impl</code>, and every number in this guide, is v4 (plan 65 §2.2; HEXAGON.md §1.4 on that branch).</li>
+    <li>Rule for any layout or ABI change: bump the version, make <code>.hexcfg</code> reject old images, and update HEXAGON.md §1.4/§2 in the same PR (skill <code>hexagon-gates</code>, kernel review list).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>Where the files are</h2>
+  <table>
+    <tr><th>Path</th><th>Side</th><th>Role</th></tr>
+    <tr><td><code>nntrainer/tensor/hexagon/htp/nntr_htp.idl</code></td><td>both</td><td>FastRPC interface: init / forward / forward_debug</td></tr>
+    <tr><td><code>nntrainer/tensor/hexagon/htp/nntr_htp_common.h</code></td><td>both</td><td>op-list wire format v4, validator, op extents / row rule / size helpers, tiled32 index</td></tr>
+    <tr><td><code>nntrainer/tensor/hexagon/htp/nntr_htp_rope.h</code></td><td>both</td><td>the one RoPE cos/sin row generator, shared by the packer and the simulator reference (PR #50)</td></tr>
+    <tr><td><code>nntrainer/tensor/hexagon/htp/executor.c</code></td><td>DSP</td><td>RPC glue: handshake, mapping, delegates to htp_graph; keeps a dummy path for n_ops == 0</td></tr>
+    <tr><td><code>nntrainer/tensor/hexagon/htp/htp_graph.{h,c}</code>, <code>worker_pool.{h,c}</code></td><td>DSP</td><td>executor: pool, scratch, VTCM (+ the HMX arena and HexKL version line in <code>HTP_HMX</code> builds, #68), sequential dispatch, per-kind profile counters</td></tr>
+    <tr><td><code>nntrainer/tensor/hexagon/htp/hmx/</code></td><td>DSP</td><td>(since #68, compiled only with <code>-DHTP_HMX=1</code>) <code>htp_hmx.{h,c}</code>: arena layout, worker-0 lazy HMX lock, HexKL version; <code>hexkl_acc_tile.{h,c}</code>: the int32 accumulator-layout probe ported from PR nntrainer#4327 (Apache-2.0, provenance in <code>NOTICE</code>). <code>hexkl_micro.h</code> is not copied — <code>-I $HEXKL_ADDON_ROOT/include</code>; HexKL itself is linked from the user's mount, never committed</td></tr>
+    <tr><td><code>nntrainer/tensor/hexagon/htp/ops/</code>, <code>hvx/</code>, <code>hex/</code>, <code>dma/</code></td><td>DSP</td><td>one kernel per op kind; vector helpers; scalar utils and the user-DMA queue (the last three imported from llama.cpp's ggml-hexagon, MIT)</td></tr>
+    <tr><td><code>nntrainer/tensor/hexagon/host/</code></td><td>host</td><td><code>rpcmem_allocator</code>, <code>hexagon_runner</code>, <code>graph_lowering</code> (part of libnntrainer with <code>enable-hexagon</code>)</td></tr>
+    <tr><td><code>Applications/CausalLM/hexagon/</code></td><td>host</td><td><code>qwen3_lowering</code>, <code>qwen3_w8cx_bin</code>, <code>hexagon_backend</code>, <code>hex_image</code>, <code>hex_pack</code></td></tr>
+    <tr><td><code>test/hexagon/</code>, <code>test/hexagon/sim/</code></td><td>x86 / sim / device</td><td>lowering and header tests, <code>hexagon_ref_run</code>, the device harnesses, the simulator golden tests (13 HVX tests plus <code>test_hmx.c</code>, the 14th since #68) and <code>ref_ops.c</code></td></tr>
+    <tr><td><code>tools/hexagon/</code></td><td>scripts</td><td>build and run scripts, <code>make_tokens.py</code>, <code>find_divergence.py</code>, <code>summ_prof.py</code>, and since #68 <code>dsp_obj_md5.sh</code> (per-object md5 of the skel sources: the "no DSP bytes changed" proof, because the linked <code>.so</code> is never comparable)</td></tr>
+  </table>
+  <p class="src">HEXAGON.md §3 "Source layout".</p>
+</div>
+
+<p class="note">Hexagon backend beginner guide · sources: docs/backend_guide/HEXAGON.md, HEXAGON_BENCHMARK.md, docs/measurements/ (#23, #24, #35, #25, #53 on hvx_impl), nntrainer/tensor/hexagon/, Applications/CausalLM/hexagon/, tools/docker/, docs/superpowers/specs/hexagon-hvx-optimization/. Written 2026-09-17, refreshed 2026-09-21 against hvx_impl commit e57f66e5 (#68 S0 merged, PR #72; S1 read from branch hvx/69-w4cx-producer-abi5, in review).</p>
+</body>
+</html>

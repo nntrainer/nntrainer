@@ -433,12 +433,6 @@ ComputeOps *get_cpu_ops();
  *  enable-opencl is on, in cl_operations/cl_compute_ops.cpp. */
 ComputeOps *get_cl_ops();
 #endif
-#ifdef ENABLE_HEXKL
-/** @brief HTP (Hexagon/HMX) accelerator ComputeOps singleton. Defined
- *  when enable-htp is on, in htp_backend/htp_compute_ops.cpp. */
-ComputeOps *get_htp_ops();
-#endif
-
 } // namespace nntrainer
 
 #endif /* __cplusplus */

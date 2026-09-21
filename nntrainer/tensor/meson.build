@@ -92,15 +92,8 @@ if get_option('enable-opencl')
   nntrainer_inc_abs += meson.current_source_dir() / 'cl_operations'
 endif
 
-if get_option('enable-htp')
-  subdir('htp_backend')
-  nntrainer_inc += include_directories('htp_backend')
-  nntrainer_inc_abs += meson.current_source_dir() / 'htp_backend'
-  # Hexagon SDK system headers needed by htp_backend.cpp (<remote.h>, <AEEStdErr.h>,
-  # <sdkl.h>).  hexagon_sdk_root is set in the top-level meson.build HTP block
-  # (fs.parent(fs.parent(hexkl_root))) and is in meson's flat scope here.
-  nntrainer_inc_abs += hexagon_sdk_root / 'incs'
-  nntrainer_inc_abs += hexagon_sdk_root / 'incs' / 'stddef'
+if get_option('enable-hexagon')
+  subdir('hexagon')
 endif
 
 foreach s : tensor_sources
