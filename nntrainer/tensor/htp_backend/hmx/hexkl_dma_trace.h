@@ -22,7 +22,7 @@
  *
  * Free of Hexagon headers: times arrive as raw qtimer ticks from the
  * caller (hexkl_probe_now_ticks), so test/htp/host compiles this file
- * as-is and scripts the clock. Fixed static tables, no heap: about 13 KiB
+ * as-is and scripts the clock. Fixed static tables, no heap: about 29 KiB
  * of .bss in the skel, sized for the 256-slot ring.
  */
 
@@ -35,11 +35,20 @@
 extern "C" {
 #endif
 
-/** @brief One call's tables: the ring holds 256 descriptors, so a call
- *  cannot have more in flight; the MoE call makes 14 waits at M=1 and
- *  about 60 at a 1776-row prefill. */
-#define HEXKL_DMA_TRACE_MAX_PUSH 256u
-#define HEXKL_DMA_TRACE_MAX_WAIT 64u
+/** @brief One call's tables. Per call, not in flight: a 1776-row prefill
+ *  pushes about 460 descriptors (32 experts x 10 weight chunks, ~28
+ *  activation blocks, ~28 copy pieces) and makes about 220 waits; M=1 is
+ *  46 and 30. Past either bound the counts go on and the records stop,
+ *  and finish() then refuses the busy numbers (a truncated union would
+ *  overstate the engine rate). */
+#define HEXKL_DMA_TRACE_MAX_PUSH 512u
+#define HEXKL_DMA_TRACE_MAX_WAIT 256u
+
+/** @brief hexkl_dma_ring.c's ring size. push2d waits for the oldest
+ *  descriptor before reusing its slot, so a record is known done once
+ *  this many pushes have followed it -- which is also when its ring_idx
+ *  stops naming it. The watermark uses that instead of the done bit. */
+#define HEXKL_DMA_TRACE_RING_N 256u
 
 /** @brief What a pushed descriptor carries. */
 enum {
@@ -126,10 +135,10 @@ typedef struct {
   uint32_t depth_max;   /**< see hexkl_dma_trace::depth_max */
   uint32_t wait;        /**< sum over every wait's t_out - t_in */
   uint32_t wait_act;    /**< the HEXKL_DMA_SITE_ACT share of that */
-  uint32_t busy_lo;     /**< union of [t_issue, t_done_lo] */
-  uint32_t busy_hi;     /**< union of [t_issue, t_done_hi] */
+  uint32_t busy_lo;     /**< union of [t_issue, t_done_lo]; 0 if dropped */
+  uint32_t busy_hi;     /**< union of [t_issue, t_done_hi]; 0 if dropped */
   uint32_t first_ready; /**< expert 0's gate_up all done (t_done_hi) */
-  uint32_t last_issue;  /**< the last weight push's t_issue */
+  uint32_t last_issue;  /**< the last weight push's t_issue; 0 if dropped */
 } hexkl_dma_trace_summary;
 
 /** @brief Empties the tables; @a now becomes t = 0. */

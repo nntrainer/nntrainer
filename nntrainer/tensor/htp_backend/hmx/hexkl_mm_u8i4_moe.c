@@ -28,8 +28,8 @@
  * the worker pool and retired only when the buffer they read or write is
  * about to be reused: two accumulator staging buffers alternate under the
  * HMX issue, res_f32 has its own region rather than aliasing gate, and a
- * block's scatter runs under the next block's first gate_up batch. Every wait is
- * placed where the dependency actually is, and each is timed, so the
+ * block's scatter runs under the next block's first gate_up batch. Every wait
+ * is placed where the dependency actually is, and each is timed, so the
  * profile's DEQUANT and SCATTER columns now read the exposed part, not the
  * work. Moving a submit or a wait without re-deriving who reads what is how
  * this breaks -- silently, as a plausible wrong output.
@@ -45,6 +45,7 @@
 
 #include "hexkl_acc_tile.h"
 #include "hexkl_dma_ring.h"
+#include "hexkl_dma_trace.h"
 #include "hexkl_micro.h"
 #include "hexkl_probe.h"
 #include "hvx_dequant_i32.h"
@@ -124,12 +125,16 @@ static uint32_t moe_dma_row_size(uint32_t total_bytes) {
  * gate_up first cost 110 us an expert against a 136 us transfer -- the
  * prefetch was hiding almost nothing (doc 46 section 26.4).
  *
+ * kind / expert / chunk only label the #87 trace record and cost nothing
+ * when probing is off.
+ *
  * @return the ring index to hand hexkl_dma_ring_wait
  */
 static uint32_t moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
                                       const hexkl_weight_u8i4 *h,
                                       uint32_t k_tiles, uint32_t n_col,
-                                      uint32_t nt0, uint32_t cn) {
+                                      uint32_t nt0, uint32_t cn, uint32_t kind,
+                                      uint32_t expert, uint32_t chunk) {
   const uint32_t row = cn * WEIGHT_TILE_BYTES_U8I4;
   const uint32_t stride = n_col * WEIGHT_TILE_BYTES_U8I4;
   const uint32_t off = nt0 * WEIGHT_TILE_BYTES_U8I4;
@@ -140,6 +145,10 @@ static uint32_t moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
   hexkl_dma_ring_push2d(vtcm_base + dst_off + off, h->wh_bytes + off, stride,
                         stride, row, k_tiles, /*src_vtcm=*/0, /*dst_vtcm=*/1);
   HEXKL_PROBE_ADD(HEXKL_PROBE_PUSH, pt);
+  if (hexkl_probe_on) {
+    hexkl_dma_trace_push(hexkl_probe_now_ticks(), idx, kind, expert, chunk, row,
+                         k_tiles, stride);
+  }
   return idx;
 }
 
@@ -160,14 +169,16 @@ static uint32_t moe_push_gate_up_chunks(uint8_t *vtcm_base, uint32_t dst_off,
                                         const hexkl_weight_u8i4 *h,
                                         uint32_t k_tiles, uint32_t gu_ntiles,
                                         uint32_t inter_ntiles, uint32_t half,
-                                        uint32_t *idx_out) {
+                                        uint32_t expert, uint32_t *idx_out) {
   uint32_t n = 0u;
   for (uint32_t g0 = 0; g0 < inter_ntiles; g0 += half) {
     const uint32_t cn = (inter_ntiles - g0 < half) ? (inter_ntiles - g0) : half;
     (void)moe_push_weight_chunk(vtcm_base, dst_off, h, k_tiles, gu_ntiles, g0,
-                                cn);
-    idx_out[n++] = moe_push_weight_chunk(vtcm_base, dst_off, h, k_tiles,
-                                         gu_ntiles, inter_ntiles + g0, cn);
+                                cn, HEXKL_DMA_KIND_GATE, expert, n);
+    idx_out[n] = moe_push_weight_chunk(vtcm_base, dst_off, h, k_tiles,
+                                       gu_ntiles, inter_ntiles + g0, cn,
+                                       HEXKL_DMA_KIND_UP, expert, n);
+    ++n;
   }
   return n;
 }
@@ -188,12 +199,17 @@ static uint32_t moe_push_gate_up_chunks(uint8_t *vtcm_base, uint32_t dst_off,
  */
 static uint32_t moe_push_act_block(uint8_t *vtcm_base, uint32_t act_off,
                                    const uint8_t *act_ah, uint32_t slot,
-                                   uint32_t K, uint32_t k_tiles) {
+                                   uint32_t K, uint32_t k_tiles,
+                                   uint32_t expert, uint32_t block) {
   const uint32_t blk_bytes = k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
   const uint32_t rs = moe_dma_row_size(blk_bytes);
   const uint32_t idx = hexkl_dma_ring_next_idx();
   hexkl_dma_ring_push2d(vtcm_base + act_off, act_ah + (size_t)slot * K, rs, rs,
                         rs, blk_bytes / rs, /*src_vtcm=*/0, /*dst_vtcm=*/1);
+  if (hexkl_probe_on) {
+    hexkl_dma_trace_push(hexkl_probe_now_ticks(), idx, HEXKL_DMA_KIND_ACT,
+                         expert, block, rs, blk_bytes / rs, rs);
+  }
   return idx;
 }
 
@@ -440,17 +456,29 @@ static void moe_pack_bg_worker(uint32_t n_units, uint32_t u, void *vctx) {
  * transfer, the same rule the weight pushes use.
  */
 static void moe_dma_copy(void *dst, const void *src, size_t bytes, int src_vtcm,
-                         int dst_vtcm) {
+                         int dst_vtcm, uint32_t site) {
   const uint32_t CHUNK = 1u << 20;
   size_t off = 0;
+  uint32_t idx = 0, piece = 0;
   while (off < bytes) {
     const uint32_t n = (bytes - off) > CHUNK ? CHUNK : (uint32_t)(bytes - off);
     const uint32_t rs = moe_dma_row_size(n);
+    idx = hexkl_dma_ring_next_idx();
     hexkl_dma_ring_push2d((uint8_t *)dst + off, (const uint8_t *)src + off, rs,
                           rs, rs, n / rs, src_vtcm, dst_vtcm);
+    if (hexkl_probe_on) {
+      hexkl_dma_trace_push(hexkl_probe_now_ticks(), idx, HEXKL_DMA_KIND_COPY, 0,
+                           piece++, rs, n / rs, rs);
+    }
     off += n;
   }
+  if (hexkl_probe_on) {
+    hexkl_dma_trace_wait_begin(hexkl_probe_now_ticks(), idx, site);
+  }
   hexkl_dma_ring_drain();
+  if (hexkl_probe_on) {
+    hexkl_dma_trace_wait_end(hexkl_probe_now_ticks());
+  }
 }
 
 /**
@@ -484,6 +512,9 @@ static void moe_dma_copy(void *dst, const void *src, size_t bytes, int src_vtcm,
         (hexkl_probe_now() - mm_t0) -                                          \
         (hexkl_probe_us[HEXKL_PROBE_ACC_READ] - mm_acc0) -                     \
         (hexkl_probe_us[HEXKL_PROBE_DEQUANT] - mm_dq0);                        \
+      /* One #87 completion sample per HMX batch: the bracket on every         \
+         descriptor is only as tight as the points that read its bit. */       \
+      hexkl_dma_trace_sample(hexkl_probe_now_ticks());                         \
     }                                                                          \
   } while (0)
 
@@ -805,11 +836,16 @@ int hexkl_mm_u8i4_moe_layer_run(
   }
   HEXKL_PROBE_T0(p0);
   hexkl_dma_ring_reset();
-  moe_dma_copy(act_c, act_f32, sizeof(float) * (size_t)M * K, 0, 0);
+  if (hexkl_probe_on) {
+    hexkl_dma_trace_reset(hexkl_probe_now_ticks());
+  }
+  moe_dma_copy(act_c, act_f32, sizeof(float) * (size_t)M * K, 0, 0,
+               HEXKL_DMA_SITE_COPY_IN);
   memset(out_c, 0, sizeof(float) * (size_t)M * N_out);
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
   if (n_active == 0u) {
-    moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0);
+    moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0,
+                 HEXKL_DMA_SITE_COPY_OUT);
     rc = AEE_SUCCESS;
     goto out;
   }
@@ -823,7 +859,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint32_t gu_idx[MOE_MAX_CHUNKS];
   uint32_t gu_nchunk = moe_push_gate_up_chunks(
     vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[0]]], k_tiles, gu_ntiles,
-    inter_ntiles, half, gu_idx);
+    inter_ntiles, half, 0u, gu_idx);
   (void)gu_nchunk;
 
   /* The scan is per source row and independent of where a row ends up, so
@@ -929,8 +965,8 @@ int hexkl_mm_u8i4_moe_layer_run(
      finishes with the activation slot (below, next to the gate_up
      prefetch) -- see moe_push_act_block for why that order matters; blocks
      after the first of an expert are queued in place. */
-  uint32_t act_idx =
-    moe_push_act_block(vtcm_base, L.act_off, act_ah, slot_of[0], K, k_tiles);
+  uint32_t act_idx = moe_push_act_block(vtcm_base, L.act_off, act_ah,
+                                        slot_of[0], K, k_tiles, 0u, 0u);
 
   for (uint32_t i = 0; i < n_active; ++i) {
     const uint32_t e = order[i];
@@ -974,7 +1010,14 @@ int hexkl_mm_u8i4_moe_layer_run(
          (below), so by now it has had that block's requant and down to
          arrive under. */
       HEXKL_PROBE_T0(p0);
+      if (hexkl_probe_on) {
+        hexkl_dma_trace_wait_begin(hexkl_probe_now_ticks(), act_idx,
+                                   HEXKL_DMA_SITE_ACT);
+      }
       hexkl_dma_ring_wait(act_idx);
+      if (hexkl_probe_on) {
+        hexkl_dma_trace_wait_end(hexkl_probe_now_ticks());
+      }
       for (uint32_t r = 0; r < m_blk; ++r) {
         scale[r] = slot_scale[slot_of[i] + mb + r];
         zp[r] = slot_zp[slot_of[i] + mb + r];
@@ -995,8 +1038,10 @@ int hexkl_mm_u8i4_moe_layer_run(
         for (uint32_t nt0 = 0; nt0 < dn_ntiles; nt0 += L.acc_tiles) {
           const uint32_t cn =
             (dn_ntiles - nt0 < L.acc_tiles) ? (dn_ntiles - nt0) : L.acc_tiles;
-          dn_idx[dn_nchunk++] = moe_push_weight_chunk(
-            vtcm_base, L.w_dn_off, d, inter_ktiles, dn_ntiles, nt0, cn);
+          dn_idx[dn_nchunk] = moe_push_weight_chunk(
+            vtcm_base, L.w_dn_off, d, inter_ktiles, dn_ntiles, nt0, cn,
+            HEXKL_DMA_KIND_DOWN, i, dn_nchunk);
+          ++dn_nchunk;
         }
       }
 
@@ -1021,7 +1066,14 @@ int hexkl_mm_u8i4_moe_layer_run(
            hide behind anything, which is what DMA_FIRST records. */
         if (mb == 0u) {
           HEXKL_PROBE_T0(p0);
+          if (hexkl_probe_on) {
+            hexkl_dma_trace_wait_begin(hexkl_probe_now_ticks(), gu_idx[ci],
+                                       HEXKL_DMA_SITE_GU);
+          }
           hexkl_dma_ring_wait(gu_idx[ci]);
+          if (hexkl_probe_on) {
+            hexkl_dma_trace_wait_end(hexkl_probe_now_ticks());
+          }
           HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
           if (first_drain && ci == 0u) {
             hexkl_probe_us[HEXKL_PROBE_DMA_FIRST] =
@@ -1104,18 +1156,19 @@ int hexkl_mm_u8i4_moe_layer_run(
         hvx_worker_pool_wait_bg(pool, pack_job,
                                 MOE_PACK_UNITS_THROUGH(slot_of[i] + mb + BR));
         HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
-        act_idx = moe_push_act_block(vtcm_base, L.act_off, act_ah,
-                                     slot_of[i] + mb + BR, K, k_tiles);
+        act_idx =
+          moe_push_act_block(vtcm_base, L.act_off, act_ah, slot_of[i] + mb + BR,
+                             K, k_tiles, i, (mb + BR) / BR);
       } else if (i + 1u < n_active) {
         HEXKL_PROBE_T0(p0);
         hvx_worker_pool_wait_bg(pool, pack_job,
                                 MOE_PACK_UNITS_THROUGH(slot_of[i + 1u]));
         HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
         act_idx = moe_push_act_block(vtcm_base, L.act_off, act_ah,
-                                     slot_of[i + 1u], K, k_tiles);
+                                     slot_of[i + 1u], K, k_tiles, i + 1u, 0u);
         gu_nchunk = moe_push_gate_up_chunks(
           vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[i + 1u]]], k_tiles,
-          gu_ntiles, inter_ntiles, half, gu_idx);
+          gu_ntiles, inter_ntiles, half, i + 1u, gu_idx);
       }
 
       /* gate_off holds silu(gate)*up for this block. Requantize it for
@@ -1142,7 +1195,14 @@ int hexkl_mm_u8i4_moe_layer_run(
           L.result_off + (ci & 1u) * L.acc_tiles * ACC_TILE_BYTES;
         if (mb == 0u) {
           HEXKL_PROBE_T0(p0);
+          if (hexkl_probe_on) {
+            hexkl_dma_trace_wait_begin(hexkl_probe_now_ticks(), dn_idx[ci],
+                                       HEXKL_DMA_SITE_DN);
+          }
           hexkl_dma_ring_wait(dn_idx[ci]);
+          if (hexkl_probe_on) {
+            hexkl_dma_trace_wait_end(hexkl_probe_now_ticks());
+          }
           HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN_DN, p0);
         }
         MOE_MM_BEGIN();
@@ -1232,7 +1292,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   HEXKL_PROBE_ADD(HEXKL_PROBE_SCATTER, p0);
 
   HEXKL_PROBE_T0(p0);
-  moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0);
+  moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0,
+               HEXKL_DMA_SITE_COPY_OUT);
   HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
 
 out:
@@ -1241,6 +1302,29 @@ out:
   hvx_worker_pool_wait(pool);
   if (last_job) {
     hvx_worker_pool_wait_bg(pool, last_job, UINT32_MAX);
+  }
+  if (hexkl_probe_on) {
+    /* #87: close the trace and fold its per-call numbers into the probe
+       slots, ticks to microseconds through the same HAP conversion the
+       stage timers use. Counts stay counts. */
+    hexkl_dma_trace_summary ds;
+    hexkl_dma_trace_finish(hexkl_probe_now_ticks(), &ds);
+    hexkl_probe_us[HEXKL_PROBE_DMA_DESC] = ds.n_desc;
+    hexkl_probe_us[HEXKL_PROBE_DMA_WAITS] = ds.n_wait;
+    hexkl_probe_us[HEXKL_PROBE_DMA_WAITS_BLOCKED] = ds.n_blocked;
+    hexkl_probe_us[HEXKL_PROBE_DMA_DEPTH_MAX] = ds.depth_max;
+    hexkl_probe_us[HEXKL_PROBE_DMA_WAIT_US] =
+      HAP_perf_qtimer_count_to_us(ds.wait);
+    hexkl_probe_us[HEXKL_PROBE_DMA_WAIT_ACT_US] =
+      HAP_perf_qtimer_count_to_us(ds.wait_act);
+    hexkl_probe_us[HEXKL_PROBE_DMA_BUSY_LO_US] =
+      HAP_perf_qtimer_count_to_us(ds.busy_lo);
+    hexkl_probe_us[HEXKL_PROBE_DMA_BUSY_HI_US] =
+      HAP_perf_qtimer_count_to_us(ds.busy_hi);
+    hexkl_probe_us[HEXKL_PROBE_DMA_FIRST_READY_US] =
+      HAP_perf_qtimer_count_to_us(ds.first_ready);
+    hexkl_probe_us[HEXKL_PROBE_DMA_LAST_ISSUE_US] =
+      HAP_perf_qtimer_count_to_us(ds.last_issue);
   }
   /* Nothing to free: the scratch stays with the session. */
   return rc;

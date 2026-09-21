@@ -7,6 +7,7 @@
    sides. */
 #include "hexkl_acc_tile.h"
 #include "hexkl_dma_ring.h"
+#include "hexkl_dma_trace.h"
 #include "hexkl_mm_u8i4_moe.h"
 #include "hexkl_probe.h"
 #include "hvx_dequant_i32.h"
@@ -19,6 +20,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "nntr_moe_dma_plan.h"
 
 /* ---- accumulator + acc layout ---- */
 static int32_t g_acc[64][32];
@@ -135,10 +138,10 @@ void hvx_quant_rows_u8_params(const float *x, uint32_t m, uint32_t mp,
     zp[r] = (int32_t)z;
   }
 }
-int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *map,
-                                uint32_t m, uint32_t mp, uint32_t k,
-                                const float *scale, const int32_t *zp,
-                                uint8_t *out, hvx_worker_pool *p) {
+int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *map, uint32_t m,
+                                uint32_t mp, uint32_t k, const float *scale,
+                                const int32_t *zp, uint8_t *out,
+                                hvx_worker_pool *p) {
   (void)p;
   /* Tiles run (row_block, inner_tile) at a 2048-byte stride, so a caller
      passing more than 64 rows writes several row blocks. The kernel now
@@ -613,6 +616,121 @@ int main(void) {
     printf("4 MB arena        : rc=%d (want %d)\n", r, AEE_ENOMEMORY);
     fail |= (r != AEE_ENOMEMORY);
   }
+
+  /* --- #87: the DMA trace is inert when probing is off, and a no-op for
+     the output when it is on ------------------------------------------ */
+  {
+    float *got_on = (float *)malloc(sizeof(float) * M * N_out);
+    hexkl_probe_on = 1;
+    int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
+                                        M, K, inter, N_out, NE, hg, hd, ridx,
+                                        rc_, rw, act, got_on, NULL, &scratch);
+    fail |= (r != 0);
+    const uint64_t desc_on = hexkl_probe_us[HEXKL_PROBE_DMA_DESC];
+    hexkl_dma_trace_reset(0);
+    memset(hexkl_probe_us, 0, sizeof(hexkl_probe_us));
+    hexkl_probe_on = 0;
+    r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M,
+                                    K, inter, N_out, NE, hg, hd, ridx, rc_, rw,
+                                    act, got, NULL, &scratch);
+    fail |= (r != 0);
+    const int same = memcmp(got_on, got, sizeof(float) * M * N_out) == 0;
+    printf("profile on vs off : memcmp %s (%llu descriptors traced when on)\n",
+           same ? "== 0" : "!= 0", (unsigned long long)desc_on);
+    printf(same ? "PROFILE ON/OFF BYTE-IDENTICAL\n"
+                : "PROFILE ON/OFF DIFFER\n");
+    fail |= !same || desc_on == 0u;
+    const hexkl_dma_trace *t = hexkl_dma_trace_get();
+    uint64_t slots = 0;
+    for (int k = HEXKL_PROBE_DMA_DESC; k <= HEXKL_PROBE_DMA_LAST_ISSUE_US; ++k)
+      slots += hexkl_probe_us[k];
+    const int untouched = t->n_push == 0u && t->n_wait == 0u &&
+                          t->n_blocked == 0u && t->n_dropped == 0u &&
+                          slots == 0u;
+    printf(untouched ? "PROFILE OFF: TRACE UNTOUCHED\n"
+                     : "PROFILE OFF: TRACE WRITTEN (n_push=%u n_wait=%u)\n",
+           (unsigned)t->n_push, (unsigned)t->n_wait);
+    fail |= !untouched;
+    hexkl_probe_on = 1;
+    free(got_on);
+  }
+
+  /* --- #87: the M=1 push/wait trace at the LFM2 shape is the planner's
+     list (test/htp/nntr_moe_dma_plan.h), descriptor for descriptor ------ */
+  {
+    const uint32_t LK = 2048, LI = 1792, LN = 2048, LNE = 4;
+    hexkl_moe_layout R;
+    fail |= hexkl_mm_u8i4_moe_layout(LK, LI, LN, sizeof vtcm, &R) != 0;
+    W lg[4], ld[4];
+    uint32_t lhg[4], lhd[4];
+    for (uint32_t e = 0; e < LNE; ++e) {
+      make_weight(8u + e, LK, 2 * LI, &lg[e]);
+      make_weight(12u + e, LI, LN, &ld[e]);
+      lhg[e] = 8u + e;
+      lhd[e] = 12u + e;
+    }
+    float *lact = (float *)malloc(sizeof(float) * LK);
+    for (uint32_t i = 0; i < LK; ++i)
+      lact[i] = rndf();
+    float *lout = (float *)malloc(sizeof(float) * LN);
+    uint32_t lrc[4] = {1, 1, 1, 1}, lridx[4] = {0, 0, 0, 0};
+    float lrw[4] = {0.4f, 0.3f, 0.2f, 0.1f};
+    const uint32_t ring0 = g_stub_idx;
+    int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
+                                        1, LK, LI, LN, LNE, lhg, lhd, lridx,
+                                        lrc, lrw, lact, lout, NULL, &scratch);
+    fail |= (r != 0);
+    static nntr_moe_dma_item plan[NNTR_MOE_DMA_PLAN_MAX];
+    const uint32_t n_plan =
+      nntr_moe_dma_plan_m1(LK, LI, LN, LNE, R.acc_tiles, R.w_gu_off, R.w_dn_off,
+                           R.act_off, 0u, plan, NNTR_MOE_DMA_PLAN_MAX);
+    const hexkl_dma_trace *t = hexkl_dma_trace_get();
+    uint32_t push_ord[NNTR_MOE_DMA_PLAN_MAX];
+    uint32_t np = 0, nw = 0, bad = 0;
+    for (uint32_t k = 0; k < n_plan; ++k) {
+      const nntr_moe_dma_item *it = &plan[k];
+      if (it->op == NNTR_MOE_DMA_OP_PUSH) {
+        push_ord[k] = np;
+        const hexkl_dma_trace_push_rec *p = &t->push[np];
+        if (np >= t->n_push || p->kind != it->kind || p->expert != it->expert ||
+            p->chunk != it->chunk || p->row_size != it->row_size ||
+            p->nrows != it->nrows || p->src_stride != it->src_stride ||
+            p->ring_idx - ring0 != np) {
+          if (bad++ < 4)
+            printf("  push %u: plan kind=%u e=%u c=%u %ux%u@%u, trace kind=%u "
+                   "e=%u c=%u %ux%u@%u\n",
+                   np, it->kind, it->expert, it->chunk, it->row_size, it->nrows,
+                   it->src_stride, p->kind, p->expert, p->chunk, p->row_size,
+                   p->nrows, p->src_stride);
+        }
+        ++np;
+      } else {
+        const hexkl_dma_trace_wait_rec *w = &t->wait[nw];
+        if (nw >= t->n_wait || w->site != it->kind ||
+            w->ring_idx - ring0 != push_ord[it->src_off]) {
+          if (bad++ < 4)
+            printf("  wait %u: plan site=%u on push %u, trace site=%u on "
+                   "push %u\n",
+                   nw, it->kind, push_ord[it->src_off], w->site,
+                   w->ring_idx - ring0);
+        }
+        ++nw;
+      }
+    }
+    const int match = bad == 0u && np == t->n_push && nw == t->n_wait &&
+                      hexkl_probe_us[HEXKL_PROBE_DMA_DESC] == np;
+    printf("LFM2 M=1 trace    : %u pushes %u waits (plan %u/%u, %u items), "
+           "depth max %llu\n",
+           t->n_push, t->n_wait, np, nw, n_plan,
+           (unsigned long long)hexkl_probe_us[HEXKL_PROBE_DMA_DEPTH_MAX]);
+    printf(match ? "IN-SITU CHUNK PLAN MATCHES KERNEL (%u descriptors)\n"
+                 : "IN-SITU CHUNK PLAN DIFFERS FROM KERNEL (%u descriptors)\n",
+           np);
+    fail |= !match || np != 46u;
+    free(lact);
+    free(lout);
+  }
+
   printf(fail ? "\nFAIL\n" : "\nALL CHECKS PASS\n");
   hexkl_moe_scratch_free(&scratch);
   return fail;
