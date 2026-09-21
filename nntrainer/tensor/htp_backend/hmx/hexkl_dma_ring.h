@@ -15,6 +15,55 @@
 
 #include <stdint.h>
 
+/** @brief One 2D DMA descriptor. Hardware-defined layout; do not reorder.
+ *
+ * Shared with test/htp/nntr_hvx_dma_probe.c, which drives one engine per
+ * worker thread with its own descriptors instead of this file's single
+ * dmlinked chain. The asm helpers below are Hexagon-only; a host build
+ * (test/htp/host) sees the struct and nothing else. */
+typedef struct __attribute__((aligned(128))) hexkl_dma_desc2d_s {
+  void *next;
+  uint32_t dst_stride : 24;
+  uint32_t desc_size : 2;
+  uint32_t dst_comp : 1;
+  uint32_t src_comp : 1;
+  uint32_t dst_bypass : 1;
+  uint32_t src_bypass : 1;
+  uint32_t order : 1;
+  uint32_t done : 1;
+  void *src;
+  void *dst;
+  uint32_t desc_type : 8;
+  uint32_t reserved0 : 24;
+  uint32_t row_size : 24;
+  uint32_t nrows_lo : 8;
+  uint32_t nrows_hi : 8;
+  uint32_t src_stride : 24;
+  uint32_t offset : 24;
+  uint32_t reserved1 : 8;
+} hexkl_dma_desc2d;
+
+#if defined(__hexagon__)
+/** @brief Chains @a next after the in-flight @a cur (dmlink). */
+static inline void hexkl_dma_link(void *cur, void *next) {
+  asm volatile(" release(%0):at" : : "r"(next));
+  asm volatile(" dmlink(%0, %1)" : : "r"(cur), "r"(next));
+}
+
+/** @brief Starts this thread's DMA engine on descriptor @a p (dmstart). */
+static inline void hexkl_dma_start(void *p) {
+  asm volatile(" release(%0):at" : : "r"(p));
+  asm volatile(" dmstart(%0)" : : "r"(p));
+}
+
+/** @brief One dmpoll; callers spin on the descriptor's done bit around it. */
+static inline void hexkl_dma_poll(void) {
+  unsigned r = 0;
+  asm volatile(" %0 = dmpoll" : "=r"(r) : : "memory");
+  (void)r;
+}
+#endif /* __hexagon__ */
+
 /**
  * @brief Resets the ring to empty.
  *
