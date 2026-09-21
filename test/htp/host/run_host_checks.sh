@@ -28,9 +28,23 @@ cc=${CC:-gcc}
   -DMOE_TAIL_MAX_ROWS=16u \
   -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/moe_layer_host_check" \
-  "$HERE/moe_layer_host_check.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" -lm
+  "$HERE/moe_layer_host_check.c" "$HERE/hvx_scalar_stubs.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" -lm
 
 "$OUT/moe_layer_host_check"
+
+# The conv block kernel (doc 51 section 2) on the same stand-ins. It is
+# built on the MoE kernel's exported helpers, so that file links in too.
+# -ffp-contract=off: the conv gate's reference is a separate multiply and
+# add per tap, as the HVX computes it, and the host compiler must not fuse
+# them into an FMA the device does not have.
+"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  -o "$OUT/conv_block_host_check" \
+  "$HERE/conv_block_host_check.c" "$HERE/hvx_scalar_stubs.c" \
+  "$BACKEND/hmx/hexkl_conv_block.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" -lm
+
+"$OUT/conv_block_host_check"
 
 # The worker pool's two lanes on pthreads (stub/qurt.h). Concurrency is
 # exercised for real here -- 3 workers, a caller that helps -- but a
