@@ -97,8 +97,8 @@ enum {
       At 31.6 GB/s measured and 5.6 GB/s averaged, something is serialising
       and the push is one of two candidates. */
   HEXKL_PROBE_PUSH,
-  HEXKL_PROBE_DRAIN,        /**< hexkl_dma_ring_drain */
-  HEXKL_PROBE_SWIGLU,       /**< hvx_swiglu_inplace_f32 (fused layer only) */
+  HEXKL_PROBE_DRAIN,  /**< hexkl_dma_ring_drain */
+  HEXKL_PROBE_SWIGLU, /**< hvx_swiglu_inplace_f32 (fused layer only) */
   /** Routing multiply + accumulate into the layer output (MoE layer call
       only). Its own slot rather than sharing ACC_COPY: the first
       measurement of that call had 104.8 ms in a bucket ACC_READ and this
@@ -118,6 +118,23 @@ enum {
    *  is running, 0 when layer_run fell back to the vendor copy. One number
    *  that says which path the numbers beside it came from. */
   HEXKL_PROBE_ACC_STRIDE,
+  /* PR #86's HEXKL_PROBE_PATH belongs here, before the #87 slots below. */
+  /** [#87] The MoE layer call's DMA ring use, from hexkl_dma_trace.c.
+      Counts unless named _US. The trace runs only while hexkl_probe_on is
+      set, so all of these read 0 on the untimed entry point. */
+  HEXKL_PROBE_DMA_DESC,          /**< descriptors pushed this call */
+  HEXKL_PROBE_DMA_WAITS,         /**< ring waits (act, gate_up, down, copy) */
+  HEXKL_PROBE_DMA_WAITS_BLOCKED, /**< of those, done bit 0 at entry */
+  HEXKL_PROBE_DMA_WAIT_US,       /**< every traced wait, summed */
+  /** The activation-block wait's share of GATHER: at expert 0 it covers
+      the whole gate_up[0] pushed ahead of it, which is what the profile's
+      "first 1024 KB took 0 us" line hid (plan 87 section 0 ii). */
+  HEXKL_PROBE_DMA_WAIT_ACT_US,
+  HEXKL_PROBE_DMA_BUSY_LO_US,     /**< engine busy, union of [issue, done_lo] */
+  HEXKL_PROBE_DMA_BUSY_HI_US,     /**< engine busy, union of [issue, done_hi] */
+  HEXKL_PROBE_DMA_DEPTH_MAX,      /**< most descriptors outstanding at once */
+  HEXKL_PROBE_DMA_FIRST_READY_US, /**< t0 -> expert 0's gate_up resident */
+  HEXKL_PROBE_DMA_LAST_ISSUE_US,  /**< t0 -> the last weight push */
   HEXKL_PROBE_N
 };
 
@@ -141,6 +158,13 @@ void hexkl_probe_reset(int enable);
 /** @brief Same DSP-internal clock hexkl_attn_u8.c times stages with. */
 static inline uint64_t hexkl_probe_now(void) {
   return HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+}
+
+/** @brief The same clock, raw: 19.2 MHz ticks (52 ns), for the DMA trace's
+ *  per-descriptor timestamps, where a microsecond is too coarse to order
+ *  a push against the HMX batch that follows it. */
+static inline uint64_t hexkl_probe_now_ticks(void) {
+  return HAP_perf_get_qtimer_count();
 }
 
 /** @brief Reads the clock into @a v, or does nothing when probing is off. */
