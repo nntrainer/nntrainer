@@ -59,6 +59,8 @@ typedef struct {
   nntr_hvx_arena arenas[NNTR_HVX_MAX_ARENAS];
   hexkl_moe_scratch moe_scratch; /**< the MoE layer call's heap scratch,
                                       grown on demand, freed in close() */
+  uint32_t moe_flags; /**< HEXKL_MOE_FLAG_* bits from moe_set_opts; the
+                           session is calloc'd, so 0 = the HMX loop */
 } nntr_hvx_session;
 
 /** @brief HAP_mmap_put on every attached arena. close() calls it after the

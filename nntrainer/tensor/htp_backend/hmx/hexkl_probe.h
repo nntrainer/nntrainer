@@ -118,7 +118,6 @@ enum {
    *  is running, 0 when layer_run fell back to the vendor copy. One number
    *  that says which path the numbers beside it came from. */
   HEXKL_PROBE_ACC_STRIDE,
-  /* PR #86's HEXKL_PROBE_PATH belongs here, before the #87 slots below. */
   /** [#87] The MoE layer call's DMA ring use, from hexkl_dma_trace.c.
       Counts unless named _US. The trace runs only while hexkl_probe_on is
       set, so all of these read 0 on the untimed entry point. */
@@ -135,6 +134,12 @@ enum {
   HEXKL_PROBE_DMA_DEPTH_MAX,      /**< most descriptors outstanding at once */
   HEXKL_PROBE_DMA_FIRST_READY_US, /**< t0 -> expert 0's gate_up resident */
   HEXKL_PROBE_DMA_LAST_ISSUE_US,  /**< t0 -> the last weight push */
+  /** NOT a time: which path the MoE layer call took -- 0 the HMX block
+   *  loop, 1 the M=1 HVX GEMV (HEXKL_MOE_FLAG_M1_GEMV and M <= 4). Beside
+   *  BLOCKS == 0 and DMA_KB == 0 it is what says the numbers next to it
+   *  came from the GEMV and not from a block loop that happened to be
+   *  cheap. */
+  HEXKL_PROBE_PATH,
   HEXKL_PROBE_N
 };
 

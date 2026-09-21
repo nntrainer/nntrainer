@@ -885,7 +885,6 @@ enum {
   MOE_T_PUSH,         /**< hexkl_dma_ring_push2d itself */
   MOE_T_STAGE, /**< copying the FastRPC buffers to and from cached heap */
   MOE_T_ACC_STRIDE,
-  /* PR #86's MOE_T_PATH belongs here, before the #87 slots below. */
   /** [#87] The DMA ring trace's per-call numbers (hexkl_probe.h's
       HEXKL_PROBE_DMA_*), in the same order. Counts unless named _US. */
   MOE_T_DMA_DESC,
@@ -898,6 +897,7 @@ enum {
   MOE_T_DMA_DEPTH_MAX,
   MOE_T_DMA_FIRST_READY_US,
   MOE_T_DMA_LAST_ISSUE_US,
+  MOE_T_PATH, /**< NOT us: 0 = HMX block loop, 1 = M=1 HVX GEMV */
   MOE_N_STAGES
 };
 
@@ -976,7 +976,7 @@ int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
   return hexkl_mm_u8i4_moe_layer_run(
     &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
     N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
-    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch);
+    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch, s->moe_flags);
 }
 
 int nntr_hvx_mm_u8i4_moe_layer_timed(
@@ -1009,7 +1009,7 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
   rc = hexkl_mm_u8i4_moe_layer_run(
     &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
     N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
-    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch);
+    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch, s->moe_flags);
   t1 = hexkl_probe_now();
   hexkl_probe_on = 0;
 
@@ -1037,6 +1037,7 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
     stage_us[MOE_T_DMA_DESC + k] =
       (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_DESC + k];
   }
+  stage_us[MOE_T_PATH] = (uint32)hexkl_probe_us[HEXKL_PROBE_PATH];
   return rc;
 }
 
@@ -1050,6 +1051,19 @@ int nntr_hvx_moe_dma_trace_read(remote_handle64 handle, uint32 *words,
      survive until the next timed call overwrites them. A buffer too small
      for the whole trace gets 0 words rather than a truncated one. */
   *n_words = hexkl_dma_trace_serialize(words, (uint32_t)wordsLen);
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_moe_set_opts(remote_handle64 handle, uint32 flags,
+                          uint32 *applied) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || !applied) {
+    return AEE_EBADPARM;
+  }
+  /* Only the bits this skel knows are kept; the echo is how the ARM side
+     tells "took" from "ignored by an older skel". */
+  s->moe_flags = flags & HEXKL_MOE_FLAG_M1_GEMV;
+  *applied = s->moe_flags;
   return AEE_SUCCESS;
 }
 
