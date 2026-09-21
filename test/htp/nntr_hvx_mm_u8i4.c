@@ -19,6 +19,7 @@
 #include <remote.h>
 
 #include "hexkl_dma_ring.h"
+#include "hexkl_dma_trace.h"
 #include "hexkl_micro.h"
 #include "hexkl_mm_u8i4.h"
 #include "hexkl_mm_u8i4_dma.h"
@@ -194,7 +195,6 @@ enum {
 #endif
 #endif
 
-
 int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
                          uint32 dma_bytes, uint32 *res, int resLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
@@ -274,8 +274,9 @@ int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
       res[7] |= (uint32)((p == NULL ? 1u : 2u) << (ti * 2u));
     }
     if (va == NULL) {
-      FARF(ERROR, "arena_probe: every HAP_mmap prot/flags pair failed "
-                  "(fd=%d bytes=%u mask=0x%x)",
+      FARF(ERROR,
+           "arena_probe: every HAP_mmap prot/flags pair failed "
+           "(fd=%d bytes=%u mask=0x%x)",
            (int)fd, (unsigned)bytes, (unsigned)res[7]);
       return AEE_ENOMEMORY;
     }
@@ -878,12 +879,25 @@ enum {
   MOE_T_MM,        /**< the HMX issue loop, timed rather than left a residual */
   MOE_T_DMA_KB,    /**< NOT us: kilobytes pushed through the DMA ring */
   MOE_T_DMA_FIRST, /**< us of the first weight drain = one 3.5 MiB transfer */
-  MOE_T_ALLOC,   /**< the layer call's own malloc and free */
+  MOE_T_ALLOC,     /**< the layer call's own malloc and free */
   MOE_T_DMA_FIRST_KB, /**< NOT us: KB that first wait covered */
-  MOE_T_DRAIN_DN,  /**< the down-weight drain, apart from gate_up's */
-  MOE_T_PUSH,      /**< hexkl_dma_ring_push2d itself */
-  MOE_T_STAGE,     /**< copying the FastRPC buffers to and from cached heap */
+  MOE_T_DRAIN_DN,     /**< the down-weight drain, apart from gate_up's */
+  MOE_T_PUSH,         /**< hexkl_dma_ring_push2d itself */
+  MOE_T_STAGE, /**< copying the FastRPC buffers to and from cached heap */
   MOE_T_ACC_STRIDE,
+  /* PR #86's MOE_T_PATH belongs here, before the #87 slots below. */
+  /** [#87] The DMA ring trace's per-call numbers (hexkl_probe.h's
+      HEXKL_PROBE_DMA_*), in the same order. Counts unless named _US. */
+  MOE_T_DMA_DESC,
+  MOE_T_DMA_WAITS,
+  MOE_T_DMA_WAITS_BLOCKED,
+  MOE_T_DMA_WAIT_US,
+  MOE_T_DMA_WAIT_ACT_US,
+  MOE_T_DMA_BUSY_LO_US,
+  MOE_T_DMA_BUSY_HI_US,
+  MOE_T_DMA_DEPTH_MAX,
+  MOE_T_DMA_FIRST_READY_US,
+  MOE_T_DMA_LAST_ISSUE_US,
   MOE_N_STAGES
 };
 
@@ -1019,7 +1033,24 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
   stage_us[MOE_T_DRAIN_DN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN_DN];
   stage_us[MOE_T_PUSH] = (uint32)hexkl_probe_us[HEXKL_PROBE_PUSH];
   stage_us[MOE_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
+  for (int k = 0; k <= MOE_T_DMA_LAST_ISSUE_US - MOE_T_DMA_DESC; ++k) {
+    stage_us[MOE_T_DMA_DESC + k] =
+      (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_DESC + k];
+  }
   return rc;
+}
+
+int nntr_hvx_moe_dma_trace_read(remote_handle64 handle, uint32 *words,
+                                int wordsLen, uint32 *n_words) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || !words || wordsLen <= 0 || !n_words) {
+    return AEE_EBADPARM;
+  }
+  /* The tables of the last mm_u8i4_moe_layer_timed call: static, so they
+     survive until the next timed call overwrites them. A buffer too small
+     for the whole trace gets 0 words rather than a truncated one. */
+  *n_words = hexkl_dma_trace_serialize(words, (uint32_t)wordsLen);
+  return AEE_SUCCESS;
 }
 
 int nntr_hvx_mm_u8i4_gate_up_swiglu(remote_handle64 handle, uint32 M, uint32 K,
