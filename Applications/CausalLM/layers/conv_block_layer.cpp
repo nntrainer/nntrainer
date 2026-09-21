@@ -154,39 +154,20 @@ static void quantChannelsSym(float *w, unsigned int N, unsigned int K,
   }
 }
 
-/** The opposite of SmoothQuant's direction: input channel k of the weight
- *  (column k of every output channel) divided by m_k = max_n |w[n][k]|^alpha,
- *  and x's channel k multiplied by it. The product is unchanged. It takes
- *  the along-K variation that Q4_0's block scales captured OUT of the
- *  weight, where one scale per channel cannot follow it, and puts it into
- *  the activation, where per-row u8 has 14 dB of headroom over the weight
- *  (doc 51 section 2.11). Weight statistics only, so it needs no
- *  calibration and folds into the load-time conversion for free. */
-static void rowFlattenInPlace(float *x, unsigned int rows, unsigned int K,
-                              float *w, unsigned int N, float alpha) {
-  std::vector<float> m(K, 0.f);
-  for (unsigned int n = 0; n < N; ++n)
-    for (unsigned int k = 0; k < K; ++k)
-      m[k] = std::max(m[k], std::fabs(w[static_cast<size_t>(n) * K + k]));
-  for (unsigned int k = 0; k < K; ++k)
-    m[k] = m[k] > 0.f ? std::pow(m[k], alpha) : 1.f;
-  for (unsigned int n = 0; n < N; ++n)
-    for (unsigned int k = 0; k < K; ++k)
-      w[static_cast<size_t>(n) * K + k] /= m[k];
-  for (unsigned int t = 0; t < rows; ++t)
-    for (unsigned int k = 0; k < K; ++k)
-      x[static_cast<size_t>(t) * K + k] *= m[k];
-}
-
-/** The load-time rule per (channel, K-group of @a B): what the DSP would
- *  see if each K-group were its own registered weight with its own scale,
- *  dequantized and summed in f32 -- B = 32 is Q4_0 itself. */
+/** Symmetric int4 per (channel, K-group of @a B): what the DSP would see
+ *  if each K-group were its own registered weight with its own scale,
+ *  dequantized and summed in f32. Symmetric, not the load-time rule: that
+ *  rule folds 0 into an asymmetric range without a zero point, and on a
+ *  small group whose min and max differ it clips one side -- the first
+ *  emulation of these groups used it and read WORSE for smaller groups.
+ *  B = 32 is Q4_0's own grid, so its row must land on the act-u8-only
+ *  number; that is the check on this emulation. */
 static void quantChannelsBlocked(float *w, unsigned int N, unsigned int K,
                                  unsigned int B) {
   for (unsigned int n = 0; n < N; ++n)
     for (unsigned int k0 = 0; k0 < K; k0 += B)
-      quantChannelsCur(w + static_cast<size_t>(n) * K + k0, 1,
-                       std::min(B, K - k0));
+      quantChannelsSym(w + static_cast<size_t>(n) * K + k0, 1,
+                       std::min(B, K - k0), 7L);
 }
 
 static double snrDb(const float *ref, const float *got, size_t n) {
@@ -479,7 +460,7 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         out_w.getData<char>(), static_cast<int>(N), static_cast<int>(C),
         w_out_f.data());
       static const char *const names[] = {
-        "cur int4/ch", "rowflat1", "rowflat.5", "blk256", "blk128", "int8/ch"};
+        "cur int4/ch", "blk32(=Q4_0)", "blk64", "blk128", "blk256", "int8/ch"};
       std::string line = "[conv_block]   recipes (f32 emulation, act u8):";
       for (int rcp = 0; rcp < 6; ++rcp) {
         std::vector<float> xr(in_step.getData<float>(),
@@ -488,13 +469,10 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         std::vector<float> win(w_in_f), wout(w_out_f);
         auto quant_w = [&](float *w, unsigned int n_out, unsigned int k_in,
                            float *act, unsigned int act_rows) {
-          if (rcp == 1 || rcp == 2)
-            rowFlattenInPlace(act, act_rows, k_in, w, n_out,
-                              rcp == 1 ? 1.f : 0.5f);
-          if (rcp == 3)
-            quantChannelsBlocked(w, n_out, k_in, 256);
-          else if (rcp == 4)
-            quantChannelsBlocked(w, n_out, k_in, 128);
+          (void)act;
+          (void)act_rows;
+          if (rcp >= 1 && rcp <= 4)
+            quantChannelsBlocked(w, n_out, k_in, 32u << (rcp - 1));
           else if (rcp == 5)
             quantChannelsSym(w, n_out, k_in, 127L);
           else
