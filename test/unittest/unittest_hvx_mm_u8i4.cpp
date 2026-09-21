@@ -2270,6 +2270,139 @@ TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
   rfree(buf);
 }
 
+/* [#80] The M=1 GEMV path against the HMX block loop on silicon: the same
+   MoE layer call with moe_set_opts(0) and moe_set_opts(1), byte-compared.
+   The host check (test/htp/host/moe_layer_host_check.c) holds the plumbing
+   with scalar stand-ins; this is the one place the HVX GEMV's int32 and
+   the HMX's are compared for real, through the same epilogues, and the
+   weights are read from the arena as production reads them -- the mapping
+   the GEMV's vector loads and l2fetch have never been measured against. */
+TEST_F(HmxMmU8I4Layer, MoeLayerM1GemvMatchesHmx) {
+  const uint32_t K = 2048, I = 1792, N = 2048, NE = 4;
+
+  auto alloc =
+    (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+  auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+  auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+  using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
+  auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
+  if (!alloc || !rfree || !to_fd || !fmmap) {
+    GTEST_SKIP() << "rpcmem/fastrpc_mmap not available";
+  }
+
+  std::vector<Weight> gu(NE), dn(NE);
+  std::vector<uint32_t> h_gu(NE), h_dn(NE);
+  for (uint32_t e = 0; e < NE; ++e) {
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0xA8000000u + e, gu[e]));
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xC8000000u + e, dn[e]));
+    h_gu[e] = gu[e].handle;
+    h_dn[e] = dn[e].handle;
+  }
+  auto wh_bytes = [](uint32_t k, uint32_t n) {
+    return (k / 32u) * (n / 32u) * 512u;
+  };
+  const uint32_t gu_len = wh_bytes(K, 2 * I), dn_len = wh_bytes(I, N);
+  const uint32_t stride_gu = (gu_len + 4095u) & ~4095u;
+  const uint32_t stride_dn = (dn_len + 4095u) & ~4095u;
+  const uint32_t arena_bytes = NE * (stride_gu + stride_dn);
+  void *buf = alloc(25, 0 /*UNCACHED*/, (int)arena_bytes);
+  ASSERT_NE(buf, nullptr) << "uncached rpcmem_alloc failed";
+  const int fd = to_fd(buf);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(fmmap(CDSP_DOMAIN_ID, fd, buf, 0, arena_bytes,
+                  static_cast<int>(FASTRPC_MAP_FD)),
+            0);
+  uint32_t arena = 0xFFFFFFFFu;
+  ASSERT_EQ(nntr_hvx_arena_attach(handle_, fd, arena_bytes, &arena),
+            AEE_SUCCESS);
+  auto *base = static_cast<uint8_t *>(buf);
+  std::vector<uint32_t> a_gu(NE), a_dn(NE);
+  uint32_t off = 0;
+  for (uint32_t e = 0; e < NE; ++e) {
+    ASSERT_EQ(
+      nntr_hvx_weight_bake_export(handle_, h_gu[e], base + off, (int)gu_len),
+      AEE_SUCCESS);
+    ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
+                handle_, K, 2 * I, arena, off, gu[e].d.data(), (int)(2 * I),
+                gu[e].colsum.data(), (int)(2 * I), gu[e].bias.data(),
+                (int)(2 * I), &a_gu[e]),
+              AEE_SUCCESS);
+    off += stride_gu;
+    ASSERT_EQ(
+      nntr_hvx_weight_bake_export(handle_, h_dn[e], base + off, (int)dn_len),
+      AEE_SUCCESS);
+    ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
+                handle_, I, N, arena, off, dn[e].d.data(), (int)N,
+                dn[e].colsum.data(), (int)N, dn[e].bias.data(), (int)N,
+                &a_dn[e]),
+              AEE_SUCCESS);
+    off += stride_dn;
+  }
+
+  // M=1: the decode shape, one row to every expert. M=4: one expert holds
+  // all four tokens, the rest 3, 2 and 1, rows distinct inside an expert
+  // (the top-k guarantee the scatter relies on).
+  struct Routing {
+    uint32_t M;
+    std::vector<uint32_t> count;
+    std::vector<uint32_t> index;
+  };
+  const std::vector<Routing> routings = {
+    {1u, {1, 1, 1, 1}, {0, 0, 0, 0}},
+    {4u, {4, 3, 2, 1}, {0, 1, 2, 3, 1, 2, 3, 2, 3, 3}},
+  };
+  size_t bad_total = 0;
+  for (const Routing &rt : routings) {
+    std::vector<float> x(static_cast<size_t>(rt.M) * K);
+    fill_deterministic(x, 0x5EED0080u + rt.M);
+    std::vector<float> weight(rt.index.size());
+    for (size_t i = 0; i < weight.size(); ++i)
+      weight[i] = 0.1f + 0.05f * static_cast<float>(i);
+
+    auto run = [&](uint32_t flags, std::vector<float> &out) {
+      uint32_t applied = 0xFFFFFFFFu;
+      const int oerr = nntr_hvx_moe_set_opts(handle_, flags, &applied);
+      EXPECT_EQ(oerr, AEE_SUCCESS);
+      EXPECT_EQ(applied, flags) << "the skel did not keep the bit";
+      out.assign(static_cast<size_t>(rt.M) * N, 1.0f);
+      return nntr_hvx_mm_u8i4_moe_layer(
+        handle_, rt.M, K, I, N, a_gu.data(), (int)a_gu.size(), a_dn.data(),
+        (int)a_dn.size(), rt.index.data(), (int)rt.index.size(),
+        rt.count.data(), (int)rt.count.size(), weight.data(),
+        (int)weight.size(), x.data(), (int)x.size(), out.data(),
+        (int)out.size());
+    };
+    std::vector<float> hmx, m1;
+    ASSERT_EQ(run(0u, hmx), AEE_SUCCESS);
+    ASSERT_EQ(run(1u, m1), AEE_SUCCESS);
+    size_t bad = 0;
+    for (size_t i = 0; i < hmx.size(); ++i) {
+      if (std::memcmp(&hmx[i], &m1[i], sizeof(float)) != 0)
+        ++bad;
+    }
+    std::cout << "U8I4_FIELD path=moe_m1_gemv field=bad_elems_M" << rt.M
+              << " value=" << bad << " of " << hmx.size() << std::endl;
+    EXPECT_EQ(bad, 0u) << "M=" << rt.M
+                       << ": the HVX GEMV path and the HMX block loop "
+                          "disagree on the same routing";
+    bad_total += bad;
+  }
+  // Back to the default so later tests in this process see the HMX loop.
+  uint32_t applied = 0xFFFFFFFFu;
+  ASSERT_EQ(nntr_hvx_moe_set_opts(handle_, 0u, &applied), AEE_SUCCESS);
+  ASSERT_EQ(applied, 0u);
+  std::cout << "U8I4_FIELD path=moe_m1_gemv field=bit_identical value="
+            << (bad_total == 0 ? "yes" : "no") << std::endl;
+
+  for (uint32_t e = 0; e < NE; ++e) {
+    for (uint32_t h : {a_gu[e], a_dn[e], h_gu[e], h_dn[e]}) {
+      EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h), AEE_SUCCESS);
+    }
+  }
+  EXPECT_EQ(nntr_hvx_arena_detach(handle_, arena), AEE_SUCCESS);
+  rfree(buf);
+}
+
 TEST_F(HmxMmU8I4Layer, MemoryCeilings) {
   const double need_gb = 4.10;
 
