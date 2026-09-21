@@ -214,6 +214,10 @@ void tanh_gelu_v2(const unsigned int N, const float *X, float *Y) {
   __fallback_tanh_gelu(N, X, Y);
 }
 
+void gelu_v2(const unsigned int N, const float *X, float *Y) {
+  __fallback_gelu_v2(N, X, Y);
+}
+
 void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z) {
   __fallback_tanh_gelu_mul(N, X, Y, Z);
 }
@@ -284,11 +288,15 @@ void dequantize_row_q6_K(const void *x, float *y, int64_t k) {
   return __fallback_dequantize_row_q6_K(x, y, k);
 }
 
+void quantize_row_q6_K(const float *src, void *dst, int64_t k) {
+  return __fallback_quantize_row_q6_K(src, dst, k);
+}
+
 template <> void dequantize_row_q8_K(const void *x, float *y, int64_t k) {
   return __fallback_dequantize_row_q8_K(x, y, k);
 }
 
-template <> void quantize_row_q8_K(const void *x, float *y, int64_t k) {
+template <> void quantize_row_q8_K(const float *x, void *y, int64_t k) {
   return __fallback_quantize_row_q8_K(x, y, k);
 }
 
@@ -310,9 +318,9 @@ void repack_q4_0_to_q4_0_8(void *W, void *repacked_W, size_t data_size,
   return __fallback_repack_q4_0_to_q4_0_8(W, repacked_W, data_size, M, N);
 }
 
-void repack_q4_K_to_q4_K_8(void *W, void *repacked_W, size_t data_size,
-                           const unsigned int M, const unsigned int N) {
-  return __fallback_repack_q4_K_to_q4_K_8(W, repacked_W, data_size, M, N);
+void repack_q4_K(void *dst, void *src, size_t data_size, const unsigned int M,
+                 const unsigned int N) {
+  return __fallback_repack_q4_K_to_q4_K_8(dst, src, data_size, M, N);
 }
 
 void unpack_q4_0(const void *in_q4_0x, void *out_q4_0, size_t data_size,
