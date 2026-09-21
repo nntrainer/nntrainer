@@ -24,7 +24,9 @@ OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 cc=${CC:-gcc}
-"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
+# -O2: the M=1 cases run the HMX stand-in at the real shape (64 rows a
+# tile, scalar), about a minute at -O2 and several at -O1.
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
   -DMOE_TAIL_MAX_ROWS=16u \
   -I "$HERE/stub" -I "$HERE/.." -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/moe_layer_host_check" \

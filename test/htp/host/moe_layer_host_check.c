@@ -61,6 +61,19 @@ int hexkl_micro_hmx_mm_u8i4(uint8_t *base, uint32_t act_off, uint32_t w_off) {
     }
   return 0;
 }
+/* Every GEMV call's int32 result, logged so the M=1 check can hold the
+   tiles the kernel fed its epilogues against a reference computed from the
+   token rows the routing named -- which is what the kernel's slot pack and
+   row bookkeeping are for. Rows up to the GEMV's 4-row group. */
+typedef struct {
+  const uint8_t *wh;
+  uint32_t nt, m;
+  int32_t tile[4 * 32];
+} gemv_log_entry;
+static gemv_log_entry *g_gemv_log;
+static size_t g_gemv_n, g_gemv_cap;
+static void gemv_log_reset(void) { g_gemv_n = 0; }
+
 /* The HVX GEMM's stand-in: the same sum, over the tiles the kernel points
    it at, into the row-stride-32 tile the header promises. */
 void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
@@ -77,6 +90,16 @@ void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
       }
       out[r * 32u + c] = s;
     }
+  if (g_gemv_n == g_gemv_cap) {
+    g_gemv_cap = g_gemv_cap ? 2u * g_gemv_cap : 1024u;
+    g_gemv_log =
+      (gemv_log_entry *)realloc(g_gemv_log, g_gemv_cap * sizeof *g_gemv_log);
+  }
+  gemv_log_entry *le = &g_gemv_log[g_gemv_n++];
+  le->wh = wh;
+  le->nt = nt;
+  le->m = m > 4u ? 4u : m;
+  memcpy(le->tile, out, sizeof(int32_t) * 32u * le->m);
 }
 int hexkl_micro_hmx_acc_read_int32(uint8_t *base, uint32_t cfg, uint32_t off) {
   (void)cfg;
@@ -404,6 +427,66 @@ static void quant_row(const float *x, uint32_t k, uint8_t *q, float *scale,
   }
 }
 
+/* The layer, one expert and one row at a time: quantize the row, gate_up,
+   SwiGLU, requantize, down, then the routing multiply and the add into the
+   token's output row -- in expert order, rows in order, like the kernel. */
+static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
+                            uint32_t N_out, uint32_t NE, const W *wg,
+                            const W *wd, const float *act, const uint32_t *ridx,
+                            const uint32_t *rc_, const float *rw, float *want) {
+  uint8_t *aq = (uint8_t *)malloc(K);
+  uint8_t *mq = (uint8_t *)malloc(inter);
+  float *gu = (float *)malloc(sizeof(float) * 2 * inter);
+  float *dn = (float *)malloc(sizeof(float) * N_out);
+  float *mid = (float *)malloc(sizeof(float) * inter);
+  uint32_t base = 0;
+  memset(want, 0, sizeof(float) * M * N_out);
+  for (uint32_t e = 0; e < NE; ++e) {
+    for (uint32_t i = 0; i < rc_[e]; ++i) {
+      uint32_t row = ridx[base + i];
+      float as;
+      int32_t az;
+      quant_row(act + (size_t)row * K, K, aq, &as, &az);
+      ref_mm(&wg[e], aq, as, az, gu);
+      for (uint32_t j = 0; j < inter; ++j)
+        mid[j] = gu[j] / (1.f + expf(-gu[j])) * gu[inter + j];
+      float ms;
+      int32_t mz;
+      quant_row(mid, inter, mq, &ms, &mz);
+      ref_mm(&wd[e], mq, ms, mz, dn);
+      for (uint32_t c = 0; c < N_out; ++c) {
+        /* Two operations through a volatile, matching what the kernel and
+           the ARM path both do -- see hvx_scale_add_rows_f32's stub. */
+        volatile float p = dn[c] * rw[base + i];
+        want[(size_t)row * N_out + c] = want[(size_t)row * N_out + c] + p;
+      }
+    }
+    base += rc_[e];
+  }
+  free(aq);
+  free(mq);
+  free(gu);
+  free(dn);
+  free(mid);
+}
+
+/* Elements of got outside 1e-5 relative of want; worst gets the largest. */
+static uint32_t count_mismatches(const float *got, const float *want,
+                                 uint32_t n, double *worst) {
+  uint32_t bad = 0;
+  *worst = 0.0;
+  for (uint32_t i = 0; i < n; ++i) {
+    double d = fabs((double)got[i] - (double)want[i]);
+    double s = fabs((double)want[i]) + 1e-6;
+    if (d / s > 1e-5) {
+      ++bad;
+    }
+    if (d / s > *worst)
+      *worst = d / s;
+  }
+  return bad;
+}
+
 /* ------------------------------- the test ------------------------------- */
 static uint32_t rnd_state = 12345u;
 static uint32_t rnd(void) {
@@ -437,6 +520,193 @@ static void make_weight(uint32_t slot, uint32_t K, uint32_t N, W *w) {
   s->w_scale = w->ws;
   s->colsum_w = w->cs;
   s->bias = w->bias;
+}
+
+/* ---- The M=1 GEMV path against the HMX stand-in ------------------------
+   One (shape, M) case: the same call with flags 0 (every expert a 64-row
+   HMX block) and with HEXKL_MOE_FLAG_M1_GEMV, byte-compared. The HMX stub
+   and the GEMV stub sum the same u8 x i4 products, so identical output
+   here says the M=1 path packs the right rows into the right slots, runs
+   the same epilogues on them and adds them into the output in the same
+   order -- the plumbing, which is what a host check can hold. Whether the
+   HVX GEMV's int32 equals the HMX's on silicon is the device gtest's.
+   The log of GEMV tiles is then held against a reference built from the
+   token rows the routing names, independently of the kernel's slot pack. */
+static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
+                       uint32_t inter, uint32_t N_out, uint32_t NE,
+                       const uint32_t *rc_, uint32_t slot0, uint8_t *vtcm,
+                       size_t vtcm_bytes, hexkl_moe_scratch *scratch) {
+  W *wg = (W *)calloc(NE, sizeof(W));
+  W *wd = (W *)calloc(NE, sizeof(W));
+  uint32_t *hg = (uint32_t *)calloc(NE, sizeof(uint32_t));
+  uint32_t *hd = (uint32_t *)calloc(NE, sizeof(uint32_t));
+  uint32_t n_rows = 0, active = 0;
+  for (uint32_t e = 0; e < NE; ++e) {
+    n_rows += rc_[e];
+    if (rc_[e] == 0u)
+      continue; /* the kernel validates handles only where rows are */
+    make_weight(slot0 + 2u * active, K, 2 * inter, &wg[e]);
+    make_weight(slot0 + 2u * active + 1u, inter, N_out, &wd[e]);
+    hg[e] = slot0 + 2u * active;
+    hd[e] = slot0 + 2u * active + 1u;
+    ++active;
+  }
+  /* Distinct rows inside an expert (the top-k guarantee the kernel's
+     scatter needs), a different first row per expert. */
+  uint32_t *ridx = (uint32_t *)malloc(sizeof(uint32_t) * n_rows);
+  float *rw = (float *)malloc(sizeof(float) * n_rows);
+  for (uint32_t e = 0, i = 0; e < NE; ++e)
+    for (uint32_t r = 0; r < rc_[e]; ++r, ++i) {
+      ridx[i] = (e * 7u + r) % M;
+      rw[i] = 0.1f + 0.9f * ((float)(rnd() % 100u) / 100.f);
+    }
+  float *act = (float *)malloc(sizeof(float) * M * K);
+  for (uint32_t i = 0; i < M * K; ++i)
+    act[i] = rndf();
+
+  float *out_hmx = (float *)malloc(sizeof(float) * M * N_out);
+  float *out_m1 = (float *)malloc(sizeof(float) * M * N_out);
+  int fail = 0;
+
+  memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
+  int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, vtcm_bytes, vtcm_bytes, M,
+                                      K, inter, N_out, NE, hg, hd, ridx, rc_,
+                                      rw, act, out_hmx, NULL, scratch, 0u);
+  const uint64_t blocks_hmx = hexkl_probe_us[HEXKL_PROBE_BLOCKS];
+  const uint64_t path_hmx = hexkl_probe_us[HEXKL_PROBE_PATH];
+  if (r != 0 || blocks_hmx != active || path_hmx != 0u) {
+    printf("M1 GEMV shape=%s M=%u: HMX stand-in rc=%d blocks=%llu (want %u) "
+           "path=%llu\n",
+           shape, M, r, (unsigned long long)blocks_hmx, active,
+           (unsigned long long)path_hmx);
+    fail = 1;
+  }
+
+  memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
+  gemv_log_reset();
+  r = hexkl_mm_u8i4_moe_layer_run(
+    &g_tbl, vtcm, vtcm_bytes, vtcm_bytes, M, K, inter, N_out, NE, hg, hd, ridx,
+    rc_, rw, act, out_m1, NULL, scratch, HEXKL_MOE_FLAG_M1_GEMV);
+  const uint64_t blocks = hexkl_probe_us[HEXKL_PROBE_BLOCKS];
+  const uint64_t dma_kb = hexkl_probe_us[HEXKL_PROBE_DMA_KB];
+  const uint64_t path = hexkl_probe_us[HEXKL_PROBE_PATH];
+  const int same = memcmp(out_hmx, out_m1, sizeof(float) * M * N_out);
+  fail |= (r != 0) || blocks != 0u || dma_kb != 0u || path != 1u || same != 0;
+
+  /* The logged gate_up tiles, row by row, against the routing's token row
+     quantized by the reference's own quantizer. Down tiles are not held
+     this way: their input is the kernel's requantized SwiGLU, which no
+     independent int32 spec exists for -- the f32 memcmp above covers them.
+     Every (expert, gate/up column) must be there exactly once. */
+  uint32_t i32_bad = 0, i32_seen = 0;
+  {
+    uint8_t *aq = (uint8_t *)malloc(K);
+    const uint32_t kt_n = K / 32u, gu_nt = (2u * inter) / 32u;
+    for (size_t li = 0; li < g_gemv_n; ++li) {
+      const gemv_log_entry *le = &g_gemv_log[li];
+      uint32_t e = NE, base = 0;
+      for (uint32_t x = 0, b = 0; x < NE; b += rc_[x], ++x)
+        if (rc_[x] != 0u && (const uint8_t *)wg[x].nib == le->wh) {
+          e = x;
+          base = b;
+        }
+      if (e == NE)
+        continue; /* a down GEMV */
+      ++i32_seen;
+      for (uint32_t rr = 0; rr < le->m; ++rr) {
+        float as;
+        int32_t az;
+        quant_row(act + (size_t)ridx[base + rr] * K, K, aq, &as, &az);
+        for (uint32_t c = 0; c < 32; ++c) {
+          int32_t sum = 0;
+          for (uint32_t kt = 0; kt < kt_n; ++kt)
+            for (uint32_t k = 0; k < 32; ++k)
+              sum += (int32_t)aq[kt * 32u + k] *
+                     wh_value((const uint8_t *)wg[e].nib +
+                                (size_t)(kt * gu_nt + le->nt) * 512u,
+                              k, c);
+          if (sum != le->tile[rr * 32u + c])
+            ++i32_bad;
+        }
+      }
+    }
+    free(aq);
+    if (i32_seen != active * gu_nt)
+      fail = 1;
+  }
+  fail |= (i32_bad != 0u);
+
+  /* And the M=1 output against the f32 reference on its own, as the
+     37-row fixture is. */
+  float *want = (float *)malloc(sizeof(float) * M * N_out);
+  reference_layer(M, K, inter, N_out, NE, wg, wd, act, ridx, rc_, rw, want);
+  double worst = 0.0;
+  const uint32_t bad = count_mismatches(out_m1, want, M * N_out, &worst);
+  fail |= (bad != 0u);
+
+  printf("M1 GEMV shape=%s M=%u f32 memcmp=%d i32 exact=%s blocks=%llu "
+         "dma_kb=%llu (path=%llu, hmx blocks=%llu, gate_up tiles=%u, ref "
+         "mismatches=%u worst_rel=%g)\n",
+         shape, M, same != 0, i32_bad == 0u ? "yes" : "NO",
+         (unsigned long long)blocks, (unsigned long long)dma_kb,
+         (unsigned long long)path, (unsigned long long)blocks_hmx, i32_seen,
+         bad, worst);
+
+  for (uint32_t e = 0; e < NE; ++e) {
+    if (rc_[e] == 0u)
+      continue;
+    g_tbl.slots[hg[e]].in_use = 0;
+    g_tbl.slots[hd[e]].in_use = 0;
+    free(wg[e].nib);
+    free(wg[e].ws);
+    free(wg[e].cs);
+    free(wg[e].bias);
+    free(wd[e].nib);
+    free(wd[e].ws);
+    free(wd[e].cs);
+    free(wd[e].bias);
+  }
+  free(wg);
+  free(wd);
+  free(hg);
+  free(hd);
+  free(ridx);
+  free(rw);
+  free(act);
+  free(out_hmx);
+  free(out_m1);
+  free(want);
+  return fail;
+}
+
+/* M=1: four experts one row each; M=2: both tokens share two experts (two
+   rows of a pair to the same expert) and take one more each; M=4: one
+   expert holds all four tokens, then 3, 2 and seven singles. The active
+   experts are spread over the table with empties between them, at a
+   stride coprime to the count so no two land on one slot. */
+static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
+                        hexkl_moe_scratch *scratch) {
+  static const uint32_t counts[3][10] = {
+    {1, 1, 1, 1}, {2, 2, 1, 1, 1, 1}, {4, 3, 2, 1, 1, 1, 1, 1, 1, 1}};
+  static const uint32_t Ms[3] = {1, 2, 4};
+  int fail = 0;
+  for (int shape = 0; shape < 2; ++shape) {
+    const uint32_t K = shape ? 2048 : 64, inter = shape ? 1792 : 32,
+                   N_out = shape ? 2048 : 64, NE = shape ? 32 : 12;
+    uint32_t *rc_ = (uint32_t *)calloc(NE, sizeof(uint32_t));
+    for (int c = 0; c < 3; ++c) {
+      memset(rc_, 0, sizeof(uint32_t) * NE);
+      for (uint32_t i = 0; i < 10 && counts[c][i] != 0u; ++i)
+        rc_[(i * 5u) % NE] = counts[c][i];
+      fail |= run_m1_case(shape ? "real" : "tiny", Ms[c], K, inter, N_out, NE,
+                          rc_, 64u, vtcm, vtcm_bytes, scratch);
+    }
+    free(rc_);
+  }
+  printf(fail
+           ? "M1 GEMV PATH DIFFERS FROM HMX PATH\n"
+           : "M1 GEMV PATH BIT-IDENTICAL TO HMX PATH (M=1,2,4; tiny+real)\n");
+  return fail;
 }
 
 int main(void) {
@@ -490,53 +760,17 @@ int main(void) {
   hexkl_moe_scratch scratch = {NULL, NULL, 0};
   rc = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K,
                                    inter, N_out, NE, hg, hd, ridx, rc_, rw, act,
-                                   got, NULL, &scratch);
+                                   got, NULL, &scratch, 0u);
   printf("run rc=%d  n_rows=%u\n", rc, n_rows);
   if (rc)
     return 1;
 
   /* reference */
   float *want = (float *)calloc(M * N_out, sizeof(float));
-  uint8_t *aq = (uint8_t *)malloc(K);
-  uint8_t *mq = (uint8_t *)malloc(inter);
-  float *gu = (float *)malloc(sizeof(float) * 2 * inter);
-  float *dn = (float *)malloc(sizeof(float) * N_out);
-  float *mid = (float *)malloc(sizeof(float) * inter);
-  uint32_t base = 0;
-  for (uint32_t e = 0; e < NE; ++e) {
-    for (uint32_t i = 0; i < rc_[e]; ++i) {
-      uint32_t row = ridx[base + i];
-      float as;
-      int32_t az;
-      quant_row(act + (size_t)row * K, K, aq, &as, &az);
-      ref_mm(&wg[e], aq, as, az, gu);
-      for (uint32_t j = 0; j < inter; ++j)
-        mid[j] = gu[j] / (1.f + expf(-gu[j])) * gu[inter + j];
-      float ms;
-      int32_t mz;
-      quant_row(mid, inter, mq, &ms, &mz);
-      ref_mm(&wd[e], mq, ms, mz, dn);
-      for (uint32_t c = 0; c < N_out; ++c) {
-        /* Two operations through a volatile, matching what the kernel and
-           the ARM path both do -- see hvx_scale_add_rows_f32's stub. */
-        volatile float p = dn[c] * rw[base + i];
-        want[(size_t)row * N_out + c] = want[(size_t)row * N_out + c] + p;
-      }
-    }
-    base += rc_[e];
-  }
+  reference_layer(M, K, inter, N_out, NE, wg, wd, act, ridx, rc_, rw, want);
 
   double worst = 0.0;
-  uint32_t bad = 0;
-  for (uint32_t i = 0; i < M * N_out; ++i) {
-    double d = fabs((double)got[i] - (double)want[i]);
-    double s = fabs((double)want[i]) + 1e-6;
-    if (d / s > 1e-5) {
-      ++bad;
-    }
-    if (d / s > worst)
-      worst = d / s;
-  }
+  uint32_t bad = count_mismatches(got, want, M * N_out, &worst);
   printf("mismatches=%u of %u   worst_rel=%g\n", bad, M * N_out, worst);
   printf(bad == 0 ? "MOE KERNEL MATCHES REFERENCE\n" : "MOE KERNEL DIFFERS\n");
   int fail = (bad != 0);
@@ -571,13 +805,35 @@ int main(void) {
       fail = 1;
   }
 
+  /* The switch does not apply at M > 4: the same call with the flag set
+     takes the HMX path -- same blocks, same DMA, same bytes. */
+  {
+    float *got_on = (float *)malloc(sizeof(float) * M * N_out);
+    const uint64_t kb_off = hexkl_probe_us[HEXKL_PROBE_DMA_KB];
+    memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
+    int r = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+      ridx, rc_, rw, act, got_on, NULL, &scratch, HEXKL_MOE_FLAG_M1_GEMV);
+    const int same = memcmp(got, got_on, sizeof(float) * M * N_out);
+    printf("M=37 flag on      : rc=%d HMX blocks=%llu dma_kb=%llu (off %llu) "
+           "path=%llu memcmp=%d\n",
+           r, (unsigned long long)hexkl_probe_us[HEXKL_PROBE_BLOCKS],
+           (unsigned long long)hexkl_probe_us[HEXKL_PROBE_DMA_KB],
+           (unsigned long long)kb_off,
+           (unsigned long long)hexkl_probe_us[HEXKL_PROBE_PATH], same != 0);
+    fail |= (r != 0) || hexkl_probe_us[HEXKL_PROBE_BLOCKS] != 5u ||
+            hexkl_probe_us[HEXKL_PROBE_DMA_KB] != kb_off ||
+            hexkl_probe_us[HEXKL_PROBE_PATH] != 0u || same != 0;
+    free(got_on);
+  }
+
   /* --- edge cases the routing can actually produce --------------------- */
   {
     uint32_t z[8] = {0, 0, 0, 0, 0};
     memset(got, 0xA5, sizeof(float) * M * N_out);
     int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
                                         M, K, inter, N_out, NE, hg, hd, ridx, z,
-                                        rw, act, got, NULL, &scratch);
+                                        rw, act, got, NULL, &scratch, 0u);
     int ok = (r == 0);
     for (uint32_t i = 0; i < M * N_out; ++i) {
       if (got[i] != 0.f) {
@@ -592,7 +848,7 @@ int main(void) {
     uint32_t c64[8] = {64, 0, 0, 0, 0};
     int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
                                         M, K, inter, N_out, NE, hg, hd, ridx,
-                                        c64, rw, act, got, NULL, &scratch);
+                                        c64, rw, act, got, NULL, &scratch, 0u);
     printf("exactly 64 rows   : rc=%d\n", r);
     fail |= (r != 0);
   }
@@ -601,7 +857,7 @@ int main(void) {
     uint32_t bad_row[1] = {M};
     int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
                                         M, K, inter, N_out, NE, hg, hd, bad_row,
-                                        c1, rw, act, got, NULL, &scratch);
+                                        c1, rw, act, got, NULL, &scratch, 0u);
     printf("row_index >= M    : rc=%d (want %d)\n", r, AEE_EBADPARM);
     fail |= (r != AEE_EBADPARM);
   }
@@ -622,9 +878,9 @@ int main(void) {
   {
     float *got_on = (float *)malloc(sizeof(float) * M * N_out);
     hexkl_probe_on = 1;
-    int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
-                                        M, K, inter, N_out, NE, hg, hd, ridx,
-                                        rc_, rw, act, got_on, NULL, &scratch);
+    int r = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+      ridx, rc_, rw, act, got_on, NULL, &scratch, 0u);
     fail |= (r != 0);
     const uint64_t desc_on = hexkl_probe_us[HEXKL_PROBE_DMA_DESC];
     hexkl_dma_trace_reset(0);
@@ -632,7 +888,7 @@ int main(void) {
     hexkl_probe_on = 0;
     r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M,
                                     K, inter, N_out, NE, hg, hd, ridx, rc_, rw,
-                                    act, got, NULL, &scratch);
+                                    act, got, NULL, &scratch, 0u);
     fail |= (r != 0);
     const int same = memcmp(got_on, got, sizeof(float) * M * N_out) == 0;
     printf("profile on vs off : memcmp %s (%llu descriptors traced when on)\n",
@@ -676,9 +932,9 @@ int main(void) {
     uint32_t lrc[4] = {1, 1, 1, 1}, lridx[4] = {0, 0, 0, 0};
     float lrw[4] = {0.4f, 0.3f, 0.2f, 0.1f};
     const uint32_t ring0 = g_stub_idx;
-    int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
-                                        1, LK, LI, LN, LNE, lhg, lhd, lridx,
-                                        lrc, lrw, lact, lout, NULL, &scratch);
+    int r = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1, LK, LI, LN, LNE, lhg, lhd,
+      lridx, lrc, lrw, lact, lout, NULL, &scratch, 0u);
     fail |= (r != 0);
     static nntr_moe_dma_item plan[NNTR_MOE_DMA_PLAN_MAX];
     const uint32_t n_plan =
@@ -731,7 +987,9 @@ int main(void) {
     free(lout);
   }
 
+  fail |= run_m1_cases(vtcm, sizeof vtcm, &scratch);
   printf(fail ? "\nFAIL\n" : "\nALL CHECKS PASS\n");
+  free(g_gemv_log);
   hexkl_moe_scratch_free(&scratch);
   return fail;
 }
