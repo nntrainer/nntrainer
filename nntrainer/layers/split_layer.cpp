@@ -112,23 +112,24 @@ void SplitLayer::forwarding(RunLayerContext &context, bool training) {
   const TensorDim in_dim = input_.getDim();
   input_.reshape(input_reshape_helper);
 
+  const size_t in_height = input_reshape_helper.height();
+  const size_t out_height = output_reshape_helper.height();
+  const size_t width = input_reshape_helper.width();
+  const TensorDim src_dim(1, 1, out_height, width, in_dim.getTensorType());
+
   for (unsigned int idx = 0; idx < split_number; idx++) {
     Tensor &output_ = context.getOutput(idx);
     const TensorDim out_dim = output_.getDim();
     output_.reshape(output_reshape_helper);
 
+    const TensorDim dest_dim(1, 1, out_height, width, out_dim.getTensorType());
+
     for (unsigned int batch = 0; batch < input_.batch(); batch++) {
-      const Tensor source_tensor = Tensor::Map(
-        input_.getAddress(batch, 0, idx * output_reshape_helper.height(), 0),
-        output_reshape_helper.height() * input_reshape_helper.width() *
-          sizeof(float),
-        {1, 1, output_reshape_helper.height(), input_reshape_helper.width()});
-      Tensor dest_tensor = Tensor::Map(
-        output_.getAddress(batch, 0, 0, 0),
-        output_reshape_helper.height() * output_reshape_helper.width() *
-          sizeof(float),
-        {1, 1, output_reshape_helper.height(), output_reshape_helper.width()});
-      dest_tensor.copy(source_tensor);
+      const Tensor source_tensor = input_.getSharedDataTensor(
+        src_dim, (batch * in_height + idx * out_height) * width);
+      Tensor dest_tensor =
+        output_.getSharedDataTensor(dest_dim, batch * out_height * width);
+      dest_tensor.copyData(source_tensor);
     }
 
     output_.reshape(out_dim);
@@ -155,8 +156,9 @@ void SplitLayer::incremental_forwarding(RunLayerContext &context,
   const unsigned int B = input_.batch();
   const unsigned int num_steps = to - from; // 1 for decode
   const unsigned int split_w = input_.width() / split_number;
+  const size_t type_size = input_.getDim().getDataTypeSize();
 
-  // For each actual batch and each valid time step, copy only split_w floats
+  // For each actual batch and each valid time step, copy only split_w elements
   // from the chunk at [b, 0, s, idx*split_w] into output[b, 0, s, 0].
   // This is O(B * num_steps * split_number * split_w) vs the full
   // O(B * INIT_SEQ_LEN * split_number * split_w) of forwarding().
@@ -164,9 +166,9 @@ void SplitLayer::incremental_forwarding(RunLayerContext &context,
     for (unsigned int s = 0; s < num_steps; ++s) {
       for (unsigned int idx = 0; idx < split_number; ++idx) {
         Tensor &output_ = context.getOutput(idx);
-        const float *src = input_.getAddress(b, 0, s, idx * split_w);
-        float *dst = output_.getAddress(b, 0, s, 0);
-        std::memcpy(dst, src, split_w * sizeof(float));
+        const char *src = input_.getAddress<char>(b, 0, s, idx * split_w);
+        char *dst = output_.getAddress<char>(b, 0, s, 0);
+        std::memcpy(dst, src, split_w * type_size);
       }
     }
   }
@@ -180,23 +182,24 @@ void SplitLayer::calcDerivative(RunLayerContext &context) {
   const TensorDim in_dim = input_.getDim();
   input_.reshape(input_reshape_helper);
 
+  const size_t in_height = input_reshape_helper.height();
+  const size_t out_height = output_reshape_helper.height();
+  const size_t width = input_reshape_helper.width();
+  const TensorDim dest_dim(1, 1, out_height, width, in_dim.getTensorType());
+
   for (unsigned int idx = 0; idx < split_number; idx++) {
     Tensor output_ = context.getIncomingDerivative(idx);
     const TensorDim out_dim = output_.getDim();
     output_.reshape(output_reshape_helper);
 
+    const TensorDim src_dim(1, 1, out_height, width, out_dim.getTensorType());
+
     for (unsigned int batch = 0; batch < input_.batch(); batch++) {
-      Tensor dest_tensor = Tensor::Map(
-        input_.getAddress(batch, 0, idx * output_reshape_helper.height(), 0),
-        output_reshape_helper.height() * input_reshape_helper.width() *
-          sizeof(float),
-        {1, 1, output_reshape_helper.height(), input_reshape_helper.width()});
-      const Tensor source_tensor = Tensor::Map(
-        output_.getAddress(batch, 0, 0, 0),
-        output_reshape_helper.height() * output_reshape_helper.width() *
-          sizeof(float),
-        {1, 1, output_reshape_helper.height(), output_reshape_helper.width()});
-      dest_tensor.copy(source_tensor);
+      Tensor dest_tensor = input_.getSharedDataTensor(
+        dest_dim, (batch * in_height + idx * out_height) * width);
+      const Tensor source_tensor =
+        output_.getSharedDataTensor(src_dim, batch * out_height * width);
+      dest_tensor.copyData(source_tensor);
     }
 
     output_.reshape(out_dim);
