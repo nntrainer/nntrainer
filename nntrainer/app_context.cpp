@@ -532,7 +532,7 @@ int AppContext::registerLayer(const std::string &library_path,
 
   void *handle = DynamicLibraryLoader::loadLibrary(full_path.c_str(),
                                                    RTLD_LAZY | RTLD_LOCAL);
-  const char *error_msg = DynamicLibraryLoader::getLastError();
+  std::string error_msg = DynamicLibraryLoader::getLastError();
 
   NNTR_THROW_IF(handle == nullptr, std::invalid_argument)
     << func_tag << "open plugin failed, reason: " << error_msg;
@@ -543,7 +543,7 @@ int AppContext::registerLayer(const std::string &library_path,
 
   error_msg = DynamicLibraryLoader::getLastError();
   auto close_dl = [handle] { DynamicLibraryLoader::freeLibrary(handle); };
-  NNTR_THROW_IF_CLEANUP(error_msg != nullptr || pluggable == nullptr,
+  NNTR_THROW_IF_CLEANUP(!error_msg.empty() || pluggable == nullptr,
                         std::invalid_argument, close_dl)
     << func_tag << "loading symbol failed, reason: " << error_msg;
 
@@ -572,7 +572,7 @@ int AppContext::registerOptimizer(const std::string &library_path,
 
   void *handle = DynamicLibraryLoader::loadLibrary(full_path.c_str(),
                                                    RTLD_LAZY | RTLD_LOCAL);
-  const char *error_msg = DynamicLibraryLoader::getLastError();
+  std::string error_msg = DynamicLibraryLoader::getLastError();
 
   NNTR_THROW_IF(handle == nullptr, std::invalid_argument)
     << func_tag << "open plugin failed, reason: " << error_msg;
@@ -583,7 +583,7 @@ int AppContext::registerOptimizer(const std::string &library_path,
 
   error_msg = DynamicLibraryLoader::getLastError();
   auto close_dl = [handle] { DynamicLibraryLoader::freeLibrary(handle); };
-  NNTR_THROW_IF_CLEANUP(error_msg != nullptr || pluggable == nullptr,
+  NNTR_THROW_IF_CLEANUP(!error_msg.empty() || pluggable == nullptr,
                         std::invalid_argument, close_dl)
     << func_tag << "loading symbol failed, reason: " << error_msg;
 

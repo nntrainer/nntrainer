@@ -45,7 +45,11 @@ class DynamicLibraryLoader {
 public:
   static void *loadLibrary(const char *path, [[maybe_unused]] const int flag) {
 #if defined(_WIN32)
-    return LoadLibraryA(path);
+    HMODULE handle = LoadLibraryA(path);
+    if (handle != nullptr) {
+      SetLastError(ERROR_SUCCESS);
+    }
+    return handle;
 #else
     return dlopen(path, flag);
 #endif
@@ -59,17 +63,38 @@ public:
 #endif
   }
 
-  static const char *getLastError() {
+  /**
+   * @brief Error reported by the most recent loader call
+   *
+   * @return error description, empty when the last call did not fail
+   *
+   * @note Follows the dlerror() contract: an empty result means "no error" and
+   * reading the error consumes it, so a second call returns an empty string
+   * until another loader call fails. On Windows the thread error is sticky and
+   * process-wide, so loadLibrary()/loadSymbol() clear it on success to keep an
+   * error raised by unrelated code from being reported as a loader failure.
+   */
+  static std::string getLastError() {
 #if defined(_WIN32)
-    return std::to_string(GetLastError()).c_str();
+    const DWORD code = GetLastError();
+    if (code == ERROR_SUCCESS) {
+      return std::string();
+    }
+    SetLastError(ERROR_SUCCESS);
+    return std::to_string(code);
 #else
-    return dlerror();
+    const char *error = dlerror();
+    return error == nullptr ? std::string() : std::string(error);
 #endif
   }
 
   static void *loadSymbol(void *handle, const char *symbol_name) {
 #if defined(_WIN32)
-    return GetProcAddress((HMODULE)handle, symbol_name);
+    FARPROC symbol = GetProcAddress((HMODULE)handle, symbol_name);
+    if (symbol != nullptr) {
+      SetLastError(ERROR_SUCCESS);
+    }
+    return symbol;
 #else
     return dlsym(handle, symbol_name);
 #endif

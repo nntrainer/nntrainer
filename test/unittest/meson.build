@@ -78,6 +78,7 @@ test_target = [
   ['unittest_nntrainer_save_with_dtype', []],
   ['unittest_safetensors_quantize', []],
   ['unittest_thread_manager', []],
+  ['unittest_dynamic_library_loader', []],
   #['unittest_nntrainer_task', []],
 ]
 
