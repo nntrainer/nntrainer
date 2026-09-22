@@ -41,3 +41,5 @@ mkdir -p "$OUT_DIR"
 rm -f "$OUT_DIR/nntr_hvx_skel.c"
 
 echo "generated: $OUT_DIR/nntr_hvx.h, $OUT_DIR/nntr_hvx_stub.c"
+echo "NOTE: this is the ARM client stub only. The DSP skel is generated and"
+echo "      built separately by test/htp/build.sh -- an IDL change needs BOTH."
