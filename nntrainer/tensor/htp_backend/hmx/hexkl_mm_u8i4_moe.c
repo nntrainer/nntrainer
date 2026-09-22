@@ -504,10 +504,10 @@ static inline void moe_m1_pf_gu(const moe_m1_ctx *c, uint32_t b0, uint32_t b1,
  *         moe_tail_pair_unit's body on that expert's buffers.
  *
  * With a lead, block b+1's gate box goes out before block b's first gate
- * column and its up box before block b's first up column. The hardware
+ * column and its up box after block b's last gate column. The hardware
  * queues three l2fetch per thread and stalls on a fourth, so this keeps
- * at most three outstanding while the current block's gate box -- whose
- * column was just read -- retires. */
+ * at most three outstanding: by the time the fourth box goes out, every
+ * column of block b's gate box has been read. */
 static void moe_m1_pair_worker(uint32_t n_lanes, uint32_t i, void *v) {
   const moe_m1_ctx *c = (const moe_m1_ctx *)v;
   const int lead = HVX_GEMV_PF_LEAD_KB != 0u;
@@ -532,7 +532,7 @@ static void moe_m1_pair_worker(uint32_t n_lanes, uint32_t i, void *v) {
       }
       (lead ? hvx_gemm_u8i4_wh_col_nopf : hvx_gemm_u8i4_wh_col)(
         e->act_ah, e->m, c->k_tiles, e->g->wh_bytes, c->gu_ntiles, j, tiles);
-      if (lead && u == b0 && b1 < n1) {
+      if (lead && u + 1u == b1 && b1 < n1) {
         moe_m1_pf_gu(c, b1, n1, 1u);
       }
       (lead ? hvx_gemm_u8i4_wh_col_nopf : hvx_gemm_u8i4_wh_col)(

@@ -108,7 +108,8 @@ static void gemv_stand_in(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
    column computed without its own l2fetch must find its bit in one of them,
    unconsumed, from its own lane -- so it was covered, ahead of it, at most
    two blocks earlier, and fetched once. Every box must also sit inside its
-   weight's columns and fit the l2fetch's 16-bit fields. */
+   weight's columns, fit the l2fetch's 16-bit fields, and go out with at
+   most two others still unread. */
 #define PF_LANES 6u
 #define PF_RING 4u
 typedef struct {
@@ -133,6 +134,19 @@ void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
            g_lane, nt, n_tiles, n_col, k_tiles);
     ++g_pf_bad;
     return;
+  }
+  /* The hardware queues three l2fetch per thread and stalls it on a
+     fourth. A box counts as outstanding until every column of it was read
+     (a fetch finishes no later than the loads that need all of it). */
+  uint32_t outstanding = 0;
+  for (uint32_t k = 0; k < PF_RING; ++k) {
+    const pf_box *o = &g_pf[g_lane][k];
+    outstanding +=
+      o->wh && o->used != ((o->n == 64u) ? ~0ull : ((1ull << o->n) - 1u));
+  }
+  if (outstanding >= 3u) {
+    printf("PF fourth box outstanding: lane=%u nt=%u\n", g_lane, nt);
+    ++g_pf_bad;
   }
   pf_box *b = &g_pf[g_lane][g_pf_head[g_lane]++ % PF_RING];
   /* A box leaving the ring with columns unconsumed was a fetch nothing
