@@ -37,6 +37,7 @@
 
 #include <acti_func.h>
 #include <common_properties.h>
+#include <compute_ops.h>
 #include <cpu_backend.h>
 #include <layer_impl.h>
 #include <limits.h>
@@ -375,6 +376,30 @@ private:
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
   bool skip_prefill = false;
+
+  /**
+   * @brief The ComputeOps this layer's context resolves to, captured at
+   *        the start of each forwarding so the per-batch helpers (which
+   *        take no context) can ask it for an accelerated attention.
+   *        nullptr means "CPU only", which is also what get_cpu_ops()'s
+   *        supports_sdpa_fp16_kvcache() answers.
+   */
+  nntrainer::ComputeOps *compute_ops_ = nullptr;
+
+  /**
+   * @brief Runs steps 2-4 (Q.K^T, softmax, .V) of one batch on the
+   *        accelerator when the context's ComputeOps offers one and the
+   *        shape fits its contract (causal, f32 query/output, fp16 cache).
+   *
+   * @return true if attention_output_step now holds the result; false
+   *         means nothing was written and the CPU path must run.
+   */
+  bool try_accelerated_attention(nntrainer::Tensor &query_step,
+                                 nntrainer::Tensor &cached_key,
+                                 nntrainer::Tensor &cached_value,
+                                 nntrainer::Tensor &attention_output_step,
+                                 unsigned int cache_from, unsigned int cache_to,
+                                 const float *sinks);
 
   enum INOUT_INDEX {
     /** input index */

@@ -37,29 +37,15 @@
 #define HVX_CONVERT_MAGIC_BITS 0x4B400000u
 
 /**
- * @brief Converts int32 lanes to f32 lanes. Exact for |x| <= 2^22.
- *
- * HVX_Vector is type-agnostic: passing it directly to an f32 intrinsic
- * reinterprets the bits without conversion. Q6_Vsf_equals_Vw /
- * Q6_Vw_equals_Vsf look like reinterpret but are in fact NUMERIC
- * conversions (V79 HVX Programmer's Reference Manual: "Convert IEEE
- * floating point to integer... round to zero"), which would destroy the
- * magic-number identity.
- */
-static inline HVX_Vector hvx_w_to_sf(HVX_Vector v) {
-  const HVX_Vector magic = Q6_V_vsplat_R(HVX_CONVERT_MAGIC_BITS);
-  const HVX_Vector bits = Q6_Vw_vadd_VwVw(v, magic);
-  return Q6_Vsf_vsub_VsfVsf(bits, magic);
-}
-
-/**
  * @brief Converts f32 lanes to int32 lanes, rounding to nearest even.
  *
  * The rounding comes from the float add, so it is round-to-nearest-even.
  * Host references that compare against this must use nearbyint, not round.
  * Valid for results in |x| <= 2^22.
  *
- * Same reinterpret note as hvx_w_to_sf: the cross-type handoff is implicit.
+ * The cross-type handoff between sf and w intrinsics is implicit: HVX_Vector
+ * is type-agnostic, so the same vector flows from Q6_Vsf_vadd_VsfVsf to
+ * Q6_Vw_vsub_VwVw without an explicit convert.
  */
 static inline HVX_Vector hvx_sf_to_w_rne(HVX_Vector v) {
   const HVX_Vector magic = Q6_V_vsplat_R(HVX_CONVERT_MAGIC_BITS);
