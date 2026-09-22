@@ -286,6 +286,9 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
   assert(nr % 4 == 0);
   assert(nc % ncols_interleaved == 0);
 
+/// @note the kernel below is hand encoded (.inst) and issues SMMLA, so it
+/// assembles whatever -march says and would trap on a CPU without i8mm
+#if defined(__ARM_FEATURE_MATMUL_INT8)
   const void *b_ptr = vx;
   const void *a_ptr = vy;
   float *res_ptr = s;
@@ -686,6 +689,53 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
                          "v30", "v31", "x9", "x10", "x20", "x21", "x22", "x23",
                          "x24", "x25", "x26", "x27", "x28");
   return;
+#else
+  float sumf[4][4];
+  int sumi;
+
+  for (int y = 0; y < nr / 4; y++) {
+    const block_q8_0x4 *a_ptr = (const block_q8_0x4 *)vy + (y * nb);
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+      const block_q4_0x4 *b_ptr = (const block_q4_0x4 *)vx + (x * nb);
+      for (int m = 0; m < 4; m++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          sumf[m][j] = 0.0;
+        }
+      }
+      for (int l = 0; l < nb; l++) {
+        for (int k = 0; k < (qk / (2 * blocklen)); k++) {
+          for (int m = 0; m < 4; m++) {
+            for (int j = 0; j < ncols_interleaved; j++) {
+              sumi = 0;
+              for (int i = 0; i < blocklen; ++i) {
+                const int v0 =
+                  (int8_t)(b_ptr[l].qs[k * ncols_interleaved * blocklen +
+                                       j * blocklen + i]
+                           << 4);
+                const int v1 =
+                  (int8_t)(b_ptr[l].qs[k * ncols_interleaved * blocklen +
+                                       j * blocklen + i] &
+                           0xF0);
+                sumi +=
+                  ((v0 * a_ptr[l].qs[k * 4 * blocklen + m * blocklen + i]) +
+                   (v1 * a_ptr[l].qs[k * 4 * blocklen + m * blocklen + i +
+                                     qk / 2 * 4])) >>
+                  4;
+              }
+              sumf[m][j] += sumi * nntr_compute_fp16_to_fp32(b_ptr[l].d[j]) *
+                            nntr_compute_fp16_to_fp32(a_ptr[l].d[m]);
+            }
+          }
+        }
+      }
+      for (int m = 0; m < 4; m++) {
+        for (int j = 0; j < ncols_interleaved; j++) {
+          s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
+        }
+      }
+    }
+  }
+#endif
 }
 
 #ifdef ENABLE_FP16
