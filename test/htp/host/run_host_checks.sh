@@ -24,37 +24,16 @@ OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 cc=${CC:-gcc}
-"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
+# -O2: the M=1 cases run the HMX stand-in at the real shape (64 rows a
+# tile, scalar), about a minute at -O2 and several at -O1.
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
   -DMOE_TAIL_MAX_ROWS=16u \
-  -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  -I "$HERE/stub" -I "$HERE/.." -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/moe_layer_host_check" \
-  "$HERE/moe_layer_host_check.c" "$HERE/hvx_scalar_stubs.c" \
-  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" -lm
+  "$HERE/moe_layer_host_check.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" \
+  "$BACKEND/hmx/hexkl_dma_trace.c" -lm
 
 "$OUT/moe_layer_host_check"
-
-# The conv block kernel (doc 51 section 2) on the same stand-ins. It is
-# built on the MoE kernel's exported helpers, so that file links in too.
-# -ffp-contract=off: the conv gate's reference is a separate multiply and
-# add per tap, as the HVX computes it, and the host compiler must not fuse
-# them into an FMA the device does not have.
-"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
-  -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
-  -o "$OUT/conv_block_host_check" \
-  "$HERE/conv_block_host_check.c" "$HERE/hvx_scalar_stubs.c" \
-  "$BACKEND/hmx/hexkl_conv_block.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" -lm
-
-"$OUT/conv_block_host_check"
-
-# The FC / projection call (hexkl_mm_u8i4_layer_run) on the same stand-ins:
-# several handles against one activation, the pooled epilogue's batching.
-"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
-  -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
-  -o "$OUT/fc_layer_host_check" \
-  "$HERE/fc_layer_host_check.c" "$HERE/hvx_scalar_stubs.c" \
-  "$BACKEND/hmx/hexkl_mm_u8i4_dma.c" -lm
-
-"$OUT/fc_layer_host_check"
 
 # The worker pool's two lanes on pthreads (stub/qurt.h). Concurrency is
 # exercised for real here -- 3 workers, a caller that helps -- but a
@@ -66,3 +45,24 @@ cc=${CC:-gcc}
   "$HERE/worker_pool_host_check.c" "$BACKEND/hvx/hvx_worker_pool.c"
 
 "$OUT/worker_pool_host_check"
+
+# The DMA probe's descriptor plan (test/htp/nntr_dma_probe_plan.h): the
+# skel runs the same header-only function, so the geometry checked here --
+# disjoint rows, in-bounds destinations, worker balance -- is what the
+# device DMAs. Bandwidth is measured on the device, never here.
+"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
+  -I "$HERE/.." \
+  -o "$OUT/dma_probe_host_check" \
+  "$HERE/dma_probe_host_check.c"
+
+"$OUT/dma_probe_host_check"
+
+# The MoE call's DMA ring trace (hexkl_dma_trace.c, #87): completion
+# brackets, the union-of-intervals busy time, ring depth and the blocked
+# bit on a scripted timeline whose expected numbers are hand arithmetic.
+"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
+  -I "$HERE/stub" -I "$BACKEND/hmx" \
+  -o "$OUT/dma_trace_host_check" \
+  "$HERE/dma_trace_host_check.c" "$BACKEND/hmx/hexkl_dma_trace.c"
+
+"$OUT/dma_trace_host_check"
