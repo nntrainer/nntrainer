@@ -34,6 +34,9 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 
+static_assert(ml::train::TensorDim::MAXDIM <= ML_TENSOR_RANK_LIMIT,
+              "TensorDim::MAXDIM does not fit in ml_tensor_dimension");
+
 /**
  * @brief   Global lock for nntrainer C-API
  * @details This lock ensures that ml_train_model_destroy is thread safe. All
@@ -1241,12 +1244,14 @@ int ml_train_model_get_input_tensors_info(ml_train_model_h model,
       return status;
     }
 
-    std::vector<unsigned int> u_dim;
+    /// @note u_dim must stay a full, zero-initialized ml_tensor_dimension:
+    /// its type lets the callee read every ML_TENSOR_RANK_LIMIT entry.
+    ml_tensor_dimension u_dim = {0};
 
     for (unsigned int j = 0; j < dims[i].getNumDim(); j++)
-      u_dim.push_back(dims[i].getDim()[j]);
+      u_dim[j] = dims[i].getDim()[j];
 
-    status = ml_tensors_info_set_tensor_dimension(*info, i, u_dim.data());
+    status = ml_tensors_info_set_tensor_dimension(*info, i, u_dim);
     if (status != ML_ERROR_NONE) {
       ml_tensors_info_destroy(*info);
       return status;
@@ -1305,12 +1310,14 @@ int ml_train_model_get_output_tensors_info(ml_train_model_h model,
       return status;
     }
 
-    std::vector<unsigned int> u_dim;
+    /// @note u_dim must stay a full, zero-initialized ml_tensor_dimension:
+    /// its type lets the callee read every ML_TENSOR_RANK_LIMIT entry.
+    ml_tensor_dimension u_dim = {0};
 
     for (unsigned int j = 0; j < dims[i].getNumDim(); j++)
-      u_dim.push_back(dims[i].getDim()[j]);
+      u_dim[j] = dims[i].getDim()[j];
 
-    status = ml_tensors_info_set_tensor_dimension(*info, i, u_dim.data());
+    status = ml_tensors_info_set_tensor_dimension(*info, i, u_dim);
     if (status != ML_ERROR_NONE) {
       ml_tensors_info_destroy(*info);
       return status;
@@ -1420,12 +1427,14 @@ int ml_train_model_get_weight(ml_train_model_h model, const char *layer_name,
       return status;
     }
 
-    std::vector<unsigned int> u_dim;
+    /// @note u_dim must stay a full, zero-initialized ml_tensor_dimension:
+    /// its type lets the callee read every ML_TENSOR_RANK_LIMIT entry.
+    ml_tensor_dimension u_dim = {0};
 
     for (unsigned int j = 0; j < dims[i].getNumDim(); j++)
-      u_dim.push_back(dims[i].getDim()[j]);
+      u_dim[j] = dims[i].getDim()[j];
 
-    status = ml_tensors_info_set_tensor_dimension(*info, i, u_dim.data());
+    status = ml_tensors_info_set_tensor_dimension(*info, i, u_dim);
     if (status != ML_ERROR_NONE) {
       ml_tensors_info_destroy(*info);
       return status;
