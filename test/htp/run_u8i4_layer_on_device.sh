@@ -133,16 +133,19 @@ fi
     APP_BUILD_SCRIPT=./Android.mk \
     NNTRAINER_ROOT="$REPO_ROOT" \
     HEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
-    unittest_hvx_mm_u8i4
+    unittest_hvx_mm_u8i4 unittest_hvx_attn_f16
 )
 TEST_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_mm_u8i4"
 [ -f "$TEST_BIN" ] || fail "test binary did not build: $TEST_BIN"
+ATTN_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_attn_f16"
+[ -f "$ATTN_BIN" ] || fail "test binary did not build: $ATTN_BIN"
 
 # --- 4. push + run -----------------------------------------------------------
 log "4/4  Pushing to $DEVICE:$DEVICE_TMP and running"
 adb shell "mkdir -p $DEVICE_TMP"
 adb push "$SKEL" "$DEVICE_TMP/" >/dev/null
 adb push "$TEST_BIN" "$DEVICE_TMP/" >/dev/null
+adb push "$ATTN_BIN" "$DEVICE_TMP/" >/dev/null
 # c++_shared runtime the test binary links against (APP_STL in Application.mk).
 # The prebuilt directory is named after the build host, so glob it rather
 # than assuming linux-x86_64.
@@ -157,13 +160,19 @@ fi
 
 echo "  (unsigned-PD enable happens inside the test itself via remote_session_control)"
 adb shell "cd $DEVICE_TMP && \
-  chmod +x unittest_hvx_mm_u8i4 && \
+  chmod +x unittest_hvx_mm_u8i4 unittest_hvx_attn_f16 && \
   LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
-  ./unittest_hvx_mm_u8i4" 2>&1 | tee "$RUN_LOG"
+  ./unittest_hvx_mm_u8i4 && \
+  LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
+  ./unittest_hvx_attn_f16" 2>&1 | tee "$RUN_LOG"
 
 echo
 log "Summary"
-grep -E "^\[  (PASSED|FAILED)|U8I[48]_FIELD" "$RUN_LOG" || true
+grep -E "^\[  (PASSED|FAILED)|U8I[48]_FIELD|ATTN_F16_FIELD" "$RUN_LOG" || true
+echo
+echo "fp16 attention gate: every ATTN_F16_FIELD probe=... value=1 (a 0 means"
+echo "the hand-built tile layouts differ from HexKL's on this part -- stop"
+echo "there), then every HmxAttnF16 test PASSED with snr_db above 40."
 echo
 echo "Full log: $RUN_LOG"
 echo "Gate to clear before building on top of this: all PASSED, and the"

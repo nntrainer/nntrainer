@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 
+#include "hexkl_kv_tiles_f16.h"
 #include "hexkl_mm_u8i4_dma.h"
 #include "hexkl_mm_u8i8_dma.h"
 #include "hvx_worker_pool.h"
@@ -34,10 +35,14 @@
 typedef struct {
   uint8_t *vtcm_base;
   uint32_t vtcm_size;
-  uint32_t config_off; /**< session-constant: depends only on vtcm_size */
-  int hmx_locked;      /**< close() only unlocks/finalizes what open() set up */
+  uint32_t config_off;    /**< session-constant: depends only on vtcm_size */
+  uint32_t hmx_fp16_rate; /**< HMX fp16 MACs/cycle from hw_init; 0 means
+                               this part has no fp16 HMX and every f16
+                               entry point must return AEE_EUNSUPPORTED */
+  int hmx_locked; /**< close() only unlocks/finalizes what open() set up */
   hexkl_weight_u8i4_table weights_u8i4;
   hexkl_weight_u8i8_table weights_u8i8;
+  hexkl_kv_tiles_f16_table kv_tiles; /**< resident fp16 KV tile caches */
   hvx_worker_pool *quant_pool; /**< sized from the HVX unit count in open() */
 } nntr_hvx_session;
 
