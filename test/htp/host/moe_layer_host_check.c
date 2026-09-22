@@ -76,7 +76,7 @@ static void gemv_log_reset(void) { g_gemv_n = 0; }
 
 /* The HVX GEMM's stand-in: the same sum, over the tiles the kernel points
    it at, into the row-stride-32 tile the header promises. */
-void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+static void gemv_stand_in(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
                           const uint8_t *wh, uint32_t n_col, uint32_t nt,
                           int32_t *out) {
   for (uint32_t r = 0; r < m; ++r)
@@ -100,6 +100,80 @@ void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
   le->nt = nt;
   le->m = m > 4u ? 4u : m;
   memcpy(le->tile, out, sizeof(int32_t) * 32u * le->m);
+}
+
+/* ---- The M=1 path's l2fetch lead (HVX_GEMV_PF_LEAD_KB), per lane -------
+   The pool stand-in below sets g_lane. Each lane keeps its last PF_RING
+   boxes (two blocks of stage A's gate + up pair) with a bit per column; a
+   column computed without its own l2fetch must find its bit in one of them,
+   unconsumed, from its own lane -- so it was covered, ahead of it, at most
+   two blocks earlier, and fetched once. Every box must also sit inside its
+   weight's columns and fit the l2fetch's 16-bit fields. */
+#define PF_LANES 6u
+#define PF_RING 4u
+typedef struct {
+  const uint8_t *wh;
+  uint32_t n_col, k_tiles, nt0, n;
+  uint64_t used; /* bit t: column nt0 + t consumed */
+} pf_box;
+static pf_box g_pf[PF_LANES][PF_RING];
+static uint32_t g_pf_head[PF_LANES];
+static uint32_t g_lane;
+static uint64_t g_pf_cols, g_pf_used, g_pf_bad, g_nopf_n, g_col_n;
+static void pf_reset(void) {
+  memset(g_pf, 0, sizeof g_pf);
+  memset(g_pf_head, 0, sizeof g_pf_head);
+  g_pf_cols = g_pf_used = g_pf_bad = g_nopf_n = g_col_n = 0;
+}
+void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                               uint32_t n_tiles, uint32_t k_tiles) {
+  if (n_tiles == 0u || n_tiles > 64u || nt + n_tiles > n_col ||
+      n_col * 512u > 0xFFFFu || n_tiles * 512u > 0xFFFFu || k_tiles > 0xFFFFu) {
+    printf("PF box out of range: lane=%u nt=%u n=%u n_col=%u k_tiles=%u\n",
+           g_lane, nt, n_tiles, n_col, k_tiles);
+    ++g_pf_bad;
+    return;
+  }
+  pf_box *b = &g_pf[g_lane][g_pf_head[g_lane]++ % PF_RING];
+  /* A box leaving the ring with columns unconsumed was a fetch nothing
+     read ahead of time: over-fetch, or a lead longer than two blocks. */
+  if (b->wh && b->used != ((b->n == 64u) ? ~0ull : ((1ull << b->n) - 1u)))
+    ++g_pf_bad;
+  b->wh = wh;
+  b->n_col = n_col;
+  b->k_tiles = k_tiles;
+  b->nt0 = nt;
+  b->n = n_tiles;
+  b->used = 0;
+  g_pf_cols += n_tiles;
+}
+void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
+                               uint32_t k_tiles, const uint8_t *wh,
+                               uint32_t n_col, uint32_t nt, int32_t *out) {
+  int found = 0;
+  for (uint32_t k = 0; k < PF_RING && !found; ++k) {
+    pf_box *b = &g_pf[g_lane][k];
+    if (b->wh == wh && b->n_col == n_col && b->k_tiles == k_tiles &&
+        nt >= b->nt0 && nt < b->nt0 + b->n &&
+        !(b->used & (1ull << (nt - b->nt0)))) {
+      b->used |= 1ull << (nt - b->nt0);
+      ++g_pf_used;
+      found = 1;
+    }
+  }
+  if (!found) {
+    printf("PF column not covered: lane=%u nt=%u n_col=%u\n", g_lane, nt,
+           n_col);
+    ++g_pf_bad;
+  }
+  ++g_nopf_n;
+  gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, out);
+}
+void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                          const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                          int32_t *out) {
+  ++g_col_n;
+  gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, out);
 }
 int hexkl_micro_hmx_acc_read_int32(uint8_t *base, uint32_t cfg, uint32_t off) {
   (void)cfg;
@@ -234,11 +308,23 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units) {
   (void)pool;
-  /* One slice covering everything. Writing this the way the real function's
-     degenerate branch used to be written -- func(n_units, 0, ctx) -- is what
-     this check caught first time out: that form means "worker 0 of n_units"
+  /* The device's lane count, n = min(n_units, 6), one lane after another,
+     so each lane's slice and its l2fetch boxes are checked as the device
+     splits them. The degenerate branch is func(1, 0): writing it the way
+     the real function's used to be -- func(n_units, 0, ctx) -- is what this
+     check caught first time out; that form means "worker 0 of n_units"
      and does 1/n_units of the work. */
-  func(1u, 0, ctx);
+  const uint32_t n = n_units < PF_LANES ? n_units : PF_LANES;
+  if (n <= 1u) {
+    g_lane = 0;
+    func(1u, 0, ctx);
+    return;
+  }
+  for (uint32_t i = 0; i < n; ++i) {
+    g_lane = i;
+    func(n, i, ctx);
+  }
+  g_lane = 0;
 }
 /* submit runs the job to completion on the spot and wait is a no-op: the
    harness cannot exercise the overlap, only that every job is submitted
@@ -532,6 +618,7 @@ static void make_weight(uint32_t slot, uint32_t K, uint32_t N, W *w) {
    HVX GEMV's int32 equals the HMX's on silicon is the device gtest's.
    The log of GEMV tiles is then held against a reference built from the
    token rows the routing names, independently of the kernel's slot pack. */
+static int g_pf_lead_ok = 1;
 static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
                        uint32_t inter, uint32_t N_out, uint32_t NE,
                        const uint32_t *rc_, uint32_t slot0, uint8_t *vtcm,
@@ -584,6 +671,7 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
 
   memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
   gemv_log_reset();
+  pf_reset();
   r = hexkl_mm_u8i4_moe_layer_run(
     &g_tbl, vtcm, vtcm_bytes, vtcm_bytes, M, K, inter, N_out, NE, hg, hd, ridx,
     rc_, rw, act, out_m1, NULL, scratch, HEXKL_MOE_FLAG_M1_GEMV);
@@ -592,6 +680,27 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   const uint64_t path = hexkl_probe_us[HEXKL_PROBE_PATH];
   const int same = memcmp(out_hmx, out_m1, sizeof(float) * M * N_out);
   fail |= (r != 0) || blocks != 0u || dma_kb != 0u || path != 1u || same != 0;
+
+  /* The lead: with it, every GEMV column went through the prefetch-free
+     call, each covered once by its own lane's box (no double fetch, no
+     over-fetch); without it, every column fetched itself as before. */
+  const uint64_t cols = (uint64_t)active * ((2u * inter + N_out) / 32u);
+  const int pf_ok =
+    g_pf_bad == 0u &&
+    (HVX_GEMV_PF_LEAD_KB != 0u
+       ? (g_col_n == 0u && g_nopf_n == cols && g_pf_cols == cols &&
+          g_pf_used == cols)
+       : (g_nopf_n == 0u && g_pf_cols == 0u && g_col_n == cols));
+  if (!pf_ok) {
+    printf("M1 GEMV shape=%s M=%u PF lead=%u: boxes=%llu cols covered=%llu "
+           "nopf=%llu self-prefetched=%llu bad=%llu (want %llu columns)\n",
+           shape, M, (unsigned)HVX_GEMV_PF_LEAD_KB,
+           (unsigned long long)g_pf_cols, (unsigned long long)g_pf_used,
+           (unsigned long long)g_nopf_n, (unsigned long long)g_col_n,
+           (unsigned long long)g_pf_bad, (unsigned long long)cols);
+    fail = 1;
+  }
+  g_pf_lead_ok &= pf_ok;
 
   /* The logged gate_up tiles, row by row, against the routing's token row
      quantized by the reference's own quantizer. Down tiles are not held
@@ -706,6 +815,10 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
   printf(fail
            ? "M1 GEMV PATH DIFFERS FROM HMX PATH\n"
            : "M1 GEMV PATH BIT-IDENTICAL TO HMX PATH (M=1,2,4; tiny+real)\n");
+  printf(g_pf_lead_ok ? "M1 GEMV PREFETCH LEAD COVERS EVERY COLUMN (lanes=%u; "
+                        "lead %u KB)\n"
+                      : "M1 GEMV PREFETCH LEAD WRONG (lanes=%u; lead %u KB)\n",
+         PF_LANES, (unsigned)HVX_GEMV_PF_LEAD_KB);
   return fail;
 }
 

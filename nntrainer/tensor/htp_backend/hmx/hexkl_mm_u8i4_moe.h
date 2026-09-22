@@ -130,4 +130,18 @@ int hexkl_mm_u8i4_moe_layer_run(
  */
 #define HEXKL_MOE_FLAG_M1_GEMV 1u
 
+/**
+ * @brief The M=1 GEMV path's l2fetch lead, in KB of weight per lane: a
+ *        lane issues the box of its next block of units -- that many KB of
+ *        adjacent columns, at least one unit, never across an expert --
+ *        before it computes the current one, so each block's weight is on
+ *        its way to L2 a block ahead. 0 is the old behaviour: every column
+ *        issues its own l2fetch right before its loads. A hint only; no
+ *        result depends on it. A build-time knob, like hvx_impl's
+ *        HTP_MM_NO_PREFETCH: HEX_EXTRA_CFLAGS=-DHVX_GEMV_PF_LEAD_KB=<n>.
+ */
+#ifndef HVX_GEMV_PF_LEAD_KB
+#define HVX_GEMV_PF_LEAD_KB 64u
+#endif
+
 #endif /* __NNTRAINER_HEXKL_MM_U8I4_MOE_H__ */
