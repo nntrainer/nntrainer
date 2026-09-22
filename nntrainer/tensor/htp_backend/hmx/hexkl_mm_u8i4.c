@@ -12,16 +12,14 @@
 
 #include <AEEStdErr.h>
 
+#include "hexkl_hmx_geom.h"
 #include "hexkl_micro.h"
 
 #include "hexkl_mm_u8i4.h"
 
-#define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
-
-/** @brief Bytes in one packed i4 weight tile (32x32 values). */
-#define WEIGHT_TILE_BYTES 512u
-/** @brief Bytes in one int32 accumulator tile (64x32 values). */
-#define ACC_TILE_BYTES 8192u
+#define WEIGHT_TILE_BYTES HEXKL_WEIGHT_TILE_BYTES_I4
+#define ACC_TILE_BYTES HEXKL_ACC_TILE_BYTES
+#define ROUND_UP_U32(v, a) HEXKL_ROUND_UP_U32(v, a)
 
 int hexkl_mm_u8i4_plan(uint8_t *vtcm_base, uint32_t vtcm_size, uint32_t m_pad,
                        uint32_t k, uint32_t n, hexkl_mm_u8i4_layout *out) {
