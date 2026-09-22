@@ -19,6 +19,13 @@
 #include <random>
 #include <tuple>
 #include <vector>
+#if defined(__linux__) || defined(__ANDROID__)
+#include <cstring>
+#include <setjmp.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <chrono>
 #include <iostream>
@@ -942,6 +949,186 @@ TEST(nntrainer_cpu_backend_standalone, gemm_benchmark_comparison_32x1024x4096) {
 TEST(nntrainer_cpu_backend_standalone, gemm_benchmark_comparison_1x3072x512) {
   run_gemm_benchmark_comparison(1, 3072, 512);
 }
+
+/**
+ * @brief Fill A (M x N, row-major) and X (N) with values that are exactly
+ * representable in fp16 and whose products and partial sums stay exact for the
+ * sizes used below, so the gemv result can be compared against a float
+ * reference without tolerating rounding noise. No value is zero, so a dropped
+ * or misplaced tail element always changes the result.
+ * @note Exactness holds because every product is a multiple of 0.125 and
+ * small (|product| <= 1.875 at alpha = 1, <= 3.75 at alpha = 2, where the
+ * kernel scales X in fp16 first); raising N or alpha past |result| = 256 would
+ * start rounding the fp16 store and invalidate the tight tolerance.
+ */
+static void fill_gemv_operands(_FP16 *A, _FP16 *X, unsigned int M,
+                               unsigned int N) {
+  for (unsigned int i = 0; i < M * N; ++i) {
+    const int t = static_cast<int>(i % 6);
+    A[i] = static_cast<_FP16>((t < 3 ? t - 3 : t - 2) * 0.5f);
+  }
+  for (unsigned int i = 0; i < N; ++i) {
+    X[i] = static_cast<_FP16>((static_cast<int>(i % 5) + 1) * 0.25f);
+  }
+}
+
+/**
+ * @brief Y = alpha * A * X + beta * Y, evaluated in float.
+ */
+static std::vector<float> reference_gemv(const _FP16 *A, const _FP16 *X,
+                                         const _FP16 *Y, unsigned int M,
+                                         unsigned int N, float alpha,
+                                         float beta) {
+  std::vector<float> ref(M);
+  for (unsigned int j = 0; j < M; ++j) {
+    float acc = 0.f;
+    for (unsigned int n = 0; n < N; ++n) {
+      acc += static_cast<float>(A[j * N + n]) * static_cast<float>(X[n]);
+    }
+    ref[j] = alpha * acc + beta * static_cast<float>(Y[j]);
+  }
+  return ref;
+}
+
+/**
+ * @brief Run one non-transposed fp16 gemv and check it against the reference.
+ */
+static void run_hgemv_case(unsigned int M, unsigned int N, float alpha,
+                           float beta) {
+  std::vector<_FP16> A(M * N);
+  std::vector<_FP16> X(N);
+  std::vector<_FP16> Y(M, static_cast<_FP16>(1.f));
+
+  fill_gemv_operands(A.data(), X.data(), M, N);
+  auto ref = reference_gemv(A.data(), X.data(), Y.data(), M, N, alpha, beta);
+
+  nntrainer::sgemv(0, false, M, N, alpha, A.data(), N, X.data(), 1, beta,
+                   Y.data(), 1);
+
+  for (unsigned int j = 0; j < M; ++j) {
+    EXPECT_NEAR(static_cast<float>(Y[j]), ref[j], 1e-2f)
+      << "M=" << M << " N=" << N << " alpha=" << alpha << " beta=" << beta
+      << " row=" << j;
+  }
+}
+
+TEST(nntrainer_cpu_backend_standalone, hgemv_tail_lengths) {
+  for (unsigned int N = 1; N <= 40; ++N) {
+    for (unsigned int M : {1u, 3u, 5u, 8u, 9u}) {
+      run_hgemv_case(M, N, 1.f, 0.f);
+      run_hgemv_case(M, N, 2.f, 0.5f);
+    }
+  }
+}
+
+#if defined(__linux__) || defined(__ANDROID__)
+
+/**
+ * @brief Buffer whose last element ends exactly at a PROT_NONE guard page, so
+ * that any read past the end faults instead of silently succeeding.
+ */
+class GuardedFP16Buffer {
+public:
+  explicit GuardedFP16Buffer(size_t count) {
+    if (count == 0) {
+      return;
+    }
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t bytes = count * sizeof(_FP16);
+    const size_t data_bytes = ((bytes + page_size - 1) / page_size) * page_size;
+
+    mapped_bytes = data_bytes + page_size;
+    base = mmap(nullptr, mapped_bytes, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+      base = nullptr;
+      ptr = nullptr;
+      return;
+    }
+    char *guard = static_cast<char *>(base) + data_bytes;
+    if (mprotect(guard, page_size, PROT_NONE) != 0) {
+      munmap(base, mapped_bytes);
+      base = nullptr;
+      ptr = nullptr;
+      return;
+    }
+    ptr = reinterpret_cast<_FP16 *>(guard - bytes);
+  }
+
+  ~GuardedFP16Buffer() {
+    if (base != nullptr) {
+      munmap(base, mapped_bytes);
+    }
+  }
+
+  GuardedFP16Buffer(const GuardedFP16Buffer &) = delete;
+  GuardedFP16Buffer &operator=(const GuardedFP16Buffer &) = delete;
+
+  _FP16 *data() { return ptr; }
+
+private:
+  void *base = nullptr;
+  size_t mapped_bytes = 0;
+  _FP16 *ptr = nullptr;
+};
+
+TEST(nntrainer_cpu_backend_standalone, hgemv_tail_does_not_read_past_operands) {
+  const unsigned int M = 7;
+
+  for (unsigned int N : {13u, 14u, 15u}) {
+    GuardedFP16Buffer a_buf(M * N);
+    GuardedFP16Buffer x_buf(N);
+    if (a_buf.data() == nullptr || x_buf.data() == nullptr) {
+      GTEST_SKIP() << "mmap/mprotect unavailable";
+    }
+
+    std::vector<_FP16> Y(M, static_cast<_FP16>(1.f));
+    fill_gemv_operands(a_buf.data(), x_buf.data(), M, N);
+    auto ref =
+      reference_gemv(a_buf.data(), x_buf.data(), Y.data(), M, N, 1.f, 0.f);
+
+    nntrainer::sgemv(0, false, M, N, 1.f, a_buf.data(), N, x_buf.data(), 1, 0.f,
+                     Y.data(), 1);
+
+    for (unsigned int j = 0; j < M; ++j) {
+      EXPECT_NEAR(static_cast<float>(Y[j]), ref[j], 1e-2f)
+        << "N=" << N << " row=" << j;
+    }
+  }
+}
+
+static sigjmp_buf guard_fault_jmp;
+static volatile sig_atomic_t guard_fault_caught;
+
+static void guard_fault_handler(int) {
+  guard_fault_caught = 1;
+  siglongjmp(guard_fault_jmp, 1);
+}
+
+TEST(nntrainer_cpu_backend_standalone, hgemv_tail_guard_page_is_armed_n) {
+  GuardedFP16Buffer x_buf(13);
+  if (x_buf.data() == nullptr) {
+    GTEST_SKIP() << "mmap/mprotect unavailable";
+  }
+
+  struct sigaction sa;
+  struct sigaction old_sa;
+  std::memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = guard_fault_handler;
+  sigemptyset(&sa.sa_mask);
+  ASSERT_EQ(sigaction(SIGSEGV, &sa, &old_sa), 0);
+
+  guard_fault_caught = 0;
+  if (sigsetjmp(guard_fault_jmp, 1) == 0) {
+    volatile const _FP16 *past_end = x_buf.data() + 13;
+    (void)*past_end;
+  }
+  sigaction(SIGSEGV, &old_sa, nullptr);
+
+  EXPECT_EQ(static_cast<int>(guard_fault_caught), 1);
+}
+
+#endif
 
 int main(int argc, char **argv) {
   int result = -1;
