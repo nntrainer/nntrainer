@@ -20,7 +20,9 @@
  * the l2fetch (compiled out off-target), timing, and the pool's lanes; the
  * device gtest MoeLayerM1GemvMatchesHmx covers those.
  *
- * Every row count 1..16 runs; rows past m must stay untouched.
+ * Every row count 1..16 runs, so both the one-row loop (m = 1, 5, 9, 13)
+ * and the four-row loop run, through the self-prefetching column call and
+ * the one without its own l2fetch. Rows past m must stay untouched.
  */
 #include "hvx_gemm_u8i4_wh.h"
 
@@ -93,21 +95,25 @@ int main(void) {
       for (size_t b = 0; b < sizeof ncs / sizeof ncs[0]; ++b) {
         const uint32_t nts[] = {0u, 1u, ncs[b] - 1u};
         for (size_t t = 0; t < 3; ++t)
-          for (uint32_t m = 1; m <= HVX_GEMM_U8I4_MAX_ROWS; ++m) {
-            const uint32_t b1 = run_case(hvx_gemm_u8i4_wh_col, act, wh, m,
-                                         kts[a], ncs[b], nts[t]);
-            bad += b1;
-            ++cases;
-            if (b1)
-              printf("HVX GEMV NATIVE col m=%u k_tiles=%u n_col=%u nt=%u "
-                     "data=%d bad=%u\n",
-                     m, kts[a], ncs[b], nts[t], data, b1);
-          }
+          for (uint32_t m = 1; m <= HVX_GEMM_U8I4_MAX_ROWS; ++m)
+            for (int f = 0; f < 2; ++f) {
+              const uint32_t b1 =
+                run_case(f ? hvx_gemm_u8i4_wh_col_nopf : hvx_gemm_u8i4_wh_col,
+                         act, wh, m, kts[a], ncs[b], nts[t]);
+              bad += b1;
+              ++cases;
+              if (b1)
+                printf("HVX GEMV NATIVE %s m=%u k_tiles=%u n_col=%u nt=%u "
+                       "data=%d bad=%u\n",
+                       f ? "col_nopf" : "col", m, kts[a], ncs[b], nts[t], data,
+                       b1);
+            }
       }
   }
   printf("HVX GEMV NATIVE cases=%u bad=%u\n", cases, bad);
-  printf(bad ? "HVX GEMV NATIVE DIFFERS FROM THE SCALAR SPEC\n"
-             : "HVX GEMV NATIVE BIT-IDENTICAL (libnative; m=1..16)\n");
+  printf(
+    bad ? "HVX GEMV NATIVE DIFFERS FROM THE SCALAR SPEC\n"
+        : "HVX GEMV NATIVE BIT-IDENTICAL (libnative; m=1..16 rows1+rows4)\n");
   free(act);
   free(wh);
   return bad ? 1 : 0;

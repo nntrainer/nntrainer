@@ -117,7 +117,12 @@ if [ -f "$LIBNATIVE/lib/libnative.a" ]; then
   }
   gemv_native "$BACKEND/hvx/hvx_gemm_u8i4_wh.c" "$OUT/gemv_native_check"
   "$OUT/gemv_native_check"
-  for mut in 's/vasr_VwR(acc0, 4)/vasr_VwR(acc0, 3)/'; do
+  # One mutant per loop: the one-row loop's final shift (caught only on
+  # the lone rows m = 1, 5, 9, 13, which is how this shows that loop runs)
+  # and the four-row loop's. Sending m = 1 to the four-row loop is not a
+  # mutant: its row 0 is the same int32 by construction.
+  for mut in 's/vasr_VwR(acc, 4)/vasr_VwR(acc, 3)/' \
+    's/vasr_VwR(acc0, 4)/vasr_VwR(acc0, 3)/'; do
     sed "$mut" "$BACKEND/hvx/hvx_gemm_u8i4_wh.c" > "$OUT/mutant.c"
     if cmp -s "$OUT/mutant.c" "$BACKEND/hvx/hvx_gemm_u8i4_wh.c"; then
       echo "HVX GEMV MUTATION DID NOT APPLY: $mut"; exit 1

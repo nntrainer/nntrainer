@@ -29,25 +29,56 @@
 #define AH_TILE_BYTES 2048u
 #define AH_ROW_BYTES 32u
 
-/**
- * @brief Prefetches the n-tile column's k_tiles tiles into L2: 512 bytes
- *        every n_col*512, k_tiles times -- one 2D l2fetch, so the loads
- *        below find the weight in L2 instead of paying DDR latency 64
- *        times over. A hint only; it changes no result.
- */
-static inline void prefetch_col(const uint8_t *col, uint32_t stride,
-                                uint32_t k_tiles) {
+void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                               uint32_t n_tiles, uint32_t k_tiles) {
 #if defined(__hexagon__)
-  /* Rtt: [47:32] stride, [31:16] width, [15:0] height. Both strides this
-     is called with (112*512, 64*512) fit 16 bits. */
-  const uint64_t cfg = ((uint64_t)stride << 32) |
-                       ((uint64_t)WH_TILE_BYTES << 16) | (uint64_t)k_tiles;
-  Q6_l2fetch_AP((void *)col, cfg);
+  /* Rtt: [47:32] stride, [31:16] width, [15:0] height -- 16 bits each; the
+     callers' strides (112*512, 64*512) and widths (at most 6*512) fit. */
+  const uint64_t cfg = ((uint64_t)(n_col * WH_TILE_BYTES) << 32) |
+                       ((uint64_t)(n_tiles * WH_TILE_BYTES) << 16) |
+                       (uint64_t)k_tiles;
+  Q6_l2fetch_AP((void *)(wh + (size_t)nt * WH_TILE_BYTES), cfg);
 #else
-  (void)col;
-  (void)stride;
+  (void)wh;
+  (void)n_col;
+  (void)nt;
+  (void)n_tiles;
   (void)k_tiles;
 #endif
+}
+
+/**
+ * @brief Row r0 of one column alone: gemm_rows4's acc0 with the three
+ *        other rows left out.
+ *
+ * At m = 1 gemm_rows4 issues 32 vrmpy per k-tile for 8 that are stored,
+ * and its four accumulators rotate, so no vrmpy finds its accumulator
+ * produced by the packet before it -- the V79 HVX PRM's accumulator stall
+ * (80-N2040-61 AB section 5.6). One chain is the non-stalling pattern that
+ * section shows, and it is also acc0's exact sequence: same kt, same g,
+ * low nibble then high, same final shift, so the int32 is gemm_rows4's row
+ * r0 by construction.
+ */
+static inline void gemm_row1(const uint8_t *act_ah, uint32_t r0,
+                             uint32_t k_tiles, const uint8_t *col,
+                             uint32_t stride, int32_t *out) {
+  const HVX_Vector mask = Q6_V_vsplat_R((int)0xF0F0F0F0u);
+  HVX_Vector acc = Q6_V_vzero();
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    const uint8_t *tile = col + (size_t)kt * stride;
+    const uint32_t *a0 =
+      (const uint32_t *)(act_ah + (size_t)kt * AH_TILE_BYTES +
+                         r0 * AH_ROW_BYTES);
+    for (uint32_t g = 0; g < 4u; ++g) {
+      const HVX_Vector v = *(const HVX_UVector *)(tile + g * 128u);
+      const HVX_Vector wlo = Q6_V_vand_VV(Q6_Vh_vasl_VhR(v, 4), mask);
+      const HVX_Vector whi = Q6_V_vand_VV(v, mask);
+      acc = Q6_Vw_vrmpyacc_VwVubVb(acc, Q6_V_vsplat_R((int)a0[2u * g]), wlo);
+      acc =
+        Q6_Vw_vrmpyacc_VwVubVb(acc, Q6_V_vsplat_R((int)a0[2u * g + 1u]), whi);
+    }
+  }
+  *(HVX_UVector *)(out + (size_t)r0 * 32u) = Q6_Vw_vasr_VwR(acc, 4);
 }
 
 /**
@@ -113,16 +144,26 @@ static inline void gemm_rows4(const uint8_t *act_ah, uint32_t r0, uint32_t rows,
   }
 }
 
-void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
-                          const uint8_t *wh, uint32_t n_col, uint32_t nt,
-                          int32_t *out) {
+void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
+                               uint32_t k_tiles, const uint8_t *wh,
+                               uint32_t n_col, uint32_t nt, int32_t *out) {
   const uint32_t stride = n_col * WH_TILE_BYTES;
   const uint8_t *col = wh + (size_t)nt * WH_TILE_BYTES;
   if (m > HVX_GEMM_U8I4_MAX_ROWS) {
     m = HVX_GEMM_U8I4_MAX_ROWS;
   }
-  prefetch_col(col, stride, k_tiles);
   for (uint32_t r0 = 0; r0 < m; r0 += 4u) {
-    gemm_rows4(act_ah, r0, m - r0, k_tiles, col, stride, out);
+    if (m - r0 == 1u) {
+      gemm_row1(act_ah, r0, k_tiles, col, stride, out);
+    } else {
+      gemm_rows4(act_ah, r0, m - r0, k_tiles, col, stride, out);
+    }
   }
+}
+
+void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                          const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                          int32_t *out) {
+  hvx_gemm_u8i4_wh_prefetch(wh, n_col, nt, 1u, k_tiles);
+  hvx_gemm_u8i4_wh_col_nopf(act_ah, m, k_tiles, wh, n_col, nt, out);
 }

@@ -44,6 +44,14 @@
  *                 prefetched)
  * @param n_col    the weight's n-tile count (tile row stride)
  * @param nt       the n-tile column to compute
+ * Accumulation order, per output int32: kt ascending, then the four
+ * 128-byte quarters g ascending, then the quarter's low-nibble rows before
+ * its high-nibble rows, all into one accumulator per row, then one
+ * arithmetic shift by 4. Rows go four at a time (gemm_rows4) and a lone
+ * last row (m = 1, 5, 9, 13) alone (gemm_row1); both follow that order.
+ * The integer sums are exact either way, so the order is documented for
+ * the review list, not needed for the equality.
+ *
  * @param out      m x 32 int32, row-major, row stride 32 -- the same shape
  *                 hexkl_micro_hmx_acc_read_int32 lands with row_stride 32,
  *                 so the existing dequant passes read it unchanged
@@ -51,5 +59,24 @@
 void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
                           const uint8_t *wh, uint32_t n_col, uint32_t nt,
                           int32_t *out);
+
+/** @brief hvx_gemm_u8i4_wh_col without its own l2fetch: for a caller that
+ *         already issued hvx_gemm_u8i4_wh_prefetch over this column ahead
+ *         of time. Same arguments, same result. */
+void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
+                               uint32_t k_tiles, const uint8_t *wh,
+                               uint32_t n_col, uint32_t nt, int32_t *out);
+
+/**
+ * @brief One 2D l2fetch of the @a n_tiles adjacent columns [nt, nt+n_tiles)
+ *        over all @a k_tiles: n_tiles*512 bytes every n_col*512, k_tiles
+ *        times. A hint only; it changes no result. The hardware queues
+ *        three per thread and stalls the thread on a fourth (V79 PRM,
+ *        "Software-based l2fetch"), so a caller keeps at most three
+ *        outstanding. Width, stride and height are 16-bit fields:
+ *        n_tiles*512 and n_col*512 must be below 65536.
+ */
+void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                               uint32_t n_tiles, uint32_t k_tiles);
 
 #endif /* __NNTRAINER_HVX_GEMM_U8I4_WH_H__ */
