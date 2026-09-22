@@ -75,3 +75,13 @@ cc=${CC:-gcc}
   "$HERE/dma_trace_host_check.c" "$BACKEND/hmx/hexkl_dma_trace.c"
 
 "$OUT/dma_trace_host_check"
+
+# The #100 replay cells (nntr_moe_dma_plan.h): the 16 lists the gtest
+# replays, inside the skel's parse rules and the VTCM bound, and the tag
+# sum the gtest expects, simulated and held against a byte-by-byte copy.
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
+  -I "$HERE/.." \
+  -o "$OUT/replay_cells_host_check" \
+  "$HERE/replay_cells_host_check.c"
+
+"$OUT/replay_cells_host_check"

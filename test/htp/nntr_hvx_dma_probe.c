@@ -20,7 +20,13 @@
  *
  * dma_replay (#87, below) drives the MoE layer call's own M=1 descriptor
  * list (test/htp/nntr_moe_dma_plan.h) through the production ring or
- * through per-worker chains, with no compute between the pushes.
+ * through per-worker chains, with no compute between the pushes. #100 adds
+ * to the same entry, with no IDL change: schedule word 0 is
+ * flags << 16 | op << 8 | kind, where flags pick the push's destination
+ * mode (NNTR_MOE_DMA_DST_*) and op 2 (DRAIN, workers == 1 only) empties
+ * the ring so the next push dmstarts; descriptors up to 4 MiB; and a 13th
+ * result word, when the caller asks for it, sums the tag bytes of every
+ * push's VTCM window (nntr_dma_pattern) so a stale window fails.
  */
 
 #include <stdatomic.h>
@@ -199,7 +205,7 @@ int nntr_hvx_dma_probe(remote_handle64 handle, uint32 arena, uint32 src_off,
 
 typedef struct {
   uint32_t op, kind, expert, src_off, dst_off, row_size, nrows, src_stride,
-    t_rel;
+    t_rel, dst_stride;
 } replay_item;
 
 static replay_item g_items[REPLAY_MAX_ITEMS];
@@ -242,6 +248,7 @@ static const uint8_t *replay_src(const replay_ctx *c, const replay_item *it) {
 /** @brief workers == 1: the production ring and the production trace. */
 static void replay_ring(replay_ctx *c, hexkl_dma_trace_summary *sum) {
   static uint32_t ring_idx[REPLAY_MAX_ITEMS];
+  uint32_t last_idx = 0u;
   hexkl_dma_ring_reset();
   hexkl_dma_trace_reset(HAP_perf_get_qtimer_count());
   for (uint32_t k = 0; k < c->n_items; ++k) {
@@ -250,17 +257,24 @@ static void replay_ring(replay_ctx *c, hexkl_dma_trace_summary *sum) {
       replay_spin_until(c->t_call0, it->t_rel);
     }
     if (it->op == NNTR_MOE_DMA_OP_PUSH) {
-      ring_idx[k] = hexkl_dma_ring_next_idx();
+      ring_idx[k] = last_idx = hexkl_dma_ring_next_idx();
       hexkl_dma_ring_push2d(c->vtcm + it->dst_off, replay_src(c, it),
-                            it->row_size, it->src_stride, it->row_size,
+                            it->dst_stride, it->src_stride, it->row_size,
                             it->nrows, 0, 1);
       hexkl_dma_trace_push(HAP_perf_get_qtimer_count(), ring_idx[k], it->kind,
                            it->expert, 0u, it->row_size, it->nrows,
                            it->src_stride);
-    } else {
+    } else if (it->op == NNTR_MOE_DMA_OP_WAIT) {
       const uint32_t idx = ring_idx[it->src_off];
       hexkl_dma_trace_wait_begin(HAP_perf_get_qtimer_count(), idx, it->kind);
       hexkl_dma_ring_wait(idx);
+      hexkl_dma_trace_wait_end(HAP_perf_get_qtimer_count());
+    } else {
+      /** DRAIN: traced as a wait on the newest push (the chain retires in
+         order); the engine is idle after it, so the next push dmstarts. */
+      hexkl_dma_trace_wait_begin(HAP_perf_get_qtimer_count(), last_idx,
+                                 it->kind);
+      hexkl_dma_ring_drain();
       hexkl_dma_trace_wait_end(HAP_perf_get_qtimer_count());
     }
   }
@@ -298,7 +312,7 @@ static void replay_worker(uint32_t n_threads, uint32_t i, void *v) {
       d->src = (void *)replay_src(c, it);
       d->dst = c->vtcm + it->dst_off;
       d->src_stride = it->src_stride;
-      d->dst_stride = it->row_size;
+      d->dst_stride = it->dst_stride;
       d->row_size = it->row_size;
       d->nrows_lo = it->nrows & 0xffu;
       d->nrows_hi = (it->nrows >> 8) & 0xffu;
@@ -407,10 +421,12 @@ int nntr_hvx_dma_replay(remote_handle64 handle, uint32 arena,
   const uint32_t vtcm_limit =
     load == 2u ? s->config_off - REPLAY_LOAD_VTCM_BYTES : s->config_off;
   uint32_t bytes_per_call = 0u, gu_lo = UINT32_MAX, gu_hi = 0u, n_push = 0u;
+  uint32_t t_lo = UINT32_MAX, t_hi = 0u;
   for (uint32_t k = 0; k < c.n_items; ++k) {
     const uint32 *w = schedule + k * REPLAY_WORDS;
     replay_item *it = &g_items[k];
-    it->op = w[0] >> 8;
+    const uint32_t flags = w[0] >> 16;
+    it->op = (w[0] >> 8) & 0xffu;
     it->kind = w[0] & 0xffu;
     it->expert = w[1];
     it->src_off = w[2];
@@ -419,8 +435,20 @@ int nntr_hvx_dma_replay(remote_handle64 handle, uint32 arena,
     it->nrows = w[5];
     it->src_stride = w[6];
     it->t_rel = w[7];
+    if (flags > NNTR_MOE_DMA_DST_STRIDED) {
+      FARF(ERROR, "dma_replay: item %u flags 0x%x", (unsigned)k,
+           (unsigned)flags);
+      return AEE_EBADPARM;
+    }
+    it->dst_stride =
+      nntr_moe_dma_dst_stride(flags, it->row_size, it->src_stride);
     if (it->op == NNTR_MOE_DMA_OP_PUSH) {
       const uint32_t bytes = it->row_size * it->nrows;
+      /* Per item: a strided push spans its source pitch in VTCM. */
+      const uint32_t extent =
+        it->nrows == 0u
+          ? 0u
+          : nntr_moe_dma_extent(flags, it->row_size, it->nrows, it->src_stride);
       const int weight = it->kind == NNTR_MOE_DMA_KIND_GATE ||
                          it->kind == NNTR_MOE_DMA_KIND_UP ||
                          it->kind == NNTR_MOE_DMA_KIND_DOWN;
@@ -428,8 +456,10 @@ int nntr_hvx_dma_replay(remote_handle64 handle, uint32 arena,
                                (uint64_t)(it->nrows - 1u) * it->src_stride +
                                it->row_size;
       if (it->row_size == 0u || it->nrows == 0u ||
-          it->src_stride < it->row_size || bytes > (1u << 20) ||
-          (uint64_t)it->dst_off + bytes > vtcm_limit ||
+          it->src_stride < it->row_size ||
+          (uint64_t)it->row_size * it->nrows >
+            NNTR_MOE_DMA_REPLAY_MAX_DESC_BYTES ||
+          (uint64_t)it->dst_off + extent > vtcm_limit ||
           src_end > region_bytes || (weight && it->expert >= c.n_regions) ||
           (weight && it->expert >= 8u)) {
         FARF(ERROR, "dma_replay: item %u out of range", (unsigned)k);
@@ -443,15 +473,27 @@ int nntr_hvx_dma_replay(remote_handle64 handle, uint32 arena,
         if (it->dst_off < gu_lo) {
           gu_lo = it->dst_off;
         }
-        if (it->dst_off + bytes > gu_hi) {
-          gu_hi = it->dst_off + bytes;
+        if (it->dst_off + extent > gu_hi) {
+          gu_hi = it->dst_off + extent;
         }
+      }
+      if (it->dst_off < t_lo) {
+        t_lo = it->dst_off;
+      }
+      if (it->dst_off + extent > t_hi) {
+        t_hi = it->dst_off + extent;
       }
       bytes_per_call += bytes;
       g_item_ord[k] = n_push++;
     } else if (it->op == NNTR_MOE_DMA_OP_WAIT) {
       if (it->src_off >= k || g_items[it->src_off].op != NNTR_MOE_DMA_OP_PUSH) {
         FARF(ERROR, "dma_replay: wait %u on a non-push", (unsigned)k);
+        return AEE_EBADPARM;
+      }
+    } else if (it->op == NNTR_MOE_DMA_OP_DRAIN) {
+      if (workers != 1u || n_push == 0u) {
+        FARF(ERROR, "dma_replay: drain %u needs workers 1 and a push before",
+             (unsigned)k);
         return AEE_EBADPARM;
       }
     } else {
@@ -461,9 +503,11 @@ int nntr_hvx_dma_replay(remote_handle64 handle, uint32 arena,
   if (n_push == 0u || c.n_experts == 0u) {
     return AEE_EBADPARM;
   }
-  if (gu_lo != UINT32_MAX) {
-    memset(c.vtcm + gu_lo, 0, gu_hi - gu_lo);
-  }
+  /** Every push's window (a superset of the gate_up one), zeroed once
+     before the first call: the tag sum after the last call then tells a
+     transfer that never landed, or with fresh = 1 one that landed a call
+     late, from a live one. */
+  memset(c.vtcm + t_lo, 0, t_hi - t_lo);
 
   /* The optional load: the pool's workers claim units while the caller
      runs the replay; the stop flag turns the rest of the units into
@@ -551,5 +595,12 @@ int nntr_hvx_dma_replay(remote_handle64 handle, uint32 arena,
   res[9] = atomic_load(&l.units);
   res[10] = (uint32)HAP_perf_qtimer_count_to_us(busy_lo);
   res[11] = (uint32)HAP_perf_qtimer_count_to_us(busy_hi);
+  if (resLen > 12) {
+    uint32_t tag_sum = 0;
+    for (uint32_t i = t_lo; i + 32u < t_hi; i += 64u) {
+      tag_sum += c.vtcm[i + 32u];
+    }
+    res[12] = tag_sum;
+  }
   return AEE_SUCCESS;
 }
