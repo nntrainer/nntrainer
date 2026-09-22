@@ -894,6 +894,18 @@ void __fallback_gemm_q4_0(const unsigned int M, const unsigned int N,
                           const unsigned int ldb, T *C, const unsigned int ldc);
 
 /**
+ * @brief Q4_0 row-wise GEMV: A (1,K) * W.T (N,K) = O (1,N)
+ *
+ * @param N Number of rows in the weight matrix
+ * @param K Number of elements per weight row and in the activation
+ * @param A FP32 activation quantized to Q8_0 at runtime
+ * @param B Canonical row-major Q4_0 weight matrix
+ * @param C FP32 output
+ */
+void __fallback_gemv_q4_0_rowwise(const unsigned int N, const unsigned int K,
+                                  const float *A, const void *B, float *C);
+
+/**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *
  * @param M Original row size of output

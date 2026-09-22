@@ -22,7 +22,6 @@
 #include <assert.h>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <unordered_map>
 
 //

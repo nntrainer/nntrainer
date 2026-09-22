@@ -1004,6 +1004,17 @@ template <typename T = float>
 void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const T *A, const unsigned int lda, const void *B,
                const unsigned int ldb, T *C, const unsigned int ldc);
+
+/**
+ * @brief Compute canonical Q4_0 weight rows against one FP32 activation row
+ * @param N Number of canonical Q4_0 weight rows
+ * @param K Number of elements per activation and weight row
+ * @param A FP32 activation row to quantize online
+ * @param B Canonical row-major Q4_0 weights
+ * @param C FP32 output vector
+ */
+void gemv_q4_0_rowwise(const unsigned int N, const unsigned int K,
+                       const float *A, const void *B, float *C);
 /**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *
@@ -1087,6 +1098,7 @@ size_t quantize_q4_K(const float *src, void *dst, int64_t nrow,
  */
 size_t quantize_q6_K(const float *src, void *dst, int64_t nrow,
                      int64_t n_per_row, const float *quant_weights);
+
 /**
  * @brief dequantize row of q4_K data to float
  *

@@ -57,6 +57,19 @@ void nntr_gemv_q4_0_8x8_q8_0(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc);
 
+/**
+ * @brief Multiply canonical row-major Q4_0 rows by one Q8_0 activation row
+ * @param k Number of elements per row
+ * @param output Contiguous output for the supplied weight rows
+ * @param q4_weight Canonical row-major Q4_0 weight rows
+ * @param q8_activation One Q8_0 activation row
+ * @param num_rows Number of weight rows to compute
+ */
+void nntr_gemv_q4_0_q8_0_canonical_rows(int k, float *__restrict output,
+                                        const void *__restrict q4_weight,
+                                        const void *__restrict q8_activation,
+                                        size_t num_rows);
+
 void nntr_gemv_q4_K_8x8_q8_K(int n, float *__restrict s, size_t bs,
                              const void *__restrict vx,
                              const void *__restrict vy, int nr, int nc);
