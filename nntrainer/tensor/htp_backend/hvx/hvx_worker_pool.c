@@ -166,7 +166,11 @@ void hvx_worker_pool_destroy(hvx_worker_pool *pool) {
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units) {
   if (!pool || pool->n_workers == 0 || n_units <= 1) {
-    func(n_units == 0 ? 1u : n_units, 0, ctx);
+    // Inline: ONE participant that owns every unit. Passing n_units as
+    // n_threads here made the callee compute slice 0 of n_units and skip
+    // the rest -- latent while every device had workers, found the first
+    // time a kernel ran with pool == NULL.
+    func(1u, 0, ctx);
     return;
   }
 
