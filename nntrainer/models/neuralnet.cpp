@@ -31,9 +31,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <thread>
 
@@ -75,6 +78,22 @@
 namespace nntrainer {
 
 namespace {
+
+/**
+ * @brief Run @a fn and keep the first exception it throws in @a err. A throw
+ *        escaping a std::thread calls std::terminate, so loader threads use
+ *        this and the caller rethrows @a err after join.
+ */
+template <typename F>
+void keepFirstError(F &&fn, std::exception_ptr &err, std::mutex &m) {
+  try {
+    fn();
+  } catch (...) {
+    std::lock_guard<std::mutex> lock(m);
+    if (!err)
+      err = std::current_exception();
+  }
+}
 
 Tensor mapExternalTensor(float *buf, const TensorDim &dim) {
   const unsigned int bytes = static_cast<unsigned int>(
@@ -1041,6 +1060,10 @@ void NeuralNetwork::load(const std::string &file_path,
             NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
               << "CreateFileA failed";
 
+            LARGE_INTEGER li;
+            NNTR_THROW_IF(!GetFileSizeEx(hFile, &li), std::runtime_error)
+              << "GetFileSizeEx failed";
+
             HANDLE hMap =
               CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
             NNTR_THROW_IF((hMap == NULL), std::runtime_error)
@@ -1051,8 +1074,17 @@ void NeuralNetwork::load(const std::string &file_path,
             NNTR_THROW_IF((view == nullptr), std::runtime_error)
               << "MapViewOfFile failed";
 
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+            try {
+              node->read(ReadView{view, static_cast<size_t>(li.QuadPart)},
+                         false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            } catch (...) {
+              UnmapViewOfFile(view);
+              CloseHandle(hMap);
+              CloseHandle(hFile);
+              throw;
+            }
 
             // Early unmap: let the OS reclaim the working set ASAP
             UnmapViewOfFile(view);
@@ -1080,8 +1112,14 @@ void NeuralNetwork::load(const std::string &file_path,
             (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
 
             char *view = static_cast<char *>(mmap_ptr);
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+            try {
+              node->read(ReadView{view, f_size}, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            } catch (...) {
+              ::munmap(mmap_ptr, f_size);
+              throw;
+            }
 
             // Early drop: pages no longer needed; helps lower peak RSS during
             // overlap
@@ -1093,15 +1131,20 @@ void NeuralNetwork::load(const std::string &file_path,
         }
       };
 
+      std::exception_ptr load_error;
+      std::mutex load_error_mutex;
       std::vector<std::thread> threads;
       threads.reserve(num_load_threads);
       for (size_t t = 0; t < num_load_threads; ++t) {
-        threads.emplace_back(load_worker);
+        threads.emplace_back(
+          [&]() { keepFirstError(load_worker, load_error, load_error_mutex); });
       }
       for (auto &t : threads) {
         if (t.joinable())
           t.join();
       }
+      if (load_error)
+        std::rethrow_exception(load_error);
 
     } else {
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
@@ -1210,10 +1253,16 @@ void NeuralNetwork::load(const std::string &file_path,
     NNTR_THROW_IF(!st_file.is_open(), std::runtime_error)
       << "Cannot open safetensors file: " << f_path;
 
+    const uint64_t f_size = std::filesystem::file_size(f_path);
+
     uint64_t header_size = 0;
     st_file.read(reinterpret_cast<char *>(&header_size), sizeof(header_size));
     NNTR_THROW_IF(!st_file, std::runtime_error)
       << "Failed to read safetensors header length from: " << f_path;
+    NNTR_THROW_IF(header_size > f_size - sizeof(header_size),
+                  std::runtime_error)
+      << "safetensors header_size " << header_size << " exceeds file size "
+      << f_size << ": " << f_path;
 
     std::string header_json(header_size, '\0');
     st_file.read(header_json.data(), static_cast<std::streamsize>(header_size));
@@ -1228,6 +1277,9 @@ void NeuralNetwork::load(const std::string &file_path,
     // Parse header: name -> (offset_start, size_in_bytes)
     auto name_offset_map = safetensors::parseHeader(header_json);
 
+    // Bytes available for weight data; every entry used below must fit in it.
+    const size_t data_size = f_size - data_base;
+
     // Assign file offsets to each weight by name
     std::unordered_set<const Tensor *> visited_st;
     for (auto iter = model_graph.cbegin(); iter != model_graph.cend(); iter++) {
@@ -1239,8 +1291,12 @@ void NeuralNetwork::load(const std::string &file_path,
         auto it = name_offset_map.find(name);
         if (it == name_offset_map.end())
           continue;
-        const size_t file_off = data_base + it->second.first;
-        weight->getVariableRef().setFileOffset(file_off);
+        const auto [off, len] = it->second;
+        NNTR_THROW_IF(off > data_size || len > data_size - off,
+                      std::runtime_error)
+          << "safetensors entry '" << name << "' [" << off << ", " << off + len
+          << ") exceeds data section of " << data_size << " bytes: " << f_path;
+        weight->getVariableRef().setFileOffset(data_base + off);
       }
     }
 
@@ -1249,12 +1305,14 @@ void NeuralNetwork::load(const std::string &file_path,
       NNTR_THROW_IF((model_file_fd == -1), std::invalid_argument)
         << "Cannot open safetensors file: " << f_path;
 
+      std::exception_ptr load_error;
+      std::mutex load_error_mutex;
       std::vector<std::thread> threads;
       threads.reserve(model_graph.size());
       for (auto iter = model_graph.cbegin(); iter != model_graph.cend();
            ++iter) {
         auto node = *iter;
-        threads.emplace_back([&, node]() {
+        auto load_node = [&, node]() {
           if (!MMAP_READ) {
             auto local_file = checkedOpenStream<std::ifstream>(
               f_path, std::ios::in | std::ios::binary);
@@ -1268,6 +1326,10 @@ void NeuralNetwork::load(const std::string &file_path,
             NNTR_THROW_IF((hFile == INVALID_HANDLE_VALUE), std::runtime_error)
               << "CreateFileA failed for safetensors file: " << f_path;
 
+            LARGE_INTEGER li;
+            NNTR_THROW_IF(!GetFileSizeEx(hFile, &li), std::runtime_error)
+              << "GetFileSizeEx failed for safetensors file: " << f_path;
+
             HANDLE hMap =
               CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
             NNTR_THROW_IF((hMap == NULL), std::runtime_error)
@@ -1278,8 +1340,17 @@ void NeuralNetwork::load(const std::string &file_path,
             NNTR_THROW_IF((view == nullptr), std::runtime_error)
               << "MapViewOfFile failed for safetensors file: " << f_path;
 
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+            try {
+              node->read(ReadView{view, static_cast<size_t>(li.QuadPart)},
+                         false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            } catch (...) {
+              UnmapViewOfFile(view);
+              CloseHandle(hMap);
+              CloseHandle(hFile);
+              throw;
+            }
 
             UnmapViewOfFile(view);
             CloseHandle(hMap);
@@ -1303,19 +1374,30 @@ void NeuralNetwork::load(const std::string &file_path,
             (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_RANDOM);
 
             char *view = static_cast<char *>(mmap_ptr);
-            node->read(view, false, exec_mode, fsu_mode,
-                       std::numeric_limits<size_t>::max(), true, model_file_fd);
+            try {
+              node->read(ReadView{view, f_size}, false, exec_mode, fsu_mode,
+                         std::numeric_limits<size_t>::max(), true,
+                         model_file_fd);
+            } catch (...) {
+              ::munmap(mmap_ptr, f_size);
+              throw;
+            }
 
             (void)::posix_madvise(mmap_ptr, f_size, POSIX_MADV_DONTNEED);
             ::munmap(mmap_ptr, f_size);
 #endif
           }
+        };
+        threads.emplace_back([&, load_node]() {
+          keepFirstError(load_node, load_error, load_error_mutex);
         });
       }
       for (auto &t : threads) {
         if (t.joinable())
           t.join();
       }
+      if (load_error)
+        std::rethrow_exception(load_error);
     } else {
       // TRAINING mode: sequential read
       std::ifstream st_in(f_path, std::ios::in | std::ios::binary);

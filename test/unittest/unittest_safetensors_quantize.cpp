@@ -12,6 +12,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -125,6 +127,27 @@ TEST(SafetensorsUtil, build_parse_round_trip_p) {
   EXPECT_EQ(md["nntr_format"], "nntr-safetensors-v1");
 }
 
+/**
+ * @brief data_offsets with end < start must be rejected, not turned into a
+ *        size that wraps to ~2^64 (#4334 H1).
+ */
+TEST(SafetensorsUtil, parse_rejects_reversed_offsets_n) {
+  const std::string json =
+    R"({"w":{"dtype":"F32","shape":[1,1,1,4],"data_offsets":[16,0]}})";
+  EXPECT_THROW(st::parseHeaderEntries(json), std::runtime_error);
+  EXPECT_THROW(st::parseHeader(json), std::runtime_error);
+}
+
+/**
+ * @brief A number that does not fit in size_t must be rejected, not wrap to a
+ *        small value (#4334 H1).
+ */
+TEST(SafetensorsUtil, parse_rejects_overflowing_offset_n) {
+  const std::string json =
+    R"({"w":{"dtype":"F32","shape":[4],"data_offsets":[0,99999999999999999999999]}})";
+  EXPECT_THROW(st::parseHeaderEntries(json), std::runtime_error);
+}
+
 TEST(SafetensorsUtil, inspect_reports_quant_type_p) {
   std::vector<st::TensorEntry> entries;
   st::TensorEntry quant;
@@ -151,7 +174,8 @@ TEST(SafetensorsUtil, inspect_reports_quant_type_p) {
 // ===========================================================================
 
 static std::unique_ptr<nntrainer::NeuralNetwork>
-createFcNN(unsigned int input_width, unsigned int units) {
+createFcNN(unsigned int input_width, unsigned int units,
+           ml::train::ExecutionMode mode = ml::train::ExecutionMode::TRAIN) {
   auto nn = std::make_unique<nntrainer::NeuralNetwork>();
   nn->addLayer(ml::train::layer::Input(
     {"name=input", "input_shape=1:1:" + std::to_string(input_width)}));
@@ -160,7 +184,7 @@ createFcNN(unsigned int input_width, unsigned int units) {
   nn->setOptimizer(ml::train::optimizer::SGD({"learning_rate=0.1"}));
   nn->setProperty({"loss=mse", "batch_size=1"});
   nn->compile();
-  nn->initialize();
+  nn->initialize(mode);
   return nn;
 }
 
@@ -287,6 +311,124 @@ TEST(SafetensorsQuant, q4_0_records_target_isa_p) {
   EXPECT_EQ(md["nntr_q4_0_isa"], "arm");
 
   remove(st_path.c_str());
+}
+
+// ===========================================================================
+// Loading malformed files must throw, not read outside the file (#4334 H1)
+// ===========================================================================
+
+/**
+ * @brief Write [header_size][header_json][data] to @a path.
+ */
+static void writeSafetensors(const std::string &path, uint64_t header_size,
+                             const std::string &header_json,
+                             const std::vector<char> &data) {
+  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  f.write(reinterpret_cast<const char *>(&header_size), sizeof(header_size));
+  f.write(header_json.data(), static_cast<std::streamsize>(header_json.size()));
+  f.write(data.data(), static_cast<std::streamsize>(data.size()));
+}
+
+/**
+ * @brief Save an FP32 FC model as safetensors and split it into header / data.
+ */
+static void saveFcSafetensors(const std::string &path, std::string &header,
+                              std::vector<char> &data) {
+  auto nn = createFcNN(8, 16);
+  nn->save(path, ModelFormat::MODEL_FORMAT_SAFETENSORS, DataType::NONE);
+  const std::vector<char> all = readFile(path);
+  uint64_t header_size = 0;
+  std::memcpy(&header_size, all.data(), sizeof(header_size));
+  header.assign(all.data() + sizeof(header_size), header_size);
+  data.assign(all.begin() + sizeof(header_size) + header_size, all.end());
+}
+
+/**
+ * @brief Control: an untouched FP32 safetensors loads in INFERENCE (mmap) mode.
+ */
+TEST(SafetensorsLoad, inference_load_intact_p) {
+  const std::string path = "st_h1_intact.safetensors";
+  std::string header;
+  std::vector<char> data;
+  saveFcSafetensors(path, header, data);
+  auto nn = createFcNN(8, 16, ml::train::ExecutionMode::INFERENCE);
+  EXPECT_NO_THROW(nn->load(path, ModelFormat::MODEL_FORMAT_SAFETENSORS));
+  remove(path.c_str());
+}
+
+/**
+ * @brief header_size larger than the file must be rejected before it is used
+ *        as an allocation size.
+ */
+TEST(SafetensorsLoad, rejects_header_size_beyond_file_n) {
+  const std::string path = "st_h1_hsize.safetensors";
+  std::string header;
+  std::vector<char> data;
+  saveFcSafetensors(path, header, data);
+  writeSafetensors(path, uint64_t{1} << 60, header, data);
+  auto nn = createFcNN(8, 16, ml::train::ExecutionMode::INFERENCE);
+  EXPECT_THROW(nn->load(path, ModelFormat::MODEL_FORMAT_SAFETENSORS),
+               std::runtime_error);
+  remove(path.c_str());
+}
+
+/**
+ * @brief data_offsets pointing past the end of the file must be rejected
+ *        instead of being read through the mapping.
+ */
+TEST(SafetensorsLoad, rejects_offsets_beyond_file_n) {
+  const std::string path = "st_h1_offs.safetensors";
+  std::string header;
+  std::vector<char> data;
+  saveFcSafetensors(path, header, data);
+  auto entries = st::parseHeaderEntries(header);
+  for (auto &e : entries) {
+    e.offset_start += 1u << 20;
+    e.offset_end += 1u << 20;
+  }
+  const std::string bad = st::buildHeader(entries);
+  writeSafetensors(path, bad.size(), bad, data);
+  auto nn = createFcNN(8, 16, ml::train::ExecutionMode::INFERENCE);
+  EXPECT_THROW(nn->load(path, ModelFormat::MODEL_FORMAT_SAFETENSORS),
+               std::runtime_error);
+  remove(path.c_str());
+}
+
+/**
+ * @brief A truncated file (data section cut in half) must be rejected.
+ */
+TEST(SafetensorsLoad, rejects_truncated_file_n) {
+  const std::string path = "st_h1_trunc.safetensors";
+  std::string header;
+  std::vector<char> data;
+  saveFcSafetensors(path, header, data);
+  data.resize(data.size() / 2);
+  writeSafetensors(path, header.size(), header, data);
+  auto nn = createFcNN(8, 16, ml::train::ExecutionMode::INFERENCE);
+  EXPECT_THROW(nn->load(path, ModelFormat::MODEL_FORMAT_SAFETENSORS),
+               std::runtime_error);
+  remove(path.c_str());
+}
+
+/**
+ * @brief A truncated .bin must make INFERENCE (mmap, multi-threaded) load
+ *        throw to the caller, not read past the mapping or terminate the
+ *        process from a worker thread.
+ */
+TEST(SafetensorsLoad, bin_truncated_inference_n) {
+  const std::string path = "h1_trunc.bin";
+  {
+    auto nn = createFcNN(8, 16);
+    nn->save(path, ModelFormat::MODEL_FORMAT_BIN, DataType::NONE);
+  }
+  auto nn_ok = createFcNN(8, 16, ml::train::ExecutionMode::INFERENCE);
+  ASSERT_NO_THROW(nn_ok->load(path, ModelFormat::MODEL_FORMAT_BIN));
+
+  std::filesystem::resize_file(path, std::filesystem::file_size(path) / 2);
+  auto nn = createFcNN(8, 16, ml::train::ExecutionMode::INFERENCE);
+  EXPECT_THROW(nn->load(path, ModelFormat::MODEL_FORMAT_BIN),
+               std::runtime_error);
+  remove(path.c_str());
 }
 
 int main(int argc, char **argv) {

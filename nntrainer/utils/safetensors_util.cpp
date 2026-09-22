@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -221,8 +222,12 @@ public:
   size_t readNumber() {
     skipWs();
     size_t v = 0;
-    while (pos < src.size() && src[pos] >= '0' && src[pos] <= '9')
-      v = v * 10 + (src[pos++] - '0');
+    while (pos < src.size() && src[pos] >= '0' && src[pos] <= '9') {
+      const size_t d = static_cast<size_t>(src[pos++] - '0');
+      if (v > (std::numeric_limits<size_t>::max() - d) / 10)
+        throw std::runtime_error("safetensors: number out of range");
+      v = v * 10 + d;
+    }
     return v;
   }
 
@@ -314,6 +319,9 @@ std::vector<TensorEntry> parseHeaderEntries(const std::string &json) {
         s.expect(',');
         e.offset_end = s.readNumber();
         s.expect(']');
+        if (e.offset_end < e.offset_start)
+          throw std::runtime_error(
+            "safetensors: data_offsets end < start for '" + key + "'");
       } else {
         s.skipValue();
       }

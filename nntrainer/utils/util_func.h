@@ -40,7 +40,15 @@
 // unsigned int getSeed() { return 0; }
 
 namespace nntrainer {
-using ReadSource = std::variant<std::ifstream *, const char *>;
+/**
+ * @brief A read-only view of a mapped weight file: base pointer + length, so
+ *        reads through it can be bounds-checked.
+ */
+struct ReadView {
+  const char *data;
+  size_t size;
+};
+using ReadSource = std::variant<std::ifstream *, ReadView>;
 
 #define NN_RETURN_STATUS()                                                     \
   do {                                                                         \
@@ -171,7 +179,8 @@ void checkedRead(std::ifstream &file, char *array, std::streamsize size,
  * @param array char * array
  * @param size size of the array
  * @param error_msg error msg to print when operation fail
- * @throw std::runtime_error if file.fail() is true after read.
+ * @throw std::runtime_error if the read would go past the end of a ReadView,
+ * or if the stream read fails or comes up short.
  */
 void checkedRead(ReadSource src, char *array, std::streamsize size,
                  const char *error_msg, size_t start_offset,

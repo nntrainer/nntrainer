@@ -22,6 +22,10 @@
  */
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <cstdio>
+#include <fstream>
+
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <nntrainer_logger.h>
@@ -141,6 +145,38 @@ TEST(nntrainer_util_func, throw_status_default_n) {
 /**
  * @brief Main gtest
  */
+/**
+ * @brief checkedRead on a mapped view must stay inside the view (#4334 H1).
+ */
+TEST(nntrainer_util_func, checkedRead_view_bounds_n) {
+  char src[16] = {0};
+  char dst[17];
+  nntrainer::ReadView view{src, sizeof(src)};
+  EXPECT_NO_THROW(nntrainer::checkedRead(view, dst, 8, "read", 8, true));
+  EXPECT_THROW(nntrainer::checkedRead(view, dst, 8, "read", 9, true),
+               std::runtime_error);
+  EXPECT_THROW(nntrainer::checkedRead(view, dst, 8, "read", SIZE_MAX, true),
+               std::runtime_error);
+  EXPECT_THROW(nntrainer::checkedRead(view, dst, 17, "read", 0, false),
+               std::runtime_error);
+}
+
+/**
+ * @brief checkedRead on an ifstream must report a short read (#4334 H1).
+ */
+TEST(nntrainer_util_func, checkedRead_stream_short_read_n) {
+  const char *path = "checked_read_short.bin";
+  {
+    std::ofstream f(path, std::ios::binary);
+    f.write("abcd", 4);
+  }
+  char dst[8];
+  std::ifstream in(path, std::ios::binary);
+  EXPECT_THROW(nntrainer::checkedRead(&in, dst, 8, "read", 0, true),
+               std::runtime_error);
+  std::remove(path);
+}
+
 int main(int argc, char **argv) {
   int result = -1;
 

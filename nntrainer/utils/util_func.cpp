@@ -91,20 +91,20 @@ void checkedRead(std::ifstream &file, char *array, std::streamsize size,
 void checkedRead(ReadSource src, char *array, std::streamsize size,
                  const char *error_msg, size_t start_offset,
                  bool read_from_offset) {
-
+  const size_t n = static_cast<size_t>(size);
   if (auto f = std::get_if<std::ifstream *>(&src)) {
     if (read_from_offset) {
       (*f)->seekg(start_offset, std::ios::beg);
+      checkFile(**f, "failed to move offset");
     }
-    (*f)->read(static_cast<char *>(array), static_cast<std::streamsize>(size));
-    // checkFile((*f), error_msg);
-  } else if (auto p = std::get_if<const char *>(&src)) {
+    (*f)->read(static_cast<char *>(array), size);
+    checkFile(**f, error_msg);
+  } else if (auto v = std::get_if<ReadView>(&src)) {
+    const size_t off = read_from_offset ? start_offset : 0;
+    if (off > v->size || n > v->size - off)
+      throw std::runtime_error(error_msg);
     /// @todo use mmap instead memcpy to reduce peak memory
-    if (read_from_offset) {
-      std::memcpy(array, (*p) + start_offset, size);
-    } else {
-      std::memcpy(array, (*p), size);
-    }
+    std::memcpy(array, v->data + off, n);
   }
 }
 
