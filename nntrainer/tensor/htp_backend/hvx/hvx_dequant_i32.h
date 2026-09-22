@@ -191,6 +191,40 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *job);
  * @param dst         the [rows x inter] SwiGLU output; column g0 * 32 of it
  *                    is where this run's first pair lands
  */
+/**
+ * @brief Fused dequant + elementwise product over tile PAIRS from two
+ *        weights that share the activation: staged slot j is the first
+ *        weight's tile at column c0 + 32 j, slot n_pairs + j the second's
+ *        at the same column, and dst gets dq(first) * dq(second).
+ *
+ * The conv block's pre-conv gate (doc 51 section 2): in_proj's a and c
+ * column slices are two registered weights, and a * c is the only thing
+ * the block needs of them, so neither is ever stored. Same shape of job
+ * as hvx_dq_swiglu_job, with the second weight's constants separate
+ * because they come from a different handle.
+ */
+typedef struct {
+  const uint8_t *tiles_base;
+  uint32_t tile_stride;
+  uint32_t n_pairs;
+  uint32_t c0; /**< first COLUMN of the batch (a multiple of 32) */
+  uint32_t row_stride;
+  uint32_t m_count;
+  const float *act_scale;
+  const int32_t *act_zp;
+  const int32_t *colsum_a; /**< the first weight's, at column 0 */
+  const float *w_scale_a;
+  const float *bias_a;
+  const int32_t *colsum_b; /**< the second weight's, at column 0 */
+  const float *w_scale_b;
+  const float *bias_b;
+  float *dst;
+  uint32_t dst_stride;
+} hvx_dq_mul_job;
+
+/** @brief hvx_worker_pool_func over an hvx_dq_mul_job; units are pairs. */
+void hvx_dq_mul_worker(uint32_t n_threads, uint32_t i, void *job);
+
 void hvx_dequant_swiglu_acc_tiles_to_f32(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_pairs,
   uint32_t g0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
