@@ -156,12 +156,41 @@ e.g.,
 $ ./build/Applications/CausalLM/nntr_causallm /tmp/nntrainer/Applications/CausalLM/res/qwen3/qwen3-4b/
 ```
 
+#### Tokenizer library
+
+`Applications/CausalLM/lib/libtokenizers_c.a` is a **tracked** prebuilt of the
+in-tree Rust crate `Applications/CausalLM/tokenizers_c_win` (the `_win` suffix is
+historical; the crate is the source of truth for every platform). Meson copies it
+into `<builddir>/Applications/CausalLM/libtokenizers_c.a` and links the copy, so
+no build step names a tracked path as a link input.
+
+Never write into `Applications/CausalLM/lib/`. A modified archive there shows up
+as a dirty 36+ MB tracked file that blocks `git checkout`. To link an archive
+you built yourself - for example after changing `tokenizers_c_win/src/lib.rs`,
+or for a toolchain the tracked archive does not match - pass it explicitly:
+
+```bash
+$ cargo build --release --locked \
+      --manifest-path Applications/CausalLM/tokenizers_c_win/Cargo.toml \
+      --target-dir build/tokenizers_c_host
+$ meson setup build -Denable-transformer=true \
+      -Dcausallm-tokenizer-lib=$PWD/build/tokenizers_c_host/release/libtokenizers_c.a
+```
+
+Refreshing the tracked archive itself is a deliberate, reviewed commit (the
+archive has to be rebuilt whenever the crate gains symbols), not a build step.
+
 ### 3. Windows Build & Test
 
 Windows CausalLM builds need a `tokenizers_c.lib` that matches the local
 MSVC toolchain. The repository keeps the Linux static library in
 `Applications/CausalLM/lib/`; Windows builds generate the matching library from
 source instead of carrying a checked-in binary.
+
+The generated library belongs under the build directory (or wherever
+`-Dcausallm-tokenizer-lib` points), never in `Applications\CausalLM\lib\`: that
+directory holds the tracked Linux archive, and overwriting it leaves a dirty
+36+ MB tracked file that blocks `git checkout`.
 
 #### Prerequisites
 

@@ -55,6 +55,10 @@ endif
 tokenizer_dependencies = []
 tokenizer_option = get_option('causallm-tokenizer-lib')
 tokenizer_rust_target = ''
+# The archive whose presence is checked at configure time. It is the same as
+# tokenizer_path everywhere except for the staged prebuilt below, where the
+# link input is a copy that does not exist yet while meson is configuring.
+tokenizer_check_path = ''
 if get_option('platform') == 'windows'
     if meson.is_cross_build()
         if host_machine.cpu_family() == 'aarch64'
@@ -71,18 +75,37 @@ if get_option('platform') == 'windows'
     else
         tokenizer_path = meson.build_root() / 'tokenizers_c_win' / 'target' / tokenizer_rust_target / 'release' / 'tokenizers_c.lib'
     endif
+    tokenizer_check_path = tokenizer_path
+elif tokenizer_option != ''
+    tokenizer_path = tokenizer_option
+    tokenizer_check_path = tokenizer_path
 else
-    if tokenizer_option != ''
-        error('causallm-tokenizer-lib is only supported for Windows CausalLM builds.')
+    # lib/libtokenizers_c.a is a *tracked* prebuilt of the in-tree crate
+    # tokenizers_c_win (cargo names a staticlib exactly like this). Stage it
+    # into the build directory and link the staged copy, so the build never
+    # names a tracked path as a link input: refreshing the archive for a local
+    # toolchain then has a build-directory target to land on instead of the
+    # tracked file, whose modification breaks `git checkout` for everyone.
+    # A locally built archive is passed with -Dcausallm-tokenizer-lib=<path>
+    # (accepted on every platform, see the branch above); nothing should ever
+    # write Applications/CausalLM/lib/.
+    tokenizer_prebuilt = 'lib' / 'libtokenizers_c.a'
+    tokenizer_check_path = meson.current_source_dir() / tokenizer_prebuilt
+    if fs.exists(tokenizer_check_path)
+        configure_file(
+            input: tokenizer_prebuilt,
+            output: 'libtokenizers_c.a',
+            copy: true,
+        )
     endif
 
-    tokenizer_path = meson.current_source_dir() / 'lib' / 'libtokenizers_c.a'
+    tokenizer_path = meson.current_build_dir() / 'libtokenizers_c.a'
 endif
 
 generate_windows_tokenizer = tokenizer_option == ''
 generate_windows_tokenizer = generate_windows_tokenizer and get_option('platform') == 'windows'
 generate_windows_tokenizer = generate_windows_tokenizer and build_machine.system() == 'windows'
-generate_windows_tokenizer = generate_windows_tokenizer and not fs.exists(tokenizer_path)
+generate_windows_tokenizer = generate_windows_tokenizer and not fs.exists(tokenizer_check_path)
 
 if generate_windows_tokenizer
     run_command(
@@ -99,12 +122,12 @@ if generate_windows_tokenizer
     )
 endif
 
-if not fs.exists(tokenizer_path)
+if not fs.exists(tokenizer_check_path)
     if get_option('platform') == 'windows'
         tokenizer_error = 'CausalLM Windows build requires tokenizers_c.lib. Run Applications\\CausalLM\\build_tokenizer_windows.ps1 -BuildDir @0@ or pass -Dcausallm-tokenizer-lib=/path/to/tokenizers_c.lib.'
         error(tokenizer_error.format(meson.build_root()))
     else
-        error('CausalLM tokenizer library not found: @0@'.format(tokenizer_path))
+        error('CausalLM tokenizer library not found: @0@. Build the in-tree crate Applications/CausalLM/tokenizers_c_win and pass -Dcausallm-tokenizer-lib=/path/to/libtokenizers_c.a.'.format(tokenizer_check_path))
     endif
 endif
 
