@@ -55,7 +55,19 @@ struct hvx_worker_pool_s {
   qurt_thread_t *tids;
   hvx_worker_ctx *worker_ctx;
   unsigned char *stack_blob;
+  /** submit(): the caller sits out, so the job's own index space is the
+      workers' -- the trampoline below maps (n_threads, id) onto it. */
+  hvx_worker_pool_func async_func;
+  void *async_ctx;
+  int async_in_flight;
 };
+
+/** @brief Worker id 1..k -> job index 0..k-1 for hvx_worker_pool_submit. */
+static void hvx_worker_pool_async_trampoline(uint32_t n_threads, uint32_t id,
+                                             void *pool_) {
+  hvx_worker_pool *pool = (hvx_worker_pool *)pool_;
+  pool->async_func(n_threads - 1u, id - 1u, pool->async_ctx);
+}
 
 static void hvx_worker_pool_thread_entry(void *arg) {
   hvx_worker_ctx *me = (hvx_worker_ctx *)arg;
@@ -202,4 +214,45 @@ void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
   // Pairs with each worker's release store to barrier: makes every
   // worker's writes to ctx visible to the calling thread from here on.
   atomic_thread_fence(memory_order_acquire);
+}
+
+int hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
+                           void *ctx, uint32_t n_units) {
+  if (!pool || pool->n_workers == 0 || n_units == 0) {
+    // Inline: ONE participant that owns every unit. Passing n_units as
+    // n_threads here made the callee compute slice 0 of n_units and skip
+    // the rest -- latent while every device had workers, found the first
+    // time a kernel ran with pool == NULL.
+    func(1u, 0, ctx);
+    return 0;
+  }
+  // Same publish-then-wake-everyone protocol as run(), with the caller's
+  // slot (id 0) deliberately empty: n_threads counts it so the workers'
+  // "am I a participant" test (id < n_threads) stays unchanged, and the
+  // trampoline hides it from the job.
+  uint32_t k = n_units;
+  if (k > pool->n_workers) {
+    k = pool->n_workers;
+  }
+  pool->async_func = func;
+  pool->async_ctx = ctx;
+  pool->func = hvx_worker_pool_async_trampoline;
+  pool->ctx = pool;
+  pool->n_threads = k + 1u;
+  pool->async_in_flight = 1;
+  atomic_store_explicit(&pool->barrier, k, memory_order_relaxed);
+  atomic_fetch_add_explicit(&pool->seqn, 1, memory_order_release);
+  qurt_futex_wake(&pool->seqn, (int)pool->n_workers);
+  return 1;
+}
+
+void hvx_worker_pool_wait(hvx_worker_pool *pool) {
+  if (!pool || !pool->async_in_flight) {
+    return;
+  }
+  while (atomic_load_explicit(&pool->barrier, memory_order_relaxed) > 0) {
+    hvx_worker_pool_pause();
+  }
+  atomic_thread_fence(memory_order_acquire);
+  pool->async_in_flight = 0;
 }
