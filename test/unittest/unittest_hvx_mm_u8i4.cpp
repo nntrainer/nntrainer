@@ -608,6 +608,97 @@ protected:
     ref_int_matmul(u_rm, w.q_w, m_pad, K, w.N, acc);
     ref_dequant(acc, M, w.N, scale, zp, w.colsum, w.d, w.bias, out);
   }
+
+  /** @brief Experts registered twice: on the DSP heap (h_*) and borrowed
+   *         from one uncached rpcmem arena (a_*), the mapping production
+   *         reads. */
+  struct MoeExperts {
+    std::vector<Weight> gu, dn;
+    std::vector<uint32_t> h_gu, h_dn, a_gu, a_dn;
+    void *buf = nullptr;
+    void (*rfree)(void *) = nullptr;
+    uint32_t arena = 0xFFFFFFFFu;
+  };
+
+  /** @brief NE experts of gate_up K x 2I and down I x N into @a x, the
+   *         setup MoeLayerM1GemvMatchesHmx and MoeM1GemvFeedVsCompute
+   *         share. GTEST_SKIPs without rpcmem / fastrpc_mmap: the caller
+   *         checks IsSkipped(). */
+  void MakeMoeExperts(uint32_t K, uint32_t I, uint32_t N, uint32_t NE,
+                      MoeExperts &x) {
+    auto alloc =
+      (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+    x.rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+    auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+    using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
+    auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
+    if (!alloc || !x.rfree || !to_fd || !fmmap) {
+      GTEST_SKIP() << "rpcmem/fastrpc_mmap not available";
+    }
+
+    x.gu.resize(NE);
+    x.dn.resize(NE);
+    x.h_gu.resize(NE);
+    x.h_dn.resize(NE);
+    for (uint32_t e = 0; e < NE; ++e) {
+      ASSERT_NO_FATAL_FAILURE(
+        MakeAndRegister(K, 2 * I, 0xA8000000u + e, x.gu[e]));
+      ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xC8000000u + e, x.dn[e]));
+      x.h_gu[e] = x.gu[e].handle;
+      x.h_dn[e] = x.dn[e].handle;
+    }
+    auto wh_bytes = [](uint32_t k, uint32_t n) {
+      return (k / 32u) * (n / 32u) * 512u;
+    };
+    const uint32_t gu_len = wh_bytes(K, 2 * I), dn_len = wh_bytes(I, N);
+    const uint32_t stride_gu = (gu_len + 4095u) & ~4095u;
+    const uint32_t stride_dn = (dn_len + 4095u) & ~4095u;
+    const uint32_t arena_bytes = NE * (stride_gu + stride_dn);
+    x.buf = alloc(25, 0 /*UNCACHED*/, (int)arena_bytes);
+    ASSERT_NE(x.buf, nullptr) << "uncached rpcmem_alloc failed";
+    const int fd = to_fd(x.buf);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(fmmap(CDSP_DOMAIN_ID, fd, x.buf, 0, arena_bytes,
+                    static_cast<int>(FASTRPC_MAP_FD)),
+              0);
+    ASSERT_EQ(nntr_hvx_arena_attach(handle_, fd, arena_bytes, &x.arena),
+              AEE_SUCCESS);
+    auto *base = static_cast<uint8_t *>(x.buf);
+    x.a_gu.resize(NE);
+    x.a_dn.resize(NE);
+    uint32_t off = 0;
+    for (uint32_t e = 0; e < NE; ++e) {
+      ASSERT_EQ(nntr_hvx_weight_bake_export(handle_, x.h_gu[e], base + off,
+                                            (int)gu_len),
+                AEE_SUCCESS);
+      ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
+                  handle_, K, 2 * I, x.arena, off, x.gu[e].d.data(),
+                  (int)(2 * I), x.gu[e].colsum.data(), (int)(2 * I),
+                  x.gu[e].bias.data(), (int)(2 * I), &x.a_gu[e]),
+                AEE_SUCCESS);
+      off += stride_gu;
+      ASSERT_EQ(nntr_hvx_weight_bake_export(handle_, x.h_dn[e], base + off,
+                                            (int)dn_len),
+                AEE_SUCCESS);
+      ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
+                  handle_, I, N, x.arena, off, x.dn[e].d.data(), (int)N,
+                  x.dn[e].colsum.data(), (int)N, x.dn[e].bias.data(), (int)N,
+                  &x.a_dn[e]),
+                AEE_SUCCESS);
+      off += stride_dn;
+    }
+  }
+
+  /** @brief Releases every handle of @a x, detaches and frees the arena. */
+  void ReleaseMoeExperts(MoeExperts &x) {
+    for (size_t e = 0; e < x.h_gu.size(); ++e) {
+      for (uint32_t h : {x.a_gu[e], x.a_dn[e], x.h_gu[e], x.h_dn[e]}) {
+        EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h), AEE_SUCCESS);
+      }
+    }
+    EXPECT_EQ(nntr_hvx_arena_detach(handle_, x.arena), AEE_SUCCESS);
+    x.rfree(x.buf);
+  }
 };
 
 TEST_F(HmxMmU8I4Layer, ThreeWeightsMatchPerWeightReference) {
@@ -2279,65 +2370,12 @@ TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
    the GEMV's vector loads and l2fetch have never been measured against. */
 TEST_F(HmxMmU8I4Layer, MoeLayerM1GemvMatchesHmx) {
   const uint32_t K = 2048, I = 1792, N = 2048, NE = 4;
-
-  auto alloc =
-    (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
-  auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
-  auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
-  using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
-  auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
-  if (!alloc || !rfree || !to_fd || !fmmap) {
-    GTEST_SKIP() << "rpcmem/fastrpc_mmap not available";
+  MoeExperts x;
+  ASSERT_NO_FATAL_FAILURE(MakeMoeExperts(K, I, N, NE, x));
+  if (IsSkipped()) {
+    return;
   }
-
-  std::vector<Weight> gu(NE), dn(NE);
-  std::vector<uint32_t> h_gu(NE), h_dn(NE);
-  for (uint32_t e = 0; e < NE; ++e) {
-    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0xA8000000u + e, gu[e]));
-    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0xC8000000u + e, dn[e]));
-    h_gu[e] = gu[e].handle;
-    h_dn[e] = dn[e].handle;
-  }
-  auto wh_bytes = [](uint32_t k, uint32_t n) {
-    return (k / 32u) * (n / 32u) * 512u;
-  };
-  const uint32_t gu_len = wh_bytes(K, 2 * I), dn_len = wh_bytes(I, N);
-  const uint32_t stride_gu = (gu_len + 4095u) & ~4095u;
-  const uint32_t stride_dn = (dn_len + 4095u) & ~4095u;
-  const uint32_t arena_bytes = NE * (stride_gu + stride_dn);
-  void *buf = alloc(25, 0 /*UNCACHED*/, (int)arena_bytes);
-  ASSERT_NE(buf, nullptr) << "uncached rpcmem_alloc failed";
-  const int fd = to_fd(buf);
-  ASSERT_GE(fd, 0);
-  ASSERT_EQ(fmmap(CDSP_DOMAIN_ID, fd, buf, 0, arena_bytes,
-                  static_cast<int>(FASTRPC_MAP_FD)),
-            0);
-  uint32_t arena = 0xFFFFFFFFu;
-  ASSERT_EQ(nntr_hvx_arena_attach(handle_, fd, arena_bytes, &arena),
-            AEE_SUCCESS);
-  auto *base = static_cast<uint8_t *>(buf);
-  std::vector<uint32_t> a_gu(NE), a_dn(NE);
-  uint32_t off = 0;
-  for (uint32_t e = 0; e < NE; ++e) {
-    ASSERT_EQ(
-      nntr_hvx_weight_bake_export(handle_, h_gu[e], base + off, (int)gu_len),
-      AEE_SUCCESS);
-    ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
-                handle_, K, 2 * I, arena, off, gu[e].d.data(), (int)(2 * I),
-                gu[e].colsum.data(), (int)(2 * I), gu[e].bias.data(),
-                (int)(2 * I), &a_gu[e]),
-              AEE_SUCCESS);
-    off += stride_gu;
-    ASSERT_EQ(
-      nntr_hvx_weight_bake_export(handle_, h_dn[e], base + off, (int)dn_len),
-      AEE_SUCCESS);
-    ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
-                handle_, I, N, arena, off, dn[e].d.data(), (int)N,
-                dn[e].colsum.data(), (int)N, dn[e].bias.data(), (int)N,
-                &a_dn[e]),
-              AEE_SUCCESS);
-    off += stride_dn;
-  }
+  const std::vector<uint32_t> &a_gu = x.a_gu, &a_dn = x.a_dn;
 
   // M=1: the decode shape, one row to every expert. M=4: one expert holds
   // all four tokens, the rest 3, 2 and 1, rows distinct inside an expert
@@ -2393,14 +2431,102 @@ TEST_F(HmxMmU8I4Layer, MoeLayerM1GemvMatchesHmx) {
   ASSERT_EQ(applied, 0u);
   std::cout << "U8I4_FIELD path=moe_m1_gemv field=bit_identical value="
             << (bad_total == 0 ? "yes" : "no") << std::endl;
+  ReleaseMoeExperts(x);
+}
 
-  for (uint32_t e = 0; e < NE; ++e) {
-    for (uint32_t h : {a_gu[e], a_dn[e], h_gu[e], h_dn[e]}) {
-      EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, h), AEE_SUCCESS);
-    }
+/* [#105] Where the M=1 GEMV's time goes: three cells through the same
+   timed MoE layer call (moe_set_opts(1), M = 1, four experts, one warm-up
+   + 20 reps). "arena" reads the production mapping (uncached rpcmem),
+   "heap" the same experts' DSP-heap copies (cached), "hot" a small pair
+   (K 2048, inter 128, N 256; 272 KiB) shared by all four experts, so it
+   sits in L2 after the warm-up and the loop runs with no DDR under it.
+   hot ~ arena in ns/tile says the kernel is issue-bound; hot << arena
+   says the rest is feed. No performance assertion: the numbers are read
+   in the handoff next to the level-2 profile row. MM is the wall of the
+   two GEMV stages, SWIGLU their summed lane time (hexkl_mm_u8i4_moe.c). */
+TEST_F(HmxMmU8I4Layer, MoeM1GemvFeedVsCompute) {
+  const uint32_t K = 2048, I = 1792, N = 2048, NE = 4;
+  // test/htp/nntr_hvx_mm_u8i4.c's MOE_N_STAGES and the three slots read.
+  const int kMoeStages = 30, kMm = 10, kLane = 2, kPath = 29, kReps = 20;
+  MoeExperts x;
+  ASSERT_NO_FATAL_FAILURE(MakeMoeExperts(K, I, N, NE, x));
+  if (IsSkipped()) {
+    return;
   }
-  EXPECT_EQ(nntr_hvx_arena_detach(handle_, arena), AEE_SUCCESS);
-  rfree(buf);
+  const uint32_t hI = 128, hN = 256;
+  Weight hot_gu, hot_dn;
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * hI, 0xA8105000u, hot_gu));
+  ASSERT_NO_FATAL_FAILURE(MakeAndRegister(hI, hN, 0xC8105000u, hot_dn));
+
+  uint32_t applied = 0xFFFFFFFFu;
+  ASSERT_EQ(nntr_hvx_moe_set_opts(handle_, 1u, &applied), AEE_SUCCESS);
+  ASSERT_EQ(applied, 1u);
+
+  struct Cell {
+    const char *name;
+    uint32_t inter, n_out;
+    std::vector<uint32_t> gu, dn;
+  };
+  const std::vector<Cell> cells = {
+    {"arena", I, N, x.a_gu, x.a_dn},
+    {"heap", I, N, x.h_gu, x.h_dn},
+    {"hot", hI, hN, std::vector<uint32_t>(NE, hot_gu.handle),
+     std::vector<uint32_t>(NE, hot_dn.handle)},
+  };
+  const std::vector<uint32_t> row_count(NE, 1u), row_index(NE, 0u);
+  const std::vector<float> row_weight(NE, 0.25f);
+  std::vector<float> act(K);
+  fill_deterministic(act, 0x5EED0105u);
+  for (const Cell &c : cells) {
+    std::vector<float> out(c.n_out);
+    std::vector<uint32_t> stage(kMoeStages);
+    std::vector<uint32_t> mm, lane;
+    for (int rep = 0; rep <= kReps; ++rep) {
+      std::fill(stage.begin(), stage.end(), 0u);
+      ASSERT_EQ(nntr_hvx_mm_u8i4_moe_layer_timed(
+                  handle_, 1, K, c.inter, c.n_out, c.gu.data(), (int)NE,
+                  c.dn.data(), (int)NE, row_index.data(), (int)NE,
+                  row_count.data(), (int)NE, row_weight.data(), (int)NE,
+                  act.data(), (int)K, out.data(), (int)c.n_out, stage.data(),
+                  kMoeStages),
+                AEE_SUCCESS)
+        << c.name;
+      ASSERT_EQ(stage[kPath], 1u) << c.name << ": not the M=1 GEMV path";
+      if (rep > 0) {
+        mm.push_back(stage[kMm]);
+        lane.push_back(stage[kLane]);
+      }
+    }
+    // The median rep by MM, with that rep's lane time; the min for rule 2.
+    std::vector<size_t> ord(mm.size());
+    for (size_t i = 0; i < ord.size(); ++i)
+      ord[i] = i;
+    std::sort(ord.begin(), ord.end(),
+              [&](size_t a, size_t b) { return mm[a] < mm[b]; });
+    const size_t med = ord[ord.size() / 2];
+    // WH tiles (512 B) one call reads: per expert gate_up (K/32) x (2I/32)
+    // and down (I/32) x (N/32).
+    const double tiles =
+      static_cast<double>(NE) *
+      ((K / 32u) * (2u * c.inter / 32u) + (c.inter / 32u) * (c.n_out / 32u));
+    const double mm_us = mm[med], lane_us = lane[med];
+    const double gbps = mm_us > 0 ? tiles * 512.0 / mm_us / 1000.0 : 0.0;
+    const bool real = c.inter == I;
+    std::cout << std::fixed << std::setprecision(2)
+              << "U8I4_FIELD path=m1_bench cell=" << c.name
+              << " mm_us=" << mm_us << " mm_min_us=" << mm[ord[0]]
+              << " lane_us=" << lane_us
+              << " lanes=" << (mm_us > 0 ? lane_us / mm_us : 0.0)
+              << " tiles=" << tiles
+              << " ns_per_tile=" << lane_us * 1000.0 / tiles << " gbps=" << gbps
+              << ((real && gbps > 150.0) ? " INVALID" : "") << std::endl;
+  }
+
+  ASSERT_EQ(nntr_hvx_moe_set_opts(handle_, 0u, &applied), AEE_SUCCESS);
+  ASSERT_EQ(applied, 0u);
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, hot_gu.handle), AEE_SUCCESS);
+  EXPECT_EQ(nntr_hvx_weight_release_u8i4(handle_, hot_dn.handle), AEE_SUCCESS);
+  ReleaseMoeExperts(x);
 }
 
 TEST_F(HmxMmU8I4Layer, MemoryCeilings) {
