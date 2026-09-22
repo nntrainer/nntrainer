@@ -11,6 +11,7 @@
 #include "hvx_gather_ah_u8.h"
 #include "hvx_gemm_u8i4_wh.h"
 #include "hvx_scale_add_f32.h"
+#include "hvx_swiglu_f32.h"
 #include <AEEStdErr.h>
 #include <math.h>
 #include <stdlib.h>
@@ -466,4 +467,36 @@ void make_weight(uint32_t slot, uint32_t K, uint32_t N, W *w) {
   s->w_scale = w->ws;
   s->colsum_w = w->cs;
   s->bias = w->bias;
+}
+
+/* Link-only stand-ins for the paths of hexkl_mm_u8i4_dma.c no host check
+   takes: the registration bake (make_weight fills the table directly),
+   the DDR fallback when the accumulator layout is unusable (the stub
+   layout always is), and the fused SwiGLU entries. Reaching one is a
+   harness bug, not a kernel result. */
+int hexkl_micro_hmx_rm_to_wh_i4(uint8_t *b, uint32_t off, const int8_t *rm,
+                                uint32_t tr, uint32_t tc, uint32_t N) {
+  (void)b, (void)off, (void)rm, (void)tr, (void)tc, (void)N;
+  abort();
+}
+int hexkl_micro_hmx_copy_32b_to_submatrix(uint8_t *b, uint32_t off,
+                                          int32_t *dst, uint32_t rb,
+                                          uint32_t nt, uint32_t m_pad,
+                                          uint32_t N) {
+  (void)b, (void)off, (void)dst, (void)rb, (void)nt, (void)m_pad, (void)N;
+  abort();
+}
+void hvx_dequant_i32_to_f32(const int32_t *acc, uint32_t m_valid,
+                            uint32_t m_pad, uint32_t n, const float *act_scale,
+                            const int32_t *act_zp, const int32_t *colsum_w,
+                            const float *w_scale, const float *bias, float *out,
+                            int accumulate) {
+  (void)acc, (void)m_valid, (void)m_pad, (void)n, (void)act_scale, (void)act_zp;
+  (void)colsum_w, (void)w_scale, (void)bias, (void)out, (void)accumulate;
+  abort();
+}
+void hvx_swiglu_inplace_f32(float *gate, const float *up, uint32_t m_valid,
+                            uint32_t n_out, hvx_worker_pool *pool) {
+  (void)gate, (void)up, (void)m_valid, (void)n_out, (void)pool;
+  abort();
 }

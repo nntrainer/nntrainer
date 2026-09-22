@@ -1036,6 +1036,19 @@ int hexkl_mm_u8i4_moe_layer_run(
     int have_next = 0;
     if (have_cur) {
       const hexkl_weight_u8i4 *g = &tbl->slots[h_gate_up[blk.e]];
+      /* Known before the gate_up so its expert's weight can start
+         arriving during it (below). */
+      have_next = moe_blk_next(&nblk, n_active, order, row_count, slot_of);
+      /* The next expert's gate_up, chunk by chunk as this block's batches
+         free the columns: batch gb is the last reader of chunk gb's
+         columns, so chunk gb of the next expert goes out the moment it
+         has been issued and arrives under the batches after it and
+         DN(n-1). Pushed whole after the last batch, 3.5 MB had only
+         DN(n-1)'s two batches to hide behind and DRAIN read 251 us a call
+         (doc 51 section 2.24). Block 0's chunks went out before the loop
+         with the scan to hide behind. */
+      const hexkl_weight_u8i4 *g_next =
+        (have_next && nblk.first) ? &tbl->slots[h_gate_up[nblk.e]] : NULL;
       /* The block's rows' quantization parameters: contiguous in slot
          order, since every expert's slots are padded to whole blocks. */
       const float *act_scale = slot_scale + blk.slot;
@@ -1108,6 +1121,13 @@ int hexkl_mm_u8i4_moe_layer_run(
           }
         }
         HEXKL_MOE_MM_END();
+        if (g_next) {
+          (void)hexkl_moe_push_weight_chunk(vtcm_base, L.w_gu_off, g_next,
+                                            k_tiles, gu_ntiles, g0, np);
+          gu_idx[gb] =
+            hexkl_moe_push_weight_chunk(vtcm_base, L.w_gu_off, g_next, k_tiles,
+                                        gu_ntiles, inter_ntiles + g0, np);
+        }
 
         /* Retire what the pool is running -- DN(n-1)'s last epilogue at
            gb == 0, epilogue gb-1 otherwise (its buffer is the one batch
@@ -1141,13 +1161,11 @@ int hexkl_mm_u8i4_moe_layer_run(
         ++sb;
       }
 
-      /* A and the gate_up slot are free once the last batch is issued: the
-         nblk block's activation, and its expert's gate_up when it is a
-         new expert, go out now and arrive under DN(n-1). Activation
-         first: it is what GU(n+1) waits on before anything else, and
-         queued behind 3.5 MB of gate_up that wait would cover the gate_up
-         too. */
-      have_next = moe_blk_next(&nblk, n_active, order, row_count, slot_of);
+      /* A is free once the last batch is issued: the next block's
+         activation goes out now and arrives under DN(n-1). It is queued
+         behind the gate_up chunks above, so its wait at GU(n+1) covers
+         whatever of them is still in flight -- the last pair at most,
+         which had DN(n-1) to land under. */
       if (have_next) {
         HEXKL_PROBE_T0(p0);
         hvx_worker_pool_wait_bg(pool, pack_job,
@@ -1155,11 +1173,6 @@ int hexkl_mm_u8i4_moe_layer_run(
         HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
         act_idx = hexkl_moe_push_act_block(vtcm_base, L.act_off, act_ah,
                                            nblk.slot, K, k_tiles);
-        if (nblk.first) {
-          gu_nchunk = moe_push_gate_up_chunks(
-            vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[nblk.e]], k_tiles,
-            gu_ntiles, inter_ntiles, half, gu_idx);
-        }
       }
     }
 
