@@ -48,8 +48,46 @@ public:
   }
 
   size_t capacity() const { return capacity_; }
-  size_t size() const { return order_.size(); }
-  bool resident(Key k) const { return pos_.count(k) != 0; }
+  size_t size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return order_.size();
+  }
+  bool resident(Key k) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pos_.count(k) != 0;
+  }
+
+  /**
+   * @brief Evicts least recently used keys outside @a pinned until @a n more
+   *        keys fit -- room for keys the caller will bring in itself and
+   *        then hand to acquire() with a load that does nothing.
+   * @return false, evicting nothing, when the pinned keys already resident
+   *         leave no room for @a n.
+   */
+  bool makeRoom(size_t n, const std::vector<Key> &pinned,
+                const std::function<void(Key)> &evict) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::unordered_set<Key> pin(pinned.begin(), pinned.end());
+    size_t pinned_resident = 0;
+    for (Key k : pin)
+      pinned_resident += pos_.count(k);
+    if (pinned_resident + n > capacity_)
+      return false;
+    size_t excess =
+      order_.size() + n > capacity_ ? order_.size() + n - capacity_ : 0;
+    for (auto it = order_.begin(); excess != 0 && it != order_.end();) {
+      if (pin.count(*it) != 0) {
+        ++it;
+        continue;
+      }
+      Key victim = *it;
+      it = order_.erase(it);
+      pos_.erase(victim);
+      evict(victim);
+      --excess;
+    }
+    return true;
+  }
 
   /**
    * @brief Makes every key in @a need resident, evicting the least recently

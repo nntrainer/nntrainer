@@ -168,6 +168,10 @@ private:
    *  pool. Unset, nothing about the resident path changes. */
   bool experts_virtual;
   unsigned int cache_per_layer;
+  /** [doc 52 section 10.10] This layer's row in the table of virtual
+   *  experts preloadExperts builds in layer order, so a prefill call can
+   *  read the next layer's experts while it runs; -1 until preloaded. */
+  int expert_layer_slot;
   /** Ordinal of this MoE layer in finalize order, the layer id written to
    *  NNTR_MOE_TRACE. */
   unsigned int trace_layer;

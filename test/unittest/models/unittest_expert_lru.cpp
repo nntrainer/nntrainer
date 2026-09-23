@@ -120,4 +120,38 @@ TEST(ExpertLru, RefreshMovesResidentKeysToTheBackInOrder) {
   EXPECT_EQ(r.evicted, (std::vector<int>{1}));
 }
 
+TEST(ExpertLru, MakeRoomEvictsOldestUnpinnedUntilNFit) {
+  ExpertLru lru;
+  int layer;
+  lru.addLayer(&layer, 5);
+  Recorder r;
+  lru.acquire({key(0), key(1), key(2), key(3), key(4)}, r.load, r.evict);
+  // Room for 3 with 0 and 2 pinned: 1, 3, 4 go in LRU order.
+  EXPECT_TRUE(lru.makeRoom(3, {key(0), key(2)}, r.evict));
+  EXPECT_EQ(r.evicted, (std::vector<int>{1, 3, 4}));
+  EXPECT_EQ(ids(lru.order()), (std::vector<int>{0, 2}));
+  // The caller brings them in itself; acquire files them with a no-op load.
+  size_t loads = 0;
+  lru.acquire(
+    {key(5), key(6), key(7)}, [&](ExpertLru::Key) { ++loads; }, r.evict);
+  EXPECT_EQ(loads, 3u);
+  EXPECT_EQ(lru.size(), 5u);
+  EXPECT_EQ(r.evicted.size(), 3u); // no further eviction
+}
+
+TEST(ExpertLru, MakeRoomRefusesWithoutEvictingWhenPinsFillThePool) {
+  ExpertLru lru;
+  int layer;
+  lru.addLayer(&layer, 4);
+  Recorder r;
+  lru.acquire({key(0), key(1), key(2), key(3)}, r.load, r.evict);
+  // 3 pinned resident + 2 wanted > 4: nothing may go.
+  EXPECT_FALSE(lru.makeRoom(2, {key(0), key(1), key(2), key(9)}, r.evict));
+  EXPECT_TRUE(r.evicted.empty());
+  EXPECT_EQ(lru.size(), 4u);
+  // Room that already exists costs nothing.
+  EXPECT_TRUE(lru.makeRoom(0, {}, r.evict));
+  EXPECT_TRUE(r.evicted.empty());
+}
+
 } // namespace
