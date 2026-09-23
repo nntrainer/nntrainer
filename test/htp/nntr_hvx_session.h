@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 
+#include "hexkl_graph.h"
 #include "hexkl_mm_u8i4_dma.h"
 #include "hexkl_mm_u8i4_moe.h"
 #include "hexkl_mm_u8i8_dma.h"
@@ -61,7 +62,19 @@ typedef struct {
                                       grown on demand, freed in close() */
   uint32_t moe_flags; /**< HEXKL_MOE_FLAG_* bits from moe_set_opts; the
                            session is calloc'd, so 0 = the HMX loop */
+  hexkl_graph *graph; /**< [#85] the decode op table from graph_init; NULL
+                           = none. Freed in close() before the weight
+                           tables, since its MoE ops name their handles */
 } nntr_hvx_session;
+
+/** @brief [#85] mm_u8i4_moe_layer_timed's stage table, shared with
+ *  forward_debug so the two cannot drift: the slot count the ARM side
+ *  must pass, and the fill from the probe tables after a bracket
+ *  [t0, t1] (hexkl_probe_now ticks) around the run. Both live in
+ *  nntr_hvx_mm_u8i4.c, next to the enum that names the slots. */
+uint32_t nntr_hvx_moe_stage_count(void);
+int nntr_hvx_moe_stage_fill(uint32_t *stage_us, uint64_t t0, uint64_t t1,
+                            int rc);
 
 /** @brief HAP_mmap_put on every attached arena. close() calls it after the
  *  weight tables are released, since a borrowed slot points into one. Lives

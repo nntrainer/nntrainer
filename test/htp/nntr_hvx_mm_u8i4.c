@@ -140,6 +140,13 @@ int nntr_hvx_weight_release_u8i4(remote_handle64 handle, uint32 w_handle) {
   if (!s) {
     return AEE_EBADPARM;
   }
+  /* [#85] The arena_detach rule, one level up: a handle the live graph's
+     MoE ops name stays registered until graph_release. */
+  if (hexkl_graph_uses_handle(s->graph, w_handle)) {
+    FARF(ERROR, "weight_release_u8i4: handle %u is bound in the graph",
+         (unsigned)w_handle);
+    return AEE_EBADSTATE;
+  }
   return hexkl_weight_u8i4_release(&s->weights_u8i4, w_handle);
 }
 
@@ -1013,7 +1020,15 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
     row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch, s->moe_flags);
   t1 = hexkl_probe_now();
   hexkl_probe_on = 0;
+  return nntr_hvx_moe_stage_fill(stage_us, t0, t1, rc);
+}
 
+uint32_t nntr_hvx_moe_stage_count(void) { return MOE_N_STAGES; }
+
+/* [#85] The slot fill, shared with forward_debug (nntr_hvx_graph.c). Read
+   after hexkl_probe_on is cleared, as moe_layer_timed always did. */
+int nntr_hvx_moe_stage_fill(uint32 *stage_us, uint64_t t0, uint64_t t1,
+                            int rc) {
   stage_us[MOE_T_DSP_TOTAL] = (uint32)(t1 - t0);
   stage_us[MOE_T_QUANT] = (uint32)hexkl_probe_us[HEXKL_PROBE_QUANT];
   stage_us[MOE_T_SWIGLU] = (uint32)hexkl_probe_us[HEXKL_PROBE_SWIGLU];
