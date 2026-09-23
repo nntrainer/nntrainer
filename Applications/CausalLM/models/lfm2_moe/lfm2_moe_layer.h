@@ -131,6 +131,19 @@ public:
    */
   bool supportBackwarding() const override { return false; }
 
+  /**
+   * @brief [doc 52] Brings this layer's virtual experts into the shared
+   *        resident pool at load, in expert order, until the pool is full.
+   *        Called by Transformer::repack_weight after every weight is read
+   *        so the first prefill pays no arena mapping; a no-op when the
+   *        experts are not virtual. Goes through the same LRU the forward
+   *        uses, so what is resident and what the LRU believes agree.
+   * @return true when every expert of this layer is resident afterwards
+   *         (always, for non-virtual experts): what the load-time warm-up
+   *         call needs of the layer it runs on.
+   */
+  bool preloadExperts(nntrainer::RunLayerContext &context);
+
   static constexpr const char *type = "lfm2_moe"; /**< type of the layer */
 
 private:
@@ -146,6 +159,22 @@ private:
   std::vector<unsigned int> expert_down_proj_indices;
   unsigned int gate_idx;
   unsigned int expert_bias_idx;
+
+  /** [doc 52] Expert weights left virtual (never read by the loader) and
+   *  streamed from the model file into accelerator-owned slots under an
+   *  LRU shared by every MoE layer: set when the layer runs on an
+   *  accelerator engine and NNTR_MOE_CACHE_EXPERTS is in the environment.
+   *  cache_per_layer is that variable's value, this layer's share of the
+   *  pool. Unset, nothing about the resident path changes. */
+  bool experts_virtual;
+  unsigned int cache_per_layer;
+  /** [doc 52 section 10.10] This layer's row in the table of virtual
+   *  experts preloadExperts builds in layer order, so a prefill call can
+   *  read the next layer's experts while it runs; -1 until preloaded. */
+  int expert_layer_slot;
+  /** Ordinal of this MoE layer in finalize order, the layer id written to
+   *  NNTR_MOE_TRACE. */
+  unsigned int trace_layer;
 
   // intermediate tensor indices
   unsigned int router_logits_idx;
@@ -167,11 +196,17 @@ private:
    * @param expert_bias Per-expert bias tensor [1, 1, 1, E]
    * @param total_tokens number of tokens routed
    * @param[out] expert_assignments per-expert list of (token index, weight)
+   * @param[out] extra_top_k when non-null, every token's top-(k + 5)
+   *             expert ids in rank order, appended token by token: the
+   *             recency hint the expert LRU refreshes from (doc 52), the
+   *             same rule Lfm2CachedSlimMoELayer applies. The routing
+   *             itself is unchanged by asking for it.
    */
   void buildExpertAssignments(
     const nntrainer::Tensor &router_logits,
     const nntrainer::Tensor &expert_bias, unsigned int total_tokens,
-    std::vector<std::vector<std::pair<unsigned, float>>> &expert_assignments);
+    std::vector<std::vector<std::pair<unsigned, float>>> &expert_assignments,
+    std::vector<int> *extra_top_k = nullptr);
 
   /**
    * @brief Run one expert as a token batch and stream its compact output

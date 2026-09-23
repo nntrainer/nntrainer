@@ -358,7 +358,13 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   }
 
   // VTCM layout: activation (all row-bands, shared across every handle) |
-  // weight double-buffer (sized for the widest handle) | one result tile.
+  // weight double-buffer (sized for the widest handle) | TWO staging
+  // buffers of acc_tiles result tiles each, in whatever room is left (at
+  // least one tile each): the HMX issues a batch of n-tiles into one while
+  // the pool dequantizes the other, the same shape as hexkl_mm_u8i4_moe.c's
+  // epilogue. Dequantizing each tile on the calling thread between two
+  // acc_reads left the HMX idle for it -- 270-400 us of a 1.3-1.8 ms
+  // prefill projection call (doc 51 section 2.24).
   const uint32_t act_bytes =
     n_rblocks * k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
   const uint32_t act_off = 0;
@@ -369,11 +375,16 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   };
   const uint32_t result_off =
     ROUND_UP_U32(wbuf[1] + wb_max, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  if (result_off + ACC_TILE_BYTES > config_off) {
+  const uint32_t arena = vtcm_size < config_off ? vtcm_size : config_off;
+  if (result_off + 2u * ACC_TILE_BYTES > arena) {
     return AEE_ENOMEMORY; // double-buffered widest weight does not fit VTCM
   }
-  if (result_off + ACC_TILE_BYTES > vtcm_size) {
-    return AEE_ENOMEMORY;
+  /* Capped at 32 like the MoE kernel's: past the worker count a bigger
+     batch parallelises no better, and a smaller one exposes less at the
+     end of each row block. */
+  uint32_t acc_tiles = (arena - result_off) / (2u * ACC_TILE_BYTES);
+  if (acc_tiles > 32u) {
+    acc_tiles = 32u;
   }
 
   // Reset once per call, before ANY push2d -- moved here (was just before
@@ -469,6 +480,14 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
 
   int rc = AEE_SUCCESS;
   size_t out_off = 0;
+  /* The pooled epilogue: one job per staging buffer, each alive from its
+     submit to the wait one batch later, and the staging parity runs across
+     row blocks and handles. Not with accumulate (the attention paths add
+     into out_cat and the job has no flag for it) nor without the in-place
+     tile layout; those keep the synchronous tile-at-a-time path. */
+  const int pipelined = acc_layout->usable && !o->accumulate;
+  hvx_dq_tiles_job dq_job[2];
+  uint32_t sb = 0u;
 
   // Handle 0's weight was issued before the activation quantization above;
   // this is where the wait for it lands. With one handle -- every MoE
@@ -498,39 +517,77 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
     }
 
     for (uint32_t rb = 0; rb < n_rblocks; ++rb) {
-      for (uint32_t nt = 0; nt < nt_n; ++nt) {
-        hexkl_micro_hmx_acc_clear_int32();
-        for (uint32_t kt = 0; kt < k_tiles; ++kt) {
-          const uint32_t act_tile_off =
-            act_off + (rb * k_tiles + kt) * HEXKL_HMX_ACTIVATION_ALIGNMENT;
-          const uint32_t w_tile_off =
-            wcur + (kt * nt_n + nt) * WEIGHT_TILE_BYTES_U8I4;
-          rc = hexkl_micro_hmx_mm_u8i4(vtcm_base, act_tile_off, w_tile_off);
+      /** The rows beyond M are the accumulator's padding: their
+       * quantization parameters are synthetic, so emitting them would be
+       * wrong, not merely wasted -- the same rule hvx_dequant_i32_to_f32
+       * applies via m_valid. At decode that is 62 of 64 rows never touched
+       * at all. */
+      const uint32_t m0 = rb * HEXKL_ACC_TILE_ROWS;
+      const uint32_t cnt =
+        (m0 >= M)
+          ? 0u
+          : ((M - m0 < HEXKL_ACC_TILE_ROWS) ? (M - m0) : HEXKL_ACC_TILE_ROWS);
+      for (uint32_t nt0 = 0; nt0 < nt_n; nt0 += acc_tiles) {
+        const uint32_t nb = (nt_n - nt0 < acc_tiles) ? (nt_n - nt0) : acc_tiles;
+        const uint32_t stage_off =
+          result_off + (sb & 1u) * acc_tiles * ACC_TILE_BYTES;
+        /* This staging buffer was last read by the job two batches back,
+           retired when the last one was submitted. */
+        for (uint32_t j = 0; j < nb; ++j) {
+          hexkl_micro_hmx_acc_clear_int32();
+          for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+            const uint32_t act_tile_off =
+              act_off + (rb * k_tiles + kt) * HEXKL_HMX_ACTIVATION_ALIGNMENT;
+            const uint32_t w_tile_off =
+              wcur + (kt * nt_n + nt0 + j) * WEIGHT_TILE_BYTES_U8I4;
+            rc = hexkl_micro_hmx_mm_u8i4(vtcm_base, act_tile_off, w_tile_off);
+            if (rc != AEE_SUCCESS) {
+              goto out;
+            }
+          }
+          HEXKL_PROBE_T0(p0);
+          rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off,
+                                              stage_off + j * ACC_TILE_BYTES);
+          HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
           if (rc != AEE_SUCCESS) {
             goto out;
           }
         }
-        HEXKL_PROBE_T0(p0);
-        rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off, result_off);
-        HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
-        if (rc != AEE_SUCCESS) {
-          goto out;
-        }
-        if (acc_layout->usable) {
-          /** Dequantize the tile where it already is. The rows beyond M are
-           * the accumulator's padding: their quantization parameters are
-           * synthetic, so emitting them would be wrong, not merely wasted --
-           * the same rule hvx_dequant_i32_to_f32 applies via m_valid. At
-           * decode that is 62 of 64 rows never touched at all. */
-          const uint32_t m0 = rb * HEXKL_ACC_TILE_ROWS;
-          const uint32_t cnt =
-            (m0 >= M) ? 0u
-                      : ((M - m0 < HEXKL_ACC_TILE_ROWS) ? (M - m0)
-                                                        : HEXKL_ACC_TILE_ROWS);
+        if (pipelined) {
+          /* Retire the previous batch's job -- what this wait reads is the
+             exposed part -- then hand this batch to the pool and go on
+             issuing. */
+          HEXKL_PROBE_T0(p0);
+          hvx_worker_pool_wait(o->pool);
+          HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
           if (cnt != 0u) {
+            hvx_dq_tiles_job *jb = &dq_job[sb & 1u];
+            jb->tiles_base =
+              (const uint8_t *)((const int32_t *)(vtcm_base + stage_off) +
+                                acc_layout->base);
+            jb->tile_stride = ACC_TILE_BYTES;
+            jb->nt0 = nt0;
+            jb->row_stride = acc_layout->row_stride;
+            jb->m_count = cnt;
+            jb->act_scale = act_scale + m0;
+            jb->act_zp = act_zp + m0;
+            jb->colsum_w = h->colsum_w;
+            jb->w_scale = h->w_scale;
+            jb->bias = h->bias;
+            jb->dst_a = out_cat + out_off + (size_t)m0 * h->N;
+            jb->dst_b = NULL;
+            jb->split = h->N;
+            jb->dst_stride = h->N;
+            jb->n_tiles = nb;
+            hvx_worker_pool_submit(o->pool, hvx_dq_tiles_worker, jb, nb);
+          }
+        } else if (acc_layout->usable) {
+          /* Dequantize each tile where it is, on this thread. */
+          for (uint32_t j = 0; j < nb && cnt != 0u; ++j) {
             const int32_t *tile =
-              (const int32_t *)(vtcm_base + result_off) + acc_layout->base;
-            const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
+              (const int32_t *)(vtcm_base + stage_off + j * ACC_TILE_BYTES) +
+              acc_layout->base;
+            const uint32_t c0 = (nt0 + j) * HEXKL_ACC_TILE_COLS;
             HEXKL_PROBE_T0(p0);
             hvx_dequant_acc_tile_to_f32(
               tile, acc_layout->row_stride, cnt, act_scale + m0, act_zp + m0,
@@ -539,14 +596,18 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
             HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
           }
         } else {
-          HEXKL_PROBE_T0(p0);
-          rc = hexkl_micro_hmx_copy_32b_to_submatrix(
-            vtcm_base, result_off, acc_scratch, rb, nt, m_pad, h->N);
-          HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
-          if (rc != AEE_SUCCESS) {
-            goto out;
+          for (uint32_t j = 0; j < nb; ++j) {
+            HEXKL_PROBE_T0(p0);
+            rc = hexkl_micro_hmx_copy_32b_to_submatrix(
+              vtcm_base, stage_off + j * ACC_TILE_BYTES, acc_scratch, rb,
+              nt0 + j, m_pad, h->N);
+            HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
+            if (rc != AEE_SUCCESS) {
+              goto out;
+            }
           }
         }
+        ++sb;
       }
     }
 
@@ -572,6 +633,12 @@ int hexkl_mm_u8i4_layer_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   }
 
 out:
+  /* The last batch's job, or one left in flight by an error path, reads
+     VTCM and the scale arrays freed below and writes out_cat: retire it
+     before either goes away. */
+  HEXKL_PROBE_T0(p0);
+  hvx_worker_pool_wait(o->pool);
+  HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
   free(loc_scale);
   free(loc_zp);
   free(acc_scratch);
