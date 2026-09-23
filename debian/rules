@@ -75,7 +75,8 @@ override_dh_auto_install:
 NNTR_BACKEND_INC = debian/tmp/usr/include/nntrainer
 NNTR_BACKEND_HEADERS = $(wildcard $(NNTR_BACKEND_INC)/x86_compute_backend.h $(NNTR_BACKEND_INC)/avx2_impl.h)
 NNTR_BACKEND_HEADERS += $(wildcard $(NNTR_BACKEND_INC)/arm_compute_backend.h $(NNTR_BACKEND_INC)/armv7_neon.h)
-NNTR_BACKEND_HEADERS += $(wildcard $(NNTR_BACKEND_INC)/mask_neon.h $(NNTR_BACKEND_INC)/neon_impl.h $(NNTR_BACKEND_INC)/neon_mathfun.h)
+NNTR_BACKEND_HEADERS += $(wildcard $(NNTR_BACKEND_INC)/mask_neon.h $(NNTR_BACKEND_INC)/neon_impl.h)
+NNTR_BACKEND_HEADERS += $(wildcard $(NNTR_BACKEND_INC)/neon_mathfun.h $(NNTR_BACKEND_INC)/neon_mathfun.hxx)
 NNTR_BACKEND_HEADERS += $(wildcard $(NNTR_BACKEND_INC)/hgemm*.h $(NNTR_BACKEND_INC)/matrix_transpose*.h)
 NNTR_BACKEND_HEADERS += $(wildcard $(NNTR_BACKEND_INC)/kleidiai_*.h $(NNTR_BACKEND_INC)/kai_*.h)
 
