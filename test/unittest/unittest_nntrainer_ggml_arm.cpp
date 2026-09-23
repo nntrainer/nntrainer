@@ -39,6 +39,12 @@ static inline uint16_t fp32_to_fp16_bits(float f) {
   return bits;
 }
 
+static inline float fp16_bits_to_fp32(uint16_t bits) {
+  __fp16 h;
+  memcpy(&h, &bits, sizeof(h));
+  return (float)h;
+}
+
 using std::chrono::duration_cast;
 using std::chrono::high_resolution_clock;
 using std::chrono::nanoseconds;
@@ -538,6 +544,158 @@ TEST(nntrainer_ggml_arm, gemm_q8_0_4x8_128x128x128) {
   float cos = test_q8_0_4x8(M, N, K);
 
   EXPECT_GT(cos, 0.999f);
+}
+
+/**
+ * @brief Scalar reference for nntr_gemv_q8_0_4x8_q8_0.
+ *
+ * Accumulates each 32-element block in int32 and applies the two deltas once
+ * per block, mirroring the vectorized kernel's arithmetic so that the two can
+ * be compared with a tight tolerance.
+ */
+static void nntr_gemv_q8_0_4x8_q8_0_ref(int n, float *__restrict s,
+                                        const block_q8_0x4_testonly *b,
+                                        const block_q8_0_testonly *a, int nc) {
+  const int nb = n / 32;
+
+  for (int x = 0; x < nc / 4; x++) {
+    const block_q8_0x4_testonly *bp = b + x * nb;
+    for (int j = 0; j < 4; j++) {
+      float sum = 0.0f;
+      for (int l = 0; l < nb; l++) {
+        int32_t acc = 0;
+        for (int k = 0; k < 4; k++) {
+          for (int i = 0; i < 8; i++) {
+            acc += bp[l].qs[k * 32 + j * 8 + i] * a[l].qs[k * 8 + i];
+          }
+        }
+        sum += acc * fp16_bits_to_fp32(bp[l].d[j]) * fp16_bits_to_fp32(a[l].d);
+      }
+      s[x * 4 + j] = sum;
+    }
+  }
+}
+
+/**
+ * @brief Build random q8_0x4 weights and a random q8_0 activation row
+ */
+static void fill_gemv_q8_0_4x8_operands(std::vector<block_q8_0x4_testonly> &b,
+                                        std::vector<block_q8_0_testonly> &a,
+                                        int nb, int nc, unsigned int seed) {
+  b.assign((size_t)(nc / 4) * nb, block_q8_0x4_testonly{});
+  a.assign(nb, block_q8_0_testonly{});
+
+  std::mt19937 gen(seed);
+  std::uniform_int_distribution<int> quant(-127, 127);
+  std::uniform_real_distribution<float> delta(0.01f, 0.5f);
+
+  for (auto &blk : b) {
+    for (int j = 0; j < 4; j++)
+      blk.d[j] = fp32_to_fp16_bits(delta(gen));
+    for (auto &v : blk.qs)
+      v = (int8_t)quant(gen);
+  }
+  for (auto &blk : a) {
+    blk.d = fp32_to_fp16_bits(delta(gen));
+    for (auto &v : blk.qs)
+      v = (int8_t)quant(gen);
+  }
+}
+
+TEST(nntrainer_ggml_arm, gemv_q8_0_4x8_matches_scalar_reference) {
+  nntr_ggml_init();
+
+  for (int K : {32, 128, 256}) {
+    for (int nc : {4, 16, 128}) {
+      std::vector<block_q8_0x4_testonly> B;
+      std::vector<block_q8_0_testonly> A;
+      fill_gemv_q8_0_4x8_operands(B, A, K / 32, nc, 1234u + K + nc);
+
+      std::vector<float> got(nc, 0.0f), want(nc, 0.0f);
+      nntr_gemv_q8_0_4x8_q8_0(K, got.data(), nc, B.data(), A.data(), 1, nc);
+      nntr_gemv_q8_0_4x8_q8_0_ref(K, want.data(), B.data(), A.data(), nc);
+
+      for (int i = 0; i < nc; i++) {
+        SCOPED_TRACE("K=" + std::to_string(K) + " nc=" + std::to_string(nc) +
+                     " col=" + std::to_string(i));
+        EXPECT_NEAR(want[i], got[i], std::abs(want[i]) * 1e-4f + 1e-3f);
+      }
+    }
+  }
+}
+
+/**
+ * @brief Each 8-byte chunk of the activation row must reach the matching
+ * weight chunk.
+ *
+ * Only one chunk is non-zero per iteration and every chunk carries a distinct
+ * weight, so a chunk that is dropped or read from the wrong offset changes the
+ * result. This is what a miscompiled 32-byte activation load looks like.
+ */
+TEST(nntrainer_ggml_arm, gemv_q8_0_4x8_activation_chunk_coverage) {
+  nntr_ggml_init();
+
+  const int K = 32, nc = 4;
+
+  for (int chunk = 0; chunk < 4; chunk++) {
+    std::vector<block_q8_0x4_testonly> B(1, block_q8_0x4_testonly{});
+    std::vector<block_q8_0_testonly> A(1, block_q8_0_testonly{});
+
+    for (int j = 0; j < 4; j++)
+      B[0].d[j] = fp32_to_fp16_bits(1.0f);
+    A[0].d = fp32_to_fp16_bits(1.0f);
+
+    for (int k = 0; k < 4; k++)
+      for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 8; i++)
+          B[0].qs[k * 32 + j * 8 + i] = (int8_t)(k + 1);
+
+    for (int i = 0; i < 8; i++)
+      A[0].qs[chunk * 8 + i] = 8;
+
+    std::vector<float> got(nc, 0.0f);
+    nntr_gemv_q8_0_4x8_q8_0(K, got.data(), nc, B.data(), A.data(), 1, nc);
+
+    const float want = 8.0f * 8.0f * (float)(chunk + 1);
+    for (int j = 0; j < nc; j++) {
+      SCOPED_TRACE("chunk=" + std::to_string(chunk) +
+                   " col=" + std::to_string(j));
+      EXPECT_NEAR(want, got[j], 1e-3f);
+    }
+  }
+}
+
+TEST(nntrainer_ggml_arm, gemv_q8_0_4x8_zero_scale_n) {
+  nntr_ggml_init();
+
+  const int K = 128, nc = 16, nb = K / 32;
+  std::vector<block_q8_0x4_testonly> B;
+  std::vector<block_q8_0_testonly> A;
+
+  fill_gemv_q8_0_4x8_operands(B, A, nb, nc, 4242u);
+  for (auto &blk : A)
+    blk.d = fp32_to_fp16_bits(0.0f);
+
+  std::vector<float> got(nc, -1.0f);
+  nntr_gemv_q8_0_4x8_q8_0(K, got.data(), nc, B.data(), A.data(), 1, nc);
+  for (int i = 0; i < nc; i++)
+    EXPECT_FLOAT_EQ(0.0f, got[i]);
+
+  fill_gemv_q8_0_4x8_operands(B, A, nb, nc, 4242u);
+  for (int l = 0; l < nb; l++)
+    B[l].d[2] = fp32_to_fp16_bits(0.0f);
+
+  std::fill(got.begin(), got.end(), -1.0f);
+  nntr_gemv_q8_0_4x8_q8_0(K, got.data(), nc, B.data(), A.data(), 1, nc);
+
+  std::vector<float> want(nc, 0.0f);
+  nntr_gemv_q8_0_4x8_q8_0_ref(K, want.data(), B.data(), A.data(), nc);
+
+  EXPECT_FLOAT_EQ(0.0f, got[2]);
+  for (int i = 0; i < nc; i++) {
+    SCOPED_TRACE("col=" + std::to_string(i));
+    EXPECT_NEAR(want[i], got[i], std::abs(want[i]) * 1e-4f + 1e-3f);
+  }
 }
 
 TEST(nntrainer_ggml_arm, DISABLED_quantize_row_q8_0_benchmark) {
