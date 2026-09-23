@@ -2134,7 +2134,11 @@ class HmxArenaSlotReuse : public HmxMmU8I4Layer {
 protected:
   /** @return bad elements on the reuse pass (pass 1), or SIZE_MAX if the
    *  run could not get that far. */
-  size_t Run(const char *path) {
+  /** @param swap fill the slot the way the host's expert pool does since
+   *  doc 52 section 10.12: overwrite it while the previous pair is still
+   *  registered, then one weight_swap_u8i4_arena registers the new pair and
+   *  releases the old -- rather than release, overwrite, register. */
+  size_t Run(const char *path, bool swap = false) {
     const uint32_t K = 2048, I = 1792, N = 2048, M = 64, NE = 2;
 
     auto alloc =
@@ -2205,6 +2209,7 @@ protected:
     };
 
     size_t reuse_bad = SIZE_MAX;
+    uint32_t prev_gu = 0xFFFFFFFFu, prev_dn = 0xFFFFFFFFu;
     std::vector<uint8_t> host_gu(gu_len), host_dn(dn_len);
     for (uint32_t e = 0; e < NE; ++e) {
       if (nntr_hvx_weight_bake_export(handle_, gu[e].handle, host_gu.data(),
@@ -2217,22 +2222,44 @@ protected:
       std::memcpy(base, host_gu.data(), gu_len);
       std::memcpy(base + stride_gu, host_dn.data(), dn_len);
       uint32_t a_gu = 0xFFFFFFFFu, a_dn = 0xFFFFFFFFu;
-      if (nntr_hvx_weight_register_u8i4_arena(
-            handle_, K, 2 * I, arena, 0, gu[e].d.data(), (int)(2 * I),
-            gu[e].colsum.data(), (int)(2 * I), gu[e].bias.data(), (int)(2 * I),
-            &a_gu) != AEE_SUCCESS ||
-          nntr_hvx_weight_register_u8i4_arena(
-            handle_, I, N, arena, stride_gu, dn[e].d.data(), (int)N,
-            dn[e].colsum.data(), (int)N, dn[e].bias.data(), (int)N,
-            &a_dn) != AEE_SUCCESS) {
+      if (swap) {
+        const int err = nntr_hvx_weight_swap_u8i4_arena(
+          handle_, prev_gu, prev_dn, K, I, N, arena, 0, stride_gu,
+          gu[e].d.data(), (int)(2 * I), gu[e].colsum.data(), (int)(2 * I),
+          dn[e].d.data(), (int)N, dn[e].colsum.data(), (int)N, &a_gu, &a_dn);
+        if (err != AEE_SUCCESS) {
+          ADD_FAILURE() << path
+                        << ": weight_swap_u8i4_arena failed: " << hex(err);
+          break;
+        }
+        if (prev_gu != 0xFFFFFFFFu) {
+          // The swap released them: releasing again must be refused.
+          EXPECT_NE(nntr_hvx_weight_release_u8i4(handle_, prev_gu), AEE_SUCCESS)
+            << path << ": the old gate_up handle survived the swap";
+          EXPECT_NE(nntr_hvx_weight_release_u8i4(handle_, prev_dn), AEE_SUCCESS)
+            << path << ": the old down handle survived the swap";
+        }
+      } else if (nntr_hvx_weight_register_u8i4_arena(
+                   handle_, K, 2 * I, arena, 0, gu[e].d.data(), (int)(2 * I),
+                   gu[e].colsum.data(), (int)(2 * I), gu[e].bias.data(),
+                   (int)(2 * I), &a_gu) != AEE_SUCCESS ||
+                 nntr_hvx_weight_register_u8i4_arena(
+                   handle_, I, N, arena, stride_gu, dn[e].d.data(), (int)N,
+                   dn[e].colsum.data(), (int)N, dn[e].bias.data(), (int)N,
+                   &a_dn) != AEE_SUCCESS) {
         ADD_FAILURE() << path << ": register_arena failed";
         break;
       }
       std::vector<float> from_heap, from_slot;
       const int e1 = run(gu[e].handle, dn[e].handle, from_heap);
       const int e2 = run(a_gu, a_dn, from_slot);
-      nntr_hvx_weight_release_u8i4(handle_, a_gu);
-      nntr_hvx_weight_release_u8i4(handle_, a_dn);
+      if (swap) { // the next pass's swap releases them
+        prev_gu = a_gu;
+        prev_dn = a_dn;
+      } else {
+        nntr_hvx_weight_release_u8i4(handle_, a_gu);
+        nntr_hvx_weight_release_u8i4(handle_, a_dn);
+      }
       if (e1 != AEE_SUCCESS || e2 != AEE_SUCCESS) {
         ADD_FAILURE() << path << ": moe_layer failed";
         break;
@@ -2247,6 +2274,10 @@ protected:
       reuse_bad = bad;
     }
 
+    if (prev_gu != 0xFFFFFFFFu) {
+      nntr_hvx_weight_release_u8i4(handle_, prev_gu);
+      nntr_hvx_weight_release_u8i4(handle_, prev_dn);
+    }
     nntr_hvx_arena_detach(handle_, arena);
     for (uint32_t e = 0; e < NE; ++e) {
       nntr_hvx_weight_release_u8i4(handle_, gu[e].handle);
@@ -2261,6 +2292,12 @@ TEST_F(HmxArenaSlotReuse, Uncached) {
   EXPECT_EQ(Run("arena_slot_reuse"), 0u)
     << "a reused uncached slot differs from the heap weight: the DSP read "
        "stale bytes, and register_arena needs an L2 invalidate";
+}
+
+TEST_F(HmxArenaSlotReuse, Swap) {
+  EXPECT_EQ(Run("arena_slot_swap", /*swap=*/true), 0u)
+    << "the slot refilled under a still-registered pair and swapped in "
+       "differs from the heap weight";
 }
 
 TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
