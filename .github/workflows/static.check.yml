@@ -124,6 +124,23 @@ jobs:
         # Originally from "pr-prebuild-prohibited-words"
         run: |
           bash .github/workflows/static.check.scripts/prohibited-words.sh $changed_file_list
+      - name: /Checker/ prohibited-words self-test
+        # This step runs a repository script rather than acting on
+        # $changed_file_list. For a pull_request event the step list comes
+        # from the merge ref while the tree comes from the PR head, so a PR
+        # whose head predates this script would fail here on a missing
+        # file. Run the self-test only when the head actually carries it,
+        # and fail loudly only when the PR is the one removing it.
+        run: |
+          selftest=.github/workflows/static.check.scripts/test_prohibited_words.sh
+          if [ -f "$selftest" ]; then
+            bash "$selftest"
+          elif git show --pretty="format:" --name-only --no-renames --diff-filter=D ${{ github.event.pull_request.head.sha }} -${{ github.event.pull_request.commits }} | grep -qxF "$selftest"; then
+            echo "::error::This PR removes $selftest; remove its workflow step too, or restore the script (also update this step if the script moved)."
+            exit 1
+          else
+            echo "Skipped: $selftest is not in this branch's tree and this PR does not remove it."
+          fi
       - name: /Checker/ signed-off-by required
         # Originally from "pr-prebuild-signed-off-by"
         run: |
