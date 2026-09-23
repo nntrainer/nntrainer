@@ -437,9 +437,32 @@ static uint32_t moe_tail_rows(uint32_t n_e) {
  * LFM2 shape, only when a decode call comes before any prefill call (a
  * prefill call's 12.8 MB already covers it).
  *
- * ponytail: the arena feed is whatever the DSP's mapping of uncached ION
- * gives vector loads behind an l2fetch; staging each expert's weight into
- * VTCM by DMA is the upgrade (LEDGER (22) feed half, #100).
+ * THE VTCM FEED (#117, hexkl_moe_flags_feed). The arena read above tops
+ * out at 21-27 GB/s on this SoC (LEDGER rule 27) while the DMA engine
+ * moves the same bytes at 31-32 (#100's f2 cell, rule 32), so with the
+ * feed on each expert's gate_up and down are staged into VTCM by the
+ * engine one expert ahead and the GEMV reads the VTCM copy. The M=1 path
+ * uses no VTCM otherwise, so the whole arena is free: two gate_up-sized
+ * slabs G0 / G1 at offsets 0 and gu_bytes double-buffer stage A by expert
+ * (gate_up of expert i in slab i & 1), and once a slab has no gate_up
+ * left to hold, two down matrices land in it (down of expert j in slab
+ * (j >> 1) & 1, half j & 1). Every push is a whole matrix in one
+ * descriptor -- f2's shape, 8 per call at top-4 -- and every reuse of a
+ * slab follows the join of the pool run that read it, which is what lets
+ * the host scoreboard (test/htp/host/moe_layer_host_check.c) check the
+ * schedule exactly. The caller alone touches the ring; the waits sit
+ * inside the MM bracket so mm reads the feed + compute wall, and they are
+ * NOT added to DRAIN / DRAIN_DN, whose subtraction would double-count
+ * them. The l2fetch lead is off under the feed: an l2fetch of a VTCM
+ * address is meaningless and one of the arena bytes would pull the same
+ * DDR bytes twice. A shape whose two slabs do not fit the arena runs the
+ * arena read as before and the call's feed count says so.
+ *
+ * ponytail: one pool run per expert and stage (6 extra fork/joins a call)
+ * is the price of a schedule a host check can prove. If the vtcm
+ * microbench cell shows mm - bytes / engine rate well above the ~20 us
+ * compute tail, the upgrade is one run per stage with lanes polling their
+ * slab's descriptor (hexkl_dma_ring_is_done) -- plan 117 section 3.2.
  */
 #define MOE_M1_MAX_ROWS 4u
 #define MOE_M1_MAX_EXPERTS 16u
@@ -450,6 +473,9 @@ typedef struct {
   const uint8_t *act_ah; /**< the expert's slot block, AH tiles */
   const hexkl_weight_u8i4 *g;
   const hexkl_weight_u8i4 *d;
+  const uint8_t *gu_wh;   /**< the WH bytes the GEMV reads: g->wh_bytes (the
+                               arena) or the expert's VTCM slab (#117) */
+  const uint8_t *dn_wh;   /**< likewise for the down matrix */
   const float *act_scale; /**< slot tables at the block's first slot */
   const int32_t *act_zp;
   int32_t *acc_gu; /**< inter_ntiles pairs x 2 tiles, MOE_M1_TILE_I32 each */
@@ -469,13 +495,21 @@ typedef struct {
   uint32_t lead_kb; /**< this call's l2fetch lead, KB per lane; 0 = each
                          column issues its own fetch (hexkl_moe_flags_*) */
   uint32_t rows1;   /**< this call's row loop: 1 = gemm_row1 for a lone row */
+  uint32_t feed;    /**< 1: the workers read VTCM slabs, take the
+                         prefetch-free entry and issue no box (#117) */
+  /** The unit range [u_lo, u_hi) one pool run of stage A or C covers:
+      every unit of the call when the feed is off (today's three runs), one
+      expert's units per run when it is on, so each slab reuse follows a
+      join. Unit numbering stays global (expert = u / per). */
+  uint32_t u_lo, u_hi;
 } moe_m1_ctx;
 
-/** @brief Lane @a i's contiguous share [lo, hi) of @a n_units. */
-static inline void moe_m1_slice(uint32_t n_units, uint32_t n_lanes, uint32_t i,
-                                uint32_t *lo, uint32_t *hi) {
-  *lo = (uint32_t)((uint64_t)n_units * i / n_lanes);
-  *hi = (uint32_t)((uint64_t)n_units * (i + 1u) / n_lanes);
+/** @brief Lane @a i's contiguous share [lo, hi) of the units [u_lo, u_hi). */
+static inline void moe_m1_slice(uint32_t u_lo, uint32_t u_hi, uint32_t n_lanes,
+                                uint32_t i, uint32_t *lo, uint32_t *hi) {
+  const uint32_t n_units = u_hi - u_lo;
+  *lo = u_lo + (uint32_t)((uint64_t)n_units * i / n_lanes);
+  *hi = u_lo + (uint32_t)((uint64_t)n_units * (i + 1u) / n_lanes);
 }
 
 /** @brief End of the lead block that starts at unit @a u: at most @a d
@@ -524,11 +558,13 @@ static inline void moe_m1_pf_gu(const moe_m1_ctx *c, uint32_t b0, uint32_t b1,
 static void moe_m1_pair_worker(uint32_t n_lanes, uint32_t i, void *v) {
   const moe_m1_ctx *c = (const moe_m1_ctx *)v;
   const int lead = c->lead_kb != 0u;
+  /* Under the feed the bytes are in VTCM: no box, no self-prefetch. */
+  const int nopf = lead || c->feed;
   const uint32_t d = moe_m1_lead_units(c->lead_kb, 2u * c->k_tiles * 512u);
   uint32_t lo, hi, b1, n1;
   uint64_t t0 = 0;
   HEXKL_PROBE_T0(t0);
-  moe_m1_slice(c->n_active * c->inter_ntiles, n_lanes, i, &lo, &hi);
+  moe_m1_slice(c->u_lo, c->u_hi, n_lanes, i, &lo, &hi);
   b1 = lo < hi ? moe_m1_block_end(lo, d, c->inter_ntiles, hi) : lo;
   if (lead && lo < b1) {
     moe_m1_pf_gu(c, lo, b1, 0u);
@@ -543,14 +579,14 @@ static void moe_m1_pair_worker(uint32_t n_lanes, uint32_t i, void *v) {
       if (lead && u == b0 && b1 < n1) {
         moe_m1_pf_gu(c, b1, n1, 0u);
       }
-      (lead ? hvx_gemm_u8i4_wh_col_nopf
-            : hvx_gemm_u8i4_wh_col)(e->act_ah, e->m, c->k_tiles, e->g->wh_bytes,
+      (nopf ? hvx_gemm_u8i4_wh_col_nopf
+            : hvx_gemm_u8i4_wh_col)(e->act_ah, e->m, c->k_tiles, e->gu_wh,
                                     c->gu_ntiles, j, c->rows1, tiles);
       if (lead && u + 1u == b1 && b1 < n1) {
         moe_m1_pf_gu(c, b1, n1, 1u);
       }
-      (lead ? hvx_gemm_u8i4_wh_col_nopf : hvx_gemm_u8i4_wh_col)(
-        e->act_ah, e->m, c->k_tiles, e->g->wh_bytes, c->gu_ntiles,
+      (nopf ? hvx_gemm_u8i4_wh_col_nopf : hvx_gemm_u8i4_wh_col)(
+        e->act_ah, e->m, c->k_tiles, e->gu_wh, c->gu_ntiles,
         c->inter_ntiles + j, c->rows1, tiles + MOE_M1_TILE_I32);
       hvx_dequant_swiglu_acc_tiles_to_f32(
         (const uint8_t *)tiles, MOE_M1_TILE_BYTES, 1u, j,
@@ -566,7 +602,7 @@ static void moe_m1_pair_worker(uint32_t n_lanes, uint32_t i, void *v) {
 static void moe_m1_requant_worker(uint32_t n_lanes, uint32_t i, void *v) {
   const moe_m1_ctx *c = (const moe_m1_ctx *)v;
   uint32_t lo, hi;
-  moe_m1_slice(c->n_active, n_lanes, i, &lo, &hi);
+  moe_m1_slice(0u, c->n_active, n_lanes, i, &lo, &hi);
   for (uint32_t u = lo; u < hi; ++u) {
     const moe_m1_expert *e = &c->ex[u];
     const uint32_t m4 = ROUND_UP_U32(e->m, 4u);
@@ -593,11 +629,12 @@ static inline void moe_m1_pf_dn(const moe_m1_ctx *c, uint32_t b0, uint32_t b1) {
 static void moe_m1_down_worker(uint32_t n_lanes, uint32_t i, void *v) {
   const moe_m1_ctx *c = (const moe_m1_ctx *)v;
   const int lead = c->lead_kb != 0u;
+  const int nopf = lead || c->feed;
   const uint32_t d = moe_m1_lead_units(c->lead_kb, c->inter_ktiles * 512u);
   uint32_t lo, hi, b1, n1;
   uint64_t t0 = 0;
   HEXKL_PROBE_T0(t0);
-  moe_m1_slice(c->n_active * c->dn_ntiles, n_lanes, i, &lo, &hi);
+  moe_m1_slice(c->u_lo, c->u_hi, n_lanes, i, &lo, &hi);
   b1 = lo < hi ? moe_m1_block_end(lo, d, c->dn_ntiles, hi) : lo;
   if (lead && lo < b1) {
     moe_m1_pf_dn(c, lo, b1);
@@ -612,9 +649,9 @@ static void moe_m1_down_worker(uint32_t n_lanes, uint32_t i, void *v) {
       const uint32_t nt = u % c->dn_ntiles;
       int32_t *tile = e->acc_dn + (size_t)nt * MOE_M1_TILE_I32;
       const uint32_t c0 = nt * HEXKL_HMX_INT8_BLOCK_N_COL;
-      (lead ? hvx_gemm_u8i4_wh_col_nopf : hvx_gemm_u8i4_wh_col)(
-        e->mid_ah, e->m, c->inter_ktiles, e->d->wh_bytes, c->dn_ntiles, nt,
-        c->rows1, tile);
+      (nopf ? hvx_gemm_u8i4_wh_col_nopf
+            : hvx_gemm_u8i4_wh_col)(e->mid_ah, e->m, c->inter_ktiles, e->dn_wh,
+                                    c->dn_ntiles, nt, c->rows1, tile);
       hvx_dequant_acc_tile_to_f32(tile, HEXKL_HMX_INT8_BLOCK_N_COL, e->m,
                                   e->rq_scale, e->rq_zp, e->d->colsum_w + c0,
                                   e->d->w_scale + c0, e->d->bias + c0,
@@ -622,6 +659,56 @@ static void moe_m1_down_worker(uint32_t n_lanes, uint32_t i, void *v) {
     }
   }
   moe_tail_probe_add(t0);
+}
+
+/* ---- The M=1 feed's slabs and ring calls (#117; the schedule is in the
+   M=1 block of hexkl_mm_u8i4_moe_layer_run) ------------------------------ */
+
+/** @brief VTCM offset of expert @a i's gate_up: slab i & 1. */
+static inline uint32_t moe_m1_gu_off(uint32_t i, uint32_t gu_bytes) {
+  return (i & 1u) * gu_bytes;
+}
+
+/** @brief VTCM offset of expert @a j's down: slab (j >> 1) & 1, half
+ *         j & 1 -- so downs j and j + 4 share a slot, and j + 4 is pushed
+ *         only after C(j)'s join. */
+static inline uint32_t moe_m1_dn_off(uint32_t j, uint32_t gu_bytes,
+                                     uint32_t dn_bytes) {
+  return ((j >> 1u) & 1u) * gu_bytes + (j & 1u) * dn_bytes;
+}
+
+/** @brief One whole-matrix descriptor (f2's shape: moe_push_weight_chunk
+ *         with nt0 = 0, cn = n_col), counted in DMA_KB and traced but NOT
+ *         timed into PUSH: it is issued inside the MM bracket, and the
+ *         profile row subtracts both, so charging PUSH too would take the
+ *         push time off the rest twice.
+ *  @return the ring index to hand moe_m1_wait */
+static inline uint32_t moe_m1_push(uint8_t *vtcm_base, uint32_t dst_off,
+                                   const hexkl_weight_u8i4 *h, uint32_t k_tiles,
+                                   uint32_t n_col, uint32_t kind,
+                                   uint32_t expert) {
+  const uint32_t row = n_col * WEIGHT_TILE_BYTES_U8I4;
+  const uint32_t idx = hexkl_dma_ring_next_idx();
+  HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_KB, (row * k_tiles) >> 10);
+  hexkl_dma_ring_push2d(vtcm_base + dst_off, h->wh_bytes, row, row, row,
+                        k_tiles, /*src_vtcm=*/0, /*dst_vtcm=*/1);
+  if (hexkl_probe_on) {
+    hexkl_dma_trace_push(hexkl_probe_now_ticks(), idx, kind, expert, 0u, row,
+                         k_tiles, row);
+  }
+  return idx;
+}
+
+/** @brief A traced ring wait. Not timed into DRAIN / DRAIN_DN: it sits
+ *         inside the MM bracket (the comment atop the M=1 section). */
+static inline void moe_m1_wait(uint32_t idx, uint32_t site) {
+  if (hexkl_probe_on) {
+    hexkl_dma_trace_wait_begin(hexkl_probe_now_ticks(), idx, site);
+  }
+  hexkl_dma_ring_wait(idx);
+  if (hexkl_probe_on) {
+    hexkl_dma_trace_wait_end(hexkl_probe_now_ticks());
+  }
 }
 
 /**
@@ -905,6 +992,15 @@ int hexkl_mm_u8i4_moe_layer_run(
   const uint32_t inter_ktiles = inter / HEXKL_HMX_INT8_BLOCK_N_INNER;
   const uint32_t dn_ntiles = N_out / HEXKL_HMX_INT8_BLOCK_N_COL;
   const uint32_t BR = HEXKL_HMX_INT8_BLOCK_N_ROW;
+  /* The M=1 feed (#117): asked for, and the two gate_up slabs fit the
+     arena with two downs fitting one slab. A shape that fails runs the
+     arena read and the call's M1_FEED count says so. 7 MiB of the ~8.3 MB
+     arena at the LFM2 shape; no heap, no address-space growth. */
+  const uint32_t gu_bytes = k_tiles * gu_ntiles * WEIGHT_TILE_BYTES_U8I4;
+  const uint32_t dn_bytes = inter_ktiles * dn_ntiles * WEIGHT_TILE_BYTES_U8I4;
+  const int m1_feed = use_m1 && hexkl_moe_flags_feed(flags) != 0u &&
+                      2u * (uint64_t)gu_bytes <= arena &&
+                      2u * (uint64_t)dn_bytes <= gu_bytes;
   /* Pairs per staged batch; the chunk size the gate_up pushes use too. */
   const uint32_t half = L.acc_tiles / 2u;
   /* Bounded arrays below; a shape that needs more chunks than they hold is
@@ -1104,10 +1200,20 @@ int hexkl_mm_u8i4_moe_layer_run(
      see moe_push_gate_up_chunks. */
   uint32_t gu_idx[MOE_MAX_CHUNKS];
   uint32_t gu_nchunk = 0u;
+  /* The M=1 feed's ring indices: gate_up of expert i, down of expert j. */
+  uint32_t m1_gu_idx[MOE_M1_MAX_EXPERTS], m1_dn_idx[MOE_M1_MAX_EXPERTS];
   if (!use_m1) {
     gu_nchunk = moe_push_gate_up_chunks(
       vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[0]]], k_tiles,
       gu_ntiles, inter_ntiles, half, 0u, gu_idx);
+  } else if (m1_feed) {
+    /* One gate_up per slab, at the same point for the same reason: the
+       scan and the pack are in front of them. Whole matrices (f2). */
+    for (uint32_t i = 0; i < n_active && i < 2u; ++i) {
+      m1_gu_idx[i] = moe_m1_push(vtcm_base, moe_m1_gu_off(i, gu_bytes),
+                                 &tbl->slots[h_gate_up[order[i]]], k_tiles,
+                                 gu_ntiles, HEXKL_DMA_KIND_GATE, i);
+    }
   }
   (void)gu_nchunk;
 
@@ -1155,6 +1261,10 @@ int hexkl_mm_u8i4_moe_layer_run(
       x->act_ah = act_ah + (size_t)sb * K;
       x->g = &tbl->slots[h_gate_up[e]];
       x->d = &tbl->slots[h_down[e]];
+      x->gu_wh =
+        m1_feed ? vtcm_base + moe_m1_gu_off(i, gu_bytes) : x->g->wh_bytes;
+      x->dn_wh = m1_feed ? vtcm_base + moe_m1_dn_off(i, gu_bytes, dn_bytes)
+                         : x->d->wh_bytes;
       x->act_scale = slot_scale + sb;
       x->act_zp = slot_zp + sb;
       x->acc_gu = (int32_t *)moe_carve(&xb, (size_t)inter_ntiles * 2u *
@@ -1180,22 +1290,83 @@ int hexkl_mm_u8i4_moe_layer_run(
     m1.N_out = N_out;
     /* The (loop, lead) pair, resolved once per call: the flags word when
        the caller set the tune bit, else the build's defaults (#113). */
-    m1.lead_kb = hexkl_moe_flags_lead_kb(flags);
+    /* Under the feed the lead is off by construction (the section
+       comment); the banner still prints the requested lead beside
+       feed=vtcm so the log names the cell. */
+    m1.lead_kb = m1_feed ? 0u : hexkl_moe_flags_lead_kb(flags);
     m1.rows1 = hexkl_moe_flags_rows1(flags);
+    m1.feed = m1_feed ? 1u : 0u;
+    HEXKL_PROBE_COUNT(HEXKL_PROBE_M1_FEED, m1_feed ? 1u : 0u);
 
     /* MM is the wall of the two GEMV stages on the caller; SWIGLU their
        summed worker-time (moe_tail_probe_add), so SWIGLU / lanes ~ MM says
        the lanes were balanced, and the bytes over MM is the arena read
-       rate. REQUANT and SCATTER are their stages' wall; BLOCKS, DMA_KB,
-       ACC_READ, DEQUANT and DRAIN stay 0. */
+       rate. REQUANT and SCATTER are their stages' wall; BLOCKS, ACC_READ,
+       DEQUANT and DRAIN stay 0. With the feed, DMA_KB counts the eight
+       pushes, the waits sit inside MM, and the first wait sets DMA_FIRST
+       with the HMX path's caveat (the push went out before the scan, so
+       it times the exposed remainder). */
     HEXKL_PROBE_T0(p0);
-    hvx_worker_pool_run(pool, moe_m1_pair_worker, &m1, n_active * inter_ntiles);
+    if (!m1_feed) {
+      m1.u_lo = 0u;
+      m1.u_hi = n_active * inter_ntiles;
+      hvx_worker_pool_run(pool, moe_m1_pair_worker, &m1,
+                          n_active * inter_ntiles);
+    } else {
+      for (uint32_t i = 0; i < n_active; ++i) {
+        uint64_t pw = 0;
+        HEXKL_PROBE_T0(pw);
+        moe_m1_wait(m1_gu_idx[i], HEXKL_DMA_SITE_GU);
+        if (i == 0u) {
+          HEXKL_PROBE_ADD(HEXKL_PROBE_DMA_FIRST, pw);
+          HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_FIRST_KB, gu_bytes >> 10);
+        }
+        m1.u_lo = i * inter_ntiles;
+        m1.u_hi = (i + 1u) * inter_ntiles;
+        hvx_worker_pool_run(pool, moe_m1_pair_worker, &m1, inter_ntiles);
+        /* Slab i & 1 is free: the join above is the barrier. It takes the
+           gate_up two experts on, or -- once no gate_up is left for it --
+           its two downs (experts 2s and 2s + 1 of slab s). */
+        if (i + 2u < n_active) {
+          m1_gu_idx[i + 2u] = moe_m1_push(
+            vtcm_base, moe_m1_gu_off(i + 2u, gu_bytes), m1.ex[i + 2u].g,
+            k_tiles, gu_ntiles, HEXKL_DMA_KIND_GATE, i + 2u);
+        } else {
+          for (uint32_t j = 2u * (i & 1u); j < 2u * (i & 1u) + 2u; ++j) {
+            if (j < n_active) {
+              m1_dn_idx[j] = moe_m1_push(
+                vtcm_base, moe_m1_dn_off(j, gu_bytes, dn_bytes), m1.ex[j].d,
+                inter_ktiles, dn_ntiles, HEXKL_DMA_KIND_DOWN, j);
+            }
+          }
+        }
+      }
+    }
     HEXKL_PROBE_ADD(HEXKL_PROBE_MM, p0);
     HEXKL_PROBE_T0(p0);
     hvx_worker_pool_run(pool, moe_m1_requant_worker, &m1, n_active);
     HEXKL_PROBE_ADD(HEXKL_PROBE_REQUANT, p0);
     HEXKL_PROBE_T0(p0);
-    hvx_worker_pool_run(pool, moe_m1_down_worker, &m1, n_active * dn_ntiles);
+    if (!m1_feed) {
+      m1.u_lo = 0u;
+      m1.u_hi = n_active * dn_ntiles;
+      hvx_worker_pool_run(pool, moe_m1_down_worker, &m1, n_active * dn_ntiles);
+    } else {
+      for (uint32_t j = 0; j < n_active; ++j) {
+        moe_m1_wait(m1_dn_idx[j], HEXKL_DMA_SITE_DN);
+        m1.u_lo = j * dn_ntiles;
+        m1.u_hi = (j + 1u) * dn_ntiles;
+        hvx_worker_pool_run(pool, moe_m1_down_worker, &m1, dn_ntiles);
+        /* Down slot j & 3 is free after the join; a fifth or later expert
+           (M <= 4 routing to more than four) takes it. */
+        if (j + 4u < n_active) {
+          m1_dn_idx[j + 4u] =
+            moe_m1_push(vtcm_base, moe_m1_dn_off(j + 4u, gu_bytes, dn_bytes),
+                        m1.ex[j + 4u].d, inter_ktiles, dn_ntiles,
+                        HEXKL_DMA_KIND_DOWN, j + 4u);
+        }
+      }
+    }
     HEXKL_PROBE_ADD(HEXKL_PROBE_MM, p0);
 
     HEXKL_PROBE_T0(p0);
