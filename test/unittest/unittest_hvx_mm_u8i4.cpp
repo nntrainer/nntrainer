@@ -2115,131 +2115,196 @@ TEST_F(HmxMmU8I4Layer, ArenaUncachedWriteAfterMap) {
  * a weight still points into it.
  */
 /**
- * [doc 52] The sequence the expert LRU makes and no test above covers: the
- * DSP reads an arena slot, the host overwrites the slot with another
- * expert's bytes, the DSP reads it again. The DMA descriptors read DDR
- * through L2 (src_bypass = 0), so if the DSP's mapping of the arena is
- * cacheable, the second read could return the first expert's stale lines.
- * Gate for slot reuse on device: bit-identical to the heap-registered
- * weight, both before and after the overwrite.
+ * [doc 52] The sequence the expert LRU makes: the DSP reads an arena slot,
+ * the host overwrites the slot with another expert's bytes, the DSP reads it
+ * again. Run three ways, each pass compared bit for bit with the same weight
+ * registered on the DSP heap:
+ *
+ *  - Uncached: the shipped arena. The weight DMA reads DDR through L2
+ *    (src_bypass = 0), so a cacheable DSP-side mapping could serve the first
+ *    expert's stale lines on the second pass.
+ *  - CachedCleaned: NNTR_HTP_ARENA_CACHED's arena (doc 52 section 10.10) --
+ *    a cached rpcmem buffer, written by the CPU, then DC CVAC + DSB over the
+ *    written range. The gate for that switch.
+ *  - CachedNotCleaned: the same without the clean. Reported, not asserted:
+ *    a failure here is what proves the clean is load-bearing, a pass means
+ *    the lines happened to be written back (or the path is IO-coherent).
+ *
+ * The slot is filled by the CPU (bake_export into a heap vector, then
+ * memcpy), as pread fills it. Filling it by bake_export straight into the
+ * ION buffer, as this test first did, has the DSP write the bytes and never
+ * exercises a host write at all.
  */
-TEST_F(HmxMmU8I4Layer, ArenaSlotReuseMatchesHeap) {
-  const uint32_t K = 2048, I = 1792, N = 2048, M = 64, NE = 2;
-
-  auto alloc =
-    (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
-  auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
-  auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
-  using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
-  auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
-  if (!alloc || !rfree || !to_fd || !fmmap) {
-    GTEST_SKIP() << "rpcmem/fastrpc_mmap not available";
+class HmxArenaSlotReuse : public HmxMmU8I4Layer {
+protected:
+  /** @brief The clean NNTR_HTP_ARENA_CACHED does after every arena write
+   *  (htp_compute_ops.cpp cleanForDsp), restated because this binary does
+   *  not link the backend. */
+  static void cleanToPoC(const void *p, size_t len) {
+#if defined(__aarch64__)
+    uint64_t ctr = 0;
+    asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    const uintptr_t line = uintptr_t(4) << ((ctr >> 16) & 0xFu);
+    uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~(line - 1);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(p) + len;
+    for (; a < end; a += line)
+      asm volatile("dc cvac, %0" : : "r"(a) : "memory");
+    asm volatile("dsb sy" : : : "memory");
+#else
+    (void)p;
+    (void)len;
+#endif
   }
 
-  // Two experts on the heap: the references, and the bytes the slot gets.
-  std::vector<Weight> gu(NE), dn(NE);
-  std::vector<uint32_t> h_gu(NE), h_dn(NE);
-  for (uint32_t e = 0; e < NE; ++e) {
-    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0x5107A000u + e, gu[e]));
-    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0x5107B000u + e, dn[e]));
-    h_gu[e] = gu[e].handle;
-    h_dn[e] = dn[e].handle;
+  /** @return bad elements on the reuse pass (pass 1), or SIZE_MAX if the
+   *  run could not get that far. */
+  size_t Run(uint32_t rpc_flags, bool clean, const char *path) {
+    const uint32_t K = 2048, I = 1792, N = 2048, M = 64, NE = 2;
+
+    auto alloc =
+      (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+    auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+    auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+    using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
+    auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
+    if (!alloc || !rfree || !to_fd || !fmmap) {
+      std::cout << "U8I4_FIELD path=" << path
+                << " field=skipped value=no_rpcmem" << std::endl;
+      return SIZE_MAX;
+    }
+
+    std::vector<Weight> gu(NE), dn(NE);
+    for (uint32_t e = 0; e < NE; ++e) {
+      MakeAndRegister(K, 2 * I, 0x5107A000u + e, gu[e]);
+      MakeAndRegister(I, N, 0x5107B000u + e, dn[e]);
+      if (::testing::Test::HasFatalFailure())
+        return SIZE_MAX;
+    }
+
+    auto wh_bytes = [](uint32_t k, uint32_t n) {
+      return (k / 32u) * (n / 32u) * 512u;
+    };
+    const uint32_t gu_len = wh_bytes(K, 2 * I), dn_len = wh_bytes(I, N);
+    const uint32_t stride_gu = (gu_len + 4095u) & ~4095u;
+    // ONE expert slot, laid out as register_qs4cx_wh_expert_file lays it:
+    // gate_up at 0, down at stride_gu.
+    const uint32_t arena_bytes = stride_gu + ((dn_len + 4095u) & ~4095u);
+
+    void *buf = alloc(25, rpc_flags, (int)arena_bytes);
+    if (buf == nullptr) {
+      ADD_FAILURE() << path << ": rpcmem_alloc(flags=" << rpc_flags
+                    << ") failed";
+      return SIZE_MAX;
+    }
+    const int fd = to_fd(buf);
+    uint32_t arena = 0xFFFFFFFFu;
+    if (fd < 0 ||
+        fmmap(CDSP_DOMAIN_ID, fd, buf, 0, arena_bytes,
+              static_cast<int>(FASTRPC_MAP_FD)) != 0 ||
+        nntr_hvx_arena_attach(handle_, fd, arena_bytes, &arena) !=
+          AEE_SUCCESS) {
+      ADD_FAILURE() << path << ": could not map and attach the slot";
+      rfree(buf);
+      return SIZE_MAX;
+    }
+    auto *base = static_cast<uint8_t *>(buf);
+
+    std::vector<float> x(static_cast<size_t>(M) * K);
+    fill_deterministic(x, 0x5EED0052u);
+    // One expert takes every row: the call is [e] alone, so the slot's
+    // contents are the only thing that can differ between runs.
+    std::vector<uint32_t> row_index(M);
+    std::vector<float> row_weight(M);
+    for (uint32_t r = 0; r < M; ++r) {
+      row_index[r] = r;
+      row_weight[r] = 0.25f + 0.5f * (r % 7u) / 7.0f;
+    }
+    const std::vector<uint32_t> row_count = {M};
+    auto run = [&](uint32_t hg, uint32_t hd, std::vector<float> &out) {
+      out.assign(static_cast<size_t>(M) * N, 1.0f);
+      return nntr_hvx_mm_u8i4_moe_layer(
+        handle_, M, K, I, N, &hg, 1, &hd, 1, row_index.data(),
+        (int)row_index.size(), row_count.data(), (int)row_count.size(),
+        row_weight.data(), (int)row_weight.size(), x.data(), (int)x.size(),
+        out.data(), (int)out.size());
+    };
+
+    size_t reuse_bad = SIZE_MAX;
+    std::vector<uint8_t> host_gu(gu_len), host_dn(dn_len);
+    for (uint32_t e = 0; e < NE; ++e) {
+      if (nntr_hvx_weight_bake_export(handle_, gu[e].handle, host_gu.data(),
+                                      (int)gu_len) != AEE_SUCCESS ||
+          nntr_hvx_weight_bake_export(handle_, dn[e].handle, host_dn.data(),
+                                      (int)dn_len) != AEE_SUCCESS) {
+        ADD_FAILURE() << path << ": bake_export failed";
+        break;
+      }
+      std::memcpy(base, host_gu.data(), gu_len);
+      std::memcpy(base + stride_gu, host_dn.data(), dn_len);
+      if (clean) {
+        cleanToPoC(base, gu_len);
+        cleanToPoC(base + stride_gu, dn_len);
+      }
+      uint32_t a_gu = 0xFFFFFFFFu, a_dn = 0xFFFFFFFFu;
+      if (nntr_hvx_weight_register_u8i4_arena(
+            handle_, K, 2 * I, arena, 0, gu[e].d.data(), (int)(2 * I),
+            gu[e].colsum.data(), (int)(2 * I), gu[e].bias.data(), (int)(2 * I),
+            &a_gu) != AEE_SUCCESS ||
+          nntr_hvx_weight_register_u8i4_arena(
+            handle_, I, N, arena, stride_gu, dn[e].d.data(), (int)N,
+            dn[e].colsum.data(), (int)N, dn[e].bias.data(), (int)N,
+            &a_dn) != AEE_SUCCESS) {
+        ADD_FAILURE() << path << ": register_arena failed";
+        break;
+      }
+      std::vector<float> from_heap, from_slot;
+      const int e1 = run(gu[e].handle, dn[e].handle, from_heap);
+      const int e2 = run(a_gu, a_dn, from_slot);
+      nntr_hvx_weight_release_u8i4(handle_, a_gu);
+      nntr_hvx_weight_release_u8i4(handle_, a_dn);
+      if (e1 != AEE_SUCCESS || e2 != AEE_SUCCESS) {
+        ADD_FAILURE() << path << ": moe_layer failed";
+        break;
+      }
+      size_t bad = 0;
+      for (size_t i = 0; i < from_heap.size(); ++i)
+        if (std::memcmp(&from_slot[i], &from_heap[i], sizeof(float)) != 0)
+          ++bad;
+      std::cout << "U8I4_FIELD path=" << path << " pass=" << e
+                << " field=bad_elems value=" << bad << " of "
+                << from_heap.size() << std::endl;
+      reuse_bad = bad;
+    }
+
+    nntr_hvx_arena_detach(handle_, arena);
+    for (uint32_t e = 0; e < NE; ++e) {
+      nntr_hvx_weight_release_u8i4(handle_, gu[e].handle);
+      nntr_hvx_weight_release_u8i4(handle_, dn[e].handle);
+    }
+    rfree(buf);
+    return reuse_bad;
   }
+};
 
-  auto wh_bytes = [](uint32_t k, uint32_t n) {
-    return (k / 32u) * (n / 32u) * 512u;
-  };
-  const uint32_t gu_len = wh_bytes(K, 2 * I), dn_len = wh_bytes(I, N);
-  const uint32_t stride_gu = (gu_len + 4095u) & ~4095u;
-  // ONE expert slot, laid out as register_qs4cx_wh_expert_file lays it:
-  // gate_up at 0, down at stride_gu.
-  const uint32_t arena_bytes = stride_gu + ((dn_len + 4095u) & ~4095u);
+TEST_F(HmxArenaSlotReuse, Uncached) {
+  EXPECT_EQ(Run(0 /*UNCACHED*/, /*clean=*/false, "arena_slot_reuse"), 0u)
+    << "a reused uncached slot differs from the heap weight: the DSP read "
+       "stale bytes, and register_arena needs an L2 invalidate";
+}
 
-  void *buf = alloc(25, 0 /*UNCACHED*/, (int)arena_bytes);
-  ASSERT_NE(buf, nullptr) << "uncached rpcmem_alloc failed";
-  const int fd = to_fd(buf);
-  ASSERT_GE(fd, 0);
-  ASSERT_EQ(fmmap(CDSP_DOMAIN_ID, fd, buf, 0, arena_bytes,
-                  static_cast<int>(FASTRPC_MAP_FD)),
-            0);
-  uint32_t arena = 0xFFFFFFFFu;
-  ASSERT_EQ(nntr_hvx_arena_attach(handle_, fd, arena_bytes, &arena),
-            AEE_SUCCESS);
-  auto *base = static_cast<uint8_t *>(buf);
+TEST_F(HmxArenaSlotReuse, CachedCleaned) {
+  EXPECT_EQ(
+    Run(1 /*RPCMEM_DEFAULT_FLAGS*/, /*clean=*/true, "arena_cached_clean"), 0u)
+    << "cached arena + DC CVAC is not enough: leave NNTR_HTP_ARENA_CACHED "
+       "off";
+}
 
-  std::vector<float> x(static_cast<size_t>(M) * K);
-  fill_deterministic(x, 0x5EED0052u);
-  // One expert takes every row: the call is [e] alone, so the slot's
-  // contents are the only thing that can differ between runs.
-  std::vector<uint32_t> row_index(M);
-  std::vector<float> row_weight(M);
-  for (uint32_t r = 0; r < M; ++r) {
-    row_index[r] = r;
-    row_weight[r] = 0.25f + 0.5f * (r % 7u) / 7.0f;
-  }
-  const std::vector<uint32_t> row_count = {M};
-
-  auto run = [&](uint32_t hg, uint32_t hd, std::vector<float> &out) {
-    out.assign(static_cast<size_t>(M) * N, 1.0f);
-    return nntr_hvx_mm_u8i4_moe_layer(
-      handle_, M, K, I, N, &hg, 1, &hd, 1, row_index.data(),
-      (int)row_index.size(), row_count.data(), (int)row_count.size(),
-      row_weight.data(), (int)row_weight.size(), x.data(), (int)x.size(),
-      out.data(), (int)out.size());
-  };
-  auto count_bad = [](const std::vector<float> &a,
-                      const std::vector<float> &b) {
-    size_t bad = 0;
-    for (size_t i = 0; i < a.size(); ++i)
-      if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0)
-        ++bad;
-    return bad;
-  };
-
-  // Fill the slot with expert e, register, run, release -- twice, so the
-  // second pass is a reuse of a slot the DSP has already read.
-  for (uint32_t e = 0; e < NE; ++e) {
-    ASSERT_EQ(nntr_hvx_weight_bake_export(handle_, h_gu[e], base, (int)gu_len),
-              AEE_SUCCESS);
-    ASSERT_EQ(nntr_hvx_weight_bake_export(handle_, h_dn[e], base + stride_gu,
-                                          (int)dn_len),
-              AEE_SUCCESS);
-    uint32_t a_gu = 0xFFFFFFFFu, a_dn = 0xFFFFFFFFu;
-    ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
-                handle_, K, 2 * I, arena, 0, gu[e].d.data(), (int)(2 * I),
-                gu[e].colsum.data(), (int)(2 * I), gu[e].bias.data(),
-                (int)(2 * I), &a_gu),
-              AEE_SUCCESS);
-    ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
-                handle_, I, N, arena, stride_gu, dn[e].d.data(), (int)N,
-                dn[e].colsum.data(), (int)N, dn[e].bias.data(), (int)N, &a_dn),
-              AEE_SUCCESS);
-
-    std::vector<float> from_heap, from_slot;
-    ASSERT_EQ(run(h_gu[e], h_dn[e], from_heap), AEE_SUCCESS);
-    ASSERT_EQ(run(a_gu, a_dn, from_slot), AEE_SUCCESS);
-    const size_t bad = count_bad(from_heap, from_slot);
-    std::cout << "U8I4_FIELD path=arena_slot_reuse pass=" << e
-              << " field=bad_elems value=" << bad << " of " << from_heap.size()
-              << std::endl;
-    EXPECT_EQ(bad, 0u) << (e == 0 ? "first fill of the slot differs from the "
-                                    "heap weight: not a reuse problem"
-                                  : "REUSED slot differs from the heap "
-                                    "weight: the DSP read stale bytes -- the "
-                                    "arena mapping is cacheable on the DSP "
-                                    "and register_arena needs an L2 "
-                                    "invalidate (doc 52 section 10)");
-
-    ASSERT_EQ(nntr_hvx_weight_release_u8i4(handle_, a_gu), AEE_SUCCESS);
-    ASSERT_EQ(nntr_hvx_weight_release_u8i4(handle_, a_dn), AEE_SUCCESS);
-  }
-
-  ASSERT_EQ(nntr_hvx_arena_detach(handle_, arena), AEE_SUCCESS);
-  for (uint32_t e = 0; e < NE; ++e) {
-    nntr_hvx_weight_release_u8i4(handle_, h_gu[e]);
-    nntr_hvx_weight_release_u8i4(handle_, h_dn[e]);
-  }
-  rfree(buf);
+TEST_F(HmxArenaSlotReuse, CachedNotCleaned) {
+  const size_t bad =
+    Run(1 /*RPCMEM_DEFAULT_FLAGS*/, /*clean=*/false, "arena_cached_noclean");
+  std::cout << "U8I4_FIELD path=arena_cached_noclean field=verdict value="
+            << (bad == 0 ? "clean_not_proven_needed" : "clean_is_needed")
+            << std::endl;
 }
 
 TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
