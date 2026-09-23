@@ -22,39 +22,6 @@
 #include <hmx_hexagon_protos.h>
 #include <string.h>
 
-/** @brief One 2D DMA descriptor. Hardware-defined layout; do not reorder. */
-typedef struct __attribute__((aligned(128))) hexkl_dma_desc2d_s {
-  void *next;
-  uint32_t dst_stride : 24;
-  uint32_t desc_size : 2;
-  uint32_t dst_comp : 1;
-  uint32_t src_comp : 1;
-  uint32_t dst_bypass : 1;
-  uint32_t src_bypass : 1;
-  uint32_t order : 1;
-  uint32_t done : 1;
-  void *src;
-  void *dst;
-  uint32_t desc_type : 8;
-  uint32_t reserved0 : 24;
-  uint32_t row_size : 24;
-  uint32_t nrows_lo : 8;
-  uint32_t nrows_hi : 8;
-  uint32_t src_stride : 24;
-  uint32_t offset : 24;
-  uint32_t reserved1 : 8;
-} hexkl_dma_desc2d;
-
-static inline void hexkl_dma_link(void *cur, void *next) {
-  asm volatile(" release(%0):at" : : "r"(next));
-  asm volatile(" dmlink(%0, %1)" : : "r"(cur), "r"(next));
-}
-
-static inline void hexkl_dma_start(void *p) {
-  asm volatile(" release(%0):at" : : "r"(p));
-  asm volatile(" dmstart(%0)" : : "r"(p));
-}
-
 /** @brief Power of two, comfortably above the pushes any one call issues,
  *         so a call's transfers never wrap into ones still in flight. */
 #define HEXKL_DMA_RING_N 256u
@@ -67,9 +34,7 @@ static int g_started;
 static void hexkl_dma_ring_wait_idx_(uint32_t i) {
   long guard = 0;
   while (!g_ring[i].done && guard++ < 50000000L) {
-    unsigned r = 0;
-    asm volatile(" %0 = dmpoll" : "=r"(r) : : "memory");
-    (void)r;
+    hexkl_dma_poll();
   }
 }
 
@@ -139,4 +104,9 @@ void hexkl_dma_ring_drain(void) {
     g_pop = (g_pop + 1) & (HEXKL_DMA_RING_N - 1);
   }
   g_started = 0; // engine idle after drain -- the next push must dmstart
+}
+
+int hexkl_dma_ring_is_done(uint32_t idx) {
+  return ((volatile hexkl_dma_desc2d *)&g_ring[idx & (HEXKL_DMA_RING_N - 1)])
+    ->done;
 }
