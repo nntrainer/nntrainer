@@ -145,3 +145,16 @@ else
   echo "HVX GEMV NATIVE CHECK SKIPPED (no $LIBNATIVE/lib/libnative.a;" \
     "source tools/htp/env.sh)"
 fi
+
+# The per-token entry skeleton (#85): htp_graph_desc.h's validator and
+# LFM2 builder (the LFM2.5 list validates, each mutation fails with its
+# own code, never AEE_EBADPARM) and hexkl_graph.c's forward loop on the
+# tiny fixture's shapes -- the identity with nothing resident, and with
+# MOE resident byte-equal to a direct layer_run call on a recording
+# stand-in of the kernel (the kernel's own loops are the first check's).
+"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
+  -I "$HERE/stub" -I "$BACKEND" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  -o "$OUT/graph_host_check" \
+  "$HERE/graph_host_check.c" "$BACKEND/hmx/hexkl_graph.c"
+
+"$OUT/graph_host_check"
