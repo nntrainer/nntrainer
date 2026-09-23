@@ -264,12 +264,8 @@ typedef struct {
 #define MOE_RQ_UNIT_ROWS 16u
 #define MOE_RQ_UNITS (HEXKL_HMX_INT8_BLOCK_N_ROW / MOE_RQ_UNIT_ROWS)
 
-static inline void moe_worker_probe_add(uint64_t t0);
-
 static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
   moe_dn_ctx *c = (moe_dn_ctx *)vctx;
-  uint64_t t0 = 0;
-  HEXKL_PROBE_T0(t0);
   if (c->gate) {
     /* Rows [m_blk, m4) are padding the pack takes whole, zeroed so the
        bytes are deterministic; rows past m4 are not packed and never
@@ -314,16 +310,6 @@ static void moe_dn_worker(uint32_t n_threads, uint32_t i, void *vctx) {
                              c->weights_b[q], HEXKL_ACC_TILE_COLS);
     }
   }
-  moe_worker_probe_add(t0);
-}
-
-/** @brief The gate_up epilogue job, timed: hvx_dq_swiglu_worker's slice
- *         with its worker time filed like moe_dn_worker's. */
-static void moe_gu_worker(uint32_t n_threads, uint32_t i, void *vctx) {
-  uint64_t t0 = 0;
-  HEXKL_PROBE_T0(t0);
-  hvx_dq_swiglu_worker(n_threads, i, vctx);
-  moe_worker_probe_add(t0);
 }
 
 /* ---- O1: an expert's tail block on the HVX ------------------------------
@@ -382,19 +368,15 @@ typedef struct {
     N_out;
 } moe_tail_ctx;
 
-/** @brief Worker time spent inside this kernel's pool jobs -- the gate_up
- *         epilogue (dequant + SwiGLU), the down epilogue (dequant, scatter,
- *         the requant units it carries) and the tail units -- summed
- *         across workers and filed under the SWIGLU column, which this
- *         kernel has no synchronous pass for. The same reading as the conv
- *         block's cb_stage_probe_add: HIDDEN work, not wall time, so the
- *         host leaves it out of the mm residual. What it answers is how
- *         much of the HMX shadow (3 workers x the issue time) the
- *         epilogues consume -- the number that decides whether making the
- *         epilogue arithmetic cheaper can move anything (doc 53 section
- *         8.4). Atomic because the slices run concurrently; HEXKL_PROBE_ADD
- *         is not. */
-static inline void moe_worker_probe_add(uint64_t t0) {
+/** @brief Worker time spent inside tail units, summed across workers,
+ *         filed under the SWIGLU column -- always 0 for this kernel
+ *         otherwise, so it needs no new column and no app rebuild. It is
+ *         worker-time, not wall time: it says how much of the HMX shadow
+ *         the tails consume (3 workers x host is the capacity), and
+ *         whether a unit is the ~20 us designed for or something an
+ *         uncached weight mapping would make of it. Atomic because the
+ *         units run concurrently; HEXKL_PROBE_ADD is not. */
+static inline void moe_tail_probe_add(uint64_t t0) {
   if (hexkl_probe_on) {
     atomic_fetch_add_explicit(
       (_Atomic uint64_t *)&hexkl_probe_us[HEXKL_PROBE_SWIGLU],
@@ -419,7 +401,7 @@ static void moe_tail_pair_unit(uint32_t n_units, uint32_t j, void *v) {
     (const uint8_t *)tiles, MOE_TAIL_TILE_BYTES, 1u, j,
     HEXKL_HMX_INT8_BLOCK_N_COL, t->m, t->act_scale, t->act_zp, t->g->colsum_w,
     t->g->w_scale, t->g->bias, t->inter, t->sh->gate_f32, t->inter, NULL);
-  moe_worker_probe_add(t0);
+  moe_tail_probe_add(t0);
 }
 
 /** @brief The one requantization unit: gate_f32 -> mid_ah, the same two
@@ -442,7 +424,7 @@ static void moe_tail_requant_unit(uint32_t n_units, uint32_t u, void *v) {
                            t->inter, sh->rq_scale, sh->rq_zp, NULL);
   hvx_quant_pack_u8_ah_rows(sh->gate_f32, NULL, 0u, m4, t->inter, sh->rq_scale,
                             sh->rq_zp, sh->mid_ah);
-  moe_worker_probe_add(t0);
+  moe_tail_probe_add(t0);
 }
 
 /** @brief Unit nt: down column nt, dequantized into res. */
@@ -459,7 +441,7 @@ static void moe_tail_down_unit(uint32_t n_units, uint32_t nt, void *v) {
                               t->sh->rq_scale, t->sh->rq_zp,
                               t->d->colsum_w + c0, t->d->w_scale + c0,
                               t->d->bias + c0, t->res + c0, t->N_out, 0);
-  moe_worker_probe_add(t0);
+  moe_tail_probe_add(t0);
 }
 
 /** @brief Rows of expert e's tail, 0 when it has none: a block of at most
@@ -1155,7 +1137,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           jb->inter = inter;
           jb->dst = gate;
           jb->dst_stride = inter;
-          hvx_worker_pool_submit(pool, moe_gu_worker, jb, np);
+          hvx_worker_pool_submit(pool, hvx_dq_swiglu_worker, jb, np);
         }
         ++sb;
       }

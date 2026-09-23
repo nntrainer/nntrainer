@@ -2114,6 +2114,134 @@ TEST_F(HmxMmU8I4Layer, ArenaUncachedWriteAfterMap) {
  * rule that keeps a borrowed slot safe -- an arena cannot be detached while
  * a weight still points into it.
  */
+/**
+ * [doc 52] The sequence the expert LRU makes and no test above covers: the
+ * DSP reads an arena slot, the host overwrites the slot with another
+ * expert's bytes, the DSP reads it again. The DMA descriptors read DDR
+ * through L2 (src_bypass = 0), so if the DSP's mapping of the arena is
+ * cacheable, the second read could return the first expert's stale lines.
+ * Gate for slot reuse on device: bit-identical to the heap-registered
+ * weight, both before and after the overwrite.
+ */
+TEST_F(HmxMmU8I4Layer, ArenaSlotReuseMatchesHeap) {
+  const uint32_t K = 2048, I = 1792, N = 2048, M = 64, NE = 2;
+
+  auto alloc =
+    (void *(*)(int, uint32_t, int))dlsym(RTLD_DEFAULT, "rpcmem_alloc");
+  auto rfree = (void (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_free");
+  auto to_fd = (int (*)(void *))dlsym(RTLD_DEFAULT, "rpcmem_to_fd");
+  using FastrpcMmap = int (*)(int, int, void *, int, size_t, int);
+  auto fmmap = (FastrpcMmap)dlsym(RTLD_DEFAULT, "fastrpc_mmap");
+  if (!alloc || !rfree || !to_fd || !fmmap) {
+    GTEST_SKIP() << "rpcmem/fastrpc_mmap not available";
+  }
+
+  // Two experts on the heap: the references, and the bytes the slot gets.
+  std::vector<Weight> gu(NE), dn(NE);
+  std::vector<uint32_t> h_gu(NE), h_dn(NE);
+  for (uint32_t e = 0; e < NE; ++e) {
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(K, 2 * I, 0x5107A000u + e, gu[e]));
+    ASSERT_NO_FATAL_FAILURE(MakeAndRegister(I, N, 0x5107B000u + e, dn[e]));
+    h_gu[e] = gu[e].handle;
+    h_dn[e] = dn[e].handle;
+  }
+
+  auto wh_bytes = [](uint32_t k, uint32_t n) {
+    return (k / 32u) * (n / 32u) * 512u;
+  };
+  const uint32_t gu_len = wh_bytes(K, 2 * I), dn_len = wh_bytes(I, N);
+  const uint32_t stride_gu = (gu_len + 4095u) & ~4095u;
+  // ONE expert slot, laid out as register_qs4cx_wh_expert_file lays it:
+  // gate_up at 0, down at stride_gu.
+  const uint32_t arena_bytes = stride_gu + ((dn_len + 4095u) & ~4095u);
+
+  void *buf = alloc(25, 0 /*UNCACHED*/, (int)arena_bytes);
+  ASSERT_NE(buf, nullptr) << "uncached rpcmem_alloc failed";
+  const int fd = to_fd(buf);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(fmmap(CDSP_DOMAIN_ID, fd, buf, 0, arena_bytes,
+                  static_cast<int>(FASTRPC_MAP_FD)),
+            0);
+  uint32_t arena = 0xFFFFFFFFu;
+  ASSERT_EQ(nntr_hvx_arena_attach(handle_, fd, arena_bytes, &arena),
+            AEE_SUCCESS);
+  auto *base = static_cast<uint8_t *>(buf);
+
+  std::vector<float> x(static_cast<size_t>(M) * K);
+  fill_deterministic(x, 0x5EED0052u);
+  // One expert takes every row: the call is [e] alone, so the slot's
+  // contents are the only thing that can differ between runs.
+  std::vector<uint32_t> row_index(M);
+  std::vector<float> row_weight(M);
+  for (uint32_t r = 0; r < M; ++r) {
+    row_index[r] = r;
+    row_weight[r] = 0.25f + 0.5f * (r % 7u) / 7.0f;
+  }
+  const std::vector<uint32_t> row_count = {M};
+
+  auto run = [&](uint32_t hg, uint32_t hd, std::vector<float> &out) {
+    out.assign(static_cast<size_t>(M) * N, 1.0f);
+    return nntr_hvx_mm_u8i4_moe_layer(
+      handle_, M, K, I, N, &hg, 1, &hd, 1, row_index.data(),
+      (int)row_index.size(), row_count.data(), (int)row_count.size(),
+      row_weight.data(), (int)row_weight.size(), x.data(), (int)x.size(),
+      out.data(), (int)out.size());
+  };
+  auto count_bad = [](const std::vector<float> &a,
+                      const std::vector<float> &b) {
+    size_t bad = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+      if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0)
+        ++bad;
+    return bad;
+  };
+
+  // Fill the slot with expert e, register, run, release -- twice, so the
+  // second pass is a reuse of a slot the DSP has already read.
+  for (uint32_t e = 0; e < NE; ++e) {
+    ASSERT_EQ(nntr_hvx_weight_bake_export(handle_, h_gu[e], base, (int)gu_len),
+              AEE_SUCCESS);
+    ASSERT_EQ(nntr_hvx_weight_bake_export(handle_, h_dn[e], base + stride_gu,
+                                          (int)dn_len),
+              AEE_SUCCESS);
+    uint32_t a_gu = 0xFFFFFFFFu, a_dn = 0xFFFFFFFFu;
+    ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
+                handle_, K, 2 * I, arena, 0, gu[e].d.data(), (int)(2 * I),
+                gu[e].colsum.data(), (int)(2 * I), gu[e].bias.data(),
+                (int)(2 * I), &a_gu),
+              AEE_SUCCESS);
+    ASSERT_EQ(nntr_hvx_weight_register_u8i4_arena(
+                handle_, I, N, arena, stride_gu, dn[e].d.data(), (int)N,
+                dn[e].colsum.data(), (int)N, dn[e].bias.data(), (int)N, &a_dn),
+              AEE_SUCCESS);
+
+    std::vector<float> from_heap, from_slot;
+    ASSERT_EQ(run(h_gu[e], h_dn[e], from_heap), AEE_SUCCESS);
+    ASSERT_EQ(run(a_gu, a_dn, from_slot), AEE_SUCCESS);
+    const size_t bad = count_bad(from_heap, from_slot);
+    std::cout << "U8I4_FIELD path=arena_slot_reuse pass=" << e
+              << " field=bad_elems value=" << bad << " of " << from_heap.size()
+              << std::endl;
+    EXPECT_EQ(bad, 0u) << (e == 0 ? "first fill of the slot differs from the "
+                                    "heap weight: not a reuse problem"
+                                  : "REUSED slot differs from the heap "
+                                    "weight: the DSP read stale bytes -- the "
+                                    "arena mapping is cacheable on the DSP "
+                                    "and register_arena needs an L2 "
+                                    "invalidate (doc 52 section 10)");
+
+    ASSERT_EQ(nntr_hvx_weight_release_u8i4(handle_, a_gu), AEE_SUCCESS);
+    ASSERT_EQ(nntr_hvx_weight_release_u8i4(handle_, a_dn), AEE_SUCCESS);
+  }
+
+  ASSERT_EQ(nntr_hvx_arena_detach(handle_, arena), AEE_SUCCESS);
+  for (uint32_t e = 0; e < NE; ++e) {
+    nntr_hvx_weight_release_u8i4(handle_, h_gu[e]);
+    nntr_hvx_weight_release_u8i4(handle_, h_dn[e]);
+  }
+  rfree(buf);
+}
+
 TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
   const uint32_t K = 2048, I = 1792, N = 2048, M = 64, NE = 2;
 
