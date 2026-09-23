@@ -100,4 +100,4 @@ option('arm-arch', type: 'combo',
        description: 'Target ARM architecture. "none" disables arm related features.')
 option('arm-march', type: 'string',
        value: '',
-       description: 'ARM march flag (e.g., "-march=armv8.2-a+fp16+dotprod+i8mm"). If empty, derived from arm-arch.')
+       description: 'ARM march flag (e.g., "armv8.2-a+dotprod" or "-march=armv8.2-a+fp16+dotprod+i8mm"). If empty, derived from arm-arch. The i8mm kernels are compiled in only when the given ISA has i8mm, which is how a portable (distro) build is made. Note that the KleidiAI int4 micro-kernels are hand encoded and issue SDOT regardless of this flag, so a build meant to run on a CPU without dotprod needs more than this option.')

@@ -24,6 +24,17 @@ else
 	export ENABLE_DEBUG?= false
 endif
 
+# A distribution package has to run on every CPU it can be installed on, so
+# drop i8mm from the tuned default (armv8.2-a+dotprod+i8mm): the build daemons
+# and many arm64 machines do not implement it, and nntrainer selects its i8mm
+# kernels at compile time, so a tuned build dies with SIGILL there.
+# dotprod is kept because the KleidiAI int4 (QS4CX) micro-kernels are hand
+# encoded and issue SDOT whatever -march says, so it is the real floor of this
+# package anyway. Native builds are unaffected.
+ifeq ($(DEB_HOST_ARCH),arm64)
+	MESON_ARM_ARGS = -Darm-march=armv8.2-a+dotprod
+endif
+
 %:
 	dh $@ --parallel
 
@@ -44,6 +55,7 @@ override_dh_auto_configure:
                 -Dcapi-ml-common-actual=capi-ml-common \
                 -Dcapi-ml-inference-actual=capi-ml-inference \
                 -Denable-capi=enabled \
+		$(MESON_ARM_ARGS) \
 		build --wrap-mode=nodownload
 
 override_dh_auto_build:
@@ -54,6 +66,23 @@ override_dh_auto_test:
 
 override_dh_auto_install:
 	DESTDIR=$(CURDIR)/debian/tmp ninja -C build install
+
+# meson installs the compute backend headers of the architecture it built
+# for, so the set cannot be spelled out in the architecture independent
+# .install file: naming a header that was not built makes dh_install fail,
+# and leaving an installed one out makes dh_missing fail. Install whatever
+# the build produced instead.
+NNTR_BACKEND_INC = debian/tmp/usr/include/nntrainer
+NNTR_BACKEND_HEADERS = $(wildcard $(NNTR_BACKEND_INC)/x86_compute_backend.h $(NNTR_BACKEND_INC)/avx2_impl.h)
+NNTR_BACKEND_HEADERS += $(wildcard $(NNTR_BACKEND_INC)/arm_compute_backend.h $(NNTR_BACKEND_INC)/armv7_neon.h)
+NNTR_BACKEND_HEADERS += $(wildcard $(NNTR_BACKEND_INC)/mask_neon.h $(NNTR_BACKEND_INC)/neon_impl.h)
+NNTR_BACKEND_HEADERS += $(wildcard $(NNTR_BACKEND_INC)/neon_mathfun.h $(NNTR_BACKEND_INC)/neon_mathfun.hxx)
+NNTR_BACKEND_HEADERS += $(wildcard $(NNTR_BACKEND_INC)/hgemm*.h $(NNTR_BACKEND_INC)/matrix_transpose*.h)
+NNTR_BACKEND_HEADERS += $(wildcard $(NNTR_BACKEND_INC)/kleidiai_*.h $(NNTR_BACKEND_INC)/kai_*.h)
+
+override_dh_install:
+	dh_install
+	test -z "$(strip $(NNTR_BACKEND_HEADERS))" || dh_install -pnntrainer-dev $(NNTR_BACKEND_HEADERS) usr/include/nntrainer
 
 override_dh_missing:
 	dh_missing --fail-missing

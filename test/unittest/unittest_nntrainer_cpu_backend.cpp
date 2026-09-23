@@ -143,6 +143,107 @@ TEST(nntrainer_cpu_backend_standalone, ele_add) {
   }
 }
 
+static constexpr float TRANSPOSE_CANARY = -424242.F;
+static constexpr size_t TRANSPOSE_GUARD = 64;
+
+/**
+ * @brief compare nntrainer::transpose_matrix against the fallback
+ * implementation, on a destination buffer padded with a canary region so that
+ * an out-of-range store is detected as well
+ *
+ * @param M row length of the input matrix
+ * @param N col length of the input matrix
+ * @param ld_src_pad extra leading dimension of the input matrix
+ * @param ld_dst_pad extra leading dimension of the output matrix
+ */
+static void verify_transpose_matrix(unsigned int M, unsigned int N,
+                                    unsigned int ld_src_pad = 0,
+                                    unsigned int ld_dst_pad = 0) {
+  const unsigned int ld_src = N + ld_src_pad;
+  const unsigned int ld_dst = M + ld_dst_pad;
+  const size_t src_len = static_cast<size_t>(M) * ld_src;
+  const size_t dst_len = static_cast<size_t>(N) * ld_dst + 2 * TRANSPOSE_GUARD;
+
+  std::vector<float> src = generate_random_vector<float>(src_len);
+  std::vector<float> dst(dst_len, TRANSPOSE_CANARY);
+  std::vector<float> ref_dst(dst_len, TRANSPOSE_CANARY);
+
+  nntrainer::transpose_matrix(M, N, src.data(), ld_src,
+                              dst.data() + TRANSPOSE_GUARD, ld_dst);
+  nntrainer::__fallback_transpose_matrix(
+    M, N, src.data(), ld_src, ref_dst.data() + TRANSPOSE_GUARD, ld_dst);
+
+  for (size_t i = 0; i < dst_len; ++i) {
+    ASSERT_EQ(dst[i], ref_dst[i])
+      << "M=" << M << " N=" << N << " ld_src=" << ld_src << " ld_dst=" << ld_dst
+      << " index=" << i;
+  }
+}
+
+/**
+ * @brief Matrix transpose unittest : shapes with a dimension smaller than the
+ * 4x4 tile of the NEON kernel, which used to wrap around in unsigned
+ * arithmetic and read/write far out of bounds (issue #4335 C4)
+ *
+ */
+TEST(nntrainer_cpu_backend_standalone, transpose_matrix_small) {
+  for (unsigned int M = 1; M <= 9; ++M) {
+    for (unsigned int N = 1; N <= 9; ++N) {
+      verify_transpose_matrix(M, N);
+    }
+  }
+}
+
+/**
+ * @brief Matrix transpose unittest : every combination of full tiles and
+ * remainder rows / columns
+ *
+ */
+TEST(nntrainer_cpu_backend_standalone, transpose_matrix_remainder) {
+  for (unsigned int M = 16; M <= 20; ++M) {
+    for (unsigned int N = 16; N <= 20; ++N) {
+      verify_transpose_matrix(M, N);
+    }
+  }
+  verify_transpose_matrix(64, 64);
+  verify_transpose_matrix(33, 5);
+  verify_transpose_matrix(5, 33);
+}
+
+/**
+ * @brief Matrix transpose unittest : shapes taking the M > 128 branch
+ *
+ */
+TEST(nntrainer_cpu_backend_standalone, transpose_matrix_large) {
+  verify_transpose_matrix(129, 4);
+  verify_transpose_matrix(130, 7);
+  verify_transpose_matrix(132, 133);
+  verify_transpose_matrix(160, 3);
+  verify_transpose_matrix(256, 64);
+}
+
+/**
+ * @brief Matrix transpose unittest : leading dimensions larger than the matrix
+ *
+ */
+TEST(nntrainer_cpu_backend_standalone, transpose_matrix_strided) {
+  verify_transpose_matrix(2, 3, 5, 7);
+  verify_transpose_matrix(3, 130, 1, 2);
+  verify_transpose_matrix(129, 3, 4, 1);
+  verify_transpose_matrix(17, 17, 3, 3);
+}
+
+/**
+ * @brief Matrix transpose unittest : an empty matrix must leave the
+ * destination untouched
+ *
+ */
+TEST(nntrainer_cpu_backend_standalone, transpose_matrix_empty_n) {
+  verify_transpose_matrix(0, 5);
+  verify_transpose_matrix(5, 0);
+  verify_transpose_matrix(0, 0);
+}
+
 template <typename T = float>
 float compute_mse(const uint32_t M, const uint32_t N, std::vector<T> &ref_dst,
                   std::vector<T> &dst, bool print = false) {
