@@ -21,6 +21,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 static int g_fail;
 
@@ -38,10 +39,12 @@ int main(void) {
                         (3u << HTP_MOE_GEMV_LEAD_SHIFT) |
                         HTP_MOE_FLAG_GEMV_ROWS1_SET | HTP_MOE_FLAG_GEMV_ROWS1;
   expect(d192 == 0x103c1u, "D192 is 0x103c1");
-  expect(htp_moe_opts_flags(NULL, NULL, NULL) == d192, "unset is on, D192");
-  expect(htp_moe_opts_flags("0", NULL, NULL) == (d192 & ~HTP_MOE_FLAG_M1_GEMV),
+  expect(htp_moe_opts_flags(NULL, NULL, NULL, NULL) == d192,
+         "unset is on, D192");
+  expect(htp_moe_opts_flags("0", NULL, NULL, NULL) ==
+           (d192 & ~HTP_MOE_FLAG_M1_GEMV),
          "0 is off");
-  expect(htp_moe_opts_flags("1", NULL, NULL) == d192, "1 is on");
+  expect(htp_moe_opts_flags("1", NULL, NULL, NULL) == d192, "1 is on");
   if (!g_fail)
     printf("MOE M1 GEMV OPTS: unset=on(0x103c1) 0=off 1=on\n");
 
@@ -49,24 +52,25 @@ int main(void) {
      variable, so naming one leaves the other at the default instead of
      resetting it to zero; both tune bits are always sent so the echo
      names the cell. */
-  expect(htp_moe_opts_flags(NULL, "0", "0") ==
+  expect(htp_moe_opts_flags(NULL, "0", "0", NULL) ==
            (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_GEMV_LEAD_SET |
             HTP_MOE_FLAG_GEMV_ROWS1_SET),
          "LEAD_KB=0 ROWS1=0 is the old four-row, no-lead cell 0xc1");
-  expect(htp_moe_opts_flags(NULL, "0", "0") == 0xc1u, "A0 word is 0xc1");
-  expect(htp_moe_opts_flags(NULL, "192", NULL) == d192,
+  expect(htp_moe_opts_flags(NULL, "0", "0", NULL) == 0xc1u, "A0 word is 0xc1");
+  expect(htp_moe_opts_flags(NULL, "192", NULL, NULL) == d192,
          "192 KB is 3 units of 64 KB, and the loop stays at the default");
-  expect(htp_moe_opts_flags(NULL, "1536", "1") ==
+  expect(htp_moe_opts_flags(NULL, "1536", "1", NULL) ==
            (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_GEMV_LEAD_SET |
             (24u << HTP_MOE_GEMV_LEAD_SHIFT) | HTP_MOE_FLAG_GEMV_ROWS1_SET |
             HTP_MOE_FLAG_GEMV_ROWS1),
          "1536 KB + rows1");
-  expect(htp_moe_opts_flags(NULL, NULL, "1") == d192,
+  expect(htp_moe_opts_flags(NULL, NULL, "1", NULL) == d192,
          "rows1 alone does not force the lead to 0");
-  expect(htp_moe_opts_flags(NULL, NULL, "0") ==
+  expect(htp_moe_opts_flags(NULL, NULL, "0", NULL) ==
            (d192 & ~HTP_MOE_FLAG_GEMV_ROWS1),
          "rows1=0 is an explicit four-row loop at the default lead");
-  expect(htp_moe_opts_flags("0", NULL, "1") == (d192 & ~HTP_MOE_FLAG_M1_GEMV),
+  expect(htp_moe_opts_flags("0", NULL, "1", NULL) ==
+           (d192 & ~HTP_MOE_FLAG_M1_GEMV),
          "the opt-out keeps bit 0 clear and still carries the pair");
   /* Rounding to the nearest unit, the >= 0 floor and the 127-unit clamp
      the l2fetch width field imposes. */
@@ -81,9 +85,27 @@ int main(void) {
          "clamped to 127 units");
   expect((htp_moe_gemv_lead_units("999999") & ~HTP_MOE_GEMV_LEAD_BITS) == 0u,
          "the clamped field still fits bits [15:8]");
+  /* #117's feed knob. Sent only when its variable is set, so an unset run
+     keeps A's word (0x103c1, feed=default = the skel's build value);
+     FEED=1 on D192 is 0x303e1 (feed=vtcm), FEED=0 is 0x103e1 (feed=arena).
+     It touches neither of the other two knobs. */
+  expect(htp_moe_opts_flags(NULL, NULL, NULL, NULL) == 0x103c1u,
+         "unset feed leaves A's word 0x103c1");
+  expect(htp_moe_opts_flags(NULL, NULL, NULL, "1") == 0x303e1u,
+         "FEED=1 on D192 is 0x303e1");
+  expect(htp_moe_opts_flags(NULL, NULL, NULL, "0") == 0x103e1u,
+         "FEED=0 on D192 is 0x103e1");
+  expect(htp_moe_opts_flags(NULL, "0", "0", "1") == 0x200e1u,
+         "FEED=1 on the four-row, no-lead cell is 0x200e1");
+  expect(htp_moe_opts_flags("0", NULL, NULL, "1") == 0x303e0u,
+         "the opt-out keeps bit 0 clear and still carries the feed");
+  expect(!strcmp(htp_moe_opts_feed_name(0x103c1u), "default") &&
+           !strcmp(htp_moe_opts_feed_name(0x303e1u), "vtcm") &&
+           !strcmp(htp_moe_opts_feed_name(0x103e1u), "arena"),
+         "feed names: default / vtcm / arena");
   if (!g_fail)
     printf("MOE GEMV TUNE OPTS: per-knob tune bits, 64 KB units, "
-           "round+clamp 127\n");
+           "round+clamp 127, feed unset/0/1\n");
 
   /* C: dsp 1044.0, swiglu 5601.2, printed rest -5588.2 -> the other named
      stages (mm 974.7 among them) sum to 1044.0 + 5588.2 - 5601.2 = 1031.0;

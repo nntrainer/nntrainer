@@ -76,6 +76,45 @@ static void gemv_log_reset(void) { g_gemv_n = 0; }
 
 /* The HVX GEMM's stand-in: the same sum, over the tiles the kernel points
    it at, into the row-stride-32 tile the header promises. */
+/* ---- #117: the M=1 feed's scoreboard ------------------------------------
+   Every push is recorded (destination range, source, ring index) and every
+   ring wait marks the pushes it retires (in issue order, as the dmlinked
+   chain does). A GEMV column read from VTCM must then find the latest push
+   covering its address WAITED and long enough for the column, a push onto
+   a slab must find the slab's previous matrix fully read (n_col columns,
+   once each: the pool run that read it has joined), and every push must
+   land inside the arena. The DMA stand-in still copies at once, so a read
+   before its wait computes the right bytes here and stale ones on device;
+   the scoreboard is what turns that into a failure without a phone. On
+   only inside run_m1_case with the feed set (g_score_on): the HMX path's
+   chunked pushes are read by the HMX stand-in, not by columns. */
+static uint32_t g_lane; /* set by the pool stand-in below */
+#define SCORE_MAX 256u
+typedef struct {
+  const uint8_t *dst, *src;
+  uint32_t bytes, row_size, nrows, idx, reads, waited;
+} score_push;
+static score_push g_score[SCORE_MAX];
+static uint32_t g_score_n, g_score_on, g_score_bad, g_score_waits,
+  g_score_vtcm_reads;
+static const uint8_t *g_vtcm_lo, *g_vtcm_hi;
+static void score_reset(int on, const uint8_t *vtcm, size_t vtcm_bytes) {
+  g_score_n = g_score_bad = g_score_waits = g_score_vtcm_reads = 0;
+  g_score_on = on ? 1u : 0u;
+  g_vtcm_lo = vtcm;
+  g_vtcm_hi = vtcm + vtcm_bytes;
+}
+static int in_vtcm(const uint8_t *p) { return p >= g_vtcm_lo && p < g_vtcm_hi; }
+/* The latest push whose destination range holds @a p, or NULL. */
+static score_push *score_find(const uint8_t *p) {
+  for (uint32_t k = g_score_n; k-- > 0u;) {
+    score_push *sp = &g_score[k];
+    if (p >= sp->dst && p < sp->dst + sp->bytes)
+      return sp;
+  }
+  return NULL;
+}
+
 static void gemv_stand_in(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
                           const uint8_t *wh, uint32_t n_col, uint32_t nt,
                           int32_t *out) {
@@ -83,6 +122,26 @@ static void gemv_stand_in(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
      (hvx_gemm_u8i4_wh.c); the stand-in is that sum, so it is the same
      function either way and the caller only records which loop was
      asked for. */
+  const uint8_t *src_wh = wh;
+  if (g_score_on && in_vtcm(wh)) {
+    /* One whole matrix per push (f2): the column's last tile must be
+       inside it, and it must have been waited for. */
+    score_push *sp = score_find(wh);
+    const size_t need = ((size_t)(k_tiles - 1u) * n_col + nt + 1u) * 512u;
+    if (!sp || sp->dst != wh || !sp->waited || need > sp->bytes ||
+        sp->row_size != n_col * 512u || sp->nrows != k_tiles) {
+      if (g_score_bad++ < 4u)
+        printf("FEED read not covered: lane=%u nt=%u n_col=%u %s\n", g_lane, nt,
+               n_col,
+               !sp           ? "no push"
+               : !sp->waited ? "push not waited"
+                             : "shape");
+    } else {
+      ++sp->reads;
+      ++g_score_vtcm_reads;
+      src_wh = sp->src; /* the log names the expert by its arena bytes */
+    }
+  }
   for (uint32_t r = 0; r < m; ++r)
     for (uint32_t c = 0; c < 32; ++c) {
       int32_t s = 0;
@@ -100,7 +159,7 @@ static void gemv_stand_in(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
       (gemv_log_entry *)realloc(g_gemv_log, g_gemv_cap * sizeof *g_gemv_log);
   }
   gemv_log_entry *le = &g_gemv_log[g_gemv_n++];
-  le->wh = wh;
+  le->wh = src_wh;
   le->nt = nt;
   le->m = m > 4u ? 4u : m;
   memcpy(le->tile, out, sizeof(int32_t) * 32u * le->m);
@@ -123,7 +182,6 @@ typedef struct {
 } pf_box;
 static pf_box g_pf[PF_LANES][PF_RING];
 static uint32_t g_pf_head[PF_LANES];
-static uint32_t g_lane;
 static uint64_t g_pf_cols, g_pf_used, g_pf_bad, g_nopf_n, g_col_n;
 /* Bit 0: a column ran with rows1 = 0, bit 1: with rows1 = 1. The two knobs
    are independent only if what the call asked for is what every column
@@ -183,6 +241,13 @@ void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
                                int32_t *out) {
   int found = 0;
   g_rows1_seen |= 1u << (rows1 != 0u);
+  if (g_score_on && in_vtcm(wh)) {
+    /* Under the feed no box covers a column; the scoreboard in
+       gemv_stand_in holds the read instead. */
+    ++g_nopf_n;
+    gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, out);
+    return;
+  }
   for (uint32_t k = 0; k < PF_RING && !found; ++k) {
     pf_box *b = &g_pf[g_lane][k];
     if (b->wh == wh && b->n_col == n_col && b->k_tiles == k_tiles &&
@@ -217,15 +282,25 @@ int hexkl_micro_hmx_acc_read_int32(uint8_t *base, uint32_t cfg, uint32_t off) {
 /* ---- DMA ring: completes immediately, so a push issued while the
    destination is still live shows up as a wrong result. ---- */
 void hexkl_dma_ring_reset(void) {}
-void hexkl_dma_ring_drain(void) {}
 /* Indices are handed out and waited on for real shape, but every transfer
-   has already completed by the time push2d returns, so a wait is a no-op.
-   That is the point: a chunk consumed before its push would read stale
-   bytes on device and read correct ones here, so what this harness checks
-   is that every chunk IS pushed and that the offsets line up. */
+   has already completed by the time push2d returns, so a wait is a no-op
+   for the bytes. That is the point: a chunk consumed before its push would
+   read stale bytes on device and read correct ones here, so what this
+   harness checks is that every chunk IS pushed and that the offsets line
+   up -- and, under the M=1 feed, the scoreboard above: a wait retires
+   every push at or before its index, as the dmlinked chain does. */
 static uint32_t g_stub_idx;
 uint32_t hexkl_dma_ring_next_idx(void) { return g_stub_idx++; }
-void hexkl_dma_ring_wait(uint32_t idx) { (void)idx; }
+static void score_retire(uint32_t idx) {
+  for (uint32_t k = 0; k < g_score_n; ++k)
+    if (g_score[k].idx <= idx)
+      g_score[k].waited = 1u;
+}
+void hexkl_dma_ring_wait(uint32_t idx) {
+  ++g_score_waits;
+  score_retire(idx);
+}
+void hexkl_dma_ring_drain(void) { score_retire(g_stub_idx); }
 /* Every transfer is complete by the time push2d returns, so the trace's
    watermark sees each descriptor done at the very next point. */
 int hexkl_dma_ring_is_done(uint32_t idx) {
@@ -235,7 +310,41 @@ int hexkl_dma_ring_is_done(uint32_t idx) {
 void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
                            uint32_t rs, uint32_t nrows, int sv, int dv) {
   (void)sv;
-  (void)dv;
+  /* Only the VTCM-bound pushes are slab pushes; moe_dma_copy's heap-to-heap
+     pieces (dst_vtcm = 0) are the two other descriptors of a call. */
+  if (g_score_on && dv) {
+    const uint8_t *d0 = (const uint8_t *)dst;
+    const size_t bytes = (size_t)(nrows - 1u) * ds + rs;
+    /* (iii) inside the arena; (ii) the slab's previous matrix was read
+       whole -- its pool run has joined -- before this lands on it. */
+    if (!in_vtcm(d0) || d0 + bytes > g_vtcm_hi) {
+      if (g_score_bad++ < 4u)
+        printf("FEED push outside the arena: %zu bytes at +%td\n", bytes,
+               d0 - g_vtcm_lo);
+    }
+    for (uint32_t k = 0; k < g_score_n; ++k) {
+      const score_push *sp = &g_score[k];
+      if (d0 < sp->dst + sp->bytes && sp->dst < d0 + bytes &&
+          sp->reads != sp->row_size / 512u) {
+        if (g_score_bad++ < 4u)
+          printf("FEED push onto a live slab: +%td (previous matrix %u of %u "
+                 "columns read)\n",
+                 d0 - g_vtcm_lo, sp->reads, sp->row_size / 512u);
+        break;
+      }
+    }
+    if (g_score_n < SCORE_MAX) {
+      score_push *sp = &g_score[g_score_n++];
+      sp->dst = d0;
+      sp->src = (const uint8_t *)src;
+      sp->bytes = (uint32_t)bytes;
+      sp->row_size = rs;
+      sp->nrows = nrows;
+      sp->idx = g_stub_idx - 1u; /* next_idx was taken just before */
+      sp->reads = 0u;
+      sp->waited = 0u;
+    }
+  }
   for (uint32_t r = 0; r < nrows; ++r)
     memcpy((uint8_t *)dst + (size_t)r * ds,
            (const uint8_t *)src + (size_t)r * ss, rs);
@@ -652,6 +761,8 @@ static void make_weight(uint32_t slot, uint32_t K, uint32_t N, W *w) {
    The log of GEMV tiles is then held against a reference built from the
    token rows the routing names, independently of the kernel's slot pack. */
 static int g_pf_lead_ok = 1;
+static int g_feed_sched_ok = 1;
+static uint64_t g_feed_pushes, g_feed_waits;
 static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
                        uint32_t inter, uint32_t N_out, uint32_t NE,
                        const uint32_t *rc_, uint32_t slot0, uint8_t *vtcm,
@@ -659,6 +770,7 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
                        uint32_t gemv_flags, float *ref, int have_ref) {
   const uint32_t lead_kb = hexkl_moe_flags_lead_kb(gemv_flags);
   const uint32_t rows1 = hexkl_moe_flags_rows1(gemv_flags);
+  const uint32_t feed = hexkl_moe_flags_feed(gemv_flags);
   /* Same weights and activation for every configuration of a case, so the
      HMX reference above can be computed once and reused. */
   rnd_state = 12345u + 7919u * M + 104729u * (uint32_t)(shape[0] == 'r');
@@ -700,6 +812,7 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
      buffer back for every configuration of a case, so it runs once. */
   int r = 0;
   uint64_t blocks_hmx = active;
+  score_reset(0, vtcm, vtcm_bytes); /* the HMX run is not scored */
   if (have_ref) {
     memcpy(out_hmx, ref, sizeof(float) * M * N_out);
   } else {
@@ -722,29 +835,42 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
   gemv_log_reset();
   pf_reset();
+  score_reset(feed != 0u, vtcm, vtcm_bytes);
   r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, vtcm_bytes, vtcm_bytes, M, K,
                                   inter, N_out, NE, hg, hd, ridx, rc_, rw, act,
                                   out_m1, NULL, scratch, gemv_flags);
   const uint64_t blocks = hexkl_probe_us[HEXKL_PROBE_BLOCKS];
   const uint64_t dma_kb = hexkl_probe_us[HEXKL_PROBE_DMA_KB];
   const uint64_t path = hexkl_probe_us[HEXKL_PROBE_PATH];
+  const uint64_t fed = hexkl_probe_us[HEXKL_PROBE_M1_FEED];
+  /* With the feed every active expert's two matrices go through the ring
+     (the same count the HMX path's check below wants); without it none. */
+  const uint64_t want_kb =
+    feed
+      ? (uint64_t)active * ((((K / 32u) * ((2u * inter) / 32u) * 512u) >> 10) +
+                            (((inter / 32u) * (N_out / 32u) * 512u) >> 10))
+      : 0u;
   const int same = memcmp(out_hmx, out_m1, sizeof(float) * M * N_out);
-  fail |= (r != 0) || blocks != 0u || dma_kb != 0u || path != 1u || same != 0;
+  fail |= (r != 0) || blocks != 0u || dma_kb != want_kb || path != 1u ||
+          fed != feed || same != 0;
 
   /* The lead: with it, every GEMV column went through the prefetch-free
      call, each covered once by its own lane's box (no double fetch, no
-     over-fetch); without it, every column fetched itself as before. */
+     over-fetch); without it, every column fetched itself as before. Under
+     the feed (#117) no box at all: every column took the prefetch-free
+     entry on a VTCM address the scoreboard holds. */
   const uint64_t cols = (uint64_t)active * ((2u * inter + N_out) / 32u);
   const int pf_ok =
     g_pf_bad == 0u && g_rows1_seen == (1u << (rows1 != 0u)) &&
-    (lead_kb != 0u ? (g_col_n == 0u && g_nopf_n == cols && g_pf_cols == cols &&
-                      g_pf_used == cols)
-                   : (g_nopf_n == 0u && g_pf_cols == 0u && g_col_n == cols));
+    (feed != 0u      ? (g_col_n == 0u && g_pf_cols == 0u && g_nopf_n == cols)
+     : lead_kb != 0u ? (g_col_n == 0u && g_nopf_n == cols &&
+                        g_pf_cols == cols && g_pf_used == cols)
+                     : (g_nopf_n == 0u && g_pf_cols == 0u && g_col_n == cols));
   if (!pf_ok) {
-    printf("M1 GEMV shape=%s M=%u PF lead=%u rows1=%u: boxes=%llu "
+    printf("M1 GEMV shape=%s M=%u PF lead=%u rows1=%u feed=%u: boxes=%llu "
            "cols covered=%llu nopf=%llu self-prefetched=%llu bad=%llu "
            "rows1_seen=%u (want %llu columns)\n",
-           shape, M, (unsigned)lead_kb, (unsigned)rows1,
+           shape, M, (unsigned)lead_kb, (unsigned)rows1, (unsigned)feed,
            (unsigned long long)g_pf_cols, (unsigned long long)g_pf_used,
            (unsigned long long)g_nopf_n, (unsigned long long)g_col_n,
            (unsigned long long)g_pf_bad, (unsigned)g_rows1_seen,
@@ -752,6 +878,29 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
     fail = 1;
   }
   g_pf_lead_ok &= pf_ok;
+
+  /* The feed's schedule (#117): two whole-matrix pushes and two waits per
+     active expert, every VTCM read covered by a waited push, every push
+     inside the arena and onto a slab whose previous matrix was read whole
+     (gemv_stand_in / push2d above), and nothing pushed and left unread. */
+  if (feed != 0u) {
+    uint32_t unread = 0;
+    for (uint32_t k = 0; k < g_score_n; ++k)
+      unread += g_score[k].reads != g_score[k].row_size / 512u;
+    const int sched_ok = g_score_bad == 0u && g_score_n == 2u * active &&
+                         g_score_waits == 2u * active &&
+                         g_score_vtcm_reads == cols && unread == 0u;
+    if (!sched_ok) {
+      printf("M1 GEMV shape=%s M=%u FEED SCHEDULE: pushes=%u waits=%u "
+             "vtcm reads=%u unread=%u bad=%u (want %u/%u/%llu/0/0)\n",
+             shape, M, g_score_n, g_score_waits, g_score_vtcm_reads, unread,
+             g_score_bad, 2u * active, 2u * active, (unsigned long long)cols);
+      fail = 1;
+    }
+    g_feed_sched_ok &= sched_ok;
+    g_feed_pushes += g_score_n;
+    g_feed_waits += g_score_waits;
+  }
 
   /* The logged gate_up tiles, row by row, against the routing's token row
      quantized by the reference's own quantizer. Down tiles are not held
@@ -804,13 +953,13 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   const uint32_t bad = count_mismatches(out_m1, want, M * N_out, &worst);
   fail |= (bad != 0u);
 
-  printf("M1 GEMV shape=%s M=%u f32 memcmp=%d i32 exact=%s blocks=%llu "
-         "dma_kb=%llu (path=%llu, hmx blocks=%llu, gate_up tiles=%u, ref "
-         "mismatches=%u worst_rel=%g)\n",
-         shape, M, same != 0, i32_bad == 0u ? "yes" : "NO",
-         (unsigned long long)blocks, (unsigned long long)dma_kb,
-         (unsigned long long)path, (unsigned long long)blocks_hmx, i32_seen,
-         bad, worst);
+  printf("M1 GEMV shape=%s M=%u lead=%u rows1=%u feed=%u f32 memcmp=%d i32 "
+         "exact=%s blocks=%llu dma_kb=%llu (path=%llu, hmx blocks=%llu, "
+         "gate_up tiles=%u, ref mismatches=%u worst_rel=%g)\n",
+         shape, M, (unsigned)lead_kb, (unsigned)rows1, (unsigned)feed,
+         same != 0, i32_bad == 0u ? "yes" : "NO", (unsigned long long)blocks,
+         (unsigned long long)dma_kb, (unsigned long long)path,
+         (unsigned long long)blocks_hmx, i32_seen, bad, worst);
 
   for (uint32_t e = 0; e < NE; ++e) {
     if (rc_[e] == 0u)
@@ -841,42 +990,53 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
 
 /* M=1: four experts one row each; M=2: both tokens share two experts (two
    rows of a pair to the same expert) and take one more each; M=4: one
-   expert holds all four tokens, then 3, 2 and seven singles. The active
+   expert holds all four tokens, then 3, 2 and seven singles; then M=1 to
+   three and to five experts, the odd counts the feed's slab schedule
+   (#117) branches on: the slab whose last gate_up is expert n-2 takes its
+   downs first, and a fifth expert's down reuses a slot. The active
    experts are spread over the table with empties between them, at a
    stride coprime to the count so no two land on one slot. */
 static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
                         hexkl_moe_scratch *scratch) {
-  static const uint32_t counts[3][10] = {
-    {1, 1, 1, 1}, {2, 2, 1, 1, 1, 1}, {4, 3, 2, 1, 1, 1, 1, 1, 1, 1}};
-  static const uint32_t Ms[3] = {1, 2, 4};
+  static const uint32_t counts[5][10] = {{1, 1, 1, 1},
+                                         {2, 2, 1, 1, 1, 1},
+                                         {4, 3, 2, 1, 1, 1, 1, 1, 1, 1},
+                                         {1, 1, 1},
+                                         {1, 1, 1, 1, 1}};
+  static const uint32_t Ms[5] = {1, 2, 4, 1, 1};
   /* #113's matrix, run inside one build: the five leads the device sweep
      measures x the two row loops, plus the build's own defaults (the tune
-     bit clear), which is what a run that sets no env var gets. The lead
-     changes which columns each lane's boxes must cover and the loop
-     changes which kernel entry every column takes; neither changes a
-     result bit, so every cell is also held against the HMX path. */
+     bits clear), which is what a run that sets no env var gets; since
+     #117 the whole matrix again with the VTCM feed on. The lead changes
+     which columns each lane's boxes must cover, the loop changes which
+     kernel entry every column takes and the feed changes where the bytes
+     are read from; none changes a result bit, so every cell is also held
+     against the HMX path. */
   static const uint32_t leads_kb[] = {0u, 192u, 384u, 768u, 1536u};
+  const size_t n_pairs = 2u * (sizeof leads_kb / sizeof *leads_kb);
   int fail = 0;
   for (int shape = 0; shape < 2; ++shape) {
     const uint32_t K = shape ? 2048 : 64, inter = shape ? 1792 : 32,
                    N_out = shape ? 2048 : 64, NE = shape ? 32 : 12;
     uint32_t *rc_ = (uint32_t *)calloc(NE, sizeof(uint32_t));
-    for (int c = 0; c < 3; ++c) {
+    for (int c = 0; c < 5; ++c) {
       memset(rc_, 0, sizeof(uint32_t) * NE);
       for (uint32_t i = 0; i < 10 && counts[c][i] != 0u; ++i)
         rc_[(i * 5u) % NE] = counts[c][i];
       float *ref = (float *)malloc(sizeof(float) * Ms[c] * N_out);
-      for (size_t cfg = 0; cfg <= 2u * (sizeof leads_kb / sizeof *leads_kb);
-           ++cfg) {
+      for (size_t cfg = 0; cfg <= 2u * n_pairs; ++cfg) {
         uint32_t flags = HEXKL_MOE_FLAG_M1_GEMV;
         if (cfg != 0u) {
-          const size_t i = cfg - 1u;
+          const size_t i = (cfg - 1u) % n_pairs;
           flags |= HEXKL_MOE_FLAG_GEMV_LEAD_SET |
                    HEXKL_MOE_FLAG_GEMV_ROWS1_SET |
+                   HEXKL_MOE_FLAG_GEMV_FEED_SET |
                    ((leads_kb[i / 2u] / HEXKL_MOE_GEMV_LEAD_KB_UNIT)
                     << HEXKL_MOE_GEMV_LEAD_SHIFT);
           if (i % 2u)
             flags |= HEXKL_MOE_FLAG_GEMV_ROWS1;
+          if (cfg > n_pairs)
+            flags |= HEXKL_MOE_FLAG_GEMV_FEED;
         }
         fail |=
           run_m1_case(shape ? "real" : "tiny", Ms[c], K, inter, N_out, NE, rc_,
@@ -889,9 +1049,10 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
   if (fail)
     printf("M1 GEMV PATH DIFFERS FROM HMX PATH\n");
   else
-    printf("M1 GEMV PATH BIT-IDENTICAL TO HMX PATH (M=1,2,4; tiny+real; "
-           "%u lead x loop configurations)\n",
-           (unsigned)(1u + 2u * (sizeof leads_kb / sizeof *leads_kb)));
+    printf("M1 GEMV PATH BIT-IDENTICAL TO HMX PATH (M=1,2,4, 3 and 5 experts; "
+           "tiny+real; "
+           "%u lead x loop configurations, feed=arena,vtcm)\n",
+           (unsigned)(1u + 2u * n_pairs));
   printf(g_pf_lead_ok
            ? "M1 GEMV PREFETCH LEAD COVERS EVERY COLUMN (lanes=%u; leads "
              "0/192/384/768/1536 KB x rows4,rows1; build default %u KB "
@@ -900,6 +1061,15 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
              "0/192/384/768/1536 KB x rows4,rows1; build default %u KB "
              "rows1=%u)\n",
          PF_LANES, (unsigned)HVX_GEMV_PF_LEAD_KB, (unsigned)HVX_GEMV_M1_ROWS1);
+  printf(g_feed_sched_ok
+           ? "M1 GEMV VTCM FEED SCHEDULE OK (%llu pushes, %llu waits over the "
+             "cases; whole-matrix descriptors, every read after its wait, 2 "
+             "slabs <= arena, no l2fetch under the feed; build default "
+             "feed=%u)\n"
+           : "M1 GEMV VTCM FEED SCHEDULE WRONG (%llu pushes, %llu waits; build "
+             "default feed=%u)\n",
+         (unsigned long long)g_feed_pushes, (unsigned long long)g_feed_waits,
+         (unsigned)HVX_GEMV_M1_FEED);
   return fail;
 }
 

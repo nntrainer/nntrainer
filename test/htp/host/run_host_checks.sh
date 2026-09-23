@@ -30,7 +30,10 @@ cc=${CC:-gcc}
 # #113: the l2fetch lead and the GEMV row loop are a per-call field of the
 # moe_set_opts word, so the check itself sweeps the whole
 # {0, 192, 384, 768, 1536} KB x {rows4, rows1} matrix plus the build's own
-# defaults, instead of this loop compiling one configuration at a time.
+# defaults, instead of this loop compiling one configuration at a time;
+# since #117 that matrix twice, with the arena read and with the VTCM
+# feed, whose push/wait schedule the check's scoreboard holds
+# (M1 GEMV VTCM FEED SCHEDULE OK).
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
   -DMOE_TAIL_MAX_ROWS=16u \
   -I "$HERE/stub" -I "$HERE/.." -I "$BACKEND/hmx" -I "$BACKEND/hvx" \

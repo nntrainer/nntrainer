@@ -2368,10 +2368,12 @@ TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
    serves the whole matrix, and the echo the caller compares proves which
    cell ran. The lead field is masked to 8 bits: without the mask a lead of
    16384 KB or more would spill into bit 16 and silently ask for the other
-   row loop, which the echo could not catch. */
-static uint32_t MoeGemvOpts(uint32_t lead_kb, bool rows1) {
-  return 1u | 0x80u | 0x40u | (((lead_kb / 64u) & 0xFFu) << 8) |
-         (rows1 ? 0x10000u : 0u);
+   row loop, which the echo could not catch. [#117] Bit 5 makes bit 17
+   authoritative: the weight feed, 1 = each expert's matrices staged into
+   VTCM by DMA, 0 = the arena read. */
+static uint32_t MoeGemvOpts(uint32_t lead_kb, bool rows1, bool feed = false) {
+  return 1u | 0x80u | 0x40u | 0x20u | (((lead_kb / 64u) & 0xFFu) << 8) |
+         (rows1 ? 0x10000u : 0u) | (feed ? 0x20000u : 0u);
 }
 
 /* [#80] The M=1 GEMV path against the HMX block loop on silicon: the same
@@ -2427,15 +2429,19 @@ TEST_F(HmxMmU8I4Layer, MoeLayerM1GemvMatchesHmx) {
     };
     std::vector<float> hmx, m1;
     ASSERT_EQ(run(0u, hmx), AEE_SUCCESS);
-    // Every (loop, lead) pair the microbench sweeps: the lead is an
-    // l2fetch hint and the loop is the same int32 sum in the same order,
-    // so a single differing byte under any of them voids that variant
-    // (#113 gate (a)).
+    // Every (loop, lead) pair the microbench sweeps, with the arena read
+    // and with the VTCM feed (#117): the lead is an l2fetch hint, the loop
+    // is the same int32 sum in the same order and the feed reads the same
+    // WH bytes from a DMA'd copy, so a single differing byte under any of
+    // them voids that variant (#113 gate (a); under the feed a wrong byte
+    // is a stale or partial slab, which no host check can time).
     size_t bad = 0;
+    for (int feed = 0; feed < 2; ++feed) {
     for (uint32_t lead_kb : {0u, 192u, 384u, 768u, 1536u}) {
       for (int rows1 = 0; rows1 < 2; ++rows1) {
-        ASSERT_EQ(run(MoeGemvOpts(lead_kb, rows1 != 0), m1), AEE_SUCCESS)
-          << "lead_kb=" << lead_kb << " rows1=" << rows1;
+          ASSERT_EQ(run(MoeGemvOpts(lead_kb, rows1 != 0, feed != 0), m1),
+                    AEE_SUCCESS)
+            << "lead_kb=" << lead_kb << " rows1=" << rows1 << " feed=" << feed;
         size_t bad_cell = 0;
         for (size_t i = 0; i < hmx.size(); ++i) {
           if (std::memcmp(&hmx[i], &m1[i], sizeof(float)) != 0)
@@ -2444,13 +2450,14 @@ TEST_F(HmxMmU8I4Layer, MoeLayerM1GemvMatchesHmx) {
         if (bad_cell != 0) {
           std::cout << "U8I4_FIELD path=moe_m1_gemv field=bad_cell_M" << rt.M
                     << " lead_kb=" << lead_kb << " rows1=" << rows1
-                    << " value=" << bad_cell << std::endl;
+                      << " feed=" << feed << " value=" << bad_cell << std::endl;
         }
         bad += bad_cell;
       }
     }
+    }
     std::cout << "U8I4_FIELD path=moe_m1_gemv field=bad_elems_M" << rt.M
-              << " value=" << bad << " of " << (10u * hmx.size()) << std::endl;
+              << " value=" << bad << " of " << (20u * hmx.size()) << std::endl;
     EXPECT_EQ(bad, 0u) << "M=" << rt.M
                        << ": the HVX GEMV path and the HMX block loop "
                           "disagree on the same routing";
@@ -2485,11 +2492,20 @@ TEST_F(HmxMmU8I4Layer, MoeLayerM1GemvMatchesHmx) {
    up_{b+1} and stage C keeps the current box and the next, so it is 2 x
    lead_kb per lane and 12 x lead_kb over the six lanes. That is the number
    the L2 budget is read against -- the lead where the arena column stops
-   falling is the answer. */
+   falling is the answer.
+
+   [#117] A fourth cell, "vtcm": the arena experts with the VTCM feed on
+   (each expert's matrices DMA'd into VTCM one expert ahead, the GEMV
+   reading the copy), at the one-row loop with and without the requested
+   lead (the kernel forces the lead off under the feed, so the two lines
+   must agree) and at the four-row loop. Its mm_us against the arena
+   column at the same loop is the feed's gain; mm_us minus the bytes over
+   the engine rate is the compute tail plus the per-expert fork/joins. */
 TEST_F(HmxMmU8I4Layer, MoeM1GemvFeedVsCompute) {
   const uint32_t K = 2048, I = 1792, N = 2048, NE = 4;
-  // test/htp/nntr_hvx_mm_u8i4.c's MOE_N_STAGES and the three slots read.
-  const int kMoeStages = 30, kMm = 10, kLane = 2, kPath = 29, kReps = 20;
+  // test/htp/nntr_hvx_mm_u8i4.c's MOE_N_STAGES and the four slots read.
+  const int kMoeStages = 31, kMm = 10, kLane = 2, kPath = 29, kFeed = 30,
+            kReps = 20;
   MoeExperts x;
   ASSERT_NO_FATAL_FAILURE(MakeMoeExperts(K, I, N, NE, x));
   if (IsSkipped()) {
@@ -2506,12 +2522,14 @@ TEST_F(HmxMmU8I4Layer, MoeM1GemvFeedVsCompute) {
     const char *name;
     uint32_t inter, n_out;
     std::vector<uint32_t> gu, dn;
+    bool feed;
   };
   const std::vector<Cell> cells = {
-    {"arena", I, N, x.a_gu, x.a_dn},
-    {"heap", I, N, x.h_gu, x.h_dn},
+    {"arena", I, N, x.a_gu, x.a_dn, false},
+    {"heap", I, N, x.h_gu, x.h_dn, false},
     {"hot", hI, hN, std::vector<uint32_t>(NE, hot_gu.handle),
-     std::vector<uint32_t>(NE, hot_dn.handle)},
+     std::vector<uint32_t>(NE, hot_dn.handle), false},
+    {"vtcm", I, N, x.a_gu, x.a_dn, true},
   };
   const std::vector<uint32_t> row_count(NE, 1u), row_index(NE, 0u);
   const std::vector<float> row_weight(NE, 0.25f);
@@ -2528,11 +2546,14 @@ TEST_F(HmxMmU8I4Layer, MoeM1GemvFeedVsCompute) {
     {0u, false},  {0u, true},    {192u, false}, {192u, true},   {384u, false},
     {384u, true}, {768u, false}, {768u, true},  {1536u, false}, {1536u, true}};
   const std::vector<Pair> control = {{0u, false}, {192u, true}};
+  const std::vector<Pair> fed = {{0u, true}, {192u, true}, {0u, false}};
   for (const Cell &c : cells) {
-    const std::vector<Pair> &pairs =
-      std::strcmp(c.name, "heap") == 0 ? control : full;
+    const std::vector<Pair> &pairs = c.feed ? fed
+                                     : std::strcmp(c.name, "heap") == 0
+                                       ? control
+                                       : full;
     for (const Pair &pr : pairs) {
-      const uint32_t opts = MoeGemvOpts(pr.lead_kb, pr.rows1);
+      const uint32_t opts = MoeGemvOpts(pr.lead_kb, pr.rows1, c.feed);
       ASSERT_EQ(nntr_hvx_moe_set_opts(handle_, opts, &applied), AEE_SUCCESS);
       ASSERT_EQ(applied, opts) << "the skel does not know #113's tune bits";
       std::vector<float> out(c.n_out);
@@ -2549,6 +2570,8 @@ TEST_F(HmxMmU8I4Layer, MoeM1GemvFeedVsCompute) {
                   AEE_SUCCESS)
           << c.name;
         ASSERT_EQ(stage[kPath], 1u) << c.name << ": not the M=1 GEMV path";
+        ASSERT_EQ(stage[kFeed], c.feed ? 1u : 0u)
+          << c.name << ": the feed the call took is not the cell's";
         if (rep > 0) {
           mm.push_back(stage[kMm]);
           lane.push_back(stage[kLane]);
@@ -2572,6 +2595,7 @@ TEST_F(HmxMmU8I4Layer, MoeM1GemvFeedVsCompute) {
       std::cout << std::fixed << std::setprecision(2)
                 << "U8I4_FIELD path=m1_bench cell=" << c.name
                 << " lead_kb=" << pr.lead_kb << " rows1=" << (pr.rows1 ? 1 : 0)
+                << " feed=" << (c.feed ? 1 : 0)
                 << " inflight_kb=" << (2u * pr.lead_kb) << " mm_us=" << mm_us
                 << " mm_min_us=" << mm[ord[0]] << " lane_us=" << lane_us
                 << " lanes=" << (mm_us > 0 ? lane_us / mm_us : 0.0)
