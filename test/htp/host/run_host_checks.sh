@@ -66,3 +66,16 @@ cc=${CC:-gcc}
   "$HERE/worker_pool_host_check.c" "$BACKEND/hvx/hvx_worker_pool.c"
 
 "$OUT/worker_pool_host_check"
+
+# weight_swap_u8i4_arena (doc 52 section 10.12): the real skel entry point
+# over the real weight registry, the arena plain aligned memory. The header
+# qaic would generate is written from the IDL, so the entry points'
+# definitions are checked against the IDL too -- a mismatch fails here.
+python3 "$HERE/gen_nntr_hvx_h.py" "$HERE/../nntr_hvx.idl" "$OUT/nntr_hvx.h"
+"$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
+  -I "$OUT" -I "$HERE/stub" -I "$HERE/.." -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  -o "$OUT/swap_host_check" \
+  "$HERE/swap_host_check.c" "$HERE/../nntr_hvx_mm_u8i4.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_dma.c" "$HERE/hvx_scalar_stubs.c" -lm
+
+"$OUT/swap_host_check"

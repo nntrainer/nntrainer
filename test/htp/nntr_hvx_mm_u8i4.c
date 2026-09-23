@@ -448,6 +448,79 @@ int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
                                           bias, w_handle);
 }
 
+/** @brief The IDL's "nothing to release" for weight_swap_u8i4_arena. */
+#define NNTR_HVX_NO_HANDLE 0xFFFFFFFFu
+
+/** @brief True for a live handle whose bytes are borrowed from an arena --
+ *  the only kind weight_swap_u8i4_arena may release, since the host's
+ *  expert pool never owns a heap-baked weight. */
+static int swap_releasable(const hexkl_weight_u8i4_table *tbl, uint32 h) {
+  return h < HEXKL_MM_U8I4_MAX_WEIGHTS && tbl->slots[h].in_use &&
+         tbl->slots[h].borrowed;
+}
+
+int nntr_hvx_weight_swap_u8i4_arena(
+  remote_handle64 handle, uint32 old_gu, uint32 old_dn, uint32 K, uint32 inter,
+  uint32 N_out, uint32 arena, uint32 off_gu, uint32 off_dn,
+  const float *gu_scale, int gu_scaleLen, const int32 *gu_colsum,
+  int gu_colsumLen, const float *dn_scale, int dn_scaleLen,
+  const int32 *dn_colsum, int dn_colsumLen, uint32 *h_gu, uint32 *h_dn) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  const uint32 n_gu = 2u * inter;
+  const int release_old =
+    !(old_gu == NNTR_HVX_NO_HANDLE && old_dn == NNTR_HVX_NO_HANDLE);
+  float *bias;
+  uint32 g = NNTR_HVX_NO_HANDLE, d = NNTR_HVX_NO_HANDLE;
+  int rc;
+  if (!s || !h_gu || !h_dn) {
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)gu_scaleLen != n_gu || (uint32_t)gu_colsumLen != n_gu ||
+      (uint32_t)dn_scaleLen != N_out || (uint32_t)dn_colsumLen != N_out) {
+    FARF(ERROR, "weight_swap_u8i4_arena: bad lengths (K=%u inter=%u N=%u)",
+         (unsigned)K, (unsigned)inter, (unsigned)N_out);
+    return AEE_EBADPARM;
+  }
+  /* Checked before anything is registered, so a bad pair costs nothing:
+     both or neither, both arena-borrowed, and not the same handle twice. */
+  if (release_old &&
+      (old_gu == old_dn || !swap_releasable(&s->weights_u8i4, old_gu) ||
+       !swap_releasable(&s->weights_u8i4, old_dn))) {
+    FARF(ERROR, "weight_swap_u8i4_arena: old pair %u/%u is not releasable",
+         (unsigned)old_gu, (unsigned)old_dn);
+    return AEE_EBADPARM;
+  }
+  bias = (float *)calloc(n_gu > N_out ? n_gu : N_out, sizeof(float));
+  if (!bias) {
+    return AEE_ENOMEMORY;
+  }
+  /* The same extent checks and registry call as weight_register_u8i4_arena,
+     through its own entry point rather than a copy of it. */
+  rc = nntr_hvx_weight_register_u8i4_arena(handle, K, n_gu, arena, off_gu,
+                                           gu_scale, (int)n_gu, gu_colsum,
+                                           (int)n_gu, bias, (int)n_gu, &g);
+  if (rc == AEE_SUCCESS) {
+    rc = nntr_hvx_weight_register_u8i4_arena(
+      handle, inter, N_out, arena, off_dn, dn_scale, (int)N_out, dn_colsum,
+      (int)N_out, bias, (int)N_out, &d);
+    if (rc != AEE_SUCCESS) {
+      hexkl_weight_u8i4_release(&s->weights_u8i4, g);
+    }
+  }
+  free(bias);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  /* Last, and validated above, so these cannot fail. */
+  if (release_old) {
+    hexkl_weight_u8i4_release(&s->weights_u8i4, old_gu);
+    hexkl_weight_u8i4_release(&s->weights_u8i4, old_dn);
+  }
+  *h_gu = g;
+  *h_dn = d;
+  return AEE_SUCCESS;
+}
+
 int nntr_hvx_mem_probe_dsp_heap(remote_handle64 handle, uint32 chunk_mb,
                                 uint32 max_chunks, uint32 *chunks_ok,
                                 int chunks_okLen, uint64 *touched_sum,

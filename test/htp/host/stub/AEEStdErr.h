@@ -3,6 +3,7 @@
 #define AEE_SUCCESS 0
 #define AEE_EFAILED 1
 #define AEE_ENOMEMORY 2
+#define AEE_EBADSTATE 13
 #define AEE_EBADPARM 14
 #define AEE_EUNSUPPORTED 20
 typedef int AEEResult;
