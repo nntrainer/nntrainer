@@ -33,36 +33,39 @@ static void expect(int ok, const char *what) {
 }
 
 int main(void) {
-  /* The D192 word, #113's landed default: bit 0 on, both tune bits, lead
-     3 x 64 KB in [15:8], rows1 in bit 16 = 0x103c1. */
-  const uint32_t d192 = HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_GEMV_LEAD_SET |
+  /* The landed default: #113's D192 (bit 0 on, lead 3 x 64 KB in [15:8],
+     rows1 in bit 16) under #117's VTCM feed (bit 17), all three tune bits
+     set = 0x303e1. FEED=0 is the D192 arena read, 0x103e1. */
+  const uint32_t feed_set = HTP_MOE_FLAG_GEMV_LEAD_SET |
+                            HTP_MOE_FLAG_GEMV_ROWS1_SET |
+                            HTP_MOE_FLAG_GEMV_FEED_SET;
+  const uint32_t d192 = HTP_MOE_FLAG_M1_GEMV | feed_set |
                         (3u << HTP_MOE_GEMV_LEAD_SHIFT) |
-                        HTP_MOE_FLAG_GEMV_ROWS1_SET | HTP_MOE_FLAG_GEMV_ROWS1;
-  expect(d192 == 0x103c1u, "D192 is 0x103c1");
+                        HTP_MOE_FLAG_GEMV_ROWS1 | HTP_MOE_FLAG_GEMV_FEED;
+  expect(d192 == 0x303e1u, "D192 + feed is 0x303e1");
   expect(htp_moe_opts_flags(NULL, NULL, NULL, NULL) == d192,
-         "unset is on, D192");
+         "unset is on, D192 + feed");
   expect(htp_moe_opts_flags("0", NULL, NULL, NULL) ==
            (d192 & ~HTP_MOE_FLAG_M1_GEMV),
          "0 is off");
   expect(htp_moe_opts_flags("1", NULL, NULL, NULL) == d192, "1 is on");
   if (!g_fail)
-    printf("MOE M1 GEMV OPTS: unset=on(0x103c1) 0=off 1=on\n");
+    printf("MOE M1 GEMV OPTS: unset=on(0x303e1) 0=off 1=on\n");
 
   /* #113's (loop, lead) fields. Each knob is overridden only by its own
-     variable, so naming one leaves the other at the default instead of
-     resetting it to zero; both tune bits are always sent so the echo
-     names the cell. */
-  expect(htp_moe_opts_flags(NULL, "0", "0", NULL) ==
-           (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_GEMV_LEAD_SET |
-            HTP_MOE_FLAG_GEMV_ROWS1_SET),
-         "LEAD_KB=0 ROWS1=0 is the old four-row, no-lead cell 0xc1");
-  expect(htp_moe_opts_flags(NULL, "0", "0", NULL) == 0xc1u, "A0 word is 0xc1");
+     variable, so naming one leaves the others at the default instead of
+     resetting them to zero; all three tune bits are always sent so the
+     echo names the cell. */
+  expect(htp_moe_opts_flags(NULL, "0", "0", "0") ==
+           (HTP_MOE_FLAG_M1_GEMV | feed_set),
+         "LEAD_KB=0 ROWS1=0 FEED=0 is the pre-#115 four-row, no-lead cell");
+  expect(htp_moe_opts_flags(NULL, "0", "0", "0") == 0xe1u,
+         "pre-#115 word is 0xe1");
   expect(htp_moe_opts_flags(NULL, "192", NULL, NULL) == d192,
          "192 KB is 3 units of 64 KB, and the loop stays at the default");
   expect(htp_moe_opts_flags(NULL, "1536", "1", NULL) ==
-           (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_GEMV_LEAD_SET |
-            (24u << HTP_MOE_GEMV_LEAD_SHIFT) | HTP_MOE_FLAG_GEMV_ROWS1_SET |
-            HTP_MOE_FLAG_GEMV_ROWS1),
+           (HTP_MOE_FLAG_M1_GEMV | feed_set | (24u << HTP_MOE_GEMV_LEAD_SHIFT) |
+            HTP_MOE_FLAG_GEMV_ROWS1 | HTP_MOE_FLAG_GEMV_FEED),
          "1536 KB + rows1");
   expect(htp_moe_opts_flags(NULL, NULL, "1", NULL) == d192,
          "rows1 alone does not force the lead to 0");
@@ -85,24 +88,20 @@ int main(void) {
          "clamped to 127 units");
   expect((htp_moe_gemv_lead_units("999999") & ~HTP_MOE_GEMV_LEAD_BITS) == 0u,
          "the clamped field still fits bits [15:8]");
-  /* #117's feed knob. Sent only when its variable is set, so an unset run
-     keeps A's word (0x103c1, feed=default = the skel's build value);
-     FEED=1 on D192 is 0x303e1 (feed=vtcm), FEED=0 is 0x103e1 (feed=arena).
-     It touches neither of the other two knobs. */
-  expect(htp_moe_opts_flags(NULL, NULL, NULL, NULL) == 0x103c1u,
-         "unset feed leaves A's word 0x103c1");
+  /* #117's feed knob, the default since its sitting: unset and FEED=1 are
+     0x303e1 (feed=vtcm), FEED=0 is 0x103e1 (feed=arena, the next
+     sitting's A0). It touches neither of the other two knobs. */
   expect(htp_moe_opts_flags(NULL, NULL, NULL, "1") == 0x303e1u,
-         "FEED=1 on D192 is 0x303e1");
+         "FEED=1 on D192 is 0x303e1, the unset word");
   expect(htp_moe_opts_flags(NULL, NULL, NULL, "0") == 0x103e1u,
          "FEED=0 on D192 is 0x103e1");
-  expect(htp_moe_opts_flags(NULL, "0", "0", "1") == 0x200e1u,
-         "FEED=1 on the four-row, no-lead cell is 0x200e1");
-  expect(htp_moe_opts_flags("0", NULL, NULL, "1") == 0x303e0u,
+  expect(htp_moe_opts_flags(NULL, "0", "0", NULL) == 0x200e1u,
+         "LEAD_KB=0 ROWS1=0 keeps the feed: 0x200e1");
+  expect(htp_moe_opts_flags("0", NULL, NULL, NULL) == 0x303e0u,
          "the opt-out keeps bit 0 clear and still carries the feed");
-  expect(!strcmp(htp_moe_opts_feed_name(0x103c1u), "default") &&
-           !strcmp(htp_moe_opts_feed_name(0x303e1u), "vtcm") &&
+  expect(!strcmp(htp_moe_opts_feed_name(0x303e1u), "vtcm") &&
            !strcmp(htp_moe_opts_feed_name(0x103e1u), "arena"),
-         "feed names: default / vtcm / arena");
+         "feed names: vtcm / arena");
   if (!g_fail)
     printf("MOE GEMV TUNE OPTS: per-knob tune bits, 64 KB units, "
            "round+clamp 127, feed unset/0/1\n");

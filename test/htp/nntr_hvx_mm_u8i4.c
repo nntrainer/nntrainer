@@ -897,7 +897,7 @@ enum {
   MOE_T_DMA_DEPTH_MAX,
   MOE_T_DMA_FIRST_READY_US,
   MOE_T_DMA_LAST_ISSUE_US,
-  MOE_T_PATH, /**< NOT us: 0 = HMX block loop, 1 = M=1 HVX GEMV */
+  MOE_T_PATH,    /**< NOT us: 0 = HMX block loop, 1 = M=1 HVX GEMV */
   MOE_T_M1_FEED, /**< NOT us: 1 = the GEMV read VTCM slabs fed by DMA (#117) */
   MOE_N_STAGES
 };

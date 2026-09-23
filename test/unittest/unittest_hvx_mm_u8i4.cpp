@@ -2437,24 +2437,24 @@ TEST_F(HmxMmU8I4Layer, MoeLayerM1GemvMatchesHmx) {
     // is a stale or partial slab, which no host check can time).
     size_t bad = 0;
     for (int feed = 0; feed < 2; ++feed) {
-    for (uint32_t lead_kb : {0u, 192u, 384u, 768u, 1536u}) {
-      for (int rows1 = 0; rows1 < 2; ++rows1) {
+      for (uint32_t lead_kb : {0u, 192u, 384u, 768u, 1536u}) {
+        for (int rows1 = 0; rows1 < 2; ++rows1) {
           ASSERT_EQ(run(MoeGemvOpts(lead_kb, rows1 != 0, feed != 0), m1),
                     AEE_SUCCESS)
             << "lead_kb=" << lead_kb << " rows1=" << rows1 << " feed=" << feed;
-        size_t bad_cell = 0;
-        for (size_t i = 0; i < hmx.size(); ++i) {
-          if (std::memcmp(&hmx[i], &m1[i], sizeof(float)) != 0)
-            ++bad_cell;
-        }
-        if (bad_cell != 0) {
-          std::cout << "U8I4_FIELD path=moe_m1_gemv field=bad_cell_M" << rt.M
-                    << " lead_kb=" << lead_kb << " rows1=" << rows1
+          size_t bad_cell = 0;
+          for (size_t i = 0; i < hmx.size(); ++i) {
+            if (std::memcmp(&hmx[i], &m1[i], sizeof(float)) != 0)
+              ++bad_cell;
+          }
+          if (bad_cell != 0) {
+            std::cout << "U8I4_FIELD path=moe_m1_gemv field=bad_cell_M" << rt.M
+                      << " lead_kb=" << lead_kb << " rows1=" << rows1
                       << " feed=" << feed << " value=" << bad_cell << std::endl;
+          }
+          bad += bad_cell;
         }
-        bad += bad_cell;
       }
-    }
     }
     std::cout << "U8I4_FIELD path=moe_m1_gemv field=bad_elems_M" << rt.M
               << " value=" << bad << " of " << (20u * hmx.size()) << std::endl;

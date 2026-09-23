@@ -176,21 +176,23 @@ int hexkl_mm_u8i4_moe_layer_run(
  *        slabs double-buffered by expert) and the GEMV reads the VTCM
  *        copy; 0 = the GEMV reads the arena behind its own l2fetch. The
  *        compile-time default, overridable per call by the bits below.
- *        0 until #117's sitting passes its gate. Under the feed the
- *        l2fetch lead is off by construction (nothing to fetch), so the
- *        (loop, lead) pair reads as (rows1, ignored).
+ *        1 since #117's sitting passed its gate twice (M==1 mm 676 us vs
+ *        D192's 932, decode +29..33 % at every G, text identical, M>1
+ *        dsp within 0.04 %). Under the feed the l2fetch lead is off by
+ *        construction (nothing to fetch), so the (loop, lead) pair reads
+ *        as (rows1, ignored).
  */
 #ifndef HVX_GEMV_M1_FEED
-#define HVX_GEMV_M1_FEED 0u
+#define HVX_GEMV_M1_FEED 1u
 #endif
 
 /**
- * @brief moe_set_opts' two tune bits: each says that its own field below is
+ * @brief moe_set_opts' tune bits: each says that its own field below is
  *        authoritative and replaces the matching compile-time default above
  *        for every call of the session. Unset, that default stands. The
- *        ARM side (htp_moe_opts.h) always sets both, sending its own copy
- *        of the defaults when the env names nothing, so every log's echo
- *        names the (loop, lead) cell that ran (LEDGER rule 21).
+ *        ARM side (htp_moe_opts.h) always sets all three, sending its own
+ *        copy of the defaults when the env names nothing, so every log's
+ *        echo names the (loop, lead, feed) cell that ran (LEDGER rule 21).
  *
  * The point of carrying the pair in the word rather than in the build is
  * that one skel and one app then serve the whole (loop x lead) matrix,
