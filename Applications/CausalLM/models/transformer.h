@@ -372,6 +372,14 @@ protected:
   std::string MODEL_TENSOR_TYPE;
   std::string EMBEDDING_DTYPE; /** embedding dtype */
   std::string FC_LAYER_DTYPE;  /** custom_fc_lora */
+  /**
+   * @brief Engine the attention core layers run on ("attention_engine" in
+   *        nntr_config.json, e.g. "htp"); empty keeps the model default.
+   *        Also decides where the KV cache lives: with an engine whose
+   *        ComputeOps offers alloc_shared, the cache slabs are allocated
+   *        there so the accelerator reads them in place.
+   */
+  std::string ATTENTION_ENGINE;
   std::string EMBEDDING_FILE_NAME;
   std::string PLE_FILE_NAME;
 

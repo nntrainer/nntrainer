@@ -34,6 +34,9 @@
 #include <vector>
 
 #include <common.h>
+#include <compute_ops.h>
+#include <context.h>
+#include <context_data.h>
 #include <layer_context.h>
 #include <lm_head.h>
 #include <mha_core.h>
@@ -144,6 +147,30 @@ void CausalLM::allocateAndBindKVCache() {
 #endif
 
     const unsigned int max_timestep = static_cast<unsigned int>(MAX_SEQ_LEN);
+
+    // With the attention layers on an accelerator, put the cache in memory
+    // that accelerator reads in place (ComputeOps::alloc_shared; rpcmem on
+    // the HTP), so no call copies the used cache range. A backend without
+    // shared memory returns nullptr from alloc_shared and the manager
+    // keeps the heap; a missing or unusable engine is reported and the
+    // model runs as before.
+    if (!ATTENTION_ENGINE.empty()) {
+      try {
+        auto *ctx =
+          nntrainer::Engine::Global().getRegisteredContext(ATTENTION_ENGINE);
+        auto data = ctx ? ctx->getContextData() : nullptr;
+        nntrainer::ComputeOps *ops = data ? data->getComputeOps() : nullptr;
+        if (ops) {
+          kv_cache.setSharedAllocator(
+            [ops](size_t bytes) { return ops->alloc_shared(bytes); },
+            [ops](void *block) { ops->free_shared(block); });
+        }
+      } catch (const std::exception &e) {
+        std::cerr << "KV cache stays in host memory: attention_engine '"
+                  << ATTENTION_ENGINE << "' unavailable (" << e.what() << ")"
+                  << std::endl;
+      }
+    }
 
     kv_cache.allocate(static_cast<unsigned int>(NUM_LAYERS), BATCH_SIZE,
                       max_timestep,

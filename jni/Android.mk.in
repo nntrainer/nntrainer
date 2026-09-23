@@ -73,6 +73,17 @@ LOCAL_SRC_FILES          := @MESON_HEXKL_LIB_DIR@/libsdkl.so
 LOCAL_C_INCLUDES         := @MESON_HEXKL_INCLUDE_DIR@
 LOCAL_EXPORT_C_INCLUDES  := $(LOCAL_C_INCLUDES)
 include $(PREBUILT_SHARED_LIBRARY)
+
+# HtpBackend's FastRPC session (nntr_hvx_open/close, remote_session_control)
+# resolves against the device's own libcdsprpc.so at runtime; this is only
+# the Hexagon SDK's link-time stub of the same library, needed so
+# libnntrainer.so's undefined remote_handle64_open/close/invoke and
+# remote_session_control symbols resolve at link time. Do NOT push it to
+# the device: it shadows the real one and every call then fails.
+include $(CLEAR_VARS)
+LOCAL_MODULE             := cdsprpc
+LOCAL_SRC_FILES          := @MESON_HEXAGON_FASTRPC_LIB_DIR@/libcdsprpc.so
+include $(PREBUILT_SHARED_LIBRARY)
 endif
 
 include $(CLEAR_VARS)
@@ -214,7 +225,7 @@ ifeq (@MESON_ENABLE_OPENCL@,1)
 endif
 
 ifeq (@MESON_ENABLE_HEXKL@,1)
-  LOCAL_SHARED_LIBRARIES += sdkl
+  LOCAL_SHARED_LIBRARIES += sdkl cdsprpc
 endif
 
 ifeq ($(MESON_HAS_TFLITE), 1)

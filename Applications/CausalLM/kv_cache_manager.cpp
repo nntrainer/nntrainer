@@ -12,9 +12,79 @@
 
 #include "kv_cache_manager.h"
 
+#include <memory>
 #include <stdexcept>
+#include <utility>
+
+#include <memory_data.h>
 
 namespace causallm {
+
+KVCacheManager::~KVCacheManager() { releaseShared(); }
+
+KVCacheManager &KVCacheManager::operator=(KVCacheManager &&other) noexcept {
+  if (this != &other) {
+    // The tensors go first so nothing still points into the blocks the
+    // allocator gets back.
+    layer_caches_.clear();
+    releaseShared();
+    layer_caches_ = std::move(other.layer_caches_);
+    cache_pos_ = other.cache_pos_;
+    batch_size_ = other.batch_size_;
+    max_seq_len_ = other.max_seq_len_;
+    num_heads_kv_ = other.num_heads_kv_;
+    head_dim_ = other.head_dim_;
+    kv_width_ = other.kv_width_;
+    kv_widths_ = std::move(other.kv_widths_);
+    dtype_ = other.dtype_;
+    format_ = other.format_;
+    shared_alloc_ = std::move(other.shared_alloc_);
+    shared_free_ = std::move(other.shared_free_);
+    shared_blocks_ = std::move(other.shared_blocks_);
+    other.shared_blocks_.clear();
+  }
+  return *this;
+}
+
+void KVCacheManager::setSharedAllocator(SharedAlloc alloc, SharedFree release) {
+  if (isAllocated()) {
+    throw std::logic_error(
+      "KVCacheManager::setSharedAllocator: call before allocate()");
+  }
+  if (static_cast<bool>(alloc) != static_cast<bool>(release)) {
+    throw std::invalid_argument(
+      "KVCacheManager::setSharedAllocator: need both alloc and release");
+  }
+  shared_alloc_ = std::move(alloc);
+  shared_free_ = std::move(release);
+}
+
+nntrainer::Tensor
+KVCacheManager::makeCacheTensor(const ml::train::TensorDim &dim) {
+  if (shared_alloc_) {
+    const size_t bytes = dim.getDataLen() * dim.getDataTypeSize();
+    void *block = shared_alloc_(bytes);
+    if (block) {
+      shared_blocks_.push_back(block);
+      // An unallocated tensor of this shape, then bound to the block: the
+      // same setData() path the memory pool uses, so every view built from
+      // it (getSharedDataTensor) resolves into the block.
+      nntrainer::Tensor t(dim, false);
+      t.setData(std::make_shared<nntrainer::MemoryData>(block), 0, false);
+      return t;
+    }
+  }
+  return nntrainer::Tensor(dim, true);
+}
+
+void KVCacheManager::releaseShared() {
+  if (shared_free_) {
+    for (void *block : shared_blocks_) {
+      shared_free_(block);
+    }
+  }
+  shared_blocks_.clear();
+}
 
 void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
                               unsigned int max_seq_len,
@@ -62,12 +132,15 @@ void KVCacheManager::allocate(unsigned int num_layers, unsigned int batch_size,
   format_ = format;
   cache_pos_ = 0;
 
+  // Re-allocation: drop the old tensors before their blocks go back.
+  layer_caches_.clear();
+  releaseShared();
   layer_caches_.resize(num_layers);
   for (unsigned int i = 0; i < num_layers; ++i) {
     ml::train::TensorDim cache_dim({batch_size, 1, max_seq_len, kv_widths_[i]},
                                    {format, dtype});
-    layer_caches_[i].key_cache = nntrainer::Tensor(cache_dim, true);
-    layer_caches_[i].value_cache = nntrainer::Tensor(cache_dim, true);
+    layer_caches_[i].key_cache = makeCacheTensor(cache_dim);
+    layer_caches_[i].value_cache = makeCacheTensor(cache_dim);
   }
 }
 

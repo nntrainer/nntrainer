@@ -406,6 +406,11 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int _from, unsigned int _to,
                                           bool training) {
+  // Whatever ComputeOps this context resolves to (CPU, or HTP when the
+  // model runs with engine="htp" and the DSP session opened) decides per
+  // batch below whether attention leaves the CPU.
+  compute_ops_ = context.getComputeOps();
+
   // External KV cache path: from/to are interpreted as the absolute write
   // position; route through forwarding() which reads cache_key/cache_value
   // from input slots 3/4. forwarding() advances cache_index internally.
@@ -690,6 +695,54 @@ void MHACoreLayer::compute_kcaches(nntrainer::Tensor &in,
   }
 }
 
+bool MHACoreLayer::try_accelerated_attention(
+  nntrainer::Tensor &query_step, nntrainer::Tensor &cached_key,
+  nntrainer::Tensor &cached_value, nntrainer::Tensor &attention_output_step,
+  unsigned int cache_from, unsigned int cache_to, const float *sinks) {
+  if (!compute_ops_ || !compute_ops_->supports_sdpa_fp16_kvcache()) {
+    return false;
+  }
+  // The accelerated kernel implements the causal, windowed attention this
+  // layer computes for FP32 activations over the fp16 cache -- the shape
+  // every CausalLM model here runs. Anything else stays on the CPU.
+  if (!is_causal ||
+      query_step.getDataType() != ml::train::TensorDim::DataType::FP32 ||
+      attention_output_step.getDataType() !=
+        ml::train::TensorDim::DataType::FP32) {
+    return false;
+  }
+  const uint16_t *k_bits = nullptr;
+  const uint16_t *v_bits = nullptr;
+  switch (cached_key.getDataType()) {
+  case ml::train::TensorDim::DataType::UINT16:
+    k_bits = cached_key.getData<uint16_t>();
+    v_bits = cached_value.getData<uint16_t>();
+    break;
+#ifdef ENABLE_FP16
+  case ml::train::TensorDim::DataType::FP16:
+    k_bits = reinterpret_cast<const uint16_t *>(cached_key.getData<_FP16>());
+    v_bits = reinterpret_cast<const uint16_t *>(cached_value.getData<_FP16>());
+    break;
+#endif
+  default:
+    return false;
+  }
+  const unsigned int n_q = cache_to - cache_from;
+  const unsigned int q_stride = num_heads_Q * head_dim;
+  const unsigned int kv_stride = num_heads_KV * head_dim;
+  // local_window_size defaults to UINT_MAX meaning "no window"; the kernel
+  // spells that 0.
+  const unsigned int window =
+    (local_window_size == 0 || local_window_size >= cache_to)
+      ? 0u
+      : static_cast<unsigned int>(local_window_size);
+  return compute_ops_->sdpa_fp16_kvcache(
+    query_step.getData<float>(), q_stride, k_bits, v_bits, kv_stride, n_q,
+    cache_from, cache_to, num_heads_Q, num_heads_KV, head_dim, window,
+    attn_logit_softcapping, sinks, attention_output_step.getData<float>(),
+    q_stride);
+}
+
 void MHACoreLayer::one_batch_incremental_forwarding(
   const unsigned int batch, const unsigned int _from, const unsigned int from,
   const unsigned int to, nntrainer::Tensor &query_step,
@@ -761,6 +814,12 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     cached_key_dim, batch * cache_key_dim.getFeatureLen(), true);
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
+
+  if (try_accelerated_attention(query_step, b_cached_key, b_cached_value,
+                                attention_output_step, cache_from, cache_to,
+                                nullptr)) {
+    return;
+  }
 
   // out_ stores the output of Q * K
   nntrainer::Tensor out_(1, 1,
@@ -842,6 +901,12 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     cached_key_dim, batch * cache_key_dim.getFeatureLen(), true);
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
+
+  if (try_accelerated_attention(query_step, b_cached_key, b_cached_value,
+                                attention_output_step, from, to,
+                                sink_step.getData<float>())) {
+    return;
+  }
 
   nntrainer::Tensor out_(1, 1,
                          is_causal ? (((to - from) == 1)

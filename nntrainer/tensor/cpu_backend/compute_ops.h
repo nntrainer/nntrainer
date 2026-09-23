@@ -214,6 +214,62 @@ public:
                                     float *matCdata, unsigned int M,
                                     unsigned int N, unsigned int K);
 
+  /**
+   * @brief Fused causal attention over an fp16 KV cache (MHACoreLayer's
+   *        compute_kcaches + softmax_triangle + compute_fp16vcache in one
+   *        call, no materialized logits).
+   *
+   * out[q][(n*G+g)*hd + d] = softmax_k(q_row . k_row / sqrt(hd)) . v over
+   * cache rows [max(0, pos+1-window), pos], pos = cache_from + q, with
+   * G = n_head_q / n_head_kv query heads per KV head. Optional logit
+   * softcap tanh(s/softcap)*softcap (0 = off) and per-head sink logits
+   * (nullptr = none), both with MHACoreLayer's semantics.
+   *
+   * @param q          f32 [n_q][q_stride], post-RoPE, head h at column h*hd
+   * @param k_cache    fp16 bit patterns [cache_to][kv_stride], post-RoPE
+   * @param v_cache    fp16 bit patterns [cache_to][kv_stride]
+   * @param window     sliding window; 0 means unlimited
+   * @param sinks      n_head_q floats or nullptr
+   * @param out        f32 [n_q][out_stride]
+   * @return true on success; false means the accelerator could not run
+   *         this call (shape or transport) and the caller should take the
+   *         CPU path for it. Unlike the gemm ops above this never throws
+   *         for a runtime failure: attention sits on the per-token hot
+   *         path and a fallback is always available.
+   */
+  virtual bool supports_sdpa_fp16_kvcache() const { return false; }
+  virtual bool sdpa_fp16_kvcache(
+    const float *q, unsigned int q_stride, const uint16_t *k_cache,
+    const uint16_t *v_cache, unsigned int kv_stride, unsigned int n_q,
+    unsigned int cache_from, unsigned int cache_to, unsigned int n_head_q,
+    unsigned int n_head_kv, unsigned int head_dim, unsigned int window,
+    float softcap, const float *sinks, float *out, unsigned int out_stride);
+
+  /**
+   * @brief Memory the backend's accelerator reads in place.
+   *
+   * sdpa_fp16_kvcache's K/V cache reaches the accelerator without a copy
+   * only when it lives in memory obtained here: on the HTP this is rpcmem,
+   * a dma-buf FastRPC maps into the DSP and cache-maintains per call, where
+   * a cache in ordinary memory is copied into a scratch buffer on every
+   * call (the whole used range, every token). The default backend has no
+   * such memory and returns nullptr; a caller then allocates as usual and
+   * still gets correct results, just with the copy.
+   *
+   * @param bytes block size
+   * @return a block at least 16-byte aligned, or nullptr when this backend
+   *         has no shared memory or the allocation failed
+   */
+  virtual void *alloc_shared(size_t bytes) {
+    (void)bytes;
+    return nullptr;
+  }
+
+  /**
+   * @brief Releases a block from alloc_shared(). nullptr is a no-op.
+   */
+  virtual void free_shared(void *block) { (void)block; }
+
   virtual bool supports_gemv_int4_batch_fp32() const { return false; }
   virtual void gemv_int4_batch_fp32(std::vector<void *> weights,
                                     std::vector<uint16_t *> scales,

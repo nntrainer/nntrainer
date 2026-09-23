@@ -160,6 +160,46 @@ test('unittest_memory_pool', unittest_memory_pool_exe,
   suite: 'unittests'
 )
 
+# The fp16 attention planner is plain C arithmetic shared with the DSP-side
+# kernel (nntrainer/tensor/htp_backend/hmx/hexkl_attn_f16_plan.h); it has no
+# Hexagon dependency, so it is tested on every host build, not only under
+# -Denable-htp. Standalone because the shared loop cannot add its include dir.
+unittest_hexkl_attn_f16_plan_exe = executable(
+  'unittest_hexkl_attn_f16_plan',
+  'unittest_hexkl_attn_f16_plan.cpp',
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hmx'),
+  dependencies: nntrainer_test_main_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_hexkl_attn_f16_plan', unittest_hexkl_attn_f16_plan_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_attn_f16_plan')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
+# The resident KV tile registry is plain C too (its AEE codes come from a
+# tiny shim off-target); tested on the host against the documented layout.
+unittest_hexkl_kv_tiles_f16_exe = executable(
+  'unittest_hexkl_kv_tiles_f16',
+  ['unittest_hexkl_kv_tiles_f16.cpp',
+   '../../nntrainer/tensor/htp_backend/hmx/hexkl_kv_tiles_f16.c'],
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hmx'),
+  dependencies: nntrainer_test_main_deps,
+  # The DSP sources are C11 (hexagon-clang builds them so); the project's
+  # default C standard predates for-loop declarations.
+  override_options: ['c_std=c11'],
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_hexkl_kv_tiles_f16', unittest_hexkl_kv_tiles_f16_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_kv_tiles_f16')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
 unittest_inc = include_directories('.')
 
 # subdir('memory')

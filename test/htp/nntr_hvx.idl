@@ -10,4 +10,182 @@
 interface nntr_hvx : remote_handle64 {
    AEEResult add_f32(in sequence<float> a, in sequence<float> b,
                      rout sequence<float> c);
+
+   // Accuracy harness: the whole flow, quantization and dequantization on
+   // the DSP. Intermediate buffers come back so each stage is checkable.
+   AEEResult mm_u8i4_from_f32(in uint32 M, in uint32 K, in uint32 N,
+                              in sequence<float> act_f32,
+                              in sequence<int8> w_i4_rm,
+                              in sequence<float> w_scale,
+                              in sequence<int32> colsum_w,
+                              in sequence<float> bias,
+                              rout sequence<uint8> act_u8_ah,
+                              rout sequence<float> act_scale,
+                              rout sequence<int32> act_zp,
+                              rout sequence<int32> acc_i32,
+                              rout sequence<float> out_f32);
+
+   // --- Performance path ---
+   //
+   // Bakes a K x N int4 weight (int4 values in int8 containers, row-major)
+   // to WH layout once and keeps it DSP-resident, along with its dequant
+   // constants, until weight_release_u8i4. hw_init and the HMX lock happen
+   // once in nntr_hvx_open, not per call -- see nntr_hvx_session.h.
+   AEEResult weight_register_u8i4(in uint32 K, in uint32 N,
+                                  in sequence<int8> w_i4_rm,
+                                  in sequence<float> w_scale,
+                                  in sequence<int32> colsum_w,
+                                  in sequence<float> bias,
+                                  rout uint32 w_handle);
+
+   AEEResult weight_release_u8i4(in uint32 w_handle);
+
+   // Runs matmuls against several registered weights that share ONE
+   // quantized activation -- e.g. a Q/K/V or gate/up projection set. Every
+   // handle must have been registered with the same K. Quantizes act_f32
+   // once, double-buffers each handle's weight into VTCM with the next
+   // handle prefetched while the current one computes (cross-matmul
+   // prefetch, measured at 1.7-2x over SDKL on V79), and returns
+   // dequantized f32 -- one contiguous M x handle[i].N block per handle in
+   // call order.
+   AEEResult mm_u8i4_layer(in uint32 M, in uint32 K,
+                           in sequence<uint32> w_handles,
+                           in sequence<float> act_f32,
+                           rout sequence<float> out_cat);
+
+   // Same three ops, at the wider weight width. u8i8 keeps the activation
+   // at uint8 (HMX's activation port is always 8-bit) and widens only the
+   // weight, so the accuracy risk relative to u8i4 is narrower -- this is
+   // why it is worth having alongside u8i4 rather than instead of it.
+   AEEResult weight_register_u8i8(in uint32 K, in uint32 N,
+                                  in sequence<int8> w_i8_rm,
+                                  in sequence<float> w_scale,
+                                  in sequence<int32> colsum_w,
+                                  in sequence<float> bias,
+                                  rout uint32 w_handle);
+
+   AEEResult weight_release_u8i8(in uint32 w_handle);
+
+   AEEResult mm_u8i8_layer(in uint32 M, in uint32 K,
+                           in sequence<uint32> w_handles,
+                           in sequence<float> act_f32,
+                           rout sequence<float> out_cat);
+
+   // --- fp16 attention bring-up ---
+   //
+   // Layout probe for the hand-written fp16 tile builders the attention
+   // kernel depends on (hvx_tile_f16.h). x and w are 32x32 fp16 row-major
+   // (bit patterns in uint16); wt is w transposed, computed on the host.
+   // flags[i] is 1 where builder i matched HexKL's own converter byte for
+   // byte (see nntr_hvx_attn_f16.c for the index meanings). y_hexkl and
+   // y_hand are x.w computed on HMX with HexKL-built and hand-built tiles
+   // respectively, as 32x32 fp16 row-major, for the host to check against
+   // its own reference. Returns AEE_EUNSUPPORTED when hmx_fp16_rate is 0.
+   AEEResult probe_f16_layouts(in sequence<uint16> x, in sequence<uint16> w,
+                               in sequence<uint16> wt,
+                               rout sequence<uint32> flags,
+                               rout sequence<uint16> y_hexkl,
+                               rout sequence<uint16> y_hand);
+
+   // Math probe for the HVX primitives both attention kernels share. x is
+   // 64 f32. Returns: hf(x) via the natural-order narrowing (f32x64_to_hf),
+   // 2^hf(x) via hvx_attn_exp2_hf, softcap(hf(x)) with cap 30 (in the
+   // log2e-scaled domain the kernels use), and misc = { sum of x[0..31],
+   // per-parity max of hf(x) (even, odd), max over all 64, dot(hf(x),
+   // hf(x)) by the decode kernel's widening accumulate, 2^(x[0]) with x[0]
+   // passed as an fp16 scalar through hvx_attn_f32_to_hf }.
+   AEEResult probe_f16_math(in sequence<float> x, rout sequence<uint16> hf_x,
+                            rout sequence<uint16> exp2_x,
+                            rout sequence<uint16> softcap_x,
+                            rout sequence<float> misc);
+
+   // fp16 subtraction probe: hf(x) - hf(c) three ways -- the direct
+   // Vhf_vsub_VhfVhf, the qf16 route (Vqf16_vsub_VhfVhf then
+   // Vhf_equals_Vqf16), and 2^(direct difference) -- so the one step of
+   // the softmax the math probe does not cover is isolated.
+   AEEResult probe_f16_sub(in sequence<float> x, in float c,
+                           rout sequence<uint16> sub_hf,
+                           rout sequence<uint16> sub_qf16,
+                           rout sequence<uint16> exp2_sub_hf);
+
+   // Decode-block probe: the first cache block of hvx_attn_decode_f16 for
+   // one (row, head), step by step. q is head_dim f32, k is kv rows of
+   // head_dim fp16 (kv <= 64, contiguous). Returns the f32 scores the dot
+   // products produced, the fp16 scores after narrowing + masking, the
+   // fp16 probabilities, and misc = { m (fp16 as f32), rowsum, scale }.
+   AEEResult probe_f16_decode_block(in uint32 head_dim, in uint32 kv,
+                                    in sequence<float> q,
+                                    in sequence<uint16> k,
+                                    rout sequence<float> sc_f32,
+                                    rout sequence<uint16> sv_hf,
+                                    rout sequence<uint16> p_hf,
+                                    rout sequence<float> misc);
+
+   // Causal (optionally sliding-window) attention for one prefill step on
+   // HMX: fp16 flash attention with online softmax over the fp16 KV cache.
+   // q_f32 is [n_q][n_head_q*head_dim] post-RoPE; k_cache/v_cache are
+   // [cache_to][n_head_kv*head_dim] fp16 bit patterns; out_f32 matches q.
+   // br/bc are the query/cache block sizes (bc a multiple of 32); 0 for
+   // either lets the DSP pick (hexkl_attn_f16_choose_tiling). softcap
+   // > 0 applies tanh(s/softcap)*softcap to the scaled logits (Gemma);
+   // sinks is empty or n_head_q per-head sink logits that join each row's
+   // softmax denominator (GPT-OSS). stats_us returns the on-DSP phase
+   // times in microseconds, in the order of hexkl_attn_f16_stats, followed
+   // by the block count.
+   AEEResult attn_f16_prefill(in uint32 n_q, in uint32 cache_from,
+                              in uint32 cache_to, in uint32 n_head_q,
+                              in uint32 n_head_kv, in uint32 head_dim,
+                              in uint32 window, in uint32 br, in uint32 bc,
+                              in float softcap,
+                              in sequence<float> q_f32,
+                              in sequence<uint16> k_cache,
+                              in sequence<uint16> v_cache,
+                              in sequence<float> sinks,
+                              rout sequence<float> out_f32,
+                              rout sequence<uint32> stats_us);
+
+   // The decode counterpart: same contract and options, no HMX. One
+   // (query row, head) per HVX work unit, fp16 dot products, f32 output
+   // accumulation, K/V read from DDR directly. For n_q < 5 and head_dim
+   // <= 128 (llama.cpp's own gate) this beats padding one row into a
+   // 32-row HMX tile. stats_us[0] is the total on-DSP time.
+   AEEResult attn_f16_decode(in uint32 n_q, in uint32 cache_from,
+                             in uint32 cache_to, in uint32 n_head_q,
+                             in uint32 n_head_kv, in uint32 head_dim,
+                             in uint32 window, in float softcap,
+                             in sequence<float> q_f32,
+                             in sequence<uint16> k_cache,
+                             in sequence<uint16> v_cache,
+                             in sequence<float> sinks,
+                             rout sequence<float> out_f32,
+                             rout sequence<uint32> stats_us);
+
+   // --- resident fp16 KV cache as HMX tiles ("NativeKV") ---
+   //
+   // Registers zeroed tile storage for one layer's cache of up to max_rows
+   // rows; append writes cache rows [row0, row0+n) from the cache's own
+   // row-major fp16 layout ([n][n_head_kv*head_dim]) into K^T / V weight
+   // tiles once, so every later attention step DMAs ready 2 KiB tiles
+   // instead of raw rows and does no tile work. Rows may be rewritten.
+   AEEResult kv_register_f16(in uint32 max_rows, in uint32 n_head_kv,
+                             in uint32 head_dim, rout uint32 kv_handle);
+
+   AEEResult kv_release_f16(in uint32 kv_handle);
+
+   AEEResult kv_append_f16(in uint32 kv_handle, in uint32 row0,
+                           in sequence<uint16> k_rows,
+                           in sequence<uint16> v_rows);
+
+   // attn_f16_prefill against a registered cache instead of k_cache /
+   // v_cache sequences. cache_to must not exceed the registered max_rows.
+   // Output is bit-identical to attn_f16_prefill on the same rows.
+   AEEResult attn_f16_prefill_resident(in uint32 kv_handle, in uint32 n_q,
+                                       in uint32 cache_from,
+                                       in uint32 cache_to, in uint32 n_head_q,
+                                       in uint32 window, in uint32 br,
+                                       in uint32 bc, in float softcap,
+                                       in sequence<float> q_f32,
+                                       in sequence<float> sinks,
+                                       rout sequence<float> out_f32,
+                                       rout sequence<uint32> stats_us);
 };

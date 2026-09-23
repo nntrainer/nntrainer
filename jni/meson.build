@@ -90,11 +90,27 @@ if get_option('enable-htp')
   # hexkl_lib_dir is set in the top-level meson.build HTP block and is in scope.
   and_conf.set('MESON_ENABLE_HEXKL', 1)
   and_conf.set('MESON_HEXKL_LIB_DIR', hexkl_lib_dir)
-  and_conf.set('MESON_HEXKL_INCLUDE_DIR', hexkl_root / 'include')
+  # Exported by the sdkl prebuilt to every module that links it, so
+  # libnntrainer's HtpBackend finds remote.h / AEEStdErr.h / rpcmem.h the
+  # same way the meson host build does (hexkl_inc in the top-level HTP
+  # block). LOCAL_C_INCLUDES is a space-separated list.
+  and_conf.set('MESON_HEXKL_INCLUDE_DIR', ' '.join([
+    hexkl_root / 'include',
+    hexagon_sdk_root / 'incs',
+    hexagon_sdk_root / 'incs' / 'stddef',
+    hexagon_sdk_root / 'ipc' / 'fastrpc' / 'incs',
+    hexagon_sdk_root / 'ipc' / 'fastrpc' / 'rpcmem' / 'inc']))
+  # libcdsprpc.so's link-time stub: HtpBackend's FastRPC session
+  # (nntr_hvx_open/close, remote_session_control) needs it at link time even
+  # though the actual symbols resolve against the device's own copy at
+  # runtime. hexagon_sdk_root is the top-level HTP block's variable.
+  and_conf.set('MESON_HEXAGON_FASTRPC_LIB_DIR',
+              hexagon_sdk_root / 'ipc' / 'fastrpc' / 'remote' / 'ship' / 'android_aarch64')
 else
   and_conf.set('MESON_ENABLE_HEXKL', 0)
   and_conf.set('MESON_HEXKL_LIB_DIR', '')
   and_conf.set('MESON_HEXKL_INCLUDE_DIR', '')
+  and_conf.set('MESON_HEXAGON_FASTRPC_LIB_DIR', '')
 endif
 
 if tflite_dep.found()
