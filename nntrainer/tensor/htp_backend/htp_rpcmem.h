@@ -96,8 +96,18 @@ constexpr uint32_t HTP_RPC_FLAGS_UNCACHED = 0;
  */
 class HtpRpcBuffer {
 public:
+  /** @brief How many buffers this process has constructed (ION or heap).
+   *  [#88] Read by the profile's staging: line: a count that grows with
+   *  the call count means a call path allocates per call; the staging
+   *  pool should hold it at one per size class per direction. */
+  static uint32_t &allocCount() {
+    static uint32_t n = 0;
+    return n;
+  }
+
   explicit HtpRpcBuffer(size_t bytes, uint32_t flags = HTP_RPC_FLAGS_DEFAULT) :
     bytes_(bytes) {
+    ++allocCount();
     const HtpRpcMemApi &api = HtpRpcMemApi::get();
     if (api.alloc != nullptr) {
       data_ = static_cast<uint8_t *>(
