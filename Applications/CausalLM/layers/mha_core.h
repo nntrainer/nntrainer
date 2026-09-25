@@ -7,6 +7,7 @@
  * @see    https://github.com/nntrainer/nntrainer
  *         https://arxiv.org/abs/1706.03762
  * @author Jijoong Moon <jijoong.moon@samsung.com>
+ * @author Anirudh Bocha <b.saianirud@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  This is custom_mha_core layer supports
  *         the work of multi_head_attention.
@@ -399,9 +400,22 @@ private:
     attention_weight,
     dropout_mask,
     attention_output,
+    /** training-only caches (see trainForwarding()/calcDerivative()) */
+    train_q_roped,
+    train_k_roped,
+    train_attn_wt,
   };
-  std::array<unsigned int, 7> tensor_idx;
+  std::array<unsigned int, 10> tensor_idx;
   unsigned int sink_idx;
+
+  /** whether the training-only tensors above were requested (only true when
+   *  !use_external_cache and the graph was compiled for TRAIN) */
+  bool train_tensors_requested = false;
+
+  /** whether the internal KV cache tensors were requested (only true when
+   *  !use_external_cache and the graph was NOT compiled for TRAIN; training
+   *  never uses the cache, so it is not allocated there) */
+  bool internal_cache_requested = false;
 
   /** attention parameters */
   unsigned int max_position_embeddings;
@@ -512,6 +526,34 @@ private:
    * @param context Context of the layer
    */
   void calcCommonDerivative(nntrainer::RunLayerContext &context);
+
+  /**
+   * @brief Full-sequence (training) forward for the internal-cache
+   *        (!use_external_cache) path. Implements a plain, dense causal
+   *        multi-head attention with GQA — deliberately not reusing the
+   *        packed/windowed/threaded inference kernels above, so the math
+   *        stays simple enough to verify with a finite-difference gradient
+   *        check. Scope: FP32 only, is_causal, no sliding window, no
+   *        attention sink, no logit softcapping (Qwen3-dense default
+   *        config) — training with any of those features enabled throws.
+   */
+  void trainForwarding(nntrainer::RunLayerContext &context);
+
+  /**
+   * @brief Undo the rotate-half RoPE rotation on a gradient tensor.
+   * @details Forward applies, per (position, head) pair and per rotated
+   *          coordinate pair (i0, i1 = i0 + half_): out_i0 = a*cos - b*sin,
+   *          out_i1 = a*sin + b*cos. This is an orthogonal 2D rotation, so
+   *          the backward pass applies its transpose (equivalently, the
+   *          rotation by -theta): d_a = cos*d_i0 + sin*d_i1,
+   *          d_b = -sin*d_i0 + cos*d_i1.
+   * @param grad gradient buffer to rotate in place, laid out identically to
+   *        the forward RoPE input (contiguous rows of `width` elements,
+   *        `dim`-sized head chunks within each row).
+   */
+  void apply_inverse_rotary_emb(float *grad, unsigned int width,
+                                unsigned int dim, unsigned int height,
+                                unsigned int from);
 
   size_t calc_attn_index(size_t i);
 
