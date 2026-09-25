@@ -330,6 +330,7 @@ static void evict_from_caches(const void *buf, size_t bytes) {
  * Compares latency of:
  * - nntr_gemm_qai8dxp_qsi4cxp_packed (KleidiAI with channel-wise quant)
  * - gemm_q4_0<float> (GGML-style Q4_0 GEMM)
+ * - nntr_gemm_f16_qai8dxp_qsi4cxp_packed (KleidiAI, F16 I/O; ENABLE_FP16 only)
  */
 void run_gemm_benchmark_comparison(const size_t M, const size_t N,
                                    const size_t K,
@@ -382,6 +383,33 @@ void run_gemm_benchmark_comparison(const size_t M, const size_t N,
   }
 
   std::vector<uint8_t> packed_weight_qai8dxp(max_rhs_packed_size);
+
+#ifdef ENABLE_FP16
+  // ============================================================
+  // Setup 3: f16 qai8dxp_qsi4cxp (KleidiAI, F16 I/O)
+  //   Reuses the same qs4cx-quantized weight as Setup 2, but packs it with
+  //   the F16 rhs packer and feeds an F16 activation / F16 output.
+  // ============================================================
+  std::vector<__fp16> activation_f16(M * K);
+  for (size_t i = 0; i < M * K; i++) {
+    activation_f16[i] = static_cast<__fp16>(activation[i]);
+  }
+  std::vector<__fp16> dst_f16(M * N);
+
+  const size_t num_idx_variants_f16 =
+    nntrainer::__kai_get_num_ukernel_variants_f16_qai8dxp_qsi4cxp();
+  size_t max_rhs_packed_size_f16 = 0;
+  for (size_t idx_variant = 0; idx_variant < num_idx_variants_f16;
+       idx_variant++) {
+    size_t rhs_packed_size =
+      nntrainer::get_rhs_packed_size_f16_qsi4cxp_qs4cxs1s0(N, K, idx_variant,
+                                                           true);
+    max_rhs_packed_size_f16 =
+      std::max(max_rhs_packed_size_f16, rhs_packed_size);
+  }
+
+  std::vector<uint8_t> packed_weight_f16(max_rhs_packed_size_f16);
+#endif // ENABLE_FP16
 
   // ============================================================
   // Benchmark: gemm_q4_0<float>
@@ -445,6 +473,47 @@ void run_gemm_benchmark_comparison(const size_t M, const size_t N,
     total_time_qai8dxp[idx_variant] = local_time;
   }
 
+#ifdef ENABLE_FP16
+  // ============================================================
+  // Benchmark: f16 qai8dxp_qsi4cxp_packed
+  // ============================================================
+  std::vector<nanoseconds> total_time_f16(num_idx_variants_f16, nanoseconds(0));
+
+  for (size_t idx_variant = 0; idx_variant < num_idx_variants_f16;
+       idx_variant++) {
+    // rhs pack (F16 packer)
+    nntrainer::rhs_pack_f16_qsi4cxp_qs4cxs1s0(
+      N, K, packed_weight_f16.data(), rhs_native_mtx_qs4cx.data(),
+      rhs_scales_f32.data(), idx_variant, true);
+
+    // cold-RHS eviction, same scheme as the benchmarks above
+    const size_t rhs_packed_size =
+      nntrainer::get_rhs_packed_size_f16_qsi4cxp_qs4cxs1s0(N, K, idx_variant,
+                                                           true);
+
+    // warm up
+    for (size_t i = 0; i < warmup_iters; ++i) {
+      evict_from_caches(packed_weight_f16.data(), rhs_packed_size);
+      nntrainer::gemm_f16_qai8dxp_qsi4cxp(M, N, K, activation_f16.data(),
+                                          packed_weight_f16.data(),
+                                          dst_f16.data(), idx_variant);
+    }
+
+    nanoseconds local_time = nanoseconds(0);
+
+    for (size_t i = 0; i < test_iters; ++i) {
+      evict_from_caches(packed_weight_f16.data(), rhs_packed_size);
+      auto t1 = steady_clock::now();
+      nntrainer::gemm_f16_qai8dxp_qsi4cxp(M, N, K, activation_f16.data(),
+                                          packed_weight_f16.data(),
+                                          dst_f16.data(), idx_variant);
+      auto t2 = steady_clock::now();
+      local_time += duration_cast<nanoseconds>(t2 - t1);
+    }
+    total_time_f16[idx_variant] = local_time;
+  }
+#endif // ENABLE_FP16
+
   // ============================================================
   // Print results
   // ============================================================
@@ -466,6 +535,18 @@ void run_gemm_benchmark_comparison(const size_t M, const size_t N,
               << avg_ns_qai8dxp / 1'000 << " us, " << avg_ns_qai8dxp / 1'000'000
               << " ms)" << std::endl;
   }
+#ifdef ENABLE_FP16
+  for (size_t i = 0; i < num_idx_variants_f16; i++) {
+    auto avg_ns_f16 = total_time_f16[i].count() / test_iters;
+    std::cout << "-----------------------------------------" << std::endl;
+    std::cout << "ukernel[" << i << "] "
+              << nntrainer::__kai_get_num_ukernel_name_f16_qai8dxp_qsi4cxp(i)
+              << std::endl;
+    std::cout << "  f16_qai8dxp_qsi4cxp_packed: " << avg_ns_f16 << " ns ("
+              << avg_ns_f16 / 1'000 << " us, " << avg_ns_f16 / 1'000'000
+              << " ms)" << std::endl;
+  }
+#endif // ENABLE_FP16
 }
 
 // Benchmarks, not correctness tests: DISABLED from the default
