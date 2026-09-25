@@ -33,10 +33,6 @@
 #include <layer_context.h>
 #include <tensor_dim.h>
 
-namespace ml::train {
-class Layer;
-}
-
 namespace nntrainer {
 
 class InitLayerContext;
@@ -76,8 +72,10 @@ enum class InPlaceDirection {
  * @class   Layer Base class for layers
  * @brief   Base class for all layers
  *
- * @details nntrainer::Layer inherits ml::train::Layer but has been omitted to
- * disallow static_cast between nntrainer::Layer and ml::train::Layer objects.
+ * @details Internal (devel API) base class for all layer implementations. It is
+ * independent from the public ml::train::Layer interface; the two are bridged
+ * by nntrainer::LayerNode, which inherits ml::train::Layer and wraps a
+ * nntrainer::Layer via composition.
  */
 class Layer {
 
