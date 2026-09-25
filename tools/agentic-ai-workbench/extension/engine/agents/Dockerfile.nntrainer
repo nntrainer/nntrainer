@@ -1,0 +1,35 @@
+# Dockerfile for building nntrainer
+# This provides a consistent build environment for nntrainer across platforms
+
+FROM ubuntu:22.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build tools
+    git \
+    meson \
+    ninja-build \
+    gcc \
+    g++ \
+    pkg-config \
+    cmake \
+    make \
+    # Libraries
+    libopenblas-dev \
+    libiniparser-dev \
+    libjsoncpp-dev \
+    libcurl3-dev \
+    libssl-dev \
+    # Utilities
+    ca-certificates \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /workspace
+
+# Default command (can be overridden)
+CMD ["/bin/bash"]
