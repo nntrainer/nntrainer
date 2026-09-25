@@ -13,77 +13,23 @@
  */
 
 #include "avx2_impl.h"
+#include "avx2_internal.h"
 #include <array>
-#if __has_include(<bit>)
-#include <bit>
-#endif
 #include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <fallback_internal.h>
 #include <fp16.h>
 #include <immintrin.h>
 #include <limits>
-#if __has_include(<numbers>)
-#include <numbers>
-#endif
-#include <type_traits>
-#if __has_include(<version>)
-#include <version>
-#endif
-#include <fallback_internal.h>
 #include <nntrainer_error.h>
 #include <thread_manager.h>
+#include <type_traits>
 #include <util_func.h>
 #include <vector>
 
 #include "nntr_ggml_impl_common.h"
-
-#if !defined(__has_constexpr_builtin)
-#define __has_constexpr_builtin(x) (0)
-#endif
-
-#if !defined(__has_cpp_attribute)
-#define __has_cpp_attribute(x) (0)
-#endif
-
-// VECTORCALL calling-conv (default for x86_64-linux-gnu)
-#if _MSC_VER >= 1700
-#define _nnt_CC_VECTORCALL __vectorcall
-#else
-#define _nnt_CC_VECTORCALL
-#endif
-
-// Flatten attribute
-#if _MSC_VER >= 1700 || __has_cpp_attribute(msvc::flatten)
-#define _nnt_ATTR_FLATTEN [[msvc::flatten]]
-#elif __has_cpp_attribute(gnu::flatten)
-// clang, g++
-#define _nnt_ATTR_FLATTEN [[gnu::flatten]]
-#else
-#define _nnt_ATTR_FLATTEN
-#endif
-
-#if _MSC_VER >= 1700 || __has_cpp_attribute(msvc::noinline)
-#define _nnt_ATTR_NOINLINE [[msvc::noinline]]
-#elif __has_cpp_attribute(gnu::flatten)
-// clang, g++
-#define _nnt_ATTR_NOINLINE [[gnu::noinline]]
-#else
-#define _nnt_ATTR_NOINLINE
-#endif
-
-#if _MSC_VER >= 1700 || __has_cpp_attribute(msvc::forceinline)
-#define _nnt_ATTR_ALWAYS_INLINE [[msvc::forceinline]]
-#elif __has_cpp_attribute(gnu::always_inline)
-#define _nnt_ATTR_ALWAYS_INLINE [[gnu::always_inline]]
-#endif
-
-#if __has_cpp_attribute(unikely)
-#define UNLIKELY [[unlikely]]
-#else
-#define UNLIKELY
-#endif
 
 #if !defined(_MSC_VER) && !defined(__clang__)
 #pragma GCC diagnostic ignored "-Wattributes"
@@ -95,238 +41,16 @@
 #define RESTRICT
 #endif
 
-namespace {
-
-template <typename To_, typename From_>
-constexpr inline bool concept17_BinaryCastable =
-  sizeof(To_) == sizeof(From_) &&
-  std::is_trivially_copyable_v<From_> &&std::is_trivially_copyable_v<To_>;
-
-template <class To_, class From_>
-auto compat_bit_cast(const From_ &src) noexcept
-  -> std::enable_if_t<concept17_BinaryCastable<To_, From_>, To_> {
-#if __cpp_lib_bit_cast >= 201806L
-  return std::bit_cast<To_>(src);
-#else
-  To_ dst;
-  std::memcpy(&dst, &src, sizeof(To_));
-  return dst;
-#endif
-}
-
-[[nodiscard]] constexpr inline unsigned
-constexpr_popcount(uint32_t v) noexcept {
-#if __cpp_lib_bitops >= 201907L
-  return std::popcount(v);
-#else
-  // Popcount via bit-hack
-  v = v - ((v >> 1) & 0x55555555);                // reuse input as temporary
-  v = (v & 0x33333333) + ((v >> 2) & 0x33333333); // temp
-  auto c = (((v + (v >> 4)) & 0xF0F0F0F) * 0x1010101) >> 24; // count
-  return c;
-#endif
-}
-
-template <unsigned I_>
-constexpr inline bool concept17_PowerOfTwo = (constexpr_popcount(I_) == 1);
-
-namespace numbers {
-
-#if __has_include(<numbers>) && __cpp_lib_math_constants >= 201907L
-using std::numbers::ln2_v;
-using std::numbers::log2e_v;
-#else
-template <typename Float_> constexpr inline auto ln2_v = Float_{M_LN2};
-
-template <typename Float_> constexpr inline auto log2e_v = Float_{M_LOG2E};
-#endif
-} // namespace numbers
-
-constexpr inline float EXP_ARG_MIN = -87.0;
-constexpr inline float EXP_ARG_MAX = +88.3762626647949f;
-
-// @brief Precalculated lookup table for 2^x calculation
-template <unsigned N_, typename Ty_ = uint32_t, typename Float_ = float,
-          typename = std::enable_if_t<concept17_PowerOfTwo<N_>>>
-struct Exp2Table {
-
-  constexpr static inline auto MANTISSA_BITS =
-    std::numeric_limits<Float_>::digits - 1;
-
-#if __cpp_consteval >= 201811L && __has_constexpr_builtin(__builtin_exp2)
-  [[nodiscard]] static consteval auto calculate() noexcept {
-    std::array<Ty_, N_> t;
-    for (unsigned i = 0; i < N_; ++i)
-      t[i] = std::bit_cast<Ty_>(std::exp2(Float_{1.0} * i / N_)) -
-             ((i << MANTISSA_BITS) / N_);
-    return t;
-  }
-#endif
-};
-
-#if !__has_constexpr_builtin(__builtin_exp2) || !(__cpp_consteval >= 201811L)
-
-// @brief Precalculated lookup table for 2^x calculation when we don't have
-// constexpr math functions
-template <> struct Exp2Table<8, uint32_t, float> {
-  [[nodiscard]] static constexpr auto calculate() noexcept {
-    std::array<uint32_t, 8> t = {0x3f800000U, 0x3f7b95c2U, 0x3f7837f0U,
-                                 0x3f75fed7U, 0x3f7504f3U, 0x3f75672aU,
-                                 0x3f7744fdU, 0x3f7ac0c7U};
-    return t;
-  }
-};
-
-#endif
-
-template <unsigned N_> // requires PowerOfTwo<N_>
-alignas(__m256) inline constexpr auto exp2_table_v = Exp2Table<N_>::calculate();
-
-// Scalar version of expf() approximation with 3-th deg polynominal of
-// fractional part
-//
-// The error with regards to std::expf less than 5e-6
-// It is valid in range [-87, +88.37) - not handling +INF, NaN etc.
-// The function domain is clamped to valid function range.
-//
-// The strategy picked is to approximate exp as 2^K*2^F
-template <unsigned N_, typename = std::enable_if_t<concept17_PowerOfTwo<N_>>>
-[[nodiscard]] _nnt_ATTR_ALWAYS_INLINE _nnt_ATTR_FLATTEN inline float
-approx_exp_exp2_lookup(float x) noexcept {
-  constexpr static unsigned N_MASK = uint32_t(N_ - 1U);
-  constexpr static unsigned FLT_MANTISSA_BITS =
-    std::numeric_limits<float>::digits - 1U;
-
-  x = std::max(x, EXP_ARG_MIN);
-  x *= float(0x1.0p1 / numbers::ln2_v<double> * N_);
-  x = std::min(x, float(EXP_ARG_MAX / numbers::ln2_v<double> * N_));
-
-  // Round nearest and convert integer part to an int (std::modf)
-  // NB: This way doesn't handle ties even.
-  auto x_int = x + 0x1.8p23f;
-  auto x_uint = compat_bit_cast<uint32_t>(x_int);
-  x_int -= 0x1.8p23f;
-  auto x_frac = x - x_int;
-
-  auto s_int = exp2_table_v<N_>[x_uint & N_MASK];
-  auto x_uint_shifted = x_uint
-                        << (FLT_MANTISSA_BITS - constexpr_popcount(N_MASK));
-  auto s_int_2 = s_int + x_uint_shifted;
-  auto s = compat_bit_cast<float>(s_int_2);
-
-  // Polynominal of form C0*x^3 + C1*x^2 + C2*x^1 + 1.0
-  static constexpr float poly_4[] = {0x1.c6af84b912394p-5f / N_ / N_ / N_,
-                                     0x1.ebfce50fac4f3p-3f / N_ / N_,
-                                     0x1.62e42ff0c52d6p-1f / N_};
-
-  auto q0 = std::fma(x_frac, poly_4[0], poly_4[1]);
-  auto x_frac_pow2 = x_frac * x_frac;
-  auto q2 = x_frac * poly_4[2]; // not adding +1.0
-
-  x = std::fma(q0, x_frac_pow2, q2);
-
-  return std::fma(x, s, s); // NB: (handles (x+1) by addition of s)
-}
-
-// Vectorized version of above
-template <unsigned N_, typename = std::enable_if_t<concept17_PowerOfTwo<N_>>>
-_nnt_ATTR_ALWAYS_INLINE _nnt_ATTR_FLATTEN inline auto _nnt_CC_VECTORCALL
-avx2_approx_exp_e2lookup(__m256 xs) noexcept {
-
-  constexpr static uint32_t N_MASK = uint32_t(N_ - 1U);
-  alignas(64) constexpr static auto EXP2_TBL = exp2_table_v<N_>;
-  constexpr static unsigned MANTISSA_BITS =
-    std::numeric_limits<float>::digits - 1;
-
-  // Ensure arg in range [exp_arg_min, exp_arg_max]
-  xs = _mm256_max_ps(xs, _mm256_set1_ps(EXP_ARG_MIN));
-  // Would clamp to EXP_ARG_MAX but we move it after multiplication for IPC:
-  // xs = _mm256_min_ps(xs, _mm256_set1_ps(EXP_ARG_MAX));
-
-  xs =
-    _mm256_mul_ps(xs, _mm256_set1_ps(float(1.0 / numbers::ln2_v<double> * N_)));
-  // Clamp EXP_ARG_MAX after multiply
-  xs = _mm256_min_ps(
-    xs, _mm256_set1_ps(float(EXP_ARG_MAX / numbers::ln2_v<double> * N_)));
-
-  // Mostly equivalent to, doesn't round ties to even
-  // auto xs_int = _mm256_round_ps(xs, _MM_FROUND_TO_NEAREST_INT |
-  // _MM_FROUND_NO_EXC); auto xs_int_as_u32 = _mm256_cvtps_epi32(xs_int);
-  auto xs_int = _mm256_add_ps(xs, _mm256_set1_ps(0x1.8p23f));
-  auto xs_int_as_u32 = _mm256_castps_si256(xs_int);
-  xs_int = _mm256_sub_ps(xs_int, _mm256_set1_ps(0x1.8p23f));
-
-  // Calculate fractional part
-  auto xs_frac = _mm256_sub_ps(xs, xs_int);
-  // Indices for lookup (modulo N_)
-  auto exp2_idxs = _mm256_and_si256(xs_int_as_u32, _mm256_set1_epi32(N_MASK));
-
-  __m256i s_ints;
-
-  // Lookup e^xs_int s factor
-  if constexpr (N_ == 8) {
-    // Lookup by vector permute
-    auto tbl = _mm256_load_si256((__m256i *)EXP2_TBL.data());
-    s_ints = _mm256_permutevar8x32_epi32(tbl, exp2_idxs);
-  } else {
-    // Falback for not fitting number of vector elements
-    s_ints = _mm256_i32gather_epi32(EXP2_TBL.data(), exp2_idxs, 1);
-  }
-
-  auto xs_uint_shifted = _mm256_slli_epi32(
-    xs_int_as_u32, MANTISSA_BITS - constexpr_popcount(N_MASK));
-  auto s_ints_2 = _mm256_add_epi32(s_ints, xs_uint_shifted);
-  auto s_floats = _mm256_castsi256_ps(s_ints_2);
-
-  static constexpr float poly_d4[] = {0x1.c6af84b912394p-5f / N_ / N_ / N_,
-                                      0x1.ebfce50fac4f3p-3f / N_ / N_,
-                                      0x1.62e42ff0c52d6p-1f / N_};
-
-  const auto C0 = _mm256_set1_ps(poly_d4[0]);
-  const auto C1 = _mm256_set1_ps(poly_d4[1]);
-  const auto C2 = _mm256_set1_ps(poly_d4[2]);
-
-  auto qs0 = _mm256_fmadd_ps(xs_frac, C0, C1);
-  auto xs_frac_pow2 = _mm256_mul_ps(xs_frac, xs_frac);
-  auto qs2 = _mm256_mul_ps(xs_frac, C2);
-
-  xs = _mm256_fmadd_ps(qs0, xs_frac_pow2, qs2);
-
-  return _mm256_fmadd_ps(xs, s_floats, s_floats);
-}
-
-_nnt_ATTR_ALWAYS_INLINE _nnt_ATTR_FLATTEN auto _nnt_CC_VECTORCALL
-avx2_negate_ps(__m256 x) noexcept -> __m256 {
-  constexpr auto SIGN_SHIFT = sizeof(float) * 8 - 1;
-  const auto UNDEF = _mm256_undefined_si256();
-  const auto sign_bit =
-    _mm256_slli_epi32(_mm256_cmpeq_epi16(UNDEF, UNDEF), SIGN_SHIFT);
-  auto flt_sign_bit = _mm256_castsi256_ps(sign_bit);
-  auto neg_x = _mm256_xor_ps(x, flt_sign_bit);
-  return neg_x;
-}
-
-_nnt_ATTR_ALWAYS_INLINE _nnt_ATTR_FLATTEN auto _nnt_CC_VECTORCALL
-avx2_approx_swiglu(__m256 x, __m256 s) noexcept -> __m256 {
-  auto neg_x = avx2_negate_ps(x);
-  auto inv_sigmoid =
-    _mm256_add_ps(avx2_approx_exp_e2lookup<8>(neg_x), _mm256_set1_ps(1.0f));
-  auto swiglu_nonscaled = _mm256_div_ps(x, inv_sigmoid);
-  return _mm256_mul_ps(swiglu_nonscaled, s);
-}
-
-_nnt_ATTR_ALWAYS_INLINE _nnt_ATTR_FLATTEN auto _nnt_CC_VECTORCALL
-avx2_approx_swiglu_alpha(__m256 x, __m256 s, __m256 alpha) noexcept -> __m256 {
-  auto alpha_x = _mm256_mul_ps(alpha, x);
-  auto neg_alpha_x = avx2_negate_ps(alpha_x);
-  auto inv_sigmoid = _mm256_add_ps(avx2_approx_exp_e2lookup<8>(neg_alpha_x),
-                                   _mm256_set1_ps(1.0f));
-  auto swiglu_nonscaled = _mm256_div_ps(x, inv_sigmoid);
-  return _mm256_mul_ps(swiglu_nonscaled, s);
-}
-} // namespace
-
 namespace nntrainer::avx2 {
+
+// Shared SIMD primitives defined in avx2_internal.h that this file depends on.
+using nntrainer::avx2::internal::avx2_approx_swiglu;
+using nntrainer::avx2::internal::avx2_approx_swiglu_alpha;
+using nntrainer::avx2::internal::exp256_ps;
+using nntrainer::avx2::internal::hsum_avx;
+using nntrainer::avx2::internal::poly_gelu_erf_avx2;
+using nntrainer::avx2::internal::poly_gelu_tanh_avx2;
+using nntrainer::avx2::internal::rcp_ps;
 
 /**
  * @brief struct of q4_0x8 block
@@ -701,16 +425,27 @@ static inline void convert_q4_0x8_noshuffle(const void *src,
 
 // ================== wrappers for your K,N combinations ==================
 // K = 3072 (UNIT = 768)
+/**
+ * @brief convert_q4_0x8_shuffle for K=3072 N=98304
+ */
 void convert_q4_0x8_shuffle_K3072_N98304(const void *src, uint16_t *d_out,
                                          uint8_t *qs_out) {
   // groups = (N*8)/UNIT = 1024
   convert_q4_0x8_noshuffle<768, 1024>(src, d_out, qs_out);
 }
+
+/**
+ * @brief convert_q4_0x8_shuffle for K=3072 N=36864
+ */
 void convert_q4_0x8_shuffle_K3072_N36864(const void *src, uint16_t *d_out,
                                          uint8_t *qs_out) {
   // groups = 384
   convert_q4_0x8_noshuffle<768, 384>(src, d_out, qs_out);
 }
+
+/**
+ * @brief convert_q4_0x8_shuffle for K=3072 N=3072
+ */
 void convert_q4_0x8_shuffle_K3072_N3072(const void *src, uint16_t *d_out,
                                         uint8_t *qs_out) {
   // groups = 32
@@ -718,16 +453,27 @@ void convert_q4_0x8_shuffle_K3072_N3072(const void *src, uint16_t *d_out,
 }
 
 // K = 8192 (UNIT = 2048)
+/**
+ * @brief convert_q4_0x8_shuffle for K=8192 N=98304
+ */
 void convert_q4_0x8_shuffle_K8192_N98304(const void *src, uint16_t *d_out,
                                          uint8_t *qs_out) {
   // groups = 384
   convert_q4_0x8_noshuffle<2048, 384>(src, d_out, qs_out);
 }
+
+/**
+ * @brief convert_q4_0x8_shuffle for K=8192 N=36864
+ */
 void convert_q4_0x8_shuffle_K8192_N36864(const void *src, uint16_t *d_out,
                                          uint8_t *qs_out) {
   // groups = 144
   convert_q4_0x8_noshuffle<2048, 144>(src, d_out, qs_out);
 }
+
+/**
+ * @brief convert_q4_0x8_shuffle for K=8192 N=3072
+ */
 void convert_q4_0x8_shuffle_K8192_N3072(const void *src, uint16_t *d_out,
                                         uint8_t *qs_out) {
   // groups = 12
@@ -993,122 +739,6 @@ void swiglu(const unsigned int N, float *X, const float *Y, const float *Z,
   _mm_setcsr(oldcsr);
 }
 
-#define gelu_start_tanh -4.38086284326899f
-#define gelu_end_tanh 4.38086284326899f
-
-#define tanh_c_gelu_p0 5.91303808e-6f
-#define tanh_c_gelu_p1 5.00000000e-1f
-#define tanh_c_gelu_p2 3.98865869e-1f
-#define tanh_c_gelu_p4 -6.66574676e-2f
-#define tanh_c_gelu_p6 1.00712610e-2f
-#define tanh_c_gelu_p8 -1.19336340e-3f
-#define tanh_c_gelu_p10 1.09543224e-4f
-#define tanh_c_gelu_p12 -7.55788500e-6f
-#define tanh_c_gelu_p14 3.73374142e-7f
-#define tanh_c_gelu_p16 -1.23162678e-8f
-#define tanh_c_gelu_p18 2.40940960e-10f
-#define tanh_c_gelu_p20 -2.10237709e-12f
-
-#define gelu_start_erf -4.59373833108583f
-#define gelu_end_erf 4.59373833108583f
-
-#define erf_c_gelu_p0 8.70757509e-06f
-#define erf_c_gelu_p1 5.00000000e-1f
-#define erf_c_gelu_p2 3.98833088e-01f
-#define erf_c_gelu_p4 -6.62633808e-02f
-#define erf_c_gelu_p6 9.78776282e-03f
-#define erf_c_gelu_p8 -1.10798998e-03f
-#define erf_c_gelu_p10 9.51056006e-05f
-#define erf_c_gelu_p12 -6.04633051e-06f
-#define erf_c_gelu_p14 2.73076070e-07f
-#define erf_c_gelu_p16 -8.20707325e-09f
-#define erf_c_gelu_p18 1.46115955e-10f
-#define erf_c_gelu_p20 -1.16009840e-12f
-
-static inline __m256 poly_gelu_tanh_avx2(__m256 x) {
-  const __m256 x2 = _mm256_mul_ps(x, x);
-
-  __m256 y = _mm256_mul_ps(x2, _mm256_set1_ps(tanh_c_gelu_p20));
-  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p18));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p16));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p14));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p12));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p10));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p8));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p6));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p4));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(tanh_c_gelu_p2));
-  y = _mm256_mul_ps(x2, y);
-
-  __m256 z = _mm256_mul_ps(x, _mm256_set1_ps(tanh_c_gelu_p1));
-  z = _mm256_add_ps(z, _mm256_set1_ps(tanh_c_gelu_p0));
-
-  y = _mm256_add_ps(y, z);
-
-  const __m256 gt_start =
-    _mm256_cmp_ps(x, _mm256_set1_ps(gelu_start_tanh), _CMP_GT_OQ);
-  const __m256 le_end =
-    _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_tanh), _CMP_LE_OQ);
-  const __m256 gt_end =
-    _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_tanh), _CMP_GT_OQ);
-
-  y = _mm256_and_ps(y, gt_start);
-  y = _mm256_and_ps(y, le_end);
-  __m256 x_hi = _mm256_and_ps(x, gt_end);
-
-  return _mm256_add_ps(y, x_hi);
-}
-
-static inline __m256 poly_gelu_erf_avx2(__m256 x) {
-  const __m256 x2 = _mm256_mul_ps(x, x);
-
-  __m256 y = _mm256_mul_ps(x2, _mm256_set1_ps(erf_c_gelu_p20));
-  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p18));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p16));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p14));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p12));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p10));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p8));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p6));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p4));
-  y = _mm256_mul_ps(x2, y);
-  y = _mm256_add_ps(y, _mm256_set1_ps(erf_c_gelu_p2));
-  y = _mm256_mul_ps(x2, y);
-
-  __m256 z = _mm256_mul_ps(x, _mm256_set1_ps(erf_c_gelu_p1));
-  z = _mm256_add_ps(z, _mm256_set1_ps(erf_c_gelu_p0));
-
-  y = _mm256_add_ps(y, z);
-
-  const __m256 gt_start =
-    _mm256_cmp_ps(x, _mm256_set1_ps(gelu_start_erf), _CMP_GT_OQ);
-  const __m256 le_end =
-    _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_erf), _CMP_LE_OQ);
-  const __m256 gt_end =
-    _mm256_cmp_ps(x, _mm256_set1_ps(gelu_end_erf), _CMP_GT_OQ);
-
-  y = _mm256_and_ps(y, gt_start);
-  y = _mm256_and_ps(y, le_end);
-  __m256 x_hi = _mm256_and_ps(x, gt_end);
-
-  return _mm256_add_ps(y, x_hi);
-}
-
 void tanh_gelu_v2(const unsigned int N, const float *X, float *Y) {
   unsigned int i = 0;
 
@@ -1143,6 +773,8 @@ void gelu_v2(const unsigned int N, const float *X, float *Y) {
 void ele_mul(const unsigned int N, const float *X, const float *Y, float *Z,
              float alpha, float beta, unsigned int i_stride,
              unsigned int o_stride) {
+  if (N == 0)
+    return; // the i_stride == 0 broadcast paths read Y[0] unconditionally
   if (alpha == 1.0f && beta == 0.0f && o_stride == 1) {
     unsigned int N8 = (N & ~(7));
     if (i_stride == 0) {
@@ -1174,12 +806,53 @@ void ele_mul(const unsigned int N, const float *X, const float *Y, float *Z,
       Z++;
     }
   } else {
-    // TODO: AVX2 implementation if used
-    for (unsigned int i = 0; i < N; ++i) {
-      *Z = *X * alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
-      X += o_stride;
-      Y += i_stride;
-      Z += o_stride;
+    if (o_stride == 1 && (i_stride == 0 || i_stride == 1)) {
+      unsigned int N8 = (N & ~(7));
+      auto alpha_v = _mm256_set1_ps(alpha);
+      auto beta_v = _mm256_set1_ps(beta);
+
+      if (i_stride == 0) {
+        auto y = _mm256_set1_ps(Y[0]);
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto z = _mm256_mul_ps(_mm256_mul_ps(x, alpha_v), y);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Z += 8;
+        }
+      } else {
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto y = _mm256_loadu_ps(Y);
+          auto z = _mm256_mul_ps(_mm256_mul_ps(x, alpha_v), y);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Y += 8;
+          Z += 8;
+        }
+      }
+
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X * alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X * alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X += o_stride;
+        Y += i_stride;
+        Z += o_stride;
+      }
     }
   }
 }
@@ -1187,6 +860,8 @@ void ele_mul(const unsigned int N, const float *X, const float *Y, float *Z,
 void ele_add(const unsigned int N, const float *X, const float *Y, float *Z,
              float alpha, float beta, unsigned int i_stride,
              unsigned int o_stride) {
+  if (N == 0)
+    return; // the i_stride == 0 broadcast paths read Y[0] unconditionally
   if (alpha == 1.0f && beta == 0.0f && o_stride == 1) {
     unsigned int N8 = (N & ~(7));
     if (i_stride == 0) {
@@ -1218,126 +893,270 @@ void ele_add(const unsigned int N, const float *X, const float *Y, float *Z,
       Z++;
     }
   } else {
-    // TODO: AVX2 implementation if used
-    for (unsigned int i = 0; i < N; ++i) {
-      *Z = *X + alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
-      X += o_stride;
-      Y += i_stride;
-      Z += o_stride;
+    if (o_stride == 1 && (i_stride == 0 || i_stride == 1)) {
+      unsigned int N8 = (N & ~(7));
+      auto alpha_v = _mm256_set1_ps(alpha);
+      auto beta_v = _mm256_set1_ps(beta);
+
+      if (i_stride == 0) {
+        auto y = _mm256_set1_ps(Y[0]);
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto z = _mm256_fmadd_ps(alpha_v, y, x);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Z += 8;
+        }
+      } else {
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto y = _mm256_loadu_ps(Y);
+          auto z = _mm256_fmadd_ps(alpha_v, y, x);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Y += 8;
+          Z += 8;
+        }
+      }
+
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X + alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X + alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X += o_stride;
+        Y += i_stride;
+        Z += o_stride;
+      }
     }
   }
 }
 
-static inline __m256 exp256_ps(__m256 x) {
-  /*  Low-Precision Version I*/
-  // const __m256 c1 = _mm256_set1_ps(12102203.0f);
-  // const __m256 c2 = _mm256_set1_ps(1065353216.0f);
-  // __m256 fx = _mm256_add_ps(_mm256_mul_ps(x, c1),c2);
-  // return _mm256_castsi256_ps(_mm256_cvtps_epi32(fx));
+void ele_sub(const unsigned int N, const float *X, const float *Y, float *Z,
+             float alpha, float beta, unsigned int i_stride,
+             unsigned int o_stride) {
+  if (N == 0)
+    return; // the i_stride == 0 broadcast paths read Y[0] unconditionally
+  if (alpha == 1.0f && beta == 0.0f && o_stride == 1) {
+    unsigned int N8 = (N & ~(7));
+    if (i_stride == 0) {
+      auto y = _mm256_set1_ps(Y[0]);
+      for (unsigned int i = 0; i < N8; i += 8) {
+        auto x = _mm256_loadu_ps(X);
+        auto z = _mm256_sub_ps(x, y);
+        _mm256_storeu_ps(Z, z);
+        X += 8;
+        Z += 8;
+      }
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X - Y[0];
+        X++;
+        Z++;
+      }
+    } else if (i_stride == 1) {
+      for (unsigned int i = 0; i < N8; i += 8) {
+        auto x = _mm256_loadu_ps(X);
+        auto y = _mm256_loadu_ps(Y);
+        auto z = _mm256_sub_ps(x, y);
+        _mm256_storeu_ps(Z, z);
+        X += 8;
+        Y += 8;
+        Z += 8;
+      }
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X - *Y;
+        X++;
+        Y++;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X - *Y;
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    }
+  } else {
+    if (o_stride == 1 && (i_stride == 0 || i_stride == 1)) {
+      unsigned int N8 = (N & ~(7));
+      auto alpha_v = _mm256_set1_ps(alpha);
+      auto beta_v = _mm256_set1_ps(beta);
 
-  /* Low-Precision Version II*/
-  /*    const __m256 ln2 = _mm256_set1_ps(0.69314718056f);
-    const __m256 inv_ln2 = _mm256_set1_ps(1.44269504089f); // 1 / ln(2)
+      if (i_stride == 0) {
+        auto y = _mm256_set1_ps(Y[0]);
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto z = _mm256_fnmadd_ps(alpha_v, y, x);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Z += 8;
+        }
+      } else {
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto y = _mm256_loadu_ps(Y);
+          auto z = _mm256_fnmadd_ps(alpha_v, y, x);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Y += 8;
+          Z += 8;
+        }
+      }
 
-    // Range reduction: x = n * ln2 + r,  where n is integer and |r| <= ln2/2
-    __m256 fx = _mm256_mul_ps(x, inv_ln2);
-    fx = _mm256_round_ps(fx, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-    __m256i emm0 = _mm256_cvtps_epi32(fx);
-
-    __m256 tmp = _mm256_mul_ps(fx, ln2);
-    __m256 r = _mm256_sub_ps(x, tmp);
-
-    // Compute polynomial approximation of exp(r)
-    const __m256 c1 = _mm256_set1_ps(1.9875691500E-4f);
-    const __m256 c2 = _mm256_set1_ps(1.3981999507E-3f);
-    const __m256 c3 = _mm256_set1_ps(8.3334519073E-3f);
-    const __m256 c4 = _mm256_set1_ps(4.1665795894E-2f);
-    const __m256 c5 = _mm256_set1_ps(1.6666665459E-1f);
-    const __m256 c6 = _mm256_set1_ps(5.0000001201E-1f);
-
-  //  __m256 r2 = _mm256_mul_ps(r, r);
-  //  __m256 r3 = _mm256_mul_ps(r2, r);
-  //  __m256 r4 = _mm256_mul_ps(r2, r2);
-
-    __m256 y = _mm256_fmadd_ps(c1, r, c2);
-    y = _mm256_fmadd_ps(y, r, c3);
-    y = _mm256_fmadd_ps(y, r, c4);
-    y = _mm256_fmadd_ps(y, r, c5);
-    y = _mm256_fmadd_ps(y, r, c6);
-    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(1.0f));
-
-    // Reconstruct exp(x) = 2^n * exp(r)
-    emm0 = _mm256_add_epi32(emm0, _mm256_set1_epi32(127));
-    emm0 = _mm256_slli_epi32(emm0, 23);
-    __m256 pow2n = _mm256_castsi256_ps(emm0);
-
-    return _mm256_mul_ps(y, pow2n);
-  */
-  /* Low-Precision Versino III */
-  const __m256 LOG2EF = _mm256_set1_ps(1.44269504088896341f); // 1 / ln(2)
-  const __m256 LN2 = _mm256_set1_ps(0.6931471805599453f);     // ln(2)
-
-  // Clamp input to range to prevent overflow/underflow
-  const __m256 max_x = _mm256_set1_ps(88.3762626647949f);  // log(FLT_MAX)
-  const __m256 min_x = _mm256_set1_ps(-88.3762626647949f); // log(FLT_MIN)
-  x = _mm256_max_ps(min_x, _mm256_min_ps(max_x, x));
-
-  // Range reduction: x = n * ln2 + r
-  __m256 fx = _mm256_mul_ps(x, LOG2EF); // x * (1/ln(2))
-  fx = _mm256_floor_ps(_mm256_add_ps(fx, _mm256_set1_ps(0.5f)));
-
-  __m256 tmp = _mm256_mul_ps(fx, LN2); // n * ln(2)
-  __m256 r = _mm256_sub_ps(x, tmp);    // r = x - n * ln2
-
-  // Compute exp(r) using 10th-order polynomial (Horner's method)
-  const __m256 c0 = _mm256_set1_ps(1.0f);
-  const __m256 c1 = _mm256_set1_ps(1.0f);
-  const __m256 c2 = _mm256_set1_ps(0.5f);
-  const __m256 c3 = _mm256_set1_ps(1.0f / 6.0f);
-  const __m256 c4 = _mm256_set1_ps(1.0f / 24.0f);
-  const __m256 c5 = _mm256_set1_ps(1.0f / 120.0f);
-  const __m256 c6 = _mm256_set1_ps(1.0f / 720.0f);
-  const __m256 c7 = _mm256_set1_ps(1.0f / 5040.0f);
-  const __m256 c8 = _mm256_set1_ps(1.0f / 40320.0f);
-  const __m256 c9 = _mm256_set1_ps(1.0f / 362880.0f);
-  const __m256 c10 = _mm256_set1_ps(1.0f / 3628800.0f);
-
-  __m256 y = c10;
-  y = _mm256_fmadd_ps(y, r, c9);
-  y = _mm256_fmadd_ps(y, r, c8);
-  y = _mm256_fmadd_ps(y, r, c7);
-  y = _mm256_fmadd_ps(y, r, c6);
-  y = _mm256_fmadd_ps(y, r, c5);
-  y = _mm256_fmadd_ps(y, r, c4);
-  y = _mm256_fmadd_ps(y, r, c3);
-  y = _mm256_fmadd_ps(y, r, c2);
-  y = _mm256_fmadd_ps(y, r, c1);
-  y = _mm256_fmadd_ps(y, r, c0); // final y = (((...r+...)*r+...)*r + 1)
-
-  // Reconstruct exp(x) = 2^n * exp(r)
-  __m256i emm0 = _mm256_cvtps_epi32(fx);
-  emm0 = _mm256_add_epi32(emm0, _mm256_set1_epi32(127));
-  emm0 = _mm256_slli_epi32(emm0, 23);
-  __m256 pow2n = _mm256_castsi256_ps(emm0);
-
-  return _mm256_mul_ps(y, pow2n);
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X - alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X - alpha * *Y + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X += o_stride;
+        Y += i_stride;
+        Z += o_stride;
+      }
+    }
+  }
 }
 
-static inline __m256 rcp_ps(__m256 x) {
-  // Use Newton-Raphson method to enhance accuracy
-  // x_n+1 = x_n * (2 - x_0 * x_n)
-  __m256 rcp = _mm256_rcp_ps(x);
-  __m256 two = _mm256_set1_ps(2.0f);
-  // rcp * (2 - x * rcp)
-  return _mm256_mul_ps(rcp, _mm256_fnmadd_ps(x, rcp, two));
+void ele_div(const unsigned int N, const float *X, const float *Y, float *Z,
+             float alpha, float beta, unsigned int i_stride,
+             unsigned int o_stride) {
+  if (N == 0)
+    return; // the i_stride == 0 broadcast paths read Y[0] unconditionally
+  if (alpha == 1.0f && beta == 0.0f && o_stride == 1) {
+    unsigned int N8 = (N & ~(7));
+    if (i_stride == 0) {
+      auto y = _mm256_set1_ps(Y[0]);
+      for (unsigned int i = 0; i < N8; i += 8) {
+        auto x = _mm256_loadu_ps(X);
+        auto z = _mm256_div_ps(x, y);
+        _mm256_storeu_ps(Z, z);
+        X += 8;
+        Z += 8;
+      }
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X / Y[0];
+        X++;
+        Z++;
+      }
+    } else if (i_stride == 1) {
+      for (unsigned int i = 0; i < N8; i += 8) {
+        auto x = _mm256_loadu_ps(X);
+        auto y = _mm256_loadu_ps(Y);
+        auto z = _mm256_div_ps(x, y);
+        _mm256_storeu_ps(Z, z);
+        X += 8;
+        Y += 8;
+        Z += 8;
+      }
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X / *Y;
+        X++;
+        Y++;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X / *Y;
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    }
+  } else {
+    if (o_stride == 1 && (i_stride == 0 || i_stride == 1)) {
+      unsigned int N8 = (N & ~(7));
+      auto alpha_v = _mm256_set1_ps(alpha);
+      auto beta_v = _mm256_set1_ps(beta);
+
+      if (i_stride == 0) {
+        auto y = _mm256_set1_ps(Y[0]);
+        auto denom = _mm256_mul_ps(alpha_v, y);
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto z = _mm256_div_ps(x, denom);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Z += 8;
+        }
+      } else {
+        for (unsigned int i = 0; i < N8; i += 8) {
+          auto x = _mm256_loadu_ps(X);
+          auto y = _mm256_loadu_ps(Y);
+          auto denom = _mm256_mul_ps(alpha_v, y);
+          auto z = _mm256_div_ps(x, denom);
+          if (beta != 0.0f) {
+            auto z_old = _mm256_loadu_ps(Z);
+            z = _mm256_fmadd_ps(beta_v, z_old, z);
+          }
+          _mm256_storeu_ps(Z, z);
+          X += 8;
+          Y += 8;
+          Z += 8;
+        }
+      }
+
+      for (unsigned int i = N8; i < N; ++i) {
+        *Z = *X / (alpha * *Y) + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X++;
+        Y += i_stride;
+        Z++;
+      }
+    } else {
+      for (unsigned int i = 0; i < N; ++i) {
+        *Z = *X / (alpha * *Y) + ((0.0f == beta) ? 0.0f : beta * *Z);
+        X += o_stride;
+        Y += i_stride;
+        Z += o_stride;
+      }
+    }
+  }
 }
+
+// exp256_ps and rcp_ps are now in avx2_internal.h
 
 static void softmax_row_inplace(float *qk_out, size_t start_row, size_t end_row,
                                 size_t num_heads) {
   const size_t vec_end = num_heads & ~((size_t)7); // floor(num_heads / 8) * 8
 
-  // 1. find max for each head
-  float *max_vals = new float[num_heads];
+  // 1. find max for each head (reusable thread-local scratch: 0 per-call alloc)
+  // TODO: these thread_local buffers stay alive per worker thread for the
+  // process lifetime (thread pool) and only grow to a high-water mark of
+  // 2 * max(num_heads) floats per worker (sub-KB for typical models); they are
+  // never released. Free or shrink them here if the attention memory footprint
+  // needs to be reduced.
+  static thread_local std::vector<float> max_vals_buf;
+  static thread_local std::vector<float> sum_vals_buf;
+  max_vals_buf.resize(num_heads);
+  sum_vals_buf.resize(num_heads);
+  float *max_vals = max_vals_buf.data();
 
   // initialize max_vals with first row of qk_out
   std::memcpy(max_vals, qk_out + start_row * num_heads,
@@ -1358,7 +1177,7 @@ static void softmax_row_inplace(float *qk_out, size_t start_row, size_t end_row,
   }
 
   // 2. calc exp(x - max) and sum
-  float *sum_vals = new float[num_heads];
+  float *sum_vals = sum_vals_buf.data();
   std::memset(sum_vals, 0, num_heads * sizeof(float));
 
   for (size_t r = start_row; r < end_row; ++r) {
@@ -1405,9 +1224,6 @@ static void softmax_row_inplace(float *qk_out, size_t start_row, size_t end_row,
       row[c] *= sum_vals[c];
     }
   }
-
-  delete[] max_vals;
-  delete[] sum_vals;
 }
 
 static void softmax_row_with_sink_inplace(float *qk_out, size_t start_row,
@@ -1415,8 +1231,17 @@ static void softmax_row_with_sink_inplace(float *qk_out, size_t start_row,
                                           float *sink) {
   const size_t vec_end = num_heads & ~((size_t)7); // floor(num_heads / 8) * 8
 
-  // 1. find max for each head
-  float *max_vals = new float[num_heads];
+  // 1. find max for each head (reusable thread-local scratch: 0 per-call alloc)
+  // TODO: these thread_local buffers stay alive per worker thread for the
+  // process lifetime (thread pool) and only grow to a high-water mark of
+  // 2 * max(num_heads) floats per worker (sub-KB for typical models); they are
+  // never released. Free or shrink them here if the attention memory footprint
+  // needs to be reduced.
+  static thread_local std::vector<float> max_vals_buf;
+  static thread_local std::vector<float> sum_vals_buf;
+  max_vals_buf.resize(num_heads);
+  sum_vals_buf.resize(num_heads);
+  float *max_vals = max_vals_buf.data();
 
   // initialize max_vals with sink
   std::memcpy(max_vals, sink, num_heads * sizeof(float));
@@ -1436,7 +1261,7 @@ static void softmax_row_with_sink_inplace(float *qk_out, size_t start_row,
   }
 
   // 2. calc exp(x - max) and sum
-  float *sum_vals = new float[num_heads];
+  float *sum_vals = sum_vals_buf.data();
   // init sum_vals with exp(sink - max)
   {
     for (size_t c = 0; c < vec_end; c += 8) {
@@ -1496,9 +1321,6 @@ static void softmax_row_with_sink_inplace(float *qk_out, size_t start_row,
       row[c] *= sum_vals[c];
     }
   }
-
-  delete[] max_vals;
-  delete[] sum_vals;
 }
 
 template <>
@@ -1622,28 +1444,42 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
     << "head_start (" << head_start << ") must be less than head_end ("
     << actual_head_end << ")";
 
-  std::vector<float> tmp_fp32(head_dim);
-  int num_blocks = head_dim / 8;
-  __m256 *sumVec = new __m256[std::max(1, num_blocks * gqa_size)];
+  const int num_blocks = head_dim / 8;
+  const int rem = head_dim % 8;
+
+  // Reusable thread-local scratch so the kernel performs zero per-call
+  // allocations after warm-up (ThreadManager::parallel_for gives each worker
+  // its own thread_local copy). sumVec holds num_blocks*gqa_size accumulator
+  // vectors as a flat float buffer (8 floats each) to avoid the
+  // -Wignored-attributes warning that a std::vector<__m256> would raise.
+  // Resolve each thread_local data pointer once into a local so the hot loops
+  // do plain pointer arithmetic (no per-access TLS/vector indirection).
+  // TODO: these thread_local buffers stay alive per worker thread for the
+  // process lifetime (thread pool) and only grow to a high-water mark of about
+  // head_dim * (1 + gqa_size) floats per worker (a few KB for typical LLM
+  // shapes); they are never released. Free or shrink them here if the
+  // attention memory footprint needs to be reduced.
+  static thread_local std::vector<float> tmp_fp32;
+  static thread_local std::vector<float> sumVec;
+  static thread_local std::vector<float> sumRem;
+  tmp_fp32.resize(head_dim);
+  sumVec.resize((size_t)std::max(1, num_blocks * gqa_size) * 8);
+  sumRem.resize((size_t)gqa_size * rem);
+  float *tmp = tmp_fp32.data();
+  float *sv = sumVec.data();
+  float *rem_buf = sumRem.data();
 
   for (int n = head_start; n < actual_head_end; ++n) {
-    int rem = head_dim % 8;
-
-    /* Declaration: std::vector<__m256> sumVec(num_blocks * gqa_size,
-     * _mm256_setzero_ps()); caused warning: ignoring attributes on template
-     * argument ‘__m256’ [-Wignored-attributes].
-     * So it is implemented that way.
-     */
     for (int i = 0; i < num_blocks * gqa_size; i++) {
-      sumVec[i] = _mm256_setzero_ps();
+      _mm256_storeu_ps(&sv[(size_t)i * 8], _mm256_setzero_ps());
     }
-    std::vector<float> sumRem((size_t)gqa_size * rem, 0.0f);
+    std::fill(sumRem.begin(), sumRem.end(), 0.0f);
 
     for (int j = row_num < local_window_size ? 0
                                              : row_num + 1 - local_window_size;
          j <= row_num; ++j) {
       const uint16_t *vptr = vcache + (j * num_cache_head + n) * head_dim;
-      load_fp16_8_to_chunk(vptr, tmp_fp32.data(), head_dim);
+      load_fp16_8_to_chunk(vptr, tmp, head_dim);
 
       for (int h = 0; h < gqa_size; ++h) {
         float a_val =
@@ -1656,15 +1492,18 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
         __m256 inVec = _mm256_set1_ps(a_val);
 
         for (int b = 0; b < num_blocks; ++b) {
-          __m256 bVec = _mm256_loadu_ps(&tmp_fp32[b * 8]);
-          sumVec[h * num_blocks + b] =
-            _mm256_fmadd_ps(inVec, bVec, sumVec[h * num_blocks + b]);
+          __m256 bVec = _mm256_loadu_ps(&tmp[b * 8]);
+          float *accPtr = &sv[(size_t)(h * num_blocks + b) * 8];
+          _mm256_storeu_ps(
+            accPtr, _mm256_fmadd_ps(inVec, bVec, _mm256_loadu_ps(accPtr)));
         }
 
-        float *remPtr = &sumRem.data()[h * rem];
-        int base = num_blocks * 8;
-        for (int r = 0; r < rem; ++r) {
-          remPtr[r] += a_val * tmp_fp32[base + r];
+        if (rem > 0) {
+          float *remPtr = &rem_buf[(size_t)h * rem];
+          int base = num_blocks * 8;
+          for (int r = 0; r < rem; ++r) {
+            remPtr[r] += a_val * tmp[base + r];
+          }
         }
       }
     }
@@ -1672,19 +1511,21 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
     for (int h = 0; h < gqa_size; ++h) {
       for (int b = 0; b < num_blocks; ++b) {
         int out_base = (n * gqa_size + h) * head_dim + b * 8;
-        _mm256_storeu_ps(&output[out_base], sumVec[h * num_blocks + b]);
+        _mm256_storeu_ps(
+          &output[out_base],
+          _mm256_loadu_ps(&sv[(size_t)(h * num_blocks + b) * 8]));
       }
 
-      float *remPtr = &sumRem.data()[h * rem];
-      // float *remPtr = &sumRem[h * rem];
-      int base = num_blocks * 8;
-      for (int r = 0; r < rem; ++r) {
-        int out_idx = (n * gqa_size + h) * head_dim + base + r;
-        output[out_idx] = remPtr[r];
+      if (rem > 0) {
+        float *remPtr = &rem_buf[(size_t)h * rem];
+        int base = num_blocks * 8;
+        for (int r = 0; r < rem; ++r) {
+          int out_idx = (n * gqa_size + h) * head_dim + base + r;
+          output[out_idx] = remPtr[r];
+        }
       }
     }
   }
-  delete[] sumVec;
 }
 
 template <>
@@ -1692,8 +1533,6 @@ void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
                      int num_rows, int num_cache_head, int head_dim,
                      int gqa_size, int tile_size, size_t local_window_size,
                      int head_start, int head_end) {
-  std::vector<float> tmp_fp32(head_dim);
-
   // If head_end is -1, process all heads from head_start to num_cache_head.
   // No other negative values are accepted for head_end.
   int actual_head_end = (head_end < 0) ? num_cache_head : head_end;
@@ -1707,6 +1546,8 @@ void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
     num_rows < local_window_size ? 0 : num_rows - local_window_size;
   int row_cnt = num_rows < local_window_size ? num_rows : local_window_size;
   const int tile_count = (row_cnt + tile_size - 1) / tile_size;
+  const float inv_sqrt_head_dim =
+    1.0f / std::sqrt(static_cast<float>(head_dim));
 
   for (int n = head_start; n < actual_head_end; ++n) {
     for (int t = 0; t < tile_count; ++t) {
@@ -1724,16 +1565,16 @@ void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
                          _MM_HINT_T0);
           }
           const uint16_t *kptr = kcache + (row * num_cache_head + n) * head_dim;
-          load_fp16_8_to_chunk(kptr, tmp_fp32.data(), head_dim);
 
-          const float *k_row = tmp_fp32.data();
-
+          // Convert the FP16 key row to FP32 on the fly inside the dot product
+          // (8 lanes via F16C) instead of staging it in a temporary buffer.
           float sum = 0.0f;
           int i = 0;
           __m256 acc = _mm256_setzero_ps();
           for (; i + 8 <= head_dim; i += 8) {
             __m256 va = _mm256_loadu_ps(in_ptr + i);
-            __m256 vb = _mm256_loadu_ps(k_row + i);
+            __m256 vb = convert_vector_f16_to_f32(
+              _mm_loadu_si128(reinterpret_cast<const __m128i *>(kptr + i)));
             acc = _mm256_fmadd_ps(va, vb, acc);
           }
 
@@ -1745,10 +1586,10 @@ void compute_kcaches(const float *in, const uint16_t *kcache, float *output,
           sum += _mm_cvtss_f32(sum128);
 
           for (; i < head_dim; ++i)
-            sum += in_ptr[i] * k_row[i];
+            sum += in_ptr[i] * nntrainer::compute_fp16_to_fp32(kptr[i]);
 
           output[(row - start_row) * num_cache_head * gqa_size + n * gqa_size +
-                 g] = sum / sqrt((float)head_dim);
+                 g] = sum * inv_sqrt_head_dim;
         }
       }
     }
@@ -1843,16 +1684,7 @@ void compute_rotary_emb_value(unsigned int width, unsigned int dim,
   }
 }
 
-static float hsum_avx(__m256 v) {
-  __m128 vlow = _mm256_castps256_ps128(v);
-  __m128 vhigh = _mm256_extractf128_ps(v, 1);
-  vlow = _mm_add_ps(vlow, vhigh);
-  __m128 shuf = _mm_movehdup_ps(vlow);
-  __m128 sums = _mm_add_ps(vlow, shuf);
-  shuf = _mm_movehl_ps(shuf, sums);
-  sums = _mm_add_ss(sums, shuf);
-  return _mm_cvtss_f32(sums);
-}
+// hsum_avx is now in avx2_internal.h
 
 void rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,
