@@ -1,0 +1,36 @@
+# Python virtual environment
+engine/venv/**
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+
+# Node modules (not needed in packaged extension)
+node_modules/**
+
+# Development and test files
+engine/tests/**
+engine/.pytest_cache/**
+**/*.test.js
+**/*.spec.js
+
+# Temporary files
+extension_tmp/**
+**/*.log
+**/.git/**
+**/.DS_Store
+**/Thumbs.db
+
+# Documentation (exclude from root, but include docs/ folder)
+**/*.md
+!docs/*.md
+!docs/**/*.md
+
+# Build artifacts
+*.vsix
+tsconfig.tsbuildinfo
+
+# IDE files
+.vscode/**
+.idea/**
+*.swp
+*.swo

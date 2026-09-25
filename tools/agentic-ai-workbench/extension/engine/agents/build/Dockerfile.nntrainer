@@ -1,0 +1,29 @@
+# nntrainer Build Image
+# Used by the AI Compiler Workbench for consistent, platform-independent builds
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ninja-build \
+    meson \
+    pkg-config \
+    libglib2.0-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libopenblas-dev \
+    libomp-dev \
+    git \
+    wget \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /workspace
+
+# Default command (overridden by docker_builder.py)
+CMD ["/bin/bash"]
