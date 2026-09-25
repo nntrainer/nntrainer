@@ -6,12 +6,16 @@
  * @date   23 April 2024
  * @see    https://github.com/nntrainer/nntrainer
  * @author Sungsik Kong <ss.kong@samsung.com>
+ * @author Pranjal Thapliyal <p.thapliyal@samsung.com>
  * @bug    No known bugs except for NYI items
  * @brief  Function interface to use cblas lib from cpu_backend
  *
  */
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wredundant-decls"
 #include <cblas.h>
+#pragma GCC diagnostic pop
 #include <cblas_interface.h>
 
 namespace nntrainer {
