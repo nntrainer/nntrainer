@@ -181,8 +181,6 @@ inline void CachedSlimMoELayer::compute_expert_forward(
                                        input.getTensorType());
   nntrainer::TensorDim intermediate_dim({1, 1, num_tokens, intermediate_size},
                                         input.getTensorType());
-  nntrainer::TensorDim out_step_dim({1, 1, 1, hidden_size},
-                                    input.getTensorType());
   // Create intermediate tensors for this token
   nntrainer::Tensor gate_out(intermediate_dim);
   nntrainer::Tensor acti_out(intermediate_dim);
@@ -233,13 +231,6 @@ inline void CachedSlimMoELayer::compute_expert_forward(
   }
 
   acti_out.dot(down_proj, output);
-
-  // Apply routing weights to the compact expert output.
-  for (size_t i = 0; i < num_tokens; ++i) {
-    nntrainer::Tensor expert_token_output =
-      output.getSharedDataTensor(out_step_dim, i * hidden_size, true);
-    expert_token_output.multiply_i(token_assignments[i].second);
-  }
 }
 
 void CachedSlimMoELayer::incremental_forwarding(
@@ -327,7 +318,6 @@ void CachedSlimMoELayer::incremental_forwarding(
       }
     }
 
-    std::vector<nntrainer::Tensor> expert_outputs(num_experts);
     std::vector<int> target_idx_vector;
     target_idx_vector.reserve(num_experts);
 
@@ -338,13 +328,12 @@ void CachedSlimMoELayer::incremental_forwarding(
         continue;
 
       target_idx_vector.push_back(expert_idx);
-      expert_outputs[expert_idx] =
-        nntrainer::Tensor(static_cast<unsigned int>(assignments.size()), 1, 1,
-                          hidden_size, output.getTensorType());
     }
 
     int hit_count = 0;
     int miss_count = 0;
+    nntrainer::TensorDim token_step_dim({1, 1, 1, hidden_size},
+                                        output.getTensorType());
 
 #ifdef DEBUG
     auto t1_miss = high_resolution_clock::now();
@@ -359,6 +348,9 @@ void CachedSlimMoELayer::incremental_forwarding(
     // execution_mutex_.
     for (int expert_idx : target_idx_vector) {
       const auto &assignments = expert_assignments[expert_idx];
+      nntrainer::Tensor expert_output(
+        static_cast<unsigned int>(assignments.size()), 1, 1, hidden_size,
+        output.getTensorType());
       if (need_load[expert_idx]) {
 
 #ifdef DEBUG
@@ -378,7 +370,7 @@ void CachedSlimMoELayer::incremental_forwarding(
         }
 
         compute_expert_forward(
-          input, expert_outputs[expert_idx], assignments,
+          input, expert_output, assignments,
           context.getWeight(expert_gate_proj_indices[expert_idx]),
           context.getWeight(expert_up_proj_indices[expert_idx]),
           context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
@@ -396,7 +388,7 @@ void CachedSlimMoELayer::incremental_forwarding(
         }
 
         compute_expert_forward(
-          input, expert_outputs[expert_idx], assignments,
+          input, expert_output, assignments,
           context.getWeight(expert_gate_proj_indices[expert_idx]),
           context.getWeight(expert_up_proj_indices[expert_idx]),
           context.getWeight(expert_down_proj_indices[expert_idx]), hidden_size);
@@ -404,6 +396,20 @@ void CachedSlimMoELayer::incremental_forwarding(
 #ifdef DEBUG
         t2_hit = high_resolution_clock::now();
 #endif
+      }
+
+      // Accumulate each compact expert output immediately so only one expert's
+      // output is resident at a time. The serial, ascending expert loop
+      // preserves the existing accumulation order.
+      for (size_t i = 0; i < assignments.size(); ++i) {
+        nntrainer::Tensor token_output = output.getSharedDataTensor(
+          token_step_dim, assignments[i].first * hidden_size, true);
+        nntrainer::Tensor expert_token_output =
+          expert_output.getSharedDataTensor(token_step_dim, i * hidden_size,
+                                            true);
+        // Preserve the original FP32 rounding order while streaming outputs.
+        expert_token_output.multiply_i(assignments[i].second);
+        token_output.add_i(expert_token_output);
       }
     }
 
@@ -439,21 +445,6 @@ void CachedSlimMoELayer::incremental_forwarding(
 #ifdef DEBUG
     auto t2_evict = high_resolution_clock::now();
 #endif
-
-    // Combine expert outputs
-    nntrainer::TensorDim token_step_dim({1, 1, 1, hidden_size},
-                                        output.getTensorType());
-    for (int expert_idx : target_idx_vector) {
-      const auto &assignments = expert_assignments[expert_idx];
-      for (size_t i = 0; i < assignments.size(); ++i) {
-        nntrainer::Tensor token_output = output.getSharedDataTensor(
-          token_step_dim, assignments[i].first * hidden_size, true);
-        nntrainer::Tensor expert_token_output =
-          expert_outputs[expert_idx].getSharedDataTensor(token_step_dim,
-                                                         i * hidden_size, true);
-        token_output.add_i(expert_token_output);
-      }
-    }
 
     // reshape output: [B*S,1,1,H] -> [B,1,S,H]
     output.reshape({batch_size, 1, seq_len, hidden_size});
