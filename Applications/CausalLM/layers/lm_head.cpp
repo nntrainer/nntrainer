@@ -173,6 +173,14 @@ void LmHeadLayer::calcGradient(nntrainer::RunLayerContext &context) {
     "calcGradient for LMHead layer is not supported");
 }
 
+void LmHeadLayer::pack(nntrainer::RunLayerContext &context) {
+  for (auto &w : context.getWeights()) {
+    auto &var = w->getVariableRef();
+    if (var.getDataType() == nntrainer::TensorDim::DataType::QS4CX)
+      var.pack();
+  }
+}
+
 void LmHeadLayer::exportTo(nntrainer::Exporter &exporter,
                            const ml::train::ExportMethods &method) const {
   LayerImpl::exportTo(exporter, method);
