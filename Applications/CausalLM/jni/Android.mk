@@ -263,6 +263,21 @@ LOCAL_C_INCLUDES += \
 
 include $(BUILD_EXECUTABLE)
 
+# Build nntr_quantize_stream executable
+include $(CLEAR_VARS)
+
+LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
+LOCAL_MODULE := nntr_quantize_stream
+LOCAL_LDLIBS := -llog -landroid
+
+LOCAL_SRC_FILES := ../quantize_stream.cpp
+
+LOCAL_SHARED_LIBRARIES := nntrainer ccapi-nntrainer
+
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/..
+
+include $(BUILD_EXECUTABLE)
+
 # Build nntr_safetensors_info executable
 include $(CLEAR_VARS)
 
