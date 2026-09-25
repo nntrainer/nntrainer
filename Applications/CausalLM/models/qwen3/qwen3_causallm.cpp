@@ -17,6 +17,7 @@
  * @brief	This defines a qwen3 causal language model.
  * @see		https://github.com/nnstreamer/
  * @author	Eunju Yang <ej.yang@samsung.com>
+ * @author	Pranjal Thapliyal <p.thapliyal@samsung.com>
  * @bug		No known bugs except for NYI items
  *
  */
@@ -36,50 +37,65 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
                                          Tensor value) {
 
   // Q layer
-  LayerHandle wq(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
-     withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+  std::vector<std::string> wq_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_wq"),
+    withKey("unit", head_dim * n_heads), withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones")};
+  if (hasLoRA("wq"))
+    appendLoRAProps(wq_props);
+  else if (LORA_RANK > 0)
+    wq_props.push_back(withKey("trainable", "false"));
+  LayerHandle wq(createLayer("fully_connected", wq_props));
   Tensor q = wq(query);
 
-  // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape)))
-  LayerHandle q_norm(createLayer(
-    "reshaped_rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
-     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
+  // Q-reshaped-norm layer (q_norm(q_proj.view(hidden_shape))). Never a LoRA
+  // target; frozen when LoRA is active unless TRAIN_NORMS asks for the
+  // "LoRA + norms" recipe.
+  std::vector<std::string> q_norm_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_q_norm"),
+    withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
+    withKey("feature_size", std::to_string(head_dim))};
+  if (LORA_RANK > 0 && !TRAIN_NORMS)
+    q_norm_props.push_back(withKey("trainable", "false"));
+  LayerHandle q_norm(createLayer("reshaped_rms_norm", q_norm_props));
   Tensor q_normed = q_norm(q);
 
   // K layer
-  LayerHandle wk(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
-     withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+  std::vector<std::string> wk_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_wk"),
+    withKey("unit", head_dim * n_heads / GQA_SIZE),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones")};
+  if (hasLoRA("wk"))
+    appendLoRAProps(wk_props);
+  else if (LORA_RANK > 0)
+    wk_props.push_back(withKey("trainable", "false"));
+  LayerHandle wk(createLayer("fully_connected", wk_props));
   Tensor k = wk(key);
 
   // K-reshaped-norm layer (k_norm(k_proj.view(hidden_shape)))
-  LayerHandle k_norm(createLayer(
-    "reshaped_rms_norm",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
-     withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
-     withKey("feature_size", std::to_string(head_dim))}));
+  std::vector<std::string> k_norm_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_k_norm"),
+    withKey("packed", "false"), withKey("epsilon", std::to_string(NORM_EPS)),
+    withKey("feature_size", std::to_string(head_dim))};
+  if (LORA_RANK > 0 && !TRAIN_NORMS)
+    k_norm_props.push_back(withKey("trainable", "false"));
+  LayerHandle k_norm(createLayer("reshaped_rms_norm", k_norm_props));
   Tensor k_normed = k_norm(k);
 
   // V layer
-  LayerHandle wv(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
-     withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "true"), withKey("weight_initializer", "ones")}));
+  std::vector<std::string> wv_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_wv"),
+    withKey("unit", head_dim * n_heads / GQA_SIZE),
+    withKey("disable_bias", "true"), withKey("weight_initializer", "ones")};
+  if (hasLoRA("wv"))
+    appendLoRAProps(wv_props);
+  else if (LORA_RANK > 0)
+    wv_props.push_back(withKey("trainable", "false"));
+  LayerHandle wv(createLayer("fully_connected", wv_props));
   Tensor v = wv(value);
 
-  // External KV cache placeholders (per-layer). Storage is owned by the host
-  // (KVCacheManager) and bound at runtime via setExternalTensors.
-  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
-
-  // Attention core layer
+  // Attention core layer (frozen: GQA has no learnable weights beyond
+  // Q/K/V/O, so there's nothing here for LoRA to target)
   LayerHandle mha(createLayer(
     "mha_core",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
@@ -90,14 +106,30 @@ Tensor Qwen3Transformer::createAttention(const int layer_id, int seq_len,
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
-  Tensor a = mha({q_normed, k_normed, v, cache_k, cache_v});
+
+  Tensor a;
+  if (FOR_TRAINING) {
+    // No KV-cache placeholders for training: mha_core's internal-cache
+    // (3-input) construction is what its training-mode forward/backward
+    // (trainForwarding()/calcDerivative() in mha_core.cpp) requires.
+    a = mha({q_normed, k_normed, v});
+  } else {
+    // External KV cache placeholders (per-layer). Storage is owned by the
+    // host (KVCacheManager) and bound at runtime via setExternalTensors.
+    auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
+    a = mha({q_normed, k_normed, v, cache_k, cache_v});
+  }
 
   // O layer
-  LayerHandle wo(createLayer(
-    "fully_connected",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
-     withKey("unit", DIM), withKey("disable_bias", "true"),
-     withKey("weight_initializer", "ones")}));
+  std::vector<std::string> wo_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_attention_out"),
+    withKey("unit", DIM), withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones")};
+  if (hasLoRA("wo"))
+    appendLoRAProps(wo_props);
+  else if (LORA_RANK > 0)
+    wo_props.push_back(withKey("trainable", "false"));
+  LayerHandle wo(createLayer("fully_connected", wo_props));
   return wo(a);
 }
 

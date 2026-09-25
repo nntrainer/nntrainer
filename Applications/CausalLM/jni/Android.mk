@@ -166,6 +166,24 @@ LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
 
 include $(BUILD_EXECUTABLE)
 
+# Build nntr_lora_train executable (on-device LoRA fine-tuning)
+include $(CLEAR_VARS)
+
+LOCAL_CFLAGS += $(CAUSALLM_COMMON_CFLAGS)
+LOCAL_MODULE := nntr_lora_train
+LOCAL_LDLIBS := -llog -landroid
+
+LOCAL_SRC_FILES := \
+    ../lora_train.cpp \
+    ../train_qwen3_lora.cpp
+
+LOCAL_SHARED_LIBRARIES := causallm_core nntrainer ccapi-nntrainer
+LOCAL_STATIC_LIBRARIES := tokenizers_c
+
+LOCAL_C_INCLUDES += $(CAUSALLM_COMMON_INCLUDES)
+
+include $(BUILD_EXECUTABLE)
+
 # Build test_api executable
 include $(CLEAR_VARS)
 

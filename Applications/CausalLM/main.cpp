@@ -17,6 +17,8 @@
  * @brief	This is a main file for CausalLM application
  * @see		https://github.com/nnstreamer/
  * @author	Eunju Yang <ej.yang@samsung.com>
+ * @author	Pranjal Thapliyal <p.thapliyal@samsung.com>
+ * @author	Sumon Nath <sumon.nath@samsung.com>
  * @bug		No known bugs except for NYI items
  *
  */
@@ -356,6 +358,11 @@ int main(int argc, char *argv[]) {
     resolveNntrConfigPath(nntr_cfg, "binary_config_path", model_path);
     resolveNntrConfigPath(nntr_cfg, "image_newline_path", model_path);
 
+    if (nntr_cfg.contains("lora_q4_file_name") &&
+        !nntr_cfg["lora_q4_file_name"].get<std::string>().empty()) {
+      nntr_cfg["lora_weight_q4"] = true;
+    }
+
     if (nntr_cfg.contains("system_prompt")) {
       system_head_prompt =
         nntr_cfg["system_prompt"]["head_prompt"].get<std::string>();
@@ -428,7 +435,19 @@ int main(int argc, char *argv[]) {
       return EXIT_FAILURE;
     }
     model->initialize();
-    model->load_weight(weight_file);
+    if (nntr_cfg.contains("lora_q4_file_name") &&
+        !nntr_cfg["lora_q4_file_name"].get<std::string>().empty()) {
+      const std::string lora_q4_file =
+        model_path + "/" + nntr_cfg["lora_q4_file_name"].get<std::string>();
+      model->load_weight_lora_q4(weight_file, lora_q4_file);
+    } else if (nntr_cfg.contains("lora_file_name") &&
+              !nntr_cfg["lora_file_name"].get<std::string>().empty()) {
+      const std::string lora_file =
+        model_path + "/" + nntr_cfg["lora_file_name"].get<std::string>();
+      model->load_weight_lora(weight_file, lora_file);
+    } else {
+      model->load_weight(weight_file);
+    }
     model->repack_weight();
 
     bool do_sample = generation_cfg.value("do_sample", false);
