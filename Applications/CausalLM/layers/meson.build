@@ -1,5 +1,6 @@
 causallm_layer_inc_abs = [meson.current_source_dir()]
 causallm_layer_inc = [include_directories('.')]
+causallm_layer_inc_parent = [include_directories('..')]
 
 causallm_rms_norm_src_abs = [meson.current_source_dir() / 'rms_norm.cpp']
 causallm_swiglu_src_abs = [meson.current_source_dir() / 'swiglu.cpp']
@@ -88,14 +89,14 @@ causallm_lm_head_dep = declare_dependency(
 causallm_mha_core = shared_library(
     'mha_core_layer',
     causallm_mha_core_abs,
-    include_directories: causallm_layer_inc,
+    include_directories: causallm_layer_inc + causallm_layer_inc_parent,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
     install: true,
     install_dir: application_install_dir
 )
 causallm_mha_core_dep = declare_dependency(
     link_with: causallm_mha_core,
-    include_directories: causallm_layer_inc
+    include_directories: causallm_layer_inc + causallm_layer_inc_parent
 )
 
 causallm_embedding_layer = shared_library(

@@ -46,6 +46,8 @@
 #include <unordered_map>
 #include <utility>
 
+#include <kv_cache_manager.h>
+
 namespace causallm {
 
 namespace props {
@@ -321,16 +323,28 @@ public:
     std::vector<nntrainer::TensorDim> input_dimensions) override;
 
   /**
-   * @brief Set the cache index for external cache mode.
-   *        Must be called before forwarding() when use_external_cache is true.
+   * @brief Set the cache index (fallback when no KVCacheManager is bound).
    * @param[in] idx current write position in the KV cache
    */
   WIN_EXPORT void setCacheIndex(unsigned int idx) { cache_index = idx; }
 
   /**
-   * @brief Get the current cache index
+   * @brief Get the current cache index (delegates to KVCacheManager when
+   * bound).
    */
-  WIN_EXPORT unsigned int getCacheIndex() const { return cache_index; }
+  WIN_EXPORT unsigned int getCacheIndex() const {
+    return kv_cache_manager_ ? kv_cache_manager_->getPosition() : cache_index;
+  }
+
+  /**
+   * @brief Bind the shared KVCacheManager that owns the write position.
+   *        Once bound, this layer reads the position from the manager and
+   *        does not self-advance; the host advances it once per step.
+   * @param[in] manager pointer to the host-owned KVCacheManager (not owned)
+   */
+  WIN_EXPORT void setKVCacheManager(KVCacheManager *manager) {
+    kv_cache_manager_ = manager;
+  }
 
   inline static const std::string type = "mha_core";
 
@@ -352,7 +366,12 @@ private:
   nntrainer::ActiFunc sm;
 
   float epsilon;            /** to avoid overflow */
-  unsigned int cache_index; /** idx of kv cache */
+  unsigned int cache_index; /** kv cache write position; fallback when
+                                kv_cache_manager_ is not bound */
+
+  /** Shared KV cache manager (not owned). When bound, it is the single
+   *  source of truth for the write position. */
+  KVCacheManager *kv_cache_manager_ = nullptr;
 
   /**
    * @brief Whether to use externally provided cache tensors
