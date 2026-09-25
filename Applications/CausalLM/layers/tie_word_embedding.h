@@ -7,6 +7,7 @@
  * @brief  This is Tie_Word_Embedding Layer Class of Neural Network
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
+ * @author Anirudh Bocha <b.saianirud@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  */
@@ -25,8 +26,40 @@
 #include <common_properties.h>
 #include <layer_devel.h>
 #include <layer_impl.h>
+#include <vector>
 
 namespace causallm {
+
+/**
+ * @brief Per-batch-index row (within the current input buffer) that
+ *        lm_head-mode forwarding() should project to vocab logits. An empty
+ *        vector (default), or a batch index beyond its size, means "use the
+ *        last row" (height - 1), matching incremental_forwarding_lmhead's
+ *        inference behavior.
+ *
+ * @details Under right-padded training the last *real* token is not at
+ *          row (height - 1), so the lm head must be told which row to read
+ *          -- and since different samples in the same batch pad to
+ *          different lengths, that row is inherently per batch index, not
+ *          one shared value. The vector is produced by the *embedding*-mode
+ *          instance of this same layer (see forwarding()), which is the
+ *          first node in the graph and is the only place the raw token ids
+ *          are visible: it scans every batch row for its own last non-pad
+ *          id and records read_row[b] here, and the lm_head-mode instance
+ *          reads it back later in the very same forward pass on the same
+ *          thread. It is deliberately NOT thread_local and deliberately NOT
+ *          set by the data pipeline: nntrainer runs the dataset generator on
+ *          a separate producer thread which may also prefetch ahead of the
+ *          trainer, so a value written there is both invisible to the
+ *          training thread and liable to describe the wrong sample.
+ *
+ *          This is a separate variable from lm_head.h's
+ *          `g_lm_head_read_row` to avoid an inter-shared-library link
+ *          dependency between tie_word_embedding_layer.so and lm_head.so
+ *          (a model only ever loads one of the two lm-head layer types,
+ *          depending on whether it ties embeddings).
+ */
+extern std::vector<unsigned int> g_tie_embedding_lm_head_read_row;
 
 /**
  * @class   TieWordEmbedding
@@ -103,8 +136,15 @@ public:
 
   /**
    * @copydoc Layer::supportBackwarding()
+   * @note calcDerivative is implemented for lm_head mode only (FP32);
+   *       embedding mode keeps throwing, since there is no meaningful
+   *       gradient with respect to token indices and that instance is the
+   *       first layer in the graph, so it is never invoked. calcGradient is
+   *       implemented for BOTH modes and accumulates into the one shared
+   *       tied weight; the framework only calls it when the layer is
+   *       trainable (frozen under LoRA-only training).
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; }
+  WIN_EXPORT bool supportBackwarding() const override { return true; }
 
   WIN_EXPORT void updateTensorsByInputDimensions(
     nntrainer::RunLayerContext &context,

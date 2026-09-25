@@ -7,11 +7,14 @@
  * @brief  Implementation of custom RMS normalization function
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
+ * @author Anirudh Bocha <b.saianirud@samsung.com>
  * @bug    No known bugs except for NYI items
  *
  */
 
 #include <cmath>
+#include <vector>
 #include <cpu_backend.h>
 #include <reshaped_rms_norm.h>
 
@@ -46,14 +49,49 @@ void ReshapedRMSNormLayer::finalize(nntrainer::InitLayerContext &context) {
       gamma_dim, nntrainer::props::InitializerInfo::Enum::NONE,
       nntrainer::WeightRegularizer::NONE, 1.0f, 0.0f, "gamma", true);
   }
+
+  /**
+   * @note inv_rms cache: one value per feature_size-wide chunk, populated by
+   * computeRMSNorm() during forwarding() and read back verbatim by
+   * calcDerivative()/calcGradient(), instead of being recomputed from the
+   * input tensor at backward time -- see RMSNormLayer's identical cache in
+   * rms_norm.cpp for the full rationale (this layer has the same
+   * cross-layer buffer-reuse hazard; it is used for Qwen3's per-head
+   * Q-norm/K-norm, which sit just as deep in the 28-layer stack).
+   */
+  cache_inv_rms =
+    (context.getExecutionMode() == ml::train::ExecutionMode::TRAIN);
+  if (cache_inv_rms) {
+    const unsigned int chunks_per_batch = dim[0].getFeatureLen() / feature_size;
+    nntrainer::TensorDim inv_rms_dim(
+      dim[0].batch(), 1, chunks_per_batch, 1,
+      nntrainer::TensorDim::TensorType(context.getFormat(),
+                                       nntrainer::TensorDim::DataType::FP32));
+    wt_idx[RMSParams::inv_rms] = context.requestTensor(
+      inv_rms_dim, "inv_rms", nntrainer::Initializer::NONE, false,
+      nntrainer::TensorLifespan::ITERATION_LIFESPAN);
+  }
 }
 
 void ReshapedRMSNormLayer::forwarding(nntrainer::RunLayerContext &context,
-                                      bool training) {}
+                                      bool training) {
+  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  computeRMSNorm(context, 0, in.getDim().height());
+}
 
 void ReshapedRMSNormLayer::incremental_forwarding(
   nntrainer::RunLayerContext &context, unsigned int from, unsigned int to,
   bool training) {
+  bool is_prefill = !from || (to - from) > 1;
+  if (skip_prefill && is_prefill)
+    return;
+
+  computeRMSNorm(context, from, to);
+}
+
+void ReshapedRMSNormLayer::computeRMSNorm(nntrainer::RunLayerContext &context,
+                                          unsigned int from,
+                                          unsigned int to) {
   auto &epsilon = std::get<nntrainer::props::Epsilon>(rms_props).get();
 
   nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
@@ -64,10 +102,6 @@ void ReshapedRMSNormLayer::incremental_forwarding(
 
   ml::train::TensorDim in_step_dim = in_dim;
   ml::train::TensorDim out_step_dim = out_dim;
-
-  bool is_prefill = !from || (to - from) > 1;
-  if (skip_prefill && is_prefill)
-    return;
 
   in_step_dim.batch(1);
   in_step_dim.height(to - from);
@@ -112,6 +146,27 @@ void ReshapedRMSNormLayer::incremental_forwarding(
         in_step.getData<float>(), out_step.getData<float>(),
         in_step.getDim().height(), in_step.getDim().width(), epsilon);
 #endif
+      // Cache inv_rms per chunk for calcDerivative()/calcGradient() to read
+      // back verbatim -- see the note in finalize() for why this must not
+      // be recomputed from the input tensor at backward time instead.
+      if (cache_inv_rms) {
+        nntrainer::Tensor &inv_rms_cache =
+          context.getTensor(wt_idx[RMSParams::inv_rms]);
+        const unsigned int chunks_from =
+          from * (in_dim.width() / feature_size);
+        float *inv_rms_row = inv_rms_cache.getData<float>() +
+                            b * inv_rms_cache.getDim().getFeatureLen() +
+                            chunks_from;
+        const float *x_chunk = in_step.getData<float>();
+        const unsigned int chunks = in_step.getDim().height();
+        for (unsigned int c = 0; c < chunks; ++c) {
+          float ms = 0.0f;
+          for (unsigned int w = 0; w < feature_size; ++w)
+            ms += x_chunk[c * feature_size + w] * x_chunk[c * feature_size + w];
+          ms /= feature_size;
+          inv_rms_row[c] = 1.0f / std::sqrt(ms + epsilon);
+        }
+      }
 #ifdef ENABLE_FP16
     } else if (in_step.getDataType() == ml::train::TensorDim::DataType::FP16) {
       // FP16 activation: kernel accumulates squares in FP32 (no overflow).
@@ -148,10 +203,154 @@ void ReshapedRMSNormLayer::updateTensorsByInputDimensions(
   std::vector<nntrainer::TensorDim> input_dimensions) {
   context.updateInput(SINGLE_INOUT_IDX, input_dimensions[0]);
   context.updateOutput(SINGLE_INOUT_IDX, input_dimensions[0]);
+
+  if (cache_inv_rms) {
+    const unsigned int chunks_per_batch =
+      input_dimensions[0].getFeatureLen() / feature_size;
+    nntrainer::TensorDim inv_rms_dim(input_dimensions[0].batch(), 1,
+                                     chunks_per_batch, 1);
+    context.updateTensor(wt_idx[RMSParams::inv_rms], inv_rms_dim);
+  }
 }
 
+void ReshapedRMSNormLayer::setBatch(nntrainer::RunLayerContext &context,
+                                    unsigned int batch) {
+  if (cache_inv_rms)
+    context.updateTensor(wt_idx[RMSParams::inv_rms], batch);
+}
+
+/**
+ * @brief calcDerivative for ReshapedRMSNorm.
+ * @details Identical math to RMSNormLayer::calcDerivative, but each row of
+ *          width `feature_size` (rather than the full tensor width) is
+ *          normalized independently, matching the reshape done in
+ *          computeRMSNorm(). dgamma is computed in calcGradient(), which
+ *          the framework only calls when the layer is trainable.
+ */
 void ReshapedRMSNormLayer::calcDerivative(nntrainer::RunLayerContext &context) {
-  std::throw_with_nested(std::runtime_error("Training is not supported yet."));
+  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  const nntrainer::Tensor &dy =
+    context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &dx = context.getOutgoingDerivative(SINGLE_INOUT_IDX);
+  const nntrainer::Tensor &inv_rms_cache =
+    context.getTensor(wt_idx[RMSParams::inv_rms]);
+
+  NNTR_THROW_IF(in.getDataType() != ml::train::TensorDim::DataType::FP32,
+                std::invalid_argument)
+    << "[reshaped_rms_norm] calcDerivative only supports FP32 for now";
+
+  nntrainer::Tensor gamma_fp32;
+  const float *g = nullptr;
+  if (use_gamma) {
+    nntrainer::Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);
+    gamma_fp32 = (gamma.getDataType() == ml::train::TensorDim::DataType::FP32)
+                   ? gamma
+                   : gamma.clone(ml::train::TensorDim::DataType::FP32);
+    g = gamma_fp32.getData<float>();
+  }
+
+  const ml::train::TensorDim &in_dim = in.getDim();
+  const unsigned int chunks_per_batch = in_dim.getFeatureLen() / feature_size;
+  const unsigned int batch = in_dim.batch();
+  const unsigned int inv_rms_stride = inv_rms_cache.getDim().getFeatureLen();
+
+  const float *x = in.getData<float>();
+  const float *dy_ = dy.getData<float>();
+  const float *inv_rms_ = inv_rms_cache.getData<float>();
+  float *dx_ = dx.getData<float>();
+
+  for (unsigned int b = 0; b < batch; ++b) {
+    const float *x_b = x + b * in_dim.getFeatureLen();
+    const float *dy_b = dy_ + b * in_dim.getFeatureLen();
+    float *dx_b = dx_ + b * in_dim.getFeatureLen();
+    const float *inv_rms_b = inv_rms_ + b * inv_rms_stride;
+
+    for (unsigned int r = 0; r < chunks_per_batch; ++r) {
+      const float *x_row = x_b + r * feature_size;
+      const float *dy_row = dy_b + r * feature_size;
+      float *dx_row = dx_b + r * feature_size;
+
+      // Read back the inv_rms this chunk's forward pass computed, rather
+      // than recomputing it from x_row here -- see the note in finalize()
+      // for why re-deriving it from the (possibly since-reused) input
+      // buffer at this point is unsafe.
+      const float inv_rms = inv_rms_b[r];
+      const float inv_rms3 = inv_rms * inv_rms * inv_rms;
+
+      float sum_gdyx = 0.0f;
+      for (unsigned int w = 0; w < feature_size; ++w) {
+        float gdy = use_gamma ? g[w] * dy_row[w] : dy_row[w];
+        sum_gdyx += gdy * x_row[w];
+      }
+      float mean_gdyx = sum_gdyx / feature_size;
+
+      for (unsigned int w = 0; w < feature_size; ++w) {
+        float gdy = use_gamma ? g[w] * dy_row[w] : dy_row[w];
+        dx_row[w] = inv_rms * gdy - inv_rms3 * x_row[w] * mean_gdyx;
+      }
+    }
+  }
+}
+
+/**
+ * @brief calcGradient for ReshapedRMSNorm.
+ * @details Same accumulation as RMSNormLayer::calcGradient, but gamma spans
+ *          one `feature_size`-wide chunk and every chunk in the tensor
+ *          contributes to it:
+ *          dL/dgamma[w] = sum over chunks of dy[c][w]*x[c][w]*inv_rms[c].
+ *          No-op when use_gamma is false, since then there is no weight.
+ */
+void ReshapedRMSNormLayer::calcGradient(nntrainer::RunLayerContext &context) {
+  if (!use_gamma)
+    return;
+
+  nntrainer::Tensor &in = context.getInput(SINGLE_INOUT_IDX);
+  const nntrainer::Tensor &dy =
+    context.getIncomingDerivative(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &dgamma = context.getWeightGrad(wt_idx[RMSParams::gamma]);
+  const nntrainer::Tensor &inv_rms_cache =
+    context.getTensor(wt_idx[RMSParams::inv_rms]);
+
+  NNTR_THROW_IF(in.getDataType() != ml::train::TensorDim::DataType::FP32 ||
+                  dgamma.getDataType() !=
+                    ml::train::TensorDim::DataType::FP32,
+                std::invalid_argument)
+    << "[reshaped_rms_norm] calcGradient only supports FP32 for now";
+
+  const ml::train::TensorDim &in_dim = in.getDim();
+  const unsigned int chunks_per_batch = in_dim.getFeatureLen() / feature_size;
+  const unsigned int batch = in_dim.batch();
+  const unsigned int inv_rms_stride = inv_rms_cache.getDim().getFeatureLen();
+
+  const float *x = in.getData<float>();
+  const float *dy_ = dy.getData<float>();
+  const float *inv_rms_ = inv_rms_cache.getData<float>();
+
+  std::vector<double> acc(feature_size, 0.0);
+
+  for (unsigned int b = 0; b < batch; ++b) {
+    const float *x_b = x + b * in_dim.getFeatureLen();
+    const float *dy_b = dy_ + b * in_dim.getFeatureLen();
+    const float *inv_rms_b = inv_rms_ + b * inv_rms_stride;
+
+    for (unsigned int r = 0; r < chunks_per_batch; ++r) {
+      const float *x_row = x_b + r * feature_size;
+      const float *dy_row = dy_b + r * feature_size;
+      const float inv_rms = inv_rms_b[r];
+
+      for (unsigned int w = 0; w < feature_size; ++w)
+        acc[w] += static_cast<double>(dy_row[w]) * x_row[w] * inv_rms;
+    }
+  }
+
+  float *dg = dgamma.getData<float>();
+  if (context.isGradientFirstAccess(wt_idx[RMSParams::gamma])) {
+    for (unsigned int w = 0; w < feature_size; ++w)
+      dg[w] = static_cast<float>(acc[w]);
+  } else {
+    for (unsigned int w = 0; w < feature_size; ++w)
+      dg[w] += static_cast<float>(acc[w]);
+  }
 }
 
 #ifdef PLUGGABLE
