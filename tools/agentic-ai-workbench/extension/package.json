@@ -2,7 +2,7 @@
   "name": "ai-compiler-workbench",
   "displayName": "AI Compiler Workbench -- Agentic Graph Visualiser",
   "description": "Agentic pipeline that discovers HuggingFace models, checks nntrainer compatibility, and generates nntrainer-compatible C++ + an interactive knowledge graph, orchestrated with LangGraph/LangChain.",
-  "version": "0.3.1",
+  "version": "0.3.11",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -29,6 +29,10 @@
       {
         "command": "aiCompilerWorkbench.runPipeline",
         "title": "AI Compiler Workbench: Run Pipeline (Convert HuggingFace Model)"
+      },
+      {
+        "command": "aiCompilerWorkbench.generateBuildAndProfile",
+        "title": "AI Compiler Workbench: Generate, Build & Profile (fully automatic, Docker)"
       },
       {
         "command": "aiCompilerWorkbench.stopPipeline",
@@ -60,20 +64,40 @@
           "default": "",
           "markdownDescription": "Your own Anthropic API key. Used by the **Compatibility Agent** (op-fix suggestions), the **Auto-Fix Agent** (compiler-error patches), and the **Chat** panel. Leave blank to skip all three -- the deterministic agents (discovery, tracing, weight download/conversion, INI/C++/graph generation, compiling, profiling, artifacts) all work without it."
         },
+        "aiCompilerWorkbench.clineUmsToken": {
+          "type": "string",
+          "default": "ollama",
+          "markdownDescription": "Your Cline UMS token (from Cline SR extension settings) or Ollama API key (use 'ollama'). Used by the **Chat** panel and **LLM Code Generation** as an alternative to Anthropic API key."
+        },
+        "aiCompilerWorkbench.clineApiBase": {
+          "type": "string",
+          "default": "http://localhost:11434/v1",
+          "markdownDescription": "Base URL for the LLM API endpoint. For Ollama, set to `http://localhost:11434/v1`. For Cline/Gauss, use `http://localhost:6543/v1`."
+        },
+        "aiCompilerWorkbench.clineModel": {
+          "type": "string",
+          "default": "sonnet",
+          "markdownDescription": "Model name for LLM generation. Defaults to Claude Sonnet (faster, reliable for code generation). For Ollama, explicitly set a local model tag such as `llama3.1:8b` or `codellama:7b`. Use 'opus' for more complex reasoning tasks."
+        },
+        "aiCompilerWorkbench.claudeCliTimeout": {
+          "type": "integer",
+          "default": 300,
+          "markdownDescription": "Timeout in seconds for Claude Code CLI calls. Increase for large prompts or complex code generation tasks. Default is 300 seconds (5 minutes)."
+        },
         "aiCompilerWorkbench.nntrainerPath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to a local nntrainer install **prefix** (a directory containing `include/nntrainer` and `lib/`), built from [nntrainer/nntrainer](https://github.com/nntrainer/nntrainer) via `meson --prefix=<this path> build && ninja -C build install`. Required only for **Profile On-Device**; everything else works without it. If left blank, the extension will prompt you for it the first time you use that command -- including an option to build nntrainer from source automatically (Ubuntu only)."
+          "markdownDescription": "Path to a local nntrainer install **prefix** (a directory containing `include/nntrainer` and `lib/`), built from [nntrainer/nntrainer](https://github.com/nntrainer/nntrainer) via `meson --prefix=<this path> build && ninja -C build install`. Required only for **Profile On-Device**; everything else works without it. If left blank, the extension will use the workspace root as the nntrainer repo path."
         },
         "aiCompilerWorkbench.nntrainerRepoPath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to a local clone (via `git clone`, not a downloaded zip -- submodules require real git metadata) of the [nntrainer/nntrainer](https://github.com/nntrainer/nntrainer) source repo. Used by **Build nntrainer From Source**; remembered so you aren't asked again on subsequent builds."
+          "markdownDescription": "Path to a local clone (via `git clone`, not a downloaded zip -- submodules require real git metadata) of the [nntrainer/nntrainer](https://github.com/nntrainer/nntrainer) source repo. Used by **Build nntrainer From Source**; defaults to workspace root if not set."
         },
         "aiCompilerWorkbench.causallmProjectRoot": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to your CausalLM integration project (the one with `transformer.h`, `causal_lm.h`, `<arch>_causallm.h`), used only when **Install Generated Files** is enabled below. Generated CausalLM components (`generated_<arch>_causallm.{h,cpp}`) always get written to `<output>/generated/causallm/<arch>/` regardless of this setting -- this only controls whether they're *also* copied into your real project."
+          "markdownDescription": "Path to your CausalLM integration project (the one with `transformer.h`, `causal_lm.h`, `<arch>_causallm.h`), used only when **Install Generated Files** is enabled below. Generated CausalLM components (`generated_<arch>_causallm.{h,cpp}`) always get written to `<output>/generated/causallm/<arch>/` regardless of this setting -- this only controls whether they're *also* copied into your real project. Defaults to `<workspace>/Applications/CausalLM` if not set."
         },
         "aiCompilerWorkbench.generatedHeaderDirectory": {
           "type": "string",
@@ -89,12 +113,58 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "When enabled, copies generated CausalLM `.h`/`.cpp` files into `causallmProjectRoot`'s generated-header/source directories after each run. **Off by default** -- this writes into a project outside the extension's own output directory, so it's opt-in rather than something a first run does silently."
+        },
+        "aiCompilerWorkbench.useDockerBuild": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "When enabled, builds nntrainer inside a Docker container instead of on the host system. Useful for creating consistent, reproducible builds across different platforms. Requires Docker to be installed and running. **Off by default** -- use the host system's toolchain unless you need Docker isolation."
+        },
+        "aiCompilerWorkbench.causallmPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the CausalLM repository (`Applications/CausalLM`). Required for generating `.bin` weight files. If left blank, the extension will search in common locations."
+        },
+        "aiCompilerWorkbench.enableQuantization": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable optional weight quantization after conversion to reduce model size."
+        },
+        "aiCompilerWorkbench.defaultQuantizationPreset": {
+          "type": "string",
+          "enum": [
+            "none",
+            "Q4_0-FP32",
+            "Q6_K-Q4_0",
+            "Q4_0-Q6_K"
+          ],
+          "default": "Q4_0-FP32",
+          "description": "Default quantization preset. 'none' = FP32 only, 'Q4_0-FP32' = Q4_0 FC layers + FP32 embedding, etc."
+        },
+        "aiCompilerWorkbench.targetISA": {
+          "type": "string",
+          "enum": [
+            "x86",
+            "ARM"
+          ],
+          "default": "x86",
+          "description": "Target instruction set architecture for quantized weights. x86_64 or ARM64."
+        },
+        "aiCompilerWorkbench.nntrQuantizePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to `nntr_quantize` binary. If empty, will search PATH and common locations."
         }
       }
     }
   },
   "publisher": "local-dev",
   "devDependencies": {
-    "@vscode/vsce": "^3.0.0"
+    "@secretlint/node": "^12.0.0",
+    "@vscode/vsce": "^2.15.0",
+    "vsce": "^2.14.0"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12",
+    "undici": "^5.28.4"
   }
 }
