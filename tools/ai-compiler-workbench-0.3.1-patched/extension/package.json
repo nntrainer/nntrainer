@@ -1,0 +1,100 @@
+{
+  "name": "ai-compiler-workbench",
+  "displayName": "AI Compiler Workbench -- Agentic Graph Visualiser",
+  "description": "Agentic pipeline that discovers HuggingFace models, checks nntrainer compatibility, and generates nntrainer-compatible C++ + an interactive knowledge graph, orchestrated with LangGraph/LangChain.",
+  "version": "0.3.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Visualization",
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:aiCompilerWorkbench.openWorkbench",
+    "onCommand:aiCompilerWorkbench.runPipeline",
+    "onCommand:aiCompilerWorkbench.stopPipeline",
+    "onCommand:aiCompilerWorkbench.checkEnvironment",
+    "onCommand:aiCompilerWorkbench.runDeviceProfiler",
+    "onCommand:aiCompilerWorkbench.buildNntrainer"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiCompilerWorkbench.openWorkbench",
+        "title": "AI Compiler Workbench: Open Agentic Graph Visualiser"
+      },
+      {
+        "command": "aiCompilerWorkbench.runPipeline",
+        "title": "AI Compiler Workbench: Run Pipeline (Convert HuggingFace Model)"
+      },
+      {
+        "command": "aiCompilerWorkbench.stopPipeline",
+        "title": "AI Compiler Workbench: Stop Pipeline"
+      },
+      {
+        "command": "aiCompilerWorkbench.checkEnvironment",
+        "title": "AI Compiler Workbench: Check / Install Python Dependencies"
+      },
+      {
+        "command": "aiCompilerWorkbench.runDeviceProfiler",
+        "title": "AI Compiler Workbench: Run On-Device Profiling (builds nntrainer first if needed)"
+      },
+      {
+        "command": "aiCompilerWorkbench.buildNntrainer",
+        "title": "AI Compiler Workbench: Build nntrainer From Source Only (Ubuntu, advanced)"
+      }
+    ],
+    "configuration": {
+      "title": "AI Compiler Workbench",
+      "properties": {
+        "aiCompilerWorkbench.pythonPath": {
+          "type": "string",
+          "default": "python3",
+          "description": "Python interpreter to use. The extension will offer to auto-install torch/transformers/langchain into it, but the interpreter itself must already exist."
+        },
+        "aiCompilerWorkbench.anthropicApiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Your own Anthropic API key. Used by the **Compatibility Agent** (op-fix suggestions), the **Auto-Fix Agent** (compiler-error patches), and the **Chat** panel. Leave blank to skip all three -- the deterministic agents (discovery, tracing, weight download/conversion, INI/C++/graph generation, compiling, profiling, artifacts) all work without it."
+        },
+        "aiCompilerWorkbench.nntrainerPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to a local nntrainer install **prefix** (a directory containing `include/nntrainer` and `lib/`), built from [nntrainer/nntrainer](https://github.com/nntrainer/nntrainer) via `meson --prefix=<this path> build && ninja -C build install`. Required only for **Profile On-Device**; everything else works without it. If left blank, the extension will prompt you for it the first time you use that command -- including an option to build nntrainer from source automatically (Ubuntu only)."
+        },
+        "aiCompilerWorkbench.nntrainerRepoPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to a local clone (via `git clone`, not a downloaded zip -- submodules require real git metadata) of the [nntrainer/nntrainer](https://github.com/nntrainer/nntrainer) source repo. Used by **Build nntrainer From Source**; remembered so you aren't asked again on subsequent builds."
+        },
+        "aiCompilerWorkbench.causallmProjectRoot": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to your CausalLM integration project (the one with `transformer.h`, `causal_lm.h`, `<arch>_causallm.h`), used only when **Install Generated Files** is enabled below. Generated CausalLM components (`generated_<arch>_causallm.{h,cpp}`) always get written to `<output>/generated/causallm/<arch>/` regardless of this setting -- this only controls whether they're *also* copied into your real project."
+        },
+        "aiCompilerWorkbench.generatedHeaderDirectory": {
+          "type": "string",
+          "default": "include/generated",
+          "description": "Directory (relative to causallmProjectRoot) that generated .h files are copied into, when installGeneratedFiles is enabled."
+        },
+        "aiCompilerWorkbench.generatedSourceDirectory": {
+          "type": "string",
+          "default": "src/generated",
+          "description": "Directory (relative to causallmProjectRoot) that generated .cpp files are copied into, when installGeneratedFiles is enabled."
+        },
+        "aiCompilerWorkbench.installGeneratedFiles": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "When enabled, copies generated CausalLM `.h`/`.cpp` files into `causallmProjectRoot`'s generated-header/source directories after each run. **Off by default** -- this writes into a project outside the extension's own output directory, so it's opt-in rather than something a first run does silently."
+        }
+      }
+    }
+  },
+  "publisher": "local-dev",
+  "devDependencies": {
+    "@vscode/vsce": "^3.0.0"
+  }
+}
