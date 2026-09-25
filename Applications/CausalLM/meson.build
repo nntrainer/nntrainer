@@ -230,6 +230,22 @@ if get_option('enable-test')
     suite: 'unittests'
   )
 
+  unittest_lora_backward_gradcheck = executable(
+    'unittest_lora_backward_gradcheck',
+    meson.current_source_dir() / 'layers' / 'unittest_lora_backward_gradcheck.cpp',
+    dependencies: [nntrainer_dep, gtest_main_dep, causallm_rms_norm_dep,
+                   causallm_reshaped_rms_norm_dep, causallm_swiglu_dep],
+    include_directories: causallm_layer_inc,
+    build_by_default: true,
+    install: false,
+  )
+
+  test('unittest_lora_backward_gradcheck', unittest_lora_backward_gradcheck,
+    args: '--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_lora_backward_gradcheck'),
+    timeout: 60,
+    suite: 'unittests'
+  )
+
   unittest_kv_cache_manager = executable(
     'unittest_kv_cache_manager',
     meson.source_root() / 'test' / 'unittest' / 'layers' / 'unittest_kv_cache_manager.cpp',

@@ -7,6 +7,7 @@
  * @brief  Implementation of RMS normalization function
  * @see    https://github.com/nntrainer/nntrainer
  * @author Seungbaek Hong <sb92.hong@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  * @note   This layer only supports inference mode.
  */
@@ -76,9 +77,17 @@ public:
   WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
 
   /**
+   * @copydoc Layer::calcGradient(RunLayerContext &context)
+   * @note Only invoked when the layer is trainable. Under LoRA-only
+   *       training gamma is frozen so this never runs; it exists so that
+   *       full fine-tuning (or a "LoRA + norms" recipe) can train gamma.
+   */
+  WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
+
+  /**
    * @copydoc bool supportBackwarding() const
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; };
+  WIN_EXPORT bool supportBackwarding() const override { return true; };
 
   /**
    * @copydoc Layer::exportTo(Exporter &exporter, ExportMethods method)
@@ -116,6 +125,14 @@ private:
              nntrainer::props::SkipPrefill>
     rms_props;
   bool skip_prefill = false;
+
+  /**
+   * @brief shared per-row RMS normalization compute used by both forwarding
+   *        (full sequence, [0, height)) and incremental_forwarding (decode
+   *        step, [from, to)).
+   */
+  void computeRMSNorm(nntrainer::RunLayerContext &context, unsigned int from,
+                      unsigned int to);
 };
 
 } // namespace causallm

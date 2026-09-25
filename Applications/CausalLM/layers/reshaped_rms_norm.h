@@ -7,6 +7,7 @@
  * @brief  Implementation of RMS normalization function with reshaping.
  * @see    https://github.com/nntrainer/nntrainer
  * @author Eunju Yang <ej.yang@samsung.com>
+ * @author Niket Agarwal <niket.a@samsung.com>
  * @bug    No known bugs except for NYI items
  * @note   This layer only supports inference mode.
  */
@@ -85,9 +86,16 @@ public:
   WIN_EXPORT void calcDerivative(nntrainer::RunLayerContext &context) override;
 
   /**
+   * @copydoc Layer::calcGradient(RunLayerContext &context)
+   * @note Only invoked when the layer is trainable; frozen under LoRA-only
+   *       training. No-op when use_gamma is false (no weight to train).
+   */
+  WIN_EXPORT void calcGradient(nntrainer::RunLayerContext &context) override;
+
+  /**
    * @copydoc bool supportBackwarding() const
    */
-  WIN_EXPORT bool supportBackwarding() const override { return false; };
+  WIN_EXPORT bool supportBackwarding() const override { return true; };
 
   /**
    * @copydoc Layer::exportTo(Exporter &exporter, ExportMethods method)
@@ -128,6 +136,14 @@ private:
   unsigned int feature_size;
   bool skip_prefill = false;
   bool use_gamma;
+
+  /**
+   * @brief shared per-chunk RMS normalization compute used by both
+   *        forwarding (full sequence, [0, height)) and
+   *        incremental_forwarding (decode step, [from, to)).
+   */
+  void computeRMSNorm(nntrainer::RunLayerContext &context, unsigned int from,
+                      unsigned int to);
 };
 
 } // namespace causallm
