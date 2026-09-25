@@ -31,7 +31,8 @@
  *                           nntr_config.json, and the .bin weight file.
  *
  *   Options:
- *     --output, -o <path> Output directory (default: <model_path>)
+ *     --output, -o <path> Output directory (default: generated from the
+ *                         dtype configuration and target ISA)
  *     --fc_dtype <type>   Target dtype for FC layers (default: Q4_0)
  *     --embd_dtype <type> Target dtype for embedding layer (default: FP32)
  *     --lmhead_dtype <type> Target dtype for LM head layer (default: FP32)
@@ -182,6 +183,17 @@ std::string toLower(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(),
                  [](unsigned char c) { return std::tolower(c); });
   return value;
+}
+
+/**
+ * @brief Generate the default output directory name
+ */
+std::string generateOutputDirectoryName(DataType fc_dtype, DataType embd_dtype,
+                                        DataType lmhead_dtype,
+                                        const std::string &target_isa) {
+  return "quantized_fc_" + toLower(dataTypeToStr(fc_dtype)) + "_embd_" +
+         toLower(dataTypeToStr(embd_dtype)) + "_lmhead_" +
+         toLower(dataTypeToStr(lmhead_dtype)) + "_isa_" + toLower(target_isa);
 }
 
 /**
@@ -404,7 +416,8 @@ void printUsage(const char *prog) {
     << "                          nntr_config.json, and .bin weight file\n"
     << "\n"
     << "Options:\n"
-    << "  --output, -o <path>   Output directory (default: <model_path>)\n"
+    << "  --output, -o <path>   Output directory (default: generated from\n"
+    << "                        dtype configuration and target ISA)\n"
     << "  --fc_dtype <type>     Target dtype for FC layers (default: Q4_0)\n"
     << "  --embd_dtype <type>   Target dtype for embedding (default: FP32)\n"
     << "  --lmhead_dtype <type> Target dtype for LM head (default: same as "
@@ -663,6 +676,7 @@ int main(int argc, char *argv[]) {
     json generation_cfg =
       causallm::LoadJsonFile(model_path + "/generation_config.json");
     json nntr_cfg = causallm::LoadJsonFile(model_path + "/nntr_config.json");
+    const json source_nntr_cfg = nntr_cfg;
 
     // If a target config is specified, read dtypes from it
     if (!target_config_path.empty()) {
@@ -700,9 +714,14 @@ int main(int argc, char *argv[]) {
                    "results.\n";
     }
 
-    // Setup output directory
+    // By default, keep quantized artifacts separate from the FP32 model while
+    // retaining an explicit --output path for callers that need another
+    // layout.
     if (output_dir.empty())
-      output_dir = model_path;
+      output_dir = (std::filesystem::path(model_path) /
+                    generateOutputDirectoryName(fc_dtype, embd_dtype,
+                                                lmhead_dtype, isa_str))
+                     .string();
     std::filesystem::create_directories(output_dir);
 
     // Determine output filename
@@ -829,7 +848,7 @@ int main(int argc, char *argv[]) {
     // =========================================================================
     std::cout << "[5/5] Generating nntr_config.json...\n";
 
-    json new_nntr_cfg = nntr_cfg;
+    json new_nntr_cfg = source_nntr_cfg;
     new_nntr_cfg["model_file_name"] = output_bin_name;
     new_nntr_cfg["fc_layer_dtype"] = dataTypeToStr(fc_dtype);
     new_nntr_cfg["embedding_dtype"] = dataTypeToStr(embd_dtype);
@@ -867,6 +886,9 @@ int main(int argc, char *argv[]) {
                                  "special_tokens_map.json",
                                  "vocab.json",
                                  "merges.txt",
+                                 "tokenizer.model",
+                                 "spiece.model",
+                                 "sentencepiece.bpe.model",
                                  "modules.json"};
       for (const char *fname : aux_files) {
         std::filesystem::path src = std::filesystem::path(model_path) / fname;
