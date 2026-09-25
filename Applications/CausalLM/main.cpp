@@ -17,6 +17,7 @@
  * @brief	This is a main file for CausalLM application
  * @see		https://github.com/nnstreamer/
  * @author	Eunju Yang <ej.yang@samsung.com>
+ * @author	Pranjal Thapliyal <p.thapliyal@samsung.com>
  * @bug		No known bugs except for NYI items
  *
  */
@@ -428,7 +429,14 @@ int main(int argc, char *argv[]) {
       return EXIT_FAILURE;
     }
     model->initialize();
-    model->load_weight(weight_file);
+    if (nntr_cfg.contains("lora_file_name") &&
+        !nntr_cfg["lora_file_name"].get<std::string>().empty()) {
+      const std::string lora_file =
+        model_path + "/" + nntr_cfg["lora_file_name"].get<std::string>();
+      model->load_weight_lora(weight_file, lora_file);
+    } else {
+      model->load_weight(weight_file);
+    }
     model->repack_weight();
 
     bool do_sample = generation_cfg.value("do_sample", false);

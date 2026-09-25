@@ -17,6 +17,7 @@
  * @brief	This is Fully Connected Layer Class for Neural Network
  * @see		https://github.com/nntrainer/nntrainer
  * @author	Jijoong Moon <jijoong.moon@samsung.com>
+ * @author	Anirudh Bocha <b.saianirud@samsung.com>
  * @bug		No known bugs except for NYI items
  *
  */
@@ -122,12 +123,12 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
 
   weight_idx[FCParams::weight] = context.requestWeight(
     weight_dim, weight_initializer, weight_regularizer,
-    weight_regularizer_constant, weight_decay, "weight", true);
+    weight_regularizer_constant, weight_decay, "weight", (lora_rank == 0));
 
   if (disable_bias.empty() || disable_bias.get() == false) {
     weight_idx[FCParams::bias] =
       context.requestWeight(bias_dim, bias_initializer, WeightRegularizer::NONE,
-                            1.0f, bias_decay, "bias", true);
+                            1.0f, bias_decay, "bias", (lora_rank == 0));
   }
 
   /** create weights for LoRA */
@@ -163,12 +164,24 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
                             context.getActivationDataType()),
       is_nchw ? 0b1011 : 0b1101);
 
+    /**
+     * @note Standard LoRA initialization (Hu et al. 2021): A is drawn from a
+     * zero-mean distribution and B is zero, so the adapter contributes
+     * B*A == 0 at step 0 and the pretrained model is reproduced exactly.
+     *
+     * The reverse assignment (A zero, B random) also gives B*A == 0, but is
+     * badly conditioned: with A == 0 the only non-zero gradient at step 0 is
+     * dL/dA = x^T (dy B^T) * scaling, i.e. the first update to A is steered
+     * entirely by the *random* B, so the initial step is a large step in an
+     * arbitrary direction. Empirically that made training diverge above
+     * lr ~1e-6 on Qwen3-0.6B, whereas this ordering is stable at 1e-4.
+     */
     lora_idx[LORAParams::loraA] = context.requestWeight(
-      loraA_dim, Initializer::ZEROS, weight_regularizer,
+      loraA_dim, Initializer::LECUN_NORMAL, weight_regularizer,
       weight_regularizer_constant, weight_decay, "loraA", true);
 
     lora_idx[LORAParams::loraB] = context.requestWeight(
-      loraB_dim, Initializer::LECUN_NORMAL, weight_regularizer,
+      loraB_dim, Initializer::ZEROS, weight_regularizer,
       weight_regularizer_constant, weight_decay, "loraB", true);
 
     lora_idx[LORAParams::loraTmp] =
@@ -266,17 +279,30 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   Tensor &weight = context.getWeight(weight_idx[FCParams::weight]);
   Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   Tensor &hidden_ = context.getOutput(SINGLE_INOUT_IDX);
-  Tensor loraA, loraB, hidden_tmp_lora, hidden_out_lora;
+  Tensor loraA, loraB;
+  TensorDim hidden_tmp_lora_dim, hidden_out_lora_dim;
 
   bool is_prefill = !from || (to - from) > 1;
   if (skip_prefill && is_prefill)
     return;
 
-  if (!std::get<props::LoraRank>(fc_props).empty()) {
+  const bool has_lora = !std::get<props::LoraRank>(fc_props).empty();
+  if (has_lora) {
     loraA = context.getWeight(lora_idx[LORAParams::loraA]);
     loraB = context.getWeight(lora_idx[LORAParams::loraB]);
-    hidden_tmp_lora = context.getTensor(lora_idx[LORAParams::loraTmp]);
-    hidden_out_lora = context.getTensor(lora_idx[LORAParams::loraOut]);
+    /**
+     * @note loraTmp/loraOut are requested with FORWARD_GRAD_LIFESPAN /
+     * FORWARD_FUNC_LIFESPAN, which are not allocated when the graph is
+     * compiled without a backward pass (pure inference). This function is
+     * the inference/decode path, so only shape metadata is read from them
+     * here (always valid, independent of data allocation); the actual
+     * scratch computation below uses freshly-allocated local tensors rather
+     * than a shared-data view into this possibly-unallocated storage.
+     */
+    hidden_tmp_lora_dim =
+      context.getTensor(lora_idx[LORAParams::loraTmp]).getDim();
+    hidden_out_lora_dim =
+      context.getTensor(lora_idx[LORAParams::loraOut]).getDim();
   }
 
   TensorDim input_dim = input_.getDim();
@@ -301,25 +327,19 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
 
     input_step.dot(weight, hidden_step, false, false);
 
-    if (!std::get<props::LoraRank>(fc_props).empty()) {
-      nntrainer::TensorDim hidden_tmp_lora_step_dim = hidden_tmp_lora.getDim();
+    if (has_lora) {
+      nntrainer::TensorDim hidden_tmp_lora_step_dim = hidden_tmp_lora_dim;
       hidden_tmp_lora_step_dim.batch(1);
       if (hidden_tmp_lora_step_dim.height() > 1)
         hidden_tmp_lora_step_dim.height(to - from);
 
-      nntrainer::TensorDim hidden_out_lora_step_dim = hidden_out_lora.getDim();
+      nntrainer::TensorDim hidden_out_lora_step_dim = hidden_out_lora_dim;
       hidden_out_lora_step_dim.batch(1);
       if (hidden_out_lora_step_dim.height() > 1)
         hidden_out_lora_step_dim.height(to - from);
 
-      nntrainer::Tensor hidden_tmp_lora_step =
-        hidden_tmp_lora.getSharedDataTensor(
-          hidden_tmp_lora_step_dim,
-          b * hidden_tmp_lora.height() * hidden_tmp_lora.width(), true);
-      nntrainer::Tensor hidden_out_lora_step =
-        hidden_out_lora.getSharedDataTensor(
-          hidden_out_lora_step_dim,
-          b * hidden_out_lora.height() * hidden_out_lora.width(), true);
+      nntrainer::Tensor hidden_tmp_lora_step(hidden_tmp_lora_step_dim, true);
+      nntrainer::Tensor hidden_out_lora_step(hidden_out_lora_step_dim, true);
 
       input_step.dot(loraA, hidden_tmp_lora_step, false, false);
       hidden_tmp_lora_step.dot(loraB, hidden_out_lora_step, false, false);

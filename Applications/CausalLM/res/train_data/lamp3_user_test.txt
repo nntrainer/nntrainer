@@ -1,0 +1,102 @@
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This knife, which is supposed to be a really good brand for the price: isnt. I am very disappointed in it. I have used it sparingly on only onions, garlic, and tomatoes. I have had it for a few months, and already it won't hold an edge. I can no longer slice tomatoes without it failing on the skin, or tearing them up trying to slice them! This is not worth the price paid!<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Not a PB fan, but needed it for a recipe.
+Chocolate PB Power balls from Strength and Sunshine..,. Awesome recipe!<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Wish it wasn't SO SPENDY! I use it to keep track of my gas and mileage for my job which requires me to drive my own vehicle. It would be nice to have the month all written up (the number of days of the month don't change from year to year except Feb), so I didn't have to write it in, as they don't give you more than 31 anyway..... but that isn't really an issue. But all in all, this does the job w<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This has a nap making it very slippery in one direction.
+It also leaches onto your skin, so your hands turn black from the black parts.
+NOT happy with this product, and would not buy again!<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: They are ok. Wish they were seasoned. Raw wood....guess Ill have to do it myself.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: These are nice looking pillowcases. I have not had them long enough to know how well they hold up to frequent washings, but will edit this as I find out. Since I am not using them for the normal use of pillowcases, but rather using them inside plastic tubs that hold grains, that review might be awhile. They are attractive, they feel nice and seem to be well made.<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Seems to be working well. I have a large older tub, and it barely fits the length for it ( @ 63 it is much longer than todays tubs which are about 6 inches shorter). I keep it outside the tub after showers, and wring the bottom out of water. The bottom has shortened, like I washed it, but thatt ok as I had the bar almost to the ceiling at first. The bottom is also wrinkled, because I wring it out <|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This fan tops out at barely 9  not counting the wire handle. That figures out to $8.58 per inch. WAAAAY TOO EXPENSIVE! I haven't been able to actually use it yet, but am thinking about returning it. I don't believe something this tiny can actually put out what they claim. It is all metal, but it seems to be pretty thin stuff...it has no weight to it, and it is not straight, so Im wondering if when<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Came with NO instructions as to how to put it together. I tried with the photo, but still had problems. There are very general instructions on how to use, but seriously? You put stuff in the hopper and use the handle and turn it to process....The hopper does not fit on the base, am I suppose to use a hammer ti get it to fit???? I guess you do get what you pay for, but instructions on how to put it<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I love these, but they are not available anymore. I wish they were, as I like to try out first, then decide if I want to purchase more. I do!!! I wanted to see how they washed and if they would lose structure and not fit, or unravel, etc., but they didnt. Sure wish I could buy more! I don't remember if they offered these in black, but Id buy the natural and the black again.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: These are nice, but I feel that the image is way too small, and it sits nearly at the base of the back, so no one can even see it when you aren't sitting on it. The last seat cover I had, the image was WAY at the top so that people could see it behind me as I sat in it, and was visible when not in the seat at all. That is the whole point of getting a cute seat cover like this...it's supposed to be<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I love it, because it makes me smile, but I won't use it!! Too likely to get you fired!!!!!<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Pretty plain and not very visible for detail. I wouldn't buy this again.<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I'm still debating this, as I only just got it and have only cooked rice in it. I DID note that the temperature seems to be a bit off. The recipes for rice said low heat, which I began with. After an hour, it didn't appear to be cooking AT ALL, (even though the outside was heated) so I re-adjusted to high, and .... WOW!!! WAY TOO HOT!!! (cooked 7 cups in under an hour! The liquid on the outside ed<|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: Although I am generally satisfied with this DVD, it said nowhere on the description that this was NOT the Widescreen Version.  They still make Full Screen?????)
+The seller was very prompt, and I have NO problems with them, but I AM dissatisfied that this did not state ANYWHERE that this was the Full Screen version.
+I looked on the box, and even there it is almost invisible. Why are the Widescreen <|im_end|>
+<|im_start|>assistant
+3
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I do like this book, but the description wasn't completely accurate. It said there were minor blemishes like worn pages, etc. the fact is, this book has a 1.5" long tear in the binding. It is still useable, but I would NOT say it is in good condition, but rather fair.<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: While this book might have some good information, it was supposed to be a revised, updated version of a 1952 book. It read like a book out of the 1800's. I could not get past the `ye auld-fashioned' wording to what might have been informative, useful information. Really update it, and it might be a good source of great stuff.<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I thought that being a Prime member and having a subscription to a product, I would be getting a GREAT price. Not so, apparently, as I an get this cheaper at a local store! The first shipment came with a good price, but it went up by $5 the next month. Shame!!!
+This 2 star is for Amazon for the above reasons, but the actual Tanka bar is great, and I give IT 4 stars. It would get a 5 if it were org<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This isn't stainless steel, it looks and feels more like silver plastic, which I don't want. The threaded insert would not hold the pump on, and I had to screw it on tighter with a pair of pliers and even that took several times before it held. I hope it will continue to hold as I don't want the pump part to fall into the jar. I seems to pump well, as some here have a misunderstanding regarding it<|im_end|>
+<|im_start|>assistant
+2
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This stomper works much better than jars or other `grab what you can to do the job' implements! I purchased it to make sauerkraut the old fashioned way in a crock, but found a great recipe in a book about fermenting which makes sauerkraut right in a canning jar. This fits perfectly inside a large mouth canning jar, and does the job much better than using a smaller jar to fit inside the larger one.<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: This appears to be a very good quality item. I rinse and dry immediately, and so far, it has held up nicely. Works well. It might be nice to have is a bit narrower to use in cups that are not wide. That is the only drawback I can see, and it is minor. I am glad I bought this!<|im_end|>
+<|im_start|>assistant
+5
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: I would have given it 4.5 stars if I could. the only reason I didn't give it a 5 is because it is a bit taller than I wanted.
+
+I have another one almost exactly like it that sits a bit lower so the center of gravity is lower to avoid having it tip over if it is put where it *really shouldnt* be (like a soft hassock).
+
+I actually have had no issues with it tipping, but because it is taller, it intr<|im_end|>
+<|im_start|>assistant
+4
+<|im_start|>user
+What is the score of the following review on a scale of 1 to 5? Just answer with 1, 2, 3, 4, or 5 without further explanation. review: These are perfect! They look very nice, and are sturdy, not thin. I make a lot of concoctions where I cant use a metal anything. And I don't do plastic. I have some wooden ones, which I also love, but sometimes I don't want to use wooden. These fit the bill so well! I have already ordered two more sets.<|im_end|>
+<|im_start|>assistant
+5
