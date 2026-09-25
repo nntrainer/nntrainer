@@ -82,7 +82,8 @@ Tensor GptOssForCausalLM::createAttention(const int layer_id, int seq_len,
      withKey("use_sink", "true"),
      withKey("rope_scaling_factor", ATTENTION_ROPE_SCALING_FACTOR),
      withKey("rope_scaling_type", "yarn"),
-     withKey("rope_scaling_max_position_embeddings", 4096)}));
+     withKey("rope_scaling_max_position_embeddings", 4096),
+     withKey("use_gemm_attention", USE_FLASH_ATTENTION ? "true" : "false")}));
   Tensor a = mha({q, k, v, cache_k, cache_v});
 
   // O layer

@@ -1229,14 +1229,14 @@ void ele_add(const unsigned int N, const float *X, const float *Y, float *Z,
 }
 
 static inline __m256 exp256_ps(__m256 x) {
-  /*  Low-Precision Version I*/
+  /** Low-Precision Version I */
   // const __m256 c1 = _mm256_set1_ps(12102203.0f);
   // const __m256 c2 = _mm256_set1_ps(1065353216.0f);
   // __m256 fx = _mm256_add_ps(_mm256_mul_ps(x, c1),c2);
   // return _mm256_castsi256_ps(_mm256_cvtps_epi32(fx));
 
-  /* Low-Precision Version II*/
-  /*    const __m256 ln2 = _mm256_set1_ps(0.69314718056f);
+  /** Low-Precision Version II */
+  /**   const __m256 ln2 = _mm256_set1_ps(0.69314718056f);
     const __m256 inv_ln2 = _mm256_set1_ps(1.44269504089f); // 1 / ln(2)
 
     // Range reduction: x = n * ln2 + r,  where n is integer and |r| <= ln2/2
@@ -1273,7 +1273,7 @@ static inline __m256 exp256_ps(__m256 x) {
 
     return _mm256_mul_ps(y, pow2n);
   */
-  /* Low-Precision Versino III */
+  /** Low-Precision Version III */
   const __m256 LOG2EF = _mm256_set1_ps(1.44269504088896341f); // 1 / ln(2)
   const __m256 LN2 = _mm256_set1_ps(0.6931471805599453f);     // ln(2)
 
@@ -1629,7 +1629,7 @@ void compute_fp16vcache_fp32_transposed(int row_num, const float *in,
   for (int n = head_start; n < actual_head_end; ++n) {
     int rem = head_dim % 8;
 
-    /* Declaration: std::vector<__m256> sumVec(num_blocks * gqa_size,
+    /** Declaration: std::vector<__m256> sumVec(num_blocks * gqa_size,
      * _mm256_setzero_ps()); caused warning: ignoring attributes on template
      * argument ‘__m256’ [-Wignored-attributes].
      * So it is implemented that way.
@@ -2519,6 +2519,126 @@ void causal_depthwise_conv1d_k3_decode(const float *x_cur,
     y_cur[c] = w0[c] * x_cur[c] + w1[c] * s1[c] + w2[c] * s0[c];
     state[c] = s1[c];        // s0 <- s1
     state[W + c] = x_cur[c]; // s1 <- x_cur
+  }
+}
+
+// Fused FP32 x FP16-bits -> FP32 GEMM (AVX2 + F16C). Equivalent of ARM shgemm
+// but reads FP16-bits (uint16_t) directly without materializing an FP32 copy
+// of B — saves the temporary buffer and halves memory traffic compared to
+// {convert+sgemm}. Row-major only, alpha applied, beta hard-coded to 0 to keep
+// the kernel small (this is all the flash path needs).
+//
+// Two operand layouts:
+//   TransB=true  (QK): C[m, n] = alpha * sum_k A[m,k] * fp16(B[n,k])
+//                       B is N rows x K cols, row-major, ldb columns
+//   TransB=false (AV): C[m, n] = alpha * sum_k A[m,k] * fp16(B[k,n])
+//                       B is K rows x N cols, row-major, ldb columns
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2,f16c,fma")))
+#endif
+void hsgemm_fp16bits_avx2(unsigned int M, unsigned int N, unsigned int K,
+                     float alpha, const float *A, unsigned int lda,
+                     const uint16_t *B, unsigned int ldb, bool TransB, float *C,
+                     unsigned int ldc) {
+  const __m256 valpha = _mm256_set1_ps(alpha);
+  if (TransB) {
+    // QK path. Block 4 m-rows so we amortize the B (K-row) conversion across 4
+    // accumulators per inner k-step.
+    unsigned int m = 0;
+    for (; m + 4 <= M; m += 4) {
+      const float *a0 = A + (size_t)(m + 0) * lda;
+      const float *a1 = A + (size_t)(m + 1) * lda;
+      const float *a2 = A + (size_t)(m + 2) * lda;
+      const float *a3 = A + (size_t)(m + 3) * lda;
+      for (unsigned int n = 0; n < N; ++n) {
+        const uint16_t *b_row = B + (size_t)n * ldb;
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+        unsigned int k = 0;
+        for (; k + 8 <= K; k += 8) {
+          __m256 b =
+            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b_row + k)));
+          acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a0 + k), b, acc0);
+          acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a1 + k), b, acc1);
+          acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a2 + k), b, acc2);
+          acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a3 + k), b, acc3);
+        }
+        // Horizontal-reduce 4 accumulators in parallel via two hadd-pairs.
+        // acc0 = [s00 s01 s02 s03 | s04 s05 s06 s07] -> partial sums
+        __m256 h01 = _mm256_hadd_ps(acc0, acc1);
+        __m256 h23 = _mm256_hadd_ps(acc2, acc3);
+        __m256 h = _mm256_hadd_ps(h01, h23);
+        // h lanes: [s0_lo s1_lo s2_lo s3_lo | s0_hi s1_hi s2_hi s3_hi]
+        __m128 lo = _mm256_castps256_ps128(h);
+        __m128 hi = _mm256_extractf128_ps(h, 1);
+        __m128 sums = _mm_add_ps(lo, hi); // [s0 s1 s2 s3]
+        float s[4];
+        _mm_storeu_ps(s, sums);
+        // tail k
+        for (; k < K; ++k) {
+          const float bv = nntrainer::compute_fp16_to_fp32(b_row[k]);
+          s[0] += a0[k] * bv;
+          s[1] += a1[k] * bv;
+          s[2] += a2[k] * bv;
+          s[3] += a3[k] * bv;
+        }
+        C[(size_t)(m + 0) * ldc + n] = alpha * s[0];
+        C[(size_t)(m + 1) * ldc + n] = alpha * s[1];
+        C[(size_t)(m + 2) * ldc + n] = alpha * s[2];
+        C[(size_t)(m + 3) * ldc + n] = alpha * s[3];
+      }
+    }
+    // m tail (unblocked)
+    for (; m < M; ++m) {
+      const float *a_row = A + (size_t)m * lda;
+      for (unsigned int n = 0; n < N; ++n) {
+        const uint16_t *b_row = B + (size_t)n * ldb;
+        __m256 acc = _mm256_setzero_ps();
+        unsigned int k = 0;
+        for (; k + 8 <= K; k += 8) {
+          __m256 a = _mm256_loadu_ps(a_row + k);
+          __m256 b =
+            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b_row + k)));
+          acc = _mm256_fmadd_ps(a, b, acc);
+        }
+        __m128 lo = _mm256_castps256_ps128(acc);
+        __m128 hi = _mm256_extractf128_ps(acc, 1);
+        __m128 s = _mm_add_ps(lo, hi);
+        s = _mm_hadd_ps(s, s);
+        s = _mm_hadd_ps(s, s);
+        float sum = _mm_cvtss_f32(s);
+        for (; k < K; ++k)
+          sum += a_row[k] * nntrainer::compute_fp16_to_fp32(b_row[k]);
+        C[(size_t)m * ldc + n] = alpha * sum;
+      }
+    }
+  } else {
+    // AV path. Block n in 8-wide vector lanes; broadcast A[m,k] inside loop.
+    for (unsigned int m = 0; m < M; ++m) {
+      const float *a_row = A + (size_t)m * lda;
+      float *c_row = C + (size_t)m * ldc;
+      unsigned int n = 0;
+      for (; n + 8 <= N; n += 8) {
+        __m256 acc = _mm256_setzero_ps();
+        for (unsigned int k = 0; k < K; ++k) {
+          __m256 a_b = _mm256_set1_ps(a_row[k]);
+          __m256 b = _mm256_cvtph_ps(
+            _mm_loadu_si128((const __m128i *)(B + (size_t)k * ldb + n)));
+          acc = _mm256_fmadd_ps(a_b, b, acc);
+        }
+        _mm256_storeu_ps(c_row + n, _mm256_mul_ps(valpha, acc));
+      }
+      // n tail
+      for (; n < N; ++n) {
+        float sum = 0.0f;
+        for (unsigned int k = 0; k < K; ++k)
+          sum +=
+            a_row[k] * nntrainer::compute_fp16_to_fp32(B[(size_t)k * ldb + n]);
+        c_row[n] = alpha * sum;
+      }
+    }
   }
 }
 

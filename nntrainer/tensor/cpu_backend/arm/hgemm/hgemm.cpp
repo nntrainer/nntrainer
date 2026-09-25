@@ -195,3 +195,147 @@ void hgemm_K1(const __fp16 *A, const __fp16 *B, __fp16 *C, unsigned int M,
     }
   }
 }
+
+// QK micro-kernel for the FP16-query + FP32-score attention path.
+// Computes S[m, n] = alpha * sum_k A[m, k] * B[n, k]   (TransB-style dot)
+// using ARMv8.2-A FMLAL (vfmlalq_low/high_f16): each pair of intrinsics
+// widens 8 FP16 products into two FP32 accumulators, so the per-element
+// product is computed in FP32 from the start. This avoids the FP16-product
+// overflow that an FP16-accumulating kernel hits when packing wide encoder
+// logits (Q,K magnitudes ~400 -> products ~160k > FP16 max 65504), and unlike
+// a cast-up-Q+shgemm path it never materialises an FP32 copy of Q.
+//
+// Layout: A row-major (M rows, lda cols), B row-major (N rows, ldb cols),
+// C row-major (M rows, ldc cols). Inner length K is the dot length and
+// must match both A's and B's stride argument (i.e. lda == ldb == K when
+// the rows are contiguous).
+//
+// Requires FEAT_FHM (asimdfhm in /proc/cpuinfo). The "+feature" target
+// attribute form adds these ISA extensions on top of whatever -march the TU
+// is built with, rather than pinning the function to "arch=armv8.2-a" (which
+// would silently downgrade codegen -- and break builds targeting a stricter
+// baseline like armv9.2-a).
+// Single-output FP16xFP16->FP32 dot, used for the M/N tails of the blocked
+// kernel below. The 4x2 block reproduces this exact accumulation order per
+// output, so blocked and tail results are bit-identical (no token drift).
+__attribute__((target("+fp16+fp16fml+dotprod+i8mm"))) static inline float
+fmlal_dot_one(const __fp16 *a_row, const __fp16 *b_row, unsigned int K) {
+  float32x4_t acc0 = vdupq_n_f32(0.0f);
+  float32x4_t acc1 = vdupq_n_f32(0.0f);
+  unsigned int k = 0;
+  for (; k + 16 <= K; k += 16) {
+    float16x8_t a0 = vld1q_f16(a_row + k);
+    float16x8_t b0 = vld1q_f16(b_row + k);
+    float16x8_t a1 = vld1q_f16(a_row + k + 8);
+    float16x8_t b1 = vld1q_f16(b_row + k + 8);
+    acc0 = vfmlalq_low_f16(acc0, a0, b0);
+    acc1 = vfmlalq_high_f16(acc1, a0, b0);
+    acc0 = vfmlalq_low_f16(acc0, a1, b1);
+    acc1 = vfmlalq_high_f16(acc1, a1, b1);
+  }
+  if (k + 8 <= K) {
+    float16x8_t a0 = vld1q_f16(a_row + k);
+    float16x8_t b0 = vld1q_f16(b_row + k);
+    acc0 = vfmlalq_low_f16(acc0, a0, b0);
+    acc1 = vfmlalq_high_f16(acc1, a0, b0);
+    k += 8;
+  }
+  float sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+  for (; k < K; ++k)
+    sum += (float)a_row[k] * (float)b_row[k];
+  return sum;
+}
+
+// QK GEMM: C[m,n] = alpha * sum_k A[m,k]*B[n,k] (FP16 in, FP32 out).
+// 4x2 (M x N) register-blocked: each k-step loads 4 A-rows and 2 B-rows once
+// and reuses them across the 8 outputs of the tile, cutting the naive kernel's
+// per-(m,n) reloads of B by 4x and of A by 2x. Per-output accumulation order
+// is identical to fmlal_dot_one(), so output is bit-identical to the previous
+// naive triple-loop. M/N remainders fall back to fmlal_dot_one().
+__attribute__((target("+fp16+fp16fml+dotprod+i8mm"))) void
+hgemm_f16xf16_f32_fmlal(const __fp16 *A, const __fp16 *B, float *C,
+                        unsigned int M, unsigned int N, unsigned int K,
+                        float alpha, unsigned int lda, unsigned int ldb,
+                        unsigned int ldc) {
+  unsigned int m = 0;
+  for (; m + 4 <= M; m += 4) {
+    const __fp16 *ar[4] = {A + (size_t)(m + 0) * lda, A + (size_t)(m + 1) * lda,
+                           A + (size_t)(m + 2) * lda,
+                           A + (size_t)(m + 3) * lda};
+    float *cr[4] = {C + (size_t)(m + 0) * ldc, C + (size_t)(m + 1) * ldc,
+                    C + (size_t)(m + 2) * ldc, C + (size_t)(m + 3) * ldc};
+    unsigned int n = 0;
+    for (; n + 2 <= N; n += 2) {
+      const __fp16 *br[2] = {B + (size_t)(n + 0) * ldb,
+                             B + (size_t)(n + 1) * ldb};
+      float32x4_t lo[4][2], hi[4][2];
+      for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 2; ++j) {
+          lo[i][j] = vdupq_n_f32(0.0f);
+          hi[i][j] = vdupq_n_f32(0.0f);
+        }
+      unsigned int k = 0;
+      for (; k + 16 <= K; k += 16) {
+        float16x8_t Alo[4], Ahi[4], Blo[2], Bhi[2];
+        for (int i = 0; i < 4; ++i) {
+          Alo[i] = vld1q_f16(ar[i] + k);
+          Ahi[i] = vld1q_f16(ar[i] + k + 8);
+        }
+        for (int j = 0; j < 2; ++j) {
+          Blo[j] = vld1q_f16(br[j] + k);
+          Bhi[j] = vld1q_f16(br[j] + k + 8);
+        }
+        for (int i = 0; i < 4; ++i)
+          for (int j = 0; j < 2; ++j) {
+            lo[i][j] = vfmlalq_low_f16(lo[i][j], Alo[i], Blo[j]);
+            hi[i][j] = vfmlalq_high_f16(hi[i][j], Alo[i], Blo[j]);
+            lo[i][j] = vfmlalq_low_f16(lo[i][j], Ahi[i], Bhi[j]);
+            hi[i][j] = vfmlalq_high_f16(hi[i][j], Ahi[i], Bhi[j]);
+          }
+      }
+      if (k + 8 <= K) {
+        float16x8_t Alo[4], Blo[2];
+        for (int i = 0; i < 4; ++i)
+          Alo[i] = vld1q_f16(ar[i] + k);
+        for (int j = 0; j < 2; ++j)
+          Blo[j] = vld1q_f16(br[j] + k);
+        for (int i = 0; i < 4; ++i)
+          for (int j = 0; j < 2; ++j) {
+            lo[i][j] = vfmlalq_low_f16(lo[i][j], Alo[i], Blo[j]);
+            hi[i][j] = vfmlalq_high_f16(hi[i][j], Alo[i], Blo[j]);
+          }
+        k += 8;
+      }
+      for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 2; ++j) {
+          float sum = vaddvq_f32(vaddq_f32(lo[i][j], hi[i][j]));
+          for (unsigned int kk = k; kk < K; ++kk)
+            sum += (float)ar[i][kk] * (float)br[j][kk];
+          cr[i][n + j] = alpha * sum;
+        }
+    }
+    // N remainder (n < N): 4 outputs per column via the scalar-order helper.
+    for (; n < N; ++n) {
+      const __fp16 *b_row = B + (size_t)n * ldb;
+      for (int i = 0; i < 4; ++i)
+        cr[i][n] = alpha * fmlal_dot_one(ar[i], b_row, K);
+    }
+  }
+  // M remainder (m < M): naive per (m, n).
+  for (; m < M; ++m) {
+    const __fp16 *a_row = A + (size_t)m * lda;
+    float *c_row = C + (size_t)m * ldc;
+    for (unsigned int n = 0; n < N; ++n)
+      c_row[n] = alpha * fmlal_dot_one(a_row, B + (size_t)n * ldb, K);
+  }
+}
+
+#include <sys/auxv.h>
+#ifndef HWCAP_ASIMDFHM
+#define HWCAP_ASIMDFHM (1 << 23)
+#endif
+
+bool hgemm_fp16fml_supported() {
+  static const bool supported = (getauxval(AT_HWCAP) & HWCAP_ASIMDFHM) != 0;
+  return supported;
+}

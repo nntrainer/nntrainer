@@ -1096,9 +1096,9 @@ unsigned int isamax(const unsigned int N, const __fp16 *X) {
   return retIdx;
 }
 
-void custom_hgemm(const __fp16 *A, const __fp16 *B, __fp16 *C, uint32_t M,
-                  uint32_t N, uint32_t K, float alpha, float beta, bool TransA,
-                  bool TransB) {
+void hgemm_f16xf16_f16(const __fp16 *A, const __fp16 *B, __fp16 *C, uint32_t M,
+                       uint32_t N, uint32_t K, float alpha, float beta,
+                       bool TransA, bool TransB) {
   hgemm(A, B, C, M, N, K, alpha, beta, TransA, TransB);
 }
 

@@ -25,6 +25,26 @@
 #include <fallback.h>
 #endif
 
+// Surface the FP16 / flash-attention GEMM kernels so consumers can reach them
+// through <cpu_backend.h>. They are declared outside ENABLE_FP16 in their
+// per-arch headers, so this works even for translation units built with
+// ENABLE_FP16=0 (e.g. the CausalLM flash-attention path in mha_core.cpp); the
+// definitions live in libnntrainer (built ENABLE_FP16=1) and resolve at link
+// time. See docs/flash-attention.md.
+//
+// The ARM branch additionally requires ENABLE_FP16 or
+// __ARM_FEATURE_FP16_VECTOR_ARITHMETIC (set only when the compiler targets
+// -march=...+fp16): hgemm.h and neon_impl.h declare bare __fp16 signatures,
+// which is not a usable type on ARM targets built without that extension
+// (e.g. Tizen armv7l/aarch64, which do not support fp16 NEON).
+#if !defined(__x86_64__) && !defined(__i386__) && defined(__ARM_NEON) &&       \
+  (defined(ENABLE_FP16) || defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC))
+#include <hgemm.h>     // hgemm_f16xf16_f32_fmlal (QK, FMLAL)
+#include <neon_impl.h> // nntrainer::neon::hgemm_f16xf16_f16 (AV) + exp_ps
+#elif defined(__x86_64__) || defined(__i386__)
+#include <avx2_impl.h> // nntrainer::avx2::hsgemm_fp16bits_avx2 (QK + AV)
+#endif
+
 // Expose the ComputeOps dispatch table (and init_backend declaration) to any
 // consumer that already includes cpu_backend.h.
 #include <compute_ops.h>
