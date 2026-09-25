@@ -809,6 +809,87 @@ TEST(nntrainer_cpu_backend_standalone, ele_mul_3072_istr_1) {
   run_ele_mul_test(N, alpha, beta, i_stride, o_stride);
 }
 
+static void run_layer_norm_wrt_width_test(size_t height, size_t width) {
+  constexpr float epsilon = 1e-6f;
+  std::vector<float> input =
+    generate_random_vector<float, false>(height * width);
+  std::vector<float> gamma = generate_random_vector<float, false>(width);
+  std::vector<float> beta = generate_random_vector<float, false>(width);
+  std::vector<float> output(height * width);
+  std::vector<float> reference(height * width);
+
+  for (size_t h = 0; h < height; ++h) {
+    const float *row = input.data() + h * width;
+    float mean = 0.0f;
+    for (size_t w = 0; w < width; ++w)
+      mean += row[w];
+    mean /= static_cast<float>(width);
+    float variance = 0.0f;
+    for (size_t w = 0; w < width; ++w) {
+      const float deviation = row[w] - mean;
+      variance += deviation * deviation;
+    }
+    variance /= static_cast<float>(width);
+    const float inv_std_dev = 1.0f / std::sqrt(variance + epsilon);
+    for (size_t w = 0; w < width; ++w)
+      reference[h * width + w] =
+        (row[w] - mean) * inv_std_dev * gamma[w] + beta[w];
+  }
+
+  nntrainer::layer_norm_wrt_width_fp32_intrinsic(input.data(), output.data(),
+                                                 gamma.data(), beta.data(),
+                                                 height, width, epsilon);
+
+  for (size_t i = 0; i < output.size(); ++i)
+    EXPECT_NEAR(output[i], reference[i], 1e-5f);
+}
+
+TEST(nntrainer_cpu_backend_standalone, layer_norm_wrt_width_fp32_tail) {
+  run_layer_norm_wrt_width_test(5, 769);
+}
+
+#ifdef ENABLE_FP16
+TEST(nntrainer_cpu_backend_standalone, layer_norm_wrt_width_fp16_tail) {
+  constexpr size_t height = 5;
+  constexpr size_t width = 769;
+  constexpr float epsilon = 1e-6f;
+  std::vector<float> input_fp32 =
+    generate_random_vector<float, false>(height * width);
+  std::vector<float> gamma = generate_random_vector<float, false>(width);
+  std::vector<float> beta = generate_random_vector<float, false>(width);
+  std::vector<_FP16> input(height * width);
+  for (size_t i = 0; i < input.size(); ++i)
+    input[i] = static_cast<_FP16>(input_fp32[i]);
+  std::vector<_FP16> output(height * width);
+
+  nntrainer::layer_norm_wrt_width_fp16_intrinsic(input.data(), output.data(),
+                                                 gamma.data(), beta.data(),
+                                                 height, width, epsilon);
+
+  for (size_t h = 0; h < height; ++h) {
+    float mean = 0.0f;
+    for (size_t w = 0; w < width; ++w)
+      mean += static_cast<float>(input[h * width + w]);
+    mean /= static_cast<float>(width);
+    float variance = 0.0f;
+    for (size_t w = 0; w < width; ++w) {
+      const float deviation = static_cast<float>(input[h * width + w]) - mean;
+      variance += deviation * deviation;
+    }
+    variance /= static_cast<float>(width);
+    const float inv_std_dev = 1.0f / std::sqrt(variance + epsilon);
+    for (size_t w = 0; w < width; ++w) {
+      const float normalized =
+        (static_cast<float>(input[h * width + w]) - mean) * inv_std_dev;
+      const _FP16 reference =
+        static_cast<_FP16>(normalized * gamma[w] + beta[w]);
+      EXPECT_NEAR(static_cast<float>(output[h * width + w]),
+                  static_cast<float>(reference), 0.004f);
+    }
+  }
+}
+#endif
+
 TEST(nntrainer_cpu_backend_standalone, ele_mul_3072_istr_16_ostr_16) {
   const unsigned int N = 3072;
   const float alpha = 3.f;

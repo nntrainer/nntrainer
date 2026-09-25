@@ -2317,6 +2317,72 @@ void rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
 }
 
 template <>
+void layer_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
+                                         _FP16 *__restrict Y,
+                                         const float *__restrict gamma,
+                                         const float *__restrict beta, size_t H,
+                                         size_t W, float epsilon) {
+  for (size_t h = 0; h < H; ++h) {
+    const _FP16 *row_x = X + h * W;
+    _FP16 *row_y = Y + h * W;
+    size_t w = 0;
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    for (; w + 8 <= W; w += 8) {
+      const float16x8_t input = vld1q_f16(row_x + w);
+      sum0 = vaddq_f32(sum0, vcvt_f32_f16(vget_low_f16(input)));
+      sum1 = vaddq_f32(sum1, vcvt_f32_f16(vget_high_f16(input)));
+    }
+    float sum = vaddvq_f32(vaddq_f32(sum0, sum1));
+    for (; w < W; ++w)
+      sum += static_cast<float>(row_x[w]);
+    const float mean = sum / static_cast<float>(W);
+    const float32x4_t mean_v = vdupq_n_f32(mean);
+
+    w = 0;
+    float32x4_t variance0 = vdupq_n_f32(0.0f);
+    float32x4_t variance1 = vdupq_n_f32(0.0f);
+    for (; w + 8 <= W; w += 8) {
+      const float16x8_t input = vld1q_f16(row_x + w);
+      const float32x4_t deviation0 =
+        vsubq_f32(vcvt_f32_f16(vget_low_f16(input)), mean_v);
+      const float32x4_t deviation1 =
+        vsubq_f32(vcvt_f32_f16(vget_high_f16(input)), mean_v);
+      variance0 = vfmaq_f32(variance0, deviation0, deviation0);
+      variance1 = vfmaq_f32(variance1, deviation1, deviation1);
+    }
+    float variance = vaddvq_f32(vaddq_f32(variance0, variance1));
+    for (; w < W; ++w) {
+      const float deviation = static_cast<float>(row_x[w]) - mean;
+      variance += deviation * deviation;
+    }
+    const float inv_std_dev =
+      1.0f / std::sqrt(variance / static_cast<float>(W) + epsilon);
+    const float32x4_t inv_std_dev_v = vdupq_n_f32(inv_std_dev);
+
+    w = 0;
+    for (; w + 8 <= W; w += 8) {
+      const float16x8_t input = vld1q_f16(row_x + w);
+      float32x4_t normalized0 = vmulq_f32(
+        vsubq_f32(vcvt_f32_f16(vget_low_f16(input)), mean_v), inv_std_dev_v);
+      float32x4_t normalized1 = vmulq_f32(
+        vsubq_f32(vcvt_f32_f16(vget_high_f16(input)), mean_v), inv_std_dev_v);
+      normalized0 =
+        vfmaq_f32(vld1q_f32(beta + w), normalized0, vld1q_f32(gamma + w));
+      normalized1 = vfmaq_f32(vld1q_f32(beta + w + 4), normalized1,
+                              vld1q_f32(gamma + w + 4));
+      vst1q_f16(row_y + w, vcombine_f16(vcvt_f16_f32(normalized0),
+                                        vcvt_f16_f32(normalized1)));
+    }
+    for (; w < W; ++w) {
+      const float normalized =
+        (static_cast<float>(row_x[w]) - mean) * inv_std_dev;
+      row_y[w] = static_cast<_FP16>(normalized * gamma[w] + beta[w]);
+    }
+  }
+}
+
+template <>
 void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,
                                        float epsilon) {

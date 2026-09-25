@@ -1196,6 +1196,9 @@ void __fallback_compute_rotary_emb_value(unsigned int width, unsigned int dim,
 void __fallback_rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
                                                   float *__restrict Y, size_t H,
                                                   size_t W, float epsilon);
+void __fallback_layer_norm_wrt_width_fp32_intrinsic(
+  const float *__restrict X, float *__restrict Y, const float *__restrict gamma,
+  const float *__restrict beta, size_t H, size_t W, float epsilon);
 /**
  * @brief rms normalization computation w.r.t. width in H*W matrix input
  *
@@ -1209,6 +1212,11 @@ template <typename T = float>
 void __fallback_rms_norm_wrt_width_fp16_intrinsic(const T *__restrict X,
                                                   T *__restrict Y, size_t H,
                                                   size_t W, float epsilon);
+#ifdef ENABLE_FP16
+void __fallback_layer_norm_wrt_width_fp16_intrinsic(
+  const _FP16 *__restrict X, _FP16 *__restrict Y, const float *__restrict gamma,
+  const float *__restrict beta, size_t H, size_t W, float epsilon);
+#endif
 /**
  * @brief fallback for clamping function.
  *

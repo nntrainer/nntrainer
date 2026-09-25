@@ -651,6 +651,30 @@ void __fallback_rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
   }
 }
 
+void __fallback_layer_norm_wrt_width_fp32_intrinsic(
+  const float *__restrict X, float *__restrict Y, const float *__restrict gamma,
+  const float *__restrict beta, size_t H, size_t W, float epsilon) {
+  for (size_t h = 0; h < H; ++h) {
+    const float *row_x = X + h * W;
+    float *row_y = Y + h * W;
+    float mean = 0.0f;
+    for (size_t w = 0; w < W; ++w)
+      mean += row_x[w];
+    mean /= static_cast<float>(W);
+
+    float variance = 0.0f;
+    for (size_t w = 0; w < W; ++w) {
+      const float deviation = row_x[w] - mean;
+      variance += deviation * deviation;
+    }
+    variance /= static_cast<float>(W);
+    const float inv_std_dev = 1.0f / std::sqrt(variance + epsilon);
+
+    for (size_t w = 0; w < W; ++w)
+      row_y[w] = (row_x[w] - mean) * inv_std_dev * gamma[w] + beta[w];
+  }
+}
+
 template <>
 void __fallback_rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
                                                   float *__restrict Y, size_t H,

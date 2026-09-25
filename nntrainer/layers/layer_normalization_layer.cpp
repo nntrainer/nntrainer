@@ -22,6 +22,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <thread_manager.h>
 #include <util_func.h>
 
 namespace nntrainer {
@@ -37,6 +38,52 @@ enum LNParams {
   temp_origin_size,
   temp_normalized_size,
 };
+
+static void layerNormWrtWidthParallel(const Tensor &input, Tensor &output,
+                                      const Tensor &gamma, const Tensor &beta,
+                                      size_t rows, size_t width,
+                                      float epsilon) {
+  auto &thread_manager = ThreadManager::Global();
+  const size_t thread_count = thread_manager.getComputeThreadCount();
+  const size_t tasks = rows >= 4 ? std::min(rows, thread_count) : 1;
+
+  auto run_rows = [&](size_t task) {
+    const size_t row_begin = rows * task / tasks;
+    const size_t row_end = rows * (task + 1) / tasks;
+    if (input.getDataType() == TensorDim::DataType::FP32) {
+      layer_norm_wrt_width_fp32_intrinsic(
+        input.getData<float>() + row_begin * width,
+        output.getData<float>() + row_begin * width, gamma.getData<float>(),
+        beta.getData<float>(), row_end - row_begin, width, epsilon);
+    } else {
+#ifdef ENABLE_FP16
+      layer_norm_wrt_width_fp16_intrinsic(
+        input.getData<_FP16>() + row_begin * width,
+        output.getData<_FP16>() + row_begin * width, gamma.getData<float>(),
+        beta.getData<float>(), row_end - row_begin, width, epsilon);
+#endif
+    }
+  };
+
+  thread_manager.parallel_for(0, tasks, run_rows);
+}
+
+static bool supportsLayerNormWrtWidthFastPath(
+  const Tensor &input, const Tensor &output, const Tensor &gamma,
+  const Tensor &beta, const std::vector<unsigned int> &normalize_axes) {
+  const auto input_type = input.getDataType();
+  bool supported_input_type = input_type == TensorDim::DataType::FP32;
+#ifdef ENABLE_FP16
+  supported_input_type =
+    supported_input_type || input_type == TensorDim::DataType::FP16;
+#endif
+  return normalize_axes.size() == 1 &&
+         normalize_axes[0] == TensorDim::getNumDim() - 1 &&
+         input.getContiguous() && output.getContiguous() &&
+         gamma.getDataType() == TensorDim::DataType::FP32 &&
+         beta.getDataType() == TensorDim::DataType::FP32 &&
+         supported_input_type;
+}
 
 LayerNormalizationLayer::LayerNormalizationLayer() :
   Layer(),
@@ -147,6 +194,14 @@ void LayerNormalizationLayer::forwarding(RunLayerContext &context,
   Tensor &temp_full_size = output;
   Tensor &temp_norm_size = inv_std_dev;
 
+  if (!training && supportsLayerNormWrtWidthFastPath(input, output, gamma, beta,
+                                                     normalize_axes)) {
+    const size_t width = input.width();
+    const size_t rows = input.size() / width;
+    layerNormWrtWidthParallel(input, output, gamma, beta, rows, width, epsilon);
+    return;
+  }
+
   input.average(normalize_axes, temp_norm_size);
   input.subtract(temp_norm_size, deviation);
 
@@ -202,6 +257,30 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
 
   Tensor &temp_full_size = output;
   Tensor &temp_norm_size = inv_std_dev;
+
+  if (!training && supportsLayerNormWrtWidthFastPath(input, output, gamma, beta,
+                                                     normalize_axes)) {
+    const size_t width = input_dim.width();
+    const size_t rows_per_bc = to - from;
+    const size_t feature_len = input_dim.getFeatureLen();
+    for (unsigned int b = 0; b < input_dim.batch(); ++b) {
+      for (unsigned int c = 0; c < input_dim.channel(); ++c) {
+        const size_t offset =
+          static_cast<size_t>(b) * feature_len +
+          static_cast<size_t>(c) * input_dim.height() * width +
+          static_cast<size_t>(from) * width;
+        Tensor input_rows = input.getSharedDataTensor(
+          TensorDim(1, 1, rows_per_bc, width, input.getTensorType()), offset,
+          true);
+        Tensor output_rows = output.getSharedDataTensor(
+          TensorDim(1, 1, rows_per_bc, width, output.getTensorType()), offset,
+          true);
+        layerNormWrtWidthParallel(input_rows, output_rows, gamma, beta,
+                                  rows_per_bc, width, epsilon);
+      }
+    }
+    return;
+  }
 
   input.average(normalize_axes, temp_norm_size);
   input.subtract(temp_norm_size, deviation);

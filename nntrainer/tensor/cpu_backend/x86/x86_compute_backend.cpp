@@ -493,6 +493,15 @@ void rms_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
   nntrainer::avx2::rms_norm_wrt_width_fp32_intrinsic(X, Y, H, W, epsilon);
 }
 
+void layer_norm_wrt_width_fp32_intrinsic(const float *__restrict X,
+                                         float *__restrict Y,
+                                         const float *__restrict gamma,
+                                         const float *__restrict beta, size_t H,
+                                         size_t W, float epsilon) {
+  __fallback_layer_norm_wrt_width_fp32_intrinsic(X, Y, gamma, beta, H, W,
+                                                 epsilon);
+}
+
 template <>
 void rms_norm_wrt_width_fp16_intrinsic(const float *__restrict X,
                                        float *__restrict Y, size_t H, size_t W,

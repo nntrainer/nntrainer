@@ -339,4 +339,13 @@ void rms_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
   __fallback_rms_norm_wrt_width_fp16_intrinsic<_FP16>(X, Y, H, W, epsilon);
 }
 
+void layer_norm_wrt_width_fp16_intrinsic(const _FP16 *__restrict X,
+                                         _FP16 *__restrict Y,
+                                         const float *__restrict gamma,
+                                         const float *__restrict beta, size_t H,
+                                         size_t W, float epsilon) {
+  __fallback_layer_norm_wrt_width_fp16_intrinsic(X, Y, gamma, beta, H, W,
+                                                 epsilon);
+}
+
 } /* namespace nntrainer */
