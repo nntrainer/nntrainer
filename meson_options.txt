@@ -48,7 +48,7 @@ option('hexkl-sdk-root', type: 'string', value: '')
 # the Android app process on current SM8750/V79 devices.
 option('hexkl-lib-subdir', type: 'string', value: 'armv8_android26')
 option('mmap-read', type: 'boolean', value: true)
-option('enable-kernel-caching', type: 'boolean', value: false)
+option('enable-kernel-caching', type: 'boolean', value: true)
 
 # dependency conflict resolution
 option('capi-ml-inference-actual', type: 'string', value: 'capi-ml-inference',
@@ -69,8 +69,16 @@ option('enable-long-test', type: 'boolean', value: false)
 # backend options
 option('enable-blas', type: 'boolean', value: true)
 option('enable-fp16', type: 'boolean', value: false)
+option('fp16-impl', type: 'combo',
+       choices: ['auto', 'native', 'wrapper'],
+       value: 'auto',
+       description: 'x86_64 fp16 backing type. "auto" probes whether the compiler can do native _Float16 arithmetic and falls back to the uint16 nntrainer::Half wrapper if not (e.g. MSVC). "native" forces _Float16. "wrapper" forces the Half wrapper even on GCC/clang (Linux test harness for the MSVC path).')
 option('enable-cublas', type: 'boolean', value: false)
 option('enable-opencl', type: 'boolean', value: false)
+option('enable-cuda', type: 'boolean', value: false,
+       description: 'Build the additive NVIDIA CUDA GPU backend (NVRTC runtime kernel compilation + cudart + cuBLAS + driver API). Independent of and non-exclusive with enable-opencl; selected at runtime via engine=cuda. Desktop NVIDIA only (not android).')
+option('cuda-path', type: 'string', value: '/usr/local/cuda',
+       description: 'CUDA toolkit root used when enable-cuda is set (expects include/ and lib64/).')
 option('enable-biqgemm', type: 'boolean', value: false)
 option('biqgemm-path', type: 'string', value: '../BiQGEMM')
 option('enable-benchmarks', type: 'boolean', value : false)

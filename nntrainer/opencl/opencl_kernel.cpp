@@ -19,6 +19,13 @@
 
 namespace nntrainer::opencl {
 
+// Set whenever a shared-virtual-memory pointer is bound as a kernel argument,
+// read and cleared by CommandQueueManager when the kernel is enqueued, so the
+// coherence drain runs only after a dispatch that actually touched shared
+// memory. The dispatch path is single threaded -- a kernel is fully bound and
+// then enqueued before the next one is bound -- so a file-scope flag is enough.
+static bool s_bind_touched_svm = false;
+
 /**
  * @brief Create a Kernel From Program object
  *
@@ -79,6 +86,11 @@ bool Kernel::SetKernelArguments(cl_uint arg_index, const void *arg_value,
  * @return true if successful or false otherwise
  */
 bool Kernel::SetKernelSVMArguments(cl_uint arg_index, const void *arg_value) {
+  // This dispatch reads or writes shared virtual memory, so its
+  // producer-to-consumer handoff needs an explicit flush on a device without
+  // fine-grain coherence. The flag accumulates until the next dispatch
+  // consumes it, so the order the arguments are bound in does not matter.
+  s_bind_touched_svm = true;
   int error_code;
   // returns NULL with error code if fails
   error_code = clSetKernelArgSVMPointer(kernel_, arg_index, arg_value);
@@ -97,5 +109,11 @@ bool Kernel::SetKernelSVMArguments(cl_uint arg_index, const void *arg_value) {
  * @return const cl_kernel
  */
 const cl_kernel Kernel::GetKernel() { return kernel_; }
+
+bool Kernel::takeDispatchTouchedSVM() {
+  const bool touched = s_bind_touched_svm;
+  s_bind_touched_svm = false;
+  return touched;
+}
 
 } // namespace nntrainer::opencl

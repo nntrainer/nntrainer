@@ -92,11 +92,32 @@ if get_option('enable-opencl')
   test_target += [['unittest_opencl_kernels_int4', []]]
   test_target += [['unittest_opencl_kernels_qk_k', []]]
   test_target += [['unittest_attention_kernels_cl', []]]
+  # The device residency plane places FP16 activations, so the test needs the
+  # FP16 tensor type as well as OpenCL.
+  if get_option('enable-fp16')
+    test_target += [['unittest_cl_residency', []]]
+  endif
+  # CPU-vs-OpenCL differential for the embedding pooling/normalize whole-ops.
+  # The backend is selected by NNTR_OPS_BACKEND so the two engines are compared
+  # across separate processes.
+  test_target += [['unittest_embedding_pool_ops', []]]
 endif
 
 if get_option('enable-fp16')
   test_target += [['unittest_nntrainer_tensor_fp16', []]]
   test_target += [['unittest_nntrainer_tensor_pool_fp16', []]]
+  # Compares nntrainer::Half against the compiler's own half type. That needs a
+  # native half to compare against, which is exactly what the wrapper exists to
+  # replace, so build it only where both are available -- which is every
+  # GCC/clang build including -Dfp16-impl=wrapper, and not MSVC.
+  if cxx.compiles('''#ifdef __ARM_FP16_FORMAT_IEEE
+__fp16 f(__fp16 a, __fp16 b) { return a * b; }
+#else
+_Float16 f(_Float16 a, _Float16 b) { return a * b; }
+#endif
+int main() { return 0; }''', name: 'a native half type to compare Half against')
+    test_target += [['unittest_half_fp16', []]]
+  endif
 endif
 
 if get_option('enable-profile')
@@ -126,6 +147,32 @@ foreach target: test_target
     suite: 'unittests'
   )
 endforeach
+
+# CUDA kernel unittests (the CUDA analogue of the OpenCL kernel tests above).
+# Standalone targets: the shared loop cannot add per-target dependencies, and
+# these need cuda_dep (cuda_runtime.h + cudart for the managed buffers they
+# compare against the host reference). They skip themselves at runtime when no
+# CUDA device is present, so the target still builds and runs on a CI machine
+# with the toolkit but no card.
+if get_option('enable-cuda')
+  foreach cuda_kernel_test: ['unittest_cuda_kernels_layernorm',
+                             'unittest_cuda_kernels_gelu',
+                             'unittest_cuda_kernels_fc_qs4cx']
+    cuda_kernel_test_exe = executable(
+      cuda_kernel_test,
+      cuda_kernel_test + '.cpp',
+      dependencies: unittest_nntrainer_deps + [cuda_dep],
+      install: get_option('enable-test'),
+      install_dir: application_install_dir
+    )
+    test(cuda_kernel_test, cuda_kernel_test_exe,
+      args: ['--gtest_output=xml:@0@/@1@.xml'.format(
+        meson.build_root(), cuda_kernel_test)],
+      timeout: test_timeout,
+      suite: 'unittests'
+    )
+  endforeach
+endif
 
 # DDTree core tests embed the golden vectors (ddtree_golden/build_golden.h), so
 # this target is defined standalone to add that directory to its include path

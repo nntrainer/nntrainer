@@ -63,6 +63,14 @@ private:
   unsigned int NUM_EXPERTS;
   unsigned int NUM_EXPERTS_PER_TOK;
   std::vector<std::string> LAYER_TYPES;
+
+  /** @copydoc Transformer::getLayerSlidingWindow(int) — the LAYER_TYPES table
+   *  names the sliding layers. */
+  unsigned int getLayerSlidingWindow(int layer_id) const override {
+    return (LAYER_TYPES[layer_id] == "sliding_attention") ? SLIDING_WINDOW
+                                                          : UINT_MAX;
+  }
+
   float ATTENTION_ROPE_SCALING_FACTOR;
 };
 

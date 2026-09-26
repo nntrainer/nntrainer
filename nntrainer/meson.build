@@ -21,6 +21,7 @@ nntrainer_headers = [
    meson.current_source_dir() / 'context_data.h',
    meson.current_source_dir() / 'engine.h',
    meson.current_source_dir() / 'mem_allocator.h',
+   meson.current_source_dir() / 'model_features.h',
 ]
 
 nntrainer_base_deps=[
@@ -35,6 +36,10 @@ nntrainer_base_deps=[
 
 if get_option('enable-opencl')
   nntrainer_base_deps += clblast_dep
+endif
+
+if get_option('enable-cuda')
+  nntrainer_base_deps += cuda_dep
 endif
 
 if get_option('enable-htp')
@@ -68,6 +73,11 @@ if get_option('enable-opencl')
   nntrainer_elements += 'layers/cl_layers'
 
   nntrainer_inc_abs += meson.source_root() / 'subprojects' / 'CLBlast' / 'include'
+endif
+
+if get_option('enable-cuda')
+  nntrainer_elements += 'cuda'
+  nntrainer_elements += 'layers/cuda_layers'
 endif
 
 if get_option('enable-npu')
@@ -106,6 +116,13 @@ if get_option('enable-opencl')
   nntrainer_headers += meson.current_source_dir() / 'cl_svm_allocator.h'
   nntrainer_common_sources += 'cl_context.cpp'
   nntrainer_common_sources += 'cl_svm_allocator.cpp'
+endif
+
+if get_option('enable-cuda')
+  # Sources only: the CUDA Context, allocator and layer headers stay internal
+  # and are not install_headers()'d -- see the note in cuda/meson.build.
+  nntrainer_common_sources += 'cuda_context.cpp'
+  nntrainer_common_sources += 'cuda_mem_allocator.cpp'
 endif
 
 if get_option('enable-htp')

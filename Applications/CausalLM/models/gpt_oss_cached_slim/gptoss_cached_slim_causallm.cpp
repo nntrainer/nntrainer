@@ -62,19 +62,17 @@ Tensor GptOssCachedSlimCausalLM::createAttention(const int layer_id,
      withKey("weight_initializer", "ones")}));
   Tensor q = wq(query);
 
-  // External KV cache placeholders (per-layer). Storage is owned by the host
-  // (KVCacheManager) and bound at runtime via setExternalTensors.
-  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
-
   // Attention core layer
-  unsigned sliding_window =
-    (LAYER_TYPES[layer_id] == "sliding_attention") ? SLIDING_WINDOW : UINT_MAX;
+  const unsigned int sliding_window = getLayerSlidingWindow(layer_id);
   // this attention uses sink!
   LayerHandle mha(createLayer(
     "mha_core",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
      withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
-     withKey("max_timestep", std::to_string(INIT_SEQ_LEN + NUM_TO_GENERATE)),
+     // Size the KV cache and the RoPE LUT by the context window, like every
+     // other model: num_to_generate is optional and may be 0 (no explicit
+     // cap), which would otherwise leave positions past INIT_SEQ_LEN uncovered.
+     withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
      withKey("sliding_window", sliding_window),
      withKey("rope_theta", ROPE_THETA),
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
@@ -83,7 +81,8 @@ Tensor GptOssCachedSlimCausalLM::createAttention(const int layer_id,
      withKey("rope_scaling_factor", ATTENTION_ROPE_SCALING_FACTOR),
      withKey("rope_scaling_type", "yarn"),
      withKey("rope_scaling_max_position_embeddings", 4096)}));
-  Tensor a = mha({q, k, v, cache_k, cache_v});
+  Tensor a = wireAttentionKVCache(layer_id, n_heads, mha, q, k, v,
+                                  /*use_int8=*/false);
 
   // O layer
   LayerHandle wo(createLayer(
@@ -125,12 +124,12 @@ void GptOssCachedSlimCausalLM::setupParameters(json &cfg, json &generation_cfg,
 void GptOssCachedSlimCausalLM::registerCustomLayers() {
   CausalLM::registerCustomLayers();
   auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+  // cpu-context registration goes through Engine::registerLayerFactory below
+  // (no static_cast to AppContext).
 
   try {
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::CachedSlimGptOssMoELayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::CachedSlimGptOssMoELayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;

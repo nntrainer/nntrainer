@@ -308,6 +308,7 @@ std::vector<float *> DebertaV2::encode(const WSTR prompt,
   }
 
   std::string prompt_ = system_prompt + prompt + tail_prompt;
+  ensureTokenizer(); // join the async load
   auto tokenized = tokenizer->Encode(prompt_, true);
 
   unsigned int input_len =
@@ -349,14 +350,14 @@ void DebertaV2::registerCustomLayers() {
   SentenceTransformer::registerCustomLayers();
 
   const auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+  // cpu-context registration goes through Engine::registerLayerFactory below
+  // (no static_cast to AppContext).
 
   try {
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::DebertaAttentionLayer>);
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::SharedFullyConnectedLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::DebertaAttentionLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::SharedFullyConnectedLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;

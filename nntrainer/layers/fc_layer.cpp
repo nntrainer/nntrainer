@@ -42,7 +42,8 @@ enum LORAParams { loraA, loraB, loraTmp, loraOut };
 FullyConnectedLayer::FullyConnectedLayer() :
   LayerImpl(),
   lora_scaling(1.0f),
-  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha()),
+  fc_props(props::Unit(), props::LoraRank(), props::LoraAlpha(),
+           props::FusedActivation()),
   quantizer(nullptr) {
   weight_idx.fill(std::numeric_limits<unsigned>::max());
   lora_idx.fill(std::numeric_limits<unsigned>::max());
@@ -192,6 +193,25 @@ void FullyConnectedLayer::finalize(InitLayerContext &context) {
     quantizer = nullptr;
     break;
   }
+
+  // inline fused activation: if the FusionRealizer moved an activation onto
+  // this FC (fused_activation set), build the SAME ActiFunc the standalone
+  // ActivationLayer would use, so the fused forward is value-identical.
+  auto &fused_act = std::get<props::FusedActivation>(fc_props);
+  rejectFusedActivationOnTrainingGraph(fused_act, context.getExecutionMode(),
+                                       "FC");
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
+    if (context.getActivationDataType() == TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+      acti_func.setActiFunc<_FP16>(fused_act.get());
+#else
+      throw std::invalid_argument(
+        "[FC] fused fp16 activation needs enable-fp16");
+#endif
+    } else {
+      acti_func.setActiFunc<float>(fused_act.get());
+    }
+  }
 }
 
 void FullyConnectedLayer::exportTo(
@@ -257,6 +277,21 @@ void FullyConnectedLayer::forwarding(RunLayerContext &context, bool training) {
       hidden_.add_i(bias);
     }
   }
+
+  // fused activation epilogue: apply the activation inline on the GEMM
+  // output, eliminating the separate ActivationLayer node. In-place when the
+  // activation supports it (relu/sigmoid/tanh); otherwise via a temp input
+  // copy, exactly mirroring ActivationLayer's run_fn(input, output) ->
+  // value-identical.
+  auto &fused_act = std::get<props::FusedActivation>(fc_props);
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
+    if (acti_func.supportInPlace()) {
+      acti_func.run_fn(hidden_, hidden_);
+    } else {
+      Tensor in_copy = hidden_.clone();
+      acti_func.run_fn(in_copy, hidden_);
+    }
+  }
 }
 
 void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
@@ -291,6 +326,8 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
   hidden_step_dim.batch(1);
   if (hidden_dim.height() > 1)
     hidden_step_dim.height(to - from);
+
+  auto &fused_act = std::get<props::FusedActivation>(fc_props);
 
   // @todo make it parallelized with batch axis
   for (unsigned int b = 0; b < hidden_.batch(); ++b) {
@@ -335,6 +372,19 @@ void FullyConnectedLayer::incremental_forwarding(RunLayerContext &context,
         hidden_step.add_i(bias_cast);
       } else {
         hidden_step.add_i(bias);
+      }
+    }
+
+    // The same epilogue forwarding() applies. Without it one layer with one
+    // fused_activation value would produce two different results depending on
+    // which entry point ran, and the incremental path -- the one an LLM graph
+    // takes -- would return pre-activation values.
+    if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
+      if (acti_func.supportInPlace()) {
+        acti_func.run_fn(hidden_step, hidden_step);
+      } else {
+        Tensor in_copy = hidden_step.clone();
+        acti_func.run_fn(in_copy, hidden_step);
       }
     }
   }

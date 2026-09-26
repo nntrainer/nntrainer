@@ -18,7 +18,7 @@
 #include "int4_utils.h"
 #include "nntrainer_test_util.h"
 #include "q4_0_utils.h"
-#include "swiglu_cl.h"
+#include "swiglu_cl_op.h"
 #include "tensor_dim.h"
 #include "timer.h"
 #include <blas_kernel_interface.h>

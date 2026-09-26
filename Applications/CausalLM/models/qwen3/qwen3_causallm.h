@@ -36,6 +36,28 @@ public:
                          Tensor value) override;
 
   void registerCustomLayers() override;
+
+  /** @copydoc Transformer::getLayerSlidingWindow(int) — one uniform window for
+   *  every layer (no full-attention interleave), so the base pattern rule does
+   *  not apply. */
+  unsigned int getLayerSlidingWindow(int layer_id) const override {
+    (void)layer_id;
+    return SLIDING_WINDOW;
+  }
+
+  /** @copydoc Transformer::getModelFeatures() — qwen3: q/k-norm, SwiGLU,
+   *  pre-norm, head_dim=128, decode-GPU OFF (d=128 diverges), tied lm_head. */
+  nntrainer::ModelFeatures getModelFeatures() const override {
+    nntrainer::ModelFeatures f;
+    f.has_qk_norm = true;
+    f.mlp_kind = nntrainer::MlpKind::SWIGLU;
+    f.norm_style = nntrainer::NormStyle::PRE;
+    f.lmhead_kind = nntrainer::LmHeadKind::TIED;
+    f.decode_gpu = false;
+    f.decode_rope_gpu = false; // qwen3: host decode (head_dim=128 diverges)
+    f.head_dim = 128;
+    return f;
+  }
 };
 
 /**
