@@ -44,6 +44,18 @@ protected:
 
   std::vector<std::string> layer_types;
 
+  /** @copydoc Transformer::getLayerSlidingWindow(int) — the layer_types table
+   *  names the sliding layers; with no table every layer slides. */
+  unsigned int getLayerSlidingWindow(int layer_id) const override {
+    if (!layer_types.empty()) {
+      if (layer_id < static_cast<int>(layer_types.size()) &&
+          layer_types[layer_id] == "sliding_attention")
+        return SLIDING_WINDOW;
+      return UINT_MAX;
+    }
+    return SLIDING_WINDOW;
+  }
+
 public:
   Tensor createAttention(const int layer_id, int seq_len, int n_heads,
                          int head_dim, Tensor query, Tensor key,

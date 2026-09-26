@@ -15,6 +15,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <tensor.h>
 #include <util_func.h>
 
 #include <layer_context.h>
@@ -35,11 +36,11 @@ void AdditionLayer::forwarding(RunLayerContext &context, bool training) {
   /** @todo check possibility for in-place of addition layer */
   for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {
     const Tensor &input_ = context.getInput(idx);
-    if (!idx) {
-      hidden_.copy(input_);
-    } else {
-      hidden_.add_i(input_);
-    }
+    // The first operand copies into hidden, the rest accumulate. The active
+    // backend's op table picks the residency path: the CPU table runs the same
+    // host copy/add this used to call inline, an accelerator can keep the
+    // residual stream in device memory.
+    hidden_.getOps()->residual_op(hidden_, input_, /*accumulate=*/idx != 0);
   }
 }
 
@@ -61,6 +62,27 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
     Tensor hidden_step = hidden_.getSharedDataTensor(
       hidden_step_dim, b * hidden_dim.getFeatureLen(), true);
 
+    // The two-input join -- the residual stream's shape in every decoder --
+    // can be one dispatch instead of a copy and an accumulate. Ask the op
+    // table; a backend that cannot do it declines and the per-operand loop
+    // below runs unchanged.
+    if (context.getNumInputs() == 2) {
+      const Tensor &i0 = context.getInput(0);
+      const Tensor &i1 = context.getInput(1);
+      TensorDim s0d = i0.getDim(), s1d = i1.getDim();
+      const unsigned int f0 = s0d.getFeatureLen(), f1 = s1d.getFeatureLen();
+      s0d.batch(1);
+      s0d.height(to - from);
+      s1d.batch(1);
+      s1d.height(to - from);
+      Tensor s0 =
+        i0.getSharedDataTensor(s0d, static_cast<size_t>(b) * f0, true);
+      Tensor s1 =
+        i1.getSharedDataTensor(s1d, static_cast<size_t>(b) * f1, true);
+      if (hidden_step.getOps()->residual_op2(hidden_step, s0, s1))
+        continue;
+    }
+
     /** @todo check possibility for in-place of addition layer */
     for (unsigned int idx = 0; idx < context.getNumInputs(); ++idx) {
       const Tensor &input_ = context.getInput(idx);
@@ -72,11 +94,8 @@ void AdditionLayer::incremental_forwarding(RunLayerContext &context,
 
       Tensor input_step = input_.getSharedDataTensor(
         input_step_dim, b * input_dim.getFeatureLen(), true);
-      if (!idx) {
-        hidden_step.copy(input_step);
-      } else {
-        hidden_step.add_i(input_step);
-      }
+      hidden_step.getOps()->residual_op(hidden_step, input_step,
+                                        /*accumulate=*/idx != 0);
     }
   }
 }

@@ -63,7 +63,9 @@ private:
 
 public:
   /**
-   * @brief Initialize Buffer objects.
+   * @brief Initialize Buffer objects. Every region is allocated on its first
+   *        use rather than here, so a process that never runs a
+   *        block-quantized GEMM pays nothing for them.
    */
   void initBuffers();
 
@@ -120,8 +122,8 @@ public:
   void *getSVMQuant(unsigned int idx = 0);
 
   /**
-   * @brief Destroy Buffer pointers.
-   *
+   * @brief Destructor. Deliberately does not release the OpenCL regions --
+   *        see the note on the definition.
    */
   ~ClBufferManager();
 };

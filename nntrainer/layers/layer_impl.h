@@ -41,6 +41,7 @@ class BiasInitializer;
 class DisableBias;
 class Print;
 class SkipPrefill;
+class FusedActivation;
 } // namespace props
 
 /**
@@ -91,6 +92,27 @@ public:
                         const ml::train::ExportMethods &method) const override;
 
 protected:
+  /**
+   * @brief Refuse a fused activation epilogue on a graph that will train.
+   *
+   * A fused epilogue has no backward: calcDerivative()/calcGradient() of the
+   * host layer do not apply the activation derivative, so a training graph
+   * carrying one would converge to the wrong values with no diagnostic. The
+   * FusionRealizer only ever sets the property on an inference compile; this
+   * rejects the other ways in (an INI, a saved model, a direct setProperty)
+   * so the misuse is an exception at finalize() rather than silent numerics.
+   *
+   * @param fused_act the layer's fused_activation property
+   * @param mode execution mode the layer is being finalized for
+   * @param layer_type layer type string, for the message
+   * @throws std::invalid_argument if a real activation is fused outside
+   *         inference
+   */
+  static void
+  rejectFusedActivationOnTrainingGraph(const props::FusedActivation &fused_act,
+                                       ml::train::ExecutionMode mode,
+                                       const char *layer_type);
+
   std::unique_ptr<
     std::tuple<props::WeightRegularizer, props::WeightRegularizerConstant,
                props::WeightInitializer, props::WeightDecay, props::BiasDecay,

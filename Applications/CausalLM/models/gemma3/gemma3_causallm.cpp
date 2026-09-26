@@ -70,10 +70,8 @@ void Gemma3Transformer::setupParameters(json &cfg, json &generation_cfg,
   if (cfg.contains("layer_types")) {
     layer_types = cfg["layer_types"].get<std::vector<std::string>>();
   }
-  if (cfg.contains("attn_logit_softcapping") &&
-      !cfg["attn_logit_softcapping"].is_null()) {
-    ATTN_LOGIT_SOFTCAPPING = cfg["attn_logit_softcapping"].get<float>();
-  }
+  // attn_logit_softcapping is now parsed in Transformer::setupParameters
+  // (base).
 }
 
 Tensor Gemma3Transformer::createTransformerDecoderBlock(const int layer_id,
@@ -172,16 +170,7 @@ Tensor Gemma3Transformer::createAttention(const int layer_id, int seq_len,
   Tensor k_normed = k_norm(k);
 
   // Attention core layer
-  unsigned int window_size = UINT_MAX;
-  if (!layer_types.empty()) {
-    if (layer_id < layer_types.size()) {
-      if (layer_types[layer_id] == "sliding_attention") {
-        window_size = SLIDING_WINDOW;
-      }
-    }
-  } else {
-    window_size = SLIDING_WINDOW;
-  }
+  const unsigned int window_size = getLayerSlidingWindow(layer_id);
 
   float rope_theta = ROPE_THETA; // Default global
   if (!layer_types.empty() && layer_id < layer_types.size()) {
@@ -189,10 +178,6 @@ Tensor Gemma3Transformer::createAttention(const int layer_id, int seq_len,
       rope_theta = 10000.0f;
     }
   }
-
-  // External KV cache placeholders (per-layer). Storage is owned by the host
-  // (KVCacheManager) and bound at runtime via setExternalTensors.
-  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
 
   LayerHandle mha(createLayer(
     "mha_core",
@@ -205,7 +190,8 @@ Tensor Gemma3Transformer::createAttention(const int layer_id, int seq_len,
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
-  Tensor a = mha({q_normed, k_normed, v, cache_k, cache_v});
+  Tensor a = wireAttentionKVCache(layer_id, n_heads, mha, q_normed, k_normed, v,
+                                  /*use_int8=*/false);
 
   // O layer
   LayerHandle wo(createLayer(
@@ -263,12 +249,12 @@ Tensor Gemma3Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
 
 void Gemma3Transformer::registerCustomLayers() {
   auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+  // cpu-context registration goes through Engine::registerLayerFactory below
+  // (no static_cast to AppContext).
 
   try {
-    app_context->registerFactory(
-      nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
+    ct_engine.registerLayerFactory(
+      "cpu", nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;

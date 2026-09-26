@@ -59,7 +59,7 @@ bool RMSNormLayerCl::registerClKernels(ClContext &cl_context) {
       ml_loge("OpenCL Error: Fail to register rmsnorm_cl_fp16 kernel");
       break;
     }
-    layer_kernel_ptrs.emplace_back(kernel_rmsnorm_ptr);
+    layer_kernel_ptrs.emplace_back(kernel_rmsnorm_fp16_ptr);
 #endif
 
     return true;
@@ -75,6 +75,8 @@ bool RMSNormLayerCl::registerClKernels(ClContext &cl_context) {
 void RMSNormLayerCl::finalize(InitLayerContext &context) {
   std::vector<TensorDim> dim = context.getInputDimensions();
   context.setOutputDimensions(dim);
+  if (!std::get<props::SkipPrefill>(rmsnorm_props).empty())
+    skip_prefill = std::get<props::SkipPrefill>(rmsnorm_props).get();
   auto &rmsparams_gamma = std::get<props::GammaInitializer>(rmsnorm_props);
 
   TensorDim gamma_dim(
@@ -103,9 +105,17 @@ void RMSNormLayerCl::forwarding(RunLayerContext &context, bool training) {
 
 void RMSNormLayerCl::rmsnormProcess(Tensor const &input, Tensor &result,
                                     Tensor const &gamma, const float epsilon) {
+  // Bind device memory directly (SVM-direct) only when the tensors are
+  // GPU-resident, i.e. allocated from the SVM pool. On the default host (cpu)
+  // pool getData() returns HOST pointers, and passing those as SVM kernel
+  // arguments produces garbage -- so take the host-bounce path there.
+  // rmsnorm_cl's use_svm defaults to true, so omitting it is not neutral.
+  const auto md = input.getMemoryData();
+  const bool use_svm = md && md->isSVM();
   rmsnorm_cl(input.getData<float>(), gamma.getData<float>(),
              result.getData<float>(), epsilon,
-             input.batch() * input.channel() * input.height(), input.width());
+             input.batch() * input.channel() * input.height(), input.width(),
+             use_svm);
 }
 
 #ifdef ENABLE_FP16
@@ -146,20 +156,25 @@ void RMSNormLayerCl::rmsnormProcess_fp16(Tensor const &input, Tensor &result,
       break;
     }
 
+    // SetKernelArguments takes a POINTER to the value (clSetKernelArg
+    // semantics), so a cl_mem arg must be passed by address. Passing
+    // GetBuffer() (a cl_mem) directly bound a garbage handle =>
+    // CL_INVALID_MEM_OBJECT, which silently broke this dispatch and left the
+    // output stale.
     ret = kernel_rmsnorm_ptr->SetKernelArguments(
-      0, clbuffInstance.getInBufferA()->GetBuffer(), sizeof(cl_mem));
+      0, &clbuffInstance.getInBufferA()->GetBuffer(), sizeof(cl_mem));
     if (!ret) {
       break;
     }
 
     ret = kernel_rmsnorm_ptr->SetKernelArguments(
-      1, clbuffInstance.getOutBufferA()->GetBuffer(), sizeof(cl_mem));
+      1, &clbuffInstance.getOutBufferA()->GetBuffer(), sizeof(cl_mem));
     if (!ret) {
       break;
     }
 
     ret = kernel_rmsnorm_ptr->SetKernelArguments(
-      2, clbuffInstance.getInBufferB()->GetBuffer(), sizeof(cl_mem));
+      2, &clbuffInstance.getInBufferB()->GetBuffer(), sizeof(cl_mem));
     if (!ret) {
       break;
     }
@@ -169,7 +184,10 @@ void RMSNormLayerCl::rmsnormProcess_fp16(Tensor const &input, Tensor &result,
       break;
     }
 
-    ret = kernel_rmsnorm_ptr->SetKernelArguments(3, &epsilon, sizeof(cl_half));
+    // The fp16 kernel takes epsilon as a float: a half cannot hold a typical
+    // rms_norm_eps (1e-5 / 1e-6 are subnormal there).
+    const float epsilon_f = epsilon;
+    ret = kernel_rmsnorm_ptr->SetKernelArguments(3, &epsilon_f, sizeof(float));
     if (!ret) {
       break;
     }
@@ -209,6 +227,14 @@ void RMSNormLayerCl::rmsnormProcess_fp16(Tensor const &input, Tensor &result,
 void RMSNormLayerCl::incremental_forwarding(nntrainer::RunLayerContext &context,
                                             unsigned int from, unsigned int to,
                                             bool training) {
+  // A decoder block that shares its key/value cache with an earlier block has
+  // nothing to contribute during prefill (from == 0); the live token is
+  // recomputed at decode. This is the same contract skip_prefill already has
+  // on the CPU layers and on the CUDA RMSNorm layer, which registers under the
+  // same type string as this one -- without it here, a graph that carries the
+  // property cannot move to the OpenCL backend.
+  if (skip_prefill && from == 0)
+    return;
   Tensor &in = context.getInput(SINGLE_INOUT_IDX);
   Tensor &out = context.getOutput(SINGLE_INOUT_IDX);
   Tensor &gamma = context.getWeight(wt_idx[RMSParams::gamma]);

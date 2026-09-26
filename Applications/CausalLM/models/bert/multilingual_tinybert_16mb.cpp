@@ -36,6 +36,7 @@ std::vector<float *> MultilingualTinyBert::encode(const WSTR prompt,
   }
 
   std::string prompt_ = system_prompt + prompt + tail_prompt;
+  ensureTokenizer(); // join the async load
   auto tokenized = tokenizer->Encode(prompt_, true);
 
   unsigned int input_len =

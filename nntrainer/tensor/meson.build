@@ -7,7 +7,6 @@ tensor_sources = [
   'tensor.cpp',
   'tensor_base.cpp',
   'float_tensor.cpp',
-  'int4_tensor.cpp',
   'int4_utils.cpp',
   'uint4_tensor.cpp',
   'uint_tensor.cpp',
@@ -34,10 +33,10 @@ tensor_sources = [
 
 tensor_headers = [
   'memory_data.h',
+  'residency_policy.h',
   'tensor.h',
   'tensor_base.h',
   'float_tensor.h',
-  'int4_tensor.h',
   'int4_utils.h',
   'uint4_tensor.h',
   'char_tensor.h',

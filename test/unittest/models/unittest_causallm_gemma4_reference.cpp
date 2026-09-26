@@ -76,4 +76,12 @@ TEST(Gemma4DifferentialTest, Q40CloseToFP32Reference) {
   causallm_test::runQ40DifferentialChecks(gemma4Model());
 }
 
+/**
+ * @brief QINT4 (channelwise int4) logits stay within tolerance of the FP32
+ *        reference. On engine=cuda this drives the fused QINT4 dequant-GEMM FC.
+ */
+TEST(Gemma4DifferentialTest, QINT4CloseToFP32Reference) {
+  causallm_test::runQINT4DifferentialChecks(gemma4Model());
+}
+
 } // namespace

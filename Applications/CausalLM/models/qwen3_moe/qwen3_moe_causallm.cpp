@@ -61,11 +61,12 @@ void Qwen3MoECausalLM::registerCustomLayers() {
 
   Qwen3CausalLM::registerCustomLayers();
   auto &ct_engine = nntrainer::Engine::Global();
-  auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
+  // cpu-context registration goes through Engine::registerLayerFactory below
+  // (no static_cast to AppContext).
 
   try {
-    app_context->registerFactory(nntrainer::createLayer<causallm::MoELayer>);
+    ct_engine.registerLayerFactory("cpu",
+                                   nntrainer::createLayer<causallm::MoELayer>);
   } catch (std::invalid_argument &e) {
     std::cerr << "failed to register factory, reason: " << e.what()
               << std::endl;
