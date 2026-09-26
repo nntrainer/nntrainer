@@ -999,16 +999,61 @@ public:
    */
   bool reStoreData() { return needs_restore_data; }
 
-  std::string getComputeEngineType() {
-    auto size = props::ComputeEngineTypeInfo::EnumList.size();
-    auto data = std::data(props::ComputeEngineTypeInfo::EnumList);
-    for (unsigned i = 0; i < size; ++i) {
-      if (data[i] == compute_engine) {
-        return props::ComputeEngineTypeInfo::EnumStr[i];
-      }
-    }
-    return "cpu";
-  }
+  /**
+   * @brief the node's compute-engine NAME — a registered Context name, cached
+   *        from the `engine=` property at finalize() ("cpu" until then).
+   *        Registry-open: may be any Engine-registered name (e.g. "npu"), not
+   *        just the closed enum's four; feeds getRegisteredContext() directly.
+   */
+  std::string getComputeEngineType() { return compute_engine; }
+
+  /**
+   * @brief Which residency plane this node's tensors live on, resolved from
+   *        its `engine` property.
+   *
+   * An engine tag is a registered Context NAME, not a device taxonomy: names
+   * are flat map keys bound one-per-Context by registerContext(), so "gpu" and
+   * "cuda" are disjoint by construction and neither is a superset of the
+   * other. The name is therefore not something to pattern-match on; the
+   * Context it resolves to declares its own plane via
+   * Context::residencyEngine(), and this query reports that declaration. A
+   * vendor backend that self-registers under any name (e.g. "npu", "exynos")
+   * resolves here with no edit to this class.
+   *
+   * Unlike getComputeEngineType() (which reflects the cached member set only
+   * during finalize()), this reads the property directly and is therefore
+   * valid earlier, e.g. when choosing the graph-wide memory allocator at
+   * NetworkGraph construction.
+   *
+   * @return residency plane of this node (CPU when the property is unset)
+   */
+  ml::train::LayerComputeEngine residencyEngine() const;
+
+  /**
+   * @brief Query whether this node's tensors live on the OpenCL residency
+   *        plane. Shorthand for `residencyEngine() == GPU`; a CUDA node
+   *        reports CUDA, not GPU, because the two are separate planes with
+   *        separate allocators - see residencyEngine() for the contract.
+   * @return true iff this node's engine resolves to the GPU plane
+   */
+  bool isComputeEngineGPU() const;
+
+  /**
+   * @brief Query whether this node's tensors live on the CUDA residency plane
+   *        (the additive NVIDIA backend); used to route the graph's memory
+   *        allocator to CUDA Unified Memory. Shorthand for
+   *        `residencyEngine() == CUDA`.
+   * @return true iff this node's engine resolves to the CUDA plane
+   */
+  bool isComputeEngineCUDA() const;
+
+  /**
+   * @brief Query whether this node runs on the host residency plane (the
+   *        `engine` property is unset — CPU is the default — or resolves to a
+   *        host-resident Context). Shorthand for `residencyEngine() == CPU`.
+   * @return true iff this node's engine resolves to CPU
+   */
+  bool isComputeEngineCPU() const;
 
 private:
   /**
@@ -1038,11 +1083,13 @@ private:
     output_connections; /**< output layer names */
 
   /**
-   * @brief compute_engine Information about the compute backend being used
-   *
+   * @brief compute_engine — the compute backend as a registered Context NAME
+   *        (registry-open; "npu"/"vulkan"-style self-registered backends need
+   *        no enum edit). The residency plane still speaks the
+   *        LayerComputeEngine enum via toLayerComputeEngine() in
+   *        layer_node.cpp.
    */
-  ml::train::LayerComputeEngine compute_engine =
-    ml::train::LayerComputeEngine::CPU;
+  std::string compute_engine = "cpu";
 
 #ifdef ENABLE_TEST
   /**

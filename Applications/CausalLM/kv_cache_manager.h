@@ -19,6 +19,9 @@
 #include <string>
 #include <vector>
 
+#include <memory>
+
+#include <memory_pool.h>
 #include <tensor.h>
 #include <tensor_dim.h>
 
@@ -183,15 +186,42 @@ public:
    * @brief Save KV cache to file up to specified length
    * @param[in] path file path
    * @param[in] seq_len number of positions to save
+   * @param[in] model_tag opaque identity of the model that produced the cache
+   *            (see describeFile()); recorded in the header so a later load can
+   *            refuse a file written by a different model instead of
+   *            reinterpreting its bytes. Empty writes an unnamed file, which
+   *            loads into any geometry-compatible model.
    */
-  void save(const std::string &path, unsigned int seq_len) const;
+  void save(const std::string &path, unsigned int seq_len,
+            const std::string &model_tag = std::string()) const;
 
   /**
    * @brief Load KV cache from file
    * @param[in] path file path
-   * @param[in] seq_len number of positions to load
+   * @param[in] seq_len number of positions to load. 0 means "whatever the file
+   *            says", which only a file carrying a header can answer.
+   * @param[in] model_tag identity to check the header's against; empty skips
+   *            the model check (the geometry checks always run).
+   * @return the absolute token position the loaded cache holds
+   * @throw std::runtime_error naming the field that disagreed
    */
-  void load(const std::string &path, unsigned int seq_len);
+  unsigned int load(const std::string &path, unsigned int seq_len,
+                    const std::string &model_tag = std::string());
+
+  /**
+   * @brief Describe a saved KV-cache file without loading it: the header's
+   *        model tag, token length and geometry, or why it cannot be read.
+   * @param[in] path file path
+   * @return one human-readable line
+   */
+  static std::string describeFile(const std::string &path);
+
+  /**
+   * @brief Bytes this manager's geometry needs on disk for @p seq_len
+   *        positions, header included. What save() will write.
+   * @param[in] seq_len number of positions
+   */
+  size_t fileBytesFor(unsigned int seq_len) const;
 
   /**
    * @brief Get number of layers
@@ -215,7 +245,144 @@ public:
    */
   unsigned int getKVWidth() const { return num_heads_kv_ * head_dim_; }
 
+  /**
+   * @brief [kv-share] Declare, per layer, which EARLIER layer owns the K/V
+   *        storage this layer reads. A KV-shared layer (gemma4
+   *        `num_kv_shared_layers`) recomputes nothing: it attends over the
+   *        source layer's K/V plane. Reproducing the VALUES into a private
+   *        slab (what this manager used to do) is byte-for-byte redundant --
+   *        for a 35-layer config with num_kv_shared_layers=20, that duplicated
+   *        more than half the whole KV plane, all of it device-resident
+   *        because the SVM/UVM pool populates every page it reserves.
+   *
+   *        With a source declared, allocate() gives the layer NO pool token
+   *        and NO new storage: its key/value Tensors are aliases (same
+   *        MemoryData, same offset) onto the source's. The alias is exactly
+   *        the operation the model's bind already performs when it hands the
+   *        cache to the graph placeholder, so nothing downstream can tell the
+   *        difference except the byte count.
+   *
+   *        Contract (checked in allocate(), which throws on violation):
+   *          - sources[i] < i    -- a source is always allocated first, so one
+   *                                 forward pass over the layers suffices;
+   *          - sources[i] == -1  -- this layer owns its cache (the default);
+   *          - the geometry (cap x width x dtype) of i and sources[i] must be
+   *            identical, otherwise the alias would reinterpret the plane.
+   *
+   *        MUST be called BEFORE allocate(). An empty vector (the default)
+   *        means every layer owns its cache -- bit-identical to the
+   *        pre-aliasing behaviour.
+   *
+   *        Derive the vector from the SAME rule the graph builder uses to pick
+   *        the shared-attention source (Gemma4Transformer::
+   *        getSharedKVSourceLayer(), reached through the
+   *        Transformer::getKVSourceLayer() hook). If allocation and graph
+   *        building ever disagree, a layer silently attends over the wrong
+   *        layer's K/V: fluent, wrong, and crash-free.
+   *
+   * @param[in] sources per-layer KV source layer id (-1 = owns its cache)
+   */
+  void setLayerKVSources(std::vector<int> sources) {
+    layer_kv_sources_ = std::move(sources);
+  }
+
+  /**
+   * @brief The layer whose K/V storage layer_idx aliases, or -1 when the layer
+   *        owns its own cache.
+   * @param[in] layer_idx attention layer index
+   */
+  int getLayerKVSource(unsigned int layer_idx) const {
+    if (layer_idx < layer_kv_sources_.size())
+      return layer_kv_sources_[layer_idx];
+    return -1;
+  }
+
+  /**
+   * @brief true when layer_idx's K/V tensors are views onto another layer's
+   *        storage, i.e. contribute zero bytes of their own.
+   * @param[in] layer_idx attention layer index
+   */
+  bool isLayerKVAliased(unsigned int layer_idx) const {
+    return getLayerKVSource(layer_idx) >= 0;
+  }
+
+  /**
+   * @brief [kv-window-ring] Set the per-layer physical row capacity. A
+   * sliding-window layer under the ring stores only Wcap rows instead of
+   * max_seq_len; pass caps[i]=Wcap for those layers and caps[i]=0 (or
+   * max_seq_len) for the full ones. Must be called BEFORE allocate(). An empty
+   * vector means every layer is full max_seq.
+   */
+  void setLayerCaps(std::vector<unsigned int> caps) {
+    layer_caps_ = std::move(caps);
+  }
+
+  /**
+   * @brief Physical row capacity of a layer's cache (Wcap for a ring layer,
+   * else max_seq_len). The write/read code modulo-indexes against this.
+   */
+  unsigned int getLayerCap(unsigned int layer_idx) const {
+    if (layer_idx < layer_caps_.size() && layer_caps_[layer_idx] > 0)
+      return layer_caps_[layer_idx];
+    return max_seq_len_;
+  }
+
+  /**
+   * @brief Physical rows of layer @p layer_idx that a save of @p seq_len
+   *        absolute positions has to write.
+   * @details For a full layer this is @p seq_len. For a ring layer (a sliding
+   *          window storing Wcap rows and modulo-indexing into them) the live
+   *          rows ARE the whole plane once the window has been passed, and
+   *          which row holds which position is a function of the absolute
+   *          position -- so the plane is written whole and the position in the
+   *          header is what re-derives the mapping. Writing seq_len rows there
+   *          would read past the plane; that is the bug this replaces.
+   * @param[in] layer_idx attention layer index
+   * @param[in] seq_len absolute token position being saved
+   */
+  unsigned int rowsToPersist(unsigned int layer_idx,
+                             unsigned int seq_len) const {
+    const unsigned int cap = getLayerCap(layer_idx);
+    return seq_len < cap ? seq_len : cap;
+  }
+
 private:
+  /**
+   * @brief FNV-1a over the per-layer geometry vectors, so the header can refuse
+   *        a file whose widths / ring capacities / alias map differ without
+   *        carrying a variable-length table.
+   */
+  unsigned int geometryDigest() const;
+
+  /**
+   * @brief [kv-share] Validate layer_kv_sources_ against num_layers and the
+   *        per-layer geometry, and throw if the declaration is unusable.
+   *        Called once at the top of allocate(), i.e. BEFORE any memory is
+   *        requested, so a bad map can never reach the pool.
+   */
+  void validateKVSources(unsigned int num_layers) const;
+
+  /**
+   * @brief [kv-share] Point layer `dst`'s K/V tensors at layer `src`'s
+   *        storage. Shares the source's MemoryData shared_ptr (so teardown
+   *        order is irrelevant on both the pool and the host branch) at the
+   *        source's offset -- the same setData() the model bind performs.
+   *        Never leaves a tensor empty: `cache_dim` is the layer's own
+   *        geometry and is asserted equal to the source's.
+   */
+  void aliasLayerCache(unsigned int dst, unsigned int src,
+                       const ml::train::TensorDim &cache_dim);
+
+  /**
+   * @brief [kv-share] One-time witness of the resolved layer -> source map,
+   *        the bytes it kept out of the pool, and a live re-check that every
+   *        alias actually resolves to its source's address. Emitted at the end
+   *        of allocate() whenever sharing is declared.
+   */
+  void reportKVShare(unsigned int num_layers, unsigned int batch_size,
+                     ml::train::TensorDim::DataType dtype,
+                     const char *where) const;
+
   /**
    * @brief Per-layer cache storage
    */
@@ -226,6 +393,14 @@ private:
 
   std::vector<LayerCache> layer_caches_; /**< per-layer KV caches */
 
+  /**
+   * @brief Optional SVM-backed memory pool. When NNTR_GPU_SVM_POOL is set and
+   * the GPU (gpu-svm) allocator is available, the KV caches are allocated from
+   * this pool so their MemoryData reports isSVM()=true — required for the
+   * GPU flash attention path (mha_core). Null on the host (CPU) path.
+   */
+  std::shared_ptr<nntrainer::MemoryPool> svm_pool_;
+
   unsigned int cache_pos_ = 0;    /**< current write position */
   unsigned int batch_size_ = 0;   /**< batch size */
   unsigned int max_seq_len_ = 0;  /**< max sequence length */
@@ -233,6 +408,10 @@ private:
   unsigned int head_dim_ = 0;     /**< head dimension */
   unsigned int kv_width_ = 0;     /**< num_heads_kv * head_dim */
   std::vector<unsigned int> kv_widths_;
+  /** [kv-share] per-layer KV alias source (-1 = owns its cache) */
+  std::vector<int> layer_kv_sources_;
+  /** [kv-window-ring] per-layer physical row capacity (0 = full max_seq_len) */
+  std::vector<unsigned int> layer_caps_;
 
   ml::train::TensorDim::DataType dtype_ = ml::train::TensorDim::DataType::FP16;
   ml::train::TensorDim::Format format_ = ml::train::TensorDim::Format::NCHW;

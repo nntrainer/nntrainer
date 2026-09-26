@@ -14,15 +14,21 @@ endif
 
 # Common Includes Definition
 #
-# The last entry is TEMPORARY and app-local: four layer TUs here (mha_core,
-# reshaped_rms_norm, rms_norm_gpu, per_layer_slice_gpu) still include the raw
-# OpenCL kernel wrappers <blas_kernels.h> / <attention_kernels.h> instead of
-# going through the ComputeOps table. Those two headers are private to
-# libnntrainer and are deliberately not installed, so the ndk build reaches
+# The cl_operations entry is TEMPORARY and app-local: four layer TUs here
+# (mha_core, reshaped_rms_norm, rms_norm_gpu, per_layer_slice_gpu) still include
+# the raw OpenCL kernel wrappers <blas_kernels.h> / <attention_kernels.h>
+# instead of going through the ComputeOps table. Those two headers are private
+# to libnntrainer and are deliberately not installed, so the ndk build reaches
 # them through the nntrainer source dir rather than through the prebuilt
 # include export. Delete that entry together with the last raw
 # nntrainer::*_cl(...) call site under ../layers; it exists to keep the bypass
 # visible and app-local, never to make it ABI.
+#
+# The layers/llm entry serves the same purpose for <layer_prof.h>, the
+# header-only NNTR_LAYER_PROFILE instrumentation. It is intentionally kept out
+# of nntrainer_headers (it is a development aid, not -devel surface, and
+# installing it would require matching packaging/nntrainer.spec and
+# debian/*.install entries), so the ndk build resolves it from the source tree.
 CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/.. \
     $(LOCAL_PATH)/../layers \
@@ -34,6 +40,7 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
+    $(LOCAL_PATH)/../models/gemma2 \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/bert \
     $(LOCAL_PATH)/../models/timm_vit \
@@ -43,11 +50,30 @@ CAUSALLM_COMMON_INCLUDES := \
     $(LOCAL_PATH)/../models/lfm2 \
     $(LOCAL_PATH)/../third_party/minja/include \
     $(LOCAL_PATH)/../third_party \
+    $(NNTRAINER_ROOT)/nntrainer/utils \
+    $(NNTRAINER_ROOT)/nntrainer/tensor \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
+    $(NNTRAINER_ROOT)/nntrainer/layers/llm \
 
 # Common compile flags. -std=c++17/-fexceptions/-frtti come from Application.mk
-# (APP_CPPFLAGS); -march and the FP16 ABI defines are inherited from the
-# prebuilt nntrainer modules below via LOCAL_EXPORT_CFLAGS.
+# (APP_CPPFLAGS); -march and the ABI defines are inherited from the prebuilt
+# nntrainer modules below via LOCAL_EXPORT_CFLAGS.
+#
+# ENABLE_OPENCL is one of those inherited defines and must not be repeated
+# here. It does two things at once: it selects the app's GPU-routed layer
+# implementations (rms_norm_gpu / per_layer_slice_gpu / the cl paths inside
+# mha_core), and it gates the cl_context.h member of engine.h -- and
+# cl_context.h is installed only when nntrainer itself was configured with
+# -Denable-opencl=true. Hardcoding it therefore makes the app disagree with the
+# library it links: on a CPU-only prebuilt the app fails to compile on a missing
+# header, which is an ABI break rather than a missing feature.
+#
+# Both halves matter, so neither hardcode it nor drop the feature. Build
+# nntrainer with -Denable-opencl=true (build_android.sh forwards -D* verbatim)
+# and the define arrives through NNTRAINER_EXPORT_CFLAGS with the headers that
+# go with it. Getting this wrong in the other direction is equally silent: an
+# app compiled without the define falls back to CPU (Adreno gemma4 191 vs
+# 2400 TPS), which is why the export has to carry it rather than nobody.
 CAUSALLM_COMMON_CFLAGS := -O3 -ffast-math \
     -Wno-nan-infinity-disabled -Wno-deprecated-literal-operator
 
@@ -59,6 +85,12 @@ $(error $(NNTRAINER_PREBUILT_MK) not found. Build nntrainer first (tools/package
 endif
 include $(NNTRAINER_PREBUILT_MK)
 LOCAL_PATH := $(CAUSALLM_JNI_PATH)
+
+# No OpenCL prebuilt module here: every module below reaches the driver
+# through libnntrainer.so, which loads it via its own loader. A
+# PREBUILT_SHARED_LIBRARY is validated at parse time, so declaring one for
+# builddir/opencl aborts ndk-build outright whenever nntrainer was configured
+# without -Denable-opencl=true and that tree was never downloaded.
 
 # Tokenizer library
 include $(CLEAR_VARS)
@@ -78,6 +110,7 @@ LOCAL_SRC_FILES := \
     ../models/causal_lm.cpp \
     ../models/transformer.cpp \
     ../models/sentence_transformer.cpp \
+    ../models/model_registry.cpp \
     ../kv_cache_manager.cpp \
     ../models/qwen2/qwen2_causallm.cpp \
     ../models/qwen2/qwen2_embedding.cpp \
@@ -94,22 +127,20 @@ LOCAL_SRC_FILES := \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
-    ../layers/scalar_multiply.cpp \
-    ../layers/logit_softcapping.cpp \
+    ../layers/per_layer_slice_gpu.cpp \
     ../layers/mha_core.cpp \
-    ../layers/lm_head.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/custom_multiply.cpp \
     ../layers/causal_conv1d_layer.cpp \
+    ../layers/rms_reverse_norm.cpp \
     ../layers/rms_norm.cpp \
-    ../layers/swiglu.cpp \
-    ../layers/tie_word_embedding.cpp \
+    ../layers/rms_norm_gpu.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
-    ../layers/qkv_layer.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
+    ../models/gemma2/gemma2_causallm.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
@@ -196,6 +227,7 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/causal_lm.cpp \
     ../models/transformer.cpp \
     ../models/sentence_transformer.cpp \
+    ../models/model_registry.cpp \
     ../kv_cache_manager.cpp \
     ../models/qwen2/qwen2_causallm.cpp \
     ../models/qwen2/qwen2_embedding.cpp \
@@ -206,27 +238,26 @@ LOCAL_SRC_FILES := ../quantize.cpp \
     ../models/qwen3_cached_slim_moe/qwen3_cached_slim_moe_causallm.cpp \
     ../models/gpt_oss/gptoss_causallm.cpp \
     ../models/gpt_oss_cached_slim/gptoss_cached_slim_causallm.cpp \
+    ../huggingface_tokenizer.cpp \
     ../llm_util.cpp \
     ../layers/embedding_layer.cpp \
     ../layers/embedding_pooling_layer.cpp \
     ../layers/embedding_normalize_layer.cpp \
     ../layers/per_layer_slice.cpp \
-    ../layers/scalar_multiply.cpp \
-    ../layers/logit_softcapping.cpp \
+    ../layers/per_layer_slice_gpu.cpp \
     ../layers/mha_core.cpp \
     ../models/qwen3_moe/qwen_moe_layer.cpp \
     ../layers/reshaped_rms_norm.cpp \
     ../layers/custom_multiply.cpp \
     ../layers/causal_conv1d_layer.cpp \
+    ../layers/rms_reverse_norm.cpp \
     ../layers/rms_norm.cpp \
-    ../layers/swiglu.cpp \
-    ../layers/tie_word_embedding.cpp\
-    ../layers/lm_head.cpp\
+    ../layers/rms_norm_gpu.cpp \
     ../models/qwen3_cached_slim_moe/qwen_moe_layer_cached.cpp \
-    ../layers/qkv_layer.cpp \
     ../models/qwen3_slim_moe/qwen_moe_layer_fsu.cpp \
     ../models/gpt_oss/gpt_oss_moe_layer.cpp \
     ../models/gpt_oss_cached_slim/gpt_oss_moe_layer_cached.cpp \
+    ../models/gemma2/gemma2_causallm.cpp \
     ../models/gemma3/gemma3_causallm.cpp \
     ../models/gemma3/embedding_gemma.cpp \
     ../models/gemma4/gemma4_causallm.cpp \
@@ -253,13 +284,17 @@ LOCAL_C_INCLUDES += \
     $(LOCAL_PATH)/../models/qwen3_moe \
     $(LOCAL_PATH)/../models/qwen3_slim_moe \
     $(LOCAL_PATH)/../models/qwen3_cached_slim_moe \
+    $(LOCAL_PATH)/../models/gemma2 \
     $(LOCAL_PATH)/../models/gemma3 \
     $(LOCAL_PATH)/../models/bert \
     $(LOCAL_PATH)/../models/deberta_v2 \
     $(LOCAL_PATH)/../models/gemma4 \
     $(LOCAL_PATH)/../models/xlm_roberta \
     $(LOCAL_PATH)/../models/lfm2 \
+    $(NNTRAINER_ROOT)/nntrainer/utils \
+    $(NNTRAINER_ROOT)/nntrainer/tensor \
     $(NNTRAINER_ROOT)/nntrainer/tensor/cl_operations \
+    $(NNTRAINER_ROOT)/nntrainer/layers/llm \
 
 include $(BUILD_EXECUTABLE)
 

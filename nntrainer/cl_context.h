@@ -119,6 +119,12 @@ public:
                             const int int_key = -1);
 
   /**
+   * @copydoc Context::registerLayerFactory
+   */
+  int registerLayerFactory(PtrFactoryType<nntrainer::Layer> factory,
+                           const std::string &key, const int int_key) override;
+
+  /**
    * @brief Create an Object from the integer key
    *
    * @tparam T Type of Object, currently, Only Layer is supported
@@ -209,10 +215,13 @@ public:
    * @param kernel_string kernel implementation string
    * @param kernel_name kernel name
    * @return std::shared_ptr<opencl::Kernel>
+   * @note by const reference on purpose: kernel sources are tens of KB and a
+   *       by-value signature copies the whole source on every cached lookup.
    */
-  const SharedPtrClKernel registerClKernel(std::string kernel_string,
-                                           std::string kernel_name,
-                                           std::string compile_options = {});
+  const SharedPtrClKernel
+  registerClKernel(const std::string &kernel_string,
+                   const std::string &kernel_name,
+                   const std::string &compile_options = {});
 
   /**
    * @brief Initialize and register all blas OpenCl kernels
@@ -230,6 +239,14 @@ public:
   std::string getName() override { return "gpu"; }
 
   /**
+   * @brief Capability snapshot of the OpenCL device, probed once in
+   *        initialize(). Callers that need to branch on what the device can do
+   *        read this, never a device-name string.
+   * @return const DeviceCaps& the probed capabilities
+   */
+  const DeviceCaps &caps() const override { return caps_; }
+
+  /**
    * @brief Set the Mem Allocator object
    *
    * @param mem Memory allocator object
@@ -243,6 +260,9 @@ private:
    * @brief   Overriden initialization function
    */
   void initialize() noexcept override;
+
+  /** device capabilities, probed once at initialize() */
+  DeviceCaps caps_;
 
   void add_default_object();
 

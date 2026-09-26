@@ -160,6 +160,13 @@ if get_option('platform') != 'android' and host_machine.cpu_family() == 'aarch64
 endif
 
 if get_option('enable-fp16')
+   # fp16-impl is read by exactly one branch below, the non-android x86_64 one:
+   # every other arch has a native half type and takes it unconditionally. Say
+   # so rather than let a non-default value be discarded in silence, which
+   # otherwise lets someone believe they produced a wrapper build.
+   if get_option('fp16-impl') != 'auto' and not (arch == 'x86_64' and get_option('platform') != 'android')
+     warning('fp16-impl=@0@ is ignored on this build: the option selects the x86_64 fp16 backing type, and this build uses the native __fp16/_Float16.'.format(get_option('fp16-impl')))
+   endif
    if get_option('platform') == 'android'
      # NDK clang (and non-ARM host compilers used for the meson-built QNN
      # plugin) reject -mfp16-format=ieee; only pass it when supported.
@@ -212,11 +219,26 @@ if get_option('enable-fp16')
        error ('The compiler does not support -mfp16-format=ieee')
      endif
    elif arch == 'x86_64'
-     if cc.version().version_compare('>=12.1.0')
-       message ('Float16 for x86_64 enabled. Modern gcc-x64 generally supports float16 with _Float16.')
+     # Selection is capability-based, not compiler-name-based: use native
+     # _Float16 when the compiler can actually *do* half arithmetic, otherwise
+     # fall back to the uint16-backed nntrainer::Half wrapper (e.g. MSVC).
+     fp16_impl = get_option('fp16-impl')
+     fp16_probe = '''_Float16 mul(_Float16 a, _Float16 b){ return a * b; }
+int main(){ _Float16 x = (_Float16)1, y = (_Float16)2; return (int)mul(x, y); }'''
+     if fp16_impl == 'native'
+       fp16_native = true
+     elif fp16_impl == 'wrapper'
+       fp16_native = false
+     else # auto
+       fp16_native = cxx.compiles(fp16_probe, name: 'native _Float16 arithmetic')
+     endif
+     if fp16_native
+       message ('Float16 for x86_64 enabled: native _Float16 (GCC/clang, byte-identical).')
        extra_defines += '-DENABLE_FP16=1'
      else
-       warning ('Float16 for x86_64 enabled. However, software emulation is applied for fp16, making it slower and inconsistent. Use GCC 12+ for FP16 support. This build will probably fail unless you bring a compiler that supports fp16 for x64.')
+       message ('Float16 for x86_64 enabled: uint16-backed nntrainer::Half wrapper (no native _Float16).')
+       extra_defines += '-DENABLE_FP16=1'
+       extra_defines += '-DUSE_HALF_WRAPPER=1'
      endif
    elif arch == 'riscv64'
      error ('RISCV64 RVV support and fp16 support is not yet implemented.')
@@ -269,6 +291,42 @@ endif
 if get_option('opencl-kernel-path') != ''
   message ('OpenCL kernel path set to: @0@'.format(get_option('opencl-kernel-path')))
   extra_defines += '-DOPENCL_KERNEL_PATH=@0@'.format(get_option('opencl-kernel-path'))
+endif
+
+# Additive NVIDIA CUDA backend. Mirrors the OpenCL wiring above but is fully
+# independent: when enable-cuda is false this block is skipped and the OpenCL /
+# CPU builds are byte-identical. Kernels are compiled at runtime via NVRTC, so
+# the library build only needs to link cudart/nvrtc/cuBLAS + the driver API --
+# there is no nvcc/device-code compilation step and no arch to pick at build
+# time.
+if get_option('enable-cuda')
+  if get_option('platform') == 'android'
+    error('enable-cuda is only supported on desktop NVIDIA platforms, not android')
+  endif
+
+  extra_defines += '-DENABLE_CUDA=1'
+
+  cuda_path = get_option('cuda-path')
+  cuda_incdir = include_directories(cuda_path / 'include')
+  cuda_libdir = cuda_path / 'lib64'
+
+  cudart_dep   = cxx.find_library('cudart',   dirs: cuda_libdir, required: true)
+  nvrtc_dep    = cxx.find_library('nvrtc',    dirs: cuda_libdir, required: true)
+  cublas_dep   = cxx.find_library('cublas',   dirs: cuda_libdir, required: true)
+  cublaslt_dep = cxx.find_library('cublasLt', dirs: cuda_libdir, required: true)
+  # libcuda (driver API: cuModuleLoad/cuLaunchKernel) ships with the NVIDIA
+  # driver, not the toolkit; fall back to the toolkit stub if the driver lib is
+  # not on the default search path.
+  cudadrv_dep = cxx.find_library('cuda', required: false)
+  if not cudadrv_dep.found()
+    cudadrv_dep = cxx.find_library('cuda', dirs: cuda_libdir / 'stubs', required: true)
+  endif
+
+  cuda_dep = declare_dependency(
+    include_directories: cuda_incdir,
+    dependencies: [cudart_dep, nvrtc_dep, cublas_dep, cublaslt_dep, cudadrv_dep],
+  )
+  message('CUDA backend enabled. Toolkit: ' + cuda_path)
 endif
 
 # HTP (Hexagon/HMX) backend via Qualcomm HexKL CPU Macro API (libsdkl.so).

@@ -4,6 +4,7 @@
 /usr/include/nntrainer/optimizer.h
 /usr/include/nntrainer/dataset.h
 /usr/include/nntrainer/tensor_dim.h
+/usr/include/nntrainer/half_fp16.h
 /usr/include/nntrainer/tensor_api.h
 /usr/lib/*/pkgconfig/ccapi-ml-training.pc
 /usr/lib/*/libccapi-*.a

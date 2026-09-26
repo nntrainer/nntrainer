@@ -26,9 +26,14 @@ void nntr_gemm_q4_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
 #ifdef ENABLE_FP16
 // Pick the half type the same way tensor_dim.h does, so this header stays
 // self-contained even if a caller pulls it in without tensor_dim.h. On
-// ARM/Android (USE__FP16) it is __fp16; on x86_64 fp16 builds it is _Float16.
+// ARM/Android (USE__FP16) it is __fp16; on x86_64 fp16 builds it is _Float16,
+// except on compilers without native _Float16 (MSVC), where the build defines
+// USE_HALF_WRAPPER and the uint16-backed nntrainer::Half stands in.
 #ifdef USE__FP16
 #define NNTR_GGML_FP16 __fp16
+#elif defined(USE_HALF_WRAPPER)
+#include "half_fp16.h" // self-contained leaf: uint16-backed nntrainer::Half
+#define NNTR_GGML_FP16 ::nntrainer::Half
 #else
 #define NNTR_GGML_FP16 _Float16
 #endif
