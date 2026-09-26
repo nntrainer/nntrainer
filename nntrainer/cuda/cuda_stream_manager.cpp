@@ -361,7 +361,7 @@ int *cuda_pos_buffer() {
   return sh->pos_dev;
 }
 
-/* [kv-regime] The host half of the decode graph's validity. Declared in
+/** [kv-regime] The host half of the decode graph's validity. Declared in
  * cuda_stream_manager.h, where the mechanism and the measurement that motivated
  * it are written down. Kept next to SharedCudaState because it has to be ONE
  * table per process: the sites that record are in the layer module and the site
@@ -372,7 +372,7 @@ bool kv_regime_gt(int kv_len, int threshold) {
   auto *sh = shared_cuda_state();
   if (sh->regime_recording == 0)
     return answer;
-  /* Store the site's distance to its bound, so one per-token delta re-asks the
+  /** Store the site's distance to its bound, so one per-token delta re-asks the
    * question no matter which count (N_kv, N_kv-1, ...) the site compared. */
   const int delta = kv_len - threshold;
   for (int i = 0; i < sh->regime_n; ++i)
@@ -409,7 +409,7 @@ bool kv_regime_holds(int kv_len) {
   const int delta = kv_len - sh->regime_base_kv;
   if (sh->regime_exact != 0)
     return delta == 0;
-  /* A table that overflowed is not a description of the capture, so it cannot
+  /** A table that overflowed is not a description of the capture, so it cannot
    * certify one. Recapture every step instead of replaying an unknown. */
   if (sh->regime_overflow != 0)
     return delta == 0;
