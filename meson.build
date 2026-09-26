@@ -555,7 +555,15 @@ endif
 if get_option('platform') == 'windows'
     googletest_lib_dir_absolute = windows_resource_dir_absolute / 'googletest'
     googletest_lib_dir_absolute_win = googletest_lib_dir_absolute.replace('/', '\\')
-    run_command(['xcopy', '/C', '/Y', googletest_lib_dir_absolute_win, meson.current_build_dir()], check: true)
+    # Only copy the prebuilt gtest/gmock libs when something will link them.
+    # This xcopy used to run for every windows configure, so a build with
+    # -Denable-test=false still hard-failed when nntrainer-windows-resource was
+    # absent -- which is every consumer build, none of which wants the test
+    # suite. The declarations below stay unconditional: they are cheap, and
+    # gating them would make the variables undefined for any later reference.
+    if get_option('enable-test')
+      run_command(['xcopy', '/C', '/Y', googletest_lib_dir_absolute_win, meson.current_build_dir()], check: true)
+    endif
     googletest_dir_relative = subprojects_dir_relative / 'googletest'
     gtest_include = include_directories(googletest_dir_relative / 'googletest' / 'include')
     gmock_include = include_directories(googletest_dir_relative / 'googlemock' / 'include')

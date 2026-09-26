@@ -7,7 +7,12 @@
 
 param (
     [string]$BuildDir = "build",
-    [string]$RustTarget = ""
+    [string]$RustTarget = "",
+    # Link the static CRT (/MT + crt-static) instead of the dynamic default.
+    # Required when the consuming build uses -Db_vscrt=static_from_buildtype:
+    # a single /MD object in this lib (the cc-crate C++ deps, e.g. esaxx)
+    # otherwise fails every exe link with LNK2038 RuntimeLibrary mismatch.
+    [switch]$StaticCrt
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,25 +66,33 @@ Write-Output "  target: $TargetDir"
 $PreviousRustFlags = $env:RUSTFLAGS
 $PreviousCFlags = $env:CFLAGS
 $PreviousCxxFlags = $env:CXXFLAGS
-$DynamicCrtFlag = "-C target-feature=-crt-static"
+# These are APPENDED after any caller-provided flags, so they always win --
+# the CRT choice is owned by this switch, not by ambient env.
+if ($StaticCrt) {
+    $RustCrtFlag = "-C target-feature=+crt-static"
+    $CCrtFlag = "/MT"
+} else {
+    $RustCrtFlag = "-C target-feature=-crt-static"
+    $CCrtFlag = "/MD"
+}
 
 try {
     if ([string]::IsNullOrWhiteSpace($PreviousRustFlags)) {
-        $env:RUSTFLAGS = $DynamicCrtFlag
+        $env:RUSTFLAGS = $RustCrtFlag
     } else {
-        $env:RUSTFLAGS = "$PreviousRustFlags $DynamicCrtFlag"
+        $env:RUSTFLAGS = "$PreviousRustFlags $RustCrtFlag"
     }
 
     if ([string]::IsNullOrWhiteSpace($PreviousCFlags)) {
-        $env:CFLAGS = "/MD"
+        $env:CFLAGS = $CCrtFlag
     } else {
-        $env:CFLAGS = "$PreviousCFlags /MD"
+        $env:CFLAGS = "$PreviousCFlags $CCrtFlag"
     }
 
     if ([string]::IsNullOrWhiteSpace($PreviousCxxFlags)) {
-        $env:CXXFLAGS = "/MD"
+        $env:CXXFLAGS = $CCrtFlag
     } else {
-        $env:CXXFLAGS = "$PreviousCxxFlags /MD"
+        $env:CXXFLAGS = "$PreviousCxxFlags $CCrtFlag"
     }
 
     & cargo @CargoArgs

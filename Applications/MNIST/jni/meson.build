@@ -17,6 +17,16 @@ mnist_sources = [
   'main.cpp'
 ]
 
+# This demo links gtest unconditionally, but on windows the prebuilt gtest
+# libs are only copied into the build dir when the tests are built (the
+# enable-test gate around that xcopy) -- gtest_dep.found() still says true
+# there, and the link then dies with LNK1181 on a gtest.lib that was never
+# copied. A gtest demo in a build that asked for no tests is dead weight
+# anyway: skip it, completing the gate's other half.
+if host_machine.system() == 'windows' and not get_option('enable-test')
+  subdir_done()
+endif
+
 if not gtest_dep.found()
   error('Gtest dependency not found for MNIST application')
 endif

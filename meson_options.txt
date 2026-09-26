@@ -89,7 +89,7 @@ option('nnstreamer-subplugin-install-path', type: 'string', value: 'lib/nnstream
 # application related options
 option('enable-transformer', type: 'boolean', value: false)
 option('causallm-tokenizer-lib', type: 'string', value: '',
-       description: 'Windows-only path to tokenizers_c.lib for CausalLM. The default is generated under <builddir>/tokenizers_c_win/target.')
+       description: 'Path to a prebuilt CausalLM tokenizer library to link instead of the default. Windows generates its default under <builddir>/tokenizers_c_win/target; elsewhere the tracked Applications/CausalLM/lib/libtokenizers_c.a is staged into the build directory. Use this option for a locally built archive - never overwrite the tracked one.')
 
 # ARM architecture options
 # Note: Tizen (GBS) builds do not use this option
