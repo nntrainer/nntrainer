@@ -25,14 +25,12 @@ subdir('layers')
 # Add common layers to dependencies
 causallm_layer_dependencies += [
     causallm_rms_norm_dep,
-    causallm_tie_word_embedding_dep,
-    causallm_lm_head_dep,
-    causallm_swiglu_dep,
+    # tie_word_embedding, lm_head and swiglu are core nntrainer layers
     causallm_mha_core_dep,
     causallm_embedding_layer_dep,
-    causallm_lm_head_dep,
     causallm_reshaped_rms_norm_dep,
-    causallm_qkv_layer_dep,
+    causallm_rms_reverse_norm_dep,
+    # qkv_layer is a core nntrainer layer
     causallm_embedding_pooling_layer_dep,
     causallm_embedding_normalize_layer_dep,
     causallm_causal_conv1d_dep,
@@ -40,9 +38,16 @@ causallm_layer_dependencies += [
     causallm_deberta_attention_layer_dep,
     causallm_shared_fully_connected_layer_dep,
     causallm_per_layer_slice_dep,
-    causallm_scalar_multiply_dep,
-    causallm_logit_softcapping_dep,
+    # scalar_multiply and logit_softcapping are core nntrainer layers
 ]
+
+# Additive CUDA backend: the model TUs (transformer/causal_lm/gemma4) include
+# cuda_context.h to register layers on the cuda context, which pulls cuda.h ->
+# they need the CUDA toolkit include path. cuda_dep is defined in the root
+# meson.build only when enable-cuda is set.
+if get_option('enable-cuda')
+    causallm_layer_dependencies += cuda_dep
+endif
 
 subdir('models')
 
@@ -360,6 +365,30 @@ if get_option('enable-test')
       timeout: 60,
       suite: 'unittests',
       env: {'NNTR_QUANTIZE_BIN': e_quantize.full_path()}
+    )
+  endif
+
+  # Dedicated gemma4_tiny differential test for the additive CUDA backend.
+  # Built even in FP16-enabled builds (where the broad model-unittest set above
+  # is skipped), so engine=cuda first-light can be validated against the HF
+  # reference. Run with NNTR_ENGINE=cuda (or cpu for a baseline).
+  if get_option('enable-cuda')
+    unittest_cuda_gemma4 = executable(
+      'unittest_cuda_gemma4',
+      [
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'causallm_test_utils.cpp',
+        meson.source_root() / 'test' / 'unittest' / 'models' / 'unittest_causallm_gemma4_reference.cpp',
+      ],
+      dependencies: [
+        nntrainer_dep,
+        nntrainer_ccapi_dep,
+        gtest_main_dep,
+        causallm_layer_dependencies,
+        causallm_dep
+      ],
+      include_directories: causallm_inc + [causallm_unittest_inc],
+      build_by_default: false,
+      install: false,
     )
   endif
 endif

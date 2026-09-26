@@ -120,5 +120,28 @@ int amaxCl(const Tensor &input);
  */
 int aminCl(const Tensor &input);
 
+/**
+ * @brief v8c GPU path entry point — paper 8/4/4 (arXiv:2505.00232): int8
+ *        activation × channel-wise QINT4 weight GEMM. Default-on for the GPU
+ *        FC dispatch; NNTR_FC_INT8_GPU=0 disables. Caller falls back to the
+ *        generic host path on false.
+ * @param[in] input fp32 or fp16 activation tensor [M, K]
+ * @param[in] weight channel-wise QINT4 (QS4CX) weight tensor [K, N]
+ * @param[out] output fp32 or fp16 tensor [M, N] (preallocated)
+ * @return true if the v8c path executed; false if not applicable
+ *         (env disabled, weight not int4, shape misaligned).
+ */
+bool dotCl_v8c(const Tensor &input, const Tensor &weight, Tensor &output);
+
+/**
+ * @brief Eagerly build the v8c GPU weight entry (nibble permute + upload +
+ *        image view) for a freshly READ int4 FC weight, so the first prefill
+ *        does not pay the lazy per-weight build. Called by the CL FC layer
+ *        after the base read. Returns false (no-op) off the v8c path (env
+ *        unset / non-int4 / unsupported shape); the lazy build in dotCl_v8c
+ *        still covers those.
+ */
+bool dotCl_v8c_prebuild_weight(const Tensor &weight);
+
 } // namespace nntrainer
 #endif /* __BLAS_KERNEL_INTERFACE_H__ */

@@ -1,12 +1,24 @@
 #!/bin/bash
 
-# Script to build tokenizers-cpp library for Android
+# Build the CausalLM tokenizers_c static library for Android.
+#
+# Source of truth is the in-tree crate Applications/CausalLM/tokenizers_c_win,
+# NOT an external mlc-ai/tokenizers-cpp checkout. The crate exports exactly the
+# C ABI declared in Applications/CausalLM/tokenizers_c.h and is pinned by its
+# own Cargo.lock, so the android archive is reproducible and matches the tracked
+# x86 archive lib/libtokenizers_c.a member for member. The C++ side of the
+# tokenizer (tokenizers::Tokenizer) is compiled from the in-tree
+# huggingface_tokenizer.cpp by every ndk module that needs it, exactly as the
+# meson build does -- it must not also arrive prebuilt inside this archive.
+#
+# usage: ./build_tokenizer_android.sh [abi]      (default: arm64-v8a)
+
 set -e
 
 # Default target ABI
 TARGET_ABI="${1:-arm64-v8a}"
 
-echo "Building tokenizers-cpp library for Android $TARGET_ABI..."
+echo "Building tokenizers_c library for Android $TARGET_ABI..."
 
 # Check prerequisites
 if [ -z "$ANDROID_NDK" ]; then
@@ -14,45 +26,33 @@ if [ -z "$ANDROID_NDK" ]; then
     exit 1
 fi
 
-# Check if cmake is installed
-if ! command -v cmake &> /dev/null; then
-    echo "Error: cmake is not installed. Please install cmake."
-    exit 1
-fi
-
 # Check if rust is installed
 if ! command -v rustc &> /dev/null || ! command -v cargo &> /dev/null; then
-    echo "Error: Rust is not installed. Please install Rust from https://rustup.rs/"
-    exit 1
+    if [ -x "$HOME/.cargo/bin/cargo" ]; then
+        export PATH="$HOME/.cargo/bin:$PATH"
+    else
+        echo "Error: Rust is not installed. Please install Rust from https://rustup.rs/"
+        exit 1
+    fi
 fi
 
-# Map Android ABI to Rust target
+# Map Android ABI to the Rust target triple and the NDK cross-compiler prefix.
 case "$TARGET_ABI" in
     "arm64-v8a")
         RUST_TARGET="aarch64-linux-android"
+        CLANG_PREFIX="aarch64-linux-android"
         ;;
     "armeabi-v7a")
         RUST_TARGET="armv7-linux-androideabi"
+        CLANG_PREFIX="armv7a-linux-androideabi"
         ;;
     "x86")
         RUST_TARGET="i686-linux-android"
+        CLANG_PREFIX="i686-linux-android"
         ;;
     "x86_64")
         RUST_TARGET="x86_64-linux-android"
-        ;;
-esac
-
-# Install Rust target if not already installed
-echo "Checking Rust target: $RUST_TARGET"
-if ! rustup target list --installed | grep -q "$RUST_TARGET"; then
-    echo "Installing Rust target: $RUST_TARGET"
-    rustup target add "$RUST_TARGET"
-fi
-
-# Validate target ABI
-case "$TARGET_ABI" in
-    "arm64-v8a"|"armeabi-v7a"|"x86"|"x86_64")
-        echo "Target ABI: $TARGET_ABI"
+        CLANG_PREFIX="x86_64-linux-android"
         ;;
     *)
         echo "Error: Invalid target ABI: $TARGET_ABI"
@@ -60,32 +60,25 @@ case "$TARGET_ABI" in
         exit 1
         ;;
 esac
+echo "Target ABI: $TARGET_ABI"
 
-# Set build directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="$SCRIPT_DIR/tokenizers-cpp-build"
+# Must track APP_PLATFORM in jni/Application.mk: this archive is linked into
+# modules built against that API level.
+ANDROID_API=29
 
-# Clone tokenizers-cpp repository if not exists
-if [ ! -d "$BUILD_DIR/tokenizers-cpp" ]; then
-    echo "Cloning tokenizers-cpp repository..."
-    mkdir -p "$BUILD_DIR"
-    cd "$BUILD_DIR"
-    git clone https://github.com/mlc-ai/tokenizers-cpp.git
+# Install the Rust target if it is not already installed
+echo "Checking Rust target: $RUST_TARGET"
+if command -v rustup &> /dev/null; then
+    if ! rustup target list --installed | grep -q "^$RUST_TARGET$"; then
+        echo "Installing Rust target: $RUST_TARGET"
+        rustup target add "$RUST_TARGET"
+    fi
 fi
 
-cd "$BUILD_DIR/tokenizers-cpp"
-
-# Update submodules
-echo "Updating submodules..."
-git submodule update --init --recursive
-
-# Create build directory for specific ABI
-mkdir -p "build-android-$TARGET_ABI"
-cd "build-android-$TARGET_ABI"
-
-# Set up Android toolchain variables
-ANDROID_PLATFORM="android-29"
-ANDROID_STL="c++_static"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CRATE_DIR="$SCRIPT_DIR/tokenizers_c_win"
+BUILD_DIR="${BUILD_DIR:-$SCRIPT_DIR/tokenizers-android-build}"
+TARGET_DIR="$BUILD_DIR/target-$TARGET_ABI"
 
 # Detect platform for NDK paths
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -99,150 +92,49 @@ else
     NDK_HOST="linux-x86_64"
 fi
 
-# Set Rust environment variables for cross-compilation
-export CARGO_TARGET_DIR="$BUILD_DIR/tokenizers-cpp/build-android-$TARGET_ABI/rust"
+TOOLCHAIN="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin"
+TARGET_CC="$TOOLCHAIN/${CLANG_PREFIX}${ANDROID_API}-clang"
+if [ ! -x "$TARGET_CC" ]; then
+    echo "Error: $TARGET_CC not found."
+    exit 1
+fi
 
-# Additional Rust configuration for Android
-export CARGO_BUILD_TARGET="$RUST_TARGET"
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/aarch64-linux-android29-clang"
-export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/armv7a-linux-androideabi29-clang"
-export CARGO_TARGET_I686_LINUX_ANDROID_LINKER="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/i686-linux-android29-clang"
-export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/x86_64-linux-android29-clang"
+# The crate is a staticlib, so rustc only archives -- but the tokenizers
+# dependency pulls onig_sys and esaxx-rs, which compile C/C++ and therefore need
+# a cross compiler for the target triple.
+RUST_TARGET_UPPER=$(echo "$RUST_TARGET" | tr 'a-z-' 'A-Z_')
+RUST_TARGET_LOWER=$(echo "$RUST_TARGET" | tr '-' '_')
+export CARGO_TARGET_${RUST_TARGET_UPPER}_LINKER="$TARGET_CC"
+export CC_${RUST_TARGET_LOWER}="$TARGET_CC"
+export CXX_${RUST_TARGET_LOWER}="${TARGET_CC}++"
+export AR_${RUST_TARGET_LOWER}="$TOOLCHAIN/llvm-ar"
 
-export CC_aarch64_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/aarch64-linux-android29-clang"
-export CXX_aarch64_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/aarch64-linux-android29-clang++"
-export AR_aarch64_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/llvm-ar"
-export CC_armv7_linux_androideabi="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/armv7a-linux-androideabi29-clang"
-export CXX_armv7_linux_androideabi="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/armv7a-linux-androideabi29-clang++"
-export AR_armv7_linux_androideabi="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/llvm-ar"
-export CC_i686_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/i686-linux-android29-clang"
-export CXX_i686_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/i686-linux-android29-clang++"
-export AR_i686_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/llvm-ar"
-export CC_x86_64_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/x86_64-linux-android29-clang"
-export CXX_x86_64_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/x86_64-linux-android29-clang++"
-export AR_x86_64_linux_android="$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/llvm-ar"
+echo "Building crate: $CRATE_DIR"
+echo "Target dir:     $TARGET_DIR"
 
-# Configure with CMake for Android
-echo "Configuring CMake for Android $TARGET_ABI..."
-cmake .. \
-    -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
-    -DANDROID_ABI="$TARGET_ABI" \
-    -DANDROID_PLATFORM="$ANDROID_PLATFORM" \
-    -DANDROID_STL="$ANDROID_STL" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_SHARED_LIBS=OFF \
-    -DTOKENIZERS_CPP_BUILD_TESTS=OFF \
-    -DTOKENIZERS_CPP_BUILD_EXAMPLES=OFF \
-    -DCMAKE_VERBOSE_MAKEFILE=ON
+cargo build \
+    --manifest-path "$CRATE_DIR/Cargo.toml" \
+    --target-dir "$TARGET_DIR" \
+    --target "$RUST_TARGET" \
+    --release \
+    --locked
 
-# Build the library
-echo "Building tokenizers-cpp..."
-cmake --build . -j$(nproc) --verbose
+BUILT="$TARGET_DIR/$RUST_TARGET/release/libtokenizers_c.a"
+if [ ! -f "$BUILT" ]; then
+    echo "Error: libtokenizers_c.a was not produced at $BUILT"
+    exit 1
+fi
 
-# Show what was actually built
-echo "Build complete. Checking build outputs..."
-echo "Contents of build directory:"
-ls -la
-echo ""
-echo "Looking for static libraries (.a files):"
-find . -name "*.a" -type f -ls
-echo ""
-
-# Find and copy the built library
-echo "Searching for built libraries..."
 mkdir -p "$SCRIPT_DIR/lib/$TARGET_ABI"
+cp -f "$BUILT" "$SCRIPT_DIR/lib/$TARGET_ABI/libtokenizers_android_c.a"
 
-# Current directory is build-android-$TARGET_ABI
-CURRENT_BUILD_DIR="$BUILD_DIR/tokenizers-cpp/build-android-$TARGET_ABI"
-
-# Find all the generated libraries
-echo "Looking for .a files in build directory..."
-find "$CURRENT_BUILD_DIR" -name "*.a" -type f | while read -r lib; do
-    echo "Found library: $lib"
-done
-
-# Collect all libraries to combine
-LIBS_TO_COMBINE=""
-
-# Search for specific libraries with more flexible paths
-for lib_name in "libtokenizers_cpp.a" "libtokenizers_c.a" "libsentencepiece.a"; do
-    echo "Searching for $lib_name..."
-    lib_path=$(find "$CURRENT_BUILD_DIR" -name "$lib_name" -type f | head -n 1)
-    if [ -n "$lib_path" ]; then
-        echo "Found $lib_name at: $lib_path"
-        LIBS_TO_COMBINE="$LIBS_TO_COMBINE $lib_path"
-    fi
-done
-
-# If specific libraries not found, collect all .a files
-if [ -z "$LIBS_TO_COMBINE" ]; then
-    echo "Specific libraries not found. Collecting all .a files..."
-    LIBS_TO_COMBINE=$(find "$CURRENT_BUILD_DIR" -name "*.a" -type f | grep -v "CMakeFiles" | tr '\n' ' ')
+# jni/Android.mk links ../lib/libtokenizers_android_c.a for the default ABI.
+if [ "$TARGET_ABI" = "arm64-v8a" ]; then
+    cp -f "$BUILT" "$SCRIPT_DIR/lib/libtokenizers_android_c.a"
 fi
 
-# Combine all libraries into one
-if [ -n "$LIBS_TO_COMBINE" ]; then
-    echo "Libraries to combine: $LIBS_TO_COMBINE"
-    
-    # Create a temporary directory for extracting object files
-    TEMP_DIR="$BUILD_DIR/temp_objs"
-    rm -rf "$TEMP_DIR"
-    mkdir -p "$TEMP_DIR"
-    cd "$TEMP_DIR"
-    
-    # Extract all object files from each library
-    for lib in $LIBS_TO_COMBINE; do
-        if [ -f "$lib" ]; then
-            echo "Extracting from $lib..."
-            "$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/llvm-ar" x "$lib"
-        else
-            echo "Warning: Could not find $lib"
-        fi
-    done
-    
-    # Create the combined library
-    echo "Creating combined library..."
-    if ls *.o 1> /dev/null 2>&1; then
-        "$ANDROID_NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/llvm-ar" rcs "$SCRIPT_DIR/lib/$TARGET_ABI/libtokenizers_android_c.a" *.o
-        echo "Combined library created successfully"
-    else
-        echo "Error: No object files found to combine"
-        echo "Checking if any libraries were built..."
-        
-        # If no object files, maybe the libraries are header-only or built differently
-        # Try to copy the first found library as-is
-        first_lib=$(echo $LIBS_TO_COMBINE | awk '{print $1}')
-        if [ -f "$first_lib" ]; then
-            echo "Copying $first_lib as libtokenizers_android_c.a"
-            cp "$first_lib" "$SCRIPT_DIR/lib/$TARGET_ABI/libtokenizers_android_c.a"
-        else
-            cd ..
-            rm -rf "$TEMP_DIR"
-            exit 1
-        fi
-    fi
-    
-    # Clean up
-    cd ..
-    rm -rf "$TEMP_DIR"
-else
-    echo "Error: No libraries found to combine"
-    echo "Build may have failed. Check the build output above."
-    exit 1
-fi
-
-# For backward compatibility, also copy to lib directory for default ABI
-if [ "$TARGET_ABI" = "arm64-v8a" ] && [ -f "$SCRIPT_DIR/lib/$TARGET_ABI/libtokenizers_android_c.a" ]; then
-    cp "$SCRIPT_DIR/lib/$TARGET_ABI/libtokenizers_android_c.a" "$SCRIPT_DIR/lib/libtokenizers_android_c.a"
-fi
-
-if [ -f "$SCRIPT_DIR/lib/$TARGET_ABI/libtokenizers_android_c.a" ]; then
-    echo "Build completed successfully!"
-    echo "Library copied to: $SCRIPT_DIR/lib/$TARGET_ABI/libtokenizers_android_c.a"
-    if [ "$TARGET_ABI" = "arm64-v8a" ]; then
-        echo "Also copied to: $SCRIPT_DIR/lib/libtokenizers_android_c.a (for backward compatibility)"
-    fi
-else
-    echo "Error: Failed to build or find the tokenizers library"
-    exit 1
+echo "Build completed successfully!"
+echo "Library copied to: $SCRIPT_DIR/lib/$TARGET_ABI/libtokenizers_android_c.a"
+if [ "$TARGET_ABI" = "arm64-v8a" ]; then
+    echo "Also copied to: $SCRIPT_DIR/lib/libtokenizers_android_c.a"
 fi

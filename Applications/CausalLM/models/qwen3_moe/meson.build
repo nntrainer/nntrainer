@@ -7,14 +7,25 @@ qwen3_moe_inc = include_directories('.')
 # Define Layers
 causallm_moe_layer_src_abs = [meson.current_source_dir() / 'qwen_moe_layer.cpp']
 
-causallm_moe_layer = shared_library(
-    'qwen_moe_layer',
-    causallm_moe_layer_src_abs,
-    include_directories: [causallm_layer_inc, qwen3_moe_inc],
-    dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
-    install: true,
-    install_dir: application_install_dir
-)
+if get_option('default_library') == 'static'
+    causallm_moe_layer = static_library(
+        'qwen_moe_layer',
+        causallm_moe_layer_src_abs,
+        include_directories: [causallm_layer_inc, qwen3_moe_inc],
+        dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+        install: true,
+        install_dir: application_install_dir
+    )
+else
+    causallm_moe_layer = shared_library(
+        'qwen_moe_layer',
+        causallm_moe_layer_src_abs,
+        include_directories: [causallm_layer_inc, qwen3_moe_inc],
+        dependencies: [nntrainer_dep, nntrainer_ccapi_dep],
+        install: true,
+        install_dir: application_install_dir
+    )
+endif
 
 causallm_moe_layer_dep = declare_dependency(
     link_with: causallm_moe_layer,

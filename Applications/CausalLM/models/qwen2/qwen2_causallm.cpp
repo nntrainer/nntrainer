@@ -48,22 +48,19 @@ Tensor Qwen2Transformer::createAttention(const int layer_id, int seq_len,
      withKey("disable_bias", "false"), withKey("weight_initializer", "ones")}));
   Tensor v = wv(value);
 
-  // External KV cache placeholders (per-layer). Storage is owned by the host
-  // (KVCacheManager) and bound at runtime via setExternalTensors.
-  auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
-
   // Attention core layer
   LayerHandle mha(createLayer(
     "mha_core",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
      withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
      withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
-     withKey("sliding_window", SLIDING_WINDOW),
+     withKey("sliding_window", getLayerSlidingWindow(layer_id)),
      withKey("rope_theta", ROPE_THETA),
      withKey("max_position_embeddings", MAX_POSITION_EMBEDDINGS),
      withKey("max_new_tokens", std::to_string(NUM_TO_GENERATE)),
      withKey("is_causal", IS_CAUSAL ? "true" : "false")}));
-  Tensor a = mha({q, k, v, cache_k, cache_v});
+  Tensor a = wireAttentionKVCache(layer_id, n_heads, mha, q, k, v,
+                                  /*use_int8=*/false);
 
   // O layer
   LayerHandle wo(createLayer(

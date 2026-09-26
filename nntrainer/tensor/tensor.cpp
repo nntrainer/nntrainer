@@ -15,7 +15,6 @@
 
 #include <char_tensor.h>
 #include <float_tensor.h>
-#include <int4_tensor.h>
 #include <lazy_tensor.h>
 #include <q4_0_tensor.h>
 #include <q4_k_tensor.h>
@@ -64,8 +63,10 @@ Tensor::Tensor(
   std::vector<float> const &scales, ml::train::TensorDim::TensorType t_type,
   QScheme qscheme_) {
   if (t_type.data_type == Tdatatype::QINT4) {
-    itensor_ =
-      std::make_unique<Int4QTensor>(d, scales, t_type.format, qscheme_);
+    throw std::invalid_argument(
+      "QINT4 is an on-disk format only: int4 weights materialise as QS4CX. "
+      "Load them through a QS4CX tensor, or mark the record legacy with "
+      "Tensor::setOnDiskLegacyQint4().");
   } else if (t_type.data_type == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(d, scales, t_type.format, qscheme_);
   } else {
@@ -149,7 +150,10 @@ Tensor::Tensor(std::string name_, Tformat fm, Tdatatype d_type) {
   } else if (d_type == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(name_, fm);
   } else if (d_type == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(name_, fm);
+    throw std::invalid_argument(
+      "QINT4 is an on-disk format only: int4 weights materialise as QS4CX. "
+      "Load them through a QS4CX tensor, or mark the record legacy with "
+      "Tensor::setOnDiskLegacyQint4().");
   } else if (d_type == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(name_, fm);
@@ -205,7 +209,10 @@ Tensor::Tensor(const TensorDim &d, bool alloc_now, Initializer init,
   } else if (d.getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(d, alloc_now, init, name, qscheme);
   } else if (d.getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(d, alloc_now, init, name, qscheme);
+    throw std::invalid_argument(
+      "QINT4 is an on-disk format only: int4 weights materialise as QS4CX. "
+      "Load them through a QS4CX tensor, or mark the record legacy with "
+      "Tensor::setOnDiskLegacyQint4().");
   } else if (d.getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(d, alloc_now, init, name);
@@ -256,7 +263,10 @@ Tensor::Tensor(const TensorDim &d, const void *buf, QScheme qscheme) {
   } else if (d.getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(d, buf, qscheme);
   } else if (d.getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(d, buf);
+    throw std::invalid_argument(
+      "QINT4 is an on-disk format only: int4 weights materialise as QS4CX. "
+      "Load them through a QS4CX tensor, or mark the record legacy with "
+      "Tensor::setOnDiskLegacyQint4().");
   } else if (d.getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(d, buf);
@@ -302,7 +312,10 @@ Tensor::Tensor(const Tensor &rhs) {
   } else if (rhs.getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(*rhs.itensor_);
+    throw std::invalid_argument(
+      "QINT4 is an on-disk format only: int4 weights materialise as QS4CX. "
+      "Load them through a QS4CX tensor, or mark the record legacy with "
+      "Tensor::setOnDiskLegacyQint4().");
   } else if (rhs.getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(*rhs.itensor_);
@@ -331,6 +344,8 @@ Tensor::Tensor(const std::unique_ptr<TensorBase> &rhs) {
 #else
     throw std::invalid_argument("Error: enable-fp16 is not enabled");
 #endif
+  } else if (rhs->getDataType() == Tdatatype::QS4CX) {
+    itensor_ = std::make_unique<QS4CX_Tensor>(*rhs.get());
   } else if (rhs->getDataType() == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(*rhs.get());
   } else if (rhs->getDataType() == Tdatatype::UINT8) {
@@ -344,7 +359,10 @@ Tensor::Tensor(const std::unique_ptr<TensorBase> &rhs) {
   } else if (rhs->getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(*rhs.get());
   } else if (rhs->getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(*rhs.get());
+    throw std::invalid_argument(
+      "QINT4 is an on-disk format only: int4 weights materialise as QS4CX. "
+      "Load them through a QS4CX tensor, or mark the record legacy with "
+      "Tensor::setOnDiskLegacyQint4().");
   } else if (rhs->getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(*rhs.get());
@@ -370,6 +388,8 @@ Tensor &Tensor::operator=(const Tensor &rhs) {
     itensor_ = std::make_unique<Q6_K_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::Q4_0) {
     itensor_ = std::make_unique<Q4_0_Tensor>(*rhs.itensor_);
+  } else if (rhs.getDataType() == Tdatatype::QS4CX) {
+    itensor_ = std::make_unique<QS4CX_Tensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT4) {
     itensor_ = std::make_unique<Uint4QTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::UINT8) {
@@ -383,7 +403,10 @@ Tensor &Tensor::operator=(const Tensor &rhs) {
   } else if (rhs.getDataType() == Tdatatype::QINT8) {
     itensor_ = std::make_unique<CharTensor>(*rhs.itensor_);
   } else if (rhs.getDataType() == Tdatatype::QINT4) {
-    itensor_ = std::make_unique<Int4QTensor>(*rhs.itensor_);
+    throw std::invalid_argument(
+      "QINT4 is an on-disk format only: int4 weights materialise as QS4CX. "
+      "Load them through a QS4CX tensor, or mark the record legacy with "
+      "Tensor::setOnDiskLegacyQint4().");
   } else if (rhs.getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
     itensor_ = std::make_unique<BCQTensor>(*rhs.itensor_);
@@ -421,6 +444,8 @@ bool Tensor::operator==(const Tensor &rhs) const {
       return itensorCompare<Q6_K_Tensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::Q4_0) {
       return itensorCompare<Q4_0_Tensor>(itensor_.get(), rhs.itensor_.get());
+    } else if (getDataType() == Tdatatype::QS4CX) {
+      return itensorCompare<QS4CX_Tensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::UINT4) {
       return itensorCompare<Uint4QTensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::UINT8) {
@@ -434,7 +459,10 @@ bool Tensor::operator==(const Tensor &rhs) const {
     } else if (getDataType() == Tdatatype::QINT8) {
       return itensorCompare<CharTensor>(itensor_.get(), rhs.itensor_.get());
     } else if (getDataType() == Tdatatype::QINT4) {
-      return itensorCompare<Int4QTensor>(itensor_.get(), rhs.itensor_.get());
+      throw std::invalid_argument(
+        "QINT4 is an on-disk format only: int4 weights materialise as QS4CX. "
+        "Load them through a QS4CX tensor, or mark the record legacy with "
+        "Tensor::setOnDiskLegacyQint4().");
     } else if (getDataType() == Tdatatype::BCQ) {
 #ifdef ENABLE_BIQGEMM
       return itensorCompare<BCQTensor>(itensor_.get(), rhs.itensor_.get());
@@ -1274,6 +1302,16 @@ const std::shared_ptr<MemoryData> Tensor::getMemoryData() const {
 
 size_t Tensor::getOffset() const { return itensor_->getOffset(); }
 
+bool Tensor::isClMem() const {
+  auto md = itensor_->getMemoryData();
+  return md && md->isClMem();
+}
+
+void *Tensor::getClMem() const {
+  auto md = itensor_->getMemoryData();
+  return md ? md->deviceMem() : nullptr;
+}
+
 void Tensor::copy(const Tensor &from) {
   /// @todo enable copy to non-contiguous tensor
   if (!itensor_->getContiguous() || !from.getContiguous()) {
@@ -1591,6 +1629,10 @@ bool Tensor::checkContinuous(unsigned int np1, unsigned int np2) const {
 
   return false;
 }
+
+void Tensor::setOnDiskLegacyQint4(bool v) { itensor_->setOnDiskLegacyQint4(v); }
+
+void Tensor::setQs4cxRecordPadded(bool v) { itensor_->setQs4cxRecordPadded(v); }
 
 void Tensor::setFileOffset(const size_t file_offset) {
   itensor_->setFileOffset(file_offset);

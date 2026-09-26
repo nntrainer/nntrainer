@@ -50,4 +50,19 @@ void LayerImpl::exportTo(Exporter &exporter,
   exporter.saveResult(*layer_impl_props, method, this);
 }
 
+void LayerImpl::rejectFusedActivationOnTrainingGraph(
+  const props::FusedActivation &fused_act, ml::train::ExecutionMode mode,
+  const char *layer_type) {
+  if (fused_act.empty() || fused_act.get() == ActivationType::ACT_NONE)
+    return;
+
+  NNTR_THROW_IF(mode != ml::train::ExecutionMode::INFERENCE,
+                std::invalid_argument)
+    << "[" << layer_type
+    << "] fused_activation is an inference-only epilogue: it has no backward, "
+       "so a graph that can train must keep the activation as its own layer. "
+       "Set activation= instead and let the compiler fuse it on an inference "
+       "compile.";
+}
+
 } // namespace nntrainer

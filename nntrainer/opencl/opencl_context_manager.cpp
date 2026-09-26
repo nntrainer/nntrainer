@@ -89,6 +89,16 @@ void ContextManager::ReleaseContext() {
  */
 const cl_device_id ContextManager::GetDeviceId() { return device_id_; }
 
+std::string ContextManager::GetDeviceSignature() {
+  if (device_id_ == nullptr)
+    return "unknown";
+  char name[256] = {0};
+  char drv[256] = {0};
+  clGetDeviceInfo(device_id_, CL_DEVICE_NAME, sizeof(name) - 1, name, nullptr);
+  clGetDeviceInfo(device_id_, CL_DRIVER_VERSION, sizeof(drv) - 1, drv, nullptr);
+  return std::string(name) + "|" + std::string(drv);
+}
+
 void *ContextManager::createSVMRegion(size_t size) {
   if (context_)
     return clSVMAlloc(context_, CL_MEM_READ_WRITE, size, 0);

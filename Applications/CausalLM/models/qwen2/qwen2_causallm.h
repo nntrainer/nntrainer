@@ -35,6 +35,14 @@ public:
   Tensor createAttention(const int layer_id, int seq_len, int n_heads,
                          int head_dim, Tensor query, Tensor key,
                          Tensor value) override;
+
+  /** @copydoc Transformer::getLayerSlidingWindow(int) — one uniform window for
+   *  every layer (no full-attention interleave), so the base pattern rule does
+   *  not apply. */
+  unsigned int getLayerSlidingWindow(int layer_id) const override {
+    (void)layer_id;
+    return SLIDING_WINDOW;
+  }
 };
 
 /**
