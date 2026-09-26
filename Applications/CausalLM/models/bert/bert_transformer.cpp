@@ -144,14 +144,15 @@ Tensor BertTransformer::createTransformerDecoderBlock(const int layer_id,
   // Residual (input + attention_out) + post LayerNorm
   LayerHandle attention_res(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_res")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_attention_res"),
+     withKey("engine", causallm_engine())}));
   Tensor attention_residual = attention_res({input, att_out});
 
   LayerHandle attention_norm(createLayer(
     "layer_normalization",
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention_norm"),
      withKey("epsilon", toStringPrecise(NORM_EPS)), withKey("axis", 3),
-     withKey("packed", "false")}));
+     withKey("packed", "false"), withKey("engine", causallm_engine())}));
   Tensor attention_normed = attention_norm(attention_residual);
 
   // Feed-forward sub-block
@@ -161,14 +162,15 @@ Tensor BertTransformer::createTransformerDecoderBlock(const int layer_id,
   // Residual (normed + ffn_down) + post LayerNorm
   LayerHandle ffn_res(createLayer(
     "addition",
-    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_res")}));
+    {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_res"),
+     withKey("engine", causallm_engine())}));
   Tensor ffn_residual = ffn_res({attention_normed, ffn_layers});
 
   LayerHandle ffn_norm(createLayer(
     "layer_normalization",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_norm"),
      withKey("epsilon", toStringPrecise(NORM_EPS)), withKey("axis", 3),
-     withKey("packed", "false")}));
+     withKey("packed", "false"), withKey("engine", causallm_engine())}));
 
   return ffn_norm(ffn_residual);
 }
@@ -187,21 +189,24 @@ Tensor BertTransformer::createAttention(const int layer_id, int seq_len,
   LayerHandle wq(createLayer(
     "fully_connected",
     {withKey("name", Q), withKey("unit", head_dim * n_heads),
-     withKey("disable_bias", "false"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "false"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor q = wq(query);
 
   // K layer (bias enabled for BERT)
   LayerHandle wk(createLayer(
     "fully_connected",
     {withKey("name", K), withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "false"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "false"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor k = wk(key);
 
   // V layer (bias enabled for BERT)
   LayerHandle wv(createLayer(
     "fully_connected",
     {withKey("name", V), withKey("unit", head_dim * n_heads / GQA_SIZE),
-     withKey("disable_bias", "false"), withKey("weight_initializer", "ones")}));
+     withKey("disable_bias", "false"), withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor v = wv(value);
 
   // Attention core layer (bidirectional, no RoPE)
@@ -212,7 +217,10 @@ Tensor BertTransformer::createAttention(const int layer_id, int seq_len,
     withKey("max_timestep", std::to_string(INIT_SEQ_LEN)),
     withKey("rope_theta", ROPE_THETA),
     withKey("use_rope", "false"),
-    withKey("is_causal", "false")};
+    withKey("is_causal", "false"),
+    // use_gemm_attention routes the (non-causal, encoder) prefill onto the GPU
+    // flash path, which handles is_causal=false + no-RoPE.
+  };
   LayerHandle mha(createLayer("mha_core", a_params));
   Tensor a = mha({q, k, v});
 
@@ -220,7 +228,8 @@ Tensor BertTransformer::createAttention(const int layer_id, int seq_len,
   LayerHandle wo(
     createLayer("fully_connected", {withKey("name", O), withKey("unit", DIM),
                                     withKey("disable_bias", "false"),
-                                    withKey("weight_initializer", "ones")}));
+                                    withKey("weight_initializer", "ones"),
+                                    withKey("engine", causallm_engine())}));
 
   return wo(a);
 }
@@ -231,20 +240,22 @@ Tensor BertTransformer::createMlp(const int layer_id, int dim, int hidden_dim,
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_fc1"),
      withKey("unit", hidden_dim), withKey("disable_bias", "false"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
   Tensor fc1_out = fc1(input);
 
   LayerHandle act(createLayer(
     "activation",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_act"),
-     withKey("activation", "gelu")}));
+     withKey("activation", "gelu"), withKey("engine", causallm_engine())}));
   Tensor activated = act(fc1_out);
 
   LayerHandle down(createLayer(
     "fully_connected",
     {withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
      withKey("unit", dim), withKey("disable_bias", "false"),
-     withKey("weight_initializer", "ones")}));
+     withKey("weight_initializer", "ones"),
+     withKey("engine", causallm_engine())}));
 
   return down(activated);
 }

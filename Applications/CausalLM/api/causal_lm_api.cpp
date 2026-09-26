@@ -26,20 +26,9 @@
 #include "callback_streamer.h"
 #include "causal_lm.h"
 #include "chat_template.h"
-#include "gemma3_causallm.h"
-#if !defined(_WIN32)
-#include "gptoss_cached_slim_causallm.h"
-#endif
-#include "gptoss_causallm.h"
 #include "json.hpp"
 #include "model_config_internal.h"
-#include "qwen2_causallm.h"
-#if !defined(_WIN32)
-#include "qwen3_cached_slim_moe_causallm.h"
-#endif
-#include "qwen3_causallm.h"
-#include "qwen3_moe_causallm.h"
-#include "qwen3_slim_moe_causallm.h"
+#include "model_registry.h"
 #include <factory.h>
 #include <fstream>
 #include <sys/stat.h>
@@ -210,66 +199,15 @@ std::string resolveNntrConfigPathForTest(const std::string &value,
 } // namespace causal_lm_api_test
 #endif
 
-// Helper to register models (similar to main.cpp)
-// ensuring factory is populated.
+// Helper to register models, ensuring factory is populated.
 // @note: Factory registration is singleton and persistent, but we do it once
-// here to be sure. Since main.cpp is not linked, we must duplicate registration
-// or share it. Assuming this lib is used independently of main.cpp.
+// here to be sure. This delegates to the shared causallm::registerAllModels()
+// (models/model_registry.h) so this lib registers the same set of models as
+// main.cpp without duplicating the registration list.
 static void register_models() {
   static std::once_flag flag;
   std::call_once(flag, []() {
-    causallm::Factory::Instance().registerModel(
-      "LlamaForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::CausalLM>(cfg, generation_cfg,
-                                                    nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen2ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen2CausalLM>(cfg, generation_cfg,
-                                                         nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3CausalLM>(cfg, generation_cfg,
-                                                         nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3MoeForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3MoECausalLM>(cfg, generation_cfg,
-                                                            nntr_cfg);
-      });
-    causallm::Factory::Instance().registerModel(
-      "Qwen3SlimMoeForCausalLM",
-      [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3SlimMoECausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-#if !defined(_WIN32)
-    causallm::Factory::Instance().registerModel(
-      "Qwen3CachedSlimMoeForCausalLM",
-      [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Qwen3CachedSlimMoECausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-#endif
-    causallm::Factory::Instance().registerModel(
-      "GptOssForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::GptOssForCausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-#if !defined(_WIN32)
-    causallm::Factory::Instance().registerModel(
-      "GptOssCachedSlimCausalLM",
-      [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::GptOssCachedSlimCausalLM>(
-          cfg, generation_cfg, nntr_cfg);
-      });
-#endif
-    causallm::Factory::Instance().registerModel(
-      "Gemma3ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
-        return std::make_unique<causallm::Gemma3CausalLM>(cfg, generation_cfg,
-                                                          nntr_cfg);
-      });
+    causallm::registerAllModels();
 
     // Register built-in configurations
     register_builtin_model_configs();
@@ -309,7 +247,8 @@ static std::string apply_chat_template(const std::string &architecture,
              architecture == "Qwen3SlimMoeForCausalLM" ||
              architecture == "Qwen3CachedSlimMoeForCausalLM") {
     return "<|im_start|>user\n" + input + "<|im_end|>\n<|im_start|>assistant\n";
-  } else if (architecture == "Gemma3ForCausalLM") {
+  } else if (architecture == "Gemma2ForCausalLM" ||
+             architecture == "Gemma3ForCausalLM") {
     return "<start_of_turn>user\n" + input +
            "<end_of_turn>\n<start_of_turn>model\n";
   }

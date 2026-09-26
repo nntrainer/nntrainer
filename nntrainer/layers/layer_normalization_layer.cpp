@@ -22,6 +22,7 @@
 #include <nntrainer_error.h>
 #include <nntrainer_log.h>
 #include <node_exporter.h>
+#include <tensor.h>
 #include <util_func.h>
 
 namespace nntrainer {
@@ -74,6 +75,15 @@ void LayerNormalizationLayer::finalize(InitLayerContext &context) {
   normalize_axes.erase(
     std::unique(normalize_axes.begin(), normalize_axes.end()),
     normalize_axes.end());
+
+  // The layer_norm whole-op normalizes over the LAST (width) axis. Record
+  // whether this instance's axis property matches that contract; the inference
+  // forward paths dispatch through the op table when it does and keep the
+  // composite path otherwise. This is a purely structural predicate -- the
+  // layer never names a backend, so one class serves every backend.
+  width_axis_only =
+    (normalize_axes.size() == 1 &&
+     normalize_axes[0] == ml::train::TensorDim::getNumDim() - 1);
 
   TensorDim normalize_dim(context.getFormat(), context.getWeightDataType());
   for (unsigned int axis : normalize_axes) {
@@ -140,6 +150,17 @@ void LayerNormalizationLayer::forwarding(RunLayerContext &context,
   Tensor &gamma = context.getWeight(wt_idx[LNParams::gamma]);
   Tensor &beta = context.getWeight(wt_idx[LNParams::beta]);
 
+  // Backend-neutral whole-op dispatch: one call, no preprocessor branch, no
+  // backend name. Inference only -- the training path below also populates
+  // deviation/variance/inv_std_dev, which calcDerivative consumes, so it stays
+  // composite until a layer_norm backward whole-op exists.
+  if (!training && width_axis_only) {
+    input.getOps()->layer_norm(input, output, gamma, beta, epsilon,
+                               input.batch() * input.channel() * input.height(),
+                               /*row_offset=*/0);
+    return;
+  }
+
   Tensor &deviation = context.getTensor(wt_idx[LNParams::deviation]);
   Tensor &variance = context.getTensor(wt_idx[LNParams::variance]);
   Tensor &inv_std_dev = context.getTensor(wt_idx[LNParams::inv_std_dev]);
@@ -173,6 +194,32 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
 
   Tensor &gamma = context.getWeight(wt_idx[LNParams::gamma]);
   Tensor &beta = context.getWeight(wt_idx[LNParams::beta]);
+
+  // Backend-neutral whole-op dispatch for the width-axis inference case.
+  //
+  // The rows are (batch, channel, height) flattened and the live window is
+  // rows [from, to) INSIDE each (b, c) plane, which is the window the FP32 fast
+  // path below already uses (getAddress<float>(b, c, row_begin, 0), row_count
+  // rows). That window is contiguous only within one plane, hence the (b, c)
+  // loop with a computed row_offset rather than a single call. Whole Tensors
+  // are passed and the window given as numbers, deliberately not as
+  // getSharedDataTensor views, which do not carry residency state.
+  if (!training && width_axis_only) {
+    const TensorDim in_dim = input.getDim();
+    const unsigned int H = in_dim.height();
+    const unsigned int row_begin = (to > from && to <= H) ? from : 0u;
+    const unsigned int row_end = (to > from && to <= H) ? to : H;
+    const unsigned int rows = row_end - row_begin;
+    for (unsigned int b = 0; b < in_dim.batch(); ++b) {
+      for (unsigned int c = 0; c < in_dim.channel(); ++c) {
+        const unsigned int row_offset =
+          (b * in_dim.channel() + c) * H + row_begin;
+        input.getOps()->layer_norm(input, output, gamma, beta, epsilon, rows,
+                                   row_offset);
+      }
+    }
+    return;
+  }
 
   Tensor &deviation = context.getTensor(wt_idx[LNParams::deviation]);
   Tensor &variance = context.getTensor(wt_idx[LNParams::variance]);
@@ -220,10 +267,6 @@ void LayerNormalizationLayer::incremental_forwarding(RunLayerContext &context,
   // - Computes: output = deviation / sqrt(mean(deviation^2) + epsilon)
   // - Supports incremental decoding with [from, to) row range
   // - Processes all batches and channels
-  const bool width_axis_only =
-    normalize_axes.size() == 1 &&
-    normalize_axes[0] == ml::train::TensorDim::getNumDim() - 1;
-
   if (deviation.getDataType() == ml::train::TensorDim::DataType::FP32 &&
       width_axis_only) {
     const unsigned int W = input_dim.width();

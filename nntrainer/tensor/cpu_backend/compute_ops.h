@@ -40,6 +40,8 @@
 
 namespace nntrainer {
 
+class Tensor;
+
 /**
  * @class ComputeOps
  * @brief Abstract dispatch interface for tensor compute kernels.
@@ -375,6 +377,142 @@ public:
                                               float *sin_);
 #endif // ENABLE_FP16
 
+  // ===========================================================================
+  // Whole-op (Tensor-level) ops.
+  //
+  // Every op above takes raw pointers and a length, which is all a CPU kernel
+  // needs. An accelerator needs more: it has to know whether the operand
+  // already lives in device memory so it can bind that buffer instead of
+  // staging the bytes back and forth. A raw pointer cannot answer that, so the
+  // ops below take Tensors and the backend implementation introspects them.
+  //
+  // The division of labour is: a backend-neutral Layer owns structure, shapes
+  // and orchestration, ComputeOps owns the whole kernel. That is what lets one
+  // Layer class serve every backend instead of a per-backend Layer fork.
+  //
+  // The row window is expressed as two numbers, (active_rows, row_offset),
+  // rather than as sub-Tensor views, because a view is a fresh Tensor and does
+  // not necessarily carry the residency state of the tensor it was cut from.
+  // Rows are the (batch, channel, height) axes flattened; width() is the
+  // per-row element count.
+  //
+  // Every default below throws, so a backend that does not implement an op
+  // reports it instead of silently computing something else.
+  // ===========================================================================
+
+  /**
+   * @brief GeGLU activation over the `active_rows` rows starting at
+   *        `row_offset`: out = gelu_tanh(in1) * in2 ({gate, up} -> result).
+   *        in1/in2/out share shape.
+   */
+  virtual void geglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                     unsigned int active_rows, unsigned int row_offset);
+
+  /**
+   * @brief SwiGLU activation over the `active_rows` rows starting at
+   *        `row_offset`: out = silu(in1) * in2 = (in1 * sigmoid(in1)) * in2
+   *        ({gate, up} -> result). in1/in2/out share shape.
+   */
+  virtual void swiglu(const Tensor &in1, const Tensor &in2, Tensor &out,
+                      unsigned int active_rows, unsigned int row_offset);
+
+  /**
+   * @brief Row-wise layer normalization over the `active_rows` rows starting at
+   *        `row_offset`: out = (x - mean(x)) * rsqrt(var(x) + epsilon) * gamma
+   *        + beta, with mean/variance taken over the LAST (width) axis and
+   *        accumulated in FP32. in/out share shape; width() is the normalized
+   *        dimension. gamma/beta are [1,1,1,W] and are BOTH required; they may
+   *        carry the weight dtype, which need not equal the activation dtype.
+   *        in/out may alias -- the op is row-independent and reads each element
+   *        before it writes it.
+   * @note  There is deliberately no `axis` parameter: the op normalizes over
+   *        width and nothing else. The Layer owns the axis contract and only
+   *        dispatches here when its property matches.
+   */
+  virtual void layer_norm(const Tensor &in, Tensor &out, const Tensor &gamma,
+                          const Tensor &beta, float epsilon,
+                          unsigned int active_rows, unsigned int row_offset);
+
+  /**
+   * @brief Element-wise activation over the `active_rows` rows starting at
+   *        `row_offset`: out = f_act(in). @p act_type is an
+   *        nntrainer::ActivationType cast to int, kept as an int so this header
+   *        stays free of the layers headers. ACT_NONE copies in -> out. in/out
+   *        share shape and MAY alias. A backend implements only the modes it
+   *        can accelerate and throws for the rest, so there is no silent host
+   *        fallback on a device-resident tensor; query support without
+   *        provoking the throw via supports_activation().
+   */
+  virtual void activation(const Tensor &in, Tensor &out, int act_type,
+                          unsigned int active_rows, unsigned int row_offset);
+
+  /**
+   * @brief Whether activation() can service @p act_type on this backend (an
+   *        nntrainer::ActivationType cast to int). Capability predicate in the
+   *        style of supports_shgemm(): a backend that throws for the modes it
+   *        cannot accelerate overrides this so callers and tests can ask
+   *        first. Default true -- the CPU table services every mode.
+   */
+  virtual bool supports_activation(int act_type) const {
+    (void)act_type;
+    return true;
+  }
+
+  /**
+   * @brief One residual-add operand: hidden = input (accumulate == false, the
+   *        first operand) or hidden += input (accumulate == true). The neutral
+   *        AdditionLayer calls this once per input so an accelerator can keep
+   *        the residual stream device-resident while the CPU table runs the
+   *        host Tensor copy/add.
+   */
+  virtual void residual_op(Tensor &hidden, const Tensor &input,
+                           bool accumulate);
+
+  /**
+   * @brief Fully-connected matmul: output = input * weight. The neutral
+   *        FullyConnectedLayer owns the weight/bias binding and calls this for
+   *        the matmul, so a quantized accelerator GEMM lives in the op table
+   *        instead of in a forked Layer. input/weight may carry residency
+   *        state the implementation reads, hence non-const.
+   */
+  virtual void fc(Tensor &input, Tensor &weight, Tensor &output);
+
+  /**
+   * @brief Optional one-time weight transform at load time, e.g. an
+   *        accelerator repack. Default no-op; called from the layer's read()
+   *        once the weights are in memory.
+   */
+  virtual void fc_prebuild_weight(Tensor &weight) { (void)weight; }
+
+  /**
+   * @brief Fused activation epilogue: apply an element-wise activation in
+   *        place on a compute layer's output, after GEMM+bias. This is the
+   *        in-place special case of activation(): one tensor, whole tensor, so
+   *        a backend can fuse it into the GEMM epilogue. @p act_type is an
+   *        nntrainer::ActivationType cast to int; ACT_NONE is a no-op.
+   */
+  virtual void apply_activation(Tensor &out, int act_type);
+
+  /**
+   * @brief Mean over rows: out[0, w) is the average over
+   *        r in [row_offset, row_offset + active_rows) of in[r, w).
+   *        `in` is a [.., rows, W] tensor and `out` a [.., 1, W] tensor.
+   * @note  Distinct from the width-axis reductions above: this one reduces
+   *        ACROSS rows, not within one. Backs mean-token pooling.
+   */
+  virtual void mean_rows(const Tensor &in, Tensor &out,
+                         unsigned int active_rows, unsigned int row_offset);
+
+  /**
+   * @brief Row-wise L2 normalize along the last dimension:
+   *        out[r, :] = in[r, :] / max(||in[r, :]||_2, epsilon).
+   * @note  The epsilon is a FLOOR ON THE NORM and the denominator uses the SUM
+   *        of squares. This is Tensor::normalization_i(3) semantics, which is
+   *        NOT RMSNorm (mean of squares, epsilon under the sqrt, mandatory
+   *        gamma).
+   */
+  virtual void l2_normalize_rows(const Tensor &in, Tensor &out, float epsilon);
+
 protected:
   /**
    * @brief Helper used by default impls to throw a uniform "not
@@ -432,6 +570,11 @@ ComputeOps *get_cpu_ops();
 /** @brief OpenCL accelerator ComputeOps singleton. Defined when
  *  enable-opencl is on, in cl_operations/cl_compute_ops.cpp. */
 ComputeOps *get_cl_ops();
+#endif
+#ifdef ENABLE_CUDA
+/** @brief CUDA accelerator ComputeOps singleton. Defined when enable-cuda is
+ *  on, in cuda/cuda_compute_ops.cpp. */
+ComputeOps *get_cuda_ops();
 #endif
 #ifdef ENABLE_HEXKL
 /** @brief HTP (Hexagon/HMX) accelerator ComputeOps singleton. Defined

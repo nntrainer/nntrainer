@@ -614,6 +614,25 @@ public:
   void pack() { itensor_->pack(); }
 
   /**
+   * @brief     Pack the weight data eagerly for the fp16-activation KAI path
+   * @note      See TensorBase::packF16Activation()
+   */
+  void packF16Activation() { itensor_->packF16Activation(); }
+
+  /**
+   * @brief     Whether packF16Activation() has produced a packed buffer
+   */
+  bool isPackedF16Activation() const {
+    return itensor_->isPackedF16Activation();
+  }
+
+  /**
+   * @brief     Whether pack() has produced a fp32-activation packed buffer
+   * @note      See TensorBase::isPacked()
+   */
+  bool isPacked() const { return itensor_->isPacked(); }
+
+  /**
    * @brief     i data index
    * @retval    template T pointer (address of ith data)
    */
@@ -1574,6 +1593,22 @@ public:
   size_t getOffset() const;
 
   /**
+   * @brief  True if this tensor's memory lives in device memory the host
+   *         cannot address, which the memory planner decided at allocation.
+   *         A layer asks this to know HOW to bind the tensor to a kernel: a
+   *         buffer argument rather than a pointer. False for every tensor on
+   *         the host or shared plane, so existing callers are unaffected.
+   */
+  bool isClMem() const;
+
+  /**
+   * @brief  The device buffer backing this tensor, or nullptr when it is not
+   *         device-resident. Non-owning: the pool that planned the tensor
+   *         owns the buffer.
+   */
+  void *getClMem() const;
+
+  /**
    * @brief     Copy the Tensor
    * @param[in] from Tensor to be copied
    *
@@ -1863,6 +1898,19 @@ public:
   void setFileOffset(size_t file_offset);
 
   /**
+   * @brief Mark the on-disk bytes as a legacy QINT4 record, so that read()
+   *        transcodes them to QS4CX. @see TensorBase::setOnDiskLegacyQint4
+   *        for why no in-tree caller sets it yet.
+   */
+  void setOnDiskLegacyQint4(bool v);
+
+  /**
+   * @brief Select the QS4CX record layout: padded when true, trimmed when
+   *        false. @see TensorBase::setQs4cxRecordPadded
+   */
+  void setQs4cxRecordPadded(bool v);
+
+  /**
    * @brief     get FileOffset of Tensor
    * @return    size_t fileOffset
    */
@@ -2043,6 +2091,16 @@ public:
   const std::shared_ptr<ContextData> &getContextData() const {
     return itensor_->getContextData();
   }
+
+  /**
+   * @brief Get the ComputeOps this tensor dispatches through.
+   *
+   * Priority: the attached ContextData's per-vendor table, else the global
+   * one. This is how a backend-neutral Layer reaches the right backend's
+   * whole-op without a preprocessor branch at the call site, e.g.
+   * `in.getOps()->layer_norm(...)`.
+   */
+  ComputeOps *getOps() const { return itensor_->getOps(); }
 
   /**
    * @brief Propagate this tensor's ContextData to a result tensor.

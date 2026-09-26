@@ -255,7 +255,11 @@ public:
    * @brief Run prefill and return logits before token sampling
    */
   std::vector<float> prefillLogits(const std::string &prompt) override {
-    auto encoded = this->tokenizer->Encode(prompt);
+    auto *tok = this->getTokenizer(); // joins the async tokenizer load
+    if (tok == nullptr)
+      throw std::runtime_error("tiny CausalLM model has no tokenizer");
+
+    auto encoded = tok->Encode(prompt);
     if (encoded.empty())
       throw std::invalid_argument("tiny CausalLM prompt encoded to no tokens");
 
@@ -643,6 +647,16 @@ void runFp32DifferentialChecks(const DifferentialModel &model);
  * @param model Differential model descriptor
  */
 void runQ40DifferentialChecks(const DifferentialModel &model);
+
+/**
+ * @brief Quantize the FP32 fixture to QINT4 (channelwise int4, plain container)
+ *        and verify the logits/tokens stay within tolerance of the HF
+ * reference. Used to exercise the CUDA backend's fused QINT4 dequant-GEMM FC
+ * path.
+ *
+ * @param model Differential model descriptor
+ */
+void runQINT4DifferentialChecks(const DifferentialModel &model);
 
 /**
  * @brief Run the FP32 differential checks for an embedding model

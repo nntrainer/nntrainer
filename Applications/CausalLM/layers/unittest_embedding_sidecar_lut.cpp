@@ -58,6 +58,15 @@ void writeU16(const std::filesystem::path &path,
             values.size() * sizeof(uint16_t));
 }
 
+void writeF32(const std::filesystem::path &path,
+              const std::vector<float> &values) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream out(path, std::ios::binary);
+  ASSERT_TRUE(out.is_open());
+  out.write(reinterpret_cast<const char *>(values.data()),
+            values.size() * sizeof(float));
+}
+
 void writeText(const std::filesystem::path &path, const std::string &text) {
   std::filesystem::create_directories(path.parent_path());
   std::ofstream out(path);
@@ -113,7 +122,7 @@ TEST(CausalLmEmbeddingSidecarLut, rawUint16RequiresExactHintedSize) {
   EXPECT_TRUE(lut->is_raw_u16);
   EXPECT_EQ(lut->in_dim, 2u);
   EXPECT_EQ(lut->out_dim, 3u);
-  EXPECT_EQ(lut->bytes.size(), 6u * sizeof(uint16_t));
+  EXPECT_EQ(lut->payload_size(), 6u * sizeof(uint16_t));
 
   const auto bad_path = dir.path() / "bad_embedding.u16";
   writeU16(bad_path, {1, 2, 3, 4, 5, 6});
@@ -142,7 +151,7 @@ TEST(CausalLmEmbeddingSidecarLut, ufixed8ManifestUsesRelativePathAndDims) {
   EXPECT_EQ(lut->out_dim, 4u);
   EXPECT_FLOAT_EQ(lut->scale, 0.5f);
   EXPECT_EQ(lut->offset, -1);
-  EXPECT_EQ(lut->bytes.size(), 6u);
+  EXPECT_EQ(lut->payload_size(), 6u);
 }
 
 TEST(CausalLmEmbeddingSidecarLut, sfixed4ManifestParsesAndValidatesRowScale) {
@@ -180,6 +189,80 @@ TEST(CausalLmEmbeddingSidecarLut, sfixed4ManifestParsesAndValidatesRowScale) {
   EXPECT_THROW(
     causallm::get_or_load_quant_lut(bad_manifest_path.string(), 2, 4),
     std::invalid_argument);
+}
+
+TEST(CausalLmEmbeddingSidecarLut, sfixed4PerBlockManifestFromBinaryScalePath) {
+  TempDir dir("nntrainer_embedding_sidecar_sfixed4_blocks");
+  const auto lut_path = dir.path() / "embedding.s4";
+  const auto scale_path = dir.path() / "scales.f32";
+  const auto manifest_path = dir.path() / "manifest.json";
+
+  // 2 rows x 4 columns, cut into 2 blocks of 2 columns: 4 scales.
+  writeBytes(lut_path, {0x21, 0x43, 0x65, 0x87});
+  writeF32(scale_path, {0.5f, 1.5f, 2.5f, 3.5f});
+  writeText(manifest_path, R"({
+    "lut-path": "embedding.s4",
+    "size": 4,
+    "size-per-layer": 2,
+    "datatype": "sfixed4",
+    "quant-type": "per-row-per-block-symmetric",
+    "quant-param": { "scale-shape": [2, 2], "scale-path": "scales.f32" }
+  })");
+
+  auto lut = causallm::get_or_load_quant_lut(manifest_path.string(), 2, 4);
+
+  ASSERT_NE(lut, nullptr);
+  EXPECT_TRUE(lut->is_signed4);
+  EXPECT_EQ(lut->in_dim, 2u);
+  EXPECT_EQ(lut->out_dim, 4u);
+  EXPECT_EQ(lut->sfixed4_blocks, 2u);
+  ASSERT_EQ(lut->row_scales.size(), 4u);
+  EXPECT_FLOAT_EQ(lut->row_scales[0], 0.5f);
+  EXPECT_FLOAT_EQ(lut->row_scales[3], 3.5f);
+
+  // Row 1 nibbles are 0x65,0x87 -> low-first two's complement 5, 6, 7, -8;
+  // columns 0-1 take scale[2], columns 2-3 scale[3].
+  std::vector<float> row(4, 0.0f);
+  causallm::decode_quant_lut_row_to_fp32(*lut, 1, 2.0f, row.data(), row.size());
+  EXPECT_FLOAT_EQ(row[0], 5.0f * 2.5f * 2.0f);
+  EXPECT_FLOAT_EQ(row[1], 6.0f * 2.5f * 2.0f);
+  EXPECT_FLOAT_EQ(row[2], 7.0f * 3.5f * 2.0f);
+  EXPECT_FLOAT_EQ(row[3], -8.0f * 3.5f * 2.0f);
+
+  // scale-shape blocks and size/size-per-layer must agree.
+  const auto bad_manifest_path = dir.path() / "bad_manifest.json";
+  writeText(bad_manifest_path, R"({
+    "lut-path": "embedding.s4",
+    "size": 4,
+    "size-per-layer": 2,
+    "datatype": "sfixed4",
+    "quant-type": "per-row-per-block-symmetric",
+    "quant-param": { "scale-shape": [2, 4], "scale-path": "scales.f32" }
+  })");
+  EXPECT_THROW(
+    causallm::get_or_load_quant_lut(bad_manifest_path.string(), 2, 4),
+    std::invalid_argument);
+}
+
+TEST(CausalLmEmbeddingSidecarLut, sfixed4ScalePathSizeMismatchThrows) {
+  TempDir dir("nntrainer_embedding_sidecar_sfixed4_scalefile");
+  const auto lut_path = dir.path() / "embedding.s4";
+  const auto scale_path = dir.path() / "scales.f32";
+  const auto manifest_path = dir.path() / "manifest.json";
+
+  writeBytes(lut_path, {0x21, 0x43, 0x65, 0x87});
+  writeF32(scale_path, {0.5f, 1.5f, 2.5f}); // one short of rows*blocks
+  writeText(manifest_path, R"({
+    "lut-path": "embedding.s4",
+    "size": 4,
+    "size-per-layer": 2,
+    "datatype": "sfixed4",
+    "quant-type": "per-row-per-block-symmetric",
+    "quant-param": { "scale-path": "scales.f32" }
+  })");
+
+  EXPECT_THROW(causallm::get_or_load_quant_lut(manifest_path.string(), 2, 4),
+               std::runtime_error);
 }
 
 TEST(CausalLmEmbeddingSidecarLut, unsupportedManifestDatatypeThrows) {
