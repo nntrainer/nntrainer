@@ -35,7 +35,6 @@
 
 #include <common.h>
 #include <layer_context.h>
-#include <lm_head.h>
 #include <mha_core.h>
 #include <nntrainer_error.h>
 #include <tensor.h>
@@ -348,15 +347,9 @@ std::vector<unsigned int> CausalLM::generate(float *logits, bool do_sample,
 
 void CausalLM::registerCustomLayers() {
   Transformer::registerCustomLayers();
-  const auto &ct_engine = nntrainer::Engine::Global();
-  const auto app_context =
-    static_cast<nntrainer::AppContext *>(ct_engine.getRegisteredContext("cpu"));
-  try {
-    app_context->registerFactory(nntrainer::createLayer<causallm::LmHeadLayer>);
-  } catch (std::invalid_argument &e) {
-    std::cerr << "failed to register factory, reason: " << e.what()
-              << std::endl;
-  }
+  // lm_head is a core layer now; the cpu, gpu and cuda contexts register it
+  // themselves, which is what lets an untied model build its graph under
+  // engine=gpu at all.
 }
 
 void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,

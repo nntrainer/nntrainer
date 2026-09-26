@@ -18,11 +18,9 @@
 #include <app_context.h>
 #include <engine.h>
 #include <llm_util.hpp>
-#include <logit_softcapping.h>
 #include <model.h>
 #include <per_layer_slice.h>
 #include <reshaped_rms_norm.h>
-#include <scalar_multiply.h>
 
 namespace causallm {
 
@@ -798,8 +796,8 @@ void Gemma4Transformer::registerCustomLayers() {
 
   tryRegister(nntrainer::createLayer<causallm::ReshapedRMSNormLayer>);
   tryRegister(nntrainer::createLayer<causallm::PerLayerSliceLayer>);
-  tryRegister(nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
-  tryRegister(nntrainer::createLayer<causallm::LogitSoftCappingLayer>);
+  // scalar_multiply and logit_softcapping are core layers now, registered by
+  // every context that can run them.
 }
 
 void Gemma4CausalLM::registerCustomLayers() {
