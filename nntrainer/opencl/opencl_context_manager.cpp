@@ -75,6 +75,18 @@ const cl_context &ContextManager::GetContext() {
   return context_;
 }
 
+const cl_context &ContextManager::GetContextNoRetain() {
+  // NNTR_CL_CTX_RETAIN=1 restores the retaining accessor everywhere, so the
+  // same binary can be its own control arm.
+  static const bool retain = []() {
+    const char *e = std::getenv("NNTR_CL_CTX_RETAIN");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (context_ != nullptr && !retain)
+    return context_;
+  return GetContext();
+}
+
 void ContextManager::ReleaseContext() {
   if (context_) {
     // decrements the context reference count
@@ -89,9 +101,19 @@ void ContextManager::ReleaseContext() {
  */
 const cl_device_id ContextManager::GetDeviceId() { return device_id_; }
 
+std::string ContextManager::GetDeviceSignature() {
+  if (device_id_ == nullptr)
+    return "unknown";
+  char name[256] = {0};
+  char drv[256] = {0};
+  clGetDeviceInfo(device_id_, CL_DEVICE_NAME, sizeof(name) - 1, name, nullptr);
+  clGetDeviceInfo(device_id_, CL_DRIVER_VERSION, sizeof(drv) - 1, drv, nullptr);
+  return std::string(name) + "|" + std::string(drv);
+}
+
 void *ContextManager::createSVMRegion(size_t size) {
   if (context_)
-    return clSVMAlloc(context_, CL_MEM_READ_WRITE, size, 0);
+    return clSVMAllocT(context_, CL_MEM_READ_WRITE, size, 0);
   else
     return nullptr;
 }
@@ -99,7 +121,7 @@ void *ContextManager::createSVMRegion(size_t size) {
 void ContextManager::releaseSVMRegion(void *svm_ptr) {
   if (svm_ptr) {
     // deallocates the SVM memory
-    clSVMFree(context_, svm_ptr);
+    clSVMFreeT(context_, svm_ptr);
   } else {
     ml_logw("Attempted to deallocate a null pointer");
   }

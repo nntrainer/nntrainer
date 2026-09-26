@@ -130,6 +130,49 @@ public:
   virtual std::shared_ptr<MemoryData> getMemory(unsigned int idx);
 
   /**
+   * @brief Get device memory backing the token, if this pool has a device
+   *        plane at all.
+   *
+   * @param idx The token received from requestMemory
+   *
+   * @return the device buffer for the token, or nullptr when this pool has no
+   *         device plane or cannot back this token in it. A null answer is not
+   *         an error: it means the tensor stays on the plane getMemory()
+   *         returned, which is a placement, not a failure.
+   *
+   * @details Called by the memory planner for the tensors it wants
+   *          device-resident, after allocate(). A pool with a device plane
+   *          creates the buffer on the first ask, so a graph that wants none
+   *          pays for none.
+   */
+  virtual void *deviceMemory(unsigned int idx) {
+    (void)idx;
+    return nullptr;
+  }
+
+  /**
+   * @brief Tell the pool which tokens another plane is going to own outright.
+   *
+   * @param tokens tokens whose bytes will live only on a pool-provided second
+   *        plane (the device cl_mem plane), so the shared plane never has to
+   *        hold them
+   *
+   * @details Called once, before allocate(), by the only caller that knows the
+   * answer -- the residency planner in TensorPool, which classifies a tensor
+   * from its dtype, engine and consumers, none of which need memory to be
+   * decided. A pool with one plane has nothing to do with this and ignores it;
+   * the two-plane pool uses it to leave the shared slice unallocated for the
+   * offsets it is going to back with a device buffer anyway.
+   *
+   * It is advice, not instruction: a pool is free to allocate the shared slice
+   * anyway (and the device pool does exactly that when the device buffer it
+   * meant to substitute cannot be created).
+   */
+  virtual void noteDeviceOnlyTokens(const std::vector<unsigned int> &tokens) {
+    (void)tokens;
+  }
+
+  /**
    * @brief Free all the allocated memory
    *
    */
@@ -213,6 +256,25 @@ protected:
    * @brief  Get memory size
    */
   std::vector<size_t> &getMemorySize() { return memory_size; }
+
+  /**
+   * @brief Whether the shared plane has to hold the bytes at this offset.
+   *
+   * @param offset planner offset
+   * @return true (this pool has only the one plane, so every offset needs it)
+   *
+   * @details The per-offset allocateFSU() path asks before each allocation, so
+   * a subclass with a second plane can answer "no" for an offset that plane
+   * owns outright and leave the shared slice unallocated. A false answer
+   * leaves that token's shared pointer null, which is the honest value: there
+   * is no host-addressable byte behind it. Only allocateFSU() consults this --
+   * the single-buffer allocate() path cannot leave a hole in one contiguous
+   * allocation, so a pool that wants holes must take the FSU path.
+   */
+  virtual bool sharedSliceNeeded(size_t offset) const {
+    (void)offset;
+    return true;
+  }
 
   /**
    * @brief  Get memory execution order

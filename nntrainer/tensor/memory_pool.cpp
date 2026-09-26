@@ -208,6 +208,20 @@ void MemoryPool::allocateFSU() {
   int i = 0;
   for (auto &s : memory_offset) {
     size_t current_size = memory_size.at(i);
+    /** An offset a second plane owns outright gets no shared slice at all --
+     *  see sharedSliceNeeded(). The token's shared pointer stays null, which
+     *  is the truthful value for bytes that exist only on the other plane;
+     *  reading it is a bug this makes loud instead of silently serving a
+     *  never-written slice. Recorded in offset_ptr so the aliasing tokens at
+     *  the same offset take the same answer. */
+    if (!sharedSliceNeeded(s)) {
+      memory_ptrs.push_back(nullptr);
+      offset_ptr[s] = nullptr;
+      allocated_size[s] = current_size;
+      offset_indices[s].push_back(i);
+      i++;
+      continue;
+    }
     auto it = offset_ptr.find(s);
     if (it == offset_ptr.end()) {
       void *ptr = nullptr;
@@ -249,10 +263,23 @@ std::shared_ptr<MemoryData> MemoryPool::getMemory(unsigned int idx) {
   if (mem_pool == nullptr && owned_buffers_.empty())
     throw std::invalid_argument("Getting memory before allocation");
 
-  auto mem_data = std::make_shared<MemoryData>((void *)memory_ptrs.at(idx - 1));
-  // SVM-ness propagates implicitly through the allocator name now;
-  // callers that need to know inspect getAllocator()->getName().
-  mem_data->setSVM(allocator_->getName() == "gpu-svm");
+  void *shared = memory_ptrs.at(idx - 1);
+  auto mem_data = std::make_shared<MemoryData>(shared);
+  // SVM-ness comes from what the allocator produces, not from its name: an
+  // OpenCL SVM allocation is both host-addressable and device-visible. See
+  // MemAllocator::isSVM() for why this is not a generic unified-memory test.
+  //
+  // ... EXCEPT for a token that has no shared slice at all. allocateFSU()
+  // leaves those null on purpose (sharedSliceNeeded(), above) because the bytes
+  // exist only on a second plane, and the comment there promises the null makes
+  // a read "loud". It did not: asking the ALLOCATOR meant a null-pointer token
+  // still answered isSVM() == true, so every `md->isSVM()` guard downstream
+  // passed and handed the null straight to a kernel as an SVM argument --
+  // mha_core does exactly that for Q/K/V on the OHWI attention path, and the
+  // GPU then reads zeros through its own mapping and the model
+  // answers something else, silently. The flags belong to the TOKEN, not to
+  // the allocator: no memory, no planes.
+  mem_data->setSVM(shared != nullptr && allocator_->isSVM());
   return mem_data;
 }
 

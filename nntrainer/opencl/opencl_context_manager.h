@@ -53,6 +53,25 @@ public:
   const cl_context &GetContext();
 
   /**
+   * @brief Get the OpenCL context without taking a reference on it.
+   *
+   * GetContext() increments the context reference count on every call, which
+   * is right for an owner but wrong for the dispatch path: the blas and
+   * attention kernels ask for the context once per operation and never
+   * release, so on an Adreno 840 decode cell that was ~423 clRetainContext
+   * calls per token -- pure host bookkeeping in front of a GPU that is waiting
+   * for work. Those call sites use this instead. The context outlives them
+   * (CommandQueueManager holds the owning reference for the process), so no
+   * reference of their own is needed.
+   *
+   * Falls back to GetContext() before the context exists, so a first caller
+   * still creates it.
+   *
+   * @return const cl_context
+   */
+  const cl_context &GetContextNoRetain();
+
+  /**
    * @brief Release OpenCL context
    *
    */
@@ -64,6 +83,16 @@ public:
    * @return const cl_device_id
    */
   const cl_device_id GetDeviceId();
+
+  /**
+   * @brief Get a stable signature of the active device (name + driver
+   *        version). Used to key the on-disk kernel binary cache so a binary
+   *        built for a different GPU, or before a driver update, is never
+   *        loaded.
+   *
+   * @return std::string "<device-name>|<driver-version>"
+   */
+  std::string GetDeviceSignature();
 
   /**
    * @brief Get the Device Info

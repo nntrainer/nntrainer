@@ -299,7 +299,8 @@ Conv2DLayer::Conv2DLayer(
   padding(padding_),
   conv_props(props::FilterSize(), std::array<props::KernelSize, CONV2D_DIM>(),
              std::array<props::Stride, CONV2D_DIM>(), props::Padding2D(),
-             std::array<props::Dilation, CONV2D_DIM>()) {
+             std::array<props::Dilation, CONV2D_DIM>(),
+             props::FusedActivation()) {
   wt_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
@@ -377,6 +378,24 @@ void Conv2DLayer::finalize(InitLayerContext &context) {
                   eff_in_width - padding[2] - kernel_size[1] > IM,
                 std::invalid_argument)
     << "Failed to initialize: Calculated patch end is over int max";
+
+  // inline fused activation (set by the FusionRealizer): build the same
+  // ActiFunc a standalone ActivationLayer would, for a value-identical
+  // epilogue.
+  auto &fused_act = std::get<props::FusedActivation>(conv_props);
+  rejectFusedActivationOnTrainingGraph(fused_act, context.getExecutionMode(),
+                                       "Conv2D");
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
+    if (context.getActivationDataType() == TensorDim::DataType::FP16) {
+#ifdef ENABLE_FP16
+      acti_func.setActiFunc<_FP16>(fused_act.get());
+#else
+      throw std::invalid_argument("[Conv2D] fused fp16 act needs enable-fp16");
+#endif
+    } else {
+      acti_func.setActiFunc<float>(fused_act.get());
+    }
+  }
 }
 
 void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
@@ -473,6 +492,18 @@ void Conv2DLayer::forwarding(RunLayerContext &context, bool training) {
     status = hidden_.add_i(bias_kernel);
     if (status != ML_ERROR_NONE) {
       throw std::invalid_argument("[Conv2D] adding bias failed");
+    }
+  }
+
+  // fused activation epilogue (value-identical to a standalone
+  // ActivationLayer); in-place for relu/sigmoid/tanh, else via a temp copy.
+  auto &fused_act = std::get<props::FusedActivation>(conv_props);
+  if (!fused_act.empty() && fused_act.get() != ActivationType::ACT_NONE) {
+    if (acti_func.supportInPlace()) {
+      acti_func.run_fn(hidden_, hidden_);
+    } else {
+      Tensor in_copy = hidden_.clone();
+      acti_func.run_fn(in_copy, hidden_);
     }
   }
 }

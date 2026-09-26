@@ -29,7 +29,14 @@ typedef struct {
   double generation_duration_ms;
   double total_duration_ms;
   double initialization_duration_ms;
+  /** The honest footprint of this run: max over the run of RssAnon plus the
+   *  accelerator bytes this process holds (footprint_sampler.h). Falls back to
+   *  peak_rss_kb where /proc is not available. */
   size_t peak_memory_kb;
+  /** getrusage ru_maxrss -- the worker's lifetime host high-water, no
+   *  accelerator, never reset. Kept for debugging; it is what peak_memory_kb
+   *  used to be. */
+  size_t peak_rss_kb;
 } TransformerPerformanceMetrics;
 
 #ifdef __cplusplus
@@ -50,7 +57,13 @@ typedef struct {
 #endif
 
 /**
- * @brief Get peak memory usage in KB
+ * @brief Get peak host RSS in KB, as the kernel's lifetime high-water.
+ *
+ * @note This is not the number to show a user: it excludes the accelerator
+ * (kgsl on Adreno, dma-buf on the NPU, which together are the bulk of an LLM's
+ * footprint) and it never comes back down, so from the second request onwards
+ * it reports the worker's history rather than the request's peak. See
+ * footprint_sampler.h for the per-run honest footprint.
  */
 inline size_t getPeakMemoryKb() {
 #if defined(_WIN32)

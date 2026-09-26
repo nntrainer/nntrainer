@@ -44,6 +44,7 @@ public:
    * @brief     Constructor of TensorPool
    */
   TensorPool() :
+    pool_tag_("pool"),
     allocator_(std::make_shared<MemAllocator>()),
     mem_pool(std::make_unique<MemoryPool>(allocator_)),
     cache_loader(nullptr) {}
@@ -61,6 +62,7 @@ public:
     ml::train::ExecutionMode execution_mode = ml::train::ExecutionMode::TRAIN,
     std::shared_ptr<MemAllocator> allocator =
       std::make_shared<MemAllocator>()) :
+    pool_tag_(fsu_name.empty() ? std::string("pool") : fsu_name),
     allocator_(std::move(allocator)) {
     if (enable_fsu) {
       auto cache_pool = std::make_shared<CachePool>(fsu_path, fsu_name,
@@ -68,7 +70,11 @@ public:
       cache_loader = std::make_unique<CacheLoader>(cache_pool);
       mem_pool = cache_pool;
     } else {
-      mem_pool = std::make_shared<MemoryPool>(allocator_);
+      // The allocator decides which KIND of pool backs this one: a plain
+      // offset-planned MemoryPool, or one that can also hand out device
+      // memory. Which it is follows from what the allocator can produce, so
+      // it is not a branch on the allocator's name here.
+      mem_pool = allocator_->makePool(allocator_);
     }
   }
 
@@ -82,7 +88,7 @@ public:
    */
   void reinitialize() {
     name_map.clear();
-    mem_pool = std::make_shared<MemoryPool>(allocator_);
+    mem_pool = allocator_->makePool(allocator_);
   }
 
   /**
@@ -98,7 +104,7 @@ public:
       throw std::runtime_error(
         "[TensorPool] cannot change allocator after allocation");
     allocator_ = std::move(allocator);
-    mem_pool = std::make_shared<MemoryPool>(allocator_);
+    mem_pool = allocator_->makePool(allocator_);
   }
 
   /**
@@ -197,6 +203,9 @@ public:
    * @param lifespan Lifespan of this tensor.
    * @param init Initializer of the tensor.
    * @param is_weight_grad Identification of weight gradient
+   * @param engine compute engine of the requesting layer, used by the memory
+   *        planner to decide where the tensor lives. CPU by default, which
+   *        leaves every existing caller planned exactly as before.
    *
    * @return ptr to the created tensor
    *
@@ -204,11 +213,11 @@ public:
    * @note we assume that the caller checks if the exec_order and lifespan are
    * compatible.
    */
-  Tensor *request(const std::string &name, const TensorDim &dim,
-                  const std::vector<unsigned int> &exec_order,
-                  TensorLifespan lifespan,
-                  const Initializer &init = Initializer::NONE,
-                  bool is_weight_grad = false);
+  Tensor *request(
+    const std::string &name, const TensorDim &dim,
+    const std::vector<unsigned int> &exec_order, TensorLifespan lifespan,
+    const Initializer &init = Initializer::NONE, bool is_weight_grad = false,
+    ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU);
 
   /**
    * @brief     Request tensor which is a view of already requested with the
@@ -220,6 +229,10 @@ public:
    * @param exec_order The execution orders for this tensors
    * @param lifespan Lifespan of this tensor
    * @param offset offset from the reference
+   * @param consumer_engine compute engine of the layer that reads this view.
+   *        Accumulated into the source's record of whether every consumer is
+   *        on the device, since a tensor can only be placed where all of its
+   *        readers can reach it. CPU by default, the conservative answer.
    *
    * @return ptr to a tensor which is sharing the same data with
    * reference.
@@ -233,7 +246,9 @@ public:
   Tensor *view(const std::string &name, const std::string &reference,
                const TensorDim &dim,
                const std::vector<unsigned int> &exec_order,
-               TensorLifespan lifespan, const size_t offset = 0);
+               TensorLifespan lifespan, const size_t offset = 0,
+               ml::train::LayerComputeEngine consumer_engine =
+                 ml::train::LayerComputeEngine::CPU);
 
   /**
    * @brief extend a tensor life as tensor is being shared.
@@ -265,10 +280,11 @@ public:
    * @return Tensor* ptr to either to the existing tensor or newly created
    * tensor
    */
-  Tensor *requestOrExtend(const std::string &name, const TensorDim &dim,
-                          const std::vector<unsigned int> &exec_order,
-                          TensorLifespan lifespan,
-                          const Initializer &init = Initializer::NONE);
+  Tensor *requestOrExtend(
+    const std::string &name, const TensorDim &dim,
+    const std::vector<unsigned int> &exec_order, TensorLifespan lifespan,
+    const Initializer &init = Initializer::NONE,
+    ml::train::LayerComputeEngine engine = ml::train::LayerComputeEngine::CPU);
 
   /**
    * @brief reidentify the source of already created tensor (or view).
@@ -380,6 +396,16 @@ private:
     std::vector<unsigned int> exec_order; /**< exec order */
     std::vector<unsigned int>
       dependents; /**< list of dependents to the source */
+    ml::train::LayerComputeEngine engine =
+      ml::train::LayerComputeEngine::CPU; /**< compute engine of the layer that
+                          writes this tensor; the first half of the placement
+                          decision. Views share the source's MemoryData and so
+                          inherit its placement. */
+    bool all_consumers_device =
+      true; /**< AND of every view consumer's engine. The other half: a tensor
+                 can only be placed in device memory when every layer that
+                 reads it runs there, otherwise one of them is left reading a
+                 plane it cannot address. */
   };
 
   /**
@@ -465,6 +491,12 @@ private:
   std::vector<RequestSpec> pool; /**< list of requested tensors */
   std::unordered_map<std::string, unsigned int>
     name_map; /**< indexing of requested tensors */
+
+  /** Which pool this is ("weight_pool" / "tensor_pool"), for the GPU memory
+   *  ledger. The constructor already takes the name for FSU's cache files;
+   *  keeping it unconditionally costs one string and makes the ledger able to
+   *  say which plane a tagged allocation belongs to. */
+  std::string pool_tag_;
   std::shared_ptr<MemAllocator>
     allocator_; /**< backend allocator threaded down to MemoryPool/
                      CachePool. Stored on TensorPool so reinitialize()

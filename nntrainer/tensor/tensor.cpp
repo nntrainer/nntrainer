@@ -1274,6 +1274,16 @@ const std::shared_ptr<MemoryData> Tensor::getMemoryData() const {
 
 size_t Tensor::getOffset() const { return itensor_->getOffset(); }
 
+bool Tensor::isClMem() const {
+  auto md = itensor_->getMemoryData();
+  return md && md->isClMem();
+}
+
+void *Tensor::getClMem() const {
+  auto md = itensor_->getMemoryData();
+  return md ? md->deviceMem() : nullptr;
+}
+
 void Tensor::copy(const Tensor &from) {
   /// @todo enable copy to non-contiguous tensor
   if (!itensor_->getContiguous() || !from.getContiguous()) {

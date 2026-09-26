@@ -33,6 +33,24 @@
 #include <utility>
 #include <vector>
 
+#include <compute_ops.h>
+#include <neuralnet.h>
+
+#if defined(ENABLE_OPENCL)
+#include <cl_context.h> // OpenCL-only; registration uses the Engine facade.
+
+namespace nntrainer::opencl {
+/**
+ * @brief GPU memory ledger phase boundary.
+ *
+ * Declared rather than included: the ledger lives behind the OpenCL backend's
+ * own headers and the app wants exactly this one call, so that the phases a
+ * footprint question turns on (load / prefill / decode) are named by the only
+ * code that knows where they are. Inert unless NNTR_GPU_MEM_ACCT is set.
+ */
+void clMemAcctDump(const char *phase);
+} // namespace nntrainer::opencl
+#endif
 #include <common.h>
 #include <layer_context.h>
 #include <lm_head.h>
@@ -41,6 +59,7 @@
 #include <tensor.h>
 
 #include <causal_lm.h>
+#include <footprint_sampler.h> // per-run honest peak (RssAnon + accelerator)
 #include <llm_util.hpp>
 #include <utf8_stream_util.h>
 
@@ -363,6 +382,17 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
                    const WSTR tail_prompt, bool log_output) {
 
   auto start_total = std::chrono::high_resolution_clock::now();
+  /** The peak belongs to THIS request, so the second message does not inherit
+   *  the first one's high-water. arm() rather than a reset because a caller
+   *  that lazily loaded the model just before this call has already started
+   *  measuring, and that load is part of the same request. */
+  FootprintSampler::get().arm();
+#if defined(ENABLE_OPENCL)
+  /** Load is finished here and no forward has run: everything in the ledger at
+   *  this point is weights, planes and mirrors, i.e. the part of the footprint
+   *  that a prompt cannot change. */
+  nntrainer::opencl::clMemAcctDump("after-load");
+#endif
   if (!is_initialized) {
     throw std::runtime_error("CausalLM model is not initialized. Please call "
                              "initialize() before run().");
@@ -615,6 +645,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
     input_sample[static_cast<size_t>(b) * MAX_SEQ_LEN] =
       static_cast<float>(id_list[b]);
 
+#if defined(ENABLE_OPENCL)
+  /** The GPU footprint peaks somewhere between "the graph is built" and "the
+   *  first token is out", and which side of the prefill it peaks on decides
+   *  which lever is worth building. Name the boundary. */
+  nntrainer::opencl::clMemAcctDump("after-prefill");
+#endif
   auto start_generation = std::chrono::high_resolution_clock::now();
 
   for (unsigned int token_generation_idx = input_len + 1;
@@ -684,7 +720,12 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   auto finish_total = std::chrono::high_resolution_clock::now();
   auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
     finish_total - start_total);
-  size_t peak_memory = getPeakMemoryKb();
+#if defined(ENABLE_OPENCL)
+  nntrainer::opencl::clMemAcctDump("after-decode");
+#endif
+  const size_t maxrss_kb = getPeakMemoryKb();
+  const size_t honest_kb = FootprintSampler::get().finish();
+  const size_t peak_memory = resolvePeakMemoryKb(honest_kb, maxrss_kb);
 
   if (log_output) {
 
@@ -700,6 +741,8 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
               << " TPS\n";
     std::cout << "total: " << total_duration.count() << " ms\n";
     std::cout << "peak memory: " << peak_memory << " KB\n";
+    std::cout << "  (honest RssAnon+accel: " << honest_kb
+              << " KB, ru_maxrss: " << maxrss_kb << " KB)\n";
     std::cout << "==========================================================\n";
   }
 
@@ -709,6 +752,7 @@ void CausalLM::run(const WSTR prompt, bool do_sample, const WSTR system_prompt,
   performance_metrics.generation_duration_ms = generation_duration.count();
   performance_metrics.total_duration_ms = total_duration.count();
   performance_metrics.peak_memory_kb = peak_memory;
+  performance_metrics.peak_rss_kb = maxrss_kb;
 
   has_run_ = true;
 }
