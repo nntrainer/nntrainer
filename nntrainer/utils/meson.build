@@ -11,6 +11,7 @@ util_sources = [
   'thread_manager.cpp',
   'thread_manager_util.cpp',
   'safetensors_util.cpp',
+  'driver_version.cpp',
 ]
 
 util_headers = [
@@ -29,6 +30,7 @@ util_headers = [
   'thread_manager.h',
   'thread_manager_util.h',
   'safetensors_util.h',
+  'driver_version.h',
 ]
 
 if get_option('enable-trace')

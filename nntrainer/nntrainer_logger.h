@@ -77,6 +77,29 @@ public:
    */
   void setTimeStampType(nntrainer_log_timestamp type) { ts_type = type; }
 
+  /**
+   * @brief     Directory the log file is written to.
+   *
+   * NNTR_LOG_DIR names it outright; set to the empty string or "off" it
+   * disables file logging. Otherwise it is "logs" under the per-user base
+   * directory (see resolveUserDataDir()), never the working directory.
+   *
+   * @return    the directory, or "" when file logging is disabled
+   */
+  static std::string resolveLogDir();
+
+  /**
+   * @brief     Create @a dir if needed and open @a file_name in it for
+   *            appending. Never throws.
+   *
+   * @param     dir directory to write into; "" fails without touching disk
+   * @param     file_name log file name inside @a dir
+   * @param     out stream to open; left closed on failure
+   * @return    true when @a out is open for writing
+   */
+  static bool openLogFile(const std::string &dir, const std::string &file_name,
+                          std::ofstream &out) noexcept;
+
 protected:
   /**
    * @brief     Logging instance
@@ -87,11 +110,12 @@ protected:
    */
   static const char *const logfile_name;
   /**
-   * @brief     Log file directory path.
+   * @brief     Log directory name under the per-user base directory.
    */
-  static const char *const logfile_dir;
+  static const char *const logfile_subdir;
   /**
-   * @brief     output stream
+   * @brief     output stream; closed when file logging is disabled or the
+   *            log directory could not be written
    */
   std::ofstream outputstream;
 

@@ -24,7 +24,11 @@
 #define MAX_PATH_LENGTH 1024
 #endif
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <random>
 
@@ -252,6 +256,59 @@ tm *getLocaltime(tm *tp) {
   return tp;
 #else
   return localtime_r(&t, tp);
+#endif
+}
+
+std::string getUserCacheBaseDir() {
+  auto env = [](const char *name) -> std::string {
+    const char *v = std::getenv(name);
+    return (v != nullptr) ? std::string(v) : std::string();
+  };
+#if defined(_WIN32)
+  for (const char *name : {"LOCALAPPDATA", "APPDATA", "TEMP"}) {
+    std::string v = env(name);
+    if (!v.empty())
+      return v;
+  }
+  return "";
+#elif defined(__ANDROID__)
+  return "";
+#else
+  std::string xdg = env("XDG_CACHE_HOME");
+  if (!xdg.empty())
+    return xdg;
+  std::string home = env("HOME");
+  if (!home.empty())
+    return (std::filesystem::path(home) / ".cache").string();
+  return "";
+#endif
+}
+
+std::string resolveUserDataDir(const char *env_override,
+                               const std::string &configured) {
+  if (env_override != nullptr) {
+    if (const char *e = std::getenv(env_override); e != nullptr) {
+      std::string v(e);
+      std::string lower = v;
+      std::transform(
+        lower.begin(), lower.end(), lower.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      if (v.empty() || lower == "off")
+        return "";
+      return v;
+    }
+  }
+
+  if (configured.empty() || std::filesystem::path(configured).is_absolute())
+    return configured;
+
+#if defined(__ANDROID__)
+  return configured;
+#else
+  const std::string base = getUserCacheBaseDir();
+  if (base.empty())
+    return "";
+  return (std::filesystem::path(base) / "nntrainer" / configured).string();
 #endif
 }
 

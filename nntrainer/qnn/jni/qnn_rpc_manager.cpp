@@ -41,13 +41,33 @@ QNNRpcManager::QNNRpcManager() {
     exit(-1);
   }
 #endif
-  // Get QNN Interface
+  // Get QNN Interface.
+  //
+  // Both of the checks below are load-bearing, not defensive noise. This
+  // constructor runs from QNNContext::initialize(), which runs from
+  // Engine::Global() -- i.e. on the FIRST model load of ANY process built with
+  // -Denable-npu=true, including a pure GPU or CPU one. A process that does
+  // not ship the QNN SDK next to it (the GPU cell, the x86 harness, an app
+  // whose APK carries only the OpenCL path) gets a null library handle here,
+  // and resolveSymbol() only LOGS its failure and returns nullptr -- so
+  // calling through getInterfaceProviders was an unconditional SIGSEGV at
+  // pc=0, before a single layer was built. Throwing instead lands in
+  // QNNContext::initialize()'s catch and then in Engine::add_default_object()'s
+  // "QNN context plugin not available" warning, which is the intended
+  // degradation: no QNN layers registered, everything else runs.
   void *libBackendHandle = pal::dynamicloading::dlOpen(
     "libQnnHtp.so",
     pal::dynamicloading::DL_NOW | pal::dynamicloading::DL_GLOBAL);
+  if (libBackendHandle == nullptr) {
+    ml_loge("QNNRpcManager: libQnnHtp.so is not loadable");
+    throw std::runtime_error("QNNRpcManager: libQnnHtp.so unavailable");
+  }
   QnnInterfaceGetProvidersFn_t getInterfaceProviders{nullptr};
   getInterfaceProviders = resolveSymbol<QnnInterfaceGetProvidersFn_t>(
     libBackendHandle, "QnnInterface_getProviders");
+  if (getInterfaceProviders == nullptr)
+    throw std::runtime_error(
+      "QNNRpcManager: QnnInterface_getProviders unavailable");
   QnnInterface_t **interfaceProviders{nullptr};
   uint32_t numProviders{0};
   if (QNN_SUCCESS !=
