@@ -28,6 +28,7 @@
 #include <cstring>
 #include <regex>
 #include <sstream>
+#include <string>
 
 #include <nntrainer_error.h>
 #include <random>
@@ -422,6 +423,42 @@ char *getRealpath(const char *name, char *resolved);
  * @return tm struct
  */
 tm *getLocaltime(tm *tp);
+
+/**
+ * @brief Per-user base directory for the files nntrainer writes on its own
+ *        behalf (log files, the compiled-kernel cache).
+ *
+ * The library must never write these into the process's working directory:
+ * an application started from a directory it cannot write to (a Windows
+ * program launched from C:\Windows\System32, a service started from /) would
+ * otherwise fail -- or, before the fail-soft handling, crash -- inside model
+ * load. The base is looked up, in order:
+ *  - Windows:     %LOCALAPPDATA%, then %APPDATA%, then %TEMP%
+ *  - Android:     none; see resolveUserDataDir()
+ *  - other POSIX: $XDG_CACHE_HOME, then $HOME/.cache
+ *
+ * @return the base directory, or "" when none can be determined
+ */
+std::string getUserCacheBaseDir();
+
+/**
+ * @brief Resolve the directory for one kind of file nntrainer writes on its
+ *        own behalf.
+ *
+ * @param env_override name of the environment variable that overrides the
+ *        result, or nullptr for none. Unset: @a configured decides. Set to the
+ *        empty string or to "off" (any case): "" is returned, which disables
+ *        writing. Any other value is returned exactly as given.
+ * @param configured built-in location. Absolute: returned exactly. Empty: ""
+ *        (disabled). Relative: resolved to <base>/nntrainer/<configured>
+ *        under getUserCacheBaseDir(); with no base determinable, "" -- never
+ *        the working directory. On Android a relative @a configured is
+ *        returned unchanged: there the working directory is the app's own
+ *        private storage, which the app prepares.
+ * @return the directory to use, or "" meaning "do not write these files"
+ */
+std::string resolveUserDataDir(const char *env_override,
+                               const std::string &configured);
 
 /**
  * @brief Create and return std::regex with the received string

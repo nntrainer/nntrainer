@@ -31,6 +31,7 @@
 #include <sstream>
 #include <stdarg.h>
 #include <stdexcept>
+#include <system_error>
 #include <util_func.h>
 
 namespace nntrainer {
@@ -39,7 +40,7 @@ namespace nntrainer {
  * @brief     logfile name
  */
 const char *const Logger::logfile_name = "log_nntrainer_";
-const char *const Logger::logfile_dir = "./logs/";
+const char *const Logger::logfile_subdir = "logs";
 /**
  * @brief     instance for single logger
  */
@@ -73,6 +74,36 @@ Logger::~Logger() {
   }
 }
 
+std::string Logger::resolveLogDir() {
+  return resolveUserDataDir("NNTR_LOG_DIR", logfile_subdir);
+}
+
+bool Logger::openLogFile(const std::string &dir, const std::string &file_name,
+                         std::ofstream &out) noexcept {
+  try {
+    if (dir.empty())
+      return false;
+    // The error_code overload: the throwing one raises
+    // std::filesystem::filesystem_error for a directory that cannot be
+    // created, and the logger is first constructed inside whatever call
+    // logged first -- model load, typically -- so that exception used to
+    // take the whole load down.
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec)
+      return false;
+    out.open((std::filesystem::path(dir) / file_name).string(),
+             std::ios_base::app);
+    if (!out.is_open() || !out.good()) {
+      out.close();
+      return false;
+    }
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 Logger::Logger() : ts_type(NNTRAINER_LOG_TIMESTAMP_SEC) {
   struct tm now;
   getLocaltime(&now);
@@ -82,19 +113,15 @@ Logger::Logger() : ts_type(NNTRAINER_LOG_TIMESTAMP_SEC) {
      << now.tm_mday << std::setfill('0') << std::setw(2) << now.tm_hour
      << std::setfill('0') << std::setw(2) << now.tm_min << std::setfill('0')
      << std::setw(2) << now.tm_sec << ".out";
-  if (!std::filesystem::exists(logfile_dir)) {
-    std::filesystem::create_directories(logfile_dir);
-  }
-  outputstream.open(logfile_dir + ss.str(), std::ios_base::app);
-  if (!outputstream.good()) {
-    char buf[256] = {
-      0,
-    };
-    std::string cur_path = std::string(buf);
-    std::string err_msg =
-      "Unable to initialize the Logger on path(" + cur_path + ")";
-    throw std::runtime_error(err_msg);
-  }
+
+  // Fail-soft: logging is diagnostics, and a directory that cannot be written
+  // must never cost the caller its model load. Without a log file, warnings
+  // and errors go to stderr (see log()) and the rest is dropped.
+  const std::string dir = resolveLogDir();
+  if (!dir.empty() && !openLogFile(dir, ss.str(), outputstream))
+    std::cerr << "nntrainer: cannot write log files under " << dir
+              << "; file logging disabled, warnings and errors go to stderr"
+              << std::endl;
 }
 
 void Logger::log(const std::string &message,
@@ -138,7 +165,10 @@ void Logger::log(const std::string &message,
        << now.tm_sec << ']';
   }
 
-  outputstream << ss.str() << " " << message << std::endl;
+  if (outputstream.is_open())
+    outputstream << ss.str() << " " << message << std::endl;
+  else if (loglevel >= NNTRAINER_LOG_WARN)
+    std::cerr << ss.str() << " " << message << std::endl;
 }
 
 } /* namespace nntrainer */
