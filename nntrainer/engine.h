@@ -161,6 +161,27 @@ public:
     return engines.at(name);
   }
 
+  /**
+   * @brief is a Context with this name registered?
+   *
+   * @note getRegisteredContext() throws for a name that is not registered,
+   *       which is the right contract for a caller that cannot do its work
+   *       without that backend. It is the wrong one for the paths that only
+   *       finish work IF a backend was brought up -- load-time and teardown
+   *       hooks compiled in with a backend but reached on every engine. Since
+   *       add_default_object() registers the OpenCL and CUDA contexts only
+   *       when the run asks for them, such a hook has to ask first instead of
+   *       letting the throw escape into its caller.
+   *
+   * @param name Context name (case-insensitive)
+   * @return true when a Context is registered under this name
+   */
+  bool isContextRegistered(std::string name) const {
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return engines.find(name) != engines.end();
+  }
+
   std::unordered_map<std::string, std::shared_ptr<nntrainer::MemAllocator>>
   getAllocators() {
     return allocator;
@@ -173,6 +194,32 @@ public:
    * @return Context name
    */
   std::string parseComputeEngine(const std::vector<std::string> &props) const;
+
+  /**
+   * @brief Register a layer factory on a backend by engine name, without a
+   *        static_cast to a concrete Context. Resolves the engine to its
+   *        Context and dispatches through the Context::registerLayerFactory
+   *        virtual (each backend forwards to its own registerFactory<Layer>).
+   *        This is the registration facade for vendor add-only backends and
+   *        the Application layer.
+   *        See docs/backend_guide/ARCHITECTURE_REFACTOR.md §5.
+   *
+   * @param engine registered context name ("cpu"/"gpu"/"cuda"/...)
+   * @param creator layer creator (createLayer<T> result)
+   * @param key string key (empty ⇒ derived from getType())
+   * @param int_key integer key (-1 ⇒ auto-assigned)
+   * @return registered integer key, or -1 if the backend is registered but
+   *         declines to register a factory. An engine name that is not
+   *         registered at all throws std::invalid_argument from
+   *         getRegisteredContext().
+   */
+  int registerLayerFactory(
+    const std::string &engine,
+    nntrainer::Context::PtrFactoryType<nntrainer::Layer> creator,
+    const std::string &key = "", const int int_key = -1) const {
+    return getRegisteredContext(engine)->registerLayerFactory(creator, key,
+                                                              int_key);
+  }
 
   /**
    * @brief Create an Layer Object with Layer name

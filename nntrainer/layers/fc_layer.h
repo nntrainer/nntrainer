@@ -15,6 +15,7 @@
 #define __FC_LAYER_H__
 #ifdef __cplusplus
 
+#include <acti_func.h>
 #include <common_properties.h>
 #include <layer_impl.h>
 
@@ -118,16 +119,23 @@ public:
 
 private:
   float lora_scaling;
-  std::tuple<props::Unit, props::LoraRank, props::LoraAlpha>
+  std::tuple<props::Unit, props::LoraRank, props::LoraAlpha,
+             props::FusedActivation, props::PlanLastRowOnly>
     fc_props;                             /**< fc layer properties :
                                                 unit - number of output neurons,
                                                 lora_rank - rank of lora (optional)
                                                 lora_scaling - scaling factor of LoRA apply, i.e.,
-                                             lora_scaling = alpha / lora_rank */
+                                             lora_scaling = alpha / lora_rank
+                                                fused_activation - inline activation
+                                             applied after GEMM+bias
+                                                plan_last_row_only - plan the output at height 1
+                                             because only the last row is ever produced */
   std::array<unsigned int, 2> weight_idx; /**< indices of the weights */
   std::array<unsigned int, 4> lora_idx;   /**< indices of the lora weights */
   std::unique_ptr<nntrainer::Quantizer> quantizer;
   bool skip_prefill = false;
+  ActiFunc acti_func; /**< inline fused activation; inert unless
+                           fused_activation is set by the FusionRealizer */
 };
 } // namespace nntrainer
 

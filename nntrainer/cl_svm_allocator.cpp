@@ -10,7 +10,11 @@
  * @brief   Implementation of OpenCL SVM-backed MemAllocator subclass.
  */
 
+#include <cl_buffer_pool.h>
 #include <cl_svm_allocator.h>
+#include <cstdlib>
+#include <cstring>
+#include <memory_pool.h>
 #include <mutex>
 #include <opencl_context_manager.h>
 #include <unordered_set>
@@ -27,6 +31,22 @@ std::unordered_set<void *> host_owned;
 
 ClSVMAllocator::ClSVMAllocator(opencl::ContextManager &ctx) : ctx_(ctx) {}
 
+std::shared_ptr<MemoryPool>
+ClSVMAllocator::makePool(const std::shared_ptr<MemAllocator> &self) {
+  // NNTR_GPU_CLMEM_POOL=0: fall back to the plain SVM-backed MemoryPool, whose
+  // deviceMemory() returns null, so the planner demotes every device placement
+  // to the shared plane and no tensor is placed on cl_mem at all.
+  //
+  // The device plane stays ON by default -- this is an opt-OUT and changes no
+  // default. What it buys is the A/B: the plane is the largest single variable
+  // in a device run, and separating "the kernels are wrong" from "the
+  // placement is wrong" otherwise costs a rebuild.
+  const char *e = std::getenv("NNTR_GPU_CLMEM_POOL");
+  if (e != nullptr && e[0] == '0')
+    return std::make_shared<MemoryPool>(self);
+  return std::make_shared<ClBufferPool>(self);
+}
+
 void ClSVMAllocator::track_host_owned(void *ptr) {
   std::lock_guard<std::mutex> lk(host_owned_mtx);
   host_owned.insert(ptr);
@@ -40,6 +60,25 @@ bool ClSVMAllocator::consume_host_owned(void *ptr) {
 void ClSVMAllocator::alloc(void **ptr, size_t size, size_t alignment) {
   void *svm = ctx_.createSVMRegion(size);
   if (svm != nullptr) {
+    // Zero it. clSVMAlloc hands back whatever the driver's page pool last
+    // held, and the activation plane carved out of this region is NOT fully
+    // written before it is read: the residency planner's own device-plane
+    // buffers are zero-filled at creation for exactly this reason --
+    // "Match the shared plane's zero-initialisation: a producer writes only
+    // the rows it has, and an element-wise consumer reads the padded rows
+    // too" (cl_buffer_pool.cpp). That premise is true of the fallback below,
+    // which is calloc-shaped, and false of every real-SVM device, so on a
+    // coarse-grain device the padded rows carried per-run driver garbage into
+    // the forward pass.
+    //
+    // One memset of the plane at model load, once per process. NNTR_SVM_ZERO=0
+    // restores the old contents-undefined behaviour as a bisection arm.
+    static const bool zero_on = []() {
+      const char *e = std::getenv("NNTR_SVM_ZERO");
+      return e == nullptr || e[0] != '0';
+    }();
+    if (zero_on)
+      std::memset(svm, 0, size);
     *ptr = svm;
     return;
   }

@@ -6,16 +6,41 @@ set -e
 
 # Parse options
 USE_BUILD_CACHE=0
+MESON_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --cache)
             USE_BUILD_CACHE=1
             shift
             ;;
+        -D*|--arm-arch=*)
+            # Forwarded verbatim to tools/package_android.sh, which already
+            # filters these out of its own argv and hands them to meson. Without
+            # this, enable-opencl keeps its false default and the only android
+            # binaries this script can produce are CPU-only.
+            MESON_ARGS+=("$1")
+            shift
+            ;;
+        --arm-arch)
+            # The space-separated spelling reaches here rather than the case
+            # above. tools/package_android.sh only matches --arm-arch=<version>,
+            # so say which spelling to use instead of reporting the option as
+            # unknown -- it is the option name that is right and the separator
+            # that is wrong.
+            echo "Error: use --arm-arch=<version>, not --arm-arch <version>"
+            echo "  tools/package_android.sh, which this forwards to, parses"
+            echo "  only the '=' form."
+            exit 1
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--cache]"
-            echo "  --cache  Reuse existing nntrainer builddir if available"
+            echo "Usage: $0 [--cache] [-Doption=value ...] [--arm-arch=<version>]"
+            echo "  --cache        Reuse existing nntrainer builddir if available"
+            echo "  -D*            Passed through to meson via tools/package_android.sh"
+            echo "  --arm-arch=*   Passed through to tools/package_android.sh."
+            echo "                 The '=' form only: the space-separated"
+            echo "                 spelling is not accepted downstream."
+            echo "Example: $0 -Denable-opencl=true"
             exit 1
             ;;
     esac
@@ -103,6 +128,12 @@ log_info "NNTRAINER_ROOT: $NNTRAINER_ROOT"
 log_info "Build cache: $([ "$USE_BUILD_CACHE" -eq 1 ] && echo 'enabled' || echo 'disabled (default)')"
 log_info "ANDROID_NDK: $ANDROID_NDK"
 log_info "Working directory: $(pwd)"
+log_info "meson args: ${MESON_ARGS[*]:-(none)}"
+
+if [ "$USE_BUILD_CACHE" -eq 1 ] && [ ${#MESON_ARGS[@]} -gt 0 ]; then
+    log_warning "--cache skips the nntrainer reconfigure, so the cached builddir"
+    log_warning "options win and ${MESON_ARGS[*]} will have no effect."
+fi
 
 # Step 1: Build nntrainer for Android if not already built
 log_step "1/4" "Build nntrainer for Android"
@@ -116,7 +147,7 @@ else
         log_info "Removing existing builddir..."
         rm -rf builddir
     fi
-    ./tools/package_android.sh
+    ./tools/package_android.sh "${MESON_ARGS[@]}"
 fi
 
 # Check if build was successful

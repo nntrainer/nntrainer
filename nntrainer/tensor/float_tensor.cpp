@@ -16,7 +16,7 @@
 #include <chrono>
 #include <cpu_backend.h>
 #include <float_tensor.h>
-#include <int4_tensor.h>
+#include <int4_utils.h>
 #include <q4_0_utils.h>
 #include <thread_manager.h>
 
@@ -756,7 +756,6 @@ Tensor &FloatTensor::dot(Tensor const &input, Tensor &output, bool trans,
     break;
   case Tdatatype::QINT16:
   case Tdatatype::QINT8:
-  case Tdatatype::QINT4:
     dotQInteger(input, output, trans, trans_in, beta, input.getDataType());
     break;
   case Tdatatype::QS4CX:
@@ -775,8 +774,9 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   unsigned int K = getDim().width();
   Tdatatype input_dtype = input[0]->getDataType();
 
-  // Handle standard inputs
-  if (input_dtype != Tdatatype::Q4_0 && input_dtype != Tdatatype::QINT4) {
+  // Handle standard inputs. The batched fast path is Q4_0-only: int4 weights
+  // are QS4CX and go through the per-item dot above.
+  if (input_dtype != Tdatatype::Q4_0) {
     for (unsigned int i = 0; i < input.size(); ++i) {
       dot(*input[i], *output[i], trans, trans_in, beta);
     }
@@ -794,36 +794,12 @@ void FloatTensor::dot(std::vector<Tensor *> input, std::vector<Tensor *> output,
   }
 
   auto *o = getOps();
-  if (input_dtype == Tdatatype::Q4_0) {
-    if (o->supports_gemm_q4_0_batch_fp32() && M > 1) {
-      o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
-    } else {
-      for (unsigned int i = 0; i < input.size(); ++i) {
-        o->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
-                          Ns[i]);
-      }
-    }
-  } else { // QINT4
-    if (o->supports_gemv_int4_batch_fp32() &&
-        input[0]->getMemoryData()->isSVM() &&
-        output[0]->getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
-      std::vector<uint16_t *> scales;
-      for (unsigned int i = 0; i < input.size(); ++i) {
-        scales.push_back(input[i]->getScale<uint16_t>());
-      }
-      if (M == 1) {
-        o->gemv_int4_batch_fp32(mdatas, scales, data, rdatas, K, Ns,
-                                Int4QTensor::getGroupSize());
-      } else {
-        o->gemm_int4_batch_fp32(data, mdatas, scales, rdatas, M, Ns, K,
-                                Int4QTensor::getGroupSize());
-      }
-    } else {
-      /// @todo Replace with standard CPU INT4 computation
-      for (unsigned int i = 0; i < input.size(); ++i) {
-        o->gemm_q4_0_fp32(M, Ns[i], K, data, K, (void *)input[i]->getData(),
-                          Ns[i], rdatas[i], Ns[i]);
-      }
+  if (o->supports_gemm_q4_0_batch_fp32() && M > 1) {
+    o->gemm_q4_0_batch_fp32(mdatas, data, rdatas, M, Ns, K);
+  } else {
+    for (unsigned int i = 0; i < input.size(); ++i) {
+      o->gemm_q4_0_fp32(M, Ns[i], K, data, K, mdatas[i], Ns[i], rdatas[i],
+                        Ns[i]);
     }
   }
 }
@@ -1038,10 +1014,10 @@ Tensor &FloatTensor::dotQInteger(Tensor const &input, Tensor &output,
       output.getMemoryData()->isSVM() && getMemoryData()->isSVM()) {
     if (M == 1) {
       o->gemv_int4_accel_fp32(mdata, input.getScale<uint16_t>(), data, rdata, K,
-                              N, Int4QTensor::getGroupSize());
+                              N, Int4Utils::ROW_BLOCK_SIZE);
     } else {
       o->sgemm_int4_accel_fp32(data, mdata, input.getScale<uint16_t>(), rdata,
-                               M, N, K, Int4QTensor::getGroupSize());
+                               M, N, K, Int4Utils::ROW_BLOCK_SIZE);
     }
   } else {
     /// @todo Replace with standard CPU INT4 computation
@@ -1061,7 +1037,6 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
   defined(__ANDROID__) || defined(__arm__) || defined(_M_ARM) ||               \
   defined(_M_ARM64)
   float *lhs = (float *)getData();
-  char *rhs = input.getPackedData<char>();
   float *out = output.getData<float>();
 
   /**
@@ -1081,7 +1056,23 @@ Tensor &FloatTensor::dotQs4cx(Tensor const &input, Tensor &output, bool trans,
    */
   size_t opt_kernel_idx = (M == 1) ? 2 : 8;
 
-  gemm_qai8dxp_qsi4cxp(M, N, K, lhs, rhs, out, opt_kernel_idx);
+  /**
+   * @note Packing the rhs once after load is a caller-driven optimization
+   * (Tensor::pack(), reached through the layer's pack() hook), not a
+   * precondition of this operator: a QS4CX weight that was only loaded is a
+   * complete operand. Take the pre-packed kernel when the pack is there and
+   * the entry point that packs the rhs itself when it is not, which is what
+   * the x86 branch below already does unconditionally. Both spell the same
+   * ukernel with the same rhs bytes, so only the cost differs.
+   */
+  if (input.isPacked()) {
+    gemm_qai8dxp_qsi4cxp(M, N, K, lhs, input.getPackedData<char>(), out,
+                         opt_kernel_idx);
+  } else {
+    gemm_qai8dxp_qsi4cxp_rhs_unpacked(M, N, K, lhs, input.getData<char>(),
+                                      input.getScale(), out, opt_kernel_idx,
+                                      true);
+  }
 #elif defined(__x86_64__) || defined(__i586__) || defined(_M_X64) ||           \
   defined(_M_IX86)
 

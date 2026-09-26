@@ -111,7 +111,8 @@ test_target = [
   'unittest_layers_mol_attention.cpp',
   'unittest_layers_multi_head_attention.cpp',
   'unittest_layers_positional_encoding.cpp',
-  'unittest_layers_upsample2d.cpp'
+  'unittest_layers_upsample2d.cpp',
+  'unittest_layers_sigmoid_gate.cpp'
 ]
 
 if get_option('enable-opencl')
@@ -122,6 +123,7 @@ if get_option('enable-opencl')
   test_target += 'unittest_layers_fully_connected_cl.cpp'
   test_target += 'unittest_layers_concat_cl.cpp'
   test_target += 'unittest_layers_swiglu_cl.cpp'
+  test_target += 'unittest_layers_norm_activation_neutral.cpp'
 endif
 
 if get_option('enable-tflite-backbone')

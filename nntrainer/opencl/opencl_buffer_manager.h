@@ -63,7 +63,16 @@ private:
 
 public:
   /**
-   * @brief Initialize Buffer objects.
+   * @brief Does nothing, and no longer needs calling.
+   *
+   * Every region is allocated on its first use now, in the getters below, so
+   * a process that never runs a block-quantized GEMM pays nothing for them.
+   * The name outlived the behaviour: nothing here initialises a buffer any
+   * more, and the OpenCL context bring-up no longer calls it.
+   *
+   * Kept only because this header is installed, so dropping the symbol would
+   * break anything compiled against the previous package. New code should not
+   * call it.
    */
   void initBuffers();
 
@@ -120,8 +129,8 @@ public:
   void *getSVMQuant(unsigned int idx = 0);
 
   /**
-   * @brief Destroy Buffer pointers.
-   *
+   * @brief Destructor. Deliberately does not release the OpenCL regions --
+   *        see the note on the definition.
    */
   ~ClBufferManager();
 };

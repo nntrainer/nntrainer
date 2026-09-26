@@ -14,6 +14,8 @@
  */
 
 #include "tensor_api_impl.h"
+#include <chrono>
+#include <load_trace.h>
 
 #include <model.h>
 
@@ -313,6 +315,8 @@ static const char *dtypeToStr(nntrainer::TensorDim::DataType dt) {
     return "Q4_K";
   case DT::Q6_K:
     return "Q6_K";
+  case DT::QS4CX:
+    return "QS4CX";
   case DT::BCQ:
     return "BCQ";
   default:
@@ -343,6 +347,12 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
     std::shared_ptr<Layer> layer;
     std::vector<std::string> input_layer_names;
   };
+
+  // The symbolic graph walk and the addLayer calls that realize it. Measured
+  // on an Adreno 840 handset, gemma4 E2B: the largest single item of an init
+  // outside the weight load. Timed by hand rather than with a Scope because it
+  // ends where compile() begins, not where this function returns.
+  const auto _lt_add_t0 = std::chrono::steady_clock::now();
 
   std::vector<LayerInfo> layers_in_order;
   std::unordered_set<Layer *> visited;
@@ -549,19 +559,33 @@ int Model::compile(std::vector<Tensor> &inputs, std::vector<Tensor> &outputs,
   }
 
   // 3. Compile the model
-  status = compile(mode);
+  nntrainer::load_trace::add(
+    nntrainer::load_trace::G_ADD,
+    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - _lt_add_t0)
+      .count());
+  {
+    nntrainer::load_trace::Scope _lt(nntrainer::load_trace::G_COMPILE);
+    status = compile(mode);
+  }
   if (status != ML_ERROR_NONE) {
     return status;
   }
 
   // 4. Initialize the model
-  status = initialize(mode);
+  {
+    nntrainer::load_trace::Scope _lt(nntrainer::load_trace::G_INIT);
+    status = initialize(mode);
+  }
   if (status != ML_ERROR_NONE) {
     return status;
   }
 
   // 5. Allocate tensor memory
-  status = allocate(mode);
+  {
+    nntrainer::load_trace::Scope _lt_alloc(nntrainer::load_trace::G_ALLOC);
+    status = allocate(mode);
+  }
   if (status != ML_ERROR_NONE) {
     return status;
   }

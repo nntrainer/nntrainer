@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <fc_layer.h>
+#include <layer_context.h>
 #include <layers_common_tests.h>
 
 auto semantic_fc = LayerSemanticsParamType(
@@ -89,3 +90,95 @@ GTEST_PARAMETER_TEST(FullyConnected16, LayerGoldenTest,
                                        fc_basic_single_batch_w16a16,
                                        fc_basic_no_decay_w16a16));
 #endif
+
+/**
+ * @brief A fused activation epilogue has no backward, so finalizing a layer
+ * that carries one for anything other than an inference graph must throw
+ * rather than silently drop the activation derivative during training.
+ */
+TEST(FullyConnected, fusedActivationOnTrainingGraph_n) {
+  auto layer = nntrainer::createLayer<nntrainer::FullyConnectedLayer>();
+  EXPECT_NO_THROW(layer->setProperty({"unit=5", "fused_activation=relu"}));
+
+  std::vector<ml::train::TensorDim> input_dims(
+    1, ml::train::TensorDim({1, 1, 1, 4}));
+  nntrainer::InitLayerContext train_context(
+    input_dims, {true}, false, "fc", "", 0.0f, {"NCHW", "FP32", "FP32"}, 1.0f,
+    ml::train::ExecutionMode::TRAIN);
+  EXPECT_THROW(layer->finalize(train_context), std::invalid_argument);
+}
+
+/**
+ * @brief The same property is accepted on an inference graph, which is the
+ * only mode the FusionRealizer sets it in.
+ */
+TEST(FullyConnected, fusedActivationOnInferenceGraph_p) {
+  auto layer = nntrainer::createLayer<nntrainer::FullyConnectedLayer>();
+  EXPECT_NO_THROW(layer->setProperty({"unit=5", "fused_activation=relu"}));
+
+  std::vector<ml::train::TensorDim> input_dims(
+    1, ml::train::TensorDim({1, 1, 1, 4}));
+  nntrainer::InitLayerContext infer_context(
+    input_dims, {true}, false, "fc", "", 0.0f, {"NCHW", "FP32", "FP32"}, 1.0f,
+    ml::train::ExecutionMode::INFERENCE);
+  EXPECT_NO_THROW(layer->finalize(infer_context));
+}
+
+/**
+ * @brief Finalize a fully connected layer over an eight-row input and report
+ * the height the layer planned its output at.
+ *
+ * @param props properties to set on the layer before finalizing
+ * @return unsigned int planned output height
+ */
+static unsigned int plannedOutputHeight(const std::vector<std::string> &props) {
+  auto layer = nntrainer::createLayer<nntrainer::FullyConnectedLayer>();
+  layer->setProperty(props);
+
+  std::vector<ml::train::TensorDim> input_dims(
+    1, ml::train::TensorDim({1, 1, 8, 4}));
+  nntrainer::InitLayerContext context(input_dims, {true}, false, "fc", "", 0.0f,
+                                      {"NCHW", "FP32", "FP32"}, 1.0f,
+                                      ml::train::ExecutionMode::INFERENCE);
+  layer->finalize(context);
+
+  return context.getOutSpecs().at(0).variable_spec.dim.height();
+}
+
+/**
+ * @brief Without the property the output keeps the graph-build height, which
+ * is the behaviour of every layer that does not carry it.
+ */
+TEST(FullyConnected, planLastRowOnlyUnset_p) {
+  EXPECT_EQ(plannedOutputHeight({"unit=5"}), 8u);
+  EXPECT_EQ(plannedOutputHeight({"unit=5", "skip_prefill=true"}), 8u);
+}
+
+/**
+ * @brief A layer the model has declared to produce only its last row plans a
+ * single output row instead of a plane whose rows above the first are never
+ * written.
+ */
+TEST(FullyConnected, planLastRowOnlySet_p) {
+  EXPECT_EQ(plannedOutputHeight(
+              {"unit=5", "skip_prefill=true", "plan_last_row_only=true"}),
+            1u);
+}
+
+/**
+ * @brief The property is read together with skip_prefill: on a layer that does
+ * fill every row, shortening the plan would drop the rows it writes, so the
+ * collapse is not applied.
+ */
+TEST(FullyConnected, planLastRowOnlyWithoutSkipPrefill_p) {
+  EXPECT_EQ(plannedOutputHeight({"unit=5", "plan_last_row_only=true"}), 8u);
+}
+
+/**
+ * @brief Setting the property false is the same as leaving it unset.
+ */
+TEST(FullyConnected, planLastRowOnlyFalse_p) {
+  EXPECT_EQ(plannedOutputHeight(
+              {"unit=5", "skip_prefill=true", "plan_last_row_only=false"}),
+            8u);
+}
