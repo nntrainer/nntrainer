@@ -126,6 +126,14 @@ private:
   std::vector<unsigned int> normalize_axes; /**< normalize axes */
   std::vector<unsigned int>
     remain_axes; /**< remained axes (exclusive with normalize axes) */
+  /**
+   * @brief whether normalize_axes is exactly the last (width) axis, i.e. the
+   * contract of the ComputeOps::layer_norm whole-op. Set in finalize(); the
+   * inference forward paths dispatch through in.getOps()->layer_norm(...) when
+   * it holds and fall back to the composite path otherwise. This is the only
+   * structural condition the layer tests, and it never names a backend.
+   */
+  bool width_axis_only = false;
 
   std::array<unsigned int, 7> wt_idx;
   std::tuple<std::vector<props::Axis>, props::Epsilon, props::GammaInitializer,

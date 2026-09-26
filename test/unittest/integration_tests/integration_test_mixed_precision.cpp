@@ -119,11 +119,17 @@ TEST(mixed_precision, model_tensor_type_test) {
     ml::train::createModel(ml::train::ModelType::NEURAL_NET, {"loss=mse"});
 
   std::string positive_type_list[] = {
-    "QINT4-FP16",    "QINT4-FP32",    "QINT8-FP16",   "QINT8-FP32",
-    "FP16-FP16",     "FP16-FP32",     "FP32-FP16",    "FP32-FP32",
-    "QINT16-QINT16", "UINT16-UINT16", "QINT8-UINT16", "UINT4-UINT8",
-    "UINT4-UINT16",  "UINT8-UINT8",   "UINT8-UINT16"};
-  std::string negative_type_list[] = {"FP16-XXX", "XXX-XXX", "", "ttkt"};
+    "QINT8-FP16",   "QINT8-FP32",  "FP16-FP16",     "FP16-FP32",
+    "FP32-FP16",    "FP32-FP32",   "QINT16-QINT16", "UINT16-UINT16",
+    "QINT8-UINT16", "UINT4-UINT8", "UINT4-UINT16",  "UINT8-UINT8",
+    "UINT8-UINT16", "QS4CX-FP32",  "QS4CX-FP16"};
+
+  /// @note QINT4-FP16 and QINT4-FP32 are rejected at property-parse time.
+  /// Channel-wise int4 is QS4CX and QINT4 is deprecated: it is an on-disk
+  /// format only, so a model that asked for one could not allocate a single
+  /// weight. QS4CX-FP16 / QS4CX-FP32 replace them.
+  std::string negative_type_list[] = {"FP16-XXX", "XXX-XXX",    "",
+                                      "ttkt",     "QINT4-FP16", "QINT4-FP32"};
 
   for (auto type_item : positive_type_list) {
     EXPECT_NO_THROW(nn->setProperty(

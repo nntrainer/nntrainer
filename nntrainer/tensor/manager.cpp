@@ -32,6 +32,8 @@
 #include <unistd.h>
 #endif
 
+#include <env_compat.h>
+
 #include <activation_layer.h>
 #include <basic_planner.h>
 #include <bn_layer.h>
@@ -48,6 +50,7 @@
 #include <optimized_v1_planner.h>
 #include <optimized_v2_planner.h>
 #include <optimized_v3_planner.h>
+#include <residency_policy.h>
 #include <tensor_pool.h>
 #include <tensor_wrap_specs.h>
 #include <util_func.h>
@@ -196,11 +199,14 @@ static Tensor *requestTensor_(const TensorSpecV2 &spec,
   case RT::PLACEHOLDER:
     return tp.placeholder(name, spec.dim);
   case RT::UNIQUE:
-    return tp.request(name, spec.dim, order, spec.ls, spec.initializer);
+    return tp.request(name, spec.dim, order, spec.ls, spec.initializer,
+                      /*is_weight_grad=*/false, spec.engine);
   case RT::SHARED:
-    return tp.requestOrExtend(name, spec.dim, order, spec.ls, spec.initializer);
+    return tp.requestOrExtend(name, spec.dim, order, spec.ls, spec.initializer,
+                              spec.engine);
   case RT::READ_ONLY_VIEW:
-    return tp.view(name, spec.reference_name, spec.dim, order, spec.ls);
+    return tp.view(name, spec.reference_name, spec.dim, order, spec.ls,
+                   /*offset=*/0, spec.engine);
   case RT::MAYBE_MODIFYING_VIEW:
   default:
     throw std::logic_error("requestTensor_ should not reach here");
@@ -471,7 +477,33 @@ std::vector<Weight *> Manager::requestWeights(
           var_exec_order.push_back(std::max(lah_order, 0));
         }
       }
-      if (is_virtual) {
+      // [pool-bypass] Give QS4CX weights their own heap allocation instead of
+      // a slice of the pool's shared arena. The GPU paths consume DERIVED
+      // device forms (v8c backing / dp4a caches) built once from this payload,
+      // so after that build the plain bytes are dead weight -- but a pool slice
+      // can never be released (one arena, freed whole; SVM refuses page drops,
+      // UVM cannot decommit). A self-owned heap buffer's pages CAN be dropped
+      // in place (madvise/DiscardVirtualMemory on anon pages), keeping the
+      // pointer valid for the pointer-keyed derived caches. Reuses the proven
+      // UNMANAGED exclusion (finalize / allocate-bind skip) +
+      // QS4CX_Tensor::allocate() self-alloc. Not under FSU (its swap
+      // bookkeeping assumes pool residency).
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) ||             \
+  defined(_M_IX86)
+      const bool qs4cx_heap_bypass =
+        dim_v.getDataType() == ml::train::TensorDim::DataType::QS4CX &&
+        !enable_fsu && nntr_env_on("NNTR_QS4CX_HEAP_BYPASS");
+#else
+      const bool qs4cx_heap_bypass = false;
+#endif
+      if (qs4cx_heap_bypass) {
+        // Real exec_order (graph bookkeeping like getMinMaxTensorExecutionOrder
+        // iterates it -- an empty set segfaults there); the pool exclusion is
+        // carried by UNMANAGED alone (finalize/allocate skip on lifespan).
+        var = weight_pool.request(name, dim_v, var_exec_order,
+                                  TensorLifespan::UNMANAGED, t_initializer);
+        var->allocate(); // QS4CX_Tensor::allocate(): new uint8_t[], self-owned
+      } else if (is_virtual) {
         var = weight_pool.request(name, dim_v, var_exec_order,
                                   TensorLifespan::VIRTUAL, t_initializer);
       } else {
@@ -563,20 +595,21 @@ std::vector<Var_Grad *> Manager::requestTensors(
     if (is_dependent) {
       const auto &shared_name = shared_names.at(i);
       var = tensor_pool.requestOrExtend(shared_name, dim, var_exec_order, tspan,
-                                        t_init);
+                                        t_init, t_engine);
       if (need_grad && tspan > TensorLifespan::FORWARD_FUNC_LIFESPAN) {
         grad = tensor_pool.requestOrExtend(shared_name + Var_Grad::grad_suffix,
                                            dim, grad_exec_order, tspan,
-                                           Initializer::ZEROS);
+                                           Initializer::ZEROS, t_engine);
       }
     } else {
-      var = tensor_pool.request(name, dim, var_exec_order, tspan, t_init);
+      var = tensor_pool.request(name, dim, var_exec_order, tspan, t_init,
+                                /*is_weight_grad=*/false, t_engine);
       if (is_train_mode && need_grad &&
           tspan > TensorLifespan::FORWARD_FUNC_LIFESPAN) {
         grad = tensor_pool.request(name + Var_Grad::grad_suffix, /// name
                                    dim, grad_exec_order, tspan,
-                                   Initializer::ZEROS /// tensor initializer
-        );
+                                   Initializer::ZEROS, /// tensor initializer
+                                   /*is_weight_grad=*/false, t_engine);
       }
     }
 
@@ -627,11 +660,30 @@ Manager::requestInputs(const GraphNode &node,
   std::vector<Var_Grad *> ret;
   size_t current_size = inputs_v2.size();
 
+  /** An input is a view of the producer's output, so it carries the CONSUMING
+   *  layer's engine: the planner needs to know every reader before it can
+   *  place the tensor they share. MultiOut, the node the graph inserts for a
+   *  fan-out, is engine-neutral -- it is an in-place identity that touches no
+   *  data, and its real consumers register their own engines on views that
+   *  resolve to the same source, so it must not vote. An application may
+   *  declare further neutral layer types (see residency_policy.h) for layers
+   *  registered on one engine that bind their inputs on another. */
+  const auto *consumer_lnode = dynamic_cast<const LayerNode *>(&node);
+  const bool engine_neutral =
+    node.getType() == MultiOutLayer::type ||
+    ResidencyPolicy::global().isEngineNeutral(node.getType());
+  const auto consumer_engine =
+    (engine_neutral ||
+     (consumer_lnode != nullptr && consumer_lnode->isComputeEngineGPU()))
+      ? ml::train::LayerComputeEngine::GPU
+      : ml::train::LayerComputeEngine::CPU;
+
   for (unsigned int idx = 0; idx < inputs_dim.size(); idx++) {
     TensorSpecV2 var_spec = var_common_spec, grad_spec = grad_common_spec;
 
     var_spec.name = std::string("input") + std::to_string(idx);
     var_spec.dim = inputs_dim[idx];
+    var_spec.engine = consumer_engine;
 
     grad_spec.name = var_spec.name + Var_Grad::grad_suffix;
     grad_spec.dim = inputs_dim[idx];

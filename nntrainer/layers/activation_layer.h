@@ -97,6 +97,12 @@ private:
   std::unique_ptr<PropTypes> activation_props; /**< activation props */
 
   ActiFunc acti_func; /**< activation function from activation type */
+  /**
+   * @brief the configured activation cached as an int (an ActivationType) for
+   * the ComputeOps::activation whole-op dispatch. acti_func is kept for the
+   * backward path (run_prime_fn), which has no whole-op yet.
+   */
+  int act_type_int = (int)ActivationType::ACT_NONE;
   bool skip_prefill = false;
 };
 

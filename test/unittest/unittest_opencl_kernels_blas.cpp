@@ -10,15 +10,19 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <cmath>
 #include <cstring>
 #include <gtest/gtest.h>
 #include <utility>
+#include <vector>
 
 #include "fallback_internal.h"
+#include "gelu_cl_op.h"
 #include "int4_utils.h"
+#include "layernorm_cl_op.h"
 #include "nntrainer_test_util.h"
 #include "q4_0_utils.h"
-#include "swiglu_cl.h"
+#include "swiglu_cl_op.h"
 #include "tensor_dim.h"
 #include "timer.h"
 #include <blas_kernel_interface.h>
@@ -642,6 +646,172 @@ TEST(blas_kernels, rmsnorm_fp32) {
   EXPECT_IN_RANGE((float)cosSim, 0.99, 1);
 }
 
+// LayerNorm / GELU whole-ops. These go through the op entry points
+// (layernorm_cl_op / gelu_cl_op) rather than the former blas_kernels wrappers,
+// i.e. exactly the symbols ClComputeOps::layer_norm / ::activation forward to,
+// so they cover the argument binding AND the kernel math. Tensors here come
+// from the default (host) pool, so the ops take their host-bounce branch --
+// the SVM-direct branch is the same kernel with the pointers bound directly.
+TEST(blas_kernels, layernorm_fp32) {
+  // Small, fully-deterministic LayerNorm on the GPU checked element-wise
+  // against a plain CPU reference LayerNorm.
+  const unsigned int height = 3;
+  const unsigned int width = 8;
+  const float kEpsilon = 0.001f;
+
+  nntrainer::init_backend();
+  (void)nntrainer::Engine::Global().getRegisteredContext("gpu");
+
+  nntrainer::TensorDim::TensorType t_fp32 = {nntrainer::Tformat::NCHW,
+                                             nntrainer::Tdatatype::FP32};
+  nntrainer::Tensor in(1, 1, height, width, t_fp32);
+  nntrainer::Tensor out(1, 1, height, width, t_fp32);
+  nntrainer::Tensor gamma(1, 1, 1, width, t_fp32);
+  nntrainer::Tensor beta(1, 1, 1, width, t_fp32);
+
+  // Deterministic, non-trivial input/gamma/beta (rows have different means so
+  // the mean-subtraction path is actually exercised).
+  float *ip = in.getData<float>();
+  for (unsigned int h = 0; h < height; ++h)
+    for (unsigned int w = 0; w < width; ++w)
+      ip[h * width + w] = ((h * width + w) % 7) * 0.5f - 1.0f;
+  for (unsigned int w = 0; w < width; ++w) {
+    gamma.getData<float>()[w] = 0.5f + 0.1f * w;
+    beta.getData<float>()[w] = -0.3f + 0.05f * w;
+  }
+
+  nntrainer::layernorm_cl_op(in, out, gamma, beta, kEpsilon, height,
+                             /*row_offset=*/0);
+
+  /// CPU reference LayerNorm (mean, var, (x-mean)/sqrt(var+eps)*gamma + beta)
+  float maxAbsErr = 0.0f;
+  for (unsigned int h = 0; h < height; ++h) {
+    double mean = 0.0;
+    for (unsigned int w = 0; w < width; ++w)
+      mean += ip[h * width + w];
+    mean /= width;
+    double var = 0.0;
+    for (unsigned int w = 0; w < width; ++w) {
+      double d = ip[h * width + w] - mean;
+      var += d * d;
+    }
+    var /= width;
+    double inv = 1.0 / std::sqrt(var + (double)kEpsilon);
+    for (unsigned int w = 0; w < width; ++w) {
+      double ref =
+        (ip[h * width + w] - mean) * inv * gamma.getData<float>()[w] +
+        beta.getData<float>()[w];
+      float gpu = out.getData<float>()[h * width + w];
+      float err = std::fabs(gpu - (float)ref);
+      if (err > maxAbsErr)
+        maxAbsErr = err;
+    }
+  }
+
+  std::cout << "LayerNorm max abs error : " << maxAbsErr << std::endl;
+
+  EXPECT_LT(maxAbsErr, 1e-4f);
+}
+
+TEST(blas_kernels, layernorm_fp32_row_window) {
+  // The (active_rows, row_offset) window must leave the rows outside it
+  // untouched -- this is the decode/step contract the neutral Layer relies on.
+  const unsigned int height = 4;
+  const unsigned int width = 8;
+  const float kEpsilon = 0.001f;
+
+  nntrainer::init_backend();
+  (void)nntrainer::Engine::Global().getRegisteredContext("gpu");
+
+  nntrainer::TensorDim::TensorType t_fp32 = {nntrainer::Tformat::NCHW,
+                                             nntrainer::Tdatatype::FP32};
+  nntrainer::Tensor in(1, 1, height, width, t_fp32);
+  nntrainer::Tensor out(1, 1, height, width, t_fp32);
+  nntrainer::Tensor gamma(1, 1, 1, width, t_fp32);
+  nntrainer::Tensor beta(1, 1, 1, width, t_fp32);
+
+  float *ip = in.getData<float>();
+  for (unsigned int i = 0; i < height * width; ++i)
+    ip[i] = (i % 5) * 0.75f - 1.5f;
+  gamma.setValue(1.0f);
+  beta.setValue(0.0f);
+  out.setValue(-99.0f);
+
+  nntrainer::layernorm_cl_op(in, out, gamma, beta, kEpsilon, /*active_rows=*/2,
+                             /*row_offset=*/1);
+
+  for (unsigned int h = 0; h < height; ++h) {
+    for (unsigned int w = 0; w < width; ++w) {
+      const float got = out.getData<float>()[h * width + w];
+      if (h == 0 || h == 3) {
+        EXPECT_FLOAT_EQ(got, -99.0f) << "row window leaked at h=" << h;
+      } else {
+        double mean = 0.0;
+        for (unsigned int k = 0; k < width; ++k)
+          mean += ip[h * width + k];
+        mean /= width;
+        double var = 0.0;
+        for (unsigned int k = 0; k < width; ++k) {
+          double d = ip[h * width + k] - mean;
+          var += d * d;
+        }
+        var /= width;
+        const double ref =
+          (ip[h * width + w] - mean) / std::sqrt(var + (double)kEpsilon);
+        EXPECT_NEAR(got, (float)ref, 1e-4f);
+      }
+    }
+  }
+}
+
+TEST(blas_kernels, gelu_fp32) {
+  // Fixed FP32 input of 24 values spanning negatives/zero/positives.
+  const std::vector<float> host_in = {
+    -6.0f, -4.5f,  -3.0f, -2.5f, -2.0f, -1.5f, -1.0f, -0.75f,
+    -0.5f, -0.25f, -0.1f, 0.0f,  0.1f,  0.25f, 0.5f,  0.75f,
+    1.0f,  1.5f,   2.0f,  2.5f,  3.0f,  4.5f,  6.0f,  8.0f};
+  const unsigned int num_elems = (unsigned int)host_in.size();
+
+  nntrainer::init_backend();
+  (void)nntrainer::Engine::Global().getRegisteredContext("gpu");
+
+  nntrainer::TensorDim::TensorType t_fp32 = {nntrainer::Tformat::NCHW,
+                                             nntrainer::Tdatatype::FP32};
+  nntrainer::Tensor in(1, 1, 1, num_elems, t_fp32);
+  nntrainer::Tensor out(1, 1, 1, num_elems, t_fp32);
+  std::memcpy(in.getData<float>(), host_in.data(), num_elems * sizeof(float));
+
+  // Double-precision CPU reference for both GELU variants.
+  auto ref_gelu = [](double x, int mode) -> double {
+    if (mode == 1) {
+      // tanh approximation (ACT_TANH_GELU)
+      const double inner = 0.7978845608028654 * (x + 0.044715 * x * x * x);
+      return 0.5 * x * (1.0 + std::tanh(inner));
+    }
+    // erf-based exact GELU (ACT_GELU)
+    return 0.5 * x * (1.0 + std::erf(x * 0.70710678118654752));
+  };
+
+  for (int mode = 0; mode <= 1; ++mode) {
+    out.setValue(0.0f);
+    nntrainer::gelu_cl_op(in, out, mode, /*active_rows=*/1, /*row_offset=*/0);
+
+    float max_abs_err = 0.0f;
+    for (unsigned int i = 0; i < num_elems; ++i) {
+      const double ref = ref_gelu((double)host_in[i], mode);
+      const float got = out.getData<float>()[i];
+      const float err = std::fabs((float)(got - ref));
+      if (err > max_abs_err)
+        max_abs_err = err;
+    }
+
+    std::cout << "GELU mode " << mode << " (" << (mode ? "tanh" : "erf")
+              << ") max abs error = " << max_abs_err << std::endl;
+
+    EXPECT_LT(max_abs_err, 1e-4f);
+  }
+}
+
 TEST(blas_kernels, swiglu_layer_fp32_67_3072) {
   const int batch = 1;
   const int channel = 1;
@@ -693,12 +863,10 @@ TEST(blas_kernels, swiglu_layer_fp32_67_3072) {
 
   static constexpr uint32_t run_count = 500;
 
-  SwiGLULayerCl layer;
-
   auto t1_cl = std::chrono::high_resolution_clock::now();
   for (unsigned int i = 0; i < run_count; ++i) {
-    layer.swiglu_cl((float *)gpu_in1, (float *)gpu_in2, (float *)gpu_dst, width,
-                    height, true);
+    nntrainer::swiglu_cl((float *)gpu_in1, (float *)gpu_in2, (float *)gpu_dst,
+                         width, height, true);
   }
   auto t2_cl = std::chrono::high_resolution_clock::now();
 

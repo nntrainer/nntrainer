@@ -8,6 +8,7 @@
  * @bug		No known bugs except for NYI items
  */
 
+#include <algorithm>
 #include <cpu_backend.h>
 #include <math.h>
 #include <quantizer.h>
@@ -397,5 +398,96 @@ Tensor GgmlQuantizer::dequantize(const Tensor &input, Tdatatype dtype) {
 }
 
 QScheme GgmlQuantizer::qscheme() const { return scheme_; }
+
+/**
+ * @brief QS4CXQuantizer class
+ */
+std::unique_ptr<Quantizer> QS4CXQuantizer::create() {
+  return std::make_unique<QS4CXQuantizer>();
+}
+
+Tensor QS4CXQuantizer::quantize(const Tensor &input, Tdatatype qtype) {
+  NNTR_THROW_IF(qtype != Tdatatype::QS4CX, std::invalid_argument)
+    << "[QS4CXQuantizer::quantize] Output data type must be QS4CX.";
+
+  TensorDim dim = input.getDim();
+  dim.setDataType(Tdatatype::QS4CX);
+
+  // QS4CX_Tensor sizes itself from the dimension, so the record and its scale
+  // section are allocated by the constructor.
+  Tensor output(dim, true, Initializer::NONE, "", QScheme::QS4CX);
+
+  quantize(input, output, nullptr, nullptr);
+
+  return output;
+}
+
+Tensor &QS4CXQuantizer::quantize(const Tensor &input, Tensor &output,
+                                 float *scales, unsigned int *zero_points) {
+  /// @note zero_points is deliberately unread: QS4CX is symmetric and the +8
+  /// bias is part of the nibble encoding, so there is no per-channel zero
+  /// point to honour. @see the @a zero_points note on the declaration.
+  NNTR_THROW_IF(input.getDataType() != Tdatatype::FP32, std::invalid_argument)
+    << "[QS4CXQuantizer::quantize] Input tensor must be FP32.";
+
+  NNTR_THROW_IF(output.empty(), std::invalid_argument)
+    << "[QS4CXQuantizer::quantize] Cannot quantize to an empty tensor.";
+
+  NNTR_THROW_IF(output.getDataType() != Tdatatype::QS4CX, std::invalid_argument)
+    << "[QS4CXQuantizer::quantize] Output tensor must be QS4CX.";
+
+  const TensorDim dim = input.getDim();
+
+  /// @note Only height and width are compared here. batch and channel need no
+  /// check because a QS4CX output cannot carry any other value: the
+  /// QS4CX_Tensor constructor rejects batch != 1 or channel != 1 before this
+  /// runs, so the two dimensions are 1 on both sides by construction.
+  NNTR_THROW_IF(dim.height() != output.height() ||
+                  dim.width() != output.width(),
+                std::invalid_argument)
+    << "[QS4CXQuantizer::quantize] Tensor shape does not match.";
+
+  const size_t K = dim.height();
+  const size_t N = dim.width();
+
+  // One scale per output channel means the kernel walks the weight channel by
+  // channel, so hand it the (N, K) view. batch()/channel() are 1 here - the
+  // QS4CX_Tensor constructor rejects anything else.
+  Tensor input_t = input.transpose("0:2:1");
+
+  float *out_scales = output.getScale<float>();
+  quant_qs4cx_f32(N, K, input_t.getData(), output.getData<uint8_t>(),
+                  out_scales, true);
+
+  if (scales != nullptr)
+    std::copy(out_scales, out_scales + N, scales);
+
+  return output;
+}
+
+Tensor QS4CXQuantizer::dequantize(const Tensor &input, Tdatatype dtype) {
+  NNTR_THROW_IF(dtype != Tdatatype::FP32, std::invalid_argument)
+    << "[QS4CXQuantizer::dequantize] Output data type must be FP32.";
+
+  NNTR_THROW_IF(input.getDataType() != Tdatatype::QS4CX, std::invalid_argument)
+    << "[QS4CXQuantizer::dequantize] Input tensor must be QS4CX.";
+
+  const TensorDim dim = input.getDim();
+  const size_t K = dim.height();
+  const size_t N = dim.width();
+
+  // The kernel unpacks into the (N, K) layout the record is stored in; put it
+  // back to the (K, N) shape the caller quantized.
+  Tensor output_t(dim.batch(), dim.channel(), static_cast<unsigned int>(N),
+                  static_cast<unsigned int>(K),
+                  {Tformat::NCHW, Tdatatype::FP32});
+
+  dequant_qs4cx_f32(N, K, input.getData<uint8_t>(), input.getScale<float>(),
+                    output_t.getData(), true);
+
+  return output_t.transpose("0:2:1");
+}
+
+QScheme QS4CXQuantizer::qscheme() const { return QScheme::QS4CX; }
 
 } // namespace nntrainer

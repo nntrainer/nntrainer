@@ -41,7 +41,7 @@
 #include "gptoss_cached_slim_causallm.h"
 #endif
 #include "gptoss_causallm.h"
-#if !defined(_WIN32) && !defined(__ANDROID__)
+#if !defined(_WIN32)
 #include "multilingual_tinybert_16mb.h"
 #endif
 #include "qwen2_causallm.h"
@@ -63,6 +63,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <thread>
 
@@ -221,6 +223,19 @@ int main(int argc, char *argv[]) {
 
   auto start_time = std::chrono::high_resolution_clock::now();
 
+  /* INITBISECT_MARKS: env-gated init-phase trace (NNTR_INIT_TRACE). */
+  static const bool _itrace = std::getenv("NNTR_INIT_TRACE") != nullptr;
+  auto _ilap = [&](const char *what) {
+    if (!_itrace)
+      return;
+    std::fprintf(stderr, "[init-trace] %8.1f ms  rss=%zu kB  %s\n",
+                 std::chrono::duration<double, std::milli>(
+                   std::chrono::high_resolution_clock::now() - start_time)
+                   .count(),
+                 read_vm_rss_kb(), what);
+    std::fflush(stderr);
+  };
+
   /** Register all runnable causallm models to factory */
   causallm::Factory::Instance().registerModel(
     "LlamaForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
@@ -299,7 +314,7 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::DebertaV2>(cfg, generation_cfg,
                                                    nntr_cfg);
     });
-#if !defined(_WIN32) && !defined(__ANDROID__)
+#if !defined(_WIN32)
   causallm::Factory::Instance().registerModel(
     "MultilingualTinyBert", [](json cfg, json generation_cfg, json nntr_cfg) {
       return std::make_unique<causallm::MultilingualTinyBert>(
@@ -323,6 +338,7 @@ int main(int argc, char *argv[]) {
       return std::make_unique<causallm::Lfm2CausalLM>(cfg, generation_cfg,
                                                       nntr_cfg);
     });
+  _ilap("model registration");
 
   // Validate arguments
   if (argc < 2) {
@@ -368,6 +384,7 @@ int main(int argc, char *argv[]) {
       nntr_cfg["model_file_name"].get<std::string>();
 
     std::cout << weight_file << std::endl;
+    _ilap("config json parsed");
 
     // Initialize and run model
     std::string architecture;
@@ -418,6 +435,7 @@ int main(int argc, char *argv[]) {
       }
     }
 
+    _ilap("chat template + prompt");
     auto model = causallm::Factory::Instance().create(architecture, cfg,
                                                       generation_cfg, nntr_cfg);
     if (!model) {
@@ -427,9 +445,13 @@ int main(int argc, char *argv[]) {
       std::cerr << std::endl;
       return EXIT_FAILURE;
     }
+    _ilap("Factory::create");
     model->initialize();
+    _ilap("model->initialize");
     model->load_weight(weight_file);
+    _ilap("model->load_weight");
     model->repack_weight();
+    _ilap("model->repack_weight");
 
     bool do_sample = generation_cfg.value("do_sample", false);
 

@@ -583,7 +583,6 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/q4_0_tensor.h
 %{_includedir}/nntrainer/q4_0_utils.h
 %{_includedir}/nntrainer/qs4cx_tensor.h
-%{_includedir}/nntrainer/int4_tensor.h
 %{_includedir}/nntrainer/int4_utils.h
 %{_includedir}/nntrainer/uint4_tensor.h
 %{_includedir}/nntrainer/char_tensor.h
@@ -694,6 +693,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 # custom layer kits
 %{_includedir}/nntrainer/app_context.h
 %{_includedir}/nntrainer/context.h
+%{_includedir}/nntrainer/model_features.h
 %{_includedir}/nntrainer/engine.h
 # optimizer headers
 %{_includedir}/nntrainer/optimizer_context.h
@@ -790,6 +790,7 @@ cp -r result %{buildroot}%{_datadir}/nntrainer/unittest/
 %{_includedir}/nntrainer/optimizer.h
 %{_includedir}/nntrainer/dataset.h
 %{_includedir}/nntrainer/tensor_dim.h
+%{_includedir}/nntrainer/half_fp16.h
 %{_libdir}/pkgconfig/ccapi-ml-training.pc
 
 %files -n ccapi-machine-learning-training-devel-static
