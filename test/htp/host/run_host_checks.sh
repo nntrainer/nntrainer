@@ -182,3 +182,17 @@ fi
   "$HERE/graph_host_check.c" "$BACKEND/hmx/hexkl_graph.c"
 
 "$OUT/graph_host_check"
+
+# The M=1 small ops (#82): the REAL HVX sources hvx_m1_ops_f32.c and
+# hvx_conv_gate_f32.c compiled against hvx_emu/ (one IEEE f32 op per lane,
+# no stand-in) and memcmp'd with the scalar spec nntrainer/tensor/
+# m1_ops_det.h, plus the spec's tolerance against a double reference.
+# -ffp-contract=off and no -ffast-math: the spec rounds every op on its
+# own and keeps subnormals, and the host compiler must too.
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/m1_ops_host_check" \
+  "$HERE/m1_ops_host_check.c" "$BACKEND/hvx/hvx_m1_ops_f32.c" \
+  "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
+
+"$OUT/m1_ops_host_check"
