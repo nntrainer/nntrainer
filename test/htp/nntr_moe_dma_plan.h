@@ -11,8 +11,10 @@
  *
  * hexkl_mm_u8i4_moe.c pushes its weights and activations through the ring
  * in an order fixed by the code (gate_up[0] ahead of the quantize, the
- * activation block behind it, down[i] behind the activation wait, the next
- * expert's activation and gate_up after the gate_up matmul). This header
+ * activation block behind it, the next expert's activation and gate_up
+ * after the gate_up matmul, then down[i] once down[i-1]'s matmul has
+ * issued its last read of the down buffer -- the down matmul runs one
+ * block behind the gate_up, upstream PR #4327 5731b6e5). This header
  * writes that order down as data for one 64-row block per expert (M=1 is
  * the decode shape), so the host check can hold the kernel's push trace
  * against it and the dma_replay entry can drive the same list with no
@@ -183,18 +185,13 @@ nntr_moe_dma_plan_m1(uint32_t K, uint32_t inter, uint32_t N_out,
       act_bytes / act_rs, act_rs, 0u, vtcm_act);
   act_push = n - 1u;
 
+  /* Block i (one per expert at M=1): the activation wait, GU(i)'s chunk
+     waits, the next block's activation and gate_up, DN(i-1)'s chunk waits,
+     then down[i] into the buffer DN(i-1) has just finished reading. */
+  uint32_t dn_n = 0u;
   for (uint32_t i = 0; i < n_active; ++i) {
     PUT(NNTR_MOE_DMA_OP_WAIT, NNTR_MOE_DMA_SITE_ACT, i, 0u, 0u, 0u, 0u,
         act_push, 0u);
-    uint32_t dn_n = 0u;
-    for (uint32_t nt0 = 0, c = 0; nt0 < dn_ntiles; nt0 += acc_tiles, ++c) {
-      const uint32_t cn =
-        (dn_ntiles - nt0 < acc_tiles) ? (dn_ntiles - nt0) : acc_tiles;
-      PUT(NNTR_MOE_DMA_OP_PUSH, NNTR_MOE_DMA_KIND_DOWN, i, c, cn * T,
-          inter_ktiles, dn_ntiles * T, dn_off + nt0 * T, vtcm_dn + nt0 * T);
-      dn_last[c] = n - 1u;
-      dn_n = c + 1u;
-    }
     for (uint32_t c = 0; c < gu_n; ++c) {
       PUT(NNTR_MOE_DMA_OP_WAIT, NNTR_MOE_DMA_SITE_GU, i, c, 0u, 0u, 0u,
           gu_last[c], 0u);
@@ -214,10 +211,24 @@ nntr_moe_dma_plan_m1(uint32_t K, uint32_t inter, uint32_t N_out,
         gu_last[c] = n - 1u;
       }
     }
-    for (uint32_t c = 0; c < dn_n; ++c) {
-      PUT(NNTR_MOE_DMA_OP_WAIT, NNTR_MOE_DMA_SITE_DN, i, c, 0u, 0u, 0u,
+    for (uint32_t c = 0; i != 0u && c < dn_n; ++c) {
+      PUT(NNTR_MOE_DMA_OP_WAIT, NNTR_MOE_DMA_SITE_DN, i - 1u, c, 0u, 0u, 0u,
           dn_last[c], 0u);
     }
+    dn_n = 0u;
+    for (uint32_t nt0 = 0, c = 0; nt0 < dn_ntiles; nt0 += acc_tiles, ++c) {
+      const uint32_t cn =
+        (dn_ntiles - nt0 < acc_tiles) ? (dn_ntiles - nt0) : acc_tiles;
+      PUT(NNTR_MOE_DMA_OP_PUSH, NNTR_MOE_DMA_KIND_DOWN, i, c, cn * T,
+          inter_ktiles, dn_ntiles * T, dn_off + nt0 * T, vtcm_dn + nt0 * T);
+      dn_last[c] = n - 1u;
+      dn_n = c + 1u;
+    }
+  }
+  /* The last block's down matmul, after the loop. */
+  for (uint32_t c = 0; c < dn_n; ++c) {
+    PUT(NNTR_MOE_DMA_OP_WAIT, NNTR_MOE_DMA_SITE_DN, n_active - 1u, c, 0u, 0u,
+        0u, dn_last[c], 0u);
   }
   {
     const uint32_t rs = nntr_moe_dma_row_size(copy_out);
