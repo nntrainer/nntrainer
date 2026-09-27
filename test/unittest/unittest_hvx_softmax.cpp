@@ -30,6 +30,7 @@
 #include <AEEStdErr.h>
 #include <remote.h>
 
+#include "m1_ops_det.h"
 #include "nntr_hvx.h"
 #include "swiglu_det.h"
 
@@ -286,6 +287,243 @@ TEST(SwigluDetNeon, MatchesScalar) {
     << "the NEON path does not match the scalar specification -- the usual "
        "cause is the compiler contracting a multiply and an add into an fmla";
 #endif
+}
+
+class HvxM1Ops : public HtpSession {};
+
+namespace {
+
+/**
+ * @brief Inputs for the M=1 small-op tests: the host check's spread
+ *        (test/htp/host/m1_ops_host_check.c) -- random rows plus a zero, an
+ *        all-subnormal (+-1e-39: HVX keeps subnormals, rule 24) and a
+ *        large (|x| ~ 1e4) row, so the device is judged on what the host
+ *        check already passed.
+ */
+void m1_fill_row(float *x, int n, int kind, std::mt19937 &rng) {
+  std::uniform_real_distribution<float> small(-3.0f, 3.0f);
+  std::uniform_real_distribution<float> large(-1e4f, 1e4f);
+  for (int i = 0; i < n; ++i) {
+    switch (kind) {
+    case 1:
+      x[i] = 0.0f;
+      break;
+    case 2:
+      x[i] = (i & 1) ? -1e-39f : 1e-39f;
+      break;
+    case 3:
+      x[i] = large(rng);
+      break;
+    default:
+      x[i] = small(rng);
+    }
+  }
+}
+
+/** @brief cos[32] | sin[32] for one position at LFM2.5's rope_theta. */
+void m1_rope_cs(float *cs, uint32_t pos) {
+  for (int i = 0; i < 32; ++i) {
+    const double inv_freq = std::pow(5e6, -(2.0 * i) / 64.0);
+    const double ang = static_cast<double>(pos) * inv_freq;
+    cs[i] = static_cast<float>(std::cos(ang));
+    cs[32 + i] = static_cast<float>(std::sin(ang));
+  }
+}
+
+int m1_count_bad(const std::vector<float> &dsp, const std::vector<float> &ref,
+                 const char *what) {
+  int bad = 0;
+  for (size_t i = 0; i < dsp.size(); ++i) {
+    if (bits_of(dsp[i]) != bits_of(ref[i])) {
+      if (bad == 0) {
+        std::cout << "M1_OPS " << what << " first mismatch i=" << i
+                  << std::hexfloat << " dsp=" << dsp[i] << " ref=" << ref[i]
+                  << std::defaultfloat << std::endl;
+      }
+      ++bad;
+    }
+  }
+  return bad;
+}
+
+/** @brief One RMSNorm shape on the device against m1_ops_det.h; returns the
+ *         output and the row-scale bad counts through the arguments. */
+void m1_rmsnorm_case(remote_handle64 handle, uint32_t n, uint32_t chunk,
+                     const std::vector<float> &x, int *bad_y, int *bad_rs) {
+  const uint32_t nchunk = n / chunk;
+  std::mt19937 rng(0x82000002u);
+  std::uniform_real_distribution<float> gd(0.5f, 1.5f);
+  std::vector<float> gamma(chunk), y(n, 0.0f), rs(nchunk, 0.0f);
+  for (auto &g : gamma) {
+    g = gd(rng);
+  }
+  const int err = nntr_hvx_rmsnorm_det_f32(
+    handle, chunk, 1e-5f, x.data(), static_cast<int>(n), gamma.data(),
+    static_cast<int>(chunk), y.data(), static_cast<int>(n), rs.data(),
+    static_cast<int>(nchunk));
+  ASSERT_EQ(err, AEE_SUCCESS) << "rmsnorm_det_f32 failed: " << hex(err)
+                              << " (0x8000040e = stale skel, rule 3)";
+  std::vector<float> y_ref(n), rs_ref(nchunk);
+  m1_rmsnorm_det(x.data(), gamma.data(), y_ref.data(), n, chunk, 1e-5f,
+                 rs_ref.data());
+  *bad_rs = m1_count_bad(rs, rs_ref, "rmsnorm row_scale");
+  *bad_y = m1_count_bad(y, y_ref, "rmsnorm y");
+}
+
+} // namespace
+
+/**
+ * @brief A bad shape is AEE_EINVALIDFORMAT from the entry's own check.
+ *        AEE_EBADPARM here means the skel predates these three methods
+ *        (rule 3) -- rebuild it before reading the other cases.
+ */
+TEST_F(HvxM1Ops, RejectsBadShapes) {
+  std::vector<float> x(2048, 1.0f), gamma(48, 1.0f), y(2048), rs(1);
+  // chunk 48: a multiple of 16 but neither of 32 nor a power of two.
+  int err =
+    nntr_hvx_rmsnorm_det_f32(handle_, 48u, 1e-5f, x.data(), 2048, gamma.data(),
+                             48, y.data(), 2048, rs.data(), 1);
+  EXPECT_EQ(err, AEE_EINVALIDFORMAT + kDspOffset)
+    << "rmsnorm chunk 48: got " << hex(err);
+
+  std::vector<float> cs(32, 0.0f), qk(128, 1.0f), yq(128);
+  err = nntr_hvx_rope64_det_f32(handle_, 1u, cs.data(), 32, qk.data(), 128,
+                                yq.data(), 128);
+  EXPECT_EQ(err, AEE_EINVALIDFORMAT + kDspOffset)
+    << "rope cs of 32: got " << hex(err);
+
+  const int C = 64;
+  std::vector<float> abc(3 * C, 1.0f), w(3 * C, 1.0f), st(2 * C, 0.0f), out(C),
+    so(2 * C);
+  // state_out must be three rows (the kernel's scratch row), not two.
+  err = nntr_hvx_conv_gate_m1_f32(handle_, abc.data(), 3 * C, w.data(), 3 * C,
+                                  st.data(), 2 * C, out.data(), C, so.data(),
+                                  2 * C);
+  EXPECT_EQ(err, AEE_EINVALIDFORMAT + kDspOffset)
+    << "conv state_out of 2C: got " << hex(err);
+}
+
+/**
+ * @brief The hidden RMSNorm (n = chunk = 2048) on the four row kinds, bit
+ *        for bit against the scalar spec. row_scale is compared first: a
+ *        bad count there puts the divergence in the reduction or the
+ *        rsqrt, a clean row_scale with bad y puts it in the scaling.
+ *
+ * The last row (|x| ~ 3e38, sum of squares overflows to inf) is printed
+ * and not gated: rule 24's unexplained overflow case, where the host
+ * emulation has no device confirmation of the inf/NaN encodings.
+ */
+TEST_F(HvxM1Ops, RmsnormMatchesDetBitExact) {
+  const uint32_t n = 2048;
+  std::mt19937 rng(0x82000001u);
+  std::vector<float> x(n);
+  for (int kind = 0; kind < 4; ++kind) {
+    m1_fill_row(x.data(), static_cast<int>(n), kind, rng);
+    int bad_y = -1, bad_rs = -1;
+    ASSERT_NO_FATAL_FAILURE(m1_rmsnorm_case(handle_, n, n, x, &bad_y, &bad_rs));
+    std::cout << "M1_OPS_FIELD rmsnorm kind=" << kind << " bad_y=" << bad_y
+              << " bad_row_scale=" << bad_rs << " of " << n << std::endl;
+    EXPECT_EQ(bad_rs, 0) << "kind " << kind
+                         << ": the reduction or rsqrt differs from the spec";
+    EXPECT_EQ(bad_y, 0) << "kind " << kind << ": y differs from the spec";
+  }
+  std::uniform_real_distribution<float> huge(-3e38f, 3e38f);
+  for (auto &v : x) {
+    v = huge(rng);
+  }
+  int bad_y = -1, bad_rs = -1;
+  ASSERT_NO_FATAL_FAILURE(m1_rmsnorm_case(handle_, n, n, x, &bad_y, &bad_rs));
+  std::cout << "M1_OPS_FIELD rmsnorm overflow_row (not gated) bad_y=" << bad_y
+            << " bad_row_scale=" << bad_rs << " of " << n << std::endl;
+}
+
+/** @brief The per-head q/k norm: 32 x 64 and 8 x 64 with one shared
+ *         64-float gamma, heads 0..2 the fixed kinds. */
+TEST_F(HvxM1Ops, QkNormMatchesDetBitExact) {
+  std::mt19937 rng(0x82000003u);
+  for (uint32_t heads : {32u, 8u}) {
+    const uint32_t n = heads * 64u;
+    std::vector<float> x(n);
+    for (uint32_t h = 0; h < heads; ++h) {
+      m1_fill_row(x.data() + h * 64u, 64,
+                  (h < 3u) ? static_cast<int>(h) + 1 : 0, rng);
+    }
+    int bad_y = -1, bad_rs = -1;
+    ASSERT_NO_FATAL_FAILURE(
+      m1_rmsnorm_case(handle_, n, 64u, x, &bad_y, &bad_rs));
+    std::cout << "M1_OPS_FIELD qk_norm heads=" << heads << " bad_y=" << bad_y
+              << " bad_row_scale=" << bad_rs << " of " << n << std::endl;
+    EXPECT_EQ(bad_rs, 0) << heads << " heads: row scale differs";
+    EXPECT_EQ(bad_y, 0) << heads << " heads: y differs";
+  }
+}
+
+/** @brief RoPE on 32 q + 8 k heads at positions 0, 1, 511, 1023, 4095;
+ *         position 0 is also the identity bit for bit. */
+TEST_F(HvxM1Ops, Rope64MatchesDetBitExact) {
+  const uint32_t n_q = 32, n_k = 8, n = (n_q + n_k) * 64u;
+  std::mt19937 rng(0x82000004u);
+  std::vector<float> qk(n), y(n), y_ref(n), cs(64);
+  for (uint32_t h = 0; h < n_q + n_k; ++h) {
+    m1_fill_row(qk.data() + h * 64u, 64, (h < 3u) ? static_cast<int>(h) + 1 : 0,
+                rng);
+  }
+  for (uint32_t pos : {0u, 1u, 511u, 1023u, 4095u}) {
+    m1_rope_cs(cs.data(), pos);
+    std::fill(y.begin(), y.end(), 0.0f);
+    const int err = nntr_hvx_rope64_det_f32(handle_, n_q, cs.data(), 64,
+                                            qk.data(), static_cast<int>(n),
+                                            y.data(), static_cast<int>(n));
+    ASSERT_EQ(err, AEE_SUCCESS) << "rope64_det_f32 failed: " << hex(err);
+    y_ref = qk;
+    for (uint32_t h = 0; h < n_q + n_k; ++h) {
+      m1_rope64_det(y_ref.data() + h * 64u, cs.data());
+    }
+    const int bad = m1_count_bad(y, y_ref, "rope64");
+    std::cout << "M1_OPS_FIELD rope64 pos=" << pos << " bad=" << bad << " of "
+              << n << std::endl;
+    EXPECT_EQ(bad, 0) << "pos " << pos << ": differs from the spec";
+    if (pos == 0u) {
+      EXPECT_EQ(m1_count_bad(y, qk, "rope64 identity"), 0)
+        << "position 0 is not the identity";
+    }
+  }
+}
+
+/**
+ * @brief The conv1d + gate as a chain of 8 tokens from a zero state, each
+ *        call's out and new state against the spec's chain; the chain
+ *        equals one prefill-shape hvx_conv_gate_f32 call by construction
+ *        (the same kernel at m_count = 1; m1_ops_host_check proves it).
+ */
+TEST_F(HvxM1Ops, ConvGateM1MatchesDetBitExact) {
+  const int C = 2048;
+  std::mt19937 rng(0x82000005u);
+  std::uniform_real_distribution<float> wd(-1.0f, 1.0f);
+  std::vector<float> w(3 * C), abc(3 * C), out(C), state_in(2 * C, 0.0f),
+    state_out(3 * C), out_ref(C), state_ref(2 * C, 0.0f);
+  for (auto &v : w) {
+    v = wd(rng);
+  }
+  int bad_out = 0, bad_state = 0;
+  for (int t = 0; t < 8; ++t) {
+    m1_fill_row(abc.data(), 3 * C, (t >= 1 && t <= 3) ? t : 0, rng);
+    std::fill(out.begin(), out.end(), 0.0f);
+    const int err = nntr_hvx_conv_gate_m1_f32(
+      handle_, abc.data(), 3 * C, w.data(), 3 * C, state_in.data(), 2 * C,
+      out.data(), C, state_out.data(), 3 * C);
+    ASSERT_EQ(err, AEE_SUCCESS) << "conv_gate_m1_f32 failed: " << hex(err);
+    m1_conv_gate_det(abc.data(), state_ref.data(), w.data(), out_ref.data(),
+                     static_cast<uint32_t>(C));
+    bad_out += m1_count_bad(out, out_ref, "conv out");
+    std::copy(state_out.begin(), state_out.begin() + 2 * C, state_in.begin());
+    bad_state += m1_count_bad(state_in, state_ref, "conv state");
+  }
+  std::cout << "M1_OPS_FIELD conv_gate_m1 C=" << C
+            << " chain=8 bad_out=" << bad_out << " bad_state=" << bad_state
+            << std::endl;
+  EXPECT_EQ(bad_out, 0) << "conv1d + gate differs from the spec";
+  EXPECT_EQ(bad_state, 0) << "the conv state shift differs from the spec";
 }
 
 TEST_F(HvxExp, RejectsNonVectorLength) {
