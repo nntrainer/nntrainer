@@ -19,6 +19,7 @@
 #include "hexkl_mm_u8i4_dma.h"
 #include "hexkl_mm_u8i4_moe.h"
 #include "hexkl_mm_u8i8_dma.h"
+#include "hvx_attn_m1_f32.h"
 #include "hvx_worker_pool.h"
 
 /**
@@ -60,11 +61,15 @@ typedef struct {
   nntr_hvx_arena arenas[NNTR_HVX_MAX_ARENAS];
   hexkl_moe_scratch moe_scratch; /**< the MoE layer call's heap scratch,
                                       grown on demand, freed in close() */
-  uint32_t moe_flags; /**< HEXKL_MOE_FLAG_* bits from moe_set_opts; the
-                           session is calloc'd, so 0 = the HMX loop */
-  hexkl_graph *graph; /**< [#85] the decode op table from graph_init; NULL
-                           = none. Freed in close() before the weight
-                           tables, since its MoE ops name their handles */
+  uint32_t moe_flags;       /**< HEXKL_MOE_FLAG_* bits from moe_set_opts; the
+                                 session is calloc'd, so 0 = the HMX loop */
+  hexkl_graph *graph;       /**< [#85] the decode op table from graph_init; NULL
+                                 = none. Freed in close() before the weight
+                                 tables, since its MoE ops name their handles */
+  hvx_attn_m1_ctx *attn_m1; /**< [#81] the m=1 attention KV cache from
+                                 attn_m1_register; NULL = none. Borrows
+                                 quant_pool, so it is freed in close()
+                                 before hvx_worker_pool_destroy */
 } nntr_hvx_session;
 
 /** @brief [#85] mm_u8i4_moe_layer_timed's stage table, shared with
