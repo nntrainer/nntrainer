@@ -4,7 +4,7 @@
 # Runs the HTP kernels' host checks: no device, no Hexagon SDK, no HMX.
 #
 # What these are and are not. The HMX and HVX primitives are replaced by
-# scalar stand-ins in stub/ and in the check itself, so this does NOT
+# scalar stand-ins in stub/, standin/ and the check itself, so this does NOT
 # verify the hardware's arithmetic -- the device tests do that, and this
 # would give false confidence if it were read as doing so. What it does
 # verify is everything around the arithmetic: which rows each expert gets,
@@ -36,10 +36,11 @@ cc=${CC:-gcc}
 # (M1 GEMV VTCM FEED SCHEDULE OK).
 "$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter \
   -DMOE_TAIL_MAX_ROWS=16u \
-  -I "$HERE/stub" -I "$HERE/.." -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  -I "$HERE/stub" -I "$HERE/standin" -I "$HERE/.." -I "$BACKEND/.." \
+  -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/moe_layer_host_check" \
-  "$HERE/moe_layer_host_check.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" \
-  "$BACKEND/hmx/hexkl_dma_trace.c" -lm
+  "$HERE/moe_layer_host_check.c" "$HERE/standin/hvx_scalar.c" \
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_dma_trace.c" -lm
 
 "$OUT/moe_layer_host_check"
 
@@ -49,9 +50,11 @@ cc=${CC:-gcc}
 # add per tap, as the HVX computes it, and the host compiler must not fuse
 # them into an FMA the device does not have.
 "$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
-  -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  -I "$HERE/stub" -I "$HERE/standin" -I "$BACKEND/.." -I "$BACKEND/hmx" \
+  -I "$BACKEND/hvx" \
   -o "$OUT/conv_block_host_check" \
   "$HERE/conv_block_host_check.c" "$HERE/hvx_scalar_stubs.c" \
+  "$HERE/standin/hvx_scalar.c" \
   "$BACKEND/hmx/hexkl_conv_block.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" \
   "$BACKEND/hmx/hexkl_dma_trace.c" -lm
 
@@ -60,9 +63,11 @@ cc=${CC:-gcc}
 # The FC / projection call (hexkl_mm_u8i4_layer_run) on the same stand-ins:
 # several handles against one activation, the pooled epilogue's batching.
 "$cc" -std=c99 -O1 -Wall -Wextra -Wno-unused-parameter \
-  -I "$HERE/stub" -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  -I "$HERE/stub" -I "$HERE/standin" -I "$BACKEND/.." -I "$BACKEND/hmx" \
+  -I "$BACKEND/hvx" \
   -o "$OUT/fc_layer_host_check" \
   "$HERE/fc_layer_host_check.c" "$HERE/hvx_scalar_stubs.c" \
+  "$HERE/standin/hvx_scalar.c" \
   "$BACKEND/hmx/hexkl_mm_u8i4_dma.c" -lm
 
 "$OUT/fc_layer_host_check"

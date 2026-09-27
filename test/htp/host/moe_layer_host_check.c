@@ -13,6 +13,7 @@
 #include "hvx_dequant_i32.h"
 #include "hvx_gather_ah_u8.h"
 #include "hvx_gemm_u8i4_wh.h"
+#include "hvx_scalar.h"
 #include "hvx_scale_add_f32.h"
 #include <AEEStdErr.h>
 #include <math.h>
@@ -22,44 +23,16 @@
 #include <string.h>
 
 #include "nntr_moe_dma_plan.h"
+#include "swiglu_det.h"
 
-/* ---- accumulator + acc layout ---- */
-static int32_t g_acc[64][32];
+/* ---- acc layout: the tile stand-in (standin/hvx_scalar.c) is a 64 x 32
+   int32 tile at row stride 32, base 0 ---- */
 static hexkl_acc_layout g_layout = {1, 1, 0,
                                     32}; /* probed, usable, base, stride */
 const hexkl_acc_layout *hexkl_acc_layout_get(uint8_t *b, uint32_t off) {
   (void)b;
   (void)off;
   return &g_layout;
-}
-int hexkl_micro_hmx_acc_clear_int32(void) {
-  memset(g_acc, 0, sizeof g_acc);
-  return 0;
-}
-
-/* Weight tile: 512 bytes = 32k x 32n int4 in the device's WH layout
-   (htp_wh_layout.h: byte (k/8)*128 + c*4 + k%4, low nibble for k%8 < 4),
-   two's complement nibbles. The HMX stub, the HVX GEMM stand-in and the
-   reference all read a tile through this one function, so the layout is
-   the real one and the three cannot disagree on it -- the HVX GEMM's
-   whole claim is that it reads the same bytes as the HMX.
-   Activation tile: 64 rows x 32 bytes u8. */
-static int wh_value(const uint8_t *tile, uint32_t k, uint32_t c) {
-  const uint32_t byte = (k / 8u) * 128u + c * 4u + (k % 4u);
-  const int nib = (tile[byte] >> (((k / 4u) % 2u) ? 4 : 0)) & 0xF;
-  return nib >= 8 ? nib - 16 : nib;
-}
-int hexkl_micro_hmx_mm_u8i4(uint8_t *base, uint32_t act_off, uint32_t w_off) {
-  const uint8_t *a = base + act_off;
-  const uint8_t *w = base + w_off;
-  for (int r = 0; r < 64; ++r)
-    for (uint32_t c = 0; c < 32; ++c) {
-      int32_t s = 0;
-      for (uint32_t k = 0; k < 32; ++k)
-        s += (int32_t)a[r * 32 + k] * wh_value(w, k, c);
-      g_acc[r][c] += s;
-    }
-  return 0;
 }
 /* Every GEMV call's int32 result, logged so the M=1 check can hold the
    tiles the kernel fed its epilogues against a reference computed from the
@@ -142,17 +115,7 @@ static void gemv_stand_in(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
       src_wh = sp->src; /* the log names the expert by its arena bytes */
     }
   }
-  for (uint32_t r = 0; r < m; ++r)
-    for (uint32_t c = 0; c < 32; ++c) {
-      int32_t s = 0;
-      for (uint32_t kt = 0; kt < k_tiles; ++kt) {
-        const uint8_t *tile = wh + ((size_t)kt * n_col + nt) * 512u;
-        const uint8_t *arow = act_ah + (size_t)kt * 2048u + r * 32u;
-        for (uint32_t k = 0; k < 32; ++k)
-          s += (int32_t)arow[k] * wh_value(tile, k, c);
-      }
-      out[r * 32u + c] = s;
-    }
+  hvx_scalar_gemv(act_ah, m, k_tiles, wh, n_col, nt, out);
   if (g_gemv_n == g_gemv_cap) {
     g_gemv_cap = g_gemv_cap ? 2u * g_gemv_cap : 1024u;
     g_gemv_log =
@@ -193,8 +156,8 @@ static void pf_reset(void) {
   g_pf_cols = g_pf_used = g_pf_bad = g_nopf_n = g_col_n = 0;
   g_rows1_seen = 0;
 }
-void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
-                               uint32_t n_tiles, uint32_t k_tiles) {
+static void hook_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                          uint32_t n_tiles, uint32_t k_tiles) {
   /* n_tiles > 64 is this stand-in's limit, not the kernel's (it clamps at
      127, the l2fetch width field's bound): the per-column bitmap below is
      one uint64_t. No shape reaches 64 units today -- the deepest swept
@@ -235,12 +198,19 @@ void hvx_gemm_u8i4_wh_prefetch(const uint8_t *wh, uint32_t n_col, uint32_t nt,
   b->used = 0;
   g_pf_cols += n_tiles;
 }
-void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
-                               uint32_t k_tiles, const uint8_t *wh,
-                               uint32_t n_col, uint32_t nt, uint32_t rows1,
-                               int32_t *out) {
+/* hvx_gemm_u8i4_wh_col (nopf = 0) and _col_nopf (nopf = 1), through the
+   stand-in file's hook: the bookkeeping is this check's, the sum is the
+   shared one. */
+static void hook_gemv(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
+                      const uint8_t *wh, uint32_t n_col, uint32_t nt,
+                      uint32_t rows1, int nopf, int32_t *out) {
   int found = 0;
   g_rows1_seen |= 1u << (rows1 != 0u);
+  if (!nopf) {
+    ++g_col_n;
+    gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, out);
+    return;
+  }
   if (g_score_on && in_vtcm(wh)) {
     /* Under the feed no box covers a column; the scoreboard in
        gemv_stand_in holds the read instead. */
@@ -266,19 +236,6 @@ void hvx_gemm_u8i4_wh_col_nopf(const uint8_t *act_ah, uint32_t m,
   ++g_nopf_n;
   gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, out);
 }
-void hvx_gemm_u8i4_wh_col(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
-                          const uint8_t *wh, uint32_t n_col, uint32_t nt,
-                          uint32_t rows1, int32_t *out) {
-  ++g_col_n;
-  g_rows1_seen |= 1u << (rows1 != 0u);
-  gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, out);
-}
-int hexkl_micro_hmx_acc_read_int32(uint8_t *base, uint32_t cfg, uint32_t off) {
-  (void)cfg;
-  memcpy(base + off, g_acc, sizeof g_acc);
-  return 0;
-}
-
 /* ---- DMA ring: completes immediately, so a push issued while the
    destination is still live shows up as a wrong result. ---- */
 void hexkl_dma_ring_reset(void) {}
@@ -350,99 +307,6 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
            (const uint8_t *)src + (size_t)r * ss, rs);
 }
 
-/* ---- quant / dequant / swiglu ---- */
-void hvx_quant_rows_u8_params(const float *x, uint32_t m, uint32_t mp,
-                              uint32_t k, float *scale, int32_t *zp,
-                              hvx_worker_pool *p) {
-  (void)p;
-  for (uint32_t r = 0; r < mp; ++r) {
-    float lo = 0.f, hi = 0.f;
-    if (r < m)
-      for (uint32_t j = 0; j < k; ++j) {
-        float v = x[(size_t)r * k + j];
-        if (v < lo)
-          lo = v;
-        if (v > hi)
-          hi = v;
-      }
-    float s = (hi - lo) / 255.f;
-    if (s <= 0.f)
-      s = 1e-8f;
-    scale[r] = s;
-    long z = lrintf(-lo / s);
-    if (z < 0)
-      z = 0;
-    if (z > 255)
-      z = 255;
-    zp[r] = (int32_t)z;
-  }
-}
-int hvx_quant_pack_u8_ah_mapped(const float *x, const uint32_t *map, uint32_t m,
-                                uint32_t mp, uint32_t k, const float *scale,
-                                const int32_t *zp, uint8_t *out,
-                                hvx_worker_pool *p) {
-  (void)p;
-  /* Tiles run (row_block, inner_tile) at a 2048-byte stride, so a caller
-     passing more than 64 rows writes several row blocks. The kernel now
-     packs the whole activation in one call, so this can no longer assume
-     one block the way it did. */
-  const uint32_t kt_n = k / 32u;
-  memset(out, 0, (size_t)mp * k);
-  for (uint32_t r = 0; r < m; ++r)
-    for (uint32_t kt = 0; kt < kt_n; ++kt)
-      for (uint32_t j = 0; j < 32; ++j) {
-        const size_t sr = map ? map[r] : r;
-        long q = lrintf(x[sr * k + kt * 32 + j] / scale[r]) + zp[r];
-        if (q < 0)
-          q = 0;
-        if (q > 255)
-          q = 255;
-        out[(size_t)(r / 64u) * kt_n * 2048u + (size_t)kt * 2048u +
-            (size_t)(r % 64u) * 32u + j] = (uint8_t)q;
-      }
-  return 0;
-}
-
-int hvx_quant_pack_u8_ah(const float *x, uint32_t m, uint32_t mp, uint32_t k,
-                         const float *scale, const int32_t *zp, uint8_t *out,
-                         hvx_worker_pool *p) {
-  return hvx_quant_pack_u8_ah_mapped(x, NULL, m, mp, k, scale, zp, out, p);
-}
-/* A row range, same scalar formula as the mapped stand-in above so the
-   two cannot drift: the kernel's units are 16-row quarters of a block. */
-void hvx_quant_pack_u8_ah_rows(const float *x, const uint32_t *map, uint32_t m0,
-                               uint32_t m1, uint32_t k, const float *scale,
-                               const int32_t *zp, uint8_t *out) {
-  const uint32_t kt_n = k / 32u;
-  for (uint32_t r = m0; r < m1; ++r)
-    for (uint32_t kt = 0; kt < kt_n; ++kt)
-      for (uint32_t j = 0; j < 32; ++j) {
-        const size_t sr = map ? map[r] : r;
-        long q = lrintf(x[sr * k + kt * 32 + j] / scale[r]) + zp[r];
-        if (q < 0)
-          q = 0;
-        if (q > 255)
-          q = 255;
-        out[(size_t)(r / 64u) * kt_n * 2048u + (size_t)kt * 2048u +
-            (size_t)(r % 64u) * 32u + j] = (uint8_t)q;
-      }
-}
-void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
-                                 uint32_t m, const float *as, const int32_t *az,
-                                 const int32_t *cs, const float *ws,
-                                 const float *bias, float *out,
-                                 uint32_t ostride, int accumulate) {
-  for (uint32_t r = 0; r < m; ++r)
-    for (uint32_t c = 0; c < 32; ++c) {
-      float v = ((float)(tile[(size_t)r * stride + c] - az[r] * cs[c])) *
-                  as[r] * ws[c] +
-                bias[c];
-      if (accumulate)
-        out[(size_t)r * ostride + c] += v;
-      else
-        out[(size_t)r * ostride + c] = v;
-    }
-}
 /* The pool runs everything on the caller, which is what its own NULL path
    does for n_units <= 1. Doing it here rather than passing NULL keeps the
    kernel's call sites exercised: the range arithmetic they hand the worker
@@ -516,84 +380,6 @@ void hvx_scale_add_rows_f32(float *dst, const float *src, float scale,
     dst[i] = dst[i] + p;
   }
 }
-/* Scalar stand-in for the fused gate/up dequant + SwiGLU job. Same policy
-   as the batch dequant stand-in below: a loop over the per-tile stand-in,
-   so what is checked is the kernel's pairing arithmetic -- that staged
-   slot j is gate column g0+j and slot n_pairs+j the up column opposite it
-   -- not the arithmetic of SwiGLU, which the device gates cover bit for
-   bit. */
-void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
-  const hvx_dq_swiglu_job *c = (const hvx_dq_swiglu_job *)vjob;
-  (void)n_threads;
-  (void)i;
-  float gt[64 * 32], ut[64 * 32];
-  for (uint32_t j = 0; j < c->n_pairs; ++j) {
-    const uint32_t cg = (c->g0 + j) * 32u, cu = c->inter + cg;
-    hvx_dequant_acc_tile_to_f32(
-      (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride),
-      c->row_stride, c->m_count, c->act_scale, c->act_zp, c->colsum_w + cg,
-      c->w_scale + cg, c->bias + cg, gt, 32u, 0);
-    hvx_dequant_acc_tile_to_f32(
-      (const int32_t *)(c->tiles_base +
-                        (size_t)(c->n_pairs + j) * c->tile_stride),
-      c->row_stride, c->m_count, c->act_scale, c->act_zp, c->colsum_w + cu,
-      c->w_scale + cu, c->bias + cu, ut, 32u, 0);
-    for (uint32_t r = 0; r < c->m_count; ++r)
-      for (uint32_t k = 0; k < 32u; ++k) {
-        const float g = gt[r * 32u + k];
-        c->dst[(size_t)r * c->dst_stride + cg + k] =
-          g / (1.f + expf(-g)) * ut[r * 32u + k];
-      }
-  }
-}
-/* The tail path calls the pooled pair function directly (pool NULL, one
-   pair); it is the job above run synchronously, as on device. */
-void hvx_dequant_swiglu_acc_tiles_to_f32(
-  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_pairs,
-  uint32_t g0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
-  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
-  const float *bias, uint32_t inter, float *dst, uint32_t dst_stride,
-  hvx_worker_pool *pool) {
-  (void)pool;
-  hvx_dq_swiglu_job jb;
-  jb.tiles_base = tiles_base;
-  jb.tile_stride = tile_stride;
-  jb.n_pairs = n_pairs;
-  jb.g0 = g0;
-  jb.row_stride = row_stride;
-  jb.m_count = m_count;
-  jb.act_scale = act_scale;
-  jb.act_zp = act_zp;
-  jb.colsum_w = colsum_w;
-  jb.w_scale = w_scale;
-  jb.bias = bias;
-  jb.inter = inter;
-  jb.dst = dst;
-  jb.dst_stride = dst_stride;
-  hvx_dq_swiglu_worker(1u, 0u, &jb);
-}
-/* Scalar stand-in for the pooled batch dequant job. Deliberately a loop
-   over the per-tile stand-in above, exactly as the real one is a pooled
-   loop over the real per-tile kernel: what this harness can check is the
-   kernel's batching arithmetic -- which tile lands at which staged slot,
-   which column it carries -- and a stand-in that recomputed the dequant
-   itself would check the stand-in. */
-void hvx_dq_tiles_worker(uint32_t n_threads, uint32_t i, void *vjob) {
-  const hvx_dq_tiles_job *c = (const hvx_dq_tiles_job *)vjob;
-  (void)n_threads;
-  (void)i;
-  for (uint32_t j = 0; j < c->n_tiles; ++j) {
-    const uint32_t c0 = (c->nt0 + j) * 32u;
-    const int32_t *tile =
-      (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride);
-    float *out =
-      (c0 < c->split) ? (c->dst_a + c0) : (c->dst_b + (c0 - c->split));
-    hvx_dequant_acc_tile_to_f32(tile, c->row_stride, c->m_count, c->act_scale,
-                                c->act_zp, c->colsum_w + c0, c->w_scale + c0,
-                                c->bias + c0, out, c->dst_stride, 0);
-  }
-}
-
 uint64_t hexkl_probe_us[HEXKL_PROBE_N];
 /* On, so the counting probes (blocks, DMA bytes) run here too -- this
    harness is where a miscounted block or a push that never happens shows up
@@ -676,8 +462,10 @@ static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
       int32_t az;
       quant_row(act + (size_t)row * K, K, aq, &as, &az);
       ref_mm(&wg[e], aq, as, az, gu);
+      /* swiglu_det.h: the spec the HVX SwiGLU matches bit for bit, and
+         what standin/hvx_scalar.c runs, so the two agree to the bit. */
       for (uint32_t j = 0; j < inter; ++j)
-        mid[j] = gu[j] / (1.f + expf(-gu[j])) * gu[inter + j];
+        mid[j] = swiglu_det_one(gu[j], gu[inter + j]);
       float ms;
       int32_t mz;
       quant_row(mid, inter, mq, &ms, &mz);
@@ -1075,6 +863,8 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
 
 int main(void) {
   const uint32_t M = 37, K = 64, inter = 32, N_out = 64, NE = 5;
+  hvx_scalar_hook.prefetch = hook_prefetch;
+  hvx_scalar_hook.gemv = hook_gemv;
   static uint8_t vtcm[8u << 20];
 
   hexkl_moe_layout L;
