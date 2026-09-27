@@ -196,3 +196,19 @@ fi
   "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
 
 "$OUT/m1_ops_host_check"
+
+# Decode attention at m=1 (#81): the REAL HVX source hvx_attn_m1_f32.c on
+# hvx_emu/ with the REAL worker pool on pthreads (stub/qurt.h) at 0, 3 and
+# 7 workers, memcmp'd against nntrainer/tensor/attn_m1_det.h for L = 1,
+# 63, 64, 65, 512, 1024, plus append-chain == bulk, the L = 1 case and the
+# error codes; the spec against a double reference within 2^-13 max|V|.
+# -include malloc.h: the cache is memalign(128), which the Hexagon libc
+# declares in stdlib.h and glibc in malloc.h.
+"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -pthread -include malloc.h \
+  -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/attn_m1_host_check" \
+  "$HERE/attn_m1_host_check.c" "$BACKEND/hvx/hvx_attn_m1_f32.c" \
+  "$BACKEND/hvx/hvx_worker_pool.c" -lm
+
+"$OUT/attn_m1_host_check"
