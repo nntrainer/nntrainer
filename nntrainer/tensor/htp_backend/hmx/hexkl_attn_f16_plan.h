@@ -111,26 +111,34 @@ static inline uint32_t hexkl_attn_round_up(uint32_t v, uint32_t a) {
 }
 
 /**
- * @brief Validates the shape and derives G and g_br into @a t.
+ * @brief Validates the shape and derives G and g_br into @a t, with the
+ *        tile row count padded to @a row_align: 32 for fp16 tiles, 64 for
+ *        the uint8 activation tiles of the quantized kernel.
  *
- * br and bc must already be set by the caller (the Phase 3 chooser or a
- * test); this only checks them and fills the derived fields.
+ * br and bc must already be set by the caller (the chooser or a test);
+ * this only checks them and fills the derived fields.
  */
-static inline int hexkl_attn_f16_tiling_init(const hexkl_attn_f16_shape *s,
-                                             hexkl_attn_f16_tiling *t) {
+static inline int hexkl_attn_f16_tiling_init_aligned(
+  const hexkl_attn_f16_shape *s, hexkl_attn_f16_tiling *t, uint32_t row_align) {
   if (!s || !t || s->n_q == 0 || s->n_head_q == 0 || s->n_head_kv == 0 ||
       s->head_dim == 0 || s->head_dim > 256u ||
       (s->head_dim % HEXKL_ATTN_TILE) != 0 ||
       (s->n_head_q % s->n_head_kv) != 0 ||
-      s->cache_to < s->cache_from + s->n_q) {
+      s->cache_to < s->cache_from + s->n_q || row_align == 0) {
     return HEXKL_ATTN_EBADPARM;
   }
   if (t->br == 0 || t->bc == 0 || (t->bc % HEXKL_ATTN_TILE) != 0) {
     return HEXKL_ATTN_EBADPARM;
   }
   t->g = s->n_head_q / s->n_head_kv;
-  t->g_br = hexkl_attn_round_up(t->g * t->br, HEXKL_ATTN_TILE);
+  t->g_br = hexkl_attn_round_up(t->g * t->br, row_align);
   return HEXKL_ATTN_OK;
+}
+
+/** @brief hexkl_attn_f16_tiling_init_aligned at the fp16 tile height. */
+static inline int hexkl_attn_f16_tiling_init(const hexkl_attn_f16_shape *s,
+                                             hexkl_attn_f16_tiling *t) {
+  return hexkl_attn_f16_tiling_init_aligned(s, t, HEXKL_ATTN_TILE);
 }
 
 /**

@@ -353,33 +353,18 @@ static int phase_qk(attn_ctx *c, uint32_t buf, uint32_t sbuf) {
 
 /**
  * @brief Online softmax for one row pair (tile vector v of row tile i)
- *        across this block's column tiles, in place -> P, plus the row
- *        state and this block's rescale factor for the two rows.
- *
- * Pass 1 applies the softcap, masks, and finds the row max; pass 2
- * exponentiates and sums.
- *
- * Rows that have seen nothing visible yet keep m = -inf. Their exponent
- * base has to be a finite stand-in (0 here) so -inf - m does not become
- * NaN; every lane of such a row is -inf and exponentiates to exactly 0,
- * and its rescale 2^(m - 0) is 0 against an O that is still 0. Once a
- * visible lane appears m becomes finite and the ordinary path takes over.
- * This happens whenever a query block straddles a cache-block boundary --
- * the first rows of the block see nothing in the last cache block.
+ *        across this block's column tiles: the visibility bounds of the
+ *        two rows, then hvx_attn_online_softmax_pair over S[sbuf].
  */
 static void softmax_row_pair(attn_ctx *c, uint32_t i, uint32_t v) {
-  const HVX_Vector neg_inf = Q6_Vh_vsplat_R((int)HVX_ATTN_HF_NEG_INF);
-  const HVX_Vector one_hf = Q6_Vh_vsplat_R((int)HVX_ATTN_HF_ONE);
-  const HVX_Vector zero = Q6_V_vzero();
-  const uint32_t ct = c->L.n_col_tiles;
-  const uint32_t sbuf = c->w_sbuf;
-  const uint32_t k0 = c->w_kb * c->t->bc;
-  const int masked = c->w_masked;
   const uint32_t r0 = 32u * i + 2u * v;
-  const uint32_t r1 = r0 + 1u;
-
-  HVX_Vector lo_pair = zero, hi_pair = zero;
-  if (masked) {
+  hvx_attn_softmax_pair_args a;
+  a.n_col_tiles = c->L.n_col_tiles;
+  a.k0 = c->w_kb * c->t->bc;
+  a.masked = c->w_masked;
+  a.lo_pair = Q6_V_vzero();
+  a.hi_pair = Q6_V_vzero();
+  if (a.masked) {
     // Pad rows get [0, 65535): everything visible, nothing to mask.
     uint32_t lo[2] = {0, 0}, hi[2] = {0xFFFFu, 0xFFFFu};
     for (uint32_t p = 0; p < 2u; ++p) {
@@ -388,63 +373,17 @@ static void softmax_row_pair(attn_ctx *c, uint32_t i, uint32_t v) {
         hexkl_attn_f16_row_range(c->s, q, &lo[p], &hi[p]);
       }
     }
-    lo_pair = hvx_attn_splat_pair_hf(lo[0], lo[1]);
-    hi_pair = hvx_attn_splat_pair_hf(hi[0], hi[1]);
+    a.lo_pair = hvx_attn_splat_pair_hf(lo[0], lo[1]);
+    a.hi_pair = hvx_attn_splat_pair_hf(hi[0], hi[1]);
   }
-
-  // Pass 1: softcap and mask in place, row max.
-  HVX_Vector mx = neg_inf;
-  for (uint32_t col = 0; col < ct; ++col) {
-    HVX_Vector *sp = s_tile(c, sbuf, i, col) + v;
-    HVX_Vector sv = *sp;
-    int dirty = 0;
-    if (c->softcap_on) {
-      sv = hvx_attn_softcap_hf(sv, c->cap_hf, c->inv_cap_hf);
-      dirty = 1;
-    }
-    if (masked) {
-      const HVX_VectorPred vis =
-        hvx_attn_visible(c->col_idx, k0 + 32u * col, lo_pair, hi_pair);
-      sv = Q6_V_vmux_QVV(vis, sv, neg_inf);
-      dirty = 1;
-    }
-    if (dirty) {
-      *sp = sv;
-    }
-    mx = Q6_Vhf_vmax_VhfVhf(mx, sv);
-  }
-  mx = hvx_attn_pairmax_hf(mx);
-
-  const HVX_Vector m_old = hvx_attn_splat_pair_hf(c->m_hf[r0], c->m_hf[r1]);
-  const HVX_Vector m_new = Q6_Vhf_vmax_VhfVhf(m_old, mx);
-  const HVX_VectorPred unseen = Q6_Q_vcmp_eq_VhVh(m_new, neg_inf);
-  const HVX_Vector m_use = Q6_V_vmux_QVV(unseen, zero, m_new);
-  const HVX_Vector a = hvx_attn_exp2_hf(Q6_Vhf_vsub_VhfVhf(m_old, m_use));
-
-  const uint32_t mw = hvx_attn_word0(m_new);
-  c->m_hf[r0] = (uint16_t)(mw & 0xFFFFu);
-  c->m_hf[r1] = (uint16_t)(mw >> 16);
-  const uint32_t aw = hvx_attn_word0(a);
-  c->a_hf[r0] = (uint16_t)(aw & 0xFFFFu);
-  c->a_hf[r1] = (uint16_t)(aw >> 16);
-
-  // Pass 2: P = 2^(S - m'), row sums by parity through the widening
-  // multiply (even lanes -> low half -> row r0).
-  HVX_Vector sum0 = zero, sum1 = zero;
-  for (uint32_t col = 0; col < ct; ++col) {
-    HVX_Vector *sp = s_tile(c, sbuf, i, col) + v;
-    const HVX_Vector p = hvx_attn_exp2_hf(Q6_Vhf_vsub_VhfVhf(*sp, m_use));
-    *sp = p;
-    const HVX_VectorPair w = Q6_Wqf32_vmpy_VhfVhf(p, one_hf);
-    sum0 = Q6_Vqf32_vadd_Vqf32Vqf32(sum0, Q6_V_lo_W(w));
-    sum1 = Q6_Vqf32_vadd_Vqf32Vqf32(sum1, Q6_V_hi_W(w));
-  }
-  const float add0 =
-    hvx_attn_lane0_f32(hvx_attn_sum32_sf(Q6_Vsf_equals_Vqf32(sum0)));
-  const float add1 =
-    hvx_attn_lane0_f32(hvx_attn_sum32_sf(Q6_Vsf_equals_Vqf32(sum1)));
-  c->l_f32[r0] = c->l_f32[r0] * hvx_attn_hf_to_f32(c->a_hf[r0]) + add0;
-  c->l_f32[r1] = c->l_f32[r1] * hvx_attn_hf_to_f32(c->a_hf[r1]) + add1;
+  a.col_idx = c->col_idx;
+  a.softcap_on = c->softcap_on;
+  a.cap_hf = c->cap_hf;
+  a.inv_cap_hf = c->inv_cap_hf;
+  // Column tiles of one row tile are contiguous 2 KiB: 16 vectors apart.
+  hvx_attn_online_softmax_pair(s_tile(c, c->w_sbuf, i, 0) + v,
+                               TB / sizeof(HVX_Vector), &a, c->m_hf + r0,
+                               c->a_hf + r0, c->l_f32 + r0);
 }
 
 static void softmax_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
