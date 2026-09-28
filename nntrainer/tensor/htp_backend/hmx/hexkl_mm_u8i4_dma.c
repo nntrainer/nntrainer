@@ -116,14 +116,44 @@ static uint32_t hexkl_weight_u8i4_free_slot(hexkl_weight_u8i4_table *tbl) {
 }
 
 /**
- * @brief Allocates a slot's four arrays and copies the caller's bytes in.
+ * @brief [doc 52 section 10.30] Fills a borrowed slot's scales and column
+ *        sums from the arena, where the host lays them right after the WH
+ *        bytes: N f32 scales, then N i32 column sums. Bias is zero.
+ *
+ * Through the DMA engine, not memcpy: the arena is host-uncached DDR,
+ * which the scalar core reads at under 1 GB/s (doc 46 section 10) and the
+ * DMA at full bandwidth. Both ends are invalidated around the transfer --
+ * the source because the engine reads through L2 (src_bypass=0) and a
+ * previous swap into this slot may have left its lines there, the
+ * destination because the epilogues read these arrays and L1 may still
+ * hold them. Drained before returning: the slot is usable at once.
+ */
+static void hexkl_weight_u8i4_tail_from_arena(hexkl_weight_u8i4 *h,
+                                              uint32_t wh_bytes) {
+  const uint8_t *tail = h->wh_bytes + wh_bytes;
+  const uint32_t n4 = (uint32_t)sizeof(float) * h->N;
+  hexkl_dcache_inva(tail, 2u * n4);
+  hexkl_dma_ring_push2d(h->w_scale, tail, n4, n4, n4, 1u, 0, 0);
+  hexkl_dma_ring_push2d(h->colsum_w, tail + n4, n4, n4, n4, 1u, 0, 0);
+  hexkl_dma_ring_drain();
+  hexkl_dcache_inva(h->w_scale, 2u * n4);
+  memset(h->bias, 0, n4);
+}
+
+/**
+ * @brief Allocates a slot's arrays and copies the caller's bytes in.
  *
  * @a wh_src is the finished WH bytes -- the VTCM scratch the bake just
  * wrote, or the host's cached copy. Neither path owns them afterwards.
+ * The three N-sized arrays are one 128-aligned block (hexkl_weight_u8i4's
+ * arrays): the DMA that fills them from an arena wants aligned rows, and
+ * one allocation frees as one.
  */
 /* borrow != 0 points the slot at wh_src instead of copying it: the bytes
    live in a host arena the DSP has mapped, and release() must not free
-   them. Everything else about the slot is the same either way. */
+   them. A NULL w_scale with borrow set takes the scales and column sums
+   from the arena too (hexkl_weight_u8i4_tail_from_arena). Everything else
+   about the slot is the same either way. */
 static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
                                        uint32_t slot, uint32_t K, uint32_t N,
                                        uint32_t wh_bytes, const uint8_t *wh_src,
@@ -131,29 +161,35 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
                                        const int32_t *colsum_w,
                                        const float *bias, int borrow) {
   hexkl_weight_u8i4 *h = &tbl->slots[slot];
+  const size_t n4 = sizeof(float) * N; /* N is a multiple of 32: n4 of 128 */
+  uintptr_t a;
   h->wh_bytes = borrow ? (uint8_t *)wh_src : (uint8_t *)malloc(wh_bytes);
-  h->w_scale = (float *)malloc(sizeof(float) * N);
-  h->colsum_w = (int32_t *)malloc(sizeof(int32_t) * N);
-  h->bias = (float *)malloc(sizeof(float) * N);
-  if (!h->wh_bytes || !h->w_scale || !h->colsum_w || !h->bias) {
+  h->arrays = malloc(3u * n4 + 128u);
+  if (!h->wh_bytes || !h->arrays) {
     if (!borrow) {
       free(h->wh_bytes);
     }
-    free(h->w_scale);
-    free(h->colsum_w);
-    free(h->bias);
+    free(h->arrays);
     memset(h, 0, sizeof(*h));
     return AEE_ENOMEMORY;
   }
+  a = ((uintptr_t)h->arrays + 127u) & ~(uintptr_t)127u;
+  h->w_scale = (float *)a;
+  h->colsum_w = (int32_t *)(a + n4);
+  h->bias = (float *)(a + 2u * n4);
   h->borrowed = borrow;
+  h->K = K;
+  h->N = N;
   if (!borrow) {
     memcpy(h->wh_bytes, wh_src, wh_bytes);
   }
-  memcpy(h->w_scale, w_scale, sizeof(float) * N);
-  memcpy(h->colsum_w, colsum_w, sizeof(int32_t) * N);
-  memcpy(h->bias, bias, sizeof(float) * N);
-  h->K = K;
-  h->N = N;
+  if (w_scale) {
+    memcpy(h->w_scale, w_scale, n4);
+    memcpy(h->colsum_w, colsum_w, n4);
+    memcpy(h->bias, bias, n4);
+  } else {
+    hexkl_weight_u8i4_tail_from_arena(h, wh_bytes);
+  }
   h->in_use = 1;
   return AEE_SUCCESS;
 }
@@ -232,7 +268,10 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
   uint32_t slot;
   int rc;
 
-  if (!tbl || !wh || !w_scale || !colsum_w || !bias || !out_handle) {
+  /* Either all three arrays or none: none means they follow wh in the
+     arena (doc 52 section 10.30). */
+  if (!tbl || !wh || !out_handle || (!w_scale != !colsum_w) ||
+      (!w_scale != !bias)) {
     return AEE_EBADPARM;
   }
   if (((uintptr_t)wh % WEIGHT_TILE_BYTES_U8I4) != 0u) {
@@ -252,6 +291,33 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
     return rc;
   }
   *out_handle = slot;
+  return AEE_SUCCESS;
+}
+
+int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
+                                   uint32_t K, uint32_t N, const uint8_t *wh,
+                                   const float *w_scale,
+                                   const int32_t *colsum_w) {
+  hexkl_weight_u8i4 *w;
+  if (!tbl || !wh || (!w_scale != !colsum_w) ||
+      h >= HEXKL_MM_U8I4_MAX_WEIGHTS) {
+    return AEE_EBADPARM;
+  }
+  w = &tbl->slots[h];
+  if (!w->in_use || !w->borrowed || w->K != K || w->N != N ||
+      ((uintptr_t)wh % WEIGHT_TILE_BYTES_U8I4) != 0u) {
+    return AEE_EBADPARM;
+  }
+  w->wh_bytes = (uint8_t *)wh;
+  if (w_scale) {
+    memcpy(w->w_scale, w_scale, sizeof(float) * N);
+    memcpy(w->colsum_w, colsum_w, sizeof(int32_t) * N);
+    memset(w->bias, 0, sizeof(float) * N);
+  } else {
+    hexkl_weight_u8i4_tail_from_arena(w, (K / HEXKL_HMX_INT8_BLOCK_N_INNER) *
+                                           (N / HEXKL_HMX_INT8_BLOCK_N_COL) *
+                                           WEIGHT_TILE_BYTES_U8I4);
+  }
   return AEE_SUCCESS;
 }
 
@@ -302,9 +368,7 @@ int hexkl_weight_u8i4_release(hexkl_weight_u8i4_table *tbl, uint32_t handle) {
   if (!h->borrowed) {
     free(h->wh_bytes);
   }
-  free(h->w_scale);
-  free(h->colsum_w);
-  free(h->bias);
+  free(h->arrays);
   memset(h, 0, sizeof(*h));
   return AEE_SUCCESS;
 }
