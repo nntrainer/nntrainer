@@ -53,22 +53,34 @@ typedef struct {
   uint32_t id; /**< 1..n_workers; 0 is reserved for the calling thread */
 } hvx_worker_ctx;
 
+/** @brief One foreground job's fields. Two slots, indexed by the job's
+ *         generation (fg_id & 1): the caller fills slot (g+1)&1 for job
+ *         g+1 while slot g&1 still holds job g, and a worker that read
+ *         fg_id == g and then slot g&1 re-reads fg_id before acting -- if
+ *         it still reads g, the slot was job g's (slot g&1 is next written
+ *         for job g+2, and only after g+1 was published). [#136] With one
+ *         set of fields, a worker that observed job g but was descheduled
+ *         before reading them resumed with g+1's, served g+1 uncounted
+ *         and again under its own generation: the caller returned while a
+ *         participant was still writing. */
+typedef struct {
+  hvx_worker_pool_func func;
+  void *ctx;
+  uint32_t n_threads; /**< participants: main + workers for run, workers
+                           only for submit */
+  /** Nonzero for a submit's job: the caller is not worker 0, and worker
+      id k acts as index k-1 of n_threads instead of index k. */
+  int async;
+} hvx_worker_job;
+
 struct hvx_worker_pool_s {
   _Atomic uint32_t seqn;    /**< wake counter: bumped by every publish */
   _Atomic uint32_t fg_id;   /**< bumped once per run/submit: the job a
                                  worker has not served yet */
   _Atomic uint32_t barrier; /**< participating workers still running */
   _Atomic int killed;
-  hvx_worker_pool_func func;
-  void *ctx;
-  uint32_t n_threads; /**< participants for the current job: main + workers
-                           for run, workers only for submit */
-  /** Nonzero while a submit's job is in flight. Workers read it under the
-      fg_id acquire, so a job's mode is fixed before it is published: in a
-      submitted job the caller is not worker 0, and worker id k acts as
-      index k-1 of n_threads instead of index k. */
-  int async;
-  int outstanding; /**< caller-side: a submit not yet waited for */
+  hvx_worker_job job[2]; /**< job fg_id lives in job[fg_id & 1] */
+  int outstanding;       /**< caller-side: a submit not yet waited for */
 
   /** The background lane: a ring of caller-owned jobs in submit order.
       Workers scan from head; a job's units are claimable only once every
@@ -142,13 +154,24 @@ static void hvx_worker_pool_thread_entry(void *arg) {
     const uint32_t fg =
       atomic_load_explicit(&pool->fg_id, memory_order_acquire);
     if (fg != prev_fg) {
+      const hvx_worker_job job = pool->job[fg & 1u];
+      /* The fields above are job fg's only if fg_id has not moved since
+         the acquire load: the caller writes a slot before its release
+         increment, and rewrites this one only two jobs on (see
+         hvx_worker_job). A moved fg_id means job fg completed without
+         this worker -- it was not a participant -- so it loops and picks
+         up the newer job under that job's own generation. */
+      atomic_thread_fence(memory_order_acquire);
+      if (atomic_load_explicit(&pool->fg_id, memory_order_relaxed) != fg) {
+        continue;
+      }
       prev_fg = fg;
-      const uint32_t idx = pool->async ? (me->id - 1u) : me->id;
-      if (idx < pool->n_threads) {
-        pool->func(pool->n_threads, idx, pool->ctx);
+      const uint32_t idx = job.async ? (me->id - 1u) : me->id;
+      if (idx < job.n_threads) {
+        job.func(job.n_threads, idx, job.ctx);
         atomic_fetch_sub_explicit(&pool->barrier, 1, memory_order_release);
       }
-      // me->id >= pool->n_threads: this run didn't need this worker.
+      // me->id >= n_threads: this job didn't need this worker.
       continue;
     }
     /* One background unit, then back to the top: a foreground job that
@@ -269,6 +292,26 @@ void hvx_worker_pool_wait(hvx_worker_pool *pool) {
   pool->outstanding = 0;
 }
 
+/** @brief Fills the next job's slot; the caller's release increment of
+ *         fg_id publishes it. The previous job is complete here (both
+ *         callers wait first), so no worker still needs the other slot's
+ *         predecessor -- but a worker may still be READING this slot's
+ *         predecessor (job fg_id - 1, which it observed and lost, see
+ *         hvx_worker_job): the release fence keeps that reader's re-check
+ *         of fg_id from seeing the old generation next to new fields. */
+static void hvx_worker_pool_publish(hvx_worker_pool *pool,
+                                    hvx_worker_pool_func func, void *ctx,
+                                    uint32_t n_threads, int async) {
+  hvx_worker_job *job =
+    &pool->job[(atomic_load_explicit(&pool->fg_id, memory_order_relaxed) + 1u) &
+               1u];
+  atomic_thread_fence(memory_order_release);
+  job->func = func;
+  job->ctx = ctx;
+  job->n_threads = n_threads;
+  job->async = async;
+}
+
 void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
                             void *ctx, uint32_t n_units) {
   if (n_units == 0u) {
@@ -284,10 +327,7 @@ void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
   if (n > pool->n_workers) {
     n = pool->n_workers;
   }
-  pool->func = func;
-  pool->ctx = ctx;
-  pool->n_threads = n;
-  pool->async = 1;
+  hvx_worker_pool_publish(pool, func, ctx, n, 1);
   pool->outstanding = 1;
   atomic_store_explicit(&pool->barrier, n, memory_order_relaxed);
   /* Publish, then wake everyone -- run() explains why everyone. */
@@ -397,10 +437,7 @@ void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
     n = pool->n_workers + 1u;
   }
 
-  pool->func = func;
-  pool->ctx = ctx;
-  pool->n_threads = n;
-  pool->async = 0;
+  hvx_worker_pool_publish(pool, func, ctx, n, 0);
   atomic_store_explicit(&pool->barrier, n - 1u, memory_order_relaxed);
 
   // Publish the job, then wake every worker -- not just the n-1 that will

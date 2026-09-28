@@ -37,6 +37,7 @@
 
 #include "nntr_hvx.h"
 
+#include "attn_m1_det.h"
 #include "htp_rpc_bench.h"
 #include "mha_htp_host_model.h"
 
@@ -747,6 +748,322 @@ TEST_F(HvxAttnScores, FusedForwardPerLayerCost) {
       }
     }
   }
+}
+
+/* ---- [#81] decode attention at m=1 with the DSP-resident KV cache -------- */
+
+class HvxAttnM1 : public HtpSession {};
+
+namespace {
+
+/** @brief LFM2.5's attention shape: 32 q heads, 8 kv heads, head_dim 64. */
+constexpr uint32_t kM1Kv = 8, kM1Gqa = 4, kM1Hd = 64, kM1Nq = kM1Kv * kM1Gqa;
+constexpr float kM1Scale = 0.125f;
+
+int32_t m1_bits_of(float f) {
+  int32_t i;
+  std::memcpy(&i, &f, sizeof(i));
+  return i;
+}
+
+/**
+ * @brief The host check's input spread (test/htp/host/attn_m1_host_check.c):
+ *        kind 1 zeros, 2 subnormal +-1e-39 (HVX keeps subnormals, rule 24),
+ *        3 large (|x| ~ 1e3, the exp clamp), else random in [-4, 4].
+ */
+void m1_fill_row(float *x, size_t n, int kind, std::mt19937 &rng) {
+  std::uniform_real_distribution<float> small(-4.0f, 4.0f);
+  std::uniform_real_distribution<float> large(-1e3f, 1e3f);
+  for (size_t i = 0; i < n; ++i) {
+    switch (kind) {
+    case 1:
+      x[i] = 0.0f;
+      break;
+    case 2:
+      x[i] = (i & 1u) ? -1e-39f : 1e-39f;
+      break;
+    case 3:
+      x[i] = large(rng);
+      break;
+    default:
+      x[i] = small(rng);
+    }
+  }
+}
+
+/** @brief q with heads 0..2 the fixed kinds. */
+void m1_fill_q(std::vector<float> &q, std::mt19937 &rng) {
+  q.assign((size_t)kM1Nq * kM1Hd, 0.0f);
+  for (uint32_t h = 0; h < kM1Nq; ++h) {
+    m1_fill_row(q.data() + (size_t)h * kM1Hd, kM1Hd, (h < 3u) ? (int)h + 1 : 0,
+                rng);
+  }
+}
+
+/** @brief L rows of k and v, [L][kv][head_dim]: positions 0 / 1 the zero and
+ *         subnormal kinds in both, position 2 a large k. */
+void m1_fill_kv(std::vector<float> &k, std::vector<float> &v, uint32_t L,
+                std::mt19937 &rng) {
+  const size_t row = (size_t)kM1Kv * kM1Hd;
+  k.assign(L * row, 0.0f);
+  v.assign(L * row, 0.0f);
+  for (uint32_t p = 0; p < L; ++p) {
+    const int kind = (p == 0u) ? 1 : (p == 1u) ? 2 : 0;
+    m1_fill_row(k.data() + p * row, row, (p == 2u) ? 3 : kind, rng);
+    m1_fill_row(v.data() + p * row, row, kind, rng);
+  }
+}
+
+/** @brief attn_m1_det.h's output and stats for L rows. */
+void m1_spec(const std::vector<float> &q, const std::vector<float> &k,
+             const std::vector<float> &v, uint32_t L, uint32_t max_seq,
+             std::vector<float> *out, std::vector<float> *stats) {
+  std::vector<float> kt((size_t)kM1Kv * kM1Hd * max_seq, 0.0f);
+  std::vector<float> vv((size_t)kM1Kv * max_seq * kM1Hd, 0.0f);
+  std::vector<float> e(L);
+  for (uint32_t p = 0; p < L; ++p) {
+    for (uint32_t h = 0; h < kM1Kv; ++h) {
+      attn_m1_det_append(kt.data() + (size_t)h * kM1Hd * max_seq,
+                         vv.data() + (size_t)h * max_seq * kM1Hd, kM1Hd,
+                         max_seq, p, k.data() + ((size_t)p * kM1Kv + h) * kM1Hd,
+                         v.data() + ((size_t)p * kM1Kv + h) * kM1Hd);
+    }
+  }
+  out->assign((size_t)kM1Nq * kM1Hd, 0.0f);
+  stats->assign(2u * kM1Nq, 0.0f);
+  attn_m1_det_forward(q.data(), kt.data(), vv.data(), kM1Kv, kM1Gqa, kM1Hd,
+                      max_seq, L, kM1Scale, e.data(), out->data(),
+                      stats->data());
+}
+
+/** @brief max_abs_err / max|V| of @a out against softmax(q.Kt*scale).V in
+ *         double (printed, not asserted: rule 25). */
+double m1_double_ref_err(const std::vector<float> &q,
+                         const std::vector<float> &k,
+                         const std::vector<float> &v, uint32_t L,
+                         const std::vector<float> &out) {
+  std::vector<double> s(L);
+  double worst = 0.0;
+  for (uint32_t hq = 0; hq < kM1Nq; ++hq) {
+    const uint32_t h = hq / kM1Gqa;
+    double m = -INFINITY, den = 0.0;
+    for (uint32_t p = 0; p < L; ++p) {
+      double acc = 0.0;
+      for (uint32_t d = 0; d < kM1Hd; ++d) {
+        const size_t i = ((size_t)p * kM1Kv + h) * kM1Hd + d;
+        acc += (double)q[(size_t)hq * kM1Hd + d] * (double)k[i];
+        den = std::max(den, std::fabs((double)v[i]));
+      }
+      s[p] = acc * (double)kM1Scale;
+      m = std::max(m, s[p]);
+    }
+    double l = 0.0;
+    for (uint32_t p = 0; p < L; ++p) {
+      s[p] = std::exp(s[p] - m);
+      l += s[p];
+    }
+    for (uint32_t d = 0; d < kM1Hd; ++d) {
+      double o = 0.0;
+      for (uint32_t p = 0; p < L; ++p) {
+        o += s[p] * (double)v[((size_t)p * kM1Kv + h) * kM1Hd + d];
+      }
+      o /= l;
+      const double err = std::fabs((double)out[(size_t)hq * kM1Hd + d] - o);
+      if (den > 0.0) {
+        worst = std::max(worst, err / den);
+      }
+    }
+  }
+  return worst;
+}
+
+int m1_count_bad(const std::vector<float> &dsp, const std::vector<float> &ref,
+                 const char *what) {
+  int bad = 0;
+  for (size_t i = 0; i < dsp.size(); ++i) {
+    if (m1_bits_of(dsp[i]) != m1_bits_of(ref[i])) {
+      if (bad == 0) {
+        std::cout << "ATTN_M1 " << what << " first mismatch i=" << i
+                  << std::hexfloat << " dsp=" << dsp[i] << " ref=" << ref[i]
+                  << std::defaultfloat << std::endl;
+      }
+      ++bad;
+    }
+  }
+  return bad;
+}
+
+/** @brief kv_append of L-1 rows to @a layer from position 0 (a rewind when
+ *         the layer already holds rows), then forward of the last. */
+int m1_run(remote_handle64 handle, uint32_t layer, const std::vector<float> &q,
+           const std::vector<float> &k, const std::vector<float> &v, uint32_t L,
+           std::vector<float> *out, std::vector<float> *stats) {
+  const size_t row = (size_t)kM1Kv * kM1Hd;
+  int err = nntr_hvx_attn_m1_kv_append(handle, layer, 0u, L - 1u, k.data(),
+                                       (int)((L - 1u) * row), v.data(),
+                                       (int)((L - 1u) * row));
+  if (err != AEE_SUCCESS) {
+    return err;
+  }
+  out->assign((size_t)kM1Nq * kM1Hd, 0.0f);
+  return nntr_hvx_attn_m1_forward(
+    handle, layer, L - 1u, kM1Scale, q.data(), (int)q.size(),
+    k.data() + (size_t)(L - 1u) * row, (int)row,
+    v.data() + (size_t)(L - 1u) * row, (int)row, out->data(), (int)out->size(),
+    stats ? stats->data() : nullptr, stats ? (int)stats->size() : 0);
+}
+
+} // namespace
+
+/**
+ * @brief A bad shape is AEE_EINVALIDFORMAT, a hole or a missing cache
+ *        AEE_EBADSTATE, from the entries' own checks. AEE_EBADPARM
+ *        (0x8000040e) here means the skel predates these four methods
+ *        (rule 3) -- rebuild it before reading the other cases.
+ */
+TEST_F(HvxAttnM1, RejectsBadShapes) {
+  std::vector<float> q((size_t)kM1Nq * kM1Hd, 1.0f),
+    k((size_t)kM1Kv * kM1Hd, 1.0f), v(k.size(), 1.0f), y(q.size());
+  int err = nntr_hvx_attn_m1_forward(
+    handle_, 0u, 0u, kM1Scale, q.data(), (int)q.size(), k.data(), (int)k.size(),
+    v.data(), (int)v.size(), y.data(), (int)y.size(), nullptr, 0);
+  EXPECT_EQ(err, AEE_EBADSTATE + kDspOffset)
+    << "forward without a cache: got " << hex(err);
+  // max_seq 100: not a multiple of 32.
+  err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 100u);
+  EXPECT_EQ(err, AEE_EINVALIDFORMAT + kDspOffset)
+    << "register max_seq 100: got " << hex(err);
+  err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 1024u);
+  ASSERT_EQ(err, AEE_SUCCESS) << "register: " << hex(err);
+  err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 1024u);
+  EXPECT_EQ(err, AEE_EBADSTATE + kDspOffset)
+    << "second register: got " << hex(err);
+  // q one head short.
+  err = nntr_hvx_attn_m1_forward(handle_, 0u, 0u, kM1Scale, q.data(),
+                                 (int)q.size() - kM1Hd, k.data(), (int)k.size(),
+                                 v.data(), (int)v.size(), y.data(),
+                                 (int)y.size(), nullptr, 0);
+  EXPECT_EQ(err, AEE_EINVALIDFORMAT + kDspOffset)
+    << "forward q of 31 heads: got " << hex(err);
+  // A hole: position 1 of an empty layer.
+  err = nntr_hvx_attn_m1_forward(
+    handle_, 0u, 1u, kM1Scale, q.data(), (int)q.size(), k.data(), (int)k.size(),
+    v.data(), (int)v.size(), y.data(), (int)y.size(), nullptr, 0);
+  EXPECT_EQ(err, AEE_EBADSTATE + kDspOffset) << "hole: got " << hex(err);
+  err = nntr_hvx_attn_m1_forward(handle_, 0u, 1024u, kM1Scale, q.data(),
+                                 (int)q.size(), k.data(), (int)k.size(),
+                                 v.data(), (int)v.size(), y.data(),
+                                 (int)y.size(), nullptr, 0);
+  EXPECT_EQ(err, AEE_EINVALIDFORMAT + kDspOffset)
+    << "pos == max_seq: got " << hex(err);
+  err = nntr_hvx_attn_m1_release(handle_);
+  EXPECT_EQ(err, AEE_SUCCESS) << "release: " << hex(err);
+  err = nntr_hvx_attn_m1_release(handle_);
+  EXPECT_EQ(err, AEE_EBADSTATE + kDspOffset)
+    << "second release: got " << hex(err);
+}
+
+/**
+ * @brief The six lengths of the host check against attn_m1_det.h compiled
+ *        into this binary, bit for bit, on a cache registered at the
+ *        LFM2.5 shape and max_seq 2048 (the 48 MiB allocation of plan 81
+ *        section 3.1, proved once here). stats (m, l) are compared too and
+ *        printed on a mismatch, so a bad count names the stage; the
+ *        double-reference error is printed, not asserted (rule 25).
+ */
+TEST_F(HvxAttnM1, MatchesDetSpecBitExact) {
+  const uint32_t max_seq = 2048u, layer = 5u;
+  int err =
+    nntr_hvx_attn_m1_register(handle_, 6u, kM1Kv, kM1Gqa, kM1Hd, max_seq);
+  ASSERT_EQ(err, AEE_SUCCESS)
+    << "register 6 x 8 x 64 x 2048 (48 MiB): " << hex(err)
+    << " (0x8000040e = stale skel)";
+  std::mt19937 rng(0x81000001u);
+  std::vector<float> q, k, v, out, stats(2u * kM1Nq), out_ref, stats_ref;
+  m1_fill_q(q, rng);
+  for (uint32_t L : {1u, 63u, 64u, 65u, 512u, 1024u}) {
+    m1_fill_kv(k, v, L, rng);
+    std::fill(stats.begin(), stats.end(), 0.0f);
+    err = m1_run(handle_, layer, q, k, v, L, &out, &stats);
+    ASSERT_EQ(err, AEE_SUCCESS) << "L=" << L << ": " << hex(err);
+    m1_spec(q, k, v, L, max_seq, &out_ref, &stats_ref);
+    const int bad_stats = m1_count_bad(stats, stats_ref, "stats (m, l)");
+    const int bad = m1_count_bad(out, out_ref, "out");
+    std::cout << "ATTN_M1_FIELD L=" << L << " bad=" << bad
+              << " bad_stats=" << bad_stats << " of " << out.size()
+              << " err/max|V|(double)=" << m1_double_ref_err(q, k, v, L, out)
+              << std::endl;
+    EXPECT_EQ(bad_stats, 0)
+      << "L=" << L << ": the max or the sum differs from the spec";
+    EXPECT_EQ(bad, 0) << "L=" << L << ": out differs from the spec";
+  }
+  EXPECT_EQ(nntr_hvx_attn_m1_release(handle_), AEE_SUCCESS);
+}
+
+/** @brief 65 forward calls from an empty layer vs one kv_append of 64 rows
+ *         plus a forward on another layer: the last outputs byte-equal (the
+ *         host check also compares the cache bytes, which the entries do
+ *         not expose). */
+TEST_F(HvxAttnM1, AppendChainEqualsBulk) {
+  const uint32_t L = 65u;
+  int err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 1024u);
+  ASSERT_EQ(err, AEE_SUCCESS) << "register: " << hex(err);
+  std::mt19937 rng(0x81000002u);
+  std::vector<float> q, k, v, out_a((size_t)kM1Nq * kM1Hd), out_b;
+  m1_fill_q(q, rng);
+  m1_fill_kv(k, v, L, rng);
+  const size_t row = (size_t)kM1Kv * kM1Hd;
+  for (uint32_t p = 0; p < L; ++p) {
+    err = nntr_hvx_attn_m1_forward(handle_, 0u, p, kM1Scale, q.data(),
+                                   (int)q.size(), k.data() + p * row, (int)row,
+                                   v.data() + p * row, (int)row, out_a.data(),
+                                   (int)out_a.size(), nullptr, 0);
+    ASSERT_EQ(err, AEE_SUCCESS) << "chain pos " << p << ": " << hex(err);
+  }
+  err = m1_run(handle_, 1u, q, k, v, L, &out_b, nullptr);
+  ASSERT_EQ(err, AEE_SUCCESS) << "bulk: " << hex(err);
+  const int bad = m1_count_bad(out_a, out_b, "chain vs bulk");
+  std::cout << "ATTN_M1_FIELD append_chain L=" << L << " bad=" << bad
+            << std::endl;
+  EXPECT_EQ(bad, 0) << "the append chain's last output differs from bulk";
+  EXPECT_EQ(nntr_hvx_attn_m1_release(handle_), AEE_SUCCESS);
+}
+
+/** @brief The per-layer forward cost at pos 511 and 1023 (median of 10
+ *         calls, host-timed, transport included): the first read of plan
+ *         81 section 0's 0.5 / 1.0 ms per token estimate for 6 layers.
+ *         Printed, not asserted. */
+TEST_F(HvxAttnM1, PerLayerCost) {
+  int err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 1024u);
+  ASSERT_EQ(err, AEE_SUCCESS) << "register: " << hex(err);
+  std::mt19937 rng(0x81000003u);
+  std::vector<float> q, k, v, out((size_t)kM1Nq * kM1Hd);
+  m1_fill_q(q, rng);
+  const size_t row = (size_t)kM1Kv * kM1Hd;
+  for (uint32_t L : {512u, 1024u}) {
+    m1_fill_kv(k, v, L, rng);
+    err = nntr_hvx_attn_m1_kv_append(handle_, 0u, 0u, L - 1u, k.data(),
+                                     (int)((L - 1u) * row), v.data(),
+                                     (int)((L - 1u) * row));
+    ASSERT_EQ(err, AEE_SUCCESS) << "kv_append: " << hex(err);
+    std::vector<double> us;
+    for (int it = 0; it < 10; ++it) {
+      const auto t0 = std::chrono::steady_clock::now();
+      err = nntr_hvx_attn_m1_forward(
+        handle_, 0u, L - 1u, kM1Scale, q.data(), (int)q.size(),
+        k.data() + (size_t)(L - 1u) * row, (int)row,
+        v.data() + (size_t)(L - 1u) * row, (int)row, out.data(),
+        (int)out.size(), nullptr, 0);
+      const auto t1 = std::chrono::steady_clock::now();
+      ASSERT_EQ(err, AEE_SUCCESS) << "forward: " << hex(err);
+      us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+    }
+    std::sort(us.begin(), us.end());
+    std::cout << "ATTN_M1_FIELD pos=" << (L - 1u) << " us=" << us[us.size() / 2]
+              << " us_min=" << us.front() << " (host-timed, median of 10)"
+              << std::endl;
+  }
+  EXPECT_EQ(nntr_hvx_attn_m1_release(handle_), AEE_SUCCESS);
 }
 
 int main(int argc, char **argv) {

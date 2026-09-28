@@ -3,14 +3,19 @@
    a background job is in flight; every background unit runs exactly once;
    wait_bg(n) returns only when units [0, n) are done; a background job
    can follow a larger and a smaller one (the stale-bg_n path in
-   bg_take_one); and the caller with no workers runs everything inline.
+   bg_take_one); the caller with no workers runs everything inline; and
+   [#136] a job published right after one that left a worker idle is never
+   served by that worker under the earlier job's generation (POOL RACE OK).
    Timing is not measured -- the device profile does that. */
 #include "hvx_worker_pool.h"
 
+#include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static int failures = 0;
 #define CHECK(cond, ...)                                                       \
@@ -168,6 +173,108 @@ static void gate_round(hvx_worker_pool *pool, uint8_t *done) {
   }
 }
 
+/* [#136] The job pickup race at a job boundary. A worker reads fg_id and
+   only then the job's fields; one that observed job J but was descheduled
+   before reading them (it was not a participant of J, so J completed
+   without it) resumes with J+1's fields, serves J+1 uncounted, decrements
+   its barrier, and with prev_fg still J serves J+1 a second time -- the
+   caller sees barrier == 0 while a real participant is still writing (or,
+   the barrier underflowing, never sees 0 again: the watchdog turns that
+   hang into a FAIL). The device shape: a job that leaves a worker idle
+   (run(2): main + one worker) followed at once by one that needs every
+   worker (run(8)), the per-token entry's back-to-back pool jobs. Several
+   pools run the pattern at once so the cores are oversubscribed and a
+   worker does get descheduled inside that window (the planning session's
+   reproducer: six harness processes side by side). Every slice's output
+   must be written, once, before run returns. */
+#define RACE_POOLS 6u
+#ifndef RACE_ROUNDS
+#define RACE_ROUNDS 2000u
+#endif
+#ifndef RACE_WATCHDOG_S
+#define RACE_WATCHDOG_S 120u
+#endif
+
+typedef struct {
+  _Atomic uint32_t ran[8];
+  uint32_t tag[8];
+  uint32_t round;
+} race_ctx;
+
+static void race_slice(uint32_t n_threads, uint32_t i, void *v) {
+  race_ctx *c = (race_ctx *)v;
+  (void)n_threads;
+  c->tag[i] = c->round;
+  atomic_fetch_add(&c->ran[i], 1u);
+}
+
+static void race_watchdog(int sig) {
+  (void)sig;
+  static const char msg[] = "POOL RACE FAIL (hung: a run never returned)\n";
+  if (write(1, msg, sizeof(msg) - 1) < 0) {
+  }
+  _exit(1);
+}
+
+static void *race_driver(void *v) {
+  uint32_t *bad = (uint32_t *)v;
+  hvx_worker_pool *pool = hvx_worker_pool_create(3);
+  if (!pool) {
+    *bad = 1u;
+    return NULL;
+  }
+  race_ctx a, b; /* outside the loop: a late writer lands in a live frame */
+  for (uint32_t r = 1; r <= RACE_ROUNDS && *bad < 8u; ++r) {
+    for (int s = 0; s < 8; ++s) {
+      atomic_init(&a.ran[s], 0);
+      atomic_init(&b.ran[s], 0);
+      a.tag[s] = b.tag[s] = 0;
+    }
+    a.round = b.round = r;
+    hvx_worker_pool_run(pool, race_slice, &a, 2u); /* workers 2, 3 idle */
+    hvx_worker_pool_run(pool, race_slice, &b, 8u); /* main + 3 workers */
+    for (uint32_t i = 0; i < 4u; ++i) {
+      const uint32_t n = atomic_load(&b.ran[i]);
+      if (b.tag[i] != r || n != 1u) {
+        (*bad)++;
+        printf("FAIL pool race: round %u slice %u ran %u times, tag %u "
+               "(run returned before it was written)\n",
+               r, i, n, b.tag[i]);
+      }
+    }
+    for (uint32_t i = 0; i < 2u; ++i) {
+      if (a.tag[i] != r || atomic_load(&a.ran[i]) != 1u) {
+        (*bad)++;
+        printf("FAIL pool race: round %u first job slice %u\n", r, i);
+      }
+    }
+  }
+  hvx_worker_pool_destroy(pool);
+  return NULL;
+}
+
+static void race_check(void) {
+  pthread_t tid[RACE_POOLS];
+  uint32_t bad[RACE_POOLS] = {0};
+  signal(SIGALRM, race_watchdog);
+  alarm(RACE_WATCHDOG_S);
+  for (uint32_t p = 0; p < RACE_POOLS; ++p)
+    pthread_create(&tid[p], NULL, race_driver, &bad[p]);
+  uint32_t total = 0;
+  for (uint32_t p = 0; p < RACE_POOLS; ++p) {
+    pthread_join(tid[p], NULL);
+    total += bad[p];
+  }
+  alarm(0);
+  if (total) {
+    failures += (int)total;
+    printf("POOL RACE FAIL (%u bad slices, %u pools x %u rounds)\n", total,
+           RACE_POOLS, RACE_ROUNDS);
+  } else {
+    printf("POOL RACE OK (%u pools x %u rounds)\n", RACE_POOLS, RACE_ROUNDS);
+  }
+}
+
 int main(void) {
   uint8_t *done = (uint8_t *)malloc(MAX_UNITS);
 
@@ -181,12 +288,13 @@ int main(void) {
   hvx_worker_pool *pool = hvx_worker_pool_create(3);
   CHECK(pool != NULL, "create");
   for (int iter = 0; iter < 30; ++iter) {
-    bg_round(pool, 257u, done, 1);  /* big, with foreground traffic */
-    bg_round(pool, 5u, done, 0);    /* smaller after bigger: stale bg_n */
-    bg_round(pool, 300u, done, 0);  /* bigger after smaller */
+    bg_round(pool, 257u, done, 1); /* big, with foreground traffic */
+    bg_round(pool, 5u, done, 0);   /* smaller after bigger: stale bg_n */
+    bg_round(pool, 300u, done, 0); /* bigger after smaller */
     bg_round(pool, 1u, done, 1);
     gate_round(pool, done);
   }
+  race_check();
   hvx_worker_pool_wait_bg(NULL, NULL, 10u);
   hvx_worker_pool_destroy(pool);
   free(done);
