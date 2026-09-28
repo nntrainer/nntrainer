@@ -48,6 +48,8 @@ inline int htpDecodeOp(unsigned, unsigned, const float *, unsigned, float *,
 #define HTP_OP_CONV1D_GATE 2
 #define HTP_OP_QK_NORM 3
 #define HTP_OP_ATTN_M1 5
+#define HTP_OP_ADD 6
+#define HTP_OP_ROUTER_TOPK 7
 #endif
 
 /** @brief RMSNorm of one row of W: y = norm(x) * gamma. */
@@ -83,6 +85,26 @@ inline int htpDecodeAttn(unsigned pos, const float *qkv, unsigned len,
                          unsigned rope_len) {
   return htpDecodeOp(HTP_OP_ATTN_M1, pos, qkv, len, out, out_len, rope,
                      rope_len, nullptr, 0, 0.0f);
+}
+
+/** @brief [#132] The residual add of one row: out = residual + addend
+ *  (W floats). The DSP holds the residual (its slot 0), so only the
+ *  addend travels; on 1 @a out is written only when the ADD ends a
+ *  stretch, which the validator rules out -- the next norm hook writes. */
+inline int htpDecodeAdd(unsigned pos, const float *addend, float *out,
+                        unsigned W) {
+  return htpDecodeOp(HTP_OP_ADD, pos, addend, W, out, W, nullptr, 0, nullptr, 0,
+                     0.0f);
+}
+
+/** @brief [#132] The MoE router of one row: x (K floats, the ffn-normed
+ *  row), gate_w the [K][E] gate weight, bias the E expert biases. On 1 the
+ *  DSP routes and runs the experts in the same stretch; the layer skips
+ *  its router, top-k and experts and writes nothing. */
+inline int htpDecodeRouter(unsigned pos, const float *x, unsigned K,
+                           const float *gate_w, unsigned E, const float *bias) {
+  return htpDecodeOp(HTP_OP_ROUTER_TOPK, pos, x, K, nullptr, 0, gate_w, K * E,
+                     bias, E, 0.0f);
 }
 
 /** @brief Rows [0, n_rows) of the layer whose attention hook returned 2,
