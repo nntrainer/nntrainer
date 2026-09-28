@@ -144,7 +144,8 @@ int hexkl_kv_q_register(hexkl_kv_q_table *tbl, hexkl_kv_q_kind kind,
   kv->v4 = (int8_t *)calloc(values, 1u);
   kv->s_k = (float *)calloc(rows, sizeof(float));
   kv->colsum_k = (int32_t *)calloc(rows, sizeof(int32_t));
-  kv->s_v = (float *)calloc(rows * kv->n_dot_tiles, sizeof(float));
+  kv->s_v =
+    (float *)calloc(rows * kv->n_dot_tiles + HEXKL_KV_Q_SV_PAD, sizeof(float));
   kv->kt = (uint8_t *)calloc(n_tiles, kv->tile_bytes);
   kv->v = (uint8_t *)calloc(n_tiles, kv->tile_bytes);
   kv->stage_kt = (int8_t *)calloc((size_t)head_dim * 32u, 1u);
@@ -157,7 +158,7 @@ int hexkl_kv_q_register(hexkl_kv_q_table *tbl, hexkl_kv_q_kind kind,
   for (size_t i = 0; i < rows; ++i) {
     kv->s_k[i] = 1.0f;
   }
-  for (size_t i = 0; i < rows * kv->n_dot_tiles; ++i) {
+  for (size_t i = 0; i < rows * kv->n_dot_tiles + HEXKL_KV_Q_SV_PAD; ++i) {
     kv->s_v[i] = 1.0f;
   }
   kv->in_use = 1;

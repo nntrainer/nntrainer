@@ -35,6 +35,8 @@ enum {
   QSTAT_OUPD,
   QSTAT_STORE,
   QSTAT_N_BLOCKS,
+  QSTAT_US_TOTAL,
+  QSTAT_KCYCLES, /**< processor kilocycles of the call */
   QSTAT_COUNT
 };
 
@@ -286,5 +288,7 @@ int nntr_hvx_attn_q_prefill(remote_handle64 handle, uint32 kv_handle,
   stats_us[QSTAT_OUPD] = (uint32)st.us_oupd;
   stats_us[QSTAT_STORE] = (uint32)st.us_store;
   stats_us[QSTAT_N_BLOCKS] = st.n_blocks;
+  stats_us[QSTAT_US_TOTAL] = (uint32)st.us_total;
+  stats_us[QSTAT_KCYCLES] = (uint32)(st.pcycles / 1000u);
   return AEE_SUCCESS;
 }

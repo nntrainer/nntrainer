@@ -52,7 +52,7 @@ regions(const hexkl_attn_q_layout &L, const hexkl_attn_f16_shape &s,
   const uint32_t rt = L.n_row_tiles, ct = L.n_col_tiles, dt = L.n_dot_tiles;
   const uint32_t wb = ct * dt * L.tile_bytes;
   std::vector<std::pair<uint32_t, uint32_t>> r;
-  r.push_back({L.q_ah, L.q_ah + rt * dt * TB});
+  r.push_back({L.q_ah, L.q_ah + L.n_qb_chunk * rt * dt * TB});
   for (int i = 0; i < 2; ++i)
     r.push_back({L.kt_wh[i], L.kt_wh[i] + wb});
   for (int i = 0; i < 2; ++i)
@@ -62,10 +62,7 @@ regions(const hexkl_attn_q_layout &L, const hexkl_attn_f16_shape &s,
     r.push_back({L.s_hf[i], L.s_hf[i] + 2 * rt * ct * TB});
   r.push_back({L.p_ah, L.p_ah + dt * rt * ct * TB});
   r.push_back({L.o_f32, L.o_f32 + t.g_br * s.head_dim * 4});
-  r.push_back({L.qx_f32, L.qx_f32 + t.g_br * s.head_dim * 4});
-  for (int i = 0; i < 2; ++i)
-    r.push_back({L.sv_blk[i], L.sv_blk[i] + dt * t.bc * 4});
-  r.push_back({L.meta, L.meta + hexkl_attn_q_meta_bytes(t.g_br, dt)});
+  r.push_back({L.qx_f32, L.qx_f32 + L.n_qb_chunk * t.g_br * s.head_dim * 4});
   return r;
 }
 
@@ -94,31 +91,35 @@ TEST(HexklAttnQPlan, TilingPadsRowsTo64) {
 TEST(HexklAttnQPlan, LayoutRegionsAreAlignedDisjointAndFit) {
   const uint32_t arena = 8u << 20;
   for (uint32_t tile_bytes : {1024u, 512u}) {
-    for (auto [nq, to, hq, hkv, hd, br, bc] :
-         {std::make_tuple(128u, 1024u, 16u, 4u, 128u, 16u, 256u),
-          std::make_tuple(100u, 100u, 8u, 8u, 64u, 64u, 32u),
-          std::make_tuple(7u, 4096u, 32u, 8u, 256u, 20u, 64u),
-          std::make_tuple(1u, 64u, 1u, 1u, 32u, 1u, 32u)}) {
-      auto s = shape(nq, to - nq, to, hq, hkv, hd);
-      auto t = tiling(br, bc);
-      ASSERT_EQ(hexkl_attn_q_tiling_init(&s, &t), HEXKL_ATTN_OK);
-      hexkl_attn_q_layout L{};
-      ASSERT_EQ(hexkl_attn_q_plan(&s, &t, arena, tile_bytes, &L), HEXKL_ATTN_OK)
-        << "hd " << hd << " tile_bytes " << tile_bytes;
-      EXPECT_EQ(L.tile_bytes, tile_bytes);
-      EXPECT_EQ(L.n_row_tiles, t.g_br / 64);
-      auto r = regions(L, s, t);
-      for (const auto &[b, e] : r) {
-        EXPECT_EQ(b % TB, 0u) << "region at " << b;
-        EXPECT_LE(e, L.total);
+    for (uint32_t chunk : {1u, 8u}) {
+      for (auto [nq, to, hq, hkv, hd, br, bc] :
+           {std::make_tuple(128u, 1024u, 16u, 4u, 128u, 16u, 256u),
+            std::make_tuple(100u, 100u, 8u, 8u, 64u, 64u, 32u),
+            std::make_tuple(7u, 4096u, 32u, 8u, 256u, 20u, 64u),
+            std::make_tuple(1u, 64u, 1u, 1u, 32u, 1u, 32u)}) {
+        auto s = shape(nq, to - nq, to, hq, hkv, hd);
+        auto t = tiling(br, bc);
+        ASSERT_EQ(hexkl_attn_q_tiling_init(&s, &t), HEXKL_ATTN_OK);
+        hexkl_attn_q_layout L{};
+        ASSERT_EQ(hexkl_attn_q_plan(&s, &t, arena, tile_bytes, chunk, &L),
+                  HEXKL_ATTN_OK)
+          << "hd " << hd << " tile_bytes " << tile_bytes;
+        EXPECT_EQ(L.tile_bytes, tile_bytes);
+        EXPECT_EQ(L.n_row_tiles, t.g_br / 64);
+        auto r = regions(L, s, t);
+        for (const auto &[b, e] : r) {
+          EXPECT_EQ(b % TB, 0u) << "region at " << b;
+          EXPECT_LE(e, L.total);
+        }
+        std::sort(r.begin(), r.end());
+        for (size_t i = 1; i < r.size(); ++i) {
+          EXPECT_LE(r[i - 1].second, r[i].first)
+            << "overlap between regions ending " << r[i - 1].second
+            << " and starting " << r[i].first;
+        }
+        EXPECT_EQ(L.n_qb_chunk, chunk);
+        EXPECT_LE(L.total, arena);
       }
-      std::sort(r.begin(), r.end());
-      for (size_t i = 1; i < r.size(); ++i) {
-        EXPECT_LE(r[i - 1].second, r[i].first)
-          << "overlap between regions ending " << r[i - 1].second
-          << " and starting " << r[i].first;
-      }
-      EXPECT_LE(L.total, arena);
     }
   }
 }
@@ -128,11 +129,15 @@ TEST(HexklAttnQPlan, LayoutRejectsBadInputAndReportsNoFit) {
   auto t = tiling(16, 256);
   ASSERT_EQ(hexkl_attn_q_tiling_init(&s, &t), HEXKL_ATTN_OK);
   hexkl_attn_q_layout L{};
-  EXPECT_EQ(hexkl_attn_q_plan(&s, &t, 8u << 20, 768u, &L), HEXKL_ATTN_EBADPARM);
-  EXPECT_EQ(hexkl_attn_q_plan(&s, &t, 64u << 10, 1024u, &L), HEXKL_ATTN_ENOMEM);
+  EXPECT_EQ(hexkl_attn_q_plan(&s, &t, 8u << 20, 768u, 1, &L),
+            HEXKL_ATTN_EBADPARM);
+  EXPECT_EQ(hexkl_attn_q_plan(&s, &t, 8u << 20, 1024u, 0, &L),
+            HEXKL_ATTN_EBADPARM);
+  EXPECT_EQ(hexkl_attn_q_plan(&s, &t, 64u << 10, 1024u, 1, &L),
+            HEXKL_ATTN_ENOMEM);
   // An fp16 tiling (g_br 96) is not a valid uint8 tiling.
   auto t32 = tiling(24, 256);
   ASSERT_EQ(hexkl_attn_f16_tiling_init(&s, &t32), HEXKL_ATTN_OK);
-  EXPECT_EQ(hexkl_attn_q_plan(&s, &t32, 8u << 20, 1024u, &L),
+  EXPECT_EQ(hexkl_attn_q_plan(&s, &t32, 8u << 20, 1024u, 1, &L),
             HEXKL_ATTN_EBADPARM);
 }

@@ -45,6 +45,9 @@ typedef struct {
   uint64_t us_pv;      /**< HMX P'.V incl. accumulator reads */
   uint64_t us_oupd;    /**< f32 partial output rescale + accumulate */
   uint64_t us_store;   /**< O/l -> f32 rows in DDR */
+  uint64_t us_total;   /**< whole call, qtimer */
+  uint64_t pcycles;    /**< whole call, processor cycles: the ratio to
+                            us_total is the clock the DSP actually ran at */
   uint32_t n_blocks;   /**< (kv_head, q_block, kv_block) iterations run */
 } hexkl_attn_q_stats;
 

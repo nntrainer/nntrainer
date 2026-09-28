@@ -235,6 +235,24 @@ static inline HVX_Vector hvx_attn_recip_f32(HVX_Vector v) {
 }
 
 /**
+ * @brief 1/v for 32 positive normal f32 lanes of any magnitude.
+ *
+ * The magic-constant seed (0x7EF311C7 - bits) is within ~12% for every
+ * normal positive float; three Newton steps bring it to f32 precision. No
+ * zero / inf handling: callers pass scales they know are positive.
+ */
+static inline HVX_Vector hvx_attn_recip_pos_f32(HVX_Vector v) {
+  const HVX_Vector two = Q6_V_vsplat_R(0x40000000); // 2.0f
+  HVX_Vector i = Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(0x7EF311C7), v);
+  for (int n = 0; n < 3; ++n) {
+    const HVX_Vector iv = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(i, v));
+    const HVX_Vector corr = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(two, iv));
+    i = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(i, corr));
+  }
+  return i;
+}
+
+/**
  * @brief Logit softcap on 64 fp16 lanes: cap * tanh(s / cap).
  *
  * MHACoreLayer's attn_logit_softcapping, applied to scores that already

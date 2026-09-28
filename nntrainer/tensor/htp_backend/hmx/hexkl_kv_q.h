@@ -47,6 +47,8 @@ extern "C" {
 
 /** @brief Resident caches per session (one per attention layer). */
 #define HEXKL_KV_Q_MAX 64u
+/** @brief Extra s_v rows after the last head (the largest block size). */
+#define HEXKL_KV_Q_SV_PAD 256u
 
 /** @brief Weight width of the cache: A8W8 or A8W4 in the FC layers' terms. */
 typedef enum {
@@ -68,7 +70,12 @@ typedef struct {
   int8_t *v4;           /**< [n_head_kv][max_rows/4][head_dim][4] */
   float *s_k;           /**< [n_head_kv][max_rows] */
   int32_t *colsum_k;    /**< [n_head_kv][max_rows] */
-  float *s_v;           /**< [n_head_kv][max_rows][head_dim/32] */
+  float *s_v;           /**< [n_head_kv][head_dim/32][max_rows + pad]: a
+                             block's scales of one group are contiguous,
+                             so the attention kernel reads them from DDR
+                             as vectors; HEXKL_KV_Q_SV_PAD rows of 1.0 past
+                             the end keep a block that overruns the last
+                             head in bounds */
   uint8_t *kt;          /**< K^T WH tiles, [n_head_kv][n_col][n_dot] */
   uint8_t *v;           /**< V WH tiles, same order */
   int8_t *stage_kt;     /**< [head_dim][32] row-major bake source */
@@ -139,10 +146,11 @@ static inline size_t hexkl_kv_q_sk_index(const hexkl_kv_q *kv, uint32_t n,
   return (size_t)n * kv->max_rows + row;
 }
 
-/** @brief Index into s_v for 32-dim group g. */
+/** @brief Index into s_v for 32-dim group g: rows of one (head, group)
+ *         are contiguous. */
 static inline size_t hexkl_kv_q_sv_index(const hexkl_kv_q *kv, uint32_t n,
                                          uint32_t row, uint32_t g) {
-  return ((size_t)n * kv->max_rows + row) * kv->n_dot_tiles + g;
+  return ((size_t)n * kv->n_dot_tiles + g) * kv->max_rows + row;
 }
 
 /** @brief Byte offset of WH tile (n, column tile c, dot tile d) in kt or v. */

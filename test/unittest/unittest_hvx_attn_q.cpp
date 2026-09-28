@@ -190,10 +190,10 @@ protected:
   }
 };
 
-constexpr int kQStatCount = 10;
+constexpr int kQStatCount = 12;
 const char *const kQStatNames[kQStatCount] = {
-  "qprep",  "dma", "qk",   "dequant", "softmax",
-  "pquant", "pv",  "oupd", "store",   "n_blocks"};
+  "qprep", "dma",  "qk",    "dequant",  "softmax",  "pquant",
+  "pv",    "oupd", "store", "n_blocks", "us_total", "kcycles"};
 
 /**
  * @brief Attention over a quantized cache against the f32 reference over
@@ -290,6 +290,13 @@ protected:
                   << s.cache_to << "x" << s.n_head_q << "/" << s.n_head_kv
                   << "x" << s.head_dim << " field=" << kQStatNames[i]
                   << " value=" << stats[i] << "\n";
+      }
+      if (stats[10] > 0) {
+        std::cout << "ATTN_Q_FIELD kind=" << kind << " shape=" << s.n_q << "x"
+                  << s.cache_to << "x" << s.n_head_q << "/" << s.n_head_kv
+                  << "x" << s.head_dim << " field=clock_mhz value="
+                  << static_cast<double>(stats[11]) * 1000.0 / stats[10]
+                  << "\n";
       }
     }
   }
