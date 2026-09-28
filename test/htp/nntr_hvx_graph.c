@@ -4,8 +4,9 @@
  *
  * @file   nntr_hvx_graph.c
  * @date   23 Sep 2026
- * @brief  The per-token entry: graph_init / graph_release / forward /
- *         forward_debug over the session's hexkl_graph (#85)
+ * @brief  The per-token entry: graph_init / graph_release / graph_set_param
+ *         / forward / forward_debug over the session's hexkl_graph (#85,
+ *         #130)
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
@@ -40,12 +41,39 @@ int nntr_hvx_graph_init(remote_handle64 handle, const uint32 *desc, int descLen,
     return rc;
   }
   *n_ops = s->graph->n_ops;
-  FARF(HIGH,
-       "[graph] init n_ops=%u layers=%u hidden=%u max_seq=%u resident=0x%x",
-       (unsigned)s->graph->n_ops, (unsigned)s->graph->n_layers,
-       (unsigned)s->graph->hidden, (unsigned)s->graph->max_seq,
-       (unsigned)hexkl_graph_resident_kinds());
+  {
+    char names[128];
+    FARF(
+      HIGH, "[graph] init n_ops=%u layers=%u hidden=%u max_seq=%u resident=%s",
+      (unsigned)s->graph->n_ops, (unsigned)s->graph->n_layers,
+      (unsigned)s->graph->hidden, (unsigned)s->graph->max_seq,
+      htp_graph_kinds_str(hexkl_graph_resident_kinds(), names, sizeof(names)));
+    (void)names;
+  }
   return AEE_SUCCESS;
+}
+
+int nntr_hvx_graph_set_param(remote_handle64 handle, uint32 op, uint32 which,
+                             const float *data, int dataLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  int rc;
+  if (!s || !data) {
+    return AEE_EBADPARM;
+  }
+  if (s->graph == NULL) {
+    FARF(ERROR, "graph_set_param: no graph; call graph_init first");
+    return AEE_EBADSTATE;
+  }
+  if (dataLen < 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  rc = hexkl_graph_set_param(s->graph, op, which, data, (uint32_t)dataLen);
+  if (rc != AEE_SUCCESS) {
+    FARF(ERROR, "graph_set_param: op=%u which=%u n=%d: %s (0x%08x)",
+         (unsigned)op, (unsigned)which, dataLen, htp_graph_err_name(rc),
+         (unsigned)rc);
+  }
+  return rc;
 }
 
 int nntr_hvx_graph_release(remote_handle64 handle) {
@@ -87,24 +115,30 @@ static void graph_env_of(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->pool = s->quant_pool;
   env->scratch = (hexkl_moe_scratch *)&s->moe_scratch;
   env->moe_flags = s->moe_flags;
+  env->attn_m1 = s->attn_m1; /* [#130] borrowed; NULL until registered */
 }
 
 /** @brief One FARF line per call (HIGH: silent unless the mask enables
- *  it), the per-op pcycles summed and the MoE op's own. */
+ *  it): the per-op pcycles summed, the MoE op's own, and the attention
+ *  op's own (the other small ops are the remainder). */
 static void graph_farf(const hexkl_graph *g, uint32_t start, uint32_t resume) {
-  uint64_t total = 0, moe = 0;
+  uint64_t total = 0, moe = 0, attn = 0;
   uint32_t i;
   for (i = start; i < resume; ++i) {
     total += g->op_pcycles[i];
     if (g->ops[i].kind == HTP_OP_MOE) {
       moe += g->op_pcycles[i];
+    } else if (g->ops[i].kind == HTP_OP_ATTN_M1) {
+      attn += g->op_pcycles[i];
     }
   }
-  FARF(HIGH, "[graph] start=%u resume=%u ops=%u pcyc=%llu moe=%llu",
+  FARF(HIGH, "[graph] start=%u resume=%u ops=%u pcyc=%llu moe=%llu attn=%llu",
        (unsigned)start, (unsigned)resume, (unsigned)(resume - start),
-       (unsigned long long)total, (unsigned long long)moe);
+       (unsigned long long)total, (unsigned long long)moe,
+       (unsigned long long)attn);
   (void)total;
   (void)moe;
+  (void)attn;
 }
 
 int nntr_hvx_forward(remote_handle64 handle, uint32 start_op, uint32 pos,
