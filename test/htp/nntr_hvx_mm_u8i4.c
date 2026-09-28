@@ -20,7 +20,6 @@
 
 #include "hexkl_conv_block.h"
 #include "hexkl_dma_ring.h"
-#include "hexkl_dma_trace.h"
 #include "hexkl_micro.h"
 #include "hexkl_mm_u8i4.h"
 #include "hexkl_mm_u8i4_dma.h"
@@ -141,13 +140,6 @@ int nntr_hvx_weight_release_u8i4(remote_handle64 handle, uint32 w_handle) {
   if (!s) {
     return AEE_EBADPARM;
   }
-  /* [#85] The arena_detach rule, one level up: a handle the live graph's
-     MoE ops name stays registered until graph_release. */
-  if (hexkl_graph_uses_handle(s->graph, w_handle)) {
-    FARF(ERROR, "weight_release_u8i4: handle %u is bound in the graph",
-         (unsigned)w_handle);
-    return AEE_EBADSTATE;
-  }
   return hexkl_weight_u8i4_release(&s->weights_u8i4, w_handle);
 }
 
@@ -202,6 +194,7 @@ enum {
 #define NNTR_HAVE_HAP_MMAP 1
 #endif
 #endif
+
 
 int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
                          uint32 dma_bytes, uint32 *res, int resLen) {
@@ -282,9 +275,8 @@ int nntr_hvx_arena_probe(remote_handle64 handle, int32 fd, uint32 bytes,
       res[7] |= (uint32)((p == NULL ? 1u : 2u) << (ti * 2u));
     }
     if (va == NULL) {
-      FARF(ERROR,
-           "arena_probe: every HAP_mmap prot/flags pair failed "
-           "(fd=%d bytes=%u mask=0x%x)",
+      FARF(ERROR, "arena_probe: every HAP_mmap prot/flags pair failed "
+                  "(fd=%d bytes=%u mask=0x%x)",
            (int)fd, (unsigned)bytes, (unsigned)res[7]);
       return AEE_ENOMEMORY;
     }
@@ -454,6 +446,79 @@ int nntr_hvx_weight_register_u8i4_arena(remote_handle64 handle, uint32 K,
   return hexkl_weight_u8i4_register_arena(&s->weights_u8i4, s->vtcm_size, K, N,
                                           a->va + wh_off, w_scale, colsum_w,
                                           bias, w_handle);
+}
+
+/** @brief The IDL's "nothing to release" for weight_swap_u8i4_arena. */
+#define NNTR_HVX_NO_HANDLE 0xFFFFFFFFu
+
+/** @brief True for a live handle whose bytes are borrowed from an arena --
+ *  the only kind weight_swap_u8i4_arena may release, since the host's
+ *  expert pool never owns a heap-baked weight. */
+static int swap_releasable(const hexkl_weight_u8i4_table *tbl, uint32 h) {
+  return h < HEXKL_MM_U8I4_MAX_WEIGHTS && tbl->slots[h].in_use &&
+         tbl->slots[h].borrowed;
+}
+
+int nntr_hvx_weight_swap_u8i4_arena(
+  remote_handle64 handle, uint32 old_gu, uint32 old_dn, uint32 K, uint32 inter,
+  uint32 N_out, uint32 arena, uint32 off_gu, uint32 off_dn,
+  const float *gu_scale, int gu_scaleLen, const int32 *gu_colsum,
+  int gu_colsumLen, const float *dn_scale, int dn_scaleLen,
+  const int32 *dn_colsum, int dn_colsumLen, uint32 *h_gu, uint32 *h_dn) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  const uint32 n_gu = 2u * inter;
+  const int release_old =
+    !(old_gu == NNTR_HVX_NO_HANDLE && old_dn == NNTR_HVX_NO_HANDLE);
+  float *bias;
+  uint32 g = NNTR_HVX_NO_HANDLE, d = NNTR_HVX_NO_HANDLE;
+  int rc;
+  if (!s || !h_gu || !h_dn) {
+    return AEE_EBADPARM;
+  }
+  if ((uint32_t)gu_scaleLen != n_gu || (uint32_t)gu_colsumLen != n_gu ||
+      (uint32_t)dn_scaleLen != N_out || (uint32_t)dn_colsumLen != N_out) {
+    FARF(ERROR, "weight_swap_u8i4_arena: bad lengths (K=%u inter=%u N=%u)",
+         (unsigned)K, (unsigned)inter, (unsigned)N_out);
+    return AEE_EBADPARM;
+  }
+  /* Checked before anything is registered, so a bad pair costs nothing:
+     both or neither, both arena-borrowed, and not the same handle twice. */
+  if (release_old &&
+      (old_gu == old_dn || !swap_releasable(&s->weights_u8i4, old_gu) ||
+       !swap_releasable(&s->weights_u8i4, old_dn))) {
+    FARF(ERROR, "weight_swap_u8i4_arena: old pair %u/%u is not releasable",
+         (unsigned)old_gu, (unsigned)old_dn);
+    return AEE_EBADPARM;
+  }
+  bias = (float *)calloc(n_gu > N_out ? n_gu : N_out, sizeof(float));
+  if (!bias) {
+    return AEE_ENOMEMORY;
+  }
+  /* The same extent checks and registry call as weight_register_u8i4_arena,
+     through its own entry point rather than a copy of it. */
+  rc = nntr_hvx_weight_register_u8i4_arena(handle, K, n_gu, arena, off_gu,
+                                           gu_scale, (int)n_gu, gu_colsum,
+                                           (int)n_gu, bias, (int)n_gu, &g);
+  if (rc == AEE_SUCCESS) {
+    rc = nntr_hvx_weight_register_u8i4_arena(
+      handle, inter, N_out, arena, off_dn, dn_scale, (int)N_out, dn_colsum,
+      (int)N_out, bias, (int)N_out, &d);
+    if (rc != AEE_SUCCESS) {
+      hexkl_weight_u8i4_release(&s->weights_u8i4, g);
+    }
+  }
+  free(bias);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  /* Last, and validated above, so these cannot fail. */
+  if (release_old) {
+    hexkl_weight_u8i4_release(&s->weights_u8i4, old_gu);
+    hexkl_weight_u8i4_release(&s->weights_u8i4, old_dn);
+  }
+  *h_gu = g;
+  *h_dn = d;
+  return AEE_SUCCESS;
 }
 
 int nntr_hvx_mem_probe_dsp_heap(remote_handle64 handle, uint32 chunk_mb,
@@ -887,26 +952,12 @@ enum {
   MOE_T_MM,        /**< the HMX issue loop, timed rather than left a residual */
   MOE_T_DMA_KB,    /**< NOT us: kilobytes pushed through the DMA ring */
   MOE_T_DMA_FIRST, /**< us of the first weight drain = one 3.5 MiB transfer */
-  MOE_T_ALLOC,     /**< the layer call's own malloc and free */
+  MOE_T_ALLOC,   /**< the layer call's own malloc and free */
   MOE_T_DMA_FIRST_KB, /**< NOT us: KB that first wait covered */
-  MOE_T_DRAIN_DN,     /**< the down-weight drain, apart from gate_up's */
-  MOE_T_PUSH,         /**< hexkl_dma_ring_push2d itself */
-  MOE_T_STAGE, /**< copying the FastRPC buffers to and from cached heap */
+  MOE_T_DRAIN_DN,  /**< the down-weight drain, apart from gate_up's */
+  MOE_T_PUSH,      /**< hexkl_dma_ring_push2d itself */
+  MOE_T_STAGE,     /**< copying the FastRPC buffers to and from cached heap */
   MOE_T_ACC_STRIDE,
-  /** [#87] The DMA ring trace's per-call numbers (hexkl_probe.h's
-      HEXKL_PROBE_DMA_*), in the same order. Counts unless named _US. */
-  MOE_T_DMA_DESC,
-  MOE_T_DMA_WAITS,
-  MOE_T_DMA_WAITS_BLOCKED,
-  MOE_T_DMA_WAIT_US,
-  MOE_T_DMA_WAIT_ACT_US,
-  MOE_T_DMA_BUSY_LO_US,
-  MOE_T_DMA_BUSY_HI_US,
-  MOE_T_DMA_DEPTH_MAX,
-  MOE_T_DMA_FIRST_READY_US,
-  MOE_T_DMA_LAST_ISSUE_US,
-  MOE_T_PATH,    /**< NOT us: 0 = HMX block loop, 1 = M=1 HVX GEMV */
-  MOE_T_M1_FEED, /**< NOT us: 1 = the GEMV read VTCM slabs fed by DMA (#117) */
   MOE_N_STAGES
 };
 
@@ -932,12 +983,6 @@ static void moe_fill_stage_us(uint32 *stage_us, uint32 dsp_total) {
   stage_us[MOE_T_DRAIN_DN] = (uint32)hexkl_probe_us[HEXKL_PROBE_DRAIN_DN];
   stage_us[MOE_T_PUSH] = (uint32)hexkl_probe_us[HEXKL_PROBE_PUSH];
   stage_us[MOE_T_ACC_STRIDE] = (uint32)hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE];
-  for (int k = 0; k <= MOE_T_DMA_LAST_ISSUE_US - MOE_T_DMA_DESC; ++k) {
-    stage_us[MOE_T_DMA_DESC + k] =
-      (uint32)hexkl_probe_us[HEXKL_PROBE_DMA_DESC + k];
-  }
-  stage_us[MOE_T_PATH] = (uint32)hexkl_probe_us[HEXKL_PROBE_PATH];
-  stage_us[MOE_T_M1_FEED] = (uint32)hexkl_probe_us[HEXKL_PROBE_M1_FEED];
 }
 
 /** @brief Shared by both entry points so they cannot drift on what they
@@ -1015,7 +1060,7 @@ int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
   return hexkl_mm_u8i4_moe_layer_run(
     &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
     N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
-    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch, s->moe_flags);
+    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch);
 }
 
 int nntr_hvx_mm_u8i4_moe_layer_timed(
@@ -1048,20 +1093,10 @@ int nntr_hvx_mm_u8i4_moe_layer_timed(
   rc = hexkl_mm_u8i4_moe_layer_run(
     &s->weights_u8i4, s->vtcm_base, s->vtcm_size, s->config_off, M, K, inter,
     N_out, (uint32_t)h_gate_upLen, h_gate_up, h_down, row_index, row_count,
-    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch, s->moe_flags);
+    row_weight, act_f32, out_f32, s->quant_pool, &s->moe_scratch);
   t1 = hexkl_probe_now();
   hexkl_probe_on = 0;
-  return nntr_hvx_moe_stage_fill(stage_us, t0, t1, rc);
-}
 
-uint32_t nntr_hvx_moe_stage_count(void) { return MOE_N_STAGES; }
-
-/* [#85] The slot fill, shared with forward_debug (nntr_hvx_graph.c). Read
-   after hexkl_probe_on is cleared, as moe_layer_timed always did; the
-   column copy itself is moe_fill_stage_us, which the conv block's timed
-   entry shares. */
-int nntr_hvx_moe_stage_fill(uint32 *stage_us, uint64_t t0, uint64_t t1,
-                            int rc) {
   moe_fill_stage_us(stage_us, (uint32)(t1 - t0));
   return rc;
 }
@@ -1146,35 +1181,6 @@ int nntr_hvx_mm_u8i4_conv_block_timed(
   hexkl_probe_on = 0;
   moe_fill_stage_us(stage_us, (uint32)(t1 - t0));
   return rc;
-}
-
-int nntr_hvx_moe_dma_trace_read(remote_handle64 handle, uint32 *words,
-                                int wordsLen, uint32 *n_words) {
-  nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s || !words || wordsLen <= 0 || !n_words) {
-    return AEE_EBADPARM;
-  }
-  /* The tables of the last mm_u8i4_moe_layer_timed call: static, so they
-     survive until the next timed call overwrites them. A buffer too small
-     for the whole trace gets 0 words rather than a truncated one. */
-  *n_words = hexkl_dma_trace_serialize(words, (uint32_t)wordsLen);
-  return AEE_SUCCESS;
-}
-
-int nntr_hvx_moe_set_opts(remote_handle64 handle, uint32 flags,
-                          uint32 *applied) {
-  nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s || !applied) {
-    return AEE_EBADPARM;
-  }
-  /* Only the bits this skel knows are kept; the echo is how the ARM side
-     tells "took" from "ignored by an older skel". Since #113 that covers
-     the tune bit and the (lead, rows1) field beside it, so a skel without
-     them echoes a different word and the ARM side throws rather than
-     measuring the wrong cell of the matrix. */
-  s->moe_flags = flags & HEXKL_MOE_FLAGS_KNOWN;
-  *applied = s->moe_flags;
-  return AEE_SUCCESS;
 }
 
 int nntr_hvx_mm_u8i4_gate_up_swiglu(remote_handle64 handle, uint32 M, uint32 K,
