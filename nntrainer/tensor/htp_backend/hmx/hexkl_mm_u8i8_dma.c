@@ -26,14 +26,10 @@
 
 #include <AEEStdErr.h>
 
-#include "hexkl_acc_tile.h"
 #include "hexkl_dma_ring.h"
 #include "hexkl_micro.h"
-#include "hexkl_mm_opts.h"
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
-
-#include "hexkl_probe.h"
 
 #define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
 
@@ -45,8 +41,9 @@
  *         u8i4 module -- the accumulator width does not depend on the
  *         weight width. */
 #define ACC_TILE_BYTES 8192u
-/** @brief Largest single DMA row HexKL/HVX will move correctly; rows above
- *         this size have a documented hardware bug (doc13 §3a, §5). */
+/** @brief Largest single DMA row the engine will move correctly. Rows
+ *         above 256 KB hit a known hardware erratum, so a transfer is
+ *         chunked into rows at or below this size. */
 #define MAX_DMA_ROW_BYTES 262144u
 
 static uint32_t dma_row_size_dividing(uint32_t total_bytes) {
@@ -145,16 +142,10 @@ int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
                             uint32_t vtcm_size, uint32_t config_off, uint32_t M,
                             uint32_t K, const uint32_t *handles,
                             uint32_t n_handles, const float *act_f32,
-                            float *out_cat, const hexkl_mm_opts *opts) {
-  static const hexkl_mm_opts kDefaults = {0};
-  const hexkl_mm_opts *o = opts ? opts : &kDefaults;
-
+                            float *out_cat, hvx_worker_pool *pool) {
   if (!tbl || !vtcm_base || !handles || n_handles == 0 || !act_f32 ||
       !out_cat || M == 0 || K == 0) {
     return AEE_EBADPARM;
-  }
-  if ((o->act_scale == NULL) != (o->act_zp == NULL)) {
-    return AEE_EBADPARM; // both or neither, per hexkl_mm_opts.h
   }
 
   const uint32_t m_pad = ROUND_UP_U32(M, HEXKL_HMX_INT8_BLOCK_N_ROW);
@@ -183,6 +174,9 @@ int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
     }
   }
 
+  // See hexkl_mm_u8i4_dma.c's VTCM layout comment: one result slot per
+  // (row-band, output-tile) pair, so async output write-back never has
+  // to be waited on before the next tile's acc_read reuses a slot.
   const uint32_t act_bytes =
     n_rblocks * k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
   const uint32_t act_off = 0;
@@ -191,62 +185,33 @@ int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
     ROUND_UP_U32(act_off + act_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT),
     ROUND_UP_U32(act_off + act_bytes, HEXKL_HMX_ACTIVATION_ALIGNMENT) + wb_max,
   };
+  const uint32_t n_slots = n_tiles_max * n_rblocks;
   const uint32_t result_off =
     ROUND_UP_U32(wbuf[1] + wb_max, HEXKL_HMX_ACTIVATION_ALIGNMENT);
-  if (result_off + ACC_TILE_BYTES > config_off) {
+  if (result_off + (uint64_t)n_slots * ACC_TILE_BYTES > config_off) {
     return AEE_ENOMEMORY; // double-buffered widest weight does not fit VTCM
   }
-  if (result_off + ACC_TILE_BYTES > vtcm_size) {
+  if (result_off + (uint64_t)n_slots * ACC_TILE_BYTES > vtcm_size) {
     return AEE_ENOMEMORY;
   }
 
-  /** Safe here and not earlier: result_off has just been bounds-checked, and
-   * the probe writes a ramp over that tile. */
-  const hexkl_acc_layout *acc_layout =
-    hexkl_acc_layout_get(vtcm_base, result_off);
-  hexkl_probe_us[HEXKL_PROBE_ACC_STRIDE] =
-    acc_layout->usable ? acc_layout->row_stride : 0u;
-
-  /** Caller-supplied params (o->act_scale) skip the min/max scan; loc_* are
-   * only allocated for the dynamic path. */
-  float *loc_scale = NULL;
-  int32_t *loc_zp = NULL;
-  /* Only the fallback dequant path needs the DDR staging matrix. */
+  float *act_scale = (float *)malloc(sizeof(float) * m_pad);
+  int32_t *act_zp = (int32_t *)malloc(sizeof(int32_t) * m_pad);
   int32_t *acc_scratch =
-    acc_layout->usable
-      ? NULL
-      : (int32_t *)malloc(sizeof(int32_t) * (size_t)m_pad * n_max);
-  if (o->act_scale == NULL) {
-    loc_scale = (float *)malloc(sizeof(float) * m_pad);
-    loc_zp = (int32_t *)malloc(sizeof(int32_t) * m_pad);
-  }
-  if ((!acc_layout->usable && !acc_scratch) ||
-      (o->act_scale == NULL && (!loc_scale || !loc_zp))) {
-    free(loc_scale);
-    free(loc_zp);
+    (int32_t *)malloc(sizeof(int32_t) * (size_t)m_pad * n_max);
+  if (!act_scale || !act_zp || !acc_scratch) {
+    free(act_scale);
+    free(act_zp);
     free(acc_scratch);
     return AEE_ENOMEMORY;
   }
-  uint64_t p0 = 0;
-  HEXKL_PROBE_T0(p0);
-  const float *act_scale = o->act_scale;
-  const int32_t *act_zp = o->act_zp;
-  if (act_scale == NULL) {
-    hvx_quant_rows_u8_params(act_f32, M, m_pad, K, loc_scale, loc_zp, o->pool);
-    act_scale = loc_scale;
-    act_zp = loc_zp;
-  }
-  int rc0 = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
-                                 vtcm_base + act_off, o->pool);
-  HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
-  if (rc0 != AEE_SUCCESS) {
-    free(loc_scale);
-    free(loc_zp);
-    free(acc_scratch);
-    return rc0;
+  hvx_quant_rows_u8_params(act_f32, M, m_pad, K, act_scale, act_zp, pool);
+  int rc = hvx_quant_pack_u8_ah(act_f32, M, m_pad, K, act_scale, act_zp,
+                                vtcm_base + act_off, pool);
+  if (rc != AEE_SUCCESS) {
+    goto out;
   }
 
-  int rc = AEE_SUCCESS;
   size_t out_off = 0;
   hexkl_dma_ring_reset();
 
@@ -257,9 +222,7 @@ int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
     const uint32_t rs0 = dma_row_size_dividing(wb0);
     hexkl_dma_ring_push2d(vtcm_base + wbuf[0], h0->wh_bytes, rs0, rs0, rs0,
                           wb0 / rs0, /*src_vtcm=*/0, /*dst_vtcm=*/1);
-    HEXKL_PROBE_T0(p0);
     hexkl_dma_ring_drain();
-    HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
   }
 
   for (uint32_t i = 0; i < n_handles; ++i) {
@@ -290,68 +253,37 @@ int hexkl_mm_u8i8_layer_run(hexkl_weight_u8i8_table *tbl, uint8_t *vtcm_base,
             goto out;
           }
         }
-        HEXKL_PROBE_T0(p0);
-        rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off, result_off);
-        HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_READ, p0);
+        // This tile's own slot -- see hexkl_mm_u8i4_dma.c's VTCM layout
+        // comment for why (rb, nt) never collide with another in-flight
+        // tile.
+        const uint32_t slot_off =
+          result_off + (rb * n_tiles_max + nt) * ACC_TILE_BYTES;
+        rc = hexkl_micro_hmx_acc_read_int32(vtcm_base, config_off, slot_off);
         if (rc != AEE_SUCCESS) {
           goto out;
         }
-        if (acc_layout->usable) {
-          /** Dequantize the tile where it already is. The rows beyond M are
-           * the accumulator's padding: their quantization parameters are
-           * synthetic, so emitting them would be wrong, not merely wasted --
-           * the same rule hvx_dequant_i32_to_f32 applies via m_valid. At
-           * decode that is 62 of 64 rows never touched at all. */
-          const uint32_t m0 = rb * HEXKL_ACC_TILE_ROWS;
-          const uint32_t cnt =
-            (m0 >= M) ? 0u
-                      : ((M - m0 < HEXKL_ACC_TILE_ROWS) ? (M - m0)
-                                                        : HEXKL_ACC_TILE_ROWS);
-          if (cnt != 0u) {
-            const int32_t *tile =
-              (const int32_t *)(vtcm_base + result_off) + acc_layout->base;
-            const uint32_t c0 = nt * HEXKL_ACC_TILE_COLS;
-            HEXKL_PROBE_T0(p0);
-            hvx_dequant_acc_tile_to_f32(
-              tile, acc_layout->row_stride, cnt, act_scale + m0, act_zp + m0,
-              h->colsum_w + c0, h->w_scale + c0, h->bias + c0,
-              out_cat + out_off + (size_t)m0 * h->N + c0, h->N, o->accumulate);
-            HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
-          }
-        } else {
-          HEXKL_PROBE_T0(p0);
-          rc = hexkl_micro_hmx_copy_32b_to_submatrix(
-            vtcm_base, result_off, acc_scratch, rb, nt, m_pad, h->N);
-          HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
-          if (rc != AEE_SUCCESS) {
-            goto out;
-          }
-        }
+
+        // See hexkl_mm_u8i4_dma.c: async VTCM -> DDR write-back replacing
+        // the scalar hexkl_micro_hmx_copy_32b_to_submatrix.
+        int32_t *dst = acc_scratch + (size_t)rb * 64 * h->N + (size_t)nt * 32;
+        hexkl_dma_ring_push2d(dst, vtcm_base + slot_off, h->N * 4, 32 * 4,
+                              32 * 4, 64, /*src_vtcm=*/1, /*dst_vtcm=*/0);
       }
     }
 
-    /** On the in-place path the dequant has already happened, per tile, above
-     * this drain: it reads the VTCM result tile and writes DDR, neither of
-     * which the weight prefetch touches, so it overlaps the transfer for
-     * free. The fallback below cannot -- it needs the whole staging matrix
-     * first. */
-    HEXKL_PROBE_T0(p0);
+    // See hexkl_mm_u8i4_dma.c: this drain covers both the next handle's
+    // weight prefetch and every output tile pushed above.
     hexkl_dma_ring_drain();
-    HEXKL_PROBE_ADD(HEXKL_PROBE_DRAIN, p0);
 
-    if (!acc_layout->usable) {
-      HEXKL_PROBE_T0(p0);
-      hvx_dequant_i32_to_f32(acc_scratch, M, m_pad, h->N, act_scale, act_zp,
-                             h->colsum_w, h->w_scale, h->bias,
-                             out_cat + out_off, o->accumulate);
-      HEXKL_PROBE_ADD(HEXKL_PROBE_DEQUANT, p0);
-    }
+    hvx_dequant_i32_to_f32(acc_scratch, M, m_pad, h->N, act_scale, act_zp,
+                           h->colsum_w, h->w_scale, h->bias, out_cat + out_off,
+                           pool);
     out_off += (size_t)M * h->N;
   }
 
 out:
-  free(loc_scale);
-  free(loc_zp);
+  free(act_scale);
+  free(act_zp);
   free(acc_scratch);
   return rc;
 }
