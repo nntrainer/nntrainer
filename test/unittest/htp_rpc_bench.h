@@ -123,14 +123,17 @@ struct RpcBuf {
  * #if defined() guard around this compiled the whole thing out and then
  * reported "not in this SDK" for an SDK that has them.
  *
+ * @param poll_us how long the host polls before the interrupt wait; the
+ *        kernel benchmarks keep 100, the dspqueue bench passes the app's
+ *        NNTR_HTP_POLL_US default of 5000 (htp_backend.cpp).
  * @return 2 poll mode, 1 PM mode, 0 every mode rejected. Report it: a run's
  *         transport numbers can only be read knowing which mode produced them.
  */
-inline int htp_set_latency_qos(remote_handle64 h) {
+inline int htp_set_latency_qos(remote_handle64 h, uint32_t poll_us = 100) {
   struct remote_rpc_control_latency lat;
   std::memset(&lat, 0, sizeof(lat));
   lat.enable = RPC_POLL_QOS;
-  lat.latency = 100;
+  lat.latency = poll_us;
   int rc =
     remote_handle64_control(h, DSPRPC_CONTROL_LATENCY, &lat, sizeof(lat));
   if (rc == AEE_SUCCESS) {
