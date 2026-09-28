@@ -37,7 +37,6 @@
 
 #include <acti_func.h>
 #include <common_properties.h>
-#include <compute_ops.h>
 #include <cpu_backend.h>
 #include <layer_impl.h>
 #include <limits.h>
@@ -377,30 +376,6 @@ private:
   bool is_causal;
   bool skip_prefill = false;
 
-  /**
-   * @brief The ComputeOps this layer's context resolves to, captured at
-   *        the start of each forwarding so the per-batch helpers (which
-   *        take no context) can ask it for an accelerated attention.
-   *        nullptr means "CPU only", which is also what get_cpu_ops()'s
-   *        supports_sdpa_fp16_kvcache() answers.
-   */
-  nntrainer::ComputeOps *compute_ops_ = nullptr;
-
-  /**
-   * @brief Runs steps 2-4 (Q.K^T, softmax, .V) of one batch on the
-   *        accelerator when the context's ComputeOps offers one and the
-   *        shape fits its contract (causal, f32 query/output, fp16 cache).
-   *
-   * @return true if attention_output_step now holds the result; false
-   *         means nothing was written and the CPU path must run.
-   */
-  bool try_accelerated_attention(nntrainer::Tensor &query_step,
-                                 nntrainer::Tensor &cached_key,
-                                 nntrainer::Tensor &cached_value,
-                                 nntrainer::Tensor &attention_output_step,
-                                 unsigned int cache_from, unsigned int cache_to,
-                                 const float *sinks);
-
   enum INOUT_INDEX {
     /** input index */
     QUERY = 0,
@@ -476,6 +451,19 @@ private:
    */
   void precompute_freqs(int head_dim, unsigned int seq_len,
                         float theta = 10000.0, bool is_fp16 = false);
+
+  /**
+   * @brief [#130] The HTP per-token attention hook at one decode row:
+   *        hands q | k | v, the RoPE table (once) and, when asked, the
+   *        CPU cache's rows [0, pos) to the backend; on true the output
+   *        row was written by the DSP and this layer's cache is stale
+   *        from now on (the DSP owns it, plan 130 section 3.3).
+   */
+  bool htpDecodeAttention(nntrainer::RunLayerContext &context,
+                          unsigned int pos);
+  std::vector<float> htp_rope_table_; /**< [max_timestep][cos 32 | sin 32] */
+  bool htp_owns_cache_ = false;       /**< a hook returned 1: rows past the
+                                           prompt are the DSP's, not this cache's */
 
   /**
    * @brief _compute frequency parameters for default ROPE

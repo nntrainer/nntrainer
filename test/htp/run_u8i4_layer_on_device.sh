@@ -2,45 +2,33 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Builds the DSP skel + the ARM gtest for the u8i4 AND u8i8 layer endpoints
-# and runs them on a connected device. Both live in one gtest binary
-# (unittest_hvx_mm_u8i4 despite the name -- it predates the u8i8 fixture),
-# so one run covers both.
+# (HTP_PR_PLAN.md PR①/PR② / doc15 §8 item 3) and runs it on a connected
+# device. Both live in one gtest binary (unittest_hvx_mm_u8i4 despite the
+# name -- it predates the u8i8 fixture), so one run covers both.
 #
 # What this checks, in order:
-#   1. DSP skel compiles clean against HexKL (-Wall -Werror)
+#   1. DSP skel compiles clean against HexKL beta2 (-Wall -Werror)
 #   2. libnntrainer.so + the ARM gtest binary build for arm64-v8a
 #   3. unittest_hvx_mm_u8i4 passes on-device -- the original u8i4 accuracy
 #      harness (Shape1-4), the u8i4 layer-endpoint tests, and the u8i8
 #      layer-endpoint tests
-#   4. the reported layer_x4/harness speedup (u8i4) lands near the 1.7-2x
-#      the cross-matmul prefetch was measured at, and the u8i8-vs-u8i4 ratio
-#      is sane (both printed, not asserted -- see the ReportPerCallCost*
-#      tests' comments)
+#   4. the reported layer_x4/harness speedup (u8i4) lands near doc13 §3a's
+#      1.7-2x, and the u8i8-vs-u8i4 ratio is sane (both printed, not
+#      asserted -- see the ReportPerCallCost* tests' comments)
 #
-# Required, with no default -- these are per-machine install paths, and a
-# guessed one fails later and less clearly than an unset one does here:
-#   HEXAGON_SDK_ROOT  Hexagon SDK install (its directory name is the version
-#                     test/htp/build.sh looks for under HEXKL_ROOT/lib)
-#   HEXKL_ROOT        hexkl_addon install. NOT the copy under
-#                     Hexagon_SDK/*/addons/ -- that one has no v79 micro lib
-#   ANDROID_NDK       NDK install used for the arm64-v8a build
-#
-# Optional:
-#   DEVICE_TMP        on-device scratch dir (default below)
-#   HEXAGON_TOOLS_VER Hexagon toolchain dir name under tools/HEXAGON_Tools;
-#                     auto-detected when exactly one is installed
+# Override any of these if your paths differ:
+: "${HEXAGON_SDK_ROOT:=$HOME/workspace/Hexagon_SDK/6.4.0.2}"
+: "${HEXKL_ROOT:=$HOME/workspace/hxkl-beta2/hexkl_addon}"   # beta2, NOT the
+                                                            # one under
+                                                            # Hexagon_SDK/*/addons/
+: "${HEXKL_SDK_VER:=6.4.0.2}"
+: "${ANDROID_NDK:=$HOME/workspace/android-ndk-r26d}"
+: "${DEVICE_TMP:=/data/local/tmp/htp_u8i4_layer_test}"
 
 set -eu
 
-: "${HEXAGON_SDK_ROOT:?set HEXAGON_SDK_ROOT to your Hexagon SDK install}"
-: "${HEXKL_ROOT:?set HEXKL_ROOT to your hexkl_addon path}"
-: "${ANDROID_NDK:?set ANDROID_NDK to your NDK install}"
-: "${DEVICE_TMP:=/data/local/tmp/htp_u8i4_layer_test}"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-
-RUN_LOG="${RUN_LOG:-$(mktemp -t hvx_mm_u8i4_device_run.XXXXXX.log)}"
 
 log()  { echo -e "\n\033[1;36m==> $*\033[0m"; }
 fail() { echo -e "\033[1;31mFAILED: $*\033[0m" >&2; exit 1; }
@@ -50,19 +38,9 @@ for v in HEXAGON_SDK_ROOT HEXKL_ROOT ANDROID_NDK; do
 done
 
 export HEXAGON_SDK_ROOT
-# The toolchain directory carries a version in its name that moves with the
-# SDK, so pin it only when there is a choice to make.
-TOOLS_DIR="$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools"
-if [ -n "${HEXAGON_TOOLS_VER:-}" ]; then
-  export DEFAULT_HEXAGON_TOOLS_ROOT="$TOOLS_DIR/$HEXAGON_TOOLS_VER"
-else
-  n_tools=$(find "$TOOLS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-  [ "$n_tools" -eq 1 ] ||
-    fail "found $n_tools toolchains under $TOOLS_DIR -- set HEXAGON_TOOLS_VER to the one to use"
-  export DEFAULT_HEXAGON_TOOLS_ROOT="$(find "$TOOLS_DIR" -mindepth 1 -maxdepth 1 -type d)"
-fi
+export DEFAULT_HEXAGON_TOOLS_ROOT="$HEXAGON_SDK_ROOT/tools/HEXAGON_Tools/19.0.04"
 [ -d "$DEFAULT_HEXAGON_TOOLS_ROOT" ] ||
-  fail "Hexagon tools not at $DEFAULT_HEXAGON_TOOLS_ROOT"
+  fail "Hexagon tools not at $DEFAULT_HEXAGON_TOOLS_ROOT -- check the toolchain version dir name"
 
 if ! adb get-state >/dev/null 2>&1; then
   fail "no device visible to adb -- check 'adb devices'"
@@ -71,22 +49,29 @@ DEVICE="$(adb get-serialno)"
 echo "device: $DEVICE"
 
 # --- 1. DSP skel -----------------------------------------------------------
-log "1/4  Building the DSP skel (test/htp/build.sh)"
+log "1/4  Building the DSP skel (test/htp/build.sh, HexKL $HEXKL_SDK_VER)"
 (
   cd "$REPO_ROOT/test/htp"
-  HEXKL_ROOT="$HEXKL_ROOT" bash build.sh
+  HEXKL_ROOT="$HEXKL_ROOT" HEXKL_SDK_VER="$HEXKL_SDK_VER" bash build.sh
 )
 SKEL="$REPO_ROOT/test/htp/build/libnntr_hvx_skel.so"
 [ -f "$SKEL" ] || fail "skel did not build: $SKEL"
+# The ARM client stub comes from the same IDL and is generated separately.
+# Regenerated here every time rather than when the IDL "looks" changed: a
+# fresh skel meeting a stale client returns EBADPARM on the new entry points
+# and the two once drifted for exactly that reason (doc 46 section 14.2).
+log "1b/4 Regenerating the ARM client stub (generate_stub.sh)"
+HEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
+  bash "$REPO_ROOT/nntrainer/tensor/htp_backend/generate_stub.sh" ||
+  fail "generate_stub.sh failed"
 
 # --- 2. libnntrainer.so for arm64-v8a --------------------------------------
 # unittest_hvx_mm_u8i4 does not itself call into nntrainer, but Android.mk's
 # PREBUILT_SHARED_LIBRARY entries for it are parsed unconditionally, so the
 # .so must exist on disk before ndk-build will process ANY target in this
 # file. -Denable-htp is not required for this test (it never goes through
-# nntrainer's HtpComputeOps seam), but matches what the CausalLM-side work
-# will eventually need from the same builddir, so building it now saves a
-# second full rebuild.
+# nntrainer's HtpComputeOps seam), but matches what PR③ will eventually need
+# from the same builddir, so building it now saves a second full rebuild.
 LIBNNTRAINER="$REPO_ROOT/builddir/jni/arm64-v8a/libnntrainer.so"
 if [ -f "$LIBNNTRAINER" ]; then
   log "2/4  libnntrainer.so already built, skipping (rm -rf builddir to force)"
@@ -109,7 +94,7 @@ fi
 [ -f "$LIBNNTRAINER" ] || fail "libnntrainer.so did not build: $LIBNNTRAINER"
 
 # --- 3. ARM gtest -----------------------------------------------------------
-log "3/4  Building unittest_hvx_mm_u8i4 (ndk-build, arm64-v8a)"
+log "3/4  Building unittest_hvx_mm_u8i4 + _softmax + _attn (ndk-build, arm64-v8a)"
 GTEST_SUBMODULE="$REPO_ROOT/subprojects/googletest"
 if [ ! -f "$GTEST_SUBMODULE/googletest/include/gtest/gtest.h" ]; then
   echo "  googletest submodule looks unfetched -- running git submodule update"
@@ -133,48 +118,97 @@ fi
     APP_BUILD_SCRIPT=./Android.mk \
     NNTRAINER_ROOT="$REPO_ROOT" \
     HEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
-    unittest_hvx_mm_u8i4 unittest_hvx_attn_f16
-)
+    unittest_hvx_mm_u8i4 unittest_hvx_softmax unittest_hvx_attn \
+    unittest_hvx_fc
+) || fail "ndk-build failed -- see the error above.
+
+A failed build used to fall through to whatever binary was left from last
+time, which then ran, printed plausible numbers, and cost a device cycle to
+notice. Three of those in this session. The binaries existing is not the
+same as them being current."
 TEST_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_mm_u8i4"
 [ -f "$TEST_BIN" ] || fail "test binary did not build: $TEST_BIN"
-ATTN_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_attn_f16"
+# The softmax fixture carries the blocked-softmax gate: PHASE B of the fused
+# attention loop against mha_softmax_blocked_ref, the same host model the whole
+# flash loop is specified against.
+SOFTMAX_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_softmax"
+[ -f "$SOFTMAX_BIN" ] || fail "test binary did not build: $SOFTMAX_BIN"
+# PHASE A (S = Q.Kt) against mha_htp_host_scores, the same stage the fused
+# forward will run.
+ATTN_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_attn"
 [ -f "$ATTN_BIN" ] || fail "test binary did not build: $ATTN_BIN"
+# The other half of the QNN comparison table: one fully connected layer at
+# Qwen3-0.6B's q_proj shape, u8 x i8, reported the way QNN net-run reports.
+FC_BIN="$REPO_ROOT/test/jni/obj/local/arm64-v8a/unittest_hvx_fc"
+[ -f "$FC_BIN" ] || fail "test binary did not build: $FC_BIN"
 
 # --- 4. push + run -----------------------------------------------------------
 log "4/4  Pushing to $DEVICE:$DEVICE_TMP and running"
 adb shell "mkdir -p $DEVICE_TMP"
 adb push "$SKEL" "$DEVICE_TMP/" >/dev/null
 adb push "$TEST_BIN" "$DEVICE_TMP/" >/dev/null
+adb push "$SOFTMAX_BIN" "$DEVICE_TMP/" >/dev/null
 adb push "$ATTN_BIN" "$DEVICE_TMP/" >/dev/null
-# c++_shared runtime the test binary links against (APP_STL in Application.mk).
-# The prebuilt directory is named after the build host, so glob it rather
-# than assuming linux-x86_64.
-CXX_SHARED=$(find "$ANDROID_NDK/toolchains/llvm/prebuilt" \
-  -path "*/aarch64-linux-android/libc++_shared.so" -print -quit 2>/dev/null || true)
-if [ -n "$CXX_SHARED" ]; then
-  adb push "$CXX_SHARED" "$DEVICE_TMP/" >/dev/null
-else
-  echo "  warning: libc++_shared.so not found under $ANDROID_NDK -- the test"
-  echo "  will fail to load unless the device already has a copy"
-fi
+adb push "$FC_BIN" "$DEVICE_TMP/" >/dev/null
+# c++_shared runtime the test binary links against (APP_STL in Application.mk)
+CXX_SHARED="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+[ -f "$CXX_SHARED" ] && adb push "$CXX_SHARED" "$DEVICE_TMP/" >/dev/null
+# HexKL's ARM-side library. sdkl_cpu_i4_rm_to_i4_wh is the layout conversion
+# the DSP does at registration, runnable on the application processor -- the
+# WH layout tests dlopen this and skip when it is absent, so a HexKL drop
+# without an armv8 build still runs everything else.
+SDKL_SO="$HEXKL_ROOT/lib/$HEXKL_SDK_VER/armv8_android26/libsdkl.so"
+[ -f "$SDKL_SO" ] && adb push "$SDKL_SO" "$DEVICE_TMP/" >/dev/null
 
 echo "  (unsigned-PD enable happens inside the test itself via remote_session_control)"
 adb shell "cd $DEVICE_TMP && \
-  chmod +x unittest_hvx_mm_u8i4 unittest_hvx_attn_f16 && \
+  chmod +x unittest_hvx_mm_u8i4 && \
   LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
-  ./unittest_hvx_mm_u8i4 && \
+  ./unittest_hvx_mm_u8i4" 2>&1 | tee /tmp/hvx_mm_u8i4_device_run.log
+
+echo
+log "4b/4  HVX softmax, including the blocked (flash attention PHASE B) gate"
+adb shell "cd $DEVICE_TMP && \
+  chmod +x unittest_hvx_softmax && \
   LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
-  ./unittest_hvx_attn_f16" 2>&1 | tee "$RUN_LOG"
+  ./unittest_hvx_softmax" 2>&1 | tee /tmp/hvx_softmax_device_run.log
+
+echo
+log "4c/4  Attention PHASE A (S = Q.Kt) against the host model"
+adb shell "cd $DEVICE_TMP && \
+  chmod +x unittest_hvx_attn && \
+  LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
+  ./unittest_hvx_attn" 2>&1 | tee /tmp/hvx_attn_device_run.log
+
+echo
+log "4d/4  Fully connected layer cost (Qwen3-0.6B q_proj, u8 x i8)"
+adb shell "cd $DEVICE_TMP && \
+  chmod +x unittest_hvx_fc && \
+  LD_LIBRARY_PATH=$DEVICE_TMP ADSP_LIBRARY_PATH=$DEVICE_TMP \
+  ./unittest_hvx_fc" 2>&1 | tee /tmp/hvx_fc_device_run.log
 
 echo
 log "Summary"
-grep -E "^\[  (PASSED|FAILED)|U8I[48]_FIELD|ATTN_F16_FIELD" "$RUN_LOG" || true
+grep -E "^\[  (PASSED|FAILED)|U8I[48]_FIELD" /tmp/hvx_mm_u8i4_device_run.log || true
+grep -E "^\[  (PASSED|FAILED)|BLOCKED_FIELD" /tmp/hvx_softmax_device_run.log || true
+grep -E "^\[  (PASSED|FAILED)|ATTN_FIELD" /tmp/hvx_attn_device_run.log || true
+grep -E "^\[  (PASSED|FAILED)|FC_FIELD" /tmp/hvx_fc_device_run.log || true
 echo
-echo "fp16 attention gate: every ATTN_F16_FIELD probe=... value=1 (a 0 means"
-echo "the hand-built tile layouts differ from HexKL's on this part -- stop"
-echo "there), then every HmxAttnF16 test PASSED with snr_db above 40."
+echo "Full logs: /tmp/hvx_mm_u8i4_device_run.log"
+echo "           /tmp/hvx_softmax_device_run.log"
+echo "           /tmp/hvx_attn_device_run.log"
+echo "           /tmp/hvx_fc_device_run.log"
 echo
-echo "Full log: $RUN_LOG"
-echo "Gate to clear before building on top of this: all PASSED, and the"
-echo "printed U8I4_FIELD path=layer_x4 field=speedup_vs_harness value=..."
-echo "in the neighbourhood of 1.7-2. If it is not, stop and find out why."
+echo "Tables and a HTML report from those logs:"
+echo "  tools/htp_attn_report.py"
+echo "  tools/htp_attn_report.py --html /tmp/htp_attn_report.html"
+echo "  tools/htp_fc_report.py            # the fully connected layer"
+echo "  tools/htp_fc_report.py --qnn 512=<ms>,1024=<ms>   # overlay QNN, per M"
+echo "Gate to clear before starting PR③: all PASSED, and the printed"
+echo "U8I4_FIELD path=layer_x4 field=speedup_vs_harness value=... should be"
+echo "in the neighbourhood of 1.7-2 (doc13 §3a). If it is not, stop and find"
+echo "out why before building anything on top of this."
+echo
+echo "Gate for the attention work: HvxSoftmaxBlocked all PASSED, and both"
+echo "BLOCKED_FIELD max_abs_err_p / max_abs_err_l <= 1e-6 against the host"
+echo "model. That is what makes the later bit-exactness gates meaningful."
