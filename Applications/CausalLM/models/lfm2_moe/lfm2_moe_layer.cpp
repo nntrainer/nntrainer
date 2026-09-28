@@ -290,11 +290,13 @@ void Lfm2MoELayer::buildExpertAssignments(
       scored[e] = {s + bias[e], static_cast<int>(e)};
     }
 
-    // top-k experts by (sigmoid + bias)
+    // top-k experts by (sigmoid + bias); an exact tie goes to the lower
+    // index -- a total order, so the selection does not depend on the
+    // library's partial_sort, and the HTP router's rule (m1_ops_det.h)
     std::partial_sort(
       scored.begin(), scored.begin() + topk, scored.end(),
       [](const std::pair<float, int> &a, const std::pair<float, int> &b) {
-        return a.first > b.first;
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
       });
 
     // routing weights come from the bias-free sigmoid scores
