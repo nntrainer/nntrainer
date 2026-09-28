@@ -23,6 +23,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -64,7 +65,8 @@ protected:
     const uint32_t split = rows / 2;
     auto append = [&](uint32_t row0, uint32_t n, const uint16_t *kr,
                       const uint16_t *vr) {
-      ASSERT_EQ(hexkl_kv_q_append(&host, host_h, row0, n, kr, vr, nullptr), 0);
+      ASSERT_EQ(
+        hexkl_kv_q_append(&host, host_h, row0, n, kr, vr, nullptr, nullptr), 0);
       const int e = nntr_hvx_kv_append_q(handle_, dsp_h, row0, kr,
                                          static_cast<int>(n * width), vr,
                                          static_cast<int>(n * width));
@@ -102,17 +104,34 @@ protected:
     ASSERT_EQ(hexkl_kv_q_dump(kv, 0, rows, hkq.data(), hvq.data(), hsk.data(),
                               hcs.data(), hsv.data()),
               0);
-    size_t k_diff = 0, v_diff = 0;
+    // The DSP quantizes on HVX with the same scales; a value may differ by
+    // one step where the f32 product lands on a rounding tie the scalar
+    // path resolves differently. Scales are bit-identical, and colsum has
+    // to be the sum of the values the DSP actually stored.
+    size_t k_diff = 0, v_diff = 0, k_far = 0, v_far = 0;
     for (size_t i = 0; i < values; ++i) {
-      k_diff += kq[i] != hkq[i];
-      v_diff += vq[i] != hvq[i];
+      const int dk = std::abs(kq[i] - hkq[i]), dv = std::abs(vq[i] - hvq[i]);
+      k_diff += dk != 0;
+      v_diff += dv != 0;
+      k_far += dk > 1;
+      v_far += dv > 1;
     }
-    EXPECT_EQ(k_diff, 0u) << "K values differ from the host quantizer";
-    EXPECT_EQ(v_diff, 0u) << "V values differ from the host quantizer";
+    EXPECT_EQ(k_far, 0u) << "K values off by more than one step";
+    EXPECT_EQ(v_far, 0u) << "V values off by more than one step";
+    EXPECT_LE(k_diff, values / 500) << "K one-step differences: " << k_diff;
+    EXPECT_LE(v_diff, values / 500) << "V one-step differences: " << v_diff;
     EXPECT_EQ(std::memcmp(sk.data(), hsk.data(), heads * sizeof(float)), 0);
-    EXPECT_EQ(std::memcmp(cs.data(), hcs.data(), heads * sizeof(int32_t)), 0);
     EXPECT_EQ(std::memcmp(sv.data(), hsv.data(), heads * dt * sizeof(float)),
               0);
+    for (uint32_t r = 0; r < rows; ++r) {
+      for (uint32_t n = 0; n < n_kv; ++n) {
+        int32_t sum = 0;
+        for (uint32_t d = 0; d < hd; ++d) {
+          sum += kq[static_cast<size_t>(r) * n_kv * hd + n * hd + d];
+        }
+        ASSERT_EQ(cs[r * n_kv + n], sum) << "colsum row " << r << " head " << n;
+      }
+    }
   }
 
   /**
@@ -458,6 +477,55 @@ TEST_F(HvxAttnQDecode, ReportTimes) {
   RunDecode(0, {1, 1023, 1024, 16, 4, 128, 0, 0, 0}, kSnrQ8, true);
   RunDecode(0, {1, 4095, 4096, 16, 4, 128, 0, 0, 0}, kSnrQ8, true);
   RunDecode(1, {1, 4095, 4096, 16, 4, 128, 0, 0, 0}, kSnrQ4, true);
+}
+
+/**
+ * @brief attn_q_step as the model uses it: one row appended and attended
+ *        per call, with the append's breakdown, at two cache depths and for
+ *        both kinds.
+ */
+TEST_F(HvxAttnQDecode, StepTiming) {
+  for (uint32_t kind : {0u, 1u}) {
+    for (uint32_t rows : {512u, 4096u}) {
+      const uint32_t n_kv = 8, hd = 128, n_q_heads = 16, width = n_kv * hd;
+      std::vector<uint16_t> k(static_cast<size_t>(rows) * width), v(k.size());
+      fill_hf(k, 0x57E90001u, 1.0f);
+      fill_hf(v, 0x57E90002u, 1.0f);
+      std::vector<float> q(static_cast<size_t>(n_q_heads) * hd);
+      fill_deterministic(q, 0x57E90003u, 3.0f);
+      uint32_t h = 0;
+      ASSERT_EQ(nntr_hvx_kv_register_q(handle_, kind, rows, n_kv, hd, &h),
+                AEE_SUCCESS);
+      ASSERT_EQ(nntr_hvx_kv_append_q(
+                  handle_, h, 0, k.data(), static_cast<int>((rows - 1) * width),
+                  v.data(), static_cast<int>((rows - 1) * width)),
+                AEE_SUCCESS);
+      std::vector<float> out(q.size());
+      std::vector<uint32_t> st(8, 0), acc(8, 0);
+      const int reps = 8;
+      for (int r = 0; r < reps; ++r) {
+        const int err = nntr_hvx_attn_q_step(
+          handle_, h, rows - 1,
+          k.data() + static_cast<size_t>(rows - 1) * width,
+          static_cast<int>(width),
+          v.data() + static_cast<size_t>(rows - 1) * width,
+          static_cast<int>(width), 1, rows - 1, rows, n_q_heads, 0, 0.0f,
+          q.data(), static_cast<int>(q.size()), nullptr, 0, out.data(),
+          static_cast<int>(out.size()), st.data(), 8);
+        ASSERT_EQ(err, AEE_SUCCESS) << hex(err);
+        for (int i = 0; i < 7; ++i) {
+          acc[i] += st[i];
+        }
+      }
+      std::cout << "ATTN_Q_FIELD path=step kind=" << kind << " rows=" << rows
+                << " append_us=" << acc[0] / reps
+                << " attn_us=" << acc[1] / reps << " total_us=" << acc[3] / reps
+                << " quant_us=" << acc[4] / reps
+                << " stage_us=" << acc[5] / reps << " bake_us=" << acc[6] / reps
+                << "\n";
+      EXPECT_EQ(nntr_hvx_kv_release_q(handle_, h), AEE_SUCCESS);
+    }
+  }
 }
 
 TEST_F(HvxAttnQ, AccumulatorLayoutIsRowMajorStrided) {

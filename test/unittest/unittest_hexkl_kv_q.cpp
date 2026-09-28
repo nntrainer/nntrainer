@@ -190,10 +190,11 @@ TEST(HexklKvQ, AppendDumpRoundTripAndRewrite) {
     auto k = rows_hf(rows, width, 0x51u + kind, 1.0f);
     auto v = rows_hf(rows, width, 0x52u + kind, 1.0f);
     // Two appends, host build: no bake.
-    ASSERT_EQ(hexkl_kv_q_append(&tbl, h, 0, 40, k.data(), v.data(), nullptr),
-              0);
+    ASSERT_EQ(
+      hexkl_kv_q_append(&tbl, h, 0, 40, k.data(), v.data(), nullptr, nullptr),
+      0);
     ASSERT_EQ(hexkl_kv_q_append(&tbl, h, 40, 30, k.data() + 40 * width,
-                                v.data() + 40 * width, nullptr),
+                                v.data() + 40 * width, nullptr, nullptr),
               0);
 
     std::vector<int8_t> kq(static_cast<size_t>(rows) * width), vq(kq.size());
@@ -237,8 +238,9 @@ TEST(HexklKvQ, AppendDumpRoundTripAndRewrite) {
     // Rewrite rows 10..12 with new data; only those change.
     auto k2 = rows_hf(3, width, 0x77u, 1.0f);
     auto v2 = rows_hf(3, width, 0x78u, 1.0f);
-    ASSERT_EQ(hexkl_kv_q_append(&tbl, h, 10, 3, k2.data(), v2.data(), nullptr),
-              0);
+    ASSERT_EQ(
+      hexkl_kv_q_append(&tbl, h, 10, 3, k2.data(), v2.data(), nullptr, nullptr),
+      0);
     std::vector<int8_t> kq2(kq.size()), vq2(vq.size());
     ASSERT_EQ(hexkl_kv_q_dump(kv, 0, rows, kq2.data(), vq2.data(), nullptr,
                               nullptr, nullptr),
@@ -270,8 +272,9 @@ TEST(HexklKvQ, AppendDumpRoundTripAndRewrite) {
     }
 
     // Out of range.
-    EXPECT_NE(hexkl_kv_q_append(&tbl, h, 120, 9, k.data(), v.data(), nullptr),
-              0);
+    EXPECT_NE(
+      hexkl_kv_q_append(&tbl, h, 120, 9, k.data(), v.data(), nullptr, nullptr),
+      0);
     EXPECT_NE(
       hexkl_kv_q_dump(kv, 120, 9, nullptr, nullptr, nullptr, nullptr, nullptr),
       0);

@@ -199,6 +199,14 @@ int hexkl_kv_q_release(hexkl_kv_q_table *tbl, uint32_t handle);
 /** @brief The slot, or NULL if the handle is not in use. */
 const hexkl_kv_q *hexkl_kv_q_get(const hexkl_kv_q_table *tbl, uint32_t handle);
 
+/** @brief Where an append spends its time, microseconds (DSP only; the host
+ *         build leaves it zero). */
+typedef struct {
+  uint32_t quant_us; /**< fp16 -> int8/int4 masters, scales, colsums */
+  uint32_t stage_us; /**< masters -> row-major staging of the column tiles */
+  uint32_t bake_us;  /**< HexKL rm_to_wh of the staged tiles */
+} hexkl_kv_q_append_stats;
+
 /**
  * @brief Quantizes and stores cache rows [row0, row0 + n_rows) from the
  *        cache's own row-major fp16 layout ([n_rows][n_head_kv*head_dim]),
@@ -212,7 +220,8 @@ const hexkl_kv_q *hexkl_kv_q_get(const hexkl_kv_q_table *tbl, uint32_t handle);
  */
 int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
                       uint32_t n_rows, const uint16_t *k_rows,
-                      const uint16_t *v_rows, uint8_t *vtcm_base);
+                      const uint16_t *v_rows, uint8_t *vtcm_base,
+                      hexkl_kv_q_append_stats *st);
 
 /**
  * @brief Fills the row-major staging buffers with column tile @a c of head

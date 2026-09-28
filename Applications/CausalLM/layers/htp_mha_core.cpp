@@ -916,15 +916,12 @@ bool MHACoreLayer::try_quantized_attention(
   if (synced > cache_from) {
     synced = cache_from;
   }
-  if (synced < cache_to) {
-    const size_t off = batch * cache_key_dim.getFeatureLen() +
-                       static_cast<size_t>(synced) * width;
-    if (!compute_ops_->kv_cache_q_append(handle, synced, cache_to - synced,
-                                         width, k_base + off, v_base + off)) {
-      return fail("append");
-    }
-    synced = cache_to;
-  }
+  // The missing rows -- normally just this step's -- ride along with the
+  // attention call: one round trip per layer per step.
+  const unsigned int append_row0 = synced;
+  const unsigned int append_rows = cache_to - synced;
+  const size_t off = batch * cache_key_dim.getFeatureLen() +
+                     static_cast<size_t>(append_row0) * width;
 
   const unsigned int n_q = cache_to - cache_from;
   const unsigned int q_stride = num_heads_Q * head_dim;
@@ -932,12 +929,13 @@ bool MHACoreLayer::try_quantized_attention(
     (local_window_size == 0 || local_window_size >= cache_to)
       ? 0u
       : static_cast<unsigned int>(local_window_size);
-  if (!compute_ops_->sdpa_q_kvcache(handle, io.q, q_stride, n_q, cache_from,
-                                    cache_to, num_heads_Q, num_heads_KV,
-                                    head_dim, window, attn_logit_softcapping,
-                                    sinks, io.out, q_stride)) {
+  if (!compute_ops_->sdpa_q_kvcache(
+        handle, append_row0, append_rows, width, k_base + off, v_base + off,
+        io.q, q_stride, n_q, cache_from, cache_to, num_heads_Q, num_heads_KV,
+        head_dim, window, attn_logit_softcapping, sinks, io.out, q_stride)) {
     return fail("attention");
   }
+  synced = cache_to;
   io.commit(attention_output_step);
   if (!accel_logged_) {
     accel_logged_ = true;

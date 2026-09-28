@@ -18,8 +18,12 @@
 
 #ifdef __hexagon__
 #include "hexkl_micro.h"
+#include "hvx_kv_quant.h"
 #include <AEEStdErr.h>
+#include <HAP_perf.h>
+static inline uint64_t kvq_now_us(void) { return HAP_perf_get_time_us(); }
 #else
+static inline uint64_t kvq_now_us(void) { return 0; }
 // Host build (the unit test): the codes this file returns, with the SDK's
 // values (AEEStdErr.h: AEE_EOFFSET + 0x002 / 0x00E / 0x001).
 #define AEE_SUCCESS 0
@@ -201,13 +205,81 @@ void hexkl_kv_q_stage(hexkl_kv_q *kv, uint32_t n, uint32_t c) {
 }
 
 /**
+ * @brief Where element (row r, col k) of a 32x32 int8 weight tile lands in
+ *        the 1024-byte WH layout, derived at runtime from HexKL's own
+ *        rm_to_wh_i8 the way hexkl_acc_tile derives the accumulator layout:
+ *        bake a tile whose bytes are the low 8 bits of their own index,
+ *        then one whose bytes are the high 2 bits, and read the permutation
+ *        off the two results. With it an appended row is 2 * head_dim
+ *        byte stores per head straight into the tiles -- no 32-row
+ *        re-staging, no HexKL call per token. int4 tiles are nibble-packed
+ *        and keep the re-bake path.
+ */
+#ifdef __hexagon__
+static uint16_t g_wh_i8_pos[1024];
+static int g_wh_i8_state; /* 0 unprobed, 1 usable, -1 not */
+
+static int wh_i8_probe(uint8_t *vtcm_base) {
+  if (g_wh_i8_state != 0) {
+    return g_wh_i8_state == 1;
+  }
+  g_wh_i8_state = -1;
+  int8_t src[1024];
+  uint8_t out[2][1024];
+  for (int pass = 0; pass < 2; ++pass) {
+    for (int i = 0; i < 1024; ++i) {
+      src[i] = (int8_t)(pass ? (i >> 8) : (i & 0xFF));
+    }
+    if (hexkl_micro_hmx_rm_to_wh_i8(vtcm_base, 0u, src, 0u, 0u, 32u) !=
+        AEE_SUCCESS) {
+      return 0;
+    }
+    memcpy(out[pass], vtcm_base, 1024u);
+  }
+  uint8_t seen[1024];
+  memset(seen, 0, sizeof(seen));
+  for (int p = 0; p < 1024; ++p) {
+    const unsigned idx = (unsigned)out[0][p] | ((unsigned)out[1][p] << 8);
+    if (idx >= 1024u || seen[idx]) {
+      return 0;
+    }
+    seen[idx] = 1;
+    g_wh_i8_pos[idx] = (uint16_t)p;
+  }
+  g_wh_i8_state = 1;
+  return 1;
+}
+
+/** @brief Writes one quantized row of head n straight into its int8 WH
+ *         tiles: cache row @a row is column row%32 of the K^T tiles and
+ *         row row%32 of the V tiles of column tile row/32. */
+static void write_row_i8_tiles(hexkl_kv_q *kv, uint32_t n, uint32_t row,
+                               const int8_t *qk, const int8_t *qv) {
+  const uint32_t c = row / 32u, rr = row % 32u;
+  for (uint32_t d = 0; d < kv->n_dot_tiles; ++d) {
+    uint8_t *kt = kv->kt + hexkl_kv_q_tile_off(kv, n, c, d);
+    uint8_t *vt = kv->v + hexkl_kv_q_tile_off(kv, n, c, d);
+    for (uint32_t j = 0; j < 32u; ++j) {
+      kt[g_wh_i8_pos[j * 32u + rr]] = (uint8_t)qk[32u * d + j];
+      vt[g_wh_i8_pos[rr * 32u + j]] = (uint8_t)qv[32u * d + j];
+    }
+  }
+}
+#endif
+
+/**
  * @brief Re-bakes the K^T and V tiles of column tile c of head n from the
  *        staging through a VTCM scratch tile. DSP only: needs HexKL.
  */
 static int bake_col_tile(hexkl_kv_q *kv, uint32_t n, uint32_t c,
-                         uint8_t *vtcm_base) {
+                         uint8_t *vtcm_base, hexkl_kv_q_append_stats *st) {
 #ifdef __hexagon__
+  const uint64_t t0 = kvq_now_us();
   hexkl_kv_q_stage(kv, n, c);
+  const uint64_t t1 = kvq_now_us();
+  if (st) {
+    st->stage_us += (uint32_t)(t1 - t0);
+  }
   const uint32_t tb = kv->tile_bytes;
   for (uint32_t d = 0; d < kv->n_dot_tiles; ++d) {
     int rc;
@@ -235,52 +307,76 @@ static int bake_col_tile(hexkl_kv_q *kv, uint32_t n, uint32_t c,
     }
     memcpy(kv->v + hexkl_kv_q_tile_off(kv, n, c, d), vtcm_base + tb, tb);
   }
+  if (st) {
+    st->bake_us += (uint32_t)(kvq_now_us() - t1);
+  }
   return AEE_SUCCESS;
 #else
   (void)kv;
   (void)n;
   (void)c;
   (void)vtcm_base;
+  (void)st;
   return AEE_EFAILED;
 #endif
 }
 
 int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
                       uint32_t n_rows, const uint16_t *k_rows,
-                      const uint16_t *v_rows, uint8_t *vtcm_base) {
+                      const uint16_t *v_rows, uint8_t *vtcm_base,
+                      hexkl_kv_q_append_stats *st) {
   hexkl_kv_q *kv = (hexkl_kv_q *)hexkl_kv_q_get(tbl, handle);
   if (!kv || !k_rows || !v_rows || n_rows == 0 ||
       row0 + n_rows > kv->max_rows || row0 + n_rows < row0) {
     return AEE_EBADPARM;
   }
+  if (st) {
+    memset(st, 0, sizeof(*st));
+  }
+  const uint64_t tq0 = kvq_now_us();
   const uint32_t hd = kv->head_dim;
   const uint32_t stride = kv->n_head_kv * hd;
+#ifndef __hexagon__
   float x[256];
+#endif
   int8_t q[256];
+  int8_t qk_row[256];
   float sv[8];
+  int direct = 0;
+#ifdef __hexagon__
+  direct = vtcm_base && kv->kind == HEXKL_KV_Q8 && wh_i8_probe(vtcm_base);
+#endif
 
   for (uint32_t r = 0; r < n_rows; ++r) {
     const uint32_t row = row0 + r;
     const uint16_t *krow = k_rows + (size_t)r * stride;
     const uint16_t *vrow = v_rows + (size_t)r * stride;
     for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
+      float sk;
+      int32_t cs;
+#ifdef __hexagon__
+      hvx_kv_quant_k_row(krow + n * hd, hd, kv->qmax, qk_row, &sk, &cs);
+#else
       for (uint32_t d = 0; d < hd; ++d) {
         x[d] = hexkl_kv_q_hf_to_f32(krow[n * hd + d]);
       }
-      float sk;
-      int32_t cs;
-      hexkl_kv_q_quant_k_row(x, hd, kv->qmax, q, &sk, &cs);
+      hexkl_kv_q_quant_k_row(x, hd, kv->qmax, qk_row, &sk, &cs);
+#endif
       kv->s_k[hexkl_kv_q_sk_index(kv, n, row)] = sk;
       kv->colsum_k[hexkl_kv_q_sk_index(kv, n, row)] = cs;
       for (uint32_t d = 0; d < hd; ++d) {
         kv->kt4[hexkl_kv_q_kt4_index(kv, n, row, d)] =
-          (uint8_t)(q[d] + HEXKL_KV_Q_BIAS);
+          (uint8_t)(qk_row[d] + HEXKL_KV_Q_BIAS);
       }
 
+#ifdef __hexagon__
+      hvx_kv_quant_v_row(vrow + n * hd, hd, kv->qmax, q, sv);
+#else
       for (uint32_t d = 0; d < hd; ++d) {
         x[d] = hexkl_kv_q_hf_to_f32(vrow[n * hd + d]);
       }
       hexkl_kv_q_quant_v_row(x, hd, kv->qmax, q, sv);
+#endif
       for (uint32_t g = 0; g < kv->n_dot_tiles; ++g) {
         kv->s_v[hexkl_kv_q_sv_index(kv, n, row, g)] = sv[g];
       }
@@ -288,17 +384,25 @@ int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
         kv->v4[hexkl_kv_q_v4_index(kv, n, row, d)] =
           (uint8_t)(q[d] + HEXKL_KV_Q_BIAS);
       }
+#ifdef __hexagon__
+      if (direct) {
+        write_row_i8_tiles(kv, n, row, qk_row, q);
+      }
+#endif
     }
   }
 
-  if (!vtcm_base) {
+  if (st) {
+    st->quant_us = (uint32_t)(kvq_now_us() - tq0);
+  }
+  if (!vtcm_base || direct) {
     return AEE_SUCCESS;
   }
   const uint32_t c_lo = row0 / 32u;
   const uint32_t c_hi = (row0 + n_rows - 1u) / 32u;
   for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
     for (uint32_t c = c_lo; c <= c_hi; ++c) {
-      const int rc = bake_col_tile(kv, n, c, vtcm_base);
+      const int rc = bake_col_tile(kv, n, c, vtcm_base, st);
       if (rc != AEE_SUCCESS) {
         return rc;
       }

@@ -98,7 +98,7 @@ int nntr_hvx_kv_append_q(remote_handle64 handle, uint32 kv_handle, uint32 row0,
   }
   return hexkl_kv_q_append(&s->kv_q, kv_handle, row0,
                            (uint32_t)k_rowsLen / stride, k_rows, v_rows,
-                           s->vtcm_base);
+                           s->vtcm_base, NULL);
 }
 
 int nntr_hvx_kv_dump_q(remote_handle64 handle, uint32 kv_handle, uint32 row0,
@@ -335,5 +335,88 @@ int nntr_hvx_attn_q_decode(remote_handle64 handle, uint32 kv_handle, uint32 n_q,
   }
   stats_us[0] = (uint32)us;
   stats_us[1] = (uint32)((HAP_perf_get_pcycles() - c0) / 1000u);
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_attn_q_step(remote_handle64 handle, uint32 kv_handle, uint32 row0,
+                         const uint16 *k_rows, int k_rowsLen,
+                         const uint16 *v_rows, int v_rowsLen, uint32 n_q,
+                         uint32 cache_from, uint32 cache_to, uint32 n_head_q,
+                         uint32 window, float softcap, const float *q_f32,
+                         int q_f32Len, const float *sinks, int sinksLen,
+                         float *out_f32, int out_f32Len, uint32 *stats_us,
+                         int stats_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  const hexkl_kv_q *kv = hexkl_kv_q_get(&s->kv_q, kv_handle);
+  if (!kv || cache_to > kv->max_rows || stats_usLen < 8) {
+    FARF(ERROR, "attn_q_step: bad handle, cache_to or stats");
+    return AEE_EBADPARM;
+  }
+  hexkl_kv_q_append_stats ast;
+  memset(&ast, 0, sizeof(ast));
+  const uint64_t t0 = HAP_perf_get_time_us();
+  const uint32_t stride = kv->n_head_kv * kv->head_dim;
+  if (k_rowsLen != v_rowsLen || k_rowsLen < 0 ||
+      ((uint32_t)k_rowsLen % stride) != 0) {
+    FARF(ERROR, "attn_q_step: bad row lengths");
+    return AEE_EBADPARM;
+  }
+  if (k_rowsLen > 0) {
+    const int rc =
+      hexkl_kv_q_append(&s->kv_q, kv_handle, row0, (uint32_t)k_rowsLen / stride,
+                        k_rows, v_rows, s->vtcm_base, &ast);
+    if (rc != AEE_SUCCESS) {
+      FARF(ERROR, "attn_q_step: append failed: 0x%08x", rc);
+      return rc;
+    }
+  }
+  const uint64_t t1 = HAP_perf_get_time_us();
+
+  hexkl_attn_f16_shape shape = {n_q,           cache_from,   cache_to, n_head_q,
+                                kv->n_head_kv, kv->head_dim, window,   softcap};
+  const uint64_t q_elems = (uint64_t)n_q * n_head_q * kv->head_dim;
+  if ((uint64_t)q_f32Len != q_elems || (uint64_t)out_f32Len != q_elems ||
+      (sinksLen != 0 && (uint32)sinksLen != n_head_q)) {
+    FARF(ERROR, "attn_q_step: bad lengths");
+    return AEE_EBADPARM;
+  }
+  hexkl_attn_q_io io;
+  memset(&io, 0, sizeof(io));
+  io.q = q_f32;
+  io.q_stride = n_head_q * kv->head_dim;
+  io.sinks = sinksLen ? sinks : NULL;
+  io.out = out_f32;
+  io.out_stride = n_head_q * kv->head_dim;
+  io.kv = kv;
+
+  int res;
+  const int decode = n_q < 5u && kv->head_dim <= 128u;
+  if (decode) {
+    res = hvx_attn_decode_q(&shape, &io, s->quant_pool, NULL);
+  } else {
+    hexkl_attn_f16_tiling tiling = {0, 0, 0, 0};
+    hexkl_attn_f16_choose_tiling(&shape, &tiling);
+    if (hexkl_attn_q_tiling_init(&shape, &tiling) != HEXKL_ATTN_OK) {
+      return AEE_EBADPARM;
+    }
+    res = hexkl_attn_q_prefill(s->vtcm_base, s->config_off, &shape, &tiling,
+                               &io, s->quant_pool, NULL);
+  }
+  if (res != AEE_SUCCESS) {
+    FARF(ERROR, "attn_q_step: kernel failed: 0x%08x", res);
+    return res;
+  }
+  const uint64_t t2 = HAP_perf_get_time_us();
+  stats_us[0] = (uint32)(t1 - t0);
+  stats_us[1] = (uint32)(t2 - t1);
+  stats_us[2] = decode ? 0u : 1u;
+  stats_us[3] = (uint32)(t2 - t0);
+  stats_us[4] = ast.quant_us;
+  stats_us[5] = ast.stage_us;
+  stats_us[6] = ast.bake_us;
+  stats_us[7] = (uint32)((uint32_t)k_rowsLen / stride);
   return AEE_SUCCESS;
 }
