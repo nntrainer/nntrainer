@@ -526,6 +526,82 @@ TEST_F(HvxM1Ops, ConvGateM1MatchesDetBitExact) {
   EXPECT_EQ(bad_state, 0) << "the conv state shift differs from the spec";
 }
 
+/**
+ * @brief [#132] The MoE router at K 2048 / E 32 / top 4 (LFM2.5) and K 128
+ *        and 64 / E 4 / top 2 (the fixtures), on random, exact-tie and
+ *        1-ulp near-tie rows (m1_ops_host_check's construction): logits,
+ *        selection order and routing weights bit for bit against
+ *        m1_router_topk_det. A bad count in logits alone puts the
+ *        divergence in the GEMV; clean logits with bad weights put it in
+ *        exp_det / recip_det; a bad selection with clean logits is the tie
+ *        rule. 0x8000040e is a skel that predates the method (rule 3).
+ */
+TEST_F(HvxM1Ops, RouterTopkMatchesDetBitExact) {
+  struct Shape {
+    uint32_t K, E, top_k;
+  };
+  std::mt19937 rng(0x13200001u);
+  std::uniform_real_distribution<float> xd(-2.0f, 2.0f), wd(-0.05f, 0.05f),
+    bd(-0.01f, 0.01f);
+  for (const Shape sh :
+       {Shape{2048u, 32u, 4u}, Shape{128u, 4u, 2u}, Shape{64u, 4u, 2u}}) {
+    const uint32_t K = sh.K, E = sh.E, top_k = sh.top_k;
+    int bad_logits = 0, bad_sel = 0, bad_weight = 0;
+    for (int kind = 0; kind < 3; ++kind) {
+      for (int rep = 0; rep < 8; ++rep) {
+        std::vector<float> x(K), w(static_cast<size_t>(K) * E), bias(E);
+        for (auto &v : x)
+          v = xd(rng);
+        for (auto &v : w)
+          v = wd(rng);
+        for (auto &v : bias)
+          v = bd(rng);
+        if (kind != 0) {
+          // e1 < e2 share a column and meet at the last selected place
+          const uint32_t e1 = rng() % (E - 1u);
+          const uint32_t e2 = e1 + 1u + rng() % (E - 1u - e1);
+          for (uint32_t k = 0; k < K; ++k)
+            w[static_cast<size_t>(k) * E + e2] =
+              w[static_cast<size_t>(k) * E + e1];
+          for (uint32_t e = 0, n = 0; e < E && n + 1u < top_k; ++e) {
+            if (e != e1 && e != e2) {
+              bias[e] = 2.0f;
+              ++n;
+            }
+          }
+          bias[e1] = 1.0f;
+          bias[e2] = kind == 1 ? 1.0f : std::nextafter(1.0f, 2.0f);
+        }
+        std::vector<float> logits(E, 0.0f), weight(top_k, 0.0f);
+        std::vector<uint32_t> sel(top_k, 0u);
+        const int err = nntr_hvx_router_topk_det_f32(
+          handle_, top_k, x.data(), static_cast<int>(K), w.data(),
+          static_cast<int>(w.size()), bias.data(), static_cast<int>(E),
+          logits.data(), static_cast<int>(E), sel.data(),
+          static_cast<int>(top_k), weight.data(), static_cast<int>(top_k));
+        ASSERT_EQ(err, AEE_SUCCESS)
+          << "router_topk_det_f32 failed: " << hex(err)
+          << " (0x8000040e = stale skel, rule 3)";
+        std::vector<float> logits_ref(E), weight_ref(top_k);
+        std::vector<uint32_t> sel_ref(top_k);
+        m1_router_topk_det(x.data(), w.data(), bias.data(), K, E, top_k,
+                           logits_ref.data(), sel_ref.data(),
+                           weight_ref.data());
+        bad_logits += m1_count_bad(logits, logits_ref, "router logits");
+        bad_weight += m1_count_bad(weight, weight_ref, "router weight");
+        bad_sel += sel == sel_ref ? 0 : 1;
+      }
+    }
+    std::cout << "M1_OPS_FIELD router_topk K=" << K << " E=" << E
+              << " top_k=" << top_k << " rows=24 bad_logits=" << bad_logits
+              << " bad_sel=" << bad_sel << " bad_weight=" << bad_weight
+              << std::endl;
+    EXPECT_EQ(bad_logits, 0) << "K " << K << ": logits differ from the spec";
+    EXPECT_EQ(bad_sel, 0) << "K " << K << ": the selection differs";
+    EXPECT_EQ(bad_weight, 0) << "K " << K << ": routing weights differ";
+  }
+}
+
 TEST_F(HvxExp, RejectsNonVectorLength) {
   const int n = 33;
   std::vector<float> in(n, 1.0f), out(n, 0.0f);

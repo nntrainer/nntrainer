@@ -5,7 +5,8 @@
  * @file   nntr_hvx_small_ops.c
  * @date   27 Sep 2026
  * @brief  DSP-side test entries for the M=1 small ops (hvx_m1_ops_f32.c):
- *         RMSNorm / per-head norm, RoPE at head_dim 64, conv1d + gate
+ *         RMSNorm / per-head norm, RoPE at head_dim 64, conv1d + gate, the
+ *         MoE router (#132)
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
@@ -19,6 +20,7 @@
 #include <AEEStdErr.h>
 #include <HAP_farf.h>
 #include <remote.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "nntr_hvx.h"
@@ -92,5 +94,39 @@ int nntr_hvx_conv_gate_m1_f32(remote_handle64 handle, const float *abc,
   }
   memcpy(state_out, state_in, (size_t)sLen * sizeof(float));
   hvx_conv_gate_m1_f32(abc, state_out, conv_w, y, C);
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_router_topk_det_f32(remote_handle64 handle, uint32 top_k,
+                                 const float *x, int xLen, const float *w,
+                                 int wLen, const float *bias, int biasLen,
+                                 float *logits, int logitsLen, uint32 *sel,
+                                 int selLen, float *weight, int weightLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  const uint32_t K = (xLen > 0) ? (uint32_t)xLen : 0u;
+  const uint32_t E = (biasLen > 0) ? (uint32_t)biasLen : 0u;
+  if (K == 0u || K % 4u != 0u || E == 0u || E > LANES || top_k == 0u ||
+      top_k > E || (uint32)wLen != K * E || (uint32)logitsLen != E ||
+      (uint32)selLen != top_k || (uint32)weightLen != top_k) {
+    FARF(ERROR,
+         "router_topk_det_f32: bad shape (top_k=%u x=%d w=%d bias=%d "
+         "logits=%d sel=%d weight=%d)",
+         (unsigned)top_k, xLen, wLen, biasLen, logitsLen, selLen, weightLen);
+    return AEE_EINVALIDFORMAT;
+  }
+  /* the kernel reads one 32-lane vector per weight row */
+  float *w32 = (float *)calloc((size_t)K * LANES, sizeof(float));
+  if (w32 == NULL) {
+    return AEE_ENOMEMORY;
+  }
+  for (uint32_t k = 0; k < K; ++k) {
+    memcpy(w32 + (size_t)k * LANES, w + (size_t)k * E, E * sizeof(float));
+  }
+  hvx_router_topk_f32(x, w32, bias, K, E, top_k, logits, (uint32_t *)sel,
+                      weight);
+  free(w32);
   return AEE_SUCCESS;
 }
