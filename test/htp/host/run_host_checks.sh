@@ -215,7 +215,8 @@ fi
 # hvx_emu/ with the REAL worker pool on pthreads (stub/qurt.h) at 0, 3 and
 # 7 workers, memcmp'd against nntrainer/tensor/attn_m1_det.h for L = 1,
 # 63, 64, 65, 512, 1024 at the shapes (n_kv, gqa, head_dim) = (8, 4, 64),
-# (1, 2, 64) and (2, 3, 32) (#146: the specialised and the generic paths),
+# (1, 2, 64), (2, 3, 32) and (2, 2, 32) (#146: the specialised path and
+# both runtime-shape copies),
 # plus append-chain == bulk, the L = 1 case and the error codes; the spec
 # against a double reference within 2^-13 max|V|; and the phase words
 # (#146), which must leave the output bytes alone (ATTN M1 PHASES OK).

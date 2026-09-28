@@ -16,14 +16,14 @@
  *  1. BIT IDENTITY. hvx_attn_m1_f32.c -- the skel's own source, not a
  *     stand-in -- runs on the lane-by-lane emulation with the pthread
  *     worker pool (stub/qurt.h) at 0, 3 and 7 workers, and is memcmp'd
- *     against the scalar spec for L = 1, 63, 64, 65, 512, 1024 at three
+ *     against the scalar spec for L = 1, 63, 64, 65, 512, 1024 at four
  *     shapes (n_kv, gqa, head_dim) -- LFM2.5's (8, 4, 64), the hd64
- *     fixture's (1, 2, 64) and (2, 3, 32), which only the generic path
- *     serves (#146) -- at max_seq 1024, and LFM2.5 once at 2048. The three
- *     worker counts must agree byte for byte: the head split is
- *     deterministic by construction and this proves it. Each forward is
- *     repeated with the phase words requested (#146): the same bytes out,
- *     every word taken (ATTN M1 PHASES OK).
+ *     fixture's (1, 2, 64), and (2, 3, 32) and (2, 2, 32), which only the
+ *     runtime-shape copies serve (#146) -- at max_seq 1024, and LFM2.5
+ *     once at 2048. The three worker counts must agree byte for byte: the
+ *     head split is deterministic by construction and this proves it. Each
+ *     forward is repeated with the phase words requested (#146): the same
+ *     bytes out, every word taken (ATTN M1 PHASES OK).
  *     Two structural cases: an append chain of L forward calls leaves the
  *     cache byte-equal to one kv_append of L rows and the same last
  *     output; at L = 1 the output is v * recip_det(1.0f) bit for bit
@@ -77,8 +77,10 @@ static uint32_t g_seed;
 static int N_KV, GQA, HD, N_Q;
 /** @brief (n_kv, gqa, head_dim): LFM2.5 first (the specialised path, and
  *         the shape of the append-chain, identity and error cases), the
- *         hd64 fixture's, and one the kernel serves on its generic path. */
-static const int SHAPES[3][3] = {{8, 4, 64}, {1, 2, 64}, {2, 3, 32}};
+ *         hd64 fixture's, one per kv head on the generic copy (odd gqa),
+ *         and q-head pairs at a runtime head_dim. */
+static const int SHAPES[4][3] = {
+  {8, 4, 64}, {1, 2, 64}, {2, 3, 32}, {2, 2, 32}};
 
 static void set_shape(const int *shape) {
   g_seed = 0x81810001u; /* every shape sees the same input stream */
