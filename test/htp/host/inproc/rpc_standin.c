@@ -109,6 +109,15 @@ static rpc_buf *buf_of_fd(int fd) {
   return g_bufs[fd - RPC_FD_BASE].ptr ? &g_bufs[fd - RPC_FD_BASE] : NULL;
 }
 
+/** @brief [#141] The address behind a fastrpc_mmap'd fd, NULL when the fd
+ *  is unknown or not mapped: dspqueue_standin.c's buffer references
+ *  resolve through this, with the device's own rule. */
+void *rpc_standin_mapped_ptr(int fd);
+void *rpc_standin_mapped_ptr(int fd) {
+  const rpc_buf *b = buf_of_fd(fd);
+  return (b && b->mapped) ? b->ptr : NULL;
+}
+
 /* ---- remote.h: the session controls and the fd mapping ---- */
 EXPORT int remote_session_control(uint32_t req, void *data, uint32_t len) {
   (void)req, (void)data, (void)len;
