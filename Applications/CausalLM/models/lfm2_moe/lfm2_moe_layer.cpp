@@ -757,16 +757,24 @@ static bool tryMoeLayerOnAccelerator(
         need.push_back(key);
         expert_of[key] = e;
       }
+      // [doc 52 section 10.23] acquire() frees every slot the misses need
+      // before it names the first miss, so the misses are gathered and
+      // loaded together after it: one registration round trip, not one
+      // per expert. Nothing reads them before the call below.
+      std::vector<ExpertFileDesc> missed;
       g_m0.misses += g_expert_lru.acquire(
         need,
         [&](causallm::ExpertLru::Key k) {
           const size_t e = expert_of[k];
-          loadVirtualExpert(ops,
-                            expertDesc(context.getWeight(gate_up_indices[e]),
-                                       context.getWeight(down_indices[e])),
-                            /*at_load=*/false);
+          missed.push_back(expertDesc(context.getWeight(gate_up_indices[e]),
+                                      context.getWeight(down_indices[e])));
         },
         release);
+      if (!missed.empty() && !ops->register_qs4cx_wh_expert_files(missed)) {
+        throw std::runtime_error(
+          "this engine cannot load a virtual expert from the model file "
+          "(register_qs4cx_wh_expert_files); unset NNTR_MOE_CACHE_EXPERTS");
+      }
     }
     for (size_t e : group) {
       if (experts_virtual) { // the tensor's address is the key, no scale
