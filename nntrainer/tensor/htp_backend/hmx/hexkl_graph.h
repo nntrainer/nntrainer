@@ -5,7 +5,8 @@
  * @file   hexkl_graph.h
  * @date   23 Sep 2026
  * @brief  The session's validated decode op table and its forward loop
- *         (#85), with the small ops and m=1 attention resident (#130)
+ *         (#85), with the small ops and m=1 attention resident (#130),
+ *         the residual add and the router (#132)
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
@@ -16,10 +17,13 @@
  * table; forward then runs `for op from start: if !resident break;
  * table[kind]()` and reports where it stopped. The kernel table holds
  * MOE (hexkl_mm_u8i4_moe_layer_run unchanged), RMSNORM / QK_NORM / ROPE /
- * CONV1D_GATE (#82's hvx_m1_ops_f32.c) and ATTN_M1 (#81's
- * hvx_attn_m1_f32.c over the session's cache, borrowed through the env).
- * The small ops' parameters -- gammas, conv weights, the conv state seed,
- * the RoPE table -- are bound once after init through
+ * CONV1D_GATE (#82's hvx_m1_ops_f32.c), ATTN_M1 (#81's
+ * hvx_attn_m1_f32.c over the session's cache, borrowed through the env),
+ * ADD (hvx_scale_add_rows_f32 at scale 1 into slot 0, the residual) and
+ * ROUTER_TOPK (hvx_router_topk_f32, whose routing the next MOE op
+ * consumes in the same call; #132). The small ops' parameters -- gammas,
+ * conv weights, the conv state seed, the RoPE table, the router weight
+ * and bias -- are bound once after init through
  * hexkl_graph_set_param (plan 130 section 3.1); forward refuses an op
  * whose parameter is missing with AEE_EBADSTATE.
  */
@@ -48,9 +52,10 @@ typedef struct {
                                  fails with AEE_EBADSTATE */
 } hexkl_graph_env;
 
-/** @brief The start op's per-call side input while the router stays on
- *  the ARM: the MoE routing of this token, in mm_u8i4_moe_layer's layout.
- *  Empty (n_rows 0, n_experts 0) once ROUTER_TOPK is resident. */
+/** @brief The MoE routing of this token, in mm_u8i4_moe_layer's layout:
+ *  the start op's per-call side input while the router stays on the ARM
+ *  (empty -- n_rows 0, n_experts 0 -- otherwise), or the graph's own
+ *  route_* record once a resident ROUTER_TOPK op has filled it (#132). */
 typedef struct {
   const uint32_t *row_index;
   const uint32_t *row_count;
@@ -72,6 +77,11 @@ typedef struct {
                                             conv state, row 2 scratch) */
   uint32_t ordinal[HTP_GRAPH_MAX_OPS]; /**< ATTN_M1: the attention-layer
                                             index the cache is keyed by */
+  /** The last ROUTER_TOPK op's routing (#132), in expert order: rewritten
+   *  by every router op, read by the MOE op after it. */
+  uint32_t route_idx[HTP_GRAPH_MAX_EXPERTS];
+  uint32_t route_cnt[HTP_GRAPH_MAX_EXPERTS];
+  float route_w[HTP_GRAPH_MAX_EXPERTS];
 } hexkl_graph;
 
 /** @brief HTP_GRAPH_KIND_BIT mask of the kinds whose table slot is
@@ -121,8 +131,8 @@ int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle);
  * @a routing is consumed by the first MoE op run; a second MoE op in the
  * same call, or a MoE op with no routing, fails with AEE_EBADSTATE.
  * @return 0, AEE_EBADSTATE (no graph, routing; a RMSNORM / QK_NORM /
- *         CONV1D_GATE op with no parameter or state bound, a ROPE op with
- *         no table, an ATTN_M1 op with no cache in @a env, or the cache
+ *         CONV1D_GATE / ROUTER_TOPK op with no parameter or state bound, a ROPE
+ * op with no table, an ATTN_M1 op with no cache in @a env, or the cache
  *         kernel's own hole), HTP_GRAPH_E_BADITEM (start_op past the
  *         list, pos >= max_seq), HTP_GRAPH_E_INVALIDFORMAT (an act length
  *         or the routing's shape disagrees with the op), or the kernel's

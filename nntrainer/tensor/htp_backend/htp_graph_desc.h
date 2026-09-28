@@ -135,12 +135,16 @@ static inline const char *htp_graph_kinds_str(uint32_t mask, char *buf,
  *  2 x head_dim (q gamma | k gamma) for QK_NORM; CONV_W is 3 x N
  *  (w0 | w1 | w2) and CONV_STATE 2 x N (x_{t-2} | x_{t-1}) for
  *  CONV1D_GATE; ROPE_TABLE is max_seq x 64 (cos[32] | sin[32] per
- *  position) with op == HTP_GRAPH_NO_OP. */
+ *  position) with op == HTP_GRAPH_NO_OP; ROUTER_W is K x n_experts
+ *  (the gate weight, row-major [K][E]) and ROUTER_BIAS n_experts for
+ *  ROUTER_TOPK (#132). Append, never reorder. */
 enum {
   HTP_GRAPH_PARAM_GAMMA = 0,
   HTP_GRAPH_PARAM_CONV_W,
   HTP_GRAPH_PARAM_CONV_STATE,
   HTP_GRAPH_PARAM_ROPE_TABLE,
+  HTP_GRAPH_PARAM_ROUTER_W,
+  HTP_GRAPH_PARAM_ROUTER_BIAS,
   HTP_GRAPH_PARAM_N
 };
 
@@ -291,13 +295,21 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         must be a power of two too -- gqa <= 8, max_seq a multiple of
  *         32; ROPE: head_dim 64), NOTALLOWED for a resident
  *         ATTN_M1 whose layer's ROPE is not resident (the DSP stretch must
- *         apply RoPE, since mha_core does on the CPU)
+ *         apply RoPE, since mha_core does on the CPU). #132's rules: an ADD
+ *         writes slot 0 and reads another slot (INVALIDFORMAT: slot 0 is
+ *         its implicit second operand, the residual); a resident ADD needs
+ *         every RMSNORM resident (NOTALLOWED: slot 0 holds the residual
+ *         across calls only if op 0 seeds it each token and no CPU norm
+ *         leaves a stretch start that would re-seed it); a resident
+ *         ROUTER_TOPK needs the next op, its MOE, resident (NOTALLOWED:
+ *         the routing has no other consumer)
  */
 static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
                                           uint32_t resident_ok,
                                           uint32_t *n_ops_out) {
   uint32_t n_layers, n_ops, hidden, vocab, max_seq, i, prev_layer = 0;
   uint32_t attn_layer = HTP_GRAPH_NO_OP, attn_stage = 0, rope_resident = 0;
+  uint32_t add_resident = 0, rmsnorm_cpu = 0;
   if (w == NULL || n_words < HTP_GRAPH_HEADER_WORDS)
     return HTP_GRAPH_E_INCOMPLETEITEM;
   if (w[0] != HTP_GRAPH_MAGIC)
@@ -369,6 +381,8 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     case HTP_OP_ADD:
       if (op->N != hidden || (k == HTP_OP_ADD && op->K != hidden))
         return HTP_GRAPH_E_INVALIDFORMAT;
+      if (k == HTP_OP_ADD && (op->out_slot != 0u || op->in_slot == 0u))
+        return HTP_GRAPH_E_INVALIDFORMAT;
       break;
     case HTP_OP_ROUTER_TOPK:
       if (op->K != hidden || op->N != op->n_experts || op->n_experts == 0u ||
@@ -432,6 +446,12 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     if (k == HTP_OP_RMSNORM && op->resident != 0u &&
         (op->K % 32u != 0u || (op->K & (op->K - 1u)) != 0u))
       return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
+    if (k == HTP_OP_ROUTER_TOPK && op->resident != 0u &&
+        (i + 1u >= n_ops || htp_graph_op_cat(w, i + 1u)->kind != HTP_OP_MOE ||
+         htp_graph_op_cat(w, i + 1u)->resident == 0u))
+      return HTP_GRAPH_E_NOTALLOWED;
+    add_resident |= k == HTP_OP_ADD && op->resident != 0u;
+    rmsnorm_cpu |= k == HTP_OP_RMSNORM && op->resident == 0u;
     if (op->next_mm != HTP_GRAPH_NO_OP &&
         (op->next_mm <= i || op->next_mm >= n_ops ||
          !htp_graph_kind_streams_weights(
@@ -440,6 +460,8 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     if (op->resident != 0u && (resident_ok & HTP_GRAPH_KIND_BIT(k)) == 0u)
       return HTP_GRAPH_E_CLASSNOTSUPPORT;
   }
+  if (add_resident && rmsnorm_cpu)
+    return HTP_GRAPH_E_NOTALLOWED;
   if (n_ops_out != NULL)
     *n_ops_out = n_ops;
   return 0u;

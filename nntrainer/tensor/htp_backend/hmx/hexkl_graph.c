@@ -5,7 +5,8 @@
  * @file   hexkl_graph.c
  * @date   23 Sep 2026
  * @brief  The session's validated decode op table and its forward loop
- *         (#85), with the small ops and m=1 attention resident (#130)
+ *         (#85), with the small ops and m=1 attention resident (#130),
+ *         the residual add and the router (#132)
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
@@ -16,9 +17,11 @@
  * words is the widest resident op), plus the parameters bound through
  * hexkl_graph_set_param -- about 1.8 MiB at LFM2.5 (49 gammas of 8 KiB,
  * 18 x (24 + 24) KiB conv weight and state, a 512 KiB RoPE table at
- * max_seq 2048; plan 82 section 3.4) -- all DSP heap, no arena, no VTCM,
- * no DMA. The 48 MiB KV cache the ATTN_M1 op reads is the session's
- * (hvx_attn_m1_f32.h's budget note), borrowed through the env.
+ * max_seq 2048; plan 82 section 3.4) -- plus, with ROUTER_TOPK resident
+ * (#132), 22 router weights padded to [2048][32] f32, 256 KiB each, 5.5
+ * MiB -- all DSP heap, no arena, no VTCM, no DMA. The 48 MiB KV cache the
+ * ATTN_M1 op reads is the session's (hvx_attn_m1_f32.h's budget note), borrowed
+ * through the env.
  */
 
 #include "hexkl_graph.h"
@@ -30,6 +33,7 @@
 #include <HAP_perf.h>
 
 #include "hvx_m1_ops_f32.h"
+#include "hvx_scale_add_f32.h"
 
 /* htp_graph_desc.h restates the SDK's codes so it can be built with no
    SDK; here both are in scope, so a drift is a build error. */
@@ -185,6 +189,51 @@ static int graph_op_attn_m1(hexkl_graph *g, const htp_graph_op *op,
                              in + n_q + n_k, out, NULL);
 }
 
+/* ---- #132: the residual add and the router ------------------------------ */
+
+/* out is slot 0, the residual (the validator's rule): slot 0 += in * 1.
+   x * 1 is exact and the add rounds once, which is the CPU's copy +
+   add_i bit for bit. */
+static int graph_op_add(hexkl_graph *g, const htp_graph_op *op,
+                        graph_call *call, const float *in, float *out) {
+  (void)g;
+  (void)call;
+  hvx_scale_add_rows_f32(out, in, 1.0f, op->N);
+  return AEE_SUCCESS;
+}
+
+/* The logits go to the out slot (nothing reads them); the routing goes to
+   g->route_* in ascending expert order -- tryMoeLayerOnAccelerator's
+   grouping -- and the call's routing points at it for the MOE op next. */
+static int graph_op_router_topk(hexkl_graph *g, const htp_graph_op *op,
+                                graph_call *call, const float *in, float *out) {
+  const uint32_t i = (uint32_t)(op - g->ops);
+  uint32_t sel[HTP_GRAPH_MAX_EXPERTS], e, r, n = 0;
+  float w[HTP_GRAPH_MAX_EXPERTS], by_expert[HTP_GRAPH_MAX_EXPERTS];
+  if (g->param[i] == NULL || g->state[i] == NULL) {
+    return AEE_EBADSTATE;
+  }
+  hvx_router_topk_f32(in, g->param[i], g->state[i], op->K, op->n_experts,
+                      op->top_k, out, sel, w);
+  memset(g->route_cnt, 0, sizeof(g->route_cnt));
+  for (r = 0; r < op->top_k; ++r) {
+    g->route_cnt[sel[r]] = 1u;
+    by_expert[sel[r]] = w[r];
+  }
+  for (e = 0; e < op->n_experts; ++e) {
+    if (g->route_cnt[e] != 0u) {
+      g->route_idx[n] = 0u;
+      g->route_w[n++] = by_expert[e];
+    }
+  }
+  call->routing.row_index = g->route_idx;
+  call->routing.row_count = g->route_cnt;
+  call->routing.row_weight = g->route_w;
+  call->routing.n_rows = n;
+  call->routing.n_experts = op->n_experts;
+  return AEE_SUCCESS;
+}
+
 /** @brief The kernel table: a NULL slot is a kind this build does not run
  *  (hvx_impl's htp_op_table rule); the validator refuses a resident bit on
  *  it with AEE_ECLASSNOTSUPPORT, so forward never reaches a NULL. */
@@ -195,8 +244,8 @@ static const graph_kernel kernels[HTP_OP_KIND_N] = {
   graph_op_qk_norm,     /* QK_NORM      #82 */
   graph_op_rope,        /* ROPE         #82 */
   graph_op_attn_m1,     /* ATTN_M1      #81 */
-  NULL,                 /* ADD */
-  NULL,                 /* ROUTER_TOPK */
+  graph_op_add,         /* ADD          #132 */
+  graph_op_router_topk, /* ROUTER_TOPK  #132 */
   graph_op_moe,         /* MOE */
   NULL,                 /* DENSE_FFN */
   NULL,                 /* LM_HEAD */
@@ -310,6 +359,10 @@ static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which) {
     return op->kind == HTP_OP_CONV1D_GATE ? 3u * op->N : 0u;
   case HTP_GRAPH_PARAM_CONV_STATE:
     return op->kind == HTP_OP_CONV1D_GATE ? 2u * op->N : 0u;
+  case HTP_GRAPH_PARAM_ROUTER_W:
+    return op->kind == HTP_OP_ROUTER_TOPK ? op->K * op->n_experts : 0u;
+  case HTP_GRAPH_PARAM_ROUTER_BIAS:
+    return op->kind == HTP_OP_ROUTER_TOPK ? op->n_experts : 0u;
   default:
     return 0u;
   }
@@ -339,12 +392,34 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
     if (want == 0u) {
       return AEE_EINVALIDFORMAT;
     }
-    /* the conv state buffer is 3 rows: the kernel's scratch is row 2 */
+    /* the conv state buffer is 3 rows: the kernel's scratch is row 2; the
+       router bias shares the state pointer (a ROUTER_TOPK op has none) */
     alloc = (which == HTP_GRAPH_PARAM_CONV_STATE) ? 3u * g->ops[op].N : want;
-    dst = (which == HTP_GRAPH_PARAM_CONV_STATE) ? &g->state[op] : &g->param[op];
+    dst = (which == HTP_GRAPH_PARAM_CONV_STATE ||
+           which == HTP_GRAPH_PARAM_ROUTER_BIAS)
+            ? &g->state[op]
+            : &g->param[op];
   }
   if (n != want) {
     return AEE_EINVALIDFORMAT;
+  }
+  if (which == HTP_GRAPH_PARAM_ROUTER_W) {
+    /* one vector per weight row: [K][E] padded to [K][32], zero lanes */
+    const uint32_t K = g->ops[op].K, E = g->ops[op].n_experts;
+    uint32_t k;
+    if (*dst == NULL) {
+      *dst = (float *)memalign(128, (size_t)K * HTP_GRAPH_MAX_EXPERTS *
+                                      sizeof(float));
+      if (*dst == NULL) {
+        return AEE_ENOMEMORY;
+      }
+    }
+    memset(*dst, 0, (size_t)K * HTP_GRAPH_MAX_EXPERTS * sizeof(float));
+    for (k = 0; k < K; ++k) {
+      memcpy(*dst + (size_t)k * HTP_GRAPH_MAX_EXPERTS, data + (size_t)k * E,
+             (size_t)E * sizeof(float));
+    }
+    return AEE_SUCCESS;
   }
   if (*dst == NULL) {
     *dst = (float *)calloc(alloc, sizeof(float));

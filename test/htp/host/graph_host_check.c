@@ -37,7 +37,13 @@
    [CONV1D_GATE] chain from a seeded state, [QK_NORM ROPE ATTN_M1] at four
    positions after a kv_append seed -- plus resume_at, the builder's slot
    routing, the per-op pcycles and the forward-time refusals (a missing
-   parameter, state, table or cache, and the cache's hole). */
+   parameter, state, table or cache, and the cache's hole).
+
+   #132, same shapes with MOE on the stand-in: [ADD RMSNORM] after an op-0
+   RMSNORM seeded slot 0, and [ADD RMSNORM ROUTER_TOPK MOE ADD RMSNORM]
+   across a layer boundary, against the scalar composition -- slot 0 as
+   the residual across calls, the router's routing reaching the MOE op in
+   the same call, and a router with no weights refused. */
 #include "hexkl_graph.h"
 #include "htp_graph_desc.h"
 #include <AEEStdErr.h>
@@ -128,6 +134,10 @@ static const htp_graph_lfm2_shape kHd64 = {3, 1, 128, 64, 32, 4,    2,
    HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM) | HTP_GRAPH_KIND_BIT(HTP_OP_ROPE) |      \
    HTP_GRAPH_KIND_BIT(HTP_OP_CONV1D_GATE) |                                    \
    HTP_GRAPH_KIND_BIT(HTP_OP_ATTN_M1))
+/* #132's D mask: the six plus the residual add and the router */
+#define D_KINDS                                                                \
+  (ALL_KINDS | HTP_GRAPH_KIND_BIT(HTP_OP_ADD) |                                \
+   HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK))
 
 static uint32_t build(uint32_t *w, uint32_t cap, const htp_graph_lfm2_shape *s,
                       const char *layers, uint32_t resident) {
@@ -221,6 +231,19 @@ static void mut_rmsnorm_k_not_pow2(uint32_t *w, uint32_t *n) {
   htp_graph_op_at(w, w[3] - 2u)->N = 2080u;
   (void)n;
 }
+/* #132: the residual add's and the router's rules */
+static void mut_add_rmsnorm_cpu(uint32_t *w, uint32_t *n) {
+  htp_graph_op_at(w, nth_op(w, HTP_OP_RMSNORM, 7))->resident = 0u;
+  (void)n;
+}
+static void mut_router_moe_cpu(uint32_t *w, uint32_t *n) {
+  htp_graph_op_at(w, nth_op(w, HTP_OP_MOE, 5))->resident = 0u;
+  (void)n;
+}
+static void mut_add_out_slot_1(uint32_t *w, uint32_t *n) {
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ADD, 3))->out_slot = 1u;
+  (void)n;
+}
 static void mut_truncated(uint32_t *w, uint32_t *n) {
   (void)w;
   *n -= 1u;
@@ -269,6 +292,10 @@ static const struct {
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
   {"RMSNORM resident at K 2080", mut_rmsnorm_k_not_pow2,
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+  {"ADD resident, a RMSNORM not", mut_add_rmsnorm_cpu, HTP_GRAPH_E_NOTALLOWED},
+  {"ROUTER_TOPK resident, its MOE not", mut_router_moe_cpu,
+   HTP_GRAPH_E_NOTALLOWED},
+  {"ADD out_slot 1", mut_add_out_slot_1, HTP_GRAPH_E_INVALIDFORMAT},
 };
 
 static void check_validator(void) {
@@ -276,7 +303,7 @@ static void check_validator(void) {
                     HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
   static uint32_t m[sizeof(w) / sizeof(w[0])];
   const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
-  const uint32_t resident_ok = ALL_KINDS;
+  const uint32_t resident_ok = D_KINDS;
   uint32_t n = build(w, cap, &kLfm25, kLfm25Layers, resident_ok);
   uint32_t n_ops = 0, i, rc;
   char names[128];
@@ -319,8 +346,11 @@ static void check_validator(void) {
          n_ops, n, htp_graph_kinds_str(resident_ok, names, sizeof(names)));
   /* the mask parser both sides read NNTR_HTP_FORWARD_KINDS with */
   CHECK(htp_graph_kinds_parse("MOE,RMSNORM,QK_NORM,ROPE,CONV1D_GATE,ATTN_M1") ==
-          resident_ok,
-        "kinds parse (all)");
+          ALL_KINDS,
+        "kinds parse (six)");
+  CHECK(htp_graph_kinds_parse("MOE,RMSNORM,QK_NORM,ROPE,CONV1D_GATE,ATTN_M1,"
+                              "ADD,ROUTER_TOPK") == resident_ok,
+        "kinds parse (D)");
   CHECK(htp_graph_kinds_parse("MOE") == HTP_GRAPH_KIND_BIT(HTP_OP_MOE) &&
           htp_graph_kinds_parse("MOE,BOGUS") == 0u &&
           htp_graph_kinds_parse("") == 0u,
@@ -816,10 +846,176 @@ static void check_stretches(void) {
            "of 12 with a re-seed)\n");
 }
 
+/* ---- #132: [ADD RMSNORM] and [ADD RMSNORM ROUTER_TOPK MOE ADD RMSNORM] -- */
+#define HD64_E 4u
+#define HD64_TOP 2u
+#define HD64_INTER 32u
+
+/* hd64's two MoE layers on the stand-in: gate_up 200 + 10 m + e, down
+   250 + 10 m + e (the tiny fixture's handles stay 10..73). */
+static void bind_hd64(uint32_t *w) {
+  uint32_t m, e;
+  for (m = 0; m < 2u; ++m) {
+    htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_MOE, m));
+    for (e = 0; e < HD64_E; ++e) {
+      op->h_gu[e] = 200u + 10u * m + e;
+      op->h_dn[e] = 250u + 10u * m + e;
+      register_weight(op->h_gu[e], HID, 2u * HD64_INTER);
+      register_weight(op->h_dn[e], HD64_INTER, HID);
+    }
+  }
+}
+
+static void check_add_router(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  uint32_t n, rc, resume, seed = 132u, i, e, r, nr = 0;
+  static float x[HID], a[HID], a2[HID], out[HID], ref[HID], h[HID], nrm[HID];
+  static float gam[4][HID], rw[HID * HD64_E], moe[HID];
+  float rbias[HD64_E], lg[HD64_E], wt[HD64_TOP];
+  uint32_t sel[HD64_TOP], r_idx[HD64_TOP], r_cnt[HD64_E] = {0};
+  float r_w[HD64_TOP], by_e[HD64_E];
+  uint32_t op_norm[4], op_add0, op_add1, op_router;
+  int err = 0;
+
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  env.vtcm_base = g_vtcm;
+  env.vtcm_size = sizeof(g_vtcm);
+  env.config_off = 32u;
+  env.pool = (hvx_worker_pool *)&env;
+  env.scratch = &g_scratch;
+  n = build(w, cap, &kHd64, "CAC", D_KINDS);
+  bind_hd64(w);
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, &g);
+  CHECK(rc == 0u && g != NULL, "hd64 D init: %s", htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  /* layer 0's norms (0, 5), layer 1's ffn norm (15), layer 2's operator
+     norm (19); layer 0's ffn-side ADD (4) and layer 1's first ADD (14) */
+  op_norm[0] = nth_op(w, HTP_OP_RMSNORM, 0);
+  op_norm[1] = nth_op(w, HTP_OP_RMSNORM, 1);
+  op_norm[2] = nth_op(w, HTP_OP_RMSNORM, 3);
+  op_norm[3] = nth_op(w, HTP_OP_RMSNORM, 4);
+  op_add0 = nth_op(w, HTP_OP_ADD, 0);
+  op_add1 = nth_op(w, HTP_OP_ADD, 2);
+  op_router = nth_op(w, HTP_OP_ROUTER_TOPK, 0);
+  CHECK(op_norm[1] == op_add0 + 1u && op_add1 == op_router - 2u &&
+          op_norm[2] == op_router - 1u && op_norm[3] == op_router + 3u &&
+          g->ops[op_router + 1u].kind == HTP_OP_MOE &&
+          g->ops[op_router + 2u].kind == HTP_OP_ADD &&
+          g->ops[op_norm[3] + 1u].kind == HTP_OP_FC &&
+          g->ops[op_norm[1] + 1u].kind == HTP_OP_DENSE_FFN,
+        "hd64 D op indices");
+  for (i = 0; i < 4u; ++i) {
+    fill(gam[i], HID, &seed);
+    rc = (uint32_t)hexkl_graph_set_param(g, op_norm[i], HTP_GRAPH_PARAM_GAMMA,
+                                         gam[i], HID);
+    CHECK(rc == 0u, "gamma %u: %s", i, htp_graph_err_name(rc));
+  }
+  fill(x, HID, &seed);
+  fill(a, HID, &seed);
+  fill(a2, HID, &seed);
+  fill(rw, HID * HD64_E, &seed);
+  fill(rbias, HD64_E, &seed);
+
+  /* (1) a router with no weights bound: AEE_EBADSTATE (ADD and the norm
+     ran first and moved slot 0; op 0 below re-seeds it) */
+  rc = (uint32_t)hexkl_graph_forward(g, &env, op_add1, 1000u, 0u, NULL, a, HID,
+                                     out, HID, &resume);
+  CHECK(rc == (uint32_t)AEE_EBADSTATE, "ROUTER_TOPK without weights: %s",
+        htp_graph_err_name(rc));
+  printf("  ROUTER_TOPK forward with no weights bound -> %s (0x%x)\n",
+         htp_graph_err_name(rc), rc);
+  rc = (uint32_t)hexkl_graph_set_param(g, op_router, HTP_GRAPH_PARAM_ROUTER_W,
+                                       rw, HID * HD64_E - 1u);
+  CHECK(rc == (uint32_t)AEE_EINVALIDFORMAT, "router W length: %s",
+        htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_set_param(
+    g, op_norm[0], HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, HD64_E);
+  CHECK(rc == (uint32_t)AEE_EINVALIDFORMAT, "router bias on a norm: %s",
+        htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_set_param(g, op_router, HTP_GRAPH_PARAM_ROUTER_W,
+                                       rw, HID * HD64_E);
+  CHECK(rc == 0u, "set router W: %s", htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_set_param(
+    g, op_router, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, HD64_E);
+  CHECK(rc == 0u, "set router bias: %s", htp_graph_err_name(rc));
+
+  /* (2) op 0 seeds slot 0 with the embedding row x */
+  rc = (uint32_t)hexkl_graph_forward(g, &env, op_norm[0], 1000u, 0u, NULL, x,
+                                     HID, out, HID, &resume);
+  CHECK(rc == 0u && resume == op_norm[0] + 1u, "op 0: %s resume %u",
+        htp_graph_err_name(rc), resume);
+
+  /* (3) [ADD RMSNORM]: out = rmsnorm(x + a), slot 0 = x + a */
+  rc = (uint32_t)hexkl_graph_forward(g, &env, op_add0, 1000u, 0u, NULL, a, HID,
+                                     out, HID, &resume);
+  CHECK(rc == 0u && resume == op_norm[1] + 1u, "[ADD RMSNORM]: %s resume %u",
+        htp_graph_err_name(rc), resume);
+  for (i = 0; i < HID; ++i)
+    h[i] = m1_det_add(x[i], a[i]);
+  m1_rmsnorm_det(h, gam[1], ref, HID, HID, kHd64.eps, NULL);
+  CHECK(memcmp(out, ref, sizeof(ref)) == 0, "[ADD RMSNORM] differs");
+  CHECK(memcmp(g->slots, h, sizeof(h)) == 0, "slot 0 != x + a");
+  check_pcycles(g, op_add0, op_norm[1] + 1u, "[ADD RMSNORM]");
+  err |= memcmp(out, ref, sizeof(ref)) != 0 || memcmp(g->slots, h, sizeof(h));
+
+  /* (4) [ADD RMSNORM ROUTER_TOPK MOE ADD RMSNORM], slot 0 carried over:
+     h = s0 + a2, n = rmsnorm(h), routing = router_topk_det(n),
+     h2 = h + standin(n, routing), out = rmsnorm(h2) */
+  memset(&g_last, 0, sizeof(g_last));
+  rc = (uint32_t)hexkl_graph_forward(g, &env, op_add1, 1000u, 0u, NULL, a2, HID,
+                                     out, HID, &resume);
+  CHECK(rc == 0u && resume == op_norm[3] + 1u, "[ADD .. RMSNORM]: %s resume %u",
+        htp_graph_err_name(rc), resume);
+  for (i = 0; i < HID; ++i)
+    h[i] = m1_det_add(h[i], a2[i]);
+  m1_rmsnorm_det(h, gam[2], nrm, HID, HID, kHd64.eps, NULL);
+  m1_router_topk_det(nrm, rw, rbias, HID, HD64_E, HD64_TOP, lg, sel, wt);
+  for (r = 0; r < HD64_TOP; ++r) {
+    r_cnt[sel[r]] = 1u;
+    by_e[sel[r]] = wt[r];
+  }
+  for (e = 0; e < HD64_E; ++e) {
+    if (r_cnt[e]) {
+      r_idx[nr] = 0u;
+      r_w[nr++] = by_e[e];
+    }
+  }
+  CHECK(g_last.n_calls == 1u &&
+          memcmp(g_last.row_count, r_cnt, sizeof(r_cnt)) == 0,
+        "the MOE op did not get the router's routing");
+  {
+    const htp_graph_op *mo = &g->ops[op_router + 1u];
+    hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, HID,
+                                HD64_INTER, HID, HD64_E, mo->h_gu, mo->h_dn,
+                                r_idx, r_cnt, r_w, nrm, moe, env.pool,
+                                &g_scratch, 0u);
+  }
+  for (i = 0; i < HID; ++i)
+    h[i] = m1_det_add(h[i], moe[i]);
+  m1_rmsnorm_det(h, gam[3], ref, HID, HID, kHd64.eps, NULL);
+  CHECK(memcmp(out, ref, sizeof(ref)) == 0,
+        "[ADD RMSNORM ROUTER_TOPK MOE ADD RMSNORM] differs");
+  CHECK(memcmp(g->slots, h, sizeof(h)) == 0, "slot 0 != h2");
+  check_pcycles(g, op_add1, op_norm[3] + 1u, "[ADD .. RMSNORM]");
+  err |= memcmp(out, ref, sizeof(ref)) != 0 || memcmp(g->slots, h, sizeof(h));
+  hexkl_graph_free(g);
+  if (err == 0)
+    printf("GRAPH STRETCH BIT-IDENTICAL: ADD+RMSNORM "
+           "ADD+RMSNORM+ROUTER_TOPK+MOE+ADD+RMSNORM (hd64 shape, MOE on the "
+           "stand-in, slot 0 carried across calls, resume_at the next FC)\n");
+}
+
 int main(void) {
   check_validator();
   check_forward();
   check_stretches();
+  check_add_router();
   if (g_fail) {
     printf("GRAPH CHECKS FAILED (%d)\n", g_fail);
     return 1;

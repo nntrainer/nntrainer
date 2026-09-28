@@ -192,7 +192,8 @@ fi
   -o "$OUT/graph_host_check" \
   "$HERE/graph_host_check.c" "$BACKEND/hmx/hexkl_graph.c" \
   "$BACKEND/hvx/hvx_m1_ops_f32.c" "$BACKEND/hvx/hvx_conv_gate_f32.c" \
-  "$BACKEND/hvx/hvx_attn_m1_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" -lm
+  "$BACKEND/hvx/hvx_attn_m1_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" \
+  "$BACKEND/hvx/hvx_scale_add_f32.c" -lm
 
 "$OUT/graph_host_check"
 
