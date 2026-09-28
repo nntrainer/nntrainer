@@ -17,10 +17,26 @@
 #include <remote.h>
 
 #include "hexkl_acc_tile.h"
+#include "hexkl_attn_q.h"
 #include "hexkl_kv_q.h"
 #include "hexkl_micro.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
+
+/** @brief stats_us slots of attn_q_prefill. */
+enum {
+  QSTAT_QPREP = 0,
+  QSTAT_DMA,
+  QSTAT_QK,
+  QSTAT_DEQUANT,
+  QSTAT_SOFTMAX,
+  QSTAT_PQUANT,
+  QSTAT_PV,
+  QSTAT_OUPD,
+  QSTAT_STORE,
+  QSTAT_N_BLOCKS,
+  QSTAT_COUNT
+};
 
 /** @brief One uint8 activation tile (64x32), also its alignment. */
 #define ACT_TILE_BYTES HEXKL_HMX_ACTIVATION_ALIGNMENT
@@ -209,5 +225,66 @@ int nntr_hvx_probe_kv_q_mm(remote_handle64 handle, uint32 kv_handle, uint32 n,
       return rc;
     }
   }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_attn_q_prefill(remote_handle64 handle, uint32 kv_handle,
+                            uint32 n_q, uint32 cache_from, uint32 cache_to,
+                            uint32 n_head_q, uint32 window, uint32 br,
+                            uint32 bc, float softcap, const float *q_f32,
+                            int q_f32Len, const float *sinks, int sinksLen,
+                            float *out_f32, int out_f32Len, uint32 *stats_us,
+                            int stats_usLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  const hexkl_kv_q *kv = hexkl_kv_q_get(&s->kv_q, kv_handle);
+  if (!kv || cache_to > kv->max_rows) {
+    FARF(ERROR, "attn_q_prefill: bad handle or cache_to");
+    return AEE_EBADPARM;
+  }
+  hexkl_attn_f16_shape shape = {n_q,           cache_from,   cache_to, n_head_q,
+                                kv->n_head_kv, kv->head_dim, window,   softcap};
+  hexkl_attn_f16_tiling tiling = {br, bc, 0, 0};
+  if (br == 0 || bc == 0) {
+    hexkl_attn_f16_choose_tiling(&shape, &tiling);
+  }
+  if (hexkl_attn_q_tiling_init(&shape, &tiling) != HEXKL_ATTN_OK) {
+    FARF(ERROR, "attn_q_prefill: bad shape/tiling");
+    return AEE_EBADPARM;
+  }
+  const uint64_t q_elems = (uint64_t)n_q * n_head_q * kv->head_dim;
+  if ((uint64_t)q_f32Len != q_elems || (uint64_t)out_f32Len != q_elems ||
+      stats_usLen < QSTAT_COUNT ||
+      (sinksLen != 0 && (uint32)sinksLen != n_head_q)) {
+    FARF(ERROR, "attn_q_prefill: bad lengths");
+    return AEE_EBADPARM;
+  }
+  hexkl_attn_q_io io;
+  memset(&io, 0, sizeof(io));
+  io.q = q_f32;
+  io.q_stride = n_head_q * kv->head_dim;
+  io.sinks = sinksLen ? sinks : NULL;
+  io.out = out_f32;
+  io.out_stride = n_head_q * kv->head_dim;
+  io.kv = kv;
+  hexkl_attn_q_stats st;
+  int res = hexkl_attn_q_prefill(s->vtcm_base, s->config_off, &shape, &tiling,
+                                 &io, s->quant_pool, &st);
+  if (res != AEE_SUCCESS) {
+    FARF(ERROR, "attn_q_prefill: kernel failed: 0x%08x", res);
+    return res;
+  }
+  stats_us[QSTAT_QPREP] = (uint32)st.us_qprep;
+  stats_us[QSTAT_DMA] = (uint32)st.us_dma;
+  stats_us[QSTAT_QK] = (uint32)st.us_qk;
+  stats_us[QSTAT_DEQUANT] = (uint32)st.us_dequant;
+  stats_us[QSTAT_SOFTMAX] = (uint32)st.us_softmax;
+  stats_us[QSTAT_PQUANT] = (uint32)st.us_pquant;
+  stats_us[QSTAT_PV] = (uint32)st.us_pv;
+  stats_us[QSTAT_OUPD] = (uint32)st.us_oupd;
+  stats_us[QSTAT_STORE] = (uint32)st.us_store;
+  stats_us[QSTAT_N_BLOCKS] = st.n_blocks;
   return AEE_SUCCESS;
 }
