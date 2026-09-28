@@ -140,4 +140,18 @@ int hvx_attn_m1_forward(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
                         float scale, const float *q, const float *k,
                         const float *v, float *out, float *stats);
 
+/**
+ * @brief hvx_attn_m1_forward that also fills the phase words (#146).
+ *
+ * @param prof  ATTN_M1_PROF_WORDS uint32 words (attn_m1_det.h's
+ *              ATTN_M1_PROF_* indices), or NULL -- then this is exactly
+ *              hvx_attn_m1_forward and takes no timestamp. Written only on
+ *              AEE_SUCCESS. The words are a measurement channel: the output
+ *              and stats are byte-equal with and without them
+ */
+int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
+                             float scale, const float *q, const float *k,
+                             const float *v, float *out, float *stats,
+                             uint32_t *prof);
+
 #endif /* __NNTRAINER_HVX_ATTN_M1_F32_H__ */

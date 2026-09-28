@@ -39,9 +39,11 @@
 #include <string.h>
 
 #include <AEEStdErr.h>
+#include <HAP_perf.h>
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
 
+#include "attn_m1_det.h"
 #include "hvx_convert.h"
 #include "hvx_swiglu_det.h"
 
@@ -180,6 +182,19 @@ int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
   return AEE_SUCCESS;
 }
 
+/** @brief One unit's phase pcycles (#146): each unit writes only its own
+ *         slot, the caller reduces them after the pool run, so no atomics. */
+typedef struct {
+  uint64_t start, end;
+  uint32_t scores, softmax, pv;
+  uint32_t lanes; /**< the pool's n, as the unit saw it */
+} prof_slot;
+
+/** @brief Lanes the phase words record. ponytail: a pool of more than 15
+ *         workers would leave its lanes >= 16 out of the sums (the device
+ *         has 6 HVX contexts, the host check 8); widen the array then. */
+#define PROF_SLOTS 16u
+
 typedef struct {
   const hvx_attn_m1_ctx *ctx;
   uint32_t layer;
@@ -188,7 +203,15 @@ typedef struct {
   const float *q;
   float *out;
   float *stats;
+  prof_slot *slots; /**< NULL unless the phase words were requested */
 } forward_job;
+
+/** @brief Adds the pcycles since *t to *acc and moves *t to now. */
+static inline void prof_mark(uint32_t *acc, uint64_t *t) {
+  const uint64_t now = HAP_perf_get_pcycles();
+  *acc += (uint32_t)(now - *t);
+  *t = now;
+}
 
 /** @brief Every lane equal to the max / sum of the input's lanes: rotate
  *         by half the remaining width and combine, five steps. Each step
@@ -207,8 +230,10 @@ static inline HVX_Vector reduce_sum_sf(HVX_Vector v) {
   return v;
 }
 
-/** @brief One kv head, written by the unit that owns scratch lane @a lane. */
-static void attn_head(const forward_job *job, uint32_t h, uint32_t lane) {
+/** @brief One kv head, written by the unit that owns scratch lane @a lane;
+ *         @a ps (NULL: no timestamps) accumulates the phase pcycles. */
+static void attn_head(const forward_job *job, uint32_t h, uint32_t lane,
+                      prof_slot *ps) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
   const uint32_t gqa = ctx->gqa, hd = ctx->head_dim, ms = ctx->max_seq;
   const uint32_t L = job->L, nblk = (L + LANES - 1u) / LANES;
@@ -223,6 +248,7 @@ static void attn_head(const forward_job *job, uint32_t h, uint32_t lane) {
   float *e = ctx->scratch + (size_t)lane * gqa * ms;
   const HVX_Vector neg_max = Q6_V_vsplat_R((int32_t)NEG_FLT_MAX_BITS);
   HVX_Vector vmax[MAX_GQA], acc[MAX_GQA];
+  uint64_t t = ps ? HAP_perf_get_pcycles() : 0u;
 
   /* Scores: s[g][p] = (sum_d q[g][d] * Kt[d][p], d ascending) * scale. */
   for (uint32_t g = 0; g < gqa; ++g) {
@@ -249,6 +275,10 @@ static void attn_head(const forward_job *job, uint32_t h, uint32_t lane) {
     }
   }
 
+  if (ps) {
+    prof_mark(&ps->scores, &t);
+  }
+
   /* Softmax: m, e = exp_det(s - m) with the dead lanes zeroed, l, r. */
   HVX_Vector r[MAX_GQA];
   for (uint32_t g = 0; g < gqa; ++g) {
@@ -271,6 +301,10 @@ static void attn_head(const forward_job *job, uint32_t h, uint32_t lane) {
       memcpy(job->stats + 2u * hq, &mb, sizeof(float));
       memcpy(job->stats + 2u * hq + 1u, &lb, sizeof(float));
     }
+  }
+
+  if (ps) {
+    prof_mark(&ps->softmax, &t);
   }
 
   /* PV: o[g][vec] = sum_p e[g][p] * V[p][vec], p ascending; out = o * r. */
@@ -296,19 +330,39 @@ static void attn_head(const forward_job *job, uint32_t h, uint32_t lane) {
       vo[i] = Q6_Vsf_vmpy_VsfVsf(o[g][i], r[g]);
     }
   }
+  if (ps) {
+    prof_mark(&ps->pv, &t);
+  }
 }
 
 /** @brief Pool unit i of n: kv heads i, i + n, ..., scratch lane i. */
 static void forward_unit(uint32_t n, uint32_t i, void *arg) {
   const forward_job *job = (const forward_job *)arg;
+  prof_slot *ps = (job->slots && i < PROF_SLOTS) ? &job->slots[i] : NULL;
+  if (ps) {
+    ps->lanes = n;
+    ps->start = HAP_perf_get_pcycles();
+  }
   for (uint32_t h = i; h < job->ctx->n_kv; h += n) {
-    attn_head(job, h, i);
+    attn_head(job, h, i, ps);
+  }
+  if (ps) {
+    ps->end = HAP_perf_get_pcycles();
   }
 }
 
 int hvx_attn_m1_forward(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
                         float scale, const float *q, const float *k,
                         const float *v, float *out, float *stats) {
+  return hvx_attn_m1_forward_prof(ctx, layer, pos, scale, q, k, v, out, stats,
+                                  NULL);
+}
+
+int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
+                             float scale, const float *q, const float *k,
+                             const float *v, float *out, float *stats,
+                             uint32_t *prof) {
+  const uint64_t qt0 = prof ? HAP_perf_get_qtimer_count() : 0u;
   if (!ctx) {
     return AEE_EBADSTATE;
   }
@@ -318,6 +372,8 @@ int hvx_attn_m1_forward(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   if (pos > ctx->kv_len[layer]) {
     return AEE_EBADSTATE;
   }
+  prof_slot slots[PROF_SLOTS];
+  uint64_t t0 = prof ? HAP_perf_get_pcycles() : 0u;
   for (uint32_t h = 0; h < ctx->n_kv; ++h) {
     append_head(ctx, layer, h, pos, k + (size_t)h * ctx->head_dim,
                 v + (size_t)h * ctx->head_dim);
@@ -332,6 +388,32 @@ int hvx_attn_m1_forward(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   job.q = q;
   job.out = out;
   job.stats = stats;
+  job.slots = prof ? slots : NULL;
+  if (prof) {
+    memset(slots, 0, sizeof(slots));
+    memset(prof, 0, ATTN_M1_PROF_WORDS * sizeof(uint32_t));
+    prof_mark(&prof[ATTN_M1_PROF_APPEND], &t0);
+  }
   hvx_worker_pool_run(ctx->pool, forward_unit, &job, ctx->n_kv);
+  if (prof) {
+    const uint64_t pool_t0 = t0;
+    prof_mark(&prof[ATTN_M1_PROF_POOL], &t0);
+    const uint32_t lanes = slots[0].lanes;
+    prof[ATTN_M1_PROF_LANES] = lanes;
+    for (uint32_t i = 0; i < lanes && i < PROF_SLOTS; ++i) {
+      const uint32_t busy = (uint32_t)(slots[i].end - slots[i].start);
+      const uint32_t skew = (uint32_t)(slots[i].start - pool_t0);
+      prof[ATTN_M1_PROF_SCORES] += slots[i].scores;
+      prof[ATTN_M1_PROF_SOFTMAX] += slots[i].softmax;
+      prof[ATTN_M1_PROF_PV] += slots[i].pv;
+      if (busy > prof[ATTN_M1_PROF_BUSY_MAX]) {
+        prof[ATTN_M1_PROF_BUSY_MAX] = busy;
+      }
+      if (skew > prof[ATTN_M1_PROF_START_MAX]) {
+        prof[ATTN_M1_PROF_START_MAX] = skew;
+      }
+    }
+    prof[ATTN_M1_PROF_CALL_QT] = (uint32_t)(HAP_perf_get_qtimer_count() - qt0);
+  }
   return AEE_SUCCESS;
 }

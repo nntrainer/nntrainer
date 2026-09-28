@@ -74,6 +74,37 @@
  *         the position block the score loop computes at once. */
 #define ATTN_M1_DET_LANES 32u
 
+/*
+ * THE PHASE WORDS (#146) -- a measurement channel, not arithmetic. A
+ * caller that passes 2 * n_q + ATTN_M1_PROF_WORDS stats floats to the
+ * attn_m1_forward entry receives the (m, l) pairs followed by these uint32
+ * words, bit-copied (memcpy, so no 2^24 float bound). They live here
+ * because this is the one header the kernel, the skel entry, the host
+ * check and the device gtest all include. Pcycles are the core-wide
+ * counter, so the caller's and the units' readings share one clock.
+ *   APPEND     pcycles of the k/v append (caller)
+ *   POOL       pcycles from just before the pool run to its return (caller)
+ *   LANES      units that ran concurrently: min(units, workers + 1)
+ *   SCORES     sum over units of the score loops (incl. the running vmax)
+ *   SOFTMAX    sum over units of max tree + exp_det + lane sum + recip_det
+ *   PV         sum over units of PV + o * r
+ *   BUSY_MAX   max over units of (end - start)
+ *   START_MAX  max over units of (start - POOL's t0): dispatch skew
+ *   CALL_QT    19.2 MHz qtimer ticks of the whole forward (dsp_us = /19.2)
+ * Pool dispatch + merge = POOL - BUSY_MAX; lane imbalance = BUSY_MAX /
+ * ((SCORES + SOFTMAX + PV) / LANES).
+ */
+#define ATTN_M1_PROF_APPEND 0u
+#define ATTN_M1_PROF_POOL 1u
+#define ATTN_M1_PROF_LANES 2u
+#define ATTN_M1_PROF_SCORES 3u
+#define ATTN_M1_PROF_SOFTMAX 4u
+#define ATTN_M1_PROF_PV 5u
+#define ATTN_M1_PROF_BUSY_MAX 6u
+#define ATTN_M1_PROF_START_MAX 7u
+#define ATTN_M1_PROF_CALL_QT 8u
+#define ATTN_M1_PROF_WORDS 9u
+
 /** @brief One f32 operation, forced to round on its own (see swiglu_det.h
  *         for why a volatile store and not -ffp-contract). */
 static inline float attn_m1_det_mul(float a, float b) {

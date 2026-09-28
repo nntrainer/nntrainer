@@ -1029,10 +1029,86 @@ TEST_F(HvxAttnM1, AppendChainEqualsBulk) {
   EXPECT_EQ(nntr_hvx_attn_m1_release(handle_), AEE_SUCCESS);
 }
 
+namespace {
+
+/** @brief One forward at the last position of @a layer, host-timed, with
+ *         the phase words (#146) requested when @a words is non-null. */
+int m1_timed_forward(remote_handle64 handle, uint32_t layer, uint32_t L,
+                     const std::vector<float> &q, const std::vector<float> &k,
+                     const std::vector<float> &v, std::vector<float> *out,
+                     std::vector<uint32_t> *words, double *us) {
+  const size_t row = (size_t)kM1Kv * kM1Hd;
+  std::vector<float> stats(words ? 2u * kM1Nq + ATTN_M1_PROF_WORDS : 0u);
+  const auto t0 = std::chrono::steady_clock::now();
+  const int err = nntr_hvx_attn_m1_forward(
+    handle, layer, L - 1u, kM1Scale, q.data(), (int)q.size(),
+    k.data() + (size_t)(L - 1u) * row, (int)row,
+    v.data() + (size_t)(L - 1u) * row, (int)row, out->data(), (int)out->size(),
+    words ? stats.data() : nullptr, (int)stats.size());
+  const auto t1 = std::chrono::steady_clock::now();
+  *us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+  if (words) {
+    words->resize(ATTN_M1_PROF_WORDS);
+    std::memcpy(words->data(), stats.data() + 2u * kM1Nq,
+                ATTN_M1_PROF_WORDS * sizeof(uint32_t));
+  }
+  return err;
+}
+
+template <typename T> T m1_median(std::vector<T> x) {
+  std::sort(x.begin(), x.end());
+  return x[x.size() / 2];
+}
+
+/** @brief The ATTN_M1_PHASE line: the median of each word over the calls.
+ *         dsp_us is CALL_QT / 19.2; mhz is (APPEND + POOL) pcycles per
+ *         dsp_us of the same call -- the effective clock, a little low
+ *         since the entry's checks and the reduce sit outside both. */
+void m1_print_phase(uint32_t pos, const char *which,
+                    const std::vector<std::vector<uint32_t>> &calls) {
+  auto word = [&](uint32_t w) {
+    std::vector<uint32_t> x;
+    for (const auto &c : calls) {
+      x.push_back(c[w]);
+    }
+    return m1_median(x);
+  };
+  std::vector<double> mhz;
+  for (const auto &c : calls) {
+    const double us = c[ATTN_M1_PROF_CALL_QT] / 19.2;
+    mhz.push_back(
+      us > 0.0 ? (c[ATTN_M1_PROF_APPEND] + (double)c[ATTN_M1_PROF_POOL]) / us
+               : 0.0);
+  }
+  std::cout << "ATTN_M1_PHASE pos=" << pos << " " << which
+            << " append=" << word(ATTN_M1_PROF_APPEND)
+            << " scores=" << word(ATTN_M1_PROF_SCORES)
+            << " softmax=" << word(ATTN_M1_PROF_SOFTMAX)
+            << " pv=" << word(ATTN_M1_PROF_PV)
+            << " busy_max=" << word(ATTN_M1_PROF_BUSY_MAX)
+            << " start_max=" << word(ATTN_M1_PROF_START_MAX)
+            << " pool=" << word(ATTN_M1_PROF_POOL)
+            << " lanes=" << word(ATTN_M1_PROF_LANES)
+            << " dsp_us=" << word(ATTN_M1_PROF_CALL_QT) / 19.2
+            << " mhz=" << m1_median(mhz) << " (pcycles, median of "
+            << calls.size() << ")" << std::endl;
+}
+
+constexpr const char *kM1StaleProf =
+  " (AEE_EINVALIDFORMAT here = a skel without the #146 phase words)";
+
+} // namespace
+
 /** @brief The per-layer forward cost at pos 511 and 1023 (median of 10
  *         calls, host-timed, transport included): the first read of plan
  *         81 section 0's 0.5 / 1.0 ms per token estimate for 6 layers.
- *         Printed, not asserted. */
+ *         Printed, not asserted. Since #146 each position also prints the
+ *         phase split of 10 more calls with the words requested (warm: the
+ *         same layer every call), and then the same two positions COLD: 6
+ *         layers at max_seq 2048 and the layer rotated per call, so each
+ *         call's slab (4.19 MB at pos 1023) was evicted by the other five,
+ *         as in the model (plan 146 section 3.1). The cold us= is taken
+ *         with the words requested; the warm us= line is unchanged. */
 TEST_F(HvxAttnM1, PerLayerCost) {
   int err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 1024u);
   ASSERT_EQ(err, AEE_SUCCESS) << "register: " << hex(err);
@@ -1048,20 +1124,59 @@ TEST_F(HvxAttnM1, PerLayerCost) {
     ASSERT_EQ(err, AEE_SUCCESS) << "kv_append: " << hex(err);
     std::vector<double> us;
     for (int it = 0; it < 10; ++it) {
-      const auto t0 = std::chrono::steady_clock::now();
-      err = nntr_hvx_attn_m1_forward(
-        handle_, 0u, L - 1u, kM1Scale, q.data(), (int)q.size(),
-        k.data() + (size_t)(L - 1u) * row, (int)row,
-        v.data() + (size_t)(L - 1u) * row, (int)row, out.data(),
-        (int)out.size(), nullptr, 0);
-      const auto t1 = std::chrono::steady_clock::now();
+      double t = 0.0;
+      err = m1_timed_forward(handle_, 0u, L, q, k, v, &out, nullptr, &t);
       ASSERT_EQ(err, AEE_SUCCESS) << "forward: " << hex(err);
-      us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+      us.push_back(t);
     }
     std::sort(us.begin(), us.end());
     std::cout << "ATTN_M1_FIELD pos=" << (L - 1u) << " us=" << us[us.size() / 2]
               << " us_min=" << us.front() << " (host-timed, median of 10)"
               << std::endl;
+    std::vector<std::vector<uint32_t>> calls(10);
+    for (auto &w : calls) {
+      double t = 0.0;
+      err = m1_timed_forward(handle_, 0u, L, q, k, v, &out, &w, &t);
+      ASSERT_EQ(err, AEE_SUCCESS)
+        << "forward with the phase words: " << hex(err) << kM1StaleProf;
+    }
+    m1_print_phase(L - 1u, "warm", calls);
+  }
+  EXPECT_EQ(nntr_hvx_attn_m1_release(handle_), AEE_SUCCESS);
+
+  constexpr uint32_t kLayers = 6u;
+  err =
+    nntr_hvx_attn_m1_register(handle_, kLayers, kM1Kv, kM1Gqa, kM1Hd, 2048u);
+  ASSERT_EQ(err, AEE_SUCCESS) << "register 6 x 2048: " << hex(err);
+  for (uint32_t L : {512u, 1024u}) {
+    m1_fill_kv(k, v, L, rng);
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+      err = nntr_hvx_attn_m1_kv_append(handle_, layer, 0u, L - 1u, k.data(),
+                                       (int)((L - 1u) * row), v.data(),
+                                       (int)((L - 1u) * row));
+      ASSERT_EQ(err, AEE_SUCCESS)
+        << "kv_append layer " << layer << ": " << hex(err);
+    }
+    /* One round of 6 to put every layer's slab behind the other five, then
+       10 timed calls, each on the least recently used layer. */
+    std::vector<double> us;
+    std::vector<std::vector<uint32_t>> calls;
+    for (uint32_t it = 0; it < kLayers + 10u; ++it) {
+      std::vector<uint32_t> w;
+      double t = 0.0;
+      err = m1_timed_forward(handle_, it % kLayers, L, q, k, v, &out, &w, &t);
+      ASSERT_EQ(err, AEE_SUCCESS)
+        << "cold forward: " << hex(err) << kM1StaleProf;
+      if (it >= kLayers) {
+        us.push_back(t);
+        calls.push_back(w);
+      }
+    }
+    std::sort(us.begin(), us.end());
+    std::cout << "ATTN_M1_FIELD cold pos=" << (L - 1u)
+              << " us=" << us[us.size() / 2] << " us_min=" << us.front()
+              << " (host-timed, median of 10, 6 layers rotated)" << std::endl;
+    m1_print_phase(L - 1u, "cold", calls);
   }
   EXPECT_EQ(nntr_hvx_attn_m1_release(handle_), AEE_SUCCESS);
 }

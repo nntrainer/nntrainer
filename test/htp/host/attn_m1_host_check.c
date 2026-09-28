@@ -16,10 +16,14 @@
  *  1. BIT IDENTITY. hvx_attn_m1_f32.c -- the skel's own source, not a
  *     stand-in -- runs on the lane-by-lane emulation with the pthread
  *     worker pool (stub/qurt.h) at 0, 3 and 7 workers, and is memcmp'd
- *     against the scalar spec for L = 1, 63, 64, 65, 512, 1024 at the
- *     LFM2.5 shape (32 q heads, 8 kv heads, head_dim 64), max_seq 1024 and
- *     once 2048. The three worker counts must agree byte for byte: the
- *     kv-head split is deterministic by construction and this proves it.
+ *     against the scalar spec for L = 1, 63, 64, 65, 512, 1024 at three
+ *     shapes (n_kv, gqa, head_dim) -- LFM2.5's (8, 4, 64), the hd64
+ *     fixture's (1, 2, 64) and (2, 3, 32), which only the generic path
+ *     serves (#146) -- at max_seq 1024, and LFM2.5 once at 2048. The three
+ *     worker counts must agree byte for byte: the head split is
+ *     deterministic by construction and this proves it. Each forward is
+ *     repeated with the phase words requested (#146): the same bytes out,
+ *     every word taken (ATTN M1 PHASES OK).
  *     Two structural cases: an append chain of L forward calls leaves the
  *     cache byte-equal to one kv_append of L rows and the same last
  *     output; at L = 1 the output is v * recip_det(1.0f) bit for bit
@@ -65,13 +69,29 @@ static int g_fail = 0;
     }                                                                          \
   } while (0)
 
-enum { N_KV = 8, GQA = 4, HD = 64, N_Q = N_KV * GQA, N_LAYERS = 2, LAYER = 1 };
+enum { N_LAYERS = 2, LAYER = 1 };
+/** @brief LFM2.5's shape, SHAPES[0]: the fixed-size cases run at it. */
+enum { LFM_KV = 8, LFM_Q = 32, LFM_HD = 64 };
+static uint32_t g_seed;
+/** @brief The shape under test, set per row of SHAPES by set_shape(). */
+static int N_KV, GQA, HD, N_Q;
+/** @brief (n_kv, gqa, head_dim): LFM2.5 first (the specialised path, and
+ *         the shape of the append-chain, identity and error cases), the
+ *         hd64 fixture's, and one the kernel serves on its generic path. */
+static const int SHAPES[3][3] = {{8, 4, 64}, {1, 2, 64}, {2, 3, 32}};
+
+static void set_shape(const int *shape) {
+  g_seed = 0x81810001u; /* every shape sees the same input stream */
+  N_KV = shape[0];
+  GQA = shape[1];
+  HD = shape[2];
+  N_Q = N_KV * GQA;
+}
 static const float SCALE = 0.125f;
 static const uint32_t POOLS[3] = {0u, 3u, 7u};
 
 /* ---- inputs ------------------------------------------------------------ */
 
-static uint32_t g_seed = 0x81810001u;
 static float frand(float lo, float hi) {
   g_seed = g_seed * 1664525u + 1013904223u;
   return lo + (hi - lo) * ((float)(g_seed >> 8) / 16777216.0f);
@@ -122,7 +142,7 @@ static void spec_forward(const float *q, const float *k, const float *v,
   float *vv = calloc((size_t)N_KV * max_seq * HD, sizeof(float));
   float *e = malloc((size_t)L * sizeof(float));
   for (uint32_t p = 0; p < L; ++p) {
-    for (uint32_t h = 0; h < N_KV; ++h) {
+    for (uint32_t h = 0; h < (uint32_t)N_KV; ++h) {
       attn_m1_det_append(kt + (size_t)h * HD * max_seq,
                          vv + (size_t)h * max_seq * HD, HD, max_seq, p,
                          k + ((size_t)p * N_KV + h) * HD,
@@ -194,12 +214,63 @@ static uint32_t count_bad(const float *a, const float *b, size_t n) {
   return bad;
 }
 
+static int g_prof_fail = 0;
+
+/**
+ * @brief The phase words (#146): the same forward again (a rewind to L-1
+ *        and the same row) with the words requested must give the same out
+ *        and stats bytes, every pcycle word must have been taken (the host
+ *        stub's counter is monotonic, so a bracket that ran reads > 0),
+ *        LANES must be min(units, workers + 1) and POOL >= BUSY_MAX. The
+ *        qtimer stub reads 0, so CALL_QT is a device-only word.
+ * @return the number of failed conditions
+ */
+static uint32_t check_phase_words(hvx_attn_m1_ctx *ctx, uint32_t L,
+                                  uint32_t workers, const float *q,
+                                  const float *k, const float *v,
+                                  const float *out_ref,
+                                  const float *stats_ref) {
+  float *out = malloc((size_t)N_Q * HD * sizeof(float));
+  float *stats = malloc(2u * N_Q * sizeof(float));
+  uint32_t w[ATTN_M1_PROF_WORDS];
+  memset(w, 0xA5, sizeof(w));
+  const int rc =
+    hvx_attn_m1_forward_prof(ctx, LAYER, L - 1u, SCALE, q, k, v, out, stats, w);
+  const uint32_t units = (uint32_t)N_KV;
+  const uint32_t lanes =
+    workers == 0u ? 1u : (units < workers + 1u ? units : workers + 1u);
+  uint32_t bad = (rc != AEE_SUCCESS);
+  bad += count_bad(out, out_ref, (size_t)N_Q * HD) != 0u;
+  bad += count_bad(stats, stats_ref, 2u * N_Q) != 0u;
+  bad += w[ATTN_M1_PROF_LANES] != lanes;
+  static const uint32_t taken[] = {ATTN_M1_PROF_APPEND,   ATTN_M1_PROF_POOL,
+                                   ATTN_M1_PROF_SCORES,   ATTN_M1_PROF_SOFTMAX,
+                                   ATTN_M1_PROF_PV,       ATTN_M1_PROF_BUSY_MAX,
+                                   ATTN_M1_PROF_START_MAX};
+  for (size_t i = 0; i < sizeof(taken) / sizeof(taken[0]); ++i) {
+    bad += w[taken[i]] == 0u;
+  }
+  bad += w[ATTN_M1_PROF_POOL] < w[ATTN_M1_PROF_BUSY_MAX];
+  if (bad) {
+    printf("  phase words L=%u workers=%u rc=%d:", L, workers, rc);
+    for (uint32_t i = 0; i < ATTN_M1_PROF_WORDS; ++i) {
+      printf(" %u", w[i]);
+    }
+    printf(" (lanes expected %u)\n", lanes);
+    g_prof_fail = 1;
+  }
+  free(out);
+  free(stats);
+  return bad;
+}
+
 /**
  * @brief One length: kv_append of L-1 rows, forward of the last, at each
  *        worker count; byte-equal across counts and against the spec.
  */
 static void check_length(uint32_t L, uint32_t max_seq,
                          hvx_worker_pool *const pools[3]) {
+  uint32_t prof_bad = 0;
   float *q = malloc((size_t)N_Q * HD * sizeof(float));
   float *k = malloc((size_t)L * N_KV * HD * sizeof(float));
   float *v = malloc((size_t)L * N_KV * HD * sizeof(float));
@@ -222,6 +293,8 @@ static void check_length(uint32_t L, uint32_t max_seq,
                              out[p], stats[p]);
     CHECK(rc == AEE_SUCCESS, "L=%u forward rc=%d", L, rc);
     CHECK(ctx->kv_len[LAYER] == L, "L=%u kv_len=%u", L, ctx->kv_len[LAYER]);
+    prof_bad += check_phase_words(ctx, L, POOLS[p], q, k + last, v + last,
+                                  out[p], stats[p]);
     hvx_attn_m1_free(ctx);
   }
   spec_forward(q, k, v, L, max_seq, out_det, stats_det);
@@ -235,9 +308,10 @@ static void check_length(uint32_t L, uint32_t max_seq,
   const uint32_t bad_stats = count_bad(stats[0], stats_det, 2u * N_Q);
   const double err = double_ref_err(q, k, v, L, out_det);
 
-  printf("ATTN M1 L=%u max_seq=%u workers={0,3,7} bad=%u bad_stats=%u "
-         "pool_bad=%u err/max|V|(double)=%.3e\n",
-         L, max_seq, bad_out, bad_stats, pool_bad, err);
+  printf("ATTN M1 shape=(%d,%d,%d) L=%u max_seq=%u workers={0,3,7} bad=%u "
+         "bad_stats=%u pool_bad=%u prof_bad=%u err/max|V|(double)=%.3e\n",
+         N_KV, GQA, HD, L, max_seq, bad_out, bad_stats, pool_bad, prof_bad,
+         err);
   if (bad_out || bad_stats) {
     for (int hq = 0; hq < N_Q; ++hq) {
       if (count_bad(out[0] + hq * HD, out_det + hq * HD, HD) ||
@@ -252,6 +326,8 @@ static void check_length(uint32_t L, uint32_t max_seq,
   }
   CHECK(bad_out == 0u && bad_stats == 0u, "L=%u: HVX differs from the spec", L);
   CHECK(pool_bad == 0u, "L=%u: worker counts disagree", L);
+  CHECK(prof_bad == 0u, "L=%u: the phase words are wrong or change the output",
+        L);
   CHECK(err <= ldexp(1.0, -13),
         "L=%u: %.3e of max|V| from the double "
         "reference (bound 2^-13)",
@@ -314,8 +390,9 @@ static void check_append_chain(uint32_t L, hvx_worker_pool *pool) {
 
 /** @brief L = 1: e = [1.0], l = 1.0, out = v * recip_det(1.0f) per head. */
 static void check_identity(hvx_worker_pool *pool) {
-  float q[N_Q * HD], k[N_KV * HD], v[N_KV * HD], out[N_Q * HD], stats[2 * N_Q],
-    ref[N_Q * HD];
+  float q[LFM_Q * LFM_HD], k[LFM_KV * LFM_HD], v[LFM_KV * LFM_HD],
+    out[LFM_Q * LFM_HD], stats[2 * LFM_Q];
+  float ref[LFM_Q * LFM_HD] = {0.0f}; /* gcc cannot see N_Q == LFM_Q */
   fill_q(q);
   fill_row(k, N_KV * HD, 0);
   fill_row(v, N_KV * HD, 0);
@@ -361,7 +438,8 @@ static void check_errors(hvx_worker_pool *pool) {
   CHECK(!bad && err == AEE_EINVALIDFORMAT, "head_dim 256: ctx=%p err=%d",
         (void *)bad, err);
 
-  float q[N_Q * HD], k[N_KV * HD], v[N_KV * HD], out[N_Q * HD];
+  float q[LFM_Q * LFM_HD], k[LFM_KV * LFM_HD], v[LFM_KV * LFM_HD],
+    out[LFM_Q * LFM_HD];
   fill_q(q);
   fill_row(k, N_KV * HD, 0);
   fill_row(v, N_KV * HD, 0);
@@ -398,8 +476,11 @@ int main(void) {
   }
 
   static const uint32_t lengths[] = {1u, 63u, 64u, 65u, 512u, 1024u};
-  for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
-    check_length(lengths[i], 1024u, pools);
+  for (size_t s = sizeof(SHAPES) / sizeof(SHAPES[0]); s-- > 0;) {
+    set_shape(SHAPES[s]); /* LFM2.5 last: the cases below use it */
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
+      check_length(lengths[i], 1024u, pools);
+    }
   }
   check_length(1024u, 2048u, pools);
   check_append_chain(65u, pools[1]);
@@ -408,6 +489,9 @@ int main(void) {
 
   for (int p = 0; p < 3; ++p) {
     hvx_worker_pool_destroy(pools[p]);
+  }
+  if (!g_prof_fail) {
+    printf("ATTN M1 PHASES OK\n");
   }
   if (g_fail) {
     printf("ATTN M1 CHECK FAILED\n");
