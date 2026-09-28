@@ -453,6 +453,19 @@ private:
                         float theta = 10000.0, bool is_fp16 = false);
 
   /**
+   * @brief [#130] The HTP per-token attention hook at one decode row:
+   *        hands q | k | v, the RoPE table (once) and, when asked, the
+   *        CPU cache's rows [0, pos) to the backend; on true the output
+   *        row was written by the DSP and this layer's cache is stale
+   *        from now on (the DSP owns it, plan 130 section 3.3).
+   */
+  bool htpDecodeAttention(nntrainer::RunLayerContext &context,
+                          unsigned int pos);
+  std::vector<float> htp_rope_table_; /**< [max_timestep][cos 32 | sin 32] */
+  bool htp_owns_cache_ = false;       /**< a hook returned 1: rows past the
+                                           prompt are the DSP's, not this cache's */
+
+  /**
    * @brief _compute frequency parameters for default ROPE
    */
   void _compute_default_parameters(int head_dim, float theta);

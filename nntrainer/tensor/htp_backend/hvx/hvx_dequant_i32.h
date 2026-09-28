@@ -108,15 +108,12 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t row_stride,
  * @param nt0         n-tile index of the first staged tile
  * @param dst_stride  f32 elements between consecutive rows of dst_a/dst_b
  */
-void hvx_dequant_acc_tiles_to_f32(const uint8_t *tiles_base,
-                                  uint32_t tile_stride, uint32_t n_tiles,
-                                  uint32_t nt0, uint32_t row_stride,
-                                  uint32_t m_count, const float *act_scale,
-                                  const int32_t *act_zp,
-                                  const int32_t *colsum_w,
-                                  const float *w_scale, const float *bias,
-                                  float *dst_a, float *dst_b, uint32_t split,
-                                  uint32_t dst_stride, hvx_worker_pool *pool);
+void hvx_dequant_acc_tiles_to_f32(
+  const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_tiles,
+  uint32_t nt0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
+  const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
+  const float *bias, float *dst_a, float *dst_b, uint32_t split,
+  uint32_t dst_stride, hvx_worker_pool *pool);
 
 /**
  * @brief The batch dequant as a job the caller owns, so it can run on the
