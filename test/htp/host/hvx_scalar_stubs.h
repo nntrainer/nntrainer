@@ -10,7 +10,9 @@
 #include <stdint.h>
 
 #include "hexkl_mm_u8i4_dma.h"
-#include "hvx_scalar.h" /* wh_value and the tile / GEMV / quant stand-ins */
+
+/* One int4 value of a WH weight tile (htp_wh_layout.h's byte order). */
+int wh_value(const uint8_t *tile, uint32_t k, uint32_t c);
 
 /* A reference weight: the same WH bytes the table slot borrows. */
 typedef struct {
