@@ -32,6 +32,8 @@
 #include <cstdlib>
 #include <dlfcn.h>
 
+#include <dspqueue.h>
+
 namespace nntrainer {
 
 /**
@@ -78,6 +80,45 @@ struct HtpRpcMemApi {
       return a;
     }();
     return api;
+  }
+};
+
+/**
+ * @brief [#141] dspqueue, resolved at runtime from the same libcdsprpc.so,
+ *        so libnntrainer.so has no dspqueue import and still loads on a
+ *        runtime without it. missing names the first unresolved symbol.
+ */
+struct HtpDspqApi {
+  decltype(&dspqueue_create) create = nullptr;
+  decltype(&dspqueue_close) close = nullptr;
+  decltype(&dspqueue_export) export_ = nullptr;
+  decltype(&dspqueue_write) write = nullptr;
+  decltype(&dspqueue_read) read = nullptr;
+  decltype(&dspqueue_read_noblock) read_noblock = nullptr;
+  decltype(&dspqueue_get_stat) get_stat = nullptr;
+  const char *missing = nullptr; /**< first unresolved name, or null */
+
+  static const HtpDspqApi &get() {
+    static const HtpDspqApi api;
+    return api;
+  }
+
+  HtpDspqApi() {
+    resolve(create, "dspqueue_create");
+    resolve(close, "dspqueue_close");
+    resolve(export_, "dspqueue_export");
+    resolve(write, "dspqueue_write");
+    resolve(read, "dspqueue_read");
+    resolve(read_noblock, "dspqueue_read_noblock");
+    resolve(get_stat, "dspqueue_get_stat");
+  }
+
+private:
+  template <typename F> void resolve(F &f, const char *name) {
+    f = reinterpret_cast<F>(dlsym(RTLD_DEFAULT, name));
+    if (f == nullptr && missing == nullptr) {
+      missing = name;
+    }
   }
 };
 
