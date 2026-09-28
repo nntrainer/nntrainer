@@ -792,11 +792,20 @@ static bool tryMoeLayerOnAccelerator(
   // call goes out in pool-sized groups and the host adds their outputs.
   // Each call zero-fills its whole output and scatter-adds only its own
   // experts' rows, so the sum is the layer's output with the fp32 addition
-  // order changed across group boundaries: the ppl can move in its last
-  // digits, unlike every other path here. Only prefill ever takes this; a
+  // order changed across group boundaries, which should move the ppl in its
+  // last digits only. It measured 63.03 against every other path's 62.09
+  // (section 10.15): not that, and open. Only prefill ever takes this; a
   // decode call's 4 experts always fit.
-  if (experts_virtual && active.size() > g_expert_lru.capacity()) {
-    const size_t cap = g_expert_lru.capacity();
+  // NNTR_MOE_SPLIT=<n> caps a group at n experts below the pool's size, so
+  // the split can be run where no group evicts another (section 10.15).
+  // Measurement switch, not a default.
+  static const size_t split_env = [] {
+    const char *v = std::getenv("NNTR_MOE_SPLIT");
+    return v ? static_cast<size_t>(std::strtoul(v, nullptr, 10)) : size_t(0);
+  }();
+  const size_t cap = split_env ? std::min(split_env, g_expert_lru.capacity())
+                               : g_expert_lru.capacity();
+  if (experts_virtual && active.size() > cap) {
     float *out = output.getData<float>();
     const size_t n_out = static_cast<size_t>(total_tokens) * hidden_size;
     std::vector<float> part(n_out);

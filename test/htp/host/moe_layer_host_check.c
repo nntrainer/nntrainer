@@ -154,6 +154,35 @@ int main(void) {
       fail = 1;
   }
 
+  /* Split (doc 52 section 10.14): experts {0,1,2} then {3,4}, summed on
+     the host, against the whole call. Only the fp32 addition order may
+     differ, so the error is taken against the output's largest magnitude:
+     per element, a sum that cancels to near zero reads 3.5e-5 here. */
+  {
+    float *a = (float *)malloc(sizeof(float) * M * N_out);
+    float *b = (float *)malloc(sizeof(float) * M * N_out);
+    uint32_t n0 = rc_[0] + rc_[1] + rc_[2];
+    int r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, sizeof vtcm, sizeof vtcm,
+                                        M, K, inter, N_out, 3, hg, hd, ridx,
+                                        rc_, rw, act, a, NULL, &scratch);
+    r |= hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, 2, hg + 3,
+      hd + 3, ridx + n0, rc_ + 3, rw + n0, act, b, NULL, &scratch);
+    double w = 0.0, big = 0.0;
+    for (uint32_t i = 0; i < M * N_out; ++i) {
+      double d = fabs((double)(a[i] + b[i]) - (double)got[i]);
+      if (d > w)
+        w = d;
+      if (fabs((double)got[i]) > big)
+        big = fabs((double)got[i]);
+    }
+    w /= big;
+    printf("split 3+2 vs whole: rc=%d worst_rel=%g\n", r, w);
+    fail |= (r != 0 || w > 1e-5);
+    free(a);
+    free(b);
+  }
+
   /* --- edge cases the routing can actually produce --------------------- */
   {
     uint32_t z[8] = {0, 0, 0, 0, 0};
