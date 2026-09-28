@@ -76,6 +76,8 @@ private:
   std::tuple<nntrainer::props::Unit> conv_props;
   std::array<unsigned int, 3> weight_idx; /**< in_proj, conv, out_proj */
   std::array<unsigned int, 4> tensor_idx; /**< proj, gated, conv_out, state */
+  bool htp_owns_state_ = false; /**< [#130] a decode hook returned 1: the
+                                     DSP advances the conv state now */
 };
 
 } // namespace causallm
