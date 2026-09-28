@@ -97,4 +97,9 @@ static inline int qurt_futex_wake(void *addr, int n) {
   return 0;
 }
 
+/* Bits 15:8 are the HVX context count. Four, as v79 has: nntr_hvx_open
+   sizes its worker pool at units - 1 = 3, the class of
+   hvx_add_f32.c's own decode. */
+static inline int qurt_hvx_get_units(void) { return 0x0400; }
+
 #endif /* HOST_STUB_QURT_H */

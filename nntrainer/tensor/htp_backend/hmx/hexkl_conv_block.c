@@ -34,8 +34,8 @@
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
 
-#define ROUND_UP_U32(v, a) ((((v) + ((a) - 1)) / (a)) * (a))
-#define ROUND_UP_SZ(v, a) ((((v) + ((a) - 1)) / (a)) * (a))
+#define ROUND_UP_U32(v, a) ((((v) + ((a)-1)) / (a)) * (a))
+#define ROUND_UP_SZ(v, a) ((((v) + ((a)-1)) / (a)) * (a))
 #define CB_SCRATCH_ALIGN 128u
 
 /** @brief Kept in sync with hexkl_mm_u8i4_dma.c's copies by inspection. */

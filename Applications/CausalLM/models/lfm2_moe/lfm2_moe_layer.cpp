@@ -13,21 +13,17 @@
 #include <acti_func.h>
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <compute_ops.h>
 #include <cpu_backend.h>
-#include <cstdio>
 #include <cstdlib>
-#include <deque>
-#include <expert_lru.h>
+#include <htp_decode_hook.h>
 #include <iostream>
 #include <lfm2_moe_layer.h>
 #include <node_exporter.h>
 #include <stdexcept>
 #include <thread_manager.h>
-#include <unordered_map>
 
 /** [A1] The deterministic SwiGLU. nntrainer::swiglu is left alone on
     purpose -- every model on ARM uses it and nothing is wrong with it.
@@ -79,8 +75,6 @@ struct M0Stages {
   uint64_t ffn = 0;     /**< the expert FFN itself: HTP dispatch or two dots */
   uint64_t route = 0;   /**< multiply by the routing weight */
   uint64_t scatter = 0; /**< add_i back into the layer output */
-  uint64_t misses = 0;  /**< a count, not a time: experts loaded from the
-                             model file for this call (doc 52) */
 
   void reset() { *this = M0Stages{}; }
   uint64_t sum() const {
@@ -134,78 +128,6 @@ static constexpr size_t SINGLE_INOUT_IDX = 0;
 static constexpr bool NORM_TOPK_PROB = true;
 static constexpr float ROUTED_SCALING_FACTOR = 1.0f;
 
-/** [doc 52] Experts beyond the routed top-k whose recency the LRU refreshes,
- *  Lfm2CachedSlimMoELayer's value. */
-static constexpr unsigned EXTRA_TOPK = 5;
-
-/** [doc 52] The one pool of resident experts every MoE layer draws on. Its
- *  capacity is NNTR_MOE_CACHE_EXPERTS per layer, summed over the layers
- *  that finalize with virtual experts; the accelerator holds one slot per
- *  resident expert (register_qs4cx_wh_expert_file). Shared rather than per
- *  layer because the layer call needs a whole layer's active experts
- *  resident at once -- 32 at prefill -- which 22 layers x 2 can lend one
- *  layer and a per-layer bound of 2 cannot. */
-static causallm::ExpertLru g_expert_lru;
-
-using ExpertFileDesc = nntrainer::ComputeOps::ExpertFileDesc;
-
-/** [doc 52 section 10.10] Every virtual MoE layer's experts, as the backend
- *  needs them to read one from the file, in layer order (preloadExperts is
- *  called in graph order). Row i + 1 is what layer i reads ahead. */
-static std::vector<std::vector<ExpertFileDesc>> g_expert_layers;
-
-/** Finalize-order ordinal of MoE layers, for NNTR_MOE_TRACE. */
-static std::atomic<unsigned> g_moe_layer_count{0};
-
-/** @brief NNTR_MOE_PREFETCH=<k>: prefill reads the experts of the layers up
- *  to k ahead under the current layers' calls (doc 52 sections 10.10,
- *  10.20); 0 or unset is off. C=8 has room for k=4: this layer's 32 and
- *  four more layers' fit its 176 slots. */
-static int expertPrefetchDepth() {
-  static const int k = [] {
-    const char *v = std::getenv("NNTR_MOE_PREFETCH");
-    return v != nullptr ? std::max(0, std::atoi(v)) : 0;
-  }();
-  return k;
-}
-
-/** [doc 52 section 10.20] Read-ahead batches in flight, oldest first: the
- *  layer slot each was queued for and the LRU slots it holds. */
-static std::deque<std::pair<int, size_t>> g_prefetch_batches;
-/** The next layer slot to queue in the current prefill. */
-static int g_prefetch_next = 0;
-
-/**
- * @brief NNTR_MOE_TRACE=<path>: one line per MoE layer call,
- *        "<layer> <tokens> | <routed experts> | <top-(k+5) per token>",
- *        for tools/moe_expert_cache_sim.py to replay against cache
- *        policies offline (doc 52 section 10.10). The routing is the same
- *        whatever the cache does, so one resident run gives every C.
- */
-static std::FILE *moeTrace() {
-  static std::FILE *f = [] {
-    const char *path = std::getenv("NNTR_MOE_TRACE");
-    return (path != nullptr && *path != '\0') ? std::fopen(path, "w") : nullptr;
-  }();
-  return f;
-}
-
-/** @brief NNTR_MOE_CACHE_EXPERTS as a count, 0 when unset or unparsable
- *  (the resident path, unchanged). The same variable and the same parsing
- *  as Lfm2CachedSlimMoELayer, so one knob drives the CPU and HTP caches. */
-static unsigned int expertCacheFromEnv(unsigned int num_experts) {
-  const char *value = std::getenv("NNTR_MOE_CACHE_EXPERTS");
-  if (value == nullptr || *value == '\0' || *value == '-')
-    return 0;
-  errno = 0;
-  char *end = nullptr;
-  const unsigned long parsed = std::strtoul(value, &end, 10);
-  if (errno == ERANGE || end == value || *end != '\0')
-    return 0;
-  return static_cast<unsigned int>(
-    std::min<unsigned long>(num_experts, parsed));
-}
-
 /** M0 (doc 43 §5): ordinal of prefill forwarding() calls, so each MoE layer
  * prints under a stable index in layer order. Decode never touches this --
  * it runs incremental_forwarding. */
@@ -221,10 +143,6 @@ Lfm2MoELayer::Lfm2MoELayer() :
   expert_down_proj_indices({}),
   gate_idx(std::numeric_limits<unsigned>::max()),
   expert_bias_idx(std::numeric_limits<unsigned>::max()),
-  experts_virtual(false),
-  cache_per_layer(0),
-  expert_layer_slot(-1),
-  trace_layer(0),
   router_logits_idx(std::numeric_limits<unsigned>::max()),
   decode_expert_output_idx(std::numeric_limits<unsigned>::max()),
   decode_gate_up_output_idx(std::numeric_limits<unsigned>::max()),
@@ -255,21 +173,6 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
   // 3. Get MoE properties
   num_experts = std::get<props::NumExperts>(moe_props).get();
   topk = std::get<props::NumExpertsPerToken>(moe_props).get();
-
-  // [doc 52] With NNTR_MOE_CACHE_EXPERTS set and an accelerator engine,
-  // the expert weights are requested virtual: the loader records their
-  // file offsets and reads nothing, and the forward brings each expert
-  // from the file into the accelerator's slot pool on demand, under one
-  // LRU shared by every MoE layer (g_expert_lru). A CPU-engine layer keeps
-  // its resident weights whatever the variable says -- the CPU cache is
-  // Lfm2CachedSlimMoELayer's job.
-  trace_layer = g_moe_layer_count.fetch_add(1);
-  cache_per_layer = expertCacheFromEnv(num_experts);
-  experts_virtual =
-    cache_per_layer != 0 &&
-    context.getComputeEngineType() != ml::train::LayerComputeEngine::CPU;
-  if (experts_virtual)
-    g_expert_lru.addLayer(this, cache_per_layer);
   const unsigned int intermediate_size =
     std::get<nntrainer::props::Unit>(moe_props).get();
   const unsigned int hidden_size = in_dim.width(); // Feature dimension
@@ -334,13 +237,13 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
     expert_gate_up_proj_indices.push_back(context.requestWeight(
       expert_gate_up_dim, weight_initializer, weight_regularizer,
       weight_regularizer_constant, weight_decay,
-      "expert_gate_up_" + std::to_string(i), false, experts_virtual));
+      "expert_gate_up_" + std::to_string(i), false));
 
     // Down projection
     expert_down_proj_indices.push_back(context.requestWeight(
       expert_down_dim, weight_initializer, weight_regularizer,
       weight_regularizer_constant, weight_decay,
-      "expert_down_" + std::to_string(i), false, experts_virtual));
+      "expert_down_" + std::to_string(i), false));
   }
 
   // 6. Request intermediate tensor for router logits [batch*seq, 1, 1, E]
@@ -369,16 +272,10 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
 void Lfm2MoELayer::buildExpertAssignments(
   const nntrainer::Tensor &router_logits, const nntrainer::Tensor &expert_bias,
   unsigned int total_tokens,
-  std::vector<std::vector<std::pair<unsigned, float>>> &expert_assignments,
-  std::vector<int> *extra_top_k) {
+  std::vector<std::vector<std::pair<unsigned, float>>> &expert_assignments) {
 
   const float *logits = router_logits.getData<float>();
   const float *bias = expert_bias.getData<float>();
-  // Sorting the top-(k + EXTRA_TOPK) prefix instead of the top-k one leaves
-  // the top-k set and its order what they were; only the LRU hint reads
-  // the rest.
-  const unsigned extended =
-    extra_top_k ? std::min<unsigned>(topk + EXTRA_TOPK, num_experts) : topk;
 
   // Reusable scratch buffers (per token).
   std::vector<float> sig(num_experts);
@@ -394,11 +291,13 @@ void Lfm2MoELayer::buildExpertAssignments(
       scored[e] = {s + bias[e], static_cast<int>(e)};
     }
 
-    // top-k experts by (sigmoid + bias)
+    // top-k experts by (sigmoid + bias); an exact tie goes to the lower
+    // index -- a total order, so the selection does not depend on the
+    // library's partial_sort, and the HTP router's rule (m1_ops_det.h)
     std::partial_sort(
-      scored.begin(), scored.begin() + extended, scored.end(),
+      scored.begin(), scored.begin() + topk, scored.end(),
       [](const std::pair<float, int> &a, const std::pair<float, int> &b) {
-        return a.first > b.first;
+        return a.first > b.first || (a.first == b.first && a.second < b.second);
       });
 
     // routing weights come from the bias-free sigmoid scores
@@ -412,89 +311,7 @@ void Lfm2MoELayer::buildExpertAssignments(
       const float weight = sig[expert_idx] * inv * ROUTED_SCALING_FACTOR;
       expert_assignments[expert_idx].emplace_back(i, weight);
     }
-    if (extra_top_k) {
-      for (unsigned int k = 0; k < extended; ++k)
-        extra_top_k->push_back(scored[k].second);
-    }
   }
-}
-
-/** @brief [doc 52] One virtual expert from the model file into the
- *  accelerator's slot pool, keyed by its two weight tensors. The dims are
- *  the kernel's: gate_up is [K, 2 * inter], down [inter, N_out]. */
-static ExpertFileDesc expertDesc(nntrainer::Tensor &gu, nntrainer::Tensor &dn) {
-  if (gu.getDataType() != nntrainer::Tdatatype::QS4CX_WH ||
-      dn.getDataType() != nntrainer::Tdatatype::QS4CX_WH) {
-    throw std::runtime_error(
-      "NNTR_MOE_CACHE_EXPERTS on an accelerator engine needs QS4CX_WH expert "
-      "weights (the file's bytes go to the DSP as they are); this model's "
-      "are not");
-  }
-  return ExpertFileDesc{&gu,
-                        &dn,
-                        gu.getFd(),
-                        gu.getFileOffset(),
-                        dn.getFileOffset(),
-                        static_cast<unsigned int>(gu.height()),
-                        static_cast<unsigned int>(dn.height()),
-                        static_cast<unsigned int>(dn.width())};
-}
-
-static void loadVirtualExpert(nntrainer::ComputeOps *ops,
-                              const ExpertFileDesc &d, bool at_load) {
-  if (!ops->register_qs4cx_wh_expert_file(d, at_load)) {
-    throw std::runtime_error(
-      "this engine cannot load a virtual expert from the model file "
-      "(register_qs4cx_wh_expert_file); unset NNTR_MOE_CACHE_EXPERTS");
-  }
-}
-
-bool Lfm2MoELayer::preloadExperts(nntrainer::RunLayerContext &context) {
-  if (!experts_virtual)
-    return true;
-  auto *ops = context.getComputeOps();
-  if (ops == nullptr) {
-    throw std::runtime_error("virtual MoE experts need the layer's engine to "
-                             "provide ComputeOps; none is registered");
-  }
-  // Every virtual layer has finalized by now, so the pool's capacity is
-  // final: size the backend's slot memory to it, once.
-  static bool reserved = false;
-  if (!reserved) {
-    ops->reserve_qs4cx_wh_expert_slots(g_expert_lru.capacity());
-    reserved = true;
-  }
-
-  std::vector<ExpertFileDesc> descs;
-  descs.reserve(num_experts);
-  for (unsigned int e = 0; e < num_experts; ++e)
-    descs.push_back(
-      expertDesc(context.getWeight(expert_gate_up_proj_indices[e]),
-                 context.getWeight(expert_down_proj_indices[e])));
-  if (expert_layer_slot < 0) {
-    expert_layer_slot = static_cast<int>(g_expert_layers.size());
-    g_expert_layers.push_back(descs);
-  }
-
-  std::vector<causallm::ExpertLru::Key> need;
-  std::unordered_map<causallm::ExpertLru::Key, unsigned int> expert_of;
-  const size_t room = g_expert_lru.capacity() - g_expert_lru.size();
-  for (unsigned int e = 0; e < num_experts && need.size() < room; ++e) {
-    need.push_back(descs[e].key_gu);
-    expert_of[descs[e].key_gu] = e;
-  }
-  if (!need.empty()) {
-    g_expert_lru.acquire(
-      need,
-      [&](causallm::ExpertLru::Key k) {
-        loadVirtualExpert(ops, descs[expert_of[k]], /*at_load=*/true);
-      },
-      [](causallm::ExpertLru::Key) {
-        throw std::logic_error("preloadExperts evicted an expert: the pool "
-                               "filled past its capacity");
-      });
-  }
-  return need.size() == num_experts;
 }
 
 void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
@@ -645,17 +462,10 @@ static bool tryMoeLayerOnAccelerator(
   nntrainer::RunLayerContext &context,
   const std::vector<unsigned int> &gate_up_indices,
   const std::vector<unsigned int> &down_indices, unsigned int total_tokens,
-  unsigned int hidden_size, unsigned int intermediate_size,
-  bool experts_virtual, const std::vector<int> *extra_top_k,
-  int expert_layer_slot) {
+  unsigned int hidden_size, unsigned int intermediate_size) {
 
   auto *ops = input.getOps();
   if (ops == nullptr || !ops->supports_gemm_qs4cx_moe_layer_fp32()) {
-    if (experts_virtual) {
-      throw std::runtime_error("virtual MoE experts (NNTR_MOE_CACHE_EXPERTS) "
-                               "have no CPU path: the layer's engine offers "
-                               "no MoE layer call");
-    }
     return false;
   }
 
@@ -711,219 +521,29 @@ static bool tryMoeLayerOnAccelerator(
     dn_scale[e] = dn.getScale<float>();
   }
 
-  // [doc 52] Virtual experts: the ones this call routes to are made
-  // resident through the shared LRU (a miss releases the least recently
-  // used expert's slot and reads this one from the file into it), the
-  // arrays are compacted to them, and the weight tensors' addresses stand
-  // in for the data pointers the accelerator keys its handles on, with a
-  // null scale to say so. Compacting changes nothing numerically: an
-  // expert with no rows adds nothing, and the kernel's scatter-add order
-  // over the remaining experts is what the full array gave.
-  std::vector<size_t> active;
-  active.reserve(n_experts);
-  for (size_t e = 0; e < n_experts; ++e) {
-    if (!experts_virtual || !expert_assignments[e].empty())
-      active.push_back(e);
-  }
-  auto release = [&](causallm::ExpertLru::Key k) {
-    if (!ops->release_qs4cx_wh_expert(k)) {
-      throw std::logic_error("expert LRU evicted an expert the "
-                             "accelerator does not hold");
-    }
-  };
-
-  // One call's worth: make @a group resident (virtual experts), and build
-  // the arrays the kernel takes for it. Grouped by expert in expert order
-  // -- the layout the kernel slices by running offsets, so the order here
-  // is part of the contract, not a convenience.
-  std::vector<causallm::ExpertLru::Key> need;
-  std::vector<void *> call_gu, call_dn;
-  std::vector<float *> call_gus, call_dns;
-  std::vector<unsigned int> row_index, row_count;
+  // Grouped by expert in expert order -- the layout the kernel slices by
+  // running offsets, so the order here is part of the contract, not a
+  // convenience.
+  std::vector<unsigned int> row_index, row_count(n_experts);
   std::vector<float> row_weight;
-  auto stage = [&](const std::vector<size_t> &group) {
-    need.clear();
-    call_gu.clear();
-    call_dn.clear();
-    call_gus.clear();
-    call_dns.clear();
-    row_index.clear();
-    row_count.clear();
-    row_weight.clear();
-    if (experts_virtual) {
-      std::unordered_map<causallm::ExpertLru::Key, size_t> expert_of;
-      for (size_t e : group) {
-        auto *key = &context.getWeight(gate_up_indices[e]);
-        need.push_back(key);
-        expert_of[key] = e;
-      }
-      // [doc 52 section 10.23] acquire() frees every slot the misses need
-      // before it names the first miss, so the misses are gathered and
-      // loaded together after it: one registration round trip, not one
-      // per expert. Nothing reads them before the call below.
-      std::vector<ExpertFileDesc> missed;
-      g_m0.misses += g_expert_lru.acquire(
-        need,
-        [&](causallm::ExpertLru::Key k) {
-          const size_t e = expert_of[k];
-          missed.push_back(expertDesc(context.getWeight(gate_up_indices[e]),
-                                      context.getWeight(down_indices[e])));
-        },
-        release);
-      if (!missed.empty() && !ops->register_qs4cx_wh_expert_files(missed)) {
-        throw std::runtime_error(
-          "this engine cannot load a virtual expert from the model file "
-          "(register_qs4cx_wh_expert_files); unset NNTR_MOE_CACHE_EXPERTS");
-      }
+  size_t total_rows = 0;
+  for (const auto &a : expert_assignments) {
+    total_rows += a.size();
+  }
+  row_index.reserve(total_rows);
+  row_weight.reserve(total_rows);
+  for (size_t e = 0; e < n_experts; ++e) {
+    row_count[e] = static_cast<unsigned int>(expert_assignments[e].size());
+    for (const auto &pair : expert_assignments[e]) {
+      row_index.push_back(pair.first);
+      row_weight.push_back(pair.second);
     }
-    for (size_t e : group) {
-      if (experts_virtual) { // the tensor's address is the key, no scale
-        call_gu.push_back(&context.getWeight(gate_up_indices[e]));
-        call_dn.push_back(&context.getWeight(down_indices[e]));
-        call_gus.push_back(nullptr);
-        call_dns.push_back(nullptr);
-      } else {
-        call_gu.push_back(gu_data[e]);
-        call_dn.push_back(dn_data[e]);
-        call_gus.push_back(gu_scale[e]);
-        call_dns.push_back(dn_scale[e]);
-      }
-      row_count.push_back(
-        static_cast<unsigned int>(expert_assignments[e].size()));
-      for (const auto &pair : expert_assignments[e]) {
-        row_index.push_back(pair.first);
-        row_weight.push_back(pair.second);
-      }
-    }
-  };
-  auto call = [&](float *dst) {
-    ops->gemm_qs4cx_moe_layer_fp32(
-      call_gu, call_gus, call_dn, call_dns, row_index, row_count, row_weight,
-      input.getData<float>(), dst, total_tokens, hidden_size, intermediate_size,
-      hidden_size, weights_wh);
-  };
-
-  // [doc 52 section 10.14] A layer call needs all of its routed experts
-  // resident at once, and at NNTR_MOE_CACHE_EXPERTS=1 the shared pool (one
-  // slot per layer, 22) is smaller than a prefill layer's 31-32. Then the
-  // call goes out in pool-sized groups and the host adds their outputs.
-  // Each call zero-fills its whole output and scatter-adds only its own
-  // experts' rows, so the sum is the layer's output with the fp32 addition
-  // order changed across group boundaries, which should move the ppl in its
-  // last digits only. It measured 63.03 against every other path's 62.09
-  // (section 10.15): not that, and open. Only prefill ever takes this; a
-  // decode call's 4 experts always fit.
-  // NNTR_MOE_SPLIT=<n> caps a group at n experts below the pool's size, so
-  // the split can be run where no group evicts another (section 10.15).
-  // Measurement switch, not a default.
-  static const size_t split_env = [] {
-    const char *v = std::getenv("NNTR_MOE_SPLIT");
-    return v ? static_cast<size_t>(std::strtoul(v, nullptr, 10)) : size_t(0);
-  }();
-  const size_t cap = split_env ? std::min(split_env, g_expert_lru.capacity())
-                               : g_expert_lru.capacity();
-  if (experts_virtual && active.size() > cap) {
-    float *out = output.getData<float>();
-    const size_t n_out = static_cast<size_t>(total_tokens) * hidden_size;
-    std::vector<float> part(n_out);
-    for (size_t g0 = 0; g0 < active.size(); g0 += cap) {
-      const size_t g1 = std::min(active.size(), g0 + cap);
-      stage(std::vector<size_t>(active.begin() + g0, active.begin() + g1));
-      if (g0 == 0) {
-        call(out);
-      } else {
-        call(part.data());
-        for (size_t i = 0; i < n_out; ++i)
-          out[i] += part[i];
-      }
-    }
-  } else {
-    // [doc 52 sections 10.10, 10.20] Prefill read-ahead: prefill routes
-    // every token to its top-4, so a layer wants (nearly) all 32 of its
-    // experts, and which ones is known long before its turn. This layer
-    // queues the ones layers up to NNTR_MOE_PREFETCH ahead lack, the
-    // backend reads them while this and the following calls run, and each
-    // layer registers its own batch -- between calls -- before it stages.
-    // Room comes from evicting outside this call's experts and the queued
-    // layers' resident ones, and the in-flight slots are held so no miss
-    // takes them; where there is no room the queue stops and resumes a
-    // layer later.
-    const int depth =
-      experts_virtual && total_tokens > 1 && expert_layer_slot >= 0
-        ? expertPrefetchDepth()
-        : 0;
-    auto take_batch = [&] {
-      const size_t held = g_prefetch_batches.front().second;
-      g_prefetch_batches.pop_front();
-      g_expert_lru.unhold(held);
-      g_expert_lru.acquire(
-        ops->prefetch_qs4cx_wh_experts_end(), [](causallm::ExpertLru::Key) {},
-        [](causallm::ExpertLru::Key) {
-          throw std::logic_error("expert prefetch overfilled the LRU");
-        });
-    };
-    if (depth > 0) {
-      // Layer 0 starts a prefill: whatever an earlier one left goes first.
-      while (!g_prefetch_batches.empty() &&
-             (expert_layer_slot == 0 ||
-              g_prefetch_batches.front().first <= expert_layer_slot))
-        take_batch();
-      if (expert_layer_slot == 0)
-        g_prefetch_next = 1;
-    }
-
-    stage(active);
-
-    if (depth > 0) {
-      g_prefetch_next = std::max(g_prefetch_next, expert_layer_slot + 1);
-      const int last = std::min(expert_layer_slot + depth,
-                                static_cast<int>(g_expert_layers.size()) - 1);
-      for (; g_prefetch_next <= last; ++g_prefetch_next) {
-        std::vector<causallm::ExpertLru::Key> pinned(need);
-        for (int l = expert_layer_slot + 1; l <= g_prefetch_next; ++l)
-          for (const ExpertFileDesc &d : g_expert_layers[l])
-            if (g_expert_lru.resident(d.key_gu))
-              pinned.push_back(d.key_gu);
-        std::vector<ExpertFileDesc> want;
-        for (const ExpertFileDesc &d : g_expert_layers[g_prefetch_next])
-          if (!g_expert_lru.resident(d.key_gu))
-            want.push_back(d);
-        if (want.empty())
-          continue;
-        if (!g_expert_lru.makeRoom(want.size(), pinned, release))
-          break;
-        g_expert_lru.hold(want.size());
-        bool queued = false;
-        try {
-          queued = ops->prefetch_qs4cx_wh_experts_begin(want);
-        } catch (...) {
-          g_expert_lru.unhold(want.size());
-          throw;
-        }
-        if (queued)
-          g_prefetch_batches.emplace_back(g_prefetch_next, want.size());
-        else
-          g_expert_lru.unhold(want.size());
-      }
-    }
-
-    call(output.getData<float>());
   }
 
-  // Recency from the routing's extended top-k, token by token, so the
-  // last token's likely-next experts end up most recent -- the rule
-  // Lfm2CachedSlimMoELayer applies after its own pass.
-  if (experts_virtual && extra_top_k != nullptr && !extra_top_k->empty()) {
-    // Walked back to front, as Lfm2CachedSlimMoELayer walks it: the list
-    // is rank order within each token, and refresh() makes its LAST entry
-    // the most recent, so reversing puts a token's top-ranked expert --
-    // the likeliest to be routed to again -- at the back.
-    std::vector<causallm::ExpertLru::Key> recency;
-    recency.reserve(extra_top_k->size());
-    for (auto it = extra_top_k->rbegin(); it != extra_top_k->rend(); ++it)
-      recency.push_back(&context.getWeight(gate_up_indices[*it]));
-    g_expert_lru.refresh(recency);
-  }
+  ops->gemm_qs4cx_moe_layer_fp32(
+    gu_data, gu_scale, dn_data, dn_scale, row_index, row_count, row_weight,
+    input.getData<float>(), output.getData<float>(), total_tokens, hidden_size,
+    intermediate_size, hidden_size, weights_wh);
   return true;
 }
 
@@ -1151,6 +771,18 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       output.reshape({total_tokens, 1, 1, hidden_size});
     }
 
+    // [#132] one decode row: the HTP routes, runs the experts and adds
+    // the result into its resident residual in the same stretch, so the
+    // layer writes nothing (the next norm hook returns the stream)
+    if (total_tokens == 1 &&
+        gate_weights.getDataType() == ml::train::TensorDim::DataType::FP32 &&
+        htpDecodeRouter(from, input.getData<float>(), hidden_size,
+                        gate_weights.getData<float>(), num_experts,
+                        expert_bias.getData<float>())) {
+      output.reshape({batch_size, 1, seq_len, hidden_size});
+      continue;
+    }
+
     // routing
     {
       M0Timer t(&g_m0.router);
@@ -1159,23 +791,11 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
       num_experts);
-    std::vector<int> extra_top_k;
     size_t max_assigned_tokens = 0;
     {
       M0Timer t(&g_m0.topk);
-      buildExpertAssignments(
-        router_logits, expert_bias, total_tokens, expert_assignments,
-        (experts_virtual || moeTrace() != nullptr) ? &extra_top_k : nullptr);
-      if (std::FILE *tf = moeTrace()) {
-        std::fprintf(tf, "%u %u |", trace_layer, total_tokens);
-        for (unsigned int e = 0; e < num_experts; ++e)
-          if (!expert_assignments[e].empty())
-            std::fprintf(tf, " %u", e);
-        std::fputs(" |", tf);
-        for (int e : extra_top_k)
-          std::fprintf(tf, " %d", e);
-        std::fputc('\n', tf);
-      }
+      buildExpertAssignments(router_logits, expert_bias, total_tokens,
+                             expert_assignments);
 
       for (const auto &assignments : expert_assignments)
         max_assigned_tokens = std::max(max_assigned_tokens, assignments.size());
@@ -1211,8 +831,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       moe_layer_done = tryMoeLayerOnAccelerator(
         input, output, expert_assignments, context, expert_gate_up_proj_indices,
         expert_down_proj_indices, total_tokens, hidden_size,
-        std::get<nntrainer::props::Unit>(moe_props).get(), experts_virtual,
-        &extra_top_k, expert_layer_slot);
+        std::get<nntrainer::props::Unit>(moe_props).get());
     }
 
     // The ARM path's own preparation, after the accelerator has had its
@@ -1300,7 +919,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                 << " gather=" << g_m0.gather << " ffn=" << g_m0.ffn
                 << " route=" << g_m0.route << " scatter=" << g_m0.scatter
                 << " other=" << (m0_us > named ? m0_us - named : 0)
-                << " miss=" << g_m0.misses << std::endl;
+                << std::endl;
     }
   }
   g_m0_on = false;

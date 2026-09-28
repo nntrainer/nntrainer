@@ -10,6 +10,7 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include "htp_decode_hook.h"
 #include <conv_block_layer.h>
 
 #include <compute_ops.h>
@@ -250,10 +251,23 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       yr[j] = b[j] * yr[j];
   };
   if (rows == 1) {
-    gate_pre(0);
-    nntrainer::causal_depthwise_conv1d_k3_decode(g, w_ptr, state, y, C);
-    gate_post(0);
+    // [#130] the HTP runs the gate + conv + gate of one token when
+    // CONV1D_GATE is resident; it holds the conv state from then on and
+    // this layer's copy stays what the prefill left (plan 130 section 3.3)
+    if (htpDecodeConvGate(from, p, y, C, w_ptr, state)) {
+      htp_owns_state_ = true;
+    } else {
+      gate_pre(0);
+      nntrainer::causal_depthwise_conv1d_k3_decode(g, w_ptr, state, y, C);
+      gate_post(0);
+    }
   } else {
+    // ponytail: the same refusal as mha_core's -- a second prompt's
+    // prefill would convolve from a state the DSP moved on from
+    NNTR_THROW_IF(htp_owns_state_ && from > 0, std::runtime_error)
+      << "conv_block: a multi-row forwarding at " << from
+      << " after the HTP decode hook took over the conv state "
+         "(NNTR_HTP_FORWARD=1 supports one prompt per process)";
     nntrainer::ThreadManager::Global().parallel_for(
       0, static_cast<size_t>(rows), gate_pre);
     nntrainer::causal_depthwise_conv1d_k3(g, w_ptr, nullptr, y, 1, rows, C);
