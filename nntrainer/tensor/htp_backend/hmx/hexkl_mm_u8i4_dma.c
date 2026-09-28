@@ -255,6 +255,26 @@ int hexkl_weight_u8i4_register_arena(hexkl_weight_u8i4_table *tbl,
   return AEE_SUCCESS;
 }
 
+int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
+                                   uint32_t K, uint32_t N, const uint8_t *wh,
+                                   const float *w_scale,
+                                   const int32_t *colsum_w) {
+  hexkl_weight_u8i4 *w;
+  if (!tbl || !wh || !w_scale || !colsum_w || h >= HEXKL_MM_U8I4_MAX_WEIGHTS) {
+    return AEE_EBADPARM;
+  }
+  w = &tbl->slots[h];
+  if (!w->in_use || !w->borrowed || w->K != K || w->N != N ||
+      ((uintptr_t)wh % WEIGHT_TILE_BYTES_U8I4) != 0u) {
+    return AEE_EBADPARM;
+  }
+  w->wh_bytes = (uint8_t *)wh;
+  memcpy(w->w_scale, w_scale, sizeof(float) * N);
+  memcpy(w->colsum_w, colsum_w, sizeof(int32_t) * N);
+  memset(w->bias, 0, sizeof(float) * N);
+  return AEE_SUCCESS;
+}
+
 int hexkl_weight_u8i4_borrows(const hexkl_weight_u8i4_table *tbl,
                               const uint8_t *base, uint32_t bytes) {
   uint32_t i;
