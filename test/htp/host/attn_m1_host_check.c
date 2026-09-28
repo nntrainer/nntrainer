@@ -236,7 +236,8 @@ static uint32_t check_phase_words(hvx_attn_m1_ctx *ctx, uint32_t L,
   memset(w, 0xA5, sizeof(w));
   const int rc =
     hvx_attn_m1_forward_prof(ctx, LAYER, L - 1u, SCALE, q, k, v, out, stats, w);
-  const uint32_t units = (uint32_t)N_KV;
+  /* One unit per (kv head, q-head pair), or per kv head at an odd gqa. */
+  const uint32_t units = (uint32_t)(GQA % 2 == 0 ? N_KV * GQA / 2 : N_KV);
   const uint32_t lanes =
     workers == 0u ? 1u : (units < workers + 1u ? units : workers + 1u);
   uint32_t bad = (rc != AEE_SUCCESS);

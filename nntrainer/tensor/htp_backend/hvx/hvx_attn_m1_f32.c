@@ -10,11 +10,12 @@
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
  *
- * Per kv head, three passes over the cache in the spec's order:
+ * Per unit (a kv head and a pair of its q heads, or the whole group when
+ * gqa is odd), three passes over the cache in the spec's order:
  *   scores  one 32-position block at a time: for d ascending, acc[g] =
- *           acc[g] + splat(q[g][d]) * Kt[d][block] for the gqa q heads g
- *           that share this kv head, then s = acc * scale (stored to the
- *           lane's scratch; the block's running vmax takes the live lanes)
+ *           acc[g] + splat(q[g][d]) * Kt[d][block] for the unit's q heads
+ *           g, then s = acc * scale (stored to the q head's scratch row;
+ *           the block's running vmax takes the live lanes)
  *   softmax m = rotate-tree max; e = exp_det(s - m), masked lanes -> 0,
  *           summed lane-wise over blocks, then the rotate tree; r =
  *           recip_det(l). Both trees leave every lane equal (the rotation
@@ -204,6 +205,7 @@ typedef struct {
   float *out;
   float *stats;
   prof_slot *slots; /**< NULL unless the phase words were requested */
+  uint32_t units;   /**< attn_units(ctx) */
 } forward_job;
 
 /** @brief Adds the pcycles since *t to *acc and moves *t to now. */
@@ -231,20 +233,21 @@ static inline HVX_Vector reduce_sum_sf(HVX_Vector v) {
 }
 
 /**
- * @brief One kv head, written by the unit that owns scratch lane @a lane;
- *        @a ps (NULL: no timestamps) accumulates the phase pcycles.
+ * @brief q heads g0 .. g0 + ng - 1 of kv head @a h; their probabilities go
+ *        to the scratch rows of those q heads. @a ps (NULL: no timestamps)
+ *        accumulates the phase pcycles.
  *
- * Always inlined so attn_head can call it with a literal (gqa, hd): then
+ * Always inlined so attn_unit can call it with a literal (ng, hd): then
  * the g / i loops unroll and acc, vmax and o live in registers instead of
  * on the stack (plan 146 section 3.2: a runtime trip count spilled every
  * accumulator to a vmem load/store per MAC). Same operations, same order
  * per lane, whichever call site -- the spec does not move.
  */
 static inline __attribute__((always_inline)) void
-attn_body(const forward_job *job, uint32_t h, uint32_t lane, prof_slot *ps,
-          const uint32_t gqa, const uint32_t hd) {
+attn_body(const forward_job *job, uint32_t h, uint32_t g0, prof_slot *ps,
+          const uint32_t ng, const uint32_t hd) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
-  const uint32_t ms = ctx->max_seq;
+  const uint32_t ms = ctx->max_seq, hq0 = h * ctx->gqa + g0;
   const uint32_t L = job->L, nblk = (L + LANES - 1u) / LANES;
   const uint32_t n_live = L - (nblk - 1u) * LANES; /* lanes of the last */
   /* The last block needs a mask only when it is partial; a full one skips
@@ -253,29 +256,29 @@ attn_body(const forward_job *job, uint32_t h, uint32_t lane, prof_slot *ps,
   const HVX_VectorPred live = Q6_Q_vsetq2_R((int)(n_live * sizeof(float)));
   const float *kt = kt_head(ctx, job->layer, h);
   const float *vv = v_head(ctx, job->layer, h);
-  const float *q = job->q + (size_t)h * gqa * hd;
-  float *e = ctx->scratch + (size_t)lane * gqa * ms;
+  const float *q = job->q + (size_t)hq0 * hd;
+  float *e = ctx->scratch + (size_t)hq0 * ms;
   const HVX_Vector neg_max = Q6_V_vsplat_R((int32_t)NEG_FLT_MAX_BITS);
   HVX_Vector vmax[MAX_GQA], acc[MAX_GQA];
   uint64_t t = ps ? HAP_perf_get_pcycles() : 0u;
 
   /* Scores: s[g][p] = (sum_d q[g][d] * Kt[d][p], d ascending) * scale. */
-  for (uint32_t g = 0; g < gqa; ++g) {
+  for (uint32_t g = 0; g < ng; ++g) {
     vmax[g] = neg_max;
   }
   for (uint32_t b = 0; b < nblk; ++b) {
-    for (uint32_t g = 0; g < gqa; ++g) {
+    for (uint32_t g = 0; g < ng; ++g) {
       acc[g] = Q6_V_vzero();
     }
     for (uint32_t d = 0; d < hd; ++d) {
       const HVX_Vector kv =
         *(const HVX_Vector *)(kt + (size_t)d * ms + b * LANES);
-      for (uint32_t g = 0; g < gqa; ++g) {
+      for (uint32_t g = 0; g < ng; ++g) {
         acc[g] = Q6_Vsf_vadd_VsfVsf(
           acc[g], Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(q[(size_t)g * hd + d]), kv));
       }
     }
-    for (uint32_t g = 0; g < gqa; ++g) {
+    for (uint32_t g = 0; g < ng; ++g) {
       const HVX_Vector s = Q6_Vsf_vmpy_VsfVsf(acc[g], job->vscale);
       *(HVX_Vector *)(e + (size_t)g * ms + b * LANES) = s;
       vmax[g] = Q6_Vsf_vmax_VsfVsf(vmax[g], (partial && b + 1u == nblk)
@@ -290,7 +293,7 @@ attn_body(const forward_job *job, uint32_t h, uint32_t lane, prof_slot *ps,
 
   /* Softmax: m, e = exp_det(s - m) with the dead lanes zeroed, l, r. */
   HVX_Vector r[MAX_GQA];
-  for (uint32_t g = 0; g < gqa; ++g) {
+  for (uint32_t g = 0; g < ng; ++g) {
     const HVX_Vector m = reduce_max_sf(vmax[g]);
     HVX_Vector *eg = (HVX_Vector *)(e + (size_t)g * ms);
     HVX_Vector sum = Q6_V_vzero();
@@ -305,7 +308,7 @@ attn_body(const forward_job *job, uint32_t h, uint32_t lane, prof_slot *ps,
     const HVX_Vector l = reduce_sum_sf(sum);
     r[g] = hvx_recip_det_sf(l);
     if (job->stats) {
-      const uint32_t hq = h * gqa + g;
+      const uint32_t hq = hq0 + g;
       const int32_t mb = Q6_R_vextract_VR(m, 0), lb = Q6_R_vextract_VR(l, 0);
       memcpy(job->stats + 2u * hq, &mb, sizeof(float));
       memcpy(job->stats + 2u * hq + 1u, &lb, sizeof(float));
@@ -319,7 +322,7 @@ attn_body(const forward_job *job, uint32_t h, uint32_t lane, prof_slot *ps,
   /* PV: o[g][vec] = sum_p e[g][p] * V[p][vec], p ascending; out = o * r. */
   const uint32_t nvec = hd / LANES;
   HVX_Vector o[MAX_GQA][MAX_HD_VEC];
-  for (uint32_t g = 0; g < gqa; ++g) {
+  for (uint32_t g = 0; g < ng; ++g) {
     for (uint32_t i = 0; i < nvec; ++i) {
       o[g][i] = Q6_V_vzero();
     }
@@ -332,15 +335,15 @@ attn_body(const forward_job *job, uint32_t h, uint32_t lane, prof_slot *ps,
     for (uint32_t i = 0; i < nvec; ++i) {
       vr[i] = vp[i];
     }
-    for (uint32_t g = 0; g < gqa; ++g) {
+    for (uint32_t g = 0; g < ng; ++g) {
       const HVX_Vector ep = hvx_splat_sf(e[(size_t)g * ms + p]);
       for (uint32_t i = 0; i < nvec; ++i) {
         o[g][i] = Q6_Vsf_vadd_VsfVsf(o[g][i], Q6_Vsf_vmpy_VsfVsf(ep, vr[i]));
       }
     }
   }
-  for (uint32_t g = 0; g < gqa; ++g) {
-    HVX_UVector *vo = (HVX_UVector *)(job->out + ((size_t)h * gqa + g) * hd);
+  for (uint32_t g = 0; g < ng; ++g) {
+    HVX_UVector *vo = (HVX_UVector *)(job->out + ((size_t)hq0 + g) * hd);
     for (uint32_t i = 0; i < nvec; ++i) {
       vo[i] = Q6_Vsf_vmpy_VsfVsf(o[g][i], r[g]);
     }
@@ -350,19 +353,32 @@ attn_body(const forward_job *job, uint32_t h, uint32_t lane, prof_slot *ps,
   }
 }
 
-/** @brief attn_body at LFM2.5's (gqa 4, head_dim 64) with constants, every
- *         other registered shape on the runtime-shape copy. */
-static void attn_head(const forward_job *job, uint32_t h, uint32_t lane,
-                      prof_slot *ps) {
+/** @brief Units per call: one per (kv head, q-head pair) when gqa is even,
+ *         else one per kv head. */
+static inline uint32_t attn_units(const hvx_attn_m1_ctx *ctx) {
+  return ctx->gqa % 2u == 0u ? ctx->n_kv * (ctx->gqa / 2u) : ctx->n_kv;
+}
+
+/** @brief Unit @a u: q heads 2j, 2j + 1 of kv head u / (gqa/2) (j = u %
+ *         (gqa/2)), with constants at head_dim 64 (LFM2.5, the hd64
+ *         fixture); an odd gqa takes a whole kv head on the runtime-shape
+ *         copy. The two units of one kv head are adjacent indices, so they
+ *         run at the same time and share its Kt / V slab in L2. */
+static void attn_unit(const forward_job *job, uint32_t u, prof_slot *ps) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
-  if (ctx->gqa == 4u && ctx->head_dim == 64u) {
-    attn_body(job, h, lane, ps, 4u, 64u);
+  if (ctx->gqa % 2u != 0u) {
+    attn_body(job, u, 0u, ps, ctx->gqa, ctx->head_dim);
+    return;
+  }
+  const uint32_t pairs = ctx->gqa / 2u, h = u / pairs, g0 = 2u * (u % pairs);
+  if (ctx->head_dim == 64u) {
+    attn_body(job, h, g0, ps, 2u, 64u);
   } else {
-    attn_body(job, h, lane, ps, ctx->gqa, ctx->head_dim);
+    attn_body(job, h, g0, ps, 2u, ctx->head_dim);
   }
 }
 
-/** @brief Pool unit i of n: kv heads i, i + n, ..., scratch lane i. */
+/** @brief Pool lane i of n: units i, i + n, ... */
 static void forward_unit(uint32_t n, uint32_t i, void *arg) {
   const forward_job *job = (const forward_job *)arg;
   prof_slot *ps = (job->slots && i < PROF_SLOTS) ? &job->slots[i] : NULL;
@@ -370,8 +386,8 @@ static void forward_unit(uint32_t n, uint32_t i, void *arg) {
     ps->lanes = n;
     ps->start = HAP_perf_get_pcycles();
   }
-  for (uint32_t h = i; h < job->ctx->n_kv; h += n) {
-    attn_head(job, h, i, ps);
+  for (uint32_t u = i; u < job->units; u += n) {
+    attn_unit(job, u, ps);
   }
   if (ps) {
     ps->end = HAP_perf_get_pcycles();
@@ -416,12 +432,13 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   job.out = out;
   job.stats = stats;
   job.slots = prof ? slots : NULL;
+  job.units = attn_units(ctx);
   if (prof) {
     memset(slots, 0, sizeof(slots));
     memset(prof, 0, ATTN_M1_PROF_WORDS * sizeof(uint32_t));
     prof_mark(&prof[ATTN_M1_PROF_APPEND], &t0);
   }
-  hvx_worker_pool_run(ctx->pool, forward_unit, &job, ctx->n_kv);
+  hvx_worker_pool_run(ctx->pool, forward_unit, &job, job.units);
   if (prof) {
     const uint64_t pool_t0 = t0;
     prof_mark(&prof[ATTN_M1_PROF_POOL], &t0);
