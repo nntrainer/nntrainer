@@ -659,20 +659,19 @@ class HvxFcQ4 : public HtpSession {};
 
 namespace {
 
-/** @brief fc_q4m1_f32's variant word (nntr_hvx.idl). */
-constexpr uint32_t FC_NATIVE = 0u, FC_INTRIN = 1u, FC_SFFMA = 2u,
-                   FC_FEED_VTCM = 1u << 16;
+/** @brief fc_q4m1_f32's variant word (nntr_hvx.idl): the feed bit only
+ *  since the second sitting (the kernel is the intrinsics one). */
+constexpr uint32_t FC_FEED_VTCM = 1u << 16;
 
 struct FcVariant {
   const char *name;
   uint32_t word;
 };
 
-const FcVariant kFcVariants[5] = {{"hvx_native", FC_NATIVE},
-                                  {"hvx_intrin", FC_INTRIN},
-                                  {"sffma8", FC_SFFMA | (8u << 8)},
-                                  {"sffma16", FC_SFFMA | (16u << 8)},
-                                  {"sffma32", FC_SFFMA | (32u << 8)}};
+/** @brief The kernel(s) G1 / G3 run; the first sitting's hvx_native and
+ *  sffma* returned 0 on silicon and are gone (HvxFcQ4.SfProbe says why). */
+const FcVariant kFcVariants[] = {{"hvx_intrin", 0u}};
+constexpr int kNV = sizeof(kFcVariants) / sizeof(kFcVariants[0]);
 
 /** @brief A K x N canonical Q4_0 weight from q4_gemv_cases.h, registered
  *         on the DSP as Q4M1. */
@@ -723,10 +722,8 @@ void fc_run(remote_handle64 handle, const FcWeight &w, uint32_t variant,
  *        bit -- the five FC shapes, 8 rows each from q4_gemv_cases.h
  *        (block magnitudes 2^-20 .. 2^20, zero / tiny / quantizer-edge
  *        blocks; negative, f16-subnormal, zero and power-of-two d_w, an
- *        exact cancellation), every kernel variant, both feeds, 6 lanes.
- *        Bad hvx_native with clean hvx_intrin: the IEEE .sf instructions
- *        are not RN on silicon (the plan's stop rule: fall back to the
- *        intrinsics). Bad sffma*: the scalar sffma or the terms.
+ *        exact cancellation), the intrinsics kernel with its own vector
+ *        quantizer, both feeds, 6 lanes.
  */
 TEST_F(HvxFcQ4, MatchesSpecBitExact) {
   const uint32_t shapes[5][2] = {{2048u, 6144u},
@@ -763,17 +760,23 @@ TEST_F(HvxFcQ4, MatchesSpecBitExact) {
   std::cout << "FC_Q4_FIELD total bad=" << bad_total << std::endl;
 }
 
-/** @brief The CPU-order quantizer, SwiGLU and argmax on the DSP's scalar
- *         unit against their specs (q8_quant_f32, swiglu_cpu_f32,
- *         argmax_f32). */
+/** @brief The FC's vector quantizer (q8_quant_f32 runs hvx_q4m1_prep) on
+ *         400 + 100 rows of every kind plus rows around its 2^-100 scalar
+ *         fallback, and the scalar SwiGLU and argmax, against their specs
+ *         (q8_quant_f32, swiglu_cpu_f32, argmax_f32). */
 TEST_F(HvxFcQ4, SmallOpsMatchSpec) {
   int bad_q = 0, bad_s = 0, bad_a = 0;
   for (uint32_t K : {2048u, 7168u}) {
     std::vector<float> x(K);
     std::vector<int8_t> q(K), q_ref(K);
     std::vector<uint16_t> d(K / 32u), d_ref(K / 32u);
-    for (int r = 0; r < 8; ++r) {
+    const int rows = K == 2048u ? 400 : 100;
+    for (int r = 0; r < rows; ++r) {
       make_row(x.data(), K, r % 4, r);
+      if (r % 50 == 49)
+        for (uint32_t i = 0; i < K; ++i)
+          x[i] = std::ldexp(frand(-1.0f, 1.0f),
+                            -100 + static_cast<int>((i / 32u) % 5u) - 2);
       ASSERT_EQ(nntr_hvx_q8_quant_f32(handle_, x.data(), static_cast<int>(K),
                                       q.data(), static_cast<int>(K), d.data(),
                                       static_cast<int>(K / 32u)),
@@ -828,10 +831,168 @@ TEST_F(HvxFcQ4, SmallOpsMatchSpec) {
 }
 
 /**
+ * @brief The scalar divide the vector quantizer relies on (sf_probe op 6,
+ *        the Hexagon's sfrecipa / sffixup sequence) against the integer
+ *        cpu_det_div_rn: amax / 127 for every mantissa at amax exponents
+ *        -100, 0 and 20, and 1 / d for every mantissa at d exponents -107,
+ *        0 and 12 (both quotients depend on the mantissa alone in that
+ *        range), 6 x 2^23 divides in 2^20-element calls.
+ */
+TEST_F(HvxFcQ4, ScalarDivide) {
+  const uint32_t chunk = 1u << 20;
+  std::vector<float> a(chunk), b(chunk), o(chunk);
+  uint64_t bad = 0, n = 0;
+  const int ea[3] = {-100, 0, 20}, ed[3] = {-107, 0, 12};
+  for (int kind = 0; kind < 2; ++kind)
+    for (int t = 0; t < 3; ++t)
+      for (uint32_t m0 = 0; m0 < (1u << 23); m0 += chunk) {
+        for (uint32_t i = 0; i < chunk; ++i) {
+          const uint32_t m = m0 + i;
+          if (kind == 0) {
+            a[i] =
+              cpu_det_float((static_cast<uint32_t>(ea[t] + 127) << 23) | m);
+            b[i] = 127.0f;
+          } else {
+            a[i] = 1.0f;
+            b[i] =
+              cpu_det_float((static_cast<uint32_t>(ed[t] + 127) << 23) | m);
+          }
+        }
+        ASSERT_EQ(nntr_hvx_sf_probe(
+                    handle_, 6u, a.data(), static_cast<int>(chunk), b.data(),
+                    static_cast<int>(chunk), o.data(), static_cast<int>(chunk)),
+                  AEE_SUCCESS)
+          << "sf_probe (0x8000040e = stale skel, rule 3)";
+        for (uint32_t i = 0; i < chunk; ++i, ++n) {
+          const float r = cpu_det_div_rn(a[i], b[i]);
+          if (cpu_det_bits(r) != cpu_det_bits(o[i])) {
+            if (bad < 8)
+              std::printf("SCALAR_DIV diff %08x / %08x dsp=%08x spec=%08x\n",
+                          cpu_det_bits(a[i]), cpu_det_bits(b[i]),
+                          cpu_det_bits(o[i]), cpu_det_bits(r));
+            ++bad;
+          }
+        }
+      }
+  std::printf("SCALAR_DIV divides=%llu bad=%llu\n",
+              static_cast<unsigned long long>(n),
+              static_cast<unsigned long long>(bad));
+  EXPECT_EQ(bad, 0u);
+}
+
+/**
+ * @brief Why the first sitting's hvx_native and sffma variants read 0 on
+ *        silicon (the ISS matched): each f32 operation on the DSP,
+ *        sf_probe's IEEE-form asm vadd / vsub / vmpy (.sf = .sf op .sf)
+ *        against the Q6_Vsf_* intrinsics (qf32 op + conversion) and the
+ *        scalar sffma, (1) on 256 random normal pairs and (2) on the
+ *        operands of the kernel's first failing step -- column group 0,
+ *        block 0 of the 2048 x 32 G1 weight on row kind 0: the split
+ *        product P1 = F1 * S1, P2 = F2 * S2 and uh = P1 + P2 (the
+ *        Fast2Sum head), computed here by the host's IEEE ops. Prints per
+ *        op the lanes that differ from the host and one lane in hex.
+ */
+TEST_F(HvxFcQ4, SfProbe) {
+  auto probe = [&](uint32_t op, const std::vector<float> &a,
+                   const std::vector<float> &b) {
+    std::vector<float> o(a.size(), -1.0f);
+    const int err = nntr_hvx_sf_probe(
+      handle_, op, a.data(), static_cast<int>(a.size()), b.data(),
+      static_cast<int>(b.size()), o.data(), static_cast<int>(o.size()));
+    EXPECT_EQ(err, AEE_SUCCESS) << "sf_probe op " << op << ": " << hex(err);
+    return o;
+  };
+  auto report = [&](const char *set, const char *name, uint32_t op,
+                    const std::vector<float> &a, const std::vector<float> &b,
+                    const std::vector<float> &ref) {
+    const std::vector<float> o = probe(op, a, b);
+    int bad = 0, first = -1;
+    for (size_t i = 0; i < o.size(); ++i)
+      if (cpu_det_bits(o[i]) != cpu_det_bits(ref[i])) {
+        ++bad;
+        first = first < 0 ? static_cast<int>(i) : first;
+      }
+    const size_t i = first < 0 ? 0u : static_cast<size_t>(first);
+    std::printf("SF_PROBE %s op=%s bad=%d/%zu lane=%zu a=%08x b=%08x "
+                "dsp=%08x host=%08x\n",
+                set, name, bad, o.size(), i, cpu_det_bits(a[i]),
+                cpu_det_bits(b[i]), cpu_det_bits(o[i]), cpu_det_bits(ref[i]));
+    return bad;
+  };
+  auto run_set = [&](const char *set, const std::vector<float> &a,
+                     const std::vector<float> &b, bool sffma) {
+    std::vector<float> add(a.size()), sub(a.size()), mul(a.size()),
+      fma1(a.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+      volatile float x = a[i], y = b[i];
+      volatile float s0 = x + y, s1 = x - y, s2 = x * y;
+      add[i] = s0;
+      sub[i] = s1;
+      mul[i] = s2;
+      fma1[i] = std::fma(a[i], b[i], 1.0f);
+    }
+    int intrin_bad = report(set, "intrin_vadd", 3u, a, b, add);
+    intrin_bad += report(set, "intrin_vsub", 4u, a, b, sub);
+    intrin_bad += report(set, "intrin_vmpy", 5u, a, b, mul);
+    report(set, "asm_ieee_vadd", 0u, a, b, add);
+    report(set, "asm_ieee_vsub", 1u, a, b, sub);
+    report(set, "asm_ieee_vmpy", 2u, a, b, mul);
+    if (sffma)
+      intrin_bad += report(set, "scalar_sffma", 7u, a, b, fma1);
+    return intrin_bad;
+  };
+  std::mt19937 rng(0x5f5f5f5fu);
+  std::uniform_real_distribution<float> md(1.0f, 2.0f);
+  std::vector<float> a(256), b(256);
+  for (size_t i = 0; i < a.size(); ++i) {
+    a[i] = std::ldexp((rng() & 1u) ? -md(rng) : md(rng),
+                      static_cast<int>(rng() % 60u) - 30);
+    b[i] = std::ldexp((rng() & 1u) ? -md(rng) : md(rng),
+                      static_cast<int>(rng() % 60u) - 30);
+  }
+  int intrin_bad = run_set("random", a, b, true);
+  // the kernel's first step on the G1 data: group 0, block 0
+  const uint32_t K = 2048u;
+  std::vector<uint8_t> w(static_cast<size_t>(32u) * (K / 32u) * 18u);
+  make_weights(w.data(), K, 32u);
+  std::vector<float> x(K);
+  make_row(x.data(), K, 0, 0);
+  std::vector<int8_t> q(K);
+  std::vector<uint16_t> d(K / 32u);
+  q8_0_quant_cpu_det(x.data(), K, q.data(), d.data());
+  const uint32_t ea = (d[0] >> 10) & 31u;
+  const int32_t ma = static_cast<int32_t>((d[0] & 1023u) | (ea ? 1024u : 0u));
+  std::vector<float> F1(32), S1(32), F2(32), S2(32), P1(32), P2(32);
+  for (uint32_t l = 0; l < 32u; ++l) {
+    const uint8_t *blk = w.data() + static_cast<size_t>(l) * (K / 32u) * 18u;
+    const int32_t isum = q4_cpu_block_isum(blk + 2, q.data());
+    const uint32_t h = q4_cpu_block_d(blk), E = (h >> 10) & 31u;
+    int32_t mw = static_cast<int32_t>((h & 1023u) | (E ? 1024u : 0u));
+    int32_t T = isum * mw;
+    T = (h & 0x8000u) ? -T : T;
+    const int32_t Th = T >> 13, Tl = T & 0x1fff;
+    const uint32_t s2 = ((E ? E : 1u) + (ea ? ea : 1u) - 50u + 127u) << 23;
+    F1[l] = static_cast<float>(Th * ma);
+    F2[l] = static_cast<float>(Tl * ma);
+    S2[l] = cpu_det_float(s2);
+    S1[l] = cpu_det_float(s2 + (13u << 23));
+    P1[l] = F1[l] * S1[l];
+    P2[l] = F2[l] * S2[l];
+  }
+  intrin_bad += run_set("step_P1=F1*S1", F1, S1, false);
+  intrin_bad += run_set("step_P2=F2*S2", F2, S2, false);
+  intrin_bad += run_set("step_uh=P1+P2", P1, P2, false);
+  std::printf("SF_PROBE intrinsics+sffma bad=%d (the kernel's ops; 0 "
+              "expected)\n",
+              intrin_bad);
+  EXPECT_EQ(intrin_bad, 0);
+}
+
+/**
  * @brief G3 (plan 132): the exact FC's rate on silicon, reported, not
  *        gated (it feeds decision D). The per-token FC set of LFM2.5
  *        (453 M weights) and the tied lm_head (262 M, measured as one
- *        16384-row slice and scaled by 128000 / 16384), every variant,
+ *        16384-row slice and scaled by 128000 / 16384), the kernel,
  *        weights read directly from the heap or fed to VTCM by per-lane
  *        DMA (src_bypass), 1 / 2 / 4 / 6 lanes; 3 timed calls after one
  *        warm-up. Per cell: us per call, cycles per (column, 32-block)
@@ -850,7 +1011,7 @@ TEST_F(HvxFcQ4, Rate) {
     {7168u, 2048u, 2.0},  {2048u, 16384u, 128000.0 / 16384.0}};
   const uint32_t lane_set[4] = {1u, 2u, 4u, 6u};
   // [variant][feed][lanes] -> ms per token (FC and lm_head), quant ms
-  double ms[5][2][4] = {}, ms_lm[5][2][4] = {}, ms_q[5][2][4] = {};
+  double ms[kNV][2][4] = {}, ms_lm[kNV][2][4] = {}, ms_q[kNV][2][4] = {};
   int bad_total = 0;
   for (const Shape &sh : shapes) {
     FcWeight w;
@@ -861,7 +1022,7 @@ TEST_F(HvxFcQ4, Rate) {
     const std::vector<float> ref = fc_spec(w, x);
     const double steps = static_cast<double>(w.N) * (w.K / 32u);
     const double gbytes = static_cast<double>(w.N) * w.K * 18.0 / 32.0;
-    for (int vi = 0; vi < 5; ++vi) {
+    for (int vi = 0; vi < kNV; ++vi) {
       for (int fi = 0; fi < 2; ++fi) {
         for (int li = 0; li < 4; ++li) {
           const uint32_t word = kFcVariants[vi].word | (fi ? FC_FEED_VTCM : 0u);
@@ -894,7 +1055,7 @@ TEST_F(HvxFcQ4, Rate) {
     }
     EXPECT_EQ(nntr_hvx_q4m1_release(handle_, w.h), AEE_SUCCESS);
   }
-  for (int vi = 0; vi < 5; ++vi)
+  for (int vi = 0; vi < kNV; ++vi)
     for (int fi = 0; fi < 2; ++fi)
       for (int li = 0; li < 4; ++li)
         std::cout << std::fixed << std::setprecision(3)
