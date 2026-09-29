@@ -22,9 +22,16 @@
 
 #define VTCM_BYTES (8u << 20)
 static uint8_t g_vtcm[VTCM_BYTES] __attribute__((aligned(2048)));
+/** [#132 Part B E3] One session holds the VTCM and the HMX, as on the
+ *  device (#178: a second session's hw_init is refused and it opens lite,
+ *  with no VTCM); the full open's close gives them back (hmx_unlock). */
+static int g_hw_held;
 
 int hexkl_micro_hw_init(uint8_t **vtcm_base, uint32_t *vtcm_size,
                         uint32_t *hmx_fp16_rate) {
+  if (g_hw_held)
+    return AEE_EFAILED;
+  g_hw_held = 1;
   *vtcm_base = g_vtcm;
   *vtcm_size = VTCM_BYTES;
   if (hmx_fp16_rate)
@@ -32,7 +39,10 @@ int hexkl_micro_hw_init(uint8_t **vtcm_base, uint32_t *vtcm_size,
   return AEE_SUCCESS;
 }
 int hexkl_micro_hmx_lock(void) { return AEE_SUCCESS; }
-int hexkl_micro_hmx_unlock(void) { return AEE_SUCCESS; }
+int hexkl_micro_hmx_unlock(void) {
+  g_hw_held = 0;
+  return AEE_SUCCESS;
+}
 uint32_t hexkl_micro_hmx_config_size(void) { return 2048u; }
 int hexkl_micro_hmx_setup_acc_read_int32(uint8_t *b, uint32_t cfg) {
   (void)b;
