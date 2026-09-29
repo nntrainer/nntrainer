@@ -8,7 +8,7 @@ name: Static checkers and verifiers
 
 on:
   pull_request:
-    branches: [ main ]
+    branches: [ main, hvx_impl ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}

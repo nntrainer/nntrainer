@@ -7,6 +7,9 @@ causallm_src = [
     meson.current_source_dir() / 'api' / 'model_config.cpp',
     meson.current_source_dir() / 'api' / 'streamer.cpp',
     meson.current_source_dir() / 'kv_cache_manager.cpp',
+    meson.current_source_dir() / 'hexagon' / 'qwen3_lowering.cpp',
+    meson.current_source_dir() / 'hexagon' / 'qwen3_w8cx_bin.cpp',
+    meson.current_source_dir() / 'hexagon' / 'hexagon_backend.cpp',
 ]
 
 executable_src = [
@@ -14,7 +17,14 @@ executable_src = [
 ]
 
 causallm_inc_abs = [meson.current_source_dir()]
-causallm_inc = [include_directories('.')]
+# qwen3_lowering.cpp only needs graph_lowering.h/nntr_htp_common.h, which
+# have no SDK/rpcmem dependency, so these two dirs are safe to add even
+# when enable-hexagon is off (default x86 builds).
+causallm_inc = [
+    include_directories('.'),
+    include_directories('../../nntrainer/tensor/hexagon/host'),
+    include_directories('../../nntrainer/tensor/hexagon/htp'),
+]
 causallm_inc_minja_inc = include_directories('third_party/minja/include')
 causallm_inc_nlohmann_inc = include_directories('third_party')
 
@@ -183,6 +193,21 @@ e_quantize = executable('nntr_quantize',
     quantize_src,
     include_directories: causallm_inc,
     dependencies: [nntrainer_dep, nntrainer_ccapi_dep, causallm_layer_dependencies, causallm_dep],
+)
+
+
+hexpack_src = [
+    meson.current_source_dir() / 'hexagon' / 'hex_pack.cpp',
+    meson.current_source_dir() / 'hexagon' / 'hex_image.cpp',
+    meson.current_source_dir() / 'hexagon' / 'qwen3_w8cx_bin.cpp',
+    meson.current_source_dir() / 'hexagon' / 'qwen3_lowering.cpp',
+    meson.current_source_dir() / '..' / '..' / 'nntrainer' / 'tensor' / 'hexagon' / 'host' / 'graph_lowering.cpp',
+]
+
+# Host-only tool (no SDK/rpcmem): W8_CX .bin -> packed DSP weight image.
+e_hexpack = executable('nntr_hexpack',
+    hexpack_src,
+    include_directories: causallm_inc,
 )
 
 

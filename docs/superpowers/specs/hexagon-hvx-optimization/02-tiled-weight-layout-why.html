@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P2 — 왜 32행 타일 가중치 레이아웃인가</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb;
+    --panel: #f3f3f1;
+    --text-1: #0b0b0b;
+    --text-2: #52514e;
+    --grid: #d9d8d3;
+    --w: #2a78d6;      /* weights  (slot 1 blue)   */
+    --w-light: #cde2fb;
+    --x: #eb6834;      /* activations (slot 2 orange) */
+    --x-light: #fbd9cc;
+    --acc: #1baf7a;    /* accumulator / output (slot 3 aqua) */
+    --acc-light: #cdeee0;
+    --dim: #b7b6b0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface: #1a1a19;
+      --panel: #242423;
+      --text-1: #ffffff;
+      --text-2: #c3c2b7;
+      --grid: #3a3a38;
+      --w: #3987e5;
+      --w-light: #1c3a5e;
+      --x: #d95926;
+      --x-light: #5a2a17;
+      --acc: #199e70;
+      --acc-light: #16442f;
+      --dim: #5a5a57;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 48px;
+    background: var(--surface); color: var(--text-1);
+    font: 15px/1.55 -apple-system, "Segoe UI", "Noto Sans KR", Roboto, sans-serif;
+    max-width: 1240px; margin-inline: auto;
+  }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 8px; }
+  .sub { color: var(--text-2); margin: 0 0 28px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 28px; }
+  @media (max-width: 900px) { .row { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border-radius: 10px; padding: 18px 18px 14px;
+  }
+  .panel p { color: var(--text-2); margin: 6px 0 0; font-size: 14px; }
+  .panel .verdict { margin-top: 10px; font-size: 14px; color: var(--text-1); }
+  svg { width: 100%; height: auto; display: block; }
+  text { font-family: inherit; fill: var(--text-1); }
+  .t2 { fill: var(--text-2); }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--text-2); margin: 0 0 22px; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+    margin-right: 6px; vertical-align: -2px; background: var(--c);
+  }
+  .ctrl { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text-2); margin: 6px 0 4px; }
+  .ctrl input[type=range] { width: 160px; accent-color: var(--w); }
+  .ctrl button {
+    border: 1px solid var(--grid); background: var(--surface); color: var(--text-1);
+    border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin-top: 4px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { color: var(--text-2); font-weight: 600; }
+  td:first-child { color: var(--text-2); white-space: nowrap; }
+  .note { color: var(--text-2); font-size: 13px; margin-top: 18px; }
+  .tip {
+    position: fixed; pointer-events: none; background: var(--text-1); color: var(--surface);
+    padding: 6px 9px; border-radius: 6px; font-size: 12px; line-height: 1.4;
+    opacity: 0; transition: opacity .08s; white-space: nowrap; z-index: 10;
+  }
+</style>
+</head>
+<body>
+
+<h1>P2 — 왜 32행 타일 가중치 레이아웃인가</h1>
+<p class="sub">W8A8 matmul: <span class="mono">y[n] = Σ<sub>k</sub> w[n][k]·x[k]</span>, int8 × int8 → int32.
+HVX 벡터는 128바이트, <span class="mono">vrmpy</span>는 lane 32개 × (4 MAC)을 한 명령에 수행한다.
+두 방식 모두 명령 한 번에 128 MAC이지만, 그 128 MAC이 <b>어디에 쌓이는지</b>가 다르다.</p>
+
+<div class="legend">
+  <span style="--c: var(--w)">가중치 w (int8, 이미지에 고정)</span>
+  <span style="--c: var(--x)">활성값 x (int8, 토큰마다 바뀜)</span>
+  <span style="--c: var(--acc)">누산기 lane / 출력 y</span>
+</div>
+
+<div class="row">
+  <div class="panel">
+    <h2>지금: 행 순서 <span class="mono">[N][K]</span> + <span class="mono">hvx_dot_i8</span></h2>
+    <div class="ctrl">
+      <label>k 청크 <input id="rowStep" type="range" min="0" max="7" value="0"></label>
+      <span id="rowStepLabel" class="mono"></span>
+    </div>
+    <svg id="svgRow" viewBox="0 0 600 420" role="img" aria-label="행 순서 레이아웃: 벡터 하나가 한 행의 128 k를 담고, 32 lane을 수평으로 더해 출력 하나를 만든다"></svg>
+    <p>벡터 하나 = <b>한 행</b>의 연속 128 k. lane 32개는 모두 <b>같은 출력 y[n]</b>의 조각이다.
+    K를 다 돈 뒤 32 lane을 수평으로 합쳐야 값 하나가 나오고, 다음 행으로 넘어가 처음부터 반복한다.</p>
+    <p class="verdict">→ 출력 1개당 리덕션 1회. 행 순서 메모리에서는 이 형태밖에 만들 수 없다.</p>
+  </div>
+
+  <div class="panel">
+    <h2>P2 이후: 32행 × 128k 타일 (4 KB) + <span class="mono">vrmpyacc</span></h2>
+    <div class="ctrl">
+      <label>벡터 g <input id="tileStep" type="range" min="0" max="31" value="0"></label>
+      <span id="tileStepLabel" class="mono"></span>
+      <button id="play">▶ 재생</button>
+    </div>
+    <svg id="svgTile" viewBox="0 0 600 420" role="img" aria-label="타일 레이아웃: 벡터 하나가 32행의 연속 4 k를 담고, lane마다 다른 출력 행이 쌓인다"></svg>
+    <p>벡터 v[g] = <b>32개 행</b> × 연속 4 k. x는 같은 4바이트를 32 lane에 복제(splat).
+    lane r에는 <b>행 nt·32+r</b>의 부분합이 쌓이고, g=0..31과 k-타일을 다 돌면 lane 32개가 그대로 완성된 y 32개다.</p>
+    <p class="verdict">→ 수평 리덕션 없음. 출력 32개가 한 누산기에서 동시에 완성된다.</p>
+  </div>
+</div>
+
+<div class="panel" style="margin-bottom: 28px;">
+  <h2>메모리 순서와 DMA</h2>
+  <svg id="svgMem" viewBox="0 0 1160 190" role="img" aria-label="행 순서와 타일 순서의 바이트 배열 비교"></svg>
+  <p>타일 순서에서는 n-타일 하나(행 32개)의 K 전체 스트립 <span class="mono">k_tiles × 4096 = 32·K</span> 바이트가 <b>연속</b>이다.
+  DDR → VTCM 전송이 디스크립터 1개의 선형 스트리밍이 된다. 값은 하나도 안 바뀌고 바이트 <b>순서만</b> 바뀐다(총 바이트 수 불변).</p>
+</div>
+
+<div class="panel">
+  <h2>정리</h2>
+  <table>
+    <tr><th></th><th>행 순서 + hvx_dot_i8</th><th>타일 + vrmpyacc (P3 커널)</th></tr>
+    <tr><td>벡터 1개의 내용</td><td>행 1개 × k 128</td><td>행 32개 × k 4</td></tr>
+    <tr><td>lane 32개의 의미</td><td>같은 y[n]의 조각 32개</td><td>서로 다른 y 32개</td></tr>
+    <tr><td>출력 32개를 얻는 데</td><td>행 32번 순회 + 리덕션 32회</td><td>누산 후 리덕션 0회</td></tr>
+    <tr><td>가중치 스트리밍</td><td>행 단위(K 바이트)로 흩어짐</td><td>32·K 바이트 연속, DMA 1개</td></tr>
+    <tr><td>전제</td><td>없음</td><td>가중치가 <b>미리</b> 타일 순서로 놓여 있어야 함 ← <b>P2</b></td></tr>
+  </table>
+  <p class="note">P2는 이 전제(레이아웃 + 세 소비자의 동일한 역인덱스 <span class="mono">nntr_htp_tile_off</span>)만 깔고, PPL·top1이 P2 전과 bit-exact임을 증명한다.
+  커널 교체(P3)는 그 위에서 산술만 신경 쓰면 된다. 예산: prefill ≈ 55 ms/tok 중 W8A8 ≈ 49 ms → 목표 10 ms에는 W8A8 약 13× 필요.</p>
+</div>
+
+<div id="tip" class="tip"></div>
+
+<script>
+(() => {
+  const NS = "http://www.w3.org/2000/svg";
+  const tip = document.getElementById("tip");
+  const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+  function el(parent, tag, attrs, text) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+    if (text !== undefined) e.textContent = text;
+    parent.appendChild(e);
+    return e;
+  }
+  function hover(node, html) {
+    node.addEventListener("mousemove", (ev) => {
+      tip.innerHTML = html; tip.style.opacity = 1;
+      tip.style.left = (ev.clientX + 14) + "px"; tip.style.top = (ev.clientY + 14) + "px";
+    });
+    node.addEventListener("mouseleave", () => tip.style.opacity = 0);
+  }
+  const rgba = (hex, a) => {
+    const n = parseInt(hex.slice(1), 16);
+    return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;
+  };
+
+  /* ---------------- shared geometry: a 32 x 32 grid standing for 32 rows x 128 k (4 k per cell) */
+  const G = { x: 30, y: 46, cell: 8, rows: 32, cols: 32 };   // 256 x 256 px
+  function drawGrid(svg, title, subtitle) {
+    el(svg, "text", { x: G.x, y: 22, "font-size": 13, "font-weight": 600 }, title);
+    el(svg, "text", { x: G.x, y: 38, "font-size": 11, class: "t2" }, subtitle);
+    const grp = el(svg, "g");
+    for (let r = 0; r < G.rows; r++)
+      for (let c = 0; c < G.cols; c++)
+        el(grp, "rect", { x: G.x + c*G.cell, y: G.y + r*G.cell, width: G.cell-1, height: G.cell-1,
+                          fill: css("--w-light"), "data-r": r, "data-c": c });
+    // axes
+    el(svg, "text", { x: G.x + 128, y: G.y + 256 + 18, "font-size": 11, "text-anchor": "middle", class: "t2" },
+       "k →  (한 칸 = 연속 4 k, 가로 32칸 = 128 k)");
+    const ty = el(svg, "text", { x: G.x - 10, y: G.y + 128, "font-size": 11, "text-anchor": "middle", class: "t2",
+                                 transform: `rotate(-90 ${G.x-10} ${G.y+128})` }, "n (행) ↓  32행");
+    return grp;
+  }
+  function paint(grp, pred, color) {
+    for (const rect of grp.children) {
+      const r = +rect.dataset.r, c = +rect.dataset.c;
+      rect.setAttribute("fill", pred(r, c) ? color : css("--w-light"));
+    }
+  }
+  // right-hand column: x vector, vrmpy box, 32 lanes
+  function drawLanes(svg, laneLabel) {
+    const lx = 350, ly = G.y;
+    el(svg, "text", { x: lx, y: 38, "font-size": 11, class: "t2" }, laneLabel);
+    const lanes = [];
+    for (let r = 0; r < 32; r++)
+      lanes.push(el(svg, "rect", { x: lx, y: ly + r*8, width: 120, height: 7, rx: 1, fill: css("--acc-light") }));
+    el(svg, "text", { x: lx + 60, y: ly + 256 + 18, "font-size": 11, "text-anchor": "middle", class: "t2" }, "누산기 lane 0..31 (int32)");
+    return { lanes, lx, ly };
+  }
+  function arrow(svg, x1, y1, x2, y2, color) {
+    const id = "ah" + Math.random().toString(36).slice(2, 7);
+    const d = el(svg, "defs");
+    const m = el(d, "marker", { id, viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto-start-reverse" });
+    el(m, "path", { d: "M0,0 L10,5 L0,10 z", fill: color });
+    el(svg, "line", { x1, y1, x2, y2, stroke: color, "stroke-width": 2, "marker-end": `url(#${id})` });
+  }
+
+  /* ---------------- LEFT: row-major */
+  {
+    const svg = document.getElementById("svgRow");
+    const grp = drawGrid(svg, "가중치 w[n][k] — 행 n=0..31의 k 0..127 구간", "메모리: 행 n의 k 0..K-1 이 연속, 다음 행이 그 뒤에");
+    const { lanes, lx, ly } = drawLanes(svg, "vrmpy: lane r = 행 n, k[4r..4r+3] 의 합");
+    // x vector: 128 k under the grid highlighted row → show as bar on top of lanes
+    const xBar = el(svg, "rect", { x: lx, y: 24 - 8, width: 120, height: 0, fill: "none" });
+    const yOut = el(svg, "rect", { x: lx + 40, y: ly + 256 + 40, width: 40, height: 14, rx: 4, fill: css("--acc") });
+    el(svg, "text", { x: lx + 60, y: ly + 256 + 70, "font-size": 11, "text-anchor": "middle", class: "t2" }, "수평 리덕션 32→1");
+    const yLabel = el(svg, "text", { x: lx + 60, y: ly + 256 + 84, "font-size": 12, "text-anchor": "middle", class: "mono" }, "");
+    arrow(svg, lx + 60, ly + 258, lx + 60, ly + 256 + 38, css("--acc"));
+    // reduction fan lines
+    for (let r = 0; r < 32; r += 4)
+      el(svg, "line", { x1: lx + 120, y1: ly + r*8 + 4, x2: lx + 122, y2: ly + r*8 + 4, stroke: css("--dim"), "stroke-width": 1 });
+    // caption showing the chosen row (n) and step
+    const stepLbl = document.getElementById("rowStepLabel");
+    const slider = document.getElementById("rowStep");
+    const ROW = 5;   // the row being computed
+    function render() {
+      const s = +slider.value;                 // which 128-k chunk of the row; grid shows chunk 0 only, so lanes colour all
+      paint(grp, (r, c) => r === ROW, css("--w"));
+      lanes.forEach((ln, r) => ln.setAttribute("fill", css("--acc")));
+      stepLbl.textContent = `행 n=${ROW}, k=${s*128}..${s*128+127}  `;
+      yLabel.textContent = `y[${ROW}]  ← 값 1개`;
+    }
+    for (const rect of grp.children) hover(rect, `w[n=${rect.dataset.r}][k=${rect.dataset.c*4}..${rect.dataset.c*4+3}]<br>행 순서 오프셋 = n·K + k`);
+    lanes.forEach((ln, r) => hover(ln, `lane ${r}: 행 n=${ROW} 의 k[${4*r}..${4*r+3}] 부분합<br>→ 최종엔 32 lane을 모두 더해야 y[${ROW}]`));
+    hover(yOut, `y[${ROW}] 하나를 얻는 데 K/128 vrmpy + 리덕션 1회`);
+    slider.addEventListener("input", render);
+    render();
+  }
+
+  /* ---------------- RIGHT: tiled */
+  {
+    const svg = document.getElementById("svgTile");
+    const grp = drawGrid(svg, "타일(nt, kt) = 32행 × 128k = 4096 B", "메모리: v[0], v[1], …, v[31] 순서로 128 B씩 연속");
+    const { lanes, lx, ly } = drawLanes(svg, "vrmpyacc: lane r = 행 r 의 누적 합");
+    el(svg, "text", { x: lx + 60, y: ly + 256 + 40, "font-size": 11, "text-anchor": "middle", class: "t2" }, "K 완주 후: lane r 가 곧 y[nt·32 + r]");
+    const out = [];
+    for (let r = 0; r < 32; r++)
+      out.push(el(svg, "rect", { x: lx + r*3.75, y: ly + 256 + 48, width: 3, height: 14, rx: 1, fill: css("--acc") }));
+    el(svg, "text", { x: lx + 60, y: ly + 256 + 84, "font-size": 12, "text-anchor": "middle", class: "mono" }, "y[0..31]  ← 값 32개, 리덕션 0회");
+    arrow(svg, lx + 60, ly + 258, lx + 60, ly + 256 + 46, css("--acc"));
+    // x splat indicator drawn above the grid column
+    const xMark = el(svg, "rect", { x: 0, y: G.y - 6, width: G.cell - 1, height: 4, rx: 1, fill: css("--x") });
+    const slider = document.getElementById("tileStep");
+    const lbl = document.getElementById("tileStepLabel");
+    function render() {
+      const g = +slider.value;
+      paint(grp, (r, c) => c === g, css("--w"));
+      // lanes fill progressively: intensity by how many g have been accumulated
+      lanes.forEach((ln) => ln.setAttribute("fill", rgba(css("--acc"), 0.25 + 0.75 * (g + 1) / 32)));
+      xMark.setAttribute("x", G.x + g*G.cell);
+      lbl.textContent = `v[${g}] = 32행 × k[${4*g}..${4*g+3}] · x[${4*g}..+3] splat`;
+    }
+    for (const rect of grp.children)
+      hover(rect, `w[n=${rect.dataset.r}][k=${rect.dataset.c*4}..+3]<br>타일 내 오프셋 = g·128 + r·4 (g=${rect.dataset.c}, r=${rect.dataset.r})`);
+    lanes.forEach((ln, r) => hover(ln, `lane ${r}: 행 nt·32+${r} 의 부분합<br>다른 lane과 섞이지 않음 → 그대로 y`));
+    slider.addEventListener("input", render);
+    let timer = null;
+    document.getElementById("play").addEventListener("click", (ev) => {
+      if (timer) { clearInterval(timer); timer = null; ev.target.textContent = "▶ 재생"; return; }
+      ev.target.textContent = "⏸ 정지";
+      timer = setInterval(() => { slider.value = (+slider.value + 1) % 32; render(); }, 180);
+    });
+    render();
+  }
+
+  /* ---------------- BOTTOM: memory order bars */
+  {
+    const svg = document.getElementById("svgMem");
+    const W = 1100, x0 = 30;
+    // conceptual N=64 rows, K=256 (2 k-tiles): each row = 256 B; total 16 KB; draw as 64 segments per row-major, 4 tiles per tiled.
+    const rowsN = 64, K = 256, kt = K / 128, ntiles = rowsN / 32;
+    // row-major bar
+    el(svg, "text", { x: x0, y: 22, "font-size": 13, "font-weight": 600 }, "행 순서  [N][K]  (예: N=64, K=256 → 16 KB)");
+    const y1 = 32, h = 34;
+    const seg = W / rowsN;
+    for (let n = 0; n < rowsN; n++) {
+      const inTile0 = n < 32;
+      const r = el(svg, "rect", { x: x0 + n*seg, y: y1, width: seg - 1, height: h, rx: 2,
+                                  fill: inTile0 ? css("--w") : css("--w-light") });
+      hover(r, `행 n=${n}: 오프셋 ${n*K} .. ${n*K+K-1}  (${K} B)`);
+    }
+    el(svg, "text", { x: x0, y: y1 + h + 16, "font-size": 11, class: "t2" },
+       "행 0..31 (진한 색)의 바이트는 각 256 B 조각이 이어져 있지만, 커널이 원하는 '32행 × 같은 k' 는 256 B 간격으로 흩어져 있다 → 행마다 따로 가져와 재배열");
+
+    // tiled bar
+    const y2 = 112;
+    el(svg, "text", { x: x0, y: y2 - 10, "font-size": 13, "font-weight": 600 }, "타일 순서  tile(nt, kt) = (nt·k_tiles + kt)·4096  (같은 16 KB)");
+    const tileW = W / (ntiles * kt);
+    for (let nt = 0; nt < ntiles; nt++)
+      for (let k = 0; k < kt; k++) {
+        const i = nt*kt + k;
+        const r = el(svg, "rect", { x: x0 + i*tileW, y: y2, width: tileW - 2, height: h, rx: 3,
+                                    fill: nt === 0 ? css("--w") : css("--w-light") });
+        hover(r, `tile(nt=${nt}, kt=${k}): 오프셋 ${i*4096} .. ${i*4096+4095}<br>행 ${nt*32}..${nt*32+31} × k ${k*128}..${k*128+127}`);
+        el(svg, "text", { x: x0 + i*tileW + tileW/2, y: y2 + 22, "font-size": 12, "text-anchor": "middle",
+                          fill: nt === 0 ? "#ffffff" : css("--text-2"), class: "mono" }, `tile(${nt},${k})`);
+      }
+    // DMA brace for nt=0 strip
+    const bx1 = x0, bx2 = x0 + kt*tileW - 2, by = y2 + h + 8;
+    el(svg, "path", { d: `M${bx1},${by} v6 H${bx2} v-6`, stroke: css("--acc"), fill: "none", "stroke-width": 2 });
+    el(svg, "text", { x: (bx1 + bx2)/2, y: by + 22, "font-size": 11, "text-anchor": "middle", fill: css("--text-1") },
+       `n-타일 0의 K 전체 스트립 = k_tiles × 4096 = 32·K B 연속 → DMA 디스크립터 1개`);
+  }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hexagon backend guide — 03 Kernels</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb;
+    --panel: #f3f3f1;
+    --text-1: #0b0b0b;
+    --text-2: #52514e;
+    --grid: #d9d8d3;
+    --w: #2a78d6;      /* weights  (slot 1 blue)   */
+    --w-light: #cde2fb;
+    --x: #eb6834;      /* activations (slot 2 orange) */
+    --x-light: #fbd9cc;
+    --acc: #1baf7a;    /* accumulator / output (slot 3 aqua) */
+    --acc-light: #cdeee0;
+    --dim: #b7b6b0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface: #1a1a19;
+      --panel: #242423;
+      --text-1: #ffffff;
+      --text-2: #c3c2b7;
+      --grid: #3a3a38;
+      --w: #3987e5;
+      --w-light: #1c3a5e;
+      --x: #d95926;
+      --x-light: #5a2a17;
+      --acc: #199e70;
+      --acc-light: #16442f;
+      --dim: #5a5a57;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 48px;
+    background: var(--surface); color: var(--text-1);
+    font: 15px/1.55 -apple-system, "Segoe UI", "Noto Sans KR", Roboto, sans-serif;
+    max-width: 1240px; margin-inline: auto;
+  }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 8px; }
+  .sub { color: var(--text-2); margin: 0 0 28px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 28px; }
+  @media (max-width: 900px) { .row { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border-radius: 10px; padding: 18px 18px 14px;
+  }
+  .panel p { color: var(--text-2); margin: 6px 0 0; font-size: 14px; }
+  .panel .verdict { margin-top: 10px; font-size: 14px; color: var(--text-1); }
+  svg { width: 100%; height: auto; display: block; }
+  text { font-family: inherit; fill: var(--text-1); }
+  .t2 { fill: var(--text-2); }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--text-2); margin: 0 0 22px; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+    margin-right: 6px; vertical-align: -2px; background: var(--c);
+  }
+  .ctrl { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text-2); margin: 6px 0 4px; }
+  .ctrl input[type=range] { width: 160px; accent-color: var(--w); }
+  .ctrl button {
+    border: 1px solid var(--grid); background: var(--surface); color: var(--text-1);
+    border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin-top: 4px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { color: var(--text-2); font-weight: 600; }
+  td:first-child { color: var(--text-2); white-space: nowrap; }
+  .note { color: var(--text-2); font-size: 13px; margin-top: 18px; }
+  .tip {
+    position: fixed; pointer-events: none; background: var(--text-1); color: var(--surface);
+    padding: 6px 9px; border-radius: 6px; font-size: 12px; line-height: 1.4;
+    opacity: 0; transition: opacity .08s; white-space: nowrap; z-index: 10;
+  }
+</style>
+<style>
+  /* guide additions: identical on every page of hexagon-guide/ */
+  nav.guide { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; margin: 0 0 24px; padding: 10px 0; border-block: 1px solid var(--grid); }
+  nav.guide a { color: var(--text-2); text-decoration: none; }
+  nav.guide a.here { color: var(--text-1); font-weight: 600; }
+  nav.guide a:hover { color: var(--w); }
+  a { color: var(--w); }
+  .panel { margin-bottom: 24px; }
+  .panel ul, .panel ol { color: var(--text-2); font-size: 14px; margin: 6px 0 0; padding-left: 22px; }
+  .panel li { margin: 3px 0; }
+  .panel li b, .panel p b { color: var(--text-1); }
+  pre { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 10px 12px; font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; overflow-x: auto; margin: 8px 0; color: var(--text-1); white-space: pre; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.93em; }
+  .src { color: var(--text-2); font-size: 12px; }
+  .status { border-left: 4px solid var(--acc); }
+  .warn { border-left: 4px solid var(--x); }
+  .step { counter-increment: step; }
+  .kv td:first-child { white-space: normal; }
+  dl.gl { margin: 0; font-size: 14px; }
+  dl.gl dt { font-weight: 600; margin-top: 10px; }
+  dl.gl dd { margin: 2px 0 0; color: var(--text-2); }
+  td, th { word-break: break-word; }
+  td:first-child { white-space: normal; }
+</style>
+</head>
+<body>
+<nav class="guide">
+  <a href="index.html">Overview</a>
+  <a href="01-run-it.html">01 Run it</a>
+  <a href="02-architecture.html">02 Architecture</a>
+  <a class="here" href="03-kernels.html">03 Kernels</a>
+  <a href="04-measure-and-debug.html">04 Measure and debug</a>
+  <a href="05-glossary.html">05 Glossary</a>
+  <a href="06-performance.html">06 Performance</a>
+</nav>
+<h1>03 · Kernels: what the DSP actually computes, and why it is written this way</h1>
+<p class="sub">Four kernels carry almost all of the time, plus one helper that feeds them. Each section says what the math is, how the vector unit does it, what it bought, and where the number comes from. The last section explains the project's most surprising rule — float arithmetic only in Qualcomm's "qf" format — in plain words.</p>
+
+<div class="legend">
+  <span style="--c: var(--w)">weights (int8, fixed in the image)</span>
+  <span style="--c: var(--x)">activations (quantized per token, change every call)</span>
+  <span style="--c: var(--acc)">accumulator lanes / outputs</span>
+</div>
+
+<div class="panel">
+  <h2>Quantization in one paragraph</h2>
+  <p>The model's weights are stored as 8-bit integers with one floating-point scale per output row ("W8", per-channel; the checkpoint format is called W8_CX). Activations — the numbers flowing between layers — are fp16 and are converted to 8-bit integers on the fly, one scale per token ("A8", per-token dynamic quantization), right before each matmul. The matmul then multiplies integers, which the vector unit does very fast and exactly, and only at the end multiplies the integer sum by the two scales to get back a float. One layer, <code>down_proj</code>, keeps 16-bit activations instead ("A16") because 8 bits lose too much there (HEXAGON.md §1.4, §2.3, §7 rule 8).</p>
+</div>
+
+<div class="panel">
+  <h2>1 · W8A8 tiled <code>vrmpy</code> matmul (q, k, v, o, gate, up and the logits)</h2>
+  <svg viewBox="0 0 760 250" role="img" aria-label="One 128-byte weight vector holds 4 consecutive k of 32 rows; the 4-byte activation is broadcast; vrmpyacc adds a 4-product partial sum into each of 32 int32 lanes">
+    <text x="20" y="22" font-size="12" font-weight="600">weight vector v[g] (128 B)</text>
+    <text x="20" y="38" font-size="10" class="t2">32 rows × 4 consecutive k</text>
+    <g>
+      <rect x="20" y="48" width="200" height="176" fill="var(--w-light)"/>
+      <line x1="20" y1="70" x2="220" y2="70" stroke="var(--surface)"/><line x1="20" y1="92" x2="220" y2="92" stroke="var(--surface)"/>
+      <line x1="20" y1="114" x2="220" y2="114" stroke="var(--surface)"/><line x1="20" y1="136" x2="220" y2="136" stroke="var(--surface)"/>
+      <line x1="20" y1="158" x2="220" y2="158" stroke="var(--surface)"/><line x1="20" y1="180" x2="220" y2="180" stroke="var(--surface)"/>
+      <line x1="20" y1="202" x2="220" y2="202" stroke="var(--surface)"/>
+      <line x1="70" y1="48" x2="70" y2="224" stroke="var(--surface)"/><line x1="120" y1="48" x2="120" y2="224" stroke="var(--surface)"/><line x1="170" y1="48" x2="170" y2="224" stroke="var(--surface)"/>
+      <text x="45" y="63" font-size="9" text-anchor="middle">w[r][4g]</text><text x="95" y="63" font-size="9" text-anchor="middle">+1</text><text x="145" y="63" font-size="9" text-anchor="middle">+2</text><text x="195" y="63" font-size="9" text-anchor="middle">+3</text>
+      <text x="120" y="215" font-size="9" text-anchor="middle" class="t2">… row r = 0..31 of tile nt</text>
+    </g>
+    <text x="300" y="22" font-size="12" font-weight="600">activation splat</text>
+    <text x="300" y="38" font-size="10" class="t2">same 4 bytes xq[4g..4g+3] in all 32 lanes</text>
+    <rect x="300" y="48" width="120" height="176" fill="var(--x-light)"/>
+    <text x="360" y="140" font-size="10" text-anchor="middle">Q6_V_vsplat_R</text>
+    <text x="480" y="22" font-size="12" font-weight="600">acc: 32 int32 lanes</text>
+    <text x="480" y="38" font-size="10" class="t2">lane r ← lane r + Σ₄ w·x</text>
+    <rect x="480" y="48" width="120" height="176" fill="var(--acc-light)"/>
+    <text x="540" y="140" font-size="10" text-anchor="middle">Q6_Vw_vrmpyacc_VwVbVb</text>
+    <text x="240" y="140" font-size="16" text-anchor="middle">×</text>
+    <text x="450" y="140" font-size="16" text-anchor="middle">→</text>
+    <text x="680" y="120" font-size="10" text-anchor="middle" class="t2">after all g and all</text>
+    <text x="680" y="134" font-size="10" text-anchor="middle" class="t2">k-tiles: lane r is</text>
+    <text x="680" y="148" font-size="10" text-anchor="middle" class="t2">the whole dot product</text>
+    <text x="680" y="162" font-size="10" text-anchor="middle" class="t2">of row nt·32 + r</text>
+    <text x="380" y="245" font-size="11" text-anchor="middle" class="t2">no horizontal reduction, no vector-to-scalar traffic (HEXAGON.md §2.1, §7 rule 5)</text>
+  </svg>
+  <ul>
+    <li><b>The layout does the work.</b> An int8 <code>[N][K]</code> weight is stored as 4 KB tiles of 32 rows × 128 k. Inside a tile, vector <code>g</code> holds bytes <code>[4r, 4r+3] = w[nt·32 + r][kt·128 + 4g .. +3]</code>. One <code>vrmpyacc</code> of that vector against a 4-byte broadcast of the activation adds a 4-product partial sum into each of 32 int32 lanes, one lane per output row. After the tile's 32 vectors and all k-tiles, every lane is a finished dot product. A whole n-tile's K strip (<code>32·K</code> bytes) is contiguous, so one DMA descriptor streams it (HEXAGON.md §2.1; nntr_htp_common.h; the interactive picture is <code>docs/superpowers/specs/hexagon-hvx-optimization/02-tiled-weight-layout-why.html</code>).</li>
+    <li><b>Exact integers, then two multiplies.</b> Integer sums are exact in any order, so they match the scalar reference bit for bit. The epilogue converts with <code>Q6_Vsf_equals_Vw</code> and multiplies in the reference's order <code>((float)acc × sw[n]) × sx[t]</code> using qf32 ops, then narrows once to fp16. The qf32 rounding can differ from an IEEE product by one fp16 ulp, which is why the unit tests keep a 2e-3 / 1e-3 bound (HEXAGON.md §7 rule 5).</li>
+    <li><b>Token blocking.</b> <code>MM_TB = 4</code>: one weight-vector load feeds four <code>vrmpyacc</code>, one per token. It showed only 1.3–3.7 % in the simulator, which does not charge weight bandwidth realistically. On the device it is inert in decode (m = 1: one token, nothing to block), so its sweep is a prefill question and was moved from #25 to issue #57 (HEXAGON.md §8.3, §9; ledger ⑩).</li>
+    <li><b>Where the kernel stands on the device (#25, 2026-09-18, merged in PR #61).</b> With the cross-op weight prefetch the W8A8 matmuls of a 512-context decode step take 16.1 Mcyc, 0.5 Mcyc <em>less</em> than a skel that DMAs the same weight bytes and multiplies nothing: the int8 multiply is fully hidden behind the weight stream, and the stream itself (596 MB per step at 32.3 GB/s, 54 tok/s) is the bound. What is left in the step is attention (32 % at 512, 79 % at 4096; issue #58), the int16 <code>down_proj</code> below, and eltwise (HEXAGON.md §8.2 "#25"; 25-decode-prefetch.md "Notes").</li>
+    <li><b>What is meant to replace it for the six projections (issue #65) — and where that stands on 2026-09-21.</b> The user decision of 2026-09-18 ends the A8W8 HVX-only line with the issues already filed and makes the top goal a 4-bit port: the q/k/v/o/gate/up matmuls move to the HMX matrix unit (u8 activation × int4 weight through HexKL, per-channel scales, the <code>w4cx</code> layout) with a new <code>MATMUL_W4A8</code> kind, while this kernel keeps serving the W8 image and, if HMX turns out to pad a single decode row to 64 at too high a cost, an m=1 HVX W4 variant of it (unsigned nibbles plus an <code>8·Σx</code> correction, the design #51 had) takes decode. The reference the W4 rows are read against is GENIEX_QAIRT w4a16: 8,207 / 121 tok/s at 512 (plan docs/plans/65-w4-htp-port.md §1, §3, §4). <b>S0 (#68) is merged</b> (PR #72): HexKL is linked, HMX and a VTCM arena are acquired at init, <code>hexkl_acc_tile</code> is ported and the <code>hmx</code> simulator test proves a 64×32 u8 × 32×32 i4 micro-matmul bit-exact on the v79 simulator — but there is still <b>no HMX op kernel</b>; this <code>vrmpy</code> kernel serves every projection and its STATs are bit-identical to before (HEXAGON.md §2.2, §5.2, §7 rules 10–11). <b>S1 (#69) is in review, pending a user decision</b>: on branch <code>hvx/69-w4cx-producer-abi5</code> the x86 W4 reference exists and is bit-exact against a numpy evaluation, but its accuracy gate failed — per-channel int4 round-to-nearest on Qwen3-0.6B gives PPL <b>46.2279 / 148</b> against W8's <b>22.5282 / 186</b> (2.052 ×) on a 512-token prompt, where the plan's stop line was 1.25 × even with q/k/v/o kept int8 (Torch fake quant: only gate + up int4 1.280 ×; a per-row clip search 1.196 × for those two alone). Group scales, which #51's <code>w4g128</code> had as its accuracy insurance, cannot be expressed in HMX's per-channel tiles (HEXAGON.md §8.1 "Per-channel int4" on that branch; plan 65 §3.1, §4 S1). Nothing of S1 is on <code>hvx_impl</code>.</li>
+    <li><b>What it bought.</b> Simulator, prefill of 128 tokens at position 512: <code>MATMUL_W8A8</code> 938,298,568 → 20,931,069 pcycles (44.8×); decode W8A8 + LOGITS 8,134,596 → 527,389 (15.4×) (HEXAGON.md §8.3 "M6 P3"). Device (S25 Ultra): a 128-token prefill chunk went from ≈ 5.4 s to 736 ms and teacher-forced decode from 156 M to 55.9 M pcycles per step (HEXAGON.md §8.2 "M6 P3 on device").</li>
+    <li>Rows are split across workers in whole tiles; a worker can get an empty range (tested with n = 64 over four workers). MATMUL_LOGITS is the same kernel with m = 1 and fp32 output whose store is unaligned-safe (hvx-matmul.c; HEXAGON.md §5.2).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>2 · W8A16 int16 <code>down_proj</code></h2>
+  <svg viewBox="0 0 760 200" role="img" aria-label="int8 weight bytes are unpacked to int16, multiplied lane-wise with int16 activations into int32 lanes; four rows are then folded with shuffles">
+    <rect x="20" y="40" width="180" height="40" rx="6" fill="var(--w-light)"/>
+    <text x="110" y="64" font-size="11" text-anchor="middle">128 int8 weight bytes (row-major)</text>
+    <rect x="20" y="120" width="180" height="40" rx="6" fill="var(--w-light)"/>
+    <text x="110" y="144" font-size="11" text-anchor="middle">Q6_Wh_vunpack_Vb → 128 int16</text>
+    <line x1="110" y1="80" x2="110" y2="120" stroke="var(--dim)" stroke-width="2"/>
+    <rect x="260" y="120" width="160" height="40" rx="6" fill="var(--x-light)"/>
+    <text x="340" y="144" font-size="11" text-anchor="middle">int16 activation row</text>
+    <rect x="480" y="120" width="120" height="40" rx="6" fill="var(--acc-light)"/>
+    <text x="540" y="144" font-size="11" text-anchor="middle">64 int32 lanes</text>
+    <text x="230" y="144" font-size="16" text-anchor="middle">×</text>
+    <text x="450" y="144" font-size="16" text-anchor="middle">→</text>
+    <text x="540" y="100" font-size="10" text-anchor="middle" class="t2">Q6_Ww_vmpyacc_WwVhVh</text>
+    <rect x="640" y="100" width="110" height="80" rx="6" fill="none" stroke="var(--grid)"/>
+    <text x="695" y="125" font-size="10" text-anchor="middle" class="t2">fold 4 rows:</text>
+    <text x="695" y="140" font-size="10" text-anchor="middle" class="t2">2 × vshuff</text>
+    <text x="695" y="155" font-size="10" text-anchor="middle" class="t2">3 × vror, qf32</text>
+    <line x1="600" y1="140" x2="640" y2="140" stroke="var(--dim)" stroke-width="2"/>
+    <text x="380" y="190" font-size="11" text-anchor="middle" class="t2">exact int32 for k ≤ 16384; the validator rejects a larger k (HEXAGON.md §7 rule 8, §1.4)</text>
+  </svg>
+  <ul>
+    <li><b>Why not int8 here.</b> The input of <code>down_proj</code> is the SwiGLU output, which has large outliers; quantizing it per token to int8 costs about 6 % perplexity on its own (x86 breakdown on 128 tokens, reference 20.32: all-int8 21.72, <code>down</code> in fp32 20.38, while making <code>wo</code>, q/k/v/gate/up or the lm_head fp32 helps far less) (HEXAGON.md §2.3).</li>
+    <li><b>How.</b> The activation row is quantized per token to int16 (<code>absmax / 32767</code>). The kernel unpacks each 128 weight bytes to int16, multiplies lane-wise into int32 with <code>Q6_Ww_vmpyacc_WwVhVh</code> (a lane holds <code>k/64</code> products of magnitude ≤ 32767 × 127, which stays inside int32 for <code>k ≤ 16384</code>), then folds four rows together with two shuffles and three rotates, converting to fp32 first and folding in qf32. Scaling keeps the reference order, narrowing is one fp32→fp16 step, and no scalar horizontal sum is left. The weights stay row-major <code>[N][K]</code> because this kernel reads whole rows (HEXAGON.md §7 rule 8, §2.1; hvx-matmul.c header).</li>
+    <li><b>What it bought.</b> Simulator 8-token gate: <code>MATMUL_W8A16</code> per call 2,445,246 → 683,954 pcycles (3.58×), whole run 6,940,426 → 3,415,503 (2.03×) (HEXAGON.md §8.3 "M6 P4"). Device: 128-token prefill chunk 736 → 478 ms; generation-mode decode 32.0 tok/s host wall at 59.5 M pcycles per step; teacher-forced decode 43.3 M pcycles (HEXAGON.md §8.2 "M6 P4 on device").</li>
+    <li><b>Two facts from #25 (2026-09-18).</b> The four-row fold in the epilogue is exact for four rows only: a build with <code>MM16_R</code> other than 4 compiled and returned wrong <code>down_proj</code> rows silently, so #25 (PR #61, merged) pins <code>MM16_R</code> to 4 with a static check and issue #57 generalises the fold (R ∈ {2, 4, 8}) before it can be swept. And in the decode step this kernel is 8.6 Mcyc of 54.6 (15.7 %), only 1.35 Mcyc above the time its 88.1 MB of weights take to arrive — because those row-major rows come straight from DDR at 21 GB/s where the tiled DMA ring reaches 37; putting them on the ring is issue #59, worth about 3 Mcyc (HEXAGON.md §8.2 "#25", §9).</li>
+    <li><b>Accuracy effect.</b> The x86 reference itself moved when the definition changed (fp16 activation → int16): PPL 37.4738 → 37.1629 on the 387-token local prompt (−0.83 %). On the device the kernel is exact to its definition: recomputing the int16 reference from the DSP's <em>own</em> input gives rel-RMS 1.6e-4 with a max of one fp16 ulp (HEXAGON.md §5.1, §8.2).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>3 · Attention</h2>
+  <svg viewBox="0 0 760 210" role="img" aria-label="K is cached transposed so one vector spans 64 positions of one head dimension; scores accumulate per head dim, softmax in fp32 scratch, then P times V">
+    <text x="20" y="22" font-size="12" font-weight="600">K cache, transposed: [head_dim][max_seq]</text>
+    <rect x="20" y="34" width="330" height="100" fill="var(--acc-light)"/>
+    <line x1="20" y1="54" x2="350" y2="54" stroke="var(--surface)"/><line x1="20" y1="74" x2="350" y2="74" stroke="var(--surface)"/><line x1="20" y1="94" x2="350" y2="94" stroke="var(--surface)"/><line x1="20" y1="114" x2="350" y2="114" stroke="var(--surface)"/>
+    <rect x="20" y="54" width="130" height="20" fill="var(--acc)" opacity="0.8"/>
+    <text x="85" y="68" font-size="10" text-anchor="middle" fill="#fff">1 vector = 64 positions</text>
+    <text x="185" y="150" font-size="10" text-anchor="middle" class="t2">row = one dimension d (0..127) · column = position p</text>
+    <text x="185" y="166" font-size="10" text-anchor="middle" class="t2">score[p] += q[d] · K[d][p]  — 64 positions per multiply-accumulate</text>
+    <rect x="400" y="34" width="160" height="40" rx="6" fill="var(--x-light)"/><text x="480" y="58" font-size="11" text-anchor="middle">scores fp32, per-worker scratch</text>
+    <rect x="400" y="86" width="160" height="40" rx="6" fill="var(--x-light)"/><text x="480" y="110" font-size="11" text-anchor="middle">softmax (borrowed HVX exp)</text>
+    <rect x="400" y="138" width="160" height="40" rx="6" fill="var(--acc-light)"/><text x="480" y="162" font-size="11" text-anchor="middle">out = Σ p · V[p][:]</text>
+    <line x1="480" y1="74" x2="480" y2="86" stroke="var(--dim)" stroke-width="2"/><line x1="480" y1="126" x2="480" y2="138" stroke="var(--dim)" stroke-width="2"/>
+    <text x="660" y="60" font-size="10" text-anchor="middle" class="t2">workers split by KV head;</text>
+    <text x="660" y="74" font-size="10" text-anchor="middle" class="t2">GQA: 16 q heads share 8 kv heads</text>
+    <text x="660" y="110" font-size="10" text-anchor="middle" class="t2">causal: only p ≤ current pos</text>
+    <text x="660" y="150" font-size="10" text-anchor="middle" class="t2">V stored [max_seq][head_dim]</text>
+    <text x="380" y="200" font-size="11" text-anchor="middle" class="t2">hvx-attn.c header; HEXAGON.md §2.2, §8.2 (M4 → M5)</text>
+  </svg>
+  <ul>
+    <li><b>What it is.</b> For each query token, attention scores every earlier position (causal), turns the scores into weights with a softmax, and mixes the value vectors with those weights. Qwen3-0.6B uses grouped-query attention (GQA): 16 query heads share 8 key/value heads (HEXAGON.md §2.1 shape line; hvx-attn.c).</li>
+    <li><b>The trick is the K layout.</b> Keys are cached transposed, <code>[head_dim][max_seq]</code> per layer and head, so one 128-byte vector spans 64 positions of a single dimension and the score loop accumulates 64 positions per multiply-accumulate instead of doing a 64-lane horizontal sum per (query, position). That is the M4 → M5 change: at 512 tokens decode went 102.0 → 89.2 ms and no longer depends on position; a 128-token chunk at position 896 fell from 10.8 s to 6.5 s (HEXAGON.md §8.2 first table and bullets). The validator therefore requires <code>max_seq % 64 == 0</code> (HEXAGON.md §2.2).</li>
+    <li><b>Where it sits now.</b> After P3 and P4 it is the largest remaining cost at long context and the only one that grows with sequence length (simulator: 27.5 % of prefill at position 512, 16.7 % of decode; HEXAGON.md §8.3 P3 rows). K^T reuse across query rows in prefill is the planned P5 work (HEXAGON.md §9).</li>
+    <li>The kernel also appends this call's k and v into the cache and computes scores in fp32 scratch per worker, narrowing after the exp in place (hvx-attn.c).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>4 · The per-token quantizer (<code>quant_row</code>)</h2>
+  <svg viewBox="0 0 760 120" role="img" aria-label="Pipeline: fp16 row, absmax by unsigned max of sign-cleared bits, scale, qf32 multiply, magic-constant rounding, saturating pack to int8 or int16">
+    <rect x="10" y="40" width="110" height="40" rx="6" fill="var(--x-light)"/><text x="65" y="64" font-size="10" text-anchor="middle">fp16 row (k)</text>
+    <rect x="140" y="40" width="130" height="40" rx="6" fill="var(--x-light)"/><text x="205" y="58" font-size="10" text-anchor="middle">absmax = unsigned max</text><text x="205" y="72" font-size="10" text-anchor="middle">of sign-cleared bits</text>
+    <rect x="290" y="40" width="110" height="40" rx="6" fill="var(--x-light)"/><text x="345" y="58" font-size="10" text-anchor="middle">inv = qmax / absmax</text><text x="345" y="72" font-size="10" text-anchor="middle">127 or 32767</text>
+    <rect x="420" y="40" width="120" height="40" rx="6" fill="var(--x-light)"/><text x="480" y="58" font-size="10" text-anchor="middle">x · inv in qf32</text><text x="480" y="72" font-size="10" text-anchor="middle">+ magic, ties-to-even</text>
+    <rect x="560" y="40" width="110" height="40" rx="6" fill="var(--acc-light)"/><text x="615" y="58" font-size="10" text-anchor="middle">saturating pack</text><text x="615" y="72" font-size="10" text-anchor="middle">int8 / int16 + scale</text>
+    <line x1="120" y1="60" x2="140" y2="60" stroke="var(--dim)" stroke-width="2"/><line x1="270" y1="60" x2="290" y2="60" stroke="var(--dim)" stroke-width="2"/><line x1="400" y1="60" x2="420" y2="60" stroke="var(--dim)" stroke-width="2"/><line x1="540" y1="60" x2="560" y2="60" stroke="var(--dim)" stroke-width="2"/>
+    <text x="380" y="108" font-size="11" text-anchor="middle" class="t2">hvx-quant.h; scalar definitions ref_quant_row / ref_quant_row_i16 in test/hexagon/sim/ref_ops.c</text>
+  </svg>
+  <ul>
+    <li><b>Why it matters.</b> Before P3 this ran as scalar code, cost ≈ 345 k pcycles for one k = 1024 row, and at m = 1 a single worker ran it alone — it alone kept decode from meeting its target. Vectorizing it closed that gate and took simulated prefill from 18.19 to 7.37 ms/token (HEXAGON.md §8.3 P3 bullets).</li>
+    <li><b>How it rounds.</b> The vector unit's qf32 format uses "Von Neumann" (jam) rounding, so no qf-only kernel can reproduce <code>lrintf(x × inv)</code> for every input. The kernel adds a magic constant (<code>1.5 × 2^8</code> for int8, <code>1.5 × 2^16</code> for int16) so the integer bits read as a fixed-point product, then finishes the rounding as integer ops. The rounding resolution is 2^-14 of an int8 step (2^-6 for int16), so a small fraction of elements differ from the scalar reference by one LSB: modelled ~3.6e-5 for int8 (observed 0/65536 in <code>test_quant</code>), about 1 % for int16 (observed 167/25600). The tests allow exactly that (HEXAGON.md §7 rules 6 and 8, §5.2).</li>
+    <li>It runs on the worker pool, never on the RPC thread, even for a single row (HEXAGON.md §7 rule 7).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>5 · The elementwise kernels</h2>
+  <p>RMSNORM, ROPE, SILU_MUL, ADD and EMBED are cheap by comparison (all together under 2 % of simulated prefill; HEXAGON.md §8.3 P3 rows). Two things about them are worth knowing: they compute in fp32 inside the op and narrow to fp16 once (rule 2 below), and SILU clamps the exponent argument at <code>-g ≤ 80</code> because layer 27 of qwen3 produces <code>|g| &gt; 250</code>, which overflowed <code>exp(-g)</code> and turned <code>1/(1+inf)</code> into NaN in the HVX reciprocal (HEXAGON.md §7 rule 3). EMBED reads the tiled table through <code>nntr_htp_tile_off</code>, a gather of K/4 4-byte loads per token, once per forward (HEXAGON.md §2.1).</p>
+</div>
+
+<div class="panel warn">
+  <h2>6 · Why qf-format only — HEXAGON.md §7 in plain words</h2>
+  <p>The Hexagon vector unit (HVX) can do floating-point math in two number formats. One is the ordinary IEEE format everybody uses (<code>Vhf</code> for fp16, <code>Vsf</code> for fp32). The other is Qualcomm's own intermediate format, "qf16" / "qf32", which keeps an extra exponent range and rounds differently; you convert back to IEEE with a <code>_equals_</code> instruction when you are done. On the 8 Elite silicon this project targets, the IEEE-format instructions were found not to be trustworthy: <code>Q6_Vhf_vadd_VhfVhf</code> returned all zeros, and in a v79-native build <code>Q6_Wsf_vmpyacc_WsfVhfVhf</code> and chained <code>Q6_Vqf32_vadd_Vqf32Vqf32</code> produced infinities in attention and in the W8A16 dot (also on the v79 simulator, and sensitive to a printf). The rule that came out of it (HEXAGON.md §7 rule 1):</p>
+  <ul>
+    <li>Kernels use only qf-format arithmetic — <code>Wqf32_vmpy_VhfVhf</code>, <code>Vqf32_vadd/vsub_VsfVsf</code>, <code>Vqf32_vmpy_VsfVsf</code>, <code>Vsf_equals_Vqf32</code>, <code>Vhf_equals_Wqf32</code> — and, until #35, the shipping skel was built with <code>HEX_ARCH=v75</code>, which runs unchanged on v79 silicon.</li>
+    <li><b>A second rule about rounding</b> (§7 rule 2): converting a qf16 product straight to fp16 (<code>Vhf_equals_Vqf16</code>) rounds badly (a v75 simulator probe: correct 57 %, truncated 21 %, worse 21 %), while <code>Vhf_equals_Wqf32</code> is an exact round-to-nearest-even. So every kernel computes in fp32 inside the op and narrows to fp16 once, the same contract as the scalar reference; truncating at every op boundary instead costs 2.7 % perplexity.</li>
+    <li><b>The cost of the rule</b> is a small, understood accuracy band: the qf32 chain in attention and the W8A8 epilogue rounds differently from the fp32 reference, and the DSP-vs-reference perplexity gap sits at +0.16 … +1.29 % across prompts. It was isolated on a 1-layer image to that upstream chain, not to the new kernels (HEXAGON.md §8.2 "M6 P4 on device", §9; ledger ⑮).</li>
+  </ul>
+  <p><b>The 2026-09-17 twist.</b> With the SDK 6.4 toolchain (hexagon-clang 19.0.04) a v79-native skel ran the full 512 / 1024 / 4096 set on the S25 Ultra with no hang, no DSP restart and no fatal log line, tracking the v75 skel's perplexity and top-1 at every context and running 10–27 % faster (prefill +9.7 / +12.0 / +26.9 %, decode DSP cycles −6.5 / −9.1 / −16.6 %). The old infinities did not reproduce. But the same v79 build failed four simulator tests by ±1 LSB (<code>quant</code>, <code>matmul</code>, <code>matmul_dma</code>, <code>logits</code>) — all in qf-only code with no architecture branch — while the ops that <em>do</em> take the IEEE helpers on v79 (attention, elementwise) passed. Standing rule from it: a v79 change is judged by <b>both</b> gates — a ±1 LSB simulator failure does not predict a device failure, and a device <code>--eval</code> match does not clear a failing simulator test (HEXAGON.md §7 rule 1 update, §5.2, §8.2; 23-sdk64-baseline.md).</p>
+  <p><b>The 2026-09-18 closure (#35): rule 1's question is answered and v79 ships.</b> The four simulator failures were one sign bug in the quantiser's decode of the rounded product (rule 6), not the IEEE helpers; #35 replaced the qf32 magic-add decode with an integer decode of the sf bits, after which both simulators pass 13/13 (and the v75 int16 rounding became sign-symmetric). On silicon, a v79 skel built with the IEEE helpers (B1) and the same tree built with <code>-DHTP_FORCE_QF_HELPERS</code> (B2, the qf-format helpers forced on the <code>&gt;= 79</code> target) gave <b>the same PPL and top-1 digit for digit</b> on both 512-token prompts (32.4497 / 184 and 41.4947 / 162) and were within 0.5 % prefill / 0.1 % DSP cycles of each other, in 15 runs with no hang, SSR or fatal FARF line. So the 2026-08 inf / all-zero failures were a toolchain-8.x artefact: with 19.0.04 the IEEE-format path is neither a correctness nor a speed difference on this part. <b><code>HEX_ARCH=v79</code> is the shipping build</b>; v75 is a fallback built only when a change touches an <code>__HVX_ARCH__</code> branch. What B1 = B2 does <em>not</em> explain is why the v79 skel sits 1.7 % <em>below</em> the x86 reference on the P4 prompt where the v75 skel with the same decode sits +0.03 % above it; that lives somewhere in the v79 build outside the helpers (worker count, codegen) and joined the layer-0 bisection of #26 (ledger ⑮). Both the integer quantiser decode in <code>hvx-quant.h</code> and the <code>HTP_FORCE_QF_HELPERS</code> switch in <code>hvx-base.h</code> are on <code>hvx_impl</code> since #35 (HEXAGON.md §7 rule 1 "Closed", §9; 35-v79-skel.md "Notes"; <a href="06-performance.html">06 · Performance</a>).</p>
+  <p class="note">Where the architecture branch lives in the code: <code>hvx/hvx-base.h</code> selects, under <code>__HVX_ARCH__ &lt; 79</code>, qf32-based helpers for fp16/fp32 add, sub, mul and multiply-accumulate; at <code>&gt;= 79</code> the same helpers call the native IEEE instructions (<code>Q6_Vsf_vadd_VsfVsf</code>, <code>Q6_Wsf_vmpyacc_WsfVhfVhf</code>, …). The <code>quant_row</code> and W8A8 epilogue paths do not go through those helpers; their only arch-dependent instruction is the exact fp16→fp32 widening. The comment at the top of <code>hvx-attn.c</code> ("output is accumulated in IEEE fp32 vector pairs") describes the v79 branch of that helper; on the v75 build the same call is a qf32 add followed by a conversion.</p>
+</div>
+
+<div class="panel">
+  <h2>Rules to review any kernel change against</h2>
+  <table>
+    <tr><th>Rule (HEXAGON.md §7)</th><th>One line</th></tr>
+    <tr><td>1 qf-format only (closed by #35; v79 ships)</td><td>the 2026-08 IEEE misbehaviour was a toolchain-8.x artefact — on silicon IEEE and qf helpers give identical PPL / top-1; a v79 change is still judged by simulator and device both</td></tr>
+    <tr><td>2 fp32 inside, narrow once</td><td><code>Vhf_equals_Vqf16</code> rounds badly; <code>Vhf_equals_Wqf32</code> is exact RNE</td></tr>
+    <tr><td>3 SILU clamp</td><td><code>-g ≤ 80</code>, else NaN via the reciprocal</td></tr>
+    <tr><td>4 <code>-mhvx-ieee-fp</code></td><td>needed for the fp16 intrinsics; probed and printed by both build scripts</td></tr>
+    <tr><td>5 tiled int8 matmul</td><td>exact int32 sums; epilogue in reference order, qf32; one fp16 ulp tolerance</td></tr>
+    <tr><td>6 vector quantizer</td><td>magic-constant rounding; ±1 LSB at ≤ 2e-4 rate on generic rows; tie row byte-identical</td></tr>
+    <tr><td>7 HVX only on workers</td><td>the RPC thread owns no HVX context; the simulator will not tell you</td></tr>
+    <tr><td>8 int16 down_proj</td><td>exact for <code>k ≤ 16384</code>; ~1 % ±1 LSB; qf32 fold order differs from the int64 reference</td></tr>
+    <tr><td>10 HMX on worker 0 only (#68, 2026-09-21)</td><td>the HMX lock is per thread: worker 0 takes it lazily on its first HMX section and releases it in a <code>wp_run</code> job at destroy; an HMX kernel runs its HMX section on worker 0 and fans the HVX epilogue out, never the reverse; a refused HMX attribute means an op that needs HMX fails at <code>init</code>, never silently on HVX; the HVX kernels keep exactly the first 4 MB of VTCM and their slab geometry, so an HMX build's <code>profile acc</code> STAT must stay bit-identical (#68: = #25's)</td></tr>
+    <tr><td>11 the v79 simulator executes HMX (#68, 2026-09-21)</td><td>the plain <code>-mv79</code> core (<code>v79na_1</code>, HMX v3) runs HexKL's own micro-mm example bit-exact and <code>test_hmx</code> reads <code>max_abs=0</code> in place, through the vendor copy and after a VTCM → DDR → DMA → VTCM relocate, so every HMX numeric STAT is a simulator gate like the 13 HVX tests; only the int32 accumulator tile layout (sim: <code>usable=1 base=0 row_stride=32</code>) is device-only and is re-read on the silicon in the first HMX handoff (H1, #70) — a device <code>usable=0</code> sends that path to HexKL's slower vendor copy, a measured cost, not a hang. The WH weight-tile permutation the test prints (element <code>(k, n)</code> of a 32×32 int4 tile → byte <code>128·(k&gt;&gt;3) + 4·n + (k&amp;3)</code>, nibble <code>(k&gt;&gt;2)&amp;1</code>) is S3's HVX reader contract, checked on the simulator alone</td></tr>
+    <tr><td>9 two units, two clocks</td><td>name the unit serial; compare DSP Mcycles across units, tok/s only within one; read gaps against the run's own clock; the first run after a push is cold, so tight A/Bs are a reversed double pass; at 4096 the row moves with the unit and the session, not the code (#53), so a 4096 verdict is an A/B inside one order with battery °C and charging status recorded (a measurement rule, not a kernel rule — see <a href="04-measure-and-debug.html">04</a>)</td></tr>
+  </table>
+  <p class="src">Also the kernel review list in the <code>hexagon-gates</code> skill: 128-byte alignment of every DMA/VTCM buffer, worker count from <code>wp_create</code> never hard-coded, integer paths bit-exact against <code>ref_ops.c</code>.</p>
+</div>
+
+<p class="note">Hexagon backend beginner guide · sources: docs/backend_guide/HEXAGON.md, HEXAGON_BENCHMARK.md, docs/measurements/ (#23, #24, #35, #25, #53 on hvx_impl), nntrainer/tensor/hexagon/, Applications/CausalLM/hexagon/, tools/docker/, docs/superpowers/specs/hexagon-hvx-optimization/. Written 2026-09-17, refreshed 2026-09-21 against hvx_impl commit e57f66e5 (#68 S0 merged, PR #72; S1 read from branch hvx/69-w4cx-producer-abi5, in review).</p>
+</body>
+</html>

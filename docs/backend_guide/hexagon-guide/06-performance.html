@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hexagon backend guide — 06 Performance record</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb;
+    --panel: #f3f3f1;
+    --text-1: #0b0b0b;
+    --text-2: #52514e;
+    --grid: #d9d8d3;
+    --w: #2a78d6;      /* weights  (slot 1 blue)   */
+    --w-light: #cde2fb;
+    --x: #eb6834;      /* activations (slot 2 orange) */
+    --x-light: #fbd9cc;
+    --acc: #1baf7a;    /* accumulator / output (slot 3 aqua) */
+    --acc-light: #cdeee0;
+    --dim: #b7b6b0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface: #1a1a19;
+      --panel: #242423;
+      --text-1: #ffffff;
+      --text-2: #c3c2b7;
+      --grid: #3a3a38;
+      --w: #3987e5;
+      --w-light: #1c3a5e;
+      --x: #d95926;
+      --x-light: #5a2a17;
+      --acc: #199e70;
+      --acc-light: #16442f;
+      --dim: #5a5a57;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 48px;
+    background: var(--surface); color: var(--text-1);
+    font: 15px/1.55 -apple-system, "Segoe UI", "Noto Sans KR", Roboto, sans-serif;
+    max-width: 1240px; margin-inline: auto;
+  }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 8px; }
+  .sub { color: var(--text-2); margin: 0 0 28px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 28px; }
+  @media (max-width: 900px) { .row { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border-radius: 10px; padding: 18px 18px 14px;
+  }
+  .panel p { color: var(--text-2); margin: 6px 0 0; font-size: 14px; }
+  .panel .verdict { margin-top: 10px; font-size: 14px; color: var(--text-1); }
+  svg { width: 100%; height: auto; display: block; }
+  text { font-family: inherit; fill: var(--text-1); }
+  .t2 { fill: var(--text-2); }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--text-2); margin: 0 0 22px; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+    margin-right: 6px; vertical-align: -2px; background: var(--c);
+  }
+  .ctrl { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text-2); margin: 6px 0 4px; }
+  .ctrl input[type=range] { width: 160px; accent-color: var(--w); }
+  .ctrl button {
+    border: 1px solid var(--grid); background: var(--surface); color: var(--text-1);
+    border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin-top: 4px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { color: var(--text-2); font-weight: 600; }
+  td:first-child { color: var(--text-2); white-space: nowrap; }
+  .note { color: var(--text-2); font-size: 13px; margin-top: 18px; }
+  .tip {
+    position: fixed; pointer-events: none; background: var(--text-1); color: var(--surface);
+    padding: 6px 9px; border-radius: 6px; font-size: 12px; line-height: 1.4;
+    opacity: 0; transition: opacity .08s; white-space: nowrap; z-index: 10;
+  }
+</style>
+<style>
+  /* guide additions: identical on every page of hexagon-guide/ */
+  nav.guide { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; margin: 0 0 24px; padding: 10px 0; border-block: 1px solid var(--grid); }
+  nav.guide a { color: var(--text-2); text-decoration: none; }
+  nav.guide a.here { color: var(--text-1); font-weight: 600; }
+  nav.guide a:hover { color: var(--w); }
+  a { color: var(--w); }
+  .panel { margin-bottom: 24px; }
+  .panel ul, .panel ol { color: var(--text-2); font-size: 14px; margin: 6px 0 0; padding-left: 22px; }
+  .panel li { margin: 3px 0; }
+  .panel li b, .panel p b { color: var(--text-1); }
+  pre { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 10px 12px; font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; overflow-x: auto; margin: 8px 0; color: var(--text-1); white-space: pre; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.93em; }
+  .src { color: var(--text-2); font-size: 12px; }
+  .status { border-left: 4px solid var(--acc); }
+  .warn { border-left: 4px solid var(--x); }
+  .step { counter-increment: step; }
+  .kv td:first-child { white-space: normal; }
+  dl.gl { margin: 0; font-size: 14px; }
+  dl.gl dt { font-weight: 600; margin-top: 10px; }
+  dl.gl dd { margin: 2px 0 0; color: var(--text-2); }
+  td, th { word-break: break-word; }
+  td:first-child { white-space: normal; }
+</style>
+</head>
+<body>
+<nav class="guide">
+  <a href="index.html">Overview</a>
+  <a href="01-run-it.html">01 Run it</a>
+  <a href="02-architecture.html">02 Architecture</a>
+  <a href="03-kernels.html">03 Kernels</a>
+  <a href="04-measure-and-debug.html">04 Measure and debug</a>
+  <a href="05-glossary.html">05 Glossary</a>
+  <a class="here" href="06-performance.html">06 Performance</a>
+</nav>
+<h1>06 · Performance record: every device measurement, newest first</h1>
+<p class="sub">This page is built only from numbers a person read off a Galaxy S25 Ultra. Sources, in order: the filled measurement handoffs on <code>hvx_impl</code> (<code>docs/measurements/23-sdk64-baseline.md</code>, <code>24-host-logits.md</code>, <code>35-v79-skel.md</code>, <code>25-decode-prefetch.md</code> and <code>53-4096-unit-split.md</code>), the comparison table, <code>nntrainer</code> rows and "Goals" of <code>HEXAGON_BENCHMARK.md</code>, and <code>HEXAGON.md</code> §7 rule 9 and §8.2. Model: Qwen3-0.6B, W8A8 (int8 per-channel weights, per-token int8 activations, int16 activation for <code>down_proj</code>). Every number names its source. The next handoff in the queue, <code>58-decode-attn-gqa.md</code> (branch <code>hvx/58-decode-attn-gqa</code>), is written but not yet run, so it has no row here.</p>
+
+<div class="legend">
+  <span style="--c: var(--w)">decode at 512 tokens of context</span>
+  <span style="--c: var(--x)">decode at 4096 tokens of context</span>
+  <span style="--c: var(--acc)">GENIEX_QAIRT w4a16 reference lines (the stage-3 W4 target)</span>
+  <span style="--c: var(--dim)">goal lines and the measured ceiling</span>
+</div>
+
+<div class="panel status">
+  <h2>Latest — measurement #25, 2026-09-18 (HEXAGON_BENCHMARK.md "Goals → Now")</h2>
+  <p>Unit <code>R3CY10WM83Y</code> (Galaxy S25 Ultra, Snapdragon 8 Elite, cDSP v79), <b>v79 skel with the cross-op weight prefetch</b> (variant B of the handoff, md5 <code>98b07caf…</code>, built with <code>-DHTP_PROF_FARF</code> so the DSP prints its per-kind cycle split), rebuilt on the workstation with Hexagon SDK 6.4.0.2 / hexagon-clang 19.0.04 (<code>toolv19</code>) from branch <code>hvx/25-decode-prefetch</code> @ <code>7d318718</code>. Harness <code>hexagon_e2e_test --chunk 128 --steps 64</code>; decode = 1000 ÷ median host wall over the 63 single-token steps, prefill = prompt tokens ÷ host wall of the prefill chunks; the 512 row is pass 2 of a reversed double pass (25-decode-prefetch.md "Results"; HEXAGON.md §8.2 "#25" block). The prefetch is the shipping default from #25 on and its code is on <code>hvx_impl</code> (PR #61 merged), so a skel built from this tree is the one these rows measured. The later #53 sitting (2026-09-18, same unit) produced no new shipping number: it re-ran two skels at 4096 only to settle the 4096 spread, see the History block below.</p>
+  <table>
+    <tr><th>Context</th><th>Prefill tok/s</th><th>Decode tok/s</th><th>DSP Mcycles / decode step</th><th>Goal (decode)</th><th>Gap</th></tr>
+    <tr><td>512</td><td><b>191.1</b></td><td><b>33.7</b></td><td>54.6 (#35 on the same unit: 61.2)</td><td><b>Relative to nntrainer's own CPU baseline</b> (issue #60, user decisions 2026-09-18: Qwen3-0.6B on the S25 Ultra CPU from <code>main</code>, precision <code>Q4_0-FP16</code>, measured by the user; the multiple is set once that row is filled, and is then written as the multiple plus the tok/s it resolves to). The physical bound any multiple must respect is the measured W8 weight-stream ceiling, <b>54 tok/s</b> (#25 variant C). ≥ 70.3 stays the goal of the w4a8 row (#51, now folded into #65)</td><td>pending #60; 1.6× to the ceiling</td></tr>
+    <tr><td>1024</td><td><b>123.7</b></td><td><b>26.3</b></td><td>73.7 (#35: 77.8)</td><td>— (no goal row)</td><td>—</td></tr>
+    <tr><td>4096</td><td><b>30.8</b></td><td><b>11.1</b></td><td>184.6 (#35 cooled re-run: 186.8; the four #53 runs of the same day 192.9–197.3)</td><td>≥ 27.5 (the stage-1 HVX-only decode @4096 row and the w4a8 row's 4096 goal); attention is 79 % of this step, so the lever is issue #58, not the weight stream. The 4096 cell's cross-session spread is settled by #53 (unit / session state, not code, ±5 % between sittings on one unit), so #58's 4096 gate is read as an A/B inside one order and a 2.5× goal check is unaffected by it</td><td>2.5×</td></tr>
+  </table>
+  <p>Prefill goal at 512: 1000 tok/s interim (gap 5.2×); 3,409 is out of HVX-only reach and belongs to stage 2 (HVX + HMX). The prefill figure is 4 % under #35's 198.7 on the same unit because this session's DSP clock was lower (<code>pcycles_per_us</code> 1743–2046 across runs); in DSP cycles the prefetch build's prefill is 1.3 % <em>under</em> the no-prefetch control, so it is the clock, not a regression. Accuracy on the same runs: <code>--eval</code> on <code>t512_23.i32</code> <b>41.4947 / 162</b> in all six 512 runs (= #35 B1), 5.8595 / 692 at 1024 and 1.5623 / 3759 at 4096 (= #35), generated ids byte-identical with and without the prefetch.</p>
+  <table>
+    <tr><th>Context</th><th>nntrainer W8A8, HVX only (#25 B, above)</th><th>Floor: nntrainer CPU, <code>Q4_0-FP16</code>, <code>main</code> (issue #60)</th><th>Stage-3 W4 reference: GENIEX_QAIRT w4a16, Galaxy S25 (AI Hub)</th><th>Ours ÷ QAIRT (prefill / decode; derived here)</th></tr>
+    <tr><td>512</td><td>191.1 / 33.7</td><td>pending / pending</td><td><b>8,207 / 121</b></td><td>0.023 / 0.28</td></tr>
+    <tr><td>1024</td><td>123.7 / 26.3</td><td>pending / pending</td><td><b>7,503 / 112</b></td><td>0.016 / 0.23</td></tr>
+    <tr><td>4096</td><td>30.8 / 11.1</td><td>pending / pending</td><td><b>3,546 / 57.6</b></td><td>0.009 / 0.19</td></tr>
+  </table>
+  <p>How to read the reference table: the CPU row is the <em>floor</em> — once filled, every nntrainer NPU row is read as a multiple of it (user decision 2026-09-18; HEXAGON_BENCHMARK.md CPU row and "Goals"). The GENIEX_QAIRT row is the <em>target</em> of the new top goal, issue #65 (stage 3: port upstream PR nntrainer/nntrainer#4327's W4 path — HMX u8×i4 matmul, DMA ring, u8 attention — into this backend and measure Qwen3-0.6B end to end). Those cells are a w4a16 QNN graph on the same silicon; 121 tok/s = 8.3 ms per step ≈ 300 MB of 4-bit weights at 36 GB/s, i.e. a whole step that is the weight stream at the DMA ceiling with attention ≈ 0 (plan 65-w4-htp-port.md §1, "Not a gate, recorded"). The full list of every external row, including the GENIEX_LLAMACPP NPU / CPU rows that the w4a8 goals of 70.3 / 27.5 come from, is in "Baselines and references" further down.</p>
+  <p><b>Status on 2026-09-21: no new device number.</b> No measurement handoff has been filled since #25 and #53 on 2026-09-18, so the rows above are still the newest device numbers; #58's handoff (<code>docs/measurements/58-decode-attn-gqa.md</code>, branch <code>hvx/58-decode-attn-gqa</code>) is with the user and still empty, so it has no History row yet. What did move is the stage-3 port: <b>#68 (S0 of #65) merged into <code>hvx_impl</code> on 2026-09-21</b> (PR #72, <code>026af1e8</code>) — HexKL is linked, the HMX unit and a VTCM arena are acquired at graph init, and the v79 simulator turned out to execute HMX bit-exactly, so HMX numeric tests are simulator gates. S0 changes no kernel and produces no device number: the HVX kernels' <code>profile acc</code> STAT is bit-identical to #25's and the <code>-DHTP_HMX=0</code> build is md5-identical per object to the previous tree (HEXAGON_BENCHMARK.md log 2026-09-21; HEXAGON.md §7 rules 10–11, §9; plan 65 §4 "S0 outcome"). S1's first result — x86 only, <em>in review</em> on branch <code>hvx/69-w4cx-producer-abi5</code>, PR not yet opened — is under "What is open" below: plain per-channel int4 misses the accuracy band by a wide margin (PPL 2.05 × W8 against a ≤ 1.10 × gate), and the W4 direction is pending a user decision. The stage-3 reference cells in the table above are unchanged.</p>
+  <p class="src">HEXAGON_BENCHMARK.md "Goals" (Now / Goal / Gap columns; log entries 2026-09-18 for #25, #53, the #60 policy and the user decisions on stage 3) and its three "v79 skel + cross-op weight prefetch" rows plus the "weight-stream-only skel" ceiling row; the GENIEX_QAIRT "8 Elite (Galaxy S25)" rows of its comparison table; HEXAGON.md §8.2 "#25" and "#53" blocks; 25-decode-prefetch.md "Results" pass-2 rows, "Goal rows", "Pass rules"; docs/plans/65-w4-htp-port.md §1 on branch <code>hvx/65-w4-htp-port</code>.</p>
+</div>
+
+<div class="panel">
+  <h2>How to read the rows (method)</h2>
+  <ul>
+    <li><b>One harness, one recipe.</b> Every row is <code>hexagon_e2e_test --chunk 128 --steps 64</code> on a packed <code>qwen3_full</code> image (<code>qwen3_full4k</code>, packed with <code>--max-seq 4224</code>, for the 4096 row). Decode tok/s is 1000 ÷ the median host wall time (µs around one RPC) over the 63 single-token steps after the prompt; prefill tok/s is prompt tokens ÷ the summed wall time of the 128-token chunks; DSP Mcycles per step is the median of the DSP's own cycle counter over the same 63 steps (HEXAGON_BENCHMARK.md "Method"; HEXAGON.md §8.2 "Throughput by context").</li>
+    <li><b>Two phones, two clocks — and one phone, many clocks.</b> Two S25 Ultra units have been used. <code>R3CY10WM83Y</code> (P3, P4, #24, #35, #25) held 1905–1915 MHz in the generation loop through #35; the #23 unit <code>R3CY205ZMND</code> held 2054 MHz. With the same kernels the DSP cycles per step agree within ~1 % at 512 and 1024, while tok/s differ by −8 / −1 %. In #25 the clock of the <em>same</em> unit wandered between 1743 and 2046 MHz from run to run, so the host-ms column and the Mcyc column even disagreed on the order of two variants. So <b>tok/s is compared only within one unit and session; DSP Mcycles per step is the number to compare across units and across sessions</b> (HEXAGON.md §7 rule 9 (a)–(b); HEXAGON_BENCHMARK.md "Method"; 25-decode-prefetch.md "Notes").</li>
+    <li><b>An A/B verdict needs the reversed double pass.</b> The first run after a push is cold: rule 9 (d) had it at 3–5 %, and #25 measured the first run of pass 1 at <b>+8.5 %</b> DSP cycles over the same skel in pass 2 (66.97 vs 61.74 Mcyc). Read on pass 1 alone, the prefetch would have looked like −16 % instead of the −11.6 % it is. Every verdict tighter than ±10 % is therefore read from pass 2 of a run that goes A, B, C, D and then D, C, B, A; a single warm-up run is not a substitute (HEXAGON.md §7 rule 9 (d); 25-decode-prefetch.md "Steps" 1–2, "Notes").</li>
+    <li><b>The per-kind split (<code>HTP_PROF_FARF</code>).</b> A skel built with <code>-DHTP_PROF_FARF</code> prints one <code>nntr_htp: prof … mm8=… mm16=… lg=… attn=… rest=…</code> line per forward call (kilo-cycles spent in the W8A8 matmuls, the int16 <code>down_proj</code>, the lm_head, attention and everything else); <code>tools/hexagon/summ_farf_prof.py</code> takes the median over the decode steps. All four #25 skels carried the flag so its cost cancels in every ratio; the shipping build does not (HEXAGON.md §5.3 "Measurement-only skel flags"; 25-decode-prefetch.md "Artifacts"; both on <code>hvx_impl</code> since PR #61).</li>
+    <li><b>The 512 decode figure is ±5 % by construction.</b> Its median is taken over 63 steps that are still settling after the prefill (first-ten vs last-ten step median 67.1 → 64.3 Mcyc at 512, flat at 1024 and 4096), so treat a 512 decode difference under 5 % as noise (23-sdk64-baseline.md "Results"; HEXAGON.md §8.2 caveat paragraph). #25's environment check used the same band: its control had to land within ±5 % of #35's 61.2 Mcyc on the same unit, and did (+0.9 %).</li>
+    <li><b>The 4096 row moves with the unit and the session, not with the code (rule 9 (e), the standing rule since #53).</b> On <code>R3CY10WM83Y</code> the 4096 cell read about +6 % cycles / −6 % prefill against every other 4096 reference, on v75 (#24) and v79 (#35) alike. #53 (2026-09-18) ran #23 B's <em>exact</em> v79 binary next to <code>hvx_impl</code>'s skel on this unit: inside one order the two are indistinguishable (0.10 % and 0.004 %, same 64 generated tokens), #23's own binary reads +8.6 % over its number on the other unit, the two orders 25 min apart differ by 2.2 % for both skels, and the four-run mean sits 4.4 % above the same unit's #35 cooled re-run from the same morning. So: <b>a 4096 verdict is an A/B inside one order</b> (both skels back to back after the same idle; one order resolves 0.1 %), never a 4096 cell against another sitting's row; a 4096 handoff records <code>dumpsys battery</code> temperature and charging status before each order plus the idle minutes, and names the sitting it is read against; the between-sitting spread on one unit is ±5 % and the cross-unit offset at 4096 is ≈ +9 % with identical bytes, so #23 B's 4096 cells stay the other unit's numbers and every 4096 goal check is read on the unit that runs it. A skel's file size is not a tree fingerprint (S2 landed 32 B under a prediction made on another tree); the <code>--eval</code> PPL / top-1 digits are (HEXAGON.md §7 rule 9 (e); 53-4096-unit-split.md "Reading"; HEXAGON_BENCHMARK.md "Method").</li>
+    <li><b>PPL / top-1</b> come from <code>hexagon_e2e_test --eval</code>: teacher-forced perplexity over the prompt and the count of next tokens the top-1 prediction got right. Two 512-token prompts exist: the P4 prompt <code>t512.i32</code> (x86 reference 33.0195 / 184, the accuracy gate) and <code>t512_23.i32</code> (x86 41.5466 / 164 with the workstation's gcc build, 41.2365 / 161 with the container's clang build — quote the build). The 1024 / 4096 prompts have no x86 reference (23-sdk64-baseline.md "Accuracy"; HEXAGON.md §5.1). A stream-only skel (#25 C) has no <code>--eval</code>: its outputs are garbage by construction.</li>
+    <li><b>What the goals are read against (user decisions of 2026-09-18).</b> The stage-1 W8A8 decode goal is no longer a fixed tok/s. Every HVX goal is read relative to nntrainer's own CPU baseline — Qwen3-0.6B on the S25 Ultra CPU from <code>main</code>, precision <code>Q4_0-FP16</code> — which issue #60 measures (handoff <code>docs/measurements/60-cpu-baseline.md</code>, pending); a goal that is a multiple of that baseline is written as the multiple plus the tok/s it resolves to once the row is filled. The provisional ≥ 60 tok/s was withdrawn because it sits above the measured 54 tok/s weight-stream ceiling; the ceiling stays the physical bound any multiple must respect. Two more decisions the same evening: the A8W8 HVX-only line (stages 1–2) <em>ends with the issues already filed</em> (#26, #41, #57, #58, #59, #60), HMX for that line comes later; and the new top goal is <b>stage 3, issue #65 (p0)</b>: port upstream PR nntrainer/nntrainer#4327's W4 path (HMX u8×i4 matmul, DMA ring, u8 attention, KV quantisation) into this backend's structure and measure Qwen3-0.6B end to end, read against GENIEX_QAIRT w4a16 on the Galaxy S25 (8,207 / 121 at 512, 7,503 / 112 at 1024, 3,546 / 57.6 at 4096, prefill / decode tok/s) with the #60 CPU row as the floor. #51 (the HVX 4-bit stream) is folded into #65 as its decode path (HEXAGON_BENCHMARK.md "Goals" stage-1 W8A8 and stage-3 rows, CPU row, log 2026-09-18 "User decisions (evening)"; plan 65-w4-htp-port.md §1, §7).</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>History — one block per measurement, newest first</h2>
+  <p>Each block header gives the date, the issue, what changed in one clause, the unit, the skel and SDK, and the measurement file; the rows under it are the three contexts. Every <code>nntrainer</code> row of HEXAGON_BENCHMARK.md's comparison table appears here (the three "HVX + HMX" rows, the "w4a8" row and the "CPU, <code>main</code>" baseline row are TODO / pending there and have no device number yet). A handoff that produced no new benchmark row (#53) is still a block, because what it decided governs how the 4096 rows are read.</p>
+
+  <table>
+    <tr><th colspan="7"><b>2026-09-18 · #53 · no change: #23 B's exact v79 binary re-run at 4096 next to <code>hvx_impl</code>'s skel on this unit</b> — the question was whether the +6 % 4096 offset on <code>R3CY10WM83Y</code> (#24 v75, #35 v79) is the unit / session or a code change since <code>e086248a</code>. Unit <code>R3CY10WM83Y</code>; SDK 6.4.0.1 / hexagon-clang 19.0.04 workstation builds, v79 only, 4096 only. S1 = #23 B's stored binary <code>aba0126e…</code> (50,920 B, mtime 2026-09-17, copied not rebuilt); S2 = this tree's skel <code>1ab00865…</code> (50,952 B, DSP sources identical to <code>202278a4</code>). Two mirrored orders (S1 S2, then S2 S1) after ≥ 20 min idle each, battery °C read before every run, phone on USB and charging throughout, then one 4096 <code>--eval</code> per skel. File: <code>docs/measurements/53-4096-unit-split.md</code>. In the benchmark as <em>no new row</em>: the three 4096 notes, the method paragraph and the decode @4096 goal cell cite it. Issue #53 closed.</th></tr>
+    <tr><th>Order / slot</th><th>Skel</th><th>Idle min · battery °C at start</th><th>Prefill tok/s</th><th>Decode host ms (tok/s, derived here as 1000 ÷ ms)</th><th>DSP Mcyc / step (first-ten / last-ten)</th><th>PPL / top-1 (<code>--eval</code>)</th></tr>
+    <tr><td>O1 / 1</td><td>S1 (#23 B tree)</td><td>20 · 28.5</td><td>30.15</td><td>96.503 (10.4)</td><td><b>197.285</b> (196.5 / 198.0)</td><td rowspan="2"><b>1.5687 / 3758</b> = #23 B digit for digit</td></tr>
+    <tr><td>O1 / 2</td><td>S2 (<code>hvx_impl</code>)</td><td>0 · 31.1</td><td>30.40</td><td>96.248 (10.4)</td><td><b>197.092</b> (196.4 / 197.8)</td></tr>
+    <tr><td>O2 / 1</td><td>S2 (<code>hvx_impl</code>)</td><td>22 · 28.5</td><td>30.85</td><td>94.437 (10.6)</td><td><b>192.897</b> (192.2 / 193.3)</td><td rowspan="2"><b>1.5623 / 3759</b> = #35 B1 digit for digit</td></tr>
+    <tr><td>O2 / 2</td><td>S1 (#23 B tree)</td><td>0 · 30.8</td><td>30.83</td><td>93.885 (10.7)</td><td><b>192.905</b> (191.1 / 193.4)</td></tr>
+    <tr><td colspan="7" class="src">Reading: inside an order the skels differ by 0.10 % (O1) and 0.004 % (O2) and generate the same 64 tokens; between the orders every run moved by −2.2 %; the four-run mean 195.0 Mcyc is +4.4 % over #35 B1's cooled re-run (186.753, same unit, same morning) and +9.8 % over #23 B's 177.6 on <code>R3CY205ZMND</code>, with S1 alone at +8.6 %. Slot-matched, the plan's outcome-1 gate (|Δ| ≤ 2 % in both slots) misses at −2.22 % / +2.17 % with opposite signs — the per-order drift, not a per-skel difference — so by the letter the handoff's verdict is "inconclusive"; in substance the code / build outcome is excluded (its gate needed S1 ≤ 181.2) and unit / session state is the only cause left. All four prefill readings (30.15–30.85) sit 6 % below #35 B1 and 12 % below #23 B, moving with the Mcyc. The <code>--eval</code> digits are the tree fingerprint: S2's size missed its prediction by 32 B because the prediction came from a different tree (53-4096-unit-split.md "Results", "Reading", "Notes from the run"; HEXAGON.md §8.2 "#53" block, §7 rule 9 (e)).</td></tr>
+  </table>
+
+  <table>
+    <tr><th colspan="6"><b>2026-09-18 · #25 · cross-op weight prefetch, the W8 weight-stream ceiling, and the 64-row chunk</b> — one DMA queue per worker for the whole session, and each tiled matmul kicks chunk 0 of the <em>next</em> tiled matmul into its free half of VTCM while the small ops in between run (ledger ①); the same run measured a skel that streams every weight byte but multiplies nothing (the ceiling) and a fixed 64-row DMA chunk (ledger ⑨). Unit <code>R3CY10WM83Y</code>; v79 skels rebuilt on the workstation with SDK 6.4.0.2 / hexagon-clang 19.0.04 from <code>hvx/25-decode-prefetch</code> @ <code>7d318718</code>, all four with <code>-DHTP_PROF_FARF</code>: A control <code>-DHTP_MM_NO_PREFETCH</code> (<code>de8050b8…</code>), <b>B prefetch</b> = the shipping behaviour (<code>98b07caf…</code>), C <code>-DHTP_MM_STREAM_ONLY</code> (<code>6520a381…</code>), D <code>-DHTP_MM_CHUNK_ROWS=64u</code> (<code>8effb875…</code>). File: <code>docs/measurements/25-decode-prefetch.md</code> (on <code>hvx_impl</code> since PR #61 merged, together with the prefetch code and the measurement flags). In the benchmark as the three "v79 skel + cross-op weight prefetch" rows (B) and the "weight-stream-only skel" ceiling row (C) — the current "Now". 14 runs in one session, 14/14 clean, no DSP restart, no fatal FARF line, no stalled step after the prefill chunks.</th></tr>
+    <tr><th>Variant · context</th><th>Prefill tok/s</th><th>Decode tok/s</th><th>DSP Mcyc / step</th><th>FARF median Mcyc: <code>mm8</code> / <code>mm16</code> / <code>lg</code> / <code>attn</code> / <code>rest</code></th><th>PPL / top-1 (<code>--eval</code>)</th></tr>
+    <tr><td>A control · 512 (pass 2)</td><td>188.5</td><td>30.6 (32.64 ms)</td><td>61.7 (pass 1: 67.0, the +8.5 % cold run); +0.9 % vs #35's 61.2 = environment check passed</td><td>24.35 / 7.87 / 9.07 / 17.31 / 3.08</td><td><code>t512_23</code> 41.4947 / 162 (both passes)</td></tr>
+    <tr><td><b>B prefetch · 512 (pass 2)</b></td><td><b>191.1</b></td><td><b>33.7</b> (29.72 ms)</td><td><b>54.6</b> — B/A 0.884, <b>−11.6 %</b></td><td><b>16.05</b> / 8.59 / 8.96 / 17.26 / 3.65 — <code>mm8</code> −34 % vs A, 0.5 Mcyc <em>under</em> C's pure DMA wait</td><td>41.4947 / 162 (both passes); ids byte-identical to A</td></tr>
+    <tr><td>C stream-only · 512 (pass 2)</td><td>370.3 (nothing multiplied)</td><td>32.9 (30.40 ms)</td><td>53.0 — of which the stream phase <code>mm8</code>+<code>mm16</code>+<code>lg</code> = <b>32.2 Mcyc = 18.5 ms at 1743 MHz = 32.3 GB/s → ceiling 54 tok/s</b></td><td>16.58 / 7.23 / 8.35 / 16.65 / 4.13</td><td>n/a (garbage by construction)</td></tr>
+    <tr><td>D chunk 64 · 512 (pass 2)</td><td>181.4</td><td>34.1 (29.33 ms, at the session's highest clock, 2046 MHz)</td><td>60.0 — D/B 1.099, <b>+9.9 %</b>: rejected, max-fit chunk stays</td><td>20.66 / 7.91 / 9.01 / 18.77 / 3.60</td><td>41.4947 / 162 (both passes)</td></tr>
+    <tr><td><b>B prefetch · 1024</b></td><td><b>123.7</b></td><td><b>26.3</b> (38.00 ms)</td><td><b>73.7</b> (#35: 77.8, −5.2 %); equals C's 73.8 within 0.1 %</td><td>ATTN 34.2 = 46 % of the step</td><td>5.8595 / 692 (= #35)</td></tr>
+    <tr><td>C stream-only · 1024</td><td>186.6</td><td>26.2 (38.16 ms)</td><td>73.8; <code>mm8</code>+<code>mm16</code> 25.9, ceiling ≈ 54.5 tok/s (the <code>lg</code> cell derived, a read-back item)</td><td>—</td><td>n/a</td></tr>
+    <tr><td><b>B prefetch · 4096</b></td><td><b>30.8</b></td><td><b>11.1</b> (90.28 ms)</td><td><b>184.6</b> (#35 cooled re-run: 186.8, −1.2 %, same unit and day, inside the #53 caveat)</td><td>ATTN 146.6 = <b>79 %</b> of the step</td><td>1.5623 / 3759 (= #35)</td></tr>
+    <tr><td>C stream-only · 4096</td><td>33.6</td><td>10.9 (91.79 ms)</td><td>186.9; <code>mm8</code>+<code>mm16</code> 26.4, ceiling ≈ 56.3 tok/s (derived)</td><td>—</td><td>n/a</td></tr>
+    <tr><td colspan="6" class="src">How the ceiling is read: <code>HTP_MM_STREAM_ONLY</code> drops the multiply in the routine that serves both the W8A8 matmuls and the lm_head, so C's <code>lg</code> is DMA wait as much as its <code>mm8</code>; the skel prints <code>stream bytes/step=595984384</code> = 28 layers × 15,728,640 B + 151,936 × 1024 B of lm_head. The handoff's first reading ("≈ 74 tok/s", 43.6–46.0 GB/s) took <code>mm8</code>+<code>mm16</code> alone and left out the lm_head's 26 % of the bytes; it was corrected at the read-back to 54 tok/s and that is the number the goal reads. Per path at 512: tiled q/k/v/o/gate/up DMA 352.3 MB in 9.5 ms = 37.0 GB/s; lm_head 155.6 MB at 32.5 GB/s; row-major <code>down</code> 88.1 MB at 21.2 GB/s (issue #59). <code>mm8</code>+<code>mm16</code> is flat with context (23.8 / 25.9 / 26.4 Mcyc), so the ceiling is ≈ 54–57 tok/s at every depth (25-decode-prefetch.md "Goal rows" stream table; HEXAGON.md §8.2 "The ceiling (G1'), read correctly"; HEXAGON_BENCHMARK.md ceiling row).</td></tr>
+  </table>
+
+  <table>
+    <tr><th colspan="5"><b>2026-09-18 · #35 · v79 becomes the shipping skel</b> — quantiser decode rewritten as an integer decode of the sf bits (fixes the four ±1-LSB v79 simulator failures; both simulators 13/13); the first v79 rows on this unit. Unit <code>R3CY10WM83Y</code>; v79 skel <code>8d8cdb26…</code>, SDK 6.4.0.1 / hexagon-clang 19.0.04, rebuilt on the workstation from branch <code>hvx/35-v79-skel</code> @ <code>305c51f1</code>. File: <code>docs/measurements/35-v79-skel.md</code> (on <code>hvx_impl</code>). In the benchmark as the three "v79 shipping skel" rows — the "Now" until #25, and #25's reference on this unit.</th></tr>
+    <tr><th>Context</th><th>Prefill tok/s</th><th>Decode tok/s</th><th>DSP Mcyc / step</th><th>PPL / top-1 (<code>--eval</code>)</th></tr>
+    <tr><td>512</td><td>198.7</td><td>30.9 (32.39 ms)</td><td>61.2</td><td><code>t512_23</code> 41.4947 / 162 (x86 41.5466 / 164, −0.12 %); P4 prompt <b>32.4497 / 184</b> (x86 33.0195 / 184, −1.73 %)</td></tr>
+    <tr><td>1024</td><td>131.1</td><td>24.9 (40.23 ms)</td><td>77.8</td><td>5.8595 / 692</td></tr>
+    <tr><td>4096</td><td>32.7 (first run 32.1)</td><td>11.2 (first run 10.8; 89.10 / 92.27 ms)</td><td>186.8 (first run 188.0)</td><td>1.5623 / 3759</td></tr>
+    <tr><td colspan="5" class="src">Recorded in the same handoff, not benchmark rows: <b>B2</b>, the same tree built with <code>-DHTP_FORCE_QF_HELPERS</code> (qf-format helpers forced on the v79 target, md5 <code>627480ca…</code>): 512 → 197.7 / 30.9 / 61.1 Mcyc, PPL and top-1 identical to B1 digit for digit on both 512 prompts. <b>A</b>, the v75 skel with the same new decode (<code>aff2fb88…</code>): 512 → 185.1 / 29.5 / 64.3 Mcyc, <code>t512_23</code> 41.0253 / 167, P4 prompt 33.0295 / 188 (+0.03 %). 15 runs, no hang, SSR or fatal FARF line (35-v79-skel.md "Results", "Notes").</td></tr>
+  </table>
+
+  <table>
+    <tr><th colspan="5"><b>2026-09-18 · #24 · host-side logits buffer moved to rpcmem + <code>FASTRPC_MAP_STATIC</code></b> — no DSP byte changed; a control row on the P4 unit that also exposed the unit-clock difference. Unit <code>R3CY10WM83Y</code>; v75 skel <code>cc0f1725…</code> built from the #33 tree (its DSP diff against #23's <code>81dcaab4…</code> is comments, clang-format and one per-call token-id check), harnesses SDK 6.4.0.1 / NDK r26d. File: <code>docs/measurements/24-host-logits.md</code> (on <code>hvx_impl</code>). In the benchmark as the three "unit <code>R3CY10WM83Y</code>" v75 rows.</th></tr>
+    <tr><th>Context</th><th>Prefill tok/s</th><th>Decode tok/s</th><th>DSP Mcyc / step</th><th>PPL / top-1 (<code>--eval</code>)</th></tr>
+    <tr><td>512</td><td>185.5 (malloc, pass 2; static 182.5, rpcmem 184.7)</td><td>29.4 (34.00–34.07 ms; the three host memories within 70 µs)</td><td>65.1 (static; rpcmem 64.8, malloc 64.9)</td><td>P4 prompt 33.0884 / 189 with malloc and with rpcmem — identical to #23 A (x86 33.0195 / 184)</td></tr>
+    <tr><td>1024</td><td>114.5</td><td>23.0 (43.42 ms)</td><td>85.0</td><td>—</td></tr>
+    <tr><td>4096</td><td>25.4</td><td>9.1 (110.04 ms)</td><td>225.9 (+6 % vs #23 after 168 s of sustained load, not repeated)</td><td>—</td></tr>
+    <tr><td colspan="5" class="src">Also measured: the logits return in isolation (<code>hexagon_rpc_test</code>, 32 calls, warm): malloc 8919 µs, rpcmem 8771 µs, rpcmem + static <b>6381 µs</b> (−2538 µs), against a 259 µs 8-float call. Generated ids byte-identical across the three memories and to #23's logs at 512, 1024 and 4096. The <code>--eval</code> loop ran the DSP at 1167–1178 MHz against 1905–1915 in the generation loop (issue #41's opening number) (24-host-logits.md "Results" (i)–(iii)).</td></tr>
+  </table>
+
+  <table>
+    <tr><th colspan="5"><b>2026-09-17 · #23 · variant B: the same sources built <code>HEX_ARCH=v79</code></b> — first silicon numbers for the v79-native skel (pre-#35 quantiser decode; the four ±1-LSB v79 simulator failures were still present). Unit <code>R3CY205ZMND</code>*; v79 skel <code>aba0126e…</code>, SDK 6.4.0.1 / hexagon-clang 19.0.04, workstation build @ <code>e086248a</code>. File: <code>docs/measurements/23-sdk64-baseline.md</code>. In the benchmark as the three "unit <code>R3CY205ZMND</code>, v79-native skel" rows; kept as the v79 reference on that unit.</th></tr>
+    <tr><th>Context</th><th>Prefill tok/s</th><th>Decode tok/s</th><th>DSP Mcyc / step</th><th>PPL / top-1 (<code>--eval</code>)</th></tr>
+    <tr><td>512</td><td>207.4</td><td>31.4 (31.9 ms)</td><td>60.1</td><td><code>t512_23</code> 41.2623 / 161 (x86 41.5466 / 164, −0.68 %); P4 prompt not run</td></tr>
+    <tr><td>1024</td><td>131.2</td><td>25.3 (39.6 ms)</td><td>76.5</td><td>5.9509 / 692</td></tr>
+    <tr><td>4096</td><td>34.4</td><td>11.4 (87.4 ms)</td><td>177.6</td><td>1.5687 / 3758</td></tr>
+  </table>
+
+  <table>
+    <tr><th colspan="5"><b>2026-09-17 · #23 · variant A: the P4 kernels rebuilt with SDK 6.4</b> — toolchain moved from SDK 6.0.0.2 / toolchain 8.7.08 to SDK 6.4.0.1 / hexagon-clang 19.0.04, kernels unchanged since <code>82eacd7e</code>; the question was "did the SDK move cost anything" (ledger ⑭). Unit <code>R3CY205ZMND</code>*; v75 skel <code>81dcaab4…</code>. File: <code>docs/measurements/23-sdk64-baseline.md</code>. In the benchmark as the three "v75 skel rebuilt with SDK 6.4.0.1" rows.</th></tr>
+    <tr><th>Context</th><th>Prefill tok/s</th><th>Decode tok/s</th><th>DSP Mcyc / step</th><th>PPL / top-1 (<code>--eval</code>)</th></tr>
+    <tr><td>512</td><td>189.0</td><td>31.9 (31.3 ms)</td><td>64.3</td><td><code>t512_23</code> 40.7596 / 162; P4 prompt 33.0884 / 189 (x86 33.0195 / 184, +0.21 %)</td></tr>
+    <tr><td>1024</td><td>117.1</td><td>23.2 (43.2 ms)</td><td>84.2</td><td>5.9141 / 698</td></tr>
+    <tr><td>4096</td><td>27.1</td><td>9.6 (104.1 ms)</td><td>213.0</td><td>1.5662 / 3763</td></tr>
+  </table>
+
+  <table>
+    <tr><th colspan="5"><b>2026-09-16 · M6 P4 · int16 activation for <code>down_proj</code></b> (<code>MATMUL_W8A16</code> lane-wise kernel) on top of P3's tiled <code>vrmpy</code> matmul and vector quantizer — the first record of the current kernel set and the baseline #23 re-measured. Unit <code>R3CY10WM83Y</code>; v75 skel built at <code>82eacd7e</code>, SDK 6.0.0.2 / toolchain 8.7.08. No measurement file (predates <code>docs/measurements/</code>): HEXAGON.md §8.2 "M6 P4 on device" and "Throughput by context". In the benchmark as the three "M6 P4" rows.</th></tr>
+    <tr><th>Context</th><th>Prefill tok/s</th><th>Decode tok/s</th><th>DSP Mcyc / step</th><th>PPL / top-1 (<code>--eval</code>)</th></tr>
+    <tr><td>512</td><td>192.1</td><td>27.7 (36.1 ms)</td><td>68.9</td><td>P4 prompt 33.3132 / 189 (x86 33.0195 / 184, +0.89 %); 387-token local prompt 37.6413 / 138 (x86 37.1629 / 134, +1.29 %)</td></tr>
+    <tr><td>1024</td><td>118.2</td><td>22.9 (43.7 ms)</td><td>85.2</td><td>—</td></tr>
+    <tr><td>4096</td><td>27.3</td><td>9.4 (106.1 ms)</td><td>216.9</td><td>—</td></tr>
+  </table>
+  <p class="src">* Which unit ran #23: the handoff's own "Results" heading says <code>R3CY10WM83Y</code>, and its step 2 notes that the drafts quoted the two serials inconsistently and passed none to <code>adb</code>. #24 read back a different serial the next day and a different generation-loop clock (1.91 vs 2.05 GHz) with cycle counts that match, so HEXAGON_BENCHMARK.md and HEXAGON.md §7 rule 9 assign #23 to <code>R3CY205ZMND</code>; this page follows that ruling.</p>
+</div>
+
+<div class="panel">
+  <h2>Before the benchmark table: the records the P4 rows replaced</h2>
+  <p>Earlier device numbers use a different harness state or prompt and are not comparable cell for cell; they show the shape of the climb. All from HEXAGON.md §8.2.</p>
+  <table>
+    <tr><th>Record</th><th>What it was</th><th>Decode</th><th>Prefill</th></tr>
+    <tr><td>M4 → M5 (attention kernel vectorised)</td><td>Galaxy S25 (HEXAGON.md §8 header: SM-S931N, SDK 6.3.0.0), v75 skel; scalar-score vs vectorised attention, same session</td><td>512: 9.8 → 11.2 tok/s (211 → 185 Mcyc); 1024: 7.3 → 11.3 tok/s</td><td>512: 21.1 → 25.2 tok/s; 1024: 16.8 → 23.2 tok/s</td></tr>
+    <tr><td>M6 P3 (tiled <code>vrmpy</code> matmul, vector quantizer), 2026-09-16</td><td>S25 Ultra <code>R3CY10WM83Y</code>, v75 skel @ <code>343653a5</code>, local 387-token prompt</td><td><code>--steps 64</code> steady ~73 Mcyc, host 76.4 ms (13.1 tok/s); <code>--eval</code> 55.9 Mcyc, host 45.8 ms (21.8 tok/s)</td><td>128-token chunk at pos 0: 1,413 Mcyc / 736 ms</td></tr>
+    <tr><td>M6 P4, same prompt as P3</td><td>same phone, skel @ <code>82eacd7e</code></td><td><code>--steps 64</code> steady 59.5 Mcyc, host 31.2 ms (32.0 tok/s); <code>--eval</code> 43.3 Mcyc, host 38.0 ms (26.3 tok/s)</td><td>871.9 Mcyc / 478 ms</td></tr>
+    <tr><td>Before M6, per-op HexKL path</td><td>—</td><td>~0.16 tok/s</td><td>—</td></tr>
+  </table>
+  <p class="src">HEXAGON.md §8.2: M4 → M5 table, "M6 P3 on device", "M6 P4 on device" (the P3/P4 host figures are marked not comparable there — "the DSP pcycles are the comparable number").</p>
+</div>
+
+<div class="panel">
+  <h2>Baselines and references: every non-nntrainer row of the benchmark table, and the CPU floor</h2>
+  <p>These are the numbers our rows are read against. The GENIEX rows come from Qualcomm AI Hub (<code>aihub.qualcomm.com/models/qwen3_0_6b</code>) and were not measured by us; "QPN" is Qualcomm's reference platform, "Galaxy S25" the retail phone. The last row is nntrainer's own CPU path, to be measured by the user on the S25 Ultra from <code>main</code>; until it is filled every goal that is "a multiple of the baseline" reads "pending #60".</p>
+  <table>
+    <tr><th>Runtime</th><th>Precision</th><th>Device</th><th>Backend</th><th>Context</th><th>Prefill tok/s</th><th>Decode tok/s</th><th>Role in our goals</th></tr>
+    <tr><td>GENIEX_LLAMACPP</td><td>q4_0</td><td>8 Elite QPN</td><td>NPU</td><td>512</td><td>3,409</td><td><b>70.3</b></td><td>the stage-1 w4a8 decode @512 goal (≥ 70.3); the 3,409 prefill is "out of HVX-only reach", stage 2 chases it</td></tr>
+    <tr><td>GENIEX_LLAMACPP</td><td>q4_0</td><td>8 Elite QPN</td><td>NPU</td><td>4096</td><td>2,550</td><td><b>27.5</b></td><td>the decode @4096 goal (≥ 27.5) of the stage-1 HVX-only and w4a8 rows</td></tr>
+    <tr><td>GENIEX_LLAMACPP</td><td>q4_0</td><td>8 Elite QPN</td><td>CPU</td><td>512</td><td>945</td><td>89.4</td><td>llama.cpp on the phone's CPU; context for the #60 floor, not a goal</td></tr>
+    <tr><td>GENIEX_LLAMACPP</td><td>q4_0</td><td>8 Elite QPN</td><td>CPU</td><td>4096</td><td>237</td><td>18.9</td><td>same</td></tr>
+    <tr><td>GENIEX_QAIRT</td><td>w4a16</td><td>8 Elite (Galaxy S25)</td><td>NPU</td><td>512</td><td><b>8,207</b></td><td><b>121</b></td><td><b>stage-3 (#65) reference @512</b>; drawn on the chart</td></tr>
+    <tr><td>GENIEX_QAIRT</td><td>w4a16</td><td>8 Elite (Galaxy S25)</td><td>NPU</td><td>1024</td><td><b>7,503</b></td><td><b>112</b></td><td>stage-3 (#65) reference @1024</td></tr>
+    <tr><td>GENIEX_QAIRT</td><td>w4a16</td><td>8 Elite (Galaxy S25)</td><td>NPU</td><td>4096</td><td><b>3,546</b></td><td><b>57.6</b></td><td><b>stage-3 (#65) reference @4096</b>; drawn on the chart</td></tr>
+    <tr><td>GENIEX_QAIRT</td><td>w4a16</td><td>8 Elite QPN</td><td>NPU</td><td>4096</td><td>7,574</td><td>115</td><td>the same graph on the reference platform; shows how much the retail phone's thermals and clocks cost at 4096 (not a goal)</td></tr>
+    <tr><td><b>nntrainer</b></td><td><code>Q4_0</code> weights, fp16 activations (<code>Q4_0-FP16</code>)</td><td>8 Elite (Galaxy S25 Ultra)</td><td>CPU, <code>main</code></td><td>512 / 1024 / 4096</td><td><b>pending</b></td><td><b>pending</b></td><td><b>the floor every nntrainer NPU row is read against</b> (issue #60; user decisions 2026-09-18: baseline = CPU from <code>main</code>, precision = <code>Q4_0-FP16</code>); handoff <code>docs/measurements/60-cpu-baseline.md</code> (branch <code>hvx/60-cpu-baseline</code>)</td></tr>
+  </table>
+  <p class="src">HEXAGON_BENCHMARK.md comparison table (all GENIEX rows and the CPU row, verbatim), "Goals" (which cell each reference feeds) and log 2026-09-18 "User decisions (evening)". Note the precision mismatch when comparing: our rows are W8A8, the QAIRT rows w4a16 and the LLAMACPP rows q4_0 — 4-bit weights halve the bytes per decode step, which is exactly why the stage-3 goal is a W4 port and why 70.3 with int8 weights would need 41.9 GB/s over the whole step, above the 37 GB/s the DMA path reaches (HEXAGON_BENCHMARK.md stage-1 W8A8 levers cell; issue #49).</p>
+</div>
+
+<div class="panel">
+  <h2>Decode tok/s over measurement date, 512 and 4096, with the goal lines, the measured ceiling and the GENIEX_QAIRT references</h2>
+  <svg viewBox="0 0 760 440" role="img" aria-label="Decode tokens per second at 512 and at 4096 tokens of context for the seven device sittings between 2026-09-16 and 2026-09-18, with goal lines at 70.3 and 27.5, the measured 54 tok/s weight-stream ceiling, and the GENIEX_QAIRT w4a16 reference lines at 121 and 57.6">
+    <!-- grid and y axis: 0..130 tok/s over y = 340..30 (2.3846 px per tok/s) -->
+    <g font-size="10" class="t2">
+      <line x1="90" y1="340" x2="700" y2="340" stroke="var(--grid)"/>
+      <line x1="90" y1="280.4" x2="700" y2="280.4" stroke="var(--grid)"/>
+      <line x1="90" y1="220.8" x2="700" y2="220.8" stroke="var(--grid)"/>
+      <line x1="90" y1="161.2" x2="700" y2="161.2" stroke="var(--grid)"/>
+      <line x1="90" y1="101.5" x2="700" y2="101.5" stroke="var(--grid)"/>
+      <line x1="90" y1="41.9" x2="700" y2="41.9" stroke="var(--grid)"/>
+      <text x="82" y="344" text-anchor="end">0</text>
+      <text x="82" y="284" text-anchor="end">25</text>
+      <text x="82" y="225" text-anchor="end">50</text>
+      <text x="82" y="165" text-anchor="end">75</text>
+      <text x="82" y="105" text-anchor="end">100</text>
+      <text x="82" y="46" text-anchor="end">125</text>
+      <text x="20" y="20" font-size="11">decode tok/s</text>
+      <text x="180" y="362" text-anchor="middle">2026-09-16</text>
+      <text x="395" y="362" text-anchor="middle">2026-09-17</text>
+      <text x="615" y="362" text-anchor="middle">2026-09-18</text>
+      <text x="180" y="376" text-anchor="middle">M6 P4 · R3CY10WM83Y</text>
+      <text x="395" y="376" text-anchor="middle">#23 A v75 · #23 B v79 · R3CY205ZMND</text>
+      <text x="615" y="376" text-anchor="middle">#24 v75 · #35 v79 · #25 v79+prefetch · #53 4096 re-run · R3CY10WM83Y</text>
+    </g>
+    <!-- GENIEX_QAIRT w4a16 reference lines (solid, aqua) -->
+    <g stroke="var(--acc)" stroke-width="1.5">
+      <line x1="90" y1="51.5" x2="700" y2="51.5"/>
+      <line x1="90" y1="202.6" x2="700" y2="202.6"/>
+    </g>
+    <!-- goal lines (dashed) and the measured ceiling (dotted) -->
+    <g stroke="var(--dim)" stroke-width="1.5" stroke-dasharray="6 4">
+      <line x1="90" y1="172.4" x2="700" y2="172.4"/>
+      <line x1="90" y1="274.4" x2="700" y2="274.4"/>
+    </g>
+    <g stroke="var(--dim)" stroke-width="1.5" stroke-dasharray="2 3">
+      <line x1="90" y1="211.2" x2="700" y2="211.2"/>
+    </g>
+    <g font-size="10" class="t2">
+      <text x="94" y="48">121 · GENIEX_QAIRT w4a16 @512 (Galaxy S25) — the stage-3 W4 reference (#65)</text>
+      <text x="94" y="169">70.3 · w4a8 goal @512 (GENIEX_LLAMACPP q4_0 NPU)</text>
+      <text x="94" y="199">57.6 · GENIEX_QAIRT w4a16 @4096 (Galaxy S25) — stage-3 reference</text>
+      <text x="94" y="223">54 · W8 weight-stream ceiling @512 (#25 C, measured); the W8A8 goal is a multiple of the CPU baseline, pending #60</text>
+      <text x="696" y="287" text-anchor="end">27.5 · goal @4096 (stage-1 HVX-only and w4a8)</text>
+      <text x="696" y="120" text-anchor="end">CPU floor (#60, Q4_0-FP16): pending — no line until measured</text>
+    </g>
+    <!-- 512 series: blue circles. v75 solid connector, v79 dashed connector -->
+    <polyline points="180,273.9 375,263.9 555,269.9" fill="none" stroke="var(--w)" stroke-width="2"/>
+    <polyline points="415,265.1 595,266.3 635,259.6" fill="none" stroke="var(--w)" stroke-width="2" stroke-dasharray="5 4"/>
+    <g stroke="var(--panel)" stroke-width="2">
+      <circle cx="180" cy="273.9" r="5" fill="var(--panel)" stroke="var(--w)"><title>M6 P4, 2026-09-16, v75, 512: 27.7 tok/s, 68.9 Mcyc</title></circle>
+      <circle cx="375" cy="263.9" r="5" fill="var(--panel)" stroke="var(--w)"><title>#23 A, 2026-09-17, v75, 512: 31.9 tok/s, 64.3 Mcyc</title></circle>
+      <circle cx="415" cy="265.1" r="5" fill="var(--w)"><title>#23 B, 2026-09-17, v79, 512: 31.4 tok/s, 60.1 Mcyc</title></circle>
+      <circle cx="555" cy="269.9" r="5" fill="var(--panel)" stroke="var(--w)"><title>#24, 2026-09-18, v75, 512: 29.4 tok/s, 65.1 Mcyc</title></circle>
+      <circle cx="595" cy="266.3" r="5" fill="var(--w)"><title>#35 B1, 2026-09-18, v79, 512: 30.9 tok/s, 61.2 Mcyc</title></circle>
+      <circle cx="635" cy="259.6" r="5" fill="var(--w)"><title>#25 B, 2026-09-18, v79 + cross-op prefetch, 512: 33.7 tok/s, 54.6 Mcyc</title></circle>
+    </g>
+    <g font-size="10">
+      <text x="180" y="262" text-anchor="middle">27.7</text>
+      <text x="368" y="258" text-anchor="end">31.9</text>
+      <text x="422" y="260">31.4</text>
+      <text x="548" y="266" text-anchor="end">29.4</text>
+      <text x="595" y="258" text-anchor="middle">30.9</text>
+      <text x="642" y="254">33.7</text>
+    </g>
+    <!-- 4096 series: orange squares -->
+    <polyline points="180,317.6 375,317.1 555,318.3" fill="none" stroke="var(--x)" stroke-width="2"/>
+    <polyline points="415,312.8 595,313.3 635,313.5 675,314.7" fill="none" stroke="var(--x)" stroke-width="2" stroke-dasharray="5 4"/>
+    <g stroke-width="2">
+      <rect x="175" y="312.6" width="10" height="10" fill="var(--panel)" stroke="var(--x)"><title>M6 P4, 2026-09-16, v75, 4096: 9.4 tok/s, 216.9 Mcyc</title></rect>
+      <rect x="370" y="312.1" width="10" height="10" fill="var(--panel)" stroke="var(--x)"><title>#23 A, 2026-09-17, v75, 4096: 9.6 tok/s, 213.0 Mcyc</title></rect>
+      <rect x="410" y="307.8" width="10" height="10" fill="var(--x)" stroke="var(--panel)"><title>#23 B, 2026-09-17, v79, 4096: 11.4 tok/s, 177.6 Mcyc</title></rect>
+      <rect x="550" y="313.3" width="10" height="10" fill="var(--panel)" stroke="var(--x)"><title>#24, 2026-09-18, v75, 4096: 9.1 tok/s, 225.9 Mcyc</title></rect>
+      <rect x="590" y="308.3" width="10" height="10" fill="var(--x)" stroke="var(--panel)"><title>#35 B1, 2026-09-18, v79, 4096: 11.2 tok/s, 186.8 Mcyc (cooled re-run)</title></rect>
+      <rect x="630" y="308.5" width="10" height="10" fill="var(--x)" stroke="var(--panel)"><title>#25 B, 2026-09-18, v79 + cross-op prefetch, 4096: 11.1 tok/s, 184.6 Mcyc</title></rect>
+      <rect x="670" y="309.7" width="10" height="10" fill="var(--x)" stroke="var(--panel)"><title>#53 S2 (hvx_impl skel, same tree as #25 B) order 2, 2026-09-18, 4096: 10.6 tok/s (1000 / 94.437 ms), 192.9 Mcyc; order 1 read 10.4 tok/s / 197.1 Mcyc — the same day's spread on one unit</title></rect>
+    </g>
+    <g font-size="10">
+      <text x="180" y="334" text-anchor="middle">9.4</text>
+      <text x="368" y="334" text-anchor="end">9.6</text>
+      <text x="424" y="306">11.4</text>
+      <text x="548" y="334" text-anchor="end">9.1</text>
+      <text x="595" y="334" text-anchor="middle">11.2</text>
+      <text x="635" y="306" text-anchor="middle">11.1</text>
+      <text x="682" y="334">10.6</text>
+    </g>
+    <!-- legend -->
+    <g font-size="11">
+      <circle cx="100" cy="410" r="5" fill="var(--panel)" stroke="var(--w)" stroke-width="2"/><text x="110" y="414">512, v75 skel</text>
+      <circle cx="205" cy="410" r="5" fill="var(--w)"/><text x="215" y="414">512, v79 skel</text>
+      <rect x="305" y="405" width="10" height="10" fill="var(--panel)" stroke="var(--x)" stroke-width="2"/><text x="320" y="414">4096, v75 skel</text>
+      <rect x="420" y="405" width="10" height="10" fill="var(--x)"/><text x="435" y="414">4096, v79 skel</text>
+      <line x1="530" y1="410" x2="560" y2="410" stroke="var(--dim)" stroke-width="1.5" stroke-dasharray="6 4"/><text x="566" y="414">goal</text>
+      <line x1="605" y1="410" x2="635" y2="410" stroke="var(--dim)" stroke-width="1.5" stroke-dasharray="2 3"/><text x="641" y="414">ceiling</text>
+      <line x1="100" y1="430" x2="130" y2="430" stroke="var(--acc)" stroke-width="1.5"/><text x="136" y="434">GENIEX_QAIRT w4a16 reference (Galaxy S25, AI Hub)</text>
+    </g>
+  </svg>
+  <p><b>Read the chart with the unit in mind.</b> The 2026-09-17 points are from unit <code>R3CY205ZMND</code> (2.05 GHz in the decode loop); the 09-16 and 09-18 points are from <code>R3CY10WM83Y</code> (1.91 GHz through #35, 1.74–2.05 GHz run to run in #25 and #53). A tok/s step between those columns is mostly the clock: with the same v75 kernels, #24 and #23 A differ by −8 % tok/s at 512 but only +1.2 % in DSP cycles (65.1 vs 64.3 Mcyc). <b>DSP Mcycles per decode step is the number to compare across device units</b>; tok/s only within a unit and session (HEXAGON_BENCHMARK.md "Method"; HEXAGON.md §7 rule 9 (b)). In cycles the record reads: 512 → 68.9 (P4) → 64.3 (#23 A) → 60.1 (#23 B) → 65.1 (#24) → 61.2 (#35) → <b>54.6 (#25)</b>; 4096 → 216.9 → 213.0 → 177.6 → 225.9 → 186.8 → <b>184.6</b> → 192.9–197.3 (#53, the same tree re-run in a later sitting of the same day). The 09-16 → 09-17 512 "gain" of 27.7 → 31.9 tok/s was the unit, not the SDK; the #35 → #25 512 gain is real (−11.6 % cycles on the same unit, same day, pass 2 of a reversed double pass), while at 4096 the prefetch changed nothing because attention, not the weight stream, is 79 % of that step. The last 4096 point shows why rule 9 (e) exists: #53 ran the very same tree as #25 B and #23 B's exact binary and got 192.9–197.3 Mcyc from both — a 4096 cell is not comparable across sittings even on one unit, only an A/B inside one order is. Hover a point for its Mcyc.</p>
+  <p><b>The two aqua lines are not goals of the current W8A8 line.</b> 121 and 57.6 tok/s are what GENIEX_QAIRT's w4a16 graph reaches on the same phone at 512 and 4096; they are the reference the stage-3 W4 port (#65) is read against, and they sit 3.6× and 5.2× above the #25 points. The CPU floor (#60) has no line yet because it has not been measured; once it is, it goes in as a third reference line and the W8A8 goal becomes "n × floor = m tok/s".</p>
+  <p class="src">Points: the History blocks above (the #53 point derived as 1000 ÷ its median host ms; the handoff records ms and Mcyc, not tok/s). Goal lines: HEXAGON_BENCHMARK.md "Goals" — stage 1 w4a8 ≥ 70.3 @512 / ≥ 27.5 @4096 (the GENIEX_LLAMACPP q4_0 NPU rows); the stage-1 HVX-only decode @4096 row shares the 27.5. The stage-1 W8A8 decode @512 goal has no line: since 2026-09-18 it is a multiple of the CPU baseline that issue #60 has yet to measure. Ceiling: the #25 variant C row (54 tok/s = 596 MB/step at 32.3 GB/s). Reference lines: the GENIEX_QAIRT w4a16 "8 Elite (Galaxy S25)" rows of the comparison table, the stage-3 goal cell, and the log entry "User decisions (evening)".</p>
+</div>
+
+<div class="panel">
+  <h2>What each measurement decided</h2>
+  <p><b>M6 P4 (2026-09-16) — the kernel set is complete and exact to its definition.</b> The int16 <code>down_proj</code> kernel matched a reference recomputed from the DSP's own input to one fp16 ulp (rel-RMS 1.6e-4); the DSP-vs-x86 perplexity gap of +0.16 … +1.29 % across prompts was isolated to the upstream ATTN/W8A8 qf32 chain, not to the new kernels, and became the accuracy band later handoffs gate on. Decode time on the DSP fell 2.5–2.8× against P3; the host wall fell further than the DSP did for reasons not investigated, which is where the rule "the DSP pcycles are the comparable number" comes from (HEXAGON.md §8.2 "M6 P4 on device").</p>
+  <p><b>#23 (2026-09-17) — no SDK regression; v79 is data, not a default.</b> Variant A (v75, SDK 6.4.0.1) matched P4 within −1.6 … −0.6 % on prefill and at or above it on decode, with the P4 prompt at +0.21 % against x86, so ledger ⑭ (SDK 6.4) closed. The 512 decode pair was found to be ±5 % by construction, which became a standing caveat. Variant B (v79-native skel) ran the full set with no hang, no DSP restart and no fatal FARF line, 10–27 % faster than v75 with PPL and top-1 tracking A at every context — while the same build failed four simulator tests by ±1 LSB. Standing rule from it: a v79 change is judged by <em>both</em> gates; the shipping skel stayed v75 until ledger ④ was answered, and issue #35 was told to re-read its plan against these numbers (23-sdk64-baseline.md "Results", "Accuracy"; HEXAGON.md §7 rule 1 update, §8.2).</p>
+  <p><b>#24 (2026-09-18) — the logits return is not a lever; ledger ⑫ closed.</b> The 607,744-byte logits return costs about 2.5 ms in an empty call (removed by mapping the rpcmem buffer once with <code>FASTRPC_MAP_STATIC</code>) and less than 0.1 ms inside a real 34 ms decode step, where malloc, rpcmem and static land within 70 µs of each other with byte-identical generated ids and PPL. The harness and <code>HexagonBackend</code> ship the static path on the strength of the isolated number; no DSP top-k / argmax method (ABI v5) is opened, because its trigger had been written against the nominal 2090 MHz clock and the same-minute malloc run showed the gap to be this unit's 1.91 GHz clock. Two by-products: the two-unit / two-clock rule (HEXAGON.md §7 rule 9, with "compare Mcycles across units" and "run sub-ms A/Bs twice with reversed order, read the second pass") and issue #41's opening number (1.17 GHz under <code>--eval</code>). The decode budget was sent to the weight stream (#25, then #51) and to #41 (24-host-logits.md "What the rules yield"; HEXAGON.md §8.2 "Host path" verdict, §9).</p>
+  <p><b>#35 (2026-09-18) — the v79 flip is accepted; §7 rule 1 closed; the 4096 drift goes to issue #53.</b> B1 (v79 shipping skel) passed the ±5 % speed gate at 512 and 1024 and the <code>t512_23</code> accuracy gate, and "Now" in the benchmark moved to its rows. B2 (qf helpers forced on v79) reproduced B1's PPL and top-1 digit for digit within 0.5 % speed, so the 2026-08 IEEE-helper failures were a toolchain-8.x artefact and rule 1's open question closed. Two misses were ruled not to hold the flip: the 4096 cells (+5.9 / +5.2 % cycles, −6.6 / −4.9 % prefill against #23 B on the other unit) repeat #24's v75 miss on this unit the day before with a DSP diff of comments and one token-id check, so they are attributed to unit / session and tracked as issue #53 (rule 9 (e)); and the P4-prompt band 33.07–33.45 had been set from v75 records only, so <b>32.4497 / 184 is re-baselined as the v79 accuracy record</b> (band ±0.3 %, top-1 184 ± 4), with the 1.7 % v79-vs-v75 offset sent to the layer-0 bisection of #26 (ledger ⑮). Read within the unit and the day, v79 is still 17 % fewer decode cycles and 29 % more prefill than v75 at 4096 (35-v79-skel.md "Verdict", "Notes"; HEXAGON.md §7 rule 1 "Closed", §8.2 "#35" verdict, §9).</p>
+  <p><b>#25 (2026-09-18) — the W8 weight stream is finished at 512; the next decode lever is attention; ledger ① and ⑨ closed.</b> The cross-op prefetch cut the decode step from 61.7 to 54.6 Mcyc at 512 (B/A 0.884, −11.6 %, well inside the ≤ 0.90 gate) and the W8A8 matmul share from 24.3 to 16.1 Mcyc (−34 %) — 0.5 Mcyc <em>below</em> the pure DMA wait of the stream-only skel for the same bytes, so at 512 the int8 multiplies are now entirely hidden behind the weight stream and the prefetch build's stream phase (33.6 Mcyc) is within 4 % of the ceiling's (32.2). Prefetch is therefore <b>on by default</b> (G1 PASS). The 64-row chunk (D) read +9.9 % cycles over B with lower prefill, so <b>the max-fit chunk stays</b> (D FAIL); accuracy was unchanged to the digit across A, B, D and both passes (G3 PASS). The ceiling (G1'): every weight byte of the step, 595,984,384 B, streams in 32.2 Mcyc = 18.5 ms = 32.3 GB/s, a <b>54 tok/s bound at 512</b> and ≈ 54–57 at every depth; the handoff's first "≈ 74" had left out the lm_head's 26 % of the bytes and was corrected at the read-back. Because 54 is below the provisional ≥ 60 goal, that goal was withdrawn, and the user then decided (issue #60) that every HVX goal is read relative to nntrainer's own CPU baseline instead of a fixed tok/s. What the per-kind split says about the rest: at 1024 and 4096 the prefetch build equals the stream-only skel within 0.1 / 1.2 % because <b>attention is 46 % / 79 % of those steps</b> (34.2 / 146.6 Mcyc, ≈ 6.5 GB/s over the fp16 KV cache, a fifth of what the weight DMA reaches) — issue #58 (balance the 8 kv heads over the 6 workers, share K^T across the GQA pair at m=1; gate: attention halved at 4096) is the first decode lever from here. Two smaller findings became issues too: the row-major <code>down_proj</code> rows stream at 21 GB/s where the tiled ring reaches 37 (issue #59, ≈ 3 Mcyc of the step) and the int16 kernel's epilogue folds exactly four rows, so <code>MM16_R</code> is pinned to 4 by a static check until issue #57 generalises it (that issue also inherits the <code>MM_TB</code> / <code>MM16_TB</code> prefill sweep, inert at m=1). The 4-bit stream of #51 buys 8.3–9.6 ms/step at these rates, which is not enough for 70.3 on its own, so its targets need #58 as well (25-decode-prefetch.md "Pass rules", "Notes"; HEXAGON.md §8.2 "#25" verdicts and "The ceiling (G1'), read correctly", §9; HEXAGON_BENCHMARK.md "Goals" and log 2026-09-18).</p>
+  <p><b>#53 (2026-09-18) — the 4096 spread is the unit and the session, not the code; issue closed, no bisection, no re-baseline; rule 9 (e) becomes a standing rule.</b> The handoff's own gate table returns "outcome 3, inconclusive" by the letter: the slot-matched deltas are −2.22 % and +2.17 %, just outside its ±2 % band and with opposite signs. The supervisor read the substance instead: opposite signs of equal size are a <em>per-order</em> drift (every run in order 2 was 2.2 % faster than every run in order 1, while the two skels agree to 0.1 % inside each order), the code / build outcome is positively excluded (#23 B's exact binary never came near its 177.6 on this unit — 197.3 and 192.9, +8.6 %), and the bisection the plan had prepared (<code>1bbd8d53</code> → #35 / #50 / #33) is not opened. A second-day pair, which the handoff asked for before any re-baseline, was judged not worth a sitting: it would only buy a re-baselined #23 4096 cell that no open verdict needs, because #58's 4096 gate is an A/B inside one order and the decode @4096 goal is 2.5× away, far outside the ±5 % session spread. What changed in the rulebook: a 4096 verdict is read inside one order, a 4096 handoff records battery temperature, charging status and idle minutes before each order (the phone was charging throughout #53, and #23 B's / #35 B1's charge state is not on record — the one variable left unsplit), the cross-unit 4096 offset of ≈ +9 % with identical bytes is a documented property of <code>R3CY10WM83Y</code>, and a skel's file size is no longer trusted as a tree fingerprint — the <code>--eval</code> digits are. The measurement file's "rule 9 (e) stays open, one more pair" and the supervisor's "closed as completed" are the same data read at two levels; this page follows the supervisor's fold, which is what HEXAGON.md and HEXAGON_BENCHMARK.md carry (53-4096-unit-split.md "Verdict", "Reading", "Notes from the run"; HEXAGON.md §7 rule 9 (e), §8.2 "#53" block, §9; HEXAGON_BENCHMARK.md log 2026-09-18 "#53").</p>
+  <p><b>Goal policy (2026-09-18, user decisions, issues #60 and #65) — HVX goals are read against nntrainer's own CPU; the A8W8 HVX-only line is wrapped up; the top goal is the W4 port.</b> After #25 showed the fixed ≥ 60 tok/s W8A8 goal to be above the physical ceiling, the replacement proposed by the supervisor (a fixed ≥ 40) was dropped: the stage-1 W8A8 decode goal, and every other HVX goal, is now a multiple of what nntrainer itself reaches on the S25 Ultra CPU from <code>main</code> with Qwen3-0.6B. The same evening the user fixed that baseline's precision to <code>Q4_0-FP16</code> (#60 unblocked; handoff <code>docs/measurements/60-cpu-baseline.md</code>, still to be run), decided that the A8W8 HVX-only line ends with the issues already filed (#26, #41, #57, #58, #59, #60) with HMX for it later, and opened <b>issue #65 (p0)</b> as the new top goal: bring upstream PR nntrainer/nntrainer#4327's W4 path (HMX u8×i4 matmul, DMA ring, u8 attention, KV quantisation) into this backend's structure and measure Qwen3-0.6B end to end, read against GENIEX_QAIRT w4a16 on the Galaxy S25 with the #60 row as the floor. A stage-3 row was added to the goals; #51's HVX w4g128 plan is folded into #65 as its decode (m=1) path, re-based on the per-channel <code>w4cx</code> format. Until #60 is filled the W8A8 goal cell reads "pending #60", and the 54 tok/s ceiling remains the bound any multiple must respect (HEXAGON_BENCHMARK.md "Goals" stage-1 W8A8 and stage-3 rows, the CPU row, log 2026-09-18; plan 65-w4-htp-port.md §1, §7).</p>
+</div>
+
+<div class="panel warn">
+  <h2>What is open after these measurements</h2>
+  <p>Ordered as HEXAGON_BENCHMARK.md "Goals" and HEXAGON.md §9 order them after the user decisions of 2026-09-18: the W4 port first, then the A8W8 HVX-only line's remaining filed issues, which close that line.</p>
+  <ul>
+    <li><b>#65 (p0) — stage 3, the W4 port of upstream PR nntrainer/nntrainer#4327 (HMX u8×i4).</b> Plan <code>docs/plans/65-w4-htp-port.md</code> (on <code>hvx_impl</code> since S0 merged); files are ported one by one into <code>nntrainer/tensor/hexagon/htp/hmx/</code>. Four stage sub-issues, each one PR with a gate. <b>S0 = #68, merged 2026-09-21</b> (PR #72 at <code>026af1e8</code>): <code>build_skel.sh</code> / <code>build_sim_test.sh</code> link HexKL's <code>libhexkl_micro.a</code> (<code>-DHTP_HMX=1</code> whenever the addon is on the mount), <code>htp_graph_init</code> asks for 8 MB of VTCM plus the HMX unit and lays HexKL's arena above the HVX kernels' unchanged 4 MB, worker 0 takes the per-thread HMX lock lazily, <code>hexkl_acc_tile</code> is ported from the PR, and a 14th simulator test <code>hmx</code> probes the int32 accumulator layout, runs one 64×32 u8 × 32×32 i4 micro-matmul against a scalar reference, relocates a baked weight tile VTCM → DDR → DMA → VTCM and prints the WH tile permutation. Outcome: the plain <code>-mv79</code> simulator core (<code>v79na_1</code>, HMX v3) executes HMX bit-exactly (every <code>hmx_mm_*</code> STAT <code>max_abs=0</code>), so every HMX numeric STAT is a simulator gate and the planned "links and skips" degrade was not needed; only the accumulator layout is re-read on the device in H1. No DSP number changed: <code>profile acc</code> is bit-identical to #25's and the <code>-DHTP_HMX=0</code> build is md5-identical in all 12 DSP objects (<code>tools/hexagon/dsp_obj_md5.sh</code>) (HEXAGON.md §2.2 "HMX arena", §5.2, §7 rules 10–11, §9; plan 65 §4 "S0 outcome"). <b>S1 = #69, in review, pending a user decision</b> (branch <code>hvx/69-w4cx-producer-abi5</code>, PR not yet opened; nothing of it is on <code>hvx_impl</code>): the W4 producer, image and x86 reference with no DSP kernel (ABI v5, kind <code>MATMUL_W4A8</code>, layout ids <code>W4CX_DOWN8</code> / <code>W4CX</code>; <code>init</code> rejects a W4 list with rc 4 until S2's kernel exists). Its gate was an x86 PPL ≤ 1.10 × the W8 reference, else a per-tensor int8 fallback set, else <code>needs-user</code>. Measured on that branch, x86 <code>--eval</code> over the first 512 tokens of <em>Pride and Prejudice</em> (511 steps; the P4 / <code>t512_23</code> files were not on that machine): W8 <code>tiled32</code> <b>22.5282 / 186</b>, the six-projection per-channel int4 RTN image <b>46.2279 / 148</b>, i.e. <b>2.052 ×</b>. Torch weight-only fake quant on the same tokens agrees (six int4 1.915 ×; only gate + up int4 1.280 ×; only q/k/v/o int4 1.321 ×; a per-row clip search brings six int4 to 1.776 × and gate + up alone to 1.196 ×) — above the plan's 1.25 × stop line even with q/k/v/o back at int8, which is the S1 gate's <code>needs-user</code> branch. The options the plan names are group scales on HVX only (#51's <code>w4g128</code>, which HMX's per-channel tiles cannot express) or HMX u8i8 W8A8 prefill (the original stage 2). Read this as a result in review, not a merged fact (HEXAGON.md §8.1 "Per-channel int4 (w4cx, #65 S1, 2026-09-21, x86 only)" on branch <code>hvx/69-w4cx-producer-abi5</code>; plan 65 §4 S1). <b>S2 = #70</b> the HMX kernel for the six per-layer projections and handoff H1 (A = W8 control, B = W4 HMX, C = stream-only, D = probe; gates: <code>mm4(B) ≤ 0.25 × mm8(A)</code> at m=128, decode not regressed at m=1, environment check within ±5 % of #25 B's 54.6 Mcyc; H1 prefill expected ≈ 350–500 tok/s, read as <code>mm4</code> not tok/s); <b>S3 = #71</b> the full 4-bit image (<code>embed</code>, <code>LOGITS</code>, <code>down</code>) plus the m=1 HVX W4 kernel if H1 shows HMX padding one row to 64 costs more than 2 Mcyc, and handoff H2 (gate: decode stream phase ≤ 0.55 × the W8 control's; rows at 512 / 1024 / 4096 against 121 / 112 / 57.6 and the #60 floor; the 4096 read inside one order, rule 9 (e)). Expected, not gated: with the HVX 4-bit stream plus #58 attention ≈ 60–66 tok/s decode at 512, with HMX at m=1 ≈ 40–46; 8,207 prefill needs u8 op boundaries, HMX/HVX overlap and attention on HMX — later issues. #51 is folded in as the S3 decode path (plan 65 §1, §4, §7). With S1's band failed, S2 and S3 wait for the user's decision on the format.</li>
+    <li><b>#58 — decode attention split over the workers with GQA fusion, <code>state:needs-measurement</code> (the user is measuring; on 2026-09-21 the handoff file is still empty, so this page has no #58 row yet).</b> Branch <code>hvx/58-decode-attn-gqa</code> @ <code>7c8e318d</code>, handoff <code>docs/measurements/58-decode-attn-gqa.md</code>: A/B/C/D skels (control, split + fusion, + <code>l2fetch</code>, fusion only), a 512 reversed double pass, 4096 as an A/B inside one order. Gate G1: <code>attn(B) ≤ 9.0 Mcyc</code> at 512 (A ≈ 17.3) and <code>attn(B) ≤ 0.5 × attn(A)</code> inside each order at 4096 (A ≈ 146.6 → ≤ 73); G2: PPL within ±0.3 % of 41.4947 / 162 and 1.5623 / 3759. The decode @4096 goal (27.5 tok/s = 36 ms/step) needs ATTN ≤ 36 Mcyc against 38 Mcyc of everything else, so this is the first decode lever. <em>Simulator caveat:</em> the branch's op total missed the plan's 0.6× simulator floor (it reads 0.72×) because the v79 simulator's sixth worker runs at half speed in every configuration (workers 0–4 take 152–167 Kcyc for four jobs each, worker 5 takes 308 Kcyc for the same four) while the other five are balanced as the gate intended; whether the sixth worker is also slow on silicon is unknown, so the device decides — if B's <code>attn</code> lands near 2/3 of A instead of 1/2 at 4096, a per-worker FARF split is the first thing to look at. #65 orders itself behind #58: its FARF instrument and attention share are what H1 / H2 are read against (58-decode-attn-gqa.md "Why", "Pass rules", "Notes from the run"; HEXAGON.md §9; plan 65 §7).</li>
+    <li><b>#60 — the CPU baseline</b>: Qwen3-0.6B on the S25 Ultra CPU from <code>main</code> at <code>Q4_0-FP16</code>, 512 / 1024 / 4096, the floor every NPU row is read against; handoff on branch <code>hvx/60-cpu-baseline</code>, measurement pending; independent of everything else and needed to read every row (HEXAGON_BENCHMARK.md CPU row, "Goals"; plan 65 §7).</li>
+    <li><b>#26 — prefill attention (P5) and the upstream qf32 drift (ledger ⑮)</b>: K^T reuse across query rows in the prefill kernel, and the layer-0 bisection of the DSP-vs-x86 PPL band, now with a v79-vs-v75 <code>--dump-op</code> pair to explain #35's −1.7 % offset; becomes the next prefill lever the moment #65's H1 split lands (HEXAGON.md §9; plan 65 §7).</li>
+    <li><b>#41 — DSP clock during host idle gaps</b>: 1.17 GHz under <code>--eval</code> vs 1.91 GHz in the generation loop on the same unit; a <code>HAP_power</code> / DCVS vote sized for gapped decode, judged on the <code>engine="htp"</code> app path, not the harness; the upstream PR's session <code>HAP_power_set</code> block is the same lever (HEXAGON.md §9; plan 65 §7).</li>
+    <li><b>#57 — generalise the W8A16 epilogue fold</b> so <code>MM16_R</code> ∈ {2, 4, 8} can be swept (pinned to 4 by a static check since #25), and run the <code>MM_TB</code> / <code>MM16_TB</code> prefill sweep in the same device session; re-targets its gates to the <code>w4cx</code> rows after #65 S3 (HEXAGON.md §9; plan 65 §7).</li>
+    <li><b>#59 — move the row-major <code>down_proj</code> rows onto the DMA ring</b>: 21 → 37 GB/s, ≈ 3 Mcyc of the decode step (ledger ⑬); <code>down</code> stays on HVX in the W4 port, so this remains valid and re-targets to the <code>w4cx</code> rows after S3 (HEXAGON.md §8.2 "#25", §9; plan 65 §7).</li>
+    <li><b>Closed since the guide's 2026-09-18 commit:</b> #68 (S0 of #65, PR #72 merged 2026-09-21 — build, resources and the <code>hmx</code> simulator test; no device number). Closed earlier: #53 (above; no bisection, no re-baseline) and PR #61 (the #25 prefetch code, flags and <code>summ_farf_prof.py</code> are on <code>hvx_impl</code>). #51 is not closed but folded into #65 (label stays <code>state:planned</code> + <code>needs-user</code> until S3 merges).</li>
+  </ul>
+</div>
+
+<p class="note">Hexagon backend beginner guide · sources: docs/measurements/23-sdk64-baseline.md, 24-host-logits.md, 35-v79-skel.md, 25-decode-prefetch.md, 53-4096-unit-split.md (all on hvx_impl), docs/measurements/58-decode-attn-gqa.md (branch hvx/58-decode-attn-gqa, not yet run), docs/plans/65-w4-htp-port.md (on hvx_impl since PR #72), docs/backend_guide/HEXAGON_BENCHMARK.md (log 2026-09-21), docs/backend_guide/HEXAGON.md §7 rules 9–11, §8.2 and §9, and §8.1 "Per-channel int4" as read with <code>git show hvx/69-w4cx-producer-abi5:docs/backend_guide/HEXAGON.md</code> (in review). Written 2026-09-18, refreshed 2026-09-21 against hvx_impl commit e57f66e5 (no new measurement row this cycle).</p>
+</body>
+</html>

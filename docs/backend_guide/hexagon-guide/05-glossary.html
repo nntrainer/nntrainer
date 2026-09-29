@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hexagon backend guide — 05 Glossary</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb;
+    --panel: #f3f3f1;
+    --text-1: #0b0b0b;
+    --text-2: #52514e;
+    --grid: #d9d8d3;
+    --w: #2a78d6;      /* weights  (slot 1 blue)   */
+    --w-light: #cde2fb;
+    --x: #eb6834;      /* activations (slot 2 orange) */
+    --x-light: #fbd9cc;
+    --acc: #1baf7a;    /* accumulator / output (slot 3 aqua) */
+    --acc-light: #cdeee0;
+    --dim: #b7b6b0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      color-scheme: dark;
+      --surface: #1a1a19;
+      --panel: #242423;
+      --text-1: #ffffff;
+      --text-2: #c3c2b7;
+      --grid: #3a3a38;
+      --w: #3987e5;
+      --w-light: #1c3a5e;
+      --x: #d95926;
+      --x-light: #5a2a17;
+      --acc: #199e70;
+      --acc-light: #16442f;
+      --dim: #5a5a57;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 48px;
+    background: var(--surface); color: var(--text-1);
+    font: 15px/1.55 -apple-system, "Segoe UI", "Noto Sans KR", Roboto, sans-serif;
+    max-width: 1240px; margin-inline: auto;
+  }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 8px; }
+  .sub { color: var(--text-2); margin: 0 0 28px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 28px; }
+  @media (max-width: 900px) { .row { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border-radius: 10px; padding: 18px 18px 14px;
+  }
+  .panel p { color: var(--text-2); margin: 6px 0 0; font-size: 14px; }
+  .panel .verdict { margin-top: 10px; font-size: 14px; color: var(--text-1); }
+  svg { width: 100%; height: auto; display: block; }
+  text { font-family: inherit; fill: var(--text-1); }
+  .t2 { fill: var(--text-2); }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--text-2); margin: 0 0 22px; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+    margin-right: 6px; vertical-align: -2px; background: var(--c);
+  }
+  .ctrl { display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--text-2); margin: 6px 0 4px; }
+  .ctrl input[type=range] { width: 160px; accent-color: var(--w); }
+  .ctrl button {
+    border: 1px solid var(--grid); background: var(--surface); color: var(--text-1);
+    border-radius: 6px; padding: 3px 10px; font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin-top: 4px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { color: var(--text-2); font-weight: 600; }
+  td:first-child { color: var(--text-2); white-space: nowrap; }
+  .note { color: var(--text-2); font-size: 13px; margin-top: 18px; }
+  .tip {
+    position: fixed; pointer-events: none; background: var(--text-1); color: var(--surface);
+    padding: 6px 9px; border-radius: 6px; font-size: 12px; line-height: 1.4;
+    opacity: 0; transition: opacity .08s; white-space: nowrap; z-index: 10;
+  }
+</style>
+<style>
+  /* guide additions: identical on every page of hexagon-guide/ */
+  nav.guide { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; margin: 0 0 24px; padding: 10px 0; border-block: 1px solid var(--grid); }
+  nav.guide a { color: var(--text-2); text-decoration: none; }
+  nav.guide a.here { color: var(--text-1); font-weight: 600; }
+  nav.guide a:hover { color: var(--w); }
+  a { color: var(--w); }
+  .panel { margin-bottom: 24px; }
+  .panel ul, .panel ol { color: var(--text-2); font-size: 14px; margin: 6px 0 0; padding-left: 22px; }
+  .panel li { margin: 3px 0; }
+  .panel li b, .panel p b { color: var(--text-1); }
+  pre { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 10px 12px; font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; overflow-x: auto; margin: 8px 0; color: var(--text-1); white-space: pre; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.93em; }
+  .src { color: var(--text-2); font-size: 12px; }
+  .status { border-left: 4px solid var(--acc); }
+  .warn { border-left: 4px solid var(--x); }
+  .step { counter-increment: step; }
+  .kv td:first-child { white-space: normal; }
+  dl.gl { margin: 0; font-size: 14px; }
+  dl.gl dt { font-weight: 600; margin-top: 10px; }
+  dl.gl dd { margin: 2px 0 0; color: var(--text-2); }
+  td, th { word-break: break-word; }
+  td:first-child { white-space: normal; }
+</style>
+</head>
+<body>
+<nav class="guide">
+  <a href="index.html">Overview</a>
+  <a href="01-run-it.html">01 Run it</a>
+  <a href="02-architecture.html">02 Architecture</a>
+  <a href="03-kernels.html">03 Kernels</a>
+  <a href="04-measure-and-debug.html">04 Measure and debug</a>
+  <a class="here" href="05-glossary.html">05 Glossary</a>
+  <a href="06-performance.html">06 Performance</a>
+</nav>
+<h1>05 · Glossary</h1>
+<p class="sub">Every acronym and project word used in this guide, one line each. Where a term has a precise definition in the project, the section is given.</p>
+
+<div class="row">
+<div class="panel">
+  <h2>Hardware and platform</h2>
+  <dl class="gl">
+    <dt>DSP</dt><dd>Digital signal processor: a second processor in the phone built for wide vector math and low power.</dd>
+    <dt>cDSP</dt><dd>The compute DSP of a Snapdragon chip, the one this backend runs on (HEXAGON.md §1).</dd>
+    <dt>Hexagon</dt><dd>Qualcomm's DSP architecture and instruction set.</dd>
+    <dt>HVX</dt><dd>Hexagon Vector eXtensions: 128-byte vector registers and instructions; "HVX only" means no HMX (HEXAGON_BENCHMARK.md).</dd>
+    <dt>HMX</dt><dd>Hexagon Matrix eXtensions: a matrix unit (one per core) reachable through HexKL. Since #68 (PR #72, 2026-09-21) a skel built with the HexKL addon mounted acquires the HMX unit and a VTCM arena at <code>init()</code>, but no op uses it yet; stage 3 of the goals (issue #65) plans it for 4-bit weights (u8 activation × int4 weight), stage 2 (HMX for the A8W8 line) is deferred (HEXAGON.md §2.2, §9).</dd>
+    <dt>HexKL</dt><dd>Qualcomm's kernel library that exposes HMX; must be obtained from Qualcomm (plan 0000 §3) and is never committed (<code>NOTICE</code>). The add-on at <code>/opt/qcom/hexkl_addon</code> (<code>HEXKL_ADDON_ROOT</code>) carries <code>libhexkl_micro.a</code>; since #68 the build scripts link it whenever it is present (<code>-DHTP_HMX=1</code>), and the version read at init is <code>1.0.0-beta1 hexagon v79</code> (HEXAGON.md §2.2, §5.3).</dd>
+    <dt><code>HTP_HMX</code></dt><dd>The compile flag the build scripts set themselves: 1 when HexKL is on the mount (the <code>hmx/</code> sources are compiled and HexKL linked), 0 otherwise or with <code>HEX_EXTRA_CFLAGS=-DHTP_HMX=0</code> (the HVX-only tree, object-identical to before #68) (HEXAGON.md §5.3; build_skel.sh).</dd>
+    <dt>VTCM arena (HMX arena)</dt><dd>In an <code>HTP_HMX</code> build, the VTCM above the HVX kernels' unchanged first 4 MB: HexKL's config region at the top, two 8 KB int32 result tiles below it, the rest free for a future kernel's activation tiles and weight strips; 8 MB requested with the HMX unit, 4 MB floor (HEXAGON.md §2.2 "HMX arena"; hmx/htp_hmx.h).</dd>
+    <dt>acc layout (accumulator tile layout)</dt><dd>The undocumented arrangement in which HexKL lands a 64×32 int32 result tile in VTCM; <code>hexkl_acc_tile.c</code> (ported from PR nntrainer#4327) probes it with a ramp so a result can be read in place instead of through HexKL's slow vendor copy. Simulator: <code>usable=1 base=0 row_stride=32</code>; the one HMX fact the simulator cannot vouch for, re-read on the device in the first HMX handoff (HEXAGON.md §7 rule 11).</dd>
+    <dt>WH layout / WH bake</dt><dd>HexKL's weight-tile order for HMX: a 32×32 int4 tile (512 B) is permuted by <code>rm_to_wh_i4</code> before use. #68's <code>hmx</code> test showed the bake is a pure bit permutation of the index — element <code>(k, n)</code> → byte <code>128·(k&gt;&gt;3) + 4·n + (k&amp;3)</code>, nibble <code>(k&gt;&gt;2)&amp;1</code> — and that a baked tile survives a VTCM → DDR → DMA → VTCM round trip (HEXAGON.md §5.2, §7 rule 11).</dd>
+    <dt>v75 / v79</dt><dd>Hexagon architecture versions. The S25 Ultra's cDSP is v79; since #35 (2026-09-18) the shipping skel is built <code>HEX_ARCH=v79</code>, and a v75 build, which runs unchanged on v79 silicon, is the fallback (HEXAGON.md §7 rule 1, §9).</dd>
+    <dt>unit / serial</dt><dd>One physical phone, named by its <code>adb</code> serial. Two S25 Ultra units are on record, <code>R3CY10WM83Y</code> (1.91 GHz in the decode loop) and <code>R3CY205ZMND</code> (2.05 GHz); tok/s is compared only within a unit (HEXAGON.md §7 rule 9).</dd>
+    <dt>pcycles_per_us</dt><dd>The DSP's effective clock in MHz during a run, printed by the harness; read gaps and bars against it, not against the nominal 2090 (HEXAGON.md §7 rule 9 (c)).</dd>
+    <dt>SSR</dt><dd>Subsystem restart: the DSP crashing and rebooting; a real failure, unlike the benign adsprpc permission lines (23-sdk64-baseline.md "Notes").</dd>
+    <dt>8 Elite / SM8750</dt><dd>The Snapdragon 8 Elite chip of the Galaxy S25 / S25 Ultra (HEXAGON.md §8).</dd>
+    <dt>VTCM</dt><dd>Vector Tightly Coupled Memory: small, fast memory local to the DSP; 4 MB requested best-effort (HEXAGON.md §2.2).</dd>
+    <dt>DMA</dt><dd>Direct memory access: an engine that copies memory (DDR → VTCM) while the vector unit computes.</dd>
+    <dt>DDR</dt><dd>The phone's main memory, shared by CPU and DSP.</dd>
+    <dt>QuRT</dt><dd>The real-time OS on the DSP; provides threads, HVX locking and the simulator boot image.</dd>
+    <dt>PD (unsigned PD)</dt><dd>Protection domain, a process on the DSP; "unsigned" avoids per-device signing (HEXAGON.md §1.2).</dd>
+    <dt>pcycles / Mcyc</dt><dd>DSP processor cycles as counted by <code>HAP_perf_get_pcycles</code>; Mcyc = millions of them per token. Mcyc per decode step is the number to compare across device units (HEXAGON_BENCHMARK.md "Method").</dd>
+  </dl>
+</div>
+<div class="panel">
+  <h2>RPC and memory</h2>
+  <dl class="gl">
+    <dt>FastRPC</dt><dd>Qualcomm's remote procedure call between CPU and DSP; one call per chunk or token here (~0.26 ms).</dd>
+    <dt>IDL</dt><dd>Interface definition language; <code>nntr_htp.idl</code> declares <code>init</code>, <code>forward</code>, <code>forward_debug</code>.</dd>
+    <dt>QAIC</dt><dd>The SDK tool that turns the IDL into a stub and a skel at build time.</dd>
+    <dt>stub / skel</dt><dd>Generated glue: the stub runs on the host and marshals the call, the skel runs on the DSP and unmarshals it. "The skel" also names the whole DSP library <code>libnntr_htp_skel.so</code>.</dd>
+    <dt>rpcmem / dma-buf / fd</dt><dd>Shared memory both processors can address, allocated by <code>RpcmemBuffer</code>, identified by a file descriptor (fd) and handed to the DSP once (HEXAGON.md §1.1).</dd>
+    <dt>HAP_mmap</dt><dd>The DSP call that maps a registered fd for the session.</dd>
+    <dt>AEE codes</dt><dd>The DSP error numbers (<code>AEE_EBADPARM</code>, <code>AEE_EUNSUPPORTED</code>, …) from <code>AEEStdErr.h</code>. The DSP returns them as-is (HEXAGON.md §1.3); FastRPC hands them to the host offset by the <code>0x80000400</code> DSP error base, which is why logs show <code>0x80000406</code> / <code>0x80000414</code> (hexagon_runner.cpp).</dd>
+    <dt>AEE_EBADPARM</dt><dd>"Bad parameter", code 14: what <code>init()</code> returns for a rejected op-list (every validator rc but 3) and <code>forward()</code> for a bad token count, position, logits length or token id. Seen on the host as <code>0x8000040E</code>, spelled <code>kHexagonBadParm</code> in hexagon_runner.h so the host-side token-id pre-check can return the identical value (HEXAGON.md §1.4).</dd>
+    <dt>ABI</dt><dd>Application binary interface; here the op-list wire format, version 4 (HEXAGON.md §1.4).</dd>
+    <dt>op-list</dt><dd>The 64-byte header plus 64-byte op descriptors that tell the DSP what to run.</dd>
+    <dt>WEIGHTS / KV / ACT / TOKENS / LOGITS</dt><dd>The five buffer ids an op can reference; the first three are mapped once, the last two are per-call arguments.</dd>
+    <dt>FARF</dt><dd>The DSP logging macro; lines reach logcat only with a <code>.farf</code> level file (HEXAGON.md §5.3).</dd>
+    <dt>SSR</dt><dd>Subsystem restart: the DSP crashing and rebooting.</dd>
+    <dt>adb</dt><dd>Android debug bridge, the USB command line to the phone; used only by the person with the workstation.</dd>
+  </dl>
+</div>
+</div>
+
+<div class="row">
+<div class="panel">
+  <h2>Model and numerics</h2>
+  <dl class="gl">
+    <dt>LLM, decoder-only</dt><dd>A language model that generates one token at a time from the previous ones; Qwen3-0.6B here.</dd>
+    <dt>prefill / decode</dt><dd>Prefill processes the prompt in chunks (128 tokens by default); decode generates one token per call.</dd>
+    <dt>tok/s</dt><dd>Tokens per second; prefill and decode are reported separately because they have different bottlenecks.</dd>
+    <dt>logits</dt><dd>One score per vocabulary entry for the next token; 151,936 floats for this model.</dd>
+    <dt>PPL</dt><dd>Perplexity: how surprised the model is by a known text, lower is better; measured teacher-forced with <code>--eval</code>.</dd>
+    <dt>top-1</dt><dd>How many next tokens the model's best guess got right during <code>--eval</code>.</dd>
+    <dt>teacher-forced</dt><dd>Feeding the true next token instead of the generated one, so every step is comparable.</dd>
+    <dt>W8A8 / W8A16</dt><dd>8-bit weights with 8-bit (or 16-bit) activations; the activations are quantized per token on the fly.</dd>
+    <dt>W8_CX</dt><dd>The checkpoint format: int8 weights with one fp32 scale per output channel (per-channel, "CX").</dd>
+    <dt>RTN (round to nearest)</dt><dd>The plainest weight quantiser: scale = amax ÷ 7 per output channel, each weight rounded to the nearest int4 code. #65 S1's x86 result (in review) is for per-channel int4 RTN on Qwen3-0.6B: PPL 46.2279 / 148 against W8's 22.5282 / 186, 2.052 × (HEXAGON.md §8.1 on branch hvx/69-w4cx-producer-abi5).</dd>
+    <dt>per-token / per-channel</dt><dd>One scale per activation row (token) / one scale per weight output row (channel).</dd>
+    <dt>tiled32</dt><dd>The weight byte order: 4 KB tiles of 32 rows × 128 k, so one vector holds 32 rows × 4 k (HEXAGON.md §2.1).</dd>
+    <dt>vrmpy / vrmpyacc</dt><dd>The HVX instruction that multiplies 4 int8 pairs per lane and accumulates into int32 lanes.</dd>
+    <dt>MAC / GMAC</dt><dd>Multiply-accumulate operation; billions of them.</dd>
+    <dt>KV cache</dt><dd>Stored keys and values of every earlier position so decode does not recompute them; lives on the DSP.</dd>
+    <dt>GQA</dt><dd>Grouped-query attention: several query heads share one key/value head (16 share 8 here).</dd>
+    <dt>SDPA</dt><dd>Scaled dot-product attention, the score-softmax-mix computation.</dd>
+    <dt>RoPE</dt><dd>Rotary position embedding, applied to q and k from a precomputed cos/sin table.</dd>
+    <dt>RMSNorm / QK-Norm</dt><dd>Root-mean-square normalisation; QK-Norm applies it per head to q and k.</dd>
+    <dt>SiLU / SwiGLU</dt><dd>The activation function and the gated block (<code>SiLU(gate) ⊙ up</code>) in the feed-forward part.</dd>
+    <dt>down_proj</dt><dd>The last feed-forward matmul, fed by the SwiGLU output; the one with int16 activations.</dd>
+    <dt>lm_head</dt><dd>The final projection to logits; tied to the embedding table here.</dd>
+  </dl>
+</div>
+<div class="panel">
+  <h2>Float formats and precision words</h2>
+  <dl class="gl">
+    <dt>fp16 / fp32</dt><dd>16- and 32-bit IEEE floating point; <code>hf</code> and <code>sf</code> in HVX instruction names.</dd>
+    <dt>qf16 / qf32</dt><dd>Qualcomm's intermediate float formats on HVX; converted back with <code>_equals_</code> instructions (HEXAGON.md §7).</dd>
+    <dt>IEEE-format ops</dt><dd>HVX instructions that operate directly on fp16/fp32 (<code>Vhf_vadd</code>, <code>Vsf_vmpy</code>, …); avoided by rule 1.</dd>
+    <dt>RNE</dt><dd>Round to nearest, ties to even.</dd>
+    <dt>Von Neumann (jam) rounding</dt><dd>qf32's truncate-and-set-LSB behaviour, why the quantizer needs a magic constant (HEXAGON.md §7 rule 6).</dd>
+    <dt>ulp / LSB</dt><dd>Unit in the last place / least significant bit: the smallest step of a number format.</dd>
+    <dt>atol / rtol</dt><dd>Absolute and relative tolerance in <code>|d| ≤ atol + rtol·|ref|</code>.</dd>
+    <dt>rel-RMS</dt><dd>Root-mean-square of the difference relative to the reference, over a whole tensor.</dd>
+    <dt>splat</dt><dd>Broadcasting one value into every lane of a vector.</dd>
+    <dt>epilogue</dt><dd>The part of a matmul kernel after the integer sums: scaling and narrowing.</dd>
+  </dl>
+</div>
+</div>
+
+<div class="row">
+<div class="panel">
+  <h2>Tools and files</h2>
+  <dl class="gl">
+    <dt>SDK</dt><dd>Hexagon SDK 6.4 (6.4.0.2 in the container, 6.4.0.1 on the workstation), with hexagon-clang 19.0.04 (<code>toolv19</code>).</dd>
+    <dt>NDK</dt><dd>Android NDK r26d, baked into the dev image, cross-builds the host harness.</dd>
+    <dt>qpm-cli</dt><dd>Qualcomm Package Manager; installs the SDK inside the container after a login.</dd>
+    <dt>OrbStack / Rosetta</dt><dd>The container runtime on the Mac and Apple's x86 emulation the simulator runs under.</dd>
+    <dt>hexagon-sim</dt><dd>The instruction-level simulator; correctness gate, no DDR model.</dd>
+    <dt><code>test_hmx</code> / <code>hmx</code></dt><dd>The 14th simulator test since #68, built only with <code>HTP_HMX=1</code>: acquires VTCM + HMX, probes the acc layout on worker 0 under the lazy lock, runs one 64×32 u8 × 32×32 i4 micro-matmul against a scalar int32 reference, relocates a baked WH tile through DDR and prints the WH permutation. Without HexKL it prints <code>SKIP: built without HTP_HMX</code> and returns 2, never a pass (HEXAGON.md §5.2).</dd>
+    <dt><code>dsp_obj_md5.sh</code></dt><dd>Compiles each skel source with <code>-c</code> under the same flags as <code>build_skel.sh</code> and prints a sorted md5 list — the per-object proof that a PR changed no DSP bytes; the linked <code>.so</code> embeds random temp object names and is never comparable (HEXAGON.md §3; skill <code>hexagon-gates</code>).</dd>
+    <dt>SIM_TEST / SIM_PROF / STAT</dt><dd>Line prefixes of the simulator tests, the profile scenarios and their recorded statistics.</dd>
+    <dt>E2E / RPC_TEST</dt><dd>Line prefixes of <code>hexagon_e2e_test</code> and <code>hexagon_rpc_test</code> on the device.</dd>
+    <dt>.hexw / .hexcfg</dt><dd>The packed weight image and its 12-line shape file (HEXAGON.md §2.4).</dd>
+    <dt>.i32</dt><dd>A token file: 32-bit little-endian ids from <code>make_tokens.py</code>.</dd>
+    <dt>md5</dt><dd>A checksum used to prove which artifact actually ran.</dd>
+    <dt>HF</dt><dd>HuggingFace; the public Qwen3-0.6B download the wizard fetches.</dd>
+    <dt>GENIEX / QAIRT / QPN</dt><dd>Qualcomm AI Hub runtimes (GENIEX_LLAMACPP = llama.cpp under Genie, GENIEX_QAIRT = a QNN graph) and reference platform (QPN) whose rows are the references in HEXAGON_BENCHMARK.md: the LLAMACPP q4_0 NPU rows give the w4a8 goals 70.3 / 27.5, the QAIRT w4a16 Galaxy S25 rows (8,207 / 121, 7,503 / 112, 3,546 / 57.6) are the stage-3 (#65) reference. All of them are in the "Baselines and references" table on <a href="06-performance.html">06</a>.</dd>
+  </dl>
+</div>
+<div class="panel">
+  <h2>Project words</h2>
+  <dl class="gl">
+    <dt>M1 … M6</dt><dd>Milestones of the backend: M1 round-trip, M4/M5 attention kernels, M6 the HVX optimisation series.</dd>
+    <dt>P1 … P5</dt><dd>Phases inside M6: P1 profile baseline, P2 tiled layout (ABI v4), P3 tiled vrmpy matmul, P4 int16 down_proj, P5 attention (planned).</dd>
+    <dt>ledger ①–⑮</dt><dd>The follow-up list in <code>docs/superpowers/specs/hexagon-hvx-optimization/07-follow-ups.md</code>; e.g. ① cross-op prefetch (closed, #25: on by default), ④ v79-native skel (done, #35), ⑨ 64-row chunk (closed, #25: rejected), ⑩ <code>MM_TB</code> sweep (to #57), ⑫ host logits path (closed, #24: not a lever), ⑬ <code>down</code> on the DMA ring (to #59), ⑭ SDK 6.4 (closed, #23), ⑮ upstream qf32 drift (open, #26).</dd>
+    <dt>issues #23 / #24 / #25 / #26 / #35 / #41 / #51 / #53 / #57 / #58 / #59 / #60 / #61 / #65 / #68–#72</dt><dd>The device measurements (#23 SDK 6.4 baseline, #24 host logits, #35 v79 skel, #25 cross-op prefetch and the weight-stream ceiling, #53 the 4096 unit-split — closed: unit / session, not code) and the follow-ups: #26 prefill attention and the upstream qf32 drift, #41 DSP clock during host idle gaps, #57 generalise the W8A16 four-row fold (<code>MM16_R</code>) and run the prefill <code>MM_TB</code> sweep, #58 decode attention (32–79 % of the decode step; handoff written, awaiting the phone), #59 <code>down_proj</code> rows onto the DMA ring (21 → 37 GB/s), #60 the CPU baseline (<code>Q4_0-FP16</code>) the goals are read against; #61 is the merged PR that carried the #25 code; #51 (HVX 4-bit stream) is folded into <b>#65</b>, the p0 top goal: port upstream PR nntrainer/nntrainer#4327's W4 HMX path. The user decision of 2026-09-18 ends the A8W8 HVX-only line with #26 #41 #57 #58 #59 #60. #65's stage sub-issues: <b>#68</b> S0 build + HexKL link + <code>hmx</code> simulator test (merged 2026-09-21 as PR <b>#72</b>), <b>#69</b> S1 W4 producer / image / ABI v5 / x86 PPL band (in review, band failed, pending a user decision), <b>#70</b> S2 HMX kernel + handoff H1, <b>#71</b> S3 full 4-bit image + handoff H2 (closes #51). See <a href="06-performance.html">06 · Performance</a>.</dd>
+    <dt>W8A8 / w4a8 / w4a16 / q4_0 / <code>Q4_0-FP16</code> / <code>w4cx</code></dt><dd>Weight and activation bit widths: 8-bit weights with 8-bit activations (this backend); 4-bit weights with 8-bit activations (the stage-1 w4a8 goal row and the #65 port); w4a16 and q4_0 are the Qualcomm AI Hub rows' formats; <code>Q4_0-FP16</code> is the precision of nntrainer's own CPU baseline (4-bit block-quantised weights, fp16 activations; issue #60); <code>w4cx</code> is #65's per-channel int4 image layout — one fp32 scale per output channel, the only form HMX's u8×i4 tiles can apply; its x86 accuracy on Qwen3-0.6B (S1, in review) is 2.05 × the W8 PPL, far outside the ≤ 1.10 × gate, and the format is pending a user decision (HEXAGON_BENCHMARK.md; plan 65 §3, §4; HEXAGON.md §8.1 on branch hvx/69-w4cx-producer-abi5).</dd>
+    <dt>weight-stream bound / ceiling</dt><dd>The decode ceiling set by reading every weight byte once per token: 596 MB of int8 weights per step. Measured in #25 with a stream-only skel: 32.3 GB/s, <b>54 tok/s at 512</b> (≈ 54–57 at every depth); the provisional ≥ 60 goal was withdrawn as above it, and 70.3 with int8 weights would need 41.9 GB/s (HEXAGON_BENCHMARK.md "Goals" and ceiling row; issue #49).</dd>
+    <dt>cross-op prefetch</dt><dd>Each tiled matmul kicks the first DMA chunk of the next tiled matmul into its free VTCM half while the small ops in between run; one DMA queue per worker for the session. −11.6 % decode cycles at 512 in #25, on by default; on <code>hvx_impl</code> since PR #61 merged (HEXAGON.md §2.2).</dd>
+    <dt>stream-only skel (<code>HTP_MM_STREAM_ONLY</code>)</dt><dd>A measurement build that DMAs every weight byte and multiplies nothing; outputs are garbage, its step time is the ceiling (#25 variant C).</dd>
+    <dt><code>HTP_PROF_FARF</code> / <code>summ_farf_prof.py</code></dt><dd>A measurement build flag that makes the DSP print, per forward call, its cycles split into <code>mm8</code> / <code>mm16</code> / <code>lg</code> / <code>attn</code> / <code>rest</code>; the script takes the decode medians of a <code>device_farf_*.log</code> (on <code>hvx_impl</code> since #25 / PR #61; the <code>attn</code> column is what #58's gate reads).</dd>
+    <dt>CPU baseline (#60)</dt><dd>nntrainer running Qwen3-0.6B on the S25 Ultra CPU from <code>main</code> at <code>Q4_0-FP16</code> (user decision 2026-09-18); every NPU goal is a multiple of it, written as the multiple plus the resolved tok/s once measured (pending; handoff on branch hvx/60-cpu-baseline).</dd>
+    <dt>cold run / reversed double pass</dt><dd>The first e2e run after a push is slower (3–5 % in #24, +8.5 % DSP cycles in #25); any A/B verdict tighter than ±10 % is run twice with the order reversed and only the second pass is read (HEXAGON.md §7 rule 9 (d)).</dd>
+    <dt>4096 A/B inside one order (rule 9 (e))</dt><dd>At 4096 even the DSP Mcyc figure moves with the session (±5 % between sittings on one unit, ≈ +9 % between units with the same binary; #53), so a 4096 verdict compares both skels back to back inside one order after the same idle, with battery °C and charging status recorded before the order; a 4096 cell is never read against another sitting's row (HEXAGON.md §7 rule 9 (e)).</dd>
+    <dt>sixth-worker simulator caveat</dt><dd>In the v79 simulator worker 5 of a six-worker pool runs at half the speed of workers 0–4 in every configuration (#58's per-worker timers), so a simulator op-total ratio over a balanced pool under-reads; the device decides (58-decode-attn-gqa.md "Notes from the run").</dd>
+    <dt>FASTRPC_MAP_STATIC</dt><dd>A FastRPC mapping flag that maps a host rpcmem buffer once for the session instead of per call; used for the logits buffer since #24 (HEXAGON.md §1.1, §8.2 "Host path"; on hvx_impl since PR #52).</dd>
+    <dt>handoff</dt><dd>A <code>docs/measurements/&lt;issue#&gt;-&lt;slug&gt;.md</code> file a person executes on the phone and fills in.</dd>
+    <dt>gate / rung</dt><dd>One level of the verification ladder in the <code>hexagon-gates</code> skill; rungs 0–4 in the container, 5 on the phone.</dd>
+    <dt>state:* labels</dt><dd>The issue state machine: needs-plan → planned → in-progress → review, with needs-measurement → measured on the side (plan 0000 §5).</dd>
+    <dt>engine="htp"</dt><dd>The <code>nntr_config.json</code> switch that sends the whole model to the DSP (HEXAGON.md §5.4).</dd>
+    <dt>fallback</dt><dd>The app running on the CPU when the DSP path is unavailable; a safety net, not a strategy.</dd>
+    <dt>harness</dt><dd><code>hexagon_e2e_test</code> / <code>hexagon_rpc_test</code>: the standalone device programs used for measurement and debugging.</dd>
+    <dt>reference</dt><dd><code>hexagon_ref_run</code> on x86, the accuracy oracle.</dd>
+  </dl>
+</div>
+</div>
+
+<p class="note">Hexagon backend beginner guide · sources: docs/backend_guide/HEXAGON.md, HEXAGON_BENCHMARK.md, docs/measurements/ (#23, #24, #35, #25, #53 on hvx_impl), nntrainer/tensor/hexagon/, Applications/CausalLM/hexagon/, tools/docker/, docs/superpowers/specs/hexagon-hvx-optimization/. Written 2026-09-17, refreshed 2026-09-21 against hvx_impl commit e57f66e5 (#68 S0 merged, PR #72; S1 read from branch hvx/69-w4cx-producer-abi5, in review).</p>
+</body>
+</html>

@@ -427,9 +427,21 @@ int main(int argc, char *argv[]) {
       std::cerr << std::endl;
       return EXIT_FAILURE;
     }
-    model->initialize();
-    model->load_weight(weight_file);
-    model->repack_weight();
+    // engine="htp" (nntr_config.json): whole-graph DSP offload for qwen3;
+    // anything that cannot go to the DSP falls back to the CPU graph.
+    bool on_dsp = false;
+    if (nntr_cfg.value("engine", "cpu") == "htp") {
+      auto *lm = dynamic_cast<causallm::CausalLM *>(model.get());
+      on_dsp = architecture == "Qwen3ForCausalLM" && lm &&
+               lm->initHexagon(weight_file);
+      if (!on_dsp)
+        std::cerr << "hexagon: engine=htp unavailable, running on CPU\n";
+    }
+    if (!on_dsp) {
+      model->initialize();
+      model->load_weight(weight_file);
+      model->repack_weight();
+    }
 
     bool do_sample = generation_cfg.value("do_sample", false);
 

@@ -1,6 +1,14 @@
 This project includes code derived from llama.cpp
 which is licensed under the MIT License:
 
+Files under nntrainer/tensor/hexagon/htp/hex/ (hex-utils.h, hex-fastdiv.h,
+hex-dump.h, hex-common.h), nntrainer/tensor/hexagon/htp/dma/ (dma-queue.c,
+dma-queue.h), and nntrainer/tensor/hexagon/htp/hvx/ (hvx-exp.h, hvx-base.h,
+hvx-floor.h, hvx-inverse.h, hvx-types.h) are imported from llama.cpp's
+ggml-hexagon backend (https://github.com/ggml-org/llama.cpp,
+ggml/src/ggml-hexagon/htp/) and are likewise MIT-licensed; see the MIT
+License text below.
+
 MIT License
 
 Copyright (c) 2023-2024 The ggml authors
@@ -22,3 +30,16 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+This project includes code ported from the nntrainer upstream pull request
+#4327 (https://github.com/nntrainer/nntrainer/pull/4327), which is licensed
+under the Apache License 2.0 like this project:
+
+Files under nntrainer/tensor/hexagon/htp/hmx/ (hexkl_acc_tile.c,
+hexkl_acc_tile.h) are Copyright (C) 2026 SeungHui Lee and keep their original
+SPDX and author headers; each carries a @see line naming the pull request.
+
+HexKL (libhexkl_micro.a, hexkl_micro.h; Copyright (c) Qualcomm Technologies,
+Inc.) is a Qualcomm addon that the Hexagon build scripts link from the user's
+own installation (mounted by tools/docker/run.sh at /opt/qcom/hexkl_addon,
+like the Hexagon SDK); no part of it is copied into this tree.
