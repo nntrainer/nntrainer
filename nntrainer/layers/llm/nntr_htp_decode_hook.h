@@ -119,6 +119,18 @@ inline int htpDecodeLmHead(unsigned pos, const float *x, unsigned K,
                      nullptr, 0, 0.0f);
 }
 
+/** @brief [#132 Part B] Whether the HTP runs the whole decode row at
+ *  @a pos (every kind resident, the row handed over): a layer's FC GEMVs
+ *  are then discarded work and it skips them. False without HTP. */
+inline bool htpDecodeRowResident(unsigned pos) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->decode_row_resident(pos);
+#else
+  (void)pos;
+  return false;
+#endif
+}
+
 /** @brief Rows [0, n_rows) of the layer whose attention hook returned 2,
  *  [n_rows][n_kv x head_dim] f32 each. */
 inline bool htpDecodeKvSeed(unsigned n_rows, const float *k_rows,

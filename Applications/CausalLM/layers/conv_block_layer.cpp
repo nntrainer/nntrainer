@@ -226,11 +226,15 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   // path and the "reference" would carry the same quantization points as
   // the fused call (the first DIFF run measured that as 150 dB and proved
   // the kernel, not the numerics -- doc 51 section 2.9).
+  // [#132 Part B] every kind resident: the HTP runs this row's in_proj,
+  // gate, conv and out_proj; the CONV1D_GATE hook below still binds its
+  // weights, and neither projection's result would be read
+  const bool row_resident = rows == 1 && htpDecodeRowResident(from);
   if (compare) {
     nntrainer::gemm_q4_0<float>(rows, 3 * C, K, in_step.getData<float>(), K,
                                 in_w.getData<char>(), 3 * C,
                                 proj.getData<float>(), 3 * C);
-  } else {
+  } else if (!row_resident) {
     in_step.dot(in_w, proj, false, false);
   }
 
@@ -282,7 +286,7 @@ void ConvBlockLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   if (compare) {
     nntrainer::gemm_q4_0<float>(rows, N, C, y, C, out_w.getData<char>(), N,
                                 out_step.getData<float>(), N);
-  } else {
+  } else if (!row_resident) {
     conv_out.dot(out_w, out_step, false, false);
   }
 
