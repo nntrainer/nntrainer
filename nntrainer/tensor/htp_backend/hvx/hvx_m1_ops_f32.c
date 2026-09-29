@@ -24,7 +24,7 @@
  * norms' domain is m1_ops_det.h's (d >= eps, normal). The router is the
  * third exception (#132 PR 2): the Android CPU's order, E fused sffma
  * chains on the scalar core and the spec's own sigmoid and selection
- * (m1_router_cpu_select).
+ * (m1_router_cpu_sigmoid / _pick).
  */
 
 #include "hvx_m1_ops_f32.h"
@@ -147,36 +147,83 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
  *         a time, a hint only -- the bits do not depend on it. */
 #define ROUTER_PF_ROWS 128u
 
-void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
-                         uint32_t K, uint32_t E, uint32_t top_k, float *logits,
-                         uint32_t *sel, float *weight) {
-  float acc[LANES];
-  uint32_t e, k;
-  if (!x || !w32 || !bias || !logits || !sel || !weight || K == 0u || E == 0u ||
-      E > LANES || top_k == 0u || top_k > E) {
-    return;
+/** @brief Router chains run at once: ROUTER_CHAINS accumulators stay in
+ *  registers across the k loop (the first sitting's 32-entry array spilled
+ *  to memory, 427784 pcycles/op against the vector router's 34100). */
+#ifndef ROUTER_CHAINS
+#define ROUTER_CHAINS 8u
+#endif
+
+/** @brief Experts e0 .. e0 + ROUTER_CHAINS - 1 of the w32 rows: one fused
+ *         chain each over k in order (the CPU's sgemv_n fmadd). */
+static inline __attribute__((always_inline)) void
+router_chains(const float *x, const float *w32, uint32_t K, uint32_t e0,
+              float *out) {
+  float acc[ROUTER_CHAINS];
+  for (uint32_t j = 0; j < ROUTER_CHAINS; ++j) {
+    acc[j] = 0.0f;
   }
-  /* [#132 PR 2] the CPU's sgemv_n: one fused chain per expert in k order,
-     E independent chains on the scalar core (m1_router_cpu_det) */
-  for (e = 0; e < E; ++e) {
-    acc[e] = 0.0f;
-  }
-  for (k = 0; k < K; ++k) {
+  for (uint32_t k0 = 0; k0 < K; k0 += ROUTER_PF_ROWS) {
+    const uint32_t k1 = k0 + ROUTER_PF_ROWS < K ? k0 + ROUTER_PF_ROWS : K;
 #if defined(__hexagon__)
-    if (k % ROUTER_PF_ROWS == 0u && k + ROUTER_PF_ROWS < K) {
-      /* Rtt: [47:32] stride, [31:16] width, [15:0] height */
-      Q6_l2fetch_AP((void *)(w32 + (size_t)(k + ROUTER_PF_ROWS) * LANES),
+    if (e0 == 0u && k1 < K) {
+      /* the next 16 KiB; Rtt: [47:32] stride, [31:16] width, [15:0] height */
+      Q6_l2fetch_AP((void *)(w32 + (size_t)k1 * LANES),
                     ((uint64_t)(LANES * 4u) << 32) |
                       ((uint64_t)(LANES * 4u) << 16) |
                       (uint64_t)ROUTER_PF_ROWS);
     }
 #endif
-    const float xk = x[k];
-    const float *row = w32 + (size_t)k * LANES;
-    for (e = 0; e < E; ++e) {
-      acc[e] = Q6_R_sfmpyacc_RR(acc[e], xk, row[e]);
+    for (uint32_t k = k0; k < k1; ++k) {
+      const float xk = x[k];
+      /* w32 is at least 8-byte aligned (malloc's, the graph's memalign),
+         a row 128 bytes, e0 a multiple of 8 floats: paired loads */
+      const float *row = (const float *)__builtin_assume_aligned(
+        w32 + (size_t)k * LANES + e0, 8);
+      for (uint32_t j = 0; j < ROUTER_CHAINS; ++j) {
+        acc[j] = Q6_R_sfmpyacc_RR(acc[j], xk, row[j]);
+      }
     }
   }
+  for (uint32_t j = 0; j < ROUTER_CHAINS; ++j) {
+    out[j] = acc[j];
+  }
+}
+
+typedef struct {
+  const float *x, *w32, *bias;
+  uint32_t K, E;
+  float *acc, *sig, *score;
+} router_ctx;
+
+/** @brief Pool lane i: chain groups i, i + n, ... of ROUTER_CHAINS, then
+ *         the sigmoids of the experts it owns (the expf port and the
+ *         integer divide are the costly scalar part, so they spread too). */
+static void router_lane(uint32_t n, uint32_t i, void *v) {
+  const router_ctx *c = (const router_ctx *)v;
+  for (uint32_t e0 = i * ROUTER_CHAINS; e0 < c->E; e0 += n * ROUTER_CHAINS) {
+    router_chains(c->x, c->w32, c->K, e0, c->acc + e0);
+    for (uint32_t e = e0; e < e0 + ROUTER_CHAINS && e < c->E; ++e) {
+      m1_router_cpu_sigmoid(c->acc[e], c->bias[e], &c->sig[e], &c->score[e]);
+    }
+  }
+}
+
+void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
+                         uint32_t K, uint32_t E, uint32_t top_k, float *logits,
+                         uint32_t *sel, float *weight, hvx_worker_pool *pool) {
+  float acc[LANES], sig[LANES], score[LANES];
+  if (!x || !w32 || !bias || !logits || !sel || !weight || K == 0u || E == 0u ||
+      E > LANES || top_k == 0u || top_k > E) {
+    return;
+  }
+  /* [#132 PR 2] the CPU's sgemv_n: one fused chain per expert in k order
+     (m1_router_cpu_det), ROUTER_CHAINS of them per pool lane on the scalar
+     cores; lanes >= E are the padding's zero columns, computed and dropped.
+     The bits do not depend on the lane count. */
+  router_ctx c = {x, w32, bias, K, E, acc, sig, score};
+  hvx_worker_pool_run(pool, router_lane, &c,
+                      (E + ROUTER_CHAINS - 1u) / ROUTER_CHAINS);
   memcpy(logits, acc, (size_t)E * sizeof(float));
-  m1_router_cpu_select(logits, bias, E, top_k, sel, weight);
+  m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
 }

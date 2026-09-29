@@ -395,30 +395,33 @@ static inline float m1_expf_bionic_det(float x) {
   return (float)y;
 }
 
+/** @brief One expert's sigmoid and selection score, as
+ *         buildExpertAssignments computes them: sig = RN(1 / (expf(-l) +
+ *         1)) with bionic expf, score = sig + bias. */
+static inline void m1_router_cpu_sigmoid(float logit, float bias, float *sig,
+                                         float *score) {
+  const float ex =
+    m1_expf_bionic_det(m1_det_float(m1_det_bits(logit) ^ 0x80000000u));
+  *sig = cpu_det_div_rn(1.0f, m1_det_add(ex, 1.0f));
+  *score = m1_det_add(*sig, bias);
+}
+
 /**
- * @brief The router after its logits, as buildExpertAssignments runs it:
- *        sigmoid with bionic expf and a true divide, biased top-k, the
- *        -ffast-math weight sum, the weights. Shared by the spec and the
- *        DSP kernel, whose logits come from sffma chains.
+ * @brief The router after its sigmoids: biased top-k (the lowest index on
+ *        a tie), the -ffast-math weight sum, a true divide, the weights.
+ *        Shared by the spec and the DSP kernel.
  *
- * @param logits  E floats (1..32)
- * @param bias    E floats, added for the selection only
+ * @param sig     E sigmoids (1..32), m1_router_cpu_sigmoid's
+ * @param score   E selection scores, the same
  * @param top_k   1..E
  * @param sel     top_k expert indices out, in selection order
  * @param weight  top_k routing weights out, in selection order
  */
-static inline void m1_router_cpu_select(const float *logits, const float *bias,
-                                        uint32_t E, uint32_t top_k,
-                                        uint32_t *sel, float *weight) {
-  float sig[M1_DET_ROUTER_MAX_E], score[M1_DET_ROUTER_MAX_E];
+static inline void m1_router_cpu_pick(const float *sig, const float *score,
+                                      uint32_t E, uint32_t top_k, uint32_t *sel,
+                                      float *weight) {
   uint32_t taken = 0u, e, r;
   float a0 = 0.0f, a1 = 0.0f, wsum, inv;
-  for (e = 0; e < E; ++e) {
-    const float ex =
-      m1_expf_bionic_det(m1_det_float(m1_det_bits(logits[e]) ^ 0x80000000u));
-    sig[e] = cpu_det_div_rn(1.0f, m1_det_add(ex, 1.0f));
-    score[e] = m1_det_add(sig[e], bias[e]);
-  }
   for (r = 0; r < top_k; ++r) {
     uint32_t best = E;
     for (e = 0; e < E; ++e) {
@@ -459,14 +462,16 @@ static inline void m1_router_cpu_det(const float *x, const float *w,
                                      const float *bias, uint32_t K, uint32_t E,
                                      uint32_t top_k, float *logits,
                                      uint32_t *sel, float *weight) {
+  float sig[M1_DET_ROUTER_MAX_E], score[M1_DET_ROUTER_MAX_E];
   for (uint32_t e = 0; e < E; ++e) {
     float acc = 0.0f;
     for (uint32_t k = 0; k < K; ++k) {
       acc = cpu_det_fma(x[k], w[(size_t)k * E + e], acc);
     }
     logits[e] = acc;
+    m1_router_cpu_sigmoid(acc, bias[e], &sig[e], &score[e]);
   }
-  m1_router_cpu_select(logits, bias, E, top_k, sel, weight);
+  m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
 }
 
 /** @brief neon_mathfun's exp_ps for one lane, as the shipped binary runs

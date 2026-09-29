@@ -53,7 +53,18 @@
 #include <string.h>
 
 #include "attn_m1_det.h"
+#include "hvx_worker_pool.h"
 #include "m1_ops_det.h"
+
+/** @brief A real pthread pool (hvx_worker_pool.c on stub/qurt.h) for the
+ *  env: since #132 PR 2 the router op runs its chains on it. */
+static hvx_worker_pool *real_pool(void) {
+  static hvx_worker_pool *p;
+  if (p == NULL) {
+    p = hvx_worker_pool_create(3u);
+  }
+  return p;
+}
 
 static int g_fail;
 #define CHECK(cond, ...)                                                       \
@@ -458,7 +469,7 @@ static void check_forward(void) {
   env.vtcm_base = g_vtcm;
   env.vtcm_size = sizeof(g_vtcm);
   env.config_off = 32u;
-  env.pool = (hvx_worker_pool *)&env; /* any non-NULL, only passed through */
+  env.pool = real_pool(); /* the stand-in passes it through */
   env.scratch = &g_scratch;
   for (i = 0; i < 64u; ++i) {
     act[i] = frand(&seed);
@@ -897,7 +908,7 @@ static void check_add_router(void) {
   env.vtcm_base = g_vtcm;
   env.vtcm_size = sizeof(g_vtcm);
   env.config_off = 32u;
-  env.pool = (hvx_worker_pool *)&env;
+  env.pool = real_pool(); /* ROUTER_TOPK's chains run on it (#132 PR 2) */
   env.scratch = &g_scratch;
   n = build(w, cap, &kHd64, "CAC", D_KINDS);
   bind_hd64(w);

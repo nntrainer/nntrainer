@@ -821,7 +821,7 @@ static void check_router_kernel(void) {
         memset(lg_h, 0xA5, sizeof(lg_h));
         memset(wt_h, 0xA5, sizeof(wt_h));
         memset(sel_h, 0xA5, sizeof(sel_h));
-        hvx_router_topk_f32(x, w32, bias, K, E, top_k, lg_h, sel_h, wt_h);
+        hvx_router_topk_f32(x, w32, bias, K, E, top_k, lg_h, sel_h, wt_h, NULL);
         m1_router_cpu_det(x, w, bias, K, E, top_k, lg_d, sel_d, wt_d);
         bad += memcmp(lg_h, lg_d, E * sizeof(float)) != 0;
         bad += memcmp(sel_h, sel_d, top_k * sizeof(uint32_t)) != 0;

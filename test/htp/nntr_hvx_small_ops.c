@@ -126,7 +126,7 @@ int nntr_hvx_router_topk_det_f32(remote_handle64 handle, uint32 top_k,
     memcpy(w32 + (size_t)k * LANES, w + (size_t)k * E, E * sizeof(float));
   }
   hvx_router_topk_f32(x, w32, bias, K, E, top_k, logits, (uint32_t *)sel,
-                      weight);
+                      weight, s->quant_pool);
   free(w32);
   return AEE_SUCCESS;
 }

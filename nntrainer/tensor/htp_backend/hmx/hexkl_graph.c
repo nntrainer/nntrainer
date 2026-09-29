@@ -209,7 +209,7 @@ static int graph_op_router_topk(hexkl_graph *g, const htp_graph_op *op,
     return AEE_EBADSTATE;
   }
   hvx_router_topk_f32(in, g->param[i], g->state[i], op->K, op->n_experts,
-                      op->top_k, out, sel, w);
+                      op->top_k, out, sel, w, call->env->pool);
   memset(g->route_cnt, 0, sizeof(g->route_cnt));
   for (r = 0; r < op->top_k; ++r) {
     g->route_cnt[sel[r]] = 1u;
