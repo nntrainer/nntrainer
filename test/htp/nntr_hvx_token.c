@@ -31,9 +31,11 @@
 #include <AEEStdErr.h>
 #include <HAP_farf.h>
 #include <HAP_mem.h>
+#include <HAP_perf.h>
 #include <remote.h>
 
 #include "hexkl_token.h"
+#include "htp_dspq_wire.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
@@ -122,15 +124,17 @@ void nntr_hvx_token_shutdown(nntr_hvx_session *s) {
 
 int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
                        const float *act, uint32_t act_len, float *logits,
-                       uint32_t logits_len, uint32_t res[4]) {
+                       uint32_t logits_len, struct htp_dspq_token_resp_s *r) {
   struct nntr_hvx_token *t = s ? s->token : NULL;
   hexkl_graph_env env;
-  uint32_t id = 0;
+  uint32_t id = 0, k;
   int rc;
   if (t == NULL || s->graph == NULL) {
     return AEE_EBADSTATE;
   }
   const hexkl_token_stats before = t->st;
+  const uint64_t us0 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
+  const uint64_t pc0 = HAP_perf_get_pcycles();
   nntr_hvx_graph_env(s, &env);
   if (t->role == 0u) {
     if (act == NULL) {
@@ -142,10 +146,17 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
     rc =
       hexkl_token_serve(s->graph, &env, t->page, tok, pos, t->spin_us, &t->st);
   }
-  res[0] = id;
-  res[1] = t->st.hops - before.hops;
-  res[2] = t->st.wait_us - before.wait_us;
-  res[3] = (uint32_t)(t->st.pcycles - before.pcycles);
+  r->wall_pcyc = (uint32_t)(HAP_perf_get_pcycles() - pc0);
+  r->wall_us =
+    (uint32_t)(HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count()) - us0);
+  r->id = id;
+  r->hops = t->st.hops - before.hops;
+  r->wait_us = t->st.wait_us - before.wait_us;
+  r->pcycles = (uint32_t)(t->st.pcycles - before.pcycles);
+  for (k = 0; k < HTP_DSPQ_TOKEN_KINDS && k < HTP_OP_KIND_N; ++k) {
+    r->kind_pcyc[k] =
+      (uint32_t)(t->st.kind_pcycles[k] - before.kind_pcycles[k]);
+  }
   if (rc != AEE_SUCCESS) {
     FARF(ERROR, "[token] %s tok=%u pos=%u: 0x%08x (timeouts %u stale %u)",
          t->role ? "S1" : "S2", (unsigned)tok, (unsigned)pos, (unsigned)rc,

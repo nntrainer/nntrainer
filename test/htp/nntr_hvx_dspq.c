@@ -137,7 +137,7 @@ static int dspq_token(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
                       uint32_t nb, struct dspqueue_buffer *bufs) {
   const htp_dspq_token_req *q = (const htp_dspq_token_req *)m;
   htp_dspq_token_resp resp;
-  uint32_t res[4] = {0, 0, 0, 0}, i;
+  uint32_t i;
   const int logits = len == sizeof(*q) && (q->flags & HTP_DSPQ_TOKEN_LOGITS);
   const int valid =
     len == sizeof(*q) && (q->flags & ~HTP_DSPQ_TOKEN_LOGITS) == 0u &&
@@ -151,15 +151,11 @@ static int dspq_token(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
       d->s, q->seq, q->pos, nb >= 1u ? (const float *)bufs[0].ptr : NULL,
       nb >= 1u ? (uint32_t)(bufs[0].size / 4u) : 0u,
       nb == 2u ? (float *)bufs[1].ptr : NULL,
-      nb == 2u ? (uint32_t)(bufs[1].size / 4u) : 0u, res);
+      nb == 2u ? (uint32_t)(bufs[1].size / 4u) : 0u, &resp);
   } else {
     resp.rc = AEE_EBADPARM;
     ++d->bad;
   }
-  resp.id = res[0];
-  resp.hops = res[1];
-  resp.wait_us = res[2];
-  resp.pcycles = res[3];
   for (i = 0; i < nb; ++i) {
     bufs[i].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
   }

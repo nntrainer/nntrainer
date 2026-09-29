@@ -35,10 +35,16 @@
  * refuses a header or trailer that does not carry it (a stale read:
  * HEXKL_TOKEN_E_STALE). seq = tok x 256 + round + 1, so no value of an
  * earlier round or token can pass for this one. A wait spins spin_us,
- * then polls every 50 us, and gives up HEXKL_TOKEN_TIMEOUT_US after the
+ * with a pause between reads, then sleeps HEXKL_TOKEN_POLL_US between
+ * reads, and gives up HEXKL_TOKEN_TIMEOUT_US after the
  * spin window with AEE_EEXPIRED -- the ARM turns that into its throw, a
  * lost post is never a hang. A side whose forward fails posts its code in
  * the header, so the other returns it at once instead of timing out.
+ *
+ * Before each post the side parks its worker pool
+ * (hvx_worker_pool_park): the other session computes next, and a pool
+ * that spins after its last job would hold the hardware threads its lanes
+ * need.
  *
  * No heap, no VTCM, no DMA: the page is the caller's (an ION buffer both
  * PDs map), the rows live in it.
@@ -64,8 +70,10 @@
 #define HEXKL_MBOX_BYTES (HEXKL_MBOX_S1_SLOT + HEXKL_MBOX_SLOT)
 /** @brief A wait gives up this long after its spin window. */
 #define HEXKL_TOKEN_TIMEOUT_US 1000000u
-/** @brief Poll period after the spin window. */
-#define HEXKL_TOKEN_POLL_US 50u
+/** @brief Poll period after the spin window: a sleep, so the waiting
+ *  session holds no hardware thread the other session's lanes need
+ *  (E5b: the 1 ms busy spin tripled both sessions' cycles). */
+#define HEXKL_TOKEN_POLL_US 20u
 /** @brief Rounds (S1 stretches) one token may have: seq's low byte. */
 #define HEXKL_TOKEN_MAX_ROUNDS 255u
 /** @brief A header or trailer that does not carry the posted seq. */
@@ -87,6 +95,7 @@ typedef struct {
   uint32_t timeouts; /**< waits that gave up (AEE_EEXPIRED) */
   uint32_t stale;    /**< reads refused as stale */
   uint64_t pcycles;  /**< the op_pcycles of every stretch this side ran */
+  uint64_t kind_pcycles[HTP_OP_KIND_N]; /**< the same, per op kind */
 } hexkl_token_stats;
 
 /** @brief The sequence value of round @a round of token @a tok. */

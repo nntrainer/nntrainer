@@ -66,12 +66,20 @@ typedef struct {
   uint32_t op, seq, flags, pos;
 } htp_dspq_token_req;
 
+/** @brief The graph's op kinds (htp_graph_desc.h HTP_OP_KIND_N; the ARM
+ *  side asserts they agree). */
+#define HTP_DSPQ_TOKEN_KINDS 11u
+
 /** @brief OP_TOKEN's response: id (S2: LM_HEAD's argmax), the hops this
- *  side made, its wait for the other side, the pcycles of its ops. */
-typedef struct {
+ *  side made, its wait for the other side, the pcycles of its ops; the
+ *  token's wall time on this side and the pcycles over it (their ratio is
+ *  the clock), and the op pcycles per kind. */
+typedef struct htp_dspq_token_resp_s {
   uint32_t seq;
   int32_t rc;
   uint32_t id, hops, wait_us, pcycles;
+  uint32_t wall_us, wall_pcyc;
+  uint32_t kind_pcyc[HTP_DSPQ_TOKEN_KINDS];
 } htp_dspq_token_resp;
 
 /** @brief The request message length for n_experts experts and n_rows

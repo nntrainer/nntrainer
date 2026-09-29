@@ -26,6 +26,8 @@
 
 #include <string.h>
 
+#include "hvx_worker_pool.h"
+
 #include <AEEStdErr.h>
 
 #if defined(__hexagon__)
@@ -70,6 +72,12 @@ static void tk_refresh(void *p, uint32_t n) {
   (void)p;
   (void)n;
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
+static inline void tk_pause(void) {
+#if defined(__hexagon__)
+  asm volatile(" pause(#255)\n");
 #endif
 }
 
@@ -127,7 +135,9 @@ static int tk_take(uint8_t *slot, volatile uint32_t *word, uint32_t seq,
       return AEE_EEXPIRED;
     }
     if (dt >= spin_us) {
-      tk_sleep();
+      tk_sleep(); /* one read of the word per wake */
+    } else {
+      tk_pause();
     }
   }
   st->wait_us += (uint32_t)(tk_now_us() - t0);
@@ -151,6 +161,9 @@ static void tk_pcycles(const hexkl_graph *g, uint32_t s, uint32_t e,
                        hexkl_token_stats *st) {
   for (; s < e; ++s) {
     st->pcycles += g->op_pcycles[s];
+    if (g->ops[s].kind < HTP_OP_KIND_N) {
+      st->kind_pcycles[g->ops[s].kind] += g->op_pcycles[s];
+    }
   }
 }
 
@@ -206,6 +219,7 @@ int hexkl_token_main(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
       if (rc != AEE_SUCCESS) {
         return rc; /* S1 has served its last round: nothing to abort */
       }
+      hvx_worker_pool_park(env->pool); /* the token is done */
       tk_pcycles(g, start, end, st);
       *id = last->kind == HTP_OP_LM_HEAD ? g->lm_id : 0u;
       ++st->tokens;
@@ -219,6 +233,7 @@ int hexkl_token_main(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
       rc = hexkl_graph_forward(g, env, start, end - start, pos, NULL, in,
                                in_len, tk_row(mine), n_out, &resume);
     }
+    hvx_worker_pool_park(env->pool); /* S1 computes next */
     /* posted either way: a failure ends S1's token at once */
     tk_post(mine, ping, seq, end, n_out, rc);
     ++st->hops;
@@ -284,6 +299,7 @@ int hexkl_token_serve(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
                                      &resume);
       }
     }
+    hvx_worker_pool_park(env->pool); /* S2 computes next */
     tk_post(mine, pong, seq, resume, n_out, rc);
     ++st->hops;
     if (rc != AEE_SUCCESS) {

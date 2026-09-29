@@ -76,6 +76,15 @@ void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
 void hvx_worker_pool_wait(hvx_worker_pool *pool);
 
 /**
+ * @brief [#132 Part B] The caller has no more work for a while (another
+ *        session of the process computes next): workers go to sleep at
+ *        once instead of spinning HVX_WORKER_POOL_SPIN pauses, so they do
+ *        not hold hardware threads the other session's lanes need. The next
+ *        run / submit / submit_bg clears it. Caller-side, like the others.
+ */
+void hvx_worker_pool_park(hvx_worker_pool *pool);
+
+/**
  * @brief A background job: func(n_units, u, ctx) for u in [0, n_units),
  *        claimed one unit at a time by whichever worker has no run/submit
  *        job to serve. The caller owns the struct and @a done (n_units

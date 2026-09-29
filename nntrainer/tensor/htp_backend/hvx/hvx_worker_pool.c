@@ -79,6 +79,8 @@ struct hvx_worker_pool_s {
                                  worker has not served yet */
   _Atomic uint32_t barrier; /**< participating workers still running */
   _Atomic int killed;
+  _Atomic int parked;    /**< [#132 Part B] hvx_worker_pool_park: skip the
+                              post-job spin until the next publish */
   hvx_worker_job job[2]; /**< job fg_id lives in job[fg_id & 1] */
   int outstanding;       /**< caller-side: a submit not yet waited for */
 
@@ -187,7 +189,8 @@ static void hvx_worker_pool_thread_entry(void *arg) {
        pause(#255) covers the gap between two submits; a worker that
        sees nothing in that time is between calls and sleeps as before. */
     for (uint32_t spin = 0; spin < HVX_WORKER_POOL_SPIN; ++spin) {
-      if (atomic_load_explicit(&pool->seqn, memory_order_acquire) != seqn) {
+      if (atomic_load_explicit(&pool->seqn, memory_order_acquire) != seqn ||
+          atomic_load_explicit(&pool->parked, memory_order_relaxed)) {
         break;
       }
       hvx_worker_pool_pause();
@@ -207,6 +210,7 @@ hvx_worker_pool *hvx_worker_pool_create(uint32_t n_workers) {
   atomic_init(&pool->fg_id, 0);
   atomic_init(&pool->barrier, 0);
   atomic_init(&pool->killed, 0);
+  atomic_init(&pool->parked, 0);
   atomic_init(&pool->bg_head, 0);
   atomic_init(&pool->bg_tail, 0);
   pool->n_workers = n_workers;
@@ -305,6 +309,7 @@ static void hvx_worker_pool_publish(hvx_worker_pool *pool,
   hvx_worker_job *job =
     &pool->job[(atomic_load_explicit(&pool->fg_id, memory_order_relaxed) + 1u) &
                1u];
+  atomic_store_explicit(&pool->parked, 0, memory_order_relaxed);
   atomic_thread_fence(memory_order_release);
   job->func = func;
   job->ctx = ctx;
@@ -387,6 +392,7 @@ void hvx_worker_pool_submit_bg(hvx_worker_pool *pool, hvx_bg_job *job) {
     atomic_load_explicit(&pool->bg_tail, memory_order_relaxed);
   pool->bg_ring[tail % HVX_WORKER_POOL_BG_DEPTH] = job;
   /* The job and its slot are visible before the tail that announces it. */
+  atomic_store_explicit(&pool->parked, 0, memory_order_relaxed);
   atomic_store_explicit(&pool->bg_tail, tail + 1u, memory_order_release);
   atomic_fetch_add_explicit(&pool->seqn, 1, memory_order_release);
   qurt_futex_wake(&pool->seqn, (int)pool->n_workers);
@@ -459,4 +465,10 @@ void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
   // Pairs with each worker's release store to barrier: makes every
   // worker's writes to ctx visible to the calling thread from here on.
   atomic_thread_fence(memory_order_acquire);
+}
+
+void hvx_worker_pool_park(hvx_worker_pool *pool) {
+  if (pool != NULL) {
+    atomic_store_explicit(&pool->parked, 1, memory_order_relaxed);
+  }
 }

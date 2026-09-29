@@ -233,6 +233,8 @@ static void *race_driver(void *v) {
     a.round = b.round = r;
     hvx_worker_pool_run(pool, race_slice, &a, 2u); /* workers 2, 3 idle */
     hvx_worker_pool_run(pool, race_slice, &b, 8u); /* main + 3 workers */
+    if (r & 1u) /* [#132 Part B] park between rounds: the next run must */
+      hvx_worker_pool_park(pool); /* still wake every worker it needs */
     for (uint32_t i = 0; i < 4u; ++i) {
       const uint32_t n = atomic_load(&b.ran[i]);
       if (b.tag[i] != r || n != 1u) {

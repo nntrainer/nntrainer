@@ -132,13 +132,14 @@ void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env);
  *  (token_driver_start) on its graph: S2 runs from op 0 on @a act (the
  *  embedding row) and returns the id, the logits into @a logits when it
  *  is not NULL; S1 serves its rounds (@a act, @a logits unused).
- *  res (4): [id, hops, wait_us, pcycles of the token's ops]. The dspq
+ *  @a r gets everything but seq and rc (htp_dspq_wire.h). The dspq
  *  thread's HTP_DSPQ_OP_TOKEN calls it. Lives in nntr_hvx_token.c.
  *  @return 0, AEE_EBADSTATE (no driver or no graph), AEE_EINVALIDFORMAT
  *          (a length), or hexkl_token_main / hexkl_token_serve's code */
+struct htp_dspq_token_resp_s;
 int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
                        const float *act, uint32_t act_len, float *logits,
-                       uint32_t logits_len, uint32_t res[4]);
+                       uint32_t logits_len, struct htp_dspq_token_resp_s *r);
 
 /** @brief [#132 Part B E2] Stops the token driver, if any (close()).
  *  Lives in nntr_hvx_token.c. */
