@@ -131,6 +131,29 @@ inline bool htpDecodeRowResident(unsigned pos) {
 #endif
 }
 
+/** @brief [#132 Part B E3] Whether the decode tokens bring their logits
+ *  back; false when the caller takes the id (htpDecodeTokenId) and nothing
+ *  reads the logits. No-op without HTP. */
+inline void htpDecodeWantLogits(bool want) {
+#ifdef ENABLE_HEXKL
+  nntrainer::get_htp_ops()->set_decode_logits(want);
+#else
+  (void)want;
+#endif
+}
+
+/** @brief [#132 Part B E3] The id the NPU picked for the last decode token
+ *  (its argmax, first maximum) when its logits did not come back; false
+ *  otherwise, and always without HTP. */
+inline bool htpDecodeTokenId(unsigned *id) {
+#ifdef ENABLE_HEXKL
+  return nntrainer::get_htp_ops()->take_decode_token_id(id);
+#else
+  (void)id;
+  return false;
+#endif
+}
+
 /** @brief Rows [0, n_rows) of the layer whose attention hook returned 2,
  *  [n_rows][n_kv x head_dim] f32 each. */
 inline bool htpDecodeKvSeed(unsigned n_rows, const float *k_rows,
