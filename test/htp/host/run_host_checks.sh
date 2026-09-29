@@ -138,6 +138,21 @@ cc=${CC:-gcc}
 
 "$OUT/dma_replay_host_check"
 
+# [#90] The two-reader probe's ring cell (f2, fresh = 1) on the same
+# skel source and stand-in, which here also counts the bytes it landed
+# and the source pages it read: bytes = res[2] x res[1], one rotation's
+# distinct footprint, the tag for 1 / 20 / 500 calls; then the DDR bounds
+# (85.3 GB/s, #77's 3265.6 refused) and the net-per-token arithmetic.
+"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -pthread \
+  -include malloc.h -I "$HERE/replay_stub" -I "$HERE/stub" -I "$HERE/.." \
+  -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+  -o "$OUT/two_reader_host_check" \
+  "$HERE/two_reader_host_check.c" "$HERE/../nntr_hvx_dma_probe.c" \
+  "$BACKEND/hmx/hexkl_dma_ring.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
+  "$BACKEND/hvx/hvx_worker_pool.c" -lm
+
+"$OUT/two_reader_host_check"
+
 # The real HVX GEMV (hvx_gemm_u8i4_wh.c, the skel's own source) on x86
 # against the Hexagon tools' HVX emulation, libnative: every stand-in above
 # replaces the kernel, this runs it. g++ links because libnative.a is C++.
