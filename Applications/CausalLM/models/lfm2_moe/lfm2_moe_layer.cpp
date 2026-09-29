@@ -17,7 +17,9 @@
 #include <cmath>
 #include <compute_ops.h>
 #include <cpu_backend.h>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <htp_decode_hook.h>
 #include <iostream>
 #include <lfm2_moe_layer.h>
@@ -84,6 +86,34 @@ struct M0Stages {
 
 M0Stages g_m0;
 bool g_m0_on = false;
+
+/** @brief [#150] NNTR_OP_TIME=1: the decode MoE layer's M0 slots summed
+ *         over the run, split into the ARM part (setup + router + top-k)
+ *         and the call (`ffn`: staging, queue write, ARM spin, response),
+ *         one line at exit. Per call would be 22 lines per token on the
+ *         timed run's stderr. */
+struct OpTimeMoe {
+  uint64_t calls = 0, cpu_us = 0, call_us = 0;
+
+  static bool on() {
+    static const bool v = [] {
+      const char *e = std::getenv("NNTR_OP_TIME");
+      return e != nullptr && std::strcmp(e, "1") == 0;
+    }();
+    return v;
+  }
+
+  ~OpTimeMoe() {
+    if (calls != 0)
+      std::fprintf(stderr,
+                   "[OP-TIME] moe calls=%llu cpu_us=%llu call_us=%llu\n",
+                   static_cast<unsigned long long>(calls),
+                   static_cast<unsigned long long>(cpu_us),
+                   static_cast<unsigned long long>(call_us));
+  }
+};
+
+OpTimeMoe g_op_time_moe;
 
 /** @brief Adds its lifetime to one M0Stages slot, and costs two predicted
  *         branches when profiling is off. */
@@ -726,8 +756,9 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
    * this path too (from=0,to=prompt_len), decode is the total_tokens==1
    * case and stays silent under the same guard. */
   const bool m0_profile = std::getenv("NNTR_M0_PROFILE") != nullptr;
+  const bool op_time = to - from == 1 && OpTimeMoe::on();
   const auto m0_t0 = std::chrono::steady_clock::now();
-  g_m0_on = m0_profile;
+  g_m0_on = m0_profile || op_time;
   g_m0.reset();
 
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
@@ -921,6 +952,11 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                 << " other=" << (m0_us > named ? m0_us - named : 0)
                 << std::endl;
     }
+  }
+  if (op_time) {
+    ++g_op_time_moe.calls;
+    g_op_time_moe.cpu_us += g_m0.setup + g_m0.router + g_m0.topk;
+    g_op_time_moe.call_us += g_m0.ffn;
   }
   g_m0_on = false;
 }
