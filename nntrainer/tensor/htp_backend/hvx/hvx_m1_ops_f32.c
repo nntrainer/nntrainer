@@ -153,6 +153,9 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
 #ifndef ROUTER_CHAINS
 #define ROUTER_CHAINS 8u
 #endif
+/* a lane writes acc[e0 .. e0 + ROUTER_CHAINS) of 32 and loads row pairs */
+_Static_assert(32u % ROUTER_CHAINS == 0u && ROUTER_CHAINS % 2u == 0u,
+               "ROUTER_CHAINS must divide 32 and be even");
 /** @brief L1 prefetch distance of the chain loop, in rows (a hint: the
  *  bits do not depend on it). ISS, one 8-chain group at K = 2048: 47.7k
  *  pcycles without it, 15.7k at 4 / 8 / 16 rows, 25.0k at 32. */

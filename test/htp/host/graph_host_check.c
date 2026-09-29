@@ -908,7 +908,9 @@ static void check_add_router(void) {
   env.vtcm_base = g_vtcm;
   env.vtcm_size = sizeof(g_vtcm);
   env.config_off = 32u;
-  env.pool = real_pool(); /* ROUTER_TOPK's chains run on it (#132 PR 2) */
+  env.pool = real_pool(); /* ROUTER_TOPK hands it its chains (#132 PR 2;
+                            one group at E = 4: m1_ops_host_check runs
+                            the multi-lane split) */
   env.scratch = &g_scratch;
   n = build(w, cap, &kHd64, "CAC", D_KINDS);
   bind_hd64(w);

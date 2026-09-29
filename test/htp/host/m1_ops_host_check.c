@@ -67,13 +67,16 @@
 #include "hvx_m1_ops_f32.h"
 #include "m1_ops_det.h"
 
-/* The pool's NULL path, in place of the pthread pool: hvx_worker_pool_run
-   with no workers calls func(1, 0, ctx) once on the caller. */
+/* The pool, run in place of the pthread pool: min(n_units, 3) lanes called
+   one after another on the caller -- lanes are independent by the pool's
+   contract, and three lanes over the router's four chain groups give lane
+   0 two groups, so the lane start and step (#132 PR 2) are exercised. */
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units) {
+  const uint32_t n = n_units < 3u ? n_units : 3u;
   (void)pool;
-  if (n_units) {
-    func(1u, 0u, ctx);
+  for (uint32_t i = 0; i < n; ++i) {
+    func(n, i, ctx);
   }
 }
 
