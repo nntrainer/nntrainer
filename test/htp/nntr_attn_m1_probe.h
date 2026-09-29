@@ -48,8 +48,7 @@
 #define ATTN_M1_PROBE_PV4_COLD_L2F 23u     /**< the same, 32 KiB window lead */
 #define ATTN_M1_PROBE_SCORES1_COLD 24u     /**< SCORES1 over cold tiles */
 #define ATTN_M1_PROBE_SCORES1_COLD_L2F 25u /**< the same, next-tile lead */
-#define ATTN_M1_PROBE_SCORES1_SPLAT 26u /**< SCORES1, q splat per scalar load  \
-                                         */
+#define ATTN_M1_PROBE_SCORES1_SPLAT 26u    /**< SCORES1, scalar q splats */
 #define ATTN_M1_PROBE_COST_END 27u
 
 /** @brief Positions per lane and rep of the compute cost ops. */
