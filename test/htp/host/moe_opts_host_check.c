@@ -123,6 +123,37 @@ int main(void) {
     printf("MOE GEMV TUNE OPTS: per-knob tune bits, 64 KB units, "
            "round+clamp 127, feed unset/0/1, dma_bypass 0x703e1\n");
 
+  /* #177's queue field, bits [20:19] = N - 1: unset leaves the default
+     word alone, 2 and 4 give the Q2 / Q4 words, and every other value is
+     an error that leaves the output untouched. */
+  {
+    const uint32_t def = htp_moe_opts_flags(NULL, NULL, NULL, NULL) |
+                         htp_moe_opts_dma_bypass(NULL);
+    static const char *const bad[] = {"0", "5", "x", "", "2 ", "12", "-1"};
+    uint32_t q = 0xdeadu;
+    expect(htp_moe_opts_dma_queues(NULL, &q) == 0 && (def | q) == 0x703e1u &&
+             htp_moe_opts_dma_q(def | q) == 1u,
+           "queues unset: 0x703e1, N = 1");
+    expect(htp_moe_opts_dma_queues("1", &q) == 0 && (def | q) == 0x703e1u,
+           "queues 1: 0x703e1");
+    expect(htp_moe_opts_dma_queues("2", &q) == 0 && (def | q) == 0xf03e1u &&
+             htp_moe_opts_dma_q(def | q) == 2u,
+           "queues 2: 0xf03e1");
+    expect(htp_moe_opts_dma_queues("3", &q) == 0 && (def | q) == 0x1703e1u,
+           "queues 3: 0x1703e1");
+    expect(htp_moe_opts_dma_queues("4", &q) == 0 && (def | q) == 0x1f03e1u &&
+             htp_moe_opts_dma_q(def | q) == 4u,
+           "queues 4: 0x1f03e1");
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; ++i) {
+      q = 0xdeadu;
+      expect(htp_moe_opts_dma_queues(bad[i], &q) == -1 && q == 0xdeadu,
+             "queues: an invalid value is an error");
+    }
+    if (!g_fail)
+      printf("MOE M1 GEMV OPTS dma_queues: unset=1(0x703e1) 2=0xf03e1 "
+             "4=0x1f03e1 invalid(0,5,x,'',...)=error\n");
+  }
+
   /* C: dsp 1044.0, swiglu 5601.2, printed rest -5588.2 -> the other named
      stages (mm 974.7 among them) sum to 1044.0 + 5588.2 - 5601.2 = 1031.0;
      host 1792.2. */

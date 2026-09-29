@@ -61,6 +61,35 @@ static inline uint32_t htp_moe_opts_dma_bypass(const char *env) {
   return (env == NULL || atoi(env) != 0) ? HTP_MOE_FLAG_DMA_BYPASS : 0u;
 }
 
+/** @brief hexkl_mm_u8i4_moe.h's DMA queue field restated (#177): bits
+ *  [20:19] hold N - 1, the number of DMA queues (pool lanes) the M = 1
+ *  feed splits each weight matrix over. The default N = 1 leaves the field
+ *  0, so an unset run's word stays 0x703e1; N = 2 is 0xf03e1, N = 4
+ *  0x1f03e1. */
+#define HTP_MOE_DMA_Q_SHIFT 19u
+#define HTP_MOE_DMA_Q_BITS 3u
+#define HTP_MOE_DMA_QUEUES_DEFAULT 1u
+
+/** @brief The queue field for getenv("NNTR_MOE_DMA_QUEUES"): unset gives
+ *  HTP_MOE_DMA_QUEUES_DEFAULT, exactly "1".."4" gives N. Anything else is
+ *  an error (returns -1, *bits untouched): a mistyped variant must not run
+ *  as the reference. */
+static inline int htp_moe_opts_dma_queues(const char *env, uint32_t *bits) {
+  uint32_t n = HTP_MOE_DMA_QUEUES_DEFAULT;
+  if (env != NULL) {
+    if (env[0] < '1' || env[0] > '4' || env[1] != '\0')
+      return -1;
+    n = (uint32_t)(env[0] - '0');
+  }
+  *bits = (n - 1u) << HTP_MOE_DMA_Q_SHIFT;
+  return 0;
+}
+
+/** @brief N, the queue count a flags word names: its field + 1. */
+static inline uint32_t htp_moe_opts_dma_q(uint32_t flags) {
+  return ((flags >> HTP_MOE_DMA_Q_SHIFT) & HTP_MOE_DMA_Q_BITS) + 1u;
+}
+
 /** @brief The bits of moe_set_opts' echo that must equal what was sent.
  *  With the GEMV on, all of them. With it off, the tune bits mean nothing
  *  on the HMX loop, so only bit 0 -- plus the bypass bit when it was asked
