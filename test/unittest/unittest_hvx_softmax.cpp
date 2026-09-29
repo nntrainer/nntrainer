@@ -406,8 +406,9 @@ TEST_F(HvxM1Ops, RejectsBadShapes) {
 /**
  * @brief The hidden RMSNorm (n = chunk = 2048) on the four row kinds, bit
  *        for bit against the scalar spec. row_scale is compared first: a
- *        bad count there puts the divergence in the reduction or the
- *        rsqrt, a clean row_scale with bad y puts it in the scaling.
+ *        bad count there puts the divergence in the scalar row scale
+ *        (sffma chains, integer sqrt / reciprocal; #164), a clean
+ *        row_scale with bad y puts it in the scaling.
  *
  * The last row (|x| ~ 3e38, sum of squares overflows to inf) is printed
  * and not gated: rule 24's unexplained overflow case, where the host
@@ -427,6 +428,26 @@ TEST_F(HvxM1Ops, RmsnormMatchesDetBitExact) {
                          << ": the reduction or rsqrt differs from the spec";
     EXPECT_EQ(bad_y, 0) << "kind " << kind << ": y differs from the spec";
   }
+  // [#164] G0's magnitude sweep: one row per 2^e, e = -20 .. 20, elements
+  // +-[0.5, 1) 2^e -- the spec is the CPU's order, so any normal-range
+  // magnitude the model can produce must hold, not only the kinds above.
+  std::uniform_real_distribution<float> mant(0.5f, 1.0f);
+  int sweep_y = 0, sweep_rs = 0;
+  for (int e = -20; e <= 20; ++e) {
+    for (auto &v : x) {
+      const float m = mant(rng);
+      v = std::ldexp((rng() & 1u) ? -m : m, e);
+    }
+    int bad_y = -1, bad_rs = -1;
+    ASSERT_NO_FATAL_FAILURE(m1_rmsnorm_case(handle_, n, n, x, &bad_y, &bad_rs));
+    sweep_y += bad_y;
+    sweep_rs += bad_rs;
+  }
+  std::cout << "M1_OPS_FIELD rmsnorm sweep 2^-20..2^20 rows=41 bad_y="
+            << sweep_y << " bad_row_scale=" << sweep_rs << std::endl;
+  EXPECT_EQ(sweep_rs, 0) << "sweep: the row scale differs from the spec";
+  EXPECT_EQ(sweep_y, 0) << "sweep: y differs from the spec";
+
   std::uniform_real_distribution<float> huge(-3e38f, 3e38f);
   for (auto &v : x) {
     v = huge(rng);
@@ -456,6 +477,28 @@ TEST_F(HvxM1Ops, QkNormMatchesDetBitExact) {
     EXPECT_EQ(bad_rs, 0) << heads << " heads: row scale differs";
     EXPECT_EQ(bad_y, 0) << heads << " heads: y differs";
   }
+  // [#164] the magnitude sweep: head h of 40 at 2^e, e = h % 41 - 20,
+  // twice with the second call shifted by 20 (all 41 magnitudes covered)
+  std::uniform_real_distribution<float> mant(0.5f, 1.0f);
+  int sweep_y = 0, sweep_rs = 0;
+  for (uint32_t shift : {0u, 20u}) {
+    const uint32_t n = 40u * 64u;
+    std::vector<float> x(n);
+    for (uint32_t i = 0; i < n; ++i) {
+      const int e = static_cast<int>((i / 64u + shift) % 41u) - 20;
+      const float m = mant(rng);
+      x[i] = std::ldexp((rng() & 1u) ? -m : m, e);
+    }
+    int bad_y = -1, bad_rs = -1;
+    ASSERT_NO_FATAL_FAILURE(
+      m1_rmsnorm_case(handle_, n, 64u, x, &bad_y, &bad_rs));
+    sweep_y += bad_y;
+    sweep_rs += bad_rs;
+  }
+  std::cout << "M1_OPS_FIELD qk_norm sweep 2^-20..2^20 heads=80 bad_y="
+            << sweep_y << " bad_row_scale=" << sweep_rs << std::endl;
+  EXPECT_EQ(sweep_rs, 0) << "sweep: row scale differs";
+  EXPECT_EQ(sweep_y, 0) << "sweep: y differs";
 }
 
 /** @brief RoPE (fp16 since #152) on 32 q + 8 k heads at positions 0, 1,
