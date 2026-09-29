@@ -12,8 +12,11 @@
  *         This code is a part of the break down version of the mha layer.
  */
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -24,8 +27,6 @@ static std::mutex rope_init_mtx;
 #include <fp16.h>
 #include <layer_context.h>
 #include <mha_core.h>
-
-#include "htp_decode_hook.h"
 #include <nntrainer_error.h>
 #include <node_exporter.h>
 #include <thread_manager.h>
@@ -38,6 +39,49 @@ inline float convert_scalar(uint16_t h) {
 }
 
 namespace causallm {
+
+namespace {
+/**
+ * @brief Per-phase attention timing, opt-in via NNTR_ATTN_PROFILE.
+ * Accumulated across a whole prefill call and printed once at the end.
+ */
+struct AttnPhaseStats {
+  uint64_t rope_ns = 0;
+  uint64_t alloc_ns = 0;
+  uint64_t qk_ns = 0;
+  uint64_t softmax_ns = 0;
+  uint64_t av_ns = 0;
+  uint64_t score_bytes = 0;
+  uint64_t calls = 0;
+};
+
+bool attnProfileEnabled() {
+  static const bool enabled = std::getenv("NNTR_ATTN_PROFILE") != nullptr;
+  return enabled;
+}
+
+AttnPhaseStats &attnStats() {
+  static AttnPhaseStats s;
+  return s;
+}
+
+inline uint64_t attnNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+           std::chrono::high_resolution_clock::now().time_since_epoch())
+    .count();
+}
+} // namespace
+
+void printAttnProfile() {
+  if (!attnProfileEnabled())
+    return;
+  const auto &s = attnStats();
+  std::cout << "ATTNPROF\tcalls=" << s.calls << "\trope_ms=" << s.rope_ns / 1e6
+            << "\talloc_ms=" << s.alloc_ns / 1e6 << "\tqk_ms=" << s.qk_ns / 1e6
+            << "\tsoftmax_ms=" << s.softmax_ns / 1e6
+            << "\tav_ms=" << s.av_ns / 1e6
+            << "\tscore_MB_total=" << s.score_bytes / 1048576.0 << "\n";
+}
 
 #define tile_size 4
 
@@ -408,23 +452,6 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int _from, unsigned int _to,
                                           bool training) {
-  // [#130] one decode row through the HTP when ATTN_M1 is resident, on
-  // either cache path: _from is the absolute position on both.
-  if (_to - _from == 1 && htpDecodeAttention(context, _from)) {
-    cache_index = _to;
-    htp_owns_cache_ = true;
-    return;
-  }
-  // ponytail: once the DSP owns the cache this layer's rows [prompt, ..)
-  // are stale, so a later multi-row prefill (a second prompt appended to
-  // the same context) would attend to garbage and then re-seed the DSP
-  // from it. Refused, not silently wrong; the upgrade is writing the
-  // decoded k / v back from the DSP, or running that prefill on the DSP.
-  NNTR_THROW_IF(htp_owns_cache_ && _to - _from > 1 && _from > 0,
-                std::runtime_error)
-    << "mha_core: a multi-row forwarding at " << _from
-    << " after the HTP decode hook took over the KV cache "
-       "(NNTR_HTP_FORWARD=1 supports one prompt per process)";
   // External KV cache path: from/to are interpreted as the absolute write
   // position; route through forwarding() which reads cache_key/cache_value
   // from input slots 3/4. forwarding() advances cache_index internally.
@@ -580,83 +607,6 @@ void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
   // increase cache size
   cache_index += step_size;
-}
-
-bool MHACoreLayer::htpDecodeAttention(nntrainer::RunLayerContext &context,
-                                      unsigned int pos) {
-  nntrainer::Tensor &query = context.getInput(INOUT_INDEX::QUERY);
-  nntrainer::Tensor &key = context.getInput(INOUT_INDEX::KEY);
-  nntrainer::Tensor &value = context.getInput(INOUT_INDEX::VALUE);
-  nntrainer::Tensor &output = context.getOutput(INOUT_INDEX::OUTPUT);
-  if (query.getDataType() != ml::train::TensorDim::DataType::FP32 ||
-      query.batch() != 1)
-    return false;
-  // The row is q | k | v of the step (row 0 of batch 0 on every path).
-  const unsigned int wq = query.width(), wk = key.width(), wv = value.width();
-  static thread_local std::vector<float> row;
-  row.resize(wq + wk + wv);
-  std::memcpy(row.data(), query.getData<float>(), wq * sizeof(float));
-  std::memcpy(row.data() + wq, key.getData<float>(), wk * sizeof(float));
-  std::memcpy(row.data() + wq + wk, value.getData<float>(), wv * sizeof(float));
-  // The RoPE table, once per layer instance, in the ROPE op's shape
-  // (head_dim 64: cos[i][0..31] | sin[i][0..31], the CPU RoPE's own
-  // source, plan 82 section 3.4). At another head_dim the op cannot be
-  // resident (the validator refuses it), so no table is needed.
-  if (htp_rope_table_.empty() && use_rope && head_dim == 64) {
-    if (freqs_fp32 == nullptr) {
-      const std::lock_guard<std::mutex> lock(rope_init_mtx);
-      if (freqs_fp32 == nullptr)
-        precompute_freqs(head_dim, max_position_embeddings, theta, false);
-    }
-    const unsigned int rows =
-      std::get<nntrainer::props::MaxTimestep>(mha_core_props).get();
-    NNTR_THROW_IF(freqs_fp32->cos.size() < rows, std::runtime_error)
-      << "mha_core: the RoPE cache holds " << freqs_fp32->cos.size()
-      << " positions, max_timestep is " << rows;
-    htp_rope_table_.resize(static_cast<size_t>(rows) * 64);
-    for (unsigned int i = 0; i < rows; ++i) {
-      std::memcpy(htp_rope_table_.data() + static_cast<size_t>(i) * 64,
-                  freqs_fp32->cos[i].data(), 32 * sizeof(float));
-      std::memcpy(htp_rope_table_.data() + static_cast<size_t>(i) * 64 + 32,
-                  freqs_fp32->sin[i].data(), 32 * sizeof(float));
-    }
-  }
-  int r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
-                        wq, htp_rope_table_.data(),
-                        static_cast<unsigned>(htp_rope_table_.size()));
-  if (r == 2) {
-    // Seed the DSP cache from this layer's rows [0, pos): fp16 bits on
-    // every platform's cache (FP16 or UINT16 storage), f32 when it is.
-    nntrainer::Tensor &ck =
-      use_external_cache
-        ? context.getInput(3)
-        : context.getTensor(tensor_idx[AttentionParams::cache_key]);
-    nntrainer::Tensor &cv =
-      use_external_cache
-        ? context.getInput(4)
-        : context.getTensor(tensor_idx[AttentionParams::cache_value]);
-    const size_t n = static_cast<size_t>(pos) * wk;
-    std::vector<float> k_rows(n), v_rows(n);
-    auto rows_f32 = [n](const nntrainer::Tensor &c, float *dst) {
-      if (c.getDataType() == ml::train::TensorDim::DataType::FP32) {
-        std::memcpy(dst, c.getData<float>(), n * sizeof(float));
-        return;
-      }
-      const uint16_t *src = c.getData<uint16_t>();
-      for (size_t i = 0; i < n; ++i)
-        dst[i] = nntrainer::compute_fp16_to_fp32(src[i]);
-    };
-    rows_f32(ck, k_rows.data());
-    rows_f32(cv, v_rows.data());
-    htpDecodeKvSeed(pos, k_rows.data(), v_rows.data());
-    r = htpDecodeAttn(pos, row.data(), wq + wk + wv, output.getData<float>(),
-                      wq, htp_rope_table_.data(),
-                      static_cast<unsigned>(htp_rope_table_.size()));
-    NNTR_THROW_IF(r != 1, std::runtime_error)
-      << "mha_core: the HTP attention hook asked for a seed twice at pos "
-      << pos;
-  }
-  return r == 1;
 }
 
 /**
@@ -838,10 +788,20 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   if (skip_prefill && is_prefill)
     return;
 
+  const bool attn_prof = attnProfileEnabled() && step_size > 1;
+  auto &astats = attnStats();
+  uint64_t ta = attn_prof ? attnNowNs() : 0;
+
   // apply rotary embedding for query
   if (use_rope) {
     apply_rotary_emb_tensor_v2(query_step, query_step, head_dim, cache_index,
                                false);
+  }
+  if (attn_prof) {
+    uint64_t t = attnNowNs();
+    astats.rope_ns += t - ta;
+    ta = t;
+    astats.calls++;
   }
 
   /// @todo replace step_size into input height
@@ -867,14 +827,35 @@ void MHACoreLayer::one_batch_incremental_forwarding(
 
   unsigned int gqa_size = num_heads_Q / num_heads_KV;
 
+  if (attn_prof) {
+    uint64_t t = attnNowNs();
+    astats.alloc_ns += t - ta;
+    astats.score_bytes += out_.size() * sizeof(float);
+    ta = t;
+  }
+
   compute_kcaches(query_step, b_cached_key, out_, cache_from,
                   cache_to - cache_from, num_heads_Q, gqa_size, head_dim);
+  if (attn_prof) {
+    uint64_t t = attnNowNs();
+    astats.qk_ns += t - ta;
+    ta = t;
+  }
 
   softmax_triangle(out_, step_size, num_heads_Q, cache_from);
+  if (attn_prof) {
+    uint64_t t = attnNowNs();
+    astats.softmax_ns += t - ta;
+    ta = t;
+  }
 
   compute_fp16vcache_transposed(out_, b_cached_value, attention_output_step,
                                 cache_from, num_heads_KV, gqa_size, head_dim,
                                 cache_to);
+  if (attn_prof) {
+    astats.av_ns += attnNowNs() - ta;
+    printAttnProfile();
+  }
 }
 
 void MHACoreLayer::one_batch_incremental_forwarding(
