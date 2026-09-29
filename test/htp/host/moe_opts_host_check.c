@@ -102,12 +102,13 @@ int main(void) {
   expect(!strcmp(htp_moe_opts_feed_name(0x303e1u), "vtcm") &&
            !strcmp(htp_moe_opts_feed_name(0x103e1u), "arena"),
          "feed names: vtcm / arena");
-  /* #158's bypass bit: only a non-zero NNTR_MOE_DMA_BYPASS sets it, so an
-     unset run's word stays 0x303e1; the knob word is 0x703e1. The echo must
+  /* #158's bypass bit: on by default (unset or non-zero), so an unset run's
+     word is 0x703e1; NNTR_MOE_DMA_BYPASS=0 gives 0x303e1. The echo must
      carry it whether or not the GEMV is on (the HMX loop honours it too). */
-  expect(htp_moe_opts_dma_bypass(NULL) == 0u &&
+  expect(htp_moe_opts_dma_bypass(NULL) == HTP_MOE_FLAG_DMA_BYPASS &&
+           htp_moe_opts_dma_bypass("1") == HTP_MOE_FLAG_DMA_BYPASS &&
            htp_moe_opts_dma_bypass("0") == 0u,
-         "bypass unset / 0 is clear");
+         "bypass unset / 1 is set, 0 is clear");
   expect((htp_moe_opts_flags(NULL, NULL, NULL, NULL) |
           htp_moe_opts_dma_bypass("1")) == 0x703e1u,
          "BYPASS=1 on the default word is 0x703e1");

@@ -50,14 +50,15 @@
 
 /** @brief hexkl_mm_u8i4_moe.h's HEXKL_MOE_FLAG_DMA_BYPASS restated (#158):
  *  bit 18 sets src_bypass on every arena expert weight descriptor, M = 1
- *  feed and M > 1 HMX path alike. Sent only when NNTR_MOE_DMA_BYPASS is a
- *  non-zero number, so an unset run's word stays 0x303e1. */
+ *  feed and M > 1 HMX path alike. On by default since the #158 sitting
+ *  (user, 2026-09-29: decode +31..35 %, MoE dumps bit-identical), so an
+ *  unset run's word is 0x703e1; NNTR_MOE_DMA_BYPASS=0 clears it (0x303e1). */
 #define HTP_MOE_FLAG_DMA_BYPASS 0x40000u
 
 /** @brief HTP_MOE_FLAG_DMA_BYPASS for getenv("NNTR_MOE_DMA_BYPASS"): set
- *  for a non-zero number, clear when unset or "0". */
+ *  when unset or a non-zero number, clear for "0". */
 static inline uint32_t htp_moe_opts_dma_bypass(const char *env) {
-  return (env != NULL && atoi(env) != 0) ? HTP_MOE_FLAG_DMA_BYPASS : 0u;
+  return (env == NULL || atoi(env) != 0) ? HTP_MOE_FLAG_DMA_BYPASS : 0u;
 }
 
 /** @brief The bits of moe_set_opts' echo that must equal what was sent.
