@@ -11,27 +11,38 @@
  * @bug    No known bugs except for NYI items
  *
  * Per unit (a kv head and a pair of its q heads, or the whole group when
- * gqa is odd), three passes over the cache in the spec's order:
- *   scores  one 32-position block at a time: for d ascending, acc[g] =
- *           acc[g] + splat(q[g][d]) * Kt[d][block] for the unit's q heads
- *           g, then s = acc * scale (stored to the q head's scratch row;
- *           the block's running vmax takes the live lanes)
- *   softmax m = rotate-tree max; e = exp_det(s - m), masked lanes -> 0,
- *           summed lane-wise over blocks, then the rotate tree; r =
- *           recip_det(l). Both trees leave every lane equal (the rotation
- *           by half the remaining width makes each step periodic), so the
- *           reduced vectors are used whole -- no scalar FPU anywhere.
- *   PV      for p ascending, o[g][vec] = o[g][vec] + splat(e[g][p]) *
- *           V[p][vec]; out = o * r
- * Rule 24: plain Vsf, no qf32, no flush-to-zero. The masked lanes of the
- * last block are filled with -FLT_MAX for the max rather than -inf, so no
- * lane ever holds an infinity (the inf encodings are the open case of
- * rule 24 and the domain keeps every live score far from FLT_MAX).
+ * gqa is odd), the spec's steps in its order on fp16 values held in f32:
+ *   q16     the unit's q rows rounded (hvx_rne16_sf) into a local block
+ *   scores  one 32-position block at a time, per q head: eight
+ *           accumulators acc[l] over d = 8 blk + l, acc[l] = fma16(acc[l],
+ *           splat(q16[d]), Kt[d][block]) -- the CPU's float16x8_t lanes
+ *           as eight vectors whose lanes are positions -- then the
+ *           vpaddq tree, 0 + t, * scale, each rounded; stored to the q
+ *           head's scratch row, the block's running vmax over live lanes
+ *   softmax m = rotate-tree max + 0; per block the exp-table index of
+ *           rne16(s - m) (vector); then on the scalar core, per position
+ *           in order, e = table[index] and l = rne16(l + e) -- the CPU's
+ *           sequential fp16 sum, about 1 k scalar steps per q head; then
+ *           per block e / l as div16 (vector: recip_det and an exact
+ *           midpoint check, below)
+ *   PV      for p ascending, o[g][vec] = fma16(o[g][vec], splat(e[g][p]),
+ *           V[p][vec]); out = o
+ * fma16 is attn_m1_det_fma16 per lane: the exact product, TwoSum, the
+ * round-to-odd fix-up in word ops, then hvx_rne16_sf -- about 20 vector
+ * ops where the f32 kernel had 2 (plan 152 section 3.3's cost).
+ * Rule 24: plain Vsf add / sub / mul and word ops, no qf32, no hf, no
+ * flush-to-zero; after the entry rounding every sf operand is a normal f32
+ * or zero (fp16 values are >= 2^-24, their products >= 2^-48). The one
+ * exception is the caller's raw q / k / v entering hvx_rne16_sf, which may
+ * be f32 subnormals: C absorbs them, so the result is the same +-0
+ * whether the hardware flushes that input or not. The masked lanes of the last
+ * block are filled with -FLT_MAX for the max rather than -inf, and zeroed
+ * before the divide.
  *
- * ponytail: the q splats are re-formed per block (4 scalar loads and
- * splats per d); a per-head splat table in scratch would trade 32 KiB of
- * writes for them, worth it only if #85's per-op pcycles say the score
- * loop is not DDR-bound (plan 81 section 0 expects it to be).
+ * ponytail: the q splats are re-formed per block (a scalar load and a
+ * splat per d); a per-head splat table would trade 32 KiB of writes for
+ * them, worth it only if the phase words say the score loop is not
+ * compute-bound (it is: fma16 dominates).
  */
 
 #include "hvx_attn_m1_f32.h"
@@ -54,12 +65,14 @@
 #define VLEN 128u
 /** @brief The mask fill for the max: the most negative finite f32. */
 #define NEG_FLT_MAX_BITS 0xFF7FFFFFu
-/** @brief Upper bound on q heads per kv head the register file holds:
- *         gqa score accumulators plus gqa * head_dim/32 PV accumulators
- *         stay under the 32 vector registers at 4 x 2. */
+/** @brief Upper bound on q heads per kv head (the q16 block and the PV
+ *         accumulators: 2 * gqa vectors). */
 #define MAX_GQA 8u
-/** @brief Upper bound on head_dim / 32 for the PV accumulator array. */
-#define MAX_HD_VEC 4u
+/** @brief The one head_dim: the CPU order's eight accumulators over d and
+ *         the resident RoPE's head size (#152). */
+#define HD 64u
+/** @brief Vectors per head row. */
+#define HD_VEC (HD / LANES)
 
 hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
                                     uint32_t gqa, uint32_t head_dim,
@@ -68,8 +81,7 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
   int rc = AEE_SUCCESS;
   hvx_attn_m1_ctx *ctx = NULL;
   if (n_layers == 0u || n_kv == 0u || gqa == 0u || gqa > MAX_GQA ||
-      head_dim == 0u || head_dim % LANES != 0u ||
-      head_dim / LANES > MAX_HD_VEC || max_seq == 0u || max_seq % LANES != 0u) {
+      head_dim != HD || max_seq == 0u || max_seq % LANES != 0u) {
     rc = AEE_EINVALIDFORMAT;
     goto out;
   }
@@ -98,7 +110,8 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
   ctx->v = (float *)memalign(VLEN, (size_t)cache_floats * sizeof(float));
   ctx->scratch =
     (float *)memalign(VLEN, (size_t)scratch_floats * sizeof(float));
-  if (!ctx->kv_len || !ctx->kt || !ctx->v || !ctx->scratch) {
+  ctx->exp_tab = (float *)malloc(ATTN_M1_DET_EXP_N * sizeof(float));
+  if (!ctx->kv_len || !ctx->kt || !ctx->v || !ctx->scratch || !ctx->exp_tab) {
     rc = AEE_ENOMEMORY;
     hvx_attn_m1_free(ctx);
     ctx = NULL;
@@ -108,6 +121,9 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
      The scratch is fully written before it is read. */
   memset(ctx->kt, 0, (size_t)cache_floats * sizeof(float));
   memset(ctx->v, 0, (size_t)cache_floats * sizeof(float));
+  /* exp16 at every fp16 d in [-17.5, 0], once per cache (18.5 k scalar
+     exp_ps, a few ms; the double helpers are __hexagon_* imports). */
+  attn_m1_det_exp_table(ctx->exp_tab);
 out:
   if (err) {
     *err = rc;
@@ -119,6 +135,7 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
   if (!ctx) {
     return;
   }
+  free(ctx->exp_tab);
   free(ctx->scratch);
   free(ctx->v);
   free(ctx->kt);
@@ -140,21 +157,21 @@ static inline float *v_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
          ((size_t)layer * ctx->n_kv + h) * ctx->max_seq * ctx->head_dim;
 }
 
-/** @brief Spec step 1 for one kv head: the transposed scatter into Kt and
- *         the row copy into V (V's row is vector-aligned; k and v are the
- *         caller's, so scalar and HVX_UVector). */
+/** @brief Spec steps 0-1 for one kv head: the rows rounded to fp16, the
+ *         transposed scatter into Kt (scalar) and the row into V (V's row
+ *         is vector-aligned; k and v are the caller's, so HVX_UVector). A
+ *         seed row that is already fp16 (the CPU's cache) is unchanged. */
 static inline void append_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
                                uint32_t h, uint32_t pos, const float *k,
                                const float *v) {
   float *kt = kt_head(ctx, layer, h);
-  for (uint32_t d = 0; d < ctx->head_dim; ++d) {
-    kt[(size_t)d * ctx->max_seq + pos] = k[d];
+  for (uint32_t d = 0; d < HD; ++d) {
+    kt[(size_t)d * ctx->max_seq + pos] = attn_m1_det_rne16(k[d]);
   }
-  HVX_Vector *vd =
-    (HVX_Vector *)(v_head(ctx, layer, h) + (size_t)pos * ctx->head_dim);
+  HVX_Vector *vd = (HVX_Vector *)(v_head(ctx, layer, h) + (size_t)pos * HD);
   const HVX_UVector *vs = (const HVX_UVector *)v;
-  for (uint32_t i = 0; i < ctx->head_dim / LANES; ++i) {
-    vd[i] = vs[i];
+  for (uint32_t i = 0; i < HD_VEC; ++i) {
+    vd[i] = hvx_rne16_sf(vs[i]);
   }
 }
 
@@ -215,21 +232,39 @@ static inline void prof_mark(uint32_t *acc, uint64_t *t) {
   *t = now;
 }
 
-/** @brief Every lane equal to the max / sum of the input's lanes: rotate
- *         by half the remaining width and combine, five steps. Each step
- *         is periodic in the rotation, so the last one leaves every lane
- *         with the same bits (attn_m1_det.h step 5's tree, lane 0). */
+/** @brief Every lane equal to the max of the input's lanes: rotate by
+ *         half the remaining width and combine, five steps. Each step is
+ *         periodic in the rotation, so the last one leaves every lane with
+ *         the same bits. */
 static inline HVX_Vector reduce_max_sf(HVX_Vector v) {
   for (uint32_t rot = VLEN / 2u; rot >= 4u; rot >>= 1) {
     v = Q6_Vsf_vmax_VsfVsf(v, Q6_V_vror_VR(v, (int)rot));
   }
   return v;
 }
-static inline HVX_Vector reduce_sum_sf(HVX_Vector v) {
-  for (uint32_t rot = VLEN / 2u; rot >= 4u; rot >>= 1) {
-    v = Q6_Vsf_vadd_VsfVsf(v, Q6_V_vror_VR(v, (int)rot));
-  }
-  return v;
+
+/**
+ * @brief attn_m1_det_rne16 for the scalar sum, without its volatiles.
+ *        The skel is built without -ffast-math, so the compiler neither
+ *        reassociates (x + c) - c nor contracts (there is no multiply);
+ *        the volatiles in the spec are for the host and ARM builds, and
+ *        here they would put three store-load round trips on the one
+ *        dependent chain of the softmax (#152). HvxAttnM1.* compares the
+ *        result with the spec on silicon.
+ */
+static inline float rne16_scalar(float x) {
+  uint32_t u, rb;
+  memcpy(&u, &x, sizeof(u));
+  uint32_t ef = u & 0x7F800000u;
+  ef = ef < ATTN_M1_DET_EF_MIN16 ? ATTN_M1_DET_EF_MIN16 : ef;
+  const uint32_t cb = ef + ATTN_M1_DET_RNE16_C;
+  float c;
+  memcpy(&c, &cb, sizeof(c));
+  float r = (x + c) - c;
+  memcpy(&rb, &r, sizeof(rb));
+  rb |= u & 0x80000000u;
+  memcpy(&r, &rb, sizeof(r));
+  return r;
 }
 
 /**
@@ -237,15 +272,13 @@ static inline HVX_Vector reduce_sum_sf(HVX_Vector v) {
  *        to the scratch rows of those q heads. @a ps (NULL: no timestamps)
  *        accumulates the phase pcycles.
  *
- * Always inlined so attn_unit can call it with a literal (ng, hd): then
- * the g / i loops unroll and acc, vmax and o live in registers instead of
- * on the stack (plan 146 section 3.2: a runtime trip count spilled every
- * accumulator to a vmem load/store per MAC). Same operations, same order
- * per lane, whichever call site -- the spec does not move.
+ * Always inlined so attn_unit can call it with a literal ng: then the g
+ * loops unroll and the accumulators live in registers (plan 146 section
+ * 3.2). Same operations, same order per lane, whichever call site.
  */
 static inline __attribute__((always_inline)) void
 attn_body(const forward_job *job, uint32_t h, uint32_t g0, prof_slot *ps,
-          const uint32_t ng, const uint32_t hd) {
+          const uint32_t ng) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
   const uint32_t ms = ctx->max_seq, hq0 = h * ctx->gqa + g0;
   const uint32_t L = job->L, nblk = (L + LANES - 1u) / LANES;
@@ -256,30 +289,48 @@ attn_body(const forward_job *job, uint32_t h, uint32_t g0, prof_slot *ps,
   const HVX_VectorPred live = Q6_Q_vsetq2_R((int)(n_live * sizeof(float)));
   const float *kt = kt_head(ctx, job->layer, h);
   const float *vv = v_head(ctx, job->layer, h);
-  const float *q = job->q + (size_t)hq0 * hd;
   float *e = ctx->scratch + (size_t)hq0 * ms;
   const HVX_Vector neg_max = Q6_V_vsplat_R((int32_t)NEG_FLT_MAX_BITS);
-  HVX_Vector vmax[MAX_GQA], acc[MAX_GQA];
+  HVX_Vector vmax[MAX_GQA];
+  union {
+    HVX_Vector v[MAX_GQA * HD_VEC];
+    float f[MAX_GQA * HD];
+  } q16;
   uint64_t t = ps ? HAP_perf_get_pcycles() : 0u;
 
-  /* Scores: s[g][p] = (sum_d q[g][d] * Kt[d][p], d ascending) * scale. */
+  /* Step 0 for q: the unit's rows rounded to fp16 once. */
+  const HVX_UVector *qs = (const HVX_UVector *)(job->q + (size_t)hq0 * HD);
+  for (uint32_t i = 0; i < ng * HD_VEC; ++i) {
+    q16.v[i] = hvx_rne16_sf(qs[i]);
+  }
+
+  /* Scores. Per block and q head, the CPU's eight lanes over d = 8 blk + l
+     as eight vectors of positions; the vpaddq tree; 0 + t; * scale. */
   for (uint32_t g = 0; g < ng; ++g) {
     vmax[g] = neg_max;
   }
   for (uint32_t b = 0; b < nblk; ++b) {
     for (uint32_t g = 0; g < ng; ++g) {
-      acc[g] = Q6_V_vzero();
-    }
-    for (uint32_t d = 0; d < hd; ++d) {
-      const HVX_Vector kv =
-        *(const HVX_Vector *)(kt + (size_t)d * ms + b * LANES);
-      for (uint32_t g = 0; g < ng; ++g) {
-        acc[g] = Q6_Vsf_vadd_VsfVsf(
-          acc[g], Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(q[(size_t)g * hd + d]), kv));
+      const float *qg = q16.f + (size_t)g * HD;
+      HVX_Vector acc[ATTN_M1_DET_ACC];
+      for (uint32_t l = 0; l < ATTN_M1_DET_ACC; ++l) {
+        acc[l] = Q6_V_vzero();
       }
-    }
-    for (uint32_t g = 0; g < ng; ++g) {
-      const HVX_Vector s = Q6_Vsf_vmpy_VsfVsf(acc[g], job->vscale);
+      for (uint32_t d = 0; d < HD; ++d) {
+        const HVX_Vector kv =
+          *(const HVX_Vector *)(kt + (size_t)d * ms + b * LANES);
+        acc[d % ATTN_M1_DET_ACC] =
+          hvx_fma16_sf(acc[d % ATTN_M1_DET_ACC], hvx_splat_sf(qg[d]), kv);
+      }
+      const HVX_Vector s03 = hvx_rne16_sf(
+        Q6_Vsf_vadd_VsfVsf(hvx_rne16_sf(Q6_Vsf_vadd_VsfVsf(acc[0], acc[1])),
+                           hvx_rne16_sf(Q6_Vsf_vadd_VsfVsf(acc[2], acc[3]))));
+      const HVX_Vector s47 = hvx_rne16_sf(
+        Q6_Vsf_vadd_VsfVsf(hvx_rne16_sf(Q6_Vsf_vadd_VsfVsf(acc[4], acc[5])),
+                           hvx_rne16_sf(Q6_Vsf_vadd_VsfVsf(acc[6], acc[7]))));
+      const HVX_Vector tt = Q6_Vsf_vadd_VsfVsf(
+        Q6_V_vzero(), hvx_rne16_sf(Q6_Vsf_vadd_VsfVsf(s03, s47)));
+      const HVX_Vector s = hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(tt, job->vscale));
       *(HVX_Vector *)(e + (size_t)g * ms + b * LANES) = s;
       vmax[g] = Q6_Vsf_vmax_VsfVsf(vmax[g], (partial && b + 1u == nblk)
                                               ? Q6_V_vmux_QVV(live, s, neg_max)
@@ -291,27 +342,55 @@ attn_body(const forward_job *job, uint32_t h, uint32_t g0, prof_slot *ps,
     prof_mark(&ps->scores, &t);
   }
 
-  /* Softmax: m, e = exp_det(s - m) with the dead lanes zeroed, l, r. */
-  HVX_Vector r[MAX_GQA];
+  /* Softmax: m; the exp-table index of rne16(s - m) per lane; the table
+     read and the sequential fp16 sum on the scalar core; the divide. */
+  const HVX_Vector abs_mask = Q6_V_vsplat_R(0x7FFFFFFF);
+  const HVX_Vector bias = Q6_V_vsplat_R((int)ATTN_M1_DET_EXP_BIAS);
+  const HVX_Vector idx_max = Q6_V_vsplat_R((int)ATTN_M1_DET_EXP_LAST + 1);
+  HVX_Vector m[MAX_GQA];
   for (uint32_t g = 0; g < ng; ++g) {
-    const HVX_Vector m = reduce_max_sf(vmax[g]);
+    m[g] = Q6_Vsf_vadd_VsfVsf(reduce_max_sf(vmax[g]), Q6_V_vzero());
     HVX_Vector *eg = (HVX_Vector *)(e + (size_t)g * ms);
-    HVX_Vector sum = Q6_V_vzero();
     for (uint32_t b = 0; b < nblk; ++b) {
-      HVX_Vector ev = hvx_exp_det_sf(Q6_Vsf_vsub_VsfVsf(eg[b], m));
+      const HVX_Vector d = hvx_rne16_sf(Q6_Vsf_vsub_VsfVsf(eg[b], m[g]));
+      HVX_Vector ix =
+        Q6_Vw_vsub_VwVw(Q6_Vuw_vlsr_VuwR(Q6_V_vand_VV(d, abs_mask), 13), bias);
+      ix = Q6_Vw_vmin_VwVw(Q6_Vw_vmax_VwVw(ix, Q6_V_vzero()), idx_max);
+      eg[b] = ix;
+    }
+  }
+  /* The sums: one dependent scalar chain per q head, the unit's heads
+     interleaved so the core overlaps them. */
+  float l[MAX_GQA];
+  for (uint32_t g = 0; g < ng; ++g) {
+    l[g] = 0.0f;
+  }
+  for (uint32_t p = 0; p < L; ++p) {
+    for (uint32_t g = 0; g < ng; ++g) {
+      float *ep = e + (size_t)g * ms + p;
+      uint32_t ix;
+      memcpy(&ix, ep, sizeof(ix));
+      const float ev = ctx->exp_tab[ix];
+      *ep = ev;
+      l[g] = rne16_scalar(l[g] + ev);
+    }
+  }
+  for (uint32_t g = 0; g < ng; ++g) {
+    HVX_Vector *eg = (HVX_Vector *)(e + (size_t)g * ms);
+    const HVX_Vector lv = hvx_splat_sf(l[g]);
+    const HVX_Vector r = hvx_recip_det_sf(lv);
+    for (uint32_t b = 0; b < nblk; ++b) {
+      HVX_Vector ev = eg[b];
       if (partial && b + 1u == nblk) {
         ev = Q6_V_vmux_QVV(live, ev, Q6_V_vzero());
       }
-      eg[b] = ev;
-      sum = Q6_Vsf_vadd_VsfVsf(sum, ev);
+      eg[b] = hvx_div16_sf(ev, lv, r);
     }
-    const HVX_Vector l = reduce_sum_sf(sum);
-    r[g] = hvx_recip_det_sf(l);
     if (job->stats) {
       const uint32_t hq = hq0 + g;
-      const int32_t mb = Q6_R_vextract_VR(m, 0), lb = Q6_R_vextract_VR(l, 0);
+      const int32_t mb = Q6_R_vextract_VR(m[g], 0);
       memcpy(job->stats + 2u * hq, &mb, sizeof(float));
-      memcpy(job->stats + 2u * hq + 1u, &lb, sizeof(float));
+      memcpy(job->stats + 2u * hq + 1u, &l[g], sizeof(float));
     }
   }
 
@@ -319,33 +398,31 @@ attn_body(const forward_job *job, uint32_t h, uint32_t g0, prof_slot *ps,
     prof_mark(&ps->softmax, &t);
   }
 
-  /* PV: o[g][vec] = sum_p e[g][p] * V[p][vec], p ascending; out = o * r. */
-  const uint32_t nvec = hd / LANES;
-  HVX_Vector o[MAX_GQA][MAX_HD_VEC];
+  /* PV: o[g][vec] = fma16(o[g][vec], e[g][p], V[p][vec]), p ascending. */
+  HVX_Vector o[MAX_GQA][HD_VEC];
   for (uint32_t g = 0; g < ng; ++g) {
-    for (uint32_t i = 0; i < nvec; ++i) {
+    for (uint32_t i = 0; i < HD_VEC; ++i) {
       o[g][i] = Q6_V_vzero();
     }
   }
   for (uint32_t p = 0; p < L; ++p) {
-    /* The V row once per p, not once per g: the o stores no longer alias
-       it once o is in registers, but a local says so in every build. */
-    const HVX_Vector *vp = (const HVX_Vector *)(vv + (size_t)p * hd);
-    HVX_Vector vr[MAX_HD_VEC];
-    for (uint32_t i = 0; i < nvec; ++i) {
+    /* The V row once per p, not once per g. */
+    const HVX_Vector *vp = (const HVX_Vector *)(vv + (size_t)p * HD);
+    HVX_Vector vr[HD_VEC];
+    for (uint32_t i = 0; i < HD_VEC; ++i) {
       vr[i] = vp[i];
     }
     for (uint32_t g = 0; g < ng; ++g) {
       const HVX_Vector ep = hvx_splat_sf(e[(size_t)g * ms + p]);
-      for (uint32_t i = 0; i < nvec; ++i) {
-        o[g][i] = Q6_Vsf_vadd_VsfVsf(o[g][i], Q6_Vsf_vmpy_VsfVsf(ep, vr[i]));
+      for (uint32_t i = 0; i < HD_VEC; ++i) {
+        o[g][i] = hvx_fma16_sf(o[g][i], ep, vr[i]);
       }
     }
   }
   for (uint32_t g = 0; g < ng; ++g) {
-    HVX_UVector *vo = (HVX_UVector *)(job->out + ((size_t)hq0 + g) * hd);
-    for (uint32_t i = 0; i < nvec; ++i) {
-      vo[i] = Q6_Vsf_vmpy_VsfVsf(o[g][i], r[g]);
+    HVX_UVector *vo = (HVX_UVector *)(job->out + ((size_t)hq0 + g) * HD);
+    for (uint32_t i = 0; i < HD_VEC; ++i) {
+      vo[i] = o[g][i];
     }
   }
   if (ps) {
@@ -360,22 +437,17 @@ static inline uint32_t attn_units(const hvx_attn_m1_ctx *ctx) {
 }
 
 /** @brief Unit @a u: q heads 2j, 2j + 1 of kv head u / (gqa/2) (j = u %
- *         (gqa/2)), with constants at head_dim 64 (LFM2.5, the hd64
- *         fixture); an odd gqa takes a whole kv head on the runtime-shape
+ *         (gqa/2)); an odd gqa takes a whole kv head on the runtime-ng
  *         copy. The two units of one kv head are adjacent indices, so they
  *         run at the same time and share its Kt / V slab in L2. */
 static void attn_unit(const forward_job *job, uint32_t u, prof_slot *ps) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
   if (ctx->gqa % 2u != 0u) {
-    attn_body(job, u, 0u, ps, ctx->gqa, ctx->head_dim);
+    attn_body(job, u, 0u, ps, ctx->gqa);
     return;
   }
-  const uint32_t pairs = ctx->gqa / 2u, h = u / pairs, g0 = 2u * (u % pairs);
-  if (ctx->head_dim == 64u) {
-    attn_body(job, h, g0, ps, 2u, 64u);
-  } else {
-    attn_body(job, h, g0, ps, 2u, ctx->head_dim);
-  }
+  const uint32_t pairs = ctx->gqa / 2u;
+  attn_body(job, u / pairs, 2u * (u % pairs), ps, 2u);
 }
 
 /** @brief Pool lane i of n: units i, i + n, ... */
@@ -418,8 +490,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   prof_slot slots[PROF_SLOTS];
   uint64_t t0 = prof ? HAP_perf_get_pcycles() : 0u;
   for (uint32_t h = 0; h < ctx->n_kv; ++h) {
-    append_head(ctx, layer, h, pos, k + (size_t)h * ctx->head_dim,
-                v + (size_t)h * ctx->head_dim);
+    append_head(ctx, layer, h, pos, k + (size_t)h * HD, v + (size_t)h * HD);
   }
   ctx->kv_len[layer] = pos + 1u;
 

@@ -290,10 +290,11 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         does not point forward at a weight-streaming op, CLASSNOTSUPPORT
  *         for a resident bit on a kind with no kernel here,
  *         SCHEMENOTSUPPORTED for a resident op outside its kernel's shape
- *         rule (RMSNORM: K a power of two and a multiple of 32; QK_NORM /
- *         ATTN_M1: head_dim 32, 64 or 128 -- the per-head norm's chunk
- *         must be a power of two too -- gqa <= 8, max_seq a multiple of
- *         32; ROPE: head_dim 64), NOTALLOWED for a resident
+ *         rule (RMSNORM: K a power of two and a multiple of 32; QK_NORM:
+ *         head_dim 32, 64 or 128 -- the per-head norm's chunk must be a
+ *         power of two too -- gqa <= 8, max_seq a multiple of 32; ROPE and
+ *         ATTN_M1 (#152: the fp16 CPU order): head_dim 64), NOTALLOWED for
+ *         a resident
  *         ATTN_M1 whose layer's ROPE is not resident (the DSP stretch must
  *         apply RoPE, since mha_core does on the CPU). #132's rules: an ADD
  *         writes slot 0 and reads another slot (INVALIDFORMAT: slot 0 is
@@ -431,7 +432,8 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       if (op->resident != 0u) {
         if (op->head_dim % 32u != 0u || op->head_dim > 128u ||
             (op->head_dim & (op->head_dim - 1u)) != 0u || op->gqa > 8u ||
-            max_seq % 32u != 0u || (k == HTP_OP_ROPE && op->head_dim != 64u))
+            max_seq % 32u != 0u ||
+            ((k == HTP_OP_ROPE || k == HTP_OP_ATTN_M1) && op->head_dim != 64u))
           return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
         if (k == HTP_OP_ATTN_M1 && rope_resident == 0u)
           return HTP_GRAPH_E_NOTALLOWED;

@@ -25,8 +25,9 @@
  *     device-confirmed for add/sub/mul (rule 24), re-checked by HvxM1Ops.*.
  *  2. TOLERANCE. The spec against a plain fp32 reference (straight C,
  *     sqrtf, CPU order; printed) and a double reference (asserted):
- *     RMSNorm <= 4 ulp of |y|, RoPE <= 2^-22 (|a| + |b|), conv
- *     <= 2^-21 |b| sum|w_i g_i|, each with a floor of two subnormal quanta
+ *     RMSNorm <= 4 ulp of |y|, RoPE (fp16 since #152) <= 2^-8 (|a| +
+ *     |b|), conv <= 2^-21 |b| sum|w_i g_i|, each with a floor of two
+ *     subnormal quanta (2^-22 for the fp16 RoPE)
  *     so the all-subnormal row (kept, not flushed: rule 24) is judged on
  *     what f32 can hold.
  *
@@ -244,7 +245,7 @@ static void check_rope(void) {
   }
 
   uint32_t bad = 0, bad_identity = 0;
-  double max_rel32 = 0.0, max_rel64 = 0.0;
+  double max_rel = 0.0;
   for (size_t p = 0; p < sizeof(positions) / sizeof(positions[0]); ++p) {
     rope_cs(cs, positions[p], 5e6);
     memcpy(y_hvx, x, N * sizeof(float));
@@ -258,50 +259,39 @@ static void check_rope(void) {
       bad_p += memcmp(&y_hvx[i], &y_det[i], sizeof(float)) ? 1u : 0u;
     }
     if (positions[p] == 0u) {
+      /* cos 1, sin 0: the fp16 input itself (by value: a -0 input and a
+         negative b give +0, as the CPU's fsub does). */
       for (int i = 0; i < N; ++i) {
-        bad_identity += memcmp(&y_det[i], &x[i], sizeof(float)) ? 1u : 0u;
+        bad_identity += y_det[i] != attn_m1_det_rne16(x[i]);
       }
     }
     for (int h = 0; h < NQ + NK; ++h) {
       for (int i = 0; i < 32; ++i) {
         const float a = x[h * 64 + i], b = x[h * 64 + 32 + i];
         const float c = cs[i], s = cs[32 + i];
-        /* Plain fp32 (compiled -ffp-contract=off) and double. */
-        const float r0_32 = a * c - b * s, r1_32 = a * s + b * c;
         const double r0 = (double)a * c - (double)b * s;
         const double r1 = (double)a * s + (double)b * c;
-        double tol = ldexp(fabs(a) + fabs(b), -22);
-        if (tol < SUBNORMAL_FLOOR) {
-          tol = SUBNORMAL_FLOOR;
+        /* fp16: the operands and three steps rounded, 2^-11 each. */
+        double tol = ldexp(fabs(a) + fabs(b), -8);
+        if (tol < ldexp(1.0, -22)) {
+          tol = ldexp(1.0, -22);
         }
         const double e0 = fabs((double)y_det[h * 64 + i] - r0) / tol;
         const double e1 = fabs((double)y_det[h * 64 + 32 + i] - r1) / tol;
-        const double f0 = fabs((double)y_det[h * 64 + i] - r0_32) / tol;
-        const double f1 = fabs((double)y_det[h * 64 + 32 + i] - r1_32) / tol;
-        if (e0 > max_rel64) {
-          max_rel64 = e0;
-        }
-        if (e1 > max_rel64) {
-          max_rel64 = e1;
-        }
-        if (f0 > max_rel32) {
-          max_rel32 = f0;
-        }
-        if (f1 > max_rel32) {
-          max_rel32 = f1;
-        }
+        max_rel = e0 > max_rel ? e0 : max_rel;
+        max_rel = e1 > max_rel ? e1 : max_rel;
       }
     }
     printf("M1 OPS rope64 pos=%u heads=%d+%d bad=%u\n", positions[p], NQ, NK,
            bad_p);
     bad += bad_p;
   }
-  printf("M1 OPS rope64 identity_at_pos0 bad=%u err/tol(fp32)=%.3f "
-         "err/tol(double)=%.3f (tol = 2^-22 (|a|+|b|))\n",
-         bad_identity, max_rel32, max_rel64);
+  printf("M1 OPS rope64 (fp16, #152) identity_at_pos0 bad=%u "
+         "err/tol(double)=%.3f (tol = 2^-8 (|a|+|b|), floor 2^-22)\n",
+         bad_identity, max_rel);
   CHECK(bad == 0u, "rope64: HVX differs from m1_ops_det");
   CHECK(bad_identity == 0u, "rope64: position 0 is not the identity");
-  CHECK(max_rel64 <= 1.0, "rope64: %.3f of the tolerance", max_rel64);
+  CHECK(max_rel <= 1.0, "rope64: %.3f of the tolerance", max_rel);
 
   free(x);
   free(y_hvx);

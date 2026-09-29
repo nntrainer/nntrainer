@@ -226,15 +226,16 @@ fi
 
 "$OUT/m1_ops_host_check"
 
-# Decode attention at m=1 (#81): the REAL HVX source hvx_attn_m1_f32.c on
-# hvx_emu/ with the REAL worker pool on pthreads (stub/qurt.h) at 0, 3 and
-# 7 workers, memcmp'd against nntrainer/tensor/attn_m1_det.h for L = 1,
-# 63, 64, 65, 512, 1024 at the shapes (n_kv, gqa, head_dim) = (8, 4, 64),
-# (1, 2, 64), (2, 3, 32) and (2, 2, 32) (#146: the specialised path and
-# both runtime-shape copies),
-# plus append-chain == bulk, the L = 1 case and the error codes; the spec
-# against a double reference within 2^-13 max|V|; and the phase words
-# (#146), which must leave the output bytes alone (ATTN M1 PHASES OK).
+# Decode attention at m=1 (#81, fp16 CPU order since #152): the spec
+# nntrainer/tensor/attn_m1_det.h against an independent _Float16 model of
+# the Android CPU attention with five mutants (ATTN M1 F16 CPU-ORDER OK);
+# hvx_convert.h's fp16 primitives against the spec (ATTN M1 PRIM); then
+# the REAL HVX source hvx_attn_m1_f32.c on hvx_emu/ with the REAL worker
+# pool on pthreads (stub/qurt.h) at 0, 3 and 7 workers, memcmp'd against
+# the spec for L = 1, 63, 64, 65, 512, 1024 at (n_kv, gqa) = (8, 4),
+# (1, 2), (2, 3), head_dim 64, plus append-chain == bulk, the L = 1 case,
+# a division tie and the error codes; and the phase words (#146), which
+# must leave the output bytes alone (ATTN M1 PHASES OK).
 # -include malloc.h: the cache is memalign(128), which the Hexagon libc
 # declares in stdlib.h and glibc in malloc.h.
 "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \

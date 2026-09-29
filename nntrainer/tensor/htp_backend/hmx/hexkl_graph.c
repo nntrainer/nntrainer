@@ -164,17 +164,12 @@ static int graph_op_conv1d_gate(hexkl_graph *g, const htp_graph_op *op,
   return AEE_SUCCESS;
 }
 
-/** @brief 1/sqrt(head_dim) for the head_dims the validator admits (32,
- *  64, 128): exact 0.125f at 64, and no libm on the skel's import list. */
+/** @brief 1/sqrt(head_dim) at the one head_dim the validator admits for a
+ *  resident ATTN_M1 (64 since #152): 0.125f, exact, and the same bits as
+ *  the fp16 CPU's `/ sqrt(64.f)` (attn_m1_det.h step 2). */
 static float graph_attn_scale(uint32_t head_dim) {
-  switch (head_dim) {
-  case 32u:
-    return 0.17677669529663688f;
-  case 64u:
-    return 0.125f;
-  default:
-    return 0.08838834764831845f; /* 128 */
-  }
+  (void)head_dim;
+  return 0.125f;
 }
 
 static int graph_op_attn_m1(hexkl_graph *g, const htp_graph_op *op,

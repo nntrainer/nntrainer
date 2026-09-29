@@ -37,6 +37,7 @@
 
 #include "nntr_hvx.h"
 
+#include "../htp/host/attn_m1_cases.h"
 #include "attn_m1_det.h"
 #include "htp_rpc_bench.h"
 #include "mha_htp_host_model.h"
@@ -766,52 +767,27 @@ int32_t m1_bits_of(float f) {
   return i;
 }
 
-/**
- * @brief The host check's input spread (test/htp/host/attn_m1_host_check.c):
- *        kind 1 zeros, 2 subnormal +-1e-39 (HVX keeps subnormals, rule 24),
- *        3 large (|x| ~ 1e3, the exp clamp), else random in [-4, 4].
- */
-void m1_fill_row(float *x, size_t n, int kind, std::mt19937 &rng) {
-  std::uniform_real_distribution<float> small(-4.0f, 4.0f);
-  std::uniform_real_distribution<float> large(-1e3f, 1e3f);
-  for (size_t i = 0; i < n; ++i) {
-    switch (kind) {
-    case 1:
-      x[i] = 0.0f;
-      break;
-    case 2:
-      x[i] = (i & 1u) ? -1e-39f : 1e-39f;
-      break;
-    case 3:
-      x[i] = large(rng);
-      break;
-    default:
-      x[i] = small(rng);
-    }
-  }
-}
-
-/** @brief q with heads 0..2 the fixed kinds. */
-void m1_fill_q(std::vector<float> &q, std::mt19937 &rng) {
+/** @brief q rows from attn_m1_cases.h, the host check's inputs: heads 0..2
+ *         zero / fp16-subnormal / large, head 3 soft, the last two the
+ *         adversarial score heads. */
+void m1_fill_q(std::vector<float> &q, amc_rng &rng) {
   q.assign((size_t)kM1Nq * kM1Hd, 0.0f);
-  for (uint32_t h = 0; h < kM1Nq; ++h) {
-    m1_fill_row(q.data() + (size_t)h * kM1Hd, kM1Hd, (h < 3u) ? (int)h + 1 : 0,
-                rng);
-  }
+  amc_fill_q(&rng, q.data(), kM1Nq, kM1Hd);
 }
 
-/** @brief L rows of k and v, [L][kv][head_dim]: positions 0 / 1 the zero and
- *         subnormal kinds in both, position 2 a large k. */
-void m1_fill_kv(std::vector<float> &k, std::vector<float> &v, uint32_t L,
-                std::mt19937 &rng) {
+/** @brief L rows of k and v, [L][kv][head_dim], from attn_m1_cases.h:
+ *         positions 0 / 1 / 2 the fixed kinds, then the adversarial score
+ *         rows; with @a q, also the PV midpoint cases planted for it (the
+ *         count is returned; the timing tests skip the search). */
+uint32_t m1_fill_kv(std::vector<float> &k, std::vector<float> &v, uint32_t L,
+                    amc_rng &rng, const std::vector<float> *q = nullptr) {
   const size_t row = (size_t)kM1Kv * kM1Hd;
   k.assign(L * row, 0.0f);
   v.assign(L * row, 0.0f);
-  for (uint32_t p = 0; p < L; ++p) {
-    const int kind = (p == 0u) ? 1 : (p == 1u) ? 2 : 0;
-    m1_fill_row(k.data() + p * row, row, (p == 2u) ? 3 : kind, rng);
-    m1_fill_row(v.data() + p * row, row, kind, rng);
-  }
+  amc_fill_kv(&rng, k.data(), v.data(), L, kM1Kv, kM1Gqa, kM1Hd);
+  return q ? amc_plant_pv(q->data(), k.data(), v.data(), L, kM1Kv, kM1Gqa,
+                          kM1Hd)
+           : 0u;
 }
 
 /** @brief attn_m1_det.h's output and stats for L rows. */
@@ -933,6 +909,12 @@ TEST_F(HvxAttnM1, RejectsBadShapes) {
   err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 100u);
   EXPECT_EQ(err, AEE_EINVALIDFORMAT + kDspOffset)
     << "register max_seq 100: got " << hex(err);
+  // head_dim 32 and 128: the fp16 CPU order is head_dim 64 only (#152).
+  for (uint32_t hd : {32u, 128u}) {
+    err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, hd, 1024u);
+    EXPECT_EQ(err, AEE_EINVALIDFORMAT + kDspOffset)
+      << "register head_dim " << hd << ": got " << hex(err);
+  }
   err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 1024u);
   ASSERT_EQ(err, AEE_SUCCESS) << "register: " << hex(err);
   err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 1024u);
@@ -967,9 +949,12 @@ TEST_F(HvxAttnM1, RejectsBadShapes) {
  * @brief The six lengths of the host check against attn_m1_det.h compiled
  *        into this binary, bit for bit, on a cache registered at the
  *        LFM2.5 shape and max_seq 2048 (the 48 MiB allocation of plan 81
- *        section 3.1, proved once here). stats (m, l) are compared too and
- *        printed on a mismatch, so a bad count names the stage; the
- *        double-reference error is printed, not asserted (rule 25).
+ *        section 3.1, proved once here), with attn_m1_cases.h's rows: the
+ *        fused-FMA midpoint cases (score_cases, pv_cases) are where a
+ *        silicon Vsf op that is not IEEE would show first (#152). stats
+ *        (m, l) are compared too and printed on a mismatch, so a bad count
+ *        names the stage; the double-reference error is printed, not
+ *        asserted (rule 25).
  */
 TEST_F(HvxAttnM1, MatchesDetSpecBitExact) {
   const uint32_t max_seq = 2048u, layer = 5u;
@@ -978,11 +963,11 @@ TEST_F(HvxAttnM1, MatchesDetSpecBitExact) {
   ASSERT_EQ(err, AEE_SUCCESS)
     << "register 6 x 8 x 64 x 2048 (48 MiB): " << hex(err)
     << " (0x8000040e = stale skel)";
-  std::mt19937 rng(0x81000001u);
+  amc_rng rng{0x81000001u};
   std::vector<float> q, k, v, out, stats(2u * kM1Nq), out_ref, stats_ref;
   m1_fill_q(q, rng);
   for (uint32_t L : {1u, 63u, 64u, 65u, 512u, 1024u}) {
-    m1_fill_kv(k, v, L, rng);
+    const uint32_t planted = m1_fill_kv(k, v, L, rng, &q);
     std::fill(stats.begin(), stats.end(), 0.0f);
     err = m1_run(handle_, layer, q, k, v, L, &out, &stats);
     ASSERT_EQ(err, AEE_SUCCESS) << "L=" << L << ": " << hex(err);
@@ -991,6 +976,8 @@ TEST_F(HvxAttnM1, MatchesDetSpecBitExact) {
     const int bad = m1_count_bad(out, out_ref, "out");
     std::cout << "ATTN_M1_FIELD L=" << L << " bad=" << bad
               << " bad_stats=" << bad_stats << " of " << out.size()
+              << " pv_cases=" << planted
+              << " score_cases=" << (L > 3u ? 2u * (L - 3u) : 0u)
               << " err/max|V|(double)=" << m1_double_ref_err(q, k, v, L, out)
               << std::endl;
     EXPECT_EQ(bad_stats, 0)
@@ -1008,7 +995,7 @@ TEST_F(HvxAttnM1, AppendChainEqualsBulk) {
   const uint32_t L = 65u;
   int err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 1024u);
   ASSERT_EQ(err, AEE_SUCCESS) << "register: " << hex(err);
-  std::mt19937 rng(0x81000002u);
+  amc_rng rng{0x81000002u};
   std::vector<float> q, k, v, out_a((size_t)kM1Nq * kM1Hd), out_b;
   m1_fill_q(q, rng);
   m1_fill_kv(k, v, L, rng);
@@ -1112,7 +1099,7 @@ constexpr const char *kM1StaleProf =
 TEST_F(HvxAttnM1, PerLayerCost) {
   int err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 1024u);
   ASSERT_EQ(err, AEE_SUCCESS) << "register: " << hex(err);
-  std::mt19937 rng(0x81000003u);
+  amc_rng rng{0x81000003u};
   std::vector<float> q, k, v, out((size_t)kM1Nq * kM1Hd);
   m1_fill_q(q, rng);
   const size_t row = (size_t)kM1Kv * kM1Hd;

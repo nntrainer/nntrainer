@@ -14,6 +14,9 @@
  * reduced sum is already splat across the lanes, so it stays there rather
  * than round-tripping through the scalar FPU, whose sffma the compiler may
  * contract into and whose subnormal handling this file need not know.
+ * RoPE is the exception to "f32 inside": it is the Android CPU's fp16
+ * RoPE (#152), every step rounded with hvx_rne16_sf, so the resident
+ * attention sees the CPU's q and k bit for bit.
  * Rule 24: no flush-to-zero anywhere, no qf32 (v75/v79 differ). The one
  * exp, the router's sigmoid (#132), is hvx_swiglu_det.h's exp_det with its
  * own clamp; the domain is m1_ops_det.h's (d >= eps keeps the rsqrt seed
@@ -96,12 +99,18 @@ void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
   }
 }
 
-/** @brief One head: a | b halves, (a*c) - (b*s) and (a*s) + (b*c). */
+/** @brief One head in fp16 (m1_rope64_det): a | b halves rounded, then
+ *         rne16(rne16(a*c) - rne16(b*s)) and rne16(rne16(a*s) + rne16(b*c)),
+ *         the CPU's fmul / fsub / fadd .8h. */
 static inline void hvx_rope64_head(float *x, HVX_Vector c, HVX_Vector s) {
   HVX_UVector *v = (HVX_UVector *)x;
-  const HVX_Vector a = v[0], b = v[1];
-  v[0] = Q6_Vsf_vsub_VsfVsf(Q6_Vsf_vmpy_VsfVsf(a, c), Q6_Vsf_vmpy_VsfVsf(b, s));
-  v[1] = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(a, s), Q6_Vsf_vmpy_VsfVsf(b, c));
+  const HVX_Vector a = hvx_rne16_sf(v[0]), b = hvx_rne16_sf(v[1]);
+  v[0] =
+    hvx_rne16_sf(Q6_Vsf_vsub_VsfVsf(hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(a, c)),
+                                    hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(b, s))));
+  v[1] =
+    hvx_rne16_sf(Q6_Vsf_vadd_VsfVsf(hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(a, s)),
+                                    hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(b, c))));
 }
 
 void hvx_rope64_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
@@ -109,8 +118,9 @@ void hvx_rope64_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
   if (!cs || (n_q && !q) || (n_k && !k)) {
     return;
   }
-  const HVX_Vector c = ((const HVX_UVector *)cs)[0];
-  const HVX_Vector s = ((const HVX_UVector *)cs)[1];
+  /* The CPU's table is (_FP16) of the same f32 values. */
+  const HVX_Vector c = hvx_rne16_sf(((const HVX_UVector *)cs)[0]);
+  const HVX_Vector s = hvx_rne16_sf(((const HVX_UVector *)cs)[1]);
   for (uint32_t h = 0; h < n_q; ++h) {
     hvx_rope64_head(q + (size_t)h * 2u * LANES, c, s);
   }

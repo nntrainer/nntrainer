@@ -15,12 +15,12 @@
  * HvxSwigluDet.MatchesScalarBitExact confirmed on the device (rule 24), and
  * what HvxM1Ops.* re-checks for these kernels. Each lane below stores
  * through a volatile so the host compiler cannot contract or reassociate.
- * The integer ops, the byte rotate, the predicate ops and the mux move
- * bits exactly; vmin / vmax on finite values are exact by definition, and
- * Vsf_equals_Vw is one exactly representable int -> f32 conversion for
- * |w| <= 2^24 (plan 81 section 3.3 adds these for the attention kernel).
- * What this emulation cannot see: an aligned-load fault (the small ops use
- * HVX_UVector everywhere; the attention kernel's cache loads are aligned
+ * The integer and bitwise ops, the byte rotate, the predicate ops and the
+ * mux move bits exactly; vmin / vmax on finite values are exact by definition,
+ * and Vsf_equals_Vw is one exactly representable int -> f32 conversion for |w|
+ * <= 2^24 (plan 81 section 3.3 adds these for the attention kernel). What this
+ * emulation cannot see: an aligned-load fault (the small ops use HVX_UVector
+ * everywhere; the attention kernel's cache loads are aligned
  * -- a review item), inf/NaN encodings, and timing.
  *
  * vror follows the PRM: Vd.ub[i] = Vu.ub[(i + Rt) mod 128]. The reduction
@@ -117,6 +117,44 @@ HVX_EMU_W_BINOP(Q6_Vw_vadd_VwVw, +)
 HVX_EMU_W_BINOP(Q6_Vw_vsub_VwVw, -)
 #undef HVX_EMU_W_BINOP
 
+/* Bitwise ops and signed word max / min / arithmetic shift (#152: the
+   fp16 rounding and the round-to-odd step); exact by definition. */
+#define HVX_EMU_V_BITOP(name, op)                                              \
+  static inline HVX_Vector name(HVX_Vector a, HVX_Vector b) {                  \
+    HVX_Vector r;                                                              \
+    for (int i = 0; i < HVX_EMU_LANES; ++i) {                                  \
+      r.w[i] = a.w[i] op b.w[i];                                               \
+    }                                                                          \
+    return r;                                                                  \
+  }
+HVX_EMU_V_BITOP(Q6_V_vand_VV, &)
+HVX_EMU_V_BITOP(Q6_V_vor_VV, |)
+HVX_EMU_V_BITOP(Q6_V_vxor_VV, ^)
+#undef HVX_EMU_V_BITOP
+
+static inline HVX_Vector Q6_Vw_vmax_VwVw(HVX_Vector a, HVX_Vector b) {
+  HVX_Vector r;
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    r.w[i] = a.w[i] > b.w[i] ? a.w[i] : b.w[i];
+  }
+  return r;
+}
+static inline HVX_Vector Q6_Vw_vmin_VwVw(HVX_Vector a, HVX_Vector b) {
+  HVX_Vector r;
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    r.w[i] = a.w[i] < b.w[i] ? a.w[i] : b.w[i];
+  }
+  return r;
+}
+
+static inline HVX_Vector Q6_Vw_vasr_VwR(HVX_Vector a, int32_t n) {
+  HVX_Vector r;
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    r.w[i] = a.w[i] >> (n & 31); /* arithmetic on every host compiler */
+  }
+  return r;
+}
+
 static inline HVX_Vector Q6_Vuw_vlsr_VuwR(HVX_Vector a, int32_t n) {
   HVX_Vector r;
   for (int i = 0; i < HVX_EMU_LANES; ++i) {
@@ -149,6 +187,38 @@ static inline HVX_VectorPred Q6_Q_vcmp_gt_VwVw(HVX_Vector a, HVX_Vector b) {
   for (int i = 0; i < HVX_EMU_LANES; ++i) {
     const uint8_t f = (a.w[i] > b.w[i]) ? 1u : 0u;
     memset(q.q + 4 * i, f, 4);
+  }
+  return q;
+}
+
+static inline HVX_VectorPred Q6_Q_vcmp_eq_VwVw(HVX_Vector a, HVX_Vector b) {
+  HVX_VectorPred q;
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    const uint8_t f = (a.w[i] == b.w[i]) ? 1u : 0u;
+    memset(q.q + 4 * i, f, 4);
+  }
+  return q;
+}
+
+/* Predicate logic, per byte: Qs & Qt, Qs | Qt and Qs & ~Qt. */
+static inline HVX_VectorPred Q6_Q_and_QQ(HVX_VectorPred a, HVX_VectorPred b) {
+  HVX_VectorPred q;
+  for (int i = 0; i < 4 * HVX_EMU_LANES; ++i) {
+    q.q[i] = a.q[i] & b.q[i];
+  }
+  return q;
+}
+static inline HVX_VectorPred Q6_Q_or_QQ(HVX_VectorPred a, HVX_VectorPred b) {
+  HVX_VectorPred q;
+  for (int i = 0; i < 4 * HVX_EMU_LANES; ++i) {
+    q.q[i] = a.q[i] | b.q[i];
+  }
+  return q;
+}
+static inline HVX_VectorPred Q6_Q_and_QQn(HVX_VectorPred a, HVX_VectorPred b) {
+  HVX_VectorPred q;
+  for (int i = 0; i < 4 * HVX_EMU_LANES; ++i) {
+    q.q[i] = a.q[i] & (uint8_t)!b.q[i];
   }
   return q;
 }
