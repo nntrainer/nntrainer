@@ -34,13 +34,17 @@
  *     [0, l]) whose recip_det product is off by one or which is an exact
  *     tie, plus a sample: the cases attention-level data almost never
  *     reaches (a divide whose correction is removed passes every
- *     attention call below).
+ *     attention call below). Since #170 also hvx_attn_m1_hf.h, the fp16-lane
+ *     primitives of the fast kernel (ATTN M1 HF PRIM OK): the one-rounding
+ *     FMA on adversarial, zero / sign and random triples, the hf ops over
+ *     every finite fp16, the score tree, exp16 at every fp16 d <= 0 and
+ *     the divide on the sweep's hard quotients.
  *  3. KERNEL == SPEC. hvx_attn_m1_f32.c -- the skel's own source -- on the
  *     lane-by-lane emulation with the pthread worker pool at 0, 3 and 7
- *     workers, memcmp'd against the spec for L = 1, 63, 64, 65, 512, 1024
- *     at the shapes (n_kv, gqa) = (8, 4) (LFM2.5), (1, 2) (the hd64
- *     fixture) and (2, 3) (odd gqa: one unit per kv head), head_dim 64, at
- *     max_seq 1024, and LFM2.5 once at 2048. Each forward is repeated with
+ *     workers, memcmp'd against the spec for L = 1, 63, 64, 65, 512, 513,
+ *     1024, 1536 at the shapes (n_kv, gqa) = (8, 4) (LFM2.5), (1, 2) (the
+ *     hd64 fixture) and (2, 3) (odd gqa: one unit per kv head), head_dim
+ *     64, at max_seq 2048 (the model's). Each forward is repeated with
  *     the phase words requested (ATTN M1 PHASES OK). Structural cases: an
  *     append chain equals one bulk append; at L = 1 the output is rne16(v)
  *     exactly; a division tie (p = 2^-25 between 0 and 2^-24) rounds to
@@ -60,6 +64,7 @@
 #include "attn_m1_cases.h"
 #include "attn_m1_det.h"
 #include "hvx_attn_m1_f32.h"
+#include "hvx_attn_m1_hf.h"
 #include "hvx_convert.h"
 #include "hvx_swiglu_det.h"
 #include "hvx_worker_pool.h"
@@ -513,6 +518,12 @@ static void check_prim_fma16(void) {
   CHECK(bad == 0u, "hvx_fma16_sf differs from attn_m1_det_fma16");
 }
 
+/** @brief The hard quotients of the sweep below (c0 off by one or a tie),
+ *         which check_hf_prim runs again through the hf divide. */
+#define N_DIV_HARD_MAX 40000u
+static float g_div_hard_e[N_DIV_HARD_MAX], g_div_hard_l[N_DIV_HARD_MAX];
+static uint32_t g_div_hard = 0;
+
 /**
  * @brief hvx_div16_sf against rne16(e / l) over every fp16 l in [1, 2048]
  *        and every fp16 e in [0, l]: 173 M quotients. Every 32-lane batch
@@ -554,6 +565,10 @@ static void check_prim_div16(void) {
         off += c0 != want[lane];
         ties += (uint64_t)tie;
         hard |= (c0 != want[lane]) | tie;
+        if (((c0 != want[lane]) | tie) && g_div_hard < N_DIV_HARD_MAX) {
+          g_div_hard_e[g_div_hard] = ef;
+          g_div_hard_l[g_div_hard++] = l;
+        }
         e.w[lane++] = hvx_emu_w(ef);
         ++total;
       }
@@ -581,6 +596,210 @@ static void check_prim_div16(void) {
          (unsigned long long)ties, (unsigned long long)run, bad);
   CHECK(off > 0u && ties > 0u, "the division sweep found no hard case");
   CHECK(bad == 0u, "hvx_div16_sf differs from rne16(e / l)");
+}
+
+/* ==== 2b. the hf primitives (#170) against the spec ===================== */
+
+static HVX_Vector hf_load(const uint16_t *x) {
+  HVX_Vector v;
+  for (int i = 0; i < 64; ++i) {
+    hvx_emu_set_h(&v, i, x[i]);
+  }
+  return v;
+}
+
+/** @brief hvx_hf_fma on 64 triples against attn_m1_det_fma16, bitwise;
+ *         out-of-domain lanes (|result| > 65504) skipped. Adds the lanes
+ *         run to *n and the double-rounding hazards among them to *hz. */
+static uint32_t hf_fma_batch(const uint16_t *c, const uint16_t *a,
+                             const uint16_t *b, uint32_t *n, uint32_t *hz) {
+  const HVX_Vector y =
+    hvx_hf_fma(hf_load(c), hf_load(a), hf_load(b), Q6_Vh_vsplat_R(HVX_HF_ONE));
+  uint32_t bad = 0;
+  for (int i = 0; i < 64; ++i) {
+    const float fc = amc_h2f(c[i]), fa = amc_h2f(a[i]), fb = amc_h2f(b[i]);
+    const float ref = attn_m1_det_fma16(fc, fa, fb);
+    if (fabsf(ref) > 65504.0f) {
+      continue;
+    }
+    ++*n;
+    *hz += (uint32_t)amc_is_midpoint_case(fc, fa, fb);
+    bad += hvx_emu_h(&y, i) != amc_f2h(ref);
+  }
+  return bad;
+}
+
+/**
+ * @brief hvx_attn_m1_hf.h against the spec (plan 170 step 1, G2's ATTN M1
+ *        HF PRIM): the one-rounding FMA on the two attn_m1_cases.h
+ *        families and random fp16 triples (the hazards among them are
+ *        counted, so a family that stopped reaching the double-rounding
+ *        case fails); the hf ops the tree and softmax use over every
+ *        finite fp16 a x 4 random b; the score tree; exp16 at every fp16
+ *        d <= 0; the divide on the hard quotients of check_prim_div16.
+ *        What the emulation assumes (hvx_emu's qf32 note) is S1's to test.
+ */
+static void check_hf_prim(void) {
+  amc_rng r = {0x17000001u};
+  uint16_t c[64], a[64], b[64];
+  uint32_t n_adv = 0, hz_adv = 0, bad_adv = 0, n_zs = 0, hz_zs = 0, bad_zs = 0;
+  uint32_t n_rnd = 0, hz_rnd = 0, bad_rnd = 0;
+  for (uint32_t it = 0; it < 1200u; ++it) {
+    for (uint32_t i = 0; i < 64u; ++i) {
+      amc_fma_adversarial(&r, it * 64u + i, &c[i], &a[i], &b[i]);
+    }
+    bad_adv += hf_fma_batch(c, a, b, &n_adv, &hz_adv);
+  }
+  for (uint32_t it = 0; it < 400u; ++it) {
+    for (uint32_t i = 0; i < 64u; ++i) {
+      amc_fma_zero_sign(&r, &c[i], &a[i], &b[i]);
+    }
+    bad_zs += hf_fma_batch(c, a, b, &n_zs, &hz_zs);
+  }
+  for (uint32_t it = 0; it < 16000u; ++it) {
+    for (uint32_t i = 0; i < 64u; ++i) {
+      c[i] = amc_f2h(attn_m1_det_rne16(amc_frand(&r, -8.0f, 8.0f)));
+      a[i] = amc_f2h(attn_m1_det_rne16(amc_frand(&r, -8.0f, 8.0f)));
+      b[i] = amc_f2h(attn_m1_det_rne16(amc_frand(&r, -1.0f, 1.0f)));
+    }
+    bad_rnd += hf_fma_batch(c, a, b, &n_rnd, &hz_rnd);
+  }
+  printf("ATTN M1 HF PRIM qfma: adversarial n=%u hazards=%u bad=%u, "
+         "zero_sign n=%u bad=%u, random n=%u hazards=%u bad=%u\n",
+         n_adv, hz_adv, bad_adv, n_zs, bad_zs, n_rnd, hz_rnd, bad_rnd);
+  CHECK(hz_adv > 0u, "the adversarial family reaches no hazard");
+  CHECK(bad_adv + bad_zs + bad_rnd == 0u, "hvx_hf_fma differs from fma16");
+
+  /* hf add / sub / mul / max, * 0.125 and 0 + x: every finite fp16 a (both
+     signs) against 4 random b (a quarter of them +-0). */
+  uint32_t n_ops = 0, bad_op[6] = {0, 0, 0, 0, 0, 0};
+  const HVX_Vector eighth = Q6_Vh_vsplat_R(0x3000), zero = Q6_V_vzero();
+  for (uint32_t base = 0; base < 2u * 0x7C00u; base += 64u) {
+    for (uint32_t i = 0; i < 64u; ++i) {
+      const uint32_t x = base + i;
+      a[i] = (uint16_t)(((x & 1u) << 15) | (x >> 1));
+    }
+    const HVX_Vector va = hf_load(a);
+    for (int rep = 0; rep < 4; ++rep) {
+      for (uint32_t i = 0; i < 64u; ++i) {
+        const uint32_t k = amc_next(&r);
+        b[i] = (uint16_t)((k & 0x8000u) |
+                          ((k & 3u) == 0u ? 0u : (k >> 2) % 0x7C00u));
+      }
+      const HVX_Vector vb = hf_load(b);
+      const HVX_Vector y[6] = {
+        Q6_Vhf_vadd_VhfVhf(va, vb),     Q6_Vhf_vsub_VhfVhf(va, vb),
+        Q6_Vhf_vmpy_VhfVhf(va, vb),     Q6_Vhf_vmax_VhfVhf(va, vb),
+        Q6_Vhf_vmpy_VhfVhf(va, eighth), Q6_Vhf_vadd_VhfVhf(zero, va)};
+      for (uint32_t i = 0; i < 64u; ++i) {
+        const float x = amc_h2f(a[i]), z = amc_h2f(b[i]);
+        const float ref[6] = {attn_m1_det_rne16(attn_m1_det_add(x, z)),
+                              attn_m1_det_rne16(attn_m1_det_sub(x, z)),
+                              attn_m1_det_rne16(attn_m1_det_mul(x, z)),
+                              x > z ? x : z,
+                              attn_m1_det_rne16(attn_m1_det_mul(x, 0.125f)),
+                              attn_m1_det_add(0.0f, x)};
+        for (int o = 0; o < 6; ++o) {
+          if (fabsf(ref[o]) > 65504.0f) {
+            continue;
+          }
+          const uint16_t got = hvx_emu_h(&y[o], (int)i);
+          /* max: by value (the spec's max is canonicalised by + 0) */
+          bad_op[o] += o == 3 ? amc_h2f(got) != ref[o] : got != amc_f2h(ref[o]);
+        }
+        ++n_ops;
+      }
+    }
+  }
+  printf("ATTN M1 HF PRIM hf ops, every finite fp16 x 4 random: n=%u bad "
+         "add=%u sub=%u mul=%u max=%u mul0.125=%u zero_plus=%u\n",
+         n_ops, bad_op[0], bad_op[1], bad_op[2], bad_op[3], bad_op[4],
+         bad_op[5]);
+  CHECK(bad_op[0] + bad_op[1] + bad_op[2] + bad_op[3] + bad_op[4] + bad_op[5] ==
+          0u,
+        "an hf op differs from rne16(f32 op)");
+
+  /* The score tree on random fp16 accumulators. */
+  uint32_t bad_tree = 0;
+  for (uint32_t it = 0; it < 4000u; ++it) {
+    HVX_Vector acc[ATTN_M1_DET_ACC];
+    uint16_t h[ATTN_M1_DET_ACC][64];
+    for (uint32_t l = 0; l < ATTN_M1_DET_ACC; ++l) {
+      for (uint32_t i = 0; i < 64u; ++i) {
+        h[l][i] = amc_f2h(attn_m1_det_rne16(amc_frand(&r, -64.0f, 64.0f)));
+      }
+      acc[l] = hf_load(h[l]);
+    }
+    const HVX_Vector y = hvx_hf_score(acc, eighth);
+    for (uint32_t i = 0; i < 64u; ++i) {
+      float f[ATTN_M1_DET_ACC];
+      for (uint32_t l = 0; l < ATTN_M1_DET_ACC; ++l) {
+        f[l] = amc_h2f(h[l][i]);
+      }
+      const float s03 = attn_m1_det_rne16(
+        attn_m1_det_add(attn_m1_det_rne16(attn_m1_det_add(f[0], f[1])),
+                        attn_m1_det_rne16(attn_m1_det_add(f[2], f[3]))));
+      const float s47 = attn_m1_det_rne16(
+        attn_m1_det_add(attn_m1_det_rne16(attn_m1_det_add(f[4], f[5])),
+                        attn_m1_det_rne16(attn_m1_det_add(f[6], f[7]))));
+      const float t =
+        attn_m1_det_add(0.0f, attn_m1_det_rne16(attn_m1_det_add(s03, s47)));
+      bad_tree += hvx_emu_h(&y, (int)i) !=
+                  amc_f2h(attn_m1_det_rne16(attn_m1_det_mul(t, 0.125f)));
+    }
+  }
+
+  /* exp16 at every fp16 d <= 0: +0 and 0x8000 .. 0xFBFF. */
+  uint32_t n_exp = 0, bad_exp = 0;
+  const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
+  for (uint32_t base = 0x7FFFu; base < 0xFC00u; base += 64u) {
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < 64u; ++i) {
+      const uint32_t x = base + i;
+      a[i] = x == 0x7FFFu ? 0u : x < 0xFC00u ? (uint16_t)x : 0x8000u;
+      live += x < 0xFC00u;
+    }
+    const HVX_Vector y = hvx_hf_exp16(hf_load(a), one);
+    for (uint32_t i = 0; i < live; ++i) {
+      bad_exp +=
+        hvx_emu_h(&y, (int)i) != amc_f2h(attn_m1_det_exp16(amc_h2f(a[i])));
+      ++n_exp;
+    }
+  }
+
+  /* The divide on check_prim_div16's hard quotients, l per lane. */
+  uint32_t bad_div = 0;
+  for (uint32_t base = 0; base < g_div_hard; base += 64u) {
+    float want[64];
+    for (uint32_t i = 0; i < 64u; ++i) {
+      const uint32_t j = base + i < g_div_hard ? base + i : base;
+      a[i] = amc_f2h(g_div_hard_e[j]);
+      b[i] = amc_f2h(g_div_hard_l[j]);
+      want[i] =
+        attn_m1_det_rne16(attn_m1_det_div(g_div_hard_e[j], g_div_hard_l[j]));
+    }
+    const HVX_VectorPair l = hvx_hf_widen(hf_load(b), one);
+    const HVX_VectorPair rc = Q6_W_vcombine_VV(hvx_recip_det_sf(Q6_V_hi_W(l)),
+                                               hvx_recip_det_sf(Q6_V_lo_W(l)));
+    const HVX_Vector y = hvx_hf_div16(hf_load(a), l, rc, one);
+    for (uint32_t i = 0; i < 64u; ++i) {
+      bad_div += hvx_emu_h(&y, (int)i) != amc_f2h(want[i]);
+    }
+  }
+  printf("ATTN M1 HF PRIM score tree n=%u bad=%u; exp16 at every fp16 d <= 0 "
+         "(%u) bad=%u; div16 on %u hard quotients bad=%u\n",
+         4000u * 64u, bad_tree, n_exp, bad_exp, g_div_hard, bad_div);
+  CHECK(n_exp == 31745u, "exp16 swept %u values", n_exp);
+  CHECK(g_div_hard > 0u && g_div_hard < N_DIV_HARD_MAX,
+        "div16 hard quotients: %u", g_div_hard);
+  CHECK(bad_tree + bad_exp + bad_div == 0u,
+        "the hf tree, exp16 or divide differs from the spec");
+  if (bad_adv + bad_zs + bad_rnd + bad_tree + bad_exp + bad_div == 0u &&
+      bad_op[0] + bad_op[1] + bad_op[2] + bad_op[3] + bad_op[4] + bad_op[5] ==
+        0u &&
+      hz_adv > 0u && n_exp == 31745u) {
+    printf("ATTN M1 HF PRIM OK\n");
+  }
 }
 
 /* ==== 3. the kernel against the spec ==================================== */
@@ -894,6 +1113,7 @@ int main(void) {
   check_prim_rne16();
   check_prim_fma16();
   check_prim_div16();
+  check_hf_prim();
 
   hvx_worker_pool *pools[3];
   for (int p = 0; p < 3; ++p) {
@@ -901,14 +1121,14 @@ int main(void) {
     CHECK(POOLS[p] == 0u || pools[p], "pool of %u workers", POOLS[p]);
   }
 
-  static const uint32_t lengths[] = {1u, 63u, 64u, 65u, 512u, 1024u};
+  static const uint32_t lengths[] = {1u,   63u,  64u,   65u,
+                                     512u, 513u, 1024u, 1536u};
   for (size_t s = sizeof(SHAPES) / sizeof(SHAPES[0]); s-- > 0;) {
     set_shape(SHAPES[s]); /* LFM2.5 last: the cases below use it */
     for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
-      check_length(lengths[i], 1024u, pools);
+      check_length(lengths[i], 2048u, pools);
     }
   }
-  check_length(1024u, 2048u, pools);
   check_append_chain(65u, pools[1]);
   check_identity(pools[2]);
   check_division_tie(pools[1]);

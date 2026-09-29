@@ -253,4 +253,93 @@ static inline uint32_t amc_plant_pv(const float *q, const float *k, float *v,
   return planted;
 }
 
+/*
+ * fp16 FMA TRIPLES (#170): (c, a, b) as fp16 bits, for the one-rounding
+ * FMA of hvx_attn_m1_hf.h (host check ATTN M1 HF PRIM, device probe
+ * HvxAttnM1Probe.Semantics). Two families beside the real-data case file
+ * (tools/htp/attn_fma_cases.py), plan 170 section 0:
+ *  - ADVERSARIAL. a*b's 22-bit mantissa product within +-300 of 2^21 (so
+ *    within a few units of an 11-bit boundary) scaled to about half an
+ *    fp16 ulp of c: the sum lands next to c's midpoints. Kind n % 4: 0 same
+ *    signs, 1 odd c, 2 opposite signs (cancellation), 3 small c and a
+ *    product up to 2^11 smaller (fp16 subnormal results; half of them with
+ *    a subnormal c).
+ *  - ZERO / SIGN. +-0 and tiny subnormal c, +-0 or tiny a, normal b: the
+ *    signed-zero results and products far below c.
+ * A triple whose fused result is past 65504 is outside the domain; the
+ * comparisons skip it.
+ */
+
+/** @brief fp16 bits to f32, exact (finite values). */
+static inline float amc_h2f(uint16_t h) {
+  const int e = (h >> 10) & 31, m = h & 1023;
+  const float v =
+    e == 0 ? ldexpf((float)m, -24) : ldexpf((float)(1024 + m), e - 25);
+  return (h & 0x8000u) ? -v : v;
+}
+
+/** @brief An f32 on the fp16 grid to its fp16 bits (65536, rne16's
+ *         overflow, to inf). */
+static inline uint16_t amc_f2h(float f) {
+  const uint32_t u = attn_m1_det_bits(f);
+  const uint16_t s = (uint16_t)((u >> 16) & 0x8000u);
+  const float a = fabsf(f);
+  if (a < ldexpf(1.0f, -14)) {
+    return (uint16_t)(s | (uint16_t)(a * 16777216.0f));
+  }
+  const int e = (int)((u >> 23) & 0xFFu) - 127;
+  return (uint16_t)(s | (uint16_t)(((e + 15) << 10) | ((u >> 13) & 0x3FFu)));
+}
+
+static inline uint16_t amc_mk16(uint32_t s, int e, uint32_t m) {
+  return (uint16_t)((s << 15) | ((uint32_t)e << 10) | m);
+}
+
+/** @brief The n-th adversarial triple (kind n % 4). */
+static inline void amc_fma_adversarial(amc_rng *r, uint32_t n, uint16_t *c,
+                                       uint16_t *a, uint16_t *b) {
+  const uint32_t kind = n % 4u;
+  uint32_t ma, mb;
+  for (;;) {
+    ma = 1024u + amc_next(r) % 1024u;
+    const int k = (int)(amc_next(r) % 601u) - 300;
+    mb = (uint32_t)(((1 << 21) + k + (int)ma / 2) / (int)ma);
+    if (mb >= 1024u && mb <= 2047u) {
+      break;
+    }
+  }
+  int ec = 2 + (int)(amc_next(r) % 27u);
+  const uint32_t cm = (amc_next(r) % 1024u) | (kind & 1u);
+  const uint32_t sc = amc_next(r) & 1u, sp = kind == 2u ? !sc : sc;
+  /* a*b = ma*mb * 2^(ea+eb-50) ~ 2^(ea+eb-29) and half an ulp of c is
+     2^(ec-26): so ea + eb = ec + 3 */
+  const int e_h = ec + 3;
+  int ea = 1 + (int)(amc_next(r) % 30u), eb = e_h - ea;
+  if (kind == 3u) {
+    ec = 1 + (int)(amc_next(r) % 3u);
+    eb -= (int)(amc_next(r) % 12u);
+  }
+  if (eb < 1 || eb > 30) {
+    ea = 15;
+    eb = e_h - 15;
+  }
+  eb = eb < 1 ? 1 : eb > 30 ? 30 : eb;
+  *a = amc_mk16(sp, ea, ma - 1024u);
+  *b = amc_mk16(0u, eb, mb - 1024u);
+  *c = amc_mk16(sc, ec, cm);
+  if (kind == 3u && (amc_next(r) & 1u)) {
+    *c = amc_mk16(sc, 0, amc_next(r) % 1024u);
+  }
+}
+
+/** @brief One zero / sign triple. */
+static inline void amc_fma_zero_sign(amc_rng *r, uint16_t *c, uint16_t *a,
+                                     uint16_t *b) {
+  const uint32_t k = amc_next(r);
+  *c = (uint16_t)(((k & 1u) << 15) | (((k >> 1) & 3u) ? (k >> 3) % 64u : 0u));
+  *a = (uint16_t)((((k >> 9) & 1u) << 15) |
+                  (((k >> 10) & 1u) ? 0u : 1u + (k >> 11) % 900u));
+  *b = (uint16_t)((((k >> 20) & 1u) << 15) | (0x0400u + (k >> 21) % 0x3000u));
+}
+
 #endif /* __NNTRAINER_ATTN_M1_CASES_H__ */

@@ -34,6 +34,12 @@ typedef struct {
 
 typedef HVX_Vector HVX_UVector;
 
+/** @brief A register pair Vdd = V(d+1):V(d): lo is V(d), what Q6_V_lo_W
+ *         returns and the second operand of Q6_W_vcombine_VV (#170). */
+typedef struct {
+  HVX_Vector lo, hi;
+} HVX_VectorPair;
+
 /** @brief A vector predicate: one flag per byte, as the ISA defines it. The
  *         word-lane ops below set and test all four bytes of a lane. */
 typedef struct {

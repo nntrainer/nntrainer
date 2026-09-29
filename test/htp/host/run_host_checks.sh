@@ -229,10 +229,12 @@ fi
 # Decode attention at m=1 (#81, fp16 CPU order since #152): the spec
 # nntrainer/tensor/attn_m1_det.h against an independent _Float16 model of
 # the Android CPU attention with five mutants (ATTN M1 F16 CPU-ORDER OK);
-# hvx_convert.h's fp16 primitives against the spec (ATTN M1 PRIM); then
+# hvx_convert.h's fp16 primitives against the spec (ATTN M1 PRIM) and,
+# since #170, hvx_attn_m1_hf.h's fp16-lane ones (ATTN M1 HF PRIM OK); then
 # the REAL HVX source hvx_attn_m1_f32.c on hvx_emu/ with the REAL worker
 # pool on pthreads (stub/qurt.h) at 0, 3 and 7 workers, memcmp'd against
-# the spec for L = 1, 63, 64, 65, 512, 1024 at (n_kv, gqa) = (8, 4),
+# the spec for L = 1, 63, 64, 65, 512, 513, 1024, 1536 (max_seq 2048) at
+# (n_kv, gqa) = (8, 4),
 # (1, 2), (2, 3), head_dim 64, plus append-chain == bulk, the L = 1 case,
 # a division tie and the error codes; and the phase words (#146), which
 # must leave the output bytes alone (ATTN M1 PHASES OK).
