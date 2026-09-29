@@ -350,6 +350,22 @@ int hexkl_mm_u8i4_moe_layer_run(
  */
 #define HEXKL_MOE_FLAG_DMA_BYPASS 0x40000u
 
+/**
+ * @brief Bits [20:19] of the flags word (#177): N - 1, where N is the
+ *        number of DMA queues the M=1 feed splits every weight matrix over.
+ *        0 (N = 1) is #117's single dmlinked ring, unchanged. With N > 1
+ *        each matrix is cut by k-tile rows into min(N, pool lanes)
+ *        contiguous slices, and pool lane i issues slice i on its own
+ *        thread's queue and polls it done before its unit returns, so a
+ *        matrix is complete at the join of the run that carried it (the
+ *        M=1 section comment of hexkl_mm_u8i4_moe.c). No byte changes: the
+ *        same bytes land in the same place, only more engines move them.
+ *        The probe (S26, bypass on): 33.0 / 43.2 / 55.9 GB/s at 1 / 2 / 4
+ *        queues. No build default; the ARM side sends it.
+ */
+#define HEXKL_MOE_DMA_Q_SHIFT 19u
+#define HEXKL_MOE_DMA_Q_BITS 3u
+
 /** @brief Every bit this build understands; moe_set_opts keeps these and
  *         drops the rest, which is what makes the echo a version check. */
 #define HEXKL_MOE_FLAGS_KNOWN                                                  \
@@ -357,7 +373,13 @@ int hexkl_mm_u8i4_moe_layer_run(
    HEXKL_MOE_FLAG_GEMV_ROWS1_SET | HEXKL_MOE_FLAG_GEMV_FEED_SET |              \
    ((uint32_t)HEXKL_MOE_GEMV_LEAD_BITS << HEXKL_MOE_GEMV_LEAD_SHIFT) |         \
    HEXKL_MOE_FLAG_GEMV_ROWS1 | HEXKL_MOE_FLAG_GEMV_FEED |                      \
-   HEXKL_MOE_FLAG_DMA_BYPASS)
+   HEXKL_MOE_FLAG_DMA_BYPASS |                                                 \
+   ((uint32_t)HEXKL_MOE_DMA_Q_BITS << HEXKL_MOE_DMA_Q_SHIFT))
+
+/** @brief The call's DMA queue count for the M=1 feed, 1..4. */
+static inline uint32_t hexkl_moe_flags_dma_q(uint32_t flags) {
+  return ((flags >> HEXKL_MOE_DMA_Q_SHIFT) & HEXKL_MOE_DMA_Q_BITS) + 1u;
+}
 
 /** @brief The call's l2fetch lead in KB: the flags word when the lead bit
  *         is set, else the build's default. */

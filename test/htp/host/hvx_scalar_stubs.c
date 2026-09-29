@@ -52,6 +52,16 @@ void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
     memcpy((uint8_t *)dst + (size_t)r * ds,
            (const uint8_t *)src + (size_t)r * ss, rs);
 }
+/* #177's lane queue, likewise complete at once (the MoE file links here;
+   moe_layer_host_check holds its schedule). */
+void hexkl_dma_lane_push2d(hexkl_dma_desc2d *d, hexkl_dma_desc2d *prev,
+                           void *dst, const void *src, uint32_t ds, uint32_t ss,
+                           uint32_t rs, uint32_t nrows, int sv, int dv) {
+  (void)d;
+  (void)prev;
+  hexkl_dma_ring_push2d(dst, src, ds, ss, rs, nrows, sv, dv);
+}
+void hexkl_dma_lane_wait(hexkl_dma_desc2d *d) { (void)d; }
 
 /* The pool runs everything on the caller, which is what its own NULL path
    does for n_units <= 1. Doing it here rather than passing NULL keeps the

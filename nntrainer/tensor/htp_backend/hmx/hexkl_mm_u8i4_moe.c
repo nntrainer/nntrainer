@@ -585,6 +585,14 @@ static uint32_t moe_tail_rows(uint32_t n_e) {
  * DDR bytes twice. A shape whose two slabs do not fit the arena runs the
  * arena read as before and the call's feed count says so.
  *
+ * N DMA QUEUES (#177, hexkl_moe_flags_dma_q > 1). The ring is one thread's
+ * engine; the probe moves 1.3-1.7x more with 2-4 queues. So each matrix is
+ * split by rows over the pool lanes, each lane issues its slice on its own
+ * queue inside a pool run and polls it before the run joins (moe_m1_q_*):
+ * GU(0) in a run of its own before the scan, every later push on the first
+ * run after the join that frees its slab. The slabs, the GEMV units and
+ * their order are unchanged, so the output is the same bytes.
+ *
  * ponytail: one pool run per expert and stage (6 extra fork/joins a call)
  * is the price of a schedule a host check can prove. If the vtcm
  * microbench cell shows mm - bytes / engine rate well above the ~20 us
@@ -869,6 +877,117 @@ static inline uint32_t moe_m1_push(uint8_t *vtcm_base, uint32_t dst_off,
   return idx;
 }
 
+/* ---- #177: the feed over N DMA queues ------------------------------------
+   With N > 1 (hexkl_moe_flags_dma_q) no weight push goes through the ring.
+   Each matrix is cut by k-tile rows into nq = min(N, the run's lanes)
+   contiguous slices (moe_m1_slice's rule, the replay's), and a pool run
+   carries up to two such matrices beside its own stage work: lane i < nq
+   issues slice i of each on its own thread's queue, runs the stage worker,
+   and polls its last descriptor before it returns. A matrix is therefore
+   complete at the join of the run that carried it, and it is read only by
+   a later run. Every push rides the first run that starts after the join
+   freeing its slab, so the slab schedule is #117's, one run later. */
+
+/** @brief One matrix a run carries: its VTCM destination and arena source. */
+typedef struct {
+  uint8_t *dst;
+  const uint8_t *src;
+  uint32_t row, nrows; /**< bytes per k-tile row, k-tile rows */
+  int bypass;
+} moe_m1_qpush;
+
+/** @brief A pool run's DMA half (moe_m1_q_worker's context). */
+typedef struct {
+  moe_m1_qpush push[2];
+  uint32_t n_push;
+  uint32_t nq;                /**< queues asked for, 2..4 */
+  uint32_t nq_used;           /**< min(nq, lanes), set by lane 0 */
+  hvx_worker_pool_func inner; /**< the stage worker, or NULL */
+  void *inner_ctx;
+} moe_m1_qrun;
+
+/** @brief Per lane, the two descriptors of its chain in the current run.
+ *  1 KiB of static memory; a lane polls both done before its unit returns,
+ *  so the next run may reuse them. */
+static hexkl_dma_desc2d g_m1q_desc[4][2] __attribute__((aligned(128)));
+
+/** @brief Posts one whole matrix for the next run and counts it in DMA_KB,
+ *         as moe_m1_push does for the ring. The caller's thread only. */
+static void moe_m1_q_post(moe_m1_qrun *q, uint8_t *dst,
+                          const hexkl_weight_u8i4 *h, uint32_t k_tiles,
+                          uint32_t n_col) {
+  moe_m1_qpush *p = &q->push[q->n_push++];
+  p->dst = dst;
+  p->src = h->wh_bytes;
+  p->row = n_col * WEIGHT_TILE_BYTES_U8I4;
+  p->nrows = k_tiles;
+  p->bypass = moe_weight_src_bypass(h, g_moe_src_bypass);
+  HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_KB, (p->row * k_tiles) >> 10);
+}
+
+/** @brief Lane @a i: issue its slices of the posted matrices, run the stage
+ *         worker, then poll its chain done. Touches no probe slot. */
+static void moe_m1_q_worker(uint32_t n, uint32_t i, void *v) {
+  moe_m1_qrun *q = (moe_m1_qrun *)v;
+  const uint32_t nq = q->nq < n ? q->nq : n;
+  hexkl_dma_desc2d *last = NULL;
+  if (i < nq) {
+    for (uint32_t k = 0; k < q->n_push; ++k) {
+      const moe_m1_qpush *p = &q->push[k];
+      uint32_t r0, r1;
+      moe_m1_slice(0u, p->nrows, nq, i, &r0, &r1);
+      if (r0 < r1) {
+        hexkl_dma_desc2d *d = &g_m1q_desc[i][k];
+        hexkl_dma_lane_push2d(d, last, p->dst + (size_t)r0 * p->row,
+                              p->src + (size_t)r0 * p->row, p->row, p->row,
+                              p->row, r1 - r0, p->bypass, /*dst_vtcm=*/1);
+        last = d;
+      }
+    }
+    if (i == 0u) {
+      q->nq_used = nq;
+    }
+  }
+  if (q->inner != NULL) {
+    q->inner(n, i, q->inner_ctx);
+  }
+  if (last != NULL) {
+    hexkl_dma_lane_wait(last);
+  }
+}
+
+/** @brief One pool run of @a inner over @a n_units units (none: NULL) with
+ *         the posted matrices riding it; clears the posts after the join.
+ *         At least nq units, so every queue gets a lane. */
+static void moe_m1_q_run(hvx_worker_pool *pool, moe_m1_qrun *q,
+                         hvx_worker_pool_func inner, void *inner_ctx,
+                         uint32_t n_units) {
+  q->inner = inner;
+  q->inner_ctx = inner_ctx;
+  hvx_worker_pool_run(pool, moe_m1_q_worker, q,
+                      n_units > q->nq ? n_units : q->nq);
+  q->n_push = 0u;
+}
+
+/** @brief Posts what #117's schedule pushes after stage A(@a i)'s join:
+ *         the gate_up two experts on, or -- once slab i & 1 has no gate_up
+ *         left to hold -- its two downs. */
+static void moe_m1_q_post_after_a(moe_m1_qrun *q, const moe_m1_ctx *c,
+                                  uint32_t i, uint8_t *vtcm_base,
+                                  uint32_t gu_bytes, uint32_t dn_bytes) {
+  if (i + 2u < c->n_active) {
+    moe_m1_q_post(q, vtcm_base + moe_m1_gu_off(i + 2u, gu_bytes),
+                  c->ex[i + 2u].g, c->k_tiles, c->gu_ntiles);
+    return;
+  }
+  for (uint32_t j = 2u * (i & 1u); j < 2u * (i & 1u) + 2u; ++j) {
+    if (j < c->n_active) {
+      moe_m1_q_post(q, vtcm_base + moe_m1_dn_off(j, gu_bytes, dn_bytes),
+                    c->ex[j].d, c->inter_ktiles, c->dn_ntiles);
+    }
+  }
+}
+
 /** @brief A traced ring wait. Not timed into DRAIN / DRAIN_DN: it sits
  *         inside the MM bracket (the comment atop the M=1 section). */
 static inline void moe_m1_wait(uint32_t idx, uint32_t site) {
@@ -1125,6 +1244,12 @@ int hexkl_mm_u8i4_moe_layer_run(
   const int m1_feed = use_m1 && hexkl_moe_flags_feed(flags) != 0u &&
                       2u * (uint64_t)gu_bytes <= arena &&
                       2u * (uint64_t)dn_bytes <= gu_bytes;
+  /* #177: the feed's pushes split over N queues (pool lanes) when N > 1;
+     N = 1 is the ring schedule below, unchanged. */
+  moe_m1_qrun m1q;
+  m1q.n_push = 0u;
+  m1q.nq = m1_feed ? hexkl_moe_flags_dma_q(flags) : 1u;
+  m1q.nq_used = 1u;
   /* Pairs per staged batch; the chunk size the gate_up pushes use too. */
   const uint32_t half = L.acc_tiles / 2u;
   /* Bounded arrays below; a shape that needs more chunks than they hold is
@@ -1330,6 +1455,18 @@ int hexkl_mm_u8i4_moe_layer_run(
     gu_nchunk = moe_push_gate_up_chunks(
       vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[0]]], k_tiles,
       gu_ntiles, inter_ntiles, half, 0u, gu_idx);
+  } else if (m1_feed && m1q.nq > 1u) {
+    /* #177: GU(0) alone, in its own run (the pool is needed by the scan
+       next), so only it is exposed; GU(1) rides stage A(0)'s run. The
+       input copy above drained the ring, so the caller's engine is idle
+       for lane 0. DMA_FIRST times the whole transfer here. */
+    uint64_t pw = 0;
+    HEXKL_PROBE_T0(pw);
+    moe_m1_q_post(&m1q, vtcm_base + moe_m1_gu_off(0u, gu_bytes),
+                  &tbl->slots[h_gate_up[order[0]]], k_tiles, gu_ntiles);
+    moe_m1_q_run(pool, &m1q, NULL, NULL, m1q.nq);
+    HEXKL_PROBE_ADD(HEXKL_PROBE_DMA_FIRST, pw);
+    HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_FIRST_KB, gu_bytes >> 10);
   } else if (m1_feed) {
     /* One gate_up per slab, at the same point for the same reason: the
        scan and the pack are in front of them. Whole matrices (f2). */
@@ -1421,7 +1558,7 @@ int hexkl_mm_u8i4_moe_layer_run(
     m1.lead_kb = m1_feed ? 0u : hexkl_moe_flags_lead_kb(flags);
     m1.rows1 = hexkl_moe_flags_rows1(flags);
     m1.feed = m1_feed ? 1u : 0u;
-    HEXKL_PROBE_COUNT(HEXKL_PROBE_M1_FEED, m1_feed ? 1u : 0u);
+    HEXKL_PROBE_COUNT(HEXKL_PROBE_M1_FEED, m1_feed ? m1q.nq_used : 0u);
 
     /* MM is the wall of the two GEMV stages on the caller; SWIGLU their
        summed worker-time (moe_worker_probe_add), so SWIGLU / lanes ~ MM says
@@ -1437,6 +1574,27 @@ int hexkl_mm_u8i4_moe_layer_run(
       m1.u_hi = n_active * inter_ntiles;
       hvx_worker_pool_run(pool, moe_m1_pair_worker, &m1,
                           n_active * inter_ntiles);
+    } else if (m1q.nq > 1u) {
+      /* #177: run A(i) carries what the ring schedule pushes after A(i-1)'s
+         join -- GU(1) for i = 0 -- and run B what it pushes after the last
+         A. The same slabs, each written one run after the join that frees
+         it and read only after the join of the run that wrote it. */
+      for (uint32_t i = 0; i < n_active; ++i) {
+        if (i == 0u) {
+          if (n_active > 1u) {
+            moe_m1_q_post(&m1q, vtcm_base + moe_m1_gu_off(1u, gu_bytes),
+                          m1.ex[1].g, k_tiles, gu_ntiles);
+          }
+        } else {
+          moe_m1_q_post_after_a(&m1q, &m1, i - 1u, vtcm_base, gu_bytes,
+                                dn_bytes);
+        }
+        m1.u_lo = i * inter_ntiles;
+        m1.u_hi = (i + 1u) * inter_ntiles;
+        moe_m1_q_run(pool, &m1q, moe_m1_pair_worker, &m1, inter_ntiles);
+      }
+      moe_m1_q_post_after_a(&m1q, &m1, n_active - 1u, vtcm_base, gu_bytes,
+                            dn_bytes);
     } else {
       for (uint32_t i = 0; i < n_active; ++i) {
         uint64_t pw = 0;
@@ -1469,13 +1627,33 @@ int hexkl_mm_u8i4_moe_layer_run(
     }
     HEXKL_PROBE_ADD(HEXKL_PROBE_MM, p0);
     HEXKL_PROBE_T0(p0);
-    hvx_worker_pool_run(pool, moe_m1_requant_worker, &m1, n_active);
+    if (m1q.n_push != 0u) {
+      /* #177: the last A's downs ride the requant run (ponytail: C(0)
+         cannot overlap them; if REQUANT >> its compute, move the second
+         into C(0)'s run). */
+      moe_m1_q_run(pool, &m1q, moe_m1_requant_worker, &m1, n_active);
+    } else {
+      hvx_worker_pool_run(pool, moe_m1_requant_worker, &m1, n_active);
+    }
     HEXKL_PROBE_ADD(HEXKL_PROBE_REQUANT, p0);
     HEXKL_PROBE_T0(p0);
     if (!m1_feed) {
       m1.u_lo = 0u;
       m1.u_hi = n_active * dn_ntiles;
       hvx_worker_pool_run(pool, moe_m1_down_worker, &m1, n_active * dn_ntiles);
+    } else if (m1q.nq > 1u) {
+      /* #177: down slot (j - 1) & 3 is free after C(j - 1)'s join, so a
+         fifth or later expert's down D(j + 3) rides C(j)'s run. */
+      for (uint32_t j = 0; j < n_active; ++j) {
+        if (j >= 1u && j + 3u < n_active) {
+          moe_m1_q_post(&m1q,
+                        vtcm_base + moe_m1_dn_off(j + 3u, gu_bytes, dn_bytes),
+                        m1.ex[j + 3u].d, inter_ktiles, dn_ntiles);
+        }
+        m1.u_lo = j * dn_ntiles;
+        m1.u_hi = (j + 1u) * dn_ntiles;
+        moe_m1_q_run(pool, &m1q, moe_m1_down_worker, &m1, dn_ntiles);
+      }
     } else {
       for (uint32_t j = 0; j < n_active; ++j) {
         moe_m1_wait(m1_dn_idx[j], HEXKL_DMA_SITE_DN);

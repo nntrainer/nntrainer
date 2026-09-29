@@ -128,4 +128,28 @@ int hexkl_dma_ring_is_done(uint32_t idx);
  */
 void hexkl_dcache_inva(const void *p, uint32_t bytes);
 
+/**
+ * @brief Queues one 2D transfer on the CALLING thread's own DMA queue,
+ *        outside the ring (#177): fills @a d as hexkl_dma_ring_push2d fills
+ *        a ring slot, then dmstarts it when @a prev is NULL, else dmlinks
+ *        it after @a prev.
+ *
+ * For a pool lane that issues its own slice of a weight matrix. The lane
+ * owns @a d (and @a prev) until its hexkl_dma_lane_wait returns, and must
+ * wait before its pool unit returns: nothing measured says a queue keeps
+ * running once its issuing thread blocks, so no descriptor outlives the
+ * unit that started it (plan 177 section 3). The caller's own engine must
+ * be idle at the first lane push; the MoE call drains the ring after its
+ * input copy, which guarantees it.
+ */
+void hexkl_dma_lane_push2d(hexkl_dma_desc2d *d, hexkl_dma_desc2d *prev,
+                           void *dst, const void *src, uint32_t dst_stride,
+                           uint32_t src_stride, uint32_t row_size,
+                           uint32_t nrows, int src_bypass, int dst_vtcm);
+
+/** @brief Spins (dmpoll) until @a d, the last descriptor this thread
+ *         pushed with hexkl_dma_lane_push2d, is done -- and with it every
+ *         earlier one of the same chain. Same 50 M-poll guard as the ring. */
+void hexkl_dma_lane_wait(hexkl_dma_desc2d *d);
+
 #endif /* __NNTRAINER_HEXKL_DMA_RING_H__ */
