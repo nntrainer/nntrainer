@@ -1414,8 +1414,12 @@ TEST_F(HvxAttnM1Probe, Semantics) {
  *        together (the throughput the cost model needs); lane_pcyc_per_fma64
  *        is the lane-summed pcycles per FMA (#152's 24.6 for today's loop at
  *        6 lanes, 32-lane FMAs counted in pairs); mhz is the pcycles per
- *        qtimer microsecond; gbps the FETCH pair's read rate. Printed, not
- *        asserted, except that each call succeeds on the lanes asked for.
+ *        qtimer microsecond; gbps the FETCH pair's read rate. Since #170
+ *        round 2 the kernel's leads on cold slabs (pv4_cold*, scores1_cold*:
+ *        each against pv4 / scores1, the hot-vs-cold ratio per lead) and
+ *        scores1_splat (q splatted per scalar load, against scores1).
+ *        Printed, not asserted, except that each call succeeds on the lanes
+ *        asked for.
  */
 TEST_F(HvxAttnM1Probe, Cost) {
   static const struct {
@@ -1427,7 +1431,12 @@ TEST_F(HvxAttnM1Probe, Cost) {
               {ATTN_M1_PROBE_SCORES2, "scores2", 20u},
               {ATTN_M1_PROBE_PV4, "pv4", 20u},
               {ATTN_M1_PROBE_FETCH, "fetch", 5u},
-              {ATTN_M1_PROBE_FETCH_L2F, "fetch_l2f", 5u}};
+              {ATTN_M1_PROBE_FETCH_L2F, "fetch_l2f", 5u},
+              {ATTN_M1_PROBE_PV4_COLD, "pv4_cold", 5u},
+              {ATTN_M1_PROBE_PV4_COLD_L2F, "pv4_cold_l2f", 5u},
+              {ATTN_M1_PROBE_SCORES1_COLD, "scores1_cold", 5u},
+              {ATTN_M1_PROBE_SCORES1_COLD_L2F, "scores1_cold_l2f", 5u},
+              {ATTN_M1_PROBE_SCORES1_SPLAT, "scores1_splat", 20u}};
   for (const auto &o : kOps) {
     for (uint32_t lanes : {1u, 2u, 4u, 6u}) {
       std::vector<uint32_t> w(ATTN_M1_PROBE_WORDS, 0u);

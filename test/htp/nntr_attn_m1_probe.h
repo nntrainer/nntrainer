@@ -14,7 +14,8 @@
  * SEMANTICS ops (< 16) run hvx_attn_m1_hf.h on n fp16 lanes, one thread:
  * a, b, c and y all n long, n a multiple of 64, y[i] = f(a[i], b[i], c[i]).
  * COST ops (16 ..) run a kernel-shaped loop on synthetic, L2-resident data
- * (the FETCH pair: a cold slab) on `lanes` pool lanes, `reps` pool runs,
+ * (the FETCH pair and the COLD ops: a cold slab) on `lanes` pool lanes,
+ * `reps` pool runs,
  * each timed; a, b, c and y are empty and prof holds the words below.
  * Free of Hexagon headers so the ARM gtest can include it.
  */
@@ -41,13 +42,24 @@
 #define ATTN_M1_PROBE_PV4 19u       /**< hf PV, four q heads per V row */
 #define ATTN_M1_PROBE_FETCH 20u     /**< stream a cold slab, no l2fetch */
 #define ATTN_M1_PROBE_FETCH_L2F 21u /**< the same with an l2fetch lead */
-#define ATTN_M1_PROBE_COST_END 22u
+/* #170 round 2: the kernel's leads on cold data (a slab per lane, evicted
+   between reps) and the splat source, each against its warm op above */
+#define ATTN_M1_PROBE_PV4_COLD 22u         /**< PV4 over cold V rows, no lead */
+#define ATTN_M1_PROBE_PV4_COLD_L2F 23u     /**< the same, 32 KiB window lead */
+#define ATTN_M1_PROBE_SCORES1_COLD 24u     /**< SCORES1 over cold tiles */
+#define ATTN_M1_PROBE_SCORES1_COLD_L2F 25u /**< the same, next-tile lead */
+#define ATTN_M1_PROBE_SCORES1_SPLAT 26u /**< SCORES1, q splat per scalar load  \
+                                         */
+#define ATTN_M1_PROBE_COST_END 27u
 
 /** @brief Positions per lane and rep of the compute cost ops. */
 #define ATTN_M1_PROBE_L 1024u
 /** @brief The FETCH slab: 3 MiB of fp16, the KV of one layer at L 1536,
  *         split evenly over the lanes. */
 #define ATTN_M1_PROBE_SLAB_BYTES (3u << 20)
+/** @brief The cold ops' slab per lane: ATTN_M1_PROBE_L V rows, or
+ *         ATTN_M1_PROBE_L / 64 Kt tiles (128 KiB). */
+#define ATTN_M1_PROBE_COLD_BYTES (128u << 10)
 #define ATTN_M1_PROBE_MAX_LANES 8u
 #define ATTN_M1_PROBE_MAX_REPS 10000u
 

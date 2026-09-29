@@ -21,13 +21,19 @@
  * data (a 32 KiB tile per lane, re-read for ATTN_M1_PROBE_L positions), so
  * they measure the vector pipe, not DDR; the FETCH pair streams a cold
  * 3 MiB slab (evicted by reading 4 MiB between runs, outside the timer)
- * with and without an l2fetch lead two 16 KiB blocks ahead. Each lane
- * reads its own data; each pool run is timed on the caller (pcycles and
- * qtimer), each lane times itself.
+ * with and without an l2fetch lead two 16 KiB blocks ahead. Round 2 (#170
+ * plan round 2 step 1) adds the kernel's leads on cold data -- PV4 over
+ * 128 KiB of V rows per lane with and without the 32 KiB window, SCORES1
+ * over 16 Kt tiles per lane with and without the next-tile box -- each
+ * read against its warm op, and SCORES1 with q splatted from scalar loads
+ * (round 1's P1) against the splat vectors. Each lane reads its own data;
+ * each pool run is timed on the caller (pcycles and qtimer), each lane
+ * times itself.
  *
- * ADDRESS BUDGET: the call allocates at most lanes * 48 KiB (compute ops)
- * or 7 MiB (the FETCH slab and evictor) on the DSP heap and frees it
- * before returning; nothing persists in the session.
+ * ADDRESS BUDGET: the call allocates at most lanes * 48 KiB (compute ops),
+ * 7 MiB (the FETCH slab and evictor) or lanes * 176 KiB + 4 MiB (the cold
+ * ops) on the DSP heap and frees it before returning; nothing persists in
+ * the session.
  *
  * Errors: a bad op, length, lane or rep count is AEE_EINVALIDFORMAT, an
  * allocation failure AEE_ENOMEMORY; never AEE_EBADPARM (the stale-skel
@@ -67,8 +73,8 @@
 typedef struct {
   uint32_t op;
   uint8_t *buf;        /**< compute ops: PER_LANE bytes per lane */
-  const uint8_t *slab; /**< FETCH: the slab */
-  uint32_t chunk;      /**< FETCH: bytes per lane */
+  const uint8_t *slab; /**< FETCH and the cold ops: the slab */
+  uint32_t chunk;      /**< FETCH and the cold ops: bytes per lane */
   uint64_t busy[ATTN_M1_PROBE_MAX_LANES];
   HVX_Vector sink[ATTN_M1_PROBE_MAX_LANES];
   uint32_t lanes;
@@ -104,13 +110,63 @@ static HVX_Vector cost_fma16_sf(uint8_t *buf) {
 /** @brief One step of accumulator l for d = d0 + l. */
 #define QFMA(A, Q, K) A = hvx_hf_fma(A, Q, K, one)
 
-/** @brief hf scores over a tiled Kt ([64 d][64 positions] per tile), one q
+/** @brief hf scores of one tiled Kt tile ([64 d][64 positions]), one q
  *         head: eight named accumulators over d = 8 blk + l (arrays spill
  *         on hexagon-clang 19 -O3), then the tree and * 0.125. */
-static HVX_Vector cost_scores1(uint8_t *buf) {
+static inline HVX_Vector scores1_tile(const HVX_Vector *kt,
+                                      const HVX_Vector *qs) {
   const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
-  const HVX_Vector eighth = Q6_Vh_vsplat_R(0x3000);
+  HVX_Vector a0 = Q6_V_vzero(), a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0,
+             a6 = a0, a7 = a0;
+#pragma unroll 1
+  for (uint32_t d = 0; d < 64u; d += 8u) {
+    QFMA(a0, qs[d], kt[d]);
+    QFMA(a1, qs[d + 1u], kt[d + 1u]);
+    QFMA(a2, qs[d + 2u], kt[d + 2u]);
+    QFMA(a3, qs[d + 3u], kt[d + 3u]);
+    QFMA(a4, qs[d + 4u], kt[d + 4u]);
+    QFMA(a5, qs[d + 5u], kt[d + 5u]);
+    QFMA(a6, qs[d + 6u], kt[d + 6u]);
+    QFMA(a7, qs[d + 7u], kt[d + 7u]);
+  }
+  const HVX_Vector acc[ATTN_M1_DET_ACC] = {a0, a1, a2, a3, a4, a5, a6, a7};
+  return hvx_hf_score(acc, Q6_Vh_vsplat_R(0x3000));
+}
+
+/** @brief scores1_tile over the lane's L2-resident tile, PL / 64 times. */
+static HVX_Vector cost_scores1(uint8_t *buf) {
   const HVX_Vector *qs = (const HVX_Vector *)(buf + OFF_Q);
+  HVX_Vector sink = Q6_V_vzero();
+  for (uint32_t b = 0; b < PL / 64u; ++b) {
+    const HVX_Vector *kt = (const HVX_Vector *)(buf + OFF_TILE);
+    LAUNDER(kt);
+    sink = Q6_V_vor_VV(sink, scores1_tile(kt, qs));
+  }
+  return sink;
+}
+
+/** @brief scores1_tile over PL / 64 cold tiles of the lane's slab, with
+ *         the kernel's P1 lead (the next tile's box) if @a l2f. */
+static HVX_Vector cost_scores1_cold(uint8_t *buf, const uint8_t *slab,
+                                    int l2f) {
+  const HVX_Vector *qs = (const HVX_Vector *)(buf + OFF_Q);
+  const HVX_Vector *kt = (const HVX_Vector *)slab;
+  HVX_Vector sink = Q6_V_vzero();
+  for (uint32_t b = 0; b < PL / 64u; ++b) {
+    if (l2f && b + 1u < PL / 64u) {
+      Q6_l2fetch_AP((void *)(kt + 64u * (b + 1u)),
+                    (128ull << 32) | (128ull << 16) | 64u);
+    }
+    sink = Q6_V_vor_VV(sink, scores1_tile(kt + 64u * b, qs));
+  }
+  return sink;
+}
+
+/** @brief cost_scores1 with q splatted from a scalar load per value (round
+ *         1's P1): the splat source is the only difference. */
+static HVX_Vector cost_scores1_splat(uint8_t *buf) {
+  const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
+  const uint16_t *qh = (const uint16_t *)(buf + OFF_Q); /* lane 0 of each */
   HVX_Vector sink = Q6_V_vzero();
   for (uint32_t b = 0; b < PL / 64u; ++b) {
     const HVX_Vector *kt = (const HVX_Vector *)(buf + OFF_TILE);
@@ -119,17 +175,17 @@ static HVX_Vector cost_scores1(uint8_t *buf) {
                a6 = a0, a7 = a0;
 #pragma unroll 1
     for (uint32_t d = 0; d < 64u; d += 8u) {
-      QFMA(a0, qs[d], kt[d]);
-      QFMA(a1, qs[d + 1u], kt[d + 1u]);
-      QFMA(a2, qs[d + 2u], kt[d + 2u]);
-      QFMA(a3, qs[d + 3u], kt[d + 3u]);
-      QFMA(a4, qs[d + 4u], kt[d + 4u]);
-      QFMA(a5, qs[d + 5u], kt[d + 5u]);
-      QFMA(a6, qs[d + 6u], kt[d + 6u]);
-      QFMA(a7, qs[d + 7u], kt[d + 7u]);
+      QFMA(a0, Q6_Vh_vsplat_R(qh[64u * d]), kt[d]);
+      QFMA(a1, Q6_Vh_vsplat_R(qh[64u * (d + 1u)]), kt[d + 1u]);
+      QFMA(a2, Q6_Vh_vsplat_R(qh[64u * (d + 2u)]), kt[d + 2u]);
+      QFMA(a3, Q6_Vh_vsplat_R(qh[64u * (d + 3u)]), kt[d + 3u]);
+      QFMA(a4, Q6_Vh_vsplat_R(qh[64u * (d + 4u)]), kt[d + 4u]);
+      QFMA(a5, Q6_Vh_vsplat_R(qh[64u * (d + 5u)]), kt[d + 5u]);
+      QFMA(a6, Q6_Vh_vsplat_R(qh[64u * (d + 6u)]), kt[d + 6u]);
+      QFMA(a7, Q6_Vh_vsplat_R(qh[64u * (d + 7u)]), kt[d + 7u]);
     }
     const HVX_Vector acc[ATTN_M1_DET_ACC] = {a0, a1, a2, a3, a4, a5, a6, a7};
-    sink = Q6_V_vor_VV(sink, hvx_hf_score(acc, eighth));
+    sink = Q6_V_vor_VV(sink, hvx_hf_score(acc, Q6_Vh_vsplat_R(0x3000)));
   }
   return sink;
 }
@@ -200,6 +256,33 @@ static HVX_Vector cost_pv4(uint8_t *buf) {
   return Q6_V_vor_VV(Q6_V_vor_VV(o0, o1), Q6_V_vor_VV(o2, o3));
 }
 
+/** @brief cost_pv4 over PL cold V rows of the lane's slab, with the
+ *         kernel's P3 lead if @a l2f: a box of the first two 16 KiB blocks,
+ *         then at each block the one two blocks ahead. */
+static HVX_Vector cost_pv4_cold(uint8_t *buf, const uint8_t *slab, int l2f) {
+  const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
+  const HVX_Vector *vr = (const HVX_Vector *)slab;
+  const uint16_t *pr = (const uint16_t *)(buf + OFF_P);
+  const uint64_t box = (128ull << 32) | (128ull << 16);
+  if (l2f) {
+    Q6_l2fetch_AP((void *)vr, box | (2u * FETCH_BLOCK_VEC));
+  }
+  HVX_Vector o0 = Q6_V_vzero(), o1 = o0, o2 = o0, o3 = o0;
+  for (uint32_t p0 = 0; p0 < PL; p0 += FETCH_BLOCK_VEC) {
+    if (l2f && p0 + FETCH_LEAD_VEC < PL) {
+      Q6_l2fetch_AP((void *)(vr + p0 + FETCH_LEAD_VEC), box | FETCH_BLOCK_VEC);
+    }
+    for (uint32_t p = p0; p < p0 + FETCH_BLOCK_VEC; ++p) {
+      const HVX_Vector v = vr[p];
+      o0 = hvx_hf_fma(o0, Q6_Vh_vsplat_R(pr[p]), v, one);
+      o1 = hvx_hf_fma(o1, Q6_Vh_vsplat_R(pr[PL + p]), v, one);
+      o2 = hvx_hf_fma(o2, Q6_Vh_vsplat_R(pr[2u * PL + p]), v, one);
+      o3 = hvx_hf_fma(o3, Q6_Vh_vsplat_R(pr[3u * PL + p]), v, one);
+    }
+  }
+  return Q6_V_vor_VV(Q6_V_vor_VV(o0, o1), Q6_V_vor_VV(o2, o3));
+}
+
 /** @brief Every vector of @a bytes at @a src, optionally with an l2fetch
  *         of the block two ahead (Rtt: stride, width, height = 128 B x
  *         128 rows). */
@@ -237,6 +320,19 @@ static void probe_lane(uint32_t n, uint32_t i, void *arg) {
     break;
   case ATTN_M1_PROBE_PV4:
     r = cost_pv4(buf);
+    break;
+  case ATTN_M1_PROBE_PV4_COLD:
+  case ATTN_M1_PROBE_PV4_COLD_L2F:
+    r = cost_pv4_cold(buf, job->slab + (size_t)i * job->chunk,
+                      job->op == ATTN_M1_PROBE_PV4_COLD_L2F);
+    break;
+  case ATTN_M1_PROBE_SCORES1_COLD:
+  case ATTN_M1_PROBE_SCORES1_COLD_L2F:
+    r = cost_scores1_cold(buf, job->slab + (size_t)i * job->chunk,
+                          job->op == ATTN_M1_PROBE_SCORES1_COLD_L2F);
+    break;
+  case ATTN_M1_PROBE_SCORES1_SPLAT:
+    r = cost_scores1_splat(buf);
     break;
   default:
     r = cost_fetch(job->slab + (size_t)i * job->chunk, job->chunk,
@@ -365,11 +461,13 @@ int nntr_hvx_attn_m1_probe(remote_handle64 handle, uint32 op, uint32 lanes,
       yLen != 0 || profLen != (int)ATTN_M1_PROBE_WORDS) {
     return AEE_EINVALIDFORMAT;
   }
-  const int fetch = op >= ATTN_M1_PROBE_FETCH;
+  const int fetch = op == ATTN_M1_PROBE_FETCH || op == ATTN_M1_PROBE_FETCH_L2F;
+  const int cold =
+    op >= ATTN_M1_PROBE_PV4_COLD && op <= ATTN_M1_PROBE_SCORES1_COLD_L2F;
   probe_job job;
   memset(&job, 0, sizeof(job));
   job.op = op;
-  uint8_t *mem = NULL, *evict = NULL;
+  uint8_t *mem = NULL, *evict = NULL, *slab = NULL;
   if (fetch) {
     mem = (uint8_t *)memalign(128, ATTN_M1_PROBE_SLAB_BYTES);
     evict = (uint8_t *)memalign(128, EVICT_BYTES);
@@ -397,10 +495,27 @@ int nntr_hvx_attn_m1_probe(remote_handle64 handle, uint32 op, uint32 lanes,
     }
     job.buf = mem;
   }
+  if (cold) { /* each lane's slab: finite fp16, as fill_lanes' tile */
+    slab = (uint8_t *)memalign(128, (size_t)lanes * ATTN_M1_PROBE_COLD_BYTES);
+    evict = (uint8_t *)memalign(128, EVICT_BYTES);
+    if (!slab || !evict) {
+      free(mem);
+      free(slab);
+      free(evict);
+      return AEE_ENOMEMORY;
+    }
+    uint16_t *s16 = (uint16_t *)slab;
+    for (size_t k = 0; k < (size_t)lanes * ATTN_M1_PROBE_COLD_BYTES / 2u; ++k) {
+      s16[k] = (uint16_t)(0x2000u + (k * 7u) % 1000u);
+    }
+    memset(evict, 0x22, EVICT_BYTES);
+    job.slab = slab;
+    job.chunk = ATTN_M1_PROBE_COLD_BYTES;
+  }
   uint64_t wall = 0, qt = 0;
   HVX_Vector ev = Q6_V_vzero();
   for (uint32_t r = 0; r < reps; ++r) {
-    if (fetch) { /* cold: read 4 MiB of other lines, outside the timer */
+    if (fetch || cold) { /* read 4 MiB of other lines, outside the timer */
       ev = Q6_V_vor_VV(ev, cost_fetch(evict, EVICT_BYTES, 0));
     }
     const uint64_t t0 = HAP_perf_get_pcycles(),
@@ -424,12 +539,16 @@ int nntr_hvx_attn_m1_probe(remote_handle64 handle, uint32 op, uint32 lanes,
   prof[ATTN_M1_PROBE_W_BUSY_MAX] = (uint32_t)mx;
   put64(prof, ATTN_M1_PROBE_W_BUSY_SUM, sum);
   prof[ATTN_M1_PROBE_W_FMA64] = op == ATTN_M1_PROBE_SCORES2 ? 2u * PL
-                                : op == ATTN_M1_PROBE_PV4   ? 4u * PL
-                                : fetch                     ? 0u
-                                                            : PL;
-  prof[ATTN_M1_PROBE_W_BYTES] = fetch ? job.chunk : 0u;
+                                : op == ATTN_M1_PROBE_PV4 ||
+                                    op == ATTN_M1_PROBE_PV4_COLD ||
+                                    op == ATTN_M1_PROBE_PV4_COLD_L2F
+                                  ? 4u * PL
+                                : fetch ? 0u
+                                        : PL;
+  prof[ATTN_M1_PROBE_W_BYTES] = fetch || cold ? job.chunk : 0u;
   prof[ATTN_M1_PROBE_W_SINK] = (uint32_t)Q6_R_vextract_VR(sink, 0);
   free(mem);
+  free(slab);
   free(evict);
   return AEE_SUCCESS;
 }
