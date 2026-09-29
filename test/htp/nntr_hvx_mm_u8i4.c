@@ -395,8 +395,9 @@ int nntr_hvx_arena_detach(remote_handle64 handle, uint32 arena) {
   if (!a) {
     return AEE_EBADPARM;
   }
-  if (hexkl_weight_u8i4_borrows(&s->weights_u8i4, a->va, a->bytes)) {
-    return AEE_EBADSTATE;
+  if (hexkl_weight_u8i4_borrows(&s->weights_u8i4, a->va, a->bytes) ||
+      nntr_hvx_q4m1_borrows(s, a->va, a->bytes)) {
+    return AEE_EBADSTATE; /* [#132 Part B E3] q4m1_attach borrows too */
   }
 #ifndef NNTR_HAVE_HAP_MMAP
   return AEE_EUNSUPPORTED;

@@ -47,11 +47,12 @@
  * dst_bypass 0 (the DMA writes through the L2, where the GEMV reads it),
  * for a session whose VTCM does not hold two groups per lane (#178: the
  * second session gets none). Address space: the Q4M1 weights are DSP heap
- * copies (q4m1_register), 80 slots; the whole LFM2.5 FC set is 383 MiB,
+ * copies (q4m1_register) or [E3] borrowed from an attached arena
+ * (q4m1_attach, no heap), 80 slots; the whole LFM2.5 FC set is 383 MiB,
  * which only a session without the 3840 MiB MoE arena can hold (plan 132
- * Part B section 3.2: S2's arena in E3) -- one session holding both is a
- * host-only configuration. The L2 scratch is 2 MiB of heap on first use,
- * freed in close().
+ * Part B section 3.2: S2's arena, attached, so S2's heap stays small) --
+ * one session holding both is a host-only configuration. The L2 scratch
+ * is 2 MiB of heap on first use, freed in close().
  */
 
 #include <stdlib.h>
@@ -106,8 +107,11 @@ static hexkl_dma_desc2d g_desc[FC_Q4_MAX_LANES][2]
 
 void nntr_hvx_q4m1_free_all(nntr_hvx_session *s) {
   for (uint32_t i = 0; i < NNTR_HVX_Q4M1_SLOTS; ++i) {
-    free(s->q4m1[i].w);
+    if (!s->q4m1[i].borrowed) {
+      free(s->q4m1[i].w);
+    }
     s->q4m1[i].w = NULL;
+    s->q4m1[i].borrowed = 0;
   }
   free(s->fc_l2);
   s->fc_l2 = NULL;
@@ -142,11 +146,53 @@ int nntr_hvx_q4m1_register(remote_handle64 handle, uint32 K, uint32 N,
       s->q4m1[i].w = p;
       s->q4m1[i].K = K;
       s->q4m1[i].N = N;
+      s->q4m1[i].borrowed = 0;
       *h = i;
       return AEE_SUCCESS;
     }
   }
   return AEE_EBADITEM;
+}
+
+int nntr_hvx_q4m1_attach(remote_handle64 handle, uint32 arena, uint32 off,
+                         uint32 K, uint32 N, uint32 *h) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s || !h) {
+    return AEE_EBADPARM;
+  }
+  if (K == 0u || K % 64u != 0u || K > FC_Q4_MAX_K || N == 0u ||
+      N % Q4M1_GROUP != 0u || off % 128u != 0u ||
+      arena >= NNTR_HVX_MAX_ARENAS || s->arenas[arena].va == NULL ||
+      (uint64_t)off + q4m1_bytes(K, N) > s->arenas[arena].bytes) {
+    FARF(ERROR, "q4m1_attach: bad weight (arena=%u off=%u K=%u N=%u)",
+         (unsigned)arena, (unsigned)off, (unsigned)K, (unsigned)N);
+    return AEE_EINVALIDFORMAT;
+  }
+  for (uint32_t i = 0; i < NNTR_HVX_Q4M1_SLOTS; ++i) {
+    if (s->q4m1[i].w == NULL) {
+      /* no copy and no cache maintenance: the ARM wrote the uncached
+         arena before this call and the DSP never writes it, so no line
+         of it is dirty here when the feed's DMA reads DDR around the L2 */
+      s->q4m1[i].w = s->arenas[arena].va + off;
+      s->q4m1[i].K = K;
+      s->q4m1[i].N = N;
+      s->q4m1[i].borrowed = 1;
+      *h = i;
+      return AEE_SUCCESS;
+    }
+  }
+  return AEE_EBADITEM;
+}
+
+int nntr_hvx_q4m1_borrows(const nntr_hvx_session *s, const uint8_t *va,
+                          uint32_t bytes) {
+  for (uint32_t i = 0; i < NNTR_HVX_Q4M1_SLOTS; ++i) {
+    if (s->q4m1[i].borrowed && s->q4m1[i].w >= va &&
+        s->q4m1[i].w < va + bytes) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 int nntr_hvx_q4m1_release(remote_handle64 handle, uint32 h) {
@@ -160,8 +206,11 @@ int nntr_hvx_q4m1_release(remote_handle64 handle, uint32 h) {
   if (hexkl_graph_uses_q4m1(s->graph, h)) {
     return AEE_EBADSTATE; /* a resident op names it (graph_release first) */
   }
-  free(s->q4m1[h].w);
+  if (!s->q4m1[h].borrowed) {
+    free(s->q4m1[h].w);
+  }
   s->q4m1[h].w = NULL;
+  s->q4m1[h].borrowed = 0;
   return AEE_SUCCESS;
 }
 

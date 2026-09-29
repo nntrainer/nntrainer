@@ -53,10 +53,13 @@
  *  the weights themselves are on the heap. */
 #define NNTR_HVX_Q4M1_SLOTS 80
 
-/** @brief One Q4M1 weight on the DSP heap (memalign 128). w NULL = free. */
+/** @brief One Q4M1 weight on the DSP heap (memalign 128), or [#132 Part B
+ *  E3] borrowed from an attached arena (q4m1_attach: never freed here).
+ *  w NULL = free. */
 typedef struct {
   uint8_t *w;
   uint32_t K, N;
+  uint32_t borrowed; /**< 1: w points into an arena (q4m1_attach) */
 } nntr_hvx_q4m1_slot;
 
 /** @brief One host rpcmem buffer as the DSP sees it. va NULL means free. */
@@ -144,6 +147,11 @@ void nntr_hvx_token_shutdown(nntr_hvx_session *s);
 /** @brief [#132 PR 2] Frees every Q4M1 slot and the L2 feed scratch. Lives
  *  in nntr_hvx_fc_q4.c. */
 void nntr_hvx_q4m1_free_all(nntr_hvx_session *s);
+
+/** @brief [#132 Part B E3] Whether a Q4M1 slot borrows from [va, va +
+ *  bytes) (arena_detach refuses then). Lives in nntr_hvx_fc_q4.c. */
+int nntr_hvx_q4m1_borrows(const nntr_hvx_session *s, const uint8_t *va,
+                          uint32_t bytes);
 
 /**
  * @brief [#132 Part B] One Q4M1 FC over @a lanes pool threads: y (N) =
