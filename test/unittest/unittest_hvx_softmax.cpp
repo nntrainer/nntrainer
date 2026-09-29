@@ -458,8 +458,10 @@ TEST_F(HvxM1Ops, QkNormMatchesDetBitExact) {
   }
 }
 
-/** @brief RoPE on 32 q + 8 k heads at positions 0, 1, 511, 1023, 4095;
- *         position 0 is also the identity bit for bit. */
+/** @brief RoPE (fp16 since #152) on 32 q + 8 k heads at positions 0, 1,
+ *         511, 1023, 4095; position 0 is also the fp16-rounded input, by
+ *         value (a -0 input with a negative b comes out +0, as the CPU's
+ *         fsub does). */
 TEST_F(HvxM1Ops, Rope64MatchesDetBitExact) {
   const uint32_t n_q = 32, n_k = 8, n = (n_q + n_k) * 64u;
   std::mt19937 rng(0x82000004u);
@@ -484,8 +486,11 @@ TEST_F(HvxM1Ops, Rope64MatchesDetBitExact) {
               << n << std::endl;
     EXPECT_EQ(bad, 0) << "pos " << pos << ": differs from the spec";
     if (pos == 0u) {
-      EXPECT_EQ(m1_count_bad(y, qk, "rope64 identity"), 0)
-        << "position 0 is not the identity";
+      int bad_id = 0;
+      for (uint32_t i = 0; i < n; ++i) {
+        bad_id += y[i] != attn_m1_det_rne16(qk[i]);
+      }
+      EXPECT_EQ(bad_id, 0) << "position 0 is not the fp16 identity";
     }
   }
 }

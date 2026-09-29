@@ -212,6 +212,15 @@ static void mut_rope_head_dim_32(uint32_t *w, uint32_t *n) {
   op->gqa = 6u;
   (void)n;
 }
+static void mut_attn_head_dim_32(uint32_t *w, uint32_t *n) {
+  /* K = 3072 = (4 + 2) x 16 x 32 and N = 2048 = 4 x 16 x 32: consistent,
+     so only #152's head_dim 64 rule (the fp16 CPU order) can refuse it */
+  htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_ATTN_M1, 2));
+  op->head_dim = 32u;
+  op->n_kv = 16u;
+  op->gqa = 4u;
+  (void)n;
+}
 static void mut_qk_norm_head_dim_96(uint32_t *w, uint32_t *n) {
   /* K = 3072 = (2 + 2) x 8 x 96: consistent, and the per-head norm's
      chunk would not be a power of two */
@@ -285,6 +294,8 @@ static const struct {
   {"RMSNORM eps_bits 0", mut_eps_zero, HTP_GRAPH_E_INVALIDFORMAT},
   {"ROPE before QK_NORM", mut_rope_before_qk_norm, HTP_GRAPH_E_INVALIDITEM},
   {"ROPE resident at head_dim 32", mut_rope_head_dim_32,
+   HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+  {"ATTN_M1 resident at head_dim 32", mut_attn_head_dim_32,
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
   {"ATTN_M1 resident, its ROPE not", mut_attn_without_rope,
    HTP_GRAPH_E_NOTALLOWED},

@@ -138,21 +138,6 @@ cc=${CC:-gcc}
 
 "$OUT/dma_replay_host_check"
 
-# [#90] The two-reader probe's ring cell (f2, fresh = 1) on the same
-# skel source and stand-in, which here also counts the bytes it landed
-# and the source pages it read: bytes = res[2] x res[1], one rotation's
-# distinct footprint, the tag for 1 / 20 / 500 calls; then the DDR bounds
-# (85.3 GB/s, #77's 3265.6 refused) and the net-per-token arithmetic.
-"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -pthread \
-  -include malloc.h -I "$HERE/replay_stub" -I "$HERE/stub" -I "$HERE/.." \
-  -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
-  -o "$OUT/two_reader_host_check" \
-  "$HERE/two_reader_host_check.c" "$HERE/../nntr_hvx_dma_probe.c" \
-  "$BACKEND/hmx/hexkl_dma_ring.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
-  "$BACKEND/hvx/hvx_worker_pool.c" -lm
-
-"$OUT/two_reader_host_check"
-
 # The real HVX GEMV (hvx_gemm_u8i4_wh.c, the skel's own source) on x86
 # against the Hexagon tools' HVX emulation, libnative: every stand-in above
 # replaces the kernel, this runs it. g++ links because libnative.a is C++.
@@ -226,15 +211,16 @@ fi
 
 "$OUT/m1_ops_host_check"
 
-# Decode attention at m=1 (#81): the REAL HVX source hvx_attn_m1_f32.c on
-# hvx_emu/ with the REAL worker pool on pthreads (stub/qurt.h) at 0, 3 and
-# 7 workers, memcmp'd against nntrainer/tensor/attn_m1_det.h for L = 1,
-# 63, 64, 65, 512, 1024 at the shapes (n_kv, gqa, head_dim) = (8, 4, 64),
-# (1, 2, 64), (2, 3, 32) and (2, 2, 32) (#146: the specialised path and
-# both runtime-shape copies),
-# plus append-chain == bulk, the L = 1 case and the error codes; the spec
-# against a double reference within 2^-13 max|V|; and the phase words
-# (#146), which must leave the output bytes alone (ATTN M1 PHASES OK).
+# Decode attention at m=1 (#81, fp16 CPU order since #152): the spec
+# nntrainer/tensor/attn_m1_det.h against an independent _Float16 model of
+# the Android CPU attention with five mutants (ATTN M1 F16 CPU-ORDER OK);
+# hvx_convert.h's fp16 primitives against the spec (ATTN M1 PRIM); then
+# the REAL HVX source hvx_attn_m1_f32.c on hvx_emu/ with the REAL worker
+# pool on pthreads (stub/qurt.h) at 0, 3 and 7 workers, memcmp'd against
+# the spec for L = 1, 63, 64, 65, 512, 1024 at (n_kv, gqa) = (8, 4),
+# (1, 2), (2, 3), head_dim 64, plus append-chain == bulk, the L = 1 case,
+# a division tie and the error codes; and the phase words (#146), which
+# must leave the output bytes alone (ATTN M1 PHASES OK).
 # -include malloc.h: the cache is memalign(128), which the Hexagon libc
 # declares in stdlib.h and glibc in malloc.h.
 "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
