@@ -153,9 +153,28 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
 #ifndef ROUTER_CHAINS
 #define ROUTER_CHAINS 8u
 #endif
+/** @brief L1 prefetch distance of the chain loop, in rows (a hint: the
+ *  bits do not depend on it). ISS, one 8-chain group at K = 2048: 47.7k
+ *  pcycles without it, 15.7k at 4 / 8 / 16 rows, 25.0k at 32. */
+#ifndef ROUTER_L1_AHEAD
+#define ROUTER_L1_AHEAD 8u
+#endif
 
 /** @brief Experts e0 .. e0 + ROUTER_CHAINS - 1 of the w32 rows: one fused
  *         chain each over k in order (the CPU's sgemv_n fmadd). */
+/** @brief One k of the chains: acc[j] = fma(x[k], w32[k][e0 + j], acc[j]).
+ *  w32 is at least 8-byte aligned (malloc's, the graph's memalign), a row
+ *  128 bytes, e0 a multiple of 8 floats: paired loads. */
+#define ROUTER_STEP(k)                                                         \
+  do {                                                                         \
+    const float xk_ = x[(k)];                                                  \
+    const float *row_ = (const float *)__builtin_assume_aligned(               \
+      w32 + (size_t)(k)*LANES + e0, 8);                                        \
+    for (uint32_t j_ = 0; j_ < ROUTER_CHAINS; ++j_) {                          \
+      acc[j_] = Q6_R_sfmpyacc_RR(acc[j_], xk_, row_[j_]);                      \
+    }                                                                          \
+  } while (0)
+
 static inline __attribute__((always_inline)) void
 router_chains(const float *x, const float *w32, uint32_t K, uint32_t e0,
               float *out) {
@@ -174,15 +193,23 @@ router_chains(const float *x, const float *w32, uint32_t K, uint32_t e0,
                       (uint64_t)ROUTER_PF_ROWS);
     }
 #endif
-    for (uint32_t k = k0; k < k1; ++k) {
-      const float xk = x[k];
-      /* w32 is at least 8-byte aligned (malloc's, the graph's memalign),
-         a row 128 bytes, e0 a multiple of 8 floats: paired loads */
-      const float *row = (const float *)__builtin_assume_aligned(
-        w32 + (size_t)k * LANES + e0, 8);
-      for (uint32_t j = 0; j < ROUTER_CHAINS; ++j) {
-        acc[j] = Q6_R_sfmpyacc_RR(acc[j], xk, row[j]);
-      }
+    /* rows up to kpf prefetch the row ROUTER_L1_AHEAD ahead into L1
+       (each k reads a new line, and the loop was bound by that miss:
+       #132 S3, 65528 pcycles/op); the last ROUTER_L1_AHEAD rows do not,
+       so the hint never leaves the buffer and the loop has no test */
+    const uint32_t kpf =
+      K > ROUTER_L1_AHEAD
+        ? (k1 < K - ROUTER_L1_AHEAD ? k1 : K - ROUTER_L1_AHEAD)
+        : k0;
+    uint32_t k = k0;
+    for (; k < kpf; ++k) {
+#if defined(__hexagon__)
+      Q6_dcfetch_A((void *)(w32 + (size_t)(k + ROUTER_L1_AHEAD) * LANES + e0));
+#endif
+      ROUTER_STEP(k);
+    }
+    for (; k < k1; ++k) {
+      ROUTER_STEP(k);
     }
   }
   for (uint32_t j = 0; j < ROUTER_CHAINS; ++j) {
