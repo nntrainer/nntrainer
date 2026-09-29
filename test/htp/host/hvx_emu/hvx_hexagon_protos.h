@@ -445,4 +445,75 @@ HVX_EMU_QF_BINOP(Q6_Vqf32_vsub_VsfVsf, -)
 
 static inline HVX_Vector Q6_Vsf_equals_Vqf32(HVX_Vector a) { return a; }
 
+/* ==== moves, packs, masked stores, prefetch (#170 round 2) ===============
+ *
+ * Bit moves only, written from the PRM's pseudocode: vshuff's swap network
+ * (Vdd.v[0] = Vv, Vdd.v[1] = Vu, then for each offset bit set in Rt swap
+ * v[1].ub[k] with v[0].ub[k + offset] where k lacks that bit -- Rt = -2
+ * interleaves halfwords, -4 words, Vv's element first), vpacke (the low
+ * halfword of each word, Vv's first), vunpack (halfwords zero-extended,
+ * lanes 0..31 to lo), the byte-masked aligned store and l2fetch, a
+ * prefetch hint with no architectural effect (a no-op here). The ISS runs
+ * of plan 170 round 2 matched these on the kernel's patterns. */
+
+static inline HVX_VectorPair Q6_W_vshuff_VVR(HVX_Vector u, HVX_Vector v,
+                                             int32_t rt) {
+  HVX_VectorPair w;
+  w.lo = v;
+  w.hi = u;
+  uint8_t *lo = (uint8_t *)w.lo.w, *hi = (uint8_t *)w.hi.w;
+  for (int off = 1; off < 4 * HVX_EMU_LANES; off <<= 1) {
+    if (rt & off) {
+      for (int k = 0; k < 4 * HVX_EMU_LANES; ++k) {
+        if (!(k & off)) {
+          const uint8_t t = hi[k];
+          hi[k] = lo[k + off];
+          lo[k + off] = t;
+        }
+      }
+    }
+  }
+  return w;
+}
+
+static inline HVX_Vector Q6_Vh_vpacke_VwVw(HVX_Vector u, HVX_Vector v) {
+  HVX_Vector r;
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    hvx_emu_set_h(&r, i, (uint16_t)v.w[i]);
+    hvx_emu_set_h(&r, i + HVX_EMU_LANES, (uint16_t)u.w[i]);
+  }
+  return r;
+}
+
+static inline HVX_VectorPair Q6_Wuw_vunpack_Vuh(HVX_Vector u) {
+  HVX_VectorPair w;
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    w.lo.w[i] = (int32_t)hvx_emu_h(&u, i);
+    w.hi.w[i] = (int32_t)hvx_emu_h(&u, i + HVX_EMU_LANES);
+  }
+  return w;
+}
+
+/* if (Qv) vmem(Rt) = Vs: the bytes whose flag is set. The hardware drops
+   the address's low 7 bits; a kernel that passes an unaligned one is wrong
+   there, so the emulation stops. */
+static inline void Q6_vmem_QRIV(HVX_VectorPred q, HVX_Vector *addr,
+                                HVX_Vector v) {
+  if ((uintptr_t)addr & (4u * HVX_EMU_LANES - 1u)) {
+    __builtin_trap();
+  }
+  uint8_t *dst = (uint8_t *)addr;
+  const uint8_t *src = (const uint8_t *)v.w;
+  for (int i = 0; i < 4 * HVX_EMU_LANES; ++i) {
+    if (q.q[i]) {
+      dst[i] = src[i];
+    }
+  }
+}
+
+static inline void Q6_l2fetch_AP(void *addr, uint64_t cfg) {
+  (void)addr;
+  (void)cfg;
+}
+
 #endif /* __NNTRAINER_HVX_EMU_HVX_HEXAGON_PROTOS_H__ */
