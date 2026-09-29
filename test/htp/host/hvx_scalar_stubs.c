@@ -91,6 +91,11 @@ void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
     func(1u, 0, ctx);
 }
 void hvx_worker_pool_wait(hvx_worker_pool *pool) { (void)pool; }
+/* No workers: the MoE feed's GU(0) job (#185) takes its run fallback. */
+uint32_t hvx_worker_pool_workers(const hvx_worker_pool *pool) {
+  (void)pool;
+  return 0u;
+}
 /* The background lane, likewise: every unit runs at submit, in order, and
    the waits find them done. What this checks is that the kernel waits for
    the right block before it queues it -- a wait for too few units cannot

@@ -62,6 +62,8 @@ static void gemv_log_reset(void) { g_gemv_n = 0; }
    only inside run_m1_case with the feed set (g_score_on): the HMX path's
    chunked pushes are read by the HMX stand-in, not by columns. */
 static uint32_t g_lane; /* set by the pool stand-in below */
+/* The device pool's lanes: 5 workers + the caller. */
+#define PF_LANES 6u
 #define SCORE_MAX 256u
 /* #177: a push may also be one lane's slice of a matrix (lane >= 0), issued
    on that lane's own queue inside pool run `run`, with its descriptor. */
@@ -81,9 +83,30 @@ static uint32_t g_run;
 /* Set only by the timeout case in run_m1_cases. */
 static int g_lane_timeout;
 static const uint8_t *g_vtcm_lo, *g_vtcm_hi;
+/* #185: the pool stand-ins' state. g_workers is the pool's worker count
+   (the caller is not one): a submitted job runs on min(n, g_workers) lanes,
+   a run on min(n, g_workers + 1). A submitted job is pending until the
+   wait; g_in_run is set while a run's or a job's lanes execute. */
+static uint32_t g_workers = PF_LANES - 1u, g_pending, g_in_run, g_submits;
+/* #185: the dataflow scoreboard. The stand-ins report every buffer they
+   read or write (hvx_scalar_hook.buf); inside one run or job, a read and a
+   write -- or two writes -- of overlapping bytes from two different lanes
+   are a race on the device, where the lanes run at once, and a silent pass
+   here, where they run one after another. Same-lane accesses of one kind
+   are merged, so a run's table stays a few entries per lane. */
+typedef struct {
+  const uint8_t *lo, *hi;
+  uint32_t lane;
+  int w;
+} df_access;
+#define DF_MAX 1024u
+static df_access g_df[DF_MAX];
+static uint32_t g_df_n, g_df_bad;
+static uint64_t g_df_seen;
 static void score_reset(int on, const uint8_t *vtcm, size_t vtcm_bytes) {
   g_score_n = g_score_bad = g_score_waits = g_score_vtcm_reads = 0;
   g_lane_waits = 0;
+  g_pending = g_in_run = g_df_n = 0;
   g_score_on = on ? 1u : 0u;
   g_vtcm_lo = vtcm;
   g_vtcm_hi = vtcm + vtcm_bytes;
@@ -168,7 +191,6 @@ static void gemv_stand_in(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
    two blocks earlier, and fetched once. Every box must also sit inside its
    weight's columns, fit the l2fetch's 16-bit fields, and go out with at
    most two others still unread. */
-#define PF_LANES 6u
 #define PF_RING 4u
 typedef struct {
   const uint8_t *wh;
@@ -268,6 +290,43 @@ static void hook_gemv(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
   ++g_nopf_n;
   gemv_stand_in(act_ah, m, k_tiles, wh, n_col, nt, out);
 }
+/* #185: the stand-ins' buffer hook (the dataflow scoreboard above). Only
+   on the feed cells and inside a run or job; the caller's own accesses
+   between runs are ordered by the joins. */
+static void hook_buf(const void *p, size_t bytes, int write) {
+  const uint8_t *lo = (const uint8_t *)p, *hi = lo + bytes;
+  if (!g_score_on || !g_in_run)
+    return;
+  ++g_df_seen;
+  for (uint32_t k = 0; k < g_df_n; ++k) {
+    const df_access *a = &g_df[k];
+    if (a->lane != g_lane && (a->w || write) && lo < a->hi && a->lo < hi) {
+      ++g_df_bad;
+      if (g_score_bad++ < 4u)
+        printf("FEED cross-lane RAW/WAR in run %u: lane %u %s +%zu B, lane %u "
+               "%s it\n",
+               g_run, g_lane, write ? "writes" : "reads", bytes, a->lane,
+               a->w ? "writes" : "reads");
+      return;
+    }
+  }
+  for (uint32_t k = 0; k < g_df_n; ++k) {
+    df_access *a = &g_df[k];
+    if (a->lane == g_lane && a->w == write && lo <= a->hi && a->lo <= hi) {
+      a->lo = lo < a->lo ? lo : a->lo;
+      a->hi = hi > a->hi ? hi : a->hi;
+      return;
+    }
+  }
+  if (g_df_n == DF_MAX) {
+    ++g_df_bad;
+    if (g_score_bad++ < 4u)
+      printf("FEED dataflow table full in run %u\n", g_run);
+    return;
+  }
+  g_df[g_df_n++] = (df_access){lo, hi, g_lane, write};
+}
+
 /* ---- DMA ring: completes immediately, so a push issued while the
    destination is still live shows up as a wrong result. ---- */
 void hexkl_dma_ring_reset(void) {}
@@ -398,46 +457,63 @@ static void score_run_end(void) {
     }
 }
 
-/* The pool runs everything on the caller, which is what its own NULL path
-   does for n_units <= 1. Doing it here rather than passing NULL keeps the
-   kernel's call sites exercised: the range arithmetic they hand the worker
-   is part of what this check is for. */
+/* The pool runs every lane on the caller, one after another. Doing it here
+   rather than passing NULL keeps the kernel's call sites exercised: the
+   range arithmetic they hand the worker is part of what this check is
+   for. On the feed cells a run or job started inside another, or while a
+   submitted job is still pending (#185: the kernel must join it first,
+   or the join is lost), is a schedule error. */
+static void pool_lanes(hvx_worker_pool_func func, void *ctx, uint32_t n) {
+  if (g_score_on && (g_in_run || g_pending) && g_score_bad++ < 4u)
+    printf(g_in_run ? "FEED nested pool run\n"
+                    : "FEED pool used while a submitted job is in flight\n");
+  g_pending = 0; /* the real run and submit wait for it first */
+  ++g_run;
+  g_df_n = 0;
+  g_in_run = 1;
+  /* The degenerate branch is func(1, 0): writing it the way the real
+     function's used to be -- func(n_units, 0, ctx) -- is what this check
+     caught first time out; that form means "worker 0 of n_units" and does
+     1/n_units of the work. */
+  for (uint32_t i = 0; i < (n > 1u ? n : 1u); ++i) {
+    g_lane = i;
+    func(n > 1u ? n : 1u, i, ctx);
+  }
+  g_lane = 0;
+  g_in_run = 0;
+  score_run_end();
+}
+/* The device's lane count, n = min(n_units, workers + 1), so each lane's
+   slice and its l2fetch boxes are checked as the device splits them. */
 void hvx_worker_pool_run(hvx_worker_pool *pool, hvx_worker_pool_func func,
                          void *ctx, uint32_t n_units) {
   (void)pool;
-  /* The device's lane count, n = min(n_units, 6), one lane after another,
-     so each lane's slice and its l2fetch boxes are checked as the device
-     splits them. The degenerate branch is func(1, 0): writing it the way
-     the real function's used to be -- func(n_units, 0, ctx) -- is what this
-     check caught first time out; that form means "worker 0 of n_units"
-     and does 1/n_units of the work. */
-  const uint32_t n = n_units < PF_LANES ? n_units : PF_LANES;
-  ++g_run;
-  if (n <= 1u) {
-    g_lane = 0;
-    func(1u, 0, ctx);
-    score_run_end();
-    return;
-  }
-  for (uint32_t i = 0; i < n; ++i) {
-    g_lane = i;
-    func(n, i, ctx);
-  }
-  g_lane = 0;
-  score_run_end();
+  pool_lanes(func, ctx, n_units < g_workers + 1u ? n_units : g_workers + 1u);
 }
-/* submit runs the job to completion on the spot and wait is a no-op: the
-   harness cannot exercise the overlap, only that every job is submitted
-   with the right buffer and retired before that buffer is reused -- which
-   a job that ran late would show as a wrong result on device and cannot
-   show here. The device tests are where the ordering is checked. */
+/* submit: the workers only, n = min(n_units, workers) -- lane i is worker
+   i + 1 on the device -- run to completion on the spot; the job then stays
+   pending until the wait. With no workers it runs inline, as the real one
+   does, and nothing is pending. The harness cannot exercise the overlap
+   with the caller, only that the job is joined before the pool is used
+   again and before its buffers are; the device tests check the timing. */
 void hvx_worker_pool_submit(hvx_worker_pool *pool, hvx_worker_pool_func func,
                             void *ctx, uint32_t n_units) {
   (void)pool;
-  if (n_units != 0u)
-    func(1u, 0, ctx);
+  if (n_units == 0u)
+    return;
+  pool_lanes(func, ctx,
+             g_workers ? (n_units < g_workers ? n_units : g_workers) : 1u);
+  g_pending = g_workers != 0u;
+  ++g_submits;
 }
-void hvx_worker_pool_wait(hvx_worker_pool *pool) { (void)pool; }
+void hvx_worker_pool_wait(hvx_worker_pool *pool) {
+  (void)pool;
+  g_pending = 0;
+}
+uint32_t hvx_worker_pool_workers(const hvx_worker_pool *pool) {
+  (void)pool;
+  return g_workers;
+}
 /* The background lane, likewise: every unit runs at submit, in order, and
    the waits find them done. What this checks is that the kernel waits for
    the right block before it queues it -- a wait for too few units cannot
@@ -937,17 +1013,17 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
    expert holds all four tokens, then 3, 2 and seven singles; then M=1 to
    three and to five experts, the odd counts the feed's slab schedule
    (#117) branches on: the slab whose last gate_up is expert n-2 takes its
-   downs first, and a fifth expert's down reuses a slot. The active
+   downs first, and a fifth expert's down reuses a slot; then M=1 to one
+   and to two experts (#185: n < 4, with and without a run B). The active
    experts are spread over the table with empties between them, at a
    stride coprime to the count so no two land on one slot. */
 static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
                         hexkl_moe_scratch *scratch) {
-  static const uint32_t counts[5][10] = {{1, 1, 1, 1},
-                                         {2, 2, 1, 1, 1, 1},
-                                         {4, 3, 2, 1, 1, 1, 1, 1, 1, 1},
-                                         {1, 1, 1},
-                                         {1, 1, 1, 1, 1}};
-  static const uint32_t Ms[5] = {1, 2, 4, 1, 1};
+  static const uint32_t counts[7][10] = {
+    {1, 1, 1, 1}, {2, 2, 1, 1, 1, 1}, {4, 3, 2, 1, 1, 1, 1, 1, 1, 1},
+    {1, 1, 1},    {1, 1, 1, 1, 1},    {1},
+    {1, 1}};
+  static const uint32_t Ms[7] = {1, 2, 4, 1, 1, 1, 1};
   /* #113's matrix, run inside one build: the five leads the device sweep
      measures x the two row loops, plus the build's own defaults (the tune
      bits clear), which is what a run that sets no env var gets; since
@@ -963,7 +1039,7 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
     const uint32_t K = shape ? 2048 : 64, inter = shape ? 1792 : 32,
                    N_out = shape ? 2048 : 64, NE = shape ? 32 : 12;
     uint32_t *rc_ = (uint32_t *)calloc(NE, sizeof(uint32_t));
-    for (int c = 0; c < 5; ++c) {
+    for (int c = 0; c < 7; ++c) {
       memset(rc_, 0, sizeof(uint32_t) * NE);
       for (uint32_t i = 0; i < 10 && counts[c][i] != 0u; ++i)
         rc_[(i * 5u) % NE] = counts[c][i];
@@ -1006,10 +1082,11 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
   if (fail)
     printf("M1 GEMV PATH DIFFERS FROM HMX PATH\n");
   else
-    printf("M1 GEMV PATH BIT-IDENTICAL TO HMX PATH (M=1,2,4, 3 and 5 experts; "
-           "tiny+real; "
-           "%u lead x loop configurations, feed=arena,vtcm)\n",
-           (unsigned)(1u + 2u * n_pairs));
+    printf(
+      "M1 GEMV PATH BIT-IDENTICAL TO HMX PATH (M=1,2,4, 1, 2, 3 and 5 experts; "
+      "tiny+real; "
+      "%u lead x loop configurations, feed=arena,vtcm)\n",
+      (unsigned)(1u + 2u * n_pairs));
   printf(g_pf_lead_ok
            ? "M1 GEMV PREFETCH LEAD COVERS EVERY COLUMN (lanes=%u; leads "
              "0/192/384/768/1536 KB x rows4,rows1; build default %u KB "
@@ -1055,6 +1132,34 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
       g_q_ok = 0;
     }
   }
+  /* #185: N = 4 queues on a pool of 3 workers, fewer than the queues: the
+     call must still use all four (a run's lanes include the caller) and
+     match the HMX path. */
+  {
+    static const uint32_t K = 64, inter = 32, N_out = 64, NE = 12;
+    uint32_t rc_[12] = {0};
+    float ref[64];
+    for (uint32_t i = 0; i < 4u; ++i)
+      rc_[(i * 5u) % NE] = 1u;
+    g_workers = 3u;
+    const int f = run_m1_case(
+      "tiny", 1u, K, inter, N_out, NE, rc_, 64u, vtcm, vtcm_bytes, scratch,
+      HEXKL_MOE_FLAG_M1_GEMV | HEXKL_MOE_FLAG_GEMV_FEED_SET |
+        HEXKL_MOE_FLAG_GEMV_FEED | (3u << HEXKL_MOE_DMA_Q_SHIFT),
+      ref, 0);
+    g_workers = PF_LANES - 1u;
+    printf("M1 FEED QUEUES 3-WORKER POOL %s (N=4, fed=4, bit-identical)\n",
+           f ? "WRONG" : "OK");
+    fail |= f;
+  }
+  if (g_df_bad == 0u && g_df_seen != 0u)
+    printf("M1 FEED DATAFLOW OK (%llu buffer accesses in feed runs; no "
+           "cross-lane RAW/WAR/WAW inside a run)\n",
+           (unsigned long long)g_df_seen);
+  else
+    printf("M1 FEED DATAFLOW WRONG (%u races, %llu accesses)\n", g_df_bad,
+           (unsigned long long)g_df_seen);
+  fail |= g_df_bad != 0u || g_df_seen == 0u;
   if (g_q_ok && g_q_cells != 0u)
     printf("M1 FEED QUEUES OK (n=2,3,4; %u cells, %llu slices, %llu lane "
            "waits; each slice waited by its lane in its run, read in a later "
@@ -1080,6 +1185,7 @@ int main(void) {
   const uint32_t M = 37, K = 64, inter = 32, N_out = 64, NE = 5;
   hvx_scalar_hook.prefetch = hook_prefetch;
   hvx_scalar_hook.gemv = hook_gemv;
+  hvx_scalar_hook.buf = hook_buf;
   static uint8_t vtcm[8u << 20];
 
   hexkl_moe_layout L;

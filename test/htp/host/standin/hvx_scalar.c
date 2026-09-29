@@ -23,7 +23,13 @@
 #include <stddef.h>
 #include <string.h>
 
-hvx_scalar_hooks hvx_scalar_hook = {NULL, NULL};
+hvx_scalar_hooks hvx_scalar_hook = {NULL, NULL, NULL};
+
+/** @brief Reports a buffer access to a check's hook, if any. */
+static void buf(const void *p, size_t bytes, int write) {
+  if (hvx_scalar_hook.buf && bytes != 0u)
+    hvx_scalar_hook.buf(p, bytes, write);
+}
 
 /* ---- the HMX accumulator: one 64 x 32 int32 tile ---- */
 static int32_t g_acc[64][32];
@@ -67,6 +73,8 @@ int hexkl_micro_hmx_acc_read_int32(uint8_t *base, uint32_t cfg, uint32_t off) {
 void hvx_scalar_gemv(const uint8_t *act_ah, uint32_t m, uint32_t k_tiles,
                      const uint8_t *wh, uint32_t n_col, uint32_t nt,
                      int32_t *out) {
+  if (m != 0u && k_tiles != 0u)
+    buf(act_ah, (size_t)(k_tiles - 1u) * 2048u + (size_t)m * 32u, 0);
   for (uint32_t r = 0; r < m; ++r)
     for (uint32_t c = 0; c < 32; ++c) {
       int32_t s = 0;
@@ -107,6 +115,9 @@ void hvx_quant_rows_u8_params(const float *x, uint32_t m, uint32_t mp,
                               uint32_t k, float *scale, int32_t *zp,
                               hvx_worker_pool *p) {
   (void)p;
+  buf(x, sizeof(float) * (size_t)m * k, 0);
+  buf(scale, sizeof(float) * mp, 1);
+  buf(zp, sizeof(int32_t) * mp, 1);
   for (uint32_t r = 0; r < mp; ++r) {
     float lo = 0.f, hi = 0.f;
     if (r < m)
@@ -137,6 +148,15 @@ void hvx_quant_pack_u8_ah_rows(const float *x, const uint32_t *map, uint32_t m0,
                                uint32_t m1, uint32_t k, const float *scale,
                                const int32_t *zp, uint8_t *out) {
   const uint32_t kt_n = k / 32u;
+  if (m1 > m0) {
+    for (uint32_t r = m0; r < m1; ++r)
+      buf(x + (map ? map[r] : r) * (size_t)k, sizeof(float) * k, 0);
+    buf(scale + m0, sizeof(float) * (m1 - m0), 0);
+    buf(zp + m0, sizeof(int32_t) * (m1 - m0), 0);
+    /* The whole 64-row blocks the rows fall in: over-covers, never under. */
+    buf(out + (size_t)(m0 / 64u) * kt_n * 2048u,
+        (size_t)((m1 + 63u) / 64u - m0 / 64u) * kt_n * 2048u, 1);
+  }
   for (uint32_t r = m0; r < m1; ++r)
     for (uint32_t kt = 0; kt < kt_n; ++kt)
       for (uint32_t j = 0; j < 32; ++j) {
@@ -165,11 +185,13 @@ int hvx_quant_pack_u8_ah(const float *x, uint32_t m, uint32_t mp, uint32_t k,
   return hvx_quant_pack_u8_ah_mapped(x, NULL, m, mp, k, scale, zp, out, p);
 }
 
-void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
-                                 uint32_t m, const float *as, const int32_t *az,
-                                 const int32_t *cs, const float *ws,
-                                 const float *bias, float *out,
-                                 uint32_t ostride, int accumulate) {
+/* The tile dequant without the buffer hook: the pooled workers below call
+   it on their own stack tiles, which lanes run one after another on the
+   host share, so reporting those would be a false cross-lane race. */
+static void dq_tile(const int32_t *tile, uint32_t stride, uint32_t m,
+                    const float *as, const int32_t *az, const int32_t *cs,
+                    const float *ws, const float *bias, float *out,
+                    uint32_t ostride, int accumulate) {
   for (uint32_t r = 0; r < m; ++r)
     for (uint32_t c = 0; c < 32; ++c) {
       float v = ((float)(tile[(size_t)r * stride + c] - az[r] * cs[c])) *
@@ -180,6 +202,17 @@ void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
       else
         out[(size_t)r * ostride + c] = v;
     }
+}
+void hvx_dequant_acc_tile_to_f32(const int32_t *tile, uint32_t stride,
+                                 uint32_t m, const float *as, const int32_t *az,
+                                 const int32_t *cs, const float *ws,
+                                 const float *bias, float *out,
+                                 uint32_t ostride, int accumulate) {
+  buf(as, sizeof(float) * m, 0);
+  buf(az, sizeof(int32_t) * m, 0);
+  for (uint32_t r = 0; r < m; ++r)
+    buf(out + (size_t)r * ostride, sizeof(float) * 32u, 1);
+  dq_tile(tile, stride, m, as, az, cs, ws, bias, out, ostride, accumulate);
 }
 /* The DDR fallback's whole-matrix dequant (accumulator layout unusable):
    the same formula per element, row stride n. */
@@ -250,17 +283,22 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
   float gt[64 * 32], ut[64 * 32];
   uint32_t lo, hi;
   slice(c->n_pairs, n_threads, i, &lo, &hi);
+  if (lo < hi) {
+    buf(c->act_scale, sizeof(float) * c->m_count, 0);
+    buf(c->act_zp, sizeof(int32_t) * c->m_count, 0);
+    for (uint32_t r = 0; r < c->m_count; ++r)
+      buf(c->dst + (size_t)r * c->dst_stride + (c->g0 + lo) * 32u,
+          sizeof(float) * (hi - lo) * 32u, 1);
+  }
   for (uint32_t j = lo; j < hi; ++j) {
     const uint32_t cg = (c->g0 + j) * 32u, cu = c->inter + cg;
-    hvx_dequant_acc_tile_to_f32(
-      (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride),
-      c->row_stride, c->m_count, c->act_scale, c->act_zp, c->colsum_w + cg,
-      c->w_scale + cg, c->bias + cg, gt, 32u, 0);
-    hvx_dequant_acc_tile_to_f32(
-      (const int32_t *)(c->tiles_base +
-                        (size_t)(c->n_pairs + j) * c->tile_stride),
-      c->row_stride, c->m_count, c->act_scale, c->act_zp, c->colsum_w + cu,
-      c->w_scale + cu, c->bias + cu, ut, 32u, 0);
+    dq_tile((const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride),
+            c->row_stride, c->m_count, c->act_scale, c->act_zp,
+            c->colsum_w + cg, c->w_scale + cg, c->bias + cg, gt, 32u, 0);
+    dq_tile((const int32_t *)(c->tiles_base +
+                              (size_t)(c->n_pairs + j) * c->tile_stride),
+            c->row_stride, c->m_count, c->act_scale, c->act_zp,
+            c->colsum_w + cu, c->w_scale + cu, c->bias + cu, ut, 32u, 0);
     for (uint32_t r = 0; r < c->m_count; ++r)
       for (uint32_t k = 0; k < 32u; ++k)
         c->dst[(size_t)r * c->dst_stride + cg + k] =
@@ -302,15 +340,13 @@ void hvx_dq_mul_worker(uint32_t n_threads, uint32_t i, void *vjob) {
   slice(c->n_pairs, n_threads, i, &lo, &hi);
   for (uint32_t j = lo; j < hi; ++j) {
     const uint32_t col = c->c0 + j * 32u;
-    hvx_dequant_acc_tile_to_f32(
-      (const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride),
-      c->row_stride, c->m_count, c->act_scale, c->act_zp, c->colsum_a + col,
-      c->w_scale_a + col, c->bias_a + col, at, 32u, 0);
-    hvx_dequant_acc_tile_to_f32(
-      (const int32_t *)(c->tiles_base +
-                        (size_t)(c->n_pairs + j) * c->tile_stride),
-      c->row_stride, c->m_count, c->act_scale, c->act_zp, c->colsum_b + col,
-      c->w_scale_b + col, c->bias_b + col, bt, 32u, 0);
+    dq_tile((const int32_t *)(c->tiles_base + (size_t)j * c->tile_stride),
+            c->row_stride, c->m_count, c->act_scale, c->act_zp,
+            c->colsum_a + col, c->w_scale_a + col, c->bias_a + col, at, 32u, 0);
+    dq_tile((const int32_t *)(c->tiles_base +
+                              (size_t)(c->n_pairs + j) * c->tile_stride),
+            c->row_stride, c->m_count, c->act_scale, c->act_zp,
+            c->colsum_b + col, c->w_scale_b + col, c->bias_b + col, bt, 32u, 0);
     for (uint32_t r = 0; r < c->m_count; ++r)
       for (uint32_t k = 0; k < 32u; ++k)
         c->dst[(size_t)r * c->dst_stride + col + k] =
