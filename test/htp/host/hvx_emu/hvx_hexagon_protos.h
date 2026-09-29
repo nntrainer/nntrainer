@@ -23,6 +23,11 @@
  * everywhere; the attention kernel's cache loads are aligned
  * -- a review item), inf/NaN encodings, and timing.
  *
+ * One scalar-core op is emulated too (#164): Q6_R_sfmpyacc_RR, the sffma
+ * instruction, is fmaf -- one IEEE fused multiply-add, which the ISS
+ * matched bit for bit on 784 RMSNORM rows and two subnormal-sum probes
+ * (plan 164 section 0); HvxM1Ops.* re-checks it on silicon.
+ *
  * vror follows the PRM: Vd.ub[i] = Vu.ub[(i + Rt) mod 128]. The reduction
  * that uses it gives the same bits in either direction (IEEE add
  * commutes), which m1_ops_det.h's comment spells out.
@@ -31,6 +36,7 @@
 #ifndef __NNTRAINER_HVX_EMU_HVX_HEXAGON_PROTOS_H__
 #define __NNTRAINER_HVX_EMU_HVX_HEXAGON_PROTOS_H__
 
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -45,6 +51,13 @@ static inline int32_t hvx_emu_w(float f) {
   int32_t w;
   memcpy(&w, &f, sizeof(w));
   return w;
+}
+
+/** @brief sffma: x + s * t with one rounding (the SDK's
+ *         __builtin_HEXAGON_F2_sffma, accumulator first). */
+static inline float Q6_R_sfmpyacc_RR(float x, float s, float t) {
+  volatile float r = fmaf(s, t, x);
+  return r;
 }
 
 static inline HVX_Vector Q6_V_vzero(void) {

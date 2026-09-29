@@ -26,26 +26,29 @@
  *
  * Every step is one f32 multiply, add or subtract, rounded to nearest even
  * on its own, with subnormals kept (LEDGER rule 24: HVX does not flush, so
- * neither may the host). No fused multiply-add, no qf32 (v75 and v79
- * disagree on qf32 -> sf), no divide, no sqrt, no libm. The ORDER is part
- * of the contract: reassociating the reduction or contracting a
- * multiply-add changes the bits. Each scalar operation below stores
- * through a volatile so no compiler can contract or reassociate it.
+ * neither may the host). No qf32 (v75 and v79 disagree on qf32 -> sf), no
+ * libm. Two exceptions, both in the RMSNorm row scale and both exact by
+ * IEEE's definition (#164): one fused multiply-add per square (fmaf; the
+ * Android CPU's fmla, the DSP's sffma), and a square root and a
+ * reciprocal computed in integers, each correctly rounded (no libm sqrt,
+ * no division). The ORDER is part of the contract: reassociating the
+ * reduction, splitting the fused step or fusing any other changes the
+ * bits. Each scalar operation below stores through a volatile so no
+ * compiler can contract or reassociate it.
  *
  *   rmsnorm_det(x[chunk], gamma[chunk], eps), per chunk (2048 for the
- *   hidden norm, 64 for a q/k head):
- *     acc[j]   = 0,  acc[j] = acc[j] + x[32 i + j] * x[32 i + j]  (32 lanes)
- *     sum      = pairwise tree over the lanes: (j, j+16), (j, j+8), (j, j+4),
- *                (j, j+2), (j, j+1) -- what vror + vadd leaves in every lane
- *     d        = sum * (1/chunk) + eps        (1/chunk exact: power of two)
- *     r        = rsqrt_det(d)
- *     y[i]     = (x[i] * r) * gamma[i]        (the CPU's order: scale, then
- *                                               multiply_i(gamma))
- *   rsqrt_det(d):
- *     y = bitcast_f32(0x5F3759DF - (bitcast_u32(d) >> 1))
- *     h = d * 0.5f
- *     three times: t = h*y; t = t*y; t = 1.5f - t; y = y*t
- *
+ *   hidden norm, 64 for a q/k head) -- the Android CPU's
+ *   neon::rms_norm_wrt_width_fp32_intrinsic + multiply_i(gamma), read off
+ *   the shipped libnntrainer.so's aarch64 disassembly (plan 164 section 0):
+ *     acc[j] = 0,  acc[j] = fma(x[16 i + j], x[16 i + j], acc[j]),
+ *              j = 0 .. 15              (four float32x4 fmla accumulators)
+ *     h[k]   = (acc[4k] + acc[4k+1]) + (acc[4k+2] + acc[4k+3])   (faddp x2)
+ *     s      = ((h[0] + h[1]) + h[2]) + h[3]
+ *     d      = s * (1/chunk) + eps  (1/chunk exact: power of two, so this
+ *                                     is the CPU's s / chunk bit for bit)
+ *     r      = RN(1 / RN(sqrt(d)))  (fsqrt then fdiv: two roundings, NOT
+ *                                     the correctly rounded 1/sqrt)
+ *     y[i]   = (x[i] * r) * gamma[i]
  *   rope64_det(x[64], cs[64]),  cs = cos[0..31] | sin[0..31], i < 32 --
  *   in fp16, the Android CPU's compute_rotary_emb_value(__fp16) (#152;
  *   rne16 is attn_m1_det.h's, the operands its copyData / (_FP16) casts):
@@ -81,24 +84,25 @@
  * DOMAIN (the analogue of LEDGER section 4's SiLU/exp argument clamp). The
  * router's exp is exp_det, clamped to [-88, 85] (swiglu_det.h), so its
  * recip_det sees 1 + e in [1, 1 + e^85] and wsum + 1e-6 in [1e-6, 4]: both
- * inside recip_det's seed range. The other ops contain no exp; what bounds
- * their inputs is the rsqrt seed. d >= eps = 1e-5 keeps the seed in the
- * normal range from below; from above, the sum of chunk squares stays
- * finite while |x| < sqrt(FLT_MAX / chunk), about 4e17 at chunk = 2048
- * and 2.3e18 at 64, and a residual row past that is already broken. "fp32
+ * inside recip_det's seed range. The norms contain no exp: d >= eps, a
+ * positive normal (the graph validator requires it), keeps sqrt_rn and
+ * recip_rn on normal inputs with normal results; a sum of squares that
+ * overflows gives d = +inf and r = +0, the CPU's IEEE answer. "fp32
  * inside, narrow once": nothing here narrows -- every op reads and writes
  * f32, and the u8 narrowing is the next FC's quantizer.
  *
- * ACCURACY, for the record. Three Newton-Raphson steps take the magic
- * seed's ~3.4 % to below f32's last bit; the 32-lane tree sum is more
- * accurate than a sequential one, not less. The fixed point is not always
- * the correctly rounded 1/sqrt, and it does not have to be: bit identity
- * between the implementations, not agreement with libm, is the property.
+ * ACCURACY, for the record. The RMSNorm scale is no longer this file's
+ * choice: it is the CPU's, 16 fused chains and two correctly rounded
+ * steps, within about 1.5 ulp of the exact 1/sqrt. Until #164 this was a
+ * 32-lane tree sum and a three-step Newton rsqrt, within 1-3 ulp of the
+ * CPU's r on about half of the decode rows -- enough to flip the rare
+ * element at an fp16 boundary downstream of the q/k norm.
  */
 
 #ifndef __NNTRAINER_M1_OPS_DET_H__
 #define __NNTRAINER_M1_OPS_DET_H__
 
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -109,8 +113,8 @@
 #define M1_DET_LANES 32u
 /** @brief RoPE head dimension: one vector per half head. */
 #define M1_DET_HEAD_DIM 64u
-/** @brief The fast inverse square root seed (Lomont / Quake III). */
-#define M1_DET_RSQRT_SEED 0x5F3759DFu
+/** @brief The CPU RMSNorm's independent fused chains: 4 x float32x4. */
+#define M1_DET_NORM_CHAINS 16u
 
 /** @brief One f32 operation, forced to round on its own (see swiglu_det.h
  *         for why a volatile store and not -ffp-contract). */
@@ -126,6 +130,11 @@ static inline float m1_det_sub(float a, float b) {
   volatile float r = a - b;
   return r;
 }
+/** @brief a * b + c with ONE rounding (IEEE fusedMultiplyAdd). */
+static inline float m1_det_fma(float a, float b, float c) {
+  volatile float r = fmaf(a, b, c);
+  return r;
+}
 
 static inline uint32_t m1_det_bits(float f) {
   uint32_t u;
@@ -138,57 +147,110 @@ static inline float m1_det_float(uint32_t u) {
   return f;
 }
 
-/** @brief 1/sqrt(d), the normative scalar form of hvx_rsqrt_det_sf.
- *         DOMAIN: d a positive normal (the eps floor guarantees it). */
-static inline float m1_rsqrt_det(float d) {
-  float y = m1_det_float(M1_DET_RSQRT_SEED - (m1_det_bits(d) >> 1));
-  const float h = m1_det_mul(d, 0.5f);
-  for (int it = 0; it < 3; ++it) {
-    float t = m1_det_mul(h, y);
-    t = m1_det_mul(t, y);
-    t = m1_det_sub(1.5f, t);
-    y = m1_det_mul(y, t);
+/**
+ * @brief RN(sqrt(d)) in integers, the CPU's fsqrt. DOMAIN: d a positive
+ *        normal or +inf (NaN passes through).
+ *
+ * d = m 2^ee; M = m << s in [2^48, 2^50) with ee - s even, so
+ * sqrt(d) = sqrt(M) 2^((ee-s)/2). q = floor(sqrt(M)) has 25 bits, and
+ * (q + 1) >> 1 rounds to nearest: M is not an odd square (it has at least
+ * 25 trailing zero bits), so the root is never a tie.
+ */
+static inline float m1_sqrt_rn_det(float d) {
+  const uint32_t u = m1_det_bits(d);
+  if (u >= 0x7f800000u) {
+    return d;
   }
-  return y;
+  const int ee = (int)(u >> 23) - 150;
+  const uint64_t m = (u & 0x7fffffu) | 0x800000u;
+  const int s = ((ee - 25) & 1) ? 26 : 25;
+  uint64_t rem = m << s, q = 0, bit = 1ull << 48;
+  while (bit) {
+    if (rem >= q + bit) {
+      rem -= q + bit;
+      q = (q >> 1) + bit;
+    } else {
+      q >>= 1;
+    }
+    bit >>= 2;
+  }
+  uint32_t r = (uint32_t)((q + 1u) >> 1);
+  int E = (ee - s) / 2 + 1;
+  if (r == 1u << 24) {
+    r >>= 1;
+    ++E;
+  }
+  return m1_det_float(((uint32_t)(E + 150) << 23) | (r & 0x7fffffu));
 }
 
 /**
- * @brief The 32-lane sum of squares of @a chunk floats, reduced as the
- *        HVX does it: lane accumulation, then the pairwise tree.
+ * @brief RN(1/q) in integers, the CPU's fdiv 1.0f / q. DOMAIN: q a positive
+ *        normal whose reciprocal is normal (q < 2^126), or +inf (-> +0).
  *
- * IEEE add is commutative bit for bit, so which of a pair's two operands
- * comes first does not matter, and neither does the direction vror
- * rotates: every lane ends with the same bits.
+ * Exact for a power of two; else Q = floor(2^48 / mq) has 25 bits and
+ * (Q + 1) >> 1 rounds to nearest (1/mq is not a dyadic rational, so no
+ * tie). On the DSP the 64-bit divide is __hexagon_udivdi3.
  */
-static inline float m1_sumsq_det(const float *x, uint32_t chunk) {
-  float acc[M1_DET_LANES];
-  for (uint32_t j = 0; j < M1_DET_LANES; ++j) {
+static inline float m1_recip_rn_det(float q) {
+  const uint32_t u = m1_det_bits(q);
+  if (u >= 0x7f800000u) {
+    return u == 0x7f800000u ? 0.0f : q;
+  }
+  const int Eq = (int)(u >> 23) - 150;
+  const uint64_t mq = (u & 0x7fffffu) | 0x800000u;
+  if (mq == 0x800000u) {
+    return m1_det_float((uint32_t)(-Eq - 23 + 127) << 23);
+  }
+  uint32_t r = (uint32_t)(((1ull << 48) / mq + 1u) >> 1);
+  int E = -47 - Eq;
+  if (r == 1u << 24) {
+    r >>= 1;
+    ++E;
+  }
+  return m1_det_float(((uint32_t)(E + 150) << 23) | (r & 0x7fffffu));
+}
+
+/** @brief s from the 16 chains: two faddp per float32x4, then the four
+ *         in order -- ((h0 + h1) + h2) + h3. */
+static inline float m1_norm_reduce_det(const float *acc) {
+  float h[4];
+  for (uint32_t k = 0; k < 4u; ++k) {
+    h[k] = m1_det_add(m1_det_add(acc[4u * k], acc[4u * k + 1u]),
+                      m1_det_add(acc[4u * k + 2u], acc[4u * k + 3u]));
+  }
+  return m1_det_add(m1_det_add(m1_det_add(h[0], h[1]), h[2]), h[3]);
+}
+
+/** @brief The CPU's sum of squares of @a chunk floats (chunk % 16 == 0):
+ *         16 fused chains, then m1_norm_reduce_det. */
+static inline float m1_sumsq_cpu_det(const float *x, uint32_t chunk) {
+  float acc[M1_DET_NORM_CHAINS];
+  for (uint32_t j = 0; j < M1_DET_NORM_CHAINS; ++j) {
     acc[j] = 0.0f;
   }
-  for (uint32_t i = 0; i < chunk; i += M1_DET_LANES) {
-    for (uint32_t j = 0; j < M1_DET_LANES; ++j) {
-      acc[j] = m1_det_add(acc[j], m1_det_mul(x[i + j], x[i + j]));
+  for (uint32_t i = 0; i < chunk; i += M1_DET_NORM_CHAINS) {
+    for (uint32_t j = 0; j < M1_DET_NORM_CHAINS; ++j) {
+      acc[j] = m1_det_fma(x[i + j], x[i + j], acc[j]);
     }
   }
-  for (uint32_t s = M1_DET_LANES / 2u; s >= 1u; s >>= 1) {
-    for (uint32_t j = 0; j < s; ++j) {
-      acc[j] = m1_det_add(acc[j], acc[j + s]);
-    }
-  }
-  return acc[0];
+  return m1_norm_reduce_det(acc);
+}
+
+/** @brief r from the sum of squares: RN(1 / RN(sqrt(s / chunk + eps))). */
+static inline float m1_norm_scale_det(float s, uint32_t chunk, float eps) {
+  const float d = m1_det_add(m1_det_mul(s, 1.0f / (float)chunk), eps);
+  return m1_recip_rn_det(m1_sqrt_rn_det(d));
 }
 
 /**
- * @brief RMSNorm over one chunk: y = (x * rsqrt(mean(x^2) + eps)) * gamma.
+ * @brief RMSNorm over one chunk: y = (x * r) * gamma, r the CPU's scale.
  *
  * @param chunk  a power of two and a multiple of 32
  * @return r, the row scale (what the IDL's row_scale reports)
  */
 static inline float m1_rmsnorm_chunk_det(const float *x, const float *gamma,
                                          float *y, uint32_t chunk, float eps) {
-  const float sum = m1_sumsq_det(x, chunk);
-  const float d = m1_det_add(m1_det_mul(sum, 1.0f / (float)chunk), eps);
-  const float r = m1_rsqrt_det(d);
+  const float r = m1_norm_scale_det(m1_sumsq_cpu_det(x, chunk), chunk, eps);
   for (uint32_t i = 0; i < chunk; ++i) {
     y[i] = m1_det_mul(m1_det_mul(x[i], r), gamma[i]);
   }

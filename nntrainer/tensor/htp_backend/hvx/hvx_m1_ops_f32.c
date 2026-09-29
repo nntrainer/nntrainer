@@ -10,17 +10,19 @@
  * @bug    No known bugs except for NYI items
  *
  * Every arithmetic step is a Vsf multiply, add or subtract on whole
- * vectors -- including the per-chunk scalars (mean + eps, the rsqrt): the
- * reduced sum is already splat across the lanes, so it stays there rather
- * than round-tripping through the scalar FPU, whose sffma the compiler may
- * contract into and whose subnormal handling this file need not know.
- * RoPE is the exception to "f32 inside": it is the Android CPU's fp16
- * RoPE (#152), every step rounded with hvx_rne16_sf, so the resident
+ * vectors, with one exception: the RMSNorm row scale r (#164) is the
+ * Android CPU's, computed on the scalar core -- 16 sffma chains held in
+ * registers (IEEE fused multiply-add, the CPU's fmla), m1_ops_det.h's
+ * reduction order, and its integer sqrt / reciprocal, each correctly
+ * rounded. HVX has no sf FMA, and an emulated one costs more than the
+ * whole kernel (plan 164 section 3.2); r is one scalar per chunk, splat
+ * once for the (x * r) * gamma loop.
+ * RoPE is the other exception to "f32 inside": it is the Android CPU's
+ * fp16 RoPE (#152), every step rounded with hvx_rne16_sf, so the resident
  * attention sees the CPU's q and k bit for bit.
  * Rule 24: no flush-to-zero anywhere, no qf32 (v75/v79 differ). The one
  * exp, the router's sigmoid (#132), is hvx_swiglu_det.h's exp_det with its
- * own clamp; the domain is m1_ops_det.h's (d >= eps keeps the rsqrt seed
- * normal).
+ * own clamp; the norms' domain is m1_ops_det.h's (d >= eps, normal).
  */
 
 #include "hvx_m1_ops_f32.h"
@@ -33,36 +35,26 @@
 #include "hvx_conv_gate_f32.h"
 #include "hvx_convert.h"
 #include "hvx_swiglu_det.h"
+#include "m1_ops_det.h"
 
 #define LANES 32u
 
-/** @brief 1/sqrt(d) per lane: the seed and three Newton-Raphson steps of
- *         m1_rsqrt_det, in its order (t = h*y; t = t*y; t = 1.5 - t;
- *         y = y*t). */
-static inline HVX_Vector hvx_rsqrt_det_sf(HVX_Vector d) {
-  HVX_Vector y =
-    Q6_Vw_vsub_VwVw(Q6_V_vsplat_R(0x5F3759DFu), Q6_Vuw_vlsr_VuwR(d, 1));
-  const HVX_Vector h = Q6_Vsf_vmpy_VsfVsf(d, hvx_splat_sf(0.5f));
-  const HVX_Vector three_halves = hvx_splat_sf(1.5f);
-  for (int it = 0; it < 3; ++it) {
-    HVX_Vector t = Q6_Vsf_vmpy_VsfVsf(h, y);
-    t = Q6_Vsf_vmpy_VsfVsf(t, y);
-    t = Q6_Vsf_vsub_VsfVsf(three_halves, t);
-    y = Q6_Vsf_vmpy_VsfVsf(y, t);
+/** @brief The CPU's row scale r of one chunk (m1_norm_scale_det of
+ *         m1_sumsq_cpu_det): the 16 chains are sffma (Q6_R_sfmpyacc_RR,
+ *         one rounding, what fmaf is), in registers; the reduction and the
+ *         integer sqrt / reciprocal are the spec's own functions. */
+static inline float hvx_rmsnorm_scale(const float *x, uint32_t chunk,
+                                      float eps) {
+  float acc[M1_DET_NORM_CHAINS];
+  for (uint32_t j = 0; j < M1_DET_NORM_CHAINS; ++j) {
+    acc[j] = 0.0f;
   }
-  return y;
-}
-
-/** @brief Sum of all 32 lanes into every lane: five rotate-and-add steps.
- *         IEEE add commutes bit for bit, so the rotation direction does
- *         not matter and every lane ends equal (m1_sumsq_det's tree). */
-static inline HVX_Vector hvx_reduce_add_sf(HVX_Vector v) {
-  v = Q6_Vsf_vadd_VsfVsf(v, Q6_V_vror_VR(v, 64));
-  v = Q6_Vsf_vadd_VsfVsf(v, Q6_V_vror_VR(v, 32));
-  v = Q6_Vsf_vadd_VsfVsf(v, Q6_V_vror_VR(v, 16));
-  v = Q6_Vsf_vadd_VsfVsf(v, Q6_V_vror_VR(v, 8));
-  v = Q6_Vsf_vadd_VsfVsf(v, Q6_V_vror_VR(v, 4));
-  return v;
+  for (uint32_t i = 0; i < chunk; i += M1_DET_NORM_CHAINS) {
+    for (uint32_t j = 0; j < M1_DET_NORM_CHAINS; ++j) {
+      acc[j] = Q6_R_sfmpyacc_RR(acc[j], x[i + j], x[i + j]);
+    }
+  }
+  return m1_norm_scale_det(m1_norm_reduce_det(acc), chunk, eps);
 }
 
 void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
@@ -71,8 +63,6 @@ void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
       (chunk & (chunk - 1u)) != 0u || n % chunk != 0u) {
     return;
   }
-  const HVX_Vector inv_chunk = hvx_splat_sf(1.0f / (float)chunk);
-  const HVX_Vector veps = hvx_splat_sf(eps);
   const uint32_t nvec = chunk / LANES;
 
   for (uint32_t c = 0; c < n / chunk; ++c) {
@@ -80,19 +70,11 @@ void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
     const HVX_UVector *vg = (const HVX_UVector *)gamma;
     HVX_UVector *vy = (HVX_UVector *)(y + (size_t)c * chunk);
 
-    HVX_Vector acc = Q6_V_vzero();
-    for (uint32_t i = 0; i < nvec; ++i) {
-      const HVX_Vector xv = vx[i];
-      acc = Q6_Vsf_vadd_VsfVsf(acc, Q6_Vsf_vmpy_VsfVsf(xv, xv));
-    }
-    const HVX_Vector sum = hvx_reduce_add_sf(acc);
-    const HVX_Vector d =
-      Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(sum, inv_chunk), veps);
-    const HVX_Vector r = hvx_rsqrt_det_sf(d);
+    const float rs = hvx_rmsnorm_scale(x + (size_t)c * chunk, chunk, eps);
     if (row_scale_out) {
-      const int32_t rb = Q6_R_vextract_VR(r, 0);
-      memcpy(row_scale_out + c, &rb, sizeof(float));
+      row_scale_out[c] = rs;
     }
+    const HVX_Vector r = hvx_splat_sf(rs);
     for (uint32_t i = 0; i < nvec; ++i) {
       vy[i] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(vx[i], r), vg[i]);
     }

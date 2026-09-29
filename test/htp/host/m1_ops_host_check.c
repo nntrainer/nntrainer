@@ -31,6 +31,18 @@
  *     so the all-subnormal row (kept, not flushed: rule 24) is judged on
  *     what f32 can hold.
  *
+ * The norms' row scale (#164) has a third half: the spec against an
+ * independent model of the Android CPU's RMSNorm written from its aarch64
+ * disassembly (fmaf chains, sqrtf, 1.0f /), on the fixed kinds and 20 000
+ * random rows over magnitudes 2^-20 .. 2^20 at chunk 2048 and 64, plus four
+ * mutants that must differ from it (NORM CPU-ORDER); the integer sqrt and
+ * reciprocal against sqrtf and 1.0f / on every 251st positive normal and
+ * +-4 ulp around every power of two (SQRT/RECIP RN; M1_NORM_EXHAUSTIVE=1
+ * for every positive normal, about a minute); and a replay mode,
+ *   m1_ops_host_check --replay <gamma_rms.f32> <gamma_qk.f32> <norm.bin>...
+ * that runs the kernel on dev/norm-shadow dumps with the true gammas and
+ * memcmp's it against the CPU's dumped output.
+ *
  * Inputs: an LCG from a fixed seed, plus three fixed rows / heads: all
  * zeros, all subnormal (+-1e-39) and large (|x| ~ 1e4).
  *
@@ -215,6 +227,309 @@ static void check_rmsnorm(const char *name, uint32_t n, uint32_t chunk) {
   free(y_f64);
   free(rs_hvx);
   free(rs_det);
+}
+
+/* ---- RMSNorm row scale vs the Android CPU (#164) ----------------------- */
+
+/* Written from the aarch64 disassembly of the shipped libnntrainer.so's
+   neon::rms_norm_wrt_width_fp32_intrinsic (plan 164 section 0), NOT from
+   m1_ops_det.h: four float32x4 fmla accumulators, faddp twice per vector,
+   the four in order, fdiv by W, fadd eps, fsqrt, fdiv 1 / q. Mutant 0 is
+   that; 1-4 are what the check must tell apart from it. */
+enum {
+  NORM_CPU = 0,
+  NORM_MUT_TREE32, /* the pre-#164 spec's 32-lane non-fused tree sum */
+  NORM_MUT_NOFMA,  /* the 16 chains as a multiply, then an add */
+  NORM_MUT_RSQRT,  /* the pre-#164 magic-seed Newton rsqrt for fsqrt+fdiv */
+  NORM_MUT_ORDER,  /* h0 + (h1 + (h2 + h3)) */
+  NORM_N_MUT = 4
+};
+static float norm_rsqrt_newton(float d) {
+  volatile float y = m1_det_float(0x5F3759DFu - (m1_det_bits(d) >> 1));
+  volatile float h = d * 0.5f;
+  for (int it = 0; it < 3; ++it) {
+    volatile float t = h * y;
+    t = t * y;
+    t = 1.5f - t;
+    y = y * t;
+  }
+  return y;
+}
+static float norm_cpu_r(const float *x, uint32_t W, float eps, int mut) {
+  volatile float s;
+  if (mut == NORM_MUT_TREE32) {
+    volatile float a[32] = {0};
+    for (uint32_t i = 0; i < W; i += 32u) {
+      for (uint32_t j = 0; j < 32u; ++j) {
+        volatile float p = x[i + j] * x[i + j];
+        a[j] = a[j] + p;
+      }
+    }
+    for (uint32_t st = 16u; st >= 1u; st >>= 1) {
+      for (uint32_t j = 0; j < st; ++j) {
+        a[j] = a[j] + a[j + st];
+      }
+    }
+    s = a[0];
+  } else {
+    volatile float acc[4][4] = {{0}};
+    for (uint32_t i = 0; i < W; i += 16u) {
+      for (int v = 0; v < 4; ++v) {
+        for (int l = 0; l < 4; ++l) {
+          const float e = x[i + 4u * v + l];
+          if (mut == NORM_MUT_NOFMA) {
+            volatile float p = e * e;
+            acc[v][l] = acc[v][l] + p;
+          } else {
+            acc[v][l] = fmaf(e, e, acc[v][l]);
+          }
+        }
+      }
+    }
+    volatile float h[4];
+    for (int v = 0; v < 4; ++v) {
+      volatile float p = acc[v][0] + acc[v][1], q = acc[v][2] + acc[v][3];
+      h[v] = p + q;
+    }
+    if (mut == NORM_MUT_ORDER) {
+      volatile float t = h[2] + h[3];
+      t = h[1] + t;
+      s = h[0] + t;
+    } else {
+      s = h[0] + h[1];
+      s = s + h[2];
+      s = s + h[3];
+    }
+  }
+  volatile float mean = s / (float)W;
+  volatile float d = eps + mean;
+  if (mut == NORM_MUT_RSQRT) {
+    return norm_rsqrt_newton(d);
+  }
+  volatile float q = sqrtf(d);
+  volatile float r = 1.0f / q;
+  return r;
+}
+
+/** @brief One row of the sweep: the spec's r and y against the CPU model's,
+ *         and each mutant's r against the model's (a difference is a catch). */
+static uint32_t norm_row(const float *x, const float *gamma, float *y,
+                         uint32_t W, float eps, uint32_t *caught) {
+  const float eps_ = eps;
+  const float r_cpu = norm_cpu_r(x, W, eps_, NORM_CPU);
+  const float r_det = m1_rmsnorm_chunk_det(x, gamma, y, W, eps_);
+  uint32_t bad = memcmp(&r_cpu, &r_det, sizeof(float)) != 0;
+  for (uint32_t i = 0; i < W; ++i) {
+    volatile float t = x[i] * r_cpu;
+    const float yc = t * gamma[i];
+    bad += memcmp(&yc, &y[i], sizeof(float)) != 0;
+  }
+  for (int m = 1; m <= NORM_N_MUT; ++m) {
+    const float r_m = norm_cpu_r(x, W, eps_, m);
+    caught[m - 1] += memcmp(&r_m, &r_cpu, sizeof(float)) != 0;
+  }
+  return bad;
+}
+
+static void check_norm_cpu_order(void) {
+  enum { ROWS = 20000 };
+  static const uint32_t widths[2] = {2048u, 64u};
+  const float eps = 1e-5f;
+  float *x = malloc(2048u * sizeof(float));
+  float *g = malloc(2048u * sizeof(float));
+  float *y = malloc(2048u * sizeof(float));
+  uint32_t caught[NORM_N_MUT] = {0, 0, 0, 0}, bad = 0, rows = 0;
+  fill_rand(g, 2048u, 0.5f, 1.5f);
+  for (int w = 0; w < 2; ++w) {
+    const uint32_t W = widths[w];
+    for (int kind = 1; kind <= 3; ++kind, ++rows) {
+      fill_row(x, W, kind);
+      bad += norm_row(x, g, y, W, eps, caught);
+    }
+    /* 2048: 2 000 rows; 64: 18 000 -- one magnitude 2^e, e in [-20, 20],
+       per row, elements +-[0.5, 1) 2^e */
+    const uint32_t n = w == 0 ? ROWS / 10 : ROWS - ROWS / 10;
+    for (uint32_t k = 0; k < n; ++k, ++rows) {
+      const int e = (int)(k % 41u) - 20;
+      for (uint32_t i = 0; i < W; ++i) {
+        const float m = frand(0.5f, 1.0f);
+        x[i] = ldexpf((g_seed >> 31) ? -m : m, e);
+      }
+      bad += norm_row(x, g, y, W, eps, caught);
+    }
+  }
+  uint32_t n_caught = 0;
+  for (int m = 0; m < NORM_N_MUT; ++m) {
+    n_caught += caught[m] != 0u;
+  }
+  printf("M1 OPS NORM spec vs CPU model rows=%u bad=%u; mutant r differs on "
+         "tree32=%u nofma=%u rsqrt=%u order=%u rows\n",
+         rows, bad, caught[0], caught[1], caught[2], caught[3]);
+  CHECK(bad == 0u, "norm: m1_ops_det differs from the CPU model");
+  CHECK(n_caught == NORM_N_MUT, "norm: a mutant went unseen");
+  if (bad == 0u && n_caught == NORM_N_MUT) {
+    printf("M1 OPS NORM CPU-ORDER OK mutants=%u/%d\n", n_caught, NORM_N_MUT);
+  }
+  free(x);
+  free(g);
+  free(y);
+}
+
+/** @brief sqrt_rn and recip_rn against sqrtf and 1.0f / for one input;
+ *         recip only where 1/d is normal (d < 2^126). */
+static void rn_one(uint32_t u, uint64_t *n, uint64_t *bad_s, uint64_t *bad_r) {
+  const float d = m1_det_float(u);
+  volatile float s = sqrtf(d);
+  const float sd = m1_sqrt_rn_det(d);
+  if (memcmp(&sd, (const void *)&s, sizeof(float))) {
+    if ((*bad_s)++ < 5u) {
+      printf("sqrt_rn bad at %08x\n", u);
+    }
+  }
+  if (u < 0x7e800000u) {
+    volatile float r = 1.0f / d;
+    const float rd = m1_recip_rn_det(d);
+    if (memcmp(&rd, (const void *)&r, sizeof(float))) {
+      if ((*bad_r)++ < 5u) {
+        printf("recip_rn bad at %08x\n", u);
+      }
+    }
+  }
+  ++*n;
+}
+
+static void check_sqrt_recip_rn(void) {
+  uint64_t n = 0, bad_s = 0, bad_r = 0;
+  const char *ex = getenv("M1_NORM_EXHAUSTIVE");
+  const int exhaustive = ex && ex[0] == '1';
+  const uint32_t stride = exhaustive ? 1u : 251u;
+  for (uint32_t u = 0x00800000u; u < 0x7f800000u; u += stride) {
+    rn_one(u, &n, &bad_s, &bad_r);
+  }
+  /* +-4 ulp around every power of two: the exponent edges, where the
+     mantissa wraps and the 2^24 rounding carry happens */
+  for (uint32_t e = 1u; e < 255u; ++e) {
+    for (int k = -4; k <= 4; ++k) {
+      const int64_t u = (int64_t)(e << 23) + k;
+      if (u >= 0x00800000 && u < 0x7f800000) {
+        rn_one((uint32_t)u, &n, &bad_s, &bad_r);
+      }
+    }
+  }
+  /* specials: +inf -> sqrt +inf, recip +0 */
+  const float inf = m1_det_float(0x7f800000u);
+  const int inf_ok = m1_det_bits(m1_sqrt_rn_det(inf)) == 0x7f800000u &&
+                     m1_det_bits(m1_recip_rn_det(inf)) == 0u;
+  printf("M1 OPS SQRT/RECIP RN %s inputs=%llu sqrt_bad=%llu recip_bad=%llu "
+         "inf_ok=%d\n",
+         exhaustive ? "EXHAUSTIVE" : "every 251st + exponent edges",
+         (unsigned long long)n, (unsigned long long)bad_s,
+         (unsigned long long)bad_r, inf_ok);
+  CHECK(bad_s == 0u && bad_r == 0u && inf_ok, "sqrt_rn / recip_rn");
+  if (bad_s == 0u && bad_r == 0u && inf_ok) {
+    printf("M1 OPS SQRT/RECIP RN OK\n");
+  }
+}
+
+/* ---- replay of dev/norm-shadow dumps ----------------------------------- */
+
+static float *read_all(const char *path, size_t n_floats) {
+  FILE *f = fopen(path, "rb");
+  float *b = malloc(n_floats * sizeof(float));
+  const size_t got = f ? fread(b, sizeof(float), n_floats, f) : 0u;
+  if (f) {
+    fclose(f);
+  }
+  if (got != n_floats) {
+    printf("REPLAY: %s: %zu of %zu floats\n", path, got, n_floats);
+    free(b);
+    return NULL;
+  }
+  return b;
+}
+
+/**
+ * @brief Runs hvx_rmsnorm_f32 (on hvx_emu) on every record of each dump and
+ *        memcmp's it with the CPU's output in the record.
+ *
+ * Record (dev/norm-shadow): u32 tag, pos, n_in, n_out; f32 in[n_in],
+ * cpu[n_out], other[n_out]. Tag 0 (RMSNORM on HTP) and 2 (on CPU): one
+ * 2048 row, gamma = the call's, in order operator_norm, ffn_norm per layer
+ * then embedding_norm (49 per step). Tag 1: in = q | k | v, cpu = the
+ * CPU's normed q | k, 64 per head, gamma = q | k of the step's next
+ * attention layer (6 per step). gamma_rms.f32: 49 x 2048; gamma_qk.f32:
+ * 6 x (q 64 | k 64); both from hf/model.safetensors, bf16 -> f32.
+ */
+static int replay(int argc, char **argv) {
+  enum { W = 2048, N_RMS = 49, N_QK = 6, HD = 64 };
+  const float eps = 1e-5f;
+  float *grms = read_all(argv[0], (size_t)N_RMS * W);
+  float *gqk = read_all(argv[1], (size_t)N_QK * 2 * HD);
+  if (!grms || !gqk) {
+    return 2;
+  }
+  unsigned long ok[3] = {0, 0, 0}, n[3] = {0, 0, 0};
+  float *in = malloc(8192u * sizeof(float)), *cpu = malloc(8192u * 4u);
+  float *other = malloc(8192u * 4u), *y = malloc(8192u * 4u);
+  for (int fi = 2; fi < argc; ++fi) {
+    FILE *f = fopen(argv[fi], "rb");
+    if (!f) {
+      printf("REPLAY: cannot open %s\n", argv[fi]);
+      return 2;
+    }
+    unsigned long fok[3] = {0, 0, 0}, fn[3] = {0, 0, 0};
+    uint32_t h[4], k_rms = 0, k_qk = 0;
+    while (fread(h, sizeof(uint32_t), 4, f) == 4) {
+      if (h[2] > 8192u || h[3] > 8192u || h[0] > 2u ||
+          fread(in, 4, h[2], f) != h[2] || fread(cpu, 4, h[3], f) != h[3] ||
+          fread(other, 4, h[3], f) != h[3]) {
+        printf("REPLAY: %s: bad record\n", argv[fi]);
+        return 2;
+      }
+      if (h[0] != 1u) {
+        if (h[2] != W || h[3] != W) {
+          printf("REPLAY: %s: RMSNORM record of %u\n", argv[fi], h[2]);
+          return 2;
+        }
+        hvx_rmsnorm_f32(in, grms + (size_t)(k_rms++ % N_RMS) * W, y, W, W, eps,
+                        NULL);
+        ++fn[h[0]];
+        fok[h[0]] += !memcmp(y, cpu, W * sizeof(float));
+      } else {
+        const uint32_t wk = h[3] <= h[2] ? h[2] - h[3] : 0u;
+        const uint32_t wq = wk <= h[3] ? h[3] - wk : 0u;
+        if (wk == 0u || wq == 0u || wq % HD != 0u || wk % HD != 0u) {
+          printf("REPLAY: %s: QK_NORM record of %u / %u\n", argv[fi], h[2],
+                 h[3]);
+          return 2;
+        }
+        const float *gq = gqk + (size_t)(k_qk++ % N_QK) * 2u * HD;
+        hvx_rmsnorm_f32(in, gq, y, wq, HD, eps, NULL);
+        hvx_rmsnorm_f32(in + wq, gq + HD, y + wq, wk, HD, eps, NULL);
+        for (uint32_t hd = 0; hd < h[3] / HD; ++hd) {
+          ++fn[1];
+          fok[1] += !memcmp(y + hd * HD, cpu + hd * HD, HD * sizeof(float));
+        }
+      }
+    }
+    fclose(f);
+    printf("REPLAY %s rms(tag0)=%lu/%lu rms_cpu(tag2)=%lu/%lu "
+           "qk_heads=%lu/%lu\n",
+           argv[fi], fok[0], fn[0], fok[2], fn[2], fok[1], fn[1]);
+    for (int t = 0; t < 3; ++t) {
+      ok[t] += fok[t];
+      n[t] += fn[t];
+    }
+  }
+  printf("REPLAY rms=%lu/%lu qk_heads=%lu/%lu (rms_cpu=%lu/%lu)\n", ok[0], n[0],
+         ok[1], n[1], ok[2], n[2]);
+  free(in);
+  free(cpu);
+  free(other);
+  free(y);
+  free(grms);
+  free(gqk);
+  return ok[0] == n[0] && ok[1] == n[1] && ok[2] == n[2] ? 0 : 1;
 }
 
 /* ---- RoPE -------------------------------------------------------------- */
@@ -626,10 +941,15 @@ static void check_router_vs_cpu(void) {
   free(w32);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc >= 5 && !strcmp(argv[1], "--replay")) {
+    return replay(argc - 2, argv + 2);
+  }
   check_rmsnorm("rmsnorm", 2048u, 2048u);
   check_rmsnorm("qk_norm_q", 32u * 64u, 64u);
   check_rmsnorm("qk_norm_k", 8u * 64u, 64u);
+  check_norm_cpu_order();
+  check_sqrt_recip_rn();
   check_rope();
   check_conv();
   check_router_kernel();

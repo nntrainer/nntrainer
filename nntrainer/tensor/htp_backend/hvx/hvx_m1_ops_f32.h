@@ -13,10 +13,12 @@
  *
  * The specification, its operation order and its domain live in
  * m1_ops_det.h; this file implements it in plain Vsf (no qf32, no sf FMA --
- * HVX has none) and nothing else. All four run on the calling thread: no
- * worker pool, no VTCM, no DMA, no heap. Every load and store goes through
- * HVX_UVector, because the FastRPC buffers the test entries hand in, and
- * the per-token entry's activation slots, carry no 128-byte alignment.
+ * HVX has none), except the RMSNorm row scale: scalar-core sffma and the
+ * spec's integer sqrt / reciprocal (#164). All four run on the calling
+ * thread: no worker pool, no VTCM, no DMA, no heap. Every load and store
+ * goes through HVX_UVector, because the FastRPC buffers the test entries
+ * hand in, and the per-token entry's activation slots, carry no 128-byte
+ * alignment.
  *
  * SHAPE CONTRACT: a call with a shape the kernel does not accept (the
  * parameter notes below) returns without writing anything -- there is no
@@ -35,7 +37,9 @@
 #include <stdint.h>
 
 /**
- * @brief y = (x * rsqrt(mean(x^2) + eps)) * gamma, per chunk.
+ * @brief y = (x * r) * gamma per chunk, r the Android CPU's RMSNorm scale
+ *        RN(1 / RN(sqrt(s / chunk + eps))), s the sum of squares over 16
+ *        fused chains reduced ((h0 + h1) + h2) + h3 (m1_ops_det.h, #164).
  *
  * @param x, y          n floats; may alias
  * @param gamma         chunk floats, shared by every chunk
