@@ -5,7 +5,7 @@
  * @file   nntr_hvx_attn_m1.c
  * @date   27 Sep 2026
  * @brief  DSP-side entries for decode attention at m=1 with the session's
- *         f32 KV cache (hvx_attn_m1_f32.c): register / release / kv_append
+ *         fp16 KV cache (hvx_attn_m1_f32.c): register / release / kv_append
  *         / forward
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
@@ -57,7 +57,7 @@ int nntr_hvx_attn_m1_register(remote_handle64 handle, uint32 n_layers,
        "cache=%u KiB",
        (unsigned)n_layers, (unsigned)n_kv, (unsigned)gqa, (unsigned)head_dim,
        (unsigned)max_seq,
-       (unsigned)(s->attn_m1->cache_floats * 2u * sizeof(float) / 1024u));
+       (unsigned)(s->attn_m1->cache_halves * 2u * sizeof(uint16_t) / 1024u));
   return AEE_SUCCESS;
 }
 

@@ -19,7 +19,7 @@
  * 18 x (24 + 24) KiB conv weight and state, a 512 KiB RoPE table at
  * max_seq 2048; plan 82 section 3.4) -- plus, with ROUTER_TOPK resident
  * (#132), 22 router weights padded to [2048][32] f32, 256 KiB each, 5.5
- * MiB -- all DSP heap, no arena, no VTCM, no DMA. The 48 MiB KV cache the
+ * MiB -- all DSP heap, no arena, no VTCM, no DMA. The 24 MiB fp16 KV cache the
  * ATTN_M1 op reads is the session's (hvx_attn_m1_f32.h's budget note), borrowed
  * through the env.
  */
