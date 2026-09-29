@@ -78,6 +78,8 @@ static uint32_t g_score_n, g_score_on, g_score_bad, g_score_waits,
 /* Bumped by the pool stand-in at every run: a slice must be waited by the
    lane that issued it inside the same run, and read only in a later one. */
 static uint32_t g_run;
+/* Set only by the timeout case in run_m1_cases. */
+static int g_lane_timeout;
 static const uint8_t *g_vtcm_lo, *g_vtcm_hi;
 static void score_reset(int on, const uint8_t *vtcm, size_t vtcm_bytes) {
   g_score_n = g_score_bad = g_score_waits = g_score_vtcm_reads = 0;
@@ -364,7 +366,7 @@ void hexkl_dma_lane_push2d(hexkl_dma_desc2d *d, hexkl_dma_desc2d *prev,
   (void)prev;
   score_push2d(dst, src, ds, ss, rs, nrows, sv, dv, (int)g_lane, d);
 }
-void hexkl_dma_lane_wait(hexkl_dma_desc2d *d) {
+int hexkl_dma_lane_wait(hexkl_dma_desc2d *d) {
   uint32_t k = g_score_n;
   ++g_lane_waits;
   while (k-- > 0u) {
@@ -377,11 +379,14 @@ void hexkl_dma_lane_wait(hexkl_dma_desc2d *d) {
     if (g_score_on && g_score_bad++ < 4u)
       printf("FEED lane %u waits on a descriptor it did not issue in run %u\n",
              g_lane, g_run);
-    return;
+    return 0;
   }
   for (uint32_t j = 0; j <= k; ++j)
     if (g_score[j].lane == (int)g_lane && g_score[j].run == g_run)
       g_score[j].waited = 1u;
+  /* A wait that ran out of its guard must fail the call: one case injects
+     it on lane 1 (g_lane_timeout) and expects AEE_EFAILED. */
+  return (g_lane_timeout && g_lane == 1u) ? -1 : 0;
 }
 /* After a run's join: every slice it issued was waited inside it. */
 static void score_run_end(void) {
@@ -647,6 +652,7 @@ static uint64_t g_feed_pushes, g_feed_waits;
 static int g_q_ok = 1;
 static uint32_t g_q_cells;
 static uint64_t g_q_slices, g_q_lane_waits;
+static int g_last_rc; /* the M=1 call's return code, for the timeout case */
 static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
                        uint32_t inter, uint32_t N_out, uint32_t NE,
                        const uint32_t *rc_, uint32_t slot0, uint8_t *vtcm,
@@ -727,6 +733,7 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, vtcm_bytes, vtcm_bytes, M, K,
                                   inter, N_out, NE, hg, hd, ridx, rc_, rw, act,
                                   out_m1, NULL, scratch, gemv_flags);
+  g_last_rc = r;
   const uint64_t blocks = hexkl_probe_us[HEXKL_PROBE_BLOCKS];
   const uint64_t dma_kb = hexkl_probe_us[HEXKL_PROBE_DMA_KB];
   const uint64_t path = hexkl_probe_us[HEXKL_PROBE_PATH];
@@ -1016,6 +1023,38 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
            "cells' weight bytes, 0 on the arena read and on heap copies; "
            "output bit-identical to the HMX path)\n",
            g_bypass_cells, (unsigned long long)g_bypass_total);
+  /* A lane wait that runs out of its guard (lane 1 of every run here) must
+     fail the call, not return a result: the call returns AEE_EFAILED. Its
+     other mismatches are expected, so its fail flag is not counted. */
+  {
+    static const uint32_t K = 64, inter = 32, N_out = 64, NE = 12;
+    uint32_t rc_[12] = {0};
+    float ref[64];
+    for (uint32_t i = 0; i < 4u; ++i)
+      rc_[(i * 5u) % NE] = 1u;
+    const int q_ok = g_q_ok;
+    const uint32_t q_cells = g_q_cells;
+    const uint64_t q_slices = g_q_slices, q_waits = g_q_lane_waits;
+    printf("-- injected lane timeout (the lines below are expected):\n");
+    g_lane_timeout = 1;
+    (void)run_m1_case(
+      "tiny", 1u, K, inter, N_out, NE, rc_, 64u, vtcm, vtcm_bytes, scratch,
+      HEXKL_MOE_FLAG_M1_GEMV | HEXKL_MOE_FLAG_GEMV_FEED_SET |
+        HEXKL_MOE_FLAG_GEMV_FEED | (3u << HEXKL_MOE_DMA_Q_SHIFT),
+      ref, 0);
+    g_lane_timeout = 0;
+    g_q_ok = q_ok; /* the case's own mismatches are the expected ones */
+    g_q_cells = q_cells;
+    g_q_slices = q_slices;
+    g_q_lane_waits = q_waits;
+    if (g_last_rc == AEE_EFAILED) {
+      printf("M1 FEED QUEUES TIMEOUT OK (a lane wait past its guard fails "
+             "the call: AEE_EFAILED)\n");
+    } else {
+      printf("M1 FEED QUEUES TIMEOUT WRONG (rc=%d)\n", g_last_rc);
+      g_q_ok = 0;
+    }
+  }
   if (g_q_ok && g_q_cells != 0u)
     printf("M1 FEED QUEUES OK (n=2,3,4; %u cells, %llu slices, %llu lane "
            "waits; each slice waited by its lane in its run, read in a later "

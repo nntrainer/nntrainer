@@ -149,7 +149,11 @@ void hexkl_dma_lane_push2d(hexkl_dma_desc2d *d, hexkl_dma_desc2d *prev,
 
 /** @brief Spins (dmpoll) until @a d, the last descriptor this thread
  *         pushed with hexkl_dma_lane_push2d, is done -- and with it every
- *         earlier one of the same chain. Same 50 M-poll guard as the ring. */
-void hexkl_dma_lane_wait(hexkl_dma_desc2d *d);
+ *         earlier one of the same chain. Same 50 M-poll guard as the ring.
+ *  @return 0 when done, -1 when the guard ran out: the chain may still be
+ *          moving, so its bytes and descriptors must not be trusted or
+ *          reused, and the caller fails the call instead of computing on
+ *          them. */
+int hexkl_dma_lane_wait(hexkl_dma_desc2d *d);
 
 #endif /* __NNTRAINER_HEXKL_DMA_RING_H__ */

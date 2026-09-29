@@ -900,8 +900,12 @@ typedef struct {
 typedef struct {
   moe_m1_qpush push[2];
   uint32_t n_push;
-  uint32_t nq;                /**< queues asked for, 2..4 */
-  uint32_t nq_used;           /**< min(nq, lanes), set by lane 0 */
+  uint32_t nq;      /**< queues asked for, 2..4 */
+  uint32_t nq_used; /**< min(nq, lanes), set by lane 0 */
+  /** Set by a lane whose wait ran out of its guard: the call then fails
+      (AEE_EFAILED) instead of returning a result computed on bytes that
+      may not have landed. Only ever set to 1, so lanes may race on it. */
+  volatile uint32_t timed_out;
   hvx_worker_pool_func inner; /**< the stage worker, or NULL */
   void *inner_ctx;
 } moe_m1_qrun;
@@ -951,8 +955,8 @@ static void moe_m1_q_worker(uint32_t n, uint32_t i, void *v) {
   if (q->inner != NULL) {
     q->inner(n, i, q->inner_ctx);
   }
-  if (last != NULL) {
-    hexkl_dma_lane_wait(last);
+  if (last != NULL && hexkl_dma_lane_wait(last) != 0) {
+    q->timed_out = 1u;
   }
 }
 
@@ -1250,6 +1254,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   m1q.n_push = 0u;
   m1q.nq = m1_feed ? hexkl_moe_flags_dma_q(flags) : 1u;
   m1q.nq_used = 1u;
+  m1q.timed_out = 0u;
   /* Pairs per staged batch; the chunk size the gate_up pushes use too. */
   const uint32_t half = L.acc_tiles / 2u;
   /* Bounded arrays below; a shape that needs more chunks than they hold is
@@ -1688,7 +1693,7 @@ int hexkl_mm_u8i4_moe_layer_run(
     moe_dma_copy(out_f32, out_c, sizeof(float) * (size_t)M * N_out, 0, 0,
                  HEXKL_DMA_SITE_COPY_OUT);
     HEXKL_PROBE_ADD(HEXKL_PROBE_ACC_COPY, p0);
-    rc = AEE_SUCCESS;
+    rc = m1q.timed_out ? AEE_EFAILED : AEE_SUCCESS;
     goto out;
   }
 

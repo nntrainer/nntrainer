@@ -61,7 +61,10 @@ void hexkl_dma_lane_push2d(hexkl_dma_desc2d *d, hexkl_dma_desc2d *prev,
   (void)prev;
   hexkl_dma_ring_push2d(dst, src, ds, ss, rs, nrows, sv, dv);
 }
-void hexkl_dma_lane_wait(hexkl_dma_desc2d *d) { (void)d; }
+int hexkl_dma_lane_wait(hexkl_dma_desc2d *d) {
+  (void)d;
+  return 0;
+}
 
 /* The pool runs everything on the caller, which is what its own NULL path
    does for n_units <= 1. Doing it here rather than passing NULL keeps the
