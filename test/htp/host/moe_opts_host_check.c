@@ -102,9 +102,25 @@ int main(void) {
   expect(!strcmp(htp_moe_opts_feed_name(0x303e1u), "vtcm") &&
            !strcmp(htp_moe_opts_feed_name(0x103e1u), "arena"),
          "feed names: vtcm / arena");
+  /* #158's bypass bit: only a non-zero NNTR_MOE_DMA_BYPASS sets it, so an
+     unset run's word stays 0x303e1; the knob word is 0x703e1. The echo must
+     carry it whether or not the GEMV is on (the HMX loop honours it too). */
+  expect(htp_moe_opts_dma_bypass(NULL) == 0u &&
+           htp_moe_opts_dma_bypass("0") == 0u,
+         "bypass unset / 0 is clear");
+  expect((htp_moe_opts_flags(NULL, NULL, NULL, NULL) |
+          htp_moe_opts_dma_bypass("1")) == 0x703e1u,
+         "BYPASS=1 on the default word is 0x703e1");
+  expect(htp_moe_opts_must_match(0x703e1u) == ~0u,
+         "GEMV on: the whole echo must match");
+  expect(htp_moe_opts_must_match(0x303e0u) == HTP_MOE_FLAG_M1_GEMV,
+         "opt-out without bypass: only bit 0");
+  expect(htp_moe_opts_must_match(0x703e0u) ==
+           (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_DMA_BYPASS),
+         "opt-out with bypass: bit 0 and bit 18");
   if (!g_fail)
     printf("MOE GEMV TUNE OPTS: per-knob tune bits, 64 KB units, "
-           "round+clamp 127, feed unset/0/1\n");
+           "round+clamp 127, feed unset/0/1, dma_bypass 0x703e1\n");
 
   /* C: dsp 1044.0, swiglu 5601.2, printed rest -5588.2 -> the other named
      stages (mm 974.7 among them) sum to 1044.0 + 5588.2 - 5601.2 = 1031.0;

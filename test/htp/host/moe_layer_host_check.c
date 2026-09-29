@@ -264,9 +264,18 @@ int hexkl_dma_ring_is_done(uint32_t idx) {
   (void)idx;
   return 1;
 }
+/* [#158] Bytes pushed with src_bypass set, and pushes that set it on a
+   heap-to-heap copy (dst_vtcm = 0), which must never happen: the DSP wrote
+   those sources. The checks below hold the byte count against the weight
+   bytes of the arena-backed experts, so a bypassed activation block or a
+   bypassed heap weight shows up as a surplus. */
+static uint64_t g_bypass_bytes, g_bypass_bad;
 void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t ds, uint32_t ss,
                            uint32_t rs, uint32_t nrows, int sv, int dv) {
-  (void)sv;
+  if (sv) {
+    g_bypass_bytes += (uint64_t)rs * nrows;
+    g_bypass_bad += dv == 0;
+  }
   /* Only the VTCM-bound pushes are slab pushes; moe_dma_copy's heap-to-heap
      pieces (dst_vtcm = 0) are the two other descriptors of a call. */
   if (g_score_on && dv) {
@@ -530,6 +539,7 @@ static void make_weight(uint32_t slot, uint32_t K, uint32_t N, W *w) {
   }
   hexkl_weight_u8i4 *s = &g_tbl.slots[slot];
   s->in_use = 1;
+  s->borrowed = 1; /* arena-backed, as every QS4CX_WH expert is */
   s->K = K;
   s->N = N;
   s->wh_bytes = (uint8_t *)w->nib;
@@ -550,6 +560,8 @@ static void make_weight(uint32_t slot, uint32_t K, uint32_t N, W *w) {
    token rows the routing names, independently of the kernel's slot pack. */
 static int g_pf_lead_ok = 1;
 static int g_feed_sched_ok = 1;
+static uint32_t g_bypass_cells; /**< [#158] cells run with the bypass bit */
+static uint64_t g_bypass_total; /**< bytes they bypassed, summed */
 static uint64_t g_feed_pushes, g_feed_waits;
 static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
                        uint32_t inter, uint32_t N_out, uint32_t NE,
@@ -624,6 +636,7 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   gemv_log_reset();
   pf_reset();
   score_reset(feed != 0u, vtcm, vtcm_bytes);
+  g_bypass_bytes = g_bypass_bad = 0u;
   r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, vtcm_bytes, vtcm_bytes, M, K,
                                   inter, N_out, NE, hg, hd, ridx, rc_, rw, act,
                                   out_m1, NULL, scratch, gemv_flags);
@@ -641,6 +654,25 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   const int same = memcmp(out_hmx, out_m1, sizeof(float) * M * N_out);
   fail |= (r != 0) || blocks != 0u || dma_kb != want_kb || path != 1u ||
           fed != feed || same != 0;
+  /* [#158] Under the bypass bit every feed push, and nothing else, reads
+     around the L2: exactly the active experts' weight bytes. Without the
+     feed there is no weight push, so nothing is bypassed either. */
+  const int bypass = (gemv_flags & HEXKL_MOE_FLAG_DMA_BYPASS) != 0u;
+  const uint64_t want_bypass =
+    bypass && feed
+      ? (uint64_t)active *
+          ((K / 32u) * ((2u * inter) / 32u) + (inter / 32u) * (N_out / 32u)) *
+          512u
+      : 0u;
+  if (g_bypass_bytes != want_bypass || g_bypass_bad != 0u) {
+    printf("M1 GEMV shape=%s M=%u bypass=%d feed=%u: bypassed %llu B (want "
+           "%llu), %llu on heap copies\n",
+           shape, M, bypass, (unsigned)feed, (unsigned long long)g_bypass_bytes,
+           (unsigned long long)want_bypass, (unsigned long long)g_bypass_bad);
+    fail = 1;
+  }
+  g_bypass_cells += bypass;
+  g_bypass_total += g_bypass_bytes;
 
   /* The lead: with it, every GEMV column went through the prefetch-free
      call, each covered once by its own lane's box (no double fetch, no
@@ -741,10 +773,11 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   const uint32_t bad = count_mismatches(out_m1, want, M * N_out, &worst);
   fail |= (bad != 0u);
 
-  printf("M1 GEMV shape=%s M=%u lead=%u rows1=%u feed=%u f32 memcmp=%d i32 "
+  printf("M1 GEMV shape=%s M=%u lead=%u rows1=%u feed=%u bypass=%d f32 "
+         "memcmp=%d i32 "
          "exact=%s blocks=%llu dma_kb=%llu (path=%llu, hmx blocks=%llu, "
          "gate_up tiles=%u, ref mismatches=%u worst_rel=%g)\n",
-         shape, M, (unsigned)lead_kb, (unsigned)rows1, (unsigned)feed,
+         shape, M, (unsigned)lead_kb, (unsigned)rows1, (unsigned)feed, bypass,
          same != 0, i32_bad == 0u ? "yes" : "NO", (unsigned long long)blocks,
          (unsigned long long)dma_kb, (unsigned long long)path,
          (unsigned long long)blocks_hmx, i32_seen, bad, worst);
@@ -825,6 +858,12 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
             flags |= HEXKL_MOE_FLAG_GEMV_ROWS1;
           if (cfg > n_pairs)
             flags |= HEXKL_MOE_FLAG_GEMV_FEED;
+          /* [#158] The bypass bit on the 192 and 768 KB cells of both
+             halves: both loops with and without it, on the feed and on
+             the arena read. The lead means nothing under the feed, so the
+             cells it lands on differ only in this bit. */
+          if ((i / 2u) % 2u)
+            flags |= HEXKL_MOE_FLAG_DMA_BYPASS;
         }
         fail |=
           run_m1_case(shape ? "real" : "tiny", Ms[c], K, inter, N_out, NE, rc_,
@@ -849,6 +888,11 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
              "0/192/384/768/1536 KB x rows4,rows1; build default %u KB "
              "rows1=%u)\n",
          PF_LANES, (unsigned)HVX_GEMV_PF_LEAD_KB, (unsigned)HVX_GEMV_M1_ROWS1);
+  if (!fail)
+    printf("M1 GEMV DMA BYPASS OK (%u cells, %llu B bypassed = the feed "
+           "cells' weight bytes, 0 on the arena read and on heap copies; "
+           "output bit-identical to the HMX path)\n",
+           g_bypass_cells, (unsigned long long)g_bypass_total);
   printf(g_feed_sched_ok
            ? "M1 GEMV VTCM FEED SCHEDULE OK (%llu pushes, %llu waits over the "
              "cases; whole-matrix descriptors, every read after its wait, 2 "
@@ -979,6 +1023,42 @@ int main(void) {
             hexkl_probe_us[HEXKL_PROBE_DMA_KB] != kb_off ||
             hexkl_probe_us[HEXKL_PROBE_PATH] != 0u || same != 0;
     free(got_on);
+  }
+
+  /* [#158] The M > 1 HMX path under the bypass bit: the same bytes, and
+     src_bypass on exactly the arena-backed weight chunks -- not on the
+     activation blocks, not on the staging copies, and not on a heap slot
+     (expert 1's gate_up here, which the DSP would have memcpy'd). The two
+     runs above sent no bypass bit, so nothing may have been bypassed yet. */
+  {
+    const uint64_t before = g_bypass_bytes;
+    float *got_bp = (float *)malloc(sizeof(float) * M * N_out);
+    uint64_t want = 0u;
+    for (uint32_t e = 0; e < NE; ++e)
+      if (rc_[e] != 0u)
+        want += (uint64_t)((K / 32u) * ((2u * inter) / 32u) +
+                           (inter / 32u) * (N_out / 32u)) *
+                512u;
+    g_tbl.slots[hg[1]].borrowed = 0;
+    want -= (uint64_t)(K / 32u) * ((2u * inter) / 32u) * 512u;
+    int r = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+      ridx, rc_, rw, act, got_bp, NULL, &scratch,
+      HEXKL_MOE_FLAG_M1_GEMV | HEXKL_MOE_FLAG_DMA_BYPASS);
+    g_tbl.slots[hg[1]].borrowed = 1;
+    const int same = memcmp(got, got_bp, sizeof(float) * M * N_out);
+    printf("M=37 dma bypass   : rc=%d bypassed %llu B (want %llu, before %llu, "
+           "heap copies %llu) memcmp=%d\n",
+           r, (unsigned long long)g_bypass_bytes, (unsigned long long)want,
+           (unsigned long long)before, (unsigned long long)g_bypass_bad,
+           same != 0);
+    const int ok = r == 0 && before == 0u && g_bypass_bytes == want &&
+                   g_bypass_bad == 0u && same == 0;
+    printf(ok ? "MOE HMX DMA BYPASS OK (weights only, arena slots only, "
+                "bit-identical)\n"
+              : "MOE HMX DMA BYPASS WRONG\n");
+    fail |= !ok;
+    free(got_bp);
   }
 
   /* --- edge cases the routing can actually produce --------------------- */

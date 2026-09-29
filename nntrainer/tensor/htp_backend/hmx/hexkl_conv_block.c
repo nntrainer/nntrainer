@@ -213,7 +213,7 @@ static uint32_t cb_push_chunks(uint8_t *vtcm_base, uint32_t dst_off,
   for (uint32_t nt0 = 0; nt0 < n_col; nt0 += cn) {
     const uint32_t c = (n_col - nt0 < cn) ? (n_col - nt0) : cn;
     idx_out[n++] = hexkl_moe_push_weight_chunk(vtcm_base, dst_off, h, k_tiles,
-                                               n_col, nt0, c);
+                                               n_col, nt0, c, 0);
   }
   return n;
 }
@@ -343,9 +343,9 @@ int hexkl_conv_block_run(hexkl_weight_u8i4_table *tbl, uint8_t *vtcm_base,
   for (uint32_t g0 = 0; g0 < c_ntiles; g0 += half) {
     const uint32_t cn = (c_ntiles - g0 < half) ? (c_ntiles - g0) : half;
     (void)hexkl_moe_push_weight_chunk(vtcm_base, L.w_a_off, wa, k_tiles,
-                                      c_ntiles, g0, cn);
+                                      c_ntiles, g0, cn, 0);
     idx_ac[n_ac++] = hexkl_moe_push_weight_chunk(vtcm_base, L.w_b_off, wc,
-                                                 k_tiles, c_ntiles, g0, cn);
+                                                 k_tiles, c_ntiles, g0, cn, 0);
   }
 
   HEXKL_PROBE_T0(p0);

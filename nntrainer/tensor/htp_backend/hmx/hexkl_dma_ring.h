@@ -78,7 +78,9 @@ void hexkl_dma_ring_reset(void);
  *        chains onto the in-flight descriptor via dmlink so many transfers
  *        run on the single DMA engine without a second dmstart.
  *
- * @param src_vtcm  nonzero if @a src is in VTCM (bypasses L2)
+ * @param src_vtcm  nonzero sets src_bypass (read around the DSP L2): @a src
+ *                  is in VTCM, or is DDR no DSP store has written (#158's
+ *                  arena weights, HEXKL_MOE_FLAG_DMA_BYPASS)
  * @param dst_vtcm  nonzero if @a dst is in VTCM (bypasses L2)
  */
 void hexkl_dma_ring_push2d(void *dst, const void *src, uint32_t dst_stride,

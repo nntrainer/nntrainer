@@ -116,12 +116,13 @@ void *hexkl_moe_carve(uint8_t **cur, size_t bytes);
  * @brief Pushes n-tile columns [nt0, nt0+cn) of a WH weight into VTCM at
  *        @a dst_off, one 2D descriptor; the destination keeps the source's
  *        tile indexing (kt * n_col + nt).
+ * @param src_bypass the descriptor's src_bypass (HEXKL_MOE_FLAG_DMA_BYPASS)
  * @return the ring index to hand hexkl_dma_ring_wait
  */
 uint32_t hexkl_moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
                                      const hexkl_weight_u8i4 *h,
                                      uint32_t k_tiles, uint32_t n_col,
-                                     uint32_t nt0, uint32_t cn);
+                                     uint32_t nt0, uint32_t cn, int src_bypass);
 
 /** @brief Queues one 64-row AH activation block (rows [slot, slot+64) of
  *         a packed activation) heap -> VTCM. Push it AHEAD of the weights
@@ -326,13 +327,37 @@ int hexkl_mm_u8i4_moe_layer_run(
 /** @brief Bit 17 of the flags word: the VTCM feed selector (#117). */
 #define HEXKL_MOE_FLAG_GEMV_FEED 0x20000u
 
+/**
+ * @brief Bit 18 of the flags word (#158): every expert weight descriptor of
+ *        the call -- the M=1 feed's whole-matrix pushes and the M>1 HMX
+ *        path's gate_up / down chunks -- sets src_bypass, so the DMA reads
+ *        DDR around the DSP L2 (the probe: 69.3 vs 37.3 GB/s, fresh 168
+ *        MiB, tag-validated). Off unless the flags word sets it; no build
+ *        default. No byte changes: the same bytes land in the same place.
+ *
+ * Why no cache maintenance: src_bypass only skips the DSP L2, and a
+ * bypassing read is stale only if that L2 holds a dirty line of the source.
+ * The bit is set only for arena-backed (borrowed) slots: the CPU fills the
+ * arena before it is attached and nothing on the DSP ever writes it (the
+ * GEMV's arena read and l2fetch leave clean lines, which a bypassing read
+ * may ignore). A heap slot was memcpy'd by the DSP, so it keeps
+ * src_bypass = 0 under the knob too. The ARM side of
+ * the same bytes is the CPU's business either way: an ARM cached mapping
+ * (#157's plan) needs its clean per fill with or without this bit, since
+ * the DSP L2 is not the ARM's cache. Activation blocks and the staging
+ * copies are NOT covered: the DSP writes them (dirty lines), so they keep
+ * src_bypass = 0.
+ */
+#define HEXKL_MOE_FLAG_DMA_BYPASS 0x40000u
+
 /** @brief Every bit this build understands; moe_set_opts keeps these and
  *         drops the rest, which is what makes the echo a version check. */
 #define HEXKL_MOE_FLAGS_KNOWN                                                  \
   (HEXKL_MOE_FLAG_M1_GEMV | HEXKL_MOE_FLAG_GEMV_LEAD_SET |                     \
    HEXKL_MOE_FLAG_GEMV_ROWS1_SET | HEXKL_MOE_FLAG_GEMV_FEED_SET |              \
    ((uint32_t)HEXKL_MOE_GEMV_LEAD_BITS << HEXKL_MOE_GEMV_LEAD_SHIFT) |         \
-   HEXKL_MOE_FLAG_GEMV_ROWS1 | HEXKL_MOE_FLAG_GEMV_FEED)
+   HEXKL_MOE_FLAG_GEMV_ROWS1 | HEXKL_MOE_FLAG_GEMV_FEED |                      \
+   HEXKL_MOE_FLAG_DMA_BYPASS)
 
 /** @brief The call's l2fetch lead in KB: the flags word when the lead bit
  *         is set, else the build's default. */

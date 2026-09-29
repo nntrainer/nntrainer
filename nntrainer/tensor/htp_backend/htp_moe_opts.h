@@ -48,6 +48,29 @@
 #define HTP_MOE_FLAG_GEMV_FEED_SET 0x20u
 #define HTP_MOE_FLAG_GEMV_FEED 0x20000u
 
+/** @brief hexkl_mm_u8i4_moe.h's HEXKL_MOE_FLAG_DMA_BYPASS restated (#158):
+ *  bit 18 sets src_bypass on every arena expert weight descriptor, M = 1
+ *  feed and M > 1 HMX path alike. Sent only when NNTR_MOE_DMA_BYPASS is a
+ *  non-zero number, so an unset run's word stays 0x303e1. */
+#define HTP_MOE_FLAG_DMA_BYPASS 0x40000u
+
+/** @brief HTP_MOE_FLAG_DMA_BYPASS for getenv("NNTR_MOE_DMA_BYPASS"): set
+ *  for a non-zero number, clear when unset or "0". */
+static inline uint32_t htp_moe_opts_dma_bypass(const char *env) {
+  return (env != NULL && atoi(env) != 0) ? HTP_MOE_FLAG_DMA_BYPASS : 0u;
+}
+
+/** @brief The bits of moe_set_opts' echo that must equal what was sent.
+ *  With the GEMV on, all of them. With it off, the tune bits mean nothing
+ *  on the HMX loop, so only bit 0 -- plus the bypass bit when it was asked
+ *  for, because the HMX loop's weight DMA honours it (#158): a skel that
+ *  predates it must fail the run, not measure the default. */
+static inline uint32_t htp_moe_opts_must_match(uint32_t flags) {
+  if ((flags & HTP_MOE_FLAG_M1_GEMV) != 0u)
+    return ~0u;
+  return HTP_MOE_FLAG_M1_GEMV | (flags & HTP_MOE_FLAG_DMA_BYPASS);
+}
+
 /**
  * @brief The lead field for a requested lead in KB: rounded to the nearest
  *        multiple of HTP_MOE_GEMV_LEAD_KB_UNIT and clamped to

@@ -130,10 +130,25 @@ static uint32_t moe_dma_row_size(uint32_t total_bytes) {
  *
  * @return the ring index to hand hexkl_dma_ring_wait
  */
+/** @brief [#158] This call's HEXKL_MOE_FLAG_DMA_BYPASS, set on entry to
+ *         hexkl_mm_u8i4_moe_layer_run before its first push. File state like
+ *         the ring itself: one DSP thread drives both. */
+static int g_moe_src_bypass;
+
+/** @brief The src_bypass a weight's descriptor gets: the knob, and only for
+ *         an arena-backed (borrowed) slot -- the CPU wrote those bytes and
+ *         the DSP never does. A heap slot was memcpy'd by the DSP, so its
+ *         lines may still be dirty in the L2 a bypassing read skips. */
+static inline int moe_weight_src_bypass(const hexkl_weight_u8i4 *h,
+                                        int src_bypass) {
+  return src_bypass && h->borrowed;
+}
+
 uint32_t hexkl_moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
                                      const hexkl_weight_u8i4 *h,
                                      uint32_t k_tiles, uint32_t n_col,
-                                     uint32_t nt0, uint32_t cn) {
+                                     uint32_t nt0, uint32_t cn,
+                                     int src_bypass) {
   const uint32_t row = cn * WEIGHT_TILE_BYTES_U8I4;
   const uint32_t stride = n_col * WEIGHT_TILE_BYTES_U8I4;
   const uint32_t off = nt0 * WEIGHT_TILE_BYTES_U8I4;
@@ -141,8 +156,10 @@ uint32_t hexkl_moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
   uint64_t pt = 0;
   HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_KB, (row * k_tiles) >> 10);
   HEXKL_PROBE_T0(pt);
+  /* push2d's src_vtcm is what sets the descriptor's src_bypass. */
   hexkl_dma_ring_push2d(vtcm_base + dst_off + off, h->wh_bytes + off, stride,
-                        stride, row, k_tiles, /*src_vtcm=*/0, /*dst_vtcm=*/1);
+                        stride, row, k_tiles,
+                        moe_weight_src_bypass(h, src_bypass), /*dst_vtcm=*/1);
   HEXKL_PROBE_ADD(HEXKL_PROBE_PUSH, pt);
   return idx;
 }
@@ -156,8 +173,8 @@ static uint32_t moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
                                       uint32_t k_tiles, uint32_t n_col,
                                       uint32_t nt0, uint32_t cn, uint32_t kind,
                                       uint32_t expert, uint32_t chunk) {
-  const uint32_t idx =
-    hexkl_moe_push_weight_chunk(vtcm_base, dst_off, h, k_tiles, n_col, nt0, cn);
+  const uint32_t idx = hexkl_moe_push_weight_chunk(
+    vtcm_base, dst_off, h, k_tiles, n_col, nt0, cn, g_moe_src_bypass);
   if (hexkl_probe_on) {
     hexkl_dma_trace_push(hexkl_probe_now_ticks(), idx, kind, expert, chunk,
                          cn * WEIGHT_TILE_BYTES_U8I4, k_tiles,
@@ -843,7 +860,8 @@ static inline uint32_t moe_m1_push(uint8_t *vtcm_base, uint32_t dst_off,
   const uint32_t idx = hexkl_dma_ring_next_idx();
   HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_KB, (row * k_tiles) >> 10);
   hexkl_dma_ring_push2d(vtcm_base + dst_off, h->wh_bytes, row, row, row,
-                        k_tiles, /*src_vtcm=*/0, /*dst_vtcm=*/1);
+                        k_tiles, moe_weight_src_bypass(h, g_moe_src_bypass),
+                        /*dst_vtcm=*/1);
   if (hexkl_probe_on) {
     hexkl_dma_trace_push(hexkl_probe_now_ticks(), idx, kind, expert, 0u, row,
                          k_tiles, row);
@@ -1031,6 +1049,7 @@ int hexkl_mm_u8i4_moe_layer_run(
     return AEE_EBADPARM;
   }
 
+  g_moe_src_bypass = (flags & HEXKL_MOE_FLAG_DMA_BYPASS) != 0u;
   const uint32_t arena = vtcm_size < config_off ? vtcm_size : config_off;
   hexkl_moe_layout L;
   int rc = hexkl_mm_u8i4_moe_layout(K, inter, N_out, arena, &L);
