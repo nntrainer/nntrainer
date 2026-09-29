@@ -27,14 +27,15 @@
  * Every step is one f32 multiply, add or subtract, rounded to nearest even
  * on its own, with subnormals kept (LEDGER rule 24: HVX does not flush, so
  * neither may the host). No qf32 (v75 and v79 disagree on qf32 -> sf), no
- * libm. Two exceptions, both in the RMSNorm row scale and both exact by
- * IEEE's definition (#164): one fused multiply-add per square (fmaf; the
- * Android CPU's fmla, the DSP's sffma), and a square root and a
- * reciprocal computed in integers, each correctly rounded (no libm sqrt,
- * no division). The ORDER is part of the contract: reassociating the
- * reduction, splitting the fused step or fusing any other changes the
- * bits. Each scalar operation below stores through a volatile so no
- * compiler can contract or reassociate it.
+ * libm. Two exceptions, both exact by IEEE's definition: the fused
+ * multiply-add (fmaf; the Android CPU's fmla, the DSP's sffma) where the
+ * CPU fuses, and square roots, reciprocals and divisions computed in
+ * integers, each correctly rounded (no libm sqrt, no division) -- in the
+ * RMSNorm row scale (#164) and in the CPU-order router and SwiGLU (#132
+ * PR 2, through q4_gemv_cpu_det.h's helpers). The ORDER is part of the
+ * contract: reassociating the reduction, splitting the fused step or fusing any
+ * other changes the bits. Each scalar operation below stores through a volatile
+ * so no compiler can contract or reassociate it.
  *
  *   rmsnorm_det(x[chunk], gamma[chunk], eps), per chunk (2048 for the
  *   hidden norm, 64 for a q/k head) -- the Android CPU's
@@ -65,29 +66,39 @@
  *     out = b*y
  *     state <- s1 | g
  *
- *   router_topk_det(x[K], W[K][E], bias[E], top_k), E <= 32, K % 4 == 0
- *   (#132; LFM2's buildExpertAssignments, lfm2_moe_layer.cpp):
- *     a_j      = 0,  a_j = a_j + x[k] * W[k][e]  for k = j (mod 4), in k
- *                order                  (four lane accumulators on HVX)
- *     logit[e] = (a_0 + a_1) + (a_2 + a_3)
- *     sig[e]   = recip_det(1 + exp_det(0 - logit[e]))   (swiglu_det.h)
+ *   router_cpu_det(x[K], W[K][E], bias[E], top_k), E <= 32 (#132 PR 2;
+ *   the Android CPU's router, read off the shipped binaries: OpenBLAS
+ *   sgemv_n and buildExpertAssignments in libcausallm_core.so). Unlike
+ *   the ops above it is the CPU's order, so it takes q4_gemv_cpu_det.h's
+ *   fused step and exact integer division:
+ *     logit[e] = 0, logit[e] = fma(x[k], W[k][e], logit[e]), k = 0..K-1
+ *     sig[e]   = RN(1 / (expf(-logit[e]) + 1))   (expf: bionic's, ported
+ *                                                  as m1_expf_bionic_det)
  *     score[e] = sig[e] + bias[e]
  *     sel[r]   = argmax of score over the unchosen, the LOWEST index on a
  *                tie, r = 0 .. top_k-1  (the CPU comparator's total order)
- *     wsum     = 0, wsum = wsum + sig[sel[r]] in selection order
- *     inv      = recip_det(wsum + 1e-6)
- *     weight[r] = (sig[sel[r]] * inv) * 1.0  (NORM_TOPK_PROB, its epsilon
- *                and ROUTED_SCALING_FACTOR)
+ *     wsum     = (sig[sel1] + sig[sel3] + ..) + (sig[sel0] + sig[sel2] + ..)
+ *                (two accumulators over odd / even r from 0, -ffast-math's
+ *                unroll; an odd top_k adds its last one after)
+ *     inv      = RN(1 / (wsum + 1e-6))
+ *     weight[r] = sig[sel[r]] * inv  (NORM_TOPK_PROB, its epsilon;
+ *                ROUTED_SCALING_FACTOR 1.0 is folded away in the binary)
  *     ponytail: LFM2's router constants are hard-coded here; a router with
  *     another scale or no normalization needs them in the op record.
  *
+ *   swiglu_cpu_det(y[n], z[n]): neon::swiglu with neon_mathfun's exp_ps as
+ *   the binary computes it (one fused step, the rest separate; plan 132
+ *   section 0.2): out = RN(y / (exp_ps(-y) + 1)) * z. The MoE's own
+ *   swiglu_det.h stays: that path's reference is the HTP, not the CPU.
+ *
+ *   argmax_first(x[n]): std::max_element, the first maximum wins.
+ *
  * DOMAIN (the analogue of LEDGER section 4's SiLU/exp argument clamp). The
- * router's exp is exp_det, clamped to [-88, 85] (swiglu_det.h), so its
- * recip_det sees 1 + e in [1, 1 + e^85] and wsum + 1e-6 in [1e-6, 4]: both
- * inside recip_det's seed range. The norms contain no exp: d >= eps, a
- * positive normal (the graph validator requires it), keeps sqrt_rn and
- * recip_rn on normal inputs with normal results; a sum of squares that
- * overflows gives d = +inf and r = +0, the CPU's IEEE answer. "fp32
+ * CPU-order router and SwiGLU take any finite input, as the CPU does.
+ * The norms contain no exp: d >= eps, a positive normal (the graph
+ * validator requires it), keeps sqrt_rn and recip_rn on normal inputs
+ * with normal results; a sum of squares that overflows gives d = +inf and
+ * r = +0, the CPU's IEEE answer. "fp32
  * inside, narrow once": nothing here narrows -- every op reads and writes
  * f32, and the u8 narrowing is the next FC's quantizer.
  *
@@ -107,7 +118,7 @@
 #include <string.h>
 
 #include "attn_m1_det.h"
-#include "swiglu_det.h"
+#include "q4_gemv_cpu_det.h"
 
 /** @brief f32 lanes in one 128-byte HVX vector; the reduction's width. */
 #define M1_DET_LANES 32u
@@ -320,34 +331,92 @@ static inline void m1_conv_gate_det(const float *abc, float *state,
 #define M1_DET_ROUTER_MAX_E M1_DET_LANES
 
 /**
- * @brief The MoE router of one token: logits, sigmoid, biased top-k and the
- *        normalized routing weights (LFM2's buildExpertAssignments).
+ * @brief expf as the phone's bionic libm computes it: the Arm
+ *        optimized-routines algorithm (32-entry 2^(i/32) table, a cubic in
+ *        double, one final rounding to f32). G0 (ExpfBionic.*) pins this
+ *        port to the device's libm over all 2^32 inputs; the host check
+ *        pins it to the same algorithm in glibc.
  *
- * @param x       K floats, the ffn-normed row
- * @param w       K x E floats, row-major [K][E] (the gate weight's layout)
+ * The contraction question is settled: fused and unfused polynomial
+ * steps, and round-half-even (the host's shift) versus round-half-away
+ * (aarch64's frinta) for k, give the same f32 on every input, so the port
+ * uses plain double operations -- the DSP has no double fma to call.
+ */
+static inline float m1_expf_bionic_det(float x) {
+  static const uint64_t tab[32] = {
+    0x3ff0000000000000ull, 0x3fefd9b0d3158574ull, 0x3fefb5586cf9890full,
+    0x3fef9301d0125b51ull, 0x3fef72b83c7d517bull, 0x3fef54873168b9aaull,
+    0x3fef387a6e756238ull, 0x3fef1e9df51fdee1ull, 0x3fef06fe0a31b715ull,
+    0x3feef1a7373aa9cbull, 0x3feedea64c123422ull, 0x3feece086061892dull,
+    0x3feebfdad5362a27ull, 0x3feeb42b569d4f82ull, 0x3feeab07dd485429ull,
+    0x3feea47eb03a5585ull, 0x3feea09e667f3bcdull, 0x3fee9f75e8ec5f74ull,
+    0x3feea11473eb0187ull, 0x3feea589994cce13ull, 0x3feeace5422aa0dbull,
+    0x3feeb737b0cdc5e5ull, 0x3feec49182a3f090ull, 0x3feed503b23e255dull,
+    0x3feee89f995ad3adull, 0x3feeff76f2fb5e47ull, 0x3fef199bdd85529cull,
+    0x3fef3720dcef9069ull, 0x3fef5818dcfba487ull, 0x3fef7c97337b9b5full,
+    0x3fefa4afa2a490daull, 0x3fefd0765b6e4540ull};
+  const double inv_ln2_n = 0x1.71547652b82fep+0 * 32.0;
+  const double c0 = 0x1.c6af84b912394p-5 / 32.0 / 32.0 / 32.0;
+  const double c1 = 0x1.ebfce50fac4f3p-3 / 32.0 / 32.0;
+  const double c2 = 0x1.62e42ff0c52d6p-1 / 32.0;
+  const double shift = 0x1.8p+52;
+  const uint32_t ux = cpu_det_bits(x), abstop = (ux >> 20) & 0x7ffu;
+  if (abstop >= 0x42bu) { /* |x| >= 88 or NaN */
+    if (ux == 0xff800000u) {
+      return 0.0f;
+    }
+    if (abstop >= 0x7f8u) {
+      return cpu_det_add(x, x);
+    }
+    if (x > 0x1.62e42ep6f) {
+      return cpu_det_float(0x7f800000u);
+    }
+    if (x < -0x1.9fe368p6f) {
+      return 0.0f;
+    }
+  }
+  volatile double z = inv_ln2_n * (double)x;
+  volatile double kd = z + shift;
+  uint64_t ki, t;
+  memcpy(&ki, (const void *)&kd, sizeof(ki));
+  kd = kd - shift;
+  volatile double r = z - kd;
+  t = tab[ki % 32u] + (ki << 47);
+  double s;
+  memcpy(&s, &t, sizeof(s));
+  volatile double p = c0 * r;
+  p = p + c1;
+  volatile double r2 = r * r;
+  volatile double y = c2 * r;
+  y = y + 1.0;
+  volatile double q = p * r2;
+  y = q + y;
+  y = y * s;
+  return (float)y;
+}
+
+/**
+ * @brief The router after its logits, as buildExpertAssignments runs it:
+ *        sigmoid with bionic expf and a true divide, biased top-k, the
+ *        -ffast-math weight sum, the weights. Shared by the spec and the
+ *        DSP kernel, whose logits come from sffma chains.
+ *
+ * @param logits  E floats (1..32)
  * @param bias    E floats, added for the selection only
- * @param K       a multiple of 4
- * @param E       1..32
  * @param top_k   1..E
- * @param logits  E floats out
  * @param sel     top_k expert indices out, in selection order
  * @param weight  top_k routing weights out, in selection order
  */
-static inline void m1_router_topk_det(const float *x, const float *w,
-                                      const float *bias, uint32_t K, uint32_t E,
-                                      uint32_t top_k, float *logits,
-                                      uint32_t *sel, float *weight) {
+static inline void m1_router_cpu_select(const float *logits, const float *bias,
+                                        uint32_t E, uint32_t top_k,
+                                        uint32_t *sel, float *weight) {
   float sig[M1_DET_ROUTER_MAX_E], score[M1_DET_ROUTER_MAX_E];
-  uint32_t taken = 0u, e, r, k;
-  float wsum = 0.0f, inv;
+  uint32_t taken = 0u, e, r;
+  float a0 = 0.0f, a1 = 0.0f, wsum, inv;
   for (e = 0; e < E; ++e) {
-    float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (k = 0; k < K; ++k) {
-      a[k & 3u] = m1_det_add(a[k & 3u], m1_det_mul(x[k], w[(size_t)k * E + e]));
-    }
-    logits[e] = m1_det_add(m1_det_add(a[0], a[1]), m1_det_add(a[2], a[3]));
-    sig[e] = swiglu_det_recip(
-      m1_det_add(1.0f, swiglu_det_exp(m1_det_sub(0.0f, logits[e]))));
+    const float ex =
+      m1_expf_bionic_det(m1_det_float(m1_det_bits(logits[e]) ^ 0x80000000u));
+    sig[e] = cpu_det_div_rn(1.0f, m1_det_add(ex, 1.0f));
     score[e] = m1_det_add(sig[e], bias[e]);
   }
   for (r = 0; r < top_k; ++r) {
@@ -359,12 +428,97 @@ static inline void m1_router_topk_det(const float *x, const float *w,
     }
     taken |= 1u << best;
     sel[r] = best;
-    wsum = m1_det_add(wsum, sig[best]);
   }
-  inv = swiglu_det_recip(m1_det_add(wsum, 1e-6f));
+  for (r = 0; r + 1u < top_k; r += 2u) {
+    a0 = m1_det_add(sig[sel[r]], a0);
+    a1 = m1_det_add(sig[sel[r + 1u]], a1);
+  }
+  wsum = m1_det_add(a1, a0);
+  if (top_k & 1u) {
+    wsum = m1_det_add(sig[sel[top_k - 1u]], wsum);
+  }
+  inv = cpu_det_div_rn(1.0f, m1_det_add(wsum, 1e-6f));
   for (r = 0; r < top_k; ++r) {
-    weight[r] = m1_det_mul(m1_det_mul(sig[sel[r]], inv), 1.0f);
+    weight[r] = m1_det_mul(sig[sel[r]], inv);
   }
+}
+
+/**
+ * @brief The Android CPU's MoE router of one token (the doc above).
+ *
+ * @param x       K floats, the ffn-normed row
+ * @param w       K x E floats, row-major [K][E] (the gate weight's layout)
+ * @param bias    E floats, added for the selection only
+ * @param E       1..32
+ * @param top_k   1..E
+ * @param logits  E floats out
+ * @param sel     top_k expert indices out, in selection order
+ * @param weight  top_k routing weights out, in selection order
+ */
+static inline void m1_router_cpu_det(const float *x, const float *w,
+                                     const float *bias, uint32_t K, uint32_t E,
+                                     uint32_t top_k, float *logits,
+                                     uint32_t *sel, float *weight) {
+  for (uint32_t e = 0; e < E; ++e) {
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < K; ++k) {
+      acc = cpu_det_fma(x[k], w[(size_t)k * E + e], acc);
+    }
+    logits[e] = acc;
+  }
+  m1_router_cpu_select(logits, bias, E, top_k, sel, weight);
+}
+
+/** @brief neon_mathfun's exp_ps for one lane, as the shipped binary runs
+ *         it: fmin / fmax clamp, ONE fma (fx), a truncating floor, the
+ *         cephes polynomial in separate multiplies and adds. */
+static inline float m1_exp_ps_cpu_det(float x) {
+  const float hi = 88.3762626647949f, lo = -88.3762626647949f;
+  x = x < hi ? x : hi;
+  x = x > lo ? x : lo;
+  float fx = cpu_det_fma(x, 1.44269504088896341f, 0.5f);
+  const float t = (float)(int32_t)fx; /* fcvtzs + scvtf: |fx| < 129 */
+  fx = m1_det_sub(t, t > fx ? 1.0f : 0.0f);
+  x = m1_det_sub(x, m1_det_mul(fx, 0.693359375f));
+  x = m1_det_sub(x, m1_det_mul(fx, -2.12194440e-4f));
+  const float z = m1_det_mul(x, x);
+  float y = m1_det_mul(1.9875691500E-4f, x);
+  y = m1_det_add(y, 1.3981999507E-3f);
+  y = m1_det_mul(y, x);
+  y = m1_det_add(y, 8.3334519073E-3f);
+  y = m1_det_mul(y, x);
+  y = m1_det_add(y, 4.1665795894E-2f);
+  y = m1_det_mul(y, x);
+  y = m1_det_add(y, 1.6666665459E-1f);
+  y = m1_det_mul(y, x);
+  y = m1_det_add(y, 5.0000001201E-1f);
+  y = m1_det_mul(y, z);
+  y = m1_det_add(y, x);
+  y = m1_det_add(y, 1.0f);
+  const uint32_t pow2n = (uint32_t)((int32_t)fx + 127) << 23;
+  return m1_det_mul(y, m1_det_float(pow2n));
+}
+
+/** @brief neon::swiglu: out[i] = RN(y[i] / (exp_ps(-y[i]) + 1)) * z[i]
+ *         (n % 4 == 0: the scalar tail uses std::exp, not exp_ps). */
+static inline void m1_swiglu_cpu_det(const float *y, const float *z, float *out,
+                                     uint32_t n) {
+  for (uint32_t i = 0; i < n; ++i) {
+    const float e =
+      m1_exp_ps_cpu_det(m1_det_float(m1_det_bits(y[i]) ^ 0x80000000u));
+    out[i] = m1_det_mul(cpu_det_div_rn(y[i], m1_det_add(e, 1.0f)), z[i]);
+  }
+}
+
+/** @brief std::max_element: the index of the first maximum. */
+static inline uint32_t m1_argmax_first(const float *x, uint32_t n) {
+  uint32_t best = 0;
+  for (uint32_t i = 1; i < n; ++i) {
+    if (x[best] < x[i]) {
+      best = i;
+    }
+  }
+  return best;
 }
 
 #endif /* __NNTRAINER_M1_OPS_DET_H__ */

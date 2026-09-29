@@ -986,7 +986,7 @@ static void check_add_router(void) {
   for (i = 0; i < HID; ++i)
     h[i] = m1_det_add(h[i], a2[i]);
   m1_rmsnorm_det(h, gam[2], nrm, HID, HID, kHd64.eps, NULL);
-  m1_router_topk_det(nrm, rw, rbias, HID, HD64_E, HD64_TOP, lg, sel, wt);
+  m1_router_cpu_det(nrm, rw, rbias, HID, HD64_E, HD64_TOP, lg, sel, wt);
   for (r = 0; r < HD64_TOP; ++r) {
     r_cnt[sel[r]] = 1u;
     by_e[sel[r]] = wt[r];

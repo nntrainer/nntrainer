@@ -46,14 +46,15 @@
  * Inputs: an LCG from a fixed seed, plus three fixed rows / heads: all
  * zeros, all subnormal (+-1e-39) and large (|x| ~ 1e4).
  *
- * The router (#132) has no tolerance half: its output is a selection. It
- * is memcmp'd against the spec (logits, selection order, weights) at
- * three shapes on random, exact-tie and 1-ulp near-tie rows; then the
- * spec is set against a copy of the CPU's buildExpertAssignments (expf, a
- * true divide, a sequential dot, the total-order comparator) on 100000
- * LFM2.5-shaped rows, and every selection that differs must sit at a CPU
- * 4th/5th score gap below 1e-4 -- the near-tie class, never a logic or
- * tie-rule difference.
+ * The router (#132; the Android CPU's order since #132 PR 2) has no
+ * tolerance half: it is memcmp'd kernel against spec (logits, selection
+ * order, weights) at three shapes on random, exact-tie and 1-ulp near-tie
+ * rows; then the spec against an independent copy of the CPU's router
+ * (fmaf chains, glibc expf, true divides, the -ffast-math weight sum) bit
+ * for bit on LFM2.5-shaped rows, with three mutants that must be caught.
+ * The bionic expf port is pinned to glibc's same algorithm, the SwiGLU
+ * spec to an independent copy of neon::swiglu (three mutants), and
+ * argmax_first to std::max_element's tie rule.
  */
 
 #include <math.h>
@@ -821,7 +822,7 @@ static void check_router_kernel(void) {
         memset(wt_h, 0xA5, sizeof(wt_h));
         memset(sel_h, 0xA5, sizeof(sel_h));
         hvx_router_topk_f32(x, w32, bias, K, E, top_k, lg_h, sel_h, wt_h);
-        m1_router_topk_det(x, w, bias, K, E, top_k, lg_d, sel_d, wt_d);
+        m1_router_cpu_det(x, w, bias, K, E, top_k, lg_d, sel_d, wt_d);
         bad += memcmp(lg_h, lg_d, E * sizeof(float)) != 0;
         bad += memcmp(sel_h, sel_d, top_k * sizeof(uint32_t)) != 0;
         bad += memcmp(wt_h, wt_d, top_k * sizeof(float)) != 0;
@@ -841,7 +842,7 @@ static void check_router_kernel(void) {
     printf("ROUTER TOPK K=%u E=%u top_k=%u rows=%u (random, exact tie, "
            "1-ulp near tie) bad=%u tie_to_lowest=%u/8\n",
            K, E, top_k, rows, bad, ties_low);
-    CHECK(bad == 0u, "router K=%u: HVX differs from m1_router_topk_det", K);
+    CHECK(bad == 0u, "router K=%u: HVX differs from m1_router_cpu_det", K);
     CHECK(ties_low == 8u,
           "router K=%u: an exact tie did not go to the lower "
           "index",
@@ -852,11 +853,13 @@ static void check_router_kernel(void) {
   free(w32);
 }
 
-/** @brief buildExpertAssignments (lfm2_moe_layer.cpp) in C: a sequential
- *         dot for the logits (the CPU's BLAS has its own order), expf, a
- *         true divide, and std::partial_sort under the total order score
- *         descending, index ascending -- a full sort gives the same first
- *         top_k. Also returns the 4th / 5th score gap. */
+/**
+ * @brief The Android CPU's router written independently from its
+ *        disassembly (plan 132 section 0.2), with the host's own fmaf, a
+ *        true divide and glibc expf, plus one mutant per rejected order:
+ *        mut 1 the merged spec's four partial sums, 2 an unfused chain, 3
+ *        the wsum in selection order ((s0 + s1) + s2) + s3.
+ */
 typedef struct {
   float s;
   int e;
@@ -868,77 +871,260 @@ static int scored_cmp(const void *pa, const void *pb) {
   }
   return a->e - b->e;
 }
-static float router_cpu(const float *x, const float *w, const float *bias,
-                        uint32_t K, uint32_t E, uint32_t top_k, uint32_t *sel,
-                        float *logits) {
+static void router_ref(const float *x, const float *w, const float *bias,
+                       uint32_t K, uint32_t E, uint32_t top_k, int mut,
+                       float *logits, uint32_t *sel, float *weight) {
   scored_t sc[ROUTER_MAX_E];
+  float sig[ROUTER_MAX_E];
   for (uint32_t e = 0; e < E; ++e) {
-    float l = 0.0f;
-    for (uint32_t k = 0; k < K; ++k) {
-      l += x[k] * w[(size_t)k * E + e];
+    volatile float l = 0.0f;
+    if (mut == 1) {
+      volatile float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      for (uint32_t k = 0; k < K; ++k) {
+        volatile float p = x[k] * w[(size_t)k * E + e];
+        a[k & 3u] = a[k & 3u] + p;
+      }
+      volatile float h0 = a[0] + a[1], h1 = a[2] + a[3];
+      l = h0 + h1;
+    } else {
+      for (uint32_t k = 0; k < K; ++k) {
+        if (mut == 2) {
+          volatile float p = x[k] * w[(size_t)k * E + e];
+          l = l + p;
+        } else {
+          l = fmaf(x[k], w[(size_t)k * E + e], l);
+        }
+      }
     }
     logits[e] = l;
-    const float s = 1.0f / (1.0f + expf(-l));
-    sc[e].s = s + bias[e];
+    volatile float d = expf(-l) + 1.0f;
+    volatile float sg = 1.0f / d;
+    sig[e] = sg;
+    volatile float scv = sg + bias[e];
+    sc[e].s = scv;
     sc[e].e = (int)e;
   }
   qsort(sc, E, sizeof(sc[0]), scored_cmp);
+  volatile float wsum;
+  if (mut == 3) {
+    wsum = 0.0f;
+    for (uint32_t r = 0; r < top_k; ++r) {
+      wsum = wsum + sig[sc[r].e];
+    }
+  } else {
+    volatile float a0 = 0.0f, a1 = 0.0f;
+    uint32_t r = 0;
+    for (; r + 1u < top_k; r += 2u) {
+      a0 = sig[sc[r].e] + a0;
+      a1 = sig[sc[r + 1u].e] + a1;
+    }
+    wsum = a1 + a0;
+    if (r < top_k) {
+      wsum = sig[sc[r].e] + wsum;
+    }
+  }
+  volatile float den = wsum + 1e-6f;
+  volatile float inv = 1.0f / den;
   for (uint32_t r = 0; r < top_k; ++r) {
     sel[r] = (uint32_t)sc[r].e;
+    volatile float wt = sig[sc[r].e] * inv;
+    weight[r] = wt;
   }
-  return sc[top_k - 1u].s - sc[top_k].s;
 }
 
-static uint32_t sel_mask(const uint32_t *sel, uint32_t top_k) {
-  uint32_t m = 0;
-  for (uint32_t r = 0; r < top_k; ++r) {
-    m |= 1u << sel[r];
-  }
-  return m;
-}
-
+/** @brief The spec against the independent CPU reference on LFM2.5-shaped
+ *         rows, bit for bit (logits, selection, weights); every mutant
+ *         must be caught on at least one row. */
 static void check_router_vs_cpu(void) {
-  enum { ROWS = 100000, TIE_ROWS = 1000 };
+  enum { ROWS = 5000, TIE_ROWS = 500, MUTS = 3 };
   const uint32_t K = 2048u, E = 32u, top_k = 4u;
   float *x = malloc(K * sizeof(float));
   float *w = malloc((size_t)K * E * sizeof(float));
   float *w32 = malloc((size_t)K * ROUTER_MAX_E * sizeof(float));
   float bias[ROUTER_MAX_E], lg[ROUTER_MAX_E], lg_c[ROUTER_MAX_E];
-  float wt[ROUTER_MAX_E];
+  float wt[ROUTER_MAX_E], wt_c[ROUTER_MAX_E];
   uint32_t sel_d[ROUTER_MAX_E], sel_c[ROUTER_MAX_E];
-  uint32_t flips = 0, tie_flips = 0;
-  float max_gap = 0.0f, max_dlogit = 0.0f;
-  /* one weight matrix and bias (a layer), a fresh activation per row */
+  uint32_t bad = 0, caught[MUTS + 1] = {0};
   router_inputs(x, w, w32, bias, K, E, top_k, 0);
-  for (uint32_t row = 0; row < ROWS; ++row) {
-    fill_rand(x, K, -2.0f, 2.0f);
-    m1_router_topk_det(x, w, bias, K, E, top_k, lg, sel_d, wt);
-    const float gap = router_cpu(x, w, bias, K, E, top_k, sel_c, lg_c);
-    for (uint32_t e = 0; e < E; ++e) {
-      const float d = fabsf(lg[e] - lg_c[e]);
-      max_dlogit = d > max_dlogit ? d : max_dlogit;
+  for (uint32_t row = 0; row < ROWS + TIE_ROWS; ++row) {
+    if (row < ROWS) {
+      /* magnitudes 2^-20 .. 2^20 across rows: the chain's rounding at
+         every scale */
+      const float m = ldexpf(1.0f, (int)(row % 41u) - 20);
+      fill_rand(x, K, -2.0f * m, 2.0f * m);
+    } else {
+      router_inputs(x, w, w32, bias, K, E, top_k, 1);
     }
-    if (sel_mask(sel_d, top_k) != sel_mask(sel_c, top_k)) {
-      ++flips;
-      max_gap = gap > max_gap ? gap : max_gap;
+    m1_router_cpu_det(x, w, bias, K, E, top_k, lg, sel_d, wt);
+    for (int mut = 0; mut <= MUTS; ++mut) {
+      router_ref(x, w, bias, K, E, top_k, mut, lg_c, sel_c, wt_c);
+      const int diff = memcmp(lg, lg_c, E * sizeof(float)) != 0 ||
+                       memcmp(sel_d, sel_c, top_k * sizeof(uint32_t)) != 0 ||
+                       memcmp(wt, wt_c, top_k * sizeof(float)) != 0;
+      if (mut == 0) {
+        bad += diff;
+      } else {
+        caught[mut] += diff;
+      }
     }
   }
-  for (uint32_t row = 0; row < TIE_ROWS; ++row) {
-    router_inputs(x, w, w32, bias, K, E, top_k, 1);
-    m1_router_topk_det(x, w, bias, K, E, top_k, lg, sel_d, wt);
-    router_cpu(x, w, bias, K, E, top_k, sel_c, lg_c);
-    tie_flips += sel_mask(sel_d, top_k) != sel_mask(sel_c, top_k);
+  printf("ROUTER CPU-ORDER rows=%d (+%d exact ties) bad=%u mutants caught: "
+         "4-partial=%u unfused=%u wsum-in-order=%u\n",
+         ROWS, TIE_ROWS, bad, caught[1], caught[2], caught[3]);
+  CHECK(bad == 0u, "router spec differs from the CPU reference on %u rows",
+        bad);
+  for (int mut = 1; mut <= MUTS; ++mut) {
+    CHECK(caught[mut] > 0u, "router mutant %d not caught", mut);
   }
-  /* max_dlogit is the noise scale a flip needs a gap below */
-  printf("ROUTER SPEC vs CPU rows=%d set_flips=%u max_gap_at_flip=%.3g "
-         "max_logit_diff=%.3g exact_tie_rows=%d tie_flips=%u\n",
-         ROWS, flips, (double)max_gap, (double)max_dlogit, TIE_ROWS, tie_flips);
-  CHECK(max_gap < 1e-4f, "router spec vs CPU: a flip at a score gap %.3g",
-        (double)max_gap);
-  CHECK(tie_flips == 0u, "router spec vs CPU: %u exact ties split", tie_flips);
   free(x);
   free(w);
   free(w32);
+}
+
+/* ---- bionic expf port, swiglu, argmax (#132 PR 2) ----------------------- */
+
+/** @brief The port against the host's glibc expf, which is the same Arm
+ *         optimized-routines algorithm plus a correction on two inputs the
+ *         algorithm misrounds (found by the full 2^32 sweep, 2026-09-29).
+ *         Every 61st bit pattern here, and those two by name. The device
+ *         gtest ExpfBionic.* compares all 2^32 against bionic itself. */
+static void check_expf_port(void) {
+  static const uint32_t glibc_fixed[2] = {0x4202422fu, 0xc27c65d9u};
+  uint64_t n = 0, bad = 0;
+  for (uint64_t u = 0; u < (1ull << 32); u += 61u) {
+    float x;
+    const uint32_t b = (uint32_t)u;
+    memcpy(&x, &b, sizeof(x));
+    if (x != x || b == glibc_fixed[0] || b == glibc_fixed[1]) {
+      continue;
+    }
+    const float p = m1_expf_bionic_det(x), g = expf(x);
+    ++n;
+    bad += memcmp(&p, &g, sizeof(p)) != 0;
+  }
+  uint32_t fixed_ulp = 0;
+  for (int i = 0; i < 2; ++i) {
+    float x;
+    memcpy(&x, &glibc_fixed[i], sizeof(x));
+    const float p = m1_expf_bionic_det(x), g = expf(x);
+    fixed_ulp += (uint32_t)abs((int32_t)(m1_det_bits(p) - m1_det_bits(g)));
+  }
+  printf("EXPF PORT vs glibc inputs=%llu bad=%llu glibc-corrected pair "
+         "ulp=%u (0 or 2: one each way if this glibc corrects them)\n",
+         (unsigned long long)n, (unsigned long long)bad, fixed_ulp);
+  CHECK(bad == 0u, "expf port differs from glibc on %llu inputs",
+        (unsigned long long)bad);
+  CHECK(fixed_ulp <= 2u, "expf port: the glibc pair is %u ulp off", fixed_ulp);
+}
+
+/** @brief neon::swiglu as the binary runs it, written independently with
+ *         plain float operators (this file is built with
+ *         -ffp-contract=off) and fmaf for the one fused step; mut 1 fuses
+ *         every polynomial step, 2 is libm expf (the scalar tail's
+ *         std::exp), 3 multiplies by the reciprocal instead of dividing.
+ *         Splitting the fused fx step is no mutant: after the floor it is
+ *         bit-equivalent (0 of 1017966 inputs within 2000 ulps of every
+ *         floor boundary differ, checked 2026-09-29). */
+static float swiglu_ref(float y, float z, int mut) {
+  volatile float x = -y;
+  x = fminf(x, 88.3762626647949f);
+  x = fmaxf(x, -88.3762626647949f);
+  volatile float fx = fmaf(x, 1.44269504088896341f, 0.5f);
+  volatile float t = (float)(int32_t)fx;
+  fx = (t > fx) ? t - 1.0f : t - 0.0f;
+  volatile float a = fx * 0.693359375f;
+  x = x - a;
+  volatile float bq = fx * -2.12194440e-4f;
+  x = x - bq;
+  volatile float zz = x * x, p;
+  static const float c[6] = {1.9875691500E-4f, 1.3981999507E-3f,
+                             8.3334519073E-3f, 4.1665795894E-2f,
+                             1.6666665459E-1f, 5.0000001201E-1f};
+  p = c[0];
+  for (int i = 1; i < 6; ++i) {
+    if (mut == 1) {
+      p = fmaf(p, x, c[i]);
+    } else {
+      volatile float m = p * x;
+      p = m + c[i];
+    }
+  }
+  p = p * zz;
+  p = p + x;
+  p = p + 1.0f;
+  uint32_t pb = (uint32_t)((int32_t)fx + 127) << 23;
+  float pow2n;
+  memcpy(&pow2n, &pb, sizeof(pow2n));
+  volatile float e = p * pow2n;
+  if (mut == 2) {
+    e = expf(-y);
+  }
+  volatile float den = e + 1.0f;
+  volatile float q;
+  if (mut == 3) {
+    volatile float r = 1.0f / den;
+    q = y * r;
+  } else {
+    q = y / den;
+  }
+  volatile float out = q * z;
+  return out;
+}
+
+static void check_swiglu_argmax(void) {
+  enum { N = 7168, ROWS = 64, MUTS = 3 };
+  float *y = malloc(N * sizeof(float)), *z = malloc(N * sizeof(float));
+  float *o = malloc(N * sizeof(float));
+  uint32_t bad = 0, caught[MUTS + 1] = {0};
+  for (int row = 0; row < ROWS; ++row) {
+    /* the dense FFN's gate range plus the clamp and far tails */
+    const float span = row < 16 ? 8.0f : row < 48 ? 100.0f : 1e4f;
+    fill_rand(y, N, -span, span);
+    fill_rand(z, N, -4.0f, 4.0f);
+    if (row == 1) {
+      for (uint32_t i = 0; i < N; ++i) {
+        y[i] = (i & 1u) ? -1e-39f : 1e-39f;
+      }
+    }
+    if (row == 2) {
+      /* -y a few ulps either side of every floor boundary of fx,
+         (k - 0.5) / log2(e) */
+      for (uint32_t i = 0; i < N; ++i) {
+        const int k = (int)(i / 56u) - 127;
+        const float x0 = (float)(((double)k - 0.5) / 1.4426950408889634);
+        y[i] = -m1_det_float(m1_det_bits(x0) + (uint32_t)(i % 56u) - 28u);
+      }
+    }
+    m1_swiglu_cpu_det(y, z, o, N);
+    for (uint32_t i = 0; i < N; ++i) {
+      for (int mut = 0; mut <= MUTS; ++mut) {
+        const float r = swiglu_ref(y[i], z[i], mut);
+        const int diff = memcmp(&r, &o[i], sizeof(r)) != 0;
+        if (mut == 0) {
+          bad += diff;
+        } else {
+          caught[mut] += diff;
+        }
+      }
+    }
+  }
+  printf("SWIGLU CPU-ORDER elems=%d bad=%u mutants caught: fused-poly=%u "
+         "libm-expf=%u recip-mul=%u\n",
+         N * ROWS, bad, caught[1], caught[2], caught[3]);
+  CHECK(bad == 0u, "swiglu spec differs from the CPU reference");
+  for (int mut = 1; mut <= MUTS; ++mut) {
+    CHECK(caught[mut] > 0u, "swiglu mutant %d not caught", mut);
+  }
+  /* argmax: first of equal maxima; a later larger one wins */
+  float v[8] = {1.0f, 3.0f, 2.0f, 3.0f, -1.0f, 3.0f, 0.0f, 2.5f};
+  const uint32_t i0 = m1_argmax_first(v, 8);
+  v[6] = 4.0f;
+  const uint32_t i1 = m1_argmax_first(v, 8);
+  printf("ARGMAX first-of-ties=%u later-max=%u\n", i0, i1);
+  CHECK(i0 == 1u && i1 == 6u, "argmax_first");
+  free(y);
+  free(z);
+  free(o);
 }
 
 int main(int argc, char **argv) {
@@ -954,6 +1140,8 @@ int main(int argc, char **argv) {
   check_conv();
   check_router_kernel();
   check_router_vs_cpu();
+  check_expf_port();
+  check_swiglu_argmax();
   if (g_fail) {
     printf("M1 OPS CHECK FAILED\n");
     return 1;

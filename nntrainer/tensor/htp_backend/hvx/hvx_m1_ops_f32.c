@@ -20,9 +20,11 @@
  * RoPE is the other exception to "f32 inside": it is the Android CPU's
  * fp16 RoPE (#152), every step rounded with hvx_rne16_sf, so the resident
  * attention sees the CPU's q and k bit for bit.
- * Rule 24: no flush-to-zero anywhere, no qf32 (v75/v79 differ). The one
- * exp, the router's sigmoid (#132), is hvx_swiglu_det.h's exp_det with its
- * own clamp; the norms' domain is m1_ops_det.h's (d >= eps, normal).
+ * Rule 24: no flush-to-zero anywhere, no qf32 (v75/v79 differ); the
+ * norms' domain is m1_ops_det.h's (d >= eps, normal). The router is the
+ * third exception (#132 PR 2): the Android CPU's order, E fused sffma
+ * chains on the scalar core and the spec's own sigmoid and selection
+ * (m1_router_cpu_select).
  */
 
 #include "hvx_m1_ops_f32.h"
@@ -145,28 +147,21 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
  *         a time, a hint only -- the bits do not depend on it. */
 #define ROUTER_PF_ROWS 128u
 
-/** @brief One vector seen as its 32 lanes, for the scalar selection. */
-typedef union {
-  HVX_Vector v;
-  float f[LANES];
-} router_lanes;
-
 void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
                          uint32_t K, uint32_t E, uint32_t top_k, float *logits,
                          uint32_t *sel, float *weight) {
-  HVX_Vector a0 = Q6_V_vzero(), a1 = Q6_V_vzero(), a2 = Q6_V_vzero(),
-             a3 = Q6_V_vzero();
-  const HVX_UVector *vw = (const HVX_UVector *)w32;
-  HVX_Vector wsum = Q6_V_vzero();
-  router_lanes lg, sg, sc;
-  uint32_t taken = 0u, e, r, k;
-  if (!x || !w32 || !bias || !logits || !sel || !weight || K == 0u ||
-      K % 4u != 0u || E == 0u || E > LANES || top_k == 0u || top_k > E) {
+  float acc[LANES];
+  uint32_t e, k;
+  if (!x || !w32 || !bias || !logits || !sel || !weight || K == 0u || E == 0u ||
+      E > LANES || top_k == 0u || top_k > E) {
     return;
   }
-  /* logit: four lane accumulators over k = 0, 1, 2, 3 (mod 4), then
-     (a0 + a1) + (a2 + a3) -- m1_router_topk_det's order per lane */
-  for (k = 0; k < K; k += 4u) {
+  /* [#132 PR 2] the CPU's sgemv_n: one fused chain per expert in k order,
+     E independent chains on the scalar core (m1_router_cpu_det) */
+  for (e = 0; e < E; ++e) {
+    acc[e] = 0.0f;
+  }
+  for (k = 0; k < K; ++k) {
 #if defined(__hexagon__)
     if (k % ROUTER_PF_ROWS == 0u && k + ROUTER_PF_ROWS < K) {
       /* Rtt: [47:32] stride, [31:16] width, [15:0] height */
@@ -176,48 +171,12 @@ void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
                       (uint64_t)ROUTER_PF_ROWS);
     }
 #endif
-    a0 = Q6_Vsf_vadd_VsfVsf(a0, Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(x[k]), vw[k]));
-    a1 = Q6_Vsf_vadd_VsfVsf(
-      a1, Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(x[k + 1u]), vw[k + 1u]));
-    a2 = Q6_Vsf_vadd_VsfVsf(
-      a2, Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(x[k + 2u]), vw[k + 2u]));
-    a3 = Q6_Vsf_vadd_VsfVsf(
-      a3, Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(x[k + 3u]), vw[k + 3u]));
-  }
-  lg.v =
-    Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vadd_VsfVsf(a0, a1), Q6_Vsf_vadd_VsfVsf(a2, a3));
-  /* sigmoid = recip_det(1 + exp_det(0 - logit)); score = sigmoid + bias */
-  sg.v = hvx_recip_det_sf(
-    Q6_Vsf_vadd_VsfVsf(hvx_splat_sf(1.0f),
-                       hvx_exp_det_sf(Q6_Vsf_vsub_VsfVsf(Q6_V_vzero(), lg.v))));
-  memset(&sc, 0, sizeof(sc));
-  memcpy(sc.f, bias, (size_t)E * sizeof(float));
-  sc.v = Q6_Vsf_vadd_VsfVsf(sg.v, sc.v);
-  memcpy(logits, lg.f, (size_t)E * sizeof(float));
-  /* top_k rounds of argmax over the unchosen, the lowest index on a tie: a
-     compare moves no bits, so the scalar unit may do it */
-  for (r = 0; r < top_k; ++r) {
-    uint32_t best = E;
+    const float xk = x[k];
+    const float *row = w32 + (size_t)k * LANES;
     for (e = 0; e < E; ++e) {
-      if (!(taken & (1u << e)) && (best == E || sc.f[e] > sc.f[best])) {
-        best = e;
-      }
+      acc[e] = Q6_R_sfmpyacc_RR(acc[e], xk, row[e]);
     }
-    taken |= 1u << best;
-    sel[r] = best;
-    wsum = Q6_Vsf_vadd_VsfVsf(wsum, hvx_splat_sf(sg.f[best]));
   }
-  /* weight = (sig * recip_det(wsum + 1e-6)) * 1.0 on splats, so no scalar
-     FPU op (and no sffma the compiler could contract into) touches the
-     arithmetic */
-  {
-    const HVX_Vector inv =
-      hvx_recip_det_sf(Q6_Vsf_vadd_VsfVsf(wsum, hvx_splat_sf(1e-6f)));
-    for (r = 0; r < top_k; ++r) {
-      lg.f[r] = sg.f[sel[r]];
-    }
-    lg.v =
-      Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(lg.v, inv), hvx_splat_sf(1.0f));
-    memcpy(weight, lg.f, (size_t)top_k * sizeof(float));
-  }
+  memcpy(logits, acc, (size_t)E * sizeof(float));
+  m1_router_cpu_select(logits, bias, E, top_k, sel, weight);
 }

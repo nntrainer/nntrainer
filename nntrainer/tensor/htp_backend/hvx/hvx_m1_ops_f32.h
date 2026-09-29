@@ -76,20 +76,21 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
                           float *out, uint32_t C);
 
 /**
- * @brief The MoE router of one token (m1_router_topk_det): logits, sigmoid,
- *        biased top-k with the lowest index winning a tie, and the
- *        normalized routing weights.
+ * @brief The MoE router of one token in the Android CPU's order
+ *        (m1_router_cpu_det, #132 PR 2): logits, sigmoid, biased top-k
+ *        with the lowest index winning a tie, and the normalized routing
+ *        weights.
  *
- * One weight row is one vector: four lane accumulators over k mod 4 give
- * the spec's summation order per expert. The weight read (K x 128 B, 256
- * KiB at LFM2.5) is direct HVX loads from DDR with an l2fetch of the next
- * 16 KiB ahead -- a hint that moves no bits.
+ * The logits are E fused chains over k in order, run on the scalar core
+ * with sffma (E independent chains in flight); the rest is the spec's own
+ * m1_router_cpu_select. The weight read (K x 128 B, 256 KiB at LFM2.5)
+ * keeps an l2fetch of the next 16 KiB ahead -- a hint that moves no bits.
  *
  * @param x       K floats
  * @param w32     K x 32 floats: the [K][E] gate weight padded to 32 columns
  *                (lanes >= E are read and ignored)
  * @param bias    E floats
- * @param K       a multiple of 4
+ * @param K       >= 1
  * @param E       1..32
  * @param top_k   1..E
  * @param logits  E floats out
