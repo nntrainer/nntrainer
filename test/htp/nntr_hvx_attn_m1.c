@@ -22,10 +22,12 @@
 #include <AEEStdErr.h>
 #include <HAP_farf.h>
 #include <remote.h>
+#include <string.h>
 
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
 
+#include "attn_m1_det.h"
 #include "hvx_attn_m1_f32.h"
 
 int nntr_hvx_attn_m1_register(remote_handle64 handle, uint32 n_layers,
@@ -112,7 +114,8 @@ int nntr_hvx_attn_m1_forward(remote_handle64 handle, uint32 layer, uint32 pos,
   if (qLen < 0 || kLen < 0 || vLen < 0 || yLen < 0 || statsLen < 0 ||
       (uint32_t)qLen != n_q * c->head_dim ||
       (uint32_t)kLen != c->n_kv * c->head_dim || vLen != kLen || yLen != qLen ||
-      (statsLen != 0 && (uint32_t)statsLen != 2u * n_q)) {
+      (statsLen != 0 && (uint32_t)statsLen != 2u * n_q &&
+       (uint32_t)statsLen != 2u * n_q + ATTN_M1_PROF_WORDS)) {
     FARF(ERROR,
          "attn_m1_forward: bad shape (q=%d k=%d v=%d y=%d stats=%d; "
          "n_q=%u head_dim=%u)",
@@ -120,6 +123,16 @@ int nntr_hvx_attn_m1_forward(remote_handle64 handle, uint32 layer, uint32 pos,
          (unsigned)c->head_dim);
     return AEE_EINVALIDFORMAT;
   }
-  return hvx_attn_m1_forward(s->attn_m1, layer, pos, scale, q, k, v, y,
-                             statsLen ? stats : NULL);
+  if ((uint32_t)statsLen != 2u * n_q + ATTN_M1_PROF_WORDS) {
+    return hvx_attn_m1_forward(s->attn_m1, layer, pos, scale, q, k, v, y,
+                               statsLen ? stats : NULL);
+  }
+  /* The phase words (#146) follow the (m, l) pairs, bit-copied. */
+  uint32_t prof[ATTN_M1_PROF_WORDS];
+  const int rc = hvx_attn_m1_forward_prof(s->attn_m1, layer, pos, scale, q, k,
+                                          v, y, stats, prof);
+  if (rc == AEE_SUCCESS) {
+    memcpy(stats + 2u * n_q, prof, sizeof(prof));
+  }
+  return rc;
 }

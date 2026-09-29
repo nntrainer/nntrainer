@@ -33,12 +33,14 @@
  * would halve it and is the upgrade path once an sf -> hf rounding spec is
  * device-confirmed (plan 81 section 3.1).
  *
- * THREADS. forward runs one unit per kv head on hvx_worker_pool_run: unit
- * i takes kv heads i, i + n, ... and writes probabilities into scratch
- * lane i (n <= n_kv, so the scratch is sized by heads, not by workers).
- * The split is deterministic by construction: no reduction crosses a
- * head, so the output is byte-equal at any worker count -- which the host
- * check proves at 0, 3 and 7 workers.
+ * THREADS. forward runs one unit per (kv head, pair of its q heads) on
+ * hvx_worker_pool_run when gqa is even -- 16 units at LFM2.5's shape, so
+ * the busiest of 6 lanes runs 1.5 kv heads' work instead of 2 (#146) --
+ * and one unit per kv head when gqa is odd. Lane i takes units i, i + n,
+ * ...; each unit writes its q heads' probabilities into their own scratch
+ * rows. The split is deterministic by construction: no reduction crosses
+ * a q head, so the output is byte-equal at any worker count -- which the
+ * host check proves at 0, 3 and 7 workers.
  *
  * ALIGNMENT. q, k, v, out and stats are the caller's FastRPC buffers and
  * carry no vector alignment: every access to them is HVX_UVector or
@@ -80,7 +82,7 @@ typedef struct {
   uint32_t *kv_len;    /**< [n_layers] positions held, 0..max_seq */
   float *kt;           /**< [n_layers][n_kv][head_dim][max_seq], memalign 128 */
   float *v;            /**< [n_layers][n_kv][max_seq][head_dim], memalign 128 */
-  float *scratch;      /**< [n_kv][gqa][max_seq] probabilities, memalign 128 */
+  float *scratch;      /**< [n_kv * gqa][max_seq] per q head, memalign 128 */
   size_t cache_floats; /**< floats in kt, and in v */
   hvx_worker_pool *pool; /**< borrowed; NULL runs every head on the caller */
 } hvx_attn_m1_ctx;
@@ -139,5 +141,19 @@ int hvx_attn_m1_kv_append(hvx_attn_m1_ctx *ctx, uint32_t layer,
 int hvx_attn_m1_forward(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
                         float scale, const float *q, const float *k,
                         const float *v, float *out, float *stats);
+
+/**
+ * @brief hvx_attn_m1_forward that also fills the phase words (#146).
+ *
+ * @param prof  ATTN_M1_PROF_WORDS uint32 words (attn_m1_det.h's
+ *              ATTN_M1_PROF_* indices), or NULL -- then this is exactly
+ *              hvx_attn_m1_forward and takes no timestamp. Written only on
+ *              AEE_SUCCESS. The words are a measurement channel: the output
+ *              and stats are byte-equal with and without them
+ */
+int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
+                             float scale, const float *q, const float *k,
+                             const float *v, float *out, float *stats,
+                             uint32_t *prof);
 
 #endif /* __NNTRAINER_HVX_ATTN_M1_F32_H__ */

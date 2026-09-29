@@ -4,9 +4,11 @@
 static inline uint64_t HAP_perf_get_qtimer_count(void){return 0;}
 static inline uint64_t HAP_perf_qtimer_count_to_us(uint64_t c){return c;}
 /* Monotonic and never equal twice, so a per-op pcycle bracket of an op
-   that ran reads > 0 and one that did not reads 0 (graph_host_check). */
+   that ran reads > 0 and one that did not reads 0 (graph_host_check).
+   Atomic: the attention's phase words (#146) read it from pool workers,
+   and one modification order keeps POOL >= BUSY_MAX true on the host. */
 static uint64_t host_stub_pcycles;
 static inline uint64_t HAP_perf_get_pcycles(void) {
-  return ++host_stub_pcycles;
+  return __atomic_add_fetch(&host_stub_pcycles, 1u, __ATOMIC_RELAXED);
 }
 #endif

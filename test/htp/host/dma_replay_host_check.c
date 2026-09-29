@@ -15,8 +15,11 @@
  * as the gtest serializes them and holds res[12] against
  * nntr_moe_dma_tag_sum, so the skel's parse, destination modes, drain,
  * window and tag sum are checked against the simulator the gtest trusts.
- * Also: the old traced cells still read the res[6] #99 reported
- * (1 467 840), and bad flags or a drain with two workers are refused. The
+ * Also: the traced list unflagged still reads the res[6] #99 reported
+ * (1 467 840); with DST_STRIDED on every push (the gtest's MoeChunkReplay
+ * schedule since #99) it reads the kernel's footprint, 0xA5 x gu / 64,
+ * and 22 560 768 bytes per call; bad flags or a drain with two workers
+ * are refused. The
  * device's timing and its interleaving of transfers are not modelled.
  */
 #include "nntr_hvx.h"
@@ -105,6 +108,29 @@ int main(void) {
     if (err != AEE_SUCCESS || res[6] != 1467840u) {
       printf("FAIL old cell workers=%u: err=%d res[6]=%u\n", w, err, res[6]);
       fail = 1;
+    }
+  }
+  /* #99: MoeChunkReplay's schedule, every push strided, 1/2/4 workers. */
+  {
+    static nntr_moe_dma_item strided[NNTR_MOE_DMA_PLAN_MAX];
+    for (uint32_t k = 0; k < nt; ++k) {
+      strided[k] = traced[k];
+      if (strided[k].op == NNTR_MOE_DMA_OP_PUSH) {
+        strided[k].flags = NNTR_MOE_DMA_DST_STRIDED;
+      }
+    }
+    for (uint32_t w = 1; w <= 4; w *= 2) {
+      uint32_t res[12] = {0};
+      memset(s.vtcm_base, 0x5a, s.vtcm_size);
+      const int err =
+        nntr_hvx_dma_replay(h, 0, region, sched, serialize(strided, nt), w, 0,
+                            0, 0, 0, calls, res, 12);
+      if (err != AEE_SUCCESS || res[6] != 0xA5u * (gu / 64u) ||
+          res[6] != 9461760u || res[2] != 22560768u) {
+        printf("FAIL strided cell workers=%u: err=%d res[6]=%u bytes=%u\n", w,
+               err, res[6], res[2]);
+        fail = 1;
+      }
     }
   }
   /* Refused: both destination modes at once; a drain on two workers. */

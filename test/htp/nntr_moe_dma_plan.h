@@ -250,8 +250,8 @@ nntr_moe_dma_plan_m1(uint32_t K, uint32_t inter, uint32_t N_out,
 /** @brief Destination mode of one replay push (item flags). DST_PACKED
  *  lands rows back to back (dst_stride = row_size), DST_STRIDED keeps the
  *  source stride (the kernel's VTCM layout). Neither set = the replay's
- *  default, which is packed in this tree; #99 makes it strided, and it
- *  changes nntr_moe_dma_dst_stride with the skel. */
+ *  default, packed; the gtest's MoeChunkReplay cells set DST_STRIDED on
+ *  every push (#99), the #100 traced* cells keep the default. */
 #define NNTR_MOE_DMA_DST_PACKED 1u
 #define NNTR_MOE_DMA_DST_STRIDED 2u
 
