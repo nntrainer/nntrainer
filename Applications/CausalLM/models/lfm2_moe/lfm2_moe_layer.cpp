@@ -21,16 +21,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <htp_decode_hook.h>
 #include <deque>
 #include <expert_lru.h>
-#include <htp_decode_hook.h>
 #include <iostream>
 #include <lfm2_moe_layer.h>
 #include <node_exporter.h>
 #include <stdexcept>
 #include <thread_manager.h>
 #include <unordered_map>
-#include <unordered_set>
 
 /** [A1] The deterministic SwiGLU. nntrainer::swiglu is left alone on
     purpose -- every model on ARM uses it and nothing is wrong with it.
@@ -160,6 +159,9 @@ private:
 } // namespace
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
+/** Optional second input: what the router reads instead of the experts'
+ *  input (props::RouterType). */
+static constexpr size_t ROUTER_IN_IDX = 1;
 
 /** LFM2-MoE router hyper-parameters (fixed for LFM2-8B-A1B). */
 static constexpr bool NORM_TOPK_PROB = true;
@@ -226,18 +228,20 @@ static std::FILE *moeTrace() {
   return f;
 }
 
-/** @brief NNTR_MOE_CACHE_EXPERTS as a count, 0 when unset or unparsable
- *  (the resident path, unchanged). The same variable and the same parsing
- *  as Lfm2CachedSlimMoELayer, so one knob drives the CPU and HTP caches. */
-static unsigned int expertCacheFromEnv(unsigned int num_experts) {
+/** @brief NNTR_MOE_CACHE_EXPERTS as a count; unset or unparsable falls back
+ *  to @a from_props (the cache_experts property, 0 = the resident path,
+ *  unchanged). The same variable and the same parsing as
+ *  Lfm2CachedSlimMoELayer, so one knob drives the CPU and HTP caches. */
+static unsigned int expertCacheFromEnv(unsigned int num_experts,
+                                       unsigned int from_props) {
   const char *value = std::getenv("NNTR_MOE_CACHE_EXPERTS");
   if (value == nullptr || *value == '\0' || *value == '-')
-    return 0;
+    return std::min(num_experts, from_props);
   errno = 0;
   char *end = nullptr;
   const unsigned long parsed = std::strtoul(value, &end, 10);
   if (errno == ERANGE || end == value || *end != '\0')
-    return 0;
+    return std::min(num_experts, from_props);
   return static_cast<unsigned int>(
     std::min<unsigned long>(num_experts, parsed));
 }
@@ -252,7 +256,9 @@ Lfm2MoELayer::Lfm2MoELayer() :
   num_experts(0),
   topk(0),
   moe_props(props::NumExperts(), props::NumExpertsPerToken(),
-            nntrainer::props::Unit(), props::MoEActivation()),
+            nntrainer::props::Unit(), props::MoEActivation(),
+            props::RouterType(), props::CacheExperts()),
+  softmax_router(false),
   expert_gate_up_proj_indices({}),
   expert_down_proj_indices({}),
   gate_idx(std::numeric_limits<unsigned>::max()),
@@ -269,8 +275,15 @@ Lfm2MoELayer::Lfm2MoELayer() :
 void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
 
   // 1. Validate input/output dimensions
-  NNTR_THROW_IF(context.getNumInputs() != 1, std::invalid_argument)
-    << "LFM2 MoE layer only supports single input";
+  NNTR_THROW_IF(context.getNumInputs() < 1 || context.getNumInputs() > 2,
+                std::invalid_argument)
+    << "MoE layer takes one input, or two when the router reads its own";
+  const std::string &router_type = std::get<props::RouterType>(moe_props);
+  NNTR_THROW_IF(router_type != "sigmoid_bias" && router_type != "softmax_scale",
+                std::invalid_argument)
+    << "MoE router_type must be sigmoid_bias or softmax_scale, got "
+    << router_type;
+  softmax_router = router_type == "softmax_scale";
 
   auto &weight_regularizer =
     std::get<nntrainer::props::WeightRegularizer>(*layer_impl_props);
@@ -283,6 +296,10 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
 
   // 2. Set output dimensions (same as input)
   const auto &in_dim = context.getInputDimensions()[SINGLE_INOUT_IDX];
+  NNTR_THROW_IF(context.getNumInputs() == 2 &&
+                  context.getInputDimensions()[ROUTER_IN_IDX] != in_dim,
+                std::invalid_argument)
+    << "MoE router input must have the experts' input shape";
   const bool is_nchw = context.getFormat() == nntrainer::Tformat::NCHW;
   std::vector<nntrainer::TensorDim> output_dims(1);
   output_dims[SINGLE_INOUT_IDX] = in_dim;
@@ -300,7 +317,8 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
   // its resident weights whatever the variable says -- the CPU cache is
   // Lfm2CachedSlimMoELayer's job.
   trace_layer = g_moe_layer_count.fetch_add(1);
-  cache_per_layer = expertCacheFromEnv(num_experts);
+  cache_per_layer = expertCacheFromEnv(
+    num_experts, std::get<props::CacheExperts>(moe_props).get());
   experts_virtual =
     cache_per_layer != 0 &&
     context.getComputeEngineType() != ml::train::LayerComputeEngine::CPU;
@@ -423,11 +441,22 @@ void Lfm2MoELayer::buildExpertAssignments(
   for (unsigned int i = 0; i < total_tokens; ++i) {
     const float *lrow = logits + static_cast<size_t>(i) * num_experts;
 
-    // sigmoid scores (bias-free) and biased scores used only for selection
-    for (unsigned int e = 0; e < num_experts; ++e) {
-      const float s = 1.0f / (1.0f + std::exp(-lrow[e]));
-      sig[e] = s;
-      scored[e] = {s + bias[e], static_cast<int>(e)};
+    if (softmax_router) {
+      // softmax_scale (Gemma-4): softmax in f32, selection and weights from
+      // the same scores; the [E] weight scales the top-k weights below.
+      const float mx = *std::max_element(lrow, lrow + num_experts);
+      float sum = 0.0f;
+      for (unsigned int e = 0; e < num_experts; ++e)
+        sum += sig[e] = std::exp(lrow[e] - mx);
+      for (unsigned int e = 0; e < num_experts; ++e)
+        scored[e] = {sig[e] /= sum, static_cast<int>(e)};
+    } else {
+      // sigmoid scores (bias-free) and biased scores used only for selection
+      for (unsigned int e = 0; e < num_experts; ++e) {
+        const float s = 1.0f / (1.0f + std::exp(-lrow[e]));
+        sig[e] = s;
+        scored[e] = {s + bias[e], static_cast<int>(e)};
+      }
     }
 
     // top-k experts by (sigmoid + bias); an exact tie goes to the lower
@@ -444,10 +473,14 @@ void Lfm2MoELayer::buildExpertAssignments(
     for (unsigned int k = 0; k < topk; ++k)
       wsum += sig[scored[k].second];
 
-    const float inv = NORM_TOPK_PROB ? (1.0f / (wsum + 1e-6f)) : 1.0f;
+    const float inv = softmax_router   ? 1.0f / wsum
+                      : NORM_TOPK_PROB ? (1.0f / (wsum + 1e-6f))
+                                       : 1.0f;
     for (unsigned int k = 0; k < topk; ++k) {
       const int expert_idx = scored[k].second;
-      const float weight = sig[expert_idx] * inv * ROUTED_SCALING_FACTOR;
+      const float weight =
+        sig[expert_idx] * inv *
+        (softmax_router ? bias[expert_idx] : ROUTED_SCALING_FACTOR);
       expert_assignments[expert_idx].emplace_back(i, weight);
     }
     if (extra_top_k) {
@@ -548,6 +581,8 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
 
   nntrainer::Tensor &input = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output = context.getOutput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &router_in =
+    context.getNumInputs() == 2 ? context.getInput(ROUTER_IN_IDX) : input;
 
   nntrainer::Tensor &router_logits = context.getTensor(router_logits_idx);
 
@@ -560,18 +595,19 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
     M0Timer t(&g_m0.setup);
     // reshape input: [B,1,S,H] -> [B*S,1,1,H]
     input.reshape({total_tokens, 1, 1, hidden_size});
+    router_in.reshape({total_tokens, 1, 1, hidden_size});
 
     // reshape output: [B,1,S,H] -> [B*S,1,1,H]
     output.reshape({total_tokens, 1, 1, hidden_size});
     output.setZero();
   }
 
-  // routing: raw logits -> sigmoid + expert-bias top-k selection
+  // routing: raw logits -> top-k selection (props::RouterType)
   nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
   nntrainer::Tensor &expert_bias = context.getWeight(expert_bias_idx);
   {
     M0Timer t(&g_m0.router);
-    input.dot(gate_weights, router_logits);
+    router_in.dot(gate_weights, router_logits);
   }
 
   std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(
@@ -747,28 +783,6 @@ static bool tryMoeLayerOnAccelerator(
     dn_data[e] = dn.getData<char>();
     gu_scale[e] = gu.getScale<float>();
     dn_scale[e] = dn.getScale<float>();
-  }
-
-  // [plan 201 S1] A virtual layer hands all its experts and the pool's
-  // policy to the backend at its first call (layer order: the first
-  // prefill runs the layers in order), for the per-token entry's miss path.
-  if (experts_virtual) {
-    // ponytail: one model per process -- the set, like the backend's
-    // pool_descs_, is never cleared; a second model in the same process
-    // needs both reset with it.
-    static std::unordered_set<const void *> handed;
-    if (handed.insert(&context.getWeight(gate_up_indices[0])).second) {
-      std::vector<ExpertFileDesc> all;
-      for (size_t e = 0; e < n_experts; ++e)
-        all.push_back(expertDesc(context.getWeight(gate_up_indices[e]),
-                                 context.getWeight(down_indices[e])));
-      ops->set_decode_moe_experts(
-        all, [](const std::vector<const void *> &need,
-                const std::function<void(const void *)> &load,
-                const std::function<void(const void *)> &evict) {
-          g_expert_lru.acquire(need, load, evict);
-        });
-    }
   }
 
   // [doc 52] Virtual experts: the ones this call routes to are made
@@ -1174,6 +1188,8 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
   nntrainer::Tensor &input_ = context.getInput(SINGLE_INOUT_IDX);
   nntrainer::Tensor &output_ = context.getOutput(SINGLE_INOUT_IDX);
+  nntrainer::Tensor &router_in_ =
+    context.getNumInputs() == 2 ? context.getInput(ROUTER_IN_IDX) : input_;
 
   nntrainer::Tensor &router_logits_ = context.getTensor(router_logits_idx);
   nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
@@ -1194,6 +1210,8 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     auto input = input_.getSharedDataTensor(
       input_step_dim, b * input_step_dim.getFeatureLen(), true);
+    auto router_in = router_in_.getSharedDataTensor(
+      input_step_dim, b * input_step_dim.getFeatureLen(), true);
     auto output = output_.getSharedDataTensor(
       output_step_dim, b * output_step_dim.getFeatureLen(), true);
     auto router_logits =
@@ -1208,6 +1226,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       M0Timer t(&g_m0.setup);
       // reshape input: [B,1,S,H] -> [B*S,1,1,H]
       input.reshape({total_tokens, 1, 1, hidden_size});
+      router_in.reshape({total_tokens, 1, 1, hidden_size});
 
       // reshape output: [B,1,S,H] -> [B*S,1,1,H]
       output.reshape({total_tokens, 1, 1, hidden_size});
@@ -1232,7 +1251,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     // routing
     {
       M0Timer t(&g_m0.router);
-      input.dot(gate_weights, router_logits);
+      router_in.dot(gate_weights, router_logits);
     }
 
     std::vector<std::vector<std::pair<unsigned, float>>> expert_assignments(

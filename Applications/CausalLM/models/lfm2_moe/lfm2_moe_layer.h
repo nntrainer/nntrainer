@@ -151,8 +151,13 @@ private:
   unsigned int topk;             /**< number of experts per token, i.e., topk */
   nntrainer::ActiFunc acti_func; /**< activation function for the expert */
   std::tuple<props::NumExperts, props::NumExpertsPerToken,
-             nntrainer::props::Unit, props::MoEActivation>
+             nntrainer::props::Unit, props::MoEActivation, props::RouterType,
+             props::CacheExperts>
     moe_props;
+  /** props::RouterType "softmax_scale": Gemma-4 routing, and the layer's
+   *  optional second input is what the router reads (Gemma-4 norms the
+   *  residual differently for the router and for the experts). */
+  bool softmax_router;
 
   // weight indices
   std::vector<unsigned int> expert_gate_up_proj_indices;
@@ -193,7 +198,8 @@ private:
   /**
    * @brief Build the per-expert token assignments for LFM2 routing.
    * @param router_logits Raw router logits tensor [total_tokens, 1, 1, E]
-   * @param expert_bias Per-expert bias tensor [1, 1, 1, E]
+   * @param expert_bias Per-expert bias (or, for softmax_scale, scale)
+   *        tensor [1, 1, 1, E]
    * @param total_tokens number of tokens routed
    * @param[out] expert_assignments per-expert list of (token index, weight)
    * @param[out] extra_top_k when non-null, every token's top-(k + 5)

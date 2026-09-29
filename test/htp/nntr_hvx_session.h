@@ -51,11 +51,9 @@
 /** @brief [#132 PR 2] How many Q4M1 weights (q4m1_register) one session
  *  holds at once. [#132 Part B] 80 (the #178 probe's): the resident graph
  *  holds the whole FC set -- LFM2.5's 66 weights plus the lm_head's 8
- *  slices of 16384 rows -- in one session; the slots are 16 bytes each,
- *  the weights themselves are on the heap. [plan 201 S4] 256: Gemma 4's
- *  FC set is about 230 (30 layers x q, k, v, o, up, gate, down less the
- *  five full layers' v, plus the lm_head's 16 slices of 16384 rows). */
-#define NNTR_HVX_Q4M1_SLOTS 256
+ *  slices of 16384 rows -- in one session; the slots are 12 bytes each,
+ *  the weights themselves are on the heap. */
+#define NNTR_HVX_Q4M1_SLOTS 80
 
 /** @brief One Q4M1 weight on the DSP heap (memalign 128), or [#132 Part B
  *  E3] borrowed from an attached arena (q4m1_attach: never freed here).
@@ -114,8 +112,8 @@ typedef struct {
   uint8_t *fc_l2; /**< [#132 Part B, #178] the FC runner's L2 feed scratch
                        (2 MiB of DSP heap, first use), freed in close() */
   struct nntr_hvx_token *token; /**< [#132 Part B E2] the token driver
-                       (nntr_hvx_token.c): the mailbox page and the
-                       counters; NULL = none. Stopped in close() after the dspq
+                       (nntr_hvx_token.c): the mailbox page and the role;
+                       NULL = none. Stopped in close() after the dspq
                        thread that runs it */
 } nntr_hvx_session;
 
@@ -138,13 +136,14 @@ void nntr_hvx_dspq_shutdown(nntr_hvx_session *s);
  *  nntr_hvx_graph.c. */
 void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env);
 
-/** @brief [#132 Part B E2, #211] One token of the session's driver
- *  (token_driver_start) on its graph: every op on @a act (the embedding
- *  row), the id returned, the logits into @a logits when it is not NULL.
+/** @brief [#132 Part B E2] One token of the session's role
+ *  (token_driver_start) on its graph: S2 runs from op 0 on @a act (the
+ *  embedding row) and returns the id, the logits into @a logits when it
+ *  is not NULL; S1 serves its rounds (@a act, @a logits unused).
  *  @a r gets everything but seq and rc (htp_dspq_wire.h). The dspq
  *  thread's HTP_DSPQ_OP_TOKEN calls it. Lives in nntr_hvx_token.c.
  *  @return 0, AEE_EBADSTATE (no driver or no graph), AEE_EINVALIDFORMAT
- *          (a length or no @a act), or hexkl_token_main's code */
+ *          (a length), or hexkl_token_main / hexkl_token_serve's code */
 struct htp_dspq_token_resp_s;
 int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
                        const float *act, uint32_t act_len, float *logits,
