@@ -45,7 +45,10 @@
  * caller's rounding and stores, SCORES = P1 (with the k column merge),
  * SOFTMAX = P2 + the two caller steps + the divides, PV = P3's chains,
  * summed over lanes; POOL spans P1 .. P3; BUSY_MAX is the busiest lane over
- * the three runs; LANES and START_MAX are P1's.
+ * the three runs; LANES and START_MAX are P1's. Round 3 splits SOFTMAX:
+ * EXP and ET bracket P2's two halves per unit, MAX and SUM the caller's
+ * steps, DIV the divides (every bracket behind if (ps) / if (prof), so a
+ * NULL prof takes no timestamp).
  */
 
 #include "hvx_attn_m1_f32.h"
@@ -226,7 +229,8 @@ typedef struct {
   uint64_t start; /**< P1's start */
   uint64_t busy;  /**< sum of the runs' (end - start) */
   uint32_t scores, softmax, pv;
-  uint32_t lanes; /**< P1's n */
+  uint32_t exp, et, div; /**< SOFTMAX's pieces (round 3) */
+  uint32_t lanes;        /**< P1's n */
 } prof_slot;
 
 /** @brief Lanes the phase words record. ponytail: a pool of more than 15
@@ -338,7 +342,7 @@ static void p1_unit(const forward_job *job, uint32_t u) {
  * those 2 * (heads) bytes of row i. Moves only: every lane of ET gets the
  * bits the scalar scatter wrote, and the lanes past n_q are never in a mask.
  */
-static void p2_unit(const forward_job *job, uint32_t u) {
+static void p2_unit(const forward_job *job, uint32_t u, prof_slot *ps) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
   const uint32_t h = u / job->ntl, t = u % job->ntl;
   const uint32_t live = t + 1u == job->ntl ? job->n_live : TILE;
@@ -348,6 +352,7 @@ static void p2_unit(const forward_job *job, uint32_t u) {
   for (uint32_t g = 0; g < MAX_GQA; ++g) {
     e[g] = Q6_V_vzero();
   }
+  const uint64_t t0 = ps ? HAP_perf_get_pcycles() : 0u;
   for (uint32_t g = 0; g < ctx->gqa; ++g) {
     const uint32_t hq = h * ctx->gqa + g;
     HVX_Vector *row =
@@ -359,6 +364,7 @@ static void p2_unit(const forward_job *job, uint32_t u) {
     }
     *row = e[g];
   }
+  const uint64_t t1 = ps ? HAP_perf_get_pcycles() : 0u;
   HVX_Vector *et = (HVX_Vector *)ctx->et + (size_t)t * TILE;
   for (uint32_t g0 = 0; g0 < ctx->gqa; g0 += 4u) {
     const uint32_t hq0 = h * ctx->gqa + g0;
@@ -383,6 +389,10 @@ static void p2_unit(const forward_job *job, uint32_t u) {
         Q6_vmem_QRIV(lanes, et + 16u * b + i, Q6_V_vror_VR(tv, (int)rot));
       }
     }
+  }
+  if (ps) {
+    ps->exp += (uint32_t)(t1 - t0);
+    ps->et += (uint32_t)(HAP_perf_get_pcycles() - t1);
   }
 }
 
@@ -416,6 +426,7 @@ pv_group(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
   if (ps) {
     const uint64_t now = HAP_perf_get_pcycles();
     ps->softmax += (uint32_t)(now - *t);
+    ps->div += (uint32_t)(now - *t);
     *t = now;
   }
   HVX_Vector o0 = Q6_V_vzero(), o1 = o0, o2 = o0, o3 = o0;
@@ -484,7 +495,7 @@ static void run_p2(uint32_t n, uint32_t i, void *arg) {
   prof_slot *ps = (job->slots && i < PROF_SLOTS) ? &job->slots[i] : NULL;
   const uint64_t t0 = ps ? HAP_perf_get_pcycles() : 0u;
   for (uint32_t u = i; u < job->units; u += n) {
-    p2_unit(job, u);
+    p2_unit(job, u, ps);
   }
   if (ps) {
     const uint32_t dt = (uint32_t)(HAP_perf_get_pcycles() - t0);
@@ -594,7 +605,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   job.scale = Q6_Vh_vsplat_R(hvx_hf_bits_rne(scale));
   job.out = out;
   job.slots = prof ? slots : NULL;
-  uint32_t serial = 0; /* the caller's max and sum, into SOFTMAX */
+  uint32_t max_pc = 0, sum_pc = 0; /* the caller's steps, into SOFTMAX */
   if (prof) {
     memset(slots, 0, sizeof(slots));
     memset(prof, 0, ATTN_M1_PROF_WORDS * sizeof(uint32_t));
@@ -626,8 +637,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
     job.m[hq] = m == 0x8000u ? 0u : m; /* m + 0: only -0 changes */
   }
   if (prof) {
-    const uint64_t now = HAP_perf_get_pcycles();
-    serial += (uint32_t)(now - ts);
+    max_pc = (uint32_t)(HAP_perf_get_pcycles() - ts);
   }
 
   hvx_worker_pool_run(ctx->pool, run_p2, &job, job.units);
@@ -648,7 +658,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
     job.l[hq] = hf_float(lsum.h[hq]);
   }
   if (prof) {
-    serial += (uint32_t)(HAP_perf_get_pcycles() - ts);
+    sum_pc = (uint32_t)(HAP_perf_get_pcycles() - ts);
   }
 
   hvx_worker_pool_run(ctx->pool, run_p3, &job, n_q);
@@ -663,11 +673,16 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
     prof[ATTN_M1_PROF_POOL] = (uint32_t)(HAP_perf_get_pcycles() - t0);
     const uint32_t lanes = slots[0].lanes;
     prof[ATTN_M1_PROF_LANES] = lanes;
-    prof[ATTN_M1_PROF_SOFTMAX] = serial;
+    prof[ATTN_M1_PROF_MAX] = max_pc;
+    prof[ATTN_M1_PROF_SUM] = sum_pc;
+    prof[ATTN_M1_PROF_SOFTMAX] = max_pc + sum_pc;
     for (uint32_t i = 0; i < PROF_SLOTS; ++i) {
       prof[ATTN_M1_PROF_SCORES] += slots[i].scores;
       prof[ATTN_M1_PROF_SOFTMAX] += slots[i].softmax;
       prof[ATTN_M1_PROF_PV] += slots[i].pv;
+      prof[ATTN_M1_PROF_EXP] += slots[i].exp;
+      prof[ATTN_M1_PROF_ET] += slots[i].et;
+      prof[ATTN_M1_PROF_DIV] += slots[i].div;
       if (slots[i].busy > prof[ATTN_M1_PROF_BUSY_MAX]) {
         prof[ATTN_M1_PROF_BUSY_MAX] = (uint32_t)slots[i].busy;
       }

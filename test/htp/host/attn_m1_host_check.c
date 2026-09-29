@@ -895,8 +895,9 @@ static int g_prof_fail = 0;
  *        and the same row) with the words requested must give the same out
  *        and stats bytes, every pcycle word must have been taken (the host
  *        stub's counter is monotonic, so a bracket that ran reads > 0),
- *        LANES must be min(units, workers + 1) and POOL >= BUSY_MAX. The
- *        qtimer stub reads 0, so CALL_QT is a device-only word.
+ *        LANES must be min(units, workers + 1), POOL >= BUSY_MAX and
+ *        (#170 round 3) SOFTMAX >= EXP + ET + MAX + SUM + DIV. The qtimer
+ *        stub reads 0, so CALL_QT is a device-only word.
  * @return the number of failed conditions
  */
 static uint32_t check_phase_words(hvx_attn_m1_ctx *ctx, uint32_t L,
@@ -918,14 +919,20 @@ static uint32_t check_phase_words(hvx_attn_m1_ctx *ctx, uint32_t L,
   bad += count_bad(out, out_ref, (size_t)N_Q * HD) != 0u;
   bad += count_bad(stats, stats_ref, 2u * N_Q) != 0u;
   bad += w[ATTN_M1_PROF_LANES] != lanes;
-  static const uint32_t taken[] = {ATTN_M1_PROF_APPEND,   ATTN_M1_PROF_POOL,
-                                   ATTN_M1_PROF_SCORES,   ATTN_M1_PROF_SOFTMAX,
-                                   ATTN_M1_PROF_PV,       ATTN_M1_PROF_BUSY_MAX,
-                                   ATTN_M1_PROF_START_MAX};
+  static const uint32_t taken[] = {
+    ATTN_M1_PROF_APPEND,    ATTN_M1_PROF_POOL, ATTN_M1_PROF_SCORES,
+    ATTN_M1_PROF_SOFTMAX,   ATTN_M1_PROF_PV,   ATTN_M1_PROF_BUSY_MAX,
+    ATTN_M1_PROF_START_MAX, ATTN_M1_PROF_EXP,  ATTN_M1_PROF_ET,
+    ATTN_M1_PROF_MAX,       ATTN_M1_PROF_SUM,  ATTN_M1_PROF_DIV};
   for (size_t i = 0; i < sizeof(taken) / sizeof(taken[0]); ++i) {
     bad += w[taken[i]] == 0u;
   }
   bad += w[ATTN_M1_PROF_POOL] < w[ATTN_M1_PROF_BUSY_MAX];
+  /* round 3's split: SOFTMAX holds its five pieces (the brackets nest in
+     SOFTMAX's, and the counter only grows) */
+  bad += (uint64_t)w[ATTN_M1_PROF_SOFTMAX] <
+         (uint64_t)w[ATTN_M1_PROF_EXP] + w[ATTN_M1_PROF_ET] +
+           w[ATTN_M1_PROF_MAX] + w[ATTN_M1_PROF_SUM] + w[ATTN_M1_PROF_DIV];
   if (bad) {
     printf("  phase words L=%u workers=%u rc=%d:", L, workers, rc);
     for (uint32_t i = 0; i < ATTN_M1_PROF_WORDS; ++i) {

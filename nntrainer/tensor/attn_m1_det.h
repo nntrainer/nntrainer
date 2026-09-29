@@ -130,6 +130,13 @@
  *   BUSY_MAX   max over units of (end - start)
  *   START_MAX  max over units of (start - POOL's t0): dispatch skew
  *   CALL_QT    19.2 MHz qtimer ticks of the whole forward (dsp_us = /19.2)
+ * and SOFTMAX split (#170 round 3; SOFTMAX keeps its meaning, so it is at
+ * least the sum of these five plus the P2 loop's own overhead):
+ *   EXP        sum over units of exp16 (s - m, the lookup, the S stores)
+ *   ET         sum over units of the ET transpose and its masked stores
+ *   MAX        the caller's max over the scores
+ *   SUM        the caller's sequential sum over the ET rows
+ *   DIV        sum over lanes of the divides before PV
  * Pool dispatch + merge = POOL - BUSY_MAX; lane imbalance = BUSY_MAX /
  * ((SCORES + SOFTMAX + PV) / LANES).
  */
@@ -142,7 +149,12 @@
 #define ATTN_M1_PROF_BUSY_MAX 6u
 #define ATTN_M1_PROF_START_MAX 7u
 #define ATTN_M1_PROF_CALL_QT 8u
-#define ATTN_M1_PROF_WORDS 9u
+#define ATTN_M1_PROF_EXP 9u
+#define ATTN_M1_PROF_ET 10u
+#define ATTN_M1_PROF_MAX 11u
+#define ATTN_M1_PROF_SUM 12u
+#define ATTN_M1_PROF_DIV 13u
+#define ATTN_M1_PROF_WORDS 14u
 
 /** @brief One f32 operation, forced to round on its own (see swiglu_det.h
  *         for why a volatile store and not -ffp-contract). */
