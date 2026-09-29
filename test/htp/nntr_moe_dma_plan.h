@@ -29,6 +29,7 @@
 #ifndef __NNTR_MOE_DMA_PLAN_H__
 #define __NNTR_MOE_DMA_PLAN_H__
 
+#include <stddef.h>
 #include <stdint.h>
 
 /** @brief 4 experts x 11 + 2 copies at the LFM2 shape; room for more. */
@@ -250,10 +251,21 @@ nntr_moe_dma_plan_m1(uint32_t K, uint32_t inter, uint32_t N_out,
 /** @brief Destination mode of one replay push (item flags). DST_PACKED
  *  lands rows back to back (dst_stride = row_size), DST_STRIDED keeps the
  *  source stride (the kernel's VTCM layout). Neither set = the replay's
- *  default, which is packed in this tree; #99 makes it strided, and it
- *  changes nntr_moe_dma_dst_stride with the skel. */
+ *  default, packed; the gtest's MoeChunkReplay cells set DST_STRIDED on
+ *  every push (#99), the #100 traced* cells keep the default. */
 #define NNTR_MOE_DMA_DST_PACKED 1u
 #define NNTR_MOE_DMA_DST_STRIDED 2u
+/** @brief [#158] The push's descriptor reads its DDR source with
+ *  src_bypass = 1 (around the DSP L2) instead of the ring's 0. */
+#define NNTR_MOE_DMA_SRC_BYPASS 4u
+/** @brief [#158] workers > 1: every worker issues its own slice of the
+ *  push's rows on its own queue (rows [i n / W, (i + 1) n / W)), instead
+ *  of one worker the whole push by push ordinal. Each VTCM byte keeps one
+ *  writer per push kind, so the last write lands in list order and
+ *  nntr_moe_dma_tag_sum holds unchanged. workers == 1 ignores it. */
+#define NNTR_MOE_DMA_SPLIT_ROWS 8u
+/** @brief Every flag bit the skel's dma_replay accepts. */
+#define NNTR_MOE_DMA_FLAGS_ALL 15u
 
 /** @brief Largest payload of one replay descriptor: a whole gate_up matrix
  *  (57344 x 64 = 3.5 MiB, cell f2) fits; the struct's row_size is 24 bits
@@ -617,6 +629,115 @@ static inline uint32_t nntr_moe_dma_tag_sum(const nntr_moe_dma_item *it,
     sum += samples[j];
   }
   return sum;
+}
+
+/** ======================================================================
+ * [#90] The two-reader probe (docs/plans/90-two-reader-ddr-probe.md): the
+ * DSP's DDR stream is the f2 cell with fresh = 1, and every DDR rate the
+ * probe prints is held against the phone's physical ceiling. Shared by
+ * unittest_hvx_dma_probe (TwoReaderDdr, PrefetchOverlap) and
+ * two_reader_host_check. Pure arithmetic, no DSP call.
+ * ====================================================================== */
+
+/** @brief The S25 Ultra's DDR peak, GB/s: a 64-bit LPDDR5X-10667 bus,
+ *  10 667 MT/s x 8 B (plan 100 section 1). A DDR read above it is not a
+ *  DDR read (LEDGER rule 12). */
+#define NNTR_DDR_CEILING_GBS 85.3
+/** @brief How far the ring stream may sit from the same run's f2 20-call
+ *  cell (DDR_DSP_REF) before the line reads INVALID. */
+#define NNTR_TWO_READER_REF_TOL 0.20
+
+/** @brief How the probe drives the ring reader. */
+typedef struct {
+  const char *name;
+  uint32_t fresh;           /**< 1: every call reads the next regions */
+  uint32_t calls_per_chunk; /**< calls per dma_replay RPC (~0.3 s) */
+  uint32_t chunks_max;      /**< RPCs at most */
+  uint32_t min_us;          /**< stop once the chunks' qtimer sum reaches it */
+} nntr_two_reader_spec;
+
+/**
+ * @brief The ring reader's list: cell f2 (id 12: 4 experts, one descriptor
+ *        per gate_up and down matrix, 22 020 096 B a call, strided into
+ *        VTCM) at the LFM2 shape, replayed with fresh = 1 in chunks of 500
+ *        calls until 1.2 s.
+ * @return items written, 0 if @a max is too small.
+ */
+static inline uint32_t nntr_two_reader_cell(nntr_moe_dma_item *out,
+                                            uint32_t max,
+                                            nntr_two_reader_spec *spec) {
+  uint32_t fresh, load;
+  const uint32_t n = nntr_moe_dma_cell(12u, NULL, 0u, 2048u, 1792u, 2048u, 4u,
+                                       out, max, &spec->name, &fresh, &load);
+  spec->fresh = 1u;
+  spec->calls_per_chunk = 500u;
+  spec->chunks_max = 8u;
+  spec->min_us = 1200000u;
+  return load == 0u ? n : 0u;
+}
+
+/** @brief Distinct DDR one fresh = 1 rotation covers: the replay's
+ *  n_regions (res[7]) regions, each read front to back by f2. */
+static inline uint64_t nntr_two_reader_footprint_bytes(uint32_t n_regions,
+                                                       uint32_t region_bytes) {
+  return (uint64_t)n_regions * region_bytes;
+}
+
+/** @brief 1 iff @a bytes in @a us is a rate a DDR read can have: us > 0
+ *  and at most @a ceiling_gbs. */
+static inline int nntr_ddr_rate_valid(uint64_t bytes, uint64_t us,
+                                      double ceiling_gbs) {
+  return us > 0u && (double)bytes / (double)us / 1e3 <= ceiling_gbs;
+}
+
+/** @brief 1 iff a ring-alone rate is valid: every call's bytes landed
+ *  (@a checksum_ok, the res[12] tag), at most the ceiling and within
+ *  NNTR_TWO_READER_REF_TOL of the same run's f2 20-call rate. */
+static inline int nntr_two_reader_verdict(double gbs, double ref_gbs,
+                                          int checksum_ok) {
+  const double lo = ref_gbs * (1.0 - NNTR_TWO_READER_REF_TOL),
+               hi = ref_gbs * (1.0 + NNTR_TWO_READER_REF_TOL);
+  return checksum_ok && gbs > 0.0 && gbs <= NNTR_DDR_CEILING_GBS && gbs >= lo &&
+         gbs <= hi;
+}
+
+/** ======================================================================
+ * [#158] DMA engine settings: the #90 ring cell (f2, fresh = 1) with
+ * src_bypass 0/1 and 1/2/4 queues. Shared by unittest_hvx_dma_probe
+ * (DmaSettings) and two_reader_host_check.
+ * ====================================================================== */
+
+/** @brief A setting must beat the single-queue, src_bypass = 0 anchor of
+ *  the same run by this much (and pass its tag) before the M=1 feed gets
+ *  a knob for it. */
+#define NNTR_DMA_SETTINGS_MIN_GAIN 0.10
+
+/**
+ * @brief nntr_two_reader_cell with NNTR_MOE_DMA_SRC_BYPASS on every push
+ *        when @a bypass, and NNTR_MOE_DMA_SPLIT_ROWS always (a no-op for
+ *        one queue; the queue count is dma_replay's workers argument).
+ * @return items written, 0 if @a max is too small.
+ */
+static inline uint32_t nntr_dma_settings_cell(uint32_t bypass,
+                                              nntr_moe_dma_item *out,
+                                              uint32_t max,
+                                              nntr_two_reader_spec *spec) {
+  const uint32_t n = nntr_two_reader_cell(out, max, spec);
+  for (uint32_t k = 0; k < n; ++k) {
+    if (out[k].op == NNTR_MOE_DMA_OP_PUSH) {
+      out[k].flags |=
+        NNTR_MOE_DMA_SPLIT_ROWS | (bypass ? NNTR_MOE_DMA_SRC_BYPASS : 0u);
+    }
+  }
+  return n;
+}
+
+/** @brief One layer's net of the prefetch: the bytes the re-read no longer
+ *  waits for (@a cold_us - @a reread_us) minus what the touch cost the DSP
+ *  call (@a dsp_us - @a dsp_alone_us). Negative = the prefetch loses. */
+static inline double nntr_prefetch_net_us(double cold_us, double reread_us,
+                                          double dsp_us, double dsp_alone_us) {
+  return (cold_us - reread_us) - (dsp_us - dsp_alone_us);
 }
 
 #endif /* __NNTR_MOE_DMA_PLAN_H__ */

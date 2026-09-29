@@ -26,7 +26,10 @@
  * mode (NNTR_MOE_DMA_DST_*) and op 2 (DRAIN, workers == 1 only) empties
  * the ring so the next push dmstarts; descriptors up to 4 MiB; and a 13th
  * result word, when the caller asks for it, sums the tag bytes of every
- * push's VTCM window (nntr_dma_pattern) so a stale window fails.
+ * push's VTCM window (nntr_dma_pattern) so a stale window fails. #158
+ * adds two more flag bits, still no IDL change: SRC_BYPASS sets the push's
+ * src_bypass, and SPLIT_ROWS (workers > 1) has every worker issue its own
+ * row slice of the push on its own queue.
  */
 
 #include <stdatomic.h>
@@ -205,8 +208,33 @@ int nntr_hvx_dma_probe(remote_handle64 handle, uint32 arena, uint32 src_off,
 
 typedef struct {
   uint32_t op, kind, expert, src_off, dst_off, row_size, nrows, src_stride,
-    t_rel, dst_stride;
+    t_rel, dst_stride, flags;
 } replay_item;
+
+/** @brief Worker @a i's descriptor for item @a k: one slot per worker, so
+ *  a SPLIT_ROWS push has a descriptor on every queue (128 x 8 = 1024 =
+ *  NNTR_DMA_PROBE_MAX_DESC). */
+#define REPLAY_DESC(k, i) (&g_desc[(k)*8u + (i)])
+
+/** @brief src_bypass for a push. [#158] The arena is written once by the
+ *  CPU before it is attached and never by the DSP, so no line of it is
+ *  dirty in the DSP L2; a read around the L2 sees the same bytes and needs
+ *  no cache maintenance. */
+static inline uint32_t replay_src_bypass(const replay_item *it) {
+  return (it->flags & NNTR_MOE_DMA_SRC_BYPASS) ? 1u : 0u;
+}
+
+/** @brief Worker @a i of @a n's rows of @a it: [*r0, *r0 + return). The
+ *  whole push for its owner (push ordinal mod n) unless SPLIT_ROWS. */
+static inline uint32_t replay_rows(const replay_item *it, uint32_t ord,
+                                   uint32_t i, uint32_t n, uint32_t *r0) {
+  if (!(it->flags & NNTR_MOE_DMA_SPLIT_ROWS)) {
+    *r0 = 0u;
+    return ord % n == i ? it->nrows : 0u;
+  }
+  *r0 = it->nrows * i / n;
+  return it->nrows * (i + 1u) / n - *r0;
+}
 
 static replay_item g_items[REPLAY_MAX_ITEMS];
 static uint32_t g_item_ord[REPLAY_MAX_ITEMS]; /**< push ordinal of a push */
@@ -260,7 +288,7 @@ static void replay_ring(replay_ctx *c, hexkl_dma_trace_summary *sum) {
       ring_idx[k] = last_idx = hexkl_dma_ring_next_idx();
       hexkl_dma_ring_push2d(c->vtcm + it->dst_off, replay_src(c, it),
                             it->dst_stride, it->src_stride, it->row_size,
-                            it->nrows, 0, 1);
+                            it->nrows, (int)replay_src_bypass(it), 1);
       hexkl_dma_trace_push(HAP_perf_get_qtimer_count(), ring_idx[k], it->kind,
                            it->expert, 0u, it->row_size, it->nrows,
                            it->src_stride);
@@ -284,7 +312,8 @@ static void replay_ring(replay_ctx *c, hexkl_dma_trace_summary *sum) {
 }
 
 /** @brief workers > 1: this thread's pushes on its own dmstart chain, its
- *  own waits; depth and blocked bookkeeping per thread. */
+ *  own waits; depth and blocked bookkeeping per thread. A push is this
+ *  thread's by push ordinal, or its row slice of every push (SPLIT_ROWS). */
 static void replay_worker(uint32_t n_threads, uint32_t i, void *v) {
   replay_ctx *c = (replay_ctx *)v;
   if (i == 0u) {
@@ -292,33 +321,35 @@ static void replay_worker(uint32_t n_threads, uint32_t i, void *v) {
   }
   hexkl_dma_desc2d *prev = NULL;
   uint32_t issued = 0u, seen = 0u, own[REPLAY_MAX_ITEMS], depth_max = 0u,
-           wait_ticks = 0u, n_blocked = 0u;
+           wait_ticks = 0u, n_blocked = 0u, r0 = 0u;
   for (uint32_t k = 0; k < c->n_items; ++k) {
     const replay_item *it = &g_items[k];
-    /* Owner by push ordinal modulo the threads the pool actually gave,
-       not the count asked for: a capped pool must still issue everything. */
+    /* By the threads the pool actually gave, not the count asked for: a
+       capped pool must still issue everything. */
     if (it->op == NNTR_MOE_DMA_OP_PUSH) {
-      if (g_item_ord[k] % n_threads != i) {
+      const uint32_t rows = replay_rows(it, g_item_ord[k], i, n_threads, &r0);
+      if (rows == 0u) {
         continue;
       }
       if (c->pace) {
         replay_spin_until(c->t_call0, it->t_rel);
       }
-      hexkl_dma_desc2d *d = &g_desc[k];
+      hexkl_dma_desc2d *d = REPLAY_DESC(k, i);
       memset(d, 0, sizeof(*d));
       d->desc_size = 1;
       d->desc_type = 9;
       d->dst_bypass = 1;
-      d->src = (void *)replay_src(c, it);
-      d->dst = c->vtcm + it->dst_off;
+      d->src_bypass = replay_src_bypass(it);
+      d->src = (void *)(replay_src(c, it) + (size_t)r0 * it->src_stride);
+      d->dst = c->vtcm + it->dst_off + (size_t)r0 * it->dst_stride;
       d->src_stride = it->src_stride;
       d->dst_stride = it->dst_stride;
       d->row_size = it->row_size;
-      d->nrows_lo = it->nrows & 0xffu;
-      d->nrows_hi = (it->nrows >> 8) & 0xffu;
+      d->nrows_lo = rows & 0xffu;
+      d->nrows_hi = (rows >> 8) & 0xffu;
       Q6_dccleaninva_A((void *)d);
       /* Outstanding before this push, own chain only. */
-      while (seen < issued && g_desc[own[seen]].done) {
+      while (seen < issued && REPLAY_DESC(own[seen], i)->done) {
         ++seen;
       }
       if (issued - seen + 1u > depth_max) {
@@ -332,13 +363,14 @@ static void replay_worker(uint32_t n_threads, uint32_t i, void *v) {
       prev = d;
       own[issued++] = k;
     } else {
-      if (g_item_ord[it->src_off] % n_threads != i) {
+      const replay_item *p = &g_items[it->src_off];
+      if (replay_rows(p, g_item_ord[it->src_off], i, n_threads, &r0) == 0u) {
         continue;
       }
       if (c->pace) {
         replay_spin_until(c->t_call0, it->t_rel);
       }
-      hexkl_dma_desc2d *d = &g_desc[it->src_off];
+      hexkl_dma_desc2d *d = REPLAY_DESC(it->src_off, i);
       const uint64_t t_in = HAP_perf_get_qtimer_count();
       if (!d->done) {
         ++n_blocked;
@@ -435,7 +467,10 @@ int nntr_hvx_dma_replay(remote_handle64 handle, uint32 arena,
     it->nrows = w[5];
     it->src_stride = w[6];
     it->t_rel = w[7];
-    if (flags > NNTR_MOE_DMA_DST_STRIDED) {
+    it->flags = flags;
+    if ((flags & ~NNTR_MOE_DMA_FLAGS_ALL) != 0u ||
+        (flags & (NNTR_MOE_DMA_DST_PACKED | NNTR_MOE_DMA_DST_STRIDED)) ==
+          (NNTR_MOE_DMA_DST_PACKED | NNTR_MOE_DMA_DST_STRIDED)) {
       FARF(ERROR, "dma_replay: item %u flags 0x%x", (unsigned)k,
            (unsigned)flags);
       return AEE_EBADPARM;
