@@ -17,7 +17,8 @@
  *    special values, subnormals and random bit patterns.
  * 2. SPEC == CPU. The reference is written from the disassembly with the
  *    host's '/', fmaf and _Float16 (plan 132 section 0.1); the spec must
- *    equal it on the five FC shapes, activations 2^-20 .. 2^20 per block,
+ *    equal it on the five FC shapes (and two K % 128 == 64 ones, the
+ *    quantizer's pair tail), activations 2^-20 .. 2^20 per block,
  *    zero and tiny blocks, negative and subnormal d_w. Each mutant (one
  *    per rejected order) must differ somewhere: Q4 GEMV CPU-ORDER OK
  *    mutants=N/N. Near ties are counted: steps whose exact sum is a
@@ -271,8 +272,9 @@ static void check_shape(uint32_t K, uint32_t N, uint32_t *mut_caught,
   int8_t *q = aligned_alloc(128, K);
   uint16_t *da = malloc(nb * sizeof(uint16_t));
   hvx_q4m1_act act;
-  act.q = q;
-  act.d = da;
+  /* its own q and d: the spec's buffers would compare with themselves */
+  act.q = aligned_alloc(128, K);
+  act.d = malloc(nb * sizeof(uint16_t));
   act.s8 = malloc(nb * sizeof(int32_t));
   act.ma = malloc(nb * sizeof(int32_t));
   act.ea = malloc(nb * sizeof(int32_t));
@@ -333,6 +335,8 @@ static void check_shape(uint32_t K, uint32_t N, uint32_t *mut_caught,
   free(yk);
   free(q);
   free(da);
+  free(act.q);
+  free(act.d);
   free(act.s8);
   free(act.ma);
   free(act.ea);
@@ -368,18 +372,18 @@ static void check_quant(void) {
 }
 
 int main(void) {
-  static const uint32_t shapes[5][2] = {{2048u, 6144u},
-                                        {2048u, 2048u},
-                                        {2048u, 512u},
-                                        {7168u, 2048u},
-                                        {2048u, 7168u}};
+  /* the five FC shapes, then two with K % 128 == 64 (the quantizer's
+     pair tail; the fixtures' dense down has K = 64, #132 Part B) */
+  static const uint32_t shapes[7][2] = {
+    {2048u, 6144u}, {2048u, 2048u}, {2048u, 512u}, {7168u, 2048u},
+    {2048u, 7168u}, {64u, 128u},    {192u, 64u}};
   static const char *mut_name[MUT_COUNT] = {
     "", "unfused", "partial4", "amax*(1/127)", "x/d", "round-away", "f32-d_a"};
   uint32_t caught[MUT_COUNT] = {0}, bad_spec = 0, bad_kernel = 0, ties = 0,
            ro = 0, to_zero = 0;
   check_helpers();
   check_quant();
-  for (int s = 0; s < 5; ++s) {
+  for (int s = 0; s < 7; ++s) {
     check_shape(shapes[s][0], shapes[s][1], caught, &bad_spec, &bad_kernel,
                 &ties, &ro, &to_zero);
   }

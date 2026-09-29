@@ -43,7 +43,19 @@
    RMSNORM seeded slot 0, and [ADD RMSNORM ROUTER_TOPK MOE ADD RMSNORM]
    across a layer boundary, against the scalar composition -- slot 0 as
    the residual across calls, the router's routing reaching the MOE op in
-   the same call, and a router with no weights refused. */
+   the same call, and a router with no weights refused.
+
+   #132 Part B, the hd64 shape with every kind resident: the REAL
+   hvx_q4_gemv_f32.c (quantizer and GEMV) on hvx_emu/ behind a host fc
+   runner, driven through FC (q | k | v, three parts), DENSE_FFN and
+   LM_HEAD (two slices, the argmax, a tie), and [RMSNORM LM_HEAD] as a
+   stretch, memcmp'd against the CPU-order specs (q4_gemv_cpu_det.h,
+   m1_swiglu_cpu_det, m1_argmax_first); init's handle refusals; the feed
+   word reaching the runner; and the two sessions' complementary masks on
+   the LFM2.5 list (each validates, together they are every kind, and
+   their stretches alternate at the MoE hops). run_host_checks.sh then
+   builds this file against mutants of hexkl_graph.c, each of which must
+   fail it. */
 #include "hexkl_graph.h"
 #include "htp_graph_desc.h"
 #include <AEEStdErr.h>
@@ -53,6 +65,7 @@
 #include <string.h>
 
 #include "attn_m1_det.h"
+#include "hvx_q4_gemv_f32.h"
 #include "hvx_worker_pool.h"
 #include "m1_ops_det.h"
 
@@ -414,8 +427,56 @@ static void check_validator(void) {
           HTP_GRAPH_E_SCHEMENOTSUPPORTED == (uint32_t)AEE_ESCHEMENOTSUPPORTED &&
           HTP_GRAPH_E_NOTALLOWED == (uint32_t)AEE_ENOTALLOWED,
         "error code values drifted from AEEStdErr.h");
-  CHECK(hexkl_graph_resident_kinds() == resident_ok,
+  CHECK(hexkl_graph_resident_kinds() == HTP_GRAPH_KINDS_ALL,
         "kernel table: resident kinds 0x%x", hexkl_graph_resident_kinds());
+
+  /* #132 Part B: the same list for two sessions, complementary masks */
+  {
+    static uint32_t s1[sizeof(w) / sizeof(w[0])], s2[sizeof(w) / sizeof(w[0])];
+    uint32_t n_s1 = 0, n_s2 = 0, hops = 0, bad = 0;
+    n = build(w, cap, &kLfm25, kLfm25Layers, HTP_GRAPH_KINDS_ALL);
+    rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, NULL);
+    CHECK(rc == 0u, "LFM2.5 all kinds: %s", htp_graph_err_name(rc));
+    memcpy(s1, w, n * sizeof(uint32_t));
+    memcpy(s2, w, n * sizeof(uint32_t));
+    htp_graph_set_resident(s1, HTP_GRAPH_KINDS_S1);
+    htp_graph_set_resident(s2, HTP_GRAPH_KINDS_S2);
+    CHECK((HTP_GRAPH_KINDS_S1 & HTP_GRAPH_KINDS_S2) == 0u &&
+            (HTP_GRAPH_KINDS_S1 | HTP_GRAPH_KINDS_S2) == HTP_GRAPH_KINDS_ALL,
+          "masks do not partition the kinds");
+    rc = htp_graph_validate(s1, n, HTP_GRAPH_KINDS_ALL, NULL);
+    CHECK(rc == 0u, "S1 mask: %s", htp_graph_err_name(rc));
+    rc = htp_graph_validate(s2, n, HTP_GRAPH_KINDS_ALL, NULL);
+    CHECK(rc == 0u, "S2 mask: %s", htp_graph_err_name(rc));
+    /* every op resident in exactly one session; S1's stretches are
+       exactly [ROUTER_TOPK MOE] and each is a hop between two of S2's */
+    for (i = 0; i < n_ops; ++i) {
+      const htp_graph_op *a = htp_graph_op_cat(s1, i),
+                         *b = htp_graph_op_cat(s2, i);
+      const int starts_s1 =
+        a->resident && (i == 0u || !htp_graph_op_cat(s1, i - 1u)->resident);
+      const int starts_s2 =
+        b->resident && (i == 0u || !htp_graph_op_cat(s2, i - 1u)->resident);
+      bad += a->resident == b->resident;
+      if (starts_s1) {
+        ++n_s1;
+        bad += a->kind != HTP_OP_ROUTER_TOPK || i + 2u >= n_ops ||
+               htp_graph_op_cat(s1, i + 1u)->kind != HTP_OP_MOE ||
+               htp_graph_op_cat(s1, i + 2u)->resident;
+      }
+      n_s2 += starts_s2;
+      hops += (starts_s1 || starts_s2) && i != 0u;
+    }
+    CHECK(bad == 0u && n_s1 == 22u && n_s2 == 23u && hops == 44u &&
+            htp_graph_op_cat(s2, 0)->resident &&
+            htp_graph_op_cat(s2, n_ops - 1u)->resident,
+          "session split: bad=%u S1 stretches=%u S2 stretches=%u hops=%u", bad,
+          n_s1, n_s2, hops);
+    printf("GRAPH SESSION MASKS OK: S1=%s S2 = the other %u kinds; LFM2.5 "
+           "S2 stretches=%u S1 stretches=%u hops/token=%u\n",
+           htp_graph_kinds_str(HTP_GRAPH_KINDS_S1, names, sizeof(names)),
+           HTP_OP_KIND_N - 2u, n_s2, n_s1, hops);
+  }
 }
 
 /* ---- forward half ------------------------------------------------------ */
@@ -479,7 +540,7 @@ static void check_forward(void) {
   /* (1) every op non-resident: the identity at every start op */
   n = build(w, cap, &kTiny, "AC", 0u);
   CHECK(n != 0u, "tiny build");
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, &g);
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
   CHECK(rc == 0u && g != NULL, "init (none resident): %s",
         htp_graph_err_name(rc));
   if (g != NULL) {
@@ -509,24 +570,24 @@ static void check_forward(void) {
 
   /* (2) MOE resident: init refuses a free or mis-shaped handle */
   n = build(w, cap, &kTiny, "AC", resident_ok);
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, &g);
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
   CHECK(rc == HTP_GRAPH_E_INVHANDLE && g == NULL, "unbound handles: %s",
         htp_graph_err_name(rc));
   bind_tiny(w);
   htp_graph_op_at(w, nth_op(w, HTP_OP_MOE, 1))->h_dn[2] = 7u; /* free slot */
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, &g);
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
   CHECK(rc == HTP_GRAPH_E_INVHANDLE, "free handle: %s", htp_graph_err_name(rc));
   printf("  missing weight handle                     -> %s (0x%x)\n",
          htp_graph_err_name(rc), rc);
   bind_tiny(w);
   g_tbl.slots[31].N = 96u; /* layer 0 expert 1's down: inter differs */
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, &g);
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
   CHECK(rc == HTP_GRAPH_E_INVHANDLE, "mis-shaped handle: %s",
         htp_graph_err_name(rc));
   printf("  weight handle of another shape            -> %s (0x%x)\n",
          htp_graph_err_name(rc), rc);
   g_tbl.slots[31].N = 64u;
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, &g);
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
   CHECK(rc == 0u && g != NULL, "init (MOE resident): %s",
         htp_graph_err_name(rc));
   if (g == NULL)
@@ -668,7 +729,7 @@ static void check_stretches(void) {
   env.tbl = &g_tbl;
   n = build(w, cap, &kHd64, "CAC", mask);
   CHECK(n != 0u, "hd64 build");
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, &g);
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
   CHECK(rc == 0u && g != NULL, "hd64 init: %s", htp_graph_err_name(rc));
   if (g == NULL)
     return;
@@ -914,7 +975,7 @@ static void check_add_router(void) {
   env.scratch = &g_scratch;
   n = build(w, cap, &kHd64, "CAC", D_KINDS);
   bind_hd64(w);
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, &g);
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
   CHECK(rc == 0u && g != NULL, "hd64 D init: %s", htp_graph_err_name(rc));
   if (g == NULL)
     return;
@@ -1035,11 +1096,262 @@ static void check_add_router(void) {
            "stand-in, slot 0 carried across calls, resume_at the next FC)\n");
 }
 
+/* ---- #132 Part B: the Q4M1 kinds against the CPU-order specs ---------- */
+#define Q_SLOTS 16u
+static uint8_t *g_qw[Q_SLOTS]; /* Q4M1 bytes the host runner reads */
+static uint8_t *g_qc[Q_SLOTS]; /* the same weight, canonical block_q4_0 */
+static hexkl_graph_q4m1_shape g_qs[Q_SLOTS];
+static uint32_t g_fc_calls, g_fc_feed;
+
+/* The session runner's host twin: the real GEMV on the Q4M1 bytes, no
+   feed (the DMA feed moves no bits; the in-process E2E runs the real
+   runner on its DMA stand-in). */
+static int host_fc(void *ctx, uint32_t h, uint32_t feed, const hvx_q4m1_act *a,
+                   float *y) {
+  (void)ctx;
+  ++g_fc_calls;
+  g_fc_feed = feed;
+  if (h >= Q_SLOTS || g_qw[h] == NULL)
+    return AEE_EBADITEM;
+  hvx_q4m1_gemv_groups(g_qw[h], g_qs[h].K, g_qs[h].N / Q4M1_GROUP, a, y);
+  return AEE_SUCCESS;
+}
+
+static void q_block_rand(uint8_t *blk, uint32_t *seed) {
+  uint32_t j;
+  const uint16_t d =
+    (uint16_t)(0x2000u |
+               (((*seed = *seed * 1664525u + 1013904223u) >> 8) & 0x7ffu));
+  blk[0] = (uint8_t)(d & 0xffu);
+  blk[1] = (uint8_t)(d >> 8);
+  for (j = 0; j < 16u; ++j) {
+    *seed = *seed * 1664525u + 1013904223u;
+    blk[2 + j] = (uint8_t)(*seed >> 24);
+  }
+}
+
+static void q_register(uint32_t h, uint32_t K, uint32_t N, uint32_t *seed) {
+  const size_t bytes = (size_t)N * (K / 32u) * Q4_CPU_BLOCK_BYTES;
+  size_t b;
+  g_qc[h] = realloc(g_qc[h], bytes);
+  free(g_qw[h]);
+  g_qw[h] = aligned_alloc(128, (q4m1_bytes(K, N) + 127u) & ~(size_t)127u);
+  for (b = 0; b < bytes / Q4_CPU_BLOCK_BYTES; ++b)
+    q_block_rand(g_qc[h] + b * Q4_CPU_BLOCK_BYTES, seed);
+  q4m1_from_q4_0(g_qc[h], K, N, g_qw[h]);
+  g_qs[h].K = K;
+  g_qs[h].N = N;
+}
+
+/* the CPU's FC of x: the Q8_0 quantizer, then the fused chain */
+static void spec_fc(uint32_t h, const float *x, float *y) {
+  static int8_t q[8192];
+  static uint16_t d[256];
+  q8_0_quant_cpu_det(x, g_qs[h].K, q, d);
+  q4_gemv_cpu_det(g_qc[h], q, d, g_qs[h].K, g_qs[h].N, y);
+}
+
+static void check_q4m1(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
+  htp_graph_lfm2_shape shape = kHd64;
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  uint32_t n, rc, resume, seed = 0x1320u, i, fc_qkv, ffn, lm, fin, best, r2;
+  static float x[HID], out[3u * HID], ref[3u * HID], up[64], gate[64], act[64],
+    gam[HID], nrm[HID];
+  htp_graph_op *op;
+  int err = 0;
+
+  shape.vocab = 64u; /* two lm_head slices of 32 rows */
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  env.vtcm_base = g_vtcm;
+  env.vtcm_size = sizeof(g_vtcm);
+  env.config_off = 32u;
+  env.pool = real_pool();
+  env.scratch = &g_scratch;
+  n = build(w, cap, &shape, "CAC", HTP_GRAPH_KINDS_ALL);
+  CHECK(n != 0u, "hd64 all-kinds build");
+  bind_hd64(w);
+  fc_qkv = nth_op(w, HTP_OP_FC, 2); /* layer 0: in, out; layer 1: qkv */
+  ffn = nth_op(w, HTP_OP_DENSE_FFN, 0);
+  lm = nth_op(w, HTP_OP_LM_HEAD, 0);
+  fin = lm - 1u;
+  CHECK(htp_graph_op_cat(w, fc_qkv)->N == 256u && lm == w[3] - 1u &&
+          htp_graph_op_cat(w, fin)->kind == HTP_OP_RMSNORM,
+        "hd64 all-kinds op indices");
+
+  /* (1) init: a resident FC op with no parts is refused */
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  CHECK(rc == HTP_GRAPH_E_INVHANDLE && g == NULL, "unbound FC: %s",
+        htp_graph_err_name(rc));
+  /* the FC parts: every FC op one part except qkv (q 128 | k 64 | v 64) */
+  {
+    uint32_t h = 0, f = 0, k;
+    for (i = 0; i < w[3]; ++i) {
+      op = htp_graph_op_at(w, i);
+      if (op->kind == HTP_OP_FC && i != fc_qkv) {
+        q_register(h, op->K, op->N, &seed);
+        op->h_gu[0] = h++;
+        op->n_experts = 1u;
+        ++f;
+      }
+    }
+    op = htp_graph_op_at(w, fc_qkv);
+    for (k = 0; k < 3u; ++k) {
+      q_register(h, HID, k == 0u ? 128u : 64u, &seed);
+      op->h_gu[k] = h++;
+    }
+    op->n_experts = 3u;
+    op = htp_graph_op_at(w, ffn); /* up, gate, down */
+    q_register(h, HID, 64u, &seed);
+    op->h_gu[0] = h++;
+    q_register(h, HID, 64u, &seed);
+    op->h_gu[1] = h++;
+    q_register(h, 64u, HID, &seed);
+    op->h_dn[0] = h++;
+    op->n_experts = 3u;
+    op = htp_graph_op_at(w, lm);
+    q_register(h, HID, 32u, &seed);
+    op->h_gu[0] = h++;
+    q_register(h, HID, 32u, &seed);
+    op->h_gu[1] = h++;
+    op->n_experts = 2u;
+    CHECK(f == 5u && h <= Q_SLOTS, "hd64 FC count %u, slots %u", f, h);
+  }
+  /* (2) init's shape refusals: a part of the wrong K, parts that do not
+     sum to N, a down of the wrong shape, no shape table */
+  op = htp_graph_op_at(w, fc_qkv);
+  op->n_experts = 2u;
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  CHECK(rc == HTP_GRAPH_E_INVHANDLE, "qkv parts short of N: %s",
+        htp_graph_err_name(rc));
+  op->n_experts = 3u;
+  g_qs[op->h_gu[1]].K = 64u;
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  CHECK(rc == HTP_GRAPH_E_INVHANDLE, "part of another K: %s",
+        htp_graph_err_name(rc));
+  g_qs[op->h_gu[1]].K = HID;
+  op = htp_graph_op_at(w, ffn);
+  {
+    const uint32_t keep = op->h_dn[0];
+    op->h_dn[0] = op->h_gu[0]; /* 128 x 64 where 64 x 128 belongs */
+    rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+    CHECK(rc == HTP_GRAPH_E_INVHANDLE, "down of another shape: %s",
+          htp_graph_err_name(rc));
+    op->h_dn[0] = keep;
+  }
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
+  CHECK(rc == HTP_GRAPH_E_INVHANDLE, "no shape table: %s",
+        htp_graph_err_name(rc));
+  printf("  Q4M1 op: no parts / short / K / down / no table -> %s (0x%x)\n",
+         htp_graph_err_name(rc), rc);
+  htp_graph_op_at(w, fc_qkv)->feed = 1u; /* the L2 feed, for (4) */
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  CHECK(rc == 0u && g != NULL, "hd64 all-kinds init: %s",
+        htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  CHECK(g->logits != NULL && g->ffn != NULL && g->slot_words == 3u * HID,
+        "Q4M1 buffers / slots %u", g->slot_words);
+  /* the dense FFN's h_gu[2] is 0 and names nothing: slot 0 is the first
+     FC's, so park that FC on another slot for this one probe */
+  {
+    const uint32_t fc0 = nth_op(w, HTP_OP_FC, 0), keep = g->ops[fc0].h_gu[0];
+    g->ops[fc0].h_gu[0] = g->ops[fc_qkv].h_gu[0];
+    CHECK(hexkl_graph_uses_q4m1(g, g->ops[ffn].h_dn[0]) &&
+            hexkl_graph_uses_q4m1(g, g->ops[ffn].h_gu[1]) &&
+            hexkl_graph_uses_q4m1(g, g->ops[lm].h_gu[1]) &&
+            !hexkl_graph_uses_q4m1(g, 0u) &&
+            !hexkl_graph_uses_q4m1(g, Q_SLOTS - 1u),
+          "uses_q4m1");
+    g->ops[fc0].h_gu[0] = keep;
+  }
+
+  /* (3) no runner in the env: AEE_EBADSTATE */
+  fill(x, HID, &seed);
+  rc = (uint32_t)hexkl_graph_forward(g, &env, fc_qkv, 1u, 0u, NULL, x, HID, out,
+                                     256u, &resume);
+  CHECK(rc == (uint32_t)AEE_EBADSTATE, "FC without a runner: %s",
+        htp_graph_err_name(rc));
+  env.fc = host_fc;
+
+  /* (4) [FC] q | k | v: three parts, one quantization, the op's feed */
+  g_fc_calls = 0;
+  rc = (uint32_t)hexkl_graph_forward(g, &env, fc_qkv, 1u, 0u, NULL, x, HID, out,
+                                     256u, &resume);
+  CHECK(rc == 0u && resume == fc_qkv + 1u && g_fc_calls == 3u &&
+          g_fc_feed == 1u,
+        "[FC qkv]: %s resume %u calls %u feed %u", htp_graph_err_name(rc),
+        resume, g_fc_calls, g_fc_feed);
+  op = &g->ops[fc_qkv];
+  spec_fc(op->h_gu[0], x, ref);
+  spec_fc(op->h_gu[1], x, ref + 128);
+  spec_fc(op->h_gu[2], x, ref + 192);
+  CHECK(memcmp(out, ref, 256u * sizeof(float)) == 0, "[FC qkv] differs");
+  err |= memcmp(out, ref, 256u * sizeof(float)) != 0;
+
+  /* (5) [DENSE_FFN] up, gate, silu(gate) * up, down */
+  rc = (uint32_t)hexkl_graph_forward(g, &env, ffn, 1u, 0u, NULL, x, HID, out,
+                                     HID, &resume);
+  CHECK(rc == 0u && resume == ffn + 1u, "[DENSE_FFN]: %s",
+        htp_graph_err_name(rc));
+  op = &g->ops[ffn];
+  spec_fc(op->h_gu[0], x, up);
+  spec_fc(op->h_gu[1], x, gate);
+  m1_swiglu_cpu_det(gate, up, act, 64u);
+  spec_fc(op->h_dn[0], act, ref);
+  CHECK(memcmp(out, ref, HID * sizeof(float)) == 0, "[DENSE_FFN] differs");
+  err |= memcmp(out, ref, HID * sizeof(float)) != 0;
+
+  /* (6) [RMSNORM LM_HEAD]: the final norm from slot 0, the two slices,
+     the logits as the stretch's output, the first maximum */
+  fill(gam, HID, &seed);
+  rc = (uint32_t)hexkl_graph_set_param(g, fin, HTP_GRAPH_PARAM_GAMMA, gam, HID);
+  CHECK(rc == 0u, "final gamma: %s", htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_forward(g, &env, fin, 1000u, 0u, NULL, x, HID, out,
+                                     64u, &resume);
+  CHECK(rc == 0u && resume == w[3], "[RMSNORM LM_HEAD]: %s resume %u",
+        htp_graph_err_name(rc), resume);
+  m1_rmsnorm_det(x, gam, nrm, HID, HID, shape.eps, NULL);
+  op = &g->ops[lm];
+  spec_fc(op->h_gu[0], nrm, ref);
+  spec_fc(op->h_gu[1], nrm, ref + 32);
+  best = m1_argmax_first(ref, 64u);
+  CHECK(memcmp(out, ref, 64u * sizeof(float)) == 0 && g->lm_id == best,
+        "[RMSNORM LM_HEAD] differs (lm_id %u, want %u)", g->lm_id, best);
+  err |= memcmp(out, ref, 64u * sizeof(float)) != 0 || g->lm_id != best;
+  /* a tie: row best's weights copied into row r2 = best + 37 mod 64, so
+     the first of the two equal maxima must win, as std::max_element */
+  r2 = (best + 37u) % 64u;
+  {
+    const uint32_t hb = op->h_gu[best / 32u], h2 = op->h_gu[r2 / 32u];
+    const size_t row = (HID / 32u) * Q4_CPU_BLOCK_BYTES;
+    memcpy(g_qc[h2] + (r2 % 32u) * row, g_qc[hb] + (best % 32u) * row, row);
+    q4m1_from_q4_0(g_qc[h2], HID, 32u, g_qw[h2]);
+  }
+  rc = (uint32_t)hexkl_graph_forward(g, &env, fin, 1000u, 0u, NULL, x, HID, out,
+                                     64u, &resume);
+  CHECK(rc == 0u && memcmp(&out[best], &out[r2], sizeof(float)) == 0 &&
+          g->lm_id == (best < r2 ? best : r2),
+        "argmax tie: rows %u and %u, lm_id %u", best, r2, g->lm_id);
+  err |= g->lm_id != (best < r2 ? best : r2);
+  hexkl_graph_free(g);
+  if (err == 0)
+    printf("GRAPH Q4M1 BIT-IDENTICAL: FC q|k|v (3 parts, feed passed) "
+           "DENSE_FFN (up gate swiglu down) RMSNORM+LM_HEAD (2 slices, "
+           "argmax first of a tie) vs q4_gemv_cpu_det / m1_swiglu_cpu_det / "
+           "m1_argmax_first (hd64 shape, the real HVX kernel on hvx_emu)\n");
+}
+
 int main(void) {
   check_validator();
   check_forward();
   check_stretches();
   check_add_router();
+  check_q4m1();
   if (g_fail) {
     printf("GRAPH CHECKS FAILED (%d)\n", g_fail);
     return 1;
