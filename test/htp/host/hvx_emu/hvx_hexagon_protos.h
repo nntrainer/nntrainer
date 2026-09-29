@@ -640,4 +640,22 @@ static inline HVX_VectorPair Q6_Ww_vunpack_Vh(HVX_Vector a) {
   return r;
 }
 
+/* [#132 PR 2] the quantizer's byte pack, second stage: vpacke(u, v) of
+   halfwords keeps each one's even (low) byte, v's into the low half of the
+   result, u's into the high half (checked against the SDK's libnative);
+   the word stage is #170's Q6_Vh_vpacke_VwVw above. */
+static inline HVX_Vector Q6_Vb_vpacke_VhVh(HVX_Vector u, HVX_Vector v) {
+  HVX_Vector r;
+  uint16_t hu[2 * HVX_EMU_LANES], hv[2 * HVX_EMU_LANES];
+  uint8_t b[4 * HVX_EMU_LANES];
+  memcpy(hu, u.w, sizeof(hu));
+  memcpy(hv, v.w, sizeof(hv));
+  for (int i = 0; i < 2 * HVX_EMU_LANES; ++i) {
+    b[i] = (uint8_t)hv[i];
+    b[2 * HVX_EMU_LANES + i] = (uint8_t)hu[i];
+  }
+  memcpy(r.w, b, sizeof(b));
+  return r;
+}
+
 #endif /* __NNTRAINER_HVX_EMU_HVX_HEXAGON_PROTOS_H__ */

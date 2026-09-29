@@ -23,11 +23,13 @@
  *    mutants=N/N. Near ties are counted: steps whose exact sum is a
  *    midpoint of two floats, and round-to-odd corrections of the kernel's
  *    algorithm (a scalar model of it), so the pass says what it covered.
- * 3. KERNEL == SPEC. The three variants (NATIVE and INTRIN are the same
- *    intrinsics here; SFFMA at 8, 16 and 32 columns in flight) over the
- *    same rows: Q4 GEMV BIT-IDENTICAL. What this rests on: one Vsf op =
- *    one IEEE op and sffma = fmaf, which the device gtest HvxFcQ4.*
- *    re-checks on silicon.
+ * 3. KERNEL == SPEC. The vector kernel over the same rows, and the vector
+ *    quantizer hvx_q4m1_prep over 3000 more (every row kind, blocks around
+ *    its 2^-100 scalar fallback, f16-overflowing d excluded):
+ *    Q4 GEMV BIT-IDENTICAL, Q8 QUANT HVX BIT-IDENTICAL. What this rests
+ *    on: one Vsf op = one IEEE op (silicon: the 2026-09-29 G1) and the
+ *    DSP's scalar divide = IEEE RN, which HvxFcQ4.ScalarDivide sweeps on
+ *    silicon.
  * 4. LAYOUT. q4_0_from_q4_0x4 inverts the ARM repack (the ggml packer,
  *    re-typed here) bit for bit.
  */
@@ -275,7 +277,6 @@ static void check_shape(uint32_t K, uint32_t N, uint32_t *mut_caught,
   act.ma = malloc(nb * sizeof(int32_t));
   act.ea = malloc(nb * sizeof(int32_t));
   act.df = malloc(nb * sizeof(float));
-  float *fs = aligned_alloc(128, 2u * K * sizeof(float));
 
   make_weights(w, K, N);
   repack_q4_0x4(w, K, N, w4);
@@ -285,15 +286,8 @@ static void check_shape(uint32_t K, uint32_t N, uint32_t *mut_caught,
         N);
   q4m1_from_q4_0(w, K, N, m1);
 
-  static const struct {
-    uint32_t variant, cif;
-  } kv[5] = {{HVX_Q4M1_NATIVE, 0},
-             {HVX_Q4M1_INTRIN, 0},
-             {HVX_Q4M1_SFFMA, 8},
-             {HVX_Q4M1_SFFMA, 16},
-             {HVX_Q4M1_SFFMA, 32}};
   const int rows = 4;
-  uint32_t bad_spec = 0, bad_k[5] = {0};
+  uint32_t bad_spec = 0, bad_k = 0;
   for (int row = 0; row < rows; ++row) {
     make_row(x, K, row, row);
     q8_0_quant_cpu_det(x, K, q, da);
@@ -318,23 +312,17 @@ static void check_shape(uint32_t K, uint32_t N, uint32_t *mut_caught,
     hvx_q4m1_prep(x, K, &act);
     CHECK(memcmp(act.q, q, K) == 0 && memcmp(act.d, da, nb * 2u) == 0,
           "hvx_q4m1_prep differs from q8_0_quant_cpu_det");
-    for (int v = 0; v < 5; ++v) {
-      memset(yk, 0xA5, N * sizeof(float));
-      hvx_q4m1_gemv_groups(m1, K, N / Q4M1_GROUP, &act, yk, kv[v].variant,
-                           kv[v].cif, fs);
-      for (uint32_t n = 0; n < N; ++n) {
-        bad_k[v] += fbits(yk[n]) != fbits(ys[n]);
-      }
+    memset(yk, 0xA5, N * sizeof(float));
+    hvx_q4m1_gemv_groups(m1, K, N / Q4M1_GROUP, &act, yk);
+    for (uint32_t n = 0; n < N; ++n) {
+      bad_k += fbits(yk[n]) != fbits(ys[n]);
     }
   }
-  printf("Q4 GEMV K=%u N=%u rows=%d spec-vs-cpu bad=%u kernel bad: native=%u "
-         "intrin=%u sffma8=%u sffma16=%u sffma32=%u layout=%s\n",
-         K, N, rows, bad_spec, bad_k[0], bad_k[1], bad_k[2], bad_k[3], bad_k[4],
-         layout_ok ? "ok" : "BAD");
+  printf("Q4 GEMV K=%u N=%u rows=%d spec-vs-cpu bad=%u kernel bad=%u "
+         "layout=%s\n",
+         K, N, rows, bad_spec, bad_k, layout_ok ? "ok" : "BAD");
   *total_bad_spec += bad_spec;
-  for (int v = 0; v < 5; ++v) {
-    *total_bad_kernel += bad_k[v];
-  }
+  *total_bad_kernel += bad_k;
   free(w);
   free(w4);
   free(wc);
@@ -349,7 +337,34 @@ static void check_shape(uint32_t K, uint32_t N, uint32_t *mut_caught,
   free(act.ma);
   free(act.ea);
   free(act.df);
-  free(fs);
+}
+
+/** @brief hvx_q4m1_prep == q8_0_quant_cpu_det on 3000 rows of K = 2048:
+ *  make_row's four kinds, and rows whose blocks sit at 2^-100 times 2^-2
+ *  .. 2^2 (both sides of the scalar fallback). */
+static void check_quant(void) {
+  enum { K = 2048, NB = K / 32 };
+  static float x[K];
+  static int8_t q[K], qs[K];
+  static uint16_t d[NB], ds[NB];
+  static int32_t s8[NB], ma[NB], ea[NB];
+  static float df[NB];
+  hvx_q4m1_act act = {q, s8, ma, ea, df, d};
+  uint32_t bad = 0, rows = 0;
+  for (int r = 0; r < 3000; ++r, ++rows) {
+    if (r < 2800) {
+      make_row(x, K, r % 4, r);
+    } else {
+      for (uint32_t i = 0; i < K; ++i) {
+        x[i] = ldexpf(frand(-1.0f, 1.0f), -100 + (int)((i / 32u) % 5u) - 2);
+      }
+    }
+    hvx_q4m1_prep(x, K, &act);
+    q8_0_quant_cpu_det(x, K, qs, ds);
+    bad += memcmp(q, qs, K) != 0 || memcmp(d, ds, sizeof(d)) != 0;
+  }
+  printf("Q8 QUANT HVX rows=%u K=%d bad_rows=%u\n", rows, K, bad);
+  CHECK(bad == 0u, "hvx_q4m1_prep differs from q8_0_quant_cpu_det");
 }
 
 int main(void) {
@@ -363,6 +378,7 @@ int main(void) {
   uint32_t caught[MUT_COUNT] = {0}, bad_spec = 0, bad_kernel = 0, ties = 0,
            ro = 0, to_zero = 0;
   check_helpers();
+  check_quant();
   for (int s = 0; s < 5; ++s) {
     check_shape(shapes[s][0], shapes[s][1], caught, &bad_spec, &bad_kernel,
                 &ties, &ro, &to_zero);
@@ -385,6 +401,7 @@ int main(void) {
     return 1;
   }
   printf("Q4 GEMV CPU-ORDER OK mutants=%u/%d\n", n_caught, MUT_COUNT - 1);
+  printf("Q8 QUANT HVX BIT-IDENTICAL\n");
   printf("Q4 GEMV BIT-IDENTICAL\n");
   return 0;
 }

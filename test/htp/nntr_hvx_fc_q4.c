@@ -20,9 +20,10 @@
  * groups over @a lanes pool threads; with the VTCM feed each thread
  * double-buffers its next group into its own VTCM slice on its own DMA
  * engine while it computes the current one (weight DMA hidden behind
- * compute). The small ops run the scalar specs themselves: m1_ops_det.h
- * compiled for the DSP is the kernel, so G1 checks the DSP's scalar IEEE
- * unit and the compiler, not a second implementation.
+ * compute). q8_quant_f32 runs the FC's own vector quantizer; SwiGLU and
+ * argmax run the scalar specs themselves (m1_ops_det.h compiled for the
+ * DSP is the kernel, so G1 checks the DSP's scalar IEEE unit and the
+ * compiler, not a second implementation).
  * ponytail: scalar, so a 7168-element SwiGLU pays 7168 integer divides on
  * one thread (test entries only); plan 132 section 3.2's HVX SwiGLU and
  * argmax come with Part B if decision D keeps the dense FFN and lm_head on
@@ -64,8 +65,8 @@
 #define FC_Q4_MAX_K 8192u
 /** @brief Pool threads the static per-thread state serves. */
 #define FC_Q4_MAX_LANES 8u
-/** @brief fc_q4m1_f32's variant word: bits 0-7 HVX_Q4M1_*, 8-15 columns
- *  in flight for SFFMA, bit 16 the VTCM feed. */
+/** @brief fc_q4m1_f32's variant word: bit 16 the VTCM feed; every other
+ *  bit must be 0 (the kernel variants of the first sitting are gone). */
 #define FC_Q4_FEED_VTCM (1u << 16)
 /** @brief fc_q4m1_f32's stats words. */
 #define FC_Q4_STATS 8
@@ -75,8 +76,6 @@ static int32_t g_s8[FC_Q4_MAX_K / 32u], g_ma[FC_Q4_MAX_K / 32u],
   g_ea[FC_Q4_MAX_K / 32u];
 static float g_df[FC_Q4_MAX_K / 32u];
 static uint16_t g_d[FC_Q4_MAX_K / 32u];
-static float g_fs[FC_Q4_MAX_LANES][2u * FC_Q4_MAX_K]
-  __attribute__((aligned(128)));
 static hexkl_dma_desc2d g_desc[FC_Q4_MAX_LANES][2]
   __attribute__((aligned(128)));
 
@@ -93,7 +92,7 @@ int nntr_hvx_q4m1_register(remote_handle64 handle, uint32 K, uint32 N,
   if (!s) {
     return AEE_EBADPARM;
   }
-  if (K == 0u || K % 64u != 0u || K > FC_Q4_MAX_K || N == 0u ||
+  if (K == 0u || K % 128u != 0u || K > FC_Q4_MAX_K || N == 0u ||
       N % Q4M1_GROUP != 0u || (size_t)wLen != q4m1_bytes(K, N)) {
     FARF(ERROR, "q4m1_register: bad shape (K=%u N=%u bytes=%d)", (unsigned)K,
          (unsigned)N, wLen);
@@ -142,7 +141,7 @@ typedef struct {
   size_t gbytes;
   const hvx_q4m1_act *a;
   float *y;
-  uint32_t variant, cif, feed_vtcm;
+  uint32_t feed_vtcm;
   uint8_t *vtcm;
   uint32_t vtcm_per_lane;
   uint32_t lanes_used;           /**< written by lane 0 */
@@ -187,12 +186,10 @@ static void fc_lane(uint32_t n, uint32_t i, void *v) {
   if (i == 0u) {
     c->lanes_used = n;
   }
-  float *fs = g_fs[i];
   if (!c->feed_vtcm) {
     for (uint32_t g = i; g < c->G; g += n) {
       hvx_q4m1_gemv_groups(c->w + g * c->gbytes, c->K, 1u, c->a,
-                           c->y + (size_t)g * Q4M1_GROUP, c->variant, c->cif,
-                           fs);
+                           c->y + (size_t)g * Q4M1_GROUP);
     }
     return;
   }
@@ -213,7 +210,7 @@ static void fc_lane(uint32_t n, uint32_t i, void *v) {
                    c->w + (g + n) * c->gbytes, (uint32_t)c->gbytes);
     }
     hvx_q4m1_gemv_groups(buf[cur], c->K, 1u, c->a,
-                         c->y + (size_t)g * Q4M1_GROUP, c->variant, c->cif, fs);
+                         c->y + (size_t)g * Q4M1_GROUP);
     cur ^= 1u;
   }
 }
@@ -229,11 +226,9 @@ int nntr_hvx_fc_q4m1_f32(remote_handle64 handle, uint32 h, uint32 variant,
     return AEE_EBADITEM;
   }
   const nntr_hvx_q4m1_slot *w = &s->q4m1[h];
-  const uint32_t kind = variant & 0xffu, cif = (variant >> 8) & 0xffu;
   const uint32_t feed = (variant & FC_Q4_FEED_VTCM) ? 1u : 0u;
   if ((uint32_t)xLen != w->K || (uint32_t)yLen != w->N ||
-      statsLen != FC_Q4_STATS || kind > HVX_Q4M1_SFFMA ||
-      (kind == HVX_Q4M1_SFFMA && cif != 8u && cif != 16u && cif != 32u) ||
+      statsLen != FC_Q4_STATS || (variant & ~FC_Q4_FEED_VTCM) != 0u ||
       lanes == 0u || lanes > FC_Q4_MAX_LANES || reps == 0u) {
     FARF(ERROR, "fc_q4m1_f32: bad call (x=%d y=%d variant=0x%x lanes=%u)", xLen,
          yLen, (unsigned)variant, (unsigned)lanes);
@@ -246,8 +241,6 @@ int nntr_hvx_fc_q4m1_f32(remote_handle64 handle, uint32 h, uint32 variant,
   c.G = w->N / Q4M1_GROUP;
   c.gbytes = (size_t)(w->K / 64u) * Q4M1_PAIR_BYTES;
   c.y = y;
-  c.variant = kind;
-  c.cif = cif;
   c.feed_vtcm = feed;
   if (feed) {
     /* two groups per lane below the HMX config block; nothing of the
@@ -294,10 +287,15 @@ int nntr_hvx_q8_quant_f32(remote_handle64 handle, const float *x, int xLen,
   if (!s) {
     return AEE_EBADPARM;
   }
-  if (xLen <= 0 || xLen % 32 != 0 || qLen != xLen || dLen != xLen / 32) {
+  if (xLen <= 0 || xLen % 128 != 0 || xLen > (int)FC_Q4_MAX_K || qLen != xLen ||
+      dLen != xLen / 32) {
     return AEE_EINVALIDFORMAT;
   }
-  q8_0_quant_cpu_det(x, (uint32_t)xLen, (int8_t *)q, (uint16_t *)d);
+  /* the FC's own quantizer (hvx_q4m1_prep), not the scalar spec */
+  hvx_q4m1_act a = {g_q, g_s8, g_ma, g_ea, g_df, g_d};
+  hvx_q4m1_prep(x, (uint32_t)xLen, &a);
+  memcpy(q, g_q, (size_t)xLen);
+  memcpy(d, g_d, (size_t)dLen * sizeof(uint16_t));
   return AEE_SUCCESS;
 }
 

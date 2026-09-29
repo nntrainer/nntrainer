@@ -11,18 +11,15 @@
  * @bug    No known bugs except for NYI items
  *
  * Each output column is the CPU's chain acc = fma(isum_b, s_b, acc) over
- * the 32-blocks in order. Three ways to run it, all equal to the spec:
- *
- *  HVX_Q4M1_NATIVE / HVX_Q4M1_INTRIN: 32 columns per vector. The integer
- *    dot is vrmpy; the product isum * d_w * d_a is split exactly into two
- *    f32 (P1 + P2), and RN(acc + P1 + P2) is Boldo-Melquiond's emulated
- *    FMA: Fast2Sum, TwoSum, a round-to-odd add, one final RN add. NATIVE
- *    issues the IEEE vadd / vsub / vmpy .sf instructions (-mhvx-ieee-fp);
- *    INTRIN the Q6_Vsf_* intrinsics, which the compiler lowers to a qf32
- *    op and a conversion (the host emulation's form; the silicon fallback).
- *  HVX_Q4M1_SFFMA: HVX makes isum and s (both exact) for all blocks of a
- *    group, then the scalar core runs the chains with sffma, @a cif
- *    columns in flight (8, 16 or 32 independent chains).
+ * the 32-blocks in order, 32 columns per vector: the integer dot is
+ * vrmpy; the product isum * d_w * d_a is split exactly into two f32
+ * (P1 + P2), and RN(acc + P1 + P2) is Boldo-Melquiond's emulated FMA
+ * (Fast2Sum, TwoSum, a round-to-odd add), every step a Q6_Vsf_*
+ * intrinsic (a qf32 op and a conversion; one IEEE op on silicon). The
+ * inline-asm IEEE .sf instructions and a scalar-sffma tail were tried and
+ * dropped after the 2026-09-29 sitting (measurement 132-pr2: the .sf
+ * instructions return 0 on the phone although the ISS models them; the
+ * sffma tail ran at 2.4x the vector kernel's time).
  *
  * No DSP state: the caller owns the weight (128-byte aligned, the Q4M1
  * bytes), the prepared activation and the scratch.
@@ -37,13 +34,6 @@
 extern "C" {
 #endif
 
-/** @brief Kernel variants (the fc_q4m1_f32 entry's variant, low byte). */
-enum {
-  HVX_Q4M1_NATIVE = 0,
-  HVX_Q4M1_INTRIN = 1,
-  HVX_Q4M1_SFFMA = 2,
-};
-
 /** @brief One quantized activation row, from hvx_q4m1_prep. Arrays of K
  *         (q) and K / 32 (the rest) elements, owned by the caller. */
 typedef struct {
@@ -55,22 +45,18 @@ typedef struct {
   uint16_t *d; /**< per block: d_a, the f16 the CPU stores */
 } hvx_q4m1_act;
 
-/** @brief q8_0_quant_cpu_det of x (K % 64 == 0) plus the per-block terms
- *         the kernels read. Scalar, exact integer helpers. */
+/** @brief q8_0_quant_cpu_det of x (K % 128 == 0, K <= 8192) on the vector
+ *         unit, plus
+ *         the per-block terms the kernel reads (hvx_q4_gemv_f32.c). */
 void hvx_q4m1_prep(const float *x, uint32_t K, hvx_q4m1_act *a);
 
 /**
  * @brief @a ngroups consecutive groups of 32 columns: y[32 i + l] for group
  *        i of @a w (Q4M1, 128-byte aligned, K / 64 units of 1152 bytes
  *        per group).
- *
- * @param variant HVX_Q4M1_*
- * @param cif     columns in flight for HVX_Q4M1_SFFMA: 8, 16 or 32
- * @param fs      HVX_Q4M1_SFFMA scratch: 2 K floats, 128-byte aligned
  */
 void hvx_q4m1_gemv_groups(const uint8_t *w, uint32_t K, uint32_t ngroups,
-                          const hvx_q4m1_act *a, float *y, uint32_t variant,
-                          uint32_t cif, float *fs);
+                          const hvx_q4m1_act *a, float *y);
 
 #ifdef __cplusplus
 }
