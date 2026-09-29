@@ -17,6 +17,8 @@
 
 #include <app_context.h>
 #include <engine.h>
+#include <lfm2_causallm.h>
+#include <lfm2_moe_layer.h>
 #include <llm_util.hpp>
 #include <logit_softcapping.h>
 #include <model.h>
@@ -138,20 +140,27 @@ void Gemma4Transformer::setupParameters(json &cfg, json &generation_cfg,
   ATTENTION_K_EQ_V =
     cfg.contains("attention_k_eq_v") && cfg["attention_k_eq_v"].get<bool>();
 
-  NNTR_THROW_IF(!cfg.contains("hidden_size_per_layer_input") ||
-                  cfg["hidden_size_per_layer_input"].is_null() ||
-                  cfg["hidden_size_per_layer_input"].get<unsigned int>() == 0,
+  // 0 (the MoE checkpoints) means no per-layer input path at all.
+  HIDDEN_SIZE_PER_LAYER_INPUT = cfg.value("hidden_size_per_layer_input", 0u);
+  VOCAB_SIZE_PER_LAYER_INPUT = cfg.value("vocab_size_per_layer_input", 0u);
+  NNTR_THROW_IF(HIDDEN_SIZE_PER_LAYER_INPUT != 0 &&
+                  VOCAB_SIZE_PER_LAYER_INPUT == 0,
                 std::invalid_argument)
-    << "[Gemma4] hidden_size_per_layer_input must be provided and > 0";
-  NNTR_THROW_IF(!cfg.contains("vocab_size_per_layer_input") ||
-                  cfg["vocab_size_per_layer_input"].is_null() ||
-                  cfg["vocab_size_per_layer_input"].get<unsigned int>() == 0,
-                std::invalid_argument)
-    << "[Gemma4] vocab_size_per_layer_input must be provided and > 0";
-  HIDDEN_SIZE_PER_LAYER_INPUT =
-    cfg["hidden_size_per_layer_input"].get<unsigned int>();
-  VOCAB_SIZE_PER_LAYER_INPUT =
-    cfg["vocab_size_per_layer_input"].get<unsigned int>();
+    << "[Gemma4] vocab_size_per_layer_input must be > 0 when "
+       "hidden_size_per_layer_input is";
+
+  ENABLE_MOE_BLOCK = cfg.value("enable_moe_block", false);
+  if (ENABLE_MOE_BLOCK) {
+    NUM_EXPERTS = cfg.at("num_experts").get<unsigned int>();
+    NUM_EXPERTS_PER_TOK = cfg.at("top_k_experts").get<unsigned int>();
+    MOE_INTERMEDIATE_SIZE = cfg.at("moe_intermediate_size").get<unsigned int>();
+    // Same keys and defaults as Lfm2MoeCausalLM::setupParameters.
+    MOE_LAYER_DTYPE = nntr_cfg.value("moe_layer_dtype", FC_LAYER_DTYPE);
+    MOE_ENGINE = nntr_cfg.value("moe_engine", std::string("cpu"));
+    MOE_HTP_LAYERS =
+      parseLayerIdList(nntr_cfg.value("moe_htp_layers", std::string("")));
+    MOE_CACHE_EXPERTS = nntr_cfg.value("moe_cache_experts", 0u);
+  }
 
   FULL_ATTENTION_ROPE_THETA = ROPE_THETA;
   SLIDING_ATTENTION_ROPE_THETA = ROPE_THETA;
@@ -261,6 +270,26 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
                                   EMBEDDING_SCALE, EMBEDDING_FILE_NAME)));
   Tensor h = embedding(x);
 
+  if (HIDDEN_SIZE_PER_LAYER_INPUT != 0)
+    constructPerLayerInput(x, h);
+
+  layer_k_norms.assign(NUM_LAYERS, Tensor());
+  layer_v_norms.assign(NUM_LAYERS, Tensor());
+  for (int i = 0; i < NUM_LAYERS; ++i) {
+    h = createTransformerDecoderBlock(i, h);
+  }
+
+  std::vector<std::string> output_norm_props = {
+    withKey("name", "output_norm"),
+    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
+  appendSkipPrefillIfNeeded(output_norm_props, true);
+  LayerHandle out_norm(createLayer("rms_norm", output_norm_props));
+  h = out_norm(h);
+
+  return {x, h};
+}
+
+void Gemma4Transformer::constructPerLayerInput(Tensor x, Tensor h) {
   const unsigned int per_layer_total_dim =
     NUM_LAYERS * HIDDEN_SIZE_PER_LAYER_INPUT;
 
@@ -315,21 +344,6 @@ std::pair<Tensor, Tensor> Gemma4Transformer::constructModel() {
                   withKey("multiplier", std::to_string(per_layer_input_scale)),
                 }));
   per_layer_input = per_layer_input_scale_layer(per_layer_sum_out);
-
-  layer_k_norms.assign(NUM_LAYERS, Tensor());
-  layer_v_norms.assign(NUM_LAYERS, Tensor());
-  for (int i = 0; i < NUM_LAYERS; ++i) {
-    h = createTransformerDecoderBlock(i, h);
-  }
-
-  std::vector<std::string> output_norm_props = {
-    withKey("name", "output_norm"),
-    withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
-  appendSkipPrefillIfNeeded(output_norm_props, true);
-  LayerHandle out_norm(createLayer("rms_norm", output_norm_props));
-  h = out_norm(h);
-
-  return {x, h};
 }
 
 Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
@@ -397,6 +411,32 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
 
   Tensor ffn_out = createMlp(layer_id, DIM, INTERMEDIATE_SIZE, pre_ffn);
 
+  if (ENABLE_MOE_BLOCK) {
+    // Gemma4TextDecoderLayer: norm_1(mlp) + norm_2(experts(norm(residual)))
+    // with the router reading its own norm of the residual (doc 55 §6.2;
+    // its scale and hidden^-0.5 are folded into that norm's gamma by the
+    // converter).
+    auto norm = [&](const char *suffix, Tensor in) {
+      std::vector<std::string> props = {
+        withKey("name", "layer" + std::to_string(layer_id) + suffix),
+        withKey("epsilon", std::to_string(NORM_EPS)),
+        withKey("packed", "false")};
+      appendSkipPrefillIfNeeded(props, is_kv_shared_layer);
+      return LayerHandle(createLayer("rms_norm", props))(in);
+    };
+    Tensor mlp_normed = norm("_post_ffn_norm_1", ffn_out);
+    Tensor router_in = norm("_router_norm", post_attention);
+    Tensor experts_in = norm("_pre_ffn_norm_2", post_attention);
+    Tensor moe_out = createMoe(layer_id, experts_in, router_in);
+    Tensor moe_normed = norm("_post_ffn_norm_2", moe_out);
+
+    std::vector<std::string> ffn_sum_props = {
+      withKey("name", "layer" + std::to_string(layer_id) + "_ffn_sum")};
+    appendSkipPrefillIfNeeded(ffn_sum_props, is_kv_shared_layer);
+    LayerHandle ffn_sum(createLayer("addition", ffn_sum_props));
+    ffn_out = ffn_sum({mlp_normed, moe_normed});
+  }
+
   std::vector<std::string> post_ffn_norm_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_post_ffn_norm"),
     withKey("epsilon", std::to_string(NORM_EPS)), withKey("packed", "false")};
@@ -411,6 +451,17 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
     createLayer("addition", decoder_output_base_props));
   Tensor decoder_output_base =
     decoder_output_base_layer({post_attention, post_ffn});
+
+  std::vector<std::string> layer_scalar_props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_layer_scalar"),
+    withKey("packed", "false"),
+    withKey("use_weight", "true"),
+  };
+  appendSkipPrefillIfNeeded(layer_scalar_props, is_kv_shared_layer);
+  LayerHandle layer_scalar(createLayer("scalar_multiply", layer_scalar_props));
+
+  if (HIDDEN_SIZE_PER_LAYER_INPUT == 0)
+    return layer_scalar(decoder_output_base);
 
   // Select [B, S, hidden_size_per_layer_input] from packed per-layer input
   // [B, S, num_layers*hidden_size_per_layer_input]
@@ -483,15 +534,28 @@ Tensor Gemma4Transformer::createTransformerDecoderBlock(const int layer_id,
   Tensor decoder_output =
     decoder_output_layer({decoder_output_base, per_layer_input_normed});
 
-  std::vector<std::string> layer_scalar_props = {
-    withKey("name", "layer" + std::to_string(layer_id) + "_layer_scalar"),
-    withKey("packed", "false"),
-    withKey("use_weight", "true"),
-  };
-  appendSkipPrefillIfNeeded(layer_scalar_props, is_kv_shared_layer);
-  LayerHandle layer_scalar(createLayer("scalar_multiply", layer_scalar_props));
-
   return layer_scalar(decoder_output);
+}
+
+Tensor Gemma4Transformer::createMoe(const int layer_id, Tensor input,
+                                    Tensor router_input) {
+  const std::string engine =
+    (MOE_HTP_LAYERS.empty() || MOE_HTP_LAYERS.count(layer_id)) ? MOE_ENGINE
+                                                               : "cpu";
+  std::vector<std::string> props = {
+    withKey("name", "layer" + std::to_string(layer_id) + "_sparse_moe"),
+    withKey("unit", MOE_INTERMEDIATE_SIZE),
+    withKey("num_experts", NUM_EXPERTS),
+    withKey("num_experts_per_token", NUM_EXPERTS_PER_TOK),
+    withKey("moe_activation", "tanh_gelu"),
+    withKey("router_type", "softmax_scale"),
+    withKey("weight_dtype", MOE_LAYER_DTYPE),
+    withKey("engine", engine)};
+  if (MOE_CACHE_EXPERTS != 0)
+    props.push_back(withKey("cache_experts", MOE_CACHE_EXPERTS));
+  appendSkipPrefillIfNeeded(props, isKVSharedLayer(layer_id));
+  LayerHandle moe(createLayer("lfm2_moe", props));
+  return moe({input, router_input});
 }
 
 Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
@@ -637,14 +701,21 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   LayerHandle wk(createLayer("fully_connected", k_params));
   Tensor k = wk(key);
 
-  // V layer [B, S, H] -> [B, S, Nk*Dh]
-  std::vector<std::string> v_params = {
-    withKey("name", V), withKey("unit", curr_head_dim * curr_kv_heads),
-    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
-  appendSkipPrefillIfNeeded(v_params, is_kv_shared_layer);
-  LayerHandle wv(createLayer("fully_connected", v_params));
-  Tensor v = wv(value);
+  // V layer [B, S, H] -> [B, S, Nk*Dh]. attention_k_eq_v: a full-attention
+  // layer has no v_proj and V is the raw K projection (before k_norm and
+  // RoPE), v_norm'ed below like any V -- Gemma4TextAttention.forward.
+  Tensor v;
+  if (ATTENTION_K_EQ_V && !is_sliding) {
+    v = k;
+  } else {
+    std::vector<std::string> v_params = {
+      withKey("name", V), withKey("unit", curr_head_dim * curr_kv_heads),
+      withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
+      withKey("weight_dtype", FC_LAYER_DTYPE)};
+    appendSkipPrefillIfNeeded(v_params, is_kv_shared_layer);
+    LayerHandle wv(createLayer("fully_connected", v_params));
+    v = wv(value);
+  }
 
   // q_norm on per-head projection [B, S, Nq*Dh]
   std::vector<std::string> q_norm_params = {
@@ -800,6 +871,8 @@ void Gemma4Transformer::registerCustomLayers() {
   tryRegister(nntrainer::createLayer<causallm::PerLayerSliceLayer>);
   tryRegister(nntrainer::createLayer<causallm::ScalarMultiplyLayer>);
   tryRegister(nntrainer::createLayer<causallm::LogitSoftCappingLayer>);
+  if (ENABLE_MOE_BLOCK)
+    tryRegister(nntrainer::createLayer<causallm::Lfm2MoELayer>);
 }
 
 void Gemma4CausalLM::registerCustomLayers() {

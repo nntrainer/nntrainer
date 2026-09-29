@@ -14,6 +14,7 @@
 #define __GEMMA4_CAUSAL_LM_H__
 
 #include <causal_lm.h>
+#include <set>
 
 namespace causallm {
 
@@ -58,6 +59,20 @@ protected:
   bool USE_DOUBLE_WIDE_MLP = false;
   float EMBEDDING_PER_LAYER_SCALE = 1.0f;
 
+  /** MoE block beside the dense MLP (config enable_moe_block; doc 55). The
+   *  expert layer is the LFM2 MoE layer with router_type softmax_scale, so
+   *  the same nntr_config keys as LFM2 drive it: moe_layer_dtype,
+   *  moe_engine, moe_htp_layers, and moe_cache_experts (the per-layer expert
+   *  cache C; NNTR_MOE_CACHE_EXPERTS in the environment overrides it). */
+  bool ENABLE_MOE_BLOCK = false;
+  unsigned int NUM_EXPERTS = 0;
+  unsigned int NUM_EXPERTS_PER_TOK = 0;
+  unsigned int MOE_INTERMEDIATE_SIZE = 0;
+  std::string MOE_LAYER_DTYPE;
+  std::string MOE_ENGINE = "cpu";
+  std::set<int> MOE_HTP_LAYERS;
+  unsigned int MOE_CACHE_EXPERTS = 0;
+
   std::string FULL_ATTENTION_ROPE_TYPE = "default";
   std::string SLIDING_ATTENTION_ROPE_TYPE = "default";
   float FULL_ATTENTION_ROPE_PARTIAL_ROTARY_FACTOR = 1.0f;
@@ -74,6 +89,9 @@ protected:
                                  bool enable_skip) const;
   std::pair<Tensor, Tensor>
   createGemma4KVCachePlaceholders(const int layer_id, unsigned int kv_width);
+  /** The per-layer input embedding, projection and norm (hidden_size_per_
+   *  layer_input != 0); leaves the result in per_layer_input. */
+  void constructPerLayerInput(Tensor x, Tensor h);
 
 public:
   Tensor createAttention(const int layer_id, int seq_len, int n_heads,
@@ -93,6 +111,9 @@ public:
 
   Tensor createMlp(const int layer_id, int dim, int hidden_dim,
                    Tensor input) override;
+  /** The MoE half of a Gemma-4 FFN block: router on @a router_input, experts
+   *  on @a input, both already normed by the caller. */
+  Tensor createMoe(const int layer_id, Tensor input, Tensor router_input);
 
   void registerCustomLayers() override;
 
