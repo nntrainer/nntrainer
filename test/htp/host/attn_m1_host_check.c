@@ -38,12 +38,15 @@
  *     primitives of the fast kernel (ATTN M1 HF PRIM OK): the one-rounding
  *     FMA on adversarial, zero / sign and random triples, the hf ops over
  *     every finite fp16, the score tree, exp16 at every fp16 d <= 0 and
- *     the divide on the sweep's hard quotients.
+ *     the divide on the sweep's hard quotients; since round 2 the vector
+ *     rounding hvx_hf_round_row at every f32 the scalar row walks and the
+ *     vector widening hvx_hf_store_sf at every finite fp16.
  *  3. KERNEL == SPEC. hvx_attn_m1_f32.c -- the skel's own source -- on the
  *     lane-by-lane emulation with the pthread worker pool at 0, 3 and 7
  *     workers, memcmp'd against the spec for L = 1, 63, 64, 65, 512, 513,
  *     1024, 1536 at the shapes (n_kv, gqa) = (8, 4) (LFM2.5), (1, 2) (the
- *     hd64 fixture) and (2, 3) (odd gqa: one unit per kv head), head_dim
+ *     hd64 fixture), (2, 3) (odd gqa: single-chain P3 ranges, partial ET
+ *     groups) and (1, 8) (two ET transpose groups per kv head), head_dim
  *     64, at max_seq 2048 (the model's). Each forward is repeated with
  *     the phase words requested (ATTN M1 PHASES OK). Structural cases: an
  *     append chain equals one bulk append; at L = 1 the output is rne16(v)
@@ -719,20 +722,56 @@ static void check_hf_prim(void) {
           0u,
         "an hf op differs from rne16(f32 op)");
 
-  /* hvx_hf_bits_rne == fp16 bits of rne16 at every f32 below 65520 (the
-     positive half exhaustively, the negative half every 61st pattern). */
+  /* hvx_hf_bits_rne and the kernel's vector form hvx_hf_round_row (#170
+     round 2) == fp16 bits of rne16 at every f32 below 65520 (the positive
+     half exhaustively, the negative half every 61st pattern), 64 values
+     per vector call. */
   uint64_t n_cvt = 0;
-  uint32_t bad_cvt = 0;
+  uint32_t bad_cvt = 0, bad_vcvt = 0, nb = 0;
+  float xb[64];
+  uint16_t want_b[64];
   for (uint32_t a = 0; a < 0x477FF000u; ++a) {
     for (uint32_t sg = 0; sg < (a % 61u == 0u ? 2u : 1u); ++sg) {
       const float x = attn_m1_det_float(a | (sg << 31));
-      bad_cvt += hvx_hf_bits_rne(x) != amc_f2h(attn_m1_det_rne16(x));
+      const uint16_t want = amc_f2h(attn_m1_det_rne16(x));
+      bad_cvt += hvx_hf_bits_rne(x) != want;
       ++n_cvt;
+      xb[nb] = x;
+      want_b[nb++] = want;
+      if (nb == 64u || a + 1u == 0x477FF000u) {
+        const HVX_Vector y = hvx_hf_round_row(xb);
+        for (uint32_t i = 0; i < nb; ++i) {
+          bad_vcvt += hvx_emu_h(&y, (int)i) != want_b[i];
+        }
+        nb = 0;
+      }
     }
   }
-  printf("ATTN M1 HF PRIM f32 -> fp16 bits: %llu values, bad=%u\n",
-         (unsigned long long)n_cvt, bad_cvt);
+  /* ... and back: hvx_hf_store_sf == the f32 of every finite fp16 (the
+     output widening; -0 and the subnormals included). */
+  uint32_t n_wid = 0, bad_wid = 0;
+  for (uint32_t base = 0; base < 0x10000u; base += 64u) {
+    float o[64];
+    for (uint32_t i = 0; i < 64u; ++i) {
+      a[i] = (uint16_t)(base + i);
+    }
+    hvx_hf_store_sf(o, hf_load(a));
+    for (uint32_t i = 0; i < 64u; ++i) {
+      if ((a[i] & 0x7C00u) != 0x7C00u) {
+        const float want = amc_h2f(a[i]);
+        bad_wid += memcmp(&o[i], &want, sizeof(want)) != 0;
+        ++n_wid;
+      }
+    }
+  }
+  printf("ATTN M1 HF PRIM f32 -> fp16 bits: %llu values, bad=%u, vector "
+         "bad=%u; fp16 -> f32 vector: %u values, bad=%u\n",
+         (unsigned long long)n_cvt, bad_cvt, bad_vcvt, n_wid, bad_wid);
   CHECK(bad_cvt == 0u, "hvx_hf_bits_rne differs from rne16");
+  CHECK(bad_vcvt == 0u, "hvx_hf_round_row differs from rne16");
+  CHECK(n_wid == 63488u && bad_wid == 0u,
+        "hvx_hf_store_sf differs from the fp16 value (%u of %u)", bad_wid,
+        n_wid);
 
   /* The score tree on random fp16 accumulators. */
   uint32_t bad_tree = 0;
@@ -809,7 +848,8 @@ static void check_hf_prim(void) {
         "div16 hard quotients: %u", g_div_hard);
   CHECK(bad_tree + bad_exp + bad_div == 0u,
         "the hf tree, exp16 or divide differs from the spec");
-  if (bad_adv + bad_zs + bad_rnd + bad_tree + bad_exp + bad_div + bad_cvt ==
+  if (bad_adv + bad_zs + bad_rnd + bad_tree + bad_exp + bad_div + bad_cvt +
+          bad_vcvt + bad_wid ==
         0u &&
       bad_op[0] + bad_op[1] + bad_op[2] + bad_op[3] + bad_op[4] + bad_op[5] ==
         0u &&
@@ -827,8 +867,9 @@ enum { LFM_KV = 8, LFM_Q = 32, HD = 64 };
 static uint32_t N_KV, GQA, N_Q;
 static amc_rng g_rng;
 /** @brief (n_kv, gqa): LFM2.5 first (the q-head-pair units), the hd64
- *         fixture's, and an odd gqa (one unit per kv head). */
-static const uint32_t SHAPES[3][2] = {{8, 4}, {1, 2}, {2, 3}};
+ *         fixture's, an odd gqa (one unit per kv head) and gqa 8 (two PV
+ *         groups and two ET transpose groups per kv head). */
+static const uint32_t SHAPES[4][2] = {{8, 4}, {1, 2}, {2, 3}, {1, 8}};
 
 static void set_shape(const uint32_t *shape) {
   g_rng.s = 0x81810001u; /* every shape sees the same input stream */

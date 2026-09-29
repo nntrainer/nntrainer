@@ -235,7 +235,7 @@ fi
 # pool on pthreads (stub/qurt.h) at 0, 3 and 7 workers, memcmp'd against
 # the spec for L = 1, 63, 64, 65, 512, 513, 1024, 1536 (max_seq 2048) at
 # (n_kv, gqa) = (8, 4),
-# (1, 2), (2, 3), head_dim 64, plus append-chain == bulk, the L = 1 case,
+# (1, 2), (2, 3), (1, 8), head_dim 64, plus append-chain == bulk, the L = 1 case,
 # a division tie and the error codes; and the phase words (#146), which
 # must leave the output bytes alone (ATTN M1 PHASES OK).
 # -include malloc.h: the cache is memalign(128), which the Hexagon libc

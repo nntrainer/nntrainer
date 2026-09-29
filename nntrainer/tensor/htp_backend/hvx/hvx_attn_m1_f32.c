@@ -13,37 +13,39 @@
  * Plan 170 section 3. Every fp16 step of the spec is one hf op or one
  * hvx_attn_m1_hf.h primitive (its fused FMA was bit-exact on silicon
  * against the spec on real, adversarial and zero / sign triples: S1, G1).
- * One call, after the k / v rows are appended and q is rounded into splat
- * vectors, runs three pool runs with two short serial steps between them
- * (the lane plan from S1's cost sweep: the one-head score shape and the
- * four-head PV shape scale to 6 lanes, the two-head score shape does not):
+ * One call rounds k / v / q as vectors (the v row into V, the k row kept
+ * for P1, q as one splat vector per value), then runs three pool runs with
+ * two short serial steps between them (the lane plan from S1's cost sweep:
+ * the one-head score shape and the four-head PV shape scale to 6 lanes,
+ * the two-head score shape does not):
  *
- *   P1 scores   unit = (kv head, 64-position Kt tile): for each q head of
+ *   P1 scores   unit = (kv head, 64-position Kt tile): the last tile first
+ *               takes the new k column (spec step 1); for each q head of
  *               the kv head, eight accumulators over d = 8 blk + l (the
  *               CPU's float16x8_t lanes, positions in the vector lanes),
  *               the vpaddq tree, 0 + t, * scale -> S[hq][tile]. The tile
- *               (8 KiB) is read from DDR once and from L2 for the other q
- *               heads.
+ *               (8 KiB) is read from DDR once, behind an l2fetch the lane
+ *               issued one unit earlier, and from L2 for the other q heads.
  *   caller      m per q head: hf max over its tiles (masked past L), a
  *               rotate-tree to one lane, + 0.
  *   P2 exp      same units: e = exp16(hf(s - m)) (masked lanes 0) back to
- *               S, and each e scattered into ET[p][hq], one 128-byte row
- *               per position with the q heads in lanes 0 .. n_q - 1.
+ *               S, and into ET[p][hq], one 128-byte row per position with
+ *               the q heads in lanes 0 .. n_q - 1, by a 4-head transpose
+ *               and masked vector stores (the caller l2fetched ET).
  *   caller      l: the CPU's sequential fp16 sum, all q heads at once: one
  *               hf add per position on the ET rows (lanes past n_q are 0).
- *   P3 PV       unit = (kv head, up to 4 of its q heads): divide their rows
- *               by l (hvx_hf_div16), then o[g] = fma(o[g], splat(p[g][p]),
- *               V[p]) for p ascending, four chains sharing each V row load;
- *               out = o widened to f32.
+ *   P3 PV       lane i of n takes a range of q-head chains (whole pairs
+ *               for an even gqa) and walks it by kv head in groups of 4 / 2
+ *               / 1: divide their rows by l (hvx_hf_div16), then o[g] =
+ *               fma(o[g], splat(p[g][p]), V[p]) for p ascending, the chains
+ *               of a group sharing each V row load, the V rows l2fetched
+ *               two 16 KiB blocks ahead; out = o widened to f32 as vectors.
  *
- * The phase words keep their meaning (attn_m1_det.h): SCORES = P1, SOFTMAX
- * = P2 + the two caller steps + the divides, PV = P3's chains, summed over
- * lanes; POOL spans P1 .. P3; BUSY_MAX is the busiest lane over the three
- * runs; LANES and START_MAX are P1's.
- *
- * ponytail: P3 has n_kv * ceil(gqa / 4) units, 8 at LFM2.5 on 6 lanes, so
- * two lanes run two units; splitting two kv heads into head pairs would
- * even it out, worth it if the phase words show BUSY_MAX >> PV / LANES.
+ * The phase words keep their meaning (attn_m1_det.h): APPEND = the
+ * caller's rounding and stores, SCORES = P1 (with the k column merge),
+ * SOFTMAX = P2 + the two caller steps + the divides, PV = P3's chains,
+ * summed over lanes; POOL spans P1 .. P3; BUSY_MAX is the busiest lane over
+ * the three runs; LANES and START_MAX are P1's.
  */
 
 #include "hvx_attn_m1_f32.h"
@@ -130,8 +132,10 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
   ctx->v = (uint16_t *)memalign(VLEN, (size_t)halves * sizeof(uint16_t));
   ctx->s = (uint16_t *)memalign(VLEN, (size_t)n_q * seq * sizeof(uint16_t));
   ctx->et = (uint16_t *)memalign(VLEN, (size_t)seq * VLEN);
-  ctx->qh = (uint16_t *)malloc((size_t)n_q * HD * sizeof(uint16_t));
-  if (!ctx->kv_len || !ctx->kt || !ctx->v || !ctx->s || !ctx->et || !ctx->qh) {
+  ctx->qs = (uint16_t *)memalign(VLEN, (size_t)n_q * HD * VLEN);
+  ctx->kr = (uint16_t *)memalign(VLEN, (size_t)n_kv * HD * sizeof(uint16_t));
+  if (!ctx->kv_len || !ctx->kt || !ctx->v || !ctx->s || !ctx->et || !ctx->qs ||
+      !ctx->kr) {
     rc = AEE_ENOMEMORY;
     hvx_attn_m1_free(ctx);
     ctx = NULL;
@@ -153,7 +157,8 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
   if (!ctx) {
     return;
   }
-  free(ctx->qh);
+  free(ctx->kr);
+  free(ctx->qs);
   free(ctx->et);
   free(ctx->s);
   free(ctx->v);
@@ -174,9 +179,10 @@ static inline uint16_t *v_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
   return ctx->v + ((size_t)layer * ctx->n_kv + h) * ctx->seq * HD;
 }
 
-/** @brief Spec steps 0-1 for one kv head: k and v rounded to fp16 (a seed
- *         row that is already fp16 is unchanged), k into its tile's column,
- *         v as the position's row. k and v are the caller's: scalar. */
+/** @brief Spec steps 0-1 for one kv head of the prefill seed: k and v
+ *         rounded to fp16 (a seed row that is already fp16 is unchanged), k
+ *         into its tile's column, v as the position's row. forward's own
+ *         append is vector (hvx_attn_m1_forward_prof, p1_unit's merge). */
 static inline void append_head(const hvx_attn_m1_ctx *ctx, uint32_t layer,
                                uint32_t h, uint32_t pos, const float *k,
                                const float *v) {
@@ -228,6 +234,29 @@ typedef struct {
  *         has 6 HVX contexts, the host check 8); widen the array then. */
 #define PROF_SLOTS 16u
 
+/* The l2fetch leads (plan 170 round 2 sections 3.1-3.3). A lead is a hint
+   with no effect on any value; each is compiled out with -D<name>=0 if its
+   probe cell reads slower than no lead (LEDGER rule 31). A lane keeps at
+   most three boxes queued (the hardware stalls the thread on a fourth). */
+#ifndef ATTN_M1_P1_LEAD
+#define ATTN_M1_P1_LEAD 1 /**< P1: the lane's next Kt tile */
+#endif
+#ifndef ATTN_M1_PV_LEAD
+#define ATTN_M1_PV_LEAD 1 /**< P3: the V rows two 16 KiB blocks ahead */
+#endif
+#ifndef ATTN_M1_ET_LEAD
+#define ATTN_M1_ET_LEAD 1 /**< the caller: the ET rows P2 will write */
+#endif
+/** @brief V rows per PV fetch block (16 KiB), S1's FETCH_L2F shape. */
+#define PV_BLOCK 128u
+
+/** @brief l2fetch of @a rows 128-byte rows at @a p (Rtt: [47:32] stride,
+ *         [31:16] width, [15:0] height; the height clamped to 16 bits). */
+static inline void l2fetch_rows(const void *p, uint32_t rows) {
+  Q6_l2fetch_AP((void *)p, (128ull << 32) | (128ull << 16) |
+                             (rows < 0xFFFFu ? rows : 0xFFFFu));
+}
+
 typedef struct {
   const hvx_attn_m1_ctx *ctx;
   uint32_t layer, L, ntl; /**< positions, and their tiles */
@@ -240,32 +269,50 @@ typedef struct {
   uint32_t units;
 } forward_job;
 
-/** @brief P1 unit u: kv head u / ntl, tile u % ntl, every q head of it. */
+/** @brief The Kt tile of P1 / P2 unit u. */
+static inline HVX_Vector *unit_tile(const forward_job *job, uint32_t u) {
+  return (HVX_Vector *)(kt_head(job->ctx, job->layer, u / job->ntl) +
+                        (size_t)(u % job->ntl) * HD * TILE);
+}
+
+/** @brief P1 unit u: kv head u / ntl, tile u % ntl, every q head of it. The
+ *         last tile first takes the new position's k column (spec step 1),
+ *         from the row the caller rounded. */
 static void p1_unit(const forward_job *job, uint32_t u) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
   const uint32_t h = u / job->ntl, t = u % job->ntl;
   const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
-  const HVX_Vector *kt =
-    (const HVX_Vector *)(kt_head(ctx, job->layer, h) + (size_t)t * HD * TILE);
+  HVX_Vector *kt = unit_tile(job, u);
+  if (t + 1u == job->ntl) { /* lane pos % 64 = n_live - 1 of each d row */
+    const uint32_t j = job->n_live - 1u;
+    HVX_VectorPred lane = Q6_Q_vsetq2_R((int)(2u * j + 2u));
+    if (j) {
+      lane = Q6_Q_and_QQn(lane, Q6_Q_vsetq2_R((int)(2u * j)));
+    }
+    const uint16_t *kr = ctx->kr + (size_t)h * HD;
+    for (uint32_t d = 0; d < HD; ++d) {
+      kt[d] = Q6_V_vmux_QVV(lane, Q6_Vh_vsplat_R(kr[d]), kt[d]);
+    }
+  }
   for (uint32_t g = 0; g < ctx->gqa; ++g) {
     const uint32_t hq = h * ctx->gqa + g;
-    const uint16_t *qh = ctx->qh + (size_t)hq * HD;
+    const HVX_Vector *qs = (const HVX_Vector *)ctx->qs + (size_t)hq * HD;
     /* acc[l] sees only d = 8 k + l, so the eight chains run as two passes
        of four (the same operations per chain; eight chains at once spill
-       on hexagon-clang 19). */
+       on hexagon-clang 19). q[d] is the caller's splat vector. */
     HVX_Vector a0, a1, a2, a3, a4, a5, a6, a7;
     for (uint32_t half = 0; half < 2u; ++half) {
-      const uint16_t *qp = qh + 4u * half;
+      const HVX_Vector *qp = qs + 4u * half;
       const HVX_Vector *kp = kt + 4u * half;
       HVX_Vector c0 = Q6_V_vzero(), c1 = c0, c2 = c0, c3 = c0;
 #if defined(__hexagon__)
 #pragma unroll 1
 #endif
       for (uint32_t d = 0; d < HD; d += ATTN_M1_DET_ACC) {
-        c0 = hvx_hf_fma(c0, Q6_Vh_vsplat_R(qp[d]), kp[d], one);
-        c1 = hvx_hf_fma(c1, Q6_Vh_vsplat_R(qp[d + 1u]), kp[d + 1u], one);
-        c2 = hvx_hf_fma(c2, Q6_Vh_vsplat_R(qp[d + 2u]), kp[d + 2u], one);
-        c3 = hvx_hf_fma(c3, Q6_Vh_vsplat_R(qp[d + 3u]), kp[d + 3u], one);
+        c0 = hvx_hf_fma(c0, qp[d], kp[d], one);
+        c1 = hvx_hf_fma(c1, qp[d + 1u], kp[d + 1u], one);
+        c2 = hvx_hf_fma(c2, qp[d + 2u], kp[d + 2u], one);
+        c3 = hvx_hf_fma(c3, qp[d + 3u], kp[d + 3u], one);
       }
       if (half == 0u) {
         a0 = c0, a1 = c1, a2 = c2, a3 = c3;
@@ -279,40 +326,80 @@ static void p1_unit(const forward_job *job, uint32_t u) {
   }
 }
 
-/** @brief P2 unit u: e = exp16(s - m) of its tile for every q head, masked
- *         past L, back into S and scattered into the ET rows. */
+/**
+ * @brief P2 unit u: e = exp16(s - m) of its tile for every q head, masked
+ *        past L, back into S and into the ET rows.
+ *
+ * ET row p holds the q heads in lanes. The unit's heads are adjacent lanes
+ * hq0 .. hq0 + 3 of every row of its tile, so four e vectors (positions in
+ * lanes) are transposed in groups of four heads: a halfword and then a
+ * word vshuff make 8-byte tuples (e0[i], e1[i], e2[i], e3[i]), 16 per
+ * vector; a vror puts tuple i at byte 2 * hq0 and one masked store writes
+ * those 2 * (heads) bytes of row i. Moves only: every lane of ET gets the
+ * bits the scalar scatter wrote, and the lanes past n_q are never in a mask.
+ */
 static void p2_unit(const forward_job *job, uint32_t u) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
   const uint32_t h = u / job->ntl, t = u % job->ntl;
   const uint32_t live = t + 1u == job->ntl ? job->n_live : TILE;
   const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
   const HVX_VectorPred mask = Q6_Q_vsetq2_R((int)(live * 2u));
+  HVX_Vector e[MAX_GQA];
+  for (uint32_t g = 0; g < MAX_GQA; ++g) {
+    e[g] = Q6_V_vzero();
+  }
   for (uint32_t g = 0; g < ctx->gqa; ++g) {
     const uint32_t hq = h * ctx->gqa + g;
-    uint16_t *row = ctx->s + (size_t)hq * ctx->seq + (size_t)t * TILE;
-    const HVX_Vector d =
-      Q6_Vhf_vsub_VhfVhf(*(HVX_Vector *)row, Q6_Vh_vsplat_R(job->m[hq]));
-    HVX_Vector e = hvx_hf_exp16(d, one);
+    HVX_Vector *row =
+      (HVX_Vector *)(ctx->s + (size_t)hq * ctx->seq + (size_t)t * TILE);
+    const HVX_Vector d = Q6_Vhf_vsub_VhfVhf(*row, Q6_Vh_vsplat_R(job->m[hq]));
+    e[g] = hvx_hf_exp16(d, one);
     if (live < TILE) {
-      e = Q6_V_vmux_QVV(mask, e, Q6_V_vzero());
+      e[g] = Q6_V_vmux_QVV(mask, e[g], Q6_V_vzero());
     }
-    *(HVX_Vector *)row = e;
-    uint16_t *et = ctx->et + (size_t)t * TILE * TILE + hq;
-    for (uint32_t i = 0; i < live; ++i) {
-      et[(size_t)i * TILE] = row[i];
+    *row = e[g];
+  }
+  HVX_Vector *et = (HVX_Vector *)ctx->et + (size_t)t * TILE;
+  for (uint32_t g0 = 0; g0 < ctx->gqa; g0 += 4u) {
+    const uint32_t hq0 = h * ctx->gqa + g0;
+    const uint32_t cnt = ctx->gqa - g0 < 4u ? ctx->gqa - g0 : 4u;
+    const HVX_VectorPair w01 = Q6_W_vshuff_VVR(e[g0 + 1u], e[g0], -2);
+    const HVX_VectorPair w23 = Q6_W_vshuff_VVR(e[g0 + 3u], e[g0 + 2u], -2);
+    const HVX_VectorPair lo =
+      Q6_W_vshuff_VVR(Q6_V_lo_W(w23), Q6_V_lo_W(w01), -4);
+    const HVX_VectorPair hi =
+      Q6_W_vshuff_VVR(Q6_V_hi_W(w23), Q6_V_hi_W(w01), -4);
+    const HVX_Vector tup[4] = {Q6_V_lo_W(lo), Q6_V_hi_W(lo), Q6_V_lo_W(hi),
+                               Q6_V_hi_W(hi)};
+    HVX_VectorPred lanes = Q6_Q_vsetq2_R((int)(2u * (hq0 + cnt)));
+    if (hq0) {
+      lanes = Q6_Q_and_QQn(lanes, Q6_Q_vsetq2_R((int)(2u * hq0)));
+    }
+    for (uint32_t b = 0; b < 4u && 16u * b < live; ++b) {
+      const HVX_Vector tv = tup[b];
+      const uint32_t n = live - 16u * b < 16u ? live - 16u * b : 16u;
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t rot = (8u * i - 2u * hq0) & (VLEN - 1u);
+        Q6_vmem_QRIV(lanes, et + 16u * b + i, Q6_V_vror_VR(tv, (int)rot));
+      }
     }
   }
 }
 
 /** @brief P3 for q heads g0 .. g0 + ng - 1 of kv head h (ng literal at the
  *         call sites, so the chains live in registers): the divides, then
- *         PV with the V row loaded once per position. */
+ *         PV with the V row loaded once per position, the V rows fetched
+ *         two 16 KiB blocks ahead of the chain. */
 static inline __attribute__((always_inline)) void
 pv_group(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
          prof_slot *ps, uint64_t *t) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
   const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
-  const uint32_t hq0 = h * ctx->gqa + g0;
+  const uint32_t hq0 = h * ctx->gqa + g0, L = job->L;
+  const HVX_Vector *vr = (const HVX_Vector *)v_head(ctx, job->layer, h);
+#if ATTN_M1_PV_LEAD
+  l2fetch_rows(vr, L < 2u * PV_BLOCK ? L : 2u * PV_BLOCK);
+#endif
   const uint16_t *p[PV_GROUP];
   for (uint32_t g = 0; g < ng; ++g) {
     uint16_t *row = ctx->s + (size_t)(hq0 + g) * ctx->seq;
@@ -331,32 +418,37 @@ pv_group(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
     ps->softmax += (uint32_t)(now - *t);
     *t = now;
   }
-  const HVX_Vector *vr = (const HVX_Vector *)v_head(ctx, job->layer, h);
   HVX_Vector o0 = Q6_V_vzero(), o1 = o0, o2 = o0, o3 = o0;
-  for (uint32_t q = 0; q < job->L; ++q) {
-    const HVX_Vector v = vr[q];
-    o0 = hvx_hf_fma(o0, Q6_Vh_vsplat_R(p[0][q]), v, one);
-    if (ng > 1u) {
-      o1 = hvx_hf_fma(o1, Q6_Vh_vsplat_R(p[1][q]), v, one);
+  /* p ascending in blocks of PV_BLOCK; the chain loop is round 1's. */
+  for (uint32_t q0 = 0; q0 < L; q0 += PV_BLOCK) {
+#if ATTN_M1_PV_LEAD
+    if (q0 + 2u * PV_BLOCK < L) {
+      const uint32_t rest = L - q0 - 2u * PV_BLOCK;
+      l2fetch_rows(vr + q0 + 2u * PV_BLOCK, rest < PV_BLOCK ? rest : PV_BLOCK);
     }
-    if (ng > 2u) {
-      o2 = hvx_hf_fma(o2, Q6_Vh_vsplat_R(p[2][q]), v, one);
-    }
-    if (ng > 3u) {
-      o3 = hvx_hf_fma(o3, Q6_Vh_vsplat_R(p[3][q]), v, one);
+#endif
+    const HVX_Vector *vb = vr + q0;
+    const uint16_t *b0 = p[0] + q0, *b1 = p[ng > 1u ? 1u : 0u] + q0,
+                   *b2 = p[ng > 2u ? 2u : 0u] + q0,
+                   *b3 = p[ng > 3u ? 3u : 0u] + q0;
+    const uint32_t nb = L - q0 < PV_BLOCK ? L - q0 : PV_BLOCK;
+    for (uint32_t q = 0; q < nb; ++q) {
+      const HVX_Vector v = vb[q];
+      o0 = hvx_hf_fma(o0, Q6_Vh_vsplat_R(b0[q]), v, one);
+      if (ng > 1u) {
+        o1 = hvx_hf_fma(o1, Q6_Vh_vsplat_R(b1[q]), v, one);
+      }
+      if (ng > 2u) {
+        o2 = hvx_hf_fma(o2, Q6_Vh_vsplat_R(b2[q]), v, one);
+      }
+      if (ng > 3u) {
+        o3 = hvx_hf_fma(o3, Q6_Vh_vsplat_R(b3[q]), v, one);
+      }
     }
   }
   const HVX_Vector o[PV_GROUP] = {o0, o1, o2, o3};
   for (uint32_t g = 0; g < ng; ++g) {
-    union {
-      HVX_Vector v;
-      uint16_t h[TILE];
-    } ob;
-    ob.v = o[g];
-    float *out = job->out + (size_t)(hq0 + g) * HD;
-    for (uint32_t d = 0; d < HD; ++d) {
-      out[d] = hf_float(ob.h[d]);
-    }
+    hvx_hf_store_sf(job->out + (size_t)(hq0 + g) * HD, o[g]);
   }
   if (ps) {
     const uint64_t now = HAP_perf_get_pcycles();
@@ -365,38 +457,17 @@ pv_group(const forward_job *job, uint32_t h, uint32_t g0, const uint32_t ng,
   }
 }
 
-/** @brief P3 units per kv head. */
-static inline uint32_t pv_groups(const hvx_attn_m1_ctx *ctx) {
-  return (ctx->gqa + PV_GROUP - 1u) / PV_GROUP;
-}
-
-static void p3_unit(const forward_job *job, uint32_t u, prof_slot *ps,
-                    uint64_t *t) {
-  const uint32_t gr = pv_groups(job->ctx), h = u / gr;
-  const uint32_t g0 = (u % gr) * PV_GROUP;
-  const uint32_t ng = job->ctx->gqa - g0;
-  switch (ng < PV_GROUP ? ng : PV_GROUP) {
-  case 1:
-    pv_group(job, h, g0, 1u, ps, t);
-    break;
-  case 2:
-    pv_group(job, h, g0, 2u, ps, t);
-    break;
-  case 3:
-    pv_group(job, h, g0, 3u, ps, t);
-    break;
-  default:
-    pv_group(job, h, g0, 4u, ps, t);
-    break;
-  }
-}
-
-/** @brief The three runs' pool lane i of n: units i, i + n, ... */
+/** @brief The P1 / P2 runs' pool lane i of n: units i, i + n, ... */
 static void run_p1(uint32_t n, uint32_t i, void *arg) {
   const forward_job *job = (const forward_job *)arg;
   prof_slot *ps = (job->slots && i < PROF_SLOTS) ? &job->slots[i] : NULL;
   const uint64_t t0 = ps ? HAP_perf_get_pcycles() : 0u;
   for (uint32_t u = i; u < job->units; u += n) {
+#if ATTN_M1_P1_LEAD
+    if (u + n < job->units) {
+      l2fetch_rows(unit_tile(job, u + n), HD);
+    }
+#endif
     p1_unit(job, u);
   }
   if (ps) {
@@ -422,13 +493,39 @@ static void run_p2(uint32_t n, uint32_t i, void *arg) {
   }
 }
 
+/**
+ * @brief P3's lane i of n: a range of q-head chains, in whole pairs when
+ *        gqa is even (unit = 2 chains, else 1): units [i u / n, (i + 1) u
+ *        / n) of u = n_q / unit, walked by kv head in groups of 4, 2 or 1.
+ *        Every chain is its own arithmetic, so any split gives the same
+ *        bytes. At LFM2.5 on 6 lanes the lanes run 4 or 6 chains (1.125x
+ *        the mean) in groups of 4 and 2 only.
+ *
+ * No group of 3: hexagon-clang 19 compiles pv_group's ng = 3 chain loop
+ * with one product moved through sf and back to qf32 (vadd(sf, 0)), a
+ * sequence S1 never measured; the 4, 2 and 1 loops are round 1's shape.
+ */
 static void run_p3(uint32_t n, uint32_t i, void *arg) {
   const forward_job *job = (const forward_job *)arg;
+  const uint32_t gqa = job->ctx->gqa, n_q = job->ctx->n_kv * gqa;
+  const uint32_t unit = gqa % 2u == 0u ? 2u : 1u, n_units = n_q / unit;
   prof_slot *ps = (job->slots && i < PROF_SLOTS) ? &job->slots[i] : NULL;
   uint64_t t = ps ? HAP_perf_get_pcycles() : 0u;
   const uint64_t t0 = t;
-  for (uint32_t u = i; u < job->units; u += n) {
-    p3_unit(job, u, ps, &t);
+  const uint32_t end = (i + 1u) * n_units / n * unit;
+  for (uint32_t hq = i * n_units / n * unit; hq < end;) {
+    const uint32_t h = hq / gqa, g0 = hq % gqa, head_end = (h + 1u) * gqa;
+    const uint32_t left = (end < head_end ? end : head_end) - hq;
+    if (left >= 4u) {
+      pv_group(job, h, g0, 4u, ps, &t);
+      hq += 4u;
+    } else if (left >= 2u) {
+      pv_group(job, h, g0, 2u, ps, &t);
+      hq += 2u;
+    } else {
+      pv_group(job, h, g0, 1u, ps, &t);
+      hq += 1u;
+    }
   }
   if (ps) {
     ps->busy += HAP_perf_get_pcycles() - t0;
@@ -462,16 +559,32 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   }
   prof_slot slots[PROF_SLOTS];
   uint64_t t0 = prof ? HAP_perf_get_pcycles() : 0u;
+  /* Steps 0-1, as vectors (hvx_hf_round_row is hvx_hf_bits_rne per lane):
+     v into its row; k kept for P1, which writes the column into the tile
+     it reads anyway; q as one splat vector per value, P1's operands. */
   for (uint32_t h = 0; h < ctx->n_kv; ++h) {
-    append_head(ctx, layer, h, pos, k + (size_t)h * HD, v + (size_t)h * HD);
+    *(HVX_Vector *)(ctx->kr + (size_t)h * HD) =
+      hvx_hf_round_row(k + (size_t)h * HD);
+    *(HVX_Vector *)(v_head(ctx, layer, h) + (size_t)pos * HD) =
+      hvx_hf_round_row(v + (size_t)h * HD);
   }
   ctx->kv_len[layer] = pos + 1u;
 
   const uint32_t n_q = ctx->n_kv * ctx->gqa, L = pos + 1u;
-  /* Step 0 for q: rounded to fp16 (P1 splats each value as it goes). */
-  for (uint32_t i = 0; i < n_q * HD; ++i) {
-    ctx->qh[i] = hvx_hf_bits_rne(q[i]);
+  HVX_Vector *qs = (HVX_Vector *)ctx->qs;
+  for (uint32_t hq = 0; hq < n_q; ++hq) {
+    union {
+      HVX_Vector v;
+      uint16_t h[TILE];
+    } qv;
+    qv.v = hvx_hf_round_row(q + (size_t)hq * HD);
+    for (uint32_t d = 0; d < HD; ++d) {
+      *qs++ = Q6_Vh_vsplat_R(qv.h[d]);
+    }
   }
+#if ATTN_M1_ET_LEAD
+  l2fetch_rows(ctx->et, L);
+#endif
   forward_job job;
   job.ctx = ctx;
   job.layer = layer;
@@ -538,8 +651,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
     serial += (uint32_t)(HAP_perf_get_pcycles() - ts);
   }
 
-  job.units = ctx->n_kv * pv_groups(ctx);
-  hvx_worker_pool_run(ctx->pool, run_p3, &job, job.units);
+  hvx_worker_pool_run(ctx->pool, run_p3, &job, n_q);
 
   if (stats) {
     for (uint32_t hq = 0; hq < n_q; ++hq) {

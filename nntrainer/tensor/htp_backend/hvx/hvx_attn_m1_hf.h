@@ -42,6 +42,12 @@
  *                   ponytail: an hf-native divide (the midpoint test on
  *                   qf32 products) would drop the widen / narrow; worth it
  *                   only if the phase words show the divide matters.
+ *   hvx_hf_round_row / hvx_hf_store_sf  (#170 round 2) the kernel's q / k
+ *                   / v rounding and its output widening as vectors:
+ *                   hvx_hf_bits_rne and hf_float per lane in integer ops
+ *                   plus exact f32 steps, so the sign of a zero and the
+ *                   subnormals come through (no qf32 conversion on the
+ *                   result; qf32 has no -0).
  *
  * Widening and narrowing values already on the fp16 grid are exact both
  * ways. The host emulation (test/htp/host/hvx_emu) checks all of this
@@ -232,6 +238,71 @@ static inline HVX_Vector hvx_hf_div16(HVX_Vector e, HVX_VectorPair l,
   return hvx_hf_narrow(
     Q6_W_vcombine_VV(hvx_div16_sf(Q6_V_hi_W(w), Q6_V_hi_W(l), Q6_V_hi_W(r)),
                      hvx_div16_sf(Q6_V_lo_W(w), Q6_V_lo_W(l), Q6_V_lo_W(r))));
+}
+
+/**
+ * @brief hvx_hf_bits_rne on 32 f32 lanes: the fp16 bits of rne16(x) in the
+ *        low halfword of each word (the high one is 0).
+ *
+ * The same steps as the scalar function, so the same bits by construction
+ * (ATTN M1 HF PRIM walks every f32 below 65520): at or above 2^-14 the
+ * normal fp16 is the magnitude's bits shifted down 13 with round to
+ * nearest even (+ 0xFFF + the kept lsb, then the shift) and the exponent
+ * rebased; below it the subnormal grid 2^-24, i.e. the integer nearest to
+ * |x| * 2^24 (exact) by the 1.5 * 2^23 add of hvx_hf_exp16_sf (one
+ * rounding, ties to even; 1024 is the smallest normal's bits, as it should
+ * be). The sign is ORed back as bits, so a zero result keeps it -- no qf32
+ * conversion touches the result (hvx_hf_narrow would, and qf32 has no -0).
+ */
+static inline HVX_Vector hvx_hf_bits_rne_w(HVX_Vector x) {
+  const HVX_Vector a = Q6_V_vand_VV(x, Q6_V_vsplat_R(0x7FFFFFFF));
+  const HVX_Vector s =
+    Q6_V_vand_VV(Q6_Vuw_vlsr_VuwR(x, 16), Q6_V_vsplat_R(0x8000));
+  const HVX_Vector lsb =
+    Q6_V_vand_VV(Q6_Vuw_vlsr_VuwR(a, 13), Q6_V_vsplat_R(1));
+  const HVX_Vector rn = Q6_Vw_vsub_VwVw(
+    Q6_Vuw_vlsr_VuwR(
+      Q6_Vw_vadd_VwVw(Q6_Vw_vadd_VwVw(a, Q6_V_vsplat_R(0xFFF)), lsb), 13),
+    Q6_V_vsplat_R(112 << 10));
+  const HVX_Vector rs =
+    Q6_Vw_vsub_VwVw(hvx_hf_add_rn(hvx_hf_mul_rn(a, hvx_splat_sf(16777216.0f)),
+                                  hvx_splat_sf(12582912.0f)),
+                    Q6_V_vsplat_R(0x4B400000));
+  const HVX_VectorPred normal =
+    Q6_Q_vcmp_gt_VwVw(a, Q6_V_vsplat_R(ATTN_M1_DET_EF_MIN16 - 1u));
+  return Q6_V_vor_VV(Q6_V_vmux_QVV(normal, rn, rs), s);
+}
+
+/** @brief One head row: 64 f32 at @a x (any 4-byte alignment) rounded to
+ *         64 fp16 lanes, lane i = hvx_hf_bits_rne(x[i]). */
+static inline HVX_Vector hvx_hf_round_row(const float *x) {
+  return Q6_Vh_vpacke_VwVw(hvx_hf_bits_rne_w(*(const HVX_UVector *)(x + 32)),
+                           hvx_hf_bits_rne_w(*(const HVX_UVector *)x));
+}
+
+/**
+ * @brief 32 fp16 values (zero-extended words) to f32, exactly and with the
+ *        sign of a zero kept: the kernel's scalar hf_float per lane. A
+ *        normal is its bits rebased; a subnormal m * 2^-24 (m < 1024 made
+ *        f32 by hvx_w_to_sf, then one exact multiply); the sign ORed last.
+ */
+static inline HVX_Vector hvx_hf_bits_to_sf(HVX_Vector h) {
+  const HVX_Vector a = Q6_V_vand_VV(h, Q6_V_vsplat_R(0x7FFF));
+  const HVX_Vector s =
+    Q6_Vw_vasl_VwR(Q6_V_vand_VV(h, Q6_V_vsplat_R(0x8000)), 16);
+  const HVX_Vector nrm =
+    Q6_Vw_vadd_VwVw(Q6_Vw_vasl_VwR(a, 13), Q6_V_vsplat_R(112 << 23));
+  const HVX_Vector sub =
+    hvx_hf_mul_rn(hvx_w_to_sf(a), hvx_splat_sf(1.0f / 16777216.0f));
+  const HVX_VectorPred normal = Q6_Q_vcmp_gt_VwVw(a, Q6_V_vsplat_R(0x3FF));
+  return Q6_V_vor_VV(Q6_V_vmux_QVV(normal, nrm, sub), s);
+}
+
+/** @brief 64 fp16 lanes to 64 f32 at @a out (any 4-byte alignment). */
+static inline void hvx_hf_store_sf(float *out, HVX_Vector h) {
+  const HVX_VectorPair w = Q6_Wuw_vunpack_Vuh(h);
+  *(HVX_UVector *)out = hvx_hf_bits_to_sf(Q6_V_lo_W(w));
+  *(HVX_UVector *)(out + 32) = hvx_hf_bits_to_sf(Q6_V_hi_W(w));
 }
 
 #endif /* __NNTRAINER_HVX_ATTN_M1_HF_H__ */

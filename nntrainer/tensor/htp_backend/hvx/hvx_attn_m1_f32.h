@@ -32,21 +32,24 @@
  * of max_seq, so 24 MiB at nntr_config.json's max_seq_len 2048 (48 MiB
  * with the f32 cache before #170). Scratch per cache: the scores /
  * probabilities n_q * seq * 2 (128 KiB), the transposed exps seq * 128
- * (256 KiB) and q (4 KiB) at LFM2.5 and 2048. No
- * VTCM, no mapping, no DMA. Growth policy: none; the size is fixed at
+ * (256 KiB), the q splats n_q * head_dim * 128 (256 KiB; #170 round 2, was
+ * 4 KiB of q) and the k rows n_kv * head_dim * 2 (1 KiB) at LFM2.5 and
+ * 2048: +253 KiB of the ~182 MiB heap. No VTCM, no mapping, no DMA (the
+ * l2fetch leads are hints). Growth policy: none; the size is fixed at
  * create.
  *
  * THREADS. forward runs three pool runs (hvx_attn_m1_f32.c's header):
- * scores and exp by (kv head, 64-position tile), PV by (kv head, up to four
- * q heads), with the max and the sequential sum on the caller between them.
- * No reduction crosses a unit except those two serial steps, so the output
- * is byte-equal at any worker count -- which the host check proves at 0, 3
- * and 7 workers.
+ * scores and exp by (kv head, 64-position tile), PV by a range of q-head
+ * chains per lane (#170 round 2: 1.125x the mean lane at 6 lanes, from 1.5x
+ * with (kv head, 4 heads) units), with the max and the sequential sum on
+ * the caller between them. No reduction crosses a unit or a chain except
+ * those two serial steps, so the output is byte-equal at any worker count
+ * -- which the host check proves at 0, 3 and 7 workers.
  *
  * ALIGNMENT. q, k, v, out and stats are the caller's FastRPC buffers and
- * carry no vector alignment: every access to them is scalar. The cache and
- * the scratch are memalign(128) and are read and written with aligned
- * vectors.
+ * carry no vector alignment beyond a float's: they are read and written
+ * with unaligned vectors (HVX_UVector). The cache and the scratch are
+ * memalign(128) and are read and written with aligned vectors.
  *
  * ERRORS are AEEStdErr codes so the skel entries pass them through:
  * AEE_EINVALIDFORMAT for a shape, position or scale out of range (scale
@@ -85,7 +88,8 @@ typedef struct {
   uint16_t *v;           /**< fp16 [n_layers][n_kv][seq][head_dim] */
   uint16_t *s;           /**< fp16 [n_kv * gqa][seq]: scores, then probs */
   uint16_t *et;          /**< fp16 [seq][64]: the exps, q heads in lanes */
-  uint16_t *qh;          /**< fp16 [n_kv * gqa][head_dim]: q rounded */
+  uint16_t *qs;          /**< fp16 [n_kv * gqa][head_dim][64]: q splats */
+  uint16_t *kr;          /**< fp16 [n_kv][head_dim]: the new k rows */
   size_t cache_halves;   /**< fp16 values in kt, and in v */
   hvx_worker_pool *pool; /**< borrowed; NULL runs every unit on the caller */
 } hvx_attn_m1_ctx;
