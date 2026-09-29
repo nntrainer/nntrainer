@@ -777,14 +777,17 @@ void m1_fill_q(std::vector<float> &q, amc_rng &rng) {
 
 /** @brief L rows of k and v, [L][kv][head_dim], from attn_m1_cases.h:
  *         positions 0 / 1 / 2 the fixed kinds, then the adversarial score
- *         rows, and the PV midpoint cases planted for @a q (returned). */
+ *         rows; with @a q, also the PV midpoint cases planted for it (the
+ *         count is returned; the timing tests skip the search). */
 uint32_t m1_fill_kv(std::vector<float> &k, std::vector<float> &v, uint32_t L,
-                    amc_rng &rng, const std::vector<float> &q) {
+                    amc_rng &rng, const std::vector<float> *q = nullptr) {
   const size_t row = (size_t)kM1Kv * kM1Hd;
   k.assign(L * row, 0.0f);
   v.assign(L * row, 0.0f);
   amc_fill_kv(&rng, k.data(), v.data(), L, kM1Kv, kM1Gqa, kM1Hd);
-  return amc_plant_pv(q.data(), k.data(), v.data(), L, kM1Kv, kM1Gqa, kM1Hd);
+  return q ? amc_plant_pv(q->data(), k.data(), v.data(), L, kM1Kv, kM1Gqa,
+                          kM1Hd)
+           : 0u;
 }
 
 /** @brief attn_m1_det.h's output and stats for L rows. */
@@ -964,7 +967,7 @@ TEST_F(HvxAttnM1, MatchesDetSpecBitExact) {
   std::vector<float> q, k, v, out, stats(2u * kM1Nq), out_ref, stats_ref;
   m1_fill_q(q, rng);
   for (uint32_t L : {1u, 63u, 64u, 65u, 512u, 1024u}) {
-    const uint32_t planted = m1_fill_kv(k, v, L, rng, q);
+    const uint32_t planted = m1_fill_kv(k, v, L, rng, &q);
     std::fill(stats.begin(), stats.end(), 0.0f);
     err = m1_run(handle_, layer, q, k, v, L, &out, &stats);
     ASSERT_EQ(err, AEE_SUCCESS) << "L=" << L << ": " << hex(err);
@@ -995,7 +998,7 @@ TEST_F(HvxAttnM1, AppendChainEqualsBulk) {
   amc_rng rng{0x81000002u};
   std::vector<float> q, k, v, out_a((size_t)kM1Nq * kM1Hd), out_b;
   m1_fill_q(q, rng);
-  m1_fill_kv(k, v, L, rng, q);
+  m1_fill_kv(k, v, L, rng);
   const size_t row = (size_t)kM1Kv * kM1Hd;
   for (uint32_t p = 0; p < L; ++p) {
     err = nntr_hvx_attn_m1_forward(handle_, 0u, p, kM1Scale, q.data(),
@@ -1101,7 +1104,7 @@ TEST_F(HvxAttnM1, PerLayerCost) {
   m1_fill_q(q, rng);
   const size_t row = (size_t)kM1Kv * kM1Hd;
   for (uint32_t L : {512u, 1024u}) {
-    m1_fill_kv(k, v, L, rng, q);
+    m1_fill_kv(k, v, L, rng);
     err = nntr_hvx_attn_m1_kv_append(handle_, 0u, 0u, L - 1u, k.data(),
                                      (int)((L - 1u) * row), v.data(),
                                      (int)((L - 1u) * row));
@@ -1133,7 +1136,7 @@ TEST_F(HvxAttnM1, PerLayerCost) {
     nntr_hvx_attn_m1_register(handle_, kLayers, kM1Kv, kM1Gqa, kM1Hd, 2048u);
   ASSERT_EQ(err, AEE_SUCCESS) << "register 6 x 2048: " << hex(err);
   for (uint32_t L : {512u, 1024u}) {
-    m1_fill_kv(k, v, L, rng, q);
+    m1_fill_kv(k, v, L, rng);
     for (uint32_t layer = 0; layer < kLayers; ++layer) {
       err = nntr_hvx_attn_m1_kv_append(handle_, layer, 0u, L - 1u, k.data(),
                                        (int)((L - 1u) * row), v.data(),
