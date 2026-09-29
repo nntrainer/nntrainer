@@ -32,9 +32,11 @@
  * of max_seq, so 24 MiB at nntr_config.json's max_seq_len 2048 (48 MiB
  * with the f32 cache before #170). Scratch per cache: the scores /
  * probabilities n_q * seq * 2 (128 KiB), the transposed exps seq * 128
- * (256 KiB), the q splats n_q * head_dim * 128 (256 KiB; #170 round 2, was
- * 4 KiB of q) and the k rows n_kv * head_dim * 2 (1 KiB) at LFM2.5 and
- * 2048: +253 KiB of the ~182 MiB heap. No VTCM, no mapping, no DMA (the
+ * (256 KiB), the q rows n_q * 128 (4 KiB; round 2's splats were
+ * n_q * head_dim * 128 = 256 KiB, kept only under ATTN_M1_Q_LUT=0), the k
+ * rows n_kv * head_dim * 2 (1 KiB) and the exp16 table ATTN_M1_DET_EXP_N *
+ * 2 (37 KiB, #170 round 3) at LFM2.5 and 2048: about 426 KiB of the ~182
+ * MiB heap (215 KiB less than round 2). No VTCM, no mapping, no DMA (the
  * l2fetch leads are hints). Growth policy: none; the size is fixed at
  * create.
  *
@@ -88,7 +90,7 @@ typedef struct {
   uint16_t *v;           /**< fp16 [n_layers][n_kv][seq][head_dim] */
   uint16_t *s;           /**< fp16 [n_kv * gqa][seq]: scores, then probs */
   uint16_t *et;          /**< fp16 [seq][64]: the exps, q heads in lanes */
-  uint16_t *qs;          /**< fp16 [n_kv * gqa][head_dim][64]: q splats */
+  uint16_t *qs;          /**< fp16 [n_kv * gqa][64]: q, zipped for vlut16 */
   uint16_t *kr;          /**< fp16 [n_kv][head_dim]: the new k rows */
   uint16_t *exp_tab;     /**< fp16 [ATTN_M1_DET_EXP_N]: exp16 by index */
   size_t cache_halves;   /**< fp16 values in kt, and in v */

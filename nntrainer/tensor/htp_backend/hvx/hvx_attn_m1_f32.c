@@ -14,7 +14,7 @@
  * hvx_attn_m1_hf.h primitive (its fused FMA was bit-exact on silicon
  * against the spec on real, adversarial and zero / sign triples: S1, G1).
  * One call rounds k / v / q as vectors (the v row into V, the k row kept
- * for P1, q as one splat vector per value), then runs three pool runs with
+ * for P1, q as one zipped row per head), then runs three pool runs with
  * two short serial steps between them (the lane plan from S1's cost sweep:
  * the one-head score shape and the four-head PV shape scale to 6 lanes,
  * the two-head score shape does not):
@@ -22,8 +22,9 @@
  *   P1 scores   unit = (kv head, 64-position Kt tile): the last tile first
  *               takes the new k column (spec step 1); for each q head of
  *               the kv head, eight accumulators over d = 8 blk + l (the
- *               CPU's float16x8_t lanes, positions in the vector lanes),
- *               the vpaddq tree, 0 + t, * scale -> S[hq][tile]. The tile
+ *               CPU's float16x8_t lanes, positions in the vector lanes;
+ *               q[d] a vlut16 splat of the zipped row, round 3), the
+ *               vpaddq tree, 0 + t, * scale -> S[hq][tile]. The tile
  *               (8 KiB) is read from DDR once, behind an l2fetch the lane
  *               issued one unit earlier, and from L2 for the other q heads.
  *   caller      m per q head: hf max over its tiles (masked past L), a
@@ -84,6 +85,18 @@
 /** @brief fp16 bits of -65504, the mask fill for the max. */
 #define HF_NEG_MAX 0xFBFF
 
+/* Round 3's two lookups (plan 170 round 3 sections 3.1-3.2), each the same
+   bits as round 2's form; 0 compiles round 2's form back for the S4 A/B
+   skel (r2w) and goes in the fold. */
+#ifndef ATTN_M1_EXP_TAB
+#define ATTN_M1_EXP_TAB 1 /**< P2: exp16 by the checked table */
+#endif
+#ifndef ATTN_M1_Q_LUT
+#define ATTN_M1_Q_LUT 1 /**< P1: q[d] by vlut16 from one zipped row */
+#endif
+/** @brief q bytes per q head: one zipped row, or round 2's 64 splats. */
+#define QS_BYTES (ATTN_M1_Q_LUT ? VLEN : HD * VLEN)
+
 /** @brief Tiles of a max_seq. */
 static inline uint32_t tiles_of(uint32_t max_seq) {
   return (max_seq + TILE - 1u) / TILE;
@@ -138,7 +151,7 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
   ctx->v = (uint16_t *)memalign(VLEN, (size_t)halves * sizeof(uint16_t));
   ctx->s = (uint16_t *)memalign(VLEN, (size_t)n_q * seq * sizeof(uint16_t));
   ctx->et = (uint16_t *)memalign(VLEN, (size_t)seq * VLEN);
-  ctx->qs = (uint16_t *)memalign(VLEN, (size_t)n_q * HD * VLEN);
+  ctx->qs = (uint16_t *)memalign(VLEN, (size_t)n_q * QS_BYTES);
   ctx->kr = (uint16_t *)memalign(VLEN, (size_t)n_kv * HD * sizeof(uint16_t));
   ctx->exp_tab = (uint16_t *)malloc(ATTN_M1_DET_EXP_N * sizeof(uint16_t));
   float *tmp = (float *)malloc(ATTN_M1_DET_EXP_N * sizeof(float));
@@ -260,12 +273,6 @@ typedef struct {
 #ifndef ATTN_M1_ET_LEAD
 #define ATTN_M1_ET_LEAD 1 /**< the caller: the ET rows P2 will write */
 #endif
-/* Round 3's two lookups (plan 170 round 3 sections 3.1-3.2), each the same
-   bits as round 2's form; 0 compiles round 2's form back for the S4 A/B
-   skel (r2w) and goes in the fold. */
-#ifndef ATTN_M1_EXP_TAB
-#define ATTN_M1_EXP_TAB 1 /**< P2: exp16 by the checked table */
-#endif
 /** @brief V rows per PV fetch block (16 KiB), S1's FETCH_L2F shape. */
 #define PV_BLOCK 128u
 
@@ -313,17 +320,44 @@ static void p1_unit(const forward_job *job, uint32_t u) {
       kt[d] = Q6_V_vmux_QVV(lane, Q6_Vh_vsplat_R(kr[d]), kt[d]);
     }
   }
+#if ATTN_M1_Q_LUT
+  const HVX_Vector b2 = Q6_Vb_vsplat_R(2), b8 = Q6_Vb_vsplat_R(8);
+#endif
   for (uint32_t g = 0; g < ctx->gqa; ++g) {
     const uint32_t hq = h * ctx->gqa + g;
+#if ATTN_M1_Q_LUT
+    const HVX_Vector qrow = ((const HVX_Vector *)ctx->qs)[hq];
+#else
     const HVX_Vector *qs = (const HVX_Vector *)ctx->qs + (size_t)hq * HD;
+#endif
     /* acc[l] sees only d = 8 k + l, so the eight chains run as two passes
        of four (the same operations per chain; eight chains at once spill
-       on hexagon-clang 19). q[d] is the caller's splat vector. */
+       on hexagon-clang 19). q[d], q[d + 1] are one vlut16 of the caller's
+       zipped row with index bytes (d, d + 1), q[d + 2], q[d + 3] one more
+       at + 2, the next step + 8 (round 2: the caller's splat vectors). */
     HVX_Vector a0, a1, a2, a3, a4, a5, a6, a7;
     for (uint32_t half = 0; half < 2u; ++half) {
-      const HVX_Vector *qp = qs + 4u * half;
       const HVX_Vector *kp = kt + 4u * half;
       HVX_Vector c0 = Q6_V_vzero(), c1 = c0, c2 = c0, c3 = c0;
+#if ATTN_M1_Q_LUT
+      HVX_Vector i01 =
+        Q6_Vh_vsplat_R((int)((4u * half) | (4u * half + 1u) << 8));
+#if defined(__hexagon__)
+#pragma unroll 1
+#endif
+      for (uint32_t d = 0; d < HD; d += ATTN_M1_DET_ACC) {
+        const int rt = (int)((d + 4u * half) >> 4); /* the same for all 4 */
+        const HVX_VectorPair q01 = hvx_hf_splat2_lut(i01, qrow, rt);
+        const HVX_VectorPair q23 =
+          hvx_hf_splat2_lut(Q6_Vb_vadd_VbVb(i01, b2), qrow, rt);
+        c0 = hvx_hf_fma(c0, Q6_V_lo_W(q01), kp[d], one);
+        c1 = hvx_hf_fma(c1, Q6_V_hi_W(q01), kp[d + 1u], one);
+        c2 = hvx_hf_fma(c2, Q6_V_lo_W(q23), kp[d + 2u], one);
+        c3 = hvx_hf_fma(c3, Q6_V_hi_W(q23), kp[d + 3u], one);
+        i01 = Q6_Vb_vadd_VbVb(i01, b8);
+      }
+#else
+      const HVX_Vector *qp = qs + 4u * half;
 #if defined(__hexagon__)
 #pragma unroll 1
 #endif
@@ -333,6 +367,7 @@ static void p1_unit(const forward_job *job, uint32_t u) {
         c2 = hvx_hf_fma(c2, qp[d + 2u], kp[d + 2u], one);
         c3 = hvx_hf_fma(c3, qp[d + 3u], kp[d + 3u], one);
       }
+#endif
       if (half == 0u) {
         a0 = c0, a1 = c1, a2 = c2, a3 = c3;
       } else {
@@ -619,7 +654,8 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   uint64_t t0 = prof ? HAP_perf_get_pcycles() : 0u;
   /* Steps 0-1, as vectors (hvx_hf_round_row is hvx_hf_bits_rne per lane):
      v into its row; k kept for P1, which writes the column into the tile
-     it reads anyway; q as one splat vector per value, P1's operands. */
+     it reads anyway; q as one zipped row per head, which P1 splats by
+     vlut16 (round 2: one splat vector per value). */
   for (uint32_t h = 0; h < ctx->n_kv; ++h) {
     *(HVX_Vector *)(ctx->kr + (size_t)h * HD) =
       hvx_hf_round_row(k + (size_t)h * HD);
@@ -631,6 +667,9 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
   const uint32_t n_q = ctx->n_kv * ctx->gqa, L = pos + 1u;
   HVX_Vector *qs = (HVX_Vector *)ctx->qs;
   for (uint32_t hq = 0; hq < n_q; ++hq) {
+#if ATTN_M1_Q_LUT
+    qs[hq] = hvx_hf_round_row_lut(q + (size_t)hq * HD);
+#else
     union {
       HVX_Vector v;
       uint16_t h[TILE];
@@ -639,6 +678,7 @@ int hvx_attn_m1_forward_prof(hvx_attn_m1_ctx *ctx, uint32_t layer, uint32_t pos,
     for (uint32_t d = 0; d < HD; ++d) {
       *qs++ = Q6_Vh_vsplat_R(qv.h[d]);
     }
+#endif
   }
 #if ATTN_M1_ET_LEAD
   l2fetch_rows(ctx->et, L);
