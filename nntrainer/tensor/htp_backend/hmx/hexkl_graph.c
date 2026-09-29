@@ -686,11 +686,13 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
     if (act_out == NULL || act_out_len != htp_graph_op_out_words(last)) {
       return AEE_EINVALIDFORMAT;
     }
-    memcpy(act_out,
-           last->kind == HTP_OP_LM_HEAD
-             ? g->logits
-             : g->slots + (size_t)last->out_slot * g->slot_words,
-           (size_t)act_out_len * sizeof(float));
+    const float *src = last->kind == HTP_OP_LM_HEAD
+                         ? g->logits
+                         : g->slots + (size_t)last->out_slot * g->slot_words;
+    /* the token driver may hand the logits buffer itself (hexkl_token.c) */
+    if (src != act_out) {
+      memcpy(act_out, src, (size_t)act_out_len * sizeof(float));
+    }
   }
   return AEE_SUCCESS;
 }

@@ -117,7 +117,7 @@ static int graph_check_args(const nntr_hvx_session *s, int row_indexLen,
   return AEE_SUCCESS;
 }
 
-static void graph_env_of(const nntr_hvx_session *s, hexkl_graph_env *env) {
+void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->tbl = (hexkl_weight_u8i4_table *)&s->weights_u8i4;
   env->vtcm_base = s->vtcm_base;
   env->vtcm_size = s->vtcm_size;
@@ -167,7 +167,7 @@ int nntr_hvx_forward(remote_handle64 handle, uint32 start_op, uint32 pos,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  graph_env_of(s, &env);
+  nntr_hvx_graph_env(s, &env);
   routing.row_index = row_index;
   routing.row_count = row_count;
   routing.row_weight = row_weight;
@@ -218,7 +218,7 @@ int nntr_hvx_forward_debug(remote_handle64 handle, uint32 start_op,
          (unsigned)nntr_hvx_moe_stage_count());
     return AEE_EBADPARM;
   }
-  graph_env_of(s, &env);
+  nntr_hvx_graph_env(s, &env);
   routing.row_index = row_index;
   routing.row_count = row_count;
   routing.row_weight = row_weight;

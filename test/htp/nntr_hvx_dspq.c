@@ -13,12 +13,17 @@
  * @bug    No known bugs except for NYI items
  *
  * Plan docs/plans/141-dspq-moe.md sections 3.2-3.4; the packet is
- * htp_dspq_wire.h. Same entry function, same argument bytes, same session
- * state, so the arithmetic is the FastRPC path's bit for bit: the kernel
- * resets its DMA ring per call and the pool splits jobs by index, so
- * which thread is lane 0 does not enter the result. The ARM side keeps at
- * most one DSP entry in flight (its invoke mutex spans write -> response),
- * so this thread and the FastRPC threads never run a kernel at once.
+ * htp_dspq_wire.h. [#132 Part B E2] The same thread answers
+ * HTP_DSPQ_OP_TOKEN, one decode token of the session's token driver role
+ * (nntr_hvx_token.c): on S1 it waits for S2's rows on the mailbox page
+ * between its rounds, on S2 it runs the token's graph -- both sessions'
+ * own threads, not pool lanes (plan 132-part-b section 3.2). Same entry
+ * function, same argument bytes, same session state, so the arithmetic is the
+ * FastRPC path's bit for bit: the kernel resets its DMA ring per call and the
+ * pool splits jobs by index, so which thread is lane 0 does not enter the
+ * result. The ARM side keeps at most one DSP entry in flight (its invoke mutex
+ * spans write -> response), so this thread and the FastRPC threads never run a
+ * kernel at once.
  *
  * Waiting: after each response the thread spins on read_noblock with
  * pause(#255) for spin_us (the decode gaps between two MoE calls), then
@@ -123,6 +128,49 @@ static int dspq_run(struct nntr_hvx_dspq *d, const dspq_msg *m,
     (const float *)bufs[0].ptr, act_len, (float *)bufs[1].ptr, out_len);
 }
 
+/** @brief [#132 Part B E2] Answers one HTP_DSPQ_OP_TOKEN packet: the
+ *  session's token driver role on the packet's buffers (S2: 0 the
+ *  embedding row, 1 the logits under HTP_DSPQ_TOKEN_LOGITS; S1: none).
+ *  A malformed packet is answered AEE_EBADPARM, as a MoE packet is.
+ *  @return dspqueue_write's code */
+static int dspq_token(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
+                      uint32_t nb, struct dspqueue_buffer *bufs) {
+  const htp_dspq_token_req *q = (const htp_dspq_token_req *)m;
+  htp_dspq_token_resp resp;
+  uint32_t res[4] = {0, 0, 0, 0}, i;
+  const int logits = len == sizeof(*q) && (q->flags & HTP_DSPQ_TOKEN_LOGITS);
+  const int valid =
+    len == sizeof(*q) && (q->flags & ~HTP_DSPQ_TOKEN_LOGITS) == 0u &&
+    nb <= 2u && (nb == 2u) == (logits != 0) &&
+    (nb < 1u || (bufs[0].ptr != NULL && bufs[0].size % 4u == 0u)) &&
+    (nb < 2u || (bufs[1].ptr != NULL && bufs[1].size % 4u == 0u));
+  memset(&resp, 0, sizeof(resp));
+  resp.seq = len >= 8 ? m->u[1] : 0;
+  if (valid) {
+    resp.rc = nntr_hvx_token_run(
+      d->s, q->seq, q->pos, nb >= 1u ? (const float *)bufs[0].ptr : NULL,
+      nb >= 1u ? (uint32_t)(bufs[0].size / 4u) : 0u,
+      nb == 2u ? (float *)bufs[1].ptr : NULL,
+      nb == 2u ? (uint32_t)(bufs[1].size / 4u) : 0u, res);
+  } else {
+    resp.rc = AEE_EBADPARM;
+    ++d->bad;
+  }
+  resp.id = res[0];
+  resp.hops = res[1];
+  resp.wait_us = res[2];
+  resp.pcycles = res[3];
+  for (i = 0; i < nb; ++i) {
+    bufs[i].flags = DSPQUEUE_BUFFER_FLAG_DEREF;
+  }
+  if (nb == 2u) {
+    bufs[1].flags |= DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER |
+                     DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
+  }
+  return dspqueue_write(d->q, 0, nb, bufs, sizeof(resp), (const uint8_t *)&resp,
+                        DSPQUEUE_TIMEOUT_NONE);
+}
+
 static void dspq_thread(void *arg) {
   struct nntr_hvx_dspq *d = (struct nntr_hvx_dspq *)arg;
   dspq_msg m;
@@ -157,6 +205,17 @@ static void dspq_thread(void *arg) {
     }
     if (len >= 4 && m.u[0] == HTP_DSPQ_OP_QUIT && nb == 0) {
       break;
+    }
+    if (len >= 4 && m.u[0] == HTP_DSPQ_OP_TOKEN) {
+      err = dspq_token(d, &m, len, nb, bufs);
+      if (err != AEE_SUCCESS) {
+        FARF(ERROR, "dspq: write failed: 0x%08x", (unsigned)err);
+        ++d->bad;
+        break;
+      }
+      ++d->served;
+      spin_until = d->spin_us ? dspq_now_us() + d->spin_us : 0;
+      continue;
     }
 
     // A malformed packet is answered too, so the ARM side never hangs on it.

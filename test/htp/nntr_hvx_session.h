@@ -91,6 +91,10 @@ typedef struct {
                                  graph's FC kinds, freed in close() */
   uint8_t *fc_l2; /**< [#132 Part B, #178] the FC runner's L2 feed scratch
                        (2 MiB of DSP heap, first use), freed in close() */
+  struct nntr_hvx_token *token; /**< [#132 Part B E2] the token driver
+                       (nntr_hvx_token.c): the mailbox page and the role;
+                       NULL = none. Stopped in close() after the dspq
+                       thread that runs it */
 } nntr_hvx_session;
 
 /** @brief [#85] mm_u8i4_moe_layer_timed's stage table, shared with
@@ -106,6 +110,27 @@ int nntr_hvx_moe_stage_fill(uint32_t *stage_us, uint64_t t0, uint64_t t1,
  *  close() calls it first, while the tables the thread reads still exist.
  *  Lives in nntr_hvx_dspq.c. */
 void nntr_hvx_dspq_shutdown(nntr_hvx_session *s);
+
+/** @brief [#132 Part B E2] The graph kernels' view of the session
+ *  (hexkl_graph_env), for forward and the token driver. Lives in
+ *  nntr_hvx_graph.c. */
+void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env);
+
+/** @brief [#132 Part B E2] One token of the session's role
+ *  (token_driver_start) on its graph: S2 runs from op 0 on @a act (the
+ *  embedding row) and returns the id, the logits into @a logits when it
+ *  is not NULL; S1 serves its rounds (@a act, @a logits unused).
+ *  res (4): [id, hops, wait_us, pcycles of the token's ops]. The dspq
+ *  thread's HTP_DSPQ_OP_TOKEN calls it. Lives in nntr_hvx_token.c.
+ *  @return 0, AEE_EBADSTATE (no driver or no graph), AEE_EINVALIDFORMAT
+ *          (a length), or hexkl_token_main / hexkl_token_serve's code */
+int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
+                       const float *act, uint32_t act_len, float *logits,
+                       uint32_t logits_len, uint32_t res[4]);
+
+/** @brief [#132 Part B E2] Stops the token driver, if any (close()).
+ *  Lives in nntr_hvx_token.c. */
+void nntr_hvx_token_shutdown(nntr_hvx_session *s);
 
 /** @brief [#132 PR 2] Frees every Q4M1 slot and the L2 feed scratch. Lives
  *  in nntr_hvx_fc_q4.c. */

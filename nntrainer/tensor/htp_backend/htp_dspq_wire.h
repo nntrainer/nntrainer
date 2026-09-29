@@ -27,7 +27,16 @@
 
 #define HTP_DSPQ_OP_MOE 1u
 #define HTP_DSPQ_OP_QUIT 2u
+/** @brief [#132 Part B E2] One decode token of the session's token driver
+ *  role (nntr_hvx_token.c): htp_dspq_token_req, answered with
+ *  htp_dspq_token_resp. S2's packet carries buffer 0, the embedding row
+ *  (op 0's width in f32), and with HTP_DSPQ_TOKEN_LOGITS buffer 1, the
+ *  logits (vocab f32); S1's carries none. */
+#define HTP_DSPQ_OP_TOKEN 3u
 #define HTP_DSPQ_FLAG_TIMED 1u
+/** @brief OP_TOKEN: S2 writes the logits into buffer 1 (NNTR_PPL_DECODE,
+ *  the shadows); without it only the id travels. */
+#define HTP_DSPQ_TOKEN_LOGITS 1u
 /** @brief mm_u8i4_moe_layer_timed's slot count; both sides check theirs. */
 #define HTP_DSPQ_STAGES 31u
 #define HTP_DSPQ_MAX_MSG 4096u
@@ -49,6 +58,21 @@ typedef struct {
 } htp_dspq_resp;
 
 #define HTP_DSPQ_RESP_BASE_BYTES 8u
+
+/** @brief [#132 Part B E2] OP_TOKEN's request: seq is the token number
+ *  both sessions' packets carry (the mailbox's sequence values derive
+ *  from it), pos the token's position. */
+typedef struct {
+  uint32_t op, seq, flags, pos;
+} htp_dspq_token_req;
+
+/** @brief OP_TOKEN's response: id (S2: LM_HEAD's argmax), the hops this
+ *  side made, its wait for the other side, the pcycles of its ops. */
+typedef struct {
+  uint32_t seq;
+  int32_t rc;
+  uint32_t id, hops, wait_us, pcycles;
+} htp_dspq_token_resp;
 
 /** @brief The request message length for n_experts experts and n_rows
  *  routed rows (u64, so a hostile count cannot wrap). */
