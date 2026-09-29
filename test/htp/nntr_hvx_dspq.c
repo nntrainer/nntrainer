@@ -287,6 +287,8 @@ int nntr_hvx_dspq_start(remote_handle64 handle, uint64 queue_id,
   if (s == NULL || s->dspq != NULL) {
     return AEE_EBADSTATE;
   }
+  /* [#178] a lite session (no HMX) takes a queue for OP_TOKEN (S2 in #132
+     Part B E3); its OP_MOE packets get the MoE entry's AEE_EUNSUPPORTED */
   if (nntr_hvx_moe_stage_count() != HTP_DSPQ_STAGES) {
     FARF(ERROR, "dspq: stage slots %u, wire header says %u",
          (unsigned)nntr_hvx_moe_stage_count(), (unsigned)HTP_DSPQ_STAGES);

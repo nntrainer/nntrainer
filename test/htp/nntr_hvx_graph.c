@@ -50,6 +50,19 @@ int nntr_hvx_graph_init(remote_handle64 handle, const uint32 *desc, int descLen,
          (unsigned)rc, descLen);
     return rc;
   }
+  if (!s->hmx_locked) {
+    /* [#178, #132 Part B E3] the lite open (S2) has no HMX: its graph may
+       hold every kind but MOE resident (HTP_GRAPH_KINDS_S2) */
+    uint32_t i;
+    for (i = 0; i < s->graph->n_ops; ++i) {
+      if (s->graph->ops[i].resident && s->graph->ops[i].kind == HTP_OP_MOE) {
+        FARF(ERROR, "graph_init: a resident MOE op on a session without HMX");
+        hexkl_graph_free(s->graph);
+        s->graph = NULL;
+        return AEE_EUNSUPPORTED;
+      }
+    }
+  }
   *n_ops = s->graph->n_ops;
   {
     char names[128];

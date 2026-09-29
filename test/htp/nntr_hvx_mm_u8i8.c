@@ -82,6 +82,9 @@ static int check_layer_args(const nntr_hvx_session *s, uint32 M, uint32 K,
   if (!s || w_handlesLen <= 0) {
     return AEE_EBADPARM;
   }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
+  }
   if ((uint32_t)act_f32Len != M * K) {
     FARF(ERROR, "mm_u8i8_layer: bad act_f32Len (M=%u K=%u)", (unsigned)M,
          (unsigned)K);

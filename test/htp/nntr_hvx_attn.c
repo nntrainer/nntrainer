@@ -166,6 +166,9 @@ int nntr_hvx_attn_forward(remote_handle64 handle, uint32 h, uint32 kv_from,
   if (!s) {
     return AEE_EBADPARM;
   }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
+  }
   ctx = attn_lookup(h);
   if (!ctx) {
     return AEE_EBADPARM;
@@ -200,6 +203,9 @@ int nntr_hvx_attn_forward_timed(remote_handle64 handle, uint32 h,
 
   if (!s) {
     return AEE_EBADPARM;
+  }
+  if (!s->hmx_locked) {
+    return AEE_EUNSUPPORTED; /* [#178] the lite open has no HMX */
   }
   ctx = attn_lookup(h);
   if (!ctx) {

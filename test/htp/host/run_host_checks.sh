@@ -293,6 +293,15 @@ done
 
 "$OUT/q4_gemv_host_check"
 
+# [#178] The mailbox hop (nntr_hvx_mailbox.c, included as-is): both roles on
+# two pthreads, 10 000 exchanges at 0 and 8 KiB, no timeout, no stale word,
+# checksums equal; a lone role times out instead of hanging (MAILBOX OK).
+# The DSP cache maintenance and the hop's cost are the device's (probe Q2).
+"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -pthread \
+  -o "$OUT/mailbox_host_check" "$HERE/mailbox_host_check.c"
+
+"$OUT/mailbox_host_check"
+
 # Decode attention at m=1 (#81, fp16 CPU order since #152): the spec
 # nntrainer/tensor/attn_m1_det.h against an independent _Float16 model of
 # the Android CPU attention with five mutants (ATTN M1 F16 CPU-ORDER OK);
