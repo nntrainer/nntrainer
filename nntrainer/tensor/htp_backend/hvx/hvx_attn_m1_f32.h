@@ -4,62 +4,55 @@
  *
  * @file   hvx_attn_m1_f32.h
  * @date   27 Sep 2026
- * @brief  Decode attention at m=1 on HVX with a DSP-resident KV cache of
- *         fp16 values in f32, bit-identical to nntrainer/tensor/attn_m1_det.h
- *         (the Android fp16 CPU attention)
+ * @brief  Decode attention at m=1 on HVX with a DSP-resident fp16 KV cache,
+ *         bit-identical to nntrainer/tensor/attn_m1_det.h (the Android fp16
+ *         CPU attention)
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
  *
  * The specification, its operation order and its domain live in
- * attn_m1_det.h; this file implements it in plain Vsf and word ops (no
- * qf32, no hf, no sf FMA -- HVX has none; the fused fp16 FMA is built from
- * an exact product, TwoSum and round-to-odd) over a cache object the
- * session owns (plan 81 section 3.1, plan 152 section 3.3):
+ * attn_m1_det.h; this file's kernel (hvx_attn_m1_f32.c; the name predates
+ * the fp16 cache) runs it in fp16 lanes with hvx_attn_m1_hf.h's primitives
+ * (plan 170) over a cache object the session owns:
  *
- *   Kt [n_layers][n_kv][head_dim][max_seq]   one 128-B vector = 32 positions
- *   V  [n_layers][n_kv][max_seq][head_dim]   one position = head_dim/32 vectors
+ *   Kt [n_layers][n_kv][seq / 64][head_dim][64]  fp16, one 8 KiB tile per
+ *                                                64 positions (a vector per d)
+ *   V  [n_layers][n_kv][seq][head_dim]           fp16, a vector per position
  *
- * both f32 on the DSP heap holding fp16 values (every row is rounded on
- * append; the CPU's seed rows already are), 128-byte aligned, zero-filled
- * at create so the lanes past the context in the last block read finite
- * values (they are masked out of every reduction). head_dim is 64 only.
- * The q heads of a unit share each V row in PV; the score loop reads a
- * block's 64 Kt vectors once per q head (the kernel is compute-bound
- * since #152, and sharing them would need 16 live accumulators) -- each
- * q head's sequence is the spec's.
+ * seq = max_seq rounded up to 64. Every row is rounded to fp16 on append
+ * (the CPU's seed rows already are), 128-byte aligned, zero-filled at
+ * create so the lanes past the context in the last tile read finite values
+ * (they are masked out of every reduction). head_dim is 64 only, n_kv *
+ * gqa <= 64 (the sum vector's lanes).
  *
  * ADDRESS BUDGET (doc 46 section 41: 3840 MiB arena + about 182 MiB heap).
- * The cache is n_layers * n_kv * head_dim * max_seq * 2 * 4 bytes: at the
- * LFM2.5 shape (6 attention layers, 8 kv heads, head_dim 64) that is 24 MiB
- * per 1024 of max_seq, so 48 MiB at nntr_config.json's max_seq_len 2048 --
- * 26 % of the heap, with no VTCM, no mapping and no DMA. The probability
- * scratch is n_kv * gqa * max_seq * 4 = 256 KiB at 2048, the exp table
- * ATTN_M1_DET_EXP_N * 4 = 74 KiB per cache (#152). Growth policy: none;
- * the Kt stride is max_seq, so the size is fixed at create. An fp16
- * cache would halve it but needs hf widening ops the emulator lacks, and
- * the kernel is compute-bound since #152 (plan 152 section 3.4).
+ * The cache is n_layers * n_kv * head_dim * seq * 2 * 2 bytes: at the
+ * LFM2.5 shape (6 attention layers, 8 kv heads, head_dim 64) 12 MiB per 1024
+ * of max_seq, so 24 MiB at nntr_config.json's max_seq_len 2048 (48 MiB
+ * with the f32 cache before #170). Scratch per cache: the scores /
+ * probabilities n_q * seq * 2 (128 KiB), the transposed exps seq * 128
+ * (256 KiB) and q (4 KiB) at LFM2.5 and 2048. No
+ * VTCM, no mapping, no DMA. Growth policy: none; the size is fixed at
+ * create.
  *
- * THREADS. forward runs one unit per (kv head, pair of its q heads) on
- * hvx_worker_pool_run when gqa is even -- 16 units at LFM2.5's shape, so
- * the busiest of 6 lanes runs 1.5 kv heads' work instead of 2 (#146) --
- * and one unit per kv head when gqa is odd. Lane i takes units i, i + n,
- * ...; each unit writes its q heads' probabilities into their own scratch
- * rows. The split is deterministic by construction: no reduction crosses
- * a q head, so the output is byte-equal at any worker count -- which the
- * host check proves at 0, 3 and 7 workers.
+ * THREADS. forward runs three pool runs (hvx_attn_m1_f32.c's header):
+ * scores and exp by (kv head, 64-position tile), PV by (kv head, up to four
+ * q heads), with the max and the sequential sum on the caller between them.
+ * No reduction crosses a unit except those two serial steps, so the output
+ * is byte-equal at any worker count -- which the host check proves at 0, 3
+ * and 7 workers.
  *
  * ALIGNMENT. q, k, v, out and stats are the caller's FastRPC buffers and
- * carry no vector alignment: every access to them is HVX_UVector or
- * scalar. The cache and the scratch are memalign(128) and are read and
- * written with aligned vectors; every such pointer is a multiple of 32
- * floats from a 128-byte base (max_seq and head_dim are multiples of 32).
+ * carry no vector alignment: every access to them is scalar. The cache and
+ * the scratch are memalign(128) and are read and written with aligned
+ * vectors.
  *
  * ERRORS are AEEStdErr codes so the skel entries pass them through:
- * AEE_EINVALIDFORMAT for a shape or position out of range, AEE_EBADSTATE
- * for a hole (pos past the layer's length) or a missing cache,
- * AEE_ENOMEMORY when the heap refuses the cache. Never AEE_EBADPARM, which
- * stays the stale-skel symptom (rule 3).
+ * AEE_EINVALIDFORMAT for a shape, position or scale out of range (scale
+ * must be an fp16 value), AEE_EBADSTATE for a hole (pos past the layer's
+ * length) or a missing cache, AEE_ENOMEMORY when the heap refuses the
+ * cache. Never AEE_EBADPARM, which stays the stale-skel symptom (rule 3).
  *
  * test/htp/host/attn_m1_host_check.c compiles THIS source against the
  * hvx_emu/ intrinsic emulation and the real worker pool on pthreads and
@@ -77,22 +70,24 @@
 
 /**
  * @brief The cache object. Read-only for callers (the host check compares
- *        two caches byte for byte through kt / v / cache_floats); create,
+ *        two caches byte for byte through kt / v / cache_halves); create,
  *        kv_append and forward are the writers.
  */
 typedef struct {
   uint32_t n_layers;
   uint32_t n_kv;
   uint32_t gqa;
-  uint32_t head_dim;   /**< 64 */
-  uint32_t max_seq;    /**< a multiple of 32; the Kt stride */
-  uint32_t *kv_len;    /**< [n_layers] positions held, 0..max_seq */
-  float *kt;           /**< [n_layers][n_kv][head_dim][max_seq], memalign 128 */
-  float *v;            /**< [n_layers][n_kv][max_seq][head_dim], memalign 128 */
-  float *scratch;      /**< [n_kv * gqa][max_seq] per q head, memalign 128 */
-  size_t cache_floats; /**< floats in kt, and in v */
-  float *exp_tab;      /**< ATTN_M1_DET_EXP_N floats: exp16 by index */
-  hvx_worker_pool *pool; /**< borrowed; NULL runs every head on the caller */
+  uint32_t head_dim;     /**< 64 */
+  uint32_t max_seq;      /**< a multiple of 32; the position bound */
+  uint32_t seq;          /**< max_seq rounded up to 64: the tile count * 64 */
+  uint32_t *kv_len;      /**< [n_layers] positions held, 0..max_seq */
+  uint16_t *kt;          /**< fp16 [n_layers][n_kv][seq/64][head_dim][64] */
+  uint16_t *v;           /**< fp16 [n_layers][n_kv][seq][head_dim] */
+  uint16_t *s;           /**< fp16 [n_kv * gqa][seq]: scores, then probs */
+  uint16_t *et;          /**< fp16 [seq][64]: the exps, q heads in lanes */
+  uint16_t *qh;          /**< fp16 [n_kv * gqa][head_dim]: q rounded */
+  size_t cache_halves;   /**< fp16 values in kt, and in v */
+  hvx_worker_pool *pool; /**< borrowed; NULL runs every unit on the caller */
 } hvx_attn_m1_ctx;
 
 /**
@@ -100,8 +95,7 @@ typedef struct {
  *
  * @param n_layers  attention layers (the layer ordinal space), >= 1
  * @param n_kv      kv heads, >= 1
- * @param gqa       q heads per kv head, 1..8 (the local q16 block and the
- *                  PV accumulators hold 2 * gqa vectors)
+ * @param gqa       q heads per kv head, 1..8, with n_kv * gqa <= 64
  * @param head_dim  64 (the CPU order's 8 accumulators; the RoPE's head)
  * @param max_seq   a multiple of 32; the position bound
  * @param pool      the session's worker pool, borrowed; may be NULL

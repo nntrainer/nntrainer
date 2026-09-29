@@ -719,6 +719,21 @@ static void check_hf_prim(void) {
           0u,
         "an hf op differs from rne16(f32 op)");
 
+  /* hvx_hf_bits_rne == fp16 bits of rne16 at every f32 below 65520 (the
+     positive half exhaustively, the negative half every 61st pattern). */
+  uint64_t n_cvt = 0;
+  uint32_t bad_cvt = 0;
+  for (uint32_t a = 0; a < 0x477FF000u; ++a) {
+    for (uint32_t sg = 0; sg < (a % 61u == 0u ? 2u : 1u); ++sg) {
+      const float x = attn_m1_det_float(a | (sg << 31));
+      bad_cvt += hvx_hf_bits_rne(x) != amc_f2h(attn_m1_det_rne16(x));
+      ++n_cvt;
+    }
+  }
+  printf("ATTN M1 HF PRIM f32 -> fp16 bits: %llu values, bad=%u\n",
+         (unsigned long long)n_cvt, bad_cvt);
+  CHECK(bad_cvt == 0u, "hvx_hf_bits_rne differs from rne16");
+
   /* The score tree on random fp16 accumulators. */
   uint32_t bad_tree = 0;
   for (uint32_t it = 0; it < 4000u; ++it) {
@@ -794,7 +809,8 @@ static void check_hf_prim(void) {
         "div16 hard quotients: %u", g_div_hard);
   CHECK(bad_tree + bad_exp + bad_div == 0u,
         "the hf tree, exp16 or divide differs from the spec");
-  if (bad_adv + bad_zs + bad_rnd + bad_tree + bad_exp + bad_div == 0u &&
+  if (bad_adv + bad_zs + bad_rnd + bad_tree + bad_exp + bad_div + bad_cvt ==
+        0u &&
       bad_op[0] + bad_op[1] + bad_op[2] + bad_op[3] + bad_op[4] + bad_op[5] ==
         0u &&
       hz_adv > 0u && n_exp == 31745u) {
@@ -853,8 +869,8 @@ static uint32_t check_phase_words(hvx_attn_m1_ctx *ctx, uint32_t L,
   memset(w, 0xA5, sizeof(w));
   const int rc =
     hvx_attn_m1_forward_prof(ctx, LAYER, L - 1u, SCALE, q, k, v, out, stats, w);
-  /* One unit per (kv head, q-head pair), or per kv head at an odd gqa. */
-  const uint32_t units = GQA % 2u == 0u ? N_KV * GQA / 2u : N_KV;
+  /* LANES is the score run's: one unit per (kv head, 64-position tile). */
+  const uint32_t units = N_KV * ((L + 63u) / 64u);
   const uint32_t lanes =
     workers == 0u ? 1u : (units < workers + 1u ? units : workers + 1u);
   uint32_t bad = (rc != AEE_SUCCESS);
@@ -984,8 +1000,9 @@ static void check_append_chain(uint32_t L, hvx_worker_pool *pool) {
   rc = hvx_attn_m1_forward(b, LAYER, L - 1u, SCALE, q, k + last, v + last,
                            out_b, NULL);
   CHECK(rc == AEE_SUCCESS, "bulk forward rc=%d", rc);
-  const int kt_eq = memcmp(a->kt, b->kt, a->cache_floats * sizeof(float)) == 0;
-  const int v_eq = memcmp(a->v, b->v, a->cache_floats * sizeof(float)) == 0;
+  const int kt_eq =
+    memcmp(a->kt, b->kt, a->cache_halves * sizeof(uint16_t)) == 0;
+  const int v_eq = memcmp(a->v, b->v, a->cache_halves * sizeof(uint16_t)) == 0;
   const uint32_t bad = count_bad(out_a, out_b, (size_t)N_Q * HD);
   printf("ATTN M1 append-chain L=%u vs bulk: Kt_equal=%d V_equal=%d "
          "out_bad=%u kv_len=%u/%u\n",
@@ -1096,6 +1113,9 @@ static void check_errors(hvx_worker_pool *pool) {
   CHECK(rc == AEE_EINVALIDFORMAT, "kv_append past max_seq: rc=%d", rc);
   rc = hvx_attn_m1_forward(NULL, 0u, 0u, SCALE, q, k, v, out, NULL);
   CHECK(rc == AEE_EBADSTATE, "NULL ctx: rc=%d", rc);
+  /* #170: the scale is one hf multiply, so it must be an fp16 value */
+  rc = hvx_attn_m1_forward(ctx, 0u, 0u, 0.1f, q, k, v, out, NULL);
+  CHECK(rc == AEE_EINVALIDFORMAT, "scale 0.1 (not fp16): rc=%d", rc);
   for (uint32_t p = 0; p < 5u; ++p) {
     rc = hvx_attn_m1_forward(ctx, 0u, p, SCALE, q, k, v, out, NULL);
     CHECK(rc == AEE_SUCCESS, "pos %u rc=%d", p, rc);

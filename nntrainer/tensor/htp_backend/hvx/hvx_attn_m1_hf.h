@@ -61,6 +61,38 @@
 /** @brief fp16 bits of 1.0, the qf32 widening multiplier. */
 #define HVX_HF_ONE 0x3C00
 
+/**
+ * @brief fp16 bits of rne16(x) for any finite f32 x with |x| < 65520 (the
+ *        spec's domain), in integer ops: the kernel's q / k / v rounding,
+ *        one scalar step per value instead of attn_m1_det_rne16's volatile
+ *        f32 ops. Round to nearest even on the dropped bits; below 2^-14
+ *        onto the subnormal grid (x = m * 2^(e - 150), grid 2^-24), so an f32
+ *        subnormal or anything under 2^-25 gives a signed zero, as rne16's
+ *        sign restore does. attn_m1_host_check.c compares it with
+ *        rne16 for every f32 below 65520 (ATTN M1 HF PRIM).
+ */
+static inline uint16_t hvx_hf_bits_rne(float x) {
+  uint32_t u;
+  __builtin_memcpy(&u, &x, sizeof(u));
+  const uint32_t s = (u >> 16) & 0x8000u, a = u & 0x7FFFFFFFu;
+  uint32_t r, rem, half;
+  if (a >= 0x38800000u) { /* normal fp16: drop 13 bits */
+    r = (a >> 13) - (112u << 10);
+    rem = a & 0x1FFFu;
+    half = 0x1000u;
+  } else if (a >= 0x33000000u) { /* [2^-25, 2^-14): shift 14..24 */
+    const uint32_t sh = 126u - (a >> 23);
+    const uint32_t m = (a & 0x7FFFFFu) | 0x800000u;
+    r = m >> sh;
+    rem = m & ((1u << sh) - 1u);
+    half = 1u << (sh - 1u);
+  } else {
+    return (uint16_t)s;
+  }
+  r += (rem > half || (rem == half && (r & 1u))) ? 1u : 0u;
+  return (uint16_t)(s | r);
+}
+
 /** @brief RN16(c + a*b), rounded once; @a one = Q6_Vh_vsplat_R(HVX_HF_ONE). */
 static inline HVX_Vector hvx_hf_fma(HVX_Vector c, HVX_Vector a, HVX_Vector b,
                                     HVX_Vector one) {

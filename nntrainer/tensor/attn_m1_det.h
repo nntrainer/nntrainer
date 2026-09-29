@@ -92,11 +92,13 @@
  * construction; exp16 is 1 at d = 0, so 1 <= l <= L and the divide never
  * sees 0.
  *
- * NOT IN THIS HEADER: how the kernel gets there. It reads exp16 from a
- * table (attn_m1_det_exp_table below, 18.5 k entries; the host check
- * compares it with exp16 at every fp16 d <= 0) and divides with recip_det
- * plus an exact midpoint check (hvx_attn_m1_f32.c); both are proved equal
- * to the lines above, not approximations of them.
+ * NOT IN THIS HEADER: how the kernel gets there. Since #170 it runs every
+ * step in fp16 lanes (hvx_attn_m1_hf.h): the fused FMA as a qf32 multiply-
+ * add narrowed once to hf, exp16 as exp_ps with each f32 rounding explicit,
+ * the divide as recip_det plus an exact midpoint check; each is proved
+ * equal to the lines above on the host and was bit-exact on silicon (plan
+ * 170 S1), not an approximation of them. attn_m1_det_exp_table below (the
+ * #152 kernel's form of exp16) stays as a checked equivalent.
  */
 
 #ifndef __NNTRAINER_ATTN_M1_DET_H__
