@@ -137,7 +137,23 @@ endif
 
 if host_machine.cpu_family() == 'aarch64'
   test_target += [['unittest_nntrainer_kleidiai', []]]
-  test_target += [['unittest_nntrainer_ggml_arm', []]]
+
+  # unittest_nntrainer_ggml_arm assumes the omp ggml wrappers, which lack some
+  # multi-weight entry points, and is told when it runs the bstp or mixed ones.
+  ggml_lib_backend = {'bstp': 'bs_threadpool', 'mixed': 'mixed'}.get(get_option('thread-backend'), 'omp')
+  ggml_test_exe = executable(
+    'unittest_nntrainer_ggml_arm',
+    'unittest_nntrainer_ggml_arm.cpp',
+    cpp_args: ggml_lib_backend == 'omp' ? [] : ['-DGGML_ARM_TEST_MULTI_WEIGHT_ALL_LAYOUTS=1'],
+    dependencies: unittest_nntrainer_deps,
+    install: get_option('enable-test'),
+    install_dir: application_install_dir
+  )
+  test('unittest_nntrainer_ggml_arm', ggml_test_exe,
+    args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_nntrainer_ggml_arm')],
+    timeout: test_timeout,
+    suite: 'unittests'
+  )
 endif
 
 foreach target: test_target

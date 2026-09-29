@@ -176,6 +176,8 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M,
         M_step_end = (M_step_end % NB_COLS)
                        ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
                        : M_step_end;
+        if (M_step_start >= M_step_end)
+          continue;
 
         nntr_gemv_q4_0_4x8_q8_0(K, (float *)(C + M_step_start), N,
                                 (void *)((char *)B + M_step_start * B_step),
@@ -196,6 +198,8 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M,
         M_step_end = (M_step_end % NB_COLS)
                        ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
                        : M_step_end;
+        if (M_step_start >= M_step_end)
+          continue;
 
         nntr_gemv_q4_0_4x8_q8_0(K, (float *)(C + M_step_start), N,
                                 (void *)((char *)B + M_step_start * B_step),
@@ -340,6 +344,8 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                                         : M_step_start;
       M_step_end =
         (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
+      if (M_step_start >= M_step_end)
+        return;
 
       nntr_gemv_q4_0_8x8_q8_0(K, (float *)((C) + M_step_start), N,
                               (void *)((char *)B + M_step_start * B_step),
@@ -375,6 +381,8 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
       src0_start =
         (src0_start % 8) ? src0_start + 8 - (src0_start % 8) : src0_start;
       src0_end = (src0_end % 8) ? src0_end + 8 - (src0_end % 8) : src0_end;
+      if (src0_start >= src0_end)
+        return;
 
       nntr_gemm_q4_0_8x8_q8_0(K, (float *)(C + src0_start), ldc,
                               (void *)((char *)B + src0_start * B_step),
@@ -392,6 +400,8 @@ void __ggml_q4_0_8x8_q8_0_GEMM(const unsigned int M, const unsigned int N,
                          : M_step_start;
         M_step_end =
           (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
+        if (M_step_start >= M_step_end)
+          return;
 
         nntr_gemv_q4_0_8x8_q8_0(
           K, (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
@@ -662,6 +672,8 @@ void __ggml_q4_K_8x8_q8_K_GEMM(const unsigned int M, const unsigned int N,
                                         : M_step_start;
       M_step_end =
         (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
+      if (M_step_start >= M_step_end)
+        return;
 
       nntr_gemv_q4_K_8x8_q8_K(K, (float *)((C) + M_step_start), N,
                               (void *)((char *)B + M_step_start * B_step),
@@ -695,6 +707,8 @@ void __ggml_q4_K_8x8_q8_K_GEMM(const unsigned int M, const unsigned int N,
       src0_start =
         (src0_start % 8) ? src0_start + 8 - (src0_start % 8) : src0_start;
       src0_end = (src0_end % 8) ? src0_end + 8 - (src0_end % 8) : src0_end;
+      if (src0_start >= src0_end)
+        return;
 
       nntr_gemm_q4_K_8x8_q8_K(K, (float *)(C + src0_start), ldc,
                               (void *)((char *)B + src0_start * B_step),
@@ -712,6 +726,8 @@ void __ggml_q4_K_8x8_q8_K_GEMM(const unsigned int M, const unsigned int N,
                          : M_step_start;
         M_step_end =
           (M_step_end % 8) ? M_step_end + 8 - (M_step_end % 8) : M_step_end;
+        if (M_step_start >= M_step_end)
+          return;
 
         nntr_gemv_q4_K_8x8_q8_K(
           K, (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
