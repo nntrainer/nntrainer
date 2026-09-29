@@ -804,7 +804,10 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
 
     // [#132] one decode row: the HTP routes, runs the experts and adds
     // the result into its resident residual in the same stretch, so the
-    // layer writes nothing (the next norm hook returns the stream)
+    // layer writes nothing (the next norm hook returns the stream). The
+    // fused call is the MoE wait, so it counts as ffn (#150); a continue
+    // stops the timer through its destructor.
+    M0Timer fused(&g_m0.ffn);
     if (total_tokens == 1 &&
         gate_weights.getDataType() == ml::train::TensorDim::DataType::FP32 &&
         htpDecodeRouter(from, input.getData<float>(), hidden_size,
@@ -813,6 +816,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       output.reshape({batch_size, 1, seq_len, hidden_size});
       continue;
     }
+    fused.stop();
 
     // routing
     {
