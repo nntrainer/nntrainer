@@ -44,9 +44,11 @@
 #define NNTR_HVX_MAX_ARENAS 32
 
 /** @brief [#132 PR 2] How many Q4M1 weights (q4m1_register) one session
- *  holds at once: the shadow registers one FC or lm_head slice at a time,
- *  the rate test one shape at a time; eight leaves room for both. */
-#define NNTR_HVX_Q4M1_SLOTS 8
+ *  holds at once. [#132 Part B] 80 (the #178 probe's): the resident graph
+ *  holds the whole FC set -- LFM2.5's 66 weights plus the lm_head's 8
+ *  slices of 16384 rows -- in one session; the slots are 12 bytes each,
+ *  the weights themselves are on the heap. */
+#define NNTR_HVX_Q4M1_SLOTS 80
 
 /** @brief One Q4M1 weight on the DSP heap (memalign 128). w NULL = free. */
 typedef struct {
@@ -84,8 +86,11 @@ typedef struct {
   struct nntr_hvx_dspq *dspq; /**< [#141] the MoE call's dspqueue thread
                                  (nntr_hvx_dspq.c); NULL = no queue.
                                  Stopped first in close() */
-  nntr_hvx_q4m1_slot q4m1[NNTR_HVX_Q4M1_SLOTS]; /**< [#132 PR 2] test
-                                 weights of fc_q4m1_f32, freed in close() */
+  nntr_hvx_q4m1_slot q4m1[NNTR_HVX_Q4M1_SLOTS]; /**< [#132 PR 2] the Q4M1
+                                 weights of fc_q4m1_f32 and (Part B) the
+                                 graph's FC kinds, freed in close() */
+  uint8_t *fc_l2; /**< [#132 Part B, #178] the FC runner's L2 feed scratch
+                       (2 MiB of DSP heap, first use), freed in close() */
 } nntr_hvx_session;
 
 /** @brief [#85] mm_u8i4_moe_layer_timed's stage table, shared with
@@ -102,8 +107,31 @@ int nntr_hvx_moe_stage_fill(uint32_t *stage_us, uint64_t t0, uint64_t t1,
  *  Lives in nntr_hvx_dspq.c. */
 void nntr_hvx_dspq_shutdown(nntr_hvx_session *s);
 
-/** @brief [#132 PR 2] Frees every Q4M1 slot. Lives in nntr_hvx_fc_q4.c. */
+/** @brief [#132 PR 2] Frees every Q4M1 slot and the L2 feed scratch. Lives
+ *  in nntr_hvx_fc_q4.c. */
 void nntr_hvx_q4m1_free_all(nntr_hvx_session *s);
+
+/**
+ * @brief [#132 Part B] One Q4M1 FC over @a lanes pool threads: y (N) =
+ *        weight @a h times the prepared activation @a a. @a feed 0 reads
+ *        the weight from DDR in place, FC_Q4_FEED_VTCM (1 << 16) stages
+ *        each lane's next 32-column group into VTCM by DMA, FC_Q4_FEED_L2
+ *        (1 << 17) the same into the session's L2 scratch.
+ * @return 0, AEE_EBADITEM (a free or out-of-range handle),
+ *         AEE_EINVALIDFORMAT (lanes, feed, or a feed that cannot hold two
+ *         groups per lane), AEE_ENOMEMORY, AEE_EEXPIRED (a DMA never
+ *         completed: y is void). Lives in nntr_hvx_fc_q4.c.
+ */
+int nntr_hvx_fc_q4m1_run(nntr_hvx_session *s, uint32_t h, const hvx_q4m1_act *a,
+                         float *y, uint32_t lanes, uint32_t feed,
+                         uint32_t *lanes_used);
+
+/** @brief [#132 Part B] The graph's hexkl_graph_fc_fn over @a ctx = the
+ *  session: the op's feed 0 takes VTCM at 6 lanes when two groups per lane
+ *  fit below the HMX config block, else the L2 scratch at 3 lanes; feed 1
+ *  the L2 scratch. Lives in nntr_hvx_fc_q4.c. */
+int nntr_hvx_fc_q4m1_graph(void *ctx, uint32_t h, uint32_t feed,
+                           const hvx_q4m1_act *a, float *y);
 
 /** @brief HAP_mmap_put on every attached arena. close() calls it after the
  *  weight tables are released, since a borrowed slot points into one. Lives

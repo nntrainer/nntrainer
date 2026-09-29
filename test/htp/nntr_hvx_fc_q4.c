@@ -36,7 +36,22 @@
  * ponytail: the quantized activation and the per-lane scratch are static,
  * so two fc_q4m1_f32 calls must not overlap -- true while nntrainer opens
  * one session per process and calls it from one thread (the tests, the
- * shadow). A resident Part B kernel moves them into the session.
+ * shadow, and the graph's forward, which runs its ops one at a time). A
+ * second session is a second PD with its own statics.
+ *
+ * [#132 Part B] nntr_hvx_fc_q4m1_run is the one lane runner: the test
+ * entry and the resident graph's FC / DENSE_FFN / LM_HEAD ops
+ * (nntr_hvx_graph.c's callback) both call it. Its feeds: VTCM by DMA
+ * (dst_bypass 1) below the HMX config block, or -- lifted from the #178
+ * probe -- the same double buffer in a 2 MiB DSP heap scratch with
+ * dst_bypass 0 (the DMA writes through the L2, where the GEMV reads it),
+ * for a session whose VTCM does not hold two groups per lane (#178: the
+ * second session gets none). Address space: the Q4M1 weights are DSP heap
+ * copies (q4m1_register), 80 slots; the whole LFM2.5 FC set is 383 MiB,
+ * which only a session without the 3840 MiB MoE arena can hold (plan 132
+ * Part B section 3.2: S2's arena in E3) -- one session holding both is a
+ * host-only configuration. The L2 scratch is 2 MiB of heap on first use,
+ * freed in close().
  */
 
 #include <stdlib.h>
@@ -65,9 +80,19 @@
 #define FC_Q4_MAX_K 8192u
 /** @brief Pool threads the static per-thread state serves. */
 #define FC_Q4_MAX_LANES 8u
-/** @brief fc_q4m1_f32's variant word: bit 16 the VTCM feed; every other
- *  bit must be 0 (the kernel variants of the first sitting are gone). */
+/** @brief fc_q4m1_f32's variant word: bit 16 the VTCM feed, bit 17 the L2
+ *  feed (not both); every other bit must be 0 (the kernel variants of the
+ *  first sitting are gone). */
 #define FC_Q4_FEED_VTCM (1u << 16)
+#define FC_Q4_FEED_L2 (1u << 17)
+/** @brief The L2 feed's scratch: 2 x 129 KiB x 6 lanes at K = 7168 fits. */
+#define FC_Q4_L2_BYTES (2u << 20)
+/** @brief The graph's lanes per feed (#178 set3, L2-fed: 26 GB/s at K =
+ *  7168 and 52 at K = 2048 with 3 lanes, the best of 1..6; VTCM-fed: 6,
+ *  45.5 GB/s). ponytail: one count per feed, not per K; the upgrade is a
+ *  per-shape table from the E sitting's profile lines. */
+#define FC_Q4_GRAPH_LANES_VTCM 6u
+#define FC_Q4_GRAPH_LANES_L2 3u
 /** @brief fc_q4m1_f32's stats words. */
 #define FC_Q4_STATS 8
 
@@ -84,6 +109,8 @@ void nntr_hvx_q4m1_free_all(nntr_hvx_session *s) {
     free(s->q4m1[i].w);
     s->q4m1[i].w = NULL;
   }
+  free(s->fc_l2);
+  s->fc_l2 = NULL;
 }
 
 int nntr_hvx_q4m1_register(remote_handle64 handle, uint32 K, uint32 N,
@@ -92,7 +119,7 @@ int nntr_hvx_q4m1_register(remote_handle64 handle, uint32 K, uint32 N,
   if (!s) {
     return AEE_EBADPARM;
   }
-  if (K == 0u || K % 128u != 0u || K > FC_Q4_MAX_K || N == 0u ||
+  if (K == 0u || K % 64u != 0u || K > FC_Q4_MAX_K || N == 0u ||
       N % Q4M1_GROUP != 0u || (size_t)wLen != q4m1_bytes(K, N)) {
     FARF(ERROR, "q4m1_register: bad shape (K=%u N=%u bytes=%d)", (unsigned)K,
          (unsigned)N, wLen);
@@ -130,6 +157,9 @@ int nntr_hvx_q4m1_release(remote_handle64 handle, uint32 h) {
   if (h >= NNTR_HVX_Q4M1_SLOTS || s->q4m1[h].w == NULL) {
     return AEE_EBADITEM;
   }
+  if (hexkl_graph_uses_q4m1(s->graph, h)) {
+    return AEE_EBADSTATE; /* a resident op names it (graph_release first) */
+  }
   free(s->q4m1[h].w);
   s->q4m1[h].w = NULL;
   return AEE_SUCCESS;
@@ -141,22 +171,24 @@ typedef struct {
   size_t gbytes;
   const hvx_q4m1_act *a;
   float *y;
-  uint32_t feed_vtcm;
+  uint32_t feed_vtcm;  /**< any DMA feed (VTCM or L2) */
+  uint32_t dst_bypass; /**< 1 the VTCM feed, 0 the L2 feed */
   uint8_t *vtcm;
   uint32_t vtcm_per_lane;
   uint32_t lanes_used;           /**< written by lane 0 */
   volatile uint32_t dma_expired; /**< any lane whose DMA never completed */
 } fc_ctx;
 
-/** @brief One 1-row DMA of @a bytes into VTCM on this thread's engine,
- *  around the DSP L2 (the registration cleaned the source). */
+/** @brief One 1-row DMA of @a bytes into VTCM (or, @a dst_bypass 0, the L2
+ *  scratch) on this thread's engine, reading around the DSP L2 (the
+ *  registration cleaned the source). */
 static void fc_dma_start(hexkl_dma_desc2d *d, void *dst, const void *src,
-                         uint32_t bytes) {
+                         uint32_t bytes, uint32_t dst_bypass) {
   memset(d, 0, sizeof(*d));
   d->desc_size = 1;
   d->desc_type = 9;
   d->src_bypass = 1;
-  d->dst_bypass = 1;
+  d->dst_bypass = dst_bypass;
   d->src = (void *)src;
   d->dst = dst;
   d->src_stride = bytes;
@@ -198,7 +230,7 @@ static void fc_lane(uint32_t n, uint32_t i, void *v) {
   uint32_t cur = 0;
   if (i < c->G) {
     fc_dma_start(&g_desc[i][0], buf[0], c->w + i * c->gbytes,
-                 (uint32_t)c->gbytes);
+                 (uint32_t)c->gbytes, c->dst_bypass);
   }
   for (uint32_t g = i; g < c->G; g += n) {
     if (!fc_dma_wait(&g_desc[i][cur])) {
@@ -207,12 +239,82 @@ static void fc_lane(uint32_t n, uint32_t i, void *v) {
     }
     if (g + n < c->G) {
       fc_dma_start(&g_desc[i][cur ^ 1u], buf[cur ^ 1u],
-                   c->w + (g + n) * c->gbytes, (uint32_t)c->gbytes);
+                   c->w + (g + n) * c->gbytes, (uint32_t)c->gbytes,
+                   c->dst_bypass);
     }
     hvx_q4m1_gemv_groups(buf[cur], c->K, 1u, c->a,
                          c->y + (size_t)g * Q4M1_GROUP);
     cur ^= 1u;
   }
+}
+
+int nntr_hvx_fc_q4m1_run(nntr_hvx_session *s, uint32_t h, const hvx_q4m1_act *a,
+                         float *y, uint32_t lanes, uint32_t feed,
+                         uint32_t *lanes_used) {
+  if (h >= NNTR_HVX_Q4M1_SLOTS || s->q4m1[h].w == NULL) {
+    return AEE_EBADITEM;
+  }
+  const nntr_hvx_q4m1_slot *w = &s->q4m1[h];
+  if (lanes == 0u || lanes > FC_Q4_MAX_LANES ||
+      (feed & ~(FC_Q4_FEED_VTCM | FC_Q4_FEED_L2)) != 0u ||
+      feed == (FC_Q4_FEED_VTCM | FC_Q4_FEED_L2)) {
+    return AEE_EINVALIDFORMAT;
+  }
+  fc_ctx c;
+  memset(&c, 0, sizeof(c));
+  c.w = w->w;
+  c.K = w->K;
+  c.G = w->N / Q4M1_GROUP;
+  c.gbytes = (size_t)(w->K / 64u) * Q4M1_PAIR_BYTES;
+  c.a = a;
+  c.y = y;
+  c.feed_vtcm = feed != 0u;
+  c.dst_bypass = feed == FC_Q4_FEED_VTCM;
+  if (feed == FC_Q4_FEED_VTCM) {
+    /* two groups per lane below the HMX config block; nothing of the
+       session lives there between calls */
+    c.vtcm = s->vtcm_base;
+    c.vtcm_per_lane = (s->config_off / lanes) & ~127u;
+  } else if (feed == FC_Q4_FEED_L2) {
+    if (!s->fc_l2) {
+      s->fc_l2 = (uint8_t *)memalign(128, FC_Q4_L2_BYTES);
+      if (!s->fc_l2) {
+        return AEE_ENOMEMORY;
+      }
+    }
+    c.vtcm = s->fc_l2;
+    c.vtcm_per_lane = (FC_Q4_L2_BYTES / lanes) & ~127u;
+  }
+  if (c.feed_vtcm && c.vtcm_per_lane < 2u * c.gbytes) {
+    FARF(ERROR, "fc_q4m1: feed %u per lane < 2 x %u", c.vtcm_per_lane,
+         (unsigned)c.gbytes);
+    return AEE_EINVALIDFORMAT;
+  }
+  hvx_worker_pool_run(s->quant_pool, fc_lane, &c, lanes);
+  if (c.dma_expired) {
+    FARF(ERROR, "fc_q4m1: a lane's weight DMA never completed");
+    return AEE_EEXPIRED;
+  }
+  if (lanes_used) {
+    *lanes_used = c.lanes_used;
+  }
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_fc_q4m1_graph(void *ctx, uint32_t h, uint32_t feed,
+                           const hvx_q4m1_act *a, float *y) {
+  nntr_hvx_session *s = (nntr_hvx_session *)ctx;
+  if (h >= NNTR_HVX_Q4M1_SLOTS || s->q4m1[h].w == NULL) {
+    return AEE_EBADITEM;
+  }
+  const size_t gbytes = (size_t)(s->q4m1[h].K / 64u) * Q4M1_PAIR_BYTES;
+  const uint32_t per_lane = (s->config_off / FC_Q4_GRAPH_LANES_VTCM) & ~127u;
+  if (feed == 0u && per_lane >= 2u * gbytes) {
+    return nntr_hvx_fc_q4m1_run(s, h, a, y, FC_Q4_GRAPH_LANES_VTCM,
+                                FC_Q4_FEED_VTCM, NULL);
+  }
+  return nntr_hvx_fc_q4m1_run(s, h, a, y, FC_Q4_GRAPH_LANES_L2, FC_Q4_FEED_L2,
+                              NULL);
 }
 
 int nntr_hvx_fc_q4m1_f32(remote_handle64 handle, uint32 h, uint32 variant,
@@ -226,46 +328,27 @@ int nntr_hvx_fc_q4m1_f32(remote_handle64 handle, uint32 h, uint32 variant,
     return AEE_EBADITEM;
   }
   const nntr_hvx_q4m1_slot *w = &s->q4m1[h];
-  const uint32_t feed = (variant & FC_Q4_FEED_VTCM) ? 1u : 0u;
+  const uint32_t feed = variant & (FC_Q4_FEED_VTCM | FC_Q4_FEED_L2);
   if ((uint32_t)xLen != w->K || (uint32_t)yLen != w->N ||
-      statsLen != FC_Q4_STATS || (variant & ~FC_Q4_FEED_VTCM) != 0u ||
-      lanes == 0u || lanes > FC_Q4_MAX_LANES || reps == 0u) {
+      statsLen != FC_Q4_STATS || variant != feed ||
+      feed == (FC_Q4_FEED_VTCM | FC_Q4_FEED_L2) || lanes == 0u ||
+      lanes > FC_Q4_MAX_LANES || reps == 0u) {
     FARF(ERROR, "fc_q4m1_f32: bad call (x=%d y=%d variant=0x%x lanes=%u)", xLen,
          yLen, (unsigned)variant, (unsigned)lanes);
     return AEE_EINVALIDFORMAT;
   }
-  fc_ctx c;
-  memset(&c, 0, sizeof(c));
-  c.w = w->w;
-  c.K = w->K;
-  c.G = w->N / Q4M1_GROUP;
-  c.gbytes = (size_t)(w->K / 64u) * Q4M1_PAIR_BYTES;
-  c.y = y;
-  c.feed_vtcm = feed;
-  if (feed) {
-    /* two groups per lane below the HMX config block; nothing of the
-       session lives there between calls */
-    c.vtcm = s->vtcm_base;
-    c.vtcm_per_lane = (s->config_off / lanes) & ~127u;
-    if (c.vtcm_per_lane < 2u * c.gbytes) {
-      FARF(ERROR, "fc_q4m1_f32: VTCM %u per lane < 2 x %u", c.vtcm_per_lane,
-           (unsigned)c.gbytes);
-      return AEE_EINVALIDFORMAT;
-    }
-  }
   hvx_q4m1_act a = {g_q, g_s8, g_ma, g_ea, g_df, g_d};
-  c.a = &a;
   uint64_t prep_us = 0, gemv_us = 0, pcyc = 0;
+  uint32_t lanes_used = 0;
   for (uint32_t r = 0; r < reps; ++r) {
     const uint64_t t0 = hexkl_probe_now();
     hvx_q4m1_prep(x, w->K, &a);
     const uint64_t t1 = hexkl_probe_now();
     const uint64_t p0 = HAP_perf_get_pcycles();
-    hvx_worker_pool_run(s->quant_pool, fc_lane, &c, lanes);
+    const int rc = nntr_hvx_fc_q4m1_run(s, h, &a, y, lanes, feed, &lanes_used);
     pcyc += HAP_perf_get_pcycles() - p0;
-    if (c.dma_expired) {
-      FARF(ERROR, "fc_q4m1_f32: a lane's weight DMA never completed");
-      return AEE_EEXPIRED;
+    if (rc != AEE_SUCCESS) {
+      return rc;
     }
     gemv_us += hexkl_probe_now() - t1;
     prep_us += t1 - t0;
@@ -274,7 +357,7 @@ int nntr_hvx_fc_q4m1_f32(remote_handle64 handle, uint32 h, uint32 variant,
   stats[1] = (uint32)prep_us;
   stats[2] = (uint32)(pcyc & 0xffffffffu);
   stats[3] = (uint32)(pcyc >> 32);
-  stats[4] = c.lanes_used;
+  stats[4] = lanes_used;
   stats[5] = reps;
   stats[6] = w->K;
   stats[7] = w->N;
@@ -287,7 +370,7 @@ int nntr_hvx_q8_quant_f32(remote_handle64 handle, const float *x, int xLen,
   if (!s) {
     return AEE_EBADPARM;
   }
-  if (xLen <= 0 || xLen % 128 != 0 || xLen > (int)FC_Q4_MAX_K || qLen != xLen ||
+  if (xLen <= 0 || xLen % 64 != 0 || xLen > (int)FC_Q4_MAX_K || qLen != xLen ||
       dLen != xLen / 32) {
     return AEE_EINVALIDFORMAT;
   }

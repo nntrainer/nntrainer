@@ -26,6 +26,18 @@
  * and bias -- are bound once after init through
  * hexkl_graph_set_param (plan 130 section 3.1); forward refuses an op
  * whose parameter is missing with AEE_EBADSTATE.
+ *
+ * [#132 Part B] FC, DENSE_FFN and LM_HEAD: the Android CPU's M=1 Q4_0 FC
+ * bit for bit (q4_gemv_cpu_det.h) -- hvx_q4m1_prep quantizes the op's
+ * input once (hvx_intrin, = q8_0_quant_cpu_det) and the session's FC
+ * runner (the env's fc callback: nntr_hvx_fc_q4.c's lanes and weight
+ * feed) runs each Q4M1 part on it. DENSE_FFN is up, gate,
+ * m1_swiglu_cpu_det (neon::swiglu's order), a second quantization and
+ * down; LM_HEAD is its slices into the graph's logits buffer, then
+ * m1_argmax_first (std::max_element) into lm_id. The weights are Q4M1
+ * handles of the session's table bound in the op record before
+ * graph_init (htp_graph_desc.h), checked there against the shapes the
+ * caller passes.
  */
 
 #ifndef __NNTRAINER_HEXKL_GRAPH_H__
@@ -36,6 +48,26 @@
 #include "../htp_graph_desc.h" /* beside hmx/, on every include path */
 #include "hexkl_mm_u8i4_moe.h"
 #include "hvx_attn_m1_f32.h"
+#include "hvx_q4_gemv_f32.h"
+
+/** @brief Largest K a Q4M1 op quantizes (the validator's rule; the model's
+ *  widest is 7168, the dense down). */
+#define HEXKL_GRAPH_Q4M1_MAX_K 8192u
+
+/**
+ * @brief The session's FC runner (#132 Part B): y (the slot's N floats)
+ *        = weight @a h (a Q4M1 handle of the session's table) times the
+ *        prepared activation @a a, with @a feed the op's (0 VTCM when it
+ *        fits, else the L2 scratch; 1 the L2 scratch).
+ * @return 0, or the runner's code (AEE_EEXPIRED: a weight DMA never came)
+ */
+typedef int (*hexkl_graph_fc_fn)(void *ctx, uint32_t h, uint32_t feed,
+                                 const hvx_q4m1_act *a, float *y);
+
+/** @brief One Q4M1 slot's shape for hexkl_graph_init (K 0 = free). */
+typedef struct {
+  uint32_t K, N;
+} hexkl_graph_q4m1_shape;
 
 /** @brief What a kernel needs from the session, handed per call so the
  *  graph holds no pointer into the session. */
@@ -50,6 +82,9 @@ typedef struct {
   hvx_attn_m1_ctx *attn_m1; /**< the session's m=1 KV cache (#81), borrowed;
                                  NULL = none, and a resident ATTN_M1 op
                                  fails with AEE_EBADSTATE */
+  hexkl_graph_fc_fn fc;     /**< [#132 Part B] the Q4M1 kinds' runner; NULL
+                                 = none, and they fail with AEE_EBADSTATE */
+  void *fc_ctx;
 } hexkl_graph_env;
 
 /** @brief The MoE routing of this token, in mm_u8i4_moe_layer's layout:
@@ -82,6 +117,16 @@ typedef struct {
   uint32_t route_idx[HTP_GRAPH_MAX_EXPERTS];
   uint32_t route_cnt[HTP_GRAPH_MAX_EXPERTS];
   float route_w[HTP_GRAPH_MAX_EXPERTS];
+  /* [#132 Part B] the Q4M1 kinds' state, allocated at init only when one
+     is resident: the part widths, the quantized activation, the dense
+     FFN's up | gate | swiglu rows, the logits and their argmax */
+  hexkl_graph_q4m1_shape *q4m1; /**< n_q4m1 slot shapes, copied at init */
+  uint32_t n_q4m1;
+  hvx_q4m1_act act; /**< its arrays in act_buf, HEXKL_GRAPH_Q4M1_MAX_K */
+  uint8_t *act_buf;
+  float *ffn;     /**< 3 x the widest DENSE_FFN N */
+  float *logits;  /**< vocab floats: LM_HEAD's output, not a slot */
+  uint32_t lm_id; /**< m1_argmax_first of the last LM_HEAD's logits */
 } hexkl_graph;
 
 /** @brief HTP_GRAPH_KIND_BIT mask of the kinds whose table slot is
@@ -90,14 +135,21 @@ uint32_t hexkl_graph_resident_kinds(void);
 
 /**
  * @brief Validates the words, checks every resident MoE op's handles
- *        against @a tbl (in use, gate_up K x 2N, down N x N_out) and
- *        keeps a copy.
+ *        against @a tbl (in use, gate_up K x 2N, down N x N_out) and every
+ *        resident Q4M1 op's against @a q4m1 (#132 Part B: each part in
+ *        range and in use, K the op's, an FC's or LM_HEAD's part widths
+ *        multiples of 32 summing to N, a DENSE_FFN's up and gate K x N and
+ *        down N x N_out), and keeps a copy.
+ * @param q4m1   the session's Q4M1 slot shapes (may be NULL when @a n_q4m1
+ *               is 0: then a resident Q4M1 op is refused)
  * @return 0 or htp_graph_validate's code; HTP_GRAPH_E_INVHANDLE for a
  *         handle that is out of range, free or of the wrong shape;
  *         AEE_ENOMEMORY when the heap refuses
  */
 int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
-                     const hexkl_weight_u8i4_table *tbl, hexkl_graph **out);
+                     const hexkl_weight_u8i4_table *tbl,
+                     const hexkl_graph_q4m1_shape *q4m1, uint32_t n_q4m1,
+                     hexkl_graph **out);
 
 /** @brief Frees the table, the slots and every bound parameter. Safe on
  *  NULL. The KV cache is the session's, not the graph's. */
@@ -118,13 +170,17 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
  *  refuses such a handle with AEE_EBADSTATE while the graph lives. */
 int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle);
 
+/** @brief [#132 Part B] The same for a Q4M1 handle (q4m1_release). */
+int hexkl_graph_uses_q4m1(const hexkl_graph *g, uint32_t handle);
+
 /**
  * @brief Runs ops [start_op, ...) while they are resident, at most
  *        @a n_ops_limit of them.
  *
  * act_in (act_in_len == the start op's input width) is copied into the
  * start op's in_slot; when at least one op ran, the last op's out_slot is
- * copied to act_out (act_out_len == its output width) -- the f32 wrapper
+ * copied to act_out (act_out_len == its output width; an LM_HEAD's
+ * logits come from the graph's logits buffer) -- the f32 wrapper
  * of doc 45 section 3.1 that goes away when the ARM stops touching
  * activations. When no op ran (the start op is not resident) act_out is
  * untouched, *resume_at == start_op and every op_pcycles entry is 0.
@@ -132,7 +188,8 @@ int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle);
  * same call, or a MoE op with no routing, fails with AEE_EBADSTATE.
  * @return 0, AEE_EBADSTATE (no graph, routing; a RMSNORM / QK_NORM /
  *         CONV1D_GATE / ROUTER_TOPK op with no parameter or state bound, a ROPE
- * op with no table, an ATTN_M1 op with no cache in @a env, or the cache
+ * op with no table, an ATTN_M1 op with no cache in @a env, a Q4M1 op with
+ * no fc runner in @a env, or the cache
  *         kernel's own hole), HTP_GRAPH_E_BADITEM (start_op past the
  *         list, pos >= max_seq), HTP_GRAPH_E_INVALIDFORMAT (an act length
  *         or the routing's shape disagrees with the op), or the kernel's

@@ -45,7 +45,7 @@ typedef struct {
   uint16_t *d; /**< per block: d_a, the f16 the CPU stores */
 } hvx_q4m1_act;
 
-/** @brief q8_0_quant_cpu_det of x (K % 128 == 0, K <= 8192) on the vector
+/** @brief q8_0_quant_cpu_det of x (K % 64 == 0, K <= 8192) on the vector
  *         unit, plus
  *         the per-block terms the kernel reads (hvx_q4_gemv_f32.c). */
 void hvx_q4m1_prep(const float *x, uint32_t K, hvx_q4m1_act *a);

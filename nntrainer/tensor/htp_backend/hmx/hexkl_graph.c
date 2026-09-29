@@ -21,7 +21,11 @@
  * (#132), 22 router weights padded to [2048][32] f32, 256 KiB each, 5.5
  * MiB -- all DSP heap, no arena, no VTCM, no DMA. The 24 MiB fp16 KV cache the
  * ATTN_M1 op reads is the session's (hvx_attn_m1_f32.h's budget note), borrowed
- * through the env.
+ * through the env. [#132 Part B] With a Q4M1 kind resident: the quantized
+ * activation (about 13 KiB), the dense FFN's three rows (84 KiB at inter
+ * 7168), the logits (vocab floats, 256 KiB at 65536) and the slot shape
+ * copy (8 B a slot) -- about 0.35 MiB of heap. The Q4M1 weights are the
+ * session's (nntr_hvx_fc_q4.c's note), not the graph's.
  */
 
 #include "hexkl_graph.h"
@@ -33,7 +37,9 @@
 #include <HAP_perf.h>
 
 #include "hvx_m1_ops_f32.h"
+#include "hvx_q4_gemv_f32.h"
 #include "hvx_scale_add_f32.h"
+#include "m1_ops_det.h"
 
 /* htp_graph_desc.h restates the SDK's codes so it can be built with no
    SDK; here both are in scope, so a drift is a build error. */
@@ -229,12 +235,82 @@ static int graph_op_router_topk(hexkl_graph *g, const htp_graph_op *op,
   return AEE_SUCCESS;
 }
 
+/* ---- #132 Part B: the CPU-exact Q4_0 FC, the dense FFN, the lm_head ---- */
+
+/* Runs parts h[0..n) on the prepared activation, their outputs
+   concatenated in y (q | k | v; the lm_head's slices). */
+static int graph_q4m1_parts(hexkl_graph *g, const htp_graph_op *op,
+                            const graph_call *call, const uint32_t *h,
+                            uint32_t n, float *y) {
+  uint32_t p;
+  for (p = 0; p < n; ++p) {
+    const int rc = call->env->fc(call->env->fc_ctx, h[p], op->feed, &g->act, y);
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+    y += g->q4m1[h[p]].N;
+  }
+  return AEE_SUCCESS;
+}
+
+static int graph_op_fc(hexkl_graph *g, const htp_graph_op *op, graph_call *call,
+                       const float *in, float *out) {
+  if (call->env->fc == NULL) {
+    return AEE_EBADSTATE;
+  }
+  hvx_q4m1_prep(in, op->K, &g->act);
+  return graph_q4m1_parts(g, op, call, op->h_gu, op->n_experts, out);
+}
+
+/* up and gate on one quantization, silu(gate) * up in the CPU's order
+   (m1_swiglu_cpu_det: swiglu layer input 0 is gate), the swiglu row
+   quantized, down. ponytail: the SwiGLU is the scalar spec on one thread
+   (inter 7168 = 7168 integer divides, twice a token); an HVX form with a
+   bit-compare gate is the upgrade if the E sitting's profile line names
+   it. */
+static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
+                              graph_call *call, const float *in, float *out) {
+  float *up = g->ffn, *gate = g->ffn + op->N, *act = g->ffn + 2u * op->N;
+  int rc;
+  if (call->env->fc == NULL) {
+    return AEE_EBADSTATE;
+  }
+  hvx_q4m1_prep(in, op->K, &g->act);
+  rc = call->env->fc(call->env->fc_ctx, op->h_gu[0], op->feed, &g->act, up);
+  if (rc == AEE_SUCCESS) {
+    rc = call->env->fc(call->env->fc_ctx, op->h_gu[1], op->feed, &g->act, gate);
+  }
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  m1_swiglu_cpu_det(gate, up, act, op->N);
+  hvx_q4m1_prep(act, op->N, &g->act);
+  return call->env->fc(call->env->fc_ctx, op->h_dn[0], op->feed, &g->act, out);
+}
+
+/* The slices into g->logits (forward hands them out as the op's output),
+   then the first maximum, as the CPU's sampler picks it. */
+static int graph_op_lm_head(hexkl_graph *g, const htp_graph_op *op,
+                            graph_call *call, const float *in, float *out) {
+  int rc;
+  (void)out;
+  if (call->env->fc == NULL) {
+    return AEE_EBADSTATE;
+  }
+  hvx_q4m1_prep(in, op->K, &g->act);
+  rc = graph_q4m1_parts(g, op, call, op->h_gu, op->n_experts, g->logits);
+  if (rc == AEE_SUCCESS) {
+    g->lm_id = m1_argmax_first(g->logits, op->N);
+  }
+  return rc;
+}
+
 /** @brief The kernel table: a NULL slot is a kind this build does not run
  *  (hvx_impl's htp_op_table rule); the validator refuses a resident bit on
  *  it with AEE_ECLASSNOTSUPPORT, so forward never reaches a NULL. */
 static const graph_kernel kernels[HTP_OP_KIND_N] = {
   graph_op_rmsnorm,     /* RMSNORM      #82 */
-  NULL,                 /* FC           plan 85 section 7 */
+  graph_op_fc,          /* FC           #132 Part B */
   graph_op_conv1d_gate, /* CONV1D_GATE  #82 */
   graph_op_qk_norm,     /* QK_NORM      #82 */
   graph_op_rope,        /* ROPE         #82 */
@@ -242,8 +318,8 @@ static const graph_kernel kernels[HTP_OP_KIND_N] = {
   graph_op_add,         /* ADD          #132 */
   graph_op_router_topk, /* ROUTER_TOPK  #132 */
   graph_op_moe,         /* MOE */
-  NULL,                 /* DENSE_FFN */
-  NULL,                 /* LM_HEAD */
+  graph_op_dense_ffn,   /* DENSE_FFN    #132 Part B */
+  graph_op_lm_head,     /* LM_HEAD      #132 Part B */
 };
 
 uint32_t hexkl_graph_resident_kinds(void) {
@@ -265,9 +341,39 @@ static int graph_check_handle(const hexkl_weight_u8i4_table *tbl, uint32_t h,
   return AEE_SUCCESS;
 }
 
+/* A resident Q4M1 op's parts against the slot shapes (hexkl_graph.h). */
+static int graph_check_q4m1(const htp_graph_op *op,
+                            const hexkl_graph_q4m1_shape *q4m1,
+                            uint32_t n_q4m1) {
+  uint32_t p, sum = 0;
+#define Q4M1_OK(h, k) ((h) < n_q4m1 && q4m1[h].K != 0u && q4m1[h].K == (k))
+  if (op->kind == HTP_OP_DENSE_FFN) {
+    return (op->n_experts == 3u && Q4M1_OK(op->h_gu[0], op->K) &&
+            Q4M1_OK(op->h_gu[1], op->K) && Q4M1_OK(op->h_dn[0], op->N) &&
+            q4m1[op->h_gu[0]].N == op->N && q4m1[op->h_gu[1]].N == op->N &&
+            q4m1[op->h_dn[0]].N == op->N_out)
+             ? AEE_SUCCESS
+             : AEE_EINVHANDLE;
+  }
+  if (op->n_experts == 0u) {
+    return AEE_EINVHANDLE;
+  }
+  for (p = 0; p < op->n_experts; ++p) {
+    if (!Q4M1_OK(op->h_gu[p], op->K) || q4m1[op->h_gu[p]].N % 32u != 0u) {
+      return AEE_EINVHANDLE;
+    }
+    sum += q4m1[op->h_gu[p]].N;
+  }
+#undef Q4M1_OK
+  return sum == op->N ? AEE_SUCCESS : AEE_EINVHANDLE;
+}
+
 int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
-                     const hexkl_weight_u8i4_table *tbl, hexkl_graph **out) {
-  uint32_t n_ops = 0, i, e, slot_words = 0, n_attn = 0;
+                     const hexkl_weight_u8i4_table *tbl,
+                     const hexkl_graph_q4m1_shape *q4m1, uint32_t n_q4m1,
+                     hexkl_graph **out) {
+  uint32_t n_ops = 0, i, e, slot_words = 0, n_attn = 0, ffn_n = 0;
+  uint32_t q4m1_ops = 0, vocab_out = 0;
   hexkl_graph *g;
   int rc;
   if (out == NULL || tbl == NULL) {
@@ -293,10 +399,22 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
         }
       }
     }
+    if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) != 0u) {
+      if (q4m1 == NULL || graph_check_q4m1(op, q4m1, n_q4m1) != AEE_SUCCESS) {
+        return AEE_EINVHANDLE;
+      }
+      ++q4m1_ops;
+      if (op->kind == HTP_OP_DENSE_FFN && op->N > ffn_n) {
+        ffn_n = op->N;
+      }
+    }
     if (htp_graph_op_in_words(op) > slot_words) {
       slot_words = htp_graph_op_in_words(op);
     }
-    if (htp_graph_op_out_words(op) > slot_words) {
+    /* the logits are not a slot: g->logits below */
+    if (op->kind == HTP_OP_LM_HEAD) {
+      vocab_out = op->N;
+    } else if (htp_graph_op_out_words(op) > slot_words) {
       slot_words = htp_graph_op_out_words(op);
     }
   }
@@ -317,6 +435,29 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
       free(g);
       return AEE_ENOMEMORY;
     }
+  }
+  if (q4m1_ops != 0u) {
+    /* q (K bytes, 128-aligned) then s8 / ma / ea / df / d per block */
+    const size_t nb = HEXKL_GRAPH_Q4M1_MAX_K / 32u;
+    g->act_buf = (uint8_t *)memalign(128, HEXKL_GRAPH_Q4M1_MAX_K + nb * 18u);
+    g->q4m1 =
+      (hexkl_graph_q4m1_shape *)malloc((size_t)n_q4m1 * sizeof(*g->q4m1));
+    g->ffn = ffn_n ? (float *)malloc((size_t)3u * ffn_n * sizeof(float)) : NULL;
+    g->logits =
+      vocab_out ? (float *)malloc((size_t)vocab_out * sizeof(float)) : NULL;
+    if (g->act_buf == NULL || g->q4m1 == NULL || (ffn_n && g->ffn == NULL) ||
+        (vocab_out && g->logits == NULL)) {
+      hexkl_graph_free(g);
+      return AEE_ENOMEMORY;
+    }
+    memcpy(g->q4m1, q4m1, (size_t)n_q4m1 * sizeof(*g->q4m1));
+    g->n_q4m1 = n_q4m1;
+    g->act.q = (int8_t *)g->act_buf;
+    g->act.s8 = (int32_t *)(g->act_buf + HEXKL_GRAPH_Q4M1_MAX_K);
+    g->act.ma = g->act.s8 + nb;
+    g->act.ea = g->act.ma + nb;
+    g->act.df = (float *)(g->act.ea + nb);
+    g->act.d = (uint16_t *)(g->act.df + nb);
   }
   for (i = 0; i < n_ops; ++i) {
     g->ops[i] = *htp_graph_op_cat(words, i);
@@ -339,6 +480,10 @@ void hexkl_graph_free(hexkl_graph *g) {
   }
   free(g->rope_cs);
   free(g->slots);
+  free(g->act_buf);
+  free(g->q4m1);
+  free(g->ffn);
+  free(g->logits);
   free(g);
 }
 
@@ -445,6 +590,33 @@ int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle) {
   return 0;
 }
 
+int hexkl_graph_uses_q4m1(const hexkl_graph *g, uint32_t handle) {
+  uint32_t i, p;
+  if (g == NULL) {
+    return 0;
+  }
+  for (i = 0; i < g->n_ops; ++i) {
+    const htp_graph_op *op = &g->ops[i];
+    if (!op->resident ||
+        (HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) == 0u) {
+      continue;
+    }
+    if (op->kind == HTP_OP_DENSE_FFN) { /* up, gate, down */
+      if (op->h_gu[0] == handle || op->h_gu[1] == handle ||
+          op->h_dn[0] == handle) {
+        return 1;
+      }
+      continue;
+    }
+    for (p = 0; p < op->n_experts; ++p) {
+      if (op->h_gu[p] == handle) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
                         uint32_t start_op, uint32_t n_ops_limit, uint32_t pos,
                         const hexkl_graph_routing *routing, const float *act_in,
@@ -514,7 +686,10 @@ int hexkl_graph_forward(hexkl_graph *g, const hexkl_graph_env *env,
     if (act_out == NULL || act_out_len != htp_graph_op_out_words(last)) {
       return AEE_EINVALIDFORMAT;
     }
-    memcpy(act_out, g->slots + (size_t)last->out_slot * g->slot_words,
+    memcpy(act_out,
+           last->kind == HTP_OP_LM_HEAD
+             ? g->logits
+             : g->slots + (size_t)last->out_slot * g->slot_words,
            (size_t)act_out_len * sizeof(float));
   }
   return AEE_SUCCESS;

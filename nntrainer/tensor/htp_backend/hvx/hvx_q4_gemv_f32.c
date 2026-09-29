@@ -86,13 +86,32 @@ static inline uint16_t q4m1_f32_to_f16(float f) {
   return (uint16_t)(((u >> 16) & 0x8000u) | h);
 }
 
+#if defined(NNTR_Q4M1_HOST_ID)
+#include <stdlib.h>
+/** @brief In the in-process host build only (meson htp-inproc defines the
+ *  macro; the skel never does): NNTR_INPROC_X86_Q8=1 makes the quantizer
+ *  take x86 nntrainer's id = 127 / amax instead of the Android CPU's
+ *  RN(1 / RN(amax / 127)) -- the one place the x86 CPU's Q4_0 FC order
+ *  differs from the Android CPU's -- so run_inproc_e2e.sh can hold an
+ *  all-resident token against the x86 CPU path bit for bit. */
+static int q4m1_host_id(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char *e = getenv("NNTR_INPROC_X86_Q8");
+    v = e != NULL && atoi(e) != 0;
+  }
+  return v;
+}
+#endif
+
 /** @brief Blocks per call the quantizer's static scratch serves (K <=
  *  8192, the entry's own limit). */
 #define Q4M1_PREP_MAX_NB 256u
 
 /**
- * q8_0_quant_cpu_det on the vector unit (K % 128 == 0, K <= 8192), one
- * 32-float block per vector, in
+ * q8_0_quant_cpu_det on the vector unit (K % 64 == 0, K <= 8192), one
+ * 32-float block per vector, four at a time (a K % 128 == 64 row ends in a
+ * pair, whose 64 quant bytes are stored through a copy), in
  * three passes so the vector and scalar units meet twice per call, not
  * twice per block:
  *   1 (vector) amax = max |x|: word max of the sign-cleared bits (exact,
@@ -125,16 +144,17 @@ void hvx_q4m1_prep(const float *x, uint32_t K, hvx_q4m1_act *a) {
   const uint32_t nb = K / Q4_CPU_QK;
   const HVX_UVector *xv = (const HVX_UVector *)x;
   for (uint32_t b = 0; b < nb; b += 4u) { /* 4 independent trees */
+    const uint32_t nj = nb - b < 4u ? nb - b : 4u;
     HVX_Vector m[4];
     for (uint32_t j = 0; j < 4u; ++j) {
-      m[j] = Q6_V_vand_VV(xv[b + j], absm);
+      m[j] = j < nj ? Q6_V_vand_VV(xv[b + j], absm) : Q6_V_vzero();
     }
     for (int r = 64; r >= 4; r >>= 1) {
       for (uint32_t j = 0; j < 4u; ++j) {
         m[j] = Q6_Vw_vmax_VwVw(m[j], Q6_V_vror_VR(m[j], r));
       }
     }
-    for (uint32_t j = 0; j < 4u; ++j) { /* amax in every lane of m[j] */
+    for (uint32_t j = 0; j < nj; ++j) { /* amax in every lane of m[j] */
       amax_v[(b + j) / 32u] = Q6_V_vmux_QVV(
         Q6_Q_vcmp_eq_VwVw(lanes, Q6_V_vsplat_R((int32_t)((b + j) % 32u))), m[j],
         amax_v[(b + j) / 32u]);
@@ -150,17 +170,27 @@ void hvx_q4m1_prep(const float *x, uint32_t K, hvx_q4m1_act *a) {
       continue;
     }
     const float d = cpu_det_float(amax_bits) / 127.0f;
+#if defined(NNTR_Q4M1_HOST_ID)
+    const float id =
+      q4m1_host_id() ? 127.0f / cpu_det_float(amax_bits) : 1.0f / d;
+#else
     const float id = 1.0f / d;
+#endif
     memcpy(&id_bits[b], &id, sizeof(float));
     a->d[b] = q4m1_f32_to_f16(d);
   }
   for (uint32_t b = 0; b < nb; b += 4u) {
+    const uint32_t nj = nb - b < 4u ? nb - b : 4u;
     HVX_Vector qw[4], sv[4];
     for (uint32_t j = 0; j < 4u; ++j) {
-      qw[j] = Q6_Vw_vsub_VwVw(
-        Q6_Vsf_vadd_VsfVsf(
-          Q6_Vsf_vmpy_VsfVsf(xv[b + j], Q6_V_vsplat_R(id_bits[b + j])), magic),
-        magic);
+      qw[j] =
+        j < nj
+          ? Q6_Vw_vsub_VwVw(
+              Q6_Vsf_vadd_VsfVsf(
+                Q6_Vsf_vmpy_VsfVsf(xv[b + j], Q6_V_vsplat_R(id_bits[b + j])),
+                magic),
+              magic)
+          : Q6_V_vzero();
       sv[j] = qw[j];
     }
     for (int r = 64; r >= 4; r >>= 1) {
@@ -168,13 +198,18 @@ void hvx_q4m1_prep(const float *x, uint32_t K, hvx_q4m1_act *a) {
         sv[j] = Q6_Vw_vadd_VwVw(sv[j], Q6_V_vror_VR(sv[j], r));
       }
     }
-    for (uint32_t j = 0; j < 4u; ++j) {
+    for (uint32_t j = 0; j < nj; ++j) {
       sum_v[(b + j) / 32u] = Q6_V_vmux_QVV(
         Q6_Q_vcmp_eq_VwVw(lanes, Q6_V_vsplat_R((int32_t)((b + j) % 32u))),
         sv[j], sum_v[(b + j) / 32u]);
     }
-    *(HVX_UVector *)(a->q + (size_t)b * Q4_CPU_QK) = Q6_Vb_vpacke_VhVh(
+    const HVX_Vector packed = Q6_Vb_vpacke_VhVh(
       Q6_Vh_vpacke_VwVw(qw[3], qw[2]), Q6_Vh_vpacke_VwVw(qw[1], qw[0]));
+    if (nj == 4u) {
+      *(HVX_UVector *)(a->q + (size_t)b * Q4_CPU_QK) = packed;
+    } else {
+      memcpy(a->q + (size_t)b * Q4_CPU_QK, &packed, (size_t)nj * Q4_CPU_QK);
+    }
   }
   for (uint32_t b = 0; b < nb; ++b) {
     int32_t s;

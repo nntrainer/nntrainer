@@ -34,7 +34,17 @@ int nntr_hvx_graph_init(remote_handle64 handle, const uint32 *desc, int descLen,
     FARF(ERROR, "graph_init: a graph is already live; release it first");
     return AEE_EBADSTATE;
   }
-  rc = hexkl_graph_init(desc, (uint32_t)descLen, &s->weights_u8i4, &s->graph);
+  {
+    /* [#132 Part B] the Q4M1 slots' shapes, for the FC kinds' handles */
+    hexkl_graph_q4m1_shape q4m1[NNTR_HVX_Q4M1_SLOTS];
+    uint32_t i;
+    for (i = 0; i < NNTR_HVX_Q4M1_SLOTS; ++i) {
+      q4m1[i].K = s->q4m1[i].w ? s->q4m1[i].K : 0u;
+      q4m1[i].N = s->q4m1[i].w ? s->q4m1[i].N : 0u;
+    }
+    rc = hexkl_graph_init(desc, (uint32_t)descLen, &s->weights_u8i4, q4m1,
+                          NNTR_HVX_Q4M1_SLOTS, &s->graph);
+  }
   if (rc != AEE_SUCCESS) {
     FARF(ERROR, "graph_init: %s (0x%08x), %d words", htp_graph_err_name(rc),
          (unsigned)rc, descLen);
@@ -115,7 +125,9 @@ static void graph_env_of(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->pool = s->quant_pool;
   env->scratch = (hexkl_moe_scratch *)&s->moe_scratch;
   env->moe_flags = s->moe_flags;
-  env->attn_m1 = s->attn_m1; /* [#130] borrowed; NULL until registered */
+  env->attn_m1 = s->attn_m1;        /* [#130] borrowed; NULL until registered */
+  env->fc = nntr_hvx_fc_q4m1_graph; /* [#132 Part B] */
+  env->fc_ctx = (void *)s;
 }
 
 /** @brief One FARF line per call (HIGH: silent unless the mask enables
