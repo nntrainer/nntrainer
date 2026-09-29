@@ -593,11 +593,31 @@ static uint32_t moe_tail_rows(uint32_t n_e) {
  * run after the join that frees its slab. The slabs, the GEMV units and
  * their order are unchanged, so the output is the same bytes.
  *
- * ponytail: one pool run per expert and stage (6 extra fork/joins a call)
- * is the price of a schedule a host check can prove. If the vtcm
- * microbench cell shows mm - bytes / engine rate well above the ~20 us
- * compute tail, the upgrade is one run per stage with lanes polling their
- * slab's descriptor (hexkl_dma_ring_is_done) -- plan 117 section 3.2.
+ * At 4 queues the call is DMA-bound (#185: ~21.5 MB at ~62 GB/s is ~76 %
+ * of it), so the schedule's job is to keep the engines busy, not to hide
+ * compute. The run table at n = 4 experts (the decode shape):
+ *
+ *   run    carries          dest            computes
+ *   GU0    GU(0)            slab 0          -
+ *   A(0)   GU(1)            slab 1          A(0)
+ *   A(1)   GU(2)            slab 0          A(1)
+ *   A(2)   GU(3)            slab 1          A(2)
+ *   A(3)   D(0), D(1)       slab 0          A(3)
+ *   B      -                -               requant of every expert
+ *   C(0)   D(2)             slab 1 half 0   C(0)
+ *   C(1)   D(3)             slab 1 half 1   C(1)
+ *   C(2)   -                -               C(2)
+ *   C(3)   -                -               C(3)
+ *
+ * The last A frees downs {0, 1} (odd n: they ride B, read by C(0)) or
+ * {2, 3} (even n: they ride C(0) and C(1), two joins ahead of their
+ * readers). A fifth or later down D(j + 3) rides C(j). Every slice is
+ * still issued and polled by one lane inside one run and read only in a
+ * later run, the invariant the host check proves.
+ *
+ * ponytail: C(2) and C(3) move no bytes (~38 us/call of idle engines).
+ * The next rung is a third down slot in the arena's spare ~0.9 MiB or a
+ * down split by rows over two runs; both need their own host proof.
  */
 #define MOE_M1_MAX_ROWS 4u
 #define MOE_M1_MAX_EXPERTS 16u
@@ -1598,8 +1618,14 @@ int hexkl_mm_u8i4_moe_layer_run(
         m1.u_hi = (i + 1u) * inter_ntiles;
         moe_m1_q_run(pool, &m1q, moe_m1_pair_worker, &m1, inter_ntiles);
       }
-      moe_m1_q_post_after_a(&m1q, &m1, n_active - 1u, vtcm_base, gu_bytes,
-                            dn_bytes);
+      /* #185: the last A frees the downs {0, 1} (n odd) or {2, 3} (n
+         even) of #117's schedule. Downs 0 and 1 are read by C(0) and C(1),
+         so they ride run B; downs 2 and 3 ride C(0) and C(1) below, two
+         joins ahead of their readers, instead of lengthening B. */
+      if (((n_active - 1u) & 1u) == 0u) {
+        moe_m1_q_post_after_a(&m1q, &m1, n_active - 1u, vtcm_base, gu_bytes,
+                              dn_bytes);
+      }
     } else {
       for (uint32_t i = 0; i < n_active; ++i) {
         uint64_t pw = 0;
@@ -1633,9 +1659,7 @@ int hexkl_mm_u8i4_moe_layer_run(
     HEXKL_PROBE_ADD(HEXKL_PROBE_MM, p0);
     HEXKL_PROBE_T0(p0);
     if (m1q.n_push != 0u) {
-      /* #177: the last A's downs ride the requant run (ponytail: C(0)
-         cannot overlap them; if REQUANT >> its compute, move the second
-         into C(0)'s run). */
+      /* #177: downs 0 and 1 of an odd n ride the requant run. */
       moe_m1_q_run(pool, &m1q, moe_m1_requant_worker, &m1, n_active);
     } else {
       hvx_worker_pool_run(pool, moe_m1_requant_worker, &m1, n_active);
@@ -1647,9 +1671,16 @@ int hexkl_mm_u8i4_moe_layer_run(
       m1.u_hi = n_active * dn_ntiles;
       hvx_worker_pool_run(pool, moe_m1_down_worker, &m1, n_active * dn_ntiles);
     } else if (m1q.nq > 1u) {
-      /* #177: down slot (j - 1) & 3 is free after C(j - 1)'s join, so a
-         fifth or later expert's down D(j + 3) rides C(j)'s run. */
+      /* #185: at an even n, downs 2 and 3 (slab 1, free since the last
+         A's join) ride C(0) and C(1). #177: down slot (j - 1) & 3 is free
+         after C(j - 1)'s join, so a fifth or later expert's down D(j + 3)
+         rides C(j)'s run. At most two posts a run. */
       for (uint32_t j = 0; j < n_active; ++j) {
+        if (j < 2u && ((n_active - 1u) & 1u) && j + 2u < n_active) {
+          moe_m1_q_post(&m1q,
+                        vtcm_base + moe_m1_dn_off(j + 2u, gu_bytes, dn_bytes),
+                        m1.ex[j + 2u].d, inter_ktiles, dn_ntiles);
+        }
         if (j >= 1u && j + 3u < n_active) {
           moe_m1_q_post(&m1q,
                         vtcm_base + moe_m1_dn_off(j + 3u, gu_bytes, dn_bytes),
