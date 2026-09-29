@@ -90,6 +90,7 @@ typedef struct {
   uint16_t *et;          /**< fp16 [seq][64]: the exps, q heads in lanes */
   uint16_t *qs;          /**< fp16 [n_kv * gqa][head_dim][64]: q splats */
   uint16_t *kr;          /**< fp16 [n_kv][head_dim]: the new k rows */
+  uint16_t *exp_tab;     /**< fp16 [ATTN_M1_DET_EXP_N]: exp16 by index */
   size_t cache_halves;   /**< fp16 values in kt, and in v */
   hvx_worker_pool *pool; /**< borrowed; NULL runs every unit on the caller */
 } hvx_attn_m1_ctx;

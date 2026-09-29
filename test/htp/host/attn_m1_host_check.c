@@ -803,9 +803,38 @@ static void check_hf_prim(void) {
     }
   }
 
-  /* exp16 at every fp16 d <= 0: +0 and 0x8000 .. 0xFBFF. */
-  uint32_t n_exp = 0, bad_exp = 0;
+  /* exp16 at every fp16 d <= 0: +0 and 0x8000 .. 0xFBFF; since round 3
+     also the kernel's lookup there: hvx_hf_exp16_idx == the spec's index
+     and the fp16 table at it == exp16's bits (-inf included: 0xFC00). */
+  uint32_t n_exp = 0, bad_exp = 0, n_idx = 0, bad_idx = 0, bad_tab = 0;
   const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
+  uint16_t *tab_h = malloc(ATTN_M1_DET_EXP_N * sizeof(uint16_t));
+  float *tab_f = malloc(ATTN_M1_DET_EXP_N * sizeof(float));
+  hvx_hf_exp16_fill(tab_h, tab_f);
+  for (uint32_t base = 0x7FFFu; base <= 0xFC00u; base += 64u) {
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < 64u; ++i) {
+      const uint32_t x = base + i;
+      a[i] = x == 0x7FFFu ? 0u : x <= 0xFC00u ? (uint16_t)x : 0x8000u;
+      live += x <= 0xFC00u;
+    }
+    const HVX_Vector ix = hvx_hf_exp16_idx(hf_load(a));
+    for (uint32_t i = 0; i < live; ++i) {
+      const float d = amc_h2f(a[i]);
+      const uint16_t got = hvx_emu_h(&ix, (int)i);
+      bad_idx += got != attn_m1_det_exp_index(d);
+      bad_tab +=
+        got >= ATTN_M1_DET_EXP_N || tab_h[got] != amc_f2h(attn_m1_det_exp16(d));
+      ++n_idx;
+    }
+  }
+  free(tab_f);
+  free(tab_h);
+  printf("ATTN M1 HF PRIM exp16 lookup at every fp16 d <= 0 (%u): vector "
+         "index bad=%u, tab[index] != exp16 bad=%u\n",
+         n_idx, bad_idx, bad_tab);
+  CHECK(n_idx == 31746u, "the exp16 lookup swept %u values", n_idx);
+  CHECK(bad_idx + bad_tab == 0u, "the exp16 lookup differs from the spec");
   for (uint32_t base = 0x7FFFu; base < 0xFC00u; base += 64u) {
     uint32_t live = 0;
     for (uint32_t i = 0; i < 64u; ++i) {
@@ -849,7 +878,7 @@ static void check_hf_prim(void) {
   CHECK(bad_tree + bad_exp + bad_div == 0u,
         "the hf tree, exp16 or divide differs from the spec");
   if (bad_adv + bad_zs + bad_rnd + bad_tree + bad_exp + bad_div + bad_cvt +
-          bad_vcvt + bad_wid ==
+          bad_vcvt + bad_wid + bad_idx + bad_tab ==
         0u &&
       bad_op[0] + bad_op[1] + bad_op[2] + bad_op[3] + bad_op[4] + bad_op[5] ==
         0u &&

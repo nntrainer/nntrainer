@@ -48,6 +48,12 @@
  *                   plus exact f32 steps, so the sign of a zero and the
  *                   subnormals come through (no qf32 conversion on the
  *                   result; qf32 has no -0).
+ *   hvx_hf_exp16_fill / hvx_hf_exp16_idx  (#170 round 3) exp16 as a lookup:
+ *                   attn_m1_det_exp_table's values as fp16 bits, and the
+ *                   spec's attn_m1_det_exp_index as three integer ops on
+ *                   the hf lanes. The kernel gathers tab[idx(d)] with
+ *                   scalar loads; the host check proves tab[idx(d)] is
+ *                   exp16(d) bit for bit at every fp16 d <= 0.
  *
  * Widening and narrowing values already on the fp16 grid are exact both
  * ways. The host emulation (test/htp/host/hvx_emu) checks all of this
@@ -224,6 +230,29 @@ static inline HVX_Vector hvx_hf_exp16(HVX_Vector d, HVX_Vector one) {
   const HVX_VectorPair w = hvx_hf_widen(d, one);
   return hvx_hf_narrow(Q6_W_vcombine_VV(hvx_hf_exp16_sf(Q6_V_hi_W(w)),
                                         hvx_hf_exp16_sf(Q6_V_lo_W(w))));
+}
+
+/** @brief Fills ATTN_M1_DET_EXP_N fp16 bits of attn_m1_det_exp_table (the
+ *         entries are fp16 values, so the rounding is exact); @a tmp holds
+ *         ATTN_M1_DET_EXP_N floats. */
+static inline void hvx_hf_exp16_fill(uint16_t *tab, float *tmp) {
+  attn_m1_det_exp_table(tmp);
+  for (uint32_t i = 0; i < ATTN_M1_DET_EXP_N; ++i) {
+    tab[i] = hvx_hf_bits_rne(tmp[i]);
+  }
+}
+
+/**
+ * @brief attn_m1_det_exp_index on 64 hf lanes d <= 0. For a normal fp16
+ *        magnitude m (bits >= 0x400) the spec's (f32 bits >> 13) - BIAS is
+ *        m + 0x1C000 - 0x1C3FF = m - 1023; a zero or subnormal saturates to
+ *        0 (exp16 = 1), anything from 17.5 on clamps to LAST + 1 (0.0).
+ *        The sign bit is dropped (the domain is d <= 0, -0 gives 0).
+ */
+static inline HVX_Vector hvx_hf_exp16_idx(HVX_Vector d) {
+  const HVX_Vector mag = Q6_V_vand_VV(d, Q6_Vh_vsplat_R(0x7FFF));
+  return Q6_Vuh_vmin_VuhVuh(Q6_Vuh_vsub_VuhVuh_sat(mag, Q6_Vh_vsplat_R(1023)),
+                            Q6_Vh_vsplat_R((int)(ATTN_M1_DET_EXP_N - 1u)));
 }
 
 /**

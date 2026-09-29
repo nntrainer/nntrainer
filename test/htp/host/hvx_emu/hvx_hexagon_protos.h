@@ -516,4 +516,77 @@ static inline void Q6_l2fetch_AP(void *addr, uint64_t cfg) {
   (void)cfg;
 }
 
+/* ==== byte / halfword integer ops and vlut16 (#170 round 3) ===============
+ *
+ * Diffed against hexagon-sim -mv79 (128-byte mode) on iota and spread
+ * inputs before use (plan 170 round 3 section 3.2). vlut16: output
+ * halfword j of lo takes index byte i = Vu.b[2j], of hi i = Vu.b[2j + 1];
+ * it is Vv.h[2 (i & 15) + 32 (Rt & 1) + ((Rt >> 1) & 1)] when i >> 4 ==
+ * (Rt & 15), else 0 -- so a row stored zipped (vshuffe of two word
+ * vectors: halfword 2 (d & 31) + (d >> 5) holds element d) is read as
+ * element d by (i = d, Rt = d >> 4) for d < 64. vshuffe: halfword 2k is
+ * Vv's halfword 2k, 2k + 1 is Vu's halfword 2k. vsub_sat on unsigned
+ * halfwords clamps at 0; vmin unsigned; vsplat_b the low byte; vadd_b
+ * wraps. */
+
+static inline HVX_VectorPair Q6_Wh_vlut16_VbVhR(HVX_Vector u, HVX_Vector v,
+                                                int32_t rt) {
+  HVX_VectorPair w;
+  const uint8_t *ib = (const uint8_t *)u.w;
+  const int sel = 32 * (rt & 1) + ((rt >> 1) & 1);
+  for (int j = 0; j < 2 * HVX_EMU_LANES; ++j) {
+    const uint8_t i0 = ib[2 * j], i1 = ib[2 * j + 1];
+    hvx_emu_set_h(&w.lo, j,
+                  (i0 >> 4) == (rt & 15) ? hvx_emu_h(&v, 2 * (i0 & 15) + sel)
+                                         : 0u);
+    hvx_emu_set_h(&w.hi, j,
+                  (i1 >> 4) == (rt & 15) ? hvx_emu_h(&v, 2 * (i1 & 15) + sel)
+                                         : 0u);
+  }
+  return w;
+}
+
+static inline HVX_Vector Q6_Vb_vsplat_R(int32_t x) {
+  HVX_Vector r;
+  memset(r.w, (uint8_t)x, sizeof(r.w));
+  return r;
+}
+
+static inline HVX_Vector Q6_Vb_vadd_VbVb(HVX_Vector a, HVX_Vector b) {
+  HVX_Vector r;
+  const uint8_t *pa = (const uint8_t *)a.w, *pb = (const uint8_t *)b.w;
+  uint8_t *pr = (uint8_t *)r.w;
+  for (int i = 0; i < 4 * HVX_EMU_LANES; ++i) {
+    pr[i] = (uint8_t)(pa[i] + pb[i]);
+  }
+  return r;
+}
+
+static inline HVX_Vector Q6_Vuh_vsub_VuhVuh_sat(HVX_Vector a, HVX_Vector b) {
+  HVX_Vector r;
+  for (int i = 0; i < 2 * HVX_EMU_LANES; ++i) {
+    const uint16_t x = hvx_emu_h(&a, i), y = hvx_emu_h(&b, i);
+    hvx_emu_set_h(&r, i, x > y ? (uint16_t)(x - y) : 0u);
+  }
+  return r;
+}
+
+static inline HVX_Vector Q6_Vuh_vmin_VuhVuh(HVX_Vector a, HVX_Vector b) {
+  HVX_Vector r;
+  for (int i = 0; i < 2 * HVX_EMU_LANES; ++i) {
+    const uint16_t x = hvx_emu_h(&a, i), y = hvx_emu_h(&b, i);
+    hvx_emu_set_h(&r, i, x < y ? x : y);
+  }
+  return r;
+}
+
+static inline HVX_Vector Q6_Vh_vshuffe_VhVh(HVX_Vector u, HVX_Vector v) {
+  HVX_Vector r;
+  for (int k = 0; k < HVX_EMU_LANES; ++k) {
+    hvx_emu_set_h(&r, 2 * k, hvx_emu_h(&v, 2 * k));
+    hvx_emu_set_h(&r, 2 * k + 1, hvx_emu_h(&u, 2 * k));
+  }
+  return r;
+}
+
 #endif /* __NNTRAINER_HVX_EMU_HVX_HEXAGON_PROTOS_H__ */

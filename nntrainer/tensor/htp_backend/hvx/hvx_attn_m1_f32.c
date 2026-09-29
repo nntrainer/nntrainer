@@ -31,7 +31,10 @@
  *   P2 exp      same units: e = exp16(hf(s - m)) (masked lanes 0) back to
  *               S, and into ET[p][hq], one 128-byte row per position with
  *               the q heads in lanes 0 .. n_q - 1, by a 4-head transpose
- *               and masked vector stores (the caller l2fetched ET).
+ *               and masked vector stores (the caller l2fetched ET). Since
+ *               round 3 exp16 is the spec's checked table (37 KiB in the
+ *               ctx) at the spec's index, three integer ops per vector,
+ *               gathered by scalar loads for the unit's heads at once.
  *   caller      l: the CPU's sequential fp16 sum, all q heads at once: one
  *               hf add per position on the ET rows (lanes past n_q are 0).
  *   P3 PV       lane i of n takes a range of q-head chains (whole pairs
@@ -137,13 +140,18 @@ hvx_attn_m1_ctx *hvx_attn_m1_create(uint32_t n_layers, uint32_t n_kv,
   ctx->et = (uint16_t *)memalign(VLEN, (size_t)seq * VLEN);
   ctx->qs = (uint16_t *)memalign(VLEN, (size_t)n_q * HD * VLEN);
   ctx->kr = (uint16_t *)memalign(VLEN, (size_t)n_kv * HD * sizeof(uint16_t));
+  ctx->exp_tab = (uint16_t *)malloc(ATTN_M1_DET_EXP_N * sizeof(uint16_t));
+  float *tmp = (float *)malloc(ATTN_M1_DET_EXP_N * sizeof(float));
   if (!ctx->kv_len || !ctx->kt || !ctx->v || !ctx->s || !ctx->et || !ctx->qs ||
-      !ctx->kr) {
+      !ctx->kr || !ctx->exp_tab || !tmp) {
+    free(tmp);
     rc = AEE_ENOMEMORY;
     hvx_attn_m1_free(ctx);
     ctx = NULL;
     goto out;
   }
+  hvx_hf_exp16_fill(ctx->exp_tab, tmp);
+  free(tmp);
   /* Finite zeros wherever a tile or a sum row is read past the context;
      the lanes of ET past n_q stay 0 for good. */
   memset(ctx->kt, 0, (size_t)halves * sizeof(uint16_t));
@@ -160,6 +168,7 @@ void hvx_attn_m1_free(hvx_attn_m1_ctx *ctx) {
   if (!ctx) {
     return;
   }
+  free(ctx->exp_tab);
   free(ctx->kr);
   free(ctx->qs);
   free(ctx->et);
@@ -250,6 +259,12 @@ typedef struct {
 #endif
 #ifndef ATTN_M1_ET_LEAD
 #define ATTN_M1_ET_LEAD 1 /**< the caller: the ET rows P2 will write */
+#endif
+/* Round 3's two lookups (plan 170 round 3 sections 3.1-3.2), each the same
+   bits as round 2's form; 0 compiles round 2's form back for the S4 A/B
+   skel (r2w) and goes in the fold. */
+#ifndef ATTN_M1_EXP_TAB
+#define ATTN_M1_EXP_TAB 1 /**< P2: exp16 by the checked table */
 #endif
 /** @brief V rows per PV fetch block (16 KiB), S1's FETCH_L2F shape. */
 #define PV_BLOCK 128u
@@ -346,13 +361,44 @@ static void p2_unit(const forward_job *job, uint32_t u, prof_slot *ps) {
   const hvx_attn_m1_ctx *ctx = job->ctx;
   const uint32_t h = u / job->ntl, t = u % job->ntl;
   const uint32_t live = t + 1u == job->ntl ? job->n_live : TILE;
-  const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
   const HVX_VectorPred mask = Q6_Q_vsetq2_R((int)(live * 2u));
   HVX_Vector e[MAX_GQA];
   for (uint32_t g = 0; g < MAX_GQA; ++g) {
     e[g] = Q6_V_vzero();
   }
   const uint64_t t0 = ps ? HAP_perf_get_pcycles() : 0u;
+#if ATTN_M1_EXP_TAB
+  /* The unit's index vectors are stored first and gathered in one scalar
+     loop, then reloaded: the HVX-store -> scalar-load hazard is paid once
+     per unit, not per head (the v79 ISS: 225 vs 325 pcycles per vector). */
+  union {
+    HVX_Vector v[MAX_GQA];
+    uint16_t h[MAX_GQA * TILE];
+  } ix, ev;
+  for (uint32_t g = 0; g < ctx->gqa; ++g) {
+    const uint32_t hq = h * ctx->gqa + g;
+    const HVX_Vector *row =
+      (const HVX_Vector *)(ctx->s + (size_t)hq * ctx->seq + (size_t)t * TILE);
+    ix.v[g] =
+      hvx_hf_exp16_idx(Q6_Vhf_vsub_VhfVhf(*row, Q6_Vh_vsplat_R(job->m[hq])));
+  }
+  const uint16_t *restrict tab = ctx->exp_tab;
+  const uint32_t n_ix = ctx->gqa * TILE;
+#if defined(__hexagon__)
+#pragma unroll 8
+#endif
+  for (uint32_t i = 0; i < n_ix; ++i) {
+    ev.h[i] = tab[ix.h[i]];
+  }
+  for (uint32_t g = 0; g < ctx->gqa; ++g) {
+    const uint32_t hq = h * ctx->gqa + g;
+    HVX_Vector *row =
+      (HVX_Vector *)(ctx->s + (size_t)hq * ctx->seq + (size_t)t * TILE);
+    e[g] = live < TILE ? Q6_V_vmux_QVV(mask, ev.v[g], Q6_V_vzero()) : ev.v[g];
+    *row = e[g];
+  }
+#else
+  const HVX_Vector one = Q6_Vh_vsplat_R(HVX_HF_ONE);
   for (uint32_t g = 0; g < ctx->gqa; ++g) {
     const uint32_t hq = h * ctx->gqa + g;
     HVX_Vector *row =
@@ -364,6 +410,7 @@ static void p2_unit(const forward_job *job, uint32_t u, prof_slot *ps) {
     }
     *row = e[g];
   }
+#endif
   const uint64_t t1 = ps ? HAP_perf_get_pcycles() : 0u;
   HVX_Vector *et = (HVX_Vector *)ctx->et + (size_t)t * TILE;
   for (uint32_t g0 = 0; g0 < ctx->gqa; g0 += 4u) {
