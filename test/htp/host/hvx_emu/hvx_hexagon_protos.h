@@ -589,4 +589,55 @@ static inline HVX_Vector Q6_Vh_vshuffe_VhVh(HVX_Vector u, HVX_Vector v) {
   return r;
 }
 
+/* [#132 PR 2] the Q4_0 GEMV's integer part (hvx_q4_gemv_f32.c). */
+
+/* Vd.uh[i] = Vu.uh[i] >> Rt, halfword lanes. */
+static inline HVX_Vector Q6_Vuh_vlsr_VuhR(HVX_Vector a, int32_t n) {
+  HVX_Vector r;
+  uint16_t h[2 * HVX_EMU_LANES];
+  memcpy(h, a.w, sizeof(h));
+  for (int i = 0; i < 2 * HVX_EMU_LANES; ++i) {
+    h[i] = (uint16_t)(h[i] >> (n & 15));
+  }
+  memcpy(r.w, h, sizeof(h));
+  return r;
+}
+
+/* Vx.w[i] += sum_j Vu.ub[4i + j] * Rt.b[j]. */
+static inline HVX_Vector Q6_Vw_vrmpyacc_VwVubRb(HVX_Vector x, HVX_Vector u,
+                                                int32_t rt) {
+  HVX_Vector r;
+  const uint8_t *pu = (const uint8_t *)u.w;
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    int32_t s = 0;
+    for (int j = 0; j < 4; ++j) {
+      s += (int32_t)pu[4 * i + j] * (int32_t)(int8_t)(rt >> (8 * j));
+    }
+    r.w[i] = (int32_t)((uint32_t)x.w[i] + (uint32_t)s);
+  }
+  return r;
+}
+
+/* Vd.w[i] = Vu.w[i] * Vv.uh[2i] (the even unsigned halfword), low 32. */
+static inline HVX_Vector Q6_Vw_vmpyie_VwVuh(HVX_Vector a, HVX_Vector b) {
+  HVX_Vector r;
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    r.w[i] = (int32_t)((uint32_t)a.w[i] * (uint32_t)(b.w[i] & 0xffff));
+  }
+  return r;
+}
+
+/* Vdd.w = vunpack(Vu.h): sign-extended, in order -- lo gets halfwords
+   0..31, hi 32..63 (the prototype's d layout matched the v79 ISS so). */
+static inline HVX_VectorPair Q6_Ww_vunpack_Vh(HVX_Vector a) {
+  HVX_VectorPair r;
+  int16_t h[2 * HVX_EMU_LANES];
+  memcpy(h, a.w, sizeof(h));
+  for (int i = 0; i < HVX_EMU_LANES; ++i) {
+    r.lo.w[i] = h[i];
+    r.hi.w[i] = h[HVX_EMU_LANES + i];
+  }
+  return r;
+}
+
 #endif /* __NNTRAINER_HVX_EMU_HVX_HEXAGON_PROTOS_H__ */

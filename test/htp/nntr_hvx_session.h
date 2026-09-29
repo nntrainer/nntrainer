@@ -43,6 +43,17 @@
  *  three-word structs, so the slots cost nothing next to being wrong. */
 #define NNTR_HVX_MAX_ARENAS 32
 
+/** @brief [#132 PR 2] How many Q4M1 weights (q4m1_register) one session
+ *  holds at once: the shadow registers one FC or lm_head slice at a time,
+ *  the rate test one shape at a time; eight leaves room for both. */
+#define NNTR_HVX_Q4M1_SLOTS 8
+
+/** @brief One Q4M1 weight on the DSP heap (memalign 128). w NULL = free. */
+typedef struct {
+  uint8_t *w;
+  uint32_t K, N;
+} nntr_hvx_q4m1_slot;
+
 /** @brief One host rpcmem buffer as the DSP sees it. va NULL means free. */
 typedef struct {
   int fd;
@@ -73,6 +84,8 @@ typedef struct {
   struct nntr_hvx_dspq *dspq; /**< [#141] the MoE call's dspqueue thread
                                  (nntr_hvx_dspq.c); NULL = no queue.
                                  Stopped first in close() */
+  nntr_hvx_q4m1_slot q4m1[NNTR_HVX_Q4M1_SLOTS]; /**< [#132 PR 2] test
+                                 weights of fc_q4m1_f32, freed in close() */
 } nntr_hvx_session;
 
 /** @brief [#85] mm_u8i4_moe_layer_timed's stage table, shared with
@@ -88,6 +101,9 @@ int nntr_hvx_moe_stage_fill(uint32_t *stage_us, uint64_t t0, uint64_t t1,
  *  close() calls it first, while the tables the thread reads still exist.
  *  Lives in nntr_hvx_dspq.c. */
 void nntr_hvx_dspq_shutdown(nntr_hvx_session *s);
+
+/** @brief [#132 PR 2] Frees every Q4M1 slot. Lives in nntr_hvx_fc_q4.c. */
+void nntr_hvx_q4m1_free_all(nntr_hvx_session *s);
 
 /** @brief HAP_mmap_put on every attached arena. close() calls it after the
  *  weight tables are released, since a borrowed slot points into one. Lives

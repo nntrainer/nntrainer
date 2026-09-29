@@ -226,6 +226,18 @@ fi
 
 "$OUT/m1_ops_host_check"
 
+# The CPU-order Q4_0 FC (#132 PR 2): the spec q4_gemv_cpu_det.h against an
+# independent model of the Android CPU's quantizer and fused chain, six
+# mutants (Q4 GEMV CPU-ORDER OK), and the REAL DSP source hvx_q4_gemv_f32.c
+# on hvx_emu/ in all its variants against the spec (Q4 GEMV BIT-IDENTICAL).
+# gnu11 for _Float16, the host's own f16 conversions.
+"$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/q4_gemv_host_check" \
+  "$HERE/q4_gemv_host_check.c" "$BACKEND/hvx/hvx_q4_gemv_f32.c" -lm
+
+"$OUT/q4_gemv_host_check"
+
 # Decode attention at m=1 (#81, fp16 CPU order since #152): the spec
 # nntrainer/tensor/attn_m1_det.h against an independent _Float16 model of
 # the Android CPU attention with five mutants (ATTN M1 F16 CPU-ORDER OK);
