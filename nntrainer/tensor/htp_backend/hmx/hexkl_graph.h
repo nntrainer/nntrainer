@@ -126,7 +126,10 @@ typedef struct {
   uint8_t *act_buf;
   float *ffn;     /**< 3 x the widest DENSE_FFN N */
   float *logits;  /**< vocab floats: LM_HEAD's output, not a slot */
-  uint32_t lm_id; /**< m1_argmax_first of the last LM_HEAD's logits */
+  uint32_t lm_id; /**< m1_argmax_first of the last LM_HEAD's logits, the
+                       LM_BAN ids skipped */
+  uint32_t ban[HTP_GRAPH_MAX_BAN]; /**< [#132 Part B E3] LM_BAN's ids */
+  uint32_t n_ban;
 } hexkl_graph;
 
 /** @brief HTP_GRAPH_KIND_BIT mask of the kinds whose table slot is

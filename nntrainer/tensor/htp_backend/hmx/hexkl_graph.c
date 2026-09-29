@@ -30,6 +30,7 @@
 
 #include "hexkl_graph.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -300,7 +301,19 @@ static int graph_op_lm_head(hexkl_graph *g, const htp_graph_op *op,
   hvx_q4m1_prep(in, op->K, &g->act);
   rc = graph_q4m1_parts(g, op, call, op->h_gu, op->n_experts, g->logits);
   if (rc == AEE_SUCCESS) {
+    /* [#132 Part B E3] the banned ids at -inf for the pick only (the
+       CPU's applyBadWordsPenalty), put back in reverse so a repeated id
+       gets its own value again */
+    float keep[HTP_GRAPH_MAX_BAN];
+    uint32_t i;
+    for (i = 0; i < g->n_ban; ++i) {
+      keep[i] = g->logits[g->ban[i]];
+      g->logits[g->ban[i]] = -INFINITY;
+    }
     g->lm_id = m1_argmax_first(g->logits, op->N);
+    for (i = g->n_ban; i-- > 0;) {
+      g->logits[g->ban[i]] = keep[i];
+    }
   }
   return rc;
 }
@@ -517,6 +530,25 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
   }
   if (which >= HTP_GRAPH_PARAM_N || data == NULL) {
     return AEE_EBADITEM;
+  }
+  if (which == HTP_GRAPH_PARAM_LM_BAN) {
+    uint32_t i;
+    if (op >= g->n_ops || g->ops[op].kind != HTP_OP_LM_HEAD) {
+      return AEE_EBADITEM;
+    }
+    if (n > HTP_GRAPH_MAX_BAN) { /* 0 clears the list */
+      return AEE_EINVALIDFORMAT;
+    }
+    for (i = 0; i < n; ++i) {
+      uint32_t id;
+      memcpy(&id, &data[i], sizeof(id));
+      if (id >= g->ops[op].N) {
+        return AEE_EINVALIDFORMAT;
+      }
+      g->ban[i] = id;
+    }
+    g->n_ban = n;
+    return AEE_SUCCESS;
   }
   if (which == HTP_GRAPH_PARAM_ROPE_TABLE) {
     if (op != HTP_GRAPH_NO_OP) {

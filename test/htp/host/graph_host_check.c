@@ -1338,11 +1338,52 @@ static void check_q4m1(void) {
           g->lm_id == (best < r2 ? best : r2),
         "argmax tie: rows %u and %u, lm_id %u", best, r2, g->lm_id);
   err |= g->lm_id != (best < r2 ? best : r2);
+  /* [#132 Part B E3] LM_BAN: the pick skips the banned ids as the CPU's
+     bad-words penalty (-inf) does, the logits stay raw, a repeated id is
+     harmless; an id past N or a non-LM_HEAD op is refused */
+  {
+    float ban[3], lg[64], tmp[64];
+    uint32_t id, want;
+    memcpy(lg, out, sizeof(lg));
+    id = best < r2 ? best : r2;
+    memcpy(&ban[0], &id, 4u);
+    memcpy(&ban[1], &id, 4u);
+    id = (id + 5u) % 64u;
+    memcpy(&ban[2], &id, 4u);
+    rc =
+      (uint32_t)hexkl_graph_set_param(g, lm, HTP_GRAPH_PARAM_LM_BAN, ban, 3u);
+    CHECK(rc == 0u, "LM_BAN: %s", htp_graph_err_name(rc));
+    rc = (uint32_t)hexkl_graph_forward(g, &env, fin, 1000u, 0u, NULL, x, HID,
+                                       out, 64u, &resume);
+    memcpy(tmp, lg, sizeof(tmp));
+    tmp[best < r2 ? best : r2] = -INFINITY;
+    tmp[id] = -INFINITY;
+    want = m1_argmax_first(tmp, 64u);
+    CHECK(rc == 0u && memcmp(out, lg, sizeof(lg)) == 0 && g->lm_id == want &&
+            want == (best < r2 ? r2 : best),
+          "LM_BAN: lm_id %u, want %u (the tie's second), logits %s", g->lm_id,
+          want, memcmp(out, lg, sizeof(lg)) == 0 ? "raw" : "CHANGED");
+    err |= rc != 0u || memcmp(out, lg, sizeof(lg)) != 0 || g->lm_id != want ||
+           want != (best < r2 ? r2 : best);
+    id = 64u;
+    memcpy(&ban[0], &id, 4u);
+    rc =
+      (uint32_t)hexkl_graph_set_param(g, lm, HTP_GRAPH_PARAM_LM_BAN, ban, 1u);
+    CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "LM_BAN id 64 of 64: %s",
+          htp_graph_err_name(rc));
+    err |= rc != HTP_GRAPH_E_INVALIDFORMAT;
+    rc =
+      (uint32_t)hexkl_graph_set_param(g, fin, HTP_GRAPH_PARAM_LM_BAN, ban, 1u);
+    CHECK(rc == HTP_GRAPH_E_BADITEM, "LM_BAN on RMSNORM: %s",
+          htp_graph_err_name(rc));
+    err |= rc != HTP_GRAPH_E_BADITEM;
+  }
   hexkl_graph_free(g);
   if (err == 0)
     printf("GRAPH Q4M1 BIT-IDENTICAL: FC q|k|v (3 parts, feed passed) "
            "DENSE_FFN (up gate swiglu down) RMSNORM+LM_HEAD (2 slices, "
-           "argmax first of a tie) vs q4_gemv_cpu_det / m1_swiglu_cpu_det / "
+           "argmax first of a tie, LM_BAN skips its ids) vs q4_gemv_cpu_det / "
+           "m1_swiglu_cpu_det / "
            "m1_argmax_first (hd64 shape, the real HVX kernel on hvx_emu)\n");
 }
 

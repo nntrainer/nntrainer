@@ -153,7 +153,12 @@ static inline const char *htp_graph_kinds_str(uint32_t mask, char *buf,
  *  CONV1D_GATE; ROPE_TABLE is max_seq x 64 (cos[32] | sin[32] per
  *  position) with op == HTP_GRAPH_NO_OP; ROUTER_W is K x n_experts
  *  (the gate weight, row-major [K][E]) and ROUTER_BIAS n_experts for
- *  ROUTER_TOPK (#132). Append, never reorder. */
+ *  ROUTER_TOPK (#132). [#132 Part B E3] LM_BAN is 0..HTP_GRAPH_MAX_BAN
+ *  token ids (u32 bits in the f32 words, each < N; 0 clears) for LM_HEAD:
+ *  its argmax
+ *  skips them, as the CPU's bad-words penalty sets those logits to -inf
+ *  before its first-maximum pick; the logits themselves stay raw. A later
+ *  LM_BAN replaces the list. Append, never reorder. */
 enum {
   HTP_GRAPH_PARAM_GAMMA = 0,
   HTP_GRAPH_PARAM_CONV_W,
@@ -161,8 +166,11 @@ enum {
   HTP_GRAPH_PARAM_ROPE_TABLE,
   HTP_GRAPH_PARAM_ROUTER_W,
   HTP_GRAPH_PARAM_ROUTER_BIAS,
+  HTP_GRAPH_PARAM_LM_BAN,
   HTP_GRAPH_PARAM_N
 };
+/** @brief LM_BAN's longest list. */
+#define HTP_GRAPH_MAX_BAN 32u
 
 enum { HTP_GRAPH_LAYER_CONV = 0, HTP_GRAPH_LAYER_ATTN = 1 };
 enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
