@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -30,6 +31,7 @@
 #include <AEEStdErr.h>
 #include <remote.h>
 
+#include "../htp/host/q4_gemv_cases.h"
 #include "m1_ops_det.h"
 #include "nntr_hvx.h"
 #include "swiglu_det.h"
@@ -579,10 +581,12 @@ TEST_F(HvxM1Ops, ConvGateM1MatchesDetBitExact) {
  *        and 64 / E 4 / top 2 (the fixtures), on random, exact-tie and
  *        1-ulp near-tie rows (m1_ops_host_check's construction): logits,
  *        selection order and routing weights bit for bit against
- *        m1_router_topk_det. A bad count in logits alone puts the
- *        divergence in the GEMV; clean logits with bad weights put it in
- *        exp_det / recip_det; a bad selection with clean logits is the tie
- *        rule. 0x8000040e is a skel that predates the method (rule 3).
+ *        m1_router_cpu_det (the Android CPU's order since #132 PR 2). A bad
+ *        count in logits alone puts the divergence in the sffma chains;
+ *        clean logits with bad weights put it in the expf port / integer
+ *        divide on the DSP's scalar unit; a bad selection with clean logits
+ *        is the tie rule. 0x8000040e is a skel that predates the method
+ *        (rule 3).
  */
 TEST_F(HvxM1Ops, RouterTopkMatchesDetBitExact) {
   struct Shape {
@@ -632,9 +636,8 @@ TEST_F(HvxM1Ops, RouterTopkMatchesDetBitExact) {
           << " (0x8000040e = stale skel, rule 3)";
         std::vector<float> logits_ref(E), weight_ref(top_k);
         std::vector<uint32_t> sel_ref(top_k);
-        m1_router_topk_det(x.data(), w.data(), bias.data(), K, E, top_k,
-                           logits_ref.data(), sel_ref.data(),
-                           weight_ref.data());
+        m1_router_cpu_det(x.data(), w.data(), bias.data(), K, E, top_k,
+                          logits_ref.data(), sel_ref.data(), weight_ref.data());
         bad_logits += m1_count_bad(logits, logits_ref, "router logits");
         bad_weight += m1_count_bad(weight, weight_ref, "router weight");
         bad_sel += sel == sel_ref ? 0 : 1;
@@ -648,6 +651,263 @@ TEST_F(HvxM1Ops, RouterTopkMatchesDetBitExact) {
     EXPECT_EQ(bad_sel, 0) << "K " << K << ": the selection differs";
     EXPECT_EQ(bad_weight, 0) << "K " << K << ": routing weights differ";
   }
+}
+
+/* ---- [#132 PR 2] the CPU-exact Q4_0 FC and the CPU-order small ops ---- */
+
+class HvxFcQ4 : public HtpSession {};
+
+namespace {
+
+/** @brief fc_q4m1_f32's variant word (nntr_hvx.idl). */
+constexpr uint32_t FC_NATIVE = 0u, FC_INTRIN = 1u, FC_SFFMA = 2u,
+                   FC_FEED_VTCM = 1u << 16;
+
+struct FcVariant {
+  const char *name;
+  uint32_t word;
+};
+
+const FcVariant kFcVariants[5] = {{"hvx_native", FC_NATIVE},
+                                  {"hvx_intrin", FC_INTRIN},
+                                  {"sffma8", FC_SFFMA | (8u << 8)},
+                                  {"sffma16", FC_SFFMA | (16u << 8)},
+                                  {"sffma32", FC_SFFMA | (32u << 8)}};
+
+/** @brief A K x N canonical Q4_0 weight from q4_gemv_cases.h, registered
+ *         on the DSP as Q4M1. */
+struct FcWeight {
+  uint32_t K = 0, N = 0, h = 0;
+  std::vector<uint8_t> canon;
+};
+
+void fc_register(remote_handle64 handle, uint32_t K, uint32_t N, FcWeight *w) {
+  w->K = K;
+  w->N = N;
+  w->canon.resize(static_cast<size_t>(N) * (K / 32u) * 18u);
+  make_weights(w->canon.data(), K, N);
+  std::vector<uint8_t> m1(q4m1_bytes(K, N));
+  q4m1_from_q4_0(w->canon.data(), K, N, m1.data());
+  const int err = nntr_hvx_q4m1_register(handle, K, N, m1.data(),
+                                         static_cast<int>(m1.size()), &w->h);
+  ASSERT_EQ(err, AEE_SUCCESS) << "q4m1_register failed: " << hex(err)
+                              << " (0x8000040e = stale skel, rule 3)";
+}
+
+/** @brief The spec's output for x. */
+std::vector<float> fc_spec(const FcWeight &w, const std::vector<float> &x) {
+  std::vector<int8_t> q(w.K);
+  std::vector<uint16_t> d(w.K / 32u);
+  std::vector<float> y(w.N);
+  q8_0_quant_cpu_det(x.data(), w.K, q.data(), d.data());
+  q4_gemv_cpu_det(w.canon.data(), q.data(), d.data(), w.K, w.N, y.data());
+  return y;
+}
+
+/** @brief One fc_q4m1_f32 call; stats (8 words) out. */
+void fc_run(remote_handle64 handle, const FcWeight &w, uint32_t variant,
+            uint32_t lanes, uint32_t reps, const std::vector<float> &x,
+            std::vector<float> *y, std::vector<uint32_t> *stats) {
+  y->assign(w.N, 0.0f);
+  stats->assign(8, 0u);
+  const int err = nntr_hvx_fc_q4m1_f32(
+    handle, w.h, variant, lanes, reps, x.data(), static_cast<int>(w.K),
+    y->data(), static_cast<int>(w.N), stats->data(), 8);
+  ASSERT_EQ(err, AEE_SUCCESS) << "fc_q4m1_f32 failed: " << hex(err);
+}
+
+} // namespace
+
+/**
+ * @brief G1 (plan 132): the DSP's Q4_0 FC equals q4_gemv_cpu_det bit for
+ *        bit -- the five FC shapes, 8 rows each from q4_gemv_cases.h
+ *        (block magnitudes 2^-20 .. 2^20, zero / tiny / quantizer-edge
+ *        blocks; negative, f16-subnormal, zero and power-of-two d_w, an
+ *        exact cancellation), every kernel variant, both feeds, 6 lanes.
+ *        Bad hvx_native with clean hvx_intrin: the IEEE .sf instructions
+ *        are not RN on silicon (the plan's stop rule: fall back to the
+ *        intrinsics). Bad sffma*: the scalar sffma or the terms.
+ */
+TEST_F(HvxFcQ4, MatchesSpecBitExact) {
+  const uint32_t shapes[5][2] = {{2048u, 6144u},
+                                 {2048u, 2048u},
+                                 {2048u, 512u},
+                                 {7168u, 2048u},
+                                 {2048u, 7168u}};
+  int bad_total = 0;
+  for (const auto &sh : shapes) {
+    FcWeight w;
+    ASSERT_NO_FATAL_FAILURE(fc_register(handle_, sh[0], sh[1], &w));
+    std::vector<float> x(w.K), y;
+    std::vector<uint32_t> st;
+    for (const FcVariant &v : kFcVariants) {
+      for (uint32_t feed : {0u, FC_FEED_VTCM}) {
+        int bad = 0;
+        for (int r = 0; r < 8; ++r) {
+          make_row(x.data(), w.K, r % 4, r);
+          const std::vector<float> ref = fc_spec(w, x);
+          ASSERT_NO_FATAL_FAILURE(
+            fc_run(handle_, w, v.word | feed, 6u, 1u, x, &y, &st));
+          bad += m1_count_bad(y, ref, v.name);
+        }
+        std::cout << "FC_Q4_FIELD K=" << w.K << " N=" << w.N
+                  << " variant=" << v.name
+                  << " feed=" << (feed ? "vtcm" : "direct")
+                  << " rows=8 bad=" << bad << std::endl;
+        EXPECT_EQ(bad, 0) << v.name << " K=" << w.K << " N=" << w.N;
+        bad_total += bad;
+      }
+    }
+    EXPECT_EQ(nntr_hvx_q4m1_release(handle_, w.h), AEE_SUCCESS);
+  }
+  std::cout << "FC_Q4_FIELD total bad=" << bad_total << std::endl;
+}
+
+/** @brief The CPU-order quantizer, SwiGLU and argmax on the DSP's scalar
+ *         unit against their specs (q8_quant_f32, swiglu_cpu_f32,
+ *         argmax_f32). */
+TEST_F(HvxFcQ4, SmallOpsMatchSpec) {
+  int bad_q = 0, bad_s = 0, bad_a = 0;
+  for (uint32_t K : {2048u, 7168u}) {
+    std::vector<float> x(K);
+    std::vector<int8_t> q(K), q_ref(K);
+    std::vector<uint16_t> d(K / 32u), d_ref(K / 32u);
+    for (int r = 0; r < 8; ++r) {
+      make_row(x.data(), K, r % 4, r);
+      ASSERT_EQ(nntr_hvx_q8_quant_f32(handle_, x.data(), static_cast<int>(K),
+                                      q.data(), static_cast<int>(K), d.data(),
+                                      static_cast<int>(K / 32u)),
+                AEE_SUCCESS);
+      q8_0_quant_cpu_det(x.data(), K, q_ref.data(), d_ref.data());
+      bad_q += q != q_ref || d != d_ref;
+    }
+  }
+  std::mt19937 rng(0x13205u);
+  const uint32_t N = 7168u;
+  std::vector<float> y(N), z(N), o(N), o_ref(N);
+  for (int r = 0; r < 8; ++r) {
+    const float span = r < 3 ? 8.0f : r < 6 ? 100.0f : 1e4f;
+    std::uniform_real_distribution<float> yd(-span, span), zd(-4.0f, 4.0f);
+    for (uint32_t i = 0; i < N; ++i) {
+      y[i] = yd(rng);
+      z[i] = zd(rng);
+      if (r == 7)
+        y[i] = -cpu_det_float(
+          cpu_det_bits(static_cast<float>(
+            (static_cast<double>(static_cast<int>(i / 56u) - 127) - 0.5) /
+            1.4426950408889634)) +
+          (i % 56u) - 28u);
+    }
+    ASSERT_EQ(nntr_hvx_swiglu_cpu_f32(handle_, y.data(), static_cast<int>(N),
+                                      z.data(), static_cast<int>(N), o.data(),
+                                      static_cast<int>(N)),
+              AEE_SUCCESS);
+    m1_swiglu_cpu_det(y.data(), z.data(), o_ref.data(), N);
+    bad_s += m1_count_bad(o, o_ref, "swiglu_cpu");
+  }
+  std::vector<float> lg(128000);
+  std::uniform_real_distribution<float> ld(-20.0f, 20.0f);
+  for (int r = 0; r < 4; ++r) {
+    for (auto &v : lg)
+      v = ld(rng);
+    lg[1000u + 7u * r] = 50.0f; /* a tie: the first must win */
+    lg[90000u + r] = 50.0f;
+    uint32_t idx = 0;
+    ASSERT_EQ(nntr_hvx_argmax_f32(handle_, lg.data(),
+                                  static_cast<int>(lg.size()), &idx),
+              AEE_SUCCESS);
+    bad_a +=
+      idx != m1_argmax_first(lg.data(), 128000u) || idx != 1000u + 7u * r;
+  }
+  std::cout << "FC_Q4_FIELD small ops: q8_quant bad_rows=" << bad_q
+            << " swiglu_cpu bad=" << bad_s << " argmax bad=" << bad_a
+            << std::endl;
+  EXPECT_EQ(bad_q, 0);
+  EXPECT_EQ(bad_s, 0);
+  EXPECT_EQ(bad_a, 0);
+}
+
+/**
+ * @brief G3 (plan 132): the exact FC's rate on silicon, reported, not
+ *        gated (it feeds decision D). The per-token FC set of LFM2.5
+ *        (453 M weights) and the tied lm_head (262 M, measured as one
+ *        16384-row slice and scaled by 128000 / 16384), every variant,
+ *        weights read directly from the heap or fed to VTCM by per-lane
+ *        DMA (src_bypass), 1 / 2 / 4 / 6 lanes; 3 timed calls after one
+ *        warm-up. Per cell: us per call, cycles per (column, 32-block)
+ *        step per lane, GB/s; per variant, feed and lane count the
+ *        projected ms per token of the whole set (FC_RATE_PROJ). Every
+ *        output is bit-compared to the spec as well.
+ */
+TEST_F(HvxFcQ4, Rate) {
+  struct Shape {
+    uint32_t K, N;
+    double per_token;
+  };
+  const Shape shapes[6] = {
+    {2048u, 6144u, 18.0}, {2048u, 2048u, 30.0},
+    {2048u, 512u, 12.0},  {2048u, 7168u, 4.0},
+    {7168u, 2048u, 2.0},  {2048u, 16384u, 128000.0 / 16384.0}};
+  const uint32_t lane_set[4] = {1u, 2u, 4u, 6u};
+  // [variant][feed][lanes] -> ms per token (FC and lm_head), quant ms
+  double ms[5][2][4] = {}, ms_lm[5][2][4] = {}, ms_q[5][2][4] = {};
+  int bad_total = 0;
+  for (const Shape &sh : shapes) {
+    FcWeight w;
+    ASSERT_NO_FATAL_FAILURE(fc_register(handle_, sh.K, sh.N, &w));
+    std::vector<float> x(w.K), y;
+    std::vector<uint32_t> st;
+    make_row(x.data(), w.K, 0, 1);
+    const std::vector<float> ref = fc_spec(w, x);
+    const double steps = static_cast<double>(w.N) * (w.K / 32u);
+    const double gbytes = static_cast<double>(w.N) * w.K * 18.0 / 32.0;
+    for (int vi = 0; vi < 5; ++vi) {
+      for (int fi = 0; fi < 2; ++fi) {
+        for (int li = 0; li < 4; ++li) {
+          const uint32_t word = kFcVariants[vi].word | (fi ? FC_FEED_VTCM : 0u);
+          ASSERT_NO_FATAL_FAILURE(
+            fc_run(handle_, w, word, lane_set[li], 1u, x, &y, &st));
+          ASSERT_NO_FATAL_FAILURE(
+            fc_run(handle_, w, word, lane_set[li], 3u, x, &y, &st));
+          const int bad = m1_count_bad(y, ref, kFcVariants[vi].name);
+          bad_total += bad;
+          const double us = st[0] / 3.0, qus = st[1] / 3.0;
+          const double pcyc =
+            (static_cast<double>(st[3]) * 4294967296.0 + st[2]) / 3.0;
+          const double cyc_step = pcyc * st[4] / steps;
+          std::cout << std::fixed << std::setprecision(2) << "FC_RATE K=" << w.K
+                    << " N=" << w.N << " variant=" << kFcVariants[vi].name
+                    << " feed=" << (fi ? "vtcm" : "direct")
+                    << " lanes=" << st[4] << " us_per_call=" << us
+                    << " quant_us=" << qus << " pcyc_per_call=" << pcyc
+                    << " cyc_per_colstep_lane=" << cyc_step
+                    << " GBps=" << gbytes / (us * 1e3) << " bad=" << bad
+                    << std::defaultfloat << std::endl;
+          const double tok = sh.per_token * us / 1000.0;
+          if (w.N == 16384u)
+            ms_lm[vi][fi][li] += tok;
+          else
+            ms[vi][fi][li] += tok;
+          ms_q[vi][fi][li] += sh.per_token * qus / 1000.0;
+        }
+      }
+    }
+    EXPECT_EQ(nntr_hvx_q4m1_release(handle_, w.h), AEE_SUCCESS);
+  }
+  for (int vi = 0; vi < 5; ++vi)
+    for (int fi = 0; fi < 2; ++fi)
+      for (int li = 0; li < 4; ++li)
+        std::cout << std::fixed << std::setprecision(3)
+                  << "FC_RATE_PROJ variant=" << kFcVariants[vi].name
+                  << " feed=" << (fi ? "vtcm" : "direct")
+                  << " lanes=" << lane_set[li]
+                  << " ms_per_token=" << ms[vi][fi][li] + ms_lm[vi][fi][li]
+                  << " (fc=" << ms[vi][fi][li]
+                  << " lm_head=" << ms_lm[vi][fi][li]
+                  << ") quant_ms=" << ms_q[vi][fi][li]
+                  << " cpu_reference_ms=7.4" << std::defaultfloat << std::endl;
+  std::cout << "FC_RATE bad_total=" << bad_total << std::endl;
+  EXPECT_EQ(bad_total, 0);
 }
 
 TEST_F(HvxExp, RejectsNonVectorLength) {
