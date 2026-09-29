@@ -589,16 +589,17 @@ static uint32_t moe_tail_rows(uint32_t n_e) {
  * engine; the probe moves 1.3-1.7x more with 2-4 queues. So each matrix is
  * split by rows over the pool lanes, each lane issues its slice on its own
  * queue inside a pool run and polls it before the run joins (moe_m1_q_*):
- * GU(0) in a run of its own before the scan, every later push on the first
- * run after the join that frees its slab. The slabs, the GEMV units and
- * their order are unchanged, so the output is the same bytes.
+ * GU(0) in a workers-only job beside the scan and the pack (#185), every
+ * later push on the first run after the join that frees its slab. The slabs,
+ * the GEMV units and their order are unchanged, so the output is the same
+ * bytes.
  *
  * At 4 queues the call is DMA-bound (#185: ~21.5 MB at ~62 GB/s is ~76 %
  * of it), so the schedule's job is to keep the engines busy, not to hide
  * compute. The run table at n = 4 experts (the decode shape):
  *
  *   run    carries          dest            computes
- *   GU0    GU(0)            slab 0          -
+ *   GU0    GU(0)            slab 0          - (caller: scan + pack)
  *   A(0)   GU(1)            slab 1          A(0)
  *   A(1)   GU(2)            slab 0          A(1)
  *   A(2)   GU(3)            slab 1          A(2)
@@ -990,6 +991,20 @@ static void moe_m1_q_run(hvx_worker_pool *pool, moe_m1_qrun *q,
   q->inner_ctx = inner_ctx;
   hvx_worker_pool_run(pool, moe_m1_q_worker, q,
                       n_units > q->nq ? n_units : q->nq);
+  q->n_push = 0u;
+}
+
+/** @brief #185: the posted matrices as a workers-only job (no stage work):
+ *         the caller is free until moe_m1_q_join. Only when the pool has
+ *         nq workers, so every queue still gets a lane. */
+static void moe_m1_q_submit(hvx_worker_pool *pool, moe_m1_qrun *q) {
+  q->inner = NULL;
+  hvx_worker_pool_submit(pool, moe_m1_q_worker, q, q->nq);
+}
+
+/** @brief Waits for moe_m1_q_submit's job; every slice has landed after. */
+static void moe_m1_q_join(hvx_worker_pool *pool, moe_m1_qrun *q) {
+  hvx_worker_pool_wait(pool);
   q->n_push = 0u;
 }
 
@@ -1476,22 +1491,32 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint32_t gu_nchunk = 0u;
   /* The M=1 feed's ring indices: gate_up of expert i, down of expert j. */
   uint32_t m1_gu_idx[MOE_M1_MAX_EXPERTS], m1_dn_idx[MOE_M1_MAX_EXPERTS];
+  /* #185: GU(0) is a submitted job, joined after QUANT. */
+  int gu0_async = 0;
   if (!use_m1) {
     gu_nchunk = moe_push_gate_up_chunks(
       vtcm_base, L.w_gu_off, &tbl->slots[h_gate_up[order[0]]], k_tiles,
       gu_ntiles, inter_ntiles, half, 0u, gu_idx);
   } else if (m1_feed && m1q.nq > 1u) {
-    /* #177: GU(0) alone, in its own run (the pool is needed by the scan
-       next), so only it is exposed; GU(1) rides stage A(0)'s run. The
-       input copy above drained the ring, so the caller's engine is idle
-       for lane 0. DMA_FIRST times the whole transfer here. */
-    uint64_t pw = 0;
-    HEXKL_PROBE_T0(pw);
+    /* GU(0) alone; GU(1) rides stage A(0)'s run. #185: as a workers-only
+       job, so the caller runs the scan, the slot order and the pack below
+       (QUANT) while the queues move it, and joins it after QUANT; the scan
+       then takes no pool (the job holds it). A pool with fewer workers
+       than queues keeps #177's run of its own, the caller as lane 0 (the
+       input copy above drained the ring, so its engine is idle); that
+       run's DMA_FIRST times the whole transfer. */
     moe_m1_q_post(&m1q, vtcm_base + moe_m1_gu_off(0u, gu_bytes),
                   &tbl->slots[h_gate_up[order[0]]], k_tiles, gu_ntiles);
-    moe_m1_q_run(pool, &m1q, NULL, NULL, m1q.nq);
-    HEXKL_PROBE_ADD(HEXKL_PROBE_DMA_FIRST, pw);
-    HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_FIRST_KB, gu_bytes >> 10);
+    if (hvx_worker_pool_workers(pool) >= m1q.nq) {
+      moe_m1_q_submit(pool, &m1q);
+      gu0_async = 1;
+    } else {
+      uint64_t pw = 0;
+      HEXKL_PROBE_T0(pw);
+      moe_m1_q_run(pool, &m1q, NULL, NULL, m1q.nq);
+      HEXKL_PROBE_ADD(HEXKL_PROBE_DMA_FIRST, pw);
+      HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_FIRST_KB, gu_bytes >> 10);
+    }
   } else if (m1_feed) {
     /* One gate_up per slab, at the same point for the same reason: the
        scan and the pack are in front of them. Whole matrices (f2). */
@@ -1506,7 +1531,8 @@ int hexkl_mm_u8i4_moe_layer_run(
   /* The scan is per source row and independent of where a row ends up, so
      it still runs once over M rows. */
   HEXKL_PROBE_T0(p0);
-  hvx_quant_rows_u8_params(act_c, M, m_pad, K, scale_all, zp_all, pool);
+  hvx_quant_rows_u8_params(act_c, M, m_pad, K, scale_all, zp_all,
+                           gu0_async ? NULL : pool);
 
   /* Slot order: every active expert's rows, each expert padded up to a
      whole 64-row block. Padding slots repeat row 0 -- their accumulator
@@ -1567,6 +1593,16 @@ int hexkl_mm_u8i4_moe_layer_run(
       x->m = row_count[e];
     }
     HEXKL_PROBE_ADD(HEXKL_PROBE_QUANT, p0);
+    if (gu0_async) {
+      /* #185: DMA_FIRST times GU(0)'s remainder exposed after QUANT, as
+         the N = 1 ring's first wait does; before M1_FEED, which reads the
+         job's nq_used. */
+      uint64_t pw = 0;
+      HEXKL_PROBE_T0(pw);
+      moe_m1_q_join(pool, &m1q);
+      HEXKL_PROBE_ADD(HEXKL_PROBE_DMA_FIRST, pw);
+      HEXKL_PROBE_COUNT(HEXKL_PROBE_DMA_FIRST_KB, gu_bytes >> 10);
+    }
     m1.n_active = n_active;
     m1.k_tiles = k_tiles;
     m1.inter = inter;

@@ -729,6 +729,10 @@ static int g_q_ok = 1;
 static uint32_t g_q_cells;
 static uint64_t g_q_slices, g_q_lane_waits;
 static int g_last_rc; /* the M=1 call's return code, for the timeout case */
+/* #185: the N > 1 cells' run shape -- pool runs and submitted jobs per call
+   against the schedule's table (hexkl_mm_u8i4_moe.c, N DMA QUEUES). */
+static int g_ov_ok = 1;
+static uint32_t g_ov_cells;
 static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
                        uint32_t inter, uint32_t N_out, uint32_t NE,
                        const uint32_t *rc_, uint32_t slot0, uint8_t *vtcm,
@@ -806,6 +810,7 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   pf_reset();
   score_reset(feed != 0u, vtcm, vtcm_bytes);
   g_bypass_bytes = g_bypass_bad = 0u;
+  const uint32_t run0 = g_run, sub0 = g_submits;
   r = hexkl_mm_u8i4_moe_layer_run(&g_tbl, vtcm, vtcm_bytes, vtcm_bytes, M, K,
                                   inter, N_out, NE, hg, hd, ridx, rc_, rw, act,
                                   out_m1, NULL, scratch, gemv_flags);
@@ -914,6 +919,21 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
              (unsigned long long)cols);
       fail = 1;
     }
+    /* #185: GU(0) is one submitted job when the pool has a worker per
+       queue, else a run; then n A runs, run B and n C runs. */
+    const uint32_t want_sub = g_workers >= nq ? 1u : 0u;
+    const uint32_t want_runs = (1u - want_sub) + active + 1u + active;
+    const int ov_ok =
+      g_submits - sub0 == want_sub && g_run - run0 == want_runs + want_sub;
+    if (!ov_ok) {
+      printf("M1 GEMV shape=%s M=%u QUEUES=%u n=%u: %u runs, %u jobs (want "
+             "%u runs, %u jobs)\n",
+             shape, M, nq, active, g_run - run0 - (g_submits - sub0),
+             g_submits - sub0, want_runs, want_sub);
+      fail = 1;
+    }
+    g_ov_ok &= ov_ok;
+    ++g_ov_cells;
     g_q_ok &= q_ok && !fail;
     ++g_q_cells;
     g_q_slices += g_score_n;
@@ -1109,8 +1129,8 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
     float ref[64];
     for (uint32_t i = 0; i < 4u; ++i)
       rc_[(i * 5u) % NE] = 1u;
-    const int q_ok = g_q_ok;
-    const uint32_t q_cells = g_q_cells;
+    const int q_ok = g_q_ok, ov_ok = g_ov_ok;
+    const uint32_t q_cells = g_q_cells, ov_cells = g_ov_cells;
     const uint64_t q_slices = g_q_slices, q_waits = g_q_lane_waits;
     printf("-- injected lane timeout (the lines below are expected):\n");
     g_lane_timeout = 1;
@@ -1121,6 +1141,8 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
       ref, 0);
     g_lane_timeout = 0;
     g_q_ok = q_ok; /* the case's own mismatches are the expected ones */
+    g_ov_ok = ov_ok;
+    g_ov_cells = ov_cells;
     g_q_cells = q_cells;
     g_q_slices = q_slices;
     g_q_lane_waits = q_waits;
@@ -1152,6 +1174,13 @@ static int run_m1_cases(uint8_t *vtcm, size_t vtcm_bytes,
            f ? "WRONG" : "OK");
     fail |= f;
   }
+  if (g_ov_ok && g_ov_cells != 0u)
+    printf("M1 FEED OVERLAP OK (%u cells; GU(0) job beside QUANT; run B "
+           "always)\n",
+           g_ov_cells);
+  else
+    printf("M1 FEED OVERLAP WRONG (%u cells)\n", g_ov_cells);
+  fail |= !g_ov_ok || g_ov_cells == 0u;
   if (g_df_bad == 0u && g_df_seen != 0u)
     printf("M1 FEED DATAFLOW OK (%llu buffer accesses in feed runs; no "
            "cross-lane RAW/WAR/WAW inside a run)\n",
