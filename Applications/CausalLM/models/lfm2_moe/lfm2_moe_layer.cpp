@@ -159,14 +159,17 @@ static std::atomic<unsigned> g_moe_layer_count{0};
 
 /** @brief NNTR_MOE_PREFETCH=<k>: prefill reads the experts of the layers up
  *  to k ahead under the current layers' calls (doc 52 sections 10.10,
- *  10.20); 0 turns it off. Unset is 4 (section 10.26): warm, k made no
- *  difference, while a cold first prefill fell 2318 -> 935 ms at k=4.
- *  Where the pool has no room -- C=8 fits this layer's 32 and four more
- *  layers' in its 176 slots, C <= 3 not even one -- queuing just stops. */
+ *  10.20); 0 turns it off. Unset is every remaining layer (section 10.33):
+ *  the pool's room is the real limit -- C=8 fits this layer's 32 and four
+ *  more layers' in its 176 slots, C <= 3 not even one -- and where there is
+ *  none, queuing just stops. A cap of 4 (section 10.26) was the same at
+ *  C=8 but cost C=16 130 ms cold: its preload covers layers 0-10, so the
+ *  first layer with anything to read is 11, and a 4-layer horizon did not
+ *  start reading it until layer 7. */
 static int expertPrefetchDepth() {
   static const int k = [] {
     const char *v = std::getenv("NNTR_MOE_PREFETCH");
-    return v != nullptr ? std::max(0, std::atoi(v)) : 4;
+    return v != nullptr ? std::max(0, std::atoi(v)) : 1 << 20;
   }();
   return k;
 }
@@ -846,10 +849,11 @@ static bool tryMoeLayerOnAccelerator(
     // queues the ones layers up to NNTR_MOE_PREFETCH ahead lack, the
     // backend reads them while this and the following calls run, and each
     // layer registers its own batch -- between calls -- before it stages.
-    // Room comes from evicting outside this call's experts and the queued
-    // layers' resident ones, and the in-flight slots are held so no miss
-    // takes them; where there is no room the queue stops and resumes a
-    // layer later.
+    // Room comes from evicting outside this call's experts and every later
+    // layer's resident ones -- all of them are about to be used, and the
+    // slots that free up each layer are the finished layers' (section
+    // 10.33) -- and the in-flight slots are held so no miss takes them;
+    // where there is no room the queue stops and resumes a layer later.
     const int depth =
       experts_virtual && total_tokens > 1 && expert_layer_slot >= 0
         ? expertPrefetchDepth()
@@ -878,11 +882,11 @@ static bool tryMoeLayerOnAccelerator(
 
     if (depth > 0) {
       g_prefetch_next = std::max(g_prefetch_next, expert_layer_slot + 1);
-      const int last = std::min(expert_layer_slot + depth,
-                                static_cast<int>(g_expert_layers.size()) - 1);
+      const int n_layers = static_cast<int>(g_expert_layers.size());
+      const int last = std::min(expert_layer_slot + depth, n_layers - 1);
       for (; g_prefetch_next <= last; ++g_prefetch_next) {
         std::vector<causallm::ExpertLru::Key> pinned(need);
-        for (int l = expert_layer_slot + 1; l <= g_prefetch_next; ++l)
+        for (int l = expert_layer_slot + 1; l < n_layers; ++l)
           for (const ExpertFileDesc &d : g_expert_layers[l])
             if (g_expert_lru.resident(d.key_gu))
               pinned.push_back(d.key_gu);
