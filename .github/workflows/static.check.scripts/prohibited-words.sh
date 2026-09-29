@@ -58,7 +58,7 @@ for file in `cat $files`; do
       continue
   fi
   # Handle only text files among files in one commit.
-  if [[ `file $file | grep "ASCII text" | wc -l` -gt 0 ]]; then
+  if [[ `file $file | grep -E "(ASCII|Unicode) text" | wc -l` -gt 0 ]]; then
     case $file in
       # Declare source code files to inspect a prohibited word
       *.c | *.h | *.cpp | *.hpp| *.py | *.sh | *.php | *.md )
