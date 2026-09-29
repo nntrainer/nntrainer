@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -38,9 +39,11 @@
 #include "nntr_hvx.h"
 
 #include "../htp/host/attn_m1_cases.h"
+#include "../htp/nntr_attn_m1_probe.h"
 #include "attn_m1_det.h"
 #include "htp_rpc_bench.h"
 #include "mha_htp_host_model.h"
+#include "swiglu_det.h"
 
 namespace {
 
@@ -946,7 +949,7 @@ TEST_F(HvxAttnM1, RejectsBadShapes) {
 }
 
 /**
- * @brief The six lengths of the host check against attn_m1_det.h compiled
+ * @brief The eight lengths of the host check against attn_m1_det.h compiled
  *        into this binary, bit for bit, on a cache registered at the
  *        LFM2.5 shape and max_seq 2048 (the 48 MiB allocation of plan 81
  *        section 3.1, proved once here), with attn_m1_cases.h's rows: the
@@ -966,7 +969,7 @@ TEST_F(HvxAttnM1, MatchesDetSpecBitExact) {
   amc_rng rng{0x81000001u};
   std::vector<float> q, k, v, out, stats(2u * kM1Nq), out_ref, stats_ref;
   m1_fill_q(q, rng);
-  for (uint32_t L : {1u, 63u, 64u, 65u, 512u, 1024u}) {
+  for (uint32_t L : {1u, 63u, 64u, 65u, 512u, 513u, 1024u, 1536u}) {
     const uint32_t planted = m1_fill_kv(k, v, L, rng, &q);
     std::fill(stats.begin(), stats.end(), 0.0f);
     err = m1_run(handle_, layer, q, k, v, L, &out, &stats);
@@ -1086,24 +1089,25 @@ constexpr const char *kM1StaleProf =
 
 } // namespace
 
-/** @brief The per-layer forward cost at pos 511 and 1023 (median of 10
- *         calls, host-timed, transport included): the first read of plan
+/** @brief The per-layer forward cost at pos 511, 1023 and 1535 (median of
+ *         10 calls, host-timed, transport included): the first read of plan
  *         81 section 0's 0.5 / 1.0 ms per token estimate for 6 layers.
  *         Printed, not asserted. Since #146 each position also prints the
  *         phase split of 10 more calls with the words requested (warm: the
- *         same layer every call), and then the same two positions COLD: 6
+ *         same layer every call), and then the same positions COLD: 6
  *         layers at max_seq 2048 and the layer rotated per call, so each
  *         call's slab (4.19 MB at pos 1023) was evicted by the other five,
  *         as in the model (plan 146 section 3.1). The cold us= is taken
- *         with the words requested; the warm us= line is unchanged. */
+ *         with the words requested; the warm us= line is unchanged. Since
+ *         #170 the warm cache is max_seq 2048 too (pos 1535 needs it). */
 TEST_F(HvxAttnM1, PerLayerCost) {
-  int err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 1024u);
+  int err = nntr_hvx_attn_m1_register(handle_, 2u, kM1Kv, kM1Gqa, kM1Hd, 2048u);
   ASSERT_EQ(err, AEE_SUCCESS) << "register: " << hex(err);
   amc_rng rng{0x81000003u};
   std::vector<float> q, k, v, out((size_t)kM1Nq * kM1Hd);
   m1_fill_q(q, rng);
   const size_t row = (size_t)kM1Kv * kM1Hd;
-  for (uint32_t L : {512u, 1024u}) {
+  for (uint32_t L : {512u, 1024u, 1536u}) {
     m1_fill_kv(k, v, L, rng);
     err = nntr_hvx_attn_m1_kv_append(handle_, 0u, 0u, L - 1u, k.data(),
                                      (int)((L - 1u) * row), v.data(),
@@ -1135,7 +1139,7 @@ TEST_F(HvxAttnM1, PerLayerCost) {
   err =
     nntr_hvx_attn_m1_register(handle_, kLayers, kM1Kv, kM1Gqa, kM1Hd, 2048u);
   ASSERT_EQ(err, AEE_SUCCESS) << "register 6 x 2048: " << hex(err);
-  for (uint32_t L : {512u, 1024u}) {
+  for (uint32_t L : {512u, 1024u, 1536u}) {
     m1_fill_kv(k, v, L, rng);
     for (uint32_t layer = 0; layer < kLayers; ++layer) {
       err = nntr_hvx_attn_m1_kv_append(handle_, layer, 0u, L - 1u, k.data(),
@@ -1166,6 +1170,297 @@ TEST_F(HvxAttnM1, PerLayerCost) {
     m1_print_phase(L - 1u, "cold", calls);
   }
   EXPECT_EQ(nntr_hvx_attn_m1_release(handle_), AEE_SUCCESS);
+}
+
+/* ---- [#170] the fp16-lane primitives on silicon (plan 170 step 1, S1) --- */
+
+class HvxAttnM1Probe : public HtpSession {};
+
+namespace {
+
+/** @brief One semantics op of attn_m1_probe over a.size() lanes (padded
+ *         to a multiple of 64 with lane 0's operands). */
+int probe_sem(remote_handle64 h, uint32_t op, std::vector<uint16_t> a,
+              std::vector<uint16_t> b, std::vector<uint16_t> c,
+              std::vector<uint16_t> *y) {
+  const size_t n = a.size(), np = (n + 63u) / 64u * 64u;
+  a.resize(np, a[0]);
+  b.resize(np, b[0]);
+  c.resize(np, c[0]);
+  y->assign(np, 0u);
+  const int err =
+    nntr_hvx_attn_m1_probe(h, op, 1u, 1u, a.data(), (int)np, b.data(), (int)np,
+                           c.data(), (int)np, y->data(), (int)np, nullptr, 0);
+  y->resize(n);
+  return err;
+}
+
+/** @brief hvx_hf_fma on (c, a, b) triples against attn_m1_det_fma16, bit
+ *         for bit; triples whose fused result is past 65504 are skipped.
+ *         Prints the ATTN_M1_PROBE qfma line; returns the bad count. */
+int probe_qfma(remote_handle64 h, const char *name,
+               const std::vector<uint16_t> &c, const std::vector<uint16_t> &a,
+               const std::vector<uint16_t> &b) {
+  std::vector<uint16_t> y;
+  const int err = probe_sem(h, ATTN_M1_PROBE_QFMA, a, b, c, &y);
+  EXPECT_EQ(err, AEE_SUCCESS)
+    << "attn_m1_probe qfma: " << hex(err) << " (0x8000040e = stale skel)";
+  if (err != AEE_SUCCESS) {
+    return -1;
+  }
+  int n = 0, hz = 0, sub = 0, bad = 0;
+  for (size_t i = 0; i < c.size(); ++i) {
+    const float fc = amc_h2f(c[i]), fa = amc_h2f(a[i]), fb = amc_h2f(b[i]);
+    const float ref = attn_m1_det_fma16(fc, fa, fb);
+    if (std::fabs(ref) > 65504.0f) {
+      continue;
+    }
+    ++n;
+    hz += amc_is_midpoint_case(fc, fa, fb);
+    sub += std::fabs(ref) < std::ldexp(1.0f, -14);
+    if (y[i] != amc_f2h(ref)) {
+      if (bad < 4) {
+        std::cout << "ATTN_M1_PROBE qfma " << name << " mismatch c=" << std::hex
+                  << c[i] << " a=" << a[i] << " b=" << b[i] << " got=" << y[i]
+                  << " want=" << amc_f2h(ref) << std::dec << std::endl;
+      }
+      ++bad;
+    }
+  }
+  std::cout << "ATTN_M1_PROBE qfma " << name << " n=" << n << " hazards=" << hz
+            << " subnormal=" << sub << " bad=" << bad << std::endl;
+  return bad;
+}
+
+/** @brief The case file of tools/htp/attn_fma_cases.py: uint16 (c, a, b)
+ *         triples from #136's dump_attn. NNTR_ATTN_FMA_CASES, else
+ *         ./attn_fma_cases.bin. */
+bool read_fma_cases(std::vector<uint16_t> *c, std::vector<uint16_t> *a,
+                    std::vector<uint16_t> *b, std::string *path) {
+  const char *env = std::getenv("NNTR_ATTN_FMA_CASES");
+  *path = env ? env : "attn_fma_cases.bin";
+  FILE *f = std::fopen(path->c_str(), "rb");
+  if (!f) {
+    return false;
+  }
+  uint16_t t[3];
+  while (std::fread(t, sizeof(uint16_t), 3, f) == 3) {
+    c->push_back(t[0]);
+    a->push_back(t[1]);
+    b->push_back(t[2]);
+  }
+  std::fclose(f);
+  return !c->empty();
+}
+
+} // namespace
+
+/**
+ * @brief G1 of plan 170: hvx_attn_m1_hf.h on silicon against attn_m1_det.h
+ *        compiled into this binary, bit for bit.
+ *   - qfma, the one-rounding FMA: the #136-derived case file (every
+ *     double-rounding hazard and inexact midpoint of a real-data replay,
+ *     plus a sample), attn_m1_cases.h's adversarial (76,800) and zero /
+ *     sign (25,600) families. Its bad=0 is what the design rests on
+ *     (plan 170 step 2's stop rule).
+ *   - hf add / sub / mul / max, * 0.125 and 0 + x over every finite fp16
+ *     a x 4 random b (max by value).
+ *   - exp16 (the vector exp_ps) at all 31,745 fp16 d <= 0.
+ *   - div16 on the host check's hard quotients (rne16(e * recip_det(l))
+ *     off by one, or e / l a tie), found here with swiglu_det_recip, the
+ *     scalar twin of hvx_recip_det_sf.
+ * Each row prints an ATTN_M1_PROBE line; every row is also asserted.
+ */
+TEST_F(HvxAttnM1Probe, Semantics) {
+  std::vector<uint16_t> c, a, b, y;
+  std::string path;
+  ASSERT_TRUE(read_fma_cases(&c, &a, &b, &path))
+    << "no fma case file at " << path
+    << " (tools/htp/attn_fma_cases.py; set NNTR_ATTN_FMA_CASES)";
+  EXPECT_EQ(probe_qfma(handle_, "cases", c, a, b), 0);
+  amc_rng r{0x17000001u};
+  c.assign(76800u, 0u), a.assign(76800u, 0u), b.assign(76800u, 0u);
+  for (uint32_t i = 0; i < 76800u; ++i) {
+    amc_fma_adversarial(&r, i, &c[i], &a[i], &b[i]);
+  }
+  EXPECT_EQ(probe_qfma(handle_, "adversarial", c, a, b), 0);
+  c.assign(25600u, 0u), a.assign(25600u, 0u), b.assign(25600u, 0u);
+  for (uint32_t i = 0; i < 25600u; ++i) {
+    amc_fma_zero_sign(&r, &c[i], &a[i], &b[i]);
+  }
+  EXPECT_EQ(probe_qfma(handle_, "zero_sign", c, a, b), 0);
+
+  /* hf ops: every finite fp16 a (both signs) x 4 random b */
+  a.clear(), b.clear();
+  for (uint32_t rep = 0; rep < 4u; ++rep) {
+    for (uint32_t x = 0; x < 2u * 0x7C00u; ++x) {
+      a.push_back((uint16_t)(((x & 1u) << 15) | (x >> 1)));
+      const uint32_t k = amc_next(&r);
+      b.push_back(
+        (uint16_t)((k & 0x8000u) | ((k & 3u) == 0u ? 0u : (k >> 2) % 0x7C00u)));
+    }
+  }
+  static const struct {
+    uint32_t op;
+    const char *name;
+  } kOps[] = {
+    {ATTN_M1_PROBE_ADD, "add"},         {ATTN_M1_PROBE_SUB, "sub"},
+    {ATTN_M1_PROBE_MUL, "mul"},         {ATTN_M1_PROBE_MAX, "max"},
+    {ATTN_M1_PROBE_EIGHTH, "mul0.125"}, {ATTN_M1_PROBE_ZPLUS, "zero_plus"}};
+  for (const auto &o : kOps) {
+    const int err = probe_sem(handle_, o.op, a, b, a, &y);
+    ASSERT_EQ(err, AEE_SUCCESS) << o.name << ": " << hex(err);
+    int n = 0, bad = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+      const float x = amc_h2f(a[i]), z = amc_h2f(b[i]);
+      float ref = 0.0f;
+      switch (o.op) {
+      case ATTN_M1_PROBE_ADD:
+        ref = attn_m1_det_rne16(attn_m1_det_add(x, z));
+        break;
+      case ATTN_M1_PROBE_SUB:
+        ref = attn_m1_det_rne16(attn_m1_det_sub(x, z));
+        break;
+      case ATTN_M1_PROBE_MUL:
+        ref = attn_m1_det_rne16(attn_m1_det_mul(x, z));
+        break;
+      case ATTN_M1_PROBE_MAX:
+        ref = x > z ? x : z;
+        break;
+      case ATTN_M1_PROBE_EIGHTH:
+        ref = attn_m1_det_rne16(attn_m1_det_mul(x, 0.125f));
+        break;
+      default:
+        ref = attn_m1_det_add(0.0f, x);
+        break;
+      }
+      if (std::fabs(ref) > 65504.0f) {
+        continue;
+      }
+      ++n;
+      bad +=
+        o.op == ATTN_M1_PROBE_MAX ? amc_h2f(y[i]) != ref : y[i] != amc_f2h(ref);
+    }
+    std::cout << "ATTN_M1_PROBE hf " << o.name << " n=" << n << " bad=" << bad
+              << std::endl;
+    EXPECT_EQ(bad, 0) << o.name;
+  }
+
+  /* exp16 at every fp16 d <= 0: +0, then -0 .. -65504 */
+  a.assign(1u, 0u);
+  for (uint32_t x = 0x8000u; x < 0xFC00u; ++x) {
+    a.push_back((uint16_t)x);
+  }
+  ASSERT_EQ(probe_sem(handle_, ATTN_M1_PROBE_EXP16, a, a, a, &y), AEE_SUCCESS);
+  int bad_exp = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    bad_exp += y[i] != amc_f2h(attn_m1_det_exp16(amc_h2f(a[i])));
+  }
+  std::cout << "ATTN_M1_PROBE exp16 n=" << a.size() << " bad=" << bad_exp
+            << std::endl;
+  EXPECT_EQ(bad_exp, 0);
+
+  /* div16 on the hard quotients of l in [1, 2048], e in [0, l] */
+  a.clear(), b.clear();
+  std::vector<uint16_t> want;
+  for (uint32_t lb = 0x3C00u; lb <= 0x6800u; ++lb) {
+    const float l = amc_h2f((uint16_t)lb), rc = swiglu_det_recip(l);
+    for (uint32_t eb = 0; eb < 0x7C00u; ++eb) {
+      const float e = amc_h2f((uint16_t)eb);
+      if (e > l) {
+        break;
+      }
+      const float w = attn_m1_det_rne16(attn_m1_det_div(e, l));
+      const float c0 = attn_m1_det_rne16(attn_m1_det_mul(e, rc));
+      const double q = (double)e / (double)l;
+      const float qf = (float)q;
+      const bool tie = (double)qf == q && attn_m1_det_rne16(qf) != qf &&
+                       (qf >= std::ldexp(1.0f, -14)
+                          ? (attn_m1_det_bits(qf) & 0x1FFFu) == 0x1000u
+                          : std::fmod(q * 33554432.0, 2.0) == 1.0);
+      if (c0 != w || tie) {
+        a.push_back((uint16_t)eb);
+        b.push_back((uint16_t)lb);
+        want.push_back(amc_f2h(w));
+      }
+    }
+  }
+  ASSERT_FALSE(a.empty());
+  ASSERT_EQ(probe_sem(handle_, ATTN_M1_PROBE_DIV16, a, b, a, &y), AEE_SUCCESS);
+  int bad_div = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    bad_div += y[i] != want[i];
+  }
+  std::cout << "ATTN_M1_PROBE div16 hard n=" << a.size() << " bad=" << bad_div
+            << std::endl;
+  EXPECT_EQ(bad_div, 0);
+
+  /* a length that is not a multiple of 64: the entry's own check */
+  std::vector<uint16_t> s63(63u, 0u);
+  const int err = nntr_hvx_attn_m1_probe(
+    handle_, ATTN_M1_PROBE_ADD, 1u, 1u, s63.data(), 63, s63.data(), 63,
+    s63.data(), 63, s63.data(), 63, nullptr, 0);
+  EXPECT_EQ(err, AEE_EINVALIDFORMAT + kDspOffset) << "n=63: " << hex(err);
+}
+
+/**
+ * @brief The cost side of S1 (plan 170 step 2 cell (b)): each cost op at
+ *        1 / 2 / 4 / 6 pool lanes, one warm-up run then `reps` timed runs.
+ *        pcyc_per_fma64 is the wall pcycles per 64-lane FMA of all lanes
+ *        together (the throughput the cost model needs); lane_pcyc_per_fma64
+ *        is the lane-summed pcycles per FMA (#152's 24.6 for today's loop at
+ *        6 lanes, 32-lane FMAs counted in pairs); mhz is the pcycles per
+ *        qtimer microsecond; gbps the FETCH pair's read rate. Printed, not
+ *        asserted, except that each call succeeds on the lanes asked for.
+ */
+TEST_F(HvxAttnM1Probe, Cost) {
+  static const struct {
+    uint32_t op;
+    const char *name;
+    uint32_t reps;
+  } kOps[] = {{ATTN_M1_PROBE_FMA16_SF, "fma16_sf", 20u},
+              {ATTN_M1_PROBE_SCORES1, "scores1", 20u},
+              {ATTN_M1_PROBE_SCORES2, "scores2", 20u},
+              {ATTN_M1_PROBE_PV4, "pv4", 20u},
+              {ATTN_M1_PROBE_FETCH, "fetch", 5u},
+              {ATTN_M1_PROBE_FETCH_L2F, "fetch_l2f", 5u}};
+  for (const auto &o : kOps) {
+    for (uint32_t lanes : {1u, 2u, 4u, 6u}) {
+      std::vector<uint32_t> w(ATTN_M1_PROBE_WORDS, 0u);
+      int err = AEE_SUCCESS;
+      for (uint32_t reps : {1u, o.reps}) { /* warm-up, then timed */
+        err = nntr_hvx_attn_m1_probe(handle_, o.op, lanes, reps, nullptr, 0,
+                                     nullptr, 0, nullptr, 0, nullptr, 0,
+                                     w.data(), (int)w.size());
+        ASSERT_EQ(err, AEE_SUCCESS) << o.name << " lanes=" << lanes << ": "
+                                    << hex(err) << " (0x8000040e = stale skel)";
+      }
+      auto w64 = [&](uint32_t i) {
+        return (double)w[i] + 4294967296.0 * (double)w[i + 1u];
+      };
+      const double wall = w64(ATTN_M1_PROBE_W_WALL);
+      const double us = w64(ATTN_M1_PROBE_W_QT) / 19.2;
+      const double busy = w64(ATTN_M1_PROBE_W_BUSY_SUM);
+      const double n_fma = (double)w[ATTN_M1_PROBE_W_FMA64] *
+                           w[ATTN_M1_PROBE_W_LANES] * w[ATTN_M1_PROBE_W_REPS];
+      const double bytes = (double)w[ATTN_M1_PROBE_W_BYTES] *
+                           w[ATTN_M1_PROBE_W_LANES] * w[ATTN_M1_PROBE_W_REPS];
+      std::cout << "ATTN_M1_PROBE_COST op=" << o.name << " lanes=" << lanes
+                << " ran=" << w[ATTN_M1_PROBE_W_LANES]
+                << " reps=" << w[ATTN_M1_PROBE_W_REPS];
+      if (n_fma > 0.0) {
+        std::cout << " pcyc_per_fma64=" << wall / n_fma
+                  << " lane_pcyc_per_fma64=" << busy / n_fma;
+      }
+      if (bytes > 0.0) {
+        std::cout << " gbps=" << bytes / (us * 1e3);
+      }
+      std::cout << " mhz=" << (us > 0.0 ? wall / us : 0.0) << " us=" << us
+                << " busy_max=" << w[ATTN_M1_PROBE_W_BUSY_MAX]
+                << " sink=" << w[ATTN_M1_PROBE_W_SINK] << std::endl;
+      EXPECT_EQ(w[ATTN_M1_PROBE_W_LANES], lanes) << o.name;
+    }
+  }
 }
 
 int main(int argc, char **argv) {
