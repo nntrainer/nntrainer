@@ -46,10 +46,14 @@
  *     h = d * 0.5f
  *     three times: t = h*y; t = t*y; t = 1.5f - t; y = y*t
  *
- *   rope64_det(x[64], cs[64]),  cs = cos[0..31] | sin[0..31], i < 32:
- *     a = x[i]; b = x[i + 32]
- *     x[i]      = (a*c) - (b*s)
- *     x[i + 32] = (a*s) + (b*c)                (neon_impl.cpp's formula)
+ *   rope64_det(x[64], cs[64]),  cs = cos[0..31] | sin[0..31], i < 32 --
+ *   in fp16, the Android CPU's compute_rotary_emb_value(__fp16) (#152;
+ *   rne16 is attn_m1_det.h's, the operands its copyData / (_FP16) casts):
+ *     a = rne16(x[i]); b = rne16(x[i + 32]); c = rne16(cs[i]);
+ *     s = rne16(cs[i + 32])
+ *     x[i]      = rne16(rne16(a*c) - rne16(b*s))
+ *     x[i + 32] = rne16(rne16(a*s) + rne16(b*c))
+ *   (fmul / fsub / fadd .8h, each rounded; no fmla in that loop)
  *
  *   conv_gate_m1_det(abc[3C], state[2C], w[3C], out[C]):
  *     g   = a*c                                (the in_proj split a | b | c)
@@ -98,6 +102,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "attn_m1_det.h"
 #include "swiglu_det.h"
 
 /** @brief f32 lanes in one 128-byte HVX vector; the reduction's width. */
@@ -209,12 +214,20 @@ static inline void m1_rmsnorm_det(const float *x, const float *gamma, float *y,
   }
 }
 
-/** @brief RoPE on one head of 64, in place. cs = cos[32] | sin[32]. */
+/** @brief RoPE on one head of 64 in fp16, in place. cs = cos[32] |
+ *         sin[32] in f32 (the table the host uploads); the output is fp16
+ *         values in f32. */
 static inline void m1_rope64_det(float *x, const float *cs) {
   for (uint32_t i = 0; i < M1_DET_HEAD_DIM / 2u; ++i) {
-    const float a = x[i], b = x[i + 32], c = cs[i], s = cs[i + 32];
-    x[i] = m1_det_sub(m1_det_mul(a, c), m1_det_mul(b, s));
-    x[i + 32] = m1_det_add(m1_det_mul(a, s), m1_det_mul(b, c));
+    const float a = attn_m1_det_rne16(x[i]);
+    const float b = attn_m1_det_rne16(x[i + 32]);
+    const float c = attn_m1_det_rne16(cs[i]);
+    const float s = attn_m1_det_rne16(cs[i + 32]);
+    x[i] = attn_m1_det_rne16(m1_det_sub(attn_m1_det_rne16(m1_det_mul(a, c)),
+                                        attn_m1_det_rne16(m1_det_mul(b, s))));
+    x[i + 32] =
+      attn_m1_det_rne16(m1_det_add(attn_m1_det_rne16(m1_det_mul(a, s)),
+                                   attn_m1_det_rne16(m1_det_mul(b, c))));
   }
 }
 

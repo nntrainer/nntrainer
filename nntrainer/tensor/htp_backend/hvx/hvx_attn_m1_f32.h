@@ -4,34 +4,39 @@
  *
  * @file   hvx_attn_m1_f32.h
  * @date   27 Sep 2026
- * @brief  Decode attention at m=1 on HVX with a DSP-resident f32 KV cache,
- *         bit-identical to nntrainer/tensor/attn_m1_det.h
+ * @brief  Decode attention at m=1 on HVX with a DSP-resident KV cache of
+ *         fp16 values in f32, bit-identical to nntrainer/tensor/attn_m1_det.h
+ *         (the Android fp16 CPU attention)
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
  *
  * The specification, its operation order and its domain live in
- * attn_m1_det.h; this file implements it in plain Vsf (no qf32, no sf FMA --
- * HVX has none) over a cache object the session owns (plan 81 section 3.1):
+ * attn_m1_det.h; this file implements it in plain Vsf and word ops (no
+ * qf32, no hf, no sf FMA -- HVX has none; the fused fp16 FMA is built from
+ * an exact product, TwoSum and round-to-odd) over a cache object the
+ * session owns (plan 81 section 3.1, plan 152 section 3.3):
  *
  *   Kt [n_layers][n_kv][head_dim][max_seq]   one 128-B vector = 32 positions
  *   V  [n_layers][n_kv][max_seq][head_dim]   one position = head_dim/32 vectors
  *
- * both f32 on the DSP heap, 128-byte aligned, zero-filled at create so the
- * lanes past the context in the last block read finite values (they are
- * masked out of every reduction). Per kv head, one HVX_Vector accumulator
- * per q head of its GQA group shares the Kt stream, then the V stream --
- * the fusion changes no arithmetic, each q head's sequence is the spec's.
+ * both f32 on the DSP heap holding fp16 values (every row is rounded on
+ * append; the CPU's seed rows already are), 128-byte aligned, zero-filled
+ * at create so the lanes past the context in the last block read finite
+ * values (they are masked out of every reduction). head_dim is 64 only.
+ * The q heads of a unit share the Kt stream, then the V stream -- each q
+ * head's sequence is the spec's.
  *
  * ADDRESS BUDGET (doc 46 section 41: 3840 MiB arena + about 182 MiB heap).
  * The cache is n_layers * n_kv * head_dim * max_seq * 2 * 4 bytes: at the
  * LFM2.5 shape (6 attention layers, 8 kv heads, head_dim 64) that is 24 MiB
  * per 1024 of max_seq, so 48 MiB at nntr_config.json's max_seq_len 2048 --
  * 26 % of the heap, with no VTCM, no mapping and no DMA. The probability
- * scratch is n_kv * gqa * max_seq * 4 = 256 KiB at 2048. Growth policy:
- * none; the Kt stride is max_seq, so the size is fixed at create. fp16 K/V
- * would halve it and is the upgrade path once an sf -> hf rounding spec is
- * device-confirmed (plan 81 section 3.1).
+ * scratch is n_kv * gqa * max_seq * 4 = 256 KiB at 2048, the exp table
+ * ATTN_M1_DET_EXP_N * 4 = 74 KiB per cache (#152). Growth policy: none;
+ * the Kt stride is max_seq, so the size is fixed at create. An fp16
+ * cache would halve it but needs hf widening ops the emulator lacks, and
+ * the kernel is compute-bound since #152 (plan 152 section 3.4).
  *
  * THREADS. forward runs one unit per (kv head, pair of its q heads) on
  * hvx_worker_pool_run when gqa is even -- 16 units at LFM2.5's shape, so
@@ -77,13 +82,14 @@ typedef struct {
   uint32_t n_layers;
   uint32_t n_kv;
   uint32_t gqa;
-  uint32_t head_dim;   /**< a multiple of 32 */
+  uint32_t head_dim;   /**< 64 */
   uint32_t max_seq;    /**< a multiple of 32; the Kt stride */
   uint32_t *kv_len;    /**< [n_layers] positions held, 0..max_seq */
   float *kt;           /**< [n_layers][n_kv][head_dim][max_seq], memalign 128 */
   float *v;            /**< [n_layers][n_kv][max_seq][head_dim], memalign 128 */
   float *scratch;      /**< [n_kv * gqa][max_seq] per q head, memalign 128 */
   size_t cache_floats; /**< floats in kt, and in v */
+  float *exp_tab;      /**< ATTN_M1_DET_EXP_N floats: exp16 by index */
   hvx_worker_pool *pool; /**< borrowed; NULL runs every head on the caller */
 } hvx_attn_m1_ctx;
 
@@ -92,9 +98,9 @@ typedef struct {
  *
  * @param n_layers  attention layers (the layer ordinal space), >= 1
  * @param n_kv      kv heads, >= 1
- * @param gqa       q heads per kv head, 1..8 (the register file holds gqa
- *                  score accumulators plus gqa * head_dim/32 PV ones)
- * @param head_dim  a multiple of 32, at most 128
+ * @param gqa       q heads per kv head, 1..8 (the local q16 block and the
+ *                  PV accumulators hold 2 * gqa vectors)
+ * @param head_dim  64 (the CPU order's 8 accumulators; the RoPE's head)
  * @param max_seq   a multiple of 32; the position bound
  * @param pool      the session's worker pool, borrowed; may be NULL
  * @param err       receives AEE_SUCCESS, AEE_EINVALIDFORMAT (shape, or a
