@@ -2456,11 +2456,12 @@ protected:
           break;
         }
         if (prev_gu != 0xFFFFFFFFu) {
-          // The swap released them: releasing again must be refused.
-          EXPECT_NE(nntr_hvx_weight_release_u8i4(handle_, prev_gu), AEE_SUCCESS)
-            << path << ": the old gate_up handle survived the swap";
-          EXPECT_NE(nntr_hvx_weight_release_u8i4(handle_, prev_dn), AEE_SUCCESS)
-            << path << ": the old down handle survived the swap";
+          // Same shape, so (doc 52 section 10.25) the swap rebinds the old
+          // pair in place and hands the same numbers back. Releasing
+          // prev_* here, as this check did before the rebind, released the
+          // live new pair and failed the pass-1 call it exists to test.
+          EXPECT_EQ(a_gu, prev_gu) << path << ": gate_up was not rebound";
+          EXPECT_EQ(a_dn, prev_dn) << path << ": down was not rebound";
         }
       } else if (nntr_hvx_weight_register_u8i4_arena(
                    handle_, K, 2 * I, arena, 0, gu[e].d.data(), (int)(2 * I),
