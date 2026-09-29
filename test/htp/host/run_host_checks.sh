@@ -233,6 +233,40 @@ for mut in 's/m1_swiglu_cpu_det(gate, up, act, op->N)/m1_swiglu_cpu_det(up, gate
   echo "GRAPH Q4M1 MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
 done
 
+# [#132 Part B E2] The two-session token driver (hmx/hexkl_token.c): S1 and
+# S2 on two pthreads over the hd64 list split by mask, every MoE row across
+# a malloc'd mailbox page, bit-identical to the one-session run for 10 000
+# tokens (TOKEN DRIVER BIT-IDENTICAL), then the lost-post, stale-read and
+# failed-side paths (TOKEN DRIVER FAILURE PATHS OK; ~3 s of timeouts).
+# Same kernels and flags as the graph check. Then two mutants of
+# hexkl_token.c, each of which must fail it: S2 reading its own row back
+# as the MoE output, and the trailer check gone.
+token_check() { # token_check <hexkl_token.c> <exe>
+  "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+    -Wno-format-truncation -pthread -include malloc.h \
+    -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
+    -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+    -o "$2" \
+    "$HERE/token_host_check.c" "$1" "$BACKEND/hmx/hexkl_graph.c" \
+    "$BACKEND/hvx/hvx_m1_ops_f32.c" "$BACKEND/hvx/hvx_conv_gate_f32.c" \
+    "$BACKEND/hvx/hvx_attn_m1_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" \
+    "$BACKEND/hvx/hvx_scale_add_f32.c" "$BACKEND/hvx/hvx_q4_gemv_f32.c" -lm
+}
+token_check "$BACKEND/hmx/hexkl_token.c" "$OUT/token_host_check"
+"$OUT/token_host_check"
+for mut in 's/    in = tk_row(theirs);/    in = tk_row(mine);/' \
+  's/  if (\*(const uint32_t \*)(slot + HEXKL_MBOX_LINE + row) != seq) {/  if (0) {/'; do
+  sed "$mut" "$BACKEND/hmx/hexkl_token.c" > "$OUT/hexkl_token_mutant.c"
+  if cmp -s "$OUT/hexkl_token_mutant.c" "$BACKEND/hmx/hexkl_token.c"; then
+    echo "TOKEN MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  token_check "$OUT/hexkl_token_mutant.c" "$OUT/token_mutant"
+  if "$OUT/token_mutant" > "$OUT/token_mutant.log"; then
+    echo "TOKEN MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "TOKEN MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/token_mutant.log") failed checks)"
+done
+
 # The M=1 small ops (#82): the REAL HVX sources hvx_m1_ops_f32.c and
 # hvx_conv_gate_f32.c compiled against hvx_emu/ (one IEEE f32 op per lane,
 # no stand-in) and memcmp'd with the scalar spec nntrainer/tensor/
