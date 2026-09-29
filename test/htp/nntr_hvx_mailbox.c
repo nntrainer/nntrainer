@@ -145,7 +145,10 @@ int nntr_mailbox_loop(uint8_t *base, uint32_t bytes, uint32_t role, uint32_t n,
                       uint32_t payload, uint32_t spin_us, uint32_t res[5]) {
   const uint32_t words = payload / 4u;
   const uint32_t slot = (payload + 127u) & ~127u;
+  /* a payload is 0 or at least 3 words: the probe words (first, middle,
+     last) must be distinct or each exchange reads as stale */
   if (role > 1u || payload % 4u != 0u || payload > MB_MAX_PAYLOAD ||
+      (payload != 0u && payload < 12u) ||
       (uint64_t)MB_DATA + 2u * (uint64_t)slot > bytes) {
     return -1;
   }
@@ -168,7 +171,7 @@ int nntr_mailbox_loop(uint8_t *base, uint32_t bytes, uint32_t role, uint32_t n,
     mb_probe_idx(words, idx);
   }
   memset(res, 0, 5u * sizeof(uint32_t));
-  uint64_t t0 = 0;
+  uint64_t t0 = mb_now_us(); /* reset at the first exchange */
   uint32_t sum = 0, bad = 0, done = 0, timeouts = 0;
   for (uint32_t seq = 1u; seq <= n; ++seq) {
     if (role == 1u) {
@@ -213,7 +216,7 @@ int nntr_mailbox_loop(uint8_t *base, uint32_t bytes, uint32_t role, uint32_t n,
     }
     ++done;
   }
-  res[0] = (uint32_t)(mb_now_us() - t0);
+  res[0] = done ? (uint32_t)(mb_now_us() - t0) : 0u;
   res[1] = done;
   res[2] = timeouts;
   res[3] = sum;

@@ -79,13 +79,15 @@ int main(void) {
     const uint64_t t0 = mb_now_us();
     const int rc = nntr_mailbox_loop(page, bytes, 0u, 1u, 0u, 1000u, res);
     const uint64_t dt = mb_now_us() - t0;
-    const int ok = rc == 0 && res[1] == 0u && res[2] == 1u &&
+    const int ok = rc == 0 && res[0] == 0u && res[1] == 0u && res[2] == 1u &&
                    dt >= MB_TIMEOUT_US && dt < 3u * MB_TIMEOUT_US;
     printf("MAILBOX lone role 0: timeouts=%u after %llu us %s\n", res[2],
            (unsigned long long)dt, ok ? "ok" : "FAIL");
     fail |= !ok;
     /* a page too small for the payload is refused, not overrun */
     fail |= nntr_mailbox_loop(page, 1024u, 0u, 1u, 8192u, 0u, res) != -1;
+    /* a payload under 3 words has colliding probe words: refused */
+    fail |= nntr_mailbox_loop(page, bytes, 0u, 1u, 8u, 0u, res) != -1;
     free(page);
   }
   if (fail) {

@@ -450,6 +450,11 @@ int nntr_hvx_dma_replay(remote_handle64 handle, uint32 arena,
   c.workers = workers;
   c.pace = pace;
   c.fresh = fresh;
+  /* [#178] a lite session may have less VTCM than the load's 1 MiB (or
+     none): config_off - 1 MiB would wrap and pass every bound below */
+  if (load == 2u && s->config_off < REPLAY_LOAD_VTCM_BYTES) {
+    return AEE_EINVALIDFORMAT;
+  }
   const uint32_t vtcm_limit =
     load == 2u ? s->config_off - REPLAY_LOAD_VTCM_BYTES : s->config_off;
   uint32_t bytes_per_call = 0u, gu_lo = UINT32_MAX, gu_hi = 0u, n_push = 0u;
