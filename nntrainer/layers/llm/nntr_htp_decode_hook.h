@@ -142,6 +142,17 @@ inline void htpDecodeWantLogits(bool want) {
 #endif
 }
 
+/** @brief [#132 Part B E3] The bad-word ids the greedy pick sets to -inf;
+ *  the NPU's pick (htpDecodeTokenId) skips them too. No-op without HTP. */
+inline void htpDecodeBan(const unsigned *ids, unsigned n) {
+#ifdef ENABLE_HEXKL
+  nntrainer::get_htp_ops()->set_decode_ban(ids, n);
+#else
+  (void)ids;
+  (void)n;
+#endif
+}
+
 /** @brief [#132 Part B E3] The id the NPU picked for the last decode token
  *  (its argmax, first maximum) when its logits did not come back; false
  *  otherwise, and always without HTP. */
