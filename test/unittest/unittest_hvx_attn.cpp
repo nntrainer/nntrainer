@@ -1395,12 +1395,16 @@ TEST_F(HvxAttnM1Probe, Semantics) {
             << std::endl;
   EXPECT_EQ(bad_div, 0);
 
-  /* a length that is not a multiple of 64: the entry's own check */
+  /* A length that is not a multiple of 64 is refused: the entry answers
+     AEE_EINVALIDFORMAT, but on silicon the FastRPC layer answers AEE_ERPC
+     (0x80000600) before the entry runs (LEDGER rule 38, S1 2026-09-29).
+     Either is a refusal; AEE_EBADPARM would be a stale skel. */
   std::vector<uint16_t> s63(63u, 0u);
   const int err = nntr_hvx_attn_m1_probe(
     handle_, ATTN_M1_PROBE_ADD, 1u, 1u, s63.data(), 63, s63.data(), 63,
     s63.data(), 63, s63.data(), 63, nullptr, 0);
-  EXPECT_EQ(err, AEE_EINVALIDFORMAT + kDspOffset) << "n=63: " << hex(err);
+  EXPECT_TRUE(err == AEE_EINVALIDFORMAT + kDspOffset || err == (int)0x80000600u)
+    << "n=63: " << hex(err);
 }
 
 /**
