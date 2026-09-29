@@ -666,6 +666,39 @@ static uint32_t conv_chain(const float *abc, const float *w,
   return bad;
 }
 
+/** @brief [#132 E5c] The Android CPU's M=1 conv + gate written out on
+ *  its own (not the spec): g = a*c, y = fmaf(w2, s0, fmaf(w1, s1, w0*g)),
+ *  out = b*y, over the chain from row @a first; the bad count against the
+ *  HVX outputs @a out_hvx of conv_chain. */
+static uint32_t conv_cpu_model(const float *abc, const float *w,
+                               const float *state2, uint32_t first,
+                               const float *out_hvx) {
+  float *s0 = malloc(CONV_C * sizeof(float));
+  float *s1 = malloc(CONV_C * sizeof(float));
+  memcpy(s0, state2, CONV_C * sizeof(float));
+  memcpy(s1, state2 + CONV_C, CONV_C * sizeof(float));
+  uint32_t bad = 0;
+  for (uint32_t t = 0; t < CONV_CHAIN; ++t) {
+    const float *a = abc + (size_t)(first + t) * 3u * CONV_C;
+    const float *b = a + CONV_C, *c = a + 2u * CONV_C;
+    for (uint32_t j = 0; j < CONV_C; ++j) {
+      volatile float g = a[j] * c[j];
+      volatile float y0 = w[j] * g;
+      volatile float y1 = fmaf(w[CONV_C + j], s1[j], y0);
+      volatile float y2 = fmaf(w[2u * CONV_C + j], s0[j], y1);
+      volatile float o = b[j] * y2;
+      const float of = o;
+      bad +=
+        memcmp(&of, &out_hvx[(size_t)t * CONV_C + j], sizeof(float)) ? 1u : 0u;
+      s0[j] = s1[j];
+      s1[j] = g;
+    }
+  }
+  free(s0);
+  free(s1);
+  return bad;
+}
+
 static void check_conv(void) {
   float *abc = malloc((size_t)CONV_ROWS * 3u * CONV_C * sizeof(float));
   float *w = malloc(3u * CONV_C * sizeof(float));
@@ -685,44 +718,30 @@ static void check_conv(void) {
   }
   conv_g_rows(abc, g, CONV_ROWS);
 
-  /* (1) M=1 chain from a zero state vs the spec, then vs one prefill-shape
-     call over rows 0..7 (t0 = 0). */
+  /* (1) M=1 chain from a zero state vs the spec, and the spec vs an
+     independent model of the Android CPU's decode (neon
+     causal_depthwise_conv1d_k3_decode: vmulq, then two vfmaq -- fmaf
+     here -- then the gate). [#132 E5c] No longer against the prefill
+     kernel: hvx_conv_gate_f32 is unfused, which is not the CPU's order. */
   uint32_t bad_spec = conv_chain(abc, w, state2, 0u, out);
-  for (uint32_t r = 0; r < CONV_CHAIN; ++r) {
-    memcpy(z + (size_t)r * CONV_C, abc + (size_t)r * 3u * CONV_C + CONV_C,
-           CONV_C * sizeof(float));
-  }
-  hvx_conv_gate_f32(z, CONV_C, g, CONV_C, 0u, CONV_CHAIN, CONV_C, w, NULL);
-  uint32_t bad_prefill = 0;
-  for (uint32_t i = 0; i < (uint32_t)CONV_CHAIN * CONV_C; ++i) {
-    bad_prefill += memcmp(&z[i], &out[i], sizeof(float)) ? 1u : 0u;
-  }
+  uint32_t bad_cpu = conv_cpu_model(abc, w, state2, 0u, out);
   printf("M1 OPS conv_gate_m1 C=%d chain=%d from zero state: bad(spec)=%u "
-         "bad(prefill t0=0 m=%d)=%u\n",
-         CONV_C, CONV_CHAIN, bad_spec, CONV_CHAIN, bad_prefill);
+         "bad(cpu fma model)=%u\n",
+         CONV_C, CONV_CHAIN, bad_spec, bad_cpu);
   CHECK(bad_spec == 0u, "conv_gate_m1: HVX differs from m1_ops_det");
-  CHECK(bad_prefill == 0u, "conv_gate_m1: chain differs from the prefill");
+  CHECK(bad_cpu == 0u, "conv_gate_m1: differs from the CPU's fused order");
 
-  /* (2) From the state a 7-row prefill-shape call leaves (rows 5, 6 of g),
-     the chain over rows 7..14 vs one call with t0 = 7, m = 8. */
+  /* (2) From the state a 7-row prefill leaves (rows 5, 6 of g). */
   memcpy(state2, g + 5u * CONV_C, 2u * CONV_C * sizeof(float));
   bad_spec = conv_chain(abc, w, state2, 7u, out);
-  for (uint32_t r = 0; r < CONV_CHAIN; ++r) {
-    memcpy(z + (size_t)r * CONV_C,
-           abc + (size_t)(7u + r) * 3u * CONV_C + CONV_C,
-           CONV_C * sizeof(float));
-  }
-  hvx_conv_gate_f32(z, CONV_C, g, CONV_C, 7u, CONV_CHAIN, CONV_C, w, NULL);
-  bad_prefill = 0;
-  for (uint32_t i = 0; i < (uint32_t)CONV_CHAIN * CONV_C; ++i) {
-    bad_prefill += memcmp(&z[i], &out[i], sizeof(float)) ? 1u : 0u;
-  }
+  bad_cpu = conv_cpu_model(abc, w, state2, 7u, out);
   printf("M1 OPS conv_gate_m1 C=%d chain=%d from a 7-row prefill state: "
-         "bad(spec)=%u bad(prefill t0=7 m=%d)=%u\n",
-         CONV_C, CONV_CHAIN, bad_spec, CONV_CHAIN, bad_prefill);
+         "bad(spec)=%u bad(cpu fma model)=%u\n",
+         CONV_C, CONV_CHAIN, bad_spec, bad_cpu);
   CHECK(bad_spec == 0u, "conv_gate_m1 (prefill state): differs from spec");
-  CHECK(bad_prefill == 0u,
-        "conv_gate_m1 (prefill state): chain differs from the prefill");
+  CHECK(bad_cpu == 0u,
+        "conv_gate_m1 (prefill state): differs from the CPU's fused order");
+  (void)z;
 
   /* (3) Tolerance of the spec, rows 7..14, against plain fp32 in the CPU
      order and against double. */

@@ -121,20 +121,34 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
   const HVX_UVector *va = (const HVX_UVector *)abc;
   const HVX_UVector *vb = (const HVX_UVector *)(abc + C);
   const HVX_UVector *vc = (const HVX_UVector *)(abc + 2u * C);
+  const HVX_UVector *vw0 = (const HVX_UVector *)conv_w;
   HVX_UVector *vg = (HVX_UVector *)(state3 + 2u * C);
   HVX_UVector *vo = (HVX_UVector *)out;
+  const float *w1 = conv_w + C, *w2 = conv_w + 2u * C;
+  const float *s0 = state3, *s1 = state3 + C;
   const uint32_t nvec = C / LANES;
 
-  /* Row 2 <- a*c (the pre-gate the prefill path fuses into hvx_dq_mul);
-     out <- b, which the kernel multiplies in place. */
+  /* [#132 E5c] The Android CPU's decode order (m1_conv_gate_det): g = a*c
+     into row 2, y = w0*g (both one rounding each, as the vector multiply),
+     then the two fused taps y = fma(w1, s1, y), y = fma(w2, s0, y) --
+     HVX has no fused f32 multiply-add, so they are the scalar sffma, 2C of
+     them -- and out = b*y. The unfused prefill kernel (hvx_conv_gate_f32)
+     it used before is not the CPU's order. */
   for (uint32_t i = 0; i < nvec; ++i) {
     vg[i] = Q6_Vsf_vmpy_VsfVsf(va[i], vc[i]);
-    vo[i] = vb[i];
+    vo[i] = Q6_Vsf_vmpy_VsfVsf(vw0[i], vg[i]);
   }
-  /* The prefill kernel at m_count = 1 on row t = 2 of the 3-row state:
-     the same five operations in the same order as a prefill-shape call,
-     so an M=1 chain is bit-identical to the prefill over the same rows. */
-  hvx_conv_gate_f32(out, C, state3, C, 2u, 1u, C, conv_w, NULL);
+  /* the vector stores above and the scalar loads below alias out / state3
+     through different types: keep the compiler from reordering them */
+  __asm__ volatile("" ::: "memory");
+  for (uint32_t j = 0; j < C; ++j) {
+    float y = Q6_R_sfmpyacc_RR(out[j], w1[j], s1[j]);
+    out[j] = Q6_R_sfmpyacc_RR(y, w2[j], s0[j]);
+  }
+  __asm__ volatile("" ::: "memory");
+  for (uint32_t i = 0; i < nvec; ++i) {
+    vo[i] = Q6_Vsf_vmpy_VsfVsf(vb[i], vo[i]);
+  }
 
   /* state <- x_{t-1} | g. ponytail: two 8 KiB copies per token at C = 2048
      (x 18 conv layers, roughly 1-2 us); a ring of three row pointers

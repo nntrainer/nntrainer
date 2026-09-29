@@ -61,8 +61,15 @@
  *
  *   conv_gate_m1_det(abc[3C], state[2C], w[3C], out[C]):
  *     g   = a*c                                (the in_proj split a | b | c)
- *     y   = (w0*g + w1*s1) + w2*s0             (hvx_conv_gate_f32's order;
- *                                               state = x_{t-2} | x_{t-1})
+ *     y   = fma(w2, s0, fma(w1, s1, w0*g))     (the Android CPU's decode:
+ *                                               neon causal_depthwise_
+ *                                               conv1d_k3_decode's vmulq +
+ *                                               two vfmaq; state =
+ *                                               x_{t-2} | x_{t-1}. #132 E5c:
+ *                                               the unfused (w0*g + w1*s1)
+ *                                               + w2*s0 it replaced left the
+ *                                               CPU on the device after 5-25
+ *                                               tokens)
  *     out = b*y
  *     state <- s1 | g
  *
@@ -319,8 +326,9 @@ static inline void m1_conv_gate_det(const float *abc, float *state,
   float *s0 = state, *s1 = state + C;
   for (uint32_t j = 0; j < C; ++j) {
     const float g = m1_det_mul(a[j], c[j]);
-    float y = m1_det_add(m1_det_mul(w0[j], g), m1_det_mul(w1[j], s1[j]));
-    y = m1_det_add(y, m1_det_mul(w2[j], s0[j]));
+    float y = m1_det_mul(w0[j], g);
+    y = m1_det_fma(w1[j], s1[j], y);
+    y = m1_det_fma(w2[j], s0[j], y);
     out[j] = m1_det_mul(b[j], y);
     s0[j] = s1[j];
     s1[j] = g;
