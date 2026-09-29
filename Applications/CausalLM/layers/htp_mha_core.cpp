@@ -25,6 +25,7 @@ static std::mutex rope_init_mtx;
 #include <layer_context.h>
 #include <mha_core.h>
 #include <nntrainer_error.h>
+#include <nntrainer_log.h>
 #include <node_exporter.h>
 #include <thread_manager.h>
 #include <util_func.h>
@@ -117,7 +118,7 @@ MHACoreLayer::MHACoreLayer() :
     props::UseRope(), props::MaxPositionEmbeddings(), props::UseSink(),
     props::RopeScalingType(), props::RopeScalingFactor(),
     props::RopePartialRotaryFactor(), props::RopeScalingMaxPositionEmbeddings(),
-    props::AttnLogitSoftcapping(), props::IsCausal()),
+    props::AttnLogitSoftcapping(), props::IsCausal(), props::KvCacheQuant()),
   sm(nntrainer::ActivationType::ACT_SOFTMAX),
   epsilon(1e-3),
   cache_index(0),
@@ -128,7 +129,7 @@ MHACoreLayer::MHACoreLayer() :
   tensor_idx.fill(std::numeric_limits<unsigned>::max());
 }
 
-MHACoreLayer::~MHACoreLayer() {}
+MHACoreLayer::~MHACoreLayer() { release_quantized_cache(); }
 
 /************************************************************** */
 
@@ -222,6 +223,21 @@ void MHACoreLayer::finalize(nntrainer::InitLayerContext &context) {
   /** Is Causal */
   is_causal = std::get<props::IsCausal>(mha_core_props).get();
 
+  kv_cache_quant_kind = -1;
+  if (!std::get<props::KvCacheQuant>(mha_core_props).empty()) {
+    const std::string kind =
+      std::get<props::KvCacheQuant>(mha_core_props).get();
+    if (kind == "q8") {
+      kv_cache_quant_kind = 0;
+    } else if (kind == "q4") {
+      kv_cache_quant_kind = 1;
+    } else if (!kind.empty()) {
+      throw std::invalid_argument("mha_core: kv_cache_quant must be \"\", "
+                                  "\"q8\" or \"q4\", got \"" +
+                                  kind + "\"");
+    }
+  }
+
   if (!std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).empty())
     skip_prefill =
       std::get<nntrainer::props::SkipPrefill>(*layer_impl_props).get();
@@ -290,6 +306,10 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
   if (!use_external_cache) {
     return;
   }
+  // The external-cache path is driven through forwarding() directly as
+  // well as via incremental_forwarding(); either way the per-batch helpers
+  // ask this for an accelerated attention.
+  compute_ops_ = context.getComputeOps();
 
   nntrainer::Tensor &query = context.getInput(INOUT_INDEX::QUERY);
   nntrainer::Tensor &key = context.getInput(INOUT_INDEX::KEY);
@@ -406,6 +426,11 @@ void MHACoreLayer::forwarding(nntrainer::RunLayerContext &context,
 void MHACoreLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
                                           unsigned int _from, unsigned int _to,
                                           bool training) {
+  // Whatever ComputeOps this context resolves to (CPU, or HTP when the
+  // model runs with engine="htp" and the DSP session opened) decides per
+  // batch below whether attention leaves the CPU.
+  compute_ops_ = context.getComputeOps();
+
   // External KV cache path: from/to are interpreted as the absolute write
   // position; route through forwarding() which reads cache_key/cache_value
   // from input slots 3/4. forwarding() advances cache_index internally.
@@ -690,6 +715,237 @@ void MHACoreLayer::compute_kcaches(nntrainer::Tensor &in,
   }
 }
 
+namespace {
+
+/**
+ * @brief f32 views of a query step and an output step for the accelerator
+ *        kernels, which take f32 on both sides. On Android with fp16 the
+ *        layer hands its per-batch helpers fp16 step tensors, so those are
+ *        staged through f32 scratch here (a few hundred KB per step) and
+ *        the result is narrowed back on commit.
+ */
+struct AccelF32Io {
+  const float *q = nullptr;
+  float *out = nullptr;
+
+  bool prepare(nntrainer::Tensor &query_step,
+               nntrainer::Tensor &attention_output_step) {
+    const auto qt = query_step.getDataType();
+    const auto ot = attention_output_step.getDataType();
+    if (qt == ml::train::TensorDim::DataType::FP32) {
+      q = query_step.getData<float>();
+    }
+#ifdef ENABLE_FP16
+    else if (qt == ml::train::TensorDim::DataType::FP16) {
+      const _FP16 *src = query_step.getData<_FP16>();
+      q_scratch.resize(query_step.size());
+      for (size_t i = 0; i < q_scratch.size(); ++i) {
+        q_scratch[i] = static_cast<float>(src[i]);
+      }
+      q = q_scratch.data();
+    }
+#endif
+    else {
+      return false;
+    }
+    if (ot == ml::train::TensorDim::DataType::FP32) {
+      out = attention_output_step.getData<float>();
+    }
+#ifdef ENABLE_FP16
+    else if (ot == ml::train::TensorDim::DataType::FP16) {
+      out_scratch.resize(attention_output_step.size());
+      out = out_scratch.data();
+    }
+#endif
+    else {
+      return false;
+    }
+    return true;
+  }
+
+  void commit(nntrainer::Tensor &attention_output_step) {
+#ifdef ENABLE_FP16
+    if (!out_scratch.empty()) {
+      _FP16 *dst = attention_output_step.getData<_FP16>();
+      for (size_t i = 0; i < out_scratch.size(); ++i) {
+        dst[i] = static_cast<_FP16>(out_scratch[i]);
+      }
+    }
+#else
+    (void)attention_output_step;
+#endif
+  }
+
+private:
+  std::vector<float> q_scratch, out_scratch;
+};
+
+} // namespace
+
+bool MHACoreLayer::try_accelerated_attention(
+  nntrainer::Tensor &query_step, nntrainer::Tensor &cached_key,
+  nntrainer::Tensor &cached_value, nntrainer::Tensor &attention_output_step,
+  unsigned int cache_from, unsigned int cache_to, const float *sinks) {
+  if (!compute_ops_ || !compute_ops_->supports_sdpa_fp16_kvcache()) {
+    return false;
+  }
+  // The accelerated kernel implements the causal, windowed attention this
+  // layer computes over the fp16 cache -- the shape every CausalLM model
+  // here runs -- with f32 query and output; fp16 steps (Android) are
+  // staged through f32. Anything else stays on the CPU.
+  if (!is_causal) {
+    return false;
+  }
+  AccelF32Io io;
+  if (!io.prepare(query_step, attention_output_step)) {
+    return false;
+  }
+  const uint16_t *k_bits = nullptr;
+  const uint16_t *v_bits = nullptr;
+  switch (cached_key.getDataType()) {
+  case ml::train::TensorDim::DataType::UINT16:
+    k_bits = cached_key.getData<uint16_t>();
+    v_bits = cached_value.getData<uint16_t>();
+    break;
+#ifdef ENABLE_FP16
+  case ml::train::TensorDim::DataType::FP16:
+    k_bits = reinterpret_cast<const uint16_t *>(cached_key.getData<_FP16>());
+    v_bits = reinterpret_cast<const uint16_t *>(cached_value.getData<_FP16>());
+    break;
+#endif
+  default:
+    return false;
+  }
+  const unsigned int n_q = cache_to - cache_from;
+  const unsigned int q_stride = num_heads_Q * head_dim;
+  const unsigned int kv_stride = num_heads_KV * head_dim;
+  // local_window_size defaults to UINT_MAX meaning "no window"; the kernel
+  // spells that 0.
+  const unsigned int window =
+    (local_window_size == 0 || local_window_size >= cache_to)
+      ? 0u
+      : static_cast<unsigned int>(local_window_size);
+  if (!compute_ops_->sdpa_fp16_kvcache(
+        io.q, q_stride, k_bits, v_bits, kv_stride, n_q, cache_from, cache_to,
+        num_heads_Q, num_heads_KV, head_dim, window, attn_logit_softcapping,
+        sinks, io.out, q_stride)) {
+    return false;
+  }
+  io.commit(attention_output_step);
+  if (!accel_logged_) {
+    accel_logged_ = true;
+    ml_logi("mha_core: attention over the fp16 KV cache on the accelerator");
+  }
+  return true;
+}
+
+void MHACoreLayer::release_quantized_cache() {
+  if (compute_ops_) {
+    for (int h : q_cache_handles) {
+      if (h >= 0) {
+        compute_ops_->kv_cache_q_release(h);
+      }
+    }
+  }
+  q_cache_handles.clear();
+  q_cache_synced.clear();
+}
+
+bool MHACoreLayer::try_quantized_attention(
+  unsigned int batch, nntrainer::Tensor &query_step,
+  nntrainer::Tensor &cache_key, nntrainer::Tensor &cache_value,
+  const ml::train::TensorDim &cache_key_dim,
+  nntrainer::Tensor &attention_output_step, unsigned int cache_from,
+  unsigned int cache_to, const float *sinks) {
+  if (kv_cache_quant_kind < 0 || q_cache_failed || !compute_ops_ ||
+      !compute_ops_->supports_kv_cache_q() || !is_causal) {
+    return false;
+  }
+  AccelF32Io io;
+  if (!io.prepare(query_step, attention_output_step)) {
+    return false;
+  }
+  const uint16_t *k_base = nullptr;
+  const uint16_t *v_base = nullptr;
+  switch (cache_key.getDataType()) {
+  case ml::train::TensorDim::DataType::UINT16:
+    k_base = cache_key.getData<uint16_t>();
+    v_base = cache_value.getData<uint16_t>();
+    break;
+#ifdef ENABLE_FP16
+  case ml::train::TensorDim::DataType::FP16:
+    k_base = reinterpret_cast<const uint16_t *>(cache_key.getData<_FP16>());
+    v_base = reinterpret_cast<const uint16_t *>(cache_value.getData<_FP16>());
+    break;
+#endif
+  default:
+    return false;
+  }
+  const unsigned int max_rows = cache_key_dim.height();
+  const unsigned int width = cache_key_dim.width();
+  if (width != num_heads_KV * head_dim || cache_to > max_rows) {
+    return false;
+  }
+
+  auto fail = [this](const char *what) {
+    ml_logw("mha_core: quantized KV cache %s failed; this layer stays on the "
+            "fp16 path",
+            what);
+    release_quantized_cache();
+    q_cache_failed = true;
+    return false;
+  };
+
+  if (q_cache_handles.size() <= batch) {
+    q_cache_handles.resize(batch + 1, -1);
+    q_cache_synced.resize(batch + 1, 0);
+  }
+  int &handle = q_cache_handles[batch];
+  unsigned int &synced = q_cache_synced[batch];
+  if (handle < 0) {
+    handle = compute_ops_->kv_cache_q_register(
+      static_cast<unsigned int>(kv_cache_quant_kind), max_rows, num_heads_KV,
+      head_dim);
+    if (handle < 0) {
+      return fail("register");
+    }
+    synced = 0;
+  }
+  // Rows past cache_from may have been rewritten (a rewound session, a
+  // loaded cache); re-append from the first row that could differ.
+  if (synced > cache_from) {
+    synced = cache_from;
+  }
+  // The missing rows -- normally just this step's -- ride along with the
+  // attention call: one round trip per layer per step.
+  const unsigned int append_row0 = synced;
+  const unsigned int append_rows = cache_to - synced;
+  const size_t off = batch * cache_key_dim.getFeatureLen() +
+                     static_cast<size_t>(append_row0) * width;
+
+  const unsigned int n_q = cache_to - cache_from;
+  const unsigned int q_stride = num_heads_Q * head_dim;
+  const unsigned int window =
+    (local_window_size == 0 || local_window_size >= cache_to)
+      ? 0u
+      : static_cast<unsigned int>(local_window_size);
+  if (!compute_ops_->sdpa_q_kvcache(
+        handle, append_row0, append_rows, width, k_base + off, v_base + off,
+        io.q, q_stride, n_q, cache_from, cache_to, num_heads_Q, num_heads_KV,
+        head_dim, window, attn_logit_softcapping, sinks, io.out, q_stride)) {
+    return fail("attention");
+  }
+  synced = cache_to;
+  io.commit(attention_output_step);
+  if (!accel_logged_) {
+    accel_logged_ = true;
+    ml_logi("mha_core: attention over the %s quantized KV cache on the "
+            "accelerator",
+            kv_cache_quant_kind == 0 ? "int8" : "int4");
+  }
+  return true;
+}
+
 void MHACoreLayer::one_batch_incremental_forwarding(
   const unsigned int batch, const unsigned int _from, const unsigned int from,
   const unsigned int to, nntrainer::Tensor &query_step,
@@ -761,6 +1017,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     cached_key_dim, batch * cache_key_dim.getFeatureLen(), true);
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
+
+  if (try_quantized_attention(batch, query_step, cache_key, cache_value,
+                              cache_key_dim, attention_output_step, cache_from,
+                              cache_to, nullptr) ||
+      try_accelerated_attention(query_step, b_cached_key, b_cached_value,
+                                attention_output_step, cache_from, cache_to,
+                                nullptr)) {
+    return;
+  }
 
   // out_ stores the output of Q * K
   nntrainer::Tensor out_(1, 1,
@@ -842,6 +1107,15 @@ void MHACoreLayer::one_batch_incremental_forwarding(
     cached_key_dim, batch * cache_key_dim.getFeatureLen(), true);
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
+
+  if (try_quantized_attention(batch, query_step, cache_key, cache_value,
+                              cache_key_dim, attention_output_step, from, to,
+                              sink_step.getData<float>()) ||
+      try_accelerated_attention(query_step, b_cached_key, b_cached_value,
+                                attention_output_step, from, to,
+                                sink_step.getData<float>())) {
+    return;
+  }
 
   nntrainer::Tensor out_(1, 1,
                          is_causal ? (((to - from) == 1)
