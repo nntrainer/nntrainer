@@ -63,4 +63,11 @@ typedef struct {
 const hexkl_acc_layout *hexkl_acc_layout_get(uint8_t *vtcm_base,
                                              uint32_t result_off);
 
+/** @brief Element (r, c) of a tile read with a usable layout. */
+static inline int32_t hexkl_acc_tile_at(const hexkl_acc_layout *L,
+                                        const int32_t *tile, uint32_t r,
+                                        uint32_t c) {
+  return tile[L->base + r * L->row_stride + c];
+}
+
 #endif /* __NNTRAINER_HEXKL_ACC_TILE_H__ */
