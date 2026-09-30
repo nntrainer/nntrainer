@@ -238,6 +238,18 @@ static int graph_op_router_topk(hexkl_graph *g, const htp_graph_op *op,
 
 /* ---- #132 Part B: the CPU-exact Q4_0 FC, the dense FFN, the lm_head ---- */
 
+/* [#194 L1] The op's quantizer: the native one under the feed word's
+   HTP_GRAPH_FEED_NATIVE (the runner then takes the native GEMV), else the
+   CPU-exact one. */
+static void graph_prep(const htp_graph_op *op, const float *x, uint32_t K,
+                       hvx_q4m1_act *a) {
+  if ((op->feed & HTP_GRAPH_FEED_NATIVE) != 0u) {
+    hvx_q4m1_prep_vec(x, K, a);
+  } else {
+    hvx_q4m1_prep(x, K, a);
+  }
+}
+
 /* Runs parts h[0..n) on the prepared activation, their outputs
    concatenated in y (q | k | v; the lm_head's slices). */
 static int graph_q4m1_parts(hexkl_graph *g, const htp_graph_op *op,
@@ -259,7 +271,7 @@ static int graph_op_fc(hexkl_graph *g, const htp_graph_op *op, graph_call *call,
   if (call->env->fc == NULL) {
     return AEE_EBADSTATE;
   }
-  hvx_q4m1_prep(in, op->K, &g->act);
+  graph_prep(op, in, op->K, &g->act);
   return graph_q4m1_parts(g, op, call, op->h_gu, op->n_experts, out);
 }
 
@@ -275,7 +287,7 @@ static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
   if (call->env->fc == NULL) {
     return AEE_EBADSTATE;
   }
-  hvx_q4m1_prep(in, op->K, &g->act);
+  graph_prep(op, in, op->K, &g->act);
   rc = call->env->fc(call->env->fc_ctx, op->h_gu[0], op->feed, &g->act, up);
   if (rc == AEE_SUCCESS) {
     rc = call->env->fc(call->env->fc_ctx, op->h_gu[1], op->feed, &g->act, gate);
@@ -284,7 +296,7 @@ static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
     return rc;
   }
   hvx_swiglu_cpu_f32(gate, up, act, op->N, call->env->pool);
-  hvx_q4m1_prep(act, op->N, &g->act);
+  graph_prep(op, act, op->N, &g->act);
   return call->env->fc(call->env->fc_ctx, op->h_dn[0], op->feed, &g->act, out);
 }
 
@@ -297,7 +309,7 @@ static int graph_op_lm_head(hexkl_graph *g, const htp_graph_op *op,
   if (call->env->fc == NULL) {
     return AEE_EBADSTATE;
   }
-  hvx_q4m1_prep(in, op->K, &g->act);
+  graph_prep(op, in, op->K, &g->act);
   rc = graph_q4m1_parts(g, op, call, op->h_gu, op->n_experts, g->logits);
   if (rc == AEE_SUCCESS) {
     /* [#132 Part B E3] the banned ids at -inf for the pick only (the

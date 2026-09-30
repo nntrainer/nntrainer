@@ -33,6 +33,19 @@
  *    silicon.
  * 4. LAYOUT. q4_0_from_q4_0x4 inverts the ARM repack (the ggml packer,
  *    re-typed here) bit for bit.
+ * 5. [#194 L1] NATIVE. The vector quantizer hvx_q4m1_prep_vec and the
+ *    kernel hvx_q4m1_gemv_groups_native against q4_gemv_native_det.h bit
+ *    for bit (Q4 NATIVE bit-exact vs spec n/n: shapes x rows, plus 3000
+ *    quantizer rows with s8), and the spec's distance from the CPU order:
+ *    snr_db >= 60 gated on make_row's natural kinds 0..2; kind 3 puts
+ *    every element on a q rounding edge of the CPU's own d / id (exact
+ *    ties, amax / 127 vs amax * (1/127) flips), where any other quantizer
+ *    flips a q step per element -- its SNR is printed, with how much
+ *    closer or farther than the CPU order it lands to the f64 dot of the
+ *    unquantized row. What the
+ *    bit-exactness rests on beyond section 3's: the widening hf multiply
+ *    is the exact product and the qf32 -> hf narrowing one RN (#170's
+ *    ATTN_M1 path); HvxFcQ4.NativeMatchesSpec re-checks it on silicon.
  */
 
 #include <math.h>
@@ -44,6 +57,7 @@
 #include "hvx_q4_gemv_f32.h"
 #include "q4_gemv_cases.h"
 #include "q4_gemv_cpu_det.h"
+#include "q4_gemv_native_det.h"
 
 static int g_fail = 0;
 
@@ -371,6 +385,149 @@ static void check_quant(void) {
   CHECK(bad == 0u, "hvx_q4m1_prep differs from q8_0_quant_cpu_det");
 }
 
+/* ---- 5. [#194 L1] the native pair ---------------------------------------- */
+
+/** @brief 10 log10(sum ref^2 / sum (y - ref)^2); 999 when equal. */
+static double snr_db(const float *ref, const float *y, uint32_t n) {
+  double sig = 0.0, err = 0.0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const double d = (double)y[i] - (double)ref[i];
+    sig += (double)ref[i] * ref[i];
+    err += d * d;
+  }
+  return err == 0.0 ? 999.0 : 10.0 * log10(sig / err);
+}
+
+/** @brief x . dequant(W) in f64, the unquantized-activation truth. */
+static void exact_dot(const float *x, const uint8_t *w, uint32_t K, uint32_t N,
+                      float *y) {
+  const uint32_t nb = K / Q4_CPU_QK;
+  for (uint32_t n = 0; n < N; ++n) {
+    double acc = 0.0;
+    for (uint32_t b = 0; b < nb; ++b) {
+      const uint8_t *blk = w + ((size_t)n * nb + b) * Q4_CPU_BLOCK_BYTES;
+      const double dw = cpu_det_f16_to_f32(q4_cpu_block_d(blk));
+      for (uint32_t j = 0; j < 16u; ++j) {
+        acc += dw * ((int)(blk[2 + j] & 15) - 8) * x[b * 32u + j];
+        acc += dw * ((int)(blk[2 + j] >> 4) - 8) * x[b * 32u + 16u + j];
+      }
+    }
+    y[n] = (float)acc;
+  }
+}
+
+typedef struct {
+  uint32_t cells, bad; /**< shape x row cells, cells not bit-exact */
+  double snr_min;      /**< native vs CPU order, make_row kinds 0..2 */
+  double snr_edge;     /**< the same on kind 3 (quantizer-edge rows) */
+  double edge_vs_true; /**< kind 3: SNR(native, f64) - SNR(CPU, f64) */
+} native_stats;
+
+static void check_native_shape(uint32_t K, uint32_t N, native_stats *st) {
+  const uint32_t nb = K / Q4_CPU_QK;
+  uint8_t *w = malloc((size_t)N * nb * Q4_CPU_BLOCK_BYTES);
+  uint8_t *m1 = aligned_alloc(128, q4m1_bytes(K, N));
+  float *x = malloc(K * sizeof(float));
+  float *yn = malloc(N * sizeof(float)), *yc = malloc(N * sizeof(float));
+  float *yk = malloc(N * sizeof(float)), *yt = malloc(N * sizeof(float));
+  int8_t *q = malloc(K), *qc = malloc(K);
+  uint16_t *da = malloc(nb * 2u), *dc = malloc(nb * 2u);
+  hvx_q4m1_act act = {aligned_alloc(128, K), malloc(nb * 4u), NULL, NULL, NULL,
+                      malloc(nb * 2u)};
+  make_weights(w, K, N);
+  q4m1_from_q4_0(w, K, N, m1);
+  uint32_t bad = 0;
+  for (int row = 0; row < 4; ++row) {
+    make_row(x, K, row, row);
+    q8_0_quant_native_det(x, K, q, da);
+    q4_gemv_native_det(w, q, da, K, N, yn);
+    q8_0_quant_cpu_det(x, K, qc, dc);
+    q4_gemv_cpu_det(w, qc, dc, K, N, yc);
+    exact_dot(x, w, K, N, yt);
+    hvx_q4m1_prep_vec(x, K, &act);
+    memset(yk, 0xA5, N * sizeof(float));
+    hvx_q4m1_gemv_groups_native(m1, K, N / Q4M1_GROUP, &act, yk);
+    const int ok = memcmp(act.q, q, K) == 0 &&
+                   memcmp(act.d, da, nb * 2u) == 0 &&
+                   memcmp(yk, yn, N * sizeof(float)) == 0;
+    bad += !ok;
+    ++st->cells;
+    const double s = snr_db(yc, yn, N), sc = snr_db(yt, yc, N),
+                 sn = snr_db(yt, yn, N);
+    if (row < 3) { /* make_row's natural kinds */
+      st->snr_min = s < st->snr_min ? s : st->snr_min;
+    } else { /* kind 3: every block on a quantizer rounding edge */
+      st->snr_edge = s < st->snr_edge ? s : st->snr_edge;
+      st->edge_vs_true =
+        sn - sc < st->edge_vs_true ? sn - sc : st->edge_vs_true;
+    }
+  }
+  printf("Q4 NATIVE K=%u N=%u rows=4 kernel bad=%u\n", K, N, bad);
+  st->bad += bad;
+  free(w);
+  free(m1);
+  free(x);
+  free(yn);
+  free(yc);
+  free(yk);
+  free(yt);
+  free(q);
+  free(qc);
+  free(da);
+  free(dc);
+  free(act.q);
+  free(act.s8);
+  free(act.d);
+}
+
+/** @brief hvx_q4m1_prep_vec == q8_0_quant_native_det (q, d, and s8 = -8
+ *  sum q) on 3000 rows of K = 2048 (make_row's four kinds, and blocks at
+ *  2^-60 times 2^-2 .. 2^2, both sides of the zero cut); and the Newton
+ *  id against the correctly rounded 1 / d, in ulps. */
+static void check_native_quant(native_stats *st) {
+  enum { K = 2048, NB = K / 32 };
+  static float x[K];
+  static int8_t q[K] __attribute__((aligned(128))), qs[K];
+  static uint16_t d[NB], ds[NB];
+  static int32_t s8[NB];
+  hvx_q4m1_act act = {q, s8, NULL, NULL, NULL, d};
+  uint32_t bad = 0, rows = 0, id_ulp_max = 0;
+  for (int r = 0; r < 3000; ++r, ++rows) {
+    if (r < 2800) {
+      make_row(x, K, r % 4, r);
+    } else {
+      for (uint32_t i = 0; i < K; ++i) {
+        x[i] = ldexpf(frand(-1.0f, 1.0f), -60 + (int)((i / 32u) % 5u) - 2);
+      }
+    }
+    hvx_q4m1_prep_vec(x, K, &act);
+    q8_0_quant_native_det(x, K, qs, ds);
+    int ok = memcmp(q, qs, K) == 0 && memcmp(d, ds, sizeof(d)) == 0;
+    for (uint32_t b = 0; b < NB; ++b) {
+      int32_t sum = 0;
+      uint32_t amax = 0;
+      for (uint32_t j = 0; j < 32u; ++j) {
+        sum += qs[b * 32u + j];
+        const uint32_t v = fbits(x[b * 32u + j]) & 0x7fffffffu;
+        amax = v > amax ? v : amax;
+      }
+      ok &= s8[b] == -8 * sum;
+      float dd, id;
+      q4n_block_scale(amax, &dd, &id);
+      if (dd != 0.0f) {
+        const uint32_t a = fbits(id), c = fbits(cpu_det_div_rn(1.0f, dd));
+        const uint32_t u = a > c ? a - c : c - a;
+        id_ulp_max = u > id_ulp_max ? u : id_ulp_max;
+      }
+    }
+    bad += !ok;
+  }
+  printf("Q8 QUANT NATIVE rows=%u K=%d bad_rows=%u newton_id_ulp_max=%u\n",
+         rows, K, bad, id_ulp_max);
+  st->cells += rows;
+  st->bad += bad;
+}
+
 int main(void) {
   /* the five FC shapes, then two with K % 128 == 64 (the quantizer's
      pair tail; the fixtures' dense down has K = 64, #132 Part B) */
@@ -400,6 +557,17 @@ int main(void) {
   CHECK(ties > 0u && ro > 0u && to_zero > 0u, "no near-tie coverage");
   CHECK(bad_spec == 0u, "spec differs from the CPU reference");
   CHECK(bad_kernel == 0u, "kernel differs from the spec");
+  native_stats ns = {0u, 0u, 999.0, 999.0, 999.0};
+  check_native_quant(&ns);
+  for (int s = 0; s < 7; ++s) {
+    check_native_shape(shapes[s][0], shapes[s][1], &ns);
+  }
+  printf("Q4 NATIVE bit-exact vs spec %u/%u snr_db=%.1f (vs the CPU order, "
+         "natural rows; quantizer-edge rows %.1f, their distance to the f64 "
+         "dot %+.1f dB vs the CPU order's)\n",
+         ns.cells - ns.bad, ns.cells, ns.snr_min, ns.snr_edge, ns.edge_vs_true);
+  CHECK(ns.bad == 0u, "native kernel or quantizer differs from its spec");
+  CHECK(ns.snr_min >= 60.0, "native spec below 60 dB of the CPU order");
   if (g_fail) {
     printf("Q4 GEMV CHECK FAILED\n");
     return 1;

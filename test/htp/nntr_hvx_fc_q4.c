@@ -87,6 +87,10 @@
  *  first sitting are gone). */
 #define FC_Q4_FEED_VTCM (1u << 16)
 #define FC_Q4_FEED_L2 (1u << 17)
+/** @brief [#194 L1] fc_q4m1_f32's variant and the runner's feed word: bit
+ *  18 the native pair (hvx_q4m1_prep_vec, hvx_q4m1_gemv_groups_native)
+ *  beside either feed. */
+#define FC_Q4_NATIVE (1u << 18)
 /** @brief The L2 feed's scratch: 2 x 129 KiB x 6 lanes at K = 7168 fits. */
 #define FC_Q4_L2_BYTES (2u << 20)
 /** @brief The graph's lanes per feed (#178 set3, L2-fed: 26 GB/s at K =
@@ -227,6 +231,7 @@ typedef struct {
   const hvx_q4m1_act *a;
   float *y;
   uint32_t feed_vtcm;  /**< any DMA feed (VTCM or L2) */
+  uint32_t native;     /**< the native GEMV (#194 L1) */
   uint32_t dst_bypass; /**< 1 the VTCM feed, 0 the L2 feed */
   uint8_t *vtcm;
   uint32_t vtcm_per_lane;
@@ -273,10 +278,12 @@ static void fc_lane(uint32_t n, uint32_t i, void *v) {
   if (i == 0u) {
     c->lanes_used = n;
   }
+  void (*const gemv)(const uint8_t *, uint32_t, uint32_t, const hvx_q4m1_act *,
+                     float *) =
+    c->native ? hvx_q4m1_gemv_groups_native : hvx_q4m1_gemv_groups;
   if (!c->feed_vtcm) {
     for (uint32_t g = i; g < c->G; g += n) {
-      hvx_q4m1_gemv_groups(c->w + g * c->gbytes, c->K, 1u, c->a,
-                           c->y + (size_t)g * Q4M1_GROUP);
+      gemv(c->w + g * c->gbytes, c->K, 1u, c->a, c->y + (size_t)g * Q4M1_GROUP);
     }
     return;
   }
@@ -297,8 +304,7 @@ static void fc_lane(uint32_t n, uint32_t i, void *v) {
                    c->w + (g + n) * c->gbytes, (uint32_t)c->gbytes,
                    c->dst_bypass);
     }
-    hvx_q4m1_gemv_groups(buf[cur], c->K, 1u, c->a,
-                         c->y + (size_t)g * Q4M1_GROUP);
+    gemv(buf[cur], c->K, 1u, c->a, c->y + (size_t)g * Q4M1_GROUP);
     cur ^= 1u;
   }
 }
@@ -310,6 +316,8 @@ int nntr_hvx_fc_q4m1_run(nntr_hvx_session *s, uint32_t h, const hvx_q4m1_act *a,
     return AEE_EBADITEM;
   }
   const nntr_hvx_q4m1_slot *w = &s->q4m1[h];
+  const uint32_t native = feed & FC_Q4_NATIVE;
+  feed &= ~FC_Q4_NATIVE;
   if (lanes == 0u || lanes > FC_Q4_MAX_LANES ||
       (feed & ~(FC_Q4_FEED_VTCM | FC_Q4_FEED_L2)) != 0u ||
       feed == (FC_Q4_FEED_VTCM | FC_Q4_FEED_L2)) {
@@ -317,6 +325,7 @@ int nntr_hvx_fc_q4m1_run(nntr_hvx_session *s, uint32_t h, const hvx_q4m1_act *a,
   }
   fc_ctx c;
   memset(&c, 0, sizeof(c));
+  c.native = native != 0u;
   c.w = w->w;
   c.K = w->K;
   c.G = w->N / Q4M1_GROUP;
@@ -364,9 +373,11 @@ int nntr_hvx_fc_q4m1_graph(void *ctx, uint32_t h, uint32_t feed,
   }
   const size_t gbytes = (size_t)(s->q4m1[h].K / 64u) * Q4M1_PAIR_BYTES;
   const uint32_t per_lane = (s->config_off / FC_Q4_GRAPH_LANES_VTCM) & ~127u;
+  const uint32_t native =
+    (feed & HTP_GRAPH_FEED_NATIVE) != 0u ? FC_Q4_NATIVE : 0u;
   if ((feed & HTP_GRAPH_FEED_L2) == 0u && per_lane >= 2u * gbytes) {
     return nntr_hvx_fc_q4m1_run(s, h, a, y, FC_Q4_GRAPH_LANES_VTCM,
-                                FC_Q4_FEED_VTCM, NULL);
+                                FC_Q4_FEED_VTCM | native, NULL);
   }
   const uint32_t small = s->q4m1[h].K <= 2048u;
   uint32_t lanes =
@@ -374,7 +385,7 @@ int nntr_hvx_fc_q4m1_graph(void *ctx, uint32_t h, uint32_t feed,
   if (lanes == 0u) {
     lanes = small ? FC_Q4_GRAPH_LANES_L2_SMALL_K : FC_Q4_GRAPH_LANES_L2;
   }
-  return nntr_hvx_fc_q4m1_run(s, h, a, y, lanes, FC_Q4_FEED_L2, NULL);
+  return nntr_hvx_fc_q4m1_run(s, h, a, y, lanes, FC_Q4_FEED_L2 | native, NULL);
 }
 
 int nntr_hvx_fc_q4m1_f32(remote_handle64 handle, uint32 h, uint32 variant,
@@ -389,8 +400,9 @@ int nntr_hvx_fc_q4m1_f32(remote_handle64 handle, uint32 h, uint32 variant,
   }
   const nntr_hvx_q4m1_slot *w = &s->q4m1[h];
   const uint32_t feed = variant & (FC_Q4_FEED_VTCM | FC_Q4_FEED_L2);
+  const uint32_t native = variant & FC_Q4_NATIVE;
   if ((uint32_t)xLen != w->K || (uint32_t)yLen != w->N ||
-      statsLen != FC_Q4_STATS || variant != feed ||
+      statsLen != FC_Q4_STATS || variant != (feed | native) ||
       feed == (FC_Q4_FEED_VTCM | FC_Q4_FEED_L2) || lanes == 0u ||
       lanes > FC_Q4_MAX_LANES || reps == 0u) {
     FARF(ERROR, "fc_q4m1_f32: bad call (x=%d y=%d variant=0x%x lanes=%u)", xLen,
@@ -402,10 +414,15 @@ int nntr_hvx_fc_q4m1_f32(remote_handle64 handle, uint32 h, uint32 variant,
   uint32_t lanes_used = 0;
   for (uint32_t r = 0; r < reps; ++r) {
     const uint64_t t0 = hexkl_probe_now();
-    hvx_q4m1_prep(x, w->K, &a);
+    if (native) {
+      hvx_q4m1_prep_vec(x, w->K, &a);
+    } else {
+      hvx_q4m1_prep(x, w->K, &a);
+    }
     const uint64_t t1 = hexkl_probe_now();
     const uint64_t p0 = HAP_perf_get_pcycles();
-    const int rc = nntr_hvx_fc_q4m1_run(s, h, &a, y, lanes, feed, &lanes_used);
+    const int rc =
+      nntr_hvx_fc_q4m1_run(s, h, &a, y, lanes, feed | native, &lanes_used);
     pcyc += HAP_perf_get_pcycles() - p0;
     if (rc != AEE_SUCCESS) {
       return rc;

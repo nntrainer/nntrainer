@@ -196,7 +196,9 @@ enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
  * has 2 groups per lane of it, else the L2 scratch; 1 the L2 scratch
  * (hexkl_graph.h); [#132 Part B E5f] bits 8-11 / 12-15 the L2 feed's
  * lanes for a part with K <= 2048 / K > 2048, 0 = the runner's default
- * (HTP_GRAPH_FEED_*). Other kinds leave all of these 0. n_kv / gqa /
+ * (HTP_GRAPH_FEED_*); [#194 L1, htp_moe_ppl] bit 16 the native kernels
+ * (q4_gemv_native_det.h: vector quantizer, no emulated FMA) in place of the
+ * CPU-exact ones. Other kinds leave all of these 0. n_kv / gqa /
  * head_dim describe the attention kinds (QK_NORM,
  * ROPE, ATTN_M1: K == (gqa + 2) n_kv head_dim, ATTN_M1's N == gqa n_kv
  * head_dim) and eps_bits holds the f32 bits of the norm epsilon (RMSNORM,
@@ -215,7 +217,8 @@ typedef struct {
   uint32_t out_slot;
   uint32_t next_mm;
   uint32_t feed; /**< Q4M1 kinds: bit 0 the L2 feed (else VTCM if it
-                     fits); bits 8-11 / 12-15 the L2 lanes, small / large K */
+                     fits); bits 8-11 / 12-15 the L2 lanes, small / large K;
+                     bit 16 the native kernels (#194 L1) */
   uint32_t n_kv;
   uint32_t gqa;
   uint32_t head_dim;
@@ -226,6 +229,7 @@ typedef struct {
 #define HTP_GRAPH_OP_WORDS (16u + 2u * HTP_GRAPH_MAX_EXPERTS)
 /** @brief The Q4M1 kinds' feed word (htp_graph_op.feed). */
 #define HTP_GRAPH_FEED_L2 1u
+#define HTP_GRAPH_FEED_NATIVE (1u << 16)
 #define HTP_GRAPH_FEED_LANES_SMALL(f) (((f) >> 8) & 0xFu)
 #define HTP_GRAPH_FEED_LANES_LARGE(f) (((f) >> 12) & 0xFu)
 typedef char
@@ -458,7 +462,8 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     }
     if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(k)) != 0u) {
       if (op->n_experts > HTP_GRAPH_MAX_EXPERTS ||
-          (op->feed & ~(HTP_GRAPH_FEED_L2 | 0xFF00u)) != 0u ||
+          (op->feed & ~(HTP_GRAPH_FEED_L2 | 0xFF00u | HTP_GRAPH_FEED_NATIVE)) !=
+            0u ||
           HTP_GRAPH_FEED_LANES_SMALL(op->feed) > 8u ||
           HTP_GRAPH_FEED_LANES_LARGE(op->feed) > 8u)
         return HTP_GRAPH_E_INVALIDFORMAT;

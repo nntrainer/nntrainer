@@ -35,6 +35,7 @@
 #include <string.h>
 
 #include "q4_gemv_cpu_det.h"
+#include "q4_gemv_native_det.h"
 
 #define Q4M1_INLINE static inline __attribute__((always_inline))
 
@@ -108,42 +109,20 @@ static int q4m1_host_id(void) {
  *  8192, the entry's own limit). */
 #define Q4M1_PREP_MAX_NB 256u
 
-/**
- * q8_0_quant_cpu_det on the vector unit (K % 64 == 0, K <= 8192), one
- * 32-float block per vector, four at a time (a K % 128 == 64 row ends in a
- * pair, whose 64 quant bytes are stored through a copy), in
- * three passes so the vector and scalar units meet twice per call, not
- * twice per block:
- *   1 (vector) amax = max |x|: word max of the sign-cleared bits (exact,
- *              no FP op), stored per block
- *   2 (scalar) d = RN(amax / 127), id = RN(1 / d): the Hexagon's scalar
- *              divide (sfrecipa / sffixup; IEEE RN, checked against
- *              cpu_det_div_rn over every mantissa on the ISS and on
- *              silicon, HvxFcQ4.ScalarDivide), then d's f16 and terms
- *   3 (vector) q = RN-even(x * id) by the 1.5 * 2^23 magic add (|x id| <=
- *              127.5, well inside its 2^22 range; the add rounds ties to
- *              even, as fcvtns does); four blocks' low bytes per 128-byte
- *              store (vpacke), and the block sums by a rotate-add tree
- * Both Vsf ops are the silicon-checked qf32 pairs. A block under
- * Q4M1_PREP_TINY, or not finite, runs the scalar spec in pass 2.
- * ponytail: static scratch, one call at a time (as the entry file's).
- */
-void hvx_q4m1_prep(const float *x, uint32_t K, hvx_q4m1_act *a) {
-  /* lane j of amax_v[b / 32] / sum_v[b / 32] is block b = 32 (b / 32) + j:
-     one vector store per 32 blocks, read back as consecutive words */
-  static HVX_Vector amax_v[Q4M1_PREP_MAX_NB / 32u],
-    sum_v[Q4M1_PREP_MAX_NB / 32u];
-  static int32_t id_bits[Q4M1_PREP_MAX_NB];
-  static const int32_t lane_idx[32] __attribute__((aligned(128))) = {
-    0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
-    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
-  const HVX_Vector lanes = *(const HVX_Vector *)lane_idx;
-  static uint8_t scalar_blk[Q4M1_PREP_MAX_NB];
+/** @brief Lane j of each vector is its own index: the mux of a block's
+ *  word into the vector that holds 32 blocks' words. */
+static const int32_t q4m1_lane_idx[32] __attribute__((aligned(128))) = {
+  0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
+  16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
+
+/** @brief Pass 1 (vector): amax = max |x| per block, the word max of the
+ *  sign-cleared bits (exact, no FP op); lane j of amax_v[b / 32] is block
+ *  b = 32 (b / 32) + j. Four independent trees at a time. */
+static void q4m1_amax_pass(const HVX_UVector *xv, uint32_t nb,
+                           HVX_Vector *amax_v) {
+  const HVX_Vector lanes = *(const HVX_Vector *)q4m1_lane_idx;
   const HVX_Vector absm = Q6_V_vsplat_R(0x7FFFFFFF);
-  const HVX_Vector magic = Q6_V_vsplat_R(0x4B400000); /* 1.5 * 2^23 */
-  const uint32_t nb = K / Q4_CPU_QK;
-  const HVX_UVector *xv = (const HVX_UVector *)x;
-  for (uint32_t b = 0; b < nb; b += 4u) { /* 4 independent trees */
+  for (uint32_t b = 0; b < nb; b += 4u) {
     const uint32_t nj = nb - b < 4u ? nb - b : 4u;
     HVX_Vector m[4];
     for (uint32_t j = 0; j < 4u; ++j) {
@@ -160,25 +139,18 @@ void hvx_q4m1_prep(const float *x, uint32_t K, hvx_q4m1_act *a) {
         amax_v[(b + j) / 32u]);
     }
   }
-  const uint32_t *amax_w = (const uint32_t *)amax_v;
-  const int32_t *sum_w = (const int32_t *)sum_v;
-  for (uint32_t b = 0; b < nb; ++b) {
-    const uint32_t amax_bits = amax_w[b];
-    scalar_blk[b] = amax_bits < Q4M1_PREP_TINY || amax_bits >= 0x7f800000u;
-    if (scalar_blk[b]) {
-      id_bits[b] = 0;
-      continue;
-    }
-    const float d = cpu_det_float(amax_bits) / 127.0f;
-#if defined(NNTR_Q4M1_HOST_ID)
-    const float id =
-      q4m1_host_id() ? 127.0f / cpu_det_float(amax_bits) : 1.0f / d;
-#else
-    const float id = 1.0f / d;
-#endif
-    memcpy(&id_bits[b], &id, sizeof(float));
-    a->d[b] = q4m1_f32_to_f16(d);
-  }
+}
+
+/** @brief Pass 3 (vector): q = RN-even(x * id) by the 1.5 * 2^23 magic add
+ *  (|x id| <= 127.5, well inside its 2^22 range; the add rounds ties to
+ *  even, as fcvtns does); four blocks' low bytes per 128-byte store
+ *  (vpacke), and the block sums by a rotate-add tree into sum_v (lanes as
+ *  amax_v's). */
+static void q4m1_quant_pass(const HVX_UVector *xv, uint32_t nb,
+                            const int32_t *id_bits, int8_t *q,
+                            HVX_Vector *sum_v) {
+  const HVX_Vector lanes = *(const HVX_Vector *)q4m1_lane_idx;
+  const HVX_Vector magic = Q6_V_vsplat_R(0x4B400000); /* 1.5 * 2^23 */
   for (uint32_t b = 0; b < nb; b += 4u) {
     const uint32_t nj = nb - b < 4u ? nb - b : 4u;
     HVX_Vector qw[4], sv[4];
@@ -206,11 +178,57 @@ void hvx_q4m1_prep(const float *x, uint32_t K, hvx_q4m1_act *a) {
     const HVX_Vector packed = Q6_Vb_vpacke_VhVh(
       Q6_Vh_vpacke_VwVw(qw[3], qw[2]), Q6_Vh_vpacke_VwVw(qw[1], qw[0]));
     if (nj == 4u) {
-      *(HVX_UVector *)(a->q + (size_t)b * Q4_CPU_QK) = packed;
+      *(HVX_UVector *)(q + (size_t)b * Q4_CPU_QK) = packed;
     } else {
-      memcpy(a->q + (size_t)b * Q4_CPU_QK, &packed, (size_t)nj * Q4_CPU_QK);
+      memcpy(q + (size_t)b * Q4_CPU_QK, &packed, (size_t)nj * Q4_CPU_QK);
     }
   }
+}
+
+/**
+ * q8_0_quant_cpu_det on the vector unit (K % 64 == 0, K <= 8192), one
+ * 32-float block per vector, four at a time (a K % 128 == 64 row ends in a
+ * pair, whose 64 quant bytes are stored through a copy), in
+ * three passes so the vector and scalar units meet twice per call, not
+ * twice per block:
+ *   1 (vector) amax (q4m1_amax_pass)
+ *   2 (scalar) d = RN(amax / 127), id = RN(1 / d): the Hexagon's scalar
+ *              divide (sfrecipa / sffixup; IEEE RN, checked against
+ *              cpu_det_div_rn over every mantissa on the ISS and on
+ *              silicon, HvxFcQ4.ScalarDivide), then d's f16 and terms
+ *   3 (vector) q and the block sums (q4m1_quant_pass)
+ * Both Vsf ops are the silicon-checked qf32 pairs. A block under
+ * Q4M1_PREP_TINY, or not finite, runs the scalar spec in pass 2.
+ * ponytail: static scratch, one call at a time (as the entry file's).
+ */
+void hvx_q4m1_prep(const float *x, uint32_t K, hvx_q4m1_act *a) {
+  static HVX_Vector amax_v[Q4M1_PREP_MAX_NB / 32u],
+    sum_v[Q4M1_PREP_MAX_NB / 32u];
+  static int32_t id_bits[Q4M1_PREP_MAX_NB];
+  static uint8_t scalar_blk[Q4M1_PREP_MAX_NB];
+  const uint32_t nb = K / Q4_CPU_QK;
+  const HVX_UVector *xv = (const HVX_UVector *)x;
+  q4m1_amax_pass(xv, nb, amax_v);
+  const uint32_t *amax_w = (const uint32_t *)amax_v;
+  const int32_t *sum_w = (const int32_t *)sum_v;
+  for (uint32_t b = 0; b < nb; ++b) {
+    const uint32_t amax_bits = amax_w[b];
+    scalar_blk[b] = amax_bits < Q4M1_PREP_TINY || amax_bits >= 0x7f800000u;
+    if (scalar_blk[b]) {
+      id_bits[b] = 0;
+      continue;
+    }
+    const float d = cpu_det_float(amax_bits) / 127.0f;
+#if defined(NNTR_Q4M1_HOST_ID)
+    const float id =
+      q4m1_host_id() ? 127.0f / cpu_det_float(amax_bits) : 1.0f / d;
+#else
+    const float id = 1.0f / d;
+#endif
+    memcpy(&id_bits[b], &id, sizeof(float));
+    a->d[b] = q4m1_f32_to_f16(d);
+  }
+  q4m1_quant_pass(xv, nb, id_bits, a->q, sum_v);
   for (uint32_t b = 0; b < nb; ++b) {
     int32_t s;
     if (scalar_blk[b]) {
@@ -224,6 +242,52 @@ void hvx_q4m1_prep(const float *x, uint32_t K, hvx_q4m1_act *a) {
       s = sum_w[b];
     }
     q4m1_block_terms(a, b, s);
+  }
+}
+
+/**
+ * [#194 L1] q8_0_quant_native_det on the vector unit: passes 1 and 3 as
+ * hvx_q4m1_prep's, pass 2 on 32 blocks per vector instead of a scalar
+ * divide pair per block -- d = amax * RN(1/127), id by three Newton steps
+ * (every op a silicon-checked Vsf pair), f16(d) by the qf32 -> hf
+ * narrowing (one RN, #170's ATTN_M1 path) -- and s8 = -8 * sum by vector.
+ * Writes q, s8 and d only (the native GEMV reads nothing else).
+ * ponytail: static scratch, one call at a time (as hvx_q4m1_prep).
+ */
+void hvx_q4m1_prep_vec(const float *x, uint32_t K, hvx_q4m1_act *a) {
+  static HVX_Vector amax_v[Q4M1_PREP_MAX_NB / 32u],
+    sum_v[Q4M1_PREP_MAX_NB / 32u], id_v[Q4M1_PREP_MAX_NB / 32u],
+    dh_v[Q4M1_PREP_MAX_NB / 32u], s8_v[Q4M1_PREP_MAX_NB / 32u];
+  const uint32_t nb = K / Q4_CPU_QK, nc = (nb + 31u) / 32u;
+  const HVX_UVector *xv = (const HVX_UVector *)x;
+  const HVX_Vector zero = Q6_V_vzero(), two = Q6_V_vsplat_R(0x40000000);
+  const HVX_Vector tiny = Q6_V_vsplat_R((int32_t)(Q4N_TINY_BITS - 1u));
+  const HVX_Vector inf = Q6_V_vsplat_R(0x7f800000);
+  const HVX_Vector inv127 = Q6_V_vsplat_R((int32_t)Q4N_INV127_BITS);
+  const HVX_Vector seed = Q6_V_vsplat_R((int32_t)Q4N_RECIP_SEED);
+  q4m1_amax_pass(xv, nb, amax_v);
+  for (uint32_t c = 0; c < nc; ++c) {
+    const HVX_Vector A = amax_v[c];
+    const HVX_VectorPred ok =
+      Q6_Q_and_QQ(Q6_Q_vcmp_gt_VwVw(A, tiny), Q6_Q_vcmp_gt_VwVw(inf, A));
+    const HVX_Vector d = sf_mpy(A, inv127);
+    HVX_Vector r = Q6_Vw_vsub_VwVw(seed, d);
+    for (int i = 0; i < 3; ++i) {
+      r = sf_mpy(r, sf_sub(two, sf_mpy(d, r)));
+    }
+    id_v[c] = Q6_V_vmux_QVV(ok, r, zero);
+    const HVX_Vector dq =
+      Q6_Vqf32_vadd_VsfVsf(Q6_V_vmux_QVV(ok, d, zero), zero);
+    dh_v[c] = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(dq, dq));
+  }
+  q4m1_quant_pass(xv, nb, (const int32_t *)id_v, a->q, sum_v);
+  for (uint32_t c = 0; c < nc; ++c) {
+    s8_v[c] = Q6_Vw_vsub_VwVw(zero, Q6_Vw_vasl_VwR(sum_v[c], 3));
+  }
+  memcpy(a->s8, s8_v, (size_t)nb * sizeof(int32_t));
+  const uint32_t *dh_w = (const uint32_t *)dh_v; /* f16(d) in both halves */
+  for (uint32_t b = 0; b < nb; ++b) {
+    a->d[b] = (uint16_t)dh_w[b];
   }
 }
 
@@ -300,6 +364,46 @@ static void q4m1_group_hvx(const uint8_t *wg, uint32_t np,
     }
   }
   *(HVX_UVector *)y = acc;
+}
+
+/**
+ * [#194 L1] One group on the vector unit in q4_gemv_native_det's order:
+ * per pair of blocks, the 64 f16 d_w interleaved block 2p / 2p+1 by
+ * column (vror + vshuff) and widened-multiplied by d_a's pair (the exact
+ * 22-bit products: s of block 2p in the pair's lo, 2p+1 in its hi), then
+ * per block acc = RN(acc + RN(isum * s)) -- two Vsf pairs, no emulated FMA.
+ */
+static void q4m1_group_native(const uint8_t *wg, uint32_t np,
+                              const hvx_q4m1_act *a, float *y) {
+  HVX_Vector acc = Q6_V_vzero();
+  for (uint32_t p = 0; p < np; ++p) {
+    const uint8_t *unit = wg + (size_t)p * Q4M1_PAIR_BYTES;
+    const HVX_Vector D = *(const HVX_Vector *)(unit + Q4M1_D_OFF);
+    const HVX_Vector Dsh =
+      Q6_V_lo_W(Q6_W_vshuff_VVR(Q6_V_vror_VR(D, 64), D, -2));
+    const uint32_t da = (uint32_t)a->d[2u * p] | (uint32_t)a->d[2u * p + 1u]
+                                                   << 16;
+    const HVX_VectorPair S =
+      Q6_Wqf32_vmpy_VhfVhf(Dsh, Q6_V_vsplat_R((int32_t)da));
+    for (uint32_t hb = 0; hb < 2u; ++hb) {
+      const uint32_t b = 2u * p + hb;
+      const HVX_Vector is = q4m1_isum((const HVX_Vector *)(unit + 512u * hb),
+                                      a->q + (size_t)b * Q4_CPU_QK, a->s8[b]);
+      const HVX_Vector s =
+        Q6_Vsf_equals_Vqf32(hb ? Q6_V_hi_W(S) : Q6_V_lo_W(S));
+      acc = sf_add(acc, sf_mpy(Q6_Vsf_equals_Vw(is), s));
+    }
+  }
+  *(HVX_UVector *)y = acc;
+}
+
+void hvx_q4m1_gemv_groups_native(const uint8_t *w, uint32_t K, uint32_t ngroups,
+                                 const hvx_q4m1_act *a, float *y) {
+  const uint32_t np = K / 64u;
+  const size_t gbytes = (size_t)np * Q4M1_PAIR_BYTES;
+  for (uint32_t g = 0; g < ngroups; ++g) {
+    q4m1_group_native(w + g * gbytes, np, a, y + (size_t)g * Q4M1_GROUP);
+  }
 }
 
 void hvx_q4m1_gemv_groups(const uint8_t *w, uint32_t K, uint32_t ngroups,

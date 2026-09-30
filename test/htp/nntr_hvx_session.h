@@ -167,7 +167,9 @@ int nntr_hvx_q4m1_borrows(const nntr_hvx_session *s, const uint8_t *va,
  *        weight @a h times the prepared activation @a a. @a feed 0 reads
  *        the weight from DDR in place, FC_Q4_FEED_VTCM (1 << 16) stages
  *        each lane's next 32-column group into VTCM by DMA, FC_Q4_FEED_L2
- *        (1 << 17) the same into the session's L2 scratch.
+ *        (1 << 17) the same into the session's L2 scratch; [#194 L1]
+ *        FC_Q4_NATIVE (1 << 18) beside either runs the native GEMV (@a a
+ *        from hvx_q4m1_prep_vec).
  * @return 0, AEE_EBADITEM (a free or out-of-range handle),
  *         AEE_EINVALIDFORMAT (lanes, feed, or a feed that cannot hold two
  *         groups per lane), AEE_ENOMEMORY, AEE_EEXPIRED (a DMA never
@@ -180,7 +182,8 @@ int nntr_hvx_fc_q4m1_run(nntr_hvx_session *s, uint32_t h, const hvx_q4m1_act *a,
 /** @brief [#132 Part B] The graph's hexkl_graph_fc_fn over @a ctx = the
  *  session: the op's feed 0 takes VTCM at 6 lanes when two groups per lane
  *  fit below the HMX config block, else the L2 scratch at 3 lanes; feed 1
- *  the L2 scratch. Lives in nntr_hvx_fc_q4.c. */
+ *  the L2 scratch; HTP_GRAPH_FEED_NATIVE the native GEMV (#194 L1). Lives
+ *  in nntr_hvx_fc_q4.c. */
 int nntr_hvx_fc_q4m1_graph(void *ctx, uint32_t h, uint32_t feed,
                            const hvx_q4m1_act *a, float *y);
 

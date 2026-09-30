@@ -58,6 +58,19 @@ void hvx_q4m1_prep(const float *x, uint32_t K, hvx_q4m1_act *a);
 void hvx_q4m1_gemv_groups(const uint8_t *w, uint32_t K, uint32_t ngroups,
                           const hvx_q4m1_act *a, float *y);
 
+/**
+ * @brief [#194 L1] q8_0_quant_native_det (q4_gemv_native_det.h) of x on
+ *        the vector unit (K % 64 == 0, K <= 8192): writes q, s8 and d only.
+ */
+void hvx_q4m1_prep_vec(const float *x, uint32_t K, hvx_q4m1_act *a);
+
+/**
+ * @brief [#194 L1] hvx_q4m1_gemv_groups in q4_gemv_native_det's order, on
+ *        an activation from hvx_q4m1_prep_vec (reads q, s8 and d).
+ */
+void hvx_q4m1_gemv_groups_native(const uint8_t *w, uint32_t K, uint32_t ngroups,
+                                 const hvx_q4m1_act *a, float *y);
+
 #ifdef __cplusplus
 }
 #endif
