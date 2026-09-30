@@ -109,6 +109,7 @@ static void tk_post(uint8_t *slot, volatile uint32_t *word, uint32_t seq,
   h->op = op;
   h->n = rc == 0 ? n : 0u;
   h->rc = rc;
+  h->post_us = (uint32_t)tk_now_us();
   *(uint32_t *)(slot + HEXKL_MBOX_LINE + row) = seq;
   tk_clean(slot, 2u * HEXKL_MBOX_LINE + row);
   *word = seq;
@@ -122,6 +123,7 @@ static int tk_take(uint8_t *slot, volatile uint32_t *word, uint32_t seq,
                    uint32_t spin_us, hexkl_token_stats *st,
                    hexkl_mbox_hdr *out) {
   const uint64_t t0 = tk_now_us();
+  uint64_t seen;
   uint32_t row;
   for (;;) {
     tk_refresh((void *)word, 4u);
@@ -140,13 +142,20 @@ static int tk_take(uint8_t *slot, volatile uint32_t *word, uint32_t seq,
       tk_pause();
     }
   }
-  st->wait_us += (uint32_t)(tk_now_us() - t0);
+  seen = tk_now_us();
+  st->wait_us += (uint32_t)(seen - t0);
   tk_refresh(slot, HEXKL_MBOX_LINE);
   memcpy(out, slot, sizeof(*out));
   if (out->seq != seq || out->n * 4u > HEXKL_MBOX_ROW_MAX) {
     ++st->stale;
     return HEXKL_TOKEN_E_STALE;
   }
+  /* [#194 L0] the hop's own latency: from the post, or from the start of
+     this wait if the post came first, to the read that saw it (the poll
+     sleep's granularity, the cache maintenance); never more than the wait */
+  st->hop_us +=
+    (uint32_t)seen -
+    ((int32_t)(out->post_us - (uint32_t)t0) > 0 ? out->post_us : (uint32_t)t0);
   row = tk_row_bytes(out->n);
   tk_refresh(slot + HEXKL_MBOX_LINE, row + HEXKL_MBOX_LINE);
   if (*(const uint32_t *)(slot + HEXKL_MBOX_LINE + row) != seq) {

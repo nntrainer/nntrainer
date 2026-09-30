@@ -393,6 +393,11 @@ static void check_bit_identical(const uint32_t *words, uint32_t n) {
         same_logits, same_id, TOKENS);
   CHECK(g_moe_calls == g_moe_cap && same_moe == g_moe_cap,
         "MoE calls %u, %u equal of %u", g_moe_calls, same_moe, g_moe_cap);
+  /* [#194 L0] the hop latency is a part of the wait, and not all of it */
+  CHECK(st.hop_us <= st.wait_us && sa.st.hop_us <= sa.st.wait_us &&
+          st.hop_us > 0u && sa.st.hop_us > 0u,
+        "hop_us S2 %u of wait %u, S1 %u of wait %u", st.hop_us, st.wait_us,
+        sa.st.hop_us, sa.st.wait_us);
   CHECK(st.hops == 2u * rounds * TOKENS && sa.st.hops == st.hops &&
           st.timeouts + sa.st.timeouts + st.stale + sa.st.stale == 0u,
         "hops S2 %u S1 %u timeouts %u %u stale %u %u", st.hops, sa.st.hops,
@@ -401,8 +406,9 @@ static void check_bit_identical(const uint32_t *words, uint32_t n) {
     printf("TOKEN DRIVER BIT-IDENTICAL: tokens %u/%u (%u distinct ids) "
            "logits bit_identical=1 "
            "moe_calls %u/%u in+out bit_identical=1 hops=%u (%u x tokens) "
-           "timeouts=0 stale=0 (hd64 C A C, S1 = ROUTER_TOPK|MOE on a "
-           "pthread, S2 = the rest; vs the one-session all-resident run)\n",
+           "timeouts=0 stale=0 hop_us<=wait_us (hd64 C A C, S1 = "
+           "ROUTER_TOPK|MOE on a pthread, S2 = the rest; vs the one-session "
+           "all-resident run)\n",
            same_id, TOKENS, distinct, same_moe, g_moe_cap, st.hops,
            2u * rounds);
   close_session(&s1);

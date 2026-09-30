@@ -73,13 +73,15 @@ typedef struct {
 /** @brief OP_TOKEN's response: id (S2: LM_HEAD's argmax), the hops this
  *  side made, its wait for the other side, the pcycles of its ops; the
  *  token's wall time on this side and the pcycles over it (their ratio is
- *  the clock), and the op pcycles per kind. */
+ *  the clock), and the op pcycles per kind; [#194 L0] of the wait, the
+ *  time from each of the other side's posts to this side's wake-up. */
 typedef struct htp_dspq_token_resp_s {
   uint32_t seq;
   int32_t rc;
   uint32_t id, hops, wait_us, pcycles;
   uint32_t wall_us, wall_pcyc;
   uint32_t kind_pcyc[HTP_DSPQ_TOKEN_KINDS];
+  uint32_t hop_us;
 } htp_dspq_token_resp;
 
 /** @brief The request message length for n_experts experts and n_rows

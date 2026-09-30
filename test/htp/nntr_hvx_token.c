@@ -152,6 +152,7 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
   r->id = id;
   r->hops = t->st.hops - before.hops;
   r->wait_us = t->st.wait_us - before.wait_us;
+  r->hop_us = t->st.hop_us - before.hop_us;
   r->pcycles = (uint32_t)(t->st.pcycles - before.pcycles);
   for (k = 0; k < HTP_DSPQ_TOKEN_KINDS && k < HTP_OP_KIND_N; ++k) {
     r->kind_pcyc[k] =

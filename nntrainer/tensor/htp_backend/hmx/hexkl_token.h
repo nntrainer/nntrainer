@@ -85,6 +85,8 @@ typedef struct {
   uint32_t op;  /**< S2 -> S1: where S1 starts; S1 -> S2: where S2 resumes */
   uint32_t n;   /**< the row's f32 count */
   int32_t rc;   /**< 0, or the poster's failure (the row is void) */
+  uint32_t post_us; /**< [#194 L0] the poster's clock at the post (low 32
+                         bits of the QTimer's us, global to both PDs) */
 } hexkl_mbox_hdr;
 
 /** @brief One side's counters, accumulated over its calls. */
@@ -92,6 +94,8 @@ typedef struct {
   uint32_t tokens;   /**< calls that returned 0 */
   uint32_t hops;     /**< rows posted plus rows received */
   uint32_t wait_us;  /**< time spent waiting for the other side */
+  uint32_t hop_us;   /**< [#194 L0] of it, from each post (or the wait's
+                          start, if later) to the wake-up that saw it */
   uint32_t timeouts; /**< waits that gave up (AEE_EEXPIRED) */
   uint32_t stale;    /**< reads refused as stale */
   uint64_t pcycles;  /**< the op_pcycles of every stretch this side ran */
