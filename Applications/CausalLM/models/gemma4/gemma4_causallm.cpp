@@ -583,7 +583,7 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
     withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
-  LayerHandle mha(createLayer("mha_core", a_params));
+  LayerHandle mha(createAttentionCore(a_params));
   Tensor a = mha({q_scaled, shared_k_norm, shared_v_norm, cache_k, cache_v});
 
   // O layer [B, S, Nq*Dh] -> [B, S, H]
@@ -720,7 +720,7 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     withKey("attn_logit_softcapping", std::to_string(ATTN_LOGIT_SOFTCAPPING)),
     withKey("is_causal", IS_CAUSAL ? "true" : "false")};
   appendSkipPrefillIfNeeded(a_params, is_kv_shared_layer);
-  LayerHandle mha(createLayer("mha_core", a_params));
+  LayerHandle mha(createAttentionCore(a_params));
   Tensor a = mha({q_scaled, k_normed, v_normed, cache_k, cache_v});
 
   // O layer [B, S, Nq*Dh] -> [B, S, H]

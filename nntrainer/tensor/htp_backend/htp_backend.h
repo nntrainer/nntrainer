@@ -9,11 +9,21 @@
  * @bug    No known bugs except for NYI items
  * @brief  HTP (Hexagon Tensor Processor) backend lifecycle.
  *
- * Wraps the Qualcomm HexKL CPU Macro API (sdkl.h / libsdkl.so) NPU
- * lifecycle as a process-wide singleton. Initialization is attempted
- * once; if it fails (no device, missing skel, etc.) the backend is
- * left DISABLED and every HtpComputeOps::supports_*() returns false so
- * callers transparently fall back to the CPU path.
+ * Process-wide singleton owning the one HexKL micro-API FastRPC session a
+ * process opens: nntr_hvx_open against libnntr_hvx_skel.so, the skel
+ * test/htp/build.sh builds from test/htp/nntr_hvx.idl. This directory's
+ * generate_stub.sh produces the matching client stub from the same IDL, so
+ * the interface has one source of truth. If the skel is not reachable
+ * (not on ADSP_LIBRARY_PATH, no device, driver error) construction leaves
+ * the backend DISABLED and every HtpComputeOps::supports_*() reports
+ * false, so callers transparently take the CPU path.
+ *
+ * This used to own a HexKL CPU Macro API (sdkl.h / libsdkl.so) session
+ * instead. Nothing on this branch computed through it, and keeping it was
+ * a standing hazard rather than a convenience: once any process has run
+ * the micro API's hexkl_micro_hw_init (which the skel does in its open),
+ * a macro-API session fails permanently -- measured on the prior attention
+ * branch, see docs/backend_guide/htp_backend/20_hmx_flash_attention_plan.md.
  *
  * Compiled only when ENABLE_HEXKL is defined (meson: -Denable-htp=true).
  */
@@ -23,30 +33,49 @@
 #ifdef __cplusplus
 #ifdef ENABLE_HEXKL
 
+#include <cstdint>
+
 namespace nntrainer {
 
 /**
  * @class HtpBackend
- * @brief Process-wide owner of the HexKL NPU session (init/finalize).
+ * @brief Process-wide owner of the HexKL micro-API FastRPC session.
  */
 class HtpBackend {
 public:
   /**
    * @brief Access the process-wide singleton. The first call attempts
-   *        sdkl_npu_initialize() exactly once (thread-safe).
+   *        nntr_hvx_open() exactly once (thread-safe).
    */
   static HtpBackend &global();
 
   /**
-   * @brief Whether the NPU was successfully initialized and is usable.
-   *        When false, all HTP ops must defer to the CPU fallback.
+   * @brief Whether the HTP session is open and usable. When false, all
+   *        HTP ops must defer to the CPU fallback.
    */
   bool enabled() const { return enabled_; }
 
   /**
-   * @brief Target CDSP domain id the session was initialized on.
+   * @brief The FastRPC session handle every nntr_hvx_* call dispatches
+   *        through. Only meaningful when enabled() is true.
    */
-  int domain() const { return domain_; }
+  uint64_t handle() const { return handle_; }
+
+  /**
+   * @brief DSP-visible memory: an rpcmem block, i.e. a dma-buf the rpcmem
+   *        library registers with FastRPC as it allocates. Any range of it
+   *        passed as a FastRPC buffer argument is then mapped into the DSP
+   *        and cache-maintained instead of copied -- the KV cache goes
+   *        here so attention never copies the used cache per call.
+   * @return the block, or nullptr when the backend is disabled, @a bytes
+   *         is 0 or above the rpcmem limit, or the allocation failed
+   */
+  void *alloc_shared(size_t bytes);
+
+  /**
+   * @brief Frees a block from alloc_shared(); nullptr is a no-op.
+   */
+  void free_shared(void *block);
 
   ~HtpBackend();
 
@@ -57,18 +86,8 @@ private:
   HtpBackend();
 
   bool enabled_ = false;
-  int domain_ = 0; ///< CDSP_DOMAIN_ID (resolved in the .cpp)
+  uint64_t handle_ = 0;
 };
-
-/**
- * @brief True while the NPU session is initialized and sdkl_npu_free is
- *        safe to call. Set false by HtpBackend's destructor immediately
- *        before sdkl_npu_finalize so namespace-scope statics destroyed
- *        afterwards skip freeing an already-finalized NPU. A plain flag
- *        (not HtpBackend::enabled()) avoids touching the singleton after
- *        its own destruction.
- */
-bool npuAlive();
 
 } // namespace nntrainer
 

@@ -160,6 +160,81 @@ test('unittest_memory_pool', unittest_memory_pool_exe,
   suite: 'unittests'
 )
 
+# The fp16 attention planner is plain C arithmetic shared with the DSP-side
+# kernel (nntrainer/tensor/htp_backend/hmx/hexkl_attn_f16_plan.h); it has no
+# Hexagon dependency, so it is tested on every host build, not only under
+# -Denable-htp. Standalone because the shared loop cannot add its include dir.
+unittest_hexkl_attn_f16_plan_exe = executable(
+  'unittest_hexkl_attn_f16_plan',
+  'unittest_hexkl_attn_f16_plan.cpp',
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hmx'),
+  dependencies: nntrainer_test_main_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_hexkl_attn_f16_plan', unittest_hexkl_attn_f16_plan_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_attn_f16_plan')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
+# The resident KV tile registry is plain C too (its AEE codes come from a
+# tiny shim off-target); tested on the host against the documented layout.
+unittest_hexkl_kv_tiles_f16_exe = executable(
+  'unittest_hexkl_kv_tiles_f16',
+  ['unittest_hexkl_kv_tiles_f16.cpp',
+   '../../nntrainer/tensor/htp_backend/hmx/hexkl_kv_tiles_f16.c'],
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hmx'),
+  dependencies: nntrainer_test_main_deps,
+  # The DSP sources are C11 (hexagon-clang builds them so); the project's
+  # default C standard predates for-loop declarations.
+  override_options: ['c_std=c11'],
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_hexkl_kv_tiles_f16', unittest_hexkl_kv_tiles_f16_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_kv_tiles_f16')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
+# The quantized (int8 / int4) KV cache registry: quantizer, master layouts
+# and append / dump bookkeeping are plain C; only the HexKL tile bake is
+# DSP-side and is exercised by the device test instead.
+unittest_hexkl_kv_q_exe = executable(
+  'unittest_hexkl_kv_q',
+  ['unittest_hexkl_kv_q.cpp',
+   '../../nntrainer/tensor/htp_backend/hmx/hexkl_kv_q.c'],
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hmx'),
+  dependencies: nntrainer_test_main_deps,
+  override_options: ['c_std=c11'],
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+unittest_hexkl_attn_q_plan_exe = executable(
+  'unittest_hexkl_attn_q_plan',
+  'unittest_hexkl_attn_q_plan.cpp',
+  include_directories: include_directories(
+    '../../nntrainer/tensor/htp_backend/hmx'),
+  dependencies: nntrainer_test_main_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_hexkl_attn_q_plan', unittest_hexkl_attn_q_plan_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_attn_q_plan')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
+test('unittest_hexkl_kv_q', unittest_hexkl_kv_q_exe,
+  args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_hexkl_kv_q')],
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
 unittest_inc = include_directories('.')
 
 # subdir('memory')

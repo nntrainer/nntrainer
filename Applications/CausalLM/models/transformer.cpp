@@ -142,6 +142,8 @@ void Transformer::setupParameters(json &cfg, json &generation_cfg,
                     : 1;
   EMBEDDING_DTYPE = nntr_cfg["embedding_dtype"];
   FC_LAYER_DTYPE = nntr_cfg["fc_layer_dtype"];
+  ATTENTION_ENGINE = nntr_cfg.value("attention_engine", std::string());
+  ATTENTION_KV_DTYPE = nntr_cfg.value("attention_kv_dtype", std::string());
   EMBEDDING_FILE_NAME = nntr_cfg.value("embedding_file_name", std::string());
   PLE_FILE_NAME = nntr_cfg.value("ple_file_name", std::string());
 
@@ -462,6 +464,20 @@ Transformer::createKVCachePlaceholders(const int layer_id, int n_heads) {
   return {cache_k_input(Tensor()), cache_v_input(Tensor())};
 }
 
+LayerHandle Transformer::createAttentionCore(std::vector<std::string> props) {
+  // "attention_engine" puts the layer on that engine's ComputeOps (e.g.
+  // "htp": attention on the DSP; the engine falls back to the CPU path per
+  // call when it cannot take a shape); "attention_kv_dtype" adds the
+  // quantized cache mirror on top of it.
+  if (!ATTENTION_ENGINE.empty()) {
+    props.emplace_back(withKey("engine", ATTENTION_ENGINE));
+  }
+  if (!ATTENTION_KV_DTYPE.empty()) {
+    props.emplace_back(withKey("kv_cache_quant", ATTENTION_KV_DTYPE));
+  }
+  return createLayer("mha_core", props);
+}
+
 /**
  * @brief Create the default attention subgraph.
  */
@@ -498,8 +514,7 @@ Tensor Transformer::createAttention(const int layer_id, int seq_len,
   auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
 
   // Attention core layer
-  LayerHandle mha(createLayer(
-    "mha_core",
+  LayerHandle mha(createAttentionCore(
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
      withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
      withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),

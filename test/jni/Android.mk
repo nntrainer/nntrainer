@@ -887,4 +887,84 @@ LOCAL_LDLIBS += -L$(HEXAGON_SDK_ROOT)/ipc/fastrpc/remote/ship/android_aarch64 \
 LOCAL_STATIC_LIBRARIES := googletest_main
 
 include $(BUILD_EXECUTABLE)
+
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := unittest_hvx_mm_u8i4
+LOCAL_CFLAGS := -Igoogletest/include -pthread -fexceptions -O3 -DNDK_BUILD=1
+LOCAL_CXXFLAGS += -std=c++17 -frtti -fexceptions
+LOCAL_LDLIBS := -llog -landroid
+
+LOCAL_SRC_FILES := \
+	 ../unittest/unittest_hvx_mm_u8i4.cpp \
+	 ../htp/generated/nntr_hvx_stub.c
+
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../htp/generated \
+	 $(HEXAGON_SDK_ROOT)/incs \
+	 $(HEXAGON_SDK_ROOT)/incs/stddef \
+	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs
+
+LOCAL_LDLIBS += -L$(HEXAGON_SDK_ROOT)/ipc/fastrpc/remote/ship/android_aarch64 \
+	 -lcdsprpc
+
+LOCAL_STATIC_LIBRARIES := googletest_main
+
+include $(BUILD_EXECUTABLE)
+
+# fp16 flash attention on HMX: layout probe + accuracy against the CPU
+# attention reference + per-phase DSP timings. Same skel, same session.
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := unittest_hvx_attn_f16
+LOCAL_CFLAGS := -Igoogletest/include -pthread -fexceptions -O3 -DNDK_BUILD=1
+LOCAL_CXXFLAGS += -std=c++17 -frtti -fexceptions
+LOCAL_LDLIBS := -llog -landroid
+
+LOCAL_SRC_FILES := \
+	 ../unittest/unittest_hvx_attn_f16.cpp \
+	 ../htp/generated/nntr_hvx_stub.c
+
+# rpcmem/inc: rpcmem.h for the shared-KV-cache timing test; the symbols
+# are in libcdsprpc.so.
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../htp/generated \
+	 $(HEXAGON_SDK_ROOT)/incs \
+	 $(HEXAGON_SDK_ROOT)/incs/stddef \
+	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs \
+	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/rpcmem/inc
+
+LOCAL_LDLIBS += -L$(HEXAGON_SDK_ROOT)/ipc/fastrpc/remote/ship/android_aarch64 \
+	 -lcdsprpc
+
+LOCAL_STATIC_LIBRARIES := googletest_main
+
+include $(BUILD_EXECUTABLE)
+
+# Quantized (A8W8 / A8W4) KV cache and attention. hexkl_kv_q.c is compiled
+# in on the ARM side too: its quantizer and master layouts are the host
+# reference the DSP's dump is compared to bit for bit.
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := unittest_hvx_attn_q
+LOCAL_CFLAGS := -Igoogletest/include -pthread -fexceptions -O3 -DNDK_BUILD=1
+LOCAL_CXXFLAGS += -std=c++17 -frtti -fexceptions
+LOCAL_LDLIBS := -llog -landroid
+
+LOCAL_SRC_FILES := \
+	 ../unittest/unittest_hvx_attn_q.cpp \
+	 ../htp/generated/nntr_hvx_stub.c \
+	 $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend/hmx/hexkl_kv_q.c
+
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../htp/generated \
+	 $(LOCAL_PATH)/../unittest \
+	 $(NNTRAINER_ROOT)/nntrainer/tensor/htp_backend/hmx \
+	 $(HEXAGON_SDK_ROOT)/incs \
+	 $(HEXAGON_SDK_ROOT)/incs/stddef \
+	 $(HEXAGON_SDK_ROOT)/ipc/fastrpc/incs
+
+LOCAL_LDLIBS += -L$(HEXAGON_SDK_ROOT)/ipc/fastrpc/remote/ship/android_aarch64 \
+	 -lcdsprpc
+
+LOCAL_STATIC_LIBRARIES := googletest_main
+
+include $(BUILD_EXECUTABLE)
 endif

@@ -37,6 +37,7 @@
 
 #include <acti_func.h>
 #include <common_properties.h>
+#include <compute_ops.h>
 #include <cpu_backend.h>
 #include <layer_impl.h>
 #include <limits.h>
@@ -45,6 +46,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace causallm {
 
@@ -137,6 +139,18 @@ public:
   static constexpr const char *key =
     "attn_logit_softcapping";                 /**< unique key to access */
   using prop_tag = nntrainer::float_prop_tag; /**< property type */
+};
+
+/**
+ * @brief KvCacheQuant: "" (off), "q8" or "q4". Keep an int8 / int4 mirror
+ *        of this layer's KV cache on the accelerator and run attention
+ *        over it (ComputeOps::sdpa_q_kvcache) instead of over the fp16
+ *        cache. The fp16 cache stays the source of truth.
+ */
+class KvCacheQuant final : public nntrainer::Property<std::string> {
+public:
+  static constexpr const char *key = "kv_cache_quant";
+  using prop_tag = nntrainer::str_prop_tag;
 };
 
 /**
@@ -345,7 +359,7 @@ private:
     props::MaxPositionEmbeddings, props::UseSink, props::RopeScalingType,
     props::RopeScalingFactor, props::RopePartialRotaryFactor,
     props::RopeScalingMaxPositionEmbeddings, props::AttnLogitSoftcapping,
-    props::IsCausal>
+    props::IsCausal, props::KvCacheQuant>
     mha_core_props; /**< mha_core layer properties */
 
   /** softmax activation operation */
@@ -375,6 +389,64 @@ private:
   float attn_logit_softcapping = 0.0f;
   bool is_causal;
   bool skip_prefill = false;
+
+  /**
+   * @brief The ComputeOps this layer's context resolves to, captured at
+   *        the start of each forwarding so the per-batch helpers (which
+   *        take no context) can ask it for an accelerated attention.
+   *        nullptr means "CPU only", which is also what get_cpu_ops()'s
+   *        supports_sdpa_fp16_kvcache() answers.
+   */
+  nntrainer::ComputeOps *compute_ops_ = nullptr;
+
+  /**
+   * @brief The accelerator-resident quantized mirror of the KV cache
+   *        (props::KvCacheQuant). One handle per batch; q_cache_synced is
+   *        how many rows of that handle match the fp16 cache, so a rewind
+   *        or a cache load simply re-appends from there. One failure
+   *        anywhere releases everything and this layer stays on the fp16
+   *        path for good: the CPU/fp16 result is always available.
+   */
+  int kv_cache_quant_kind = -1; /**< -1 off, 0 int8, 1 int4 */
+  std::vector<int> q_cache_handles;
+  std::vector<unsigned int> q_cache_synced;
+  bool q_cache_failed = false;
+  bool accel_logged_ = false; /**< one info line the first time attention
+                                   leaves the CPU, for run logs */
+
+  /**
+   * @brief Attention of one batch over the quantized mirror: registers the
+   *        handle on first use, appends the fp16 cache rows [synced,
+   *        cache_to) -- this step's rows included -- and runs
+   *        sdpa_q_kvcache. Same fallback contract as
+   *        try_accelerated_attention.
+   */
+  bool try_quantized_attention(unsigned int batch,
+                               nntrainer::Tensor &query_step,
+                               nntrainer::Tensor &cache_key,
+                               nntrainer::Tensor &cache_value,
+                               const ml::train::TensorDim &cache_key_dim,
+                               nntrainer::Tensor &attention_output_step,
+                               unsigned int cache_from, unsigned int cache_to,
+                               const float *sinks);
+
+  /** @brief Releases every quantized-cache handle. */
+  void release_quantized_cache();
+
+  /**
+   * @brief Runs steps 2-4 (Q.K^T, softmax, .V) of one batch on the
+   *        accelerator when the context's ComputeOps offers one and the
+   *        shape fits its contract (causal, f32 query/output, fp16 cache).
+   *
+   * @return true if attention_output_step now holds the result; false
+   *         means nothing was written and the CPU path must run.
+   */
+  bool try_accelerated_attention(nntrainer::Tensor &query_step,
+                                 nntrainer::Tensor &cached_key,
+                                 nntrainer::Tensor &cached_value,
+                                 nntrainer::Tensor &attention_output_step,
+                                 unsigned int cache_from, unsigned int cache_to,
+                                 const float *sinks);
 
   enum INOUT_INDEX {
     /** input index */

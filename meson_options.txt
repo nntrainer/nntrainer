@@ -47,6 +47,11 @@ option('hexkl-sdk-root', type: 'string', value: '')
 # SDKL helper on armv8: the armv9 prebuilt may use instructions unavailable to
 # the Android app process on current SM8750/V79 devices.
 option('hexkl-lib-subdir', type: 'string', value: 'armv8_android26')
+# The Hexagon SDK the HexKL addon belongs to (remote.h, rpcmem.h, the
+# FastRPC link stub). Empty derives it as the addon's grandparent, which is
+# right when the addon sits at <sdk>/addons/hexkl_addon and wrong when it
+# was unpacked elsewhere.
+option('hexagon-sdk-root', type: 'string', value: '')
 option('mmap-read', type: 'boolean', value: true)
 option('enable-kernel-caching', type: 'boolean', value: false)
 

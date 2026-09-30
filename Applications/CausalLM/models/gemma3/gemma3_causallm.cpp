@@ -194,8 +194,7 @@ Tensor Gemma3Transformer::createAttention(const int layer_id, int seq_len,
   // (KVCacheManager) and bound at runtime via setExternalTensors.
   auto [cache_k, cache_v] = createKVCachePlaceholders(layer_id, n_heads);
 
-  LayerHandle mha(createLayer(
-    "mha_core",
+  LayerHandle mha(createAttentionCore(
     {withKey("name", "layer" + std::to_string(layer_id) + "_attention"),
      withKey("num_heads", n_heads), withKey("num_heads_kv", n_heads / GQA_SIZE),
      withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
