@@ -160,10 +160,9 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
   r->misses = t->st.misses - before.misses;
   r->miss_us = t->st.miss_us - before.miss_us;
   r->route_n = 0u;
-  if (t->role == 1u) { /* [plan 201 S1] the routed sets, for the pool */
-    r->route_n = s->graph->route_log_n;
-    memcpy(r->route, s->graph->route_log, r->route_n);
-  }
+  /* [plan 201 S1] the routed sets, for the pool: S1's, or the one PD's */
+  r->route_n = s->graph->route_log_n;
+  memcpy(r->route, s->graph->route_log, r->route_n);
   for (k = 0; k < HTP_DSPQ_TOKEN_KINDS && k < HTP_OP_KIND_N; ++k) {
     r->kind_pcyc[k] =
       (uint32_t)(t->st.kind_pcycles[k] - before.kind_pcycles[k]);

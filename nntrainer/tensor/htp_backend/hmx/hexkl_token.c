@@ -192,82 +192,6 @@ uint32_t hexkl_token_rounds(const hexkl_graph *g) {
   return n;
 }
 
-int hexkl_token_main(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
-                     uint32_t tok, uint32_t pos, const float *act_in,
-                     uint32_t act_len, float *logits, uint32_t logits_len,
-                     uint32_t spin_us, hexkl_token_stats *st, uint32_t *id) {
-  uint8_t *const mine = mbox + HEXKL_MBOX_S2_SLOT;
-  uint8_t *const theirs = mbox + HEXKL_MBOX_S1_SLOT;
-  volatile uint32_t *const ping = (volatile uint32_t *)(mbox + HEXKL_MBOX_PING);
-  volatile uint32_t *const pong = (volatile uint32_t *)(mbox + HEXKL_MBOX_PONG);
-  const float *in = act_in;
-  uint32_t in_len = act_len, start = 0, round = 0, end, resume;
-  hexkl_mbox_hdr h;
-  int rc;
-  *id = 0u;
-  if (g->n_ops == 0u || !g->ops[0].resident) {
-    return AEE_EBADSTATE;
-  }
-  for (;;) {
-    const htp_graph_op *last;
-    uint32_t n_out, seq;
-    end = tk_stretch_end(g, start);
-    last = &g->ops[end - 1u];
-    if (end == g->n_ops) {
-      float *out = logits;
-      uint32_t out_len = logits_len;
-      if (out == NULL) {
-        if (last->kind != HTP_OP_LM_HEAD) {
-          return AEE_EINVALIDFORMAT;
-        }
-        out = g->logits; /* forward skips the copy onto itself */
-        out_len = last->N;
-      }
-      rc = hexkl_graph_forward(g, env, start, end - start, pos, NULL, in,
-                               in_len, out, out_len, &resume);
-      if (rc != AEE_SUCCESS) {
-        return rc; /* S1 has served its last round: nothing to abort */
-      }
-      hvx_worker_pool_park(env->pool); /* the token is done */
-      tk_pcycles(g, start, end, st);
-      *id = last->kind == HTP_OP_LM_HEAD ? g->lm_id : 0u;
-      ++st->tokens;
-      return AEE_SUCCESS;
-    }
-    n_out = htp_graph_op_out_words(last);
-    seq = hexkl_token_seq(tok, round);
-    if (round >= HEXKL_TOKEN_MAX_ROUNDS || n_out * 4u > HEXKL_MBOX_ROW_MAX) {
-      rc = AEE_EINVALIDFORMAT;
-    } else {
-      rc = hexkl_graph_forward(g, env, start, end - start, pos, NULL, in,
-                               in_len, tk_row(mine), n_out, &resume);
-    }
-    hvx_worker_pool_park(env->pool); /* S1 computes next */
-    /* posted either way: a failure ends S1's token at once */
-    tk_post(mine, ping, seq, end, n_out, rc);
-    ++st->hops;
-    if (rc != AEE_SUCCESS) {
-      return rc;
-    }
-    tk_pcycles(g, start, end, st);
-    rc = tk_take(theirs, pong, seq, spin_us, st, &h);
-    if (rc != AEE_SUCCESS) {
-      return rc;
-    }
-    ++st->hops;
-    if (h.rc != AEE_SUCCESS) {
-      return h.rc;
-    }
-    if (h.op <= end || h.op >= g->n_ops || !g->ops[h.op].resident) {
-      return AEE_EBADSTATE;
-    }
-    start = h.op;
-    in = tk_row(theirs);
-    in_len = h.n;
-    ++round;
-  }
-}
-
 /* ---- [plan 201 S1] the expert pool's miss round (P-A) ------------------ */
 
 /** @brief One S1 token's miss rounds: the env its rebinds go through. */
@@ -359,6 +283,90 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
   }
   tk_clean(a, sizeof(*a));
   return rc;
+}
+
+int hexkl_token_main(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
+                     uint32_t tok, uint32_t pos, const float *act_in,
+                     uint32_t act_len, float *logits, uint32_t logits_len,
+                     uint32_t spin_us, hexkl_token_stats *st, uint32_t *id) {
+  uint8_t *const mine = mbox + HEXKL_MBOX_S2_SLOT;
+  uint8_t *const theirs = mbox + HEXKL_MBOX_S1_SLOT;
+  volatile uint32_t *const ping = (volatile uint32_t *)(mbox + HEXKL_MBOX_PING);
+  volatile uint32_t *const pong = (volatile uint32_t *)(mbox + HEXKL_MBOX_PONG);
+  const float *in = act_in;
+  uint32_t in_len = act_len, start = 0, round = 0, end, resume;
+  hexkl_mbox_hdr h;
+  /* [plan 201 S1] one PD: this side runs the MOE ops too */
+  tk_miss miss = {env, mbox, tok, 0u, spin_us, st};
+  hexkl_graph_env menv = *env;
+  int rc;
+  menv.miss.post = tk_miss_post;
+  menv.miss.wait = tk_miss_wait;
+  menv.miss.ctx = &miss;
+  env = &menv;
+  g->route_log_n = 0u;
+  *id = 0u;
+  if (g->n_ops == 0u || !g->ops[0].resident) {
+    return AEE_EBADSTATE;
+  }
+  for (;;) {
+    const htp_graph_op *last;
+    uint32_t n_out, seq;
+    end = tk_stretch_end(g, start);
+    last = &g->ops[end - 1u];
+    if (end == g->n_ops) {
+      float *out = logits;
+      uint32_t out_len = logits_len;
+      if (out == NULL) {
+        if (last->kind != HTP_OP_LM_HEAD) {
+          return AEE_EINVALIDFORMAT;
+        }
+        out = g->logits; /* forward skips the copy onto itself */
+        out_len = last->N;
+      }
+      rc = hexkl_graph_forward(g, env, start, end - start, pos, NULL, in,
+                               in_len, out, out_len, &resume);
+      if (rc != AEE_SUCCESS) {
+        return rc; /* S1 has served its last round: nothing to abort */
+      }
+      hvx_worker_pool_park(env->pool); /* the token is done */
+      tk_pcycles(g, start, end, st);
+      *id = last->kind == HTP_OP_LM_HEAD ? g->lm_id : 0u;
+      ++st->tokens;
+      return AEE_SUCCESS;
+    }
+    n_out = htp_graph_op_out_words(last);
+    seq = hexkl_token_seq(tok, round);
+    if (round >= HEXKL_TOKEN_MAX_ROUNDS || n_out * 4u > HEXKL_MBOX_ROW_MAX) {
+      rc = AEE_EINVALIDFORMAT;
+    } else {
+      rc = hexkl_graph_forward(g, env, start, end - start, pos, NULL, in,
+                               in_len, tk_row(mine), n_out, &resume);
+    }
+    hvx_worker_pool_park(env->pool); /* S1 computes next */
+    /* posted either way: a failure ends S1's token at once */
+    tk_post(mine, ping, seq, end, n_out, rc);
+    ++st->hops;
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+    tk_pcycles(g, start, end, st);
+    rc = tk_take(theirs, pong, seq, spin_us, st, &h);
+    if (rc != AEE_SUCCESS) {
+      return rc;
+    }
+    ++st->hops;
+    if (h.rc != AEE_SUCCESS) {
+      return h.rc;
+    }
+    if (h.op <= end || h.op >= g->n_ops || !g->ops[h.op].resident) {
+      return AEE_EBADSTATE;
+    }
+    start = h.op;
+    in = tk_row(theirs);
+    in_len = h.n;
+    ++round;
+  }
 }
 
 int hexkl_token_serve(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
