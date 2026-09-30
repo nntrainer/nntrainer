@@ -140,20 +140,60 @@ if host_machine.cpu_family() == 'aarch64'
 
   # unittest_nntrainer_ggml_arm assumes the omp ggml wrappers, which lack some
   # multi-weight entry points, and is told when it runs the bstp or mixed ones.
+  #
+  # The library links the ggml GEMM wrappers of the configured thread-backend
+  # only. Build the test again for every other backend, without the library,
+  # so each one is run: from that backend's wrapper plus the library's
+  # backend-independent ggml and thread-manager sources.
+  ggml_dir = meson.source_root() / 'nntrainer' / 'tensor' / 'cpu_backend' / 'ggml_interface'
+  ggml_test_common_sources = []
+  foreach s : ggml_interface_common_sources
+    ggml_test_common_sources += ggml_dir / s
+  endforeach
+  foreach s : ggml_impl_interface_sources
+    ggml_test_common_sources += ggml_dir / 'nntr_ggml_impl' / s
+  endforeach
+  foreach s : thread_manager_sources
+    ggml_test_common_sources += meson.source_root() / 'nntrainer' / 'utils' / s
+  endforeach
   ggml_lib_backend = {'bstp': 'bs_threadpool', 'mixed': 'mixed'}.get(get_option('thread-backend'), 'omp')
-  ggml_test_exe = executable(
-    'unittest_nntrainer_ggml_arm',
-    'unittest_nntrainer_ggml_arm.cpp',
-    cpp_args: ggml_lib_backend == 'omp' ? [] : ['-DGGML_ARM_TEST_MULTI_WEIGHT_ALL_LAYOUTS=1'],
-    dependencies: unittest_nntrainer_deps,
-    install: get_option('enable-test'),
-    install_dir: application_install_dir
-  )
-  test('unittest_nntrainer_ggml_arm', ggml_test_exe,
-    args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), 'unittest_nntrainer_ggml_arm')],
-    timeout: test_timeout,
-    suite: 'unittests'
-  )
+  foreach backend : ['omp', 'bs_threadpool', 'mixed']
+    ggml_test_cpp_args = backend == 'omp' ? [] : ['-DGGML_ARM_TEST_MULTI_WEIGHT_ALL_LAYOUTS=1']
+    if backend == ggml_lib_backend
+      ggml_test_name = 'unittest_nntrainer_ggml_arm'
+      ggml_test_exe = executable(
+        ggml_test_name,
+        'unittest_nntrainer_ggml_arm.cpp',
+        cpp_args: ggml_test_cpp_args,
+        dependencies: unittest_nntrainer_deps,
+        install: get_option('enable-test'),
+        install_dir: application_install_dir
+      )
+    else
+      ggml_test_name = 'unittest_nntrainer_ggml_arm_' + backend
+      ggml_test_exe = executable(
+        ggml_test_name,
+        [
+          'unittest_nntrainer_ggml_arm.cpp',
+          ggml_dir / 'ggml_interface_' + backend + '.cpp',
+          ggml_test_common_sources,
+        ],
+        cpp_args: ggml_test_cpp_args,
+        dependencies: [
+          gtest_dep,
+          dependency('threads'),
+          nntrainer_dep.partial_dependency(includes: true, compile_args: true),
+          nntrainer_testutil_dep.partial_dependency(includes: true),
+        ],
+        install: false
+      )
+    endif
+    test(ggml_test_name, ggml_test_exe,
+      args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), ggml_test_name)],
+      timeout: test_timeout,
+      suite: 'unittests'
+    )
+  endforeach
 endif
 
 foreach target: test_target
