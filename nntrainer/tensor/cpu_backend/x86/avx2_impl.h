@@ -123,6 +123,18 @@ void swiglu(const unsigned int N, float *X, const float *Y, const float *Z);
 void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
 
 /**
+ * @brief fused tanh-gelu and multiply with AVX :
+ *        X = 0.5 * Y * (1 + tanh(0.7978845608 * (Y + 0.044715 * Y^3))) * Z
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (output)
+ * @param Y float * for Vector Y (input, gelu applied to this)
+ * @param Z float * for Vector Z (input, multiplied in)
+ */
+void tanh_gelu_mul(const unsigned int N, float *X, const float *Y,
+                   const float *Z);
+
+/**
  * @brief swiglu function with AVX : X = (Y / (1 + exp( -Y ))) * Z
  *
  * @param N number of elements in X

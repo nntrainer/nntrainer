@@ -206,75 +206,113 @@ void __ggml_q4_0_4x8_q8_0_GEMM(const unsigned int M,
     unsigned int qa_4_rows_size = sizeof(block_q8_0x4) * blocks_per_4_rows;
     const size_t qa_row_size = (sizeof(block_q8_0) * K) / QK8_0;
 
-    unsigned int M4 = ((M - M % 4) / 4);
-    unsigned int qa_size = qa_4_rows_size * (((M >> 2) << 2) / 4 + 1);
+    unsigned int M4 = M / 4;
+    unsigned int qa_size =
+      qa_4_rows_size * M4 + static_cast<unsigned int>(qa_row_size) * (M % 4);
 
     std::vector<char> QA = std::vector<char>(qa_size);
+    char *qa_data = QA.data();
 
-    for (unsigned int i = 0; i < M4; i++) {
-      nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, QA.data() + i * qa_4_rows_size,
-                                 K);
+    // online quantization of the shared activation, paid once for all weights
+    unsigned int quant_chunk = 8;
+    if (M4 >= 2 * quant_chunk) {
+      tm.parallel_for(0, (M4 + quant_chunk - 1) / quant_chunk, [=](size_t t) {
+        unsigned int q_end = std::min(quant_chunk * (t + 1), (size_t)M4);
+        for (unsigned int i = quant_chunk * t; i < q_end; i++) {
+          nntr_quantize_mat_q8_0_4x8(A + 4 * i * K,
+                                     qa_data + i * qa_4_rows_size, K);
+        }
+      });
+    } else {
+      for (unsigned int i = 0; i < M4; i++) {
+        nntr_quantize_mat_q8_0_4x8(A + 4 * i * K, qa_data + i * qa_4_rows_size,
+                                   K);
+      }
     }
 
     for (unsigned int i = M4 * 4; i < M; i++) {
       nntr_quantize_row_q8_0(
         (float *)A + i * K,
-        (QA.data() + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
+        (qa_data + (M4 * qa_4_rows_size) + (i - M4 * 4) * qa_row_size), K);
     }
 
-    tm.parallel_for(0, thread_num, [&](size_t i) {
-      for (unsigned int num_w = 0; num_w < Ns.size(); ++num_w) {
-        unsigned int N = Ns[num_w];
-        unsigned int ldc = ldcs[num_w];
+    // Same 2D row x col tiling the single-weight GEMM uses -- fixed 16-row
+    // chunks with a column chunk sized for ~64 tasks per thread, so the
+    // asymmetric cores can work-steal. The weight index is folded into the
+    // same task space, which keeps the balance while still paying for the
+    // activation quantization and the barrier only once.
+    const unsigned int row_chunk_size = 16;
+    const size_t row_loop = (M4 * 4 + row_chunk_size - 1) / row_chunk_size;
+    const unsigned int A_step = sizeof(block_q8_0) * (K / QK8_0);
 
-        float *C = Cs[num_w];
-        void *B = Bs[num_w];
+    std::vector<size_t> col_chunks(Ns.size());
+    std::vector<size_t> col_loops(Ns.size());
+    std::vector<size_t> task_offset(Ns.size() + 1, 0);
+    for (size_t w = 0; w < Ns.size(); ++w) {
+      col_chunks[w] = (size_t)std::clamp<size_t>(
+        (size_t)Ns[w] * row_loop / ((size_t)64 * thread_num) / 4 * 4, 16, 64);
+      col_loops[w] = (Ns[w] + col_chunks[w] - 1) / col_chunks[w];
+      task_offset[w + 1] = task_offset[w] + col_loops[w] * row_loop;
+    }
 
-        unsigned int src0_start = (i * N) / thread_num;
-        unsigned int src0_end = ((i + 1) * N) / thread_num;
+    if (task_offset.back() > 0) {
+      const size_t num_w = Ns.size();
+      const size_t *offsets = task_offset.data();
+      const size_t *loops = col_loops.data();
+      const size_t *chunks = col_chunks.data();
+      const unsigned int *ns = Ns.data();
+      void *const *bs = Bs.data();
+      float *const *cs = Cs.data();
+      const unsigned int *ldcs_data = ldcs.data();
 
-        src0_start = (src0_start % NB_COLS)
-                       ? src0_start + NB_COLS - (src0_start % NB_COLS)
-                       : src0_start;
+      tm.parallel_for(0, task_offset.back(), [=](size_t task) {
+        size_t w = 0;
+        while (w + 1 < num_w && task >= offsets[w + 1])
+          ++w;
+        const size_t local = task - offsets[w];
+        const size_t col_loop = loops[w];
+        const unsigned int N = ns[w];
 
-        src0_end = (src0_end % NB_COLS)
-                     ? src0_end + NB_COLS - (src0_end % NB_COLS)
-                     : src0_end;
+        unsigned int r = local / col_loop;
+        unsigned int c = local % col_loop;
 
-        nntr_gemm_q4_0_4x8_q8_0(K, (float *)(C + src0_start), ldc,
-                                (void *)((char *)B + src0_start * B_step),
-                                QA.data(), M4 * 4, src0_end - src0_start);
-      }
-    });
+        unsigned int r_start = r * row_chunk_size;
+        unsigned int r_end = std::min((unsigned int)(row_chunk_size * (r + 1)),
+                                      (unsigned int)(M4 * 4));
+        unsigned int c_start = c * chunks[w];
+        unsigned int c_end =
+          (unsigned int)std::min(chunks[w] * (c + 1), (size_t)N);
 
-    if (M4 * 4 != M) {
-      tm.parallel_for(0, thread_num, [&](size_t thread_idx) {
-        for (unsigned int num_w = 0; num_w < Ns.size(); ++num_w) {
-          unsigned int N = Ns[num_w];
-          unsigned int ldc = ldcs[num_w];
-          float *C = Cs[num_w];
-          void *B = Bs[num_w];
-
-          for (int pb = M4 * 4; pb < static_cast<int>(M); pb++) {
-            unsigned int M_step_start = (thread_idx * N) / thread_num;
-            unsigned int M_step_end = ((thread_idx + 1) * N) / thread_num;
-            M_step_start = (M_step_start % NB_COLS)
-                             ? M_step_start + NB_COLS - (M_step_start % NB_COLS)
-                             : M_step_start;
-            M_step_end = (M_step_end % NB_COLS)
-                           ? M_step_end + NB_COLS - (M_step_end % NB_COLS)
-                           : M_step_end;
-
-            nntr_gemv_q4_0_4x8_q8_0(
-              K,
-              (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) +
-                        M_step_start),
-              N, (void *)((char *)B + M_step_start * B_step),
-              QA.data() + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size,
-              1, M_step_end - M_step_start);
-          }
-        }
+        nntr_gemm_q4_0_4x8_q8_0(K, (float *)(cs[w] + r_start * N + c_start),
+                                ldcs_data[w],
+                                (void *)((char *)bs[w] + c_start * B_step),
+                                (void *)(qa_data + r_start * A_step),
+                                r_end - r_start, c_end - c_start);
       });
+    }
+
+    // leftover 1 ~ 3 rows, per weight, with multithreaded GEMV
+    for (unsigned int num_w = 0; num_w < Ns.size(); ++num_w) {
+      const unsigned int N = Ns[num_w];
+      float *C = Cs[num_w];
+      void *B = Bs[num_w];
+
+      for (unsigned int pb = M4 * 4; pb < M; pb++) {
+        unsigned int chunk_size = 16;
+        unsigned int loop = (N + chunk_size - 1) / chunk_size;
+
+        tm.parallel_for(0, loop, [=](size_t idx) {
+          unsigned int M_step_start = chunk_size * idx;
+          unsigned int M_step_end = std::min(chunk_size * (idx + 1), (size_t)N);
+
+          nntr_gemv_q4_0_4x8_q8_0(
+            K,
+            (float *)((C + ((pb - M4 * 4) * N) + (M4 * 4 * N)) + M_step_start),
+            N, (void *)((char *)B + M_step_start * B_step),
+            qa_data + (M4 * qa_4_rows_size) + (pb - M4 * 4) * qa_row_size, 1,
+            M_step_end - M_step_start);
+        });
+      }
     }
   }
 }

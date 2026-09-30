@@ -22,6 +22,7 @@
 #include <limits>
 #include <stdexcept>
 #include <tensor_dim.h>
+#include <vector>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -1004,6 +1005,16 @@ template <typename T = float>
 void gemm_q4_0(const unsigned int M, const unsigned int N, const unsigned int K,
                const T *A, const unsigned int lda, const void *B,
                const unsigned int ldb, T *C, const unsigned int ldc);
+
+/**
+ * @brief q4_0 GEMM against several weights : A (M,K) * Ws[i].T (Ns[i],K)
+ *
+ * The fallback has no batched kernel, so it simply walks the weights.
+ */
+void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
+               const unsigned int K, const float *A, const unsigned int lda,
+               std::vector<void *> Bs, std::vector<unsigned int> ldbs,
+               std::vector<float *> Cs, std::vector<unsigned int> ldcs);
 /**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)
  *

@@ -26,14 +26,17 @@
 #include "model_common_properties.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <compute_ops.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <thread>
 
@@ -522,17 +525,25 @@ sharedConstTensors NeuralNetwork::incremental_forwarding(
     auto f = std::get<0>(node->getExecutionOrder());
     if (exec_mode == ExecutionMode::TRAIN or
         (exec_mode == ExecutionMode::INFERENCE and !fsu_mode)) {
-      // auto start_layer =
-      //      std::chrono::high_resolution_clock::now(); // log the
-      //      start_prefill time
-      model_graph.flushCacheExcept(f);
-      node->incremental_forwarding(from, to, training);
-      // auto end_layer =
-      //  std::chrono::high_resolution_clock::now(); // log th
-      //   auto duration_ =
-      //   std::chrono::duration_cast<std::chrono::nanoseconds>(end_layer-start_layer);
-      // std::cout << node->getName() <<" : "<< duration_.count()<<"
-      // ns"<<std::endl;
+      // Per-layer timing, opt-in via NNTR_LAYER_PROFILE so it costs nothing
+      // when unset. Emits one TSV line per layer per call:
+      //   LAYERPROF <span> <layer name> <ns>
+      // where <span> is (to - from), i.e. > 1 for prefill and 1 for decode.
+      static const bool layer_profile =
+        std::getenv("NNTR_LAYER_PROFILE") != nullptr;
+      if (layer_profile) {
+        auto start_layer = std::chrono::high_resolution_clock::now();
+        model_graph.flushCacheExcept(f);
+        node->incremental_forwarding(from, to, training);
+        auto end_layer = std::chrono::high_resolution_clock::now();
+        auto duration_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          end_layer - start_layer);
+        std::cout << "LAYERPROF\t" << (to - from) << "\t" << node->getName()
+                  << "\t" << duration_.count() << "\n";
+      } else {
+        model_graph.flushCacheExcept(f);
+        node->incremental_forwarding(from, to, training);
+      }
     } else {
       model_graph.checkLoadComplete(f);
       node->incremental_forwarding(from, to, training);

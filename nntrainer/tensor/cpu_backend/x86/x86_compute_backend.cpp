@@ -300,8 +300,9 @@ void swiglu(const unsigned int N, float *X, float *Y, float *Z, float alpha) {
 }
 
 void tanh_gelu(const unsigned int N, const float *X, float *Y) {
-  // AVX implmenetation will be implemented, now fallback instead
-  __fallback_tanh_gelu(N, X, Y);
+  // Same formula as __fallback_tanh_gelu, evaluated with AVX2 instead of a
+  // scalar libm std::tanh per element.
+  nntrainer::avx2::tanh_gelu_v2(N, X, Y);
 }
 
 void tanh_gelu_v2(const unsigned int N, const float *X, float *Y) {
@@ -313,11 +314,11 @@ void gelu_v2(const unsigned int N, const float *X, float *Y) {
 }
 
 void tanh_gelu_mul(const unsigned int N, float *X, float *Y, float *Z) {
-  __fallback_tanh_gelu_mul(N, X, Y, Z);
+  nntrainer::avx2::tanh_gelu_mul(N, X, Y, Z);
 }
 
 void tanh_gelu_v2_mul(const unsigned int N, float *X, float *Y, float *Z) {
-  __fallback_tanh_gelu_mul(N, X, Y, Z);
+  nntrainer::avx2::tanh_gelu_mul(N, X, Y, Z);
 }
 
 float max_val(const unsigned int N, float *X) { return __fallback_max(N, X); }
@@ -337,7 +338,7 @@ void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
                const unsigned int K, const float *A, const unsigned int lda,
                std::vector<void *> Bs, std::vector<unsigned int> ldbs,
                std::vector<float *> Cs, std::vector<unsigned int> ldcs) {
-  throw std::runtime_error("Error: NYI for gemm_q4_0 with vectored weights");
+  return __ggml_q4_0_8x8_q8_0_GEMM(M, Ns, K, A, lda, Bs, ldbs, Cs, ldcs);
 }
 
 void gemm_q4_K(const unsigned int M, const unsigned int N, const unsigned int K,

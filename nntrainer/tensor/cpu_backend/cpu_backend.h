@@ -32,6 +32,7 @@
 #include <common.h>
 #include <cstdint>
 #include <tensor_dim.h>
+#include <vector>
 
 #ifdef ENABLE_FP16
 /**
@@ -1094,6 +1095,29 @@ extern void gemm_q4_0(const unsigned int M, const unsigned int N,
                       const unsigned int K, const T *A, const unsigned int lda,
                       const void *B, const unsigned int ldb, T *C,
                       const unsigned int ldc);
+
+/**
+ * @brief q4_0 GEMM against several weights : A (M,K) * Ws[i].T (Ns[i],K)
+ *
+ * Quantizes A to q8_0 once and walks every weight inside a single parallel
+ * region, so the activation packing and the thread barrier are paid once
+ * rather than once per weight. Only profitable for M > 1.
+ *
+ * @param M Original row size of output
+ * @param Ns Original col size of each output
+ * @param K Hidden size, shared by every weight
+ * @param A Input activation to be online-runtime quantized to q8_0 format
+ * @param lda Leading dimension of A
+ * @param Bs Offline-quantized transposed weights
+ * @param ldbs Leading dimension of each B
+ * @param Cs float* outputs
+ * @param ldcs Leading dimension of each C
+ */
+extern void gemm_q4_0(const unsigned int M, std::vector<unsigned int> Ns,
+                      const unsigned int K, const float *A,
+                      const unsigned int lda, std::vector<void *> Bs,
+                      std::vector<unsigned int> ldbs, std::vector<float *> Cs,
+                      std::vector<unsigned int> ldcs);
 
 /**
  * @brief q4_K GEMM : A (M,K) * W.T (N,K) = O (M,N)

@@ -1125,6 +1125,25 @@ void tanh_gelu_v2(const unsigned int N, const float *X, float *Y) {
   }
 }
 
+void tanh_gelu_mul(const unsigned int N, float *X, const float *Y,
+                   const float *Z) {
+  unsigned int i = 0;
+
+  for (; i + 8 <= N; i += 8) {
+    __m256 y = _mm256_loadu_ps(&Y[i]);
+    __m256 z = _mm256_loadu_ps(&Z[i]);
+    __m256 g = poly_gelu_tanh_avx2(y);
+    _mm256_storeu_ps(&X[i], _mm256_mul_ps(g, z));
+  }
+
+  for (; i < N; ++i) {
+    const float y = Y[i];
+    X[i] = 0.5f * y *
+           (1.0f + std::tanh(0.7978845608f * (y + 0.044715f * y * y * y))) *
+           Z[i];
+  }
+}
+
 void gelu_v2(const unsigned int N, const float *X, float *Y) {
   unsigned int i = 0;
 

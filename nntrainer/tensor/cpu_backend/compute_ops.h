@@ -167,6 +167,24 @@ public:
                               const unsigned int ldb, float *C,
                               const unsigned int ldc);
 
+  /**
+   * @brief One activation against several q4_0 weights in a single call.
+   *
+   * Shares the online q8_0 quantization of the activation and a single
+   * thread barrier across all weights, instead of repeating both per weight.
+   * Only worthwhile for M > 1; callers must query the predicate first.
+   *
+   * @note @a matAdata holds the weights and @a matBdata the activation --
+   * the reverse of gemm_q4_0_fp32's naming, kept for source compatibility
+   * with the accelerator backends that introduced this entry point.
+   */
+  virtual bool supports_gemm_q4_0_batch_fp32() const { return false; }
+  virtual void gemm_q4_0_batch_fp32(std::vector<void *> matAdata,
+                                    float *matBdata,
+                                    std::vector<float *> matCdata,
+                                    unsigned int M, std::vector<unsigned int> N,
+                                    unsigned int K);
+
   // ===========================================================================
   // Quantized weight packing / quantization
   // ===========================================================================
@@ -202,13 +220,6 @@ public:
   // CPU subclasses leave both the impl (default-throw) and predicate
   // (default false) untouched. Accelerator subclasses override both.
   // ===========================================================================
-  virtual bool supports_gemm_q4_0_batch_fp32() const { return false; }
-  virtual void gemm_q4_0_batch_fp32(std::vector<void *> matAdata,
-                                    float *matBdata,
-                                    std::vector<float *> matCdata,
-                                    unsigned int M, std::vector<unsigned int> N,
-                                    unsigned int K);
-
   virtual bool supports_gemm_q4_0_accel_fp32() const { return false; }
   virtual void gemm_q4_0_accel_fp32(void *matAdata, float *matBdata,
                                     float *matCdata, unsigned int M,

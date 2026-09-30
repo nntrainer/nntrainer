@@ -60,6 +60,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -73,6 +74,7 @@
 #include "embedding_gemma.h"
 #include "gemma3_causallm.h"
 #include "gemma4_causallm.h"
+#include "gemma4_moe_causallm.h"
 #if !defined(_WIN32)
 #include "gptoss_cached_slim_causallm.h"
 #endif
@@ -354,11 +356,21 @@ void registerAllModels() {
                           return std::make_unique<causallm::Gemma3CausalLM>(
                             cfg, generation_cfg, nntr_cfg);
                         });
-  factory.registerModel("Gemma4ForCausalLM",
-                        [](json cfg, json generation_cfg, json nntr_cfg) {
-                          return std::make_unique<causallm::Gemma4CausalLM>(
-                            cfg, generation_cfg, nntr_cfg);
-                        });
+  factory.registerModel(
+    "Gemma4ForCausalLM", [](json cfg, json generation_cfg, json nntr_cfg) {
+      const json &text_cfg =
+        cfg.contains("text_config") && cfg["text_config"].is_object()
+          ? cfg["text_config"]
+          : cfg;
+      if (text_cfg.value("enable_moe_block", false)) {
+        return std::unique_ptr<causallm::Transformer>(
+          std::make_unique<causallm::Gemma4MoECausalLM>(cfg, generation_cfg,
+                                                        nntr_cfg));
+      }
+      return std::unique_ptr<causallm::Transformer>(
+        std::make_unique<causallm::Gemma4CausalLM>(cfg, generation_cfg,
+                                                   nntr_cfg));
+    });
   factory.registerModel("EmbeddingGemma",
                         [](json cfg, json generation_cfg, json nntr_cfg) {
                           return std::make_unique<causallm::EmbeddingGemma>(
@@ -512,6 +524,10 @@ buildLayerDtypeMap(int num_layers, DataType fc_dtype, DataType embd_dtype,
       dtype_map[prefix + "_ffn_up"] = fc_dtype;
       dtype_map[prefix + "_ffn_down"] = fc_dtype;
 
+      // Gemma4 MoE custom layer keeps its router weights in FP32 and
+      // quantizes only the expert projections in its save override.
+      dtype_map[prefix + "_sparse_moe"] = fc_dtype;
+
       dtype_map[prefix + "_ffn_output"] = fc_dtype;
 
       // LFM2 conv-block projections (causal_conv1d core stays FP32, but the
@@ -616,6 +632,7 @@ int main(int argc, char *argv[]) {
   std::string output_bin_name = "";
   std::string target_config_path = "";
   std::string output_format = "bin";
+  std::optional<unsigned int> target_moe_cache_size;
 
   for (int i = 2; i < argc; ++i) {
     std::string arg = argv[i];
@@ -676,6 +693,9 @@ int main(int argc, char *argv[]) {
         lmhead_dtype_str = target_cfg["lmhead_dtype"].get<std::string>();
       if (target_cfg.contains("model_file_name") && output_bin_name.empty())
         output_bin_name = target_cfg["model_file_name"].get<std::string>();
+      if (target_cfg.contains("moe_cache_size"))
+        target_moe_cache_size =
+          target_cfg["moe_cache_size"].get<unsigned int>();
     }
 
     // Default lmhead_dtype to embd_dtype if not specified
@@ -727,9 +747,13 @@ int main(int argc, char *argv[]) {
     std::string src_weight_path = model_path + "/" + original_bin;
     std::string dst_weight_path = output_dir + "/" + output_bin_name;
 
-    int num_layers = cfg["num_hidden_layers"].get<int>();
     std::string architecture =
       cfg["architectures"].get<std::vector<std::string>>()[0];
+    const json &network_cfg =
+      cfg.contains("text_config") && cfg["text_config"].is_object()
+        ? cfg["text_config"]
+        : cfg;
+    int num_layers = network_cfg["num_hidden_layers"].get<int>();
 
     std::cout << "  Architecture: " << architecture << "\n";
     std::cout << "  Num layers:   " << num_layers << "\n";
@@ -834,6 +858,8 @@ int main(int argc, char *argv[]) {
     new_nntr_cfg["fc_layer_dtype"] = dataTypeToStr(fc_dtype);
     new_nntr_cfg["embedding_dtype"] = dataTypeToStr(embd_dtype);
     new_nntr_cfg["lmhead_dtype"] = dataTypeToStr(lmhead_dtype);
+    if (target_moe_cache_size.has_value())
+      new_nntr_cfg["moe_cache_size"] = *target_moe_cache_size;
     new_nntr_cfg["model_tensor_type"] =
       buildModelTensorType(dataTypeToStr(fc_dtype));
 

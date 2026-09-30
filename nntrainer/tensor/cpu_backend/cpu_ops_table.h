@@ -184,6 +184,17 @@ public:
     nntrainer::gemm_q6_K(M, N, K, A, lda, B, ldb, C, ldc);
   }
 
+  // One activation against several q4_0 weights, sharing the online q8_0
+  // quantization of the activation and a single thread barrier. The arch
+  // backends implement this; the fallback loops over the single-weight form.
+  bool supports_gemm_q4_0_batch_fp32() const override { return true; }
+  void gemm_q4_0_batch_fp32(std::vector<void *> matAdata, float *matBdata,
+                            std::vector<float *> matCdata, unsigned int M,
+                            std::vector<unsigned int> N,
+                            unsigned int K) override {
+    nntrainer::gemm_q4_0(M, N, K, matBdata, K, matAdata, N, matCdata, N);
+  }
+
   // Quantization / Utility
   void unpack_q4_0(const void *in, void *out, size_t ds, unsigned int M,
                    unsigned int N) override {
