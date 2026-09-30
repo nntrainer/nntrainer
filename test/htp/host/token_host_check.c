@@ -475,8 +475,8 @@ static int host_rebind(void *ctx, uint32_t old_gu, uint32_t old_dn, uint32_t K,
   return AEE_SUCCESS;
 }
 
-static void pool_serve(pool_owner *o, const hexkl_miss_req *q) {
-  hexkl_miss_ans *a = (hexkl_miss_ans *)(o->page + HEXKL_MBOX_MISS_ANS);
+static void pool_serve(pool_owner *o, const htp_miss_req *q) {
+  htp_miss_ans *a = (htp_miss_ans *)(o->page + HEXKL_MBOX_MISS_ANS);
   uint32_t m, i, j, s;
   for (m = 0; m < POOL_OPS && o->op[m] != q->op; ++m) {
   }
@@ -526,8 +526,7 @@ static void pool_serve(pool_owner *o, const hexkl_miss_req *q) {
 
 static void *owner_thread(void *arg) {
   pool_owner *o = (pool_owner *)arg;
-  const hexkl_miss_req *q =
-    (const hexkl_miss_req *)(o->page + HEXKL_MBOX_MISS_REQ);
+  const htp_miss_req *q = (const htp_miss_req *)(o->page + HEXKL_MBOX_MISS_REQ);
   uint32_t last = 0;
   while (!o->stop) {
     const uint32_t seq = __atomic_load_n(&q->seq, __ATOMIC_ACQUIRE);

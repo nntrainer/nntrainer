@@ -95,6 +95,56 @@ typedef struct htp_dspq_token_resp_s {
                                             routed count, then the ids */
 } htp_dspq_token_resp;
 
+/** @brief [plan 201 S1] The token driver's mailbox page (hexkl_token.h):
+ *  after its two row slots, the expert pool's miss round (protocol P-A):
+ *  S1's request and the pool owner's (the ARM's) answer, each in its own
+ *  lines. The most experts a request names: the M = 1 MoE path's bound. */
+#define HTP_MBOX_MISS_REQ 17152u
+#define HTP_MBOX_MISS_REQ_BYTES 256u
+#define HTP_MBOX_MISS_ANS (HTP_MBOX_MISS_REQ + HTP_MBOX_MISS_REQ_BYTES)
+#define HTP_MBOX_MISS_ANS_BYTES 1024u
+#define HTP_MBOX_MISS_MAX 16u
+
+/**
+ * @brief [plan 201 S1] S1 -> the pool's owner (the ARM): MOE op @a op of
+ *        this token routes to @a routed, and its EXPERTS table lacks
+ *        @a miss. Written body first and cleaned, then @a seq (word 0);
+ *        @a seq2 repeats it, so a torn read is refused.
+ */
+typedef struct {
+  uint32_t seq; /**< hexkl_token_seq(tok, k), k the token's k-th round */
+  uint32_t op;  /**< the MOE op, graph index */
+  uint32_t n_routed, n_miss;
+  uint32_t routed[HTP_MBOX_MISS_MAX]; /**< ascending: never evicted */
+  uint32_t miss[HTP_MBOX_MISS_MAX];
+  uint32_t seq2;
+} htp_miss_req;
+
+/** @brief One expert the answer brought: read into the slot of the pair
+ *  @a old_gu / @a old_dn (hexkl_graph.h hexkl_graph_rebind_fn); S1 writes the
+ * pair's numbers after the rebind into @a h_gu / @a h_dn (NO_HANDLE before),
+ * for the owner to file. */
+typedef struct {
+  uint32_t e, old_gu, old_dn, arena, off_gu, off_dn;
+  uint32_t h_gu, h_dn;
+} htp_miss_load;
+
+/** @brief The owner -> S1: every expert it evicted (MOE op, expert), then
+ *  the misses loaded, or @a rc (the round fails the token). */
+typedef struct {
+  uint32_t seq;
+  int32_t rc;
+  uint32_t n_evict, n_load;
+  uint32_t evict[HTP_MBOX_MISS_MAX][2];
+  htp_miss_load load[HTP_MBOX_MISS_MAX];
+  uint32_t seq2;
+} htp_miss_ans;
+
+typedef char
+  htp_miss_req_fits[sizeof(htp_miss_req) <= HTP_MBOX_MISS_REQ_BYTES ? 1 : -1];
+typedef char
+  htp_miss_ans_fits[sizeof(htp_miss_ans) <= HTP_MBOX_MISS_ANS_BYTES ? 1 : -1];
+
 /** @brief The request message length for n_experts experts and n_rows
  *  routed rows (u64, so a hostile count cannot wrap). */
 static inline uint64_t htp_dspq_req_bytes(uint32_t n_experts, uint32_t n_rows) {

@@ -282,7 +282,7 @@ static int tk_miss_post(void *ctx, uint32_t op, const uint32_t *routed,
                         uint32_t n_routed, const uint32_t *miss,
                         uint32_t n_miss) {
   tk_miss *m = (tk_miss *)ctx;
-  hexkl_miss_req *q = (hexkl_miss_req *)(m->mbox + HEXKL_MBOX_MISS_REQ);
+  htp_miss_req *q = (htp_miss_req *)(m->mbox + HEXKL_MBOX_MISS_REQ);
   const uint32_t seq = hexkl_token_seq(m->tok, m->k);
   if (m->k >= HEXKL_TOKEN_MAX_ROUNDS || n_routed > HEXKL_GRAPH_MISS_MAX ||
       n_miss > n_routed) {
@@ -302,7 +302,7 @@ static int tk_miss_post(void *ctx, uint32_t op, const uint32_t *routed,
 
 static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
   tk_miss *m = (tk_miss *)ctx;
-  hexkl_miss_ans *a = (hexkl_miss_ans *)(m->mbox + HEXKL_MBOX_MISS_ANS);
+  htp_miss_ans *a = (htp_miss_ans *)(m->mbox + HEXKL_MBOX_MISS_ANS);
   volatile uint32_t *word = (volatile uint32_t *)&a->seq;
   const uint32_t seq = hexkl_token_seq(m->tok, m->k++);
   const htp_graph_op *o = &g->ops[op];
@@ -343,7 +343,7 @@ static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
                               HTP_GRAPH_NO_HANDLE, HTP_GRAPH_NO_HANDLE);
   }
   for (i = 0; rc == AEE_SUCCESS && i < a->n_load; ++i) {
-    hexkl_miss_load *l = &a->load[i];
+    htp_miss_load *l = &a->load[i];
     uint32_t hg = HTP_GRAPH_NO_HANDLE, hd = HTP_GRAPH_NO_HANDLE;
     rc =
       m->env->rebind == NULL

@@ -21,15 +21,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <htp_decode_hook.h>
 #include <deque>
 #include <expert_lru.h>
+#include <htp_decode_hook.h>
 #include <iostream>
 #include <lfm2_moe_layer.h>
 #include <node_exporter.h>
 #include <stdexcept>
 #include <thread_manager.h>
 #include <unordered_map>
+#include <unordered_set>
 
 /** [A1] The deterministic SwiGLU. nntrainer::swiglu is left alone on
     purpose -- every model on ARM uses it and nothing is wrong with it.
@@ -746,6 +747,25 @@ static bool tryMoeLayerOnAccelerator(
     dn_data[e] = dn.getData<char>();
     gu_scale[e] = gu.getScale<float>();
     dn_scale[e] = dn.getScale<float>();
+  }
+
+  // [plan 201 S1] A virtual layer hands all its experts and the pool's
+  // policy to the backend at its first call (layer order: the first
+  // prefill runs the layers in order), for the per-token entry's miss path.
+  if (experts_virtual) {
+    static std::unordered_set<const void *> handed;
+    if (handed.insert(&context.getWeight(gate_up_indices[0])).second) {
+      std::vector<ExpertFileDesc> all;
+      for (size_t e = 0; e < n_experts; ++e)
+        all.push_back(expertDesc(context.getWeight(gate_up_indices[e]),
+                                 context.getWeight(down_indices[e])));
+      ops->set_decode_moe_experts(
+        all, [](const std::vector<const void *> &need,
+                const std::function<void(const void *)> &load,
+                const std::function<void(const void *)> &evict) {
+          g_expert_lru.acquire(need, load, evict);
+        });
+    }
   }
 
   // [doc 52] Virtual experts: the ones this call routes to are made
