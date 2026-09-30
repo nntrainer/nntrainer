@@ -121,10 +121,12 @@ static hexkl_graph_q4m1_shape g_qs[Q_SLOTS];
 
 static int host_fc(void *ctx, uint32_t h, uint32_t feed, const hvx_q4m1_act *a,
                    float *y) {
-  (void)ctx, (void)feed;
+  (void)ctx;
   if (h >= Q_SLOTS || g_qw[h] == NULL)
     return AEE_EBADITEM;
-  hvx_q4m1_gemv_groups(g_qw[h], g_qs[h].K, g_qs[h].N / Q4M1_GROUP, a, y);
+  ((feed & HTP_GRAPH_FEED_NATIVE) != 0u
+     ? hvx_q4m1_gemv_groups_native
+     : hvx_q4m1_gemv_groups)(g_qw[h], g_qs[h].K, g_qs[h].N / Q4M1_GROUP, a, y);
   return AEE_SUCCESS;
 }
 

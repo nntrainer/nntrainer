@@ -68,6 +68,7 @@
 #include "hvx_q4_gemv_f32.h"
 #include "hvx_worker_pool.h"
 #include "m1_ops_det.h"
+#include "q4_gemv_native_det.h"
 
 /** @brief A real pthread pool (hvx_worker_pool.c on stub/qurt.h) for the
  *  env: since #132 PR 2 the router op runs its chains on it. */
@@ -1113,7 +1114,9 @@ static int host_fc(void *ctx, uint32_t h, uint32_t feed, const hvx_q4m1_act *a,
   g_fc_feed = feed;
   if (h >= Q_SLOTS || g_qw[h] == NULL)
     return AEE_EBADITEM;
-  hvx_q4m1_gemv_groups(g_qw[h], g_qs[h].K, g_qs[h].N / Q4M1_GROUP, a, y);
+  ((feed & HTP_GRAPH_FEED_NATIVE) != 0u
+     ? hvx_q4m1_gemv_groups_native
+     : hvx_q4m1_gemv_groups)(g_qw[h], g_qs[h].K, g_qs[h].N / Q4M1_GROUP, a, y);
   return AEE_SUCCESS;
 }
 
@@ -1143,10 +1146,17 @@ static void q_register(uint32_t h, uint32_t K, uint32_t N, uint32_t *seed) {
   g_qs[h].N = N;
 }
 
-/* the CPU's FC of x: the Q8_0 quantizer, then the fused chain */
+/* the CPU's FC of x: the Q8_0 quantizer, then the fused chain; with
+   g_native [#194 L1] q4_gemv_native_det.h's pair instead */
+static int g_native;
 static void spec_fc(uint32_t h, const float *x, float *y) {
   static int8_t q[8192];
   static uint16_t d[256];
+  if (g_native) {
+    q8_0_quant_native_det(x, g_qs[h].K, q, d);
+    q4_gemv_native_det(g_qc[h], q, d, g_qs[h].K, g_qs[h].N, y);
+    return;
+  }
   q8_0_quant_cpu_det(x, g_qs[h].K, q, d);
   q4_gemv_cpu_det(g_qc[h], q, d, g_qs[h].K, g_qs[h].N, y);
 }
@@ -1378,6 +1388,62 @@ static void check_q4m1(void) {
           htp_graph_err_name(rc));
     err |= rc != HTP_GRAPH_E_BADITEM;
   }
+  /* (7) [#194 L1] the native bit on the three kinds' feed words: the
+     validator takes it (and still refuses an unknown bit), the runner
+     sees it, and FC / DENSE_FFN / LM_HEAD equal the native specs */
+  rc = (uint32_t)hexkl_graph_set_param(g, lm, HTP_GRAPH_PARAM_LM_BAN, x, 0u);
+  CHECK(rc == 0u, "LM_BAN clear: %s", htp_graph_err_name(rc));
+  {
+    uint32_t n_v = 0, keep = htp_graph_op_at(w, ffn)->feed;
+    htp_graph_op_at(w, ffn)->feed = keep | HTP_GRAPH_FEED_NATIVE;
+    rc = htp_graph_validate(w, n, hexkl_graph_resident_kinds(), &n_v);
+    CHECK(rc == 0u, "native feed bit refused: %s", htp_graph_err_name(rc));
+    err |= rc != 0u;
+    htp_graph_op_at(w, ffn)->feed = keep | (1u << 17);
+    rc = htp_graph_validate(w, n, hexkl_graph_resident_kinds(), &n_v);
+    CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "feed bit 17 taken: %s",
+          htp_graph_err_name(rc));
+    err |= rc != HTP_GRAPH_E_INVALIDFORMAT;
+    htp_graph_op_at(w, ffn)->feed = keep;
+  }
+  g->ops[fc_qkv].feed |= HTP_GRAPH_FEED_NATIVE;
+  g->ops[ffn].feed |= HTP_GRAPH_FEED_NATIVE;
+  g->ops[lm].feed |= HTP_GRAPH_FEED_NATIVE;
+  g_native = 1;
+  {
+    int nerr = 0;
+    rc = (uint32_t)hexkl_graph_forward(g, &env, fc_qkv, 1u, 0u, NULL, x, HID,
+                                       out, 256u, &resume);
+    op = &g->ops[fc_qkv];
+    spec_fc(op->h_gu[0], x, ref);
+    spec_fc(op->h_gu[1], x, ref + 128);
+    spec_fc(op->h_gu[2], x, ref + 192);
+    nerr |= rc != 0u || g_fc_feed != (1u | HTP_GRAPH_FEED_NATIVE) ||
+            memcmp(out, ref, 256u * sizeof(float)) != 0;
+    rc = (uint32_t)hexkl_graph_forward(g, &env, ffn, 1u, 0u, NULL, x, HID, out,
+                                       HID, &resume);
+    op = &g->ops[ffn];
+    spec_fc(op->h_gu[0], x, up);
+    spec_fc(op->h_gu[1], x, gate);
+    m1_swiglu_cpu_det(gate, up, act, 64u);
+    spec_fc(op->h_dn[0], act, ref);
+    nerr |= rc != 0u || memcmp(out, ref, HID * sizeof(float)) != 0;
+    rc = (uint32_t)hexkl_graph_forward(g, &env, fin, 1000u, 0u, NULL, x, HID,
+                                       out, 64u, &resume);
+    op = &g->ops[lm];
+    spec_fc(op->h_gu[0], nrm, ref);
+    spec_fc(op->h_gu[1], nrm, ref + 32);
+    nerr |= rc != 0u || memcmp(out, ref, 64u * sizeof(float)) != 0 ||
+            g->lm_id != m1_argmax_first(ref, 64u);
+    CHECK(nerr == 0, "[#194 L1] native FC / DENSE_FFN / LM_HEAD differ from "
+                     "q4_gemv_native_det");
+    err |= nerr;
+    if (nerr == 0)
+      printf("GRAPH Q4M1 NATIVE BIT-IDENTICAL: FC q|k|v DENSE_FFN "
+             "RMSNORM+LM_HEAD with HTP_GRAPH_FEED_NATIVE vs "
+             "q4_gemv_native_det (bit 17 refused)\n");
+  }
+  g_native = 0;
   hexkl_graph_free(g);
   if (err == 0)
     printf("GRAPH Q4M1 BIT-IDENTICAL: FC q|k|v (3 parts, feed passed) "

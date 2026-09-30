@@ -34,6 +34,7 @@
 #include "../htp/host/q4_gemv_cases.h"
 #include "m1_ops_det.h"
 #include "nntr_hvx.h"
+#include "q4_gemv_native_det.h"
 #include "swiglu_det.h"
 
 #include "mha_htp_host_model.h"
@@ -758,6 +759,62 @@ TEST_F(HvxFcQ4, MatchesSpecBitExact) {
     EXPECT_EQ(nntr_hvx_q4m1_release(handle_, w.h), AEE_SUCCESS);
   }
   std::cout << "FC_Q4_FIELD total bad=" << bad_total << std::endl;
+}
+
+/**
+ * @brief [#194 L1, htp_moe_ppl] The native pair (fc_q4m1_f32 variant bit
+ *        18: hvx_q4m1_prep_vec + hvx_q4m1_gemv_groups_native) equals
+ *        q4_gemv_native_det.h bit for bit on the five FC shapes, 8 rows of
+ *        every kind each plus a row of blocks around the quantizer's 2^-60
+ *        cut, the three feeds, 6 lanes -- the device canary beside
+ *        MatchesSpecBitExact (a broken E0 is a broken build; a failure
+ *        here is the hf widening product or the qf32 -> hf narrowing not
+ *        being what hvx_emu assumes). Prints the GEMV us of one call.
+ */
+TEST_F(HvxFcQ4, NativeMatchesSpec) {
+  constexpr uint32_t FC_NATIVE = 1u << 18, FC_FEED_L2 = 1u << 17;
+  const uint32_t shapes[5][2] = {{2048u, 6144u},
+                                 {2048u, 2048u},
+                                 {2048u, 512u},
+                                 {7168u, 2048u},
+                                 {2048u, 7168u}};
+  int bad_total = 0;
+  for (const auto &sh : shapes) {
+    FcWeight w;
+    ASSERT_NO_FATAL_FAILURE(fc_register(handle_, sh[0], sh[1], &w));
+    std::vector<float> x(w.K), y, ref(w.N);
+    std::vector<int8_t> q(w.K);
+    std::vector<uint16_t> d(w.K / 32u);
+    std::vector<uint32_t> st;
+    for (uint32_t feed : {0u, FC_FEED_VTCM, FC_FEED_L2}) {
+      int bad = 0;
+      for (int r = 0; r < 9; ++r) {
+        if (r < 8) {
+          make_row(x.data(), w.K, r % 4, r);
+        } else {
+          for (uint32_t i = 0; i < w.K; ++i)
+            x[i] = std::ldexp(frand(-1.0f, 1.0f),
+                              -60 + static_cast<int>((i / 32u) % 5u) - 2);
+        }
+        q8_0_quant_native_det(x.data(), w.K, q.data(), d.data());
+        q4_gemv_native_det(w.canon.data(), q.data(), d.data(), w.K, w.N,
+                           ref.data());
+        ASSERT_NO_FATAL_FAILURE(
+          fc_run(handle_, w, FC_NATIVE | feed, 6u, 1u, x, &y, &st));
+        bad += m1_count_bad(y, ref, "native");
+      }
+      std::cout << "FC_Q4_NATIVE K=" << w.K << " N=" << w.N << " feed="
+                << (feed == 0u             ? "direct"
+                    : feed == FC_FEED_VTCM ? "vtcm"
+                                           : "l2")
+                << " rows=9 bad=" << bad << " gemv_us=" << st[0]
+                << " quant_us=" << st[1] << std::endl;
+      EXPECT_EQ(bad, 0) << "native K=" << w.K << " N=" << w.N;
+      bad_total += bad;
+    }
+    EXPECT_EQ(nntr_hvx_q4m1_release(handle_, w.h), AEE_SUCCESS);
+  }
+  std::cout << "FC_Q4_NATIVE total bad=" << bad_total << std::endl;
 }
 
 /** @brief The FC's vector quantizer (q8_quant_f32 runs hvx_q4m1_prep) on
