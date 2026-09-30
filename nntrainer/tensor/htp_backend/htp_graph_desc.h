@@ -194,7 +194,9 @@ enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
  * and h_dn[0] = down (N x N_out), n_experts 3. feed says how those
  * kinds' weights reach the vector unit: 0 VTCM by DMA when the session
  * has 2 groups per lane of it, else the L2 scratch; 1 the L2 scratch
- * (hexkl_graph.h). Other kinds leave all of these 0. n_kv / gqa /
+ * (hexkl_graph.h); [#132 Part B E5f] bits 8-11 / 12-15 the L2 feed's
+ * lanes for a part with K <= 2048 / K > 2048, 0 = the runner's default
+ * (HTP_GRAPH_FEED_*). Other kinds leave all of these 0. n_kv / gqa /
  * head_dim describe the attention kinds (QK_NORM,
  * ROPE, ATTN_M1: K == (gqa + 2) n_kv head_dim, ATTN_M1's N == gqa n_kv
  * head_dim) and eps_bits holds the f32 bits of the norm epsilon (RMSNORM,
@@ -212,7 +214,8 @@ typedef struct {
   uint32_t in_slot;
   uint32_t out_slot;
   uint32_t next_mm;
-  uint32_t feed; /**< Q4M1 kinds: 0 VTCM if it fits else L2, 1 L2 */
+  uint32_t feed; /**< Q4M1 kinds: bit 0 the L2 feed (else VTCM if it
+                     fits); bits 8-11 / 12-15 the L2 lanes, small / large K */
   uint32_t n_kv;
   uint32_t gqa;
   uint32_t head_dim;
@@ -221,6 +224,10 @@ typedef struct {
   uint32_t h_dn[HTP_GRAPH_MAX_EXPERTS];
 } htp_graph_op;
 #define HTP_GRAPH_OP_WORDS (16u + 2u * HTP_GRAPH_MAX_EXPERTS)
+/** @brief The Q4M1 kinds' feed word (htp_graph_op.feed). */
+#define HTP_GRAPH_FEED_L2 1u
+#define HTP_GRAPH_FEED_LANES_SMALL(f) (((f) >> 8) & 0xFu)
+#define HTP_GRAPH_FEED_LANES_LARGE(f) (((f) >> 12) & 0xFu)
 typedef char
   htp_graph_op_size_check[sizeof(htp_graph_op) == HTP_GRAPH_OP_WORDS * 4u ? 1
                                                                           : -1];
@@ -450,7 +457,10 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       break;
     }
     if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(k)) != 0u) {
-      if (op->n_experts > HTP_GRAPH_MAX_EXPERTS || op->feed > 1u)
+      if (op->n_experts > HTP_GRAPH_MAX_EXPERTS ||
+          (op->feed & ~(HTP_GRAPH_FEED_L2 | 0xFF00u)) != 0u ||
+          HTP_GRAPH_FEED_LANES_SMALL(op->feed) > 8u ||
+          HTP_GRAPH_FEED_LANES_LARGE(op->feed) > 8u)
         return HTP_GRAPH_E_INVALIDFORMAT;
       if (op->resident != 0u &&
           (op->K % 64u != 0u || op->K > 8192u ||

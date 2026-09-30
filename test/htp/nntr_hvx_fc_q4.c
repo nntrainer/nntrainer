@@ -70,6 +70,7 @@
 
 #include "hexkl_dma_ring.h"
 #include "hexkl_probe.h"
+#include "hvx_m1_ops_f32.h"
 #include "hvx_q4_gemv_f32.h"
 #include "hvx_worker_pool.h"
 #include "m1_ops_det.h"
@@ -94,6 +95,11 @@
  *  per-shape table from the E sitting's profile lines. */
 #define FC_Q4_GRAPH_LANES_VTCM 6u
 #define FC_Q4_GRAPH_LANES_L2 3u
+/** @brief [#132 Part B E5f] The L2 feed's lanes for K <= 2048: #178's
+ *  ladder read 52 GB/s at 6 lanes there (26 at K = 7168, whose best is
+ *  FC_Q4_GRAPH_LANES_L2); E5d's token ran every FC at 3. The op's feed
+ *  word may name others (HTP_GRAPH_FEED_LANES_*). */
+#define FC_Q4_GRAPH_LANES_L2_SMALL_K 6u
 /** @brief fc_q4m1_f32's stats words. */
 #define FC_Q4_STATS 8
 
@@ -358,12 +364,17 @@ int nntr_hvx_fc_q4m1_graph(void *ctx, uint32_t h, uint32_t feed,
   }
   const size_t gbytes = (size_t)(s->q4m1[h].K / 64u) * Q4M1_PAIR_BYTES;
   const uint32_t per_lane = (s->config_off / FC_Q4_GRAPH_LANES_VTCM) & ~127u;
-  if (feed == 0u && per_lane >= 2u * gbytes) {
+  if ((feed & HTP_GRAPH_FEED_L2) == 0u && per_lane >= 2u * gbytes) {
     return nntr_hvx_fc_q4m1_run(s, h, a, y, FC_Q4_GRAPH_LANES_VTCM,
                                 FC_Q4_FEED_VTCM, NULL);
   }
-  return nntr_hvx_fc_q4m1_run(s, h, a, y, FC_Q4_GRAPH_LANES_L2, FC_Q4_FEED_L2,
-                              NULL);
+  const uint32_t small = s->q4m1[h].K <= 2048u;
+  uint32_t lanes =
+    small ? HTP_GRAPH_FEED_LANES_SMALL(feed) : HTP_GRAPH_FEED_LANES_LARGE(feed);
+  if (lanes == 0u) {
+    lanes = small ? FC_Q4_GRAPH_LANES_L2_SMALL_K : FC_Q4_GRAPH_LANES_L2;
+  }
+  return nntr_hvx_fc_q4m1_run(s, h, a, y, lanes, FC_Q4_FEED_L2, NULL);
 }
 
 int nntr_hvx_fc_q4m1_f32(remote_handle64 handle, uint32 h, uint32 variant,
