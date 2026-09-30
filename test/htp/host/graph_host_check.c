@@ -782,7 +782,7 @@ static void check_limits(void) {
   m0 = nth_op(w, HTP_OP_MOE, 0);
   /* the pool holds the even experts only */
   for (e = 0; e < 128u; ++e) {
-    gu[e] = (e & 1u) ? HTP_GRAPH_NO_HANDLE : 3968u + e;
+    gu[e] = (e & 1u) ? HTP_GRAPH_NO_HANDLE : 3969u + e;
     dn[e] = (e & 1u) ? HTP_GRAPH_NO_HANDLE : 3840u + e;
     if (!(e & 1u)) {
       register_weight(gu[e], 64u, 128u);
@@ -791,7 +791,8 @@ static void check_limits(void) {
     row_count[e] = 0u;
   }
   rc = (uint32_t)set_experts(g, m0, gu, dn, 128u);
-  CHECK(rc == 0u, "EXPERTS 128: %s", htp_graph_err_name(rc));
+  CHECK(rc == 0u && gu[126] == HEXKL_MM_U8I4_MAX_WEIGHTS - 1u,
+        "EXPERTS 128 up to the last handle: %s", htp_graph_err_name(rc));
   for (e = 0; e < 8u; ++e) {
     row_count[routed[e]] = 1u;
     row_index[e] = 0u;
@@ -829,7 +830,7 @@ static void check_limits(void) {
   hexkl_graph_free(g);
   printf("GRAPH LIMITS OK: 542 ops, 128 experts top-8, handles up to %u, a "
          "pool of the even experts bit-identical to the direct call\n",
-         HEXKL_MM_U8I4_MAX_WEIGHTS - 1u);
+         gu[126]);
 }
 
 /* ---- stretch half (#130): the real kernels vs the scalar specs --------- */
