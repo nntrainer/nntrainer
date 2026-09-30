@@ -145,6 +145,7 @@ static int dspq_token(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
     (nb < 1u || (bufs[0].ptr != NULL && bufs[0].size % 4u == 0u)) &&
     (nb < 2u || (bufs[1].ptr != NULL && bufs[1].size % 4u == 0u));
   memset(&resp, 0, sizeof(resp));
+  resp.t_in_us = (uint32_t)dspq_now_us();
   resp.seq = len >= 8 ? m->u[1] : 0;
   if (valid) {
     resp.rc = nntr_hvx_token_run(
@@ -163,6 +164,7 @@ static int dspq_token(struct nntr_hvx_dspq *d, const dspq_msg *m, uint32_t len,
     bufs[1].flags |= DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER |
                      DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
   }
+  resp.t_out_us = (uint32_t)dspq_now_us();
   return dspqueue_write(d->q, 0, nb, bufs, sizeof(resp), (const uint8_t *)&resp,
                         DSPQUEUE_TIMEOUT_NONE);
 }

@@ -82,6 +82,9 @@ typedef struct htp_dspq_token_resp_s {
   uint32_t wall_us, wall_pcyc;
   uint32_t kind_pcyc[HTP_DSPQ_TOKEN_KINDS];
   uint32_t hop_us;
+  uint32_t t_in_us, t_out_us; /**< [#194 L0] QTimer us (low 32 bits) when
+                                   the packet was read / the response is
+                                   written: the ARM's dispatch and return */
 } htp_dspq_token_resp;
 
 /** @brief The request message length for n_experts experts and n_rows
