@@ -69,6 +69,9 @@ typedef struct {
 /** @brief The graph's op kinds (htp_graph_desc.h HTP_OP_KIND_N; the ARM
  *  side asserts they agree). */
 #define HTP_DSPQ_TOKEN_KINDS 11u
+/** @brief [plan 201 S1] The routed sets' bytes (hexkl_graph.h
+ *  HEXKL_GRAPH_ROUTE_LOG; the DSP side asserts they agree). */
+#define HTP_DSPQ_TOKEN_ROUTE 320u
 
 /** @brief OP_TOKEN's response: id (S2: LM_HEAD's argmax), the hops this
  *  side made, its wait for the other side, the pcycles of its ops; the
@@ -85,6 +88,11 @@ typedef struct htp_dspq_token_resp_s {
   uint32_t t_in_us, t_out_us; /**< [#194 L0] QTimer us (low 32 bits) when
                                    the packet was read / the response is
                                    written: the ARM's dispatch and return */
+  uint32_t misses, miss_us;   /**< [plan 201 S1] S1: experts its miss rounds
+                                   loaded this token, and the waits */
+  uint32_t route_n;           /**< [plan 201 S1] S1: bytes of route */
+  uint8_t route[HTP_DSPQ_TOKEN_ROUTE]; /**< per MOE op in list order: its
+                                            routed count, then the ids */
 } htp_dspq_token_resp;
 
 /** @brief The request message length for n_experts experts and n_rows

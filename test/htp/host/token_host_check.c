@@ -39,6 +39,7 @@
 #include "htp_graph_desc.h"
 #include <AEEStdErr.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,7 +91,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   const float *act_f32, float *out_f32, hvx_worker_pool *pool,
   hexkl_moe_scratch *scratch, uint32_t flags) {
   uint32_t e, c, r = 0;
-  (void)tbl, (void)vtcm_base, (void)vtcm_size, (void)config_off, (void)pool;
+  (void)vtcm_base, (void)vtcm_size, (void)config_off, (void)pool;
   (void)scratch, (void)flags, (void)inter, (void)h_down;
   memset(out_f32, 0, (size_t)M * N_out * sizeof(float));
   for (e = 0; e < n_experts; ++e) {
@@ -98,10 +99,13 @@ int hexkl_mm_u8i4_moe_layer_run(
     for (i = 0; i < row_count[e]; ++i, ++r) {
       const float *x = act_f32 + (size_t)row_index[r] * K;
       float *y = out_f32 + (size_t)row_index[r] * N_out;
+      /* the expert is what its gate_up's bytes say, not its handle: the
+         pool check moves experts between handles */
+      const uint32_t id = *(const uint32_t *)tbl->slots[h_gate_up[e]].wh_bytes;
       for (c = 0; c < N_out; ++c)
-        y[c] += row_weight[r] *
-                (x[(c + 7u * e) % K] * (float)(h_gate_up[e] + 1u) * 0.125f +
-                 0.01f * (float)c);
+        y[c] +=
+          row_weight[r] *
+          (x[(c + 7u * e) % K] * (float)(id + 1u) * 0.125f + 0.01f * (float)c);
     }
   }
   if (g_moe_calls < g_moe_cap) {
@@ -115,6 +119,8 @@ int hexkl_mm_u8i4_moe_layer_run(
 
 /* ---- weights and parameters ------------------------------------------ */
 static hexkl_weight_u8i4_table g_tbl;
+/* each u8i4 handle's "bytes": the id of the expert it holds (10 m + e) */
+static uint32_t g_wh[64];
 static uint8_t g_vtcm[64];
 static uint8_t *g_qw[Q_SLOTS];
 static hexkl_graph_q4m1_shape g_qs[Q_SLOTS];
@@ -173,6 +179,10 @@ static uint32_t build_words(uint32_t *w) {
       /* MoE op m's expert e: gate_up 10 m + e, down 10 m + 5 + e, bound
          as its EXPERTS table (bind_params) */
       for (e = 0; e < op->n_experts; ++e) {
+        g_wh[10u * m + e] = g_wh[10u * m + 5u + e] = 10u * m + e;
+        g_tbl.slots[10u * m + e].wh_bytes = (uint8_t *)&g_wh[10u * m + e];
+        g_tbl.slots[10u * m + 5u + e].wh_bytes =
+          (uint8_t *)&g_wh[10u * m + 5u + e];
         g_tbl.slots[10u * m + e].in_use = 1;
         g_tbl.slots[10u * m + e].K = op->K;
         g_tbl.slots[10u * m + e].N = 2u * op->N;
@@ -432,6 +442,197 @@ static void check_bit_identical(const uint32_t *words, uint32_t n) {
   g_moe_cap = 0;
 }
 
+/* ---- [plan 201 S1] the pool: S1's miss rounds against an owner thread -- */
+#define POOL_OPS 2u /* the hd64 list's MoE ops */
+#define POOL_E 4u   /* experts a layer; the pool holds half of them */
+
+/* The owner (the ARM's side, here a pthread): per MoE op, which expert
+   each of its two slots holds and a recency stamp, and the op indices. */
+typedef struct {
+  uint8_t *page;
+  uint32_t op[POOL_OPS];
+  uint32_t holder[POOL_OPS][2]; /* expert in slot s */
+  uint32_t used[POOL_OPS][2];   /* recency */
+  uint32_t clock, served, loads, bad;
+  volatile int stop;
+} pool_owner;
+
+static uint32_t pool_handle(uint32_t m, uint32_t slot, int dn) {
+  return 10u * m + (dn ? 5u : 0u) + slot; /* the pair slot s owns */
+}
+
+/* The rebind stub: the pair stays (its bytes were rewritten in place). */
+static int host_rebind(void *ctx, uint32_t old_gu, uint32_t old_dn, uint32_t K,
+                       uint32_t inter, uint32_t N_out, uint32_t arena,
+                       uint32_t off_gu, uint32_t off_dn, uint32_t *h_gu,
+                       uint32_t *h_dn) {
+  (void)ctx, (void)K, (void)inter, (void)N_out, (void)arena, (void)off_gu;
+  (void)off_dn;
+  if (old_gu == HTP_GRAPH_NO_HANDLE)
+    return AEE_EBADPARM;
+  *h_gu = old_gu;
+  *h_dn = old_dn;
+  return AEE_SUCCESS;
+}
+
+static void pool_serve(pool_owner *o, const hexkl_miss_req *q) {
+  hexkl_miss_ans *a = (hexkl_miss_ans *)(o->page + HEXKL_MBOX_MISS_ANS);
+  uint32_t m, i, j, s;
+  for (m = 0; m < POOL_OPS && o->op[m] != q->op; ++m) {
+  }
+  memset(a, 0, sizeof(*a));
+  if (m == POOL_OPS) {
+    a->rc = AEE_EBADITEM;
+    ++o->bad;
+  } else {
+    /* the routed stay (they are touched first), the least recent other
+       goes: the ARM's ExpertLru rule */
+    for (i = 0; i < q->n_routed; ++i)
+      for (s = 0; s < 2u; ++s)
+        if (o->holder[m][s] == q->routed[i])
+          o->used[m][s] = ++o->clock;
+    for (i = 0; i < q->n_miss; ++i) {
+      const uint32_t e = q->miss[i];
+      uint32_t v = 2u, routed[2] = {0u, 0u};
+      for (s = 0; s < 2u; ++s) /* never a routed expert */
+        for (j = 0; j < q->n_routed; ++j)
+          routed[s] |= o->holder[m][s] == q->routed[j];
+      for (s = 0; s < 2u; ++s)
+        if (!routed[s] && (v == 2u || o->used[m][s] < o->used[m][v]))
+          v = s;
+      if (v == 2u) { /* a pool smaller than the routed set */
+        a->rc = AEE_ENOMEMORY;
+        ++o->bad;
+        break;
+      }
+      a->evict[a->n_evict][0] = q->op;
+      a->evict[a->n_evict++][1] = o->holder[m][v];
+      /* "pread": the slot's bytes become expert e's */
+      g_wh[pool_handle(m, v, 0)] = g_wh[pool_handle(m, v, 1)] = 10u * m + e;
+      a->load[a->n_load].e = e;
+      a->load[a->n_load].old_gu = pool_handle(m, v, 0);
+      a->load[a->n_load].old_dn = pool_handle(m, v, 1);
+      a->load[a->n_load].h_gu = a->load[a->n_load].h_dn = HTP_GRAPH_NO_HANDLE;
+      ++a->n_load;
+      o->holder[m][v] = e;
+      o->used[m][v] = ++o->clock;
+      ++o->loads;
+    }
+  }
+  a->seq2 = q->seq;
+  __atomic_store_n(&a->seq, q->seq, __ATOMIC_RELEASE);
+  ++o->served;
+}
+
+static void *owner_thread(void *arg) {
+  pool_owner *o = (pool_owner *)arg;
+  const hexkl_miss_req *q =
+    (const hexkl_miss_req *)(o->page + HEXKL_MBOX_MISS_REQ);
+  uint32_t last = 0;
+  while (!o->stop) {
+    const uint32_t seq = __atomic_load_n(&q->seq, __ATOMIC_ACQUIRE);
+    if (seq != last && seq != 0u && q->seq2 == seq) {
+      pool_serve(o, q);
+      last = seq;
+    } else {
+      sched_yield();
+    }
+  }
+  return NULL;
+}
+
+static void check_pool(const uint32_t *words, uint32_t n) {
+  static float ref_logits[TOKENS][VOCAB], x[HID];
+  static uint32_t ref_id[TOKENS];
+  session ref, s1, s2;
+  serve_args sa;
+  pool_owner o;
+  pthread_t th, tho;
+  hexkl_token_stats st;
+  uint32_t t, resume, id, m, e, same_logits = 0, same_id = 0;
+  int rc;
+
+  open_session(&ref, words, n, HTP_GRAPH_KINDS_ALL, 0);
+  for (t = 0; t < TOKENS; ++t) {
+    emb_row(t, x);
+    rc = hexkl_graph_forward(ref.g, &ref.env, 0u, HTP_GRAPH_MAX_OPS,
+                             t % ref.g->max_seq, NULL, x, HID, ref_logits[t],
+                             VOCAB, &resume);
+    CHECK(rc == 0, "pool reference token %u: 0x%x", t, (unsigned)rc);
+    ref_id[t] = ref.g->lm_id;
+  }
+  close_session(&ref);
+
+  open_session(&s1, words, n, HTP_GRAPH_KINDS_S1, 0);
+  open_session(&s2, words, n, HTP_GRAPH_KINDS_S2, 0);
+  s1.env.rebind = host_rebind;
+  memset(&o, 0, sizeof(o));
+  o.page = new_page();
+  /* the pool: experts 0 and 1 of each layer in slots 0 and 1 */
+  for (m = 0; m < POOL_OPS; ++m) {
+    float tab[2u * POOL_E];
+    uint32_t h;
+    o.op[m] = HTP_GRAPH_NO_OP;
+    for (t = 0, e = 0; t < s1.g->n_ops; ++t)
+      if (s1.g->ops[t].kind == HTP_OP_MOE && e++ == m)
+        o.op[m] = t;
+    for (e = 0; e < POOL_E; ++e) {
+      h = e < 2u ? pool_handle(m, e, 0) : HTP_GRAPH_NO_HANDLE;
+      memcpy(&tab[e], &h, sizeof(h));
+      h = e < 2u ? pool_handle(m, e, 1) : HTP_GRAPH_NO_HANDLE;
+      memcpy(&tab[POOL_E + e], &h, sizeof(h));
+      if (e < 2u)
+        o.holder[m][e] = e;
+    }
+    CHECK(hexkl_graph_set_param(s1.g, o.op[m], HTP_GRAPH_PARAM_EXPERTS, tab,
+                                2u * POOL_E) == 0,
+          "pool table %u", m);
+  }
+  memset(&sa, 0, sizeof(sa));
+  sa.s = &s1;
+  sa.page = o.page;
+  sa.n = TOKENS;
+  memset(&st, 0, sizeof(st));
+  pthread_create(&tho, NULL, owner_thread, &o);
+  pthread_create(&th, NULL, serve_thread, &sa);
+  for (t = 0; t < TOKENS; ++t) {
+    emb_row(t, x);
+    rc = hexkl_token_main(s2.g, &s2.env, sa.page, t, t % s2.g->max_seq, x, HID,
+                          NULL, VOCAB, SPIN_US, &st, &id);
+    if (rc != AEE_SUCCESS) {
+      CHECK(0, "pool S2 token %u: 0x%x", t, (unsigned)rc);
+      break;
+    }
+    same_logits +=
+      memcmp(s2.g->logits, ref_logits[t], VOCAB * sizeof(float)) == 0;
+    same_id += id == ref_id[t];
+  }
+  pthread_join(th, NULL);
+  o.stop = 1;
+  pthread_join(tho, NULL);
+  CHECK(sa.rc == 0 && sa.st.tokens == TOKENS, "pool S1 tokens %u rc 0x%x",
+        sa.st.tokens, (unsigned)sa.rc);
+  CHECK(same_logits == TOKENS && same_id == TOKENS,
+        "pool logits %u / ids %u of %u", same_logits, same_id, TOKENS);
+  CHECK(sa.st.misses == o.loads && o.loads > TOKENS / 4u && o.bad == 0u,
+        "pool misses S1 %u owner %u bad %u", sa.st.misses, o.loads, o.bad);
+  CHECK(st.timeouts + sa.st.timeouts + st.stale + sa.st.stale == 0u,
+        "pool timeouts %u %u stale %u %u", st.timeouts, sa.st.timeouts,
+        st.stale, sa.st.stale);
+  CHECK(sa.s->g->route_log_n == POOL_OPS * 3u, "route log %u bytes",
+        sa.s->g->route_log_n);
+  if (g_fail == 0)
+    printf("TOKEN POOL BIT-IDENTICAL: tokens %u/%u logits bit_identical=1, a "
+           "pool of %u of %u experts a layer, misses=%u (%.2f/token) in %u "
+           "rounds, timeouts=0 stale=0 (S1's miss rounds against an owner "
+           "pthread; vs the one-session all-resident run)\n",
+           same_id, TOKENS, 2u, POOL_E, o.loads, (double)o.loads / TOKENS,
+           o.served);
+  close_session(&s1);
+  close_session(&s2);
+  free(o.page);
+}
+
 /* ---- the failure paths ----------------------------------------------- */
 static void check_failures(const uint32_t *words, uint32_t n) {
   static float x[HID];
@@ -550,6 +751,7 @@ int main(void) {
   static uint32_t words[MAXW];
   const uint32_t n = build_words(words);
   check_bit_identical(words, n);
+  check_pool(words, n);
   check_failures(words, n);
   if (g_fail) {
     printf("TOKEN CHECKS FAILED (%d)\n", g_fail);

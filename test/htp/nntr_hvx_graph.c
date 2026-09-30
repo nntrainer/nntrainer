@@ -130,6 +130,18 @@ static int graph_check_args(const nntr_hvx_session *s, int row_indexLen,
   return AEE_SUCCESS;
 }
 
+/** @brief [plan 201 S1] The miss path's rebind: the IDL's swap entry,
+ *  called in the PD (the scales and column sums follow the bytes in the
+ *  arena, so the call carries offsets only). */
+static int graph_rebind(void *ctx, uint32_t old_gu, uint32_t old_dn, uint32_t K,
+                        uint32_t inter, uint32_t N_out, uint32_t arena,
+                        uint32_t off_gu, uint32_t off_dn, uint32_t *h_gu,
+                        uint32_t *h_dn) {
+  return nntr_hvx_weight_swap_u8i4_arena(
+    (remote_handle64)ctx, old_gu, old_dn, K, inter, N_out, arena, off_gu,
+    off_dn, NULL, 0, NULL, 0, NULL, 0, NULL, 0, h_gu, h_dn);
+}
+
 void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->tbl = (hexkl_weight_u8i4_table *)&s->weights_u8i4;
   env->vtcm_base = s->vtcm_base;
@@ -141,6 +153,11 @@ void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->attn_m1 = s->attn_m1;        /* [#130] borrowed; NULL until registered */
   env->fc = nntr_hvx_fc_q4m1_graph; /* [#132 Part B] */
   env->fc_ctx = (void *)s;
+  env->rebind = graph_rebind;
+  env->rebind_ctx = (void *)s;
+  env->miss.post = NULL; /* the token driver's (hexkl_token_serve) */
+  env->miss.wait = NULL;
+  env->miss.ctx = NULL;
 }
 
 /** @brief One FARF line per call (HIGH: silent unless the mask enables

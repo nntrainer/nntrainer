@@ -268,6 +268,99 @@ int hexkl_token_main(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
   }
 }
 
+/* ---- [plan 201 S1] the expert pool's miss round (P-A) ------------------ */
+
+/** @brief One S1 token's miss rounds: the env its rebinds go through. */
+typedef struct {
+  const hexkl_graph_env *env;
+  uint8_t *mbox;
+  uint32_t tok, k, spin_us;
+  hexkl_token_stats *st;
+} tk_miss;
+
+static int tk_miss_post(void *ctx, uint32_t op, const uint32_t *routed,
+                        uint32_t n_routed, const uint32_t *miss,
+                        uint32_t n_miss) {
+  tk_miss *m = (tk_miss *)ctx;
+  hexkl_miss_req *q = (hexkl_miss_req *)(m->mbox + HEXKL_MBOX_MISS_REQ);
+  const uint32_t seq = hexkl_token_seq(m->tok, m->k);
+  if (m->k >= HEXKL_TOKEN_MAX_ROUNDS || n_routed > HEXKL_GRAPH_MISS_MAX ||
+      n_miss > n_routed) {
+    return AEE_EINVALIDFORMAT;
+  }
+  q->op = op;
+  q->n_routed = n_routed;
+  q->n_miss = n_miss;
+  memcpy(q->routed, routed, n_routed * sizeof(uint32_t));
+  memcpy(q->miss, miss, n_miss * sizeof(uint32_t));
+  q->seq2 = seq;
+  tk_clean(q, sizeof(*q));
+  *(volatile uint32_t *)&q->seq = seq;
+  tk_clean(q, 4u);
+  return AEE_SUCCESS;
+}
+
+static int tk_miss_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
+  tk_miss *m = (tk_miss *)ctx;
+  hexkl_miss_ans *a = (hexkl_miss_ans *)(m->mbox + HEXKL_MBOX_MISS_ANS);
+  volatile uint32_t *word = (volatile uint32_t *)&a->seq;
+  const uint32_t seq = hexkl_token_seq(m->tok, m->k++);
+  const htp_graph_op *o = &g->ops[op];
+  const uint64_t t0 = tk_now_us();
+  uint32_t i;
+  int rc = AEE_SUCCESS;
+  for (;;) {
+    uint64_t dt;
+    tk_refresh((void *)word, 4u);
+    if (*word == seq) {
+      break;
+    }
+    dt = tk_now_us() - t0;
+    if (dt >= (uint64_t)m->spin_us + HEXKL_TOKEN_TIMEOUT_US) {
+      m->st->miss_us += (uint32_t)dt;
+      ++m->st->timeouts;
+      return AEE_EEXPIRED;
+    }
+    if (dt >= m->spin_us) {
+      tk_sleep();
+    } else {
+      tk_pause();
+    }
+  }
+  m->st->miss_us += (uint32_t)(tk_now_us() - t0);
+  tk_refresh(a, sizeof(*a));
+  if (a->seq2 != seq || a->n_evict > HEXKL_GRAPH_MISS_MAX ||
+      a->n_load > HEXKL_GRAPH_MISS_MAX) {
+    ++m->st->stale;
+    return HEXKL_TOKEN_E_STALE;
+  }
+  if (a->rc != AEE_SUCCESS) {
+    return a->rc;
+  }
+  /* evictions first: a load may take an evicted expert's pair */
+  for (i = 0; rc == AEE_SUCCESS && i < a->n_evict; ++i) {
+    rc = hexkl_graph_pool_set(g, a->evict[i][0], a->evict[i][1],
+                              HTP_GRAPH_NO_HANDLE, HTP_GRAPH_NO_HANDLE);
+  }
+  for (i = 0; rc == AEE_SUCCESS && i < a->n_load; ++i) {
+    hexkl_miss_load *l = &a->load[i];
+    uint32_t hg = HTP_GRAPH_NO_HANDLE, hd = HTP_GRAPH_NO_HANDLE;
+    rc =
+      m->env->rebind == NULL
+        ? AEE_EBADSTATE
+        : m->env->rebind(m->env->rebind_ctx, l->old_gu, l->old_dn, o->K, o->N,
+                         o->N_out, l->arena, l->off_gu, l->off_dn, &hg, &hd);
+    if (rc == AEE_SUCCESS) {
+      rc = hexkl_graph_pool_set(g, op, l->e, hg, hd);
+    }
+    l->h_gu = hg; /* the owner files these */
+    l->h_dn = hd;
+    m->st->misses += rc == AEE_SUCCESS;
+  }
+  tk_clean(a, sizeof(*a));
+  return rc;
+}
+
 int hexkl_token_serve(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
                       uint32_t tok, uint32_t pos, uint32_t spin_us,
                       hexkl_token_stats *st) {
@@ -276,7 +369,14 @@ int hexkl_token_serve(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
   volatile uint32_t *const ping = (volatile uint32_t *)(mbox + HEXKL_MBOX_PING);
   volatile uint32_t *const pong = (volatile uint32_t *)(mbox + HEXKL_MBOX_PONG);
   const uint32_t rounds = hexkl_token_rounds(g);
+  tk_miss miss = {env, mbox, tok, 0u, spin_us, st};
+  hexkl_graph_env menv = *env;
   uint32_t r;
+  menv.miss.post = tk_miss_post;
+  menv.miss.wait = tk_miss_wait;
+  menv.miss.ctx = &miss;
+  env = &menv;
+  g->route_log_n = 0u;
   if (rounds == 0u) {
     return AEE_EBADSTATE;
   }

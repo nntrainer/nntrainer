@@ -217,11 +217,15 @@ graph_check() { # graph_check <hexkl_graph.c> <exe>
 graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_host_check"
 "$OUT/graph_host_check"
 # gate and up swapped; the part offset fixed at one group; down fed the
-# FFN input's quantization; the argmax over the first slice only
+# FFN input's quantization; the argmax over the first slice only; [plan 201
+# S1] the miss round's experts before the first miss dropped, and its later
+# rows added in reverse order
 for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, gate, act, op->N,/' \
   's/y += g->q4m1\[h\[p\]\].N;/y += Q4M1_GROUP;/' \
   's/graph_prep(op, act, op->N, &g->act);/(void)act;/' \
-  's/hvx_argmax_first_f32(g->logits, op->N)/hvx_argmax_first_f32(g->logits, op->N \/ 2u)/'; do
+  's/hvx_argmax_first_f32(g->logits, op->N)/hvx_argmax_first_f32(g->logits, op->N \/ 2u)/' \
+  's/  if (first != 0u) {/  if (0) {/' \
+  's/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)i \* op->N_out, 1.0f,/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)(n - 1u - i + first) * op->N_out, 1.0f,/'; do
   sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
   if cmp -s "$OUT/hexkl_graph_mutant.c" "$BACKEND/hmx/hexkl_graph.c"; then
     echo "GRAPH Q4M1 MUTATION DID NOT APPLY: $mut"; exit 1
@@ -241,21 +245,25 @@ done
 # Same kernels and flags as the graph check. Then two mutants of
 # hexkl_token.c, each of which must fail it: S2 reading its own row back
 # as the MoE output, and the trailer check gone.
-token_check() { # token_check <hexkl_token.c> <exe>
+token_check() { # token_check <hexkl_token.c> <exe> [hexkl_graph.c]
   "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
     -Wno-format-truncation -pthread -include malloc.h \
     -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
     -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
     -o "$2" \
-    "$HERE/token_host_check.c" "$1" "$BACKEND/hmx/hexkl_graph.c" \
+    "$HERE/token_host_check.c" "$1" "${3:-$BACKEND/hmx/hexkl_graph.c}" \
     "$BACKEND/hvx/hvx_m1_ops_f32.c" "$BACKEND/hvx/hvx_conv_gate_f32.c" \
     "$BACKEND/hvx/hvx_attn_m1_f32.c" "$BACKEND/hvx/hvx_worker_pool.c" \
     "$BACKEND/hvx/hvx_scale_add_f32.c" "$BACKEND/hvx/hvx_q4_gemv_f32.c" -lm
 }
 token_check "$BACKEND/hmx/hexkl_token.c" "$OUT/token_host_check"
 "$OUT/token_host_check"
+# [plan 201 S1] the pool's third mutant: the answer's evictions not
+# cleared, so an evicted expert's table entry names the bytes its pair now
+# holds (TOKEN POOL BIT-IDENTICAL must fail)
 for mut in 's/    in = tk_row(theirs);/    in = tk_row(mine);/' \
-  's/  if (\*(const uint32_t \*)(slot + HEXKL_MBOX_LINE + row) != seq) {/  if (0) {/'; do
+  's/  if (\*(const uint32_t \*)(slot + HEXKL_MBOX_LINE + row) != seq) {/  if (0) {/' \
+  's/  for (i = 0; rc == AEE_SUCCESS \&\& i < a->n_evict; ++i) {/  for (i = 0; 0 \&\& i < a->n_evict; ++i) {/'; do
   sed "$mut" "$BACKEND/hmx/hexkl_token.c" > "$OUT/hexkl_token_mutant.c"
   if cmp -s "$OUT/hexkl_token_mutant.c" "$BACKEND/hmx/hexkl_token.c"; then
     echo "TOKEN MUTATION DID NOT APPLY: $mut"; exit 1

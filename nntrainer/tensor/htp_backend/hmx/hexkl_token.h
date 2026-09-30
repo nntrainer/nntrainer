@@ -66,8 +66,15 @@
 #define HEXKL_MBOX_SLOT (2u * HEXKL_MBOX_LINE + HEXKL_MBOX_ROW_MAX)
 #define HEXKL_MBOX_S2_SLOT 256u
 #define HEXKL_MBOX_S1_SLOT (HEXKL_MBOX_S2_SLOT + HEXKL_MBOX_SLOT)
-/** @brief The page size the driver needs (16 896 B). */
-#define HEXKL_MBOX_BYTES (HEXKL_MBOX_S1_SLOT + HEXKL_MBOX_SLOT)
+/** @brief [plan 201 S1] The expert pool's miss round (protocol P-A): S1's
+ *  request (hexkl_miss_req) and the pool owner's answer (hexkl_miss_ans),
+ *  each in its own lines after the two slots. */
+#define HEXKL_MBOX_MISS_REQ (HEXKL_MBOX_S1_SLOT + HEXKL_MBOX_SLOT)
+#define HEXKL_MBOX_MISS_REQ_BYTES 256u
+#define HEXKL_MBOX_MISS_ANS (HEXKL_MBOX_MISS_REQ + HEXKL_MBOX_MISS_REQ_BYTES)
+#define HEXKL_MBOX_MISS_ANS_BYTES 1024u
+/** @brief The page size the driver needs (18 432 B). */
+#define HEXKL_MBOX_BYTES (HEXKL_MBOX_MISS_ANS + HEXKL_MBOX_MISS_ANS_BYTES)
 /** @brief A wait gives up this long after its spin window. */
 #define HEXKL_TOKEN_TIMEOUT_US 1000000u
 /** @brief Poll period after the spin window: a sleep, so the waiting
@@ -89,6 +96,48 @@ typedef struct {
                          bits of the QTimer's us, global to both PDs) */
 } hexkl_mbox_hdr;
 
+/**
+ * @brief [plan 201 S1] S1 -> the pool's owner (the ARM): MOE op @a op of
+ *        this token routes to @a routed, and its EXPERTS table lacks
+ *        @a miss. Written body first and cleaned, then @a seq (word 0);
+ *        @a seq2 repeats it, so a torn read is refused.
+ */
+typedef struct {
+  uint32_t seq; /**< hexkl_token_seq(tok, k), k the token's k-th round */
+  uint32_t op;  /**< the MOE op, graph index */
+  uint32_t n_routed, n_miss;
+  uint32_t routed[HEXKL_GRAPH_MISS_MAX]; /**< ascending: never evicted */
+  uint32_t miss[HEXKL_GRAPH_MISS_MAX];
+  uint32_t seq2;
+} hexkl_miss_req;
+
+/** @brief One expert the answer brought: read into the slot of the pair
+ *  @a old_gu / @a old_dn (hexkl_graph_rebind_fn); S1 writes the pair's
+ *  numbers after the rebind into @a h_gu / @a h_dn (NO_HANDLE before), for
+ *  the owner to file. */
+typedef struct {
+  uint32_t e, old_gu, old_dn, arena, off_gu, off_dn;
+  uint32_t h_gu, h_dn;
+} hexkl_miss_load;
+
+/** @brief The owner -> S1: every expert it evicted (MOE op, expert), then
+ *  the misses loaded, or @a rc (the round fails the token). */
+typedef struct {
+  uint32_t seq;
+  int32_t rc;
+  uint32_t n_evict, n_load;
+  uint32_t evict[HEXKL_GRAPH_MISS_MAX][2];
+  hexkl_miss_load load[HEXKL_GRAPH_MISS_MAX];
+  uint32_t seq2;
+} hexkl_miss_ans;
+
+typedef char
+  hexkl_miss_req_fits[sizeof(hexkl_miss_req) <= HEXKL_MBOX_MISS_REQ_BYTES ? 1
+                                                                          : -1];
+typedef char
+  hexkl_miss_ans_fits[sizeof(hexkl_miss_ans) <= HEXKL_MBOX_MISS_ANS_BYTES ? 1
+                                                                          : -1];
+
 /** @brief One side's counters, accumulated over its calls. */
 typedef struct {
   uint32_t tokens;   /**< calls that returned 0 */
@@ -100,6 +149,8 @@ typedef struct {
   uint32_t stale;    /**< reads refused as stale */
   uint64_t pcycles;  /**< the op_pcycles of every stretch this side ran */
   uint64_t kind_pcycles[HTP_OP_KIND_N]; /**< the same, per op kind */
+  uint32_t misses;  /**< [plan 201 S1] experts loaded by miss rounds */
+  uint32_t miss_us; /**< the waits for their answers */
 } hexkl_token_stats;
 
 /** @brief The sequence value of round @a round of token @a tok. */
@@ -130,7 +181,12 @@ int hexkl_token_main(hexkl_graph *g, const hexkl_graph_env *env, uint8_t *mbox,
 
 /**
  * @brief S1's side of token @a tok: hexkl_token_rounds(g) rounds of wait,
- *        forward over the stretch S2 names, post.
+ *        forward over the stretch S2 names, post. [plan 201 S1] A MOE op
+ *        whose routed experts are not all in its EXPERTS table runs a miss
+ *        round on the page's miss lines: the request, the present experts,
+ *        the answer (each eviction cleared from its table, each load
+ *        rebound through @a env's rebind and entered), the rest. g's
+ *        route_log holds the token's routed sets after the call.
  * @return 0; AEE_EEXPIRED; HEXKL_TOKEN_E_STALE; S2's code from its header;
  *         hexkl_graph_forward's code (posted to S2 too); AEE_EBADSTATE (no
  *         resident op, or S2 named an op S1 does not run);

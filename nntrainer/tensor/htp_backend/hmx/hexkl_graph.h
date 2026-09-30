@@ -76,6 +76,38 @@ typedef struct {
   uint32_t K, N;
 } hexkl_graph_q4m1_shape;
 
+struct hexkl_graph_s;
+
+/**
+ * @brief [plan 201 S1] The session's in-place rebind of a pool slot (the
+ *        miss path): the expert whose bytes the ARM just read into the
+ *        arena at (@a arena, @a off_gu / @a off_dn) takes over the pair
+ *        @a old_gu / @a old_dn (HTP_GRAPH_NO_HANDLE: a fresh pair), whose
+ *        numbers come back in @a h_gu / @a h_dn
+ *        (nntr_hvx_weight_swap_u8i4_arena).
+ */
+typedef int (*hexkl_graph_rebind_fn)(void *ctx, uint32_t old_gu,
+                                     uint32_t old_dn, uint32_t K,
+                                     uint32_t inter, uint32_t N_out,
+                                     uint32_t arena, uint32_t off_gu,
+                                     uint32_t off_dn, uint32_t *h_gu,
+                                     uint32_t *h_dn);
+
+/**
+ * @brief [plan 201 S1] The expert pool's miss round, which the token driver
+ *        provides (hexkl_token.c): @a post names MOE op @a op's routed
+ *        experts and the ones its EXPERTS table lacks and returns at once;
+ *        @a wait blocks until the pool's owner answers and applies the
+ *        answer to @a g's tables. The MOE op runs its present experts
+ *        between the two.
+ */
+typedef struct {
+  int (*post)(void *ctx, uint32_t op, const uint32_t *routed, uint32_t n_routed,
+              const uint32_t *miss, uint32_t n_miss);
+  int (*wait)(void *ctx, struct hexkl_graph_s *g, uint32_t op);
+  void *ctx;
+} hexkl_graph_miss;
+
 /** @brief What a kernel needs from the session, handed per call so the
  *  graph holds no pointer into the session. */
 typedef struct {
@@ -92,6 +124,11 @@ typedef struct {
   hexkl_graph_fc_fn fc;     /**< [#132 Part B] the Q4M1 kinds' runner; NULL
                                  = none, and they fail with AEE_EBADSTATE */
   void *fc_ctx;
+  hexkl_graph_rebind_fn rebind; /**< [plan 201 S1] NULL = none */
+  void *rebind_ctx;
+  hexkl_graph_miss miss; /**< [plan 201 S1] post NULL = no miss path: a
+                              token routed to a non-resident expert fails
+                              with AEE_EBADSTATE */
 } hexkl_graph_env;
 
 /** @brief The MoE routing of this token, in mm_u8i4_moe_layer's layout:
@@ -106,7 +143,15 @@ typedef struct {
   uint32_t n_experts;
 } hexkl_graph_routing;
 
-typedef struct {
+/** @brief [plan 201 S1] The most experts one MOE op may route a token to
+ *  (the M = 1 path's MOE_M1_MAX_EXPERTS), what a miss round names. */
+#define HEXKL_GRAPH_MISS_MAX 16u
+
+/** @brief [plan 201 S1] The token's routed sets, S1's response carries
+ *  them to the pool's owner: per MOE op run, its count then its ids. */
+#define HEXKL_GRAPH_ROUTE_LOG 320u
+
+typedef struct hexkl_graph_s {
   uint32_t n_layers, n_ops, hidden, vocab, max_seq;
   uint32_t slot_words; /**< f32 per activation slot: the widest resident
                             op's in or out width */
@@ -126,6 +171,11 @@ typedef struct {
   /** the session's handle table graph_init checked against, which the
    *  EXPERTS tables are checked against too */
   const hexkl_weight_u8i4_table *tbl;
+  /** [plan 201 S1] a miss round's per-expert outputs, top_k x N_out f32
+   *  (the widest resident MOE op's), allocated at init */
+  float *moe_rows;
+  uint8_t route_log[HEXKL_GRAPH_ROUTE_LOG]; /**< cleared by the token driver */
+  uint32_t route_log_n;
   /** The last ROUTER_TOPK op's routing (#132), in expert order: rewritten
    *  by every router op, read by the MOE op after it. */
   uint32_t route_idx[HTP_GRAPH_MAX_EXPERTS];
@@ -185,6 +235,16 @@ void hexkl_graph_free(hexkl_graph *g);
  */
 int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
                           const float *data, uint32_t n);
+
+/**
+ * @brief [plan 201 S1] One EXPERTS entry: expert @a e of MOE op @a op to
+ *        the pair @a h_gu / @a h_dn (both HTP_GRAPH_NO_HANDLE: evicted).
+ * @return 0; AEE_EBADITEM (op or e out of range, not a MOE op);
+ *         AEE_EBADSTATE (no table bound); HTP_GRAPH_E_INVHANDLE (a handle
+ *         not registered at the op's shape)
+ */
+int hexkl_graph_pool_set(hexkl_graph *g, uint32_t op, uint32_t e, uint32_t h_gu,
+                         uint32_t h_dn);
 
 /** @brief Whether any MoE op's EXPERTS table names @a handle:
  *  weight_release refuses such a handle with AEE_EBADSTATE while the graph

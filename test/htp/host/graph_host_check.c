@@ -746,6 +746,32 @@ static void check_forward(void) {
 }
 
 /* ---- limits half (plan 201 S1): sized for Gemma-4-26B-A4B -------------- */
+/* A miss round answered at once: every missing odd expert e loaded on the
+   pair 3000 + e / 3200 + e, the order of events recorded. */
+typedef struct {
+  uint32_t posts, waits, kernel_calls_at_post;
+  uint32_t miss[HEXKL_GRAPH_MISS_MAX], n_miss;
+} fake_owner;
+static fake_owner g_owner;
+static int fake_post(void *ctx, uint32_t op, const uint32_t *routed,
+                     uint32_t n_routed, const uint32_t *miss, uint32_t n_miss) {
+  (void)ctx, (void)op, (void)routed, (void)n_routed;
+  ++g_owner.posts;
+  memcpy(g_owner.miss, miss, n_miss * sizeof(uint32_t));
+  g_owner.n_miss = n_miss;
+  return AEE_SUCCESS;
+}
+static int fake_wait(void *ctx, struct hexkl_graph_s *g, uint32_t op) {
+  uint32_t i;
+  int rc = AEE_SUCCESS;
+  (void)ctx;
+  ++g_owner.waits;
+  for (i = 0; rc == AEE_SUCCESS && i < g_owner.n_miss; ++i)
+    rc = hexkl_graph_pool_set(g, op, g_owner.miss[i], 3000u + g_owner.miss[i],
+                              3200u + g_owner.miss[i]);
+  return rc;
+}
+
 static void check_limits(void) {
   static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
                     HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
@@ -827,9 +853,49 @@ static void check_limits(void) {
                                      out, 64u, &resume);
   CHECK(rc == HTP_GRAPH_E_BADSTATE, "routed outside the pool: %s",
         htp_graph_err_name(rc));
+  /* the miss round (plan 201 S1): top-8 over experts 2, 5, 6, 9, 40, 63,
+     64, 126 -- misses 5, 9, 63 after a hit, in the middle and late -- equals
+     the direct call on the loaded table bit for bit */
+  {
+    static const uint32_t rt[8] = {2u, 5u, 6u, 9u, 40u, 63u, 64u, 126u};
+    uint32_t full_gu[128], full_dn[128], k;
+    for (e = 0; e < 128u; ++e) {
+      row_count[e] = 0u;
+      if (e & 1u) {
+        register_weight(3000u + e, 64u, 128u);
+        register_weight(3200u + e, 64u, 64u);
+      }
+      full_gu[e] = (e & 1u) ? 3000u + e : gu[e];
+      full_dn[e] = (e & 1u) ? 3200u + e : dn[e];
+    }
+    for (k = 0; k < 8u; ++k)
+      row_count[rt[k]] = 1u;
+    hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, 64u,
+                                64u, 64u, 128u, full_gu, full_dn, row_index,
+                                row_count, row_weight, act, ref, env.pool,
+                                &g_scratch, 0u);
+    env.miss.post = fake_post;
+    env.miss.wait = fake_wait;
+    memset(&g_owner, 0, sizeof(g_owner));
+    routing.n_experts = 128u;
+    rc = (uint32_t)hexkl_graph_forward(g, &env, m0, 1000u, 0u, &routing, act,
+                                       64u, out, 64u, &resume);
+    CHECK(rc == 0u && memcmp(out, ref, sizeof(out)) == 0 &&
+            g_owner.posts == 1u && g_owner.waits == 1u && g_owner.n_miss == 3u,
+          "miss round: %s posts %u waits %u misses %u", htp_graph_err_name(rc),
+          g_owner.posts, g_owner.waits, g_owner.n_miss);
+    CHECK(g->experts[m0][5] == 3005u && g->experts[m0][128u + 63u] == 3263u,
+          "the answer did not reach the table");
+    CHECK(g->route_log_n >= 9u && g->route_log[g->route_log_n - 9u] == 8u &&
+            g->route_log[g->route_log_n - 1u] == 126u,
+          "route log");
+    env.miss.post = NULL;
+    env.miss.wait = NULL;
+  }
   hexkl_graph_free(g);
   printf("GRAPH LIMITS OK: 542 ops, 128 experts top-8, handles up to %u, a "
-         "pool of the even experts bit-identical to the direct call\n",
+         "pool of the even experts bit-identical to the direct call; a miss "
+         "round (3 of 8 routed missing) bit-identical to the loaded table\n",
          gu[126]);
 }
 
