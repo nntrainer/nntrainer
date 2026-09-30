@@ -112,6 +112,7 @@ int hexkl_dma_ring_is_done(uint32_t idx) {
 }
 
 void hexkl_dcache_inva(const void *p, uint32_t bytes) {
+#if defined(__hexagon__)
   const uintptr_t line = 32u; /* L1 line; L2's 64 B lines cover it */
   uintptr_t a = (uintptr_t)p & ~(line - 1u);
   const uintptr_t end = (uintptr_t)p + bytes;
@@ -119,4 +120,9 @@ void hexkl_dcache_inva(const void *p, uint32_t bytes) {
     Q6_dcinva_A((void *)a);
   }
   asm volatile("" ::: "memory");
+#else
+  /* The host stand-in's transfers are memcpys: no cache sits behind them. */
+  (void)p;
+  (void)bytes;
+#endif
 }

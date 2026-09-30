@@ -402,7 +402,7 @@ static void softmax_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
  *        already run it inline by then).
  */
 static void softmax_start(attn_ctx *c, uint32_t qb, uint32_t kb, uint32_t sbuf,
-                         int masked) {
+                          int masked) {
   c->w_qb = qb;
   c->w_kb = kb;
   c->w_sbuf = sbuf;

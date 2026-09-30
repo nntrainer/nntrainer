@@ -39,9 +39,23 @@ int hexkl_mm_u8i4_moe_layer_run(
   uint32_t n_experts, const uint32_t *h_gate_up, const uint32_t *h_down,
   const uint32_t *row_index, const uint32_t *row_count, const float *row_weight,
   const float *act_f32, float *out_f32, hvx_worker_pool *pool,
-  hexkl_moe_scratch *scratch) {
+  hexkl_moe_scratch *scratch, uint32_t flags) {
   fprintf(stderr, "swap_host_check: hexkl_mm_u8i4_moe_layer_run called\n");
   abort();
+}
+/* The skel asks these two before a release or a detach; this check has no
+   decode graph and no Q4M1 slot, so nothing is ever bound or borrowed. */
+int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle) {
+  (void)g;
+  (void)handle;
+  return 0;
+}
+int nntr_hvx_q4m1_borrows(const nntr_hvx_session *s, const uint8_t *va,
+                          uint32_t bytes) {
+  (void)s;
+  (void)va;
+  (void)bytes;
+  return 0;
 }
 void hexkl_probe_reset(int enable) {
   (void)enable;
