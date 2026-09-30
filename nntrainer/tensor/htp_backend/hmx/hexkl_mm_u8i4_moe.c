@@ -1331,7 +1331,7 @@ int hexkl_mm_u8i4_moe_layer_run(
   /* Sizes once, in carve order; the sum is what the scratch must hold.
      order / base_of / slot_of are per-expert tables on the heap rather
      than stack arrays sized by HEXKL_MM_U8I4_MAX_WEIGHTS: that constant is
-     2048 and has nothing to do with how many experts this layer has. */
+     4096 and has nothing to do with how many experts this layer has. */
   /* Reserved for the most slots THIS many rows can ever need -- every
      expert padded to a whole block -- not for this call's routing. The 22
      prefill calls of a token batch have the same n_rows but a different

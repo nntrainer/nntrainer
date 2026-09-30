@@ -490,16 +490,26 @@ static void register_weight(uint32_t h, uint32_t K, uint32_t N) {
   g_tbl.slots[h].K = K;
   g_tbl.slots[h].N = N;
 }
+/** @brief [plan 201 S1] Binds MoE op @a op's EXPERTS table: h_gu[0..E)
+ *  then h_dn[0..E), as graph_set_param's f32 words. */
+static int set_experts(hexkl_graph *g, uint32_t op, const uint32_t *h_gu,
+                       const uint32_t *h_dn, uint32_t E) {
+  float t[2u * HTP_GRAPH_MAX_EXPERTS];
+  memcpy(t, h_gu, E * sizeof(uint32_t));
+  memcpy(t + E, h_dn, E * sizeof(uint32_t));
+  return hexkl_graph_set_param(g, op, HTP_GRAPH_PARAM_EXPERTS, t, 2u * E);
+}
+
 /* Layer l's expert e: gate_up handle 10 + 40 l + e, down 30 + 40 l + e. */
-static void bind_tiny(uint32_t *w) {
+static uint32_t g_tiny_gu[2][4], g_tiny_dn[2][4];
+static void bind_tiny(void) {
   uint32_t l, e;
   for (l = 0; l < 2u; ++l) {
-    htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_MOE, l));
     for (e = 0; e < 4u; ++e) {
-      op->h_gu[e] = 10u + 40u * l + e;
-      op->h_dn[e] = 30u + 40u * l + e;
-      register_weight(op->h_gu[e], 64u, 128u);
-      register_weight(op->h_dn[e], 64u, 64u);
+      g_tiny_gu[l][e] = 10u + 40u * l + e;
+      g_tiny_dn[l][e] = 30u + 40u * l + e;
+      register_weight(g_tiny_gu[l][e], 64u, 128u);
+      register_weight(g_tiny_dn[l][e], 64u, 64u);
     }
   }
 }
@@ -569,31 +579,51 @@ static void check_forward(void) {
   }
   printf("GRAPH FORWARD IDENTITY OK (22 start ops, no op resident)\n");
 
-  /* (2) MOE resident: init refuses a free or mis-shaped handle */
+  /* (2) MOE resident: the handles are each op's EXPERTS table (plan 201
+     S1), bound after init and checked there, not in the record */
   n = build(w, cap, &kTiny, "AC", resident_ok);
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
-  CHECK(rc == HTP_GRAPH_E_INVHANDLE && g == NULL, "unbound handles: %s",
-        htp_graph_err_name(rc));
-  bind_tiny(w);
-  htp_graph_op_at(w, nth_op(w, HTP_OP_MOE, 1))->h_dn[2] = 7u; /* free slot */
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
-  CHECK(rc == HTP_GRAPH_E_INVHANDLE, "free handle: %s", htp_graph_err_name(rc));
-  printf("  missing weight handle                     -> %s (0x%x)\n",
-         htp_graph_err_name(rc), rc);
-  bind_tiny(w);
-  g_tbl.slots[31].N = 96u; /* layer 0 expert 1's down: inter differs */
-  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
-  CHECK(rc == HTP_GRAPH_E_INVHANDLE, "mis-shaped handle: %s",
-        htp_graph_err_name(rc));
-  printf("  weight handle of another shape            -> %s (0x%x)\n",
-         htp_graph_err_name(rc), rc);
-  g_tbl.slots[31].N = 64u;
+  bind_tiny();
   rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
   CHECK(rc == 0u && g != NULL, "init (MOE resident): %s",
         htp_graph_err_name(rc));
   if (g == NULL)
     return;
   CHECK(g->slot_words == 64u, "slot_words %u", g->slot_words);
+  {
+    const uint32_t m0 = nth_op(w, HTP_OP_MOE, 0), m1 = nth_op(w, HTP_OP_MOE, 1);
+    rc = (uint32_t)hexkl_graph_forward(g, &env, m0, 1000u, 0u, &routing, act,
+                                       64u, out, 64u, &resume);
+    CHECK(rc == HTP_GRAPH_E_BADSTATE, "no EXPERTS table: %s",
+          htp_graph_err_name(rc));
+    printf("  MOE op with no EXPERTS table              -> %s (0x%x)\n",
+           htp_graph_err_name(rc), rc);
+    g_tiny_dn[1][2] = 7u; /* a free slot */
+    rc = (uint32_t)set_experts(g, m1, g_tiny_gu[1], g_tiny_dn[1], 4u);
+    CHECK(rc == HTP_GRAPH_E_INVHANDLE, "free handle: %s",
+          htp_graph_err_name(rc));
+    printf("  missing weight handle                     -> %s (0x%x)\n",
+           htp_graph_err_name(rc), rc);
+    g_tiny_dn[1][2] = 72u;
+    g_tbl.slots[31].N = 96u; /* layer 0 expert 1's down: inter differs */
+    rc = (uint32_t)set_experts(g, m0, g_tiny_gu[0], g_tiny_dn[0], 4u);
+    CHECK(rc == HTP_GRAPH_E_INVHANDLE, "mis-shaped handle: %s",
+          htp_graph_err_name(rc));
+    printf("  weight handle of another shape            -> %s (0x%x)\n",
+           htp_graph_err_name(rc), rc);
+    g_tbl.slots[31].N = 64u;
+    CHECK(g->experts[m0] == NULL && g->experts[m1] == NULL,
+          "a refused table was stored");
+    rc = (uint32_t)set_experts(g, m0, g_tiny_gu[0], g_tiny_dn[0], 3u);
+    CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "EXPERTS length: %s",
+          htp_graph_err_name(rc));
+    rc = (uint32_t)set_experts(g, nth_op(w, HTP_OP_RMSNORM, 0), g_tiny_gu[0],
+                               g_tiny_dn[0], 4u);
+    CHECK(rc == HTP_GRAPH_E_INVALIDFORMAT, "EXPERTS on a norm: %s",
+          htp_graph_err_name(rc));
+    rc = (uint32_t)set_experts(g, m0, g_tiny_gu[0], g_tiny_dn[0], 4u) |
+         (uint32_t)set_experts(g, m1, g_tiny_gu[1], g_tiny_dn[1], 4u);
+    CHECK(rc == 0u, "EXPERTS bind: %s", htp_graph_err_name(rc));
+  }
   CHECK(hexkl_graph_uses_handle(g, 10u) && hexkl_graph_uses_handle(g, 53u) &&
           !hexkl_graph_uses_handle(g, 7u) && !hexkl_graph_uses_handle(g, 99u),
         "uses_handle");
@@ -603,13 +633,12 @@ static void check_forward(void) {
     env.moe_flags = flag_cases[f];
     for (l = 0; l < 2u; ++l) {
       const uint32_t start = nth_op(w, HTP_OP_MOE, l);
-      const htp_graph_op *op = htp_graph_op_cat(w, start);
       moe_args direct;
       uint32_t j;
       hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, 64u,
-                                  64u, 64u, 4u, op->h_gu, op->h_dn, row_index,
-                                  row_count, row_weight, act, ref, env.pool,
-                                  &g_scratch, env.moe_flags);
+                                  64u, 64u, 4u, g_tiny_gu[l], g_tiny_dn[l],
+                                  row_index, row_count, row_weight, act, ref,
+                                  env.pool, &g_scratch, env.moe_flags);
       direct = g_last;
       memset(out, 0, sizeof(out));
       memset(&g_last, 0, sizeof(g_last));
@@ -681,10 +710,126 @@ static void check_forward(void) {
     rc = (uint32_t)hexkl_graph_forward(g, &env, start - 1u, 1000u, 0u, &routing,
                                        act, 64u, out, 4u, &resume);
     CHECK(rc == 0u && resume == start - 1u, "router op is not resident");
+    /* [plan 201 S1] a pool that does not hold experts 0 and 2 still runs
+       a token routed to 1 and 3, with the full table's bits; one that
+       does not hold 3 refuses it */
+    {
+      uint32_t gu[4], dn[4];
+      memcpy(gu, g_tiny_gu[0], sizeof(gu));
+      memcpy(dn, g_tiny_dn[0], sizeof(dn));
+      gu[0] = dn[0] = gu[2] = dn[2] = HTP_GRAPH_NO_HANDLE;
+      rc = (uint32_t)set_experts(g, start, gu, dn, 4u);
+      CHECK(rc == 0u, "EXPERTS with holes: %s", htp_graph_err_name(rc));
+      env.moe_flags = 0u;
+      hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, 64u,
+                                  64u, 64u, 4u, g_tiny_gu[0], g_tiny_dn[0],
+                                  row_index, row_count, row_weight, act, ref,
+                                  env.pool, &g_scratch, 0u);
+      rc = (uint32_t)hexkl_graph_forward(g, &env, start, 1000u, 0u, &routing,
+                                         act, 64u, out, 64u, &resume);
+      CHECK(rc == 0u && memcmp(out, ref, sizeof(out)) == 0,
+            "holes on unrouted experts: %s", htp_graph_err_name(rc));
+      dn[3] = HTP_GRAPH_NO_HANDLE;
+      rc = (uint32_t)set_experts(g, start, gu, dn, 4u);
+      CHECK(rc == 0u, "EXPERTS with a routed hole: %s", htp_graph_err_name(rc));
+      rc = (uint32_t)hexkl_graph_forward(g, &env, start, 1000u, 0u, &routing,
+                                         act, 64u, out, 64u, &resume);
+      CHECK(rc == HTP_GRAPH_E_BADSTATE, "routed to a non-resident expert: %s",
+            htp_graph_err_name(rc));
+      CHECK(!hexkl_graph_uses_handle(g, 10u) && hexkl_graph_uses_handle(g, 11u),
+            "uses_handle follows the table");
+    }
   }
   hexkl_graph_free(g);
   hexkl_graph_free(NULL);
   printf("GRAPH FORWARD REFUSALS OK\n");
+}
+
+/* ---- limits half (plan 201 S1): sized for Gemma-4-26B-A4B -------------- */
+static void check_limits(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  /* 60 conv layers, 128 experts, top-8: 60 x 9 + 2 = 542 ops, over the
+     256 before; the handles at the top of the 4096-entry table */
+  static const htp_graph_lfm2_shape big = {60, 0, 64, 64, 64, 128,  8,
+                                           8,  4, 8,  32, 8,  1e-6f};
+  char layers[61];
+  const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
+  static const uint32_t routed[8] = {2u, 6u, 18u, 40u, 64u, 90u, 100u, 126u};
+  uint32_t gu[128], dn[128], row_count[128], row_index[8], e, n, rc, m0, resume,
+    seed = 201u;
+  float row_weight[8], act[64], out[64], ref[64];
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  hexkl_graph_routing routing;
+
+  memset(layers, 'C', 60);
+  layers[60] = '\0';
+  n = build(w, cap, &big, layers, HTP_GRAPH_KIND_BIT(HTP_OP_MOE));
+  CHECK(n != 0u && w[3] == 542u, "60-layer build: %u words, %u ops", n, w[3]);
+  rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, NULL);
+  CHECK(rc == 0u, "542 ops x 128 experts: %s", htp_graph_err_name(rc));
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->resident = 1u;
+  rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, NULL);
+  CHECK(rc == HTP_GRAPH_E_SCHEMENOTSUPPORTED,
+        "resident router over 128 experts: %s", htp_graph_err_name(rc));
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->resident = 0u;
+
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
+  CHECK(rc == 0u && g != NULL, "init 542 ops: %s", htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  m0 = nth_op(w, HTP_OP_MOE, 0);
+  /* the pool holds the even experts only */
+  for (e = 0; e < 128u; ++e) {
+    gu[e] = (e & 1u) ? HTP_GRAPH_NO_HANDLE : 3968u + e;
+    dn[e] = (e & 1u) ? HTP_GRAPH_NO_HANDLE : 3840u + e;
+    if (!(e & 1u)) {
+      register_weight(gu[e], 64u, 128u);
+      register_weight(dn[e], 64u, 64u);
+    }
+    row_count[e] = 0u;
+  }
+  rc = (uint32_t)set_experts(g, m0, gu, dn, 128u);
+  CHECK(rc == 0u, "EXPERTS 128: %s", htp_graph_err_name(rc));
+  for (e = 0; e < 8u; ++e) {
+    row_count[routed[e]] = 1u;
+    row_index[e] = 0u;
+    row_weight[e] = 0.125f * (float)(e + 1u);
+  }
+  for (e = 0; e < 64u; ++e)
+    act[e] = frand(&seed);
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  env.vtcm_base = g_vtcm;
+  env.vtcm_size = sizeof(g_vtcm);
+  env.config_off = 32u;
+  env.pool = real_pool();
+  env.scratch = &g_scratch;
+  hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, 64u, 64u,
+                              64u, 128u, gu, dn, row_index, row_count,
+                              row_weight, act, ref, env.pool, &g_scratch, 0u);
+  routing.row_index = row_index;
+  routing.row_count = row_count;
+  routing.row_weight = row_weight;
+  routing.n_rows = 8u;
+  routing.n_experts = 128u;
+  rc = (uint32_t)hexkl_graph_forward(g, &env, m0, 1000u, 0u, &routing, act, 64u,
+                                     out, 64u, &resume);
+  CHECK(rc == 0u && memcmp(out, ref, sizeof(out)) == 0 &&
+          g_last.n_experts == 128u,
+        "128 experts, top-8, half the pool: %s", htp_graph_err_name(rc));
+  row_count[routed[7]] = 0u;
+  row_count[127] = 1u; /* odd: not in the pool */
+  routing.n_experts = 128u;
+  rc = (uint32_t)hexkl_graph_forward(g, &env, m0, 1000u, 0u, &routing, act, 64u,
+                                     out, 64u, &resume);
+  CHECK(rc == HTP_GRAPH_E_BADSTATE, "routed outside the pool: %s",
+        htp_graph_err_name(rc));
+  hexkl_graph_free(g);
+  printf("GRAPH LIMITS OK: 542 ops, 128 experts top-8, handles up to %u, a "
+         "pool of the even experts bit-identical to the direct call\n",
+         HEXKL_MM_U8I4_MAX_WEIGHTS - 1u);
 }
 
 /* ---- stretch half (#130): the real kernels vs the scalar specs --------- */
@@ -937,15 +1082,17 @@ static void check_stretches(void) {
 
 /* hd64's two MoE layers on the stand-in: gate_up 200 + 10 m + e, down
    250 + 10 m + e (the tiny fixture's handles stay 10..73). */
+/* MoE op m's expert e: gate_up 200 + 10 m + e, down 250 + 10 m + e */
+static uint32_t g_hd64_gu[2][HD64_E], g_hd64_dn[2][HD64_E];
 static void bind_hd64(uint32_t *w) {
   uint32_t m, e;
+  (void)w;
   for (m = 0; m < 2u; ++m) {
-    htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_MOE, m));
     for (e = 0; e < HD64_E; ++e) {
-      op->h_gu[e] = 200u + 10u * m + e;
-      op->h_dn[e] = 250u + 10u * m + e;
-      register_weight(op->h_gu[e], HID, 2u * HD64_INTER);
-      register_weight(op->h_dn[e], HD64_INTER, HID);
+      g_hd64_gu[m][e] = 200u + 10u * m + e;
+      g_hd64_dn[m][e] = 250u + 10u * m + e;
+      register_weight(g_hd64_gu[m][e], HID, 2u * HD64_INTER);
+      register_weight(g_hd64_dn[m][e], HD64_INTER, HID);
     }
   }
 }
@@ -980,6 +1127,11 @@ static void check_add_router(void) {
   CHECK(rc == 0u && g != NULL, "hd64 D init: %s", htp_graph_err_name(rc));
   if (g == NULL)
     return;
+  for (i = 0; i < 2u; ++i) {
+    rc = (uint32_t)set_experts(g, nth_op(w, HTP_OP_MOE, i), g_hd64_gu[i],
+                               g_hd64_dn[i], HD64_E);
+    CHECK(rc == 0u, "hd64 EXPERTS %u: %s", i, htp_graph_err_name(rc));
+  }
   /* layer 0's norms (0, 5), layer 1's ffn norm (15), layer 2's operator
      norm (19); layer 0's ffn-side ADD (4) and layer 1's first ADD (14) */
   op_norm[0] = nth_op(w, HTP_OP_RMSNORM, 0);
@@ -1075,13 +1227,10 @@ static void check_add_router(void) {
   CHECK(g_last.n_calls == 1u &&
           memcmp(g_last.row_count, r_cnt, sizeof(r_cnt)) == 0,
         "the MOE op did not get the router's routing");
-  {
-    const htp_graph_op *mo = &g->ops[op_router + 1u];
-    hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, HID,
-                                HD64_INTER, HID, HD64_E, mo->h_gu, mo->h_dn,
-                                r_idx, r_cnt, r_w, nrm, moe, env.pool,
-                                &g_scratch, 0u);
-  }
+  hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, HID,
+                              HD64_INTER, HID, HD64_E, g_hd64_gu[0],
+                              g_hd64_dn[0], r_idx, r_cnt, r_w, nrm, moe,
+                              env.pool, &g_scratch, 0u);
   for (i = 0; i < HID; ++i)
     h[i] = m1_det_add(h[i], moe[i]);
   m1_rmsnorm_det(h, gam[3], ref, HID, HID, kHd64.eps, NULL);
@@ -1456,6 +1605,7 @@ static void check_q4m1(void) {
 int main(void) {
   check_validator();
   check_forward();
+  check_limits();
   check_stretches();
   check_add_router();
   check_q4m1();

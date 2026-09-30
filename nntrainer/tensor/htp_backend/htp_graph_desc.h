@@ -43,12 +43,22 @@
 #define HTP_GRAPH_MAGIC 0x47505448u /* "HTPG" */
 #define HTP_GRAPH_VERSION 2u
 #define HTP_GRAPH_HEADER_WORDS 7u
-/** @brief LFM2.5-8B-A1B is 228 ops (section htp_graph_lfm2_build); the
- *  table is HTP_GRAPH_OP_WORDS x 4 B per op, so 256 is 80 KiB of DSP
- *  heap at graph_init (address-space note in hexkl_graph.c). */
-#define HTP_GRAPH_MAX_OPS 256u
+/** @brief LFM2.5-8B-A1B is 228 ops (section htp_graph_lfm2_build),
+ *  Gemma-4-26B-A4B about 25 a layer x 30 (plan 201 section 2.4); the table
+ *  is HTP_GRAPH_OP_WORDS x 4 B per op, so 1024 is 320 KiB of DSP heap at
+ *  graph_init (address-space note in hexkl_graph.c). */
+#define HTP_GRAPH_MAX_OPS 1024u
 #define HTP_GRAPH_MAX_LAYERS 64u
-#define HTP_GRAPH_MAX_EXPERTS 32u
+/** @brief A MOE / ROUTER_TOPK op's expert count (Gemma: 128). A MOE op's
+ *  handles are not in its record: they are its HTP_GRAPH_PARAM_EXPERTS
+ *  table (plan 201 S1, the expert pool's table). */
+#define HTP_GRAPH_MAX_EXPERTS 128u
+/** @brief A resident ROUTER_TOPK's expert count: the sigmoid router's one
+ *  vector of lanes (hvx_router_topk_f32, LFM2); Gemma's softmax router is
+ *  plan 201 S4. */
+#define HTP_GRAPH_ROUTER_MAX_EXPERTS 32u
+/** @brief The op record's handle arrays: the Q4M1 kinds' parts. */
+#define HTP_GRAPH_MAX_PARTS 32u
 #define HTP_GRAPH_N_SLOTS 3u
 #define HTP_GRAPH_NO_OP 0xFFFFFFFFu
 
@@ -158,7 +168,11 @@ static inline const char *htp_graph_kinds_str(uint32_t mask, char *buf,
  *  its argmax
  *  skips them, as the CPU's bad-words penalty sets those logits to -inf
  *  before its first-maximum pick; the logits themselves stay raw. A later
- *  LM_BAN replaces the list. Append, never reorder. */
+ *  LM_BAN replaces the list. [plan 201 S1] EXPERTS is a MOE op's pool
+ *  table, 2 x n_experts u32 handle words (h_gu[0..E) then h_dn[0..E)), each
+ *  a registered weight of the op's shape or HTP_GRAPH_NO_HANDLE (not
+ *  resident: forward refuses a token that routes to it); a later EXPERTS
+ *  replaces the table. Append, never reorder. */
 enum {
   HTP_GRAPH_PARAM_GAMMA = 0,
   HTP_GRAPH_PARAM_CONV_W,
@@ -167,10 +181,13 @@ enum {
   HTP_GRAPH_PARAM_ROUTER_W,
   HTP_GRAPH_PARAM_ROUTER_BIAS,
   HTP_GRAPH_PARAM_LM_BAN,
+  HTP_GRAPH_PARAM_EXPERTS,
   HTP_GRAPH_PARAM_N
 };
 /** @brief LM_BAN's longest list. */
 #define HTP_GRAPH_MAX_BAN 32u
+/** @brief An EXPERTS table entry for an expert that is not resident. */
+#define HTP_GRAPH_NO_HANDLE 0xFFFFFFFFu
 
 enum { HTP_GRAPH_LAYER_CONV = 0, HTP_GRAPH_LAYER_ATTN = 1 };
 enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
@@ -185,9 +202,10 @@ enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
  * operand implicitly. next_mm names the next weight-streaming op (FC,
  * MOE, DENSE_FFN, LM_HEAD) or HTP_GRAPH_NO_OP; nothing consumes it yet
  * (the cross-op prefetch hook is a later issue), the validator only
- * requires it to point forward. h_gu / h_dn are the MoE op's registered
- * weight handles, bound by the ARM before graph_init. [#132 Part B] The
- * Q4M1 kinds use them too, with n_experts the part count: an FC's parts
+ * requires it to point forward. h_gu / h_dn are the Q4M1 kinds' weight
+ * handles, bound by the ARM before graph_init (a MOE op leaves them unused:
+ * its handles are its HTP_GRAPH_PARAM_EXPERTS table, plan 201 S1), with
+ * n_experts the part count (#132 Part B): an FC's parts
  * are h_gu[0..n_experts), K x N_p each, their outputs concatenated (q | k
  * | v: three parts, one quantization), an LM_HEAD's are its vocab slices
  * likewise, and a DENSE_FFN has h_gu[0] = up, h_gu[1] = gate (K x N each)
@@ -223,10 +241,10 @@ typedef struct {
   uint32_t gqa;
   uint32_t head_dim;
   uint32_t eps_bits;
-  uint32_t h_gu[HTP_GRAPH_MAX_EXPERTS];
-  uint32_t h_dn[HTP_GRAPH_MAX_EXPERTS];
+  uint32_t h_gu[HTP_GRAPH_MAX_PARTS];
+  uint32_t h_dn[HTP_GRAPH_MAX_PARTS];
 } htp_graph_op;
-#define HTP_GRAPH_OP_WORDS (16u + 2u * HTP_GRAPH_MAX_EXPERTS)
+#define HTP_GRAPH_OP_WORDS (16u + 2u * HTP_GRAPH_MAX_PARTS)
 /** @brief The Q4M1 kinds' feed word (htp_graph_op.feed). */
 #define HTP_GRAPH_FEED_L2 1u
 #define HTP_GRAPH_FEED_NATIVE (1u << 16)
@@ -349,7 +367,9 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         ROUTER_TOPK needs the next op, its MOE, resident (NOTALLOWED:
  *         the routing has no other consumer). #132 Part B's rules for
  *         the Q4M1 kinds: n_experts (the part count) at most 32 and feed
- *         0 or 1 (INVALIDFORMAT); a resident one needs K % 64 == 0 and K
+ *         0 or 1 (INVALIDFORMAT); [plan 201 S1] a resident ROUTER_TOPK over
+ *         more than 32 experts (SCHEMENOTSUPPORTED: the sigmoid router's
+ *         vector width); a resident one needs K % 64 == 0 and K
  *         <= 8192, a DENSE_FFN also N (the down weight's K) % 64 == 0 and
  *         N <= 8192 -- the Q4M1 layout's pair and the quantizer's scratch
  *         (SCHEMENOTSUPPORTED)
@@ -461,7 +481,7 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       break;
     }
     if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(k)) != 0u) {
-      if (op->n_experts > HTP_GRAPH_MAX_EXPERTS ||
+      if (op->n_experts > HTP_GRAPH_MAX_PARTS ||
           (op->feed & ~(HTP_GRAPH_FEED_L2 | 0xFF00u | HTP_GRAPH_FEED_NATIVE)) !=
             0u ||
           HTP_GRAPH_FEED_LANES_SMALL(op->feed) > 8u ||
@@ -508,6 +528,9 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     }
     if (k == HTP_OP_RMSNORM && op->resident != 0u &&
         (op->K % 32u != 0u || (op->K & (op->K - 1u)) != 0u))
+      return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
+    if (k == HTP_OP_ROUTER_TOPK && op->resident != 0u &&
+        op->n_experts > HTP_GRAPH_ROUTER_MAX_EXPERTS)
       return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
     if (k == HTP_OP_ROUTER_TOPK && op->resident != 0u &&
         (i + 1u >= n_ops || htp_graph_op_cat(w, i + 1u)->kind != HTP_OP_MOE ||
@@ -589,7 +612,8 @@ htp_graph_lfm2_emit(uint32_t *w, uint32_t *n, uint32_t kind, uint32_t layer,
  * @param resident_mask HTP_GRAPH_KIND_BIT mask: which kinds get the bit
  * @return the words written, or 0 when @a cap or HTP_GRAPH_MAX_OPS is
  *         too small. Slot use: 0 = the residual stream, 1 / 2 = working.
- *         MoE handles are left 0 for the ARM to bind (htp_compute_ops.cpp).
+ *         A MOE op's handles are its EXPERTS table, bound by the ARM
+ *         after graph_init (htp_compute_ops.cpp).
  */
 static inline uint32_t htp_graph_lfm2_build(uint32_t *w, uint32_t cap,
                                             const htp_graph_lfm2_shape *s,

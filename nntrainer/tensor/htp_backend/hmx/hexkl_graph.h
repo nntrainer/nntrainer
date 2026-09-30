@@ -27,6 +27,13 @@
  * hexkl_graph_set_param (plan 130 section 3.1); forward refuses an op
  * whose parameter is missing with AEE_EBADSTATE.
  *
+ * [plan 201 S1] A MOE op's expert handles are its EXPERTS table, bound
+ * after init like a parameter and replaceable at any time: the expert
+ * pool's (layer, expert) -> handle map, HTP_GRAPH_NO_HANDLE for an expert
+ * that is not resident. forward hands the table to the kernel as its
+ * handle arrays (the kernel skips an expert with no rows before it reads
+ * its handle) and refuses a token that routes to a non-resident expert.
+ *
  * [#132 Part B] FC, DENSE_FFN and LM_HEAD: the Android CPU's M=1 Q4_0 FC
  * bit for bit (q4_gemv_cpu_det.h) -- hvx_q4m1_prep quantizes the op's
  * input once (hvx_intrin, = q8_0_quant_cpu_det) and the session's FC
@@ -112,6 +119,13 @@ typedef struct {
                                             conv state, row 2 scratch) */
   uint32_t ordinal[HTP_GRAPH_MAX_OPS]; /**< ATTN_M1: the attention-layer
                                             index the cache is keyed by */
+  /** [plan 201 S1] MOE: the op's pool table, h_gu[0..E) then h_dn[0..E)
+   *  (HTP_GRAPH_PARAM_EXPERTS; HTP_GRAPH_NO_HANDLE = not resident), NULL
+   *  until bound */
+  uint32_t *experts[HTP_GRAPH_MAX_OPS];
+  /** the session's handle table graph_init checked against, which the
+   *  EXPERTS tables are checked against too */
+  const hexkl_weight_u8i4_table *tbl;
   /** The last ROUTER_TOPK op's routing (#132), in expert order: rewritten
    *  by every router op, read by the MOE op after it. */
   uint32_t route_idx[HTP_GRAPH_MAX_EXPERTS];
@@ -137,12 +151,12 @@ typedef struct {
 uint32_t hexkl_graph_resident_kinds(void);
 
 /**
- * @brief Validates the words, checks every resident MoE op's handles
- *        against @a tbl (in use, gate_up K x 2N, down N x N_out) and every
- *        resident Q4M1 op's against @a q4m1 (#132 Part B: each part in
+ * @brief Validates the words, checks every resident Q4M1 op's handles
+ *        against @a q4m1 (#132 Part B: each part in
  *        range and in use, K the op's, an FC's or LM_HEAD's part widths
  *        multiples of 32 summing to N, a DENSE_FFN's up and gate K x N and
- *        down N x N_out), and keeps a copy.
+ *        down N x N_out), and keeps a copy and @a tbl (the MOE ops'
+ *        EXPERTS tables are checked against it when bound).
  * @param q4m1   the session's Q4M1 slot shapes (may be NULL when @a n_q4m1
  *               is 0: then a resident Q4M1 op is refused)
  * @return 0 or htp_graph_validate's code; HTP_GRAPH_E_INVHANDLE for a
@@ -164,13 +178,17 @@ void hexkl_graph_free(hexkl_graph *g);
  *        a second call replaces (CONV_STATE: re-seeds rows 0-1).
  * @return 0, AEE_EBADSTATE (no graph), HTP_GRAPH_E_BADITEM (op or which
  *         out of range), HTP_GRAPH_E_INVALIDFORMAT (the op's kind does
- *         not take @a which, or @a n is not its length), AEE_ENOMEMORY
+ *         not take @a which, or @a n is not its length),
+ *         HTP_GRAPH_E_INVHANDLE (an EXPERTS entry that is neither
+ *         HTP_GRAPH_NO_HANDLE nor a registered weight of the op's shape),
+ *         AEE_ENOMEMORY
  */
 int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
                           const float *data, uint32_t n);
 
-/** @brief Whether any resident MoE op names @a handle: weight_release
- *  refuses such a handle with AEE_EBADSTATE while the graph lives. */
+/** @brief Whether any MoE op's EXPERTS table names @a handle:
+ *  weight_release refuses such a handle with AEE_EBADSTATE while the graph
+ *  lives. */
 int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle);
 
 /** @brief [#132 Part B] The same for a Q4M1 handle (q4m1_release). */
@@ -189,7 +207,9 @@ int hexkl_graph_uses_q4m1(const hexkl_graph *g, uint32_t handle);
  * untouched, *resume_at == start_op and every op_pcycles entry is 0.
  * @a routing is consumed by the first MoE op run; a second MoE op in the
  * same call, or a MoE op with no routing, fails with AEE_EBADSTATE.
- * @return 0, AEE_EBADSTATE (no graph, routing; a RMSNORM / QK_NORM /
+ * @return 0, AEE_EBADSTATE (no graph, routing; a MOE op with no EXPERTS
+ *         table or one whose routed expert is not resident; a RMSNORM /
+ *         QK_NORM /
  *         CONV1D_GATE / ROUTER_TOPK op with no parameter or state bound, a ROPE
  * op with no table, an ATTN_M1 op with no cache in @a env, a Q4M1 op with
  * no fc runner in @a env, or the cache

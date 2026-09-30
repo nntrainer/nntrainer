@@ -12,10 +12,12 @@
  * @bug    No known bugs except for NYI items
  *
  * Address space (LEDGER rule 8): one hexkl_graph is HTP_GRAPH_MAX_OPS x
- * (320 + 8 + 8 + 8 + 4) B of table, about 87 KiB, plus HTP_GRAPH_N_SLOTS
- * x slot_words f32 of activation slots (36 KiB at LFM2.5: QK_NORM's 3072
- * words is the widest resident op), plus the parameters bound through
- * hexkl_graph_set_param -- about 1.8 MiB at LFM2.5 (49 gammas of 8 KiB,
+ * (320 + 8 + 4 + 4 + 4 + 4) B of table, about 344 KiB at 1024 ops (plan
+ * 201 S1; 88 KiB at the 256 before it), plus the MOE ops' EXPERTS tables
+ * (8 B an expert: 5.5 KiB at LFM2.5, 30 KiB at Gemma's 30 x 128), plus
+ * HTP_GRAPH_N_SLOTS x slot_words f32 of activation slots (36 KiB at LFM2.5:
+ * QK_NORM's 3072 words is the widest resident op), plus the parameters bound
+ * through hexkl_graph_set_param -- about 1.8 MiB at LFM2.5 (49 gammas of 8 KiB,
  * 18 x (24 + 24) KiB conv weight and state, a 512 KiB RoPE table at
  * max_seq 2048; plan 82 section 3.4) -- plus, with ROUTER_TOPK resident
  * (#132), 22 router weights padded to [2048][32] f32, 256 KiB each, 5.5
@@ -74,8 +76,11 @@ static int graph_op_moe(hexkl_graph *g, const htp_graph_op *op,
                         graph_call *call, const float *in, float *out) {
   const hexkl_graph_env *env = call->env;
   const hexkl_graph_routing *r = &call->routing;
+  const uint32_t *h = g->experts[op - g->ops];
   uint32_t e, sum = 0;
-  (void)g;
+  if (h == NULL) {
+    return AEE_EBADSTATE;
+  }
   /* The same checks as the per-layer entry (nntr_hvx_mm_u8i4.c
      check_moe_layer_args / check_moe_row_totals), with M fixed at 1: every
      row index is 0 and no expert sees the token twice. */
@@ -90,6 +95,12 @@ static int graph_op_moe(hexkl_graph *g, const htp_graph_op *op,
     if (r->row_count[e] > 1u) {
       return AEE_EINVALIDFORMAT;
     }
+    /* [plan 201 S1] a routed expert the pool does not hold */
+    if (r->row_count[e] != 0u &&
+        (h[e] == HTP_GRAPH_NO_HANDLE ||
+         h[op->n_experts + e] == HTP_GRAPH_NO_HANDLE)) {
+      return AEE_EBADSTATE;
+    }
     sum += r->row_count[e];
   }
   if (sum != r->n_rows) {
@@ -101,9 +112,11 @@ static int graph_op_moe(hexkl_graph *g, const htp_graph_op *op,
     }
   }
   call->routing.n_experts = 0u; /* consumed */
+  /* the table is the handle arrays: the kernel skips an expert with no
+     rows before it reads its handle, so a NO_HANDLE there is never read */
   return hexkl_mm_u8i4_moe_layer_run(
     env->tbl, env->vtcm_base, env->vtcm_size, env->config_off, 1u, op->K, op->N,
-    op->N_out, op->n_experts, op->h_gu, op->h_dn, r->row_index, r->row_count,
+    op->N_out, op->n_experts, h, h + op->n_experts, r->row_index, r->row_count,
     r->row_weight, in, out, env->pool, env->scratch, env->moe_flags);
 }
 
@@ -210,8 +223,9 @@ static int graph_op_add(hexkl_graph *g, const htp_graph_op *op,
 static int graph_op_router_topk(hexkl_graph *g, const htp_graph_op *op,
                                 graph_call *call, const float *in, float *out) {
   const uint32_t i = (uint32_t)(op - g->ops);
-  uint32_t sel[HTP_GRAPH_MAX_EXPERTS], e, r, n = 0;
-  float w[HTP_GRAPH_MAX_EXPERTS], by_expert[HTP_GRAPH_MAX_EXPERTS];
+  uint32_t sel[HTP_GRAPH_ROUTER_MAX_EXPERTS], e, r, n = 0;
+  float w[HTP_GRAPH_ROUTER_MAX_EXPERTS],
+    by_expert[HTP_GRAPH_ROUTER_MAX_EXPERTS];
   if (g->param[i] == NULL || g->state[i] == NULL) {
     return AEE_EBADSTATE;
   }
@@ -396,7 +410,7 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
                      const hexkl_weight_u8i4_table *tbl,
                      const hexkl_graph_q4m1_shape *q4m1, uint32_t n_q4m1,
                      hexkl_graph **out) {
-  uint32_t n_ops = 0, i, e, slot_words = 0, n_attn = 0, ffn_n = 0;
+  uint32_t n_ops = 0, i, slot_words = 0, n_attn = 0, ffn_n = 0;
   uint32_t q4m1_ops = 0, vocab_out = 0;
   hexkl_graph *g;
   int rc;
@@ -412,16 +426,6 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
     const htp_graph_op *op = htp_graph_op_cat(words, i);
     if (!op->resident) {
       continue;
-    }
-    if (op->kind == HTP_OP_MOE) {
-      for (e = 0; e < op->n_experts; ++e) {
-        if (graph_check_handle(tbl, op->h_gu[e], op->K, 2u * op->N) !=
-              AEE_SUCCESS ||
-            graph_check_handle(tbl, op->h_dn[e], op->N, op->N_out) !=
-              AEE_SUCCESS) {
-          return AEE_EINVHANDLE;
-        }
-      }
     }
     if ((HTP_GRAPH_KINDS_Q4M1 & HTP_GRAPH_KIND_BIT(op->kind)) != 0u) {
       if (q4m1 == NULL || graph_check_q4m1(op, q4m1, n_q4m1) != AEE_SUCCESS) {
@@ -446,6 +450,7 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
   if (g == NULL) {
     return AEE_ENOMEMORY;
   }
+  g->tbl = tbl;
   g->n_layers = words[2];
   g->n_ops = n_ops;
   g->hidden = words[4];
@@ -501,6 +506,7 @@ void hexkl_graph_free(hexkl_graph *g) {
   for (i = 0; i < g->n_ops; ++i) {
     free(g->param[i]);
     free(g->state[i]);
+    free(g->experts[i]);
   }
   free(g->rope_cs);
   free(g->slots);
@@ -561,6 +567,39 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
     g->n_ban = n;
     return AEE_SUCCESS;
   }
+  if (which == HTP_GRAPH_PARAM_EXPERTS) {
+    /* [plan 201 S1] the MOE op's pool table: every entry checked before
+       any is stored, so a refused table leaves the old one in place */
+    const htp_graph_op *o;
+    uint32_t i, *h;
+    if (op >= g->n_ops) {
+      return AEE_EBADITEM;
+    }
+    o = &g->ops[op];
+    if (o->kind != HTP_OP_MOE || n != 2u * o->n_experts) {
+      return AEE_EINVALIDFORMAT;
+    }
+    for (i = 0; i < n; ++i) {
+      uint32_t v;
+      memcpy(&v, &data[i], sizeof(v));
+      if (v != HTP_GRAPH_NO_HANDLE &&
+          (i < o->n_experts
+             ? graph_check_handle(g->tbl, v, o->K, 2u * o->N)
+             : graph_check_handle(g->tbl, v, o->N, o->N_out)) != AEE_SUCCESS) {
+        return AEE_EINVHANDLE;
+      }
+    }
+    h = g->experts[op];
+    if (h == NULL) {
+      h = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+      if (h == NULL) {
+        return AEE_ENOMEMORY;
+      }
+      g->experts[op] = h;
+    }
+    memcpy(h, data, (size_t)n * sizeof(uint32_t));
+    return AEE_SUCCESS;
+  }
   if (which == HTP_GRAPH_PARAM_ROPE_TABLE) {
     if (op != HTP_GRAPH_NO_OP) {
       return AEE_EBADITEM;
@@ -589,17 +628,20 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
   if (which == HTP_GRAPH_PARAM_ROUTER_W) {
     /* one vector per weight row: [K][E] padded to [K][32], zero lanes */
     const uint32_t K = g->ops[op].K, E = g->ops[op].n_experts;
+    const uint32_t W = HTP_GRAPH_ROUTER_MAX_EXPERTS;
     uint32_t k;
+    if (E > W) { /* the sigmoid router's width (htp_graph_desc.h) */
+      return AEE_ESCHEMENOTSUPPORTED;
+    }
     if (*dst == NULL) {
-      *dst = (float *)memalign(128, (size_t)K * HTP_GRAPH_MAX_EXPERTS *
-                                      sizeof(float));
+      *dst = (float *)memalign(128, (size_t)K * W * sizeof(float));
       if (*dst == NULL) {
         return AEE_ENOMEMORY;
       }
     }
-    memset(*dst, 0, (size_t)K * HTP_GRAPH_MAX_EXPERTS * sizeof(float));
+    memset(*dst, 0, (size_t)K * W * sizeof(float));
     for (k = 0; k < K; ++k) {
-      memcpy(*dst + (size_t)k * HTP_GRAPH_MAX_EXPERTS, data + (size_t)k * E,
+      memcpy(*dst + (size_t)k * W, data + (size_t)k * E,
              (size_t)E * sizeof(float));
     }
     return AEE_SUCCESS;
@@ -620,12 +662,11 @@ int hexkl_graph_uses_handle(const hexkl_graph *g, uint32_t handle) {
     return 0;
   }
   for (i = 0; i < g->n_ops; ++i) {
-    const htp_graph_op *op = &g->ops[i];
-    if (!op->resident || op->kind != HTP_OP_MOE) {
+    if (g->experts[i] == NULL) {
       continue;
     }
-    for (e = 0; e < op->n_experts; ++e) {
-      if (op->h_gu[e] == handle || op->h_dn[e] == handle) {
+    for (e = 0; e < 2u * g->ops[i].n_experts; ++e) {
+      if (g->experts[i][e] == handle) {
         return 1;
       }
     }

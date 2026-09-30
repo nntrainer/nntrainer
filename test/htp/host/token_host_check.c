@@ -170,15 +170,15 @@ static uint32_t build_words(uint32_t *w) {
   for (i = 0; i < w[3]; ++i) {
     htp_graph_op *op = htp_graph_op_at(w, i);
     if (op->kind == HTP_OP_MOE) {
+      /* MoE op m's expert e: gate_up 10 m + e, down 10 m + 5 + e, bound
+         as its EXPERTS table (bind_params) */
       for (e = 0; e < op->n_experts; ++e) {
-        op->h_gu[e] = 10u * m + e;
-        op->h_dn[e] = 10u * m + 5u + e;
-        g_tbl.slots[op->h_gu[e]].in_use = 1;
-        g_tbl.slots[op->h_gu[e]].K = op->K;
-        g_tbl.slots[op->h_gu[e]].N = 2u * op->N;
-        g_tbl.slots[op->h_dn[e]].in_use = 1;
-        g_tbl.slots[op->h_dn[e]].K = op->N;
-        g_tbl.slots[op->h_dn[e]].N = op->N_out;
+        g_tbl.slots[10u * m + e].in_use = 1;
+        g_tbl.slots[10u * m + e].K = op->K;
+        g_tbl.slots[10u * m + e].N = 2u * op->N;
+        g_tbl.slots[10u * m + 5u + e].in_use = 1;
+        g_tbl.slots[10u * m + 5u + e].K = op->N;
+        g_tbl.slots[10u * m + 5u + e].N = op->N_out;
       }
       ++m;
     } else if (op->kind == HTP_OP_DENSE_FFN) {
@@ -205,7 +205,7 @@ static uint32_t build_words(uint32_t *w) {
    unbound (S1's forward then fails). */
 static void bind_params(hexkl_graph *g, int skip_router) {
   static float buf[64u * 64u * 4u];
-  uint32_t i, s = 0x51u;
+  uint32_t i, e, s = 0x51u, m = 0;
   int rc = 0;
   for (i = 0; i < g->n_ops; ++i) {
     const htp_graph_op *op = &g->ops[i];
@@ -235,6 +235,16 @@ static void bind_params(hexkl_graph *g, int skip_router) {
       if (!skip_router)
         rc |= hexkl_graph_set_param(g, i, HTP_GRAPH_PARAM_ROUTER_BIAS, buf,
                                     op->n_experts);
+      break;
+    case HTP_OP_MOE:
+      for (e = 0; e < 2u * op->n_experts; ++e) {
+        const uint32_t h =
+          e < op->n_experts ? 10u * m + e : 10u * m + 5u + e - op->n_experts;
+        memcpy(&buf[e], &h, sizeof(h));
+      }
+      rc |= hexkl_graph_set_param(g, i, HTP_GRAPH_PARAM_EXPERTS, buf,
+                                  2u * op->n_experts);
+      ++m;
       break;
     default:
       break;
