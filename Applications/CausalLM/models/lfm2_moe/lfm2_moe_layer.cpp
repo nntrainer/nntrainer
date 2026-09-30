@@ -753,6 +753,9 @@ static bool tryMoeLayerOnAccelerator(
   // policy to the backend at its first call (layer order: the first
   // prefill runs the layers in order), for the per-token entry's miss path.
   if (experts_virtual) {
+    // ponytail: one model per process -- the set, like the backend's
+    // pool_descs_, is never cleared; a second model in the same process
+    // needs both reset with it.
     static std::unordered_set<const void *> handed;
     if (handed.insert(&context.getWeight(gate_up_indices[0])).second) {
       std::vector<ExpertFileDesc> all;
