@@ -265,10 +265,9 @@ static int graph_op_fc(hexkl_graph *g, const htp_graph_op *op, graph_call *call,
 
 /* up and gate on one quantization, silu(gate) * up in the CPU's order
    (m1_swiglu_cpu_det: swiglu layer input 0 is gate), the swiglu row
-   quantized, down. ponytail: the SwiGLU is the scalar spec on one thread
-   (inter 7168 = 7168 integer divides, twice a token); an HVX form with a
-   bit-compare gate is the upgrade if the E sitting's profile line names
-   it. */
+   quantized, down. [#132 E5f] The SwiGLU over the pool with the scalar
+   IEEE divide (hvx_swiglu_cpu_f32; E5d read DENSE_FFN at 5.6 ms/token
+   with the spec's integer division on one thread). */
 static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
                               graph_call *call, const float *in, float *out) {
   float *up = g->ffn, *gate = g->ffn + op->N, *act = g->ffn + 2u * op->N;
@@ -284,7 +283,7 @@ static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  m1_swiglu_cpu_det(gate, up, act, op->N);
+  hvx_swiglu_cpu_f32(gate, up, act, op->N, call->env->pool);
   hvx_q4m1_prep(act, op->N, &g->act);
   return call->env->fc(call->env->fc_ctx, op->h_dn[0], op->feed, &g->act, out);
 }
@@ -310,7 +309,7 @@ static int graph_op_lm_head(hexkl_graph *g, const htp_graph_op *op,
       keep[i] = g->logits[g->ban[i]];
       g->logits[g->ban[i]] = -INFINITY;
     }
-    g->lm_id = m1_argmax_first(g->logits, op->N);
+    g->lm_id = hvx_argmax_first_f32(g->logits, op->N);
     for (i = g->n_ban; i-- > 0;) {
       g->logits[g->ban[i]] = keep[i];
     }

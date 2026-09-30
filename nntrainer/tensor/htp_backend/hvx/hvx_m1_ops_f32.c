@@ -271,3 +271,79 @@ void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
   memcpy(logits, acc, (size_t)E * sizeof(float));
   m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
 }
+
+/* ---- [#132 Part B E5f] SwiGLU over the pool, argmax in one vector pass -- */
+
+typedef struct {
+  const float *y, *z;
+  float *out;
+  uint32_t n;
+} swiglu_cpu_ctx;
+
+static void swiglu_cpu_lane(uint32_t n_threads, uint32_t i, void *v) {
+  const swiglu_cpu_ctx *c = (const swiglu_cpu_ctx *)v;
+  const uint32_t lo = (uint32_t)((uint64_t)c->n * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)c->n * (i + 1u) / n_threads);
+  for (uint32_t k = lo; k < hi; ++k) {
+    const float e =
+      m1_exp_ps_cpu_det(m1_det_float(m1_det_bits(c->y[k]) ^ 0x80000000u));
+    /* one IEEE RN divide (sfrecipa / sffixup), as cpu_det_div_rn rounds */
+    volatile float q = c->y[k] / m1_det_add(e, 1.0f);
+    c->out[k] = m1_det_mul(q, c->z[k]);
+  }
+}
+
+void hvx_swiglu_cpu_f32(const float *y, const float *z, float *out, uint32_t n,
+                        hvx_worker_pool *pool) {
+  swiglu_cpu_ctx c = {y, z, out, n};
+  /* 1024 elements a lane at least: a fork / join is a few microseconds */
+  const uint32_t units = n / 1024u ? n / 1024u : 1u;
+  hvx_worker_pool_run(pool, swiglu_cpu_lane, &c, units);
+}
+
+uint32_t hvx_argmax_first_f32(const float *x, uint32_t n) {
+  if (n == 0u || n % LANES != 0u) {
+    return m1_argmax_first(x, n);
+  }
+  const HVX_Vector negz = Q6_V_vsplat_R((int32_t)0x80000000);
+  const HVX_Vector mag = Q6_V_vsplat_R(0x7FFFFFFF);
+  const HVX_Vector inf = Q6_V_vsplat_R(0x7F800000);
+  const HVX_Vector zero = Q6_V_vzero();
+  const HVX_Vector ones = Q6_V_vsplat_R(-1);
+  HVX_Vector best = Q6_V_vsplat_R((int32_t)0x80000000); /* below every key */
+  HVX_Vector blk = zero, nan = zero;
+  const HVX_UVector *xv = (const HVX_UVector *)x;
+  for (uint32_t b = 0; b < n / LANES; ++b) {
+    HVX_Vector v = xv[b];
+    /* NaN: |bits| > +inf */
+    nan =
+      Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(Q6_V_vand_VV(v, mag), inf), ones, nan);
+    /* -0 compares equal to +0 */
+    v = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VwVw(v, negz), zero, v);
+    /* order-preserving key: negatives flip their magnitude bits */
+    const HVX_Vector key =
+      Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VwVw(zero, v), Q6_V_vxor_VV(v, mag), v);
+    const HVX_VectorPred gt = Q6_Q_vcmp_gt_VwVw(key, best); /* strictly */
+    best = Q6_V_vmux_QVV(gt, key, best);
+    blk = Q6_V_vmux_QVV(gt, Q6_V_vsplat_R((int32_t)b), blk);
+  }
+  const int32_t *bw = (const int32_t *)&best, *kw = (const int32_t *)&blk,
+                *nw = (const int32_t *)&nan;
+  int32_t m = bw[0];
+  for (uint32_t l = 0; l < LANES; ++l) {
+    if (nw[l]) {
+      return m1_argmax_first(x, n);
+    }
+    if (bw[l] > m) {
+      m = bw[l];
+    }
+  }
+  uint32_t idx = n;
+  for (uint32_t l = 0; l < LANES; ++l) {
+    const uint32_t at = (uint32_t)kw[l] * LANES + l;
+    if (bw[l] == m && at < idx) {
+      idx = at;
+    }
+  }
+  return idx;
+}

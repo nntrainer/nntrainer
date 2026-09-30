@@ -451,7 +451,9 @@ int nntr_hvx_swiglu_cpu_f32(remote_handle64 handle, const float *y, int yLen,
   if (yLen <= 0 || zLen != yLen || outLen != yLen) {
     return AEE_EINVALIDFORMAT;
   }
-  m1_swiglu_cpu_det(y, z, out, (uint32_t)yLen);
+  /* [#132 E5f] the graph's kernel, so G1 (SmallOpsMatchSpec) holds it and
+     its scalar divide against the host's spec */
+  hvx_swiglu_cpu_f32(y, z, out, (uint32_t)yLen, s->quant_pool);
   return AEE_SUCCESS;
 }
 
@@ -464,6 +466,6 @@ int nntr_hvx_argmax_f32(remote_handle64 handle, const float *x, int xLen,
   if (xLen <= 0) {
     return AEE_EINVALIDFORMAT;
   }
-  *idx = m1_argmax_first(x, (uint32_t)xLen);
+  *idx = hvx_argmax_first_f32(x, (uint32_t)xLen); /* the graph's kernel */
   return AEE_SUCCESS;
 }

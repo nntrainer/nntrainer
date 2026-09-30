@@ -218,10 +218,10 @@ graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_host_check"
 "$OUT/graph_host_check"
 # gate and up swapped; the part offset fixed at one group; down fed the
 # FFN input's quantization; the argmax over the first slice only
-for mut in 's/m1_swiglu_cpu_det(gate, up, act, op->N)/m1_swiglu_cpu_det(up, gate, act, op->N)/' \
+for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, gate, act, op->N,/' \
   's/y += g->q4m1\[h\[p\]\].N;/y += Q4M1_GROUP;/' \
   's/hvx_q4m1_prep(act, op->N, &g->act);/(void)act;/' \
-  's/m1_argmax_first(g->logits, op->N)/m1_argmax_first(g->logits, op->N \/ 2u)/'; do
+  's/hvx_argmax_first_f32(g->logits, op->N)/hvx_argmax_first_f32(g->logits, op->N \/ 2u)/'; do
   sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
   if cmp -s "$OUT/hexkl_graph_mutant.c" "$BACKEND/hmx/hexkl_graph.c"; then
     echo "GRAPH Q4M1 MUTATION DID NOT APPLY: $mut"; exit 1

@@ -78,6 +78,25 @@ void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,
                           float *out, uint32_t C);
 
 /**
+ * @brief [#132 Part B E5f] m1_swiglu_cpu_det over @a pool's lanes: the
+ *        spec's exp_ps and add, the quotient by the Hexagon's IEEE scalar
+ *        divide instead of the spec's integer division (the same RN result:
+ *        HvxFcQ4.ScalarDivide and SmallOpsMatchSpec check it on the DSP;
+ *        m1_ops_host_check on the host), then * z. n any; pool may be NULL.
+ */
+void hvx_swiglu_cpu_f32(const float *y, const float *z, float *out, uint32_t n,
+                        hvx_worker_pool *pool);
+
+/**
+ * @brief [#132 Part B E5f] m1_argmax_first (std::max_element: the first
+ *        maximum, -0 == +0) in one vector pass: an order-preserving integer
+ *        key per lane, the lane maxima and the block each first reached
+ *        its maximum at. Runs the spec itself when n % 32 != 0 or any
+ *        element is a NaN.
+ */
+uint32_t hvx_argmax_first_f32(const float *x, uint32_t n);
+
+/**
  * @brief The MoE router of one token in the Android CPU's order
  *        (m1_router_cpu_det, #132 PR 2): logits, sigmoid, biased top-k
  *        with the lowest index winning a tie, and the normalized routing

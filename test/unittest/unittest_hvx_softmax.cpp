@@ -874,6 +874,40 @@ TEST_F(HvxFcQ4, ScalarDivide) {
           }
         }
       }
+  // [#132 Part B E5f] the SwiGLU's y / (exp_ps(-y) + 1) now takes the same
+  // divide: 16 x 2^20 general pairs -- a any finite f32 of either sign
+  // (subnormal included), b in [1, 2^127] (the denominator's range), and a
+  // quarter with b any finite nonzero -- against cpu_det_div_rn
+  std::mt19937 rng(0x5d1fu);
+  for (int c = 0; c < 16; ++c) {
+    for (uint32_t i = 0; i < chunk; ++i) {
+      uint32_t ua = rng() & 0xFFFFFFFFu;
+      if ((ua & 0x7F800000u) == 0x7F800000u)
+        ua &= 0xBF7FFFFFu; /* finite */
+      uint32_t ub = (c % 4 == 3)
+                      ? (rng() & 0xFFFFFFFFu)
+                      : ((127u + rng() % 128u) << 23) | (rng() & 0x7FFFFFu);
+      if ((ub & 0x7F800000u) == 0x7F800000u || (ub & 0x7FFFFFFFu) == 0u)
+        ub = 0x3F800000u;
+      a[i] = cpu_det_float(ua);
+      b[i] = cpu_det_float(ub);
+    }
+    ASSERT_EQ(nntr_hvx_sf_probe(handle_, 6u, a.data(), static_cast<int>(chunk),
+                                b.data(), static_cast<int>(chunk), o.data(),
+                                static_cast<int>(chunk)),
+              AEE_SUCCESS);
+    for (uint32_t i = 0; i < chunk; ++i, ++n) {
+      const float r = cpu_det_div_rn(a[i], b[i]);
+      if (cpu_det_bits(r) != cpu_det_bits(o[i])) {
+        if (bad < 16)
+          std::printf("SCALAR_DIV general diff %08x / %08x dsp=%08x "
+                      "spec=%08x\n",
+                      cpu_det_bits(a[i]), cpu_det_bits(b[i]),
+                      cpu_det_bits(o[i]), cpu_det_bits(r));
+        ++bad;
+      }
+    }
+  }
   std::printf("SCALAR_DIV divides=%llu bad=%llu\n",
               static_cast<unsigned long long>(n),
               static_cast<unsigned long long>(bad));

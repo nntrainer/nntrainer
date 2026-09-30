@@ -1149,6 +1149,62 @@ static void check_swiglu_argmax(void) {
   free(o);
 }
 
+/* ---- [#132 Part B E5f] pooled SwiGLU (hardware divide), vector argmax -- */
+
+/** @brief hvx_swiglu_cpu_f32 on the stand-in's 3 lanes against
+ * m1_swiglu_cpu_det (its integer division) over random rows of three spans and
+ * the exp_ps clamp's edges; hvx_argmax_first_f32 against m1_argmax_first on
+ * random rows with planted ties, -0 / +0 maxima, -inf rows and a NaN (the spec
+ *  path). The host's divide is IEEE RN, so this holds the kernel's order;
+ *  the DSP's divide is checked on the device (HvxFcQ4.ScalarDivide). */
+static void check_swiglu_argmax_kernels(void) {
+  enum { N = 7168, V = 4096 };
+  hvx_worker_pool *pool = NULL; /* the run stand-in above: 3 lanes */
+  float *y = malloc(N * sizeof(float)), *z = malloc(N * sizeof(float));
+  float *o = malloc(N * sizeof(float)), *r = malloc(N * sizeof(float));
+  uint32_t bad_s = 0, bad_a = 0;
+  for (int t = 0; t < 12; ++t) {
+    const float span = t < 4 ? 8.0f : t < 8 ? 100.0f : 1e4f;
+    fill_rand(y, N, -span, span);
+    fill_rand(z, N, -4.0f, 4.0f);
+    if (t == 11) {
+      for (uint32_t i = 0; i < N; ++i)
+        y[i] = (i % 3 == 0) ? 88.37626f : (i % 3 == 1) ? -88.37627f : -0.0f;
+    }
+    hvx_swiglu_cpu_f32(y, z, o, N, pool);
+    m1_swiglu_cpu_det(y, z, r, N);
+    bad_s += memcmp(o, r, N * sizeof(float)) != 0;
+  }
+  float *x = malloc(V * sizeof(float));
+  for (int t = 0; t < 40; ++t) {
+    fill_rand(x, V, -30.0f, 30.0f);
+    if (t % 4 == 1) { /* a tie: the first maximum must win */
+      const uint32_t a = (uint32_t)(t * 97) % V, b = (a + 1000u) % V;
+      x[a] = x[b] = 40.0f;
+    } else if (t % 4 == 2) { /* +0 and -0 as the maximum */
+      for (uint32_t i = 0; i < V; ++i)
+        x[i] = -1.0f - (float)(i % 7);
+      x[(uint32_t)(t * 31) % V] = -0.0f;
+      x[(uint32_t)(t * 31 + 500) % V] = 0.0f;
+    } else if (t % 4 == 3) {
+      for (uint32_t i = 0; i < V; ++i)
+        x[i] = -INFINITY;
+      if (t % 8 == 7)
+        x[(uint32_t)t % V] = NAN; /* the spec path */
+    }
+    bad_a += hvx_argmax_first_f32(x, V) != m1_argmax_first(x, V);
+  }
+  printf("M1 OPS swiglu_cpu pooled bad_rows=%u/12  argmax_first bad=%u/40\n",
+         bad_s, bad_a);
+  CHECK(bad_s == 0u, "hvx_swiglu_cpu_f32 differs from m1_swiglu_cpu_det");
+  CHECK(bad_a == 0u, "hvx_argmax_first_f32 differs from m1_argmax_first");
+  free(y);
+  free(z);
+  free(o);
+  free(r);
+  free(x);
+}
+
 int main(int argc, char **argv) {
   if (argc >= 5 && !strcmp(argv[1], "--replay")) {
     return replay(argc - 2, argv + 2);
@@ -1160,6 +1216,7 @@ int main(int argc, char **argv) {
   check_sqrt_recip_rn();
   check_rope();
   check_conv();
+  check_swiglu_argmax_kernels();
   check_router_kernel();
   check_router_vs_cpu();
   check_expf_port();
