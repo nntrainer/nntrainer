@@ -309,7 +309,20 @@ public:
    *        Must be called before forwarding() when use_external_cache is true.
    * @param[in] idx current write position in the KV cache
    */
-  WIN_EXPORT void setCacheIndex(unsigned int idx) { cache_index = idx; }
+  /**
+   * @brief Set the write position of the external KV cache. The host calls
+   *        this when it repositions the cache -- after a load, a rewind, a
+   *        session switch -- and any row of the fp16 cache may have been
+   *        rewritten by then, so the quantized mirror (props::KvCacheQuant)
+   *        is marked out of date in full and re-appended from row 0 on the
+   *        next step.
+   */
+  WIN_EXPORT void setCacheIndex(unsigned int idx) {
+    cache_index = idx;
+    for (auto &synced : q_cache_synced) {
+      synced = 0;
+    }
+  }
 
   /**
    * @brief Get the current cache index
@@ -398,7 +411,7 @@ private:
                                const ml::train::TensorDim &cache_key_dim,
                                nntrainer::Tensor &attention_output_step,
                                unsigned int cache_from, unsigned int cache_to,
-                               const float *sinks);
+                               const nntrainer::Tensor *sink);
 
   /** @brief Releases every quantized-cache handle. */
   void release_quantized_cache();
@@ -416,7 +429,7 @@ private:
                                  nntrainer::Tensor &cached_value,
                                  nntrainer::Tensor &attention_output_step,
                                  unsigned int cache_from, unsigned int cache_to,
-                                 const float *sinks);
+                                 const nntrainer::Tensor *sink);
 
   enum INOUT_INDEX {
     /** input index */

@@ -355,10 +355,10 @@ int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
       float sk;
       int32_t cs;
 #ifdef __hexagon__
-      hvx_kv_quant_k_row(krow + n * hd, hd, kv->qmax, qk_row, &sk, &cs);
+      hvx_kv_quant_k_row(krow + (size_t)n * hd, hd, kv->qmax, qk_row, &sk, &cs);
 #else
       for (uint32_t d = 0; d < hd; ++d) {
-        x[d] = hexkl_kv_q_hf_to_f32(krow[n * hd + d]);
+        x[d] = hexkl_kv_q_hf_to_f32(krow[(size_t)n * hd + d]);
       }
       hexkl_kv_q_quant_k_row(x, hd, kv->qmax, qk_row, &sk, &cs);
 #endif
@@ -370,10 +370,10 @@ int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
       }
 
 #ifdef __hexagon__
-      hvx_kv_quant_v_row(vrow + n * hd, hd, kv->qmax, q, sv);
+      hvx_kv_quant_v_row(vrow + (size_t)n * hd, hd, kv->qmax, q, sv);
 #else
       for (uint32_t d = 0; d < hd; ++d) {
-        x[d] = hexkl_kv_q_hf_to_f32(vrow[n * hd + d]);
+        x[d] = hexkl_kv_q_hf_to_f32(vrow[(size_t)n * hd + d]);
       }
       hexkl_kv_q_quant_v_row(x, hd, kv->qmax, q, sv);
 #endif
@@ -425,14 +425,14 @@ int hexkl_kv_q_dump(const hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
     for (uint32_t n = 0; n < kv->n_head_kv; ++n) {
       if (k_q) {
         for (uint32_t d = 0; d < hd; ++d) {
-          k_q[(size_t)r * stride + n * hd + d] =
+          k_q[(size_t)r * stride + (size_t)n * hd + d] =
             (int8_t)((int)kv->kt4[hexkl_kv_q_kt4_index(kv, n, row, d)] -
                      HEXKL_KV_Q_BIAS);
         }
       }
       if (v_q) {
         for (uint32_t d = 0; d < hd; ++d) {
-          v_q[(size_t)r * stride + n * hd + d] =
+          v_q[(size_t)r * stride + (size_t)n * hd + d] =
             (int8_t)((int)kv->v4[hexkl_kv_q_v4_index(kv, n, row, d)] -
                      HEXKL_KV_Q_BIAS);
         }

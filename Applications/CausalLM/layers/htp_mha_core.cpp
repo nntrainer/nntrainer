@@ -827,11 +827,37 @@ namespace {
 struct AccelF32Io {
   const float *q = nullptr;
   float *out = nullptr;
+  const float *sinks = nullptr; /**< n_head_q f32, or nullptr */
 
+  /**
+   * @param sink  the per-head sink weight, or nullptr when the layer has
+   *              none; fp16 sinks are widened here (the weight is fp16 on
+   *              Android with fp16 enabled, whatever the activation type)
+   */
   bool prepare(nntrainer::Tensor &query_step,
-               nntrainer::Tensor &attention_output_step) {
+               nntrainer::Tensor &attention_output_step,
+               const nntrainer::Tensor *sink) {
     const auto qt = query_step.getDataType();
     const auto ot = attention_output_step.getDataType();
+    if (sink && !sink->empty()) {
+      const auto st = sink->getDataType();
+      if (st == ml::train::TensorDim::DataType::FP32) {
+        sinks = sink->getData<float>();
+      }
+#ifdef ENABLE_FP16
+      else if (st == ml::train::TensorDim::DataType::FP16) {
+        const _FP16 *src = sink->getData<_FP16>();
+        sink_scratch.resize(sink->size());
+        for (size_t i = 0; i < sink_scratch.size(); ++i) {
+          sink_scratch[i] = static_cast<float>(src[i]);
+        }
+        sinks = sink_scratch.data();
+      }
+#endif
+      else {
+        return false;
+      }
+    }
     if (qt == ml::train::TensorDim::DataType::FP32) {
       q = query_step.getData<float>();
     }
@@ -877,7 +903,7 @@ struct AccelF32Io {
   }
 
 private:
-  std::vector<float> q_scratch, out_scratch;
+  std::vector<float> q_scratch, out_scratch, sink_scratch;
 };
 
 } // namespace
@@ -885,7 +911,8 @@ private:
 bool MHACoreLayer::try_accelerated_attention(
   nntrainer::Tensor &query_step, nntrainer::Tensor &cached_key,
   nntrainer::Tensor &cached_value, nntrainer::Tensor &attention_output_step,
-  unsigned int cache_from, unsigned int cache_to, const float *sinks) {
+  unsigned int cache_from, unsigned int cache_to,
+  const nntrainer::Tensor *sink) {
   if (!compute_ops_ || !compute_ops_->supports_sdpa_fp16_kvcache()) {
     return false;
   }
@@ -897,7 +924,7 @@ bool MHACoreLayer::try_accelerated_attention(
     return false;
   }
   AccelF32Io io;
-  if (!io.prepare(query_step, attention_output_step)) {
+  if (!io.prepare(query_step, attention_output_step, sink)) {
     return false;
   }
   const uint16_t *k_bits = nullptr;
@@ -928,7 +955,7 @@ bool MHACoreLayer::try_accelerated_attention(
   if (!compute_ops_->sdpa_fp16_kvcache(
         io.q, q_stride, k_bits, v_bits, kv_stride, n_q, cache_from, cache_to,
         num_heads_Q, num_heads_KV, head_dim, window, attn_logit_softcapping,
-        sinks, io.out, q_stride)) {
+        io.sinks, io.out, q_stride)) {
     return false;
   }
   io.commit(attention_output_step);
@@ -956,13 +983,13 @@ bool MHACoreLayer::try_quantized_attention(
   nntrainer::Tensor &cache_key, nntrainer::Tensor &cache_value,
   const ml::train::TensorDim &cache_key_dim,
   nntrainer::Tensor &attention_output_step, unsigned int cache_from,
-  unsigned int cache_to, const float *sinks) {
+  unsigned int cache_to, const nntrainer::Tensor *sink) {
   if (kv_cache_quant_kind < 0 || q_cache_failed || !compute_ops_ ||
       !compute_ops_->supports_kv_cache_q() || !is_causal) {
     return false;
   }
   AccelF32Io io;
-  if (!io.prepare(query_step, attention_output_step)) {
+  if (!io.prepare(query_step, attention_output_step, sink)) {
     return false;
   }
   const uint16_t *k_base = nullptr;
@@ -1032,7 +1059,7 @@ bool MHACoreLayer::try_quantized_attention(
   if (!compute_ops_->sdpa_q_kvcache(
         handle, append_row0, append_rows, width, k_base + off, v_base + off,
         io.q, q_stride, n_q, cache_from, cache_to, num_heads_Q, num_heads_KV,
-        head_dim, window, attn_logit_softcapping, sinks, io.out, q_stride)) {
+        head_dim, window, attn_logit_softcapping, io.sinks, io.out, q_stride)) {
     return fail("attention");
   }
   synced = cache_to;
@@ -1228,12 +1255,13 @@ void MHACoreLayer::one_batch_incremental_forwarding(
   nntrainer::Tensor b_cached_value = cache_value.getSharedDataTensor(
     cached_value_dim, batch * cache_value_dim.getFeatureLen(), true);
 
+  // The sink weight goes as a tensor: it is fp16 on Android with fp16
+  // enabled, and the accelerated paths take f32 (staged inside).
   if (try_quantized_attention(batch, query_step, cache_key, cache_value,
                               cache_key_dim, attention_output_step, from, to,
-                              sink_step.getData<float>()) ||
+                              &sink_step) ||
       try_accelerated_attention(query_step, b_cached_key, b_cached_value,
-                                attention_output_step, from, to,
-                                sink_step.getData<float>())) {
+                                attention_output_step, from, to, &sink_step)) {
     return;
   }
 

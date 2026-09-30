@@ -43,6 +43,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -113,7 +114,7 @@ static inline float hexkl_kv_q_hf_to_f32(uint16_t h) {
     bits = sign | ((exp + 127u - 15u) << 23) | (mant << 13);
   }
   float f;
-  __builtin_memcpy(&f, &bits, sizeof(f));
+  memcpy(&f, &bits, sizeof(f));
   return f;
 }
 
