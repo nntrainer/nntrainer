@@ -4,24 +4,23 @@
  *
  * @file   nntr_hvx_token.c
  * @date   30 Sep 2026
- * @brief  [#132 Part B E2] token_driver_start / token_driver_stop and the
- *         session's token call: the mailbox page mapped once, the role
- *         (0 = S2, the main session; 1 = S1, the MoE server) and the
- *         counters, over hexkl_token.c
+ * @brief  [#132 Part B E2, #211] token_driver_start / token_driver_stop
+ *         and the session's token call: the mailbox page mapped once and
+ *         the counters, over hexkl_token.c
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
  *
- * Plan docs/plans/132-part-b-two-session-e2e.md sections 3.2 and 3.3. The
- * ARM side allocates one ION page, fastrpc_mmap's it into both sessions
- * and calls token_driver_start on each with its role; every token is then
- * one HTP_DSPQ_OP_TOKEN packet per session (nntr_hvx_dspq.c), whose
- * thread calls nntr_hvx_token_run -- so the waits run on the sessions'
- * own dspq threads, never on a pool lane. The graph is the session's
- * (graph_init with the role's mask), read at each token.
+ * The ARM side allocates one ION page (the expert pool's miss lines),
+ * fastrpc_mmap's it into the session and calls token_driver_start with
+ * role 0, the only role since #211 (the wire keeps the argument); every
+ * token is then one HTP_DSPQ_OP_TOKEN packet (nntr_hvx_dspq.c), whose
+ * thread calls nntr_hvx_token_run -- so the miss waits run on the
+ * session's dspq thread, never on a pool lane. The graph is the
+ * session's (graph_init, every kind resident), read at each token.
  *
  * Address space: the page's mapping (HAP_mmap_get, at least
- * HEXKL_MBOX_BYTES = 16.5 KiB) and this struct, both released by stop or
+ * HEXKL_MBOX_BYTES = 18 KiB) and this struct, both released by stop or
  * close.
  */
 
@@ -42,11 +41,11 @@
 typedef char
   token_route_fits[HTP_DSPQ_TOKEN_ROUTE == HEXKL_GRAPH_ROUTE_LOG ? 1 : -1];
 
-/** @brief The session's driver: its page and its side's counters. */
+/** @brief The session's driver: its page and its counters. */
 struct nntr_hvx_token {
   int fd;
   uint8_t *page;
-  uint32_t role, spin_us;
+  uint32_t spin_us;
   hexkl_token_stats st;
 };
 
@@ -65,7 +64,9 @@ int nntr_hvx_token_driver_start(remote_handle64 handle, int32 mbox_fd,
     FARF(ERROR, "token_driver_start: a driver is already running");
     return AEE_EBADSTATE;
   }
-  if (role > 1u || mbox_bytes < HEXKL_MBOX_BYTES) {
+  /* [#211] role 1 (the two-PD path's S1) is gone: an older lib asking for
+     it fails here, not with a silent timeout */
+  if (role != 0u || mbox_bytes < HEXKL_MBOX_BYTES) {
     FARF(ERROR, "token_driver_start: role %u, page %u B (want >= %u)",
          (unsigned)role, (unsigned)mbox_bytes, (unsigned)HEXKL_MBOX_BYTES);
     return AEE_EINVALIDFORMAT;
@@ -83,11 +84,10 @@ int nntr_hvx_token_driver_start(remote_handle64 handle, int32 mbox_fd,
   }
   t->fd = (int)mbox_fd;
   t->page = (uint8_t *)va;
-  t->role = role;
   t->spin_us = spin_us;
   s->token = t;
-  FARF(HIGH, "[token] start role=%s spin_us=%u page=%u B", role ? "S1" : "S2",
-       (unsigned)spin_us, (unsigned)mbox_bytes);
+  FARF(HIGH, "[token] start spin_us=%u page=%u B", (unsigned)spin_us,
+       (unsigned)mbox_bytes);
   return AEE_SUCCESS;
 }
 
@@ -96,10 +96,10 @@ static void token_teardown(nntr_hvx_session *s, uint32 *res) {
   struct nntr_hvx_token *t = s->token;
   if (res != NULL) {
     res[0] = t->st.tokens;
-    res[1] = t->st.hops;
+    res[1] = 0u; /* hops: none since #211 */
     res[2] = t->st.timeouts;
     res[3] = t->st.stale;
-    res[4] = t->st.wait_us;
+    res[4] = 0u; /* wait_us: the miss waits are in the token's miss_us */
   }
   HAP_mmap_put(t->fd);
   free(t);
@@ -138,29 +138,20 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
   const hexkl_token_stats before = t->st;
   const uint64_t us0 = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count());
   const uint64_t pc0 = HAP_perf_get_pcycles();
-  nntr_hvx_graph_env(s, &env);
-  if (t->role == 0u) {
-    if (act == NULL) {
-      return AEE_EINVALIDFORMAT;
-    }
-    rc = hexkl_token_main(s->graph, &env, t->page, tok, pos, act, act_len,
-                          logits, logits_len, t->spin_us, &t->st, &id);
-  } else {
-    rc =
-      hexkl_token_serve(s->graph, &env, t->page, tok, pos, t->spin_us, &t->st);
+  if (act == NULL) {
+    return AEE_EINVALIDFORMAT;
   }
+  nntr_hvx_graph_env(s, &env);
+  rc = hexkl_token_main(s->graph, &env, t->page, tok, pos, act, act_len, logits,
+                        logits_len, t->spin_us, &t->st, &id);
   r->wall_pcyc = (uint32_t)(HAP_perf_get_pcycles() - pc0);
   r->wall_us =
     (uint32_t)(HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count()) - us0);
-  r->id = id;
-  r->hops = t->st.hops - before.hops;
-  r->wait_us = t->st.wait_us - before.wait_us;
-  r->hop_us = t->st.hop_us - before.hop_us;
+  r->id = id; /* hops, wait_us, hop_us stay 0: no hop since #211 */
   r->pcycles = (uint32_t)(t->st.pcycles - before.pcycles);
   r->misses = t->st.misses - before.misses;
   r->miss_us = t->st.miss_us - before.miss_us;
-  r->route_n = 0u;
-  /* [plan 201 S1] the routed sets, for the pool: S1's, or the one PD's */
+  /* [plan 201 S1] the routed sets, for the pool */
   r->route_n = s->graph->route_log_n;
   memcpy(r->route, s->graph->route_log, r->route_n);
   for (k = 0; k < HTP_DSPQ_TOKEN_KINDS && k < HTP_OP_KIND_N; ++k) {
@@ -168,9 +159,9 @@ int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
       (uint32_t)(t->st.kind_pcycles[k] - before.kind_pcycles[k]);
   }
   if (rc != AEE_SUCCESS) {
-    FARF(ERROR, "[token] %s tok=%u pos=%u: 0x%08x (timeouts %u stale %u)",
-         t->role ? "S1" : "S2", (unsigned)tok, (unsigned)pos, (unsigned)rc,
-         (unsigned)t->st.timeouts, (unsigned)t->st.stale);
+    FARF(ERROR, "[token] tok=%u pos=%u: 0x%08x (timeouts %u stale %u)",
+         (unsigned)tok, (unsigned)pos, (unsigned)rc, (unsigned)t->st.timeouts,
+         (unsigned)t->st.stale);
   }
   return rc;
 }

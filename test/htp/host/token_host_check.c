@@ -24,7 +24,7 @@
  * the MoE is a stand-in that mixes its input into its output under the
  * routing and records a hash of every call's input and output (the dump's
  * analog). Gated: every token's logits memcmp-equal and ids equal, every
- * MoE call's in / out hash equal, hops 0, timeouts 0, stale 0. Then the
+ * MoE call's in / out hash equal, timeouts 0, stale 0. Then the
  * pool (miss rounds against an owner pthread) and the miss round's
  * failure paths: no owner (AEE_EEXPIRED after the 1 s window, not a
  * hang), a stale answer (HEXKL_TOKEN_E_STALE), the owner's code. What this
@@ -381,13 +381,12 @@ static void check_bit_identical(const uint32_t *words, uint32_t n) {
         same_logits, same_id, TOKENS);
   CHECK(g_moe_calls == g_moe_cap && same_moe == g_moe_cap,
         "MoE calls %u, %u equal of %u", g_moe_calls, same_moe, g_moe_cap);
-  CHECK(st.hops + st.timeouts + st.stale + st.misses == 0u,
-        "hops %u timeouts %u stale %u misses %u", st.hops, st.timeouts,
-        st.stale, st.misses);
+  CHECK(st.timeouts + st.stale + st.misses == 0u,
+        "timeouts %u stale %u misses %u", st.timeouts, st.stale, st.misses);
   if (g_fail == 0)
     printf("TOKEN DRIVER BIT-IDENTICAL: tokens %u/%u (%u distinct ids) "
            "logits bit_identical=1 "
-           "moe_calls %u/%u in+out bit_identical=1 hops=0 timeouts=0 stale=0 "
+           "moe_calls %u/%u in+out bit_identical=1 timeouts=0 stale=0 "
            "(hd64 C A C, one session, vs the one-session forward)\n",
            same_id, TOKENS, distinct, same_moe, g_moe_cap);
   close_session(&s);
@@ -558,8 +557,8 @@ static void check_pool(const uint32_t *words, uint32_t n) {
         "pool logits %u / ids %u of %u", same_logits, same_id, TOKENS);
   CHECK(st.misses == o.loads && o.loads > TOKENS / 4u && o.bad == 0u,
         "pool misses %u owner %u bad %u", st.misses, o.loads, o.bad);
-  CHECK(st.hops + st.timeouts + st.stale == 0u,
-        "pool hops %u timeouts %u stale %u", st.hops, st.timeouts, st.stale);
+  CHECK(st.timeouts + st.stale == 0u, "pool timeouts %u stale %u", st.timeouts,
+        st.stale);
   CHECK(s.g->route_log_n == POOL_OPS * 3u, "route log %u bytes",
         s.g->route_log_n);
   if (g_fail == 0)

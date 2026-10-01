@@ -112,8 +112,8 @@ typedef struct {
   uint8_t *fc_l2; /**< [#132 Part B, #178] the FC runner's L2 feed scratch
                        (2 MiB of DSP heap, first use), freed in close() */
   struct nntr_hvx_token *token; /**< [#132 Part B E2] the token driver
-                       (nntr_hvx_token.c): the mailbox page and the role;
-                       NULL = none. Stopped in close() after the dspq
+                       (nntr_hvx_token.c): the mailbox page and the
+                       counters; NULL = none. Stopped in close() after the dspq
                        thread that runs it */
 } nntr_hvx_session;
 
@@ -136,14 +136,13 @@ void nntr_hvx_dspq_shutdown(nntr_hvx_session *s);
  *  nntr_hvx_graph.c. */
 void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env);
 
-/** @brief [#132 Part B E2] One token of the session's role
- *  (token_driver_start) on its graph: S2 runs from op 0 on @a act (the
- *  embedding row) and returns the id, the logits into @a logits when it
- *  is not NULL; S1 serves its rounds (@a act, @a logits unused).
+/** @brief [#132 Part B E2, #211] One token of the session's driver
+ *  (token_driver_start) on its graph: every op on @a act (the embedding
+ *  row), the id returned, the logits into @a logits when it is not NULL.
  *  @a r gets everything but seq and rc (htp_dspq_wire.h). The dspq
  *  thread's HTP_DSPQ_OP_TOKEN calls it. Lives in nntr_hvx_token.c.
  *  @return 0, AEE_EBADSTATE (no driver or no graph), AEE_EINVALIDFORMAT
- *          (a length), or hexkl_token_main / hexkl_token_serve's code */
+ *          (a length or no @a act), or hexkl_token_main's code */
 struct htp_dspq_token_resp_s;
 int nntr_hvx_token_run(nntr_hvx_session *s, uint32_t tok, uint32_t pos,
                        const float *act, uint32_t act_len, float *logits,

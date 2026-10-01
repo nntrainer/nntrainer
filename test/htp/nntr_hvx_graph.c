@@ -51,8 +51,8 @@ int nntr_hvx_graph_init(remote_handle64 handle, const uint32 *desc, int descLen,
     return rc;
   }
   if (!s->hmx_locked) {
-    /* [#178, #132 Part B E3] the lite open (S2) has no HMX: its graph may
-       hold every kind but MOE resident (HTP_GRAPH_KINDS_S2) */
+    /* [#178, #132 Part B E3] a lite open has no HMX: its graph may hold
+       every kind but MOE resident */
     uint32_t i;
     for (i = 0; i < s->graph->n_ops; ++i) {
       if (s->graph->ops[i].resident && s->graph->ops[i].kind == HTP_OP_MOE) {
@@ -155,7 +155,7 @@ void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->fc_ctx = (void *)s;
   env->rebind = graph_rebind;
   env->rebind_ctx = (void *)s;
-  env->miss.post = NULL; /* the token driver's (hexkl_token_serve) */
+  env->miss.post = NULL; /* the token driver's (hexkl_token_main) */
   env->miss.wait = NULL;
   env->miss.ctx = NULL;
 }
