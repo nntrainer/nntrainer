@@ -219,13 +219,16 @@ graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_host_check"
 # gate and up swapped; the part offset fixed at one group; down fed the
 # FFN input's quantization; the argmax over the first slice only; [plan 201
 # S1] the miss round's experts before the first miss dropped, and its later
-# rows added in reverse order
+# rows added in reverse order; [plan 201 S4] the softmax router run as the
+# sigmoid one, and an RMSNORM's N1 bit ignored
 for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, gate, act, op->N,/' \
   's/y += g->q4m1\[h\[p\]\].N;/y += Q4M1_GROUP;/' \
   's/graph_prep(op, act, op->N, &g->act);/(void)act;/' \
   's/hvx_argmax_first_f32(g->logits, op->N)/hvx_argmax_first_f32(g->logits, op->N \/ 2u)/' \
   's/  if (first != 0u) {/  if (0) {/' \
-  's/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)i \* op->N_out, 1.0f,/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)(n - 1u - i + first) * op->N_out, 1.0f,/'; do
+  's/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)i \* op->N_out, 1.0f,/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)(n - 1u - i + first) * op->N_out, 1.0f,/' \
+  's/  if (op->eps_bits != 0u) {/  if (0) {/' \
+  's/((op->feed \& HTP_GRAPH_NORM_N1) != 0u ? hvx_rmsnorm_n1_f32/(0 ? hvx_rmsnorm_n1_f32/'; do
   sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
   if cmp -s "$OUT/hexkl_graph_mutant.c" "$BACKEND/hmx/hexkl_graph.c"; then
     echo "GRAPH Q4M1 MUTATION DID NOT APPLY: $mut"; exit 1
@@ -288,6 +291,68 @@ done
   "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
 
 "$OUT/m1_ops_host_check"
+# [plan 201 S4] The softmax router's renormalisation skipped in the spec
+# (weight = p * per-expert scale): the kernel calls the same pick, so only
+# the check against #4296's formula in double can see it -- it must.
+mkdir -p "$OUT/mut_m1"
+mut='s/  inv = swiglu_det_recip(t);/  inv = 1.0f;/'
+sed "$mut" "$BACKEND/../m1_ops_det.h" > "$OUT/mut_m1/m1_ops_det.h"
+if cmp -s "$OUT/mut_m1/m1_ops_det.h" "$BACKEND/../m1_ops_det.h"; then
+  echo "ROUTER SOFTMAX MUTATION DID NOT APPLY: $mut"; exit 1
+fi
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$OUT/mut_m1" -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/m1_ops_mutant" \
+  "$HERE/m1_ops_host_check.c" "$BACKEND/hvx/hvx_m1_ops_f32.c" \
+  "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
+if "$OUT/m1_ops_mutant" > "$OUT/m1_ops_mutant.log"; then
+  echo "ROUTER SOFTMAX MUTANT PASSED (the check is blind): $mut"; exit 1
+fi
+echo "ROUTER SOFTMAX MUTANT CAUGHT: renormalise skipped ($(grep -c '^FAIL: router softmax' "$OUT/m1_ops_mutant.log") failed checks)"
+
+# [plan 201 S4] RoPE at Gemma 4's head_dim 256 / 512: the kernel pairing
+# (i, i + 32) inside each 64-lane chunk -- LFM2's head_dim 64 RoPE reused
+# per chunk, the same bytes at 64 -- must fail the hd256 / hd512 lines.
+mut='s/\*vb = (HVX_UVector \*)(x + h);/*vb = (HVX_UVector *)(x + LANES);/'
+sed "$mut" "$BACKEND/hvx/hvx_m1_ops_f32.c" > "$OUT/hvx_m1_ops_rope_mut.c"
+if cmp -s "$OUT/hvx_m1_ops_rope_mut.c" "$BACKEND/hvx/hvx_m1_ops_f32.c"; then
+  echo "ROPE MUTATION DID NOT APPLY: $mut"; exit 1
+fi
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/m1_ops_rope_mutant" \
+  "$HERE/m1_ops_host_check.c" "$OUT/hvx_m1_ops_rope_mut.c" \
+  "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
+if "$OUT/m1_ops_rope_mutant" > "$OUT/m1_ops_rope_mutant.log"; then
+  echo "ROPE MUTANT PASSED (the check is blind): $mut"; exit 1
+fi
+echo "ROPE MUTANT CAUGHT: hd64 pairing per chunk ($(grep -c '^FAIL: rope' "$OUT/m1_ops_rope_mutant.log") failed checks, rope64 lines $(grep -c 'rope64 pos=.* bad=0' "$OUT/m1_ops_rope_mutant.log")/5 still bad=0)"
+
+# [plan 201 S4] The MoE epilogue's GeGLU-tanh: geglu_det_one (swiglu_det.h)
+# against f64 incl. the tanh saturation ends and subnormals, then the REAL
+# hvx_dequant_i32.c epilogue on hvx_emu/ (geglu and swiglu) bit for bit
+# against the spec (GEGLU OK). Then gelu swapped for silu in the kernel,
+# which must fail it.
+geglu_check() { # geglu_check <hvx_dequant_i32.c> <exe>
+  "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+    -Wno-format-truncation -pthread -include malloc.h \
+    -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
+    -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+    -o "$2" "$HERE/geglu_host_check.c" "$1" \
+    "$BACKEND/hvx/hvx_worker_pool.c" -lm
+}
+geglu_check "$BACKEND/hvx/hvx_dequant_i32.c" "$OUT/geglu_host_check"
+"$OUT/geglu_host_check"
+mut='s/c->geglu ? hvx_geglu_det_sf(g, u)/c->geglu ? hvx_swiglu_det_sf(g, u)/'
+sed "$mut" "$BACKEND/hvx/hvx_dequant_i32.c" > "$OUT/hvx_dequant_i32.c"
+if cmp -s "$OUT/hvx_dequant_i32.c" "$BACKEND/hvx/hvx_dequant_i32.c"; then
+  echo "GEGLU MUTATION DID NOT APPLY: $mut"; exit 1
+fi
+geglu_check "$OUT/hvx_dequant_i32.c" "$OUT/geglu_mutant"
+if "$OUT/geglu_mutant" > "$OUT/geglu_mutant.log"; then
+  echo "GEGLU MUTANT PASSED (the check is blind): $mut"; exit 1
+fi
+echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-9/]*' "$OUT/geglu_mutant.log"))"
 
 # The CPU-order Q4_0 FC (#132 PR 2): the spec q4_gemv_cpu_det.h against an
 # independent model of the Android CPU's quantizer and fused chain, six

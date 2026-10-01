@@ -59,6 +59,7 @@
 #include "hexkl_graph.h"
 #include "htp_graph_desc.h"
 #include <AEEStdErr.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -258,11 +259,24 @@ static void mut_attn_without_rope(uint32_t *w, uint32_t *n) {
   htp_graph_op_at(w, nth_op(w, HTP_OP_ROPE, 4))->resident = 0u;
   (void)n;
 }
-static void mut_rmsnorm_k_not_pow2(uint32_t *w, uint32_t *n) {
+static void mut_rmsnorm_k_not_32(uint32_t *w, uint32_t *n) {
   /* the final norm: K == hidden is not a validator rule for RMSNORM, so
-     only the kernel's power-of-two rule can refuse 2048 + 32 */
-  htp_graph_op_at(w, w[3] - 2u)->K = 2080u;
-  htp_graph_op_at(w, w[3] - 2u)->N = 2080u;
+     only the kernel's width rule can refuse 2048 + 24 (plan 201 S4: any
+     multiple of 32 is taken, 2080 included) */
+  htp_graph_op_at(w, w[3] - 2u)->K = 2072u;
+  htp_graph_op_at(w, w[3] - 2u)->N = 2072u;
+  (void)n;
+}
+/* [plan 201 S4] an RMSNORM feed bit other than N1; a softmax router (eps
+   set) norming over its own input slot */
+static void mut_rmsnorm_feed_2(uint32_t *w, uint32_t *n) {
+  htp_graph_op_at(w, nth_op(w, HTP_OP_RMSNORM, 2))->feed = 2u;
+  (void)n;
+}
+static void mut_softmax_router_in_is_out(uint32_t *w, uint32_t *n) {
+  htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 1));
+  op->eps_bits = 0x358637BDu; /* 1e-6f */
+  op->out_slot = op->in_slot;
   (void)n;
 }
 /* #132: the residual add's and the router's rules */
@@ -326,8 +340,12 @@ static const struct {
    HTP_GRAPH_E_NOTALLOWED},
   {"QK_NORM resident at head_dim 96", mut_qk_norm_head_dim_96,
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
-  {"RMSNORM resident at K 2080", mut_rmsnorm_k_not_pow2,
+  {"RMSNORM resident at K 2072", mut_rmsnorm_k_not_32,
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+  {"RMSNORM feed 2 (only N1 is a norm bit)", mut_rmsnorm_feed_2,
+   HTP_GRAPH_E_INVALIDFORMAT},
+  {"softmax ROUTER_TOPK in_slot == out_slot", mut_softmax_router_in_is_out,
+   HTP_GRAPH_E_INVALIDFORMAT},
   {"ADD resident, a RMSNORM not", mut_add_rmsnorm_cpu, HTP_GRAPH_E_NOTALLOWED},
   {"ROUTER_TOPK resident, its MOE not", mut_router_moe_cpu,
    HTP_GRAPH_E_NOTALLOWED},
@@ -799,6 +817,12 @@ static void check_limits(void) {
   rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, NULL);
   CHECK(rc == HTP_GRAPH_E_SCHEMENOTSUPPORTED,
         "resident router over 128 experts: %s", htp_graph_err_name(rc));
+  /* [plan 201 S4] the softmax router (eps set) takes 128 */
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->eps_bits = 0x358637BDu;
+  rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, NULL);
+  CHECK(rc == 0u, "resident softmax router over 128 experts: %s",
+        htp_graph_err_name(rc));
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->eps_bits = 0u;
   htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->resident = 0u;
 
   rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
@@ -1055,7 +1079,9 @@ static void check_stretches(void) {
   fill(cs, MAX_SEQ * HD, &seed);
   rc = (uint32_t)hexkl_graph_set_param(g, op_qk, HTP_GRAPH_PARAM_ROPE_TABLE, cs,
                                        MAX_SEQ * HD);
-  CHECK(rc == (uint32_t)AEE_EBADITEM, "rope table on an op: %s",
+  /* [plan 201 S4] a ROPE op may hold its own table; any other kind takes
+     none, the length rule every other parameter has */
+  CHECK(rc == (uint32_t)AEE_EINVALIDFORMAT, "rope table on a QK_NORM op: %s",
         htp_graph_err_name(rc));
   rc = (uint32_t)hexkl_graph_set_param(
     g, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_ROPE_TABLE, cs, MAX_SEQ * HD);
@@ -1164,7 +1190,10 @@ static void bind_hd64(uint32_t *w) {
   }
 }
 
-static void check_add_router(void) {
+/* [plan 201 S4] gemma: the same stretch with the router op made Gemma's
+   softmax router (eps_bits set, ROUTER_BIAS = g | per-expert scale) and
+   the norm before it on N1 (feed HTP_GRAPH_NORM_N1). */
+static void check_add_router(int gemma) {
   static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
                     HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
   const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
@@ -1173,7 +1202,9 @@ static void check_add_router(void) {
   uint32_t n, rc, resume, seed = 132u, i, e, r, nr = 0;
   static float x[HID], a[HID], a2[HID], out[HID], ref[HID], h[HID], nrm[HID];
   static float gam[4][HID], rw[HID * HD64_E], moe[HID];
-  float rbias[HD64_E], lg[HD64_E], wt[HD64_TOP];
+  static float rbias[HID + HD64_E], rsc[HID];
+  float lg[HD64_E], wt[HD64_TOP];
+  const uint32_t n_bias = gemma ? HID + HD64_E : HD64_E;
   uint32_t sel[HD64_TOP], r_idx[HD64_TOP], r_cnt[HD64_E] = {0};
   float r_w[HD64_TOP], by_e[HD64_E];
   uint32_t op_norm[4], op_add0, op_add1, op_router;
@@ -1190,6 +1221,11 @@ static void check_add_router(void) {
   env.scratch = &g_scratch;
   n = build(w, cap, &kHd64, "CAC", D_KINDS);
   bind_hd64(w);
+  if (gemma) {
+    memcpy(&htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->eps_bits,
+           &kHd64.eps, sizeof(float));
+    htp_graph_op_at(w, nth_op(w, HTP_OP_RMSNORM, 3))->feed = HTP_GRAPH_NORM_N1;
+  }
   rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
   CHECK(rc == 0u && g != NULL, "hd64 D init: %s", htp_graph_err_name(rc));
   if (g == NULL)
@@ -1226,6 +1262,11 @@ static void check_add_router(void) {
   fill(a2, HID, &seed);
   fill(rw, HID * HD64_E, &seed);
   fill(rbias, HD64_E, &seed);
+  if (gemma) { /* g from a router_scale, then the per-expert scale */
+    fill(rsc, HID, &seed);
+    m1_router_input_scale_det(rsc, HID, rbias);
+    fill(rbias + HID, HD64_E, &seed);
+  }
 
   /* (1) a router with no weights bound: AEE_EBADSTATE (ADD and the norm
      ran first and moved slot 0; op 0 below re-seeds it) */
@@ -1247,7 +1288,7 @@ static void check_add_router(void) {
                                        rw, HID * HD64_E);
   CHECK(rc == 0u, "set router W: %s", htp_graph_err_name(rc));
   rc = (uint32_t)hexkl_graph_set_param(
-    g, op_router, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, HD64_E);
+    g, op_router, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, n_bias);
   CHECK(rc == 0u, "set router bias: %s", htp_graph_err_name(rc));
 
   /* (2) op 0 seeds slot 0 with the embedding row x */
@@ -1269,6 +1310,21 @@ static void check_add_router(void) {
   check_pcycles(g, op_add0, op_norm[1] + 1u, "[ADD RMSNORM]");
   err |= memcmp(out, ref, sizeof(ref)) != 0 || memcmp(g->slots, h, sizeof(h));
 
+  if (gemma) {
+    /* an a2 whose row N1 norms to another r than the f32 norm does, so the
+       stretch tells the two apart (they agree on many rows) */
+    static float t1[HID], t2[HID];
+    int differs = 0;
+    for (r = 0; r < 64u && !differs; ++r) {
+      fill(a2, HID, &seed);
+      for (i = 0; i < HID; ++i)
+        t1[i] = m1_det_add(h[i], a2[i]);
+      differs = m1_rmsnorm_n1_chunk_det(t1, gam[2], t2, HID, kHd64.eps) !=
+                m1_rmsnorm_chunk_det(t1, gam[2], t2, HID, kHd64.eps);
+    }
+    CHECK(differs, "no a2 in 64 rows tells N1 from the f32 norm");
+  }
+
   /* (4) [ADD RMSNORM ROUTER_TOPK MOE ADD RMSNORM], slot 0 carried over:
      h = s0 + a2, n = rmsnorm(h), routing = router_topk_det(n),
      h2 = h + standin(n, routing), out = rmsnorm(h2) */
@@ -1279,8 +1335,16 @@ static void check_add_router(void) {
         htp_graph_err_name(rc), resume);
   for (i = 0; i < HID; ++i)
     h[i] = m1_det_add(h[i], a2[i]);
-  m1_rmsnorm_det(h, gam[2], nrm, HID, HID, kHd64.eps, NULL);
-  m1_router_cpu_det(nrm, rw, rbias, HID, HD64_E, HD64_TOP, lg, sel, wt);
+  if (gemma) {
+    static float xs[HID];
+    m1_rmsnorm_n1_chunk_det(h, gam[2], nrm, HID, kHd64.eps);
+    m1_rmsnorm_det(nrm, rbias, xs, HID, HID, kHd64.eps, NULL);
+    m1_router_softmax_det(xs, rw, rbias + HID, HID, HD64_E, HD64_TOP, lg, sel,
+                          wt);
+  } else {
+    m1_rmsnorm_det(h, gam[2], nrm, HID, HID, kHd64.eps, NULL);
+    m1_router_cpu_det(nrm, rw, rbias, HID, HD64_E, HD64_TOP, lg, sel, wt);
+  }
   for (r = 0; r < HD64_TOP; ++r) {
     r_cnt[sel[r]] = 1u;
     by_e[sel[r]] = wt[r];
@@ -1308,9 +1372,10 @@ static void check_add_router(void) {
   err |= memcmp(out, ref, sizeof(ref)) != 0 || memcmp(g->slots, h, sizeof(h));
   hexkl_graph_free(g);
   if (err == 0)
-    printf("GRAPH STRETCH BIT-IDENTICAL: ADD+RMSNORM "
+    printf("GRAPH STRETCH BIT-IDENTICAL%s: ADD+RMSNORM "
            "ADD+RMSNORM+ROUTER_TOPK+MOE+ADD+RMSNORM (hd64 shape, MOE on the "
-           "stand-in, slot 0 carried across calls, resume_at the next FC)\n");
+           "stand-in, slot 0 carried across calls, resume_at the next FC)\n",
+           gemma ? " (Gemma softmax router, N1 norm before it)" : "");
 }
 
 /* ---- #132 Part B: the Q4M1 kinds against the CPU-order specs ---------- */
@@ -1669,12 +1734,175 @@ static void check_q4m1(void) {
            "m1_argmax_first (hd64 shape, the real HVX kernel on hvx_emu)\n");
 }
 
+/* ---- [plan 201 S4] Gemma 4's attention shapes -------------------------- */
+
+/* google/gemma-4-26B-A4B: 16 q heads; sliding layers head_dim 256 over 8 kv
+   heads, full layers head_dim 512 over 2 (num_global_key_value_heads). Three
+   layers, sliding / full / sliding, at a max_seq of two 64-position tiles. */
+#define G4_HID 2816u
+#define G4_SEQ 128u
+static const struct {
+  uint32_t n_kv, gqa, hd;
+} kG4[3] = {{8u, 2u, 256u}, {2u, 8u, 512u}, {8u, 2u, 256u}};
+
+static void g4_op(uint32_t *w, uint32_t i, uint32_t kind, uint32_t layer,
+                  uint32_t resident, uint32_t K, uint32_t N) {
+  htp_graph_op *op = htp_graph_op_at(w, i);
+  memset(op, 0, sizeof(*op));
+  op->kind = kind;
+  op->layer = layer;
+  op->resident = resident;
+  op->K = K;
+  op->N = N;
+  op->next_mm = HTP_GRAPH_NO_OP;
+  op->in_slot = 2u;
+  op->out_slot = kind == HTP_OP_ATTN_M1 ? 1u : 2u;
+  if (layer < 3u) {
+    op->n_kv = kG4[layer].n_kv;
+    op->gqa = kG4[layer].gqa;
+    op->head_dim = kG4[layer].hd;
+  }
+  if (kind == HTP_OP_QK_NORM || kind == HTP_OP_RMSNORM) {
+    op->eps_bits = 0x358637BDu; /* 1e-6f */
+  }
+}
+
+/** @brief [QK_NORM ROPE ATTN_M1] x 3 then [RMSNORM LM_HEAD]; ROPE resident,
+ *  QK_NORM and the tail not, ATTN_M1 as @a attn. @return the words. */
+static uint32_t g4_list(uint32_t *w, uint32_t attn) {
+  const uint32_t n_ops = 3u * 3u + 2u;
+  uint32_t l, i = 0;
+  w[0] = HTP_GRAPH_MAGIC;
+  w[1] = HTP_GRAPH_VERSION;
+  w[2] = 3u;
+  w[3] = n_ops;
+  w[4] = G4_HID;
+  w[5] = 256u;
+  w[6] = G4_SEQ;
+  for (l = 0; l < 3u; ++l) {
+    w[HTP_GRAPH_HEADER_WORDS + l] = HTP_GRAPH_LAYER_ATTN;
+    w[HTP_GRAPH_HEADER_WORDS + 3u + l] = HTP_GRAPH_FFN_DENSE;
+  }
+  for (l = 0; l < 3u; ++l) {
+    const uint32_t q = kG4[l].gqa * kG4[l].n_kv * kG4[l].hd;
+    const uint32_t K = q + 2u * kG4[l].n_kv * kG4[l].hd;
+    g4_op(w, i++, HTP_OP_QK_NORM, l, 0u, K, K);
+    g4_op(w, i++, HTP_OP_ROPE, l, 1u, K, K);
+    g4_op(w, i++, HTP_OP_ATTN_M1, l, attn, K, q);
+  }
+  g4_op(w, i++, HTP_OP_RMSNORM, 3u, 0u, G4_HID, G4_HID);
+  g4_op(w, i++, HTP_OP_LM_HEAD, 3u, 0u, G4_HID, 256u);
+  return htp_graph_words_for(3u, n_ops);
+}
+
+/** @brief Gemma's cos | sin table, max_seq x hd: mha_core's default (all
+ *  angles) or proportional (the first @a partial of them, 0 above). */
+static void g4_table(float *cs, uint32_t hd, double theta, double partial) {
+  const uint32_t h = hd / 2u, angles = (uint32_t)(partial * hd / 2.0);
+  uint32_t p, i;
+  for (p = 0; p < G4_SEQ; ++p) {
+    for (i = 0; i < h; ++i) {
+      const double a =
+        i < angles ? (double)p * pow(theta, -(2.0 * i) / (double)hd) : 0.0;
+      cs[(size_t)p * hd + i] = (float)cos(a);
+      cs[(size_t)p * hd + h + i] = (float)sin(a);
+    }
+  }
+}
+
+/* (1) The list validates with ROPE resident at head_dim 256 / 512; (2) a
+   ROPE op with no table of its own and no head_dim 64 -> EBADSTATE (the
+   shared hd64 table is not read at another head_dim); (3) tables bound per
+   op, the two sliding layers' equal ones shared and the full one apart, a
+   wrong length refused; (4) each ROPE op's forward == m1_rope_det on its
+   q and k heads with its own table, v untouched. */
+static void check_gemma_rope(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  static float cs_s[G4_SEQ * 256u], cs_f[G4_SEQ * 512u], cs64[G4_SEQ * 64u];
+  static float in[10240u], out[10240u], ref[10240u];
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  uint32_t n, rc, resume, seed = 4296u, l, i, p;
+  int err = 0;
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  n = g4_list(w, 0u);
+  rc = htp_graph_validate(w, n, ALL_KINDS, NULL);
+  CHECK(rc == 0u, "gemma rope list: %s", htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
+  CHECK(rc == 0u && g != NULL, "gemma rope init: %s", htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  fill(in, 10240u, &seed);
+  fill(cs64, G4_SEQ * 64u, &seed);
+  rc = (uint32_t)hexkl_graph_set_param(
+    g, HTP_GRAPH_NO_OP, HTP_GRAPH_PARAM_ROPE_TABLE, cs64, G4_SEQ * 64u);
+  CHECK(rc == 0u, "gemma: shared hd64 table: %s", htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_forward(g, &env, 1u, 1u, 5u, NULL, in, 8192u, out,
+                                     8192u, &resume);
+  CHECK(rc == (uint32_t)AEE_EBADSTATE, "gemma ROPE hd256, no own table: %s",
+        htp_graph_err_name(rc));
+  g4_table(cs_s, 256u, 1e4, 1.0);
+  g4_table(cs_f, 512u, 1e6, 0.25);
+  rc = (uint32_t)hexkl_graph_set_param(g, 1u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
+                                       G4_SEQ * 256u - 1u);
+  CHECK(rc == (uint32_t)AEE_EINVALIDFORMAT, "gemma: short table: %s",
+        htp_graph_err_name(rc));
+  rc = (uint32_t)hexkl_graph_set_param(g, 1u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
+                                       G4_SEQ * 256u);
+  rc |= (uint32_t)hexkl_graph_set_param(g, 4u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_f,
+                                        G4_SEQ * 512u);
+  rc |= (uint32_t)hexkl_graph_set_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
+                                        G4_SEQ * 256u);
+  CHECK(rc == 0u, "gemma: per-op tables: %s", htp_graph_err_name(rc));
+  CHECK(g->param[1] != NULL && g->param[1] == g->param[7] &&
+          g->param[4] != g->param[1],
+        "gemma: the sliding tables are not shared (or the full one is)");
+  /* re-binding a shared table with other bytes splits it, never writes the
+     other op's copy */
+  rc = (uint32_t)hexkl_graph_set_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_f,
+                                       G4_SEQ * 256u);
+  CHECK(rc == 0u && g->param[7] != g->param[1] &&
+          memcmp(g->param[1], cs_s, sizeof(cs_s)) == 0,
+        "gemma: re-binding a shared table");
+  rc = (uint32_t)hexkl_graph_set_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
+                                       G4_SEQ * 256u);
+  CHECK(rc == 0u && g->param[7] == g->param[1], "gemma: re-sharing");
+  for (l = 0; l < 3u; ++l) {
+    const uint32_t hd = kG4[l].hd, nq = kG4[l].gqa * kG4[l].n_kv,
+                   nk = kG4[l].n_kv, K = (nq + 2u * nk) * hd;
+    const float *cs = l == 1u ? cs_f : cs_s;
+    for (p = 0; p < G4_SEQ; p += 37u) {
+      fill(in, K, &seed);
+      rc = (uint32_t)hexkl_graph_forward(g, &env, 3u * l + 1u, 1000u, p, NULL,
+                                         in, K, out, K, &resume);
+      CHECK(rc == 0u && resume == 3u * l + 2u, "gemma ROPE l%u pos %u: %s", l,
+            p, htp_graph_err_name(rc));
+      memcpy(ref, in, K * sizeof(float));
+      for (i = 0; i < nq + nk; ++i)
+        m1_rope_det(ref + i * hd, hd, cs + (size_t)p * hd);
+      if (memcmp(out, ref, K * sizeof(float)) != 0) {
+        CHECK(0, "gemma ROPE l%u (hd %u) pos %u differs", l, hd, p);
+        err = 1;
+      }
+    }
+  }
+  hexkl_graph_free(g); /* the shared table freed once (ASan / valgrind) */
+  if (err == 0)
+    printf("GRAPH GEMMA ROPE BIT-IDENTICAL: hd256 default 1e4 (2 layers, one "
+           "shared table) and hd512 proportional 0.25 1e6, own tables, 4 "
+           "positions each, vs m1_rope_det\n");
+}
+
 int main(void) {
   check_validator();
   check_forward();
   check_limits();
   check_stretches();
-  check_add_router();
+  check_add_router(0);
+  check_add_router(1);
+  check_gemma_rope();
   check_q4m1();
   if (g_fail) {
     printf("GRAPH CHECKS FAILED (%d)\n", g_fail);

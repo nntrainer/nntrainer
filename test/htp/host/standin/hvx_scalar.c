@@ -277,7 +277,8 @@ void hvx_dequant_acc_tiles_to_f32(
 }
 /* Fused gate/up dequant + SwiGLU: staged slot j is gate column g0 + j and
    slot n_pairs + j the up column opposite it. The SwiGLU itself is
-   swiglu_det.h, which the HVX kernel matches bit for bit (rule 24). */
+   swiglu_det.h, which the HVX kernel matches bit for bit (rule 24); with
+   the job's geglu set, geglu_det_one (plan 201 S4). */
 void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
   const hvx_dq_swiglu_job *c = (const hvx_dq_swiglu_job *)vjob;
   float gt[64 * 32], ut[64 * 32];
@@ -302,7 +303,8 @@ void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *vjob) {
     for (uint32_t r = 0; r < c->m_count; ++r)
       for (uint32_t k = 0; k < 32u; ++k)
         c->dst[(size_t)r * c->dst_stride + cg + k] =
-          swiglu_det_one(gt[r * 32u + k], ut[r * 32u + k]);
+          c->geglu ? geglu_det_one(gt[r * 32u + k], ut[r * 32u + k])
+                   : swiglu_det_one(gt[r * 32u + k], ut[r * 32u + k]);
   }
 }
 /* The tail path calls the pooled pair function directly (pool NULL, one
@@ -312,7 +314,7 @@ void hvx_dequant_swiglu_acc_tiles_to_f32(
   uint32_t g0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
   const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
   const float *bias, uint32_t inter, float *dst, uint32_t dst_stride,
-  hvx_worker_pool *pool) {
+  uint32_t geglu, hvx_worker_pool *pool) {
   (void)pool;
   hvx_dq_swiglu_job jb;
   jb.tiles_base = tiles_base;
@@ -329,6 +331,7 @@ void hvx_dequant_swiglu_acc_tiles_to_f32(
   jb.inter = inter;
   jb.dst = dst;
   jb.dst_stride = dst_stride;
+  jb.geglu = geglu;
   hvx_dq_swiglu_worker(1u, 0u, &jb);
 }
 /* Dequant + product pair job (the conv block's pre-conv gate): slot j is

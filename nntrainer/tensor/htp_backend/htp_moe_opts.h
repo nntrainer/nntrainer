@@ -90,15 +90,26 @@ static inline uint32_t htp_moe_opts_dma_q(uint32_t flags) {
   return ((flags >> HTP_MOE_DMA_Q_SHIFT) & HTP_MOE_DMA_Q_BITS) + 1u;
 }
 
+/** @brief hexkl_mm_u8i4_moe.h's HEXKL_MOE_FLAG_GEGLU restated (plan 201
+ *  S4): bit 21 makes every expert's gate_up epilogue gelu_tanh(gate) * up
+ *  instead of SwiGLU, on the M = 1 GEMV and the HMX loop alike. A model
+ *  property: LFM never sets it, so its word stays 0x703e1.
+ *  ponytail: nothing on the ARM side ORs it in yet; the Gemma load
+ *  hand-over (plan 201 S4, a later slice) adds it to sendMoeOptsOnce's
+ *  word, where the echo below already guards it. */
+#define HTP_MOE_FLAG_GEGLU 0x200000u
+
 /** @brief The bits of moe_set_opts' echo that must equal what was sent.
  *  With the GEMV on, all of them. With it off, the tune bits mean nothing
  *  on the HMX loop, so only bit 0 -- plus the bypass bit when it was asked
  *  for, because the HMX loop's weight DMA honours it (#158): a skel that
- *  predates it must fail the run, not measure the default. */
+ *  predates it must fail the run, not measure the default. Likewise the
+ *  GeGLU bit: a skel without it would run SwiGLU on a Gemma expert. */
 static inline uint32_t htp_moe_opts_must_match(uint32_t flags) {
   if ((flags & HTP_MOE_FLAG_M1_GEMV) != 0u)
     return ~0u;
-  return HTP_MOE_FLAG_M1_GEMV | (flags & HTP_MOE_FLAG_DMA_BYPASS);
+  return HTP_MOE_FLAG_M1_GEMV |
+         (flags & (HTP_MOE_FLAG_DMA_BYPASS | HTP_MOE_FLAG_GEGLU));
 }
 
 /**

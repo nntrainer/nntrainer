@@ -53,9 +53,9 @@
  *  handles are not in its record: they are its HTP_GRAPH_PARAM_EXPERTS
  *  table (plan 201 S1, the expert pool's table). */
 #define HTP_GRAPH_MAX_EXPERTS 128u
-/** @brief A resident ROUTER_TOPK's expert count: the sigmoid router's one
- *  vector of lanes (hvx_router_topk_f32, LFM2); Gemma's softmax router is
- *  plan 201 S4. */
+/** @brief A resident sigmoid ROUTER_TOPK's expert count: one vector of
+ *  lanes (hvx_router_topk_f32, LFM2). The softmax router (eps_bits set,
+ *  plan 201 S4) takes HTP_GRAPH_MAX_EXPERTS. */
 #define HTP_GRAPH_ROUTER_MAX_EXPERTS 32u
 /** @brief The op record's handle arrays: the Q4M1 kinds' parts. */
 #define HTP_GRAPH_MAX_PARTS 32u
@@ -161,9 +161,17 @@ static inline const char *htp_graph_kinds_str(uint32_t mask, char *buf,
  *  2 x head_dim (q gamma | k gamma) for QK_NORM; CONV_W is 3 x N
  *  (w0 | w1 | w2) and CONV_STATE 2 x N (x_{t-2} | x_{t-1}) for
  *  CONV1D_GATE; ROPE_TABLE is max_seq x 64 (cos[32] | sin[32] per
- *  position) with op == HTP_GRAPH_NO_OP; ROUTER_W is K x n_experts
+ *  position) with op == HTP_GRAPH_NO_OP, the head_dim 64 table every ROPE
+ *  op without its own reads; [plan 201 S4] on a ROPE op it is that op's own
+ *  table, max_seq x head_dim (cos[hd / 2] | sin[hd / 2] per position, from
+ *  the CPU's precompute_freqs: the layer's theta and rotary variant, e.g.
+ *  Gemma 4's proportional RoPE with partial factor 0.25 as zero angles),
+ *  shared between ROPE ops that bind equal tables; ROUTER_W is K x n_experts
  *  (the gate weight, row-major [K][E]) and ROUTER_BIAS n_experts for
- *  ROUTER_TOPK (#132). [#132 Part B E3] LM_BAN is 0..HTP_GRAPH_MAX_BAN
+ *  ROUTER_TOPK (#132); [plan 201 S4] for the softmax router (eps_bits set)
+ *  ROUTER_BIAS is K + n_experts: the input scale g[K]
+ *  (m1_router_input_scale_det: router_scale / sqrt(K)) then the per-expert
+ *  scale. [#132 Part B E3] LM_BAN is 0..HTP_GRAPH_MAX_BAN
  *  token ids (u32 bits in the f32 words, each < N; 0 clears) for LM_HEAD:
  *  its argmax
  *  skips them, as the CPU's bad-words penalty sets those logits to -inf
@@ -220,7 +228,13 @@ enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
  * head_dim describe the attention kinds (QK_NORM,
  * ROPE, ATTN_M1: K == (gqa + 2) n_kv head_dim, ATTN_M1's N == gqa n_kv
  * head_dim) and eps_bits holds the f32 bits of the norm epsilon (RMSNORM,
- * QK_NORM); both are 0 elsewhere.
+ * QK_NORM); both are 0 elsewhere. [plan 201 S4] A ROUTER_TOPK with eps_bits
+ * set is Gemma 4's softmax router: it RMS-norms its input itself (that
+ * epsilon, ROUTER_BIAS's g as gamma), so it reads the un-normed stream,
+ * then softmax, top-k, renormalise, per-expert scale (m1_ops_det.h); with
+ * eps_bits 0 it is LFM2's sigmoid router. An RMSNORM's feed bit 0
+ * (HTP_GRAPH_NORM_N1) selects N1, the order-free integer sum of squares
+ * (opt-in, not the CPU's bits).
  */
 typedef struct {
   uint32_t kind;
@@ -250,6 +264,10 @@ typedef struct {
 #define HTP_GRAPH_FEED_NATIVE (1u << 16)
 #define HTP_GRAPH_FEED_LANES_SMALL(f) (((f) >> 8) & 0xFu)
 #define HTP_GRAPH_FEED_LANES_LARGE(f) (((f) >> 12) & 0xFu)
+/** @brief An RMSNORM's feed word: N1 (hvx_rmsnorm_n1_f32, plan 201 S4).
+ *  ponytail: RMSNORM only; QK_NORM and the router's own norm take it when
+ *  N1 is chosen for the model. */
+#define HTP_GRAPH_NORM_N1 1u
 typedef char
   htp_graph_op_size_check[sizeof(htp_graph_op) == HTP_GRAPH_OP_WORDS * 4u ? 1
                                                                           : -1];
@@ -352,10 +370,13 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         does not point forward at a weight-streaming op, CLASSNOTSUPPORT
  *         for a resident bit on a kind with no kernel here,
  *         SCHEMENOTSUPPORTED for a resident op outside its kernel's shape
- *         rule (RMSNORM: K a power of two and a multiple of 32; QK_NORM:
+ *         rule (RMSNORM: K a multiple of 32 (plan 201 S4: any width,
+ *         Gemma's 2816), its feed 0 or HTP_GRAPH_NORM_N1; QK_NORM:
  *         head_dim 32, 64 or 128 -- the per-head norm's chunk must be a
- *         power of two too -- gqa <= 8, max_seq a multiple of 32; ROPE and
- *         ATTN_M1 (#152: the fp16 CPU order): head_dim 64), NOTALLOWED for
+ *         power of two too -- gqa <= 8, max_seq a multiple of 32; ROPE:
+ *         head_dim a multiple of 64 up to 512 (plan 201 S4; any other than
+ *         64 reads its own ROPE_TABLE); ATTN_M1 (#152: the fp16 CPU order):
+ *         head_dim 64), NOTALLOWED for
  *         a resident
  *         ATTN_M1 whose layer's ROPE is not resident (the DSP stretch must
  *         apply RoPE, since mha_core does on the CPU). #132's rules: an ADD
@@ -367,9 +388,11 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         ROUTER_TOPK needs the next op, its MOE, resident (NOTALLOWED:
  *         the routing has no other consumer). #132 Part B's rules for
  *         the Q4M1 kinds: n_experts (the part count) at most 32 and feed
- *         0 or 1 (INVALIDFORMAT); [plan 201 S1] a resident ROUTER_TOPK over
- *         more than 32 experts (SCHEMENOTSUPPORTED: the sigmoid router's
- *         vector width); a resident one needs K % 64 == 0 and K
+ *         0 or 1 (INVALIDFORMAT); [plan 201 S1] a resident sigmoid
+ *         ROUTER_TOPK over more than 32 experts (SCHEMENOTSUPPORTED: its
+ *         vector width; [plan 201 S4] the softmax router takes 128, needs
+ *         a valid eps and in_slot != out_slot, INVALIDFORMAT: it norms
+ *         into its out slot); a resident Q4M1 kind needs K % 64 == 0 and K
  *         <= 8192, a DENSE_FFN also N (the down weight's K) % 64 == 0 and
  *         N <= 8192 -- the Q4M1 layout's pair and the quantizer's scratch
  *         (SCHEMENOTSUPPORTED)
@@ -447,17 +470,20 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       if (op->K != 3u * op->N || op->N != hidden)
         return HTP_GRAPH_E_INVALIDFORMAT;
       break;
-    case HTP_OP_ATTN_M1:
     case HTP_OP_ADD:
-      if (op->N != hidden || (k == HTP_OP_ADD && op->K != hidden))
+      if (op->N != hidden || op->K != hidden)
         return HTP_GRAPH_E_INVALIDFORMAT;
-      if (k == HTP_OP_ADD && (op->out_slot != 0u || op->in_slot == 0u))
+      if (op->out_slot != 0u || op->in_slot == 0u)
         return HTP_GRAPH_E_INVALIDFORMAT;
       break;
+    /* ATTN_M1's N is gqa n_kv head_dim (the record rule below), the o
+       projection's K: LFM2's 32 x 64 happens to be its hidden, Gemma 4's
+       16 x 256 and 16 x 512 are not (plan 201 S4) */
     case HTP_OP_ROUTER_TOPK:
       if (op->K != hidden || op->N != op->n_experts || op->n_experts == 0u ||
           op->n_experts > HTP_GRAPH_MAX_EXPERTS || op->top_k == 0u ||
-          op->top_k > op->n_experts)
+          op->top_k > op->n_experts ||
+          (op->eps_bits != 0u && op->in_slot == op->out_slot))
         return HTP_GRAPH_E_INVALIDFORMAT;
       break;
     case HTP_OP_MOE:
@@ -511,25 +537,30 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       if (k == HTP_OP_ROPE)
         rope_resident = op->resident;
       if (op->resident != 0u) {
-        if (op->head_dim % 32u != 0u || op->head_dim > 128u ||
-            (op->head_dim & (op->head_dim - 1u)) != 0u || op->gqa > 8u ||
-            max_seq % 32u != 0u ||
-            ((k == HTP_OP_ROPE || k == HTP_OP_ATTN_M1) && op->head_dim != 64u))
+        if (op->gqa > 8u || max_seq % 32u != 0u ||
+            (k == HTP_OP_QK_NORM &&
+             (op->head_dim % 32u != 0u || op->head_dim > 128u ||
+              (op->head_dim & (op->head_dim - 1u)) != 0u)) ||
+            (k == HTP_OP_ROPE &&
+             (op->head_dim % 64u != 0u || op->head_dim > 512u)) ||
+            (k == HTP_OP_ATTN_M1 && op->head_dim != 64u))
           return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
         if (k == HTP_OP_ATTN_M1 && rope_resident == 0u)
           return HTP_GRAPH_E_NOTALLOWED;
       }
     }
-    if (k == HTP_OP_RMSNORM || k == HTP_OP_QK_NORM) {
+    if (k == HTP_OP_RMSNORM || k == HTP_OP_QK_NORM ||
+        (k == HTP_OP_ROUTER_TOPK && op->eps_bits != 0u)) {
       /* a positive finite f32: sign clear, exponent neither 0 nor 0xFF */
       const uint32_t exp = op->eps_bits & 0x7F800000u;
       if ((op->eps_bits & 0x80000000u) != 0u || exp == 0u || exp == 0x7F800000u)
         return HTP_GRAPH_E_INVALIDFORMAT;
     }
-    if (k == HTP_OP_RMSNORM && op->resident != 0u &&
-        (op->K % 32u != 0u || (op->K & (op->K - 1u)) != 0u))
+    if (k == HTP_OP_RMSNORM && (op->feed & ~HTP_GRAPH_NORM_N1) != 0u)
+      return HTP_GRAPH_E_INVALIDFORMAT;
+    if (k == HTP_OP_RMSNORM && op->resident != 0u && op->K % 32u != 0u)
       return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
-    if (k == HTP_OP_ROUTER_TOPK && op->resident != 0u &&
+    if (k == HTP_OP_ROUTER_TOPK && op->resident != 0u && op->eps_bits == 0u &&
         op->n_experts > HTP_GRAPH_ROUTER_MAX_EXPERTS)
       return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
     if (k == HTP_OP_ROUTER_TOPK && op->resident != 0u &&

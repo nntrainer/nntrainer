@@ -156,7 +156,9 @@ typedef struct hexkl_graph_s {
   uint32_t slot_words; /**< f32 per activation slot: the widest resident
                             op's in or out width */
   float *slots;        /**< HTP_GRAPH_N_SLOTS x slot_words, DSP heap */
-  float *rope_cs;      /**< [max_seq][64] cos | sin, or NULL until bound */
+  float *rope_cs;      /**< [max_seq][64] cos | sin, or NULL until bound;
+                            [plan 201 S4] a ROPE op with its own table
+                            (param[op], max_seq x head_dim) reads that */
   htp_graph_op ops[HTP_GRAPH_MAX_OPS];
   uint64_t op_pcycles[HTP_GRAPH_MAX_OPS]; /**< of the last forward */
   float *param[HTP_GRAPH_MAX_OPS];     /**< gamma or conv_w, NULL until bound */
