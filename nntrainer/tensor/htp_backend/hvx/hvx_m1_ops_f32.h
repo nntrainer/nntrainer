@@ -57,6 +57,15 @@ void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
                      uint32_t chunk, float eps, float *row_scale_out);
 
 /**
+ * @brief [plan 201 S4] N1, opt-in: hvx_rmsnorm_f32's shape and output form,
+ *        r from m1_rmsnorm_n1_chunk_det's order-free integer sum of squares
+ *        (32 word lanes). Not the CPU's bits. DOMAIN: finite x.
+ */
+void hvx_rmsnorm_n1_f32(const float *x, const float *gamma, float *y,
+                        uint32_t n, uint32_t chunk, float eps,
+                        float *row_scale_out);
+
+/**
  * @brief RoPE in place on n_q q heads then n_k k heads, each 64 contiguous
  *        floats; cs = cos[32] | sin[32] for this position.
  */

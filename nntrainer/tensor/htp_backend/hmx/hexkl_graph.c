@@ -239,7 +239,8 @@ static int graph_op_rmsnorm(hexkl_graph *g, const htp_graph_op *op,
   if (gamma == NULL) {
     return AEE_EBADSTATE;
   }
-  hvx_rmsnorm_f32(in, gamma, out, op->K, op->K, graph_eps(op), NULL);
+  ((op->feed & HTP_GRAPH_NORM_N1) != 0u ? hvx_rmsnorm_n1_f32 : hvx_rmsnorm_f32)(
+    in, gamma, out, op->K, op->K, graph_eps(op), NULL);
   return AEE_SUCCESS;
 }
 

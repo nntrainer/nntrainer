@@ -220,14 +220,15 @@ graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_host_check"
 # FFN input's quantization; the argmax over the first slice only; [plan 201
 # S1] the miss round's experts before the first miss dropped, and its later
 # rows added in reverse order; [plan 201 S4] the softmax router run as the
-# sigmoid one
+# sigmoid one, and an RMSNORM's N1 bit ignored
 for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, gate, act, op->N,/' \
   's/y += g->q4m1\[h\[p\]\].N;/y += Q4M1_GROUP;/' \
   's/graph_prep(op, act, op->N, &g->act);/(void)act;/' \
   's/hvx_argmax_first_f32(g->logits, op->N)/hvx_argmax_first_f32(g->logits, op->N \/ 2u)/' \
   's/  if (first != 0u) {/  if (0) {/' \
   's/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)i \* op->N_out, 1.0f,/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)(n - 1u - i + first) * op->N_out, 1.0f,/' \
-  's/  if (op->eps_bits != 0u) {/  if (0) {/'; do
+  's/  if (op->eps_bits != 0u) {/  if (0) {/' \
+  's/((op->feed \& HTP_GRAPH_NORM_N1) != 0u ? hvx_rmsnorm_n1_f32/(0 ? hvx_rmsnorm_n1_f32/'; do
   sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
   if cmp -s "$OUT/hexkl_graph_mutant.c" "$BACKEND/hmx/hexkl_graph.c"; then
     echo "GRAPH Q4M1 MUTATION DID NOT APPLY: $mut"; exit 1

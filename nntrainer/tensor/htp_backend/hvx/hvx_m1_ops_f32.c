@@ -61,8 +61,60 @@ static inline float hvx_rmsnorm_scale(const float *x, uint32_t chunk,
   return m1_norm_scale_det(m1_norm_reduce_det(acc), chunk, eps);
 }
 
-void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
-                     uint32_t chunk, float eps, float *row_scale_out) {
+/** @brief [plan 201 S4] N1's row scale: the largest |bits|, then q =
+ *         a 2^11 + b on 32 word lanes and the integer sums of a^2, a b and
+ *         b^2 (each term <= 2^22, so M1_N1_BLOCK_VECS of them fit a u32
+ *         lane), each block's lanes added into u64s: S = 2^22 A + 2^12 B +
+ *         C = sum q^2 exactly, so any lane count or order gives
+ *         m1_rmsnorm_n1_chunk_det's S. The rest is the spec's own scalar
+ *         m1_n1_norm_scale_det. */
+static inline float hvx_rmsnorm_n1_scale(const float *x, uint32_t chunk,
+                                         float eps) {
+  const HVX_UVector *vx = (const HVX_UVector *)x;
+  const uint32_t nvec = chunk / LANES;
+  const HVX_Vector mag = Q6_V_vsplat_R(0x7FFFFFFF);
+  const HVX_Vector magic = Q6_V_vsplat_R(0x4B400000);
+  const HVX_Vector lo11 = Q6_V_vsplat_R(0x7FF);
+  HVX_Vector vmax = Q6_V_vzero();
+  uint32_t amax = 0u;
+  uint64_t A = 0u, B = 0u, C = 0u;
+  for (uint32_t i = 0; i < nvec; ++i) {
+    vmax = Q6_Vw_vmax_VwVw(vmax, Q6_V_vand_VV(vx[i], mag));
+  }
+  const uint32_t *mw = (const uint32_t *)&vmax;
+  for (uint32_t l = 0; l < LANES; ++l) {
+    amax = mw[l] > amax ? mw[l] : amax;
+  }
+  const int k = m1_n1_shift_det(amax);
+  const HVX_Vector p = hvx_splat_sf(m1_n1_pow2_det(k));
+  for (uint32_t b0 = 0; b0 < nvec; b0 += M1_N1_BLOCK_VECS) {
+    const uint32_t e =
+      b0 + M1_N1_BLOCK_VECS < nvec ? b0 + M1_N1_BLOCK_VECS : nvec;
+    HVX_Vector va = Q6_V_vzero(), vb = Q6_V_vzero(), vc = Q6_V_vzero();
+    for (uint32_t i = b0; i < e; ++i) {
+      const HVX_Vector v = Q6_Vsf_vmpy_VsfVsf(Q6_V_vand_VV(vx[i], mag), p);
+      const HVX_Vector q = Q6_Vw_vsub_VwVw(Q6_Vsf_vadd_VsfVsf(v, magic), magic);
+      /* a, b <= 2^11 sit in the low halfword: w * w.uh is exact */
+      const HVX_Vector a = Q6_Vuw_vlsr_VuwR(q, 11);
+      const HVX_Vector lo = Q6_V_vand_VV(q, lo11);
+      va = Q6_Vw_vadd_VwVw(va, Q6_Vw_vmpyie_VwVuh(a, a));
+      vb = Q6_Vw_vadd_VwVw(vb, Q6_Vw_vmpyie_VwVuh(a, lo));
+      vc = Q6_Vw_vadd_VwVw(vc, Q6_Vw_vmpyie_VwVuh(lo, lo));
+    }
+    const uint32_t *aw = (const uint32_t *)&va, *bw = (const uint32_t *)&vb,
+                   *cw = (const uint32_t *)&vc;
+    for (uint32_t l = 0; l < LANES; ++l) {
+      A += aw[l];
+      B += bw[l];
+      C += cw[l];
+    }
+  }
+  return m1_n1_norm_scale_det((A << 22) + (B << 12) + C, k, chunk, eps);
+}
+
+static void rmsnorm_rows(const float *x, const float *gamma, float *y,
+                         uint32_t n, uint32_t chunk, float eps,
+                         float *row_scale_out, int n1) {
   if (!x || !y || chunk == 0u || chunk % LANES != 0u || n % chunk != 0u) {
     return;
   }
@@ -73,7 +125,9 @@ void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
     const HVX_UVector *vg = (const HVX_UVector *)gamma;
     HVX_UVector *vy = (HVX_UVector *)(y + (size_t)c * chunk);
 
-    const float rs = hvx_rmsnorm_scale(x + (size_t)c * chunk, chunk, eps);
+    const float rs = n1
+                       ? hvx_rmsnorm_n1_scale(x + (size_t)c * chunk, chunk, eps)
+                       : hvx_rmsnorm_scale(x + (size_t)c * chunk, chunk, eps);
     if (row_scale_out) {
       row_scale_out[c] = rs;
     }
@@ -88,6 +142,17 @@ void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
       }
     }
   }
+}
+
+void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
+                     uint32_t chunk, float eps, float *row_scale_out) {
+  rmsnorm_rows(x, gamma, y, n, chunk, eps, row_scale_out, 0);
+}
+
+void hvx_rmsnorm_n1_f32(const float *x, const float *gamma, float *y,
+                        uint32_t n, uint32_t chunk, float eps,
+                        float *row_scale_out) {
+  rmsnorm_rows(x, gamma, y, n, chunk, eps, row_scale_out, 1);
 }
 
 /** @brief One head in fp16 (m1_rope64_det): a | b halves rounded, then

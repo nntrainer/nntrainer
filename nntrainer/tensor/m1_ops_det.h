@@ -102,6 +102,9 @@
  *   renormalised over the chosen and times the per-expert scale (the
  *   function's comment has the order).
  *
+ *   rmsnorm_n1 ([plan 201 S4] N1, opt-in, not the CPU's bits): the sum of
+ *   squares in integers after a per-row power of two (its comment).
+ *
  *   swiglu_cpu_det(y[n], z[n]): neon::swiglu with neon_mathfun's exp_ps as
  *   the binary computes it (one fused step, the rest separate; plan 132
  *   section 0.2): out = RN(y / (exp_ps(-y) + 1)) * z. The MoE's own
@@ -295,6 +298,100 @@ static inline void m1_norm_apply_det(const float *x, const float *gamma,
 static inline float m1_rmsnorm_chunk_det(const float *x, const float *gamma,
                                          float *y, uint32_t chunk, float eps) {
   const float r = m1_norm_scale_det(m1_sumsq_cpu_det(x, chunk), chunk, eps);
+  m1_norm_apply_det(x, gamma, y, chunk, r);
+  return r;
+}
+
+/* ---- [plan 201 S4] N1: the sum of squares in integers (opt-in) ---------- */
+
+/** @brief N1's fixed point: |q| <= 2^M1_N1_BITS (2^22, the largest the
+ *         1.5 2^23 rounding identity takes). The HVX kernel splits q =
+ *         a 2^11 + b and sums a^2, a b and b^2 (each < 2^22 + 1) on u32
+ *         lanes, M1_N1_BLOCK_VECS vectors before a lane can overflow. */
+#define M1_N1_BITS 22
+#define M1_N1_BLOCK_VECS 512u
+
+/** @brief k with |x| 2^k < 2^M1_N1_BITS for every x whose |bits| <= amax
+ *         (the row's largest |bits|): 13 - E for amax in [2^E, 2^(E+1)),
+ *         at most 127 so 2^k is a normal f32 (a row below 2^-114 keeps
+ *         fewer bits; its s is far under any eps). */
+static inline int m1_n1_shift_det(uint32_t amax) {
+  const int k = (M1_N1_BITS - 1) - ((int)(amax >> 23) - 127);
+  return k > 127 ? 127 : k;
+}
+
+/** @brief 2^e as f32 bits for e in [-149, 127] (subnormal below -126). */
+static inline float m1_n1_pow2_det(int e) {
+  return m1_det_float(e >= -126 ? (uint32_t)(e + 127) << 23
+                                : 1u << (uint32_t)(e + 149));
+}
+
+/** @brief q = RNE(|x| 2^k) in integers: |x| 2^k is exact (or below 2^-126,
+ *         where q is 0 either way), and adding 1.5 2^23 rounds it to an
+ *         integer in the low mantissa bits (hvx_sf_to_w_rne's identity). */
+static inline uint32_t m1_n1_q_det(float x, float p) {
+  const float v = m1_det_mul(m1_det_float(m1_det_bits(x) & 0x7fffffffu), p);
+  return m1_det_bits(m1_det_add(v, 12582912.0f)) - 0x4B400000u;
+}
+
+/** @brief RN(S) for S < 2^64, in integers (no u64 -> f32 instruction to
+ *         trust): the top 24 bits, round to nearest even on the rest. */
+static inline float m1_n1_u64_to_f32_det(uint64_t S) {
+  int e = 0;
+  if (S == 0u) {
+    return 0.0f;
+  }
+  while ((S >> e) >= (1ull << 24)) {
+    ++e;
+  }
+  uint64_t m = S >> e;
+  if (e > 0) {
+    const uint64_t rest = S & ((1ull << e) - 1u), half = 1ull << (e - 1);
+    m += rest > half || (rest == half && (m & 1u));
+    if (m == 1ull << 24) {
+      m >>= 1;
+      ++e;
+    }
+  }
+  /* m < 2^24 exactly, e <= 40: (float)m is exact, the scale a power of 2 */
+  return m1_det_mul((float)(uint32_t)m, m1_n1_pow2_det(e));
+}
+
+/** @brief N1's row scale from the exact integer sum S of q^2 at shift k:
+ *         s = RN(S) 2^-k 2^-k (two exact scalings while s stays normal),
+ *         then the CPU form of m1_norm_scale_det. Shared by the spec and
+ *         the HVX kernel; only S is the kernel's own. */
+static inline float m1_n1_norm_scale_det(uint64_t S, int k, uint32_t chunk,
+                                         float eps) {
+  const float p = m1_n1_pow2_det(-k);
+  const float s = m1_det_mul(m1_det_mul(m1_n1_u64_to_f32_det(S), p), p);
+  return m1_norm_scale_det(s, chunk, eps);
+}
+
+/**
+ * @brief N1 RMSNorm over one chunk (plan 201 section 3.7): the per-row
+ *        power of two k from the largest |x|, q = RNE(|x| 2^k) <= 2^22,
+ *        S = sum q^2 exactly in integers -- any lane count, any order, the
+ *        same S -- then r from S with the spec's integer sqrt / recip, and
+ *        y = (x * r) * gamma in f32. Not the f32 norm's bits: each |x| keeps
+ *        22 bits relative to the row's largest. DOMAIN: finite x.
+ */
+static inline float m1_rmsnorm_n1_chunk_det(const float *x, const float *gamma,
+                                            float *y, uint32_t chunk,
+                                            float eps) {
+  uint32_t amax = 0u;
+  uint64_t S = 0u;
+  for (uint32_t i = 0; i < chunk; ++i) {
+    const uint32_t a = m1_det_bits(x[i]) & 0x7fffffffu;
+    amax = a > amax ? a : amax;
+  }
+  const int k = m1_n1_shift_det(amax);
+  const float p = m1_n1_pow2_det(k);
+  for (uint32_t i = 0; i < chunk; ++i) {
+    const uint64_t q = m1_n1_q_det(x[i], p);
+    S += q * q;
+  }
+  const float r = m1_n1_norm_scale_det(S, k, chunk, eps);
   m1_norm_apply_det(x, gamma, y, chunk, r);
   return r;
 }

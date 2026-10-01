@@ -227,7 +227,9 @@ enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
  * set is Gemma 4's softmax router: it RMS-norms its input itself (that
  * epsilon, ROUTER_BIAS's g as gamma), so it reads the un-normed stream,
  * then softmax, top-k, renormalise, per-expert scale (m1_ops_det.h); with
- * eps_bits 0 it is LFM2's sigmoid router.
+ * eps_bits 0 it is LFM2's sigmoid router. An RMSNORM's feed bit 0
+ * (HTP_GRAPH_NORM_N1) selects N1, the order-free integer sum of squares
+ * (opt-in, not the CPU's bits).
  */
 typedef struct {
   uint32_t kind;
@@ -257,6 +259,10 @@ typedef struct {
 #define HTP_GRAPH_FEED_NATIVE (1u << 16)
 #define HTP_GRAPH_FEED_LANES_SMALL(f) (((f) >> 8) & 0xFu)
 #define HTP_GRAPH_FEED_LANES_LARGE(f) (((f) >> 12) & 0xFu)
+/** @brief An RMSNORM's feed word: N1 (hvx_rmsnorm_n1_f32, plan 201 S4).
+ *  ponytail: RMSNORM only; QK_NORM and the router's own norm take it when
+ *  N1 is chosen for the model. */
+#define HTP_GRAPH_NORM_N1 1u
 typedef char
   htp_graph_op_size_check[sizeof(htp_graph_op) == HTP_GRAPH_OP_WORDS * 4u ? 1
                                                                           : -1];
@@ -360,7 +366,7 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         for a resident bit on a kind with no kernel here,
  *         SCHEMENOTSUPPORTED for a resident op outside its kernel's shape
  *         rule (RMSNORM: K a multiple of 32 (plan 201 S4: any width,
- *         Gemma's 2816); QK_NORM:
+ *         Gemma's 2816), its feed 0 or HTP_GRAPH_NORM_N1; QK_NORM:
  *         head_dim 32, 64 or 128 -- the per-head norm's chunk must be a
  *         power of two too -- gqa <= 8, max_seq a multiple of 32; ROPE and
  *         ATTN_M1 (#152: the fp16 CPU order): head_dim 64), NOTALLOWED for
@@ -538,6 +544,8 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       if ((op->eps_bits & 0x80000000u) != 0u || exp == 0u || exp == 0x7F800000u)
         return HTP_GRAPH_E_INVALIDFORMAT;
     }
+    if (k == HTP_OP_RMSNORM && (op->feed & ~HTP_GRAPH_NORM_N1) != 0u)
+      return HTP_GRAPH_E_INVALIDFORMAT;
     if (k == HTP_OP_RMSNORM && op->resident != 0u && op->K % 32u != 0u)
       return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
     if (k == HTP_OP_ROUTER_TOPK && op->resident != 0u && op->eps_bits == 0u &&

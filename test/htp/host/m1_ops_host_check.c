@@ -1212,7 +1212,7 @@ static void check_swiglu_argmax_kernels(void) {
   free(x);
 }
 
-/* ---- [plan 201 S4] helpers of the router check ------------------------- */
+/* ---- [plan 201 S4] helpers of the router and N1 checks ----------------- */
 
 /** @brief SNR in dB of a against the reference b over n values. */
 static double snr_db(const float *a, const double *b, uint32_t n) {
@@ -1383,6 +1383,69 @@ static void check_router_softmax(void) {
   free(wp);
 }
 
+/* ---- [plan 201 S4] N1: the order-free integer norm (opt-in) ------------ */
+
+/** @brief hvx_rmsnorm_n1_f32 (hvx_emu) against m1_rmsnorm_n1_chunk_det by
+ *         memcmp at Gemma's, LFM's and the q/k widths, every row kind; then
+ *         the spec's SNR against f64 and against the f32 norm, reported. */
+static void check_rmsnorm_n1(void) {
+  /* 16640 = 520 vectors: the kernel's u32 lanes flush once mid-row */
+  enum { NW = 5, WMAX = 16640 };
+  static const uint32_t widths[NW] = {2816u, 2048u, 64u, 32u, WMAX};
+  const float eps = 1e-6f;
+  float *x = malloc(WMAX * sizeof(float)), *g = malloc(WMAX * sizeof(float));
+  float *yh = malloc(WMAX * sizeof(float)), *yd = malloc(WMAX * sizeof(float));
+  float *yf = malloc(WMAX * sizeof(float));
+  double *y64 = malloc(WMAX * sizeof(double));
+  uint32_t bad = 0, rows = 0;
+  fill_rand(g, WMAX, 0.5f, 1.5f);
+  for (int w = 0; w < NW; ++w) {
+    const uint32_t W = widths[w];
+    double snr64_min = 999.0, snr32_min = 999.0, f32_min = 999.0;
+    for (int kind = 0; kind <= 4; ++kind) {
+      for (int rep = 0; rep < (kind == 0 || kind == 4 ? 16 : 1); ++rep) {
+        float rh, rd;
+        fill_row_peaky(x, W, kind);
+        memset(yh, 0xA5, W * sizeof(float));
+        hvx_rmsnorm_n1_f32(x, g, yh, W, W, eps, &rh);
+        rd = m1_rmsnorm_n1_chunk_det(x, g, yd, W, eps);
+        bad += memcmp(yh, yd, W * sizeof(float)) != 0 ||
+               memcmp(&rh, &rd, sizeof(float)) != 0;
+        ++rows;
+        if (kind == 1 || kind == 2) {
+          continue; /* zeros / subnormals: y is 0 or below eps's reach */
+        }
+        m1_rmsnorm_det(x, g, yf, W, W, eps, NULL);
+        ref_rmsnorm_f64(x, g, y64, W, eps);
+        const double s64 = snr_db(yd, y64, W), s64f = snr_db(yf, y64, W);
+        double *yfd = y64; /* the f32 norm as the reference */
+        for (uint32_t i = 0; i < W; ++i) {
+          yfd[i] = (double)yf[i];
+        }
+        const double s32 = snr_db(yd, yfd, W);
+        snr64_min = s64 < snr64_min ? s64 : snr64_min;
+        snr32_min = s32 < snr32_min ? s32 : snr32_min;
+        f32_min = s64f < f32_min ? s64f : f32_min;
+      }
+    }
+    printf("N1 NORM W=%u SNR(min over rows): n1 vs f64 %.1f dB, n1 vs f32 "
+           "norm %.1f dB; f32 norm vs f64 %.1f dB (random, large, peaky)\n",
+           W, snr64_min, snr32_min, f32_min);
+    CHECK(snr64_min >= 120.0, "N1 W=%u: %.1f dB against f64", W, snr64_min);
+  }
+  printf("N1 NORM HVX == SPEC bit-exact rows=%u bad=%u (W 2816/2048/64/32/"
+         "16640; "
+         "zeros, subnormals, large, peaky)\n",
+         rows, bad);
+  CHECK(bad == 0u, "hvx_rmsnorm_n1_f32 differs from m1_rmsnorm_n1_chunk_det");
+  free(x);
+  free(g);
+  free(yh);
+  free(yd);
+  free(yf);
+  free(y64);
+}
+
 int main(int argc, char **argv) {
   if (argc >= 5 && !strcmp(argv[1], "--replay")) {
     return replay(argc - 2, argv + 2);
@@ -1403,6 +1466,7 @@ int main(int argc, char **argv) {
   check_router_vs_cpu();
   check_expf_port();
   check_swiglu_argmax();
+  check_rmsnorm_n1();
   check_router_softmax();
   if (g_fail) {
     printf("M1 OPS CHECK FAILED\n");
