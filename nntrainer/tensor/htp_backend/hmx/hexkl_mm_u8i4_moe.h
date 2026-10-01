@@ -366,6 +366,16 @@ int hexkl_mm_u8i4_moe_layer_run(
 #define HEXKL_MOE_DMA_Q_SHIFT 19u
 #define HEXKL_MOE_DMA_Q_BITS 3u
 
+/**
+ * @brief Bit 21 of the flags word (plan 201 S4): the gate_up epilogue is
+ *        GeGLU-tanh, gelu_tanh(gate) * up (hvx_geglu_det_sf), instead of
+ *        SwiGLU -- on every path of the call (M=1 GEMV, HMX block loop,
+ *        HVX tail), since all three run hvx_dq_swiglu_worker. A model
+ *        property, not a tune knob: no build default, clear = SwiGLU and
+ *        the bytes of every run before it.
+ */
+#define HEXKL_MOE_FLAG_GEGLU 0x200000u
+
 /** @brief Every bit this build understands; moe_set_opts keeps these and
  *         drops the rest, which is what makes the echo a version check. */
 #define HEXKL_MOE_FLAGS_KNOWN                                                  \
@@ -374,7 +384,8 @@ int hexkl_mm_u8i4_moe_layer_run(
    ((uint32_t)HEXKL_MOE_GEMV_LEAD_BITS << HEXKL_MOE_GEMV_LEAD_SHIFT) |         \
    HEXKL_MOE_FLAG_GEMV_ROWS1 | HEXKL_MOE_FLAG_GEMV_FEED |                      \
    HEXKL_MOE_FLAG_DMA_BYPASS |                                                 \
-   ((uint32_t)HEXKL_MOE_DMA_Q_BITS << HEXKL_MOE_DMA_Q_SHIFT))
+   ((uint32_t)HEXKL_MOE_DMA_Q_BITS << HEXKL_MOE_DMA_Q_SHIFT) |                 \
+   HEXKL_MOE_FLAG_GEGLU)
 
 /** @brief The call's DMA queue count for the M=1 feed, 1..4. */
 static inline uint32_t hexkl_moe_flags_dma_q(uint32_t flags) {

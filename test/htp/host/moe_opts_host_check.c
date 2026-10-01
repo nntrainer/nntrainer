@@ -119,9 +119,13 @@ int main(void) {
   expect(htp_moe_opts_must_match(0x703e0u) ==
            (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_DMA_BYPASS),
          "opt-out with bypass: bit 0 and bit 18");
+  expect(htp_moe_opts_must_match(0x2003e0u) ==
+           (HTP_MOE_FLAG_M1_GEMV | HTP_MOE_FLAG_GEGLU),
+         "opt-out with GeGLU: bit 0 and bit 21");
   if (!g_fail)
-    printf("MOE GEMV TUNE OPTS: per-knob tune bits, 64 KB units, "
-           "round+clamp 127, feed unset/0/1, dma_bypass 0x703e1\n");
+    printf(
+      "MOE GEMV TUNE OPTS: per-knob tune bits, 64 KB units, "
+      "round+clamp 127, feed unset/0/1, dma_bypass 0x703e1, geglu echoed\n");
 
   /* #177's queue field, bits [20:19] = N - 1: unset leaves the default
      word alone, 2 and 4 give the Q2 / Q4 words, and every other value is

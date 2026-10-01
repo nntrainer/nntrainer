@@ -182,6 +182,32 @@ static inline float swiglu_det_one(float g, float u) {
   return swiglu_det_mul(swiglu_det_mul(g, s), u);
 }
 
+/**
+ * @brief gelu_tanh(g)*u, one element: the GeGLU-tanh epilogue of a MoE
+ *        expert whose model says gelu_pytorch_tanh (Gemma 4, plan 201 S4).
+ *
+ * 0.5 x (1 + tanh(a)) is 1 / (1 + exp(-2a)), so this is swiglu_det_one with
+ * the sigmoid's argument w = -2 sqrt(2/pi) (g + 0.044715 g^3) in place of
+ * -g: the same exp_det and recip_det, no tanh. The operation order is the
+ * phone CPU's neon::tanh_gelu (cube = g * (g * g), inner = g + C3 * cube,
+ * w = K * inner, g / (1 + exp(w))), with its divide replaced by recip_det.
+ * hvx_geglu_det_sf is the DSP form, bit for bit (geglu_host_check.c).
+ *
+ * Saturation: |g| past ~7e12 makes g^3 infinite, w = -/+inf, and exp_det's
+ * clamp turns that into e = 0 (gate ~ g) or e = exp(85) (gate ~ 0) -- no
+ * NaN. That clamp floors the sigmoid at 1.2e-37, so a gate below about
+ * -1e30 comes out as g * 1.2e-37 rather than 0 (-41 at -FLT_MAX), as in
+ * swiglu_det_one. Subnormal g is in range on the host; whether the DSP's Vsf
+ * keeps subnormals is the device's question (as for swiglu_det above).
+ */
+static inline float geglu_det_one(float g, float u) {
+  const float cube = swiglu_det_mul(g, swiglu_det_mul(g, g));
+  const float inner = swiglu_det_add(g, swiglu_det_mul(0.044715f, cube));
+  const float e = swiglu_det_exp(swiglu_det_mul(-1.595769121f, inner));
+  const float s = swiglu_det_recip(swiglu_det_add(1.0f, e));
+  return swiglu_det_mul(swiglu_det_mul(g, s), u);
+}
+
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #define SWIGLU_DET_HAS_NEON 1

@@ -189,4 +189,18 @@ static inline HVX_Vector hvx_swiglu_det_sf(HVX_Vector g, HVX_Vector u) {
   return Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(g, s), u);
 }
 
+/** @brief gelu_tanh(g)*u for every f32 lane: swiglu_det.h's geglu_det_one,
+ *         operation for operation -- the sigmoid of
+ *         w = -2 sqrt(2/pi) (g + 0.044715 g^3) on the same exp/recip. */
+static inline HVX_Vector hvx_geglu_det_sf(HVX_Vector g, HVX_Vector u) {
+  const HVX_Vector cube = Q6_Vsf_vmpy_VsfVsf(g, Q6_Vsf_vmpy_VsfVsf(g, g));
+  const HVX_Vector inner =
+    Q6_Vsf_vadd_VsfVsf(g, Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(0.044715f), cube));
+  const HVX_Vector e =
+    hvx_exp_det_sf(Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(-1.595769121f), inner));
+  const HVX_Vector d = Q6_Vsf_vadd_VsfVsf(hvx_splat_sf(1.0f), e);
+  const HVX_Vector s = hvx_recip_det_sf(d);
+  return Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(g, s), u);
+}
+
 #endif /* __NNTRAINER_HVX_SWIGLU_DET_H__ */

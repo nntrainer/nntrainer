@@ -611,9 +611,13 @@ static void quant_row(const float *x, uint32_t k, uint8_t *q, float *scale,
   }
 }
 
+/* [plan 201 S4] 1: the reference's epilogue is geglu_det_one. */
+static int g_ref_geglu;
+
 /* The layer, one expert and one row at a time: quantize the row, gate_up,
-   SwiGLU, requantize, down, then the routing multiply and the add into the
-   token's output row -- in expert order, rows in order, like the kernel. */
+   SwiGLU (GeGLU-tanh under g_ref_geglu), requantize, down, then the routing
+   multiply and the add into the token's output row -- in expert order, rows in
+   order, like the kernel. */
 static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
                             uint32_t N_out, uint32_t NE, const W *wg,
                             const W *wd, const float *act, const uint32_t *ridx,
@@ -635,7 +639,8 @@ static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
       /* swiglu_det.h: the spec the HVX SwiGLU matches bit for bit, and
          what standin/hvx_scalar.c runs, so the two agree to the bit. */
       for (uint32_t j = 0; j < inter; ++j)
-        mid[j] = swiglu_det_one(gu[j], gu[inter + j]);
+        mid[j] = g_ref_geglu ? geglu_det_one(gu[j], gu[inter + j])
+                             : swiglu_det_one(gu[j], gu[inter + j]);
       float ms;
       int32_t mz;
       quant_row(mid, inter, mq, &ms, &mz);
@@ -1365,6 +1370,60 @@ int main(void) {
               : "MOE HMX DMA BYPASS WRONG\n");
     fail |= !ok;
     free(got_bp);
+  }
+
+  /* [plan 201 S4] HEXKL_MOE_FLAG_GEGLU on every path of the call. M=37
+     (HMX blocks plus two HVX tails) against the reference run with
+     geglu_det_one, and unlike the SwiGLU output above; then one token
+     routed to four experts on the HMX loop, the M=1 GEMV with the VTCM
+     feed and the GEMV on the arena read: the reference again, and the
+     three byte-equal. The epilogue's arithmetic is the stand-in's here;
+     the real HVX one is geglu_host_check.c's. */
+  {
+    float *gg = (float *)malloc(sizeof(float) * M * N_out);
+    float *want_g = (float *)calloc(M * N_out, sizeof(float));
+    score_reset(0, vtcm, sizeof vtcm);
+    int r = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+      ridx, rc_, rw, act, gg, NULL, &scratch, HEXKL_MOE_FLAG_GEGLU);
+    g_ref_geglu = 1;
+    reference_layer(M, K, inter, N_out, NE, wg, wd, act, ridx, rc_, rw, want_g);
+    double w37 = 0.0;
+    const uint32_t bad37 = count_mismatches(gg, want_g, M * N_out, &w37);
+    const int differs = memcmp(gg, got, sizeof(float) * M * N_out) != 0;
+
+    const uint32_t rc1[8] = {1, 1, 0, 1, 1};
+    const uint32_t ridx1[4] = {0, 0, 0, 0};
+    const float rw1[4] = {0.4f, 0.3f, 0.2f, 0.1f};
+    static const uint32_t fl1[3] = {
+      HEXKL_MOE_FLAG_GEGLU, HEXKL_MOE_FLAG_GEGLU | HEXKL_MOE_FLAG_M1_GEMV,
+      HEXKL_MOE_FLAG_GEGLU | HEXKL_MOE_FLAG_M1_GEMV |
+        HEXKL_MOE_FLAG_GEMV_FEED_SET};
+    static const uint64_t path1[3] = {0u, 1u, 1u};
+    float o1[3][64], want1[64];
+    reference_layer(1, K, inter, N_out, NE, wg, wd, act, ridx1, rc1, rw1,
+                    want1);
+    g_ref_geglu = 0;
+    int ok1 = 1;
+    for (int f = 0; f < 3; ++f) {
+      memset(hexkl_probe_us, 0, sizeof hexkl_probe_us);
+      r |= hexkl_mm_u8i4_moe_layer_run(
+        &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, 1, K, inter, N_out, NE, hg, hd,
+        ridx1, rc1, rw1, act, o1[f], NULL, &scratch, fl1[f]);
+      ok1 &= hexkl_probe_us[HEXKL_PROBE_PATH] == path1[f] &&
+             memcmp(o1[f], o1[0], sizeof o1[0]) == 0;
+    }
+    double w1 = 0.0;
+    const uint32_t bad1 = count_mismatches(o1[0], want1, N_out, &w1);
+    const int ok = r == 0 && bad37 == 0u && differs && bad1 == 0u && ok1;
+    printf("geglu M=37 bad=%u worst_rel=%g differs_from_swiglu=%d; M=1 "
+           "hmx/gemv-vtcm/gemv-arena bad=%u same_path_bytes=%d rc=%d\n",
+           bad37, w37, differs, bad1, ok1, r);
+    printf(ok ? "MOE GEGLU FLAG OK (HMX, tail, M=1 GEMV feed+arena)\n"
+              : "MOE GEGLU FLAG WRONG\n");
+    fail |= !ok;
+    free(gg);
+    free(want_g);
   }
 
   /* Split (doc 52 section 10.14): experts {0,1,2} then {3,4}, summed on
