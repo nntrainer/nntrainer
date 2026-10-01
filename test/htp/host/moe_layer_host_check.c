@@ -456,7 +456,8 @@ static void quant_row(const float *x, uint32_t k, uint8_t *q, float *scale,
 static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
                             uint32_t N_out, uint32_t NE, const W *wg,
                             const W *wd, const float *act, const uint32_t *ridx,
-                            const uint32_t *rc_, const float *rw, float *want) {
+                            const uint32_t *rc_, const float *rw, float *want,
+                            uint32_t glu) {
   uint8_t *aq = (uint8_t *)malloc(K);
   uint8_t *mq = (uint8_t *)malloc(inter);
   float *gu = (float *)malloc(sizeof(float) * 2 * inter);
@@ -474,7 +475,9 @@ static void reference_layer(uint32_t M, uint32_t K, uint32_t inter,
       /* swiglu_det.h: the spec the HVX SwiGLU matches bit for bit, and
          what standin/hvx_scalar.c runs, so the two agree to the bit. */
       for (uint32_t j = 0; j < inter; ++j)
-        mid[j] = swiglu_det_one(gu[j], gu[inter + j]);
+        mid[j] = glu == HVX_GLU_GELU_TANH
+                   ? geglu_det_one(gu[j], gu[inter + j])
+                   : swiglu_det_one(gu[j], gu[inter + j]);
       float ms;
       int32_t mz;
       quant_row(mid, inter, mq, &ms, &mz);
@@ -768,7 +771,8 @@ static int run_m1_case(const char *shape, uint32_t M, uint32_t K,
   /* And the M=1 output against the f32 reference on its own, as the
      37-row fixture is. */
   float *want = (float *)malloc(sizeof(float) * M * N_out);
-  reference_layer(M, K, inter, N_out, NE, wg, wd, act, ridx, rc_, rw, want);
+  reference_layer(M, K, inter, N_out, NE, wg, wd, act, ridx, rc_, rw, want,
+                  HVX_GLU_SILU);
   double worst = 0.0;
   const uint32_t bad = count_mismatches(out_m1, want, M * N_out, &worst);
   fail |= (bad != 0u);
@@ -965,7 +969,8 @@ int main(void) {
 
   /* reference */
   float *want = (float *)calloc(M * N_out, sizeof(float));
-  reference_layer(M, K, inter, N_out, NE, wg, wd, act, ridx, rc_, rw, want);
+  reference_layer(M, K, inter, N_out, NE, wg, wd, act, ridx, rc_, rw, want,
+                  HVX_GLU_SILU);
 
   double worst = 0.0;
   uint32_t bad = count_mismatches(got, want, M * N_out, &worst);
@@ -1059,6 +1064,50 @@ int main(void) {
               : "MOE HMX DMA BYPASS WRONG\n");
     fail |= !ok;
     free(got_bp);
+  }
+
+  /* The identity the GeGLU epilogue rests on, x sigmoid(2y) == 0.5 x (1 +
+     tanh y), on a sweep of gate values in f32 and before any quantization:
+     a wrong constant shows up here as 1e-3, not as a u8 flip. */
+  {
+    double worst_id = 0.0;
+    for (int i = -2000; i <= 2000; ++i) {
+      const float g = (float)i * 0.005f; /* [-10, 10] */
+      /* In double: f32's 1 + tanh(y) cancels to a few ulps for y < -5. */
+      const double gd = g;
+      const double ref =
+        0.5 * gd *
+        (1.0 + tanh(0.7978845608028654 * (gd + 0.044715 * gd * gd * gd)));
+      const double d =
+        fabs((double)geglu_det_one(g, 1.f) - ref) / (fabs(ref) + 1e-6);
+      if (d > worst_id)
+        worst_id = d;
+    }
+    printf("gelu identity     : worst_rel=%g (want < 1e-5)\n", worst_id);
+    fail |= (worst_id > 1e-5);
+  }
+
+  /* The same layer under the GeGLU bit (doc 55: gelu_tanh experts) against
+     the reference in swiglu_det.h's form: the epilogue is the only
+     difference, so it must match to the bit. The M=1 GEMV reaches the same
+     hvx_dequant_swiglu_acc_tiles_to_f32 with the same act. */
+  {
+    float *got_g = (float *)malloc(sizeof(float) * M * N_out);
+    float *want_g = (float *)calloc(M * N_out, sizeof(float));
+    int r = hexkl_mm_u8i4_moe_layer_run(
+      &g_tbl, vtcm, sizeof vtcm, sizeof vtcm, M, K, inter, N_out, NE, hg, hd,
+      ridx, rc_, rw, act, got_g, NULL, &scratch, HEXKL_MOE_FLAG_GELU_TANH);
+    reference_layer(M, K, inter, N_out, NE, wg, wd, act, ridx, rc_, rw, want_g,
+                    HVX_GLU_GELU_TANH);
+    double worst_g = 0.0;
+    const uint32_t bad_g = count_mismatches(got_g, want_g, M * N_out, &worst_g);
+    const int differs = memcmp(got, got_g, sizeof(float) * M * N_out) == 0;
+    printf(
+      "gelu epilogue     : rc=%d mismatches=%u worst_rel=%g same_as_silu=%d\n",
+      r, bad_g, worst_g, differs);
+    fail |= (r != 0 || bad_g != 0 || differs);
+    free(got_g);
+    free(want_g);
   }
 
   /* Split (doc 52 section 10.14): experts {0,1,2} then {3,4}, summed on

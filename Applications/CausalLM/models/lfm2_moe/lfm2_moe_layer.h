@@ -158,6 +158,9 @@ private:
    *  optional second input is what the router reads (Gemma-4 norms the
    *  residual differently for the router and for the experts). */
   bool softmax_router;
+  /** props::MoEActivation tanh_gelu (Gemma-4) rather than swish (LFM2):
+   *  the deterministic GeGLU on both the host and the DSP (doc 55). */
+  bool gelu_act;
 
   // weight indices
   std::vector<unsigned int> expert_gate_up_proj_indices;
@@ -194,6 +197,11 @@ private:
     nntrainer::Tensor *gate_up_output;
     nntrainer::Tensor *activation_output;
   };
+
+  /** @brief act(gate)*up for n elements into dst: swiglu_det or
+   *  geglu_det_one by gelu_act. */
+  void glu(unsigned int n, float *dst, const float *gate,
+           const float *up) const;
 
   /**
    * @brief Build the per-expert token assignments for LFM2 routing.

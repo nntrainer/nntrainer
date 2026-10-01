@@ -182,6 +182,22 @@ static inline float swiglu_det_one(float g, float u) {
   return swiglu_det_mul(swiglu_det_mul(g, s), u);
 }
 
+/** @brief gelu_tanh(g)*u = (g * sigmoid(g (C0 + C1 g^2))) * u, one element:
+ *         hvx_swiglu_det.h's hvx_geglu_det_sf, operation for operation.
+ *         ponytail: scalar only; the NEON twin comes when a CPU model runs
+ *         GeGLU experts for speed rather than as a reference. */
+#define GEGLU_DET_C0 1.5957691216f
+#define GEGLU_DET_C1 0.0713548163f
+static inline float geglu_det_one(float g, float u) {
+  const float g2 = swiglu_det_mul(g, g);
+  const float poly =
+    swiglu_det_add(GEGLU_DET_C0, swiglu_det_mul(GEGLU_DET_C1, g2));
+  const float t = swiglu_det_mul(g, poly);
+  const float e = swiglu_det_exp(swiglu_det_sub(0.0f, t));
+  const float s = swiglu_det_recip(swiglu_det_add(1.0f, e));
+  return swiglu_det_mul(swiglu_det_mul(g, s), u);
+}
+
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #define SWIGLU_DET_HAS_NEON 1

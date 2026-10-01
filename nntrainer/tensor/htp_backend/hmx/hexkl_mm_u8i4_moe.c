@@ -435,7 +435,7 @@ typedef struct {
   const int32_t *act_zp;
   float *res; /**< this tail's m x N_out, read by its expert's scatter */
   uint32_t m, k_tiles, inter, inter_ktiles, inter_ntiles, gu_ntiles, dn_ntiles,
-    N_out;
+    N_out, act;
 } moe_tail_ctx;
 
 /** @brief Worker time spent inside this kernel's pool jobs -- the gate_up
@@ -476,7 +476,8 @@ static void moe_tail_pair_unit(uint32_t n_units, uint32_t j, void *v) {
   hvx_dequant_swiglu_acc_tiles_to_f32(
     (const uint8_t *)tiles, MOE_TAIL_TILE_BYTES, 1u, j,
     HEXKL_HMX_INT8_BLOCK_N_COL, t->m, t->act_scale, t->act_zp, t->g->colsum_w,
-    t->g->w_scale, t->g->bias, t->inter, t->sh->gate_f32, t->inter, NULL);
+    t->g->w_scale, t->g->bias, t->inter, t->act, t->sh->gate_f32, t->inter,
+    NULL);
   moe_worker_probe_add(t0);
 }
 
@@ -629,6 +630,7 @@ typedef struct {
       expert's units per run when it is on, so each slab reuse follows a
       join. Unit numbering stays global (expert = u / per). */
   uint32_t u_lo, u_hi;
+  uint32_t act; /**< HVX_GLU_SILU or HVX_GLU_GELU_TANH */
 } moe_m1_ctx;
 
 /** @brief Lane @a i's contiguous share [lo, hi) of the units [u_lo, u_hi). */
@@ -718,8 +720,8 @@ static void moe_m1_pair_worker(uint32_t n_lanes, uint32_t i, void *v) {
       hvx_dequant_swiglu_acc_tiles_to_f32(
         (const uint8_t *)tiles, MOE_M1_TILE_BYTES, 1u, j,
         HEXKL_HMX_INT8_BLOCK_N_COL, e->m, e->act_scale, e->act_zp,
-        e->g->colsum_w, e->g->w_scale, e->g->bias, c->inter, e->gate_f32,
-        c->inter, NULL);
+        e->g->colsum_w, e->g->w_scale, e->g->bias, c->inter, c->act,
+        e->gate_f32, c->inter, NULL);
     }
   }
   moe_worker_probe_add(t0);
@@ -1048,6 +1050,8 @@ int hexkl_mm_u8i4_moe_layer_run(
       n_experts == 0u) {
     return AEE_EBADPARM;
   }
+  const uint32_t act =
+    (flags & HEXKL_MOE_FLAG_GELU_TANH) != 0u ? HVX_GLU_GELU_TANH : HVX_GLU_SILU;
 
   g_moe_src_bypass = (flags & HEXKL_MOE_FLAG_DMA_BYPASS) != 0u;
   const uint32_t arena = vtcm_size < config_off ? vtcm_size : config_off;
@@ -1421,6 +1425,7 @@ int hexkl_mm_u8i4_moe_layer_run(
     m1.lead_kb = m1_feed ? 0u : hexkl_moe_flags_lead_kb(flags);
     m1.rows1 = hexkl_moe_flags_rows1(flags);
     m1.feed = m1_feed ? 1u : 0u;
+    m1.act = act;
     HEXKL_PROBE_COUNT(HEXKL_PROBE_M1_FEED, m1_feed ? 1u : 0u);
 
     /* MM is the wall of the two GEMV stages on the caller; SWIGLU their
@@ -1561,6 +1566,7 @@ int hexkl_mm_u8i4_moe_layer_run(
     tc->gu_ntiles = gu_ntiles;
     tc->dn_ntiles = dn_ntiles;
     tc->N_out = N_out;
+    tc->act = act;
     hvx_bg_job *jb = &jobs[1u + 3u * t];
     uint8_t *dn = tail_done + (size_t)t * (inter_ntiles + 1u + dn_ntiles);
     jb[0].func = moe_tail_pair_unit;
@@ -1755,6 +1761,7 @@ int hexkl_mm_u8i4_moe_layer_run(
           jb->inter = inter;
           jb->dst = gate;
           jb->dst_stride = inter;
+          jb->act = act;
           hvx_worker_pool_submit(pool, moe_gu_worker, jb, np);
         }
         ++sb;

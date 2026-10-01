@@ -259,6 +259,7 @@ Lfm2MoELayer::Lfm2MoELayer() :
             nntrainer::props::Unit(), props::MoEActivation(),
             props::RouterType(), props::CacheExperts()),
   softmax_router(false),
+  gelu_act(false),
   expert_gate_up_proj_indices({}),
   expert_down_proj_indices({}),
   gate_idx(std::numeric_limits<unsigned>::max()),
@@ -341,6 +342,20 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
     throw std::runtime_error(
       "Unsupported activation data type for LFM2 MoE layer");
   }
+  // The expert FFN is gate_up -> act(gate)*up -> down with the deterministic
+  // kernels (swiglu_det.h here, hvx_swiglu_det.h on the DSP), not acti_func:
+  // silu for LFM2, gelu_tanh for Gemma-4 (doc 55), nothing else.
+  switch (std::get<props::MoEActivation>(moe_props).get()) {
+  case nntrainer::ActivationType::ACT_SWISH:
+    gelu_act = false;
+    break;
+  case nntrainer::ActivationType::ACT_TANH_GELU:
+    gelu_act = true;
+    break;
+  default:
+    throw std::runtime_error(
+      "MoE layer moe_activation must be swish or tanh_gelu");
+  }
 
   // 4. Initialize gate layer (router). Always kept FP32.
   nntrainer::TensorDim gate_dim(
@@ -418,6 +433,16 @@ void Lfm2MoELayer::finalize(nntrainer::InitLayerContext &context) {
     {1, 1, 1, intermediate_size}, "decode_activation_output",
     nntrainer::Initializer::NONE, false,
     nntrainer::TensorLifespan::FORWARD_FUNC_LIFESPAN);
+}
+
+void Lfm2MoELayer::glu(unsigned int n, float *dst, const float *gate,
+                       const float *up) const {
+  if (!gelu_act) {
+    swiglu_det(n, dst, gate, up);
+    return;
+  }
+  for (unsigned int j = 0; j < n; ++j)
+    dst[j] = geglu_det_one(gate[j], up[j]);
 }
 
 void Lfm2MoELayer::buildExpertAssignments(
@@ -721,7 +746,7 @@ static bool tryMoeLayerOnAccelerator(
   const std::vector<unsigned int> &down_indices, unsigned int total_tokens,
   unsigned int hidden_size, unsigned int intermediate_size,
   bool experts_virtual, const std::vector<int> *extra_top_k,
-  int expert_layer_slot) {
+  int expert_layer_slot, bool gelu) {
 
   auto *ops = input.getOps();
   if (ops == nullptr || !ops->supports_gemm_qs4cx_moe_layer_fp32()) {
@@ -874,7 +899,7 @@ static bool tryMoeLayerOnAccelerator(
     ops->gemm_qs4cx_moe_layer_fp32(
       call_gu, call_gus, call_dn, call_dns, row_index, row_count, row_weight,
       input.getData<float>(), dst, total_tokens, hidden_size, intermediate_size,
-      hidden_size, weights_wh);
+      hidden_size, weights_wh, gelu);
   };
 
   // [doc 52 section 10.14] A layer call needs all of its routed experts
@@ -1121,7 +1146,7 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
   // are measured at the same boundary and the CPU-vs-HTP subtraction is
   // between like and like.
   M0Timer m0_ffn(&g_m0.ffn);
-  if (kFusedSwigluEnabled && num_tokens > 1 &&
+  if (kFusedSwigluEnabled && num_tokens > 1 && !gelu_act &&
       gate_up_proj.getDataType() == nntrainer::Tdatatype::QS4CX &&
       down_proj.getDataType() == nntrainer::Tdatatype::QS4CX) {
     auto *ops = token_input.getOps();
@@ -1144,18 +1169,17 @@ inline void Lfm2MoELayer::compute_expert_forward_no_critical(
     token_input.dot(gate_up_proj, gate_up_out);
 
     if (num_tokens == 1) {
-      swiglu_det(acti_out.width(), acti_out.getData<float>(),
-                 gate_up_out.getData<float>(),
-                 gate_up_out.getData<float>() + intermediate_size);
+      glu(acti_out.width(), acti_out.getData<float>(),
+          gate_up_out.getData<float>(),
+          gate_up_out.getData<float>() + intermediate_size);
     } else {
       auto &tm = nntrainer::ThreadManager::Global();
       tm.parallel_for(0, static_cast<size_t>(num_tokens), [&](size_t i) {
         const unsigned int offset = acti_out.getIndex(0, 0, i, 0);
         const unsigned int gate_up_offset = gate_up_out.getIndex(0, 0, i, 0);
-        swiglu_det(acti_out.width(), acti_out.getData<float>() + offset,
-                   gate_up_out.getData<float>() + gate_up_offset,
-                   gate_up_out.getData<float>() + gate_up_offset +
-                     intermediate_size);
+        glu(acti_out.width(), acti_out.getData<float>() + offset,
+            gate_up_out.getData<float>() + gate_up_offset,
+            gate_up_out.getData<float>() + gate_up_offset + intermediate_size);
       });
     }
 
@@ -1309,7 +1333,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         input, output, expert_assignments, context, expert_gate_up_proj_indices,
         expert_down_proj_indices, total_tokens, hidden_size,
         std::get<nntrainer::props::Unit>(moe_props).get(), experts_virtual,
-        &extra_top_k, expert_layer_slot);
+        &extra_top_k, expert_layer_slot, gelu_act);
     }
 
     // The ARM path's own preparation, after the accelerator has had its
@@ -1462,9 +1486,9 @@ void Lfm2MoELayer::computeGroupedDecodeExperts(
     nntrainer::Tensor acti_out =
       workspace.activation_output->getSharedDataTensor(intermediate_dim, 0,
                                                        true);
-    swiglu_det(acti_out.width(), acti_out.getData<float>(),
-               gate_up_views[i].getData<float>(),
-               gate_up_views[i].getData<float>() + intermediate_size);
+    glu(acti_out.width(), acti_out.getData<float>(),
+        gate_up_views[i].getData<float>(),
+        gate_up_views[i].getData<float>() + intermediate_size);
 
     nntrainer::Tensor expert_output =
       workspace.expert_output->getSharedDataTensor(token_step_dim, 0, true);

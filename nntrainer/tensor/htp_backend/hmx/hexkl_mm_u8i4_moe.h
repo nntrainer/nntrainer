@@ -213,6 +213,8 @@ void hexkl_moe_pack_bg_worker(uint32_t n_units, uint32_t u, void *vctx);
  * @param[in] row_weight  [n_rows] routing weight for each entry
  * @param[in] act_f32     [M x K]
  * @param[out] out_f32    [M x N_out]
+ * @param[in] act         HVX_GLU_SILU or HVX_GLU_GELU_TANH: the gated
+ *                        activation between gate_up and down
  * @param[in,out] scratch session-lifetime heap scratch; grown here as needed
  * @param[in] flags       HEXKL_MOE_FLAG_* bits; 0 is the HMX block loop
  * @return AEE_SUCCESS, or the first failing stage's code
@@ -350,6 +352,14 @@ int hexkl_mm_u8i4_moe_layer_run(
  */
 #define HEXKL_MOE_FLAG_DMA_BYPASS 0x40000u
 
+/** @brief Bit 19 of the flags word: the gate/up epilogue is
+ *         gelu_tanh(g)*u (HVX_GLU_GELU_TANH) instead of silu(g)*u, on the
+ *         HMX block loop, the HVX tail and the M=1 GEMV alike (they share
+ *         hvx_dequant_swiglu_acc_tiles_to_f32). Per call: the skel sets it
+ *         from the IDL's act argument on top of the session's moe_set_opts
+ *         word, so one session serves both kinds of expert. */
+#define HEXKL_MOE_FLAG_GELU_TANH 0x80000u
+
 /** @brief Every bit this build understands; moe_set_opts keeps these and
  *         drops the rest, which is what makes the echo a version check. */
 #define HEXKL_MOE_FLAGS_KNOWN                                                  \
@@ -357,7 +367,7 @@ int hexkl_mm_u8i4_moe_layer_run(
    HEXKL_MOE_FLAG_GEMV_ROWS1_SET | HEXKL_MOE_FLAG_GEMV_FEED_SET |              \
    ((uint32_t)HEXKL_MOE_GEMV_LEAD_BITS << HEXKL_MOE_GEMV_LEAD_SHIFT) |         \
    HEXKL_MOE_FLAG_GEMV_ROWS1 | HEXKL_MOE_FLAG_GEMV_FEED |                      \
-   HEXKL_MOE_FLAG_DMA_BYPASS)
+   HEXKL_MOE_FLAG_DMA_BYPASS | HEXKL_MOE_FLAG_GELU_TANH)
 
 /** @brief The call's l2fetch lead in KB: the flags word when the lead bit
  *         is set, else the build's default. */

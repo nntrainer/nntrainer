@@ -160,7 +160,14 @@ typedef struct {
   uint32_t inter;
   float *dst;
   uint32_t dst_stride;
+  uint32_t act; /**< HVX_GLU_SILU or HVX_GLU_GELU_TANH */
 } hvx_dq_swiglu_job;
+
+/** @brief The gated activation the gate/up epilogue applies: silu(g)*u
+ *         (LFM2) or gelu_tanh(g)*u (Gemma-4). The same code is the one
+ *         value the layer call carries (nntr_hvx.idl mm_u8i4_moe_layer act). */
+#define HVX_GLU_SILU 0u
+#define HVX_GLU_GELU_TANH 1u
 
 /** @brief hvx_worker_pool_func over an hvx_dq_swiglu_job. */
 void hvx_dq_swiglu_worker(uint32_t n_threads, uint32_t i, void *job);
@@ -226,7 +233,7 @@ void hvx_dequant_swiglu_acc_tiles_to_f32(
   const uint8_t *tiles_base, uint32_t tile_stride, uint32_t n_pairs,
   uint32_t g0, uint32_t row_stride, uint32_t m_count, const float *act_scale,
   const int32_t *act_zp, const int32_t *colsum_w, const float *w_scale,
-  const float *bias, uint32_t inter, float *dst, uint32_t dst_stride,
-  hvx_worker_pool *pool);
+  const float *bias, uint32_t inter, uint32_t act, float *dst,
+  uint32_t dst_stride, hvx_worker_pool *pool);
 
 #endif /* __NNTRAINER_HVX_DEQUANT_I32_H__ */
