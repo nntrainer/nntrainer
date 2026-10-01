@@ -80,15 +80,6 @@ enum {
 #define HTP_GRAPH_KIND_BIT(k) (1u << (k))
 /** @brief Every kind: the one-session all-resident mask (#132 Part B E1). */
 #define HTP_GRAPH_KINDS_ALL ((1u << HTP_OP_KIND_N) - 1u)
-/** @brief #132 Part B's two sessions get the same description with
- *  complementary masks: S1 (the MoE session: the arena, HMX, the M=1
- *  feed's VTCM) the router and the experts, S2 everything else. Each
- *  mask validates on its own (ROUTER_TOPK's MOE is in S1, every RMSNORM
- *  with the ADDs in S2), and the stretch rule cuts the list at the hops:
- *  S2 runs [0, r1), S1 [r1, r1 + 2), S2 [r1 + 2, r2), ... */
-#define HTP_GRAPH_KINDS_S1                                                     \
-  (HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK) | HTP_GRAPH_KIND_BIT(HTP_OP_MOE))
-#define HTP_GRAPH_KINDS_S2 (HTP_GRAPH_KINDS_ALL & ~HTP_GRAPH_KINDS_S1)
 /** @brief The kinds whose weights are Q4M1 handles (#132 Part B): the
  *  CPU-exact Q4_0 FC and its two compositions. */
 #define HTP_GRAPH_KINDS_Q4M1                                                   \
@@ -570,18 +561,6 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
   if (n_ops_out != NULL)
     *n_ops_out = n_ops;
   return 0u;
-}
-
-/** @brief Sets every op's resident bit to whether @a mask names its kind:
- *  how one description becomes a session's (#132 Part B: the same list,
- *  HTP_GRAPH_KINDS_S1 for the MoE session, HTP_GRAPH_KINDS_S2 for the
- *  other). The caller validates the result. */
-static inline void htp_graph_set_resident(uint32_t *w, uint32_t mask) {
-  uint32_t i;
-  for (i = 0; i < w[3]; ++i) {
-    htp_graph_op *op = htp_graph_op_at(w, i);
-    op->resident = (mask & HTP_GRAPH_KIND_BIT(op->kind)) != 0u;
-  }
 }
 
 /** @brief The LFM2 decode step's shape, from config.json / nntr_config.json. */
