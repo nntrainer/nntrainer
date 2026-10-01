@@ -23,6 +23,10 @@
 #include <cstring>
 #include <htp_decode_hook.h>
 #include <deque>
+#include <htp_wh_layout.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <expert_lru.h>
 #include <iostream>
 #include <lfm2_moe_layer.h>
@@ -726,6 +730,203 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
 }
 
 /**
+ * @brief NNTR_MOE_DIFF=<rows>: for the first @a rows tokens of every MoE
+ *        layer call, recompute the layer on the CPU from the model file's
+ *        own bytes and report the SNR of the accelerator's output against
+ *        it, with the layer's INPUT statistics beside it.
+ *
+ * The two numbers answer different halves of one question, which is why
+ * they are printed together and why this is one instrument rather than two
+ * runs (doc 56 section 6.1):
+ *
+ *   input mean/std/max already wild -> whatever is wrong is UPSTREAM of
+ *                                      this layer (attention, embedding,
+ *                                      the norms), and the MoE SNR is
+ *                                      measuring agreement on garbage;
+ *   input sane, SNR low             -> the MoE call itself, on these
+ *                                      weights and this activation.
+ *
+ * Expect 30-45 dB when the kernel is right: the reference is pure f32 and
+ * the kernel requantizes its activations to u8, so they do not agree
+ * further than that. Near 0 dB or negative is a different computation, not
+ * a quantization gap.
+ *
+ * 0 means every row. The cost is a full f32 MoE layer on the application
+ * processor -- hidden * 2 * inter + inter * hidden MACs per routed token --
+ * so the default of 8 rows keeps a prefill layer at seconds; every row is
+ * minutes and is what NNTR_MOE_SHADOW needs.
+ *
+ * ponytail: virtual experts only (the layer's weights live in the file, not
+ * in memory, which is what this reads). A resident-expert model has
+ * NNTR_L2_DIFF on the same question one level down. The upgrade path, if a
+ * resident model ever needs this one, is to read the tensors instead of the
+ * file when getFd() is -1.
+ */
+static int moeDiffRows() {
+  static const int rows = [] {
+    const char *v = std::getenv("NNTR_MOE_DIFF");
+    return v != nullptr ? std::max(0, std::atoi(v)) : -1;
+  }();
+  return rows;
+}
+
+/** @brief NNTR_MOE_SHADOW=1: compute the same reference for EVERY row and
+ *  hand the model those values instead of the accelerator's. Text that
+ *  comes back says the MoE values are the fault; text that stays broken
+ *  says they are not, which no SNR number can decide. Implies the diff. */
+static bool moeShadowEnabled() {
+  static const bool on = std::getenv("NNTR_MOE_SHADOW") != nullptr;
+  return on;
+}
+
+#ifndef _WIN32
+/** @brief pread until @a len bytes are in, or false. */
+static bool moeReadAt(int fd, void *dst, size_t len, uint64_t off) {
+  auto *p = static_cast<uint8_t *>(dst);
+  while (len != 0) {
+    const ssize_t got = ::pread(fd, p, len, static_cast<off_t>(off));
+    if (got <= 0)
+      return false;
+    p += got;
+    off += static_cast<uint64_t>(got);
+    len -= static_cast<size_t>(got);
+  }
+  return true;
+}
+
+/**
+ * @brief One QS4CX_WH weight from the model file, dequantized to f32
+ *        row-major [K][N].
+ *
+ * The file holds whBytes(K, N) nibbles, then N f32 scales, then N f32
+ * column sums (the kernel's zero-point term, not needed here). A nibble is
+ * the value plus 8, unsigned, where whSlot puts it.
+ */
+static bool moeReadExpertWeight(int fd, uint64_t off, uint32_t K, uint32_t N,
+                                std::vector<float> &out) {
+  const size_t nibbles = nntrainer::whBytes(K, N);
+  std::vector<uint8_t> packed(nibbles);
+  std::vector<float> scale(N);
+  if (!moeReadAt(fd, packed.data(), nibbles, off) ||
+      !moeReadAt(fd, scale.data(), N * sizeof(float), off + nibbles)) {
+    return false;
+  }
+  std::vector<int8_t> q(static_cast<size_t>(K) * N);
+  nntrainer::whUnpack(packed.data(), K, N, q.data());
+  out.resize(q.size());
+  auto &tm = nntrainer::ThreadManager::Global();
+  tm.parallel_for(0, K, [&](size_t k) {
+    const size_t row = k * N;
+    for (uint32_t n = 0; n < N; ++n)
+      out[row + n] = static_cast<float>(q[row + n]) * scale[n];
+  });
+  return true;
+}
+
+/** @brief The layer, in f32, from the file. See moeDiffRows(). */
+static void moeDiff(const nntrainer::Tensor &input, nntrainer::Tensor &output,
+                    const std::vector<std::vector<std::pair<unsigned, float>>>
+                      &expert_assignments,
+                    nntrainer::RunLayerContext &context,
+                    const std::vector<unsigned int> &gate_up_indices,
+                    const std::vector<unsigned int> &down_indices,
+                    unsigned int total_tokens, unsigned int hidden_size,
+                    unsigned int intermediate_size, bool gelu,
+                    unsigned int trace_layer) {
+  const bool shadow = moeShadowEnabled();
+  const int want = moeDiffRows();
+  const unsigned int rows =
+    (shadow || want == 0)
+      ? total_tokens
+      : std::min<unsigned int>(total_tokens, want < 0 ? 8u : (unsigned)want);
+
+  const float *in = input.getData<float>();
+  const size_t in_n = static_cast<size_t>(total_tokens) * hidden_size;
+  double sum = 0.0, sum2 = 0.0;
+  float in_max = 0.0f;
+  for (size_t i = 0; i < in_n; ++i) {
+    sum += in[i];
+    sum2 += static_cast<double>(in[i]) * in[i];
+    in_max = std::max(in_max, std::fabs(in[i]));
+  }
+  const double in_mean = sum / in_n;
+  const double in_std =
+    std::sqrt(std::max(0.0, sum2 / in_n - in_mean * in_mean));
+
+  std::vector<float> ref(in_n, 0.0f);
+  std::vector<float> w_gu, w_dn, mid(intermediate_size);
+  auto &tm = nntrainer::ThreadManager::Global();
+  unsigned int experts_seen = 0;
+  for (size_t e = 0; e < expert_assignments.size(); ++e) {
+    const auto &rows_of_e = expert_assignments[e];
+    if (std::none_of(rows_of_e.begin(), rows_of_e.end(),
+                     [&](const std::pair<unsigned, float> &p) {
+                       return p.first < rows;
+                     })) {
+      continue;
+    }
+    const ExpertFileDesc d = expertDesc(context.getWeight(gate_up_indices[e]),
+                                        context.getWeight(down_indices[e]));
+    if (d.fd < 0) {
+      std::fprintf(stderr,
+                   "[MOE-DIFF] layer=%u expert=%zu has no file fd; "
+                   "NNTR_MOE_DIFF needs virtual experts\n",
+                   trace_layer, e);
+      return;
+    }
+    if (!moeReadExpertWeight(d.fd, d.off_gu, d.K, 2u * intermediate_size,
+                             w_gu) ||
+        !moeReadExpertWeight(d.fd, d.off_dn, intermediate_size, d.N_out,
+                             w_dn)) {
+      std::fprintf(stderr, "[MOE-DIFF] layer=%u expert=%zu: read failed\n",
+                   trace_layer, e);
+      return;
+    }
+    ++experts_seen;
+    for (const auto &pair : rows_of_e) {
+      if (pair.first >= rows)
+        continue;
+      const float *x = in + static_cast<size_t>(pair.first) * hidden_size;
+      tm.parallel_for(0, intermediate_size, [&](size_t j) {
+        float g = 0.0f, u = 0.0f;
+        for (unsigned int k = 0; k < hidden_size; ++k) {
+          const size_t row = static_cast<size_t>(k) * 2u * intermediate_size;
+          g += x[k] * w_gu[row + j];
+          u += x[k] * w_gu[row + intermediate_size + j];
+        }
+        mid[j] = gelu ? geglu_det_one(g, u) : swiglu_det_one(g, u);
+      });
+      float *dst = ref.data() + static_cast<size_t>(pair.first) * hidden_size;
+      tm.parallel_for(0, hidden_size, [&](size_t n) {
+        float acc = 0.0f;
+        for (unsigned int j = 0; j < intermediate_size; ++j)
+          acc += mid[j] * w_dn[static_cast<size_t>(j) * hidden_size + n];
+        dst[n] += pair.second * acc;
+      });
+    }
+  }
+
+  float *got = output.getData<float>();
+  double signal = 0.0, noise = 0.0, max_ref = 0.0, max_got = 0.0;
+  for (size_t i = 0; i < static_cast<size_t>(rows) * hidden_size; ++i) {
+    const double r = ref[i], diff = static_cast<double>(got[i]) - r;
+    signal += r * r;
+    noise += diff * diff;
+    max_ref = std::max(max_ref, std::fabs(r));
+    max_got = std::max(max_got, std::fabs(static_cast<double>(got[i])));
+  }
+  std::fprintf(stderr,
+               "[MOE-DIFF] layer=%u M=%u rows=%u experts=%u snr=%.1fdB "
+               "max_abs_ref=%g max_abs_got=%g in_mean=%g in_std=%g in_max=%g\n",
+               trace_layer, total_tokens, rows, experts_seen,
+               noise == 0.0 ? 999.0 : 10.0 * std::log10(signal / noise),
+               max_ref, max_got, in_mean, in_std, static_cast<double>(in_max));
+  if (shadow)
+    std::memcpy(got, ref.data(), ref.size() * sizeof(float));
+}
+#endif
+
+/**
  * @brief [doc 46] The whole MoE FFN layer in one accelerator call.
  *
  * Flattens the per-expert assignment lists into the three arrays the call
@@ -746,7 +947,7 @@ static bool tryMoeLayerOnAccelerator(
   const std::vector<unsigned int> &down_indices, unsigned int total_tokens,
   unsigned int hidden_size, unsigned int intermediate_size,
   bool experts_virtual, const std::vector<int> *extra_top_k,
-  int expert_layer_slot, bool gelu) {
+  int expert_layer_slot, bool gelu, unsigned int trace_layer) {
 
   auto *ops = input.getOps();
   if (ops == nullptr || !ops->supports_gemm_qs4cx_moe_layer_fp32()) {
@@ -1009,6 +1210,16 @@ static bool tryMoeLayerOnAccelerator(
 
     call(output.getData<float>());
   }
+
+#ifndef _WIN32
+  // After the whole layer, split calls included: the reference is of the
+  // layer, not of one call.
+  if (experts_virtual && (moeDiffRows() >= 0 || moeShadowEnabled())) {
+    moeDiff(input, output, expert_assignments, context, gate_up_indices,
+            down_indices, total_tokens, hidden_size, intermediate_size, gelu,
+            trace_layer);
+  }
+#endif
 
   // Recency from the routing's extended top-k, token by token, so the
   // last token's likely-next experts end up most recent -- the rule
@@ -1333,7 +1544,7 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
         input, output, expert_assignments, context, expert_gate_up_proj_indices,
         expert_down_proj_indices, total_tokens, hidden_size,
         std::get<nntrainer::props::Unit>(moe_props).get(), experts_virtual,
-        &extra_top_k, expert_layer_slot, gelu_act);
+        &extra_top_k, expert_layer_slot, gelu_act, trace_layer);
     }
 
     // The ARM path's own preparation, after the accelerator has had its
