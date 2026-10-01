@@ -247,6 +247,29 @@ static void mut_attn_head_dim_32(uint32_t *w, uint32_t *n) {
   op->gqa = 4u;
   (void)n;
 }
+/* [plan 201 S4] head_dim 128 is a kernel shape now (K = 3072 = (4 + 2) x 4
+   x 128, N = 2048 = 4 x 4 x 128), but 1/sqrt(128) is not an fp16 value:
+   without a scale in eps_bits it is refused; and a scale that is not one */
+static void mut_attn_hd128_no_scale(uint32_t *w, uint32_t *n) {
+  htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_ATTN_M1, 2));
+  op->head_dim = 128u;
+  op->n_kv = 4u;
+  op->gqa = 4u;
+  op = htp_graph_op_at(w, nth_op(w, HTP_OP_ROPE, 2));
+  op->head_dim = 128u;
+  op->n_kv = 4u;
+  op->gqa = 4u;
+  op = htp_graph_op_at(w, nth_op(w, HTP_OP_QK_NORM, 2));
+  op->head_dim = 128u;
+  op->n_kv = 4u;
+  op->gqa = 4u;
+  (void)n;
+}
+static void mut_attn_scale_not_fp16(uint32_t *w, uint32_t *n) {
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ATTN_M1, 2))->eps_bits =
+    0x3DCCCCCDu; /* 0.1f */
+  (void)n;
+}
 static void mut_qk_norm_head_dim_96(uint32_t *w, uint32_t *n) {
   /* K = 3072 = (2 + 2) x 8 x 96: consistent, and the per-head norm's
      chunk would not be a power of two */
@@ -339,6 +362,10 @@ static const struct {
   {"ATTN_M1 resident, its ROPE not", mut_attn_without_rope,
    HTP_GRAPH_E_NOTALLOWED},
   {"QK_NORM resident at head_dim 96", mut_qk_norm_head_dim_96,
+   HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+  {"ATTN_M1 resident at head_dim 128, no scale", mut_attn_hd128_no_scale,
+   HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+  {"ATTN_M1 scale 0.1 (not fp16)", mut_attn_scale_not_fp16,
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
   {"RMSNORM resident at K 2072", mut_rmsnorm_k_not_32,
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
@@ -1741,6 +1768,10 @@ static void check_q4m1(void) {
    layers, sliding / full / sliding, at a max_seq of two 64-position tiles. */
 #define G4_HID 2816u
 #define G4_SEQ 128u
+/** @brief The sliding layers' window here: Gemma's 1024 does not fit
+ *  G4_SEQ, 48 crosses the first tile boundary mid-tile (attn_m1_host_check
+ *  runs 1024 itself). */
+#define G4_WIN 48u
 static const struct {
   uint32_t n_kv, gqa, hd;
 } kG4[3] = {{8u, 2u, 256u}, {2u, 8u, 512u}, {8u, 2u, 256u}};
@@ -1789,6 +1820,10 @@ static uint32_t g4_list(uint32_t *w, uint32_t attn) {
     g4_op(w, i++, HTP_OP_QK_NORM, l, 0u, K, K);
     g4_op(w, i++, HTP_OP_ROPE, l, 1u, K, K);
     g4_op(w, i++, HTP_OP_ATTN_M1, l, attn, K, q);
+    /* scale 1.0 (Gemma4TextAttention's scaling), the window on sliding
+       layers only */
+    htp_graph_op_at(w, i - 1u)->eps_bits = 0x3F800000u;
+    htp_graph_op_at(w, i - 1u)->top_k = l == 1u ? 0u : G4_WIN;
   }
   g4_op(w, i++, HTP_OP_RMSNORM, 3u, 0u, G4_HID, G4_HID);
   g4_op(w, i++, HTP_OP_LM_HEAD, 3u, 0u, G4_HID, 256u);
@@ -1895,6 +1930,99 @@ static void check_gemma_rope(void) {
            "positions each, vs m1_rope_det\n");
 }
 
+/* [plan 201 S4] [ROPE ATTN_M1] resident on the three Gemma layers, a
+   sliding cache (8 x 256, two layers) and a full one (2 x 512) in the env:
+   (1) the ordinals count within each shape's cache; (2) a shape with no
+   cache -> EBADSTATE; (3) a chain of 100 tokens through every layer, each
+   output bit-identical to m1_rope_det -> attn_m1_det_forward_win with the
+   op's window (48 on the sliding layers) and scale 1.0. */
+static void check_gemma_attn(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  static float cs_s[G4_SEQ * 256u], cs_f[G4_SEQ * 512u];
+  static float in[10240u], out[8192u], ref[8192u], qk[10240u], e[G4_SEQ];
+  static float kt[3][8u * 256u * G4_SEQ], vv[3][8u * 256u * G4_SEQ];
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  uint32_t n, rc, resume, seed = 4296u, l, i, p;
+  int err = 0, cerr = 0;
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  n = g4_list(w, 1u);
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
+  CHECK(rc == 0u && g != NULL, "gemma attn init: %s", htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  CHECK(g->ordinal[2] == 0u && g->ordinal[5] == 0u && g->ordinal[8] == 1u,
+        "gemma ordinals %u %u %u", g->ordinal[2], g->ordinal[5], g->ordinal[8]);
+  g4_table(cs_s, 256u, 1e4, 1.0);
+  g4_table(cs_f, 512u, 1e6, 0.25);
+  rc = (uint32_t)hexkl_graph_set_param(g, 1u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
+                                       G4_SEQ * 256u);
+  rc |= (uint32_t)hexkl_graph_set_param(g, 4u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_f,
+                                        G4_SEQ * 512u);
+  rc |= (uint32_t)hexkl_graph_set_param(g, 7u, HTP_GRAPH_PARAM_ROPE_TABLE, cs_s,
+                                        G4_SEQ * 256u);
+  CHECK(rc == 0u, "gemma attn tables: %s", htp_graph_err_name(rc));
+  env.attn_m1 = hvx_attn_m1_create(2u, 8u, 2u, 256u, G4_SEQ, NULL, &cerr);
+  CHECK(env.attn_m1 != NULL, "sliding cache: %d", cerr);
+  fill(in, 10240u, &seed);
+  rc = (uint32_t)hexkl_graph_forward(g, &env, 4u, 1000u, 0u, NULL, in, 10240u,
+                                     out, 8192u, &resume);
+  CHECK(rc == (uint32_t)AEE_EBADSTATE, "full layer with no hd512 cache: %s",
+        htp_graph_err_name(rc));
+  printf("  ATTN_M1 hd512 with only an hd256 cache    -> %s (0x%x)\n",
+         htp_graph_err_name(rc), rc);
+  env.attn_m1_b = hvx_attn_m1_create(1u, 2u, 8u, 512u, G4_SEQ, NULL, &cerr);
+  CHECK(env.attn_m1_b != NULL, "full cache: %d", cerr);
+  if (env.attn_m1 == NULL || env.attn_m1_b == NULL) {
+    err = 1;
+    p = 100u;
+  } else {
+    p = 0u;
+  }
+  memset(kt, 0, sizeof(kt));
+  memset(vv, 0, sizeof(vv));
+  for (; p < 100u; ++p) {
+    for (l = 0; l < 3u; ++l) {
+      const uint32_t hd = kG4[l].hd, nk = kG4[l].n_kv, nq = kG4[l].gqa * nk;
+      const uint32_t K = (nq + 2u * nk) * hd, win = l == 1u ? 0u : G4_WIN;
+      const float *cs = (l == 1u ? cs_f : cs_s) + (size_t)p * hd;
+      fill(in, K, &seed);
+      rc = (uint32_t)hexkl_graph_forward(g, &env, 3u * l + 1u, 1000u, p, NULL,
+                                         in, K, out, nq * hd, &resume);
+      if (rc != 0u || resume != 3u * l + 3u) {
+        CHECK(0, "gemma attn l%u pos %u: %s resume %u", l, p,
+              htp_graph_err_name(rc), resume);
+        err = 1;
+        continue;
+      }
+      /* the spec: RoPE on q then k heads, append k | v, attend */
+      memcpy(qk, in, K * sizeof(float));
+      for (i = 0; i < nq + nk; ++i)
+        m1_rope_det(qk + i * hd, hd, cs);
+      for (i = 0; i < nk; ++i)
+        attn_m1_det_append(kt[l] + (size_t)i * hd * G4_SEQ,
+                           vv[l] + (size_t)i * G4_SEQ * hd, hd, G4_SEQ, p,
+                           qk + (nq + i) * hd, in + (nq + nk + i) * hd);
+      attn_m1_det_forward_win(qk, kt[l], vv[l], nk, nq / nk, hd, G4_SEQ, p + 1u,
+                              win, 1.0f, e, ref, NULL);
+      if (memcmp(out, ref, nq * hd * sizeof(float)) != 0) {
+        CHECK(0, "gemma attn l%u (hd %u) pos %u differs", l, hd, p);
+        err = 1;
+      }
+    }
+  }
+  hvx_attn_m1_free(env.attn_m1);
+  hvx_attn_m1_free(env.attn_m1_b);
+  hexkl_graph_free(g);
+  if (err == 0)
+    printf("GRAPH GEMMA ATTN BIT-IDENTICAL: ROPE+ATTN_M1 on 3 layers (hd256 "
+           "window %u x 2 in one cache, hd512 full in a second), scale 1.0, "
+           "100 tokens, vs m1_rope_det -> attn_m1_det_forward_win\n",
+           G4_WIN);
+}
+
 int main(void) {
   check_validator();
   check_forward();
@@ -1903,6 +2031,7 @@ int main(void) {
   check_add_router(0);
   check_add_router(1);
   check_gemma_rope();
+  check_gemma_attn();
   check_q4m1();
   if (g_fail) {
     printf("GRAPH CHECKS FAILED (%d)\n", g_fail);

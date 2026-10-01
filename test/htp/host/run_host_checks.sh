@@ -220,7 +220,8 @@ graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_host_check"
 # FFN input's quantization; the argmax over the first slice only; [plan 201
 # S1] the miss round's experts before the first miss dropped, and its later
 # rows added in reverse order; [plan 201 S4] the softmax router run as the
-# sigmoid one, and an RMSNORM's N1 bit ignored
+# sigmoid one, an RMSNORM's N1 bit ignored, and an ATTN_M1's scale (Gemma's
+# 1.0 in eps_bits) ignored for 1/sqrt(head_dim)
 for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, gate, act, op->N,/' \
   's/y += g->q4m1\[h\[p\]\].N;/y += Q4M1_GROUP;/' \
   's/graph_prep(op, act, op->N, &g->act);/(void)act;/' \
@@ -228,7 +229,8 @@ for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, ga
   's/  if (first != 0u) {/  if (0) {/' \
   's/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)i \* op->N_out, 1.0f,/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)(n - 1u - i + first) * op->N_out, 1.0f,/' \
   's/  if (op->eps_bits != 0u) {/  if (0) {/' \
-  's/((op->feed \& HTP_GRAPH_NORM_N1) != 0u ? hvx_rmsnorm_n1_f32/(0 ? hvx_rmsnorm_n1_f32/'; do
+  's/((op->feed \& HTP_GRAPH_NORM_N1) != 0u ? hvx_rmsnorm_n1_f32/(0 ? hvx_rmsnorm_n1_f32/' \
+  's/op->eps_bits != 0u *? graph_eps(op)/0 ? graph_eps(op)/'; do
   sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
   if cmp -s "$OUT/hexkl_graph_mutant.c" "$BACKEND/hmx/hexkl_graph.c"; then
     echo "GRAPH Q4M1 MUTATION DID NOT APPLY: $mut"; exit 1
@@ -386,7 +388,10 @@ echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-
 # (n_kv, gqa) = (8, 4),
 # (1, 2), (2, 3), (1, 8), head_dim 64, plus append-chain == bulk, the L = 1 case,
 # a division tie and the error codes; and the phase words (#146), which
-# must leave the output bytes alone (ATTN M1 PHASES OK).
+# must leave the output bytes alone (ATTN M1 PHASES OK). [plan 201 S4]
+# Gemma 4's (8, 2) x 256 with a 1024 window and (2, 8) x 512, scale 1.0,
+# L = 1, 65, 1023, 1024, 1025, 4096, against the spec and an f64 reference
+# (ATTN M1 GEMMA BIT-IDENTICAL, the SNR printed per line).
 # -include malloc.h: the cache is memalign(128), which the Hexagon libc
 # declares in stdlib.h and glibc in malloc.h.
 "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
@@ -397,6 +402,27 @@ echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-
   "$BACKEND/hvx/hvx_worker_pool.c" -lm
 
 "$OUT/attn_m1_host_check"
+# [plan 201 S4] Two mutants of the kernel at Gemma 4's shapes, each of which
+# must fail it: the sliding window one position short (lo of L + 1), and V
+# taken from the k row -- attention_k_eq_v shares the projection only, the
+# cached K (k_norm with gamma, RoPE) and V (v_norm, no gamma) differ.
+for mut in 's/  job.lo = attn_m1_det_lo(L, window);/  job.lo = attn_m1_det_lo(L + 1u, window);/' \
+  's/      hvx_hf_round_row(v + i);/      hvx_hf_round_row(k + i);/'; do
+  sed "$mut" "$BACKEND/hvx/hvx_attn_m1_f32.c" > "$OUT/hvx_attn_m1_mut.c"
+  if cmp -s "$OUT/hvx_attn_m1_mut.c" "$BACKEND/hvx/hvx_attn_m1_f32.c"; then
+    echo "ATTN M1 MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+    -pthread -include malloc.h \
+    -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+    -o "$OUT/attn_m1_mutant" \
+    "$HERE/attn_m1_host_check.c" "$OUT/hvx_attn_m1_mut.c" \
+    "$BACKEND/hvx/hvx_worker_pool.c" -lm
+  if "$OUT/attn_m1_mutant" > "$OUT/attn_m1_mutant.log"; then
+    echo "ATTN M1 MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "ATTN M1 MUTANT CAUGHT: $mut ($(grep -c '^FAIL: gemma' "$OUT/attn_m1_mutant.log") Gemma lines failed)"
+done
 
 # weight_swap_u8i4_arena (doc 52 section 10.12): the real skel entry point
 # over the real weight registry, the arena plain aligned memory. The header

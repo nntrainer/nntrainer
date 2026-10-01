@@ -151,6 +151,7 @@ void nntr_hvx_graph_env(const nntr_hvx_session *s, hexkl_graph_env *env) {
   env->scratch = (hexkl_moe_scratch *)&s->moe_scratch;
   env->moe_flags = s->moe_flags;
   env->attn_m1 = s->attn_m1;        /* [#130] borrowed; NULL until registered */
+  env->attn_m1_b = NULL; /* [plan 201 S4] no second-shape cache entry yet */
   env->fc = nntr_hvx_fc_q4m1_graph; /* [#132 Part B] */
   env->fc_ctx = (void *)s;
   env->rebind = graph_rebind;

@@ -298,24 +298,46 @@ static int graph_op_conv1d_gate(hexkl_graph *g, const htp_graph_op *op,
   return AEE_SUCCESS;
 }
 
-/** @brief 1/sqrt(head_dim) at the one head_dim the validator admits for a
- *  resident ATTN_M1 (64 since #152): 0.125f, exact, and the same bits as
- *  the fp16 CPU's `/ sqrt(64.f)` (attn_m1_det.h step 2). */
-static float graph_attn_scale(uint32_t head_dim) {
-  (void)head_dim;
-  return 0.125f;
+/** @brief The score scale: eps_bits' f32 when set ([plan 201 S4] Gemma
+ *  4's 1.0, attn_m1_det.h's GEMMA note), else 1/sqrt(head_dim) -- at 64
+ *  0.125f, exact, and the same bits as the fp16 CPU's `/ sqrt(64.f)`
+ *  (attn_m1_det.h step 2). The kernel refuses a scale that is not an fp16
+ *  value (1/sqrt(512) is not). */
+static float graph_attn_scale(const htp_graph_op *op) {
+  return op->eps_bits != 0u    ? graph_eps(op)
+         : op->head_dim == 64u ? 0.125f
+                               : 1.0f / sqrtf((float)op->head_dim);
 }
 
+/** @brief The session cache an ATTN_M1 op's shape names: env->attn_m1, or
+ *  [plan 201 S4] env->attn_m1_b (Gemma's full layers beside its sliding
+ *  ones), or NULL. */
+static hvx_attn_m1_ctx *graph_attn_cache(const hexkl_graph_env *env,
+                                         const htp_graph_op *op) {
+  hvx_attn_m1_ctx *const c[2] = {env->attn_m1, env->attn_m1_b};
+  uint32_t i;
+  for (i = 0; i < 2u; ++i) {
+    if (c[i] != NULL && c[i]->n_kv == op->n_kv && c[i]->gqa == op->gqa &&
+        c[i]->head_dim == op->head_dim) {
+      return c[i];
+    }
+  }
+  return NULL;
+}
+
+/* [plan 201 S4] top_k is the sliding window (0: full causal, LFM2 and
+   Gemma's full layers), eps_bits the scale (graph_attn_scale) */
 static int graph_op_attn_m1(hexkl_graph *g, const htp_graph_op *op,
                             graph_call *call, const float *in, float *out) {
   const uint32_t hd = op->head_dim, n_q = op->gqa * op->n_kv * hd,
                  n_k = op->n_kv * hd;
-  if (call->env->attn_m1 == NULL) {
+  hvx_attn_m1_ctx *c = graph_attn_cache(call->env, op);
+  if (c == NULL) {
     return AEE_EBADSTATE;
   }
-  return hvx_attn_m1_forward(call->env->attn_m1, g->ordinal[op - g->ops],
-                             call->pos, graph_attn_scale(hd), in, in + n_q,
-                             in + n_q + n_k, out, NULL);
+  return hvx_attn_m1_forward(c, g->ordinal[op - g->ops], call->pos, op->top_k,
+                             graph_attn_scale(op), in, in + n_q, in + n_q + n_k,
+                             out, NULL);
 }
 
 /* ---- #132: the residual add and the router ------------------------------ */
@@ -533,7 +555,7 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
                      const hexkl_weight_u8i4_table *tbl,
                      const hexkl_graph_q4m1_shape *q4m1, uint32_t n_q4m1,
                      hexkl_graph **out) {
-  uint32_t n_ops = 0, i, slot_words = 0, n_attn = 0, ffn_n = 0;
+  uint32_t n_ops = 0, i, slot_words = 0, ffn_n = 0;
   uint32_t q4m1_ops = 0, vocab_out = 0, moe_rows = 0;
   hexkl_graph *g;
   int rc;
@@ -625,7 +647,19 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
   for (i = 0; i < n_ops; ++i) {
     g->ops[i] = *htp_graph_op_cat(words, i);
     if (g->ops[i].kind == HTP_OP_ATTN_M1) {
-      g->ordinal[i] = n_attn++;
+      /* [plan 201 S4] the layer index within its shape's cache: the ATTN_M1
+         ops before it of the same (n_kv, gqa, head_dim). The ARM side
+         (htp_compute_ops.cpp attn_ordinal_, the kv seed) still counts all
+         ATTN_M1 ops: the same numbers while there is one shape (LFM2); the
+         Gemma hand-over that registers attn_m1_b counts per shape too. */
+      uint32_t j;
+      g->ordinal[i] = 0u;
+      for (j = 0; j < i; ++j) {
+        g->ordinal[i] += g->ops[j].kind == HTP_OP_ATTN_M1 &&
+                         g->ops[j].n_kv == g->ops[i].n_kv &&
+                         g->ops[j].gqa == g->ops[i].gqa &&
+                         g->ops[j].head_dim == g->ops[i].head_dim;
+      }
     }
   }
   *out = g;
