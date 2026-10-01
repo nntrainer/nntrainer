@@ -143,13 +143,13 @@ inline float exp_det_ref(float x) { return swiglu_det_exp(x); }
 inline float recip_det_ref(float d) { return swiglu_det_recip(d); }
 inline float swiglu_det_ref(float g, float u) { return swiglu_det_one(g, u); }
 inline float geglu_det_ref(float g, float u) { return geglu_det_one(g, u); }
+inline float dadd(float a, float b) { return swiglu_det_add(a, b); }
+inline float dsub(float a, float b) { return swiglu_det_sub(a, b); }
 inline float dmul(float a, float b) { return swiglu_det_mul(a, b); }
 /** t = g (C0 + C1 g^2), as both geglu_det_one and the skel compute it */
 inline float geglu_t_ref(float g) {
   return dmul(g, dadd(GEGLU_DET_C0, dmul(GEGLU_DET_C1, dmul(g, g))));
 }
-inline float dadd(float a, float b) { return swiglu_det_add(a, b); }
-inline float dsub(float a, float b) { return swiglu_det_sub(a, b); }
 
 inline int32_t bits_of(float f) {
   int32_t i;
