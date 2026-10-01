@@ -289,6 +289,32 @@ done
 
 "$OUT/m1_ops_host_check"
 
+# [plan 201 S4] The MoE epilogue's GeGLU-tanh: geglu_det_one (swiglu_det.h)
+# against f64 incl. the tanh saturation ends and subnormals, then the REAL
+# hvx_dequant_i32.c epilogue on hvx_emu/ (geglu and swiglu) bit for bit
+# against the spec (GEGLU OK). Then gelu swapped for silu in the kernel,
+# which must fail it.
+geglu_check() { # geglu_check <hvx_dequant_i32.c> <exe>
+  "$cc" -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+    -Wno-format-truncation -pthread -include malloc.h \
+    -I "$HERE/hvx_emu" -I "$HERE/stub" -I "$BACKEND/.." -I "$BACKEND" \
+    -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
+    -o "$2" "$HERE/geglu_host_check.c" "$1" \
+    "$BACKEND/hvx/hvx_worker_pool.c" -lm
+}
+geglu_check "$BACKEND/hvx/hvx_dequant_i32.c" "$OUT/geglu_host_check"
+"$OUT/geglu_host_check"
+mut='s/c->geglu ? hvx_geglu_det_sf(g, u)/c->geglu ? hvx_swiglu_det_sf(g, u)/'
+sed "$mut" "$BACKEND/hvx/hvx_dequant_i32.c" > "$OUT/hvx_dequant_i32.c"
+if cmp -s "$OUT/hvx_dequant_i32.c" "$BACKEND/hvx/hvx_dequant_i32.c"; then
+  echo "GEGLU MUTATION DID NOT APPLY: $mut"; exit 1
+fi
+geglu_check "$OUT/hvx_dequant_i32.c" "$OUT/geglu_mutant"
+if "$OUT/geglu_mutant" > "$OUT/geglu_mutant.log"; then
+  echo "GEGLU MUTANT PASSED (the check is blind): $mut"; exit 1
+fi
+echo "GEGLU MUTANT CAUGHT: gelu replaced by silu ($(grep -o 'geglu bit-exact [0-9/]*' "$OUT/geglu_mutant.log"))"
+
 # The CPU-order Q4_0 FC (#132 PR 2): the spec q4_gemv_cpu_det.h against an
 # independent model of the Android CPU's quantizer and fused chain, six
 # mutants (Q4 GEMV CPU-ORDER OK), and the REAL DSP source hvx_q4_gemv_f32.c
