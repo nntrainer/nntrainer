@@ -44,26 +44,14 @@
  *        fused chains reduced ((h0 + h1) + h2) + h3 (m1_ops_det.h, #164).
  *
  * @param x, y          n floats; may alias
- * @param gamma         chunk floats, shared by every chunk; NULL: y = x * r
- *                      (Gemma's v norm)
+ * @param gamma         chunk floats, shared by every chunk
  * @param n             a multiple of chunk
- * @param chunk         a multiple of 32 (2048: LFM's hidden norm; 64: the
- *                      per-head q/k norm; 2816: Gemma's hidden norm). The
- *                      CPU's 16 chains cover it, so there is no tail; any
- *                      other width is refused (the contract below)
+ * @param chunk         a power of two and a multiple of 32 (2048: the hidden
+ *                      norm; 64: the per-head q/k norm)
  * @param row_scale_out n / chunk floats, r per chunk; NULL to skip
  */
 void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
                      uint32_t chunk, float eps, float *row_scale_out);
-
-/**
- * @brief [plan 201 S4] N1, opt-in: hvx_rmsnorm_f32's shape and output form,
- *        r from m1_rmsnorm_n1_chunk_det's order-free integer sum of squares
- *        (32 word lanes). Not the CPU's bits. DOMAIN: finite x.
- */
-void hvx_rmsnorm_n1_f32(const float *x, const float *gamma, float *y,
-                        uint32_t n, uint32_t chunk, float eps,
-                        float *row_scale_out);
 
 /**
  * @brief RoPE in place on n_q q heads then n_k k heads, each 64 contiguous
@@ -135,28 +123,5 @@ uint32_t hvx_argmax_first_f32(const float *x, uint32_t n);
 void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
                          uint32_t K, uint32_t E, uint32_t top_k, float *logits,
                          uint32_t *sel, float *weight, hvx_worker_pool *pool);
-
-/**
- * @brief [plan 201 S4] Gemma 4's router after its input norm
- *        (m1_router_softmax_det): logits as unfused Vsf chains over k, 32
- *        experts a vector and a vector per pool lane, then the spec's own
- *        m1_router_softmax_pick (softmax, top-k with the lowest index on a
- *        tie, renormalised, times the per-expert scale).
- *
- * @param x       K floats: rmsnorm(h) * m1_router_input_scale_det's g
- * @param wp      K x Ep floats: [K][E] padded to Ep = E rounded up to 32
- *                columns (lanes >= E are read and ignored)
- * @param pes     E floats, the per-expert scale
- * @param E       1..128
- * @param top_k   1..E
- * @param logits  E floats out; may alias x (written after the last read)
- * @param sel     top_k expert indices out, in selection order
- * @param weight  top_k routing weights out, in selection order
- * @param pool    the lanes for the chains (NULL: the caller alone)
- */
-void hvx_router_softmax_topk_f32(const float *x, const float *wp,
-                                 const float *pes, uint32_t K, uint32_t E,
-                                 uint32_t top_k, float *logits, uint32_t *sel,
-                                 float *weight, hvx_worker_pool *pool);
 
 #endif /* __NNTRAINER_HVX_M1_OPS_F32_H__ */

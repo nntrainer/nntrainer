@@ -38,17 +38,15 @@
  * so no compiler can contract or reassociate it.
  *
  *   rmsnorm_det(x[chunk], gamma[chunk], eps), per chunk (2048 for the
- *   hidden norm, 64 for a q/k head; [plan 201 S4] any multiple of 32, e.g.
- *   Gemma's 2816, and gamma NULL for y = x * r) -- the Android CPU's
+ *   hidden norm, 64 for a q/k head) -- the Android CPU's
  *   neon::rms_norm_wrt_width_fp32_intrinsic + multiply_i(gamma), read off
  *   the shipped libnntrainer.so's aarch64 disassembly (plan 164 section 0):
  *     acc[j] = 0,  acc[j] = fma(x[16 i + j], x[16 i + j], acc[j]),
  *              j = 0 .. 15              (four float32x4 fmla accumulators)
  *     h[k]   = (acc[4k] + acc[4k+1]) + (acc[4k+2] + acc[4k+3])   (faddp x2)
  *     s      = ((h[0] + h[1]) + h[2]) + h[3]
- *     d      = s / chunk + eps      (the CPU's fdiv: a multiply by the
- *                                     exact 1/chunk for a power of two,
- *                                     else cpu_det_div_rn)
+ *     d      = s * (1/chunk) + eps  (1/chunk exact: power of two, so this
+ *                                     is the CPU's s / chunk bit for bit)
  *     r      = RN(1 / RN(sqrt(d)))  (fsqrt then fdiv: two roundings, NOT
  *                                     the correctly rounded 1/sqrt)
  *     y[i]   = (x[i] * r) * gamma[i]
@@ -95,16 +93,6 @@
  *     ponytail: LFM2's router constants are hard-coded here; a router with
  *     another scale or no normalization needs them in the op record.
  *
- *   router_softmax_det(x[K], W[K][E], pes[E], top_k), E <= 128 ([plan 201
- *   S4] Gemma 4, #4296's Gemma4MoELayer; x is its input already normed and
- *   scaled, see m1_router_input_scale_det): unfused chains, softmax with
- *   swiglu_det.h's exp / recip, top_k with the lowest index on a tie,
- *   renormalised over the chosen and times the per-expert scale (the
- *   function's comment has the order).
- *
- *   rmsnorm_n1 ([plan 201 S4] N1, opt-in, not the CPU's bits): the sum of
- *   squares in integers after a per-row power of two (its comment).
- *
  *   swiglu_cpu_det(y[n], z[n]): neon::swiglu with neon_mathfun's exp_ps as
  *   the binary computes it (one fused step, the rest separate; plan 132
  *   section 0.2): out = RN(y / (exp_ps(-y) + 1)) * z. The MoE's own
@@ -138,7 +126,6 @@
 
 #include "attn_m1_det.h"
 #include "q4_gemv_cpu_det.h"
-#include "swiglu_det.h"
 
 /** @brief f32 lanes in one 128-byte HVX vector; the reduction's width. */
 #define M1_DET_LANES 32u
@@ -267,132 +254,24 @@ static inline float m1_sumsq_cpu_det(const float *x, uint32_t chunk) {
   return m1_norm_reduce_det(acc);
 }
 
-/** @brief r from the sum of squares: RN(1 / RN(sqrt(s / chunk + eps))).
- *         s / chunk is the CPU's fdiv: for a power-of-two chunk the
- *         multiply by its exact reciprocal (the same bits, and the code
- *         before plan 201 S4), else the integer correctly rounded divide
- *         (Gemma's hidden 2816). */
+/** @brief r from the sum of squares: RN(1 / RN(sqrt(s / chunk + eps))). */
 static inline float m1_norm_scale_det(float s, uint32_t chunk, float eps) {
-  const float mean = (chunk & (chunk - 1u)) == 0u
-                       ? m1_det_mul(s, 1.0f / (float)chunk)
-                       : cpu_det_div_rn(s, (float)chunk);
-  return m1_recip_rn_det(m1_sqrt_rn_det(m1_det_add(mean, eps)));
-}
-
-/** @brief y = (x * r) * gamma, or x * r with no gamma (Gemma's v norm). */
-static inline void m1_norm_apply_det(const float *x, const float *gamma,
-                                     float *y, uint32_t chunk, float r) {
-  for (uint32_t i = 0; i < chunk; ++i) {
-    y[i] =
-      gamma ? m1_det_mul(m1_det_mul(x[i], r), gamma[i]) : m1_det_mul(x[i], r);
-  }
+  const float d = m1_det_add(m1_det_mul(s, 1.0f / (float)chunk), eps);
+  return m1_recip_rn_det(m1_sqrt_rn_det(d));
 }
 
 /**
  * @brief RMSNorm over one chunk: y = (x * r) * gamma, r the CPU's scale.
  *
- * @param gamma  chunk floats, or NULL for y = x * r
- * @param chunk  a multiple of 32 (the CPU's 16 chains cover it, no tail)
+ * @param chunk  a power of two and a multiple of 32
  * @return r, the row scale (what the IDL's row_scale reports)
  */
 static inline float m1_rmsnorm_chunk_det(const float *x, const float *gamma,
                                          float *y, uint32_t chunk, float eps) {
   const float r = m1_norm_scale_det(m1_sumsq_cpu_det(x, chunk), chunk, eps);
-  m1_norm_apply_det(x, gamma, y, chunk, r);
-  return r;
-}
-
-/* ---- [plan 201 S4] N1: the sum of squares in integers (opt-in) ---------- */
-
-/** @brief N1's fixed point: |q| <= 2^M1_N1_BITS (2^22, the largest the
- *         1.5 2^23 rounding identity takes). The HVX kernel splits q =
- *         a 2^11 + b and sums a^2, a b and b^2 (each < 2^22 + 1) on u32
- *         lanes, M1_N1_BLOCK_VECS vectors before a lane can overflow. */
-#define M1_N1_BITS 22
-#define M1_N1_BLOCK_VECS 512u
-
-/** @brief k with |x| 2^k < 2^M1_N1_BITS for every x whose |bits| <= amax
- *         (the row's largest |bits|): 13 - E for amax in [2^E, 2^(E+1)),
- *         at most 127 so 2^k is a normal f32 (a row below 2^-114 keeps
- *         fewer bits; its s is far under any eps). */
-static inline int m1_n1_shift_det(uint32_t amax) {
-  const int k = (M1_N1_BITS - 1) - ((int)(amax >> 23) - 127);
-  return k > 127 ? 127 : k;
-}
-
-/** @brief 2^e as f32 bits for e in [-149, 127] (subnormal below -126). */
-static inline float m1_n1_pow2_det(int e) {
-  return m1_det_float(e >= -126 ? (uint32_t)(e + 127) << 23
-                                : 1u << (uint32_t)(e + 149));
-}
-
-/** @brief q = RNE(|x| 2^k) in integers: |x| 2^k is exact (or below 2^-126,
- *         where q is 0 either way), and adding 1.5 2^23 rounds it to an
- *         integer in the low mantissa bits (hvx_sf_to_w_rne's identity). */
-static inline uint32_t m1_n1_q_det(float x, float p) {
-  const float v = m1_det_mul(m1_det_float(m1_det_bits(x) & 0x7fffffffu), p);
-  return m1_det_bits(m1_det_add(v, 12582912.0f)) - 0x4B400000u;
-}
-
-/** @brief RN(S) for S < 2^64, in integers (no u64 -> f32 instruction to
- *         trust): the top 24 bits, round to nearest even on the rest. */
-static inline float m1_n1_u64_to_f32_det(uint64_t S) {
-  int e = 0;
-  if (S == 0u) {
-    return 0.0f;
-  }
-  while ((S >> e) >= (1ull << 24)) {
-    ++e;
-  }
-  uint64_t m = S >> e;
-  if (e > 0) {
-    const uint64_t rest = S & ((1ull << e) - 1u), half = 1ull << (e - 1);
-    m += rest > half || (rest == half && (m & 1u));
-    if (m == 1ull << 24) {
-      m >>= 1;
-      ++e;
-    }
-  }
-  /* m < 2^24 exactly, e <= 40: (float)m is exact, the scale a power of 2 */
-  return m1_det_mul((float)(uint32_t)m, m1_n1_pow2_det(e));
-}
-
-/** @brief N1's row scale from the exact integer sum S of q^2 at shift k:
- *         s = RN(S) 2^-k 2^-k (two exact scalings while s stays normal),
- *         then the CPU form of m1_norm_scale_det. Shared by the spec and
- *         the HVX kernel; only S is the kernel's own. */
-static inline float m1_n1_norm_scale_det(uint64_t S, int k, uint32_t chunk,
-                                         float eps) {
-  const float p = m1_n1_pow2_det(-k);
-  const float s = m1_det_mul(m1_det_mul(m1_n1_u64_to_f32_det(S), p), p);
-  return m1_norm_scale_det(s, chunk, eps);
-}
-
-/**
- * @brief N1 RMSNorm over one chunk (plan 201 section 3.7): the per-row
- *        power of two k from the largest |x|, q = RNE(|x| 2^k) <= 2^22,
- *        S = sum q^2 exactly in integers -- any lane count, any order, the
- *        same S -- then r from S with the spec's integer sqrt / recip, and
- *        y = (x * r) * gamma in f32. Not the f32 norm's bits: each |x| keeps
- *        22 bits relative to the row's largest. DOMAIN: finite x.
- */
-static inline float m1_rmsnorm_n1_chunk_det(const float *x, const float *gamma,
-                                            float *y, uint32_t chunk,
-                                            float eps) {
-  uint32_t amax = 0u;
-  uint64_t S = 0u;
   for (uint32_t i = 0; i < chunk; ++i) {
-    const uint32_t a = m1_det_bits(x[i]) & 0x7fffffffu;
-    amax = a > amax ? a : amax;
+    y[i] = m1_det_mul(m1_det_mul(x[i], r), gamma[i]);
   }
-  const int k = m1_n1_shift_det(amax);
-  const float p = m1_n1_pow2_det(k);
-  for (uint32_t i = 0; i < chunk; ++i) {
-    const uint64_t q = m1_n1_q_det(x[i], p);
-    S += q * q;
-  }
-  const float r = m1_n1_norm_scale_det(S, k, chunk, eps);
-  m1_norm_apply_det(x, gamma, y, chunk, r);
   return r;
 }
 
@@ -601,99 +480,6 @@ static inline void m1_router_cpu_det(const float *x, const float *w,
     m1_router_cpu_sigmoid(acc, bias[e], &sig[e], &score[e]);
   }
   m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
-}
-
-/* ---- [plan 201 S4] Gemma 4's softmax router ---------------------------- */
-
-/** @brief The softmax router's widest expert set (Gemma 4: 128). */
-#define M1_DET_ROUTER_SM_MAX_E 128u
-
-/** @brief g[f] = RN(router_scale[f] * RN(1 / RN(sqrt(H)))): #4296's
- *         per-feature factor `router_scale[feature] * hidden_scale`, with
- *         hidden_scale = 1.0f / std::sqrt((float)H), each step correctly
- *         rounded as on the CPU. The norm's (x * r) * g is then the CPU's
- *         rms_norm_wrt_width followed by `row[f] *= g[f]`, bit for bit. */
-static inline void m1_router_input_scale_det(const float *router_scale,
-                                             uint32_t H, float *g) {
-  const float hs = m1_recip_rn_det(m1_sqrt_rn_det((float)H));
-  for (uint32_t f = 0; f < H; ++f) {
-    g[f] = m1_det_mul(router_scale[f], hs);
-  }
-}
-
-/**
- * @brief The softmax router after its logits (shared by the spec and the
- *        DSP kernel): m = max logit; e = exp_det(l - m); p = e * recip_det(
- *        sum e, in expert order); top_k by p, the LOWEST index on a tie;
- *        t = sum of the chosen p in selection order; weight = (p *
- *        recip_det(t)) * per_expert_scale. #4296 divides where this takes
- *        recip_det, and its topK is an unstable std::partial_sort, so an
- *        exact tie may go either way there (D2: not bit-preserving).
- *
- * @param E      1..M1_DET_ROUTER_SM_MAX_E; logits finite
- * @param top_k  1..E
- */
-static inline void m1_router_softmax_pick(const float *logits, const float *pes,
-                                          uint32_t E, uint32_t top_k,
-                                          uint32_t *sel, float *weight) {
-  float p[M1_DET_ROUTER_SM_MAX_E], m = logits[0], s = 0.0f, t = 0.0f, inv;
-  uint8_t taken[M1_DET_ROUTER_SM_MAX_E];
-  uint32_t e, r;
-  for (e = 1; e < E; ++e) {
-    m = logits[e] > m ? logits[e] : m;
-  }
-  for (e = 0; e < E; ++e) {
-    p[e] = swiglu_det_exp(m1_det_sub(logits[e], m));
-    s = m1_det_add(s, p[e]);
-    taken[e] = 0u;
-  }
-  inv = swiglu_det_recip(s);
-  for (e = 0; e < E; ++e) {
-    p[e] = m1_det_mul(p[e], inv);
-  }
-  for (r = 0; r < top_k; ++r) {
-    uint32_t best = E;
-    for (e = 0; e < E; ++e) {
-      if (!taken[e] && (best == E || p[e] > p[best])) {
-        best = e;
-      }
-    }
-    taken[best] = 1u;
-    sel[r] = best;
-    t = m1_det_add(t, p[best]);
-  }
-  inv = swiglu_det_recip(t);
-  for (r = 0; r < top_k; ++r) {
-    weight[r] = m1_det_mul(m1_det_mul(p[sel[r]], inv), pes[sel[r]]);
-  }
-}
-
-/**
- * @brief Gemma 4's router of one token after its input norm (plan 201 S4;
- *        Gemma4MoELayer::forwardTensors in nntrainer/nntrainer#4296): the
- *        logits as E unfused chains over k in order, acc = RN(acc +
- *        RN(x[k] * W[k][e])) -- 32 experts a vector on HVX -- then
- *        m1_router_softmax_pick. The whole router is m1_rmsnorm_det(h,
- *        g, x, H, H, eps) with g from m1_router_input_scale_det, then this.
- *
- * @param x       K floats: the normed, scaled router input
- * @param w       K x E floats, row-major [K][E]
- * @param pes     E floats, the per-expert scale
- * @param E       1..M1_DET_ROUTER_SM_MAX_E
- */
-static inline void m1_router_softmax_det(const float *x, const float *w,
-                                         const float *pes, uint32_t K,
-                                         uint32_t E, uint32_t top_k,
-                                         float *logits, uint32_t *sel,
-                                         float *weight) {
-  for (uint32_t e = 0; e < E; ++e) {
-    float acc = 0.0f;
-    for (uint32_t k = 0; k < K; ++k) {
-      acc = m1_det_add(acc, m1_det_mul(x[k], w[(size_t)k * E + e]));
-    }
-    logits[e] = acc;
-  }
-  m1_router_softmax_pick(logits, pes, E, top_k, sel, weight);
 }
 
 /** @brief neon_mathfun's exp_ps for one lane, as the shipped binary runs
