@@ -64,12 +64,12 @@ int nntr_hvx_exp_f32(remote_handle64 handle, const float *x, int xLen, float *y,
   return AEE_SUCCESS;
 }
 
-int nntr_hvx_swiglu_det_f32(remote_handle64 handle, const float *gate,
-                            int gateLen, const float *up, int upLen, float *out,
-                            int outLen, float *exp_out, int expLen,
-                            float *recip_out, int recipLen) {
+int nntr_hvx_swiglu_det_f32(remote_handle64 handle, uint32 act,
+                            const float *gate, int gateLen, const float *up,
+                            int upLen, float *out, int outLen, float *exp_out,
+                            int expLen, float *recip_out, int recipLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
-  if (!s) {
+  if (!s || act > 1u) {
     return AEE_EBADPARM;
   }
   if (gateLen != upLen || gateLen != outLen || gateLen != expLen ||
@@ -99,10 +99,19 @@ int nntr_hvx_swiglu_det_f32(remote_handle64 handle, const float *gate,
     // a variant of it that returns its own intermediates would be a second
     // implementation to keep in step with the first.
     const HVX_Vector g = vg[i];
-    const HVX_Vector e = hvx_exp_det_sf(Q6_Vsf_vsub_VsfVsf(Q6_V_vzero(), g));
+    HVX_Vector t = g;
+    if (act == 1u) { /* GeGLU: the sigmoid's argument is g (C0 + C1 g^2) */
+      const HVX_Vector g2 = Q6_Vsf_vmpy_VsfVsf(g, g);
+      t = Q6_Vsf_vmpy_VsfVsf(
+        g,
+        Q6_Vsf_vadd_VsfVsf(hvx_splat_sf(GEGLU_DET_C0),
+                           Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(GEGLU_DET_C1), g2)));
+    }
+    const HVX_Vector e = hvx_exp_det_sf(Q6_Vsf_vsub_VsfVsf(Q6_V_vzero(), t));
     ve[i] = e;
     vr[i] = hvx_recip_det_sf(Q6_Vsf_vadd_VsfVsf(hvx_splat_sf(1.0f), e));
-    vo[i] = hvx_swiglu_det_sf(g, vu[i]);
+    vo[i] =
+      act == 1u ? hvx_geglu_det_sf(g, vu[i]) : hvx_swiglu_det_sf(g, vu[i]);
   }
   return AEE_SUCCESS;
 }
