@@ -1582,6 +1582,14 @@ void dequantize_row_qs8cx(size_t n_idx, size_t k, void *rhs_native_mtx_qs8cx,
                           void *rhs_scales_f32, void *rhs_native_mtx_f32);
 
 /**
+ * @brief get the index of the qai8dxp_qsi4cxp ukernel to use on this target
+ *
+ * @param[in] is_gemv true to select the GEMV (M == 1) ukernel, false for GEMM
+ * @return size_t index of ukernel to pass as idx_variant
+ */
+size_t get_opt_ukernel_idx_qai8dxp_qsi4cxp(bool is_gemv);
+
+/**
  * @brief get size of memory to allocate for packed rhs from nxk qs4cxs1s0 to
  * qsi4cxp
  * Note that nxk is the format of quantized rhs, not the shape of rhs

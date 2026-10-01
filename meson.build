@@ -154,9 +154,89 @@ else
   extra_defines += '-DKERNEL_CACHE=0'
 endif
 
+# Resolve the aarch64 instruction set once here, so that the forced
+# __ARM_FEATURE_* defines and the -march we actually compile with can never
+# disagree. The defines gate the KleidiAI / ggml kernel tables, so defining
+# them for an ISA the target does not implement makes the library issue
+# instructions the CPU traps on (SIGILL).
+# Distro packaging passes e.g. -Darm-march=armv8.2-a+dotprod to get a binary
+# that runs on CPUs without i8mm; native builds keep the tuned default.
+nntr_arm_march = get_option('arm-march')
+if nntr_arm_march.startswith('-march=')
+  nntr_arm_march = nntr_arm_march.split('=')[1]
+endif
+nntr_arm_dotprod = true
+nntr_arm_i8mm = true
+nntr_arm_sve = get_option('arm-arch') == 'armv9.2-a'
+if nntr_arm_march != ''
+  # Parse the ISA string: dotprod is mandatory from armv8.4-a, i8mm from
+  # armv8.6-a / armv9.1-a and SVE2 from armv9-a; +ext / +noext override the
+  # base. Android runs meson on an x86_64 host without a cross file, so this
+  # is all there is to go by there; jni/meson.build passes the same option to
+  # the Android compiler, so the kernels compiled in and the ISA compiled for
+  # stay in sync there as well.
+  nntr_arm_march_parts = nntr_arm_march.split('+')
+  nntr_arm_march_ver = nntr_arm_march_parts[0].split('armv')[-1].split('-')[0].split('.')
+  nntr_arm_march_digits = '0123456789'
+  nntr_arm_march_major = 0
+  nntr_arm_march_minor = 0
+  if nntr_arm_march_ver[0] != '' and nntr_arm_march_ver[0].strip(nntr_arm_march_digits) == ''
+    nntr_arm_march_major = nntr_arm_march_ver[0].to_int()
+  endif
+  if nntr_arm_march_ver.length() > 1 and nntr_arm_march_ver[1] != '' and nntr_arm_march_ver[1].strip(nntr_arm_march_digits) == ''
+    nntr_arm_march_minor = nntr_arm_march_ver[1].to_int()
+  endif
+  nntr_arm_dotprod = nntr_arm_march_major >= 9 or (nntr_arm_march_major == 8 and nntr_arm_march_minor >= 4)
+  nntr_arm_i8mm = (nntr_arm_march_major == 9 and nntr_arm_march_minor >= 1) or nntr_arm_march_major > 9 or (nntr_arm_march_major == 8 and nntr_arm_march_minor >= 6)
+  nntr_arm_sve = nntr_arm_march_major >= 9
+  foreach ext : nntr_arm_march_parts
+    if ext == 'dotprod'
+      nntr_arm_dotprod = true
+    elif ext == 'nodotprod'
+      nntr_arm_dotprod = false
+    elif ext == 'i8mm'
+      nntr_arm_i8mm = true
+    elif ext == 'noi8mm'
+      nntr_arm_i8mm = false
+    elif ext == 'sve' or ext == 'sve2'
+      nntr_arm_sve = true
+    elif ext == 'nosve'
+      nntr_arm_sve = false
+    endif
+  endforeach
+  if get_option('platform') != 'android' and host_machine.cpu_family() == 'aarch64'
+    # Ask the compiler as well, so that every spelling (+noi8mm, native, ...)
+    # resolves exactly the way it compiles. dotprod keeps the parsed answer
+    # too: clang 14 does not define __ARM_FEATURE_DOTPROD for armv8.6-a or
+    # armv9-a, although both mandate it.
+    nntr_arm_march_args = ['-march=' + nntr_arm_march]
+    if not cxx.has_multi_arguments(nntr_arm_march_args)
+      error('-Darm-march=@0@ is not supported by this compiler.'.format(nntr_arm_march))
+    endif
+    nntr_arm_dotprod = nntr_arm_dotprod or cxx.get_define('__ARM_FEATURE_DOTPROD', args: nntr_arm_march_args) != ''
+    nntr_arm_i8mm = cxx.get_define('__ARM_FEATURE_MATMUL_INT8', args: nntr_arm_march_args) != ''
+    nntr_arm_sve = cxx.get_define('__ARM_FEATURE_SVE', args: nntr_arm_march_args) != ''
+  endif
+elif host_machine.cpu_family() == 'aarch64'
+  if get_option('enable-fp16') and get_option('arm-arch') == 'armv9.2-a'
+    nntr_arm_march = 'armv9.2-a+fp16+sve2+sme'
+  elif get_option('enable-fp16')
+    nntr_arm_march = 'armv8.2-a+fp16+dotprod+i8mm'
+  else
+    nntr_arm_march = 'armv8.2-a+dotprod+i8mm'
+  endif
+endif
+if nntr_arm_march != ''
+  message('ARM target ISA: ' + nntr_arm_march)
+endif
+
 if get_option('platform') != 'android' and host_machine.cpu_family() == 'aarch64'
-  extra_defines += '-D__ARM_FEATURE_DOTPROD=1'
-  extra_defines += '-D__ARM_FEATURE_MATMUL_INT8=1'
+  if nntr_arm_dotprod
+    extra_defines += '-D__ARM_FEATURE_DOTPROD=1'
+  endif
+  if nntr_arm_i8mm
+    extra_defines += '-D__ARM_FEATURE_MATMUL_INT8=1'
+  endif
 endif
 
 if get_option('enable-fp16')
@@ -184,19 +264,18 @@ if get_option('enable-fp16')
        message ('The compiler does not support -mfp16-format=ieee. However, according to https://gcc.gnu.org/onlinedocs/gcc-9.1.0/gcc/Half-Precision.html, gcc may use IEEE fp16 anyway. Thus, we will proceed without the option for FP16 support.')
      endif
      # Use arm-arch option for architecture-specific flags
+     # (-march itself was resolved into nntr_arm_march above, where
+     #  -Darm-march can override it for portable distro builds.)
      arm_arch_opt = get_option('arm-arch')
+     add_project_arguments('-march=' + nntr_arm_march, language: ['c', 'cpp'])
      if arm_arch_opt == 'armv9.2-a'
-       add_project_arguments('-march=armv9.2-a+fp16+sve2+sme', language: ['c', 'cpp'])
        extra_defines += '-DARM_ARCH_ARMV9_2A=1'
        extra_defines += '-DENABLE_SVE2=1'
      elif arm_arch_opt == 'armv8.2-a'
-       add_project_arguments('-march=armv8.2-a+fp16+dotprod+i8mm', language: ['c', 'cpp'])
        extra_defines += '-DARM_ARCH_ARMV8_2A=1'
      else
-       # auto: default to armv8.2-a+fp16+dotprod+i8mm for native aarch64 builds
-       add_project_arguments('-march=armv8.2-a+fp16+dotprod+i8mm', language: ['c', 'cpp'])
        extra_defines += '-DARM_ARCH_ARMV8_2A=1'
-       message('Unknown arm-arch option. Using default armv8.2-a+fp16+dotprod+i8mm')
+       message('Unknown arm-arch option. Using default ' + nntr_arm_march)
      endif
      extra_defines += '-DENABLE_FP16=1'
      extra_defines += '-DUSE__FP16=1'
@@ -225,7 +304,7 @@ if get_option('enable-fp16')
    endif
 else
   if arch == 'aarch64'
-    add_project_arguments('-march=armv8.2-a+dotprod+i8mm', language: ['c', 'cpp'])
+    add_project_arguments('-march=' + nntr_arm_march, language: ['c', 'cpp'])
   endif
 endif
 
