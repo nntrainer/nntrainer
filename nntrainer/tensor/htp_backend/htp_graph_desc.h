@@ -59,6 +59,14 @@
 #define HTP_GRAPH_ROUTER_MAX_EXPERTS 32u
 /** @brief The op record's handle arrays: the Q4M1 kinds' parts. */
 #define HTP_GRAPH_MAX_PARTS 32u
+/** @brief The activation slots: 0 the residual stream, 1 / 2 working.
+ *  [plan 201 S4] Gemma 4's two-branch FFN fits in three: the MoE branch
+ *  first (norm 0 -> 1, router 0 -> 2, MOE 1 -> 2, its post norm 2 -> 2),
+ *  then the dense one in place on slot 1 (DENSE_FFN quantizes its input
+ *  before it writes), the branch ADD 1 -> 2, the post-FFN norm 2 -> 1 and
+ *  the residual ADD 1 -> 0 (graph_host_check's Gemma stretch). The two
+ *  branches are independent, so the order does not move a bit (the adds
+ *  commute in IEEE). */
 #define HTP_GRAPH_N_SLOTS 3u
 #define HTP_GRAPH_NO_OP 0xFFFFFFFFu
 
@@ -189,7 +197,14 @@ enum {
 #define HTP_GRAPH_NO_HANDLE 0xFFFFFFFFu
 
 enum { HTP_GRAPH_LAYER_CONV = 0, HTP_GRAPH_LAYER_ATTN = 1 };
-enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
+/** @brief A layer's FFN kind. [plan 201 S4] DENSE_MOE: Gemma 4's dense
+ *  GeGLU FFN beside the MoE in the same layer (both DENSE_FFN and
+ *  ROUTER_TOPK / MOE ops). Append, never reorder. */
+enum {
+  HTP_GRAPH_FFN_DENSE = 0,
+  HTP_GRAPH_FFN_MOE = 1,
+  HTP_GRAPH_FFN_DENSE_MOE = 2
+};
 
 /**
  * @brief One op record, HTP_GRAPH_OP_WORDS words on the wire.
@@ -197,11 +212,11 @@ enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
  * K is the input width, N the output width (inter for MOE / DENSE_FFN,
  * whose output width is N_out; vocab for LM_HEAD). in_slot / out_slot name
  * the session's
- * activation slots (plan 85 section 3.1); ADD reads slot 0 as its second
- * operand implicitly. next_mm names the next weight-streaming op (FC,
- * MOE, DENSE_FFN, LM_HEAD) or HTP_GRAPH_NO_OP; nothing consumes it yet
- * (the cross-op prefetch hook is a later issue), the validator only
- * requires it to point forward. h_gu / h_dn are the Q4M1 kinds' weight
+ * activation slots (plan 85 section 3.1); ADD reads its out slot (slot 0
+ * in LFM2) as its second operand implicitly. next_mm names the next
+ * weight-streaming op (FC, MOE, DENSE_FFN, LM_HEAD) or HTP_GRAPH_NO_OP; nothing
+ * consumes it yet (the cross-op prefetch hook is a later issue), the validator
+ * only requires it to point forward. h_gu / h_dn are the Q4M1 kinds' weight
  * handles, bound by the ARM before graph_init (a MOE op leaves them unused:
  * its handles are its HTP_GRAPH_PARAM_EXPERTS table, plan 201 S1), with
  * n_experts the part count (#132 Part B): an FC's parts
@@ -229,6 +244,20 @@ enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
  * eps_bits 0 it is LFM2's sigmoid router. An RMSNORM's feed bit 0
  * (HTP_GRAPH_NORM_N1) selects N1, the order-free integer sum of squares
  * (opt-in, not the CPU's bits).
+ *
+ * [plan 201 S4] Gemma 4 reuses fields that were 0 for these kinds: a
+ * QK_NORM's feed takes HTP_GRAPH_QKNORM_V (the v heads RMS-normed with no
+ * gamma, #4296's v_norm) and HTP_GRAPH_QKNORM_K_EQ_V (attention_k_eq_v:
+ * v is the raw k projection, the row's v part is not read, so the FC
+ * before it may write q | k only); an ADD's out_slot is any slot but its
+ * in_slot (out += in; LFM2's is slot 0, Gemma's branch sum is not) and its
+ * eps_bits, when set, the f32 multiplier applied after the add (Gemma's
+ * layer_scalar, (h + ffn) * s as the CPU's scalar_multiply); an LM_HEAD's
+ * eps_bits, when set, the final logit soft-cap (m1_softcap_det, before the
+ * argmax, so the logits handed out are capped). A DENSE_FFN's activation
+ * follows the session's MoE flags: HEXKL_MOE_FLAG_GEGLU (#209, the
+ * model's one hidden_activation) makes it gelu_tanh(gate) * up
+ * (geglu_det_one) in place of the CPU-order SwiGLU.
  */
 typedef struct {
   uint32_t kind;
@@ -262,6 +291,11 @@ typedef struct {
  *  ponytail: RMSNORM only; QK_NORM and the router's own norm take it when
  *  N1 is chosen for the model. */
 #define HTP_GRAPH_NORM_N1 1u
+/** @brief [plan 201 S4] A QK_NORM's feed word: the v heads normed without
+ *  gamma (Gemma 4's v_norm), and v taken from the raw k (attention_k_eq_v).
+ *  Bit 0 stays free for N1 (the ponytail note above). */
+#define HTP_GRAPH_QKNORM_V 2u
+#define HTP_GRAPH_QKNORM_K_EQ_V 4u
 typedef char
   htp_graph_op_size_check[sizeof(htp_graph_op) == HTP_GRAPH_OP_WORDS * 4u ? 1
                                                                           : -1];
@@ -366,17 +400,19 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         SCHEMENOTSUPPORTED for a resident op outside its kernel's shape
  *         rule (RMSNORM: K a multiple of 32 (plan 201 S4: any width,
  *         Gemma's 2816), its feed 0 or HTP_GRAPH_NORM_N1; QK_NORM:
- *         head_dim 32, 64 or 128 -- the per-head norm's chunk must be a
- *         power of two too -- gqa <= 8, max_seq a multiple of 32; ROPE
- *         and ATTN_M1 (#152: the fp16 CPU order): head_dim 64, since plan
- *         201 S4 any multiple of 64 up to 512 -- a ROPE at another than 64
- *         reads its own ROPE_TABLE, an ATTN_M1's scale is an fp16 value),
+ *         head_dim 32, 64, 128 ([plan 201 S4] 256 or 512) -- the
+ *         per-head norm's chunk must be a power of two too -- gqa <= 8,
+ *         max_seq a multiple of 32; ROPE and ATTN_M1 (#152: the fp16
+ *         CPU order): head_dim 64, since plan 201 S4 any multiple of 64
+ *         up to 512 -- a ROPE at another than 64 reads its own
+ *         ROPE_TABLE, an ATTN_M1's scale is an fp16 value),
  *         NOTALLOWED for
  *         a resident
  *         ATTN_M1 whose layer's ROPE is not resident (the DSP stretch must
  *         apply RoPE, since mha_core does on the CPU). #132's rules: an ADD
- *         writes slot 0 and reads another slot (INVALIDFORMAT: slot 0 is
- *         its implicit second operand, the residual); a resident ADD needs
+ *         writes its out slot, also its second operand, and reads another
+ *         slot (INVALIDFORMAT; slot 0, the residual, until plan 201 S4
+ *         let Gemma's branch sum use another); a resident ADD needs
  *         every RMSNORM resident (NOTALLOWED: slot 0 holds the residual
  *         across calls only if op 0 seeds it each token and no CPU norm
  *         leaves a stretch start that would re-seed it); a resident
@@ -390,7 +426,10 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         into its out slot); a resident Q4M1 kind needs K % 64 == 0 and K
  *         <= 8192, a DENSE_FFN also N (the down weight's K) % 64 == 0 and
  *         N <= 8192 -- the Q4M1 layout's pair and the quantizer's scratch
- *         (SCHEMENOTSUPPORTED)
+ *         (SCHEMENOTSUPPORTED). [plan 201 S4] INVALIDFORMAT for an ffn
+ *         kind past DENSE_MOE, a QK_NORM feed bit other than V / K_EQ_V,
+ *         an ADD multiplier or LM_HEAD soft-cap that is not a normal f32
+ *         (the soft-cap also positive)
  */
 static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
                                           uint32_t resident_ok,
@@ -416,7 +455,8 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
   if (n_words < htp_graph_words_for(n_layers, n_ops))
     return HTP_GRAPH_E_INCOMPLETEITEM;
   for (i = 0; i < 2u * n_layers; ++i)
-    if (w[HTP_GRAPH_HEADER_WORDS + i] > 1u)
+    if (w[HTP_GRAPH_HEADER_WORDS + i] >
+        (i < n_layers ? 1u : (uint32_t)HTP_GRAPH_FFN_DENSE_MOE))
       return HTP_GRAPH_E_INVALIDFORMAT;
 
   for (i = 0; i < n_ops; ++i) {
@@ -446,9 +486,9 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     if (k == HTP_OP_CONV1D_GATE && layer_kind != HTP_GRAPH_LAYER_CONV)
       return HTP_GRAPH_E_INVALIDITEM;
     if ((k == HTP_OP_MOE || k == HTP_OP_ROUTER_TOPK) &&
-        ffn_kind != HTP_GRAPH_FFN_MOE)
+        ffn_kind == HTP_GRAPH_FFN_DENSE)
       return HTP_GRAPH_E_INVALIDITEM;
-    if (k == HTP_OP_DENSE_FFN && ffn_kind != HTP_GRAPH_FFN_DENSE)
+    if (k == HTP_OP_DENSE_FFN && ffn_kind == HTP_GRAPH_FFN_MOE)
       return HTP_GRAPH_E_INVALIDITEM;
 
     if (op->K == 0u || op->N == 0u || op->in_slot >= HTP_GRAPH_N_SLOTS ||
@@ -468,7 +508,7 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     case HTP_OP_ADD:
       if (op->N != hidden || op->K != hidden)
         return HTP_GRAPH_E_INVALIDFORMAT;
-      if (op->out_slot != 0u || op->in_slot == 0u)
+      if (op->out_slot == op->in_slot)
         return HTP_GRAPH_E_INVALIDFORMAT;
       break;
     /* ATTN_M1's N is gqa n_kv head_dim (the record rule below), the o
@@ -534,7 +574,7 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       if (op->resident != 0u) {
         if (op->gqa > 8u || max_seq % 32u != 0u ||
             (k == HTP_OP_QK_NORM &&
-             (op->head_dim % 32u != 0u || op->head_dim > 128u ||
+             (op->head_dim % 32u != 0u || op->head_dim > 512u ||
               (op->head_dim & (op->head_dim - 1u)) != 0u)) ||
             ((k == HTP_OP_ROPE || k == HTP_OP_ATTN_M1) &&
              (op->head_dim % 64u != 0u || op->head_dim > 512u)))
@@ -562,6 +602,17 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
     }
     if (k == HTP_OP_RMSNORM && (op->feed & ~HTP_GRAPH_NORM_N1) != 0u)
       return HTP_GRAPH_E_INVALIDFORMAT;
+    if (k == HTP_OP_QK_NORM &&
+        (op->feed & ~(HTP_GRAPH_QKNORM_V | HTP_GRAPH_QKNORM_K_EQ_V)) != 0u)
+      return HTP_GRAPH_E_INVALIDFORMAT;
+    /* [plan 201 S4] ADD's multiplier: a normal f32 of either sign; the
+       soft-cap: a positive normal one (0: none) */
+    if ((k == HTP_OP_ADD || k == HTP_OP_LM_HEAD) && op->eps_bits != 0u) {
+      const uint32_t exp = op->eps_bits & 0x7F800000u;
+      if (exp == 0u || exp == 0x7F800000u ||
+          (k == HTP_OP_LM_HEAD && (op->eps_bits & 0x80000000u) != 0u))
+        return HTP_GRAPH_E_INVALIDFORMAT;
+    }
     if (k == HTP_OP_RMSNORM && op->resident != 0u && op->K % 32u != 0u)
       return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
     if (k == HTP_OP_ROUTER_TOPK && op->resident != 0u && op->eps_bits == 0u &&

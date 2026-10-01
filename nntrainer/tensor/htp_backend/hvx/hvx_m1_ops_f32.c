@@ -476,3 +476,65 @@ uint32_t hvx_argmax_first_f32(const float *x, uint32_t n) {
   }
   return idx;
 }
+
+/* ---- [plan 201 S4] Gemma 4: the dense GeGLU, the logit soft-cap, x * s -- */
+
+void hvx_geglu_f32(const float *gate, const float *up, float *out, uint32_t n) {
+  uint32_t i = 0;
+  for (; i + LANES <= n; i += LANES) {
+    *(HVX_UVector *)(out + i) = hvx_geglu_det_sf(
+      *(const HVX_UVector *)(gate + i), *(const HVX_UVector *)(up + i));
+  }
+  for (; i < n; ++i) {
+    out[i] = geglu_det_one(gate[i], up[i]);
+  }
+}
+
+typedef struct {
+  float *x;
+  uint32_t n;
+  float inv, cap;
+} softcap_ctx;
+
+/* m1_softcap_one_det, operation for operation, on a lane's vectors */
+static void softcap_lane(uint32_t n_threads, uint32_t i, void *v) {
+  const softcap_ctx *c = (const softcap_ctx *)v;
+  const uint32_t nvec = c->n / LANES;
+  const uint32_t lo = (uint32_t)((uint64_t)nvec * i / n_threads);
+  const uint32_t hi = (uint32_t)((uint64_t)nvec * (i + 1u) / n_threads);
+  const HVX_Vector inv = hvx_splat_sf(c->inv), cap = hvx_splat_sf(c->cap);
+  const HVX_Vector one = hvx_splat_sf(1.0f), two = hvx_splat_sf(2.0f);
+  const HVX_Vector m2 = hvx_splat_sf(-2.0f);
+  HVX_UVector *xv = (HVX_UVector *)c->x;
+  for (uint32_t b = lo; b < hi; ++b) {
+    const HVX_Vector a = Q6_Vsf_vmpy_VsfVsf(xv[b], inv);
+    const HVX_Vector e = hvx_exp_det_sf(Q6_Vsf_vmpy_VsfVsf(m2, a));
+    const HVX_Vector s = hvx_recip_det_sf(Q6_Vsf_vadd_VsfVsf(one, e));
+    xv[b] = Q6_Vsf_vmpy_VsfVsf(
+      Q6_Vsf_vsub_VsfVsf(Q6_Vsf_vmpy_VsfVsf(two, s), one), cap);
+  }
+}
+
+void hvx_softcap_f32(float *x, uint32_t n, float cap, hvx_worker_pool *pool) {
+  /* one IEEE RN divide, cpu_det_div_rn's result (hvx_swiglu_cpu_f32) */
+  volatile float inv = 1.0f / cap;
+  softcap_ctx c = {x, n, inv, cap};
+  const uint32_t nvec = n / LANES;
+  /* 256 vectors a lane at least: a fork / join is a few microseconds */
+  hvx_worker_pool_run(pool, softcap_lane, &c, nvec / 256u ? nvec / 256u : 1u);
+  for (uint32_t i = nvec * LANES; i < n; ++i) {
+    x[i] = m1_softcap_one_det(x[i], c.inv, cap);
+  }
+}
+
+void hvx_mul_scalar_f32(float *x, float s, uint32_t n) {
+  const HVX_Vector sv = hvx_splat_sf(s);
+  uint32_t i = 0;
+  for (; i + LANES <= n; i += LANES) {
+    *(HVX_UVector *)(x + i) =
+      Q6_Vsf_vmpy_VsfVsf(*(const HVX_UVector *)(x + i), sv);
+  }
+  for (; i < n; ++i) {
+    x[i] = m1_det_mul(x[i], s);
+  }
+}

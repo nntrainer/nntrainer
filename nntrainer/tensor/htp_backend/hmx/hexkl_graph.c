@@ -18,7 +18,9 @@
  * miss round's rows (top_k x N_out f32: 32 KiB at LFM2.5, 88 KiB at
  * Gemma), plus
  * HTP_GRAPH_N_SLOTS x slot_words f32 of activation slots (36 KiB at LFM2.5:
- * QK_NORM's 3072 words is the widest resident op), plus the parameters bound
+ * QK_NORM's 3072 words is the widest resident op; [plan 201 S4] 120 KiB at
+ * Gemma 4's full-attention QK_NORM, 10 x 2 x 512 words), plus the parameters
+ * bound
  * through hexkl_graph_set_param -- about 1.8 MiB at LFM2.5 (49 gammas of 8 KiB,
  * 18 x (24 + 24) KiB conv weight and state, a 512 KiB RoPE table at
  * max_seq 2048; plan 82 section 3.4) -- plus, with ROUTER_TOPK resident
@@ -27,7 +29,8 @@
  * ATTN_M1 op reads is the session's (hvx_attn_m1_f32.h's budget note), borrowed
  * through the env. [#132 Part B] With a Q4M1 kind resident: the quantized
  * activation (about 13 KiB), the dense FFN's three rows (84 KiB at inter
- * 7168), the logits (vocab floats, 256 KiB at 65536) and the slot shape
+ * 7168), the logits (vocab floats, 256 KiB at 65536; [plan 201 S4] 1 MiB
+ * at Gemma's 262144) and the slot shape
  * copy (8 B a slot) -- about 0.35 MiB of heap. The Q4M1 weights are the
  * session's (nntr_hvx_fc_q4.c's note), not the graph's.
  * [plan 201 S4] Gemma's softmax router: 30 x [2816][128] f32 weights plus
@@ -247,22 +250,30 @@ static int graph_op_rmsnorm(hexkl_graph *g, const htp_graph_op *op,
 }
 
 /* q heads with gamma[0..head_dim), k heads with gamma[head_dim..2 head_dim),
-   v copied through: the row stays q | k | v for ROPE and ATTN_M1. */
+   v copied through: the row stays q | k | v for ROPE and ATTN_M1.
+   [plan 201 S4] Gemma 4 (#4296 gemma4_causallm.cpp:672-708): with
+   HTP_GRAPH_QKNORM_V the v heads are normed with no gamma (v_norm), and
+   with HTP_GRAPH_QKNORM_K_EQ_V v is the raw k (v = k before k_norm); v is
+   written first, so in == out still reads the raw k. */
 static int graph_op_qk_norm(hexkl_graph *g, const htp_graph_op *op,
                             graph_call *call, const float *in, float *out) {
   const float *gamma = g->param[op - g->ops];
   const uint32_t hd = op->head_dim, n_q = op->gqa * op->n_kv * hd,
                  n_k = op->n_kv * hd;
   const float eps = graph_eps(op);
+  const float *v =
+    (op->feed & HTP_GRAPH_QKNORM_K_EQ_V) != 0u ? in + n_q : in + n_q + n_k;
   (void)call;
   if (gamma == NULL) {
     return AEE_EBADSTATE;
   }
+  if ((op->feed & HTP_GRAPH_QKNORM_V) != 0u) {
+    hvx_rmsnorm_f32(v, NULL, out + n_q + n_k, n_k, hd, eps, NULL);
+  } else if (v != out + n_q + n_k) {
+    memcpy(out + n_q + n_k, v, (size_t)n_k * sizeof(float));
+  }
   hvx_rmsnorm_f32(in, gamma, out, n_q, hd, eps, NULL);
   hvx_rmsnorm_f32(in + n_q, gamma + hd, out + n_q, n_k, hd, eps, NULL);
-  if (in != out) {
-    memcpy(out + n_q + n_k, in + n_q + n_k, (size_t)n_k * sizeof(float));
-  }
   return AEE_SUCCESS;
 }
 
@@ -342,14 +353,18 @@ static int graph_op_attn_m1(hexkl_graph *g, const htp_graph_op *op,
 
 /* ---- #132: the residual add and the router ------------------------------ */
 
-/* out is slot 0, the residual (the validator's rule): slot 0 += in * 1.
-   x * 1 is exact and the add rounds once, which is the CPU's copy +
-   add_i bit for bit. */
+/* out += in * 1 (LFM2: out is slot 0, the residual). x * 1 is exact and
+   the add rounds once, which is the CPU's copy + add_i bit for bit.
+   [plan 201 S4] eps_bits set: then out *= s, Gemma 4's layer_scalar
+   (#4296 gemma4_causallm.cpp:486-494, a scalar_multiply after the add). */
 static int graph_op_add(hexkl_graph *g, const htp_graph_op *op,
                         graph_call *call, const float *in, float *out) {
   (void)g;
   (void)call;
   hvx_scale_add_rows_f32(out, in, 1.0f, op->N);
+  if (op->eps_bits != 0u) {
+    hvx_mul_scalar_f32(out, graph_eps(op), op->N);
+  }
   return AEE_SUCCESS;
 }
 
@@ -438,7 +453,10 @@ static int graph_op_fc(hexkl_graph *g, const htp_graph_op *op, graph_call *call,
    (m1_swiglu_cpu_det: swiglu layer input 0 is gate), the swiglu row
    quantized, down. [#132 E5f] The SwiGLU over the pool with the scalar
    IEEE divide (hvx_swiglu_cpu_f32; E5d read DENSE_FFN at 5.6 ms/token
-   with the spec's integer division on one thread). */
+   with the spec's integer division on one thread). [plan 201 S4] Under
+   the session's HEXKL_MOE_FLAG_GEGLU (the model's activation, #209) it is
+   gelu_tanh(gate) * up (geglu_det_one), Gemma 4's dense FFN (#4296
+   gemma4_causallm.cpp:760-806: separate gate and up, tanh_gelu, multiply). */
 static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
                               graph_call *call, const float *in, float *out) {
   float *up = g->ffn, *gate = g->ffn + op->N, *act = g->ffn + 2u * op->N;
@@ -454,13 +472,20 @@ static int graph_op_dense_ffn(hexkl_graph *g, const htp_graph_op *op,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
-  hvx_swiglu_cpu_f32(gate, up, act, op->N, call->env->pool);
+  if ((call->env->moe_flags & HEXKL_MOE_FLAG_GEGLU) != 0u) {
+    hvx_geglu_f32(gate, up, act, op->N);
+  } else {
+    hvx_swiglu_cpu_f32(gate, up, act, op->N, call->env->pool);
+  }
   graph_prep(op, act, op->N, &g->act);
   return call->env->fc(call->env->fc_ctx, op->h_dn[0], op->feed, &g->act, out);
 }
 
 /* The slices into g->logits (forward hands them out as the op's output),
-   then the first maximum, as the CPU's sampler picks it. */
+   then the first maximum, as the CPU's sampler picks it. [plan 201 S4]
+   eps_bits set: the logits are soft-capped first (Gemma 4's
+   final_logit_softcapping, #4296 gemma4_causallm.cpp:855-864), so the
+   pick and the logits handed out are the capped ones, as on the CPU. */
 static int graph_op_lm_head(hexkl_graph *g, const htp_graph_op *op,
                             graph_call *call, const float *in, float *out) {
   int rc;
@@ -470,6 +495,9 @@ static int graph_op_lm_head(hexkl_graph *g, const htp_graph_op *op,
   }
   graph_prep(op, in, op->K, &g->act);
   rc = graph_q4m1_parts(g, op, call, op->h_gu, op->n_experts, g->logits);
+  if (rc == AEE_SUCCESS && op->eps_bits != 0u) {
+    hvx_softcap_f32(g->logits, op->N, graph_eps(op), call->env->pool);
+  }
   if (rc == AEE_SUCCESS) {
     /* [#132 Part B E3] the banned ids at -inf for the pick only (the
        CPU's applyBadWordsPenalty), put back in reverse so a repeated id

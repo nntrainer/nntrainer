@@ -120,6 +120,24 @@ void hvx_swiglu_cpu_f32(const float *y, const float *z, float *out, uint32_t n,
 uint32_t hvx_argmax_first_f32(const float *x, uint32_t n);
 
 /**
+ * @brief [plan 201 S4] Gemma 4's dense GeGLU: out = geglu_det_one(gate,
+ *        up) per element (swiglu_det.h, the MoE epilogue's spec), through
+ *        hvx_geglu_det_sf a vector at a time; n any (the tail scalar).
+ */
+void hvx_geglu_f32(const float *gate, const float *up, float *out, uint32_t n);
+
+/**
+ * @brief [plan 201 S4] m1_softcap_det in place over @a pool's lanes: Gemma
+ *        4's final logit soft-cap, cap a positive normal f32. n any (the
+ *        tail scalar); pool may be NULL.
+ */
+void hvx_softcap_f32(float *x, uint32_t n, float cap, hvx_worker_pool *pool);
+
+/** @brief [plan 201 S4] x[i] = x[i] * s, one IEEE multiply each (Gemma 4's
+ *         layer_scalar on the residual); n any. */
+void hvx_mul_scalar_f32(float *x, float s, uint32_t n);
+
+/**
  * @brief The MoE router of one token in the Android CPU's order
  *        (m1_router_cpu_det, #132 PR 2): logits, sigmoid, biased top-k
  *        with the lowest index winning a tie, and the normalized routing

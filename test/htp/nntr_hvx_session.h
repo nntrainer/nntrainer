@@ -51,9 +51,11 @@
 /** @brief [#132 PR 2] How many Q4M1 weights (q4m1_register) one session
  *  holds at once. [#132 Part B] 80 (the #178 probe's): the resident graph
  *  holds the whole FC set -- LFM2.5's 66 weights plus the lm_head's 8
- *  slices of 16384 rows -- in one session; the slots are 12 bytes each,
- *  the weights themselves are on the heap. */
-#define NNTR_HVX_Q4M1_SLOTS 80
+ *  slices of 16384 rows -- in one session; the slots are 16 bytes each,
+ *  the weights themselves are on the heap. [plan 201 S4] 256: Gemma 4's
+ *  FC set is about 230 (30 layers x q, k, v, o, up, gate, down less the
+ *  five full layers' v, plus the lm_head's 16 slices of 16384 rows). */
+#define NNTR_HVX_Q4M1_SLOTS 256
 
 /** @brief One Q4M1 weight on the DSP heap (memalign 128), or [#132 Part B
  *  E3] borrowed from an attached arena (q4m1_attach: never freed here).

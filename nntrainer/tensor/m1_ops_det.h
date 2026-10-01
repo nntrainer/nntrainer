@@ -113,6 +113,10 @@
  *
  *   argmax_first(x[n]): std::max_element, the first maximum wins.
  *
+ *   softcap_det(x[n], cap) ([plan 201 S4] Gemma 4's final logits):
+ *   cap * tanh(x * RN(1 / cap)) with tanh on swiglu_det.h's exp / recip
+ *   (its comment); the HTP's spec, not the CPU's libm bits.
+ *
  * DOMAIN (the analogue of LEDGER section 4's SiLU/exp argument clamp). The
  * CPU-order router and SwiGLU take any finite input, as the CPU does.
  * The norms contain no exp: d >= eps, a positive normal (the graph
@@ -751,6 +755,42 @@ static inline void m1_swiglu_cpu_det(const float *y, const float *z, float *out,
     const float e =
       m1_exp_ps_cpu_det(m1_det_float(m1_det_bits(y[i]) ^ 0x80000000u));
     out[i] = m1_det_mul(cpu_det_div_rn(y[i], m1_det_add(e, 1.0f)), z[i]);
+  }
+}
+
+/**
+ * @brief [plan 201 S4] Gemma 4's final logit soft-cap, in place:
+ *        x = cap * tanh(x * (1 / cap)), the order of #4296's
+ *        logit_softcapping layer (multiply by the f32 reciprocal, tanh,
+ *        multiply by cap).
+ *
+ * tanh(a) = 2 / (1 + exp(-2 a)) - 1 on swiglu_det.h's exp / recip (the
+ * GeGLU's sigmoid, geglu_det_one), not libm: the CPU's std::tanh is not
+ * reproducible on the DSP, so this is the HTP's spec and agrees with the
+ * CPU to rounding (D2; m1 checks give its SNR against f64), not in bits.
+ * Near a = 0 the form loses relative precision (2 s - 1 cancels): the
+ * absolute error stays about cap * 2^-23 (3.6e-6 at cap 30), below any
+ * logit gap that moves a softmax. Saturation: exp_det's clamp gives t =
+ * 1 - 2^-23 (recip_det(1) is 1 - 2^-24) above and -1 below, no NaN.
+ * Monotone up to that rounding, so the argmax of the capped row is the
+ * argmax of the raw one except where two logits round to one capped value
+ * (the first one wins, as on the CPU).
+ *
+ * @param inv RN(1 / cap): cpu_det_div_rn(1.0f, cap) (the CPU's 1.0f /
+ *            softcap; the DSP's scalar IEEE divide gives the same bits)
+ */
+static inline float m1_softcap_one_det(float x, float inv, float cap) {
+  const float a = m1_det_mul(x, inv);
+  const float e = swiglu_det_exp(m1_det_mul(-2.0f, a));
+  const float s = swiglu_det_recip(m1_det_add(1.0f, e));
+  return m1_det_mul(m1_det_sub(m1_det_mul(2.0f, s), 1.0f), cap);
+}
+
+/** @brief m1_softcap_one_det over @a n logits, in place. */
+static inline void m1_softcap_det(float *x, uint32_t n, float cap) {
+  const float inv = cpu_det_div_rn(1.0f, cap);
+  for (uint32_t i = 0; i < n; ++i) {
+    x[i] = m1_softcap_one_det(x[i], inv, cap);
   }
 }
 

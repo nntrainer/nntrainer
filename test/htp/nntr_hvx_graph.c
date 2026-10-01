@@ -12,6 +12,7 @@
  * @bug    No known bugs except for NYI items
  */
 
+#include <stdlib.h>
 #include <string.h>
 
 #include <AEEStdErr.h>
@@ -35,15 +36,21 @@ int nntr_hvx_graph_init(remote_handle64 handle, const uint32 *desc, int descLen,
     return AEE_EBADSTATE;
   }
   {
-    /* [#132 Part B] the Q4M1 slots' shapes, for the FC kinds' handles */
-    hexkl_graph_q4m1_shape q4m1[NNTR_HVX_Q4M1_SLOTS];
+    /* [#132 Part B] the Q4M1 slots' shapes, for the FC kinds' handles;
+       [plan 201 S4] on the heap (2 KiB at 256 slots, init copies it) */
+    hexkl_graph_q4m1_shape *q4m1 = (hexkl_graph_q4m1_shape *)malloc(
+      NNTR_HVX_Q4M1_SLOTS * sizeof(hexkl_graph_q4m1_shape));
     uint32_t i;
+    if (q4m1 == NULL) {
+      return AEE_ENOMEMORY;
+    }
     for (i = 0; i < NNTR_HVX_Q4M1_SLOTS; ++i) {
       q4m1[i].K = s->q4m1[i].w ? s->q4m1[i].K : 0u;
       q4m1[i].N = s->q4m1[i].w ? s->q4m1[i].N : 0u;
     }
     rc = hexkl_graph_init(desc, (uint32_t)descLen, &s->weights_u8i4, q4m1,
                           NNTR_HVX_Q4M1_SLOTS, &s->graph);
+    free(q4m1);
   }
   if (rc != AEE_SUCCESS) {
     FARF(ERROR, "graph_init: %s (0x%08x), %d words", htp_graph_err_name(rc),
