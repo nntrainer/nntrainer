@@ -1357,9 +1357,9 @@ TEST_F(HmxMmU8I4Layer, MoeLayerMatchesTwoCallReference) {
   // --- the batched call
   std::vector<float> got(static_cast<size_t>(M) * N, 1.0f); // not pre-zeroed
   int err = nntr_hvx_mm_u8i4_moe_layer(
-    handle_, M, K, I, N, h_gu.data(), static_cast<int>(h_gu.size()),
-    h_dn.data(), static_cast<int>(h_dn.size()), row_index.data(),
-    static_cast<int>(row_index.size()), row_count.data(),
+    handle_, M, K, I, N, 0u /* silu */, h_gu.data(),
+    static_cast<int>(h_gu.size()), h_dn.data(), static_cast<int>(h_dn.size()),
+    row_index.data(), static_cast<int>(row_index.size()), row_count.data(),
     static_cast<int>(row_count.size()), row_weight.data(),
     static_cast<int>(row_weight.size()), x.data(), static_cast<int>(x.size()),
     got.data(), static_cast<int>(got.size()));
@@ -1504,11 +1504,12 @@ TEST_F(HmxMmU8I4Layer, MoeLayerSplitMatchesWhole) {
     }
     out.assign(static_cast<size_t>(M) * N, 1.0f); // not pre-zeroed
     return nntr_hvx_mm_u8i4_moe_layer(
-      handle_, M, K, I, N, hg.data(), static_cast<int>(hg.size()), hd.data(),
-      static_cast<int>(hd.size()), ri.data(), static_cast<int>(ri.size()),
-      rc.data(), static_cast<int>(rc.size()), rw.data(),
-      static_cast<int>(rw.size()), x.data(), static_cast<int>(x.size()),
-      out.data(), static_cast<int>(out.size()));
+      handle_, M, K, I, N, 0u /* silu */, hg.data(),
+      static_cast<int>(hg.size()), hd.data(), static_cast<int>(hd.size()),
+      ri.data(), static_cast<int>(ri.size()), rc.data(),
+      static_cast<int>(rc.size()), rw.data(), static_cast<int>(rw.size()),
+      x.data(), static_cast<int>(x.size()), out.data(),
+      static_cast<int>(out.size()));
   };
 
   // Reference: each expert through the two calls, scatter-added on the host
@@ -1988,7 +1989,7 @@ TEST_F(HmxMmU8I4Layer, ArenaMapAndDma) {
   // Which prot/flags pair the device accepted, and what the rejected ones
   // said -- two bits each, 1 null and 2 MAP_FAILED, in the order the DSP
   // tries them.
-  static const char *kTryName[] = {"none",      "rw|shared", "r|shared",
+  static const char *kTryName[] = {"none",       "rw|shared", "r|shared",
                                    "rw|private", "r|private", "rw|0",
                                    "mmap_get"};
   field("hap_mmap_accepted", res[6] < (sizeof(kTryName) / sizeof(kTryName[0]))
@@ -2503,7 +2504,7 @@ protected:
     auto run = [&](uint32_t hg, uint32_t hd, std::vector<float> &out) {
       out.assign(static_cast<size_t>(M) * N, 1.0f);
       return nntr_hvx_mm_u8i4_moe_layer(
-        handle_, M, K, I, N, &hg, 1, &hd, 1, row_index.data(),
+        handle_, M, K, I, N, 0u /* silu */, &hg, 1, &hd, 1, row_index.data(),
         (int)row_index.size(), row_count.data(), (int)row_count.size(),
         row_weight.data(), (int)row_weight.size(), x.data(), (int)x.size(),
         out.data(), (int)out.size());
@@ -2720,8 +2721,8 @@ TEST_F(HmxMmU8I4Layer, MoeLayerFromArenaMatchesHeap) {
                  const std::vector<uint32_t> &hd, std::vector<float> &out) {
     out.assign(static_cast<size_t>(M) * N, 1.0f);
     return nntr_hvx_mm_u8i4_moe_layer(
-      handle_, M, K, I, N, hg.data(), (int)hg.size(), hd.data(), (int)hd.size(),
-      row_index.data(), (int)row_index.size(), row_count.data(),
+      handle_, M, K, I, N, 0u /* silu */, hg.data(), (int)hg.size(), hd.data(),
+      (int)hd.size(), row_index.data(), (int)row_index.size(), row_count.data(),
       (int)row_count.size(), row_weight.data(), (int)row_weight.size(),
       x.data(), (int)x.size(), out.data(), (int)out.size());
   };
