@@ -24,7 +24,9 @@
  * norms' domain is m1_ops_det.h's (d >= eps, normal). The router is the
  * third exception (#132 PR 2): the Android CPU's order, E fused sffma
  * chains on the scalar core and the spec's own sigmoid and selection
- * (m1_router_cpu_sigmoid / _pick).
+ * (m1_router_cpu_sigmoid / _pick). Gemma's softmax router (plan 201 S4) is
+ * plain Vsf chains, 32 experts a vector, and the spec's own scalar
+ * softmax / top-k / renormalise (m1_router_softmax_pick).
  */
 
 #include "hvx_m1_ops_f32.h"
@@ -275,6 +277,51 @@ void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
                       (E + ROUTER_CHAINS - 1u) / ROUTER_CHAINS);
   memcpy(logits, acc, (size_t)E * sizeof(float));
   m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
+}
+
+/* ---- [plan 201 S4] Gemma 4's softmax router ----------------------------- */
+
+typedef struct {
+  const float *x, *w;
+  uint32_t K, Ep;
+  float *acc;
+} router_sm_ctx;
+
+/** @brief Pool lane i: 32-expert blocks i, i + n, ... -- one Vsf chain
+ *         each over k in order, acc = acc + x[k] * W[k][block] (two
+ *         roundings, m1_router_softmax_det's order). */
+static void router_sm_lane(uint32_t n, uint32_t i, void *v) {
+  const router_sm_ctx *c = (const router_sm_ctx *)v;
+  for (uint32_t b = i; b < c->Ep / LANES; b += n) {
+    const float *col = c->w + (size_t)b * LANES;
+    HVX_Vector acc = Q6_V_vzero();
+    for (uint32_t k = 0; k < c->K; ++k) {
+      acc = Q6_Vsf_vadd_VsfVsf(
+        acc,
+        Q6_Vsf_vmpy_VsfVsf(hvx_splat_sf(c->x[k]),
+                           *(const HVX_UVector *)(col + (size_t)k * c->Ep)));
+    }
+    *(HVX_UVector *)(c->acc + (size_t)b * LANES) = acc;
+  }
+}
+
+void hvx_router_softmax_topk_f32(const float *x, const float *wp,
+                                 const float *pes, uint32_t K, uint32_t E,
+                                 uint32_t top_k, float *logits, uint32_t *sel,
+                                 float *weight, hvx_worker_pool *pool) {
+  float acc[M1_DET_ROUTER_SM_MAX_E];
+  const uint32_t Ep = (E + LANES - 1u) / LANES * LANES;
+  if (!x || !wp || !pes || !logits || !sel || !weight || K == 0u || E == 0u ||
+      E > M1_DET_ROUTER_SM_MAX_E || top_k == 0u || top_k > E) {
+    return;
+  }
+  /* ponytail: f32 weights, 1.4 MiB a layer at Gemma's 2816 x 128 read once
+     a token (43 MiB over 30 layers); f16 / bf16 storage halves it when the
+     router shows in the stage timers. */
+  router_sm_ctx c = {x, wp, K, Ep, acc};
+  hvx_worker_pool_run(pool, router_sm_lane, &c, Ep / LANES);
+  memcpy(logits, acc, (size_t)E * sizeof(float));
+  m1_router_softmax_pick(acc, pes, E, top_k, sel, weight);
 }
 
 /* ---- [#132 Part B E5f] SwiGLU over the pool, argmax in one vector pass -- */

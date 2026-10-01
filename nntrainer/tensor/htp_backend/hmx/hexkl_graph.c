@@ -30,6 +30,9 @@
  * 7168), the logits (vocab floats, 256 KiB at 65536) and the slot shape
  * copy (8 B a slot) -- about 0.35 MiB of heap. The Q4M1 weights are the
  * session's (nntr_hvx_fc_q4.c's note), not the graph's.
+ * [plan 201 S4] Gemma's softmax router: 30 x [2816][128] f32 weights plus
+ * 11 KiB of scales, 1.4 MiB a layer, 43 MiB (the ponytail note in
+ * hvx_router_softmax_topk_f32).
  */
 
 #include "hexkl_graph.h"
@@ -320,18 +323,27 @@ static int graph_op_add(hexkl_graph *g, const htp_graph_op *op,
 
 /* The logits go to the out slot (nothing reads them); the routing goes to
    g->route_* in ascending expert order -- tryMoeLayerOnAccelerator's
-   grouping -- and the call's routing points at it for the MOE op next. */
+   grouping -- and the call's routing points at it for the MOE op next.
+   [plan 201 S4] The softmax router (eps_bits set) norms its un-normed input
+   into the out slot first (gamma = ROUTER_BIAS's g, the validator keeps
+   in != out), then its logits overwrite it. */
 static int graph_op_router_topk(hexkl_graph *g, const htp_graph_op *op,
                                 graph_call *call, const float *in, float *out) {
   const uint32_t i = (uint32_t)(op - g->ops);
-  uint32_t sel[HTP_GRAPH_ROUTER_MAX_EXPERTS], e, r, n = 0;
-  float w[HTP_GRAPH_ROUTER_MAX_EXPERTS],
-    by_expert[HTP_GRAPH_ROUTER_MAX_EXPERTS];
+  uint32_t sel[HTP_GRAPH_MAX_EXPERTS], e, r, n = 0;
+  float w[HTP_GRAPH_MAX_EXPERTS], by_expert[HTP_GRAPH_MAX_EXPERTS];
   if (g->param[i] == NULL || g->state[i] == NULL) {
     return AEE_EBADSTATE;
   }
-  hvx_router_topk_f32(in, g->param[i], g->state[i], op->K, op->n_experts,
-                      op->top_k, out, sel, w, call->env->pool);
+  if (op->eps_bits != 0u) {
+    hvx_rmsnorm_f32(in, g->state[i], out, op->K, op->K, graph_eps(op), NULL);
+    hvx_router_softmax_topk_f32(out, g->param[i], g->state[i] + op->K, op->K,
+                                op->n_experts, op->top_k, out, sel, w,
+                                call->env->pool);
+  } else {
+    hvx_router_topk_f32(in, g->param[i], g->state[i], op->K, op->n_experts,
+                        op->top_k, out, sel, w, call->env->pool);
+  }
   memset(g->route_cnt, 0, sizeof(g->route_cnt));
   for (r = 0; r < op->top_k; ++r) {
     g->route_cnt[sel[r]] = 1u;
@@ -644,8 +656,10 @@ static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which) {
     return op->kind == HTP_OP_CONV1D_GATE ? 2u * op->N : 0u;
   case HTP_GRAPH_PARAM_ROUTER_W:
     return op->kind == HTP_OP_ROUTER_TOPK ? op->K * op->n_experts : 0u;
-  case HTP_GRAPH_PARAM_ROUTER_BIAS:
-    return op->kind == HTP_OP_ROUTER_TOPK ? op->n_experts : 0u;
+  case HTP_GRAPH_PARAM_ROUTER_BIAS: /* softmax: g[K] | per-expert scale */
+    return op->kind != HTP_OP_ROUTER_TOPK ? 0u
+           : op->eps_bits != 0u           ? op->K + op->n_experts
+                                          : op->n_experts;
   default:
     return 0u;
   }
@@ -739,9 +753,11 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
     return AEE_EINVALIDFORMAT;
   }
   if (which == HTP_GRAPH_PARAM_ROUTER_W) {
-    /* one vector per weight row: [K][E] padded to [K][32], zero lanes */
+    /* [K][E] padded to [K][W], zero lanes: one vector a row for the
+       sigmoid router, E rounded up to 32 for the softmax one */
     const uint32_t K = g->ops[op].K, E = g->ops[op].n_experts;
-    const uint32_t W = HTP_GRAPH_ROUTER_MAX_EXPERTS;
+    const uint32_t W = g->ops[op].eps_bits != 0u ? (E + 31u) / 32u * 32u
+                                                 : HTP_GRAPH_ROUTER_MAX_EXPERTS;
     uint32_t k;
     if (E > W) { /* the sigmoid router's width (htp_graph_desc.h) */
       return AEE_ESCHEMENOTSUPPORTED;

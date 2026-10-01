@@ -95,6 +95,13 @@
  *     ponytail: LFM2's router constants are hard-coded here; a router with
  *     another scale or no normalization needs them in the op record.
  *
+ *   router_softmax_det(x[K], W[K][E], pes[E], top_k), E <= 128 ([plan 201
+ *   S4] Gemma 4, #4296's Gemma4MoELayer; x is its input already normed and
+ *   scaled, see m1_router_input_scale_det): unfused chains, softmax with
+ *   swiglu_det.h's exp / recip, top_k with the lowest index on a tie,
+ *   renormalised over the chosen and times the per-expert scale (the
+ *   function's comment has the order).
+ *
  *   swiglu_cpu_det(y[n], z[n]): neon::swiglu with neon_mathfun's exp_ps as
  *   the binary computes it (one fused step, the rest separate; plan 132
  *   section 0.2): out = RN(y / (exp_ps(-y) + 1)) * z. The MoE's own
@@ -128,6 +135,7 @@
 
 #include "attn_m1_det.h"
 #include "q4_gemv_cpu_det.h"
+#include "swiglu_det.h"
 
 /** @brief f32 lanes in one 128-byte HVX vector; the reduction's width. */
 #define M1_DET_LANES 32u
@@ -496,6 +504,99 @@ static inline void m1_router_cpu_det(const float *x, const float *w,
     m1_router_cpu_sigmoid(acc, bias[e], &sig[e], &score[e]);
   }
   m1_router_cpu_pick(sig, score, E, top_k, sel, weight);
+}
+
+/* ---- [plan 201 S4] Gemma 4's softmax router ---------------------------- */
+
+/** @brief The softmax router's widest expert set (Gemma 4: 128). */
+#define M1_DET_ROUTER_SM_MAX_E 128u
+
+/** @brief g[f] = RN(router_scale[f] * RN(1 / RN(sqrt(H)))): #4296's
+ *         per-feature factor `router_scale[feature] * hidden_scale`, with
+ *         hidden_scale = 1.0f / std::sqrt((float)H), each step correctly
+ *         rounded as on the CPU. The norm's (x * r) * g is then the CPU's
+ *         rms_norm_wrt_width followed by `row[f] *= g[f]`, bit for bit. */
+static inline void m1_router_input_scale_det(const float *router_scale,
+                                             uint32_t H, float *g) {
+  const float hs = m1_recip_rn_det(m1_sqrt_rn_det((float)H));
+  for (uint32_t f = 0; f < H; ++f) {
+    g[f] = m1_det_mul(router_scale[f], hs);
+  }
+}
+
+/**
+ * @brief The softmax router after its logits (shared by the spec and the
+ *        DSP kernel): m = max logit; e = exp_det(l - m); p = e * recip_det(
+ *        sum e, in expert order); top_k by p, the LOWEST index on a tie;
+ *        t = sum of the chosen p in selection order; weight = (p *
+ *        recip_det(t)) * per_expert_scale. #4296 divides where this takes
+ *        recip_det, and its topK is an unstable std::partial_sort, so an
+ *        exact tie may go either way there (D2: not bit-preserving).
+ *
+ * @param E      1..M1_DET_ROUTER_SM_MAX_E; logits finite
+ * @param top_k  1..E
+ */
+static inline void m1_router_softmax_pick(const float *logits, const float *pes,
+                                          uint32_t E, uint32_t top_k,
+                                          uint32_t *sel, float *weight) {
+  float p[M1_DET_ROUTER_SM_MAX_E], m = logits[0], s = 0.0f, t = 0.0f, inv;
+  uint8_t taken[M1_DET_ROUTER_SM_MAX_E];
+  uint32_t e, r;
+  for (e = 1; e < E; ++e) {
+    m = logits[e] > m ? logits[e] : m;
+  }
+  for (e = 0; e < E; ++e) {
+    p[e] = swiglu_det_exp(m1_det_sub(logits[e], m));
+    s = m1_det_add(s, p[e]);
+    taken[e] = 0u;
+  }
+  inv = swiglu_det_recip(s);
+  for (e = 0; e < E; ++e) {
+    p[e] = m1_det_mul(p[e], inv);
+  }
+  for (r = 0; r < top_k; ++r) {
+    uint32_t best = E;
+    for (e = 0; e < E; ++e) {
+      if (!taken[e] && (best == E || p[e] > p[best])) {
+        best = e;
+      }
+    }
+    taken[best] = 1u;
+    sel[r] = best;
+    t = m1_det_add(t, p[best]);
+  }
+  inv = swiglu_det_recip(t);
+  for (r = 0; r < top_k; ++r) {
+    weight[r] = m1_det_mul(m1_det_mul(p[sel[r]], inv), pes[sel[r]]);
+  }
+}
+
+/**
+ * @brief Gemma 4's router of one token after its input norm (plan 201 S4;
+ *        Gemma4MoELayer::forwardTensors in nntrainer/nntrainer#4296): the
+ *        logits as E unfused chains over k in order, acc = RN(acc +
+ *        RN(x[k] * W[k][e])) -- 32 experts a vector on HVX -- then
+ *        m1_router_softmax_pick. The whole router is m1_rmsnorm_det(h,
+ *        g, x, H, H, eps) with g from m1_router_input_scale_det, then this.
+ *
+ * @param x       K floats: the normed, scaled router input
+ * @param w       K x E floats, row-major [K][E]
+ * @param pes     E floats, the per-expert scale
+ * @param E       1..M1_DET_ROUTER_SM_MAX_E
+ */
+static inline void m1_router_softmax_det(const float *x, const float *w,
+                                         const float *pes, uint32_t K,
+                                         uint32_t E, uint32_t top_k,
+                                         float *logits, uint32_t *sel,
+                                         float *weight) {
+  for (uint32_t e = 0; e < E; ++e) {
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < K; ++k) {
+      acc = m1_det_add(acc, m1_det_mul(x[k], w[(size_t)k * E + e]));
+    }
+    logits[e] = acc;
+  }
+  m1_router_softmax_pick(logits, pes, E, top_k, sel, weight);
 }
 
 /** @brief neon_mathfun's exp_ps for one lane, as the shipped binary runs

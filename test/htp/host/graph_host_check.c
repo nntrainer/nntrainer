@@ -266,6 +266,14 @@ static void mut_rmsnorm_k_not_32(uint32_t *w, uint32_t *n) {
   htp_graph_op_at(w, w[3] - 2u)->N = 2072u;
   (void)n;
 }
+/* [plan 201 S4] a softmax router (eps set) norming over its own input
+   slot */
+static void mut_softmax_router_in_is_out(uint32_t *w, uint32_t *n) {
+  htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 1));
+  op->eps_bits = 0x358637BDu; /* 1e-6f */
+  op->out_slot = op->in_slot;
+  (void)n;
+}
 /* #132: the residual add's and the router's rules */
 static void mut_add_rmsnorm_cpu(uint32_t *w, uint32_t *n) {
   htp_graph_op_at(w, nth_op(w, HTP_OP_RMSNORM, 7))->resident = 0u;
@@ -329,6 +337,8 @@ static const struct {
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
   {"RMSNORM resident at K 2072", mut_rmsnorm_k_not_32,
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+  {"softmax ROUTER_TOPK in_slot == out_slot", mut_softmax_router_in_is_out,
+   HTP_GRAPH_E_INVALIDFORMAT},
   {"ADD resident, a RMSNORM not", mut_add_rmsnorm_cpu, HTP_GRAPH_E_NOTALLOWED},
   {"ROUTER_TOPK resident, its MOE not", mut_router_moe_cpu,
    HTP_GRAPH_E_NOTALLOWED},
@@ -800,6 +810,12 @@ static void check_limits(void) {
   rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, NULL);
   CHECK(rc == HTP_GRAPH_E_SCHEMENOTSUPPORTED,
         "resident router over 128 experts: %s", htp_graph_err_name(rc));
+  /* [plan 201 S4] the softmax router (eps set) takes 128 */
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->eps_bits = 0x358637BDu;
+  rc = htp_graph_validate(w, n, HTP_GRAPH_KINDS_ALL, NULL);
+  CHECK(rc == 0u, "resident softmax router over 128 experts: %s",
+        htp_graph_err_name(rc));
+  htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->eps_bits = 0u;
   htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->resident = 0u;
 
   rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
@@ -1165,7 +1181,9 @@ static void bind_hd64(uint32_t *w) {
   }
 }
 
-static void check_add_router(void) {
+/* [plan 201 S4] gemma: the same stretch with the router op made Gemma's
+   softmax router (eps_bits set, ROUTER_BIAS = g | per-expert scale). */
+static void check_add_router(int gemma) {
   static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
                     HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
   const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
@@ -1174,7 +1192,9 @@ static void check_add_router(void) {
   uint32_t n, rc, resume, seed = 132u, i, e, r, nr = 0;
   static float x[HID], a[HID], a2[HID], out[HID], ref[HID], h[HID], nrm[HID];
   static float gam[4][HID], rw[HID * HD64_E], moe[HID];
-  float rbias[HD64_E], lg[HD64_E], wt[HD64_TOP];
+  static float rbias[HID + HD64_E], rsc[HID];
+  float lg[HD64_E], wt[HD64_TOP];
+  const uint32_t n_bias = gemma ? HID + HD64_E : HD64_E;
   uint32_t sel[HD64_TOP], r_idx[HD64_TOP], r_cnt[HD64_E] = {0};
   float r_w[HD64_TOP], by_e[HD64_E];
   uint32_t op_norm[4], op_add0, op_add1, op_router;
@@ -1191,6 +1211,10 @@ static void check_add_router(void) {
   env.scratch = &g_scratch;
   n = build(w, cap, &kHd64, "CAC", D_KINDS);
   bind_hd64(w);
+  if (gemma) {
+    memcpy(&htp_graph_op_at(w, nth_op(w, HTP_OP_ROUTER_TOPK, 0))->eps_bits,
+           &kHd64.eps, sizeof(float));
+  }
   rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
   CHECK(rc == 0u && g != NULL, "hd64 D init: %s", htp_graph_err_name(rc));
   if (g == NULL)
@@ -1227,6 +1251,11 @@ static void check_add_router(void) {
   fill(a2, HID, &seed);
   fill(rw, HID * HD64_E, &seed);
   fill(rbias, HD64_E, &seed);
+  if (gemma) { /* g from a router_scale, then the per-expert scale */
+    fill(rsc, HID, &seed);
+    m1_router_input_scale_det(rsc, HID, rbias);
+    fill(rbias + HID, HD64_E, &seed);
+  }
 
   /* (1) a router with no weights bound: AEE_EBADSTATE (ADD and the norm
      ran first and moved slot 0; op 0 below re-seeds it) */
@@ -1248,7 +1277,7 @@ static void check_add_router(void) {
                                        rw, HID * HD64_E);
   CHECK(rc == 0u, "set router W: %s", htp_graph_err_name(rc));
   rc = (uint32_t)hexkl_graph_set_param(
-    g, op_router, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, HD64_E);
+    g, op_router, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, n_bias);
   CHECK(rc == 0u, "set router bias: %s", htp_graph_err_name(rc));
 
   /* (2) op 0 seeds slot 0 with the embedding row x */
@@ -1280,8 +1309,16 @@ static void check_add_router(void) {
         htp_graph_err_name(rc), resume);
   for (i = 0; i < HID; ++i)
     h[i] = m1_det_add(h[i], a2[i]);
-  m1_rmsnorm_det(h, gam[2], nrm, HID, HID, kHd64.eps, NULL);
-  m1_router_cpu_det(nrm, rw, rbias, HID, HD64_E, HD64_TOP, lg, sel, wt);
+  if (gemma) {
+    static float xs[HID];
+    m1_rmsnorm_det(h, gam[2], nrm, HID, HID, kHd64.eps, NULL);
+    m1_rmsnorm_det(nrm, rbias, xs, HID, HID, kHd64.eps, NULL);
+    m1_router_softmax_det(xs, rw, rbias + HID, HID, HD64_E, HD64_TOP, lg, sel,
+                          wt);
+  } else {
+    m1_rmsnorm_det(h, gam[2], nrm, HID, HID, kHd64.eps, NULL);
+    m1_router_cpu_det(nrm, rw, rbias, HID, HD64_E, HD64_TOP, lg, sel, wt);
+  }
   for (r = 0; r < HD64_TOP; ++r) {
     r_cnt[sel[r]] = 1u;
     by_e[sel[r]] = wt[r];
@@ -1309,9 +1346,10 @@ static void check_add_router(void) {
   err |= memcmp(out, ref, sizeof(ref)) != 0 || memcmp(g->slots, h, sizeof(h));
   hexkl_graph_free(g);
   if (err == 0)
-    printf("GRAPH STRETCH BIT-IDENTICAL: ADD+RMSNORM "
+    printf("GRAPH STRETCH BIT-IDENTICAL%s: ADD+RMSNORM "
            "ADD+RMSNORM+ROUTER_TOPK+MOE+ADD+RMSNORM (hd64 shape, MOE on the "
-           "stand-in, slot 0 carried across calls, resume_at the next FC)\n");
+           "stand-in, slot 0 carried across calls, resume_at the next FC)\n",
+           gemma ? " (Gemma softmax router)" : "");
 }
 
 /* ---- #132 Part B: the Q4M1 kinds against the CPU-order specs ---------- */
@@ -1675,7 +1713,8 @@ int main(void) {
   check_forward();
   check_limits();
   check_stretches();
-  check_add_router();
+  check_add_router(0);
+  check_add_router(1);
   check_q4m1();
   if (g_fail) {
     printf("GRAPH CHECKS FAILED (%d)\n", g_fail);

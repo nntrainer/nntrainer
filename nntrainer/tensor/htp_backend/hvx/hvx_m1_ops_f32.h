@@ -127,4 +127,27 @@ void hvx_router_topk_f32(const float *x, const float *w32, const float *bias,
                          uint32_t K, uint32_t E, uint32_t top_k, float *logits,
                          uint32_t *sel, float *weight, hvx_worker_pool *pool);
 
+/**
+ * @brief [plan 201 S4] Gemma 4's router after its input norm
+ *        (m1_router_softmax_det): logits as unfused Vsf chains over k, 32
+ *        experts a vector and a vector per pool lane, then the spec's own
+ *        m1_router_softmax_pick (softmax, top-k with the lowest index on a
+ *        tie, renormalised, times the per-expert scale).
+ *
+ * @param x       K floats: rmsnorm(h) * m1_router_input_scale_det's g
+ * @param wp      K x Ep floats: [K][E] padded to Ep = E rounded up to 32
+ *                columns (lanes >= E are read and ignored)
+ * @param pes     E floats, the per-expert scale
+ * @param E       1..128
+ * @param top_k   1..E
+ * @param logits  E floats out; may alias x (written after the last read)
+ * @param sel     top_k expert indices out, in selection order
+ * @param weight  top_k routing weights out, in selection order
+ * @param pool    the lanes for the chains (NULL: the caller alone)
+ */
+void hvx_router_softmax_topk_f32(const float *x, const float *wp,
+                                 const float *pes, uint32_t K, uint32_t E,
+                                 uint32_t top_k, float *logits, uint32_t *sel,
+                                 float *weight, hvx_worker_pool *pool);
+
 #endif /* __NNTRAINER_HVX_M1_OPS_F32_H__ */

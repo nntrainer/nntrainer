@@ -219,13 +219,15 @@ graph_check "$BACKEND/hmx/hexkl_graph.c" "$OUT/graph_host_check"
 # gate and up swapped; the part offset fixed at one group; down fed the
 # FFN input's quantization; the argmax over the first slice only; [plan 201
 # S1] the miss round's experts before the first miss dropped, and its later
-# rows added in reverse order
+# rows added in reverse order; [plan 201 S4] the softmax router run as the
+# sigmoid one
 for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, gate, act, op->N,/' \
   's/y += g->q4m1\[h\[p\]\].N;/y += Q4M1_GROUP;/' \
   's/graph_prep(op, act, op->N, &g->act);/(void)act;/' \
   's/hvx_argmax_first_f32(g->logits, op->N)/hvx_argmax_first_f32(g->logits, op->N \/ 2u)/' \
   's/  if (first != 0u) {/  if (0) {/' \
-  's/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)i \* op->N_out, 1.0f,/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)(n - 1u - i + first) * op->N_out, 1.0f,/'; do
+  's/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)i \* op->N_out, 1.0f,/    hvx_scale_add_rows_f32(out, g->moe_rows + (size_t)(n - 1u - i + first) * op->N_out, 1.0f,/' \
+  's/  if (op->eps_bits != 0u) {/  if (0) {/'; do
   sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
   if cmp -s "$OUT/hexkl_graph_mutant.c" "$BACKEND/hmx/hexkl_graph.c"; then
     echo "GRAPH Q4M1 MUTATION DID NOT APPLY: $mut"; exit 1
@@ -288,6 +290,24 @@ done
   "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
 
 "$OUT/m1_ops_host_check"
+# [plan 201 S4] The softmax router's renormalisation skipped in the spec
+# (weight = p * per-expert scale): the kernel calls the same pick, so only
+# the check against #4296's formula in double can see it -- it must.
+mkdir -p "$OUT/mut_m1"
+mut='s/  inv = swiglu_det_recip(t);/  inv = 1.0f;/'
+sed "$mut" "$BACKEND/../m1_ops_det.h" > "$OUT/mut_m1/m1_ops_det.h"
+if cmp -s "$OUT/mut_m1/m1_ops_det.h" "$BACKEND/../m1_ops_det.h"; then
+  echo "ROUTER SOFTMAX MUTATION DID NOT APPLY: $mut"; exit 1
+fi
+"$cc" -std=c99 -O2 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off \
+  -I "$OUT/mut_m1" -I "$HERE/hvx_emu" -I "$BACKEND/.." -I "$BACKEND/hvx" \
+  -o "$OUT/m1_ops_mutant" \
+  "$HERE/m1_ops_host_check.c" "$BACKEND/hvx/hvx_m1_ops_f32.c" \
+  "$BACKEND/hvx/hvx_conv_gate_f32.c" -lm
+if "$OUT/m1_ops_mutant" > "$OUT/m1_ops_mutant.log"; then
+  echo "ROUTER SOFTMAX MUTANT PASSED (the check is blind): $mut"; exit 1
+fi
+echo "ROUTER SOFTMAX MUTANT CAUGHT: renormalise skipped ($(grep -c '^FAIL: router softmax' "$OUT/m1_ops_mutant.log") failed checks)"
 
 # [plan 201 S4] The MoE epilogue's GeGLU-tanh: geglu_det_one (swiglu_det.h)
 # against f64 incl. the tanh saturation ends and subnormals, then the REAL
