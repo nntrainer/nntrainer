@@ -100,6 +100,33 @@ inline void whPack(const int8_t *rm, uint32_t K, uint32_t N, uint8_t *out) {
 }
 
 /**
+ * @brief whPack's inverse: WH bytes back to one sign-extended int4 per int8,
+ *        K rows of N, row stride N.
+ *
+ * A host-side reader for the weights the model file keeps in tile order, so
+ * that a reference path (NNTR_MOE_DIFF) can dequantize the bytes the DSP is
+ * running without the DSP. Same K, N contract as whPack, and
+ * nntrainer_cpu_backend_standalone.wh_pack_unpacks_like_the_load_path is the
+ * round trip.
+ */
+inline void whUnpack(const uint8_t *wh, uint32_t K, uint32_t N, int8_t *rm) {
+  const uint32_t k_tiles = K / WH_TILE, n_tiles = N / WH_TILE;
+  for (uint32_t kt = 0; kt < k_tiles; ++kt) {
+    for (uint32_t nt = 0; nt < n_tiles; ++nt) {
+      const uint8_t *tile = wh + ((size_t)kt * n_tiles + nt) * WH_TILE_BYTES;
+      for (uint32_t r = 0; r < WH_TILE; ++r) {
+        int8_t *row = rm + (size_t)(kt * WH_TILE + r) * N + nt * WH_TILE;
+        for (uint32_t c = 0; c < WH_TILE; ++c) {
+          const uint32_t sl = whSlot(r, c);
+          const uint8_t nib = (tile[sl / 2] >> (4 * (sl % 2))) & 0x0Fu;
+          row[c] = static_cast<int8_t>(nib > 7u ? (int)nib - 16 : (int)nib);
+        }
+      }
+    }
+  }
+}
+
+/**
  * @brief The whole pages of [src, src + len) -- what the arena copy can hand
  *        back to the OS once a weight's bytes are in the arena.
  *
