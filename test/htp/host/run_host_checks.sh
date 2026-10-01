@@ -241,6 +241,25 @@ for mut in 's/hvx_swiglu_cpu_f32(gate, up, act, op->N,/hvx_swiglu_cpu_f32(up, ga
   fi
   echo "GRAPH Q4M1 MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
 done
+# [plan 201 S4] Gemma 4's kernels in hexkl_graph.c, each mutant must fail
+# the check's Gemma half: the v norm with k's gamma, attention_k_eq_v
+# ignored (v read from the row's v part), the dense FFN's GeGLU flag
+# ignored (SwiGLU), the soft-cap skipped, layer_scalar dropped.
+for mut in 's/    hvx_rmsnorm_f32(v, NULL, out + n_q + n_k, n_k, hd, eps, NULL);/    hvx_rmsnorm_f32(v, gamma + hd, out + n_q + n_k, n_k, hd, eps, NULL);/' \
+  's/    (op->feed \& HTP_GRAPH_QKNORM_K_EQ_V) != 0u ? in + n_q : in + n_q + n_k;/    0 ? in + n_q : in + n_q + n_k;/' \
+  's/  if ((call->env->moe_flags \& HEXKL_MOE_FLAG_GEGLU) != 0u) {/  if (0) {/' \
+  's/  if (rc == AEE_SUCCESS \&\& op->eps_bits != 0u) {/  if (0) {/' \
+  's/    hvx_mul_scalar_f32(out, graph_eps(op), op->N);/    (void)0;/'; do
+  sed "$mut" "$BACKEND/hmx/hexkl_graph.c" > "$OUT/hexkl_graph_mutant.c"
+  if cmp -s "$OUT/hexkl_graph_mutant.c" "$BACKEND/hmx/hexkl_graph.c"; then
+    echo "GRAPH GEMMA MUTATION DID NOT APPLY: $mut"; exit 1
+  fi
+  graph_check "$OUT/hexkl_graph_mutant.c" "$OUT/graph_mutant"
+  if "$OUT/graph_mutant" > "$OUT/graph_mutant.log"; then
+    echo "GRAPH GEMMA MUTANT PASSED (the check is blind): $mut"; exit 1
+  fi
+  echo "GRAPH GEMMA MUTANT CAUGHT: $mut ($(grep -c '^FAIL' "$OUT/graph_mutant.log") failed checks)"
+done
 
 # [#132 Part B E2, #211] The one-PD token driver (hmx/hexkl_token.c): one
 # session over the hd64 list with every kind resident, bit-identical to the

@@ -53,7 +53,15 @@
    m1_swiglu_cpu_det, m1_argmax_first); init's handle refusals; the feed
    word reaching the runner; and the two sessions' complementary masks on
    the LFM2.5 list (each validates, together they are every kind, and
-   their stretches alternate at the MoE hops). run_host_checks.sh then
+   their stretches alternate at the MoE hops).
+
+   [plan 201 S4] Gemma 4, one layer in the 3-slot plan (htp_graph_desc.h's
+   HTP_GRAPH_N_SLOTS note): its record mutations; QK_NORM at head_dim 256
+   (v norm) and 512 (v norm, k = v) against m1_rmsnorm_det; the FFN stretch
+   (MoE branch on the stand-in, dense GeGLU branch on the REAL GEMV, the
+   branch sum, post norm, layer_scalar) against #4296's order; the
+   262144-row head soft-capped; the soft-cap spec against f64 and its HVX
+   form and the dense GeGLU row bit for bit. run_host_checks.sh then
    builds this file against mutants of hexkl_graph.c, each of which must
    fail it. */
 #include "hexkl_graph.h"
@@ -66,6 +74,7 @@
 #include <string.h>
 
 #include "attn_m1_det.h"
+#include "hvx_m1_ops_f32.h"
 #include "hvx_q4_gemv_f32.h"
 #include "hvx_worker_pool.h"
 #include "m1_ops_det.h"
@@ -312,7 +321,9 @@ static void mut_router_moe_cpu(uint32_t *w, uint32_t *n) {
   (void)n;
 }
 static void mut_add_out_slot_1(uint32_t *w, uint32_t *n) {
-  htp_graph_op_at(w, nth_op(w, HTP_OP_ADD, 3))->out_slot = 1u;
+  /* [plan 201 S4] any out slot but the in slot (Gemma's branch sum) */
+  htp_graph_op *op = htp_graph_op_at(w, nth_op(w, HTP_OP_ADD, 3));
+  op->out_slot = op->in_slot;
   (void)n;
 }
 static void mut_truncated(uint32_t *w, uint32_t *n) {
@@ -376,7 +387,7 @@ static const struct {
   {"ADD resident, a RMSNORM not", mut_add_rmsnorm_cpu, HTP_GRAPH_E_NOTALLOWED},
   {"ROUTER_TOPK resident, its MOE not", mut_router_moe_cpu,
    HTP_GRAPH_E_NOTALLOWED},
-  {"ADD out_slot 1", mut_add_out_slot_1, HTP_GRAPH_E_INVALIDFORMAT},
+  {"ADD out_slot == in_slot", mut_add_out_slot_1, HTP_GRAPH_E_INVALIDFORMAT},
 };
 
 static void check_validator(void) {
@@ -1358,7 +1369,7 @@ static void check_add_router(int gemma) {
 }
 
 /* ---- #132 Part B: the Q4M1 kinds against the CPU-order specs ---------- */
-#define Q_SLOTS 16u
+#define Q_SLOTS 32u
 static uint8_t *g_qw[Q_SLOTS]; /* Q4M1 bytes the host runner reads */
 static uint8_t *g_qc[Q_SLOTS]; /* the same weight, canonical block_q4_0 */
 static hexkl_graph_q4m1_shape g_qs[Q_SLOTS];
@@ -1975,6 +1986,470 @@ static void check_gemma_attn(void) {
            G4_WIN);
 }
 
+/* ---- [plan 201 S4] Gemma 4: QK_NORM at 256 / 512 with the v norm, the
+   two-branch FFN, the soft-capped 262144-row head ---------------------- */
+
+/* One Gemma 4 decoder layer and the tail as #4296 builds them
+   (gemma4_causallm.cpp:347-513, gemma4_moe_causallm.cpp:49-103), in the
+   slot plan of htp_graph_desc.h's HTP_GRAPH_N_SLOTS note. ponytail: one
+   layer here; the model builder (a later S4 slice) repeats it per layer
+   with each layer's attention shape. */
+typedef struct {
+  uint32_t hidden, hd, gqa, n_kv, qk_feed, inter_dense, inter_moe, E, top_k;
+  uint32_t vocab, max_seq;
+  float eps, layer_scalar, softcap;
+} gemma_shape;
+
+static uint32_t build_gemma(uint32_t *w, uint32_t cap, const gemma_shape *s,
+                            uint32_t mask) {
+  const uint32_t h = s->hidden, qkv = (s->gqa + 2u) * s->n_kv * s->hd;
+  uint32_t n = 0, a, i, last_mm, eps_bits;
+  htp_graph_op *op;
+  if (cap < htp_graph_words_for(1u, 20u))
+    return 0u;
+  memcpy(&eps_bits, &s->eps, sizeof(eps_bits));
+  w[0] = HTP_GRAPH_MAGIC;
+  w[1] = HTP_GRAPH_VERSION;
+  w[2] = 1u;
+  w[3] = 0u;
+  w[4] = h;
+  w[5] = s->vocab;
+  w[6] = s->max_seq;
+  w[HTP_GRAPH_HEADER_WORDS] = HTP_GRAPH_LAYER_ATTN;
+  w[HTP_GRAPH_HEADER_WORDS + 1u] = HTP_GRAPH_FFN_DENSE_MOE;
+#define EMIT(kind, K, N, i_, o_)                                               \
+  htp_graph_lfm2_emit(w, &n, (kind), 0u, (K), (N), (i_), (o_), mask)
+  EMIT(HTP_OP_RMSNORM, h, h, 0, 1)->eps_bits = eps_bits; /* input_layernorm */
+  EMIT(HTP_OP_FC, h, qkv, 1, 2);
+  op = EMIT(HTP_OP_QK_NORM, qkv, qkv, 2, 2);
+  op->eps_bits = eps_bits;
+  op->feed = s->qk_feed;
+  EMIT(HTP_OP_ROPE, qkv, qkv, 2, 2);
+  EMIT(HTP_OP_ATTN_M1, qkv, s->gqa * s->n_kv * s->hd, 2, 1);
+  for (a = n - 3u; a < n; ++a) {
+    op = htp_graph_op_at(w, a);
+    op->n_kv = s->n_kv;
+    op->gqa = s->gqa;
+    op->head_dim = s->hd;
+  }
+  EMIT(HTP_OP_FC, s->gqa * s->n_kv * s->hd, h, 1, 2);
+  EMIT(HTP_OP_RMSNORM, h, h, 2, 1)->eps_bits = eps_bits; /* post_attention */
+  EMIT(HTP_OP_ADD, h, h, 1, 0);
+  /* the MoE branch first: pre_ffn_norm_2, router on the un-normed stream,
+     experts, post_ffn_norm_2 */
+  EMIT(HTP_OP_RMSNORM, h, h, 0, 1)->eps_bits = eps_bits;
+  op = EMIT(HTP_OP_ROUTER_TOPK, h, s->E, 0, 2);
+  op->n_experts = s->E;
+  op->top_k = s->top_k;
+  op->eps_bits = eps_bits;
+  op = EMIT(HTP_OP_MOE, h, s->inter_moe, 1, 2);
+  op->N_out = h;
+  op->n_experts = s->E;
+  op->top_k = s->top_k;
+  EMIT(HTP_OP_RMSNORM, h, h, 2, 2)->eps_bits = eps_bits;
+  /* the dense branch in place on slot 1: pre_ffn_norm, GeGLU MLP,
+     post_ffn_norm_1; then the branch sum, post_ffn_norm, the residual
+     add times layer_scalar */
+  EMIT(HTP_OP_RMSNORM, h, h, 0, 1)->eps_bits = eps_bits;
+  EMIT(HTP_OP_DENSE_FFN, h, s->inter_dense, 1, 1)->N_out = h;
+  EMIT(HTP_OP_RMSNORM, h, h, 1, 1)->eps_bits = eps_bits;
+  EMIT(HTP_OP_ADD, h, h, 1, 2);
+  EMIT(HTP_OP_RMSNORM, h, h, 2, 1)->eps_bits = eps_bits;
+  memcpy(&EMIT(HTP_OP_ADD, h, h, 1, 0)->eps_bits, &s->layer_scalar, 4u);
+  op = htp_graph_lfm2_emit(w, &n, HTP_OP_RMSNORM, 1u, h, h, 0, 1, mask);
+  op->eps_bits = eps_bits;
+  op = htp_graph_lfm2_emit(w, &n, HTP_OP_LM_HEAD, 1u, h, s->vocab, 1, 2, mask);
+  memcpy(&op->eps_bits, &s->softcap, 4u);
+#undef EMIT
+  w[3] = n;
+  last_mm = HTP_GRAPH_NO_OP;
+  for (i = n; i-- > 0u;) {
+    op = htp_graph_op_at(w, i);
+    op->next_mm = last_mm;
+    if (htp_graph_kind_streams_weights(op->kind))
+      last_mm = i;
+  }
+  return htp_graph_words_for(1u, n);
+}
+/* build_gemma's op indices */
+enum {
+  GM_QK = 2,
+  GM_ADD_ATTN = 7,
+  GM_PRE2 = 8,
+  GM_ROUTER = 9,
+  GM_MOE = 10,
+  GM_POST2 = 11,
+  GM_PRE = 12,
+  GM_DENSE = 13,
+  GM_POST1 = 14,
+  GM_ADD_BR = 15,
+  GM_POSTFFN = 16,
+  GM_ADD_RES = 17,
+  GM_FIN = 18,
+  GM_LM = 19
+};
+
+/* the record mutations of the Gemma list */
+static void gm_qk_feed_bit0(uint32_t *w) {
+  htp_graph_op_at(w, GM_QK)->feed |= 1u;
+}
+static void gm_qk_head_dim_1024(uint32_t *w) {
+  htp_graph_op *op = htp_graph_op_at(w, GM_QK);
+  op->head_dim = 1024u; /* a consistent record: (1 + 2) x 1 x 1024 */
+  op->n_kv = 1u;
+  op->gqa = 1u;
+  op->K = op->N = 3072u;
+}
+static void gm_add_in_is_out(uint32_t *w) {
+  htp_graph_op_at(w, GM_ADD_BR)->in_slot = 2u;
+}
+static void gm_add_scale_inf(uint32_t *w) {
+  htp_graph_op_at(w, GM_ADD_RES)->eps_bits = 0x7F800000u;
+}
+static void gm_softcap_negative(uint32_t *w) {
+  htp_graph_op_at(w, GM_LM)->eps_bits |= 0x80000000u;
+}
+static void gm_ffn_kind_3(uint32_t *w) { w[HTP_GRAPH_HEADER_WORDS + 1u] = 3u; }
+static void gm_ffn_kind_moe(uint32_t *w) {
+  w[HTP_GRAPH_HEADER_WORDS + 1u] = HTP_GRAPH_FFN_MOE;
+}
+static void gm_ffn_kind_dense(uint32_t *w) {
+  w[HTP_GRAPH_HEADER_WORDS + 1u] = HTP_GRAPH_FFN_DENSE;
+}
+
+/* The CPU's QK_NORM composition (#4296 gemma4_causallm.cpp:660-708): q and
+   k per head with their gammas, v (the raw k under K_EQ_V) with none. */
+static void spec_qk_norm(const float *in, const float *gamma, float *out,
+                         uint32_t hd, uint32_t gqa, uint32_t n_kv,
+                         uint32_t feed, float eps) {
+  const uint32_t n_q = gqa * n_kv * hd, n_k = n_kv * hd;
+  const float *v = (feed & HTP_GRAPH_QKNORM_K_EQ_V) ? in + n_q : in + n_q + n_k;
+  m1_rmsnorm_det(in, gamma, out, n_q, hd, eps, NULL);
+  m1_rmsnorm_det(in + n_q, gamma + hd, out + n_q, n_k, hd, eps, NULL);
+  if (feed & HTP_GRAPH_QKNORM_V)
+    m1_rmsnorm_det(v, NULL, out + n_q + n_k, n_k, hd, eps, NULL);
+  else
+    memcpy(out + n_q + n_k, v, n_k * sizeof(float));
+}
+
+#define GM_HID 128u
+#define GM_E 8u
+#define GM_TOP 2u
+#define GM_INTER 32u
+#define GM_DENSE_N 64u
+#define GM_VOCAB 262144u
+#define GM_SLICE 16384u
+
+static void check_gemma(void) {
+  static uint32_t w[HTP_GRAPH_HEADER_WORDS + 2u * HTP_GRAPH_MAX_LAYERS +
+                    HTP_GRAPH_MAX_OPS * HTP_GRAPH_OP_WORDS];
+  static uint32_t m[sizeof(w) / sizeof(w[0])];
+  const uint32_t cap = (uint32_t)(sizeof(w) / sizeof(w[0]));
+  const uint32_t ffn_mask =
+    HTP_GRAPH_KIND_BIT(HTP_OP_RMSNORM) | HTP_GRAPH_KIND_BIT(HTP_OP_ADD) |
+    HTP_GRAPH_KIND_BIT(HTP_OP_ROUTER_TOPK) | HTP_GRAPH_KIND_BIT(HTP_OP_MOE) |
+    HTP_GRAPH_KIND_BIT(HTP_OP_DENSE_FFN) | HTP_GRAPH_KIND_BIT(HTP_OP_LM_HEAD) |
+    HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM);
+  /* Gemma-4-26B-A4B's two attention shapes (plan 201 section 2.4): the
+     sliding layers 8 kv heads of 256 (gqa 2), the full ones 2 of 512 (gqa
+     8) with attention_k_eq_v; hidden is gqa n_kv hd here because this
+     base's ATTN_M1 record ties its N to hidden */
+  const gemma_shape qk_shapes[2] = {
+    {4096u, 256u, 2u, 8u, HTP_GRAPH_QKNORM_V, 64u, 32u, 8u, 2u, 64u, 64u, 1e-6f,
+     0.5f, 30.0f},
+    {8192u, 512u, 8u, 2u, HTP_GRAPH_QKNORM_V | HTP_GRAPH_QKNORM_K_EQ_V, 64u,
+     32u, 8u, 2u, 64u, 64u, 1e-6f, 0.5f, 30.0f}};
+  const gemma_shape fs = {GM_HID,     64u,      1u,      2u,     0u,
+                          GM_DENSE_N, GM_INTER, GM_E,    GM_TOP, GM_VOCAB,
+                          64u,        1e-6f,    0.6875f, 30.0f};
+  static const struct {
+    const char *what;
+    void (*mutate)(uint32_t *);
+    uint32_t want;
+  } gm_muts[] = {
+    {"QK_NORM feed bit 0 (N1's, not taken)", gm_qk_feed_bit0,
+     HTP_GRAPH_E_INVALIDFORMAT},
+    {"QK_NORM resident at head_dim 1024", gm_qk_head_dim_1024,
+     HTP_GRAPH_E_SCHEMENOTSUPPORTED},
+    {"ADD in_slot == out_slot", gm_add_in_is_out, HTP_GRAPH_E_INVALIDFORMAT},
+    {"ADD multiplier +inf", gm_add_scale_inf, HTP_GRAPH_E_INVALIDFORMAT},
+    {"LM_HEAD soft-cap -30", gm_softcap_negative, HTP_GRAPH_E_INVALIDFORMAT},
+    {"ffn kind 3", gm_ffn_kind_3, HTP_GRAPH_E_INVALIDFORMAT},
+    {"DENSE_FFN in a MoE-only layer", gm_ffn_kind_moe, HTP_GRAPH_E_INVALIDITEM},
+    {"ROUTER_TOPK in a dense-only layer", gm_ffn_kind_dense,
+     HTP_GRAPH_E_INVALIDITEM},
+  };
+  hexkl_graph_env env;
+  hexkl_graph *g = NULL;
+  uint32_t n, rc, resume, seed = 0x4296u, i, s, e, r, nr = 0, best;
+  static float in[10240], out[10240], ref[10240], qk_gam[1024];
+  static float x[GM_HID], gam[6][GM_HID], rw[GM_HID * GM_E],
+    rbias[GM_HID + GM_E], rsc[GM_HID];
+  static float hres[GM_HID], dn[GM_HID], up[GM_DENSE_N], gate[GM_DENSE_N],
+    act[GM_DENSE_N], dense[GM_HID], D[GM_HID], sp[GM_HID], xs[GM_HID],
+    moe[GM_HID], S[GM_HID], F[GM_HID], fo[GM_HID];
+  static float lg_ref[GM_VOCAB], lg_out[GM_VOCAB];
+  static uint32_t gu[GM_E], dnh[GM_E];
+  float lg[GM_E], wt[GM_TOP], r_w[GM_TOP], by_e[GM_E];
+  uint32_t sel[GM_TOP], r_idx[GM_TOP], r_cnt[GM_E] = {0};
+  int err = 0;
+
+  memset(&env, 0, sizeof(env));
+  env.tbl = &g_tbl;
+  env.vtcm_base = g_vtcm;
+  env.vtcm_size = sizeof(g_vtcm);
+  env.config_off = 32u;
+  env.pool = real_pool();
+  env.scratch = &g_scratch;
+  env.fc = host_fc;
+
+  /* (1) validator: the Gemma layer validates every kind it runs resident
+     here; each record mutation fails with its own code */
+  n = build_gemma(w, cap, &fs, ffn_mask);
+  rc = htp_graph_validate(w, n, ffn_mask, NULL);
+  CHECK(n != 0u && rc == 0u && w[3] == 20u, "Gemma layer validate: %s",
+        htp_graph_err_name(rc));
+  err |= rc != 0u;
+  for (i = 0; i < sizeof(gm_muts) / sizeof(gm_muts[0]); ++i) {
+    memcpy(m, w, n * sizeof(uint32_t));
+    gm_muts[i].mutate(m);
+    rc = htp_graph_validate(m, n, ffn_mask, NULL);
+    CHECK(rc == gm_muts[i].want, "Gemma mutation '%s': %s, want %s",
+          gm_muts[i].what, htp_graph_err_name(rc),
+          htp_graph_err_name(gm_muts[i].want));
+    err |= rc != gm_muts[i].want;
+    printf("  Gemma %-36s -> %s\n", gm_muts[i].what, htp_graph_err_name(rc));
+  }
+
+  /* (2) [QK_NORM] at Gemma's two shapes, in place on slot 2 (the v norm
+     must read the raw k before k is normed); the v part of the input is
+     garbage under K_EQ_V, which the op must not read */
+  for (s = 0; s < 2u; ++s) {
+    const gemma_shape *q = &qk_shapes[s];
+    const uint32_t qkv = (q->gqa + 2u) * q->n_kv * q->hd;
+    n = build_gemma(w, cap, q, HTP_GRAPH_KIND_BIT(HTP_OP_QK_NORM));
+    rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, NULL, 0u, &g);
+    CHECK(rc == 0u && g != NULL, "QK_NORM hd %u init: %s", q->hd,
+          htp_graph_err_name(rc));
+    if (g == NULL)
+      return;
+    fill(qk_gam, 2u * q->hd, &seed);
+    rc = (uint32_t)hexkl_graph_set_param(g, GM_QK, HTP_GRAPH_PARAM_GAMMA,
+                                         qk_gam, 2u * q->hd);
+    CHECK(rc == 0u, "QK_NORM gamma: %s", htp_graph_err_name(rc));
+    fill(in, qkv, &seed);
+    if (q->qk_feed & HTP_GRAPH_QKNORM_K_EQ_V)
+      for (i = qkv - q->n_kv * q->hd; i < qkv; ++i)
+        in[i] = NAN;
+    rc = (uint32_t)hexkl_graph_forward(g, &env, GM_QK, 1u, 0u, NULL, in, qkv,
+                                       out, qkv, &resume);
+    spec_qk_norm(in, qk_gam, ref, q->hd, q->gqa, q->n_kv, q->qk_feed, q->eps);
+    CHECK(rc == 0u && resume == GM_QK + 1u &&
+            memcmp(out, ref, qkv * sizeof(float)) == 0,
+          "[QK_NORM] hd %u gqa %u n_kv %u feed %u: %s, %s", q->hd, q->gqa,
+          q->n_kv, q->qk_feed, htp_graph_err_name(rc),
+          memcmp(out, ref, qkv * sizeof(float)) ? "differs" : "equal");
+    err |= rc != 0u || memcmp(out, ref, qkv * sizeof(float)) != 0;
+    hexkl_graph_free(g);
+    g = NULL;
+  }
+
+  /* (3) the FFN stretch [RMSNORM ROUTER_TOPK MOE RMSNORM RMSNORM DENSE_FFN
+     RMSNORM ADD RMSNORM ADD] with the session's GeGLU flag, against the
+     CPU's order (dense branch first, D + S, (h + F) * layer_scalar) */
+  n = build_gemma(w, cap, &fs, ffn_mask);
+  {
+    uint32_t hq = 0;
+    htp_graph_op *op = htp_graph_op_at(w, GM_DENSE); /* up, gate, down */
+    q_register(hq, GM_HID, GM_DENSE_N, &seed);
+    op->h_gu[0] = hq++;
+    q_register(hq, GM_HID, GM_DENSE_N, &seed);
+    op->h_gu[1] = hq++;
+    q_register(hq, GM_DENSE_N, GM_HID, &seed);
+    op->h_dn[0] = hq++;
+    op->n_experts = 3u;
+    op = htp_graph_op_at(w, GM_LM);
+    for (i = 0; i < GM_VOCAB / GM_SLICE; ++i) {
+      q_register(hq, GM_HID, GM_SLICE, &seed);
+      op->h_gu[i] = hq++;
+    }
+    op->n_experts = GM_VOCAB / GM_SLICE;
+    CHECK(hq <= Q_SLOTS && op->n_experts <= HTP_GRAPH_MAX_PARTS,
+          "Gemma Q4M1 slots %u", hq);
+  }
+  for (e = 0; e < GM_E; ++e) {
+    gu[e] = 400u + e;
+    dnh[e] = 450u + e;
+    register_weight(gu[e], GM_HID, 2u * GM_INTER);
+    register_weight(dnh[e], GM_INTER, GM_HID);
+  }
+  rc = (uint32_t)hexkl_graph_init(w, n, &g_tbl, g_qs, Q_SLOTS, &g);
+  CHECK(rc == 0u && g != NULL, "Gemma FFN init: %s", htp_graph_err_name(rc));
+  if (g == NULL)
+    return;
+  CHECK(g->logits != NULL, "Gemma logits buffer");
+  rc = (uint32_t)set_experts(g, GM_MOE, gu, dnh, GM_E);
+  CHECK(rc == 0u, "Gemma EXPERTS: %s", htp_graph_err_name(rc));
+  {
+    const uint32_t norms[6] = {GM_PRE2,  GM_POST2,   GM_PRE,
+                               GM_POST1, GM_POSTFFN, GM_FIN};
+    for (i = 0; i < 6u; ++i) {
+      fill(gam[i], GM_HID, &seed);
+      rc = (uint32_t)hexkl_graph_set_param(g, norms[i], HTP_GRAPH_PARAM_GAMMA,
+                                           gam[i], GM_HID);
+      CHECK(rc == 0u, "Gemma gamma %u: %s", i, htp_graph_err_name(rc));
+    }
+  }
+  fill(rw, GM_HID * GM_E, &seed);
+  fill(rsc, GM_HID, &seed);
+  m1_router_input_scale_det(rsc, GM_HID, rbias);
+  fill(rbias + GM_HID, GM_E, &seed);
+  rc = (uint32_t)hexkl_graph_set_param(g, GM_ROUTER, HTP_GRAPH_PARAM_ROUTER_W,
+                                       rw, GM_HID * GM_E);
+  rc |= (uint32_t)hexkl_graph_set_param(
+    g, GM_ROUTER, HTP_GRAPH_PARAM_ROUTER_BIAS, rbias, GM_HID + GM_E);
+  CHECK(rc == 0u, "Gemma router params");
+  env.moe_flags = HEXKL_MOE_FLAG_GEGLU;
+  fill(x, GM_HID, &seed);
+  memset(&g_last, 0, sizeof(g_last));
+  rc =
+    (uint32_t)hexkl_graph_forward(g, &env, GM_PRE2, GM_ADD_RES - GM_PRE2 + 1u,
+                                  0u, NULL, x, GM_HID, out, GM_HID, &resume);
+  CHECK(rc == 0u && resume == GM_ADD_RES + 1u,
+        "Gemma FFN stretch: %s resume %u", htp_graph_err_name(rc), resume);
+  /* the CPU's order: h = x; the dense branch */
+  memcpy(hres, x, sizeof(hres));
+  m1_rmsnorm_det(hres, gam[2], dn, GM_HID, GM_HID, fs.eps, NULL);
+  spec_fc(g->ops[GM_DENSE].h_gu[0], dn, up);
+  spec_fc(g->ops[GM_DENSE].h_gu[1], dn, gate);
+  for (i = 0; i < GM_DENSE_N; ++i)
+    act[i] = geglu_det_one(gate[i], up[i]);
+  spec_fc(g->ops[GM_DENSE].h_dn[0], act, dense);
+  m1_rmsnorm_det(dense, gam[3], D, GM_HID, GM_HID, fs.eps, NULL);
+  /* the sparse branch: experts on the pre_ffn_norm_2 row, the router on
+     the un-normed h */
+  m1_rmsnorm_det(hres, gam[0], sp, GM_HID, GM_HID, fs.eps, NULL);
+  m1_rmsnorm_det(hres, rbias, xs, GM_HID, GM_HID, fs.eps, NULL);
+  m1_router_softmax_det(xs, rw, rbias + GM_HID, GM_HID, GM_E, GM_TOP, lg, sel,
+                        wt);
+  for (r = 0; r < GM_TOP; ++r) {
+    r_cnt[sel[r]] = 1u;
+    by_e[sel[r]] = wt[r];
+  }
+  for (e = 0; e < GM_E; ++e)
+    if (r_cnt[e]) {
+      r_idx[nr] = 0u;
+      r_w[nr++] = by_e[e];
+    }
+  CHECK(g_last.n_calls == 1u && g_last.flags == HEXKL_MOE_FLAG_GEGLU &&
+          memcmp(g_last.row_count, r_cnt, sizeof(r_cnt)) == 0,
+        "Gemma MOE op: routing / flags");
+  hexkl_mm_u8i4_moe_layer_run(&g_tbl, g_vtcm, sizeof(g_vtcm), 32u, 1u, GM_HID,
+                              GM_INTER, GM_HID, GM_E, gu, dnh, r_idx, r_cnt,
+                              r_w, sp, moe, env.pool, &g_scratch,
+                              HEXKL_MOE_FLAG_GEGLU);
+  m1_rmsnorm_det(moe, gam[1], S, GM_HID, GM_HID, fs.eps, NULL);
+  for (i = 0; i < GM_HID; ++i)
+    F[i] = m1_det_add(D[i], S[i]); /* combine_ffn */
+  m1_rmsnorm_det(F, gam[4], fo, GM_HID, GM_HID, fs.eps, NULL);
+  for (i = 0; i < GM_HID; ++i) /* decoder_output, then layer_scalar */
+    ref[i] = m1_det_mul(m1_det_add(hres[i], fo[i]), fs.layer_scalar);
+  CHECK(memcmp(out, ref, GM_HID * sizeof(float)) == 0 &&
+          memcmp(g->slots, ref, GM_HID * sizeof(float)) == 0,
+        "Gemma FFN stretch differs from the CPU-order composition");
+  err |= memcmp(out, ref, GM_HID * sizeof(float)) != 0 ||
+         memcmp(g->slots, ref, GM_HID * sizeof(float)) != 0;
+  check_pcycles(g, GM_PRE2, GM_ADD_RES + 1u, "Gemma FFN");
+
+  /* (4) [RMSNORM LM_HEAD]: 16 slices of 16384 rows, soft-capped at 30
+     before the pick; the raw logits would differ */
+  rc = (uint32_t)hexkl_graph_forward(g, &env, GM_FIN, 2u, 0u, NULL, x, GM_HID,
+                                     lg_out, GM_VOCAB, &resume);
+  CHECK(rc == 0u && resume == GM_LM + 1u, "Gemma head: %s",
+        htp_graph_err_name(rc));
+  m1_rmsnorm_det(x, gam[5], dn, GM_HID, GM_HID, fs.eps, NULL);
+  for (i = 0; i < GM_VOCAB / GM_SLICE; ++i)
+    spec_fc(g->ops[GM_LM].h_gu[i], dn, lg_ref + (size_t)i * GM_SLICE);
+  {
+    int capped_differs = memcmp(lg_out, lg_ref, sizeof(lg_ref)) != 0;
+    float mx = 0.0f;
+    for (i = 0; i < GM_VOCAB; ++i)
+      mx = fabsf(lg_ref[i]) > mx ? fabsf(lg_ref[i]) : mx;
+    m1_softcap_det(lg_ref, GM_VOCAB, fs.softcap);
+    best = m1_argmax_first(lg_ref, GM_VOCAB);
+    CHECK(capped_differs && memcmp(lg_out, lg_ref, sizeof(lg_ref)) == 0 &&
+            g->lm_id == best,
+          "Gemma head: soft-capped logits %s, lm_id %u want %u (raw %s)",
+          memcmp(lg_out, lg_ref, sizeof(lg_ref)) ? "differ" : "equal", g->lm_id,
+          best, capped_differs ? "differ" : "EQUAL");
+    err |= !capped_differs || memcmp(lg_out, lg_ref, sizeof(lg_ref)) != 0 ||
+           g->lm_id != best;
+    printf("  Gemma head: vocab %u in %u slices, max |raw logit| %.2f, "
+           "lm_id %u\n",
+           GM_VOCAB, GM_VOCAB / GM_SLICE, mx, g->lm_id);
+  }
+  hexkl_graph_free(g);
+  env.moe_flags = 0u;
+
+  /* (5) the soft-cap's spec against 30 tanh(x / 30) in double over
+     [-300, 300] and its HVX form lane for lane (and a scalar tail), the
+     dense GeGLU row likewise against geglu_det_one */
+  {
+    const uint32_t N = 8192u + 7u;
+    double num = 0.0, den = 0.0, max_err = 0.0;
+    uint32_t nan = 0, same = 0;
+    for (i = 0; i < N; ++i)
+      in[i] = -300.0f + 600.0f * (float)i / (float)(N - 1u);
+    in[0] = -3.0e38f; /* the clamps */
+    in[1] = 3.0e38f;
+    in[2] = 1.0e-40f; /* subnormal */
+    memcpy(ref, in, N * sizeof(float));
+    memcpy(out, in, N * sizeof(float));
+    m1_softcap_det(ref, N, 30.0f);
+    hvx_softcap_f32(out, N, 30.0f, real_pool());
+    for (i = 0; i < N; ++i) {
+      const double t = 30.0 * tanh((double)in[i] / 30.0);
+      const double d = (double)ref[i] - t;
+      nan += ref[i] != ref[i];
+      same += memcmp(&out[i], &ref[i], sizeof(float)) == 0;
+      num += t * t;
+      den += d * d;
+      max_err = fabs(d) > max_err ? fabs(d) : max_err;
+    }
+    printf("SOFTCAP SPEC vs f64: snr=%.1f dB over [-300,300] n=%u; "
+           "max_abs_err=%.2e; nan=%u\n",
+           10.0 * log10(num / den), N, max_err, nan);
+    printf("SOFTCAP HVX == SPEC bit-exact %u/%u\n", same, N);
+    /* about 5 ulp at 30: exp_det's and recip_det's ulps through 2 s - 1 */
+    CHECK(nan == 0u && 10.0 * log10(num / den) > 120.0 && max_err < 2e-5,
+          "softcap spec vs f64");
+    CHECK(same == N, "hvx_softcap_f32 differs from m1_softcap_det");
+    err |= nan != 0u || same != N || 10.0 * log10(num / den) <= 120.0 ||
+           max_err >= 2e-5;
+    /* the dense GeGLU row: gates over [-12, 12] with the clamps and a
+       subnormal, ups a permutation of them */
+    same = 0;
+    for (i = 0; i < N; ++i)
+      in[i] /= 25.0f;
+    for (i = 0; i < N; ++i) {
+      lg_ref[i] = in[(i * 7u) % N];
+      ref[i] = geglu_det_one(in[i], lg_ref[i]);
+    }
+    hvx_geglu_f32(in, lg_ref, out, N);
+    for (i = 0; i < N; ++i)
+      same += memcmp(&out[i], &ref[i], sizeof(float)) == 0;
+    printf("DENSE GEGLU HVX == SPEC bit-exact %u/%u\n", same, N);
+    CHECK(same == N, "hvx_geglu_f32 differs from geglu_det_one");
+    err |= same != N;
+  }
+  if (err == 0)
+    printf("GRAPH GEMMA BIT-IDENTICAL: QK_NORM hd 256 (v norm) and hd 512 "
+           "(v norm, k = v), the FFN stretch (MoE branch, dense GeGLU branch, "
+           "D + S, post norm, (h + F) * layer_scalar in 3 slots) and "
+           "RMSNORM+LM_HEAD (262144 rows, 16 slices, soft-cap 30) vs "
+           "m1_ops_det.h / geglu_det_one / q4_gemv_cpu_det\n");
+}
+
 int main(void) {
   check_validator();
   check_forward();
@@ -1985,6 +2460,7 @@ int main(void) {
   check_gemma_rope();
   check_gemma_attn();
   check_q4m1();
+  check_gemma();
   if (g_fail) {
     printf("GRAPH CHECKS FAILED (%d)\n", g_fail);
     return 1;
