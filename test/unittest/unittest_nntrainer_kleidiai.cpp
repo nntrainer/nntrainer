@@ -624,6 +624,47 @@ static void compare_dequantize_row_qs4cx_fallback_vs_neon(size_t n, size_t k) {
   }
 }
 
+/**
+ * @brief the rhs packing token of a ukernel name, e.g. "qsi4cxp8x8" out of
+ * "matmul_clamp_f32_qai8dxp4x8_qsi4cxp8x8_8x8x32_neon_i8mm"
+ */
+static std::string rhs_packing_of(const std::string &ukernel_name) {
+  const size_t begin = ukernel_name.find("qsi4cxp");
+  if (begin == std::string::npos) {
+    return "";
+  }
+  return ukernel_name.substr(begin, ukernel_name.find('_', begin) - begin);
+}
+
+TEST(nntrainer_kleidiai, opt_ukernel_idx_qai8dxp_qsi4cxp) {
+  const size_t num_variants =
+    nntrainer::__kai_get_num_ukernel_variants_qai8dxp_qsi4cxp();
+  const size_t gemv_idx =
+    nntrainer::get_opt_ukernel_idx_qai8dxp_qsi4cxp(/*is_gemv=*/true);
+  const size_t gemm_idx =
+    nntrainer::get_opt_ukernel_idx_qai8dxp_qsi4cxp(/*is_gemv=*/false);
+
+  ASSERT_LT(gemv_idx, num_variants);
+  ASSERT_LT(gemm_idx, num_variants);
+
+  const std::string gemv_name =
+    nntrainer::__kai_get_num_ukernel_name_qai8dxp_qsi4cxp(gemv_idx);
+  const std::string gemm_name =
+    nntrainer::__kai_get_num_ukernel_name_qai8dxp_qsi4cxp(gemm_idx);
+
+  /// QS4CX_Tensor::pack packs the weight once for both paths, so the pair has
+  /// to share one rhs packing layout
+  EXPECT_FALSE(rhs_packing_of(gemv_name).empty()) << gemv_name;
+  EXPECT_EQ(rhs_packing_of(gemv_name), rhs_packing_of(gemm_name))
+    << "GEMV " << gemv_name << " / GEMM " << gemm_name;
+
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+  EXPECT_NE(gemm_name.find("i8mm"), std::string::npos) << gemm_name;
+#else
+  EXPECT_EQ(gemm_name.find("i8mm"), std::string::npos) << gemm_name;
+#endif
+}
+
 TEST(nntrainer_arm_neon, dequantize_row_qs4cx_vs_fallback) {
   compare_dequantize_row_qs4cx_fallback_vs_neon(/*n=*/4, /*k=*/8);
 }
