@@ -352,7 +352,8 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         does not point forward at a weight-streaming op, CLASSNOTSUPPORT
  *         for a resident bit on a kind with no kernel here,
  *         SCHEMENOTSUPPORTED for a resident op outside its kernel's shape
- *         rule (RMSNORM: K a power of two and a multiple of 32; QK_NORM:
+ *         rule (RMSNORM: K a multiple of 32 (plan 201 S4: any width,
+ *         Gemma's 2816); QK_NORM:
  *         head_dim 32, 64 or 128 -- the per-head norm's chunk must be a
  *         power of two too -- gqa <= 8, max_seq a multiple of 32; ROPE and
  *         ATTN_M1 (#152: the fp16 CPU order): head_dim 64), NOTALLOWED for
@@ -526,8 +527,7 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       if ((op->eps_bits & 0x80000000u) != 0u || exp == 0u || exp == 0x7F800000u)
         return HTP_GRAPH_E_INVALIDFORMAT;
     }
-    if (k == HTP_OP_RMSNORM && op->resident != 0u &&
-        (op->K % 32u != 0u || (op->K & (op->K - 1u)) != 0u))
+    if (k == HTP_OP_RMSNORM && op->resident != 0u && op->K % 32u != 0u)
       return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
     if (k == HTP_OP_ROUTER_TOPK && op->resident != 0u &&
         op->n_experts > HTP_GRAPH_ROUTER_MAX_EXPERTS)

@@ -149,7 +149,7 @@ static void ref_rmsnorm_f32(const float *x, const float *gamma, float *y,
   }
   const float r = 1.0f / sqrtf(sum / (float)chunk + eps);
   for (uint32_t i = 0; i < chunk; ++i) {
-    y[i] = x[i] * r * gamma[i];
+    y[i] = x[i] * r * (gamma ? gamma[i] : 1.0f);
   }
 }
 static void ref_rmsnorm_f64(const float *x, const float *gamma, double *y,
@@ -160,14 +160,17 @@ static void ref_rmsnorm_f64(const float *x, const float *gamma, double *y,
   }
   const double r = 1.0 / sqrt(sum / (double)chunk + (double)eps);
   for (uint32_t i = 0; i < chunk; ++i) {
-    y[i] = (double)x[i] * r * (double)gamma[i];
+    y[i] = (double)x[i] * r * (gamma ? (double)gamma[i] : 1.0);
   }
 }
 
 /** @brief One norm case: n floats in chunks; heads 0..2 of the row are the
  *         fixed kinds when there is more than one chunk, else the whole
- *         row cycles through the kinds. */
+ *         row cycles through the kinds. A name ending in "nogamma" runs the
+ *         gamma-free form (plan 201 S4). */
 static void check_rmsnorm(const char *name, uint32_t n, uint32_t chunk) {
+  const size_t nl = strlen(name);
+  const int no_gamma = nl >= 7u && !strcmp(name + nl - 7u, "nogamma");
   const float eps = 1e-5f;
   const uint32_t nchunk = n / chunk;
   float *x = malloc(n * sizeof(float));
@@ -193,8 +196,8 @@ static void check_rmsnorm(const char *name, uint32_t n, uint32_t chunk) {
     }
     memset(y_hvx, 0xA5, n * sizeof(float));
     memset(rs_hvx, 0xA5, nchunk * sizeof(float));
-    hvx_rmsnorm_f32(x, gamma, y_hvx, n, chunk, eps, rs_hvx);
-    m1_rmsnorm_det(x, gamma, y_det, n, chunk, eps, rs_det);
+    hvx_rmsnorm_f32(x, no_gamma ? NULL : gamma, y_hvx, n, chunk, eps, rs_hvx);
+    m1_rmsnorm_det(x, no_gamma ? NULL : gamma, y_det, n, chunk, eps, rs_det);
     for (uint32_t i = 0; i < n; ++i) {
       bad += memcmp(&y_hvx[i], &y_det[i], sizeof(float)) ? 1u : 0u;
     }
@@ -202,8 +205,10 @@ static void check_rmsnorm(const char *name, uint32_t n, uint32_t chunk) {
       bad += memcmp(&rs_hvx[c], &rs_det[c], sizeof(float)) ? 1u : 0u;
     }
     for (uint32_t c = 0; c < nchunk; ++c) {
-      ref_rmsnorm_f32(x + c * chunk, gamma, y_f32 + c * chunk, chunk, eps);
-      ref_rmsnorm_f64(x + c * chunk, gamma, y_f64 + c * chunk, chunk, eps);
+      ref_rmsnorm_f32(x + c * chunk, no_gamma ? NULL : gamma, y_f32 + c * chunk,
+                      chunk, eps);
+      ref_rmsnorm_f64(x + c * chunk, no_gamma ? NULL : gamma, y_f64 + c * chunk,
+                      chunk, eps);
     }
     for (uint32_t i = 0; i < n; ++i) {
       const double u32 = ulp_dist(y_det[i], (double)y_f32[i]);
@@ -337,22 +342,24 @@ static uint32_t norm_row(const float *x, const float *gamma, float *y,
 
 static void check_norm_cpu_order(void) {
   enum { ROWS = 20000 };
-  static const uint32_t widths[2] = {2048u, 64u};
+  /* [plan 201 S4] 2816: Gemma's hidden, not a power of two -- the CPU
+     model's fdiv by W against the spec's cpu_det_div_rn */
+  static const uint32_t widths[3] = {2048u, 64u, 2816u};
   const float eps = 1e-5f;
-  float *x = malloc(2048u * sizeof(float));
-  float *g = malloc(2048u * sizeof(float));
-  float *y = malloc(2048u * sizeof(float));
+  float *x = malloc(2816u * sizeof(float));
+  float *g = malloc(2816u * sizeof(float));
+  float *y = malloc(2816u * sizeof(float));
   uint32_t caught[NORM_N_MUT] = {0, 0, 0, 0}, bad = 0, rows = 0;
-  fill_rand(g, 2048u, 0.5f, 1.5f);
-  for (int w = 0; w < 2; ++w) {
+  fill_rand(g, 2816u, 0.5f, 1.5f);
+  for (int w = 0; w < 3; ++w) {
     const uint32_t W = widths[w];
     for (int kind = 1; kind <= 3; ++kind, ++rows) {
       fill_row(x, W, kind);
       bad += norm_row(x, g, y, W, eps, caught);
     }
-    /* 2048: 2 000 rows; 64: 18 000 -- one magnitude 2^e, e in [-20, 20],
-       per row, elements +-[0.5, 1) 2^e */
-    const uint32_t n = w == 0 ? ROWS / 10 : ROWS - ROWS / 10;
+    /* 2048: 2 000 rows; 64: 18 000; 2816: 2 000 -- one magnitude 2^e, e in
+       [-20, 20], per row, elements +-[0.5, 1) 2^e */
+    const uint32_t n = w != 1 ? ROWS / 10 : ROWS - ROWS / 10;
     for (uint32_t k = 0; k < n; ++k, ++rows) {
       const int e = (int)(k % 41u) - 20;
       for (uint32_t i = 0; i < W; ++i) {
@@ -1212,6 +1219,10 @@ int main(int argc, char **argv) {
   check_rmsnorm("rmsnorm", 2048u, 2048u);
   check_rmsnorm("qk_norm_q", 32u * 64u, 64u);
   check_rmsnorm("qk_norm_k", 8u * 64u, 64u);
+  check_rmsnorm("rmsnorm_2816", 2816u, 2816u);
+  check_rmsnorm("rmsnorm_2816_nogamma", 2816u, 2816u);
+  check_rmsnorm("v_norm_256_nogamma", 8u * 256u, 256u);
+  check_rmsnorm("rmsnorm_96", 96u, 96u);
   check_norm_cpu_order();
   check_sqrt_recip_rn();
   check_rope();

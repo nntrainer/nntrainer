@@ -258,11 +258,12 @@ static void mut_attn_without_rope(uint32_t *w, uint32_t *n) {
   htp_graph_op_at(w, nth_op(w, HTP_OP_ROPE, 4))->resident = 0u;
   (void)n;
 }
-static void mut_rmsnorm_k_not_pow2(uint32_t *w, uint32_t *n) {
+static void mut_rmsnorm_k_not_32(uint32_t *w, uint32_t *n) {
   /* the final norm: K == hidden is not a validator rule for RMSNORM, so
-     only the kernel's power-of-two rule can refuse 2048 + 32 */
-  htp_graph_op_at(w, w[3] - 2u)->K = 2080u;
-  htp_graph_op_at(w, w[3] - 2u)->N = 2080u;
+     only the kernel's width rule can refuse 2048 + 24 (plan 201 S4: any
+     multiple of 32 is taken, 2080 included) */
+  htp_graph_op_at(w, w[3] - 2u)->K = 2072u;
+  htp_graph_op_at(w, w[3] - 2u)->N = 2072u;
   (void)n;
 }
 /* #132: the residual add's and the router's rules */
@@ -326,7 +327,7 @@ static const struct {
    HTP_GRAPH_E_NOTALLOWED},
   {"QK_NORM resident at head_dim 96", mut_qk_norm_head_dim_96,
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
-  {"RMSNORM resident at K 2080", mut_rmsnorm_k_not_pow2,
+  {"RMSNORM resident at K 2072", mut_rmsnorm_k_not_32,
    HTP_GRAPH_E_SCHEMENOTSUPPORTED},
   {"ADD resident, a RMSNORM not", mut_add_rmsnorm_cpu, HTP_GRAPH_E_NOTALLOWED},
   {"ROUTER_TOPK resident, its MOE not", mut_router_moe_cpu,

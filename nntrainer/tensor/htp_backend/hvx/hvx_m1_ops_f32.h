@@ -44,10 +44,13 @@
  *        fused chains reduced ((h0 + h1) + h2) + h3 (m1_ops_det.h, #164).
  *
  * @param x, y          n floats; may alias
- * @param gamma         chunk floats, shared by every chunk
+ * @param gamma         chunk floats, shared by every chunk; NULL: y = x * r
+ *                      (Gemma's v norm)
  * @param n             a multiple of chunk
- * @param chunk         a power of two and a multiple of 32 (2048: the hidden
- *                      norm; 64: the per-head q/k norm)
+ * @param chunk         a multiple of 32 (2048: LFM's hidden norm; 64: the
+ *                      per-head q/k norm; 2816: Gemma's hidden norm). The
+ *                      CPU's 16 chains cover it, so there is no tail; any
+ *                      other width is refused (the contract below)
  * @param row_scale_out n / chunk floats, r per chunk; NULL to skip
  */
 void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,

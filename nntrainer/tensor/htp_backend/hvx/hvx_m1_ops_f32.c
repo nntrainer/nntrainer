@@ -61,8 +61,7 @@ static inline float hvx_rmsnorm_scale(const float *x, uint32_t chunk,
 
 void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
                      uint32_t chunk, float eps, float *row_scale_out) {
-  if (!x || !gamma || !y || chunk == 0u || chunk % LANES != 0u ||
-      (chunk & (chunk - 1u)) != 0u || n % chunk != 0u) {
+  if (!x || !y || chunk == 0u || chunk % LANES != 0u || n % chunk != 0u) {
     return;
   }
   const uint32_t nvec = chunk / LANES;
@@ -77,8 +76,14 @@ void hvx_rmsnorm_f32(const float *x, const float *gamma, float *y, uint32_t n,
       row_scale_out[c] = rs;
     }
     const HVX_Vector r = hvx_splat_sf(rs);
-    for (uint32_t i = 0; i < nvec; ++i) {
-      vy[i] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(vx[i], r), vg[i]);
+    if (gamma) {
+      for (uint32_t i = 0; i < nvec; ++i) {
+        vy[i] = Q6_Vsf_vmpy_VsfVsf(Q6_Vsf_vmpy_VsfVsf(vx[i], r), vg[i]);
+      }
+    } else {
+      for (uint32_t i = 0; i < nvec; ++i) {
+        vy[i] = Q6_Vsf_vmpy_VsfVsf(vx[i], r);
+      }
     }
   }
 }

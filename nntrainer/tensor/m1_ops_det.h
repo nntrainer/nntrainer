@@ -38,15 +38,17 @@
  * so no compiler can contract or reassociate it.
  *
  *   rmsnorm_det(x[chunk], gamma[chunk], eps), per chunk (2048 for the
- *   hidden norm, 64 for a q/k head) -- the Android CPU's
+ *   hidden norm, 64 for a q/k head; [plan 201 S4] any multiple of 32, e.g.
+ *   Gemma's 2816, and gamma NULL for y = x * r) -- the Android CPU's
  *   neon::rms_norm_wrt_width_fp32_intrinsic + multiply_i(gamma), read off
  *   the shipped libnntrainer.so's aarch64 disassembly (plan 164 section 0):
  *     acc[j] = 0,  acc[j] = fma(x[16 i + j], x[16 i + j], acc[j]),
  *              j = 0 .. 15              (four float32x4 fmla accumulators)
  *     h[k]   = (acc[4k] + acc[4k+1]) + (acc[4k+2] + acc[4k+3])   (faddp x2)
  *     s      = ((h[0] + h[1]) + h[2]) + h[3]
- *     d      = s * (1/chunk) + eps  (1/chunk exact: power of two, so this
- *                                     is the CPU's s / chunk bit for bit)
+ *     d      = s / chunk + eps      (the CPU's fdiv: a multiply by the
+ *                                     exact 1/chunk for a power of two,
+ *                                     else cpu_det_div_rn)
  *     r      = RN(1 / RN(sqrt(d)))  (fsqrt then fdiv: two roundings, NOT
  *                                     the correctly rounded 1/sqrt)
  *     y[i]   = (x[i] * r) * gamma[i]
@@ -254,24 +256,38 @@ static inline float m1_sumsq_cpu_det(const float *x, uint32_t chunk) {
   return m1_norm_reduce_det(acc);
 }
 
-/** @brief r from the sum of squares: RN(1 / RN(sqrt(s / chunk + eps))). */
+/** @brief r from the sum of squares: RN(1 / RN(sqrt(s / chunk + eps))).
+ *         s / chunk is the CPU's fdiv: for a power-of-two chunk the
+ *         multiply by its exact reciprocal (the same bits, and the code
+ *         before plan 201 S4), else the integer correctly rounded divide
+ *         (Gemma's hidden 2816). */
 static inline float m1_norm_scale_det(float s, uint32_t chunk, float eps) {
-  const float d = m1_det_add(m1_det_mul(s, 1.0f / (float)chunk), eps);
-  return m1_recip_rn_det(m1_sqrt_rn_det(d));
+  const float mean = (chunk & (chunk - 1u)) == 0u
+                       ? m1_det_mul(s, 1.0f / (float)chunk)
+                       : cpu_det_div_rn(s, (float)chunk);
+  return m1_recip_rn_det(m1_sqrt_rn_det(m1_det_add(mean, eps)));
+}
+
+/** @brief y = (x * r) * gamma, or x * r with no gamma (Gemma's v norm). */
+static inline void m1_norm_apply_det(const float *x, const float *gamma,
+                                     float *y, uint32_t chunk, float r) {
+  for (uint32_t i = 0; i < chunk; ++i) {
+    y[i] =
+      gamma ? m1_det_mul(m1_det_mul(x[i], r), gamma[i]) : m1_det_mul(x[i], r);
+  }
 }
 
 /**
  * @brief RMSNorm over one chunk: y = (x * r) * gamma, r the CPU's scale.
  *
- * @param chunk  a power of two and a multiple of 32
+ * @param gamma  chunk floats, or NULL for y = x * r
+ * @param chunk  a multiple of 32 (the CPU's 16 chains cover it, no tail)
  * @return r, the row scale (what the IDL's row_scale reports)
  */
 static inline float m1_rmsnorm_chunk_det(const float *x, const float *gamma,
                                          float *y, uint32_t chunk, float eps) {
   const float r = m1_norm_scale_det(m1_sumsq_cpu_det(x, chunk), chunk, eps);
-  for (uint32_t i = 0; i < chunk; ++i) {
-    y[i] = m1_det_mul(m1_det_mul(x[i], r), gamma[i]);
-  }
+  m1_norm_apply_det(x, gamma, y, chunk, r);
   return r;
 }
 
