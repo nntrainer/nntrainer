@@ -50,6 +50,14 @@ std::string __kai_get_num_ukernel_name_qai8dxp_qsi4cxp(size_t idx_variant);
 size_t __kai_get_num_ukernel_variants_qai8dxp_qsi4cxp();
 
 /**
+ * @brief get the index of the ukernel to use for the current target ISA
+ *
+ * @param[in] is_gemv true to select the GEMV (M == 1) ukernel, false for GEMM
+ * @return size_t index of ukernel, always within the ukernel table
+ */
+size_t __kai_get_opt_ukernel_idx_qai8dxp_qsi4cxp(bool is_gemv);
+
+/**
  * @brief get size of memory to allocate for packed rhs from nxk qs4cxs1s0 to
  * qsi4cxp
  * Note that nxk is the format of quantized rhs, not the shape of rhs
