@@ -71,7 +71,7 @@ static void col2im_transpose(
   unsigned int eff_k_width = (k_width - 1) * dilation[1] + 1;
 
   unsigned int height = (in_height - 1) * mstride[0] + eff_k_height;
-  unsigned int width = (in_width - 1) * mstride[1] + eff_k_height;
+  unsigned int width = (in_width - 1) * mstride[1] + eff_k_width;
 
   unsigned int out_height = height - pt - pb; // col_matrix.height
   unsigned int out_width = width - pl - pr;   // col_matrix.width
@@ -106,11 +106,11 @@ static void col2im_transpose(
               continue;
             unsigned int h = (oh - (r * dilation[0] - pt)) / mstride[0];
             unsigned int w = (ow - (s * dilation[1] - pl)) / mstride[1];
-            if (h >= H || w >= W)
+            if (h >= static_cast<unsigned int>(in_height) ||
+                w >= static_cast<unsigned int>(in_width))
               continue;
             float *val = image.getAddress<float>(0, c, h, w);
-            *val += col_matrix.getValue<float>(0, 0, out_i, out_j);
-            // out_data[(out_i)*owidth + out_j] += in.getValue<float>(0,c,h,w)
+            *val += col_matrix.getValue<float>(0, 0, out_j, out_i);
           }
         }
       }
@@ -151,7 +151,7 @@ static void im2col_transpose(
   unsigned int eff_k_width = (k_width - 1) * dilation[1] + 1;
 
   unsigned int height = (in_height - 1) * mstride[0] + eff_k_height;
-  unsigned int width = (in_width - 1) * mstride[1] + eff_k_height;
+  unsigned int width = (in_width - 1) * mstride[1] + eff_k_width;
 
   unsigned int out_height = height - pt - pb;
   unsigned int out_width = width - pl - pr;
@@ -188,7 +188,8 @@ static void im2col_transpose(
               continue;
             unsigned int h = (oh - (r * dilation[0] - pt)) / mstride[0];
             unsigned int w = (ow - (s * dilation[1] - pl)) / mstride[1];
-            if (h >= H || w >= W)
+            if (h >= static_cast<unsigned int>(in_height) ||
+                w >= static_cast<unsigned int>(in_width))
               continue;
             out_data[(out_i)*owidth + out_j] += in.getValue<float>(0, c, h, w);
           }
@@ -271,7 +272,7 @@ void Conv2DTransposeLayer::finalize(InitLayerContext &context) {
   unsigned int eff_k_width = (k_width - 1) * dilation[1] + 1;
 
   unsigned int height = (in_height - 1) * stride[0] + eff_k_height;
-  unsigned int width = (in_width - 1) * stride[1] + eff_k_height;
+  unsigned int width = (in_width - 1) * stride[1] + eff_k_width;
 
   unsigned int out_height = height - pt - pb;
   unsigned int out_width = width - pl - pr;
