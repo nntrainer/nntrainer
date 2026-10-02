@@ -2855,8 +2855,8 @@ TEST_F(HmxMmU8I4Layer, MoeLayerM1GemvMatchesHmx) {
       EXPECT_EQ(applied, flags) << "the skel did not keep the bits";
       out.assign(static_cast<size_t>(rt.M) * N, 1.0f);
       return nntr_hvx_mm_u8i4_moe_layer(
-        handle_, rt.M, K, I, N, a_gu.data(), (int)a_gu.size(), a_dn.data(),
-        (int)a_dn.size(), rt.index.data(), (int)rt.index.size(),
+        handle_, rt.M, K, I, N, 0u /* silu */, a_gu.data(), (int)a_gu.size(),
+        a_dn.data(), (int)a_dn.size(), rt.index.data(), (int)rt.index.size(),
         rt.count.data(), (int)rt.count.size(), weight.data(),
         (int)weight.size(), act.data(), (int)act.size(), out.data(),
         (int)out.size());
@@ -2996,8 +2996,8 @@ TEST_F(HmxMmU8I4Layer, MoeM1GemvFeedVsCompute) {
       for (int rep = 0; rep <= kReps; ++rep) {
         std::fill(stage.begin(), stage.end(), 0u);
         ASSERT_EQ(nntr_hvx_mm_u8i4_moe_layer_timed(
-                    handle_, 1, K, c.inter, c.n_out, c.gu.data(), (int)NE,
-                    c.dn.data(), (int)NE, row_index.data(), (int)NE,
+                    handle_, 1, K, c.inter, c.n_out, 0u /* silu */, c.gu.data(),
+                    (int)NE, c.dn.data(), (int)NE, row_index.data(), (int)NE,
                     row_count.data(), (int)NE, row_weight.data(), (int)NE,
                     act.data(), (int)K, out.data(), (int)c.n_out, stage.data(),
                     kMoeStages),
