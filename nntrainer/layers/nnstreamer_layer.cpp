@@ -211,6 +211,10 @@ void NNStreamerLayer::forwarding(RunLayerContext &context, bool training) {
 
   std::copy((float *)out_data, (float *)((char *)out_data + data_size),
             hidden_.getData());
+
+  ml_tensors_data_destroy(out_data_cont);
+  out_data_cont = nullptr;
+  out_data = nullptr;
 }
 
 void NNStreamerLayer::calcDerivative(RunLayerContext &context) {
