@@ -181,18 +181,20 @@ void QNNGraph::forwarding(RunLayerContext &context, bool training) {
   if (!qc_var->findContext(bin_path)) {
     ml_logw("Context is not created. Create Now");
 
-    qc_var->makeContext(bin_path);
+    NNTR_THROW_IF(qc_var->makeContext(bin_path) != StatusCode::SUCCESS,
+                  std::runtime_error)
+      << "cannot create QNN context from " << bin_path;
   }
 
   auto graphInfo = qc_var->graphRetrieve(bin_path, context.getName());
+
+  NNTR_THROW_IF(!graphInfo, std::invalid_argument)
+    << "cannot retrieve graph " << context.getName() << " from " << bin_path;
 
   std::optional<std::reference_wrapper<Qnn_Context_Graph_t>> op =
     qc_var->findContext(bin_path);
 
   Qnn_Context_Graph_t &context_i = *op;
-
-  NNTR_THROW_IF(!graphInfo, std::invalid_argument)
-    << "cannot retrieve graph " << context.getName() << " from " << bin_path;
 
   NNTR_THROW_IF(context.getNumInputs() != graphInfo->numInputTensors,
                 std::invalid_argument)

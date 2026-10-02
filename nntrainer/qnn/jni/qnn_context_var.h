@@ -9,6 +9,8 @@
  * @bug     No known bugs except for NYI items
  * @brief   This file contains app context data related functions and classes
  * that manages the global configuration of the current QNN environment.
+ * @note    Also compiled on Linux by test/unittest/qnn against stub SDK
+ * headers; extend those stubs when this file starts using a new symbol.
  */
 
 #ifndef __QNN_CONTEXT_VAR_H__
@@ -56,14 +58,14 @@ enum class StatusCode {
 };
 
 struct Qnn_Context_Graph_t {
-  Qnn_ContextHandle_t m_context;
-  qnn_wrapper_api::GraphInfo_t **m_graphsInfo;
+  Qnn_ContextHandle_t m_context = nullptr;
+  qnn_wrapper_api::GraphInfo_t **m_graphsInfo = nullptr;
   std::map<std::string, qnn_wrapper_api::GraphInfo_t *>
     graph_map; /** graph name in Context - graph map **/
   std::map<std::string, uint32_t>
     graph_idx; /** graph name in Context - graph map **/
 
-  uint32_t m_graphsCount;
+  uint32_t m_graphsCount = 0;
 
   QnnContext_Config_t **m_contextConfig = nullptr;
 
@@ -173,7 +175,8 @@ struct QNNVar {
             ctx.m_graphsInfo[i]->numOutputTensors);
         }
       }
-      free(*ctx.m_graphsInfo);
+      if (ctx.m_graphsCount > 0)
+        free(*ctx.m_graphsInfo);
       free(ctx.m_graphsInfo);
       ctx.m_graphsInfo = nullptr;
     }
@@ -329,6 +332,37 @@ struct QNNVar {
     if (sample_app::ProfilingLevel::OFF != m_profilingLevel) {
       extractBackendProfilingInfo();
     }
+
+    if (StatusCode::SUCCESS != returnStatus) {
+      if (context_i.m_context != nullptr &&
+          m_qnnFunctionPointers.qnnInterface.contextFree != nullptr &&
+          QNN_CONTEXT_NO_ERROR !=
+            m_qnnFunctionPointers.qnnInterface.contextFree(context_i.m_context,
+                                                           nullptr)) {
+        ml_loge("Failed to free QNN context for: %s", bin.get().c_str());
+      }
+      if (context_i.m_graphsInfo != nullptr) {
+        for (uint32_t i = 0; i < context_i.m_graphsCount; i++) {
+          if (context_i.m_graphsInfo[i] != nullptr) {
+            free(context_i.m_graphsInfo[i]->graphName);
+            qnn_wrapper_api::freeQnnTensors(
+              context_i.m_graphsInfo[i]->inputTensors,
+              context_i.m_graphsInfo[i]->numInputTensors);
+            qnn_wrapper_api::freeQnnTensors(
+              context_i.m_graphsInfo[i]->outputTensors,
+              context_i.m_graphsInfo[i]->numOutputTensors);
+          }
+        }
+        if (context_i.m_graphsCount > 0)
+          free(*context_i.m_graphsInfo);
+        free(context_i.m_graphsInfo);
+      }
+      // Entries [1..customConfigCount] belong to m_backendExtensions.
+      free(context_i.m_contextConfig[0]);
+      free(context_i.m_contextConfig);
+      return returnStatus;
+    }
+
     context_i.setGraphInfoMap();
 
     ct_map.insert(std::make_pair(bin.get(), context_i));
