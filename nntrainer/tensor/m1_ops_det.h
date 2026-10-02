@@ -53,6 +53,7 @@
  *                                     the correctly rounded 1/sqrt)
  *     y[i]   = (x[i] * r) * gamma[i]
  *   rope64_det(x[64], cs[64]),  cs = cos[0..31] | sin[0..31], i < 32 --
+ *   ([plan 201 S4] rope_det(x[hd], hd, cs[hd]) is the same with 32 -> hd / 2)
  *   in fp16, the Android CPU's compute_rotary_emb_value(__fp16) (#152;
  *   rne16 is attn_m1_det.h's, the operands its copyData / (_FP16) casts):
  *     a = rne16(x[i]); b = rne16(x[i + 32]); c = rne16(cs[i]);
@@ -415,21 +416,37 @@ static inline void m1_rmsnorm_det(const float *x, const float *gamma, float *y,
   }
 }
 
-/** @brief RoPE on one head of 64 in fp16, in place. cs = cos[32] |
- *         sin[32] in f32 (the table the host uploads); the output is fp16
- *         values in f32. */
-static inline void m1_rope64_det(float *x, const float *cs) {
-  for (uint32_t i = 0; i < M1_DET_HEAD_DIM / 2u; ++i) {
+/**
+ * @brief RoPE on one head of @a hd (even) in fp16, in place: pairs (i, i +
+ *        hd / 2), the CPU's compute_rotary_emb_value(__fp16) with half_ =
+ *        hd / 2. cs = cos[hd / 2] | sin[hd / 2] in f32 (the table the host
+ *        uploads); the output is fp16 values in f32.
+ *
+ * [plan 201 S4] The rotary variant is the table's, not this function's:
+ * mha_core's precompute_freqs builds the angles -- "default" theta_i =
+ * theta^(-2i / hd), "proportional" the same for i < partial * hd / 2 and
+ * 0 above (cos 1, sin 0: those pairs pass through the same operations),
+ * per layer theta -- so Gemma 4's partial rotary factor and per-layer
+ * theta reach the DSP as the per-op table, computed by the CPU's own code.
+ */
+static inline void m1_rope_det(float *x, uint32_t hd, const float *cs) {
+  const uint32_t h = hd / 2u;
+  for (uint32_t i = 0; i < h; ++i) {
     const float a = attn_m1_det_rne16(x[i]);
-    const float b = attn_m1_det_rne16(x[i + 32]);
+    const float b = attn_m1_det_rne16(x[i + h]);
     const float c = attn_m1_det_rne16(cs[i]);
-    const float s = attn_m1_det_rne16(cs[i + 32]);
+    const float s = attn_m1_det_rne16(cs[i + h]);
     x[i] = attn_m1_det_rne16(m1_det_sub(attn_m1_det_rne16(m1_det_mul(a, c)),
                                         attn_m1_det_rne16(m1_det_mul(b, s))));
-    x[i + 32] =
+    x[i + h] =
       attn_m1_det_rne16(m1_det_add(attn_m1_det_rne16(m1_det_mul(a, s)),
                                    attn_m1_det_rne16(m1_det_mul(b, c))));
   }
+}
+
+/** @brief m1_rope_det at head_dim 64: cs = cos[32] | sin[32]. */
+static inline void m1_rope64_det(float *x, const float *cs) {
+  m1_rope_det(x, M1_DET_HEAD_DIM, cs);
 }
 
 /**

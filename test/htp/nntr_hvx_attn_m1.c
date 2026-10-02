@@ -124,13 +124,13 @@ int nntr_hvx_attn_m1_forward(remote_handle64 handle, uint32 layer, uint32 pos,
     return AEE_EINVALIDFORMAT;
   }
   if ((uint32_t)statsLen != 2u * n_q + ATTN_M1_PROF_WORDS) {
-    return hvx_attn_m1_forward(s->attn_m1, layer, pos, scale, q, k, v, y,
+    return hvx_attn_m1_forward(s->attn_m1, layer, pos, 0u, scale, q, k, v, y,
                                statsLen ? stats : NULL);
   }
   /* The phase words (#146) follow the (m, l) pairs, bit-copied. */
   uint32_t prof[ATTN_M1_PROF_WORDS];
-  const int rc = hvx_attn_m1_forward_prof(s->attn_m1, layer, pos, scale, q, k,
-                                          v, y, stats, prof);
+  const int rc = hvx_attn_m1_forward_prof(s->attn_m1, layer, pos, 0u, scale, q,
+                                          k, v, y, stats, prof);
   if (rc == AEE_SUCCESS) {
     memcpy(stats + 2u * n_q, prof, sizeof(prof));
   }

@@ -32,7 +32,9 @@
  * session's (nntr_hvx_fc_q4.c's note), not the graph's.
  * [plan 201 S4] Gemma's softmax router: 30 x [2816][128] f32 weights plus
  * 11 KiB of scales, 1.4 MiB a layer, 43 MiB (the ponytail note in
- * hvx_router_softmax_topk_f32).
+ * hvx_router_softmax_topk_f32). Its RoPE: one max_seq x head_dim f32 table
+ * per distinct (theta, variant) -- equal tables are shared -- so 4 MiB
+ * (sliding, 256) + 8 MiB (full, 512) at max_seq 4096.
  */
 
 #include "hexkl_graph.h"
@@ -264,17 +266,24 @@ static int graph_op_qk_norm(hexkl_graph *g, const htp_graph_op *op,
   return AEE_SUCCESS;
 }
 
+/* [plan 201 S4] The op's own table (ROPE_TABLE bound on this op: max_seq
+   x head_dim, Gemma's per-layer theta and partial factor) when it has one,
+   else the session's shared head_dim 64 table (LFM2). */
 static int graph_op_rope(hexkl_graph *g, const htp_graph_op *op,
                          graph_call *call, const float *in, float *out) {
-  const uint32_t n_q = op->gqa * op->n_kv;
-  if (g->rope_cs == NULL) {
+  const uint32_t n_q = op->gqa * op->n_kv, hd = op->head_dim;
+  const float *cs = g->param[op - g->ops];
+  if (cs == NULL) {
+    cs = hd == 64u ? g->rope_cs : NULL;
+  }
+  if (cs == NULL) {
     return AEE_EBADSTATE;
   }
   if (in != out) {
     memcpy(out, in, (size_t)op->K * sizeof(float));
   }
-  hvx_rope64_f32(out, n_q, out + (size_t)n_q * 64u, op->n_kv,
-                 g->rope_cs + (size_t)call->pos * 64u);
+  hvx_rope_f32(out, n_q, out + (size_t)n_q * hd, op->n_kv,
+               cs + (size_t)call->pos * hd, hd);
   return AEE_SUCCESS;
 }
 
@@ -289,24 +298,46 @@ static int graph_op_conv1d_gate(hexkl_graph *g, const htp_graph_op *op,
   return AEE_SUCCESS;
 }
 
-/** @brief 1/sqrt(head_dim) at the one head_dim the validator admits for a
- *  resident ATTN_M1 (64 since #152): 0.125f, exact, and the same bits as
- *  the fp16 CPU's `/ sqrt(64.f)` (attn_m1_det.h step 2). */
-static float graph_attn_scale(uint32_t head_dim) {
-  (void)head_dim;
-  return 0.125f;
+/** @brief The score scale: eps_bits' f32 when set ([plan 201 S4] Gemma
+ *  4's 1.0, attn_m1_det.h's GEMMA note), else 1/sqrt(head_dim) -- at 64
+ *  0.125f, exact, and the same bits as the fp16 CPU's `/ sqrt(64.f)`
+ *  (attn_m1_det.h step 2). The kernel refuses a scale that is not an fp16
+ *  value (1/sqrt(512) is not). */
+static float graph_attn_scale(const htp_graph_op *op) {
+  return op->eps_bits != 0u    ? graph_eps(op)
+         : op->head_dim == 64u ? 0.125f
+                               : 1.0f / sqrtf((float)op->head_dim);
 }
 
+/** @brief The session cache an ATTN_M1 op's shape names: env->attn_m1, or
+ *  [plan 201 S4] env->attn_m1_b (Gemma's full layers beside its sliding
+ *  ones), or NULL. */
+static hvx_attn_m1_ctx *graph_attn_cache(const hexkl_graph_env *env,
+                                         const htp_graph_op *op) {
+  hvx_attn_m1_ctx *const c[2] = {env->attn_m1, env->attn_m1_b};
+  uint32_t i;
+  for (i = 0; i < 2u; ++i) {
+    if (c[i] != NULL && c[i]->n_kv == op->n_kv && c[i]->gqa == op->gqa &&
+        c[i]->head_dim == op->head_dim) {
+      return c[i];
+    }
+  }
+  return NULL;
+}
+
+/* [plan 201 S4] top_k is the sliding window (0: full causal, LFM2 and
+   Gemma's full layers), eps_bits the scale (graph_attn_scale) */
 static int graph_op_attn_m1(hexkl_graph *g, const htp_graph_op *op,
                             graph_call *call, const float *in, float *out) {
   const uint32_t hd = op->head_dim, n_q = op->gqa * op->n_kv * hd,
                  n_k = op->n_kv * hd;
-  if (call->env->attn_m1 == NULL) {
+  hvx_attn_m1_ctx *c = graph_attn_cache(call->env, op);
+  if (c == NULL) {
     return AEE_EBADSTATE;
   }
-  return hvx_attn_m1_forward(call->env->attn_m1, g->ordinal[op - g->ops],
-                             call->pos, graph_attn_scale(hd), in, in + n_q,
-                             in + n_q + n_k, out, NULL);
+  return hvx_attn_m1_forward(c, g->ordinal[op - g->ops], call->pos, op->top_k,
+                             graph_attn_scale(op), in, in + n_q, in + n_q + n_k,
+                             out, NULL);
 }
 
 /* ---- #132: the residual add and the router ------------------------------ */
@@ -524,7 +555,7 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
                      const hexkl_weight_u8i4_table *tbl,
                      const hexkl_graph_q4m1_shape *q4m1, uint32_t n_q4m1,
                      hexkl_graph **out) {
-  uint32_t n_ops = 0, i, slot_words = 0, n_attn = 0, ffn_n = 0;
+  uint32_t n_ops = 0, i, slot_words = 0, ffn_n = 0;
   uint32_t q4m1_ops = 0, vocab_out = 0, moe_rows = 0;
   hexkl_graph *g;
   int rc;
@@ -616,11 +647,33 @@ int hexkl_graph_init(const uint32_t *words, uint32_t n_words,
   for (i = 0; i < n_ops; ++i) {
     g->ops[i] = *htp_graph_op_cat(words, i);
     if (g->ops[i].kind == HTP_OP_ATTN_M1) {
-      g->ordinal[i] = n_attn++;
+      /* [plan 201 S4] the layer index within its shape's cache: the ATTN_M1
+         ops before it of the same (n_kv, gqa, head_dim). The ARM side
+         (htp_compute_ops.cpp attn_ordinal_, the kv seed) still counts all
+         ATTN_M1 ops: the same numbers while there is one shape (LFM2); the
+         Gemma hand-over that registers attn_m1_b counts per shape too. */
+      uint32_t j;
+      g->ordinal[i] = 0u;
+      for (j = 0; j < i; ++j) {
+        g->ordinal[i] += g->ops[j].kind == HTP_OP_ATTN_M1 &&
+                         g->ops[j].n_kv == g->ops[i].n_kv &&
+                         g->ops[j].gqa == g->ops[i].gqa &&
+                         g->ops[j].head_dim == g->ops[i].head_dim;
+      }
     }
   }
   *out = g;
   return AEE_SUCCESS;
+}
+
+/** @brief ROPE ops after @a i whose table is @a t (NULL: none). */
+static uint32_t graph_rope_users_after(const hexkl_graph *g, const float *t,
+                                       uint32_t i) {
+  uint32_t j, n = 0;
+  for (j = i + 1u; t != NULL && j < g->n_ops; ++j) {
+    n += g->ops[j].kind == HTP_OP_ROPE && g->param[j] == t;
+  }
+  return n;
 }
 
 void hexkl_graph_free(hexkl_graph *g) {
@@ -629,7 +682,11 @@ void hexkl_graph_free(hexkl_graph *g) {
     return;
   }
   for (i = 0; i < g->n_ops; ++i) {
-    free(g->param[i]);
+    /* a shared ROPE table is freed by its last holder */
+    if (g->ops[i].kind != HTP_OP_ROPE ||
+        graph_rope_users_after(g, g->param[i], i) == 0u) {
+      free(g->param[i]);
+    }
     free(g->state[i]);
     free(g->experts[i]);
   }
@@ -645,7 +702,8 @@ void hexkl_graph_free(hexkl_graph *g) {
 
 /** @brief The parameter's length for (kind, which), 0 when the kind does
  *  not take it. */
-static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which) {
+static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which,
+                                uint32_t max_seq) {
   switch (which) {
   case HTP_GRAPH_PARAM_GAMMA:
     return op->kind == HTP_OP_RMSNORM   ? op->K
@@ -657,6 +715,8 @@ static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which) {
     return op->kind == HTP_OP_CONV1D_GATE ? 2u * op->N : 0u;
   case HTP_GRAPH_PARAM_ROUTER_W:
     return op->kind == HTP_OP_ROUTER_TOPK ? op->K * op->n_experts : 0u;
+  case HTP_GRAPH_PARAM_ROPE_TABLE: /* [plan 201 S4] the op's own */
+    return op->kind == HTP_OP_ROPE ? op->head_dim * max_seq : 0u;
   case HTP_GRAPH_PARAM_ROUTER_BIAS: /* softmax: g[K] | per-expert scale */
     return op->kind != HTP_OP_ROUTER_TOPK ? 0u
            : op->eps_bits != 0u           ? op->K + op->n_experts
@@ -664,6 +724,55 @@ static uint32_t graph_param_len(const htp_graph_op *op, uint32_t which) {
   default:
     return 0u;
   }
+}
+
+/** @brief ROPE ops other than @a except whose table is @a t. */
+static uint32_t graph_rope_users(const hexkl_graph *g, const float *t,
+                                 uint32_t except) {
+  uint32_t j, n = 0;
+  for (j = 0; j < g->n_ops; ++j) {
+    n += j != except && g->ops[j].kind == HTP_OP_ROPE && g->param[j] == t;
+  }
+  return n;
+}
+
+/* [plan 201 S4] A ROPE op's own table, max_seq x head_dim. A table equal to
+   one another ROPE op of the same head_dim holds is shared, not copied
+   (Gemma's 25 sliding layers bind one: 4 MiB at max_seq 4096 and head_dim
+   256, not 100), and a shared table is never written in place. */
+static int graph_set_rope(hexkl_graph *g, uint32_t op, const float *data,
+                          uint32_t n) {
+  float *mine, *t = NULL;
+  uint32_t j;
+  if (op >= g->n_ops) {
+    return AEE_EBADITEM;
+  }
+  if (n == 0u || n != graph_param_len(&g->ops[op], HTP_GRAPH_PARAM_ROPE_TABLE,
+                                      g->max_seq)) {
+    return AEE_EINVALIDFORMAT;
+  }
+  for (j = 0; j < g->n_ops && t == NULL; ++j) {
+    if (j != op && g->ops[j].kind == HTP_OP_ROPE && g->param[j] != NULL &&
+        g->ops[j].head_dim == g->ops[op].head_dim &&
+        memcmp(g->param[j], data, (size_t)n * sizeof(float)) == 0) {
+      t = g->param[j];
+    }
+  }
+  mine = g->param[op];
+  if (t == NULL) {
+    t = (mine != NULL && graph_rope_users(g, mine, op) == 0u)
+          ? mine
+          : (float *)malloc((size_t)n * sizeof(float));
+    if (t == NULL) {
+      return AEE_ENOMEMORY;
+    }
+    memcpy(t, data, (size_t)n * sizeof(float));
+  }
+  if (mine != NULL && mine != t && graph_rope_users(g, mine, op) == 0u) {
+    free(mine);
+  }
+  g->param[op] = t;
+  return AEE_SUCCESS;
 }
 
 int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
@@ -728,17 +837,17 @@ int hexkl_graph_set_param(hexkl_graph *g, uint32_t op, uint32_t which,
     memcpy(h, data, (size_t)n * sizeof(uint32_t));
     return AEE_SUCCESS;
   }
+  if (which == HTP_GRAPH_PARAM_ROPE_TABLE && op != HTP_GRAPH_NO_OP) {
+    return graph_set_rope(g, op, data, n);
+  }
   if (which == HTP_GRAPH_PARAM_ROPE_TABLE) {
-    if (op != HTP_GRAPH_NO_OP) {
-      return AEE_EBADITEM;
-    }
     want = alloc = g->max_seq * 64u;
     dst = &g->rope_cs;
   } else {
     if (op >= g->n_ops) {
       return AEE_EBADITEM;
     }
-    want = graph_param_len(&g->ops[op], which);
+    want = graph_param_len(&g->ops[op], which, g->max_seq);
     if (want == 0u) {
       return AEE_EINVALIDFORMAT;
     }

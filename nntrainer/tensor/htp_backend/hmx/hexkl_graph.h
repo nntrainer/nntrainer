@@ -118,11 +118,16 @@ typedef struct {
   hvx_worker_pool *pool;
   hexkl_moe_scratch *scratch;
   uint32_t moe_flags;
-  hvx_attn_m1_ctx *attn_m1; /**< the session's m=1 KV cache (#81), borrowed;
-                                 NULL = none, and a resident ATTN_M1 op
-                                 fails with AEE_EBADSTATE */
-  hexkl_graph_fc_fn fc;     /**< [#132 Part B] the Q4M1 kinds' runner; NULL
-                                 = none, and they fail with AEE_EBADSTATE */
+  hvx_attn_m1_ctx *attn_m1;   /**< the session's m=1 KV cache (#81), borrowed;
+                                   NULL = none, and a resident ATTN_M1 op
+                                   fails with AEE_EBADSTATE */
+  hvx_attn_m1_ctx *attn_m1_b; /**< [plan 201 S4] a second cache of another
+                                   shape (Gemma 4's full layers beside its
+                                   sliding ones), borrowed; an ATTN_M1 op
+                                   reads the one of its (n_kv, gqa,
+                                   head_dim), NULL = none */
+  hexkl_graph_fc_fn fc;       /**< [#132 Part B] the Q4M1 kinds' runner; NULL
+                                   = none, and they fail with AEE_EBADSTATE */
   void *fc_ctx;
   hexkl_graph_rebind_fn rebind; /**< [plan 201 S1] NULL = none */
   void *rebind_ctx;
@@ -156,14 +161,18 @@ typedef struct hexkl_graph_s {
   uint32_t slot_words; /**< f32 per activation slot: the widest resident
                             op's in or out width */
   float *slots;        /**< HTP_GRAPH_N_SLOTS x slot_words, DSP heap */
-  float *rope_cs;      /**< [max_seq][64] cos | sin, or NULL until bound */
+  float *rope_cs;      /**< [max_seq][64] cos | sin, or NULL until bound;
+                            [plan 201 S4] a ROPE op with its own table
+                            (param[op], max_seq x head_dim) reads that */
   htp_graph_op ops[HTP_GRAPH_MAX_OPS];
   uint64_t op_pcycles[HTP_GRAPH_MAX_OPS]; /**< of the last forward */
   float *param[HTP_GRAPH_MAX_OPS];     /**< gamma or conv_w, NULL until bound */
   float *state[HTP_GRAPH_MAX_OPS];     /**< CONV1D_GATE: 3 x N (rows 0-1 the
                                             conv state, row 2 scratch) */
   uint32_t ordinal[HTP_GRAPH_MAX_OPS]; /**< ATTN_M1: the attention-layer
-                                            index the cache is keyed by */
+                                            index the cache is keyed by
+                                            ([plan 201 S4] counted within
+                                            its shape's cache) */
   /** [plan 201 S1] MOE: the op's pool table, h_gu[0..E) then h_dn[0..E)
    *  (HTP_GRAPH_PARAM_EXPERTS; HTP_GRAPH_NO_HANDLE = not resident), NULL
    *  until bound */
@@ -271,7 +280,8 @@ int hexkl_graph_uses_q4m1(const hexkl_graph *g, uint32_t handle);
  *         table or one whose routed expert is not resident; a RMSNORM /
  *         QK_NORM /
  *         CONV1D_GATE / ROUTER_TOPK op with no parameter or state bound, a ROPE
- * op with no table, an ATTN_M1 op with no cache in @a env, a Q4M1 op with
+ * op with no table, an ATTN_M1 op with no cache of its shape in @a env, a
+ * Q4M1 op with
  * no fc runner in @a env, or the cache
  *         kernel's own hole), HTP_GRAPH_E_BADITEM (start_op past the
  *         list, pos >= max_seq), HTP_GRAPH_E_INVALIDFORMAT (an act length

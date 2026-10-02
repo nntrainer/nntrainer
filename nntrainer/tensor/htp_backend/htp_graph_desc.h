@@ -152,7 +152,12 @@ static inline const char *htp_graph_kinds_str(uint32_t mask, char *buf,
  *  2 x head_dim (q gamma | k gamma) for QK_NORM; CONV_W is 3 x N
  *  (w0 | w1 | w2) and CONV_STATE 2 x N (x_{t-2} | x_{t-1}) for
  *  CONV1D_GATE; ROPE_TABLE is max_seq x 64 (cos[32] | sin[32] per
- *  position) with op == HTP_GRAPH_NO_OP; ROUTER_W is K x n_experts
+ *  position) with op == HTP_GRAPH_NO_OP, the head_dim 64 table every ROPE
+ *  op without its own reads; [plan 201 S4] on a ROPE op it is that op's own
+ *  table, max_seq x head_dim (cos[hd / 2] | sin[hd / 2] per position, from
+ *  the CPU's precompute_freqs: the layer's theta and rotary variant, e.g.
+ *  Gemma 4's proportional RoPE with partial factor 0.25 as zero angles),
+ *  shared between ROPE ops that bind equal tables; ROUTER_W is K x n_experts
  *  (the gate weight, row-major [K][E]) and ROUTER_BIAS n_experts for
  *  ROUTER_TOPK (#132); [plan 201 S4] for the softmax router (eps_bits set)
  *  ROUTER_BIAS is K + n_experts: the input scale g[K]
@@ -214,7 +219,10 @@ enum { HTP_GRAPH_FFN_DENSE = 0, HTP_GRAPH_FFN_MOE = 1 };
  * head_dim describe the attention kinds (QK_NORM,
  * ROPE, ATTN_M1: K == (gqa + 2) n_kv head_dim, ATTN_M1's N == gqa n_kv
  * head_dim) and eps_bits holds the f32 bits of the norm epsilon (RMSNORM,
- * QK_NORM); both are 0 elsewhere. [plan 201 S4] A ROUTER_TOPK with eps_bits
+ * QK_NORM); both are 0 elsewhere. [plan 201 S4] An ATTN_M1's eps_bits is
+ * its score scale, which must be an fp16 value (0: 1/sqrt(head_dim),
+ * LFM2's 0.125; Gemma 4 sets 1.0), and its top_k the sliding window (0:
+ * every position; Gemma's sliding layers 1024). A ROUTER_TOPK with eps_bits
  * set is Gemma 4's softmax router: it RMS-norms its input itself (that
  * epsilon, ROUTER_BIAS's g as gamma), so it reads the un-normed stream,
  * then softmax, top-k, renormalise, per-expert scale (m1_ops_det.h); with
@@ -359,8 +367,11 @@ static inline uint32_t htp_graph_op_out_words(const htp_graph_op *op) {
  *         rule (RMSNORM: K a multiple of 32 (plan 201 S4: any width,
  *         Gemma's 2816), its feed 0 or HTP_GRAPH_NORM_N1; QK_NORM:
  *         head_dim 32, 64 or 128 -- the per-head norm's chunk must be a
- *         power of two too -- gqa <= 8, max_seq a multiple of 32; ROPE and
- *         ATTN_M1 (#152: the fp16 CPU order): head_dim 64), NOTALLOWED for
+ *         power of two too -- gqa <= 8, max_seq a multiple of 32; ROPE
+ *         and ATTN_M1 (#152: the fp16 CPU order): head_dim 64, since plan
+ *         201 S4 any multiple of 64 up to 512 -- a ROPE at another than 64
+ *         reads its own ROPE_TABLE, an ATTN_M1's scale is an fp16 value),
+ *         NOTALLOWED for
  *         a resident
  *         ATTN_M1 whose layer's ROPE is not resident (the DSP stretch must
  *         apply RoPE, since mha_core does on the CPU). #132's rules: an ADD
@@ -454,13 +465,15 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       if (op->K != 3u * op->N || op->N != hidden)
         return HTP_GRAPH_E_INVALIDFORMAT;
       break;
-    case HTP_OP_ATTN_M1:
     case HTP_OP_ADD:
-      if (op->N != hidden || (k == HTP_OP_ADD && op->K != hidden))
+      if (op->N != hidden || op->K != hidden)
         return HTP_GRAPH_E_INVALIDFORMAT;
-      if (k == HTP_OP_ADD && (op->out_slot != 0u || op->in_slot == 0u))
+      if (op->out_slot != 0u || op->in_slot == 0u)
         return HTP_GRAPH_E_INVALIDFORMAT;
       break;
+    /* ATTN_M1's N is gqa n_kv head_dim (the record rule below), the o
+       projection's K: LFM2's 32 x 64 happens to be its hidden, Gemma 4's
+       16 x 256 and 16 x 512 are not (plan 201 S4) */
     case HTP_OP_ROUTER_TOPK:
       if (op->K != hidden || op->N != op->n_experts || op->n_experts == 0u ||
           op->n_experts > HTP_GRAPH_MAX_EXPERTS || op->top_k == 0u ||
@@ -519,10 +532,22 @@ static inline uint32_t htp_graph_validate(const uint32_t *w, uint32_t n_words,
       if (k == HTP_OP_ROPE)
         rope_resident = op->resident;
       if (op->resident != 0u) {
-        if (op->head_dim % 32u != 0u || op->head_dim > 128u ||
-            (op->head_dim & (op->head_dim - 1u)) != 0u || op->gqa > 8u ||
-            max_seq % 32u != 0u ||
-            ((k == HTP_OP_ROPE || k == HTP_OP_ATTN_M1) && op->head_dim != 64u))
+        if (op->gqa > 8u || max_seq % 32u != 0u ||
+            (k == HTP_OP_QK_NORM &&
+             (op->head_dim % 32u != 0u || op->head_dim > 128u ||
+              (op->head_dim & (op->head_dim - 1u)) != 0u)) ||
+            ((k == HTP_OP_ROPE || k == HTP_OP_ATTN_M1) &&
+             (op->head_dim % 64u != 0u || op->head_dim > 512u)))
+          return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
+        /* [plan 201 S4] the kernel's scale is one hf multiply: eps_bits an
+           fp16 normal (sign clear, 13 low mantissa bits clear, 2^-14 ..
+           65504), or 0 only where 1/sqrt(head_dim) is one (64, 256) */
+        if (k == HTP_OP_ATTN_M1 &&
+            (op->eps_bits != 0u
+               ? ((op->eps_bits & 0x80001FFFu) != 0u ||
+                  ((op->eps_bits >> 23) & 0xFFu) < 113u ||
+                  ((op->eps_bits >> 23) & 0xFFu) > 142u)
+               : (op->head_dim != 64u && op->head_dim != 256u)))
           return HTP_GRAPH_E_SCHEMENOTSUPPORTED;
         if (k == HTP_OP_ATTN_M1 && rope_resident == 0u)
           return HTP_GRAPH_E_NOTALLOWED;

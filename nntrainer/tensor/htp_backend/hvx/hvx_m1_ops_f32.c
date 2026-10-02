@@ -155,34 +155,46 @@ void hvx_rmsnorm_n1_f32(const float *x, const float *gamma, float *y,
   rmsnorm_rows(x, gamma, y, n, chunk, eps, row_scale_out, 1);
 }
 
-/** @brief One head in fp16 (m1_rope64_det): a | b halves rounded, then
- *         rne16(rne16(a*c) - rne16(b*s)) and rne16(rne16(a*s) + rne16(b*c)),
- *         the CPU's fmul / fsub / fadd .8h. */
-static inline void hvx_rope64_head(float *x, HVX_Vector c, HVX_Vector s) {
-  HVX_UVector *v = (HVX_UVector *)x;
-  const HVX_Vector a = hvx_rne16_sf(v[0]), b = hvx_rne16_sf(v[1]);
-  v[0] =
+/** @brief 32 lanes of one head in fp16 (m1_rope_det): a | b halves
+ *         rounded, then rne16(rne16(a*c) - rne16(b*s)) and
+ *         rne16(rne16(a*s) + rne16(b*c)), the CPU's fmul / fsub / fadd .8h.
+ *         @a h is the half head in floats: b is a + h. */
+static inline void hvx_rope_lanes(float *x, uint32_t h, HVX_Vector c,
+                                  HVX_Vector s) {
+  HVX_UVector *va = (HVX_UVector *)x, *vb = (HVX_UVector *)(x + h);
+  const HVX_Vector a = hvx_rne16_sf(*va), b = hvx_rne16_sf(*vb);
+  *va =
     hvx_rne16_sf(Q6_Vsf_vsub_VsfVsf(hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(a, c)),
                                     hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(b, s))));
-  v[1] =
+  *vb =
     hvx_rne16_sf(Q6_Vsf_vadd_VsfVsf(hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(a, s)),
                                     hvx_rne16_sf(Q6_Vsf_vmpy_VsfVsf(b, c))));
 }
 
-void hvx_rope64_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
-                    const float *cs) {
-  if (!cs || (n_q && !q) || (n_k && !k)) {
+void hvx_rope_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
+                  const float *cs, uint32_t head_dim) {
+  const uint32_t h = head_dim / 2u;
+  if (!cs || (n_q && !q) || (n_k && !k) || head_dim == 0u || h % LANES != 0u) {
     return;
   }
-  /* The CPU's table is (_FP16) of the same f32 values. */
-  const HVX_Vector c = hvx_rne16_sf(((const HVX_UVector *)cs)[0]);
-  const HVX_Vector s = hvx_rne16_sf(((const HVX_UVector *)cs)[1]);
-  for (uint32_t h = 0; h < n_q; ++h) {
-    hvx_rope64_head(q + (size_t)h * 2u * LANES, c, s);
+  /* One 32-lane chunk of the half head at a time: the table vectors are
+     loaded once per chunk for every head (the CPU's table is (_FP16) of
+     the same f32 values). */
+  for (uint32_t j = 0; j < h; j += LANES) {
+    const HVX_Vector c = hvx_rne16_sf(*(const HVX_UVector *)(cs + j));
+    const HVX_Vector s = hvx_rne16_sf(*(const HVX_UVector *)(cs + h + j));
+    for (uint32_t i = 0; i < n_q; ++i) {
+      hvx_rope_lanes(q + (size_t)i * head_dim + j, h, c, s);
+    }
+    for (uint32_t i = 0; i < n_k; ++i) {
+      hvx_rope_lanes(k + (size_t)i * head_dim + j, h, c, s);
+    }
   }
-  for (uint32_t h = 0; h < n_k; ++h) {
-    hvx_rope64_head(k + (size_t)h * 2u * LANES, c, s);
-  }
+}
+
+void hvx_rope64_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
+                    const float *cs) {
+  hvx_rope_f32(q, n_q, k, n_k, cs, 2u * LANES);
 }
 
 void hvx_conv_gate_m1_f32(const float *abc, float *state3, const float *conv_w,

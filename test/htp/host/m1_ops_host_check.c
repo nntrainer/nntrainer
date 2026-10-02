@@ -624,6 +624,94 @@ static void check_rope(void) {
   free(y_det);
 }
 
+/**
+ * @brief [plan 201 S4] Gemma 4's RoPE at head_dim 256 (sliding layers:
+ *        "default", theta 1e4) and 512 (full layers: "proportional",
+ *        partial_rotary_factor 0.25, theta 1e6), on its 16 q + kv heads.
+ *        The table is mha_core's (_compute_proportional_parameters: angles
+ *        theta^(-2i / hd) for i < 0.25 hd / 2, 0 above, the exponent over
+ *        the WHOLE head_dim; calc_trigonometric_vals_dup's cos | sin per
+ *        position) in double then rounded once, as the CPU's f32 table is.
+ *        The kernel must equal m1_rope_det bit for bit, the identity pairs
+ *        (zero angle) must pass x through, and the spec's SNR against the
+ *        rotation in double is printed. A kernel pairing (i, i + 32) per
+ *        64-lane chunk, LFM2's head reused, is run_host_checks.sh's mutant.
+ */
+static void check_rope_gemma(void) {
+  static const struct {
+    uint32_t hd, n_q, n_k;
+    double theta, partial;
+    const char *name;
+  } layers[2] = {
+    {256u, 16u, 8u, 1e4, 1.0, "sliding hd256 default 1e4"},
+    {512u, 16u, 2u, 1e6, 0.25, "full hd512 proportional 0.25 1e6"}};
+  static const uint32_t positions[] = {0u, 1u, 1023u, 1024u, 4095u};
+  for (int l = 0; l < 2; ++l) {
+    const uint32_t hd = layers[l].hd, h = hd / 2u,
+                   nh = layers[l].n_q + layers[l].n_k, n = nh * hd;
+    const uint32_t angles = (uint32_t)(layers[l].partial * hd / 2.0);
+    float *x = malloc(n * sizeof(float)), *y_hvx = malloc(n * sizeof(float));
+    float *y_det = malloc(n * sizeof(float)), *cs = malloc(hd * sizeof(float));
+    double *ang = malloc(h * sizeof(double));
+    uint32_t bad = 0, bad_pass = 0;
+    double sig = 0.0, err = 0.0;
+    for (uint32_t i = 0; i < nh; ++i) {
+      fill_row(x + i * hd, hd, i < 3u ? (int)i + 1 : 0);
+    }
+    for (size_t p = 0; p < sizeof(positions) / sizeof(positions[0]); ++p) {
+      for (uint32_t i = 0; i < h; ++i) {
+        ang[i] = i < angles ? (double)positions[p] *
+                                pow(layers[l].theta, -(2.0 * i) / (double)hd)
+                            : 0.0;
+        cs[i] = (float)cos(ang[i]);
+        cs[h + i] = (float)sin(ang[i]);
+      }
+      memcpy(y_hvx, x, n * sizeof(float));
+      memcpy(y_det, x, n * sizeof(float));
+      hvx_rope_f32(y_hvx, layers[l].n_q, y_hvx + layers[l].n_q * hd,
+                   layers[l].n_k, cs, hd);
+      for (uint32_t i = 0; i < nh; ++i) {
+        m1_rope_det(y_det + i * hd, hd, cs);
+      }
+      for (uint32_t i = 0; i < n; ++i) {
+        bad += memcmp(&y_hvx[i], &y_det[i], sizeof(float)) ? 1u : 0u;
+      }
+      for (uint32_t k = 0; k < nh; ++k) {
+        const float *xk = x + k * hd, *yk = y_det + k * hd;
+        for (uint32_t i = 0; i < h; ++i) {
+          const double a = xk[i], b = xk[h + i];
+          const double r0 = a * cos(ang[i]) - b * sin(ang[i]);
+          const double r1 = a * sin(ang[i]) + b * cos(ang[i]);
+          if (i >= angles) { /* by value: -0 may come out +0 (fsub) */
+            bad_pass += yk[i] != attn_m1_det_rne16(xk[i]);
+            bad_pass += yk[h + i] != attn_m1_det_rne16(xk[h + i]);
+          }
+          if (k >= 3u) { /* the random heads: zeros / subnormals / 1e4 are
+                            the bit checks' */
+            sig += r0 * r0 + r1 * r1;
+            err +=
+              (yk[i] - r0) * (yk[i] - r0) + (yk[h + i] - r1) * (yk[h + i] - r1);
+          }
+        }
+      }
+    }
+    const double snr = 10.0 * log10(sig / err);
+    printf("M1 OPS rope %s: heads=%u+%u x 5 positions bad=%u, pass-through "
+           "pairs %u..%u bad=%u, SNR vs f64 %.1f dB\n",
+           layers[l].name, layers[l].n_q, layers[l].n_k, bad, angles, h,
+           bad_pass, snr);
+    CHECK(bad == 0u, "rope %s: HVX differs from m1_rope_det", layers[l].name);
+    CHECK(bad_pass == 0u, "rope %s: a zero-angle pair is not x",
+          layers[l].name);
+    CHECK(snr > 60.0, "rope %s: SNR %.1f dB", layers[l].name, snr);
+    free(x);
+    free(y_hvx);
+    free(y_det);
+    free(cs);
+    free(ang);
+  }
+}
+
 /* ---- conv1d + gate ----------------------------------------------------- */
 
 enum { CONV_C = 2048, CONV_ROWS = 15, CONV_CHAIN = 8 };
@@ -1460,6 +1548,7 @@ int main(int argc, char **argv) {
   check_norm_cpu_order();
   check_sqrt_recip_rn();
   check_rope();
+  check_rope_gemma();
   check_conv();
   check_swiglu_argmax_kernels();
   check_router_kernel();

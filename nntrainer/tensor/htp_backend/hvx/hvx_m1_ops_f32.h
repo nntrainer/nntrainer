@@ -5,8 +5,9 @@
  * @file   hvx_m1_ops_f32.h
  * @date   27 Sep 2026
  * @brief  The M=1 small ops on HVX: RMSNorm (whole row / per head), RoPE at
- *         head_dim 64, causal conv1d L=3 + gate, the MoE router (#132) --
- *         each bit-identical to nntrainer/tensor/m1_ops_det.h
+ *         head_dim 64 (and any multiple of 64, plan 201 S4), causal conv1d L=3
+ * + gate, the MoE router (#132) -- each bit-identical to
+ * nntrainer/tensor/m1_ops_det.h
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
@@ -71,6 +72,16 @@ void hvx_rmsnorm_n1_f32(const float *x, const float *gamma, float *y,
  */
 void hvx_rope64_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
                     const float *cs);
+
+/**
+ * @brief [plan 201 S4] m1_rope_det on n_q q heads then n_k k heads, each
+ *        @a head_dim contiguous floats (half a head a multiple of 32: 64,
+ *        128, 256, 512); cs = cos[head_dim / 2] | sin[head_dim / 2] for
+ *        this position. A head_dim outside that rule returns without
+ *        writing (the validator refuses it first).
+ */
+void hvx_rope_f32(float *q, uint32_t n_q, float *k, uint32_t n_k,
+                  const float *cs, uint32_t head_dim);
 
 /**
  * @brief Causal depthwise conv1d (L=3) + gate for one token, through the
