@@ -11,6 +11,7 @@
 
 #include <dense_ffn_layer.h>
 
+#include "htp_decode_hook.h"
 #include <compute_ops.h>
 #include <layer_context.h>
 #include <nntrainer_error.h>
@@ -123,6 +124,11 @@ void DenseFfnLayer::incremental_forwarding(nntrainer::RunLayerContext &context,
   nntrainer::Tensor &output_ = context.getOutput(SINGLE_INOUT_IDX);
 
   const unsigned int rows = to - from;
+  // [#222] every kind resident: the HTP runs this row's FFN (DENSE_FFN),
+  // and nothing reads this output before the lm_head hook -- skipped as
+  // the per-FC form's three fully_connected layers skip theirs
+  if (rows == 1 && input_.batch() == 1 && htpDecodeRowResident(from))
+    return;
   nntrainer::TensorDim in_step_dim = input_.getDim();
   in_step_dim.batch(1);
   in_step_dim.height(rows);
