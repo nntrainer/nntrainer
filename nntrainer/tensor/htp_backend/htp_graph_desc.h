@@ -5,7 +5,8 @@
  * @file   htp_graph_desc.h
  * @date   23 Sep 2026
  * @brief  The per-token decode graph as the DSP receives it: wire format,
- *         validator and the LFM2 builder, as pure C99 (#85, v2 in #130)
+ *         validator and the LFM2 / Gemma 4 builders, as pure C99 (#85, v2 in
+ *         #130, Gemma in plan 201 S4)
  * @see    https://github.com/nntrainer/nntrainer
  * @author dlwlzzero <dlwlzzero@gmail.com>
  * @bug    No known bugs except for NYI items
@@ -44,7 +45,7 @@
 #define HTP_GRAPH_VERSION 2u
 #define HTP_GRAPH_HEADER_WORDS 7u
 /** @brief LFM2.5-8B-A1B is 228 ops (section htp_graph_lfm2_build),
- *  Gemma-4-26B-A4B about 25 a layer x 30 (plan 201 section 2.4); the table
+ *  Gemma-4-26B-A4B 542 (htp_graph_gemma_build: 18 a layer x 30); the table
  *  is HTP_GRAPH_OP_WORDS x 4 B per op, so 1024 is 320 KiB of DSP heap at
  *  graph_init (address-space note in hexkl_graph.c). */
 #define HTP_GRAPH_MAX_OPS 1024u
@@ -780,6 +781,146 @@ static inline uint32_t htp_graph_lfm2_build(uint32_t *w, uint32_t cap,
   last_mm = HTP_GRAPH_NO_OP;
   for (i = n; i-- > 0u;) {
     htp_graph_op *op = htp_graph_op_at(w, i);
+    op->next_mm = last_mm;
+    if (htp_graph_kind_streams_weights(op->kind))
+      last_mm = i;
+  }
+  return htp_graph_words_for(s->n_layers, n);
+}
+
+/** @brief [plan 201 S4] The Gemma 4 MoE decode step's shape, from
+ *  config.json's text_config (#4296's Gemma4MoECausalLM). */
+typedef struct {
+  uint32_t n_layers;
+  uint32_t hidden;
+  uint32_t inter_dense; /**< intermediate_size: the GeGLU MLP beside the MoE */
+  uint32_t inter_moe;   /**< moe_intermediate_size */
+  uint32_t n_experts;
+  uint32_t top_k;         /**< top_k_experts */
+  uint32_t n_heads;       /**< num_attention_heads, both layer kinds */
+  uint32_t n_kv;          /**< num_key_value_heads (sliding layers) */
+  uint32_t head_dim;      /**< head_dim (sliding layers) */
+  uint32_t n_kv_full;     /**< num_global_key_value_heads */
+  uint32_t head_dim_full; /**< global_head_dim */
+  uint32_t k_eq_v; /**< attention_k_eq_v: a full layer's v is its raw k */
+  uint32_t window; /**< sliding_window */
+  uint32_t vocab;
+  uint32_t max_seq;
+  float eps;     /**< rms_norm_eps, every norm and the router's */
+  float softcap; /**< final_logit_softcapping, 0 for none */
+} htp_graph_gemma_shape;
+
+/**
+ * @brief Builds the Gemma 4 MoE decode op list: per layer input_layernorm,
+ *        q | k (| v), QK_NORM (q / k with gamma, v without), RoPE,
+ *        attention (scale 1, the window on sliding layers), o_proj,
+ *        post_attention_norm and the residual add; then the two FFN
+ *        branches in HTP_GRAPH_N_SLOTS' 3-slot plan (the MoE branch first:
+ *        pre_ffn_norm_2, the softmax router on the un-normed stream, MOE,
+ *        post_ffn_norm_2; the dense GeGLU branch in place on slot 1:
+ *        pre_ffn_norm, DENSE_FFN, post_ffn_norm_1), the branch sum,
+ *        post_ffn_norm and the residual add times layer_scalar; last the
+ *        final norm and the tied, soft-capped lm_head. #4296 runs the
+ *        dense branch first; the branches are independent, so the order
+ *        moves no bit (graph_host_check's Gemma stretch).
+ * @param w             HTP_GRAPH_MAX_OPS' worth of words or more (cap)
+ * @param cap           words available in @a w
+ * @param s             the shape
+ * @param layer_is_full n_layers bytes, 1 for a full_attention layer
+ * @param layer_scalar  n_layers multipliers (the checkpoint's
+ *                      layerN_layer_scalar), or NULL for none
+ * @param resident_mask HTP_GRAPH_KIND_BIT mask: which kinds get the bit
+ * @return the words written, or 0 when the shape is not a Gemma one or
+ *         @a cap or HTP_GRAPH_MAX_OPS is too small. 18 ops a layer and 2
+ *         for the tail: Gemma-4-26B-A4B is 542. The Q4M1 kinds' parts
+ *         are the load hand-over's (htp_compute_ops.cpp), as for LFM2.
+ */
+static inline uint32_t htp_graph_gemma_build(uint32_t *w, uint32_t cap,
+                                             const htp_graph_gemma_shape *s,
+                                             const uint8_t *layer_is_full,
+                                             const float *layer_scalar,
+                                             uint32_t resident_mask) {
+  const uint32_t h = s->hidden, n_ops = 18u * s->n_layers + 2u;
+  const float attn_scale = 1.0f; /* Gemma4TextAttention's scaling */
+  uint32_t n = 0, l, i, last_mm, eps_bits, scale_bits;
+  htp_graph_op *op;
+  if (s->n_layers == 0u || s->n_layers > HTP_GRAPH_MAX_LAYERS ||
+      s->n_kv == 0u || s->n_kv_full == 0u || s->n_heads % s->n_kv != 0u ||
+      s->n_heads % s->n_kv_full != 0u || n_ops > HTP_GRAPH_MAX_OPS ||
+      cap < htp_graph_words_for(s->n_layers, n_ops))
+    return 0u;
+  memcpy(&eps_bits, &s->eps, sizeof(eps_bits));
+  memcpy(&scale_bits, &attn_scale, sizeof(scale_bits));
+  w[0] = HTP_GRAPH_MAGIC;
+  w[1] = HTP_GRAPH_VERSION;
+  w[2] = s->n_layers;
+  w[3] = 0u; /* patched below; htp_graph_op_at only reads w[2] */
+  w[4] = h;
+  w[5] = s->vocab;
+  w[6] = s->max_seq;
+  for (l = 0; l < s->n_layers; ++l) {
+    w[HTP_GRAPH_HEADER_WORDS + l] = HTP_GRAPH_LAYER_ATTN;
+    w[HTP_GRAPH_HEADER_WORDS + s->n_layers + l] = HTP_GRAPH_FFN_DENSE_MOE;
+  }
+#define G4_EMIT(kind, K, N, i_, o_)                                            \
+  htp_graph_lfm2_emit(w, &n, (kind), l, (K), (N), (i_), (o_), resident_mask)
+  for (l = 0; l < s->n_layers; ++l) {
+    const int full = layer_is_full[l] != 0u;
+    const int kev = full && s->k_eq_v != 0u;
+    const uint32_t n_kv = full ? s->n_kv_full : s->n_kv;
+    const uint32_t hd = full ? s->head_dim_full : s->head_dim;
+    const uint32_t gqa = s->n_heads / n_kv, q = s->n_heads * hd;
+    const uint32_t qkv = q + 2u * n_kv * hd;
+    uint32_t a;
+    G4_EMIT(HTP_OP_RMSNORM, h, h, 0, 1)->eps_bits = eps_bits;
+    /* under k = v the FC writes q | k; the row's v part is not read */
+    G4_EMIT(HTP_OP_FC, h, kev ? q + n_kv * hd : qkv, 1, 2);
+    op = G4_EMIT(HTP_OP_QK_NORM, qkv, qkv, 2, 2);
+    op->eps_bits = eps_bits;
+    op->feed = HTP_GRAPH_QKNORM_V | (kev ? HTP_GRAPH_QKNORM_K_EQ_V : 0u);
+    G4_EMIT(HTP_OP_ROPE, qkv, qkv, 2, 2);
+    op = G4_EMIT(HTP_OP_ATTN_M1, qkv, q, 2, 1);
+    op->eps_bits = scale_bits;
+    op->top_k = full ? 0u : s->window;
+    for (a = n - 3u; a < n; ++a) {
+      op = htp_graph_op_at(w, a);
+      op->n_kv = n_kv;
+      op->gqa = gqa;
+      op->head_dim = hd;
+    }
+    G4_EMIT(HTP_OP_FC, q, h, 1, 2);
+    G4_EMIT(HTP_OP_RMSNORM, h, h, 2, 1)->eps_bits = eps_bits;
+    G4_EMIT(HTP_OP_ADD, h, h, 1, 0);
+    G4_EMIT(HTP_OP_RMSNORM, h, h, 0, 1)->eps_bits = eps_bits;
+    op = G4_EMIT(HTP_OP_ROUTER_TOPK, h, s->n_experts, 0, 2);
+    op->n_experts = s->n_experts;
+    op->top_k = s->top_k;
+    op->eps_bits = eps_bits;
+    op = G4_EMIT(HTP_OP_MOE, h, s->inter_moe, 1, 2);
+    op->N_out = h;
+    op->n_experts = s->n_experts;
+    op->top_k = s->top_k;
+    G4_EMIT(HTP_OP_RMSNORM, h, h, 2, 2)->eps_bits = eps_bits;
+    G4_EMIT(HTP_OP_RMSNORM, h, h, 0, 1)->eps_bits = eps_bits;
+    G4_EMIT(HTP_OP_DENSE_FFN, h, s->inter_dense, 1, 1)->N_out = h;
+    G4_EMIT(HTP_OP_RMSNORM, h, h, 1, 1)->eps_bits = eps_bits;
+    G4_EMIT(HTP_OP_ADD, h, h, 1, 2);
+    G4_EMIT(HTP_OP_RMSNORM, h, h, 2, 1)->eps_bits = eps_bits;
+    op = G4_EMIT(HTP_OP_ADD, h, h, 1, 0);
+    if (layer_scalar != NULL)
+      memcpy(&op->eps_bits, &layer_scalar[l], sizeof(op->eps_bits));
+  }
+#undef G4_EMIT
+  op = htp_graph_lfm2_emit(w, &n, HTP_OP_RMSNORM, s->n_layers, h, h, 0, 1,
+                           resident_mask);
+  op->eps_bits = eps_bits;
+  op = htp_graph_lfm2_emit(w, &n, HTP_OP_LM_HEAD, s->n_layers, h, s->vocab, 1,
+                           2, resident_mask);
+  memcpy(&op->eps_bits, &s->softcap, sizeof(op->eps_bits));
+  w[3] = n;
+  last_mm = HTP_GRAPH_NO_OP;
+  for (i = n; i-- > 0u;) {
+    op = htp_graph_op_at(w, i);
     op->next_mm = last_mm;
     if (htp_graph_kind_streams_weights(op->kind))
       last_mm = i;
