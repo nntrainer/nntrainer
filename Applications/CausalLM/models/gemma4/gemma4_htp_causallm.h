@@ -73,6 +73,19 @@ protected:
   std::set<int> MOE_HTP_LAYERS;
   unsigned int MOE_CACHE_EXPERTS = 0;
 
+  /** Engines of the attention projections (q, k, v, o) and of the dense
+   *  MLP's three fully connected layers, under the nntr_config keys
+   *  Lfm2CausalLM reads (doc 50): attn_proj_engine / attn_proj_htp_layers
+   *  and dense_ffn_engine / dense_ffn_htp_layers. "htp" moves only their
+   *  prefill matmul to the accelerator -- FloatTensor::dot declines M == 1,
+   *  so decode keeps the CPU Q4_0 kernel on the same weight, which the Q4_0
+   *  registration path leaves resident. An empty layer list means every
+   *  layer. Default "cpu" leaves every existing run unchanged. */
+  std::string ATTN_PROJ_ENGINE = "cpu";
+  std::set<int> ATTN_PROJ_HTP_LAYERS;
+  std::string FFN_ENGINE = "cpu";
+  std::set<int> FFN_HTP_LAYERS;
+
   std::string FULL_ATTENTION_ROPE_TYPE = "default";
   std::string SLIDING_ATTENTION_ROPE_TYPE = "default";
   float FULL_ATTENTION_ROPE_PARTIAL_ROTARY_FACTOR = 1.0f;

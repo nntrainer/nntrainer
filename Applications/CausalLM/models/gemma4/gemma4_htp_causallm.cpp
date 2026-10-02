@@ -28,6 +28,16 @@
 
 namespace causallm {
 
+namespace {
+/** @brief @a engine for @a layer_id when the layer is in @a ids or @a ids is
+ *  empty, "cpu" otherwise -- the moe_htp_layers rule, and Lfm2CausalLM's
+ *  projEngine. */
+std::string engineFor(const std::string &engine, const std::set<int> &ids,
+                      int layer_id) {
+  return (ids.empty() || ids.count(layer_id)) ? engine : "cpu";
+}
+} // namespace
+
 bool Gemma4Transformer::isKVSharedLayer(int layer_id) const {
   const int first_kv_shared_layer_idx = NUM_LAYERS - NUM_KV_SHARED_LAYERS;
   return layer_id >= first_kv_shared_layer_idx && first_kv_shared_layer_idx > 0;
@@ -161,6 +171,13 @@ void Gemma4Transformer::setupParameters(json &cfg, json &generation_cfg,
       parseLayerIdList(nntr_cfg.value("moe_htp_layers", std::string("")));
     MOE_CACHE_EXPERTS = nntr_cfg.value("moe_cache_experts", 0u);
   }
+
+  ATTN_PROJ_ENGINE = nntr_cfg.value("attn_proj_engine", std::string("cpu"));
+  ATTN_PROJ_HTP_LAYERS =
+    parseLayerIdList(nntr_cfg.value("attn_proj_htp_layers", std::string("")));
+  FFN_ENGINE = nntr_cfg.value("dense_ffn_engine", std::string("cpu"));
+  FFN_HTP_LAYERS =
+    parseLayerIdList(nntr_cfg.value("dense_ffn_htp_layers", std::string("")));
 
   FULL_ATTENTION_ROPE_THETA = ROPE_THETA;
   SLIDING_ATTENTION_ROPE_THETA = ROPE_THETA;
@@ -584,9 +601,13 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
 
   // Q layer [B, S, H] -> [B, S, Nq*Dh]
   std::vector<std::string> q_params = {
-    withKey("name", Q), withKey("unit", curr_head_dim * n_heads),
-    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("name", Q),
+    withKey("unit", curr_head_dim * n_heads),
+    withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine",
+            engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
   appendSkipPrefillIfNeeded(q_params, is_kv_shared_layer);
   LayerHandle wq(createLayer("fully_connected", q_params));
   Tensor q = wq(query);
@@ -651,10 +672,14 @@ Tensor Gemma4Transformer::createSharedAttention(const int layer_id,
   Tensor a = mha({q_scaled, shared_k_norm, shared_v_norm, cache_k, cache_v});
 
   // O layer [B, S, Nq*Dh] -> [B, S, H]
-  std::vector<std::string> o_params = {withKey("name", O), withKey("unit", DIM),
-                                       withKey("disable_bias", "true"),
-                                       withKey("weight_initializer", "ones"),
-                                       withKey("weight_dtype", FC_LAYER_DTYPE)};
+  std::vector<std::string> o_params = {
+    withKey("name", O),
+    withKey("unit", DIM),
+    withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine",
+            engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
   appendSkipPrefillIfNeeded(o_params, is_kv_shared_layer);
   LayerHandle wo(createLayer("fully_connected", o_params));
 
@@ -685,18 +710,26 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
 
   // Q layer [B, S, H] -> [B, S, Nq*Dh]
   std::vector<std::string> q_params = {
-    withKey("name", Q), withKey("unit", curr_head_dim * n_heads),
-    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("name", Q),
+    withKey("unit", curr_head_dim * n_heads),
+    withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine",
+            engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
   appendSkipPrefillIfNeeded(q_params, is_kv_shared_layer);
   LayerHandle wq(createLayer("fully_connected", q_params));
   Tensor q = wq(query);
 
   // K layer [B, S, H] -> [B, S, Nk*Dh]
   std::vector<std::string> k_params = {
-    withKey("name", K), withKey("unit", curr_head_dim * curr_kv_heads),
-    withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("name", K),
+    withKey("unit", curr_head_dim * curr_kv_heads),
+    withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine",
+            engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
   appendSkipPrefillIfNeeded(k_params, is_kv_shared_layer);
   LayerHandle wk(createLayer("fully_connected", k_params));
   Tensor k = wk(key);
@@ -709,9 +742,13 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     v = k;
   } else {
     std::vector<std::string> v_params = {
-      withKey("name", V), withKey("unit", curr_head_dim * curr_kv_heads),
-      withKey("disable_bias", "true"), withKey("weight_initializer", "ones"),
-      withKey("weight_dtype", FC_LAYER_DTYPE)};
+      withKey("name", V),
+      withKey("unit", curr_head_dim * curr_kv_heads),
+      withKey("disable_bias", "true"),
+      withKey("weight_initializer", "ones"),
+      withKey("weight_dtype", FC_LAYER_DTYPE),
+      withKey("engine",
+              engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
     appendSkipPrefillIfNeeded(v_params, is_kv_shared_layer);
     LayerHandle wv(createLayer("fully_connected", v_params));
     v = wv(value);
@@ -795,10 +832,14 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   Tensor a = mha({q_scaled, k_normed, v_normed, cache_k, cache_v});
 
   // O layer [B, S, Nq*Dh] -> [B, S, H]
-  std::vector<std::string> o_params = {withKey("name", O), withKey("unit", DIM),
-                                       withKey("disable_bias", "true"),
-                                       withKey("weight_initializer", "ones"),
-                                       withKey("weight_dtype", FC_LAYER_DTYPE)};
+  std::vector<std::string> o_params = {
+    withKey("name", O),
+    withKey("unit", DIM),
+    withKey("disable_bias", "true"),
+    withKey("weight_initializer", "ones"),
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine",
+            engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
   appendSkipPrefillIfNeeded(o_params, is_kv_shared_layer);
   LayerHandle wo(createLayer("fully_connected", o_params));
 
@@ -810,12 +851,18 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
   const bool is_kv_shared_layer = isKVSharedLayer(layer_id);
   const int curr_hidden_dim =
     hidden_dim * ((USE_DOUBLE_WIDE_MLP && is_kv_shared_layer) ? 2 : 1);
+  // The three fully connected layers on dense_ffn_engine; GeGLU itself stays
+  // on the CPU between them.
+  const std::string ffn_engine =
+    engineFor(FFN_ENGINE, FFN_HTP_LAYERS, layer_id);
 
   std::vector<std::string> ffn_gate_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_gate"),
-    withKey("unit", curr_hidden_dim), withKey("disable_bias", "true"),
+    withKey("unit", curr_hidden_dim),
+    withKey("disable_bias", "true"),
     withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine", ffn_engine)};
   appendSkipPrefillIfNeeded(ffn_gate_props, is_kv_shared_layer);
   LayerHandle ffn_gate(createLayer("fully_connected", ffn_gate_props));
   Tensor gate = ffn_gate(input);
@@ -829,9 +876,11 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
 
   std::vector<std::string> ffn_up_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_up"),
-    withKey("unit", curr_hidden_dim), withKey("disable_bias", "true"),
+    withKey("unit", curr_hidden_dim),
+    withKey("disable_bias", "true"),
     withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine", ffn_engine)};
   appendSkipPrefillIfNeeded(ffn_up_props, is_kv_shared_layer);
   LayerHandle ffn_up(createLayer("fully_connected", ffn_up_props));
   Tensor up = ffn_up(input);
@@ -844,9 +893,11 @@ Tensor Gemma4Transformer::createMlp(const int layer_id, int dim, int hidden_dim,
 
   std::vector<std::string> ffn_down_props = {
     withKey("name", "layer" + std::to_string(layer_id) + "_ffn_down"),
-    withKey("unit", dim), withKey("disable_bias", "true"),
+    withKey("unit", dim),
+    withKey("disable_bias", "true"),
     withKey("weight_initializer", "ones"),
-    withKey("weight_dtype", FC_LAYER_DTYPE)};
+    withKey("weight_dtype", FC_LAYER_DTYPE),
+    withKey("engine", ffn_engine)};
   appendSkipPrefillIfNeeded(ffn_down_props, is_kv_shared_layer);
   LayerHandle ffn_down(createLayer("fully_connected", ffn_down_props));
 
