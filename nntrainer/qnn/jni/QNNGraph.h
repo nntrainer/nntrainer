@@ -17,6 +17,7 @@
 #include <iostream>
 #include <layer_impl.h>
 #include <qnn_context_var.h>
+#include <qnn_graph_buffer.h>
 #include <qnn_properties.h>
 #include <qnn_rpc_manager.h>
 
@@ -26,8 +27,7 @@ namespace nntrainer {
  */
 class QNNGraph : public LayerImpl {
 public:
-  using BufferTypePtr =
-    std::variant<std::monostate, uint8_t *, uint16_t *, float *>;
+  using BufferTypePtr = QnnBufferPtr;
 
   QNNGraph();
   ~QNNGraph();
@@ -74,8 +74,6 @@ public:
             TensorDim::DataType defineWeightDataType, bool fsu = false,
             size_t start_offset = 0, bool read_from_offset = false,
             int file_fd = -1) override;
-
-  void updateBufferType(std::vector<BufferTypePtr> &buffers, Tensor &T);
 
   void populateTensor(std::shared_ptr<QNNVar> qc_var,
                       Qnn_Context_Graph_t &context_i, BufferTypePtr buffer,

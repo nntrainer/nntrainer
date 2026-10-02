@@ -206,13 +206,12 @@ void QNNGraph::forwarding(RunLayerContext &context, bool training) {
     << " does not match with number of QNN's output tensors "
     << graphInfo->numOutputTensors << "!";
 
-  for (size_t i = 0; i < context.getNumInputs(); ++i) {
-    updateBufferType(currentInputBuffers, context.getInput(i));
-  }
-
-  for (size_t i = 0; i < graphInfo->numOutputTensors; ++i) {
-    updateBufferType(currentOutputBuffers, context.getOutput(i));
-  }
+  resetQnnBuffers(
+    currentInputBuffers, context.getNumInputs(),
+    [&](unsigned int i) -> Tensor & { return context.getInput(i); });
+  resetQnnBuffers(
+    currentOutputBuffers, graphInfo->numOutputTensors,
+    [&](unsigned int i) -> Tensor & { return context.getOutput(i); });
 
   Qnn_Tensor_t *inputs = nullptr;
   Qnn_Tensor_t *outputs = nullptr;
@@ -319,25 +318,6 @@ void QNNGraph::forwarding(RunLayerContext &context, bool training) {
   }
 }
 
-void QNNGraph::updateBufferType(std::vector<BufferTypePtr> &buffers,
-                                Tensor &T) {
-  Tdatatype type = T.getDataType();
-  switch (type) {
-  case Tdatatype::UINT4:
-  case Tdatatype::UINT8:
-    buffers.push_back(T.getData<uint8_t>());
-    break;
-  case Tdatatype::UINT16:
-    buffers.push_back(T.getData<uint16_t>());
-    break;
-  case Tdatatype::FP32:
-    buffers.push_back(T.getData<float>());
-    break;
-  default:
-    break;
-  }
-}
-
 void QNNGraph::populateTensor(std::shared_ptr<QNNVar> qc_var,
                               Qnn_Context_Graph_t &context_i,
                               BufferTypePtr buffers, Qnn_Tensor_t *T) {
@@ -362,7 +342,7 @@ void QNNGraph::populateTensor(std::shared_ptr<QNNVar> qc_var,
     qc_var->RpcMem->registerQnnTensor(std::get<float *>(buffers), *T,
                                       context_i.m_context);
   } break;
-  default:
+  default: // defensive: resetQnnBuffers() never yields std::monostate
     std::cout << "Unknown type: " << buffers.index() << std::endl;
     break;
   }
