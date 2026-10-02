@@ -60,6 +60,7 @@
 
 #include "hexkl_acc_tile.h"
 #include "hexkl_dma_ring.h"
+#include "hexkl_hmx_mm.h"
 #include "hexkl_micro.h"
 #include "hvx_attn_softmax_f16.h"
 #include "hvx_convert.h"
@@ -119,9 +120,6 @@ typedef struct {
 
 /* --- addressing ------------------------------------------------------- */
 
-static inline uint32_t off_of(const attn_ctx *c, const void *p) {
-  return (uint32_t)((const uint8_t *)p - c->vb);
-}
 /** @brief Q tile (row tile i, dot tile d) of q block qi of the chunk. */
 static inline uint8_t *q_tile(const attn_ctx *c, uint32_t qi, uint32_t i,
                               uint32_t d) {
@@ -340,13 +338,13 @@ static int phase_qk(attn_ctx *c, uint32_t n, uint32_t kb, uint32_t buf,
     for (uint32_t col = 0; col < c->L.n_col_tiles; ++col) {
       uint64_t t0 = now_us();
       hexkl_micro_hmx_acc_clear_int32();
-      for (uint32_t d = 0; d < c->L.n_dot_tiles; ++d) {
-        const uint32_t ao = off_of(c, q_tile(c, c->qi, i, d));
-        const uint32_t wo = off_of(c, kt_tile(c, buf, col, d));
-        int rc = q4 ? hexkl_micro_hmx_mm_u8i4(c->vb, ao, wo)
-                    : hexkl_micro_hmx_mm_u8i8(c->vb, ao, wo);
-        if (rc != AEE_SUCCESS) {
-          return rc;
+      if (q4) {
+        for (uint32_t d = 0; d < c->L.n_dot_tiles; ++d) {
+          hexkl_hmx_mm_u8i4(q_tile(c, c->qi, i, d), kt_tile(c, buf, col, d));
+        }
+      } else {
+        for (uint32_t d = 0; d < c->L.n_dot_tiles; ++d) {
+          hexkl_hmx_mm_u8i8(q_tile(c, c->qi, i, d), kt_tile(c, buf, col, d));
         }
       }
       int rc = hexkl_micro_hmx_acc_read_int32(c->vb, c->cfg, c->L.acc);
@@ -558,13 +556,13 @@ static int phase_pv(attn_ctx *c, uint32_t buf, int first) {
     for (uint32_t d = 0; d < c->L.n_dot_tiles; ++d) {
       uint64_t t0 = now_us();
       hexkl_micro_hmx_acc_clear_int32();
-      for (uint32_t col = 0; col < c->L.n_col_tiles; ++col) {
-        const uint32_t ao = off_of(c, p_tile(c, d, i, col));
-        const uint32_t wo = off_of(c, v_tile(c, buf, col, d));
-        int rc = q4 ? hexkl_micro_hmx_mm_u8i4(c->vb, ao, wo)
-                    : hexkl_micro_hmx_mm_u8i8(c->vb, ao, wo);
-        if (rc != AEE_SUCCESS) {
-          return rc;
+      if (q4) {
+        for (uint32_t col = 0; col < c->L.n_col_tiles; ++col) {
+          hexkl_hmx_mm_u8i4(p_tile(c, d, i, col), v_tile(c, buf, col, d));
+        }
+      } else {
+        for (uint32_t col = 0; col < c->L.n_col_tiles; ++col) {
+          hexkl_hmx_mm_u8i8(p_tile(c, d, i, col), v_tile(c, buf, col, d));
         }
       }
       int rc = hexkl_micro_hmx_acc_read_int32(c->vb, c->cfg, c->L.acc);
@@ -713,6 +711,18 @@ int hexkl_attn_q_prefill(uint8_t *vtcm_base, uint32_t config_off,
   if (rc != AEE_SUCCESS) {
     return rc;
   }
+  // The HMX load instructions want every activation tile 2048-byte
+  // aligned and every weight tile 128; the plan places them at multiples
+  // of 2048 and of tile_bytes, so checking the four region starts here
+  // covers every tile and the inline multiplies need no check of their
+  // own (hexkl_hmx_mm.h).
+  if (!hexkl_hmx_mm_aligned(vtcm_base + c.L.q_ah, vtcm_base + c.L.kt_wh[0]) ||
+      !hexkl_hmx_mm_aligned(vtcm_base + c.L.p_ah, vtcm_base + c.L.v_wh[0]) ||
+      !hexkl_hmx_mm_aligned(vtcm_base + c.L.q_ah, vtcm_base + c.L.kt_wh[1]) ||
+      !hexkl_hmx_mm_aligned(vtcm_base + c.L.p_ah, vtcm_base + c.L.v_wh[1])) {
+    return AEE_EBADPARM;
+  }
+
   c.acc_layout = hexkl_acc_layout_get(vtcm_base, c.L.acc);
   if (!c.acc_layout->usable || (c.acc_layout->row_stride % 32u) != 0 ||
       (c.acc_layout->base % 32u) != 0) {
