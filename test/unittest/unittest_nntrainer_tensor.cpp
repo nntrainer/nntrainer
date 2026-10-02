@@ -1920,6 +1920,191 @@ TEST(nntrainer_Tensor, copy_16_n) {
   EXPECT_THROW(output.copyData(input), std::invalid_argument);
 }
 
+/**
+ * @brief Fill every byte of a tensor's memory (packed data, then the float
+ * scales and unsigned int zero points if any) with a known pattern
+ */
+static void fillUint4Memory(nntrainer::Tensor &t) {
+  uint8_t *bytes = t.getData<uint8_t>();
+  size_t data_bytes = t.getMemoryBytes() -
+                      t.scale_size() * (sizeof(float) + sizeof(unsigned int));
+  // position-dependent bytes, so a shifted or partial copy cannot match
+  for (size_t i = 0; i < data_bytes; ++i)
+    bytes[i] = static_cast<uint8_t>(i * 37 + 11);
+
+  if (t.scale_size() == 0)
+    return;
+
+  float *scales = t.getScale<float>();
+  unsigned int *zero_points = t.getZeroPoint();
+  for (size_t i = 0; i < t.scale_size(); ++i) {
+    scales[i] = 0.5f + i;
+    zero_points[i] = 3 + i;
+  }
+}
+
+/**
+ * @brief Expect two tensors to hold byte-identical memory
+ */
+static void expectSameMemory(const nntrainer::Tensor &expected,
+                             const nntrainer::Tensor &actual) {
+  ASSERT_EQ(expected.getMemoryBytes(), actual.getMemoryBytes());
+  const uint8_t *e = expected.getData<uint8_t>();
+  const uint8_t *a = actual.getData<uint8_t>();
+  for (size_t i = 0; i < expected.getMemoryBytes(); ++i)
+    ASSERT_EQ(e[i], a[i]) << "byte " << i << " of " << expected.getMemoryBytes()
+                          << " differs";
+}
+
+/**
+ * @brief clone() of a per-tensor UINT4 tensor with an odd element count keeps
+ * its packed data, scale and zero point
+ */
+TEST(nntrainer_Tensor, copy_17_p) {
+  std::vector<std::vector<std::vector<std::vector<uint8_t>>>> in = {
+    {{{0, 1, 2, 3, 4}, {5, 6, 7, 8, 9}, {10, 11, 12, 13, 14}}}};
+  nntrainer::Tensor input(
+    in, {0.123f}, {9}, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT4},
+    nntrainer::QScheme::PER_TENSOR_AFFINE);
+
+  nntrainer::Tensor output = input.clone();
+
+  expectSameMemory(input, output);
+  EXPECT_FLOAT_EQ(*output.getScale<float>(), 0.123f);
+  EXPECT_EQ(*output.getZeroPoint(), 9u);
+}
+
+/**
+ * @brief copy(), construction from a buffer and copyData() of a per-channel
+ * UINT4 tensor keep every byte of data, scales and zero points
+ */
+TEST(nntrainer_Tensor, copy_18_p) {
+  nntrainer::TensorDim dim(1, 1, 3, 5, nntrainer::Tformat::NCHW,
+                           nntrainer::Tdatatype::UINT4);
+  nntrainer::Tensor input(dim, true, nntrainer::Initializer::NONE, "input",
+                          nntrainer::QScheme::PER_CHANNEL_AFFINE);
+  fillUint4Memory(input);
+
+  nntrainer::Tensor copied(dim, true, nntrainer::Initializer::NONE, "copied",
+                           nntrainer::QScheme::PER_CHANNEL_AFFINE);
+  copied.copy(input);
+  expectSameMemory(input, copied);
+
+  nntrainer::Tensor from_buf(dim, input.getData<uint8_t>(),
+                             nntrainer::QScheme::PER_CHANNEL_AFFINE);
+  expectSameMemory(input, from_buf);
+
+  nntrainer::Tensor copied_data(dim, true, nntrainer::Initializer::NONE,
+                                "copied_data",
+                                nntrainer::QScheme::PER_CHANNEL_AFFINE);
+  copied_data.copyData(input);
+  expectSameMemory(input, copied_data);
+
+  for (unsigned int i = 0; i < input.scale_size(); ++i)
+    EXPECT_EQ(copied.getZeroPoint()[i], 3 + i);
+}
+
+/**
+ * @brief copy(), clone(), construction from a buffer and copyData() of a Q4_K
+ * tensor copy all of its blocks
+ */
+TEST(nntrainer_Tensor, copy_19_p) {
+  nntrainer::TensorDim q4k_dim(1, 1, 8, 256, nntrainer::Tformat::NCHW,
+                               nntrainer::Tdatatype::Q4_K);
+  nntrainer::Tensor input(q4k_dim, true, nntrainer::Initializer::NONE, "input",
+                          nntrainer::QScheme::Q4_Kx8);
+  ASSERT_EQ(input.getMemoryBytes(), 1152u);
+  fillUint4Memory(input);
+
+  nntrainer::Tensor copied(q4k_dim, true, nntrainer::Initializer::NONE,
+                           "copied", nntrainer::QScheme::Q4_Kx8);
+  copied.copy(input);
+  expectSameMemory(input, copied);
+
+  nntrainer::Tensor cloned = input.clone();
+  expectSameMemory(input, cloned);
+
+  nntrainer::Tensor from_buf(q4k_dim, input.getData<uint8_t>(),
+                             nntrainer::QScheme::Q4_Kx8);
+  expectSameMemory(input, from_buf);
+
+  nntrainer::TensorDim uint4_dim(1, 1, 8, 256, nntrainer::Tformat::NCHW,
+                                 nntrainer::Tdatatype::UINT4);
+  nntrainer::Tensor uint4_input(uint4_dim, true, nntrainer::Initializer::NONE,
+                                "uint4_input", nntrainer::QScheme::Q4_Kx8);
+  fillUint4Memory(uint4_input);
+
+  nntrainer::Tensor copied_data(uint4_dim, true, nntrainer::Initializer::NONE,
+                                "copied_data", nntrainer::QScheme::Q4_Kx8);
+  copied_data.copyData(uint4_input);
+  expectSameMemory(uint4_input, copied_data);
+
+  nntrainer::Tensor uint4_from_buf(uint4_dim, uint4_input.getData<uint8_t>(),
+                                   nntrainer::QScheme::Q4_Kx8);
+  expectSameMemory(uint4_input, uint4_from_buf);
+}
+
+/**
+ * @brief copyData() of a UINT4 tensor from one with a different element count
+ * throws and leaves the destination untouched
+ */
+TEST(nntrainer_Tensor, copy_17_n) {
+  nntrainer::Tensor input(
+    {1, 1, 3, 5, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT4}, true,
+    nntrainer::Initializer::NONE, "input",
+    nntrainer::QScheme::PER_CHANNEL_AFFINE);
+  fillUint4Memory(input);
+
+  nntrainer::Tensor output(
+    {1, 1, 3, 4, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT4}, true,
+    nntrainer::Initializer::NONE, "output",
+    nntrainer::QScheme::PER_CHANNEL_AFFINE);
+  nntrainer::Tensor untouched(
+    {1, 1, 3, 4, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT4}, true,
+    nntrainer::Initializer::NONE, "untouched",
+    nntrainer::QScheme::PER_CHANNEL_AFFINE);
+
+  EXPECT_THROW(output.copyData(input), std::invalid_argument);
+  expectSameMemory(untouched, output);
+}
+
+/**
+ * @brief copyData() of a UINT4 tensor from an FP32 tensor throws
+ */
+TEST(nntrainer_Tensor, copy_18_n) {
+  nntrainer::Tensor input(
+    1, 1, 3, 5, {nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32});
+  input.setValue(1.0f);
+
+  nntrainer::Tensor output(
+    {1, 1, 3, 5, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT4}, true,
+    nntrainer::Initializer::NONE, "output",
+    nntrainer::QScheme::PER_TENSOR_AFFINE);
+
+  EXPECT_THROW(output.copyData(input), std::invalid_argument);
+}
+
+/**
+ * @brief copyData() of a Q4_K tensor from one with more blocks throws and
+ * leaves the destination untouched
+ */
+TEST(nntrainer_Tensor, copy_19_n) {
+  nntrainer::Tensor input(
+    {1, 1, 16, 256, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT4},
+    true, nntrainer::Initializer::NONE, "input", nntrainer::QScheme::Q4_Kx8);
+  fillUint4Memory(input);
+
+  nntrainer::Tensor output(
+    {1, 1, 8, 256, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT4}, true,
+    nntrainer::Initializer::NONE, "output", nntrainer::QScheme::Q4_Kx8);
+  nntrainer::Tensor untouched(
+    {1, 1, 8, 256, nntrainer::Tformat::NCHW, nntrainer::Tdatatype::UINT4}, true,
+    nntrainer::Initializer::NONE, "untouched", nntrainer::QScheme::Q4_Kx8);
+
+  EXPECT_THROW(output.copyData(input), std::invalid_argument);
+  expectSameMemory(untouched, output);
+}
+
 TEST(nntrainer_Tensor, multiply_i_01_p) {
   int status = ML_ERROR_NONE;
   int batch = 3;

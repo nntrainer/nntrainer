@@ -41,7 +41,7 @@ Q4_K_Tensor::Q4_K_Tensor(const TensorDim &d, const void *buf,
   Q4_K_Tensor(d, true, Initializer::NONE, "", qscheme_) {
   if (d.getDataLen() != 0) {
     if (buf != nullptr)
-      copy_q4k(buf);
+      copy(buf);
   }
 }
 
@@ -82,7 +82,7 @@ size_t Q4_K_Tensor::getMemoryBytes() const { return size() * sizeof(uint8_t); }
 
 size_t Q4_K_Tensor::scale_size() const { return 0; }
 
-void Q4_K_Tensor::copy_q4k(const void *buf) {
+void Q4_K_Tensor::copy(const void *buf) {
   NNTR_THROW_IF(!contiguous, std::invalid_argument)
     << getName() << " is not contiguous, cannot copy.";
 
