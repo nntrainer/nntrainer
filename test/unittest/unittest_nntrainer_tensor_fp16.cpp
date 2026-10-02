@@ -4099,6 +4099,86 @@ TEST(nntrainer_Tensor, dot_transpose_p) {
   }
 }
 
+/**
+ * @brief Check A(M x K) . B(N x K)^T in FP16 against an exact reference
+ * @note Small integer inputs keep every partial sum exact in FP16, so a column
+ * that the GEMM skips, computes twice or overruns shows up as a mismatch.
+ */
+static void expect_dot_transB_exact(unsigned int M, unsigned int N,
+                                    unsigned int K) {
+  nntrainer::TensorDim::TensorType t_type = {nntrainer::Tformat::NCHW,
+                                             nntrainer::Tdatatype::FP16};
+  nntrainer::Tensor a(1, 1, M, K, t_type);
+  nntrainer::Tensor b(1, 1, N, K, t_type);
+  for (unsigned int m = 0; m < M; ++m)
+    for (unsigned int k = 0; k < K; ++k)
+      a.setValue(0, 0, m, k, static_cast<int>((m * K + k) % 5) - 2);
+  for (unsigned int n = 0; n < N; ++n)
+    for (unsigned int k = 0; k < K; ++k)
+      b.setValue(0, 0, n, k, static_cast<int>((n * 3 + k) % 5) - 2);
+
+  nntrainer::Tensor c = a.dot(b, false, true);
+  ASSERT_EQ(c.height(), M);
+  ASSERT_EQ(c.width(), N);
+
+  unsigned int mismatches = 0;
+  std::string first_mismatch;
+  for (unsigned int m = 0; m < M; ++m) {
+    for (unsigned int n = 0; n < N; ++n) {
+      float expected = 0.0f;
+      for (unsigned int k = 0; k < K; ++k)
+        expected += static_cast<float>(a.getValue<_FP16>(0, 0, m, k)) *
+                    static_cast<float>(b.getValue<_FP16>(0, 0, n, k));
+      float actual = static_cast<float>(c.getValue<_FP16>(0, 0, m, n));
+      if (actual != expected && mismatches++ == 0)
+        first_mismatch = "(" + std::to_string(m) + ", " + std::to_string(n) +
+                         "): " + std::to_string(actual) +
+                         " != " + std::to_string(expected);
+    }
+  }
+  EXPECT_EQ(mismatches, 0u) << "M=" << M << " N=" << N << " K=" << K
+                            << ", first mismatch at " << first_mismatch;
+}
+
+/**
+ * @brief transB GEMM whose N remainder (784) splits into blocks of 16 columns
+ */
+TEST(nntrainer_Tensor, dot_transB_N_remainder_1552_p) {
+  expect_dot_transB_exact(8, 1552, 16);
+}
+
+/**
+ * @brief transB GEMM with an unaligned N that is padded to 1552 internally
+ */
+TEST(nntrainer_Tensor, dot_transB_N_remainder_padded_1540_p) {
+  expect_dot_transB_exact(8, 1540, 16);
+}
+
+/**
+ * @brief transB GEMM with two full N blocks before the 784 remainder
+ */
+TEST(nntrainer_Tensor, dot_transB_N_remainder_2320_p) {
+  expect_dot_transB_exact(8, 2320, 16);
+}
+
+/**
+ * @brief transB GEMM whose N remainder (800) already halves to 16 columns
+ */
+TEST(nntrainer_Tensor, dot_transB_N_remainder_1568_p) {
+  expect_dot_transB_exact(8, 1568, 16);
+}
+
+/**
+ * @brief transB dot with a mismatched K is rejected before GEMM
+ */
+TEST(nntrainer_Tensor, dot_transB_mismatched_K_n) {
+  nntrainer::TensorDim::TensorType t_type = {nntrainer::Tformat::NCHW,
+                                             nntrainer::Tdatatype::FP16};
+  nntrainer::Tensor a(1, 1, 8, 16, t_type);
+  nntrainer::Tensor b(1, 1, 1552, 8, t_type);
+  EXPECT_THROW(a.dot(b, false, true), std::runtime_error);
+}
+
 TEST(nntrainer_Tensor, dot_shortcuts_p) {
   nntrainer::TensorDim::TensorType t_type;
   t_type.format = nntrainer::Tformat::NCHW;

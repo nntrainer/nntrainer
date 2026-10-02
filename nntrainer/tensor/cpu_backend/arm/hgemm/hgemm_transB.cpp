@@ -79,7 +79,8 @@ void hgemm_transB_8x16(unsigned int M, unsigned int N, unsigned int K,
         if (n_min >= N_BLOCKING * 2) {
           n_min = N_BLOCKING;
         } else if (n_min > N_BLOCKING) {
-          n_min = (n_min / 2 + GEMM_UNROLLING_8 - 1) & ~(GEMM_UNROLLING_8 - 1);
+          n_min =
+            (n_min / 2 + GEMM_UNROLLING_16 - 1) & ~(GEMM_UNROLLING_16 - 1);
         }
         packing_transB16(k_min, n_min, B + ks + ldb * ns, ldb, sB);
         hgemm_kernel_8x16(m_min, n_min, k_min, sA, sB, C + ms * ldc + ns, ldc);
