@@ -105,8 +105,10 @@ typedef struct {
   float *a_f32;        /**< [g_br] this block's rescale, f32 */
   uint16_t *m_hf;      /**< [g_br] running max, fp16 bits */
   uint16_t *a_hf;      /**< [g_br] this block's rescale, fp16 bits */
-  HVX_Vector *p_scale; /**< [dt][g_br] uint8 P' scale per V group, each a
-                            splat vector so the O update loads it as is */
+  HVX_Vector *p_scale; /**< [g_br] uint8 P' scale, each a splat vector so
+                            the O update loads it as is. One per row, not
+                            per V group: the registry's V scale covers the
+                            whole row, so P' is the same for every group */
   HVX_Vector col_idx;
   HVX_Vector cap_hf, inv_cap_hf;
   int softcap_on;
@@ -142,10 +144,9 @@ static inline HVX_Vector *s_tile(const attn_ctx *c, uint32_t sbuf, uint32_t i32,
   return (HVX_Vector *)(c->vb + c->L.s_hf[sbuf] +
                         (i32 * c->L.n_col_tiles + col) * TB);
 }
-static inline uint8_t *p_tile(const attn_ctx *c, uint32_t d, uint32_t i,
-                              uint32_t col) {
-  return c->vb + c->L.p_ah +
-         ((d * c->L.n_row_tiles + i) * c->L.n_col_tiles + col) * TB;
+/** @brief P' tile (row tile i, column tile col); shared by every group. */
+static inline uint8_t *p_tile(const attn_ctx *c, uint32_t i, uint32_t col) {
+  return c->vb + c->L.p_ah + (i * c->L.n_col_tiles + col) * TB;
 }
 /** @brief Row 0 of the accumulator tile; rows are row_stride int32 apart. */
 static inline const HVX_Vector *acc_rows(const attn_ctx *c) {
@@ -417,21 +418,25 @@ static void softmax_start(attn_ctx *c, uint32_t n, uint32_t qb, uint32_t kb,
  * Four rows (two fp16 vectors) at a time: their 4 x 32 bytes are one
  * vector store, the same packing hvx_quant_pack_u8_ah uses. The block's
  * V scales are one vector per column tile, staged by dma_land.
+ *
+ * One pass for the whole block: the registry gives V one scale per row,
+ * covering every 32-dim group, so the quantized P' feeds all of the P.V
+ * matmuls rather than needing a separate pass per group.
  */
-static void pquant_unit(attn_ctx *c, uint32_t i32, uint32_t d) {
+static void pquant_unit(attn_ctx *c, uint32_t i32) {
   const HVX_Vector one_hf = Q6_Vh_vsplat_R((int)HVX_ATTN_HF_ONE);
   const HVX_Vector zero = Q6_V_vzero();
   const uint32_t ct = c->L.n_col_tiles;
   const uint32_t i64 = i32 / 2u;
   const uint32_t rbase = 32u * (i32 & 1u);
-  // The block's V scales of group d, contiguous in the registry (DDR;
+  // The block's V scales, contiguous in the registry (DDR;
   // HEXKL_KV_Q_SV_PAD keeps a block past the last head in bounds).
   const float *sv =
-    c->kv->s_v + hexkl_kv_q_sv_index(c->kv, c->w_n, c->w_kb * c->t->bc, d);
+    c->kv->s_v + hexkl_kv_q_sv_index(c->kv, c->w_n, c->w_kb * c->t->bc);
   const HVX_Vector *restrict s0 = s_tile(c, c->w_sbuf, i32, 0);
-  uint8_t *restrict p0 = p_tile(c, d, i64, 0);
+  uint8_t *restrict p0 = p_tile(c, i64, 0);
   HVX_Vector *restrict ps =
-    c->p_scale + (size_t)d * c->t->g_br + HEXKL_ATTN_Q_ROWS * i64 + rbase;
+    c->p_scale + HEXKL_ATTN_Q_ROWS * i64 + rbase;
   const HVX_Vector inv255 = hvx_splat_sf(1.0f / 255.0f);
   const HVX_Vector one_sf = hvx_splat_sf(1.0f);
 
@@ -491,11 +496,11 @@ static void pquant_unit(attn_ctx *c, uint32_t i32, uint32_t d) {
 
 static void pquant_worker(uint32_t n_threads, uint32_t i, void *ctx_) {
   attn_ctx *c = (attn_ctx *)ctx_;
-  const uint32_t n = 2u * c->L.n_row_tiles * c->L.n_dot_tiles;
+  const uint32_t n = 2u * c->L.n_row_tiles;
   uint32_t lo, hi;
   unit_range(n, n_threads, i, &lo, &hi);
   for (uint32_t u = lo; u < hi; ++u) {
-    pquant_unit(c, u / c->L.n_dot_tiles, u % c->L.n_dot_tiles);
+    pquant_unit(c, u);
   }
 }
 
@@ -509,8 +514,7 @@ static void softmax_finish_pquant(attn_ctx *c, uint32_t buf) {
     c->a_f32[r] = hvx_attn_hf_to_f32(c->a_hf[r]);
   }
   c->w_buf = buf;
-  hvx_worker_pool_run(c->pool, pquant_worker, c,
-                      2u * c->L.n_row_tiles * c->L.n_dot_tiles);
+  hvx_worker_pool_run(c->pool, pquant_worker, c, 2u * c->L.n_row_tiles);
   c->st->us_pquant += now_us() - t1;
 }
 
@@ -523,7 +527,7 @@ static void o_update(attn_ctx *c, uint32_t i, uint32_t d, int first) {
   const uint32_t rs = c->acc_layout->row_stride / 32u;
   const uint32_t hd = c->s->head_dim;
   const uint32_t R0 = HEXKL_ATTN_Q_ROWS * i;
-  const HVX_Vector *restrict ps = c->p_scale + (size_t)d * c->t->g_br + R0;
+  const HVX_Vector *restrict ps = c->p_scale + R0;
   const float *restrict af = c->a_f32 + R0;
   HVX_Vector *restrict o =
     (HVX_Vector *)((float *)(c->vb + c->L.o_f32) + (size_t)R0 * hd + 32u * d);
@@ -558,11 +562,11 @@ static int phase_pv(attn_ctx *c, uint32_t buf, int first) {
       hexkl_micro_hmx_acc_clear_int32();
       if (q4) {
         for (uint32_t col = 0; col < c->L.n_col_tiles; ++col) {
-          hexkl_hmx_mm_u8i4(p_tile(c, d, i, col), v_tile(c, buf, col, d));
+          hexkl_hmx_mm_u8i4(p_tile(c, i, col), v_tile(c, buf, col, d));
         }
       } else {
         for (uint32_t col = 0; col < c->L.n_col_tiles; ++col) {
-          hexkl_hmx_mm_u8i8(p_tile(c, d, i, col), v_tile(c, buf, col, d));
+          hexkl_hmx_mm_u8i8(p_tile(c, i, col), v_tile(c, buf, col, d));
         }
       }
       int rc = hexkl_micro_hmx_acc_read_int32(c->vb, c->cfg, c->L.acc);

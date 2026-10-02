@@ -110,15 +110,15 @@ TEST(HexklKvQ, QuantVRowIsPerGroup) {
     x[32 + i] = 4.0f * static_cast<float>(i - 16) / 16.0f; // group 1: amax 4
   }
   int8_t q[64];
-  float scales[2];
-  hexkl_kv_q_quant_v_row(x, 64, 7, q, scales);
-  EXPECT_FLOAT_EQ(scales[0], 0.16f / 7.0f);
-  EXPECT_FLOAT_EQ(scales[1], 4.0f / 7.0f);
-  // The small group still uses the full range: its amax maps to -7.
-  EXPECT_EQ(q[0], -7);
+  float scale = 0.0f;
+  hexkl_kv_q_quant_v_row(x, 64, 7, q, &scale);
+  // One scale for the row: the larger group sets it, and the smaller one
+  // is quantized against the same step rather than its own.
+  EXPECT_FLOAT_EQ(scale, 4.0f / 7.0f);
   EXPECT_EQ(q[32], -7);
+  EXPECT_EQ(q[0], 0);
   for (int i = 0; i < 64; ++i) {
-    EXPECT_NEAR(static_cast<float>(q[i]), x[i] / scales[i / 32], 0.5f + 1e-5f);
+    EXPECT_NEAR(static_cast<float>(q[i]), x[i] / scale, 0.5f + 1e-5f);
   }
 }
 
@@ -135,7 +135,7 @@ TEST(HexklKvQ, RegisterRoundsUpAndReleases) {
   EXPECT_EQ(kv->tile_bytes, 512u);
   // Untouched rows: scale 1, zero values.
   EXPECT_FLOAT_EQ(kv->s_k[hexkl_kv_q_sk_index(kv, 1, 127)], 1.0f);
-  EXPECT_FLOAT_EQ(kv->s_v[hexkl_kv_q_sv_index(kv, 1, 127, 1)], 1.0f);
+  EXPECT_FLOAT_EQ(kv->s_v[hexkl_kv_q_sv_index(kv, 1, 127)], 1.0f);
   EXPECT_EQ(kv->kt4[hexkl_kv_q_kt4_index(kv, 1, 127, 63)], HEXKL_KV_Q_BIAS);
   EXPECT_EQ(hexkl_kv_q_release(&tbl, h), 0);
   EXPECT_EQ(hexkl_kv_q_get(&tbl, h), nullptr);
@@ -199,7 +199,7 @@ TEST(HexklKvQ, AppendDumpRoundTripAndRewrite) {
 
     std::vector<int8_t> kq(static_cast<size_t>(rows) * width), vq(kq.size());
     std::vector<float> sk(static_cast<size_t>(rows) * n_kv),
-      sv(static_cast<size_t>(rows) * n_kv * (hd / 32));
+      sv(static_cast<size_t>(rows) * n_kv);
     std::vector<int32_t> cs(sk.size());
     ASSERT_EQ(hexkl_kv_q_dump(kv, 0, rows, kq.data(), vq.data(), sk.data(),
                               cs.data(), sv.data()),
@@ -210,7 +210,7 @@ TEST(HexklKvQ, AppendDumpRoundTripAndRewrite) {
       for (uint32_t n = 0; n < n_kv; ++n) {
         float x[64];
         int8_t q[64];
-        float scale, scales[2];
+        float scale, v_scale;
         int32_t colsum;
         for (uint32_t d = 0; d < hd; ++d) {
           x[d] = hexkl_kv_q_hf_to_f32(
@@ -226,12 +226,11 @@ TEST(HexklKvQ, AppendDumpRoundTripAndRewrite) {
           x[d] = hexkl_kv_q_hf_to_f32(
             v[static_cast<size_t>(r) * width + n * hd + d]);
         }
-        hexkl_kv_q_quant_v_row(x, hd, kv->qmax, q, scales);
+        hexkl_kv_q_quant_v_row(x, hd, kv->qmax, q, &v_scale);
         EXPECT_EQ(
           std::memcmp(q, &vq[static_cast<size_t>(r) * width + n * hd], hd), 0)
           << "V row " << r << " head " << n;
-        EXPECT_FLOAT_EQ(sv[(r * n_kv + n) * 2 + 0], scales[0]);
-        EXPECT_FLOAT_EQ(sv[(r * n_kv + n) * 2 + 1], scales[1]);
+        EXPECT_FLOAT_EQ(sv[r * n_kv + n], v_scale);
       }
     }
 

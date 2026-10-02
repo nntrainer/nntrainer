@@ -65,35 +65,31 @@ void hexkl_kv_q_quant_k_row(const float *x, uint32_t hd, int32_t qmax,
 }
 
 void hexkl_kv_q_quant_v_row(const float *x, uint32_t hd, int32_t qmax,
-                            int8_t *q, float *scales) {
+                            int8_t *q, float *scale) {
   const float fq = (float)qmax;
-  for (uint32_t g = 0; g < hd / 32u; ++g) {
-    const float *xg = x + 32u * g;
-    int8_t *qg = q + 32u * g;
-    float amax = 0.0f;
-    for (uint32_t d = 0; d < 32u; ++d) {
-      const float a = fabsf(xg[d]);
-      if (a > amax) {
-        amax = a;
-      }
+  float amax = 0.0f;
+  for (uint32_t d = 0; d < hd; ++d) {
+    const float a = fabsf(x[d]);
+    if (a > amax) {
+      amax = a;
     }
-    if (amax == 0.0f) {
-      memset(qg, 0, 32u);
-      scales[g] = 1.0f;
-      continue;
-    }
-    const float inv = fq / amax;
-    for (uint32_t d = 0; d < 32u; ++d) {
-      float r = rintf(xg[d] * inv);
-      if (r > fq) {
-        r = fq;
-      } else if (r < -fq) {
-        r = -fq;
-      }
-      qg[d] = (int8_t)r;
-    }
-    scales[g] = amax / fq;
   }
+  if (amax == 0.0f) {
+    memset(q, 0, hd);
+    *scale = 1.0f;
+    return;
+  }
+  const float inv = fq / amax;
+  for (uint32_t d = 0; d < hd; ++d) {
+    float r = rintf(x[d] * inv);
+    if (r > fq) {
+      r = fq;
+    } else if (r < -fq) {
+      r = -fq;
+    }
+    q[d] = (int8_t)r;
+  }
+  *scale = amax / fq;
 }
 
 static void free_slot(hexkl_kv_q *kv) {
@@ -149,8 +145,7 @@ int hexkl_kv_q_register(hexkl_kv_q_table *tbl, hexkl_kv_q_kind kind,
   kv->v4 = (uint8_t *)malloc(values);
   kv->s_k = (float *)calloc(rows, sizeof(float));
   kv->colsum_k = (int32_t *)calloc(rows, sizeof(int32_t));
-  kv->s_v =
-    (float *)calloc(rows * kv->n_dot_tiles + HEXKL_KV_Q_SV_PAD, sizeof(float));
+  kv->s_v = (float *)calloc(rows + HEXKL_KV_Q_SV_PAD, sizeof(float));
   kv->kt = (uint8_t *)calloc(n_tiles, kv->tile_bytes);
   kv->v = (uint8_t *)calloc(n_tiles, kv->tile_bytes);
   kv->stage_kt = (int8_t *)calloc((size_t)head_dim * 32u, 1u);
@@ -165,7 +160,7 @@ int hexkl_kv_q_register(hexkl_kv_q_table *tbl, hexkl_kv_q_kind kind,
   for (size_t i = 0; i < rows; ++i) {
     kv->s_k[i] = 1.0f;
   }
-  for (size_t i = 0; i < rows * kv->n_dot_tiles + HEXKL_KV_Q_SV_PAD; ++i) {
+  for (size_t i = 0; i < rows + HEXKL_KV_Q_SV_PAD; ++i) {
     kv->s_v[i] = 1.0f;
   }
   kv->in_use = 1;
@@ -377,9 +372,7 @@ int hexkl_kv_q_append(hexkl_kv_q_table *tbl, uint32_t handle, uint32_t row0,
       }
       hexkl_kv_q_quant_v_row(x, hd, kv->qmax, q, sv);
 #endif
-      for (uint32_t g = 0; g < kv->n_dot_tiles; ++g) {
-        kv->s_v[hexkl_kv_q_sv_index(kv, n, row, g)] = sv[g];
-      }
+      kv->s_v[hexkl_kv_q_sv_index(kv, n, row)] = sv[0];
       for (uint32_t d = 0; d < hd; ++d) {
         kv->v4[hexkl_kv_q_v4_index(kv, n, row, d)] =
           (uint8_t)(q[d] + HEXKL_KV_Q_BIAS);
@@ -446,10 +439,8 @@ int hexkl_kv_q_dump(const hexkl_kv_q *kv, uint32_t row0, uint32_t n_rows,
           kv->colsum_k[hexkl_kv_q_sk_index(kv, n, row)];
       }
       if (s_v) {
-        for (uint32_t g = 0; g < kv->n_dot_tiles; ++g) {
-          s_v[((size_t)r * kv->n_head_kv + n) * kv->n_dot_tiles + g] =
-            kv->s_v[hexkl_kv_q_sv_index(kv, n, row, g)];
-        }
+        s_v[(size_t)r * kv->n_head_kv + n] =
+          kv->s_v[hexkl_kv_q_sv_index(kv, n, row)];
       }
     }
   }

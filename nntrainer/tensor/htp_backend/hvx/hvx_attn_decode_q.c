@@ -15,7 +15,7 @@
  *   S[r]   = (acc[r] - 128*sum(Qu) - zp*colsum_k[r])
  *            * s_q * log2e/sqrt(hd) * s_k[r]
  *   P      = online softmax of S in f32 (lane mask; m, l, a as vectors)
- *   P'_g   = uint8 of P * s_v[r][g], scale = block row max / 255
+ *   P'     = uint8 of P * s_v[r], scale = block row max / 255
  *   acc_g  = sum_j vrmpy(V4[j][32g..] + 128, P'_g[4j..4j+3])
  *   O_g    = a*O_g + scale_g * (acc_g - 128*sum(P'_g))
  *   out    = O / l
@@ -180,23 +180,26 @@ static void decode_unit(const dec_ctx *c, uint32_t q, uint32_t h) {
     l = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(l, a), hvx_attn_sum32_sf(p));
     m = m_new;
 
-    // P' per V group: uint8 with the block's row max, packed to 32 bytes.
-    uint8_t pbytes[MAX_DT][128];
-    HVX_Vector pscale[MAX_DT], pcorr[MAX_DT];
-    for (uint32_t g = 0; g < dt; ++g) {
-      const HVX_Vector svg =
-        hvx_tile_load_u(kv->s_v + hexkl_kv_q_sv_index(kv, n, k0, g));
-      const HVX_Vector pp = Q6_Vsf_vmpy_VsfVsf(p, svg);
+    // P': uint8 with the block's row max, packed to 32 bytes. The row's
+    // V scale covers every group, so this is one quantization for the
+    // whole block rather than one per group.
+    uint8_t pbytes[128];
+    HVX_Vector pscale, pcorr;
+    {
+      const HVX_Vector svr =
+        hvx_tile_load_u(kv->s_v + hexkl_kv_q_sv_index(kv, n, k0));
+      const HVX_Vector pp = Q6_Vsf_vmpy_VsfVsf(p, svr);
       const HVX_Vector pm = hvx_attn_max32_sf(pp);
       const HVX_VectorPred pos = Q6_Q_vcmp_gt_VwVw(pm, zero);
-      pscale[g] = Q6_V_vmux_QVV(pos, Q6_Vsf_vmpy_VsfVsf(pm, inv255), one_sf);
+      pscale = Q6_V_vmux_QVV(pos, Q6_Vsf_vmpy_VsfVsf(pm, inv255), one_sf);
       const HVX_Vector pq = hvx_sf_to_w_rne(
-        Q6_Vsf_vmpy_VsfVsf(pp, hvx_attn_recip_pos_f32(pscale[g])));
-      pcorr[g] = Q6_Vw_vasl_VwR(hvx_attn_sum32_w(pq), 7); /* 128 * sum */
+        Q6_Vsf_vmpy_VsfVsf(pp, hvx_attn_recip_pos_f32(pscale)));
+      pcorr = Q6_Vw_vasl_VwR(hvx_attn_sum32_w(pq), 7); /* 128 * sum */
       const HVX_Vector ph = Q6_Vh_vpack_VwVw_sat(pq, pq);
-      hvx_tile_store_u(pbytes[g], Q6_Vub_vpack_VhVh_sat(ph, ph));
+      hvx_tile_store_u(pbytes, Q6_Vub_vpack_VhVh_sat(ph, ph));
     }
-    // P'.V: one vrmpy per (4 rows, 32 dims).
+    // P'.V: one vrmpy per (4 rows, 32 dims), the same scalar word for
+    // every group.
     HVX_Vector vacc[MAX_DT];
     for (uint32_t g = 0; g < dt; ++g) {
       vacc[g] = zero;
@@ -204,16 +207,16 @@ static void decode_unit(const dec_ctx *c, uint32_t q, uint32_t h) {
     const uint8_t *vp = vbase + (size_t)k0 * hd; /* quad k0/4: (k0/4)*hd*4 */
     for (uint32_t j = 0; j < BLOCK / 4u; ++j) {
       const uint8_t *vrow = vp + (size_t)j * hd * 4u;
+      uint32_t pw;
+      memcpy(&pw, pbytes + 4u * j, sizeof(pw));
       for (uint32_t g = 0; g < dt; ++g) {
-        uint32_t pw;
-        memcpy(&pw, pbytes[g] + 4u * j, sizeof(pw));
         vacc[g] = Q6_Vuw_vrmpyacc_VuwVubRub(
           vacc[g], hvx_tile_load_u(vrow + 128u * g), pw);
       }
     }
     for (uint32_t g = 0; g < dt; ++g) {
       const HVX_Vector t = Q6_Vsf_vmpy_VsfVsf(
-        Q6_Vsf_equals_Vw(Q6_Vw_vsub_VwVw(vacc[g], pcorr[g])), pscale[g]);
+        Q6_Vsf_equals_Vw(Q6_Vw_vsub_VwVw(vacc[g], pcorr)), pscale);
       o[g] = Q6_Vsf_vadd_VsfVsf(Q6_Vsf_vmpy_VsfVsf(o[g], a), t);
     }
   }

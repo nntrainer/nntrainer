@@ -91,7 +91,7 @@ inline void model_attention_q(const QModelKnobs &kn, const AttnShape &s,
   }
   std::vector<int8_t> kq(k.size()), vq(v.size());
   std::vector<float> sk(static_cast<size_t>(s.cache_to) * s.n_head_kv, 1.0f),
-    sv(static_cast<size_t>(s.cache_to) * s.n_head_kv * dt, 1.0f);
+    sv(static_cast<size_t>(s.cache_to) * s.n_head_kv, 1.0f);
   std::vector<int32_t> cs(sk.size(), 0);
   for (uint32_t r = 0; r < s.cache_to; ++r) {
     for (uint32_t n = 0; n < s.n_head_kv; ++n) {
@@ -103,7 +103,7 @@ inline void model_attention_q(const QModelKnobs &kn, const AttnShape &s,
       }
       if (kn.v_qmax) {
         hexkl_kv_q_quant_v_row(&vf[base], hd, kn.v_qmax, &vq[base],
-                               &sv[(r * s.n_head_kv + n) * dt]);
+                               &sv[r * s.n_head_kv + n]);
       }
     }
   }
@@ -168,17 +168,19 @@ inline void model_attention_q(const QModelKnobs &kn, const AttnShape &s,
         den += p[i];
       }
       float *orow = &out[static_cast<size_t>(qi) * qs + h * hd];
-      for (uint32_t g = 0; g < dt; ++g) {
-        for (uint32_t b0 = lo - lo % bc; b0 < hi; b0 += bc) {
-          const uint32_t blo = std::max(b0, lo), bhi = std::min(b0 + bc, hi);
-          float pm = 0.0f;
-          for (uint32_t kk = blo; kk < bhi; ++kk) {
-            pm = std::max(pm, p[kk - lo] * sv[(kk * s.n_head_kv + n) * dt + g]);
-          }
-          const float ps = pm > 0.0f ? pm / 255.0f : 1.0f;
+      // One P quantization per block: V's scale is per row, not per
+      // group, so the same P' serves every group.
+      for (uint32_t b0 = lo - lo % bc; b0 < hi; b0 += bc) {
+        const uint32_t blo = std::max(b0, lo), bhi = std::min(b0 + bc, hi);
+        float pm = 0.0f;
+        for (uint32_t kk = blo; kk < bhi; ++kk) {
+          pm = std::max(pm, p[kk - lo] * sv[kk * s.n_head_kv + n]);
+        }
+        const float ps = pm > 0.0f ? pm / 255.0f : 1.0f;
+        for (uint32_t g = 0; g < dt; ++g) {
           double acc[32] = {0.0};
           for (uint32_t kk = blo; kk < bhi; ++kk) {
-            const float pp = p[kk - lo] * sv[(kk * s.n_head_kv + n) * dt + g];
+            const float pp = p[kk - lo] * sv[kk * s.n_head_kv + n];
             const float pq =
               kn.p_u8
                 ? ps * std::min(255.0f, std::max(0.0f, std::nearbyint(pp / ps)))

@@ -74,12 +74,16 @@ typedef struct {
   uint8_t *v4;          /**< [n_head_kv][max_rows/4][head_dim][4], q+128 */
   float *s_k;           /**< [n_head_kv][max_rows] */
   int32_t *colsum_k;    /**< [n_head_kv][max_rows] */
-  float *s_v;           /**< [n_head_kv][head_dim/32][max_rows + pad]: a
-                             block's scales of one group are contiguous,
-                             so the attention kernel reads them from DDR
-                             as vectors; HEXKL_KV_Q_SV_PAD rows of 1.0 past
+  float *s_v;           /**< [n_head_kv][max_rows + pad]: one scale per
+                             (row, head), covering every 32-dim group of
+                             that row. A block's scales are contiguous, so
+                             the attention kernel reads them from DDR as
+                             vectors; HEXKL_KV_Q_SV_PAD rows of 1.0 past
                              the end keep a block that overruns the last
-                             head in bounds */
+                             head in bounds. Being independent of the
+                             group is what lets the kernel fold the scale
+                             into P and quantize P once rather than once
+                             per group */
   uint8_t *kt;          /**< K^T WH tiles, [n_head_kv][n_col][n_dot] */
   uint8_t *v;           /**< V WH tiles, same order */
   int8_t *stage_kt;     /**< [head_dim][32] row-major bake source */
@@ -153,11 +157,10 @@ static inline size_t hexkl_kv_q_sk_index(const hexkl_kv_q *kv, uint32_t n,
   return (size_t)n * kv->max_rows + row;
 }
 
-/** @brief Index into s_v for 32-dim group g: rows of one (head, group)
- *         are contiguous. */
+/** @brief Index into s_v: the rows of one head are contiguous. */
 static inline size_t hexkl_kv_q_sv_index(const hexkl_kv_q *kv, uint32_t n,
-                                         uint32_t row, uint32_t g) {
-  return ((size_t)n * kv->n_dot_tiles + g) * kv->max_rows + row;
+                                         uint32_t row) {
+  return (size_t)n * kv->max_rows + row;
 }
 
 /** @brief Byte offset of WH tile (n, column tile c, dot tile d) in kt or v. */
@@ -178,12 +181,20 @@ void hexkl_kv_q_quant_k_row(const float *x, uint32_t hd, int32_t qmax,
                             int8_t *q, float *scale, int32_t *colsum);
 
 /**
- * @brief Quantizes one V row of one head: symmetric per 32-dim group.
+ * @brief Quantizes one V row of one head: symmetric over all @a hd values.
  *
- * @param[out] scales  hd/32 entries
+ * One scale for the whole row rather than one per 32-dim group. Measured
+ * on Qwen3-0.6B, V magnitudes vary 1.7x (median) across the groups of a
+ * row but 5x to 99x across the rows of a 256-row block, so the row is
+ * where the adaptivity is worth keeping; dropping the group refinement
+ * costs 0.2-0.4 dB and makes the scale independent of the group, which is
+ * what lets the attention kernel quantize P once instead of once per
+ * group.
+ *
+ * @param[out] scale  one entry
  */
 void hexkl_kv_q_quant_v_row(const float *x, uint32_t hd, int32_t qmax,
-                            int8_t *q, float *scales);
+                            int8_t *q, float *scale);
 
 /**
  * @brief Allocates a zeroed cache for up to @a max_rows rows.

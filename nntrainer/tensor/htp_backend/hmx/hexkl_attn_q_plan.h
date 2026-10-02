@@ -65,11 +65,12 @@ typedef struct {
  *        (never VTCM: the scalar unit reads and writes it): q_scale f32 and
  *        q_zp i32 for every row of the chunk, then l f32, a f32, m_hf u16,
  *        a_hf u16 for the current q block, and one 128-byte splat vector
- *        of the P' scale per (V group, row).
+ *        of the P' scale per row.
  */
 static inline uint32_t hexkl_attn_q_meta_bytes(uint32_t g_br, uint32_t dt,
                                                uint32_t n_qb_chunk) {
-  return n_qb_chunk * g_br * 8u + g_br * (4u + 4u + 2u + 2u) + dt * g_br * 128u;
+  (void)dt;
+  return n_qb_chunk * g_br * 8u + g_br * (4u + 4u + 2u + 2u) + g_br * 128u;
 }
 
 /** @brief hexkl_attn_f16_tiling_init at the uint8 tile height. */
@@ -123,8 +124,9 @@ static inline int hexkl_attn_q_plan(const hexkl_attn_f16_shape *s,
     L->s_hf[i] = off;
     off += 2u * rt * ct * TB;
   }
+  // P' is shared by every V group, so one set of tiles rather than dt.
   L->p_ah = off;
-  off += dt * rt * ct * TB;
+  off += rt * ct * TB;
   L->o_f32 = off;
   off += hexkl_attn_round_up(t->g_br * s->head_dim * 4u, TB);
   L->qx_f32 = off;

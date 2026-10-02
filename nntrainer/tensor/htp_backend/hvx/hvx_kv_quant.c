@@ -118,22 +118,23 @@ void hvx_kv_quant_k_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
 }
 
 void hvx_kv_quant_v_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
-                        int8_t *q, float *scales) {
+                        int8_t *q, float *scale) {
   HVX_Vector v[MAX_VECS];
   const uint32_t n = hd / 32u;
   load_row_f32(x_hf, hd, v);
+  const float amax = absmax_of(v, n);
+  if (amax == 0.0f) {
+    memset(q, 0, hd);
+    *scale = 1.0f;
+    return;
+  }
   const float fq = (float)qmax;
+  const HVX_Vector inv = hvx_splat_sf(fq / amax);
   const HVX_Vector lo = Q6_V_vsplat_R(-qmax), hi = Q6_V_vsplat_R(qmax);
   HVX_Vector w[MAX_VECS];
   for (uint32_t g = 0; g < n; ++g) {
-    const float amax = absmax_of(&v[g], 1);
-    if (amax == 0.0f) {
-      w[g] = Q6_V_vzero();
-      scales[g] = 1.0f;
-      continue;
-    }
-    w[g] = quant_vec(v[g], hvx_splat_sf(fq / amax), lo, hi);
-    scales[g] = amax / fq;
+    w[g] = quant_vec(v[g], inv, lo, hi);
   }
   pack_bytes(w, hd, q);
+  *scale = amax / fq;
 }

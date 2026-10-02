@@ -117,7 +117,7 @@ int nntr_hvx_kv_dump_q(remote_handle64 handle, uint32 kv_handle, uint32 row0,
   const uint64_t heads = (uint64_t)n_rows * kv->n_head_kv;
   if ((uint64_t)k_qLen != values || (uint64_t)v_qLen != values ||
       (uint64_t)s_kLen != heads || (uint64_t)colsum_kLen != heads ||
-      (uint64_t)s_vLen != heads * kv->n_dot_tiles) {
+      (uint64_t)s_vLen != heads) {
     FARF(ERROR, "kv_dump_q: bad lengths");
     return AEE_EBADPARM;
   }

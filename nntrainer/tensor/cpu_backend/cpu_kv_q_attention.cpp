@@ -16,7 +16,7 @@
  *            * s_k[r]
  *   P      = exp2(S - max S) (two passes; the denominator is exact)
  *   per 32-row block b, per 32-dim group g:
- *   P'_g   = uint8 of P * s_v[r][g], scale = block max / 255
+ *   P'     = uint8 of P * s_v[r], scale = block max / 255
  *   O_g   += scale_g * (sum_r P'_g[r] * (V[r][32g..] + 128) - 128*sum(P'_g))
  *   out    = O / sum P
  *
@@ -300,29 +300,30 @@ void run_task(const Task &t, unsigned int q0, unsigned int q1, unsigned int h) {
       den += S[r];
     }
 
-    // P.V per block and group.
+    // P.V per block. The row's V scale covers every group, so P is
+    // quantized once for the block and feeds all of the groups.
+    const float *s_v = kv->s_v + (size_t)n * kv->max_rows;
     std::fill(o.begin(), o.end(), 0.0f);
     for (unsigned int b = lo / kBlock; b * kBlock < hi; ++b) {
       const unsigned int blo = std::max(b * kBlock, lo);
       const unsigned int bhi = std::min(b * kBlock + kBlock, hi);
-      for (unsigned int g = 0; g < dt; ++g) {
-        const float *s_v = kv->s_v + ((size_t)n * dt + g) * kv->max_rows;
-        float pm = 0.0f;
-        for (unsigned int r = blo; r < bhi; ++r) {
-          pm = std::max(pm, S[r] * s_v[r]);
-        }
-        const float ps = pm > 0.0f ? pm / 255.0f : 1.0f;
-        const float inv = 1.0f / ps;
-        std::memset(pu, 0, sizeof(pu));
-        int32_t sum_pu = 0;
-        for (unsigned int r = blo; r < bhi; ++r) {
-          const float v = std::nearbyint(S[r] * s_v[r] * inv);
-          const uint8_t u =
-            static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, v)));
-          pu[r - b * kBlock] = u;
-          sum_pu += u;
-        }
-        if (sum_pu) {
+      float pm = 0.0f;
+      for (unsigned int r = blo; r < bhi; ++r) {
+        pm = std::max(pm, S[r] * s_v[r]);
+      }
+      const float ps = pm > 0.0f ? pm / 255.0f : 1.0f;
+      const float inv = 1.0f / ps;
+      std::memset(pu, 0, sizeof(pu));
+      int32_t sum_pu = 0;
+      for (unsigned int r = blo; r < bhi; ++r) {
+        const float v = std::nearbyint(S[r] * s_v[r] * inv);
+        const uint8_t u =
+          static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, v)));
+        pu[r - b * kBlock] = u;
+        sum_pu += u;
+      }
+      if (sum_pu) {
+        for (unsigned int g = 0; g < dt; ++g) {
           pv_block(kv, n, b, g, pu, sum_pu, ps, o.data() + 32u * g);
         }
       }

@@ -32,11 +32,11 @@ void hvx_kv_quant_k_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
                         int8_t *q, float *scale, int32_t *colsum);
 
 /**
- * @brief V row of one head: symmetric per 32-dim group.
+ * @brief V row of one head: symmetric over all @a hd values, one scale.
  *
- * @param[out] scales  hd/32 entries
+ * @param[out] scale  one entry
  */
 void hvx_kv_quant_v_row(const uint16_t *x_hf, uint32_t hd, int32_t qmax,
-                        int8_t *q, float *scales);
+                        int8_t *q, float *scale);
 
 #endif /* __NNTRAINER_HVX_KV_QUANT_H__ */
