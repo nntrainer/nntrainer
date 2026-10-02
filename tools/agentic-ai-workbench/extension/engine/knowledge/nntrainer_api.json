@@ -1,0 +1,33 @@
+{
+  "headers": {
+    "neuralnet.h": "#ifndef __NEURALNET_H__\n#define __NEURALNET_H__\n\nnamespace nntrainer {\n\n/**\n * @brief Neural Network model class\n * Manages layers, weights, and forward/backward passes\n */\nclass NeuralNetwork {\npublic:\n  /**\n   * @brief Compile the model with loss and optimizer\n   * @param loss Loss function\n   * @param optimizer Optimizer\n   */\n  void compile(const std::string &loss, const std::string &optimizer);\n\n  /**\n   * @brief Add a layer to the model\n   * @param layer Layer to add\n   */\n  void addLayer(std::shared_ptr<Layer> layer);\n\n  /**\n   * @brief Forward pass through all layers\n   * @param input Input tensor\n   * @return Output tensor\n   */\n  Tensor forward(const Tensor &input);\n\n  /**\n   * @brief Backward pass for training\n   * @param loss_gradient Gradient from loss\n   */\n  void backward(const Tensor &loss_gradient);\n\n  /**\n   * @brief Load weights from file\n   * @param filepath Path to weights file\n   */\n  void loadWeights(const std::string &filepath);\n\n  /**\n   * @brief Save weights to file\n   * @param filepath Path to save weights\n   */\n  void saveWeights(const std::string &filepath) const;\n};\n\n} // namespace nntrainer\n#endif",
+    "layer.h": "#ifndef __LAYER_H__\n#define __LAYER_H__\n\nnamespace nntrainer {\n\n/**\n * @brief Base class for all layers\n */\nclass Layer {\npublic:\n  virtual ~Layer() = default;\n\n  /**\n   * @brief Initialize layer parameters\n   * @param input_shape Shape of input tensor\n   */\n  virtual void initialize(const std::vector<size_t> &input_shape) = 0;\n\n  /**\n   * @brief Forward pass\n   * @param input Input tensor\n   * @return Output tensor\n   */\n  virtual Tensor forward(const Tensor &input) = 0;\n\n  /**\n   * @brief Backward pass\n   * @param grad_output Gradient w.r.t. output\n   * @return Gradient w.r.t. input\n   */\n  virtual Tensor backward(const Tensor &grad_output) = 0;\n\n  /**\n   * @brief Get layer parameters\n   * @return Vector of weight/bias tensors\n   */\n  virtual std::vector<Tensor> getParameters() const = 0;\n};\n\n} // namespace nntrainer\n#endif",
+    "tensor.h": "#ifndef __TENSOR_H__\n#define __TENSOR_H__\n\nnamespace nntrainer {\n\n/**\n * @brief Multi-dimensional tensor class\n */\nclass Tensor {\npublic:\n  /**\n   * @brief Create a tensor with given shape\n   * @param shape Dimensions of the tensor\n   */\n  explicit Tensor(const std::vector<size_t> &shape);\n\n  /**\n   * @brief Get tensor shape\n   * @return Vector of dimensions\n   */\n  std::vector<size_t> shape() const;\n\n  /**\n   * @brief Get total number of elements\n   */\n  size_t size() const;\n\n  /**\n   * @brief Fill tensor with random values\n   */\n  void randomize();\n\n  /**\n   * @brief Fill tensor with zeros\n   */\n  void zero();\n};\n\n} // namespace nntrainer\n#endif"
+  },
+  "examples": [
+    {
+      "pattern": "forward_pass",
+      "code": "using namespace nntrainer;\nauto model = std::make_shared<NeuralNetwork>();\nmodel->addLayer(std::make_shared<FullyConnected>(128, \"relu\"));\nmodel->addLayer(std::make_shared<FullyConnected>(10, \"softmax\"));\nmodel->compile(\"categorical_crossentropy\", \"adam\");\n\nTensor input({batch_size, input_dim});\ninput.randomize();\nTensor output = model->forward(input);",
+      "note": "Always call compile() before forward(). Layers are added in order."
+    },
+    {
+      "pattern": "layer_creation",
+      "code": "auto dense = std::make_shared<FullyConnected>(units, activation);\nauto conv = std::make_shared<Conv2D>(filters, kernel_size, \"relu\");\nauto norm = std::make_shared<BatchNorm>();\nmodel->addLayer(dense);\nmodel->addLayer(conv);\nmodel->addLayer(norm);",
+      "note": "Use make_shared for memory management. Activation is optional for most layers."
+    },
+    {
+      "pattern": "weights_loading",
+      "code": "model->loadWeights(\"path/to/weights.bin\");\nTensor output = model->forward(input);\nmodel->saveWeights(\"path/to/new_weights.bin\");",
+      "note": "Weights must be loaded after compile(). File format is nntrainer's native binary format."
+    }
+  ],
+  "notes": [
+    "All tensors use row-major (C-style) memory layout",
+    "Always include <nntrainer/neuralnet.h> and use namespace nntrainer or full qualification",
+    "Use std::make_shared for layer allocation; raw pointers are not recommended",
+    "forward() and backward() should maintain tensor shape consistency",
+    "Activations like 'relu', 'sigmoid', 'tanh', 'softmax' are supported",
+    "For training: call backward() after forward(), then optimizer.step()",
+    "Layer initialization happens automatically on first forward() or explicit initialize()"
+  ]
+}
