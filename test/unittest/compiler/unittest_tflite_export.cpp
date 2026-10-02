@@ -450,3 +450,135 @@ TEST(nntrainerInterpreterTflite, SIMPLE_FC_WITH_DROPOUT) {
   }
   delete[] nntr_input;
 }
+
+/**
+ * @brief Create a model whose batch normalization follows a non-trainable
+ * layer, so that the exporter converts it to a fused MUL + ADD pair instead of
+ * folding it into the previous layer
+ *
+ * @param bn_is_last true to make the batch normalization the last layer
+ * @return ModelHandle compiled and initialized model with a 4:1:1 input
+ */
+static ModelHandle makeBnAfterNonTrainableModel(bool bn_is_last) {
+  ModelHandle nn_model = ml::train::createModel(
+    ml::train::ModelType::NEURAL_NET, {nntrainer::withKey("loss", "mse")});
+
+  nn_model->addLayer(
+    createLayer("input", {nntrainer::withKey("name", "in0"),
+                          nntrainer::withKey("input_shape", "4:1:1")}));
+  nn_model->addLayer(
+    createLayer("pooling2d", {nntrainer::withKey("name", "pool0"),
+                              nntrainer::withKey("pooling", "average"),
+                              nntrainer::withKey("pool_size", {1, 1}),
+                              nntrainer::withKey("stride", {1, 1}),
+                              nntrainer::withKey("padding", "valid")}));
+  nn_model->addLayer(createLayer(
+    "batch_normalization",
+    {nntrainer::withKey("name", "bn0"), nntrainer::withKey("epsilon", "0.5"),
+     nntrainer::withKey("moving_mean_initializer", "he_uniform"),
+     nntrainer::withKey("gamma_initializer", "he_uniform"),
+     nntrainer::withKey("beta_initializer", "he_uniform")}));
+
+  if (!bn_is_last) {
+    nn_model->addLayer(
+      createLayer("activation", {nntrainer::withKey("name", "relu0"),
+                                 nntrainer::withKey("activation", "relu")}));
+    nn_model->addLayer(
+      createLayer("pooling2d", {nntrainer::withKey("name", "pool1"),
+                                nntrainer::withKey("pooling", "average"),
+                                nntrainer::withKey("pool_size", {1, 1}),
+                                nntrainer::withKey("stride", {1, 1}),
+                                nntrainer::withKey("padding", "valid")}));
+  }
+
+  auto optimizer = ml::train::createOptimizer("sgd", {"learning_rate=0.001"});
+  EXPECT_EQ(nn_model->setOptimizer(std::move(optimizer)), ML_ERROR_NONE);
+  EXPECT_EQ(nn_model->compile(), ML_ERROR_NONE);
+  EXPECT_EQ(nn_model->initialize(), ML_ERROR_NONE);
+
+  return nn_model;
+}
+
+/**
+ * @brief Copy the weights (moving mean, moving variance, gamma, beta) of the
+ * batch normalization layer "bn0" out of the model
+ */
+static std::vector<std::vector<float>> getBnWeights(ModelHandle &nn_model) {
+  std::shared_ptr<ml::train::Layer> bn;
+  EXPECT_EQ(nn_model->getLayer("bn0", &bn), ML_ERROR_NONE);
+
+  std::vector<float *> weights;
+  std::vector<ml::train::TensorDim> dims;
+  bn->getWeights(weights, dims);
+  EXPECT_EQ(weights.size(), 4u);
+
+  std::vector<std::vector<float>> copied;
+  for (size_t i = 0; i < weights.size(); i++)
+    copied.emplace_back(weights[i], weights[i] + dims[i].getDataLen());
+  return copied;
+}
+
+/**
+ * @brief Export batch normalization after a non-trainable layer (fused MUL +
+ * ADD) and check that the export leaves the model weights intact
+ */
+TEST(nntrainerInterpreterTflite, bn_after_non_trainable_fused_mul_add) {
+  const std::string file_name = "bn_after_non_trainable.tflite";
+  ModelHandle nn_model = makeBnAfterNonTrainableModel(false);
+
+  std::vector<float> input_data;
+  for (unsigned int i = 0; i < 4; i++) {
+    input_data.push_back(static_cast<float>(rand_r(&seed) / (RAND_MAX + 1.0)) -
+                         0.5f);
+  }
+
+  std::vector<float *> inputs = {input_data.data()};
+  std::vector<float *> labels;
+  auto outputs = nn_model->inference(1, inputs, labels);
+  ASSERT_EQ(outputs.size(), 1u);
+  std::vector<float> answer(outputs[0], outputs[0] + input_data.size());
+
+  auto bn_weights = getBnWeights(nn_model);
+
+  nn_model->exports(ml::train::ExportMethods::METHOD_TFLITE, file_name);
+
+  auto tflite_out = run_tflite(file_name, input_data);
+  ASSERT_EQ(tflite_out.size(), answer.size());
+  for (size_t i = 0; i < answer.size(); i++)
+    EXPECT_NEAR(tflite_out[i], answer[i], 0.00001f);
+
+  EXPECT_EQ(getBnWeights(nn_model), bn_weights);
+
+  if (remove(file_name.c_str())) {
+    const size_t error_buflen = 100;
+    char error_buf[error_buflen];
+    std::cerr << "remove tflite " << file_name << " failed, reason: "
+              << SAFE_STRERROR(errno, error_buf, error_buflen);
+  }
+}
+
+/**
+ * @brief Exporting batch normalization after a non-trainable layer without a
+ * following activation is rejected, and the failed export must neither write
+ * a file nor release the model weights
+ */
+TEST(nntrainerInterpreterTflite, bn_after_non_trainable_as_last_layer_n) {
+  const std::string file_name = "bn_after_non_trainable_last.tflite";
+  ModelHandle nn_model = makeBnAfterNonTrainableModel(true);
+
+  auto bn_weights = getBnWeights(nn_model);
+  remove(file_name.c_str());
+
+  try {
+    nn_model->exports(ml::train::ExportMethods::METHOD_TFLITE, file_name);
+    ADD_FAILURE() << "exporting a trailing batch normalization must fail";
+  } catch (const std::invalid_argument &e) {
+    EXPECT_NE(std::string(e.what()).find("cannot be the last layer"),
+              std::string::npos)
+      << e.what();
+  }
+
+  EXPECT_EQ(getBnWeights(nn_model), bn_weights);
+  EXPECT_NE(remove(file_name.c_str()), 0)
+    << "the failed export left " << file_name << " behind";
+}
