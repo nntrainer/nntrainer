@@ -1509,11 +1509,15 @@ void nntr_gemv_q8_0_4x8_q8_0(int n, float *__restrict s, size_t bs,
       int8x16x4_t b_high = vld1q_s8_x4((const int8_t *)b_ptr->qs + 64);
       float16x4_t bd = vld1_f16((const __fp16 *)b_ptr->d);
 
-      int8x8x4_t a_chunks = vld1_s8_x4(a_ptr->qs);
-      int8x16_t a0 = vcombine_s8(a_chunks.val[0], a_chunks.val[0]);
-      int8x16_t a1 = vcombine_s8(a_chunks.val[1], a_chunks.val[1]);
-      int8x16_t a2 = vcombine_s8(a_chunks.val[2], a_chunks.val[2]);
-      int8x16_t a3 = vcombine_s8(a_chunks.val[3], a_chunks.val[3]);
+      // GCC 11 for AArch64 miscompiles the 64-bit-vector vld1_s8_x4: it reads
+      // only 16 of the 32 bytes and zeroes val[1] and val[3]. Load the row
+      // with the 128-bit form and split it by hand instead.
+      int8x16_t a_lo = vld1q_s8(a_ptr->qs);
+      int8x16_t a_hi = vld1q_s8(a_ptr->qs + 16);
+      int8x16_t a0 = vcombine_s8(vget_low_s8(a_lo), vget_low_s8(a_lo));
+      int8x16_t a1 = vcombine_s8(vget_high_s8(a_lo), vget_high_s8(a_lo));
+      int8x16_t a2 = vcombine_s8(vget_low_s8(a_hi), vget_low_s8(a_hi));
+      int8x16_t a3 = vcombine_s8(vget_high_s8(a_hi), vget_high_s8(a_hi));
       float16x4_t ad = vld1_dup_f16((const __fp16 *)&a_ptr->d);
 
       int32x4_t ret0 = vdupq_n_s32(0);
