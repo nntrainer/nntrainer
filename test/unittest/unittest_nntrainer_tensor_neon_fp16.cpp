@@ -15,6 +15,7 @@
 #include "nntrainer_test_util.h"
 #include "util_func.h"
 #include <cmath>
+#include <cpu_backend.h>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -1362,6 +1363,118 @@ TEST(nntrainer_Tensor, dot_gemm_K1) {
   EXPECT_IN_RANGE(mseErrorNeon, 0, epsilon);
   EXPECT_IN_RANGE((float)cosSimNeon, 0.99, 1);
   EXPECT_LE(mcre, 1e-5);
+}
+
+/**
+ * @brief Run fp16 sgemm on exactly representable inputs and compare with a
+ * scalar reference. Every partial sum stays a small multiple of 1/64, so the
+ * result is exact in fp16 regardless of the accumulation order.
+ */
+static void check_small_hgemm(unsigned int M, unsigned int N, unsigned int K,
+                              bool transA, bool transB, float beta) {
+  std::vector<__fp16> A(M * K), B(K * N), C(M * N);
+  std::vector<float> ref(M * N);
+  for (unsigned int i = 0; i < A.size(); ++i)
+    A[i] = static_cast<__fp16>(static_cast<int>(i * 7 % 13) - 6) / 8;
+  for (unsigned int i = 0; i < B.size(); ++i)
+    B[i] = static_cast<__fp16>(static_cast<int>((i * 5 + 3) % 11) - 5) / 8;
+  for (unsigned int i = 0; i < C.size(); ++i)
+    C[i] = static_cast<__fp16>(static_cast<int>(i % 5) - 2) / 4;
+
+  for (unsigned int m = 0; m < M; ++m) {
+    for (unsigned int n = 0; n < N; ++n) {
+      float sum = 0.F;
+      for (unsigned int k = 0; k < K; ++k) {
+        float a = transA ? A[k * M + m] : A[m * K + k];
+        float b = transB ? B[n * K + k] : B[k * N + n];
+        sum += a * b;
+      }
+      ref[m * N + n] = sum + beta * static_cast<float>(C[m * N + n]);
+    }
+  }
+
+  nntrainer::sgemm(0, transA, transB, M, N, K, 1.F, A.data(), transA ? M : K,
+                   B.data(), transB ? K : N, beta, C.data(), N);
+
+  for (unsigned int i = 0; i < C.size(); ++i) {
+    EXPECT_EQ(static_cast<float>(C[i]), ref[i])
+      << "M=" << M << " N=" << N << " K=" << K << " transA=" << transA
+      << " transB=" << transB << " beta=" << beta << " idx=" << i;
+  }
+}
+
+/**
+ * @brief hgemm_small routes M < 8, K % 8 == 0 and N % 4 == 0 to the 1x8 / 1x4
+ * kernels, which pack A in blocks of 1-3 rows. Covers every M hgemm_small can
+ * see, both kernels, the neighbouring fallback path and all transpose modes.
+ */
+TEST(nntrainer_Tensor, hgemm_small_packing_A1_any_M) {
+  nntrainer::init_backend();
+  for (bool transA : {false, true})
+    for (bool transB : {false, true})
+      for (float beta : {0.F, 1.F})
+        for (unsigned int M = 1; M < 8; ++M)
+          for (unsigned int N : {4u, 8u, 12u})
+            for (unsigned int K : {4u, 8u, 12u})
+              check_small_hgemm(M, N, K, transA, transB, beta);
+}
+
+/**
+ * @brief (3x8) x (8x8) fp16 dot, the shape that used to abort in packing_A1
+ */
+TEST(nntrainer_Tensor, dot_gemm_small_3_8_8) {
+  int batch = 1;
+  int channel = 1;
+  int height = 3;
+  int width = 8;
+
+  int height_b = 8;
+  int width_b = 8;
+
+  nntrainer::TensorDim::TensorType t_type_nchw_fp16 = {
+    nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16};
+  nntrainer::TensorDim::TensorType t_type_nchw_fp32 = {
+    nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP32};
+
+  nntrainer::Tensor A(batch, channel, height, width, t_type_nchw_fp16);
+  nntrainer::Tensor B(batch, channel, height_b, width_b, t_type_nchw_fp16);
+  nntrainer::Tensor A_fp32(batch, channel, height, width, t_type_nchw_fp32);
+  nntrainer::Tensor B_fp32(batch, channel, height_b, width_b, t_type_nchw_fp32);
+
+  GEN_TEST_INPUT_RAND(A_fp32, 0, 1);
+  GEN_TEST_INPUT_RAND_B(B_fp32, 0, 1);
+  A.copyData(A_fp32);
+  B.copyData(B_fp32);
+
+  nntrainer::Tensor C = A.dot(B);
+  nntrainer::Tensor C_fp32 = A_fp32.dot(B_fp32);
+
+  ASSERT_EQ(C.height(), (size_t)height);
+  ASSERT_EQ(C.width(), (size_t)width_b);
+
+  float mseErrorNeon =
+    mse<__fp16>(C.getData<__fp16>(), C_fp32.getData<float>(), C.size());
+  double cosSimNeon = cosine_similarity<__fp16>(
+    C.getData<__fp16>(), C_fp32.getData<float>(), C.size());
+
+  EXPECT_IN_RANGE(mseErrorNeon, 0, 1e-3 * width);
+  EXPECT_IN_RANGE((float)cosSimNeon, 0.99, 1);
+}
+
+/**
+ * @brief a small fp16 dot with mismatched inner dimensions must be rejected
+ * before it reaches hgemm
+ */
+TEST(nntrainer_Tensor, dot_gemm_small_incompatible_K_n) {
+  nntrainer::TensorDim::TensorType t_type_nchw_fp16 = {
+    nntrainer::Tformat::NCHW, nntrainer::Tdatatype::FP16};
+
+  nntrainer::Tensor A(1, 1, 3, 8, t_type_nchw_fp16);
+  nntrainer::Tensor B(1, 1, 4, 8, t_type_nchw_fp16);
+  A.setValue(1.F);
+  B.setValue(1.F);
+
+  EXPECT_THROW(A.dot(B), std::runtime_error);
 }
 
 TEST(nntrainer_Tensor, dot_gemv_768_96000) {
