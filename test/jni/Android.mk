@@ -11,8 +11,13 @@ ifndef NNTRAINER_ROOT
 NNTRAINER_ROOT := $(LOCAL_PATH)/../..
 endif
 
-# ARM architecture flags - can be overridden via MESON_ARM_MARCH environment variable
-# Default: armv8.2-a+fp16+dotprod+i8mm (for compatibility with existing builds)
+# ARM architecture flags, supplied via MESON_ARM_MARCH (or ARM_MARCH_FLAGS).
+# There is no default here: if neither is set these flags are empty and the
+# modules below build for the NDK default, armv8-a on arm64-v8a. That still
+# compiles - none of the sources built here uses FP16 NEON intrinsics, only the
+# _FP16 scalar type, which AArch64 provides without +fp16 - so pass the same
+# -march the library was built with, to keep the codegen targets aligned:
+# MESON_ARM_MARCH="-march=armv8.2-a+fp16+dotprod+i8mm" - see README.md.
 ifdef MESON_ARM_MARCH
 ARM_MARCH_FLAGS := $(MESON_ARM_MARCH)
 else
@@ -84,7 +89,15 @@ include $(BUILD_STATIC_LIBRARY)
 include $(CLEAR_VARS)
 
 LOCAL_MODULE := test_util
-LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CPP_VERSION=201703L -DNNTR_NUM_THREADS=1 -D__LOGGING__=1 -DENABLE_TEST=1 -DREDUCE_TOLERANCE=1 $(ARM_MARCH_FLAGS) -O3 -frtti -DENABLE_FP16=1
+# USE__FP16 must match the library. Meson adds -DUSE__FP16=1 for the Android
+# build in the platform == 'android' branch, which applies to every ABI (the
+# aarch64 and arm branches add it too). tensor_dim.h maps _FP16 to __fp16 with
+# the define and to _Float16 without it, so omitting it here compiled this
+# translation unit against a different _FP16 type than the library it links
+# with. Most unittest modules below still do not pass it; that is latent only
+# because nntrainer_test_util.h has no _FP16 in any signature, so a new module
+# exchanging _FP16 with test_util must define it.
+LOCAL_CFLAGS := -Igoogletest/include -I../include -pthread -fexceptions -DMIN_CPP_VERSION=201703L -DNNTR_NUM_THREADS=1 -D__LOGGING__=1 -DENABLE_TEST=1 -DREDUCE_TOLERANCE=1 $(ARM_MARCH_FLAGS) -O3 -frtti -DENABLE_FP16=1 -DUSE__FP16=1
 LOCAL_CXXFLAGS      += -std=c++17 -frtti -fexceptions
 LOCAL_LDLIBS        := -llog -landroid
 
