@@ -157,6 +157,32 @@ foreach target: test_target
   )
 endforeach
 
+# DynamicLibraryLoader tests are a standalone target: on Windows the test also
+# loads a fixture module whose DllMain raises a Win32 error, which needs a
+# per-target build dependency and argument the shared loop above cannot set.
+unittest_dl_loader_args = ['--gtest_output=xml:@0@/@1@.xml'.format(
+  meson.build_root(), 'unittest_dynamic_library_loader')]
+unittest_dl_loader_depends = []
+if host_machine.system() == 'windows'
+  dl_error_fixture = shared_module('dl_error_fixture', 'dl_error_fixture.cpp',
+    name_prefix: '')
+  unittest_dl_loader_args += ['--dl-error-fixture=' + dl_error_fixture.full_path()]
+  unittest_dl_loader_depends += [dl_error_fixture]
+endif
+unittest_dl_loader_exe = executable(
+  'unittest_dynamic_library_loader',
+  'unittest_dynamic_library_loader.cpp',
+  dependencies: unittest_nntrainer_deps,
+  install: get_option('enable-test'),
+  install_dir: application_install_dir
+)
+test('unittest_dynamic_library_loader', unittest_dl_loader_exe,
+  args: unittest_dl_loader_args,
+  depends: unittest_dl_loader_depends,
+  timeout: test_timeout,
+  suite: 'unittests'
+)
+
 # CUDA kernel unittests (the CUDA analogue of the OpenCL kernel tests above).
 # Standalone targets: the shared loop cannot add per-target dependencies, and
 # these need cuda_dep (cuda_runtime.h + cudart for the managed buffers they
