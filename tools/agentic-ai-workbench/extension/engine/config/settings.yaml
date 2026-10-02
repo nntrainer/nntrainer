@@ -1,0 +1,36 @@
+# AI Compiler Workbench Configuration
+# Can be overridden by environment variables: AICOMPILER_SECTION_KEY=value
+
+cpp_generator:
+  # Maximum retry attempts for self-correction loop
+  max_retry_attempts: 3
+  # Timeout for C++ compilation (seconds)
+  compilation_timeout_sec: 60
+  # LLM model to use for code generation
+  llm_model: "claude-sonnet-4-6"
+  # Max tokens per LLM call
+  llm_max_tokens: 4000
+  # Include knowledge bank context in prompts
+  include_kb_in_prompt: true
+  # Truncate KB context if it exceeds this (chars)
+  kb_context_limit_chars: 50000
+
+graph_focus:
+  # LLM model for graph focus queries (fuzzier matching fallback)
+  llm_model: "claude-sonnet-4-6"
+  # Max tokens for graph focus LLM calls
+  llm_max_tokens: 500
+
+llm:
+  # Timeout for LLM API calls (seconds)
+  timeout_sec: 30
+  # Number of retries for transient LLM failures
+  max_retries: 3
+  # Backoff between retries (seconds)
+  retry_backoff_seconds: 2
+
+orchestrator:
+  # Timeout for individual agent runs (seconds)
+  agent_timeout_sec: 300
+  # Max concurrent agents (currently unused, planned for future)
+  max_concurrent_agents: 1
