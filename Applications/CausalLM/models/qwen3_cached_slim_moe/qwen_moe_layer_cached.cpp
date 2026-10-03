@@ -40,6 +40,7 @@ using std::chrono::nanoseconds;
 namespace causallm {
 
 static constexpr size_t SINGLE_INOUT_IDX = 0;
+static constexpr size_t EXPERT_CACHE_CAPACITY = 32;
 
 CachedSlimMoELayer::CachedSlimMoELayer() :
   LayerImpl(),
@@ -365,6 +366,26 @@ void CachedSlimMoELayer::incremental_forwarding(
         t1_miss = high_resolution_clock::now();
 #endif
 
+        int eviction_target = -1;
+        {
+          std::lock_guard<std::mutex> lock(cache_mutex);
+          if (loaded_expert_deque.size() >= EXPERT_CACHE_CAPACITY) {
+            eviction_target = loaded_expert_deque.front();
+            loaded_expert_deque.pop_front();
+            iteration_map.erase(eviction_target);
+            need_load[eviction_target] = true;
+          }
+        }
+
+        if (eviction_target >= 0) {
+          context.getWeight(expert_gate_proj_indices[eviction_target])
+            .deactivate();
+          context.getWeight(expert_up_proj_indices[eviction_target])
+            .deactivate();
+          context.getWeight(expert_down_proj_indices[eviction_target])
+            .deactivate();
+        }
+
         context.getWeight(expert_gate_proj_indices[expert_idx]).activate();
         context.getWeight(expert_up_proj_indices[expert_idx]).activate();
         context.getWeight(expert_down_proj_indices[expert_idx]).activate();
@@ -421,7 +442,7 @@ void CachedSlimMoELayer::incremental_forwarding(
 
     // Evict experts
     /// @todo apply multi thread loop
-    while (loaded_expert_deque.size() > 32) {
+    while (loaded_expert_deque.size() > EXPERT_CACHE_CAPACITY) {
       int target_idx;
       {
         std::lock_guard<std::mutex> lock(cache_mutex);
