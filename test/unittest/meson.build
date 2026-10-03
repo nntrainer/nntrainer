@@ -138,6 +138,48 @@ endif
 if host_machine.cpu_family() == 'aarch64'
   test_target += [['unittest_nntrainer_kleidiai', []]]
   test_target += [['unittest_nntrainer_ggml_arm', []]]
+
+  # The library links the ggml GEMM wrappers of the configured thread-backend
+  # only. Build unittest_nntrainer_ggml_arm again for every other backend,
+  # without the library, so each one is run: from that backend's wrapper plus
+  # the library's backend-independent ggml and thread-manager sources.
+  ggml_dir = meson.source_root() / 'nntrainer' / 'tensor' / 'cpu_backend' / 'ggml_interface'
+  ggml_test_common_sources = []
+  foreach s : ggml_interface_common_sources
+    ggml_test_common_sources += ggml_dir / s
+  endforeach
+  foreach s : ggml_impl_interface_sources
+    ggml_test_common_sources += ggml_dir / 'nntr_ggml_impl' / s
+  endforeach
+  foreach s : thread_manager_sources
+    ggml_test_common_sources += meson.source_root() / 'nntrainer' / 'utils' / s
+  endforeach
+  ggml_lib_backend = {'bstp': 'bs_threadpool', 'mixed': 'mixed'}.get(get_option('thread-backend'), 'omp')
+  foreach backend : ['omp', 'bs_threadpool', 'mixed']
+    if backend != ggml_lib_backend
+      ggml_test_name = 'unittest_nntrainer_ggml_arm_' + backend
+      ggml_test_exe = executable(
+        ggml_test_name,
+        [
+          'unittest_nntrainer_ggml_arm.cpp',
+          ggml_dir / 'ggml_interface_' + backend + '.cpp',
+          ggml_test_common_sources,
+        ],
+        dependencies: [
+          gtest_dep,
+          dependency('threads'),
+          nntrainer_dep.partial_dependency(includes: true, compile_args: true),
+          nntrainer_testutil_dep.partial_dependency(includes: true),
+        ],
+        install: false
+      )
+      test(ggml_test_name, ggml_test_exe,
+        args: ['--gtest_output=xml:@0@/@1@.xml'.format(meson.build_root(), ggml_test_name)],
+        timeout: test_timeout,
+        suite: 'unittests'
+      )
+    endif
+  endforeach
 endif
 
 foreach target: test_target
