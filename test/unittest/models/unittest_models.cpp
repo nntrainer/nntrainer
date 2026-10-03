@@ -12,6 +12,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <ini_wrapper.h>
 #include <memory>
 #include <neuralnet.h>
@@ -1279,6 +1281,146 @@ GTEST_PARAMETER_TEST(
   }),
   [](const testing::TestParamInfo<nntrainerModelTest::ParamType> &info)
     -> const auto & { return std::get<1>(info.param); });
+
+/**
+ * @brief expected sinusoidal positional encoding at (pos, i) for model_dim
+ */
+static float expectedPositionalEncoding(unsigned int pos, unsigned int i,
+                                        unsigned int model_dim) {
+  float angle = pos / std::pow(10000.0f, ((i >> 1) << 1) / (float)model_dim);
+  return (i & 1) ? std::cos(angle) : std::sin(angle);
+}
+
+/**
+ * @brief make a model feeding the input straight into positional encoding
+ */
+static std::unique_ptr<NeuralNetwork>
+makePositionalEncodingOnly(unsigned int seq_len, unsigned int model_dim,
+                           unsigned int max_timestep, bool with_loss,
+                           bool fp16 = false) {
+  std::unique_ptr<NeuralNetwork> nn(new NeuralNetwork());
+  nn->setProperty({"batch_size=1"});
+  if (fp16)
+    nn->setProperty({"model_tensor_type=FP16-FP16"});
+
+  std::vector<LayerRepresentation> layers = {
+    {"input",
+     {"name=input",
+      "input_shape=1:" + std::to_string(seq_len) + ":" +
+        std::to_string(model_dim),
+      fp16 ? "input_dtype=FP16" : "input_dtype=FP32"}},
+    {"positional_encoding",
+     {"name=pe", "max_timestep=" + std::to_string(max_timestep)}},
+  };
+  if (with_loss)
+    layers.push_back({"mse", {"name=loss", "input_layers=pe"}});
+
+  for (auto &node : makeGraph(layers))
+    nn->addLayer(node);
+
+  if (with_loss)
+    nn->setOptimizer(ml::train::createOptimizer("sgd", {"learning_rate=0.1"}));
+  return nn;
+}
+
+/**
+ * @brief run inference on a zero input and check that the output is exactly
+ * the positional encoding table
+ */
+static void expectPositionalEncodingOutput(
+  NeuralNetwork &nn, unsigned int seq_len, unsigned int model_dim,
+  TensorDim::DataType dtype = TensorDim::DataType::FP32,
+  float max_abs_err = 1e-5f) {
+  auto input = MAKE_SHARED_TENSOR(Tensor(
+    TensorDim(1, 1, seq_len, model_dim, {TensorDim::Format::NCHW, dtype}),
+    true));
+  input->setZero();
+
+  sharedConstTensors out;
+  ASSERT_NO_THROW(out = nn.inference({input}, false));
+  ASSERT_EQ(out.size(), 1u);
+  Tensor output = out[0]->clone(TensorDim::DataType::FP32);
+
+  float max_err = 0.0f;
+  for (unsigned int pos = 0; pos < seq_len; ++pos) {
+    for (unsigned int i = 0; i < model_dim; ++i) {
+      float err = std::abs(output.getValue(0, 0, pos, i) -
+                           expectedPositionalEncoding(pos, i, model_dim));
+      max_err = std::isnan(err) ? INFINITY : std::max(max_err, err);
+    }
+  }
+  EXPECT_LE(max_err, max_abs_err);
+}
+
+/**
+ * @brief every inference() reallocates the tensor pool; the positional
+ * encoding must still be added on every call, not only the first one
+ */
+TEST(nntrainerModels, positional_encoding_repeated_inference) {
+  constexpr unsigned int seq_len = 64, model_dim = 256, max_timestep = 128;
+  auto nn = makePositionalEncodingOnly(seq_len, model_dim, max_timestep, false);
+  ASSERT_EQ(nn->compile(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+  ASSERT_EQ(nn->initialize(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+
+  for (int run = 0; run < 3; ++run) {
+    SCOPED_TRACE("inference #" + std::to_string(run));
+    expectPositionalEncodingOutput(*nn, seq_len, model_dim);
+  }
+}
+
+#ifdef ENABLE_FP16
+/**
+ * @brief with FP16 weights both the FP16 table and its FP32 scratch come from
+ * the tensor pool, which every inference() reallocates
+ */
+TEST(nntrainerModels, positional_encoding_repeated_inference_fp16) {
+  constexpr unsigned int seq_len = 64, model_dim = 256, max_timestep = 128;
+  auto nn =
+    makePositionalEncodingOnly(seq_len, model_dim, max_timestep, false, true);
+  ASSERT_EQ(nn->compile(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+  ASSERT_EQ(nn->initialize(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+
+  for (int run = 0; run < 3; ++run) {
+    SCOPED_TRACE("inference #" + std::to_string(run));
+    expectPositionalEncodingOutput(*nn, seq_len, model_dim,
+                                   TensorDim::DataType::FP16, 1e-3f);
+  }
+}
+#endif
+
+/**
+ * @brief a training-mode forward pass followed by inference() must not leave
+ * inference reading a stale positional encoding table
+ */
+TEST(nntrainerModels, positional_encoding_inference_after_train_forward) {
+  constexpr unsigned int seq_len = 64, model_dim = 256, max_timestep = 128;
+  auto nn = makePositionalEncodingOnly(seq_len, model_dim, max_timestep, true);
+  ASSERT_EQ(nn->compile(), ML_ERROR_NONE);
+  ASSERT_EQ(nn->initialize(), ML_ERROR_NONE);
+  ASSERT_EQ(nn->allocate(ExecutionMode::TRAIN), ML_ERROR_NONE);
+
+  auto input = MAKE_SHARED_TENSOR(Tensor(1, 1, seq_len, model_dim));
+  auto label = MAKE_SHARED_TENSOR(Tensor(1, 1, seq_len, model_dim));
+  input->setZero();
+  label->setZero();
+  ASSERT_NO_THROW(nn->forwarding({input}, {label}));
+
+  for (int run = 0; run < 2; ++run) {
+    SCOPED_TRACE("inference #" + std::to_string(run));
+    expectPositionalEncodingOutput(*nn, seq_len, model_dim);
+  }
+}
+
+/**
+ * @brief a sequence longer than max_timestep must be rejected at initialize
+ * instead of reading past the end of the positional encoding table
+ */
+TEST(nntrainerModels, positional_encoding_seq_longer_than_max_timestep_n) {
+  constexpr unsigned int seq_len = 8, model_dim = 6, max_timestep = 7;
+  auto nn = makePositionalEncodingOnly(seq_len, model_dim, max_timestep, false);
+  ASSERT_EQ(nn->compile(ExecutionMode::INFERENCE), ML_ERROR_NONE);
+  EXPECT_THROW(nn->initialize(ExecutionMode::INFERENCE), std::invalid_argument);
+}
 
 #ifdef NDK_BUILD
 
