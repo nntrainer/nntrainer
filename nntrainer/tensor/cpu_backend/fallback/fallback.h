@@ -561,6 +561,15 @@ void tanh_gelu(const unsigned int N, const float *X, float *Y);
 void tanh_gelu_v2(const unsigned int N, const float *X, float *Y);
 
 /**
+ * @brief gelu function
+ *
+ * @param N number of elements in X
+ * @param X float * for Vector X (input)
+ * @param Y float * for Vector Y (output)
+ */
+void gelu_v2(const unsigned int N, const float *X, float *Y);
+
+/**
  * @brief tanh_gelu function with neon but as
  * X = Y / (1 + exp(-pi/4*(Y
  *      + 0.044715Y^3)) * Z
@@ -1125,6 +1134,15 @@ template <typename T = float>
 void dequantize_row_q8_K(const void *x, T *y, int64_t k);
 
 /**
+ * @brief Quantize float to q6_K Quantization format
+ *
+ * @param src float* src to be quantized
+ * @param dst void* dst to store quantized data
+ * @param k number of elements in src
+ */
+void quantize_row_q6_K(const float *src, void *dst, int64_t k);
+
+/**
  * @brief dequantize row of q8_K data to float
  *
  * @param x input to be dequantized from q8_K to float
@@ -1155,8 +1173,8 @@ void repack_q4_0_to_q4_0_8(void *dst, void *src, size_t data_size,
  * @param M number of rows
  * @param N number of columns
  */
-void repack_q4_K_to_q4_K_8(void *dst, void *src, size_t data_size,
-                           const unsigned int M, const unsigned int N);
+void repack_q4_K(void *dst, void *src, size_t data_size, const unsigned int M,
+                 const unsigned int N);
 
 /**
  * @brief repack q40 to q40x8
