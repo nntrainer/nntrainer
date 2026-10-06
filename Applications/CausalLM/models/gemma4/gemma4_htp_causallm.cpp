@@ -712,6 +712,15 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   // (the one caller passes the same normed tensor as query, key and value)
   (void)key;
   (void)value;
+  unsigned int rope_theta =
+    is_sliding ? SLIDING_ATTENTION_ROPE_THETA : FULL_ATTENTION_ROPE_THETA;
+  const std::string &rope_type =
+    is_sliding ? SLIDING_ATTENTION_ROPE_TYPE : FULL_ATTENTION_ROPE_TYPE;
+  const float rope_partial_rotary_factor =
+    is_sliding ? SLIDING_ATTENTION_ROPE_PARTIAL_ROTARY_FACTOR
+               : FULL_ATTENTION_ROPE_PARTIAL_ROTARY_FACTOR;
+  // RoPE too (doc 57 section 5 step 4): q and k leave the projection call
+  // rotated, so the attention core only converts k into its cache.
   std::vector<std::string> qkv_params = {
     withKey("name", QKV),
     withKey("q_unit", curr_head_dim * n_heads),
@@ -723,6 +732,12 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     withKey("q_scale",
             std::to_string(std::sqrt(static_cast<float>(curr_head_dim)))),
     withKey("in_norm", "true"),
+    withKey("rope", "true"),
+    withKey("rope_theta", std::to_string(rope_theta)),
+    withKey("rope_scaling_type", rope_type),
+    withKey("rope_partial_rotary_factor",
+            std::to_string(rope_partial_rotary_factor)),
+    withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
     withKey("weight_dtype", FC_LAYER_DTYPE),
     withKey("engine",
             engineFor(ATTN_PROJ_ENGINE, ATTN_PROJ_HTP_LAYERS, layer_id))};
@@ -743,18 +758,11 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
   layer_v_norms[layer_id] = v_normed;
 
   unsigned int window_size = is_sliding ? SLIDING_WINDOW : UINT_MAX;
-  unsigned int rope_theta =
-    is_sliding ? SLIDING_ATTENTION_ROPE_THETA : FULL_ATTENTION_ROPE_THETA;
-  const std::string &rope_type =
-    is_sliding ? SLIDING_ATTENTION_ROPE_TYPE : FULL_ATTENTION_ROPE_TYPE;
-  const float rope_partial_rotary_factor =
-    is_sliding ? SLIDING_ATTENTION_ROPE_PARTIAL_ROTARY_FACTOR
-               : FULL_ATTENTION_ROPE_PARTIAL_ROTARY_FACTOR;
 
   auto [cache_k, cache_v] =
     createGemma4KVCachePlaceholders(layer_id, getKVCacheWidth(layer_id));
 
-  // Attention core receives [Q_norm, K_norm, V_norm].
+  // Attention core receives [Q_norm, K_norm, V_norm], already rotated.
   std::vector<std::string> a_params = {
     withKey("name", A),
     withKey("num_heads", n_heads),
@@ -762,7 +770,7 @@ Tensor Gemma4Transformer::createAttention(const int layer_id, int seq_len,
     withKey("max_timestep", std::to_string(MAX_SEQ_LEN)),
     withKey("max_position_embeddings", std::to_string(MAX_POSITION_EMBEDDINGS)),
     withKey("sliding_window", window_size),
-    withKey("use_rope", "true"),
+    withKey("use_rope", "false"),
     withKey("rope_theta", std::to_string(rope_theta)),
     withKey("rope_scaling_type", rope_type),
     withKey("rope_partial_rotary_factor",
