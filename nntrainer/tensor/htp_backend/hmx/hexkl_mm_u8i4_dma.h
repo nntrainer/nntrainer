@@ -51,6 +51,13 @@ typedef struct {
   void *arrays;      /**< the one allocation the three arrays sit in */
   uint32_t K, N;
   int borrowed; /**< wh_bytes points into a host arena, not our heap */
+  /** 4 (QS4CX_WH) or 2 (QS2CX_WH); 0 in a slot never filled reads as 4.
+      At 2, wh_bytes holds half as many bytes -- two bits a weight indexing
+      @a pal -- which the M=1 GEMV looks up in a register
+      (hvx_gemm_u8i2_wh_*) and the HMX path expands to int4 in VTCM
+      (hvx_expand_i2i4.h). Both give the 4-bit path's int32 sums. */
+  uint32_t bits;
+  int8_t pal[4]; /**< the four int4 codes, ascending. Unused when bits == 4 */
 } hexkl_weight_u8i4;
 
 typedef struct {
@@ -123,6 +130,23 @@ int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
                                    uint32_t K, uint32_t N, const uint8_t *wh,
                                    const float *w_scale,
                                    const int32_t *colsum_w);
+
+/**
+ * @brief hexkl_weight_u8i4_register_arena for QS2CX_WH: half the bytes,
+ *        plus the palette.
+ *
+ * @a wh is whBytes2(K, N) = K*N/4 bytes of 2-bit codes in whPack's nibble
+ * order, and @a pal the four int4 codes they index. NULL arrays take the
+ * scales and column sums from the arena after the codes. The HMX path
+ * expands a chunk in place after its DMA lands, so no VTCM is set aside for
+ * it -- see hexkl_moe_expand_chunk.
+ */
+int hexkl_weight_u2i4_register_arena(hexkl_weight_u8i4_table *tbl,
+                                     uint32_t vtcm_size, uint32_t K, uint32_t N,
+                                     const uint8_t *wh, const int8_t *pal,
+                                     const float *w_scale,
+                                     const int32_t *colsum_w, const float *bias,
+                                     uint32_t *out_handle);
 
 /** @brief Whether any live slot borrows bytes inside [base, base+bytes). */
 int hexkl_weight_u8i4_borrows(const hexkl_weight_u8i4_table *tbl,

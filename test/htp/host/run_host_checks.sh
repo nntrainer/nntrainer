@@ -40,7 +40,8 @@ cc=${CC:-gcc}
   -I "$BACKEND/hmx" -I "$BACKEND/hvx" \
   -o "$OUT/moe_layer_host_check" \
   "$HERE/moe_layer_host_check.c" "$HERE/standin/hvx_scalar.c" \
-  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_dma_trace.c" -lm
+  "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" "$BACKEND/hmx/hexkl_dma_trace.c" \
+  "$BACKEND/hvx/hvx_expand_i2i4.c" -lm
 
 "$OUT/moe_layer_host_check"
 
@@ -56,7 +57,7 @@ cc=${CC:-gcc}
   "$HERE/conv_block_host_check.c" "$HERE/hvx_scalar_stubs.c" \
   "$HERE/standin/hvx_scalar.c" \
   "$BACKEND/hmx/hexkl_conv_block.c" "$BACKEND/hmx/hexkl_mm_u8i4_moe.c" \
-  "$BACKEND/hmx/hexkl_dma_trace.c" -lm
+  "$BACKEND/hmx/hexkl_dma_trace.c" "$BACKEND/hvx/hvx_expand_i2i4.c" -lm
 
 "$OUT/conv_block_host_check"
 

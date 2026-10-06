@@ -124,6 +124,16 @@ uint32_t hexkl_moe_push_weight_chunk(uint8_t *vtcm_base, uint32_t dst_off,
                                      uint32_t k_tiles, uint32_t n_col,
                                      uint32_t nt0, uint32_t cn, int src_bypass);
 
+/**
+ * @brief Expands a 2-bit chunk in place after its DMA lands. No-op at 4.
+ * @see hexkl_mm_u8i4_moe.c -- must run between the wait and the first HMX
+ *      issue that reads the chunk.
+ */
+void hexkl_moe_expand_chunk(uint8_t *vtcm_base, uint32_t dst_off,
+                            const hexkl_weight_u8i4 *h, uint32_t k_tiles,
+                            uint32_t n_col, uint32_t nt0, uint32_t cn,
+                            hvx_worker_pool *pool);
+
 /** @brief Queues one 64-row AH activation block (rows [slot, slot+64) of
  *         a packed activation) heap -> VTCM. Push it AHEAD of the weights
  *         it will be computed against -- see the definition for why.

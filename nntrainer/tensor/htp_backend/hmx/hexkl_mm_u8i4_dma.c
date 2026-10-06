@@ -190,6 +190,9 @@ static int hexkl_weight_u8i4_fill_slot(hexkl_weight_u8i4_table *tbl,
   } else {
     hexkl_weight_u8i4_tail_from_arena(h, wh_bytes);
   }
+  /* Four unless the caller says otherwise (hexkl_weight_u2i4_register_arena
+     sets 2 after this returns). */
+  h->bits = 4u;
   h->in_use = 1;
   return AEE_SUCCESS;
 }
@@ -321,6 +324,50 @@ int hexkl_weight_u8i4_rebind_arena(hexkl_weight_u8i4_table *tbl, uint32_t h,
   return AEE_SUCCESS;
 }
 
+int hexkl_weight_u2i4_register_arena(hexkl_weight_u8i4_table *tbl,
+                                     uint32_t vtcm_size, uint32_t K, uint32_t N,
+                                     const uint8_t *wh, const int8_t *pal,
+                                     const float *w_scale,
+                                     const int32_t *colsum_w, const float *bias,
+                                     uint32_t *out_handle) {
+  uint32_t wh_bytes = 0;
+  uint32_t slot;
+  int rc;
+
+  /* Either all three arrays or none, as for the 4-bit entry: none means
+     they follow the codes in the arena. */
+  if (!tbl || !wh || !pal || !out_handle || (!w_scale != !colsum_w) ||
+      (!w_scale != !bias)) {
+    return AEE_EBADPARM;
+  }
+  /* A whole tile, as for four bits: hexkl_weight_u8i4_rebind_arena (the
+     pool's swap) checks the same, so a slot registered here can always be
+     rebound. The host places weights on 4 KiB boundaries. */
+  if (((uintptr_t)wh % WEIGHT_TILE_BYTES_U8I4) != 0u) {
+    return AEE_EBADPARM;
+  }
+  /* The VTCM check is the 4-bit one on purpose: the HMX path expands the
+     codes in place into a full-width region, so what has to fit is the
+     expanded size. */
+  rc = hexkl_weight_u8i4_check(K, N, vtcm_size, &wh_bytes);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  slot = hexkl_weight_u8i4_free_slot(tbl);
+  if (slot == HEXKL_MM_U8I4_MAX_WEIGHTS) {
+    return AEE_ENOMEMORY;
+  }
+  rc = hexkl_weight_u8i4_fill_slot(tbl, slot, K, N, wh_bytes / 2u, wh, w_scale,
+                                   colsum_w, bias, /*borrow=*/1);
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  tbl->slots[slot].bits = 2u;
+  memcpy(tbl->slots[slot].pal, pal, sizeof(tbl->slots[slot].pal));
+  *out_handle = slot;
+  return AEE_SUCCESS;
+}
+
 int hexkl_weight_u8i4_borrows(const hexkl_weight_u8i4_table *tbl,
                               const uint8_t *base, uint32_t bytes) {
   uint32_t i;
@@ -347,7 +394,8 @@ int hexkl_weight_u8i4_export(const hexkl_weight_u8i4_table *tbl,
     return AEE_EBADPARM;
   }
   h = &tbl->slots[handle];
-  if (!h->in_use) {
+  /* The bake cache holds int4 WH bytes; a 2-bit slot has none to give. */
+  if (!h->in_use || h->bits == 2u) {
     return AEE_EBADPARM;
   }
   wh_bytes = (h->K / HEXKL_HMX_INT8_BLOCK_N_INNER) *
