@@ -2231,7 +2231,10 @@ int hexkl_mm_u8i4_moe_layer_run(
         /* Only the first block of an expert waits: by the second the whole
            weight is resident. n == 0 && gb == 0 is the one wait that cannot
            hide behind anything, which is what DMA_FIRST records. */
-        if (blk.first && exp_live[gb]) {
+        /* exp_bg first: only it bounds gb by MOE_EXP_DN. A call without
+           it (four bits, or more chunks than slots) may have more gate_up
+           chunks than exp_live has entries. */
+        if (blk.first && exp_bg && exp_live[gb]) {
           /* Queued a phase ago (chunks 0..1, under the previous down) or a
              batch ago (2..3); either way its DMA was waited for then. */
           HEXKL_PROBE_T0(p0);
@@ -2445,7 +2448,11 @@ int hexkl_mm_u8i4_moe_layer_run(
           (dn_ntiles - nt0 < L.acc_tiles) ? (dn_ntiles - nt0) : L.acc_tiles;
         const uint32_t stage_off =
           L.result_off + (sb & 1u) * L.acc_tiles * ACC_TILE_BYTES;
-        if (pblk.first && exp_live[MOE_EXP_DN + db]) {
+        /* exp_bg first, as for gate_up: a 4-bit call's down chunks can
+           run past exp_live (db = 8 on the lfm25 dense FFN at M = 512),
+           and the stack word read there sent the wait to a job that was
+           never queued: a hang wherever that word is nonzero (the host E2E). */
+        if (pblk.first && exp_bg && exp_live[MOE_EXP_DN + db]) {
           /* Queued during the gate_up phase just above. */
           HEXKL_PROBE_T0(p0);
           hvx_worker_pool_wait_bg(pool, &exp_job[MOE_EXP_DN + db], UINT32_MAX);
