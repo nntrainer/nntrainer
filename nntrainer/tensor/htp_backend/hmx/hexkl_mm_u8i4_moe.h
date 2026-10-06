@@ -236,6 +236,39 @@ int hexkl_mm_u8i4_moe_layer_run(
   hexkl_moe_scratch *scratch, uint32_t flags);
 
 /**
+ * @brief [#225] One decode row through FC weights held as WH handles: the
+ *        u8 row quantization of the MoE M=1 path, then per output column
+ *        tile hvx_gemm_u8i4_wh_col and the dequant epilogue of its down
+ *        stage (moe_m1_down_worker's body), the parts' outputs side by
+ *        side (q | k | v, a conv in_proj's thirds).
+ *
+ * With the feed on (hexkl_moe_flags_feed, the MoE's) each pool lane
+ * double-buffers its own next block of columns into its own VTCM slice on
+ * its own DMA queue while it computes the current one -- the Q4M1 FC
+ * runner's feed (nntr_hvx_fc_q4.c) on the WH layout. Off, or a VTCM slice
+ * too small for two columns, reads the arena behind the GEMV's l2fetch.
+ * The output bytes are the same either way.
+ *
+ * @param[in] h        [n_parts] handles of K x N_p, N_p % 32 == 0
+ * @param[in] act_f32  [K], K % 32 == 0 (any heap or slot buffer)
+ * @param[out] out_f32 [sum N_p]
+ * @return AEE_SUCCESS; AEE_EBADITEM for a handle out of range, free, of
+ *         another K or 2-bit (QS2CX_WH: refused until plan 229 S2's u8i2
+ *         column branch); AEE_EINVALIDFORMAT for a shape; AEE_EFAILED when a
+ *         lane's DMA wait ran out of its guard (the output is void); the
+ *         scratch's AEE_ENOMEMORY
+ */
+int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
+                            uint8_t *vtcm_base, uint32_t vtcm_size,
+                            uint32_t config_off, uint32_t K, uint32_t n_parts,
+                            const uint32_t *h, const float *act_f32,
+                            float *out_f32, hvx_worker_pool *pool,
+                            hexkl_moe_scratch *scratch, uint32_t flags);
+
+/** @brief [#225] hexkl_mm_u8i4_fc_m1_run's part limit (HTP_GRAPH_MAX_PARTS). */
+#define HEXKL_FC_M1_MAX_PARTS 32u
+
+/**
  * @brief Take a call of at most 4 rows (M <= 4, at most 16 active experts)
  *        through the HVX GEMV -- every expert, no 64-row HMX block, no
  *        weight DMA -- instead of the block loop. Bit-identical output:

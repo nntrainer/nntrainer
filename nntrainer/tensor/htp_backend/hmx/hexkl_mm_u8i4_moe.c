@@ -2646,3 +2646,220 @@ out:
   /* Nothing to free: the scratch stays with the session. */
   return rc;
 }
+
+/* ---- [#225] The FC at M = 1 on WH weights (hexkl_mm_u8i4_fc_m1_run) ----
+ *
+ * The decode FC set as the prefill registered it (the FC WH sidecar's
+ * handles): one u8 quantization of the row (the MoE M=1 path's scan and
+ * pack), then every output column tile of every part is one unit of
+ * moe_m1_down_worker's body -- hvx_gemm_u8i4_wh_col, then
+ * hvx_dequant_acc_tile_to_f32 into the part's columns of the output. The
+ * units are numbered across the parts (q | k | v side by side), and one
+ * pool run covers the op: a lane takes a contiguous slice of them.
+ *
+ * THE FEED. A decode FC is one to three 2 MiB matrices read once, so the
+ * MoE's whole-matrix slab schedule (one matrix ahead, a pool run per
+ * matrix) would leave the first matrix exposed and pay a run per part.
+ * Instead each lane cuts its slice into blocks of adjacent columns of one
+ * part and double-buffers them in its own VTCM slice (arena / lanes) on
+ * its own DMA queue (hexkl_dma_lane_push2d): wait block b, start block
+ * b + 1, compute block b -- the Q4M1 runner's feed (45.5 GB/s, LEDGER
+ * rule 49) on the WH tiles. A block's push is a 2D descriptor: k_tiles
+ * rows of cn x 512 B at the part's row stride, landing as a [k_tiles][cn]
+ * WH matrix the GEMV reads with n_col = cn. Every push is waited by the
+ * lane that issued it before it is read and before its buffer is pushed
+ * again, all inside the one run (moe_layer_host_check's scoreboard).
+ * ponytail: FC_M1_BLOCKS blocks a lane, so its first block's transfer
+ * (about a quarter of its slice) is exposed; the knob and the queue count
+ * are what the device profile of plan 225 step 7 reads.
+ */
+#define FC_M1_MAX_LANES 8u
+/** @brief Blocks a lane cuts its slice into (fewer when VTCM is short). */
+#define FC_M1_BLOCKS 4u
+
+typedef struct {
+  const uint8_t *act_ah;
+  const float *act_scale;
+  const int32_t *act_zp;
+  const hexkl_weight_u8i4 *w[HEXKL_FC_M1_MAX_PARTS];
+  uint32_t t0[HEXKL_FC_M1_MAX_PARTS + 1u]; /**< part p's first unit */
+  uint32_t n_parts, k_tiles, n_tiles;
+  int32_t *acc; /**< n_tiles x MOE_M1_TILE_I32 */
+  float *out;
+  uint8_t *vtcm; /**< NULL: no feed */
+  uint32_t arena, rows1;
+  int bypass;
+  volatile uint32_t timed_out; /**< only ever set to 1 */
+} fc_m1_ctx;
+
+/** @brief Per lane, the double buffer's two descriptors (the lane polls
+ *  both done before its unit returns, so the next call may reuse them). */
+static hexkl_dma_desc2d g_fc_m1_desc[FC_M1_MAX_LANES][2]
+  __attribute__((aligned(128)));
+
+/** @brief The part unit @a t belongs to. */
+static inline uint32_t fc_m1_part(const fc_m1_ctx *c, uint32_t t) {
+  uint32_t p = 0;
+  while (t >= c->t0[p + 1u]) {
+    ++p;
+  }
+  return p;
+}
+
+/** @brief End of the block that starts at unit @a t: at most @a nb units,
+ *  inside the lane's slice and the part. */
+static inline uint32_t fc_m1_block_end(const fc_m1_ctx *c, uint32_t t,
+                                       uint32_t nb, uint32_t hi) {
+  const uint32_t pe = c->t0[fc_m1_part(c, t) + 1u];
+  const uint32_t e = t + nb < pe ? t + nb : pe;
+  return e < hi ? e : hi;
+}
+
+/** @brief Starts block [b0, b1) of one part into @a dst ([k_tiles][b1 - b0]
+ *  tiles) on this lane's queue. */
+static void fc_m1_push(const fc_m1_ctx *c, hexkl_dma_desc2d *d, uint8_t *dst,
+                       uint32_t b0, uint32_t b1) {
+  const uint32_t p = fc_m1_part(c, b0);
+  const hexkl_weight_u8i4 *w = c->w[p];
+  const uint32_t row = (b1 - b0) * WEIGHT_TILE_BYTES_U8I4;
+  hexkl_dma_lane_push2d(
+    d, NULL, dst,
+    w->wh_bytes + (size_t)(b0 - c->t0[p]) * WEIGHT_TILE_BYTES_U8I4, row,
+    (w->N / HEXKL_HMX_INT8_BLOCK_N_COL) * WEIGHT_TILE_BYTES_U8I4, row,
+    c->k_tiles, moe_weight_src_bypass(w, c->bypass), /*dst_vtcm=*/1);
+}
+
+static void fc_m1_worker(uint32_t n_lanes, uint32_t i, void *v) {
+  fc_m1_ctx *c = (fc_m1_ctx *)v;
+  const uint32_t col_bytes = c->k_tiles * WEIGHT_TILE_BYTES_U8I4;
+  const uint32_t per_lane = (c->arena / n_lanes) & ~127u;
+  const uint32_t fit = per_lane / (2u * col_bytes);
+  const int feed = c->vtcm != NULL && fit != 0u;
+  hexkl_dma_desc2d *d = g_fc_m1_desc[i];
+  uint8_t *buf[2] = {NULL, NULL};
+  uint32_t lo, hi, nb = 1u, cur = 0u;
+  moe_m1_slice(0u, c->n_tiles, n_lanes, i, &lo, &hi);
+  if (lo >= hi) {
+    return;
+  }
+  if (feed) {
+    nb = (hi - lo + FC_M1_BLOCKS - 1u) / FC_M1_BLOCKS;
+    nb = nb < fit ? nb : fit;
+    buf[0] = c->vtcm + (size_t)i * per_lane;
+    buf[1] = buf[0] + (size_t)nb * col_bytes;
+  }
+  uint32_t b0 = lo, b1 = fc_m1_block_end(c, lo, nb, hi);
+  if (feed) {
+    fc_m1_push(c, &d[0], buf[0], b0, b1);
+  }
+  while (b0 < hi) {
+    const uint32_t n0 = b1, n1 = n0 < hi ? fc_m1_block_end(c, n0, nb, hi) : n0;
+    if (feed) {
+      if (hexkl_dma_lane_wait(&d[cur]) != 0) {
+        c->timed_out = 1u; /* the engine may still be busy: stop here */
+        return;
+      }
+      if (n0 < n1) {
+        fc_m1_push(c, &d[cur ^ 1u], buf[cur ^ 1u], n0, n1);
+      }
+    }
+    const uint32_t p = fc_m1_part(c, b0);
+    const hexkl_weight_u8i4 *w = c->w[p];
+    for (uint32_t t = b0; t < b1; ++t) {
+      const uint32_t nt = t - c->t0[p];
+      const uint32_t c0 = nt * HEXKL_HMX_INT8_BLOCK_N_COL;
+      int32_t *tile = c->acc + (size_t)t * MOE_M1_TILE_I32;
+      if (feed) {
+        hvx_gemm_u8i4_wh_col_nopf(c->act_ah, 1u, c->k_tiles, buf[cur], b1 - b0,
+                                  t - b0, c->rows1, tile);
+      } else {
+        hvx_gemm_u8i4_wh_col(c->act_ah, 1u, c->k_tiles, w->wh_bytes,
+                             w->N / HEXKL_HMX_INT8_BLOCK_N_COL, nt, c->rows1,
+                             tile);
+      }
+      hvx_dequant_acc_tile_to_f32(
+        tile, HEXKL_HMX_INT8_BLOCK_N_COL, 1u, c->act_scale, c->act_zp,
+        w->colsum_w + c0, w->w_scale + c0, w->bias + c0,
+        c->out + (size_t)t * HEXKL_HMX_INT8_BLOCK_N_COL,
+        c->n_tiles * HEXKL_HMX_INT8_BLOCK_N_COL, 0);
+    }
+    cur ^= 1u;
+    b0 = n0;
+    b1 = n1;
+  }
+}
+
+int hexkl_mm_u8i4_fc_m1_run(const hexkl_weight_u8i4_table *tbl,
+                            uint8_t *vtcm_base, uint32_t vtcm_size,
+                            uint32_t config_off, uint32_t K, uint32_t n_parts,
+                            const uint32_t *h, const float *act_f32,
+                            float *out_f32, hvx_worker_pool *pool,
+                            hexkl_moe_scratch *scratch, uint32_t flags) {
+  static const uint32_t row0[4] = {0u, 0u, 0u, 0u};
+  const uint32_t BR = HEXKL_HMX_INT8_BLOCK_N_ROW;
+  fc_m1_ctx c;
+  if (!tbl || !h || !act_f32 || !out_f32 || !scratch) {
+    return AEE_EBADPARM;
+  }
+  if (K == 0u || K % HEXKL_HMX_INT8_BLOCK_N_INNER != 0u || n_parts == 0u ||
+      n_parts > HEXKL_FC_M1_MAX_PARTS) {
+    return AEE_EINVALIDFORMAT;
+  }
+  memset(&c, 0, sizeof(c));
+  c.k_tiles = K / HEXKL_HMX_INT8_BLOCK_N_INNER;
+  for (uint32_t p = 0; p < n_parts; ++p) {
+    const hexkl_weight_u8i4 *w =
+      h[p] < HEXKL_MM_U8I4_MAX_WEIGHTS ? &tbl->slots[h[p]] : NULL;
+    /* ponytail: four bits only; a 2-bit handle (plan 229 S2's u8i2 FC
+       column branch) is refused until that branch exists */
+    if (w == NULL || !w->in_use || w->K != K || w->N == 0u ||
+        w->N % HEXKL_HMX_INT8_BLOCK_N_COL != 0u || w->bits == 2u) {
+      return AEE_EBADITEM;
+    }
+    c.w[p] = w;
+    c.t0[p + 1u] = c.t0[p] + w->N / HEXKL_HMX_INT8_BLOCK_N_COL;
+  }
+  c.n_parts = n_parts;
+  c.n_tiles = c.t0[n_parts];
+  /* The activation's one AH block, its row parameters (rows 1-3 repeat
+     row 0's, the M=1 path's padding rule), the accumulator tiles. */
+  const size_t sz_ah = (size_t)c.k_tiles * HEXKL_HMX_ACTIVATION_ALIGNMENT;
+  const size_t sz_rq = sizeof(float) * BR;
+  const size_t sz_acc = (size_t)c.n_tiles * MOE_M1_TILE_BYTES;
+  int rc = hexkl_moe_scratch_reserve(
+    scratch, ROUND_UP_SZ(sz_ah, MOE_SCRATCH_ALIGN) +
+               2u * ROUND_UP_SZ(sz_rq, MOE_SCRATCH_ALIGN) +
+               ROUND_UP_SZ(sz_acc, MOE_SCRATCH_ALIGN));
+  if (rc != AEE_SUCCESS) {
+    return rc;
+  }
+  uint8_t *cur = scratch->base;
+  uint8_t *act_ah = (uint8_t *)hexkl_moe_carve(&cur, sz_ah);
+  float *scale = (float *)hexkl_moe_carve(&cur, sz_rq);
+  int32_t *zp = (int32_t *)hexkl_moe_carve(&cur, sz_rq);
+  c.acc = (int32_t *)hexkl_moe_carve(&cur, sz_acc);
+  hvx_quant_rows_u8_params(act_f32, 1u, BR, K, scale, zp, NULL); /* 1 row */
+  for (uint32_t r = 1; r < 4u; ++r) {
+    scale[r] = scale[0];
+    zp[r] = zp[0];
+  }
+  hvx_quant_pack_u8_ah_rows(act_f32, row0, 0u, 4u, K, scale, zp, act_ah);
+  c.act_ah = act_ah;
+  c.act_scale = scale;
+  c.act_zp = zp;
+  c.out = out_f32;
+  c.rows1 = hexkl_moe_flags_rows1(flags);
+  c.bypass = (flags & HEXKL_MOE_FLAG_DMA_BYPASS) != 0u;
+  c.arena = vtcm_size < config_off ? vtcm_size : config_off;
+  c.vtcm =
+    (vtcm_base != NULL && hexkl_moe_flags_feed(flags) != 0u) ? vtcm_base : NULL;
+  if (c.vtcm != NULL) {
+    /* lane 0 is this thread: its engine must be idle at its first lane
+       push (hexkl_dma_lane_push2d), whatever an earlier op left queued */
+    hexkl_dma_ring_drain();
+  }
+  hvx_worker_pool_run(pool, fc_m1_worker, &c,
+                      c.n_tiles < FC_M1_MAX_LANES ? c.n_tiles
+                                                  : FC_M1_MAX_LANES);
+  return c.timed_out ? AEE_EFAILED : AEE_SUCCESS;
+}
