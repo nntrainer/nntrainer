@@ -213,6 +213,8 @@ void hexkl_moe_pack_bg_worker(uint32_t n_units, uint32_t u, void *vctx);
  * @param[in] row_weight  [n_rows] routing weight for each entry
  * @param[in] act_f32     [M x K]
  * @param[out] out_f32    [M x N_out]
+ * @param[in] act         HVX_GLU_SILU or HVX_GLU_GELU_TANH: the gated
+ *                        activation between gate_up and down
  * @param[in,out] scratch session-lifetime heap scratch; grown here as needed
  * @param[in] flags       HEXKL_MOE_FLAG_* bits; 0 is the HMX block loop
  * @return AEE_SUCCESS, or the first failing stage's code
@@ -350,31 +352,13 @@ int hexkl_mm_u8i4_moe_layer_run(
  */
 #define HEXKL_MOE_FLAG_DMA_BYPASS 0x40000u
 
-/**
- * @brief Bits [20:19] of the flags word (#177): N - 1, where N is the
- *        number of DMA queues the M=1 feed splits every weight matrix over.
- *        0 (N = 1) is #117's single dmlinked ring, unchanged. With N > 1
- *        each matrix is cut by k-tile rows into min(N, pool lanes)
- *        contiguous slices, and pool lane i issues slice i on its own
- *        thread's queue and polls it done before its unit returns, so a
- *        matrix is complete at the join of the run that carried it (the
- *        M=1 section comment of hexkl_mm_u8i4_moe.c). No byte changes: the
- *        same bytes land in the same place, only more engines move them.
- *        The probe (S26, bypass on): 33.0 / 43.2 / 55.9 GB/s at 1 / 2 / 4
- *        queues. No build default; the ARM side sends it.
- */
-#define HEXKL_MOE_DMA_Q_SHIFT 19u
-#define HEXKL_MOE_DMA_Q_BITS 3u
-
-/**
- * @brief Bit 21 of the flags word (plan 201 S4): the gate_up epilogue is
- *        GeGLU-tanh, gelu_tanh(gate) * up (hvx_geglu_det_sf), instead of
- *        SwiGLU -- on every path of the call (M=1 GEMV, HMX block loop,
- *        HVX tail), since all three run hvx_dq_swiglu_worker. A model
- *        property, not a tune knob: no build default, clear = SwiGLU and
- *        the bytes of every run before it.
- */
-#define HEXKL_MOE_FLAG_GEGLU 0x200000u
+/** @brief Bit 19 of the flags word: the gate/up epilogue is
+ *         gelu_tanh(g)*u (HVX_GLU_GELU_TANH) instead of silu(g)*u, on the
+ *         HMX block loop, the HVX tail and the M=1 GEMV alike (they share
+ *         hvx_dequant_swiglu_acc_tiles_to_f32). Per call: the skel sets it
+ *         from the IDL's act argument on top of the session's moe_set_opts
+ *         word, so one session serves both kinds of expert. */
+#define HEXKL_MOE_FLAG_GELU_TANH 0x80000u
 
 /** @brief Every bit this build understands; moe_set_opts keeps these and
  *         drops the rest, which is what makes the echo a version check. */
@@ -383,14 +367,7 @@ int hexkl_mm_u8i4_moe_layer_run(
    HEXKL_MOE_FLAG_GEMV_ROWS1_SET | HEXKL_MOE_FLAG_GEMV_FEED_SET |              \
    ((uint32_t)HEXKL_MOE_GEMV_LEAD_BITS << HEXKL_MOE_GEMV_LEAD_SHIFT) |         \
    HEXKL_MOE_FLAG_GEMV_ROWS1 | HEXKL_MOE_FLAG_GEMV_FEED |                      \
-   HEXKL_MOE_FLAG_DMA_BYPASS |                                                 \
-   ((uint32_t)HEXKL_MOE_DMA_Q_BITS << HEXKL_MOE_DMA_Q_SHIFT) |                 \
-   HEXKL_MOE_FLAG_GEGLU)
-
-/** @brief The call's DMA queue count for the M=1 feed, 1..4. */
-static inline uint32_t hexkl_moe_flags_dma_q(uint32_t flags) {
-  return ((flags >> HEXKL_MOE_DMA_Q_SHIFT) & HEXKL_MOE_DMA_Q_BITS) + 1u;
-}
+   HEXKL_MOE_FLAG_DMA_BYPASS | HEXKL_MOE_FLAG_GELU_TANH)
 
 /** @brief The call's l2fetch lead in KB: the flags word when the lead bit
  *         is set, else the build's default. */
