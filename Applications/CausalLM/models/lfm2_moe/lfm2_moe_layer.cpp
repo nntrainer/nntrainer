@@ -639,6 +639,17 @@ bool Lfm2MoELayer::preloadExperts(nntrainer::RunLayerContext &context) {
 
 /** @brief dst = rms_norm(src) * gamma over every row of src (its width),
  *  the rms_norm layer's own kernel; src and dst must not alias. */
+/** @brief The softmax router's selection as the accelerator returns it
+ *  (ComputeOps::router_logits_fp32 with top_k): what to ask for, and the
+ *  answer. */
+struct AcceleratedRoute {
+  unsigned int top_k = 0;
+  unsigned int n_sel = 0;
+  const float *scale = nullptr; /**< the [E] per-expert scale */
+  std::vector<unsigned int> sel;
+  std::vector<float> weight;
+};
+
 static void normRows(const nntrainer::Tensor &src, nntrainer::Tensor &dst,
                      const nntrainer::Tensor &gamma, float eps) {
   NNTR_THROW_IF(src.getDataType() != ml::train::TensorDim::DataType::FP32,
@@ -657,13 +668,11 @@ static void normRows(const nntrainer::Tensor &src, nntrainer::Tensor &dst,
  *  section 5 step 5). False when the backend has no such call, at a decode
  *  row (one FastRPC call costs more than the row's dot), or at a width the
  *  kernel does not take; the caller then norms and dots as before. */
-static bool routerLogitsOnAccelerator(const nntrainer::Tensor &rows,
-                                      const nntrainer::Tensor &gate_weights,
-                                      const float *gamma, float eps,
-                                      unsigned int total_tokens,
-                                      unsigned int hidden_size,
-                                      unsigned int num_experts,
-                                      nntrainer::Tensor &logits) {
+static bool routerLogitsOnAccelerator(
+  const nntrainer::Tensor &rows, const nntrainer::Tensor &gate_weights,
+  const float *gamma, float eps, unsigned int total_tokens,
+  unsigned int hidden_size, unsigned int num_experts, nntrainer::Tensor &logits,
+  AcceleratedRoute *route) {
   auto *ops = rows.getOps();
   const auto f32 = ml::train::TensorDim::DataType::FP32;
   if (total_tokens <= 1 || ops == nullptr ||
@@ -671,10 +680,36 @@ static bool routerLogitsOnAccelerator(const nntrainer::Tensor &rows,
       num_experts > 128 || rows.getDataType() != f32 ||
       gate_weights.getDataType() != f32)
     return false;
+  if (route) {
+    route->sel.resize(static_cast<size_t>(total_tokens) * route->n_sel);
+    route->weight.resize(static_cast<size_t>(total_tokens) * route->top_k);
+  }
   ops->router_logits_fp32(
     total_tokens, hidden_size, num_experts, rows.getData<float>(), gamma, eps,
-    gate_weights.getData<float>(), logits.getData<float>());
+    gate_weights.getData<float>(), logits.getData<float>(),
+    route ? route->top_k : 0u, route ? route->n_sel : 0u,
+    route ? route->scale : nullptr, route ? route->sel.data() : nullptr,
+    route ? route->weight.data() : nullptr);
   return true;
+}
+
+/** @brief buildExpertAssignments' output from the accelerator's selection:
+ *  token by token, its top_k experts in selection order with their
+ *  weights, and the n_sel-long ranking as the prefetch hint. */
+static void assignmentsFromRoute(
+  const AcceleratedRoute &route, unsigned int total_tokens,
+  std::vector<std::vector<std::pair<unsigned, float>>> &expert_assignments,
+  std::vector<int> *extra_top_k) {
+  for (unsigned int i = 0; i < total_tokens; ++i) {
+    const unsigned int *sel =
+      route.sel.data() + static_cast<size_t>(i) * route.n_sel;
+    const float *w = route.weight.data() + static_cast<size_t>(i) * route.top_k;
+    for (unsigned int k = 0; k < route.top_k; ++k)
+      expert_assignments[sel[k]].emplace_back(i, w[k]);
+    if (extra_top_k)
+      for (unsigned int k = 0; k < route.n_sel; ++k)
+        extra_top_k->push_back(static_cast<int>(sel[k]));
+  }
 }
 
 void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
@@ -709,13 +744,19 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
   const unsigned hidden_size = input.width();
   const unsigned total_tokens = batch_size * seq_len;
 
-  // routing, part one: the logits on the accelerator (its norm folded in)
-  // or the CPU's norm of the router's copy for the dot below
+  // routing, part one: the logits on the accelerator (its norm folded in,
+  // and for the softmax router its selection too) or the CPU's norm of
+  // the router's copy for the dot below
+  AcceleratedRoute route;
+  route.top_k = topk;
+  route.n_sel = topk;
+  route.scale = context.getWeight(expert_bias_idx).getData<float>();
   const bool router_on_accel = routerLogitsOnAccelerator(
     router_norm ? raw_input : router_in, context.getWeight(gate_idx),
     router_norm ? context.getWeight(router_gamma_idx).getData<float>()
                 : nullptr,
-    norm_eps, total_tokens, hidden_size, num_experts, router_logits);
+    norm_eps, total_tokens, hidden_size, num_experts, router_logits,
+    softmax_router ? &route : nullptr);
   if (router_norm && !router_on_accel)
     normRows(raw_input, router_in, context.getWeight(router_gamma_idx),
              norm_eps);
@@ -744,8 +785,11 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
   size_t max_assigned_tokens = 0;
   {
     M0Timer t(&g_m0.topk);
-    buildExpertAssignments(router_logits, expert_bias, total_tokens,
-                           expert_assignments);
+    if (router_on_accel && softmax_router)
+      assignmentsFromRoute(route, total_tokens, expert_assignments, nullptr);
+    else
+      buildExpertAssignments(router_logits, expert_bias, total_tokens,
+                             expert_assignments);
 
     for (const auto &assignments : expert_assignments)
       max_assigned_tokens = std::max(max_assigned_tokens, assignments.size());
@@ -1575,12 +1619,20 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     const unsigned total_tokens = batch_size * seq_len;
 
     // routing, part one: the logits on the accelerator (its norm folded
-    // in) or the CPU's norm of the router's copy for the dot below
+    // in, and for the softmax router its selection too) or the CPU's norm
+    // of the router's copy for the dot below
+    const bool want_extra = experts_virtual || moeTrace() != nullptr;
+    AcceleratedRoute route;
+    route.top_k = topk;
+    route.n_sel =
+      want_extra ? std::min<unsigned>(topk + EXTRA_TOPK, num_experts) : topk;
+    route.scale = expert_bias.getData<float>();
     const bool router_on_accel = routerLogitsOnAccelerator(
       router_norm ? raw : router_in, gate_weights,
       router_norm ? context.getWeight(router_gamma_idx).getData<float>()
                   : nullptr,
-      norm_eps, total_tokens, hidden_size, num_experts, router_logits);
+      norm_eps, total_tokens, hidden_size, num_experts, router_logits,
+      softmax_router ? &route : nullptr);
     if (router_norm && !router_on_accel)
       normRows(raw, router_in, context.getWeight(router_gamma_idx), norm_eps);
 
@@ -1622,9 +1674,13 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     size_t max_assigned_tokens = 0;
     {
       M0Timer t(&g_m0.topk);
-      buildExpertAssignments(
-        router_logits, expert_bias, total_tokens, expert_assignments,
-        (experts_virtual || moeTrace() != nullptr) ? &extra_top_k : nullptr);
+      if (router_on_accel && softmax_router)
+        assignmentsFromRoute(route, total_tokens, expert_assignments,
+                             want_extra ? &extra_top_k : nullptr);
+      else
+        buildExpertAssignments(router_logits, expert_bias, total_tokens,
+                               expert_assignments,
+                               want_extra ? &extra_top_k : nullptr);
       if (std::FILE *tf = moeTrace()) {
         std::fprintf(tf, "%u %u |", trace_layer, total_tokens);
         for (unsigned int e = 0; e < num_experts; ++e)
