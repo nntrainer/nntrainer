@@ -296,6 +296,48 @@ int hvx_router_rows_f32(const float *x, const float *w, float *logits,
   return 0;
 }
 
+/* The router's selection (hvx_router_topk_rows_f32): plain f32 softmax
+   and the same first-maximum scan; the HVX softmax is
+   router_rows_host_check's. */
+int hvx_router_topk_rows_f32(float *p, const float *scale, uint32_t *sel,
+                             float *weight, uint32_t M, uint32_t E,
+                             uint32_t top_k, uint32_t n_sel,
+                             hvx_worker_pool *pool) {
+  (void)pool;
+  if (!p || !scale || !sel || !weight || M == 0u || E == 0u || E % 32u != 0u ||
+      E > 128u || top_k == 0u || n_sel < top_k || n_sel > E) {
+    return -1;
+  }
+  for (uint32_t r = 0; r < M; ++r) {
+    float *pr = p + (size_t)r * E;
+    float mx = pr[0], sum = 0.0f;
+    for (uint32_t e = 1; e < E; ++e)
+      mx = pr[e] > mx ? pr[e] : mx;
+    for (uint32_t e = 0; e < E; ++e)
+      sum += pr[e] = expf(pr[e] - mx);
+    for (uint32_t e = 0; e < E; ++e)
+      pr[e] /= sum;
+    uint32_t taken[4] = {0u, 0u, 0u, 0u};
+    for (uint32_t k = 0; k < n_sel; ++k) {
+      uint32_t best = E;
+      for (uint32_t e = 0; e < E; ++e)
+        if (!(taken[e >> 5] & (1u << (e & 31u))) &&
+            (best == E || pr[e] > pr[best]))
+          best = e;
+      taken[best >> 5] |= 1u << (best & 31u);
+      sel[(size_t)r * n_sel + k] = best;
+    }
+    float wsum = 0.0f;
+    for (uint32_t k = 0; k < top_k; ++k)
+      wsum += pr[sel[(size_t)r * n_sel + k]];
+    for (uint32_t k = 0; k < top_k; ++k) {
+      const uint32_t e = sel[(size_t)r * n_sel + k];
+      weight[(size_t)r * top_k + k] = pr[e] * (1.0f / wsum) * scale[e];
+    }
+  }
+  return 0;
+}
+
 /* The RoPE the *_norm layer entry folds in: the CPU kernel's pair order,
    row by row; the HVX arithmetic is rope_rows_host_check's. */
 int hvx_rope_rows_f32(float *x, uint32_t M, uint32_t n, uint32_t hd,

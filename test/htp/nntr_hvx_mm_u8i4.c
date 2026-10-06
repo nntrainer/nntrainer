@@ -1355,8 +1355,10 @@ int nntr_hvx_mm_u8i4_moe_layer(remote_handle64 handle, uint32 M, uint32 K,
 int nntr_hvx_router_logits_f32(remote_handle64 handle, uint32 M, uint32 K,
                                uint32 E, float eps, const float *gamma,
                                int gammaLen, const float *w, int wLen,
-                               const float *x, int xLen, float *logits,
-                               int logitsLen) {
+                               const float *x, int xLen, uint32 top_k,
+                               uint32 n_sel, const float *scale, int scaleLen,
+                               float *logits, int logitsLen, uint32 *sel,
+                               int selLen, float *weight, int weightLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   if (!s) {
     return AEE_EBADPARM;
@@ -1373,6 +1375,15 @@ int nntr_hvx_router_logits_f32(remote_handle64 handle, uint32 M, uint32 K,
          logitsLen);
     return AEE_EINVALIDFORMAT;
   }
+  if (top_k != 0u && (n_sel < top_k || n_sel > E || (uint32)scaleLen != E ||
+                      (uint64_t)selLen != (uint64_t)M * n_sel ||
+                      (uint64_t)weightLen != (uint64_t)M * top_k)) {
+    FARF(ERROR,
+         "router_logits_f32: bad top-k shape (top_k=%u n_sel=%u scale=%d "
+         "sel=%d weight=%d)",
+         (unsigned)top_k, (unsigned)n_sel, scaleLen, selLen, weightLen);
+    return AEE_EINVALIDFORMAT;
+  }
   const float *rows = x;
   if (gammaLen) {
     rows = norm_rows_in(s, x, M, K, gamma, eps);
@@ -1381,6 +1392,11 @@ int nntr_hvx_router_logits_f32(remote_handle64 handle, uint32 M, uint32 K,
     }
   }
   if (hvx_router_rows_f32(rows, w, logits, M, K, E, s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
+  if (top_k != 0u &&
+      hvx_router_topk_rows_f32(logits, scale, sel, weight, M, E, top_k, n_sel,
+                               s->quant_pool) != 0) {
     return AEE_EINVALIDFORMAT;
   }
   return AEE_SUCCESS;
