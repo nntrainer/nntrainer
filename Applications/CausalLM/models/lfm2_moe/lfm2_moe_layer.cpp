@@ -651,6 +651,32 @@ static void normRows(const nntrainer::Tensor &src, nntrainer::Tensor &dst,
   dst.multiply_i(gamma);
 }
 
+/** @brief The router's logits on the accelerator at prefill: its own norm
+ *  (gamma, or nullptr) folded into the call over the raw rows, so the CPU
+ *  neither norms the router's copy nor runs the M x K x E dot (doc 57
+ *  section 5 step 5). False when the backend has no such call, at a decode
+ *  row (one FastRPC call costs more than the row's dot), or at a width the
+ *  kernel does not take; the caller then norms and dots as before. */
+static bool routerLogitsOnAccelerator(const nntrainer::Tensor &rows,
+                                      const nntrainer::Tensor &gate_weights,
+                                      const float *gamma, float eps,
+                                      unsigned int total_tokens,
+                                      unsigned int hidden_size,
+                                      unsigned int num_experts,
+                                      nntrainer::Tensor &logits) {
+  auto *ops = rows.getOps();
+  const auto f32 = ml::train::TensorDim::DataType::FP32;
+  if (total_tokens <= 1 || ops == nullptr ||
+      !ops->supports_router_logits_fp32() || num_experts % 32 != 0 ||
+      num_experts > 128 || rows.getDataType() != f32 ||
+      gate_weights.getDataType() != f32)
+    return false;
+  ops->router_logits_fp32(
+    total_tokens, hidden_size, num_experts, rows.getData<float>(), gamma, eps,
+    gate_weights.getData<float>(), logits.getData<float>());
+  return true;
+}
+
 void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
                               bool training) {
   /** M0 (doc 43 §5): ARM-side wall timer around the whole layer -- this
@@ -675,9 +701,6 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
                                   : input;
   if (in_norm)
     normRows(raw_input, input, context.getWeight(in_gamma_idx), norm_eps);
-  if (router_norm)
-    normRows(raw_input, router_in, context.getWeight(router_gamma_idx),
-             norm_eps);
 
   nntrainer::Tensor &router_logits = context.getTensor(router_logits_idx);
 
@@ -685,6 +708,17 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
   const unsigned seq_len = input.height();
   const unsigned hidden_size = input.width();
   const unsigned total_tokens = batch_size * seq_len;
+
+  // routing, part one: the logits on the accelerator (its norm folded in)
+  // or the CPU's norm of the router's copy for the dot below
+  const bool router_on_accel = routerLogitsOnAccelerator(
+    router_norm ? raw_input : router_in, context.getWeight(gate_idx),
+    router_norm ? context.getWeight(router_gamma_idx).getData<float>()
+                : nullptr,
+    norm_eps, total_tokens, hidden_size, num_experts, router_logits);
+  if (router_norm && !router_on_accel)
+    normRows(raw_input, router_in, context.getWeight(router_gamma_idx),
+             norm_eps);
 
   {
     M0Timer t(&g_m0.setup);
@@ -700,7 +734,7 @@ void Lfm2MoELayer::forwarding(nntrainer::RunLayerContext &context,
   // routing: raw logits -> top-k selection (props::RouterType)
   nntrainer::Tensor &gate_weights = context.getWeight(gate_idx);
   nntrainer::Tensor &expert_bias = context.getWeight(expert_bias_idx);
-  {
+  if (!router_on_accel) {
     M0Timer t(&g_m0.router);
     router_in.dot(gate_weights, router_logits);
   }
@@ -1526,15 +1560,10 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
       input_step_dim, b * input_step_dim.getFeatureLen(), true);
     auto router_in = router_in_.getSharedDataTensor(
       input_step_dim, b * input_step_dim.getFeatureLen(), true);
-    if (in_norm || router_norm) {
-      auto raw = raw_input_.getSharedDataTensor(
-        input_step_dim, b * input_step_dim.getFeatureLen(), true);
-      if (in_norm)
-        normRows(raw, input, context.getWeight(in_gamma_idx), norm_eps);
-      if (router_norm)
-        normRows(raw, router_in, context.getWeight(router_gamma_idx),
-                 norm_eps);
-    }
+    auto raw = raw_input_.getSharedDataTensor(
+      input_step_dim, b * input_step_dim.getFeatureLen(), true);
+    if (in_norm)
+      normRows(raw, input, context.getWeight(in_gamma_idx), norm_eps);
     auto output = output_.getSharedDataTensor(
       output_step_dim, b * output_step_dim.getFeatureLen(), true);
     auto router_logits =
@@ -1544,6 +1573,16 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     const unsigned seq_len = input.height();
     const unsigned hidden_size = input.width();
     const unsigned total_tokens = batch_size * seq_len;
+
+    // routing, part one: the logits on the accelerator (its norm folded
+    // in) or the CPU's norm of the router's copy for the dot below
+    const bool router_on_accel = routerLogitsOnAccelerator(
+      router_norm ? raw : router_in, gate_weights,
+      router_norm ? context.getWeight(router_gamma_idx).getData<float>()
+                  : nullptr,
+      norm_eps, total_tokens, hidden_size, num_experts, router_logits);
+    if (router_norm && !router_on_accel)
+      normRows(raw, router_in, context.getWeight(router_gamma_idx), norm_eps);
 
     {
       M0Timer t(&g_m0.setup);
@@ -1571,8 +1610,8 @@ void Lfm2MoELayer::incremental_forwarding(nntrainer::RunLayerContext &context,
     }
     fused.stop();
 
-    // routing
-    {
+    // routing, part two: the dot the accelerator did not do
+    if (!router_on_accel) {
       M0Timer t(&g_m0.router);
       router_in.dot(gate_weights, router_logits);
     }
