@@ -11,6 +11,7 @@
 #include "hvx_conv_gate_f32.h"
 #include "hvx_gather_ah_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
+#include "hvx_rope_rows_f32.h"
 #include "hvx_router_rows_f32.h"
 #include "hvx_scale_add_f32.h"
 #include <AEEStdErr.h>
@@ -290,6 +291,30 @@ int hvx_router_rows_f32(const float *x, const float *w, float *logits,
       for (uint32_t k = 0; k < K; ++k)
         acc += x[(size_t)r * K + k] * w[(size_t)k * E + e];
       logits[(size_t)r * E + e] = acc;
+    }
+  }
+  return 0;
+}
+
+/* The RoPE the *_norm layer entry folds in: the CPU kernel's pair order,
+   row by row; the HVX arithmetic is rope_rows_host_check's. */
+int hvx_rope_rows_f32(float *x, uint32_t M, uint32_t n, uint32_t hd,
+                      const float *cs, hvx_worker_pool *pool) {
+  (void)pool;
+  if (!x || !cs || M == 0u || hd == 0u || (hd / 2u) % 32u != 0u || n == 0u ||
+      n % hd != 0u) {
+    return -1;
+  }
+  const uint32_t half = hd / 2u;
+  for (uint32_t r = 0; r < M; ++r) {
+    const float *c = cs + (size_t)r * 2u * hd, *s = c + hd;
+    for (uint32_t h = 0; h < n / hd; ++h) {
+      float *head = x + (size_t)r * n + (size_t)h * hd;
+      for (uint32_t j = 0; j < half; ++j) {
+        const float a = head[j], b = head[j + half];
+        head[j] = a * c[j] - b * s[j];
+        head[j + half] = a * s[j] + b * c[j];
+      }
     }
   }
   return 0;

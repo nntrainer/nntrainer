@@ -30,6 +30,7 @@
 #include "hvx_dequant_i32.h"
 #include "hvx_quant_u8.h"
 #include "hvx_rmsnorm_rows_f32.h"
+#include "hvx_rope_rows_f32.h"
 #include "hvx_router_rows_f32.h"
 #include "nntr_hvx.h"
 #include "nntr_hvx_session.h"
@@ -798,14 +799,13 @@ static const float *norm_rows_in(nntr_hvx_session *s, const float *act_f32,
   return s->norm_rows;
 }
 
-int nntr_hvx_mm_u8i4_layer_norm(remote_handle64 handle, uint32 M, uint32 K,
-                                float eps, const float *pre_gamma,
-                                int pre_gammaLen, const uint32 *post_chunk,
-                                int post_chunkLen, const float *post_gamma,
-                                int post_gammaLen, const uint32 *w_handles,
-                                int w_handlesLen, const float *act_f32,
-                                int act_f32Len, float *out_cat,
-                                int out_catLen) {
+int nntr_hvx_mm_u8i4_layer_norm(
+  remote_handle64 handle, uint32 M, uint32 K, float eps, const float *pre_gamma,
+  int pre_gammaLen, const uint32 *post_chunk, int post_chunkLen,
+  const float *post_gamma, int post_gammaLen, uint32 rope_hd,
+  uint32 rope_handles, const float *rope_cs, int rope_csLen,
+  const uint32 *w_handles, int w_handlesLen, const float *act_f32,
+  int act_f32Len, float *out_cat, int out_catLen) {
   nntr_hvx_session *s = (nntr_hvx_session *)handle;
   int rc =
     check_layer_args(s, M, K, w_handles, w_handlesLen, act_f32Len, out_catLen);
@@ -837,6 +837,23 @@ int nntr_hvx_mm_u8i4_layer_norm(remote_handle64 handle, uint32 M, uint32 K,
          post_gammaLen, (unsigned)gamma_total);
     return AEE_EBADPARM;
   }
+  /* RoPE's shape: the head dim's half a multiple of 32, a table row per
+     activation row, every rotated handle a whole number of heads. */
+  if (rope_hd != 0u) {
+    if ((rope_hd / 2u) % 32u != 0u || rope_handles > (uint32_t)w_handlesLen ||
+        (uint64_t)rope_csLen != (uint64_t)M * 2u * rope_hd) {
+      FARF(ERROR, "mm_u8i4_layer_norm: rope hd %u handles %u cs %d",
+           (unsigned)rope_hd, (unsigned)rope_handles, rope_csLen);
+      return AEE_EBADPARM;
+    }
+    for (i = 0; i < (int)rope_handles; ++i) {
+      if (s->weights_u8i4.slots[w_handles[i]].N % rope_hd != 0u) {
+        FARF(ERROR, "mm_u8i4_layer_norm: rope hd %u of N %u", (unsigned)rope_hd,
+             (unsigned)s->weights_u8i4.slots[w_handles[i]].N);
+        return AEE_EBADPARM;
+      }
+    }
+  }
 
   const float *act = act_f32;
   if (pre_gammaLen != 0) {
@@ -863,6 +880,13 @@ int nntr_hvx_mm_u8i4_layer_norm(remote_handle64 handle, uint32 M, uint32 K,
                            s->quant_pool);
       g += c;
     }
+    off += (size_t)M * n_i;
+  }
+  /* Then RoPE on the first rope_handles blocks, after their norms. */
+  off = 0;
+  for (i = 0; rope_hd != 0u && i < (int)rope_handles; ++i) {
+    const uint32_t n_i = s->weights_u8i4.slots[w_handles[i]].N;
+    hvx_rope_rows_f32(out_cat + off, M, n_i, rope_hd, rope_cs, s->quant_pool);
     off += (size_t)M * n_i;
   }
   return AEE_SUCCESS;
