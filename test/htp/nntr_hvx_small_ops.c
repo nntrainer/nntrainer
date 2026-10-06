@@ -27,6 +27,7 @@
 #include "nntr_hvx_session.h"
 
 #include "hvx_m1_ops_f32.h"
+#include "hvx_rmsnorm_rows_f32.h"
 
 /** @brief f32 lanes per HVX vector. */
 #define LANES 32u
@@ -51,6 +52,31 @@ int nntr_hvx_rmsnorm_det_f32(remote_handle64 handle, uint32 chunk, float eps,
     return AEE_EINVALIDFORMAT;
   }
   hvx_rmsnorm_f32(x, gamma, y, (uint32_t)xLen, chunk, eps, row_scale);
+  return AEE_SUCCESS;
+}
+
+int nntr_hvx_rmsnorm_add_f32(remote_handle64 handle, uint32 M, uint32 n,
+                             float eps, float scale, const float *gamma,
+                             int gammaLen, const float *x, int xLen, float *out,
+                             int outLen) {
+  nntr_hvx_session *s = (nntr_hvx_session *)handle;
+  if (!s) {
+    return AEE_EBADPARM;
+  }
+  const uint64_t rows = (uint64_t)M * n;
+  if (M == 0u || n == 0u || n % LANES != 0u || rows > 0x7FFFFFFFu ||
+      (uint64_t)outLen != rows ||
+      ((uint64_t)xLen != rows && (uint64_t)xLen != 2u * rows) ||
+      (gammaLen != 0 && (uint32)gammaLen != n)) {
+    FARF(ERROR, "rmsnorm_add_f32: bad shape (M=%u n=%u gamma=%d x=%d out=%d)",
+         (unsigned)M, (unsigned)n, gammaLen, xLen, outLen);
+    return AEE_EINVALIDFORMAT;
+  }
+  const float *x2 = (uint64_t)xLen == 2u * rows ? x + rows : NULL;
+  if (hvx_rmsnorm_add_f32(out, x, x2, M, n, gammaLen ? gamma : NULL, eps, scale,
+                          s->quant_pool) != 0) {
+    return AEE_EINVALIDFORMAT;
+  }
   return AEE_SUCCESS;
 }
 
